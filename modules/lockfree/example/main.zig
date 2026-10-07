@@ -93,6 +93,7 @@ pub fn main() !void {
     job_pool.deinit();
 
     try boundedRing(gpa);
+    try workStealing(gpa);
 }
 
 /// The bounded ring: no domain, no pool, no allocation after `init` — what a
@@ -127,4 +128,24 @@ fn boundedRing(gpa: std.mem.Allocator) !void {
         ring.advance();
     }
     if (!ring.isEmpty()) return error.ExpectedEmptyRing;
+}
+
+/// The work-stealing deque: a worker pushes the tasks it spawns and pops the
+/// newest; an idle worker steals the oldest. A real scheduler gives every
+/// worker one deque; here one thread plays both roles to show the two ends.
+fn workStealing(gpa: std.mem.Allocator) !void {
+    const Task = struct { id: u32 };
+    var tasks = [_]Task{ .{ .id = 1 }, .{ .id = 2 }, .{ .id = 3 } };
+    // Starts at 2 slots and grows: the third push doubles the buffer.
+    var dq = try lockfree.Deque(*Task).init(gpa, 2);
+    defer dq.deinit();
+    for (&tasks) |*t| try dq.push(t);
+
+    const stolen = switch (dq.steal()) {
+        .success => |t| t,
+        .retry, .empty => return error.ExpectedSteal,
+    };
+    const newest = dq.pop() orelse return error.ExpectedTask;
+    std.debug.print("deque: stole task {d} (oldest), popped task {d} (newest), {d} left\n", .{ stolen.id, newest.id, dq.len() });
+    if (stolen.id != 1 or newest.id != 3 or dq.len() != 1) return error.UnexpectedOrder;
 }

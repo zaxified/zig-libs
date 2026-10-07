@@ -1,7 +1,7 @@
 # Formal litmus certification (herd7)
 
 This directory holds the **formal** layer of the lockfree module's weak-memory
-certification: `herd7` litmus tests that model-check the two load-bearing
+certification: `herd7` litmus tests that model-check the three load-bearing
 synchronization shapes against the AArch64 and RISC-V (RVWMO) axiomatic memory
 models. It sits atop the static disassembly certification in `../SPEC.md` §7 —
 that section proves the compiler *emits* the right barriers; these tests prove
@@ -10,8 +10,11 @@ lets it back in).
 
 ## Toolchain
 
-- `herd7` 7.58 (herdtools7), installed via opam. It is not on the default PATH;
-  `run.sh` pulls it in with `eval "$(opam env)"`.
+- `herd7` 7.58 (herdtools7). `run.sh` uses env `HERD7` (binary; default `herd7`
+  from PATH). When `HERD7` is unset and `opam` exists, it first loads
+  `eval "$(opam env)"`.
+- Env `HERD_LIBDIR`: when set, passed as `-set-libdir` (for a herd7 binary that
+  ships no model files; point it at herdtools7 tag 7.58 `herd/libdir`).
 - Models: the herd7-shipped `aarch64.cat` and `riscv.cat` (found by name from
   herd7's libdir — passed as `-model aarch64.cat` / `-model riscv.cat`).
 
@@ -68,23 +71,44 @@ both plain.
   `ld;fence r,rw` consume. **Never.**
 - `msqueue-riscv-relaxed.litmus` — plain `sd`/`ld`. **Sometimes.**
 
+### Shape 3 — Chase-Lev deque pop/steal Dekker interlock (SB with an RMW)
+
+`deque.zig` replaces the paper's seq_cst fences by seq_cst accesses. Owner `pop`
+does a seq_cst STORE of the lowered `bottom` and then a seq_cst LOAD of `top`; a
+thief whose claiming CAS on `top` has just succeeded (seq_cst RMW 0->1) then
+loads `bottom` (its next steal). Bug outcome: owner reads the OLD `top` AND the
+thief reads the OLD `bottom` (both miss each other, same item taken twice).
+
+- `deque-popsteal-aarch64-sc.litmus` — STLR / LDAR / CASAL (accepted by herd7
+  7.58). **Never.**
+- `deque-popsteal-aarch64-relaxed.litmus` — STR / LDR / plain CAS. **Sometimes.**
+- `deque-popsteal-riscv-sc.litmus` — store/load lowerings as in Shape 1,
+  `amoswap.w.aqrl` as the RMW (CAS stand-in; the claim always succeeds here).
+  **Never.**
+- `deque-popsteal-riscv-relaxed.litmus` — plain `sd`/`lw`/`ld`, `amoswap.w`
+  without aq/rl. **Sometimes.**
+
 ## Mapping to the source
 
 | Litmus var | Source atomic |
 |---|---|
 | SB `pin` | `Participant.local_epoch` (pin store in `enterCritical`, scan load in `tryAdvance`) |
 | SB `ptr` | queue `head`/`tail`/`Node.next` (unlink CAS vs. reader's pointer load) |
+| deque `bottom` | `Deque.bottom` (owner store in `pop`, thief load in `steal`) |
+| deque `top` | `Deque.top` (owner load in `pop`, thief claiming CAS in `steal`) |
 | MP `data` | `Node.value` (plain, written once before publish) |
 | MP `flag` | `Node.next` (release-published link / acquire-consumed) |
 
 ## Scope (honest)
 
-These tests certify the two **extracted** sync shapes — the pin/scan interlock
-and the MS-queue publish/consume — under the axiomatic AArch64/RVWMO models.
-They are **not** a whole-program proof: the full grace-period safety theorem
-(SPEC §4a / `ebr.zig` `tryAdvance`) reduces the module's reclamation safety to
-exactly these two shapes plus the seq_cst total order, and that reduction is the
-reviewed argument, not a machine-checked one here. Dynamic stress on real
+These tests certify the three **extracted** sync shapes — the pin/scan
+interlock, the MS-queue publish/consume and the deque pop/steal interlock —
+under the axiomatic AArch64/RVWMO models. They are **not** a whole-program
+proof: the full grace-period safety theorem (SPEC §4a / `ebr.zig` `tryAdvance`)
+reduces the module's reclamation safety to the first two plus the seq_cst total
+order, `deque.zig`'s file comment reduces the deque to the third (and the second
+for `push`), and those reductions are reviewed arguments, not machine-checked
+ones here. Dynamic stress on real
 ARM/RISC-V hardware remains the one thing beyond this layer; with the static
 codegen cert (§7) and this formal cert (§7.1) both green, it is now
 belt-and-suspenders rather than the sole evidence.

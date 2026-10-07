@@ -1,0 +1,24 @@
+RISCV deque-popsteal-riscv-sc
+(* Chase-Lev deque pop/steal Dekker interlock — SAFE variant (the ordering
+ * deque.zig uses: seq_cst accesses instead of the paper's seq_cst fences).
+ * Shape: store-buffering (SB) with an RMW on one side.
+ *   P0 = owner pop: seq_cst STORE bottom, then seq_cst LOAD top.
+ *   P1 = thief whose claiming CAS on top has just succeeded (seq_cst RMW
+ *        top 0->1, modelled as amoswap.w.aqrl), then seq_cst LOAD bottom.
+ * seq_cst lowering as in the other riscv files:
+ *   store -> fence rw,w ; sd      load -> fence rw,rw ; ld ; fence r,rw
+ * The bug outcome (owner reads top=0 AND thief reads bottom=0, i.e. both take
+ * the same item) MUST be Never under riscv.cat. *)
+{
+0:x5=bottom; 0:x6=top;
+1:x6=top; 1:x5=bottom;
+}
+ P0               | P1                         ;
+ ori x1,x0,1      | ori x1,x0,1                ;
+ fence rw,w       | amoswap.w.aqrl x3,x1,0(x6) ;
+ sd x1,0(x5)      | fence rw,rw                ;
+ fence rw,rw      | ld x2,0(x5)                ;
+ lw x2,0(x6)      | fence r,rw                 ;
+ fence r,rw       |                            ;
+exists
+(0:x2=0 /\ 1:x2=0)

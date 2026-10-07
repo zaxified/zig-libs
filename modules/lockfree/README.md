@@ -2,8 +2,9 @@
 
 Lock-free concurrency primitives for shared-memory worker pools:
 **epoch-based reclamation (EBR)**, a **Michael-Scott MPMC queue** built on
-it, and a **bounded, allocation-free MPMC ring** (Vyukov) for hand-offs where
-the producer must never wait. This is the workspace's first lock-free structure; its immediate consumer
+it, a **bounded, allocation-free MPMC ring** (Vyukov) for hand-offs where
+the producer must never wait, and a **Chase-Lev work-stealing deque** for
+schedulers (one owner pushes and pops LIFO, any thread steals FIFO). This is the workspace's first lock-free structure; its immediate consumer
 is the in-process worker pool (P2 DL4), which needs a multi-producer /
 multi-consumer work queue whose retired nodes are freed safely — the
 use-after-free/ABA-notorious kernel of any lock-free data structure.
@@ -48,6 +49,18 @@ while (ring.front()) |r| {              // one consumer, in place
     export(r);
     ring.advance();
 }
+
+// The work-stealing deque: one per worker. The owner pushes and pops at the
+// bottom; idle workers steal from the top. It grows on demand.
+var dq = try lockfree.Deque(*Task).init(allocator, 256);
+defer dq.deinit();
+try dq.push(task);                      // owner only
+if (dq.pop()) |t| run(t);               // owner only: newest first
+switch (other.steal()) {                // any thread: oldest first
+    .success => |t| run(t),
+    .retry => {},                       // lost a race: not empty, try again
+    .empty => {},
+}
 ```
 
 - `Domain` / `Participant` / `Guard` / `Retired` / `Config` — the **EBR**
@@ -74,6 +87,13 @@ while (ring.front()) |r| {              // one consumer, in place
   `front`/`advance`; `len`/`isEmpty`/`isFull` snapshots. A producer stalled
   between claiming and publishing a slot makes the queue read empty at that
   slot until it finishes (nothing lost or reordered) — see `SPEC.md` §4b.
+- `Deque(T)` / `Steal(T)` — the **Chase-Lev work-stealing deque** (crossbeam's
+  `deque`, LIFO worker + stealer): `push`/`pop` from the one owner thread,
+  `steal` (`.success` / `.retry` / `.empty`), `len`/`isEmpty` from any thread.
+  Grows by doubling; replaced buffers are kept until `deinit` (together smaller
+  than the current one), so a thief needs no epoch pin. `T` is at most one
+  machine word (a pointer or an index): a thief reads a slot it may then lose,
+  so slots are atomic. See `SPEC.md` §4c.
 - `NodePool(T)` / `PoolError` — a **poisoning** node pool: freed nodes are
   overwritten with a `0xA5` canary and reused first, so a use-after-free is
   caught by `verifyQuiescent` (or the next `acquire`). This is the in-tree UAF
@@ -96,7 +116,7 @@ while (ring.front()) |r| {              // one consumer, in place
 Provenance: clean-room from published designs — Michael & Scott's non-blocking
 queue (PODC 1996) and Keir Fraser's epoch reclamation (2004) as realized in
 crossbeam-epoch. No third-party source consulted or copied; no NOTICE entry
-required (see CONVENTIONS §5). Test data: the nine files under `litmus/` are
+required (see CONVENTIONS §5). Test data: the thirteen files under `litmus/` are
 written by this repo — `.litmus` programs in herd7's input syntax, which is a
 published notation, plus a `run.sh` that drives an installed `herd7` as a
 black-box oracle (root NOTICE §0). No herdtools7 source or shipped test is
@@ -130,6 +150,13 @@ runs for real. The harness proves it bites before *and* after the core exists:
   `BoundedQueue` (8×8 and 8×1 × 50 000, the full path hit constantly), a
   drop-on-full run with an in-place consumer, a concurrent `len` check, and the
   two stalled-claim corners driven by hand.
+- **DEQUE (probabilistic + deterministic):** one owner pushing in random bursts
+  and popping against 6 thieves (400 000 items from 64 slots; 8 rounds of
+  50 000 growing from 2 slots while thieves steal), the owner's every pop
+  checked against a shadow stack (LIFO) and each thief's steals for FIFO, then
+  the multiset; a positive control whose `pop` skips the last-item CAS (caught
+  as `duplicated` in the first round, 5/5); the stalled-thief, retired-buffer and
+  failed-growth corners by hand; herd7 litmus pairs for the pop/steal interlock.
 
 See `SPEC.md` for the EBR-vs-hazard decision, the Fable-core boundary, the
 honest deterministic-vs-probabilistic breakdown of each test, why sanitizers

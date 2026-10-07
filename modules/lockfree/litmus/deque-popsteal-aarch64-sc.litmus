@@ -1,0 +1,24 @@
+AArch64 deque-popsteal-aarch64-sc
+(* Chase-Lev deque pop/steal Dekker interlock — SAFE variant (the ordering
+ * deque.zig uses: seq_cst accesses instead of the paper's seq_cst fences).
+ * Shape: store-buffering (SB) with an RMW on one side.
+ *   P0 = owner pop: seq_cst STORE bottom (the lowered value), then seq_cst
+ *        LOAD top.
+ *   P1 = thief whose claiming CAS on top has just succeeded (seq_cst RMW
+ *        top 0->1), then seq_cst LOAD bottom (its next steal reading bottom).
+ * seq_cst lowering per SPEC.md 7: store -> STLR, load -> LDAR, CAS -> CASAL
+ * (LSE; accepted by herd7 7.58, so no SWPAL stand-in is needed).
+ * The bug outcome is that both miss each other: the owner reads top's OLD value
+ * (0) AND the thief reads bottom's OLD value (0) -> owner and thief take the
+ * same item. Under aarch64.cat this MUST be Never. *)
+{
+0:X1=bottom; 0:X3=top;
+1:X3=top; 1:X5=bottom;
+}
+ P0              | P1                ;
+ MOV W0,#1       | MOV W1,#0         ;
+ STLR W0,[X1]    | MOV W2,#1         ;
+ LDAR W2,[X3]    | CASAL W1,W2,[X3]  ;
+                 | LDAR W4,[X5]      ;
+exists
+(0:X2=0 /\ 1:X4=0)

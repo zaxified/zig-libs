@@ -1,0 +1,18 @@
+AArch64 deque-popsteal-aarch64-relaxed
+(* Chase-Lev deque pop/steal Dekker interlock — POSITIVE CONTROL (ordering
+ * DELIBERATELY WEAKENED: plain STR/LDR, and the claiming RMW is a plain CAS
+ * with no acquire/release). Proves the encoding exercises the store->load
+ * reorder and that STLR/LDAR/CASAL are load-bearing: with plain accesses both
+ * sides can miss each other (owner and thief take the same item). Under
+ * aarch64.cat this MUST be Sometimes/Allowed. *)
+{
+0:X1=bottom; 0:X3=top;
+1:X3=top; 1:X5=bottom;
+}
+ P0              | P1               ;
+ MOV W0,#1       | MOV W1,#0        ;
+ STR W0,[X1]     | MOV W2,#1        ;
+ LDR W2,[X3]     | CAS W1,W2,[X3]   ;
+                 | LDR W4,[X5]      ;
+exists
+(0:X2=0 /\ 1:X4=0)

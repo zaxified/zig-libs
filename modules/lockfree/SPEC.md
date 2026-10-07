@@ -28,7 +28,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Go `sync/atomic`, `sync.Pool` | Go | BSD-3-Clause | — | Go stdlib | Atomics and per-P pools only; no lock-free queue or reclamation is needed under a GC. |
 | Zig `std.atomic`, `std.Io` | Zig | MIT | — | Zig 0.16.0 | Atomic primitives only; no reclamation and no lock-free container (this module's SPEC §1). |
 
-**Where we are ahead:** the only one of the Zig options with safe reclamation (EBR) under the queue *(inferred: the other README does not mention any)*, and the most rigorously checked: a poisoning node pool that detects use-after-free, a stress driver with a deliberately broken control, and weak-memory certification on aarch64/riscv64 plus herd7 litmus tests (SPEC §7). **Where we are behind:** no work-stealing deque (crossbeam's `deque` crate), the bounded ring's capacity is a comptime power of two (crossbeam's `ArrayQueue::new` takes any runtime capacity) and it has no `force_push`, no lock-free map, no hazard pointers, and every reclamation-relevant access — pin store, epoch loads/CAS, the `local_epoch` scan loads, the queue's `head`/`tail`/`Node.next` loads and CAS — is `seq_cst` where a tuned design would use acquire/release (correct, slower; the unpin store, registration and orphan bookkeeping already use release/acquire/monotonic, SPEC §4a) (→ Backlog).
+**Where we are ahead:** the only one of the Zig options with safe reclamation (EBR) under the queue *(inferred: the other README does not mention any)*, and the most rigorously checked: a poisoning node pool that detects use-after-free, a stress driver with a deliberately broken control, and weak-memory certification on aarch64/riscv64 plus herd7 litmus tests (SPEC §7). **Where we are behind:** the work-stealing deque (since 2026-10-07, §4c) takes word-sized items only and has no `steal_batch` or FIFO worker flavour (crossbeam's `deque` has both), the bounded ring's capacity is a comptime power of two (crossbeam's `ArrayQueue::new` takes any runtime capacity) and it has no `force_push`, no lock-free map, no hazard pointers, and every reclamation-relevant access — pin store, epoch loads/CAS, the `local_epoch` scan loads, the queue's `head`/`tail`/`Node.next` loads and CAS — is `seq_cst` where a tuned design would use acquire/release (correct, slower; the unpin store, registration and orphan bookkeeping already use release/acquire/monotonic, SPEC §4a) (→ Backlog).
 
 ## 1. Dedup / std-gap
 
@@ -104,6 +104,8 @@ single shared verification story. Files:
   `Queue(u64)`.
 - `bounded.zig` — `BoundedQueue(T, capacity, opts)`, the Vyukov bounded ring
   (§4b). Independent of EBR: no slot is ever freed, so nothing needs reclaiming.
+- `deque.zig` — `Deque(T)`, the Chase-Lev work-stealing deque (§4c). Independent
+  of EBR: replaced buffers are kept, not reclaimed.
 - `harness.zig` — the stress driver, the correct oracle (`RefQueue`), the broken
   control (`BrokenRing`), the deterministic multiset `verify`, and the tests.
 - `gate.zig` — the single `fable_core_implemented` switch.
@@ -294,6 +296,62 @@ out the slot in place (its producer cannot reuse it before `advance` frees it).
 consumers the slot `front` points at can be taken and overwritten. The type
 cannot detect two threads popping a `.single` queue.
 
+## 4c. The work-stealing deque (`deque.zig`)
+
+Chase & Lev's deque (SPAA 2005) in the C11 shape of Lê et al. (PPoPP 2013), the
+design crossbeam's `deque` follows: one owner pushes and pops at `bottom`
+(LIFO), thieves claim `top` by CAS (FIFO). The protocol and the full proof are
+in the file comment; the decisions are these.
+
+**`seq_cst` accesses where the paper has fences.** The paper's `pop` is "store
+`bottom`; seq_cst fence; load `top`" and its `steal` "load `top`; seq_cst fence;
+load `bottom`". Zig 0.16 has no fence (§4a), so the four accesses themselves are
+`seq_cst`, as is every CAS on `top`. They share the total order S, and S forbids
+the store-buffering outcome in which `pop` takes the bottom item uncontested while
+a thief claims the same position (owner misses the thief's CAS, thief misses the
+owner's lowered `bottom`). The cost is the cost of the fence it replaces: on
+x86-64 the `bottom` store in `pop` is an `xchg` (the paper's `mfence`), every
+other access a plain `mov`. `push` publishes `bottom` with release and the thief's
+`seq_cst` load of `bottom` acquires it — the message-passing shape §7.1 already
+certifies. Lowerings measured 2026-10-07 (`-femit-asm`, ReleaseFast): aarch64
+`pop` = `stlr` bottom, `ldar` top, `casal`; `steal` = `ldar` top, `ldar` bottom,
+acquire load of the buffer pointer (`ldar`, `ldapr` on ARMv8.3+), `casal`;
+riscv64 seq_cst store `fence rw,w; sd`, load `fence rw,rw; ld; fence r,rw`, CAS
+`lr.d.aqrl`/`sc.d.rl`. The litmus pair (§7.1, shape 3) uses exactly the aarch64
+sequence; on riscv it models the CAS as `amoswap.w.aqrl` (an RMW with the same
+aq+rl bits as the LR/SC pair).
+
+**Word-sized items, atomic slots.** A thief reads the slot at `top` before its
+claiming CAS; when the CAS loses, the owner may be overwriting that slot on its
+next lap. crossbeam reads any `T` racily and discards it; in Zig that read is a
+data race on a plain `T`. Slots are therefore `std.atomic.Value(T)` (monotonic),
+which bounds `T` to a machine word — pointers and indices, what a scheduler
+queues. A larger `T` is a compile error that says to queue a pointer.
+
+**Growth without reclamation.** A full `push` allocates a buffer twice the size,
+copies the live positions, publishes it with release and keeps the old one in an
+owner-only list until `deinit`. A thief that loaded the old pointer may still read
+it; the owner never writes a replaced buffer again, so that read is either the
+item of its position or loses the CAS. Capacities double, so all replaced buffers
+together hold fewer slots than the current one: memory is bounded by twice the
+peak, and the deque never shrinks. crossbeam frees replaced buffers through its
+epoch scheme; reusing `ebr.Domain` here would make every thief a registered,
+pinned participant for a saving bounded by the current buffer's size. Keeping
+them means `steal` is three loads and one CAS. `push` reserves the list entry
+before allocating, so a growth that fails (`error.OutOfMemory`, the item not
+added) leaves the deque as it was.
+
+**`len` is one instant.** It reads `top`, `bottom`, then `top` again and retries
+if `top` moved: without the re-check the owner can push and pop the last item
+(moving `top`) between the two loads and the count includes items that never
+coexisted (the concurrent test saw 2 for a deque never holding more than 1). A
+negative difference — an owner's empty `pop` has lowered `bottom` and not yet put
+it back — reads as 0.
+
+**One owner.** `push`/`pop` from two threads is a data race the type cannot
+detect, as with `.single` in §4b. crossbeam splits the handle into `Worker` and
+`Stealer` types to enforce this; here it is documented.
+
 ## 5. Verification strategy — the teeth
 
 Lock-free correctness is probabilistic under naive stress, so detection is
@@ -310,6 +368,9 @@ exists (the harness runs against controls, not the gated core):
 | BOUNDED MPMC / MPSC | driver over `BoundedQueue` with 64 slots (8×8 and 8×1 ×50 000; refused pushes retry, so the full path runs constantly) | **probabilistic** |
 | BOUNDED drop-on-full | 6 producers never wait, 1 in-place consumer: accepted = received, received + refused = sent, per-producer order | **probabilistic** |
 | stalled claim | a producer (consumer) claimed and not yet published (freed) — driven by hand | **deterministic** |
+| DEQUE | one owner (random push bursts + pops, every pop checked against a shadow stack: it must return the newest item the owner has not popped, or empty) vs 6 thieves (steals checked FIFO), then the multiset; 400 000 items from 64 slots, and 8 × 50 000 growing from 2 slots under theft | **probabilistic** |
+| DEQUE DRIVER TEETH | the same driver over a `pop` that skips the last-item CAS: `duplicated` in round 1, 5/5 runs | **probabilistic** (high) |
+| deque corners | thief stalled between its reads and its CAS loses to the owner; a thief reading a retired buffer; a growth that cannot allocate; concurrent `len` while the owner pops empty | **deterministic** (the `len` one probabilistic) |
 
 **The FIFO check.** `verify` also walks each consumer's list in the order it
 dequeued and requires each producer's sequence numbers to rise (`reordered`
@@ -404,6 +465,20 @@ CAS (the stale position meets a slot already claimed, `diff > 0`, and the loop
 re-reads `tail` — one extra iteration). Not mutated: the acquire/release pairs
 on `seq` — on x86-TSO no value test can observe their demotion; they are the
 §7.1 message-passing shape.
+
+**Mutation run 2026-10-07** (schemata, ReleaseSafe, 15 mutants over
+`deque.zig`: the full check and growth, the copy's start, keeping the replaced
+buffer, publishing before writing the slot, the one-item and empty branches of
+`pop`, restoring `bottom` in both, the last-item CAS (dropped and inverted),
+`steal`'s empty bound, a lost CAS taken as success, reading the slot after the
+claim, and `len`'s clamp and re-check): 15 killed. The first pass left `len`'s
+clamp alive; the concurrent `len` test written for it then failed on the
+UNMUTATED code — `len` read `top` and `bottom` as two loads and counted 2 in a
+deque never holding more than 1 — so the re-check landed with it (§4c) and was
+mutated too (killed 20/20 after the test drove a push + pop-the-last on every
+iteration; 17/20 before). Not mutated: the `seq_cst`/acquire/release orderings —
+on x86-TSO no value test observes their demotion; the deque litmus pair (§7.1,
+shape 3) is their evidence.
 
 ## 6. Out of scope — next increments
 
@@ -673,15 +748,20 @@ weakening them lets the bug back in. Files live in `litmus/` (`run.sh` +
 
 ### Toolchain / models
 
-- `herd7` **7.58** (herdtools7, via opam; `run.sh` sources `opam env`).
+- `herd7` **7.58** (herdtools7). `run.sh` takes it from `HERD7` (default: `herd7`
+  on PATH, after `opam env` when opam exists) and the model directory from
+  `HERD_LIBDIR` (`-set-libdir`). The 2026-10-07 run used Ubuntu's `herdtools7`
+  7.58 binary — its package ships no `.cat` files — with the models from the
+  upstream `7.58` tag's `herd/libdir`; the eight earlier results reproduced
+  unchanged.
 - Models: the herd7-shipped **`aarch64.cat`** and **`riscv.cat`** (RVWMO),
   selected by name (`-model aarch64.cat` / `-model riscv.cat`).
 
 ### Method — matched pairs with teeth
 
 The full grace-period theorem (§4a, `tryAdvance`) reduces the module's
-reclamation safety to two sync shapes over the seq_cst total order S. Each shape
-is encoded as an `exists` on the **bug** outcome, in a matched pair per arch:
+reclamation safety to two sync shapes over the seq_cst total order S; the deque's
+argument (§4c, `deque.zig` file comment) adds a third. Each shape is encoded as an `exists` on the **bug** outcome, in a matched pair per arch:
 
 - **safe** — the ordering the code uses, written with the exact SPEC §7
   lowerings (seq_cst = `STLR`/`LDAR` on aarch64, `fence rw,w;sd` /
@@ -697,6 +777,13 @@ is encoded as an `exists` on the **bug** outcome, in a matched pair per arch:
 P0 = reader (pin store then shared-pointer load), P1 = reclaimer (advance/unlink
 store then epoch-scan load). Bug = the SB non-SC outcome `0:X2=0 /\ 1:X2=0`
 (reclaimer misses the pin **and** reader misses the unlink → frees a live node).
+
+**Shape 3 — Chase-Lev pop/steal interlock (2026-10-07)**, store-buffering with
+an RMW on one side: P0 = owner `pop` (seq_cst store of the lowered `bottom`, then
+seq_cst load of `top`), P1 = a thief whose claiming CAS on `top` just succeeded,
+then its seq_cst load of `bottom`. Bug = both read the other's old value
+(`0:X2=0 /\ 1:X4=0`): owner and thief take the same item. `push`'s publish of
+`bottom` is shape 2.
 
 **Shape 2 — MS-queue publish/consume**, encoded as message-passing (MP): P0 =
 enqueue (write `Node.value` plain, then release-publish the `next` link), P1 =
@@ -715,6 +802,10 @@ payload stale` (`1:X0=1 /\ 1:X2=0`, riscv `1:x1=1 /\ 1:x2=0`).
 | `msqueue-aarch64-relaxed` | MP | aarch64 | plain (STR/LDR) | `Sometimes 1 3` | ✅ control fires |
 | `msqueue-riscv-rel-acq` | MP | riscv | release/acquire (fence rw,w+sd / ld+fence r,rw) | `Never 0 3` | ✅ bug forbidden |
 | `msqueue-riscv-relaxed` | MP | riscv | plain (ld/sd) | `Sometimes 1 3` | ✅ control fires |
+| `deque-popsteal-aarch64-sc` | SB+RMW | aarch64 | seq_cst (STLR/LDAR/CASAL) | `Never 0 6` | ✅ bug forbidden |
+| `deque-popsteal-aarch64-relaxed` | SB+RMW | aarch64 | plain (STR/LDR/CAS) | `Sometimes 2 6` | ✅ control fires |
+| `deque-popsteal-riscv-sc` | SB+RMW | riscv | seq_cst (fences + amoswap.w.aqrl) | `Never 0 3` | ✅ bug forbidden |
+| `deque-popsteal-riscv-relaxed` | SB+RMW | riscv | plain (ld/sd, amoswap.w) | `Sometimes 1 3` | ✅ control fires |
 
 Safe/positive-control pairing, read as pairs: on **both** arches, both shapes
 forbid the bug under the code's real ordering and **permit** it the instant the
@@ -724,11 +815,13 @@ not the litmus encoding, is what excludes the bug.
 
 ### Honest scope
 
-This certifies the two **extracted** sync shapes — the pin/scan interlock and
-the MS-queue publish/consume — under the AArch64 and RVWMO axiomatic models. It
-is **not** a whole-program proof: the reduction from full reclamation safety to
-these two shapes plus the seq_cst total order S is the reviewed §4a argument
-(theorem at `tryAdvance`), not a machine-checked model of the entire algorithm.
+This certifies the three **extracted** sync shapes — the pin/scan interlock,
+the MS-queue publish/consume and the deque pop/steal interlock — under the
+AArch64 and RVWMO axiomatic models. It is **not** a whole-program proof: the
+reduction from full reclamation safety to the first two plus the seq_cst total
+order S is the reviewed §4a argument (theorem at `tryAdvance`), and the deque's
+reduction to the third (with shape 2 for `push`) is the argument in `deque.zig`'s
+file comment — neither is a machine-checked model of the entire algorithm.
 What remains beyond this layer is dynamic weak-memory stress on *real* ARM/RISC-V
 hardware (§7 item (a)); with the static codegen cert (§7) and this formal cert
 (§7.1) both green, that hardware run is now belt-and-suspenders corroboration
@@ -742,7 +835,10 @@ Items from §6 stay there; the survey adds what a crossbeam user hits first.
 - ~~(survey 2026-09-30) Bounded ring (`ArrayQueue` equivalent)~~ — ✅ 2026-10-06, `BoundedQueue` (§4b).
 - (2026-10-06) Runtime capacity for the bounded ring: crossbeam's `ArrayQueue::new(cap)` takes any capacity at run time; ours is a comptime power of two stored inline. A config-sized ring needs a heap-backed variant (slots slice + `init(allocator, cap)`). Effort: small; fits §2.
 - (2026-10-06) `force_push` (overwrite the oldest when full — crossbeam has it, for "latest N" buffers). With several consumers it needs the producer to claim a consumer position too. Effort: medium; fits §2.
-- (survey 2026-09-30) Work-stealing deque (crossbeam `deque`, Chase-Lev) for schedulers such as `workerpool`, which today shares one MPMC queue. Effort: medium-large; fits §2.
+- ~~(survey 2026-09-30) Work-stealing deque~~ — ✅ 2026-10-07, `Deque(T)` (§4c). ⏭ consumer: `workerpool` still shares one MPMC queue; per-worker deques + stealing is its own change there.
+- (2026-10-07) `Deque`: `stealBatch` (crossbeam's `steal_batch`/`steal_batch_and_pop`: move up to half of a victim's items in one go — fewer steals under imbalance). Effort: medium (a CAS of `top` by k, the batch read before it); fits §2.
+- (2026-10-07) `Deque`: FIFO worker flavour (crossbeam's `Worker::new_fifo`: the owner pops from the top too). Effort: small; fits §2.
+- (2026-10-07) `Deque`: items wider than a word (crossbeam takes any `T` and reads it racily). Needs either a seqlock-style slot or accepting the race; effort: medium; fits §2 only if a consumer needs it.
 - (survey 2026-09-30) Acquire/release tuning of the `seq_cst` discipline where the SPEC's argument allows it (throughput; correctness is unchanged). Effort: medium and needs the litmus/codegen certification redone; fits §2.
 
 ## Anchoring

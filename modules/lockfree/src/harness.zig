@@ -635,3 +635,186 @@ test "BOUNDED drop-on-full: every accepted item arrives exactly once, in order; 
     try testing.expectEqual(sh.accepted.load(.monotonic), got);
     try testing.expectEqual(@as(u64, producers * per), got + q.refusedCount());
 }
+
+// ── the work-stealing deque: one owner, many thieves ─────────────────────────
+
+/// What the deque driver needs from a deque: `push`/`pop` (owner) and `steal`
+/// (thieves). The real `Deque(u64)` has them; so does `BrokenDeque`.
+fn DequeStress(comptime D: type) type {
+    return struct {
+        const drain_threshold: u32 = 2048;
+
+        const Shared = struct {
+            d: *D,
+            owner_done: std.atomic.Value(bool) = .init(false),
+            failed: std.atomic.Value(bool) = .init(false),
+            allocator: std.mem.Allocator,
+        };
+
+        fn thiefMain(sh: *Shared, list: *std.ArrayListUnmanaged(u64)) void {
+            var backoff: atomic.Backoff = .{};
+            var empty_run: u32 = 0;
+            while (!sh.failed.load(.acquire)) {
+                switch (sh.d.steal()) {
+                    .success => |v| {
+                        list.append(sh.allocator, v) catch {
+                            sh.failed.store(true, .release);
+                            return;
+                        };
+                        empty_run = 0;
+                        backoff.reset();
+                    },
+                    // Contention, not emptiness: go again at once.
+                    .retry => {},
+                    .empty => {
+                        if (sh.owner_done.load(.acquire)) {
+                            empty_run += 1;
+                            if (empty_run >= drain_threshold) return;
+                        }
+                        backoff.pause();
+                    },
+                }
+            }
+        }
+
+        /// The owner pushes `n` items `encode(0, 0..n)` in random bursts and
+        /// pops a random share of each burst, then pops until empty. Its pops
+        /// are checked against a shadow stack as they happen: a pop must
+        /// return the newest item the owner has not popped itself — thieves
+        /// take from the other end, so if that item was stolen, every older
+        /// one was too and the pop must read empty. A pop that returns anything
+        /// else is `.reordered`; the multiset check then covers lost,
+        /// duplicated and corrupt items across owner and thieves.
+        fn ownerRun(sh: *Shared, n: usize, seed: u64, popped: *std.ArrayListUnmanaged(u64), shadow: *std.ArrayListUnmanaged(u64)) !?Verdict {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rnd = prng.random();
+            var next: u64 = 0;
+            while (next < n or shadow.items.len != 0) {
+                if (next < n) {
+                    const burst = @min(rnd.intRangeAtMost(usize, 1, 64), n - next);
+                    for (0..burst) |_| {
+                        try sh.d.push(encode(0, next));
+                        try shadow.append(sh.allocator, next);
+                        next += 1;
+                    }
+                }
+                const pops = if (next < n) rnd.intRangeAtMost(usize, 0, 64) else std.math.maxInt(usize);
+                var k: usize = 0;
+                while (k < pops) : (k += 1) {
+                    const v = sh.d.pop() orelse {
+                        // Empty: whatever the shadow still holds was stolen.
+                        shadow.clearRetainingCapacity();
+                        break;
+                    };
+                    try popped.append(sh.allocator, v);
+                    const want = shadow.pop() orelse return .corrupted;
+                    if (decodePid(v) != 0 or decodeSeq(v) != want) return .reordered;
+                }
+            }
+            return null;
+        }
+
+        fn run(d: *D, thieves: usize, n: usize, seed: u64, allocator: std.mem.Allocator) !Verdict {
+            var sh: Shared = .{ .d = d, .allocator = allocator };
+            // lists[0] is the owner's pops, lists[1..] one per thief.
+            const lists = try allocator.alloc(std.ArrayListUnmanaged(u64), thieves + 1);
+            defer allocator.free(lists);
+            for (lists) |*l| l.* = .empty;
+            defer for (lists) |*l| l.deinit(allocator);
+            for (lists) |*l| try l.ensureTotalCapacity(allocator, n);
+            var shadow: std.ArrayListUnmanaged(u64) = .empty;
+            defer shadow.deinit(allocator);
+
+            const ts = try allocator.alloc(std.Thread, thieves);
+            defer allocator.free(ts);
+            for (ts, 1..) |*t, i| t.* = try std.Thread.spawn(.{}, thiefMain, .{ &sh, &lists[i] });
+            const owner_verdict = ownerRun(&sh, n, seed, &lists[0], &shadow) catch |e| {
+                sh.failed.store(true, .release);
+                for (ts) |t| t.join();
+                return e;
+            };
+            sh.owner_done.store(true, .release);
+            for (ts) |t| t.join();
+            if (sh.failed.load(.acquire)) return StressError.StressThreadFailed;
+            if (owner_verdict) |v| return v;
+            // The owner's list is LIFO by design; `verify`'s per-list order
+            // check is FIFO, so hand it the owner's pops sorted (same
+            // multiset). Thieves' lists keep their order: one thief's steals
+            // come off the top, oldest first, so they rise.
+            std.mem.sort(u64, lists[0].items, {}, std.sort.asc(u64));
+            return verify(.{ .producers = 1, .consumers = thieves + 1, .per_producer = n }, lists, allocator);
+        }
+    };
+}
+
+const deque_mod = @import("deque.zig");
+
+/// The positive control: a deque whose `pop` takes the last item without
+/// racing the thieves for it (no CAS on `top`) — the bug Chase & Lev's CAS
+/// exists to prevent. Under the driver the owner and a thief both take that
+/// item: `.duplicated`.
+const BrokenDeque = struct {
+    inner: deque_mod.Deque(u64),
+
+    fn push(self: *BrokenDeque, v: u64) !void {
+        return self.inner.push(v);
+    }
+    fn steal(self: *BrokenDeque) deque_mod.Steal(u64) {
+        return self.inner.steal();
+    }
+    fn pop(self: *BrokenDeque) ?u64 {
+        const d = &self.inner;
+        const b = d.bottom.load(.monotonic) - 1;
+        d.bottom.store(b, .seq_cst);
+        const t = d.top.load(.seq_cst);
+        if (t > b) {
+            d.bottom.store(b + 1, .monotonic);
+            return null;
+        }
+        const buf = d.buffer.load(.monotonic);
+        const item = buf.slots[@as(usize, @bitCast(b)) & buf.mask].load(.monotonic);
+        if (t == b) {
+            // BUG (deliberate): no CAS — a thief may take it too. Moving
+            // `top` by hand keeps the indices consistent so the run ends.
+            d.top.store(t + 1, .seq_cst);
+            d.bottom.store(b + 1, .monotonic);
+        }
+        return item;
+    }
+};
+
+test "DEQUE DRIVER TEETH: the driver catches a pop that skips the last-item CAS (high probability)" {
+    const alloc = testing.allocator;
+    var detected = false;
+    var round: usize = 0;
+    while (round < 6 and !detected) : (round += 1) {
+        var d: BrokenDeque = .{ .inner = try deque_mod.Deque(u64).init(alloc, 64) };
+        defer d.inner.deinit();
+        const v = try DequeStress(BrokenDeque).run(&d, 4, 200_000, round, alloc);
+        detected = v != .clean;
+    }
+    try testing.expect(detected);
+}
+
+test "DEQUE: one owner (bursts, LIFO-checked pops) against 6 thieves, from capacity 64" {
+    const alloc = testing.allocator;
+    var d = try deque_mod.Deque(u64).init(alloc, 64);
+    defer d.deinit();
+    try testing.expectEqual(Verdict.clean, try DequeStress(deque_mod.Deque(u64)).run(&d, 6, 400_000, 1, alloc));
+    try testing.expect(d.isEmpty());
+}
+
+test "DEQUE: growth under theft — from capacity 2, thieves read buffers being replaced" {
+    const alloc = testing.allocator;
+    // Several rounds from the smallest buffer: each grows 2 → 64+ while
+    // thieves steal, so steals race the buffer swap (and read retired
+    // buffers) every round, not only on the first growth.
+    for (0..8) |round| {
+        var d = try deque_mod.Deque(u64).init(alloc, 2);
+        defer d.deinit();
+        try testing.expectEqual(Verdict.clean, try DequeStress(deque_mod.Deque(u64)).run(&d, 6, 50_000, 100 + round, alloc));
+        // At least one growth happened (a burst of up to 64 against 2 slots);
+        // how many depends on how fast the thieves drain — not asserted.
+        try testing.expect(d.retired.items.len >= 1);
+    }
+}

@@ -2,8 +2,9 @@
 
 //! lockfree — lock-free concurrency primitives for shared-memory worker
 //! pools: **epoch-based reclamation** (`ebr`), a **Michael-Scott MPMC
-//! queue** (`mpmc`, generic `Queue(T)`) built on it, and a **bounded,
-//! allocation-free MPMC ring** (`bounded`, Vyukov) that needs no reclamation. The immediate consumer is the in-process
+//! queue** (`mpmc`, generic `Queue(T)`) built on it, a **bounded,
+//! allocation-free MPMC ring** (`bounded`, Vyukov) that needs no reclamation,
+//! and a **Chase-Lev work-stealing deque** (`deque`). The immediate consumer is the in-process
 //! worker pool (P2 DL4); this is the workspace's first lock-free structure.
 //!
 //! **Status: core implemented.** The mechanical layer (Phase-1 scaffold) —
@@ -22,14 +23,14 @@
 //! See `SPEC.md` for the EBR-vs-hazard decision, the verification strategy
 //! (and its honest probabilistic-vs-deterministic breakdown), the exact
 //! Fable-core boundary, and the out-of-scope next increments (a lock-free
-//! hash map; hazard-pointer reclamation; a work-stealing deque).
+//! hash map; hazard-pointer reclamation).
 
 const std = @import("std");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Lock-free concurrency primitives for shared-memory worker pools — generic Michael & Scott MPMC queue + Fraser/crossbeam epoch-based reclamation under a strict seq_cst discipline, and a bounded allocation-free Vyukov MPMC ring",
+    .doc = "Lock-free concurrency primitives for shared-memory worker pools — generic Michael & Scott MPMC queue + Fraser/crossbeam epoch-based reclamation under a strict seq_cst discipline, a bounded allocation-free Vyukov MPMC ring, and a growable Chase-Lev work-stealing deque",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -44,7 +45,7 @@ pub const meta = .{
     // Internally synchronized, lock-free: the queue is safe for M producers +
     // N consumers with no mutex; EBR makes reclamation safe without one.
     .concurrency = .threadsafe,
-    .model_after = "Michael & Scott MPMC queue (PODC 1996) + Fraser/crossbeam epoch reclamation",
+    .model_after = "Michael & Scott MPMC queue (PODC 1996) + Fraser/crossbeam epoch reclamation + Chase-Lev deque (SPAA 2005)",
     .deps = .{}, // std only
 };
 
@@ -78,6 +79,10 @@ pub const BoundedQueue = bounded.BoundedQueue;
 pub const BoundedOptions = bounded.Options;
 pub const Consumers = bounded.Consumers;
 
+const deque = @import("deque.zig");
+pub const Deque = deque.Deque;
+pub const Steal = deque.Steal;
+
 const harness = @import("harness.zig");
 pub const StressConfig = harness.StressConfig;
 pub const Verdict = harness.Verdict;
@@ -93,6 +98,7 @@ test {
     _ = ebr;
     _ = mpmc;
     _ = bounded;
+    _ = deque;
     _ = harness;
 }
 
