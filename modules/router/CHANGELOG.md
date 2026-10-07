@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Tests: a fuzz harness (`src/fuzz_test.zig`, `testing.fuzz` + the deterministic
+  driver `ROUTER_FUZZ`), checked against planted mutants. No behaviour change.
 - **2026-10-07** — **BEHAVIOURAL, not breaking** (review fixes): a fallback (404/405/auto-OPTIONS/
   redirect) now picks its group by comparing the prefix segment by segment — a group or mount
   prefix with a capture (`/t/:id`, `/t/{tenant}`) scopes its fallbacks, which it never did — and

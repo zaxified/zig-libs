@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Tests: a fuzz harness (`src/fuzz_test.zig`, `testing.fuzz` + the deterministic
+  driver `REGEX_FUZZ`), checked against planted mutants; `example/main.zig` (a log filter). No
+  behaviour change.
 - **2026-10-07** — Review fixes: nested counted repetitions multiply to at most 1000, as in Go
   (`(?:(?:a{0}){1000}){2}` is `error.InvalidRepeatSize`; before, such a pattern could make the
   compiler run ~10⁹ steps); `max_depth` 1000 → 250 so compiling fits a small thread stack;

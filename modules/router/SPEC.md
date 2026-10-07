@@ -192,6 +192,16 @@ cut anything after `]` and any `:suffix`: `[::1]evil` and `a.example.com:xyz` ro
 not atomic) documented as a startup failure like every `add` error; **L4** (regex work not pruned
 by `min_reach`) accepted — linear time, a constant.
 
+**Fuzz (2026-10-07):** `src/fuzz_test.zig` — random route tables (static, `:p`/`{p}`, in-segment
+shapes, constraints, wildcards, trailing slashes) registered directly, via a group, an inline group
+and a mounted sub-router, and requests through `serveStream`; oracles: allowed statuses only, the
+matched pattern with its captures substituted rebuilds the request path exactly, no empty capture
+but a wildcard's, constraints hold, a 405's `Allow` never names the request's method, a redirect is
+the slash variant. Deterministic driver (`ROUTER_FUZZ`, testkit): 200,000 runs clean, every label
+reached (routed, 404, 405, redirect, constrained, mounted, grouped). Planted mutants: caught — a
+dropped literal check, a skipped constraint, a stale capture, an empty capture; not seen (no
+completeness reference) — a missed match, which the unit tests and the chi oracle kill.
+
 ## Backlog / deferred
 
 - ~~**Regexp constraints (`{id:[0-9]+}`)**~~ — DONE 2026-10-07 (the new `regex` module; `error.InvalidConstraint`).

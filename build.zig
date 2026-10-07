@@ -234,7 +234,7 @@ const module_list = [_]Module{
     .{ .name = "nftables", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "trie", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "fuzzysearch", .libs = &.{"storage"}, .deps = &.{"trie"}, .test_deps = &.{"testkit"} },
-    .{ .name = "regex", .libs = &.{ "format", "web" } },
+    .{ .name = "regex", .libs = &.{ "format", "web" }, .test_deps = &.{"testkit"} },
     .{ .name = "geoindex", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "readthrough", .libs = &.{"net"}, .deps = &.{"ramcache"} },
     .{ .name = "timelock_envelope", .libs = &.{"crypto"}, .deps = &.{ "tlock", "hqc", "chachapoly", "entropy" }, .test_deps = &.{"testkit"} },

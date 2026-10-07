@@ -664,6 +664,7 @@ test "invalid UTF-8 in the input reads as U+FFFD, one byte" {
 test {
     _ = syntax;
     _ = @import("go_oracle_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "robustness: random patterns and inputs compile or refuse, and match, without a trap" {

@@ -110,6 +110,16 @@ before a control character, `\x{+41}`/`\x{4_1}`/`\x+1` refused and `\x{000000041
 cost and iterator worst case are constant factors, as in Go; the capacities are tighter than Go's
 (CAPACITY, pinned); a `Matcher` points at its `Regex` (documented: do not move it).
 
+**Fuzz (2026-10-07):** `src/fuzz_test.zig` — patterns drawn from the grammar (and a share of them
+damaged byte-wise) with inputs over a small alphabet incl. invalid UTF-8; oracles: no trap,
+`isMatch` ⇔ `find`, `fullMatch` ⇒ `isMatch`, group spans inside the match, the iterator
+non-overlapping, never an empty span next to the previous, never splitting a code point, and a
+literal-only pattern matching exactly where `std.mem.indexOf` finds it. Deterministic driver
+(`REGEX_FUZZ`, testkit): 400,000 runs clean, 83 % of the patterns compiling. Planted mutants:
+caught — unanchored restart, leftmost-first cut, range search, capture restore, iterator advance
+and adjacency; not seen (pure semantics, no reference in the harness) — `_` dropped from `\w`,
+swapped split priority, both killed by the Go oracle.
+
 ## Backlog / deferred
 
 - **Unicode property classes `\pN`, `\p{Greek}`, `\PL`** *(survey 2026-10-07)* — Go users write `\p{L}` for "a letter"; needs the Unicode category and script tables (a generated, size-conscious table; comptime-selectable). Today `error.UnsupportedUnicodeClass`. Fits §2.

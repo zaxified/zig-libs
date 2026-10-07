@@ -4357,6 +4357,7 @@ test "PatternCaptures: every capture kind, in order" {
 
 test {
     _ = @import("chi_oracle_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 // ── regexp constraints (chi's `{id:[0-9]+}`, 2026-10-07) ─────────────────────
