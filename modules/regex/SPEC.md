@@ -37,7 +37,11 @@ libraries documents one); a compile cheap enough to run per call (stack scratch,
 a short pattern). **Where we are behind:** Unicode property classes; `ReplaceAll`/`Expand`/`Split`/
 `QuoteMeta`; leftmost-longest; speed on dense matches — a Pike VM with an anchoring and first-byte
 prefilter, but no DFA and no literal-string prefilter (→ Backlog). Unicode tables are 15.0 (Go
-1.26's); quangdn42/regex.zig carries 17.0.
+1.26's); quangdn42/regex.zig carries 17.0. **Head-to-head with quangdn42/regex.zig** (bxp's
+engine, commit `a22a2e68`, both through their public APIs, 2026-10-07, x86-64 ReleaseFast,
+same answers on every case): per row with the pattern compiled per call (bxp's REGEX_MATCH /
+REGEX_EXTRACT, nine template patterns × eight memo rows) ours/quangd = 0.24 (0.14–0.43 per
+case); precompiled find-all over 83 KiB = 0.32 overall, behind only on `#([0-9]+)` (1.80).
 
 ## What this module is, and what it is not
 
@@ -143,7 +147,7 @@ swapped split priority, both killed by the Go oracle.
 - **`ReplaceAll` / `Expand` (`$1`, `${name}`), `Split`, `QuoteMeta`** *(survey 2026-10-07)* — Go API users reach for them; small, on top of `Matcher`. Fits §2.
 - **Leftmost-longest (`CompilePOSIX`, `Longest()`)** *(survey 2026-10-07)*. Fits §2.
 - **Speed: a literal-string prefilter (`INV-`, `id=` — today only the first byte), an ASCII bitmap per class instead of the binary search, one-pass and bit-state engines, a lazy DFA with a caller-owned cache** *(survey 2026-10-07; anchoring + first-byte prefilter done 2026-10-07)* — dense matches (`[A-Z]+`) run at 50–60 MB/s. Fits §2 with caller-owned scratch.
-- **Head-to-head with quangdn42/regex.zig, bxp's engine today** *(2026-10-07)* — the target is comparable speed on bxp's workload before bxp switches; the benchmark (both engines through their public APIs) needs the user's consent to run the foreign code, not given yet.
+- **Single-literal-start find-all** *(2026-10-07, head-to-head)* — `#([0-9]+)` over long text: quangdn42/regex.zig 1.8× faster (~0.2 µs fixed cost per `find` in our VM: `addThread` + list setup, 2,000 thread additions per 85 KiB). Every other measured case we lead (below).
 - **`RegexSet`, a `std.Io.Reader` front end** *(survey 2026-10-07)* — rarer asks.
 - **Sibling modules that can now adopt it** *(2026-10-07)* — `validate` (`Pattern.matcher` takes a caller-supplied matcher today; a `regex` default), `jsonshape` (RFC 9535 `match()`/`search()` need I-Regexp, an RE2 subset), `tsdb` (regex label matchers), `probe` (`expect` regex). Each is that module's own backlog item; listed here so the dependency is visible.
 

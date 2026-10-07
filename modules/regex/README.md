@@ -100,7 +100,8 @@ nine template patterns over 30–70-byte bank memo rows, compiled per row:
 
 Precompiled, `Matcher.iterator` over 83 KiB of such rows runs at 50–60 MB/s for a class that
 matches every few bytes (`[A-Z]+`) and 100–680 MB/s when a literal byte starts the match
-(`id=…`, `#…`). A plain Pike VM still: no DFA (SPEC Backlog).
+(`id=…`, `#…`). A plain Pike VM still: no DFA (SPEC Backlog). Against quangdn42/regex.zig on the
+same workload: ~4× faster per row, ~3× on find-all overall (SPEC "Compared with").
 
 ## Verification
 
