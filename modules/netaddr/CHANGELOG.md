@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **Added, not breaking: Go `net/netip` + `go4.org/netipx`
+  parity; scope core → parity.** `Ip` gains `compare`/`lessThan`, `next`/`prev`,
+  `bitLen`, `prefix`, `asSlice`/`fromSlice`, `fromStd`/`toStd`,
+  `isGlobalUnicast`, `isLinkLocalMulticast`, `isInterfaceLocalMulticast`,
+  well-known constants and a `format` method; new `formatIpExpanded`; zones via
+  `Zone`/`ZonedIp`/`parseIpZoned`/`formatIpZoned` (`Ip` itself stays zone-less);
+  `AddrPort` with `parseAddrPort`/`formatAddrPort`/`compare`/`fromStd`/`toStd`;
+  `Prefix.compare` (netip order), `compareLengthFirst` (netipx order),
+  `lastAddr`, `format`; `parsePrefixOrAddr`; `IpRange` gains `isValid`,
+  `contains`, `overlaps`, `toPrefix`, `prefixes`, `format`, plus
+  `parseIpRange`/`formatIpRange`; new `IpSet` + `IpSetBuilder`. Replayed
+  against Go 1.26 / netipx by `tools/go_netip_oracle` → `src/netip_vectors.zig`.
+  Found a netipx defect (`RemoveFreePrefix` can answer ok with an invalid
+  prefix), not copied. Divergences listed in README/SPEC: zone ≤ 31 bytes,
+  no leading-zero port, `isPrivate` stays RFC 1918 only.
+
 - **2026-10-05** — Anchoring only, no code change: evidence MIXED → EXTERNAL.
   The RFC 6724 half (self-tested until now) is replayed against glibc 2.43
   `getaddrinfo` (6240 destination orderings, gai.conf = the RFC 6724 table) and

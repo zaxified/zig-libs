@@ -7,7 +7,10 @@
 //! operations (`Prefix`: mask/contains/overlap, host math, supernet, address
 //! iteration; `IpRange` with `summarize` and `mergePrefixes`), address
 //! scope/policy classification, and the RFC 6724 "which address do I connect
-//! to first" ordering that `http`, `dns` and `icmp` build on.
+//! to first" ordering that `http`, `dns` and `icmp` build on. Beside that,
+//! the rest of Go `net/netip` + `go4.org/netipx`: zones (`ZonedIp`),
+//! `AddrPort`, address ordering and next/prev, `IpRange` and the queryable
+//! `IpSet` built by `IpSetBuilder`.
 //!
 //! The RFC 6724 logic is clean-room from the RFC, covering
 //! the full destination rule set, cross-checked against Go's
@@ -20,8 +23,9 @@
 //! from their source).
 //!
 //! Scalar operations never allocate and work on caller-provided
-//! buffers/slices; only the slice-returning `summarize` and `mergePrefixes`
-//! allocate, via a caller-passed allocator.
+//! buffers/slices; only the slice-returning `summarize`, `mergePrefixes`,
+//! `IpRange.prefixes` and the `IpSet` family allocate, via a caller-passed
+//! allocator.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -29,7 +33,7 @@ const builtin = @import("builtin");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "IP parse/format (RFC 5952) + RFC 6724 source/dest selection + CIDR/Prefix ops (contains/overlaps/supernet, range↔prefix)",
+    .doc = "IP parse/format (RFC 5952) + RFC 6724 source/dest selection + CIDR/Prefix ops + Go netip/netipx parity (zones, AddrPort, ordering, IpRange, IpSet)",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -38,7 +42,7 @@ pub const meta = .{
     .platform = .any, // pure logic; `systemSource` helper is Linux-only
     .role = .util,
     .concurrency = .reentrant,
-    .model_after = "Go net/addrselect.go + glibc getaddrinfo (RFC 6724); Go net/netip.Prefix + go4.org/netipx (CIDR/prefix ops)",
+    .model_after = "Go net/addrselect.go + glibc getaddrinfo (RFC 6724); Go net/netip + go4.org/netipx (CIDR/prefix ops, zones, AddrPort, IPRange, IPSet)",
     .deps = .{}, // std only
 };
 
@@ -147,6 +151,132 @@ pub const Ip = union(enum) {
             .v6 => false,
         };
     }
+
+    /// Global unicast in Go `netip`'s sense: anything that is not
+    /// unspecified, loopback, multicast, link-local unicast or the v4
+    /// limited broadcast `255.255.255.255`. Private (RFC 1918) and
+    /// unique-local (`fc00::/7`) addresses count — "global" here is about the
+    /// address kind, not reachability. v4-mapped addresses are unwrapped
+    /// first.
+    pub fn isGlobalUnicast(ip: Ip) bool {
+        const u = ip.unmap();
+        if (u == .v4 and std.mem.allEqual(u8, &u.v4, 0xff)) return false;
+        return !(u.isUnspecified() or u.isLoopback() or u.isMulticast() or u.isLinkLocalUnicast());
+    }
+
+    /// Link-local multicast: `224.0.0.0/24` (also when IPv4-mapped) or an
+    /// IPv6 multicast address of scope 2 (`ffx2::/16`).
+    pub fn isLinkLocalMulticast(ip: Ip) bool {
+        return switch (ip.unmap()) {
+            .v4 => |q| q[0] == 224 and q[1] == 0 and q[2] == 0,
+            .v6 => |b| b[0] == 0xff and (b[1] & 0x0f) == 0x02,
+        };
+    }
+
+    /// IPv6 interface-local multicast, scope 1 (`ffx1::/16`). No IPv4
+    /// counterpart.
+    pub fn isInterfaceLocalMulticast(ip: Ip) bool {
+        return switch (ip) {
+            .v4 => false,
+            .v6 => |b| b[0] == 0xff and (b[1] & 0x0f) == 0x01,
+        };
+    }
+
+    /// Address width: 32 for v4, 128 for v6 (Go `BitLen`).
+    pub fn bitLen(ip: Ip) u8 {
+        return widthOf(ip);
+    }
+
+    /// Total order like Go `netip.Addr.Compare`: every v4 address sorts
+    /// before every v6 one (an IPv4-mapped address is v6), then numerically.
+    pub fn compare(a: Ip, b: Ip) std.math.Order {
+        const fa = std.meta.activeTag(a);
+        const fb = std.meta.activeTag(b);
+        if (fa != fb) return if (fa == .v4) .lt else .gt;
+        return std.math.order(ipToInt(a), ipToInt(b));
+    }
+
+    /// `compare(a, b) == .lt`, shaped for `std.sort` (`lessThan(ctx, a, b)`).
+    pub fn lessThan(_: void, a: Ip, b: Ip) bool {
+        return a.compare(b) == .lt;
+    }
+
+    /// The next address in the same family; null after the last one
+    /// (`255.255.255.255`, `ffff:…:ffff`). Never crosses families: the
+    /// successor of `::ffff:255.255.255.255` is `::1:0:0:0`.
+    pub fn next(ip: Ip) ?Ip {
+        const v = ipToInt(ip);
+        if (v == hostMask(widthOf(ip), 0)) return null;
+        return ipFromInt(std.meta.activeTag(ip), v + 1);
+    }
+
+    /// The previous address in the same family; null before `0.0.0.0` / `::`.
+    pub fn prev(ip: Ip) ?Ip {
+        const v = ipToInt(ip);
+        if (v == 0) return null;
+        return ipFromInt(std.meta.activeTag(ip), v - 1);
+    }
+
+    /// The masked prefix of length `bits` containing `ip` (Go
+    /// `Addr.Prefix`); null when `bits` exceeds the family width.
+    pub fn prefix(ip: Ip, bits: u8) ?Prefix {
+        if (bits > widthOf(ip)) return null;
+        return (Prefix{ .addr = ip, .bits = bits }).masked();
+    }
+
+    /// The raw bytes: 4 for v4, 16 for v6 (Go `AsSlice`; with `fromSlice`
+    /// the binary form Go's `MarshalBinary` writes for a zone-less address).
+    /// Borrows: the slice points into `ip.*`, so call it on a variable that
+    /// outlives the slice, not on a temporary.
+    pub fn asSlice(ip: *const Ip) []const u8 {
+        return switch (ip.*) {
+            .v4 => |*q| q,
+            .v6 => |*b| b,
+        };
+    }
+
+    /// 4 bytes → v4, 16 bytes → v6 (no unmapping), anything else → null
+    /// (Go `AddrFromSlice`).
+    pub fn fromSlice(bytes: []const u8) ?Ip {
+        return switch (bytes.len) {
+            4 => .{ .v4 = bytes[0..4].* },
+            16 => .{ .v6 = bytes[0..16].* },
+            else => null,
+        };
+    }
+
+    /// The address part of a `std.Io.net.IpAddress` (port and interface
+    /// dropped; `AddrPort.fromStd` keeps them). Not unmapped: a v4-mapped
+    /// `ip6` stays `.v6`, as everywhere in this module.
+    pub fn fromStd(a: std.Io.net.IpAddress) Ip {
+        return switch (a) {
+            .ip4 => |x| .{ .v4 = x.bytes },
+            .ip6 => |x| .{ .v6 = x.bytes },
+        };
+    }
+
+    /// A `std.Io.net.IpAddress` for `ip` and `port` (no interface).
+    pub fn toStd(ip: Ip, port: u16) std.Io.net.IpAddress {
+        return switch (ip) {
+            .v4 => |q| .{ .ip4 = .{ .bytes = q, .port = port } },
+            .v6 => |b| .{ .ip6 = .{ .bytes = b, .port = port } },
+        };
+    }
+
+    /// `{f}` formatting: the `formatIp` text.
+    pub fn format(ip: Ip, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var buf: [max_ip_text_len]u8 = undefined;
+        try w.writeAll(formatIp(ip, &buf));
+    }
+
+    pub const ipv4_unspecified: Ip = .{ .v4 = @splat(0) };
+    pub const ipv4_broadcast: Ip = .{ .v4 = @splat(0xff) };
+    pub const ipv6_unspecified: Ip = .{ .v6 = @splat(0) };
+    pub const ipv6_loopback: Ip = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} };
+    /// `ff02::1`.
+    pub const ipv6_link_local_all_nodes: Ip = .{ .v6 = [_]u8{ 0xff, 0x02 } ++ [_]u8{0} ** 13 ++ [_]u8{1} };
+    /// `ff02::2`.
+    pub const ipv6_link_local_all_routers: Ip = .{ .v6 = [_]u8{ 0xff, 0x02 } ++ [_]u8{0} ** 13 ++ [_]u8{2} };
 
     fn isV4Mapped(b: [16]u8) bool {
         return std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff;
@@ -322,6 +452,235 @@ pub fn formatIp(ip: Ip, buf: *[max_ip_text_len]u8) []const u8 {
             return buf[0..w];
         },
     }
+}
+
+/// Enough for any output of `formatIpExpanded` (8 groups of 4 + 7 colons).
+pub const max_ip_expanded_text_len = 39;
+
+/// Format with no compression (Go `StringExpanded`): v4 as `formatIp`,
+/// every v6 address — v4-mapped included — as eight 4-digit lowercase hex
+/// groups, `2001:0db8:0000:0000:0000:0000:0000:0001`.
+pub fn formatIpExpanded(ip: Ip, buf: *[max_ip_expanded_text_len]u8) []const u8 {
+    switch (ip) {
+        .v4 => |q| return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ q[0], q[1], q[2], q[3] }) catch unreachable,
+        .v6 => |b| {
+            const hex = "0123456789abcdef";
+            var w: usize = 0;
+            for (b, 0..) |byte, k| {
+                if (k != 0 and k % 2 == 0) {
+                    buf[w] = ':';
+                    w += 1;
+                }
+                buf[w] = hex[byte >> 4];
+                buf[w + 1] = hex[byte & 0xf];
+                w += 2;
+            }
+            return buf[0..w];
+        },
+    }
+}
+
+// ── zones (RFC 4007 §11 scoped literals) ────────────────────────────────────
+//
+// Go `netip.Addr` carries the zone inside the address; here the zone-less
+// `Ip` stays the substrate every other module switches on, and a zone rides
+// next to it in `ZonedIp` / `AddrPort`. The zone is stored inline (no
+// lifetime tied to the parsed text) and capped at `max_zone_len` bytes:
+// interface names are at most 15 (IFNAMSIZ − 1) and a numeric scope id at
+// most 10 digits, so the cap refuses nothing a kernel would accept — Go
+// accepts any length.
+
+/// Longest zone `Zone` holds.
+pub const max_zone_len = 31;
+
+/// An IPv6 zone (`eth0`, `3`): any non-empty text up to `max_zone_len`
+/// bytes, opaque as in Go — not resolved, not checked against interfaces.
+pub const Zone = struct {
+    len: u8 = 0,
+    buf: [max_zone_len]u8 = @splat(0),
+
+    pub const none: Zone = .{};
+
+    /// The zone for `text`; `none` for empty text, null when longer than
+    /// `max_zone_len`.
+    pub fn fromSlice(text: []const u8) ?Zone {
+        if (text.len > max_zone_len) return null;
+        var z: Zone = .{ .len = @intCast(text.len) };
+        @memcpy(z.buf[0..text.len], text);
+        return z;
+    }
+
+    pub fn slice(z: *const Zone) []const u8 {
+        return z.buf[0..z.len];
+    }
+
+    pub fn isNone(z: Zone) bool {
+        return z.len == 0;
+    }
+
+    pub fn eql(a: Zone, b: Zone) bool {
+        return std.mem.eql(u8, a.slice(), b.slice());
+    }
+
+    /// Byte-wise order; no zone sorts first (Go compares zone strings).
+    pub fn order(a: Zone, b: Zone) std.math.Order {
+        return std.mem.order(u8, a.slice(), b.slice());
+    }
+};
+
+/// An address with an optional zone (Go `netip.Addr` as a whole). A v4
+/// address never carries one: `init` drops it, as Go `WithZone` does.
+pub const ZonedIp = struct {
+    ip: Ip,
+    zone: Zone = .none,
+
+    /// `ip` with zone `zone_text` (empty = no zone; ignored for v4, like Go
+    /// `WithZone`); null when the zone is longer than `max_zone_len`.
+    pub fn init(ip: Ip, zone_text: []const u8) ?ZonedIp {
+        if (ip == .v4) return .{ .ip = ip };
+        return .{ .ip = ip, .zone = Zone.fromSlice(zone_text) orelse return null };
+    }
+
+    pub fn eql(a: ZonedIp, b: ZonedIp) bool {
+        return a.ip.eql(b.ip) and a.zone.eql(b.zone);
+    }
+
+    /// `Ip.compare`, then the zone (Go `Addr.Compare`).
+    pub fn compare(a: ZonedIp, b: ZonedIp) std.math.Order {
+        const o = a.ip.compare(b.ip);
+        return if (o != .eq) o else a.zone.order(b.zone);
+    }
+
+    /// `{f}` formatting: the `formatIpZoned` text.
+    pub fn format(z: ZonedIp, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var buf: [max_zoned_ip_text_len]u8 = undefined;
+        try w.writeAll(formatIpZoned(z, &buf));
+    }
+};
+
+/// Parse an address that may carry an IPv6 zone (`fe80::1%eth0`), like Go
+/// `netip.ParseAddr`: the zone is everything after the first `%`, any bytes,
+/// non-empty; a zone on an IPv4 literal is refused. Null on malformed input
+/// or a zone longer than `max_zone_len`.
+pub fn parseIpZoned(text: []const u8) ?ZonedIp {
+    const pct = std.mem.indexOfScalar(u8, text, '%') orelse
+        return .{ .ip = parseIp(text) orelse return null };
+    const zone_text = text[pct + 1 ..];
+    if (zone_text.len == 0) return null;
+    const b = parseIp6(text[0..pct]) orelse return null;
+    return .{ .ip = .{ .v6 = b }, .zone = Zone.fromSlice(zone_text) orelse return null };
+}
+
+/// Enough for any output of `formatIpZoned`.
+pub const max_zoned_ip_text_len = max_ip_text_len + 1 + max_zone_len;
+
+/// `formatIp`, then `%zone` when there is one (never after a v4 address,
+/// which cannot carry one — a hand-built value that does prints without it).
+pub fn formatIpZoned(z: ZonedIp, buf: *[max_zoned_ip_text_len]u8) []const u8 {
+    const ip_text = formatIp(z.ip, buf[0..max_ip_text_len]);
+    if (z.zone.isNone() or z.ip == .v4) return ip_text;
+    buf[ip_text.len] = '%';
+    const zs = z.zone.slice();
+    @memcpy(buf[ip_text.len + 1 ..][0..zs.len], zs);
+    return buf[0 .. ip_text.len + 1 + zs.len];
+}
+
+// ── address + port ──────────────────────────────────────────────────────────
+
+/// A numeric address, its zone and a port (Go `netip.AddrPort`). Unlike
+/// `parseHostPort`, which splits text and leaves the host unparsed, this is
+/// a value: the address is parsed, and no name is ever accepted.
+pub const AddrPort = struct {
+    ip: Ip,
+    port: u16,
+    zone: Zone = .none,
+
+    pub fn eql(a: AddrPort, b: AddrPort) bool {
+        return a.port == b.port and a.ip.eql(b.ip) and a.zone.eql(b.zone);
+    }
+
+    /// Address (with zone), then port (Go `AddrPort.Compare`).
+    pub fn compare(a: AddrPort, b: AddrPort) std.math.Order {
+        const o = (ZonedIp{ .ip = a.ip, .zone = a.zone }).compare(.{ .ip = b.ip, .zone = b.zone });
+        return if (o != .eq) o else std.math.order(a.port, b.port);
+    }
+
+    /// From a `std.Io.net.IpAddress`. A non-zero IPv6 interface index
+    /// becomes a numeric zone (`%3`); the flow label is dropped.
+    pub fn fromStd(a: std.Io.net.IpAddress) AddrPort {
+        return switch (a) {
+            .ip4 => |x| .{ .ip = .{ .v4 = x.bytes }, .port = x.port },
+            .ip6 => |x| blk: {
+                var ap: AddrPort = .{ .ip = .{ .v6 = x.bytes }, .port = x.port };
+                if (!x.interface.isNone()) {
+                    const s = std.fmt.bufPrint(&ap.zone.buf, "{d}", .{x.interface.index}) catch unreachable; // ≤ 10 digits
+                    ap.zone.len = @intCast(s.len);
+                }
+                break :blk ap;
+            },
+        };
+    }
+
+    /// To a `std.Io.net.IpAddress`. A numeric zone becomes the interface
+    /// index; an interface NAME needs the OS (`std.Io.net.Interface.Name
+    /// .resolve`), which this pure module does not call — `ZoneNotNumeric`.
+    /// Only the form `fromStd` writes counts as numeric — plain decimal
+    /// 1..2^32−1, no sign, no leading zero — so a round trip never changes
+    /// the zone text; `0` (= no interface in std), `+5` or `007` is refused.
+    pub fn toStd(ap: AddrPort) error{ZoneNotNumeric}!std.Io.net.IpAddress {
+        var a = ap.ip.toStd(ap.port);
+        if (!ap.zone.isNone() and a == .ip6) {
+            const z = ap.zone.slice();
+            if (z[0] < '1' or z[0] > '9') return error.ZoneNotNumeric;
+            for (z) |c| if (c < '0' or c > '9') return error.ZoneNotNumeric;
+            const index = std.fmt.parseInt(u32, z, 10) catch return error.ZoneNotNumeric;
+            a.ip6.interface = .{ .index = index };
+        }
+        return a;
+    }
+
+    /// `{f}` formatting: the `formatAddrPort` text.
+    pub fn format(ap: AddrPort, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var buf: [max_addr_port_text_len]u8 = undefined;
+        try w.writeAll(formatAddrPort(ap, &buf));
+    }
+};
+
+/// Parse `a.b.c.d:port` or `[v6]:port` / `[v6%zone]:port` (Go
+/// `netip.ParseAddrPort`): the split is at the last `:`, brackets are
+/// required around and only allowed around IPv6, the port is required.
+/// The port follows this module's `parsePort` (decimal, no leading zero) —
+/// Go also takes `080`. Null on malformed input.
+pub fn parseAddrPort(text: []const u8) ?AddrPort {
+    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return null;
+    const port = parsePort(text[colon + 1 ..]) orelse return null;
+    const host = text[0..colon];
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') {
+        const z = parseIpZoned(host[1 .. host.len - 1]) orelse return null;
+        if (z.ip != .v6) return null; // brackets only around IPv6
+        return .{ .ip = z.ip, .zone = z.zone, .port = port };
+    }
+    // Unbracketed: IPv4 only (an IPv6 literal would be ambiguous).
+    return .{ .ip = .{ .v4 = parseIp4(host) orelse return null }, .port = port };
+}
+
+/// Enough for any output of `formatAddrPort` (`[` addr%zone `]:` 5 digits).
+pub const max_addr_port_text_len = 1 + max_zoned_ip_text_len + 2 + 5;
+
+/// `a.b.c.d:port`, or `[v6%zone]:port` for every IPv6 address.
+pub fn formatAddrPort(ap: AddrPort, buf: *[max_addr_port_text_len]u8) []const u8 {
+    var w: usize = 0;
+    if (ap.ip == .v6) {
+        buf[0] = '[';
+        w = 1;
+    }
+    w += formatIpZoned(.{ .ip = ap.ip, .zone = ap.zone }, buf[w..][0..max_zoned_ip_text_len]).len;
+    if (ap.ip == .v6) {
+        buf[w] = ']';
+        w += 1;
+    }
+    w += (std.fmt.bufPrint(buf[w..], ":{d}", .{ap.port}) catch unreachable).len;
+    return buf[0..w];
 }
 
 // ── host:port splitting ─────────────────────────────────────────────────────
@@ -554,6 +913,48 @@ pub const Prefix = struct {
         };
     }
 
+    /// The last address of the prefix (all host bits set; netipx
+    /// `PrefixLastIP`). For a v4 prefix this is the broadcast address.
+    pub fn lastAddr(p: Prefix) Ip {
+        return p.range().to;
+    }
+
+    /// Go `netip.Prefix.Compare`: family (v4 first), then the masked
+    /// address, then the length, then the unmasked address. A hand-built
+    /// `bits` past the family width is clamped, as by every `Prefix`
+    /// operation, so `{1.2.3.4, 40}` compares equal to `{1.2.3.4, 32}`
+    /// although `eql` (field-wise) says otherwise; Go has no such value
+    /// (it is "invalid" and sorts first).
+    pub fn compare(a: Prefix, b: Prefix) std.math.Order {
+        const fa = std.meta.activeTag(a.addr);
+        const fb = std.meta.activeTag(b.addr);
+        if (fa != fb) return if (fa == .v4) .lt else .gt;
+        const ma = a.masked();
+        const mb = b.masked();
+        const o1 = std.math.order(ipToInt(ma.addr), ipToInt(mb.addr));
+        if (o1 != .eq) return o1;
+        const o2 = std.math.order(ma.bits, mb.bits);
+        if (o2 != .eq) return o2;
+        return std.math.order(ipToInt(a.addr), ipToInt(b.addr));
+    }
+
+    /// netipx `ComparePrefix`: family (v4 first), then the length (shorter
+    /// first), then the address. `bits` clamped as in `compare`.
+    pub fn compareLengthFirst(a: Prefix, b: Prefix) std.math.Order {
+        const fa = std.meta.activeTag(a.addr);
+        const fb = std.meta.activeTag(b.addr);
+        if (fa != fb) return if (fa == .v4) .lt else .gt;
+        const o = std.math.order(@min(a.bits, a.width()), @min(b.bits, b.width()));
+        if (o != .eq) return o;
+        return std.math.order(ipToInt(a.addr), ipToInt(b.addr));
+    }
+
+    /// `{f}` formatting: the `formatPrefix` text.
+    pub fn format(p: Prefix, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var buf: [max_prefix_text_len]u8 = undefined;
+        try w.writeAll(formatPrefix(p, &buf));
+    }
+
     /// Iterate every address in the prefix, network to last address.
     /// Caller-driven and allocation-free; host bits are masked away first.
     pub fn addresses(p: Prefix) AddrIterator {
@@ -605,9 +1006,94 @@ pub fn formatPrefix(p: Prefix, buf: *[max_prefix_text_len]u8) []const u8 {
     return buf[0 .. ip_text.len + bits_text.len];
 }
 
-/// An inclusive address range. Well-formed when both ends share a family and
-/// `from <= to`; `summarize` rejects anything else with `InvalidRange`.
-pub const IpRange = struct { from: Ip, to: Ip };
+/// Parse an address or a prefix, keeping only the address (netipx
+/// `ParsePrefixOrAddr`): `192.0.2.1` and `192.0.2.1/24` both give
+/// `192.0.2.1` — the address as written, host bits kept. A bare address
+/// may carry a zone (`parseIpZoned`); a prefix may not (`parsePrefix`).
+pub fn parsePrefixOrAddr(text: []const u8) ?ZonedIp {
+    if (std.mem.indexOfScalar(u8, text, '/') != null) return .{ .ip = (parsePrefix(text) orelse return null).addr };
+    return parseIpZoned(text);
+}
+
+/// An inclusive address range (netipx `IPRange`). Well-formed when both
+/// ends share a family and `from <= to` (`isValid`); every query answers
+/// false/null for a malformed one, `summarize` rejects it with
+/// `InvalidRange`.
+pub const IpRange = struct {
+    from: Ip,
+    to: Ip,
+
+    pub fn isValid(r: IpRange) bool {
+        return std.meta.activeTag(r.from) == std.meta.activeTag(r.to) and
+            ipToInt(r.from) <= ipToInt(r.to);
+    }
+
+    pub fn eql(a: IpRange, b: IpRange) bool {
+        return a.from.eql(b.from) and a.to.eql(b.to);
+    }
+
+    /// True when `ip` lies in `[from, to]`; always false across families.
+    pub fn contains(r: IpRange, ip: Ip) bool {
+        if (!r.isValid() or std.meta.activeTag(ip) != std.meta.activeTag(r.from)) return false;
+        const v = ipToInt(ip);
+        return ipToInt(r.from) <= v and v <= ipToInt(r.to);
+    }
+
+    /// True when the ranges share an address; false across families or
+    /// when either is malformed.
+    pub fn overlaps(a: IpRange, b: IpRange) bool {
+        if (!a.isValid() or !b.isValid()) return false;
+        if (std.meta.activeTag(a.from) != std.meta.activeTag(b.from)) return false;
+        return ipToInt(a.from) <= ipToInt(b.to) and ipToInt(b.from) <= ipToInt(a.to);
+    }
+
+    /// The range as one prefix when it is exactly one (netipx
+    /// `IPRange.Prefix`); null otherwise or when malformed.
+    pub fn toPrefix(r: IpRange) ?Prefix {
+        if (!r.isValid()) return null;
+        const fam = std.meta.activeTag(r.from);
+        const from = ipToInt(r.from);
+        const to = ipToInt(r.to);
+        const w = widthOf(r.from);
+        const h = rangeBlockBits(w, from, to);
+        if (from + hostMask(w, w - h) != to) return null;
+        return .{ .addr = ipFromInt(fam, from), .bits = w - h };
+    }
+
+    /// The minimal prefix list covering the range — `summarize` (netipx
+    /// `IPRange.Prefixes`). Caller owns the slice.
+    pub fn prefixes(r: IpRange, gpa: std.mem.Allocator) SummarizeError![]Prefix {
+        return summarize(gpa, r);
+    }
+
+    /// `{f}` formatting: the `formatIpRange` text.
+    pub fn format(r: IpRange, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var buf: [max_ip_range_text_len]u8 = undefined;
+        try w.writeAll(formatIpRange(r, &buf));
+    }
+};
+
+/// Parse `from-to` (netipx `ParseIPRange`): two addresses split at the first
+/// `-`, no spaces, same family, `from <= to`. As in netipx a zone on either
+/// end is accepted and dropped — a range is zone-less. Null otherwise.
+pub fn parseIpRange(text: []const u8) ?IpRange {
+    const dash = std.mem.indexOfScalar(u8, text, '-') orelse return null;
+    const from = parseIpZoned(text[0..dash]) orelse return null;
+    const to = parseIpZoned(text[dash + 1 ..]) orelse return null;
+    const r: IpRange = .{ .from = from.ip, .to = to.ip };
+    return if (r.isValid()) r else null;
+}
+
+/// Enough for any output of `formatIpRange`.
+pub const max_ip_range_text_len = 2 * max_ip_text_len + 1;
+
+/// `from-to`, both ends per `formatIp` (the form `parseIpRange` reads).
+pub fn formatIpRange(r: IpRange, buf: *[max_ip_range_text_len]u8) []const u8 {
+    const a = formatIp(r.from, buf[0..max_ip_text_len]);
+    buf[a.len] = '-';
+    const b = formatIp(r.to, buf[a.len + 1 ..][0..max_ip_text_len]);
+    return buf[0 .. a.len + 1 + b.len];
+}
 
 /// Caller-driven address iterator (see `Prefix.addresses`).
 pub const AddrIterator = struct {
@@ -658,24 +1144,25 @@ fn appendRangePrefixes(
     };
     var cur = from;
     while (true) {
-        // Host bits of the block: limited by the alignment of `cur`
-        // (trailing zeros) and by how much of the range remains.
-        const tz: u8 = @min(w, @ctz(cur));
-        const span = to - cur; // invariant: cur <= to
-        const avail: u8 = if (span == std.math.maxInt(u128))
-            128 // whole v6 space; span + 1 would overflow
-        else
-            @intCast(127 - @clz(span + 1)); // floor(log2(addresses left))
-        const h = @min(tz, avail);
-        const block_hosts: u128 = if (h == 128)
-            std.math.maxInt(u128)
-        else
-            (@as(u128, 1) << @intCast(h)) - 1;
+        const h = rangeBlockBits(w, cur, to);
         try out.append(gpa, .{ .addr = ipFromInt(fam, cur), .bits = w - h });
-        const block_last = cur + block_hosts; // cur is 2^h-aligned: no overflow
+        const block_last = cur + hostMask(w, w - h); // cur is 2^h-aligned: no overflow
         if (block_last >= to) return;
         cur = block_last + 1;
     }
+}
+
+/// Host bits of the largest block that starts at `cur` and fits in
+/// `[cur, to]` (`cur <= to`, both within a `w`-bit family): limited by the
+/// alignment of `cur` (trailing zeros) and by how much of the range remains.
+fn rangeBlockBits(w: u8, cur: u128, to: u128) u8 {
+    const tz: u8 = @min(w, @ctz(cur));
+    const span = to - cur;
+    const avail: u8 = if (span == std.math.maxInt(u128))
+        128 // whole v6 space; span + 1 would overflow
+    else
+        @intCast(127 - @clz(span + 1)); // floor(log2(addresses left))
+    return @min(tz, avail);
 }
 
 const RangeKey = struct { fam: IpFamily, from: u128, to: u128 };
@@ -723,6 +1210,372 @@ pub fn mergePrefixes(gpa: std.mem.Allocator, prefixes: []const Prefix) error{Out
         i = j;
     }
     return out.toOwnedSlice(gpa);
+}
+
+// ── address sets ────────────────────────────────────────────────────────────
+//
+// netipx `IPSet` / `IPSetBuilder`, behaviour only (clean-room). A set is a
+// sorted list of disjoint, non-adjacent inclusive ranges — v4 before v6,
+// each family in address order — so membership is a binary search and
+// every set operation a linear merge. The v4/v6 split is strict as
+// everywhere here: a v4 set never contains an IPv4-mapped v6 address.
+
+/// A queryable, immutable set of addresses. Build one with `IpSetBuilder`;
+/// `IpSet.empty` is the empty set. Owns its storage (`deinit`); read-only
+/// queries are safe from many threads at once.
+pub const IpSet = struct {
+    /// Sorted, disjoint, non-adjacent; v4 spans before v6. Internal — read
+    /// through `rangeCount`/`rangeAt`, `ranges` or `prefixes`.
+    spans: []const RangeKey = &.{},
+
+    pub const empty: IpSet = .{};
+
+    pub fn deinit(s: *IpSet, gpa: std.mem.Allocator) void {
+        gpa.free(s.spans);
+        s.* = .empty;
+    }
+
+    pub fn isEmpty(s: IpSet) bool {
+        return s.spans.len == 0;
+    }
+
+    /// Number of maximal ranges in the set.
+    pub fn rangeCount(s: IpSet) usize {
+        return s.spans.len;
+    }
+
+    /// The `i`-th maximal range (`i < rangeCount()`), in set order.
+    pub fn rangeAt(s: IpSet, i: usize) IpRange {
+        const k = s.spans[i];
+        return .{ .from = ipFromInt(k.fam, k.from), .to = ipFromInt(k.fam, k.to) };
+    }
+
+    /// Every maximal range, in order (netipx `Ranges`). Caller owns it.
+    pub fn ranges(s: IpSet, gpa: std.mem.Allocator) error{OutOfMemory}![]IpRange {
+        const out = try gpa.alloc(IpRange, s.spans.len);
+        for (out, 0..) |*r, i| r.* = s.rangeAt(i);
+        return out;
+    }
+
+    /// The minimal prefix list equal to the set, in order (netipx
+    /// `Prefixes`). Caller owns it.
+    pub fn prefixes(s: IpSet, gpa: std.mem.Allocator) error{OutOfMemory}![]Prefix {
+        var out: std.ArrayList(Prefix) = .empty;
+        errdefer out.deinit(gpa);
+        for (s.spans) |k| try appendRangePrefixes(gpa, &out, k.fam, k.from, k.to);
+        return out.toOwnedSlice(gpa);
+    }
+
+    pub fn contains(s: IpSet, ip: Ip) bool {
+        const fam = std.meta.activeTag(ip);
+        const v = ipToInt(ip);
+        const i = firstSpanEndingAtOrAfter(s.spans, fam, v);
+        return i < s.spans.len and s.spans[i].fam == fam and s.spans[i].from <= v;
+    }
+
+    /// True when every address of `r` is in the set; false for a malformed
+    /// range.
+    pub fn containsRange(s: IpSet, r: IpRange) bool {
+        if (!r.isValid()) return false;
+        const fam = std.meta.activeTag(r.from);
+        const from = ipToInt(r.from);
+        const i = firstSpanEndingAtOrAfter(s.spans, fam, from);
+        return i < s.spans.len and s.spans[i].fam == fam and
+            s.spans[i].from <= from and ipToInt(r.to) <= s.spans[i].to;
+    }
+
+    pub fn containsPrefix(s: IpSet, p: Prefix) bool {
+        return s.containsRange(p.range());
+    }
+
+    /// True when the set shares an address with `r`; false for a malformed
+    /// range.
+    pub fn overlapsRange(s: IpSet, r: IpRange) bool {
+        if (!r.isValid()) return false;
+        const fam = std.meta.activeTag(r.from);
+        const i = firstSpanEndingAtOrAfter(s.spans, fam, ipToInt(r.from));
+        return i < s.spans.len and s.spans[i].fam == fam and s.spans[i].from <= ipToInt(r.to);
+    }
+
+    pub fn overlapsPrefix(s: IpSet, p: Prefix) bool {
+        return s.overlapsRange(p.range());
+    }
+
+    /// True when the two sets share an address.
+    pub fn overlaps(a: IpSet, b: IpSet) bool {
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < a.spans.len and j < b.spans.len) {
+            const x = a.spans[i];
+            const y = b.spans[j];
+            if (x.fam == y.fam and x.from <= y.to and y.from <= x.to) return true;
+            if (spanEndsBefore(x, y)) i += 1 else j += 1;
+        }
+        return false;
+    }
+
+    pub fn eql(a: IpSet, b: IpSet) bool {
+        if (a.spans.len != b.spans.len) return false;
+        for (a.spans, b.spans) |x, y| {
+            if (x.fam != y.fam or x.from != y.from or x.to != y.to) return false;
+        }
+        return true;
+    }
+
+    pub const FreePrefix = struct { prefix: Prefix, rest: IpSet };
+
+    /// Take a `bits`-long prefix out of the set (netipx `RemoveFreePrefix`):
+    /// among the set's `prefixes()`, the longest one no longer than `bits`
+    /// (the tightest fit; on a tie the first in set order) gives up its
+    /// first `bits`-long subprefix. Returns that prefix and the set without
+    /// it (a new set the caller owns; `s` is unchanged), or null when no
+    /// prefix of the set is that large or `bits` exceeds every family's
+    /// width. netipx answers `bits` > 128 with "ok" and an invalid prefix;
+    /// here that is null.
+    pub fn removeFreePrefix(s: IpSet, gpa: std.mem.Allocator, bits: u8) error{OutOfMemory}!?FreePrefix {
+        var best: ?Prefix = null;
+        for (s.spans) |k| {
+            const w: u8 = if (k.fam == .v4) 32 else 128;
+            if (bits > w) continue;
+            var cur = k.from;
+            while (true) {
+                const h = rangeBlockBits(w, cur, k.to);
+                const pbits = w - h;
+                if (pbits <= bits and (best == null or pbits > best.?.bits))
+                    best = .{ .addr = ipFromInt(k.fam, cur), .bits = pbits };
+                const last = cur + hostMask(w, pbits);
+                if (last >= k.to) break;
+                cur = last + 1;
+            }
+        }
+        const found = best orelse return null;
+        const p: Prefix = .{ .addr = found.addr, .bits = bits };
+        var b: IpSetBuilder = .empty;
+        defer b.deinit(gpa);
+        try b.addSet(gpa, s);
+        try b.removePrefix(gpa, p);
+        return .{ .prefix = p, .rest = try b.toSet(gpa) };
+    }
+};
+
+/// Index of the first span whose end is at or after `(fam, v)`.
+fn firstSpanEndingAtOrAfter(spans: []const RangeKey, fam: IpFamily, v: u128) usize {
+    var lo: usize = 0;
+    var hi: usize = spans.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const k = spans[mid];
+        const before = @intFromEnum(k.fam) < @intFromEnum(fam) or (k.fam == fam and k.to < v);
+        if (before) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+/// `x` ends before `y` ends, in set order (family, then end address).
+fn spanEndsBefore(x: RangeKey, y: RangeKey) bool {
+    if (x.fam != y.fam) return @intFromEnum(x.fam) < @intFromEnum(y.fam);
+    return x.to < y.to;
+}
+
+/// Builds an `IpSet` (netipx `IPSetBuilder`). Adds and removes apply in
+/// call order — a removal affects only what was added before it — and
+/// inputs may overlap in any way. Operations are batched: adds are
+/// collected and normalised (sort + merge, O(n log n)) when a removal,
+/// `complement`, `intersect` or `toSet` needs the current membership. Each
+/// switch from removing back to adding applies the pending removals (O(n)),
+/// so a caller that alternates single adds and removes pays O(n) per
+/// switch — group the adds, then the removes, where the order allows.
+/// `IpSetBuilder.empty` is the empty builder; `deinit` frees it, and it
+/// stays usable after `toSet`.
+///
+/// Errors are returned at the call, not accumulated as netipx does: the
+/// only invalid input is a malformed `IpRange` (`InvalidRange`), and a
+/// `Prefix` with `bits` past its family width is clamped like every other
+/// `Prefix` operation.
+pub const IpSetBuilder = struct {
+    in: std.ArrayList(RangeKey) = .empty,
+    out: std.ArrayList(RangeKey) = .empty,
+    /// `in` is sorted, disjoint and non-adjacent.
+    normal: bool = true,
+
+    pub const empty: IpSetBuilder = .{};
+    pub const Error = error{ OutOfMemory, InvalidRange };
+
+    pub fn deinit(b: *IpSetBuilder, gpa: std.mem.Allocator) void {
+        b.in.deinit(gpa);
+        b.out.deinit(gpa);
+        b.* = .empty;
+    }
+
+    pub fn clone(b: *const IpSetBuilder, gpa: std.mem.Allocator) error{OutOfMemory}!IpSetBuilder {
+        var c: IpSetBuilder = .{ .normal = b.normal };
+        errdefer c.deinit(gpa);
+        try c.in.appendSlice(gpa, b.in.items);
+        try c.out.appendSlice(gpa, b.out.items);
+        return c;
+    }
+
+    pub fn add(b: *IpSetBuilder, gpa: std.mem.Allocator, ip: Ip) error{OutOfMemory}!void {
+        try b.addKey(gpa, keyOfIp(ip));
+    }
+
+    pub fn addPrefix(b: *IpSetBuilder, gpa: std.mem.Allocator, p: Prefix) error{OutOfMemory}!void {
+        try b.addKey(gpa, keyOfPrefix(p));
+    }
+
+    pub fn addRange(b: *IpSetBuilder, gpa: std.mem.Allocator, r: IpRange) Error!void {
+        try b.addKey(gpa, try keyOfRange(r));
+    }
+
+    pub fn addSet(b: *IpSetBuilder, gpa: std.mem.Allocator, s: IpSet) error{OutOfMemory}!void {
+        if (b.out.items.len != 0) try b.flush(gpa);
+        try b.in.appendSlice(gpa, s.spans);
+        b.normal = false;
+    }
+
+    pub fn remove(b: *IpSetBuilder, gpa: std.mem.Allocator, ip: Ip) error{OutOfMemory}!void {
+        try b.out.append(gpa, keyOfIp(ip));
+    }
+
+    pub fn removePrefix(b: *IpSetBuilder, gpa: std.mem.Allocator, p: Prefix) error{OutOfMemory}!void {
+        try b.out.append(gpa, keyOfPrefix(p));
+    }
+
+    pub fn removeRange(b: *IpSetBuilder, gpa: std.mem.Allocator, r: IpRange) Error!void {
+        try b.out.append(gpa, try keyOfRange(r));
+    }
+
+    pub fn removeSet(b: *IpSetBuilder, gpa: std.mem.Allocator, s: IpSet) error{OutOfMemory}!void {
+        try b.out.appendSlice(gpa, s.spans);
+    }
+
+    /// Replace the contents with everything NOT in them — over both
+    /// families: the complement of the empty builder is `0.0.0.0/0` + `::/0`.
+    pub fn complement(b: *IpSetBuilder, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+        try b.flush(gpa);
+        const universe = [_]RangeKey{
+            .{ .fam = .v4, .from = 0, .to = std.math.maxInt(u32) },
+            .{ .fam = .v6, .from = 0, .to = std.math.maxInt(u128) },
+        };
+        var next: std.ArrayList(RangeKey) = .empty;
+        errdefer next.deinit(gpa);
+        try subtractSpans(gpa, &next, &universe, b.in.items);
+        b.in.deinit(gpa);
+        b.in = next;
+    }
+
+    /// Keep only the addresses that are also in `s`.
+    pub fn intersect(b: *IpSetBuilder, gpa: std.mem.Allocator, s: IpSet) error{OutOfMemory}!void {
+        try b.flush(gpa);
+        var next: std.ArrayList(RangeKey) = .empty;
+        errdefer next.deinit(gpa);
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < b.in.items.len and j < s.spans.len) {
+            const x = b.in.items[i];
+            const y = s.spans[j];
+            if (x.fam == y.fam) {
+                const lo = @max(x.from, y.from);
+                const hi = @min(x.to, y.to);
+                if (lo <= hi) try next.append(gpa, .{ .fam = x.fam, .from = lo, .to = hi });
+            }
+            if (spanEndsBefore(x, y)) i += 1 else j += 1;
+        }
+        b.in.deinit(gpa);
+        b.in = next;
+    }
+
+    /// The current contents as an `IpSet` the caller owns (netipx `IPSet`).
+    pub fn toSet(b: *IpSetBuilder, gpa: std.mem.Allocator) error{OutOfMemory}!IpSet {
+        try b.flush(gpa);
+        return .{ .spans = try gpa.dupe(RangeKey, b.in.items) };
+    }
+
+    fn addKey(b: *IpSetBuilder, gpa: std.mem.Allocator, k: RangeKey) error{OutOfMemory}!void {
+        // A pending removal must apply to what was added before it only.
+        if (b.out.items.len != 0) try b.flush(gpa);
+        try b.in.append(gpa, k);
+        b.normal = false;
+    }
+
+    /// Normalise `in`, then apply and clear the pending removals.
+    fn flush(b: *IpSetBuilder, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+        if (!b.normal) {
+            normalizeSpans(&b.in);
+            b.normal = true;
+        }
+        if (b.out.items.len == 0) return;
+        normalizeSpans(&b.out);
+        var next: std.ArrayList(RangeKey) = .empty;
+        errdefer next.deinit(gpa);
+        try subtractSpans(gpa, &next, b.in.items, b.out.items);
+        b.in.deinit(gpa);
+        b.in = next;
+        b.out.clearRetainingCapacity();
+    }
+};
+
+fn keyOfIp(ip: Ip) RangeKey {
+    const v = ipToInt(ip);
+    return .{ .fam = std.meta.activeTag(ip), .from = v, .to = v };
+}
+
+fn keyOfPrefix(p: Prefix) RangeKey {
+    const r = p.range();
+    return .{ .fam = std.meta.activeTag(p.addr), .from = ipToInt(r.from), .to = ipToInt(r.to) };
+}
+
+fn keyOfRange(r: IpRange) error{InvalidRange}!RangeKey {
+    if (!r.isValid()) return error.InvalidRange;
+    return .{ .fam = std.meta.activeTag(r.from), .from = ipToInt(r.from), .to = ipToInt(r.to) };
+}
+
+/// Sort, then merge overlapping and adjacent spans in place.
+fn normalizeSpans(list: *std.ArrayList(RangeKey)) void {
+    const items = list.items;
+    if (items.len == 0) return;
+    std.sort.pdq(RangeKey, items, {}, rangeKeyLess);
+    var w: usize = 0;
+    for (items[1..]) |k| {
+        const cur = &items[w];
+        // `cur.to` at the family maximum matches the first clause, so
+        // `cur.to + 1` is never evaluated there.
+        if (k.fam == cur.fam and (k.from <= cur.to or k.from == cur.to + 1)) {
+            cur.to = @max(cur.to, k.to);
+        } else {
+            w += 1;
+            items[w] = k;
+        }
+    }
+    list.shrinkRetainingCapacity(w + 1);
+}
+
+/// Append `a \ b` to `out`; both inputs normalised, so is the result.
+fn subtractSpans(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(RangeKey),
+    a: []const RangeKey,
+    b: []const RangeKey,
+) error{OutOfMemory}!void {
+    var j: usize = 0;
+    for (a) |x| {
+        // Skip what ends before `x` begins; it cannot touch later spans either.
+        while (j < b.len and (@intFromEnum(b[j].fam) < @intFromEnum(x.fam) or
+            (b[j].fam == x.fam and b[j].to < x.from))) j += 1;
+        var cur = x.from;
+        var covered = false;
+        var k = j;
+        while (k < b.len and b[k].fam == x.fam and b[k].from <= x.to) : (k += 1) {
+            if (b[k].from > cur) try out.append(gpa, .{ .fam = x.fam, .from = cur, .to = b[k].from - 1 });
+            if (b[k].to >= x.to) {
+                covered = true;
+                break;
+            }
+            cur = b[k].to + 1; // b[k].to < x.to <= max: no overflow
+        }
+        if (!covered) try out.append(gpa, .{ .fam = x.fam, .from = cur, .to = x.to });
+        j = k;
+    }
 }
 
 // ── RFC 6724 classification ─────────────────────────────────────────────────
@@ -1078,6 +1931,8 @@ fn expectRoundTrip(text: []const u8, canonical: []const u8) !void {
 test {
     _ = @import("rfc6724_oracle_test.zig");
     _ = @import("parse_oracle_test.zig");
+    _ = @import("netip_api_test.zig");
+    _ = @import("netip_oracle_test.zig");
 }
 
 test "Ip.eql: a v4 address and its v4-mapped v6 form are NOT equal" {
