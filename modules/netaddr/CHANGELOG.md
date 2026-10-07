@@ -23,8 +23,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-10-07** — Anchoring: the three oracles (parse, RFC 6724, Go
   netip/netipx) are re-taken on CI by the new `tools/interop.zig`
   (`interop-netaddr -- --check`); the Python `--check` modes now ignore the
-  version line of the vectors header, so a different runner kernel passes when
-  the verdicts agree.
+  provenance lines (header, version constants), so a different runner kernel
+  passes when the verdicts agree.
 - **2026-10-07** — **BEHAVIOURAL, not breaking:** `Ip.isPrivate` now also
   answers true for IPv6 unique-local `fc00::/7`, as Go `netip.Addr.IsPrivate`
   does (user decision, parity). Was RFC 1918 only. The two callers (`rdap`,

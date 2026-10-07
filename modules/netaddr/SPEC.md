@@ -106,9 +106,11 @@ source is `pub const meta` in src/root.zig.
 [-- --check]`) re-takes all three oracles below — parse (glibc + Python),
 RFC 6724 (glibc + kernel, in its own `unshare -rnm`) and Go netip/netipx —
 and the interop lane runs it with `--check` at every tag / dispatch. The
-Python checks compare everything but the `// GENERATED … (versions)` line,
-so a runner with another kernel or Python build passes exactly when every
-verdict agrees. Teeth: one flipped verdict in each vectors file fails all
+Python checks compare everything but the provenance lines (the `// GENERATED
+…` header and the `glibc_version`/`kernel_release`/`python_version`
+constants), so a runner with another kernel or Python build passes exactly
+when every verdict agrees — the first CI run (Linux 7.0.0-1012-azure) agreed
+on every RFC 6724 verdict and differed only in `kernel_release`. Teeth: one flipped verdict in each vectors file fails all
 three.
 
 **Go netip/netipx oracle 2026-10-07.** `tools/go_netip_oracle` (Go 1.26.0,
