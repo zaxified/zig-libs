@@ -3,8 +3,12 @@
 //!
 //! Encrypt to a recipient's X25519 public key with **no sender key**: a fresh
 //! ephemeral keypair is generated per message, so the recipient cannot identify
-//! the sender. This is a thin, faithful wrapper over `std.crypto.nacl.SealedBox`
-//! — we do NOT roll our own crypto; the nonce derivation and AEAD are std's.
+//! the sender. The construction is libsodium's `crypto_box_seal`, byte for
+//! byte: X25519 and BLAKE2b are std's; XSalsa20-Poly1305 is
+//! `xsalsa20poly1305.zig`, a multi-block rewrite of std's (same output,
+//! differential-tested against std and pinned by the PyNaCl KATs), because
+//! std's one-block-at-a-time Salsa20 and Poly1305 held 64 KiB messages at
+//! ~2.4x libsodium's time.
 //! (X25519 keys are Curve25519, so a WireGuard pubkey doubles as a recipient key.)
 //!
 //! Key text serialization: base64 (`std.base64.standard`, RFC 4648 `A–Za–z0–9+/`
@@ -13,7 +17,7 @@
 //! (exact length, no whitespace) and returns typed errors — never panics.
 //!
 //! Provenance: original work of the zig-libs authors (MIT); a thin wrapper over
-//! std's public NaCl `crypto_box_seal` construction. Model after libsodium
+//! the public NaCl `crypto_box_seal` construction. Model after libsodium
 //! `crypto_box_seal` / Go `nacl/box`. No third-party source copied — the
 //! construction is the public NaCl standard.
 
@@ -87,7 +91,25 @@ pub const OpenError = error{InvalidCiphertext} ||
 /// parsed off the wire) -- not just a pathological caller mistake.
 pub fn seal(io: std.Io, out: []u8, msg: []const u8, recipient_pk: [public_length]u8) SealError!void {
     if (out.len != msg.len + overhead) return error.InvalidBufferSize;
-    try SealedBox.seal(io, out, msg, recipient_pk);
+    var ekp = KeyPair.generate(io);
+    defer std.crypto.secureZero(u8, &ekp.secret_key);
+    var shared = try std.crypto.nacl.Box.createSharedSecret(recipient_pk, ekp.secret_key);
+    defer std.crypto.secureZero(u8, &shared);
+    out[0..public_length].* = ekp.public_key;
+    const tag = out[public_length..][0..secretbox.tag_length];
+    secretbox.encrypt(out[overhead..], tag, msg, sealNonce(ekp.public_key, recipient_pk), shared);
+}
+
+const secretbox = @import("xsalsa20poly1305.zig");
+
+/// libsodium's sealed-box nonce: BLAKE2b-192(ephemeral_pk || recipient_pk).
+fn sealNonce(epk: [public_length]u8, pk: [public_length]u8) [secretbox.nonce_length]u8 {
+    var h = std.crypto.hash.blake2.Blake2b(secretbox.nonce_length * 8).init(.{});
+    h.update(&epk);
+    h.update(&pk);
+    var nonce: [secretbox.nonce_length]u8 = undefined;
+    h.final(&nonce);
+    return nonce;
 }
 
 /// Open a sealed message with the recipient keypair. `out` must be exactly
@@ -102,15 +124,18 @@ pub fn seal(io: std.Io, out: []u8, msg: []const u8, recipient_pk: [public_length
 /// everything else as an internal error gives an attacker a distinguishable
 /// log signal (audit finding L2).
 ///
-/// On ANY error, `out`'s contents are unspecified -- audit finding L6: std's
-/// `@memset(m, undefined)` on the failure path is a documentation-only no-op
-/// in `ReleaseFast` (the actual bytes may be leftover keystream, not zeroed
-/// and not the plaintext). A caller must not read `out` unless `open`
-/// returned successfully.
+/// On ANY error, `out`'s contents are unspecified (audit finding L6). Since
+/// the 2026-10-07 rewrite a failed tag check leaves `out` untouched -- nothing
+/// is decrypted before the tag verifies -- but that is not a promise: a
+/// caller must not read `out` unless `open` returned successfully.
 pub fn open(out: []u8, sealed: []const u8, kp: KeyPair) OpenError!void {
     if (sealed.len < overhead or sealed.len != out.len + overhead)
         return error.InvalidCiphertext;
-    try SealedBox.open(out, sealed, kp);
+    const epk = sealed[0..public_length].*;
+    var shared = try std.crypto.nacl.Box.createSharedSecret(epk, kp.secret_key);
+    defer std.crypto.secureZero(u8, &shared);
+    const tag = sealed[public_length..][0..secretbox.tag_length].*;
+    try secretbox.decrypt(out, sealed[overhead..], tag, sealNonce(epk, kp.public_key), shared);
 }
 
 // ── allocating convenience ────────────────────────────────────────────────────
@@ -529,6 +554,7 @@ fn parseKeyHex(text: []const u8) KeyEncodingError![32]u8 {
 // Dark-tests aggregator (CONVENTIONS.md §6.3): a bare re-export does not pull
 // a submodule's tests into the test binary — this reference does.
 test {
+    _ = @import("xsalsa20poly1305.zig");
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");
 }

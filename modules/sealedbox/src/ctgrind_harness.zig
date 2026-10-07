@@ -96,6 +96,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
+const secretbox = @import("xsalsa20poly1305.zig");
 
 const secret_length = root.secret_length;
 
@@ -109,6 +110,9 @@ fn secretKeyBytes() [secret_length]u8 {
     return out;
 }
 
+const sb_len = 1100;
+const sb_nonce = [_]u8{0x24} ** secretbox.nonce_length;
+
 fn reloadVolatile(comptime n: usize, src: *const [n]u8) [n]u8 {
     var out: [n]u8 = undefined;
     for (&out, src) |*o, *b| {
@@ -118,7 +122,7 @@ fn reloadVolatile(comptime n: usize, src: *const [n]u8) [n]u8 {
     return out;
 }
 
-const Target = enum { hexenc, hexdec, b64enc, b64dec };
+const Target = enum { hexenc, hexdec, b64enc, b64dec, seal, open };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -126,6 +130,8 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "hexdec")) return .hexdec;
     if (std.mem.eql(u8, s, "b64enc")) return .b64enc;
     if (std.mem.eql(u8, s, "b64dec")) return .b64dec;
+    if (std.mem.eql(u8, s, "seal")) return .seal;
+    if (std.mem.eql(u8, s, "open")) return .open;
     return error.UnknownTarget;
 }
 
@@ -178,6 +184,46 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var key: [secret_length]u8 = undefined;
             try root.parseSecretKeyBase64(&key, &input);
             std.debug.print("ctgrind_result={x}\n", .{key});
+        },
+        // The XSalsa20-Poly1305 core of `seal`/`open` (module code since the
+        // 2026-10-07 multi-block rewrite). The X25519 shared key and the
+        // plaintext are tainted; the length (1100 B) drives every path: the
+        // 8-block Salsa20 batch, single blocks, a partial block, and the
+        // 4-way and one-lane Poly1305 loops plus the padded final block.
+        .seal => {
+            var key = secretKeyBytes();
+            var msg: [sb_len]u8 = undefined;
+            for (&msg, 0..) |*b, i| b.* = @truncate(i *% 151);
+            if (tainted) {
+                std.valgrind.memcheck.makeMemUndefined(&key);
+                std.valgrind.memcheck.makeMemUndefined(&msg);
+            }
+            const k = reloadVolatile(secret_length, &key);
+            const m = reloadVolatile(sb_len, &msg);
+            var c: [sb_len]u8 = undefined;
+            var tag: [secretbox.tag_length]u8 = undefined;
+            secretbox.encrypt(&c, &tag, &m, sb_nonce, k);
+            std.debug.print("ctgrind_result={x}{x}\n", .{ tag, c[sb_len - 16 ..] });
+        },
+        // Only the key is tainted (the ciphertext is public). Expected 1:
+        // `if (!ok)`, the accept/reject `open` returns to its caller anyway.
+        .open => {
+            var msg: [sb_len]u8 = undefined;
+            for (&msg, 0..) |*b, i| b.* = @truncate(i *% 151);
+            var c: [sb_len]u8 = undefined;
+            var tag: [secretbox.tag_length]u8 = undefined;
+            secretbox.encrypt(&c, &tag, &msg, sb_nonce, secretKeyBytes());
+            var key = secretKeyBytes();
+            if (tainted) std.valgrind.memcheck.makeMemUndefined(&key);
+            const k = reloadVolatile(secret_length, &key);
+            var m: [sb_len]u8 = undefined;
+            // The accept/reject is public by contract and already counted
+            // inside `decrypt`; declassify it so the harness's own `try` is
+            // not a second, unattributed context.
+            var res = secretbox.decrypt(&m, &c, tag, sb_nonce, k);
+            std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&res));
+            try res;
+            std.debug.print("ctgrind_result={x}\n", .{m[sb_len - 16 ..]});
         },
     }
 }

@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE (same bytes, faster):** `seal`/`open`
+  no longer call `std.crypto.nacl.SealedBox`; they compose std's X25519 and BLAKE2b
+  with the module's own XSalsa20-Poly1305 (new `src/xsalsa20poly1305.zig`,
+  `src/poly1305.zig`): Salsa20 eight blocks at a time (AVX2; the target's u32 vector
+  width elsewhere), Poly1305 as four interleaved Horner chains. Against libsodium
+  1.0.18 on 64 KiB: seal 2.31x → 1.21x, open 2.39x → 1.14x; 64 B unchanged
+  (X25519). Output byte-identical: differential tests against std (every length and
+  counter edge), the PyNaCl KATs, `tools/diff_pynacl.py` 6000/6000, fuzz 2 x 200,000.
+  On a failed `open`, `out` is now left untouched (std wrote to it). Two new ctgrind
+  rows, `seal` 0 and `open` 1 (accept/reject); the four codec rows re-pinned for the
+  `root.zig` source digest only. `SealedBox` (the std re-export) is unchanged.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
   bodies are now generic over their source and run by testkit's deterministic
   driver `SEALEDBOX_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in

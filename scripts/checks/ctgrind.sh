@@ -241,7 +241,7 @@ declare -A TARGETS=(
     # pass filed the module as a thin std wrapper with nothing to measure. Both
     # were right about different functions -- `seal`/`open` ARE pure std and are
     # deliberately not targets. The codecs are the module's own choice.
-    [sealedbox]="hexenc hexdec b64enc b64dec"
+    [sealedbox]="hexenc hexdec b64enc b64dec seal open"
     # A1 `pir.md` M2: the module's central claim was never machine-checked, and
     # its sibling `fss` exposed a real defect the day IT entered the gate.
     [pir]="query reconstruct"
@@ -518,6 +518,8 @@ declare -A PATTERN=(
     [sealedbox/hexdec]='root[.]zig:[1-9]|base64[.]zig'
     [sealedbox/b64enc]='root[.]zig:[1-9]|base64[.]zig'
     [sealedbox/b64dec]='root[.]zig:[1-9]|base64[.]zig'
+    [sealedbox/seal]='xsalsa20poly1305[.]zig:[1-9]|/poly1305[.]zig:[1-9]'
+    [sealedbox/open]='xsalsa20poly1305[.]zig:[1-9]|/poly1305[.]zig:[1-9]'
     [adaptor/extract]='root[.]zig|common[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
     # ⚠ `root[.]zig` here is opaque's own file AND voprf's AND ct25519's (same
     # basename, see the blindrsa note above). That is the intended column:
@@ -693,6 +695,8 @@ declare -A LABEL=(
     [sealedbox/hexdec]='sealedbox parseSecretKeyHex (CT; 1 = accept/reject)'
     [sealedbox/b64enc]='sealedbox encodeSecretKeyBase64 (CT, table-free)'
     [sealedbox/b64dec]='sealedbox parseSecretKeyBase64 (CT; 1 = accept/reject)'
+    [sealedbox/seal]='sealedbox XSalsa20-Poly1305 encrypt (CT, multi-block)'
+    [sealedbox/open]='sealedbox XSalsa20-Poly1305 decrypt (CT; 1 = accept/reject)'
     [opaque/register]='opaque client registration (password, blind)+voprf'
     [opaque/login]='opaque client KE1+KE3 (password, blind, keyshare)+voprf'
     [opaque/serverke2]='opaque server KE2 (sk, oprf_seed, keyshare, masking_key)'
