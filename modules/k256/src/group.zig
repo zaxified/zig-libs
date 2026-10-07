@@ -501,10 +501,56 @@ pub const Secp256k1 = struct {
     /// `(X·Z, Y, Z³)` — both represent the same affine point.
     fn mulBaseDoubleGlv(g_s: [32]u8, p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
         try p.rejectIdentity();
-        const pj = ecmult.Gej{ .x = p.x.mul(p.z), .y = p.y.mul(p.z.sq()), .z = p.z, .inf = false };
-        const r = ecmult.mulDoubleBaseG(scalarValue(g_s, endian), pj, scalarValue(s_, endian)) orelse
+        const r = ecmult.mulDoubleBaseG(scalarValue(g_s, endian), p.toJacobian(), scalarValue(s_, endian)) orelse
             return error.IdentityElement;
+        return fromJacobian(r);
+    }
+
+    fn toJacobian(p: Secp256k1) ecmult.Gej {
+        return .{ .x = p.x.mul(p.z), .y = p.y.mul(p.z.sq()), .z = p.z, .inf = false };
+    }
+
+    fn fromJacobian(r: ecmult.Gej) Secp256k1 {
         return .{ .x = r.x.mul(r.z), .y = r.y, .z = r.z.sq().mul(r.z) };
+    }
+
+    /// VARIABLE-TIME `g_s·G + Σ scalars[i]·points[i]` for PUBLIC scalars and
+    /// points: one doubling chain shared by every base (`ecmult.mulMultiG`,
+    /// libsecp256k1's Straus shape), in chunks of `ecmult.multi_max_points`
+    /// whose partial sums are added with the complete law. The batch
+    /// verifier's multiply. `error.IdentityElement` if any point is the
+    /// identity, or the sum is. `points.len` must equal `scalars.len`
+    /// (a mismatch panics: a caller bug, not input data).
+    pub fn mulMultiBasePublic(g_s: [32]u8, points: []const Secp256k1, scalars: []const [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        if (points.len != scalars.len) @panic("k256: mulMultiBasePublic: points.len != scalars.len");
+        for (points) |p| try p.rejectIdentity();
+        var acc = identityElement;
+        if (comptime !gate.glv_scalarmul_implemented) {
+            if (basePoint.mulPublicDoubleAdd(g_s, endian)) |t| acc = acc.add(t) else |_| {}
+            for (points, scalars) |p, sc| {
+                if (p.mulPublicDoubleAdd(sc, endian)) |t| acc = acc.add(t) else |_| {}
+            }
+            try acc.rejectIdentity();
+            return acc;
+        }
+        if (points.len == 0) return basePoint.mulPublic(g_s, endian);
+        const max = ecmult.multi_max_points;
+        var g = scalarValue(g_s, endian);
+        var start: usize = 0;
+        while (start < points.len) {
+            const end = @min(points.len, start + max);
+            var js: [max]ecmult.Gej = undefined;
+            var ss: [max]u256 = undefined;
+            for (points[start..end], scalars[start..end], 0..) |p, sc, j| {
+                js[j] = p.toJacobian();
+                ss[j] = scalarValue(sc, endian);
+            }
+            if (ecmult.mulMultiG(g, js[0 .. end - start], ss[0 .. end - start])) |r| acc = acc.add(fromJacobian(r));
+            g = 0; // G belongs to the first chunk only
+            start = end;
+        }
+        try acc.rejectIdentity();
+        return acc;
     }
 
     /// Portable variable-time interleaved double-and-add for two bases (the

@@ -373,10 +373,10 @@ k256	ReleaseFast	field	1	0	ab18a8e82d40099a	4f13cccddea81376
 #                base point, which let LLVM fold `mul`'s per-call table (not
 #                the ECDH binary).
 #   ecdsa 10 -> 11   16/11/5/0 (G7 19a05328, `sign` handles R.x >= n).
-k256	ReleaseFast	mul	1	1	baed2c02496868dd	2e85d4bddb851304
-k256	ReleaseFast	comb	1	1	baed2c02496868dd	2ac21fe395f35487
-k256	ReleaseFast	sign	1	11	bb195b330943ba7a	bb06c2ed85209b8d
-k256	ReleaseFast	ecdsa	1	11	a3f1588789e5425a	8ff4812d21149442
+k256	ReleaseFast	mul	1	1	0b6629edcf16bc14	2e85d4bddb851304
+k256	ReleaseFast	comb	1	1	0b6629edcf16bc14	2ac21fe395f35487
+k256	ReleaseFast	sign	1	11	7e935f7dc6fa3620	bb06c2ed85209b8d
+k256	ReleaseFast	ecdsa	1	11	3a66c869221d7688	8ff4812d21149442
 # montint — all three dispatch sizes clean, no residual. `small` (L=4) and
 # `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
 # ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,
@@ -491,7 +491,11 @@ bls12_381	ReleaseFast	g2_scalarmul	1	2	17f4aae9d4d3ded9	7f4e15a241002b3f
 # splitToSignedHalves (2+14), the multiply loop (4), table build (2), topDigit
 # (1), mulBaseDoubleGlv (1). The reduceToScalar contexts only renamed. Nothing
 # new before step 10.
-bip340	ReleaseFast	sign	1	<=82	66c6f546af95d87e	0ce3274dc49157be
+# 82 -> 83 the same night (ecmult `strauss`, multi-base core for verifyBatch):
+# diffed vs 359a678d, every context moved under `strauss` unchanged except
+# topDigit 1 -> 2 (it now loops over a slice of digit strings), still inside
+# the self-check verify.
+bip340	ReleaseFast	sign	1	<=83	4c455b850fa7141a	0ce3274dc49157be
 blindrsa	ReleaseFast	blind	1	<=493	ec3c73bfc9e557df	4352055809b3f3c7
 # blindrsa sign 218 -> 7 (2026-10-02): rsa's CRT path left std.crypto.ff. Left,
 # all on the signature s that is about to be published: blindSign's ff parse of

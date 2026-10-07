@@ -482,6 +482,40 @@ test "corpus: every signature seed reaches fromBytes, and the outcomes are pinne
 // `sum(s_i)*G == sum(R_i + e_i*P_i)`, and the `+d`/`-d` errors cancel
 // exactly — the mutant batch verifier accepts two forgeries. With real
 // independent random `a_i`, the batch must reject.
+test "batch: sizes across verifyBatch's chunks (1..25) accept; a bad item in any chunk rejects" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const total = 25;
+    var msgs: [total][32]u8 = undefined;
+    var items: [total]bip340.BatchItem = undefined;
+    for (0..total) |i| {
+        var skb = [_]u8{0} ** 32;
+        skb[31] = @intCast(i + 1);
+        skb[0] = 0x5A;
+        const sk = try bip340.SecretKey.fromBytes(skb);
+        const kp = try bip340.KeyPair.fromSecretKey(sk);
+        msgs[i] = [_]u8{@intCast(i)} ** 32;
+        const sig = try bip340.sign(sk, &msgs[i], [_]u8{0xA5} ** 32, io);
+        items[i] = .{ .pubkey = kp.public, .msg = &msgs[i], .sig = try bip340.Signature.fromBytes(sig) };
+    }
+    for ([_]usize{ 1, 2, 7, 8, 9, 16, 17, 25 }) |n| {
+        const batch = items[0..n];
+        try std.testing.expect(bip340.verifyBatch(batch, io));
+        for ([_]usize{ 0, 7, 8, n - 1 }) |bad| {
+            if (bad >= n) continue;
+            const orig = batch[bad];
+            batch[bad].sig.s[31] ^= 0x01;
+            try std.testing.expect(!bip340.verifyBatch(batch, io));
+            batch[bad] = orig;
+            batch[bad].msg = &msgs[(bad + 1) % total];
+            try std.testing.expect(!bip340.verifyBatch(batch, io));
+            batch[bad] = orig;
+        }
+    }
+}
+
 test "batch: a random-linear-combination forgery (cancelling +d/-d pair) is REJECTED (F1)" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();

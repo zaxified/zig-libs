@@ -146,6 +146,11 @@ Scalar multiply variants:
   width 12 measured 0.6 % faster for 4× the table, not taken). Otherwise the RCB
   GLV combine (`glvCombine`) runs; it and the plain double-and-add are the
   oracles `ecmult.zig`'s tests pin it to (plus std).
+- **`mulMultiBasePublic`** — VARIABLE-TIME `s0·G + Σ s_i·P_i` for public data
+  (2026-10-07): the same `ecmult` core for up to 16 bases per pass, every
+  point's table brought into one common frame `S = Π s_j` by prefix/suffix
+  products (no inversion), one doubling chain, G once; longer sums are
+  chunked and the partial sums added. `bip340.verifyBatch` rides it.
 
 The fast-path DESIGN the Fable phase targets: a comptime fixed-base wNAF table for
 `G` (constant-time base-point mul), and GLV for variable-base — documented here so
@@ -568,10 +573,9 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
   33 %, `lift_x` square root + affine inversion ~25 %. Done 2026-10-07: addition-chain
   inversion/sqrt, two-fold asm reduction, `ecmult` (Jacobian + mixed adds + affine G table)
   — verify 85 → 59 µs. Open, by expected gain: (1) a variable-time safegcd inversion for
-  public data (verify's affine conversion, ~6 µs on the chain today); (2) `verifyBatch` /
-  any two-arbitrary-point double-base still on the RCB `glvCombine` — a multi-point Strauss
-  with ONE global Z across all tables (libsecp's `ecmult_strauss_wnaf`) would move it onto
-  `ecmult`; (3) lazily reduced field elements (libsecp's magnitude tracking) so add/sub
+  public data (verify's affine conversion, ~6 µs on the chain today); (2) ~~`verifyBatch` on a multi-point Straus~~ DONE 2026-10-07
+  (`mulMultiBasePublic`, 79 → 51 µs/sig); a double-base with two arbitrary points still runs
+  the RCB `glvCombine` (no consumer on a hot path); (3) lazily reduced field elements (libsecp's magnitude tracking) so add/sub
   skip the select; (4) field mul latency (~80 cycles: product rows ~27, reduction ~25,
   store/load). Each needs ctgrind re-measured where it touches CT paths.
 

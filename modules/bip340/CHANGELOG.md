@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO API CHANGE (same acceptance set, faster):** `verifyBatch` evaluates
+  `(Σ a_i·s_i)·G − Σ a_i·R_i − Σ (a_i·e_i)·P_i = O` as one multi-base sum through k256's new
+  `Secp256k1.mulMultiBasePublic` (one doubling chain per 8 items) instead of a double-base
+  multiply per item: 79.3 → 51.3 µs per signature (64-item batch), now 0.87× a single `verify`
+  (was 1.34×, A1 F3). New test across chunk boundaries (1–25 items).
 - **2026-10-07** — **NEW API:** `signWithKeyPair(*const KeyPair, msg, aux_rand, io)`, the
   `sign` of a caller who keeps the `KeyPair` (libsecp256k1's `schnorrsig_sign32` takes its
   keypair the same way): same bytes as `sign`, without re-deriving `d·G` and its inversion on

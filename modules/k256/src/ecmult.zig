@@ -296,28 +296,85 @@ pub fn mulDoubleBaseG(g_scalar: u256, p: Gej, p_scalar: u256) ?Gej {
 /// `mulDoubleBaseG` parameterised on G's tables, so a test can pass a
 /// corrupted table and prove the differential notices.
 pub fn mulDoubleBaseGWithTables(gt: *const GTables, g_scalar: u256, p: Gej, p_scalar: u256) ?Gej {
-    std.debug.assert(!p.inf);
+    return strauss(1, gt, g_scalar, &.{p}, &.{p_scalar});
+}
+
+/// Most points one `mulMultiG` call takes: their tables and digit strings live
+/// on the stack (~2 KiB per point). Callers with more points split the sum.
+pub const multi_max_points = 16;
+
+/// `g_scalar·G + Σ scalars[j]·points[j]` for PUBLIC raw scalars and public,
+/// non-identity Jacobian points (1 ≤ `points.len` ≤ `multi_max_points`,
+/// `scalars.len == points.len`). Null when the result is the identity.
+/// Variable time in everything — the batch verifier's one big multiply.
+pub fn mulMultiG(g_scalar: u256, points: []const Gej, scalars: []const u256) ?Gej {
+    return strauss(multi_max_points, &g_tables, g_scalar, points, scalars);
+}
+
+/// Interleaved (Straus) GLV+wNAF multiply over G's comptime tables and up
+/// to `max` per-call point tables, sharing ONE doubling chain.
+///
+/// One frame for every point: `oddMultiplesGlobalZ` leaves table `j` affine
+/// in the frame of scale `s_j`. The common frame is `S = Π s_j`; table `j`
+/// reaches it through `t_j = S / s_j = Π_{i≠j} s_i` (x·t², y·t³), and the
+/// `t_j` come from prefix and suffix products — no inversion. G's entries
+/// enter that frame through `S` (`addGeScaled`), and `S` is multiplied back
+/// into the result's `Z` at the end.
+fn strauss(comptime max: usize, gt: *const GTables, g_scalar: u256, points: []const Gej, scalars: []const u256) ?Gej {
+    const k = points.len;
+    std.debug.assert(k >= 1 and k <= max and scalars.len == k);
     const zero = [2]GlvHalf{ .{ .mag = 0, .negative = false }, .{ .mag = 0, .negative = false } };
+
+    // Strings 0, 1: G and φ(G); then 2 + 2j, 3 + 2j: point j and φ(point j).
+    var es: [2 + 2 * max][wnaf_len]i16 = undefined;
     const hg = splitToSignedHalves(g_scalar) orelse zero;
-    const hp = splitToSignedHalves(p_scalar) orelse zero;
-    const es = [4][wnaf_len]i16{
-        wnafDigits(p_window, hp[0]), wnafDigits(p_window, hp[1]),
-        wnafDigits(g_window, hg[0]), wnafDigits(g_window, hg[1]),
-    };
+    es[0] = wnafDigits(g_window, hg[0]);
+    es[1] = wnafDigits(g_window, hg[1]);
+    var tabs: [max][2][p_tab_len]Ge = undefined;
+    var scales: [max]Fe = undefined;
+    for (points, scalars, 0..) |p, sc, j| {
+        std.debug.assert(!p.inf);
+        const h = splitToSignedHalves(sc) orelse zero;
+        es[2 + 2 * j] = wnafDigits(p_window, h[0]);
+        es[3 + 2 * j] = wnafDigits(p_window, h[1]);
+        scales[j] = oddMultiplesGlobalZ(p_tab_len, p, &tabs[j][0]);
+    }
+    var scale = scales[0];
+    if (k > 1) {
+        var prefix: [max]Fe = undefined;
+        var acc = Fe.one;
+        for (0..k) |j| {
+            prefix[j] = acc;
+            acc = acc.mul(scales[j]);
+        }
+        scale = acc;
+        var suffix = Fe.one;
+        var j = k;
+        while (j > 0) {
+            j -= 1;
+            const t = prefix[j].mul(suffix);
+            suffix = suffix.mul(scales[j]);
+            const t2 = t.sq();
+            const t3 = t2.mul(t);
+            for (&tabs[j][0]) |*e| e.* = .{ .x = e.x.mul(t2), .y = e.y.mul(t3) };
+        }
+    }
+    for (tabs[0..k]) |*t| t[1] = phiTable(p_tab_len, &t[0]);
 
-    var pt: [2][p_tab_len]Ge = undefined;
-    const scale = oddMultiplesGlobalZ(p_tab_len, p, &pt[0]);
-    pt[1] = phiTable(p_tab_len, &pt[0]);
-
+    const strings = es[0 .. 2 + 2 * k];
     var r = Gej.infinity;
-    var i = topDigit(&es);
+    var i = topDigit(strings);
     while (i > 0) {
         i -= 1;
         r = r.dbl();
-        if (es[0][i] != 0) r = r.addGe(tableEntry(&pt[0], es[0][i]));
-        if (es[1][i] != 0) r = r.addGe(tableEntry(&pt[1], es[1][i]));
-        if (es[2][i] != 0) r = r.addGeScaled(tableEntry(&gt[0], es[2][i]), scale);
-        if (es[3][i] != 0) r = r.addGeScaled(tableEntry(&gt[1], es[3][i]), scale);
+        if (strings[0][i] != 0) r = r.addGeScaled(tableEntry(&gt[0], strings[0][i]), scale);
+        if (strings[1][i] != 0) r = r.addGeScaled(tableEntry(&gt[1], strings[1][i]), scale);
+        for (tabs[0..k], 0..) |*t, j| {
+            const d0 = strings[2 + 2 * j][i];
+            const d1 = strings[3 + 2 * j][i];
+            if (d0 != 0) r = r.addGe(tableEntry(&t[0], d0));
+            if (d1 != 0) r = r.addGe(tableEntry(&t[1], d1));
+        }
     }
     if (r.inf) return null;
     r.z = r.z.mul(scale);
@@ -485,4 +542,115 @@ test "ecmult: wnafDigits reconstructs the magnitude for every window" {
             try std.testing.expectEqual(want, acc);
         }
     }
+}
+
+/// `g·G + Σ s_j·P_j` the slow way: one double-and-add per term, summed with
+/// the complete RCB law. Null for the identity.
+fn multiOracle(g: u256, pts: []const Secp256k1, ss: []const u256) ?[2]u256 {
+    var acc = Secp256k1.identityElement;
+    var b: [32]u8 = undefined;
+    std.mem.writeInt(u256, &b, g, .big);
+    if (Secp256k1.basePoint.mulPublicDoubleAdd(b, .big)) |t| acc = acc.add(t) else |_| {}
+    for (pts, ss) |p, sc| {
+        std.mem.writeInt(u256, &b, sc, .big);
+        if (p.mulPublicDoubleAdd(b, .big)) |t| acc = acc.add(t) else |_| {}
+    }
+    acc.rejectIdentity() catch return null;
+    const a = acc.affineCoordinates();
+    return .{ a.x.toInt(), a.y.toInt() };
+}
+
+fn expectMultiSame(g: u256, pts: []const Secp256k1, ss: []const u256) !void {
+    var js: [multi_max_points]Gej = undefined;
+    for (pts, 0..) |p, j| js[j] = toJacobian(p);
+    const want = multiOracle(g, pts, ss);
+    const got = affineOf(mulMultiG(g, js[0..pts.len], ss));
+    if (want) |w| {
+        const gv = got orelse return error.TestUnexpectedIdentity;
+        try std.testing.expectEqual(w[0], gv[0]);
+        try std.testing.expectEqual(w[1], gv[1]);
+    } else {
+        try std.testing.expect(got == null);
+    }
+}
+
+const multi_random_iters: usize = if (builtin.mode == .Debug) 12 else 120;
+
+test "ecmult: mulMultiG == Σ double-and-add, 1..16 random points, z ≠ 1 and duplicates" {
+    var prng = std.Random.DefaultPrng.init(0xEC_3017_0002);
+    const rand = prng.random();
+    var pts: [multi_max_points]Secp256k1 = undefined;
+    var ss: [multi_max_points]u256 = undefined;
+    for (0..multi_random_iters) |it| {
+        const k = 1 + it % multi_max_points;
+        for (0..k) |j| {
+            var kb: [32]u8 = undefined;
+            rand.bytes(&kb);
+            pts[j] = Secp256k1.basePoint.mulPublic(kb, .big) catch Secp256k1.basePoint;
+            if (rand.boolean()) pts[j] = pts[j].add(Secp256k1.identityElement); // z ≠ 1
+            ss[j] = rand.int(u256);
+        }
+        if (k > 2) pts[1] = pts[0]; // a duplicated base
+        try expectMultiSame(rand.int(u256), pts[0..k], ss[0..k]);
+        try expectMultiSame(0, pts[0..k], ss[0..k]);
+    }
+}
+
+test "ecmult: mulMultiG cancellations — P and −P, and the batch-verify identity" {
+    const n = scalarmod.field_order;
+    const g = Secp256k1.basePoint;
+    var kb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &kb, 0xDEAD_BEEF_0123_4567, .big);
+    const p = try g.mulPublic(kb, .big);
+    // s·P + s·(−P) + 0·G = O.
+    try std.testing.expect(mulMultiG(0, &.{ toJacobian(p), toJacobian(p.neg()) }, &.{ 12345, 12345 }) == null);
+    try expectMultiSame(0, &.{ p, p.neg() }, &.{ 12345, 12345 });
+    // One step off is P.
+    try expectMultiSame(0, &.{ p, p.neg() }, &.{ 12346, 12345 });
+    // s·G − R − e·P = O for a real BIP340-shaped relation: R = kG, s = k + e·d.
+    const d: u256 = 0x1111_2222_3333_4444_5555;
+    const kk: u256 = 0x9999_8888_7777;
+    const e: u256 = 0x0F0F_0F0F_0F0F_0F0F_0F0F_0F0F;
+    std.mem.writeInt(u256, &kb, d, .big);
+    const pk = try g.mulPublic(kb, .big);
+    std.mem.writeInt(u256, &kb, kk, .big);
+    const r = try g.mulPublic(kb, .big);
+    const s_sig: u256 = @intCast((@as(u512, kk) + @as(u512, e) * d) % n);
+    const pts = [_]Secp256k1{ r, pk };
+    const ss = [_]u256{ n - 1, n - e };
+    try expectMultiSame(s_sig, &pts, &ss);
+    try std.testing.expect(mulMultiG(s_sig, &.{ toJacobian(r), toJacobian(pk) }, &ss) == null);
+    try std.testing.expect(mulMultiG(s_sig + 1, &.{ toJacobian(r), toJacobian(pk) }, &ss) != null);
+}
+
+test "ecmult: Secp256k1.mulMultiBasePublic chunks past multi_max_points; empty and identity inputs" {
+    var prng = std.Random.DefaultPrng.init(0xEC_3017_0003);
+    const rand = prng.random();
+    const count = 2 * multi_max_points + 5; // three chunks, the last one short
+    var pts: [count]Secp256k1 = undefined;
+    var ss: [count]u256 = undefined;
+    var sb: [count][32]u8 = undefined;
+    for (0..count) |j| {
+        var kb: [32]u8 = undefined;
+        rand.bytes(&kb);
+        pts[j] = try Secp256k1.basePoint.mulPublic(kb, .big);
+        ss[j] = rand.int(u256);
+        std.mem.writeInt(u256, &sb[j], ss[j], .big);
+    }
+    const g = rand.int(u256);
+    var gb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &gb, g, .big);
+    const got = (try Secp256k1.mulMultiBasePublic(gb, &pts, &sb, .big)).affineCoordinates();
+    const want = multiOracle(g, &pts, &ss).?;
+    try std.testing.expectEqual(want[0], got.x.toInt());
+    try std.testing.expectEqual(want[1], got.y.toInt());
+
+    // No points: g·G alone.
+    const g_only = (try Secp256k1.mulMultiBasePublic(gb, &.{}, &.{}, .big)).affineCoordinates();
+    const g_want = (try Secp256k1.basePoint.mulPublic(gb, .big)).affineCoordinates();
+    try std.testing.expectEqual(g_want.x.toInt(), g_only.x.toInt());
+    // An identity base, and an identity sum, are both `error.IdentityElement`.
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulMultiBasePublic(gb, &.{ pts[0], Secp256k1.identityElement }, sb[0..2], .big));
+    const zero = [_]u8{0} ** 32;
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulMultiBasePublic(zero, &.{ pts[0], pts[0].neg() }, &.{ sb[0], sb[0] }, .big));
 }

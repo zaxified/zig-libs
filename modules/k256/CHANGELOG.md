@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NEW API:** `Secp256k1.mulMultiBasePublic(g_s, points, scalars, endian)`,
+  VARIABLE-TIME `g_s·G + Σ s_i·P_i` for public data: `ecmult`'s Straus core generalised to up
+  to `ecmult.multi_max_points` (16) bases per pass — every point's odd-multiple table brought
+  into one common frame `S = Π s_j` by prefix/suffix products (no inversion), one doubling
+  chain, G once — chunked beyond that. `mulDoubleBasePublic`'s G path is now its one-point
+  case. Held by a differential vs a per-term double-and-add sum (1–16 random points, z ≠ 1,
+  duplicates; 37 points across three chunks), exact cancellations and a BIP340-shaped
+  relation summing to O. First consumer: `bip340.verifyBatch`.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE (same values, faster):** `mulDoubleBasePublic`
   with `basePoint` as one base (every BIP340/ECDSA/adaptor verifier) runs the new
   `ecmult.zig`: Jacobian coordinates with incomplete formulas (public data only), mixed

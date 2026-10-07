@@ -559,21 +559,16 @@ pub const BatchItem = struct {
 /// cannot deliver, the batch is reported unverified (`false`) rather than
 /// checked against predictable randomizers.
 ///
-/// Implementation note (documented deviation from a maximally-batched
-/// form): the right-hand side is accumulated per item via one
-/// variable-time double-base multiply (`a_i*R_i + (a_i*e_i)*P_i`) plus a
-/// complete point addition, rather than one large multi-scalar
-/// multiplication over all `2u+1` terms (std's API tops out at two bases
-/// per call). Same equation, same acceptance set. ⚠ Measured (A1 audit F3,
-/// 2026-09-04, ReleaseFast): this does NOT "forgo part of" the batching
-/// speedup — at every tested batch size (u=1,2,8,32,64) it is measurably
-/// SLOWER than `for (items) |it| verify(it)` (1.03x-1.12x, never below
-/// 1.0), and costs u-1 extra `getrandom` syscalls per batch on top. See
-/// `SPEC.md` for the numbers. Until this module has a real multi-scalar
-/// multiply to call, prefer a plain loop over `verify`. If one item's combined term is the identity
-/// (std's double-base multiply reports it as `error.IdentityElement`), the
-/// identity contributes nothing and the item is skipped — NOT a failure:
-/// the equation, not any per-item property, decides.
+/// Implementation (2026-10-07): the equation is evaluated as one sum that
+/// must vanish, `(Σ a_i·s_i)·G − Σ a_i·R_i − Σ (a_i·e_i)·P_i = O`, by k256's
+/// multi-base Straus multiply (`Secp256k1.mulMultiBasePublic`): one doubling
+/// chain per `batch_chunk` items instead of one per item, every addition a
+/// mixed one, and G once per batch. Same equation, same acceptance set.
+/// Until then (A1 audit F3, 2026-09-04) each item ran its own double-base
+/// multiply and the batch was 1.03–1.12× SLOWER than a loop over `verify`;
+/// see `SPEC.md` for the numbers now.
+const batch_chunk = 8;
+
 pub fn verifyBatch(items: []const BatchItem, io: std.Io) bool {
     // Empty batch: A1 audit F9 (LOW, round-2 Q5 -- "which normative source
     // wins" resolves to "follow the algorithm as written"). BIP340
@@ -587,8 +582,16 @@ pub fn verifyBatch(items: []const BatchItem, io: std.Io) bool {
     // `true` here is spec-mandated, not a permissive design choice this
     // module made on its own. (The equation below independently agrees:
     // it degenerates to 0*G == identity on both sides.)
+    if (items.len == 0) return true;
+    // The equation as ONE multi-base sum that must vanish:
+    //   (sum_i a_i*s_i)*G + sum_i (-a_i)*R_i + sum_i (-a_i*e_i)*P_i == O
+    // fed to k256's Straus multiply `batch_chunk` items (two bases each) at
+    // a time; G and its scalar ride the last chunk, once every s_i is in.
     var lhs_scalar = Scalar.zero; // sum_i a_i * s_i (mod n)
-    var rhs = Secp256k1.identityElement;
+    var sum = Secp256k1.identityElement;
+    var pts: [2 * batch_chunk]Secp256k1 = undefined;
+    var scs: [2 * batch_chunk][32]u8 = undefined;
+    var filled: usize = 0;
     for (items, 0..) |item, i| {
         // lift_x on the pubkey and on r_i; s_i < n. Any failure fails the batch.
         const p = item.pubkey.lift() catch return false;
@@ -636,28 +639,25 @@ pub fn verifyBatch(items: []const BatchItem, io: std.Io) bool {
 
         lhs_scalar = lhs_scalar.add(a.mul(s));
 
-        // a_i*R_i + (a_i*e_i)*P_i. R_i and P_i are real lifted points
-        // (never the identity), so the only IdentityElement case is the
-        // RESULT being the identity — which contributes nothing to the sum.
-        const term = Secp256k1.mulDoubleBasePublic(
-            r_point,
-            a.toBytes(.big),
-            p,
-            a.mul(e).toBytes(.big),
-            .big,
-        ) catch continue;
-        rhs = rhs.add(term);
+        pts[filled] = r_point;
+        scs[filled] = a.neg().toBytes(.big);
+        pts[filled + 1] = p;
+        scs[filled + 1] = a.mul(e).neg().toBytes(.big);
+        filled += 2;
+        const last = i + 1 == items.len;
+        if (filled == pts.len or last) {
+            const g_s = if (last) lhs_scalar.toBytes(.big) else [_]u8{0} ** 32;
+            // Every base was lifted above, so `IdentityElement` can only mean
+            // this chunk's partial sum is O: it contributes nothing.
+            if (Secp256k1.mulMultiBasePublic(g_s, pts[0..filled], scs[0..filled], .big)) |part| {
+                sum = sum.add(part);
+            } else |_| {}
+            filled = 0;
+        }
     }
-
-    // (sum a_i*s_i)*G vs the accumulated right-hand side. `mul` errors iff
-    // the scalar sum is 0 mod n (left side = identity): then the equation
-    // holds iff the right side is the identity too.
-    const lhs = Secp256k1.combMulBase(lhs_scalar.toBytes(.big), .big) catch {
-        rhs.rejectIdentity() catch return true;
-        return false;
-    };
-    rhs.rejectIdentity() catch return false;
-    return lhs.equivalent(rhs);
+    // Accept iff the whole sum is the identity.
+    sum.rejectIdentity() catch return true;
+    return false;
 }
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────

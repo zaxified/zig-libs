@@ -222,27 +222,24 @@ All three formerly-stubbed cores are implemented and KAT-validated
    `a_i` let an attacker pass a batch of individually-invalid signatures
    whose errors cancel — so an entropy failure returns `false` (batch not
    verified) rather than checking against a degraded draw. The RHS
-   accumulates per item as one variable-time double-base multiply
-   `a_i·R_i + (a_i·e_i)·P_i` plus a complete point addition (std's API
-   tops out at two bases per multiply — same equation and acceptance
-   set as a single 2u+1-term multi-scalar multiply). ⚠ **Measured
-   2026-09-04 (A1 audit F3), ReleaseFast, best-of-5, both arms
-   interleaved in one process: `verifyBatch` is not faster than a plain
-   `for (items) |it| verify(it)` loop at ANY tested batch size — `u=1`
-   1.117× slower, `u=2` 1.074×, `u=8` 1.034×, `u=32` 1.029×, `u=64`
-   1.035× (never below 1.0, same direction at all five sizes) — and
-   costs `u-1` extra `getrandom(2)` syscalls on top (`u=64` → 630 calls
-   per batch, via `strace -c`).** It does not forgo *part of* the
-   batching speedup; measured, it has none. A caller who wants speed
-   from batching should use `verify` in a loop until this module gets a
-   real multi-scalar-multiply path (blocked on `k256`/std exposing one
-   — see the doc comment on `verifyBatch` for the API-shape reason). A per-item
-   identity result contributes nothing and is skipped; a zero LHS
-   scalar (base `mul` reports identity) accepts iff the RHS is the
-   identity too. Validated by cross-check against `verify` (all-valid
-   batch accepts incl. the empty batch; corrupting any single
-   signature/message/pubkey, or injecting vector 11's non-lifting `r`,
-   rejects).
+   is evaluated, since 2026-10-07, as ONE sum that must vanish,
+   `(Σ a_i·s_i)·G − Σ a_i·R_i − Σ (a_i·e_i)·P_i = O`, through k256's
+   multi-base Straus multiply (`Secp256k1.mulMultiBasePublic`: one
+   doubling chain per 8 items, all-mixed additions, G once). Same equation
+   and acceptance set. Measured 2026-10-07 (`zig build bench-bip340`,
+   64-item batch): 51.3 µs per signature against 59.2 µs for one `verify`
+   (0.87×); before, 79.3 µs (1.34×). Each item still lifts BOTH `R_i` and
+   `P_i` (two square roots, ~12 µs), so for one or two items a batch is
+   expected to lose to `verify` *(inferred, not measured)*. History: A1
+   audit F3 (2026-09-04) had measured the old per-item form 1.03–1.12×
+   SLOWER than a `verify` loop at every size `u = 1..64`, plus `u−1`
+   extra `getrandom(2)` syscalls per batch (still true). A chunk whose
+   partial sum is the identity contributes nothing; the batch accepts
+   iff the whole sum is the identity. Validated by cross-check against
+   `verify` (all-valid batch accepts incl. the empty batch; corrupting any
+   single signature/message/pubkey, or injecting vector 11's
+   non-lifting `r`, rejects) and across chunk boundaries (sizes 1–25, a
+   bad item in the first, second or last chunk rejects).
 
 The two formerly-`error.SkipZigTest` KAT tests in `kat_test.zig` are
 re-enabled, plus the new batch-correctness test. Design references: none
@@ -287,4 +284,4 @@ beyond the BIP340 specification text itself and `std.crypto.ecc.Secp256k1`
 
 ## Backlog / deferred
 
-- 2026-10-07: slower than the reference on every measured operation (`tools/bench.zig`, libsecp256k1 v0.8.0): keypair 1.56×, verify 2.56×, sign 7.37× (was 2.00/3.39/9.30 before the same-day k256 field change). `sign` = two fixed-base multiplies (public key per call, nonce point) + the BIP340 self-verification, which the owner decided to KEEP (2026-10-07: fault-injection guard; speed comes from the arithmetic, not from dropping it). The curve arithmetic is `k256`'s (MULX/ADX field, GLV, comb), not std's; profiled verify (perf, 2026-10-07): point add 36 %, double 33 %, the two exponentiations (`lift_x` square root, affine inversion) ~25 %. Next levers are in k256's backlog: a precomputed affine G table for the double-base verify, a variable-time safegcd inversion, lazy reduction. `verifyBatch` per signature (64-item batch) is no faster than a single `verify` today.
+- 2026-10-07: slower than the reference on every measured operation (`tools/bench.zig`, libsecp256k1 v0.8.0): keypair 1.56×, verify 2.56×, sign 7.37× (was 2.00/3.39/9.30 before the same-day k256 field change). `sign` = two fixed-base multiplies (public key per call, nonce point) + the BIP340 self-verification, which the owner decided to KEEP (2026-10-07: fault-injection guard; speed comes from the arithmetic, not from dropping it). The curve arithmetic is `k256`'s (MULX/ADX field, GLV, comb), not std's; profiled verify (perf, 2026-10-07): point add 36 %, double 33 %, the two exponentiations (`lift_x` square root, affine inversion) ~25 %. Next levers are in k256's backlog: a precomputed affine G table for the double-base verify, a variable-time safegcd inversion, lazy reduction. `verifyBatch` per signature (64-item batch) was no faster than a single `verify`. **2026-10-07 later (k256 `ecmult`, `signWithKeyPair`, multi-base batch):** keypair 1.31×, verify 1.77×, sign 4.43× (from a ready `KeyPair`, as libsecp's `schnorrsig_sign32`), `verifyBatch` 51 µs/sig = 0.87× a single verify.
