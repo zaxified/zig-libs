@@ -237,7 +237,8 @@ pub const Regex = struct {
     pub fn isMatchReader(re: *const Regex, r: *std.Io.Reader) error{ReadFailed}!bool {
         var t: ReaderText = .init(r);
         const found = re.runSetOn(&t, false);
-        if (t.failed) return error.ReadFailed;
+        // A failure after the answer was settled does not change it.
+        if (t.failed and !found) return error.ReadFailed;
         return found;
     }
 
@@ -585,6 +586,9 @@ pub const Matcher = struct {
     /// bits (Go's limit too): a short text, where it beats the Pike VM's
     /// per-thread capture copies.
     const max_backtrack_bits = 256 * 1024;
+    /// Pending branches and restores the backtracker may hold (~400 KiB);
+    /// past it the search is handed to the Pike VM.
+    const max_backtrack_jobs = 16 * 1024;
 
     const List = struct {
         pcs: []u16,
@@ -785,6 +789,7 @@ pub const Matcher = struct {
         const visited = m.bt_visited.items;
         @memset(m.tmp, nil);
         m.bt_jobs.append(m.gpa, .{ .explore = .{ .pc = 0, .pos = start } }) catch return .oom;
+        const limit = max_backtrack_jobs;
         while (m.bt_jobs.pop()) |job| {
             var pc: u16 = undefined;
             var pos: usize = undefined;
@@ -818,12 +823,14 @@ pub const Matcher = struct {
                         pc += 1;
                     },
                     .split => |sp| {
+                        if (m.bt_jobs.items.len >= limit) return .oom;
                         m.bt_jobs.append(m.gpa, .{ .explore = .{ .pc = sp.y, .pos = pos } }) catch return .oom;
                         pc = sp.x;
                     },
                     .jmp => |t| pc = t,
                     .save => |slot| {
                         if (slot < m.k) {
+                            if (m.bt_jobs.items.len >= limit) return .oom;
                             m.bt_jobs.append(m.gpa, .{ .restore = .{ .slot = slot, .val = m.tmp[slot] } }) catch return .oom;
                             m.tmp[slot] = pos;
                         }
@@ -846,7 +853,7 @@ pub const Matcher = struct {
     pub fn findReader(m: *Matcher, r: *std.Io.Reader) error{ReadFailed}!?Span {
         var t: ReaderText = .init(r);
         const found = m.runOn(&t, 0, false);
-        if (t.failed) return error.ReadFailed;
+        if (t.failed and !found) return error.ReadFailed;
         if (!found) return null;
         return .{ .start = m.best[0], .end = m.best[1] };
     }
@@ -856,7 +863,7 @@ pub const Matcher = struct {
     pub fn capturesReader(m: *Matcher, r: *std.Io.Reader, out: []?Span) error{ReadFailed}!bool {
         var t: ReaderText = .init(r);
         const found = m.runOn(&t, 0, false);
-        if (t.failed) return error.ReadFailed;
+        if (t.failed and !found) return error.ReadFailed;
         if (!found) return false;
         m.fillCaptures(out);
         return true;
@@ -897,9 +904,9 @@ pub const Matcher = struct {
                     .match => {
                         if (full and here.cp != null) continue;
                         if (re.longest) {
-                            // The first thread to end here is the leftmost-first
-                            // among equals; a later step is longer.
-                            if (matched and m.best[1] == pos) continue;
+                            // The match state is one thread per step, so this is
+                            // the leftmost-first among the matches ending here; a
+                            // later step's is longer.
                             @memcpy(m.best, caps);
                             m.best[1] = pos;
                             matched = true;
@@ -1177,7 +1184,7 @@ test "Unicode classes: categories, scripts, aliases, loose names, negation, fold
     try expectFind("[^\\p{L}\\s]+", "ab, cd", ",");
     try expectFind("\\p{lowercase letter}+", "ABcdE", "cd"); // loose: case, space, _ and - ignored
     try expectFind("\\p{old_persian}", "\u{103a0}", "\u{103a0}"); // Go 1.26 refuses it (GO_DEFECT)
-    try expectFind("\\p{ASCII}+", "éabcé", "abc");
+    try expectFind("\\p{ASCII}+", "é\x00abc\x7fé", "\x00abc\x7f");
     try expectFind("\\p{Assigned}", "\u{378}a", "a");
     try expectFind("\\p{Any}", "\u{378}", "\u{378}");
     try expectFind("(?i)\\p{Lu}+", "abcD1", "abcD"); // folded like any class
@@ -1325,6 +1332,95 @@ test "reader front end (Go's MatchReader, FindReaderIndex): constant memory, rea
     var fbuf: [8]u8 = undefined;
     var failing: std.Io.Reader = .{ .vtable = &.{ .stream = Failing.stream }, .buffer = &fbuf, .seek = 0, .end = 0 };
     try testing.expectError(error.ReadFailed, re.isMatchReader(&failing));
+}
+
+test "the backtracker and the Pike VM agree on long texts, past the bit budget and the job cap" {
+    const gpa = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x6274);
+    const rng = prng.random();
+    const text = try gpa.alloc(u8, 40_000);
+    defer gpa.free(text);
+    for (text) |*c| c.* = "abcAB -1\n"[rng.uintLessThan(usize, 9)];
+    const patterns = [_][]const u8{ "(a+)(b*)c", "AB-1", "(?:a|b)*?c(A)", "((a)|b)+?B", "x*", "[ab]{3,}(c|\\n)", "(a*)*(b*)*c?$" };
+    var ga: [8]?Span = undefined;
+    var gb: [8]?Span = undefined;
+    for (patterns) |p| {
+        var re = try Regex.compile(gpa, p);
+        defer re.deinit(gpa);
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        var pm = try Matcher.init(gpa, &re);
+        defer pm.deinit();
+        pm.pike_only = true;
+        const ng = re.names.len;
+        // Starts from far (Pike) to near the end (backtracker), each window length.
+        for ([_]usize{ 0, 100, 20_000, 39_000, 39_900, 39_990, 40_000 }) |from| {
+            for ([_]usize{ 40, 300, 5_000, 40_000 }) |len| {
+                const in = text[0..@min(from + len, text.len)];
+                if (from > in.len) continue;
+                const f1 = m.captures(in, from, ga[0..ng]);
+                const f2 = pm.captures(in, from, gb[0..ng]);
+                errdefer std.debug.print("/{s}/ from {d} len {d}\n", .{ p, from, in.len });
+                try testing.expectEqual(f2, f1);
+                if (f1) try testing.expectEqualSlices(?Span, gb[0..ng], ga[0..ng]);
+            }
+        }
+    }
+    // A program that needs more pending branches than the cap: the search is
+    // handed to the Pike VM and still answers.
+    var deep = try Regex.compile(gpa, "((?:a|b))*c");
+    defer deep.deinit(gpa);
+    const long = "a" ** 20_000 ++ "c";
+    try testing.expect(deep.insts.len * long.len < Matcher.max_backtrack_bits); // the bits fit,
+    var dm = try Matcher.init(gpa, &deep);
+    defer dm.deinit();
+    var dg: [2]?Span = undefined;
+    try testing.expect(dm.captures(long, 0, &dg));
+    try testing.expect(dm.bt_jobs.capacity >= Matcher.max_backtrack_jobs); // the jobs did not
+    try testing.expectEqual(Span{ .start = 0, .end = long.len }, dg[0].?);
+    try testing.expectEqual(Span{ .start = long.len - 2, .end = long.len - 1 }, dg[1].?);
+}
+
+test "surrogates compile and match nothing; Expand takes the first group of a name that took part" {
+    const gpa = testing.allocator;
+    var s = try Regex.compile(gpa, "a\\x{D800}");
+    defer s.deinit(gpa);
+    try testing.expect(!s.isMatch("a\xed\xa0\x80"));
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try testing.expect(try s.literalPrefix(&out.writer)); // Go: "a\u{fffd}", complete
+    try testing.expectEqualStrings("a\u{fffd}", out.written());
+    const cs = comptime comptimeCompile("[\\x{D800}]");
+    try testing.expect(!cs.isMatch("\u{fffd}"));
+
+    var d = try Regex.compile(gpa, "(?P<n>a)|(?P<n>b)");
+    defer d.deinit(gpa);
+    const r = try d.replaceAll(gpa, "xaby", "[$n|${n}|${a b}|${1 }]");
+    defer gpa.free(r);
+    try testing.expectEqualStrings("x[a|a|${a b}|${1 }][b|b|${a b}|${1 }]y", r);
+}
+
+test "a reader that fails after the answer is settled does not turn it into an error" {
+    const Half = struct {
+        r: std.Io.Reader,
+        left: []const u8,
+        fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const self: *@This() = @fieldParentPtr("r", r);
+            if (self.left.len == 0) return error.ReadFailed;
+            const n = limit.minInt(self.left.len);
+            try w.writeAll(self.left[0..n]);
+            self.left = self.left[n..];
+            return n;
+        }
+    };
+    var re = try Regex.compile(testing.allocator, "ab");
+    defer re.deinit(testing.allocator);
+    var buf: [8]u8 = undefined;
+    var h: Half = .{ .r = .{ .vtable = &.{ .stream = Half.stream }, .buffer = &buf, .seek = 0, .end = 0 }, .left = "xab" };
+    try testing.expect(try re.isMatchReader(&h.r)); // fails right after "ab"
+    var buf2: [8]u8 = undefined;
+    var h2: Half = .{ .r = .{ .vtable = &.{ .stream = Half.stream }, .buffer = &buf2, .seek = 0, .end = 0 }, .left = "xa" };
+    try testing.expectError(error.ReadFailed, re.isMatchReader(&h2.r));
 }
 
 test "captures and names" {

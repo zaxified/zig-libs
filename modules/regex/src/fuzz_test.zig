@@ -14,7 +14,17 @@
 //!     first span is `find`'s, no empty span right after the previous one,
 //!     no span splitting a code point, and it ends;
 //!   - a literal-only pattern (no metacharacter drawn) matches exactly where
-//!     `std.mem.indexOf` finds it — a reference that shares no code.
+//!     `std.mem.indexOf` finds it — a reference that shares no code;
+//!   - the two engines agree: the backtracker (short texts) and the Pike VM
+//!     (`pike_only`) give the same match and groups;
+//!   - the reader front end agrees with the slice one (one byte per read);
+//!   - leftmost-longest starts where leftmost-first does and ends no earlier;
+//!   - `replaceAll(.., "$0")` gives the input back; `replaceAllLiteral(.., "")`
+//!     removes exactly the iterator's spans; split pieces are disjoint from
+//!     the matches; every match begins with `literalPrefix`, and a complete
+//!     prefix is matched in full; `quoteMeta(input)` matches the input exactly.
+//!
+//! A share of the patterns is compiled in POSIX syntax (`compilePosix`).
 //!
 //! The Go oracle (`go_oracle_test.zig`) is what holds the answers to Go's;
 //! this holds the engine to itself over far more shapes. Planted mutants
@@ -36,7 +46,7 @@ const fuzz_driver = testkit.fuzz.driver;
 
 /// Reach labels: the driver's `hit` (printed by `REGEX_FUZZ` runs) and a
 /// local count the in-suite test checks.
-const Label = enum { refused, compiled, full, matched, group, literal };
+const Label = enum { refused, compiled, full, matched, group, literal, posix };
 var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
 
 fn hit(comptime l: Label) void {
@@ -66,7 +76,7 @@ fn genAtom(comptime S: type, src: *S, g: *Gen, depth: u32) void {
     switch (src.valueRangeAtMost(u8, 0, if (depth < 2) 13 else 7)) {
         0, 1, 2 => g.put(([_][]const u8{ "a", "b", "c", "é", "1", " ", "-" })[src.index(7)]),
         3 => g.meta("."),
-        4 => g.meta(([_][]const u8{ "[ab]", "[^a]", "[a-c]", "[é1-2]", "[]a]", "[a-]", "[[:alpha:]]", "[^[:digit:]\\n]" })[src.index(8)]),
+        4 => g.meta(([_][]const u8{ "[ab]", "[^a]", "[a-c]", "[é1-2]", "[]a]", "[a-]", "[[:alpha:]]", "[^[:digit:]\\n]", "\\pL", "\\p{Greek}", "\\PN", "[\\p{Lu}a]", "(?i)\\p{Ll}" })[src.index(13)]),
         5 => g.meta(([_][]const u8{ "\\d", "\\w", "\\s", "\\D", "\\W", "\\S", "\\.", "\\x{e9}", "\\Qa.\\E" })[src.index(9)]),
         6 => g.meta(([_][]const u8{ "^", "$", "\\b", "\\B", "\\A", "\\z" })[src.index(6)]),
         7 => {
@@ -111,14 +121,23 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var input_buf: [24]u8 = undefined;
     var il: usize = 0;
     for (0..src.valueRangeAtMost(u8, 0, 10)) |_| {
-        const piece = ([_][]const u8{ "a", "b", "c", "1", " ", "\n", "é", "É", "-", "_", "\xff", "ab" })[src.index(12)];
+        const piece = ([_][]const u8{ "a", "b", "c", "1", " ", "\n", "é", "É", "-", "_", "\xff", "ab", "Ω", "ω" })[src.index(14)];
         if (il + piece.len > input_buf.len) break;
         @memcpy(input_buf[il..][0..piece.len], piece);
         il += piece.len;
     }
-    const input = input_buf[0..il];
+    // Now and then the input repeated to a few hundred bytes: the
+    // prefilter's 32-byte scan and the backtracker's budget edge.
+    var long_buf: [400]u8 = undefined;
+    var input: []const u8 = input_buf[0..il];
+    if (il != 0 and src.valueRangeAtMost(u8, 0, 7) == 0) {
+        var ll: usize = 0;
+        while (ll + il <= long_buf.len) : (ll += il) @memcpy(long_buf[ll..][0..il], input);
+        input = long_buf[0..ll];
+    }
 
-    var re = regex.Regex.compile(gpa, pattern) catch |e| {
+    const posix = src.valueRangeAtMost(u8, 0, 5) == 0;
+    var re = regex.Regex.compileOptions(gpa, pattern, .{ .syntax = if (posix) .posix else .perl }) catch |e| {
         if (e == error.OutOfMemory) return e;
         hit(.refused);
         return;
@@ -162,11 +181,90 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     }
     if ((n == 0) != (found == null)) return error.IteratorDisagreesWithFind;
 
-    if (g.literal_only) {
+    try crossChecks(gpa, &re, &m, input, found);
+    if (posix) hit(.posix);
+
+    if (g.literal_only and !posix) {
         hit(.literal);
         const want = std.mem.indexOf(u8, input, pattern);
         if ((want != null) != any) return error.LiteralReferenceDisagrees;
         if (want) |w| if (found.?.start != w or found.?.end != w + pattern.len) return error.LiteralReferenceSpan;
+    }
+}
+
+/// The engine-against-engine and API invariants (see the file comment).
+fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher, input: []const u8, found: ?regex.Span) anyerror!void {
+    const ng = re.names.len;
+    var g1: [regex.max_groups]?regex.Span = undefined;
+    var g2: [regex.max_groups]?regex.Span = undefined;
+    var pm = try regex.Matcher.init(gpa, re);
+    defer pm.deinit();
+    pm.pike_only = true;
+    for (0..input.len + 1) |from| {
+        const f1 = m.captures(input, from, g1[0..ng]);
+        const f2 = pm.captures(input, from, g2[0..ng]);
+        if (f1 != f2) return error.EnginesDisagree;
+        if (f1) for (g1[0..ng], g2[0..ng]) |a, b| {
+            if ((a == null) != (b == null)) return error.EnginesDisagreeOnGroups;
+            if (a) |x| if (x.start != b.?.start or x.end != b.?.end) return error.EnginesDisagreeOnGroups;
+        };
+    }
+
+    var rbuf: [4]u8 = undefined;
+    var tr: std.testing.Reader = .init(&rbuf, &.{.{ .buffer = input }});
+    tr.artificial_limit = .limited(1);
+    const rf = try m.capturesReader(&tr.interface, g1[0..ng]);
+    if (rf != (found != null)) return error.ReaderDisagrees;
+    if (rf and (g1[0].?.start != found.?.start or g1[0].?.end != found.?.end)) return error.ReaderDisagreesOnSpan;
+    var rbuf2: [4]u8 = undefined;
+    var tr2: std.testing.Reader = .init(&rbuf2, &.{.{ .buffer = input }});
+    tr2.artificial_limit = .limited(1);
+    if (try re.isMatchReader(&tr2.interface) != (found != null)) return error.ReaderMatchDisagrees;
+
+    if (!re.longest) {
+        var lre = re.*;
+        lre.longest = true;
+        var lm = try regex.Matcher.init(gpa, &lre);
+        defer lm.deinit();
+        const l = lm.find(input, 0);
+        if ((l == null) != (found == null)) return error.LongestDisagreesOnMatch;
+        if (l) |x| if (x.start != found.?.start or x.end < found.?.end) return error.LongestNotLongest;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.replaceAll(&out.writer, input, "$0");
+    if (!std.mem.eql(u8, out.written(), input)) return error.ReplaceIdentity;
+    out.clearRetainingCapacity();
+    try m.replaceAllLiteral(&out.writer, input, "");
+    var removed: usize = 0;
+    var it = m.iterator(input);
+    while (it.next()) |x| removed += x.end - x.start;
+    if (out.written().len + removed != input.len) return error.ReplaceRemovesOtherThanMatches;
+
+    var sp = m.split(input, null);
+    var pieces: usize = 0;
+    while (sp.next()) |piece| : (pieces += 1) {
+        const at = @intFromPtr(piece.ptr) - @intFromPtr(input.ptr);
+        if (input.len != 0 and at + piece.len > input.len) return error.SplitOutsideInput;
+        var it2 = m.iterator(input);
+        while (it2.next()) |x| if (x.end > x.start and at < x.end and x.start < at + piece.len) return error.SplitOverlapsMatch;
+    }
+    if (pieces > input.len + 2) return error.SplitTooMany;
+
+    out.clearRetainingCapacity();
+    const complete = try re.literalPrefix(&out.writer);
+    const prefix = out.written();
+    var it3 = m.iterator(input);
+    while (it3.next()) |x| if (!std.mem.startsWith(u8, input[x.start..], prefix)) return error.MatchWithoutLiteralPrefix;
+    if (complete and !re.fullMatch(prefix)) return error.CompletePrefixNotMatched;
+
+    if (std.unicode.utf8ValidateSlice(input)) {
+        const q = try regex.quoteMetaAlloc(gpa, input);
+        defer gpa.free(q);
+        var qre = try regex.Regex.compile(gpa, q);
+        defer qre.deinit(gpa);
+        if (!qre.fullMatch(input)) return error.QuoteMetaDoesNotMatch;
     }
 }
 

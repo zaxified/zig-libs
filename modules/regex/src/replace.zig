@@ -38,8 +38,7 @@ pub fn expand(re: *const Regex, w: *Writer, template: []const u8, input: []const
             continue;
         };
         i = ref.end;
-        const g = groupOf(re, ref.name) orelse continue;
-        if (g < groups.len) if (groups[g]) |s| try w.writeAll(s.slice(input));
+        if (groupSpan(re, ref.name, groups)) |s| try w.writeAll(s.slice(input));
     }
     try w.writeAll(template[i..]);
 }
@@ -77,12 +76,19 @@ fn nameEnd(t: []const u8, j: usize) usize {
     return i;
 }
 
-/// The group a variable names: a number (ASCII digits, no leading zero), or
-/// the first group with that name.
-fn groupOf(re: *const Regex, name: []const u8) ?usize {
-    for (name) |c| if (!std.ascii.isDigit(c)) return re.groupIndex(name);
+/// The span of the group a variable names: a number (ASCII digits, no
+/// leading zero), or — names may repeat — the first group of that name that
+/// took part in the match (Go's choice).
+fn groupSpan(re: *const Regex, name: []const u8, groups: []const ?Span) ?Span {
+    for (name) |c| if (!std.ascii.isDigit(c)) {
+        for (re.names, 0..) |n, g| {
+            if (g < groups.len and std.mem.eql(u8, n, name)) if (groups[g]) |s| return s;
+        }
+        return null;
+    };
     if (name.len > 1 and name[0] == '0') return null;
-    return std.fmt.parseInt(usize, name, 10) catch null;
+    const g = std.fmt.parseInt(usize, name, 10) catch return null;
+    return if (g < groups.len) groups[g] else null;
 }
 
 /// Write `input` with every match (as the iterator finds them) replaced by
@@ -278,8 +284,11 @@ fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: an
             }
             return complete and !stopped;
         }
+        // A surrogate (`\x{D800}`, which no text can match) is written as
+        // U+FFFD, as Go writes it.
         var buf: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(single.?, &buf) catch unreachable;
+        const cp = if (single.? >= 0xd800 and single.? <= 0xdfff) 0xfffd else single.?;
+        const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
         if (!try sink.put(buf[0..n])) return false;
         nxt = .initEmpty();
         var it3 = cur.iterator(.{});

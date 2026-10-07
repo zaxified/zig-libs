@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Fixes from the audit of the entries below: a surrogate literal (`\x{D800}`, which Go
+  compiles) panicked in the literal-prefix walk at compile time — now written as U+FFFD, as Go;
+  `expand` with a repeated group name takes the first group of that name that took part (Go), not
+  the first by index; a reader failing after the match was settled no longer turns it into
+  `error.ReadFailed`; the backtracker hands a search to the Pike VM past 16 Ki pending jobs
+  (was unbounded, ~12 MB worst case).
 - **2026-10-07** — Faster, same answers: a bit-state backtracker (Go's and RE2's, one visited bit
   per position × instruction, ≤ 256 Kbit) finds matches with groups in short texts — submatches 4–11×
   faster than before, now ahead of Go; the literal prefix (up to 16 bytes) is searched for whole by
