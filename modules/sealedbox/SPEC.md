@@ -214,10 +214,27 @@ claimed this module "INHERITS std X25519 ... (NOT a finding)" citing a measureme
   byte shuffle), so further bulk gain would come from fusing the Poly1305 pass into the
   encrypt loop (one read of the ciphertext instead of two). Not measured against the fastest
   field implementation yet (`fastest ?`).
-- **Independent review owed for `xsalsa20poly1305.zig` + `poly1305.zig`** (2026-10-07): the
-  2026-07-10 review and the 2026-09-16 audit covered a std wrapper; the module now implements
-  its symmetric primitive. Held today by differential tests against std, the PyNaCl KATs, the
-  libsodium differential (6000/6000) and ctgrind, which is evidence, not a review.
+- **Reviewed 2026-10-08: `xsalsa20poly1305.zig` + `poly1305.zig`** (line-by-line review of the
+  2026-10-07 primitive code; the 2026-07-10 review and the 2026-09-16 audit covered a std
+  wrapper). One HIGH finding, fixed:
+  - **R1 (HIGH, fixed 2026-10-08)**: `lanes` came straight from `suggestVectorLength(u32)`,
+    which is 32+ on Hexagon HVX and RISC-V zvl1024b+. `xorBlocks` transposes `n x n` groups of
+    the 16 state words, so with `n > 16` it has no group and never writes `out`: an in-place
+    `seal` of ≥ 2 KiB left the plaintext as the "ciphertext" (out-of-place left `out` as it
+    was). Probed on x86 by calling `xorBlocks(32, …)`: output untouched. The differential tests
+    only ran the host's width. Fix: `lanes` capped at 16, a comptime assert in `xorBlocks`
+    (power of two, ≤ 16), and a test of every width 1–16 against std on every host. Never
+    shipped in a tag (the rewrite was still Unreleased).
+  - Checked clean: Salsa20 quarter-round and column/row order, state layout, 64-bit counter
+    words with the carry inside a batch, HSalsa20 output words, block 0 = Poly1305 key + first
+    32 message bytes, tag verified before any plaintext is written, exact in-place aliasing;
+    Poly1305 clamping, the 4-lane Horner split (lane j of the last batch × r^(4−j)), limb
+    bounds (every column < 2^60, every u32 truncation lossless), the final carry (limb 1 ≤ 2^26
+    only in the case that re-normalises in the next step) and the branch-free `h ≥ p` select.
+    Big-endian keystream path run under qemu (s390x, ppc64 pwr9), all tests incl. every width.
+    ctgrind seal 0 / open 1 unchanged.
+  - Not covered: secret material left on the dead stack by the new code (keystream vectors,
+    HSalsa20 state, Poly1305 r/s) — the H2 class above, unchanged by the rewrite.
 
 - **Reviewed 2026-07-10** (adversarial security pass, alongside `hashdigest`) — clean: faithful
   `std.crypto` wrapper, no accidental weakening (key/nonce reuse, truncation, or a silent fallback

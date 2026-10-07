@@ -900,10 +900,10 @@ aescbc	ReleaseFast	xmlenc	1	1	b675b4e62acfe8b9	c4046968725e140d
 # pin is the whole gate, which is why the guard-stripping fix that gave bolt3
 # its pin back matters here too -- a row with NO-OWN-SRC and an unchanged count
 # would have let the barrier be deleted in silence.
-sealedbox	ReleaseFast	hexenc	1	0	11898b3a8c30e377	677e9993da327f0d
-sealedbox	ReleaseFast	hexdec	1	1	11898b3a8c30e377	1c8749621d19a09b
-sealedbox	ReleaseFast	b64enc	1	0	11898b3a8c30e377	ec1bc04ea2ea3ff7
-sealedbox	ReleaseFast	b64dec	1	1	11898b3a8c30e377	1c8749621d19a09b
+sealedbox	ReleaseFast	hexenc	1	0	44eec4e7045312b2	677e9993da327f0d
+sealedbox	ReleaseFast	hexdec	1	1	44eec4e7045312b2	1c8749621d19a09b
+sealedbox	ReleaseFast	b64enc	1	0	44eec4e7045312b2	ec1bc04ea2ea3ff7
+sealedbox	ReleaseFast	b64dec	1	1	44eec4e7045312b2	1c8749621d19a09b
 # ── sealedbox: the XSalsa20-Poly1305 core of seal/open (2026-10-07) ─────────
 # Module code since the multi-block rewrite (`xsalsa20poly1305.zig`,
 # `poly1305.zig`); before it, std's and not a target. 1100-byte message so every
@@ -913,8 +913,8 @@ sealedbox	ReleaseFast	b64dec	1	1	11898b3a8c30e377	1c8749621d19a09b
 # accept/reject it returns to its caller. The harness declassifies that result
 # before its own `try`: LLVM turns the verdict into a select, so without it the
 # `try` is a second, unattributed context (measured, and --check refused it).
-sealedbox	ReleaseFast	seal	1	0	5fb4ca623f1e9b92	162755ddf8591877
-sealedbox	ReleaseFast	open	1	1	5fb4ca623f1e9b92	4d07318504db8dd7
+sealedbox	ReleaseFast	seal	1	0	5e76fba7004b7b0b	162755ddf8591877
+sealedbox	ReleaseFast	open	1	1	5e76fba7004b7b0b	4d07318504db8dd7
 # ── pir: the query index, and the client's check ───────────────────────────
 # A1 `pir.md` M2 -- the module's central claim had never been machine-checked,
 # and its sibling `fss` exposed a REAL defect the day it entered the gate.

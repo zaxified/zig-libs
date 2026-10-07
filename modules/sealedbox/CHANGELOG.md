@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **FIX (targets with ≥ 1024-bit vectors only):** the 2026-10-07
+  XSalsa20 batch width came straight from `std.simd.suggestVectorLength(u32)`; at 32+
+  lanes (Hexagon HVX, RISC-V zvl1024b+) the keystream was never applied to messages
+  of ≥ 2 KiB, so `seal` produced plaintext. Width now capped at 16, with a test of
+  every width against std on every host (review R1, SPEC.md § Backlog). x86, ARM and
+  the other targets were not affected; no tagged release contained the bug.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE (same bytes, faster):** `seal`/`open`
   no longer call `std.crypto.nacl.SealedBox`; they compose std's X25519 and BLAKE2b
   with the module's own XSalsa20-Poly1305 (new `src/xsalsa20poly1305.zig`,

@@ -27,8 +27,11 @@ pub const tag_length = poly1305.mac_length;
 const sigma = [4]u32{ 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 }; // "expand 32-byte k"
 
 /// Blocks computed per batch: the target's natural u32 vector width
-/// (8 with AVX2, 4 with SSE/NEON), at least 4.
-const lanes = @max(4, std.simd.suggestVectorLength(u32) orelse 4);
+/// (8 with AVX2, 4 with SSE/NEON), at least 4 and at most 16. The cap is
+/// load-bearing: `xorBlocks` transposes n x n groups of the 16 state words,
+/// and with n > 16 there is no group at all, so the keystream was never
+/// applied (Hexagon HVX and RISC-V zvl1024b+ suggest 32 or more lanes).
+const lanes = @min(16, @max(4, std.simd.suggestVectorLength(u32) orelse 4));
 
 fn Lanes(comptime n: comptime_int) type {
     return @Vector(n, u32);
@@ -68,6 +71,7 @@ fn baseState(key: *const [8]u32, nonce: [2]u32) [16]u32 {
 /// XOR `n` consecutive keystream blocks starting at block `counter` into
 /// `in`, writing `out` (both exactly `64 * n` bytes).
 inline fn xorBlocks(comptime n: comptime_int, out: []u8, in: []const u8, base: *const [16]u32, counter: u64) void {
+    comptime std.debug.assert(std.math.isPowerOfTwo(n) and n <= 16);
     const V = Lanes(n);
     var x: [16]V = undefined;
     inline for (0..16) |i| x[i] = @splat(base[i]);
@@ -259,6 +263,32 @@ test "salsa20Xor matches std across lengths and counters" {
             salsa20Xor(b[0..len], in[0..len], ctr, &kw, .{ mem.readInt(u32, nonce[0..4], .little), mem.readInt(u32, nonce[4..8], .little) });
             try std.testing.expectEqualSlices(u8, a[0..len], b[0..len]);
         }
+    }
+}
+
+test "xorBlocks matches std at every batch width, not only the host's" {
+    // The bulk path runs at `lanes`, which the host picks; the transpose for
+    // the other widths (down to SSE's 4, up to the cap of 16) is checked here.
+    var prng = std.Random.DefaultPrng.init(0x1a9e5);
+    const r = prng.random();
+    var in: [64 * 16]u8 = undefined;
+    var want: [in.len]u8 = undefined;
+    var got: [in.len]u8 = undefined;
+    var key: [32]u8 = undefined;
+    var nonce: [8]u8 = undefined;
+    r.bytes(&in);
+    r.bytes(&key);
+    r.bytes(&nonce);
+    var kw: [8]u32 = undefined;
+    for (&kw, 0..) |*w, i| w.* = mem.readInt(u32, key[4 * i ..][0..4], .little);
+    const base = baseState(&kw, .{ mem.readInt(u32, nonce[0..4], .little), mem.readInt(u32, nonce[4..8], .little) });
+    const ctr: u64 = 0xffff_fffa; // carries into the high word inside a 16-block batch
+    inline for (.{ 1, 2, 4, 8, 16 }) |n| {
+        const len = 64 * n;
+        crypto.stream.salsa.Salsa20.xor(want[0..len], in[0..len], ctr, key, nonce);
+        @memset(&got, 0x55);
+        xorBlocks(n, got[0..len], in[0..len], &base, ctr);
+        try std.testing.expectEqualSlices(u8, want[0..len], got[0..len]);
     }
 }
 
