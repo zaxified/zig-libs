@@ -6,9 +6,9 @@
 
 **Scope:** core — json5/json5 2.2.3 (JS), JSON5 spec 1.0 (surveyed 2026-09-30); raised from mvp 2026-09-30 with numeric literals + whitespace/continuations
 
-**Audit:** review 2026-09-02 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-09-02 · mutation 2026-10-04 (51/52, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — JSON5 parsing (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

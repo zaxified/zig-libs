@@ -6,9 +6,9 @@
 
 **Scope:** core — rust-bitcoin `taproot` (TaprootBuilder/TaprootSpendInfo), libsecp256k1 `xonly_pubkey_tweak_add` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-09-09 · mutation 2026-10-05 (21/29, 8 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 

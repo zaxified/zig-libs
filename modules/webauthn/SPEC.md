@@ -6,9 +6,9 @@
 
 **Scope:** core — go-webauthn/webauthn (verification half); tpm/android-key/apple attestation are missing (surveyed 2026-09-30; raised from mvp 2026-09-30 when authenticatorData extensions became accepted)
 
-**Audit:** review 2026-09-02 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-09-02 · mutation 2026-10-05 (54/54) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

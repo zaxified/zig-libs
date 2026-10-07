@@ -6,9 +6,9 @@
 
 **Scope:** core — RFC 8288 / requests `Response.links` (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-10-04 · mutation 2026-10-04 (40/41, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — Link header parsing (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

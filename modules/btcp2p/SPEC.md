@@ -6,9 +6,9 @@
 
 **Scope:** mvp — Bitcoin Core v31 `protocol.h` message set; btcd `wire` / rust-bitcoin `p2p` (surveyed 2026-10-05)
 
-**Audit:** review 2026-08-06 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-08-06 · mutation 2026-10-05 (41/41) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct n/a — public wire messages (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

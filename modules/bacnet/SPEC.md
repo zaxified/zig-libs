@@ -6,9 +6,9 @@
 
 **Scope:** mvp — bacnet-stack (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-08-11 · mutation 2026-10-05 (43/43) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — building automation, no auth (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

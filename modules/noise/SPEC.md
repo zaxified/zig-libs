@@ -6,9 +6,9 @@
 
 **Scope:** core — snow v0.10.0, Noise rev 34 (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-10-04 · mutation 2026-10-04 (25/25) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

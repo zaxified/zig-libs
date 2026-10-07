@@ -6,9 +6,9 @@
 
 **Scope:** core — libsecp256k1 v0.8.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-09-15 · mutation 2026-10-05 (47/62, 15 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-09-15 (ctgrind)
 
 **Performance:** not measured
 

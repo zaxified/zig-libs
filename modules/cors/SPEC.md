@@ -6,9 +6,9 @@
 
 **Scope:** core — rs/cors (Go) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-10-04 (36/36) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — header policy, no secrets (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

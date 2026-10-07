@@ -6,9 +6,9 @@
 
 **Scope:** mvp — RFC 9497 as implemented by CIRCL `oprf` and facebook/voprf (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-18 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-07-18 · mutation 2026-10-05 (21/25, 4 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

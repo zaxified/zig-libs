@@ -6,9 +6,9 @@
 
 **Scope:** parity — Go net/netip + go4.org/netipx (surveyed 2026-09-30, gaps closed 2026-10-07)
 
-**Audit:** review 2026-10-07 · mutation 2026-10-07 · src ?
+**Audit:** review 2026-10-07 · mutation 2026-10-07 (19/20, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — IP address types (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

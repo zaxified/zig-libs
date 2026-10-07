@@ -6,9 +6,9 @@
 
 **Scope:** core — rust-bitcoin `Transaction` + `SighashCache`, Bitcoin Core `CTransaction`/`SignatureHash` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-09-15 · mutation 2026-10-05 (32/34, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct n/a — public transaction data (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

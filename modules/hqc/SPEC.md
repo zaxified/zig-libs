@@ -6,9 +6,9 @@
 
 **Scope:** parity — HQC reference v5.0.0 (spec of 2025-08-22), as packaged in liboqs 0.16.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-10-04 (26/29, 3 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 

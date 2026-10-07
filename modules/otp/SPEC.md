@@ -6,9 +6,9 @@
 
 **Scope:** core — pyotp and pquerna/otp (surveyed 2026-09-30); raised from mvp 2026-09-30 with base32 secrets + `otpauth://` parse/format
 
-**Audit:** review 2026-07-18 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-07-18 · mutation 2026-10-04 (56/57, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

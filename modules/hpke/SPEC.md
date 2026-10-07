@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-09 · mutation ? · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 

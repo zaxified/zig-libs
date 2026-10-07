@@ -6,9 +6,9 @@
 
 **Scope:** core — Wireshark 4.6.4 ieee8021ah dissector, IEEE 802.1ah (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-08-06 · mutation 2026-10-04 (44/44) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — PBB codec (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

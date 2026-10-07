@@ -6,9 +6,9 @@
 
 **Scope:** mvp — Snap7 1.4.2; no PLC clock, block list or password, which Snap7 users call routinely (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-17 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-09-17 · mutation 2026-10-05 (42/43, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — PLC protocol, no auth in scope (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

@@ -6,9 +6,9 @@
 
 **Scope:** parity — zlib 1.3.2 crc32/crc32_combine (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-03 · mutation 2026-10-03 · src ?
+**Audit:** review 2026-10-03 · mutation 2026-10-03 (56/65, 9 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — checksum only (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

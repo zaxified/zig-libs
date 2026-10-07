@@ -6,9 +6,9 @@
 
 **Scope:** core — Go crypto/x509 chain verification and rustls-webpki (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-16 · mutation 2026-09-30 · src ?
+**Audit:** review 2026-09-16 · mutation 2026-09-30 (25/25) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct n/a — public certificate verification (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

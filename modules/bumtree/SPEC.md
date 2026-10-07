@@ -6,9 +6,9 @@
 
 **Scope:** mvp — IEEE 802.1aq-2012 SPBM multicast trees (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-08-06 · mutation 2026-10-05 (24/24) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — tree data structure (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

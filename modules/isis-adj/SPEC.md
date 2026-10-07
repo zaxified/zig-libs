@@ -6,9 +6,9 @@
 
 **Scope:** mvp — holo-isis adjacency layer (holo v0.9.0), behaviour cross-checked against FRR isisd 10.7 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-07 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-09-07 · mutation 2026-10-05 (40/44, 4 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — IS-IS adjacency FSM (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

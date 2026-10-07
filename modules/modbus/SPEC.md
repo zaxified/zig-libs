@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation none · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — industrial protocol, no auth (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

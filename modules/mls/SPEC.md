@@ -6,9 +6,9 @@
 
 **Scope:** mvp — OpenMLS v0.9.0, RFC 9420 (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation 2026-10-06 · src ?
+**Audit:** review 2026-08-11 · mutation 2026-10-06 (40/41, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

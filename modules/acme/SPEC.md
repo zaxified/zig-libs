@@ -6,9 +6,9 @@
 
 **Scope:** core — Go `x/crypto/acme` + `autocert` (RFC 8555 client for auto-TLS servers), against lego and certbot; all three challenges incl. DNS-01/wildcards; no EAB, no revocation, no ARI (surveyed 2026-09-30; raised from mvp 2026-09-30 with DNS-01)
 
-**Audit:** review 2026-07-18 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-07-18 · mutation 2026-10-04 (43/47, 3 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

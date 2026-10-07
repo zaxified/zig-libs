@@ -6,9 +6,9 @@
 
 **Scope:** mvp — go-imap v2 `imapclient` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-10-05 (38/40, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

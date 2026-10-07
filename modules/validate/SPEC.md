@@ -6,9 +6,9 @@
 
 **Scope:** core — go-playground/validator v10.30.5 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-09-02 · mutation 2026-10-04 (54/58, 4 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — input validation (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

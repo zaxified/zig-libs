@@ -6,9 +6,9 @@
 
 **Scope:** core — MCP TypeScript SDK 2.2.0, server side, MCP spec 2026-07-28 (surveyed 2026-09-30; raised from mvp 2026-09-30 when 2026-07-28 was served)
 
-**Audit:** review 2026-09-02 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-09-02 · mutation 2026-10-04 (62/63, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

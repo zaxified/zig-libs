@@ -6,9 +6,9 @@
 
 **Scope:** core — Rust `cookie` 0.18 and Go `net/http` cookies (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-07-19 · mutation 2026-10-04 (32/32) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

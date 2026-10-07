@@ -6,9 +6,9 @@
 
 **Scope:** core — FastAPI 0.142 generated spec (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-10-04 (34/35, 1 eq) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — schema generation (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

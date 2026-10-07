@@ -6,9 +6,9 @@
 
 **Scope:** mvp — Jinja2 3.1.6 (surveyed 2026-09-30): faithful core and oracle-checked, but a typical Jinja2 user hits absent filters (`format`, `groupby`, `wordwrap`) and ASCII-only case mapping
 
-**Audit:** review 2026-09-02 · mutation 2026-10-06 · src ?
+**Audit:** review 2026-09-02 · mutation 2026-10-06 (36/38, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — template engine (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

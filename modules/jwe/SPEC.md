@@ -6,9 +6,9 @@
 
 **Scope:** core — go-jose v4.1.5 / panva jose (JWE compact) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-09-03 · mutation 2026-10-05 (32/35, 3 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

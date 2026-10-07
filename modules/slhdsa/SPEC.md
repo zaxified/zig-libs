@@ -6,9 +6,9 @@
 
 **Scope:** core — FIPS 205 as shipped in liboqs 0.16.0 (slhdsa-c) (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-18 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-07-18 · mutation 2026-10-05 (11/11) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 

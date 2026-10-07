@@ -6,9 +6,9 @@
 
 **Scope:** parity — jedisct1/minisign 0.12 (file format and crypto; the CLI is out of scope by design) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-10-04 (42/43, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

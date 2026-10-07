@@ -6,9 +6,9 @@
 
 **Scope:** core — OpenSSL 4.0 / BoringSSL TLS 1.3 server tickets; every TLS 1.3 resumption piece is here as engine-agnostic functions, with rotation left to the caller's schedule and no TLS 1.2 tickets (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-18 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-07-18 · mutation 2026-10-04 (37/37) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

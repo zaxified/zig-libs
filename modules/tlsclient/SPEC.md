@@ -6,9 +6,9 @@
 
 **Scope:** core — Go crypto/tls and rustls TLS clients (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-10-04 · mutation 2026-10-04 (22/23) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

@@ -6,9 +6,9 @@
 
 **Scope:** core — coder/websocket v1.8.15 + Autobahn|Testsuite (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-08-06 · mutation 2026-10-04 (68/69, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — framing; mask key not secret (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

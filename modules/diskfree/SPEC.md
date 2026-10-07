@@ -6,9 +6,9 @@
 
 **Scope:** core — GNU coreutils df 9.12 (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-10-04 · mutation 2026-10-04 (8/9, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — statvfs reporting (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

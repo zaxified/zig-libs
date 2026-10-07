@@ -6,9 +6,9 @@
 
 **Scope:** mvp — grpc-go / gRPC C-core (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-09-06 · src ?
+**Audit:** review 2026-08-06 · mutation 2026-09-06 (22/22) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — RPC framing (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

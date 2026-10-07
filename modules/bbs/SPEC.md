@@ -6,9 +6,9 @@
 
 **Scope:** core — draft-irtf-cfrg-bbs-signatures -12 and zkryptium (draft-10) (surveyed 2026-09-30; mvp -> core 2026-10-06 after the pin moved to -12 and the SHAKE-256 suite landed, both suites byte-exact on the draft's vectors)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-06 · src ?
+**Audit:** review 2026-09-09 · mutation 2026-10-06 (19/19) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-10-06 (ctgrind)
 
 **Performance:** not measured
 

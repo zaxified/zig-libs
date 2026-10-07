@@ -6,9 +6,9 @@
 
 **Scope:** mvp — google/distributed_point_functions and libfss (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-06 · src ?
+**Audit:** review 2026-09-09 · mutation 2026-10-06 (39/40, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 

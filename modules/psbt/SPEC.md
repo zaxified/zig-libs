@@ -6,9 +6,9 @@
 
 **Scope:** mvp — Bitcoin Core `psbt.h`/`rpc_psbt` (BIP174/370/371) + rust-bitcoin `psbt` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-10-05 (56/58, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct n/a — public partial transactions (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

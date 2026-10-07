@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-17 · mutation none · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

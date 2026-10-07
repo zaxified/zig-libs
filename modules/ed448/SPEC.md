@@ -6,9 +6,9 @@
 
 **Scope:** parity — OpenSSL 4.0 Ed448/X448 (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-18 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-07-18 · mutation 2026-10-04 (56/58, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-08-11 (ctgrind)
 
 **Performance:** not measured
 

@@ -6,9 +6,9 @@
 
 **Scope:** core — Go `archive/tar` / tar-rs 0.4.46; GNU tar, busybox and pax archives read (pax `path`/`linkpath`/`size`/`uid`/`gid`/`mtime` incl. nanoseconds), pax 'x' headers written on request (`WriteOptions.long_names = .pax`), both since 2026-09-30; missing: sparse files, pax global ('g') headers, arbitrary pax records (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-01 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-09-01 · mutation 2026-10-04 (51/53, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — archive reading (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

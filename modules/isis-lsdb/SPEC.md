@@ -6,9 +6,9 @@
 
 **Scope:** mvp — FRR isisd update process (10.7, `isis_lsp.c` behaviour) and holo-isis `lsdb.rs` (v0.9.0), ISO 10589 §7.3; the update process is complete, but LSP generation, the auth check and LSPDBOverload are missing (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-08-11 · mutation 2026-10-05 (47/52, 5 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — LSP database (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

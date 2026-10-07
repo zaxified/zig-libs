@@ -6,9 +6,9 @@
 
 **Scope:** parity — lnd `brontide` (lnd v0.21.3-beta) / LDK `PeerChannelEncryptor` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-11 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-09-11 · mutation 2026-10-04 (29/32, 3 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-09-08 (ctgrind)
 
 **Performance:** not measured
 

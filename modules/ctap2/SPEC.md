@@ -6,9 +6,9 @@
 
 **Scope:** core — python-fido2 2.2.1 `ClientPin` (surveyed 2026-09-30): every clientPIN subcommand of CTAP 2.1 over both protocols, getInfo, CTAPHID framing; the rest of CTAP2 (makeCredential, getAssertion, credential management) is out of this module
 
-**Audit:** review 2026-10-03 · mutation 2026-10-03 · src ?
+**Audit:** review 2026-10-03 · mutation 2026-10-03 (84/87, 3 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

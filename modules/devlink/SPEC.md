@@ -6,9 +6,9 @@
 
 **Scope:** mvp — iproute2 `devlink` 7.2.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-09-02 · mutation 2026-10-05 (36/40, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — netlink device info (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

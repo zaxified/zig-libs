@@ -6,9 +6,9 @@
 
 **Scope:** core — FRR isisd DIS election (10.7, ISO 10589 §8.4.5); holo-isis for the surrounding layer (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-08-06 · mutation 2026-10-04 (28/28) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — DIS election (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

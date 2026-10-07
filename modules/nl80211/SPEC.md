@@ -6,9 +6,9 @@
 
 **Scope:** core — iw 6.17 (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-10-04 · mutation 2026-10-04 (27/28, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — wifi netlink queries (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

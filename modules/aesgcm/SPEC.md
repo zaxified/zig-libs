@@ -6,9 +6,9 @@
 
 **Scope:** core — OpenSSL 4.0 AES-GCM (EVP), against Go `crypto/cipher`, RustCrypto `aes-gcm`, ring and `std.crypto.aead.aes_gcm` (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-04 · mutation 2026-09-28 · src ?
+**Audit:** review 2026-10-04 · mutation 2026-09-28 (31/31) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-09-28 (ctgrind)
 
 **Performance:** not measured
 

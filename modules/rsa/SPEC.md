@@ -6,9 +6,9 @@
 
 **Scope:** core — OpenSSL 4.0 RSA (PKCS#1 v2.2 signatures, OAEP, key parsing); capped at 4096-bit moduli and without RSAES-PKCS1-v1_5 (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-12 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-08-12 · mutation 2026-10-04 (55/59, 4 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-10-03 (ctgrind)
 
 **Performance:** not measured
 

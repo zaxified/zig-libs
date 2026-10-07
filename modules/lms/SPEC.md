@@ -6,9 +6,9 @@
 
 **Scope:** core — cisco/hash-sigs (RFC 8554 reference), pyhsslms, hbs-lms-rust, Bouncy Castle (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-03 · mutation 2026-10-03 · src ?
+**Audit:** review 2026-10-03 · mutation 2026-10-03 (60/67, 7 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

@@ -6,9 +6,9 @@
 
 **Scope:** core — CPython `configparser` 3.14, GLib `GKeyFile` 2.88 (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-03 · mutation 2026-10-03 · src ?
+**Audit:** review 2026-10-03 · mutation 2026-10-03 (77/77) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — INI parsing (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

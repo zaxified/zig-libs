@@ -6,9 +6,9 @@
 
 **Scope:** core — RFC 8439 ChaCha20-Poly1305 as shipped by OpenSSL 4.0 and Go `x/crypto/chacha20poly1305`; no XChaCha20 (which `std`, libsodium, Go and RustCrypto all have) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-09-02 · mutation 2026-10-04 (44/54, 8 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-09-08 (ctgrind)
 
 **Performance:** not measured
 

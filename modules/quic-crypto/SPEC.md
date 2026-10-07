@@ -6,9 +6,9 @@
 
 **Scope:** core — rustls `quic` API and ngtcp2_crypto (surveyed 2026-09-30); raised from mvp 2026-09-30 with Retry integrity + QUIC v2
 
-**Audit:** review 2026-07-18 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-07-18 · mutation 2026-10-05 (22/23, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

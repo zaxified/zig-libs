@@ -6,9 +6,9 @@
 
 **Scope:** core — Linux traceroute(8) / mtr (ICMP echo and UDP methods) (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-10-04 · mutation 2026-10-04 (29/29) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — traceroute probes (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

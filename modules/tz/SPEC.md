@@ -6,9 +6,9 @@
 
 **Scope:** core — IANA tz database / `localtime(3)`, tzdata 2026a (surveyed 2026-09-30); raised from mvp 2026-09-30 with local → UTC conversion
 
-**Audit:** review 2026-07-18 · mutation 2026-09-30 · src ?
+**Audit:** review 2026-07-18 · mutation 2026-09-30 (11/13, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — timezone data (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

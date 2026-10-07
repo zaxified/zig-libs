@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-03 · mutation 2026-08-23 · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — LSP flooding (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

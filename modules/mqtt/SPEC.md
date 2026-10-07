@@ -6,9 +6,9 @@
 
 **Scope:** core — Eclipse Mosquitto 2.x broker + client libraries: MQTT 3.1.1 and 5.0, QoS 0–2 both ways, sessions with expiry, shared subscriptions, properties end to end; broker extended auth, `$SYS`, bridging and persistence absent (surveyed 2026-09-30; raised from mvp 2026-10-01 with MQTT 5.0 and broker QoS 2)
 
-**Audit:** review 2026-10-01 · mutation 2026-10-01 · src ?
+**Audit:** review 2026-10-01 · mutation 2026-10-01 (48/48) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

@@ -6,9 +6,9 @@
 
 **Scope:** mvp — libsignal v0.103.1 and the Signal specifications (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-10-05 (29/30, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 

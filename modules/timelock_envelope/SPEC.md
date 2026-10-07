@@ -6,9 +6,9 @@
 
 **Scope:** core — drand `tle` / age (time-lock and hybrid-PQ file encryption); no equivalent AND-of-locks envelope exists (surveyed 2026-09-30; mvp -> core 2026-10-06 after the streaming format landed)
 
-**Audit:** review 2026-08-06 · mutation 2026-10-06 · src ?
+**Audit:** review 2026-08-06 · mutation 2026-10-06 (10/10) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

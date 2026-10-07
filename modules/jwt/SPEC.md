@@ -6,9 +6,9 @@
 
 **Scope:** core — golang-jwt/jwt v5.3.1 and panva/jose v6.2.12 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-01 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-09-01 · mutation 2026-10-04 (105/111, 6 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

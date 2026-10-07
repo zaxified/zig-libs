@@ -6,9 +6,9 @@
 
 **Scope:** mvp — xmss-reference (RFC 8391 reference code), go-xmssmt (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-11 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-09-11 · mutation 2026-10-05 (23/24, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct none
 
 **Performance:** not measured
 

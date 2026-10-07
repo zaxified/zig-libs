@@ -6,9 +6,9 @@
 
 **Scope:** core — helmet.js 8.3.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-07-19 · mutation 2026-10-04 (26/26) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — header policy (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

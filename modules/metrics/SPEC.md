@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-11 · mutation 2026-09-11 · src ?
 
-**Hardening:** fuzz n/a — see `**Fuzz exemption:**` below · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz n/a — see `**Fuzz exemption:**` below · ct n/a — metric counters (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

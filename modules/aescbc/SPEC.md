@@ -6,9 +6,9 @@
 
 **Scope:** core — RustCrypto `cbc` 0.2.1 / Go `crypto/cipher` CBC (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-08-06 · mutation 2026-10-05 (17/17) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 

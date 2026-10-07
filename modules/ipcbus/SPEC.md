@@ -6,13 +6,13 @@
 
 **Scope:** mvp — NNG 1.12.3 (req/rep over `ipc://`) and D-Bus as the same-host control-plane yardsticks (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation 2026-10-05 · src ?
+**Audit:** review 2026-07-19 · mutation 2026-10-05 (25/25) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — local IPC framing (keyword review, 2026-10-08)
 
 **Performance:** not measured
 
-**Evidence:** unclassified
+**Evidence:** kat — hand-written dispatch examples; framing delegated
 
 **Known defects:** none recorded
 

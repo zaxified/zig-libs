@@ -6,9 +6,9 @@
 
 **Scope:** core — libpcap (Linux live capture path) (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-10-04 · mutation 2026-10-04 (39/41, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — raw sockets (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

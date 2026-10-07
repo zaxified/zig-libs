@@ -6,9 +6,9 @@
 
 **Scope:** core — Bitcoin Core `DecodeDestination`/`EncodeDestination`/`DecodeSecret`/`EncodeSecret` + rust-bitcoin `Address` (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-03 · mutation 2026-10-03 · src ?
+**Audit:** review 2026-10-03 · mutation 2026-10-03 (53/53) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct n/a — public address derivation (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

@@ -6,9 +6,9 @@
 
 **Scope:** core — lldpd 1.0.22 (LLDP/CDP) and gopacket layers (ARP/DHCPv4) (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-10-04 · mutation 2026-10-04 (34/34) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — LLDP/CDP codec (keyword review, 2026-10-08)
 
 **Performance:** not measured
 

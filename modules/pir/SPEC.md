@@ -6,9 +6,9 @@
 
 **Scope:** core — google/distributed_point_functions PIR (two-server DPF family) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-06 · src ?
+**Audit:** review 2026-09-09 · mutation 2026-10-06 (52/53, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct ?
+**Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 

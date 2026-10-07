@@ -6,9 +6,9 @@
 
 **Scope:** core — Go net resolver / c-ares stub resolvers (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-12 · mutation 2026-10-04 · src ?
+**Audit:** review 2026-09-12 · mutation 2026-10-04 (54/54) · src ?
 
-**Hardening:** fuzz ? · ct n/a — no secret-dependent code (initial v2 fill, not reviewed)
+**Hardening:** fuzz ? · ct n/a — public DNS codec (keyword review, 2026-10-08)
 
 **Performance:** not measured
 
