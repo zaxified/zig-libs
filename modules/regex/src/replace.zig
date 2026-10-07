@@ -213,21 +213,53 @@ pub fn quoteMeta(w: *Writer, text: []const u8) Writer.Error!void {
 /// of code points ends it. Complete when, after the prefix, the match is all
 /// that is left.
 pub fn literalPrefix(re: *const Regex, w: *Writer) Writer.Error!bool {
+    const Sink = struct {
+        w: *Writer,
+        fn put(s: @This(), bytes: []const u8) Writer.Error!bool {
+            try s.w.writeAll(bytes);
+            return true;
+        }
+    };
+    return walkPrefix(re.insts, re.ranges, Sink{ .w = w });
+}
+
+/// The first `buf.len` bytes (at most) of the literal prefix, for the
+/// prefilter; its length. Also at comptime.
+pub fn prefixInto(insts: []const syntax.Inst, ranges: []const syntax.Range, buf: []u8) usize {
+    const Sink = struct {
+        buf: []u8,
+        n: *usize,
+        fn put(s: @This(), bytes: []const u8) error{}!bool {
+            if (s.n.* + bytes.len > s.buf.len) return false; // full: stop here
+            // U+FFFD also matches an invalid byte, which these bytes would miss.
+            if (std.mem.eql(u8, bytes, "\u{fffd}")) return false;
+            @memcpy(s.buf[s.n.*..][0..bytes.len], bytes);
+            s.n.* += bytes.len;
+            return true;
+        }
+    };
+    var n: usize = 0;
+    _ = walkPrefix(insts, ranges, Sink{ .buf = buf, .n = &n }) catch unreachable;
+    return n;
+}
+
+/// `literalPrefix` over a program, writing through `sink.put` (false: stop).
+fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: anytype) !bool {
     var cur: std.StaticBitSet(root.max_insts) = .initEmpty();
     var nxt: std.StaticBitSet(root.max_insts) = .initEmpty();
     var complete = true;
     var stopped = false;
     // At the start: `\A` may be passed.
-    reach(re, &cur, 0, true, &complete, &stopped);
+    reach(insts, &cur, 0, true, &complete, &stopped);
     var steps: usize = 0;
     while (!stopped and steps <= root.max_insts) : (steps += 1) {
         var single: ?u21 = null;
         var ended = false;
         var it = cur.iterator(.{});
-        while (it.next()) |pc| switch (re.insts[pc]) {
+        while (it.next()) |pc| switch (insts[pc]) {
             .match => ended = true,
             .rune => |r| {
-                const rs = re.ranges[r.start..][0..r.len];
+                const rs = ranges[r.start..][0..r.len];
                 if (rs.len != 1 or rs[0].lo != rs[0].hi or (single != null and single.? != rs[0].lo)) {
                     ended = true;
                 } else single = rs[0].lo;
@@ -239,7 +271,7 @@ pub fn literalPrefix(re: *const Regex, w: *Writer) Writer.Error!bool {
             if (complete) {
                 var only_match = cur.count() == 1;
                 var it2 = cur.iterator(.{});
-                while (it2.next()) |pc| if (re.insts[pc] != .match) {
+                while (it2.next()) |pc| if (insts[pc] != .match) {
                     only_match = false;
                 };
                 complete = only_match;
@@ -248,10 +280,10 @@ pub fn literalPrefix(re: *const Regex, w: *Writer) Writer.Error!bool {
         }
         var buf: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(single.?, &buf) catch unreachable;
-        try w.writeAll(buf[0..n]);
+        if (!try sink.put(buf[0..n])) return false;
         nxt = .initEmpty();
         var it3 = cur.iterator(.{});
-        while (it3.next()) |pc| reach(re, &nxt, @intCast(pc + 1), false, &complete, &stopped);
+        while (it3.next()) |pc| reach(insts, &nxt, @intCast(pc + 1), false, &complete, &stopped);
         std.mem.swap(std.StaticBitSet(root.max_insts), &cur, &nxt);
     }
     return false;
@@ -260,7 +292,7 @@ pub fn literalPrefix(re: *const Regex, w: *Writer) Writer.Error!bool {
 /// Add to `set` the consuming states and the match reachable from `pc0`
 /// without consuming. An assertion stops the prefix (`stopped`), except `\A`
 /// at the start, which only makes it incomplete.
-fn reach(re: *const Regex, set: *std.StaticBitSet(root.max_insts), pc0: u16, at_start: bool, complete: *bool, stopped: *bool) void {
+fn reach(insts: []const syntax.Inst, set: *std.StaticBitSet(root.max_insts), pc0: u16, at_start: bool, complete: *bool, stopped: *bool) void {
     var seen: std.StaticBitSet(root.max_insts) = .initEmpty();
     var stack: [2 * root.max_insts]u16 = undefined;
     var sp: usize = 1;
@@ -270,7 +302,7 @@ fn reach(re: *const Regex, set: *std.StaticBitSet(root.max_insts), pc0: u16, at_
         const pc = stack[sp];
         if (seen.isSet(pc)) continue;
         seen.set(pc);
-        switch (re.insts[pc]) {
+        switch (insts[pc]) {
             .jmp => |t| {
                 stack[sp] = t;
                 sp += 1;

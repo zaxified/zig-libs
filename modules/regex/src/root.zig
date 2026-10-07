@@ -265,7 +265,7 @@ pub const Regex = struct {
                 // No thread alive: a match can only start where the prefilter allows.
                 if (pf.anchored and pos != 0) return false;
                 if (@TypeOf(text.*).can_skip and pf.first != null) {
-                    pos = text.skip(pf, pos) orelse return false;
+                    pos = text.skip(&pf, pos) orelse return false;
                     prev = text.before(pos);
                 }
             }
@@ -417,9 +417,14 @@ pub const Prefilter = struct {
     first: ?[4]u64 = null,
     /// The set's only member, when it has one.
     single: ?u8 = null,
+    /// The first bytes of the literal text every match begins with
+    /// (`Regex.literalPrefix`), up to 16; used from two bytes on.
+    lit: [16]u8 = undefined,
+    lit_len: u8 = 0,
 
     /// The first position at or after `pos` whose byte may start a match.
-    fn next(pf: Prefilter, input: []const u8, pos: usize) ?usize {
+    fn next(pf: *const Prefilter, input: []const u8, pos: usize) ?usize {
+        if (pf.lit_len >= 2) return findLiteral(input, pos, pf.lit[0..pf.lit_len]);
         if (pf.single) |c| return std.mem.indexOfScalarPos(u8, input, pos, c);
         const set = pf.first.?;
         var i = pos;
@@ -430,6 +435,33 @@ pub const Prefilter = struct {
         return null;
     }
 };
+
+/// The first occurrence of `lit` (two bytes or more) at or after `pos`:
+/// 32 positions at a time, those whose first AND last byte match are checked
+/// in full ("packed pair"; `std.mem.indexOfPos` compares byte by byte for a
+/// short needle).
+fn findLiteral(input: []const u8, pos: usize, lit: []const u8) ?usize {
+    const V = @Vector(32, u8);
+    const last = lit.len - 1;
+    const first_v: V = @splat(lit[0]);
+    const last_v: V = @splat(lit[last]);
+    var i = pos;
+    while (i + last + 32 <= input.len) : (i += 32) {
+        const a: V = input[i..][0..32].*;
+        const b: V = input[i + last ..][0..32].*;
+        const m1: u32 = @bitCast(a == first_v);
+        const m2: u32 = @bitCast(b == last_v);
+        var mask = m1 & m2;
+        while (mask != 0) : (mask &= mask - 1) {
+            const at = i + @ctz(mask);
+            if (std.mem.eql(u8, input[at + 1 ..][0 .. last - 1], lit[1..last])) return at;
+        }
+    }
+    while (i + lit.len <= input.len) : (i += 1) {
+        if (input[i] == lit[0] and std.mem.eql(u8, input[i..][0..lit.len], lit)) return i;
+    }
+    return null;
+}
 
 /// Work out `Prefilter` from a program: follow the empty transitions from the
 /// start. `anchored` when a `\A` stands before every consuming state and the
@@ -488,6 +520,7 @@ fn analyze(insts: []const Inst, ranges: []const Range) Prefilter {
         }
     }
     pf.anchored = !unanchored;
+    pf.lit_len = @intCast(replace.prefixInto(insts, ranges, &pf.lit));
     if (!any_first) {
         pf.first = set;
         var count: usize = 0;
@@ -538,6 +571,20 @@ pub const Matcher = struct {
     stack: []Entry,
     tmp: []usize,
     best: []usize,
+    /// The backtracker's scratch, grown on first use: one bit per
+    /// (position, instruction) visited, all zero between searches; and its
+    /// stack of pending branches and capture restores.
+    bt_visited: std.ArrayList(u64) = .empty,
+    bt_jobs: std.ArrayList(Job) = .empty,
+    /// Tests only: always the Pike VM, to compare the two engines.
+    pike_only: bool = false,
+
+    const Job = union(enum) { explore: struct { pc: u16, pos: usize }, restore: struct { slot: u16, val: usize } };
+
+    /// The backtracker runs when (positions × instructions) fits this many
+    /// bits (Go's limit too): a short text, where it beats the Pike VM's
+    /// per-thread capture copies.
+    const max_backtrack_bits = 256 * 1024;
 
     const List = struct {
         pcs: []u16,
@@ -592,6 +639,8 @@ pub const Matcher = struct {
     }
 
     pub fn deinit(m: *Matcher) void {
+        m.bt_visited.deinit(m.gpa);
+        m.bt_jobs.deinit(m.gpa);
         m.gpa.free(m.block);
         m.* = undefined;
     }
@@ -684,8 +733,110 @@ pub const Matcher = struct {
     /// nothing; later threads of the same start may still find a longer one,
     /// and threads that started later are dropped.
     fn run(m: *Matcher, input: []const u8, from: usize, full: bool) bool {
+        if (!full and !m.pike_only and !m.re.longest) if (m.backtrack(input, from)) |found| return found;
         var t: SliceText = .{ .input = input };
         return m.runOn(&t, from, full);
+    }
+
+    /// Leftmost-first search by backtracking with a visited bit per
+    /// (position, instruction) — each state is explored once, so the time is
+    /// linear in their number, as the Pike VM's. A depth-first walk taking
+    /// the preferred branch first finds the leftmost-first match first, and
+    /// carries one set of captures instead of one per thread. A state that
+    /// failed once fails again from any start, so the bits are kept across
+    /// start positions. Null when the text is too long for the bit budget, or
+    /// the scratch cannot grow: the caller runs the Pike VM.
+    fn backtrack(m: *Matcher, input: []const u8, from: usize) ?bool {
+        const re = m.re;
+        const n = re.insts.len;
+        const width = input.len - from + 1;
+        if (width > max_backtrack_bits / n) return null;
+        const words = (width * n + 63) / 64;
+        if (m.bt_visited.items.len < words) {
+            const old = m.bt_visited.items.len;
+            m.bt_visited.resize(m.gpa, words) catch return null;
+            @memset(m.bt_visited.items[old..], 0);
+        }
+        var hi = from; // the furthest position a state was visited at
+        defer {
+            // Leave the bits zero: only the prefix that was used.
+            const used = ((hi - from + 1) * n + 63) / 64;
+            @memset(m.bt_visited.items[0..used], 0);
+            m.bt_jobs.clearRetainingCapacity();
+        }
+        const pf = &re.prefilter;
+        var start = from;
+        while (true) {
+            if (pf.anchored and start != from) return false;
+            if (pf.first != null) start = pf.next(input, start) orelse return false;
+            switch (m.backtrackAt(input, from, start, &hi)) {
+                .found => return true,
+                .oom => return null,
+                .none => {},
+            }
+            if (start >= input.len) return false;
+            start += decode(input, start).w;
+        }
+    }
+
+    fn backtrackAt(m: *Matcher, input: []const u8, from: usize, start: usize, hi: *usize) enum { found, none, oom } {
+        const re = m.re;
+        const n = re.insts.len;
+        const visited = m.bt_visited.items;
+        @memset(m.tmp, nil);
+        m.bt_jobs.append(m.gpa, .{ .explore = .{ .pc = 0, .pos = start } }) catch return .oom;
+        while (m.bt_jobs.pop()) |job| {
+            var pc: u16 = undefined;
+            var pos: usize = undefined;
+            switch (job) {
+                .restore => |r| {
+                    m.tmp[r.slot] = r.val;
+                    continue;
+                },
+                .explore => |e| {
+                    pc = e.pc;
+                    pos = e.pos;
+                },
+            }
+            while (true) {
+                const bit = (pos - from) * n + pc;
+                const mask = @as(u64, 1) << @truncate(bit);
+                if (visited[bit >> 6] & mask != 0) break;
+                visited[bit >> 6] |= mask;
+                hi.* = @max(hi.*, pos);
+                switch (re.insts[pc]) {
+                    .match => {
+                        @memcpy(m.best, m.tmp);
+                        m.best[1] = pos;
+                        return .found;
+                    },
+                    .rune, .any, .any_not_nl => {
+                        const d = decode(input, pos);
+                        const cp = d.cp orelse break;
+                        if (!re.consumes(pc, cp)) break;
+                        pos += d.w;
+                        pc += 1;
+                    },
+                    .split => |sp| {
+                        m.bt_jobs.append(m.gpa, .{ .explore = .{ .pc = sp.y, .pos = pos } }) catch return .oom;
+                        pc = sp.x;
+                    },
+                    .jmp => |t| pc = t,
+                    .save => |slot| {
+                        if (slot < m.k) {
+                            m.bt_jobs.append(m.gpa, .{ .restore = .{ .slot = slot, .val = m.tmp[slot] } }) catch return .oom;
+                            m.tmp[slot] = pos;
+                        }
+                        pc += 1;
+                    },
+                    .assert => |a| {
+                        if (!assertHolds(a, runeBefore(input, pos), decode(input, pos).cp)) break;
+                        pc += 1;
+                    },
+                }
+            }
+        }
+        return .none;
     }
 
     /// Go's `FindReaderIndex`: the leftmost match in what `r` yields, as byte
@@ -725,7 +876,7 @@ pub const Matcher = struct {
                 // No thread alive: a match can only start where the prefilter allows.
                 if (pf.anchored and pos != from) break;
                 if (@TypeOf(text.*).can_skip and pf.first != null) {
-                    pos = text.skip(pf, pos) orelse break;
+                    pos = text.skip(&pf, pos) orelse break;
                     prev = text.before(pos);
                 }
             }
@@ -841,7 +992,7 @@ const SliceText = struct {
         return runeBefore(t.input, pos);
     }
 
-    fn skip(t: *const SliceText, pf: Prefilter, pos: usize) ?usize {
+    fn skip(t: *const SliceText, pf: *const Prefilter, pos: usize) ?usize {
         return pf.next(t.input, pos);
     }
 };
@@ -881,7 +1032,7 @@ const ReaderText = struct {
         return null;
     }
 
-    fn skip(_: *const ReaderText, _: Prefilter, pos: usize) ?usize {
+    fn skip(_: *const ReaderText, _: *const Prefilter, pos: usize) ?usize {
         return pos;
     }
 
@@ -1303,6 +1454,19 @@ test "robustness: random patterns and inputs compile or refuse, and match, witho
             try testing.expectEqual(any, bare.isMatch(in));
             try testing.expectEqual(s, bm.find(in, 0));
             for (0..in.len + 1) |from| try testing.expectEqual(bm.find(in, from), m.find(in, from));
+            // The backtracker and the Pike VM find the same match and groups.
+            var pm = try Matcher.init(testing.allocator, &re);
+            defer pm.deinit();
+            pm.pike_only = true;
+            var g1: [max_groups]?Span = undefined;
+            var g2: [max_groups]?Span = undefined;
+            const ng = re.names.len;
+            for (0..in.len + 1) |from| {
+                const f1 = m.captures(in, from, g1[0..ng]);
+                const f2 = pm.captures(in, from, g2[0..ng]);
+                try testing.expectEqual(f2, f1);
+                if (f1) try testing.expectEqualSlices(?Span, g2[0..ng], g1[0..ng]);
+            }
         }
     }
     try testing.expect(compiled > 2_000); // the driver reaches the matcher
@@ -1322,6 +1486,21 @@ test "prefilter: anchoring and first bytes worked out from the program" {
         .{ .p = ".b", .anchored = false, .single = null, .first = false },
         .{ .p = "[^a]", .anchored = false, .single = null, .first = false }, // holds U+FFFD
     };
+    // The literal prefix, from two bytes on, is searched for whole.
+    const Lit = struct { p: []const u8, lit: []const u8 };
+    for ([_]Lit{
+        .{ .p = "id=([0-9]+)", .lit = "id=" },
+        .{ .p = "INV-\\d|INV-x", .lit = "INV-" },
+        .{ .p = "(?i)abc", .lit = "" },
+        .{ .p = "a\\x{fffd}b", .lit = "a" }, // U+FFFD also matches an invalid byte
+        .{ .p = "x" ** 40, .lit = "x" ** 16 },
+    }) |c| {
+        var re = try Regex.compile(testing.allocator, c.p);
+        defer re.deinit(testing.allocator);
+        try testing.expectEqualStrings(c.lit, re.prefilter.lit[0..re.prefilter.lit_len]);
+    }
+    try expectFind("a\\x{fffd}b", "xa\xffb", "a\xffb");
+    try expectFind("id=([0-9]+)", "i id id=7", "id=7");
     for (cases) |c| {
         errdefer std.debug.print("/{s}/\n", .{c.p});
         var re = try Regex.compile(testing.allocator, c.p);
@@ -1334,6 +1513,21 @@ test "prefilter: anchoring and first bytes worked out from the program" {
     try expectFind("é", "\xc3\xc3\xa9", "é");
     try expectFind("#([0-9]+)", "a#b#12", "#12");
     try expectFind("^a", "ba", null);
+}
+
+test "findLiteral agrees with std.mem.indexOfPos" {
+    var prng: std.Random.DefaultPrng = .init(0x6c6974);
+    const rng = prng.random();
+    var hay: [300]u8 = undefined;
+    var needle: [6]u8 = undefined;
+    for (0..5000) |_| {
+        const hl = rng.uintLessThan(usize, hay.len);
+        for (hay[0..hl]) |*c| c.* = "abAB"[rng.uintLessThan(usize, 4)];
+        const nl = 2 + rng.uintLessThan(usize, needle.len - 1);
+        for (needle[0..nl]) |*c| c.* = "abAB"[rng.uintLessThan(usize, 4)];
+        const pos = rng.uintLessThan(usize, hl + 1);
+        try testing.expectEqual(std.mem.indexOfPos(u8, hay[0..hl], pos, needle[0..nl]), findLiteral(hay[0..hl], pos, needle[0..nl]));
+    }
 }
 
 test "compile: a pattern past the stack builder's capacity takes the full one" {

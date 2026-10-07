@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Faster, same answers: a bit-state backtracker (Go's and RE2's, one visited bit
+  per position × instruction, ≤ 256 Kbit) finds matches with groups in short texts — submatches 4–11×
+  faster than before, now ahead of Go; the literal prefix (up to 16 bytes) is searched for whole by
+  a SIMD first-and-last-byte scan — `id=([0-9]+)` find-all 4.5× faster. New public fields
+  `Prefilter.lit`/`lit_len`, `Matcher.bt_visited`/`bt_jobs`/`pike_only`; nothing breaks.
 - **2026-10-07** — Reading from a `std.Io.Reader` (Go's `MatchReader`, `FindReaderIndex`,
   `FindReaderSubmatchIndex`): `Regex.isMatchReader`, `Matcher.findReader`,
   `Matcher.capturesReader` — constant memory, no allocator, `error.ReadFailed` from a failing
