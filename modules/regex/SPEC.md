@@ -215,7 +215,15 @@ matches where `std.mem.indexOf` does), driver `REGEX_FUZZ`.
 - **Speed past Go's: a lazy DFA with a caller-owned cache** *(survey 2026-10-07)* — RE2's and
   Rust's; would take the three cases where we trail Go (dense `[ -~]*…`, long-text find-all with
   captures) well past it. Not needed for parity. Fits §2 with caller-owned scratch.
+- **Capacity past 1024 instructions / nesting 250** *(2026-10-07; kept as the listed CAPACITY
+  divergence by the user's decision, may be revisited)* — Go compiles `a{1000}b{1000}`; here
+  `error.PatternTooLarge`. Would need a heap program and heap VM scratch for large patterns while
+  small ones stay allocation-free.
 - **An ASCII bitmap per class, a one-pass engine** *(2026-10-07)* — smaller constant factors.
+- **Fuzz: a POSIX grammar of its own** *(2026-10-07)* — the shared grammar reaches POSIX in ~1 %
+  of runs (most random patterns use Perl syntax POSIX refuses).
+- **Refresh the quangdn42/regex.zig head-to-head** *(2026-10-07)* — taken before the backtracker
+  and the literal prefilter.
 - **`RegexSet`** *(survey 2026-10-07)* — Rust's and RE2's, not Go's.
 - **Unicode 17.0** — follows Go: regenerate the tables when Go's `unicode` moves.
 - **Sibling modules that can now adopt it** *(2026-10-07)* — `validate` (`Pattern.matcher` takes a
