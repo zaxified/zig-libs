@@ -594,8 +594,13 @@ pub const RiskSpec = struct {
 
 /// One-row Dataset of risk metrics: ann_vol, downside, var95, cvar95, mdd,
 /// ulcer, sharpe, sortino, calmar. Drawdown is derived from the compounded
-/// return level (self-contained from the return series). Sharpe = (ann_return
-/// − rf) / ann_vol, Sortino = (ann_return − rf) / downside.
+/// return level (self-contained from the return series), measured from the
+/// starting level 1 — the capital before the first return — so a loss on the
+/// first row is already a drawdown. Ulcer = √(Σ dd%² / n) over the n return
+/// rows, in percent. (ffn's and quantstats' ulcer, fed the same starting point,
+/// differ only in scale: ffn averages over n + 1 points including the start,
+/// quantstats reports a fraction — tools/oracle.py converts both.) Sharpe =
+/// (ann_return − rf) / ann_vol, Sortino = (ann_return − rf) / downside.
 pub fn riskMetrics(a: std.mem.Allocator, d: Dataset, spec: RiskSpec) Error!Dataset {
     const ri = try mustIndex(d, spec.ret_col);
     const rvals = try a.alloc(f64, d.rows.len);

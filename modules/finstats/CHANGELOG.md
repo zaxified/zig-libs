@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** more of the module is anchored on foreign implementations (`tools/oracle.py` → `src/oracle_test.zig`): `correlationMatrix` vs pandas `corr(min_periods)`, `drawdownEpisodes` vs ffn `drawdown_details`, ulcer vs ffn and quantstats, `tradeStats` vs quantstats, up/down capture vs empyrical, Treynor vs quantstats, and the CAGR numerator and denominators of Sharpe/Sortino/Calmar vs ffn/empyrical. No result changed; `riskMetrics`' doc comment now states the drawdown baseline and the ulcer denominator those comparisons rely on.
+
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** foreign reference values anchor xirr/xirrPrecise
   (pyxirr, ACT/365.25), skewness/kurtosis, the normal quantile and density, Gaussian VaR/CVaR,
   quantile, riskMetrics' vol/downside/VaR/CVaR/max-drawdown, omega, beta/r² and the rolling mean and

@@ -10,6 +10,12 @@
 //! which function answers for which). Here each is recomputed by this module
 //! and compared within the tolerance the function documents.
 //!
+//! Also replayed (see the generator's docstring for the exact foreign function
+//! and any convention conversion): correlationMatrix (pandas), drawdownEpisodes
+//! and ulcer (ffn, quantstats), tradeStats (quantstats), benchmarkStats
+//! (empyrical, quantstats) and sharpe / sortino / calmar (CAGR from ffn,
+//! denominators from empyrical; the division stays this module's own).
+//!
 //! Not covered, for want of a foreign implementation: `twrDaily`,
 //! `brinsonAttribution`, the Cornish-Fisher pair (see SPEC Anchoring).
 
@@ -127,5 +133,155 @@ test "oracle: xirr and xirrPrecise against pyxirr (ACT/365.25)" {
         // `rate_tol` defaults to 1e-9; Newton's `tol` to 1e-8 on NPV.
         try near(s.xirr, try fs.xirr(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = opening }), 1e-8, 0);
         try near(s.xirr, try fs.xirrPrecise(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = opening }), 1e-8, 0);
+    }
+}
+
+/// A two-column dataset: `dt` (ISO date text) and `r` (float).
+fn datedReturns(a: std.mem.Allocator, values: []const f64) !Dataset {
+    const cols = try a.dupe(Column, &.{ .{ .name = "dt", .type = .date }, .{ .name = "r", .type = .float } });
+    const rows = try a.alloc([]const Value, values.len);
+    for (values, 0..) |v, i| rows[i] = try a.dupe(Value, &.{ .{ .text = ref.dates[i] }, .{ .float = v } });
+    return .{ .columns = cols, .rows = rows };
+}
+
+test "oracle: ulcer, sharpe, sortino, calmar (CAGR from ffn, denominators from empyrical)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (ref.ratios) |rr| {
+        const s = ref.series[rr.series];
+        errdefer std.debug.print("series {s} rf {d}\n", .{ s.name, rr.rf });
+        const d = try datedReturns(a, s.values);
+        const rm = try fs.riskMetrics(a, d, .{ .ret_col = "r", .date_col = "dt", .rf = rr.rf });
+        // Both foreign ulcers were given a level that starts at 1 (baseline point) and
+        // converted to this module's mean-over-n percent convention (see oracle.py).
+        try near(rr.ulcer_ffn, cell(rm, "ulcer"), 0, 1e-12);
+        try near(rr.ulcer_qs_as_ours, cell(rm, "ulcer"), 0, 1e-12);
+        try near(rr.sharpe, cell(rm, "sharpe"), 1e-15, 1e-10);
+        try near(rr.sortino, cell(rm, "sortino"), 1e-15, 1e-10);
+        try near(rr.calmar, cell(rm, "calmar"), 1e-15, 1e-10);
+    }
+}
+
+test "oracle: tradeStats against quantstats" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (ref.trades) |t| {
+        errdefer std.debug.print("series {s}\n", .{t.name});
+        const d = try returns(a, t.values);
+        const ts = try fs.tradeStats(a, d, .{ .ret_col = "r" });
+        try near(t.win_rate, cell(ts, "win_rate"), 0, 1e-14);
+        try near(t.payoff, cell(ts, "payoff"), 0, 1e-12);
+        try near(t.profit_factor, cell(ts, "profit_factor"), 0, 1e-12);
+        try near(t.kelly, cell(ts, "kelly"), 1e-15, 1e-12);
+        try near(t.tail_ratio, cell(ts, "tail_ratio"), 0, 1e-12);
+    }
+}
+
+test "oracle: up/down capture against empyrical, treynor against quantstats" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bvals = ref.series[3].values;
+    try testing.expectEqualStrings("bench", ref.series[3].name);
+    for (ref.bench) |b| {
+        errdefer std.debug.print("port {s} rf {d}\n", .{ ref.series[b.port].name, b.rf });
+        const pv = ref.series[b.port].values;
+        const cols = [_]Column{ .{ .name = "p", .type = .float }, .{ .name = "b", .type = .float } };
+        const rows = try a.alloc([]const Value, pv.len);
+        for (pv, bvals, 0..) |p, bb, i| rows[i] = try a.dupe(Value, &.{ .{ .float = p }, .{ .float = bb } });
+        const out = try fs.benchmarkStats(a, .{ .columns = &cols, .rows = rows }, .{
+            .port_ret_col = "p",
+            .bench_ret_col = "b",
+            .port_ann = b.port_ann,
+            .rf = b.rf,
+        });
+        try near(b.up, cell(out, "up_capture"), 1e-15, 1e-12);
+        try near(b.down, cell(out, "down_capture"), 1e-15, 1e-12);
+        try near(b.treynor, cell(out, "treynor"), 1e-15, 1e-10);
+    }
+}
+
+test "oracle: drawdownEpisodes against ffn drawdown_details" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]Column{ .{ .name = "dt", .type = .date }, .{ .name = "v", .type = .float } };
+    for (ref.dd_cases) |c| {
+        errdefer std.debug.print("case {s}\n", .{c.label});
+        const rows = try a.alloc([]const Value, c.levels.len);
+        for (c.levels, 0..) |v, i| rows[i] = try a.dupe(Value, &.{ .{ .text = ref.dates[i] }, .{ .float = v } });
+        const out = try fs.drawdownEpisodes(a, .{ .columns = &cols, .rows = rows }, .{
+            .date_col = "dt",
+            .value_col = "v",
+            .top_n = 100_000,
+        });
+        try testing.expectEqual(c.episodes.len, out.rows.len);
+        // Worst first; equal depths may come in either order, so each ffn
+        // episode is looked up by its peak date.
+        var prev: f64 = -std.math.inf(f64);
+        for (out.rows) |row| {
+            const depth = row[3].asFloat().?;
+            try testing.expect(depth >= prev);
+            prev = depth;
+        }
+        for (c.episodes) |e| {
+            errdefer std.debug.print("episode peak {s}\n", .{e.peak});
+            var found = false;
+            for (out.rows) |row| {
+                if (!std.mem.eql(u8, row[0].asText().?, e.peak)) continue;
+                found = true;
+                try testing.expectEqualStrings(e.trough, row[1].asText().?);
+                if (e.recovery) |rec| {
+                    try testing.expect(row[2] != .null and row[5] != .null);
+                    try testing.expectEqualStrings(rec, row[2].asText().?);
+                    try testing.expectEqual(e.recover_days.?, row[5].asInt().?);
+                } else {
+                    try testing.expect(row[2] == .null);
+                    try testing.expect(row[5] == .null);
+                }
+                try near(e.depth_pct, row[3].asFloat().?, 1e-12, 1e-9);
+                try testing.expectEqual(e.fall_days, row[4].asInt().?);
+            }
+            try testing.expect(found);
+        }
+    }
+}
+
+test "oracle: correlationMatrix against pandas DataFrame.corr(min_periods)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]Column{ .{ .name = "k", .type = .text }, .{ .name = "dt", .type = .date }, .{ .name = "v", .type = .float } };
+    var rows: std.ArrayList([]const Value) = .empty;
+    for (ref.corr_series) |s| {
+        for (s.dates, s.values) |dt, v| {
+            try rows.append(a, try a.dupe(Value, &.{ .{ .text = s.key }, .{ .text = dt }, .{ .float = v } }));
+        }
+    }
+    const out = try fs.correlationMatrix(a, .{ .columns = &cols, .rows = rows.items }, .{
+        .key_col = "k",
+        .date_col = "dt",
+        .value_col = "v",
+        .min_overlap = ref.corr_min_overlap,
+    });
+    try testing.expectEqual(ref.corr_series.len, out.rows.len);
+    for (ref.corr_series, 0..) |s, i| {
+        try testing.expectEqualStrings(s.key, out.rows[i][0].asText().?);
+        for (ref.corr_series, 0..) |_, j| {
+            errdefer std.debug.print("pair {d},{d}\n", .{ i, j });
+            const got = out.rows[i][j + 1];
+            if (i == j) { // pandas gives NaN for a constant/short series; the module defines 1
+                try near(1, got.asFloat().?, 0, 0);
+                continue;
+            }
+            if (ref.corr_matrix[i][j]) |want| {
+                try testing.expect(got != .null);
+                try near(want, got.asFloat().?, 1e-12, 1e-10);
+            } else {
+                try testing.expect(got == .null);
+            }
+        }
     }
 }
