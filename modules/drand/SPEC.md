@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-16 · mutation 2026-09-10 · src ?
 
-**Hardening:** fuzz ? · ct n/a — public beacon verification (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — public beacon verification (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

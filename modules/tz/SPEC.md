@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-09-30 (11/13, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — timezone data (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — timezone data (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

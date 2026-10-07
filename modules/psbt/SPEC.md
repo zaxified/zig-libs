@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-10-05 (56/58, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — public partial transactions (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — public partial transactions (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (17/18, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — charset codecs (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — charset codecs (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

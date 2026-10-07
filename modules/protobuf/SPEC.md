@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (24/24) · src ?
 
-**Hardening:** fuzz 2026-10-04 (600,000 runs clean (PROTOBUF_FUZZ)) · ct n/a — data codec only (keyword review, 2026-10-08)
+**Hardening:** fuzz 2026-10-04 (600,000 runs clean (PROTOBUF_FUZZ)) · ct n/a — data codec only (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

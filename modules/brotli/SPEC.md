@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-04 (110/132, 22 eq) · src ?
 
-**Hardening:** fuzz 2026-09-30 (230,000 runs clean, ~32% decoded reach) · ct n/a — compression only (keyword review, 2026-10-08)
+**Hardening:** fuzz 2026-09-30 (230,000 runs clean, ~32% decoded reach) · ct n/a — compression only (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (25/25) · src ?
 
-**Hardening:** fuzz 2026-10-04 (3000-script deterministic driver) · ct n/a — /proc parsers (keyword review, 2026-10-08)
+**Hardening:** fuzz 2026-10-04 (3000-script deterministic driver) · ct n/a — /proc parsers (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

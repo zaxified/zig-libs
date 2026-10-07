@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-10-06 (36/38, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — template engine (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — template engine (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

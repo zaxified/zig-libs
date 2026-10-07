@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-03 · mutation 2026-09-03 · src ?
 
-**Hardening:** fuzz ? · ct n/a — SPF computation (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — SPF computation (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

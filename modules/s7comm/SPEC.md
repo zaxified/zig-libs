@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-17 · mutation 2026-10-05 (42/43, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — PLC protocol, no auth in scope (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — PLC protocol, no auth in scope (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

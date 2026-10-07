@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-14 · mutation 2026-09-03 · src ?
 
-**Hardening:** fuzz ? · ct n/a — IS-IS codec, no auth (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — IS-IS codec, no auth (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

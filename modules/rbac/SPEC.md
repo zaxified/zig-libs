@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-04 (54/55, 1 eq) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — role permissions, no keys (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — role permissions, no keys (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

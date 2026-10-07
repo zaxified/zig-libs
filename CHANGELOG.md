@@ -24,7 +24,7 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
-- **Module grades v2 (2026-10-08) — every module re-graded, most one step lower.** The scale
+- **Module grades v2 (2026-10-07) — every module re-graded, most one step lower.** The scale
   is now scope-led: 1 ahead of the competition (parity plus a dated, measured lead; a speed
   lead must beat the fastest implementation in the field, not just the reference), 2 parity,
   3 core, 4 mvp, 5 proof of concept or a known defect. Three axes joined scope, evidence,

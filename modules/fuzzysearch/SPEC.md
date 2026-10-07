@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-04 (41/43, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — search index (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — search index (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

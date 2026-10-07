@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (24/24) · src ?
 
-**Hardening:** fuzz ? · ct n/a — mixnet simulation over sphinx (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — mixnet simulation over sphinx (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

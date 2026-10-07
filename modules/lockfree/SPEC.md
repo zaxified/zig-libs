@@ -7,7 +7,7 @@
 **Scope:** core — crossbeam (epoch + queue + deque) 0.8.x (surveyed 2026-10-06; raised from mvp 2026-10-06 when the generic queue and the bounded ring landed)
 **Audit:** review 2026-08-09 · mutation 2026-10-07 (15/15) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — concurrent queues (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — concurrent queues (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

@@ -547,9 +547,13 @@ pub fn build(b: *std.Build) void {
         mods.put(m.name, mod) catch @panic("OOM");
     }
 
+    // ReleaseFast copies of the module graph for the bench programs, created
+    // on demand (see `fastModuleGraph`).
+    var fast_mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
+
     // Aggregates for the interop programs created inside the loop below.
     const interop_all = b.step("interop", "Run every module's interop program (needs the foreign peers)");
-    const check_interop = b.step("check-interop", "Compile every interop program -- rot guard, runs no peer");
+    const check_interop = b.step("check-interop", "Compile every interop, live and bench program -- rot guard, runs no peer");
     // `live-<m>` is a SECOND kind of tools program, added 2026-09-09 for `dns`:
     // one that genuinely needs the internet. It is deliberately not folded into
     // `interop-<m>`, because every interop program promises the opposite --
@@ -707,6 +711,39 @@ pub fn build(b: *std.Build) void {
             // an instrument nothing builds is one that stops building without
             // anyone hearing.
             check_interop.dependOn(&live_exe.step);
+        }
+
+        // The comparative benchmark (grading v2, 2026-10-07): the program behind
+        // a maturity card's `**Performance:**` ratios and `**Ahead:** speed`
+        // claims, kept under CONVENTIONS.md §9 kind 3. Discovered by existence
+        // like the two above. Always ReleaseFast -- a ratio measured in Debug
+        // says nothing about either side -- and never run by any lane: it
+        // spawns the foreign implementation and takes minutes of quiet CPU.
+        if (moduleHasBench(b, m.name)) {
+            const bench_mod = b.createModule(.{
+                .root_source_file = b.path(b.fmt("modules/{s}/tools/bench.zig", .{m.name})),
+                .target = target,
+                .optimize = .ReleaseFast,
+            });
+            // The module under test and its whole dependency closure are built
+            // ReleaseFast too: the graph in `mods` follows -Doptimize, and a
+            // ReleaseFast driver over a Debug module measures Debug.
+            bench_mod.addImport(m.name, fastModuleGraph(b, target, &fast_mods, m.name));
+            for (m.deps) |dep| bench_mod.addImport(dep, fastModuleGraph(b, target, &fast_mods, dep));
+
+            const bench_exe = b.addExecutable(.{
+                .name = b.fmt("bench-{s}", .{m.name}),
+                .root_module = bench_mod,
+                .use_llvm = true,
+            });
+            const bench_run = b.addRunArtifact(bench_exe);
+            bench_run.has_side_effects = true;
+            if (b.args) |args| bench_run.addArgs(args);
+            b.step(
+                b.fmt("bench-{s}", .{m.name}),
+                b.fmt("Benchmark {s} against the foreign implementations its maturity card compares with (needs them)", .{m.name}),
+            ).dependOn(&bench_run.step);
+            check_interop.dependOn(&bench_exe.step);
         }
 
         // `check-pubfn-reach`: compile a second root over the SAME module graph
@@ -2230,6 +2267,29 @@ fn moduleHasLive(b: *std.Build, name: []const u8) bool {
 /// August for exactly that reason.
 fn moduleHasInterop(b: *std.Build, name: []const u8) bool {
     const path = b.fmt("modules/{s}/tools/interop.zig", .{name});
+    return if (b.build_root.handle.access(b.graph.io, path, .{})) |_| true else |_| false;
+}
+
+/// A ReleaseFast copy of module `name` with its dependency closure, memoised
+/// in `fast` -- what a bench program links, whatever -Doptimize says.
+fn fastModuleGraph(b: *std.Build, target: std.Build.ResolvedTarget, fast: *std.StringHashMap(*std.Build.Module), name: []const u8) *std.Build.Module {
+    if (fast.get(name)) |existing| return existing;
+    const entry = for (module_list) |e| {
+        if (std.mem.eql(u8, e.name, name)) break e;
+    } else @panic("fastModuleGraph: unknown module");
+    const mod = b.createModule(.{
+        .root_source_file = b.path(b.fmt("modules/{s}/src/root.zig", .{name})),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    fast.put(name, mod) catch @panic("OOM");
+    for (entry.deps) |dep| mod.addImport(dep, fastModuleGraph(b, target, fast, dep));
+    return mod;
+}
+
+/// Whether a module carries a comparative BENCHMARK — `modules/<name>/tools/bench.zig`.
+fn moduleHasBench(b: *std.Build, name: []const u8) bool {
+    const path = b.fmt("modules/{s}/tools/bench.zig", .{name});
     return if (b.build_root.handle.access(b.graph.io, path, .{})) |_| true else |_| false;
 }
 
@@ -4146,7 +4206,7 @@ fn moduleAnchorGrade(b: *std.Build, io: std.Io, name: []const u8) ?AnchorGrade {
 /// A module's maturity card: the `## Maturity` section of `modules/<name>/SPEC.md`
 /// (`README.md` for the modules that have no SPEC.md, the same fallback as
 /// `moduleAnchorGrade`). The Grade line is generated; the rest is written by hand
-/// (grading v2, 2026-10-08; the vocabulary is in `modules/_template/SPEC.md`):
+/// (grading v2, 2026-10-07; the vocabulary is in `modules/_template/SPEC.md`):
 ///
 ///   **Grade:** ...          -- generated by `zig build gen-catalog`
 ///   **Scope:** unsurveyed | <ahead|parity|core|mvp|poc> — <reference> (surveyed YYYY-MM-DD)
@@ -4612,7 +4672,7 @@ fn moduleMaturity(b: *std.Build, io: std.Io, name: []const u8) ?Maturity {
 
 /// The grade, 1 (best) .. 5 (do not consume) -- the Czech school scale. It is
 /// the WORST of the axes below, so it can only be raised by fixing the axis that
-/// caps it (grading v2, owner's decision 2026-10-08):
+/// caps it (grading v2, owner's decision 2026-10-07):
 ///
 ///   S scope       ahead 1 (lead ≤ 180 days old, else 2) · parity 2 · core 3 · mvp 4
 ///                 · poc 5 · unsurveyed or surveyed > 365 days ago -> provisional (`?`)

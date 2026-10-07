@@ -836,7 +836,7 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   Status line passed all four catalog gates. It is anchored to the Status line now. See `checkChangelog` in `build.zig` for the full
   calibration and for what a green run does not prove.
 - **Maturity = a computed grade over a per-module card, plus the explicit caveats**
-  (revised 2026-09-30; before that, caveats only. **Grading v2, 2026-10-08, owner's decision:**
+  (revised 2026-09-30; before that, caveats only. **Grading v2, 2026-10-07, owner's decision:**
   the scale moved down a step and gained axes, so that the grade separates what v1 lumped
   together — 175 of 238 modules sat on one number). Every module meets the same floor (§6/§7:
   tests green in both release lanes — `ReleaseSafe` and `ReleaseFast` —
@@ -860,7 +860,7 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   `maturityGrade` in `build.zig`, the vocabulary is in `modules/_template/SPEC.md`, the scale
   is explained in the README's "Module grades", and the grade appears in the catalog next to
   the module's description with the capping axes in brackets.
-  ⚠ The v2 cards started pessimistic on purpose (2026-10-08): no audit carries a source hash
+  ⚠ The v2 cards started pessimistic on purpose (2026-10-07): no audit carries a source hash
   (`src ?` → audit 2), hardening dates were not recorded (`?` → 3), nothing is measured for
   speed (`not measured` → 3), and every class C/D module is `unclassified` (3). Lines marked
   "initial v2 fill, not reviewed" are a mechanical guess awaiting a reader. A module is raised
@@ -1002,7 +1002,7 @@ that reaches it can notice.
 
   3. **A comparative benchmark against foreign implementations** that backs a
      `**Performance:**` ratio or an `**Ahead:** speed` claim in the maturity card (added
-     2026-10-08 with grading v2). Like the oracle it drives the module only through its
+     2026-10-07 with grading v2). Like the oracle it drives the module only through its
      public API, so it survives refactoring — and without it the ratio is a number nobody
      can re-check, which is exactly what kind 1 forbids for a golden.
 

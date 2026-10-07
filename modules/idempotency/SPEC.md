@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-21 · mutation 2026-09-21 · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — request dedup keys (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — request dedup keys (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

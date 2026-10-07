@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (42/43, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — tabular data handling (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — tabular data handling (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-19 · mutation 2026-10-04 (22/22) · src ?
 
-**Hardening:** fuzz ? · ct n/a — trace id headers (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — trace id headers (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

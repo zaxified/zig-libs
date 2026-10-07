@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-10-04 (24/27, 1 eq) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — TCP/ICMP probing (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — TCP/ICMP probing (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

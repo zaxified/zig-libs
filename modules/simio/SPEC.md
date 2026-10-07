@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-01 · mutation 2026-10-01 (42/46, 4 eq) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — deterministic IO simulation (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — deterministic IO simulation (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

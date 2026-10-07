@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (47/51, 4 eq) · src ?
 
-**Hardening:** fuzz 2026-10-04 (900,000 runs clean, reach per oracle) · ct n/a — data codec only (keyword review, 2026-10-08)
+**Hardening:** fuzz 2026-10-04 (900,000 runs clean, reach per oracle) · ct n/a — data codec only (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

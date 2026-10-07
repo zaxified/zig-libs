@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-07 · mutation 2026-09-02 · src ?
 
-**Hardening:** fuzz ? · ct n/a — public script data (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — public script data (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (53/53) · src ?
 
-**Hardening:** fuzz ? · ct n/a — firewall rules via netlink (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — firewall rules via netlink (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

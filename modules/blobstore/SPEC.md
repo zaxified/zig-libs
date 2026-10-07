@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-11 · mutation 2026-09-01 · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — content-addressed blobs (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — content-addressed blobs (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation none · src ?
 
-**Hardening:** fuzz ? · ct n/a — netlink ethtool queries (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — netlink ethtool queries (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

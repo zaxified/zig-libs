@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-11 · mutation 2026-10-04 (36/37, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — archive streaming (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — archive streaming (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

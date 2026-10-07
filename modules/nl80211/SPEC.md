@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (27/28, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — wifi netlink queries (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — wifi netlink queries (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

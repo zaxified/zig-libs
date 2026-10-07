@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (29/29) · src ?
 
-**Hardening:** fuzz ? · ct n/a — traceroute probes (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — traceroute probes (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

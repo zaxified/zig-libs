@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-11 · mutation 2026-10-04 (97/117, 19 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — decimal arithmetic (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — decimal arithmetic (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

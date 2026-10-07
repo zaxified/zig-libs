@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-04 · mutation none · src ?
 
-**Hardening:** fuzz ? · ct n/a — test helpers (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — test helpers (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

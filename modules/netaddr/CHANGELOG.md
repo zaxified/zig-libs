@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Performance, not breaking: `parseIp4`/`parseIp6` are single
+  pass (`parseIp` picks the family from the first separator instead of trying
+  IPv4 first), and `formatIp` writes its digits directly instead of through
+  `bufPrint`. Against Go `net/netip` (new `tools/bench.zig`, `zig build
+  bench-netaddr`): parse IPv4 1.34 → 0.88×, IPv6 1.59 → 0.86×, format IPv6
+  0.98 → 0.38× (ours/Go time). Same answers: the Go and Python oracle replays,
+  and 2 + 2 million random/mutated inputs compared against the previous
+  implementation. New deterministic fuzz driver `NETADDR_FUZZ`
+  (`src/fuzz_test.zig`): every text parser must not trap and whatever parses
+  must round-trip through its formatter; 200,000 runs clean, a planted
+  `::`-gap bug caught at seed 80.
 - **2026-10-07** — **Added, not breaking: Go `net/netip` + `go4.org/netipx`
   parity; scope core → parity.** `Ip` gains `compare`/`lessThan`, `next`/`prev`,
   `bitLen`, `prefix`, `asSlice`/`fromSlice`, `fromStd`/`toStd`,

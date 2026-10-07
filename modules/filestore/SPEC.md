@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-10-04 (22/23) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — file storage (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — file storage (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

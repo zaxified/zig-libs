@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (37/38, 1 eq) · src ?
 
-**Hardening:** fuzz 2026-10-04 (seeded sweep 2x300000 clean (in-test)) · ct n/a — trie index (keyword review, 2026-10-08)
+**Hardening:** fuzz 2026-10-04 (seeded sweep 2x300000 clean (in-test)) · ct n/a — trie index (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

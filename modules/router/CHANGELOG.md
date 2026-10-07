@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Instrument: `tools/bench.zig` + `tools/go_bench/` (`zig build
+  bench-router`), the comparative benchmark against go-chi/chi v5.3.2 behind the
+  maturity card's `**Performance:**` line: route lookup 0.54×, request bytes →
+  response bytes 0.17× chi's time, result counts checked against chi.
 - **2026-10-07** — Tests: a fuzz harness (`src/fuzz_test.zig`, `testing.fuzz` + the deterministic
   driver `ROUTER_FUZZ`), checked against planted mutants. No behaviour change.
 - **2026-10-07** — **BEHAVIOURAL, not breaking** (review fixes): a fallback (404/405/auto-OPTIONS/

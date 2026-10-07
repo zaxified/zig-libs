@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Instrument: `tools/bench.zig` + `tools/go_bench/` (`zig build
+  bench-regex`), the comparative benchmark against Go `regexp` behind the maturity
+  card's `**Performance:**` line: 18 workloads, result counts checked against Go;
+  0.02–0.91× Go's time (worst `sub_email`).
 - **2026-10-07** — Faster, same answers, now ahead of Go 1.26 on every shared workload: `isMatch` /
   `fullMatch` run a lazy DFA on the stack (programs up to 128 instructions) — Go's Hard benchmark
   `[ -~]*ABC…$` over 1 MiB 16× faster than before (was 1.25× slower than Go, now 0.08), a 12-way

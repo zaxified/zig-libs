@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (39/41, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — raw sockets (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — raw sockets (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

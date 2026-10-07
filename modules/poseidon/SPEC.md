@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation ? · src ?
 
-**Hardening:** fuzz ? · ct n/a — public-input hash (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — public-input hash (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

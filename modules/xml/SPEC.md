@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (29/30, 1 eq) · src ?
 
-**Hardening:** fuzz 2026-10-04 (360,000 runs clean (XML_FUZZ)) · ct n/a — XML parsing (keyword review, 2026-10-08)
+**Hardening:** fuzz 2026-10-04 (360,000 runs clean (XML_FUZZ)) · ct n/a — XML parsing (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

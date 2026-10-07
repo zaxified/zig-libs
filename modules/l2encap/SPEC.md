@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-04 (34/34) · src ?
 
-**Hardening:** fuzz ? · ct n/a — L2 encapsulation codec (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — L2 encapsulation codec (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (22/24, 2 eq) · src ?
 
-**Hardening:** fuzz 2026-10-04 (2000-stream deterministic driver) · ct n/a — length-prefix framing (keyword review, 2026-10-08)
+**Hardening:** fuzz 2026-10-04 (2000-stream deterministic driver) · ct n/a — length-prefix framing (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

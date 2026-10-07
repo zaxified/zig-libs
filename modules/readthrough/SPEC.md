@@ -7,7 +7,7 @@
 **Scope:** core — Caffeine LoadingCache 3.x + Go singleflight (surveyed 2026-09-30)
 **Audit:** review 2026-08-06 · mutation 2026-10-04 (35/36, 1 eq) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — cache wrapper (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — cache wrapper (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

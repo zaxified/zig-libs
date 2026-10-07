@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-10-04 (36/36) · src ?
 
-**Hardening:** fuzz ? · ct n/a — header policy, no secrets (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — header policy, no secrets (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

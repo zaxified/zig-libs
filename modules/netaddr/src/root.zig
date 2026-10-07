@@ -290,8 +290,13 @@ pub const Ip = union(enum) {
 /// panics. Zone suffixes (`fe80::1%eth0`) are rejected — split the zone off
 /// before calling.
 pub fn parseIp(text: []const u8) ?Ip {
-    if (parseIp4(text)) |q| return .{ .v4 = q };
-    if (parseIp6(text)) |b| return .{ .v6 = b };
+    // The first separator decides the family, so each literal is scanned by
+    // one parser only (an IPv6 literal used to be tried as IPv4 first).
+    for (text) |c| switch (c) {
+        '.' => return if (parseIp4(text)) |q| .{ .v4 = q } else null,
+        ':' => return if (parseIp6(text)) |b| .{ .v6 = b } else null,
+        else => {},
+    };
     return null;
 }
 
@@ -299,78 +304,81 @@ pub fn parseIp(text: []const u8) ?Ip {
 /// exactly four decimal octets 0–255, no leading zeros, nothing else.
 pub fn parseIp4(text: []const u8) ?[4]u8 {
     var out: [4]u8 = undefined;
-    var it = std.mem.splitScalar(u8, text, '.');
-    var i: usize = 0;
-    while (it.next()) |part| : (i += 1) {
-        if (i >= 4) return null;
-        if (part.len == 0 or part.len > 3) return null;
-        if (part.len > 1 and part[0] == '0') return null; // no leading zeros
-        var v: u16 = 0;
-        for (part) |c| {
-            if (c < '0' or c > '9') return null;
-            v = v * 10 + (c - '0');
-        }
-        if (v > 255) return null;
-        out[i] = @intCast(v);
+    var k: usize = 0;
+    var octet: u16 = 0;
+    var digits: u8 = 0;
+    for (text) |c| {
+        if (c >= '0' and c <= '9') {
+            if (digits == 1 and octet == 0) return null; // no leading zeros
+            octet = octet * 10 + (c - '0');
+            if (octet > 255) return null; // also caps an octet at three digits
+            digits += 1;
+        } else if (c == '.') {
+            if (digits == 0 or k == 3) return null;
+            out[k] = @intCast(octet);
+            k += 1;
+            octet = 0;
+            digits = 0;
+        } else return null;
     }
-    return if (i == 4) out else null;
+    if (digits == 0 or k != 3) return null;
+    out[3] = @intCast(octet);
+    return out;
 }
 
 /// Parse an IPv6 literal (RFC 4291 §2.2): full form, `::` compression, and an
 /// embedded dotted-quad tail (`::ffff:1.2.3.4`). Zone suffixes are rejected.
+/// One pass: groups are written in place, and the ones after a `::` are moved
+/// to the end once their count is known.
 pub fn parseIp6(text: []const u8) ?[16]u8 {
-    if (std.mem.indexOfScalar(u8, text, '%') != null) return null; // no zone
     var out: [16]u8 = @splat(0);
-    if (std.mem.indexOf(u8, text, "::")) |i| {
-        const head = parseGroupList(text[0..i], false) orelse return null;
-        const tail = parseGroupList(text[i + 2 ..], true) orelse return null;
-        if (head.len + tail.len > 7) return null; // `::` must elide ≥ 1 group
-        for (head.groups[0..head.len], 0..) |g, k| writeGroup(&out, k, g);
-        const start = 8 - tail.len;
-        for (tail.groups[0..tail.len], 0..) |g, k| writeGroup(&out, start + k, g);
-        return out;
-    }
-    const all = parseGroupList(text, true) orelse return null;
-    if (all.len != 8) return null;
-    for (all.groups[0..8], 0..) |g, k| writeGroup(&out, k, g);
-    return out;
-}
-
-const GroupList = struct { groups: [8]u16 = undefined, len: usize = 0 };
-
-/// Parse a colon-separated list of 16-bit hex groups; `v4_tail` permits a
-/// trailing dotted quad contributing the last two groups.
-fn parseGroupList(text: []const u8, v4_tail: bool) ?GroupList {
-    var gl: GroupList = .{};
-    if (text.len == 0) return gl;
-    var it = std.mem.splitScalar(u8, text, ':');
-    while (it.next()) |tok| {
-        if (tok.len == 0) return null;
-        if (std.mem.indexOfScalar(u8, tok, '.') != null) {
-            if (!v4_tail or it.next() != null) return null; // must be last
-            const q = parseIp4(tok) orelse return null;
-            if (gl.len > 6) return null;
-            gl.groups[gl.len] = (@as(u16, q[0]) << 8) | q[1];
-            gl.groups[gl.len + 1] = (@as(u16, q[2]) << 8) | q[3];
-            gl.len += 2;
-            return gl;
-        }
-        if (tok.len > 4) return null;
-        var v: u16 = 0;
-        for (tok) |c| {
-            const d = std.fmt.charToDigit(c, 16) catch return null;
+    var g: usize = 0; // groups written
+    var ellipsis: ?usize = null; // group index where `::` stands
+    var i: usize = 0;
+    if (text.len >= 2 and text[0] == ':' and text[1] == ':') {
+        ellipsis = 0;
+        i = 2;
+    } else if (text.len == 0 or text[0] == ':') return null;
+    while (i < text.len) {
+        var v: u32 = 0;
+        var n: usize = 0;
+        while (i + n < text.len) : (n += 1) {
+            const d = std.fmt.charToDigit(text[i + n], 16) catch break;
             v = (v << 4) | d;
+            if (n == 4) return null; // a fifth hex digit
         }
-        if (gl.len >= 8) return null;
-        gl.groups[gl.len] = v;
-        gl.len += 1;
+        if (n == 0) return null; // empty group, `:::`, a stray byte
+        if (i + n < text.len and text[i + n] == '.') {
+            // Dotted-quad tail: the rest must be exactly one IPv4 literal,
+            // in the last two group positions.
+            if (g > 6 or (ellipsis == null and g != 6)) return null;
+            const q = parseIp4(text[i..]) orelse return null;
+            @memcpy(out[g * 2 ..][0..4], &q);
+            g += 2;
+            break;
+        }
+        if (g == 8) return null;
+        out[g * 2] = @intCast(v >> 8);
+        out[g * 2 + 1] = @intCast(v & 0xff);
+        g += 1;
+        i += n;
+        if (i == text.len) break;
+        if (text[i] != ':') return null; // includes a `%zone`
+        i += 1;
+        if (i == text.len) return null; // a trailing single `:`
+        if (text[i] == ':') {
+            if (ellipsis != null) return null; // a second `::`
+            ellipsis = g;
+            i += 1;
+        }
     }
-    return gl;
-}
-
-fn writeGroup(out: *[16]u8, index: usize, group: u16) void {
-    out[index * 2] = @intCast(group >> 8);
-    out[index * 2 + 1] = @intCast(group & 0xff);
+    if (ellipsis) |e| {
+        if (g == 8) return null; // `::` must elide at least one group
+        const tail = (g - e) * 2;
+        std.mem.copyBackwards(u8, out[16 - tail ..], out[e * 2 ..][0..tail]);
+        @memset(out[e * 2 .. 16 - tail], 0);
+    } else if (g != 8) return null;
+    return out;
 }
 
 // ── formatting ──────────────────────────────────────────────────────────────
@@ -407,10 +415,12 @@ comptime {
 /// larger buffer passes `buf[0..max_ip_text_len]`.
 pub fn formatIp(ip: Ip, buf: *[max_ip_text_len]u8) []const u8 {
     switch (ip) {
-        .v4 => |q| return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ q[0], q[1], q[2], q[3] }) catch unreachable,
+        .v4 => |q| return buf[0..writeDottedQuad(buf, 0, q)],
         .v6 => |b| {
-            if (Ip.isV4Mapped(b))
-                return std.fmt.bufPrint(buf, "::ffff:{d}.{d}.{d}.{d}", .{ b[12], b[13], b[14], b[15] }) catch unreachable;
+            if (Ip.isV4Mapped(b)) {
+                @memcpy(buf[0..7], "::ffff:");
+                return buf[0..writeDottedQuad(buf, 7, b[12..16].*)];
+            }
 
             var groups: [8]u16 = undefined;
             for (&groups, 0..) |*g, k| g.* = (@as(u16, b[k * 2]) << 8) | b[k * 2 + 1];
@@ -446,13 +456,50 @@ pub fn formatIp(ip: Ip, buf: *[max_ip_text_len]u8) []const u8 {
                     buf[w] = ':';
                     w += 1;
                 }
-                const s = std.fmt.bufPrint(buf[w..], "{x}", .{groups[g]}) catch unreachable;
-                w += s.len;
+                w = writeHexGroup(buf, w, groups[g]);
                 g += 1;
             }
             return buf[0..w];
         },
     }
+}
+
+/// Write `q` as a dotted quad at `buf[w..]`; returns the new end. Hand-rolled
+/// rather than `bufPrint`: formatting is a hot path (logs, keys), and the
+/// generic formatter cost as much as the rest of `formatIp` together.
+fn writeDottedQuad(buf: *[max_ip_text_len]u8, start: usize, q: [4]u8) usize {
+    var w = start;
+    for (q, 0..) |octet, k| {
+        if (k != 0) {
+            buf[w] = '.';
+            w += 1;
+        }
+        if (octet >= 100) {
+            buf[w] = '0' + octet / 100;
+            w += 1;
+        }
+        if (octet >= 10) {
+            buf[w] = '0' + (octet / 10) % 10;
+            w += 1;
+        }
+        buf[w] = '0' + octet % 10;
+        w += 1;
+    }
+    return w;
+}
+
+/// Write `v` in lowercase hex without leading zeros (RFC 5952 §4.1, §4.3).
+fn writeHexGroup(buf: *[max_ip_text_len]u8, start: usize, v: u16) usize {
+    const digits = "0123456789abcdef";
+    const n: usize = if (v >= 0x1000) 4 else if (v >= 0x100) 3 else if (v >= 0x10) 2 else 1;
+    var k: usize = n;
+    var x = v;
+    while (k > 0) {
+        k -= 1;
+        buf[start + k] = digits[x & 0xf];
+        x >>= 4;
+    }
+    return start + n;
 }
 
 /// Enough for any output of `formatIpExpanded` (8 groups of 4 + 7 colons).
@@ -1934,6 +1981,7 @@ test {
     _ = @import("parse_oracle_test.zig");
     _ = @import("netip_api_test.zig");
     _ = @import("netip_oracle_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "Ip.eql: a v4 address and its v4-mapped v6 form are NOT equal" {

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-11 · mutation 2026-09-11 · src ?
 
-**Hardening:** fuzz n/a — see `**Fuzz exemption:**` below · ct n/a — metric counters (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — see `**Fuzz exemption:**` below · ct n/a — metric counters (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

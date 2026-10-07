@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-10-05 (36/40, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — netlink device info (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — netlink device info (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

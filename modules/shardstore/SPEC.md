@@ -7,7 +7,7 @@
 **Scope:** core — sharded-store pattern: Redis Cluster hash slots / Vitess (server-side), concurrent-map (in-process) (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after the merge-sorted cross-shard scan landed)
 **Audit:** review 2026-08-06 · mutation 2026-10-05 (25/27, 2 eq) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — sharded storage (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — sharded storage (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

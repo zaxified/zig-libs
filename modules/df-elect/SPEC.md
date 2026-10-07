@@ -7,7 +7,7 @@
 **Scope:** mvp — FRRouting/frr EVPN DF election, RFC 7432 §8.5, RFC 8584 (surveyed 2026-09-30; poc -> mvp 2026-09-30: N members, mod N / HRW / preference, failover)
 **Audit:** review 2026-10-01 · mutation 2026-10-01 (33/37, 4 eq) · src ?
 
-**Hardening:** fuzz 2026-10-01 (sweep 120 seeds Debug/400 opt (sim)) · ct n/a — multicast DF election (keyword review, 2026-10-08)
+**Hardening:** fuzz 2026-10-01 (sweep 120 seeds Debug/400 opt (sim)) · ct n/a — multicast DF election (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

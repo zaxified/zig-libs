@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-11 · mutation 2026-10-05 (47/52, 5 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — LSP database (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — LSP database (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

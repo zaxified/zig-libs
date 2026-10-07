@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-09-07 · src ?
 
-**Hardening:** fuzz ? · ct n/a — bpf program loader (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — bpf program loader (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

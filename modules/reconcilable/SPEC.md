@@ -7,7 +7,7 @@
 **Scope:** core — controller-runtime v0.25 reconcile loop + client-go workqueue (surveyed 2026-09-30)
 **Audit:** review 2026-08-06 · mutation ? · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — reconcile loop (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — reconcile loop (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

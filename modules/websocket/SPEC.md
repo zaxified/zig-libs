@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-04 (68/69, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — framing; mask key not secret (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — framing; mask key not secret (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-19 · mutation 2026-10-05 (22/22) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — poll loop worker (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — poll loop worker (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-07 · mutation 2026-10-05 (40/44, 4 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — IS-IS adjacency FSM (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — IS-IS adjacency FSM (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-10-04 (32/33, 1 eq) · src ?
 
-**Hardening:** fuzz n/a — see `**Fuzz exemption:**` below · ct n/a — syslog codec (keyword review, 2026-10-08)
+**Hardening:** fuzz n/a — see `**Fuzz exemption:**` below · ct n/a — syslog codec (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

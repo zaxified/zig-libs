@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (32/33) · src ?
 
-**Hardening:** fuzz ? · ct n/a — checksum only (keyword review, 2026-10-08)
+**Hardening:** fuzz ? · ct n/a — checksum only (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

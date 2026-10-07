@@ -6,6 +6,7 @@ One oracle; its answers are frozen in `src/chi_vectors.zig` and replayed by
 | tool | role |
 |---|---|
 | `interop.zig` | `zig build interop-router`: runs `go_chi_oracle` and writes (or with `--check` compares) the vectors. The interop lane runs it with `--check`. |
+| `bench.zig` + `go_bench/` | `zig build bench-router`: comparative benchmark against go-chi/chi v5.3.2, the source of the maturity card's `**Performance:**` line (CONVENTIONS.md §9 kind 3). One API-shaped table (25 routes) and 32 requests (hits, 404, 405); `lookup` = `Static(routes).match` vs chi `Mux.Match`, `serve` = request bytes → response bytes through `http.Server.serveStream` + `Router` vs `http.ReadRequest` + chi `ServeHTTP` (that one measures both HTTP stacks too). Counts must agree or the run fails. Needs the same chi module cache as the oracle. Not run by any lane. 2026-10-07, x86-64: lookup 0.54, serve 0.17 (ours/chi). |
 | `go_chi_oracle/` | go-chi/chi v5.3.2 (MIT, the module's reference) as a black box through its public API: seeded route tables (static, `{name}`, in-segment shapes, regexp constraints, `*`; every fourth table holds every shape at one position) and requests, chi's status / matched pattern / captures / `Allow` per request; plus a crafted table of the documented divergences. No chi source read. |
 
 ```bash
