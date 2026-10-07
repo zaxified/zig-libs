@@ -39,6 +39,7 @@ modules/opcua/src/security.zig	1	1
 modules/opcua/src/server.zig	1	13
 modules/otp/src/root.zig	3	0
 modules/rsa/src/root.zig	4	20
+modules/sealedbox/src/xsalsa20poly1305.zig	1	0
 modules/sessions/src/csrf.zig	1	2
 modules/signal/src/xeddsa.zig	2	0
 modules/snmp/src/usm.zig	5	0
