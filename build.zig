@@ -154,7 +154,7 @@ const module_list = [_]Module{
     .{ .name = "zstd", .libs = &.{ "format", "storage", "web" }, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "ramcache", .libs = &.{ "storage", "net" } },
-    .{ .name = "router", .libs = &.{"web"}, .deps = &.{"http"}, .timing = true, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "router", .libs = &.{"web"}, .deps = &.{ "http", "regex" }, .timing = true, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "ratelimit", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "abuseguard", .libs = &.{"web"}, .deps = &.{ "http", "netaddr", "router" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "throttle", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },

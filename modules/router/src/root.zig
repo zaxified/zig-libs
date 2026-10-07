@@ -73,6 +73,7 @@
 const std = @import("std");
 const testkit = @import("testkit");
 const http = @import("http");
+const regex = @import("regex");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -90,7 +91,7 @@ pub const meta = .{
     // connection threads.
     .concurrency = .reentrant,
     .model_after = "Go chi / julienschmidt/httprouter (segment trie, middleware chain, 404/405 semantics)",
-    .deps = .{"http"},
+    .deps = .{ "http", "regex" },
 };
 
 const Allocator = std.mem.Allocator;
@@ -353,6 +354,9 @@ pub const AddError = error{
     DuplicateParamName,
     /// More than `max_params` captures in one pattern.
     TooManyParams,
+    /// The regexp of a `{name:regexp}` capture does not compile (see
+    /// `regex.Error`; RE2 syntax).
+    InvalidConstraint,
 };
 
 pub const UseError = error{
@@ -951,7 +955,7 @@ pub const Router = struct {
                     rest = next;
                 },
                 .pattern => {
-                    node = try insertPattern(a, node, seg);
+                    node = try insertPattern(a, r.arena.child_allocator, node, seg);
                     rest = next;
                 },
                 .static => {
@@ -1000,15 +1004,17 @@ pub const Router = struct {
     /// precedence order, when new). Two patterns that differ only in their
     /// capture names cannot both live at one position — the second could
     /// never match — so that is a `ParamNameConflict`, as for `:a` vs `:b`.
-    fn insertPattern(a: Allocator, node: *Node, seg: []const u8) AddError!*Node {
+    fn insertPattern(a: Allocator, scratch_gpa: Allocator, node: *Node, seg: []const u8) AddError!*Node {
         for (node.patterns.items) |e| {
             if (std.mem.eql(u8, e.text, seg)) return e.node;
             if (samePatternShape(e.text, seg)) return error.ParamNameConflict;
         }
+        const text = try a.dupe(u8, seg);
+        const regexes = try compileConstraints(a, scratch_gpa, text);
         const child = try a.create(Node);
         child.* = .{};
         const at = patternSlot(Node.PatEdge, node.patterns.items, seg);
-        try node.patterns.insert(a, at, .{ .text = try a.dupe(u8, seg), .node = child });
+        try node.patterns.insert(a, at, .{ .text = text, .regexes = regexes, .node = child });
         return child;
     }
 
@@ -1466,7 +1472,7 @@ const StaticNode = struct {
 /// A static child (`seg` = its segment) or a named capture (`seg` = the name).
 const StaticEdge = struct { seg: []const u8, child: u32 };
 /// An in-segment pattern child (`text` = the pattern segment).
-const StaticPatEdge = struct { text: []const u8, child: u32 };
+const StaticPatEdge = struct { text: []const u8, regexes: []const ?regex.Regex, child: u32 };
 
 /// The comptime table as `matchIn` sees it: a `Ref` is an index.
 const StaticTree = struct {
@@ -1558,7 +1564,7 @@ fn buildStatic(comptime routes: []const StaticRoute) []const StaticNode {
                             len += 1;
                             const ps = nodes[node].patterns;
                             const at = patternSlot(StaticPatEdge, ps, seg);
-                            nodes[node].patterns = ps[0..at] ++ &[_]StaticPatEdge{.{ .text = seg, .child = child }} ++ ps[at..];
+                            nodes[node].patterns = ps[0..at] ++ &[_]StaticPatEdge{.{ .text = seg, .regexes = comptimeConstraints(seg), .child = child }} ++ ps[at..];
                             break :blk child;
                         };
                     },
@@ -1704,8 +1710,10 @@ const SegKind = union(enum) {
 };
 
 /// Classify `seg` and check its grammar: a capture name is non-empty and
-/// holds none of `/:*{}`; two captures need literal text between them (`{a}{b}`
-/// has no defined split); literal text holds no `:`, `*`, `{` or `}`.
+/// holds none of `/:*{}`; a constraint after `:` is non-empty (its regexp
+/// syntax is checked when it is compiled — `Router.add`, `Static`); two
+/// captures need literal text between them (`{a}{b}` has no defined split);
+/// literal text holds no `:`, `*`, `{` or `}`.
 fn classifySegment(seg: []const u8) AddError!SegKind {
     if (seg.len != 0 and (seg[0] == '*' or seg[0] == ':')) {
         const name = seg[1..];
@@ -1720,15 +1728,18 @@ fn classifySegment(seg: []const u8) AddError!SegKind {
     var i: usize = 0;
     var prev_capture = false;
     var captures: usize = 0;
+    var constrained = false;
     while (i < seg.len) {
         switch (seg[i]) {
             '{' => {
                 if (prev_capture) return error.InvalidPattern;
-                const close = std.mem.indexOfScalarPos(u8, seg, i, '}') orelse return error.InvalidPattern;
-                const inner = seg[i + 1 .. close];
-                // `{name:regexp}` (chi) is parsed here once the `regex` module
-                // exists; until then a constraint is refused, not ignored.
-                if (!validCaptureName(inner)) return error.InvalidPattern;
+                const close = closeBrace(seg, i) orelse return error.InvalidPattern;
+                const c = splitCapture(seg[i + 1 .. close]);
+                if (!validCaptureName(c.name)) return error.InvalidPattern;
+                if (c.constraint) |re| {
+                    if (re.len == 0) return error.InvalidPattern;
+                    constrained = true;
+                }
                 captures += 1;
                 prev_capture = true;
                 i = close + 1;
@@ -1740,9 +1751,36 @@ fn classifySegment(seg: []const u8) AddError!SegKind {
             },
         }
     }
-    if (captures == 1 and seg[0] == '{' and seg[seg.len - 1] == '}')
+    // `{name}` alone is `:name`; `{name:re}` alone stays a pattern (it has a
+    // constraint to check).
+    if (captures == 1 and !constrained and seg[0] == '{' and seg[seg.len - 1] == '}')
         return .{ .param = seg[1 .. seg.len - 1] };
     return .pattern;
+}
+
+/// The `}` closing the `{` at `open`: braces nest (a constraint may hold
+/// `{2}` or `{1,3}`), a backslash escapes the next byte (`\}`).
+fn closeBrace(text: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    var i = open;
+    while (i < text.len) : (i += 1) {
+        switch (text[i]) {
+            '\\' => i += 1,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// `name` or `name:regexp` (the text between a capture's braces).
+fn splitCapture(inner: []const u8) struct { name: []const u8, constraint: ?[]const u8 } {
+    if (std.mem.indexOfScalar(u8, inner, ':')) |c| return .{ .name = inner[0..c], .constraint = inner[c + 1 ..] };
+    return .{ .name = inner, .constraint = null };
 }
 
 fn validCaptureName(name: []const u8) bool {
@@ -1756,6 +1794,8 @@ const CaptureIter = struct {
 
     const Capture = struct {
         name: []const u8,
+        /// The regexp after `:`, or null.
+        constraint: ?[]const u8,
         /// Index of the `{` in `text`.
         start: usize,
         /// Index just past the `}`.
@@ -1763,10 +1803,12 @@ const CaptureIter = struct {
     };
 
     fn next(it: *CaptureIter) ?Capture {
+        // Literal text holds no braces, so the next `{` opens a capture.
         const open = std.mem.indexOfScalarPos(u8, it.text, it.i, '{') orelse return null;
-        const close = std.mem.indexOfScalarPos(u8, it.text, open, '}').?;
+        const close = closeBrace(it.text, open).?;
         it.i = close + 1;
-        return .{ .name = it.text[open + 1 .. close], .start = open, .end = close + 1 };
+        const c = splitCapture(it.text[open + 1 .. close]);
+        return .{ .name = c.name, .constraint = c.constraint, .start = open, .end = close + 1 };
     }
 };
 
@@ -1776,18 +1818,22 @@ const CaptureIter = struct {
 /// occurrence of the literal after it (at least one byte in: no capture is
 /// ever empty), and the last capture takes everything up to the literal
 /// suffix, which must end the segment. So `{name}.{ext}` splits `a.b.c` into
-/// `a` + `b.c`, and `{id}.json` reads `a.b.json` as `a.b`. On false the
-/// caller restores `params.len`.
-fn matchSegPattern(text: []const u8, seg: []const u8, params: *Params) bool {
+/// `a` + `b.c`, and `{id}.json` reads `a.b.json` as `a.b`. A constrained
+/// capture's value must then match its regexp whole (`regexes[i]`, one per
+/// capture) — the split is not retried. On false the caller restores
+/// `params.len`.
+fn matchSegPattern(text: []const u8, regexes: []const ?regex.Regex, seg: []const u8, params: *Params) bool {
     var it: CaptureIter = .{ .text = text };
     var ti: usize = 0; // into text
     var si: usize = 0; // into seg
-    while (it.next()) |c| {
+    var ci: usize = 0; // capture index
+    while (it.next()) |c| : (ci += 1) {
         const lead = text[ti..c.start];
         if (!std.mem.startsWith(u8, seg[si..], lead)) return false;
         si += lead.len;
         // The literal that follows this capture, up to the next one or the end.
-        const lit_end = std.mem.indexOfScalarPos(u8, text, c.end, '{') orelse text.len;
+        var peek = it;
+        const lit_end = if (peek.next()) |nc| nc.start else text.len;
         const lit = text[c.end..lit_end];
         const value_end = if (lit.len == 0)
             seg.len // last capture, nothing after it
@@ -1797,6 +1843,7 @@ fn matchSegPattern(text: []const u8, seg: []const u8, params: *Params) bool {
             break :blk seg.len - lit.len;
         } else std.mem.indexOfPos(u8, seg, @min(si + 1, seg.len), lit) orelse return false;
         if (value_end <= si) return false; // never empty
+        if (regexes[ci]) |re| if (!re.fullMatch(seg[si..value_end])) return false;
         params.push(c.name, seg[si..value_end]);
         si = value_end;
         ti = c.end;
@@ -1804,8 +1851,8 @@ fn matchSegPattern(text: []const u8, seg: []const u8, params: *Params) bool {
     return std.mem.eql(u8, seg[si..], text[ti..]);
 }
 
-/// Same literals and capture count, names aside — two such patterns accept
-/// exactly the same segments.
+/// Same literals, capture count and constraints, names aside — two such
+/// patterns accept exactly the same segments.
 fn samePatternShape(a: []const u8, b: []const u8) bool {
     var ia: CaptureIter = .{ .text = a };
     var ib: CaptureIter = .{ .text = b };
@@ -1819,6 +1866,9 @@ fn samePatternShape(a: []const u8, b: []const u8) bool {
         const eb = if (cb) |c| c.start else b.len;
         if (!std.mem.eql(u8, a[pa..ea], b[pb..eb])) return false;
         if (ca == null) return true;
+        const ka = ca.?.constraint orelse "";
+        const kb = cb.?.constraint orelse "";
+        if ((ca.?.constraint == null) != (cb.?.constraint == null) or !std.mem.eql(u8, ka, kb)) return false;
         pa = ca.?.end;
         pb = cb.?.end;
     }
@@ -1826,23 +1876,69 @@ fn samePatternShape(a: []const u8, b: []const u8) bool {
 
 /// Where a new pattern goes among its siblings: they are tried in order, the
 /// longer literal prefix first (`v{n}.json` before `{a}.json`), then the
-/// more literal bytes in all, then registration order. The order decides
+/// more literal bytes in all, then the more constrained captures
+/// (`{id:[0-9]+}` before `{id}`), then registration order. The order decides
 /// only between patterns that accept the same segment.
 fn patternSlot(comptime E: type, edges: []const E, text: []const u8) usize {
     const key = patternRank(text);
     for (edges, 0..) |e, i| {
-        const k = patternRank(e.text);
-        if (key[0] > k[0] or (key[0] == k[0] and key[1] > k[1])) return i;
+        if (std.mem.order(usize, &key, &patternRank(e.text)) == .gt) return i;
     }
     return edges.len;
 }
 
-fn patternRank(text: []const u8) [2]usize {
+fn patternRank(text: []const u8) [3]usize {
     const lead = std.mem.indexOfScalar(u8, text, '{') orelse text.len;
     var literal: usize = text.len;
+    var constrained: usize = 0;
     var it: CaptureIter = .{ .text = text };
-    while (it.next()) |c| literal -= c.end - c.start;
-    return .{ lead, literal };
+    while (it.next()) |c| {
+        literal -= c.end - c.start;
+        if (c.constraint != null) constrained += 1;
+    }
+    return .{ lead, literal, constrained };
+}
+
+/// Compile the constraints of pattern segment `text`, one slot per capture,
+/// into `a` (the router's arena); the compile scratch comes from `scratch_gpa`.
+fn compileConstraints(a: Allocator, scratch_gpa: Allocator, text: []const u8) AddError![]const ?regex.Regex {
+    var n: usize = 0;
+    var it: CaptureIter = .{ .text = text };
+    while (it.next()) |_| n += 1;
+    const out = try a.alloc(?regex.Regex, n);
+    var builder: ?*regex.Builder = null;
+    defer if (builder) |b| scratch_gpa.destroy(b);
+    it = .{ .text = text };
+    for (out) |*slot| {
+        const c = it.next().?;
+        const re = c.constraint orelse {
+            slot.* = null;
+            continue;
+        };
+        if (builder == null) builder = try scratch_gpa.create(regex.Builder);
+        slot.* = regex.Regex.compileUsing(a, builder.?, re) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidConstraint,
+        };
+    }
+    return out;
+}
+
+/// `compileConstraints` at compile time (a bad regexp is a compile error).
+fn comptimeConstraints(comptime text: []const u8) []const ?regex.Regex {
+    comptime {
+        var n: usize = 0;
+        var it: CaptureIter = .{ .text = text };
+        while (it.next()) |_| n += 1;
+        var out: [n]?regex.Regex = undefined;
+        it = .{ .text = text };
+        for (&out) |*slot| {
+            const c = it.next().?;
+            slot.* = if (c.constraint) |re| regex.comptimeCompile(re) else null;
+        }
+        const final = out;
+        return &final;
+    }
 }
 
 /// The target's path portion -- up to '?', or the whole target when there is
@@ -1939,7 +2035,7 @@ const Node = struct {
     min_reach: u32 = std.math.maxInt(u32),
 
     const Edge = struct { name: []const u8, node: *Node };
-    const PatEdge = struct { text: []const u8, node: *Node };
+    const PatEdge = struct { text: []const u8, regexes: []const ?regex.Regex, node: *Node };
 
     fn hasEndpoint(n: *const Node) bool {
         for (n.endpoints) |ep| {
@@ -2107,7 +2203,7 @@ fn matchIn(
         const child = tree.patChild(pe);
         if (tree.minReach(child) > remaining_after_seg) continue;
         const saved = params.len;
-        if (matchSegPattern(pe.text, seg, params)) {
+        if (matchSegPattern(pe.text, pe.regexes, seg, params)) {
             if (matchIn(tree, child, next, extra, params, depth + 1, remaining_after_seg, method, allow)) |n| return n;
         }
         params.len = saved;
@@ -3556,9 +3652,9 @@ test "Static: trailing-slash variant mirrors Router's redirect probe" {
 
 test "validatePattern and Router.add refuse the same patterns" {
     const bad = [_][]const u8{
-        "",                            "x",     "//x",                              "/a//b", "/:",  "/*/x",     "/*w/x",     "/a:b",      "/:a/:a", "/:a/*a", "/:x:y",
-        "/:a/:b/:c/:d/:e/:f/:g/:h/:i", "/{}",   "/{a}{b}",                          "/{a",   "/a}", "/{a}.{a}", "/:a/{a}.x", "/{a}.x/*a", "/{a/b}", "/x{a}*", "/{a:b}",
-        "/{a}:x",                      "/{:x}", "/{a}.{b}/{c}-{d}/{e}_{f}/:g/*h/i",
+        "",                            "x",      "//x",     "/a//b",                            "/:",  "/*/x",     "/*w/x",     "/a:b",      "/:a/:a", "/:a/*a", "/:x:y",
+        "/:a/:b/:c/:d/:e/:f/:g/:h/:i", "/{}",    "/{a}{b}", "/{a",                              "/a}", "/{a}.{a}", "/:a/{a}.x", "/{a}.x/*a", "/{a/b}", "/x{a}*", "/{a:}",
+        "/{a:[0-9]+",                  "/{a}:x", "/{:x}",   "/{a}.{b}/{c}-{d}/{e}_{f}/:g/*h/i",
     };
     for (bad) |pat| {
         var r = Router.init(testing.allocator);
@@ -4186,4 +4282,51 @@ test "PatternCaptures: every capture kind, in order" {
 
 test {
     _ = @import("chi_oracle_test.zig");
+}
+
+// ── regexp constraints (chi's `{id:[0-9]+}`, 2026-10-07) ─────────────────────
+
+test "constraints: {name:regexp} matches the whole capture, ahead of an unconstrained sibling" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/u/{id:[0-9]+}", hPat);
+    try r.get("/u/{name}", hPat);
+    try r.get("/f/{name:[a-z]+}.{ext:json|xml}", hPat);
+    try r.get("/d/{date:[0-9]{4}-[0-9]{2}}", hPat);
+    try r.get("/r/{x:a|b}", hPat);
+
+    var buf: [1024]u8 = undefined;
+    const cases = .{
+        .{ "/u/123", "/u/{id:[0-9]+} id=123" },
+        .{ "/u/12a", "/u/{name} name=12a" },
+        .{ "/f/abc.json", "/f/{name:[a-z]+}.{ext:json|xml} name=abc ext=json" },
+        .{ "/d/2026-10", "/d/{date:[0-9]{4}-[0-9]{2}} date=2026-10" },
+        .{ "/r/a", "/r/{x:a|b} x=a" },
+    };
+    inline for (cases) |c| try testing.expectEqualStrings(c[1], bodyOf(runWire(&r, wire("GET", c[0]), &buf)));
+    // The regexp is anchored at both ends (chi's `^a|b$` lets "ab" through).
+    inline for (.{ "/f/abc.yaml", "/f/ab1.json", "/d/2026-1", "/r/ab", "/u/" }) |miss|
+        try expectStatus(runWire(&r, wire("GET", miss), &buf), "404");
+    try testing.expectError(error.InvalidConstraint, r.get("/x/{id:[0-9}", hPat));
+    try testing.expectError(error.InvalidConstraint, r.get("/x/{id:(a}", hPat));
+    // Same shape, another constraint: a different pattern, both allowed.
+    try r.get("/u/{id:[a-f]+}x", hPat);
+    try r.get("/u/{id:[0-9]+}x", hPat);
+    try testing.expectEqualStrings("/u/{id:[a-f]+}x id=ab", bodyOf(runWire(&r, wire("GET", "/u/abx"), &buf)));
+    try testing.expectEqualStrings("/u/{id:[0-9]+}x id=12", bodyOf(runWire(&r, wire("GET", "/u/12x"), &buf)));
+    try testing.expectError(error.ParamNameConflict, r.get("/u/{other:[0-9]+}x", hPat));
+}
+
+test "constraints: Static compiles them at comptime and answers as Router does" {
+    const routes = [_]StaticRoute{
+        .{ .method = .get, .pattern = "/u/{id:[0-9]+}" },
+        .{ .method = .get, .pattern = "/u/{name}" },
+        .{ .method = .get, .pattern = "/f/{name}.{ext:json|xml}" },
+    };
+    const T = Static(&routes, .{});
+    var p: Params = .{};
+    try testing.expectEqual(Match{ .found = 0 }, T.match(.get, "/u/42", &p));
+    try testing.expectEqual(Match{ .found = 1 }, T.match(.get, "/u/x42", &p));
+    try testing.expectEqual(Match{ .found = 2 }, T.match(.get, "/f/a.xml", &p));
+    try testing.expectEqual(Match.not_found, T.match(.get, "/f/a.txt", &p));
 }

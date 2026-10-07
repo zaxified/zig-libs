@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — `Regex.compileUsing(gpa, builder, pattern)`: `compile` with the caller's
+  `Builder` (the ~70 KiB compile scratch), so many patterns compiled into an arena share one.
 - **2026-10-07** — New module: RE2-syntax regular expressions (Go `regexp/syntax` grammar) on a
   Pike VM — linear time, leftmost-first, compiled without an allocator (also at comptime),
   `isMatch`/`fullMatch` without one, `Matcher` for submatches and non-overlapping iteration.

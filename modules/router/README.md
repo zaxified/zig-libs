@@ -14,7 +14,7 @@ middleware.
   building (`add`/`use`/`group`) is single-owner; a built Router is
   immutable and `dispatch` is read-only + allocation-free, safe from all
   of `http.Server`'s connection threads at once.
-- **Deps:** `http`.
+- **Deps:** `http`, `regex` (constraints).
 
 Provenance: original work of the zig-libs authors (MIT); the trie matcher +
 middleware chain are clean-room, modeled after Go `go-chi/chi` (MIT) and
@@ -89,7 +89,7 @@ OpenAPI 3.1 document.
 | Topic | Behavior |
 |---|---|
 | Precedence | static > in-segment pattern > `:param` > `*wildcard` per segment, with chi-style backtracking (an endpoint-less static prefix falls back to a param sibling) |
-| Patterns | `:id` and `{id}` capture one whole segment; `{name}` inside a segment with literal text around it (`{name}.{ext}`, `v{major}`, `{id}.json`) — see "Patterns inside a segment"; `*rest` (or a bare `*`, captured as `"*"`) the remainder |
+| Patterns | `:id` and `{id}` capture one whole segment; `{name}` inside a segment with literal text around it (`{name}.{ext}`, `v{major}`, `{id}.json`); `{id:[0-9]+}` with a regexp constraint — see "Patterns inside a segment"; `*rest` (or a bare `*`, captured as `"*"`) the remainder |
 | Params | `:param` never matches an empty segment; `*wildcard` must be the last segment and captures the remainder without the leading slash (may be `""`); a pattern must not reuse one capture name twice (`error.DuplicateParamName`) or contain an empty segment other than a single trailing one (`error.InvalidPattern`) |
 | Matching | raw bytes — no percent-decoding, no case folding |
 | Middleware | outer→inner = registration order: router `use` → group → nested group → handler; chains are frozen into routes at add time, so `use` after any route ⇒ `error.RoutesAlreadyRegistered`; a fallback (404/405/auto-OPTIONS/redirect — see below) runs the chain of whichever group's prefix the request path falls under, router-level `use` alone when it falls under none — a `group("/api").use(requireAuth)` gate sees every response for `/api`, not only the ones a route actually served |
@@ -222,8 +222,14 @@ capture names (`{a}.json` vs `{b}.json`) cannot share a position: `error.ParamNa
 `router.PatternCaptures` iterates a pattern's capture names (what `openapi` builds its
 parameters from).
 
-Not yet: chi's regexp constraint `{id:[0-9]+}` is refused (`error.InvalidPattern`) until the
-`regex` module lands.
+**Regexp constraints** (chi's `{id:[0-9]+}`): after the split above, a constrained capture's
+value must match its regexp **whole** (RE2 syntax, the sibling `regex` module — linear time,
+compiled at `add`, at comptime for `Static`). `{x:a|b}` takes `a` or `b`, never `ab` (chi pastes
+`^…$` around the text and lets `ab` through). A constraint never makes a capture cross a `/`.
+Among sibling patterns of equal rank, the constrained one is tried first, so
+`/u/{id:[0-9]+}` beside `/u/{name}` sends `/u/42` to the first and `/u/x42` to the second. A
+regexp that does not compile is `error.InvalidConstraint`. Braces inside a constraint nest
+(`{d:[0-9]{4}}`); `\}` escapes one.
 
 ## Composing routers: `with`, `mount`, `any`, per-group fallbacks
 
@@ -296,8 +302,9 @@ that rewrite). `router.validatePattern` is the per-pattern grammar both share.
   order/short-circuit/state, groups, keep-alive) driven through the
   socket-free `http.Server.serveStream` — no sockets, golden responses.
 - go-chi/chi v5.3.2 as a differential oracle (`tools/go_chi_oracle`, replayed by
-  `src/chi_oracle_test.zig`): 3,600 requests over 60 seeded route tables route as chi routes
-  them — status, pattern, captures — with the divergences above pinned.
+  `src/chi_oracle_test.zig`): 3,600 requests over 60 seeded route tables (regexp constraints
+  included) route as chi routes them — status, pattern, captures — with the divergences above
+  pinned.
 - In-process integration: `http.Server` + this router on `127.0.0.1:0`,
   exercised with the Phase-1 `http.Client` (dispatch, params, middleware
   header, 404/405 + `Allow` over a real TCP connection).

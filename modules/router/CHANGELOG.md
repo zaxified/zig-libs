@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Regexp constraints, chi's `{id:[0-9]+}`: the whole capture must match the
+  regexp (RE2 syntax, new dependency `regex`; compiled at `add`, at comptime for `Static`);
+  a constrained pattern is tried before an unconstrained sibling of equal rank; a bad regexp is
+  the new `error.InvalidConstraint`. The chi oracle draws constraints (ANCHOR divergence pinned:
+  `{x:a|b}` never takes `ab`).
 - **2026-10-07** — Parity with go-chi/chi (the reference): chi's `{name}` captures — whole
   segment (same as `:name`) and **inside a segment** (`/files/{name}.{ext}`, `v{major}`,
   `{id}.json`), a bare `*` wildcard (captured as `"*"`); `with` (inline per-route middleware),

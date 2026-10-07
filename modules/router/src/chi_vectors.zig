@@ -21,1668 +21,1636 @@ pub const Table = struct { routes: []const Route, refused: u16, cases: []const C
 
 pub const tables = [_]Table{
     .{ .routes = &.{
-        .{ .method = "DELETE", .pattern = "/a" },
-        .{ .method = "GET", .pattern = "/v1" },
-        .{ .method = "PUT", .pattern = "/x.y" },
-        .{ .method = "DELETE", .pattern = "/{p0}" },
-        .{ .method = "GET", .pattern = "/{p0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}.json" },
-        .{ .method = "PUT", .pattern = "/{p0}.{q0}" },
+        .{ .method = "PUT", .pattern = "/a" },
+        .{ .method = "POST", .pattern = "/v1" },
+        .{ .method = "GET", .pattern = "/x.y" },
+        .{ .method = "POST", .pattern = "/{p0}" },
+        .{ .method = "PUT", .pattern = "/{p0}/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0}.json" },
+        .{ .method = "POST", .pattern = "/{p0}.{q0}" },
         .{ .method = "PUT", .pattern = "/v{p0}" },
-        .{ .method = "DELETE", .pattern = "/v{p0}/{p1}" },
-        .{ .method = "GET", .pattern = "/{p0}-{q0}" },
-        .{ .method = "DELETE", .pattern = "/{p0}-{q0}/{p1}" },
+        .{ .method = "POST", .pattern = "/v{p0}/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0}-{q0}" },
+        .{ .method = "POST", .pattern = "/{p0}-{q0}/{p1}" },
         .{ .method = "PUT", .pattern = "/pre{p0}" },
-        .{ .method = "DELETE", .pattern = "/pre{p0}/{p1}" },
-        .{ .method = "GET", .pattern = "/{p0}~x" },
-        .{ .method = "GET", .pattern = "/{p0}~x/{p1}" },
-        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt/{p1}" },
-        .{ .method = "DELETE", .pattern = "/b/a-b" },
-        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt/users" },
-        .{ .method = "DELETE", .pattern = "/v1" },
+        .{ .method = "POST", .pattern = "/pre{p0}/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0}~x" },
+        .{ .method = "POST", .pattern = "/{p0}~x/{p1}" },
+        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "POST", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-z]+}/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "DELETE", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-c]+}-{q0}/{p1}" },
+        .{ .method = "POST", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "DELETE", .pattern = "/a-b/" },
+        .{ .method = "POST", .pattern = "/{p0}/users/pre{p2}" },
+        .{ .method = "POST", .pattern = "/v1/users" },
+        .{ .method = "DELETE", .pattern = "/users" },
+        .{ .method = "POST", .pattern = "/x.y" },
+        .{ .method = "GET", .pattern = "/v1/a-b" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "GET", .pattern = "/x.y/{p1}-{q1}" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/b/a-b", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "a-b" },
-        } },
-        .{ .method = "GET", .path = "/ab/a.b/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "POST", .path = "/xyz.a/vjson", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/42-users/b/prexyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/aab_users.txt/json.json", .status = 405, .allow = &.{
-            "GET",
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/c7-users", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/ac7_42.txt", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/b/users/xyz/preusers", .status = 404 },
-        .{ .method = "PUT", .path = "/ac7_xyz.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/users/a42_ab.txt/txt/a42_users.txt/", .status = 404 },
-        .{ .method = "DELETE", .path = "/v42/b", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+        .{ .method = "PUT", .path = "/pre42", .status = 200, .pattern = "/pre{p0}", .params = &.{
             .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "b" },
         } },
-        .{ .method = "GET", .path = "/aa_42.txt/preab/json.json", .status = 404 },
-        .{ .method = "DELETE", .path = "/vtxt/xyz", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "xyz" },
+        .{ .method = "GET", .path = "/b/users/xyz/preusers", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/", .status = 405, .allow = &.{
+            "DELETE",
         } },
-        .{ .method = "DELETE", .path = "/42.ab/prexyz/preab", .status = 404 },
-        .{ .method = "GET", .path = "/users~x/ab", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
+        .{ .method = "DELETE", .path = "/xyz/users/a42_ab.txt/txt", .status = 404 },
+        .{ .method = "PUT", .path = "/c7.json", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/b~x/xyz.a", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/c7-json", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "q0", .value = "json" },
+        } },
+        .{ .method = "DELETE", .path = "/pretxt/txt~x/vb/c7.1", .status = 404 },
+        .{ .method = "POST", .path = "/ab~x/c7", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p1", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/vusers/b-a/ab/", .status = 404 },
+        .{ .method = "POST", .path = "/ab.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/b/ausers_users.txt/42/users~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/1-json/txt", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/xyz~x/v1/ab.c7/", .status = 404 },
+        .{ .method = "PUT", .path = "/1/ab", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "1" },
             .{ .name = "p1", .value = "ab" },
         } },
-        .{ .method = "DELETE", .path = "/ab/", .status = 404 },
-        .{ .method = "POST", .path = "/ab", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/a-b", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/42-txt/users", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "txt" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/a.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "DELETE", .path = "/v1/ab.c7/txt.users", .status = 404 },
-        .{ .method = "GET", .path = "/txt-txt", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+        .{ .method = "GET", .path = "/users/x.y/b/json-txt", .status = 404 },
+        .{ .method = "PUT", .path = "/txt~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
             .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "txt" },
         } },
-        .{ .method = "GET", .path = "/b/b", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "b" },
+        .{ .method = "DELETE", .path = "/ab", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
         } },
-        .{ .method = "DELETE", .path = "/ab_c7.txt/users", .status = 200, .pattern = "/a{p0}_{q0}.txt/users", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/42.ab/v1", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/prejson/json", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/txt/xyz.a", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/b~x/json", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/txt.txt/txt~x/xyz-1/prec7", .status = 404 },
-        .{ .method = "PUT", .path = "/a-txt", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/txt~x/users-1/vjson/ac7_json.txt", .status = 404 },
-        .{ .method = "POST", .path = "/xyz.ab", .status = 405, .allow = &.{
-            "DELETE",
+        .{ .method = "GET", .path = "/v1/a-b", .status = 200, .pattern = "/v1/a-b", .params = &.{} },
+        .{ .method = "GET", .path = "/json-xyz/txt/prejson/a1_ab.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/json-42/b", .status = 405, .allow = &.{
+            "POST",
             "PUT",
         } },
-        .{ .method = "DELETE", .path = "/txt.1/vxyz/vb/42-txt", .status = 404 },
-        .{ .method = "GET", .path = "/ab~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "ab" },
+        .{ .method = "GET", .path = "/txt/preusers", .status = 405, .allow = &.{
+            "PUT",
         } },
-        .{ .method = "POST", .path = "/42~x/b", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "PUT", .path = "/prec7", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "DELETE", .path = "/b.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "b" },
+        .{ .method = "PUT", .path = "/a/users~x/ab/xyz~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/prejson/v1", .status = 200, .pattern = "/{p0:[a-z]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "prejson" },
+            .{ .name = "p1", .value = "v1" },
         } },
-        .{ .method = "PUT", .path = "/b-users/json/1~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1/xyz", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+        .{ .method = "POST", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "PUT", .path = "/1~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
             .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/42-42", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "q0", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/va", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "va" },
+        } },
+        .{ .method = "PUT", .path = "/42/xyz", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
             .{ .name = "p1", .value = "xyz" },
         } },
-        .{ .method = "GET", .path = "/x.y/aab_1.txt", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "x.y" },
-            .{ .name = "p1", .value = "aab_1.txt" },
+        .{ .method = "GET", .path = "/b.ab", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "PUT", .path = "/aab_users.txt/users", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
+        .{ .method = "POST", .path = "/preab/b", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
             .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "users" },
-            .{ .name = "p1", .value = "users" },
+            .{ .name = "p1", .value = "b" },
         } },
-        .{ .method = "POST", .path = "/b~x/vab", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/b.xyz/ab_xyz.txt/1~x/a", .status = 404 },
+        .{ .method = "POST", .path = "/v1/users", .status = 200, .pattern = "/v1/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/xyz~x/txt-users/1-txt", .status = 404 },
+        .{ .method = "POST", .path = "/vc7/xyz", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "p1", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/txt-ab/txt~x/va/txt~x", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/a-b/a1_users.txt/b/v1", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/txt-xyz", .status = 405, .allow = &.{
             "GET",
+            "PUT",
         } },
-        .{ .method = "DELETE", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
+        .{ .method = "POST", .path = "/1.b/json-xyz/ab.users", .status = 404 },
+        .{ .method = "DELETE", .path = "/json-a/a", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
         } },
-        .{ .method = "PUT", .path = "/txt~x/va", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "POST", .path = "/json/a~x/b-txt/prejson", .status = 404 },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/users~x", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users~x" },
         } },
-        .{ .method = "PUT", .path = "/vab", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/x.y/txt.users/x.y/ab.a", .status = 404 },
-        .{ .method = "DELETE", .path = "/txt.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/prexyz", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/json~x/42", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/vusers/a-b", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/pre1", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/a~x/b-txt/prejson", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "POST", .path = "/users~x", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/b/a", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+        .{ .method = "POST", .path = "/b.a", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
             .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "a" },
+            .{ .name = "q0", .value = "a" },
         } },
         .{ .method = "GET", .path = "/pretxt/b/v1", .status = 404 },
+        .{ .method = "GET", .path = "/aab_a.txt/a", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/x.y/", .status = 404 },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/ab_a.txt/42~x/a1_txt.txt/b~x", .status = 404 },
+        .{ .method = "PUT", .path = "/json-b", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/xyz~x/prexyz/c7/", .status = 404 },
+        .{ .method = "DELETE", .path = "/xyz-c7/1", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/x.y/ausers_ab.txt/prexyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "DELETE", .path = "/a/a-b", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/v42", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/prexyz/", .status = 404 },
     } },
     .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/x.y/{p1}.{q1}" },
-        .{ .method = "DELETE", .pattern = "/x.y/v{p1}" },
-        .{ .method = "POST", .pattern = "/pre{p0}" },
-        .{ .method = "POST", .pattern = "/pre{p0}/{p1}.json" },
+        .{ .method = "POST", .pattern = "/x.y/{p1:[a-c]+}-{q1}/{p2:[0-9]+}" },
+        .{ .method = "POST", .pattern = "/{p0}/{p1}/{p2}" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "PUT", .pattern = "/{p0}/{p1}/v{p2:[0-9]+}" },
+        .{ .method = "PUT", .pattern = "/a" },
+        .{ .method = "PUT", .pattern = "/x.y/a" },
+        .{ .method = "POST", .pattern = "/a/a{p1}_{q1}.txt/v{p2:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/users/a/*" },
+        .{ .method = "PUT", .pattern = "/b/v{p1}/a" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/preab", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
+        .{ .method = "POST", .path = "/a/ajson_xyz.txt/va", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p1", .value = "ajson_xyz.txt" },
+            .{ .name = "p2", .value = "va" },
         } },
-        .{ .method = "PUT", .path = "/1~x/xyz~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/vc7", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "c7" },
+        .{ .method = "PUT", .path = "/42.b/v1", .status = 404 },
+        .{ .method = "PUT", .path = "/1/1/users", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "GET", .path = "/preb/c7.c7/1/x.y", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/vxyz", .status = 405, .allow = &.{
-            "DELETE",
+        .{ .method = "GET", .path = "/v42/a-b", .status = 404 },
+        .{ .method = "POST", .path = "/a/ac7_c7.txt/va", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p1", .value = "ac7_c7.txt" },
+            .{ .name = "p2", .value = "va" },
         } },
-        .{ .method = "GET", .path = "/a1_xyz.txt/atxt_json.txt/a-b/txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/42.b", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/b", .status = 404 },
-        .{ .method = "POST", .path = "/pretxt/a.json", .status = 200, .pattern = "/pre{p0}/{p1}.json", .params = &.{
+        .{ .method = "GET", .path = "/a1_json.txt", .status = 404 },
+        .{ .method = "POST", .path = "/txt/users/users", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
             .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/axyz_users.txt/vtxt", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y/json.xyz", .status = 200, .pattern = "/x.y/{p1}.{q1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "q1", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/ab.ab/v1", .status = 404 },
-        .{ .method = "POST", .path = "/pre1/1.json", .status = 200, .pattern = "/pre{p0}/{p1}.json", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/json~x", .status = 404 },
-        .{ .method = "POST", .path = "/prejson/xyz.json", .status = 200, .pattern = "/pre{p0}/{p1}.json", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/b-42/vb/xyz.users/users.a", .status = 404 },
-        .{ .method = "PUT", .path = "/preusers", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/a/axyz_json.txt/a/1", .status = 404 },
-        .{ .method = "POST", .path = "/pre42/c7.json", .status = 200, .pattern = "/pre{p0}/{p1}.json", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/vusers", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/ab.42", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/b/ac7_json.txt/txt-1/users", .status = 404 },
-        .{ .method = "GET", .path = "/pretxt", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/a~x/aa_b.txt/v42", .status = 404 },
-        .{ .method = "POST", .path = "/pre1/json.json", .status = 200, .pattern = "/pre{p0}/{p1}.json", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/a/pre42/vtxt/b.a", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y/ab.users", .status = 200, .pattern = "/x.y/{p1}.{q1}", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "q1", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/c7-a", .status = 404 },
-        .{ .method = "POST", .path = "/pretxt", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/users/b~x/preusers/42", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/vtxt", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/1-a/users.c7", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/vxyz", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/aab_42.txt/txt/ac7_ab.txt/", .status = 404 },
-        .{ .method = "POST", .path = "/prejson", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/42/ab.1/v1", .status = 404 },
-        .{ .method = "GET", .path = "/prea", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/ab~x/xyz~x/ab_c7.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/pre42/a.json", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/txt/c7~x/a-xyz/", .status = 404 },
-        .{ .method = "POST", .path = "/preab", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/c7", .status = 404 },
-        .{ .method = "POST", .path = "/prec7", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/vtxt/preusers", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/1.a", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/ab.xyz/ac7_42.txt/a/b-b", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/a.xyz", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/c7~x", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y/vjson", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/42-json", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y/txt.xyz", .status = 200, .pattern = "/x.y/{p1}.{q1}", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "q1", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/ab-xyz/a-b/a42_b.txt/", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y/users.ab", .status = 200, .pattern = "/x.y/{p1}.{q1}", .params = &.{
             .{ .name = "p1", .value = "users" },
-            .{ .name = "q1", .value = "ab" },
+            .{ .name = "p2", .value = "users" },
         } },
-        .{ .method = "PUT", .path = "/b/ab.b/xyz/txt", .status = 404 },
-        .{ .method = "PUT", .path = "/preusers", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/aa_b.txt/v42/va", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "GET", .path = "/1-42/42.a", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/vxyz", .status = 405, .allow = &.{
-            "DELETE",
+        .{ .method = "GET", .path = "/users/a/", .status = 200, .pattern = "/users/a/*", .params = &.{
+            .{ .name = "*", .value = "" },
         } },
-        .{ .method = "POST", .path = "/1/1", .status = 404 },
-        .{ .method = "POST", .path = "/pre1/ab.json", .status = 200, .pattern = "/pre{p0}/{p1}.json", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "ab" },
+        .{ .method = "DELETE", .path = "/b.42/xyz/a/", .status = 404 },
+        .{ .method = "GET", .path = "/users/a/aab_txt.txt/users.c7", .status = 200, .pattern = "/users/a/*", .params = &.{
+            .{ .name = "*", .value = "aab_txt.txt/users.c7" },
         } },
-        .{ .method = "PUT", .path = "/atxt_b.txt/vb/b", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/v{p0}/x.y/" },
-        .{ .method = "GET", .pattern = "/a/{p1}/{p2}-{q2}" },
-        .{ .method = "PUT", .pattern = "/b/pre{p1}/{p2}" },
-        .{ .method = "GET", .pattern = "/x.y/{p1}~x/{p2}-{q2}" },
-        .{ .method = "POST", .pattern = "/v1/{p1}" },
-        .{ .method = "DELETE", .pattern = "/users/a{p1}_{q1}.txt" },
-        .{ .method = "POST", .pattern = "/v1/" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "DELETE", .path = "/v1/42", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "POST", .path = "/axyz_txt.txt/users/a~x", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
+            .{ .name = "p0", .value = "axyz_txt.txt" },
+            .{ .name = "p1", .value = "users" },
+            .{ .name = "p2", .value = "a~x" },
         } },
-        .{ .method = "GET", .path = "/json.xyz/txt.xyz/users-42/xyz.users", .status = 404 },
-        .{ .method = "PUT", .path = "/v42/x.y/", .status = 200, .pattern = "/v{p0}/x.y", .params = &.{
-            .{ .name = "p0", .value = "42" },
+        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/prejson/users~x/txt/1~x", .status = 404 },
+        .{ .method = "POST", .path = "/a/ausers_1.txt/vc7", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p1", .value = "ausers_1.txt" },
+            .{ .name = "p2", .value = "vc7" },
         } },
-        .{ .method = "POST", .path = "/prea/aab_ab.txt", .status = 404 },
-        .{ .method = "POST", .path = "/v1/json", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/ab~x/a-b/c7~x/1", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/txt~x/ab-users", .status = 200, .pattern = "/x.y/{p1}~x/{p2}-{q2}", .params = &.{
+        .{ .method = "POST", .path = "/xyz/b", .status = 404 },
+        .{ .method = "PUT", .path = "/b/vtxt/a", .status = 200, .pattern = "/b/v{p1}/a", .params = &.{
             .{ .name = "p1", .value = "txt" },
-            .{ .name = "p2", .value = "ab" },
-            .{ .name = "q2", .value = "users" },
         } },
-        .{ .method = "PUT", .path = "/users.1/prejson/ac7_ab.txt/aa_b.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/users/axyz_c7.txt", .status = 200, .pattern = "/users/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
+        .{ .method = "GET", .path = "/ab/c7", .status = 404 },
+        .{ .method = "DELETE", .path = "/42/txt/vab", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/ab.xyz/ausers_users.txt/c7~x/ab~x/", .status = 404 },
+        .{ .method = "POST", .path = "/a/ausers_c7.txt/v42", .status = 200, .pattern = "/a/a{p1}_{q1}.txt/v{p2:[0-9]+}", .params = &.{
+            .{ .name = "p1", .value = "users" },
             .{ .name = "q1", .value = "c7" },
+            .{ .name = "p2", .value = "42" },
         } },
-        .{ .method = "POST", .path = "/txt/users.a/txt.42", .status = 404 },
-        .{ .method = "PUT", .path = "/b/pre42/a", .status = 200, .pattern = "/b/pre{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/b", .status = 404 },
-        .{ .method = "GET", .path = "/users/atxt_xyz.txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/json.xyz", .status = 404 },
-        .{ .method = "GET", .path = "/a/xyz/a-xyz", .status = 200, .pattern = "/a/{p1}/{p2}-{q2}", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
-            .{ .name = "p2", .value = "a" },
-            .{ .name = "q2", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/b", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/42~x/b-ab", .status = 200, .pattern = "/x.y/{p1}~x/{p2}-{q2}", .params = &.{
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "b" },
-            .{ .name = "q2", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/xyz/b.json/xyz.a/ausers_xyz.txt", .status = 404 },
-        .{ .method = "POST", .path = "/v1/1", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/prejson/", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/json-42", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/a-users/va/txt-txt", .status = 404 },
-        .{ .method = "POST", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/1~x/x.y/pretxt", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/42~x/b-b", .status = 200, .pattern = "/x.y/{p1}~x/{p2}-{q2}", .params = &.{
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "b" },
-            .{ .name = "q2", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/v1/json-c7/vab", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/a~x/a-c7", .status = 200, .pattern = "/x.y/{p1}~x/{p2}-{q2}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "p2", .value = "a" },
-            .{ .name = "q2", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/b/a", .status = 404 },
-        .{ .method = "POST", .path = "/v1/json", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/json", .status = 404 },
-        .{ .method = "GET", .path = "/a/c7/ab-ab", .status = 200, .pattern = "/a/{p1}/{p2}-{q2}", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "p2", .value = "ab" },
-            .{ .name = "q2", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/a-b/c7-42/json~x", .status = 404 },
-        .{ .method = "POST", .path = "/v1/xyz", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/ausers_txt.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/x.y/", .status = 200, .pattern = "/v{p0}/x.y", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/a", .status = 404 },
-        .{ .method = "POST", .path = "/a/json/users-xyz", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/a~x/v1", .status = 404 },
-        .{ .method = "GET", .path = "/v1/c7", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/prea/1-txt/pretxt", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "DELETE", .path = "/pre1/aa_ab.txt/prexyz", .status = 404 },
-        .{ .method = "PUT", .path = "/b/prea/a", .status = 200, .pattern = "/b/pre{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "a" },
+        .{ .method = "POST", .path = "/xyz/json/42", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "p1", .value = "json" },
+            .{ .name = "p2", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/b/users/pretxt", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "p1", .value = "users" },
+            .{ .name = "p2", .value = "pretxt" },
+        } },
+        .{ .method = "PUT", .path = "/txt/ab/vusers", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/txt.a/", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/a", .status = 200, .pattern = "/x.y/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/ac7_42.txt", .status = 404 },
+        .{ .method = "POST", .path = "/a/aab_b.txt/v1", .status = 200, .pattern = "/a/a{p1}_{q1}.txt/v{p2:[0-9]+}", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+            .{ .name = "q1", .value = "b" },
+            .{ .name = "p2", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/xyz.42/pre1/users/x.y/", .status = 404 },
+        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/prec7", .status = 404 },
+        .{ .method = "PUT", .path = "/c7/1/vxyz", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/a-b/", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/ab_txt.txt/v42", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/preusers/b/ab.b", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/b/vtxt/a", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "p1", .value = "vtxt" },
             .{ .name = "p2", .value = "a" },
         } },
-        .{ .method = "GET", .path = "/x.y/a/users/ab", .status = 404 },
-        .{ .method = "POST", .path = "/v1/b", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "b" },
+        .{ .method = "PUT", .path = "/preusers/vab/1-42", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "PUT", .path = "/atxt_c7.txt/c7.1/xyz/txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/users/ac7_ab.txt", .status = 200, .pattern = "/users/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "q1", .value = "ab" },
+        .{ .method = "PUT", .path = "/x.y/a", .status = 200, .pattern = "/x.y/a", .params = &.{} },
+        .{ .method = "POST", .path = "/xyz/users", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/json-json/42", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
+            .{ .name = "p0", .value = "x.y" },
+            .{ .name = "p1", .value = "json-json" },
+            .{ .name = "p2", .value = "42" },
         } },
-        .{ .method = "DELETE", .path = "/v1/42-c7/json.c7", .status = 404 },
-        .{ .method = "POST", .path = "/v1/xyz", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
+        .{ .method = "GET", .path = "/b/json/x.y/a-b", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/a", .status = 200, .pattern = "/x.y/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/b.b", .status = 404 },
+        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "POST", .path = "/a-42/users/a/json", .status = 404 },
+        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "POST", .path = "/users~x/ausers_ab.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/b/vjson/a", .status = 200, .pattern = "/b/v{p1}/a", .params = &.{
+            .{ .name = "p1", .value = "json" },
         } },
-        .{ .method = "PUT", .path = "/a-json/a-b/json", .status = 404 },
-        .{ .method = "POST", .path = "/v1/b", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "b" },
+        .{ .method = "GET", .path = "/a1_ab.txt/c7/vb/prea", .status = 404 },
+        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/1~x/txt.xyz/users-42/xyz.users", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/42-c7/a", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
+            .{ .name = "p0", .value = "x.y" },
+            .{ .name = "p1", .value = "42-c7" },
+            .{ .name = "p2", .value = "a" },
         } },
-        .{ .method = "DELETE", .path = "/vtxt/a/", .status = 404 },
-        .{ .method = "DELETE", .path = "/users/atxt_a.txt", .status = 200, .pattern = "/users/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "q1", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/a/pretxt", .status = 404 },
-        .{ .method = "POST", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/c7-txt/b/prea", .status = 404 },
-        .{ .method = "POST", .path = "/v1/xyz", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/x.y/users/b.txt", .status = 404 },
-        .{ .method = "POST", .path = "/v1/a", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/json/users/json.42/vjson", .status = 404 },
-        .{ .method = "POST", .path = "/v1/b", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "b" },
+        .{ .method = "GET", .path = "/aab_ab.txt/ab-users", .status = 404 },
+        .{ .method = "PUT", .path = "/ab", .status = 404 },
+        .{ .method = "GET", .path = "/b/c7~x/1/vtxt", .status = 404 },
+        .{ .method = "PUT", .path = "/users", .status = 404 },
+        .{ .method = "PUT", .path = "/users.1/prejson/ac7_ab.txt/aa_b.txt", .status = 404 },
+        .{ .method = "GET", .path = "/users/a/vc7", .status = 200, .pattern = "/users/a/*", .params = &.{
+            .{ .name = "*", .value = "vc7" },
         } },
         .{ .method = "PUT", .path = "/txt~x", .status = 404 },
     } },
     .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/v{p0}/{p1}/a{p2}_{q2}.txt" },
-        .{ .method = "DELETE", .pattern = "/a-b" },
-        .{ .method = "PUT", .pattern = "/v1/{p1}/b" },
-        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "POST", .pattern = "/pre{p0}" },
-        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt/{p1}" },
-        .{ .method = "GET", .pattern = "/x.y/users/{p2}-{q2}" },
-        .{ .method = "POST", .pattern = "/a/{p1}" },
+        .{ .method = "DELETE", .pattern = "/a/{p1}-{q1}/a" },
+        .{ .method = "POST", .pattern = "/x.y" },
+        .{ .method = "DELETE", .pattern = "/v1/x.y/*" },
+        .{ .method = "PUT", .pattern = "/a/{p1}" },
+        .{ .method = "GET", .pattern = "/users/{p1}/{p2}" },
+        .{ .method = "POST", .pattern = "/{p0}~x/a-b" },
+        .{ .method = "GET", .pattern = "/v{p0}" },
+        .{ .method = "PUT", .pattern = "/{p0}/x.y" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "PUT", .path = "/atxt_b.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/vusers/txt~x/v1/vab", .status = 404 },
-        .{ .method = "DELETE", .path = "/ausers_b.txt/ab", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "b" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/txt-c7", .status = 404 },
-        .{ .method = "PUT", .path = "/aab_json.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/c7.users/pre42/b.json", .status = 404 },
-        .{ .method = "PUT", .path = "/ab_users.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/ab~x/a-ab/users/ab~x/", .status = 404 },
-        .{ .method = "POST", .path = "/a/b", .status = 200, .pattern = "/a/{p1}", .params = &.{
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/b/b/users", .status = 404 },
-        .{ .method = "POST", .path = "/a/ab", .status = 200, .pattern = "/a/{p1}", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/json.xyz/xyz-b/a-users", .status = 404 },
-        .{ .method = "POST", .path = "/preab", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/users/vjson/json~x", .status = 404 },
-        .{ .method = "GET", .path = "/vab/42/atxt_users.txt", .status = 200, .pattern = "/v{p0}/{p1}/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "txt" },
-            .{ .name = "q2", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/ab~x/vb/ab-users", .status = 404 },
-        .{ .method = "POST", .path = "/a-b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/preab", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/x.y/users/ab-1", .status = 200, .pattern = "/x.y/users/{p2}-{q2}", .params = &.{
-            .{ .name = "p2", .value = "ab" },
-            .{ .name = "q2", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/vab/ab-1/users", .status = 404 },
-        .{ .method = "DELETE", .path = "/ab_1.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/prexyz/42.42/", .status = 404 },
-        .{ .method = "PUT", .path = "/a/c7", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/a/users", .status = 200, .pattern = "/a/{p1}", .params = &.{
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/ab-a/x.y/vjson", .status = 404 },
-        .{ .method = "POST", .path = "/a/a", .status = 200, .pattern = "/a/{p1}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/b~x/42~x/vc7", .status = 404 },
-        .{ .method = "POST", .path = "/a-b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/aab_b.txt/v42/prea", .status = 404 },
-        .{ .method = "DELETE", .path = "/aa_b.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/a1_1.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/pretxt", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/a42_c7.txt/vtxt/ab~x/c7", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/txt/b", .status = 200, .pattern = "/v1/{p1}/b", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/json/json~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/ac7_ab.txt/users", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "ab" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/b/v1", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/users-txt/x.y/c7~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/a1_c7.txt/1", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "c7" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/users", .status = 404 },
-        .{ .method = "PUT", .path = "/v42/a/ausers_42.txt", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/va", .status = 405, .allow = &.{
             "GET",
         } },
-        .{ .method = "GET", .path = "/users/aab_a.txt/42~x/b", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/aa_ab.txt", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/preusers/b.42/pretxt/prejson/", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/1", .status = 404 },
+        .{ .method = "GET", .path = "/vusers", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/42", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/txt-1/a", .status = 200, .pattern = "/a/{p1}-{q1}/a", .params = &.{
+            .{ .name = "p1", .value = "txt" },
+            .{ .name = "q1", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/x.y/pretxt/vb/users-b", .status = 404 },
+        .{ .method = "POST", .path = "/v1", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/json-c7/vab/users/aa_c7.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/1~x/a-b", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/pretxt/a-b/x.y", .status = 404 },
+        .{ .method = "GET", .path = "/users/xyz/42", .status = 200, .pattern = "/users/{p1}/{p2}", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+            .{ .name = "p2", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/v42/ajson_a.txt/pretxt/ab.json", .status = 404 },
+        .{ .method = "POST", .path = "/a/x.y", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "PUT", .path = "/a42_users.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "users" },
+        .{ .method = "DELETE", .path = "/xyz~x/a", .status = 404 },
+        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
         } },
-        .{ .method = "POST", .path = "/42", .status = 404 },
-        .{ .method = "DELETE", .path = "/a42_json.txt/42", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "json" },
-            .{ .name = "p1", .value = "42" },
+        .{ .method = "GET", .path = "/a", .status = 404 },
+        .{ .method = "PUT", .path = "/a/json", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "json" },
         } },
-        .{ .method = "PUT", .path = "/xyz.users/", .status = 404 },
-        .{ .method = "DELETE", .path = "/axyz_xyz.txt/ab", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "p1", .value = "ab" },
+        .{ .method = "PUT", .path = "/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/x.y/", .status = 200, .pattern = "/v1/x.y/*", .params = &.{
+            .{ .name = "*", .value = "" },
         } },
-        .{ .method = "POST", .path = "/users~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/atxt_users.txt/c7", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "users" },
+        .{ .method = "GET", .path = "/c7~x/c7~x/pre1", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/xyz-xyz/a", .status = 200, .pattern = "/a/{p1}-{q1}/a", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+            .{ .name = "q1", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/aa_b.txt/42~x/x.y", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/users-json/a", .status = 200, .pattern = "/a/{p1}-{q1}/a", .params = &.{
+            .{ .name = "p1", .value = "users" },
+            .{ .name = "q1", .value = "json" },
+        } },
+        .{ .method = "DELETE", .path = "/x.y/1-xyz/atxt_c7.txt/c7.1", .status = 404 },
+        .{ .method = "PUT", .path = "/a/json", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/vc7", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/v1", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/v42/json.c7", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/x.y/c7~x", .status = 200, .pattern = "/v1/x.y/*", .params = &.{
+            .{ .name = "*", .value = "c7~x" },
+        } },
+        .{ .method = "PUT", .path = "/prejson/b/json/42~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/x.y/42/aab_txt.txt", .status = 200, .pattern = "/v1/x.y/*", .params = &.{
+            .{ .name = "*", .value = "42/aab_txt.txt" },
+        } },
+        .{ .method = "POST", .path = "/a-b/vusers/a/pretxt", .status = 404 },
+        .{ .method = "PUT", .path = "/a/c7", .status = 200, .pattern = "/a/{p1}", .params = &.{
             .{ .name = "p1", .value = "c7" },
         } },
-        .{ .method = "GET", .path = "/c7-txt/ajson_1.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a/42", .status = 200, .pattern = "/a/{p1}", .params = &.{
-            .{ .name = "p1", .value = "42" },
+        .{ .method = "PUT", .path = "/42/b", .status = 404 },
+        .{ .method = "GET", .path = "/vjson", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
         } },
-        .{ .method = "POST", .path = "/a42_a.txt/json.xyz", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/xyz-b/b", .status = 404 },
+        .{ .method = "PUT", .path = "/b/x.y", .status = 200, .pattern = "/{p0}/x.y", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/ausers_a.txt/vb/b/atxt_txt.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/json/ab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/b/a-b/xyz.a", .status = 404 },
+        .{ .method = "PUT", .path = "/users/x.y", .status = 200, .pattern = "/{p0}/x.y", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/pre42/vjson", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/users/xyz", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/a/json-b/va/a-b", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/axyz_users.txt", .status = 404 },
+        .{ .method = "POST", .path = "/users/users/ab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/b/xyz/preab", .status = 404 },
+        .{ .method = "POST", .path = "/users/a/xyz", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/users-b/va/ab", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/x.y/vab/prea", .status = 200, .pattern = "/v1/x.y/*", .params = &.{
+            .{ .name = "*", .value = "vab/prea" },
+        } },
+        .{ .method = "GET", .path = "/ab-b/ab/prexyz/preusers", .status = 404 },
+        .{ .method = "POST", .path = "/users/c7/b", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/txt.b/vusers/b/axyz_42.txt", .status = 404 },
+        .{ .method = "POST", .path = "/vab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/a/preab/a-b/b", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/x.y/", .status = 200, .pattern = "/v1/x.y/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "DELETE", .path = "/a-json/1~x/xyz-b/a-users", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/x.y" },
+        .{ .method = "DELETE", .pattern = "/{p0:[0-9]+}.json/a-b/a-b" },
+        .{ .method = "POST", .pattern = "/v1" },
+        .{ .method = "POST", .pattern = "/*" },
+        .{ .method = "PUT", .pattern = "/a-b/b" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "PUT", .path = "/xyz.json/a-b/a-b", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/42~x/a1_42.txt/vc7/a-xyz", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/aab_ab.txt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/1.json/a-b/a-b", .status = 200, .pattern = "/{p0:[0-9]+}.json/a-b/a-b", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/atxt_users.txt/b.1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/42/vc7/b", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/a-b/b", .status = 200, .pattern = "/a-b/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/b-42/prea", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "PUT", .path = "/ab.xyz/users/ab", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/x.y", .status = 405, .allow = &.{
             "DELETE",
+            "POST",
         } },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/a/users~x/42", .status = 404 },
+        .{ .method = "POST", .path = "/ab/json/users~x", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "ab/json/users~x" },
+        } },
+        .{ .method = "POST", .path = "/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "PUT", .path = "/txt/atxt_b.txt/vusers/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/c7/txt/b-users", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/ab.json/a-b/a-b", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/ausers_xyz.txt/vtxt/c7.json", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/vc7/users-a", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "GET", .path = "/42/1/txt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/a-b/b", .status = 200, .pattern = "/a-b/b", .params = &.{} },
+        .{ .method = "POST", .path = "/c7~x", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "c7~x" },
+        } },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/xyz/a~x", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/a-b/b", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/users-b/b/preb/aab_a.txt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/a-1/txt~x", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/preab/txt~x/a42_b.txt/axyz_42.txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "preab/txt~x/a42_b.txt/axyz_42.txt" },
+        } },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/42.b/preab", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "42.b/preab" },
+        } },
+        .{ .method = "DELETE", .path = "/a.json/a-b/a-b", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/aab_xyz.txt/c7~x", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/users/preab", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/a-b/b", .status = 200, .pattern = "/a-b/b", .params = &.{} },
+        .{ .method = "GET", .path = "/vusers", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/a/pre1/c7", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/a42_xyz.txt/42/users", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a42_xyz.txt/42/users" },
+        } },
+        .{ .method = "DELETE", .path = "/a-b/b", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/json.users/vc7/1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "json.users/vc7/1" },
+        } },
+        .{ .method = "PUT", .path = "/v1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/atxt_c7.txt/prea", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/a-b/b", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/users~x/txt.42/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/a-b/b", .status = 200, .pattern = "/a-b/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/pretxt/vjson/va", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/v1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/1-txt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/a-b/b", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a-b/b" },
+        } },
+        .{ .method = "PUT", .path = "/users~x/json/va", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/prexyz", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/v42/preab/xyz-ab/1-1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/a~x", .status = 405, .allow = &.{
+            "POST",
+        } },
     } },
     .{ .routes = &.{
         .{ .method = "POST", .pattern = "/a" },
         .{ .method = "PUT", .pattern = "/a/{p1}" },
         .{ .method = "GET", .pattern = "/v1" },
         .{ .method = "POST", .pattern = "/v1/{p1}" },
-        .{ .method = "POST", .pattern = "/x.y" },
-        .{ .method = "DELETE", .pattern = "/x.y/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}" },
-        .{ .method = "PUT", .pattern = "/{p0}.json" },
-        .{ .method = "GET", .pattern = "/{p0}.json/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}.{q0}" },
-        .{ .method = "POST", .pattern = "/{p0}.{q0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/v{p0}" },
-        .{ .method = "POST", .pattern = "/{p0}-{q0}" },
+        .{ .method = "PUT", .pattern = "/x.y" },
+        .{ .method = "GET", .pattern = "/x.y/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0}" },
+        .{ .method = "GET", .pattern = "/{p0}.json" },
+        .{ .method = "POST", .pattern = "/{p0}.{q0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}.{q0}/{p1}" },
+        .{ .method = "GET", .pattern = "/v{p0}" },
+        .{ .method = "GET", .pattern = "/{p0}-{q0}" },
         .{ .method = "PUT", .pattern = "/{p0}-{q0}/{p1}" },
-        .{ .method = "GET", .pattern = "/pre{p0}" },
-        .{ .method = "GET", .pattern = "/{p0}~x" },
-        .{ .method = "DELETE", .pattern = "/{p0}~x/{p1}" },
-        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt/{p1}" },
-        .{ .method = "GET", .pattern = "/x.y" },
+        .{ .method = "POST", .pattern = "/pre{p0}" },
+        .{ .method = "GET", .pattern = "/pre{p0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0}~x" },
+        .{ .method = "GET", .pattern = "/{p0}~x/{p1}" },
+        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "POST", .pattern = "/{p0:[a-z]+}/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "GET", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "DELETE", .pattern = "/v{p0:[0-9]+}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}.json/{p1}~x" },
         .{ .method = "PUT", .pattern = "/{p0}" },
-        .{ .method = "GET", .pattern = "/{p0}/a/{p2}" },
-        .{ .method = "GET", .pattern = "/a/{p1}~x/{p2}.{q2}" },
-        .{ .method = "POST", .pattern = "/{p0}/*" },
+        .{ .method = "PUT", .pattern = "/a/users/x.y" },
+        .{ .method = "GET", .pattern = "/v1/users/{p2}.json" },
+        .{ .method = "GET", .pattern = "/b" },
+        .{ .method = "POST", .pattern = "/a/a/a" },
+        .{ .method = "PUT", .pattern = "/pre{p0}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-c]+}-{q0}/b/users" },
+        .{ .method = "DELETE", .pattern = "/a/{p1}/{p2:[a-c]+}-{q2}" },
+        .{ .method = "PUT", .pattern = "/a/{p1}~x" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "PUT", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
+        .{ .method = "PUT", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
         } },
-        .{ .method = "PUT", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/json.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/prexyz/", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "prexyz" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "GET", .path = "/42/", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/prexyz/1~x", .status = 405, .allow = &.{
+            "GET",
             "POST",
         } },
-        .{ .method = "PUT", .path = "/v42/1-1", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "DELETE", .path = "/a.json/xyz~x", .status = 200, .pattern = "/{p0}.json/{p1}~x", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p1", .value = "xyz" },
         } },
-        .{ .method = "POST", .path = "/xyz.users/a", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "users" },
+        .{ .method = "PUT", .path = "/1~x", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "1~x" },
+        } },
+        .{ .method = "POST", .path = "/v1/1", .status = 200, .pattern = "/v1/{p1}", .params = &.{
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "DELETE", .path = "/a/users.ab/b/a.1", .status = 404 },
+        .{ .method = "GET", .path = "/ajson_1.txt/json", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/a.42", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/xyz.json/a~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/v1/xyz-users/a42_json.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/c7.json/c7~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/ab~x/v1/a/txt~x", .status = 404 },
+        .{ .method = "PUT", .path = "/a/ab~x", .status = 200, .pattern = "/a/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "DELETE", .path = "/json/1/x.y/users-users", .status = 404 },
+        .{ .method = "GET", .path = "/a~x/a", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a" },
             .{ .name = "p1", .value = "a" },
         } },
-        .{ .method = "GET", .path = "/xyz-a/preab/txt/", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "PUT", .path = "/xyz.b", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz.b" },
         } },
-        .{ .method = "GET", .path = "/a/1~x/1.42", .status = 200, .pattern = "/a/{p1}~x/{p2}.{q2}", .params = &.{
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "p2", .value = "1" },
-            .{ .name = "q2", .value = "42" },
+        .{ .method = "DELETE", .path = "/json~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "json" },
         } },
-        .{ .method = "GET", .path = "/atxt_b.txt/1", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "b" },
-            .{ .name = "p1", .value = "1" },
+        .{ .method = "PUT", .path = "/1/preb/c7.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/a~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "a" },
         } },
-        .{ .method = "DELETE", .path = "/x.y/xyz", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/pre42", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "pre42" },
-        } },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "x" },
-            .{ .name = "q0", .value = "y" },
-        } },
-        .{ .method = "DELETE", .path = "/preab/json.a", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/xyz.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+        .{ .method = "PUT", .path = "/prexyz", .status = 200, .pattern = "/pre{p0}", .params = &.{
             .{ .name = "p0", .value = "xyz" },
         } },
-        .{ .method = "GET", .path = "/42.c7", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
+        .{ .method = "POST", .path = "/xyz.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "txt" },
         } },
-        .{ .method = "POST", .path = "/v1/json", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
+        .{ .method = "PUT", .path = "/xyz/42~x/c7/vusers", .status = 404 },
+        .{ .method = "PUT", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "POST", .path = "/ab/a/b/", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "*", .value = "a/b/" },
-        } },
-        .{ .method = "PUT", .path = "/a/xyz", .status = 200, .pattern = "/a/{p1}", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a-b" },
-        } },
-        .{ .method = "DELETE", .path = "/x.y/1", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+        .{ .method = "DELETE", .path = "/c7-xyz/vusers/a~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/1.ab/1", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "q0", .value = "ab" },
             .{ .name = "p1", .value = "1" },
         } },
-        .{ .method = "PUT", .path = "/txt~x/a/b/", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/xyz/a/a", .status = 404 },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/preab", .status = 405, .allow = &.{
             "POST",
-        } },
-        .{ .method = "GET", .path = "/txt/a/xyz", .status = 200, .pattern = "/{p0}/a/{p2}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p2", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/b", .status = 405, .allow = &.{
-            "DELETE",
             "PUT",
         } },
-        .{ .method = "GET", .path = "/pre42", .status = 200, .pattern = "/pre{p0}", .params = &.{
+        .{ .method = "DELETE", .path = "/c7~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/b.ab/aa_1.txt/prejson/", .status = 404 },
+        .{ .method = "POST", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "42" },
         } },
-        .{ .method = "POST", .path = "/b~x/aa_xyz.txt/b~x", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "b~x" },
-            .{ .name = "*", .value = "aa_xyz.txt/b~x" },
+        .{ .method = "GET", .path = "/vb/a-xyz/xyz.42/", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/json", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "json" },
         } },
-        .{ .method = "POST", .path = "/c7-ab", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
+        .{ .method = "DELETE", .path = "/aa_42.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "42" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/ab~x/b.42/v1/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab-a", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/v1/xyz-c7", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/x.y/json", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/a/42-b/vxyz/va", .status = 404 },
+        .{ .method = "PUT", .path = "/ab.json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "ab.json" },
+        } },
+        .{ .method = "DELETE", .path = "/1/", .status = 404 },
+        .{ .method = "PUT", .path = "/a/b", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/ausers_42.txt/prexyz/x.y", .status = 404 },
+        .{ .method = "PUT", .path = "/aab_ab.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+            .{ .name = "p0", .value = "ab" },
             .{ .name = "q0", .value = "ab" },
         } },
-        .{ .method = "PUT", .path = "/users/json~x/preb", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "POST", .path = "/prejson/vb", .status = 200, .pattern = "/{p0:[a-z]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "prejson" },
+            .{ .name = "p1", .value = "vb" },
         } },
-        .{ .method = "POST", .path = "/a-json", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/vusers/b.users/ab.1/1", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/prejson", .status = 200, .pattern = "/pre{p0}", .params = &.{
+        .{ .method = "POST", .path = "/json/xyz", .status = 200, .pattern = "/{p0:[a-z]+}/{p1}", .params = &.{
             .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/b/a.1", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/json-1", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/a/42.a/preb/a", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "POST", .path = "/users-a/ajson_b.txt/preb/c7", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "users-a" },
-            .{ .name = "*", .value = "ajson_b.txt/preb/c7" },
-        } },
-        .{ .method = "DELETE", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/a/txt~x/1.txt/ab~x", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "x" },
-            .{ .name = "q0", .value = "y" },
-        } },
-        .{ .method = "GET", .path = "/x.y/users-users", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/a.a/txt", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/v1/pre1/json-a", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/ab_c7.txt/c7", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "c7" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/preusers/a~x/vxyz/prexyz", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/x.y/xyz", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
             .{ .name = "p1", .value = "xyz" },
         } },
-        .{ .method = "POST", .path = "/pretxt/txt-xyz/c7", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "pretxt" },
-            .{ .name = "*", .value = "txt-xyz/c7" },
-        } },
-        .{ .method = "POST", .path = "/1.b/c7", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "b" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/c7-xyz/vusers/a~x", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/1", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/xyz/xyz/a", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/ab_1.txt/users", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "1" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/c7.1/prexyz/x.y", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/c7~x/ab_42.txt/ausers_c7.txt/", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/pre42", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/42-xyz", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/json~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/x.y/a-b", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
-            .{ .name = "p1", .value = "a-b" },
-        } },
-        .{ .method = "GET", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/a/42.ab/txt", .status = 405, .allow = &.{
-            "POST",
-        } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/x.y/a/v1/" },
-        .{ .method = "PUT", .pattern = "/{p0}" },
-        .{ .method = "DELETE", .pattern = "/a/a-b" },
-        .{ .method = "DELETE", .pattern = "/v{p0}/{p1}.json" },
-        .{ .method = "DELETE", .pattern = "/{p0}-{q0}" },
-        .{ .method = "PUT", .pattern = "/a-b/v1" },
-        .{ .method = "PUT", .pattern = "/x.y/a-b" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "DELETE", .path = "/xyz", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/a.ab", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/b", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/json-xyz", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/preusers/a-b", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y/a/v1/", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/preusers/a-b", .status = 405, .allow = &.{
             "GET",
-        } },
-        .{ .method = "PUT", .path = "/a-xyz/a/json/", .status = 404 },
-        .{ .method = "DELETE", .path = "/ab-1", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/v1/42/1/users", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/prea/aa_ab.txt/txt~x", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/a/v1/", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/a/ajson_1.txt", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/v1", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/txt.c7/users.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/vjson/json.json", .status = 200, .pattern = "/v{p0}/{p1}.json", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/42~x", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "42~x" },
+            "POST",
         } },
         .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "a" },
         } },
-        .{ .method = "PUT", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
+        .{ .method = "PUT", .path = "/a-xyz/a/json/", .status = 404 },
+        .{ .method = "POST", .path = "/ab/1", .status = 200, .pattern = "/{p0:[a-z]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p1", .value = "1" },
         } },
-        .{ .method = "GET", .path = "/x.y/a-b", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/pre42/aab_ab.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a/a-b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/ab~x/xyz.xyz/aa_b.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/xyz/xyz~x/xyz.b", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/a/v1/", .status = 200, .pattern = "/x.y/a/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/txt-1", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/a", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/b-xyz", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+        .{ .method = "GET", .path = "/v1/42/1/users", .status = 404 },
+        .{ .method = "GET", .path = "/preb/txt", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
             .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "xyz" },
+            .{ .name = "p1", .value = "txt" },
         } },
-        .{ .method = "POST", .path = "/a/a-b", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/aa_ab.txt/txt~x", .status = 405, .allow = &.{
             "DELETE",
         } },
-        .{ .method = "PUT", .path = "/b-xyz/json-txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/42-txt", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "txt" },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/a/ajson_1.txt", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
         } },
-        .{ .method = "DELETE", .path = "/42-b/a/1", .status = 404 },
-        .{ .method = "DELETE", .path = "/vjson/42.json", .status = 200, .pattern = "/v{p0}/{p1}.json", .params = &.{
+        .{ .method = "GET", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/txt.c7/users.txt", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/ajson_json.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
             .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "42" },
+            .{ .name = "q0", .value = "json" },
         } },
-        .{ .method = "POST", .path = "/users/b", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/v1", .status = 200, .pattern = "/a-b/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/xyz/json~x/json~x", .status = 404 },
-        .{ .method = "PUT", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
+        .{ .method = "PUT", .path = "/42~x", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "42~x" },
         } },
-        .{ .method = "DELETE", .path = "/users/json/b-1/1.xyz", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/v1", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/v1/1~x/1.c7", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/a/v1/", .status = 200, .pattern = "/x.y/a/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/preusers/v1", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y/a-b", .status = 200, .pattern = "/x.y/a-b", .params = &.{} },
-        .{ .method = "GET", .path = "/users/a1_1.txt/xyz/v1/", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y/a-b", .status = 200, .pattern = "/x.y/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/a~x", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a~x" },
-        } },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/42~x/prea", .status = 404 },
-        .{ .method = "PUT", .path = "/1", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/pretxt/1-42/users/42~x/", .status = 404 },
-        .{ .method = "DELETE", .path = "/b-ab", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/atxt_xyz.txt/", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y/a-b", .status = 200, .pattern = "/x.y/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/a-b/v1", .status = 200, .pattern = "/a-b/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/users", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/ab.b/users/b/a", .status = 404 },
     } },
     .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/v{p0}/a/v1" },
-        .{ .method = "GET", .pattern = "/v{p0}" },
-        .{ .method = "POST", .pattern = "/{p0}.{q0}/{p1}/a{p2}_{q2}.txt" },
-        .{ .method = "POST", .pattern = "/a/a{p1}_{q1}.txt/pre{p2}" },
-        .{ .method = "DELETE", .pattern = "/{p0}.{q0}/a/users" },
-        .{ .method = "GET", .pattern = "/pre{p0}/b/pre{p2}" },
-        .{ .method = "POST", .pattern = "/b" },
-        .{ .method = "POST", .pattern = "/v1/v1" },
-        .{ .method = "POST", .pattern = "/a-b/x.y" },
-        .{ .method = "PUT", .pattern = "/{p0}/{p1}~x" },
+        .{ .method = "PUT", .pattern = "/{p0}-{q0}" },
+        .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}/a/b" },
+        .{ .method = "DELETE", .pattern = "/b" },
+        .{ .method = "GET", .pattern = "/pre{p0}" },
+        .{ .method = "DELETE", .pattern = "/v1/v1" },
+        .{ .method = "PUT", .pattern = "/pre{p0}/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0}-{q0}/users" },
+        .{ .method = "GET", .pattern = "/users/x.y" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/a-b/x.y", .status = 200, .pattern = "/a-b/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/users/users/aa_b.txt", .status = 404 },
-        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
+        .{ .method = "DELETE", .path = "/preusers/txt", .status = 405, .allow = &.{
+            "PUT",
         } },
-        .{ .method = "PUT", .path = "/prejson/ab_users.txt/42~x", .status = 404 },
-        .{ .method = "POST", .path = "/v1/v1", .status = 200, .pattern = "/v1/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/a.users/v42", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/x.y", .status = 200, .pattern = "/a-b/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/pre1/json.users", .status = 404 },
-        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/atxt_42.txt/preb/json/vusers", .status = 404 },
-        .{ .method = "DELETE", .path = "/b", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "PUT", .path = "/axyz_xyz.txt", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "DELETE", .path = "/txt", .status = 404 },
-        .{ .method = "PUT", .path = "/b.c7/a/users", .status = 405, .allow = &.{
-            "DELETE",
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/xyz", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "PUT", .path = "/1-42/b/ac7_xyz.txt/vxyz/", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/x.y", .status = 200, .pattern = "/a-b/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/42/va/x.y/txt~x", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/x.y", .status = 200, .pattern = "/a-b/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/b~x/", .status = 404 },
-        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "POST", .path = "/txt/c7~x/b", .status = 404 },
-        .{ .method = "DELETE", .path = "/xyz.txt/a/users", .status = 200, .pattern = "/{p0}.{q0}/a/users", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/vtxt/xyz-txt/x.y", .status = 404 },
-        .{ .method = "PUT", .path = "/txt/users~x", .status = 200, .pattern = "/{p0}/{p1}~x", .params = &.{
+        .{ .method = "DELETE", .path = "/v1/v1", .status = 200, .pattern = "/v1/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/pretxt/json-42/v1", .status = 404 },
+        .{ .method = "PUT", .path = "/txt-xyz", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
             .{ .name = "p0", .value = "txt" },
+            .{ .name = "q0", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/v42/vc7/users", .status = 404 },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/vxyz/xyz/json~x", .status = 404 },
+        .{ .method = "GET", .path = "/prejson", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/txt.users/json/b/1.42", .status = 404 },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/c7.b/users.xyz/1.c7/a", .status = 404 },
+        .{ .method = "PUT", .path = "/users-c7", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "q0", .value = "c7" },
+        } },
+        .{ .method = "DELETE", .path = "/users/1/c7~x/json.a/", .status = 404 },
+        .{ .method = "POST", .path = "/b-b/users", .status = 200, .pattern = "/{p0}-{q0}/users", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "q0", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/txt-a", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt-a" },
+        } },
+        .{ .method = "GET", .path = "/pretxt", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/pre42", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/prea", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/ab.xyz", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/42~x", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/pre42", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/vab/b-txt/", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/b.42", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/v1/v1", .status = 200, .pattern = "/v1/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/aab_users.txt/vtxt", .status = 404 },
+        .{ .method = "PUT", .path = "/prexyz/users", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
             .{ .name = "p1", .value = "users" },
         } },
-        .{ .method = "GET", .path = "/42/txt-xyz/prexyz", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/x.y", .status = 200, .pattern = "/a-b/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/1/", .status = 404 },
-        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "GET", .path = "/42/ab/v42/ab_ab.txt", .status = 404 },
-        .{ .method = "GET", .path = "/ab.a/a/users", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/b~x/", .status = 404 },
+        .{ .method = "GET", .path = "/prea", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/pre1/json", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/users/x.y", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/users/json/va/xyz", .status = 404 },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/txt/va/b/xyz-1", .status = 404 },
+        .{ .method = "PUT", .path = "/prea/a", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/users~x/vab/ab.users/a1_ab.txt", .status = 404 },
+        .{ .method = "POST", .path = "/v1/v1", .status = 405, .allow = &.{
             "DELETE",
         } },
-        .{ .method = "PUT", .path = "/ab~x/json", .status = 404 },
-        .{ .method = "POST", .path = "/ab.a/xyz/atxt_users.txt", .status = 200, .pattern = "/{p0}.{q0}/{p1}/a{p2}_{q2}.txt", .params = &.{
+        .{ .method = "PUT", .path = "/b/xyz~x/users/", .status = 404 },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/a1_c7.txt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/xyz-1/users", .status = 200, .pattern = "/{p0}-{q0}/users", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/c7/prea/aa_b.txt/b-42", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab/a/b", .status = 200, .pattern = "/{p0}/a/b", .params = &.{
             .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/aa_42.txt/vxyz/v1/axyz_a.txt", .status = 404 },
+        .{ .method = "GET", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/txt-txt", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "q0", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/1-users/users", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/pre1/xyz", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "1" },
             .{ .name = "p1", .value = "xyz" },
-            .{ .name = "p2", .value = "txt" },
-            .{ .name = "q2", .value = "users" },
         } },
-        .{ .method = "POST", .path = "/preb/", .status = 404 },
-        .{ .method = "POST", .path = "/txt.json/42/aa_b.txt", .status = 200, .pattern = "/{p0}.{q0}/{p1}/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "json" },
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "a" },
-            .{ .name = "q2", .value = "b" },
+        .{ .method = "DELETE", .path = "/prec7/json", .status = 405, .allow = &.{
+            "PUT",
         } },
-        .{ .method = "POST", .path = "/1~x", .status = 404 },
-        .{ .method = "PUT", .path = "/txt/b~x", .status = 200, .pattern = "/{p0}/{p1}~x", .params = &.{
-            .{ .name = "p0", .value = "txt" },
+        .{ .method = "POST", .path = "/ab~x", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/users-txt", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "q0", .value = "txt" },
+        } },
+        .{ .method = "GET", .path = "/users/va/b.42", .status = 404 },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/vxyz/users", .status = 404 },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/va/x.y/txt~x", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "PUT", .pattern = "/a/x.y/{p2}" },
+        .{ .method = "PUT", .pattern = "/v{p0}/{p1}/{p2:[a-c]+}-{q2}" },
+        .{ .method = "GET", .pattern = "/{p0}/{p1:[a-c]+}-{q1}" },
+        .{ .method = "GET", .pattern = "/users/*" },
+        .{ .method = "PUT", .pattern = "/pre{p0}" },
+        .{ .method = "POST", .pattern = "/a" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "PUT", .pattern = "/*" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "PUT", .path = "/c7.a", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "c7.a" },
+        } },
+        .{ .method = "DELETE", .path = "/42.json/vtxt/va/1.42", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/va", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "va" },
+        } },
+        .{ .method = "GET", .path = "/a/x.y/ab", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/c7-xyz/json/a-ab", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/txt/users-txt", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/c7~x/vab/txt/x.y", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/pre1", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/txt/b/1~x/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/txt-ab/pretxt/42-b/a/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/users/42", .status = 200, .pattern = "/users/*", .params = &.{
+            .{ .name = "*", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/txt-42/pretxt/ab_42.txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "txt-42/pretxt/ab_42.txt" },
+        } },
+        .{ .method = "GET", .path = "/xyz/ab-a", .status = 200, .pattern = "/{p0}/{p1:[a-c]+}-{q1}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "p1", .value = "ab" },
+            .{ .name = "q1", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/42~x/json-c7", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "42~x/json-c7" },
+        } },
+        .{ .method = "DELETE", .path = "/ab", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "POST", .path = "/prexyz", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/a/x.y/1", .status = 200, .pattern = "/a/x.y/{p2}", .params = &.{
+            .{ .name = "p2", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/b/1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "b/1" },
+        } },
+        .{ .method = "DELETE", .path = "/a/x.y/1", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/a/txt/1", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/vab/xyz/txt-42", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "vab/xyz/txt-42" },
+        } },
+        .{ .method = "PUT", .path = "/1-ab", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "1-ab" },
+        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "v1" },
+        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/xyz-c7/vb/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "xyz-c7/vb/" },
+        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/xyz.xyz/b", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/42.b/atxt_42.txt/users-c7/b-users", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "42.b/atxt_42.txt/users-c7/b-users" },
+        } },
+        .{ .method = "PUT", .path = "/ab.xyz/txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "ab.xyz/txt" },
+        } },
+        .{ .method = "PUT", .path = "/ab/users~x/ajson_b.txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "ab/users~x/ajson_b.txt" },
+        } },
+        .{ .method = "POST", .path = "/prexyz", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/prec7/users/vb/users-a", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "prec7/users/vb/users-a" },
+        } },
+        .{ .method = "POST", .path = "/vusers/xyz/ab-a", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "v1" },
+        } },
+        .{ .method = "DELETE", .path = "/42", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/a-1/json~x/ab", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/42/b-xyz", .status = 200, .pattern = "/{p0}/{p1:[a-c]+}-{q1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "b" },
+            .{ .name = "q1", .value = "xyz" },
+        } },
+        .{ .method = "PUT", .path = "/vc7/preab/users.1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "vc7/preab/users.1" },
+        } },
+        .{ .method = "PUT", .path = "/v1/1/json-b", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "v1/1/json-b" },
+        } },
+        .{ .method = "POST", .path = "/c7.xyz/v42/v42", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "GET", .path = "/v42/ab~x/json", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/42/ab-a", .status = 200, .pattern = "/{p0}/{p1:[a-c]+}-{q1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "ab" },
+            .{ .name = "q1", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/preb", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/a/x.y/json", .status = 200, .pattern = "/a/x.y/{p2}", .params = &.{
+            .{ .name = "p2", .value = "json" },
+        } },
+        .{ .method = "DELETE", .path = "/42.json/ausers_c7.txt", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/users/json-json", .status = 200, .pattern = "/users/*", .params = &.{
+            .{ .name = "*", .value = "json-json" },
+        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/preusers", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/42", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/prexyz", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/ajson_txt.txt/preb", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/vc7/xyz/ab-txt", .status = 200, .pattern = "/v{p0}/{p1}/{p2:[a-c]+}-{q2}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "p1", .value = "xyz" },
+            .{ .name = "p2", .value = "ab" },
+            .{ .name = "q2", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/ab_b.txt/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "GET", .pattern = "/b/" },
+        .{ .method = "POST", .pattern = "/{p0}/v{p1:[0-9]+}/{p2}.{q2}" },
+        .{ .method = "DELETE", .pattern = "/users/{p1}/b" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "PUT", .path = "/txt/vxyz/b.42", .status = 404 },
+        .{ .method = "PUT", .path = "/users", .status = 404 },
+        .{ .method = "POST", .path = "/txt/vtxt/b.json", .status = 404 },
+        .{ .method = "PUT", .path = "/1/vxyz/b.txt/c7.42", .status = 404 },
+        .{ .method = "POST", .path = "/xyz/vjson/42.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/1.users/b~x/1.ab", .status = 404 },
+        .{ .method = "PUT", .path = "/b/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/a", .status = 404 },
+        .{ .method = "POST", .path = "/users/c7/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/txt-json", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/v1/xyz.42", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/aab_42.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/b/b", .status = 200, .pattern = "/users/{p1}/b", .params = &.{
             .{ .name = "p1", .value = "b" },
         } },
-        .{ .method = "DELETE", .path = "/a-1/preusers", .status = 404 },
-        .{ .method = "GET", .path = "/vab", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
+        .{ .method = "DELETE", .path = "/x.y/c7-xyz", .status = 404 },
+        .{ .method = "POST", .path = "/c7/vab/json.1", .status = 404 },
+        .{ .method = "GET", .path = "/1-txt/ab-1/axyz_a.txt/users", .status = 404 },
+        .{ .method = "GET", .path = "/42/v42/xyz.ab", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "GET", .path = "/42", .status = 404 },
-        .{ .method = "GET", .path = "/vc7", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
+        .{ .method = "GET", .path = "/preusers/prec7/a1_users.txt/prec7", .status = 404 },
+        .{ .method = "POST", .path = "/b/", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "DELETE", .path = "/42/preab", .status = 404 },
-        .{ .method = "POST", .path = "/42.txt/c7/ab_a.txt", .status = 200, .pattern = "/{p0}.{q0}/{p1}/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "txt" },
-            .{ .name = "p1", .value = "c7" },
+        .{ .method = "DELETE", .path = "/axyz_json.txt/b/ausers_json.txt/axyz_42.txt", .status = 404 },
+        .{ .method = "GET", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/xyz-b/42/c7~x", .status = 404 },
+        .{ .method = "GET", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/aa_1.txt", .status = 404 },
+        .{ .method = "GET", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/pre42", .status = 404 },
+        .{ .method = "GET", .path = "/txt/vab/users.1", .status = 404 },
+        .{ .method = "GET", .path = "/vxyz/json.json/a1_42.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/txt/b", .status = 200, .pattern = "/users/{p1}/b", .params = &.{
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "GET", .path = "/c7~x/a~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/42/b", .status = 200, .pattern = "/users/{p1}/b", .params = &.{
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/json/b.a", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/xyz/b", .status = 200, .pattern = "/users/{p1}/b", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/a/ab", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/42/b", .status = 200, .pattern = "/users/{p1}/b", .params = &.{
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/ab.xyz/txt/vc7", .status = 404 },
+        .{ .method = "GET", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/axyz_a.txt/users/v1/json", .status = 404 },
+        .{ .method = "GET", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/users-json/1.users/x.y/a", .status = 404 },
+        .{ .method = "POST", .path = "/42/vxyz/42.json", .status = 404 },
+        .{ .method = "PUT", .path = "/txt.1/1.xyz/preb/users.xyz", .status = 404 },
+        .{ .method = "GET", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/preb/x.y/vusers", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/a/b", .status = 200, .pattern = "/users/{p1}/b", .params = &.{
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/c7-1/b/json~x/ab.b", .status = 404 },
+        .{ .method = "POST", .path = "/c7/vb/b.a", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/42-b", .status = 404 },
+        .{ .method = "POST", .path = "/txt/vxyz/json.a", .status = 404 },
+        .{ .method = "DELETE", .path = "/a1_txt.txt/42/pretxt/users.xyz", .status = 404 },
+        .{ .method = "POST", .path = "/a/v1/b.a", .status = 200, .pattern = "/{p0}/v{p1:[0-9]+}/{p2}.{q2}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p1", .value = "1" },
             .{ .name = "p2", .value = "b" },
             .{ .name = "q2", .value = "a" },
         } },
-        .{ .method = "DELETE", .path = "/c7~x/aab_42.txt/42", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b/x.y", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/ausers_ab.txt/", .status = 404 },
-        .{ .method = "POST", .path = "/vxyz/a/v1", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/json.txt", .status = 404 },
-        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/txt-b/ab.1", .status = 404 },
-        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "POST", .path = "/1/prea/vjson", .status = 404 },
-        .{ .method = "GET", .path = "/vb", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/v42/axyz_b.txt/json", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/x.y", .status = 200, .pattern = "/a-b/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/vc7/42-b", .status = 404 },
-        .{ .method = "POST", .path = "/va", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/xyz-c7/vb/", .status = 404 },
-        .{ .method = "PUT", .path = "/json/1~x", .status = 200, .pattern = "/{p0}/{p1}~x", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/a-b/42-1", .status = 404 },
-        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/atxt_42.txt", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/{p0}.json/{p1}/" },
-        .{ .method = "DELETE", .pattern = "/a-b/a" },
-        .{ .method = "GET", .pattern = "/pre{p0}/{p1}~x/a-b" },
-        .{ .method = "PUT", .pattern = "/pre{p0}/{p1}.{q1}" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "PUT", .path = "/prexyz/ab.b", .status = 200, .pattern = "/pre{p0}/{p1}.{q1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "q1", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/users-a/users~x/aa_xyz.txt/aab_a.txt", .status = 404 },
-        .{ .method = "GET", .path = "/c7.json/txt/", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/txt/ajson_ab.txt/1", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b/a", .status = 200, .pattern = "/a-b/a", .params = &.{} },
-        .{ .method = "GET", .path = "/42/v1/pre42", .status = 404 },
-        .{ .method = "POST", .path = "/preusers/1.1", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/1.json/vb", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/a", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/ab.ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b/a", .status = 200, .pattern = "/a-b/a", .params = &.{} },
-        .{ .method = "GET", .path = "/v42/ab~x/json", .status = 404 },
-        .{ .method = "GET", .path = "/pre42/ab~x/a-b", .status = 200, .pattern = "/pre{p0}/{p1}~x/a-b", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/xyz/a/", .status = 404 },
-        .{ .method = "GET", .path = "/txt.json/txt/", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/ausers_c7.txt/users/xyz/42", .status = 404 },
-        .{ .method = "GET", .path = "/a.json/json/", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/preusers/", .status = 404 },
-        .{ .method = "GET", .path = "/prejson/users.1", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/a~x/ajson_txt.txt/preb", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/a", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/txt~x/a~x/ab_b.txt/ab-42", .status = 404 },
-        .{ .method = "GET", .path = "/txt.json/users/", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/42-a/pre42/users-ab/v1", .status = 404 },
-        .{ .method = "GET", .path = "/txt.json/xyz/", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/42.users", .status = 404 },
-        .{ .method = "GET", .path = "/preusers/txt~x/a-b", .status = 200, .pattern = "/pre{p0}/{p1}~x/a-b", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/vusers", .status = 404 },
-        .{ .method = "GET", .path = "/xyz.json/ab/", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/c7.42/vxyz/c7~x", .status = 404 },
-        .{ .method = "GET", .path = "/b.json/1/", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/v1/1.ab/v42", .status = 404 },
-        .{ .method = "GET", .path = "/c7.json/a/", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/vb/users~x/", .status = 404 },
-        .{ .method = "GET", .path = "/prejson/b~x/a-b", .status = 200, .pattern = "/pre{p0}/{p1}~x/a-b", .params = &.{
-            .{ .name = "p0", .value = "json" },
+        .{ .method = "POST", .path = "/xyz/xyz.c7/v1", .status = 404 },
+        .{ .method = "POST", .path = "/ab/vusers/json.c7", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/pre42", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/b/b", .status = 200, .pattern = "/users/{p1}/b", .params = &.{
             .{ .name = "p1", .value = "b" },
         } },
-        .{ .method = "PUT", .path = "/1~x/pre42/vjson/", .status = 404 },
-        .{ .method = "PUT", .path = "/prea/c7.json", .status = 200, .pattern = "/pre{p0}/{p1}.{q1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "q1", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/ajson_b.txt/vb/42~x/json.xyz", .status = 404 },
-        .{ .method = "GET", .path = "/pre1/42~x/a-b", .status = 200, .pattern = "/pre{p0}/{p1}~x/a-b", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/42/ab-1/", .status = 404 },
-        .{ .method = "GET", .path = "/txt.json/b/", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/xyz.42", .status = 404 },
-        .{ .method = "GET", .path = "/1.json/xyz/", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/c7.users/preusers/c7.users/ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b/a", .status = 200, .pattern = "/a-b/a", .params = &.{} },
-        .{ .method = "DELETE", .path = "/txt~x/users", .status = 404 },
-        .{ .method = "PUT", .path = "/preusers/users.c7", .status = 200, .pattern = "/pre{p0}/{p1}.{q1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "q1", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/xyz-b/42/c7~x", .status = 404 },
-        .{ .method = "PUT", .path = "/pre42/42~x/a-b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/pre1/c7.json/a/xyz/", .status = 404 },
-        .{ .method = "POST", .path = "/ab.json/users/", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/prejson", .status = 404 },
-        .{ .method = "GET", .path = "/prejson/1~x/a-b", .status = 200, .pattern = "/pre{p0}/{p1}~x/a-b", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/c7", .status = 404 },
-        .{ .method = "GET", .path = "/a.json/c7/", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/a-b", .status = 404 },
-        .{ .method = "GET", .path = "/prejson/json~x/a-b", .status = 200, .pattern = "/pre{p0}/{p1}~x/a-b", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/a/json/xyz~x", .status = 404 },
-        .{ .method = "GET", .path = "/txt.json/ab/", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/b-json/vxyz", .status = 404 },
+        .{ .method = "POST", .path = "/axyz_users.txt/b-b", .status = 404 },
+        .{ .method = "GET", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/users/b/42/c7", .status = 404 },
+        .{ .method = "POST", .path = "/b/vb/a.a", .status = 404 },
+        .{ .method = "GET", .path = "/a", .status = 404 },
     } },
     .{ .routes = &.{
-        .{ .method = "POST", .pattern = "/a" },
-        .{ .method = "PUT", .pattern = "/v1" },
-        .{ .method = "DELETE", .pattern = "/x.y" },
+        .{ .method = "PUT", .pattern = "/a" },
+        .{ .method = "GET", .pattern = "/v1" },
+        .{ .method = "GET", .pattern = "/v1/{p1}" },
+        .{ .method = "PUT", .pattern = "/x.y" },
+        .{ .method = "GET", .pattern = "/x.y/{p1}" },
         .{ .method = "POST", .pattern = "/{p0}" },
-        .{ .method = "PUT", .pattern = "/{p0}.json" },
-        .{ .method = "PUT", .pattern = "/{p0}.json/{p1}" },
-        .{ .method = "PUT", .pattern = "/{p0}.{q0}" },
-        .{ .method = "POST", .pattern = "/{p0}.{q0}/{p1}" },
-        .{ .method = "POST", .pattern = "/v{p0}" },
-        .{ .method = "GET", .pattern = "/{p0}-{q0}" },
-        .{ .method = "PUT", .pattern = "/{p0}-{q0}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0}.json" },
+        .{ .method = "DELETE", .pattern = "/{p0}.{q0}" },
+        .{ .method = "GET", .pattern = "/{p0}.{q0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/v{p0}" },
+        .{ .method = "PUT", .pattern = "/v{p0}/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0}-{q0}" },
+        .{ .method = "POST", .pattern = "/{p0}-{q0}/{p1}" },
         .{ .method = "DELETE", .pattern = "/pre{p0}" },
-        .{ .method = "PUT", .pattern = "/{p0}~x" },
-        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt/{p1}" },
-        .{ .method = "POST", .pattern = "/pre{p0}/{p1}" },
-        .{ .method = "PUT", .pattern = "/pre{p0}/a{p1}_{q1}.txt/users" },
+        .{ .method = "PUT", .pattern = "/pre{p0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0}~x" },
+        .{ .method = "DELETE", .pattern = "/{p0}~x/{p1}" },
+        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "DELETE", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "GET", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "POST", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-c]+}-{q0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0}/{p1}" },
+        .{ .method = "GET", .pattern = "/*" },
+        .{ .method = "DELETE", .pattern = "/{p0}-{q0}/b/{p2}/" },
+        .{ .method = "GET", .pattern = "/x.y/a/{p2}" },
+        .{ .method = "PUT", .pattern = "/b/users/v1" },
+        .{ .method = "POST", .pattern = "/{p0:[a-z]+}/a/" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/42.json/a", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "json" },
-            .{ .name = "p1", .value = "a" },
+        .{ .method = "POST", .path = "/c7.42", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7.42" },
         } },
-        .{ .method = "DELETE", .path = "/1.1/1~x/preb/users.xyz", .status = 404 },
-        .{ .method = "PUT", .path = "/xyz.json/b", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "b" },
+        .{ .method = "GET", .path = "/vab/42~x/ab.txt/a1_c7.txt/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "vab/42~x/ab.txt/a1_c7.txt/" },
         } },
-        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "x.y" },
+        .{ .method = "GET", .path = "/users-1/b/txt/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "users-1/b/txt/" },
         } },
-        .{ .method = "GET", .path = "/ab-b", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "b" },
+        .{ .method = "DELETE", .path = "/pretxt/c7.users", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "pretxt" },
+            .{ .name = "p1", .value = "c7.users" },
         } },
-        .{ .method = "POST", .path = "/prejson/42.b", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "42.b" },
+        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "GET", .path = "/c7-1/json.users/aa_ab.txt/c7", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "c7-1/json.users/aa_ab.txt/c7" },
         } },
-        .{ .method = "POST", .path = "/vab", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/ac7_c7.txt/v1", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "ac7_c7" },
-            .{ .name = "q0", .value = "txt" },
-            .{ .name = "p1", .value = "v1" },
-        } },
-        .{ .method = "PUT", .path = "/preusers/atxt_42.txt/users", .status = 200, .pattern = "/pre{p0}/a{p1}_{q1}.txt/users", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "q1", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/ac7_txt.txt/xyz/prea", .status = 404 },
-        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "GET", .path = "/json/c7~x/1~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/a.1/b", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/b~x/txt~x", .status = 404 },
-        .{ .method = "POST", .path = "/vb", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/vusers", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/ab.b", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/1.c7/xyz~x/a-b", .status = 404 },
-        .{ .method = "POST", .path = "/users.users/b", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "users" },
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/b.a/ab_users.txt/txt/b-json", .status = 404 },
-        .{ .method = "PUT", .path = "/ajson_c7.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "ajson_c7" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/a-ab/", .status = 404 },
-        .{ .method = "GET", .path = "/aab_b.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/pre1/ab.users/xyz/a", .status = 404 },
-        .{ .method = "DELETE", .path = "/prexyz", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/vjson/x.y/preab/aab_1.txt", .status = 404 },
-        .{ .method = "GET", .path = "/atxt_xyz.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/vab/c7-a/axyz_b.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "PUT", .path = "/prec7", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/prexyz/ab", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/vb/a-users", .status = 404 },
-        .{ .method = "PUT", .path = "/42.json/b", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/prec7/a/42/preab", .status = 404 },
-        .{ .method = "POST", .path = "/vtxt", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/vusers/1/a1_c7.txt/", .status = 404 },
-        .{ .method = "GET", .path = "/preusers/1", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/1/vxyz/1~x/ausers_1.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/json.users/aa_ab.txt/c7/b-ab", .status = 404 },
-        .{ .method = "PUT", .path = "/ausers_users.txt/json", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "users" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/users/a/1~x/vtxt", .status = 404 },
-        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/b/1~x/a-b", .status = 404 },
-        .{ .method = "PUT", .path = "/json~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+        .{ .method = "GET", .path = "/json.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
             .{ .name = "p0", .value = "json" },
         } },
-        .{ .method = "POST", .path = "/vtxt", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
+        .{ .method = "DELETE", .path = "/users/pre42/a42_json.txt", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "PUT", .path = "/aab_b.txt/42", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "b" },
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/v1", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/c7-42", .status = 405, .allow = &.{
+            "GET",
             "POST",
+        } },
+        .{ .method = "DELETE", .path = "/b/users/v1", .status = 405, .allow = &.{
+            "GET",
             "PUT",
         } },
-        .{ .method = "PUT", .path = "/va", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "PUT", .path = "/vb", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "vb" },
         } },
-        .{ .method = "DELETE", .path = "/prejson/b/c7-xyz/a-json", .status = 404 },
-        .{ .method = "PUT", .path = "/pretxt/ajson_users.txt/users", .status = 200, .pattern = "/pre{p0}/a{p1}_{q1}.txt/users", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "q1", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/txt.txt/ac7_1.txt/a/a-b", .status = 404 },
-        .{ .method = "DELETE", .path = "/pretxt", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/xyz/a-json/1-users/b/", .status = 404 },
-        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "GET", .path = "/x.y", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/a", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/b/preb/preab/json-42", .status = 404 },
-        .{ .method = "PUT", .path = "/prejson", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/users/users.json/a-1", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "POST", .pattern = "/x.y/users/" },
-        .{ .method = "POST", .pattern = "/v1" },
-        .{ .method = "POST", .pattern = "/a-b/v1" },
-        .{ .method = "PUT", .pattern = "/v{p0}/*" },
-        .{ .method = "PUT", .pattern = "/a/{p1}/{p2}" },
-        .{ .method = "POST", .pattern = "/b/{p1}" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "PUT", .path = "/vxyz/a42_b.txt", .status = 200, .pattern = "/v{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "*", .value = "a42_b.txt" },
-        } },
-        .{ .method = "PUT", .path = "/pre1/vusers", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/users/", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/txt/txt/pretxt/c7", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/v1", .status = 200, .pattern = "/a-b/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/ab~x/v42/a.a", .status = 404 },
-        .{ .method = "PUT", .path = "/a/txt/42", .status = 200, .pattern = "/a/{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/ab", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/v1", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/vjson/vjson/a~x", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/vb/prea", .status = 200, .pattern = "/v{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "*", .value = "prea" },
-        } },
-        .{ .method = "PUT", .path = "/ab~x", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/users/", .status = 200, .pattern = "/x.y/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/ab_a.txt/vjson", .status = 404 },
-        .{ .method = "PUT", .path = "/a/42/42", .status = 200, .pattern = "/a/{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/vtxt/a1_b.txt", .status = 200, .pattern = "/v{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "*", .value = "a1_b.txt" },
-        } },
-        .{ .method = "PUT", .path = "/a/a/ab", .status = 200, .pattern = "/a/{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "p2", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/42/", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/v1", .status = 200, .pattern = "/a-b/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/42.42", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/users/", .status = 200, .pattern = "/x.y/users", .params = &.{} },
-        .{ .method = "POST", .path = "/preab/1/a1_users.txt/ab-ab", .status = 404 },
-        .{ .method = "PUT", .path = "/a/json/ab", .status = 200, .pattern = "/a/{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "p2", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/v1/b/atxt_txt.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/json.users/b", .status = 404 },
-        .{ .method = "PUT", .path = "/vxyz/", .status = 200, .pattern = "/v{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "POST", .path = "/ajson_a.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/v1", .status = 200, .pattern = "/a-b/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/ab~x", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/v1", .status = 200, .pattern = "/a-b/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/a~x/a~x", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/users", .status = 200, .pattern = "/a/{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "p2", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/c7.1", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/users/", .status = 200, .pattern = "/x.y/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/json~x", .status = 404 },
-        .{ .method = "PUT", .path = "/v1", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/ab.42/1-c7/txt/users", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/v1", .status = 200, .pattern = "/a-b/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/1~x/c7/", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/v1", .status = 200, .pattern = "/a-b/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/xyz", .status = 404 },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/a-b/a/", .status = 404 },
-        .{ .method = "PUT", .path = "/a/json/b", .status = 200, .pattern = "/a/{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "json" },
+        .{ .method = "GET", .path = "/x.y/a/b", .status = 200, .pattern = "/x.y/a/{p2}", .params = &.{
             .{ .name = "p2", .value = "b" },
         } },
-        .{ .method = "GET", .path = "/v1/vxyz/json-ab/json-b", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/b/c7", .status = 200, .pattern = "/b/{p1}", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/users/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/42/xyz", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/json/42-42/xyz.42", .status = 404 },
-        .{ .method = "POST", .path = "/a/c7/json", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/json-users/a42_txt.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/c7", .status = 200, .pattern = "/v{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "*", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/x.y/prec7", .status = 404 },
-        .{ .method = "POST", .path = "/va/prejson", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/1.1", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/v1", .status = 200, .pattern = "/a-b/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/a.ab/ausers_b.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/a/42/txt", .status = 200, .pattern = "/a/{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/txt.42/txt/prea/pre1", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/x.y/users" },
-        .{ .method = "DELETE", .pattern = "/pre{p0}/x.y/{p2}-{q2}" },
-        .{ .method = "DELETE", .pattern = "/{p0}/{p1}-{q1}/{p2}.json" },
-        .{ .method = "DELETE", .pattern = "/{p0}/v1/{p2}-{q2}" },
-        .{ .method = "POST", .pattern = "/{p0}~x" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "DELETE", .path = "/42/json-1/a.json", .status = 200, .pattern = "/{p0}/{p1}-{q1}/{p2}.json", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "q1", .value = "1" },
-            .{ .name = "p2", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/vtxt/b/prexyz", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/users", .status = 200, .pattern = "/x.y/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/b/42/42~x/txt.b", .status = 404 },
-        .{ .method = "DELETE", .path = "/c7/b-users/users.json", .status = 200, .pattern = "/{p0}/{p1}-{q1}/{p2}.json", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "q1", .value = "users" },
-            .{ .name = "p2", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/ab.c7/v1/42", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/users", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/b", .status = 405, .allow = &.{
             "GET",
+            "POST",
+            "PUT",
         } },
-        .{ .method = "GET", .path = "/vxyz/users~x/a1_users.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/users", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/42/users/xyz.users/", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/users", .status = 200, .pattern = "/x.y/users", .params = &.{} },
-        .{ .method = "GET", .path = "/pre1", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/json-ab/42.json", .status = 200, .pattern = "/{p0}/{p1}-{q1}/{p2}.json", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "q1", .value = "ab" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "POST", .path = "/ab-ab/ab", .status = 404 },
-        .{ .method = "POST", .path = "/users~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/preusers", .status = 404 },
-        .{ .method = "DELETE", .path = "/pretxt/x.y/users-42", .status = 200, .pattern = "/pre{p0}/x.y/{p2}-{q2}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p2", .value = "users" },
-            .{ .name = "q2", .value = "42" },
-        } },
-        .{ .method = "POST", .path = "/json-xyz", .status = 404 },
-        .{ .method = "PUT", .path = "/users/json-users/a.json", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/txt/ab", .status = 405, .allow = &.{
             "DELETE",
+            "GET",
         } },
-        .{ .method = "POST", .path = "/vxyz", .status = 404 },
-        .{ .method = "PUT", .path = "/ab~x", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/ab/v42/pretxt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/c7-xyz/a", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
             "POST",
         } },
-        .{ .method = "GET", .path = "/txt/", .status = 404 },
-        .{ .method = "DELETE", .path = "/preab/x.y/c7-ab", .status = 200, .pattern = "/pre{p0}/x.y/{p2}-{q2}", .params = &.{
+        .{ .method = "DELETE", .path = "/prejson/b/c7-xyz/a-json", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/txt/a/", .status = 200, .pattern = "/{p0:[a-z]+}/a", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/a~x/txt.txt", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/a-b/atxt_a.txt/txt~x/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/preb", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/1-users/b/42", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/vusers/1.xyz/a-b/preb/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "vusers/1.xyz/a-b/preb/" },
+        } },
+        .{ .method = "DELETE", .path = "/ab-42/b/c7/", .status = 200, .pattern = "/{p0}-{q0}/b/{p2}", .params = &.{
             .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "42" },
             .{ .name = "p2", .value = "c7" },
-            .{ .name = "q2", .value = "ab" },
         } },
-        .{ .method = "DELETE", .path = "/b/ab~x/ab-a/ab.xyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/1/v1/a-json", .status = 200, .pattern = "/{p0}/v1/{p2}-{q2}", .params = &.{
+        .{ .method = "DELETE", .path = "/ab~x/xyz/b~x/users.json/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/b/xyz.1/1~x/b~x/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/vjson/a-b/users~x/a~x", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/b~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/a-b/ajson_xyz.txt", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "b" },
+            .{ .name = "p1", .value = "ajson_xyz.txt" },
+        } },
+        .{ .method = "DELETE", .path = "/b", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/pre1/vusers", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
             .{ .name = "p0", .value = "1" },
-            .{ .name = "p2", .value = "a" },
-            .{ .name = "q2", .value = "json" },
+            .{ .name = "p1", .value = "vusers" },
         } },
-        .{ .method = "GET", .path = "/c7~x/", .status = 404 },
-        .{ .method = "DELETE", .path = "/42/users-json/c7.json", .status = 200, .pattern = "/{p0}/{p1}-{q1}/{p2}.json", .params = &.{
-            .{ .name = "p0", .value = "42" },
+        .{ .method = "GET", .path = "/x.y/xyz", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/json/txt/prexyz/ajson_1.txt/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/ab.ab/users", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "ab" },
             .{ .name = "p1", .value = "users" },
-            .{ .name = "q1", .value = "json" },
-            .{ .name = "p2", .value = "c7" },
         } },
-        .{ .method = "DELETE", .path = "/atxt_xyz.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+        .{ .method = "PUT", .path = "/a1_ab.txt/a-b/42.b/1-b", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/1-a/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "q0", .value = "a" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/aab_users.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "aab_users" },
+            .{ .name = "q0", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/b~x", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/vc7/v42/vxyz", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "vc7/v42/vxyz" },
+        } },
+        .{ .method = "POST", .path = "/xyz.txt/b", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/ac7_json.txt/b-42/vjson", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "v1" },
+        } },
+        .{ .method = "DELETE", .path = "/42/va/vtxt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/x.y/a/ab", .status = 200, .pattern = "/x.y/a/{p2}", .params = &.{
+            .{ .name = "p2", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/c7/42.42", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "c7/42.42" },
+        } },
+        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/preab/1/a1_users.txt/ab-ab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/json-ab", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "ab" },
+        } },
+        .{ .method = "DELETE", .path = "/v1/b/atxt_txt.txt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/c7.xyz/b", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "q0", .value = "xyz" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "PUT", .path = "/b", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/xyz", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/a/ausers_b.txt", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p1", .value = "ausers_b.txt" },
+        } },
+        .{ .method = "PUT", .path = "/ab", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "a" },
         } },
-        .{ .method = "DELETE", .path = "/c7-b/x.y/a/json.json", .status = 404 },
-        .{ .method = "POST", .path = "/txt/users-txt/c7.json", .status = 405, .allow = &.{
-            "DELETE",
+    } },
+    .{ .routes = &.{
+        .{ .method = "POST", .pattern = "/{p0:[a-z]+}/{p1}" },
+        .{ .method = "PUT", .pattern = "/a/{p1:[a-z]+}" },
+        .{ .method = "GET", .pattern = "/v{p0}/pre{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0}~x/" },
+        .{ .method = "GET", .pattern = "/users/a{p1}_{q1}.txt/a-b" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-z]+}/a" },
+        .{ .method = "POST", .pattern = "/b" },
+        .{ .method = "DELETE", .pattern = "/{p0}/a/{p2:[a-z]+}" },
+        .{ .method = "POST", .pattern = "/{p0}/" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "PUT", .path = "/json~x/", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "json" },
         } },
-        .{ .method = "POST", .path = "/a42_xyz.txt/c7/42.42/vtxt", .status = 404 },
-        .{ .method = "POST", .path = "/users/v1/c7-ab", .status = 405, .allow = &.{
-            "DELETE",
+        .{ .method = "POST", .path = "/pretxt/ab-b", .status = 200, .pattern = "/{p0:[a-z]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "pretxt" },
+            .{ .name = "p1", .value = "ab-b" },
         } },
-        .{ .method = "POST", .path = "/vxyz/ac7_users.txt/ab-json/b-42", .status = 404 },
-        .{ .method = "DELETE", .path = "/pretxt/x.y/42-b", .status = 200, .pattern = "/pre{p0}/x.y/{p2}-{q2}", .params = &.{
+        .{ .method = "POST", .path = "/txt/", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "txt" },
-            .{ .name = "p2", .value = "42" },
-            .{ .name = "q2", .value = "b" },
         } },
-        .{ .method = "GET", .path = "/b-json/prexyz/b-42/vusers", .status = 404 },
-        .{ .method = "GET", .path = "/pre1/x.y/c7-42", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/ab_c7.txt/json.ab", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab/a/ab", .status = 200, .pattern = "/{p0}/a/{p2:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p2", .value = "ab" },
+        } },
+        .{ .method = "DELETE", .path = "/users~x/prejson", .status = 404 },
+        .{ .method = "GET", .path = "/vb/preb", .status = 200, .pattern = "/v{p0}/pre{p1}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/b-xyz/pre1/json/txt.42", .status = 404 },
+        .{ .method = "POST", .path = "/42/1", .status = 404 },
+        .{ .method = "POST", .path = "/prejson/json/json-users", .status = 404 },
+        .{ .method = "PUT", .path = "/42/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/vxyz/vjson/42.xyz", .status = 404 },
+        .{ .method = "PUT", .path = "/c7~x/", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/prea/prejson", .status = 200, .pattern = "/{p0:[a-z]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "prea" },
+            .{ .name = "p1", .value = "prejson" },
+        } },
+        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/v1/vc7/users/a.ab", .status = 404 },
+        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/42/vab", .status = 404 },
+        .{ .method = "POST", .path = "/42/txt", .status = 404 },
+        .{ .method = "GET", .path = "/pre1", .status = 404 },
+        .{ .method = "GET", .path = "/users/a42_b.txt/a-b", .status = 200, .pattern = "/users/a{p1}_{q1}.txt/a-b", .params = &.{
+            .{ .name = "p1", .value = "42" },
+            .{ .name = "q1", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/json/a/xyz", .status = 200, .pattern = "/{p0}/a/{p2:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p2", .value = "xyz" },
+        } },
+        .{ .method = "PUT", .path = "/a~x/b-users/atxt_42.txt/v1", .status = 404 },
+        .{ .method = "PUT", .path = "/b/a/xyz", .status = 405, .allow = &.{
             "DELETE",
         } },
-        .{ .method = "DELETE", .path = "/1~x/txt.1/users-a/ab-ab", .status = 404 },
+        .{ .method = "DELETE", .path = "/xyz.json/xyz-json/x.y/axyz_txt.txt", .status = 404 },
+        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/users", .status = 404 },
+        .{ .method = "PUT", .path = "/vtxt/preab", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/txt.xyz/txt.b/a1_users.txt/c7", .status = 404 },
+        .{ .method = "PUT", .path = "/a/a", .status = 200, .pattern = "/a/{p1:[a-z]+}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/c7.c7/42/ab.42/", .status = 404 },
+        .{ .method = "POST", .path = "/xyz/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "PUT", .path = "/a1_users.txt/preusers/v1/preab", .status = 404 },
+        .{ .method = "PUT", .path = "/a/b", .status = 200, .pattern = "/a/{p1:[a-z]+}", .params = &.{
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/users-42/42-txt/b.c7/users~x", .status = 404 },
+        .{ .method = "POST", .path = "/ab/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/vusers/v42", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/va/ajson_xyz.txt/users.ab", .status = 404 },
+        .{ .method = "PUT", .path = "/a/users", .status = 200, .pattern = "/a/{p1:[a-z]+}", .params = &.{
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/pre42/ab~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/a/a", .status = 200, .pattern = "/{p0}/a/{p2:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "p2", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/vxyz", .status = 404 },
+        .{ .method = "PUT", .path = "/ab/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/txt/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/ab~x/", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/txt~x/b", .status = 404 },
+        .{ .method = "GET", .path = "/vab/prea", .status = 200, .pattern = "/v{p0}/pre{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/b-b/a1_json.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/c7/a", .status = 404 },
+        .{ .method = "GET", .path = "/users-users/vjson/42/a", .status = 404 },
+        .{ .method = "PUT", .path = "/xyz/a", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/vb/c7-b/x.y/", .status = 404 },
+        .{ .method = "POST", .path = "/json/1", .status = 200, .pattern = "/{p0:[a-z]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "DELETE", .path = "/users/users/", .status = 404 },
+        .{ .method = "GET", .path = "/a/users", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/c7/42.42", .status = 404 },
+        .{ .method = "POST", .path = "/42/a", .status = 404 },
+        .{ .method = "GET", .path = "/ab.b/vxyz/ac7_users.txt/ab-json", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/b" },
+        .{ .method = "POST", .pattern = "/x.y/a/a{p2}_{q2}.txt" },
+        .{ .method = "POST", .pattern = "/{p0}~x" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "GET", .path = "/pre1/pre42/vjson/1~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/ab-ab", .status = 404 },
         .{ .method = "POST", .path = "/b~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
             .{ .name = "p0", .value = "b" },
         } },
@@ -1695,5281 +1663,2687 @@ pub const tables = [_]Table{
             .{ .name = "p0", .value = "a" },
         } },
         .{ .method = "DELETE", .path = "/1/users/xyz-json/", .status = 404 },
-        .{ .method = "DELETE", .path = "/users/a-42/c7.json", .status = 200, .pattern = "/{p0}/{p1}-{q1}/{p2}.json", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "q1", .value = "42" },
-            .{ .name = "p2", .value = "c7" },
+        .{ .method = "POST", .path = "/x.y/a/ausers_a.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "users" },
+            .{ .name = "q2", .value = "a" },
         } },
-        .{ .method = "GET", .path = "/preb/1~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/pre1/x.y/ab-1", .status = 200, .pattern = "/pre{p0}/x.y/{p2}-{q2}", .params = &.{
+        .{ .method = "GET", .path = "/ab-b/xyz.users", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/b-a/prea/ausers_42.txt", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/aa_ab.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "a" },
+            .{ .name = "q2", .value = "ab" },
+        } },
+        .{ .method = "DELETE", .path = "/v1", .status = 404 },
+        .{ .method = "POST", .path = "/1~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
             .{ .name = "p0", .value = "1" },
-            .{ .name = "p2", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/pretxt/ab~x/ab", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/aa_1.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "a" },
             .{ .name = "q2", .value = "1" },
         } },
-        .{ .method = "PUT", .path = "/prea/ausers_42.txt/prexyz/", .status = 404 },
-        .{ .method = "GET", .path = "/pre1/x.y/xyz-json", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/users", .status = 404 },
-        .{ .method = "DELETE", .path = "/json/v1/ab-txt", .status = 200, .pattern = "/{p0}/v1/{p2}-{q2}", .params = &.{
-            .{ .name = "p0", .value = "json" },
+        .{ .method = "POST", .path = "/b/a-b/a42_ab.txt/42.c7", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/aab_users.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
             .{ .name = "p2", .value = "ab" },
+            .{ .name = "q2", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/ac7_b.txt/v1/1~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "GET", .path = "/v1", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/a1_xyz.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "1" },
+            .{ .name = "q2", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/txt-a/vb/c7~x", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/a42_xyz.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "42" },
+            .{ .name = "q2", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/txt-users/users", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/a1_json.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "1" },
+            .{ .name = "q2", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/json/prec7/ab.ab/prejson", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/1/preb/v1", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/json/vb", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/atxt_xyz.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "txt" },
+            .{ .name = "q2", .value = "xyz" },
+        } },
+        .{ .method = "PUT", .path = "/b/json-a/x.y", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/ausers_txt.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "users" },
             .{ .name = "q2", .value = "txt" },
         } },
-        .{ .method = "GET", .path = "/ab/v1/a.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/txt/v1/users-b", .status = 200, .pattern = "/{p0}/v1/{p2}-{q2}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
+        .{ .method = "GET", .path = "/preab/b/ab", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/ausers_txt.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
             .{ .name = "p2", .value = "users" },
-            .{ .name = "q2", .value = "b" },
+            .{ .name = "q2", .value = "txt" },
         } },
-        .{ .method = "DELETE", .path = "/ab.1/c7/json~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/prexyz/x.y/json-c7", .status = 200, .pattern = "/pre{p0}/x.y/{p2}-{q2}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p2", .value = "json" },
-            .{ .name = "q2", .value = "c7" },
+        .{ .method = "GET", .path = "/v1/users/a-b/txt-42", .status = 404 },
+        .{ .method = "POST", .path = "/c7~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "POST", .path = "/ab_1.txt/a-b/c7~x/", .status = 404 },
-        .{ .method = "DELETE", .path = "/b/users-json/ab.json", .status = 200, .pattern = "/{p0}/{p1}-{q1}/{p2}.json", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "q1", .value = "json" },
-            .{ .name = "p2", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/a42_42.txt/txt-a/", .status = 404 },
-        .{ .method = "DELETE", .path = "/prexyz/x.y/txt-c7", .status = 200, .pattern = "/pre{p0}/x.y/{p2}-{q2}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p2", .value = "txt" },
-            .{ .name = "q2", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/ab-ab", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/pre{p0}/b" },
-        .{ .method = "PUT", .pattern = "/a-b/{p1}" },
-        .{ .method = "POST", .pattern = "/{p0}~x/users" },
-        .{ .method = "DELETE", .pattern = "/x.y" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/1~x/users", .status = 200, .pattern = "/{p0}~x/users", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/v1/aa_ab.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/json", .status = 200, .pattern = "/a-b/{p1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/a-users/txt~x/42-c7/b", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/1", .status = 200, .pattern = "/a-b/{p1}", .params = &.{
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/pretxt/users/ab-1", .status = 404 },
-        .{ .method = "GET", .path = "/preb/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/aa_users.txt/txt/1/v1", .status = 404 },
-        .{ .method = "GET", .path = "/preb/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/v42/users", .status = 404 },
-        .{ .method = "POST", .path = "/42~x/users", .status = 200, .pattern = "/{p0}~x/users", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "POST", .path = "/b-txt", .status = 404 },
-        .{ .method = "POST", .path = "/b~x/users", .status = 200, .pattern = "/{p0}~x/users", .params = &.{
+        .{ .method = "POST", .path = "/42~x/ac7_b.txt/42", .status = 404 },
+        .{ .method = "POST", .path = "/b~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
             .{ .name = "p0", .value = "b" },
         } },
         .{ .method = "DELETE", .path = "/42-c7", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/users.c7/a~x/b~x", .status = 404 },
-        .{ .method = "GET", .path = "/pre42/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "42" },
+        .{ .method = "POST", .path = "/a~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "a" },
         } },
-        .{ .method = "PUT", .path = "/vxyz/vtxt/b", .status = 404 },
-        .{ .method = "GET", .path = "/pretxt/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "txt" },
+        .{ .method = "PUT", .path = "/pre1/a~x/b~x/atxt_ab.txt", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/ab_xyz.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "b" },
+            .{ .name = "q2", .value = "xyz" },
         } },
-        .{ .method = "DELETE", .path = "/ausers_xyz.txt/txt/users/atxt_ab.txt", .status = 404 },
-        .{ .method = "POST", .path = "/b~x/users", .status = 200, .pattern = "/{p0}~x/users", .params = &.{
-            .{ .name = "p0", .value = "b" },
+        .{ .method = "DELETE", .path = "/b/pretxt/ab/a", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/axyz_txt.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "xyz" },
+            .{ .name = "q2", .value = "txt" },
         } },
-        .{ .method = "POST", .path = "/b.txt", .status = 404 },
-        .{ .method = "GET", .path = "/pretxt/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "txt" },
+        .{ .method = "POST", .path = "/atxt_ab.txt", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/ab_json.txt", .status = 200, .pattern = "/x.y/a/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "b" },
+            .{ .name = "q2", .value = "json" },
         } },
-        .{ .method = "DELETE", .path = "/atxt_42.txt/preb/c7-b/b", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/x.y/xyz.xyz/vb", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/vjson/users-json/42", .status = 404 },
-        .{ .method = "GET", .path = "/x.y", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/1/users-1/txt~x/b~x/", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "GET", .path = "/x.y/b.42/atxt_ab.txt/xyz.a", .status = 404 },
+        .{ .method = "PUT", .path = "/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/a42_a.txt/prea", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "GET", .path = "/42", .status = 404 },
+        .{ .method = "GET", .path = "/b", .status = 405, .allow = &.{
             "DELETE",
         } },
         .{ .method = "DELETE", .path = "/preusers/users-users/1/", .status = 404 },
-        .{ .method = "GET", .path = "/preusers/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/a42_c7.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/b", .status = 200, .pattern = "/a-b/{p1}", .params = &.{
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/pre1/v1/preb/preusers", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/x.y/c7/1", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/a", .status = 200, .pattern = "/a-b/{p1}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/a/ab-c7", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/42", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/1-1/xyz/users/c7", .status = 404 },
-        .{ .method = "GET", .path = "/preab/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/users-a", .status = 404 },
-        .{ .method = "GET", .path = "/preab/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/b", .status = 404 },
-        .{ .method = "GET", .path = "/pre42/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/vb/a~x/", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/json/42/x.y/preab/", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/a", .status = 200, .pattern = "/a-b/{p1}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/ab/ab/vxyz", .status = 404 },
-        .{ .method = "GET", .path = "/prexyz/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/a/json/42-users", .status = 404 },
-        .{ .method = "GET", .path = "/preb/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/prejson/a/ab~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/a1_c7.txt/v42/json.xyz/a-a", .status = 404 },
-        .{ .method = "POST", .path = "/x.y", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/txt/json", .status = 404 },
-        .{ .method = "GET", .path = "/prexyz/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/b-1/prejson/ausers_ab.txt", .status = 404 },
     } },
     .{ .routes = &.{
-        .{ .method = "DELETE", .pattern = "/a" },
-        .{ .method = "PUT", .pattern = "/v1" },
-        .{ .method = "POST", .pattern = "/v1/{p1}" },
-        .{ .method = "POST", .pattern = "/x.y" },
+        .{ .method = "PUT", .pattern = "/{p0}/{p1}/{p2}" },
         .{ .method = "DELETE", .pattern = "/{p0}" },
-        .{ .method = "DELETE", .pattern = "/{p0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}.json" },
-        .{ .method = "POST", .pattern = "/{p0}.{q0}" },
-        .{ .method = "POST", .pattern = "/v{p0}" },
-        .{ .method = "DELETE", .pattern = "/{p0}-{q0}" },
-        .{ .method = "GET", .pattern = "/pre{p0}" },
-        .{ .method = "PUT", .pattern = "/pre{p0}/{p1}" },
-        .{ .method = "GET", .pattern = "/{p0}~x" },
-        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt/{p1}" },
-        .{ .method = "GET", .pattern = "/a/{p1}/v1" },
-        .{ .method = "PUT", .pattern = "/x.y/*" },
-        .{ .method = "PUT", .pattern = "/v{p0}" },
-        .{ .method = "DELETE", .pattern = "/a-b/x.y/{p2}.{q2}" },
-        .{ .method = "POST", .pattern = "/v1" },
-        .{ .method = "POST", .pattern = "/a/{p1}/" },
-        .{ .method = "PUT", .pattern = "/{p0}~x/users/{p2}~x" },
-        .{ .method = "DELETE", .pattern = "/x.y/b" },
+        .{ .method = "DELETE", .pattern = "/{p0}.{q0}" },
+        .{ .method = "POST", .pattern = "/a/*" },
+        .{ .method = "POST", .pattern = "/a" },
+        .{ .method = "PUT", .pattern = "/v1/users/users" },
+        .{ .method = "POST", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "POST", .pattern = "/x.y/a-b/b" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/a/", .status = 404 },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/a/prea/42-c7", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "GET", .path = "/a-b/1~x/ab-1/a42_users.txt/", .status = 404 },
-        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/ac7_users.txt/v1", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/42.b", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "q0", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/1.ab/1~x", .status = 404 },
+        .{ .method = "PUT", .path = "/c7.c7", .status = 405, .allow = &.{
             "DELETE",
+        } },
+        .{ .method = "POST", .path = "/vusers/txt/a~x", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "GET", .path = "/a/b/v1", .status = 200, .pattern = "/a/{p1}/v1", .params = &.{
-            .{ .name = "p1", .value = "b" },
+        .{ .method = "POST", .path = "/a/txt-txt/c7.json", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "txt-txt/c7.json" },
         } },
-        .{ .method = "POST", .path = "/prexyz/b/c7.b/", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/b", .status = 200, .pattern = "/x.y/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/c7~x/users-users", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/xyz/42~x", .status = 404 },
+        .{ .method = "POST", .path = "/a/", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "GET", .path = "/1~x", .status = 405, .allow = &.{
             "DELETE",
         } },
-        .{ .method = "PUT", .path = "/aa_b.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "b" },
+        .{ .method = "POST", .path = "/a/txt-json/x.y", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "txt-json/x.y" },
         } },
-        .{ .method = "GET", .path = "/42/", .status = 404 },
-        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/c7/b/b", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y/a-users", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "a-users" },
-        } },
-        .{ .method = "GET", .path = "/ac7_xyz.txt/vtxt/va/xyz", .status = 404 },
-        .{ .method = "GET", .path = "/42~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/a-xyz/va/users/a1_xyz.txt/", .status = 404 },
-        .{ .method = "PUT", .path = "/vtxt", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/a-b", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/ab~x", .status = 405, .allow = &.{
             "DELETE",
         } },
-        .{ .method = "PUT", .path = "/c7~x/users/c7~x", .status = 200, .pattern = "/{p0}~x/users/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p2", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/ab/aa_a.txt/vjson/", .status = 404 },
-        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/vc7/xyz.json/prexyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/42.b", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/json.json", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/preusers", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/42-b", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/ab~x/a/", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/b", .status = 200, .pattern = "/x.y/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/json.42/1/txt-txt/prejson/", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/json~x", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "json~x" },
-        } },
-        .{ .method = "PUT", .path = "/x.y/prec7/ausers_c7.txt", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "prec7/ausers_c7.txt" },
-        } },
-        .{ .method = "PUT", .path = "/json-json", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/aa_1.txt", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/vc7/ausers_b.txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/x.y/ab/preab", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "ab/preab" },
-        } },
-        .{ .method = "GET", .path = "/prejson", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/x.y/b", .status = 200, .pattern = "/x.y/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/pre42/atxt_ab.txt/", .status = 404 },
-        .{ .method = "POST", .path = "/a/json/", .status = 200, .pattern = "/a/{p1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/1/json.42", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "json.42" },
-        } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/1-c7/users", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/xyz~x/b.b/txt", .status = 404 },
-        .{ .method = "PUT", .path = "/json~x/users/users~x", .status = 200, .pattern = "/{p0}~x/users/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p2", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/vxyz/a42_xyz.txt/pre42/xyz.b", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "PUT", .path = "/c7.ab/", .status = 404 },
-        .{ .method = "GET", .path = "/prejson", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/xyz-a/vxyz/prexyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/b-users", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/axyz_users.txt/a-b/axyz_ab.txt/vjson", .status = 404 },
-        .{ .method = "PUT", .path = "/atxt_1.txt/users", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "1" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/a/va/a-b", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/{p0}.{q0}" },
-        .{ .method = "PUT", .pattern = "/a/v1/{p2}.json" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/42.42", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/xyz/prea", .status = 404 },
-        .{ .method = "POST", .path = "/users.a", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/xyz.xyz/c7-b/a-b", .status = 404 },
-        .{ .method = "GET", .path = "/b.ab", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/xyz.ab/prejson/vjson/preb", .status = 404 },
-        .{ .method = "PUT", .path = "/a/v1/a.json", .status = 200, .pattern = "/a/v1/{p2}.json", .params = &.{
-            .{ .name = "p2", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/xyz~x/42.42/a", .status = 404 },
-        .{ .method = "PUT", .path = "/a/v1/c7.json", .status = 200, .pattern = "/a/v1/{p2}.json", .params = &.{
-            .{ .name = "p2", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/v1/42-b/", .status = 404 },
-        .{ .method = "GET", .path = "/c7.xyz", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/va", .status = 404 },
-        .{ .method = "GET", .path = "/json.ab", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/42/users", .status = 404 },
-        .{ .method = "PUT", .path = "/a/v1/ab.json", .status = 200, .pattern = "/a/v1/{p2}.json", .params = &.{
-            .{ .name = "p2", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/prea", .status = 404 },
-        .{ .method = "PUT", .path = "/a/v1/xyz.json", .status = 200, .pattern = "/a/v1/{p2}.json", .params = &.{
-            .{ .name = "p2", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/preusers/vb/1", .status = 404 },
-        .{ .method = "GET", .path = "/1.users", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/a/b", .status = 404 },
-        .{ .method = "GET", .path = "/c7.c7", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/axyz_users.txt/b/json/xyz", .status = 404 },
-        .{ .method = "GET", .path = "/users.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/ab~x/json-1/c7~x", .status = 404 },
-        .{ .method = "PUT", .path = "/a/v1/b.json", .status = 200, .pattern = "/a/v1/{p2}.json", .params = &.{
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/txt/aa_txt.txt/vxyz", .status = 404 },
-        .{ .method = "PUT", .path = "/a/v1/1.json", .status = 200, .pattern = "/a/v1/{p2}.json", .params = &.{
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/c7/ajson_c7.txt", .status = 404 },
-        .{ .method = "GET", .path = "/xyz.a", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+        .{ .method = "PUT", .path = "/xyz/ab/txt", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
             .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/json/1.42/xyz", .status = 404 },
-        .{ .method = "PUT", .path = "/a/v1/42.json", .status = 200, .pattern = "/a/v1/{p2}.json", .params = &.{
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "POST", .path = "/ab.1/json~x/b/1~x", .status = 404 },
-        .{ .method = "POST", .path = "/ab.c7", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/prea/prejson/ab/a-b", .status = 404 },
-        .{ .method = "GET", .path = "/xyz.users", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/42.b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/json.b", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/xyz/ab~x", .status = 404 },
-        .{ .method = "PUT", .path = "/a/v1/json.json", .status = 200, .pattern = "/a/v1/{p2}.json", .params = &.{
-            .{ .name = "p2", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/c7.xyz/xyz~x/prejson/", .status = 404 },
-        .{ .method = "GET", .path = "/1.xyz", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/prea", .status = 404 },
-        .{ .method = "PUT", .path = "/a/v1/users.json", .status = 200, .pattern = "/a/v1/{p2}.json", .params = &.{
-            .{ .name = "p2", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/vusers/xyz.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/a/v1/txt.json", .status = 200, .pattern = "/a/v1/{p2}.json", .params = &.{
+            .{ .name = "p1", .value = "ab" },
             .{ .name = "p2", .value = "txt" },
         } },
-        .{ .method = "POST", .path = "/b/ausers_txt.txt/vxyz/json-42/", .status = 404 },
-        .{ .method = "GET", .path = "/a/v1/a.json", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/a-b/ab", .status = 404 },
-        .{ .method = "POST", .path = "/c7.json", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/vab/c7~x/a", .status = 404 },
-        .{ .method = "GET", .path = "/42.c7", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/pretxt/a-b/ausers_a.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a/v1/json.json", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/a-b", .status = 404 },
-        .{ .method = "GET", .path = "/ab.b", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/prea", .status = 404 },
-        .{ .method = "POST", .path = "/ab.b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/b~x/42.1/aa_b.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/a/v1/1.json", .status = 200, .pattern = "/a/v1/{p2}.json", .params = &.{
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/vc7", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "DELETE", .pattern = "/{p0}" },
-        .{ .method = "POST", .pattern = "/users/v1/*" },
-        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt/a-b/v1" },
-        .{ .method = "GET", .pattern = "/{p0}~x/{p1}" },
-        .{ .method = "GET", .pattern = "/{p0}-{q0}/v{p1}" },
-        .{ .method = "PUT", .pattern = "/{p0}" },
-        .{ .method = "GET", .pattern = "/b/b" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/b/b", .status = 200, .pattern = "/b/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/42~x", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "42~x" },
-        } },
-        .{ .method = "GET", .path = "/users~x/c7", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/x.y/ab~x/c7", .status = 404 },
-        .{ .method = "POST", .path = "/a", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/vjson/vab/c7/xyz-c7", .status = 404 },
-        .{ .method = "DELETE", .path = "/axyz_users.txt/a-b/v1", .status = 200, .pattern = "/a{p0}_{q0}.txt/a-b/v1", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/users~x", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users~x" },
-        } },
-        .{ .method = "DELETE", .path = "/1", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/b.42/b/vxyz/c7~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/ab~x/c7", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/vxyz/v1", .status = 404 },
-        .{ .method = "PUT", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/a-txt/va/a", .status = 404 },
-        .{ .method = "GET", .path = "/b/b", .status = 200, .pattern = "/b/b", .params = &.{} },
-        .{ .method = "POST", .path = "/pre1/a-b/xyz~x", .status = 404 },
-        .{ .method = "PUT", .path = "/txt-ab/va", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/a/ab.a", .status = 404 },
-        .{ .method = "GET", .path = "/b/b", .status = 200, .pattern = "/b/b", .params = &.{} },
-        .{ .method = "POST", .path = "/c7~x", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/users/v1/users/c7", .status = 200, .pattern = "/users/v1/*", .params = &.{
-            .{ .name = "*", .value = "users/c7" },
-        } },
-        .{ .method = "POST", .path = "/users/prec7/json~x/a42_a.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/ac7_users.txt/a-b/v1", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/prexyz", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/a", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/1~x", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "1~x" },
-        } },
-        .{ .method = "GET", .path = "/b/b", .status = 200, .pattern = "/b/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/ab~x/a-b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/users/v1/ab/vc7", .status = 200, .pattern = "/users/v1/*", .params = &.{
-            .{ .name = "*", .value = "ab/vc7" },
-        } },
-        .{ .method = "POST", .path = "/c7.ab", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/users/v1/json~x/txt", .status = 200, .pattern = "/users/v1/*", .params = &.{
-            .{ .name = "*", .value = "json~x/txt" },
-        } },
-        .{ .method = "DELETE", .path = "/c7.c7/users", .status = 404 },
-        .{ .method = "GET", .path = "/xyz-txt/va", .status = 200, .pattern = "/{p0}-{q0}/v{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "txt" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/1.a/b", .status = 404 },
-        .{ .method = "DELETE", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/42.c7/preab", .status = 404 },
-        .{ .method = "PUT", .path = "/users-users/vusers", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/ab.c7/pre42/json", .status = 404 },
-        .{ .method = "DELETE", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/x.y", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/users/v1/ab-xyz/b", .status = 200, .pattern = "/users/v1/*", .params = &.{
-            .{ .name = "*", .value = "ab-xyz/b" },
-        } },
-        .{ .method = "DELETE", .path = "/a-b/xyz.c7", .status = 404 },
-        .{ .method = "DELETE", .path = "/ausers_a.txt/a-b/v1", .status = 200, .pattern = "/a{p0}_{q0}.txt/a-b/v1", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/prea", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/users/v1/txt/prec7", .status = 200, .pattern = "/users/v1/*", .params = &.{
-            .{ .name = "*", .value = "txt/prec7" },
-        } },
-        .{ .method = "POST", .path = "/x.y/vjson", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/aab_ab.txt/aa_users.txt/v1/", .status = 404 },
-        .{ .method = "GET", .path = "/a-a/v42", .status = 200, .pattern = "/{p0}-{q0}/v{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/json-42/pre42/b", .status = 404 },
-        .{ .method = "DELETE", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/xyz/a1_c7.txt/", .status = 404 },
-        .{ .method = "GET", .path = "/json-a/va", .status = 200, .pattern = "/{p0}-{q0}/v{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/ab~x", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab~x" },
-        } },
-        .{ .method = "GET", .path = "/json-1/vusers", .status = 200, .pattern = "/{p0}-{q0}/v{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "1" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/vab/v1/v42", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "POST", .pattern = "/{p0}/a-b" },
-        .{ .method = "POST", .pattern = "/v1/a-b/x.y" },
-        .{ .method = "POST", .pattern = "/users" },
-        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt/a-b" },
-        .{ .method = "GET", .pattern = "/{p0}/*" },
-        .{ .method = "POST", .pattern = "/b/" },
-        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/42/a-b", .status = 200, .pattern = "/{p0}/a-b", .params = &.{
+        .{ .method = "PUT", .path = "/ab/va/prexyz/ab.a/", .status = 404 },
+        .{ .method = "DELETE", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "42" },
         } },
-        .{ .method = "DELETE", .path = "/preusers/users.c7/users/1", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/ab-42/users-xyz/ab-1/users.ab", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/aa_ab.txt/a-b", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/b-json/users", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "b-json" },
-            .{ .name = "*", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "GET", .path = "/c7~x", .status = 404 },
-        .{ .method = "POST", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/users", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/ausers_a.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+        .{ .method = "GET", .path = "/users/b.b/txt/vc7", .status = 404 },
+        .{ .method = "DELETE", .path = "/users.42", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
             .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/ab_42.txt/b/users.b", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "ab_42.txt" },
-            .{ .name = "*", .value = "b/users.b" },
-        } },
-        .{ .method = "POST", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/ac7_a.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/ab_42.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "b" },
             .{ .name = "q0", .value = "42" },
         } },
-        .{ .method = "PUT", .path = "/a42_c7.txt/prexyz/a/preusers", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "DELETE", .path = "/users~x/a1_c7.txt/v42", .status = 405, .allow = &.{
+            "PUT",
         } },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/prexyz", .status = 404 },
-        .{ .method = "POST", .path = "/a1_txt.txt/a-b", .status = 200, .pattern = "/a{p0}_{q0}.txt/a-b", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/preb/42-json/prea/ab-xyz", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "preb" },
-            .{ .name = "*", .value = "42-json/prea/ab-xyz" },
-        } },
-        .{ .method = "POST", .path = "/aa_xyz.txt/a-b", .status = 200, .pattern = "/a{p0}_{q0}.txt/a-b", .params = &.{
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "xyz" },
         } },
-        .{ .method = "POST", .path = "/42.42/x.y/json", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "DELETE", .path = "/a-b/b/txt/json", .status = 404 },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/a/1", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "POST", .path = "/v1/a-b/x.y", .status = 200, .pattern = "/v1/a-b/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/42", .status = 404 },
-        .{ .method = "POST", .path = "/axyz_ab.txt/a-b", .status = 200, .pattern = "/a{p0}_{q0}.txt/a-b", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
+        .{ .method = "POST", .path = "/a/", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "DELETE", .path = "/txt~x/v42/vjson", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "DELETE", .path = "/xyz-json/1.xyz", .status = 404 },
+        .{ .method = "POST", .path = "/va", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/a1_c7.txt/xyz/c7/x.y", .status = 404 },
+        .{ .method = "POST", .path = "/vxyz", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/atxt_1.txt/x.y/prexyz/b", .status = 404 },
+        .{ .method = "DELETE", .path = "/42.ab", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
             .{ .name = "q0", .value = "ab" },
         } },
-        .{ .method = "POST", .path = "/1.ab/a/prexyz", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "DELETE", .path = "/users.users/a/a", .status = 405, .allow = &.{
+            "PUT",
         } },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/42-users/b~x/ab_xyz.txt/txt", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "GET", .path = "/b.1", .status = 405, .allow = &.{
+            "DELETE",
         } },
-        .{ .method = "POST", .path = "/v1/a-b/x.y", .status = 200, .pattern = "/v1/a-b/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/b/1", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "PUT", .path = "/vusers/c7~x/vab", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
+            .{ .name = "p0", .value = "vusers" },
+            .{ .name = "p1", .value = "c7~x" },
+            .{ .name = "p2", .value = "vab" },
         } },
-        .{ .method = "DELETE", .path = "/a/axyz_a.txt", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/a/preab", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "POST", .path = "/json/42-42", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/a1_users.txt/a-b", .status = 200, .pattern = "/a{p0}_{q0}.txt/a-b", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/c7.b/atxt_1.txt/ausers_txt.txt/v1", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/ac7_a.txt/a-b", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/ac7_json.txt/b/txt.42", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/preab/users-users", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/b/pre42/vb", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/1-users/a-b/1/a42_a.txt", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/users/a-b", .status = 200, .pattern = "/{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/ab/vjson/42.c7", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "*", .value = "vjson/42.c7" },
-        } },
-        .{ .method = "POST", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/a", .status = 404 },
-        .{ .method = "DELETE", .path = "/a1_users.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/1.1/atxt_users.txt/prejson/aa_b.txt", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/ausers_c7.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+        .{ .method = "DELETE", .path = "/users.c7", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
             .{ .name = "p0", .value = "users" },
             .{ .name = "q0", .value = "c7" },
         } },
-        .{ .method = "POST", .path = "/x.y/42", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/b/", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "DELETE", .path = "/ab~x/pre1/b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/axyz_txt.txt/a-b", .status = 200, .pattern = "/a{p0}_{q0}.txt/a-b", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/json-xyz/1.42", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "json-xyz" },
-            .{ .name = "*", .value = "1.42" },
-        } },
-        .{ .method = "DELETE", .path = "/b/a-b", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/json.1/preab/a42_json.txt", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/a1_c7.txt", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/1", .status = 405, .allow = &.{
             "DELETE",
         } },
-        .{ .method = "PUT", .path = "/b-users/pre1", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/v1/a-b/x.y", .status = 200, .pattern = "/v1/a-b/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/json", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/a" },
-        .{ .method = "GET", .pattern = "/v1" },
-        .{ .method = "PUT", .pattern = "/v1/{p1}" },
-        .{ .method = "DELETE", .pattern = "/x.y" },
-        .{ .method = "GET", .pattern = "/{p0}" },
-        .{ .method = "GET", .pattern = "/{p0}.json" },
-        .{ .method = "POST", .pattern = "/{p0}.json/{p1}" },
-        .{ .method = "PUT", .pattern = "/{p0}.{q0}" },
-        .{ .method = "POST", .pattern = "/v{p0}" },
-        .{ .method = "GET", .pattern = "/{p0}-{q0}" },
-        .{ .method = "GET", .pattern = "/pre{p0}" },
-        .{ .method = "DELETE", .pattern = "/pre{p0}/{p1}" },
-        .{ .method = "POST", .pattern = "/{p0}~x" },
-        .{ .method = "PUT", .pattern = "/{p0}~x/{p1}" },
-        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt/{p1}" },
-        .{ .method = "GET", .pattern = "/x.y" },
-        .{ .method = "POST", .pattern = "/users/" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "GET", .path = "/users.ab/ab~x/42/1~x", .status = 404 },
-        .{ .method = "POST", .path = "/json.json/xyz", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/xyz~x/a.a", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "a.a" },
-        } },
-        .{ .method = "PUT", .path = "/preusers/users", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/42-42/b/a/prejson", .status = 404 },
-        .{ .method = "POST", .path = "/vtxt", .status = 200, .pattern = "/v{p0}", .params = &.{
+        .{ .method = "DELETE", .path = "/txt.b", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
             .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/users~x/users-users/ab/v1/", .status = 404 },
-        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/json-a", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/preb", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "POST", .path = "/users/", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/a1_a.txt/1-ab/prejson/users", .status = 404 },
-        .{ .method = "POST", .path = "/x.y", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/txt/c7~x/v1/txt-1/", .status = 404 },
-        .{ .method = "DELETE", .path = "/ajson_b.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "json" },
             .{ .name = "q0", .value = "b" },
         } },
-        .{ .method = "DELETE", .path = "/v1/users", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/42-c7/ac7_1.txt/xyz", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "PUT", .path = "/v1/txt", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/xyz~x/users-ab", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "users-ab" },
-        } },
-        .{ .method = "POST", .path = "/ab", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/a/1.users", .status = 404 },
-        .{ .method = "GET", .path = "/xyz-xyz", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/x.y/txt", .status = 404 },
-        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/aab_txt.txt/", .status = 404 },
-        .{ .method = "PUT", .path = "/aab_a.txt/users", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/b-users/xyz-b/", .status = 404 },
-        .{ .method = "GET", .path = "/prejson", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/vab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "vab" },
-        } },
-        .{ .method = "GET", .path = "/c7-users", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/xyz/a/a1_a.txt/xyz", .status = 404 },
-        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "GET", .path = "/users/", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/x.y/a-b/b", .status = 405, .allow = &.{
             "POST",
-        } },
-        .{ .method = "GET", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/ab", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/users.1", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/ab/", .status = 404 },
-        .{ .method = "PUT", .path = "/atxt_xyz.txt/users", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/prec7", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/vxyz/a-users/", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/vb", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "vb" },
-        } },
-        .{ .method = "GET", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/axyz_1.txt/b/vjson/42.ab/", .status = 404 },
-        .{ .method = "POST", .path = "/users/", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/b-xyz/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a.json/42", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/vab/txt-ab/", .status = 404 },
-        .{ .method = "GET", .path = "/json.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/xyz/a-users/a", .status = 404 },
-        .{ .method = "PUT", .path = "/preb", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/x.y/a/users-b", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/users", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/ab-c7/json/users", .status = 404 },
-        .{ .method = "PUT", .path = "/1.json", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/txt-users", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "users" },
-        } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/{p0}.{q0}/{p1}/pre{p2}" },
-        .{ .method = "GET", .pattern = "/{p0}/b/*" },
-        .{ .method = "POST", .pattern = "/x.y" },
-        .{ .method = "DELETE", .pattern = "/pre{p0}/x.y" },
-        .{ .method = "GET", .pattern = "/x.y/a/v1" },
-        .{ .method = "PUT", .pattern = "/pre{p0}/a-b/*" },
-        .{ .method = "PUT", .pattern = "/{p0}.json/" },
-        .{ .method = "DELETE", .pattern = "/v1/{p1}/a" },
-        .{ .method = "PUT", .pattern = "/a" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/ab/b/42.b", .status = 200, .pattern = "/{p0}/b/*", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "*", .value = "42.b" },
-        } },
-        .{ .method = "GET", .path = "/x.y/users/preab", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "DELETE", .path = "/prea/x.y", .status = 200, .pattern = "/pre{p0}/x.y", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/vusers/xyz.42/b/va", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1/c7/a", .status = 200, .pattern = "/v1/{p1}/a", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/preab/", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/a/v1", .status = 200, .pattern = "/x.y/a/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/a~x/vjson", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1/users/a", .status = 200, .pattern = "/v1/{p1}/a", .params = &.{
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/prea/c7/prec7/aa_users.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/ab.xyz/1/preb", .status = 200, .pattern = "/{p0}.{q0}/{p1}/pre{p2}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/42.xyz/b/b/ab", .status = 200, .pattern = "/{p0}/b/*", .params = &.{
-            .{ .name = "p0", .value = "42.xyz" },
-            .{ .name = "*", .value = "b/ab" },
-        } },
-        .{ .method = "GET", .path = "/x.y/a/v1", .status = 200, .pattern = "/x.y/a/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/42/", .status = 404 },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "GET", .path = "/xyz", .status = 404 },
-        .{ .method = "PUT", .path = "/c7.json/", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/42~x/prexyz/prec7", .status = 404 },
-        .{ .method = "DELETE", .path = "/prec7/x.y", .status = 200, .pattern = "/pre{p0}/x.y", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/ausers_b.txt", .status = 404 },
-        .{ .method = "GET", .path = "/txt/b/vxyz", .status = 200, .pattern = "/{p0}/b/*", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "*", .value = "vxyz" },
-        } },
-        .{ .method = "PUT", .path = "/users/json/txt", .status = 404 },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "DELETE", .path = "/a/preusers", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/a/v1", .status = 200, .pattern = "/x.y/a/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/va", .status = 404 },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "PUT", .path = "/42-c7/atxt_b.txt/c7-42", .status = 404 },
-        .{ .method = "PUT", .path = "/42.json/", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/prexyz/xyz~x/x.y/vjson", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/ab.b", .status = 404 },
-        .{ .method = "POST", .path = "/preab/a-b/", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/ab-1/a42_users.txt/vusers", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "GET", .path = "/42~x", .status = 404 },
-        .{ .method = "PUT", .path = "/a.xyz/a/prec7", .status = 200, .pattern = "/{p0}.{q0}/{p1}/pre{p2}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "p2", .value = "c7" },
+        .{ .method = "PUT", .path = "/v1/users/users", .status = 200, .pattern = "/v1/users/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/ausers_a.txt/aa_1.txt/a", .status = 405, .allow = &.{
+            "PUT",
         } },
-        .{ .method = "DELETE", .path = "/a-b/txt/xyz.1/42", .status = 404 },
-        .{ .method = "PUT", .path = "/prec7/a-b/vusers/va", .status = 200, .pattern = "/pre{p0}/a-b/*", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "*", .value = "vusers/va" },
-        } },
-        .{ .method = "PUT", .path = "/xyz", .status = 404 },
-        .{ .method = "GET", .path = "/42/b/1/xyz~x", .status = 200, .pattern = "/{p0}/b/*", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "*", .value = "1/xyz~x" },
-        } },
-        .{ .method = "PUT", .path = "/vusers", .status = 404 },
-        .{ .method = "POST", .path = "/b/b/", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/c7-xyz/preb", .status = 404 },
-        .{ .method = "DELETE", .path = "/prexyz/x.y", .status = 200, .pattern = "/pre{p0}/x.y", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/atxt_xyz.txt/preab/txt~x/1-1", .status = 404 },
-        .{ .method = "GET", .path = "/ab/b/ab~x/vusers", .status = 200, .pattern = "/{p0}/b/*", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "*", .value = "ab~x/vusers" },
-        } },
-        .{ .method = "POST", .path = "/txt/vc7/a-b/a-b", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1/ab/a", .status = 200, .pattern = "/v1/{p1}/a", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/42/x.y/users", .status = 404 },
-        .{ .method = "DELETE", .path = "/prejson/x.y", .status = 200, .pattern = "/pre{p0}/x.y", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/pre1", .status = 404 },
-        .{ .method = "PUT", .path = "/pre42/a-b/", .status = 200, .pattern = "/pre{p0}/a-b/*", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "DELETE", .path = "/users.1", .status = 404 },
-        .{ .method = "PUT", .path = "/json/b/", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/json/xyz~x/b.users/1/", .status = 404 },
-        .{ .method = "GET", .path = "/1/b/a/b~x", .status = 200, .pattern = "/{p0}/b/*", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "*", .value = "a/b~x" },
-        } },
-        .{ .method = "DELETE", .path = "/users~x/ajson_1.txt/", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/a/v1", .status = 200, .pattern = "/x.y/a/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/vab", .status = 404 },
-        .{ .method = "PUT", .path = "/b.json/", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/preusers", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/{p0}.{q0}/b" },
-        .{ .method = "GET", .pattern = "/a-b/{p1}-{q1}" },
-        .{ .method = "GET", .pattern = "/x.y/{p1}.{q1}/{p2}" },
-        .{ .method = "GET", .pattern = "/{p0}.{q0}/v1/a" },
-        .{ .method = "PUT", .pattern = "/{p0}" },
-        .{ .method = "DELETE", .pattern = "/a/a-b" },
-        .{ .method = "DELETE", .pattern = "/v1/*" },
-        .{ .method = "DELETE", .pattern = "/b" },
-        .{ .method = "POST", .pattern = "/v1/v1/*" },
-        .{ .method = "DELETE", .pattern = "/*" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/v1/v1/", .status = 200, .pattern = "/v1/v1/*", .params = &.{
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "PUT", .path = "/txt/vb", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/xyz.b", .status = 405, .allow = &.{
             "DELETE",
         } },
-        .{ .method = "DELETE", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/a/xyz.users/vjson/xyz.42", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/b~x/c7/a/vab", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a-b/b", .status = 200, .pattern = "/x.y/a-b/b", .params = &.{} },
+        .{ .method = "POST", .path = "/ausers_b.txt", .status = 405, .allow = &.{
             "DELETE",
         } },
-        .{ .method = "POST", .path = "/x.y/users.users/users", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "v1" },
-        } },
-        .{ .method = "GET", .path = "/1.1/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/42-c7/42~x/users/42~x", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "42-c7/42~x/users/42~x" },
-        } },
-        .{ .method = "PUT", .path = "/a-b/ab-xyz", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/prejson/txt.a", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/b.c7/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/42/v1/a/xyz.b", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "42/v1/a/xyz.b" },
-        } },
-        .{ .method = "POST", .path = "/v1/v1/42~x/vc7", .status = 200, .pattern = "/v1/v1/*", .params = &.{
-            .{ .name = "*", .value = "42~x/vc7" },
-        } },
-        .{ .method = "GET", .path = "/vc7/prexyz", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "POST", .path = "/c7/a/users.users/users.json", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/v1/ab/ajson_ab.txt", .status = 200, .pattern = "/v1/*", .params = &.{
-            .{ .name = "*", .value = "ab/ajson_ab.txt" },
-        } },
-        .{ .method = "POST", .path = "/xyz/x.y/b/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/v1/42.a", .status = 200, .pattern = "/v1/*", .params = &.{
-            .{ .name = "*", .value = "42.a" },
-        } },
-        .{ .method = "PUT", .path = "/users.b/users~x/json-b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/42.c7/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/preusers/xyz~x/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "GET", .path = "/a/vc7", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/a-b/users-a", .status = 200, .pattern = "/a-b/{p1}-{q1}", .params = &.{
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "q1", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/x.y/users/va", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "x.y/users/va" },
-        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
         .{ .method = "POST", .path = "/42", .status = 405, .allow = &.{
             "DELETE",
-            "PUT",
         } },
-        .{ .method = "DELETE", .path = "/preusers", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "preusers" },
+        .{ .method = "DELETE", .path = "/c7.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "q0", .value = "txt" },
         } },
-        .{ .method = "PUT", .path = "/x.y/xyz.xyz/42", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/42-xyz/b~x", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/a.b/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/aab_json.txt/a/xyz/ab_c7.txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/a-b/ab-json", .status = 200, .pattern = "/a-b/{p1}-{q1}", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "q1", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/ac7_a.txt/json/c7", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/v1/", .status = 200, .pattern = "/v1/*", .params = &.{
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "DELETE", .path = "/a42_42.txt/ab~x/ac7_b.txt/txt", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "a42_42.txt/ab~x/ac7_b.txt/txt" },
-        } },
-        .{ .method = "PUT", .path = "/vc7", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "vc7" },
-        } },
-        .{ .method = "GET", .path = "/ab/users/ab/b-ab", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/a.ab/v1/a", .status = 200, .pattern = "/{p0}.{q0}/v1/a", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/ac7_b.txt/b.c7/aab_a.txt/atxt_xyz.txt/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/b.a", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "b.a" },
-        } },
-        .{ .method = "PUT", .path = "/1-42/ab~x/a~x/va", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/b~x", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "b~x" },
-        } },
-        .{ .method = "GET", .path = "/a-b/json-json", .status = 200, .pattern = "/a-b/{p1}-{q1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "q1", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/ab~x/ab.a/a/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/b.xyz/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
+        .{ .method = "PUT", .path = "/pretxt/v1", .status = 404 },
+        .{ .method = "PUT", .path = "/b/c7/json", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
             .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "xyz" },
+            .{ .name = "p1", .value = "c7" },
+            .{ .name = "p2", .value = "json" },
         } },
-        .{ .method = "POST", .path = "/json-ab/ab/ab-txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/x.y/xyz", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "x.y/xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/ab~x/txt-users/axyz_json.txt", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "ab~x/txt-users/axyz_json.txt" },
-        } },
-        .{ .method = "DELETE", .path = "/v1/", .status = 200, .pattern = "/v1/*", .params = &.{
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "GET", .path = "/users/c7", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/a-b/a-b", .status = 200, .pattern = "/a-b/{p1}-{q1}", .params = &.{
+        .{ .method = "DELETE", .path = "/vtxt/va/xyz/ac7_users.txt/", .status = 404 },
+        .{ .method = "PUT", .path = "/1/a/42", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
+            .{ .name = "p0", .value = "1" },
             .{ .name = "p1", .value = "a" },
-            .{ .name = "q1", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/aab_json.txt", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/a/a-b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/a/b/vab/prejson", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "a/b/vab/prejson" },
-        } },
-        .{ .method = "POST", .path = "/v1/v1/1~x", .status = 200, .pattern = "/v1/v1/*", .params = &.{
-            .{ .name = "*", .value = "1~x" },
-        } },
-        .{ .method = "GET", .path = "/ab_txt.txt/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
-            .{ .name = "p0", .value = "ab_txt" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/a-b/" },
-        .{ .method = "PUT", .pattern = "/pre{p0}/a-b" },
-        .{ .method = "PUT", .pattern = "/{p0}" },
-        .{ .method = "PUT", .pattern = "/{p0}.{q0}/users/{p2}" },
-        .{ .method = "POST", .pattern = "/{p0}/v{p1}/{p2}.{q2}/" },
-        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt/a" },
-        .{ .method = "GET", .pattern = "/{p0}-{q0}/" },
-        .{ .method = "PUT", .pattern = "/b/{p1}/v1" },
-        .{ .method = "DELETE", .pattern = "/b" },
-        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt/pre{p1}/{p2}/" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/ab_ab.txt/prexyz/c7/", .status = 200, .pattern = "/a{p0}_{q0}.txt/pre{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "ab" },
-            .{ .name = "p1", .value = "xyz" },
-            .{ .name = "p2", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/json/atxt_a.txt", .status = 404 },
-        .{ .method = "GET", .path = "/ab-xyz/", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/b-1/xyz-42/b", .status = 404 },
-        .{ .method = "POST", .path = "/axyz_txt.txt/pre42/xyz/", .status = 200, .pattern = "/a{p0}_{q0}.txt/pre{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "txt" },
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/b/atxt_b.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/b.users/a-b/vusers", .status = 404 },
-        .{ .method = "GET", .path = "/1-json/", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/a/1~x", .status = 404 },
-        .{ .method = "PUT", .path = "/preb/a-b", .status = 200, .pattern = "/pre{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/vb/aab_a.txt", .status = 404 },
-        .{ .method = "POST", .path = "/atxt_users.txt/preb/users/", .status = 200, .pattern = "/a{p0}_{q0}.txt/pre{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "users" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "p2", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/1~x/axyz_a.txt/42.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/a1_txt.txt/a", .status = 200, .pattern = "/a{p0}_{q0}.txt/a", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/ab.txt/json/vab", .status = 404 },
-        .{ .method = "PUT", .path = "/b/ab/v1", .status = 200, .pattern = "/b/{p1}/v1", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/a/c7-xyz/users/atxt_42.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/json.42/users/42", .status = 200, .pattern = "/{p0}.{q0}/users/{p2}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "42" },
             .{ .name = "p2", .value = "42" },
         } },
-        .{ .method = "GET", .path = "/json~x/42-b/b/", .status = 404 },
-        .{ .method = "PUT", .path = "/prejson/a-b", .status = 200, .pattern = "/pre{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/a1_1.txt/users-txt", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/json.b", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "json.b" },
-        } },
-        .{ .method = "POST", .path = "/xyz/vab/txt.42/", .status = 200, .pattern = "/{p0}/v{p1}/{p2}.{q2}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "p2", .value = "txt" },
-            .{ .name = "q2", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/users/txt.b/a42_json.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/b/c7/v1", .status = 200, .pattern = "/b/{p1}/v1", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/preusers/va/a/b/", .status = 404 },
-        .{ .method = "POST", .path = "/a", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/vc7/1~x/c7/ab.xyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/ab_xyz.txt/a", .status = 200, .pattern = "/a{p0}_{q0}.txt/a", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/c7~x/a1_c7.txt/v1/b/", .status = 404 },
-        .{ .method = "PUT", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/ab/ajson_c7.txt/vtxt/b/", .status = 404 },
-        .{ .method = "PUT", .path = "/b/c7/v1", .status = 200, .pattern = "/b/{p1}/v1", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/v1/prea", .status = 404 },
-        .{ .method = "GET", .path = "/a-1/", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/json", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/txt-ab/", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/b/c7/v1", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/42~x/json~x/ab/1~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/prea/users-json/c7-xyz", .status = 404 },
-        .{ .method = "GET", .path = "/xyz-1/", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/ab/42", .status = 404 },
-        .{ .method = "PUT", .path = "/b/b/v1", .status = 200, .pattern = "/b/{p1}/v1", .params = &.{
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/a/b.a/vb/v1", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/a/ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/c7-b/", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/a42_xyz.txt/va/", .status = 404 },
-        .{ .method = "DELETE", .path = "/axyz_42.txt/a", .status = 200, .pattern = "/a{p0}_{q0}.txt/a", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/ajson_json.txt/prec7/c7~x", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/x.y/1~x/json", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/txt.a/users/1", .status = 200, .pattern = "/{p0}.{q0}/users/{p2}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/a/b~x", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/a" },
-        .{ .method = "PUT", .pattern = "/a/{p1}" },
-        .{ .method = "POST", .pattern = "/v1" },
-        .{ .method = "DELETE", .pattern = "/v1/{p1}" },
-        .{ .method = "PUT", .pattern = "/x.y" },
-        .{ .method = "POST", .pattern = "/x.y/{p1}" },
-        .{ .method = "POST", .pattern = "/{p0}" },
-        .{ .method = "POST", .pattern = "/{p0}.json" },
-        .{ .method = "DELETE", .pattern = "/{p0}.json/{p1}" },
-        .{ .method = "GET", .pattern = "/{p0}.{q0}" },
-        .{ .method = "GET", .pattern = "/{p0}.{q0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/v{p0}" },
-        .{ .method = "PUT", .pattern = "/v{p0}/{p1}" },
-        .{ .method = "POST", .pattern = "/{p0}-{q0}" },
-        .{ .method = "PUT", .pattern = "/{p0}-{q0}/{p1}" },
-        .{ .method = "POST", .pattern = "/pre{p0}" },
-        .{ .method = "PUT", .pattern = "/pre{p0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}~x" },
-        .{ .method = "DELETE", .pattern = "/{p0}~x/{p1}" },
-        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt/{p1}" },
-        .{ .method = "GET", .pattern = "/b" },
-        .{ .method = "DELETE", .pattern = "/*" },
-        .{ .method = "PUT", .pattern = "/users" },
-        .{ .method = "DELETE", .pattern = "/a-b/a-b" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/ajson_txt.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/v1/a~x/b/c7", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/prea/users", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/c7", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/b.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/prexyz/c7~x", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "c7~x" },
-        } },
-        .{ .method = "GET", .path = "/aa_42.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "42" },
-        } },
-        .{ .method = "POST", .path = "/xyz.a/json.ab", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/b/prexyz/users/ab/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/users.users", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "PUT", .path = "/1-b/xyz", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
+        .{ .method = "POST", .path = "/users/a1_xyz.txt/", .status = 404 },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/1", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "b" },
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/vc7/prexyz", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "vc7/prexyz" },
-        } },
-        .{ .method = "GET", .path = "/a-a", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/json/b/json~x/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/ausers_xyz.txt/vxyz/vab/json~x", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/a42_json.txt", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/ac7_b.txt", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "ac7_b.txt" },
-        } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/ab~x/b/users~x", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "ab~x/b/users~x" },
-        } },
-        .{ .method = "POST", .path = "/xyz-txt", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/a-txt/1-b/txt~x", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "a-txt/1-b/txt~x" },
-        } },
-        .{ .method = "POST", .path = "/prec7/xyz", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/a/json", .status = 200, .pattern = "/a/{p1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/vc7/ab", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "vc7/ab" },
-        } },
-        .{ .method = "PUT", .path = "/ab/c7~x/pretxt/b/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/users.json/a", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/vc7/b", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "vc7/b" },
-        } },
-        .{ .method = "PUT", .path = "/c7", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/atxt_users.txt/txt-ab/txt~x/ab/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/pre42/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/txt.json/42", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/v1/b/b/txt", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "v1/b/b/txt" },
-        } },
-        .{ .method = "GET", .path = "/c7.json", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/1-42/b/xyz~x", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/1/v1/1/v1/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/preb/json", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/atxt_a.txt/ac7_xyz.txt/txt/json", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/va/json", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/vab", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/a-b/a-b", .status = 200, .pattern = "/a-b/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/ab_c7.txt/vusers/vusers/a", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/ab~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/c7", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
         } },
         .{ .method = "GET", .path = "/a", .status = 405, .allow = &.{
             "DELETE",
             "POST",
-            "PUT",
         } },
-        .{ .method = "PUT", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/json-users", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "json-users" },
-        } },
-        .{ .method = "DELETE", .path = "/ab.json/1", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/ab.ab/users-42", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "ab.ab/users-42" },
-        } },
-        .{ .method = "POST", .path = "/pre42", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/xyz~x/a~x", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/c7-xyz", .status = 405, .allow = &.{
             "DELETE",
         } },
-        .{ .method = "POST", .path = "/x.y/ab", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
-            .{ .name = "p1", .value = "ab" },
+        .{ .method = "POST", .path = "/a/aa_json.txt", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "aa_json.txt" },
         } },
-        .{ .method = "PUT", .path = "/vc7/b/a-b", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/42~x", .status = 405, .allow = &.{
             "DELETE",
         } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/{p0}.{q0}" },
-        .{ .method = "POST", .pattern = "/x.y/v{p1}" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/x.y/vusers", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/a-b", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/vb", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/prejson", .status = 404 },
-        .{ .method = "GET", .path = "/ab.json", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/v1/ajson_a.txt/vtxt/ajson_json.txt", .status = 404 },
-        .{ .method = "GET", .path = "/ab.42", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/prejson/c7/users-json/txt", .status = 404 },
-        .{ .method = "GET", .path = "/ab.xyz", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/pretxt", .status = 404 },
-        .{ .method = "GET", .path = "/b.json", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/a~x/c7/json/users", .status = 404 },
-        .{ .method = "GET", .path = "/json.ab", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/42-a/c7/xyz", .status = 404 },
-        .{ .method = "GET", .path = "/1.json", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/vab/json.b", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/v1", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/xyz.txt/b", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/vusers", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/ab~x/pretxt/aa_json.txt/json-ab", .status = 404 },
-        .{ .method = "GET", .path = "/json.a", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/x.y/users.42/xyz~x", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/vxyz", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/aab_xyz.txt/users-1/42/preb/", .status = 404 },
-        .{ .method = "GET", .path = "/c7.json", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/vc7/b/x.y/prec7", .status = 404 },
-        .{ .method = "GET", .path = "/c7.users", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/json-users/b/json", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/vc7", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/v42", .status = 404 },
-        .{ .method = "GET", .path = "/users.ab", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/ab/axyz_txt.txt/1.users/txt~x", .status = 404 },
-        .{ .method = "GET", .path = "/json.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/a-42/a/b/b~x", .status = 404 },
-        .{ .method = "GET", .path = "/users.xyz", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/pre1/axyz_xyz.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/c7.b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/prec7/pre1/txt.1/aab_json.txt", .status = 404 },
-        .{ .method = "GET", .path = "/a.c7", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/a/a1_txt.txt/x.y", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/vjson", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/a-b/v1/b", .status = 404 },
-        .{ .method = "POST", .path = "/json.c7", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/x.y/users/ajson_txt.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y/vab", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/c7~x/b/prexyz/ajson_a.txt", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/vab", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/txt-b", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/va", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/users~x/c7", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/vxyz", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/v1/atxt_1.txt", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/vusers", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/vtxt/ajson_ab.txt", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/vjson", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/xyz.42/1.a/1/", .status = 404 },
-        .{ .method = "GET", .path = "/xyz.xyz", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/42.ab/42", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/va", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/ajson_42.txt", .status = 405, .allow = &.{
-            "GET",
-        } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/a-b/pre{p1}" },
-        .{ .method = "PUT", .pattern = "/a-b/a/v1" },
-        .{ .method = "PUT", .pattern = "/a-b/a/*" },
-        .{ .method = "DELETE", .pattern = "/{p0}/*" },
-        .{ .method = "POST", .pattern = "/{p0}.{q0}" },
-        .{ .method = "GET", .pattern = "/a/{p1}/a{p2}_{q2}.txt" },
-        .{ .method = "GET", .pattern = "/pre{p0}" },
-        .{ .method = "DELETE", .pattern = "/x.y/" },
-        .{ .method = "POST", .pattern = "/v1" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/a/b/a42_ab.txt", .status = 200, .pattern = "/a/{p1}/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "p2", .value = "42" },
-            .{ .name = "q2", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/42/xyz", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "*", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/42~x/1/", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "42~x" },
-            .{ .name = "*", .value = "1/" },
-        } },
-        .{ .method = "DELETE", .path = "/42/", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "PUT", .path = "/a-b/ac7_42.txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/a-b/preb", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "a-b" },
-            .{ .name = "*", .value = "preb" },
-        } },
-        .{ .method = "PUT", .path = "/vb", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/xyz-42/c7/vc7", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/a-b/a/v1", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/v1/ac7_c7.txt/", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "v1" },
-            .{ .name = "*", .value = "ac7_c7.txt/" },
-        } },
-        .{ .method = "DELETE", .path = "/b/json", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "*", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/b", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/a/", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/vtxt", .status = 404 },
-        .{ .method = "GET", .path = "/a/txt/atxt_42.txt", .status = 200, .pattern = "/a/{p1}/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "p2", .value = "txt" },
-            .{ .name = "q2", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/prec7/1~x/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/preab", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/json", .status = 404 },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/x.y/a/1-users/1", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/preab", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/users/xyz/b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/a-b/a/v1", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "a-b" },
-            .{ .name = "*", .value = "a/v1" },
-        } },
-        .{ .method = "GET", .path = "/c7-xyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/xyz/ajson_xyz.txt/preab", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "*", .value = "ajson_xyz.txt/preab" },
-        } },
-        .{ .method = "DELETE", .path = "/txt~x/ajson_json.txt", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "txt~x" },
-            .{ .name = "*", .value = "ajson_json.txt" },
-        } },
-        .{ .method = "DELETE", .path = "/users.c7", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/c7/42.users/txt-json/b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/c7/a-c7/users~x", .status = 200, .pattern = "/{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "*", .value = "a-c7/users~x" },
-        } },
-        .{ .method = "PUT", .path = "/vtxt", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/a/b", .status = 200, .pattern = "/a-b/a/*", .params = &.{
-            .{ .name = "*", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/xyz-42/txt.c7/ab_json.txt/va", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/a.1", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/a/a42_ab.txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/pre1", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/c7/a/v1", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/a-b/a/v1", .status = 200, .pattern = "/a-b/a/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/ab.ab/b-json/ausers_a.txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/prec7", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/c7/aab_users.txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/pretxt", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/1-b/xyz.42", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/aab_42.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "aab_42" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/pre1", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/preusers/users/ab_42.txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/a/1/aa_txt.txt", .status = 200, .pattern = "/a/{p1}/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "p2", .value = "a" },
-            .{ .name = "q2", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/v1/atxt_1.txt/vxyz/vusers", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/ab.b/users.a", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/a42_a.txt/a42_42.txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/pretxt", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/c7/1/users/preb", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/c7.xyz", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/a", .status = 404 },
-        .{ .method = "GET", .path = "/a/c7/aab_txt.txt", .status = 200, .pattern = "/a/{p1}/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "p2", .value = "ab" },
-            .{ .name = "q2", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/42~x/42/vxyz/users~x", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/{p0}/v1/{p2}" },
-        .{ .method = "GET", .pattern = "/{p0}/{p1}" },
-        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt/v{p1}" },
-        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt/users" },
-        .{ .method = "POST", .pattern = "/*" },
-        .{ .method = "GET", .pattern = "/{p0}" },
-        .{ .method = "PUT", .pattern = "/{p0}/pre{p1}/x.y" },
-        .{ .method = "PUT", .pattern = "/*" },
-        .{ .method = "DELETE", .pattern = "/a/{p1}-{q1}/v1" },
-        .{ .method = "DELETE", .pattern = "/x.y/{p1}.json/v1" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "PUT", .path = "/users-42/a-b", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "users-42/a-b" },
-        } },
-        .{ .method = "PUT", .path = "/json", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/aa_1.txt/vb", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "aa_1.txt/vb" },
-        } },
-        .{ .method = "DELETE", .path = "/c7.c7/xyz/", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/json/a", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "json/a" },
-        } },
-        .{ .method = "PUT", .path = "/v1/json/a~x/ab-42/", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "v1/json/a~x/ab-42/" },
-        } },
-        .{ .method = "POST", .path = "/a/v1/42", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "a/v1/42" },
-        } },
-        .{ .method = "POST", .path = "/c7/json/b/a", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "c7/json/b/a" },
-        } },
-        .{ .method = "GET", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/42~x/preusers", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "42~x/preusers" },
-        } },
-        .{ .method = "GET", .path = "/x.y/xyz.json/v1", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/ab/vab/b~x/ab~x", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/a/1", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/b/aab_users.txt", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "b/aab_users.txt" },
-        } },
-        .{ .method = "PUT", .path = "/a/prea/x.y", .status = 200, .pattern = "/{p0}/pre{p1}/x.y", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/vusers/txt-c7/xyz/prejson", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "vusers/txt-c7/xyz/prejson" },
-        } },
-        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/txt-txt/b/preusers", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/txt/pre1/x.y", .status = 200, .pattern = "/{p0}/pre{p1}/x.y", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/42/b.1/aa_users.txt", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/aab_users.txt/va", .status = 200, .pattern = "/a{p0}_{q0}.txt/v{p1}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "users" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/vtxt/a-b", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "vtxt/a-b" },
-        } },
-        .{ .method = "POST", .path = "/vb", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "vb" },
-        } },
-        .{ .method = "GET", .path = "/vab/a/a/", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/a/b", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/ab.b/txt", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/xyz", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/ab.c7/ab-b/ab~x/b", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/a-b", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "a-b" },
-        } },
-        .{ .method = "DELETE", .path = "/aab_ab.txt/x.y/xyz.1/42", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/x.y/txt.json/v1", .status = 200, .pattern = "/x.y/{p1}.json/v1", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/xyz-c7/b/vb/txt-json", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/42-b/v1/ausers_a.txt/preusers", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "42-b/v1/ausers_a.txt/preusers" },
-        } },
-        .{ .method = "GET", .path = "/json/ab", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/va/1~x/xyz-json/", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "va/1~x/xyz-json/" },
-        } },
-        .{ .method = "POST", .path = "/atxt_1.txt/vjson", .status = 200, .pattern = "/a{p0}_{q0}.txt/v{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "1" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/c7.ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7.ab" },
-        } },
-        .{ .method = "PUT", .path = "/json/v1/users", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "json/v1/users" },
-        } },
-        .{ .method = "PUT", .path = "/json/ab-a/xyz.a", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "json/ab-a/xyz.a" },
-        } },
-        .{ .method = "DELETE", .path = "/a/42-xyz/v1", .status = 200, .pattern = "/a/{p1}-{q1}/v1", .params = &.{
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "q1", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/pre42/xyz/a~x", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/preusers/ab-json/ab~x/preb/", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/a/txt", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/users/b/pre1/xyz", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "users/b/pre1/xyz" },
-        } },
-        .{ .method = "GET", .path = "/b/b", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/c7-c7", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "c7-c7" },
-        } },
-        .{ .method = "PUT", .path = "/ab/1.c7", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "ab/1.c7" },
-        } },
-        .{ .method = "GET", .path = "/users-a/users/users.users", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/ab_xyz.txt/vxyz", .status = 200, .pattern = "/a{p0}_{q0}.txt/v{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/c7-c7/users~x", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "c7-c7/users~x" },
-        } },
-        .{ .method = "DELETE", .path = "/a/1-ab/v1", .status = 200, .pattern = "/a/{p1}-{q1}/v1", .params = &.{
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "q1", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/users.a/", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "PUT", .path = "/ab.c7/prexyz/ab/ab.xyz", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "ab.c7/prexyz/ab/ab.xyz" },
-        } },
-        .{ .method = "GET", .path = "/ab_xyz.txt/users", .status = 200, .pattern = "/a{p0}_{q0}.txt/users", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/users~x/preb/vjson", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "users~x/preb/vjson" },
-        } },
-        .{ .method = "PUT", .path = "/42/pretxt/x.y", .status = 200, .pattern = "/{p0}/pre{p1}/x.y", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/users/a.1/xyz/ab", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "users/a.1/xyz/ab" },
-        } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/a" },
-        .{ .method = "DELETE", .pattern = "/a/{p1}" },
-        .{ .method = "PUT", .pattern = "/v1" },
-        .{ .method = "PUT", .pattern = "/x.y" },
-        .{ .method = "DELETE", .pattern = "/x.y/{p1}" },
-        .{ .method = "POST", .pattern = "/{p0}" },
-        .{ .method = "GET", .pattern = "/{p0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}.json" },
-        .{ .method = "DELETE", .pattern = "/{p0}.{q0}" },
-        .{ .method = "DELETE", .pattern = "/v{p0}" },
-        .{ .method = "PUT", .pattern = "/{p0}-{q0}" },
-        .{ .method = "POST", .pattern = "/{p0}-{q0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/pre{p0}" },
-        .{ .method = "GET", .pattern = "/pre{p0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}~x" },
-        .{ .method = "POST", .pattern = "/{p0}~x/{p1}" },
-        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}-{q0}/a" },
-        .{ .method = "DELETE", .pattern = "/{p0}/b" },
-        .{ .method = "DELETE", .pattern = "/{p0}" },
-        .{ .method = "GET", .pattern = "/pre{p0}" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/users-users/1", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "users" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/42/users/a~x/c7.b/", .status = 404 },
-        .{ .method = "POST", .path = "/users~x", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users~x" },
-        } },
-        .{ .method = "PUT", .path = "/ab/ac7_txt.txt", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/x.y/42", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/a-users/1.42/axyz_json.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/b-ab/a", .status = 200, .pattern = "/{p0}-{q0}/a", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/ajson_ab.txt/preb/atxt_ab.txt/c7-json", .status = 404 },
-        .{ .method = "PUT", .path = "/v42", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/ab/b/ausers_ab.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/ab.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/txt-users/xyz.users", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/ab-txt/a", .status = 200, .pattern = "/{p0}-{q0}/a", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/x.y", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/a1_b.txt/atxt_xyz.txt", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a1_b.txt" },
-            .{ .name = "p1", .value = "atxt_xyz.txt" },
-        } },
-        .{ .method = "GET", .path = "/42/json", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/ausers_users.txt", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/ab-users/a", .status = 200, .pattern = "/{p0}-{q0}/a", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/json/xyz.users/preb/v1", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/c7", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/ab/v1", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/aab_1.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/a-b", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/x.y/ab", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/b.b/vusers/42~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/xyz/b", .status = 200, .pattern = "/{p0}/b", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/a-b/v1/1", .status = 404 },
-        .{ .method = "GET", .path = "/xyz/1", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/txt.a", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/ab.xyz/ab-42/preb/a.users/", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/txt", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/c7-txt/a", .status = 200, .pattern = "/{p0}-{q0}/a", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/txt/a/b.1", .status = 404 },
-        .{ .method = "PUT", .path = "/a-json/a", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/pre42/users", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/preab", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/a/", .status = 404 },
-        .{ .method = "DELETE", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/42/b~x/json/", .status = 404 },
-        .{ .method = "GET", .path = "/ab/b", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/users/txt/preusers", .status = 404 },
-        .{ .method = "DELETE", .path = "/1.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/xyz/ab/c7~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/ab-json/a", .status = 200, .pattern = "/{p0}-{q0}/a", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/b/users~x/", .status = 404 },
-        .{ .method = "DELETE", .path = "/c7~x/c7", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/c7.users/json/b~x", .status = 404 },
-        .{ .method = "GET", .path = "/ajson_1.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/preab/42/prexyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/prea", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/1~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/a-json", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/pre1/a/a/42~x", .status = 404 },
-        .{ .method = "POST", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/a42_xyz.txt/b/v1/ac7_a.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/vab", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/prec7", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/a" },
-        .{ .method = "GET", .pattern = "/{p0}.json/a" },
-        .{ .method = "GET", .pattern = "/a/a-b" },
-        .{ .method = "DELETE", .pattern = "/a/a/{p2}.{q2}" },
-        .{ .method = "GET", .pattern = "/a/pre{p1}/{p2}" },
-        .{ .method = "GET", .pattern = "/b" },
-        .{ .method = "GET", .pattern = "/a-b/" },
-        .{ .method = "DELETE", .pattern = "/v1" },
-        .{ .method = "GET", .pattern = "/x.y/a/v1" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/txt/json/1", .status = 404 },
-        .{ .method = "GET", .path = "/a/prea/c7", .status = 200, .pattern = "/a/pre{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "p2", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/b/txt/ab-1/b-42", .status = 404 },
-        .{ .method = "PUT", .path = "/b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/a.c7/ab/vab/xyz.c7", .status = 404 },
-        .{ .method = "POST", .path = "/a/a-b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/pre1/x.y/1", .status = 404 },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "GET", .path = "/pretxt/42/json/a", .status = 404 },
-        .{ .method = "GET", .path = "/a/preab/users", .status = 200, .pattern = "/a/pre{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "p2", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/ab.users/vxyz", .status = 404 },
-        .{ .method = "GET", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "POST", .path = "/txt/42.a/prejson", .status = 404 },
-        .{ .method = "GET", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
-        .{ .method = "GET", .path = "/vab/preusers/b/b/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/pre42/b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/users.a/users/c7-users/", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/a/v1", .status = 200, .pattern = "/x.y/a/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/txt/pretxt/prejson/json-ab", .status = 404 },
-        .{ .method = "GET", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/prea", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/users~x/42/a~x", .status = 404 },
-        .{ .method = "POST", .path = "/a", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/a/txt~x/c7~x/a~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b/", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/vusers", .status = 404 },
-        .{ .method = "PUT", .path = "/c7.json/a", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/a/vjson/b.json/a.a", .status = 404 },
-        .{ .method = "GET", .path = "/v1", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/xyz~x/pre42", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/a/ab.b", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "ab" },
-            .{ .name = "q2", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/atxt_b.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/a/42.c7", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "42" },
-            .{ .name = "q2", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/json/preb/", .status = 404 },
-        .{ .method = "GET", .path = "/1.json/a", .status = 200, .pattern = "/{p0}.json/a", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/axyz_ab.txt/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/a/json.1", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "json" },
-            .{ .name = "q2", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/aab_xyz.txt/a/ab-xyz", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/a/v1", .status = 200, .pattern = "/x.y/a/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/txt/axyz_xyz.txt", .status = 404 },
-        .{ .method = "GET", .path = "/a/pre1/users", .status = 200, .pattern = "/a/pre{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "p2", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/a42_txt.txt/json-42/", .status = 404 },
-        .{ .method = "GET", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/prejson/json~x/users", .status = 404 },
-        .{ .method = "GET", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/a/txt.1", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "txt" },
-            .{ .name = "q2", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/42.b/b/c7", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/a/xyz.json", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "xyz" },
-            .{ .name = "q2", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/a/1/a-b", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/a-b/pre1/axyz_json.txt", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/a/v1", .status = 200, .pattern = "/x.y/a/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/ab_json.txt/1~x/pretxt", .status = 404 },
-        .{ .method = "POST", .path = "/v1", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/users~x", .status = 404 },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "GET", .path = "/a~x/pre42/1~x/a-42", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/pre{p0}/*" },
-        .{ .method = "POST", .pattern = "/{p0}-{q0}/{p1}.{q1}" },
-        .{ .method = "DELETE", .pattern = "/pre{p0}" },
-        .{ .method = "DELETE", .pattern = "/{p0}-{q0}" },
-        .{ .method = "GET", .pattern = "/x.y/a-b" },
-        .{ .method = "PUT", .pattern = "/a/{p1}-{q1}/{p2}" },
-        .{ .method = "PUT", .pattern = "/{p0}.{q0}" },
-        .{ .method = "POST", .pattern = "/a-b" },
-        .{ .method = "PUT", .pattern = "/users" },
-        .{ .method = "DELETE", .pattern = "/{p0}.{q0}" },
-        .{ .method = "POST", .pattern = "/x.y/x.y" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/ab~x/aab_b.txt/ajson_users.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/42-1/", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/a-b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/42.xyz/txt-json/b~x/users", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/pretxt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/json.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/vjson/", .status = 404 },
-        .{ .method = "POST", .path = "/a.users", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/c7/42~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/prec7", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/aab_42.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "aab_42" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/pre1", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/axyz_txt.txt/preb/json/users", .status = 404 },
-        .{ .method = "PUT", .path = "/a/42-c7/c7", .status = 200, .pattern = "/a/{p1}-{q1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "q1", .value = "c7" },
-            .{ .name = "p2", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/a~x/v42/users", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/b/ajson_a.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/txt-1", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/1/x.y/ausers_xyz.txt/txt.users", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/prea", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/x.y/x.y", .status = 200, .pattern = "/x.y/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/b/users~x/txt-a/a42_a.txt/", .status = 404 },
-        .{ .method = "PUT", .path = "/prexyz/", .status = 200, .pattern = "/pre{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "GET", .path = "/a1_users.txt", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/x.y/x.y", .status = 200, .pattern = "/x.y/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/preab/1/c7~x/a-xyz", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/x.y/a-b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/42-ab", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/x.y/a-b", .status = 200, .pattern = "/x.y/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/c7-txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/preab/b", .status = 200, .pattern = "/pre{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "*", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/a/xyz/users/txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/preab", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/1/42.json", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/x.y", .status = 200, .pattern = "/x.y/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/ab/vab", .status = 404 },
-        .{ .method = "PUT", .path = "/a/json-a/b", .status = 200, .pattern = "/a/{p1}-{q1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "q1", .value = "a" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/txt", .status = 404 },
-        .{ .method = "POST", .path = "/c7-c7/b.a", .status = 200, .pattern = "/{p0}-{q0}/{p1}.{q1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "c7" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "q1", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/1-c7/a-b/v1/1~x", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/x.y", .status = 200, .pattern = "/x.y/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/xyz/a~x/aab_42.txt/txt", .status = 404 },
-        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/b/txt-b/vtxt", .status = 404 },
-        .{ .method = "DELETE", .path = "/b.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/ausers_users.txt/v1", .status = 404 },
-        .{ .method = "PUT", .path = "/a/users-42/1", .status = 200, .pattern = "/a/{p1}-{q1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "q1", .value = "42" },
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/prea/aab_users.txt/", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/preab/vab/c7-42", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/a-c7/json.c7", .status = 200, .pattern = "/{p0}-{q0}/{p1}.{q1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "c7" },
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "q1", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/json/a.b/ab-a/x.y", .status = 404 },
-        .{ .method = "POST", .path = "/prexyz", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/vxyz/prec7", .status = 404 },
-        .{ .method = "PUT", .path = "/a/ab-users/ab", .status = 200, .pattern = "/a/{p1}-{q1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "q1", .value = "users" },
-            .{ .name = "p2", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/vtxt/42-users", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "DELETE", .pattern = "/a-b" },
-        .{ .method = "POST", .pattern = "/pre{p0}/a-b" },
-        .{ .method = "DELETE", .pattern = "/v1/x.y" },
-        .{ .method = "DELETE", .pattern = "/users" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "DELETE", .path = "/v1/x.y", .status = 200, .pattern = "/v1/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/1.xyz/ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1/x.y", .status = 200, .pattern = "/v1/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/users/xyz-users/", .status = 404 },
-        .{ .method = "POST", .path = "/prec7/a-b", .status = 200, .pattern = "/pre{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/pre42/txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/aab_ab.txt/xyz-ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "GET", .path = "/1-txt/json~x/1-users", .status = 404 },
-        .{ .method = "POST", .path = "/pre42/a-b", .status = 200, .pattern = "/pre{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/vtxt/1/a/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/preusers/", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/x.y/a~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "GET", .path = "/json-c7/prec7/ac7_txt.txt/ausers_42.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/xyz-b", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1/x.y", .status = 200, .pattern = "/v1/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/a", .status = 404 },
-        .{ .method = "POST", .path = "/pre1/a-b", .status = 200, .pattern = "/pre{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/b/c7-users", .status = 404 },
-        .{ .method = "POST", .path = "/pretxt/a-b", .status = 200, .pattern = "/pre{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/pre42/vc7/v1", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/txt~x/ab-1/txt~x/", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1/x.y", .status = 200, .pattern = "/v1/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/xyz.42/xyz-json", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/42.a/vc7/aab_xyz.txt/c7.users", .status = 404 },
-        .{ .method = "DELETE", .path = "/prejson/a-b", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "GET", .path = "/ac7_a.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/ajson_ab.txt/json.json", .status = 404 },
-        .{ .method = "POST", .path = "/pre1/a-b", .status = 200, .pattern = "/pre{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/xyz~x/1", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1/x.y", .status = 200, .pattern = "/v1/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/users~x/", .status = 404 },
-        .{ .method = "POST", .path = "/prec7/a-b", .status = 200, .pattern = "/pre{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/b-txt/v42/x.y/a", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/json/preab/ab.json/json", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/c7/a42_42.txt/preusers", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/42", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1/x.y", .status = 200, .pattern = "/v1/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/xyz/1/a/prea", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/c7-42/prexyz/c7-a/a", .status = 404 },
-        .{ .method = "POST", .path = "/pretxt/a-b", .status = 200, .pattern = "/pre{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/a", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/txt/users~x/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/prea/1", .status = 404 },
+        .{ .method = "PUT", .path = "/v1/users/users", .status = 200, .pattern = "/v1/users/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/prejson/ac7_1.txt", .status = 404 },
     } },
     .{ .routes = &.{
         .{ .method = "DELETE", .pattern = "/a" },
-        .{ .method = "POST", .pattern = "/a/{p1}" },
-        .{ .method = "POST", .pattern = "/v1" },
-        .{ .method = "GET", .pattern = "/v1/{p1}" },
-        .{ .method = "GET", .pattern = "/x.y" },
+        .{ .method = "GET", .pattern = "/a/{p1}" },
+        .{ .method = "PUT", .pattern = "/v1" },
+        .{ .method = "POST", .pattern = "/x.y" },
         .{ .method = "DELETE", .pattern = "/x.y/{p1}" },
         .{ .method = "PUT", .pattern = "/{p0}" },
-        .{ .method = "DELETE", .pattern = "/{p0}/{p1}" },
-        .{ .method = "GET", .pattern = "/{p0}.json" },
-        .{ .method = "DELETE", .pattern = "/{p0}.json/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}.{q0}" },
-        .{ .method = "GET", .pattern = "/v{p0}" },
-        .{ .method = "PUT", .pattern = "/v{p0}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0}/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0}.json" },
+        .{ .method = "GET", .pattern = "/{p0}.json/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0}.{q0}" },
+        .{ .method = "DELETE", .pattern = "/v{p0}" },
         .{ .method = "GET", .pattern = "/{p0}-{q0}" },
-        .{ .method = "POST", .pattern = "/{p0}-{q0}/{p1}" },
-        .{ .method = "PUT", .pattern = "/pre{p0}" },
-        .{ .method = "PUT", .pattern = "/pre{p0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/pre{p0}" },
         .{ .method = "PUT", .pattern = "/{p0}~x" },
-        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "PUT", .pattern = "/users/*" },
-        .{ .method = "PUT", .pattern = "/a-b/x.y" },
+        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-z]+}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}.json/{p1}" },
+        .{ .method = "POST", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "POST", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "GET", .pattern = "/a/{p1}.{q1}" },
+        .{ .method = "POST", .pattern = "/b/{p1:[a-c]+}-{q1}/b" },
+        .{ .method = "GET", .pattern = "/a/a-b/*" },
+        .{ .method = "DELETE", .pattern = "/*" },
+        .{ .method = "PUT", .pattern = "/v1/{p1}/v1" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "PUT", .path = "/a/42", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "1" },
         } },
-        .{ .method = "PUT", .path = "/txt~x/x.y/ab", .status = 404 },
-        .{ .method = "PUT", .path = "/prexyz", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/prec7/a-1/txt~x/ac7_a.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/ab-json/txt", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/ab", .status = 405, .allow = &.{
             "DELETE",
-            "POST",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/txt/users", .status = 200, .pattern = "/{p0:[a-z]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/42/vc7", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "42/vc7" },
+        } },
+        .{ .method = "DELETE", .path = "/vtxt", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "GET", .path = "/c7", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/b~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/1-txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "1-txt" },
+        } },
+        .{ .method = "POST", .path = "/c7-c7", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/users/ab-1/xyz~x/1~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/a/b", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "PUT", .path = "/1/ajson_42.txt/vxyz", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/x.y/a", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/xyz.b", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/c7.ab/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/json~x", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/xyz-a/vxyz/prexyz", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/preb", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/users~x", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/ab/b", .status = 200, .pattern = "/{p0:[a-z]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/vjson/42.a/txt.users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/ajson_b.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "b" },
         } },
         .{ .method = "PUT", .path = "/a-b", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "a-b" },
         } },
-        .{ .method = "GET", .path = "/v1/txt", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "txt" },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/json/a42_b.txt/pre42/a42_txt.txt", .status = 405, .allow = &.{
+            "DELETE",
         } },
-        .{ .method = "POST", .path = "/ab.json", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/x.y/a", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/ajson_c7.txt", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/users.json/a", .status = 405, .allow = &.{
             "DELETE",
             "GET",
+        } },
+        .{ .method = "POST", .path = "/xyz.xyz/c7-b/a-b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/ab_ab.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "q0", .value = "ab" },
+        } },
+        .{ .method = "POST", .path = "/xyz.ab/prejson/vjson/preb", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/b/a-c7/b", .status = 200, .pattern = "/b/{p1:[a-c]+}-{q1}/b", .params = &.{
+            .{ .name = "p1", .value = "a" },
+            .{ .name = "q1", .value = "c7" },
+        } },
+        .{ .method = "PUT", .path = "/users.1/42/a.c7", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/vb", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/c7.ab/vb/ab-c7", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/x.y/ab", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "POST", .path = "/users~x/vjson", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/42~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/a-b/vjson", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a-b" },
+            .{ .name = "p1", .value = "vjson" },
+        } },
+        .{ .method = "POST", .path = "/va", .status = 405, .allow = &.{
+            "DELETE",
             "PUT",
+        } },
+        .{ .method = "GET", .path = "/pre1", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/users~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/1", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/b/1-users/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/a/b", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/c7.json", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "c7.json" },
+        } },
+        .{ .method = "DELETE", .path = "/txt~x", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "txt~x" },
+        } },
+        .{ .method = "GET", .path = "/txt.json", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/txt.a/ausers_txt.txt/b/v1", .status = 405, .allow = &.{
+            "DELETE",
         } },
         .{ .method = "DELETE", .path = "/x.y/1", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
             .{ .name = "p1", .value = "1" },
         } },
-        .{ .method = "PUT", .path = "/c7~x/json.b/ajson_1.txt/vab", .status = 404 },
-        .{ .method = "PUT", .path = "/a/42", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
+        .{ .method = "DELETE", .path = "/x.y/v1", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "v1" },
         } },
-        .{ .method = "POST", .path = "/users/json-xyz/json-b", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/v1/a/v1", .status = 200, .pattern = "/v1/{p1}/v1", .params = &.{
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/c7~x/pre1/1", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/vjson", .status = 405, .allow = &.{
+            "DELETE",
             "PUT",
         } },
-        .{ .method = "PUT", .path = "/prea", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
+        .{ .method = "GET", .path = "/va/preusers", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "va" },
+            .{ .name = "p1", .value = "preusers" },
         } },
-        .{ .method = "GET", .path = "/b/xyz~x", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/json.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/pre1/a-b/1~x/a-users", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "PUT", .path = "/xyz.c7/c7-42", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/a42_txt.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/ajson_a.txt/a-b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/txt.json/b", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/aa_txt.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/ab~x/vb/vc7", .status = 404 },
-        .{ .method = "GET", .path = "/vab", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/ab.1/json/b/users", .status = 404 },
-        .{ .method = "PUT", .path = "/users~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/ab/v1/prea/", .status = 404 },
-        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v{p0}", .params = &.{
+        .{ .method = "GET", .path = "/1/json", .status = 200, .pattern = "/{p0:[0-9]+}/{p1}", .params = &.{
             .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "json" },
         } },
-        .{ .method = "POST", .path = "/c7~x", .status = 405, .allow = &.{
-            "PUT",
+        .{ .method = "DELETE", .path = "/pre42/txt.1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "pre42/txt.1" },
         } },
-        .{ .method = "DELETE", .path = "/a42_txt.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/a1_xyz.txt/users-users/42", .status = 404 },
-        .{ .method = "PUT", .path = "/preusers", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/ab.42/axyz_c7.txt/c7~x/1", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/x.y", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/c7/txt/txt/xyz~x/", .status = 404 },
-        .{ .method = "POST", .path = "/b-txt/1", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "txt" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/b.xyz/1~x/vtxt", .status = 404 },
-        .{ .method = "DELETE", .path = "/ab.42", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/xyz.1", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/a-b/x.y", .status = 200, .pattern = "/a-b/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/1", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/c7/a", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/users/ac7_json.txt/ab~x/xyz", .status = 200, .pattern = "/users/*", .params = &.{
-            .{ .name = "*", .value = "ac7_json.txt/ab~x/xyz" },
-        } },
-        .{ .method = "GET", .path = "/txt-c7", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/ab~x/b.a/42-42/ab", .status = 404 },
-        .{ .method = "GET", .path = "/b-c7", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/42-json", .status = 405, .allow = &.{
-            "GET",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/preusers/txt", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/c7-users/txt/axyz_ab.txt/42", .status = 404 },
-        .{ .method = "DELETE", .path = "/42/a", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/atxt_json.txt/a1_b.txt/txt~x", .status = 404 },
-        .{ .method = "PUT", .path = "/prejson/42", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
+        .{ .method = "GET", .path = "/json.json/42", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
             .{ .name = "p0", .value = "json" },
             .{ .name = "p1", .value = "42" },
         } },
-        .{ .method = "GET", .path = "/prejson/a", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/json~x/b", .status = 405, .allow = &.{
             "DELETE",
-            "PUT",
+            "GET",
         } },
-        .{ .method = "PUT", .path = "/txt~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/pretxt/1-42", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/txt-users/42", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "users" },
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/aab_a.txt", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/a-b/42/a/json.txt", .status = 404 },
     } },
     .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/{p0}/{p1}" },
-        .{ .method = "POST", .pattern = "/a/v{p1}/v{p2}" },
+        .{ .method = "DELETE", .pattern = "/{p0}-{q0}/b" },
+        .{ .method = "POST", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "DELETE", .pattern = "/b/a/x.y" },
+        .{ .method = "DELETE", .pattern = "/b/v1" },
+        .{ .method = "DELETE", .pattern = "/b/x.y/{p2}-{q2}/" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}/a/{p2}~x" },
+        .{ .method = "GET", .pattern = "/{p0}" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/txt/a", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+        .{ .method = "GET", .path = "/b/v1", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/axyz_txt.txt/c7.xyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/a-xyz/b", .status = 200, .pattern = "/{p0}-{q0}/b", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/users/ab-users", .status = 404 },
+        .{ .method = "DELETE", .path = "/txt-42/b", .status = 200, .pattern = "/{p0}-{q0}/b", .params = &.{
             .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "a" },
+            .{ .name = "q0", .value = "42" },
         } },
-        .{ .method = "POST", .path = "/axyz_xyz.txt", .status = 404 },
-        .{ .method = "GET", .path = "/42/users", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "users" },
+        .{ .method = "POST", .path = "/x.y/b", .status = 404 },
+        .{ .method = "GET", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
         } },
-        .{ .method = "GET", .path = "/vtxt", .status = 404 },
-        .{ .method = "GET", .path = "/42/ab", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/1/", .status = 404 },
-        .{ .method = "POST", .path = "/a/v1/vxyz", .status = 200, .pattern = "/a/v{p1}/v{p2}", .params = &.{
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "p2", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/a/b.a/json~x", .status = 404 },
-        .{ .method = "POST", .path = "/a/va/vtxt", .status = 200, .pattern = "/a/v{p1}/v{p2}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "p2", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/x.y/users", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/users/users", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+        .{ .method = "DELETE", .path = "/42~x/b", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "users" },
         } },
-        .{ .method = "PUT", .path = "/vc7", .status = 404 },
-        .{ .method = "GET", .path = "/txt/ab", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/ab/axyz_b.txt/txt.xyz/vjson", .status = 404 },
-        .{ .method = "POST", .path = "/a/va/vab", .status = 200, .pattern = "/a/v{p1}/v{p2}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "p2", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/a/a1_c7.txt/vtxt/v1/", .status = 404 },
-        .{ .method = "GET", .path = "/c7/ab", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/json-xyz/a42_ab.txt/a1_users.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a/va/v1", .status = 200, .pattern = "/a/v{p1}/v{p2}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/42~x/users", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/a/vb/vab", .status = 200, .pattern = "/a/v{p1}/v{p2}", .params = &.{
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "p2", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/42~x/x.y/b-json/txt.ab", .status = 404 },
-        .{ .method = "GET", .path = "/users/json", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/a/users~x", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/a/vb/v42", .status = 200, .pattern = "/a/v{p1}/v{p2}", .params = &.{
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "POST", .path = "/ab", .status = 404 },
-        .{ .method = "POST", .path = "/a/vjson/v42", .status = 200, .pattern = "/a/v{p1}/v{p2}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/ausers_txt.txt/a.b/", .status = 404 },
-        .{ .method = "GET", .path = "/ab/ab", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+        .{ .method = "POST", .path = "/ab", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
             .{ .name = "p0", .value = "ab" },
-            .{ .name = "p1", .value = "ab" },
         } },
-        .{ .method = "DELETE", .path = "/json-b", .status = 404 },
-        .{ .method = "POST", .path = "/a/vc7/vtxt", .status = 200, .pattern = "/a/v{p1}/v{p2}", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "p2", .value = "txt" },
+        .{ .method = "POST", .path = "/c7-json/b", .status = 405, .allow = &.{
+            "DELETE",
         } },
-        .{ .method = "DELETE", .path = "/txt/1/", .status = 404 },
-        .{ .method = "POST", .path = "/a/vxyz/vjson", .status = 200, .pattern = "/a/v{p1}/v{p2}", .params = &.{
+        .{ .method = "PUT", .path = "/vab/c7~x/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/v1", .status = 200, .pattern = "/b/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/vab/pretxt/a-b/ausers_a.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/a/x.y", .status = 200, .pattern = "/b/a/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/c7-b/users/1-b/json-b", .status = 404 },
+        .{ .method = "DELETE", .path = "/xyz-txt/b", .status = 200, .pattern = "/{p0}-{q0}/b", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/json", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "GET", .path = "/1-1/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/json/users.txt/users/vc7", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/x.y/c7-b/", .status = 200, .pattern = "/b/x.y/{p2}-{q2}", .params = &.{
+            .{ .name = "p2", .value = "c7" },
+            .{ .name = "q2", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/a/txt/pretxt/txt.users", .status = 404 },
+        .{ .method = "POST", .path = "/b/a/xyz~x", .status = 404 },
+        .{ .method = "POST", .path = "/b/va", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/v1", .status = 200, .pattern = "/b/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/ab", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/b/a/x.y", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/a-b/vusers/users-xyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/v1", .status = 200, .pattern = "/b/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/users/x.y/ab~x", .status = 404 },
+        .{ .method = "POST", .path = "/json", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/json~x", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/ab", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/vab/vjson/prexyz/users.c7", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/v1", .status = 200, .pattern = "/b/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/1~x/ab~x/b.42", .status = 404 },
+        .{ .method = "POST", .path = "/xyz", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/xyz-users/preab/ab_a.txt", .status = 404 },
+        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "PUT", .path = "/prejson/1~x/aab_json.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/json/a/c7~x", .status = 404 },
+        .{ .method = "PUT", .path = "/ab/va/a", .status = 404 },
+        .{ .method = "GET", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "PUT", .path = "/x.y/prejson/users-txt/a/", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/a/x.y", .status = 200, .pattern = "/b/a/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/vjson/users/b/users-ab", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/x.y/ab-42/", .status = 200, .pattern = "/b/x.y/{p2}-{q2}", .params = &.{
+            .{ .name = "p2", .value = "ab" },
+            .{ .name = "q2", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/c7/preab/ac7_txt.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/xyz/a/42~x", .status = 404 },
+        .{ .method = "GET", .path = "/prejson/c7~x/", .status = 404 },
+        .{ .method = "POST", .path = "/xyz", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/a1_xyz.txt/a", .status = 404 },
+        .{ .method = "GET", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/a", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/b/a/b~x", .status = 404 },
+        .{ .method = "POST", .path = "/users/b", .status = 404 },
+        .{ .method = "POST", .path = "/json", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "DELETE", .path = "/c7/txt.c7/v1/txt", .status = 404 },
+        .{ .method = "PUT", .path = "/xyz/a/txt~x", .status = 404 },
+        .{ .method = "POST", .path = "/v42/pre1/users/txt", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "POST", .pattern = "/{p0}~x/v1/a" },
+        .{ .method = "DELETE", .pattern = "/{p0}-{q0}/a{p1}_{q1}.txt/" },
+        .{ .method = "DELETE", .pattern = "/a" },
+        .{ .method = "GET", .pattern = "/users" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}/a{p1}_{q1}.txt" },
+        .{ .method = "PUT", .pattern = "/{p0}/x.y" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "POST", .path = "/1/axyz_42.txt", .status = 200, .pattern = "/{p0:[0-9]+}/a{p1}_{q1}.txt", .params = &.{
+            .{ .name = "p0", .value = "1" },
             .{ .name = "p1", .value = "xyz" },
-            .{ .name = "p2", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/txt-users/", .status = 404 },
-        .{ .method = "DELETE", .path = "/42/a", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/axyz_txt.txt/42.b/users~x/a~x", .status = 404 },
-        .{ .method = "POST", .path = "/json/42", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/users/users~x/users/", .status = 404 },
-        .{ .method = "GET", .path = "/users/1", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/ajson_xyz.txt/pretxt", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/a/vusers/v42", .status = 200, .pattern = "/a/v{p1}/v{p2}", .params = &.{
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/xyz/c7~x", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "c7~x" },
-        } },
-        .{ .method = "POST", .path = "/a/v1/vb", .status = 200, .pattern = "/a/v{p1}/v{p2}", .params = &.{
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/42/vab", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/xyz/a", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/json/prejson/", .status = 404 },
-        .{ .method = "DELETE", .path = "/json/ab", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/pretxt", .status = 404 },
-        .{ .method = "GET", .path = "/json/c7", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/xyz.1/vtxt", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz.1" },
-            .{ .name = "p1", .value = "vtxt" },
-        } },
-        .{ .method = "GET", .path = "/1/a", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/a/users/a/va", .status = 404 },
-        .{ .method = "POST", .path = "/a/vtxt/vb", .status = 200, .pattern = "/a/v{p1}/v{p2}", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/atxt_1.txt/b/b/1~x", .status = 404 },
-        .{ .method = "POST", .path = "/1/json", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/ab.ab", .status = 404 },
-        .{ .method = "PUT", .path = "/a/vtxt/vc7", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/v1/txt/x.y", .status = 404 },
-        .{ .method = "POST", .path = "/ab/42", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/xyz/b/a.json/c7-1", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt/v1" },
-        .{ .method = "PUT", .pattern = "/{p0}~x/pre{p1}" },
-        .{ .method = "PUT", .pattern = "/a" },
-        .{ .method = "POST", .pattern = "/v1/{p1}/users" },
-        .{ .method = "DELETE", .pattern = "/users" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/v1/1/users", .status = 200, .pattern = "/v1/{p1}/users", .params = &.{
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/b-ab/c7~x/42~x", .status = 404 },
-        .{ .method = "PUT", .path = "/b~x/pre42", .status = 200, .pattern = "/{p0}~x/pre{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/txt.42/prec7", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/txt-users/preab/v1", .status = 404 },
-        .{ .method = "PUT", .path = "/aab_c7.txt/v1", .status = 200, .pattern = "/a{p0}_{q0}.txt/v1", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/txt.c7/b/aa_42.txt/axyz_txt.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/b~x", .status = 404 },
-        .{ .method = "POST", .path = "/v1/a/users", .status = 200, .pattern = "/v1/{p1}/users", .params = &.{
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/txt~x", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/42/users", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/vtxt", .status = 404 },
-        .{ .method = "GET", .path = "/users", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/users-txt/users/ajson_c7.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/json~x/pre1", .status = 200, .pattern = "/{p0}~x/pre{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/aa_xyz.txt/", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/json.txt/json~x/prec7/va", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/xyz.a/c7~x/aa_b.txt", .status = 404 },
-        .{ .method = "GET", .path = "/ab_a.txt/v1", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/a~x/ab/b-users", .status = 404 },
-        .{ .method = "PUT", .path = "/ab_txt.txt/v1", .status = 200, .pattern = "/a{p0}_{q0}.txt/v1", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/preab/json-json", .status = 404 },
-        .{ .method = "PUT", .path = "/a42_1.txt/v1", .status = 200, .pattern = "/a{p0}_{q0}.txt/v1", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/txt.a/txt~x/", .status = 404 },
-        .{ .method = "PUT", .path = "/aab_c7.txt/v1", .status = 200, .pattern = "/a{p0}_{q0}.txt/v1", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/x.y", .status = 404 },
-        .{ .method = "PUT", .path = "/ac7_ab.txt/v1", .status = 200, .pattern = "/a{p0}_{q0}.txt/v1", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/ab-txt/preb/b/42.b", .status = 404 },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "PUT", .path = "/a/va/a-b/a/", .status = 404 },
-        .{ .method = "POST", .path = "/v1/ab/users", .status = 200, .pattern = "/v1/{p1}/users", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/b/a/42-json/prea", .status = 404 },
-        .{ .method = "PUT", .path = "/txt~x/pre42", .status = 200, .pattern = "/{p0}~x/pre{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "POST", .path = "/42-txt", .status = 404 },
-        .{ .method = "PUT", .path = "/ab~x/prec7", .status = 200, .pattern = "/{p0}~x/pre{p1}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/42/xyz.c7/va/xyz~x", .status = 404 },
-        .{ .method = "PUT", .path = "/1~x/prec7", .status = 200, .pattern = "/{p0}~x/pre{p1}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/c7-b", .status = 404 },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "PUT", .path = "/txt-xyz/preb", .status = 404 },
-        .{ .method = "PUT", .path = "/atxt_1.txt/v1", .status = 200, .pattern = "/a{p0}_{q0}.txt/v1", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/xyz~x/ausers_json.txt/v1", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/users", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/v1/1/users", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/users/vusers/aab_txt.txt/v1", .status = 404 },
-        .{ .method = "DELETE", .path = "/b~x/prec7", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/preb/prejson/a42_ab.txt/1.xyz", .status = 404 },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "POST", .path = "/v42/axyz_1.txt/a/txt/", .status = 404 },
-        .{ .method = "POST", .path = "/a", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/vusers/axyz_1.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/txt/a~x/a-xyz/users", .status = 404 },
-        .{ .method = "PUT", .path = "/atxt_users.txt/v1", .status = 200, .pattern = "/a{p0}_{q0}.txt/v1", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/a~x/users/", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "DELETE", .pattern = "/{p0}.json/{p1}-{q1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}~x/a{p1}_{q1}.txt/x.y/" },
-        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "GET", .pattern = "/{p0}/a-b" },
-        .{ .method = "DELETE", .pattern = "/a/v{p1}/x.y" },
-        .{ .method = "DELETE", .pattern = "/{p0}" },
-        .{ .method = "DELETE", .pattern = "/{p0}-{q0}/pre{p1}/a" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/users/a-b", .status = 200, .pattern = "/{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/axyz_txt.txt/json.42/pre1/1~x", .status = 404 },
-        .{ .method = "POST", .path = "/ac7_a.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/xyz~x/c7.ab/pretxt", .status = 404 },
-        .{ .method = "GET", .path = "/txt~x/a1_json.txt/x.y/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/a/1/aa_txt.txt", .status = 404 },
-        .{ .method = "POST", .path = "/json~x/axyz_txt.txt/x.y/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/b~x/a-c7/json.users/v42", .status = 404 },
-        .{ .method = "DELETE", .path = "/json.json/b-c7", .status = 200, .pattern = "/{p0}.json/{p1}-{q1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "q1", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/users~x/atxt_xyz.txt/ab/", .status = 404 },
-        .{ .method = "POST", .path = "/axyz_a.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/vxyz/pretxt", .status = 404 },
-        .{ .method = "GET", .path = "/ab/a-b", .status = 200, .pattern = "/{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/42.1/1.b/ausers_b.txt/ab", .status = 404 },
-        .{ .method = "POST", .path = "/aab_txt.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/1/users.users/ab~x/users-users", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/vjson/x.y", .status = 200, .pattern = "/a/v{p1}/x.y", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/x.y/json.json/preusers/json", .status = 404 },
-        .{ .method = "PUT", .path = "/a1_ab.txt", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/xyz-1/preab", .status = 404 },
-        .{ .method = "GET", .path = "/b/a-b", .status = 200, .pattern = "/{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/vusers/b.xyz/xyz/a-a", .status = 404 },
-        .{ .method = "GET", .path = "/1-b/pre42/a", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/c7~x/users.a/b/", .status = 404 },
-        .{ .method = "POST", .path = "/a/vtxt/x.y", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/1/va/c7-users/json~x/", .status = 404 },
-        .{ .method = "POST", .path = "/ac7_42.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/b/1~x/vc7/users", .status = 404 },
-        .{ .method = "PUT", .path = "/ab/a-b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/xyz.ab/json~x/va/a1_txt.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/vjson/x.y", .status = 200, .pattern = "/a/v{p1}/x.y", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/a~x/b/a", .status = 404 },
-        .{ .method = "DELETE", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/1-a/ab-ab", .status = 404 },
-        .{ .method = "POST", .path = "/ab_a.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/axyz_42.txt", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "axyz_42.txt" },
-        } },
-        .{ .method = "GET", .path = "/ab/a-b", .status = 200, .pattern = "/{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/a.ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a.ab" },
-        } },
-        .{ .method = "POST", .path = "/atxt_c7.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/pretxt/a/txt/x.y/", .status = 404 },
-        .{ .method = "DELETE", .path = "/json.json/ab-txt", .status = 200, .pattern = "/{p0}.json/{p1}-{q1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "q1", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/a-ab/users/vtxt", .status = 404 },
-        .{ .method = "DELETE", .path = "/json~x/a42_a.txt/x.y/", .status = 200, .pattern = "/{p0}~x/a{p1}_{q1}.txt/x.y", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "q1", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/prea/xyz-c7/1", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/vab/x.y", .status = 200, .pattern = "/a/v{p1}/x.y", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/users", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/a1_txt.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/b.xyz/pre42/ab-b", .status = 404 },
-        .{ .method = "POST", .path = "/aa_ab.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/txt-c7", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt-c7" },
-        } },
-        .{ .method = "POST", .path = "/aab_users.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/xyz-42/users/ausers_xyz.txt/a1_txt.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/users/preab", .status = 404 },
-        .{ .method = "DELETE", .path = "/c7~x/atxt_42.txt/x.y/", .status = 200, .pattern = "/{p0}~x/a{p1}_{q1}.txt/x.y", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "txt" },
             .{ .name = "q1", .value = "42" },
         } },
-        .{ .method = "DELETE", .path = "/a42_b.txt/preusers/vb/va", .status = 404 },
-        .{ .method = "POST", .path = "/ac7_json.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/a-b/aa_ab.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/ausers_a.txt", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ausers_a.txt" },
-        } },
-        .{ .method = "DELETE", .path = "/v1/a1_xyz.txt/", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/a" },
-        .{ .method = "POST", .pattern = "/v1" },
-        .{ .method = "DELETE", .pattern = "/v1/{p1}" },
-        .{ .method = "GET", .pattern = "/x.y" },
-        .{ .method = "PUT", .pattern = "/{p0}" },
-        .{ .method = "POST", .pattern = "/{p0}/{p1}" },
-        .{ .method = "GET", .pattern = "/{p0}.json" },
-        .{ .method = "DELETE", .pattern = "/{p0}.json/{p1}" },
-        .{ .method = "POST", .pattern = "/{p0}.{q0}" },
-        .{ .method = "POST", .pattern = "/v{p0}" },
-        .{ .method = "GET", .pattern = "/v{p0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}-{q0}" },
-        .{ .method = "GET", .pattern = "/pre{p0}" },
-        .{ .method = "DELETE", .pattern = "/pre{p0}/{p1}" },
-        .{ .method = "GET", .pattern = "/{p0}~x" },
-        .{ .method = "PUT", .pattern = "/{p0}~x/{p1}" },
-        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "DELETE", .pattern = "/{p0}-{q0}/b/a-b" },
-        .{ .method = "DELETE", .pattern = "/a-b/x.y/{p2}" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/txt/1/", .status = 404 },
-        .{ .method = "DELETE", .path = "/txt.json/txt", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/txt-ab", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/a/json", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/1", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/a-42", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/prea/a/1", .status = 404 },
-        .{ .method = "PUT", .path = "/xyz~x/a", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
+        .{ .method = "GET", .path = "/a-b/c7-json/ab-xyz", .status = 404 },
+        .{ .method = "POST", .path = "/42~x/v1/a", .status = 200, .pattern = "/{p0}~x/v1/a", .params = &.{
             .{ .name = "p0", .value = "42" },
         } },
-        .{ .method = "GET", .path = "/prejson", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/preab/a~x", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/users/b", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+        .{ .method = "PUT", .path = "/pretxt/pre1", .status = 404 },
+        .{ .method = "DELETE", .path = "/users-a/a1_42.txt/", .status = 200, .pattern = "/{p0}-{q0}/a{p1}_{q1}.txt", .params = &.{
             .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "b" },
+            .{ .name = "q0", .value = "a" },
+            .{ .name = "p1", .value = "1" },
+            .{ .name = "q1", .value = "42" },
         } },
-        .{ .method = "DELETE", .path = "/ab/a1_42.txt/c7~x", .status = 404 },
-        .{ .method = "PUT", .path = "/c7~x/42", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/prejson/ab~x/vusers", .status = 404 },
-        .{ .method = "POST", .path = "/42/txt", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/vb", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "vb" },
-        } },
-        .{ .method = "PUT", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/x.y/vc7/", .status = 404 },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/users/vusers/c7.xyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/ajson_1.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+        .{ .method = "GET", .path = "/a1_ab.txt/json/prejson/c7", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/aab_json.txt/a1_users.txt/b/va", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "GET", .path = "/atxt_a.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/json/x.y", .status = 200, .pattern = "/{p0}/x.y", .params = &.{
             .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "1" },
         } },
-        .{ .method = "PUT", .path = "/c7-1/json~x/c7-txt/prexyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1/b", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "b" },
+        .{ .method = "POST", .path = "/42-c7/b", .status = 404 },
+        .{ .method = "POST", .path = "/txt~x/v1/a", .status = 200, .pattern = "/{p0}~x/v1/a", .params = &.{
+            .{ .name = "p0", .value = "txt" },
         } },
-        .{ .method = "GET", .path = "/preab", .status = 200, .pattern = "/pre{p0}", .params = &.{
+        .{ .method = "POST", .path = "/xyz/a1_c7.txt/", .status = 404 },
+        .{ .method = "POST", .path = "/json/aa_a.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/ab~x", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "GET", .path = "/a/vjson/", .status = 404 },
+        .{ .method = "POST", .path = "/users/a42_ab.txt", .status = 404 },
+        .{ .method = "GET", .path = "/users-json/txt", .status = 404 },
+        .{ .method = "POST", .path = "/json~x/v1/a", .status = 200, .pattern = "/{p0}~x/v1/a", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "GET", .path = "/pre42/c7/a-b/42", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/ab.42/a", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "POST", .path = "/json", .status = 404 },
+        .{ .method = "POST", .path = "/ab~x/v1/a", .status = 200, .pattern = "/{p0}~x/v1/a", .params = &.{
             .{ .name = "p0", .value = "ab" },
         } },
-        .{ .method = "DELETE", .path = "/users/json", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/c7~x/pre1/users", .status = 404 },
+        .{ .method = "PUT", .path = "/1~x/v1/a", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "DELETE", .path = "/vtxt", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/users~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+        .{ .method = "DELETE", .path = "/vjson/42-users/ab~x", .status = 404 },
+        .{ .method = "POST", .path = "/users~x/v1/a", .status = 200, .pattern = "/{p0}~x/v1/a", .params = &.{
             .{ .name = "p0", .value = "users" },
         } },
-        .{ .method = "GET", .path = "/b-42", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/b~x/va/", .status = 404 },
+        .{ .method = "GET", .path = "/b-42/ajson_a.txt/", .status = 405, .allow = &.{
             "DELETE",
-            "PUT",
         } },
-        .{ .method = "DELETE", .path = "/b-txt/b/a-b", .status = 200, .pattern = "/{p0}-{q0}/b/a-b", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "txt" },
+        .{ .method = "POST", .path = "/ab/xyz/vb/users-a", .status = 404 },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/ab-txt", .status = 404 },
+        .{ .method = "PUT", .path = "/users", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "PUT", .path = "/b/xyz/aab_42.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/txt~x/a", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "a" },
+        .{ .method = "PUT", .path = "/users-c7", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "POST", .path = "/ab_1.txt/1.json/prec7", .status = 404 },
-        .{ .method = "GET", .path = "/v42/json", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+        .{ .method = "DELETE", .path = "/a/txt-c7", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "POST", .path = "/42~x/pretxt/a42_c7.txt/prexyz", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/c7/1-xyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/users~x/v1/a", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/ab", .status = 404 },
+        .{ .method = "GET", .path = "/42~x/v1/a", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/ab-xyz/ab/users/vusers", .status = 404 },
+        .{ .method = "POST", .path = "/42~x/v1/a", .status = 200, .pattern = "/{p0}~x/v1/a", .params = &.{
             .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "json" },
         } },
-        .{ .method = "POST", .path = "/1-json", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/json", .status = 404 },
+        .{ .method = "DELETE", .path = "/json-a/a42_42.txt/", .status = 200, .pattern = "/{p0}-{q0}/a{p1}_{q1}.txt", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "a" },
+            .{ .name = "p1", .value = "42" },
+            .{ .name = "q1", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/xyz~x/ab~x/a/v1", .status = 404 },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "GET", .path = "/prec7", .status = 404 },
+        .{ .method = "POST", .path = "/ab~x/v1/a", .status = 200, .pattern = "/{p0}~x/v1/a", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "POST", .path = "/ab_xyz.txt", .status = 404 },
+        .{ .method = "POST", .path = "/a~x/v1/a", .status = 200, .pattern = "/{p0}~x/v1/a", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/json~x/vb/1/prec7", .status = 404 },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/ab.json/a/preab/c7", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "GET", .pattern = "/a-b" },
+        .{ .method = "POST", .pattern = "/a" },
+        .{ .method = "DELETE", .pattern = "/{p0}/v1/x.y" },
+        .{ .method = "POST", .pattern = "/x.y/*" },
+        .{ .method = "GET", .pattern = "/v1/{p1:[a-c]+}-{q1}/" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/v1/ab-b/", .status = 200, .pattern = "/v1/{p1:[a-c]+}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+            .{ .name = "q1", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/b/txt.42/vb/b", .status = 404 },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "GET", .path = "/a.a", .status = 404 },
+        .{ .method = "GET", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/a", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/42/v1/x.y", .status = 200, .pattern = "/{p0}/v1/x.y", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/json-a/v1/42~x/txt", .status = 404 },
+        .{ .method = "GET", .path = "/v1/json-ab/", .status = 404 },
+        .{ .method = "GET", .path = "/prexyz/json-json/ab_txt.txt", .status = 404 },
+        .{ .method = "GET", .path = "/v1/1-users/", .status = 404 },
+        .{ .method = "POST", .path = "/1.1/atxt_users.txt/prejson/aa_b.txt", .status = 404 },
+        .{ .method = "GET", .path = "/v1/users-c7/", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/42", .status = 200, .pattern = "/x.y/*", .params = &.{
+            .{ .name = "*", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/v1/a-json/", .status = 200, .pattern = "/v1/{p1:[a-c]+}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+            .{ .name = "q1", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/pre1/b/preusers/xyz~x", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/", .status = 200, .pattern = "/x.y/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "DELETE", .path = "/1.42/1-42/b", .status = 404 },
+        .{ .method = "GET", .path = "/v1/1-1/", .status = 404 },
+        .{ .method = "GET", .path = "/users/1~x", .status = 404 },
+        .{ .method = "GET", .path = "/a", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/b-users/pre1", .status = 404 },
+        .{ .method = "GET", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "PUT", .path = "/json", .status = 404 },
+        .{ .method = "GET", .path = "/v1/ab-a/", .status = 200, .pattern = "/v1/{p1:[a-c]+}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+            .{ .name = "q1", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/a-b/json.42", .status = 404 },
+        .{ .method = "POST", .path = "/v1/c7-1/", .status = 404 },
+        .{ .method = "GET", .path = "/ajson_txt.txt", .status = 404 },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "POST", .path = "/vusers", .status = 404 },
+        .{ .method = "GET", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "GET", .path = "/txt.users/users", .status = 404 },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/txt.users/v1/c7/", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/", .status = 200, .pattern = "/x.y/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "POST", .path = "/b", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/v1/x.y", .status = 200, .pattern = "/{p0}/v1/x.y", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/b", .status = 404 },
+        .{ .method = "GET", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "GET", .path = "/42-42/b/a/prejson", .status = 404 },
+        .{ .method = "DELETE", .path = "/txt/v1/x.y", .status = 200, .pattern = "/{p0}/v1/x.y", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "GET", .path = "/users~x/users-users/ab/v1/", .status = 404 },
+        .{ .method = "GET", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "POST", .path = "/json-a", .status = 404 },
+        .{ .method = "PUT", .path = "/b/v1/x.y", .status = 405, .allow = &.{
             "DELETE",
-            "PUT",
         } },
-        .{ .method = "GET", .path = "/c7~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+        .{ .method = "GET", .path = "/a", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/v1/txt-txt/", .status = 404 },
+        .{ .method = "DELETE", .path = "/a.42/ab/axyz_txt.txt", .status = 404 },
+        .{ .method = "POST", .path = "/a-b", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/txt/c7~x/v1/txt-1/", .status = 404 },
+        .{ .method = "GET", .path = "/v1/json-b/", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/users", .status = 404 },
+        .{ .method = "GET", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "POST", .path = "/pre42/axyz_42.txt/ab.ab", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a-b", .status = 200, .pattern = "/x.y/*", .params = &.{
+            .{ .name = "*", .value = "a-b" },
+        } },
+        .{ .method = "GET", .path = "/prejson/users~x/xyz.c7", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/txt/b.1", .status = 200, .pattern = "/x.y/*", .params = &.{
+            .{ .name = "*", .value = "txt/b.1" },
+        } },
+        .{ .method = "PUT", .path = "/aab_txt.txt/", .status = 404 },
+        .{ .method = "GET", .path = "/v1/ab-a/", .status = 200, .pattern = "/v1/{p1:[a-c]+}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+            .{ .name = "q1", .value = "a" },
+        } },
+        .{ .method = "DELETE", .path = "/ab", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "GET", .pattern = "/a" },
+        .{ .method = "GET", .pattern = "/a/{p1}" },
+        .{ .method = "PUT", .pattern = "/v1" },
+        .{ .method = "GET", .pattern = "/v1/{p1}" },
+        .{ .method = "PUT", .pattern = "/x.y" },
+        .{ .method = "POST", .pattern = "/{p0}" },
+        .{ .method = "GET", .pattern = "/{p0}/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0}.json" },
+        .{ .method = "GET", .pattern = "/{p0}.json/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0}.{q0}" },
+        .{ .method = "GET", .pattern = "/{p0}.{q0}/{p1}" },
+        .{ .method = "POST", .pattern = "/v{p0}" },
+        .{ .method = "PUT", .pattern = "/{p0}-{q0}" },
+        .{ .method = "GET", .pattern = "/pre{p0}" },
+        .{ .method = "GET", .pattern = "/pre{p0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0}~x" },
+        .{ .method = "POST", .pattern = "/{p0}~x/{p1}" },
+        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "POST", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "PUT", .pattern = "/{p0}/users" },
+        .{ .method = "POST", .pattern = "/x.y/a/{p2}" },
+        .{ .method = "DELETE", .pattern = "/a/users/" },
+        .{ .method = "GET", .pattern = "/a/x.y/a" },
+        .{ .method = "POST", .pattern = "/v1/" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/a/42", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/ab-txt/b", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab-txt" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/c7.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
             .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "PUT", .path = "/v1/aa_xyz.txt/xyz/42-txt", .status = 404 },
-        .{ .method = "GET", .path = "/users.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "users" },
+        .{ .method = "DELETE", .path = "/axyz_1.txt/b/vjson/42.ab/", .status = 404 },
+        .{ .method = "POST", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/b-xyz/", .status = 404 },
+        .{ .method = "DELETE", .path = "/va", .status = 405, .allow = &.{
+            "GET",
+            "POST",
         } },
-        .{ .method = "POST", .path = "/42~x", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/vc7/ab", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "vc7" },
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "POST", .path = "/v42", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/v1/xyz/", .status = 404 },
+        .{ .method = "DELETE", .path = "/a~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/a-b/c7.xyz/v1", .status = 404 },
+        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/ausers_42.txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "ausers_42.txt" },
+        } },
+        .{ .method = "DELETE", .path = "/x.y", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/users/users", .status = 405, .allow = &.{
             "GET",
             "PUT",
         } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/c7/b/users/va", .status = 404 },
-        .{ .method = "GET", .path = "/1~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/vab/ausers_b.txt/a-c7/preusers/", .status = 404 },
-        .{ .method = "PUT", .path = "/txt~x/42", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/vusers", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/xyz.json", .status = 405, .allow = &.{
             "POST",
             "PUT",
         } },
-        .{ .method = "GET", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/users/42", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "42" },
+        .{ .method = "POST", .path = "/x.y/json-xyz/b", .status = 404 },
+        .{ .method = "PUT", .path = "/c7.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "q0", .value = "txt" },
         } },
-        .{ .method = "GET", .path = "/a-b/x.y/c7", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/42.txt/users/txt~x/b~x/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b/x.y/c7", .status = 200, .pattern = "/a-b/x.y/{p2}", .params = &.{
-            .{ .name = "p2", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/va/vab/1.ab/txt.1", .status = 404 },
-        .{ .method = "PUT", .path = "/ab.json", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab.json" },
-        } },
-        .{ .method = "POST", .path = "/xyz-42/aa_1.txt/42/txt.json", .status = 404 },
-        .{ .method = "PUT", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/preab/xyz-users", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/txt~x", .status = 405, .allow = &.{
             "DELETE",
             "POST",
         } },
         .{ .method = "POST", .path = "/vb", .status = 200, .pattern = "/v{p0}", .params = &.{
             .{ .name = "p0", .value = "b" },
         } },
-        .{ .method = "DELETE", .path = "/1-json", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/c7-users/b/a-b", .status = 200, .pattern = "/{p0}-{q0}/b/a-b", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "POST", .pattern = "/{p0}/a/v{p2}/" },
-        .{ .method = "POST", .pattern = "/{p0}" },
-        .{ .method = "PUT", .pattern = "/*" },
-        .{ .method = "POST", .pattern = "/v1" },
-        .{ .method = "GET", .pattern = "/a-b/{p1}/" },
-        .{ .method = "DELETE", .pattern = "/a/v{p1}/{p2}" },
-        .{ .method = "GET", .pattern = "/x.y/{p1}~x/a{p2}_{q2}.txt" },
-        .{ .method = "DELETE", .pattern = "/b/{p1}-{q1}/pre{p2}" },
-        .{ .method = "GET", .pattern = "/a/a/{p2}-{q2}" },
-        .{ .method = "POST", .pattern = "/x.y/{p1}-{q1}" },
-        .{ .method = "DELETE", .pattern = "/x.y/b/{p2}/" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/b/c7-a/prejson", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/a~x", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a~x" },
-        } },
-        .{ .method = "GET", .path = "/b/42-42/pretxt", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/pre42/ab_a.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/b/a/vxyz/", .status = 200, .pattern = "/{p0}/a/v{p2}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p2", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/xyz-xyz/ab_txt.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/a/vjson/1", .status = 200, .pattern = "/a/v{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/xyz~x/json-ab", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/x.y/json-c7", .status = 200, .pattern = "/x.y/{p1}-{q1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "q1", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/b", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/users/a/vjson/", .status = 200, .pattern = "/{p0}/a/v{p2}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p2", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/ac7_xyz.txt/txt~x/xyz-a/users", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/x.y/ab-txt", .status = 200, .pattern = "/x.y/{p1}-{q1}", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "q1", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/xyz.c7", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz.c7" },
-        } },
-        .{ .method = "POST", .path = "/b/a/va/", .status = 200, .pattern = "/{p0}/a/v{p2}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p2", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/a-b/c7.users/txt/v1", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/42/a/vusers/", .status = 200, .pattern = "/{p0}/a/v{p2}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p2", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/ab~x", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "ab~x" },
-        } },
-        .{ .method = "DELETE", .path = "/a/vc7/txt", .status = 200, .pattern = "/a/v{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "p2", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/xyz/c7~x/txt", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "xyz/c7~x/txt" },
-        } },
-        .{ .method = "DELETE", .path = "/a/vjson/json", .status = 200, .pattern = "/a/v{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "p2", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/a1_c7.txt/va/", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/x.y/users~x/ausers_ab.txt", .status = 200, .pattern = "/x.y/{p1}~x/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "p2", .value = "users" },
-            .{ .name = "q2", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/txt-a/json.json/ab", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "txt-a/json.json/ab" },
-        } },
-        .{ .method = "GET", .path = "/a/a/42-b", .status = 200, .pattern = "/a/a/{p2}-{q2}", .params = &.{
-            .{ .name = "p2", .value = "42" },
-            .{ .name = "q2", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/vb/preusers/42-a", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "GET", .path = "/xyz~x/json-a", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/a/v42/42", .status = 200, .pattern = "/a/v{p1}/{p2}", .params = &.{
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/xyz/c7~x/users", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "xyz/c7~x/users" },
-        } },
-        .{ .method = "DELETE", .path = "/x.y/b/c7/", .status = 200, .pattern = "/x.y/b/{p2}", .params = &.{
-            .{ .name = "p2", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/users-c7", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/a-b/xyz/", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/vb", .status = 405, .allow = &.{
             "GET",
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/a~x/42-ab/42-users", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/x.y/a~x/ausers_xyz.txt", .status = 200, .pattern = "/x.y/{p1}~x/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "p2", .value = "users" },
-            .{ .name = "q2", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/a42_txt.txt/a1_a.txt/ausers_json.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/b/xyz-txt/pretxt", .status = 200, .pattern = "/b/{p1}-{q1}/pre{p2}", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
-            .{ .name = "q1", .value = "txt" },
-            .{ .name = "p2", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/xyz~x/42-b/axyz_b.txt", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "xyz~x/42-b/axyz_b.txt" },
-        } },
-        .{ .method = "PUT", .path = "/a/a/vc7/", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "a/a/vc7/" },
-        } },
-        .{ .method = "DELETE", .path = "/json", .status = 405, .allow = &.{
             "POST",
-            "PUT",
         } },
-        .{ .method = "DELETE", .path = "/xyz~x/b", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/xyz/a/txt/users-a", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/b/txt-txt/prea", .status = 200, .pattern = "/b/{p1}-{q1}/pre{p2}", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "q1", .value = "txt" },
-            .{ .name = "p2", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/json.json/", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/x.y/c7-a", .status = 200, .pattern = "/x.y/{p1}-{q1}", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "q1", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/a/va", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/txt/prejson/42", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/x.y/json-txt", .status = 200, .pattern = "/x.y/{p1}-{q1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "q1", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/vxyz/txt.b/v42", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "vxyz/txt.b/v42" },
-        } },
-        .{ .method = "POST", .path = "/x.y/xyz-b", .status = 200, .pattern = "/x.y/{p1}-{q1}", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
-            .{ .name = "q1", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/xyz.b", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/x.y/42-xyz", .status = 200, .pattern = "/x.y/{p1}-{q1}", .params = &.{
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "q1", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/users-txt/b-42/a~x", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/txt~x/json/c7", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "txt~x/json/c7" },
-        } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/xyz-users", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "xyz-users" },
-        } },
-        .{ .method = "DELETE", .path = "/x.y/b/42/", .status = 200, .pattern = "/x.y/b/{p2}", .params = &.{
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/preab/42~x/42.b/xyz-ab", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "preab/42~x/42.b/xyz-ab" },
-        } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "POST", .pattern = "/a-b/b" },
-        .{ .method = "POST", .pattern = "/b/a{p1}_{q1}.txt" },
-        .{ .method = "DELETE", .pattern = "/{p0}/a/b" },
-        .{ .method = "PUT", .pattern = "/a/{p1}.json" },
-        .{ .method = "PUT", .pattern = "/{p0}.{q0}" },
-        .{ .method = "GET", .pattern = "/{p0}" },
-        .{ .method = "DELETE", .pattern = "/v{p0}/a{p1}_{q1}.txt/{p2}.json/" },
-        .{ .method = "GET", .pattern = "/v1" },
-        .{ .method = "GET", .pattern = "/a-b" },
-        .{ .method = "POST", .pattern = "/v1" },
-        .{ .method = "GET", .pattern = "/{p0}/{p1}.json/users" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "DELETE", .path = "/vxyz/ab_a.txt/1.json/", .status = 200, .pattern = "/v{p0}/a{p1}_{q1}.txt/{p2}.json", .params = &.{
+        .{ .method = "POST", .path = "/xyz~x/txt", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
             .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "q1", .value = "a" },
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/json~x", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/json", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/axyz_b.txt/v1", .status = 404 },
-        .{ .method = "POST", .path = "/vjson/ajson_ab.txt/1.json/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/a-c7/a1_xyz.txt/c7.b/json-1", .status = 404 },
-        .{ .method = "PUT", .path = "/a/b.json", .status = 200, .pattern = "/a/{p1}.json", .params = &.{
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/a/aab_b.txt/users-a", .status = 404 },
-        .{ .method = "PUT", .path = "/b", .status = 405, .allow = &.{
-            "GET",
+            .{ .name = "p1", .value = "txt" },
         } },
         .{ .method = "PUT", .path = "/txt", .status = 405, .allow = &.{
             "GET",
-        } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/b.a/xyz~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/42/a/b", .status = 200, .pattern = "/{p0}/a/b", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/preusers/atxt_users.txt", .status = 404 },
-        .{ .method = "POST", .path = "/b/a42_1.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "q1", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/users~x/a/a/42", .status = 404 },
-        .{ .method = "DELETE", .path = "/txt/a/b", .status = 200, .pattern = "/{p0}/a/b", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/txt.c7", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/v1", .status = 405, .allow = &.{
-            "GET",
             "POST",
         } },
-        .{ .method = "DELETE", .path = "/ausers_c7.txt/xyz.b/preusers/a", .status = 404 },
-        .{ .method = "GET", .path = "/c7/ab.json/users", .status = 200, .pattern = "/{p0}/{p1}.json/users", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/ausers_42.txt/vxyz", .status = 404 },
-        .{ .method = "PUT", .path = "/a/json.json", .status = 200, .pattern = "/a/{p1}.json", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/a-a/preab/ab-1", .status = 404 },
-        .{ .method = "GET", .path = "/1", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/42/c7.42/vab", .status = 404 },
-        .{ .method = "POST", .path = "/b/ausers_xyz.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "q1", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/vtxt/prejson/ab~x/1", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1/aab_xyz.txt/txt.json/", .status = 200, .pattern = "/v{p0}/a{p1}_{q1}.txt/{p2}.json", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "q1", .value = "xyz" },
-            .{ .name = "p2", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/txt~x/ab/xyz-xyz/users.a", .status = 404 },
-        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/b/vjson/c7~x", .status = 404 },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/vusers/1/42", .status = 404 },
-        .{ .method = "PUT", .path = "/a/42.json", .status = 200, .pattern = "/a/{p1}.json", .params = &.{
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/pre1/json~x", .status = 404 },
-        .{ .method = "POST", .path = "/a-b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/b/axyz_ab.txt", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/1/txt.json/users", .status = 200, .pattern = "/{p0}/{p1}.json/users", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/1.b/aa_json.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/ab.ab", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/aa_json.txt/axyz_c7.txt/ab.json", .status = 404 },
-        .{ .method = "GET", .path = "/txt/a/b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/txt", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/b/aa_c7.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "q1", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/pre1/1.42/xyz", .status = 404 },
-        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/1/v42/", .status = 404 },
-        .{ .method = "DELETE", .path = "/b/atxt_ab.txt", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/c7/b~x/txt.42", .status = 404 },
-        .{ .method = "GET", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/b/v42/1~x/prec7", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/b", .status = 200, .pattern = "/a-b/b", .params = &.{} },
-        .{ .method = "POST", .path = "/a-b/c7.b", .status = 404 },
-        .{ .method = "DELETE", .path = "/txt/a/b", .status = 200, .pattern = "/{p0}/a/b", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/v1/json/", .status = 404 },
-        .{ .method = "PUT", .path = "/json/42.json/users", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/a-b/b", .status = 200, .pattern = "/a-b/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/42/pre1/axyz_json.txt", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "DELETE", .pattern = "/b" },
-        .{ .method = "GET", .pattern = "/b/v1" },
-        .{ .method = "DELETE", .pattern = "/x.y" },
-        .{ .method = "PUT", .pattern = "/{p0}-{q0}/pre{p1}/v1" },
-        .{ .method = "POST", .pattern = "/users/" },
-        .{ .method = "PUT", .pattern = "/v{p0}/{p1}" },
-        .{ .method = "POST", .pattern = "/a/v1" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "DELETE", .path = "/b/v1", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/ab-b/v42/42.ab/b~x/", .status = 404 },
-        .{ .method = "GET", .path = "/b/v1", .status = 200, .pattern = "/b/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/a-b/txt-xyz/users/aa_c7.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/txt-ab/pre42/v1", .status = 200, .pattern = "/{p0}-{q0}/pre{p1}/v1", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "ab" },
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/preusers", .status = 404 },
-        .{ .method = "PUT", .path = "/b-c7/pretxt/v1", .status = 200, .pattern = "/{p0}-{q0}/pre{p1}/v1", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "c7" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/a", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/ab-json/b-users", .status = 404 },
-        .{ .method = "GET", .path = "/b/v1", .status = 200, .pattern = "/b/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/c7-b", .status = 404 },
-        .{ .method = "POST", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/pre42/c7/vc7", .status = 404 },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/ac7_users.txt/users", .status = 404 },
-        .{ .method = "POST", .path = "/x.y", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/xyz/users~x/1~x/txt.b", .status = 404 },
-        .{ .method = "POST", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/a~x/", .status = 404 },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "GET", .path = "/users.xyz", .status = 404 },
-        .{ .method = "PUT", .path = "/users-txt/pretxt/v1", .status = 200, .pattern = "/{p0}-{q0}/pre{p1}/v1", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "txt" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/1~x/v1", .status = 404 },
-        .{ .method = "PUT", .path = "/xyz-users/prexyz/v1", .status = 200, .pattern = "/{p0}-{q0}/pre{p1}/v1", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "users" },
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/a42_b.txt/b-ab/users~x/v1", .status = 404 },
-        .{ .method = "PUT", .path = "/users-users/preusers/v1", .status = 200, .pattern = "/{p0}-{q0}/pre{p1}/v1", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "users" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/vusers", .status = 404 },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "POST", .path = "/preab/users.a", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/xyz~x/va/prejson/b", .status = 404 },
-        .{ .method = "PUT", .path = "/vc7/ab", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/prec7/ausers_json.txt/", .status = 404 },
-        .{ .method = "PUT", .path = "/v42/ab", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/ac7_1.txt/ab~x", .status = 404 },
-        .{ .method = "POST", .path = "/users/", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/users/c7.42/c7~x", .status = 404 },
-        .{ .method = "POST", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/a-b/json", .status = 404 },
-        .{ .method = "POST", .path = "/users/", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/json.ab/1/prea/aa_b.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/users", .status = 404 },
-        .{ .method = "POST", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/preusers/xyz~x/c7~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "POST", .path = "/b~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/b/v1", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/a/ab~x/b~x/a", .status = 404 },
-        .{ .method = "POST", .path = "/users/", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "GET", .path = "/c7-a", .status = 404 },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/json-b/json~x/json-42/", .status = 404 },
-        .{ .method = "PUT", .path = "/ab-ab/preusers/v1", .status = 200, .pattern = "/{p0}-{q0}/pre{p1}/v1", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "ab" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/preab", .status = 404 },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "POST", .path = "/c7-1/users/users", .status = 404 },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/b/c7/1", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "POST", .pattern = "/a" },
-        .{ .method = "PUT", .pattern = "/v1" },
-        .{ .method = "PUT", .pattern = "/v1/{p1}" },
-        .{ .method = "POST", .pattern = "/x.y" },
-        .{ .method = "GET", .pattern = "/{p0}" },
-        .{ .method = "POST", .pattern = "/{p0}/{p1}" },
-        .{ .method = "PUT", .pattern = "/{p0}.json" },
-        .{ .method = "POST", .pattern = "/{p0}.{q0}" },
-        .{ .method = "POST", .pattern = "/v{p0}" },
-        .{ .method = "POST", .pattern = "/v{p0}/{p1}" },
-        .{ .method = "PUT", .pattern = "/{p0}-{q0}" },
-        .{ .method = "POST", .pattern = "/pre{p0}" },
-        .{ .method = "POST", .pattern = "/pre{p0}/{p1}" },
-        .{ .method = "PUT", .pattern = "/{p0}~x" },
-        .{ .method = "GET", .pattern = "/{p0}~x/{p1}" },
-        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "DELETE", .pattern = "/x.y/pre{p1}/a-b" },
-        .{ .method = "POST", .pattern = "/{p0}/a-b/users" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "DELETE", .path = "/x.y/prexyz/a-b", .status = 200, .pattern = "/x.y/pre{p1}/a-b", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/a/vtxt/pre1", .status = 404 },
-        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/vab/txt.ab/1-42/1.1", .status = 404 },
-        .{ .method = "PUT", .path = "/users~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/vusers/txt/users", .status = 404 },
-        .{ .method = "POST", .path = "/vtxt/c7", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/txt/xyz~x/prexyz", .status = 404 },
-        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "PUT", .path = "/c7", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/ab-users", .status = 405, .allow = &.{
-            "GET",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/ab.users/prejson/1/42~x/", .status = 404 },
-        .{ .method = "PUT", .path = "/1.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/ab~x", .status = 405, .allow = &.{
-            "GET",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/pretxt/prexyz", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/preusers", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/json~x/c7", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/xyz-json", .status = 405, .allow = &.{
-            "GET",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "POST", .path = "/xyz/c7-json", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "c7-json" },
-        } },
-        .{ .method = "POST", .path = "/vjson", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/vab", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/prejson/txt", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/vusers/txt-users/a-42", .status = 404 },
-        .{ .method = "PUT", .path = "/a", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/a1_json.txt/xyz/42", .status = 404 },
-        .{ .method = "GET", .path = "/vusers", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "vusers" },
-        } },
-        .{ .method = "POST", .path = "/42", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/a.a", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "POST", .path = "/users~x/1.users/pre1/", .status = 404 },
+        .{ .method = "PUT", .path = "/a.1", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
             .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "a" },
+            .{ .name = "q0", .value = "1" },
         } },
-        .{ .method = "GET", .path = "/1", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/b/a-b/users", .status = 200, .pattern = "/{p0}/a-b/users", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/prejson", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/txt~x/users", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/a42_xyz.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/42-42", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/json/txt", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/42-users/b/a42_ab.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/json.1", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/ac7_42.txt/ab", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "ac7_42.txt" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/vab", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/json~x", .status = 405, .allow = &.{
-            "GET",
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/x.y", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/ausers_42.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "ausers_42" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/1~x/42", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/1.ab", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/v1/42", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/users/a", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/txt/json~x", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/axyz_b.txt/users.txt/vab/preab", .status = 404 },
-        .{ .method = "POST", .path = "/json-a", .status = 405, .allow = &.{
-            "GET",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/vjson/1.b/vusers", .status = 404 },
-        .{ .method = "POST", .path = "/pre1", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/a/a42_ab.txt/ajson_c7.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/b", .status = 200, .pattern = "/v1/{p1}", .params = &.{
+        .{ .method = "GET", .path = "/c7~x/users/vab/", .status = 404 },
+        .{ .method = "GET", .path = "/v1/b", .status = 200, .pattern = "/v1/{p1}", .params = &.{
             .{ .name = "p1", .value = "b" },
         } },
-        .{ .method = "POST", .path = "/ab.1/42/axyz_txt.txt/json~x", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "POST", .pattern = "/a-b" },
-        .{ .method = "DELETE", .pattern = "/v1" },
-        .{ .method = "GET", .pattern = "/x.y/b/{p2}" },
-        .{ .method = "DELETE", .pattern = "/{p0}~x" },
-        .{ .method = "GET", .pattern = "/v1/" },
-        .{ .method = "DELETE", .pattern = "/a" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "DELETE", .path = "/42", .status = 404 },
-        .{ .method = "POST", .path = "/v1", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/preab/json-xyz/42", .status = 404 },
-        .{ .method = "DELETE", .path = "/b~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/a1_b.txt/va/vb/ab_1.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/ab~x/a/a~x/vusers", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/b/a", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/42.json/b-users/c7/users", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "GET", .path = "/xyz-42/1/users/vjson", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "PUT", .path = "/1.1", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "GET", .path = "/1~x/c7", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/b/42", .status = 200, .pattern = "/x.y/b/{p2}", .params = &.{
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "POST", .path = "/a/prea", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/c7/b", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/prea/xyz-42/ab-b", .status = 404 },
-        .{ .method = "GET", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/a42_c7.txt/users-xyz/vxyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "POST", .path = "/txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "PUT", .path = "/a/1", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/b/1", .status = 200, .pattern = "/x.y/b/{p2}", .params = &.{
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/c7.json", .status = 404 },
-        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/c7.a/xyz/preb/txt/", .status = 404 },
-        .{ .method = "DELETE", .path = "/json~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/42.1/users~x/b.ab/json-1", .status = 404 },
-        .{ .method = "GET", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/vtxt/json-txt/a-txt/users", .status = 404 },
-        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/42.a/a.users", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "DELETE", .path = "/users/1-a/vxyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/prea", .status = 404 },
-        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "GET", .path = "/a~x/pre1/b~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "DELETE", .path = "/ab~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/json~x/xyz~x", .status = 404 },
-        .{ .method = "POST", .path = "/v1", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/ab/json-json/a-c7", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "DELETE", .path = "/json/users.42/txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/a-b/v1/aab_users.txt/xyz~x", .status = 404 },
-        .{ .method = "GET", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/a-xyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/txt~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/ab/prexyz/v1", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/42-txt/a-json/txt-1/vc7", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/{p0}.{q0}/users" },
-        .{ .method = "DELETE", .pattern = "/x.y" },
-        .{ .method = "DELETE", .pattern = "/a-b/{p1}/" },
-        .{ .method = "POST", .pattern = "/users" },
-        .{ .method = "DELETE", .pattern = "/b/{p1}/a" },
-        .{ .method = "GET", .pattern = "/x.y/{p1}" },
-        .{ .method = "DELETE", .pattern = "/users/{p1}/a-b" },
-        .{ .method = "GET", .pattern = "/{p0}.{q0}/*" },
-        .{ .method = "DELETE", .pattern = "/a/a/users" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/txt.users/users", .status = 200, .pattern = "/{p0}.{q0}/users", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/txt.1/ajson_1.txt/v1", .status = 200, .pattern = "/{p0}.{q0}/*", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "1" },
-            .{ .name = "*", .value = "ajson_1.txt/v1" },
-        } },
-        .{ .method = "GET", .path = "/a.txt/users", .status = 200, .pattern = "/{p0}.{q0}/users", .params = &.{
+        .{ .method = "GET", .path = "/x.y/users/preab", .status = 404 },
+        .{ .method = "GET", .path = "/a.a/b", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
             .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/b/vc7/prea/users/", .status = 404 },
-        .{ .method = "GET", .path = "/42.42/", .status = 200, .pattern = "/{p0}.{q0}/*", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "42" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "GET", .path = "/aa_ab.txt/1-b", .status = 200, .pattern = "/{p0}.{q0}/*", .params = &.{
-            .{ .name = "p0", .value = "aa_ab" },
-            .{ .name = "q0", .value = "txt" },
-            .{ .name = "*", .value = "1-b" },
-        } },
-        .{ .method = "DELETE", .path = "/users/ab/a-b", .status = 200, .pattern = "/users/{p1}/a-b", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/b/json-1/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/a/users", .status = 200, .pattern = "/a/a/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/b-txt/1/v1", .status = 404 },
-        .{ .method = "GET", .path = "/a/a/users", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/b/v1", .status = 404 },
-        .{ .method = "GET", .path = "/42.42/", .status = 200, .pattern = "/{p0}.{q0}/*", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "42" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "DELETE", .path = "/c7/ab.txt/prea", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/a/users", .status = 200, .pattern = "/a/a/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/1", .status = 404 },
-        .{ .method = "POST", .path = "/a/a/users", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/vtxt", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/a.42/axyz_42.txt/42~x", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/a-b/c7/", .status = 200, .pattern = "/a-b/{p1}", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/aa_xyz.txt/txt-a/42", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/b.42/users", .status = 200, .pattern = "/{p0}.{q0}/users", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/vusers/json.b", .status = 404 },
-        .{ .method = "PUT", .path = "/users.xyz/42", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/pretxt/ab~x", .status = 404 },
-        .{ .method = "GET", .path = "/b.c7/users", .status = 200, .pattern = "/{p0}.{q0}/users", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/1~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/users/1/a-b", .status = 200, .pattern = "/users/{p1}/a-b", .params = &.{
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/1.a/1-a/ab", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/a-b/b/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/users/c7/a/b~x", .status = 404 },
-        .{ .method = "GET", .path = "/xyz.users/users", .status = 200, .pattern = "/{p0}.{q0}/users", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/users.b/ab/vusers/ab", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/a/a/users", .status = 200, .pattern = "/a/a/users", .params = &.{} },
-        .{ .method = "GET", .path = "/42", .status = 404 },
-        .{ .method = "DELETE", .path = "/users/b/a-b", .status = 200, .pattern = "/users/{p1}/a-b", .params = &.{
+            .{ .name = "q0", .value = "a" },
             .{ .name = "p1", .value = "b" },
         } },
-        .{ .method = "PUT", .path = "/a/42~x/ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/b/txt/a", .status = 200, .pattern = "/b/{p1}/a", .params = &.{
-            .{ .name = "p1", .value = "txt" },
+        .{ .method = "GET", .path = "/xyz.42", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
         } },
-        .{ .method = "POST", .path = "/json", .status = 404 },
-        .{ .method = "GET", .path = "/ab.users/ab-json/a-b", .status = 200, .pattern = "/{p0}.{q0}/*", .params = &.{
-            .{ .name = "p0", .value = "ab" },
+        .{ .method = "GET", .path = "/c7/42", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/json.users/", .status = 404 },
+        .{ .method = "GET", .path = "/a/x.y/a", .status = 200, .pattern = "/a/x.y/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/users/a~x/vjson/b.json", .status = 404 },
+        .{ .method = "POST", .path = "/xyz.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/pretxt/", .status = 404 },
+        .{ .method = "PUT", .path = "/users", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/ab~x/1/json-b", .status = 404 },
+        .{ .method = "POST", .path = "/c7-a", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7-a" },
+        } },
+        .{ .method = "POST", .path = "/v42/vjson", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/ajson_42.txt", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/1.json", .status = 200, .pattern = "/{p0:[0-9]+}.json", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/users/c7.42/42~x", .status = 404 },
+        .{ .method = "PUT", .path = "/c7.users", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
             .{ .name = "q0", .value = "users" },
-            .{ .name = "*", .value = "ab-json/a-b" },
         } },
-        .{ .method = "PUT", .path = "/txt.json/users.42/xyz.c7/c7.ab", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/a/a/users", .status = 200, .pattern = "/a/a/users", .params = &.{} },
-        .{ .method = "POST", .path = "/vb/b/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b/42/", .status = 200, .pattern = "/a-b/{p1}", .params = &.{
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/ajson_ab.txt", .status = 404 },
-        .{ .method = "GET", .path = "/ab.ab/users", .status = 200, .pattern = "/{p0}.{q0}/users", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/b.1", .status = 404 },
-        .{ .method = "GET", .path = "/users.json/users", .status = 200, .pattern = "/{p0}.{q0}/users", .params = &.{
+        .{ .method = "PUT", .path = "/json~x/atxt_a.txt/b/42", .status = 404 },
+        .{ .method = "POST", .path = "/users.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
             .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "json" },
         } },
-        .{ .method = "POST", .path = "/prea", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b/json/", .status = 200, .pattern = "/a-b/{p1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/b~x/txt/vxyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/a/users", .status = 200, .pattern = "/a/a/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/xyz~x/x.y/pre1", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/a/users", .status = 200, .pattern = "/a/a/users", .params = &.{} },
-        .{ .method = "POST", .path = "/prea/b", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/json", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/1~x/prexyz/c7-users/x.y", .status = 404 },
-        .{ .method = "DELETE", .path = "/users/users/a-b", .status = 200, .pattern = "/users/{p1}/a-b", .params = &.{
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/users/b/a", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "POST", .pattern = "/a-b/{p1}/users" },
-        .{ .method = "POST", .pattern = "/users/{p1}" },
-        .{ .method = "DELETE", .pattern = "/v1" },
-        .{ .method = "GET", .pattern = "/{p0}-{q0}/{p1}/a-b" },
-        .{ .method = "POST", .pattern = "/x.y/*" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/x.y/", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/ab_xyz.txt/users-1/txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/xyz/a1_users.txt/a", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "PUT", .path = "/users.xyz/users~x/1-c7/json-ab/", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/ac7_json.txt", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "ac7_json.txt" },
-        } },
-        .{ .method = "GET", .path = "/xyz-ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/users/ab", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/ab_txt.txt/a~x/42-a/txt.ab", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/v1/ajson_b.txt", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "v1/ajson_b.txt" },
-        } },
-        .{ .method = "POST", .path = "/prexyz", .status = 404 },
-        .{ .method = "GET", .path = "/b-1/c7/a-b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/a-b", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "1" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/json/b~x/ab-txt", .status = 404 },
-        .{ .method = "GET", .path = "/a-xyz/json/a-b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/a-b", .params = &.{
+        .{ .method = "PUT", .path = "/txt/txt/atxt_json.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/a-a", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}", .params = &.{
             .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "a" },
+        } },
+        .{ .method = "DELETE", .path = "/preusers/xyz-txt/ajson_ab.txt/xyz-txt", .status = 404 },
+        .{ .method = "PUT", .path = "/42/users", .status = 200, .pattern = "/{p0}/users", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/users/42-users/b/", .status = 404 },
+        .{ .method = "GET", .path = "/xyz.xyz/xyz", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
             .{ .name = "q0", .value = "xyz" },
-            .{ .name = "p1", .value = "json" },
+            .{ .name = "p1", .value = "xyz" },
         } },
-        .{ .method = "PUT", .path = "/prejson/ausers_c7.txt/x.y", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/prexyz", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/b/prec7/vc7/", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab.json", .status = 405, .allow = &.{
             "POST",
+            "PUT",
         } },
-        .{ .method = "PUT", .path = "/a-b/ausers_ab.txt/ab/ab_xyz.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/txt/users", .status = 200, .pattern = "/a-b/{p1}/users", .params = &.{
-            .{ .name = "p1", .value = "txt" },
+        .{ .method = "PUT", .path = "/a1_ab.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "a1_ab" },
+            .{ .name = "q0", .value = "txt" },
         } },
-        .{ .method = "DELETE", .path = "/prec7/a/axyz_c7.txt/users.txt/", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/a", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/a/vjson/xyz/vb", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/b.json", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "b.json" },
-        } },
-        .{ .method = "GET", .path = "/users.b", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/preab", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/ab-ab/a/a", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/42~x/", .status = 404 },
-        .{ .method = "DELETE", .path = "/users/json", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/atxt_xyz.txt/1/x.y", .status = 404 },
-        .{ .method = "GET", .path = "/txt-a/c7/a-b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/a-b", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/b.xyz/b/c7-1", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/c7.ab/vc7", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "c7.ab/vc7" },
-        } },
-        .{ .method = "GET", .path = "/1/a42_xyz.txt", .status = 404 },
-        .{ .method = "GET", .path = "/users-json/c7/a-b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/a-b", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "json" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/pre42/ab.42/x.y/pre1", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/json.txt/a-b", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "GET", .path = "/preb", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/vb", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "vb" },
-        } },
-        .{ .method = "PUT", .path = "/a/v42", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/vusers/ab-txt", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/vxyz/xyz/c7/xyz/", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/txt/users", .status = 200, .pattern = "/a-b/{p1}/users", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/json-a/json", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "DELETE", .path = "/aab_users.txt/a1_c7.txt/v1", .status = 404 },
-        .{ .method = "POST", .path = "/xyz-42/42/a-b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/ac7_1.txt/c7.b/txt.c7", .status = 404 },
-        .{ .method = "GET", .path = "/json-a/users/a-b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/a-b", .params = &.{
+        .{ .method = "PUT", .path = "/json-42", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
             .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/xyz.json/json-b", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/json/users", .status = 200, .pattern = "/a-b/{p1}/users", .params = &.{
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/a-ab/prexyz/a", .status = 404 },
-        .{ .method = "GET", .path = "/txt-42/42/a-b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/a-b", .params = &.{
-            .{ .name = "p0", .value = "txt" },
             .{ .name = "q0", .value = "42" },
-            .{ .name = "p1", .value = "42" },
         } },
-        .{ .method = "POST", .path = "/1~x/txt.xyz", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/prejson/a", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "prejson/a" },
-        } },
-        .{ .method = "DELETE", .path = "/aab_txt.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/a1_xyz.txt/prea/pretxt", .status = 404 },
     } },
     .{ .routes = &.{
-        .{ .method = "DELETE", .pattern = "/a" },
-        .{ .method = "PUT", .pattern = "/v1" },
-        .{ .method = "POST", .pattern = "/v1/{p1}" },
-        .{ .method = "POST", .pattern = "/x.y" },
-        .{ .method = "DELETE", .pattern = "/{p0}" },
-        .{ .method = "PUT", .pattern = "/{p0}.json" },
-        .{ .method = "GET", .pattern = "/{p0}.{q0}" },
-        .{ .method = "GET", .pattern = "/v{p0}" },
-        .{ .method = "DELETE", .pattern = "/v{p0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}-{q0}" },
-        .{ .method = "GET", .pattern = "/{p0}-{q0}/{p1}" },
+        .{ .method = "PUT", .pattern = "/a/a/*" },
+        .{ .method = "PUT", .pattern = "/a/x.y" },
         .{ .method = "PUT", .pattern = "/pre{p0}" },
-        .{ .method = "GET", .pattern = "/{p0}~x" },
-        .{ .method = "DELETE", .pattern = "/{p0}~x/{p1}" },
-        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "GET", .pattern = "/x.y/{p1}.{q1}" },
-        .{ .method = "PUT", .pattern = "/a-b/users/a{p2}_{q2}.txt" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "DELETE", .path = "/va/ab", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/1-c7", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/1/vjson/ab.xyz/preusers", .status = 404 },
-        .{ .method = "GET", .path = "/v1/json", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/prea/1.ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/pretxt", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "pretxt" },
-        } },
-        .{ .method = "DELETE", .path = "/vxyz/users~x/v1/1-b/", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/c7.b", .status = 200, .pattern = "/x.y/{p1}.{q1}", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "q1", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/prec7/a-1/a.42/ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/42~x/xyz", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/txt~x/b~x/b/c7", .status = 404 },
-        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/vc7/x.y/xyz.1", .status = 404 },
-        .{ .method = "PUT", .path = "/ac7_a.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/42/txt-users/axyz_a.txt", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/txt.json", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/b/a~x/json-c7/json", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/a.ab", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/a1_1.txt/1/b/c7~x", .status = 404 },
-        .{ .method = "GET", .path = "/vusers", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/users.txt/c7-1/vtxt", .status = 404 },
-        .{ .method = "DELETE", .path = "/users~x/users", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/vc7/vusers/vtxt", .status = 404 },
-        .{ .method = "PUT", .path = "/prexyz", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/ab/a-b", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-a", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/42-42/json-users/aa_ab.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-txt", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/txt.b/ab~x", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/users.xyz", .status = 200, .pattern = "/x.y/{p1}.{q1}", .params = &.{
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "q1", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/1-a/a-b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/xyz~x/a", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/users/va/1", .status = 404 },
-        .{ .method = "PUT", .path = "/vusers", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/c7.xyz/v1", .status = 404 },
-        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/aab_c7.txt/b/prexyz/b", .status = 404 },
-        .{ .method = "GET", .path = "/txt~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/aa_42.txt", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/preusers", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/42-users/xyz", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/v1/txt", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/vjson/1-c7", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "1-c7" },
-        } },
-        .{ .method = "GET", .path = "/v1/users", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/xyz~x", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz~x" },
-        } },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "v1" },
-        } },
-        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/1/42-1/b-txt", .status = 404 },
-        .{ .method = "PUT", .path = "/aa_json.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/a/1/vusers", .status = 404 },
-        .{ .method = "GET", .path = "/ab~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/ab~x", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/a-b/users/ausers_42.txt", .status = 200, .pattern = "/a-b/users/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p2", .value = "users" },
-            .{ .name = "q2", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/aab_42.txt/txt.b", .status = 404 },
-        .{ .method = "PUT", .path = "/ausers_c7.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/c7.b/1-json/", .status = 404 },
-        .{ .method = "PUT", .path = "/users-json/json", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-    } },
-    .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/{p0}-{q0}/{p1}~x" },
-        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "POST", .pattern = "/{p0}/" },
-        .{ .method = "POST", .pattern = "/v{p0}/" },
-        .{ .method = "PUT", .pattern = "/{p0}~x/{p1}/*" },
+        .{ .method = "POST", .pattern = "/v1/a-b" },
+        .{ .method = "POST", .pattern = "/x.y" },
+        .{ .method = "DELETE", .pattern = "/a" },
         .{ .method = "GET", .pattern = "/*" },
-        .{ .method = "POST", .pattern = "/{p0}~x" },
-        .{ .method = "PUT", .pattern = "/v{p0}/a-b/users" },
-        .{ .method = "GET", .pattern = "/a-b/" },
-        .{ .method = "POST", .pattern = "/v1/users" },
+        .{ .method = "GET", .pattern = "/{p0}/{p1:[0-9]+}.json" },
+        .{ .method = "DELETE", .pattern = "/b/v{p1}" },
+        .{ .method = "PUT", .pattern = "/x.y" },
+        .{ .method = "GET", .pattern = "/users/{p1}~x" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/ac7_txt.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/json/txt/b-b/prea", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/atxt_a.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/xyz.ab/a1_c7.txt/va/vjson", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/v42/", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/txt~x/pre42/xyz", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "txt~x/pre42/xyz" },
-        } },
-        .{ .method = "PUT", .path = "/42~x/a/", .status = 200, .pattern = "/{p0}~x/{p1}/*", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "PUT", .path = "/vc7", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/txt", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "POST", .path = "/ab_42.txt/ab/", .status = 405, .allow = &.{
             "GET",
         } },
         .{ .method = "GET", .path = "/", .status = 200, .pattern = "/*", .params = &.{
             .{ .name = "*", .value = "" },
         } },
-        .{ .method = "PUT", .path = "/axyz_b.txt/x.y", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/txt/vc7/a-b/a-b", .status = 405, .allow = &.{
             "GET",
         } },
-        .{ .method = "POST", .path = "/b~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "b" },
+        .{ .method = "DELETE", .path = "/b/vab", .status = 200, .pattern = "/b/v{p1}", .params = &.{
+            .{ .name = "p1", .value = "ab" },
         } },
-        .{ .method = "GET", .path = "/axyz_b.txt/42~x/users.1", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "axyz_b.txt/42~x/users.1" },
+        .{ .method = "DELETE", .path = "/42/x.y/users", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "PUT", .path = "/vtxt/a-b/users", .status = 200, .pattern = "/v{p0}/a-b/users", .params = &.{
-            .{ .name = "p0", .value = "txt" },
+        .{ .method = "POST", .path = "/v1/a-b", .status = 200, .pattern = "/v1/a-b", .params = &.{} },
+        .{ .method = "POST", .path = "/1.c7/vab/users-c7", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "GET", .path = "/b.42", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "b.42" },
+        .{ .method = "PUT", .path = "/a/a/1.c7", .status = 200, .pattern = "/a/a/*", .params = &.{
+            .{ .name = "*", .value = "1.c7" },
         } },
-        .{ .method = "PUT", .path = "/c7~x/xyz/", .status = 200, .pattern = "/{p0}~x/{p1}/*", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "xyz" },
+        .{ .method = "POST", .path = "/1/ausers_json.txt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "GET", .path = "/1/vusers/ab.json/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "1/vusers/ab.json/" },
+        } },
+        .{ .method = "DELETE", .path = "/b/vusers", .status = 200, .pattern = "/b/v{p1}", .params = &.{
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/users~x/ajson_1.txt/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/vab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/b/json.json", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "b/json.json" },
+        } },
+        .{ .method = "GET", .path = "/c7/prejson/b-c7", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "c7/prejson/b-c7" },
+        } },
+        .{ .method = "GET", .path = "/42/txt.json", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "42/txt.json" },
+        } },
+        .{ .method = "DELETE", .path = "/b.b", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/v42/a.1/txt-users", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/users/1~x", .status = 200, .pattern = "/users/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "DELETE", .path = "/a1_txt.txt/1.ab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/txt-txt/prexyz/xyz.users/users", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/a/a/json.42", .status = 200, .pattern = "/a/a/*", .params = &.{
+            .{ .name = "*", .value = "json.42" },
+        } },
+        .{ .method = "POST", .path = "/b", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "POST", .path = "/a/xyz.users/vjson/xyz.42", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/preusers", .status = 405, .allow = &.{
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/txt~x", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/42.1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "42.1" },
+        } },
+        .{ .method = "DELETE", .path = "/b-42/c7-xyz/users/42~x", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/a/x.y", .status = 200, .pattern = "/a/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/a~x", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/users/1~x", .status = 200, .pattern = "/users/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/xyz-b", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/1", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/v1/a-b", .status = 200, .pattern = "/v1/a-b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/v1/a/xyz.b/1-json", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/a", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/b/vc7/prexyz", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "b/vc7/prexyz" },
+        } },
+        .{ .method = "DELETE", .path = "/b/vb", .status = 200, .pattern = "/b/v{p1}", .params = &.{
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/b/b.users/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/", .status = 200, .pattern = "/*", .params = &.{
             .{ .name = "*", .value = "" },
         } },
-        .{ .method = "POST", .path = "/42-1/ab", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/a/ab/ajson_ab.txt", .status = 405, .allow = &.{
             "GET",
         } },
-        .{ .method = "PUT", .path = "/ab/1~x", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/users/xyz~x", .status = 405, .allow = &.{
             "GET",
         } },
-        .{ .method = "DELETE", .path = "/prec7/users-users", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/a/txt/ajson_c7.txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a/txt/ajson_c7.txt" },
+        } },
+        .{ .method = "GET", .path = "/xyz/ab.json", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "xyz/ab.json" },
+        } },
+        .{ .method = "GET", .path = "/ab_xyz.txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "ab_xyz.txt" },
+        } },
+        .{ .method = "DELETE", .path = "/b/vb", .status = 200, .pattern = "/b/v{p1}", .params = &.{
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/c7/v1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "c7/v1" },
+        } },
+        .{ .method = "PUT", .path = "/a", .status = 405, .allow = &.{
+            "DELETE",
             "GET",
         } },
-        .{ .method = "POST", .path = "/v1/users", .status = 200, .pattern = "/v1/users", .params = &.{} },
-        .{ .method = "GET", .path = "/ab_users.txt/txt/users-txt/c7", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "ab_users.txt/txt/users-txt/c7" },
-        } },
-        .{ .method = "POST", .path = "/c7~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/b-42/a-b/v1/vab", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/txt/users.b/v42/ab.ab", .status = 405, .allow = &.{
             "GET",
         } },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/1.json/prexyz/v1/vusers", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/c7/c7.json", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "c7/c7.json" },
+        } },
+        .{ .method = "DELETE", .path = "/b~x/ab_ab.txt/a/", .status = 405, .allow = &.{
             "GET",
         } },
-        .{ .method = "PUT", .path = "/txt~x/1/users.b/1", .status = 200, .pattern = "/{p0}~x/{p1}/*", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "*", .value = "users.b/1" },
+        .{ .method = "POST", .path = "/v1/a-b", .status = 200, .pattern = "/v1/a-b", .params = &.{} },
+        .{ .method = "GET", .path = "/c7/vab", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "c7/vab" },
         } },
-        .{ .method = "GET", .path = "/va/42/json~x", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "va/42/json~x" },
-        } },
-        .{ .method = "GET", .path = "/ac7_json.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/json.c7", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/42~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/a/b-a", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/pre42/vxyz", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/v1/", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/vusers/a~x/aab_1.txt", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/vusers/", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/a~x/1/users", .status = 405, .allow = &.{
-            "GET",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/vab/", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/txt.1", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "txt.1" },
-        } },
-        .{ .method = "PUT", .path = "/vc7/a-b/users", .status = 200, .pattern = "/v{p0}/a-b/users", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/b.users/aab_xyz.txt/a-b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/b~x/1/aab_txt.txt", .status = 200, .pattern = "/{p0}~x/{p1}/*", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "*", .value = "aab_txt.txt" },
-        } },
-        .{ .method = "POST", .path = "/1~x/c7/prea/xyz/", .status = 405, .allow = &.{
-            "GET",
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/a-b/", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/txt/atxt_1.txt/b/ausers_a.txt", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/vxyz/", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/users/", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/xyz~x", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/prea/users-c7/a-xyz", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/users/ab_json.txt", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/txt~x/c7/json/xyz-b", .status = 200, .pattern = "/{p0}~x/{p1}/*", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "*", .value = "json/xyz-b" },
-        } },
-        .{ .method = "POST", .path = "/json~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+    } },
+    .{ .routes = &.{
+        .{ .method = "GET", .pattern = "/a" },
+        .{ .method = "PUT", .pattern = "/users" },
+        .{ .method = "GET", .pattern = "/{p0}/{p1}.json" },
+        .{ .method = "PUT", .pattern = "/a/v{p1}/v{p2:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/a-b/{p1:[0-9]+}/x.y" },
+        .{ .method = "PUT", .pattern = "/a-b" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/json/1.json", .status = 200, .pattern = "/{p0}/{p1}.json", .params = &.{
             .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/ab-txt/1~x", .status = 200, .pattern = "/{p0}-{q0}/{p1}~x", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "txt" },
             .{ .name = "p1", .value = "1" },
         } },
-        .{ .method = "GET", .path = "/a/users/ausers_ab.txt", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "a/users/ausers_ab.txt" },
+        .{ .method = "PUT", .path = "/42/42-a/v42/", .status = 404 },
+        .{ .method = "PUT", .path = "/a/vb/vtxt", .status = 404 },
+        .{ .method = "DELETE", .path = "/txt~x/vc7/ac7_42.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/a/vjson/vab", .status = 404 },
+        .{ .method = "GET", .path = "/ab.json/ac7_ab.txt/42-1/ac7_b.txt", .status = 404 },
+        .{ .method = "POST", .path = "/ab/a.json", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "GET", .path = "/ab_a.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "a" },
+        .{ .method = "POST", .path = "/xyz.c7/txt~x", .status = 404 },
+        .{ .method = "GET", .path = "/a-b/json/x.y", .status = 404 },
+        .{ .method = "DELETE", .path = "/42-ab/", .status = 404 },
+        .{ .method = "GET", .path = "/a/ab.json", .status = 200, .pattern = "/{p0}/{p1}.json", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p1", .value = "ab" },
         } },
-        .{ .method = "GET", .path = "/json-xyz", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "json-xyz" },
+        .{ .method = "POST", .path = "/json", .status = 404 },
+        .{ .method = "GET", .path = "/a/vc7/vusers", .status = 404 },
+        .{ .method = "DELETE", .path = "/1", .status = 404 },
+        .{ .method = "GET", .path = "/ab/1.json", .status = 200, .pattern = "/{p0}/{p1}.json", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p1", .value = "1" },
         } },
+        .{ .method = "GET", .path = "/prejson/users/txt~x/c7", .status = 404 },
+        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "GET", .path = "/atxt_xyz.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/b/b.json", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/xyz.ab/xyz/42~x/axyz_json.txt", .status = 404 },
+        .{ .method = "POST", .path = "/a/v1/va", .status = 404 },
+        .{ .method = "POST", .path = "/b~x/c7", .status = 404 },
+        .{ .method = "PUT", .path = "/a", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/vab/aab_json.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/a/vab/vab", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/vab/prejson/axyz_json.txt", .status = 404 },
+        .{ .method = "GET", .path = "/users/b.json", .status = 200, .pattern = "/{p0}/{p1}.json", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "PUT", .path = "/a-b/xyz", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "POST", .path = "/a.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/a/vtxt/vtxt", .status = 404 },
+        .{ .method = "GET", .path = "/xyz~x", .status = 404 },
+        .{ .method = "PUT", .path = "/a/va/vc7", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b/42.json", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/a/v1/vb", .status = 404 },
+        .{ .method = "POST", .path = "/ac7_users.txt/42-ab", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "PUT", .path = "/users.json/prejson/users-users", .status = 404 },
+        .{ .method = "PUT", .path = "/a/vusers/v42", .status = 200, .pattern = "/a/v{p1}/v{p2:[0-9]+}", .params = &.{
+            .{ .name = "p1", .value = "users" },
+            .{ .name = "p2", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/prexyz/json-42", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "PUT", .path = "/ausers_ab.txt/prexyz", .status = 404 },
+        .{ .method = "GET", .path = "/a-b/42/x.y", .status = 200, .pattern = "/a-b/{p1:[0-9]+}/x.y", .params = &.{
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/a42_b.txt/vc7/txt/xyz/", .status = 404 },
+        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "POST", .path = "/txt/a", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "PUT", .path = "/a1_users.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/a/vab/vab", .status = 404 },
+        .{ .method = "POST", .path = "/json/b.a", .status = 404 },
+        .{ .method = "GET", .path = "/ab/b.json", .status = 200, .pattern = "/{p0}/{p1}.json", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/axyz_b.txt/c7-a/a~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/a-b", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/xyz/1.xyz/axyz_a.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "PUT", .path = "/1/42-1/ab.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/vb/users/a1_a.txt", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/atxt_42.txt", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/{p0}.{q0}/b" },
+        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt/b" },
+        .{ .method = "POST", .pattern = "/v{p0}/" },
+    }, .refused = 0, .cases = &.{
         .{ .method = "POST", .path = "/vtxt/", .status = 200, .pattern = "/v{p0}", .params = &.{
             .{ .name = "p0", .value = "txt" },
         } },
-        .{ .method = "PUT", .path = "/vjson/", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "PUT", .path = "/users-txt/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/json.42/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/prexyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/txt.a/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "q0", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/xyz/b/users", .status = 404 },
+        .{ .method = "POST", .path = "/vc7/", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/preusers/va/a/b/", .status = 404 },
+        .{ .method = "DELETE", .path = "/a.a/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "a" },
+        } },
+        .{ .method = "DELETE", .path = "/ab.users/c7/ab.xyz/1.users", .status = 404 },
+        .{ .method = "GET", .path = "/axyz_a.txt/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/vusers/v1/b/preusers", .status = 404 },
+        .{ .method = "PUT", .path = "/42.42/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/va/vtxt/b/", .status = 404 },
+        .{ .method = "POST", .path = "/vc7/", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/v1/prea", .status = 404 },
+        .{ .method = "POST", .path = "/va/", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/b/vjson/a-b/preab", .status = 404 },
+        .{ .method = "DELETE", .path = "/ajson_1.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/b", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/c7~x/ab-users/json~x/ab", .status = 404 },
+        .{ .method = "DELETE", .path = "/aa_json.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/b", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/prea/users-json/c7-xyz", .status = 404 },
+        .{ .method = "POST", .path = "/vxyz/", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/vtxt/txt-json/x.y/b-json", .status = 404 },
+        .{ .method = "GET", .path = "/vb/", .status = 405, .allow = &.{
             "POST",
         } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "DELETE", .pattern = "/{p0}/{p1}" },
-        .{ .method = "GET", .pattern = "/{p0}/{p1}/{p2}" },
-        .{ .method = "DELETE", .pattern = "/{p0}.json/b/{p2}" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "DELETE", .path = "/1.json/b/1", .status = 200, .pattern = "/{p0}.json/b/{p2}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/1/json~x/a~x", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/a/1", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/v1/1", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "v1" },
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/b/ab", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/42.42/a.json/vtxt/1-42", .status = 404 },
-        .{ .method = "GET", .path = "/b/42/1", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/ab/prexyz/xyz.xyz/a-b/", .status = 404 },
-        .{ .method = "GET", .path = "/xyz/b/42", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/xyz~x/b.xyz/json", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/json.json/b/xyz", .status = 200, .pattern = "/{p0}.json/b/{p2}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p2", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/aa_a.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/ab.json/b/json", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/b/users~x/xyz-a/prea", .status = 404 },
-        .{ .method = "GET", .path = "/ab.json/b/ab", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "ab.json" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "p2", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/1/1-txt/users.1/ab-json/", .status = 404 },
-        .{ .method = "DELETE", .path = "/c7.json/b/b", .status = 200, .pattern = "/{p0}.json/b/{p2}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/json.c7/1-a/preusers", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/json.json/b/b", .status = 200, .pattern = "/{p0}.json/b/{p2}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/a.json", .status = 404 },
-        .{ .method = "DELETE", .path = "/users.json/b/b", .status = 200, .pattern = "/{p0}.json/b/{p2}", .params = &.{
+        .{ .method = "POST", .path = "/ab-b/users", .status = 404 },
+        .{ .method = "POST", .path = "/vusers/", .status = 200, .pattern = "/v{p0}", .params = &.{
             .{ .name = "p0", .value = "users" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/b/42~x/", .status = 404 },
-        .{ .method = "GET", .path = "/a/1/1", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/ac7_42.txt/pretxt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/ab/users", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/prec7/a-b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/ab/txt/b", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/axyz_json.txt/v1", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "axyz_json.txt" },
-            .{ .name = "p1", .value = "v1" },
-        } },
-        .{ .method = "GET", .path = "/xyz/a/b", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/ajson_1.txt/xyz.b/users-users/b", .status = 404 },
-        .{ .method = "DELETE", .path = "/txt.json/b/42", .status = 200, .pattern = "/{p0}.json/b/{p2}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "POST", .path = "/txt/ajson_b.txt/xyz.b", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/json/users", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/axyz_b.txt/", .status = 404 },
-        .{ .method = "GET", .path = "/42/b/c7", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "p2", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/1~x", .status = 404 },
-        .{ .method = "GET", .path = "/users/json/txt", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "p2", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/1/users", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/ac7_b.txt/json~x", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "ac7_b.txt" },
-            .{ .name = "p1", .value = "json~x" },
-        } },
-        .{ .method = "DELETE", .path = "/1.json/b/b", .status = 200, .pattern = "/{p0}.json/b/{p2}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/users.ab/ajson_a.txt/vxyz/aa_c7.txt", .status = 404 },
-        .{ .method = "GET", .path = "/xyz/42/ab", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "ab" },
         } },
         .{ .method = "GET", .path = "/ab", .status = 404 },
-        .{ .method = "GET", .path = "/42/c7/1", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/preab/vc7/prea/ab-c7/", .status = 404 },
-        .{ .method = "GET", .path = "/xyz.json/b/b", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "xyz.json" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/ab_b.txt/txt~x/a", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/c7/txt", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+        .{ .method = "DELETE", .path = "/ac7_b.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/b", .params = &.{
             .{ .name = "p0", .value = "c7" },
+            .{ .name = "q0", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/a42_xyz.txt/va/", .status = 404 },
+        .{ .method = "DELETE", .path = "/axyz_42.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/b", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/ajson_json.txt/prec7/c7~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/users.1/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "q0", .value = "1" },
+        } },
+        .{ .method = "DELETE", .path = "/b.users/json/a/b/", .status = 404 },
+        .{ .method = "POST", .path = "/v1/", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/a.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/ajson_b.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/b", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/users", .status = 404 },
+        .{ .method = "DELETE", .path = "/aa_1.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/b", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/pre1/a/txt.1/c7-xyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/txt.c7/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "q0", .value = "c7" },
+        } },
+        .{ .method = "PUT", .path = "/c7-users/vxyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/json.json/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/a-b/aab_c7.txt", .status = 404 },
+        .{ .method = "POST", .path = "/vtxt/", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/ab-ab", .status = 404 },
+        .{ .method = "PUT", .path = "/vxyz/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/c7/pre1/aa_users.txt", .status = 404 },
+        .{ .method = "GET", .path = "/ac7_json.txt/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/vb/prejson/prexyz/c7~x", .status = 404 },
+        .{ .method = "POST", .path = "/va/", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "DELETE", .path = "/prejson/a-b", .status = 404 },
+        .{ .method = "DELETE", .path = "/a1_ab.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/b", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "q0", .value = "ab" },
+        } },
+        .{ .method = "DELETE", .path = "/a-b/prexyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/json.users/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/users-users/", .status = 404 },
+        .{ .method = "POST", .path = "/v1/", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/1/xyz-b/prejson/", .status = 404 },
+        .{ .method = "DELETE", .path = "/ajson_42.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/b", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/42-users", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "POST", .pattern = "/a" },
+        .{ .method = "PUT", .pattern = "/v1" },
+        .{ .method = "DELETE", .pattern = "/x.y" },
+        .{ .method = "PUT", .pattern = "/x.y/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0}.json" },
+        .{ .method = "POST", .pattern = "/{p0}.{q0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}.{q0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/v{p0}" },
+        .{ .method = "PUT", .pattern = "/v{p0}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0}-{q0}" },
+        .{ .method = "DELETE", .pattern = "/pre{p0}" },
+        .{ .method = "PUT", .pattern = "/{p0}~x" },
+        .{ .method = "POST", .pattern = "/{p0}~x/{p1}" },
+        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "DELETE", .pattern = "/{p0:[0-9]+}.json/{p1}" },
+        .{ .method = "DELETE", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "PUT", .pattern = "/v{p0:[0-9]+}/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "POST", .pattern = "/a-b" },
+        .{ .method = "PUT", .pattern = "/x.y/x.y" },
+        .{ .method = "POST", .pattern = "/users/{p1}" },
+        .{ .method = "GET", .pattern = "/a/a/" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "DELETE", .path = "/a/txt", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a" },
             .{ .name = "p1", .value = "txt" },
         } },
-        .{ .method = "GET", .path = "/a.xyz/vtxt", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/ab~x/vc7/json.users", .status = 404 },
+        .{ .method = "GET", .path = "/vxyz/txt", .status = 405, .allow = &.{
             "DELETE",
+            "PUT",
         } },
-        .{ .method = "DELETE", .path = "/b/c7", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
+        .{ .method = "POST", .path = "/42~x/c7~x", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "c7~x" },
+        } },
+        .{ .method = "DELETE", .path = "/json~x/c7", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "json~x" },
             .{ .name = "p1", .value = "c7" },
         } },
-        .{ .method = "DELETE", .path = "/txt-1/ab-1/42", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/json-ab/c7.1", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/ausers_txt.txt/ab", .status = 405, .allow = &.{
+            "DELETE",
             "GET",
         } },
-        .{ .method = "PUT", .path = "/txt/json", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/vb/vc7", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/1/42/json", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/json.txt/", .status = 404 },
-        .{ .method = "GET", .path = "/b.json/b/42", .status = 200, .pattern = "/{p0}/{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "b.json" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/json.42/ausers_42.txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/c7/1", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+        .{ .method = "GET", .path = "/ab/pre42/42-42", .status = 404 },
+        .{ .method = "DELETE", .path = "/prec7", .status = 200, .pattern = "/pre{p0}", .params = &.{
             .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "1" },
         } },
-        .{ .method = "PUT", .path = "/b/axyz_1.txt/c7~x", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/b-users", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "q0", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/va/txt/users/", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/v42", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/xyz-42", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/ausers_1.txt/prejson/", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/users-42/a", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/vtxt", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "vtxt" },
+        } },
+        .{ .method = "PUT", .path = "/ac7_xyz.txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "ac7_xyz.txt" },
+        } },
+        .{ .method = "PUT", .path = "/a-b", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "a-b" },
+        } },
+        .{ .method = "GET", .path = "/axyz_json.txt/ausers_42.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "json" },
+            .{ .name = "p1", .value = "ausers_42.txt" },
+        } },
+        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/preusers/users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/ab.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/va", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/aab_txt.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "txt" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "PUT", .path = "/1/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/b.users/a/c7-42", .status = 404 },
+        .{ .method = "DELETE", .path = "/json.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "GET", .path = "/pre42", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/vxyz/users", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/users-42", .status = 405, .allow = &.{
             "GET",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/42", .status = 200, .pattern = "/{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/xyz~x/a~x", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/ab.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/vc7/b/a-b", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/b", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "PUT", .path = "/x.y/vxyz/", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/x.y", .status = 200, .pattern = "/x.y/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/1.json/a", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/b-users", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "q0", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/prexyz/vtxt", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/aab_1.txt/txt", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "1" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/aa_txt.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "aa_txt" },
+            .{ .name = "q0", .value = "txt" },
+        } },
+        .{ .method = "GET", .path = "/ajson_c7.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "c7" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/a1_txt.txt/prejson/c7/users-json", .status = 404 },
+        .{ .method = "GET", .path = "/users.json", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/pretxt/", .status = 404 },
+        .{ .method = "POST", .path = "/42-c7", .status = 405, .allow = &.{
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/ab_txt.txt/a~x/c7/json", .status = 404 },
+        .{ .method = "PUT", .path = "/va/b", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/txt.b/42-a/c7/xyz", .status = 404 },
+        .{ .method = "PUT", .path = "/1~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/a-ab/json.b/json.xyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/txt.b", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/c7~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "DELETE", .path = "/a-users/pretxt", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a-users" },
+            .{ .name = "p1", .value = "pretxt" },
         } },
     } },
     .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/users" },
-        .{ .method = "POST", .pattern = "/users" },
-        .{ .method = "PUT", .pattern = "/users" },
+        .{ .method = "PUT", .pattern = "/v{p0}/users/{p2}" },
+        .{ .method = "PUT", .pattern = "/{p0}-{q0}/b/{p2}" },
+        .{ .method = "POST", .pattern = "/{p0}/a/{p2}" },
+        .{ .method = "DELETE", .pattern = "/b/{p1}/x.y" },
+        .{ .method = "DELETE", .pattern = "/{p0}" },
+        .{ .method = "DELETE", .pattern = "/a/a-b" },
+        .{ .method = "PUT", .pattern = "/{p0}/*" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/42-1/json.a/json~x/42", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/xyz/a~x/a42_json.txt/a-users", .status = 404 },
-        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/x.y/json/b~x", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "GET", .path = "/users/ab.42/json-users", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/json/a1_c7.txt/b/ab~x", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/ab/c7.42/prec7", .status = 404 },
-        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "GET", .path = "/ab.42/ac7_1.txt/va", .status = 404 },
-        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/json~x/vjson", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/xyz-a/a/42", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/aab_b.txt/json~x/txt-txt", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/a1_b.txt/b/xyz~x/x.y/", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/json/xyz/users~x/a/", .status = 404 },
-        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/v1", .status = 404 },
-        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/42/1-xyz", .status = 404 },
-        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/1-42", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/1.xyz/1.users/txt", .status = 404 },
-        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/1.xyz/", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/vb", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/vtxt/prexyz", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/a-b/ab_xyz.txt/a.xyz/", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/a", .status = 404 },
-        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "GET", .path = "/b/42.c7", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/vxyz/b-xyz/preab/xyz", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/users/axyz_1.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/a~x/preb", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/vc7/preusers", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "GET", .path = "/txt.c7/c7.ab/x.y", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/b.users/a42_a.txt/ajson_a.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/xyz.ab/prec7", .status = 404 },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
-        .{ .method = "POST", .path = "/x.y/a1_42.txt", .status = 404 },
+        .{ .method = "GET", .path = "/a/a-b", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/users/xyz.42/prexyz", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
+        .{ .method = "POST", .path = "/preusers/b-json/b/vb", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/c7/", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "PUT", .path = "/a1_ab.txt/ajson_1.txt/ab", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "a1_ab.txt" },
+            .{ .name = "*", .value = "ajson_1.txt/ab" },
+        } },
+        .{ .method = "PUT", .path = "/1/", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "POST", .path = "/b-txt", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/a/a-42/a", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "*", .value = "a-42/a" },
+        } },
+        .{ .method = "DELETE", .path = "/preusers/a.users/v1", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/xyz/a/users", .status = 200, .pattern = "/{p0}/a/{p2}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "p2", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/prexyz/b/c7/prec7", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/1/", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "DELETE", .path = "/xyz~x", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz~x" },
+        } },
+        .{ .method = "POST", .path = "/a/a/txt", .status = 200, .pattern = "/{p0}/a/{p2}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p2", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/a1_txt.txt/x.y", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/json/a/txt", .status = 200, .pattern = "/{p0}/a/{p2}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p2", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/b/v1", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "*", .value = "v1" },
+        } },
+        .{ .method = "PUT", .path = "/42-users/b/users", .status = 200, .pattern = "/{p0}-{q0}/b/{p2}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "q0", .value = "users" },
+            .{ .name = "p2", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/preb", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "preb" },
+        } },
+        .{ .method = "DELETE", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
+        .{ .method = "POST", .path = "/users/ab", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/a/a/b", .status = 200, .pattern = "/{p0}/a/{p2}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p2", .value = "b" },
+        } },
+        .{ .method = "PUT", .path = "/txt~x/xyz/a/json~x", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "txt~x" },
+            .{ .name = "*", .value = "xyz/a/json~x" },
+        } },
+        .{ .method = "PUT", .path = "/b-txt/b/ab", .status = 200, .pattern = "/{p0}-{q0}/b/{p2}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "q0", .value = "txt" },
+            .{ .name = "p2", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/v1/v1/vxyz/txt.txt", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "v1" },
+            .{ .name = "*", .value = "v1/vxyz/txt.txt" },
+        } },
+        .{ .method = "PUT", .path = "/ab/v1", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "*", .value = "v1" },
+        } },
+        .{ .method = "GET", .path = "/ab~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/xyz/vtxt/ajson_ab.txt", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "*", .value = "vtxt/ajson_ab.txt" },
+        } },
+        .{ .method = "GET", .path = "/vjson/a~x/xyz.42/1.a", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/vb/42-1", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "vb" },
+            .{ .name = "*", .value = "42-1" },
+        } },
+        .{ .method = "PUT", .path = "/1/ac7_b.txt/aab_json.txt", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "*", .value = "ac7_b.txt/aab_json.txt" },
+        } },
+        .{ .method = "GET", .path = "/preb/c7/ajson_a.txt", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/txt/", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "POST", .path = "/c7/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/xyz/txt-b", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "*", .value = "txt-b" },
+        } },
+        .{ .method = "GET", .path = "/txt~x/b", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
+        .{ .method = "GET", .path = "/a/ab-users/a42_42.txt/preab", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/b/1/x.y", .status = 200, .pattern = "/b/{p1}/x.y", .params = &.{
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/b-ab/va/users", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/vxyz/users/42", .status = 200, .pattern = "/v{p0}/users/{p2}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "p2", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/v1", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/vjson/users/txt", .status = 200, .pattern = "/v{p0}/users/{p2}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p2", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/1/ab~x/a-b", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "*", .value = "ab~x/a-b" },
+        } },
+        .{ .method = "PUT", .path = "/1-txt/b/1", .status = 200, .pattern = "/{p0}-{q0}/b/{p2}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "q0", .value = "txt" },
+            .{ .name = "p2", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/b/json~x/vb", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/b/ab/x.y", .status = 200, .pattern = "/b/{p1}/x.y", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/vc7", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/b-c7/b/xyz", .status = 200, .pattern = "/{p0}-{q0}/b/{p2}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "q0", .value = "c7" },
+            .{ .name = "p2", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/prea/b/v1/json", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/b/b/42.xyz", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/preusers/users/txt-ab/42.c7", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/b/42/x.y", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "*", .value = "42/x.y" },
+        } },
+        .{ .method = "GET", .path = "/ab/xyz/b~x/42", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
+        .{ .method = "PUT", .path = "/a/1-users/1", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "*", .value = "1-users/1" },
+        } },
+        .{ .method = "DELETE", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
+        .{ .method = "GET", .path = "/ac7_txt.txt/xyz/b", .status = 405, .allow = &.{
+            "PUT",
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "POST", .pattern = "/x.y" },
+        .{ .method = "DELETE", .pattern = "/users" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "POST", .path = "/preab/json/b/xyz", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/c7/b", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/a-b/json-c7", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "GET", .path = "/v1/txt/ab.c7/aab_a.txt", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/ab-txt/v1/ab_json.txt/va", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/pretxt/a/a42_ab.txt/b~x", .status = 404 },
+        .{ .method = "PUT", .path = "/users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/ajson_txt.txt/v1/vb/a42_a.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/json~x/aa_42.txt/b/users.a", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/a-b/ausers_json.txt", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/42~x/txt.json/", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "POST", .path = "/b.b/1/preusers/users/", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "POST", .path = "/a1_txt.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/a.xyz/ab~x/preab/json", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/users.a/xyz.txt/v1/ab-users", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "GET", .path = "/b", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "GET", .path = "/json~x/users", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/xyz.a/json~x/a1_c7.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/xyz-json/vxyz/users~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/users~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "GET", .path = "/txt/xyz/aa_txt.txt/prec7", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/ajson_json.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/b/b~x/aab_json.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/users/pre42/ab.42/c7.users", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/42.1/a/b", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/a.b/aa_1.txt", .status = 404 },
+        .{ .method = "POST", .path = "/users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/b~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/axyz_json.txt/ab_json.txt/atxt_xyz.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/a-c7", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/b/a", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/1-xyz/preusers", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/{p0}/a/{p2}" },
+        .{ .method = "DELETE", .pattern = "/*" },
+        .{ .method = "POST", .pattern = "/x.y" },
+        .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "GET", .pattern = "/v1/" },
+        .{ .method = "POST", .pattern = "/a/{p1:[a-z]+}" },
+        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "DELETE", .pattern = "/{p0:[0-9]+}/{p1}.json/users" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "DELETE", .path = "/a-a", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a-a" },
+        } },
+        .{ .method = "DELETE", .path = "/x.y/42~x/axyz_ab.txt/a", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "x.y/42~x/axyz_ab.txt/a" },
+        } },
+        .{ .method = "GET", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/1.a/aa_c7.txt/va/ab~x", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "1.a/aa_c7.txt/va/ab~x" },
+        } },
+        .{ .method = "POST", .path = "/a/1", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/b/ab_xyz.txt/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/x.y", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "x.y" },
+        } },
+        .{ .method = "PUT", .path = "/b-a/json/txt-a", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/1", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/txt/prejson/prexyz/xyz/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/b", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "PUT", .path = "/ausers_b.txt/b/vxyz/va", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/atxt_users.txt/txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "atxt_users.txt/txt" },
+        } },
+        .{ .method = "DELETE", .path = "/xyz/42.json/users", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "xyz/42.json/users" },
+        } },
+        .{ .method = "PUT", .path = "/b/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/preusers/a42_42.txt/a", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "preusers/a42_42.txt/a" },
+        } },
+        .{ .method = "PUT", .path = "/a/users.json/users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/42/preab", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/ab/1.json/users", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "ab/1.json/users" },
+        } },
+        .{ .method = "POST", .path = "/json-users/ab/1/a~x/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/1/users~x/xyz-json", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/a", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/pretxt/json-xyz/users~x/users-c7", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/xyz~x/b/json.c7/preusers", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "GET", .path = "/preab/a-b/xyz~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/ab.c7/xyz/c7/x.y", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "ab.c7/xyz/c7/x.y" },
+        } },
+        .{ .method = "POST", .path = "/c7/a/42", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/aa_42.txt", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/users/1.json/users", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "users/1.json/users" },
+        } },
+        .{ .method = "POST", .path = "/users/x.y/prexyz/pre42", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/a1_json.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "q0", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/users~x/users.a/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/a/ab", .status = 200, .pattern = "/a/{p1:[a-z]+}", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/ab.c7/prexyz/ab/ab.xyz", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/a-users", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/a-txt", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/users/b.json/users", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "users/b.json/users" },
+        } },
+        .{ .method = "POST", .path = "/xyz/ab/users.json/ab.a", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/preab/a~x/c7.a", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/42-b/a~x/c7/v1", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/json/a/1", .status = 200, .pattern = "/{p0}/a/{p2}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p2", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/ab~x/axyz_xyz.txt", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/users~x/1-a/users-json/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/a/users.json/users", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a/users.json/users" },
+        } },
+        .{ .method = "GET", .path = "/txt/aa_1.txt", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/a" },
+        .{ .method = "POST", .pattern = "/v1" },
+        .{ .method = "POST", .pattern = "/x.y" },
+        .{ .method = "PUT", .pattern = "/x.y/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0}.json" },
+        .{ .method = "DELETE", .pattern = "/{p0}.{q0}" },
+        .{ .method = "DELETE", .pattern = "/v{p0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}-{q0}" },
+        .{ .method = "GET", .pattern = "/{p0}-{q0}/{p1}" },
+        .{ .method = "POST", .pattern = "/pre{p0}" },
+        .{ .method = "POST", .pattern = "/pre{p0}/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0}~x" },
+        .{ .method = "GET", .pattern = "/{p0}~x/{p1}" },
+        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-z]+}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "DELETE", .pattern = "/{p0:[0-9]+}.json/{p1}" },
+        .{ .method = "DELETE", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/v{p0:[0-9]+}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-c]+}-{q0}/{p1}" },
+        .{ .method = "PUT", .pattern = "/users" },
+        .{ .method = "POST", .pattern = "/a/{p1:[0-9]+}.json/b" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "DELETE", .path = "/42.a", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "q0", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/users~x", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users~x" },
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/txt.a/prejson/users", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/a.json/b", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/preusers/json", .status = 404 },
+        .{ .method = "PUT", .path = "/va/txt", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/users/json-users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/json.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/users/v1/xyz~x/vab", .status = 404 },
+        .{ .method = "POST", .path = "/a/ab.json/b", .status = 404 },
+        .{ .method = "DELETE", .path = "/axyz_b.txt/ab.a/ab", .status = 404 },
+        .{ .method = "GET", .path = "/txt-b", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt-b" },
+        } },
+        .{ .method = "POST", .path = "/pretxt/b.b/vusers", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/json/a-b/v1/1", .status = 404 },
+        .{ .method = "DELETE", .path = "/vxyz", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/preab/json.ab/", .status = 404 },
+        .{ .method = "GET", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "DELETE", .path = "/1~x/ab-42/preb", .status = 404 },
+        .{ .method = "GET", .path = "/a42_1.txt/ab", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "q0", .value = "1" },
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "POST", .path = "/vc7/b-users/vjson/a", .status = 404 },
+        .{ .method = "GET", .path = "/b-b", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "q0", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/v1/", .status = 404 },
+        .{ .method = "GET", .path = "/va/txt", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/c7~x/txt.42/txt-1", .status = 404 },
+        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "GET", .path = "/c7-42", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7-42" },
+        } },
+        .{ .method = "DELETE", .path = "/json/json.json/preab", .status = 404 },
+        .{ .method = "GET", .path = "/ajson_txt.txt/txt", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "txt" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "GET", .path = "/vusers/pre1/txt~x/xyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/xyz-c7", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "c7" },
+        } },
+        .{ .method = "GET", .path = "/json~x", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "json~x" },
+        } },
+        .{ .method = "POST", .path = "/json/users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/prea/c7.c7/preab/1~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/xyz.json/xyz", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "xyz.json" },
+            .{ .name = "p1", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/v1/vjson/preab/42", .status = 404 },
+        .{ .method = "GET", .path = "/vusers/users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/b.xyz/ab-xyz/a/pretxt", .status = 404 },
+        .{ .method = "GET", .path = "/a-txt/a", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "txt" },
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/xyz~x/preab", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/x.y/42", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/vb", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "vb" },
+        } },
+        .{ .method = "GET", .path = "/a-a/txt", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "a" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/ab/", .status = 404 },
+        .{ .method = "GET", .path = "/xyz-b/1", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "b" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/ac7_42.txt/xyz.xyz/prexyz/1.json", .status = 404 },
+        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/a-txt/b/ajson_users.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/vab", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/json.42/a1_42.txt/json.b", .status = 404 },
+        .{ .method = "GET", .path = "/a~x/c7", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p1", .value = "c7" },
+        } },
+        .{ .method = "GET", .path = "/42-users/txt/a42_c7.txt/pre42", .status = 404 },
+        .{ .method = "DELETE", .path = "/vb", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/json~x/va/ausers_a.txt/b", .status = 404 },
+        .{ .method = "DELETE", .path = "/42/1", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/1-a/users/atxt_1.txt/vc7/", .status = 404 },
+        .{ .method = "GET", .path = "/xyz.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/vc7/users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}.json/{p1}.json" },
+        .{ .method = "GET", .pattern = "/{p0}/" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/c7/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "DELETE", .path = "/ajson_txt.txt/preusers/vxyz", .status = 404 },
+        .{ .method = "GET", .path = "/42/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/vxyz/users", .status = 404 },
+        .{ .method = "GET", .path = "/1/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/a1_json.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/c7.json/ab.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/c7~x/xyz.b/ac7_b.txt", .status = 404 },
+        .{ .method = "GET", .path = "/xyz/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "PUT", .path = "/1-users/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/a/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/preusers/c7/users", .status = 404 },
+        .{ .method = "GET", .path = "/txt/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/json-ab/c7.ab/b/aa_xyz.txt", .status = 404 },
+        .{ .method = "POST", .path = "/1.json/ab.json", .status = 200, .pattern = "/{p0:[0-9]+}.json/{p1}.json", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/42", .status = 404 },
+        .{ .method = "POST", .path = "/txt.json/1.json", .status = 404 },
+        .{ .method = "PUT", .path = "/a/txt~x/c7~x/a~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab.json/users.json", .status = 404 },
+        .{ .method = "PUT", .path = "/txt/pre42/c7.1/a", .status = 404 },
+        .{ .method = "POST", .path = "/1/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/a~x/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/json.json/b.json", .status = 404 },
+        .{ .method = "PUT", .path = "/prexyz/pretxt/a/ab", .status = 404 },
+        .{ .method = "POST", .path = "/users.json/42.json", .status = 404 },
+        .{ .method = "GET", .path = "/42-1/json", .status = 404 },
+        .{ .method = "POST", .path = "/txt.json/ab.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/preab/vusers/1-c7", .status = 404 },
+        .{ .method = "POST", .path = "/users.json/b.json", .status = 404 },
+        .{ .method = "PUT", .path = "/a/ab-xyz", .status = 404 },
+        .{ .method = "POST", .path = "/a.json/users.json", .status = 404 },
+        .{ .method = "POST", .path = "/axyz_xyz.txt", .status = 404 },
+        .{ .method = "GET", .path = "/1/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/xyz-a/txt", .status = 404 },
+        .{ .method = "POST", .path = "/users.json/a.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/prejson/json~x/users", .status = 404 },
+        .{ .method = "GET", .path = "/1.json/users.json", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/1/c7", .status = 404 },
+        .{ .method = "POST", .path = "/1.json/42.json", .status = 200, .pattern = "/{p0:[0-9]+}.json/{p1}.json", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/pretxt/json/pretxt/xyz", .status = 404 },
+        .{ .method = "POST", .path = "/a.json/txt.json", .status = 404 },
+        .{ .method = "POST", .path = "/a/ab.b", .status = 404 },
+        .{ .method = "POST", .path = "/users.json/b.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/axyz_json.txt/xyz/txt", .status = 404 },
+        .{ .method = "GET", .path = "/users/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/pretxt/xyz/json.c7/1~x", .status = 404 },
+        .{ .method = "PUT", .path = "/42.json/txt.json", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/xyz-c7/1~x/a-42/txt", .status = 404 },
+        .{ .method = "POST", .path = "/txt.json/users.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab~x/x.y/json.json", .status = 404 },
+        .{ .method = "POST", .path = "/ab.json/b.json", .status = 404 },
+        .{ .method = "PUT", .path = "/pretxt/1/axyz_a.txt/b", .status = 404 },
+        .{ .method = "GET", .path = "/txt/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/xyz/a1_ab.txt/aa_1.txt", .status = 404 },
+        .{ .method = "POST", .path = "/json.json/b.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/txt/aa_users.txt/b~x", .status = 404 },
+        .{ .method = "GET", .path = "/users/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/ajson_users.txt/pre1/", .status = 404 },
+        .{ .method = "GET", .path = "/b/", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/vusers/v1/xyz-42", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "DELETE", .pattern = "/{p0}.{q0}/v1" },
+        .{ .method = "DELETE", .pattern = "/a-b/v1/v1" },
+        .{ .method = "PUT", .pattern = "/{p0}/{p1}.json/{p2}-{q2}" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "POST", .pattern = "/v{p0}/{p1}/" },
+        .{ .method = "DELETE", .pattern = "/users" },
+        .{ .method = "GET", .pattern = "/b" },
+        .{ .method = "PUT", .pattern = "/a-b" },
+        .{ .method = "POST", .pattern = "/a-b" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/xyz/a~x/v42/users", .status = 404 },
+        .{ .method = "PUT", .path = "/b", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/b/ajson_a.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/txt/1.json/xyz-1", .status = 200, .pattern = "/{p0}/{p1}.json/{p2}-{q2}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "p1", .value = "1" },
+            .{ .name = "p2", .value = "xyz" },
+            .{ .name = "q2", .value = "1" },
+        } },
+        .{ .method = "DELETE", .path = "/x.y/ausers_xyz.txt", .status = 404 },
+        .{ .method = "GET", .path = "/vab/42/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/ajson_xyz.txt/json", .status = 404 },
+        .{ .method = "DELETE", .path = "/a-b/v1/v1", .status = 200, .pattern = "/a-b/v1/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/users~x/txt-a/", .status = 404 },
+        .{ .method = "PUT", .path = "/users", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/xyz-users/b", .status = 404 },
+        .{ .method = "POST", .path = "/users", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/b-ab/c7.json/c7~x", .status = 404 },
+        .{ .method = "PUT", .path = "/ab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/ab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/a-b/v1/v1", .status = 200, .pattern = "/a-b/v1/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/b.a/c7-txt", .status = 404 },
+        .{ .method = "PUT", .path = "/ab.json", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/prec7/json.users", .status = 404 },
+        .{ .method = "PUT", .path = "/json", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/txt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/a-b/v1/v1", .status = 200, .pattern = "/a-b/v1/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/txt.json/42.json", .status = 404 },
+        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "PUT", .path = "/ab/vab", .status = 404 },
+        .{ .method = "GET", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "GET", .path = "/atxt_txt.txt/ajson_a.txt/pre42/c7/", .status = 404 },
+        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "PUT", .path = "/x.y/vtxt/a~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "GET", .path = "/a/xyz/a~x/aab_42.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/json/a.json/c7-c7", .status = 200, .pattern = "/{p0}/{p1}.json/{p2}-{q2}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p1", .value = "a" },
+            .{ .name = "p2", .value = "c7" },
+            .{ .name = "q2", .value = "c7" },
+        } },
+        .{ .method = "PUT", .path = "/txt-b", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/ab/json.json/b-txt", .status = 200, .pattern = "/{p0}/{p1}.json/{p2}-{q2}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p1", .value = "json" },
+            .{ .name = "p2", .value = "b" },
+            .{ .name = "q2", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/ausers_users.txt/v1", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/vjson/prea", .status = 404 },
+        .{ .method = "GET", .path = "/1", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/b/vc7", .status = 404 },
+        .{ .method = "DELETE", .path = "/a-b/v1/v1", .status = 200, .pattern = "/a-b/v1/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/users", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/a", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/a-b/v1/v1", .status = 200, .pattern = "/a-b/v1/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/preb", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/a", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/vab/xyz/a~x/ab~x", .status = 404 },
+        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "POST", .path = "/42-users/vusers", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "PUT", .path = "/vusers", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/a-c7/x.y/users~x", .status = 404 },
+        .{ .method = "PUT", .path = "/1/c7.json/a-1", .status = 200, .pattern = "/{p0}/{p1}.json/{p2}-{q2}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "c7" },
+            .{ .name = "p2", .value = "a" },
+            .{ .name = "q2", .value = "1" },
+        } },
+        .{ .method = "DELETE", .path = "/txt/42-1/atxt_users.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/a-b/v1/v1", .status = 200, .pattern = "/a-b/v1/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/vjson/json/json.c7", .status = 404 },
+        .{ .method = "DELETE", .path = "/a-b/v1/v1", .status = 200, .pattern = "/a-b/v1/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/users.ab/va/xyz-ab", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "GET", .pattern = "/v{p0}/{p1}/b" },
+        .{ .method = "PUT", .pattern = "/{p0}/a/{p2}/" },
+        .{ .method = "DELETE", .pattern = "/b/" },
+        .{ .method = "POST", .pattern = "/a-b/a/{p2:[a-z]+}" },
+        .{ .method = "PUT", .pattern = "/a-b/a{p1}_{q1}.txt/v1" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "POST", .path = "/va/b/b", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/a-txt/a~x/json-c7", .status = 404 },
+        .{ .method = "PUT", .path = "/users/a/txt/", .status = 200, .pattern = "/{p0}/a/{p2}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "p2", .value = "txt" },
+        } },
+        .{ .method = "GET", .path = "/v1/", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/a/b", .status = 200, .pattern = "/a-b/a/{p2:[a-z]+}", .params = &.{
+            .{ .name = "p2", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/pre42", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/a/b", .status = 200, .pattern = "/a-b/a/{p2:[a-z]+}", .params = &.{
+            .{ .name = "p2", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/json/1/preb/b", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/txt/c7/", .status = 404 },
+        .{ .method = "PUT", .path = "/c7/a/1/", .status = 200, .pattern = "/{p0}/a/{p2}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "p2", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/x.y/1/vxyz", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b/axyz_ab.txt/v1", .status = 200, .pattern = "/a-b/a{p1}_{q1}.txt/v1", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+            .{ .name = "q1", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/c7.xyz/1-xyz/42", .status = 404 },
+        .{ .method = "PUT", .path = "/1/a/42/", .status = 200, .pattern = "/{p0}/a/{p2}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p2", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/prea/ab-a/", .status = 404 },
+        .{ .method = "GET", .path = "/vusers/txt/b", .status = 200, .pattern = "/v{p0}/{p1}/b", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/users/pre42/b", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "GET", .path = "/ac7_a.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/ajson_ab.txt/json.json", .status = 404 },
+        .{ .method = "GET", .path = "/v1/c7/b", .status = 200, .pattern = "/v{p0}/{p1}/b", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/users.txt", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/a/42", .status = 404 },
+        .{ .method = "GET", .path = "/a-b/prec7/users/a", .status = 404 },
+        .{ .method = "PUT", .path = "/txt/a/b/", .status = 200, .pattern = "/{p0}/a/{p2}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "p2", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/b/ac7_json.txt/json/vtxt", .status = 404 },
+        .{ .method = "GET", .path = "/vjson/json/b", .status = 200, .pattern = "/v{p0}/{p1}/b", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/users/json/c7/a42_42.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "GET", .path = "/c7/42", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/xyz/1/a/prea", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/a/users", .status = 200, .pattern = "/a-b/a/{p2:[a-z]+}", .params = &.{
+            .{ .name = "p2", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/42.xyz/vxyz", .status = 404 },
+        .{ .method = "GET", .path = "/a-b/a/txt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/txt-c7/ajson_json.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/txt/users~x/", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b/ausers_xyz.txt/v1", .status = 200, .pattern = "/a-b/a{p1}_{q1}.txt/v1", .params = &.{
+            .{ .name = "p1", .value = "users" },
+            .{ .name = "q1", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/1/xyz-json", .status = 404 },
+        .{ .method = "PUT", .path = "/json/a/ab/", .status = 200, .pattern = "/{p0}/a/{p2}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p2", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/1.xyz/xyz~x", .status = 404 },
+        .{ .method = "GET", .path = "/vjson/42/b", .status = 200, .pattern = "/v{p0}/{p1}/b", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/b/users.txt/a1_ab.txt/v1", .status = 404 },
+        .{ .method = "PUT", .path = "/json/a/c7/", .status = 200, .pattern = "/{p0}/a/{p2}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p2", .value = "c7" },
+        } },
+        .{ .method = "PUT", .path = "/xyz.42/atxt_a.txt/txt~x", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/a/ab", .status = 200, .pattern = "/a-b/a/{p2:[a-z]+}", .params = &.{
+            .{ .name = "p2", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/b~x", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b/ac7_xyz.txt/v1", .status = 200, .pattern = "/a-b/a{p1}_{q1}.txt/v1", .params = &.{
+            .{ .name = "p1", .value = "c7" },
+            .{ .name = "q1", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/txt~x/ac7_a.txt/xyz~x/va", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "GET", .path = "/a/aab_42.txt/atxt_42.txt/", .status = 404 },
+        .{ .method = "GET", .path = "/vjson/txt/b", .status = 200, .pattern = "/v{p0}/{p1}/b", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/1-json/c7~x", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/a/json", .status = 200, .pattern = "/a-b/a/{p2:[a-z]+}", .params = &.{
+            .{ .name = "p2", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/a/xyz", .status = 200, .pattern = "/a-b/a/{p2:[a-z]+}", .params = &.{
+            .{ .name = "p2", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/xyz/pre42/json-b", .status = 404 },
     } },
     .{ .routes = &.{
         .{ .method = "DELETE", .pattern = "/a" },
@@ -6977,2532 +4351,4735 @@ pub const tables = [_]Table{
         .{ .method = "DELETE", .pattern = "/v1" },
         .{ .method = "DELETE", .pattern = "/x.y" },
         .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}/{p1}" },
         .{ .method = "GET", .pattern = "/{p0}.json" },
-        .{ .method = "GET", .pattern = "/{p0}.{q0}" },
-        .{ .method = "GET", .pattern = "/{p0}.{q0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/v{p0}" },
-        .{ .method = "PUT", .pattern = "/v{p0}/{p1}" },
-        .{ .method = "POST", .pattern = "/{p0}-{q0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}.json/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0}.{q0}" },
+        .{ .method = "POST", .pattern = "/v{p0}" },
+        .{ .method = "POST", .pattern = "/v{p0}/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0}-{q0}" },
+        .{ .method = "GET", .pattern = "/{p0}-{q0}/{p1}" },
         .{ .method = "GET", .pattern = "/pre{p0}" },
-        .{ .method = "GET", .pattern = "/{p0}~x" },
-        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "POST", .pattern = "/x.y/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}/v1" },
-        .{ .method = "PUT", .pattern = "/pre{p0}/b/*" },
-        .{ .method = "GET", .pattern = "/v{p0}/a-b" },
-        .{ .method = "POST", .pattern = "/pre{p0}/users" },
-        .{ .method = "GET", .pattern = "/{p0}/{p1}-{q1}" },
+        .{ .method = "GET", .pattern = "/pre{p0}/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0}~x" },
+        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-z]+}/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "GET", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-c]+}-{q0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/users/x.y/*" },
+        .{ .method = "DELETE", .pattern = "/{p0}" },
+        .{ .method = "PUT", .pattern = "/{p0}" },
+        .{ .method = "GET", .pattern = "/x.y/v1/a" },
+        .{ .method = "GET", .pattern = "/b/*" },
+        .{ .method = "PUT", .pattern = "/{p0}.{q0}/a/{p2}" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}/{p1}~x/{p2:[a-c]+}-{q2}" },
+        .{ .method = "DELETE", .pattern = "/a-b/a{p1}_{q1}.txt/v1" },
+        .{ .method = "POST", .pattern = "/a/users/" },
+        .{ .method = "GET", .pattern = "/v{p0}/users/{p2}-{q2}" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/b.xyz/b", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/b~x/txt-xyz/prec7/ab", .status = 404 },
-        .{ .method = "GET", .path = "/a.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/va/c7/b.a", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/a-users/aa_a.txt/aa_c7.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/pretxt/b/vusers", .status = 200, .pattern = "/pre{p0}/b/*", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "*", .value = "vusers" },
-        } },
-        .{ .method = "DELETE", .path = "/42~x/prea/a-b", .status = 404 },
-        .{ .method = "POST", .path = "/a-a", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/v1", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/ab-json", .status = 405, .allow = &.{
             "DELETE",
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/1", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/b~x/aa_txt.txt/preb", .status = 404 },
-        .{ .method = "POST", .path = "/vtxt", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/42", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/ab-json/ac7_ab.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/json/v1", .status = 200, .pattern = "/{p0}/v1", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/preab/v42/txt~x/pre42", .status = 404 },
-        .{ .method = "GET", .path = "/1.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/ab-ab/json~x/ab_a.txt/c7.users", .status = 404 },
-        .{ .method = "GET", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/aab_c7.txt/aa_a.txt/b-42/c7", .status = 404 },
-        .{ .method = "GET", .path = "/c7/b-users", .status = 200, .pattern = "/{p0}/{p1}-{q1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "q1", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/c7.xyz", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/ajson_xyz.txt/preb/ausers_txt.txt/preab", .status = 404 },
-        .{ .method = "DELETE", .path = "/1", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/42/42/b/txt-42", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/b-42/", .status = 404 },
-        .{ .method = "POST", .path = "/preb/users", .status = 200, .pattern = "/pre{p0}/users", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/xyz-json/42~x/42~x", .status = 404 },
-        .{ .method = "GET", .path = "/c7.42/a", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "42" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/pre1/vb/", .status = 404 },
-        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/ausers_ab.txt/json-b/42~x", .status = 404 },
-        .{ .method = "GET", .path = "/txt.b", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/c7~x/b/ab_json.txt/", .status = 404 },
-        .{ .method = "DELETE", .path = "/preusers", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/ajson_users.txt/42/vb", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "POST", .path = "/x.y/1.users/a~x/a", .status = 404 },
-        .{ .method = "PUT", .path = "/preusers/b/atxt_ab.txt", .status = 200, .pattern = "/pre{p0}/b/*", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "*", .value = "atxt_ab.txt" },
-        } },
-        .{ .method = "PUT", .path = "/aab_b.txt/xyz/pretxt", .status = 404 },
-        .{ .method = "PUT", .path = "/pretxt/b/", .status = 200, .pattern = "/pre{p0}/b/*", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "GET", .path = "/vjson/1~x/42", .status = 404 },
-        .{ .method = "POST", .path = "/x.y/1", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/x.y", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/vc7/a-b", .status = 200, .pattern = "/v{p0}/a-b", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/xyz~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/a~x", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/vtxt/users~x/xyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/users", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/prea", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/va/42", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/json-b", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "json-b" },
-        } },
-        .{ .method = "DELETE", .path = "/ab~x", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/pre1/users", .status = 200, .pattern = "/pre{p0}/users", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/users.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "DELETE", .path = "/xyz/a42_c7.txt/x.y", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/b/a/*" },
-        .{ .method = "POST", .pattern = "/a/{p1}~x/pre{p2}" },
-        .{ .method = "DELETE", .pattern = "/{p0}/v1" },
-        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt/{p1}~x/{p2}.json/" },
-        .{ .method = "PUT", .pattern = "/b/a/a{p2}_{q2}.txt" },
-        .{ .method = "POST", .pattern = "/{p0}" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/a/c7~x/prea", .status = 200, .pattern = "/a/{p1}~x/pre{p2}", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "p2", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/users/ajson_b.txt", .status = 404 },
-        .{ .method = "GET", .path = "/b/a/aa_a.txt", .status = 200, .pattern = "/b/a/*", .params = &.{
-            .{ .name = "*", .value = "aa_a.txt" },
-        } },
-        .{ .method = "GET", .path = "/json~x/a-b", .status = 404 },
-        .{ .method = "POST", .path = "/b/a/ajson_xyz.txt", .status = 405, .allow = &.{
             "GET",
             "PUT",
         } },
-        .{ .method = "GET", .path = "/a/vb/v1", .status = 404 },
-        .{ .method = "POST", .path = "/b/a/a/42-ab", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/prexyz/a1_xyz.txt", .status = 405, .allow = &.{
+            "DELETE",
             "GET",
         } },
-        .{ .method = "GET", .path = "/pre42", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "PUT", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
         } },
-        .{ .method = "DELETE", .path = "/txt/v1", .status = 200, .pattern = "/{p0}/v1", .params = &.{
+        .{ .method = "PUT", .path = "/ab_txt.txt/42~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/x.y", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/c7~x/1", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/vjson/users/a-b", .status = 200, .pattern = "/v{p0}/users/{p2}-{q2}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p2", .value = "a" },
+            .{ .name = "q2", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/json/b~x/users~x/x.y", .status = 404 },
+        .{ .method = "GET", .path = "/txt.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
             .{ .name = "p0", .value = "txt" },
         } },
-        .{ .method = "DELETE", .path = "/c7/users/1", .status = 404 },
-        .{ .method = "POST", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
+        .{ .method = "DELETE", .path = "/xyz.xyz", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz.xyz" },
+        } },
+        .{ .method = "PUT", .path = "/a/users/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/42.c7/prexyz", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/a/txt", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/1", .status = 200, .pattern = "/{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/prec7", .status = 200, .pattern = "/pre{p0}", .params = &.{
             .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "POST", .path = "/a42_users.txt", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a42_users.txt" },
-        } },
-        .{ .method = "GET", .path = "/b/a/prexyz/pre42", .status = 200, .pattern = "/b/a/*", .params = &.{
-            .{ .name = "*", .value = "prexyz/pre42" },
-        } },
-        .{ .method = "DELETE", .path = "/vjson/vtxt/b-a/json", .status = 404 },
-        .{ .method = "POST", .path = "/a/json~x/pre42", .status = 200, .pattern = "/a/{p1}~x/pre{p2}", .params = &.{
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/atxt_ab.txt/preb/b.xyz/vab", .status = 404 },
-        .{ .method = "GET", .path = "/b/a/prejson/pre42", .status = 200, .pattern = "/b/a/*", .params = &.{
-            .{ .name = "*", .value = "prejson/pre42" },
-        } },
-        .{ .method = "DELETE", .path = "/ac7_b.txt", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/c7~x/json.txt/vtxt/42", .status = 404 },
-        .{ .method = "PUT", .path = "/b/a/a1_1.txt", .status = 200, .pattern = "/b/a/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p2", .value = "1" },
-            .{ .name = "q2", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/ab/ab/users/xyz-1", .status = 404 },
-        .{ .method = "PUT", .path = "/42", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/c7-json/users", .status = 404 },
-        .{ .method = "PUT", .path = "/b/a/aa_1.txt", .status = 200, .pattern = "/b/a/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p2", .value = "a" },
-            .{ .name = "q2", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/prexyz/a.xyz/ac7_c7.txt/preb", .status = 404 },
-        .{ .method = "PUT", .path = "/b/a/ac7_ab.txt", .status = 200, .pattern = "/b/a/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p2", .value = "c7" },
-            .{ .name = "q2", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/txt/", .status = 404 },
-        .{ .method = "PUT", .path = "/a42_txt.txt/a~x/users.json/", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}~x/{p2}.json", .params = &.{
-            .{ .name = "p0", .value = "42" },
+        .{ .method = "POST", .path = "/xyz/prea/ac7_json.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/ajson_txt.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+            .{ .name = "p0", .value = "json" },
             .{ .name = "q0", .value = "txt" },
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "p2", .value = "users" },
         } },
-        .{ .method = "GET", .path = "/preb", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/a1_json.txt/1~x/a.json/", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}~x/{p2}.json", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "json" },
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "p2", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/vtxt/a", .status = 404 },
-        .{ .method = "POST", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/c7~x", .status = 200, .pattern = "/{p0}", .params = &.{
+        .{ .method = "DELETE", .path = "/c7~x", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "c7~x" },
         } },
-        .{ .method = "PUT", .path = "/ac7_ab.txt/users~x/txt.json/", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}~x/{p2}.json", .params = &.{
+        .{ .method = "DELETE", .path = "/xyz.json/b", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/42-ab/ajson_json.txt/users/a", .status = 404 },
+        .{ .method = "GET", .path = "/b/", .status = 200, .pattern = "/b/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "GET", .path = "/txt/users/c7-users/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/42.json/txt", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/a42_json.txt/prec7", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/b/", .status = 200, .pattern = "/b/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "GET", .path = "/xyz~x/users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/a1_xyz.txt", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/b.b", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "b.b" },
+        } },
+        .{ .method = "PUT", .path = "/users/a~x/42-txt", .status = 404 },
+        .{ .method = "POST", .path = "/42.b/a/users-b/", .status = 404 },
+        .{ .method = "DELETE", .path = "/a.json/a", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "DELETE", .path = "/a-42", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/42/b~x/a-txt", .status = 200, .pattern = "/{p0:[0-9]+}/{p1}~x/{p2:[a-c]+}-{q2}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "b" },
+            .{ .name = "p2", .value = "a" },
+            .{ .name = "q2", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/1.a/xyz~x/xyz/", .status = 404 },
+        .{ .method = "DELETE", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/b/ab/v1/1~x", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/users.json", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "q0", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/v42/42/ab.42/", .status = 404 },
+        .{ .method = "PUT", .path = "/a.ab", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
             .{ .name = "q0", .value = "ab" },
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "p2", .value = "txt" },
         } },
-        .{ .method = "GET", .path = "/preab/xyz~x/json/b", .status = 404 },
-        .{ .method = "POST", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
+        .{ .method = "PUT", .path = "/axyz_42.txt/pre1/users/a/", .status = 404 },
+        .{ .method = "GET", .path = "/vjson", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "vjson" },
+        } },
+        .{ .method = "DELETE", .path = "/ab_txt.txt/ajson_txt.txt/x.y/", .status = 404 },
+        .{ .method = "PUT", .path = "/users.json", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "q0", .value = "json" },
+        } },
+        .{ .method = "DELETE", .path = "/users/vc7/c7/c7", .status = 404 },
+        .{ .method = "PUT", .path = "/b", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/users/txt.xyz", .status = 200, .pattern = "/{p0:[a-z]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "p1", .value = "txt.xyz" },
+        } },
+        .{ .method = "POST", .path = "/a/users/", .status = 200, .pattern = "/a/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/ab/vtxt", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p1", .value = "vtxt" },
+        } },
+        .{ .method = "GET", .path = "/1/users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/v1/", .status = 404 },
+        .{ .method = "PUT", .path = "/c7~x", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7~x" },
+        } },
+        .{ .method = "POST", .path = "/a", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/ausers_b.txt", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/42~x/users", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42~x" },
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/b", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/b-users/x.y/b-json", .status = 404 },
+        .{ .method = "POST", .path = "/ab.a", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/b~x/a-b/users~x", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "POST", .pattern = "/{p0}.{q0}/*" },
+        .{ .method = "DELETE", .pattern = "/b" },
+        .{ .method = "GET", .pattern = "/a/{p1}.{q1}/{p2}.{q2}" },
+        .{ .method = "POST", .pattern = "/{p0}/*" },
+        .{ .method = "DELETE", .pattern = "/x.y/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0}/{p1}.{q1}" },
+        .{ .method = "POST", .pattern = "/x.y" },
+        .{ .method = "GET", .pattern = "/a-b/v{p1:[0-9]+}/*" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/a/42.users/b.json", .status = 200, .pattern = "/a/{p1}.{q1}/{p2}.{q2}", .params = &.{
+            .{ .name = "p1", .value = "42" },
+            .{ .name = "q1", .value = "users" },
+            .{ .name = "p2", .value = "b" },
+            .{ .name = "q2", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/1.ab/axyz_txt.txt", .status = 200, .pattern = "/{p0}.{q0}/*", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "q0", .value = "ab" },
+            .{ .name = "*", .value = "axyz_txt.txt" },
+        } },
+        .{ .method = "DELETE", .path = "/x.y/users", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/b/json-users/vc7", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/a/users.users/json.a", .status = 200, .pattern = "/a/{p1}.{q1}/{p2}.{q2}", .params = &.{
+            .{ .name = "p1", .value = "users" },
+            .{ .name = "q1", .value = "users" },
+            .{ .name = "p2", .value = "json" },
+            .{ .name = "q2", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/x.y/a/preusers", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/42~x/vab/xyz", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/b-users/xyz-json/vab", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/x.y/xyz", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/a/txt/c7.42", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/a-b/vab/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/42-json/prejson", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "42-json" },
+            .{ .name = "*", .value = "prejson" },
+        } },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/vtxt/atxt_txt.txt", .status = 200, .pattern = "/{p0}/{p1}.{q1}", .params = &.{
+            .{ .name = "p0", .value = "vtxt" },
+            .{ .name = "p1", .value = "atxt_txt" },
+            .{ .name = "q1", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/txt/1.json", .status = 200, .pattern = "/{p0}/{p1}.{q1}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "p1", .value = "1" },
+            .{ .name = "q1", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/a/a.txt", .status = 200, .pattern = "/{p0}/{p1}.{q1}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p1", .value = "a" },
+            .{ .name = "q1", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/1", .status = 404 },
+        .{ .method = "PUT", .path = "/b/42.b", .status = 200, .pattern = "/{p0}/{p1}.{q1}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "p1", .value = "42" },
+            .{ .name = "q1", .value = "b" },
+        } },
+        .{ .method = "PUT", .path = "/b/c7.json/vtxt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/ab/a-b", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "*", .value = "a-b" },
+        } },
+        .{ .method = "GET", .path = "/b.c7/txt/x.y/prec7", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/json/c7.txt", .status = 200, .pattern = "/{p0}/{p1}.{q1}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p1", .value = "c7" },
+            .{ .name = "q1", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/atxt_1.txt/vjson", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/x.y/c7", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/c7~x/a42_b.txt/v1", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "c7~x" },
+            .{ .name = "*", .value = "a42_b.txt/v1" },
+        } },
+        .{ .method = "POST", .path = "/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/a1_users.txt/preab", .status = 200, .pattern = "/{p0}.{q0}/*", .params = &.{
+            .{ .name = "p0", .value = "a1_users" },
+            .{ .name = "q0", .value = "txt" },
+            .{ .name = "*", .value = "preab" },
+        } },
+        .{ .method = "DELETE", .path = "/x.y/xyz", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+        } },
+        .{ .method = "PUT", .path = "/a42_1.txt/a/json", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/42~x/b/b-txt/preab", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/c7/users~x/c7/42~x", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/a-b/vab/b-ab", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "a-b" },
+            .{ .name = "*", .value = "vab/b-ab" },
+        } },
+        .{ .method = "POST", .path = "/users", .status = 404 },
+        .{ .method = "POST", .path = "/txt.a/42~x", .status = 200, .pattern = "/{p0}.{q0}/*", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "q0", .value = "a" },
+            .{ .name = "*", .value = "42~x" },
+        } },
+        .{ .method = "POST", .path = "/a/1-ab", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "*", .value = "1-ab" },
+        } },
+        .{ .method = "POST", .path = "/a/ab.a/a.users", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "*", .value = "ab.a/a.users" },
+        } },
+        .{ .method = "GET", .path = "/xyz/a/ab-xyz/vtxt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/users-txt/users/ajson_c7.txt", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "users-txt" },
+            .{ .name = "*", .value = "users/ajson_c7.txt" },
+        } },
+        .{ .method = "PUT", .path = "/a/json.1/1.ab", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/xyz.42/ajson_b.txt", .status = 200, .pattern = "/{p0}.{q0}/*", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "42" },
+            .{ .name = "*", .value = "ajson_b.txt" },
+        } },
+        .{ .method = "GET", .path = "/a-b/vtxt/preusers/axyz_ab.txt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/ab_users.txt/xyz.a/c7~x/aa_b.txt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/b~x/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/x.y/json", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/preb/a-b/pre1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/a/json.42/json.json", .status = 200, .pattern = "/a/{p1}.{q1}/{p2}.{q2}", .params = &.{
+            .{ .name = "p1", .value = "json" },
+            .{ .name = "q1", .value = "42" },
+            .{ .name = "p2", .value = "json" },
+            .{ .name = "q2", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/pre1/preb/txt.a", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "pre1" },
+            .{ .name = "*", .value = "preb/txt.a" },
+        } },
+        .{ .method = "GET", .path = "/42.1/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/1.a/b/users.c7/aab_txt.txt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/a/txt.b/c7.b", .status = 200, .pattern = "/a/{p1}.{q1}/{p2}.{q2}", .params = &.{
+            .{ .name = "p1", .value = "txt" },
+            .{ .name = "q1", .value = "b" },
+            .{ .name = "p2", .value = "c7" },
+            .{ .name = "q2", .value = "b" },
+        } },
+        .{ .method = "PUT", .path = "/b.ab/xyz-a/ac7_json.txt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/a.json/json~x/b", .status = 200, .pattern = "/{p0}.{q0}/*", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "json" },
+            .{ .name = "*", .value = "json~x/b" },
+        } },
+        .{ .method = "PUT", .path = "/b/a/42-json/prea", .status = 405, .allow = &.{
+            "POST",
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "PUT", .pattern = "/*" },
+        .{ .method = "POST", .pattern = "/{p0}" },
+        .{ .method = "DELETE", .pattern = "/a" },
+        .{ .method = "PUT", .pattern = "/pre{p0}/b" },
+        .{ .method = "POST", .pattern = "/{p0}.{q0}/{p1}~x/users" },
+        .{ .method = "POST", .pattern = "/v{p0}/b/a{p2}_{q2}.txt" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "PUT", .path = "/42~x/preb", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "42~x/preb" },
+        } },
+        .{ .method = "DELETE", .path = "/txt.42/c7-xyz/users~x/a", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/prec7/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
             .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "POST", .path = "/a1_xyz.txt", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a1_xyz.txt" },
+        .{ .method = "GET", .path = "/v1/json.xyz", .status = 405, .allow = &.{
+            "PUT",
         } },
-        .{ .method = "PUT", .path = "/b/a/aab_b.txt", .status = 200, .pattern = "/b/a/a{p2}_{q2}.txt", .params = &.{
+        .{ .method = "PUT", .path = "/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "PUT", .path = "/ac7_c7.txt/aab_txt.txt/v1/b", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "ac7_c7.txt/aab_txt.txt/v1/b" },
+        } },
+        .{ .method = "POST", .path = "/vtxt/b/aab_b.txt", .status = 200, .pattern = "/v{p0}/b/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p0", .value = "txt" },
             .{ .name = "p2", .value = "ab" },
             .{ .name = "q2", .value = "b" },
         } },
-        .{ .method = "DELETE", .path = "/ab.b/vc7/a/users", .status = 404 },
-        .{ .method = "PUT", .path = "/axyz_xyz.txt/b~x/txt.json/", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}~x/{p2}.json", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "p2", .value = "txt" },
+        .{ .method = "PUT", .path = "/a42_ab.txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a42_ab.txt" },
         } },
-        .{ .method = "POST", .path = "/vc7/c7/a", .status = 404 },
-        .{ .method = "PUT", .path = "/b/a/ausers_42.txt", .status = 200, .pattern = "/b/a/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p2", .value = "users" },
-            .{ .name = "q2", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/xyz~x", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/1", .status = 405, .allow = &.{
             "POST",
+            "PUT",
         } },
-        .{ .method = "PUT", .path = "/b/a/ausers_c7.txt", .status = 200, .pattern = "/b/a/a{p2}_{q2}.txt", .params = &.{
+        .{ .method = "POST", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/b.txt/b", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/vjson/b/ausers_c7.txt", .status = 200, .pattern = "/v{p0}/b/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p0", .value = "json" },
             .{ .name = "p2", .value = "users" },
             .{ .name = "q2", .value = "c7" },
         } },
-        .{ .method = "GET", .path = "/b/users/b", .status = 404 },
-        .{ .method = "POST", .path = "/b/a/aab_1.txt", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "DELETE", .path = "/prea/txt~x/xyz.txt/ajson_users.txt", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "PUT", .path = "/b~x/ab/ajson_42.txt/42-users", .status = 404 },
-        .{ .method = "POST", .path = "/a/xyz~x/pre1", .status = 200, .pattern = "/a/{p1}~x/pre{p2}", .params = &.{
-            .{ .name = "p1", .value = "xyz" },
-            .{ .name = "p2", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/prejson/a42_1.txt/vab/vab", .status = 404 },
-        .{ .method = "DELETE", .path = "/b/v1", .status = 200, .pattern = "/{p0}/v1", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/c7-b/txt-c7", .status = 404 },
-        .{ .method = "DELETE", .path = "/ab/v1", .status = 200, .pattern = "/{p0}/v1", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/v1/1", .status = 404 },
-        .{ .method = "PUT", .path = "/a42_c7.txt/json~x/a.json/", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}~x/{p2}.json", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "c7" },
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "p2", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/ac7_ab.txt", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ac7_ab.txt" },
-        } },
-        .{ .method = "GET", .path = "/b/a/preab", .status = 200, .pattern = "/b/a/*", .params = &.{
-            .{ .name = "*", .value = "preab" },
-        } },
-        .{ .method = "DELETE", .path = "/json/a-b/1-c7", .status = 404 },
-        .{ .method = "PUT", .path = "/b/a/ac7_txt.txt", .status = 200, .pattern = "/b/a/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p2", .value = "c7" },
-            .{ .name = "q2", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/users/prea", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "DELETE", .pattern = "/a/v1" },
-        .{ .method = "GET", .pattern = "/a-b/" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "GET", .path = "/txt-a", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "GET", .path = "/a~x/pre1/v42", .status = 404 },
-        .{ .method = "POST", .path = "/a-b/", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/v42", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/v1/preb/c7/x.y", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/axyz_1.txt/ab~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/x.y/1/users-ab/b.42", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/v42/vb", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/c7/xyz~x/ab-c7/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/vc7/a42_1.txt/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/aab_c7.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/pretxt/a", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b/", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/atxt_c7.txt/c7-a/users-users", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/vusers/json-1/ab-ab", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/b/json.b/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/ajson_b.txt/a42_1.txt/a", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/42-c7", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/v1/xyz~x", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/ab-users/users", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/txt.b/aab_1.txt", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/b.a", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/prexyz/1/a.a/b", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/b~x/x.y/ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/a.42/ab~x/pretxt/ab~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/c7", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/users/a", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/42/users-xyz/a", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "GET", .path = "/users", .status = 404 },
-        .{ .method = "POST", .path = "/a/v1", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/a", .status = 405, .allow = &.{
             "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/users/a-1/42.txt/txt-b", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/users-b", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/42.txt/json~x/", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/b/v1/users/" },
-        .{ .method = "PUT", .pattern = "/a-b/{p1}/a" },
-        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt/users/*" },
-        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt/a{p1}_{q1}.txt/b" },
-        .{ .method = "POST", .pattern = "/a/a/x.y" },
-        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/a1_xyz.txt/ac7_ab.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/a{p1}_{q1}.txt/b", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "q1", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/atxt_a.txt/users-c7/a.b/vjson", .status = 404 },
-        .{ .method = "POST", .path = "/ab_xyz.txt/users/", .status = 200, .pattern = "/a{p0}_{q0}.txt/users/*", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "PUT", .path = "/ab", .status = 404 },
-        .{ .method = "GET", .path = "/b/v1/users/", .status = 200, .pattern = "/b/v1/users", .params = &.{} },
-        .{ .method = "POST", .path = "/users/txt/vjson", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/a/a", .status = 200, .pattern = "/a-b/{p1}/a", .params = &.{
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/users/c7-json/va", .status = 404 },
-        .{ .method = "POST", .path = "/ab_json.txt/users/", .status = 200, .pattern = "/a{p0}_{q0}.txt/users/*", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "json" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "DELETE", .path = "/aa_b.txt/", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/x.y", .status = 405, .allow = &.{
             "POST",
-        } },
-        .{ .method = "POST", .path = "/42/users", .status = 404 },
-        .{ .method = "POST", .path = "/aa_xyz.txt/axyz_ab.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/a{p1}_{q1}.txt/b", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "p1", .value = "xyz" },
-            .{ .name = "q1", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/users.ab/users/vjson/aa_users.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a/a/x.y", .status = 200, .pattern = "/a/a/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/c7/b/a.ab/", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/c7/a", .status = 200, .pattern = "/a-b/{p1}/a", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/ab_1.txt/1.txt/", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/a/a", .status = 200, .pattern = "/a-b/{p1}/a", .params = &.{
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/vb/vusers/pre42", .status = 404 },
-        .{ .method = "POST", .path = "/aab_xyz.txt/users/xyz/a", .status = 200, .pattern = "/a{p0}_{q0}.txt/users/*", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "*", .value = "xyz/a" },
-        } },
-        .{ .method = "PUT", .path = "/users/aa_b.txt/ac7_1.txt/ab_json.txt", .status = 404 },
-        .{ .method = "POST", .path = "/aa_ab.txt/users/vc7", .status = 200, .pattern = "/a{p0}_{q0}.txt/users/*", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "ab" },
-            .{ .name = "*", .value = "vc7" },
-        } },
-        .{ .method = "POST", .path = "/c7.b/vxyz", .status = 404 },
-        .{ .method = "GET", .path = "/b/v1/users/", .status = 200, .pattern = "/b/v1/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/b", .status = 404 },
-        .{ .method = "POST", .path = "/a/a/x.y", .status = 200, .pattern = "/a/a/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/x.y/ac7_users.txt/42-1/v42", .status = 404 },
-        .{ .method = "POST", .path = "/ac7_ab.txt/users/", .status = 200, .pattern = "/a{p0}_{q0}.txt/users/*", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "ab" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "PUT", .path = "/a-1", .status = 404 },
-        .{ .method = "GET", .path = "/aab_ab.txt/ac7_txt.txt/b", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/aab_1.txt/a-b/pretxt", .status = 404 },
-        .{ .method = "POST", .path = "/ac7_a.txt/users/users/1", .status = 200, .pattern = "/a{p0}_{q0}.txt/users/*", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "*", .value = "users/1" },
-        } },
-        .{ .method = "GET", .path = "/42", .status = 404 },
-        .{ .method = "PUT", .path = "/ausers_42.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/txt/a", .status = 404 },
-        .{ .method = "PUT", .path = "/ab_txt.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/42~x", .status = 404 },
-        .{ .method = "PUT", .path = "/a42_1.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/json.users/v1/prejson", .status = 404 },
-        .{ .method = "POST", .path = "/axyz_c7.txt", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "GET", .path = "/json/txt.42", .status = 404 },
-        .{ .method = "POST", .path = "/atxt_b.txt/users/", .status = 200, .pattern = "/a{p0}_{q0}.txt/users/*", .params = &.{
+        .{ .method = "POST", .path = "/b.txt/users-txt/aab_xyz.txt/users/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/users-a", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users-a" },
+        } },
+        .{ .method = "PUT", .path = "/txt.ab/b~x/users", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "txt.ab/b~x/users" },
+        } },
+        .{ .method = "GET", .path = "/vtxt/xyz~x", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/pretxt/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
             .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/vc7/ab_1.txt/x.y/json~x", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "DELETE", .path = "/a/x.y/a1_users.txt/txt.xyz", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/vjson/b/a1_42.txt", .status = 200, .pattern = "/v{p0}/b/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p2", .value = "1" },
+            .{ .name = "q2", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/users~x/pre42/a-b", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "POST", .path = "/ab/vxyz/vxyz", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/42.b/1~x/users", .status = 200, .pattern = "/{p0}.{q0}/{p1}~x/users", .params = &.{
+            .{ .name = "p0", .value = "42" },
             .{ .name = "q0", .value = "b" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "POST", .path = "/ausers_xyz.txt/xyz", .status = 404 },
-        .{ .method = "POST", .path = "/a/a/x.y", .status = 200, .pattern = "/a/a/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/xyz-b/json.42/txt.42", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/42/a", .status = 200, .pattern = "/a-b/{p1}/a", .params = &.{
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/a", .status = 404 },
-        .{ .method = "POST", .path = "/a/a/x.y", .status = 200, .pattern = "/a/a/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/txt/v42/a/a-b", .status = 404 },
-        .{ .method = "GET", .path = "/b/v1/users/", .status = 200, .pattern = "/b/v1/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/pre42/json-users/prexyz/c7-42", .status = 404 },
-        .{ .method = "GET", .path = "/b/v1/users/", .status = 200, .pattern = "/b/v1/users", .params = &.{} },
-        .{ .method = "POST", .path = "/prea/axyz_xyz.txt/pre1/b", .status = 404 },
-        .{ .method = "POST", .path = "/ac7_xyz.txt/users/", .status = 200, .pattern = "/a{p0}_{q0}.txt/users/*", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "GET", .path = "/ab~x/vxyz/users/txt", .status = 404 },
-        .{ .method = "POST", .path = "/aab_1.txt/ajson_42.txt/b", .status = 200, .pattern = "/a{p0}_{q0}.txt/a{p1}_{q1}.txt/b", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "1" },
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "q1", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/users~x/a", .status = 404 },
-        .{ .method = "PUT", .path = "/a-b/1/a", .status = 200, .pattern = "/a-b/{p1}/a", .params = &.{
             .{ .name = "p1", .value = "1" },
         } },
-        .{ .method = "DELETE", .path = "/pre1", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/a" },
-        .{ .method = "GET", .pattern = "/v1" },
-        .{ .method = "POST", .pattern = "/x.y" },
-        .{ .method = "DELETE", .pattern = "/x.y/{p1}" },
-        .{ .method = "PUT", .pattern = "/{p0}" },
-        .{ .method = "DELETE", .pattern = "/{p0}.json" },
-        .{ .method = "GET", .pattern = "/{p0}.{q0}" },
-        .{ .method = "PUT", .pattern = "/{p0}.{q0}/{p1}" },
-        .{ .method = "GET", .pattern = "/v{p0}" },
-        .{ .method = "PUT", .pattern = "/{p0}-{q0}" },
-        .{ .method = "PUT", .pattern = "/{p0}-{q0}/{p1}" },
-        .{ .method = "GET", .pattern = "/pre{p0}" },
-        .{ .method = "PUT", .pattern = "/pre{p0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}~x" },
-        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}/" },
-        .{ .method = "POST", .pattern = "/{p0}~x/{p1}/v{p2}" },
-        .{ .method = "POST", .pattern = "/{p0}" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "DELETE", .path = "/prec7", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "GET", .path = "/atxt_a.txt/txt/xyz-json/xyz/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/axyz_42.txt/c7", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "axyz_42.txt/c7" },
+        } },
+        .{ .method = "DELETE", .path = "/ab.1/1/vb", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/vusers/b/ausers_txt.txt", .status = 200, .pattern = "/v{p0}/b/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "p2", .value = "users" },
+            .{ .name = "q2", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/ajson_ab.txt/prec7", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "ajson_ab.txt/prec7" },
+        } },
+        .{ .method = "POST", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "DELETE", .path = "/x.y", .status = 405, .allow = &.{
             "POST",
             "PUT",
         } },
-        .{ .method = "GET", .path = "/v1/42~x/ausers_b.txt", .status = 404 },
-        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/json/a/", .status = 404 },
-        .{ .method = "GET", .path = "/a.json", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "json" },
+        .{ .method = "POST", .path = "/vtxt/b/aa_42.txt", .status = 200, .pattern = "/v{p0}/b/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "p2", .value = "a" },
+            .{ .name = "q2", .value = "42" },
         } },
-        .{ .method = "GET", .path = "/c7-a/c7/users/txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/b", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
-            .{ .name = "p1", .value = "b" },
+        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "v1" },
         } },
-        .{ .method = "GET", .path = "/a-b/ab/1.ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 405, .allow = &.{
-            "GET",
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/a/c7/c7.a/aa_b.txt", .status = 404 },
-        .{ .method = "POST", .path = "/ac7_users.txt/users", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "users" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/ab~x/42~x/xyz/x.y/", .status = 404 },
-        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "DELETE", .path = "/v1/42.c7/a", .status = 404 },
-        .{ .method = "PUT", .path = "/json.xyz/txt", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
+        .{ .method = "POST", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "p1", .value = "txt" },
         } },
-        .{ .method = "DELETE", .path = "/prexyz", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "DELETE", .path = "/ab/ausers_users.txt/1", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/preab/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/users.1/users/ab~x", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/json.json/1~x/users", .status = 200, .pattern = "/{p0}.{q0}/{p1}~x/users", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "json" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/json/ab_c7.txt/v1/users.42/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "DELETE", .path = "/users/axyz_users.txt/a", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/va/b/a42_a.txt", .status = 200, .pattern = "/v{p0}/b/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "p2", .value = "42" },
+            .{ .name = "q2", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/b/vxyz/preb", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/atxt_c7.txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "atxt_c7.txt" },
+        } },
+        .{ .method = "DELETE", .path = "/a.ab/c7~x/users", .status = 405, .allow = &.{
             "POST",
             "PUT",
         } },
-        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "v1" },
+        .{ .method = "PUT", .path = "/xyz/preab", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "xyz/preab" },
         } },
-        .{ .method = "POST", .path = "/users/c7", .status = 404 },
-        .{ .method = "DELETE", .path = "/txt~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+        .{ .method = "PUT", .path = "/aab_b.txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "aab_b.txt" },
+        } },
+        .{ .method = "GET", .path = "/vc7", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/pre42/b", .status = 200, .pattern = "/pre{p0}/b", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "txt" },
         } },
-        .{ .method = "POST", .path = "/prexyz/ab.ab/1/prejson/", .status = 404 },
-        .{ .method = "GET", .path = "/vxyz", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
+        .{ .method = "POST", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
         } },
-        .{ .method = "PUT", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
+        .{ .method = "DELETE", .path = "/a1_txt.txt/ac7_a.txt/vjson/ab.a", .status = 405, .allow = &.{
+            "PUT",
         } },
-        .{ .method = "DELETE", .path = "/ac7_xyz.txt", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "POST", .path = "/ab.a/json~x/users", .status = 200, .pattern = "/{p0}.{q0}/{p1}~x/users", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "a" },
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "DELETE", .path = "/ajson_users.txt/1.42/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/v1/" },
+        .{ .method = "POST", .pattern = "/{p0:[a-z]+}/users" },
+        .{ .method = "DELETE", .pattern = "/{p0}.{q0}/{p1:[0-9]+}.json" },
+        .{ .method = "POST", .pattern = "/a" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "POST", .path = "/txt/users", .status = 200, .pattern = "/{p0:[a-z]+}/users", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/42", .status = 404 },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/x.y/", .status = 404 },
+        .{ .method = "DELETE", .path = "/json.ab/txt.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/a-ab/users/vtxt", .status = 404 },
+        .{ .method = "POST", .path = "/json/users", .status = 200, .pattern = "/{p0:[a-z]+}/users", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/ausers_a.txt/xyz~x/pre42", .status = 404 },
+        .{ .method = "POST", .path = "/42/users", .status = 404 },
+        .{ .method = "GET", .path = "/a/prea/1~x/c7.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/b.1/xyz.json", .status = 404 },
+        .{ .method = "POST", .path = "/b/vxyz/va/ab", .status = 404 },
+        .{ .method = "POST", .path = "/c7/users", .status = 404 },
+        .{ .method = "POST", .path = "/ab~x/vab", .status = 404 },
+        .{ .method = "GET", .path = "/v1/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/axyz_a.txt/xyz.users/txt-b/vb", .status = 404 },
+        .{ .method = "POST", .path = "/users/users", .status = 200, .pattern = "/{p0:[a-z]+}/users", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/42~x", .status = 404 },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "POST", .path = "/42-users/ab_c7.txt/vb/va", .status = 404 },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "GET", .path = "/users~x/a-b/aa_ab.txt/pretxt", .status = 404 },
+        .{ .method = "DELETE", .path = "/a", .status = 405, .allow = &.{
             "POST",
-            "PUT",
         } },
-        .{ .method = "PUT", .path = "/users/a.xyz/a/", .status = 404 },
-        .{ .method = "PUT", .path = "/users.users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users.users" },
+        .{ .method = "DELETE", .path = "/v1/a1_xyz.txt/", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/1-1/json~x/xyz-txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/c7.1/json.json", .status = 404 },
+        .{ .method = "PUT", .path = "/vjson/aa_ab.txt/1", .status = 404 },
+        .{ .method = "DELETE", .path = "/users.c7/1.json", .status = 200, .pattern = "/{p0}.{q0}/{p1:[0-9]+}.json", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "q0", .value = "c7" },
+            .{ .name = "p1", .value = "1" },
         } },
-        .{ .method = "GET", .path = "/ab-b/1-c7", .status = 405, .allow = &.{
-            "PUT",
+        .{ .method = "POST", .path = "/x.y", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/a-b/json.1/b.1/", .status = 404 },
+        .{ .method = "GET", .path = "/v1/", .status = 405, .allow = &.{
+            "DELETE",
         } },
-        .{ .method = "DELETE", .path = "/a/", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
+        .{ .method = "GET", .path = "/xyz/txt~x/ab.txt/v42", .status = 404 },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "POST", .path = "/vtxt/1", .status = 404 },
+        .{ .method = "POST", .path = "/v1/", .status = 405, .allow = &.{
+            "DELETE",
         } },
-        .{ .method = "PUT", .path = "/1~x/ab~x/a/txt", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "x.y" },
+        .{ .method = "POST", .path = "/a1_a.txt/ac7_json.txt/1/vjson", .status = 404 },
+        .{ .method = "DELETE", .path = "/users.c7/a.json", .status = 404 },
+        .{ .method = "POST", .path = "/aab_json.txt/xyz.json/preab", .status = 404 },
+        .{ .method = "DELETE", .path = "/c7.ab/users.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/vb/b.users/v42/xyz~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/users/c7-users/vusers/a.ab/", .status = 404 },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "GET", .path = "/preab/vab/ab_users.txt", .status = 404 },
+        .{ .method = "GET", .path = "/a/users", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/c7.users", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/c7.xyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/json.1/xyz.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/42.json/vusers", .status = 404 },
+        .{ .method = "POST", .path = "/c7/users", .status = 404 },
+        .{ .method = "DELETE", .path = "/vb/b-ab/c7~x", .status = 404 },
+        .{ .method = "GET", .path = "/json/users", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/vtxt", .status = 404 },
+        .{ .method = "PUT", .path = "/v1/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "POST", .path = "/json/users", .status = 200, .pattern = "/{p0:[a-z]+}/users", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/42.ab/vb/xyz/aab_42.txt", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/a" },
+        .{ .method = "POST", .pattern = "/v1" },
+        .{ .method = "POST", .pattern = "/x.y" },
+        .{ .method = "POST", .pattern = "/{p0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}.json" },
+        .{ .method = "DELETE", .pattern = "/{p0}.{q0}" },
+        .{ .method = "GET", .pattern = "/v{p0}" },
+        .{ .method = "DELETE", .pattern = "/v{p0}/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0}-{q0}" },
+        .{ .method = "POST", .pattern = "/{p0}-{q0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/pre{p0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}~x" },
+        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "DELETE", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-z]+}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "PUT", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/v{p0:[0-9]+}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "DELETE", .pattern = "/a-b/*" },
+        .{ .method = "GET", .pattern = "/a/x.y" },
+        .{ .method = "PUT", .pattern = "/pre{p0}/v1" },
+        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt/a{p1}_{q1}.txt" },
+        .{ .method = "POST", .pattern = "/{p0}.{q0}/a-b" },
+        .{ .method = "DELETE", .pattern = "/v1" },
+        .{ .method = "POST", .pattern = "/{p0}.{q0}" },
+        .{ .method = "GET", .pattern = "/{p0}.{q0}/v1/b" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "POST", .path = "/vusers/json", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/c7~x/b-json", .status = 404 },
+        .{ .method = "GET", .path = "/c7.c7", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/1/users/txt~x/b~x/", .status = 404 },
+        .{ .method = "GET", .path = "/c7.json/v1/b", .status = 200, .pattern = "/{p0}.{q0}/v1/b", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "q0", .value = "json" },
+        } },
+        .{ .method = "DELETE", .path = "/vab/ab.1/ab/1.txt", .status = 404 },
+        .{ .method = "GET", .path = "/vusers", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/42-a", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/txt.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "txt" },
         } },
         .{ .method = "POST", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "42" },
         } },
-        .{ .method = "DELETE", .path = "/c7.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+        .{ .method = "POST", .path = "/a.xyz/a-b", .status = 200, .pattern = "/{p0}.{q0}/a-b", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/42~x/c7/a-b/pre42", .status = 404 },
+        .{ .method = "POST", .path = "/ab_xyz.txt/atxt_c7.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt/a{p1}_{q1}.txt", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "q0", .value = "xyz" },
+            .{ .name = "p1", .value = "txt" },
+            .{ .name = "q1", .value = "c7" },
+        } },
+        .{ .method = "PUT", .path = "/vjson/b/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/b.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/b/txt-1", .status = 200, .pattern = "/{p0:[a-z]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "p1", .value = "txt-1" },
+        } },
+        .{ .method = "PUT", .path = "/1", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/json/preb", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/c7-a", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "q0", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/txt-txt/v1/prea/ajson_users.txt", .status = 404 },
+        .{ .method = "GET", .path = "/a.users/v1/b", .status = 200, .pattern = "/{p0}.{q0}/v1/b", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/json/axyz_json.txt/c7/1-users/", .status = 404 },
+        .{ .method = "POST", .path = "/b/c7", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/c7~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
             .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "GET", .path = "/c7", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "GET", .path = "/1-42/a~x", .status = 405, .allow = &.{
             "POST",
-            "PUT",
         } },
-        .{ .method = "PUT", .path = "/txt-b", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
+        .{ .method = "GET", .path = "/v42/42", .status = 200, .pattern = "/v{p0:[0-9]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/xyz.c7/ab_a.txt/1/users", .status = 404 },
+        .{ .method = "GET", .path = "/xyz.json", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/a/1~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/xyz~x/json-ab", .status = 404 },
+        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/txt~x/b/atxt_1.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/v42/1", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/txt~x/xyz-a/users/xyz.json", .status = 404 },
+        .{ .method = "PUT", .path = "/pre1/v1", .status = 200, .pattern = "/pre{p0}/v1", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/c7-users/v1/users-1", .status = 404 },
+        .{ .method = "GET", .path = "/c7.1", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/vb/ab~x/vjson", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/xyz/c7~x/txt", .status = 404 },
+        .{ .method = "POST", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/ab.a/b/", .status = 404 },
+        .{ .method = "GET", .path = "/users.json", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/json-txt/a42_json.txt/42", .status = 404 },
+        .{ .method = "POST", .path = "/c7.b/a-b", .status = 200, .pattern = "/{p0}.{q0}/a-b", .params = &.{
+            .{ .name = "p0", .value = "c7" },
             .{ .name = "q0", .value = "b" },
         } },
-        .{ .method = "DELETE", .path = "/x.y/a", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
-            .{ .name = "p1", .value = "a" },
+        .{ .method = "DELETE", .path = "/users/vb", .status = 200, .pattern = "/{p0:[a-z]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "p1", .value = "vb" },
         } },
-        .{ .method = "DELETE", .path = "/c7/", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
+        .{ .method = "DELETE", .path = "/42.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "42" },
         } },
-        .{ .method = "GET", .path = "/vab/vjson/json-ab/vusers", .status = 404 },
-        .{ .method = "GET", .path = "/ac7_txt.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/prejson/vb", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "POST", .path = "/1~x/a/b.b", .status = 404 },
-        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/b/c7/atxt_users.txt/1.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/prea/c7", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/xyz-json", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/prejson/xyz", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/users-c7/xyz~x/c7~x/ausers_xyz.txt", .status = 404 },
-        .{ .method = "POST", .path = "/c7~x/ab/vb", .status = 200, .pattern = "/{p0}~x/{p1}/v{p2}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/xyz/v1/vtxt", .status = 404 },
-        .{ .method = "GET", .path = "/vjson", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/ab.42", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+        .{ .method = "DELETE", .path = "/vab/ab", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
             .{ .name = "p0", .value = "ab" },
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/ajson_42.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+            .{ .name = "p0", .value = "json" },
             .{ .name = "q0", .value = "42" },
         } },
-        .{ .method = "DELETE", .path = "/users/", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
+        .{ .method = "DELETE", .path = "/users-42/v42", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "GET", .path = "/a-a/users-a/", .status = 404 },
-        .{ .method = "GET", .path = "/vab", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/preb/c7-txt/prec7/v1", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/va/v1/42-ab", .status = 404 },
+        .{ .method = "GET", .path = "/b.json", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
         } },
-        .{ .method = "PUT", .path = "/axyz_42.txt/b", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "axyz_42" },
-            .{ .name = "q0", .value = "txt" },
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/ac7_xyz.txt/ajson_1.txt/xyz-ab/a", .status = 404 },
-        .{ .method = "DELETE", .path = "/txt.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/1~x/1.b/prexyz", .status = 404 },
-        .{ .method = "PUT", .path = "/preb/txt", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/vjson/42~x/prejson", .status = 404 },
+        .{ .method = "PUT", .path = "/preusers/prec7/c7-users/txt.users", .status = 404 },
     } },
     .{ .routes = &.{
-        .{ .method = "POST", .pattern = "/{p0}-{q0}/{p1}/b" },
+        .{ .method = "PUT", .pattern = "/{p0}.json/{p1}" },
+        .{ .method = "GET", .pattern = "/a/*" },
+        .{ .method = "POST", .pattern = "/a-b" },
+        .{ .method = "DELETE", .pattern = "/b/{p1}~x" },
+        .{ .method = "GET", .pattern = "/a/{p1}/x.y" },
         .{ .method = "POST", .pattern = "/{p0}" },
+        .{ .method = "DELETE", .pattern = "/a/v1/x.y" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/xyz-xyz/c7/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "xyz" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/aab_1.txt/txt.1/ab", .status = 404 },
-        .{ .method = "POST", .path = "/ab-42/txt/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "42" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/vb/aa_b.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/json", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/users", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "GET", .path = "/va/a", .status = 404 },
-        .{ .method = "POST", .path = "/txt-ab/c7/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "ab" },
-            .{ .name = "p1", .value = "c7" },
+        .{ .method = "DELETE", .path = "/json~x/a-b", .status = 404 },
+        .{ .method = "GET", .path = "/a/v1/x.y", .status = 200, .pattern = "/a/{p1}/x.y", .params = &.{
+            .{ .name = "p1", .value = "v1" },
         } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "v1" },
-        } },
-        .{ .method = "POST", .path = "/42-42/txt/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "42" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/ajson_txt.txt/preab", .status = 404 },
-        .{ .method = "POST", .path = "/42-json/json/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "json" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/ausers_ab.txt/vusers/a-b", .status = 404 },
-        .{ .method = "DELETE", .path = "/42-1/ab/b", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/42.a/users~x/users.txt/", .status = 404 },
-        .{ .method = "POST", .path = "/c7-42/json/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "42" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/prec7/ab-json/a-b", .status = 404 },
-        .{ .method = "POST", .path = "/1-c7/b/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "c7" },
+        .{ .method = "GET", .path = "/ab~x/json.json/ab_json.txt/ac7_c7.txt", .status = 404 },
+        .{ .method = "GET", .path = "/a/b/x.y", .status = 200, .pattern = "/a/{p1}/x.y", .params = &.{
             .{ .name = "p1", .value = "b" },
         } },
-        .{ .method = "POST", .path = "/json-42/prexyz/ajson_b.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/42", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/b/users~x", .status = 200, .pattern = "/b/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/c7-txt/txt~x/json/txt~x", .status = 404 },
+        .{ .method = "PUT", .path = "/b/ab~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/v42", .status = 405, .allow = &.{
+            "POST",
+        } },
         .{ .method = "POST", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "xyz" },
         } },
-        .{ .method = "PUT", .path = "/a~x/v42/ac7_ab.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/42~x/a-b/users/pre42", .status = 404 },
+        .{ .method = "GET", .path = "/a/42", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/a~x/users/42/ab-xyz", .status = 404 },
+        .{ .method = "POST", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/vb/42", .status = 404 },
+        .{ .method = "PUT", .path = "/users.json/1", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/preb/vjson/xyz-users/42.b", .status = 404 },
+        .{ .method = "GET", .path = "/a/pretxt/42", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "pretxt/42" },
+        } },
+        .{ .method = "GET", .path = "/vxyz/aab_txt.txt", .status = 404 },
+        .{ .method = "GET", .path = "/a/txt/x.y", .status = 200, .pattern = "/a/{p1}/x.y", .params = &.{
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "GET", .path = "/a/", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "DELETE", .path = "/a1_txt.txt/b/a-b/json.1", .status = 404 },
+        .{ .method = "PUT", .path = "/b/c7~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/xyz.c7/users~x", .status = 404 },
+        .{ .method = "GET", .path = "/a/1/x.y", .status = 200, .pattern = "/a/{p1}/x.y", .params = &.{
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/atxt_b.txt/vjson/txt~x/a.c7", .status = 404 },
+        .{ .method = "GET", .path = "/a/xyz/x.y", .status = 200, .pattern = "/a/{p1}/x.y", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/1/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/users~x", .status = 200, .pattern = "/b/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/pre1/users/v1", .status = 404 },
+        .{ .method = "POST", .path = "/b/json~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/preusers/axyz_42.txt/c7.a/vxyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/v1/x.y", .status = 200, .pattern = "/a/v1/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/v42", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "v42" },
+        } },
+        .{ .method = "DELETE", .path = "/a/v1/x.y", .status = 200, .pattern = "/a/v1/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/aab_b.txt/users-a/json~x/users", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/v1/x.y", .status = 200, .pattern = "/a/v1/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/42/preusers/a/prea", .status = 404 },
+        .{ .method = "GET", .path = "/a/ab/x.y", .status = 200, .pattern = "/a/{p1}/x.y", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "POST", .path = "/json~x/", .status = 404 },
+        .{ .method = "GET", .path = "/a/users/x.y", .status = 200, .pattern = "/a/{p1}/x.y", .params = &.{
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/42.b", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "42.b" },
+        } },
+        .{ .method = "DELETE", .path = "/b/users~x", .status = 200, .pattern = "/b/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/a/42/a-ab/txt~x", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "42/a-ab/txt~x" },
+        } },
+        .{ .method = "DELETE", .path = "/a/v1/x.y", .status = 200, .pattern = "/a/v1/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/a-b/vb/ausers_c7.txt/xyz.b/", .status = 404 },
+        .{ .method = "GET", .path = "/a/json/x.y", .status = 200, .pattern = "/a/{p1}/x.y", .params = &.{
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "GET", .path = "/vc7/b.a/ausers_42.txt/vxyz", .status = 404 },
+        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "POST", .path = "/ausers_42.txt/va/vc7/42.json/", .status = 404 },
+        .{ .method = "PUT", .path = "/1.json/42", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/c7.42/vab/aa_42.txt", .status = 404 },
         .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "users" },
         } },
-        .{ .method = "GET", .path = "/pretxt/xyz/", .status = 404 },
-        .{ .method = "POST", .path = "/1-txt/1/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "txt" },
-            .{ .name = "p1", .value = "1" },
+        .{ .method = "DELETE", .path = "/prejson", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "DELETE", .path = "/xyz/json~x/vb", .status = 404 },
-        .{ .method = "POST", .path = "/42-42/c7/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
+        .{ .method = "PUT", .path = "/txt.json/b", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/preab/pretxt/42~x/txt~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/42~x", .status = 200, .pattern = "/b/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/a", .status = 405, .allow = &.{
+            "POST",
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "PUT", .pattern = "/v{p0:[0-9]+}/{p1:[0-9]+}.json/x.y" },
+        .{ .method = "POST", .pattern = "/{p0}/{p1:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/a/a{p1}_{q1}.txt" },
+        .{ .method = "POST", .pattern = "/*" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "GET", .pattern = "/v1" },
+        .{ .method = "POST", .pattern = "/users" },
+        .{ .method = "GET", .pattern = "/a/{p1:[0-9]+}.json/" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "POST", .path = "/1/txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "1/txt" },
+        } },
+        .{ .method = "POST", .path = "/1.b/aa_json.txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "1.b/aa_json.txt" },
+        } },
+        .{ .method = "PUT", .path = "/vab/ab.json/x.y", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/aa_json.txt/axyz_c7.txt/ab.json", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/a/json.1/a42_c7.txt/users", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "PUT", .path = "/vusers/ausers_1.txt/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/json/42", .status = 200, .pattern = "/{p0}/{p1:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/42/preab/xyz-c7/json", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/a/42.json/", .status = 200, .pattern = "/a/{p1:[0-9]+}.json", .params = &.{
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/va", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/42/42", .status = 200, .pattern = "/{p0}/{p1:[0-9]+}", .params = &.{
             .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "42" },
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/prec7", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "prec7" },
+        } },
+        .{ .method = "POST", .path = "/txt.json", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "txt.json" },
+        } },
+        .{ .method = "POST", .path = "/b/c7.b", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "b/c7.b" },
+        } },
+        .{ .method = "GET", .path = "/a/txt.json/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/v1/json/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/json", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "v1" },
+        } },
+        .{ .method = "PUT", .path = "/json.xyz/axyz_json.txt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/v42/ab.json/x.y", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/pre42/a/v42/a-json/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "pre42/a/v42/a-json/" },
+        } },
+        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "GET", .path = "/va", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/v1", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "POST", .path = "/vab/b/vusers/ab-1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "vab/b/vusers/ab-1" },
+        } },
+        .{ .method = "GET", .path = "/a/aab_b.txt", .status = 200, .pattern = "/a/a{p1}_{q1}.txt", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+            .{ .name = "q1", .value = "b" },
+        } },
+        .{ .method = "PUT", .path = "/1-b/preusers/vjson", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/b/txt-xyz", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "b/txt-xyz" },
+        } },
+        .{ .method = "POST", .path = "/prea/preab/users/ab.42/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "prea/preab/users/ab.42/" },
+        } },
+        .{ .method = "GET", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/users/c7/ab_b.txt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/a/ab_c7.txt", .status = 200, .pattern = "/a/a{p1}_{q1}.txt", .params = &.{
+            .{ .name = "p1", .value = "b" },
+            .{ .name = "q1", .value = "c7" },
+        } },
+        .{ .method = "DELETE", .path = "/ab-json/b-users", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/a/axyz_1.txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a/axyz_1.txt" },
+        } },
+        .{ .method = "PUT", .path = "/b/1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/prejson/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "PUT", .path = "/ac7_users.txt/users", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/vusers/ab.json/x.y", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/users~x", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/1/b", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "1/b" },
+        } },
+        .{ .method = "DELETE", .path = "/a/a42_users.txt/a", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/a.json", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a.json" },
+        } },
+        .{ .method = "PUT", .path = "/prea/ausers_txt.txt", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/1.json", .status = 200, .pattern = "/{p0:[0-9]+}.json", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/preab/txt~x/xyz~x/xyz", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/v1/prea/ausers_users.txt/users~x/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/users", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/42~x/prea/preab/users.a", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/ajson_xyz.txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "ajson_xyz.txt" },
+        } },
+        .{ .method = "GET", .path = "/prejson/b/1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/a/a1_a.txt", .status = 200, .pattern = "/a/a{p1}_{q1}.txt", .params = &.{
+            .{ .name = "p1", .value = "1" },
+            .{ .name = "q1", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/ausers_json.txt/", .status = 405, .allow = &.{
+            "POST",
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "GET", .pattern = "/b/{p1}/{p2}~x" },
+        .{ .method = "PUT", .pattern = "/b/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-z]+}/v1" },
+        .{ .method = "GET", .pattern = "/b/b/users" },
+        .{ .method = "GET", .pattern = "/a/{p1}-{q1}" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/a/a-c7", .status = 200, .pattern = "/a/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+            .{ .name = "q1", .value = "c7" },
+        } },
+        .{ .method = "DELETE", .path = "/42-1/ajson_c7.txt/aa_b.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/42-ab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/c7/xyz", .status = 404 },
+        .{ .method = "GET", .path = "/a/users-c7", .status = 200, .pattern = "/a/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "users" },
+            .{ .name = "q1", .value = "c7" },
+        } },
+        .{ .method = "DELETE", .path = "/users-b/pre42", .status = 404 },
+        .{ .method = "GET", .path = "/b/b/users", .status = 200, .pattern = "/b/b/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/x.y/x.y/ab~x/b~x", .status = 404 },
+        .{ .method = "GET", .path = "/users/v1", .status = 200, .pattern = "/{p0:[a-z]+}/v1", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/vc7", .status = 404 },
+        .{ .method = "PUT", .path = "/b/c7", .status = 200, .pattern = "/b/{p1}", .params = &.{
             .{ .name = "p1", .value = "c7" },
         } },
-        .{ .method = "POST", .path = "/pretxt", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "pretxt" },
+        .{ .method = "POST", .path = "/42/x.y/xyz/42-42", .status = 404 },
+        .{ .method = "PUT", .path = "/b/ab", .status = 200, .pattern = "/b/{p1}", .params = &.{
+            .{ .name = "p1", .value = "ab" },
         } },
-        .{ .method = "POST", .path = "/42-42/xyz/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "42" },
+        .{ .method = "DELETE", .path = "/va/xyz~x", .status = 404 },
+        .{ .method = "GET", .path = "/b/users/1~x", .status = 200, .pattern = "/b/{p1}/{p2}~x", .params = &.{
+            .{ .name = "p1", .value = "users" },
+            .{ .name = "p2", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/users/users/preab/42~x", .status = 404 },
+        .{ .method = "GET", .path = "/b/b/users", .status = 200, .pattern = "/b/b/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/1", .status = 404 },
+        .{ .method = "GET", .path = "/b/ab/ab~x", .status = 200, .pattern = "/b/{p1}/{p2}~x", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+            .{ .name = "p2", .value = "ab" },
+        } },
+        .{ .method = "POST", .path = "/prejson", .status = 404 },
+        .{ .method = "POST", .path = "/b/b/c7~x", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/1/", .status = 404 },
+        .{ .method = "GET", .path = "/xyz/v1", .status = 200, .pattern = "/{p0:[a-z]+}/v1", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/b.a/txt~x", .status = 404 },
+        .{ .method = "GET", .path = "/b/v1", .status = 200, .pattern = "/{p0:[a-z]+}/v1", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/v1/users/xyz~x", .status = 404 },
+        .{ .method = "GET", .path = "/json/v1", .status = 200, .pattern = "/{p0:[a-z]+}/v1", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/json/ab.xyz", .status = 404 },
+        .{ .method = "PUT", .path = "/b/users", .status = 200, .pattern = "/b/{p1}", .params = &.{
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/vab/txt.ab/1-42/1.1", .status = 404 },
+        .{ .method = "GET", .path = "/b/b/users", .status = 200, .pattern = "/b/b/users", .params = &.{} },
+        .{ .method = "POST", .path = "/aa_ab.txt/", .status = 404 },
+        .{ .method = "GET", .path = "/txt/v1", .status = 200, .pattern = "/{p0:[a-z]+}/v1", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/pretxt/ajson_a.txt/txt/xyz~x", .status = 404 },
+        .{ .method = "PUT", .path = "/b/xyz", .status = 200, .pattern = "/b/{p1}", .params = &.{
             .{ .name = "p1", .value = "xyz" },
         } },
-        .{ .method = "PUT", .path = "/json~x", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "DELETE", .path = "/preab/b/users-users/", .status = 404 },
+        .{ .method = "GET", .path = "/a/ab-1", .status = 200, .pattern = "/a/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+            .{ .name = "q1", .value = "1" },
         } },
-        .{ .method = "DELETE", .path = "/a-xyz/txt/b", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "DELETE", .path = "/1/42~x/users/v1", .status = 404 },
+        .{ .method = "PUT", .path = "/b/xyz", .status = 200, .pattern = "/b/{p1}", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
         } },
-        .{ .method = "PUT", .path = "/a-txt/x.y", .status = 404 },
-        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
+        .{ .method = "GET", .path = "/b/users/prec7/xyz", .status = 404 },
+        .{ .method = "GET", .path = "/a/v1", .status = 200, .pattern = "/{p0:[a-z]+}/v1", .params = &.{
             .{ .name = "p0", .value = "a" },
         } },
-        .{ .method = "PUT", .path = "/xyz/a.txt", .status = 404 },
-        .{ .method = "GET", .path = "/users-1/json/b", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/atxt_ab.txt/json", .status = 404 },
+        .{ .method = "PUT", .path = "/b/users", .status = 200, .pattern = "/b/{p1}", .params = &.{
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/txt~x/1~x", .status = 404 },
+        .{ .method = "GET", .path = "/b/v1", .status = 200, .pattern = "/{p0:[a-z]+}/v1", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/a-xyz/json~x/xyz", .status = 404 },
+        .{ .method = "GET", .path = "/a/ab-a", .status = 200, .pattern = "/a/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+            .{ .name = "q1", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 404 },
+        .{ .method = "GET", .path = "/b/users/a~x", .status = 200, .pattern = "/b/{p1}/{p2}~x", .params = &.{
+            .{ .name = "p1", .value = "users" },
+            .{ .name = "p2", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/users.c7/vab/a1_json.txt/xyz", .status = 404 },
+        .{ .method = "GET", .path = "/a/json-xyz", .status = 200, .pattern = "/a/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "json" },
+            .{ .name = "q1", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/a-txt/b~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/b/users", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/1", .status = 404 },
+        .{ .method = "GET", .path = "/a/b-users", .status = 200, .pattern = "/a/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "b" },
+            .{ .name = "q1", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/b/a/a42_a.txt/", .status = 404 },
+        .{ .method = "GET", .path = "/a/a-c7", .status = 200, .pattern = "/a/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+            .{ .name = "q1", .value = "c7" },
+        } },
+        .{ .method = "DELETE", .path = "/42~x/vab/1-42/a", .status = 404 },
+        .{ .method = "GET", .path = "/a/txt-c7", .status = 200, .pattern = "/a/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "txt" },
+            .{ .name = "q1", .value = "c7" },
+        } },
+        .{ .method = "GET", .path = "/users", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "GET", .pattern = "/a" },
+        .{ .method = "GET", .pattern = "/v1" },
+        .{ .method = "PUT", .pattern = "/x.y" },
+        .{ .method = "DELETE", .pattern = "/{p0}" },
+        .{ .method = "GET", .pattern = "/{p0}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0}.json" },
+        .{ .method = "POST", .pattern = "/{p0}.{q0}" },
+        .{ .method = "GET", .pattern = "/{p0}.{q0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/v{p0}" },
+        .{ .method = "POST", .pattern = "/{p0}-{q0}" },
+        .{ .method = "POST", .pattern = "/pre{p0}" },
+        .{ .method = "PUT", .pattern = "/pre{p0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0}~x" },
+        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}.json/{p1}" },
+        .{ .method = "GET", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "PUT", .pattern = "/v{p0:[0-9]+}/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-c]+}-{q0}/{p1}" },
+        .{ .method = "POST", .pattern = "/a/*" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "PUT", .path = "/txt.json", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
             "POST",
         } },
-        .{ .method = "DELETE", .path = "/txt~x/a-b/axyz_42.txt", .status = 404 },
-        .{ .method = "POST", .path = "/1-1/42/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
+        .{ .method = "DELETE", .path = "/xyz/b.42/42.a", .status = 404 },
+        .{ .method = "POST", .path = "/txt-json", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "q0", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/preusers", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/vtxt/vab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/preusers/json", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "GET", .path = "/json/ab.1", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p1", .value = "ab.1" },
+        } },
+        .{ .method = "GET", .path = "/c7.b/a", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "q0", .value = "b" },
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "DELETE", .path = "/a-b/a42_ab.txt/ajson_c7.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/vusers/1.42", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/atxt_json.txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "atxt_json.txt" },
+        } },
+        .{ .method = "DELETE", .path = "/1-txt/users.ab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/xyz", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "PUT", .path = "/vusers/", .status = 404 },
+        .{ .method = "GET", .path = "/vc7", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/v1/c7.42", .status = 405, .allow = &.{
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/vjson", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "DELETE", .path = "/prejson/a~x", .status = 405, .allow = &.{
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/vb/xyz/42~x/42", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab_b.txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "ab_b.txt" },
+        } },
+        .{ .method = "DELETE", .path = "/v1/b/ab_1.txt/a~x", .status = 404 },
+        .{ .method = "GET", .path = "/42/ab", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/a~x/vusers/users", .status = 404 },
+        .{ .method = "DELETE", .path = "/vb", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "PUT", .path = "/b-users/c7/users/txt~x", .status = 404 },
+        .{ .method = "POST", .path = "/json.xyz", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/json~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/ab.a", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "a" },
+        } },
+        .{ .method = "DELETE", .path = "/users.1/1-xyz/atxt_json.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/prec7/txt", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/42-42/x.y/prea/txt", .status = 404 },
+        .{ .method = "POST", .path = "/42-c7", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "q0", .value = "c7" },
+        } },
+        .{ .method = "DELETE", .path = "/42~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/b/c7", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/42-ab/a-b", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/pre1/42", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
             .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/users-xyz", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users-xyz" },
+        } },
+        .{ .method = "PUT", .path = "/b-txt/a", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "q0", .value = "txt" },
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/txt.42/txt-xyz/users/a-1", .status = 404 },
+        .{ .method = "GET", .path = "/xyz.1/42", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
             .{ .name = "q0", .value = "1" },
             .{ .name = "p1", .value = "42" },
         } },
-        .{ .method = "POST", .path = "/42/42", .status = 404 },
-        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
+        .{ .method = "GET", .path = "/42/preusers/42/users", .status = 404 },
+        .{ .method = "GET", .path = "/xyz", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
         } },
-        .{ .method = "DELETE", .path = "/vb/x.y/1", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/json~x/json.42", .status = 404 },
-        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/a/", .status = 404 },
-        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/users/xyz/pretxt/42", .status = 404 },
-        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/preab/v42/b~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/1-xyz/42/b", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/b/users/", .status = 404 },
-        .{ .method = "POST", .path = "/a-xyz/1/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "xyz" },
+        .{ .method = "POST", .path = "/txt/a/a", .status = 404 },
+        .{ .method = "GET", .path = "/42.1/1", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "q0", .value = "1" },
             .{ .name = "p1", .value = "1" },
         } },
-        .{ .method = "PUT", .path = "/b/users.ab", .status = 404 },
+        .{ .method = "PUT", .path = "/1-json/42.json/x.y/ab_txt.txt", .status = 404 },
+        .{ .method = "GET", .path = "/txt/a", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/ab_users.txt/42/vusers/42.a", .status = 404 },
+        .{ .method = "GET", .path = "/42~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/pretxt/users/", .status = 404 },
+        .{ .method = "GET", .path = "/xyz", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "PUT", .path = "/ab-a/users", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "a" },
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/a~x/pre1/b~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/xyz/c7", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/a/va/xyz.42", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/prexyz", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/vab/1-txt/json-json/a-c7", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "GET", .pattern = "/a/x.y/a{p2}_{q2}.txt/" },
+        .{ .method = "GET", .pattern = "/*" },
+        .{ .method = "DELETE", .pattern = "/b/v1/a-b" },
+        .{ .method = "POST", .pattern = "/a/x.y/{p2}-{q2}" },
+        .{ .method = "DELETE", .pattern = "/{p0}/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0}.json" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "PUT", .path = "/1.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/preb/c7.ab/preusers/ab.ab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/a/x.y/atxt_a.txt/", .status = 200, .pattern = "/a/x.y/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "txt" },
+            .{ .name = "q2", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/42.c7/a-b/c7", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/b/v1/a-b", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/b/v1/a-b", .status = 200, .pattern = "/b/v1/a-b", .params = &.{} },
+        .{ .method = "POST", .path = "/x.y", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/a/x.y/ab-1", .status = 200, .pattern = "/a/x.y/{p2}-{q2}", .params = &.{
+            .{ .name = "p2", .value = "ab" },
+            .{ .name = "q2", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/a~x/b/xyz~x", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/c7.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "GET", .path = "/txt-1/ab.c7/a/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "txt-1/ab.c7/a/" },
+        } },
+        .{ .method = "POST", .path = "/a/x.y/json-users", .status = 200, .pattern = "/a/x.y/{p2}-{q2}", .params = &.{
+            .{ .name = "p2", .value = "json" },
+            .{ .name = "q2", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/prexyz/json.ab/xyz.txt/preusers", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/1.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/a1_b.txt/users-b/a1_txt.txt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/json.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/aab_c7.txt/users/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/42/42", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "42/42" },
+        } },
+        .{ .method = "POST", .path = "/axyz_users.txt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/a42_b.txt/preab", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a42_b.txt/preab" },
+        } },
+        .{ .method = "POST", .path = "/b", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/b/v1/a-b", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/aab_b.txt/42/1/v1", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/c7.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/x.y", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/a/x.y/json-42", .status = 200, .pattern = "/a/x.y/{p2}-{q2}", .params = &.{
+            .{ .name = "p2", .value = "json" },
+            .{ .name = "q2", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/c7-c7/json-1/atxt_c7.txt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/json.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "GET", .path = "/x.y", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "x.y" },
+        } },
+        .{ .method = "GET", .path = "/a/x.y/axyz_txt.txt/", .status = 200, .pattern = "/a/x.y/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "xyz" },
+            .{ .name = "q2", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/c7.a/a", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/a/x.y/42-42", .status = 200, .pattern = "/a/x.y/{p2}-{q2}", .params = &.{
+            .{ .name = "p2", .value = "42" },
+            .{ .name = "q2", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/preab/vc7/v1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "preab/vc7/v1" },
+        } },
+        .{ .method = "POST", .path = "/a/x.y/aa_42.txt/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/a/va/xyz~x/c7", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/users.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/c7-txt/b", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "c7-txt" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/b/v1/a-b", .status = 200, .pattern = "/b/v1/a-b", .params = &.{} },
+        .{ .method = "GET", .path = "/ab.b/vc7/xyz.1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "ab.b/vc7/xyz.1" },
+        } },
+        .{ .method = "POST", .path = "/a/x.y/a-1", .status = 200, .pattern = "/a/x.y/{p2}-{q2}", .params = &.{
+            .{ .name = "p2", .value = "a" },
+            .{ .name = "q2", .value = "1" },
+        } },
+        .{ .method = "DELETE", .path = "/1.a/1-a/ab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/preb/ajson_txt.txt", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/v1", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/a/x.y/axyz_users.txt/", .status = 200, .pattern = "/a/x.y/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "xyz" },
+            .{ .name = "q2", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/users.b/ab/vusers/ab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/a.json", .status = 405, .allow = &.{
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/x.y/a", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "x.y/a" },
+        } },
+        .{ .method = "DELETE", .path = "/json/42", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/ab", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/1/users", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/1/ab~x", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/a/x.y/ajson_b.txt/", .status = 200, .pattern = "/a/x.y/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "json" },
+            .{ .name = "q2", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/ab_txt.txt/1/users.42/xyz.c7/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "ab_txt.txt/1/users.42/xyz.c7/" },
+        } },
+        .{ .method = "GET", .path = "/xyz", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/vb/b/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "PUT", .path = "/ajson_ab.txt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/a/x.y/aab_ab.txt/", .status = 200, .pattern = "/a/x.y/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p2", .value = "ab" },
+            .{ .name = "q2", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/b.1", .status = 405, .allow = &.{
+            "GET",
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "PUT", .pattern = "/{p0}" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}.json/pre{p1}" },
+        .{ .method = "GET", .pattern = "/a-b/x.y/x.y" },
+        .{ .method = "POST", .pattern = "/pre{p0}/users/{p2}" },
+        .{ .method = "DELETE", .pattern = "/b" },
+        .{ .method = "POST", .pattern = "/{p0}/{p1:[0-9]+}.json/" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "GET", .path = "/vab", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/json/c7.json/", .status = 404 },
+        .{ .method = "POST", .path = "/prexyz/", .status = 404 },
+        .{ .method = "POST", .path = "/prejson/users/b", .status = 200, .pattern = "/pre{p0}/users/{p2}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p2", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/b~x/b.xyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/a.json/preab", .status = 404 },
+        .{ .method = "DELETE", .path = "/prejson/vb/txt~x/prexyz", .status = 404 },
+        .{ .method = "GET", .path = "/xyz", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/42~x/a-b/xyz~x/ab", .status = 404 },
+        .{ .method = "PUT", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/prec7/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/prea", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "prea" },
+        } },
+        .{ .method = "PUT", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/xyz~x", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/a-b/x.y/x.y", .status = 200, .pattern = "/a-b/x.y/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/ausers_txt.txt", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/ab/ab.json/", .status = 404 },
+        .{ .method = "DELETE", .path = "/pre1", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/ab.txt", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/a-b/x.y/x.y", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/ajson_xyz.txt/v42/42", .status = 404 },
+        .{ .method = "POST", .path = "/preb/users/c7", .status = 200, .pattern = "/pre{p0}/users/{p2}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "p2", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/a~x", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/a42_txt.txt/preb/b~x/ajson_b.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/ajson_b.txt/pre1/ab_json.txt/json", .status = 404 },
+        .{ .method = "PUT", .path = "/42.json/pretxt", .status = 200, .pattern = "/{p0:[0-9]+}.json/pre{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "GET", .path = "/prea/ajson_xyz.txt", .status = 404 },
+        .{ .method = "GET", .path = "/a-b/x.y/x.y", .status = 200, .pattern = "/a-b/x.y/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/x.y/ab-txt/preusers/xyz-b", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/ab-txt/ab_xyz.txt/pre1", .status = 404 },
+        .{ .method = "PUT", .path = "/1.json/pre1", .status = 200, .pattern = "/{p0:[0-9]+}.json/pre{p1}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/prejson/va", .status = 404 },
+        .{ .method = "PUT", .path = "/1/xyz.json/", .status = 404 },
+        .{ .method = "POST", .path = "/txt~x/a/a/vjson", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/atxt_b.txt/1/json~x/ausers_42.txt", .status = 404 },
+        .{ .method = "POST", .path = "/prexyz/users/c7", .status = 200, .pattern = "/pre{p0}/users/{p2}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "p2", .value = "c7" },
+        } },
+        .{ .method = "GET", .path = "/vc7/atxt_b.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/ab.json/preab", .status = 404 },
+        .{ .method = "PUT", .path = "/a/json/xyz", .status = 404 },
+        .{ .method = "GET", .path = "/xyz", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/vjson", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/users/xyz.json/", .status = 404 },
+        .{ .method = "POST", .path = "/b/a-b/va", .status = 404 },
+        .{ .method = "POST", .path = "/b/1.json/", .status = 200, .pattern = "/{p0}/{p1:[0-9]+}.json", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/c7-1/json~x/users/1-c7", .status = 404 },
+        .{ .method = "POST", .path = "/ab/1.json/", .status = 200, .pattern = "/{p0}/{p1:[0-9]+}.json", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/prexyz/v1/prejson/c7.ab", .status = 404 },
+        .{ .method = "PUT", .path = "/1.json/pre42", .status = 200, .pattern = "/{p0:[0-9]+}.json/pre{p1}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/pre1/c7~x/xyz", .status = 404 },
+        .{ .method = "POST", .path = "/42/txt.json/", .status = 404 },
+        .{ .method = "POST", .path = "/42~x/json.xyz/txt~x", .status = 404 },
+        .{ .method = "PUT", .path = "/b.json/prejson", .status = 404 },
+        .{ .method = "PUT", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "POST", .pattern = "/b/users/*" },
+        .{ .method = "DELETE", .pattern = "/{p0}/b/a-b" },
+        .{ .method = "DELETE", .pattern = "/{p0}/b/{p2}" },
+        .{ .method = "POST", .pattern = "/a/a-b" },
+        .{ .method = "GET", .pattern = "/a-b/x.y" },
+        .{ .method = "POST", .pattern = "/v1/{p1:[0-9]+}.json/pre{p2}" },
+        .{ .method = "PUT", .pattern = "/x.y" },
+        .{ .method = "POST", .pattern = "/{p0}" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "POST", .path = "/b/users/", .status = 200, .pattern = "/b/users/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "GET", .path = "/vusers/users.c7/a-b", .status = 404 },
+        .{ .method = "DELETE", .path = "/txt/b/a", .status = 200, .pattern = "/{p0}/b/{p2}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "p2", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/preab/b~x/1/json-b", .status = 404 },
+        .{ .method = "POST", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "GET", .path = "/a-ab/prexyz/a", .status = 404 },
+        .{ .method = "POST", .path = "/v1/txt.json/pre42", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab.xyz/txt.xyz", .status = 404 },
         .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "a" },
         } },
-        .{ .method = "POST", .path = "/x.y/preb", .status = 404 },
-        .{ .method = "POST", .path = "/a-a/b/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "p1", .value = "b" },
+        .{ .method = "PUT", .path = "/atxt_ab.txt/vb/users", .status = 404 },
+        .{ .method = "GET", .path = "/a-b/x.y", .status = 200, .pattern = "/a-b/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/ab.a/vc7/c7.c7/v1", .status = 404 },
+        .{ .method = "DELETE", .path = "/a-b/x.y", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/xyz", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
+        .{ .method = "POST", .path = "/a~x/a.1", .status = 404 },
+        .{ .method = "DELETE", .path = "/txt/b/1", .status = 200, .pattern = "/{p0}/b/{p2}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "p2", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/a~x/va/42", .status = 404 },
+        .{ .method = "POST", .path = "/b/users/a", .status = 200, .pattern = "/b/users/*", .params = &.{
+            .{ .name = "*", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/42-ab/1/vjson", .status = 404 },
+        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/42/", .status = 404 },
+        .{ .method = "POST", .path = "/v1/a.json/prexyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab/a/users/vxyz", .status = 404 },
+        .{ .method = "POST", .path = "/v1/b.json/preusers", .status = 404 },
+        .{ .method = "POST", .path = "/b.txt/a-b/ajson_c7.txt", .status = 404 },
+        .{ .method = "POST", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/v42/json-c7/b-xyz", .status = 404 },
+        .{ .method = "POST", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
+        .{ .method = "GET", .path = "/a-b", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
         } },
         .{ .method = "DELETE", .path = "/vb", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "POST", .path = "/1-users/42/b", .status = 200, .pattern = "/{p0}-{q0}/{p1}/b", .params = &.{
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/a-b", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/txt-users/axyz_a.txt/users~x/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab/b/b", .status = 200, .pattern = "/{p0}/b/{p2}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p2", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/json-c7", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/users", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/users-ab", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/1", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/c7~x/ausers_xyz.txt/vusers", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/42.txt/preab", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/preab/ab~x", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/xyz~x/ab", .status = 404 },
+        .{ .method = "POST", .path = "/a/a-b", .status = 200, .pattern = "/a/a-b", .params = &.{} },
+        .{ .method = "PUT", .path = "/a42_a.txt/prea/preusers", .status = 404 },
+        .{ .method = "DELETE", .path = "/json/b/42", .status = 200, .pattern = "/{p0}/b/{p2}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p2", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/vab/a~x", .status = 404 },
+        .{ .method = "POST", .path = "/v1/txt.json/prea", .status = 404 },
+        .{ .method = "PUT", .path = "/ab~x/ab/atxt_xyz.txt", .status = 404 },
+        .{ .method = "POST", .path = "/v1/1.json/pre42", .status = 200, .pattern = "/v1/{p1:[0-9]+}.json/pre{p2}", .params = &.{
+            .{ .name = "p1", .value = "1" },
+            .{ .name = "p2", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/atxt_1.txt/", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "x.y" },
+        } },
+        .{ .method = "DELETE", .path = "/users/va/1", .status = 404 },
+        .{ .method = "PUT", .path = "/users/b/a-b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/c7.xyz/v1", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/a" },
+        .{ .method = "DELETE", .pattern = "/a/{p1}" },
+        .{ .method = "GET", .pattern = "/v1" },
+        .{ .method = "DELETE", .pattern = "/v1/{p1}" },
+        .{ .method = "DELETE", .pattern = "/x.y" },
+        .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "POST", .pattern = "/{p0}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0}.json" },
+        .{ .method = "PUT", .pattern = "/{p0}.{q0}" },
+        .{ .method = "POST", .pattern = "/v{p0}" },
+        .{ .method = "POST", .pattern = "/v{p0}/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0}-{q0}" },
+        .{ .method = "PUT", .pattern = "/pre{p0}" },
+        .{ .method = "GET", .pattern = "/{p0}~x" },
+        .{ .method = "PUT", .pattern = "/{p0}~x/{p1}" },
+        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "POST", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "PUT", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-c]+}-{q0}/{p1}" },
+        .{ .method = "POST", .pattern = "/a/v{p1:[0-9]+}/{p2:[a-z]+}" },
+        .{ .method = "GET", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "POST", .pattern = "/a/a" },
+        .{ .method = "PUT", .pattern = "/{p0}" },
+        .{ .method = "PUT", .pattern = "/a-b/a-b/b" },
+        .{ .method = "POST", .pattern = "/a/users/a" },
+        .{ .method = "GET", .pattern = "/v1/users" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "PUT", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/vb", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "vb" },
+        } },
+        .{ .method = "PUT", .path = "/users-txt/users.1/xyz.ab", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b/a-b/b", .status = 200, .pattern = "/a-b/a-b/b", .params = &.{} },
+        .{ .method = "POST", .path = "/42/vusers", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "vusers" },
+        } },
+        .{ .method = "PUT", .path = "/vc7", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "vc7" },
+        } },
+        .{ .method = "POST", .path = "/42/", .status = 404 },
+        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/1~x", .status = 405, .allow = &.{
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/v1/users", .status = 200, .pattern = "/v1/users", .params = &.{} },
+        .{ .method = "POST", .path = "/ausers_json.txt/xyz-json", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ausers_json.txt" },
+            .{ .name = "p1", .value = "xyz-json" },
+        } },
+        .{ .method = "POST", .path = "/users/1", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/a-b/b~x", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a-b" },
+            .{ .name = "p1", .value = "b~x" },
+        } },
+        .{ .method = "GET", .path = "/v1/users", .status = 200, .pattern = "/v1/users", .params = &.{} },
+        .{ .method = "POST", .path = "/ab", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/vab", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "vab" },
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/preab/c7/preusers/vtxt", .status = 404 },
+        .{ .method = "POST", .path = "/vc7", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "DELETE", .path = "/c7/ab.42/json/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/a-c7", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "c7" },
+        } },
+        .{ .method = "DELETE", .path = "/atxt_json.txt/axyz_xyz.txt/1-1/preusers", .status = 404 },
+        .{ .method = "GET", .path = "/vc7", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "vc7" },
+        } },
+        .{ .method = "POST", .path = "/v42/", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b/a-b/b", .status = 200, .pattern = "/a-b/a-b/b", .params = &.{} },
+        .{ .method = "POST", .path = "/xyz/c7~x/xyz-a", .status = 404 },
+        .{ .method = "GET", .path = "/v1/users", .status = 200, .pattern = "/v1/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/a.json/xyz-a/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/42", .status = 200, .pattern = "/{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/axyz_b.txt/x.y", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/b.json", .status = 405, .allow = &.{
+            "GET",
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/axyz_b.txt/42~x/users.1", .status = 404 },
+        .{ .method = "POST", .path = "/a/vtxt/a", .status = 404 },
+        .{ .method = "GET", .path = "/1-b", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "1-b" },
+        } },
+        .{ .method = "POST", .path = "/vxyz/1", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/42-1/ab", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42-1" },
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/atxt_ab.txt/txt", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "q0", .value = "ab" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "DELETE", .path = "/42", .status = 200, .pattern = "/{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/pretxt", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "pretxt" },
+        } },
+        .{ .method = "DELETE", .path = "/a-users", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
             .{ .name = "q0", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/42/c7/c7", .status = 404 },
+        .{ .method = "POST", .path = "/json-42", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/a-b/v1/vab", .status = 404 },
+        .{ .method = "POST", .path = "/a/a", .status = 200, .pattern = "/a/a", .params = &.{} },
+        .{ .method = "POST", .path = "/1.json/prexyz/v1/vusers", .status = 404 },
+        .{ .method = "DELETE", .path = "/txt~x/1", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/b.b/va", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/v42", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/users-42/c7", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/vjson/1", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/a-c7/users-a", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "a-c7" },
+            .{ .name = "p1", .value = "users-a" },
+        } },
+        .{ .method = "DELETE", .path = "/v1/a", .status = 200, .pattern = "/v1/{p1}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/xyz", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/xyz-ab", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "ab" },
+        } },
+        .{ .method = "POST", .path = "/v1/aa_users.txt", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "aa_users.txt" },
+        } },
+        .{ .method = "GET", .path = "/aab_a.txt/1", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "a" },
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/users.json/users/1", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/{p0}.{q0}/b" },
+        .{ .method = "GET", .pattern = "/{p0}/a/a" },
+        .{ .method = "PUT", .pattern = "/pre{p0}" },
+        .{ .method = "GET", .pattern = "/x.y/v1/v1" },
+        .{ .method = "POST", .pattern = "/v{p0:[0-9]+}/users" },
+        .{ .method = "GET", .pattern = "/v1/v1/*" },
+        .{ .method = "GET", .pattern = "/a/" },
+        .{ .method = "POST", .pattern = "/a-b/{p1}~x" },
+        .{ .method = "DELETE", .pattern = "/a/{p1}/{p2:[0-9]+}" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/v1/v1/vab", .status = 200, .pattern = "/v1/v1/*", .params = &.{
+            .{ .name = "*", .value = "vab" },
+        } },
+        .{ .method = "POST", .path = "/xyz-b/xyz-xyz/prea/", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b/a~x", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/a/x.y/json~x", .status = 404 },
+        .{ .method = "POST", .path = "/vjson/users", .status = 404 },
+        .{ .method = "GET", .path = "/vc7/xyz/c7", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/v1/v1", .status = 200, .pattern = "/x.y/v1/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/xyz~x/json~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab.txt/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/1", .status = 404 },
+        .{ .method = "POST", .path = "/vjson/users", .status = 404 },
+        .{ .method = "DELETE", .path = "/json.42/ab_users.txt/a1_json.txt/42~x", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/v1/v1", .status = 200, .pattern = "/x.y/v1/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/users/vab/pre42", .status = 404 },
+        .{ .method = "GET", .path = "/v1/v1/xyz~x/prexyz", .status = 200, .pattern = "/v1/v1/*", .params = &.{
+            .{ .name = "*", .value = "xyz~x/prexyz" },
+        } },
+        .{ .method = "DELETE", .path = "/vab/xyz-b/", .status = 404 },
+        .{ .method = "PUT", .path = "/prejson", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/42/1/json~x/a~x", .status = 404 },
+        .{ .method = "GET", .path = "/a/a/a", .status = 200, .pattern = "/{p0}/a/a", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/xyz.b/a.txt/xyz.ab/vb", .status = 404 },
+        .{ .method = "GET", .path = "/42/a/a", .status = 200, .pattern = "/{p0}/a/a", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "GET", .path = "/1", .status = 404 },
+        .{ .method = "DELETE", .path = "/42.42/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "q0", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/b-1/vxyz/vxyz/", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/v1/v1", .status = 200, .pattern = "/x.y/v1/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/a-b/ab~x/prea/", .status = 404 },
+        .{ .method = "POST", .path = "/vb/users", .status = 404 },
+        .{ .method = "GET", .path = "/b.xyz/json/c7", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/v1/v1", .status = 200, .pattern = "/x.y/v1/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/aa_a.txt", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/ab~x", .status = 200, .pattern = "/a-b/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/b", .status = 404 },
+        .{ .method = "POST", .path = "/vxyz/users", .status = 404 },
+        .{ .method = "PUT", .path = "/xyz~x/c7/", .status = 404 },
+        .{ .method = "GET", .path = "/v1/v1/", .status = 200, .pattern = "/v1/v1/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "PUT", .path = "/1-txt/users.1", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/json~x", .status = 200, .pattern = "/a-b/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/vb/a-b/pre1", .status = 404 },
+        .{ .method = "GET", .path = "/v1/v1/axyz_42.txt", .status = 200, .pattern = "/v1/v1/*", .params = &.{
+            .{ .name = "*", .value = "axyz_42.txt" },
+        } },
+        .{ .method = "DELETE", .path = "/a-b/a.json/a42_a.txt/x.y/", .status = 404 },
+        .{ .method = "GET", .path = "/a/", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "GET", .path = "/vtxt/a/1", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/v1/v1", .status = 200, .pattern = "/x.y/v1/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/prec7/ab-ab/vusers/1/", .status = 404 },
+        .{ .method = "GET", .path = "/a/", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/atxt_ab.txt/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/xyz.a/b", .status = 200, .pattern = "/{p0}.{q0}/b", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/a-b/a~x/a-b/ab.json", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/v1/v1", .status = 200, .pattern = "/x.y/v1/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/ab~x/b/pre1/txt", .status = 404 },
+        .{ .method = "POST", .path = "/42.txt/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/b~x/users/", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/users~x", .status = 200, .pattern = "/a-b/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/axyz_b.txt/", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/v1/v1", .status = 200, .pattern = "/x.y/v1/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/xyz.1/1~x/users", .status = 404 },
+        .{ .method = "GET", .path = "/a/1/xyz", .status = 404 },
+        .{ .method = "PUT", .path = "/json~x/42.users", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/v1/v1", .status = 200, .pattern = "/x.y/v1/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/json~x/ab/b.b", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "GET", .pattern = "/{p0}/b/{p2:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/x.y/{p1}" },
+        .{ .method = "DELETE", .pattern = "/v1" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/v1", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/prejson/v42", .status = 404 },
+        .{ .method = "GET", .path = "/xyz/b/ab", .status = 404 },
+        .{ .method = "POST", .path = "/prea/ab-c7/b.txt/b", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/preusers/b.users", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/txt", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "GET", .path = "/a.xyz/vtxt", .status = 404 },
+        .{ .method = "GET", .path = "/b/b/c7", .status = 404 },
+        .{ .method = "DELETE", .path = "/txt-1/ab-1/42", .status = 404 },
+        .{ .method = "PUT", .path = "/txt/b/json", .status = 404 },
+        .{ .method = "PUT", .path = "/vb/vc7", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/1", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/atxt_json.txt/1/b.b", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/txt", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/a42_a.txt/a42_a.txt/pre1", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/axyz_1.txt/c7~x/1.42", .status = 404 },
+        .{ .method = "POST", .path = "/v1", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/a-42/xyz~x/pre42/prexyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y/users", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/json.a/json~x/", .status = 404 },
+        .{ .method = "GET", .path = "/a/b/json", .status = 404 },
+        .{ .method = "PUT", .path = "/xyz/a~x/a42_json.txt/a-users", .status = 404 },
+        .{ .method = "GET", .path = "/1/b/1", .status = 200, .pattern = "/{p0}/b/{p2:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p2", .value = "1" },
+        } },
+        .{ .method = "DELETE", .path = "/b/txt/users", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/xyz", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/xyz-1/42/42~x", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/a", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "DELETE", .path = "/json.a/c7~x/b-ab/xyz-42", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/ab", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/1-c7/prec7/txt.c7", .status = 404 },
+        .{ .method = "GET", .path = "/42/b/42", .status = 200, .pattern = "/{p0}/b/{p2:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p2", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/va/a1_ab.txt/1", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/json", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/c7.42", .status = 404 },
+        .{ .method = "GET", .path = "/a/b/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/ausers_json.txt/ajson_c7.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/42/xyz.c7/1/users.a", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/x.y/", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/json/xyz/users~x/a/", .status = 404 },
+        .{ .method = "POST", .path = "/json/b/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/vusers/json-xyz", .status = 404 },
+        .{ .method = "POST", .path = "/txt/b/1", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/1-a/b~x/1-42/preusers", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/1", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/1.users/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/json/b/a", .status = 404 },
+        .{ .method = "POST", .path = "/prexyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/ab-1/atxt_a.txt/ab/prec7", .status = 404 },
+        .{ .method = "GET", .path = "/b/b/1", .status = 200, .pattern = "/{p0}/b/{p2:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "p2", .value = "1" },
+        } },
+        .{ .method = "PUT", .path = "/a", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/a", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/vab", .status = 404 },
+        .{ .method = "GET", .path = "/b/b/b", .status = 404 },
+        .{ .method = "PUT", .path = "/aab_c7.txt/a-b/42.c7", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/users/{p1}~x" },
+        .{ .method = "DELETE", .pattern = "/users/users/{p2}" },
+        .{ .method = "DELETE", .pattern = "/pre{p0}/v1" },
+        .{ .method = "PUT", .pattern = "/pre{p0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/*" },
+        .{ .method = "DELETE", .pattern = "/a/{p1:[0-9]+}" },
+        .{ .method = "DELETE", .pattern = "/{p0}/{p1}~x/" },
+        .{ .method = "GET", .pattern = "/{p0}/a/v1" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "PUT", .path = "/1/a/v1", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/vab", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/prea/b", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/b.users/a42_a.txt/ajson_a.txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "b.users/a42_a.txt/ajson_a.txt" },
+        } },
+        .{ .method = "DELETE", .path = "/pre1/v1", .status = 200, .pattern = "/pre{p0}/v1", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/v1/prec7/42-json", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/a/txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a/txt" },
+        } },
+        .{ .method = "GET", .path = "/users-txt/txt.txt/c7-1/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/xyz/a/v1", .status = 200, .pattern = "/{p0}/a/v1", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/1/preusers", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/users", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/c7/ac7_ab.txt/c7/prec7", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/a/c7", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a/c7" },
+        } },
+        .{ .method = "GET", .path = "/a~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/pretxt/b", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "pretxt/b" },
+        } },
+        .{ .method = "GET", .path = "/ajson_a.txt", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/ac7_json.txt", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/preb", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/users/txt~x", .status = 200, .pattern = "/users/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/users/ab~x/prec7/ab", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "users/ab~x/prec7/ab" },
+        } },
+        .{ .method = "DELETE", .path = "/users/users/a", .status = 200, .pattern = "/users/users/{p2}", .params = &.{
+            .{ .name = "p2", .value = "a" },
+        } },
+        .{ .method = "DELETE", .path = "/va/c7/b.a", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "va/c7/b.a" },
+        } },
+        .{ .method = "DELETE", .path = "/prec7/v1", .status = 200, .pattern = "/pre{p0}/v1", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "PUT", .path = "/a42_a.txt/aa_a.txt/prea/42-json", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/a/c7", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a/c7" },
+        } },
+        .{ .method = "DELETE", .path = "/42~x/prea/a-b", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "42~x/prea/a-b" },
+        } },
+        .{ .method = "DELETE", .path = "/users/a~x", .status = 200, .pattern = "/users/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "DELETE", .path = "/a-b/a~x/a-1/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a-b/a~x/a-1/" },
+        } },
+        .{ .method = "GET", .path = "/preb/v1", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/users/users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/users/users/users", .status = 200, .pattern = "/users/users/{p2}", .params = &.{
+            .{ .name = "p2", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/json-1/json-ab", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/users/a/v1", .status = 200, .pattern = "/{p0}/a/v1", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/b/ajson_a.txt/preab/v42", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/prec7/42", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
             .{ .name = "p1", .value = "42" },
         } },
-        .{ .method = "PUT", .path = "/a/json/txt.42", .status = 404 },
+        .{ .method = "GET", .path = "/c7", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/ab/json~x/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/prea/a1_txt.txt", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "prea/a1_txt.txt" },
+        } },
+        .{ .method = "GET", .path = "/json/a/v1", .status = 200, .pattern = "/{p0}/a/v1", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "DELETE", .path = "/preusers/aa_a.txt/b-42", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "preusers/aa_a.txt/b-42" },
+        } },
+        .{ .method = "DELETE", .path = "/42/a/v1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "42/a/v1" },
+        } },
+        .{ .method = "PUT", .path = "/preusers/preab/c7.xyz", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/a/c7", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a/c7" },
+        } },
+        .{ .method = "DELETE", .path = "/a~x/preb", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "a~x/preb" },
+        } },
+        .{ .method = "PUT", .path = "/preab/xyz", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p1", .value = "xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/1-a", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "1-a" },
+        } },
+        .{ .method = "DELETE", .path = "/42/a/v1", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "42/a/v1" },
+        } },
+        .{ .method = "DELETE", .path = "/c7", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "c7" },
+        } },
+        .{ .method = "GET", .path = "/prec7/42", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/b-42/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/users/b~x", .status = 200, .pattern = "/users/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/xyz-json/42~x/42~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/users/c7~x", .status = 200, .pattern = "/users/{p1}~x", .params = &.{
+            .{ .name = "p1", .value = "c7" },
+        } },
+        .{ .method = "GET", .path = "/a42_1.txt/c7", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/preab/v1", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/a~x/vusers/json-b/42~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/txt/b~x/", .status = 200, .pattern = "/{p0}/{p1}~x", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/c7~x/b/ab_json.txt/", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "c7~x/b/ab_json.txt/" },
+        } },
+        .{ .method = "DELETE", .path = "/users/json~x/", .status = 200, .pattern = "/{p0}/{p1}~x", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/a~x/42/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "PUT", .pattern = "/a" },
+        .{ .method = "GET", .pattern = "/v1" },
+        .{ .method = "PUT", .pattern = "/v1/{p1}" },
+        .{ .method = "PUT", .pattern = "/x.y" },
+        .{ .method = "GET", .pattern = "/x.y/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "POST", .pattern = "/{p0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0}.json" },
+        .{ .method = "POST", .pattern = "/{p0}.{q0}" },
+        .{ .method = "DELETE", .pattern = "/v{p0}" },
+        .{ .method = "GET", .pattern = "/{p0}-{q0}" },
+        .{ .method = "PUT", .pattern = "/pre{p0}" },
+        .{ .method = "GET", .pattern = "/{p0}~x" },
+        .{ .method = "GET", .pattern = "/{p0}~x/{p1}" },
+        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-z]+}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}.json/{p1}" },
+        .{ .method = "DELETE", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/v{p0:[0-9]+}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "GET", .pattern = "/{p0}/a{p1}_{q1}.txt/{p2:[a-c]+}-{q2}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "DELETE", .pattern = "/a/a-b/x.y" },
+        .{ .method = "DELETE", .pattern = "/users" },
+        .{ .method = "POST", .pattern = "/a/{p1}/a-b" },
+        .{ .method = "POST", .pattern = "/{p0}.json/{p1}~x/pre{p2}" },
+        .{ .method = "GET", .pattern = "/a/v{p1:[0-9]+}/users" },
+        .{ .method = "POST", .pattern = "/{p0}" },
+        .{ .method = "POST", .pattern = "/v1" },
+        .{ .method = "PUT", .pattern = "/{p0}/*" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "POST", .path = "/txt.json/json", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "txt.json" },
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/prejson/preab/json-users", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "prejson" },
+            .{ .name = "*", .value = "preab/json-users" },
+        } },
+        .{ .method = "DELETE", .path = "/a/a-b/x.y", .status = 200, .pattern = "/a/a-b/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/vjson/", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "vjson" },
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "PUT", .path = "/b/", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "DELETE", .path = "/aa_txt.txt", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/users~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/atxt_b.txt/b.1/users~x/ab~x/", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "atxt_b.txt" },
+            .{ .name = "*", .value = "b.1/users~x/ab~x/" },
+        } },
+        .{ .method = "POST", .path = "/ab/42", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/vtxt/ausers_c7.txt", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/a.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/preab/va/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/txt", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/prejson/aa_a.txt/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/json.json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "json.json" },
+        } },
+        .{ .method = "DELETE", .path = "/txt-json/json/axyz_json.txt", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/a/a-b/x.y", .status = 405, .allow = &.{
+            "DELETE",
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/v1/vb/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/vjson/42", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/1/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/ab-c7", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/v42/txt~x/json.json/preab", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/users/", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/vtxt/vjson", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "vtxt" },
+            .{ .name = "p1", .value = "vjson" },
+        } },
+        .{ .method = "GET", .path = "/42/aa_json.txt/b-a", .status = 200, .pattern = "/{p0}/a{p1}_{q1}.txt/{p2:[a-c]+}-{q2}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "a" },
+            .{ .name = "q1", .value = "json" },
+            .{ .name = "p2", .value = "b" },
+            .{ .name = "q2", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/42~x/pretxt", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42~x" },
+            .{ .name = "p1", .value = "pretxt" },
+        } },
+        .{ .method = "DELETE", .path = "/vb", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/vxyz/preab", .status = 405, .allow = &.{
+            "POST",
+            "PUT",
+        } },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/b.json/users", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "b.json" },
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/a42_a.txt/c7~x/json.txt/vtxt", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/ab-json", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/json~x", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "json~x" },
+        } },
+        .{ .method = "POST", .path = "/json.1", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "1" },
+        } },
+        .{ .method = "DELETE", .path = "/ab.a/b/42.txt/preb", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/v1/a1_a.txt/pre42/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/v1/xyz", .status = 200, .pattern = "/v1/{p1}", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/preb/42-json/vc7/ab_42.txt", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/atxt_users.txt/ajson_1.txt/preb", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/1", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/a/xyz/aab_txt.txt/users.json", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/x.y", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "x.y" },
+        } },
+        .{ .method = "PUT", .path = "/42.a/c7-users/pretxt/users/", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "42.a" },
+            .{ .name = "*", .value = "c7-users/pretxt/users/" },
+        } },
+        .{ .method = "PUT", .path = "/axyz_json.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/aab_42.txt/pretxt", .status = 200, .pattern = "/{p0}/*", .params = &.{
+            .{ .name = "p0", .value = "aab_42.txt" },
+            .{ .name = "*", .value = "pretxt" },
+        } },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
         .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "b" },
         } },
-        .{ .method = "PUT", .path = "/b~x/", .status = 404 },
-        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/prea/c7", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/{p0}.{q0}" },
-        .{ .method = "POST", .pattern = "/v1" },
-        .{ .method = "GET", .pattern = "/a-b/{p1}.{q1}/users" },
-        .{ .method = "DELETE", .pattern = "/{p0}~x/x.y/a-b" },
-        .{ .method = "POST", .pattern = "/a/{p1}" },
-        .{ .method = "DELETE", .pattern = "/x.y" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/a/1", .status = 200, .pattern = "/a/{p1}", .params = &.{
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/a", .status = 404 },
-        .{ .method = "PUT", .path = "/v1", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/ausers_ab.txt/aa_users.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/json~x/x.y/a-b", .status = 200, .pattern = "/{p0}~x/x.y/a-b", .params = &.{
+        .{ .method = "PUT", .path = "/prejson", .status = 200, .pattern = "/pre{p0}", .params = &.{
             .{ .name = "p0", .value = "json" },
         } },
-        .{ .method = "PUT", .path = "/v1/vab/42~x", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/users.txt/users", .status = 200, .pattern = "/a-b/{p1}.{q1}/users", .params = &.{
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "q1", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/ab", .status = 404 },
-        .{ .method = "GET", .path = "/x.y", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/a", .status = 404 },
-        .{ .method = "GET", .path = "/a/42", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/a/json/json.txt", .status = 404 },
-        .{ .method = "POST", .path = "/42~x/x.y/a-b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/txt/pre1", .status = 404 },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/v1/b.json/vab/b", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/users.a/users", .status = 200, .pattern = "/a-b/{p1}.{q1}/users", .params = &.{
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "q1", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/prejson/ausers_json.txt/atxt_1.txt/xyz.users", .status = 404 },
-        .{ .method = "POST", .path = "/b.b", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/vusers/b.42", .status = 404 },
-        .{ .method = "PUT", .path = "/1.1", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/a-1", .status = 404 },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/a1_b.txt/axyz_users.txt/ajson_json.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a/a", .status = 200, .pattern = "/a/{p1}", .params = &.{
+        .{ .method = "POST", .path = "/vc7/a", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "vc7" },
             .{ .name = "p1", .value = "a" },
         } },
-        .{ .method = "POST", .path = "/axyz_1.txt", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/1.json", .status = 200, .pattern = "/{p0:[0-9]+}.json", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/b/b", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/c7.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "q0", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/prec7", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "prec7" },
+        } },
+        .{ .method = "DELETE", .path = "/vxyz/json~x/", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "PUT", .path = "/txt.json", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "json" },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/x.y" },
+        .{ .method = "DELETE", .pattern = "/a/{p1}" },
+        .{ .method = "GET", .pattern = "/a-b" },
+        .{ .method = "DELETE", .pattern = "/b" },
+        .{ .method = "PUT", .pattern = "/{p0}~x/a-b" },
+        .{ .method = "GET", .pattern = "/a/v1" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/1-ab", .status = 404 },
+        .{ .method = "PUT", .path = "/c7~x/a-b", .status = 200, .pattern = "/{p0}~x/a-b", .params = &.{
+            .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "PUT", .path = "/preusers", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "POST", .path = "/1-c7/a-b/v42/users", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/1", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/va/users", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/txt", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "txt" },
         } },
-        .{ .method = "POST", .path = "/pretxt/ab~x/ab", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b/ab.ab/users", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/preab", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "v1" },
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/json", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "DELETE", .path = "/a-b/users", .status = 404 },
+        .{ .method = "PUT", .path = "/c7~x/a-b", .status = 200, .pattern = "/{p0}~x/a-b", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/pretxt/users/ab-json/a1_users.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/a", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/b/prexyz/", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/v42/txt~x/a.42/1-ab", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/v1/preb/c7/x.y", .status = 404 },
+        .{ .method = "GET", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "POST", .path = "/axyz_1.txt/ab~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/x.y/1/users-ab/b.42", .status = 404 },
+        .{ .method = "GET", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/v42/vb", .status = 404 },
+        .{ .method = "GET", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/c7/xyz~x/ab-c7/", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/vc7/a42_1.txt/", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/aab_c7.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/a", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/vxyz/b.txt", .status = 404 },
+        .{ .method = "GET", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/prea/c7-a/users-users", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/vusers/json-1/ab-ab", .status = 404 },
+        .{ .method = "GET", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/b/json.b/", .status = 404 },
+        .{ .method = "PUT", .path = "/a~x/a-b", .status = 200, .pattern = "/{p0}~x/a-b", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/a/a42_1.txt/a", .status = 404 },
+        .{ .method = "PUT", .path = "/users~x/a-b", .status = 200, .pattern = "/{p0}~x/a-b", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/pre42/atxt_xyz.txt", .status = 404 },
+        .{ .method = "GET", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "PUT", .path = "/xyz.42/a~x/b", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/a~x/users-ab", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab~x/a-b", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/json-42/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "GET", .path = "/a/42~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/b/prea", .status = 404 },
+        .{ .method = "GET", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/x.y/ab", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/a.42/ab~x/pretxt/ab~x", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "POST", .pattern = "/x.y/pre{p1}" },
+        .{ .method = "DELETE", .pattern = "/v1/{p1:[a-c]+}-{q1}/v1" },
+        .{ .method = "GET", .pattern = "/pre{p0}/v1/" },
+        .{ .method = "PUT", .pattern = "/{p0}" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "DELETE", .path = "/pre42/v1/", .status = 405, .allow = &.{
             "GET",
         } },
-        .{ .method = "DELETE", .path = "/a42_users.txt/", .status = 404 },
-        .{ .method = "DELETE", .path = "/json~x/x.y/a-b", .status = 200, .pattern = "/{p0}~x/x.y/a-b", .params = &.{
-            .{ .name = "p0", .value = "json" },
+        .{ .method = "DELETE", .path = "/v42/b.b", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/json-xyz/v1", .status = 404 },
+        .{ .method = "DELETE", .path = "/prea/a-1/", .status = 404 },
+        .{ .method = "GET", .path = "/pretxt/v1/", .status = 200, .pattern = "/pre{p0}/v1", .params = &.{
+            .{ .name = "p0", .value = "txt" },
         } },
-        .{ .method = "GET", .path = "/axyz_b.txt/", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/json.1/users", .status = 200, .pattern = "/a-b/{p1}.{q1}/users", .params = &.{
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "q1", .value = "1" },
+        .{ .method = "PUT", .path = "/axyz_c7.txt/v1", .status = 404 },
+        .{ .method = "GET", .path = "/pretxt/v1/", .status = 200, .pattern = "/pre{p0}/v1", .params = &.{
+            .{ .name = "p0", .value = "txt" },
         } },
-        .{ .method = "DELETE", .path = "/b.1", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/a-1/txt", .status = 404 },
+        .{ .method = "PUT", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "GET", .path = "/prea", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "POST", .path = "/a/ab", .status = 200, .pattern = "/a/{p1}", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/a-b", .status = 404 },
-        .{ .method = "POST", .path = "/a/users", .status = 200, .pattern = "/a/{p1}", .params = &.{
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/a-b/xyz.b/1", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/xyz~x/json/prec7/v1", .status = 404 },
-        .{ .method = "DELETE", .path = "/xyz~x/x.y/a-b", .status = 200, .pattern = "/{p0}~x/x.y/a-b", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/b/xyz-users/ab/xyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/1~x/x.y/a-b", .status = 200, .pattern = "/{p0}~x/x.y/a-b", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/xyz/1/prejson", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/txt.xyz/users", .status = 200, .pattern = "/a-b/{p1}.{q1}/users", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "q1", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/xyz.c7", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/v1/1-txt/v1", .status = 404 },
+        .{ .method = "GET", .path = "/json", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "GET", .path = "/42-a/xyz-42/b.a/42", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/vc7/a42_ab.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/xyz~x/x.y/a-b", .status = 200, .pattern = "/{p0}~x/x.y/a-b", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/42-1/json-a", .status = 404 },
-        .{ .method = "DELETE", .path = "/c7~x/x.y/a-b", .status = 200, .pattern = "/{p0}~x/x.y/a-b", .params = &.{
+        .{ .method = "GET", .path = "/prec7/v1/", .status = 200, .pattern = "/pre{p0}/v1", .params = &.{
             .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "GET", .path = "/42~x/users-ab/vusers/b", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/a.1/users", .status = 200, .pattern = "/a-b/{p1}.{q1}/users", .params = &.{
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "q1", .value = "1" },
+        .{ .method = "POST", .path = "/a-b", .status = 405, .allow = &.{
+            "PUT",
         } },
-        .{ .method = "PUT", .path = "/c7~x/ab~x/1~x/ab-xyz", .status = 404 },
-        .{ .method = "GET", .path = "/a-b/1.txt/users", .status = 200, .pattern = "/a-b/{p1}.{q1}/users", .params = &.{
-            .{ .name = "p1", .value = "1" },
+        .{ .method = "POST", .path = "/x.y/prea", .status = 200, .pattern = "/x.y/pre{p1}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/pre1/vjson", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/users-c7/v1", .status = 404 },
+        .{ .method = "POST", .path = "/c7~x/json~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/ab-txt/v1", .status = 200, .pattern = "/v1/{p1:[a-c]+}-{q1}/v1", .params = &.{
+            .{ .name = "p1", .value = "ab" },
             .{ .name = "q1", .value = "txt" },
         } },
-        .{ .method = "DELETE", .path = "/ab/1~x/42~x", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "POST", .pattern = "/{p0}" },
-        .{ .method = "POST", .pattern = "/a-b" },
-        .{ .method = "POST", .pattern = "/{p0}.json" },
-        .{ .method = "PUT", .pattern = "/{p0}.{q0}/pre{p1}/{p2}" },
-        .{ .method = "DELETE", .pattern = "/x.y/*" },
-        .{ .method = "GET", .pattern = "/pre{p0}/{p1}-{q1}/a{p2}_{q2}.txt" },
-        .{ .method = "POST", .pattern = "/{p0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/v{p0}/*" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "PUT", .path = "/42.42/pretxt/users", .status = 200, .pattern = "/{p0}.{q0}/pre{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "42" },
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "p2", .value = "users" },
+        .{ .method = "DELETE", .path = "/v1/preab", .status = 404 },
+        .{ .method = "PUT", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "json" },
         } },
-        .{ .method = "DELETE", .path = "/json-1/vxyz", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/users/v42/json.ab", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/pre42", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "POST", .path = "/json/json", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "json" },
+        .{ .method = "POST", .path = "/users/txt/vjson", .status = 404 },
+        .{ .method = "GET", .path = "/prea/v1/", .status = 200, .pattern = "/pre{p0}/v1", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "POST", .path = "/users/c7-json/va", .status = 404 },
+        .{ .method = "PUT", .path = "/b", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/ab.a/a/vc7/preb", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/prejson", .status = 200, .pattern = "/x.y/pre{p1}", .params = &.{
             .{ .name = "p1", .value = "json" },
         } },
-        .{ .method = "GET", .path = "/1/users", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/users/xyz", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/ausers_a.txt/prejson/json~x", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/c7", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "POST", .path = "/a.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+        .{ .method = "DELETE", .path = "/v1/xyz-ab/v1", .status = 404 },
+        .{ .method = "POST", .path = "/users.ab/users/vjson/aa_users.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "a" },
         } },
-        .{ .method = "POST", .path = "/x.y/vtxt/aa_42.txt/v42", .status = 405, .allow = &.{
-            "DELETE",
+        .{ .method = "PUT", .path = "/a-b/a.ab/", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/c7-json/v1", .status = 404 },
+        .{ .method = "POST", .path = "/a.1", .status = 405, .allow = &.{
+            "PUT",
         } },
-        .{ .method = "GET", .path = "/preb/xyz-1/ausers_xyz.txt", .status = 200, .pattern = "/pre{p0}/{p1}-{q1}/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "xyz" },
-            .{ .name = "q1", .value = "1" },
-            .{ .name = "p2", .value = "users" },
-            .{ .name = "q2", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/xyz~x/a~x/json", .status = 404 },
-        .{ .method = "POST", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/ac7_users.txt", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/pre1/ab-b/a42_json.txt", .status = 200, .pattern = "/pre{p0}/{p1}-{q1}/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "q1", .value = "b" },
-            .{ .name = "p2", .value = "42" },
-            .{ .name = "q2", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/xyz~x/users/vusers/a~x", .status = 404 },
-        .{ .method = "POST", .path = "/a/a", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
+        .{ .method = "POST", .path = "/x.y/prea", .status = 200, .pattern = "/x.y/pre{p1}", .params = &.{
             .{ .name = "p1", .value = "a" },
         } },
-        .{ .method = "GET", .path = "/c7~x/a42_42.txt/42/42~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/x.y/xyz", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "xyz" },
+        .{ .method = "PUT", .path = "/preusers/vb/vusers/pre42", .status = 404 },
+        .{ .method = "PUT", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
         } },
-        .{ .method = "POST", .path = "/vjson/a-b/ab.json", .status = 405, .allow = &.{
-            "DELETE",
+        .{ .method = "PUT", .path = "/x.y", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "x.y" },
         } },
-        .{ .method = "DELETE", .path = "/a-b", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "DELETE", .path = "/preusers/v1/", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "DELETE", .path = "/b", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "GET", .path = "/aa_b.txt/ac7_1.txt/", .status = 404 },
+        .{ .method = "PUT", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
         } },
-        .{ .method = "GET", .path = "/prexyz/json-1/axyz_42.txt", .status = 200, .pattern = "/pre{p0}/{p1}-{q1}/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "json" },
-            .{ .name = "q1", .value = "1" },
-            .{ .name = "p2", .value = "xyz" },
-            .{ .name = "q2", .value = "42" },
-        } },
-        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/x.y/users/vtxt", .status = 200, .pattern = "/x.y/*", .params = &.{
-            .{ .name = "*", .value = "users/vtxt" },
-        } },
-        .{ .method = "GET", .path = "/txt-ab/prea", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/users/42", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/42/a/txt.json", .status = 404 },
-        .{ .method = "PUT", .path = "/xyz.users/prexyz/users", .status = 200, .pattern = "/{p0}.{q0}/pre{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "users" },
-            .{ .name = "p1", .value = "xyz" },
-            .{ .name = "p2", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/ajson_42.txt/ajson_txt.txt/x.y", .status = 404 },
-        .{ .method = "POST", .path = "/json.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/42/json/ab-txt/va", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1/atxt_ab.txt/prec7", .status = 200, .pattern = "/v{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "*", .value = "atxt_ab.txt/prec7" },
-        } },
-        .{ .method = "PUT", .path = "/vxyz/vxyz/vxyz", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/txt.42/preab/json", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/aab_c7.txt", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "DELETE", .path = "/1~x/", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/users-c7/v1", .status = 404 },
+        .{ .method = "POST", .path = "/prec7/", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/preusers", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/ab.b/txt-a/x.y/ac7_users.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/prec7/ab-c7", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/pre42", .status = 200, .pattern = "/x.y/pre{p1}", .params = &.{
+            .{ .name = "p1", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/users-ab", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users-ab" },
+        } },
+        .{ .method = "POST", .path = "/x.y/pre1", .status = 200, .pattern = "/x.y/pre{p1}", .params = &.{
+            .{ .name = "p1", .value = "1" },
+        } },
+        .{ .method = "DELETE", .path = "/pre1/", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/xyz-xyz/v1", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/users", .status = 404 },
         .{ .method = "GET", .path = "/xyz", .status = 405, .allow = &.{
-            "POST",
+            "PUT",
         } },
-        .{ .method = "DELETE", .path = "/vtxt/", .status = 200, .pattern = "/v{p0}/*", .params = &.{
+        .{ .method = "GET", .path = "/ajson_json.txt/users-b", .status = 404 },
+        .{ .method = "GET", .path = "/pretxt/v1/", .status = 200, .pattern = "/pre{p0}/v1", .params = &.{
             .{ .name = "p0", .value = "txt" },
-            .{ .name = "*", .value = "" },
         } },
-        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "GET", .path = "/txt-users/txt~x/ab/42", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/1", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/users/b", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "POST", .pattern = "/users/{p1}-{q1}" },
+        .{ .method = "POST", .pattern = "/a" },
+        .{ .method = "DELETE", .pattern = "/{p0}.json" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}/pre{p1}/a{p2}_{q2}.txt" },
+        .{ .method = "PUT", .pattern = "/x.y/v{p1}" },
+        .{ .method = "PUT", .pattern = "/a/a/v1" },
+        .{ .method = "GET", .pattern = "/{p0}-{q0}/{p1:[a-z]+}/*" },
+        .{ .method = "DELETE", .pattern = "/{p0}/users" },
+        .{ .method = "GET", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "GET", .pattern = "/v{p0:[0-9]+}/" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/b", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/pre42/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/txt/users", .status = 200, .pattern = "/{p0}/users", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "GET", .path = "/prec7", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "prec7" },
+        } },
+        .{ .method = "DELETE", .path = "/xyz/users", .status = 200, .pattern = "/{p0}/users", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "PUT", .path = "/42~x/prexyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/1.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/a-a/xyz~x/users~x/pre1/", .status = 404 },
+        .{ .method = "DELETE", .path = "/users.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/ab.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/a/a/v1", .status = 200, .pattern = "/a/a/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/json/vtxt/ab_ab.txt/1/", .status = 404 },
+        .{ .method = "POST", .path = "/vusers/", .status = 404 },
+        .{ .method = "PUT", .path = "/txt.42/c7.txt", .status = 404 },
+        .{ .method = "POST", .path = "/users/c7-c7", .status = 200, .pattern = "/users/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "c7" },
+            .{ .name = "q1", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/xyz", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/users/xyz-b", .status = 200, .pattern = "/users/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+            .{ .name = "q1", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/xyz.b/v1/prea", .status = 404 },
+        .{ .method = "PUT", .path = "/a/a/v1", .status = 200, .pattern = "/a/a/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/pretxt", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "pretxt" },
+        } },
+        .{ .method = "DELETE", .path = "/c7-c7/a/c7.c7", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/c7/ab_c7.txt/aa_a.txt/v1", .status = 404 },
+        .{ .method = "GET", .path = "/users-b/42/1/preusers", .status = 404 },
+        .{ .method = "POST", .path = "/b-42", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/c7", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/aab_c7.txt/txt~x/", .status = 404 },
+        .{ .method = "GET", .path = "/vusers/", .status = 404 },
+        .{ .method = "PUT", .path = "/xyz~x/c7~x/b/ab", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "DELETE", .path = "/vtxt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/x.y/vtxt", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/aa_b.txt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "GET", .path = "/xyz~x/ab~x/42~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/users", .status = 200, .pattern = "/{p0}/users", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/pre1/xyz.a/b~x/42.c7", .status = 404 },
+        .{ .method = "POST", .path = "/users/1-ab", .status = 200, .pattern = "/users/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "1" },
+            .{ .name = "q1", .value = "ab" },
+        } },
+        .{ .method = "DELETE", .path = "/atxt_1.txt/preab/c7.xyz/42~x", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/vb", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
+            .{ .name = "p1", .value = "b" },
+        } },
+        .{ .method = "DELETE", .path = "/json.b/txt/xyz~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/1.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "DELETE", .path = "/prejson/txt/xyz~x/b", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/vxyz", .status = 200, .pattern = "/x.y/v{p1}", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/json.json/", .status = 404 },
+        .{ .method = "DELETE", .path = "/1/users", .status = 200, .pattern = "/{p0}/users", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/pretxt/c7~x/users/", .status = 404 },
+        .{ .method = "POST", .path = "/42.json", .status = 405, .allow = &.{
             "DELETE",
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/vc7/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/users", .status = 200, .pattern = "/{p0}/users", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/axyz_txt.txt/txt", .status = 404 },
+        .{ .method = "PUT", .path = "/a", .status = 405, .allow = &.{
+            "GET",
             "POST",
         } },
-        .{ .method = "PUT", .path = "/42/vab/txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/42.json", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/42", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/c7/preb/a42_1.txt", .status = 404 },
+        .{ .method = "POST", .path = "/ab~x/x.y/c7/x.y", .status = 404 },
+        .{ .method = "POST", .path = "/users/txt-json", .status = 200, .pattern = "/users/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "txt" },
+            .{ .name = "q1", .value = "json" },
+        } },
+        .{ .method = "GET", .path = "/b.ab/ab/ab/v42", .status = 404 },
+        .{ .method = "GET", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "PUT", .path = "/x.y/prejson/vb/a", .status = 404 },
+        .{ .method = "PUT", .path = "/a/a/v1", .status = 200, .pattern = "/a/a/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/b.b/a-b", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "GET", .pattern = "/a" },
+        .{ .method = "GET", .pattern = "/a/{p1}" },
+        .{ .method = "DELETE", .pattern = "/v1" },
+        .{ .method = "DELETE", .pattern = "/x.y" },
+        .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}.json" },
+        .{ .method = "DELETE", .pattern = "/{p0}.{q0}" },
+        .{ .method = "GET", .pattern = "/v{p0}" },
+        .{ .method = "PUT", .pattern = "/v{p0}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0}-{q0}" },
+        .{ .method = "POST", .pattern = "/pre{p0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}~x" },
+        .{ .method = "GET", .pattern = "/{p0}~x/{p1}" },
+        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}.json/{p1}" },
+        .{ .method = "DELETE", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "DELETE", .pattern = "/v{p0:[0-9]+}/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "PUT", .pattern = "/x.y/x.y/a" },
+        .{ .method = "POST", .pattern = "/v1/{p1}~x/" },
+        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt/users" },
+        .{ .method = "POST", .pattern = "/v1/{p1}" },
+        .{ .method = "GET", .pattern = "/a/*" },
+        .{ .method = "DELETE", .pattern = "/x.y/users" },
+        .{ .method = "PUT", .pattern = "/{p0}.json/a-b" },
+        .{ .method = "DELETE", .pattern = "/{p0}~x/{p1:[0-9]+}/" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "POST", .path = "/1.a", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/prea/ajson_1.txt/xyz-ab", .status = 404 },
+        .{ .method = "GET", .path = "/a/txt", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/c7-1/xyz.1", .status = 404 },
+        .{ .method = "DELETE", .path = "/1~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/vtxt/", .status = 404 },
+        .{ .method = "PUT", .path = "/aab_42.txt/users", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/c7.json", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/ab/ab", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab/c7.ab/xyz~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/txt.1", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/v1/json~x/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/txt-42/1/ac7_users.txt", .status = 404 },
+        .{ .method = "POST", .path = "/va/json", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/va/a", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/txt", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/1~x/v1/vxyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/txt.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/ajson_txt.txt/preab", .status = 404 },
+        .{ .method = "POST", .path = "/pre42", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/vxyz/ausers_ab.txt", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/vb/txt", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/42.ab/", .status = 404 },
+        .{ .method = "DELETE", .path = "/42/1", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/users.txt/", .status = 404 },
+        .{ .method = "POST", .path = "/prec7", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "PUT", .path = "/1-c7/vxyz/42/a-b", .status = 404 },
+        .{ .method = "PUT", .path = "/1.json/a-b", .status = 200, .pattern = "/{p0:[0-9]+}.json/{p1}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "a-b" },
+        } },
+        .{ .method = "POST", .path = "/x.y", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/ac7_json.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "q0", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/xyz-xyz/b.txt/a~x/v42", .status = 404 },
+        .{ .method = "PUT", .path = "/vusers/json", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/v42/pretxt/", .status = 404 },
+        .{ .method = "DELETE", .path = "/1.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "q0", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/users/preusers/json/", .status = 404 },
+        .{ .method = "GET", .path = "/vab/ab", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/c7~x/vab", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "p1", .value = "vab" },
+        } },
+        .{ .method = "GET", .path = "/1-users", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "q0", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/1/json/xyz.txt/", .status = 404 },
+        .{ .method = "GET", .path = "/txt~x/txt", .status = 200, .pattern = "/{p0}~x/{p1}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/ab/x.y", .status = 404 },
+        .{ .method = "PUT", .path = "/v1", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/xyz~x/ajson_1.txt/txt-42", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/json/prexyz/a/axyz_42.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/1", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/v42", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/txt.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "DELETE", .path = "/b/x.y/ac7_a.txt/b.b", .status = 404 },
+        .{ .method = "GET", .path = "/a/users", .status = 200, .pattern = "/a/{p1}", .params = &.{
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/1-1/v42", .status = 404 },
+        .{ .method = "PUT", .path = "/ab.json/a", .status = 404 },
+        .{ .method = "GET", .path = "/a/xyz/users/xyz", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "xyz/users/xyz" },
+        } },
+        .{ .method = "DELETE", .path = "/json.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/preusers/b.ab", .status = 404 },
+        .{ .method = "GET", .path = "/b-users", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
+            .{ .name = "q0", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/pre1/42~x/aa_json.txt/", .status = 404 },
+        .{ .method = "PUT", .path = "/json.json", .status = 405, .allow = &.{
+            "DELETE",
+            "GET",
+        } },
+        .{ .method = "PUT", .path = "/prea/", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "PUT", .pattern = "/x.y/a/{p2}/" },
+        .{ .method = "POST", .pattern = "/x.y" },
+        .{ .method = "DELETE", .pattern = "/x.y/users" },
+        .{ .method = "GET", .pattern = "/pre{p0}/a-b/x.y" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "DELETE", .path = "/x.y/users", .status = 200, .pattern = "/x.y/users", .params = &.{} },
+        .{ .method = "POST", .path = "/1~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y/users", .status = 200, .pattern = "/x.y/users", .params = &.{} },
+        .{ .method = "GET", .path = "/json/txt.42/b/json", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/a/b/", .status = 200, .pattern = "/x.y/a/{p2}", .params = &.{
+            .{ .name = "p2", .value = "b" },
+        } },
+        .{ .method = "GET", .path = "/a-b", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/1~x/1", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y/users", .status = 200, .pattern = "/x.y/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/pretxt/json/42.xyz", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/a/b/", .status = 200, .pattern = "/x.y/a/{p2}", .params = &.{
+            .{ .name = "p2", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/json", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y/users", .status = 200, .pattern = "/x.y/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/x.y", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/prea/a-b/x.y", .status = 200, .pattern = "/pre{p0}/a-b/x.y", .params = &.{
+            .{ .name = "p0", .value = "a" },
+        } },
+        .{ .method = "PUT", .path = "/v1", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/a/json/", .status = 200, .pattern = "/x.y/a/{p2}", .params = &.{
+            .{ .name = "p2", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/preab", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/a/ab/", .status = 200, .pattern = "/x.y/a/{p2}", .params = &.{
+            .{ .name = "p2", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/vb", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y/users", .status = 200, .pattern = "/x.y/users", .params = &.{} },
+        .{ .method = "PUT", .path = "/aa_ab.txt/ab-xyz/users", .status = 404 },
+        .{ .method = "GET", .path = "/preab/a-b/x.y", .status = 200, .pattern = "/pre{p0}/a-b/x.y", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/vjson/1/users-xyz/a", .status = 404 },
+        .{ .method = "GET", .path = "/pre42/a-b/x.y", .status = 200, .pattern = "/pre{p0}/a-b/x.y", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/a/json/json.txt", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a/42/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/txt/pre1", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/v1/b.json/vab/b", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/a-b/xyz~x/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y/users", .status = 200, .pattern = "/x.y/users", .params = &.{} },
+        .{ .method = "POST", .path = "/xyz-1/a-b", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/42/json-1/pre1/b.a", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/a", .status = 404 },
+        .{ .method = "GET", .path = "/preusers/a-b/x.y", .status = 200, .pattern = "/pre{p0}/a-b/x.y", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/json-a/aa_1.txt/users/users.b", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/users", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/atxt_c7.txt/1~x/vab", .status = 404 },
+        .{ .method = "GET", .path = "/prexyz/a-b/x.y", .status = 200, .pattern = "/pre{p0}/a-b/x.y", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/prejson/prexyz", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/a/ab/", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/users.xyz/a/users/axyz_b.txt/", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/a/json/", .status = 200, .pattern = "/x.y/a/{p2}", .params = &.{
+            .{ .name = "p2", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/a/1-1/va/txt.1", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y/users", .status = 200, .pattern = "/x.y/users", .params = &.{} },
+        .{ .method = "GET", .path = "/vusers/json/a-b", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/json/users/xyz~x", .status = 404 },
+        .{ .method = "GET", .path = "/prexyz/a-b/x.y", .status = 200, .pattern = "/pre{p0}/a-b/x.y", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/ab", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/a/users/", .status = 200, .pattern = "/x.y/a/{p2}", .params = &.{
+            .{ .name = "p2", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/xyz-users/ab/xyz/v1", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/1/prejson/xyz", .status = 404 },
+        .{ .method = "POST", .path = "/pre1/a-b/x.y", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/pre42", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "POST", .pattern = "/a-b/b/v1" },
+        .{ .method = "DELETE", .pattern = "/x.y" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "POST", .path = "/a-b/b/v1", .status = 200, .pattern = "/a-b/b/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/preab/vc7/a42_ab.txt/1~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/42.json", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/a-ab/42~x/users-ab", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/b/v1", .status = 200, .pattern = "/a-b/b/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/a/va/preusers", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/42~x/ab-xyz/1/1", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/b/v1", .status = 200, .pattern = "/a-b/b/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/xyz-a/1~x/vjson/c7", .status = 404 },
+        .{ .method = "GET", .path = "/a-b/b/v1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/va/ajson_users.txt/ab_42.txt", .status = 404 },
+        .{ .method = "POST", .path = "/x.y", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/ausers_txt.txt/users~x/", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/b/v1", .status = 200, .pattern = "/a-b/b/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/txt-c7/preb/ab/v1", .status = 404 },
+        .{ .method = "DELETE", .path = "/a-b/b/v1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/axyz_json.txt", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/b/v1", .status = 200, .pattern = "/a-b/b/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/c7/ajson_1.txt/xyz.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/a", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/b/v1", .status = 200, .pattern = "/a-b/b/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/json~x/ab~x", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/b/v1", .status = 200, .pattern = "/a-b/b/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/a/vtxt", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/b/v1", .status = 200, .pattern = "/a-b/b/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/xyz-b/xyz.users/xyz-1/prejson", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b/b/v1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/1-c7/b-1", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/b/v1", .status = 200, .pattern = "/a-b/b/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/v1/b.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/preb/vusers", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/a/42~x/c7~x/a42_42.txt/", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/pretxt", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/b/v1", .status = 200, .pattern = "/a-b/b/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/c7.a/vtxt", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/b/v1", .status = 200, .pattern = "/a-b/b/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/b.ab", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/json.xyz", .status = 404 },
+        .{ .method = "GET", .path = "/x.y", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "PUT", .path = "/vjson/json/", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/ausers_txt.txt/v42", .status = 404 },
+        .{ .method = "GET", .path = "/a-b/b/v1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/a42_1.txt/ab-txt/a/txt.json", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/users/c7.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/b/a-b", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/vtxt/ab/va/a-b", .status = 404 },
+        .{ .method = "POST", .path = "/a-b/b/v1", .status = 200, .pattern = "/a-b/b/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/c7/prejson", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "GET", .pattern = "/users/x.y" },
+        .{ .method = "DELETE", .pattern = "/a/b" },
+        .{ .method = "POST", .pattern = "/{p0}" },
+        .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "PUT", .pattern = "/a/users" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "POST", .path = "/users/vusers/json-txt", .status = 404 },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/prea/b-json/vab/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/42", .status = 405, .allow = &.{
+            "GET",
             "POST",
         } },
         .{ .method = "POST", .path = "/prec7", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "prec7" },
         } },
-        .{ .method = "DELETE", .path = "/preab/json-xyz/ac7_txt.txt", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/ab", .status = 405, .allow = &.{
             "GET",
-        } },
-        .{ .method = "PUT", .path = "/json~x", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "GET", .path = "/pre42/42-1/ajson_42.txt", .status = 200, .pattern = "/pre{p0}/{p1}-{q1}/a{p2}_{q2}.txt", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "q1", .value = "1" },
-            .{ .name = "p2", .value = "json" },
-            .{ .name = "q2", .value = "42" },
+        .{ .method = "GET", .path = "/vtxt/b-json/prexyz/json", .status = 404 },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/a/vusers/prea", .status = 404 },
+        .{ .method = "POST", .path = "/a/users", .status = 405, .allow = &.{
+            "PUT",
         } },
-        .{ .method = "POST", .path = "/a42_ab.txt/prea/42.txt/vxyz", .status = 404 },
-        .{ .method = "PUT", .path = "/ab.42/pre42/users", .status = 200, .pattern = "/{p0}.{q0}/pre{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "42" },
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/42/ab", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/vb/json.users", .status = 200, .pattern = "/v{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "*", .value = "json.users" },
-        } },
-        .{ .method = "DELETE", .path = "/va/42-c7", .status = 200, .pattern = "/v{p0}/*", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "*", .value = "42-c7" },
-        } },
-        .{ .method = "POST", .path = "/xyz.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/42", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/c7/c7", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/42/pre1/xyz-json/", .status = 404 },
-        .{ .method = "POST", .path = "/ab.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+        .{ .method = "DELETE", .path = "/42.ab/42.users", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/b", .status = 200, .pattern = "/a/b", .params = &.{} },
+        .{ .method = "GET", .path = "/v1/v1/json.users", .status = 404 },
+        .{ .method = "PUT", .path = "/a/users", .status = 200, .pattern = "/a/users", .params = &.{} },
+        .{ .method = "POST", .path = "/pre42/vusers/preusers/ausers_users.txt", .status = 404 },
+        .{ .method = "GET", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "ab" },
         } },
-        .{ .method = "DELETE", .path = "/1/txt.a", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/42/42-txt/", .status = 404 },
+        .{ .method = "POST", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/1-xyz", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "1-xyz" },
+        } },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/a/ab~x/prejson/atxt_c7.txt", .status = 404 },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/vb/users", .status = 404 },
+        .{ .method = "PUT", .path = "/a/users", .status = 200, .pattern = "/a/users", .params = &.{} },
+        .{ .method = "GET", .path = "/c7~x/42/v1/c7~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/b", .status = 200, .pattern = "/a/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/a-b/42~x/v1/json", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "DELETE", .path = "/users/42/v1", .status = 404 },
+        .{ .method = "DELETE", .path = "/a", .status = 405, .allow = &.{
+            "GET",
             "POST",
         } },
-        .{ .method = "PUT", .path = "/json.c7/pretxt/users", .status = 200, .pattern = "/{p0}.{q0}/pre{p1}/{p2}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "c7" },
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "p2", .value = "users" },
+        .{ .method = "DELETE", .path = "/b/", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/b", .status = 200, .pattern = "/a/b", .params = &.{} },
+        .{ .method = "GET", .path = "/vusers/txt/users/users-users", .status = 404 },
+        .{ .method = "POST", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
         } },
-        .{ .method = "PUT", .path = "/1.1/b/users", .status = 404 },
-        .{ .method = "POST", .path = "/a/users", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+        .{ .method = "DELETE", .path = "/ac7_b.txt/", .status = 404 },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/json~x/json.xyz", .status = 404 },
+        .{ .method = "POST", .path = "/txt", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/1-ab", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/c7.c7", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7.c7" },
+        } },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/a.a", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "a.a" },
+        } },
+        .{ .method = "DELETE", .path = "/a/b", .status = 200, .pattern = "/a/b", .params = &.{} },
+        .{ .method = "POST", .path = "/xyz/", .status = 404 },
+        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "users" },
         } },
-        .{ .method = "PUT", .path = "/42/", .status = 404 },
+        .{ .method = "POST", .path = "/c7~x/42/c7.a", .status = 404 },
+        .{ .method = "POST", .path = "/a/users", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/ab-users/a42_xyz.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/b", .status = 200, .pattern = "/a/b", .params = &.{} },
+        .{ .method = "GET", .path = "/txt/b/", .status = 404 },
+        .{ .method = "GET", .path = "/users/x.y", .status = 200, .pattern = "/users/x.y", .params = &.{} },
+        .{ .method = "POST", .path = "/aab_ab.txt/ab~x/txt.a/json", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/b", .status = 200, .pattern = "/a/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/vjson/xyz-a", .status = 404 },
+        .{ .method = "PUT", .path = "/a/b", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/1-ab", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "1-ab" },
+        } },
+        .{ .method = "PUT", .path = "/a/users", .status = 200, .pattern = "/a/users", .params = &.{} },
+        .{ .method = "POST", .path = "/users/va/txt-json/axyz_1.txt", .status = 404 },
     } },
     .{ .routes = &.{
         .{ .method = "POST", .pattern = "/a" },
-        .{ .method = "POST", .pattern = "/v1" },
-        .{ .method = "DELETE", .pattern = "/v1/{p1}" },
-        .{ .method = "GET", .pattern = "/x.y" },
-        .{ .method = "PUT", .pattern = "/{p0}" },
-        .{ .method = "GET", .pattern = "/{p0}.json" },
-        .{ .method = "DELETE", .pattern = "/{p0}.json/{p1}" },
+        .{ .method = "DELETE", .pattern = "/v1" },
+        .{ .method = "DELETE", .pattern = "/x.y" },
+        .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "PUT", .pattern = "/{p0}.json" },
         .{ .method = "GET", .pattern = "/{p0}.{q0}" },
-        .{ .method = "POST", .pattern = "/{p0}.{q0}/{p1}" },
-        .{ .method = "POST", .pattern = "/v{p0}" },
+        .{ .method = "PUT", .pattern = "/v{p0}" },
         .{ .method = "DELETE", .pattern = "/{p0}-{q0}" },
-        .{ .method = "DELETE", .pattern = "/{p0}-{q0}/{p1}" },
-        .{ .method = "POST", .pattern = "/pre{p0}" },
-        .{ .method = "DELETE", .pattern = "/pre{p0}/{p1}" },
-        .{ .method = "PUT", .pattern = "/{p0}~x" },
-        .{ .method = "DELETE", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "PUT", .pattern = "/v1/x.y/{p2}" },
-        .{ .method = "POST", .pattern = "/a/pre{p1}/{p2}" },
-        .{ .method = "DELETE", .pattern = "/{p0}-{q0}/{p1}.{q1}" },
-        .{ .method = "PUT", .pattern = "/a-b" },
-        .{ .method = "PUT", .pattern = "/{p0}~x/{p1}/b" },
-        .{ .method = "POST", .pattern = "/*" },
-        .{ .method = "DELETE", .pattern = "/v1/a/v1" },
-        .{ .method = "PUT", .pattern = "/a/{p1}/*" },
-        .{ .method = "GET", .pattern = "/v1/{p1}-{q1}" },
+        .{ .method = "POST", .pattern = "/{p0}-{q0}/{p1}" },
+        .{ .method = "GET", .pattern = "/pre{p0}" },
+        .{ .method = "GET", .pattern = "/pre{p0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0}~x" },
+        .{ .method = "DELETE", .pattern = "/{p0}~x/{p1}" },
+        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "POST", .pattern = "/{p0:[a-z]+}/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "POST", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/v{p0:[0-9]+}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "GET", .pattern = "/{p0:[a-c]+}-{q0}/{p1}" },
+        .{ .method = "POST", .pattern = "/a-b/{p1}/{p2}" },
+        .{ .method = "PUT", .pattern = "/v1/{p1}.json" },
+        .{ .method = "DELETE", .pattern = "/x.y/*" },
+        .{ .method = "DELETE", .pattern = "/v1/v1/{p2}" },
+        .{ .method = "GET", .pattern = "/users/{p1:[0-9]+}.json/{p2}" },
+        .{ .method = "POST", .pattern = "/{p0}/x.y" },
+        .{ .method = "GET", .pattern = "/x.y/b/a-b" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "PUT", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/vusers/", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/v1", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/42-json/a1_1.txt/aa_json.txt", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "42-json/a1_1.txt/aa_json.txt" },
-        } },
-        .{ .method = "PUT", .path = "/b~x/xyz/b", .status = 200, .pattern = "/{p0}~x/{p1}/b", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "PUT", .path = "/xyz.42/txt", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/a-b/users", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "b" },
-            .{ .name = "p1", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/1.c7", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "1.c7" },
-        } },
-        .{ .method = "GET", .path = "/txt.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/c7.json", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "c7.json" },
-        } },
-        .{ .method = "DELETE", .path = "/users.json/ab", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/a42_json.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "a42_json" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/v1/x.y/ab", .status = 200, .pattern = "/v1/x.y/{p2}", .params = &.{
-            .{ .name = "p2", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/vjson/xyz-a", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/c7.a/txt", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/a.json/aa_1.txt/users/va", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/users.xyz", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "users.xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/v1/b-a/vtxt/1-1", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/preb", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/xyz", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/prea", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "GET", .path = "/a-b/json.users", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/c7-json/c7", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "json" },
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/ausers_c7.txt", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "ausers_c7" },
-            .{ .name = "q0", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/b-ab/xyz", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "b-ab/xyz" },
-        } },
-        .{ .method = "POST", .path = "/xyz.ab/a", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "ab" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/users~x/a/json/ac7_txt.txt", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/v1/x.y/xyz", .status = 200, .pattern = "/v1/x.y/{p2}", .params = &.{
-            .{ .name = "p2", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/va/vc7", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/prexyz/c7", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "c7" },
+        .{ .method = "PUT", .path = "/c7", .status = 405, .allow = &.{
+            "GET",
         } },
         .{ .method = "PUT", .path = "/a1_1.txt/c7~x", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/c7/ab", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/vb/b.json/atxt_1.txt", .status = 404 },
+        .{ .method = "GET", .path = "/pretxt/txt", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/42~x/a/a-c7", .status = 404 },
+        .{ .method = "GET", .path = "/vjson/xyz", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "DELETE", .path = "/ac7_ab.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "ab" },
+        .{ .method = "DELETE", .path = "/ab/pre42/vc7", .status = 404 },
+        .{ .method = "PUT", .path = "/txt", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "DELETE", .path = "/a/vb/b.json/atxt_1.txt", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/vb/c7-b", .status = 405, .allow = &.{
             "POST",
-            "PUT",
         } },
-        .{ .method = "POST", .path = "/txt.txt/c7", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "txt" },
-            .{ .name = "p1", .value = "c7" },
+        .{ .method = "DELETE", .path = "/vxyz/b", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "PUT", .path = "/x.y", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "x.y" },
+        .{ .method = "DELETE", .path = "/a/ausers_b.txt", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "POST", .path = "/vtxt", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/axyz_xyz.txt/vab/txt-xyz", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "axyz_xyz.txt/vab/txt-xyz" },
-        } },
-        .{ .method = "POST", .path = "/preb", .status = 200, .pattern = "/pre{p0}", .params = &.{
+        .{ .method = "GET", .path = "/b", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
             .{ .name = "p0", .value = "b" },
         } },
-        .{ .method = "POST", .path = "/users-b", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "users-b" },
-        } },
-        .{ .method = "GET", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/b~x/b/v1/atxt_a.txt", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "b~x/b/v1/atxt_a.txt" },
-        } },
-        .{ .method = "POST", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "PUT", .path = "/ab-c7/v1/users-42", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/json.json/users", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
+        .{ .method = "GET", .path = "/c7.ab/users-42", .status = 404 },
+        .{ .method = "DELETE", .path = "/json-users", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
             .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "users" },
+            .{ .name = "q0", .value = "users" },
         } },
-        .{ .method = "POST", .path = "/axyz_json.txt/v1", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "axyz_json" },
-            .{ .name = "q0", .value = "txt" },
-            .{ .name = "p1", .value = "v1" },
+        .{ .method = "POST", .path = "/axyz_json.txt/v1", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "GET", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "DELETE", .path = "/txt", .status = 405, .allow = &.{
-            "POST",
-            "PUT",
+        .{ .method = "PUT", .path = "/a.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
+            .{ .name = "p0", .value = "a" },
         } },
-        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/users/ab~x/xyz/vjson", .status = 405, .allow = &.{
-            "POST",
+        .{ .method = "GET", .path = "/json/b.c7/json/users/", .status = 404 },
+        .{ .method = "GET", .path = "/ajson_json.txt/ab", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
+            .{ .name = "p0", .value = "json" },
+            .{ .name = "q0", .value = "json" },
+            .{ .name = "p1", .value = "ab" },
         } },
-        .{ .method = "DELETE", .path = "/v1/b", .status = 200, .pattern = "/v1/{p1}", .params = &.{
-            .{ .name = "p1", .value = "b" },
+        .{ .method = "POST", .path = "/b~x/preab/a-b", .status = 404 },
+        .{ .method = "POST", .path = "/xyz-a/ab", .status = 200, .pattern = "/{p0}-{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "q0", .value = "a" },
+            .{ .name = "p1", .value = "ab" },
         } },
-        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+        .{ .method = "GET", .path = "/c7~x/json~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "DELETE", .path = "/c7-1/b/1/aa_txt.txt", .status = 404 },
+        .{ .method = "GET", .path = "/users/txt.json/ab", .status = 404 },
+        .{ .method = "GET", .path = "/a.42/ab/a-b/pretxt", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab-42", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/a-b", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}", .params = &.{
             .{ .name = "p0", .value = "a" },
             .{ .name = "q0", .value = "b" },
         } },
-        .{ .method = "DELETE", .path = "/xyz.json/a", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "a" },
+        .{ .method = "PUT", .path = "/ab", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "POST", .path = "/vab", .status = 200, .pattern = "/v{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/prea/xyz", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/v42/42.b/json.json/aa_txt.txt", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "v42/42.b/json.json/aa_txt.txt" },
-        } },
-        .{ .method = "GET", .path = "/v1/a/v1", .status = 405, .allow = &.{
-            "DELETE",
+        .{ .method = "DELETE", .path = "/vtxt/a1_txt.txt/b~x/42-xyz", .status = 404 },
+        .{ .method = "GET", .path = "/txt-a/a", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "POST", .path = "/ajson_a.txt", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "ajson_a.txt" },
+        .{ .method = "DELETE", .path = "/c7-json/", .status = 404 },
+        .{ .method = "PUT", .path = "/v1", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "1" },
         } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "DELETE", .pattern = "/pre{p0}" },
-        .{ .method = "PUT", .pattern = "/a/a/{p2}.{q2}" },
-        .{ .method = "PUT", .pattern = "/{p0}~x" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "PUT", .path = "/users~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "users" },
+        .{ .method = "DELETE", .path = "/b.json/a1_json.txt/users", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y/v1", .status = 200, .pattern = "/x.y/*", .params = &.{
+            .{ .name = "*", .value = "v1" },
         } },
-        .{ .method = "PUT", .path = "/json/c7.a/users/42-xyz", .status = 404 },
-        .{ .method = "PUT", .path = "/txt~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "txt" },
+        .{ .method = "DELETE", .path = "/a/users", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "GET", .path = "/b/42/42.42/", .status = 404 },
-        .{ .method = "DELETE", .path = "/a/a/c7.b", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/v42", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "POST", .path = "/v1/axyz_a.txt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/json.json", .status = 405, .allow = &.{
+            "GET",
             "PUT",
         } },
-        .{ .method = "POST", .path = "/a", .status = 404 },
-        .{ .method = "PUT", .path = "/xyz~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
+        .{ .method = "GET", .path = "/prec7/", .status = 404 },
+        .{ .method = "PUT", .path = "/vc7", .status = 200, .pattern = "/v{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "POST", .path = "/vab/ac7_a.txt/txt~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/prea", .status = 200, .pattern = "/pre{p0}", .params = &.{
+        .{ .method = "PUT", .path = "/ab/ab.b/", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
+        .{ .method = "GET", .path = "/prea", .status = 200, .pattern = "/pre{p0}", .params = &.{
             .{ .name = "p0", .value = "a" },
         } },
-        .{ .method = "POST", .path = "/x.y/a~x", .status = 404 },
-        .{ .method = "GET", .path = "/b~x", .status = 405, .allow = &.{
-            "PUT",
+        .{ .method = "DELETE", .path = "/v1/v1/42", .status = 200, .pattern = "/v1/v1/{p2}", .params = &.{
+            .{ .name = "p2", .value = "42" },
         } },
-        .{ .method = "PUT", .path = "/vc7", .status = 404 },
-        .{ .method = "PUT", .path = "/a~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "a" },
+        .{ .method = "POST", .path = "/1-42/", .status = 404 },
+        .{ .method = "GET", .path = "/prec7", .status = 200, .pattern = "/pre{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "POST", .path = "/xyz", .status = 404 },
-        .{ .method = "PUT", .path = "/pre1", .status = 405, .allow = &.{
-            "DELETE",
+        .{ .method = "POST", .path = "/preb/prejson/pre42", .status = 404 },
+        .{ .method = "POST", .path = "/42.json", .status = 200, .pattern = "/{p0:[0-9]+}.json", .params = &.{
+            .{ .name = "p0", .value = "42" },
         } },
-        .{ .method = "GET", .path = "/1.txt/", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/ab.42", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "ab" },
-            .{ .name = "q2", .value = "42" },
+        .{ .method = "PUT", .path = "/prexyz/v1", .status = 405, .allow = &.{
+            "GET",
+            "POST",
         } },
-        .{ .method = "DELETE", .path = "/prexyz/1-42/txt~x/vab", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/b.c7", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "b" },
-            .{ .name = "q2", .value = "c7" },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/atxt_ab.txt/axyz_b.txt/json-a", .status = 404 },
+        .{ .method = "PUT", .path = "/txt", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "POST", .path = "/c7.txt/a-42/xyz/prexyz", .status = 404 },
-        .{ .method = "PUT", .path = "/json~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "json" },
+        .{ .method = "DELETE", .path = "/a1_txt.txt/ab.b", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "PUT", .path = "/c7", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/a.b", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "a" },
-            .{ .name = "q2", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/a-xyz/a-b/txt.a/vtxt", .status = 404 },
-        .{ .method = "POST", .path = "/a/a/json.1", .status = 405, .allow = &.{
-            "PUT",
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "1" },
         } },
         .{ .method = "PUT", .path = "/ab-1/b/a-42/xyz~x", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/c7.c7", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "c7" },
-            .{ .name = "q2", .value = "c7" },
+        .{ .method = "GET", .path = "/prec7/c7", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+            .{ .name = "p1", .value = "c7" },
         } },
-        .{ .method = "DELETE", .path = "/ausers_c7.txt/pretxt", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/txt.json", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "txt" },
-            .{ .name = "q2", .value = "json" },
+        .{ .method = "DELETE", .path = "/ausers_c7.txt/pretxt", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "POST", .path = "/atxt_json.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "q0", .value = "json" },
         } },
         .{ .method = "GET", .path = "/c7.users/users/ab-1", .status = 404 },
-        .{ .method = "POST", .path = "/preb", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/a~x/c7-xyz/ab-a", .status = 404 },
-        .{ .method = "DELETE", .path = "/prejson", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/b/pretxt", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/txt.a", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "txt" },
-            .{ .name = "q2", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/a-b/json-1", .status = 404 },
-        .{ .method = "PUT", .path = "/ab~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "PUT", .path = "/vab/ac7_users.txt/b", .status = 404 },
-        .{ .method = "PUT", .path = "/c7~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "GET", .path = "/ab.txt/", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/b.a", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "b" },
-            .{ .name = "q2", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/txt-users/1", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/json.xyz", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "json" },
-            .{ .name = "q2", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/vab/prexyz", .status = 404 },
-        .{ .method = "PUT", .path = "/json~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/xyz-users/", .status = 404 },
-        .{ .method = "PUT", .path = "/a~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/vjson/ab.1/a1_1.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/c7.1", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "c7" },
-            .{ .name = "q2", .value = "1" },
-        } },
-        .{ .method = "POST", .path = "/pre1/prexyz/txt~x/vtxt", .status = 404 },
-        .{ .method = "DELETE", .path = "/prec7", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/b-1/42/ajson_42.txt/users", .status = 404 },
-        .{ .method = "PUT", .path = "/42~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "POST", .path = "/42~x/users/a-b", .status = 404 },
-        .{ .method = "DELETE", .path = "/preusers", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-        } },
-        .{ .method = "PUT", .path = "/b.json/a-b/42", .status = 404 },
-        .{ .method = "DELETE", .path = "/pre1", .status = 200, .pattern = "/pre{p0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-        } },
-        .{ .method = "GET", .path = "/ab.users/42/json-ab/", .status = 404 },
-        .{ .method = "PUT", .path = "/a/a/json.ab", .status = 200, .pattern = "/a/a/{p2}.{q2}", .params = &.{
-            .{ .name = "p2", .value = "json" },
-            .{ .name = "q2", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/txt~x/a", .status = 404 },
     } },
     .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/x.y/users/b/" },
-        .{ .method = "GET", .pattern = "/{p0}/pre{p1}/x.y" },
+        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "DELETE", .pattern = "/{p0}~x" },
         .{ .method = "DELETE", .pattern = "/b" },
-        .{ .method = "DELETE", .pattern = "/*" },
-        .{ .method = "PUT", .pattern = "/{p0}/x.y" },
-        .{ .method = "POST", .pattern = "/{p0}/v{p1}/{p2}~x/" },
-        .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "GET", .pattern = "/{p0}-{q0}/a-b" },
+        .{ .method = "POST", .pattern = "/{p0}/{p1:[a-c]+}-{q1}/*" },
+        .{ .method = "PUT", .pattern = "/{p0}.json/a-b" },
+        .{ .method = "POST", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "GET", .pattern = "/v{p0:[0-9]+}/a/{p2}" },
+        .{ .method = "PUT", .pattern = "/users/a/b" },
+        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt/v{p1:[0-9]+}" },
+        .{ .method = "POST", .pattern = "/pre{p0}/{p1}.json/" },
     }, .refused = 0, .cases = &.{
         .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/txt.ab/users/c7-a/xyz/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/x.y/users/b/", .status = 200, .pattern = "/x.y/users/b", .params = &.{} },
-        .{ .method = "POST", .path = "/pre1/v1", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "POST", .path = "/pre42/ab/v42/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/ab/vab/ab~x/", .status = 200, .pattern = "/{p0}/v{p1}/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "p2", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/pretxt/c7.c7", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/ab.42/ausers_ab.txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/json.ab/ab~x/json/txt~x", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "json.ab/ab~x/json/txt~x" },
-        } },
-        .{ .method = "POST", .path = "/users/x.y", .status = 405, .allow = &.{
-            "DELETE",
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/xyz/ab-json", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/c7/vab/42~x/", .status = 200, .pattern = "/{p0}/v{p1}/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/a/users~x/users~x/vb", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/b", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/c7-42", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/xyz/prea/x.y", .status = 200, .pattern = "/{p0}/pre{p1}/x.y", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/a-b/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/xyz~x/ab~x/1~x/ab", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/xyz", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/a/vusers/a/a42_users.txt", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/json/vusers/c7~x/", .status = 200, .pattern = "/{p0}/v{p1}/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "p2", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/va", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/b/x.y", .status = 200, .pattern = "/{p0}/x.y", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/c7-json/txt~x/prejson", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/x.y/users/b/", .status = 200, .pattern = "/x.y/users/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/preusers", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "POST", .path = "/users-txt/a1_xyz.txt/users/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/ab/vtxt/a~x/", .status = 200, .pattern = "/{p0}/v{p1}/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "p2", .value = "a" },
-        } },
-        .{ .method = "POST", .path = "/a/1", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/c7", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/users/pre42/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "GET", .path = "/ab.a/xyz", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-        } },
-        .{ .method = "GET", .path = "/b.ab/a-b/b~x", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/ajson_b.txt/pre1/a.xyz", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "ajson_b.txt/pre1/a.xyz" },
-        } },
-        .{ .method = "GET", .path = "/x.y/users/b/", .status = 200, .pattern = "/x.y/users/b", .params = &.{} },
-        .{ .method = "POST", .path = "/users", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "GET", .path = "/42/b.ab", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "POST", .path = "/x.y/users/b/", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/users/b-b", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/x.y/users/b/", .status = 200, .pattern = "/x.y/users/b", .params = &.{} },
-        .{ .method = "GET", .path = "/c7/prejson", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/b/pretxt/x.y", .status = 200, .pattern = "/{p0}/pre{p1}/x.y", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/txt~x/x.y/a/", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/json-xyz", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/42/x.y", .status = 200, .pattern = "/{p0}/x.y", .params = &.{
-            .{ .name = "p0", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/a1_users.txt/users", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/1/va/a~x/", .status = 405, .allow = &.{
-            "DELETE",
+        .{ .method = "DELETE", .path = "/txt~x/a/xyz.a/vxyz", .status = 404 },
+        .{ .method = "PUT", .path = "/ab/ab-b/xyz-a/xyz-users", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "DELETE", .path = "/c7", .status = 200, .pattern = "/*", .params = &.{
-            .{ .name = "*", .value = "c7" },
+        .{ .method = "PUT", .path = "/a/json.json", .status = 404 },
+        .{ .method = "POST", .path = "/a1_1.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "q0", .value = "1" },
         } },
-        .{ .method = "PUT", .path = "/xyz/x.y", .status = 200, .pattern = "/{p0}/x.y", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/b/prec7", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/a~x", .status = 405, .allow = &.{
             "DELETE",
         } },
-    } },
-    .{ .routes = &.{
-        .{ .method = "POST", .pattern = "/v{p0}/a/" },
-        .{ .method = "DELETE", .pattern = "/x.y/*" },
-        .{ .method = "PUT", .pattern = "/b/b" },
-        .{ .method = "POST", .pattern = "/{p0}-{q0}/a-b/x.y/" },
-        .{ .method = "PUT", .pattern = "/{p0}.{q0}/v1" },
-        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt/x.y/a-b" },
-        .{ .method = "POST", .pattern = "/{p0}~x/x.y/{p2}" },
-        .{ .method = "PUT", .pattern = "/pre{p0}/{p1}/{p2}.{q2}" },
-        .{ .method = "DELETE", .pattern = "/a-b/v1" },
-        .{ .method = "GET", .pattern = "/{p0}/a-b/a" },
-        .{ .method = "PUT", .pattern = "/{p0}" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "POST", .path = "/xyz~x/x.y/42", .status = 200, .pattern = "/{p0}~x/x.y/{p2}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p2", .value = "42" },
+        .{ .method = "POST", .path = "/c7-xyz", .status = 404 },
+        .{ .method = "POST", .path = "/xyz", .status = 404 },
+        .{ .method = "GET", .path = "/ab-ab/a-b", .status = 200, .pattern = "/{p0}-{q0}/a-b", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "q0", .value = "ab" },
         } },
-        .{ .method = "GET", .path = "/a.c7", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/json/a-b/a", .status = 200, .pattern = "/{p0}/a-b/a", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "DELETE", .path = "/vb/42", .status = 404 },
-        .{ .method = "POST", .path = "/b~x/x.y/users", .status = 200, .pattern = "/{p0}~x/x.y/{p2}", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p2", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/ab~x/", .status = 404 },
-        .{ .method = "DELETE", .path = "/42/a-b/a", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/vtxt/aab_users.txt/json", .status = 404 },
-        .{ .method = "GET", .path = "/ab_xyz.txt/x.y/a-b", .status = 200, .pattern = "/a{p0}_{q0}.txt/x.y/a-b", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "POST", .path = "/users~x", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/42-ab/a-b/x.y/", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/va/b-1", .status = 404 },
+        .{ .method = "PUT", .path = "/ausers_42.txt/vusers", .status = 404 },
+        .{ .method = "PUT", .path = "/json-a/vjson/42~x/users/", .status = 404 },
+        .{ .method = "PUT", .path = "/ajson_1.txt/vc7", .status = 404 },
+        .{ .method = "PUT", .path = "/1/42/a-b", .status = 404 },
+        .{ .method = "GET", .path = "/prexyz/ab.json/", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "POST", .path = "/users/a42_b.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
+        .{ .method = "PUT", .path = "/vc7/", .status = 404 },
+        .{ .method = "POST", .path = "/txt~x", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "GET", .path = "/txt~x/a", .status = 404 },
+        .{ .method = "POST", .path = "/prec7/json.json/", .status = 200, .pattern = "/pre{p0}/{p1}.json", .params = &.{
             .{ .name = "p0", .value = "c7" },
+            .{ .name = "p1", .value = "json" },
         } },
-        .{ .method = "DELETE", .path = "/c7/vb/ac7_json.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/json.xyz/v1", .status = 405, .allow = &.{
-            "PUT",
+        .{ .method = "POST", .path = "/ab.b/users/va/json", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/ac7_xyz.txt/a", .status = 404 },
+        .{ .method = "PUT", .path = "/aab_json.txt/vb", .status = 404 },
+        .{ .method = "GET", .path = "/json.txt/1-42/pre1/vtxt", .status = 404 },
+        .{ .method = "GET", .path = "/txt-1/a-b", .status = 200, .pattern = "/{p0}-{q0}/a-b", .params = &.{
+            .{ .name = "p0", .value = "txt" },
+            .{ .name = "q0", .value = "1" },
         } },
-        .{ .method = "GET", .path = "/json~x", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/xyz.b/v1", .status = 200, .pattern = "/{p0}.{q0}/v1", .params = &.{
+        .{ .method = "PUT", .path = "/vc7", .status = 404 },
+        .{ .method = "POST", .path = "/json/users-a/", .status = 404 },
+        .{ .method = "POST", .path = "/pre1/v1", .status = 404 },
+        .{ .method = "GET", .path = "/xyz-b/a-b", .status = 200, .pattern = "/{p0}-{q0}/a-b", .params = &.{
             .{ .name = "p0", .value = "xyz" },
             .{ .name = "q0", .value = "b" },
         } },
-        .{ .method = "POST", .path = "/vusers/a42_b.txt", .status = 404 },
-        .{ .method = "POST", .path = "/42~x/x.y/xyz", .status = 200, .pattern = "/{p0}~x/x.y/{p2}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p2", .value = "xyz" },
+        .{ .method = "GET", .path = "/ab/v42/txt/vb", .status = 404 },
+        .{ .method = "GET", .path = "/vjson/a/users", .status = 404 },
+        .{ .method = "PUT", .path = "/v1/pre1", .status = 404 },
+        .{ .method = "POST", .path = "/42-ab", .status = 404 },
+        .{ .method = "GET", .path = "/vusers/txt~x/c7~x", .status = 404 },
+        .{ .method = "PUT", .path = "/a1_ab.txt/vab", .status = 404 },
+        .{ .method = "POST", .path = "/txt~x/42~x/a~x/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/preab/42.json/", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "DELETE", .path = "/users.1", .status = 405, .allow = &.{
-            "PUT",
+        .{ .method = "GET", .path = "/preb", .status = 404 },
+        .{ .method = "DELETE", .path = "/atxt_txt.txt", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "PUT", .path = "/b/b", .status = 200, .pattern = "/b/b", .params = &.{} },
-        .{ .method = "DELETE", .path = "/prejson/ab~x/txt", .status = 404 },
-        .{ .method = "GET", .path = "/aab_1.txt/x.y/a-b", .status = 200, .pattern = "/a{p0}_{q0}.txt/x.y/a-b", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "q0", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/x.y/42/vc7", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/users~x", .status = 405, .allow = &.{
             "DELETE",
         } },
-        .{ .method = "POST", .path = "/x.y/b~x/xyz.users", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/ab~x/xyz.c7/ab-42/v42", .status = 404 },
-        .{ .method = "GET", .path = "/ausers_xyz.txt/x.y/a-b", .status = 200, .pattern = "/a{p0}_{q0}.txt/x.y/a-b", .params = &.{
-            .{ .name = "p0", .value = "users" },
+        .{ .method = "GET", .path = "/vab/a/xyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/txt.c7", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/aa_a.txt/vtxt/b/vab/", .status = 404 },
+        .{ .method = "POST", .path = "/a1_xyz.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+            .{ .name = "p0", .value = "1" },
             .{ .name = "q0", .value = "xyz" },
         } },
-        .{ .method = "DELETE", .path = "/prec7/txt.42/v1", .status = 404 },
-        .{ .method = "PUT", .path = "/b/b", .status = 200, .pattern = "/b/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/a/v42/1~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b/v1", .status = 200, .pattern = "/a-b/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/users-users", .status = 405, .allow = &.{
-            "PUT",
+        .{ .method = "POST", .path = "/1~x/ab/xyz/txt~x", .status = 404 },
+        .{ .method = "GET", .path = "/a-txt/a-b", .status = 200, .pattern = "/{p0}-{q0}/a-b", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "txt" },
         } },
-        .{ .method = "DELETE", .path = "/a-b/v1", .status = 200, .pattern = "/a-b/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/xyz/1~x/xyz.json/json.xyz", .status = 404 },
-        .{ .method = "POST", .path = "/vc7/a/", .status = 200, .pattern = "/v{p0}/a", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/va/pre42", .status = 404 },
-        .{ .method = "PUT", .path = "/pretxt/b/c7.txt", .status = 200, .pattern = "/pre{p0}/{p1}/{p2}.{q2}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "p2", .value = "c7" },
-            .{ .name = "q2", .value = "txt" },
-        } },
-        .{ .method = "PUT", .path = "/a42_1.txt/42~x/a1_users.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/c7.c7/v1", .status = 200, .pattern = "/{p0}.{q0}/v1", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/atxt_users.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/txt/a-b/a", .status = 200, .pattern = "/{p0}/a-b/a", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/pre42/prec7/json~x", .status = 404 },
-        .{ .method = "PUT", .path = "/b/b", .status = 200, .pattern = "/b/b", .params = &.{} },
-        .{ .method = "GET", .path = "/xyz/42/txt", .status = 404 },
-        .{ .method = "GET", .path = "/c7/a-b/a", .status = 200, .pattern = "/{p0}/a-b/a", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/preb/aa_json.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/a-b/v1", .status = 200, .pattern = "/a-b/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/42/", .status = 404 },
-        .{ .method = "POST", .path = "/vjson/a/", .status = 200, .pattern = "/v{p0}/a", .params = &.{
+        .{ .method = "DELETE", .path = "/b.42/a~x/1~x/b", .status = 404 },
+        .{ .method = "DELETE", .path = "/b", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "GET", .path = "/c7.json/users/txt~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/json~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
             .{ .name = "p0", .value = "json" },
         } },
-        .{ .method = "PUT", .path = "/prea/vusers/1/v1", .status = 404 },
-        .{ .method = "POST", .path = "/xyz~x/x.y/c7", .status = 200, .pattern = "/{p0}~x/x.y/{p2}", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p2", .value = "c7" },
+        .{ .method = "DELETE", .path = "/ac7_users.txt", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "GET", .path = "/a1_users.txt/users~x/pretxt", .status = 404 },
-        .{ .method = "GET", .path = "/x.y/vb/vusers", .status = 405, .allow = &.{
+        .{ .method = "POST", .path = "/a-users", .status = 200, .pattern = "/{p0:[a-c]+}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "a" },
+            .{ .name = "q0", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/vtxt/42-json/users-txt", .status = 404 },
+        .{ .method = "POST", .path = "/users/txt-txt/vb", .status = 404 },
+        .{ .method = "POST", .path = "/vxyz/a", .status = 404 },
+        .{ .method = "PUT", .path = "/users/a/b", .status = 200, .pattern = "/users/a/b", .params = &.{} },
+        .{ .method = "GET", .path = "/a-users/users/pre42/", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/v1/" },
+        .{ .method = "POST", .pattern = "/v1" },
+        .{ .method = "GET", .pattern = "/users/{p1}-{q1}/b" },
+        .{ .method = "DELETE", .pattern = "/b/{p1}/{p2:[a-c]+}-{q2}" },
+        .{ .method = "DELETE", .pattern = "/a/v1" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}/{p1}.json" },
+        .{ .method = "DELETE", .pattern = "/users/v{p1:[0-9]+}" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "DELETE", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/a/ab~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/prea/", .status = 404 },
+        .{ .method = "POST", .path = "/txt/1.json", .status = 404 },
+        .{ .method = "POST", .path = "/v42", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/xyz/txt-ab", .status = 404 },
+        .{ .method = "PUT", .path = "/axyz_txt.txt/users~x/v1", .status = 404 },
+        .{ .method = "POST", .path = "/c7/a.json", .status = 404 },
+        .{ .method = "GET", .path = "/pre42/vusers/a-txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/b~x", .status = 404 },
+        .{ .method = "POST", .path = "/1/a.json", .status = 200, .pattern = "/{p0:[0-9]+}/{p1}.json", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/pre1/vtxt/users/vab", .status = 404 },
+        .{ .method = "POST", .path = "/ab/c7.json", .status = 404 },
+        .{ .method = "GET", .path = "/aa_xyz.txt/1-1", .status = 404 },
+        .{ .method = "POST", .path = "/txt/xyz.json", .status = 404 },
+        .{ .method = "PUT", .path = "/c7-b/prejson/42/42", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/txt/a/c7", .status = 404 },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/users/42/aa_users.txt/", .status = 404 },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/xyz~x/a/prexyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/a42_xyz.txt/vusers", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/v1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/v1", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/pre1/ac7_json.txt/", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/42/v1/ab_json.txt/", .status = 404 },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/json-txt/a-b/ab-a/users/", .status = 404 },
+        .{ .method = "GET", .path = "/users/users-b/b", .status = 200, .pattern = "/users/{p1}-{q1}/b", .params = &.{
+            .{ .name = "p1", .value = "users" },
+            .{ .name = "q1", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/1~x/vxyz", .status = 404 },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/txt~x/json-a", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/v1", .status = 200, .pattern = "/a/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/users/b/ac7_json.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/json/xyz-ab", .status = 404 },
+        .{ .method = "GET", .path = "/xyz~x/preab/x.y", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/ab/42-users", .status = 404 },
+        .{ .method = "DELETE", .path = "/users-xyz/users-ab/users.1", .status = 404 },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/prejson/ab~x/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/ab/1-xyz", .status = 404 },
+        .{ .method = "PUT", .path = "/a/42/vc7/axyz_42.txt", .status = 404 },
+        .{ .method = "GET", .path = "/b/xyz/1-users", .status = 404 },
+        .{ .method = "PUT", .path = "/ab~x/xyz.c7/ab-42/v42", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/users/xyz-txt", .status = 404 },
+        .{ .method = "PUT", .path = "/c7/42-1", .status = 404 },
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/ausers_txt.txt/v42/1~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/c7/ab.json", .status = 404 },
+        .{ .method = "PUT", .path = "/users~x/txt/json-c7", .status = 404 },
+        .{ .method = "GET", .path = "/v1/", .status = 405, .allow = &.{
             "DELETE",
         } },
+        .{ .method = "PUT", .path = "/json/1~x", .status = 404 },
+        .{ .method = "POST", .path = "/v1/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/axyz_ab.txt/pre42/ausers_a.txt", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "POST", .pattern = "/a/*" },
+        .{ .method = "GET", .pattern = "/a" },
+        .{ .method = "PUT", .pattern = "/v1/" },
+        .{ .method = "PUT", .pattern = "/{p0}/v1" },
+        .{ .method = "DELETE", .pattern = "/a/a{p1}_{q1}.txt" },
+        .{ .method = "DELETE", .pattern = "/v{p0:[0-9]+}/{p1}" },
+        .{ .method = "GET", .pattern = "/users" },
+        .{ .method = "GET", .pattern = "/{p0}~x/a-b" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "PUT", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/b.b/axyz_users.txt/json-json/ab_json.txt/", .status = 404 },
+        .{ .method = "POST", .path = "/a/json.json", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "json.json" },
+        } },
+        .{ .method = "PUT", .path = "/prea/vusers/1/v1", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/axyz_c7.txt", .status = 200, .pattern = "/a/a{p1}_{q1}.txt", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+            .{ .name = "q1", .value = "c7" },
+        } },
+        .{ .method = "GET", .path = "/a1_users.txt/users~x/pretxt", .status = 404 },
+        .{ .method = "GET", .path = "/a/vb/vusers", .status = 405, .allow = &.{
+            "POST",
+        } },
         .{ .method = "DELETE", .path = "/ab/b.ab/ab.txt/a1_1.txt", .status = 404 },
-        .{ .method = "POST", .path = "/1~x/x.y/b", .status = 200, .pattern = "/{p0}~x/x.y/{p2}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "p2", .value = "b" },
+        .{ .method = "PUT", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/xyz~x/42/b/preb", .status = 404 },
+        .{ .method = "PUT", .path = "/c7/v1", .status = 200, .pattern = "/{p0}/v1", .params = &.{
+            .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "DELETE", .path = "/42/", .status = 404 },
-        .{ .method = "PUT", .path = "/b/b", .status = 200, .pattern = "/b/b", .params = &.{} },
-        .{ .method = "PUT", .path = "/b/txt~x/prejson", .status = 404 },
-        .{ .method = "GET", .path = "/json/a-b/a", .status = 200, .pattern = "/{p0}/a-b/a", .params = &.{
-            .{ .name = "p0", .value = "json" },
+        .{ .method = "DELETE", .path = "/c7~x/txt", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "POST", .path = "/aab_xyz.txt/txt.c7", .status = 404 },
+        .{ .method = "PUT", .path = "/users", .status = 405, .allow = &.{
+            "GET",
         } },
-        .{ .method = "PUT", .path = "/txt-ab/users~x/txt.c7/json.ab", .status = 404 },
+        .{ .method = "PUT", .path = "/txt/users-b", .status = 404 },
+        .{ .method = "POST", .path = "/a/users/axyz_c7.txt", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "users/axyz_c7.txt" },
+        } },
+        .{ .method = "PUT", .path = "/vab/prejson", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/aab_ab.txt", .status = 200, .pattern = "/a/a{p1}_{q1}.txt", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+            .{ .name = "q1", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/axyz_42.txt/ab/42/users.json", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 200, .pattern = "/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/c7/a42_a.txt/a", .status = 404 },
+        .{ .method = "GET", .path = "/b/v1", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/v1/c7/atxt_42.txt/", .status = 404 },
+        .{ .method = "GET", .path = "/vusers/b", .status = 404 },
+        .{ .method = "DELETE", .path = "/ab/ab.users/1/vb", .status = 404 },
+        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/a~x/a-c7", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/prec7", .status = 404 },
+        .{ .method = "DELETE", .path = "/v42/users", .status = 200, .pattern = "/v{p0:[0-9]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/b/vc7/a-b", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/aab_json.txt", .status = 200, .pattern = "/a/a{p1}_{q1}.txt", .params = &.{
+            .{ .name = "p1", .value = "ab" },
+            .{ .name = "q1", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/b.1/a-b", .status = 404 },
+        .{ .method = "PUT", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/users/vab", .status = 404 },
+        .{ .method = "PUT", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/x.y/v42/ab.ab/axyz_users.txt", .status = 404 },
+        .{ .method = "POST", .path = "/a/ab~x", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "ab~x" },
+        } },
+        .{ .method = "POST", .path = "/b/users", .status = 404 },
+        .{ .method = "PUT", .path = "/42/v1", .status = 200, .pattern = "/{p0}/v1", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "PUT", .path = "/vc7/prea", .status = 404 },
+        .{ .method = "PUT", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/xyz~x/aab_xyz.txt/ab/pretxt/", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/v1", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "GET", .path = "/ab", .status = 404 },
+        .{ .method = "GET", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "GET", .path = "/users/json-xyz/a/", .status = 404 },
+        .{ .method = "DELETE", .path = "/v42/json", .status = 200, .pattern = "/v{p0:[0-9]+}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "PUT", .path = "/users-xyz/1.c7/a-b", .status = 404 },
+        .{ .method = "DELETE", .path = "/va/a", .status = 404 },
+        .{ .method = "PUT", .path = "/a/v1/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/a", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "DELETE", .path = "/c7/", .status = 404 },
+        .{ .method = "PUT", .path = "/vb/c7", .status = 404 },
+        .{ .method = "PUT", .path = "/prejson", .status = 404 },
+        .{ .method = "POST", .path = "/a/", .status = 200, .pattern = "/a/*", .params = &.{
+            .{ .name = "*", .value = "" },
+        } },
+        .{ .method = "POST", .path = "/xyz/txt/a1_ab.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/users/v1", .status = 200, .pattern = "/{p0}/v1", .params = &.{
+            .{ .name = "p0", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/vab/users-42/", .status = 404 },
     } },
     .{ .routes = &.{
         .{ .method = "DELETE", .pattern = "/a" },
-        .{ .method = "POST", .pattern = "/a/{p1}" },
+        .{ .method = "PUT", .pattern = "/a/{p1}" },
         .{ .method = "DELETE", .pattern = "/v1" },
         .{ .method = "PUT", .pattern = "/x.y" },
-        .{ .method = "GET", .pattern = "/x.y/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}" },
-        .{ .method = "GET", .pattern = "/{p0}.json" },
-        .{ .method = "DELETE", .pattern = "/{p0}.json/{p1}" },
-        .{ .method = "POST", .pattern = "/{p0}.{q0}" },
-        .{ .method = "GET", .pattern = "/{p0}.{q0}/{p1}" },
-        .{ .method = "POST", .pattern = "/v{p0}" },
+        .{ .method = "GET", .pattern = "/{p0}" },
+        .{ .method = "PUT", .pattern = "/{p0}.json" },
+        .{ .method = "PUT", .pattern = "/{p0}.{q0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}.{q0}/{p1}" },
+        .{ .method = "DELETE", .pattern = "/v{p0}" },
         .{ .method = "PUT", .pattern = "/v{p0}/{p1}" },
-        .{ .method = "DELETE", .pattern = "/{p0}-{q0}" },
+        .{ .method = "GET", .pattern = "/{p0}-{q0}" },
+        .{ .method = "PUT", .pattern = "/{p0}-{q0}/{p1}" },
         .{ .method = "DELETE", .pattern = "/pre{p0}" },
-        .{ .method = "POST", .pattern = "/pre{p0}/{p1}" },
-        .{ .method = "PUT", .pattern = "/{p0}~x" },
-        .{ .method = "POST", .pattern = "/{p0}~x/{p1}" },
-        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt" },
-        .{ .method = "POST", .pattern = "/a{p0}_{q0}.txt/{p1}" },
-        .{ .method = "GET", .pattern = "/{p0}/v{p1}/{p2}.{q2}" },
-        .{ .method = "GET", .pattern = "/a-b" },
-        .{ .method = "POST", .pattern = "/a/{p1}/b" },
-        .{ .method = "POST", .pattern = "/{p0}-{q0}" },
-        .{ .method = "GET", .pattern = "/{p0}/a-b/{p2}/" },
-        .{ .method = "DELETE", .pattern = "/b/users" },
+        .{ .method = "GET", .pattern = "/{p0}~x" },
+        .{ .method = "PUT", .pattern = "/{p0}~x/{p1}" },
+        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt" },
+        .{ .method = "POST", .pattern = "/{p0:[0-9]+}" },
+        .{ .method = "PUT", .pattern = "/{p0:[0-9]+}/{p1}" },
+        .{ .method = "PUT", .pattern = "/{p0:[a-z]+}" },
+        .{ .method = "DELETE", .pattern = "/{p0:[a-z]+}/{p1}" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}.json" },
+        .{ .method = "GET", .pattern = "/{p0:[0-9]+}.json/{p1}" },
+        .{ .method = "POST", .pattern = "/v{p0:[0-9]+}" },
+        .{ .method = "GET", .pattern = "/v{p0:[0-9]+}/{p1}" },
+        .{ .method = "POST", .pattern = "/{p0:[a-c]+}-{q0}" },
+        .{ .method = "DELETE", .pattern = "/{p0}/{p1}" },
+        .{ .method = "POST", .pattern = "/v{p0}/a" },
+        .{ .method = "DELETE", .pattern = "/pre{p0}/{p1:[0-9]+}/{p2}.{q2}" },
+        .{ .method = "DELETE", .pattern = "/a/a/users" },
+        .{ .method = "PUT", .pattern = "/a/pre{p1}" },
+        .{ .method = "POST", .pattern = "/*" },
+        .{ .method = "PUT", .pattern = "/v{p0}" },
+        .{ .method = "PUT", .pattern = "/a{p0}_{q0}.txt/a/{p2:[0-9]+}.json" },
+        .{ .method = "POST", .pattern = "/a/a/x.y" },
+        .{ .method = "PUT", .pattern = "/v{p0:[0-9]+}" },
     }, .refused = 0, .cases = &.{
-        .{ .method = "DELETE", .path = "/txt.json/ab", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "p1", .value = "ab" },
+        .{ .method = "PUT", .path = "/ab/b", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
         } },
-        .{ .method = "GET", .path = "/b/ab_c7.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/pre42/c7~x/vjson/users~x/", .status = 404 },
-        .{ .method = "DELETE", .path = "/vusers", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "vusers" },
+        .{ .method = "DELETE", .path = "/v1/txt~x/atxt_b.txt/", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "POST", .path = "/preusers/vjson", .status = 200, .pattern = "/pre{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "vjson" },
-        } },
-        .{ .method = "GET", .path = "/c7.json", .status = 200, .pattern = "/{p0}.json", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/pretxt/a1_ab.txt/json/42", .status = 404 },
-        .{ .method = "POST", .path = "/a/a", .status = 200, .pattern = "/a/{p1}", .params = &.{
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/42-1/v1/vb", .status = 404 },
-        .{ .method = "POST", .path = "/a/c7/b", .status = 200, .pattern = "/a/{p1}/b", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-        } },
-        .{ .method = "DELETE", .path = "/x.y/v42/ab.ab/axyz_users.txt", .status = 404 },
-        .{ .method = "POST", .path = "/a.ab", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
+        .{ .method = "GET", .path = "/b-ab", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
+            .{ .name = "p0", .value = "b" },
             .{ .name = "q0", .value = "ab" },
         } },
-        .{ .method = "DELETE", .path = "/1/atxt_json.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/x.y", .status = 200, .pattern = "/x.y", .params = &.{} },
-        .{ .method = "POST", .path = "/prea/ac7_xyz.txt/users", .status = 404 },
-        .{ .method = "POST", .path = "/42-xyz", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/vxyz/txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/x.y/txt", .status = 200, .pattern = "/x.y/{p1}", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "GET", .path = "/1-txt", .status = 405, .allow = &.{
-            "DELETE",
+        .{ .method = "DELETE", .path = "/prec7/ab/b~x", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "PUT", .path = "/prea", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "PUT", .path = "/prea/json-xyz/a/", .status = 404 },
-        .{ .method = "GET", .path = "/42/a-b/json/", .status = 200, .pattern = "/{p0}/a-b/{p2}", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p2", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/users-xyz/1.c7/a-b", .status = 404 },
-        .{ .method = "DELETE", .path = "/a.json/a", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/a/v1/", .status = 404 },
-        .{ .method = "POST", .path = "/xyz.json/c7", .status = 405, .allow = &.{
-            "DELETE",
-            "GET",
-        } },
-        .{ .method = "GET", .path = "/vusers", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/ab.json/json", .status = 200, .pattern = "/{p0}.json/{p1}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "PUT", .path = "/txt.users", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "DELETE", .path = "/1-xyz", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/a1_ab.txt", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "PUT", .path = "/vusers/json", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "json" },
-        } },
-        .{ .method = "POST", .path = "/ac7_42.txt/42", .status = 200, .pattern = "/a{p0}_{q0}.txt/{p1}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
-            .{ .name = "q0", .value = "42" },
+        .{ .method = "PUT", .path = "/a/pre42", .status = 200, .pattern = "/a/pre{p1}", .params = &.{
             .{ .name = "p1", .value = "42" },
         } },
-        .{ .method = "POST", .path = "/json.42", .status = 200, .pattern = "/{p0}.{q0}", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/c7", .status = 405, .allow = &.{
-            "DELETE",
-        } },
-        .{ .method = "GET", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "PUT", .path = "/ajson_users.txt/vusers", .status = 405, .allow = &.{
-            "GET",
+        .{ .method = "PUT", .path = "/ac7_1.txt/v1/v1", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "DELETE", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
+        .{ .method = "PUT", .path = "/ajson_b.txt/a/txt.json", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/1.txt/ab_xyz.txt/preb", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/vxyz/txt", .status = 200, .pattern = "/v{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "p1", .value = "txt" },
+        } },
+        .{ .method = "GET", .path = "/aab_ab.txt/vusers/c7-users", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/ab/a", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/ab/c7-a/42~x", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "POST", .path = "/vtxt/xyz~x/vab", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "vtxt/xyz~x/vab" },
+        } },
+        .{ .method = "POST", .path = "/42", .status = 200, .pattern = "/{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/1/ab", .status = 200, .pattern = "/{p0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "GET", .path = "/ac7_txt.txt/prec7/users~x/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/42.users/ab", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+            .{ .name = "q0", .value = "users" },
+            .{ .name = "p1", .value = "ab" },
+        } },
+        .{ .method = "PUT", .path = "/b~x/vtxt/", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v1", .params = &.{} },
+        .{ .method = "POST", .path = "/users", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "users" },
+        } },
+        .{ .method = "PUT", .path = "/vc7", .status = 200, .pattern = "/v{p0}", .params = &.{
             .{ .name = "p0", .value = "c7" },
         } },
-        .{ .method = "DELETE", .path = "/preb/aa_json.txt/v1/preb", .status = 404 },
-        .{ .method = "GET", .path = "/v1", .status = 405, .allow = &.{
+        .{ .method = "GET", .path = "/txt/vusers/txt/users.xyz", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/c7~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "POST", .path = "/json~x/a42_ab.txt/vusers", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "json~x/a42_ab.txt/vusers" },
+        } },
+        .{ .method = "PUT", .path = "/v42", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "42" },
+        } },
+        .{ .method = "DELETE", .path = "/1/va/vxyz/c7~x", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/ab.json/a", .status = 405, .allow = &.{
             "DELETE",
             "POST",
         } },
-        .{ .method = "PUT", .path = "/xyz-42/prea/vusers", .status = 404 },
-        .{ .method = "PUT", .path = "/a/42/b", .status = 405, .allow = &.{
-            "POST",
-        } },
-        .{ .method = "GET", .path = "/users/json/c7/ab-txt", .status = 404 },
-        .{ .method = "POST", .path = "/a1_b.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "b" },
-        } },
-        .{ .method = "GET", .path = "/prea/a-1/atxt_c7.txt/1.1", .status = 404 },
-        .{ .method = "GET", .path = "/v1", .status = 405, .allow = &.{
-            "DELETE",
-            "POST",
-        } },
-        .{ .method = "POST", .path = "/ab~x/json/ajson_json.txt", .status = 404 },
-        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
-        .{ .method = "PUT", .path = "/users.1/preab", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "POST", .path = "/atxt_c7.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "c7" },
-        } },
-        .{ .method = "POST", .path = "/users/users", .status = 404 },
-        .{ .method = "PUT", .path = "/b~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
-            .{ .name = "p0", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/preab/prea/xyz-txt/b~x", .status = 404 },
-        .{ .method = "GET", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
-        .{ .method = "POST", .path = "/vab/a.xyz/b~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/b/users", .status = 200, .pattern = "/b/users", .params = &.{} },
-        .{ .method = "PUT", .path = "/b/42.b/", .status = 404 },
-        .{ .method = "DELETE", .path = "/b-a", .status = 200, .pattern = "/{p0}-{q0}", .params = &.{
-            .{ .name = "p0", .value = "b" },
+        .{ .method = "GET", .path = "/ac7_a.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt", .params = &.{
+            .{ .name = "p0", .value = "c7" },
             .{ .name = "q0", .value = "a" },
         } },
-        .{ .method = "POST", .path = "/b/xyz", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "PUT", .pattern = "/v1/v1" },
-        .{ .method = "GET", .pattern = "/v1/" },
-        .{ .method = "PUT", .pattern = "/{p0}" },
-        .{ .method = "POST", .pattern = "/{p0}.json/b" },
-        .{ .method = "POST", .pattern = "/v1/users" },
-        .{ .method = "POST", .pattern = "/b/b/*" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "PUT", .path = "/42", .status = 200, .pattern = "/{p0}", .params = &.{
+        .{ .method = "POST", .path = "/v1", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "POST", .path = "/42.c7", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "42.c7" },
+        } },
+        .{ .method = "GET", .path = "/a.json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "a.json" },
+        } },
+        .{ .method = "GET", .path = "/preab/a", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/v42/a", .status = 200, .pattern = "/v{p0}/a", .params = &.{
             .{ .name = "p0", .value = "42" },
         } },
-        .{ .method = "DELETE", .path = "/a", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/v1/users", .status = 200, .pattern = "/v1/users", .params = &.{} },
-        .{ .method = "DELETE", .path = "/c7", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/b/b/xyz~x", .status = 200, .pattern = "/b/b/*", .params = &.{
-            .{ .name = "*", .value = "xyz~x" },
-        } },
-        .{ .method = "GET", .path = "/ab-users", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/vtxt/b-1/42/", .status = 404 },
-        .{ .method = "GET", .path = "/v1/users", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/axyz_a.txt/c7-users/json/vab/", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "PUT", .path = "/c7/c7/txt", .status = 404 },
-        .{ .method = "POST", .path = "/b/b/users.xyz/pre42", .status = 200, .pattern = "/b/b/*", .params = &.{
-            .{ .name = "*", .value = "users.xyz/pre42" },
+        .{ .method = "DELETE", .path = "/a/a/users", .status = 200, .pattern = "/a/a/users", .params = &.{} },
+        .{ .method = "DELETE", .path = "/x.y/v42", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
+            .{ .name = "p0", .value = "x" },
+            .{ .name = "q0", .value = "y" },
+            .{ .name = "p1", .value = "v42" },
         } },
-        .{ .method = "DELETE", .path = "/users~x/json~x", .status = 404 },
-        .{ .method = "GET", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "DELETE", .path = "/1/42.xyz/txt.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "ab" },
+        .{ .method = "POST", .path = "/vxyz", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "vxyz" },
         } },
-        .{ .method = "GET", .path = "/a1_ab.txt/a-b/v1/aa_xyz.txt", .status = 404 },
-        .{ .method = "GET", .path = "/a.json/b", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/preusers/txt/x.y/c7", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "DELETE", .path = "/c7/ab_a.txt", .status = 404 },
-        .{ .method = "GET", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/a.b/b/c7-42/axyz_a.txt", .status = 404 },
-        .{ .method = "POST", .path = "/json.json/b", .status = 200, .pattern = "/{p0}.json/b", .params = &.{
+        .{ .method = "GET", .path = "/json", .status = 200, .pattern = "/{p0}", .params = &.{
             .{ .name = "p0", .value = "json" },
         } },
-        .{ .method = "DELETE", .path = "/a-json/users/x.y", .status = 404 },
-        .{ .method = "DELETE", .path = "/b/b/", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/a.c7/users.users/preb/a-b", .status = 405, .allow = &.{
             "POST",
         } },
-        .{ .method = "PUT", .path = "/c7", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "c7" },
+        .{ .method = "POST", .path = "/1-b", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "1-b" },
         } },
-        .{ .method = "POST", .path = "/b/b/x.y/c7", .status = 200, .pattern = "/b/b/*", .params = &.{
-            .{ .name = "*", .value = "x.y/c7" },
+        .{ .method = "POST", .path = "/preb/b/json-json/preb", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "preb/b/json-json/preb" },
         } },
-        .{ .method = "GET", .path = "/json~x", .status = 405, .allow = &.{
-            "PUT",
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "GET", .path = "/42~x/prea/ausers_c7.txt/users", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "POST", .path = "/42.json/b", .status = 200, .pattern = "/{p0}.json/b", .params = &.{
+        .{ .method = "POST", .path = "/txt-a", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "txt-a" },
+        } },
+        .{ .method = "PUT", .path = "/va/json/c7", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "GET", .path = "/txt.json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "txt.json" },
+        } },
+        .{ .method = "PUT", .path = "/1", .status = 405, .allow = &.{
+            "GET",
+            "POST",
+        } },
+        .{ .method = "DELETE", .path = "/42.c7/json", .status = 200, .pattern = "/{p0}.{q0}/{p1}", .params = &.{
             .{ .name = "p0", .value = "42" },
+            .{ .name = "q0", .value = "c7" },
+            .{ .name = "p1", .value = "json" },
         } },
-        .{ .method = "POST", .path = "/users/a-b/a42_a.txt/1/", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/v1", .status = 200, .pattern = "/v1/v1", .params = &.{} },
-        .{ .method = "POST", .path = "/va/json-json/preb/xyz.1", .status = 404 },
-        .{ .method = "POST", .path = "/b/b/", .status = 200, .pattern = "/b/b/*", .params = &.{
-            .{ .name = "*", .value = "" },
+        .{ .method = "PUT", .path = "/pre1/prexyz/c7~x", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "DELETE", .path = "/ausers_c7.txt/users", .status = 404 },
-        .{ .method = "POST", .path = "/v1/users", .status = 200, .pattern = "/v1/users", .params = &.{} },
-        .{ .method = "GET", .path = "/json-a/ab/prejson", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/v1", .status = 200, .pattern = "/v1/v1", .params = &.{} },
-        .{ .method = "GET", .path = "/v1/1/preusers/ab-c7", .status = 404 },
-        .{ .method = "POST", .path = "/v1/users", .status = 200, .pattern = "/v1/users", .params = &.{} },
-        .{ .method = "POST", .path = "/prexyz/c7~x/v1/", .status = 404 },
-        .{ .method = "POST", .path = "/users.json/b", .status = 200, .pattern = "/{p0}.json/b", .params = &.{
-            .{ .name = "p0", .value = "users" },
+        .{ .method = "PUT", .path = "/a/pre42", .status = 200, .pattern = "/a/pre{p1}", .params = &.{
+            .{ .name = "p1", .value = "42" },
         } },
-        .{ .method = "DELETE", .path = "/ab_a.txt", .status = 405, .allow = &.{
-            "PUT",
+        .{ .method = "PUT", .path = "/x.y/v1/users~x", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "PUT", .path = "/users", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "users" },
+        .{ .method = "GET", .path = "/c7.json", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "c7.json" },
         } },
-        .{ .method = "PUT", .path = "/ab.json/ab/xyz", .status = 404 },
-        .{ .method = "DELETE", .path = "/b", .status = 405, .allow = &.{
-            "PUT",
+        .{ .method = "PUT", .path = "/ab", .status = 200, .pattern = "/{p0:[a-z]+}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
         } },
-        .{ .method = "POST", .path = "/xyz~x/txt/b~x/v42", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/v1", .status = 200, .pattern = "/v1/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/b.1/c7-1/1/vtxt", .status = 404 },
-        .{ .method = "PUT", .path = "/a", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "a" },
+        .{ .method = "DELETE", .path = "/a", .status = 200, .pattern = "/a", .params = &.{} },
+        .{ .method = "DELETE", .path = "/1.xyz/xyz~x/txt/", .status = 405, .allow = &.{
+            "POST",
         } },
+        .{ .method = "GET", .path = "/ab", .status = 200, .pattern = "/{p0}", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+        } },
+        .{ .method = "POST", .path = "/json.a", .status = 200, .pattern = "/*", .params = &.{
+            .{ .name = "*", .value = "json.a" },
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/b/" },
+        .{ .method = "DELETE", .pattern = "/v{p0:[0-9]+}" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
         .{ .method = "DELETE", .path = "/a.json/", .status = 404 },
-        .{ .method = "PUT", .path = "/1", .status = 200, .pattern = "/{p0}", .params = &.{
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
             .{ .name = "p0", .value = "1" },
         } },
         .{ .method = "GET", .path = "/ab/1-xyz/", .status = 404 },
-        .{ .method = "POST", .path = "/b/b/vb/pretxt", .status = 200, .pattern = "/b/b/*", .params = &.{
-            .{ .name = "*", .value = "vb/pretxt" },
+        .{ .method = "GET", .path = "/b/", .status = 405, .allow = &.{
+            "DELETE",
         } },
-        .{ .method = "POST", .path = "/prec7/xyz~x/json~x/txt~x", .status = 404 },
-        .{ .method = "POST", .path = "/1.json/b", .status = 200, .pattern = "/{p0}.json/b", .params = &.{
+        .{ .method = "PUT", .path = "/pretxt", .status = 404 },
+        .{ .method = "DELETE", .path = "/vc7", .status = 404 },
+        .{ .method = "DELETE", .path = "/json~x/txt~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/xyz/pretxt/vjson/", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "GET", .path = "/ab.a/42~x", .status = 404 },
+        .{ .method = "GET", .path = "/vab", .status = 404 },
+        .{ .method = "POST", .path = "/json.users", .status = 404 },
+        .{ .method = "PUT", .path = "/b/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/1.users/a/atxt_42.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/vc7", .status = 404 },
+        .{ .method = "PUT", .path = "/txt/json-txt", .status = 404 },
+        .{ .method = "POST", .path = "/vc7", .status = 404 },
+        .{ .method = "PUT", .path = "/b", .status = 404 },
+        .{ .method = "GET", .path = "/vjson", .status = 404 },
+        .{ .method = "GET", .path = "/users", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
             .{ .name = "p0", .value = "1" },
         } },
-        .{ .method = "PUT", .path = "/txt/xyz", .status = 404 },
-        .{ .method = "GET", .path = "/v1/v1", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/vc7", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "vc7" },
-        } },
-        .{ .method = "GET", .path = "/v1/", .status = 200, .pattern = "/v1", .params = &.{} },
-        .{ .method = "PUT", .path = "/vab", .status = 200, .pattern = "/{p0}", .params = &.{
-            .{ .name = "p0", .value = "vab" },
-        } },
-        .{ .method = "POST", .path = "/json.json/b", .status = 200, .pattern = "/{p0}.json/b", .params = &.{
-            .{ .name = "p0", .value = "json" },
-        } },
-        .{ .method = "GET", .path = "/prejson/c7.c7", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/a{p0}_{q0}.txt/*" },
-        .{ .method = "PUT", .pattern = "/b/a{p1}_{q1}.txt" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/ajson_json.txt/", .status = 200, .pattern = "/a{p0}_{q0}.txt/*", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "q0", .value = "json" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "POST", .path = "/vusers/a.b", .status = 404 },
-        .{ .method = "PUT", .path = "/b/a1_users.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "q1", .value = "users" },
-        } },
-        .{ .method = "GET", .path = "/ausers_b.txt", .status = 404 },
-        .{ .method = "POST", .path = "/b/a1_json.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/b/vjson", .status = 404 },
-        .{ .method = "DELETE", .path = "/b/ab_ab.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
+        .{ .method = "GET", .path = "/x.y/ab/vab", .status = 404 },
+        .{ .method = "POST", .path = "/vab", .status = 404 },
         .{ .method = "DELETE", .path = "/vxyz/xyz", .status = 404 },
-        .{ .method = "PUT", .path = "/b/a1_ab.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "q1", .value = "ab" },
-        } },
-        .{ .method = "DELETE", .path = "/users.42", .status = 404 },
-        .{ .method = "PUT", .path = "/b/ausers_xyz.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "users" },
-            .{ .name = "q1", .value = "xyz" },
-        } },
-        .{ .method = "PUT", .path = "/ab/x.y/aab_json.txt/b.json", .status = 404 },
-        .{ .method = "GET", .path = "/a1_json.txt/v1", .status = 200, .pattern = "/a{p0}_{q0}.txt/*", .params = &.{
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
             .{ .name = "p0", .value = "1" },
-            .{ .name = "q0", .value = "json" },
-            .{ .name = "*", .value = "v1" },
         } },
-        .{ .method = "DELETE", .path = "/c7.users/txt-b/vjson/ab~x", .status = 404 },
-        .{ .method = "GET", .path = "/ausers_ab.txt/ajson_xyz.txt", .status = 200, .pattern = "/a{p0}_{q0}.txt/*", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "q0", .value = "ab" },
-            .{ .name = "*", .value = "ajson_xyz.txt" },
+        .{ .method = "DELETE", .path = "/a42_1.txt/v42/b~x/users~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/vab", .status = 404 },
+        .{ .method = "POST", .path = "/vb/a/b.json", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/v1/va/prexyz/1~x/", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/vusers/v1", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/1/ab.b/preusers/c7", .status = 404 },
+        .{ .method = "DELETE", .path = "/vb", .status = 404 },
+        .{ .method = "PUT", .path = "/xyz/v1/1.xyz", .status = 404 },
+        .{ .method = "DELETE", .path = "/vab", .status = 404 },
+        .{ .method = "POST", .path = "/va/vusers", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/vc7", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/vjson/v1/users.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/vb/ausers_json.txt/va/", .status = 404 },
+        .{ .method = "DELETE", .path = "/v1", .status = 200, .pattern = "/v{p0:[0-9]+}", .params = &.{
+            .{ .name = "p0", .value = "1" },
         } },
-        .{ .method = "PUT", .path = "/ab.b/preusers", .status = 404 },
-        .{ .method = "DELETE", .path = "/aa_b.txt/vxyz/users~x", .status = 405, .allow = &.{
+        .{ .method = "PUT", .path = "/prejson/xyz/1~x", .status = 404 },
+        .{ .method = "GET", .path = "/b/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/42/42~x/json~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/ac7_ab.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "POST", .path = "/prec7/vc7/1", .status = 404 },
+        .{ .method = "PUT", .path = "/b/", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/1-json/prec7/preb", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/", .status = 200, .pattern = "/b", .params = &.{} },
+        .{ .method = "PUT", .path = "/vab", .status = 404 },
+        .{ .method = "DELETE", .path = "/vusers", .status = 404 },
+        .{ .method = "PUT", .path = "/users.1/vusers/42/a~x", .status = 404 },
+    } },
+    .{ .routes = &.{
+        .{ .method = "DELETE", .pattern = "/a/{p1}/x.y" },
+        .{ .method = "DELETE", .pattern = "/a/a-b/users" },
+        .{ .method = "PUT", .pattern = "/v1/{p1}-{q1}" },
+        .{ .method = "GET", .pattern = "/x.y/x.y/" },
+        .{ .method = "POST", .pattern = "/{p0}.{q0}/a-b" },
+        .{ .method = "POST", .pattern = "/{p0}~x" },
+        .{ .method = "DELETE", .pattern = "/{p0}~x" },
+        .{ .method = "PUT", .pattern = "/x.y/{p1}/a" },
+        .{ .method = "GET", .pattern = "/{p0:[a-c]+}-{q0}/a-b/*" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "DELETE", .path = "/1~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/json~x", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+        } },
+        .{ .method = "POST", .path = "/c7~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "GET", .path = "/json~x/a1_xyz.txt", .status = 404 },
+        .{ .method = "GET", .path = "/xyz-a/a-b/c7-42/xyz", .status = 404 },
+        .{ .method = "POST", .path = "/users-xyz/users", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/x.y/", .status = 200, .pattern = "/x.y/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/b/json", .status = 404 },
+        .{ .method = "GET", .path = "/a/a/x.y", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "GET", .path = "/aab_42.txt/users-a/42~x", .status = 404 },
+        .{ .method = "POST", .path = "/c7~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "c7" },
+        } },
+        .{ .method = "DELETE", .path = "/xyz~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "PUT", .path = "/x.y/x.y/", .status = 405, .allow = &.{
             "GET",
         } },
-        .{ .method = "GET", .path = "/1.xyz/a/ab-c7", .status = 404 },
-        .{ .method = "PUT", .path = "/b/aab_users.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
+        .{ .method = "DELETE", .path = "/a/users", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/xyz/a", .status = 200, .pattern = "/x.y/{p1}/a", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+        } },
+        .{ .method = "PUT", .path = "/users/users-ab/42~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/json/x.y", .status = 200, .pattern = "/a/{p1}/x.y", .params = &.{
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/vtxt/ac7_a.txt/users.c7", .status = 404 },
+        .{ .method = "PUT", .path = "/v1/ab-users", .status = 200, .pattern = "/v1/{p1}-{q1}", .params = &.{
             .{ .name = "p1", .value = "ab" },
             .{ .name = "q1", .value = "users" },
         } },
-        .{ .method = "POST", .path = "/b/x.y/b-ab/", .status = 404 },
-        .{ .method = "PUT", .path = "/b/ac7_txt.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "c7" },
-            .{ .name = "q1", .value = "txt" },
+        .{ .method = "PUT", .path = "/pretxt/xyz/a42_a.txt/json~x", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/json/a", .status = 200, .pattern = "/x.y/{p1}/a", .params = &.{
+            .{ .name = "p1", .value = "json" },
         } },
-        .{ .method = "GET", .path = "/vjson/v1", .status = 404 },
-        .{ .method = "GET", .path = "/b/axyz_json.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "GET", .path = "/b/ausers_json.txt/va/b~x", .status = 404 },
-        .{ .method = "GET", .path = "/b/ac7_users.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/json.users/preab/users.users/xyz-txt", .status = 404 },
-        .{ .method = "GET", .path = "/axyz_a.txt/1.1", .status = 200, .pattern = "/a{p0}_{q0}.txt/*", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "*", .value = "1.1" },
-        } },
-        .{ .method = "POST", .path = "/ab-users/xyz/ab-c7/prexyz/", .status = 404 },
-        .{ .method = "PUT", .path = "/b/aab_42.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "q1", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/c7.42/vjson/", .status = 404 },
-        .{ .method = "POST", .path = "/b/atxt_ab.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "DELETE", .path = "/xyz-ab/ab-ab/users~x", .status = 404 },
-        .{ .method = "DELETE", .path = "/a1_1.txt/c7-json", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/a-b/users~x", .status = 404 },
-        .{ .method = "GET", .path = "/atxt_42.txt/prec7/json~x", .status = 200, .pattern = "/a{p0}_{q0}.txt/*", .params = &.{
-            .{ .name = "p0", .value = "txt" },
-            .{ .name = "q0", .value = "42" },
-            .{ .name = "*", .value = "prec7/json~x" },
-        } },
-        .{ .method = "DELETE", .path = "/prec7", .status = 404 },
-        .{ .method = "PUT", .path = "/b/a1_b.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
+        .{ .method = "GET", .path = "/txt~x/c7~x", .status = 404 },
+        .{ .method = "POST", .path = "/xyz-42/a-b/1~x/ab_txt.txt", .status = 404 },
+        .{ .method = "GET", .path = "/42~x/v1/vxyz/", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/1/a", .status = 200, .pattern = "/x.y/{p1}/a", .params = &.{
             .{ .name = "p1", .value = "1" },
-            .{ .name = "q1", .value = "b" },
         } },
-        .{ .method = "GET", .path = "/pre42/a/prejson/b-json", .status = 404 },
-        .{ .method = "GET", .path = "/b/a42_a.txt", .status = 405, .allow = &.{
+        .{ .method = "DELETE", .path = "/va", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/x.y/", .status = 200, .pattern = "/x.y/x.y", .params = &.{} },
+        .{ .method = "PUT", .path = "/a", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/json/a", .status = 405, .allow = &.{
             "PUT",
         } },
-        .{ .method = "DELETE", .path = "/xyz/a/c7/txt", .status = 404 },
-        .{ .method = "GET", .path = "/axyz_a.txt/", .status = 200, .pattern = "/a{p0}_{q0}.txt/*", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "*", .value = "" },
-        } },
-        .{ .method = "GET", .path = "/b.c7/b/json~x", .status = 404 },
-        .{ .method = "POST", .path = "/b/ac7_42.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/users.a/axyz_users.txt/txt~x", .status = 404 },
-        .{ .method = "PUT", .path = "/b/a42_42.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "q1", .value = "42" },
-        } },
-        .{ .method = "DELETE", .path = "/preb/users-xyz", .status = 404 },
-        .{ .method = "GET", .path = "/aa_a.txt/users", .status = 200, .pattern = "/a{p0}_{q0}.txt/*", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "q0", .value = "a" },
-            .{ .name = "*", .value = "users" },
-        } },
-        .{ .method = "POST", .path = "/txt.txt/a1_1.txt/ab-ab", .status = 404 },
-        .{ .method = "PUT", .path = "/b/a42_a.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "q1", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/ac7_c7.txt/users~x/preusers/users.42", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/b/ab_c7.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "q1", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/txt/a", .status = 404 },
-        .{ .method = "GET", .path = "/a42_42.txt/axyz_42.txt/ab-xyz", .status = 200, .pattern = "/a{p0}_{q0}.txt/*", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "q0", .value = "42" },
-            .{ .name = "*", .value = "axyz_42.txt/ab-xyz" },
-        } },
-        .{ .method = "DELETE", .path = "/json-users/42", .status = 404 },
-        .{ .method = "GET", .path = "/b/aa_users.txt", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "POST", .path = "/vab/aab_xyz.txt/prea/pretxt", .status = 404 },
-        .{ .method = "PUT", .path = "/b/aa_a.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "q1", .value = "a" },
-        } },
-        .{ .method = "PUT", .path = "/c7/json.json/b/vxyz", .status = 404 },
-        .{ .method = "PUT", .path = "/b/atxt_xyz.txt", .status = 200, .pattern = "/b/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "q1", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/v1", .status = 404 },
-    } },
-    .{ .routes = &.{
-        .{ .method = "GET", .pattern = "/{p0}.json/{p1}/{p2}~x" },
-        .{ .method = "PUT", .pattern = "/v1/{p1}~x/" },
-        .{ .method = "GET", .pattern = "/pre{p0}/{p1}.{q1}/users" },
-        .{ .method = "GET", .pattern = "/v1/a{p1}_{q1}.txt" },
-    }, .refused = 0, .cases = &.{
-        .{ .method = "GET", .path = "/v1/aab_txt.txt", .status = 200, .pattern = "/v1/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "q1", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/c7.c7/ajson_42.txt", .status = 404 },
-        .{ .method = "GET", .path = "/prexyz/xyz.1/users", .status = 200, .pattern = "/pre{p0}/{p1}.{q1}/users", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
+        .{ .method = "POST", .path = "/ab/users/c7.c7/ajson_42.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/xyz/x.y", .status = 200, .pattern = "/a/{p1}/x.y", .params = &.{
             .{ .name = "p1", .value = "xyz" },
-            .{ .name = "q1", .value = "1" },
         } },
-        .{ .method = "DELETE", .path = "/vusers/va/ac7_1.txt/users-json", .status = 404 },
-        .{ .method = "GET", .path = "/preb/1.b/users", .status = 200, .pattern = "/pre{p0}/{p1}.{q1}/users", .params = &.{
+        .{ .method = "GET", .path = "/pre1/vusers/va", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/users/x.y", .status = 200, .pattern = "/a/{p1}/x.y", .params = &.{
+            .{ .name = "p1", .value = "users" },
+        } },
+        .{ .method = "GET", .path = "/ab~x/b.b", .status = 404 },
+        .{ .method = "POST", .path = "/1~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "1" },
+        } },
+        .{ .method = "GET", .path = "/preab/prea", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/x.y/", .status = 405, .allow = &.{
+            "GET",
+        } },
+        .{ .method = "GET", .path = "/b/ausers_c7.txt/b.xyz/txt~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/b~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
             .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "q1", .value = "b" },
-        } },
-        .{ .method = "POST", .path = "/pre1/a42_ab.txt/ac7_xyz.txt", .status = 404 },
-        .{ .method = "GET", .path = "/v1/atxt_txt.txt", .status = 200, .pattern = "/v1/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "q1", .value = "txt" },
-        } },
-        .{ .method = "POST", .path = "/ausers_c7.txt/b.xyz/txt~x", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/b~x/", .status = 200, .pattern = "/v1/{p1}~x", .params = &.{
-            .{ .name = "p1", .value = "b" },
         } },
         .{ .method = "POST", .path = "/users/vc7/1", .status = 404 },
-        .{ .method = "POST", .path = "/v1/atxt_users.txt", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "PUT", .path = "/txt.a/42/a-a", .status = 404 },
-        .{ .method = "GET", .path = "/v1/atxt_1.txt", .status = 200, .pattern = "/v1/a{p1}_{q1}.txt", .params = &.{
+        .{ .method = "PUT", .path = "/x.y/txt/a", .status = 200, .pattern = "/x.y/{p1}/a", .params = &.{
             .{ .name = "p1", .value = "txt" },
-            .{ .name = "q1", .value = "1" },
         } },
-        .{ .method = "DELETE", .path = "/a-1", .status = 404 },
-        .{ .method = "GET", .path = "/a.json/42/c7~x", .status = 200, .pattern = "/{p0}.json/{p1}/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "a" },
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "p2", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/ausers_1.txt/42", .status = 404 },
-        .{ .method = "GET", .path = "/prec7/1.c7/users", .status = 200, .pattern = "/pre{p0}/{p1}.{q1}/users", .params = &.{
+        .{ .method = "GET", .path = "/xyz/a1_42.txt/atxt_42.txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/c7~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
             .{ .name = "p0", .value = "c7" },
-            .{ .name = "p1", .value = "1" },
-            .{ .name = "q1", .value = "c7" },
         } },
-        .{ .method = "DELETE", .path = "/json.users/b-ab/preusers/ac7_a.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/42~x/", .status = 200, .pattern = "/v1/{p1}~x", .params = &.{
-            .{ .name = "p1", .value = "42" },
+        .{ .method = "PUT", .path = "/users.a/42.b/preusers", .status = 404 },
+        .{ .method = "PUT", .path = "/v1/json-ab", .status = 200, .pattern = "/v1/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "json" },
+            .{ .name = "q1", .value = "ab" },
         } },
-        .{ .method = "POST", .path = "/vab/prea/", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/txt~x/", .status = 200, .pattern = "/v1/{p1}~x", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-        } },
-        .{ .method = "DELETE", .path = "/42/1/b.json", .status = 404 },
-        .{ .method = "GET", .path = "/v1/b~x/", .status = 405, .allow = &.{
-            "PUT",
-        } },
-        .{ .method = "PUT", .path = "/a~x/ab/b-ab", .status = 404 },
-        .{ .method = "GET", .path = "/json.json/a/42~x", .status = 200, .pattern = "/{p0}.json/{p1}/{p2}~x", .params = &.{
+        .{ .method = "GET", .path = "/1-json/a42_1.txt/c7.c7", .status = 404 },
+        .{ .method = "DELETE", .path = "/json~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
             .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "p2", .value = "42" },
         } },
-        .{ .method = "DELETE", .path = "/json.users", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/1~x/", .status = 200, .pattern = "/v1/{p1}~x", .params = &.{
-            .{ .name = "p1", .value = "1" },
-        } },
-        .{ .method = "PUT", .path = "/atxt_c7.txt/b.txt", .status = 404 },
-        .{ .method = "GET", .path = "/ab.json/ab/b~x", .status = 200, .pattern = "/{p0}.json/{p1}/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "ab" },
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "p2", .value = "b" },
-        } },
-        .{ .method = "DELETE", .path = "/vtxt/c7/xyz~x", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/42~x/", .status = 200, .pattern = "/v1/{p1}~x", .params = &.{
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "GET", .path = "/va/1", .status = 404 },
-        .{ .method = "GET", .path = "/xyz.json/xyz/a~x", .status = 200, .pattern = "/{p0}.json/{p1}/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "xyz" },
-            .{ .name = "p2", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/vab/c7-a/va/users", .status = 404 },
-        .{ .method = "GET", .path = "/v1/atxt_c7.txt", .status = 200, .pattern = "/v1/a{p1}_{q1}.txt", .params = &.{
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "q1", .value = "c7" },
-        } },
-        .{ .method = "PUT", .path = "/a~x/users~x/c7-ab/users.txt", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/42~x/", .status = 200, .pattern = "/v1/{p1}~x", .params = &.{
-            .{ .name = "p1", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/json-c7/v1", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/b~x/", .status = 200, .pattern = "/v1/{p1}~x", .params = &.{
-            .{ .name = "p1", .value = "b" },
-        } },
-        .{ .method = "PUT", .path = "/xyz-txt/xyz/vc7", .status = 404 },
-        .{ .method = "GET", .path = "/users.json/xyz/42~x", .status = 200, .pattern = "/{p0}.json/{p1}/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "xyz" },
-            .{ .name = "p2", .value = "42" },
-        } },
-        .{ .method = "PUT", .path = "/c7-b/1~x/1~x/txt", .status = 404 },
-        .{ .method = "GET", .path = "/prejson/42.1/users", .status = 200, .pattern = "/pre{p0}/{p1}.{q1}/users", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "42" },
-            .{ .name = "q1", .value = "1" },
-        } },
-        .{ .method = "DELETE", .path = "/b-a/json", .status = 404 },
-        .{ .method = "GET", .path = "/xyz.json/b/xyz~x", .status = 200, .pattern = "/{p0}.json/{p1}/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "xyz" },
-            .{ .name = "p1", .value = "b" },
-            .{ .name = "p2", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/42~x/users/vb", .status = 404 },
-        .{ .method = "GET", .path = "/users.json/txt/a~x", .status = 200, .pattern = "/{p0}.json/{p1}/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "users" },
-            .{ .name = "p1", .value = "txt" },
-            .{ .name = "p2", .value = "a" },
-        } },
-        .{ .method = "DELETE", .path = "/1/ab-42/json~x/c7~x", .status = 404 },
-        .{ .method = "PUT", .path = "/v1/atxt_42.txt", .status = 405, .allow = &.{
-            "GET",
-        } },
-        .{ .method = "DELETE", .path = "/b", .status = 404 },
-        .{ .method = "GET", .path = "/pre42/a.xyz/users", .status = 200, .pattern = "/pre{p0}/{p1}.{q1}/users", .params = &.{
-            .{ .name = "p0", .value = "42" },
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "q1", .value = "xyz" },
-        } },
-        .{ .method = "GET", .path = "/v42/a/42", .status = 404 },
-        .{ .method = "GET", .path = "/v1/ausers_a.txt", .status = 200, .pattern = "/v1/a{p1}_{q1}.txt", .params = &.{
+        .{ .method = "POST", .path = "/v42", .status = 404 },
+        .{ .method = "PUT", .path = "/v1/users-a", .status = 200, .pattern = "/v1/{p1}-{q1}", .params = &.{
             .{ .name = "p1", .value = "users" },
             .{ .name = "q1", .value = "a" },
         } },
-        .{ .method = "DELETE", .path = "/a.users/vtxt/c7-a/b", .status = 404 },
-        .{ .method = "GET", .path = "/prejson/a.42/users", .status = 200, .pattern = "/pre{p0}/{p1}.{q1}/users", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "a" },
-            .{ .name = "q1", .value = "42" },
+        .{ .method = "PUT", .path = "/pre42/prejson", .status = 404 },
+        .{ .method = "GET", .path = "/xyz~x", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
         } },
-        .{ .method = "POST", .path = "/aab_xyz.txt", .status = 404 },
-        .{ .method = "GET", .path = "/preb/1.ab/users", .status = 200, .pattern = "/pre{p0}/{p1}.{q1}/users", .params = &.{
-            .{ .name = "p0", .value = "b" },
-            .{ .name = "p1", .value = "1" },
+        .{ .method = "PUT", .path = "/txt~x/a", .status = 404 },
+        .{ .method = "DELETE", .path = "/a/json/x.y", .status = 200, .pattern = "/a/{p1}/x.y", .params = &.{
+            .{ .name = "p1", .value = "json" },
+        } },
+        .{ .method = "GET", .path = "/vxyz/ab/42.1", .status = 404 },
+        .{ .method = "PUT", .path = "/v1/json-b", .status = 200, .pattern = "/v1/{p1}-{q1}", .params = &.{
+            .{ .name = "p1", .value = "json" },
+            .{ .name = "q1", .value = "b" },
+        } },
+        .{ .method = "POST", .path = "/xyz.json/a-a/pre1/json.users", .status = 404 },
+        .{ .method = "POST", .path = "/1.users/a-b", .status = 200, .pattern = "/{p0}.{q0}/a-b", .params = &.{
+            .{ .name = "p0", .value = "1" },
+            .{ .name = "q0", .value = "users" },
+        } },
+        .{ .method = "POST", .path = "/va", .status = 404 },
+        .{ .method = "GET", .path = "/txt-json/a-b/", .status = 404 },
+        .{ .method = "GET", .path = "/xyz~x", .status = 405, .allow = &.{
+            "DELETE",
+            "POST",
+        } },
+    } },
+    .{ .routes = &.{
+        .{ .method = "POST", .pattern = "/a-b" },
+        .{ .method = "POST", .pattern = "/v1/{p1}.{q1}" },
+        .{ .method = "GET", .pattern = "/x.y/a" },
+        .{ .method = "PUT", .pattern = "/{p0}~x/users/a{p2}_{q2}.txt" },
+        .{ .method = "PUT", .pattern = "/b/a" },
+        .{ .method = "PUT", .pattern = "/x.y/{p1}~x/{p2}" },
+        .{ .method = "GET", .pattern = "/a/a" },
+        .{ .method = "POST", .pattern = "/{p0}~x" },
+        .{ .method = "DELETE", .pattern = "/b/v1/" },
+        .{ .method = "DELETE", .pattern = "/a-b/a/v1" },
+        .{ .method = "DELETE", .pattern = "/users/x.y/{p2}" },
+    }, .refused = 0, .cases = &.{
+        .{ .method = "GET", .path = "/x.y/a", .status = 200, .pattern = "/x.y/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/preusers", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/v1/", .status = 200, .pattern = "/b/v1", .params = &.{} },
+        .{ .method = "PUT", .path = "/b.xyz/1~x/txt/ajson_ab.txt", .status = 404 },
+        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/b-a/json", .status = 404 },
+        .{ .method = "PUT", .path = "/xyz~x/users/ab_xyz.txt", .status = 200, .pattern = "/{p0}~x/users/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "p2", .value = "b" },
+            .{ .name = "q2", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/42~x/users/vb", .status = 404 },
+        .{ .method = "DELETE", .path = "/a-b/a/v1", .status = 200, .pattern = "/a-b/a/v1", .params = &.{} },
+        .{ .method = "DELETE", .path = "/a/1/ab-42", .status = 404 },
+        .{ .method = "PUT", .path = "/b/a", .status = 200, .pattern = "/b/a", .params = &.{} },
+        .{ .method = "POST", .path = "/c7/42/preab", .status = 404 },
+        .{ .method = "DELETE", .path = "/users/x.y/txt", .status = 200, .pattern = "/users/x.y/{p2}", .params = &.{
+            .{ .name = "p2", .value = "txt" },
+        } },
+        .{ .method = "PUT", .path = "/v1/xyz-c7/a/42", .status = 404 },
+        .{ .method = "GET", .path = "/a/a", .status = 200, .pattern = "/a/a", .params = &.{} },
+        .{ .method = "GET", .path = "/txt/a.users/vtxt/c7-a", .status = 404 },
+        .{ .method = "PUT", .path = "/xyz~x/users/aab_json.txt", .status = 200, .pattern = "/{p0}~x/users/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+            .{ .name = "p2", .value = "ab" },
+            .{ .name = "q2", .value = "json" },
+        } },
+        .{ .method = "GET", .path = "/1/aab_xyz.txt/a.xyz/b.ab", .status = 404 },
+        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/xyz/txt/vjson/vjson/", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/a", .status = 200, .pattern = "/x.y/a", .params = &.{} },
+        .{ .method = "POST", .path = "/axyz_txt.txt/atxt_a.txt/1~x/a~x", .status = 404 },
+        .{ .method = "POST", .path = "/v1/a.json", .status = 200, .pattern = "/v1/{p1}.{q1}", .params = &.{
+            .{ .name = "p1", .value = "a" },
+            .{ .name = "q1", .value = "json" },
+        } },
+        .{ .method = "POST", .path = "/xyz/42/preb", .status = 404 },
+        .{ .method = "POST", .path = "/x.y/a~x/c7", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "POST", .path = "/json-c7/1.42/42/ajson_a.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/b/a", .status = 200, .pattern = "/b/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/b~x/txt", .status = 404 },
+        .{ .method = "DELETE", .path = "/a-b/a/v1", .status = 200, .pattern = "/a-b/a/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/txt/ab", .status = 404 },
+        .{ .method = "PUT", .path = "/b/a", .status = 200, .pattern = "/b/a", .params = &.{} },
+        .{ .method = "PUT", .path = "/ab_ab.txt/users-1/a42_42.txt", .status = 404 },
+        .{ .method = "POST", .path = "/xyz~x", .status = 200, .pattern = "/{p0}~x", .params = &.{
+            .{ .name = "p0", .value = "xyz" },
+        } },
+        .{ .method = "GET", .path = "/ajson_txt.txt/c7.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/a-b/a/v1", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "POST", .path = "/v42/va/vc7", .status = 404 },
+        .{ .method = "GET", .path = "/a-b", .status = 405, .allow = &.{
+            "POST",
+        } },
+        .{ .method = "PUT", .path = "/v1/atxt_xyz.txt/1.ab/a-txt/", .status = 404 },
+        .{ .method = "DELETE", .path = "/b/v1/", .status = 200, .pattern = "/b/v1", .params = &.{} },
+        .{ .method = "GET", .path = "/a~x/", .status = 404 },
+        .{ .method = "POST", .path = "/users/x.y/a", .status = 405, .allow = &.{
+            "DELETE",
+        } },
+        .{ .method = "DELETE", .path = "/prec7", .status = 404 },
+        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/a-json/prejson/txt~x", .status = 404 },
+        .{ .method = "DELETE", .path = "/x.y/users~x/b", .status = 405, .allow = &.{
+            "PUT",
+        } },
+        .{ .method = "PUT", .path = "/atxt_b.txt/b", .status = 404 },
+        .{ .method = "GET", .path = "/x.y/a", .status = 200, .pattern = "/x.y/a", .params = &.{} },
+        .{ .method = "POST", .path = "/a.xyz/v1/c7", .status = 404 },
+        .{ .method = "PUT", .path = "/x.y/xyz~x/xyz", .status = 200, .pattern = "/x.y/{p1}~x/{p2}", .params = &.{
+            .{ .name = "p1", .value = "xyz" },
+            .{ .name = "p2", .value = "xyz" },
+        } },
+        .{ .method = "POST", .path = "/preb/preab/ab", .status = 404 },
+        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "DELETE", .path = "/42/users/prejson/atxt_users.txt", .status = 404 },
+        .{ .method = "POST", .path = "/a-b", .status = 200, .pattern = "/a-b", .params = &.{} },
+        .{ .method = "GET", .path = "/atxt_users.txt", .status = 404 },
+        .{ .method = "POST", .path = "/v1/ab.ab", .status = 200, .pattern = "/v1/{p1}.{q1}", .params = &.{
+            .{ .name = "p1", .value = "ab" },
             .{ .name = "q1", .value = "ab" },
         } },
-        .{ .method = "GET", .path = "/a/pretxt/", .status = 404 },
-        .{ .method = "GET", .path = "/json.json/ab/json~x", .status = 200, .pattern = "/{p0}.json/{p1}/{p2}~x", .params = &.{
-            .{ .name = "p0", .value = "json" },
-            .{ .name = "p1", .value = "ab" },
-            .{ .name = "p2", .value = "json" },
+        .{ .method = "PUT", .path = "/a~x", .status = 405, .allow = &.{
+            "POST",
         } },
-        .{ .method = "GET", .path = "/ab.xyz/b~x/a/atxt_a.txt", .status = 404 },
+        .{ .method = "PUT", .path = "/ab~x/users/aab_a.txt", .status = 200, .pattern = "/{p0}~x/users/a{p2}_{q2}.txt", .params = &.{
+            .{ .name = "p0", .value = "ab" },
+            .{ .name = "p2", .value = "ab" },
+            .{ .name = "q2", .value = "a" },
+        } },
+        .{ .method = "GET", .path = "/vjson/42~x", .status = 404 },
+        .{ .method = "PUT", .path = "/b/a", .status = 200, .pattern = "/b/a", .params = &.{} },
+        .{ .method = "POST", .path = "/ab_a.txt/vjson/ajson_b.txt/c7", .status = 404 },
     } },
 };
 
@@ -9513,6 +9090,7 @@ pub const divergence_routes = [_]Route{
     .{ .method = "GET", .pattern = "/w/{a}.{b}" },
     .{ .method = "GET", .pattern = "/q/a{x}b{y}c" },
     .{ .method = "GET", .pattern = "/v/v{n}/b" },
+    .{ .method = "GET", .pattern = "/r/{x:a|b}" },
 };
 pub const divergences = [_]Case{
     .{ .method = "GET", .path = "/files/.b", .status = 200, .pattern = "/files/{name}.{ext}", .params = &.{
@@ -9534,4 +9112,7 @@ pub const divergences = [_]Case{
         .{ .name = "b", .value = "b.json" },
     } },
     .{ .method = "GET", .path = "/q/a1b2cc", .status = 404 },
+    .{ .method = "GET", .path = "/r/ab", .status = 200, .pattern = "/r/{x:a|b}", .params = &.{
+        .{ .name = "x", .value = "ab" },
+    } },
 };

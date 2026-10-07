@@ -82,7 +82,7 @@ def gen_pattern(rng):
             segs.append(':' + rng.choice(PARAMS))
         else:
             # router's `{name}` captures, whole or inside a segment (2026-10-07).
-            segs.append(rng.choice(['{%s}', '{%s}.json', 'v{%s}', '{%s}-{b}']) % rng.choice(PARAMS))
+            segs.append(rng.choice(['{%s}', '{%s}.json', 'v{%s}', '{%s}-{b}', '{%s:[0-9]+}', '{%s:[a-z]{2}}.json']) % rng.choice(PARAMS))
     if rng.random() < 0.2:
         segs.append('*' + rng.choice(['rest', 'path', 'id']))
     p = '/' + '/'.join(segs)

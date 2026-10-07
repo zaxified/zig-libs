@@ -28,7 +28,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [karlseguin/http.zig](https://github.com/karlseguin/http.zig) router | Zig | MIT | 1.6k | no release (push 2026-08-26) | `:param` and `*` routes, per-route middleware lists with a `replace`/`append` strategy, per-route config; welded to httpz's server. |
 | [lalinsky/dusty](https://github.com/lalinsky/dusty) router | Zig | MIT (LICENSE text) | 133 | v0.3.1 (2026-09-21) | "Router with support for parameters and wildcards" *(README)*; welded to dusty. Source not read. |
 
-**Where we are ahead:** method-aware backtracking with a correct `Allow` union on 405 (RFC 9110 §15.5.6; chi/httprouter answer per node *(inferred)*), fallbacks (404/405/auto-OPTIONS/redirect) that run the matching group's middleware, dot-segment posture (`normalize_path`), registration-time refusal of duplicate capture names and empty segments, allocation-free lock-free dispatch, route introspection with docs for `openapi`, and a comptime `Static` table with the same answers (differentially tested); audited (review 2026-09-11, findings F1–F11 fixed). **On par since 2026-10-07:** chi's `{name}` captures, whole and inside a segment (`{name}.{ext}`), a bare `*`, `With` (inline per-route middleware), `Mount` of a built router (with its groups, docs and 404/405 overrides), `Handle` for every method (`any`), sub-router `NotFound`/`MethodNotAllowed` (`Group.not_found`/`method_not_allowed`), host routing (`HostRouter`, chi's separate `hostrouter`). **Where we are behind:** regexp constraints (`{id:[0-9]+}`) — refused until the `regex` module exists (→ Backlog).
+**Where we are ahead:** method-aware backtracking with a correct `Allow` union on 405 (RFC 9110 §15.5.6; chi/httprouter answer per node *(inferred)*), fallbacks (404/405/auto-OPTIONS/redirect) that run the matching group's middleware, dot-segment posture (`normalize_path`), registration-time refusal of duplicate capture names and empty segments, allocation-free lock-free dispatch, route introspection with docs for `openapi`, and a comptime `Static` table with the same answers (differentially tested); audited (review 2026-09-11, findings F1–F11 fixed). **On par since 2026-10-07:** chi's `{name}` captures, whole and inside a segment (`{name}.{ext}`), a bare `*`, `With` (inline per-route middleware), `Mount` of a built router (with its groups, docs and 404/405 overrides), `Handle` for every method (`any`), sub-router `NotFound`/`MethodNotAllowed` (`Group.not_found`/`method_not_allowed`), host routing (`HostRouter`, chi's separate `hostrouter`). Regexp constraints (`{id:[0-9]+}`, via the sibling `regex` module, RE2 syntax, anchored properly) since 2026-10-07 too. **Where we are behind:** nothing a chi user would notice missing in the router itself; chi's `middleware` package is a separate package whose pieces live in sibling modules (`ratelimit`, `throttle`, `cors`, `requestid`, `accesslog`, `security-headers`, `metrics`, …). Deliberate divergences, documented and pinned by the oracle: no empty capture, whole-literal split, a 405 `Allow` that is the union over candidates.
 
 ## Design & invariants
 
@@ -162,7 +162,7 @@ entered; the new test reaches it. No code defect found.
 
 ## Backlog / deferred
 
-- **Regexp constraints (`{id:[0-9]+}`)** *(survey 2026-09-30; user 2026-10-07: a zig-libs `regex` module, not a fixed constraint set)* — chi users write these routinely for numeric ids. Blocked on the new `regex` module (RE2 syntax, linear time, compiles at comptime too, so `Static` can take it). Until then `classifySegment` refuses a `:` inside `{…}`. Fits §2.
+- ~~**Regexp constraints (`{id:[0-9]+}`)**~~ — DONE 2026-10-07 (the new `regex` module; `error.InvalidConstraint`).
 - ~~**Mid-segment params**~~ — DONE 2026-10-07 (chi's `{name}` inside a segment; semantics in README "Patterns inside a segment").
 - ~~**Per-route inline middleware (`With`)**~~ — DONE 2026-10-07 (`with`, inline groups).
 - ~~**Sub-router `Mount`**~~ — DONE 2026-10-07 (a copy of a built router; `Group.not_found`/`method_not_allowed` carry its fallbacks).
@@ -184,11 +184,12 @@ src/root.zig.
 re-takes `tools/go_chi_oracle` (Go 1.26.0, go-chi/chi v5.3.2 pinned by go.mod/go.sum, black box
 through its public API) and the interop lane runs it with `--check`; the check ignores only the
 `// GENERATED …` line. `src/chi_oracle_test.zig` replays `src/chi_vectors.zig`: 60 seeded tables,
-3,600 requests — status, matched pattern and every capture as chi answers (chi's `RoutePattern()`
+3,600 requests (regexp constraints included) — status, matched pattern and every capture as chi answers (chi's `RoutePattern()`
 drops a trailing slash; that alone is normalized), chi's 405 `Allow` a subset of ours. The
 generated requests stay in the domain where both semantics coincide; the documented divergences
 (EMPTY: chi accepts an empty capture; SPLIT: chi ends a capture at the first byte of the next
-literal) are a crafted table whose answers are pinned both ways. Teeth: inverting sibling-pattern
-precedence fails 14 generated requests, a flipped vector fails `--check`. Still self-graded: the
+literal; ANCHOR: chi's pasted `^…$` splits a top-level alternation) are a crafted table whose
+answers are pinned both ways. Teeth: inverting sibling-pattern precedence fails 14 generated
+requests, skipping the constraint check 411, a flipped vector fails `--check`. Still self-graded: the
 composition layer (`group`/`with`/`mount`, fallback scoping, `HostRouter`) and `Static`, which the
 differential test holds to `Router`.

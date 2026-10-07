@@ -67,6 +67,13 @@ pub const Regex = struct {
     pub fn compile(gpa: std.mem.Allocator, pattern: []const u8) (Error || std.mem.Allocator.Error)!Regex {
         const b = try gpa.create(syntax.Builder);
         defer gpa.destroy(b);
+        return compileUsing(gpa, b, pattern);
+    }
+
+    /// `compile` with the caller's `Builder` (~70 KiB of compile scratch, any
+    /// lifetime) — for compiling many patterns, or into an arena that should
+    /// not hold the scratch.
+    pub fn compileUsing(gpa: std.mem.Allocator, b: *Builder, pattern: []const u8) (Error || std.mem.Allocator.Error)!Regex {
         try b.compile(pattern);
         const insts = try gpa.dupe(Inst, b.insts[0..b.ninsts]);
         errdefer gpa.free(insts);

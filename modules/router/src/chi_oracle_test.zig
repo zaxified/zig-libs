@@ -22,6 +22,9 @@
 //!    here at the first occurrence of the whole literal, and the last capture
 //!    at the literal suffix (`{id}suf` takes `asufsuf`; `{a}.json` wins
 //!    `a.b.json` with `a.b`).
+//!  - ANCHOR: chi anchors a constraint by pasting `^` and `$` around it, so
+//!    `{x:a|b}` reads as `^a|b$` and takes "ab"; here the whole capture must
+//!    match the whole regexp.
 
 const std = @import("std");
 const testing = std.testing;
@@ -152,6 +155,7 @@ test "chi oracle: the documented divergences answer as this module documents, no
         .{ 200, "/x/{id}suf\x00id\x00asuf" }, // SPLIT: the last capture runs to the suffix
         .{ 200, "/w/{a}.json\x00a\x00a.b" }, // SPLIT: the whole literal, not its first byte
         .{ 200, "/q/a{x}b{y}c\x00x\x001\x00y\x002c" }, // SPLIT
+        .{ 404, "" }, // ANCHOR: `a|b` must match all of "ab"
     };
     comptime std.debug.assert(ours.len == v.divergences.len);
     for (v.divergences, ours) |c, want| {

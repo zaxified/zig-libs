@@ -47,6 +47,7 @@ var staticWords = []string{"a", "b", "users", "v1", "x.y", "a-b"}
 
 var denseShapes = []string{
 	"a", "v1", "x.y", "{p0}", "{p0}.json", "{p0}.{q0}", "v{p0}", "{p0}-{q0}", "pre{p0}", "{p0}~x", "a{p0}_{q0}.txt",
+	"{p0:[0-9]+}", "{p0:[a-z]+}", "{p0:[0-9]+}.json", "v{p0:[0-9]+}", "{p0:[a-c]+}-{q0}",
 }
 
 // One pattern segment at depth d. Capture names are fixed per depth, so two
@@ -70,6 +71,10 @@ func patternSegment(d int, last bool) string {
 		shapes := []string{
 			"{" + p + "}.json", "{" + p + "}.{" + q + "}", "v{" + p + "}", "{" + p + "}-{" + q + "}",
 			"pre{" + p + "}", "{" + p + "}~x", "a{" + p + "}_{" + q + "}.txt",
+			// Regexp constraints, no top-level alternation (chi anchors
+			// `^re$` by pasting, which splits an alternation — a crafted
+			// divergence below).
+			"{" + p + ":[0-9]+}", "{" + p + ":[a-z]+}", "{" + p + ":[0-9]+}.json", "v{" + p + ":[0-9]+}", "{" + p + ":[a-c]+}-{" + q + "}",
 		}
 		return shapes[rnd.IntN(len(shapes))]
 	default:
@@ -393,6 +398,7 @@ var divergenceRoutes = []route{
 	{"GET", "/w/{a}.{b}"},
 	{"GET", "/q/a{x}b{y}c"},
 	{"GET", "/v/v{n}/b"},
+	{"GET", "/r/{x:a|b}"},
 }
 
 var divergenceRequests = [][2]string{
@@ -403,6 +409,7 @@ var divergenceRequests = [][2]string{
 	{"GET", "/x/asufsuf"},
 	{"GET", "/w/a.b.json"},
 	{"GET", "/q/a1b2cc"},
+	{"GET", "/r/ab"},
 }
 
 func emitDivergences(b *bytes.Buffer) {

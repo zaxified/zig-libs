@@ -356,10 +356,43 @@ fn convertPattern(arena: Allocator, pattern: []const u8) Allocator.Error![]const
             try out.appendSlice(arena, if (seg.len == 1) "*" else seg[1..]);
             try out.append(arena, '}');
         } else {
-            try out.appendSlice(arena, seg);
+            try appendTemplateSegment(arena, &out, seg);
         }
     }
     return out.items;
+}
+
+/// A segment with `{name}` / `{name:regexp}` captures (router's grammar) as an
+/// OpenAPI template: the constraint is dropped (`{id:[0-9]+}` → `{id}`) —
+/// OpenAPI has no place for it in the path, and its `pattern` keyword speaks
+/// ECMA-262, not RE2. Braces in a constraint nest and `\` escapes, as in
+/// router.
+fn appendTemplateSegment(arena: Allocator, out: *std.ArrayList(u8), seg: []const u8) Allocator.Error!void {
+    var i: usize = 0;
+    while (i < seg.len) : (i += 1) {
+        const c = seg[i];
+        try out.append(arena, c);
+        if (c != '{') continue;
+        // Copy the name, skip a `:constraint` up to the matching `}`.
+        var depth: usize = 1;
+        var in_name = true;
+        i += 1;
+        while (i < seg.len) : (i += 1) {
+            const d = seg[i];
+            if (d == '\\') {
+                i += 1;
+                continue;
+            }
+            if (d == '{') depth += 1;
+            if (d == '}') {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+            if (d == ':' and depth == 1) in_name = false;
+            if (in_name) try out.append(arena, d);
+        }
+        try out.append(arena, '}');
+    }
 }
 
 /// One `"<method>": {operation}` member, FastAPI key order: tags, summary,
@@ -1428,6 +1461,7 @@ test "generate: router's `{name}` captures, whole and inside a segment, become p
     try testing.expectError(error.DuplicateRoute, r.addDoc(.get, "/users/{id}", hOk, .{ .summary = "Second" }));
     try r.get("/files/{name}.{ext}", hOk);
     try r.get("/static/*", hOk);
+    try r.get("/d/{date:[0-9]{4}-[0-9]{2}}/{id:[0-9]+}.json", hOk);
 
     const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
     defer testing.allocator.free(json);
@@ -1442,6 +1476,10 @@ test "generate: router's `{name}` captures, whole and inside a segment, become p
     try testing.expectEqualStrings("name", params[0].object.get("name").?.string);
     try testing.expectEqualStrings("ext", params[1].object.get("name").?.string);
     try testing.expect(paths.get("/static/{*}") != null);
+    // A regexp constraint is not part of the template.
+    const d = paths.get("/d/{date}/{id}.json").?.object.get("get").?.object;
+    try testing.expectEqualStrings("get_d_date_id.json", d.get("operationId").?.string);
+    try testing.expectEqual(@as(usize, 2), d.get("parameters").?.array.items.len);
 }
 
 test "generate: /f/:p and /f/*p collide too (F5) — audit's own repro" {

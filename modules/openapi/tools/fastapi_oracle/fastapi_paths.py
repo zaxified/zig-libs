@@ -31,8 +31,37 @@ def starlette_path(pattern):
         elif s.startswith('*'):
             out.append('{%s:path}' % s[1:])
         else:
-            out.append(s)
+            # A router regexp constraint is not part of the OpenAPI template.
+            out.append(strip_constraints(s))
     return '/'.join(out)
+
+
+def strip_constraints(seg):
+    out, i = [], 0
+    while i < len(seg):
+        out.append(seg[i])
+        if seg[i] == '{':
+            depth, name = 1, True
+            i += 1
+            while i < len(seg):
+                c = seg[i]
+                if c == '\\':
+                    i += 2
+                    continue
+                if c == '{':
+                    depth += 1
+                if c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                if c == ':' and depth == 1:
+                    name = False
+                if name:
+                    out.append(c)
+                i += 1
+            out.append('}')
+        i += 1
+    return ''.join(out)
 
 
 def endpoint(names, n):
@@ -54,7 +83,7 @@ def reduce(tables):
                     if s[:1] in (':', '*'):
                         names.append(s[1:])
                     else:
-                        names += re.findall(r'\{([^}]+)\}', s)
+                        names += re.findall(r'\{([^}:]+)[:}]', strip_constraints(s))
                 app.add_api_route(starlette_path(r['pattern']), endpoint(names, n), methods=[r['method'].upper()])
             doc = app.openapi()
         except Exception as e:  # FastAPI refusing the table is its verdict
