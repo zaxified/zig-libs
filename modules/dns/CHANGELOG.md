@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **Fix (behaviour change), `Resolver.query` asks the next server when one fails.**
+  A reply with SERVFAIL, NOTIMP or REFUSED used to be returned as the answer, so one broken or
+  refusing first nameserver failed every lookup that getaddrinfo still resolved. Now such a reply
+  sends the query on to the next server and the next attempt, as glibc 2.43 does (the glibc oracle
+  gained an `rcodes` section: those three move on through every server and attempt, FORMERR and
+  NXDOMAIN end the lookup at the first). If every server fails, the last failed reply is returned,
+  so its rcode can still be read. New `pub fn serverFailed(Rcode) bool`. Anchored end to end: three
+  stubs on 127.0.0.1-3 and the Resolver itself must ask the servers glibc asked, per rcode.
+
 - **2026-10-06** — **Fix (behaviour change), `config.parseResolvConf` now does what glibc 2.43 does
   with the same file** (found by the new glibc oracle, `tools/config_oracle.py` →
   `src/config_oracle_test.zig`):

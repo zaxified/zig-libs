@@ -18,6 +18,8 @@ records every query glibc sends:
     lookup that never succeeds (every answer NXDOMAIN);
   - the nameservers and attempts: the servers glibc tries, in order, for a
     rooted name when every server answers SERVFAIL;
+  - the rcodes: over three servers and the default attempts, which rcodes
+    send glibc on to the next server and which end the lookup at once;
   - hosts: the addresses getaddrinfo returns per family, and the name
     gethostbyaddr returns.
 
@@ -73,6 +75,9 @@ SERVERS_FIXTURES = [
     ("no_nameserver", "search a.example\n"),
     ("semicolon_hash_after_server", "nameserver 127.0.0.2;x\nnameserver 127.0.0.1#y\nnameserver 127.0.0.3 # z\n"),
 ]
+# rcodes answered by every server of RCODES_TEXT: FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED.
+RCODES_TEXT = "nameserver 127.0.0.1\nnameserver 127.0.0.2\nnameserver 127.0.0.3\n"
+RCODES = [1, 2, 3, 4, 5]
 HOSTS = ("127.0.0.1 localhost\n"
          "192.0.2.1 a.example a # first\n"
          "192.0.2.2\ta.example\n"
@@ -188,6 +193,15 @@ def inner():
         out["servers"].append({"name": name, "text": text, "tried": [a for a, _, t in dns.log if t == 1]})
         unbind("/etc/resolv.conf", rc)
 
+    out["rcodes"] = []
+    rc = bind("/etc/resolv.conf", RCODES_TEXT)
+    for rcode in RCODES:
+        dns.log.clear()
+        dns.rcode = rcode
+        lookups(["probe.example."], socket.AF_INET)
+        out["rcodes"].append({"rcode": rcode, "tried": [a for a, _, t in dns.log if t == 1]})
+    unbind("/etc/resolv.conf", rc)
+
     unbind("/etc/nsswitch.conf", ns)
     unbind("/etc/hosts", empty_hosts)
     ns = bind("/etc/nsswitch.conf", "hosts: files\n")
@@ -223,6 +237,7 @@ def main():
         "pub const Lookup = struct { name: []const u8, queries: []const []const u8 };",
         "pub const Resolv = struct { name: []const u8, text: []const u8, lookups: []const Lookup };",
         "pub const Servers = struct { name: []const u8, text: []const u8, tried: []const []const u8 };",
+        "pub const Rcode = struct { rcode: u4, tried: []const []const u8 };",
         "pub const Answer = struct { name: []const u8, addrs: ?[]const []const u8 };",
         "pub const Reverse = struct { addr: []const u8, name: ?[]const u8 };",
         "",
@@ -236,6 +251,12 @@ def main():
     o.append("pub const servers = [_]Servers{")
     for s in data["servers"]:
         o.append(f"    .{{ .name = {zstr(s['name'])}, .text = {zstr(s['text'])}, .tried = &.{{{', '.join(zstr(a) for a in s['tried'])}}} }},")
+    o.append("};")
+    o.append("")
+    o.append(f"pub const rcodes_text = {zstr(RCODES_TEXT)};")
+    o.append("pub const rcodes = [_]Rcode{")
+    for r_ in data["rcodes"]:
+        o.append(f"    .{{ .rcode = {r_['rcode']}, .tried = &.{{{', '.join(zstr(a) for a in r_['tried'])}}} }},")
     o.append("};")
     h = data["hosts"]
     o.append("")

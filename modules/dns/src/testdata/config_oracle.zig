@@ -6,6 +6,7 @@
 pub const Lookup = struct { name: []const u8, queries: []const []const u8 };
 pub const Resolv = struct { name: []const u8, text: []const u8, lookups: []const Lookup };
 pub const Servers = struct { name: []const u8, text: []const u8, tried: []const []const u8 };
+pub const Rcode = struct { rcode: u4, tried: []const []const u8 };
 pub const Answer = struct { name: []const u8, addrs: ?[]const []const u8 };
 pub const Reverse = struct { addr: []const u8, name: ?[]const u8 };
 
@@ -41,6 +42,15 @@ pub const servers = [_]Servers{
     .{ .name = "attempts_digits_then_junk", .text = "nameserver 127.0.0.1\noptions attempts:3x\n", .tried = &.{ "127.0.0.1", "127.0.0.1", "127.0.0.1" } },
     .{ .name = "no_nameserver", .text = "search a.example\n", .tried = &.{ "127.0.0.1", "127.0.0.1" } },
     .{ .name = "semicolon_hash_after_server", .text = "nameserver 127.0.0.2;x\nnameserver 127.0.0.1#y\nnameserver 127.0.0.3 # z\n", .tried = &.{ "127.0.0.3", "127.0.0.3" } },
+};
+
+pub const rcodes_text = "nameserver 127.0.0.1\nnameserver 127.0.0.2\nnameserver 127.0.0.3\n";
+pub const rcodes = [_]Rcode{
+    .{ .rcode = 1, .tried = &.{"127.0.0.1"} },
+    .{ .rcode = 2, .tried = &.{ "127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.1", "127.0.0.2", "127.0.0.3" } },
+    .{ .rcode = 3, .tried = &.{"127.0.0.1"} },
+    .{ .rcode = 4, .tried = &.{ "127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.1", "127.0.0.2", "127.0.0.3" } },
+    .{ .rcode = 5, .tried = &.{ "127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.1", "127.0.0.2", "127.0.0.3" } },
 };
 
 pub const hosts_text = "127.0.0.1 localhost\n192.0.2.1 a.example a # first\n192.0.2.2\ta.example\n2001:db8::1 a.example\n192.0.2.3 B.Example\n# 192.0.2.9 commented.example\n192.0.2.4 c.example\tc-alias   c-other\n";

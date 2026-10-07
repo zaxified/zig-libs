@@ -379,6 +379,12 @@ pub fn freeNames(r: *Resolver, names: []const []const u8) void {
 
 /// One-shot query for exactly `name` (no search list, no hosts file) over
 /// the configured transport. Caller owns the returned message.
+///
+/// A reply whose rcode says the SERVER failed (`serverFailed`: SERVFAIL,
+/// NOTIMP, REFUSED) is not the answer: the next server is asked, round after
+/// round, as glibc does (`testdata/config_oracle.zig` `rcodes`). If every
+/// server fails that way, the last such reply is returned, so the caller can
+/// still read its rcode. Any other rcode, NXDOMAIN included, is final.
 pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Message {
     var qbuf: [message.max_query_len]u8 = undefined;
 
@@ -399,6 +405,10 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
     defer r.gpa.free(rbuf);
 
     var last_err: ?Error = null;
+    // The last reply from a server that failed (`serverFailed`), kept in case
+    // every server does.
+    var failed: ?message.Message = null;
+    errdefer if (failed) |*m| m.deinit();
     var attempt: u8 = 0;
     while (attempt < @max(1, r.effectiveAttempts())) : (attempt += 1) {
         for (servers) |server| {
@@ -420,7 +430,8 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
                     },
                 };
                 defer r.gpa.free(raw);
-                return r.decodeResponse(raw, id, name, ty);
+                const msg = try r.decodeResponse(raw, id, name, ty);
+                return settle(&failed, msg) orelse continue;
             }
 
             const udp = r.udpExchange(server, packet, id, rbuf) catch |err| switch (err) {
@@ -447,12 +458,38 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
                     },
                 };
                 defer r.gpa.free(traw);
-                return r.decodeResponse(traw, id, name, ty);
+                const msg = try r.decodeResponse(traw, id, name, ty);
+                return settle(&failed, msg) orelse continue;
             }
-            return r.decodeResponse(raw, id, name, ty);
+            const msg = try r.decodeResponse(raw, id, name, ty);
+            return settle(&failed, msg) orelse continue;
         }
     }
+    if (failed) |msg| return msg;
     return last_err orelse error.Timeout;
+}
+
+/// Does `rcode` say the server failed, rather than answer? Then the next
+/// server is asked. Observed of glibc 2.43 (`testdata/config_oracle.zig`
+/// `rcodes`): SERVFAIL, NOTIMP and REFUSED send it on through every server
+/// and attempt; FORMERR and NXDOMAIN end the lookup at the first server.
+/// NOERROR is an answer, even an empty one.
+pub fn serverFailed(rcode: message.Rcode) bool {
+    return switch (rcode) {
+        .serv_fail, .not_imp, .refused => true,
+        else => false,
+    };
+}
+
+/// `msg` when it is the answer, after freeing any failed reply kept before
+/// it; null when `msg` is itself a failed server's reply, which then replaces
+/// the one in `failed`.
+fn settle(failed: *?message.Message, msg: message.Message) ?message.Message {
+    if (failed.*) |*m| m.deinit();
+    failed.* = null;
+    if (!serverFailed(msg.rcode())) return msg;
+    failed.* = msg;
+    return null;
 }
 
 fn encodeChecked(buf: []u8, name: []const u8, ty: message.Type, id: u16, edns: ?u16) Error![]u8 {
@@ -2052,4 +2089,139 @@ test "tcpExchange: a canceled blocking read surfaces Canceled, not NetworkFailed
     const result = fut.cancel(io);
     try testing.expect(reached);
     try testing.expectError(error.Canceled, result);
+}
+
+// ── which rcodes move on to the next server: glibc's, end to end ────────────
+
+/// One of three UDP stubs on 127.0.0.1-3 sharing a port: answers every query
+/// with `rcode` and no records, or, when `rcode` is null, A 192.0.2.1. Each
+/// datagram it serves appends its own number (1-3) to the shared `log`.
+const RcodeStub = struct {
+    io: std.Io,
+    sock: net.Socket,
+    number: u8,
+    rcode: ?u4,
+    log: *RcodeLog,
+
+    fn run(st: *RcodeStub) void {
+        st.serve() catch |err| std.debug.print("RcodeStub: {t}\n", .{err});
+    }
+
+    fn serve(st: *RcodeStub) !void {
+        var rbuf: [message.max_query_len]u8 = undefined;
+        while (true) {
+            const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(400), .clock = .awake } };
+            const incoming = st.sock.receiveTimeout(st.io, &rbuf, t.toDeadline(st.io)) catch |err| switch (err) {
+                error.Timeout => return,
+                else => |e| return e,
+            };
+            const q = incoming.data;
+            const question = q[message.header_len..][0..EchoStub.questionLen(q[message.header_len..])];
+            st.log.add(st.number);
+            var out: [512]u8 = undefined;
+            const resp = if (st.rcode) |rc|
+                stubResponse(&out, q, 0x8180 | @as(u16, rc), question, "", 0)
+            else
+                stubResponse(&out, q, 0x8180, question, EchoStub.a_honest, 1);
+            try st.sock.send(st.io, &incoming.from, resp);
+        }
+    }
+};
+
+const RcodeLog = struct {
+    numbers: [16]u8 = @splat(0),
+    len: std.atomic.Value(usize) = .init(0),
+
+    fn add(l: *RcodeLog, n: u8) void {
+        const i = l.len.fetchAdd(1, .monotonic);
+        if (i < l.numbers.len) l.numbers[i] = n;
+    }
+
+    fn slice(l: *RcodeLog) []const u8 {
+        return l.numbers[0..@min(l.len.load(.monotonic), l.numbers.len)];
+    }
+};
+
+const rcode_servers = [_]netaddr.Ip{
+    .{ .v4 = .{ 127, 0, 0, 1 } }, .{ .v4 = .{ 127, 0, 0, 2 } }, .{ .v4 = .{ 127, 0, 0, 3 } },
+};
+
+/// Three stubs answering `rcodes[i]` (null: an answer) on 127.0.0.1-3 at one
+/// port. Null when the loopback addresses cannot be bound on one port.
+fn bindRcodeStubs(io: std.Io, rcodes: [3]?u4, log: *RcodeLog) ?[3]RcodeStub {
+    var stubs: [3]RcodeStub = undefined;
+    var port: u16 = 0;
+    for (0..3) |i| {
+        const addr: net.IpAddress = .{ .ip4 = .{ .bytes = rcode_servers[i].v4, .port = port } };
+        const sock = addr.bind(io, .{ .mode = .dgram }) catch {
+            for (stubs[0..i]) |st| st.sock.close(io);
+            return null;
+        };
+        if (i == 0) port = sock.address.getPort();
+        stubs[i] = .{ .io = io, .sock = sock, .number = @intCast(i + 1), .rcode = rcodes[i], .log = log };
+    }
+    return stubs;
+}
+
+test "query: the servers asked per rcode are the ones glibc asked (SERVFAIL, NOTIMP, REFUSED move on)" {
+    // `testdata/config_oracle.zig` `rcodes`: glibc 2.43 over three servers
+    // with its default two attempts, every server answering one rcode. The
+    // same three servers here, as stubs, and the Resolver itself. Before this
+    // test `query` returned the first server's SERVFAIL or REFUSED as the
+    // answer, so one refusing nameserver failed every lookup getaddrinfo
+    // still resolved.
+    const rec = @import("testdata/config_oracle.zig");
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try testing.expectEqualStrings("nameserver 127.0.0.1\nnameserver 127.0.0.2\nnameserver 127.0.0.3\n", rec.rcodes_text);
+    for (rec.rcodes) |fx| {
+        var log: RcodeLog = .{};
+        var stubs = bindRcodeStubs(io, @splat(fx.rcode), &log) orelse
+            return testkit.loopbackSkip("127.0.0.1-3 not bindable on one port", .{});
+        defer for (stubs) |st| st.sock.close(io);
+        var futs: [3]std.Io.Future(void) = undefined;
+        for (&futs, &stubs) |*f, *st| f.* = try io.concurrent(RcodeStub.run, .{st});
+        var r = Resolver.init(io, testing.allocator, .{ .servers = &rcode_servers, .port = stubs[0].sock.address.getPort(), .timeout_ms = 1500, .attempts = 2, .use_hosts = false, .use_search = false });
+        defer r.deinit();
+        const res = r.query("probe.example.", .a);
+        for (&futs) |*f| f.await(io);
+        var msg = try res;
+        defer msg.deinit();
+        // The reply handed back is the last one, whatever its rcode.
+        try testing.expectEqual(@as(u12, fx.rcode), @intFromEnum(msg.rcode()));
+        try testing.expectEqual(fx.tried.len, log.slice().len);
+        for (fx.tried, log.slice()) |want, n| {
+            var buf: [16]u8 = undefined;
+            const got = try std.fmt.bufPrint(&buf, "127.0.0.{d}", .{n});
+            testing.expectEqualStrings(want, got) catch |e| {
+                std.debug.print("rcode {d}: glibc asked {s}, ours {s}\n", .{ fx.rcode, want, got });
+                return e;
+            };
+        }
+    }
+}
+
+test "query: a refusing first server is skipped and the second server's answer returned" {
+    // The everyday case behind the rule: the first nameserver refuses (a
+    // resolver that serves only its own network), the second answers. The
+    // refused reply is freed on the way (testing.allocator would see it).
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const refused: u4 = @intCast(@intFromEnum(message.Rcode.refused));
+    var log: RcodeLog = .{};
+    var stubs = bindRcodeStubs(io, .{ refused, null, null }, &log) orelse
+        return testkit.loopbackSkip("127.0.0.1-3 not bindable on one port", .{});
+    defer for (stubs) |st| st.sock.close(io);
+    var futs: [3]std.Io.Future(void) = undefined;
+    for (&futs, &stubs) |*f, *st| f.* = try io.concurrent(RcodeStub.run, .{st});
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &rcode_servers, .port = stubs[0].sock.address.getPort(), .timeout_ms = 1500, .attempts = 2, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+    const res = r.query("example.com", .a);
+    for (&futs) |*f| f.await(io);
+    var msg = try res;
+    defer msg.deinit();
+    try expectOnlyHonestA(&msg);
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, log.slice());
 }
