@@ -9,8 +9,7 @@
 //! Listed divergences, each counted and pinned so a drift either way shows:
 //!  - a zone longer than `max_zone_len` (Go: any length; here refused);
 //!  - a port with a leading zero (`1.2.3.4:080`; Go takes it, this module's
-//!    `parsePort` does not — the F8 decision);
-//!  - `IsPrivate` on `fc00::/7` (Go: private; here `isUniqueLocal`'s job).
+//!    `parsePort` does not — the F8 decision).
 
 const std = @import("std");
 const testing = std.testing;
@@ -52,7 +51,6 @@ fn withZone(buf: []u8, ip_text: []const u8, zone: na.Zone) []const u8 {
 
 test "netip oracle: ParseAddr, String, StringExpanded, predicates, Next/Prev" {
     var long_zone: usize = 0;
-    var private_v6: usize = 0;
     for (v.addrs) |c| {
         errdefer std.debug.print("addr {s}\n", .{c.text});
         const got = na.parseIpZoned(c.text);
@@ -84,11 +82,7 @@ test "netip oracle: ParseAddr, String, StringExpanded, predicates, Next/Prev" {
         try testing.expectEqual(c.flags.link_local_unicast, ip.isLinkLocalUnicast());
         try testing.expectEqual(c.flags.unspecified, ip.isUnspecified());
         try testing.expectEqual(c.flags.is4in6, ip.isIpv4Mapped());
-        if (c.flags.private != ip.isPrivate()) {
-            // Go's IsPrivate also covers fc00::/7, our isUniqueLocal.
-            try testing.expect(c.flags.private and ip.isUniqueLocal());
-            private_v6 += 1;
-        }
+        try testing.expectEqual(c.flags.private, ip.isPrivate());
 
         var nbuf: [na.max_ip_text_len]u8 = undefined;
         if (ip.next()) |n| {
@@ -99,7 +93,6 @@ test "netip oracle: ParseAddr, String, StringExpanded, predicates, Next/Prev" {
         } else try testing.expectEqualStrings("", c.prev);
     }
     try testing.expectEqual(@as(usize, 1), long_zone);
-    try testing.expect(private_v6 > 0);
 }
 
 test "netip oracle: Addr.Compare" {

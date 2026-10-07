@@ -27,7 +27,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [euantorano/ip.zig](https://github.com/euantorano/ip.zig) | Zig | BSD-3-Clause | 22 | push 2019-10-31 | Only Zig ecosystem competitor found; stale since 2019, simple address type. |
 | Zig `std.Io.net.IpAddress` | Zig | MIT | — | Zig 0.16.0 | Parse/format plus socket use; no CIDR/prefix ops, no RFC 6724 destination ordering, no summarize/merge *(inferred; std source not read in this run)*. |
 
-**Where we are ahead:** of every Zig alternative by a wide margin — CIDR ops, range↔prefix summarization, and RFC 6724 destination/source selection, which even Go's `netip` does not expose; parse/format checked against glibc `inet_pton` and Python `ipaddress` on millions of inputs (Anchoring section). **Where we are behind:** nothing functional since 2026-10-07 — the netip helpers, zones, `AddrPort` and netipx's `IPRange`/`IPSet` were added. Deliberate differences, none of them a missing capability: a zone is capped at 31 bytes (Go: any length); `parseAddrPort` refuses a port with a leading zero (the module's F8 rule; Go takes `:080`); `isPrivate` is RFC 1918 only where Go also counts `fc00::/7` (here `isUniqueLocal`); set-builder errors are returned at the call rather than accumulated; `removeFreePrefix` never returns netipx's invalid-prefix-with-ok answer (Anchoring).
+**Where we are ahead:** of every Zig alternative by a wide margin — CIDR ops, range↔prefix summarization, and RFC 6724 destination/source selection, which even Go's `netip` does not expose; parse/format checked against glibc `inet_pton` and Python `ipaddress` on millions of inputs (Anchoring section). **Where we are behind:** nothing functional since 2026-10-07 — the netip helpers, zones, `AddrPort` and netipx's `IPRange`/`IPSet` were added. Deliberate differences, none of them a missing capability: a zone is capped at 31 bytes (Go: any length); `parseAddrPort` refuses a port with a leading zero (the module's F8 rule; Go takes `:080`); set-builder errors are returned at the call rather than accumulated; `removeFreePrefix` never returns netipx's invalid-prefix-with-ok answer (Anchoring).
 
 ## Design & invariants
 Allocation model: none in the scalar API — parse/format work on caller buffers
@@ -102,6 +102,15 @@ source is `pub const meta` in src/root.zig.
 
 **Anchor grade:** class B · oracle EXTERNAL
 
+**On CI since 2026-10-07.** `tools/interop.zig` (`zig build interop-netaddr
+[-- --check]`) re-takes all three oracles below — parse (glibc + Python),
+RFC 6724 (glibc + kernel, in its own `unshare -rnm`) and Go netip/netipx —
+and the interop lane runs it with `--check` at every tag / dispatch. The
+Python checks compare everything but the `// GENERATED … (versions)` line,
+so a runner with another kernel or Python build passes exactly when every
+verdict agrees. Teeth: one flipped verdict in each vectors file fails all
+three.
+
 **Go netip/netipx oracle 2026-10-07.** `tools/go_netip_oracle` (Go 1.26.0,
 `go4.org/netipx` pinned by go.mod/go.sum) drives the reference through its
 public API as a black box over our own crafted and seeded random cases and
@@ -119,8 +128,8 @@ netipx: `RemoveFreePrefix` takes the tightest prefix of either family, so for
 a length past 32 it can choose a v4 prefix and answer ok with an invalid
 prefix (227 cases, counted; ours picks among families that can hold the
 length and is checked against the contract instead). Listed divergences,
-counted: a zone over 31 bytes, a leading-zero port, `IsPrivate` on
-`fc00::/7`. Teeth: 20 schema mutants over the new code, 19 killed; the
+counted: a zone over 31 bytes, a leading-zero port. (`IsPrivate` on
+`fc00::/7` was a third until the same day: `isPrivate` now matches Go.) Teeth: 20 schema mutants over the new code, 19 killed; the
 survivor (which side of an equal end the intersect walk advances) is
 equivalent. The ranges/sets half has no third implementation as a
 tiebreaker; the brute-force bitmap model in `netip_api_test.zig` stands in

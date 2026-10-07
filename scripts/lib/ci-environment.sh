@@ -321,6 +321,14 @@ python3 -m venv "$ORACLE_VENVS/ntplib" >/dev/null 2>&1 || true
     && echo "sntp go modules: OK" || echo "sntp go modules: download failed"
 echo "::endgroup::"
 
+echo "::group::interop: netaddr (Go module cache)"
+# tools/go_netip_oracle runs with GOPROXY=off like sntp's: go4.org/netipx and
+# the pinned go1.26.0 toolchain are fetched here. The Python halves need only
+# python3, unshare, ip and mount, which the image already has.
+(cd modules/netaddr/tools/go_netip_oracle && GOTOOLCHAIN=go1.26.0 go mod download >/dev/null 2>&1) \
+    && echo "netaddr go modules: OK" || echo "netaddr go modules: download failed"
+echo "::endgroup::"
+
 echo "::group::interop: syslog (rsyslogd)"
 # Installed for /usr/sbin/rsyslogd and its plugins; tools/rsyslog_oracle.py
 # runs a copy, unconfined, inside `unshare -rn`. journald comes with systemd.

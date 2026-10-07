@@ -19,7 +19,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   against Go 1.26 / netipx by `tools/go_netip_oracle` → `src/netip_vectors.zig`.
   Found a netipx defect (`RemoveFreePrefix` can answer ok with an invalid
   prefix), not copied. Divergences listed in README/SPEC: zone ≤ 31 bytes,
-  no leading-zero port, `isPrivate` stays RFC 1918 only.
+  no leading-zero port.
+- **2026-10-07** — Anchoring: the three oracles (parse, RFC 6724, Go
+  netip/netipx) are re-taken on CI by the new `tools/interop.zig`
+  (`interop-netaddr -- --check`); the Python `--check` modes now ignore the
+  version line of the vectors header, so a different runner kernel passes when
+  the verdicts agree.
+- **2026-10-07** — **BEHAVIOURAL, not breaking:** `Ip.isPrivate` now also
+  answers true for IPv6 unique-local `fc00::/7`, as Go `netip.Addr.IsPrivate`
+  does (user decision, parity). Was RFC 1918 only. The two callers (`rdap`,
+  `whois` SSRF guards) already OR in `isUniqueLocal`, so neither changes.
 
 - **2026-10-05** — Anchoring only, no code change: evidence MIXED → EXTERNAL.
   The RFC 6724 half (self-tested until now) is replayed against glibc 2.43

@@ -132,23 +132,24 @@ pub const Ip = union(enum) {
         };
     }
 
-    /// IPv4 private-use `10/8`, `172.16/12`, `192.168/16` (RFC 1918).
+    /// Private addresses as Go `netip.Addr.IsPrivate` defines them: IPv4
+    /// private-use `10/8`, `172.16/12`, `192.168/16` (RFC 1918) and IPv6
+    /// unique-local `fc00::/7` (RFC 4193, also `isUniqueLocal`).
     ///
     /// v4-mapped addresses are unwrapped first, so `::ffff:10.0.0.1` counts —
     /// a check that missed that is exactly how a filter gets bypassed.
     ///
-    /// Returns false for every IPv6 address: RFC 1918 has no v6 counterpart,
-    /// and the nearest analogue is `fc00::/7`, which `isUniqueLocal` already
-    /// covers. Combining the two (and whatever else — CGNAT `100.64/10`,
-    /// TEST-NET, broadcast) into one "is this safe to connect to" predicate is
-    /// policy, not addressing, so it stays with the caller that has the
-    /// threat model; `rdap`'s SSRF guard is the worked example.
+    /// Until 2026-10-07 this was RFC 1918 only; it now matches Go (user
+    /// decision, parity). Combining this with loopback, link-local, CGNAT
+    /// `100.64/10`, TEST-NET, broadcast … into one "is this safe to connect
+    /// to" predicate is policy, not addressing, so it stays with the caller
+    /// that has the threat model; `rdap`'s SSRF guard is the worked example.
     pub fn isPrivate(ip: Ip) bool {
         return switch (ip.unmap()) {
             .v4 => |q| q[0] == 10 or
                 (q[0] == 172 and q[1] >= 16 and q[1] <= 31) or
                 (q[0] == 192 and q[1] == 168),
-            .v6 => false,
+            .v6 => |b| (b[0] & 0xfe) == 0xfc,
         };
     }
 
@@ -2747,12 +2748,13 @@ test "fuzz parseHostPort never panics" {
     try testing.fuzz({}, fuzzParseHostPort, .{});
 }
 
-test "Ip.isPrivate: RFC 1918 ranges and their boundaries" {
+test "Ip.isPrivate: RFC 1918 + RFC 4193 ranges and their boundaries" {
     const yes = [_][]const u8{
         "10.0.0.0",    "10.255.255.255",
         "172.16.0.0",  "172.31.255.255",
         "192.168.0.0", "192.168.255.255",
         "::ffff:10.0.0.1", // v4-mapped must not slip past
+        "fc00::", "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // RFC 4193, as Go
     };
     for (yes) |t| try std.testing.expect(parseIp(t).?.isPrivate());
 
@@ -2762,8 +2764,9 @@ test "Ip.isPrivate: RFC 1918 ranges and their boundaries" {
         "9.255.255.255",   "11.0.0.0",
         "172.15.255.255",  "172.32.0.0",
         "192.167.255.255", "192.169.0.0",
-        "8.8.8.8", "fc00::1", // unique-local is isUniqueLocal's job
-        "::1",     "fe80::1",
+        "8.8.8.8",         "fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        "fe00::",          "::1",
+        "fe80::1",
     };
     for (no) |t| try std.testing.expect(!parseIp(t).?.isPrivate());
 }

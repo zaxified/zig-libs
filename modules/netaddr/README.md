@@ -48,8 +48,8 @@ const text = netaddr.formatIp(ip, &buf);           // "2001:db8::1"
 const hp = netaddr.parseHostPort("[::1]:8080").?;  // .{ .host = "::1", .port = 8080 }
 
 // Address-space predicates (RFC 1918/4193/3927/…)
-_ = ip.isPrivate();          // 10/8, 172.16/12, 192.168/16 — v4-mapped unwrapped
-_ = ip.isUniqueLocal();      // fc00::/7, the v6 analogue
+_ = ip.isPrivate();          // 10/8, 172.16/12, 192.168/16, fc00::/7 (as Go) — v4-mapped unwrapped
+_ = ip.isUniqueLocal();      // fc00::/7 alone
 _ = ip.isLoopback();
 _ = ip.isLinkLocalUnicast();
 // Composing these into "safe to connect to" is policy, not addressing — see
@@ -113,5 +113,3 @@ _ = try set.removeFreePrefix(gpa, 24);                     // removeFreePrefix
   accumulating errors; `removeFreePrefix` only picks a prefix whose family can
   hold the requested length (netipx can pick a v4 one for `/64` and return an
   invalid prefix with ok = true) and returns null for a length past 128.
-- `Ip.isPrivate` covers only RFC 1918; Go's `IsPrivate` also counts
-  `fc00::/7`, which here is `isUniqueLocal`.

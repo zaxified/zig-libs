@@ -82,4 +82,7 @@ Provenance: original work of the zig-libs authors (MIT), clean-room from FIPS
 constants are derived in the source from their definitions (cube and square
 roots of primes) and checked against the standard's tables. No third-party
 source was ported or translated, so no `NOTICE` entry is required (root
-[`NOTICE`](../../NOTICE) §0).
+[`NOTICE`](../../NOTICE) §0). DATA: `tools/count.tsv` holds instruction counts
+per operation measured on this machine by our own tooling
+(`scripts/count-insns`, valgrind as the counter) — generated data, no
+third-party corpus.
