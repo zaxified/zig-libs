@@ -65,12 +65,16 @@ var crafted = []string{
 	`(?:(?:(?:a{0}){1000}){1000}){1000}`,
 	// Flag groups are transparent to a repetition; control characters escape themselves.
 	strings.Repeat("(?:", 260) + "a" + strings.Repeat(")", 260),
+	// Unicode simple case folding: orbits of two, three (Ǆ ǅ ǆ) and four (θ ϑ Θ ϴ), classes over
+	// runs, negation after folding, a class over all of Unicode, astral letters.
+	`(?i)é`, `(?i)É`, `(?i)[á-ž]+`, `(?i)[A-ZÁ-Ž]+`, `(?i)ǅ`, `(?i)θ`, `(?i)ϴ`, `(?i)ß`, `(?i)ẞ`, `(?i)µ`, `(?i)Ω`,
+	`(?i)[^é]`, `(?i)[^\x{0}-\x{60}]`, `(?i)[\x{0}-\x{10FFFF}]`, `(?i)[\x{100}-\x{17f}]+`, `(?i)[ⓐ-ⓩ]`, `(?i)𐐀`,
+	`(?i)straße`, `(?i)[^a-zà-ž]`, `(?i)\x{1c5}+`, `(?i)[θ-ϑ]`, `(?i:č)Č`, `č(?i)Č`,
 	`a(?i)*`, `a(?i)+b`, "\\\n", "\\\x01", "\\\x7f", `\x{+41}`, `\x{4_1}`, `\x+1`, `\x{000000041}`, `\x{0010FFFF}`, `\xG1`,
 }
 
-// The alphabet random patterns and inputs share. `É` is left out of inputs:
-// case folding beyond ASCII is a documented gap, pinned by the crafted cases.
-var inputRunes = []string{"a", "b", "c", "A", "B", "1", "2", " ", "\n", "é", "k", "s", "_", "-", "\xff"}
+// The alphabet random patterns and inputs share.
+var inputRunes = []string{"a", "b", "c", "A", "B", "1", "2", " ", "\n", "é", "É", "č", "Č", "ß", "ẞ", "k", "s", "_", "-", "\xff"}
 
 func randInput() string {
 	var b strings.Builder
@@ -80,7 +84,8 @@ func randInput() string {
 	return b.String()
 }
 
-var fixedInputs = []string{"", "a", "ab", "abc", "aab", "ba", "a\nb", "xyz", "A", "k", "K", "\u212a", "s", "S", "\u017f", "é", "É", "123", "a b", "aaa", "\xff"}
+var fixedInputs = []string{"", "a", "ab", "abc", "aab", "ba", "a\nb", "xyz", "A", "k", "K", "\u212a", "s", "S", "\u017f", "é", "É", "123", "a b", "aaa", "\xff",
+	"Ǆ", "ǅ", "ǆ", "θ", "ϑ", "Θ", "ϴ", "ß", "ẞ", "µ", "Μ", "μ", "Ω", "ω", "Ω", "ⓐ", "Ⓩ", "𐐨", "𐐀", "Čč", "STRASSE", "STRAẞE", "Ā", "ā"}
 
 var groupCount int
 
@@ -88,11 +93,11 @@ func randAtom(depth int) string {
 	r := rnd.IntN(100)
 	switch {
 	case r < 30:
-		return []string{"a", "b", "c", "A", "1", "é", "k", " ", "-", `\n`, `\.`}[rnd.IntN(11)]
+		return []string{"a", "b", "c", "A", "1", "é", "k", " ", "-", `\n`, `\.`, "Č", "ß"}[rnd.IntN(13)]
 	case r < 38:
 		return "."
 	case r < 52:
-		return []string{`[ab]`, `[^a]`, `[a-c]`, `[^a-c\n]`, `\d`, `\w`, `\s`, `\D`, `\W`, `[[:alpha:]]`, `[[:^digit:]]`, `[é1]`, `[a-]`}[rnd.IntN(13)]
+		return []string{`[ab]`, `[^a]`, `[a-c]`, `[^a-c\n]`, `\d`, `\w`, `\s`, `\D`, `\W`, `[[:alpha:]]`, `[[:^digit:]]`, `[é1]`, `[a-]`, `[á-ž]`, `[^É]`}[rnd.IntN(15)]
 	case r < 58:
 		return []string{`^`, `$`, `\b`, `\B`, `\A`, `\z`}[rnd.IntN(6)]
 	case r < 64 && depth < 3:

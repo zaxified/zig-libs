@@ -97,7 +97,8 @@ test "go oracle: crafted syntax cases and random patterns answer as Go regexp" {
     var t: Tally = .{};
     try replay(&v.crafted, &t);
     try replay(&v.random, &t);
-    std.debug.print("go oracle: {d} patterns, {d} cases ({d} matched), UNICODE_CLASS {d}, CAPACITY {d}, unexplained {d}\n", .{ t.patterns, t.cases, t.matched, t.unicode_class, t.capacity, t.bad });
+    // The tally only when a check fails: a passing step's stderr fails CI.
+    errdefer std.debug.print("go oracle: {d} patterns, {d} cases ({d} matched), UNICODE_CLASS {d}, CAPACITY {d}, unexplained {d}\n", .{ t.patterns, t.cases, t.matched, t.unicode_class, t.capacity, t.bad });
     try testing.expectEqual(@as(usize, 0), t.bad);
     try testing.expectEqual(@as(usize, 3), t.unicode_class);
     try testing.expectEqual(@as(usize, 4), t.capacity);

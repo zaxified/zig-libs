@@ -17,8 +17,9 @@
 //! submatch positions (`Matcher`) take scratch sized by the program, once.
 //!
 //! Input is UTF-8 and matched per code point; an invalid byte reads as
-//! U+FFFD, one byte wide (as Go). Not yet: Unicode property classes
-//! (`\pL`, `\p{Greek}`) and case folding beyond ASCII (SPEC Backlog).
+//! U+FFFD, one byte wide (as Go). `(?i)` folds by Unicode's simple case
+//! folding (`(?i)é` matches `É`). Not yet: Unicode property classes
+//! (`\pL`, `\p{Greek}`) (SPEC Backlog).
 
 const std = @import("std");
 const syntax = @import("syntax.zig");
@@ -63,18 +64,28 @@ pub const Regex = struct {
     names: []const []const u8,
     /// Set by `compile`: the slices above are owned (free with `deinit`).
     owned: bool = false,
+    /// What the search may skip, from `analyze` (the defaults skip nothing).
+    prefilter: Prefilter = .{},
 
     /// Compile at run time. The result owns its tables; `deinit` frees them.
+    /// A pattern that fits `small_capacity` compiles in ~9 KiB of stack
+    /// scratch; a larger one in a full `Builder` from `gpa`.
     pub fn compile(gpa: std.mem.Allocator, pattern: []const u8) (Error || std.mem.Allocator.Error)!Regex {
+        var small: syntax.BuilderOf(small_capacity) = undefined;
+        if (compileWith(gpa, &small, pattern)) |re| return re else |e| if (e != error.PatternTooLarge) return e;
         const b = try gpa.create(syntax.Builder);
         defer gpa.destroy(b);
-        return compileUsing(gpa, b, pattern);
+        return compileWith(gpa, b, pattern);
     }
 
-    /// `compile` with the caller's `Builder` (~70 KiB of compile scratch, any
+    /// `compile` with the caller's `Builder` (~80 KiB of compile scratch, any
     /// lifetime) — for compiling many patterns, or into an arena that should
     /// not hold the scratch.
     pub fn compileUsing(gpa: std.mem.Allocator, b: *Builder, pattern: []const u8) (Error || std.mem.Allocator.Error)!Regex {
+        return compileWith(gpa, b, pattern);
+    }
+
+    fn compileWith(gpa: std.mem.Allocator, b: anytype, pattern: []const u8) (Error || std.mem.Allocator.Error)!Regex {
         try b.compile(pattern);
         const insts = try gpa.dupe(Inst, b.insts[0..b.ninsts]);
         errdefer gpa.free(insts);
@@ -90,7 +101,7 @@ pub const Regex = struct {
             slot.* = try gpa.dupe(u8, n);
             done += 1;
         }
-        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true };
+        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = analyze(insts, ranges) };
     }
 
     pub fn deinit(re: *Regex, gpa: std.mem.Allocator) void {
@@ -138,20 +149,32 @@ pub const Regex = struct {
     /// `noinline`: its ~6 KiB of stack scratch is paid only while it runs,
     /// never by a caller's frame that inlined it.
     noinline fn runSet(re: *const Regex, input: []const u8, full: bool) bool {
-        var lists: [2]StateSet = .{ .{}, .{} };
+        // `undefined`, not `.{}`: a default-initialised StateSet is written
+        // whole (~2 KiB each) on every call — measured as 85 % of `isMatch`.
+        var lists: [2]StateSet = undefined;
+        const words = (re.insts.len + 63) / 64;
         var stack: [2 * max_insts]u16 = undefined;
         var cur: *StateSet = &lists[0];
         var nxt: *StateSet = &lists[1];
         var pos: usize = 0;
         var prev: ?u21 = null;
-        cur.clear();
+        cur.clear(words);
+        const pf = re.prefilter;
         while (true) {
+            if (!full and cur.n == 0) {
+                // No thread alive: a match can only start where the prefilter allows.
+                if (pf.anchored and pos != 0) return false;
+                if (pf.first != null) {
+                    pos = pf.next(input, pos) orelse return false;
+                    prev = runeBefore(input, pos);
+                }
+            }
             const here = decode(input, pos);
-            if (!full or pos == 0) re.closureSet(cur, 0, prev, here.cp, &stack);
+            if ((!full and (!pf.anchored or pos == 0)) or pos == 0) re.closureSet(cur, 0, prev, here.cp, &stack);
             // No thread left: anchored, nothing can start later; unanchored,
             // the next position starts a new one.
             if (cur.n == 0 and (full or here.cp == null)) return false;
-            nxt.clear();
+            nxt.clear(words);
             const after = if (here.cp != null) decode(input, pos + here.w) else here;
             for (cur.pcs[0..cur.n]) |pc| {
                 switch (re.insts[pc]) {
@@ -225,7 +248,7 @@ pub fn comptimeCompile(comptime pattern: []const u8) Regex {
         var names: [b.ngroups][]const u8 = undefined;
         for (&names, b.names[0..b.ngroups]) |*slot, n| slot.* = n;
         const final_names = names;
-        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names };
+        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = analyze(&insts, &ranges) };
     }
 }
 
@@ -237,15 +260,135 @@ pub fn validate(pattern: []const u8, scratch: *syntax.Builder) Error!void {
 pub const Builder = syntax.Builder;
 
 const StateSet = struct {
-    pcs: [max_insts]u16 = undefined,
-    n: u16 = 0,
-    seen: std.StaticBitSet(max_insts) = .initEmpty(),
+    pcs: [max_insts]u16,
+    n: u16,
+    seen: std.StaticBitSet(max_insts),
 
-    fn clear(s: *StateSet) void {
+    /// Empty the set; only the first `words` of `seen` (the program's
+    /// length) are ever looked at.
+    fn clear(s: *StateSet, words: usize) void {
         s.n = 0;
-        s.seen = .initEmpty();
+        @memset(s.seen.masks[0..words], 0);
     }
 };
+
+/// Table capacities `Regex.compile` tries first, on the stack: every pattern
+/// short of a large counted repetition or a big case-folded class fits.
+const small_capacity: syntax.Capacity = .{ .insts = 256, .ranges = 256, .nodes = 256 };
+
+/// Where a match can start, worked out from the program once at compile time
+/// so the search skips positions where no thread could begin. Only consulted
+/// while no thread is alive, so it never changes which match is found.
+pub const Prefilter = struct {
+    /// Every match starts at the start of the text (each path passes `\A`).
+    anchored: bool = false,
+    /// The first byte of every match is in this set (bit b of word b/64);
+    /// null when a match can be empty, or start with any byte.
+    first: ?[4]u64 = null,
+    /// The set's only member, when it has one.
+    single: ?u8 = null,
+
+    /// The first position at or after `pos` whose byte may start a match.
+    fn next(pf: Prefilter, input: []const u8, pos: usize) ?usize {
+        if (pf.single) |c| return std.mem.indexOfScalarPos(u8, input, pos, c);
+        const set = pf.first.?;
+        var i = pos;
+        while (i < input.len) : (i += 1) {
+            const c = input[i];
+            if (set[c >> 6] & (@as(u64, 1) << @truncate(c)) != 0) return i;
+        }
+        return null;
+    }
+};
+
+/// Work out `Prefilter` from a program: follow the empty transitions from the
+/// start. `anchored` when a `\A` stands before every consuming state and the
+/// match; `first` from the UTF-8 lead bytes of every class reachable there.
+/// Byte positions the set skips are never the start of a code point the VM
+/// would decode differently: a lead or ASCII byte always starts one, and a set
+/// that could need a continuation byte (U+FFFD, what an invalid byte reads
+/// as) is given up.
+fn analyze(insts: []const Inst, ranges: []const Range) Prefilter {
+    var pf: Prefilter = .{};
+    var seen: std.StaticBitSet(max_insts) = .initEmpty();
+    var stack: [2 * max_insts]u16 = undefined;
+    var set: [4]u64 = .{ 0, 0, 0, 0 };
+    var any_first = false; // a `.`, an empty match, or U+FFFD: no byte set
+    var unanchored = false; // a consuming state or the match before any `\A`
+    // Two walks: with `\A` as a wall (anchoring), and through it (first bytes).
+    for ([_]bool{ true, false }) |wall| {
+        seen = .initEmpty();
+        var sp: usize = 1;
+        stack[0] = 0;
+        while (sp != 0) {
+            sp -= 1;
+            const pc = stack[sp];
+            if (seen.isSet(pc)) continue;
+            seen.set(pc);
+            switch (insts[pc]) {
+                .jmp => |t| {
+                    stack[sp] = t;
+                    sp += 1;
+                },
+                .split => |sx| {
+                    stack[sp] = sx.y;
+                    stack[sp + 1] = sx.x;
+                    sp += 2;
+                },
+                .save => {
+                    stack[sp] = pc + 1;
+                    sp += 1;
+                },
+                .assert => |a| if (!(wall and a == .begin_text)) {
+                    stack[sp] = pc + 1;
+                    sp += 1;
+                },
+                .match, .any, .any_not_nl => if (wall) {
+                    unanchored = true;
+                } else {
+                    any_first = true;
+                },
+                .rune => |r| if (wall) {
+                    unanchored = true;
+                } else for (ranges[r.start..][0..r.len]) |rg| {
+                    if (rg.lo <= 0xfffd and 0xfffd <= rg.hi) any_first = true;
+                    addLeadBytes(&set, rg);
+                },
+            }
+        }
+    }
+    pf.anchored = !unanchored;
+    if (!any_first) {
+        pf.first = set;
+        var count: usize = 0;
+        for (set) |w| count += @popCount(w);
+        if (count == 1) {
+            for (set, 0..) |w, i| if (w != 0) {
+                pf.single = @intCast(i * 64 + @ctz(w));
+            };
+        }
+    }
+    return pf;
+}
+
+/// Add the first bytes of the UTF-8 encodings of `r` to `set`.
+fn addLeadBytes(set: *[4]u64, r: Range) void {
+    const Band = struct { lo: u21, hi: u21, shift: u5, tag: u8 };
+    const bands = [_]Band{
+        .{ .lo = 0, .hi = 0x7f, .shift = 0, .tag = 0 },
+        .{ .lo = 0x80, .hi = 0x7ff, .shift = 6, .tag = 0xc0 },
+        .{ .lo = 0x800, .hi = 0xffff, .shift = 12, .tag = 0xe0 },
+        .{ .lo = 0x10000, .hi = 0x10ffff, .shift = 18, .tag = 0xf0 },
+    };
+    for (bands) |band| {
+        const lo: u32 = @max(r.lo, band.lo);
+        const hi: u32 = @min(r.hi, band.hi);
+        if (lo > hi) continue;
+        var c: u32 = band.tag | (lo >> band.shift);
+        const last: u32 = band.tag | (hi >> band.shift);
+        while (c <= last) : (c += 1) set[c >> 6] |= @as(u64, 1) << @truncate(c);
+    }
+}
 
 // ── submatches ──────────────────────────────────────────────────────────────
 
@@ -259,6 +402,8 @@ pub const Matcher = struct {
     re: *const Regex,
     /// Capture slots per thread: two per group.
     k: usize,
+    /// The one allocation the slices below live in.
+    block: []usize,
     lists: [2]List,
     stack: []Entry,
     tmp: []usize,
@@ -283,48 +428,41 @@ pub const Matcher = struct {
 
     const Entry = union(enum) { explore: u16, restore: struct { slot: u16, val: usize } };
 
+    /// One allocation, carved into the tables below (measured: five
+    /// separate ones were most of a short pattern's per-call `Matcher` cost).
     pub fn init(gpa: std.mem.Allocator, re: *const Regex) std.mem.Allocator.Error!Matcher {
         const n = re.insts.len;
         const k = re.names.len * 2;
-        var m: Matcher = .{ .gpa = gpa, .re = re, .k = k, .lists = undefined, .stack = &.{}, .tmp = &.{}, .best = &.{} };
-        var made: usize = 0;
-        errdefer m.freeLists(made);
+        const words = 2 * (wordsFor(usize, n * k) + wordsFor(u16, n) + wordsFor(u32, n)) +
+            wordsFor(Entry, 3 * n) + 2 * wordsFor(usize, k);
+        const block = try gpa.alloc(usize, words);
+        var rest = block;
+        var m: Matcher = .{ .gpa = gpa, .re = re, .k = k, .block = block, .lists = undefined, .stack = undefined, .tmp = undefined, .best = undefined };
         for (&m.lists) |*l| {
-            l.* = .{ .pcs = &.{}, .caps = &.{}, .seen = &.{} };
-            l.pcs = try gpa.alloc(u16, n);
-            l.caps = gpa.alloc(usize, n * k) catch |e| {
-                gpa.free(l.pcs);
-                return e;
-            };
-            l.seen = gpa.alloc(u32, n) catch |e| {
-                gpa.free(l.pcs);
-                gpa.free(l.caps);
-                return e;
-            };
+            l.* = .{ .caps = take(usize, &rest, n * k), .pcs = take(u16, &rest, n), .seen = take(u32, &rest, n) };
             @memset(l.seen, 0);
-            made += 1;
         }
-        m.stack = try gpa.alloc(Entry, 3 * n);
-        errdefer gpa.free(m.stack);
-        m.tmp = try gpa.alloc(usize, k);
-        errdefer gpa.free(m.tmp);
-        m.best = try gpa.alloc(usize, k);
+        m.stack = take(Entry, &rest, 3 * n);
+        m.tmp = take(usize, &rest, k);
+        m.best = take(usize, &rest, k);
         return m;
     }
 
-    fn freeLists(m: *Matcher, made: usize) void {
-        for (m.lists[0..made]) |l| {
-            m.gpa.free(l.pcs);
-            m.gpa.free(l.caps);
-            m.gpa.free(l.seen);
-        }
+    fn wordsFor(comptime T: type, count: usize) usize {
+        return (count * @sizeOf(T) + @sizeOf(usize) - 1) / @sizeOf(usize);
+    }
+
+    /// The next `count` items of type `T` from the block (every `T` here is
+    /// aligned no stricter than `usize`).
+    fn take(comptime T: type, rest: *[]usize, count: usize) []T {
+        comptime std.debug.assert(@alignOf(T) <= @alignOf(usize));
+        const out: [*]T = @ptrCast(rest.*.ptr);
+        rest.* = rest.*[wordsFor(T, count)..];
+        return out[0..count];
     }
 
     pub fn deinit(m: *Matcher) void {
-        m.freeLists(2);
-        m.gpa.free(m.stack);
-        m.gpa.free(m.tmp);
-        m.gpa.free(m.best);
+        m.gpa.free(m.block);
         m.* = undefined;
     }
 
@@ -388,9 +526,18 @@ pub const Matcher = struct {
         var matched = false;
         var pos = from;
         var prev = runeBefore(input, from);
+        const pf = re.prefilter;
         while (true) {
+            if (!matched and cur.n == 0 and !full) {
+                // No thread alive: a match can only start where the prefilter allows.
+                if (pf.anchored and pos != from) break;
+                if (pf.first != null) {
+                    pos = pf.next(input, pos) orelse break;
+                    prev = runeBefore(input, pos);
+                }
+            }
             const here = decode(input, pos);
-            if (!matched) {
+            if (!matched and (!pf.anchored or pos == from)) {
                 @memset(m.tmp, nil);
                 m.addThread(cur, 0, pos, prev, here.cp);
             }
@@ -566,6 +713,22 @@ test "literals, classes, dot, anchors" {
     try expectFind("\\x41\\x{263a}", "A\u{263a}", "A\u{263a}");
 }
 
+test "(?i) folds by Unicode simple case folding" {
+    try expectFind("(?i)é", "xÉy", "É");
+    try expectFind("(?i)[á-ž]+", "xčÉŠx", "čÉŠ");
+    try expectFind("(?i)ǅ", "ǆ", "ǆ"); // an orbit of three: Ǆ ǅ ǆ
+    try expectFind("(?i)θ", "ϴ", "ϴ"); // an orbit of four: θ ϑ Θ ϴ
+    try expectFind("(?i)ß", "ẞ", "ẞ");
+    try expectFind("(?i)𐐀", "𐐨", "𐐨");
+    try expectFind("(?i)[^é]", "É", null); // folded before negated
+    try expectFind("é", "É", null);
+    // A class over all of Unicode folds run by run, also at comptime.
+    const all = comptime comptimeCompile("(?i)[^\\x{0}-\\x{40}]+");
+    try testing.expect(all.fullMatch("aÁ𐐀"));
+    const cz = comptime comptimeCompile("(?i)příliš žluťoučký");
+    try testing.expect(cz.fullMatch("PŘÍLIŠ ŽLUŤOUČKÝ"));
+}
+
 test "leftmost-first, greedy and lazy" {
     try expectFind("a|ab", "ab", "a");
     try expectFind("ab|a", "ab", "ab");
@@ -697,9 +860,53 @@ test "robustness: random patterns and inputs compile or refuse, and match, witho
             var n: usize = 0;
             while (it.next()) |_| n += 1;
             try testing.expect(n <= in.len + 1);
+            // The prefilter only skips: the same program without it agrees.
+            var bare = re;
+            bare.prefilter = .{};
+            var bm = try Matcher.init(testing.allocator, &bare);
+            defer bm.deinit();
+            try testing.expectEqual(any, bare.isMatch(in));
+            try testing.expectEqual(s, bm.find(in, 0));
+            for (0..in.len + 1) |from| try testing.expectEqual(bm.find(in, from), m.find(in, from));
         }
     }
     try testing.expect(compiled > 2_000); // the driver reaches the matcher
+}
+
+test "prefilter: anchoring and first bytes worked out from the program" {
+    const Case = struct { p: []const u8, anchored: bool, single: ?u8, first: bool };
+    const cases = [_]Case{
+        .{ .p = "^abc", .anchored = true, .single = 'a', .first = true },
+        .{ .p = "\\Aa|\\Ab", .anchored = true, .single = null, .first = true },
+        .{ .p = "^a|b", .anchored = false, .single = null, .first = true },
+        .{ .p = "(?m)^a", .anchored = false, .single = 'a', .first = true },
+        .{ .p = "#([0-9]+)", .anchored = false, .single = '#', .first = true },
+        .{ .p = "\\bfoo", .anchored = false, .single = 'f', .first = true },
+        .{ .p = "é", .anchored = false, .single = 0xc3, .first = true },
+        .{ .p = "a*", .anchored = false, .single = null, .first = false }, // can be empty
+        .{ .p = ".b", .anchored = false, .single = null, .first = false },
+        .{ .p = "[^a]", .anchored = false, .single = null, .first = false }, // holds U+FFFD
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("/{s}/\n", .{c.p});
+        var re = try Regex.compile(testing.allocator, c.p);
+        defer re.deinit(testing.allocator);
+        try testing.expectEqual(c.anchored, re.prefilter.anchored);
+        try testing.expectEqual(c.single, re.prefilter.single);
+        try testing.expectEqual(c.first, re.prefilter.first != null);
+    }
+    // An invalid byte before the candidate is skipped without desynchronising.
+    try expectFind("é", "\xc3\xc3\xa9", "é");
+    try expectFind("#([0-9]+)", "a#b#12", "#12");
+    try expectFind("^a", "ba", null);
+}
+
+test "compile: a pattern past the stack builder's capacity takes the full one" {
+    var re = try Regex.compile(testing.allocator, "a{600}");
+    defer re.deinit(testing.allocator);
+    try testing.expect(re.insts.len > small_capacity.insts);
+    try testing.expect(re.fullMatch("a" ** 600));
+    try testing.expectError(error.PatternTooLarge, Regex.compile(testing.allocator, "a{1000}b{1000}"));
 }
 
 test "deep nesting compiles (or is refused) on a 512 KiB thread stack" {

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-//! Re-takes regex's Go oracle and compares (`--check`) or rewrites (default)
-//! its committed vectors, which `test-regex` replays:
+//! Re-takes regex's Go-generated files and compares (`--check`) or rewrites
+//! (default) the committed ones, which `test-regex` uses:
 //!  - `tools/go_regexp_oracle`   Go `regexp`, black box → `src/go_vectors.zig`
+//!  - `tools/go_casefold`        Go `unicode.SimpleFold` → `src/casefold.zig`
 //! The check ignores the `// GENERATED … (Go version)` line: a runner with
 //! another Go patch release passes when every answer agrees.
 //!
@@ -16,7 +17,11 @@
 
 const std = @import("std");
 
-const oracle_dir = "modules/regex/tools/go_regexp_oracle";
+const Tool = struct { name: []const u8, dir: []const u8, file: []const u8 };
+const tools = [_]Tool{
+    .{ .name = "Go regexp oracle", .dir = "modules/regex/tools/go_regexp_oracle", .file = "../../src/go_vectors.zig" },
+    .{ .name = "Go case-folding table", .dir = "modules/regex/tools/go_casefold", .file = "../../src/casefold.zig" },
+};
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var da: std.heap.DebugAllocator(.{}) = .init;
@@ -46,28 +51,30 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try env.put("GOPROXY", "off");
     try env.put("GOFLAGS", "-mod=readonly");
 
-    std.debug.print("interop-regex: Go regexp ...\n", .{});
-    const argv: []const []const u8 = if (check)
-        &.{ "go", "run", ".", "-check", "../../src/go_vectors.zig" }
-    else
-        &.{ "go", "run", ".", "-out", "../../src/go_vectors.zig" };
-    var child = std.process.spawn(io, .{
-        .argv = argv,
-        .environ_map = &env,
-        .cwd = .{ .path = oracle_dir },
-        .stdin = .close,
-    }) catch |e| {
-        std.debug.print("interop-regex: could not spawn go ({t}) -- the oracle needs it\n", .{e});
-        return 1;
-    };
-    const ok = switch (try child.wait(io)) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-    if (!ok) {
-        std.debug.print("interop-regex: Go regexp oracle FAILED\n", .{});
-        return 1;
+    for (tools) |t| {
+        std.debug.print("interop-regex: {s} ...\n", .{t.name});
+        const argv: []const []const u8 = if (check)
+            &.{ "go", "run", ".", "-check", t.file }
+        else
+            &.{ "go", "run", ".", "-out", t.file };
+        var child = std.process.spawn(io, .{
+            .argv = argv,
+            .environ_map = &env,
+            .cwd = .{ .path = t.dir },
+            .stdin = .close,
+        }) catch |e| {
+            std.debug.print("interop-regex: could not spawn go ({t}) -- the oracle needs it\n", .{e});
+            return 1;
+        };
+        const ok = switch (try child.wait(io)) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (!ok) {
+            std.debug.print("interop-regex: {s} FAILED\n", .{t.name});
+            return 1;
+        }
+        std.debug.print("interop-regex: {s} {s}\n", .{ t.name, if (check) "fresh" else "re-taken" });
     }
-    std.debug.print("interop-regex: Go regexp oracle {s}\n", .{if (check) "fresh" else "re-taken"});
     return 0;
 }

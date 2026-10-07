@@ -33,9 +33,11 @@ documentation and API metadata were read — no foreign source.
 path AND comptime-compilable AND has captures; a `Regex` immutable and shareable, scratch held by
 the caller (`Matcher`), so captures never die at the next search; typed compile-time limits
 instead of a runtime blow-up; anchored on the reference by a differential oracle (none of the Zig
-libraries documents one). **Where we are behind:** Unicode property classes and full Unicode case
-folding; `ReplaceAll`/`Expand`/`Split`/`QuoteMeta`; leftmost-longest; speed — a plain Pike VM, no
-DFA, no literal prefilter (→ Backlog).
+libraries documents one); a compile cheap enough to run per call (stack scratch, ~0.2–0.5 µs for
+a short pattern). **Where we are behind:** Unicode property classes; `ReplaceAll`/`Expand`/`Split`/
+`QuoteMeta`; leftmost-longest; speed on dense matches — a Pike VM with an anchoring and first-byte
+prefilter, but no DFA and no literal-string prefilter (→ Backlog). Unicode tables are 15.0 (Go
+1.26's); quangdn42/regex.zig carries 17.0.
 
 ## What this module is, and what it is not
 
@@ -52,8 +54,23 @@ backtracking. It is not (yet) a fast regex engine — see Backlog.
   capacity is an error, never a truncated program.
 - **Classes are sorted, merged code-point ranges**, matched by binary search. `(?i)` folds each
   class member *before* its own negation and the class's `^` after that (Go's order:
-  `(?i)\W` excludes U+017F and U+212A, which fold into `\w`). Folding is ASCII plus the two
-  non-ASCII code points that fold to ASCII letters (K ↔ U+212A, S ↔ U+017F).
+  `(?i)\W` excludes U+017F and U+212A, which fold into `\w`).
+- **Case folding is Unicode's simple folding as orbits** (`casefold.zig`, generated from Go's
+  `unicode.SimpleFold`): 366 runs, each mapping a code point to its orbit successor by a constant
+  delta or as alternating upper/lower pairs. A class folds run by run — the successors of a range
+  are ranges — taken `max_orbit - 1` (3) times, so even `(?i)[\x{0}-\x{10FFFF}]` costs a few
+  hundred ranges and compiles at comptime; a literal walks its orbit directly.
+- **Two builders.** `Regex.compile` first tries `syntax.BuilderOf(small_capacity)` on the stack (~9 KiB)
+  and falls back to the full `Builder` from the allocator only on `error.PatternTooLarge`; the
+  same parse runs in both, so the verdict is the full builder's. Never `b.* = .{}` on a builder or
+  a VM state set: a default-initialised table is written whole (measured: 85 % of `isMatch` and
+  most of a short compile before 2026-10-07's fix).
+- **Prefilter** (`analyze`, once per program): `anchored` when every path from the start passes
+  `\A` before consuming or matching; `first` = the UTF-8 lead bytes of every class reachable
+  without consuming (none when the match can be empty, a `.` is reachable, or a class holds U+FFFD
+  — an invalid byte reads as U+FFFD and could start mid-sequence). Consulted only while no thread
+  is alive, so it changes where the search looks, never which match it finds; a skip lands on an
+  ASCII or lead byte, which always begins a code point the VM would decode.
 - **`x*` over an `x` that can match empty compiles as `(x+)?`**, so one empty pass through `x`
   counts and its groups take part — Go's answer for `(a*)*` on `""` (group 1 = `[0,0]`).
 - **The VM.** Thread lists in priority order; a match cuts the lower-priority threads of its step
@@ -123,10 +140,10 @@ swapped split priority, both killed by the Go oracle.
 ## Backlog / deferred
 
 - **Unicode property classes `\pN`, `\p{Greek}`, `\PL`** *(survey 2026-10-07)* — Go users write `\p{L}` for "a letter"; needs the Unicode category and script tables (a generated, size-conscious table; comptime-selectable). Today `error.UnsupportedUnicodeClass`. Fits §2.
-- **Full Unicode simple case folding for `(?i)`** *(survey 2026-10-07)* — `(?i)é` should match `É`; needs the CaseFolding table. Fits §2.
 - **`ReplaceAll` / `Expand` (`$1`, `${name}`), `Split`, `QuoteMeta`** *(survey 2026-10-07)* — Go API users reach for them; small, on top of `Matcher`. Fits §2.
 - **Leftmost-longest (`CompilePOSIX`, `Longest()`)** *(survey 2026-10-07)*. Fits §2.
-- **Speed: literal prefilter, one-pass and bit-state engines, a lazy DFA with a caller-owned cache** *(survey 2026-10-07)* — a plain Pike VM is several times slower than RE2/Rust. Fits §2 with caller-owned scratch.
+- **Speed: a literal-string prefilter (`INV-`, `id=` — today only the first byte), an ASCII bitmap per class instead of the binary search, one-pass and bit-state engines, a lazy DFA with a caller-owned cache** *(survey 2026-10-07; anchoring + first-byte prefilter done 2026-10-07)* — dense matches (`[A-Z]+`) run at 50–60 MB/s. Fits §2 with caller-owned scratch.
+- **Head-to-head with quangdn42/regex.zig, bxp's engine today** *(2026-10-07)* — the target is comparable speed on bxp's workload before bxp switches; the benchmark (both engines through their public APIs) needs the user's consent to run the foreign code, not given yet.
 - **`RegexSet`, a `std.Io.Reader` front end** *(survey 2026-10-07)* — rarer asks.
 - **Sibling modules that can now adopt it** *(2026-10-07)* — `validate` (`Pattern.matcher` takes a caller-supplied matcher today; a `regex` default), `jsonshape` (RFC 9535 `match()`/`search()` need I-Regexp, an RE2 subset), `tsdb` (regex label matchers), `probe` (`expect` regex). Each is that module's own backlog item; listed here so the dependency is visible.
 
