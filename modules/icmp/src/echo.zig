@@ -1074,10 +1074,7 @@ fn checkPacket(packet: []const u8) !void {
 }
 
 test "fuzz driver: ICMP_FUZZ" {
-    fuzz_driver.run(parsersHarness, .{ .prefix = "ICMP_FUZZ", .name = "icmp" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(parsersHarness, .{ .prefix = "ICMP_FUZZ", .name = "icmp" });
 }
 
 test "fuzz harness: 500 seeds in every test run, and it gets everywhere" {

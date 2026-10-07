@@ -295,10 +295,11 @@ test "fuzz driver: POSEIDON_FUZZ" {
         .{ driverFraming, "poseidon-bn254-framing" },
         .{ driverInjectiveBls, "poseidon-bls12-381-injective" },
     }) |h| {
-        fuzz_driver.run(h[0], .{ .prefix = "POSEIDON_FUZZ", .name = h[1] }) catch |e| switch (e) {
+        fuzz_driver.run(h[0], .{ .prefix = "POSEIDON_FUZZ", .name = h[1] }) catch |e| {
             // Not asked for (no budget, or `_ONLY` names another target).
-            error.SkipZigTest => skipped += 1,
-            else => return e,
+            // An `if`, not a `switch`: on a target where SkipZigTest is the only
+            // error left, a switch's `else` prong is a compile error.
+            if (e == error.SkipZigTest) skipped += 1 else return e;
         };
     }
     if (skipped == 3) return error.SkipZigTest;

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the test-only `ScriptSource` (the fuzz harness's cursor source) drops `pub` from its two methods; it was never reachable from outside, and the textual consumer-example trigger (CONVENTIONS.md §7.2) counted them as state methods.
 - **2026-10-07** — Performance, not breaking: the x86-64 `crc32q` chains stay
   64-bit (no narrowing and widening around every instruction): against Go
   `hash/crc32` Castagnoli (new `tools/bench.zig`, `zig build bench-crc32c`)

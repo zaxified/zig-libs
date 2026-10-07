@@ -792,11 +792,11 @@ const ScriptSource = struct {
     data: []const u8,
     cur: testkit.fuzz.Cursor,
 
-    pub fn slice(self: *ScriptSource, buf: []u8) u32 {
+    fn slice(self: *ScriptSource, buf: []u8) u32 {
         @memcpy(buf[0..self.data.len], self.data);
         return @intCast(self.data.len);
     }
-    pub fn valueRangeAtMost(self: *ScriptSource, comptime T: type, at_least: T, at_most: T) T {
+    fn valueRangeAtMost(self: *ScriptSource, comptime T: type, at_least: T, at_most: T) T {
         // Four octets, so a cut can land anywhere in a 49 984-octet message.
         const w: u32 = (@as(u32, self.cur.word()) << 16) | self.cur.word();
         const span: u64 = @as(u64, at_most - at_least) + 1;
@@ -805,10 +805,7 @@ const ScriptSource = struct {
 };
 
 test "fuzz driver: CRC32_FUZZ" {
-    fuzz_driver.run(fuzzHarness, .{ .prefix = "CRC32_FUZZ", .name = "crc32" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(fuzzHarness, .{ .prefix = "CRC32_FUZZ", .name = "crc32" });
 }
 
 test "fuzz harness: 500 seeds in every test run, and it gets everywhere" {

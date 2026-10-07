@@ -405,10 +405,7 @@ test "fuzz: compile and match never trap, and the entry points agree" {
 }
 
 test "fuzz driver: REGEX_FUZZ" {
-    fuzz_driver.run(harness, .{ .prefix = "REGEX_FUZZ", .name = "regex" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(harness, .{ .prefix = "REGEX_FUZZ", .name = "regex" });
 }
 
 test "fuzz harness: 500 seeds in every test run, and it gets everywhere" {

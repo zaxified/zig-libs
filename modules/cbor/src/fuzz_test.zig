@@ -320,10 +320,7 @@ fn checkInput(gpa: std.mem.Allocator, input: []const u8, max_depth: u32, plain_i
 }
 
 test "fuzz driver: CBOR_FUZZ" {
-    fuzz_driver.run(harness, .{ .prefix = "CBOR_FUZZ", .name = "cbor" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(harness, .{ .prefix = "CBOR_FUZZ", .name = "cbor" });
 }
 
 test "fuzz harness: 300 seeds in every test run, and it gets everywhere" {

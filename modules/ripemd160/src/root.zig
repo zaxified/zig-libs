@@ -632,10 +632,7 @@ fn streamHarness(comptime Src: type, src: *Src, gpa: std.mem.Allocator) anyerror
 }
 
 test "fuzz driver: RIPEMD160_FUZZ" {
-    fuzz_driver.run(streamHarness, .{ .prefix = "RIPEMD160_FUZZ", .name = "ripemd160" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(streamHarness, .{ .prefix = "RIPEMD160_FUZZ", .name = "ripemd160" });
 }
 
 test "fuzz harness: 500 seeds in every test run, and it gets everywhere" {

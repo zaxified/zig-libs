@@ -579,10 +579,11 @@ test "fuzz driver: ZSTD_FUZZ" {
         .{ DecodeStream, "zstd-decode-stream", 1 },
         .{ SeekableT, "zstd-seekable", 1 },
     }) |t| {
-        fuzz_driver.run(t[0].harness, .{ .prefix = "ZSTD_FUZZ", .name = t[1], .default_limit_ms = 20_000, .scale = t[2] }) catch |e| switch (e) {
+        fuzz_driver.run(t[0].harness, .{ .prefix = "ZSTD_FUZZ", .name = t[1], .default_limit_ms = 20_000, .scale = t[2] }) catch |e| {
             // Not asked for (no budget, or `_ONLY` names another target).
-            error.SkipZigTest => skipped += 1,
-            else => return e,
+            // An `if`, not a `switch`: on a target where SkipZigTest is the only
+            // error left, a switch's `else` prong is a compile error.
+            if (e == error.SkipZigTest) skipped += 1 else return e;
         };
     }
     if (skipped == 6) return error.SkipZigTest;

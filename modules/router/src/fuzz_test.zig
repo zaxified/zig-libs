@@ -363,10 +363,7 @@ test "fuzz: route tables and requests never trap, captures rebuild the path" {
 }
 
 test "fuzz driver: ROUTER_FUZZ" {
-    fuzz_driver.run(harness, .{ .prefix = "ROUTER_FUZZ", .name = "router" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(harness, .{ .prefix = "ROUTER_FUZZ", .name = "router" });
 }
 
 test "fuzz harness: 400 seeds in every test run, and it gets everywhere" {

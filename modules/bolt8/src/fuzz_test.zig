@@ -72,10 +72,7 @@ pub const ScriptSource = struct {
 };
 
 fn driven(comptime harness: anytype, comptime name: []const u8) !void {
-    fuzz_driver.run(harness, .{ .prefix = "BOLT8_FUZZ", .name = "bolt8-" ++ name }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(harness, .{ .prefix = "BOLT8_FUZZ", .name = "bolt8-" ++ name });
 }
 
 test "fuzz driver: BOLT8_FUZZ (act1)" {

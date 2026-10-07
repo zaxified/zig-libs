@@ -172,10 +172,7 @@ test "fuzz: text parsers never trap, and what parses round-trips" {
 }
 
 test "fuzz driver: NETADDR_FUZZ" {
-    fuzz_driver.run(harness, .{ .prefix = "NETADDR_FUZZ", .name = "netaddr" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(harness, .{ .prefix = "NETADDR_FUZZ", .name = "netaddr" });
 }
 
 test "fuzz harness: 500 seeds in every test run, and it gets everywhere" {

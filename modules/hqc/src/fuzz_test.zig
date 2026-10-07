@@ -58,10 +58,7 @@ pub const ScriptSource = struct {
 };
 
 test "fuzz driver: HQC_FUZZ (hqc)" {
-    fuzz_driver.run(kat.decapsHarness, .{ .prefix = "HQC_FUZZ", .name = "hqc" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(kat.decapsHarness, .{ .prefix = "HQC_FUZZ", .name = "hqc" });
 }
 
 test "fuzz harness: 60 seeds in every test run, and they get everywhere" {

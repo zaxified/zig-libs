@@ -58,17 +58,11 @@ pub const ScriptSource = struct {
 };
 
 test "fuzz driver: SEALEDBOX_FUZZ (sealedbox_open)" {
-    fuzz_driver.run(kat.openHarness, .{ .prefix = "SEALEDBOX_FUZZ", .name = "sealedbox_open" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(kat.openHarness, .{ .prefix = "SEALEDBOX_FUZZ", .name = "sealedbox_open" });
 }
 
 test "fuzz driver: SEALEDBOX_FUZZ (sealedbox_seal)" {
-    fuzz_driver.run(kat.sealHarness, .{ .prefix = "SEALEDBOX_FUZZ", .name = "sealedbox_seal" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(kat.sealHarness, .{ .prefix = "SEALEDBOX_FUZZ", .name = "sealedbox_seal" });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {

@@ -58,17 +58,11 @@ pub const ScriptSource = struct {
 };
 
 test "fuzz driver: ED448_FUZZ (ed448_point)" {
-    fuzz_driver.run(ed.pointHarness, .{ .prefix = "ED448_FUZZ", .name = "ed448_point" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(ed.pointHarness, .{ .prefix = "ED448_FUZZ", .name = "ed448_point" });
 }
 
 test "fuzz driver: ED448_FUZZ (ed448_signature)" {
-    fuzz_driver.run(ed.signatureHarness, .{ .prefix = "ED448_FUZZ", .name = "ed448_signature" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(ed.signatureHarness, .{ .prefix = "ED448_FUZZ", .name = "ed448_signature" });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {

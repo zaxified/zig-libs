@@ -230,10 +230,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
 }
 
 test "fuzz driver: XML_FUZZ" {
-    fuzz_driver.run(harness, .{ .prefix = "XML_FUZZ", .name = "xml" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(harness, .{ .prefix = "XML_FUZZ", .name = "xml" });
 }
 
 test "fuzz harness: 300 seeds in every test run" {

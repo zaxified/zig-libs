@@ -58,10 +58,7 @@ pub const ScriptSource = struct {
 };
 
 test "fuzz driver: BIP340_FUZZ (bip340)" {
-    fuzz_driver.run(kat.verifyHarness, .{ .prefix = "BIP340_FUZZ", .name = "bip340" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(kat.verifyHarness, .{ .prefix = "BIP340_FUZZ", .name = "bip340" });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {

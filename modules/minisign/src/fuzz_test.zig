@@ -58,24 +58,15 @@ pub const ScriptSource = struct {
 };
 
 test "fuzz driver: MINISIGN_FUZZ (minisign_sigfile)" {
-    fuzz_driver.run(ms.sigFileHarness, .{ .prefix = "MINISIGN_FUZZ", .name = "minisign_sigfile" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(ms.sigFileHarness, .{ .prefix = "MINISIGN_FUZZ", .name = "minisign_sigfile" });
 }
 
 test "fuzz driver: MINISIGN_FUZZ (minisign_keyfile)" {
-    fuzz_driver.run(ms.secretKeyFileHarness, .{ .prefix = "MINISIGN_FUZZ", .name = "minisign_keyfile" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(ms.secretKeyFileHarness, .{ .prefix = "MINISIGN_FUZZ", .name = "minisign_keyfile" });
 }
 
 test "fuzz driver: MINISIGN_FUZZ (minisign_comment)" {
-    fuzz_driver.run(ms.commentHarness, .{ .prefix = "MINISIGN_FUZZ", .name = "minisign_comment" }) catch |e| switch (e) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return e,
-    };
+    try fuzz_driver.run(ms.commentHarness, .{ .prefix = "MINISIGN_FUZZ", .name = "minisign_comment" });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
