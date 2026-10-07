@@ -1000,6 +1000,26 @@ fn findUnicodeName(name: []const u8) ?unicode_tables.Name {
     return null;
 }
 
+/// Whether `cp` is in the Unicode class of loose name `key` (one of
+/// `unicode_tables.names`) — a walk over its stored ranges.
+pub fn unicodeClassContains(comptime key: []const u8, cp: u21) bool {
+    const entry = comptime findUnicodeName(key).?;
+    for (entry.parts) |part| {
+        const t = unicode_tables.bases[part];
+        const bytes = unicode_tables.data[t.offset..][0..t.size];
+        var i: usize = 0;
+        var next: u32 = 0;
+        for (0..t.count) |_| {
+            const lo = next + readVarint(bytes, &i);
+            const hi = lo + readVarint(bytes, &i);
+            if (cp < lo) break;
+            if (cp <= hi) return true;
+            next = hi + 1;
+        }
+    }
+    return false;
+}
+
 /// One LEB128 varint at `bytes[i.*..]` (the generator writes at most three bytes).
 fn readVarint(bytes: []const u8, i: *usize) u32 {
     var v: u32 = 0;

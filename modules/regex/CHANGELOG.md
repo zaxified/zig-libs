@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Go's API on top of a search: `Regex.expand` (`$1`, `${name}`, `$$`),
+  `Matcher.replaceAll` / `replaceAllLiteral` / `replaceAllFunc` (to a `std.Io.Writer`) and
+  `Regex.replaceAll` / `replaceAllLiteral` (allocating), `Matcher.split` (`SplitIterator`) and
+  `Regex.split`, `quoteMeta` / `quoteMetaAlloc`, `Regex.literalPrefix`, `Regex.source` (Go's
+  `String()`), `Iterator.nextCaptures` (FindAllSubmatchIndex), `matches` (MatchString). All
+  against Go's answers. New public declarations only; nothing breaks.
 - **2026-10-07** — Leftmost-longest matching (Go's `Longest()`): `Regex.longest`, or
   `Options.longest`. POSIX ERE syntax (Go's `CompilePOSIX`): `Regex.compilePosix`,
   `compileOptions(.., .{ .syntax = .posix })`, `comptimeCompileOptions`,

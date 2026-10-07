@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const syntax = @import("syntax.zig");
+const replace = @import("replace.zig");
 
 pub const meta = .{
     .doc = "RE2-syntax regular expressions — Pike VM, linear time, comptime compile, alloc-free match",
@@ -84,6 +85,8 @@ pub const Regex = struct {
     /// Leftmost-longest matching (Go's `Longest()`; see `Options.longest`).
     /// May be set after compiling, before the `Regex` is shared.
     longest: bool = false,
+    /// The pattern it was compiled from (Go's `String()`); owned like the tables.
+    source: []const u8 = "",
 
     /// Compile at run time. The result owns its tables; `deinit` frees them.
     /// A pattern that fits `small_capacity` compiles in ~9 KiB of stack
@@ -135,7 +138,8 @@ pub const Regex = struct {
             slot.* = try gpa.dupe(u8, n);
             done += 1;
         }
-        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = analyze(insts, ranges), .longest = opts.isLongest() };
+        const source = try gpa.dupe(u8, pattern);
+        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = analyze(insts, ranges), .longest = opts.isLongest(), .source = source };
     }
 
     pub fn deinit(re: *Regex, gpa: std.mem.Allocator) void {
@@ -144,6 +148,7 @@ pub const Regex = struct {
             gpa.free(re.ranges);
             for (re.names) |n| gpa.free(n);
             gpa.free(re.names);
+            gpa.free(re.source);
         }
         re.* = undefined;
     }
@@ -170,6 +175,51 @@ pub const Regex = struct {
     /// Any way through the pattern counts, not only the leftmost-first one.
     pub fn fullMatch(re: *const Regex, input: []const u8) bool {
         return re.runSet(input, true);
+    }
+
+    /// Go's `Expand`: `template` with `$1`, `${name}`, `$$` replaced from a
+    /// match's `groups` (as `Matcher.captures` fills them) in `input`.
+    pub fn expand(re: *const Regex, w: *std.Io.Writer, template: []const u8, input: []const u8, groups: []const ?Span) std.Io.Writer.Error!void {
+        return replace.expand(re, w, template, input, groups);
+    }
+
+    /// Go's `LiteralPrefix`: writes the literal text every match begins with;
+    /// true when that text is the whole pattern.
+    pub fn literalPrefix(re: *const Regex, w: *std.Io.Writer) std.Io.Writer.Error!bool {
+        return replace.literalPrefix(re, w);
+    }
+
+    /// Go's `ReplaceAllString`, into a new allocation (see
+    /// `Matcher.replaceAll`). Allocates the VM scratch for this one call.
+    pub fn replaceAll(re: *const Regex, gpa: std.mem.Allocator, input: []const u8, template: []const u8) std.mem.Allocator.Error![]u8 {
+        var m = try Matcher.init(gpa, re);
+        defer m.deinit();
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        m.replaceAll(&out.writer, input, template) catch return error.OutOfMemory;
+        return out.toOwnedSlice();
+    }
+
+    /// Go's `ReplaceAllLiteralString`, into a new allocation.
+    pub fn replaceAllLiteral(re: *const Regex, gpa: std.mem.Allocator, input: []const u8, replacement: []const u8) std.mem.Allocator.Error![]u8 {
+        var m = try Matcher.init(gpa, re);
+        defer m.deinit();
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        m.replaceAllLiteral(&out.writer, input, replacement) catch return error.OutOfMemory;
+        return out.toOwnedSlice();
+    }
+
+    /// Go's `Split`: the pieces between matches, as slices of `input` in a new
+    /// allocation (see `SplitIterator` for `limit`).
+    pub fn split(re: *const Regex, gpa: std.mem.Allocator, input: []const u8, limit: ?usize) std.mem.Allocator.Error![][]const u8 {
+        var m = try Matcher.init(gpa, re);
+        defer m.deinit();
+        var pieces: std.ArrayList([]const u8) = .empty;
+        errdefer pieces.deinit(gpa);
+        var it = m.split(input, limit);
+        while (it.next()) |p| try pieces.append(gpa, p);
+        return pieces.toOwnedSlice(gpa);
     }
 
     /// Leftmost-first match, or null. Allocates the VM scratch for this one
@@ -287,7 +337,7 @@ pub fn comptimeCompileOptions(comptime pattern: []const u8, comptime opts: Optio
         var names: [b.ngroups][]const u8 = undefined;
         for (&names, b.names[0..b.ngroups]) |*slot, n| slot.* = n;
         const final_names = names;
-        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = analyze(&insts, &ranges), .longest = opts.isLongest() };
+        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = analyze(&insts, &ranges), .longest = opts.isLongest(), .source = pattern };
     }
 }
 
@@ -302,6 +352,26 @@ pub fn validateSyntax(pattern: []const u8, syntax_: Syntax, scratch: *syntax.Bui
 }
 
 pub const Builder = syntax.Builder;
+pub const SplitIterator = replace.SplitIterator;
+
+/// Go's `QuoteMeta`: `text` with `\.+*?()|[]{}^$` escaped — a pattern
+/// matching exactly `text`.
+pub const quoteMeta = replace.quoteMeta;
+
+/// `quoteMeta` into a new allocation.
+pub fn quoteMetaAlloc(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    replace.quoteMeta(&out.writer, text) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+/// Go's `MatchString`: compile `pattern` and look for it in `input` once.
+pub fn matches(gpa: std.mem.Allocator, pattern: []const u8, input: []const u8) (Error || std.mem.Allocator.Error)!bool {
+    var re = try Regex.compile(gpa, pattern);
+    defer re.deinit(gpa);
+    return re.isMatch(input);
+}
 
 const StateSet = struct {
     pcs: [max_insts]u16,
@@ -536,6 +606,22 @@ pub const Matcher = struct {
         return .{ .m = m, .input = input };
     }
 
+    /// Go's `ReplaceAllString`: `input` with every match replaced by
+    /// `template` expanded for it (`Regex.expand`), written to `w`.
+    pub const replaceAll = replace.replaceAll;
+    /// Go's `ReplaceAllLiteralString`: every match replaced by `replacement`
+    /// as it is.
+    pub const replaceAllLiteral = replace.replaceAllLiteral;
+    /// Go's `ReplaceAllStringFunc`: every match replaced by what
+    /// `f(context, w, match)` writes.
+    pub const replaceAllFunc = replace.replaceAllFunc;
+
+    /// Go's `Split`: the pieces of `input` between matches; at most `limit`
+    /// of them, the last the unsplit rest (null: all; 0: none).
+    pub fn split(m: *Matcher, input: []const u8, limit: ?usize) SplitIterator {
+        return .init(m, input, limit);
+    }
+
     pub const Iterator = struct {
         m: *Matcher,
         input: []const u8,
@@ -543,11 +629,23 @@ pub const Matcher = struct {
         prev_end: ?usize = null,
 
         pub fn next(it: *Iterator) ?Span {
+            return it.advance(null);
+        }
+
+        /// `next` that also fills `out` as `Matcher.captures` does (Go's
+        /// `FindAllSubmatchIndex`).
+        pub fn nextCaptures(it: *Iterator, out: []?Span) ?Span {
+            return it.advance(out);
+        }
+
+        fn advance(it: *Iterator, out: ?[]?Span) ?Span {
             while (it.pos <= it.input.len) {
-                const s = it.m.find(it.input, it.pos) orelse {
+                const found = if (out) |o| it.m.captures(it.input, it.pos, o) else it.m.find(it.input, it.pos) != null;
+                if (!found) {
                     it.pos = it.input.len + 1;
                     return null;
-                };
+                }
+                const s: Span = .{ .start = it.m.best[0], .end = it.m.best[1] };
                 var accept = true;
                 if (s.start == s.end) {
                     if (it.prev_end != null and s.start == it.prev_end.?) accept = false;
@@ -850,6 +948,67 @@ test "leftmost-longest (Go's Longest) and POSIX ERE syntax (Go's CompilePOSIX)" 
     try testing.expectEqualStrings("bc", (try px.find(testing.allocator, "a\nbc\nd")).?.slice("a\nbc\nd"));
     const cpx = comptime comptimeCompileOptions("a**|b{2}{2}", .{ .syntax = .posix });
     try testing.expect(cpx.fullMatch("bbbb"));
+}
+
+test "replace, expand, split, quoteMeta, literalPrefix, source (Go's API on top of a search)" {
+    const gpa = testing.allocator;
+    var re = try Regex.compile(gpa, "(?P<y>\\d{4})-(\\d{2})");
+    defer re.deinit(gpa);
+    try testing.expectEqualStrings("(?P<y>\\d{4})-(\\d{2})", re.source);
+    const swapped = try re.replaceAll(gpa, "from 2026-10 to 2027-01.", "$2/${y} ($$)");
+    defer gpa.free(swapped);
+    try testing.expectEqualStrings("from 10/2026 ($) to 01/2027 ($).", swapped);
+    // `$2x` names group "2x" (none): nothing; `$01` is not a group number.
+    const odd = try re.replaceAll(gpa, "2026-10", "[$2x|${2}x|$01|$]");
+    defer gpa.free(odd);
+    try testing.expectEqualStrings("[|10x||$]", odd);
+    const lit = try re.replaceAllLiteral(gpa, "2026-10!", "$1");
+    defer gpa.free(lit);
+    try testing.expectEqualStrings("$1!", lit);
+
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.replaceAllFunc(&out.writer, "a 2026-10 b", @as(usize, 7), struct {
+        fn f(n: usize, w: *std.Io.Writer, match: []const u8) std.Io.Writer.Error!void {
+            try w.print("<{d}:{d}>", .{ n, match.len });
+        }
+    }.f);
+    try testing.expectEqualStrings("a <7:7> b", out.written());
+
+    var star = try Regex.compile(gpa, "a*");
+    defer star.deinit(gpa);
+    const pieces = try star.split(gpa, "abaabaccadaaae", 5);
+    defer gpa.free(pieces);
+    const want = [_][]const u8{ "", "b", "b", "c", "cadaaae" }; // Go's doc example
+    try testing.expectEqual(want.len, pieces.len);
+    for (want, pieces) |w, p| try testing.expectEqualStrings(w, p);
+    const none = try star.split(gpa, "abc", 0);
+    defer gpa.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    const q = try quoteMetaAlloc(gpa, "1.5*[x]");
+    defer gpa.free(q);
+    try testing.expectEqualStrings("1\\.5\\*\\[x\\]", q);
+    try testing.expect(try matches(gpa, q, "is 1.5*[x]"));
+
+    out.clearRetainingCapacity();
+    try testing.expect(!try re.literalPrefix(&out.writer));
+    try testing.expectEqualStrings("", out.written());
+    var lp = try Regex.compile(gpa, "foo(bar)");
+    defer lp.deinit(gpa);
+    out.clearRetainingCapacity();
+    try testing.expect(try lp.literalPrefix(&out.writer));
+    try testing.expectEqualStrings("foobar", out.written());
+
+    // All matches with their groups (Go's FindAllSubmatchIndex).
+    var it = m.iterator("2026-10 2027-01");
+    var groups: [3]?Span = undefined;
+    var years: usize = 0;
+    while (it.nextCaptures(&groups)) |_| years += 1;
+    try testing.expectEqual(@as(usize, 2), years);
+    try testing.expectEqual(Span{ .start = 8, .end = 12 }, groups[1].?);
 }
 
 test "captures and names" {

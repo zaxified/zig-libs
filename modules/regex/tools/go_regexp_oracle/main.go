@@ -326,6 +326,29 @@ func emitPattern(b *bytes.Buffer, pat string, inputs []string) {
 	emitPatternIn(b, pat, inputs, false)
 }
 
+// The API on top of a search (Expand via ReplaceAllString, ReplaceAll*,
+// Split, FindAllSubmatchIndex, LiteralPrefix) is asked of the crafted
+// patterns and the first random ones; trnd picks the templates and the
+// split limit, apart from the stream rnd draws patterns from.
+var withAPI bool
+var trnd = rand.New(rand.NewPCG(seed^0x74706c, seed))
+
+var templates = []string{"<$0>", "[$1]", "${1}x", "$1x", "$$", "$", "${", "${}", "$g1", "${g1}", "$10", "$01", "$00", "${-1}",
+	"$ $", "${1", "x", "$é", "$١", "$Ⅷ", "${18446744073709551617}", "${4294967297}", "$2$1", "${g2}.$3", "$_", "${g1}}", "$n", "${n}"}
+
+func strs(xs []string) string {
+	var b strings.Builder
+	b.WriteString("&.{")
+	for i, x := range xs {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(zstr(x))
+	}
+	b.WriteString("}")
+	return b.String()
+}
+
 // emitPatternIn answers a pattern in Perl syntax (leftmost-first, plus the
 // same searches after Longest()) or in POSIX syntax (CompilePOSIX:
 // leftmost-longest).
@@ -355,7 +378,12 @@ func emitPatternIn(b *bytes.Buffer, pat string, inputs []string, posix bool) {
 		}
 		b.WriteString(zstr(n))
 	}
-	b.WriteString("}, .cases = &.{\n")
+	b.WriteString("}")
+	if withAPI && !posix {
+		prefix, complete := re.LiteralPrefix()
+		fmt.Fprintf(b, ", .api = true, .prefix = %s, .complete = %v", zstr(prefix), complete)
+	}
+	b.WriteString(", .cases = &.{\n")
 	for _, in := range inputs {
 		sub := re.FindStringSubmatchIndex(in)
 		var all []int
@@ -376,6 +404,18 @@ func emitPatternIn(b *bytes.Buffer, pat string, inputs []string, posix bool) {
 				b.WriteString(", .same_longest = true")
 			}
 		}
+		if withAPI && !posix {
+			t1, t2 := trnd.IntN(len(templates)), trnd.IntN(len(templates))
+			n := trnd.IntN(4) // 0..3
+			var allsub []int
+			for _, m := range re.FindAllStringSubmatchIndex(in, -1) {
+				allsub = append(allsub, m...)
+			}
+			fmt.Fprintf(b, ", .repl = &.{ .{ .t = %d, .out = %s }, .{ .t = %d, .out = %s } }", t1, zstr(re.ReplaceAllString(in, templates[t1])), t2, zstr(re.ReplaceAllString(in, templates[t2])))
+			fmt.Fprintf(b, ", .literal = %s, .func = %s", zstr(re.ReplaceAllLiteralString(in, "<$1>")),
+				zstr(re.ReplaceAllStringFunc(in, func(m string) string { return "[" + m + "]" })))
+			fmt.Fprintf(b, ", .split = %s, .split_n = %d, .split_some = %s, .allsub = %s", strs(re.Split(in, -1)), n, strs(re.Split(in, n)), ints(allsub))
+		}
 		b.WriteString(" },\n")
 	}
 	b.WriteString("} },\n")
@@ -386,9 +426,32 @@ const header = `/// Go's answers for one input: MatchString, a full match (` + "
 /// and FindAllStringIndex flattened. For a Perl-syntax pattern also the same
 /// two searches after ` + "`Longest()`" + ` — ` + "`lsub`/`lall`" + `, or ` + "`same_longest`" + ` when they
 /// equal ` + "`sub`/`all`" + `. A POSIX set's answers are CompilePOSIX's (leftmost-longest).
-pub const Case = struct { input: []const u8, match: bool, full: bool, sub: []const i32, all: []const i32, lsub: []const i32 = &.{}, lall: []const i32 = &.{}, same_longest: bool = false };
+///
+/// For an ` + "`api`" + ` pattern also: ` + "`repl`" + ` — ReplaceAllString with two of ` + "`templates`" + `;
+/// ` + "`literal`" + ` — ReplaceAllLiteralString with ` + "`<$1>`" + `; ` + "`func`" + ` — ReplaceAllStringFunc
+/// wrapping each match in ` + "`[ ]`" + `; ` + "`split`" + ` — Split(s, -1); ` + "`split_some`" + ` —
+/// Split(s, split_n); ` + "`allsub`" + ` — FindAllStringSubmatchIndex flattened.
+pub const Repl = struct { t: u8, out: []const u8 };
+pub const Case = struct {
+    input: []const u8,
+    match: bool,
+    full: bool,
+    sub: []const i32,
+    all: []const i32,
+    lsub: []const i32 = &.{},
+    lall: []const i32 = &.{},
+    same_longest: bool = false,
+    repl: []const Repl = &.{},
+    literal: []const u8 = "",
+    func: []const u8 = "",
+    split: []const []const u8 = &.{},
+    split_n: u8 = 0,
+    split_some: []const []const u8 = &.{},
+    allsub: []const i32 = &.{},
+};
 /// ` + "`ok`" + `: Go compiles the pattern. ` + "`names`" + `: SubexpNames.
-pub const Pattern = struct { pattern: []const u8, ok: bool, names: []const []const u8 = &.{}, cases: []const Case = &.{} };
+/// ` + "`api`" + `: the cases carry the API answers below, and ` + "`prefix`/`complete`" + ` is LiteralPrefix.
+pub const Pattern = struct { pattern: []const u8, ok: bool, names: []const []const u8 = &.{}, api: bool = false, prefix: []const u8 = "", complete: bool = false, cases: []const Case = &.{} };
 
 `
 
@@ -403,10 +466,24 @@ func main() {
 	b.WriteString("//! Go regexp's answers to this module's own patterns and inputs, replayed by\n")
 	b.WriteString("//! `go_oracle_test.zig`. Regenerate with the command in tools/go_regexp_oracle/main.go.\n\n")
 	b.WriteString(header)
+	b.WriteString("pub const templates = [_][]const u8")
+	b.WriteString(strs(templates)[2:])
+	b.WriteString(";\n\n/// QuoteMeta of each ASCII byte (index = byte), then of a few strings.\npub const quote_meta = [_][2][]const u8{\n")
+	var qs []string
+	for c := 0; c < 128; c++ {
+		qs = append(qs, string([]byte{byte(c)}))
+	}
+	qs = append(qs, "", "a.b*c", "é\u212a(x)", "\xff$", `\Q\E`)
+	for _, q := range qs {
+		fmt.Fprintf(&b, ".{ %s, %s },\n", zstr(q), zstr(regexp.QuoteMeta(q)))
+	}
+	b.WriteString("};\n\n")
 	b.WriteString("pub const crafted = [_]Pattern{\n")
+	withAPI = true
 	for _, p := range crafted {
 		emitPattern(&b, p, fixedInputs)
 	}
+	withAPI = false
 	b.WriteString("};\n\npub const unicode_classes = [_]Pattern{\n")
 	for _, p := range unicodeCrafted {
 		emitPattern(&b, p, unicodeInputs)
@@ -417,6 +494,7 @@ func main() {
 	b.WriteString("};\n\npub const random = [_]Pattern{\n")
 	for i := 0; i < nRandom; i++ {
 		groupCount = 0
+		withAPI = i < 200
 		p := randAlt(0)
 		var inputs []string
 		for j := 0; j < nInputs; j++ {
@@ -424,6 +502,7 @@ func main() {
 		}
 		emitPattern(&b, p, inputs)
 	}
+	withAPI = false
 	b.WriteString("};\n\npub const posix = [_]Pattern{\n")
 	for _, p := range append(append([]string{}, crafted...), posixCrafted...) {
 		emitPatternIn(&b, p, fixedInputs, true)
