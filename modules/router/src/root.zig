@@ -4183,3 +4183,7 @@ test "PatternCaptures: every capture kind, in order" {
     var empty: PatternCaptures = .init("/");
     try testing.expectEqual(@as(?[]const u8, null), empty.next());
 }
+
+test {
+    _ = @import("chi_oracle_test.zig");
+}

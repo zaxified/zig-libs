@@ -175,9 +175,20 @@ src/root.zig.
 
 ## Anchoring
 
-**Anchor grade:** class C · oracle n/a
+**Anchor grade:** class A · oracle EXTERNAL
 
-- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
-- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+- **Class A** — wire/interop format — other implementations must byte-agree with it. Since 2026-10-07 the pattern language is go-chi/chi's (`{name}`, in-segment captures, `*`), so a chi route table must route the same here, up to the documented divergences.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** path trie + middleware dispatch, in-process; wire parsing is sibling http
+**On CI since 2026-10-07.** `tools/interop.zig` (`zig build interop-router [-- --check]`)
+re-takes `tools/go_chi_oracle` (Go 1.26.0, go-chi/chi v5.3.2 pinned by go.mod/go.sum, black box
+through its public API) and the interop lane runs it with `--check`; the check ignores only the
+`// GENERATED …` line. `src/chi_oracle_test.zig` replays `src/chi_vectors.zig`: 60 seeded tables,
+3,600 requests — status, matched pattern and every capture as chi answers (chi's `RoutePattern()`
+drops a trailing slash; that alone is normalized), chi's 405 `Allow` a subset of ours. The
+generated requests stay in the domain where both semantics coincide; the documented divergences
+(EMPTY: chi accepts an empty capture; SPLIT: chi ends a capture at the first byte of the next
+literal) are a crafted table whose answers are pinned both ways. Teeth: inverting sibling-pattern
+precedence fails 14 generated requests, a flipped vector fails `--check`. Still self-graded: the
+composition layer (`group`/`with`/`mount`, fallback scoping, `HostRouter`) and `Static`, which the
+differential test holds to `Router`.

@@ -15,6 +15,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   used to be a literal byte of a static segment; `{x}` is now a capture and a stray brace is
   `error.InvalidPattern` (in-repo, only an `openapi` test relied on the literal). A regexp
   constraint (`{id:[0-9]+}`) is refused until the `regex` module exists.
+- **2026-10-07** — Tests: go-chi/chi v5.3.2 as a differential oracle (`tools/go_chi_oracle`,
+  `src/chi_oracle_test.zig`, `zig build interop-router`, on the CI interop lane): 3,600 requests
+  over 60 seeded tables answer as chi does; the documented divergences pinned. No defect found.
 - **2026-10-04** — Tests: mutation schemata run (32 mutants, 31 killed, 1 equivalent). Five
   new tests: a direct caller's `%00` path answered 400 in both normalizing postures, no
   trailing-slash redirect from `/` or toward a variant lacking the method, fallbacks running the

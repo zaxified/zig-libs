@@ -329,6 +329,13 @@ echo "::group::interop: netaddr (Go module cache)"
     && echo "netaddr go modules: OK" || echo "netaddr go modules: download failed"
 echo "::endgroup::"
 
+echo "::group::interop: router (Go module cache)"
+# tools/go_chi_oracle runs with GOPROXY=off like netaddr's: go-chi/chi/v5 and
+# the pinned go1.26.0 toolchain are fetched here.
+(cd modules/router/tools/go_chi_oracle && GOTOOLCHAIN=go1.26.0 go mod download >/dev/null 2>&1) \
+    && echo "router go modules: OK" || echo "router go modules: download failed"
+echo "::endgroup::"
+
 echo "::group::interop: syslog (rsyslogd)"
 # Installed for /usr/sbin/rsyslogd and its plugins; tools/rsyslog_oracle.py
 # runs a copy, unconfined, inside `unshare -rn`. journald comes with systemd.
