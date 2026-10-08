@@ -281,12 +281,14 @@ pub const SecNonceError = error{InvalidSecNonce};
 /// SECURITY: a `SecNonce` MUST be used as input to `sign` at most once —
 /// reusing it (with a different message/signer-set) is exactly the
 /// classic Schnorr nonce-reuse key-leak, same failure mode `bip340`'s
-/// `SPEC.md` documents for its own nonce. `sign` zeroes its OWN local copy
-/// via `deinit` right after use (defense-in-depth — reduces the value's
-/// on-stack lifetime), but that cannot reach the caller's copy: the
-/// caller remains responsible for erasing/dropping its own `SecNonce`
-/// after the single `sign` call, e.g. `defer secnonce.deinit();` placed
-/// immediately after drawing it (see `nonceGen`).
+/// `SPEC.md` documents for its own nonce. `sign` takes it by pointer and
+/// zeroes it the moment it has read it, on every call, failed ones
+/// included (BIP327's `Sign`: "secnonce[0:64] = bytes(64, 0)";
+/// libsecp256k1's `musig_partial_sign` does the same), so a second `sign`
+/// over the same value is `error.InvalidSecNonce`, never a second
+/// signature. What `sign` cannot reach is a COPY the caller made — a
+/// `SecNonce` is a plain value, so do not duplicate it (or persist it)
+/// before signing.
 pub const SecNonce = struct {
     bytes: [97]u8,
 
@@ -820,6 +822,8 @@ pub const SignError = SessionError || SecNonceError || error{
 };
 
 /// Algorithm `Sign(secnonce, sk, session_ctx)` (BIP327 §"Signing").
+/// `secnonce` is consumed: zeroed on entry, whatever the outcome (see
+/// `SecNonce`).
 ///
 /// Input checks, in order (each can fail BEFORE `getSessionValues`/
 /// `keyAgg` are ever called — this ordering is why every official
@@ -860,10 +864,13 @@ pub const SignError = SessionError || SecNonceError || error{
 ///      `partialSigVerifyInternal(s, pubnonce, pk, ctx)` must accept;
 ///      `error.SignatureVerificationFailed` otherwise, never the
 ///      unverified `s`.
-pub fn sign(secnonce: SecNonce, sk: bip340.SecretKey, ctx: SessionContext) SignError!PartialSignature {
-    // Local copy zeroed on every exit path (defense-in-depth — see
-    // `SecNonce`'s doc comment; the caller's own copy is its own to erase).
-    var sn = secnonce;
+pub fn sign(secnonce: *SecNonce, sk: bip340.SecretKey, ctx: SessionContext) SignError!PartialSignature {
+    // Consume the caller's secnonce before anything can fail (BIP327 `Sign`
+    // overwrites secnonce[0:64]; libsecp256k1 clears it on entry too): a
+    // failed attempt must not leave a nonce that a retry with different
+    // inputs would sign with again. The local copy is zeroed on every exit.
+    var sn = secnonce.*;
+    secnonce.deinit();
     defer sn.deinit();
 
     const k1_prime = try sn.k1Scalar();
@@ -935,6 +942,10 @@ pub fn partialSigVerify(
     msg: []const u8,
     signer_index: usize,
 ) PartialSigVerifyError!void {
+    // An index outside either list is the caller's input, not a reason to
+    // panic (BIP327 requires the two lists to have the same length u).
+    if (signer_index >= pubkeys.len) return error.InvalidPublicKey;
+    if (signer_index >= pubnonces.len) return error.InvalidPubNonce;
     _ = pubkeys[signer_index].point() catch return error.InvalidPublicKey;
     const aggnonce = try nonceAgg(pubnonces);
     const ctx = SessionContext{ .aggnonce = aggnonce, .pubkeys = pubkeys, .tweaks = tweaks, .msg = msg };

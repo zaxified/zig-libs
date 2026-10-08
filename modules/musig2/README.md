@@ -90,7 +90,10 @@ then the partial-signature formula with the spec's mandatory self-verify):
 ```zig
 const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pubkeys, .msg = msg };
 // Tweaked session: same, plus .tweaks = &tweaks (defaults to none).
-const psig = try musig2.sign(result.secnonce, sk, ctx); // musig2.PartialSignature
+// `sign` consumes the secnonce: it is zeroed on entry, whatever the outcome,
+// so a second `sign` with it is error.InvalidSecNonce (BIP327 / libsecp256k1).
+var secnonce = result.secnonce;
+const psig = try musig2.sign(&secnonce, sk, ctx); // musig2.PartialSignature
 ```
 
 **Partial signature verification** (`PartialSigVerify` — per-pubnonce/

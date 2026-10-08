@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING:** `sign(secnonce: *SecNonce, sk, ctx)` takes the secret nonce by
+  pointer and zeroes it on entry, on every call, failed ones included — BIP327's `Sign`
+  overwrites `secnonce[0:64]` and libsecp256k1's `musig_partial_sign` clears it the same way. Before,
+  `sign` took a copy and the caller's value survived every call, so a retry with another message
+  signed twice over one nonce (the key-recovery case). A second `sign` with a consumed secnonce is
+  now `error.InvalidSecNonce`. Migration: pass `&secnonce` (a `var`). Also: `partialSigVerify`
+  returns `error.InvalidPublicKey` / `error.InvalidPubNonce` for a `signer_index` outside
+  `pubkeys` / `pubnonces` instead of indexing out of bounds. Audit 2026-10-08 (`SPEC.md`).
+
 - **2026-10-05** — Tests: first dated mutation run (54 mutants, 45 killed, 9 equivalent or
   unobservable; `SPEC.md` § "Mutation run 2026-10-05"). No defect; 4 new tests close the 6 test
   gaps it found — the aggnonce infinity encoding is exactly 33 zero bytes, secnonce scalars `n`

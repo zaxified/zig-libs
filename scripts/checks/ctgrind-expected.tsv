@@ -765,7 +765,7 @@ ibe	ReleaseFast	decrypt	1	10	ba4d234657626842	fb52b6c55cc51706
 ibe	ReleaseFast	fp12pow	1	0	140a7d3db097ec1b	d2e187260f9f18a2
 frost	ReleaseFast	commit	1	8	cf6d181343529b92	94a2e96655c4ce21
 frost	ReleaseFast	sign	1	5	cf6d181343529b92	8484bd50690a78db
-musig2	ReleaseFast	sign	1	<=101	a4d62ba84a4d5c2f	2a2f275cd0c5c7c5
+musig2	ReleaseFast	sign	1	<=101	8e1380b257b52af1	2a2f275cd0c5c7c5
 # taproot secret 10 -> 9 (re-pin 2026-09-15). The row was already stale at
 # 0c0ef527: a --stacks run of that tree reads 9, with the SAME context set as
 # today. The source pin never moved, so the drop came from a dependency before

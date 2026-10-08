@@ -36,6 +36,7 @@ const musig2 = @import("root.zig");
 /// and the `Cursor` the perturbation harness reads its script from.
 const testkit = @import("testkit");
 const bip340 = @import("bip340");
+const k256 = @import("k256");
 const v = @import("kat_vectors.zig");
 
 fn hexN(comptime n: usize, hex_str: []const u8) [n]u8 {
@@ -213,12 +214,12 @@ test "KAT sign_verify: sign_error_test_cases (0) — signer's pubkey not in the 
     // IS valid too — but `sk`'s own derived pubkey is not among them, so
     // `sign`'s real "pubkey in session" check (step 3, before
     // `getSessionValues`/`keyAgg` are ever called) reports the error first.
-    const secnonce = musig2.SecNonce.fromBytes(hexN(97, v.sign_verify.secnonces[case.secnonce_index]));
+    var secnonce = musig2.SecNonce.fromBytes(hexN(97, v.sign_verify.secnonces[case.secnonce_index]));
     const aggnonce = try musig2.AggNonce.fromBytes(hexN(66, v.sign_verify.aggnonces[case.aggnonce_index]));
     const msg = hexN(32, v.sign_verify.msgs[case.msg_index]);
     const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pks, .msg = &msg };
 
-    try std.testing.expectError(error.PubkeyNotInSession, musig2.sign(secnonce, sk, ctx));
+    try std.testing.expectError(error.PubkeyNotInSession, musig2.sign(&secnonce, sk, ctx));
 }
 
 test "KAT sign_verify: sign_error_test_cases (1) — signer 2 provided an invalid public key" {
@@ -233,12 +234,12 @@ test "KAT sign_verify: sign_error_test_cases (1) — signer 2 provided an invali
     // matching `sk`) IS in the list and the aggnonce IS valid, so `sign`
     // proceeds into `getSessionValues` -> `keyAgg`, whose per-pubkey
     // pre-validation finds pks[2] invalid.
-    const secnonce = musig2.SecNonce.fromBytes(hexN(97, v.sign_verify.secnonces[case.secnonce_index]));
+    var secnonce = musig2.SecNonce.fromBytes(hexN(97, v.sign_verify.secnonces[case.secnonce_index]));
     const aggnonce = try musig2.AggNonce.fromBytes(hexN(66, v.sign_verify.aggnonces[case.aggnonce_index]));
     const msg = hexN(32, v.sign_verify.msgs[case.msg_index]);
     const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pks, .msg = &msg };
 
-    try std.testing.expectError(error.InvalidPublicKey, musig2.sign(secnonce, sk, ctx));
+    try std.testing.expectError(error.InvalidPublicKey, musig2.sign(&secnonce, sk, ctx));
 }
 
 test "KAT sign_verify: sign_error_test_cases (2,3,4) — aggregate nonce is invalid" {
@@ -260,7 +261,7 @@ test "KAT sign_verify: sign_error_test_cases (5) — secnonce is invalid (nonce 
 
     var buf: [8]musig2.PlainPublicKey = undefined;
     const pks = rawPubkeys(&buf, v.sign_verify.pubkeys, case.key_indices);
-    const secnonce = musig2.SecNonce.fromBytes(hexN(97, v.sign_verify.secnonces[case.secnonce_index]));
+    var secnonce = musig2.SecNonce.fromBytes(hexN(97, v.sign_verify.secnonces[case.secnonce_index]));
     try std.testing.expectError(error.InvalidSecNonce, secnonce.k1Scalar());
 
     // Composite: safe — this secnonce's k1' is exactly zero, so `sign`'s
@@ -268,7 +269,46 @@ test "KAT sign_verify: sign_error_test_cases (5) — secnonce is invalid (nonce 
     const aggnonce = try musig2.AggNonce.fromBytes(hexN(66, v.sign_verify.aggnonces[case.aggnonce_index]));
     const msg = hexN(32, v.sign_verify.msgs[case.msg_index]);
     const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pks, .msg = &msg };
-    try std.testing.expectError(error.InvalidSecNonce, musig2.sign(secnonce, sk, ctx));
+    try std.testing.expectError(error.InvalidSecNonce, musig2.sign(&secnonce, sk, ctx));
+}
+
+test "sign consumes the caller's secnonce: zeroed after a success AND after a failure, a second sign is InvalidSecNonce" {
+    // BIP327 `Sign` overwrites secnonce[0:64] and libsecp256k1's
+    // `musig_partial_sign` clears it on entry: a SecNonce signs once. Until
+    // the 2026-10-08 audit `sign` took it by value, so the caller's copy
+    // survived every call and a retry with a different message signed again
+    // over the same nonce -- the two-equations key leak.
+    const io = std.testing.io;
+    const sk_bytes = [_]u8{0x5A} ** 32;
+    const sk = try bip340.SecretKey.fromBytes(sk_bytes);
+    const pk = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase(sk_bytes, .big)).toCompressedSec1() };
+    const pks = [_]musig2.PlainPublicKey{pk};
+    const zero = [_]u8{0} ** 64;
+
+    var ng = try musig2.nonceGen(sk_bytes, pk.bytes, null, "msg", null, [_]u8{0x31} ** 32, io);
+    const ctx = musig2.SessionContext{ .aggnonce = try musig2.nonceAgg(&.{ng.pubnonce}), .pubkeys = &pks, .msg = "msg" };
+    _ = try musig2.sign(&ng.secnonce, sk, ctx);
+    try std.testing.expectEqualSlices(u8, &zero, ng.secnonce.bytes[0..64]);
+    const other = musig2.SessionContext{ .aggnonce = ctx.aggnonce, .pubkeys = &pks, .msg = "another message" };
+    try std.testing.expectError(error.InvalidSecNonce, musig2.sign(&ng.secnonce, sk, other));
+
+    // A FAILED attempt consumes it too: the signer is not in this session.
+    var ng2 = try musig2.nonceGen(sk_bytes, pk.bytes, null, "msg", null, [_]u8{0x32} ** 32, io);
+    const stranger = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase([_]u8{0x6B} ** 32, .big)).toCompressedSec1() };
+    const wrong = musig2.SessionContext{ .aggnonce = ctx.aggnonce, .pubkeys = &.{stranger}, .msg = "msg" };
+    try std.testing.expectError(error.PubkeyNotInSession, musig2.sign(&ng2.secnonce, sk, wrong));
+    try std.testing.expectEqualSlices(u8, &zero, ng2.secnonce.bytes[0..64]);
+    try std.testing.expectError(error.InvalidSecNonce, musig2.sign(&ng2.secnonce, sk, ctx));
+}
+
+test "partialSigVerify: a signer index outside either list is an error, not a panic" {
+    const pk = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase([_]u8{0x5A} ** 32, .big)).toCompressedSec1() };
+    const ng = try musig2.nonceGen(null, pk.bytes, null, "m", null, [_]u8{0x33} ** 32, std.testing.io);
+    const psig = try musig2.PartialSignature.fromBytes([_]u8{1} ** 32);
+    try std.testing.expectError(error.InvalidPublicKey, musig2.partialSigVerify(psig, &.{ng.pubnonce}, &.{pk}, &.{}, "m", 1));
+    // Two keys, one nonce: index 1 is inside `pubkeys` and outside `pubnonces`.
+    const pk2 = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase([_]u8{0x5B} ** 32, .big)).toCompressedSec1() };
+    try std.testing.expectError(error.InvalidPubNonce, musig2.partialSigVerify(psig, &.{ng.pubnonce}, &.{ pk, pk2 }, &.{}, "m", 1));
 }
 
 test "sign REJECTS a secnonce bound to a DIFFERENT signer's pubkey (SecretKeyMismatch) — no official vector for this; module-added defense" {
@@ -296,14 +336,14 @@ test "sign REJECTS a secnonce bound to a DIFFERENT signer's pubkey (SecretKeyMis
 
     // secnonce is bound to pk_a (via nonceGen's `pk` argument)...
     const rand_prime = [_]u8{0xCC} ** 32;
-    const ng = try musig2.nonceGen(sk_a_bytes, pk_a.bytes, null, "msg", null, rand_prime, io);
+    var ng = try musig2.nonceGen(sk_a_bytes, pk_a.bytes, null, "msg", null, rand_prime, io);
 
     // ...but sign is called with sk_b — a genuine mismatch.
     const pks = [_]musig2.PlainPublicKey{ pk_a, pk_b };
     const pubnonces = [_]musig2.PubNonce{ng.pubnonce};
     const aggnonce = try musig2.nonceAgg(&pubnonces);
     const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = &pks, .msg = "msg" };
-    try std.testing.expectError(error.SecretKeyMismatch, musig2.sign(ng.secnonce, sk_b, ctx));
+    try std.testing.expectError(error.SecretKeyMismatch, musig2.sign(&ng.secnonce, sk_b, ctx));
 }
 
 // Mutation run 2026-10-05: matching the session's pubkey list without the
@@ -323,11 +363,11 @@ test "sign refuses when the session lists the signer's x with the other parity" 
     flipped[0] ^= 1; // 02 <-> 03: the same x, the negated point
     const other = (try std_ecc.basePoint.mul([_]u8{0x22} ** 32, .big)).toCompressedSec1();
 
-    const ng = try musig2.nonceGen(sk_bytes, own, null, "msg", null, [_]u8{0xCC} ** 32, io);
+    var ng = try musig2.nonceGen(sk_bytes, own, null, "msg", null, [_]u8{0xCC} ** 32, io);
     const aggnonce = try musig2.nonceAgg(&.{ng.pubnonce});
     const pks = [_]musig2.PlainPublicKey{ try .fromBytes(flipped), try .fromBytes(other) };
     const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = &pks, .msg = "msg" };
-    try std.testing.expectError(error.PubkeyNotInSession, musig2.sign(ng.secnonce, sk, ctx));
+    try std.testing.expectError(error.PubkeyNotInSession, musig2.sign(&ng.secnonce, sk, ctx));
 }
 
 // Mutation run 2026-10-05: reducing a secnonce scalar mod n instead of
@@ -408,8 +448,8 @@ test "KAT sign_verify: valid_test_cases — partial signatures byte-exact; parti
         // The signing signer is always `sk`'s own (key_indices[signer_index]
         // == pubkeys[0]) and always uses secnonces[0] — the one whose
         // embedded pk is `sk`'s derived public key.
-        const secnonce = musig2.SecNonce.fromBytes(hexN(97, v.sign_verify.secnonces[0]));
-        const psig = try musig2.sign(secnonce, sk, ctx);
+        var secnonce = musig2.SecNonce.fromBytes(hexN(97, v.sign_verify.secnonces[0]));
+        const psig = try musig2.sign(&secnonce, sk, ctx);
         try std.testing.expectEqualSlices(u8, &hexN(32, case.expected), &psig.bytes);
 
         // And the top-level PartialSigVerify accepts what sign produced.
@@ -521,8 +561,8 @@ test "KAT tweak: valid_test_cases — tweaked partial signatures byte-exact; twe
         const msg = hexN(32, v.tweak.msg);
         const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pks, .tweaks = tweaks, .msg = &msg };
 
-        const secnonce = musig2.SecNonce.fromBytes(hexN(97, v.tweak.secnonce));
-        const psig = try musig2.sign(secnonce, sk, ctx);
+        var secnonce = musig2.SecNonce.fromBytes(hexN(97, v.tweak.secnonce));
+        const psig = try musig2.sign(&secnonce, sk, ctx);
         try std.testing.expectEqualSlices(u8, &hexN(32, case.expected), &psig.bytes);
 
         // The tweak-aware top-level PartialSigVerify accepts it (and its
@@ -556,8 +596,8 @@ test "KAT tweak: error_test_cases — tweak >= n rejected (leaf applyTweak AND c
     const aggnonce = try musig2.AggNonce.fromBytes(hexN(66, v.tweak.aggnonce));
     const msg = hexN(32, v.tweak.msg);
     const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pks, .tweaks = tweaks, .msg = &msg };
-    const secnonce = musig2.SecNonce.fromBytes(hexN(97, v.tweak.secnonce));
-    try std.testing.expectError(error.TweakOutOfRange, musig2.sign(secnonce, sk, ctx));
+    var secnonce = musig2.SecNonce.fromBytes(hexN(97, v.tweak.secnonce));
+    try std.testing.expectError(error.TweakOutOfRange, musig2.sign(&secnonce, sk, ctx));
 }
 
 // ── sig_agg ─────────────────────────────────────────────────────────────
@@ -659,7 +699,7 @@ test "end-to-end: 3 signers, nonceGen→nonceAgg→sign→partialSigVerify→par
 
     var psigs: [3]musig2.PartialSignature = undefined;
     for (0..3) |i| {
-        psigs[i] = try musig2.sign(secnonces[i], sks[i], ctx);
+        psigs[i] = try musig2.sign(&secnonces[i], sks[i], ctx);
         try musig2.partialSigVerify(psigs[i], &pubnonces, &pks, &.{}, msg, i);
     }
     // Cross-signer sanity: signer 0's partial signature must NOT verify
@@ -713,7 +753,7 @@ test "end-to-end: 3 signers with an x-only (Taproot-style) tweak — aggregate v
 
     var psigs: [3]musig2.PartialSignature = undefined;
     for (0..3) |i| {
-        psigs[i] = try musig2.sign(secnonces[i], sks[i], ctx);
+        psigs[i] = try musig2.sign(&secnonces[i], sks[i], ctx);
         try musig2.partialSigVerify(psigs[i], &pubnonces, &pks, &tweaks, msg, i);
     }
 
