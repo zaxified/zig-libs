@@ -57,20 +57,22 @@ test "encrypted-key KAT: parse + verify a real minisign signature" {
 test "byte-exact re-sign: unencrypted key reproduces the real minisign output bit-for-bit" {
     const gpa = std.testing.allocator;
     const pub_key = try m.parsePublicKeyFile(kat.unencrypted_public_key_file);
-    const sec_key = try m.parseSecretKeyFile(kat.unencrypted_secret_key_file);
-    const kp = try m.openSecretKey(gpa, sec_key.key, null);
+    var sec_key: m.ParsedSecretKey = undefined;
+    try m.parseSecretKeyFile(&sec_key, kat.unencrypted_secret_key_file);
+    var kp: m.KeyPair = undefined;
+    try m.openSecretKey(gpa, &kp, &sec_key.key, null);
     try std.testing.expectEqual(pub_key.key.key_number, kp.key_number);
     try std.testing.expectEqual(pub_key.key.key, kp.ed25519.public_key.toBytes());
 
     {
         const expect = try m.parseSignatureFile(kat.prehashed_signature_file);
-        const signed = try m.signFile(gpa, kp, kat.message, .prehashed, "trusted comment test 1");
+        const signed = try m.signFile(gpa, &kp, kat.message, .prehashed, "trusted comment test 1");
         try std.testing.expectEqual(expect.signature, signed.signature);
         try std.testing.expectEqual(expect.global_signature, signed.global_signature);
     }
     {
         const expect = try m.parseSignatureFile(kat.legacy_signature_file);
-        const signed = try m.signFile(gpa, kp, kat.message, .legacy, "trusted comment test 1");
+        const signed = try m.signFile(gpa, &kp, kat.message, .legacy, "trusted comment test 1");
         try std.testing.expectEqual(expect.signature, signed.signature);
         try std.testing.expectEqual(expect.global_signature, signed.global_signature);
     }
@@ -79,17 +81,20 @@ test "byte-exact re-sign: unencrypted key reproduces the real minisign output bi
 test "byte-exact re-sign: real password decrypts the real encrypted key and reproduces its signature" {
     const gpa = std.testing.allocator;
     const pub_key = try m.parsePublicKeyFile(kat.encrypted_public_key_file);
-    const sec_key = try m.parseSecretKeyFile(kat.encrypted_secret_key_file);
+    var sec_key: m.ParsedSecretKey = undefined;
+    try m.parseSecretKeyFile(&sec_key, kat.encrypted_secret_key_file);
     try std.testing.expectEqualSlices(u8, &m.kdf_alg_scrypt, &sec_key.key.kdf_alg);
     try std.testing.expectEqual(m.ops_limit_sensitive, sec_key.key.ops_limit);
     try std.testing.expectEqual(@as(u64, m.mem_limit_sensitive), sec_key.key.mem_limit);
 
-    const kp = try m.openSecretKey(gpa, sec_key.key, kat.encrypted_secret_key_password);
+    var kp: m.KeyPair = undefined;
+
+    try m.openSecretKey(gpa, &kp, &sec_key.key, kat.encrypted_secret_key_password);
     try std.testing.expectEqual(pub_key.key.key_number, kp.key_number);
     try std.testing.expectEqual(pub_key.key.key, kp.ed25519.public_key.toBytes());
 
     const expect = try m.parseSignatureFile(kat.encrypted_key_signature_file);
-    const signed = try m.signFile(gpa, kp, kat.message, .prehashed, "trusted comment test 2");
+    const signed = try m.signFile(gpa, &kp, kat.message, .prehashed, "trusted comment test 2");
     try std.testing.expectEqual(expect.signature, signed.signature);
     try std.testing.expectEqual(expect.global_signature, signed.global_signature);
 }
@@ -102,14 +107,16 @@ test "streaming (digest-based) path is byte-exact against real minisign output t
     // `minisign -S` run did, and that verifyFileDigest accepts them.
     const gpa = std.testing.allocator;
     const pub_key = try m.parsePublicKeyFile(kat.unencrypted_public_key_file);
-    const sec_key = try m.parseSecretKeyFile(kat.unencrypted_secret_key_file);
-    const kp = try m.openSecretKey(gpa, sec_key.key, null);
+    var sec_key: m.ParsedSecretKey = undefined;
+    try m.parseSecretKeyFile(&sec_key, kat.unencrypted_secret_key_file);
+    var kp: m.KeyPair = undefined;
+    try m.openSecretKey(gpa, &kp, &sec_key.key, null);
 
     var digest: [m.prehash_length]u8 = undefined;
     std.crypto.hash.blake2.Blake2b512.hash(kat.message, &digest, .{});
 
     const expect = try m.parseSignatureFile(kat.prehashed_signature_file);
-    const signed = try m.signFileDigest(gpa, kp, digest, "trusted comment test 1");
+    const signed = try m.signFileDigest(gpa, &kp, digest, "trusted comment test 1");
     try std.testing.expectEqual(expect.signature, signed.signature);
     try std.testing.expectEqual(expect.global_signature, signed.global_signature);
 
@@ -132,9 +139,11 @@ test "streaming (digest-based) path is byte-exact against real minisign output t
 
 test "negative: wrong password on the real encrypted key is rejected" {
     const gpa = std.testing.allocator;
-    const sec_key = try m.parseSecretKeyFile(kat.encrypted_secret_key_file);
-    try std.testing.expectError(error.WrongPassword, m.openSecretKey(gpa, sec_key.key, "not the password"));
-    try std.testing.expectError(error.PasswordRequired, m.openSecretKey(gpa, sec_key.key, null));
+    var sec_key: m.ParsedSecretKey = undefined;
+    try m.parseSecretKeyFile(&sec_key, kat.encrypted_secret_key_file);
+    var kp: m.KeyPair = undefined;
+    try std.testing.expectError(error.WrongPassword, m.openSecretKey(gpa, &kp, &sec_key.key, "not the password"));
+    try std.testing.expectError(error.PasswordRequired, m.openSecretKey(gpa, &kp, &sec_key.key, null));
 }
 
 test "negative: tampered payload fails verification of a real signature" {
@@ -217,7 +226,8 @@ test "negative: truncated / empty public key and secret key files" {
     try std.testing.expectError(error.WrongLength, m.parsePublicKeyFile("untrusted comment: only one line\n"));
     // No trailing newline at all -> the b64 line is truly absent.
     try std.testing.expectError(error.MissingLine, m.parsePublicKeyFile("untrusted comment: only one line"));
-    try std.testing.expectError(error.MissingUntrustedCommentPrefix, m.parseSecretKeyFile(""));
+    var sk: m.ParsedSecretKey = undefined;
+    try std.testing.expectError(error.MissingUntrustedCommentPrefix, m.parseSecretKeyFile(&sk, ""));
 
     const pub_line1_end = std.mem.indexOfScalar(u8, kat.unencrypted_public_key_file, '\n').? + 1;
     try std.testing.expectError(error.WrongLength, m.parsePublicKeyFile(kat.unencrypted_public_key_file[0..pub_line1_end]));

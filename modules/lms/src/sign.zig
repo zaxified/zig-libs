@@ -39,6 +39,7 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const core = @import("core.zig");
 const params = @import("params.zig");
+const burn = @import("burn.zig");
 
 const n = core.n;
 const id_len = core.id_len;
@@ -48,26 +49,6 @@ const Level = params.Level;
 const max_levels = params.max_levels;
 const LmsPublicKey = core.LmsPublicKey;
 const HssPublicKey = core.HssPublicKey;
-
-/// Stack scrubbed after key generation and signing. `Sha256` and the chain
-/// loops keep secret-derived blocks in frames no name reaches; the call
-/// trees here are a few hundred bytes deep (`noinline` keeps the buffer below
-/// the caller's frame, the same measured trick as `xmss`).
-const stack_burn = 16 * 1024;
-
-noinline fn burnStack() void {
-    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
-    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
-    const V = @Vector(4, u64);
-    // align(16), not `V`'s natural 32: a 32-aligned buffer makes the frame
-    // realign, and the up to 56 bytes between the saved frame pointer and
-    // the buffer stayed unzeroed — a callee's secret survived there
-    // (threshold_ecdsa stack probe, 2026-10-08). At 16 the buffer ends at
-    // the saved frame pointer.
-    var buf: [stack_burn / @sizeOf(V)]V align(16) = undefined;
-    const p: [*]align(16) volatile V = &buf;
-    for (0..buf.len) |i| p[i] = @splat(0);
-}
 
 /// Nodes at heights below `cacheHeight` are recomputed per signature; see the
 /// module doc.
@@ -100,37 +81,47 @@ pub const Tree = struct {
     /// `nodes[r - 1]` is `T[r]` for every node number `r < 2^(h - c + 1)`.
     nodes: [][n]u8,
 
-    /// Build the tree: `2^h` LM-OTS public keys are computed. O(2^h * p *
-    /// 2^w) hashes; see the module doc for wall-clock at H15..H25.
-    pub fn init(gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: [n]u8) Allocator.Error!Tree {
-        return initCached(gpa, lms, ots, id, seed, cacheHeight(lms));
+    /// Build the tree into `out`: `2^h` LM-OTS public keys are computed. O(2^h
+    /// * p * 2^w) hashes; see the module doc for wall-clock at H15..H25. The
+    /// seed goes in by pointer and the tree (which holds a copy) comes out
+    /// by pointer, so no frame of ours or the caller's holds the SEED; the
+    /// stack the body dirtied is zeroed. On error `out` holds no secret
+    /// (`deinit` on it is a no-op).
+    pub fn init(out: *Tree, gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: *const [n]u8) Allocator.Error!void {
+        return initCached(out, gpa, lms, ots, id, seed, cacheHeight(lms));
     }
 
     /// `init` with an explicit cache height `c <= h`: nodes at heights `>= c`
     /// are kept (`2^(h-c+1) - 1` of them), the `c` lowest path levels are
     /// recomputed per signature. Signatures are identical for every `c`.
-    pub fn initCached(gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: [n]u8, c: u5) Allocator.Error!Tree {
+    pub fn initCached(out: *Tree, gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: *const [n]u8, c: u5) Allocator.Error!void {
+        return burn.run(burn.init_burn, Allocator.Error!void, build, .{ out, gpa, lms, ots, id, seed, c });
+    }
+
+    fn build(out: *Tree, gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: *const [n]u8, c: u5) Allocator.Error!void {
         const h = lms.height();
         std.debug.assert(c <= h);
         const count: usize = (@as(usize, 1) << (h - c + 1)) - 1;
-        const nodes = try gpa.alloc([n]u8, count);
-        var t: Tree = .{ .gpa = gpa, .lms = lms, .ots = ots, .id = id, .seed = seed, .cache_h = c, .nodes = nodes };
+        const nodes = gpa.alloc([n]u8, count) catch |e| {
+            out.* = .{ .gpa = gpa, .lms = lms, .ots = ots, .id = id, .seed = @splat(0), .cache_h = c, .nodes = &.{} };
+            return e;
+        };
+        out.* = .{ .gpa = gpa, .lms = lms, .ots = ots, .id = id, .seed = seed.*, .cache_h = c, .nodes = nodes };
         // Level c: each node is the root of a 2^c-leaf subtree.
         const first: usize = @as(usize, 1) << (h - c);
         var j: u32 = 0;
         while (j < first) : (j += 1) {
-            nodes[first + j - 1] = t.subtreeRoot(c, j << c);
+            nodes[first + j - 1] = out.subtreeRoot(c, j << c);
         }
         // Above it, plain hashing.
         var r: usize = first - 1;
         while (r >= 1) : (r -= 1) {
-            nodes[r - 1] = core.intrHash(&t.id, @intCast(r), &nodes[2 * r - 1], &nodes[2 * r]);
+            nodes[r - 1] = core.intrHash(&out.id, @intCast(r), &nodes[2 * r - 1], &nodes[2 * r]);
         }
-        burnStack();
-        return t;
     }
 
-    /// Frees the node cache and wipes the seed.
+    /// Frees the node cache and wipes the seed. The cache holds only public
+    /// nodes (hashes of the OTS public keys), so it needs no wipe.
     pub fn deinit(self: *Tree) void {
         self.gpa.free(self.nodes);
         std.crypto.secureZero(u8, &self.seed);
@@ -181,14 +172,22 @@ pub const Tree = struct {
     /// (`out.len == lmsSignatureLength`). Does not touch any state: signing
     /// one leaf twice with different messages breaks the scheme.
     pub fn sign(self: *const Tree, q: u32, msg: []const u8, out: []u8) void {
+        burn.run(burn.sign_burn, void, signDerived, .{ self, q, msg, out });
+    }
+
+    fn signDerived(self: *const Tree, q: u32, msg: []const u8, out: []u8) void {
         const rnd = core.deriveRandomizer(&self.id, q, &self.seed);
-        self.signWithRandomizer(q, msg, &rnd, out);
+        self.signBody(q, msg, &rnd, out);
     }
 
     /// `sign` with a caller-chosen LM-OTS randomizer `C` — for known-answer
     /// tests, where the RFC's `C` is fixed. `C` must be unpredictable to an
     /// attacker (§7.1); prefer `sign`.
     pub fn signWithRandomizer(self: *const Tree, q: u32, msg: []const u8, rnd: *const [n]u8, out: []u8) void {
+        burn.run(burn.sign_burn, void, signBody, .{ self, q, msg, rnd, out });
+    }
+
+    fn signBody(self: *const Tree, q: u32, msg: []const u8, rnd: *const [n]u8, out: []u8) void {
         std.debug.assert(q < self.lms.leaves());
         std.debug.assert(out.len == core.lmsSignatureLength(self.lms, self.ots));
         const h: u5 = self.lms.height();
@@ -210,7 +209,6 @@ pub const Tree = struct {
                 dst.* = self.subtreeRoot(i, first_leaf);
             }
         }
-        burnStack();
     }
 };
 
@@ -227,8 +225,10 @@ pub const LmsSecretKey = struct {
     /// Next unused leaf.
     q: u32,
 
-    pub fn init(gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: [n]u8) Allocator.Error!LmsSecretKey {
-        return .{ .tree = try Tree.init(gpa, lms, ots, id, seed), .q = 0 };
+    /// Builds the key into `out` (see `Tree.init`; the seed goes in by pointer).
+    pub fn init(out: *LmsSecretKey, gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: *const [n]u8) Allocator.Error!void {
+        out.q = 0;
+        return Tree.init(&out.tree, gpa, lms, ots, id, seed);
     }
 
     pub fn deinit(self: *LmsSecretKey) void {
@@ -323,30 +323,36 @@ pub const SecretKey = struct {
     built: u8 = 0,
     path: [max_levels]u32 = @splat(0),
 
-    /// Generate the key: builds only the top tree (RFC 8554 §6.1 says the
-    /// lower ones may wait for the first signature, and they do). `seed` is
-    /// the secret and `id` the 16-byte identifier of the top tree, both
-    /// per Appendix A; the caller supplies them (no RNG in this module) from a
-    /// CSPRNG. `restore_at` restores an existing key; null starts at 0.
-    pub fn init(gpa: Allocator, levels: []const Level, seed: [n]u8, id: [id_len]u8, restore_at: ?Position) InitError!SecretKey {
+    /// Generate the key into `out`: builds only the top tree (RFC 8554 §6.1
+    /// says the lower ones may wait for the first signature, and they do).
+    /// `seed` is the secret (by pointer, so no frame holds a copy) and `id`
+    /// the 16-byte identifier of the top tree, both per Appendix A; the caller
+    /// supplies them (no RNG in this module) from a CSPRNG. `restore_at`
+    /// restores an existing key; null starts at 0. On error `out` holds no
+    /// secret.
+    pub fn init(out: *SecretKey, gpa: Allocator, levels: []const Level, seed: *const [n]u8, id: [id_len]u8, restore_at: ?Position) InitError!void {
+        out.seed = @splat(0); // stays zero on every error return
         if (levels.len < 1 or levels.len > max_levels) return error.InvalidLevels;
         const pos = restore_at orelse Position{};
         if (!pos.exhausted) {
             for (levels, 0..) |lv, i| if (pos.q[i] >= lv.lms.leaves()) return error.InvalidPosition;
         }
-        var sk: SecretKey = .{
+        out.* = .{
             .gpa = gpa,
-            .seed = seed,
+            .seed = seed.*,
             .levels = undefined,
             .n_levels = @intCast(levels.len),
             .pos = pos,
         };
-        @memcpy(sk.levels[0..levels.len], levels);
-        const top = try Tree.init(gpa, levels[0].lms, levels[0].ots, id, seed);
-        sk.trees[0] = top;
-        sk.pubs[0] = top.publicKey();
-        sk.built = 1;
-        return sk;
+        @memcpy(out.levels[0..levels.len], levels);
+        out.trees[0] = @as(Tree, undefined);
+        Tree.init(&out.trees[0].?, gpa, levels[0].lms, levels[0].ots, id, seed) catch |e| {
+            out.trees[0] = null;
+            std.crypto.secureZero(u8, &out.seed);
+            return e;
+        };
+        out.pubs[0] = out.trees[0].?.publicKey();
+        out.built = 1;
     }
 
     /// Wipes the seeds and frees the caches.
@@ -386,9 +392,9 @@ pub const SecretKey = struct {
     }
 
     /// The SEED and I of the tree at level `level` for the path `path`
-    /// (`path.len == level`, the parents' leaf indices). Level 0 is the key
-    /// itself and is not derived.
-    fn deriveChild(master: *const [n]u8, level: u8, path: []const u32) struct { seed: [n]u8, id: [id_len]u8 } {
+    /// (`path.len == level`, the parents' leaf indices), written to the
+    /// out-params. Level 0 is the key itself and is not derived.
+    fn deriveChild(seed_out: *[n]u8, id_out: *[id_len]u8, master: *const [n]u8, level: u8, path: []const u32) void {
         var out: [2][n]u8 = undefined;
         for (&out, 0..) |*o, tag| {
             var h = Sha256.init(.{});
@@ -398,9 +404,9 @@ pub const SecretKey = struct {
             h.update(master);
             o.* = h.finalResult();
         }
-        const id: [id_len]u8 = out[1][0..id_len].*;
-        std.crypto.secureZero(u8, &out[1]);
-        return .{ .seed = out[0], .id = id };
+        seed_out.* = out[0];
+        id_out.* = out[1][0..id_len].*;
+        std.crypto.secureZero(u8, std.mem.asBytes(&out));
     }
 
     fn dropFrom(self: *SecretKey, keep: u8) void {
@@ -418,25 +424,39 @@ pub const SecretKey = struct {
     /// the signing state: the certificates it creates are deterministic
     /// functions of the key, so repeating this after a crash is harmless.
     fn ensureTrees(self: *SecretKey, d: [max_levels]u32) Allocator.Error!void {
+        // The child seeds live in this body's frame: run it one frame down and
+        // zero what it dirtied.
+        return burn.run(burn.hss_burn, Allocator.Error!void, ensureTreesBody, .{ self, d });
+    }
+
+    fn ensureTreesBody(self: *SecretKey, d: [max_levels]u32) Allocator.Error!void {
         const total = self.n_levels;
         var keep: u8 = 1;
         while (keep < self.built and keep < total and self.path[keep - 1] == d[keep - 1]) keep += 1;
         if (keep < self.built) self.dropFrom(keep);
         var i: u8 = self.built;
         while (i < total) : (i += 1) {
-            var child = deriveChild(&self.seed, i, d[0..i]);
-            defer std.crypto.secureZero(u8, &child.seed);
+            var child_seed: [n]u8 = undefined;
+            var child_id: [id_len]u8 = undefined;
+            deriveChild(&child_seed, &child_id, &self.seed, i, d[0..i]);
+            defer std.crypto.secureZero(u8, &child_seed);
             const lv = self.levels[i];
-            var tree = try Tree.init(self.gpa, lv.lms, lv.ots, child.id, child.seed);
-            errdefer tree.deinit();
+            self.trees[i] = @as(Tree, undefined);
+            const tree = &self.trees[i].?;
+            Tree.init(tree, self.gpa, lv.lms, lv.ots, child_id, &child_seed) catch |e| {
+                self.trees[i] = null;
+                return e;
+            };
             const parent = self.levels[i - 1];
-            const buf = try self.gpa.alloc(u8, core.lmsSignatureLength(parent.lms, parent.ots));
-            errdefer self.gpa.free(buf);
+            const buf = self.gpa.alloc(u8, core.lmsSignatureLength(parent.lms, parent.ots)) catch |e| {
+                tree.deinit();
+                self.trees[i] = null;
+                return e;
+            };
             const child_pub = tree.publicKey();
             self.trees[i - 1].?.sign(d[i - 1], &child_pub.toBytes(), buf);
             self.pubs[i] = child_pub;
             self.sigs[i - 1] = buf;
-            self.trees[i] = tree;
             self.path[i - 1] = d[i - 1];
             self.built = i + 1;
         }
@@ -499,9 +519,11 @@ pub const SigningKey = struct {
         KeyHandleCopied,
     };
 
-    /// Takes ownership of `sk`; `dst` must already be at its final address.
-    pub fn init(dst: *SigningKey, sk: SecretKey, persist: ?Persist) void {
-        dst.* = .{ .sk = sk, .home = dst, .busy = .init(false), .persist = persist };
+    /// Takes ownership of `*sk` (moved into `dst`, the source then wiped and
+    /// not to be used again); `dst` must already be at its final address.
+    pub fn init(dst: *SigningKey, sk: *SecretKey, persist: ?Persist) void {
+        dst.* = .{ .sk = sk.*, .home = dst, .busy = .init(false), .persist = persist };
+        std.crypto.secureZero(u8, std.mem.asBytes(sk));
     }
 
     pub fn deinit(self: *SigningKey) void {

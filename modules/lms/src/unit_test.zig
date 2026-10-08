@@ -52,7 +52,8 @@ fn qOf(sig: []const u8) u32 {
 
 test "LMS round trip for every LM-OTS w at H5, index strictly increasing" {
     for ([_]lms.OtsParamSet{ .sha256_n32_w1, .sha256_n32_w2, .sha256_n32_w4, .sha256_n32_w8 }) |o| {
-        var sk = try lms.LmsSecretKey.init(gpa, .sha256_m32_h5, o, idOf(7), seedOf(9));
+        var sk: lms.LmsSecretKey = undefined;
+        try lms.LmsSecretKey.init(&sk, gpa, .sha256_m32_h5, o, idOf(7), &seedOf(9));
         defer sk.deinit();
         const pk_bytes = sk.publicKey().toBytes();
         var buf: [lms.max_lms_signature_length]u8 = undefined;
@@ -74,9 +75,11 @@ test "LMS round trip for every LM-OTS w at H5, index strictly increasing" {
 }
 
 test "LMS round trip at H10 (w2), and an unrelated key rejects" {
-    var sk = try lms.LmsSecretKey.init(gpa, .sha256_m32_h10, .sha256_n32_w2, idOf(1), seedOf(2));
+    var sk: lms.LmsSecretKey = undefined;
+    try lms.LmsSecretKey.init(&sk, gpa, .sha256_m32_h10, .sha256_n32_w2, idOf(1), &seedOf(2));
     defer sk.deinit();
-    var other = try lms.LmsSecretKey.init(gpa, .sha256_m32_h5, .sha256_n32_w2, idOf(1), seedOf(2));
+    var other: lms.LmsSecretKey = undefined;
+    try lms.LmsSecretKey.init(&other, gpa, .sha256_m32_h5, .sha256_n32_w2, idOf(1), &seedOf(2));
     defer other.deinit();
     var buf: [lms.max_lms_signature_length]u8 = undefined;
     const sig = try sk.sign("h10", &buf);
@@ -85,7 +88,8 @@ test "LMS round trip at H10 (w2), and an unrelated key rejects" {
 }
 
 test "LMS: exhausted key returns KeyExhausted and never signs again" {
-    var sk = try lms.LmsSecretKey.init(gpa, .sha256_m32_h5, .sha256_n32_w1, idOf(3), seedOf(4));
+    var sk: lms.LmsSecretKey = undefined;
+    try lms.LmsSecretKey.init(&sk, gpa, .sha256_m32_h5, .sha256_n32_w1, idOf(3), &seedOf(4));
     defer sk.deinit();
     var buf: [lms.max_lms_signature_length]u8 = undefined;
     var last: i64 = -1;
@@ -100,7 +104,8 @@ test "LMS: exhausted key returns KeyExhausted and never signs again" {
 }
 
 test "LMS: OutputTooSmall consumes no leaf" {
-    var sk = try lms.LmsSecretKey.init(gpa, .sha256_m32_h5, .sha256_n32_w8, idOf(3), seedOf(4));
+    var sk: lms.LmsSecretKey = undefined;
+    try lms.LmsSecretKey.init(&sk, gpa, .sha256_m32_h5, .sha256_n32_w8, idOf(3), &seedOf(4));
     defer sk.deinit();
     var small: [100]u8 = undefined;
     try std.testing.expectError(error.OutputTooSmall, sk.sign("m", &small));
@@ -108,13 +113,15 @@ test "LMS: OutputTooSmall consumes no leaf" {
 }
 
 test "tree cache height changes cost, never the signature" {
-    var full = try lms.Tree.initCached(gpa, .sha256_m32_h5, .sha256_n32_w1, idOf(5), seedOf(6), 0);
+    var full: lms.Tree = undefined;
+    try lms.Tree.initCached(&full, gpa, .sha256_m32_h5, .sha256_n32_w1, idOf(5), &seedOf(6), 0);
     defer full.deinit();
     const len = lms.lmsSignatureLength(.sha256_m32_h5, .sha256_n32_w1);
     var a: [lms.max_lms_signature_length]u8 = undefined;
     var b: [lms.max_lms_signature_length]u8 = undefined;
     for ([_]u5{ 2, 3, 5 }) |c| {
-        var t = try lms.Tree.initCached(gpa, .sha256_m32_h5, .sha256_n32_w1, idOf(5), seedOf(6), c);
+        var t: lms.Tree = undefined;
+        try lms.Tree.initCached(&t, gpa, .sha256_m32_h5, .sha256_n32_w1, idOf(5), &seedOf(6), c);
         defer t.deinit();
         try std.testing.expectEqualSlices(u8, &full.root(), &t.root());
         try std.testing.expectEqual((@as(usize, 1) << (5 - c + 1)) - 1, t.nodes.len);
@@ -140,7 +147,8 @@ fn recursiveNode(o: lms.OtsParamSet, h: u5, id: *const [16]u8, seed: *const [32]
 }
 
 test "tree root equals the recursive definition of T[1] (§5.3)" {
-    var t = try lms.Tree.init(gpa, .sha256_m32_h5, .sha256_n32_w1, idOf(0x42), seedOf(0x24));
+    var t: lms.Tree = undefined;
+    try lms.Tree.init(&t, gpa, .sha256_m32_h5, .sha256_n32_w1, idOf(0x42), &seedOf(0x24));
     defer t.deinit();
     const want = recursiveNode(.sha256_n32_w1, 5, &t.id, &t.seed, 1);
     try std.testing.expectEqualSlices(u8, &want, &t.root());
@@ -160,7 +168,8 @@ fn levelsOf(comptime spec: []const struct { lms.ParamSet, lms.OtsParamSet }) [sp
 test "HSS round trip for L = 1 .. 8 (H5, w1 at every level)" {
     inline for (1..9) |count| {
         const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** count;
-        var sk = try lms.SecretKey.init(gpa, &levels, seedOf(count), idOf(count), null);
+        var sk: lms.SecretKey = undefined;
+        try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(count), idOf(count), null);
         defer sk.deinit();
         const pk_bytes = sk.publicKey().toBytes();
         try std.testing.expectEqual(@as(u32, count), std.mem.readInt(u32, pk_bytes[0..4], .big));
@@ -182,7 +191,8 @@ test "HSS with mixed parameter sets per level, H10 and H5, w1/w2/w4" {
         .{ .sha256_m32_h10, .sha256_n32_w1 },
         .{ .sha256_m32_h5, .sha256_n32_w4 },
     });
-    var sk = try lms.SecretKey.init(gpa, &levels, seedOf(11), idOf(12), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(11), idOf(12), null);
     defer sk.deinit();
     const buf = try gpa.alloc(u8, sk.signatureLength());
     defer gpa.free(buf);
@@ -202,7 +212,8 @@ fn signatureQs(sig: []const u8, levels: []const Level, out: *[lms.max_levels]u32
 
 test "HSS L=2: the position increases strictly across a lower-tree boundary and every signature verifies" {
     const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
-    var sk = try lms.SecretKey.init(gpa, &levels, seedOf(1), idOf(2), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(1), idOf(2), null);
     defer sk.deinit();
     const pk = sk.publicKey().toBytes();
     const buf = try gpa.alloc(u8, sk.signatureLength());
@@ -231,7 +242,8 @@ test "HSS L=2: the position increases strictly across a lower-tree boundary and 
 
 test "HSS: an exhausted key refuses, after exactly the product of the tree sizes" {
     const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
-    var sk = try lms.SecretKey.init(gpa, &levels, seedOf(5), idOf(6), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(5), idOf(6), null);
     defer sk.deinit();
     const pk = sk.publicKey().toBytes();
     const buf = try gpa.alloc(u8, sk.signatureLength());
@@ -247,7 +259,8 @@ test "HSS: an exhausted key refuses, after exactly the product of the tree sizes
 
 test "HSS: a key restored at a position signs exactly what the walked key would" {
     const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
-    var a = try lms.SecretKey.init(gpa, &levels, seedOf(8), idOf(9), null);
+    var a: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&a, gpa, &levels, &seedOf(8), idOf(9), null);
     defer a.deinit();
     const buf_a = try gpa.alloc(u8, a.signatureLength());
     defer gpa.free(buf_a);
@@ -256,7 +269,8 @@ test "HSS: a key restored at a position signs exactly what the walked key would"
     try std.testing.expectEqual(@as(u32, 1), restored_at.q[0]);
     try std.testing.expectEqual(@as(u32, 4), restored_at.q[1]);
 
-    var b = try lms.SecretKey.init(gpa, &levels, seedOf(8), idOf(9), restored_at);
+    var b: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&b, gpa, &levels, &seedOf(8), idOf(9), restored_at);
     defer b.deinit();
     const buf_b = try gpa.alloc(u8, b.signatureLength());
     defer gpa.free(buf_b);
@@ -268,15 +282,18 @@ test "HSS: a key restored at a position signs exactly what the walked key would"
 
 test "HSS init validation" {
     const one = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }};
-    try std.testing.expectError(error.InvalidLevels, lms.SecretKey.init(gpa, &.{}, seedOf(1), idOf(1), null));
+    var scratch: lms.SecretKey = undefined;
+    try std.testing.expectError(error.InvalidLevels, lms.SecretKey.init(&scratch, gpa, &.{}, &seedOf(1), idOf(1), null));
+    try std.testing.expect(std.mem.allEqual(u8, &scratch.seed, 0)); // zeroed on error
     const nine = one ** 9;
-    try std.testing.expectError(error.InvalidLevels, lms.SecretKey.init(gpa, &nine, seedOf(1), idOf(1), null));
+    try std.testing.expectError(error.InvalidLevels, lms.SecretKey.init(&scratch, gpa, &nine, &seedOf(1), idOf(1), null));
     var bad: lms.Position = .{};
     bad.q[0] = 32;
-    try std.testing.expectError(error.InvalidPosition, lms.SecretKey.init(gpa, &one, seedOf(1), idOf(1), bad));
+    try std.testing.expectError(error.InvalidPosition, lms.SecretKey.init(&scratch, gpa, &one, &seedOf(1), idOf(1), bad));
     var last: lms.Position = .{};
     last.q[0] = 31;
-    var sk = try lms.SecretKey.init(gpa, &one, seedOf(1), idOf(1), last);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &one, &seedOf(1), idOf(1), last);
     defer sk.deinit();
     var buf: [1000 * 10]u8 = undefined;
     _ = try sk.sign("x", &buf);
@@ -302,9 +319,10 @@ const Log = struct {
 test "SigningKey: the next position is persisted before signing; a failed write burns no leaf" {
     const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
     var log: Log = .{};
-    const sk = try lms.SecretKey.init(gpa, &levels, seedOf(3), idOf(3), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(3), idOf(3), null);
     var handle: lms.SigningKey = undefined;
-    lms.SigningKey.init(&handle, sk, log.hook());
+    lms.SigningKey.init(&handle, &sk, log.hook());
     defer handle.deinit();
     const buf = try gpa.alloc(u8, handle.sk.signatureLength());
     defer gpa.free(buf);
@@ -345,9 +363,10 @@ test "SigningKey: with Persist.io, concurrent signers wait through the Io" {
         }
     };
     var slow: Slow = .{ .io = io };
-    const sk = try lms.SecretKey.init(gpa, &levels, seedOf(4), idOf(4), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(4), idOf(4), null);
     var handle: lms.SigningKey = undefined;
-    lms.SigningKey.init(&handle, sk, .{ .ctx = &slow, .write = Slow.write, .io = io });
+    lms.SigningKey.init(&handle, &sk, .{ .ctx = &slow, .write = Slow.write, .io = io });
     defer handle.deinit();
 
     const Worker = struct {
@@ -366,9 +385,10 @@ test "SigningKey: with Persist.io, concurrent signers wait through the Io" {
 
 test "SigningKey: a copied handle refuses to sign" {
     const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }};
-    const sk = try lms.SecretKey.init(gpa, &levels, seedOf(3), idOf(3), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(3), idOf(3), null);
     var handle: lms.SigningKey = undefined;
-    lms.SigningKey.init(&handle, sk, null);
+    lms.SigningKey.init(&handle, &sk, null);
     defer handle.deinit();
     const buf = try gpa.alloc(u8, handle.sk.signatureLength());
     defer gpa.free(buf);
@@ -379,7 +399,8 @@ test "SigningKey: a copied handle refuses to sign" {
 
 test "deinit wipes the seeds" {
     const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
-    var sk = try lms.SecretKey.init(gpa, &levels, seedOf(0xAA), idOf(1), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(0xAA), idOf(1), null);
     const buf = try gpa.alloc(u8, sk.signatureLength());
     defer gpa.free(buf);
     _ = try sk.sign("m", buf); // builds the level-1 tree, whose seed is derived
@@ -389,7 +410,8 @@ test "deinit wipes the seeds" {
     try std.testing.expect(!std.mem.allEqual(u8, &t1.seed, 0));
     sk.deinit();
     try std.testing.expect(std.mem.allEqual(u8, &sk.seed, 0));
-    var lk = try lms.LmsSecretKey.init(gpa, .sha256_m32_h5, .sha256_n32_w1, idOf(1), seedOf(0xBB));
+    var lk: lms.LmsSecretKey = undefined;
+    try lms.LmsSecretKey.init(&lk, gpa, .sha256_m32_h5, .sha256_n32_w1, idOf(1), &seedOf(0xBB));
     lk.deinit();
     try std.testing.expect(std.mem.allEqual(u8, &lk.tree.seed, 0));
 }
@@ -443,7 +465,8 @@ test "signature parsing: length, typecode, index and level-count lies are reject
         .{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 },
         .{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w2 },
     };
-    var sk = try lms.SecretKey.init(gpa, &levels, seedOf(1), idOf(1), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(1), idOf(1), null);
     defer sk.deinit();
     const pk = sk.publicKey().toBytes();
     const good_buf = try gpa.alloc(u8, sk.signatureLength() + 1);
@@ -518,7 +541,8 @@ test "the LM-OTS randomizer is derived, deterministic and leaf-specific" {
     try std.testing.expect(!std.mem.eql(u8, &c0, &c1));
     // And distinct from every private chain start value x_q[i], i <= 264.
     for (0..265) |i| {
-        const x = core.deriveX(&idOf(1), 0, @intCast(i), &seedOf(2));
+        var x: [32]u8 = undefined;
+        core.deriveX(&x, &idOf(1), 0, @intCast(i), &seedOf(2));
         try std.testing.expect(!std.mem.eql(u8, &x, &c0));
     }
 }
@@ -526,7 +550,8 @@ test "the LM-OTS randomizer is derived, deterministic and leaf-specific" {
 // ── audit 2026-10-03: state discipline, derivation and bounds ────────────────
 
 test "LMS: out exactly signatureLength is enough, one byte less is OutputTooSmall" {
-    var sk = try lms.LmsSecretKey.init(gpa, .sha256_m32_h5, .sha256_n32_w8, idOf(3), seedOf(4));
+    var sk: lms.LmsSecretKey = undefined;
+    try lms.LmsSecretKey.init(&sk, gpa, .sha256_m32_h5, .sha256_n32_w8, idOf(3), &seedOf(4));
     defer sk.deinit();
     const len = sk.signatureLength();
     const buf = try gpa.alloc(u8, len);
@@ -540,7 +565,8 @@ test "LMS: out exactly signatureLength is enough, one byte less is OutputTooSmal
 
 test "HssPublicKey.verify: a hand-built key with L outside 1..8 verifies nothing" {
     const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }};
-    var sk = try lms.SecretKey.init(gpa, &levels, seedOf(1), idOf(1), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(1), idOf(1), null);
     defer sk.deinit();
     const buf = try gpa.alloc(u8, sk.signatureLength());
     defer gpa.free(buf);
@@ -555,7 +581,8 @@ test "HssPublicKey.verify: a hand-built key with L outside 1..8 verifies nothing
 
 test "HSS: every lower tree is its own tree, and its seed is not its public identifier" {
     const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 3;
-    var sk = try lms.SecretKey.init(gpa, &levels, seedOf(0x5a), idOf(0x5b), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(0x5a), idOf(0x5b), null);
     defer sk.deinit();
     const buf = try gpa.alloc(u8, sk.signatureLength());
     defer gpa.free(buf);
@@ -592,9 +619,10 @@ test "HSS: out of memory while building a lower tree burns no leaf; staying in a
     const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
     var fa = std.testing.FailingAllocator.init(gpa, .{});
     var log: Log = .{};
-    const sk = try lms.SecretKey.init(fa.allocator(), &levels, seedOf(6), idOf(6), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, fa.allocator(), &levels, &seedOf(6), idOf(6), null);
     var handle: lms.SigningKey = undefined;
-    lms.SigningKey.init(&handle, sk, log.hook());
+    lms.SigningKey.init(&handle, &sk, log.hook());
     defer handle.deinit();
     const buf = try gpa.alloc(u8, handle.sk.signatureLength());
     defer gpa.free(buf);
@@ -640,14 +668,16 @@ test "HSS: a position persisted as exhausted restores as exhausted and never sig
     try std.testing.expect(done.exhausted);
     try std.testing.expectEqual(@as(u32, 0), done.q[0]);
     try std.testing.expectEqual(@as(u32, 0), done.q[1]);
-    var sk = try lms.SecretKey.init(gpa, &levels, seedOf(2), idOf(2), done);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(2), idOf(2), done);
     defer sk.deinit();
     const buf = try gpa.alloc(u8, sk.signatureLength());
     defer gpa.free(buf);
     try std.testing.expectError(error.KeyExhausted, sk.sign("m", buf));
     try std.testing.expect(sk.position().exhausted);
     // The last leaf of the last tree is still usable, and only once.
-    var sk2 = try lms.SecretKey.init(gpa, &levels, seedOf(2), idOf(2), last);
+    var sk2: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk2, gpa, &levels, &seedOf(2), idOf(2), last);
     defer sk2.deinit();
     _ = try sk2.sign("m", buf);
     try std.testing.expect(sk2.position().exhausted);
@@ -676,12 +706,13 @@ const Probe = struct {
 
 test "SigningKey: the position is durable before any signature byte exists; the last write says exhausted" {
     const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }};
-    const sk = try lms.SecretKey.init(gpa, &levels, seedOf(7), idOf(7), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(7), idOf(7), null);
     var handle: lms.SigningKey = undefined;
     const buf = try gpa.alloc(u8, sk.signatureLength());
     defer gpa.free(buf);
     var probe: Probe = .{ .out = buf, .handle = &handle };
-    lms.SigningKey.init(&handle, sk, .{ .ctx = &probe, .write = Probe.write });
+    lms.SigningKey.init(&handle, &sk, .{ .ctx = &probe, .write = Probe.write });
     defer handle.deinit();
     for (0..32) |i| {
         @memset(buf, 0);
@@ -727,10 +758,11 @@ fn exclusionRun(with_io: bool) !void {
     const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w8 }}; // 1296-byte signatures
     const io = std.testing.io;
     var ex: Excl = .{ .io = io, .handle = undefined };
-    const sk = try lms.SecretKey.init(gpa, &levels, seedOf(9), idOf(9), null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(9), idOf(9), null);
     var handle: lms.SigningKey = undefined;
     ex.handle = &handle;
-    lms.SigningKey.init(&handle, sk, .{ .ctx = &ex, .write = Excl.write, .io = if (with_io) io else null });
+    lms.SigningKey.init(&handle, &sk, .{ .ctx = &ex, .write = Excl.write, .io = if (with_io) io else null });
     defer handle.deinit();
     var buf: [1300]u8 = undefined;
     _ = try handle.sign("a", &buf);

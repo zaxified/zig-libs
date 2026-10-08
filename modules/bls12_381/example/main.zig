@@ -34,22 +34,23 @@ pub fn main(init: std.process.Init) !void {
     var sks: [3]bls_sig.SecretKey = undefined;
     var pks: [3]bls_sig.PublicKey = undefined;
     for (ikms, 0..) |ikm, i| {
-        sks[i] = try bls_sig.keyGen(ikm, "");
-        pks[i] = bls_sig.skToPk(sks[i]);
+        try bls_sig.keyGen(&sks[i], ikm, "");
+        pks[i] = bls_sig.skToPk(&sks[i]);
         if (!bls_sig.keyValidate(pks[i])) return error.BadKey;
     }
 
     // Registration-time step: each validator proves possession of the key
     // behind its public key, defeating rogue-key attacks against the
     // aggregate verify used below (draft §3.3.4's precondition).
-    for (sks, pks) |sk, pk| {
+    for (&sks, pks) |*sk, pk| {
         const proof = bls_sig.popProve(sk);
         if (!bls_sig.popVerify(pk, proof)) return error.PopFailed;
     }
 
     // `keyGen` also names its precondition failure: an IKM under 32 bytes
     // is rejected rather than silently accepted.
-    _ = bls_sig.keyGen("too-short", "") catch |err| switch (err) {
+    var rejected: bls_sig.SecretKey = undefined;
+    bls_sig.keyGen(&rejected, "too-short", "") catch |err| switch (err) {
         error.IkmTooShort => std.debug.print("short IKM correctly rejected\n", .{}),
         else => return err,
     };
@@ -57,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
     // All three validators co-sign the same block header.
     const header = "block #4,102,881 state_root=0xabc123";
     var sigs: [3]bls_sig.Signature = undefined;
-    for (sks, 0..) |sk, i| sigs[i] = bls_sig.sign(sk, header);
+    for (&sks, 0..) |*sk, i| sigs[i] = bls_sig.sign(sk, header);
 
     // The collector aggregates into a single signature for the wire.
     const agg = try bls_sig.aggregate(&sigs);
@@ -89,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
     // (one final exponentiation) instead of one per signature.
     const atts = [_][]const u8{ "att slot 1", "att slot 2", "att slot 3" };
     var att_sigs: [3]bls_sig.Signature = undefined;
-    for (sks, atts, &att_sigs) |sk, m, *sig| sig.* = bls_sig.sign(sk, m);
+    for (&sks, atts, &att_sigs) |*sk, m, *sig| sig.* = bls_sig.sign(sk, m);
     const batch_ok = try bls_sig.verifyBatch(io, &pks, &atts, &att_sigs);
     std.debug.print("verifyBatch of {d} attestations: {}\n", .{ atts.len, batch_ok });
     if (!batch_ok) return error.BatchFailed;
@@ -98,16 +99,17 @@ pub fn main(init: std.process.Init) !void {
     // its EIP-2334 path.
     const seed = [_]u8{0x5e} ** 32;
     const path = try bls12_381.eip2333.parsePath("m/12381/3600/0/0/0");
-    var vsk = try bls12_381.eip2333.derivePath(&seed, path.slice());
+    var vsk: bls_sig.SecretKey = undefined;
+    try bls12_381.eip2333.derivePath(&vsk, &seed, path.slice());
     defer vsk.deinit();
-    const vpk = bls_sig.skToPk(vsk);
+    const vpk = bls_sig.skToPk(&vsk);
     std.debug.print("validator 0 pubkey starts {x}\n", .{vpk.toBytes()[0..4]});
 
     // The min-sig suite: 48-byte signatures, 96-byte keys (drand quicknet's
     // BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_).
     const S = bls_sig.MinSigBasic;
-    const beacon_pk = S.skToPk(sks[0]);
-    const beacon_sig = S.sign(sks[0], "round 1000");
+    const beacon_pk = S.skToPk(&sks[0]);
+    const beacon_sig = S.sign(&sks[0], "round 1000");
     std.debug.print("min-sig: {d}-byte signature verifies: {}\n", .{ S.Signature.encoded_bytes, S.verify(beacon_pk, "round 1000", beacon_sig) });
     if (!S.verify(beacon_pk, "round 1000", beacon_sig)) return error.MinSigFailed;
 

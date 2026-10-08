@@ -40,27 +40,29 @@ pub const KeyPair = struct {
     key_number: [8]u8,
     ed25519: std.crypto.sign.Ed25519.KeyPair,
 
-    pub fn generate(io: std.Io) KeyPair;
-    pub fn publicKey(self: KeyPair) RawPublicKey;
-    pub fn toRawSecretKeyPlain(self: KeyPair) RawSecretKey;
+    // secrets cross the API by pointer: inputs `*const`, results through `out`
+    // (zeroed on error), so no frame of ours or the caller's holds a copy
+    pub fn generate(out: *KeyPair, io: std.Io) void;
+    pub fn publicKey(self: *const KeyPair) RawPublicKey;
+    pub fn toRawSecretKeyPlain(self: *const KeyPair, out: *RawSecretKey) void;
 };
 
 // scrypt encryption of the secret key (ops_limit_sensitive/mem_limit_sensitive
 // are the CLI's own defaults; ops_limit_interactive/mem_limit_interactive the
 // lighter preset)
-pub fn sealSecretKey(allocator, key_pair: KeyPair, password: []const u8, salt: [32]u8, ops_limit: u64, mem_limit: usize) !RawSecretKey;
-pub fn openSecretKey(allocator, raw: RawSecretKey, password: ?[]const u8) !KeyPair; // password null only for an unencrypted key
+pub fn sealSecretKey(allocator, out: *RawSecretKey, key_pair: *const KeyPair, password: []const u8, salt: [32]u8, ops_limit: u64, mem_limit: usize) !void;
+pub fn openSecretKey(allocator, out: *KeyPair, raw: *const RawSecretKey, password: ?[]const u8) !void; // password null only for an unencrypted key
 
 // text file parse (borrows comment slices from the input) / write (to a std.Io.Writer)
 pub fn parsePublicKeyFile(text: []const u8) !ParsedPublicKey;
-pub fn parseSecretKeyFile(text: []const u8) !ParsedSecretKey;
+pub fn parseSecretKeyFile(out: *ParsedSecretKey, text: []const u8) !void;
 pub fn parseSignatureFile(text: []const u8) !ParsedSignature;
 pub fn writePublicKeyFile(w: *std.Io.Writer, untrusted_comment: []const u8, key: RawPublicKey) !void;
-pub fn writeSecretKeyFile(w: *std.Io.Writer, untrusted_comment: []const u8, key: RawSecretKey) !void;
+pub fn writeSecretKeyFile(w: *std.Io.Writer, untrusted_comment: []const u8, key: *const RawSecretKey) !void;
 pub fn writeSignatureFile(w: *std.Io.Writer, untrusted_comment: []const u8, signature: RawSignature, trusted_comment: []const u8, global_signature: [64]u8) !void;
 
 // sign / verify (whole message resident in RAM)
-pub fn signFile(allocator, key_pair: KeyPair, message: []const u8, algorithm: Algorithm, trusted_comment: []const u8) !SignedFile;
+pub fn signFile(allocator, key_pair: *const KeyPair, message: []const u8, algorithm: Algorithm, trusted_comment: []const u8) !SignedFile;
 pub fn verifyFile(allocator, public_key: RawPublicKey, message: []const u8, parsed: ParsedSignature) !void;
 
 // sign / verify a PRECOMPUTED BLAKE2b-512 digest instead — this is what
@@ -68,9 +70,9 @@ pub fn verifyFile(allocator, public_key: RawPublicKey, message: []const u8, pars
 // std.crypto.hash.blake2.Blake2b512.update in a chunked read loop) rather
 // than holding it resident in RAM. Prehashed ("ED") only — the legacy
 // ("Ed") algorithm signs raw file bytes directly and cannot stream.
-pub fn signDigest(key_pair: KeyPair, digest: [64]u8) !RawSignature;
+pub fn signDigest(key_pair: *const KeyPair, digest: [64]u8) !RawSignature;
 pub fn verifyDigest(public_key: RawPublicKey, digest: [64]u8, sig: RawSignature) !void;
-pub fn signFileDigest(allocator, key_pair: KeyPair, digest: [64]u8, trusted_comment: []const u8) !SignedFile;
+pub fn signFileDigest(allocator, key_pair: *const KeyPair, digest: [64]u8, trusted_comment: []const u8) !SignedFile;
 pub fn verifyFileDigest(allocator, public_key: RawPublicKey, digest: [64]u8, parsed: ParsedSignature) !void;
 ```
 
@@ -81,8 +83,10 @@ const minisign = @import("minisign");
 const io = ...; // std.Io instance
 
 // Generate a key pair and sign a message.
-const kp = minisign.KeyPair.generate(io);
-const signed = try minisign.signFile(gpa, kp, message, .prehashed, "release v1.2.3");
+var kp: minisign.KeyPair = undefined;
+minisign.KeyPair.generate(&kp, io);
+defer kp.wipe();
+const signed = try minisign.signFile(gpa, &kp, message, .prehashed, "release v1.2.3");
 
 var buf: [1024]u8 = undefined;
 var w: std.Io.Writer = .fixed(&buf);

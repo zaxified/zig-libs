@@ -19,6 +19,7 @@
 const std = @import("std");
 const scalarmod = @import("scalar.zig");
 const bls_sig = @import("bls_sig.zig");
+const burn = @import("burn.zig");
 
 const Fr = scalarmod.Fr;
 const SecretKey = bls_sig.SecretKey;
@@ -70,7 +71,7 @@ fn ikmToLamportSk(out: *[lamport_chunks * lamport_k]u8, ikm: *const [32]u8, salt
 }
 
 /// `parent_SK_to_lamport_PK`: compressed Lamport public key (32 bytes).
-fn parentSkToLamportPk(parent: Fr, index: u32) [32]u8 {
+fn parentSkToLamportPk(out: *[32]u8, parent: *const Fr, index: u32) void {
     var salt: [4]u8 = undefined;
     std.mem.writeInt(u32, &salt, index, .big);
 
@@ -95,35 +96,51 @@ fn parentSkToLamportPk(parent: Fr, index: u32) [32]u8 {
         Sha256.hash(lamport_0[i * lamport_k ..][0..lamport_k], pk[i * lamport_k ..][0..lamport_k], .{});
         Sha256.hash(lamport_1[i * lamport_k ..][0..lamport_k], pk[(lamport_chunks + i) * lamport_k ..][0..lamport_k], .{});
     }
-    var out: [32]u8 = undefined;
-    Sha256.hash(&pk, &out, .{});
-    return out;
+    Sha256.hash(&pk, out, .{});
 }
 
 /// EIP-2333 `derive_master_SK(seed)`. `seed` MUST be at least 32 bytes.
-pub fn deriveMasterSk(seed: []const u8) Eip2333Error!SecretKey {
-    if (seed.len < 32) return error.SeedTooShort;
-    return .{ .scalar = hkdfModR(seed) };
+/// Every derivation below writes its key to `out` (zeroed on error), runs
+/// one frame down and zeroes the stack it dirtied (`burn.zig`).
+pub fn deriveMasterSk(out: *SecretKey, seed: []const u8) Eip2333Error!void {
+    if (seed.len < 32) {
+        out.deinit();
+        return error.SeedTooShort;
+    }
+    burn.run(burn.derive_burn, void, deriveMasterBody, .{ out, seed });
+}
+
+fn deriveMasterBody(out: *SecretKey, seed: []const u8) void {
+    out.scalar = hkdfModR(seed);
 }
 
 /// EIP-2333 `derive_child_SK(parent_SK, index)`; `index` is the full u32
-/// (EIP-2333 does not distinguish hardened indices).
-pub fn deriveChildSk(parent: SecretKey, index: u32) SecretKey {
-    var lpk = parentSkToLamportPk(parent.scalar, index);
+/// (EIP-2333 does not distinguish hardened indices). `out` may alias
+/// `parent`.
+pub fn deriveChildSk(out: *SecretKey, parent: *const SecretKey, index: u32) void {
+    burn.run(burn.derive_burn, void, deriveChildBody, .{ out, parent, index });
+}
+
+fn deriveChildBody(out: *SecretKey, parent: *const SecretKey, index: u32) void {
+    var lpk: [32]u8 = undefined;
     defer std.crypto.secureZero(u8, &lpk);
-    return .{ .scalar = hkdfModR(&lpk) };
+    parentSkToLamportPk(&lpk, &parent.scalar, index);
+    out.scalar = hkdfModR(&lpk);
 }
 
 /// Derive along `path` from the master key of `seed` (empty path = master).
-pub fn derivePath(seed: []const u8, path: []const u32) Eip2333Error!SecretKey {
-    var sk = try deriveMasterSk(seed);
-    for (path) |idx| {
-        // Each intermediate key is a secret the caller never sees: wipe it.
-        const child = deriveChildSk(sk, idx);
-        sk.deinit();
-        sk = child;
+pub fn derivePath(out: *SecretKey, seed: []const u8, path: []const u32) Eip2333Error!void {
+    if (seed.len < 32) {
+        out.deinit();
+        return error.SeedTooShort;
     }
-    return sk;
+    burn.run(burn.derive_burn, void, derivePathBody, .{ out, seed, path });
+}
+
+fn derivePathBody(out: *SecretKey, seed: []const u8, path: []const u32) void {
+    // Every intermediate key lives only in `out`, overwritten in place.
+    deriveMasterBody(out, seed);
+    for (path) |idx| deriveChildBody(out, out, idx);
 }
 
 /// Maximum number of components `parsePath` accepts.
@@ -214,7 +231,8 @@ const vectors = [_]Vec{
 
 test "eip2333: EIP master_SK vectors" {
     for (vectors) |v| {
-        const sk = try deriveMasterSk(v.seed);
+        var sk: bls_sig.SecretKey = undefined;
+        try deriveMasterSk(&sk, v.seed);
         try testing.expectEqualSlices(u8, &v.master, &sk.scalar.toBytes());
     }
 }
@@ -222,14 +240,17 @@ test "eip2333: EIP master_SK vectors" {
 test "eip2333: EIP child_SK vectors" {
     for (vectors) |v| {
         const master = try Fr.fromBytes(v.master);
-        const child = deriveChildSk(.{ .scalar = master }, v.index);
+        const parent: SecretKey = .{ .scalar = master };
+        var child: SecretKey = undefined;
+        deriveChildSk(&child, &parent, v.index);
         try testing.expectEqualSlices(u8, &v.child, &child.scalar.toBytes());
     }
 }
 
 test "eip2333: compressed_lamport_PK intermediate from the EIP" {
     const master = try Fr.fromBytes(vectors[0].master);
-    const lpk = parentSkToLamportPk(master, 0);
+    var lpk: [32]u8 = undefined;
+    parentSkToLamportPk(&lpk, &master, 0);
     const expected = hexAlloc("dd635d27d1d52b9a49df9e5c0c622360a4dd17cba7db4e89bce3cb048fb721a5");
     try testing.expectEqualSlices(u8, &expected, &lpk);
 }
@@ -238,27 +259,32 @@ test "eip2333: negative control, flipped seed byte does not match" {
     var seed: [64]u8 = undefined;
     @memcpy(&seed, vectors[0].seed);
     seed[10] ^= 1;
-    const sk = try deriveMasterSk(&seed);
+    var sk: bls_sig.SecretKey = undefined;
+    try deriveMasterSk(&sk, &seed);
     try testing.expect(!std.mem.eql(u8, &vectors[0].master, &sk.scalar.toBytes()));
 }
 
 test "eip2333: seed shorter than 32 bytes is rejected" {
     var seed: [31]u8 = @splat(7);
-    try testing.expectError(error.SeedTooShort, deriveMasterSk(&seed));
-    try testing.expectError(error.SeedTooShort, derivePath(&seed, &.{}));
+    var sk: SecretKey = undefined;
+    try testing.expectError(error.SeedTooShort, deriveMasterSk(&sk, &seed));
+    try testing.expectError(error.SeedTooShort, derivePath(&sk, &seed, &.{}));
     var ok: [32]u8 = @splat(7);
-    _ = try deriveMasterSk(&ok);
+    try deriveMasterSk(&sk, &ok);
 }
 
 test "eip2333: derivePath equals chained deriveChildSk" {
     const seed = vectors[3].seed;
     const p = try parsePath("m/12381/3600/0/0/0");
     try testing.expectEqualSlices(u32, &.{ 12381, 3600, 0, 0, 0 }, p.slice());
-    var sk = try deriveMasterSk(seed);
-    for ([_]u32{ 12381, 3600, 0, 0, 0 }) |i| sk = deriveChildSk(sk, i);
-    const via = try derivePath(seed, p.slice());
+    var sk: bls_sig.SecretKey = undefined;
+    try deriveMasterSk(&sk, seed);
+    for ([_]u32{ 12381, 3600, 0, 0, 0 }) |i| deriveChildSk(&sk, &sk, i);
+    var via: bls_sig.SecretKey = undefined;
+    try derivePath(&via, seed, p.slice());
     try testing.expectEqualSlices(u8, &sk.scalar.toBytes(), &via.scalar.toBytes());
-    const master = try derivePath(seed, &.{});
+    var master: bls_sig.SecretKey = undefined;
+    try derivePath(&master, seed, &.{});
     try testing.expectEqualSlices(u8, &vectors[3].master, &master.scalar.toBytes());
 }
 

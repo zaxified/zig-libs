@@ -13,6 +13,7 @@ const pairingmod = @import("pairing.zig");
 const hash_to_curve = @import("hash_to_curve.zig");
 const entropy = @import("entropy");
 const bls_sig = @import("bls_sig.zig");
+const burn = @import("burn.zig");
 
 const SecretKey = bls_sig.SecretKey;
 const BlsError = bls_sig.BlsError;
@@ -145,8 +146,13 @@ pub fn Bls(comptime variant: Variant, comptime scheme: Scheme) type {
         }
 
         /// draft §2.4 `SkToPk(SK) = SK * P`, `P` the `PkGroup` generator.
-        /// Constant-time `scalarMul` — `SK` is secret.
-        pub fn skToPk(sk: SecretKey) PublicKey {
+        /// Constant-time `scalarMul` — `SK` is secret, so it is passed by
+        /// pointer and the multiply runs one frame down, burned after.
+        pub fn skToPk(sk: *const SecretKey) PublicKey {
+            return burn.run(burn.sign_burn, PublicKey, skToPkBody, .{sk});
+        }
+
+        fn skToPkBody(sk: *const SecretKey) PublicKey {
             const p = PkGroup.Jacobian.fromAffine(PkGroup.Affine.generator).scalarMul(sk.scalar);
             return .{ .point = p.toAffine() };
         }
@@ -160,7 +166,7 @@ pub fn Bls(comptime variant: Variant, comptime scheme: Scheme) type {
 
         /// draft §2.6 `CoreSign` over `parts`, under `dst`. The hash lands
         /// in the subgroup by construction (RFC 9380 `clear_cofactor`).
-        fn coreSign(sk: SecretKey, parts: []const []const u8, dst: []const u8) Signature {
+        fn coreSign(sk: *const SecretKey, parts: []const []const u8, dst: []const u8) Signature {
             const q = hashToPoint(parts, dst);
             // Constant-time: `sk` is secret; `q` is public.
             const r = SigGroup.Jacobian.fromAffine(q).scalarMul(sk.scalar);
@@ -179,9 +185,14 @@ pub fn Bls(comptime variant: Variant, comptime scheme: Scheme) type {
 
         /// `Sign(SK, message)`: `CoreSign` under `dst_sig`; for
         /// MessageAugmentation over `SkToPk(SK) || message` (draft §3.2.1).
-        pub fn sign(sk: SecretKey, msg: []const u8) Signature {
+        /// The body runs one frame down and is burned after.
+        pub fn sign(sk: *const SecretKey, msg: []const u8) Signature {
+            return burn.run(burn.sign_burn, Signature, signBody, .{ sk, msg });
+        }
+
+        fn signBody(sk: *const SecretKey, msg: []const u8) Signature {
             if (scheme == .message_augmentation) {
-                const pk_bytes = skToPk(sk).toBytes();
+                const pk_bytes = skToPkBody(sk).toBytes();
                 return coreSign(sk, &.{ &pk_bytes, msg }, dst_sig);
             }
             return coreSign(sk, &.{msg}, dst_sig);
@@ -297,8 +308,12 @@ pub fn Bls(comptime variant: Variant, comptime scheme: Scheme) type {
         /// bytes under `dst_pop`.
         pub const popProve = if (scheme == .proof_of_possession) popProveImpl else {};
 
-        fn popProveImpl(sk: SecretKey) Signature {
-            const pk_bytes = skToPk(sk).toBytes();
+        fn popProveImpl(sk: *const SecretKey) Signature {
+            return burn.run(burn.sign_burn, Signature, popProveBody, .{sk});
+        }
+
+        fn popProveBody(sk: *const SecretKey) Signature {
+            const pk_bytes = skToPkBody(sk).toBytes();
             return coreSign(sk, &.{&pk_bytes}, dst_pop);
         }
 
@@ -459,7 +474,7 @@ fn testKeys(comptime n: usize) [n]SecretKey {
     for (&sks, 0..) |*sk, i| {
         var ikm: [32]u8 = @splat(@intCast(0x40 + i));
         ikm[31] = 0x5c;
-        sk.* = bls_sig.keyGen(&ikm, "scheme test") catch unreachable;
+        bls_sig.keyGen(sk, &ikm, "scheme test") catch unreachable;
     }
     return sks;
 }
@@ -467,10 +482,10 @@ fn testKeys(comptime n: usize) [n]SecretKey {
 test "every suite: sign → verify; a wrong message, key or suite is rejected" {
     const sks = testKeys(2);
     inline for (all_suites) |S| {
-        const pk = S.skToPk(sks[0]);
-        const other = S.skToPk(sks[1]);
+        const pk = S.skToPk(&sks[0]);
+        const other = S.skToPk(&sks[1]);
         try testing.expect(S.keyValidate(pk));
-        const sig = S.sign(sks[0], "attestation");
+        const sig = S.sign(&sks[0], "attestation");
         try testing.expect(S.verify(pk, "attestation", sig));
         try testing.expect(!S.verify(pk, "attestatioN", sig));
         try testing.expect(!S.verify(other, "attestation", sig));
@@ -481,12 +496,12 @@ test "every suite: sign → verify; a wrong message, key or suite is rejected" {
     }
     // Same groups, different scheme: the DST (and for AUG the message)
     // differs, so a signature never crosses suites.
-    const sig_basic = MinPkBasic.sign(sks[0], "m");
-    const pk_basic = MinPkBasic.skToPk(sks[0]);
+    const sig_basic = MinPkBasic.sign(&sks[0], "m");
+    const pk_basic = MinPkBasic.skToPk(&sks[0]);
     try testing.expect(!MinPkAug.verify(.{ .point = pk_basic.point }, "m", .{ .point = sig_basic.point }));
     try testing.expect(!MinPkPop.verify(.{ .point = pk_basic.point }, "m", .{ .point = sig_basic.point }));
-    const sig_sb = MinSigBasic.sign(sks[0], "m");
-    const pk_sb = MinSigBasic.skToPk(sks[0]);
+    const sig_sb = MinSigBasic.sign(&sks[0], "m");
+    const pk_sb = MinSigBasic.skToPk(&sks[0]);
     try testing.expect(!MinSigAug.verify(.{ .point = pk_sb.point }, "m", .{ .point = sig_sb.point }));
     try testing.expect(!MinSigPop.verify(.{ .point = pk_sb.point }, "m", .{ .point = sig_sb.point }));
 }
@@ -494,14 +509,14 @@ test "every suite: sign → verify; a wrong message, key or suite is rejected" {
 test "MessageAugmentation signs PK || message: it equals CoreSign over the concatenation" {
     const sks = testKeys(1);
     inline for (.{ MinPkAug, MinSigAug }) |S| {
-        const pk = S.skToPk(sks[0]);
+        const pk = S.skToPk(&sks[0]);
         var buf: [S.PublicKey.encoded_bytes + 5]u8 = undefined;
         @memcpy(buf[0..S.PublicKey.encoded_bytes], &pk.toBytes());
         @memcpy(buf[S.PublicKey.encoded_bytes..], "hello");
-        const want = S.coreSign(sks[0], &.{&buf}, S.dst_sig);
-        try testing.expectEqual(want.toBytes(), S.sign(sks[0], "hello").toBytes());
+        const want = S.coreSign(&sks[0], &.{&buf}, S.dst_sig);
+        try testing.expectEqual(want.toBytes(), S.sign(&sks[0], "hello").toBytes());
         // A plain CoreVerify of the bare message must fail.
-        try testing.expect(!S.coreVerify(pk, &.{"hello"}, S.dst_sig, S.sign(sks[0], "hello")));
+        try testing.expect(!S.coreVerify(pk, &.{"hello"}, S.dst_sig, S.sign(&sks[0], "hello")));
     }
 }
 
@@ -512,8 +527,8 @@ test "aggregateVerify per scheme: Basic refuses equal messages, AUG and POP acce
         var sigs: [3]S.Signature = undefined;
         const distinct = [_][]const u8{ "m0", "m1", "m2" };
         for (&pks, &sigs, sks, distinct) |*pk, *sig, sk, m| {
-            pk.* = S.skToPk(sk);
-            sig.* = S.sign(sk, m);
+            pk.* = S.skToPk(&sk);
+            sig.* = S.sign(&sk, m);
         }
         const agg = try S.aggregate(&sigs);
         try testing.expect(try S.aggregateVerify(&pks, &distinct, agg));
@@ -521,7 +536,7 @@ test "aggregateVerify per scheme: Basic refuses equal messages, AUG and POP acce
         try testing.expect(!try S.aggregateVerify(&pks, &.{ "m1", "m0", "m2" }, agg));
 
         const same = [_][]const u8{ "same", "same", "other" };
-        for (&sigs, sks, same) |*sig, sk, m| sig.* = S.sign(sk, m);
+        for (&sigs, sks, same) |*sig, sk, m| sig.* = S.sign(&sk, m);
         const agg_same = try S.aggregate(&sigs);
         const ok = try S.aggregateVerify(&pks, &same, agg_same);
         try testing.expectEqual(S != MinPkBasic and S != MinSigBasic, ok);
@@ -537,14 +552,14 @@ test "min-sig ProofOfPossession: popProve/popVerify and fastAggregateVerify" {
     var pks: [3]S.PublicKey = undefined;
     var sigs: [3]S.Signature = undefined;
     for (&pks, &sigs, sks) |*pk, *sig, sk| {
-        pk.* = S.skToPk(sk);
-        try testing.expect(S.popVerify(pk.*, S.popProve(sk)));
-        sig.* = S.sign(sk, "block 42");
+        pk.* = S.skToPk(&sk);
+        try testing.expect(S.popVerify(pk.*, S.popProve(&sk)));
+        sig.* = S.sign(&sk, "block 42");
     }
     // A proof is not a signature over the key bytes (separate DST), and a
     // proof for one key does not verify for another.
-    try testing.expect(!S.verify(pks[0], &pks[0].toBytes(), S.popProve(sks[0])));
-    try testing.expect(!S.popVerify(pks[1], S.popProve(sks[0])));
+    try testing.expect(!S.verify(pks[0], &pks[0].toBytes(), S.popProve(&sks[0])));
+    try testing.expect(!S.popVerify(pks[1], S.popProve(&sks[0])));
     const agg = try S.aggregate(&sigs);
     try testing.expect(try S.fastAggregateVerify(&pks, "block 42", agg));
     try testing.expect(!try S.fastAggregateVerify(pks[0..2], "block 42", agg));
@@ -553,7 +568,7 @@ test "min-sig ProofOfPossession: popProve/popVerify and fastAggregateVerify" {
 test "min-sig verifiers reject the identity key and a non-subgroup G1 signature" {
     const sks = testKeys(1);
     const S = MinSigBasic;
-    const sig = S.sign(sks[0], "m");
+    const sig = S.sign(&sks[0], "m");
     try testing.expect(!S.verify(.{ .point = g2.Affine.identity }, "m", .{ .point = g1.Affine.identity }));
     try testing.expect(!S.keyValidate(.{ .point = g2.Affine.identity }));
     // A point on E1 outside the order-r subgroup: the map-to-curve output
@@ -562,8 +577,8 @@ test "min-sig verifiers reject the identity key and a non-subgroup G1 signature"
     const u = hash_to_curve.hashToFieldFp(1, "off-subgroup", "TEST-DST")[0];
     const raw = hash_to_curve.mapToCurveG1(u);
     try testing.expect(!g1.Jacobian.fromAffine(raw).subgroupCheck());
-    try testing.expect(!S.verify(S.skToPk(sks[0]), "m", .{ .point = raw }));
-    try testing.expect(S.verify(S.skToPk(sks[0]), "m", sig));
+    try testing.expect(!S.verify(S.skToPk(&sks[0]), "m", .{ .point = raw }));
+    try testing.expect(S.verify(S.skToPk(&sks[0]), "m", sig));
 }
 
 test "verifyBatch: valid batches pass in every suite, across Miller chunks" {
@@ -573,15 +588,15 @@ test "verifyBatch: valid batches pass in every suite, across Miller chunks" {
         var sigs: [10]S.Signature = undefined;
         var msgs: [10][]const u8 = undefined;
         for (&pks, &sigs, &msgs, sks, 0..) |*pk, *sig, *m, sk, i| {
-            pk.* = S.skToPk(sk);
+            pk.* = S.skToPk(&sk);
             // Repeated messages are fine in a batch, in every scheme.
             m.* = if (i % 3 == 0) "dup" else "msg";
-            sig.* = S.sign(sk, m.*);
+            sig.* = S.sign(&sk, m.*);
         }
         try testing.expect(try S.verifyBatch(testing.io, &pks, &msgs, &sigs));
         // One signature for the wrong message spoils the batch.
         const saved = sigs[7];
-        sigs[7] = S.sign(sks[7], "forged");
+        sigs[7] = S.sign(&sks[7], "forged");
         try testing.expect(!try S.verifyBatch(testing.io, &pks, &msgs, &sigs));
         sigs[7] = saved;
         // Errors before any work.
@@ -593,9 +608,9 @@ test "verifyBatch: valid batches pass in every suite, across Miller chunks" {
 test "verifyBatch: two invalid signatures whose errors cancel are caught (the reason for the random coefficients)" {
     const sks = testKeys(2);
     inline for (.{ MinPkBasic, MinSigBasic }) |S| {
-        const pks = [_]S.PublicKey{ S.skToPk(sks[0]), S.skToPk(sks[1]) };
+        const pks = [_]S.PublicKey{ S.skToPk(&sks[0]), S.skToPk(&sks[1]) };
         const msgs = [_][]const u8{ "pay alice", "pay bob" };
-        const good = [_]S.Signature{ S.sign(sks[0], msgs[0]), S.sign(sks[1], msgs[1]) };
+        const good = [_]S.Signature{ S.sign(&sks[0], msgs[0]), S.sign(&sks[1], msgs[1]) };
         // D: any non-identity point of the signature group.
         const d = S.SigGroup.Jacobian.fromAffine(S.SigGroup.Affine.generator);
         const bad = [_]S.Signature{
@@ -616,13 +631,13 @@ test "verifyBatch: two invalid signatures whose errors cancel are caught (the re
 test "verifyBatch never accepts what verify refuses: identity key, non-subgroup signature" {
     const sks = testKeys(2);
     const S = MinPkPop;
-    var pks = [_]S.PublicKey{ S.skToPk(sks[0]), S.skToPk(sks[1]) };
+    var pks = [_]S.PublicKey{ S.skToPk(&sks[0]), S.skToPk(&sks[1]) };
     const msgs = [_][]const u8{ "a", "b" };
-    var sigs = [_]S.Signature{ S.sign(sks[0], "a"), S.sign(sks[1], "b") };
+    var sigs = [_]S.Signature{ S.sign(&sks[0], "a"), S.sign(&sks[1], "b") };
     pks[1] = .{ .point = g1.Affine.identity };
     sigs[1] = .{ .point = g2.Affine.identity };
     try testing.expect(!try S.verifyBatch(testing.io, &pks, &msgs, &sigs));
-    pks[1] = S.skToPk(sks[1]);
+    pks[1] = S.skToPk(&sks[1]);
     const u = hash_to_curve.hashToFieldFp2(1, "off-subgroup", "TEST-DST")[0];
     sigs[1] = .{ .point = hash_to_curve.mapToCurveG2(u) };
     try testing.expect(!g2.Jacobian.fromAffine(sigs[1].point).subgroupCheck());

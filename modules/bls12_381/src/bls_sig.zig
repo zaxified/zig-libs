@@ -34,6 +34,7 @@ const g2 = @import("g2.zig");
 const scalarmod = @import("scalar.zig");
 const pairingmod = @import("pairing.zig");
 const hash_to_curve = @import("hash_to_curve.zig");
+const burn = @import("burn.zig");
 
 pub const Fr = scalarmod.Fr;
 
@@ -64,18 +65,31 @@ pub const SecretKey = struct {
 
     pub const encoded_bytes = Fr.encoded_bytes;
 
-    /// REAL — delegates to `Fr.toBytes` directly.
-    pub fn toBytes(self: SecretKey) [encoded_bytes]u8 {
-        return self.scalar.toBytes();
+    /// REAL — `Fr.toBytes` into `out` (a secret: never returned through the
+    /// stack).
+    pub fn toBytes(self: *const SecretKey, out: *[encoded_bytes]u8) void {
+        burn.run(burn.codec_burn, void, toBytesBody, .{ self, out });
+    }
+
+    fn toBytesBody(self: *const SecretKey, out: *[encoded_bytes]u8) void {
+        out.* = self.scalar.toBytes();
     }
 
     /// REAL — delegates to `Fr.fromBytes` directly (rejects `>= r`,
     /// same canonical-encoding contract as `Fr` itself; does NOT
     /// reject `0`, since a zero scalar is merely a degenerate key, not
     /// a malformed encoding — `keyGen` itself never returns one, but a
-    /// hand-crafted or corrupted key might decode to one).
-    pub fn fromBytes(bytes: [encoded_bytes]u8) BlsError!SecretKey {
-        return .{ .scalar = try Fr.fromBytes(bytes) };
+    /// hand-crafted or corrupted key might decode to one). The key is
+    /// written to `out`; on error `out` is zeroed.
+    pub fn fromBytes(out: *SecretKey, bytes: *const [encoded_bytes]u8) BlsError!void {
+        burn.run(burn.codec_burn, BlsError!void, fromBytesBody, .{ out, bytes }) catch |e| {
+            out.deinit();
+            return e;
+        };
+    }
+
+    fn fromBytesBody(out: *SecretKey, bytes: *const [encoded_bytes]u8) BlsError!void {
+        out.scalar = try Fr.fromBytes(bytes.*);
     }
 
     /// Zeroize the secret scalar in place. `SecretKey` is entirely
@@ -144,10 +158,19 @@ comptime {
 /// round (`salt = H("BLS-SIG-KEYGEN-SALT-")`), which -05 does only on a
 /// retry — so the same IKM gives a DIFFERENT key there. For Ethereum-
 /// style hierarchical keys use `eip2333.zig`.
-pub fn keyGen(ikm: []const u8, key_info: []const u8) BlsError!SecretKey {
-    if (ikm.len < 32) return error.IkmTooShort;
+///
+/// The key is written to `out`; on error `out` is zeroed. The body runs one
+/// frame down and the stack it dirtied (PRK, OKM, the key) is zeroed after it.
+pub fn keyGen(out: *SecretKey, ikm: []const u8, key_info: []const u8) BlsError!void {
+    if (ikm.len < 32) {
+        out.deinit();
+        return error.IkmTooShort;
+    }
     std.debug.assert(key_info.len <= 254);
+    burn.run(burn.keygen_burn, void, keyGenBody, .{ out, ikm, key_info });
+}
 
+fn keyGenBody(out: *SecretKey, ikm: []const u8, key_info: []const u8) void {
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
     var salt_buf: [32]u8 = undefined;
     var salt: []const u8 = default_salt;
@@ -167,8 +190,8 @@ pub fn keyGen(ikm: []const u8, key_info: []const u8) BlsError!SecretKey {
         var okm: [l_bytes]u8 = undefined;
         Hkdf.expand(&okm, ctx, prk);
 
-        const sk = Fr.reduceWide(&okm);
-        if (!sk.isZero()) return .{ .scalar = sk };
+        out.scalar = Fr.reduceWide(&okm);
+        if (!out.scalar.isZero()) return;
 
         std.crypto.hash.sha2.Sha256.hash(salt, &salt_buf, .{});
         salt = &salt_buf;
@@ -220,9 +243,10 @@ fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
 test "SecretKey.deinit zeroizes the secret scalar (regression: fails if secureZero is removed)" {
     var sk_bytes = [_]u8{0} ** 32;
     sk_bytes[31] = 7;
-    var sk = try SecretKey.fromBytes(sk_bytes);
+    var sk: SecretKey = undefined;
+    try SecretKey.fromBytes(&sk, &sk_bytes);
     const zero_bytes = [_]u8{0} ** 32;
-    try std.testing.expect(!std.mem.eql(u8, &sk.toBytes(), &zero_bytes));
+    try std.testing.expect(!std.mem.eql(u8, &testSkBytes(&sk), &zero_bytes));
     sk.deinit();
     // `Fr`'s in-memory (Montgomery) size may exceed its 32-byte canonical
     // encoding, so assert every raw byte of the struct is zero rather than
@@ -233,8 +257,9 @@ test "SecretKey.deinit zeroizes the secret scalar (regression: fails if secureZe
 test "SecretKey/PublicKey/Signature byte codecs round-trip through Part-1-3 machinery" {
     var sk_bytes = [_]u8{0} ** 32;
     sk_bytes[31] = 7;
-    const sk = try SecretKey.fromBytes(sk_bytes);
-    try std.testing.expectEqualSlices(u8, &sk_bytes, &sk.toBytes());
+    var sk: SecretKey = undefined;
+    try SecretKey.fromBytes(&sk, &sk_bytes);
+    try std.testing.expectEqualSlices(u8, &sk_bytes, &testSkBytes(&sk));
 
     const pk: PublicKey = .{ .point = g1.Affine.generator };
     const pk_bytes = pk.toBytes();
@@ -250,21 +275,25 @@ test "SecretKey/PublicKey/Signature byte codecs round-trip through Part-1-3 mach
 }
 
 test "keyGen rejects IKM shorter than 32 bytes" {
-    try std.testing.expectError(error.IkmTooShort, keyGen(&[_]u8{0} ** 31, ""));
-    _ = try keyGen(&[_]u8{0x42} ** 32, ""); // 32 bytes: must not error
+    var short: SecretKey = undefined;
+    try std.testing.expectError(error.IkmTooShort, keyGen(&short, &[_]u8{0} ** 31, ""));
+    try keyGen(&short, &[_]u8{0x42} ** 32, ""); // 32 bytes: must not error
 }
 
 test "keyGen is deterministic (same IKM/key_info -> same SK) and produces a nonzero scalar" {
     const ikm = [_]u8{0xab} ** 32;
-    const a = try keyGen(&ikm, "");
-    const b = try keyGen(&ikm, "");
+    var a: SecretKey = undefined;
+    try keyGen(&a, &ikm, "");
+    var b: SecretKey = undefined;
+    try keyGen(&b, &ikm, "");
     try std.testing.expect(a.scalar.eql(b.scalar));
     try std.testing.expect(!a.scalar.isZero());
 
     // Different key_info overwhelmingly likely gives a different SK
     // (not a correctness requirement, just a sanity check that
     // key_info actually participates in the derivation).
-    const c = try keyGen(&ikm, "some-key-info");
+    var c: SecretKey = undefined;
+    try keyGen(&c, &ikm, "some-key-info");
     try std.testing.expect(!a.scalar.eql(c.scalar));
 }
 
@@ -275,17 +304,20 @@ test "keyGen matches an independent Python recomputation of the -05 construction
     // info suffix and the raw first-iteration salt are each pinned. The
     // mutation run of that date dropped the I2OSP(0, 1) octet and nothing
     // failed.
-    const a = try keyGen(&([_]u8{0xab} ** 32), "");
+    var a: SecretKey = undefined;
+    try keyGen(&a, &([_]u8{0xab} ** 32), "");
     try std.testing.expectEqualSlices(u8, &hexBytes(32, "5122c7e03ead241c21b84fe0afce6ce677f68bb82fb5ca6253b3c7e862a61905"), &a.scalar.toBytes());
     var ikm: [32]u8 = undefined;
     for (&ikm, 0..) |*b, i| b.* = @intCast(i);
-    const b = try keyGen(&ikm, "key-info");
+    var b: SecretKey = undefined;
+    try keyGen(&b, &ikm, "key-info");
     try std.testing.expectEqualSlices(u8, &hexBytes(32, "15c5471e3f4598a3108d05a8bd55669c4b65d857442cacdb274e38b909ec81f5"), &b.scalar.toBytes());
 }
 
 test "skToPk produces a subgroup-valid, non-identity public key; keyValidate accepts it" {
-    const sk = try keyGen(&([_]u8{0x11} ** 32), "");
-    const pk = skToPk(sk);
+    var sk: SecretKey = undefined;
+    try keyGen(&sk, &([_]u8{0x11} ** 32), "");
+    const pk = skToPk(&sk);
     try std.testing.expect(!pk.point.infinity);
     try std.testing.expect(keyValidate(pk));
 }
@@ -377,11 +409,12 @@ test "fastAggregateVerify rejects an empty pubkey slice before any pairing work"
 
 test "sign KAT: privkey/message -> published signature (ethereum/bls12-381-tests v0.1.2, sign/sign_case_11b8c7cad5238946.json)" {
     // Source: same tarball as the aggregate KAT above — see NOTICE.
-    const sk = try SecretKey.fromBytes(hexBytes(32, "47b8192d77bf871b62e87859d653922725724a5c031afeabc60bcef5ff665138"));
+    var sk: SecretKey = undefined;
+    try SecretKey.fromBytes(&sk, &hexBytes(32, "47b8192d77bf871b62e87859d653922725724a5c031afeabc60bcef5ff665138"));
     const msg = hexBytes(32, "0000000000000000000000000000000000000000000000000000000000000000");
     const expected = hexBytes(96, "b23c46be3a001c63ca711f87a005c200cc550b9429d5f4eb38d74322144f1b63926da3388979e5321012fb1a0526bcd100b5ef5fe72628ce4cd5e904aeaa3279527843fae5ca9ca675f4f51ed8f83bbf7155da9ecc9663100a885d5dc6df96d9");
 
-    const sig = sign(sk, &msg);
+    const sig = sign(&sk, &msg);
     try std.testing.expectEqualSlices(u8, &expected, &sig.toBytes());
 }
 
@@ -429,27 +462,31 @@ test "fastAggregateVerify KAT: three pubkeys + the aggregate signature over thei
 }
 
 test "PopProve/PopVerify round-trip (self-consistent — no external vector needed)" {
-    const sk = try keyGen(&([_]u8{0x22} ** 32), "");
-    const pk = skToPk(sk);
-    const proof = popProve(sk);
+    var sk: SecretKey = undefined;
+    try keyGen(&sk, &([_]u8{0x22} ** 32), "");
+    const pk = skToPk(&sk);
+    const proof = popProve(&sk);
     try std.testing.expect(popVerify(pk, proof));
 
     // A proof for a DIFFERENT key must not verify.
-    const other_sk = try keyGen(&([_]u8{0x33} ** 32), "");
-    const other_pk = skToPk(other_sk);
+    var other_sk: SecretKey = undefined;
+    try keyGen(&other_sk, &([_]u8{0x33} ** 32), "");
+    const other_pk = skToPk(&other_sk);
     try std.testing.expect(!popVerify(other_pk, proof));
 }
 
 test "end-to-end round trip: keyGen -> skToPk -> sign -> verify -> aggregate -> aggregateVerify (fresh key material, no external constant needed)" {
-    const sk1 = try keyGen(&([_]u8{0x01} ** 32), "");
-    const sk2 = try keyGen(&([_]u8{0x02} ** 32), "");
-    const pk1 = skToPk(sk1);
-    const pk2 = skToPk(sk2);
+    var sk1: SecretKey = undefined;
+    try keyGen(&sk1, &([_]u8{0x01} ** 32), "");
+    var sk2: SecretKey = undefined;
+    try keyGen(&sk2, &([_]u8{0x02} ** 32), "");
+    const pk1 = skToPk(&sk1);
+    const pk2 = skToPk(&sk2);
 
     const msg1 = "first message";
     const msg2 = "second message";
-    const sig1 = sign(sk1, msg1);
-    const sig2 = sign(sk2, msg2);
+    const sig1 = sign(&sk1, msg1);
+    const sig2 = sign(&sk2, msg2);
 
     try std.testing.expect(verify(pk1, msg1, sig1));
     try std.testing.expect(!verify(pk1, msg2, sig1)); // wrong message
@@ -470,9 +507,10 @@ test "verify rejects the identity public key (KeyValidate fires, fail-closed, no
     // A well-formed signature by a REAL key over this message — the
     // only invalid ingredient is the identity pubkey, so a `true` or a
     // panic here would mean the mandatory KeyValidate step is missing.
-    const sk = try keyGen(&([_]u8{0x55} ** 32), "");
+    var sk: SecretKey = undefined;
+    try keyGen(&sk, &([_]u8{0x55} ** 32), "");
     const msg = "identity pk must never verify";
-    const sig = sign(sk, msg);
+    const sig = sign(&sk, msg);
 
     const identity_pk: PublicKey = .{ .point = g1.Affine.identity };
     try std.testing.expect(!verify(identity_pk, msg, sig));
@@ -480,7 +518,7 @@ test "verify rejects the identity public key (KeyValidate fires, fail-closed, no
 
     // Aggregate entry points too: an identity pk anywhere in the set
     // must fail closed, not error and not panic.
-    const good_pk = skToPk(sk);
+    const good_pk = skToPk(&sk);
     const two_msgs: []const []const u8 = &.{ msg, msg };
     try std.testing.expect(!(try aggregateVerify(&.{ good_pk, identity_pk }, two_msgs, sig)));
 }
@@ -498,8 +536,9 @@ test "fastAggregateVerify rejects a ROGUE-KEY pair (cancels to identity) + the t
     // catch this forgery; ONLY `keyValidate`'s explicit check on the
     // aggregated key stands between an attacker who controls no secret
     // key at all and a signature that "verifies" for any message.
-    const sk = try keyGen(&([_]u8{0x77} ** 32), "");
-    const pk1 = skToPk(sk);
+    var sk: SecretKey = undefined;
+    try keyGen(&sk, &([_]u8{0x77} ** 32), "");
+    const pk1 = skToPk(&sk);
     try std.testing.expect(keyValidate(pk1)); // precondition: pk1 alone is fine
     const pk2: PublicKey = .{ .point = g1.Jacobian.fromAffine(pk1.point).negate().toAffine() };
     try std.testing.expect(keyValidate(pk2)); // precondition: pk2 alone is fine too
@@ -519,8 +558,10 @@ test "verify rejects a non-subgroup G2 signature (signature_subgroup_check fires
     try std.testing.expect(g2.Jacobian.fromAffine(raw).isOnCurve());
     try std.testing.expect(!g2.Jacobian.fromAffine(raw).subgroupCheck());
 
-    const sk = try keyGen(&([_]u8{0x66} ** 32), "");
-    const pk = skToPk(sk);
+    var sk: SecretKey = undefined;
+
+    try keyGen(&sk, &([_]u8{0x66} ** 32), "");
+    const pk = skToPk(&sk);
     const bad_sig: Signature = .{ .point = raw };
     const msg = "non-subgroup sig must never verify";
 
@@ -555,9 +596,9 @@ test "aggregateVerify with more signers than one Miller chunk (exercises the chu
     for (0..n) |i| {
         var ikm = [_]u8{0x70} ** 32;
         ikm[31] = @intCast(i);
-        sks[i] = try keyGen(&ikm, "");
-        pks[i] = skToPk(sks[i]);
-        sigs[i] = sign(sks[i], msgs[i]);
+        try keyGen(&sks[i], &ikm, "");
+        pks[i] = skToPk(&sks[i]);
+        sigs[i] = sign(&sks[i], msgs[i]);
     }
 
     const agg_sig = try aggregate(&sigs);
@@ -577,9 +618,11 @@ test "fuzz: SecretKey.fromBytes never crashes on arbitrary bytes" {
 fn fuzzSecretKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     var buf: [SecretKey.encoded_bytes]u8 = undefined;
     smith.bytes(&buf);
-    var sk = SecretKey.fromBytes(buf) catch return;
+    var sk: SecretKey = undefined;
+    SecretKey.fromBytes(&sk, &buf) catch return;
     defer sk.deinit();
-    _ = sk.toBytes();
+    var bytes: [32]u8 = undefined;
+    sk.toBytes(&bytes);
 }
 
 test "fuzz: PublicKey.fromBytes never crashes on arbitrary bytes" {
@@ -603,4 +646,12 @@ fn fuzzSignatureFromBytes(_: void, smith: *std.testing.Smith) !void {
     smith.bytes(&buf);
     const sig = Signature.fromBytes(buf) catch return;
     _ = sig.toBytes();
+}
+
+/// Test helper: a key's encoding as a value (tests compare it; library code
+/// never returns a secret through the stack).
+fn testSkBytes(sk: *const SecretKey) [SecretKey.encoded_bytes]u8 {
+    var b: [SecretKey.encoded_bytes]u8 = undefined;
+    sk.toBytes(&b);
+    return b;
 }

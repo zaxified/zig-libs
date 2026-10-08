@@ -103,6 +103,14 @@ WOTS+/XMSS/hypertree/FORS code serves all twelve sets.
   no systematic side-channel review was done. Secret keys are not zeroized
   on drop — callers with a real key-hygiene requirement must
   `std.crypto.secureZero` their copies.
+- **Dead stack (2026-10-09):** secrets cross the API by pointer (`*const SecretKey`,
+  `*const [n]u8` seeds) and results come back through `out` parameters, so the library
+  makes no by-value copy of SK.seed / SK.prf; `keyGenFromSeed`, `signInternal` and `sign`
+  run their body one frame down and zero the stack it dirtied (`src/burn.zig`).
+  `src/stackprobe_test.zig` (ReleaseFast only) scans a 1 MiB window below the call for
+  SK.seed, SK.prf, the HMAC key blocks of PRF_msg and the top-layer WOTS+ chain-start
+  secrets; 0 residue, negative control 0, positive control found. The caller's own
+  copy of the key (the `KeyPair` it passed in) is, as before, its to wipe.
 - **Deterministic vs hedged signing:** `addrnd = null` is the FIPS 205
   deterministic variant (opt_rand = PK.seed). FIPS 205 recommends hedged
   signing where randomness is available (fault-attack + multi-target
@@ -152,6 +160,12 @@ byte-exact by the FIPS 205 / ACVP vectors and was not re-mutated here.
   in `std`; the work is the OID-prefixed `M'` and the ACVP pre-hash vectors. Fits
   CONVENTIONS §2 (pure Zig). Currently named "out of scope this pass" in *Threat
   model / out of scope*, with no reason given — hence a backlog item, not a refusal.
+- **Stack probe does not recompute FORS leaf secrets** *(2026-10-09)*. They sit at a
+  message-dependent address (the tree and leaf come out of H_msg), which the probe would
+  have to reimplement. The probe's SK.seed windows and the WOTS+ chain-start secrets
+  (same `F(PK.seed, ADRS, SK.seed)` step) cover the inputs and the same code path; a
+  differential needle would need H_msg exposed to tests.
+
 ## Anchoring
 
 **Anchor grade:** class B · oracle EXTERNAL

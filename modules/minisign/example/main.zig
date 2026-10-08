@@ -134,13 +134,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 // file doc comment).
 
 fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
-    var kp = minisign.KeyPair.generate(io);
+    var kp: minisign.KeyPair = undefined;
+    minisign.KeyPair.generate(&kp, io);
     defer kp.wipe();
 
     const message = "zig-libs minisign module -- self-demo message, signed and verified in one process.";
     const trusted_comment = "self-demo trusted comment";
 
-    const signed = try minisign.signFile(gpa, kp, message, .prehashed, trusted_comment);
+    const signed = try minisign.signFile(gpa, &kp, message, .prehashed, trusted_comment);
     const parsed: minisign.ParsedSignature = .{
         .untrusted_comment = "",
         .signature = signed.signature,
@@ -172,7 +173,8 @@ fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
     // (`KeyIdMismatch`); the crypto check (`SignatureVerificationFailed`) is
     // accepted too so this cannot flake on that astronomically unlikely
     // coincidence.
-    var wrong_kp = minisign.KeyPair.generate(io);
+    var wrong_kp: minisign.KeyPair = undefined;
+    minisign.KeyPair.generate(&wrong_kp, io);
     defer wrong_kp.wipe();
     if (minisign.verifyFile(gpa, wrong_kp.publicKey(), message, parsed)) |_| {
         @panic("minisign-demo: self-demo: a signature verified against the WRONG public key");
@@ -485,14 +487,14 @@ fn defaultTrustedComment(gpa: Allocator, message_path: []const u8, algorithm: mi
 /// Prompt for a password only if the on-disk key is actually encrypted —
 /// mirrors real `minisign`'s own behaviour of never asking for a password
 /// an unencrypted (`-W`) key does not have.
-fn openWithPasswordIfNeeded(gpa: Allocator, io: std.Io, raw: minisign.RawSecretKey) !minisign.KeyPair {
+fn openWithPasswordIfNeeded(gpa: Allocator, io: std.Io, out: *minisign.KeyPair, raw: *const minisign.RawSecretKey) !void {
     if (std.mem.eql(u8, &raw.kdf_alg, &minisign.kdf_alg_none)) {
-        return minisign.openSecretKey(gpa, raw, null);
+        return minisign.openSecretKey(gpa, out, raw, null);
     }
     var pw_buf: [256]u8 = undefined;
     defer std.crypto.secureZero(u8, &pw_buf);
     const pw = readLine(io, "Password: ", &pw_buf) orelse "";
-    return minisign.openSecretKey(gpa, raw, pw);
+    return minisign.openSecretKey(gpa, out, raw, pw);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -500,11 +502,15 @@ fn openWithPasswordIfNeeded(gpa: Allocator, io: std.Io, raw: minisign.RawSecretK
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn runGenerate(gpa: Allocator, io: std.Io, opts: Options) !u8 {
-    var kp = minisign.KeyPair.generate(io);
+    var kp: minisign.KeyPair = undefined;
+    minisign.KeyPair.generate(&kp, io);
     defer kp.wipe();
 
-    const raw_sec: minisign.RawSecretKey = blk: {
-        if (opts.no_password) break :blk kp.toRawSecretKeyPlain();
+    var raw_sec: minisign.RawSecretKey = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&raw_sec));
+    if (opts.no_password) {
+        kp.toRawSecretKeyPlain(&raw_sec);
+    } else {
         var pw_buf: [256]u8 = undefined;
         defer std.crypto.secureZero(u8, &pw_buf);
         const pw = readLine(io, "Password: ", &pw_buf) orelse {
@@ -513,8 +519,8 @@ fn runGenerate(gpa: Allocator, io: std.Io, opts: Options) !u8 {
         };
         var salt: [minisign.salt_length]u8 = undefined;
         io.random(&salt);
-        break :blk try minisign.sealSecretKey(gpa, kp, pw, salt, minisign.ops_limit_sensitive, minisign.mem_limit_sensitive);
-    };
+        try minisign.sealSecretKey(gpa, &raw_sec, &kp, pw, salt, minisign.ops_limit_sensitive, minisign.mem_limit_sensitive);
+    }
 
     if (std.Io.Dir.path.dirname(opts.seckey_path)) |dir| {
         try std.Io.Dir.cwd().createDirPath(io, dir);
@@ -524,7 +530,7 @@ fn runGenerate(gpa: Allocator, io: std.Io, opts: Options) !u8 {
         var aw: std.Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
         const comment = opts.untrusted_comment orelse minisign.default_secret_key_comment;
-        try minisign.writeSecretKeyFile(&aw.writer, comment, raw_sec);
+        try minisign.writeSecretKeyFile(&aw.writer, comment, &raw_sec);
         writeWholeFile(io, opts.seckey_path, aw.written(), !opts.force) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 std.debug.print("minisign-demo: {s} already exists (use -f to overwrite)\n", .{opts.seckey_path});
@@ -565,12 +571,15 @@ fn runGenerate(gpa: Allocator, io: std.Io, opts: Options) !u8 {
 fn runRecreate(gpa: Allocator, io: std.Io, opts: Options) !u8 {
     const text = (try tryReadWholeFile(gpa, io, opts.seckey_path, .limited(4096), "secret key")) orelse return 1;
     defer gpa.free(text);
-    const parsed = minisign.parseSecretKeyFile(text) catch {
+    var parsed: minisign.ParsedSecretKey = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&parsed.key));
+    minisign.parseSecretKeyFile(&parsed, text) catch {
         std.debug.print("minisign-demo: {s} is not a minisign secret key\n", .{opts.seckey_path});
         return 1;
     };
 
-    var kp = try openWithPasswordIfNeeded(gpa, io, parsed.key);
+    var kp: minisign.KeyPair = undefined;
+    try openWithPasswordIfNeeded(gpa, io, &kp, &parsed.key);
     defer kp.wipe();
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
@@ -592,16 +601,22 @@ fn runRecreate(gpa: Allocator, io: std.Io, opts: Options) !u8 {
 fn runChangePassword(gpa: Allocator, io: std.Io, opts: Options) !u8 {
     const text = (try tryReadWholeFile(gpa, io, opts.seckey_path, .limited(4096), "secret key")) orelse return 1;
     defer gpa.free(text);
-    const parsed = minisign.parseSecretKeyFile(text) catch {
+    var parsed: minisign.ParsedSecretKey = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&parsed.key));
+    minisign.parseSecretKeyFile(&parsed, text) catch {
         std.debug.print("minisign-demo: {s} is not a minisign secret key\n", .{opts.seckey_path});
         return 1;
     };
 
-    var kp = try openWithPasswordIfNeeded(gpa, io, parsed.key);
+    var kp: minisign.KeyPair = undefined;
+    try openWithPasswordIfNeeded(gpa, io, &kp, &parsed.key);
     defer kp.wipe();
 
-    const raw_sec: minisign.RawSecretKey = blk: {
-        if (opts.no_password) break :blk kp.toRawSecretKeyPlain();
+    var raw_sec: minisign.RawSecretKey = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&raw_sec));
+    if (opts.no_password) {
+        kp.toRawSecretKeyPlain(&raw_sec);
+    } else {
         var pw_buf: [256]u8 = undefined;
         defer std.crypto.secureZero(u8, &pw_buf);
         const pw = readLine(io, "New password: ", &pw_buf) orelse {
@@ -610,12 +625,12 @@ fn runChangePassword(gpa: Allocator, io: std.Io, opts: Options) !u8 {
         };
         var salt: [minisign.salt_length]u8 = undefined;
         io.random(&salt);
-        break :blk try minisign.sealSecretKey(gpa, kp, pw, salt, minisign.ops_limit_sensitive, minisign.mem_limit_sensitive);
-    };
+        try minisign.sealSecretKey(gpa, &raw_sec, &kp, pw, salt, minisign.ops_limit_sensitive, minisign.mem_limit_sensitive);
+    }
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
-    try minisign.writeSecretKeyFile(&aw.writer, parsed.untrusted_comment, raw_sec);
+    try minisign.writeSecretKeyFile(&aw.writer, parsed.untrusted_comment, &raw_sec);
     try writeWholeFile(io, opts.seckey_path, aw.written(), false);
 
     try printOut(io, "updated {s}\n", .{opts.seckey_path});
@@ -629,12 +644,15 @@ fn runChangePassword(gpa: Allocator, io: std.Io, opts: Options) !u8 {
 fn runSign(gpa: Allocator, io: std.Io, opts: Options) !u8 {
     const text = (try tryReadWholeFile(gpa, io, opts.seckey_path, .limited(4096), "secret key")) orelse return 1;
     defer gpa.free(text);
-    const parsed = minisign.parseSecretKeyFile(text) catch {
+    var parsed: minisign.ParsedSecretKey = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&parsed.key));
+    minisign.parseSecretKeyFile(&parsed, text) catch {
         std.debug.print("minisign-demo: {s} is not a minisign secret key\n", .{opts.seckey_path});
         return 1;
     };
 
-    var kp = try openWithPasswordIfNeeded(gpa, io, parsed.key);
+    var kp: minisign.KeyPair = undefined;
+    try openWithPasswordIfNeeded(gpa, io, &kp, &parsed.key);
     defer kp.wipe();
 
     const algorithm: minisign.Algorithm = if (opts.legacy) .legacy else .prehashed;
@@ -665,11 +683,11 @@ fn runSign(gpa: Allocator, io: std.Io, opts: Options) !u8 {
                 },
             };
             defer gpa.free(message);
-            break :blk try minisign.signFile(gpa, kp, message, .legacy, trusted_comment);
+            break :blk try minisign.signFile(gpa, &kp, message, .legacy, trusted_comment);
         },
         .prehashed => blk: {
             const d = (try tryDigestFile(io, opts.message_path)) orelse return 1;
-            break :blk try minisign.signFileDigest(gpa, kp, d.bytes, trusted_comment);
+            break :blk try minisign.signFileDigest(gpa, &kp, d.bytes, trusted_comment);
         },
     };
 

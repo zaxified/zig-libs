@@ -73,12 +73,14 @@ test "Test Case 2: both public keys regenerate from the RFC's SEED and I (Append
         .{ .lms = .sha256_m32_h10, .ots = .sha256_n32_w4 },
         .{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w8 },
     };
-    var sk = try lms.SecretKey.init(gpa, &levels, seed0, id0, null);
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seed0, id0, null);
     defer sk.deinit();
     try std.testing.expectEqualSlices(u8, &tc2_pub, &sk.publicKey().toBytes());
 
     // Second-level tree (H5/W8): its public key is the one inside the signature.
-    var t1 = try lms.Tree.init(gpa, .sha256_m32_h5, .sha256_n32_w8, id1, seed1);
+    var t1: lms.Tree = undefined;
+    try lms.Tree.init(&t1, gpa, .sha256_m32_h5, .sha256_n32_w8, id1, &seed1);
     defer t1.deinit();
     const l1 = tc2_sig[4 + 2508 ..][0..56];
     try std.testing.expectEqualSlices(u8, l1, &t1.publicKey().toBytes());

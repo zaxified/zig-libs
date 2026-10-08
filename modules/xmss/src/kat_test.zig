@@ -41,7 +41,8 @@ test "KAT: F chain step (thash_f) vs reference" {
     var words: [8]u32 = undefined;
     for (&words, 0..) |*word, j| word.* = @intCast(7 * j + 1);
     var adrs = xmss.Adrs.fromWords(words);
-    try std.testing.expectEqualSlices(u8, &decodeHex(vec.f_out), &xmss.chainStep(&in, &pub_seed, &adrs));
+    xmss.chainStep(&in, &pub_seed, &adrs);
+    try std.testing.expectEqualSlices(u8, &decodeHex(vec.f_out), &in);
 }
 
 test "KAT: H randomized tree hash (thash_h) vs reference" {
@@ -123,7 +124,8 @@ const interop_msg = "XMSS interop test message";
 
 test "KAT: reduced-height h=4 keygen + sign byte-exact vs reference" {
     const seeds = refSeeds();
-    var kp = Xmss4.keyGen(seeds.sk_seed, seeds.sk_prf, seeds.pub_seed);
+    var kp: Xmss4.KeyPair = undefined;
+    Xmss4.keyGen(&kp, &seeds.sk_seed, &seeds.sk_prf, &seeds.pub_seed);
 
     const pk_ref = decodeHex(vec.xmss4_pk);
     try std.testing.expectEqualSlices(u8, pk_ref[0..n], &kp.pk.root);
@@ -211,7 +213,8 @@ fn expectAuthMatchesFromScratch(comptime X: type, sk_seed: *const [n]u8, pub_see
 test "BDS: h=4 exhaustive sequential signing + differential vs from-scratch auth" {
     const X = Xmss4;
     const seeds = refSeeds();
-    var kp = X.keyGen(seeds.sk_seed, seeds.sk_prf, seeds.pub_seed);
+    var kp: X.KeyPair = undefined;
+    X.keyGen(&kp, &seeds.sk_seed, &seeds.sk_prf, &seeds.pub_seed);
 
     // Sign every leaf sequentially. Each signature must verify, carry the
     // right index, and its BDS-produced auth path must byte-match a fully
@@ -241,7 +244,8 @@ test "BDS: h=6 sequential sweep verifies every leaf; differential across the 2^(
         b.* = @truncate(53 * i + 11);
         c.* = @truncate(67 * i + 13);
     }
-    var kp = X.keyGen(sk_seed, sk_prf, pub_seed);
+    var kp: X.KeyPair = undefined;
+    X.keyGen(&kp, &sk_seed, &sk_prf, &pub_seed);
 
     // Sign all 2^6 leaves (cheap: each sign is ~O(h)); verify each. Run the
     // O(2^h) from-scratch differential only at boundary indices — in
@@ -270,7 +274,8 @@ test "BDS: out-of-band index jump resynchronizes to a byte-exact auth path" {
 
     // h=4 jumps (cheap, several targets incl. last leaf).
     inline for (.{ 1, 5, 11, 15 }) |target| {
-        var kp = Xmss4.keyGen(seeds.sk_seed, seeds.sk_prf, seeds.pub_seed);
+        var kp: Xmss4.KeyPair = undefined;
+        Xmss4.keyGen(&kp, &seeds.sk_seed, &seeds.sk_prf, &seeds.pub_seed);
         kp.sk.idx = target; // out-of-band jump (bds still at leaf 0)
         var sig: [Xmss4.signature_length]u8 = undefined;
         try Xmss4.sign(&kp.sk, &sig, "jump4");
@@ -280,7 +285,8 @@ test "BDS: out-of-band index jump resynchronizes to a byte-exact auth path" {
     }
 
     // One h=6 jump landing exactly on the 2^(h-1) transition leaf.
-    var kp6 = Xmss6.keyGen(seeds.sk_seed, seeds.sk_prf, seeds.pub_seed);
+    var kp6: Xmss6.KeyPair = undefined;
+    Xmss6.keyGen(&kp6, &seeds.sk_seed, &seeds.sk_prf, &seeds.pub_seed);
     kp6.sk.idx = 32;
     var sig6: [Xmss6.signature_length]u8 = undefined;
     try Xmss6.sign(&kp6.sk, &sig6, "jump6");
@@ -295,7 +301,8 @@ test "KAT: h=2 sequential stateful walk byte-exact vs reference (leaves 0-2), ex
     // byte comparison: the reference implementation itself corrupts that
     // leaf's index field before it leaves the reference's own signer.
     const seeds = refSeeds();
-    var kp = Xmss2.keyGen(seeds.sk_seed, seeds.sk_prf, seeds.pub_seed);
+    var kp: Xmss2.KeyPair = undefined;
+    Xmss2.keyGen(&kp, &seeds.sk_seed, &seeds.sk_prf, &seeds.pub_seed);
 
     const pk_ref = decodeHex(vec.xmss2_pk);
     try std.testing.expectEqualSlices(u8, pk_ref[0..n], &kp.pk.root);

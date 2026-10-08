@@ -28,7 +28,8 @@ const xmss = @import("xmss");
 const X = xmss.XmssSha2_10_256;
 
 // Seeds from a CSPRNG — sk_seed and sk_prf secret, pub_seed public.
-var kp = X.keyGen(sk_seed, sk_prf, pub_seed); // O(2^h) hashing, one-time
+var kp: X.KeyPair = undefined;
+X.keyGen(&kp, &sk_seed, &sk_prf, &pub_seed); // O(2^h) hashing, one-time; secrets by pointer
 
 var sig: [X.signature_length]u8 = undefined;
 try X.sign(&kp.sk, &sig, message); // advances kp.sk.idx — PERSIST sk first!

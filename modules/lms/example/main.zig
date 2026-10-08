@@ -53,7 +53,8 @@ pub fn main() !void {
     // reproducibility; an appliance draws them from a CSPRNG inside an HSM.
     const seed: [32]u8 = @splat(0x5e);
     const id: [16]u8 = @splat(0x1d);
-    const key = try lms.SecretKey.init(gpa, &levels, seed, id, null);
+    var key: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&key, gpa, &levels, &seed, id, null);
 
     // The public key is 60 bytes (L, LMS type, LM-OTS type, I, root): this is
     // what ships with the product.
@@ -67,7 +68,7 @@ pub fn main() !void {
     // Written in place: it records its own address so a copy can be detected.
     var store: PositionStore = .{};
     var signer: lms.SigningKey = undefined;
-    lms.SigningKey.init(&signer, key, .{ .ctx = &store, .write = PositionStore.write });
+    lms.SigningKey.init(&signer, &key, .{ .ctx = &store, .write = PositionStore.write });
     defer signer.deinit(); // wipes the seeds, frees the node caches
 
     const sig_buf = try gpa.alloc(u8, signer.sk.signatureLength());

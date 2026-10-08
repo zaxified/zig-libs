@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING, HIGH (dead stack):** key generation and signing left SK.seed and
+  SK.prf on the dead stack, in library frames and in the caller's frame, because every
+  secret crossed the API BY VALUE (`keyGenFromSeed(sk_seed, sk_prf, pk_seed) KeyPair`,
+  `keyGen(seed)`, `sign`/`signInternal(…, sk: SecretKey, …)`, `SecretKey.fromBytes/toBytes`).
+  New `src/stackprobe_test.zig` (ReleaseFast, 1 MiB window, needles = every 16-byte window of
+  SK.seed and SK.prf, the SHA2 HMAC key blocks of PRF_msg and the WOTS+ chain-start secrets of
+  the top-layer tree; negative control 0, positive control found), SHA2-128f/128s/192f/256f and
+  SHAKE-128f/256s/256f, over keyGen, keyGenFromSeed, sign, signInternal (hedged),
+  SecretKey.fromBytes/toBytes. **Before:** every call had residue, e.g. SHA2-128f keyGen SK.seed
+  10 + SK.prf 5 windows over 5 calls (hits 95..559 B below the region top), sign 25 + 10
+  (up to 2143 B), SHAKE-256s sign 60 + 20 (up to 17 KiB); dirty depth 4.5 KiB (SHA2-128f keyGen)
+  to 25.9 KiB (SHAKE-256s sign). **After:** 0 everywhere. No WOTS+ or HMAC-block residue was
+  found before or after (the F outputs and key blocks do not survive in these frames); the
+  needle formula is checked against the engine by finding a recomputed chain-start secret in
+  the signature it made. FORS leaf secrets are not recomputed (`SPEC.md` backlog).
+  **API (BREAKING):** `keyGenFromSeed(out: *KeyPair, sk_seed, sk_prf, pk_seed: *const [n]u8)`,
+  `keyGen(out: *KeyPair, seed: *const [3n]u8)`, `signInternal(out, msg, sk: *const SecretKey,
+  addrnd)`, `sign(out, msg, sk: *const SecretKey, ctx, addrnd)`, `SecretKey.fromBytes(out:
+  *SecretKey, bytes: *const [4n]u8)`, `SecretKey.toBytes(sk: *const SecretKey, out: *[4n]u8)`.
+  `PublicKey` and `verify*` are unchanged. The bodies run one frame down and the stack they
+  dirtied is zeroed (`src/burn.zig`: 24 KiB for keygen, 32 KiB for signing, sized from the
+  measured depth — 17.2 KiB / 25.1 KiB for the deepest probed set, SHAKE-256s). Migration:
+  `var kp: Scheme.KeyPair = undefined; Scheme.keyGen(&kp, &seed);` and `&kp.sk` at the
+  `sign` call. No other module calls the changed functions (`x509` uses `verify` only).
+
 - **2026-10-05** — Audit: first dated mutation run (11 mutants, all killed; `SPEC.md` § "Mutation
   run 2026-10-05"). No code or test change.
 

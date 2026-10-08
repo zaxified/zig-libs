@@ -60,12 +60,13 @@ const Scheme = slhdsa.SlhDsaSha2_128f;
 // Key generation — supply 3n fresh CSPRNG bytes (SK.seed‖SK.prf‖PK.seed):
 var seed: [3 * Scheme.n]u8 = undefined;
 my_csprng.bytes(&seed);
-const kp = Scheme.keyGen(seed);
+var kp: Scheme.KeyPair = undefined;
+Scheme.keyGen(&kp, &seed); // secrets by pointer, result via `out`
 
 // Sign (pure variant, empty context, deterministic). Pass n fresh random
 // bytes instead of `null` for FIPS 205's recommended hedged signing:
 var sig: [Scheme.signature_length]u8 = undefined;
-try Scheme.sign(&sig, message, kp.sk, "", null);
+try Scheme.sign(&sig, message, &kp.sk, "", null);
 
 // Verify — returns bool; malformed input is false, never a panic:
 const ok = Scheme.verify(&sig, message, kp.pk, "");
@@ -73,11 +74,14 @@ const ok = Scheme.verify(&sig, message, kp.pk, "");
 // Serialization (FIPS 205 §9.1 byte layouts):
 const pk_bytes = kp.pk.toBytes(); // [2n]u8
 const pk = Scheme.PublicKey.fromBytes(pk_bytes);
-const sk = Scheme.SecretKey.fromBytes(kp.sk.toBytes());
+var sk_bytes: [Scheme.secret_key_length]u8 = undefined;
+kp.sk.toBytes(&sk_bytes); // SK.seed‖SK.prf‖PK.seed‖PK.root
+var sk: Scheme.SecretKey = undefined;
+Scheme.SecretKey.fromBytes(&sk, &sk_bytes);
 
 // Raw-message internal interface (what ACVP calls "internal") — for
 // protocol plumbing that does its own domain separation:
-Scheme.signInternal(&sig, message, kp.sk, null);
+Scheme.signInternal(&sig, message, &kp.sk, null);
 _ = Scheme.verifyInternal(&sig, message, kp.pk);
 ```
 

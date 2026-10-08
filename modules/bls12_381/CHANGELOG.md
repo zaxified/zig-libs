@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING, HIGH: every entry point that holds a BLS secret left it on the dead
+  stack.** New ReleaseFast stack probe (`stackprobe_test.zig`), 5 calls each, before → after:
+  `keyGen` the IKM 10, PRK 20, OKM 30 and the key 40; the `SecretKey`/`SecretKeyShare` codecs the
+  scalar 25–70; `skToPk`/`sign`/`popProve` (min-pk, min-sig, augmented) and `partialSign` the
+  scalar 10; EIP-2333 the master/child/path keys 45–75 and the compressed Lamport public key (the
+  child's IKM; the Lamport secret keys themselves were already wiped); `splitSecretKey` the key,
+  the coefficients and a share — all now 0. Secrets in by pointer, out through an out-param
+  (zeroed on error), bodies one frame down and burned (`burn.zig`):
+  - `keyGen(out: *SecretKey, ikm, key_info)`; `SecretKey.fromBytes(out, *const [32]u8)`,
+    `sk.toBytes(out: *[32]u8)`; `skToPk(*const SecretKey)`, `sign(*const SecretKey, msg)`,
+    `popProve(*const SecretKey)` in all six suites;
+  - `eip2333.deriveMasterSk(out, seed)`, `deriveChildSk(out, *const parent, index)` (`out` may
+    alias `parent`), `derivePath(out, seed, path)` — intermediates never leave `out`;
+  - `threshold.splitSecretKey(allocator, *const SecretKey, …)`, `partialSign(*const
+    SecretKeyShare, msg)`, `SecretKeyShare.fromBytes(out, *const bytes)`, `share.toBytes(out)`.
+  - `splitSecretKey` also wipes the shares before freeing them when its second allocation fails.
+  - The curve arithmetic (`G1`/`G2` `scalarMul`, `msm`, `Fr`) keeps its value API: it serves public
+    and secret scalars alike, and the secret entry points above burn around it. Consumers' own
+    secret paths (bbs, coconut, ibe, tlock) are swept in their own modules.
 - **2026-10-06** — **API ADDED, NO BEHAVIOURAL CHANGE:** `hash_to_curve.expandMessageXof` /
   `expandMessageXofParts` (RFC 9380 §5.3.2 with SHAKE-256; byte-exact against Appendix K.6 at
   0x20 and 0x80), `hash_to_curve.Expander` (`.xmd_sha256` / `.xof_shake256`),

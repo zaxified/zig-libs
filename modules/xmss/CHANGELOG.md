@@ -5,6 +5,30 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING + FIX (HIGH, secrets on the dead stack, dead-stack sweep wave 5):**
+  no secret travels by value any more. `keyGen` took `sk_seed` / `sk_prf` BY VALUE and returned
+  the whole `KeyPair` (private key included) by value; `prfKeygen`, `wotsSkGen` (the ≈ 2 KiB WOTS+
+  private key), `chain` and `chainStep` took or returned chain values by value, and
+  `SigningKey.init` took the `SecretKey` by value. New stack probe (`stackprobe_test.zig`, 5 calls,
+  16-byte windows of `SK_SEED`, `SK_PRF` and every chain value of every leaf of an h = 4 key,
+  NEG/POS controls), ReleaseFast: **before** — `keyGen` left 10 windows of `SK_SEED` and 10 of
+  `SK_PRF` over 5 calls, 231..279 B below the call (the by-value argument and return copies
+  in the caller's side of the frame); `sign` at leaf 0 / leaf 5 and `buildAuth` 0 (the A1 F3 burn
+  already covered the callee frames). **After** — 0 for all four, NEG = 0, POS ≥ 1.
+  API (out-param first, `*const` for secret inputs):
+  `keyGen(kp: *KeyPair, sk_seed, sk_prf, pub_seed: *const [n]u8) void`;
+  `prfKeygen(out: *[n]u8, sk_seed, pub_seed, adrs)`;
+  `wotsSkGen(sk: *[wots_len][n]u8, sk_seed, pub_seed, adrs)`;
+  `chain(x: *[n]u8, start, steps, pub_seed, adrs) void` and `chainStep(x: *[n]u8, …) void`, both IN
+  PLACE (a chain value is secret below the chain's public end); `SigningKey.init(dst, sk: *const
+  SecretKey, persist)`; `wotsPkGen`, `wotsSign`, `genLeaf` keep value returns (their results are
+  the public key, the public signature and a public leaf). `sign` and `buildAuth` already took
+  pointers. The burn moved to `burn.zig` (`run`/`stack`, `keyGen`/`sign`/`buildAuth` run their
+  body one frame down); real depth at h = 4 in ReleaseFast: `keyGen` 5.9 KiB, `sign` 8.2 KiB
+  (8.4 KiB with a traversal rebuild), `buildAuth` 5.9 KiB; burn 16 KiB (was 32 KiB). The old
+  in-`root.zig` F3 test is replaced by the probe. Migrate: `var kp: X.KeyPair = undefined;
+  X.keyGen(&kp, &sk_seed, &sk_prf, &pub_seed);` and `SigningKey.init(&h, &kp.sk, …)` then
+  `kp.sk.zeroize()`.
 - **2026-10-08** — **FIX (secrets on the dead stack):** the dead-stack burn's buffer is now
   16-aligned instead of the vector type's natural 32. At 32 the burn's frame was realigned, and
   the up to 56 bytes between its saved frame pointer and the buffer — the top of the frame the

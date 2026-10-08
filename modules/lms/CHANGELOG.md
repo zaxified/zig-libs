@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING + FIX (HIGH: seeds and OTS secrets on the dead stack):** the first
+  `stackprobe_test.zig` (ReleaseFast) found the SEED left in the dead stack after `Tree.init`
+  (30 hits in 5 calls, 111..375 B deep) and, for HSS `SecretKey.init` + first `sign`, the SEED
+  (40) and the derived child SEED (30), 239..2703 B deep, all from by-value seeds in the
+  caller's and the module's frames. Now 0 hits in every probed call (LMS and 2-level HSS keygen
+  and signing, freed heap included, NEG = 0, POS >= 1); without the new burns the probe finds
+  `x_q[i]` and OTS chain values up to 1503 B deep. API: the seed is passed by pointer and every
+  key is built through an out-parameter, with the seed zeroed on error —
+  `Tree.init(out: *Tree, gpa, lms, ots, id, seed: *const [32]u8)`, `Tree.initCached(out, …, seed, c)`,
+  `LmsSecretKey.init(out: *LmsSecretKey, …, seed: *const [32]u8)`,
+  `SecretKey.init(out: *SecretKey, gpa, levels, seed: *const [32]u8, id, restore_at)` (all return
+  `!void`), `SigningKey.init(dst, sk: *SecretKey, persist)` (moves the key and wipes the source),
+  `core.deriveX(out: *[32]u8, id, q, i, seed)`. The tree build, `Tree.sign` /
+  `signWithRandomizer` and the HSS child-tree builder run one frame down (new `burn.zig`) and
+  zero what they dirtied (4 / 2 / 4 KiB, measured 2.2 / 1.5 / 3.1 KiB). Migrate: declare
+  `var sk: lms.SecretKey = undefined;` and call `try lms.SecretKey.init(&sk, gpa, levels, &seed, id, null)`.
 - **2026-10-08** — **FIX (secrets on the dead stack):** the dead-stack burn's buffer is now
   16-aligned instead of the vector type's natural 32. At 32 the burn's frame was realigned, and
   the up to 56 bytes between its saved frame pointer and the buffer — the top of the frame the

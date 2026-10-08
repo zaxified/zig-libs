@@ -433,8 +433,8 @@ rsa	ReleaseFast	noncrt	1	0	4c52c48432f3b855	d4057b00f9df7b56
 # q_mont (length verdicts); the verdicts p == q, gcd(e, λ) = 1, d/dP/dQ ≠ 0 and
 # the qInv self-check.
 rsa	ReleaseFast	keygen	1	<=173	4c52c48432f3b855	2cb28867b78d48a6
-slhdsa	ReleaseFast	seed	1	4	6848022d967ef676	e0fdde7f5c62a2d6
-slhdsa	ReleaseFast	prf	1	8	6848022d967ef676	e0fdde7f5c62a2d6
+slhdsa	ReleaseFast	seed	1	4	8df59dd9b6015673	e0fdde7f5c62a2d6
+slhdsa	ReleaseFast	prf	1	8	8df59dd9b6015673	e0fdde7f5c62a2d6
 falcon	ReleaseFast	sign	1	<=133	d6b62d587b79541c	3f5a6dbb61a76d9d
 bls12_381	ReleaseFast	field	1	1	3747e93eca1a8b27	c1e8a3c184eada53
 # 2026-10-02 — Fr off std.crypto.ff, bls12_381 ctSelect + Fp2.isZero barriers.

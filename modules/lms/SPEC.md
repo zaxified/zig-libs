@@ -175,13 +175,22 @@ and every cached node against §5.3's recursive definition.
   bound in signing depends on the message digest `Q` (public: it is recomputable from
   the signature) and on parameters, never on the secret; the secret enters only as hash
   input. Timing of the hash itself is `std.crypto`'s.
-- **Secret handling:** SEED, the derived `x` values and the `C` input buffers are
-  zeroed with `std.crypto.secureZero` on every exit path of the module's own functions;
-  `Tree.deinit` and `SecretKey.deinit` wipe the seeds; `Tree.init` and `Tree.sign` scrub
-  16 KiB of stack below themselves (`xmss`'s measured `burnStack` trick). **Unverified:**
-  there is no dead-stack residue test here (unlike `xmss`), so that scrub is by analogy;
-  `SecretKey.init` takes the seed by value, and the caller's copy and any register/spill
-  copies are outside the module (CONVENTIONS §2.1's caveat).
+- **Secret handling (dead-stack sweep 2026-10-09):** the SEED goes in **by pointer**
+  (`*const [32]u8`) to `Tree.init` / `initCached`, `LmsSecretKey.init` and `SecretKey.init`,
+  and every key comes out through an **out-parameter** (zeroed seed on error), so neither
+  the module's frames nor the caller's hold a copy. The secret-touching bodies (tree build,
+  `Tree.sign` / `signWithRandomizer`, HSS `ensureTrees` with the child-seed derivation) run
+  one frame down (`burn.zig`) and the stack they dirtied is zeroed after them; sizes are
+  measured (4 / 2 / 4 KiB, ReleaseFast). `core.deriveX` (the OTS private value `x_q[i]`)
+  returns through an out-param too. `Tree.deinit` and `SecretKey.deinit` wipe the seeds;
+  the node cache and the certificates are public hashes and are freed without wiping
+  (the probe scans the freed heap to confirm). `SigningKey.init` moves the key from
+  `*SecretKey` and wipes the source. `stackprobe_test.zig` (ReleaseFast only) needles the
+  SEED, the HSS child SEED, `x_q[i]` and the OTS chain values for key generation (every
+  leaf) and signing (LMS and 2-level HSS), with a negative and a positive control; it is
+  0 residue with the burns and finds `x_q` / chain values 240..1503 B deep without them.
+  `deriveRandomizer`'s `C` is secret-derived but is published in the signature, so it is
+  returned by value.
 - **No internal RNG:** SEED (secret, uniformly random, used for nothing else, at least 32
   bytes — RFC 8554 §5.2) and `I` (16 bytes, random, RFC §7.1) are the caller's.
 - **Allocation:** `Tree.init` / `SecretKey.init` / `sign` (when it builds a lower tree)
@@ -281,14 +290,13 @@ while building a tree (node cache and certificate buffer, separately) burns no l
   `n`-byte value) is a small follow-up.
 - **A foreign black-box oracle** (a differential run against cisco/hash-sigs's built binary
   through the wire format, not its source), not done for this first version; and a dead-stack
-  residue test like `xmss`'s. (The mutation run is done: Audit 2026-10-03 below.)
-- **`SigningKey.init` takes the `SecretKey` by value** *(audit 2026-10-03, INFO)*: Zig has no
-  move, so the caller's original keeps the same node caches and the same (soon stale)
-  position, and its seeds stay un-wiped on the caller's stack. Signing from it, or calling
-  `deinit` on both, is the double-spend / double-free the handle exists to prevent. Doc says
-  "takes ownership"; a stricter shape would build the `SecretKey` in place inside the handle
-  (`SigningKey.initInPlace(dst, gpa, levels, seed, id, restore_at, persist)`). API change, so
-  not done here.
+  residue test like `xmss`'s. (The mutation run is done: Audit 2026-10-03 below.) *(The
+  dead-stack residue test now exists: `stackprobe_test.zig`, 2026-10-09.)*
+- **`SigningKey.init` takes the `SecretKey` by pointer and wipes it** *(audit 2026-10-03,
+  INFO; narrowed 2026-10-09)*: the source is zeroed after the move, so its seeds and stale
+  position no longer linger, but `deinit` on the zeroed source is still not a no-op the type
+  system prevents. A stricter shape would build the `SecretKey` in place inside the handle
+  (`SigningKey.initInPlace(dst, gpa, levels, seed, id, restore_at, persist)`).
 - **`Tree.sign` / `signWithRandomizer` preconditions are `std.debug.assert` only** *(audit
   2026-10-03, INFO)*: `q >= 2^h` or `out.len != lmsSignatureLength` is a panic in ReleaseSafe and
   undefined behaviour in ReleaseFast. `Tree` is the stateless building block (`LmsSecretKey` /

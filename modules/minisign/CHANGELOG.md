@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING, HIGH: key generation, signing, sealing and opening left the secret
+  key, nonce and password on the dead stack.** New ReleaseFast stack probe (`stackprobe_test.zig`),
+  5 calls each, before → after (seed / scalar `a` / nonce prefix / nonce `r` / `seed ‖ pk` image
+  windows, scrypt key stream, plaintext checksum, password): `KeyPair.generate` seed 20, `a` 30,
+  prefix 10, key image 20; every signer (`signMessage` both algorithms, `signFile`,
+  `signDigest`/`signFileDigest`, `signTrustedComment`) left `a`, the prefix and the nonce `r`
+  (≈ 40-60 hits per case); `sealSecretKey` seed 20, password 5, checksum 15; `openSecretKey`
+  seed 20, password 5, checksum 30 (plain key: seed 15, image 15); `parseSecretKeyFile` key image
+  20; `writeSecretKeyFile` key image 20 and the base64 line 60 — all now 0. The key pair was passed
+  and returned BY VALUE through every one of these. scrypt's working memory is HEAP (`xy`, `V`,
+  `dk`, 83 KiB non-zero bytes left in the allocator after each seal/open at the probe's
+  parameters) and went back to the caller's allocator unwiped — now 0 (a zeroing allocator wraps
+  it). Probe scrypt parameters: `ops_limit 32768`, `mem_limit 1 << 16`.
+  - `KeyPair.generate(out: *KeyPair, io)`, `KeyPair.toRawSecretKeyPlain(self: *const KeyPair, out:
+    *RawSecretKey)`, `KeyPair.publicKey(self: *const KeyPair)` (method-call syntax on a variable is
+    unchanged).
+  - `sealSecretKey(allocator, out: *RawSecretKey, key_pair: *const KeyPair, password, salt,
+    ops_limit, mem_limit) KdfError!void`, `openSecretKey(allocator, out: *KeyPair, raw: *const
+    RawSecretKey, password) !void`: results through the out-param, zeroed on error.
+  - `signMessage`, `signDigest`, `signTrustedComment`, `signFile`, `signFileDigest` take `key_pair:
+    *const KeyPair`.
+  - `parseSecretKeyFile(out: *ParsedSecretKey, text)` (key zeroed and comment empty on error),
+    `writeSecretKeyFile(w, comment, key: *const RawSecretKey)`, `RawSecretKey.toBytes(self: *const
+    RawSecretKey, out: *[158]u8)`, `RawSecretKey.fromBytes(out: *RawSecretKey, bytes: *const
+    [158]u8)`. Public-key, signature and verify APIs are unchanged.
+  - Secret-touching bodies run one frame down and the stack they dirtied is zeroed (`burn.zig`).
+    Not covered: the `std.Io.Writer` buffer that `writeSecretKeyFile` writes into, and the
+    caller's own copies. `example/` and `tools/bench.zig` migrated; no other module uses minisign.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
   bodies are now generic over their source and run by testkit's deterministic
   driver `MINISIGN_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in

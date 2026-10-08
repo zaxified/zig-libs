@@ -65,13 +65,17 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     // Key pair and file.
-    var kp = minisign.KeyPair.generate(io);
+    var kp: minisign.KeyPair = undefined;
+    minisign.KeyPair.generate(&kp, io);
     defer kp.wipe();
     var out: std.Io.Writer.Allocating = .init(arena);
     try minisign.writePublicKeyFile(&out.writer, "bench key", kp.publicKey());
     try dir.writeFile(io, .{ .sub_path = "pub.key", .data = out.written() });
     out.clearRetainingCapacity();
-    try minisign.writeSecretKeyFile(&out.writer, "bench key", kp.toRawSecretKeyPlain());
+    var raw: minisign.RawSecretKey = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&raw));
+    kp.toRawSecretKeyPlain(&raw);
+    try minisign.writeSecretKeyFile(&out.writer, "bench key", &raw);
     try dir.writeFile(io, .{ .sub_path = "sec.key", .data = out.written() });
     {
         const data = try gpa.alloc(u8, file_len);
@@ -101,7 +105,7 @@ pub fn main(init: std.process.Init) !u8 {
             h.final(&dg);
             return dg;
         }
-        fn sign(a: std.mem.Allocator, i: std.Io, d: std.Io.Dir, k: minisign.KeyPair) !minisign.SignedFile {
+        fn sign(a: std.mem.Allocator, i: std.Io, d: std.Io.Dir, k: *const minisign.KeyPair) !minisign.SignedFile {
             return minisign.signFileDigest(a, k, try digest(i, d), comment);
         }
         fn verify(a: std.mem.Allocator, i: std.Io, d: std.Io.Dir, pk: minisign.RawPublicKey, sig_text: []const u8) !void {
@@ -109,7 +113,7 @@ pub fn main(init: std.process.Init) !u8 {
             try minisign.verifyFileDigest(a, pk, try digest(i, d), parsed);
         }
     };
-    const signed = try Ours.sign(gpa, io, dir, kp);
+    const signed = try Ours.sign(gpa, io, dir, &kp);
     out.clearRetainingCapacity();
     try minisign.writeSignatureFile(&out.writer, "signature from the bench", signed.signature, comment, signed.global_signature);
     const our_sig = try arena.dupe(u8, out.written());
@@ -132,7 +136,7 @@ pub fn main(init: std.process.Init) !u8 {
     var our_verify: i96 = std.math.maxInt(i96);
     for (0..5) |_| {
         var t = std.Io.Clock.Timestamp.now(io, .awake);
-        _ = try Ours.sign(gpa, io, dir, kp);
+        _ = try Ours.sign(gpa, io, dir, &kp);
         our_sign = @min(our_sign, t.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
         t = std.Io.Clock.Timestamp.now(io, .awake);
         try Ours.verify(gpa, io, dir, kp.publicKey(), cli_sig);

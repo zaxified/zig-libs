@@ -266,4 +266,14 @@ bits, every target this module has). No defect found.
 
 ## Backlog / deferred
 
+- **A secret is never copied (2026-10-09).** `KeyPair` and `RawSecretKey` (plaintext for `-W`) are
+  held in the caller's storage; every API takes `*const` and results go through an out-param
+  (zeroed on error). Generating, signing, sealing, opening and the secret-key file codec run one
+  frame down and zero the stack they dirtied (`burn.zig`). scrypt's `xy`/`V`/`dk` are HEAP: the
+  seal/open bodies hand scrypt a zeroing allocator (`burn.WipeAllocator`), so nothing password
+  derived goes back unwiped to the caller's allocator. `stackprobe_test.zig` (ReleaseFast) checks
+  every path for 0 residue and 0 non-zero heap bytes. Out of reach: the `std.Io.Writer` buffer
+  `writeSecretKeyFile` writes into (the caller's), and `sealSecretKey` panics inside std's
+  `Params.fromLimits` for a caller-given `mem_limit < 1024` (only the file-controlled path of
+  `openSecretKey` is guarded).
 - **Speed: 1.30× the minisign CLI** *(bench 2026-10-07, `zig build bench-minisign`, 256 MiB streamed, interop checked both ways)*. The whole gap is BLAKE2b-512: `std.crypto.hash.blake2.Blake2b512` is scalar, libsodium's (under the CLI) is AVX2. A SIMD BLAKE2b — in std upstream or a sibling module — closes it. Effort: medium.

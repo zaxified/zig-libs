@@ -38,16 +38,21 @@ fn checkSuite(comptime S: type, comptime suite: v.Suite, comptime pop: bool) !vo
         const ikm = try unhexSlice(&ikm_buf, c.ikm);
         // draft -05 KeyGen against blst's key_gen_v5. The signing key is
         // blst's default (-04-compatible) key_gen output, taken as bytes.
-        try testing.expectEqual(try unhex(32, c.sk_v5), (try bls_sig.keyGen(ikm, "")).toBytes());
-        const sk = try bls_sig.SecretKey.fromBytes(try unhex(32, c.sk));
+        var sk_v5: bls_sig.SecretKey = undefined;
+        try bls_sig.keyGen(&sk_v5, ikm, "");
+        var sk_bytes: [32]u8 = undefined;
+        sk_v5.toBytes(&sk_bytes);
+        try testing.expectEqual(try unhex(32, c.sk_v5), sk_bytes);
+        var sk: bls_sig.SecretKey = undefined;
+        try bls_sig.SecretKey.fromBytes(&sk, &try unhex(32, c.sk));
 
-        const pk = S.skToPk(sk);
+        const pk = S.skToPk(&sk);
         try testing.expectEqual(try unhex(S.PublicKey.encoded_bytes, c.pk), pk.toBytes());
         pks[i] = pk;
 
         const msg = try unhexSlice(&msg_bufs[i], c.msg);
         msgs[i] = msg;
-        const sig = S.sign(sk, msg);
+        const sig = S.sign(&sk, msg);
         const want_sig = try unhex(S.Signature.encoded_bytes, c.sig);
         try testing.expectEqual(want_sig, sig.toBytes());
         const foreign = try S.Signature.fromBytes(want_sig);
@@ -64,7 +69,7 @@ fn checkSuite(comptime S: type, comptime suite: v.Suite, comptime pop: bool) !vo
 
         if (pop) {
             const want_pop = try unhex(S.Signature.encoded_bytes, c.pop);
-            try testing.expectEqual(want_pop, S.popProve(sk).toBytes());
+            try testing.expectEqual(want_pop, S.popProve(&sk).toBytes());
             try testing.expect(S.popVerify(pk, try S.Signature.fromBytes(want_pop)));
         }
     }
@@ -76,7 +81,9 @@ fn checkSuite(comptime S: type, comptime suite: v.Suite, comptime pop: bool) !vo
         const f = suite.fast.?;
         var fpks: [4]S.PublicKey = undefined;
         for (f.sks, &fpks) |sk_hex, *pk| {
-            pk.* = S.skToPk(try bls_sig.SecretKey.fromBytes(try unhex(32, sk_hex)));
+            var sk: bls_sig.SecretKey = undefined;
+            try bls_sig.SecretKey.fromBytes(&sk, &try unhex(32, sk_hex));
+            pk.* = S.skToPk(&sk);
         }
         var fmsg_buf: [max_hex]u8 = undefined;
         const fmsg = try unhexSlice(&fmsg_buf, f.msg);
@@ -109,8 +116,15 @@ test "blst interop: EIP-2333 master and child keys" {
     for (v.eip2333) |c| {
         var seed_buf: [128]u8 = undefined;
         const seed = try unhexSlice(&seed_buf, c.seed);
-        const master = try eip2333.deriveMasterSk(seed);
-        try testing.expectEqual(try unhex(32, c.master), master.toBytes());
-        try testing.expectEqual(try unhex(32, c.child), eip2333.deriveChildSk(master, c.index).toBytes());
+        var master: bls_sig.SecretKey = undefined;
+        try eip2333.deriveMasterSk(&master, seed);
+        var master_bytes: [32]u8 = undefined;
+        master.toBytes(&master_bytes);
+        try testing.expectEqual(try unhex(32, c.master), master_bytes);
+        var child: bls_sig.SecretKey = undefined;
+        eip2333.deriveChildSk(&child, &master, c.index);
+        var child_bytes: [32]u8 = undefined;
+        child.toBytes(&child_bytes);
+        try testing.expectEqual(try unhex(32, c.child), child_bytes);
     }
 }

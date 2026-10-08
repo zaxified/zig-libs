@@ -52,11 +52,14 @@ pub fn main() !void {
     // entropy of its own. Fixed literals here for reproducibility; an
     // appliance draws all three from a CSPRNG inside an HSM and the first two
     // never leave it.
-    const keys = Xmss.keyGen(
-        @splat(0xa1), // sk_seed  — derives every WOTS+ chain
-        @splat(0xb2), // sk_prf   — randomizes the message hash
-        @splat(0xc3), // pub_seed — public, travels in the public key
-    );
+    // Seeds and key travel by pointer: `keyGen` writes the key pair through
+    // `keys` and never returns a secret by value.
+    const sk_seed: [32]u8 = @splat(0xa1); // derives every WOTS+ chain
+    const sk_prf: [32]u8 = @splat(0xb2); // randomizes the message hash
+    const pub_seed: [32]u8 = @splat(0xc3); // public, travels in the public key
+    var keys: Xmss.KeyPair = undefined;
+    Xmss.keyGen(&keys, &sk_seed, &sk_prf, &pub_seed);
+    defer keys.sk.zeroize();
 
     // The public key is 68 bytes: OID, tree root, public seed. This is what
     // ships with the product.
@@ -73,7 +76,7 @@ pub fn main() !void {
     // consumer owns the crash-safety and the no-copy discipline alone.
     var store: IndexStore = .{};
     var signer: Xmss.SigningKey = undefined;
-    Xmss.SigningKey.init(&signer, keys.sk, .{ .ctx = &store, .write = IndexStore.write });
+    Xmss.SigningKey.init(&signer, &keys.sk, .{ .ctx = &store, .write = IndexStore.write });
     defer signer.zeroize();
 
     var sig: [Xmss.signature_length]u8 = undefined;
@@ -143,7 +146,9 @@ pub fn main() !void {
     // root, no match.
     var other_seed: [32]u8 = @splat(0xa1);
     other_seed[0] = 0xa2;
-    const other = Xmss.keyGen(other_seed, @splat(0xb2), @splat(0xc3));
+    var other: Xmss.KeyPair = undefined;
+    Xmss.keyGen(&other, &other_seed, &sk_prf, &pub_seed);
+    defer other.sk.zeroize();
     if (Xmss.verify(other.pk, artifacts[0], &sig)) return error.WrongKeyAccepted;
     std.debug.print("signature does not verify under an unrelated key\n", .{});
 

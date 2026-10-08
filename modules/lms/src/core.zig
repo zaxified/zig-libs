@@ -131,8 +131,9 @@ pub fn otsCandidate(
 }
 
 /// Appendix A: `x_q[i] = H(I || u32str(q) || u16str(i) || u8str(0xff) || SEED)`.
-pub fn deriveX(id: *const [id_len]u8, q: u32, i: u16, seed: *const [n]u8) [n]u8 {
-    return chainHash(id, q, i, 0xff, seed);
+/// The result is a secret, so it goes to `out` (never returned by value).
+pub fn deriveX(out: *[n]u8, id: *const [id_len]u8, q: u32, i: u16, seed: *const [n]u8) void {
+    out.* = chainHash(id, q, i, 0xff, seed);
 }
 
 /// The LM-OTS randomizer `C`. RFC 8554 requires it to be uniformly random or
@@ -156,7 +157,8 @@ pub fn otsPublicKeyHash(ots: OtsParamSet, id: *const [id_len]u8, q: u32, seed: *
     outer.update(&std.mem.toBytes(std.mem.nativeToBig(u16, d_pblc)));
     var i: u16 = 0;
     while (i < ots.p()) : (i += 1) {
-        var tmp = deriveX(id, q, i, seed);
+        var tmp: [n]u8 = undefined;
+        deriveX(&tmp, id, q, i, seed);
         var j: u16 = 0;
         while (j < top) : (j += 1) tmp = chainHash(id, q, i, @intCast(j), &tmp);
         outer.update(&tmp);
@@ -186,7 +188,8 @@ pub fn otsSign(
     var i: u16 = 0;
     while (i < ots.p()) : (i += 1) {
         const a = coef(&s, i, w);
-        var tmp = deriveX(id, q, i, seed);
+        var tmp: [n]u8 = undefined;
+        deriveX(&tmp, id, q, i, seed);
         var j: u16 = 0;
         while (j < a) : (j += 1) tmp = chainHash(id, q, i, @intCast(j), &tmp);
         @memcpy(out[4 + n + @as(usize, i) * n ..][0..n], &tmp);

@@ -32,16 +32,21 @@ fn katSet(comptime P: params.Params, comptime V: type) !void {
     const gpa = std.testing.allocator;
 
     // keyGen: seeds -> byte-exact pk + sk.
-    const kp = S.keyGenFromSeed(
-        hex(S.n, V.keygen_sk_seed),
-        hex(S.n, V.keygen_sk_prf),
-        hex(S.n, V.keygen_pk_seed),
+    var kp: S.KeyPair = undefined;
+    S.keyGenFromSeed(
+        &kp,
+        &hex(S.n, V.keygen_sk_seed),
+        &hex(S.n, V.keygen_sk_prf),
+        &hex(S.n, V.keygen_pk_seed),
     );
+    var kp_sk_bytes: [S.secret_key_length]u8 = undefined;
+    kp.sk.toBytes(&kp_sk_bytes);
     try std.testing.expectEqualSlices(u8, &hex(S.public_key_length, V.keygen_pk), &kp.pk.toBytes());
-    try std.testing.expectEqualSlices(u8, &hex(S.secret_key_length, V.keygen_sk), &kp.sk.toBytes());
+    try std.testing.expectEqualSlices(u8, &hex(S.secret_key_length, V.keygen_sk), &kp_sk_bytes);
 
     // sigGen (internal interface, deterministic): byte-exact signature.
-    const sk = S.SecretKey.fromBytes(hex(S.secret_key_length, V.det_sk));
+    var sk: S.SecretKey = undefined;
+    S.SecretKey.fromBytes(&sk, &hex(S.secret_key_length, V.det_sk));
     const pk = S.PublicKey.fromBytes(hex(S.public_key_length, V.det_pk));
     try std.testing.expectEqualSlices(u8, &pk.toBytes(), &sk.pk.toBytes());
     const msg = try hexAlloc(gpa, V.det_msg);
@@ -51,7 +56,7 @@ fn katSet(comptime P: params.Params, comptime V: type) !void {
     try std.testing.expectEqual(@as(usize, S.signature_length), expected.len);
     const sig = try gpa.alloc(u8, S.signature_length);
     defer gpa.free(sig);
-    S.signInternal(sig[0..S.signature_length], msg, sk, null);
+    S.signInternal(sig[0..S.signature_length], msg, &sk, null);
     try std.testing.expectEqualSlices(u8, expected, sig);
     try std.testing.expect(S.verifyInternal(sig, msg, pk));
 }
@@ -105,14 +110,15 @@ test "NIST ACVP KAT: SLH-DSA-SHAKE-256f" {
 }
 
 test "NIST ACVP sigGen tcId 2: deterministic pure signature with context is byte-exact" {
-    const sk = Scheme.SecretKey.fromBytes(hex(64, v.sha2_128f.pure_sk));
+    var sk: Scheme.SecretKey = undefined;
+    Scheme.SecretKey.fromBytes(&sk, &hex(64, v.sha2_128f.pure_sk));
     const pk = Scheme.PublicKey.fromBytes(hex(32, v.sha2_128f.pure_pk));
     const msg = hex(1, v.sha2_128f.pure_msg);
     const ctx = hex(110, v.sha2_128f.pure_ctx);
     const expected = hex(sig_len, v.sha2_128f.pure_sig);
 
     var sig: [sig_len]u8 = undefined;
-    try Scheme.sign(&sig, &msg, sk, &ctx, null);
+    try Scheme.sign(&sig, &msg, &sk, &ctx, null);
     try std.testing.expectEqualSlices(u8, &expected, &sig);
     try std.testing.expect(Scheme.verify(&sig, &msg, pk, &ctx));
 
@@ -124,14 +130,15 @@ test "NIST ACVP sigGen tcId 2: deterministic pure signature with context is byte
 }
 
 test "NIST ACVP sigGen tcId 433: hedged internal signature is byte-exact" {
-    const sk = Scheme.SecretKey.fromBytes(hex(64, v.sha2_128f.rand_sk));
+    var sk: Scheme.SecretKey = undefined;
+    Scheme.SecretKey.fromBytes(&sk, &hex(64, v.sha2_128f.rand_sk));
     const pk = Scheme.PublicKey.fromBytes(hex(32, v.sha2_128f.rand_pk));
     const msg = hex(1, v.sha2_128f.rand_msg);
     const addrnd = hex(16, v.sha2_128f.rand_addrnd);
     const expected = hex(sig_len, v.sha2_128f.rand_sig);
 
     var sig: [sig_len]u8 = undefined;
-    Scheme.signInternal(&sig, &msg, sk, addrnd);
+    Scheme.signInternal(&sig, &msg, &sk, addrnd);
     try std.testing.expectEqualSlices(u8, &expected, &sig);
     try std.testing.expect(Scheme.verifyInternal(&sig, &msg, pk));
 }
@@ -140,13 +147,14 @@ test "keygen -> sign -> verify round-trip; tampering rejects, never panics" {
     const gpa = std.testing.allocator;
     var seed: [48]u8 = undefined;
     for (&seed, 0..) |*b, i| b.* = @truncate(i * 37 + 5);
-    const kp = Scheme.keyGen(seed);
+    var kp: Scheme.KeyPair = undefined;
+    Scheme.keyGen(&kp, &seed);
 
     const msg = "zig-libs slhdsa round-trip message";
     const ctx = "ctx";
     const sig = try gpa.alloc(u8, sig_len);
     defer gpa.free(sig);
-    try Scheme.sign(sig[0..sig_len], msg, kp.sk, ctx, null);
+    try Scheme.sign(sig[0..sig_len], msg, &kp.sk, ctx, null);
     try std.testing.expect(Scheme.verify(sig, msg, kp.pk, ctx));
 
     // Flip one byte in each structural region of the signature:
@@ -161,7 +169,8 @@ test "keygen -> sign -> verify round-trip; tampering rejects, never panics" {
     try std.testing.expect(!Scheme.verify(sig, msg, kp.pk, "ctx2"));
     var seed2 = seed;
     seed2[0] +%= 1;
-    const kp2 = Scheme.keyGen(seed2);
+    var kp2: Scheme.KeyPair = undefined;
+    Scheme.keyGen(&kp2, &seed2);
     try std.testing.expect(!Scheme.verify(sig, msg, kp2.pk, ctx));
 
     // Malformed signature lengths: false, never a panic.
@@ -177,7 +186,7 @@ test "keygen -> sign -> verify round-trip; tampering rejects, never panics" {
     const big_ctx = try gpa.alloc(u8, 256);
     defer gpa.free(big_ctx);
     @memset(big_ctx, 0xAB);
-    try std.testing.expectError(error.ContextTooLong, Scheme.sign(sig[0..sig_len], msg, kp.sk, big_ctx, null));
+    try std.testing.expectError(error.ContextTooLong, Scheme.sign(sig[0..sig_len], msg, &kp.sk, big_ctx, null));
     try std.testing.expect(!Scheme.verify(sig, msg, kp.pk, big_ctx));
 
     // Exactly at the boundary: ctx.len == 255 is the FIPS 205 §10.2 LIMIT,
@@ -187,7 +196,7 @@ test "keygen -> sign -> verify round-trip; tampering rejects, never panics" {
     const max_ctx = try gpa.alloc(u8, 255);
     defer gpa.free(max_ctx);
     @memset(max_ctx, 0xCD);
-    try Scheme.sign(sig[0..sig_len], msg, kp.sk, max_ctx, null);
+    try Scheme.sign(sig[0..sig_len], msg, &kp.sk, max_ctx, null);
     try std.testing.expect(Scheme.verify(sig, msg, kp.pk, max_ctx));
 }
 
@@ -195,10 +204,11 @@ test "SHAKE-128f keygen -> pure sign -> verify round-trip with context" {
     const S = engine.SlhDsa(params.shake_128f);
     var seed: [48]u8 = undefined;
     for (&seed, 0..) |*b, i| b.* = @truncate(i *% 91 + 3);
-    const kp = S.keyGen(seed);
+    var kp: S.KeyPair = undefined;
+    S.keyGen(&kp, &seed);
     const msg = "zig-libs slhdsa shake round-trip";
     var sig: [S.signature_length]u8 = undefined;
-    try S.sign(&sig, msg, kp.sk, "ctx", null);
+    try S.sign(&sig, msg, &kp.sk, "ctx", null);
     try std.testing.expect(S.verify(&sig, msg, kp.pk, "ctx"));
     try std.testing.expect(!S.verify(&sig, msg, kp.pk, "ctx2"));
     sig[0] ^= 1;
@@ -208,13 +218,14 @@ test "SHAKE-128f keygen -> pure sign -> verify round-trip with context" {
 test "hedged and deterministic signatures differ but both verify" {
     var seed: [48]u8 = undefined;
     for (&seed, 0..) |*b, i| b.* = @truncate(i +% 200);
-    const kp = Scheme.keyGen(seed);
+    var kp: Scheme.KeyPair = undefined;
+    Scheme.keyGen(&kp, &seed);
     const msg = "same message";
 
     var det_sig: [sig_len]u8 = undefined;
     var hedged_sig: [sig_len]u8 = undefined;
-    try Scheme.sign(&det_sig, msg, kp.sk, "", null);
-    try Scheme.sign(&hedged_sig, msg, kp.sk, "", @splat(0x5C));
+    try Scheme.sign(&det_sig, msg, &kp.sk, "", null);
+    try Scheme.sign(&hedged_sig, msg, &kp.sk, "", @splat(0x5C));
     try std.testing.expect(!std.mem.eql(u8, &det_sig, &hedged_sig));
     try std.testing.expect(Scheme.verify(&det_sig, msg, kp.pk, ""));
     try std.testing.expect(Scheme.verify(&hedged_sig, msg, kp.pk, ""));

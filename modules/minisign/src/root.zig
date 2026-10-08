@@ -75,6 +75,7 @@
 
 const std = @import("std");
 const entropy = @import("entropy");
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -217,8 +218,8 @@ pub const RawSecretKey = struct {
 
     pub const wire_length = 2 + 2 + 2 + salt_length + 8 + 8 + key_number_length + secret_key_length + checksum_length; // 158
 
-    pub fn toBytes(self: RawSecretKey) [wire_length]u8 {
-        var out: [wire_length]u8 = undefined;
+    /// Serialize into `out` (secret: the plaintext key for `kdf_alg_none`).
+    pub fn toBytes(self: *const RawSecretKey, out: *[wire_length]u8) void {
         var i: usize = 0;
         out[i..][0..2].* = self.sig_alg;
         i += 2;
@@ -239,12 +240,11 @@ pub const RawSecretKey = struct {
         out[i..][0..checksum_length].* = self.checksum;
         i += checksum_length;
         std.debug.assert(i == wire_length);
-        return out;
     }
 
-    pub fn fromBytes(bytes: [wire_length]u8) RawSecretKey {
+    /// Parse `bytes` into `out` (every field is written).
+    pub fn fromBytes(out: *RawSecretKey, bytes: *const [wire_length]u8) void {
         var i: usize = 0;
-        var out: RawSecretKey = undefined;
         out.sig_alg = bytes[i..][0..2].*;
         i += 2;
         out.kdf_alg = bytes[i..][0..2].*;
@@ -264,7 +264,6 @@ pub const RawSecretKey = struct {
         out.checksum = bytes[i..][0..checksum_length].*;
         i += checksum_length;
         std.debug.assert(i == wire_length);
-        return out;
     }
 };
 
@@ -278,17 +277,28 @@ fn Base64Codec(comptime wire_length: usize) type {
 
         pub fn encode(bytes: [wire_length]u8) [encoded_length]u8 {
             var out: [encoded_length]u8 = undefined;
-            _ = Encoder.encode(&out, &bytes);
+            encodeInto(&out, &bytes);
             return out;
         }
 
+        /// By pointer, for the secret-key codec: no copy of the key in a frame.
+        pub fn encodeInto(out: *[encoded_length]u8, bytes: *const [wire_length]u8) void {
+            _ = Encoder.encode(out, bytes);
+        }
+
         pub fn decode(text: []const u8) error{ WrongLength, InvalidBase64 }![wire_length]u8 {
+            var out: [wire_length]u8 = undefined;
+            try decodeInto(&out, text);
+            return out;
+        }
+
+        /// `out` is zeroed on error.
+        pub fn decodeInto(out: *[wire_length]u8, text: []const u8) error{ WrongLength, InvalidBase64 }!void {
+            errdefer std.crypto.secureZero(u8, out);
             if (text.len != encoded_length) return error.WrongLength;
             const decoded_len = Decoder.calcSizeForSlice(text) catch return error.InvalidBase64;
             if (decoded_len != wire_length) return error.InvalidBase64;
-            var out: [wire_length]u8 = undefined;
-            Decoder.decode(&out, text) catch return error.InvalidBase64;
-            return out;
+            Decoder.decode(out, text) catch return error.InvalidBase64;
         }
     };
 }
@@ -412,19 +422,33 @@ pub const ParsedSecretKey = struct {
     key: RawSecretKey,
 };
 
-/// Parse a 2-line secret key file. Does not decrypt — see `openSecretKey`.
-pub fn parseSecretKeyFile(text: []const u8) FormatError!ParsedSecretKey {
+/// Parse a 2-line secret key file into `out`. Does not decrypt — see
+/// `openSecretKey`. `out.key` is secret for an unencrypted (`-W`) file; on error
+/// it is zeroed and the comment is empty. The body runs one frame down and the
+/// stack it dirtied is burned.
+pub fn parseSecretKeyFile(out: *ParsedSecretKey, text: []const u8) FormatError!void {
+    return burn.run(burn.codec_burn, FormatError!void, parseSecretKeyFileBody, .{ out, text });
+}
+
+fn parseSecretKeyFileBody(out: *ParsedSecretKey, text: []const u8) FormatError!void {
+    errdefer {
+        out.untrusted_comment = "";
+        std.crypto.secureZero(u8, std.mem.asBytes(&out.key));
+    }
     var it = std.mem.splitScalar(u8, text, '\n');
     const comment_line = try nextLine(&it);
     if (!std.mem.startsWith(u8, comment_line, untrusted_comment_prefix))
         return error.MissingUntrustedCommentPrefix;
     const b64_line = try nextLine(&it);
-    const key = RawSecretKey.fromBytes(try SecretKeyCodec.decode(b64_line));
-    if (!std.mem.eql(u8, &key.sig_alg, &sig_alg_legacy)) return error.UnsupportedAlgorithm;
-    if (!std.mem.eql(u8, &key.chk_alg, &chk_alg_blake2b)) return error.UnsupportedAlgorithm;
-    if (!std.mem.eql(u8, &key.kdf_alg, &kdf_alg_scrypt) and !std.mem.eql(u8, &key.kdf_alg, &kdf_alg_none))
+    var wire: [RawSecretKey.wire_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &wire);
+    try SecretKeyCodec.decodeInto(&wire, b64_line);
+    RawSecretKey.fromBytes(&out.key, &wire);
+    if (!std.mem.eql(u8, &out.key.sig_alg, &sig_alg_legacy)) return error.UnsupportedAlgorithm;
+    if (!std.mem.eql(u8, &out.key.chk_alg, &chk_alg_blake2b)) return error.UnsupportedAlgorithm;
+    if (!std.mem.eql(u8, &out.key.kdf_alg, &kdf_alg_scrypt) and !std.mem.eql(u8, &out.key.kdf_alg, &kdf_alg_none))
         return error.UnsupportedAlgorithm;
-    return .{ .untrusted_comment = comment_line[untrusted_comment_prefix.len..], .key = key };
+    out.untrusted_comment = comment_line[untrusted_comment_prefix.len..];
 }
 
 pub const ParsedSignature = struct {
@@ -477,10 +501,23 @@ pub fn writePublicKeyFile(w: *std.Io.Writer, untrusted_comment: []const u8, key:
     try w.print("{s}\n", .{PublicKeyCodec.encode(key.toBytes())});
 }
 
-pub fn writeSecretKeyFile(w: *std.Io.Writer, untrusted_comment: []const u8, key: RawSecretKey) !void {
+/// The key is read by pointer and the encoded line (the key itself for an
+/// unencrypted file) is wiped from this module's frames; `w`'s own buffer is
+/// the caller's.
+pub fn writeSecretKeyFile(w: *std.Io.Writer, untrusted_comment: []const u8, key: *const RawSecretKey) (FormatError || std.Io.Writer.Error)!void {
+    return burn.run(burn.codec_burn, (FormatError || std.Io.Writer.Error)!void, writeSecretKeyFileBody, .{ w, untrusted_comment, key });
+}
+
+fn writeSecretKeyFileBody(w: *std.Io.Writer, untrusted_comment: []const u8, key: *const RawSecretKey) (FormatError || std.Io.Writer.Error)!void {
     try checkComment(untrusted_comment);
     try w.print("{s}{s}\n", .{ untrusted_comment_prefix, untrusted_comment });
-    try w.print("{s}\n", .{SecretKeyCodec.encode(key.toBytes())});
+    var wire: [RawSecretKey.wire_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &wire);
+    var text: [SecretKeyCodec.encoded_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &text);
+    key.toBytes(&wire);
+    SecretKeyCodec.encodeInto(&text, &wire);
+    try w.print("{s}\n", .{&text});
 }
 
 pub fn writeSignatureFile(
@@ -529,14 +566,19 @@ pub const KeyPair = struct {
     key_number: [key_number_length]u8,
     ed25519: std.crypto.sign.Ed25519.KeyPair,
 
-    /// Generate a fresh random key pair (fresh random key number too).
+    /// Generate a fresh random key pair (fresh random key number too) into
+    /// `out`. The body runs one frame down and the stack it dirtied is burned.
     ///
     /// The two draws below are deliberately NOT the same call. `key_number`
     /// is published in the clear in every `.pub`/`.sig` file — it is an
     /// identifier, not a secret, and `io.random` is the right source for
     /// it. The Ed25519 seed is the signing key for every release this key
     /// will ever sign, so it is fail-closed (CONVENTIONS.md §2.2).
-    pub fn generate(io: std.Io) KeyPair {
+    pub fn generate(out: *KeyPair, io: std.Io) void {
+        burn.run(burn.generate_burn, void, generateBody, .{ out, io });
+    }
+
+    fn generateBody(out: *KeyPair, io: std.Io) void {
         var key_number: [key_number_length]u8 = undefined;
         io.random(&key_number);
 
@@ -550,11 +592,12 @@ pub const KeyPair = struct {
                 @branchHint(.unlikely);
                 continue;
             };
-            return .{ .key_number = key_number, .ed25519 = ed25519 };
+            out.* = .{ .key_number = key_number, .ed25519 = ed25519 };
+            return;
         }
     }
 
-    pub fn publicKey(self: KeyPair) RawPublicKey {
+    pub fn publicKey(self: *const KeyPair) RawPublicKey {
         return .{
             .sig_alg = sig_alg_legacy,
             .key_number = self.key_number,
@@ -565,8 +608,12 @@ pub const KeyPair = struct {
     /// The on-disk secret key struct for an unencrypted (`-W`) key: `chk`
     /// is left all-zero (see the module doc comment — the reference never
     /// computes it in this path, and never checks it either).
-    pub fn toRawSecretKeyPlain(self: KeyPair) RawSecretKey {
-        return .{
+    pub fn toRawSecretKeyPlain(self: *const KeyPair, out: *RawSecretKey) void {
+        burn.run(burn.codec_burn, void, toRawSecretKeyPlainBody, .{ self, out });
+    }
+
+    fn toRawSecretKeyPlainBody(self: *const KeyPair, out: *RawSecretKey) void {
+        out.* = .{
             .sig_alg = sig_alg_legacy,
             .kdf_alg = kdf_alg_none,
             .chk_alg = chk_alg_blake2b,
@@ -594,18 +641,35 @@ pub const KeyPair = struct {
 /// scrypt-keystream length: `key_number || secret_key || checksum`.
 const encrypted_block_length = key_number_length + secret_key_length + checksum_length; // 104
 
-/// Encrypt `key_pair` with `password` into the on-disk `RawSecretKey` form.
-/// `ops_limit`/`mem_limit` pick the scrypt cost (`ops_limit_sensitive`/
-/// `mem_limit_sensitive` are the CLI's own defaults); the wire format stores
-/// these two limits, not derived `(N, r, p)` — see the module doc comment.
+/// Encrypt `key_pair` with `password` into `out`, the on-disk `RawSecretKey`
+/// form (zeroed on error). `ops_limit`/`mem_limit` pick the scrypt cost
+/// (`ops_limit_sensitive`/`mem_limit_sensitive` are the CLI's own defaults); the
+/// wire format stores these two limits, not derived `(N, r, p)` — see the module
+/// doc comment. scrypt's working memory goes through `allocator` and is zeroed
+/// before it is freed; the body runs one frame down and the stack it dirtied is
+/// burned.
 pub fn sealSecretKey(
     allocator: std.mem.Allocator,
-    key_pair: KeyPair,
+    out: *RawSecretKey,
+    key_pair: *const KeyPair,
     password: []const u8,
     salt: [salt_length]u8,
     ops_limit: u64,
     mem_limit: usize,
-) !RawSecretKey {
+) std.crypto.pwhash.KdfError!void {
+    return burn.run(burn.kdf_burn, std.crypto.pwhash.KdfError!void, sealSecretKeyBody, .{ allocator, out, key_pair, password, salt, ops_limit, mem_limit });
+}
+
+fn sealSecretKeyBody(
+    allocator: std.mem.Allocator,
+    out: *RawSecretKey,
+    key_pair: *const KeyPair,
+    password: []const u8,
+    salt: [salt_length]u8,
+    ops_limit: u64,
+    mem_limit: usize,
+) std.crypto.pwhash.KdfError!void {
+    errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
     const plain_key_number = key_pair.key_number;
     // CONVENTIONS §2.1 Z1: our own copies of the plaintext secret key, its
     // checksum, and the scrypt keystream that encrypts them. Every `defer` is
@@ -619,23 +683,18 @@ pub fn sealSecretKey(
     const params = std.crypto.pwhash.scrypt.Params.fromLimits(ops_limit, mem_limit);
     var stream: [encrypted_block_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &stream);
-    try std.crypto.pwhash.scrypt.kdf(allocator, &stream, password, &salt, params);
+    var wipe: burn.WipeAllocator = .{ .child = allocator };
+    try std.crypto.pwhash.scrypt.kdf(wipe.allocator(), &stream, password, &salt, params);
 
-    var raw: RawSecretKey = .{
-        .sig_alg = sig_alg_legacy,
-        .kdf_alg = kdf_alg_scrypt,
-        .chk_alg = chk_alg_blake2b,
-        .salt = salt,
-        .ops_limit = ops_limit,
-        .mem_limit = mem_limit,
-        .key_number = undefined,
-        .secret_key = undefined,
-        .checksum = undefined,
-    };
-    for (&raw.key_number, 0..) |*b, i| b.* = plain_key_number[i] ^ stream[i];
-    for (&raw.secret_key, 0..) |*b, i| b.* = plain_sk[i] ^ stream[key_number_length + i];
-    for (&raw.checksum, 0..) |*b, i| b.* = plain_chk[i] ^ stream[key_number_length + secret_key_length + i];
-    return raw;
+    out.sig_alg = sig_alg_legacy;
+    out.kdf_alg = kdf_alg_scrypt;
+    out.chk_alg = chk_alg_blake2b;
+    out.salt = salt;
+    out.ops_limit = ops_limit;
+    out.mem_limit = mem_limit;
+    for (&out.key_number, 0..) |*b, i| b.* = plain_key_number[i] ^ stream[i];
+    for (&out.secret_key, 0..) |*b, i| b.* = plain_sk[i] ^ stream[key_number_length + i];
+    for (&out.checksum, 0..) |*b, i| b.* = plain_chk[i] ^ stream[key_number_length + secret_key_length + i];
 }
 
 /// `scrypt.Params.fromLimits` hardcodes block size `r = 8` (RFC 7914); its
@@ -675,24 +734,38 @@ pub const OpenSecretKeyError = error{
     MemLimitTooSmall,
 };
 
-/// Decrypt (if needed) and load a `RawSecretKey`. Pass `password = null`
-/// only for an unencrypted (`kdf_alg_none`) key — its `chk` is not checked,
-/// exactly like the reference. A wrong password is a typed
-/// `error.WrongPassword`, never a panic or silently-wrong key.
+const OpenError = OpenSecretKeyError || std.crypto.pwhash.KdfError ||
+    std.crypto.errors.NonCanonicalError || std.crypto.errors.EncodingError ||
+    std.crypto.errors.IdentityElementError;
+
+/// Decrypt (if needed) and load a `RawSecretKey` into `out` (zeroed on
+/// error). Pass `password = null` only for an unencrypted (`kdf_alg_none`) key
+/// — its `chk` is not checked, exactly like the reference. A wrong password is
+/// a typed `error.WrongPassword`, never a panic or silently-wrong key. scrypt's
+/// working memory goes through `allocator` and is zeroed before it is freed;
+/// the body runs one frame down and the stack it dirtied is burned.
 pub fn openSecretKey(
     allocator: std.mem.Allocator,
-    raw: RawSecretKey,
+    out: *KeyPair,
+    raw: *const RawSecretKey,
     password: ?[]const u8,
-) (OpenSecretKeyError || std.crypto.pwhash.KdfError ||
-    std.crypto.errors.NonCanonicalError || std.crypto.errors.EncodingError ||
-    std.crypto.errors.IdentityElementError)!KeyPair {
+) OpenError!void {
+    return burn.run(burn.kdf_burn, OpenError!void, openSecretKeyBody, .{ allocator, out, raw, password });
+}
+
+fn openSecretKeyBody(
+    allocator: std.mem.Allocator,
+    out: *KeyPair,
+    raw: *const RawSecretKey,
+    password: ?[]const u8,
+) OpenError!void {
+    errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
     if (!std.mem.eql(u8, &raw.sig_alg, &sig_alg_legacy)) return error.UnsupportedSignatureAlgorithm;
     if (!std.mem.eql(u8, &raw.chk_alg, &chk_alg_blake2b)) return error.UnsupportedChecksumAlgorithm;
 
     var key_number = raw.key_number;
     // CONVENTIONS §2.1 Z1 — the recovered plaintext secret key. The `defer`
-    // runs after the return operand is built, so the returned `KeyPair` still
-    // carries the key while this frame's copy does not.
+    // wipes this frame's copy; `out` carries the key to the caller.
     var sk_bytes = raw.secret_key;
     defer std.crypto.secureZero(u8, &sk_bytes);
 
@@ -705,7 +778,8 @@ pub fn openSecretKey(
         const params = std.crypto.pwhash.scrypt.Params.fromLimits(raw.ops_limit, mem_limit);
         var stream: [encrypted_block_length]u8 = undefined;
         defer std.crypto.secureZero(u8, &stream);
-        try std.crypto.pwhash.scrypt.kdf(allocator, &stream, pw, &raw.salt, params);
+        var wipe: burn.WipeAllocator = .{ .child = allocator };
+        try std.crypto.pwhash.scrypt.kdf(wipe.allocator(), &stream, pw, &raw.salt, params);
 
         var plain_key_number: [key_number_length]u8 = undefined;
         var plain_sk: [secret_key_length]u8 = undefined;
@@ -717,6 +791,7 @@ pub fn openSecretKey(
         for (&plain_chk, 0..) |*b, i| b.* = raw.checksum[i] ^ stream[key_number_length + secret_key_length + i];
 
         var computed_chk: [checksum_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &computed_chk);
         computeChecksum(&computed_chk, raw.sig_alg, plain_key_number, plain_sk);
         if (!std.crypto.timing_safe.eql([checksum_length]u8, computed_chk, plain_chk))
             return error.WrongPassword;
@@ -725,8 +800,11 @@ pub fn openSecretKey(
         sk_bytes = plain_sk;
     } else return error.UnsupportedKdf;
 
-    const secret_key = try std.crypto.sign.Ed25519.SecretKey.fromBytes(sk_bytes);
-    return .{ .key_number = key_number, .ed25519 = try std.crypto.sign.Ed25519.KeyPair.fromSecretKey(secret_key) };
+    var secret_key = try std.crypto.sign.Ed25519.SecretKey.fromBytes(sk_bytes);
+    defer std.crypto.secureZero(u8, &secret_key.bytes);
+    var ed25519 = try std.crypto.sign.Ed25519.KeyPair.fromSecretKey(secret_key);
+    defer std.crypto.secureZero(u8, &ed25519.secret_key.bytes);
+    out.* = .{ .key_number = key_number, .ed25519 = ed25519 };
 }
 
 // ── message signing / verification ───────────────────────────────────────────
@@ -737,14 +815,27 @@ fn prehash(message: []const u8) [prehash_length]u8 {
     return digest;
 }
 
+const EdSignError = std.crypto.errors.IdentityElementError || std.crypto.errors.NonCanonicalError ||
+    std.crypto.errors.KeyMismatchError || std.crypto.errors.WeakPublicKeyError;
+
+/// Every signature of this module goes through here: std's signer runs one
+/// frame down and the stack it dirtied (seed, scalar, nonce) is burned.
+fn edSign(key_pair: *const KeyPair, bytes: []const u8) EdSignError!std.crypto.sign.Ed25519.Signature {
+    return burn.run(burn.sign_burn, EdSignError!std.crypto.sign.Ed25519.Signature, edSignBody, .{ key_pair, bytes });
+}
+
+fn edSignBody(key_pair: *const KeyPair, bytes: []const u8) EdSignError!std.crypto.sign.Ed25519.Signature {
+    return key_pair.ed25519.sign(bytes, null);
+}
+
 /// Sign `message` (deterministic Ed25519 — `noise = null`, matching the
 /// reference's own deterministic `crypto_sign_detached`).
-pub fn signMessage(key_pair: KeyPair, message: []const u8, algorithm: Algorithm) !RawSignature {
+pub fn signMessage(key_pair: *const KeyPair, message: []const u8, algorithm: Algorithm) !RawSignature {
     const signed_bytes: []const u8 = switch (algorithm) {
         .legacy => message,
         .prehashed => &prehash(message),
     };
-    const sig = try key_pair.ed25519.sign(signed_bytes, null);
+    const sig = try edSign(key_pair, signed_bytes);
     return .{ .sig_alg = algorithm.tag(), .key_number = key_pair.key_number, .signature = sig.toBytes() };
 }
 
@@ -774,7 +865,7 @@ pub fn verifyMessage(public_key: RawPublicKey, message: []const u8, sig: RawSign
 /// used here).
 pub fn signTrustedComment(
     allocator: std.mem.Allocator,
-    key_pair: KeyPair,
+    key_pair: *const KeyPair,
     signature: RawSignature,
     trusted_comment: []const u8,
 ) ![signature_length]u8 {
@@ -782,7 +873,7 @@ pub fn signTrustedComment(
     defer allocator.free(buf);
     @memcpy(buf[0..signature_length], &signature.signature);
     @memcpy(buf[signature_length..], trusted_comment);
-    const sig = try key_pair.ed25519.sign(buf, null);
+    const sig = try edSign(key_pair, buf);
     return sig.toBytes();
 }
 
@@ -827,9 +918,9 @@ pub const SignedFile = struct {
 /// `sig_alg_prehashed` ("ED") signature — identical to what `signMessage(kp,
 /// message, .prehashed)` produces, given `digest ==
 /// Blake2b512.hash(message)`, since both funnel into the same
-/// `key_pair.ed25519.sign(&digest, null)` call.
-pub fn signDigest(key_pair: KeyPair, digest: [prehash_length]u8) !RawSignature {
-    const sig = try key_pair.ed25519.sign(&digest, null);
+/// `edSign(key_pair, &digest)` call.
+pub fn signDigest(key_pair: *const KeyPair, digest: [prehash_length]u8) !RawSignature {
+    const sig = try edSign(key_pair, &digest);
     return .{ .sig_alg = sig_alg_prehashed, .key_number = key_pair.key_number, .signature = sig.toBytes() };
 }
 
@@ -852,7 +943,7 @@ pub fn verifyDigest(public_key: RawPublicKey, digest: [prehash_length]u8, sig: R
 /// `writeSignatureFile`, exactly as with `signFile`.
 pub fn signFileDigest(
     allocator: std.mem.Allocator,
-    key_pair: KeyPair,
+    key_pair: *const KeyPair,
     digest: [prehash_length]u8,
     trusted_comment: []const u8,
 ) !SignedFile {
@@ -885,7 +976,7 @@ pub fn verifyFileDigest(
 /// `writeSignatureFile`.
 pub fn signFile(
     allocator: std.mem.Allocator,
-    key_pair: KeyPair,
+    key_pair: *const KeyPair,
     message: []const u8,
     algorithm: Algorithm,
     trusted_comment: []const u8,
@@ -915,6 +1006,10 @@ pub fn verifyFile(
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
+/// Result slot for `openSecretKey` calls that are expected to fail (the key is
+/// zeroed on error; tests run one at a time).
+var test_sink: KeyPair = undefined;
+
 test "RawPublicKey/RawSignature/RawSecretKey byte round-trip" {
     var pk: RawPublicKey = .{ .sig_alg = sig_alg_legacy, .key_number = undefined, .key = undefined };
     for (&pk.key_number, 0..) |*b, i| b.* = @intCast(i);
@@ -939,18 +1034,23 @@ test "RawPublicKey/RawSignature/RawSecretKey byte round-trip" {
     for (&sk.salt, 0..) |*b, i| b.* = @intCast(i);
     for (&sk.secret_key, 0..) |*b, i| b.* = @intCast(i);
     for (&sk.checksum, 0..) |*b, i| b.* = @intCast(i);
-    try std.testing.expectEqual(sk, RawSecretKey.fromBytes(sk.toBytes()));
+    var wire: [RawSecretKey.wire_length]u8 = undefined;
+    sk.toBytes(&wire);
+    var back: RawSecretKey = undefined;
+    RawSecretKey.fromBytes(&back, &wire);
+    try std.testing.expectEqual(sk, back);
 }
 
 test "sign/verify round-trip, both algorithms, plus tamper + wrong-key-id" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const kp = KeyPair.generate(io);
+    var kp: KeyPair = undefined;
+    KeyPair.generate(&kp, io);
     const pk = kp.publicKey();
     const msg = "round-trip message";
 
     inline for ([_]Algorithm{ .legacy, .prehashed }) |algo| {
-        const signed = try signFile(gpa, kp, msg, algo, "trusted comment");
+        const signed = try signFile(gpa, &kp, msg, algo, "trusted comment");
         try verifyMessage(pk, msg, signed.signature);
         try verifyTrustedComment(gpa, pk, signed.signature, "trusted comment", signed.global_signature);
 
@@ -975,8 +1075,10 @@ test "KeyPair.generate: two calls produce different seeds (A1 F5 -- a fixed seed
     // nothing compared two generated keys against EACH OTHER, only against
     // fixture/round-trip invariants a fixed seed satisfies just as well.
     const io = std.testing.io;
-    const kp1 = KeyPair.generate(io);
-    const kp2 = KeyPair.generate(io);
+    var kp1: KeyPair = undefined;
+    KeyPair.generate(&kp1, io);
+    var kp2: KeyPair = undefined;
+    KeyPair.generate(&kp2, io);
     try std.testing.expect(!std.mem.eql(
         u8,
         &kp1.ed25519.secret_key.toBytes(),
@@ -987,14 +1089,15 @@ test "KeyPair.generate: two calls produce different seeds (A1 F5 -- a fixed seed
 test "signDigest/verifyDigest: byte-exact against signMessage/verifyMessage's own .prehashed path" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const kp = KeyPair.generate(io);
+    var kp: KeyPair = undefined;
+    KeyPair.generate(&kp, io);
     const pk = kp.publicKey();
     const msg = "streaming digest message";
     const digest = prehash(msg);
 
     // Same key, same bytes, two entry points -> identical signature.
-    const via_message = try signMessage(kp, msg, .prehashed);
-    const via_digest = try signDigest(kp, digest);
+    const via_message = try signMessage(&kp, msg, .prehashed);
+    const via_digest = try signDigest(&kp, digest);
     try std.testing.expectEqual(via_message, via_digest);
 
     try verifyDigest(pk, digest, via_digest);
@@ -1018,7 +1121,7 @@ test "signDigest/verifyDigest: byte-exact against signMessage/verifyMessage's ow
 
     // full signFileDigest/verifyFileDigest round trip, including the
     // trusted-comment layer.
-    const signed = try signFileDigest(gpa, kp, digest, "streaming trusted comment");
+    const signed = try signFileDigest(gpa, &kp, digest, "streaming trusted comment");
     const written = blk: {
         var buf: [512]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
@@ -1045,12 +1148,16 @@ test "signDigest/verifyDigest: byte-exact against signMessage/verifyMessage's ow
 test "unencrypted secret key: seal is a no-op wrapper, chk stays zero, openSecretKey needs no password" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const kp = KeyPair.generate(io);
-    const raw = kp.toRawSecretKeyPlain();
+    var kp: KeyPair = undefined;
+    KeyPair.generate(&kp, io);
+    var raw: RawSecretKey = undefined;
+    kp.toRawSecretKeyPlain(&raw);
     try std.testing.expectEqualSlices(u8, &kdf_alg_none, &raw.kdf_alg);
     try std.testing.expectEqual(std.mem.zeroes([checksum_length]u8), raw.checksum);
 
-    const opened = try openSecretKey(gpa, raw, null);
+    var opened: KeyPair = undefined;
+
+    try openSecretKey(gpa, &opened, &raw, null);
     try std.testing.expectEqual(kp.key_number, opened.key_number);
     try std.testing.expectEqual(kp.ed25519.secret_key.toBytes(), opened.ed25519.secret_key.toBytes());
 }
@@ -1058,22 +1165,26 @@ test "unencrypted secret key: seal is a no-op wrapper, chk stays zero, openSecre
 test "encrypted secret key: seal + open round-trip, wrong password rejected" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const kp = KeyPair.generate(io);
+    var kp: KeyPair = undefined;
+    KeyPair.generate(&kp, io);
     var salt: [salt_length]u8 = undefined;
     io.random(&salt);
 
     // Cheapest legal scrypt cost so the test runs fast (`OPSLIMIT_MIN` per
     // libsodium is 32768; pair it with a small memlimit so `fromLimits`
     // lands on a tiny N).
-    const raw = try sealSecretKey(gpa, kp, "correct password", salt, 32768, 1 << 16);
+    var raw: RawSecretKey = undefined;
+    try sealSecretKey(gpa, &raw, &kp, "correct password", salt, 32768, 1 << 16);
     try std.testing.expectEqualSlices(u8, &kdf_alg_scrypt, &raw.kdf_alg);
 
-    const opened = try openSecretKey(gpa, raw, "correct password");
+    var opened: KeyPair = undefined;
+
+    try openSecretKey(gpa, &opened, &raw, "correct password");
     try std.testing.expectEqual(kp.key_number, opened.key_number);
     try std.testing.expectEqual(kp.ed25519.secret_key.toBytes(), opened.ed25519.secret_key.toBytes());
 
-    try std.testing.expectError(error.WrongPassword, openSecretKey(gpa, raw, "wrong password"));
-    try std.testing.expectError(error.PasswordRequired, openSecretKey(gpa, raw, null));
+    try std.testing.expectError(error.WrongPassword, openSecretKey(gpa, &test_sink, &raw, "wrong password"));
+    try std.testing.expectError(error.PasswordRequired, openSecretKey(gpa, &test_sink, &raw, null));
 }
 
 test "openSecretKey: the mem_limit-fits-usize guard rejects what does not fit, for any usize width" {
@@ -1119,14 +1230,14 @@ test "openSecretKey: mem_limit below the scrypt floor is rejected, not a panic (
     };
     for ([_]u64{ 0, 1, 4, 8, 1023 }) |mem_limit| {
         raw.mem_limit = mem_limit;
-        try std.testing.expectError(error.MemLimitTooSmall, openSecretKey(gpa, raw, "any password"));
+        try std.testing.expectError(error.MemLimitTooSmall, openSecretKey(gpa, &test_sink, &raw, "any password"));
     }
     // Positive control: the floor value itself must clear THIS guard — it
     // still fails, but through the KDF's own `ln == 0` guard
     // (`error.WeakParameters`), proving the ladder above is testing the
     // right guard and not just any rejection.
     raw.mem_limit = scrypt_min_mem_limit;
-    try std.testing.expectError(error.WeakParameters, openSecretKey(gpa, raw, "any password"));
+    try std.testing.expectError(error.WeakParameters, openSecretKey(gpa, &test_sink, &raw, "any password"));
 }
 
 test "openSecretKey rejects an unrecognized sig_alg/chk_alg/kdf_alg tag" {
@@ -1138,20 +1249,22 @@ test "openSecretKey rejects an unrecognized sig_alg/chk_alg/kdf_alg tag" {
     // defense-in-depth against this module's own constructors.
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const kp = KeyPair.generate(io);
-    const raw = kp.toRawSecretKeyPlain();
+    var kp: KeyPair = undefined;
+    KeyPair.generate(&kp, io);
+    var raw: RawSecretKey = undefined;
+    kp.toRawSecretKeyPlain(&raw);
 
     var bad_sig_alg = raw;
     bad_sig_alg.sig_alg = .{ 'X', 'X' };
-    try std.testing.expectError(error.UnsupportedSignatureAlgorithm, openSecretKey(gpa, bad_sig_alg, null));
+    try std.testing.expectError(error.UnsupportedSignatureAlgorithm, openSecretKey(gpa, &test_sink, &bad_sig_alg, null));
 
     var bad_chk_alg = raw;
     bad_chk_alg.chk_alg = .{ 'X', 'X' };
-    try std.testing.expectError(error.UnsupportedChecksumAlgorithm, openSecretKey(gpa, bad_chk_alg, null));
+    try std.testing.expectError(error.UnsupportedChecksumAlgorithm, openSecretKey(gpa, &test_sink, &bad_chk_alg, null));
 
     var bad_kdf_alg = raw;
     bad_kdf_alg.kdf_alg = .{ 'X', 'X' };
-    try std.testing.expectError(error.UnsupportedKdf, openSecretKey(gpa, bad_kdf_alg, "some password"));
+    try std.testing.expectError(error.UnsupportedKdf, openSecretKey(gpa, &test_sink, &bad_kdf_alg, "some password"));
 }
 
 // Regression (audit W2 `minisign` F3): only `openSecretKey`'s three tag
@@ -1468,21 +1581,23 @@ pub fn secretKeyFileHarness(comptime S: type, src: *S, allocator: std.mem.Alloca
     var buf: [secret_key_file_buf_len]u8 = undefined;
     const n: usize = src.slice(&buf);
     const drawn = buf[0..n];
-    if (parseSecretKeyFile(drawn)) |parsed| {
+    var parsed: ParsedSecretKey = undefined;
+    var opened: KeyPair = undefined;
+    if (parseSecretKeyFile(&parsed, drawn)) {
         fuzz_test.mark(.key_file_parsed);
         var pw_buf: [16]u8 = undefined;
         const pw_len: usize = @min(pw_buf.len, drawn.len);
         @memcpy(pw_buf[0..pw_len], drawn[0..pw_len]);
-        _ = openSecretKey(allocator, parsed.key, pw_buf[0..pw_len]) catch {};
+        openSecretKey(allocator, &opened, &parsed.key, pw_buf[0..pw_len]) catch {};
     } else |_| fuzz_test.mark(.key_file_rejected);
 
     var cur: tkfuzz.Cursor = .{ .bytes = drawn };
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     try buildFuzzSecretKeyFile(&text, allocator, &cur);
-    if (parseSecretKeyFile(text.items)) |parsed| {
+    if (parseSecretKeyFile(&parsed, text.items)) {
         fuzz_test.mark(.key_file_parsed);
-        _ = openSecretKey(allocator, parsed.key, "fuzz password") catch {};
+        openSecretKey(allocator, &opened, &parsed.key, "fuzz password") catch {};
     } else |_| fuzz_test.mark(.key_file_rejected);
 }
 
@@ -1507,7 +1622,11 @@ fn buildFuzzSecretKeyFile(text: *std.ArrayList(u8), allocator: std.mem.Allocator
     for (&raw.secret_key) |*b| b.* = cur.byte();
     for (&raw.checksum) |*b| b.* = cur.byte();
 
-    try text.appendSlice(allocator, &SecretKeyCodec.encode(raw.toBytes()));
+    var wire: [RawSecretKey.wire_length]u8 = undefined;
+    raw.toBytes(&wire);
+    var b64: [SecretKeyCodec.encoded_length]u8 = undefined;
+    SecretKeyCodec.encodeInto(&b64, &wire);
+    try text.appendSlice(allocator, &b64);
     if (cur.byte() & 1 == 1) try text.append(allocator, '\n');
 }
 
@@ -1529,6 +1648,8 @@ test "corpus: every secret key file reaches the parser, and the counts are pinne
     var nonempty: usize = 0;
     var parsed: usize = 0;
     var skeletons: usize = 0;
+    var parsed_key: ParsedSecretKey = undefined;
+    var opened: KeyPair = undefined;
     var seen: [secret_key_file_seeds.len]std.ArrayList(u8) = undefined;
     defer for (seen[0..skeletons]) |*s| s.deinit(allocator);
     for (secret_key_file_seeds) |sd| {
@@ -1537,13 +1658,13 @@ test "corpus: every secret key file reaches the parser, and the counts are pinne
         const n: usize = smith.slice(&buf);
         if (n != 0) nonempty += 1;
         const drawn = buf[0..n];
-        if (parseSecretKeyFile(drawn)) |_| parsed += 1 else |_| {}
+        if (parseSecretKeyFile(&parsed_key, drawn)) |_| parsed += 1 else |_| {}
 
         var cur: tkfuzz.Cursor = .{ .bytes = drawn };
         var text: std.ArrayList(u8) = .empty;
         try buildFuzzSecretKeyFile(&text, allocator, &cur);
-        if (parseSecretKeyFile(text.items)) |p| {
-            _ = openSecretKey(allocator, p.key, "fuzz password") catch {};
+        if (parseSecretKeyFile(&parsed_key, text.items)) |_| {
+            openSecretKey(allocator, &opened, &parsed_key.key, "fuzz password") catch {};
         } else |_| {}
         var already = false;
         for (seen[0..skeletons]) |s| {
@@ -1649,17 +1770,22 @@ test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "KeyPair.wipe destroys the long-term secret key, leaving the public half usable" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const kp = KeyPair.generate(io);
+    var kp: KeyPair = undefined;
+    KeyPair.generate(&kp, io);
     var salt: [salt_length]u8 = undefined;
     io.random(&salt);
 
-    const raw = try sealSecretKey(gpa, kp, "pw", salt, 32768, 1 << 16);
-    var opened = try openSecretKey(gpa, raw, "pw");
+    var raw: RawSecretKey = undefined;
+
+    try sealSecretKey(gpa, &raw, &kp, "pw", salt, 32768, 1 << 16);
+    var opened: KeyPair = undefined;
+    try openSecretKey(gpa, &opened, &raw, "pw");
 
     // Precondition: the recovered key really is the on-disk key, so the
     // assertion below is about the wipe and not about a key that was never
@@ -1758,19 +1884,21 @@ test "parsePublicKeyFile / parseSecretKeyFile: comment prefix and every algorith
     const no_prefix = try std.fmt.bufPrint(&buf, "untrusted remark: x\n{s}\n", .{pk_b64});
     try std.testing.expectError(error.MissingUntrustedCommentPrefix, parsePublicKeyFile(no_prefix));
 
-    const sk = try parseSecretKeyFile(kat.unencrypted_secret_key_file); // control
+    var sk: ParsedSecretKey = undefined;
+    var sk_sink: ParsedSecretKey = undefined;
+    try parseSecretKeyFile(&sk, kat.unencrypted_secret_key_file); // control
     inline for (.{ "sig_alg", "chk_alg", "kdf_alg" }) |field| {
         var raw = sk.key;
         @field(raw, field) = .{ 'X', 'X' };
         var w = std.Io.Writer.fixed(&buf);
-        try writeSecretKeyFile(&w, "c", raw);
-        try std.testing.expectError(error.UnsupportedAlgorithm, parseSecretKeyFile(w.buffered()));
+        try writeSecretKeyFile(&w, "c", &raw);
+        try std.testing.expectError(error.UnsupportedAlgorithm, parseSecretKeyFile(&sk_sink, w.buffered()));
     }
     var w = std.Io.Writer.fixed(&buf);
-    try writeSecretKeyFile(&w, "c", sk.key);
+    try writeSecretKeyFile(&w, "c", &sk.key);
     const text = w.buffered();
     text[0] = 'U';
-    try std.testing.expectError(error.MissingUntrustedCommentPrefix, parseSecretKeyFile(text));
+    try std.testing.expectError(error.MissingUntrustedCommentPrefix, parseSecretKeyFile(&sk_sink, text));
 }
 
 test "writers refuse a carriage return and an unprintable trusted comment" {

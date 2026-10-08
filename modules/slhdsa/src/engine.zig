@@ -15,6 +15,7 @@ const std = @import("std");
 const testkit = @import("testkit");
 const params = @import("params.zig");
 const address = @import("address.zig");
+const burn = @import("burn.zig");
 
 const Address = address.Address;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -128,16 +129,22 @@ pub fn SlhDsa(comptime P: params.Params) type {
             prf: [n]u8,
             pk: PublicKey,
 
-            pub fn fromBytes(bytes: [secret_key_length]u8) SecretKey {
-                return .{
-                    .seed = bytes[0..n].*,
-                    .prf = bytes[n .. 2 * n].*,
-                    .pk = PublicKey.fromBytes(bytes[2 * n ..].*),
-                };
+            /// Parse `SK.seed || SK.prf || PK.seed || PK.root` into `out`.
+            /// Secret in by pointer, secret out via `out` (never by value,
+            /// which would leave copies in dead frames).
+            pub fn fromBytes(out: *SecretKey, bytes: *const [secret_key_length]u8) void {
+                @memcpy(&out.seed, bytes[0..n]);
+                @memcpy(&out.prf, bytes[n .. 2 * n]);
+                @memcpy(&out.pk.seed, bytes[2 * n .. 3 * n]);
+                @memcpy(&out.pk.root, bytes[3 * n ..]);
             }
 
-            pub fn toBytes(sk: SecretKey) [secret_key_length]u8 {
-                return sk.seed ++ sk.prf ++ sk.pk.toBytes();
+            /// Serialize into `out` (the inverse of `fromBytes`).
+            pub fn toBytes(sk: *const SecretKey, out: *[secret_key_length]u8) void {
+                @memcpy(out[0..n], &sk.seed);
+                @memcpy(out[n .. 2 * n], &sk.prf);
+                @memcpy(out[2 * n .. 3 * n], &sk.pk.seed);
+                @memcpy(out[3 * n ..], &sk.pk.root);
             }
         };
 
@@ -554,24 +561,30 @@ pub fn SlhDsa(comptime P: params.Params) type {
 
         // ── §9/§10 SLH-DSA ────────────────────────────────────────────────
 
-        /// slh_keygen_internal (Algorithm 18) from the three n-byte seeds.
-        pub fn keyGenFromSeed(sk_seed: [n]u8, sk_prf: [n]u8, pk_seed: [n]u8) KeyPair {
-            const th = Thash.init(pk_seed);
+        fn keyGenBody(out: *KeyPair, sk_seed: *const [n]u8, sk_prf: *const [n]u8, pk_seed: *const [n]u8) void {
+            const th = Thash.init(pk_seed.*);
             var adrs: Address = .{};
             adrs.setLayer(d - 1);
-            const root = xmssNode(th, sk_seed, 0, hp, adrs);
-            const pk: PublicKey = .{ .seed = pk_seed, .root = root };
-            return .{
-                .sk = .{ .seed = sk_seed, .prf = sk_prf, .pk = pk },
-                .pk = pk,
-            };
+            const root = xmssNode(th, sk_seed.*, 0, hp, adrs);
+            @memcpy(&out.sk.seed, sk_seed);
+            @memcpy(&out.sk.prf, sk_prf);
+            @memcpy(&out.sk.pk.seed, pk_seed);
+            out.sk.pk.root = root;
+            out.pk = out.sk.pk;
+        }
+
+        /// slh_keygen_internal (Algorithm 18) from the three n-byte seeds.
+        /// Secrets by pointer, the key pair via `out`; the body runs one
+        /// frame down and the stack it dirtied is zeroed (`burn.zig`).
+        pub fn keyGenFromSeed(out: *KeyPair, sk_seed: *const [n]u8, sk_prf: *const [n]u8, pk_seed: *const [n]u8) void {
+            burn.run(burn.keygen_burn, void, keyGenBody, .{ out, sk_seed, sk_prf, pk_seed });
         }
 
         /// Convenience wrapper: one 3n-byte seed blob laid out as
         /// SK.seed || SK.prf || PK.seed (the FIPS 205 §9.1 order). The
         /// caller supplies the randomness (e.g. from the OS CSPRNG).
-        pub fn keyGen(seed: [3 * n]u8) KeyPair {
-            return keyGenFromSeed(seed[0..n].*, seed[n .. 2 * n].*, seed[2 * n ..].*);
+        pub fn keyGen(out: *KeyPair, seed: *const [3 * n]u8) void {
+            keyGenFromSeed(out, seed[0..n], seed[n .. 2 * n], seed[2 * n ..][0..n]);
         }
 
         /// Fold a short big-endian byte string into a u64 (toInt, Alg 2).
@@ -581,7 +594,7 @@ pub fn SlhDsa(comptime P: params.Params) type {
             return v;
         }
 
-        fn signInternalParts(out: *[signature_length]u8, msg_parts: []const []const u8, sk: SecretKey, addrnd: ?[n]u8) void {
+        fn signInternalParts(out: *[signature_length]u8, msg_parts: []const []const u8, sk: *const SecretKey, addrnd: ?[n]u8) void {
             const th = Thash.init(sk.pk.seed);
 
             // Randomizer: opt_rand = addrnd, or PK.seed for the FIPS 205
@@ -612,8 +625,9 @@ pub fn SlhDsa(comptime P: params.Params) type {
         /// randomness for hedged signing; pass `null` for the deterministic
         /// variant (opt_rand = PK.seed). This is the raw-message interface
         /// ACVP tests as "internal"; applications normally want `sign`.
-        pub fn signInternal(out: *[signature_length]u8, msg: []const u8, sk: SecretKey, addrnd: ?[n]u8) void {
-            signInternalParts(out, &.{msg}, sk, addrnd);
+        pub fn signInternal(out: *[signature_length]u8, msg: []const u8, sk: *const SecretKey, addrnd: ?[n]u8) void {
+            const parts = [_][]const u8{msg};
+            burn.run(burn.sign_burn, void, signInternalParts, .{ out, &parts, sk, addrnd });
         }
 
         fn verifyInternalParts(sig: []const u8, msg_parts: []const []const u8, pk: PublicKey) bool {
@@ -652,10 +666,11 @@ pub fn SlhDsa(comptime P: params.Params) type {
         /// M' = 0x00 || len(ctx) || ctx || M. Pass `addrnd = null` for
         /// deterministic signing, or n fresh random bytes for hedged
         /// signing (recommended by FIPS 205 where randomness is available).
-        pub fn sign(out: *[signature_length]u8, msg: []const u8, sk: SecretKey, ctx: []const u8, addrnd: ?[n]u8) SignError!void {
+        pub fn sign(out: *[signature_length]u8, msg: []const u8, sk: *const SecretKey, ctx: []const u8, addrnd: ?[n]u8) SignError!void {
             if (ctx.len > 255) return error.ContextTooLong;
             const prefix: [2]u8 = .{ 0x00, @intCast(ctx.len) };
-            signInternalParts(out, &.{ &prefix, ctx, msg }, sk, addrnd);
+            const parts = [_][]const u8{ &prefix, ctx, msg };
+            burn.run(burn.sign_burn, void, signInternalParts, .{ out, &parts, sk, addrnd });
         }
 
         /// slh_verify, pure variant (Algorithm 24). Returns false (never
@@ -750,13 +765,23 @@ test "FORS sign -> pkFromSig is self-consistent and message-bound" {
 }
 
 test "key serialization round-trips" {
-    const kp = TestScheme.keyGenFromSeed(testSeed(1), testSeed(2), testSeed(3));
+    var kp: TestScheme.KeyPair = undefined;
+    TestScheme.keyGenFromSeed(&kp, &testSeed(1), &testSeed(2), &testSeed(3));
     const pk2 = TestScheme.PublicKey.fromBytes(kp.pk.toBytes());
-    const sk2 = TestScheme.SecretKey.fromBytes(kp.sk.toBytes());
+    var sk_bytes: [TestScheme.secret_key_length]u8 = undefined;
+    kp.sk.toBytes(&sk_bytes);
+    var sk2: TestScheme.SecretKey = undefined;
+    TestScheme.SecretKey.fromBytes(&sk2, &sk_bytes);
     try std.testing.expectEqualSlices(u8, &kp.pk.toBytes(), &pk2.toBytes());
-    try std.testing.expectEqualSlices(u8, &kp.sk.toBytes(), &sk2.toBytes());
-    const kp2 = TestScheme.keyGen(testSeed(1) ++ testSeed(2) ++ testSeed(3));
-    try std.testing.expectEqualSlices(u8, &kp.sk.toBytes(), &kp2.sk.toBytes());
+    var sk2_bytes: [TestScheme.secret_key_length]u8 = undefined;
+    sk2.toBytes(&sk2_bytes);
+    try std.testing.expectEqualSlices(u8, &sk_bytes, &sk2_bytes);
+    var kp2: TestScheme.KeyPair = undefined;
+    TestScheme.keyGen(&kp2, &(testSeed(1) ++ testSeed(2) ++ testSeed(3)));
+    try std.testing.expectEqualSlices(u8, &kp.sk.seed, &kp2.sk.seed);
+    try std.testing.expectEqualSlices(u8, &kp.sk.prf, &kp2.sk.prf);
+    try std.testing.expectEqualSlices(u8, &kp.pk.toBytes(), &kp2.pk.toBytes());
+    try std.testing.expectEqualSlices(u8, &kp.sk.pk.toBytes(), &kp.pk.toBytes());
 }
 
 // ── fuzz harness (untrusted-wire decoder) ───────────────────────────────
@@ -780,7 +805,7 @@ const VerifyCorpus = struct {
         self.n += 1;
     }
 
-    fn build(self: *VerifyCorpus, sk: TestScheme.SecretKey) []const []const u8 {
+    fn build(self: *VerifyCorpus, sk: *const TestScheme.SecretKey) []const []const u8 {
         var sig: [TestScheme.signature_length]u8 = undefined;
         TestScheme.sign(&sig, "fuzz msg", sk, "", null) catch unreachable;
         self.push(&sig); // the signature that verifies
@@ -804,9 +829,10 @@ const VerifyCorpus = struct {
 };
 
 test "fuzz: verify never crashes on an arbitrary-length signature" {
-    const kp = TestScheme.keyGenFromSeed(testSeed(1), testSeed(2), testSeed(3));
+    var kp: TestScheme.KeyPair = undefined;
+    TestScheme.keyGenFromSeed(&kp, &testSeed(1), &testSeed(2), &testSeed(3));
     var corpus: VerifyCorpus = .{};
-    try std.testing.fuzz(kp.pk, fuzzVerify, .{ .corpus = corpus.build(kp.sk) });
+    try std.testing.fuzz(kp.pk, fuzzVerify, .{ .corpus = corpus.build(&kp.sk) });
 }
 
 fn fuzzVerify(pk: TestScheme.PublicKey, smith: *std.testing.Smith) !void {
@@ -824,7 +850,8 @@ fn fuzzVerify(pk: TestScheme.PublicKey, smith: *std.testing.Smith) !void {
 }
 
 test "corpus: the verify seeds reach the structural parse, and the counts are pinned" {
-    const kp = TestScheme.keyGenFromSeed(testSeed(1), testSeed(2), testSeed(3));
+    var kp: TestScheme.KeyPair = undefined;
+    TestScheme.keyGenFromSeed(&kp, &testSeed(1), &testSeed(2), &testSeed(3));
     var corpus: VerifyCorpus = .{};
     var nonempty: usize = 0;
     var accepted: usize = 0;
@@ -832,7 +859,7 @@ test "corpus: the verify seeds reach the structural parse, and the counts are pi
     // the length guard and into the FORS/hypertree reconstruction. It was 0 —
     // `verify` never once looked at a signature's content.
     var full_length: usize = 0;
-    for (corpus.build(kp.sk)) |sd| {
+    for (corpus.build(&kp.sk)) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [TestScheme.signature_length + 32]u8 = undefined;
         const len: usize = smith.slice(&buf);

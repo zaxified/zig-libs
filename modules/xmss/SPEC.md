@@ -236,11 +236,19 @@ exactly `i`).
   Measured at ReleaseFast before the fix (A1 F3): `keyGen` left 49 chain
   values, `sign` 47 per call at leaf 0 and 49 after a jump to leaf 5 — the
   same on the audited tree. Each entry point now runs its computation one
-  frame down and zeroes 32 KiB below it (the call trees reach ~10 KiB at h=4
-  and h=10); a test asserts zero residue beside a negative and a positive
-  control. `zeroize` still wipes only the two seeds. The raw WOTS+ primitives
-  (`wotsSkGen`, `wotsSign`, `wotsPkGen`, `genLeaf`, `chain`) do not burn: a
-  caller using them directly owns that stack.
+  frame down (`burn.zig`) and zeroes 16 KiB below it (the call trees reach
+  5.9 / 8.4 / 5.9 KiB for `keyGen` / `sign` / `buildAuth` at h=4); a probe
+  (`stackprobe_test.zig`) asserts zero residue of the seeds and of every
+  chain value beside a negative and a positive control. `zeroize` still wipes
+  only the two seeds.
+- **No secret crosses the API by value** (dead-stack sweep, 2026-10-09).
+  `keyGen` writes the `KeyPair` through `*KeyPair` and takes the seeds as
+  `*const`; `prfKeygen`/`wotsSkGen` write through an out-param; `chain` and
+  `chainStep` update a chain value in place; `SigningKey.init` takes
+  `*const SecretKey`. `wotsPkGen`, `wotsSign` and `genLeaf` return by value
+  only because their results are public. They, and the other raw WOTS+
+  primitives, do not burn: a caller using them directly owns that stack. A
+  `SecretKey` the caller copies is the caller's copy: `zeroize` it.
 - **Bare `SecretKey` is not thread-safe, and since the BDS rewrite the hazard
   is memory-unsafety, not just index reuse.** Two racing `sign` calls drive
   `bds.stackoffset` to 0 while `stackusage > 0`; `stackoffset - 1` underflows a
@@ -272,6 +280,15 @@ exactly `i`).
   hits this on every restart. Moderate; needs a documented BDS-state encoding,
   which conflicts with the stated no-serialisation choice, so it is a decision for
   the maintainer rather than a plain to-do. Pure Zig.
+
+- **Stack hygiene beyond the entry points** *(dead-stack sweep 2026-10-09)*. The
+  probe's needles are the raw seeds and the unmasked chain values; the masked value
+  `x XOR bitmask` that `chainStep` feeds to F, and SHA-256 block buffers holding it,
+  are not needles (the mask is public, so they are as secret as the chain value).
+  The probe is h = 4 only. `hashF`/`hashH`/`prf`/`hashMsg` return by value
+  (generic, public-role primitives). `SecretKey` is still a plain value type that
+  `SigningKey.init` copies; a handle that owns the only copy would need `init` to
+  consume it. Small. Pure Zig.
 
 ## Anchoring
 

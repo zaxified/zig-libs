@@ -102,9 +102,10 @@ test "public API surface: sizes and a sign/verify smoke" {
 
     var seed: [48]u8 = undefined;
     for (&seed, 0..) |*b, i| b.* = @truncate(i);
-    const kp = SlhDsaSha2_128f.keyGen(seed);
+    var kp: SlhDsaSha2_128f.KeyPair = undefined;
+    SlhDsaSha2_128f.keyGen(&kp, &seed);
     var sig: [SlhDsaSha2_128f.signature_length]u8 = undefined;
-    try SlhDsaSha2_128f.sign(&sig, "hello", kp.sk, "", null);
+    try SlhDsaSha2_128f.sign(&sig, "hello", &kp.sk, "", null);
     try std.testing.expect(SlhDsaSha2_128f.verify(&sig, "hello", kp.pk, ""));
     try std.testing.expect(!SlhDsaSha2_128f.verify(&sig, "hellp", kp.pk, ""));
 }
@@ -115,4 +116,5 @@ test {
     _ = engine;
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }

@@ -60,7 +60,7 @@ Debug AND ReleaseFast (see `SPEC.md` for the design record).
 Lagrange-interpolation-in-the-exponent combining — built entirely on
 Part 4's min-pk ciphersuite (a partial signature IS a `bls_sig.sign`
 call under a Shamir share; a combined signature IS an ordinary
-`bls_sig.Signature`, byte-for-byte equal to `bls_sig.sign(sk, msg)` and
+`bls_sig.Signature`, byte-for-byte equal to `bls_sig.sign(&sk, msg)` and
 verified with the ordinary `bls_sig.verify` — which transitively pins
 the threshold path to Part 4's `ethereum/bls12-381-tests` vectors). See
 `threshold.zig`'s own module doc comment and `SPEC.md`'s "Part 6
@@ -128,14 +128,16 @@ const h2 = bls12_381.hash_to_curve.hashToCurveG2("message", dst); // G2.Affine (
 
 // BLS signatures (Part 4 — min-pk/ProofOfPossession ciphersuite):
 const bls = bls12_381.bls_sig;
-const sk = try bls.keyGen("at least 32 bytes of IKM go here......", "");
-const pk = bls.skToPk(sk);
+var sk: bls.SecretKey = undefined;           // a secret: written in place, passed by pointer
+try bls.keyGen(&sk, "at least 32 bytes of IKM go here......", "");
+defer sk.deinit();
+const pk = bls.skToPk(&sk);
 const ok = bls.keyValidate(pk);               // REQUIRED on any external pk
-const sig = bls.sign(sk, "message");          // constant-time in sk
+const sig = bls.sign(&sk, "message");         // constant-time in sk
 const valid = bls.verify(pk, "message", sig); // fail-closed subgroup/KeyValidate checks
 const agg = try bls.aggregate(&.{ sig, sig2 });
 const ok3 = try bls.aggregateVerify(&.{ pk, pk2 }, &.{ "message", "msg2" }, agg);
-const proof = bls.popProve(sk);               // proof of possession (registration time)
+const proof = bls.popProve(&sk);              // proof of possession (registration time)
 const ok4 = bls.popVerify(pk, proof);
 
 // KZG polynomial commitments (Part 5 — EIP-4844/deneb):

@@ -657,7 +657,7 @@ see "Part 6 design" below.
   no-trusted-dealer deployment is ever needed.
 - **The keystone test property**: `combineSignatures` of any `>= t`
   distinctly-indexed partials from a `splitSecretKey` dealing MUST equal
-  `bls_sig.sign(sk, msg)` byte-for-byte, and MUST verify under
+  `bls_sig.sign(&sk, msg)` byte-for-byte, and MUST verify under
   `groupPublicKey(vvec)` via the ORDINARY `bls_sig.verify` — i.e. a
   threshold-BLS signature is not a new, parallel signature format that
   needs its own verifier; it inherits Part 4's entire verification
@@ -1164,13 +1164,13 @@ coefficient formula `lambda_i = Π_{j != i} x_j * (x_j - x_i)^-1` via
 comment; see "Part 6 design" above for the const-time breakdown. The
 verification chain that pins Part 6 transitively to REAL vectors: the
 keystone tests assert `splitSecretKey` -> `partialSign` (`t` distinct
-shares) -> `combineSignatures` equals `bls_sig.sign(sk, msg)`
+shares) -> `combineSignatures` equals `bls_sig.sign(&sk, msg)`
 BYTE-FOR-BYTE and verifies via `bls_sig.verify(groupPublicKey(vvec),
 ...)` — and Part 4's `sign`/`verify` are themselves pinned to
 `ethereum/bls12-381-tests` v0.1.2. Also covered: subset-independence
 (two different 3-of-5 subsets combine to the identical signature),
 Feldman VSS-consistency (`derivePublicKeyShare(vvec, i)` ==
-`bls_sig.skToPk(share_i)` for every dealt share), partial-signature
+`bls_sig.skToPk(&share_i)` for every dealt share), partial-signature
 verification over a real dealing (accepts every honest partial against
 its VSS-derived key share; rejects wrong-share and wrong-index
 partials), the `(t=2,n=3)` and `(t=n=4)` end-to-end cases, an
@@ -1184,6 +1184,12 @@ panics, Debug AND ReleaseFast.
 
 ### Backlog (deferred)
 
+0. **Dead stack of the curve layer's own callers (2026-10-09).** The secret entry points of this
+   module burn (`burn.zig`, probe `stackprobe_test.zig`), but `Fr.random` returns a secret by
+   value and `scalarMul`/`msm` take scalars by value: a consumer that draws a nonce or blinding
+   factor and multiplies with it outside these entry points (bbs, coconut, ibe, tlock) leaves it
+   in its own frames. Fixed per consumer in its sweep; an `Fr.randomInto(out, io)` twin is the
+   likely first need.
 1. **The Miller-loop sparse-multiplication optimization** — a freshly
    computed line value is structurally sparse (3 nonzero `Fp2`
    coefficients out of 6 — the "014" shape `lineValue` documents); the

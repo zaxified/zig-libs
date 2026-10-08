@@ -49,7 +49,8 @@ const image = "\x7fELF...(pretend this is 4 MiB of firmware)";
 
 pub fn main() !void {
     // ── the vendor's release pipeline ────────────────────────────────────
-    const kp = Scheme.keyGen(key_seed);
+    var kp: Scheme.KeyPair = undefined;
+    Scheme.keyGen(&kp, &key_seed);
 
     // The public key ships in the device's read-only partition, so it has to
     // survive a byte round-trip through storage — which means both directions
@@ -65,7 +66,7 @@ pub fn main() !void {
     // constant — a device with no allocator can size its download slot at
     // compile time, which is the whole reason `signature_length` is exported.
     var sig: [Scheme.signature_length]u8 = undefined;
-    Scheme.sign(&sig, image, kp.sk, firmware_context, hedge) catch |err| switch (err) {
+    Scheme.sign(&sig, image, &kp.sk, firmware_context, hedge) catch |err| switch (err) {
         // The one thing that can go wrong on the signing side, and it is a
         // programming error in the caller's context string, not a crypto
         // failure — worth naming so a build pipeline reports it usefully.

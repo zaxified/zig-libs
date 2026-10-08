@@ -29,7 +29,10 @@ const levels = [_]lms.Level{
 };
 
 // SEED (secret, 32 bytes) and I (16 bytes) from a CSPRNG: there is no RNG here.
-var sk = try lms.SecretKey.init(gpa, &levels, seed, id, null);
+// The seed goes in by pointer and the key is built in place (`out` parameter),
+// so no copy of the SEED is made on the stack.
+var sk: lms.SecretKey = undefined;
+try lms.SecretKey.init(&sk, gpa, &levels, &seed, id, null);
 defer sk.deinit(); // wipes the seeds
 
 const pk = sk.publicKey().toBytes(); // 60 bytes: ship this

@@ -10,7 +10,7 @@
 //! against the dealer's claimed sharing polynomial, and a Lagrange-
 //! interpolation-in-the-exponent combiner that turns any `t` (or more)
 //! partial signatures into a signature **indistinguishable from**
-//! (byte-for-byte equal to) `bls_sig.sign(sk, msg)`.
+//! (byte-for-byte equal to) `bls_sig.sign(&sk, msg)`.
 //!
 //! This is what makes threshold BLS uniquely simple among threshold
 //! signature schemes: unlike threshold Schnorr (the sibling `frost`
@@ -54,7 +54,7 @@
 //! loops (RFC 9591 Appendix C) with the field/group types swapped. The
 //! keystone self-consistency chain — `splitSecretKey` → `partialSign`
 //! (`t` distinct shares) → `combineSignatures` byte-for-byte equal to
-//! `bls_sig.sign(sk, msg)` — transitively pins this file to Part 4's
+//! `bls_sig.sign(&sk, msg)` — transitively pins this file to Part 4's
 //! ethereum/bls12-381-tests vectors (see the tests at the bottom).
 //! `partialSign`, `verifyPartialSignature`, and `groupPublicKey` are
 //! thin, judgment-free wrappers over Part 4's `bls_sig.sign`/
@@ -87,6 +87,7 @@ const g1 = @import("g1.zig");
 const g2 = @import("g2.zig");
 const scalarmod = @import("scalar.zig");
 const bls_sig = @import("bls_sig.zig");
+const burn = @import("burn.zig");
 
 pub const Fr = scalarmod.Fr;
 
@@ -136,21 +137,32 @@ pub const SecretKeyShare = struct {
     pub const encoded_bytes = 4 + Fr.encoded_bytes; // 36
 
     /// REAL: `index` big-endian (4 bytes) `||` `Fr.toBytes()` (32
-    /// bytes) — mechanical concatenation over already-real codecs.
-    pub fn toBytes(self: SecretKeyShare) [encoded_bytes]u8 {
-        var out: [encoded_bytes]u8 = undefined;
+    /// bytes) — mechanical concatenation over already-real codecs. Into
+    /// `out`: the encoding is a secret, never returned through the stack.
+    pub fn toBytes(self: *const SecretKeyShare, out: *[encoded_bytes]u8) void {
+        burn.run(burn.codec_burn, void, toBytesBody, .{ self, out });
+    }
+
+    fn toBytesBody(self: *const SecretKeyShare, out: *[encoded_bytes]u8) void {
         std.mem.writeInt(u32, out[0..4], self.index, .big);
         out[4..encoded_bytes].* = self.scalar.toBytes();
-        return out;
     }
 
     /// REAL. Rejects `index == 0` (see `ThresholdError.ZeroIndex`) and
     /// a non-canonical scalar (`Fr.fromBytes`'s own `>= r` rejection).
-    pub fn fromBytes(bytes: [encoded_bytes]u8) ThresholdError!SecretKeyShare {
+    /// The share is written to `out`; on error its scalar is zeroed.
+    pub fn fromBytes(out: *SecretKeyShare, bytes: *const [encoded_bytes]u8) ThresholdError!void {
+        burn.run(burn.codec_burn, ThresholdError!void, fromBytesBody, .{ out, bytes }) catch |e| {
+            out.deinit();
+            return e;
+        };
+    }
+
+    fn fromBytesBody(out: *SecretKeyShare, bytes: *const [encoded_bytes]u8) ThresholdError!void {
         const index = std.mem.readInt(u32, bytes[0..4], .big);
         if (index == 0) return error.ZeroIndex;
-        const scalar = try Fr.fromBytes(bytes[4..encoded_bytes].*);
-        return .{ .index = index, .scalar = scalar };
+        out.scalar = try Fr.fromBytes(bytes[4..encoded_bytes].*);
+        out.index = index;
     }
 
     /// Zeroize the secret `scalar` field in place; `index` is a public
@@ -327,7 +339,17 @@ pub const SplitResult = struct {
 /// comments for the exact construction and const-time notes.
 pub fn splitSecretKey(
     allocator: std.mem.Allocator,
-    sk: bls_sig.SecretKey,
+    sk: *const bls_sig.SecretKey,
+    t: u32,
+    n: u32,
+    coefficients: []const Fr,
+) ThresholdError!SplitResult {
+    return burn.run(burn.sign_burn, ThresholdError!SplitResult, splitSecretKeyBody, .{ allocator, sk, t, n, coefficients });
+}
+
+fn splitSecretKeyBody(
+    allocator: std.mem.Allocator,
+    sk: *const bls_sig.SecretKey,
     t: u32,
     n: u32,
     coefficients: []const Fr,
@@ -336,7 +358,11 @@ pub fn splitSecretKey(
     if (coefficients.len != @as(usize, t) - 1) return error.InvalidParameters;
 
     const shares = try allocator.alloc(SecretKeyShare, n);
-    errdefer allocator.free(shares);
+    errdefer {
+        // The shares are secrets: wipe them before the heap hands them on.
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(shares));
+        allocator.free(shares);
+    }
     var i: u32 = 1;
     while (i <= n) : (i += 1) {
         shares[i - 1] = .{ .index = i, .scalar = evalPolynomialAt(sk.scalar, coefficients, i) };
@@ -469,9 +495,13 @@ pub fn derivePublicKeyShare(vvec: VerificationVector, index: u32) PublicKeyShare
 /// thin, judgment-free wrapper over Part 4's already-real, already-
 /// constant-time `bls_sig.sign` — no new crypto judgment is introduced
 /// here.
-pub fn partialSign(share: SecretKeyShare, msg: []const u8) PartialSignature {
+pub fn partialSign(share: *const SecretKeyShare, msg: []const u8) PartialSignature {
+    return burn.run(burn.sign_burn, PartialSignature, partialSignBody, .{ share, msg });
+}
+
+fn partialSignBody(share: *const SecretKeyShare, msg: []const u8) PartialSignature {
     const partial_sk: bls_sig.SecretKey = .{ .scalar = share.scalar };
-    const sig = bls_sig.sign(partial_sk, msg);
+    const sig = bls_sig.sign(&partial_sk, msg);
     return .{ .index = share.index, .point = sig.point };
 }
 
@@ -502,7 +532,7 @@ pub fn verifyPartialSignature(pk_share: PublicKeyShare, msg: []const u8, partial
 
 /// Combines `t` (or more) valid, distinctly-indexed partial signatures
 /// into ONE ordinary BLS `Signature` — byte-for-byte the SAME signature
-/// `bls_sig.sign(sk, msg)` would have produced directly, because
+/// `bls_sig.sign(&sk, msg)` would have produced directly, because
 /// Lagrange interpolation in the exponent reconstructs `[sk]Q` from the
 /// partials' `[share_i]Q` pieces exactly as `frost.secretShareCombine`
 /// (or this file's own `evalPolynomialAt`'s scalar-field inverse
@@ -587,9 +617,11 @@ pub fn combineSignatures(partials: []const PartialSignature, t: u32) ThresholdEr
 
 test "SecretKeyShare/PublicKeyShare/PartialSignature byte codecs round-trip" {
     const sk_share: SecretKeyShare = .{ .index = 3, .scalar = try Fr.fromBytes([_]u8{0} ** 31 ++ [_]u8{7}) };
-    const sk_bytes = sk_share.toBytes();
+    var sk_bytes: [SecretKeyShare.encoded_bytes]u8 = undefined;
+    sk_share.toBytes(&sk_bytes);
     try std.testing.expectEqual(@as(usize, 36), sk_bytes.len);
-    const sk_back = try SecretKeyShare.fromBytes(sk_bytes);
+    var sk_back: SecretKeyShare = undefined;
+    try SecretKeyShare.fromBytes(&sk_back, &sk_bytes);
     try std.testing.expectEqual(sk_share.index, sk_back.index);
     try std.testing.expect(sk_share.scalar.eql(sk_back.scalar));
 
@@ -625,7 +657,8 @@ test "SecretKeyShare.deinit zeroizes scalar but leaves index untouched (regressi
 test "SecretKeyShare/PublicKeyShare/PartialSignature fromBytes rejects a zero index" {
     var sk_bytes = [_]u8{0} ** SecretKeyShare.encoded_bytes;
     sk_bytes[SecretKeyShare.encoded_bytes - 1] = 1; // scalar = 1, index = 0
-    try std.testing.expectError(error.ZeroIndex, SecretKeyShare.fromBytes(sk_bytes));
+    var bad_share: SecretKeyShare = undefined;
+    try std.testing.expectError(error.ZeroIndex, SecretKeyShare.fromBytes(&bad_share, &sk_bytes));
 
     var pk_bytes = [_]u8{0} ** PublicKeyShare.encoded_bytes;
     pk_bytes[4..PublicKeyShare.encoded_bytes].* = g1.toBytesCompressed(g1.Affine.generator);
@@ -684,13 +717,14 @@ test "groupPublicKey extracts commitments[0]" {
 
 test "splitSecretKey rejects invalid (t, n, coefficients) combinations before any crypto work" {
     const allocator = std.testing.allocator;
-    const sk = try bls_sig.keyGen(&([_]u8{0x9a} ** 32), "");
-    try std.testing.expectError(error.InvalidParameters, splitSecretKey(allocator, sk, 0, 5, &.{}));
-    try std.testing.expectError(error.InvalidParameters, splitSecretKey(allocator, sk, 3, 0, &.{}));
-    try std.testing.expectError(error.InvalidParameters, splitSecretKey(allocator, sk, 4, 3, &.{ Fr.one, Fr.one, Fr.one }));
+    var sk: bls_sig.SecretKey = undefined;
+    try bls_sig.keyGen(&sk, &([_]u8{0x9a} ** 32), "");
+    try std.testing.expectError(error.InvalidParameters, splitSecretKey(allocator, &sk, 0, 5, &.{}));
+    try std.testing.expectError(error.InvalidParameters, splitSecretKey(allocator, &sk, 3, 0, &.{}));
+    try std.testing.expectError(error.InvalidParameters, splitSecretKey(allocator, &sk, 4, 3, &.{ Fr.one, Fr.one, Fr.one }));
     // t=3 needs exactly 2 coefficients; supplying 1 must be rejected
     // before any polynomial evaluation is attempted.
-    try std.testing.expectError(error.InvalidParameters, splitSecretKey(allocator, sk, 3, 5, &.{Fr.one}));
+    try std.testing.expectError(error.InvalidParameters, splitSecretKey(allocator, &sk, 3, 5, &.{Fr.one}));
 }
 
 test "combineSignatures rejects too few, duplicate-indexed, or zero-indexed partials before any crypto work" {
@@ -723,25 +757,27 @@ test "partialSign/verifyPartialSignature round-trip in isolation (a share IS jus
     // of which are REAL today) — any nonzero Fr scalar behaves exactly
     // like an ordinary bls_sig.SecretKey for these two functions' own
     // contracts, since partialSign IS bls_sig.sign under the hood.
-    const sk = try bls_sig.keyGen(&([_]u8{0x5c} ** 32), "");
+    var sk: bls_sig.SecretKey = undefined;
+    try bls_sig.keyGen(&sk, &([_]u8{0x5c} ** 32), "");
     const share: SecretKeyShare = .{ .index = 7, .scalar = sk.scalar };
-    const pk_share: PublicKeyShare = .{ .index = 7, .point = bls_sig.skToPk(sk).point };
+    const pk_share: PublicKeyShare = .{ .index = 7, .point = bls_sig.skToPk(&sk).point };
 
     const msg = "threshold BLS partial signing, no dealer involved";
-    const partial = partialSign(share, msg);
+    const partial = partialSign(&share, msg);
     try std.testing.expectEqual(@as(u32, 7), partial.index);
     try std.testing.expect(verifyPartialSignature(pk_share, msg, partial));
 
     // The plain bls_sig equation agrees: a partial signed with a
     // share's raw scalar IS an ordinary bls_sig.sign output under the
     // corresponding bls_sig public key.
-    const ordinary_sig = bls_sig.sign(sk, msg);
+    const ordinary_sig = bls_sig.sign(&sk, msg);
     try std.testing.expectEqualSlices(u8, &ordinary_sig.toBytes(), &(bls_sig.Signature{ .point = partial.point }).toBytes());
 
     // Wrong message, wrong key, and an index mismatch must all reject.
     try std.testing.expect(!verifyPartialSignature(pk_share, "wrong message", partial));
-    const other_sk = try bls_sig.keyGen(&([_]u8{0x5d} ** 32), "");
-    const other_pk_share: PublicKeyShare = .{ .index = 7, .point = bls_sig.skToPk(other_sk).point };
+    var other_sk: bls_sig.SecretKey = undefined;
+    try bls_sig.keyGen(&other_sk, &([_]u8{0x5d} ** 32), "");
+    const other_pk_share: PublicKeyShare = .{ .index = 7, .point = bls_sig.skToPk(&other_sk).point };
     try std.testing.expect(!verifyPartialSignature(other_pk_share, msg, partial));
     const mismatched_partial: PartialSignature = .{ .index = 8, .point = partial.point };
     try std.testing.expect(!verifyPartialSignature(pk_share, msg, mismatched_partial));
@@ -755,7 +791,8 @@ test "partialSign/verifyPartialSignature round-trip in isolation (a share IS jus
 /// the split result. Shared by every keystone test below so they all
 /// dial the same knobs consistently.
 fn testSplit(allocator: std.mem.Allocator, ikm_byte: u8, t: u32, n: u32) !struct { sk: bls_sig.SecretKey, split: SplitResult } {
-    const sk = try bls_sig.keyGen(&([_]u8{ikm_byte} ** 32), "");
+    var sk: bls_sig.SecretKey = undefined;
+    try bls_sig.keyGen(&sk, &([_]u8{ikm_byte} ** 32), "");
     var coeffs: [8]Fr = undefined;
     var j: usize = 0;
     while (j < t - 1) : (j += 1) {
@@ -764,7 +801,7 @@ fn testSplit(allocator: std.mem.Allocator, ikm_byte: u8, t: u32, n: u32) !struct
         seed[30] = ikm_byte;
         coeffs[j] = Fr.reduceWide(&seed);
     }
-    const split = try splitSecretKey(allocator, sk, t, n, coeffs[0 .. t - 1]);
+    const split = try splitSecretKey(allocator, &sk, t, n, coeffs[0 .. t - 1]);
     return .{ .sk = sk, .split = split };
 }
 
@@ -778,9 +815,9 @@ test "keystone round trip: splitSecretKey -> partialSign (t of n) -> combineSign
 
     const msg = "threshold BLS keystone round trip";
     const partials = [_]PartialSignature{
-        partialSign(built.split.shares[0], msg),
-        partialSign(built.split.shares[2], msg),
-        partialSign(built.split.shares[4], msg),
+        partialSign(&built.split.shares[0], msg),
+        partialSign(&built.split.shares[2], msg),
+        partialSign(&built.split.shares[4], msg),
     };
     const combined = try combineSignatures(&partials, t);
 
@@ -789,7 +826,7 @@ test "keystone round trip: splitSecretKey -> partialSign (t of n) -> combineSign
     // byte-for-byte the SAME as an ordinary bls_sig.sign, and must
     // verify under the group public key via the ordinary bls_sig.verify
     // equation.
-    const expected = bls_sig.sign(built.sk, msg);
+    const expected = bls_sig.sign(&built.sk, msg);
     try std.testing.expectEqualSlices(u8, &expected.toBytes(), &combined.toBytes());
     try std.testing.expect(bls_sig.verify(groupPublicKey(built.split.vvec), msg, combined));
 }
@@ -806,21 +843,21 @@ test "any t-of-n subset combines to the SAME signature (two different 3-of-5 sub
     const shares = built.split.shares;
 
     const subset_a = [_]PartialSignature{
-        partialSign(shares[0], msg),
-        partialSign(shares[1], msg),
-        partialSign(shares[2], msg),
+        partialSign(&shares[0], msg),
+        partialSign(&shares[1], msg),
+        partialSign(&shares[2], msg),
     };
     const subset_b = [_]PartialSignature{
-        partialSign(shares[1], msg),
-        partialSign(shares[3], msg),
-        partialSign(shares[4], msg),
+        partialSign(&shares[1], msg),
+        partialSign(&shares[3], msg),
+        partialSign(&shares[4], msg),
     };
 
     const combined_a = try combineSignatures(&subset_a, t);
     const combined_b = try combineSignatures(&subset_b, t);
     try std.testing.expectEqualSlices(u8, &combined_a.toBytes(), &combined_b.toBytes());
 
-    const expected = bls_sig.sign(built.sk, msg);
+    const expected = bls_sig.sign(&built.sk, msg);
     try std.testing.expectEqualSlices(u8, &expected.toBytes(), &combined_a.toBytes());
 }
 
@@ -834,7 +871,7 @@ test "Feldman VSS consistency: derivePublicKeyShare(vvec, i) equals [share_i]G1 
 
     for (built.split.shares) |share| {
         const derived = derivePublicKeyShare(built.split.vvec, share.index);
-        const expected = bls_sig.skToPk(.{ .scalar = share.scalar });
+        const expected = bls_sig.skToPk(&.{ .scalar = share.scalar });
         try std.testing.expectEqual(share.index, derived.index);
         try std.testing.expect(derived.point.x.eql(expected.point.x));
     }
@@ -850,11 +887,11 @@ test "(t=2, n=3) end-to-end keystone chain" {
 
     const msg = "t=2,n=3 case";
     const partials = [_]PartialSignature{
-        partialSign(built.split.shares[0], msg),
-        partialSign(built.split.shares[1], msg),
+        partialSign(&built.split.shares[0], msg),
+        partialSign(&built.split.shares[1], msg),
     };
     const combined = try combineSignatures(&partials, t);
-    const expected = bls_sig.sign(built.sk, msg);
+    const expected = bls_sig.sign(&built.sk, msg);
     try std.testing.expectEqualSlices(u8, &expected.toBytes(), &combined.toBytes());
     try std.testing.expect(bls_sig.verify(groupPublicKey(built.split.vvec), msg, combined));
 }
@@ -876,11 +913,11 @@ test "fewer than t partials do NOT reconstruct the group signature (t is really 
 
     const msg = "below-threshold subsets must fail";
     const partials = [_]PartialSignature{
-        partialSign(built.split.shares[0], msg),
-        partialSign(built.split.shares[1], msg),
+        partialSign(&built.split.shares[0], msg),
+        partialSign(&built.split.shares[1], msg),
     };
     const under = try combineSignatures(&partials, 2);
-    const expected = bls_sig.sign(built.sk, msg);
+    const expected = bls_sig.sign(&built.sk, msg);
     try std.testing.expect(!std.mem.eql(u8, &expected.toBytes(), &under.toBytes()));
     try std.testing.expect(!bls_sig.verify(groupPublicKey(built.split.vvec), msg, under));
 }
@@ -894,13 +931,13 @@ test "more than t distinct partials combine to the same signature (over-determin
 
     const msg = "over-determined but consistent";
     const partials = [_]PartialSignature{
-        partialSign(built.split.shares[0], msg),
-        partialSign(built.split.shares[1], msg),
-        partialSign(built.split.shares[2], msg),
-        partialSign(built.split.shares[3], msg),
+        partialSign(&built.split.shares[0], msg),
+        partialSign(&built.split.shares[1], msg),
+        partialSign(&built.split.shares[2], msg),
+        partialSign(&built.split.shares[3], msg),
     };
     const combined = try combineSignatures(&partials, t);
-    const expected = bls_sig.sign(built.sk, msg);
+    const expected = bls_sig.sign(&built.sk, msg);
     try std.testing.expectEqualSlices(u8, &expected.toBytes(), &combined.toBytes());
 }
 
@@ -917,20 +954,20 @@ test "verifyPartialSignature over a real dealing: accepts each valid partial, re
     // public key share for its own index.
     for (shares) |share| {
         const pk_share = derivePublicKeyShare(built.split.vvec, share.index);
-        try std.testing.expect(verifyPartialSignature(pk_share, msg, partialSign(share, msg)));
+        try std.testing.expect(verifyPartialSignature(pk_share, msg, partialSign(&share, msg)));
     }
 
     // A partial made with share 2's scalar but claiming index 1 must be
     // rejected against index 1's derived public key share (wrong share
     // under the claimed identity — the misbehaving-signer case).
     const pk_share_1 = derivePublicKeyShare(built.split.vvec, 1);
-    const forged: PartialSignature = .{ .index = 1, .point = partialSign(shares[1], msg).point };
+    const forged: PartialSignature = .{ .index = 1, .point = partialSign(&shares[1], msg).point };
     try std.testing.expect(shares[1].index == 2); // shares[1] IS index 2
     try std.testing.expect(!verifyPartialSignature(pk_share_1, msg, forged));
 
     // An index mismatch between the pk share and the partial is caught
     // before any pairing work.
-    const honest_1 = partialSign(shares[0], msg);
+    const honest_1 = partialSign(&shares[0], msg);
     const relabeled: PartialSignature = .{ .index = 3, .point = honest_1.point };
     try std.testing.expect(!verifyPartialSignature(pk_share_1, msg, relabeled));
 }
@@ -945,13 +982,13 @@ test "(t=n=4) end-to-end keystone chain (every share required)" {
 
     const msg = "t=n=4 case: no slack, every share needed";
     const partials = [_]PartialSignature{
-        partialSign(built.split.shares[0], msg),
-        partialSign(built.split.shares[1], msg),
-        partialSign(built.split.shares[2], msg),
-        partialSign(built.split.shares[3], msg),
+        partialSign(&built.split.shares[0], msg),
+        partialSign(&built.split.shares[1], msg),
+        partialSign(&built.split.shares[2], msg),
+        partialSign(&built.split.shares[3], msg),
     };
     const combined = try combineSignatures(&partials, t);
-    const expected = bls_sig.sign(built.sk, msg);
+    const expected = bls_sig.sign(&built.sk, msg);
     try std.testing.expectEqualSlices(u8, &expected.toBytes(), &combined.toBytes());
     try std.testing.expect(bls_sig.verify(groupPublicKey(built.split.vvec), msg, combined));
 }

@@ -114,13 +114,13 @@ fn parseTaint(s: []const u8) !Taint {
 /// Computed at runtime (not folded at comptime) so tainting SK.seed/SK.prf
 /// afterwards actually marks memory `sign()` reads. A fixed seed just keeps
 /// repeated runs of the table comparable.
-fn fixedKeyPair() S.KeyPair {
+fn fixedKeyPair(out: *S.KeyPair) void {
     const msg = "ctgrind-slhdsa-harness-keygen-seed-v1";
     var wide: [64]u8 = undefined;
     std.crypto.hash.sha2.Sha512.hash(msg, &wide, .{});
     var seed: [3 * S.n]u8 = undefined;
     for (&seed, 0..) |*b, i| b.* = wide[i % wide.len];
-    return S.keyGen(seed);
+    S.keyGen(out, &seed);
 }
 
 /// Forces one real load from `s` through a volatile pointer, one byte at a
@@ -145,7 +145,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("valgrind_support={}\n", .{builtin.valgrind_support});
 
-    var kp = fixedKeyPair();
+    var kp: S.KeyPair = undefined;
+    fixedKeyPair(&kp);
 
     switch (target) {
         .seed => if (taint == .yes) std.valgrind.memcheck.makeMemUndefined(&kp.sk.seed),
@@ -161,7 +162,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // The call under test: FIPS 205 Algorithm 22, deterministic
     // (addrnd = null => opt_rand = PK.seed).
     var sig: [S.signature_length]u8 = undefined;
-    try S.sign(&sig, "ctgrind slhdsa harness message", kp.sk, "", null);
+    try S.sign(&sig, "ctgrind slhdsa harness message", &kp.sk, "", null);
 
     // Propagation proof: format one (tainted, if taint=yes) signature byte
     // through a non-constant-time path. See the module doc comment above.
