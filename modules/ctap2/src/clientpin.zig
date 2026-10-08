@@ -211,11 +211,11 @@ pub const SharedSecret = struct {
     /// `random`. `dst.len` must be `encryptedLen(plaintext.len)`.
     pub fn encrypt(self: *const SharedSecret, random: std.Random, dst: []u8, plaintext: []const u8) ctap2pin.CbcError!void {
         switch (self.protocol) {
-            .one => try ctap2pin.One.encrypt(self.bytes[0..32].*, dst, plaintext),
+            .one => try ctap2pin.One.encrypt(self.bytes[0..32], dst, plaintext),
             .two => {
                 var iv: [ctap2pin.Two.iv_length]u8 = undefined;
                 random.bytes(&iv);
-                try ctap2pin.Two.encrypt(self.bytes, iv, dst, plaintext);
+                try ctap2pin.Two.encrypt(&self.bytes, iv, dst, plaintext);
             },
         }
     }
@@ -227,13 +227,13 @@ pub const SharedSecret = struct {
         switch (self.protocol) {
             .one => {
                 if (ciphertext.len != 16 and ciphertext.len != 32) return error.BadTokenLength;
-                try ctap2pin.One.decrypt(self.bytes[0..32].*, tok.bytes[0..ciphertext.len], ciphertext);
+                try ctap2pin.One.decrypt(self.bytes[0..32], tok.bytes[0..ciphertext.len], ciphertext);
                 tok.len = @intCast(ciphertext.len);
             },
             .two => {
                 const n = ctap2pin.Two.decryptedLength(ciphertext.len) catch return error.BadTokenLength;
                 if (n != 32) return error.BadTokenLength;
-                try ctap2pin.Two.decrypt(self.bytes, tok.bytes[0..32], ciphertext);
+                try ctap2pin.Two.decrypt(&self.bytes, tok.bytes[0..32], ciphertext);
                 tok.len = 32;
             },
         }
@@ -412,7 +412,9 @@ pub const Client = struct {
             errdefer s.deinit();
             switch (self.protocol) {
                 inline else => |p| {
-                    var enc = ctap2pin.Impl(p).encapsulate(scalar, peer) catch |e| switch (e) {
+                    var enc: ctap2pin.Impl(p).Encaps = undefined;
+                    defer std.crypto.secureZero(u8, std.mem.asBytes(&enc));
+                    ctap2pin.Impl(p).encapsulate(&enc, &scalar, peer) catch |e| switch (e) {
                         error.InvalidScalar => {
                             attempts += 1;
                             if (attempts >= 8) return error.EntropyFailure;
@@ -420,7 +422,6 @@ pub const Client = struct {
                         },
                         else => return e,
                     };
-                    defer std.crypto.secureZero(u8, &enc.shared_secret);
                     @memcpy(s.bytes[0..enc.shared_secret.len], &enc.shared_secret);
                     s.platform_key = enc.platform_key_agreement;
                 },

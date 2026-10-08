@@ -2129,9 +2129,15 @@ fn findX509(el: *const xml.Element) ?*xml.Element {
 // gaps this closes. Verifying the IdP's OWN signatures is entirely unaffected
 // and still accepts RSA-SHA256/384/512 and ECDSA-P256 via `xmldsig.verify`,
 // exactly as before this file.
+///
+/// The key is held by pointer: an `rsa.SecretKey` is 11.8 KiB of `p`, `q`,
+/// `d` and the CRT values, and as a by-value field every options struct that
+/// carries a `SigningKey` copied all of it into the caller's frame and every
+/// frame it was passed through, where nothing wiped it (dead-stack sweep,
+/// 2026-10-08). The key must outlive the call it is passed to.
 pub const SigningKey = union(enum) {
     /// The SP's own RSA private key, used to sign an outgoing protocol message.
-    rsa: rsa.SecretKey,
+    rsa: *const rsa.SecretKey,
 };
 
 /// Every typed failure `signProtocolMessage` (and everything built on it) can
@@ -2244,7 +2250,7 @@ fn signProtocolMessage(
     defer alloc.free(si_canon);
 
     var sig_buf: [rsa.max_modulus_len]u8 = undefined;
-    const sig = rsa.signPkcs1v15(&sk, Sha256, si_canon, &sig_buf) catch |e| switch (e) {
+    const sig = rsa.signPkcs1v15(sk, Sha256, si_canon, &sig_buf) catch |e| switch (e) {
         error.EncodedMessageTooShort, error.BufferTooSmall, error.FaultDetected => return error.SigningFailed,
     };
     const sig_b64 = try base64EncodeAlloc(alloc, sig);
@@ -2722,7 +2728,7 @@ pub fn buildSignedRedirectQuery(alloc: std.mem.Allocator, opts: BuildSignedRedir
     try appendRedirectSigningInput(alloc, &q, opts.kind, opts.message_field, opts.relay_state, sig_alg_rsa_sha256);
 
     var sig_buf: [rsa.max_modulus_len]u8 = undefined;
-    const sig = rsa.signPkcs1v15(&sk, Sha256, q.items, &sig_buf) catch |e| switch (e) {
+    const sig = rsa.signPkcs1v15(sk, Sha256, q.items, &sig_buf) catch |e| switch (e) {
         error.EncodedMessageTooShort, error.BufferTooSmall, error.FaultDetected => return error.SigningFailed,
     };
     const sig_b64 = try base64EncodeAlloc(alloc, sig);
@@ -3779,6 +3785,7 @@ test {
     _ = @import("test_response_sig.zig");
     _ = @import("test_multikey.zig");
     _ = @import("test_metadata.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 const testing = std.testing;

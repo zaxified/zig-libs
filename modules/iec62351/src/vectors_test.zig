@@ -26,7 +26,7 @@ const goose = @import("goose.zig");
 const rsa = @import("rsa");
 const keys = @import("test_keys.zig");
 
-const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const EcdsaP256 = @import("p256").EcdsaP256Sha256;
 
 // ── standard-derived: RFC 4231 HMAC-SHA-256 ─────────────────────────────────
 
@@ -402,7 +402,9 @@ const kat_ecdsa_signature = [_]u8{
 };
 
 test "self: the frozen ECDSA P-256 signature reproduces and verifies" {
-    const kp = try EcdsaP256.KeyPair.generateDeterministic(kat_ecdsa_seed);
+    var kp: EcdsaP256.KeyPair = undefined;
+    try EcdsaP256.KeyPair.generateDeterministicInto(&kp, &kat_ecdsa_seed);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
     const parsed = try goose.parse(&kat_frame_hmac128, .ed2020);
     const sig = try kp.sign(parsed.macDomain(), kat_ecdsa_noise);
     try testing.expectEqualSlices(u8, &kat_ecdsa_signature, &sig.toBytes());

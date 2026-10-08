@@ -94,7 +94,9 @@ fn expand(comptime n: usize, label: []const u8) [n]u8 {
 /// reduction helper needed.
 fn w0w1FromLabel(label: []const u8) spake.W0W1 {
     const pbkdf_output = expand(80, label);
-    return spake.computeW0W1(&pbkdf_output) catch unreachable; // length is always 80
+    var out: spake.W0W1 = undefined;
+    spake.computeW0W1(&out, &pbkdf_output) catch unreachable; // length is always 80
+    return out;
 }
 
 const SessionResult = struct { k_shared_prover: [32]u8, k_shared_verifier: [32]u8 };
@@ -117,44 +119,56 @@ fn runSession(
     y: [32]u8,
 ) !SessionResult {
     // Round 1: shares. Neither side needs anything from the other yet.
-    const share_p = try spake.proverStart(x, w0); // Prover -> Verifier
-    const share_v = try spake.verifierStart(y, w0); // Verifier -> Prover
+    const share_p = try spake.proverStart(&x, &w0); // Prover -> Verifier
+    const share_v = try spake.verifierStart(&y, &w0); // Verifier -> Prover
 
     // Round 2a: the Verifier goes first — it transmits confirmV with NO
     // Prover confirmation in existence yet (RFC 9383 Appendix A.5).
-    const verifier_confirm = try spake.verifierConfirm(gpa, context, id_prover, id_verifier, w0, l, y, share_p, share_v);
+    const verifier_confirm = try spake.verifierConfirm(gpa, context, id_prover, id_verifier, &w0, l, &y, share_p, share_v);
 
     // Round 2b: the Prover validates confirmV (received above) and only
     // then computes+transmits its own confirmP, receiving K_shared.
-    const prover_result = try spake.proverFinish(
+    var prover_result: spake.ProverFinishResult = undefined;
+    try spake.proverFinish(
+        &prover_result,
         gpa,
         context,
         id_prover,
         id_verifier,
-        w0,
-        w1,
-        x,
+        &w0,
+        &w1,
+        &x,
         share_p,
         share_v,
         verifier_confirm.confirm_v, // Verifier -> Prover
     );
-    defer gpa.free(prover_result.tt);
+    defer {
+        std.crypto.secureZero(u8, prover_result.tt);
+        gpa.free(prover_result.tt);
+        std.crypto.secureZero(u8, std.mem.asBytes(&prover_result));
+    }
 
     // Round 2c: the Verifier validates confirmP (received above) and only
     // then obtains the matching K_shared.
-    const verifier_result = try spake.verifierFinish(
+    var verifier_result: spake.VerifierFinishResult = undefined;
+    try spake.verifierFinish(
+        &verifier_result,
         gpa,
         context,
         id_prover,
         id_verifier,
-        w0,
+        &w0,
         l,
-        y,
+        &y,
         share_p,
         share_v,
         prover_result.confirm_p, // Prover -> Verifier
     );
-    defer gpa.free(verifier_result.tt);
+    defer {
+        std.crypto.secureZero(u8, verifier_result.tt);
+        gpa.free(verifier_result.tt);
+        std.crypto.secureZero(u8, std.mem.asBytes(&verifier_result));
+    }
 
     must(std.mem.eql(u8, &prover_result.k_shared, &verifier_result.k_shared), @src());
 
@@ -170,7 +184,7 @@ pub fn main() !void {
     const registration = w0w1FromLabel("spake2plus example: registration pbkdf output");
     const w0 = registration.w0;
     const w1 = registration.w1;
-    const l = try spake.computeL(w1); // the Verifier's stored registration record — NEVER w1 itself
+    const l = try spake.computeL(&w1); // the Verifier's stored registration record — NEVER w1 itself
 
     const context = "zig-libs spake2plus example v1 (Matter/Thread-style commissioning)";
     const id_prover = "commissioner-app";
@@ -202,21 +216,23 @@ pub fn main() !void {
     // is what proves that `errdefer` actually fires.
     const wrong_password = w0w1FromLabel("spake2plus example: WRONG password pbkdf output");
     const scalars3 = w0w1FromLabel("spake2plus example: session 3 (wrong password) ephemeral scalars");
-    const share_p3 = try spake.proverStart(scalars3.w0, wrong_password.w0); // prover's WRONG w0
-    const share_v3 = try spake.verifierStart(scalars3.w1, w0); // verifier's CORRECT w0
-    const verifier_confirm3 = try spake.verifierConfirm(gpa, context, id_prover, id_verifier, w0, l, scalars3.w1, share_p3, share_v3);
+    const share_p3 = try spake.proverStart(&scalars3.w0, &wrong_password.w0); // prover's WRONG w0
+    const share_v3 = try spake.verifierStart(&scalars3.w1, &w0); // verifier's CORRECT w0
+    const verifier_confirm3 = try spake.verifierConfirm(gpa, context, id_prover, id_verifier, &w0, l, &scalars3.w1, share_p3, share_v3);
+    var result3: spake.ProverFinishResult = undefined;
     if (spake.proverFinish(
+        &result3,
         gpa,
         context,
         id_prover,
         id_verifier,
-        wrong_password.w0,
-        wrong_password.w1,
-        scalars3.w0,
+        &wrong_password.w0,
+        &wrong_password.w1,
+        &scalars3.w0,
         share_p3,
         share_v3,
         verifier_confirm3.confirm_v,
-    )) |_| {
+    )) {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.ConfirmationMismatch => std.debug.print("wrong password (mismatched w0): ConfirmationMismatch at prover (expected)\n", .{}),
@@ -225,35 +241,39 @@ pub fn main() !void {
 
     // ── failure path 2: tampered confirmP (named error, verifier-side) ─
     const scalars4 = w0w1FromLabel("spake2plus example: session 4 (tampered confirmP) ephemeral scalars");
-    const share_p4 = try spake.proverStart(scalars4.w0, w0);
-    const share_v4 = try spake.verifierStart(scalars4.w1, w0);
-    const verifier_confirm4 = try spake.verifierConfirm(gpa, context, id_prover, id_verifier, w0, l, scalars4.w1, share_p4, share_v4);
-    var prover_result4 = try spake.proverFinish(
+    const share_p4 = try spake.proverStart(&scalars4.w0, &w0);
+    const share_v4 = try spake.verifierStart(&scalars4.w1, &w0);
+    const verifier_confirm4 = try spake.verifierConfirm(gpa, context, id_prover, id_verifier, &w0, l, &scalars4.w1, share_p4, share_v4);
+    var prover_result4: spake.ProverFinishResult = undefined;
+    try spake.proverFinish(
+        &prover_result4,
         gpa,
         context,
         id_prover,
         id_verifier,
-        w0,
-        w1,
-        scalars4.w0,
+        &w0,
+        &w1,
+        &scalars4.w0,
         share_p4,
         share_v4,
         verifier_confirm4.confirm_v,
     );
     defer gpa.free(prover_result4.tt);
     prover_result4.confirm_p[0] ^= 0x01; // tamper the MAC in transit
+    var result4: spake.VerifierFinishResult = undefined;
     if (spake.verifierFinish(
+        &result4,
         gpa,
         context,
         id_prover,
         id_verifier,
-        w0,
+        &w0,
         l,
-        scalars4.w1,
+        &scalars4.w1,
         share_p4,
         share_v4,
         prover_result4.confirm_p,
-    )) |_| {
+    )) {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.ConfirmationMismatch => std.debug.print("tampered confirmP: ConfirmationMismatch at verifier (expected)\n", .{}),
@@ -265,20 +285,22 @@ pub fn main() !void {
     // decode as a valid P-256 point. Rejected structurally, BEFORE any
     // allocation (`computeTranscript` is never reached) — a different
     // named error from the confirmation-MAC failures above.
-    const share_p5 = try spake.proverStart(scalars4.w0, w0);
+    const share_p5 = try spake.proverStart(&scalars4.w0, &w0);
     const share_v_bad = [_]u8{0xff} ** 65;
+    var result5: spake.ProverFinishResult = undefined;
     if (spake.proverFinish(
+        &result5,
         gpa,
         context,
         id_prover,
         id_verifier,
-        w0,
-        w1,
-        scalars4.w0,
+        &w0,
+        &w1,
+        &scalars4.w0,
         share_p5,
         share_v_bad,
         [_]u8{0} ** 32,
-    )) |_| {
+    )) {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.InvalidShareV => std.debug.print("malformed share_v bytes: InvalidShareV (expected)\n", .{}),

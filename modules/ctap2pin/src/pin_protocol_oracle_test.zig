@@ -32,6 +32,38 @@ const o = @import("pin_protocol_oracle_vectors.zig");
 const One = ctap2pin.One;
 const Two = ctap2pin.Two;
 
+// ── helpers over the pointer / out-param API ────────────────────────────────
+// Test-side only: they return secrets by value, which the library API
+// deliberately does not.
+
+fn ecdhZv(d: [32]u8, peer: ctap2pin.PublicKey) ctap2pin.EcdhError![32]u8 {
+    var z: [32]u8 = undefined;
+    try ctap2pin.ecdhZ(&z, &d, peer);
+    return z;
+}
+
+fn pkOf(d: [32]u8) ctap2pin.EcdhError!ctap2pin.PublicKey {
+    return ctap2pin.publicKeyFromScalar(&d);
+}
+
+fn kdf1(z: [32]u8) One.SharedSecret {
+    var out: One.SharedSecret = undefined;
+    One.kdf(&out, &z);
+    return out;
+}
+
+fn kdf2(z: [32]u8) Two.SharedSecret {
+    var out: Two.SharedSecret = undefined;
+    Two.kdf(&out, &z);
+    return out;
+}
+
+fn encap(comptime P: type, d: [32]u8, peer: ctap2pin.PublicKey) ctap2pin.EcdhError!P.Encaps {
+    var out: P.Encaps = undefined;
+    try P.encapsulate(&out, &d, peer);
+    return out;
+}
+
 fn hx(comptime hex_str: []const u8) [hex_str.len / 2]u8 {
     var out: [hex_str.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, hex_str) catch unreachable;
@@ -46,7 +78,7 @@ const auth_pub = ctap2pin.PublicKey{
 const client_data_hash = hx(o.inputs.client_data_hash);
 
 test "oracle: publicKeyFromScalar reproduces fido2's platform key-agreement pubkey" {
-    const pk = try ctap2pin.publicKeyFromScalar(platform_scalar);
+    const pk = try pkOf(platform_scalar);
     try t.expectEqualSlices(u8, &hx(o.v1.platform_x), &pk.x);
     try t.expectEqualSlices(u8, &hx(o.v1.platform_y), &pk.y);
     // Key derivation doesn't depend on the PIN/UV protocol -- fido2 minted
@@ -56,68 +88,68 @@ test "oracle: publicKeyFromScalar reproduces fido2's platform key-agreement pubk
 }
 
 test "oracle: protocol One kdf(ecdhZ) reproduces fido2's PinProtocolV1 shared secret" {
-    const z = try ctap2pin.ecdhZ(platform_scalar, auth_pub);
-    const secret = One.kdf(z);
+    const z = try ecdhZv(platform_scalar, auth_pub);
+    const secret = kdf1(z);
     try t.expectEqualSlices(u8, &hx(o.v1.shared_secret), &secret);
 }
 
 test "oracle: protocol Two kdf(ecdhZ) reproduces fido2's PinProtocolV2 shared secret" {
-    const z = try ctap2pin.ecdhZ(platform_scalar, auth_pub);
-    const secret = Two.kdf(z);
+    const z = try ecdhZv(platform_scalar, auth_pub);
+    const secret = kdf2(z);
     try t.expectEqualSlices(u8, &hx(o.v2.shared_secret), &secret);
 }
 
 test "oracle: protocol One reproduces fido2's pinHashEnc (getPinToken wire value)" {
-    const secret = One.kdf(try ctap2pin.ecdhZ(platform_scalar, auth_pub));
+    const secret = kdf1(try ecdhZv(platform_scalar, auth_pub));
     const pin_hash = hx(o.v1.pin_hash);
     var enc: [16]u8 = undefined;
-    try One.encrypt(secret, &enc, &pin_hash);
+    try One.encrypt(&secret, &enc, &pin_hash);
     try t.expectEqualSlices(u8, &hx(o.v1.pin_hash_enc), &enc);
     // And the reverse: fido2's ciphertext decrypts to the same pin_hash.
     var dec: [16]u8 = undefined;
-    try One.decrypt(secret, &dec, &hx(o.v1.pin_hash_enc));
+    try One.decrypt(&secret, &dec, &hx(o.v1.pin_hash_enc));
     try t.expectEqualSlices(u8, &pin_hash, &dec);
 }
 
 test "oracle: protocol Two reproduces fido2's pinHashEnc (getPinToken wire value)" {
-    const secret = Two.kdf(try ctap2pin.ecdhZ(platform_scalar, auth_pub));
+    const secret = kdf2(try ecdhZv(platform_scalar, auth_pub));
     const pin_hash = hx(o.v2.pin_hash);
     const wire = hx(o.v2.pin_hash_enc); // fido2's IV || ciphertext
     const iv = wire[0..16].*;
     var enc: [32]u8 = undefined;
-    try Two.encrypt(secret, iv, &enc, &pin_hash);
+    try Two.encrypt(&secret, iv, &enc, &pin_hash);
     try t.expectEqualSlices(u8, &wire, &enc);
     var dec: [16]u8 = undefined;
-    try Two.decrypt(secret, &dec, &wire);
+    try Two.decrypt(&secret, &dec, &wire);
     try t.expectEqualSlices(u8, &pin_hash, &dec);
 }
 
 test "oracle: protocol One reproduces a simulated authenticator pinUvAuthToken exchange" {
-    const secret = One.kdf(try ctap2pin.ecdhZ(platform_scalar, auth_pub));
+    const secret = kdf1(try ecdhZv(platform_scalar, auth_pub));
     const token = hx(o.v1.pin_uv_token);
     var enc: [16]u8 = undefined;
-    try One.encrypt(secret, &enc, &token);
+    try One.encrypt(&secret, &enc, &token);
     try t.expectEqualSlices(u8, &hx(o.v1.pin_uv_token_enc), &enc);
     var dec: [16]u8 = undefined;
-    try One.decrypt(secret, &dec, &hx(o.v1.pin_uv_token_enc));
+    try One.decrypt(&secret, &dec, &hx(o.v1.pin_uv_token_enc));
     try t.expectEqualSlices(u8, &token, &dec);
 }
 
 test "oracle: protocol Two reproduces a simulated authenticator pinUvAuthToken exchange" {
-    const secret = Two.kdf(try ctap2pin.ecdhZ(platform_scalar, auth_pub));
+    const secret = kdf2(try ecdhZv(platform_scalar, auth_pub));
     const token = hx(o.v2.pin_uv_token);
     const wire = hx(o.v2.pin_uv_token_enc);
     const iv = wire[0..16].*;
     var enc: [48]u8 = undefined;
-    try Two.encrypt(secret, iv, &enc, &token);
+    try Two.encrypt(&secret, iv, &enc, &token);
     try t.expectEqualSlices(u8, &wire, &enc);
     var dec: [32]u8 = undefined;
-    try Two.decrypt(secret, &dec, &wire);
+    try Two.decrypt(&secret, &dec, &wire);
     try t.expectEqualSlices(u8, &token, &dec);
 }
 
 test "oracle: protocol One pinUvAuthParam reproduces fido2, both keying shapes" {
-    const secret = One.kdf(try ctap2pin.ecdhZ(platform_scalar, auth_pub));
+    const secret = kdf1(try ecdhZv(platform_scalar, auth_pub));
     const token = hx(o.v1.pin_uv_token);
     // setPin/getPinToken shape: authenticate(sharedSecret, pinHashEnc).
     const sig_shared = try One.authenticate(&secret, &hx(o.v1.pin_hash_enc));
@@ -132,7 +164,7 @@ test "oracle: protocol One pinUvAuthParam reproduces fido2, both keying shapes" 
 }
 
 test "oracle: protocol Two pinUvAuthParam reproduces fido2, both keying shapes" {
-    const secret = Two.kdf(try ctap2pin.ecdhZ(platform_scalar, auth_pub));
+    const secret = kdf2(try ecdhZv(platform_scalar, auth_pub));
     const token = hx(o.v2.pin_uv_token);
     const sig_shared = Two.authenticate(secret[0..32], &hx(o.v2.pin_hash_enc));
     try t.expectEqualSlices(u8, &hx(o.v2.pin_uv_param_over_pin_hash_enc), &sig_shared);

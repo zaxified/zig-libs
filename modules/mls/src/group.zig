@@ -1789,7 +1789,8 @@ pub fn Group(comptime S: type) type {
                 // ratchet tree rides on it, so — as with `init_secret` above —
                 // fail closed rather than accept `random`'s silent fallback.
                 try params.io.randomSecure(&path_secret_0);
-                const leaf_kp = S.Kem.generateKeyPair(params.io);
+                var leaf_kp: S.Kem.KeyPair = undefined;
+                S.Kem.generateKeyPair(&leaf_kp, params.io);
 
                 const st = try treekem.stageUpdatePath(S, arena, &w.ratchet_tree, w.my_leaf_index, .{
                     .group_id = w.group_id,
@@ -3206,7 +3207,8 @@ pub fn Group(comptime S: type) type {
                 .leaf => |l| l.encryption_key,
             };
             const node_secret = crypto.DeriveSecret(S, e.path_secret[0..S.Nh].*, "node") catch return false;
-            const kp = S.Kem.deriveKeyPair(&node_secret);
+            var kp: S.Kem.KeyPair = undefined;
+            S.Kem.deriveKeyPair(&kp, &node_secret);
             return std.mem.eql(u8, pub_key, &kp.public_key);
         }
     };

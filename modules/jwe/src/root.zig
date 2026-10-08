@@ -84,6 +84,7 @@ const rsa = @import("rsa");
 
 pub const header = @import("header.zig");
 pub const enc = @import("enc.zig");
+const burn = @import("burn.zig");
 pub const alg = @import("alg.zig");
 pub const Entropy = @import("entropy.zig").Entropy;
 pub const aeskw = alg.aeskw;
@@ -204,8 +205,9 @@ pub const KeyMaterial = union(enum) {
     /// `ECDH-ES`/`ECDH-ES+AxxxKW` encrypt side.
     ec_public: ecdhes.PublicKey,
     /// Recipient's static EC/OKP private key — `ECDH-ES`/`ECDH-ES+AxxxKW`
-    /// decrypt side.
-    ec_private: ecdhes.PrivateKey,
+    /// decrypt side. Borrowed, not copied: a by-value 32-byte secret would be
+    /// duplicated into every frame this union is passed through.
+    ec_private: *const ecdhes.PrivateKey,
 };
 
 /// Largest CEK/encrypted-key/IV/tag this module's internal scratch buffers
@@ -310,6 +312,58 @@ pub const DecryptError = error{
     WorkFactorTooHigh,
 } || header.ParseError || alg.Error || enc.Error;
 
+/// The ECDH-ES encrypt arm's secret-touching body: draws the ephemeral key,
+/// derives `Z`, runs the Concat KDF and (for the KW variants) wraps a random
+/// CEK. Own frame so the caller can burn everything it dirtied; the ephemeral
+/// scalar, `Z` and the KEK never leave it, and are wiped before it returns.
+noinline fn ecdhesEncryptKey(
+    key_alg: Alg,
+    content_enc: Enc,
+    pk: ecdhes.PublicKey,
+    entropy: Entropy,
+    random: std.Random,
+    opts: EncryptOptions,
+    cek: []u8,
+    ek_buf: *[max_encrypted_key_len]u8,
+    epk_coords: *ecdhes.Coordinates,
+) EncryptError![]const u8 {
+    const curve = std.meta.activeTag(pk);
+    var eph: ecdhes.EphemeralKeyPair = undefined;
+    ecdhes.generateEphemeral(&eph, curve, entropy);
+    defer eph.private.wipe();
+    var z_buf: [ecdhes.max_z_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &z_buf);
+    const z = try ecdhes.deriveZ(&eph.private, pk, &z_buf);
+    const apu = opts.apu orelse "";
+    const apv = opts.apv orelse "";
+
+    epk_coords.* = eph.public.coordinates();
+
+    if (key_alg == .@"ECDH-ES") {
+        // Direct Key Agreement: the derived key IS the CEK
+        // (keydatalen = the `enc` key size, AlgorithmID = the `enc`
+        // name); the Encrypted Key segment stays empty.
+        ecdhes.concatKdfSha256(z, @tagName(content_enc), apu, apv, cek);
+        return &.{};
+    }
+    // Key Agreement with Key Wrapping: derive a KEK (keydatalen =
+    // the KW size, AlgorithmID = the full `alg` name), wrap a
+    // random CEK under it. ECDH-ES+A192KW's 24-byte KEK hits
+    // aeskw's typed AES-192 std gap.
+    const kek_len: usize = switch (key_alg) {
+        .@"ECDH-ES+A128KW" => 16,
+        .@"ECDH-ES+A192KW" => 24,
+        .@"ECDH-ES+A256KW" => 32,
+        else => unreachable,
+    };
+    var kek_buf: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &kek_buf);
+    const kek = kek_buf[0..kek_len];
+    ecdhes.concatKdfSha256(z, @tagName(key_alg), apu, apv, kek);
+    random.bytes(cek);
+    return try alg.aeskw.wrap(kek, cek, ek_buf);
+}
+
 /// Encrypt `plaintext` into a compact-serialization JWE. `entropy` supplies
 /// every fresh value this call needs — the CEK (when `alg` isn't `dir`), the
 /// content IV, the AxxxGCMKW wrap IV, the PBES2 salt input, the ECDH-ES
@@ -347,6 +401,8 @@ pub fn encryptCompact(
     const cek_len = content_enc.cekLen() orelse return error.UnsupportedEnc;
 
     var cek_buf: [max_cek_len]u8 = undefined;
+    // The CEK (random, or the ECDH-ES / `dir` derived key) never left in the frame.
+    defer std.crypto.secureZero(u8, &cek_buf);
     const cek = cek_buf[0..cek_len];
     var ek_buf: [max_encrypted_key_len]u8 = undefined;
 
@@ -425,45 +481,19 @@ pub fn encryptCompact(
                 else => return error.KeyMaterialMismatch,
             };
             const curve = std.meta.activeTag(pk);
-            var eph = ecdhes.generateEphemeral(curve, entropy);
-            defer eph.private.wipe();
-            var z_buf: [ecdhes.max_z_len]u8 = undefined;
-            defer std.crypto.secureZero(u8, &z_buf);
-            const z = try ecdhes.deriveZ(eph.private, pk, &z_buf);
-            const apu = opts.apu orelse "";
-            const apv = opts.apv orelse "";
-
-            epk_coords = eph.public.coordinates();
+            // The secret-touching part (ephemeral key, Z, KEK) runs one frame
+            // down and is burned after it returns; only public results
+            // (`epk_coords`, the wrapped key) and the CEK come back.
+            const r = ecdhesEncryptKey(key_alg, content_enc, pk, entropy, random, opts, cek, &ek_buf, &epk_coords);
+            burn.stack(burn.ecdh_burn + burn.content_burn / 2);
+            const ek = try r;
             epk_params = .{
                 .kty = curve.jwkKty(),
                 .crv = curve.jwkCrv(),
                 .x = epk_coords.x[0..],
                 .y = if (epk_coords.y) |*y| y[0..] else null,
             };
-
-            if (key_alg == .@"ECDH-ES") {
-                // Direct Key Agreement: the derived key IS the CEK
-                // (keydatalen = the `enc` key size, AlgorithmID = the `enc`
-                // name); the Encrypted Key segment stays empty.
-                ecdhes.concatKdfSha256(z, @tagName(content_enc), apu, apv, cek);
-                break :blk &.{};
-            }
-            // Key Agreement with Key Wrapping: derive a KEK (keydatalen =
-            // the KW size, AlgorithmID = the full `alg` name), wrap a
-            // random CEK under it. ECDH-ES+A192KW's 24-byte KEK hits
-            // aeskw's typed AES-192 std gap.
-            const kek_len: usize = switch (key_alg) {
-                .@"ECDH-ES+A128KW" => 16,
-                .@"ECDH-ES+A192KW" => 24,
-                .@"ECDH-ES+A256KW" => 32,
-                else => unreachable,
-            };
-            var kek_buf: [32]u8 = undefined;
-            defer std.crypto.secureZero(u8, &kek_buf);
-            const kek = kek_buf[0..kek_len];
-            ecdhes.concatKdfSha256(z, @tagName(key_alg), apu, apv, kek);
-            random.bytes(cek);
-            break :blk try alg.aeskw.wrap(kek, cek, &ek_buf);
+            break :blk ek;
         },
         .unknown => unreachable,
     };
@@ -769,7 +799,7 @@ fn unwrapCek(
             // module implements AND the same curve as the recipient key —
             // before any point decoding or scalar mult runs.
             const curve = ecdhes.Curve.fromJwkCrv(epk.crv) orelse return error.CurveMismatch;
-            if (curve != std.meta.activeTag(sk)) return error.CurveMismatch;
+            if (curve != std.meta.activeTag(sk.*)) return error.CurveMismatch;
             const peer = try ecdhes.PublicKey.fromCoordinates(curve, epk.x, epk.y);
             var z_buf: [ecdhes.max_z_len]u8 = undefined;
             defer std.crypto.secureZero(u8, &z_buf);
@@ -848,6 +878,7 @@ test {
     _ = aeskw;
     _ = ecdhes;
     _ = @import("kat_rfc7516.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "dir + A128GCM real round-trip" {
@@ -923,7 +954,8 @@ test "unknown alg/enc are rejected up front" {
 }
 
 test "ECDH-ES direct + A128GCM real round-trip (P-256, apu/apv, empty encrypted_key)" {
-    const recipient = ecdhes.generateEphemeral(.p256, seededForTest());
+    var recipient: ecdhes.EphemeralKeyPair = undefined;
+    ecdhes.generateEphemeral(&recipient, .p256, seededForTest());
     const token = try encryptCompact(
         std.testing.allocator,
         .@"ECDH-ES",
@@ -941,7 +973,7 @@ test "ECDH-ES direct + A128GCM real round-trip (P-256, apu/apv, empty encrypted_
     _ = it.next().?; // header
     try std.testing.expectEqual(@as(usize, 0), it.next().?.len);
 
-    const plaintext = try decryptCompact(std.testing.allocator, .{ .ec_private = recipient.private }, token, .{
+    const plaintext = try decryptCompact(std.testing.allocator, .{ .ec_private = &recipient.private }, token, .{
         .expect_alg = .@"ECDH-ES",
         .expect_enc = .A128GCM,
     });
@@ -950,7 +982,8 @@ test "ECDH-ES direct + A128GCM real round-trip (P-256, apu/apv, empty encrypted_
 }
 
 test "ECDH-ES+A256KW over X25519 real round-trip" {
-    const recipient = ecdhes.generateEphemeral(.x25519, seededForTest());
+    var recipient: ecdhes.EphemeralKeyPair = undefined;
+    ecdhes.generateEphemeral(&recipient, .x25519, seededForTest());
     const token = try encryptCompact(
         std.testing.allocator,
         .@"ECDH-ES+A256KW",
@@ -963,7 +996,7 @@ test "ECDH-ES+A256KW over X25519 real round-trip" {
     );
     defer std.testing.allocator.free(token);
 
-    const plaintext = try decryptCompact(std.testing.allocator, .{ .ec_private = recipient.private }, token, .{
+    const plaintext = try decryptCompact(std.testing.allocator, .{ .ec_private = &recipient.private }, token, .{
         .expect_alg = .@"ECDH-ES+A256KW",
     });
     defer std.testing.allocator.free(plaintext);
@@ -971,7 +1004,8 @@ test "ECDH-ES+A256KW over X25519 real round-trip" {
 }
 
 test "ECDH-ES+A128KW + A128CBC-HS256 real round-trip (P-256)" {
-    const recipient = ecdhes.generateEphemeral(.p256, seededForTest());
+    var recipient: ecdhes.EphemeralKeyPair = undefined;
+    ecdhes.generateEphemeral(&recipient, .p256, seededForTest());
     const token = try encryptCompact(
         std.testing.allocator,
         .@"ECDH-ES+A128KW",
@@ -984,22 +1018,25 @@ test "ECDH-ES+A128KW + A128CBC-HS256 real round-trip (P-256)" {
     );
     defer std.testing.allocator.free(token);
 
-    const plaintext = try decryptCompact(std.testing.allocator, .{ .ec_private = recipient.private }, token, .{});
+    const plaintext = try decryptCompact(std.testing.allocator, .{ .ec_private = &recipient.private }, token, .{});
     defer std.testing.allocator.free(plaintext);
     try std.testing.expectEqualStrings("wrapped CEK, CBC-HMAC content", plaintext);
 }
 
 test "ECDH-ES cross-curve confusion is rejected: P-256 token vs X25519 key (typed)" {
-    const p256_recipient = ecdhes.generateEphemeral(.p256, seededForTest());
-    const x25519_recipient = ecdhes.generateEphemeral(.x25519, seededForTest());
+    var p256_recipient: ecdhes.EphemeralKeyPair = undefined;
+    ecdhes.generateEphemeral(&p256_recipient, .p256, seededForTest());
+    var x25519_recipient: ecdhes.EphemeralKeyPair = undefined;
+    ecdhes.generateEphemeral(&x25519_recipient, .x25519, seededForTest());
     const token = try encryptCompact(std.testing.allocator, .@"ECDH-ES", .A128GCM, .{ .ec_public = p256_recipient.public }, "hi", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
-    try std.testing.expectError(error.CurveMismatch, decryptCompact(std.testing.allocator, .{ .ec_private = x25519_recipient.private }, token, .{}));
+    try std.testing.expectError(error.CurveMismatch, decryptCompact(std.testing.allocator, .{ .ec_private = &x25519_recipient.private }, token, .{}));
 }
 
 test "ECDH-ES key-material confusion is rejected: ECDH token vs symmetric key" {
-    const recipient = ecdhes.generateEphemeral(.p256, seededForTest());
+    var recipient: ecdhes.EphemeralKeyPair = undefined;
+    ecdhes.generateEphemeral(&recipient, .p256, seededForTest());
     const token = try encryptCompact(std.testing.allocator, .@"ECDH-ES", .A128GCM, .{ .ec_public = recipient.public }, "hi", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
@@ -1008,7 +1045,8 @@ test "ECDH-ES key-material confusion is rejected: ECDH token vs symmetric key" {
 }
 
 test "ECDH-ES direct rejects a non-empty encrypted_key segment" {
-    const recipient = ecdhes.generateEphemeral(.p256, seededForTest());
+    var recipient: ecdhes.EphemeralKeyPair = undefined;
+    ecdhes.generateEphemeral(&recipient, .p256, seededForTest());
     const token = try encryptCompact(std.testing.allocator, .@"ECDH-ES", .A128GCM, .{ .ec_public = recipient.public }, "hi", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
@@ -1024,11 +1062,12 @@ test "ECDH-ES direct rejects a non-empty encrypted_key segment" {
     // token decided before any secret is used, and it is deliberately NOT
     // collapsed into the §11.5 unified key-error path — collapsing it would
     // hide the malleability defense it exists to be.
-    try std.testing.expectError(error.MalformedToken, decryptCompact(std.testing.allocator, .{ .ec_private = recipient.private }, forged, .{}));
+    try std.testing.expectError(error.MalformedToken, decryptCompact(std.testing.allocator, .{ .ec_private = &recipient.private }, forged, .{}));
 }
 
 test "ECDH-ES+A192KW is the documented AES-192 std gap" {
-    const recipient = ecdhes.generateEphemeral(.p256, seededForTest());
+    var recipient: ecdhes.EphemeralKeyPair = undefined;
+    ecdhes.generateEphemeral(&recipient, .p256, seededForTest());
     try std.testing.expectError(error.UnsupportedKeyLength, encryptCompact(std.testing.allocator, .@"ECDH-ES+A192KW", .A128GCM, .{ .ec_public = recipient.public }, "hi", "", seededForTest(), .{}));
 }
 

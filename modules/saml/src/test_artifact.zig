@@ -128,7 +128,7 @@ test "buildArtifactResolveSoap: signed output verifies through xmldsig.verify di
         .issue_instant = "2024-06-01T12:00:00Z",
         .issuer = "https://sp.example.org/metadata",
         .artifact_b64 = artifact_b64,
-        .sign_with = .{ .rsa = kp.secret_key },
+        .sign_with = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(soap_xml);
 

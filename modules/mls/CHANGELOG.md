@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** follows `hpke`'s pointer/out-param API (dead-stack sweep): HPKE private keys go to `openBase`/`setupBaseR` by pointer, `setupBaseS`/`setupBaseR` write into a local `Setup`/`Context` that is wiped on return, key pairs are derived into out-params. mls's own API is unchanged — `externalKeyPair` still returns the pair by value and `DecryptWithLabel*` still take `skR` by value; both belong to mls's own dead-stack sweep (not done yet).
+
 - **2026-10-06** — **BEHAVIOURAL:** a small-order X25519 HPKE key is refused at admission. A
   KeyPackage whose `init_key` or leaf `encryption_key` is the all-zero point (or any other
   small-order encoding) was accepted by an Add, after which every path Commit reaching that

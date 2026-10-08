@@ -60,7 +60,7 @@ test "buildSignedRedirectQuery -> verifyRedirectSignature round-trips (CONSTRUCT
         .kind = .request,
         .message_field = field,
         .relay_state = "opaque-state-123",
-        .key = .{ .rsa = kp.secret_key },
+        .key = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(query);
 
@@ -96,7 +96,7 @@ test "verifyRedirectSignature: flipped signature byte -> false (not an error)" {
     const query = try saml.buildSignedRedirectQuery(alloc, .{
         .kind = .request,
         .message_field = field,
-        .key = .{ .rsa = kp.secret_key },
+        .key = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(query);
     var parts = try splitQuery(alloc, query);
@@ -126,7 +126,7 @@ test "verifyRedirectSignature: wrong key -> false" {
     const query = try saml.buildSignedRedirectQuery(alloc, .{
         .kind = .request,
         .message_field = field,
-        .key = .{ .rsa = kp.secret_key },
+        .key = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(query);
     const parts = try splitQuery(alloc, query);
@@ -151,7 +151,7 @@ test "verifyRedirectSignature: message tampered after signing -> false" {
     const query = try saml.buildSignedRedirectQuery(alloc, .{
         .kind = .request,
         .message_field = field,
-        .key = .{ .rsa = kp.secret_key },
+        .key = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(query);
     const parts = try splitQuery(alloc, query);
@@ -297,7 +297,7 @@ test "LogoutRequest end-to-end over the Redirect binding (self round-trip)" {
         .kind = .request,
         .message_field = field,
         .relay_state = "post-logout-redirect",
-        .key = .{ .rsa = kp.secret_key },
+        .key = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(query);
 

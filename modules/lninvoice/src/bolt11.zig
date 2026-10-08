@@ -494,16 +494,16 @@ pub const EncodeParams = struct {
 /// How `encode` gets its signature: either a ready-made one (the node signed
 /// out of process) or the node's secp256k1 private key to sign with here.
 ///
-/// **`private_key` is caller-owned storage** (CONVENTIONS §2.1 Z2). `encode`
-/// takes this union by value, which for a payload this size Zig is free to pass
-/// by reference — so a `secureZero` here could clobber the caller's own
-/// variable, and on the copies it could legally reach it would only clear a
-/// value already dying with the frame. The caller must `std.crypto.secureZero`
-/// its own key storage once the invoice is encoded. Prefer the `signature`
-/// variant where the key never has to cross this boundary at all.
+/// **`private_key` points at caller-owned storage** (CONVENTIONS §2.1 Z2):
+/// a pointer, so no copy of the key lands in `encode`'s frames or the
+/// caller's (as a by-value `[32]u8` it was copied into every frame the union
+/// passed through, where nothing wiped it — dead-stack sweep, 2026-10-08).
+/// The caller must `std.crypto.secureZero` its own key storage once the
+/// invoice is encoded. Prefer the `signature` variant where the key never has
+/// to cross this boundary at all.
 pub const SignInput = union(enum) {
     signature: ecdsa.Signature,
-    private_key: [32]u8,
+    private_key: *const [32]u8,
 };
 
 fn appendBytesAsQuintets(allocator: Allocator, list: *std.ArrayList(u5), bytes: []const u8) !void {
@@ -637,7 +637,7 @@ pub fn encode(allocator: Allocator, params: EncodeParams, sign_input: SignInput)
 
     const sig: ecdsa.Signature = switch (sign_input) {
         .signature => |s| s,
-        .private_key => |pk| try ecdsa.sign(&pk, hash),
+        .private_key => |pk| try ecdsa.sign(pk, hash),
     };
 
     var sig_bytes: [65]u8 = undefined;
@@ -903,7 +903,7 @@ test "encode -> decode round-trip: fields survive re-parsing, node ID recovered 
         .timestamp = 1_700_000_000,
         .fields = &fields,
     };
-    const str = try encode(allocator, params, .{ .private_key = privkey });
+    const str = try encode(allocator, params, .{ .private_key = &privkey });
     defer allocator.free(str);
     try testing.expect(std.mem.startsWith(u8, str, "lntb"));
 
@@ -956,7 +956,7 @@ test "TEETH: an 'n' field naming a node that did NOT sign is refused" {
             .amount_msat = 1000,
             .timestamp = 1_700_000_000,
             .fields = &fields,
-        }, .{ .private_key = signer_key });
+        }, .{ .private_key = &signer_key });
         defer allocator.free(str);
         var inv = try decode(allocator, str);
         defer inv.deinit(allocator);
@@ -980,7 +980,7 @@ test "TEETH: an 'n' field naming a node that did NOT sign is refused" {
             .amount_msat = 1000,
             .timestamp = 1_700_000_000,
             .fields = &fields,
-        }, .{ .private_key = signer_key });
+        }, .{ .private_key = &signer_key });
         defer allocator.free(str);
         try testing.expectError(error.InvalidSignature, decode(allocator, str));
     }
@@ -1017,7 +1017,7 @@ test "TEETH: the network prefix is not guessed — an unknown one is refused, no
         .amount_msat = 1000,
         .timestamp = 1_700_000_000,
         .fields = &fields,
-    }, .{ .private_key = privkey });
+    }, .{ .private_key = &privkey });
     defer allocator.free(testnet_str);
 
     // Control: it decodes, and as TESTNET — not as mainnet.
@@ -1074,7 +1074,7 @@ test "TEETH: a u64 expiry survives the round trip — encode cannot emit what de
             .amount_msat = 1000,
             .timestamp = 1_700_000_000,
             .fields = &fields,
-        }, .{ .private_key = privkey });
+        }, .{ .private_key = &privkey });
         defer allocator.free(str);
         var inv = decode(allocator, str) catch |e| {
             std.debug.print("encode emitted an expiry of {d} that decode refuses: {s}\n", .{ expiry, @errorName(e) });
@@ -1139,7 +1139,7 @@ test "BOLT#11 KAT: donation invoice ENCODE byte-exact against the spec's own lnb
         .amount_msat = null,
         .timestamp = 1496314658,
         .fields = &fields,
-    }, .{ .private_key = spec_privkey });
+    }, .{ .private_key = &spec_privkey });
     defer allocator.free(str);
 
     try testing.expectEqualStrings(donation_invoice, str);

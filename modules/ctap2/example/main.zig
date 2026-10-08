@@ -52,7 +52,7 @@ const Authenticator = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const pub_key = try ctap2pin.publicKeyFromScalar(self.scalar);
+        const pub_key = try ctap2pin.publicKeyFromScalar(&self.scalar);
 
         if (request[0] == 0x04) { // authenticatorGetInfo
             const opts = [_]cbor.MapEntry{
@@ -100,7 +100,10 @@ const Authenticator = struct {
                 if (self.retries == 0) return reply(response, 0x32, null); // PIN_BLOCKED
                 const ec2 = (try cbor.cose.parseKey(key_agreement.?)).ec2;
                 const peer: ctap2pin.PublicKey = .{ .x = ec2.x[0..32].*, .y = ec2.y[0..32].* };
-                const secret = (try ctap2pin.Two.encapsulate(self.scalar, peer)).shared_secret;
+                var enc: ctap2pin.Two.Encaps = undefined;
+                try ctap2pin.Two.encapsulate(&enc, &self.scalar, peer);
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&enc));
+                const secret = &enc.shared_secret;
                 self.retries -= 1;
                 var got: [16]u8 = undefined;
                 try ctap2pin.Two.decrypt(secret, &got, pin_hash_enc);

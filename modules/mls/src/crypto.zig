@@ -352,7 +352,7 @@ pub fn DecryptWithLabelScratch(
     scratch: []u8,
 ) !void {
     const info = encodeEncryptContext(scratch, label, context) catch return error.LabelTooLong;
-    try hpke.openBase(S.Kem, S.Aead, S.Nh, enc, skR, info, "", ciphertext, plaintext_out);
+    try hpke.openBase(S.Kem, S.Aead, S.Nh, enc, &skR, info, "", ciphertext, plaintext_out);
 }
 
 /// RFC 9420 §5.1.3 `EncryptWithLabel(PublicKey, Label, Context,
@@ -391,7 +391,7 @@ pub fn DecryptWithLabel(
 ) !void {
     var buf: [label_scratch_len]u8 = undefined;
     const info = encodeEncryptContext(&buf, label, context) catch return error.LabelTooLong;
-    try hpke.openBase(S.Kem, S.Aead, S.Nh, enc, skR, info, "", ciphertext, plaintext_out);
+    try hpke.openBase(S.Kem, S.Aead, S.Nh, enc, &skR, info, "", ciphertext, plaintext_out);
 }
 
 // ── tests ─────────────────────────────────────────────────────────────
@@ -471,7 +471,8 @@ test "EncryptWithLabel/DecryptWithLabel: round trip, and a mismatched label fail
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const kp = TestSuite.Kem.generateKeyPair(io);
+    var kp: TestSuite.Kem.KeyPair = undefined;
+    TestSuite.Kem.generateKeyPair(&kp, io);
 
     const pt = "mls encrypt-with-label round trip";
     var ct: [pt.len + TestSuite.Aead.tag_length]u8 = undefined;

@@ -736,8 +736,10 @@ test "A.1.1: key_schedule_context/secret/key/base_nonce/exporter_secret, byte-ex
     // the constants, independent of dhkem/schedule (which the tests
     // further down drive for real).
     const suite_id = suite.suiteId(a1.kem_id, a1.kdf_id, a1.aead_id);
-    const psk_id_hash = suite.labeledExtract(HkdfSha256, &suite_id, "", "psk_id_hash", "");
-    const info_hash = suite.labeledExtract(HkdfSha256, &suite_id, "", "info_hash", &a1.info);
+    var psk_id_hash: [HkdfSha256.prk_length]u8 = undefined;
+    suite.labeledExtract(HkdfSha256, &psk_id_hash, &suite_id, "", "psk_id_hash", "");
+    var info_hash: [HkdfSha256.prk_length]u8 = undefined;
+    suite.labeledExtract(HkdfSha256, &info_hash, &suite_id, "", "info_hash", &a1.info);
 
     var ksc: [65]u8 = undefined;
     ksc[0] = a1.mode;
@@ -745,19 +747,21 @@ test "A.1.1: key_schedule_context/secret/key/base_nonce/exporter_secret, byte-ex
     ksc[33..65].* = info_hash;
     try testing.expectEqualSlices(u8, &a1.key_schedule_context, &ksc);
 
-    const secret = suite.labeledExtract(HkdfSha256, &suite_id, &a1.shared_secret, "secret", "");
+    var secret: [HkdfSha256.prk_length]u8 = undefined;
+
+    suite.labeledExtract(HkdfSha256, &secret, &suite_id, &a1.shared_secret, "secret", "");
     try testing.expectEqualSlices(u8, &a1.secret, &secret);
 
     var key: [16]u8 = undefined;
-    try suite.labeledExpand(HkdfSha256, &suite_id, secret, "key", &ksc, &key);
+    try suite.labeledExpand(HkdfSha256, &suite_id, &secret, "key", &ksc, &key);
     try testing.expectEqualSlices(u8, &a1.key, &key);
 
     var base_nonce: [12]u8 = undefined;
-    try suite.labeledExpand(HkdfSha256, &suite_id, secret, "base_nonce", &ksc, &base_nonce);
+    try suite.labeledExpand(HkdfSha256, &suite_id, &secret, "base_nonce", &ksc, &base_nonce);
     try testing.expectEqualSlices(u8, &a1.base_nonce, &base_nonce);
 
     var exporter_secret: [32]u8 = undefined;
-    try suite.labeledExpand(HkdfSha256, &suite_id, secret, "exp", &ksc, &exporter_secret);
+    try suite.labeledExpand(HkdfSha256, &suite_id, &secret, "exp", &ksc, &exporter_secret);
     try testing.expectEqualSlices(u8, &a1.exporter_secret, &exporter_secret);
 }
 
@@ -771,7 +775,7 @@ test "A.1.1.2: all 3 exported values, byte-exact via real LabeledExpand(exporter
     for (a1.exports) |exp| {
         var got: [32]u8 = undefined;
         std.debug.assert(exp.l == 32);
-        try suite.labeledExpand(HkdfSha256, &suite_id, a1.exporter_secret, "sec", exp.exporter_context, &got);
+        try suite.labeledExpand(HkdfSha256, &suite_id, &a1.exporter_secret, "sec", exp.exporter_context, &got);
         try testing.expectEqualSlices(u8, &exp.exported_value, &got);
     }
 }
@@ -787,22 +791,26 @@ test "A.1.1.1: nonce = base_nonce XOR I2OSP(seq, Nn), byte-exact for all 6 publi
 
 test "A.1.1: DHKEM(X25519).encapDeterministic(pkRm, {skEm,pkEm}) reproduces enc/shared_secret" {
     const eph = dhkem.X25519Kem.KeyPair{ .secret_key = a1.skEm, .public_key = a1.pkEm };
-    const got = try dhkem.X25519Kem.encapDeterministic(a1.pkRm, eph);
+    var got: dhkem.X25519Kem.Encapped = undefined;
+    try dhkem.X25519Kem.encapDeterministic(&got, a1.pkRm, &eph);
     try testing.expectEqualSlices(u8, &a1.enc, &got.enc);
     try testing.expectEqualSlices(u8, &a1.shared_secret, &got.shared_secret);
 }
 
 test "A.1.1: DHKEM(X25519).decap(enc, skRm) reproduces shared_secret" {
     const skR = dhkem.X25519Kem.KeyPair{ .secret_key = a1.skRm, .public_key = a1.pkRm };
-    const got = try dhkem.X25519Kem.decap(a1.enc, skR);
+    var got: [dhkem.X25519Kem.Nsecret]u8 = undefined;
+    try dhkem.X25519Kem.decap(&got, a1.enc, &skR);
     try testing.expectEqualSlices(u8, &a1.shared_secret, &got);
 }
 
 test "A.1.1: DHKEM(X25519).deriveKeyPair reproduces skEm/pkEm from ikmE and skRm/pkRm from ikmR" {
-    const kpE = dhkem.X25519Kem.deriveKeyPair(&a1.ikmE);
+    var kpE: dhkem.X25519Kem.KeyPair = undefined;
+    dhkem.X25519Kem.deriveKeyPair(&kpE, &a1.ikmE);
     try testing.expectEqualSlices(u8, &a1.skEm, &kpE.secret_key);
     try testing.expectEqualSlices(u8, &a1.pkEm, &kpE.public_key);
-    const kpR = dhkem.X25519Kem.deriveKeyPair(&a1.ikmR);
+    var kpR: dhkem.X25519Kem.KeyPair = undefined;
+    dhkem.X25519Kem.deriveKeyPair(&kpR, &a1.ikmR);
     try testing.expectEqualSlices(u8, &a1.skRm, &kpR.secret_key);
     try testing.expectEqualSlices(u8, &a1.pkRm, &kpR.public_key);
 }
@@ -810,7 +818,8 @@ test "A.1.1: DHKEM(X25519).deriveKeyPair reproduces skEm/pkEm from ikmE and skRm
 test "A.1.1: schedule.keySchedule(.base, shared_secret, info) matches key/base_nonce/exporter_secret" {
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(a1.kem_id, a1.kdf_id, a1.aead_id);
-    const ctx = try schedule.keySchedule(Aes128Gcm, 32, .base, &suite_id, &a1.shared_secret, &a1.info, "", "");
+    var ctx: schedule.Context(Aes128Gcm, 32) = undefined;
+    try schedule.keySchedule(Aes128Gcm, 32, &ctx, .base, &suite_id, &a1.shared_secret, &a1.info, "", "");
     try testing.expectEqualSlices(u8, &a1.key, &ctx.key);
     try testing.expectEqualSlices(u8, &a1.base_nonce, &ctx.base_nonce);
     try testing.expectEqualSlices(u8, &a1.exporter_secret, &ctx.exporter_secret);
@@ -820,7 +829,8 @@ test "A.1.1: schedule.keySchedule(.base, shared_secret, info) matches key/base_n
 test "A.1.1.1: Context.seal/.open reproduce all 6 published (pt,aad)->ct tuples (seq 0/1/2 sequential; 4/255 via direct seq set)" {
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(a1.kem_id, a1.kdf_id, a1.aead_id);
-    var sender = try schedule.keySchedule(Aes128Gcm, 32, .base, &suite_id, &a1.shared_secret, &a1.info, "", "");
+    var sender: schedule.Context(Aes128Gcm, 32) = undefined;
+    try schedule.keySchedule(Aes128Gcm, 32, &sender, .base, &suite_id, &a1.shared_secret, &a1.info, "", "");
     var receiver = sender;
 
     for (a1.encryptions) |enc_case| {
@@ -847,7 +857,8 @@ test "A.1.1.1: Context.seal/.open reproduce all 6 published (pt,aad)->ct tuples 
 test "A.1.1.2: Context.exportSecret reproduces all 3 exported values (thin wrapper over the already-verified labeledExpand)" {
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(a1.kem_id, a1.kdf_id, a1.aead_id);
-    const ctx = try schedule.keySchedule(Aes128Gcm, 32, .base, &suite_id, &a1.shared_secret, &a1.info, "", "");
+    var ctx: schedule.Context(Aes128Gcm, 32) = undefined;
+    try schedule.keySchedule(Aes128Gcm, 32, &ctx, .base, &suite_id, &a1.shared_secret, &a1.info, "", "");
     for (a1.exports) |exp| {
         var got: [32]u8 = undefined;
         std.debug.assert(exp.l == 32);
@@ -862,13 +873,13 @@ test "A.1: sealBaseDeterministic/openBase reproduce enc + the first ciphertext e
     const first = a1.encryptions[0];
 
     var ct: [45]u8 = undefined;
-    const sealed = try schedule.sealBaseDeterministic(dhkem.X25519Kem, Aes128Gcm, 32, a1.pkRm, eph, &a1.info, first.aad, first.pt, &ct);
+    const sealed = try schedule.sealBaseDeterministic(dhkem.X25519Kem, Aes128Gcm, 32, a1.pkRm, &eph, &a1.info, first.aad, first.pt, &ct);
     try testing.expectEqualSlices(u8, &a1.enc, &sealed.enc);
     try testing.expectEqualSlices(u8, first.ct, &ct);
 
     const skR = dhkem.X25519Kem.KeyPair{ .secret_key = a1.skRm, .public_key = a1.pkRm };
     var pt: [29]u8 = undefined;
-    try schedule.openBase(dhkem.X25519Kem, Aes128Gcm, 32, sealed.enc, skR, &a1.info, first.aad, &ct, &pt);
+    try schedule.openBase(dhkem.X25519Kem, Aes128Gcm, 32, sealed.enc, &skR, &a1.info, first.aad, &ct, &pt);
     try testing.expectEqualSlices(u8, first.pt, &pt);
 }
 
@@ -888,17 +899,21 @@ test "A.2: X25519 + ChaCha20Poly1305 — Encap/Decap + KeySchedule + seq-0 Seal,
 
 fn a2Vector(comptime ChaCha20Poly1305: type) !void {
     const eph = dhkem.X25519Kem.KeyPair{ .secret_key = a2.skEm, .public_key = a2.pkEm };
-    const got = try dhkem.X25519Kem.encapDeterministic(a2.pkRm, eph);
+    var got: dhkem.X25519Kem.Encapped = undefined;
+    try dhkem.X25519Kem.encapDeterministic(&got, a2.pkRm, &eph);
     try testing.expectEqualSlices(u8, &a2.enc, &got.enc);
     try testing.expectEqualSlices(u8, &a2.shared_secret, &got.shared_secret);
     const skR = dhkem.X25519Kem.KeyPair{ .secret_key = a2.skRm, .public_key = a2.pkRm };
-    try testing.expectEqualSlices(u8, &a2.shared_secret, &(try dhkem.X25519Kem.decap(a2.enc, skR)));
+    var decapped: [dhkem.X25519Kem.Nsecret]u8 = undefined;
+    try dhkem.X25519Kem.decap(&decapped, a2.enc, &skR);
+    try testing.expectEqualSlices(u8, &a2.shared_secret, &decapped);
 
     // A.2 uses the same info/pt/aad strings as A.1 (RFC 9180's Appendix A
     // fixes them across all vector sections: info "Ode on a Grecian Urn",
     // pt "Beauty is truth, truth beauty", aad "Count-0").
     const suite_id = suite.suiteId(a2.kem_id, a2.kdf_id, a2.aead_id);
-    var ctx = try schedule.keySchedule(ChaCha20Poly1305, 32, .base, &suite_id, &a2.shared_secret, &a1.info, "", "");
+    var ctx: schedule.Context(ChaCha20Poly1305, 32) = undefined;
+    try schedule.keySchedule(ChaCha20Poly1305, 32, &ctx, .base, &suite_id, &a2.shared_secret, &a1.info, "", "");
     try testing.expectEqualSlices(u8, &a2.key, &ctx.key);
     try testing.expectEqualSlices(u8, &a2.base_nonce, &ctx.base_nonce);
     try testing.expectEqualSlices(u8, &a2.exporter_secret, &ctx.exporter_secret);
@@ -912,15 +927,19 @@ test "A.3: P-256 + AES-128-GCM — Encap/Decap + KeySchedule + seq-0 Seal, byte-
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 
     const eph = dhkem.P256Kem.KeyPair{ .secret_key = a3.skEm, .public_key = a3.pkEm };
-    const got = try dhkem.P256Kem.encapDeterministic(a3.pkRm, eph);
+    var got: dhkem.P256Kem.Encapped = undefined;
+    try dhkem.P256Kem.encapDeterministic(&got, a3.pkRm, &eph);
     try testing.expectEqualSlices(u8, &a3.enc, &got.enc);
     try testing.expectEqualSlices(u8, &a3.shared_secret, &got.shared_secret);
     const skR = dhkem.P256Kem.KeyPair{ .secret_key = a3.skRm, .public_key = a3.pkRm };
-    try testing.expectEqualSlices(u8, &a3.shared_secret, &(try dhkem.P256Kem.decap(a3.enc, skR)));
+    var decapped: [dhkem.P256Kem.Nsecret]u8 = undefined;
+    try dhkem.P256Kem.decap(&decapped, a3.enc, &skR);
+    try testing.expectEqualSlices(u8, &a3.shared_secret, &decapped);
 
     // Same fixed info/pt/aad as A.1 (see the A.2 test's note).
     const suite_id = suite.suiteId(a3.kem_id, a3.kdf_id, a3.aead_id);
-    var ctx = try schedule.keySchedule(Aes128Gcm, 32, .base, &suite_id, &a3.shared_secret, &a1.info, "", "");
+    var ctx: schedule.Context(Aes128Gcm, 32) = undefined;
+    try schedule.keySchedule(Aes128Gcm, 32, &ctx, .base, &suite_id, &a3.shared_secret, &a1.info, "", "");
     try testing.expectEqualSlices(u8, &a3.key, &ctx.key);
     try testing.expectEqualSlices(u8, &a3.base_nonce, &ctx.base_nonce);
     try testing.expectEqualSlices(u8, &a3.exporter_secret, &ctx.exporter_secret);
@@ -951,11 +970,14 @@ test "A.4: DHKEM(P-256).encapDeterministic/.decap reproduce enc/shared_secret �
     // though A.4's OUTER key schedule below runs HKDF-SHA512. If this KAT
     // passed with a WRONG shared_secret, no later stage could recover.
     const eph = dhkem.P256Kem.KeyPair{ .secret_key = a4.skEm, .public_key = a4.pkEm };
-    const got = try dhkem.P256Kem.encapDeterministic(a4.pkRm, eph);
+    var got: dhkem.P256Kem.Encapped = undefined;
+    try dhkem.P256Kem.encapDeterministic(&got, a4.pkRm, &eph);
     try testing.expectEqualSlices(u8, &a4.enc, &got.enc);
     try testing.expectEqualSlices(u8, &a4.shared_secret, &got.shared_secret);
     const skR = dhkem.P256Kem.KeyPair{ .secret_key = a4.skRm, .public_key = a4.pkRm };
-    try testing.expectEqualSlices(u8, &a4.shared_secret, &(try dhkem.P256Kem.decap(a4.enc, skR)));
+    var decapped: [dhkem.P256Kem.Nsecret]u8 = undefined;
+    try dhkem.P256Kem.decap(&decapped, a4.enc, &skR);
+    try testing.expectEqualSlices(u8, &a4.shared_secret, &decapped);
 }
 
 test "A.4: key_schedule_context/secret, byte-exact via real LabeledExtract with the HKDF-SHA512 Kdf type (Nh=64)" {
@@ -966,8 +988,10 @@ test "A.4: key_schedule_context/secret, byte-exact via real LabeledExtract with 
     // wrong `key`.
     const Kdf = schedule.KdfOf(64);
     const suite_id = suite.suiteId(a4.kem_id, a4.kdf_id, a4.aead_id);
-    const psk_id_hash = suite.labeledExtract(Kdf, &suite_id, "", "psk_id_hash", "");
-    const info_hash = suite.labeledExtract(Kdf, &suite_id, "", "info_hash", &a4.info);
+    var psk_id_hash: [Kdf.prk_length]u8 = undefined;
+    suite.labeledExtract(Kdf, &psk_id_hash, &suite_id, "", "psk_id_hash", "");
+    var info_hash: [Kdf.prk_length]u8 = undefined;
+    suite.labeledExtract(Kdf, &info_hash, &suite_id, "", "info_hash", &a4.info);
 
     var ksc: [129]u8 = undefined;
     ksc[0] = a4.mode;
@@ -975,7 +999,9 @@ test "A.4: key_schedule_context/secret, byte-exact via real LabeledExtract with 
     ksc[65..129].* = info_hash;
     try testing.expectEqualSlices(u8, &a4.key_schedule_context, &ksc);
 
-    const secret = suite.labeledExtract(Kdf, &suite_id, &a4.shared_secret, "secret", "");
+    var secret: [Kdf.prk_length]u8 = undefined;
+
+    suite.labeledExtract(Kdf, &secret, &suite_id, &a4.shared_secret, "secret", "");
     try testing.expectEqualSlices(u8, &a4.secret, &secret);
 }
 
@@ -987,7 +1013,8 @@ test "A.4: schedule.keySchedule(.base, shared_secret, info, Nh=64) matches key/b
     // using HKDF-SHA256 — a mutation that hardcoded HkdfSha256 back in
     // would still COMPILE (Nh=64 only changes buffer widths, not which
     // Hkdf runs) but every assertion below would go red.
-    const ctx = try schedule.keySchedule(Aes128Gcm, 64, .base, &suite_id, &a4.shared_secret, &a4.info, "", "");
+    var ctx: schedule.Context(Aes128Gcm, 64) = undefined;
+    try schedule.keySchedule(Aes128Gcm, 64, &ctx, .base, &suite_id, &a4.shared_secret, &a4.info, "", "");
     try testing.expectEqualSlices(u8, &a4.key, &ctx.key);
     try testing.expectEqualSlices(u8, &a4.base_nonce, &ctx.base_nonce);
     try testing.expectEqualSlices(u8, &a4.exporter_secret, &ctx.exporter_secret);
@@ -997,7 +1024,8 @@ test "A.4: schedule.keySchedule(.base, shared_secret, info, Nh=64) matches key/b
 test "A.4: Context(Aead,64).seal/.open reproduce all 6 published tuples (seq 0/1/2/4/255/256)" {
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(a4.kem_id, a4.kdf_id, a4.aead_id);
-    var sender = try schedule.keySchedule(Aes128Gcm, 64, .base, &suite_id, &a4.shared_secret, &a4.info, "", "");
+    var sender: schedule.Context(Aes128Gcm, 64) = undefined;
+    try schedule.keySchedule(Aes128Gcm, 64, &sender, .base, &suite_id, &a4.shared_secret, &a4.info, "", "");
     var receiver = sender;
 
     for (a4.encryptions) |enc_case| {
@@ -1026,13 +1054,13 @@ test "A.4: sealBaseDeterministic/openBase (Nh=64) reproduce enc + the first ciph
     const first = a4.encryptions[0];
 
     var ct: [45]u8 = undefined;
-    const sealed = try schedule.sealBaseDeterministic(dhkem.P256Kem, Aes128Gcm, 64, a4.pkRm, eph, &a4.info, first.aad, first.pt, &ct);
+    const sealed = try schedule.sealBaseDeterministic(dhkem.P256Kem, Aes128Gcm, 64, a4.pkRm, &eph, &a4.info, first.aad, first.pt, &ct);
     try testing.expectEqualSlices(u8, &a4.enc, &sealed.enc);
     try testing.expectEqualSlices(u8, first.ct, &ct);
 
     const skR = dhkem.P256Kem.KeyPair{ .secret_key = a4.skRm, .public_key = a4.pkRm };
     var pt: [29]u8 = undefined;
-    try schedule.openBase(dhkem.P256Kem, Aes128Gcm, 64, sealed.enc, skR, &a4.info, first.aad, &ct, &pt);
+    try schedule.openBase(dhkem.P256Kem, Aes128Gcm, 64, sealed.enc, &skR, &a4.info, first.aad, &ct, &pt);
     try testing.expectEqualSlices(u8, first.pt, &pt);
 }
 
@@ -1070,47 +1098,51 @@ fn driveVector(comptime V: type, comptime Kem: type, comptime Aead: type) !void 
     const psk_id: []const u8 = if (@hasDecl(V, "psk_id")) &V.psk_id else "";
 
     // 1. DeriveKeyPair for both parties (§7.1.3).
-    const kpE = Kem.deriveKeyPair(&V.ikmE);
+    var kpE: Kem.KeyPair = undefined;
+    Kem.deriveKeyPair(&kpE, &V.ikmE);
     try testing.expectEqualSlices(u8, &V.skEm, &kpE.secret_key);
     try testing.expectEqualSlices(u8, &V.pkEm, &kpE.public_key);
-    const kpR = Kem.deriveKeyPair(&V.ikmR);
+    var kpR: Kem.KeyPair = undefined;
+    Kem.deriveKeyPair(&kpR, &V.ikmR);
     try testing.expectEqualSlices(u8, &V.skRm, &kpR.secret_key);
     try testing.expectEqualSlices(u8, &V.pkRm, &kpR.public_key);
 
     // 2. (Auth)Encap / (Auth)Decap (§4.1).
-    const encapped, const decapped = blk: {
-        if (comptime is_auth) {
-            const kpS = Kem.deriveKeyPair(&V.ikmS);
-            try testing.expectEqualSlices(u8, &V.skSm, &kpS.secret_key);
-            try testing.expectEqualSlices(u8, &V.pkSm, &kpS.public_key);
-            break :blk .{
-                try Kem.authEncapDeterministic(V.pkRm, kpS, kpE),
-                try Kem.authDecap(V.enc, kpR, V.pkSm),
-            };
-        }
-        break :blk .{
-            try Kem.encapDeterministic(V.pkRm, kpE),
-            try Kem.decap(V.enc, kpR),
-        };
-    };
+    var encapped: Kem.Encapped = undefined;
+    var decapped: [Kem.Nsecret]u8 = undefined;
+    if (comptime is_auth) {
+        var kpS: Kem.KeyPair = undefined;
+        Kem.deriveKeyPair(&kpS, &V.ikmS);
+        try testing.expectEqualSlices(u8, &V.skSm, &kpS.secret_key);
+        try testing.expectEqualSlices(u8, &V.pkSm, &kpS.public_key);
+        try Kem.authEncapDeterministic(&encapped, V.pkRm, &kpS, &kpE);
+        try Kem.authDecap(&decapped, V.enc, &kpR, V.pkSm);
+    } else {
+        try Kem.encapDeterministic(&encapped, V.pkRm, &kpE);
+        try Kem.decap(&decapped, V.enc, &kpR);
+    }
     try testing.expectEqualSlices(u8, &V.enc, &encapped.enc);
     try testing.expectEqualSlices(u8, &V.shared_secret, &encapped.shared_secret);
     try testing.expectEqualSlices(u8, &V.shared_secret, &decapped);
 
     // 3. key_schedule_context + secret, from the §4 primitives directly.
     const suite_id = suite.suiteId(V.kem_id, V.kdf_id, V.aead_id);
-    const psk_id_hash = suite.labeledExtract(HkdfSha256, &suite_id, "", "psk_id_hash", psk_id);
-    const info_hash = suite.labeledExtract(HkdfSha256, &suite_id, "", "info_hash", &V.info);
+    var psk_id_hash: [HkdfSha256.prk_length]u8 = undefined;
+    suite.labeledExtract(HkdfSha256, &psk_id_hash, &suite_id, "", "psk_id_hash", psk_id);
+    var info_hash: [HkdfSha256.prk_length]u8 = undefined;
+    suite.labeledExtract(HkdfSha256, &info_hash, &suite_id, "", "info_hash", &V.info);
     var ksc: [65]u8 = undefined;
     ksc[0] = V.mode;
     ksc[1..33].* = psk_id_hash;
     ksc[33..65].* = info_hash;
     try testing.expectEqualSlices(u8, &V.key_schedule_context, &ksc);
-    const secret = suite.labeledExtract(HkdfSha256, &suite_id, &V.shared_secret, "secret", psk);
+    var secret: [HkdfSha256.prk_length]u8 = undefined;
+    suite.labeledExtract(HkdfSha256, &secret, &suite_id, &V.shared_secret, "secret", psk);
     try testing.expectEqualSlices(u8, &V.secret, &secret);
 
     // 4. KeySchedule (§5.1) through the real entry point.
-    var sender = try schedule.keySchedule(Aead, 32, mode, &suite_id, &V.shared_secret, &V.info, psk, psk_id);
+    var sender: schedule.Context(Aead, 32) = undefined;
+    try schedule.keySchedule(Aead, 32, &sender, mode, &suite_id, &V.shared_secret, &V.info, psk, psk_id);
     try testing.expectEqualSlices(u8, &V.key, &sender.key);
     try testing.expectEqualSlices(u8, &V.base_nonce, &sender.base_nonce);
     try testing.expectEqualSlices(u8, &V.exporter_secret, &sender.exporter_secret);
@@ -1228,17 +1260,18 @@ fn driveSetupVector(comptime V: type, comptime Kem: type, comptime Aead: type) !
     // pattern as `sealBaseDeterministic` etc.), dispatched on `mode` at
     // comptime so a non-auth vector never has to declare a `skSm`/`pkSm`
     // field it doesn't have (mirrors `driveVector`'s `is_auth` guard).
-    var setup = if (comptime mode == .base)
-        try schedule.setupBaseSDeterministic(Kem, Aead, 32, V.pkRm, eph, &V.info)
+    var setup: schedule.Setup(Kem, Aead, 32) = undefined;
+    if (comptime mode == .base)
+        try schedule.setupBaseSDeterministic(Kem, Aead, 32, &setup, V.pkRm, &eph, &V.info)
     else if (comptime mode == .psk)
-        try schedule.setupPskSDeterministic(Kem, Aead, 32, V.pkRm, eph, &V.info, psk, psk_id)
-    else if (comptime mode == .auth) blk: {
+        try schedule.setupPskSDeterministic(Kem, Aead, 32, &setup, V.pkRm, &eph, &V.info, psk, psk_id)
+    else if (comptime mode == .auth) {
         const skS = Kem.KeyPair{ .secret_key = V.skSm, .public_key = V.pkSm };
-        break :blk try schedule.setupAuthSDeterministic(Kem, Aead, 32, V.pkRm, skS, eph, &V.info);
-    } else blk: {
+        try schedule.setupAuthSDeterministic(Kem, Aead, 32, &setup, V.pkRm, &skS, &eph, &V.info);
+    } else {
         const skS = Kem.KeyPair{ .secret_key = V.skSm, .public_key = V.pkSm };
-        break :blk try schedule.setupAuthPskSDeterministic(Kem, Aead, 32, V.pkRm, skS, eph, &V.info, psk, psk_id);
-    };
+        try schedule.setupAuthPskSDeterministic(Kem, Aead, 32, &setup, V.pkRm, &skS, &eph, &V.info, psk, psk_id);
+    }
 
     try testing.expectEqualSlices(u8, &V.enc, &setup.enc);
     try testing.expectEqualSlices(u8, &V.key, &setup.context.key);
@@ -1248,14 +1281,15 @@ fn driveSetupVector(comptime V: type, comptime Kem: type, comptime Aead: type) !
 
     // Receiver side: `setup*R`, given the `enc` the sender side just
     // produced (which already matched `V.enc` above).
-    var receiver = if (comptime mode == .base)
-        try schedule.setupBaseR(Kem, Aead, 32, setup.enc, skR, &V.info)
+    var receiver: schedule.Context(Aead, 32) = undefined;
+    if (comptime mode == .base)
+        try schedule.setupBaseR(Kem, Aead, 32, &receiver, setup.enc, &skR, &V.info)
     else if (comptime mode == .psk)
-        try schedule.setupPskR(Kem, Aead, 32, setup.enc, skR, &V.info, psk, psk_id)
+        try schedule.setupPskR(Kem, Aead, 32, &receiver, setup.enc, &skR, &V.info, psk, psk_id)
     else if (comptime mode == .auth)
-        try schedule.setupAuthR(Kem, Aead, 32, setup.enc, skR, V.pkSm, &V.info)
+        try schedule.setupAuthR(Kem, Aead, 32, &receiver, setup.enc, &skR, V.pkSm, &V.info)
     else
-        try schedule.setupAuthPskR(Kem, Aead, 32, setup.enc, skR, V.pkSm, &V.info, psk, psk_id);
+        try schedule.setupAuthPskR(Kem, Aead, 32, &receiver, setup.enc, &skR, V.pkSm, &V.info, psk, psk_id);
 
     try testing.expectEqualSlices(u8, &V.key, &receiver.key);
     try testing.expectEqualSlices(u8, &V.base_nonce, &receiver.base_nonce);
@@ -1332,11 +1366,11 @@ test "A.1.2/A.1.3/A.1.4: the single-shot sealPsk/sealAuth/sealAuthPsk wrappers r
         const eph = Kem.KeyPair{ .secret_key = V.skEm, .public_key = V.pkEm };
         const skR = Kem.KeyPair{ .secret_key = V.skRm, .public_key = V.pkRm };
         var ct: [45]u8 = undefined;
-        const sealed = try schedule.sealPskDeterministic(Kem, Aes128Gcm, 32, V.pkRm, eph, &V.info, &V.psk, &V.psk_id, V.encryptions[0].aad, V.encryptions[0].pt, &ct);
+        const sealed = try schedule.sealPskDeterministic(Kem, Aes128Gcm, 32, V.pkRm, &eph, &V.info, &V.psk, &V.psk_id, V.encryptions[0].aad, V.encryptions[0].pt, &ct);
         try testing.expectEqualSlices(u8, &V.enc, &sealed.enc);
         try testing.expectEqualSlices(u8, V.encryptions[0].ct, &ct);
         var pt: [29]u8 = undefined;
-        try schedule.openPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, &V.info, &V.psk, &V.psk_id, V.encryptions[0].aad, &ct, &pt);
+        try schedule.openPsk(Kem, Aes128Gcm, 32, sealed.enc, &skR, &V.info, &V.psk, &V.psk_id, V.encryptions[0].aad, &ct, &pt);
         try testing.expectEqualSlices(u8, V.encryptions[0].pt, &pt);
     }
 
@@ -1347,11 +1381,11 @@ test "A.1.2/A.1.3/A.1.4: the single-shot sealPsk/sealAuth/sealAuthPsk wrappers r
         const skR = Kem.KeyPair{ .secret_key = V.skRm, .public_key = V.pkRm };
         const skS = Kem.KeyPair{ .secret_key = V.skSm, .public_key = V.pkSm };
         var ct: [45]u8 = undefined;
-        const sealed = try schedule.sealAuthDeterministic(Kem, Aes128Gcm, 32, V.pkRm, skS, eph, &V.info, V.encryptions[0].aad, V.encryptions[0].pt, &ct);
+        const sealed = try schedule.sealAuthDeterministic(Kem, Aes128Gcm, 32, V.pkRm, &skS, &eph, &V.info, V.encryptions[0].aad, V.encryptions[0].pt, &ct);
         try testing.expectEqualSlices(u8, &V.enc, &sealed.enc);
         try testing.expectEqualSlices(u8, V.encryptions[0].ct, &ct);
         var pt: [29]u8 = undefined;
-        try schedule.openAuth(Kem, Aes128Gcm, 32, sealed.enc, skR, V.pkSm, &V.info, V.encryptions[0].aad, &ct, &pt);
+        try schedule.openAuth(Kem, Aes128Gcm, 32, sealed.enc, &skR, V.pkSm, &V.info, V.encryptions[0].aad, &ct, &pt);
         try testing.expectEqualSlices(u8, V.encryptions[0].pt, &pt);
     }
 
@@ -1362,11 +1396,11 @@ test "A.1.2/A.1.3/A.1.4: the single-shot sealPsk/sealAuth/sealAuthPsk wrappers r
         const skR = Kem.KeyPair{ .secret_key = V.skRm, .public_key = V.pkRm };
         const skS = Kem.KeyPair{ .secret_key = V.skSm, .public_key = V.pkSm };
         var ct: [45]u8 = undefined;
-        const sealed = try schedule.sealAuthPskDeterministic(Kem, Aes128Gcm, 32, V.pkRm, skS, eph, &V.info, &V.psk, &V.psk_id, V.encryptions[0].aad, V.encryptions[0].pt, &ct);
+        const sealed = try schedule.sealAuthPskDeterministic(Kem, Aes128Gcm, 32, V.pkRm, &skS, &eph, &V.info, &V.psk, &V.psk_id, V.encryptions[0].aad, V.encryptions[0].pt, &ct);
         try testing.expectEqualSlices(u8, &V.enc, &sealed.enc);
         try testing.expectEqualSlices(u8, V.encryptions[0].ct, &ct);
         var pt: [29]u8 = undefined;
-        try schedule.openAuthPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, V.pkSm, &V.info, &V.psk, &V.psk_id, V.encryptions[0].aad, &ct, &pt);
+        try schedule.openAuthPsk(Kem, Aes128Gcm, 32, sealed.enc, &skR, V.pkSm, &V.info, &V.psk, &V.psk_id, V.encryptions[0].aad, &ct, &pt);
         try testing.expectEqualSlices(u8, V.encryptions[0].pt, &pt);
     }
 }
@@ -1379,7 +1413,7 @@ test "A.3.2/A.3.3/A.3.4: the same single-shot wrappers over the P-256 KEM (Npk=6
         const V = a3_psk;
         const eph = Kem.KeyPair{ .secret_key = V.skEm, .public_key = V.pkEm };
         var ct: [45]u8 = undefined;
-        const sealed = try schedule.sealPskDeterministic(Kem, Aes128Gcm, 32, V.pkRm, eph, &V.info, &V.psk, &V.psk_id, V.encryptions[0].aad, V.encryptions[0].pt, &ct);
+        const sealed = try schedule.sealPskDeterministic(Kem, Aes128Gcm, 32, V.pkRm, &eph, &V.info, &V.psk, &V.psk_id, V.encryptions[0].aad, V.encryptions[0].pt, &ct);
         try testing.expectEqualSlices(u8, &V.enc, &sealed.enc);
         try testing.expectEqualSlices(u8, V.encryptions[0].ct, &ct);
     }
@@ -1388,7 +1422,7 @@ test "A.3.2/A.3.3/A.3.4: the same single-shot wrappers over the P-256 KEM (Npk=6
         const eph = Kem.KeyPair{ .secret_key = V.skEm, .public_key = V.pkEm };
         const skS = Kem.KeyPair{ .secret_key = V.skSm, .public_key = V.pkSm };
         var ct: [45]u8 = undefined;
-        const sealed = try schedule.sealAuthDeterministic(Kem, Aes128Gcm, 32, V.pkRm, skS, eph, &V.info, V.encryptions[0].aad, V.encryptions[0].pt, &ct);
+        const sealed = try schedule.sealAuthDeterministic(Kem, Aes128Gcm, 32, V.pkRm, &skS, &eph, &V.info, V.encryptions[0].aad, V.encryptions[0].pt, &ct);
         try testing.expectEqualSlices(u8, &V.enc, &sealed.enc);
         try testing.expectEqualSlices(u8, V.encryptions[0].ct, &ct);
     }
@@ -1397,7 +1431,7 @@ test "A.3.2/A.3.3/A.3.4: the same single-shot wrappers over the P-256 KEM (Npk=6
         const eph = Kem.KeyPair{ .secret_key = V.skEm, .public_key = V.pkEm };
         const skS = Kem.KeyPair{ .secret_key = V.skSm, .public_key = V.pkSm };
         var ct: [45]u8 = undefined;
-        const sealed = try schedule.sealAuthPskDeterministic(Kem, Aes128Gcm, 32, V.pkRm, skS, eph, &V.info, &V.psk, &V.psk_id, V.encryptions[0].aad, V.encryptions[0].pt, &ct);
+        const sealed = try schedule.sealAuthPskDeterministic(Kem, Aes128Gcm, 32, V.pkRm, &skS, &eph, &V.info, &V.psk, &V.psk_id, V.encryptions[0].aad, V.encryptions[0].pt, &ct);
         try testing.expectEqualSlices(u8, &V.enc, &sealed.enc);
         try testing.expectEqualSlices(u8, V.encryptions[0].ct, &ct);
     }
@@ -1430,8 +1464,11 @@ test "setupBaseS/setupPskS/setupAuthS/setupAuthPskS: real std.Io random-ephemera
     const psk = [_]u8{0x42} ** 32;
     const psk_id = "psk-id";
 
-    const skR = Kem.generateKeyPair(io);
-    const skS = Kem.generateKeyPair(io);
+    var skR: Kem.KeyPair = undefined;
+
+    Kem.generateKeyPair(&skR, io);
+    var skS: Kem.KeyPair = undefined;
+    Kem.generateKeyPair(&skS, io);
 
     const Fixture = struct {
         fn check(setup: schedule.Setup(Kem, Aead, 32), receiver: schedule.Context(Aead, 32)) !void {
@@ -1452,26 +1489,34 @@ test "setupBaseS/setupPskS/setupAuthS/setupAuthPskS: real std.Io random-ephemera
 
     // base
     {
-        const setup = try schedule.setupBaseS(Kem, Aead, 32, skR.public_key, io, info);
-        const receiver = try schedule.setupBaseR(Kem, Aead, 32, setup.enc, skR, info);
+        var setup: schedule.Setup(Kem, Aead, 32) = undefined;
+        try schedule.setupBaseS(Kem, Aead, 32, &setup, skR.public_key, io, info);
+        var receiver: schedule.Context(Aead, 32) = undefined;
+        try schedule.setupBaseR(Kem, Aead, 32, &receiver, setup.enc, &skR, info);
         try Fixture.check(setup, receiver);
     }
     // psk
     {
-        const setup = try schedule.setupPskS(Kem, Aead, 32, skR.public_key, io, info, &psk, psk_id);
-        const receiver = try schedule.setupPskR(Kem, Aead, 32, setup.enc, skR, info, &psk, psk_id);
+        var setup: schedule.Setup(Kem, Aead, 32) = undefined;
+        try schedule.setupPskS(Kem, Aead, 32, &setup, skR.public_key, io, info, &psk, psk_id);
+        var receiver: schedule.Context(Aead, 32) = undefined;
+        try schedule.setupPskR(Kem, Aead, 32, &receiver, setup.enc, &skR, info, &psk, psk_id);
         try Fixture.check(setup, receiver);
     }
     // auth
     {
-        const setup = try schedule.setupAuthS(Kem, Aead, 32, skR.public_key, skS, io, info);
-        const receiver = try schedule.setupAuthR(Kem, Aead, 32, setup.enc, skR, skS.public_key, info);
+        var setup: schedule.Setup(Kem, Aead, 32) = undefined;
+        try schedule.setupAuthS(Kem, Aead, 32, &setup, skR.public_key, &skS, io, info);
+        var receiver: schedule.Context(Aead, 32) = undefined;
+        try schedule.setupAuthR(Kem, Aead, 32, &receiver, setup.enc, &skR, skS.public_key, info);
         try Fixture.check(setup, receiver);
     }
     // auth_psk
     {
-        const setup = try schedule.setupAuthPskS(Kem, Aead, 32, skR.public_key, skS, io, info, &psk, psk_id);
-        const receiver = try schedule.setupAuthPskR(Kem, Aead, 32, setup.enc, skR, skS.public_key, info, &psk, psk_id);
+        var setup: schedule.Setup(Kem, Aead, 32) = undefined;
+        try schedule.setupAuthPskS(Kem, Aead, 32, &setup, skR.public_key, &skS, io, info, &psk, psk_id);
+        var receiver: schedule.Context(Aead, 32) = undefined;
+        try schedule.setupAuthPskR(Kem, Aead, 32, &receiver, setup.enc, &skR, skS.public_key, info, &psk, psk_id);
         try Fixture.check(setup, receiver);
     }
 }

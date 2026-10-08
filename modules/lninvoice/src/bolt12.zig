@@ -340,13 +340,13 @@ pub fn signMerkle(
     allocator: Allocator,
     tlv_stream: []const u8,
     comptime tag: []const u8,
-    secret_key: bip340.SecretKey,
+    secret_key: *const bip340.SecretKey,
     aux_rand: [32]u8,
     io: std.Io,
 ) SignError![64]u8 {
     const root = try merkleRoot(allocator, tlv_stream);
     const digest = bip340.taggedHash(tag, &root);
-    return bip340.sign(&secret_key, &digest, aux_rand, io);
+    return bip340.sign(secret_key, &digest, aux_rand, io);
 }
 
 pub const VerifyError = MerkleError || error{InvalidPublicKey};
@@ -562,7 +562,7 @@ fn appendSignedStream(
 pub fn encodeSignedInvoiceRequest(
     allocator: Allocator,
     unsigned_records: []const lnwire.RawRecord,
-    secret_key: bip340.SecretKey,
+    secret_key: *const bip340.SecretKey,
     aux_rand: [32]u8,
     io: std.Io,
 ) (SignError || bech32raw.EncodeError)![]u8 {
@@ -703,7 +703,7 @@ pub fn decodeInvoice(allocator: Allocator, str: []const u8) InvoiceDecodeError!I
 pub fn encodeSignedInvoice(
     allocator: Allocator,
     unsigned_records: []const lnwire.RawRecord,
-    secret_key: bip340.SecretKey,
+    secret_key: *const bip340.SecretKey,
     aux_rand: [32]u8,
     io: std.Io,
 ) (SignError || bech32raw.EncodeError)![]u8 {
@@ -1280,7 +1280,7 @@ test "BOLT#12 KAT: invoice_request Merkle root + signature verify — signature-
     defer threaded.deinit();
     const io = threaded.io();
     const bob_sk = try bip340.SecretKey.fromBytes([_]u8{0x42} ** 32);
-    const signed = try signMerkle(allocator, stream.items, invoice_request_sig_tag, bob_sk, [_]u8{0} ** 32, io);
+    const signed = try signMerkle(allocator, stream.items, invoice_request_sig_tag, &bob_sk, [_]u8{0} ** 32, io);
     try testing.expectEqualSlices(u8, sig_buf, &signed);
 }
 
@@ -1326,7 +1326,7 @@ test "BOLT#12 round-trip: build+sign+decode+verify an invoice_request" {
         .{ .type = TYPE_AMOUNT, .value = &.{0x64} }, // 100
         .{ .type = INVREQ_PAYER_ID, .value = &payer_id },
     };
-    const lnr = try encodeSignedInvoiceRequest(allocator, &records, sk, [_]u8{0} ** 32, io);
+    const lnr = try encodeSignedInvoiceRequest(allocator, &records, &sk, [_]u8{0} ** 32, io);
     defer allocator.free(lnr);
     try testing.expect(std.mem.startsWith(u8, lnr, "lnr1"));
 
@@ -1365,7 +1365,7 @@ test "A1 F11 x lninvoice (round-2 Q4): a payer_id with a non-SEC1 prefix from th
         .{ .type = TYPE_AMOUNT, .value = &.{0x64} },
         .{ .type = INVREQ_PAYER_ID, .value = &payer_id },
     };
-    const lnr = try encodeSignedInvoiceRequest(allocator, &records, sk, [_]u8{0} ** 32, io);
+    const lnr = try encodeSignedInvoiceRequest(allocator, &records, &sk, [_]u8{0} ** 32, io);
     defer allocator.free(lnr);
 
     var ir = try decodeInvoiceRequest(allocator, lnr);
@@ -1406,7 +1406,7 @@ test "BOLT#12 round-trip: build+sign+decode+verify an invoice" {
         .{ .type = INVOICE_AMOUNT, .value = &.{ 0x27, 0x10 } }, // 10000
         .{ .type = INVOICE_NODE_ID, .value = &node_id },
     };
-    const lni = try encodeSignedInvoice(allocator, &records, sk, [_]u8{0} ** 32, io);
+    const lni = try encodeSignedInvoice(allocator, &records, &sk, [_]u8{0} ** 32, io);
     defer allocator.free(lni);
     try testing.expect(std.mem.startsWith(u8, lni, "lni1"));
 
@@ -1541,7 +1541,7 @@ test "BOLT#12 KAT: invoice ENCODE byte-exact against lni1 string — payer-proof
     // `invoice_node_id`'s own secret key from `payer-proof-test.json`'s
     // "keys" object (secret 0x46 repeated 32 times, same as the KAT above).
     const sk = try bip340.SecretKey.fromBytes([_]u8{0x46} ** 32);
-    const got = try encodeSignedInvoice(allocator, records.items, sk, [_]u8{0} ** 32, io);
+    const got = try encodeSignedInvoice(allocator, records.items, &sk, [_]u8{0} ** 32, io);
     defer allocator.free(got);
 
     try testing.expectEqualStrings(invoice_encode_kat_want, got);
@@ -1602,7 +1602,7 @@ test "BOLT#12 KAT: invoice ENCODE byte-exact against lni1 string — payer-proof
     }
 
     const sk = try bip340.SecretKey.fromBytes([_]u8{0x46} ** 32);
-    const got = try encodeSignedInvoice(allocator, records.items, sk, [_]u8{0} ** 32, io);
+    const got = try encodeSignedInvoice(allocator, records.items, &sk, [_]u8{0} ** 32, io);
     defer allocator.free(got);
 
     try testing.expectEqualStrings(want_lni1, got);

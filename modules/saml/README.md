@@ -145,7 +145,7 @@ const md = try saml.buildSpMetadata(gpa, .{
     // optional: attribute_consuming_services, organization, contacts,
     // valid_until / cache_duration (strings you format — no clock here)
     .id = "_sp-metadata",                     // needed only to sign
-    .sign_with = .{ .rsa = sp_signing_key },  // optional, RSA-SHA256 / exclusive C14N
+    .sign_with = .{ .rsa = &sp_signing_key },  // optional, RSA-SHA256 / exclusive C14N
 });
 defer gpa.free(md);
 ```

@@ -31,18 +31,22 @@ pub fn main() !void {
     // The recipient's long-term static keypair, published out of band
     // (a real deployment would load this from key storage, not mint it
     // fresh — generated here only so the example is self-contained).
-    const recipient = Kem.generateKeyPair(io);
+    var recipient: Kem.KeyPair = undefined;
+    Kem.generateKeyPair(&recipient, io);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&recipient));
 
     const info = "example.org hpke session v1";
 
     // Sender side: SetupBaseS gives back both the encapsulated key (`enc`,
     // which travels alongside the ciphertext) and a multi-message Context.
-    const sender_setup = try hpke.setupBaseS(Kem, Aead, Nh, recipient.public_key, io, info);
-    var sender_ctx = sender_setup.context;
+    var sender_setup: hpke.Setup(Kem, Aead, Nh) = undefined;
+    try hpke.setupBaseS(Kem, Aead, Nh, &sender_setup, recipient.public_key, io, info);
+    const sender_ctx = &sender_setup.context;
 
     // Receiver side: SetupBaseR recovers the identical Context from `enc`
     // and its own private key — no `Context` is ever sent on the wire.
-    var receiver_ctx = try hpke.setupBaseR(Kem, Aead, Nh, sender_setup.enc, recipient, info);
+    var receiver_ctx: hpke.Context(Aead, Nh) = undefined;
+    try hpke.setupBaseR(Kem, Aead, Nh, &receiver_ctx, sender_setup.enc, &recipient, info);
 
     // Message 1.
     const msg1 = "order: BUY 100 XYZ @ market";

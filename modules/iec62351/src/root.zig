@@ -88,7 +88,7 @@ pub const meta = .{
     .role = .util, // pure verification/policy logic over caller-supplied bytes; no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; the replay guards are plain values owned by the caller
     .model_after = "IEC 62351-3/-4/-6 (paywalled — modelled from public descriptions, see SPEC.md); RFC 4231 + NIST SP 800-38D for the primitives",
-    .deps = .{ "x509", "rsa" }, // certificate extensions for the -3 policy; RSASSA-PSS for the -6/-4 signature profiles
+    .deps = .{ "x509", "rsa", "p256" }, // certificate extensions for the -3 policy; RSASSA-PSS and ECDSA P-256 for the -6/-4 signature profiles
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────────
@@ -105,4 +105,5 @@ test {
     _ = @import("vectors_test.zig");
     _ = @import("goose_capture_test.zig");
     _ = @import("iec61850_seam_test.zig");
+    _ = @import("stackprobe_test.zig");
 }

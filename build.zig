@@ -175,7 +175,7 @@ const module_list = [_]Module{
     // Importable as @import("aaa-gate") — hyphen OK, like security-headers.
     .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "resilience", .libs = &.{ "web", "net" } },
-    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy", "p256" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "genetlink", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "nl80211", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .netns = true },
@@ -246,7 +246,7 @@ const module_list = [_]Module{
     .{ .name = "smtp", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .timing = true },
     .{ .name = "imap", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .live = true },
     .{ .name = "iec61850", .libs = &.{"net"}, .deps = &.{"xml"}, .test_deps = &.{"testkit"}, .loopback = true },
-    .{ .name = "iec62351", .libs = &.{"net"}, .deps = &.{ "x509", "rsa" }, .test_deps = &.{ "testkit", "iec61850" } },
+    .{ .name = "iec62351", .libs = &.{"net"}, .deps = &.{ "x509", "rsa", "p256" }, .test_deps = &.{ "testkit", "iec61850" } },
     .{ .name = "s7comm", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "enip", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "bacnet", .libs = &.{"net"}, .deps = &.{ "netaddr", "websocket" }, .test_deps = &.{"testkit"} },

@@ -44,6 +44,8 @@
 const std = @import("std");
 const chachapoly = @import("chachapoly");
 const suite = @import("suite.zig");
+const dhkem = @import("dhkem.zig");
+const burn = @import("burn.zig");
 
 /// The registered `KdfId`/`Hkdf` instantiation for a key-schedule `Nh`
 /// (RFC 9180 §7.2 Table 3) — the dispatch `keySchedule`/`Context.exportSecret`
@@ -189,6 +191,10 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
         /// nonce reuse breaks AES-GCM/ChaCha20-Poly1305 confidentiality
         /// outright — see SPEC.md's threat model).
         pub fn seal(self: *Self, aad: []const u8, pt: []const u8, out: []u8) SealError!void {
+            return burn.run(burn.aead_burn, SealError!void, sealBody, .{ self, aad, pt, out });
+        }
+
+        fn sealBody(self: *Self, aad: []const u8, pt: []const u8, out: []u8) SealError!void {
             // A wrong-length `out` is a caller/API-contract bug, not
             // attacker-controlled input — still a real runtime check (not
             // `std.debug.assert`, which ReleaseFast/ReleaseSmall compile
@@ -220,6 +226,10 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
         /// `seq`, or a genuine subsequent message at that sequence number
         /// would be dropped).
         pub fn open(self: *Self, aad: []const u8, ct: []const u8, out: []u8) OpenError!void {
+            return burn.run(burn.aead_burn, OpenError!void, openBody, .{ self, aad, ct, out });
+        }
+
+        fn openBody(self: *Self, aad: []const u8, ct: []const u8, out: []u8) OpenError!void {
             // A ciphertext shorter than the tag is malformed
             // attacker-controlled input, never a panic (the slicing below
             // would otherwise assert) — treat it as an auth failure.
@@ -246,9 +256,13 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
         /// pulled from many times, unlike `seal`/`open`'s single-use-per-
         /// seq nonces).
         pub fn exportSecret(self: *const Self, suite_id: []const u8, exporter_context: []const u8, out: []u8) suite.LabeledExpandError!void {
+            return burn.run(burn.aead_burn, suite.LabeledExpandError!void, exportBody, .{ self, suite_id, exporter_context, out });
+        }
+
+        fn exportBody(self: *const Self, suite_id: []const u8, exporter_context: []const u8, out: []u8) suite.LabeledExpandError!void {
             const Kdf = KdfOf(Nh);
             comptime std.debug.assert(Nh == Kdf.prk_length); // KdfOf(Nh) must be the Nh-width KDF, not a mismatched one
-            return suite.labeledExpand(Kdf, suite_id, self.exporter_secret, "sec", exporter_context, out);
+            return suite.labeledExpand(Kdf, suite_id, &self.exporter_secret, "sec", exporter_context, out);
         }
     };
 }
@@ -280,16 +294,35 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
 /// key_schedule_context + secret, byte-exact`) exercises this EXACT
 /// sequence against the A.1.1 vector by hand — this function is that
 /// test's body wrapped in a `Context` constructor.
+///
+/// The `Context` goes into `out` (zeroed on error), not a return value: it
+/// holds the AEAD key and the exporter secret, and a returned value is a
+/// temporary in the caller's frame.
 pub fn keySchedule(
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Context(Aead, Nh),
     mode: suite.Mode,
     suite_id: []const u8,
     shared_secret: []const u8,
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
-) (KeyScheduleError || suite.LabeledExpandError)!Context(Aead, Nh) {
+) (KeyScheduleError || suite.LabeledExpandError)!void {
+    return burn.run(burn.aead_burn, (KeyScheduleError || suite.LabeledExpandError)!void, keyScheduleBody, .{ Aead, Nh, out, mode, suite_id, shared_secret, info, psk, psk_id });
+}
+
+fn keyScheduleBody(
+    comptime Aead: type,
+    comptime Nh: usize,
+    out: *Context(Aead, Nh),
+    mode: suite.Mode,
+    suite_id: []const u8,
+    shared_secret: []const u8,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+) (KeyScheduleError || suite.LabeledExpandError)!void {
     // The key-schedule KDF, dispatched from Nh (see KdfOf's doc comment) —
     // NOT the DHKEM's own internal KDF (dhkem.zig's ExtractAndExpand, fixed
     // per kem_id — HKDF-SHA256 for X25519/P-256, HKDF-SHA384 for P-384),
@@ -311,8 +344,11 @@ pub fn keySchedule(
     // complaint about a PSK that shouldn't have been supplied at all.
     if (got_psk and psk.len < Nh) return error.PskTooShort;
 
-    const psk_id_hash = suite.labeledExtract(Kdf, suite_id, "", "psk_id_hash", psk_id);
-    const info_hash = suite.labeledExtract(Kdf, suite_id, "", "info_hash", info);
+    var psk_id_hash: [Kdf.prk_length]u8 = undefined;
+
+    suite.labeledExtract(Kdf, &psk_id_hash, suite_id, "", "psk_id_hash", psk_id);
+    var info_hash: [Kdf.prk_length]u8 = undefined;
+    suite.labeledExtract(Kdf, &info_hash, suite_id, "", "info_hash", info);
 
     // key_schedule_context = I2OSP(mode, 1) || psk_id_hash || info_hash
     var ksc: [1 + 2 * Nh]u8 = undefined;
@@ -320,18 +356,15 @@ pub fn keySchedule(
     ksc[1 .. 1 + Nh].* = psk_id_hash;
     ksc[1 + Nh ..].* = info_hash;
 
-    const secret = suite.labeledExtract(Kdf, suite_id, shared_secret, "secret", psk);
+    var secret: [Kdf.prk_length]u8 = undefined;
 
-    var ctx = Context(Aead, Nh){
-        .key = undefined,
-        .base_nonce = undefined,
-        .seq = 0,
-        .exporter_secret = undefined,
-    };
-    try suite.labeledExpand(Kdf, suite_id, secret, "key", &ksc, &ctx.key);
-    try suite.labeledExpand(Kdf, suite_id, secret, "base_nonce", &ksc, &ctx.base_nonce);
-    try suite.labeledExpand(Kdf, suite_id, secret, "exp", &ksc, &ctx.exporter_secret);
-    return ctx;
+    suite.labeledExtract(Kdf, &secret, suite_id, shared_secret, "secret", psk);
+
+    errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+    out.seq = 0;
+    try suite.labeledExpand(Kdf, suite_id, &secret, "key", &ksc, &out.key);
+    try suite.labeledExpand(Kdf, suite_id, &secret, "base_nonce", &ksc, &out.base_nonce);
+    try suite.labeledExpand(Kdf, suite_id, &secret, "exp", &ksc, &out.exporter_secret);
 }
 
 // ── single-shot base-mode convenience wrappers (RFC 9180 §6.1) ──────────
@@ -387,8 +420,8 @@ pub fn Sealed(comptime Kem: type) type {
 //
 // `setup*S`/`setup*R` are additive: they call the exact same
 // `Kem.encap*`/`Kem.decap*`/`Kem.authEncap*`/`Kem.authDecap*` + `keySchedule`
-// steps the single-shot wrappers already call (see `setupEncapped`/
-// `setupDecapped` below, which `sealEncapped`/`openDecapped` now compose
+// steps the single-shot wrappers already call (see `setupS`/
+// `setupR` below, which `sealOnce`/`openOnce` now compose
 // over too) — no new crypto, just a stopping point one step earlier that
 // hands back the `Context` instead of consuming it.
 
@@ -401,41 +434,65 @@ pub fn Setup(comptime Kem: type, comptime Aead: type, comptime Nh: usize) type {
     return struct { enc: Kem.EncappedKey, context: Context(Aead, Nh) };
 }
 
-/// The post-KEM half of every `setup*S` entry point below: `KeySchedule(mode,
-/// shared_secret, info, psk, psk_id)`, packaged with the `enc` the sender
-/// must transmit. `sealEncapped` (the single-shot `Seal*` wrappers' shared
-/// body, further down) is now a thin wrapper over this plus one
-/// `Context.seal` — see that function's doc comment.
-fn setupEncapped(
+/// Errors of the sender-side `setup*S` (the KEM's `Encap`/`AuthEncap`, then
+/// `KeySchedule`) and the receiver-side `setup*R` (`Decap`/`AuthDecap`, then
+/// `KeySchedule`), and of the single-shot `seal*`/`open*` built on them.
+pub const SetupSError = dhkem.EncapError || KeyScheduleError || suite.LabeledExpandError;
+pub const SetupRError = dhkem.DecapError || KeyScheduleError || suite.LabeledExpandError;
+pub const SealOnceError = SetupSError || SealError;
+pub const OpenOnceError = SetupRError || OpenError;
+
+/// The body of every `setup*S` entry point below: `Encap`/`AuthEncap`
+/// (`skS` non-null selects the auth fold) then `KeySchedule(mode, …)` into
+/// `out`. Runs under the entry point's burn (`burn.run`), so the shared
+/// secret and the key schedule's `secret` die with the burned frames.
+fn setupS(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
-    encapped: Kem.Encapped,
+    out: *Setup(Kem, Aead, Nh),
+    pkR: *const Kem.PublicKey,
+    skS: ?*const Kem.KeyPair,
+    eph: *const Kem.KeyPair,
     mode: suite.Mode,
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
-) !Setup(Kem, Aead, Nh) {
+) SetupSError!void {
+    var encapped: Kem.Encapped = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&encapped));
+    if (skS) |s|
+        try Kem.authEncapDeterministic(&encapped, pkR.*, s, eph)
+    else
+        try Kem.encapDeterministic(&encapped, pkR.*, eph);
     const suite_id = comptime suiteIdOf(Kem, Aead, Nh);
-    const context = try keySchedule(Aead, Nh, mode, &suite_id, &encapped.shared_secret, info, psk, psk_id);
-    return .{ .enc = encapped.enc, .context = context };
+    out.enc = encapped.enc;
+    try keyScheduleBody(Aead, Nh, &out.context, mode, &suite_id, &encapped.shared_secret, info, psk, psk_id);
 }
 
-/// The post-KEM half of every `setup*R` entry point below — the mirror of
-/// `setupEncapped`. `openDecapped` is now a thin wrapper over this plus one
-/// `Context.open`.
-fn setupDecapped(
+/// The body of every `setup*R` entry point below — the mirror of `setupS`
+/// (`pkS` non-null selects `AuthDecap`).
+fn setupR(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
-    shared_secret: [Kem.Nsecret]u8,
+    out: *Context(Aead, Nh),
+    enc: *const Kem.EncappedKey,
+    skR: *const Kem.KeyPair,
+    pkS: ?*const Kem.PublicKey,
     mode: suite.Mode,
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
-) !Context(Aead, Nh) {
+) SetupRError!void {
+    var shared_secret: [Kem.Nsecret]u8 = undefined;
+    defer std.crypto.secureZero(u8, &shared_secret);
+    if (pkS) |p|
+        try Kem.authDecap(&shared_secret, enc.*, skR, p.*)
+    else
+        try Kem.decap(&shared_secret, enc.*, skR);
     const suite_id = comptime suiteIdOf(Kem, Aead, Nh);
-    return keySchedule(Aead, Nh, mode, &suite_id, &shared_secret, info, psk, psk_id);
+    try keyScheduleBody(Aead, Nh, out, mode, &suite_id, &shared_secret, info, psk, psk_id);
 }
 
 /// RFC 9180 §5.1 `SetupBaseS(pkR, info)`: `Encap(pkR)` then
@@ -446,11 +503,15 @@ pub fn setupBaseS(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
     io: std.Io,
     info: []const u8,
-) !Setup(Kem, Aead, Nh) {
-    return setupBaseSDeterministic(Kem, Aead, Nh, pkR, Kem.generateKeyPair(io), info);
+) SetupSError!void {
+    var eph: Kem.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+    Kem.generateKeyPair(&eph, io);
+    return setupBaseSDeterministic(Kem, Aead, Nh, out, pkR, &eph, info);
 }
 
 /// `setupBaseS` with the ephemeral keypair injected instead of drawn from
@@ -460,11 +521,12 @@ pub fn setupBaseSDeterministic(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
-    eph: Kem.KeyPair,
+    eph: *const Kem.KeyPair,
     info: []const u8,
-) !Setup(Kem, Aead, Nh) {
-    return setupEncapped(Kem, Aead, Nh, try Kem.encapDeterministic(pkR, eph), .base, info, "", "");
+) SetupSError!void {
+    return burn.run(burn.kem_burn, SetupSError!void, setupS, .{ Kem, Aead, Nh, out, &pkR, null, eph, .base, info, "", "" });
 }
 
 /// RFC 9180 §5.1 `SetupBaseR(enc, skR, info)` — the receiver mirror of
@@ -475,11 +537,12 @@ pub fn setupBaseR(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Context(Aead, Nh),
     enc: Kem.EncappedKey,
-    skR: Kem.KeyPair,
+    skR: *const Kem.KeyPair,
     info: []const u8,
-) !Context(Aead, Nh) {
-    return setupDecapped(Kem, Aead, Nh, try Kem.decap(enc, skR), .base, info, "", "");
+) SetupRError!void {
+    return burn.run(burn.kem_burn, SetupRError!void, setupR, .{ Kem, Aead, Nh, out, &enc, skR, null, .base, info, "", "" });
 }
 
 /// RFC 9180 §5.1 `SetupPSKS(pkR, info, psk, psk_id)` — `setupBaseS`'s
@@ -490,13 +553,17 @@ pub fn setupPskS(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
     io: std.Io,
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
-) !Setup(Kem, Aead, Nh) {
-    return setupPskSDeterministic(Kem, Aead, Nh, pkR, Kem.generateKeyPair(io), info, psk, psk_id);
+) SetupSError!void {
+    var eph: Kem.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+    Kem.generateKeyPair(&eph, io);
+    return setupPskSDeterministic(Kem, Aead, Nh, out, pkR, &eph, info, psk, psk_id);
 }
 
 /// `setupPskS` with the ephemeral keypair injected — the KAT seam.
@@ -504,13 +571,14 @@ pub fn setupPskSDeterministic(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
-    eph: Kem.KeyPair,
+    eph: *const Kem.KeyPair,
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
-) !Setup(Kem, Aead, Nh) {
-    return setupEncapped(Kem, Aead, Nh, try Kem.encapDeterministic(pkR, eph), .psk, info, psk, psk_id);
+) SetupSError!void {
+    return burn.run(burn.kem_burn, SetupSError!void, setupS, .{ Kem, Aead, Nh, out, &pkR, null, eph, .psk, info, psk, psk_id });
 }
 
 /// RFC 9180 §5.1 `SetupPSKR(enc, skR, info, psk, psk_id)` — the receiver
@@ -519,13 +587,14 @@ pub fn setupPskR(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Context(Aead, Nh),
     enc: Kem.EncappedKey,
-    skR: Kem.KeyPair,
+    skR: *const Kem.KeyPair,
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
-) !Context(Aead, Nh) {
-    return setupDecapped(Kem, Aead, Nh, try Kem.decap(enc, skR), .psk, info, psk, psk_id);
+) SetupRError!void {
+    return burn.run(burn.kem_burn, SetupRError!void, setupR, .{ Kem, Aead, Nh, out, &enc, skR, null, .psk, info, psk, psk_id });
 }
 
 /// RFC 9180 §5.1 `SetupAuthS(pkR, info, skS)` — `setupBaseS`'s auth-mode
@@ -535,12 +604,16 @@ pub fn setupAuthS(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
-    skS: Kem.KeyPair,
+    skS: *const Kem.KeyPair,
     io: std.Io,
     info: []const u8,
-) !Setup(Kem, Aead, Nh) {
-    return setupAuthSDeterministic(Kem, Aead, Nh, pkR, skS, Kem.generateKeyPair(io), info);
+) SetupSError!void {
+    var eph: Kem.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+    Kem.generateKeyPair(&eph, io);
+    return setupAuthSDeterministic(Kem, Aead, Nh, out, pkR, skS, &eph, info);
 }
 
 /// `setupAuthS` with the ephemeral keypair injected — the KAT seam. `eph`
@@ -550,12 +623,13 @@ pub fn setupAuthSDeterministic(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
-    skS: Kem.KeyPair,
-    eph: Kem.KeyPair,
+    skS: *const Kem.KeyPair,
+    eph: *const Kem.KeyPair,
     info: []const u8,
-) !Setup(Kem, Aead, Nh) {
-    return setupEncapped(Kem, Aead, Nh, try Kem.authEncapDeterministic(pkR, skS, eph), .auth, info, "", "");
+) SetupSError!void {
+    return burn.run(burn.kem_burn, SetupSError!void, setupS, .{ Kem, Aead, Nh, out, &pkR, skS, eph, .auth, info, "", "" });
 }
 
 /// RFC 9180 §5.1 `SetupAuthR(enc, skR, info, pkS)` — the receiver mirror of
@@ -564,12 +638,13 @@ pub fn setupAuthR(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Context(Aead, Nh),
     enc: Kem.EncappedKey,
-    skR: Kem.KeyPair,
+    skR: *const Kem.KeyPair,
     pkS: Kem.PublicKey,
     info: []const u8,
-) !Context(Aead, Nh) {
-    return setupDecapped(Kem, Aead, Nh, try Kem.authDecap(enc, skR, pkS), .auth, info, "", "");
+) SetupRError!void {
+    return burn.run(burn.kem_burn, SetupRError!void, setupR, .{ Kem, Aead, Nh, out, &enc, skR, &pkS, .auth, info, "", "" });
 }
 
 /// RFC 9180 §5.1 `SetupAuthPSKS(pkR, info, psk, psk_id, skS)` — both
@@ -579,14 +654,18 @@ pub fn setupAuthPskS(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
-    skS: Kem.KeyPair,
+    skS: *const Kem.KeyPair,
     io: std.Io,
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
-) !Setup(Kem, Aead, Nh) {
-    return setupAuthPskSDeterministic(Kem, Aead, Nh, pkR, skS, Kem.generateKeyPair(io), info, psk, psk_id);
+) SetupSError!void {
+    var eph: Kem.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+    Kem.generateKeyPair(&eph, io);
+    return setupAuthPskSDeterministic(Kem, Aead, Nh, out, pkR, skS, &eph, info, psk, psk_id);
 }
 
 /// `setupAuthPskS` with the ephemeral keypair injected — the KAT seam.
@@ -594,14 +673,15 @@ pub fn setupAuthPskSDeterministic(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
-    skS: Kem.KeyPair,
-    eph: Kem.KeyPair,
+    skS: *const Kem.KeyPair,
+    eph: *const Kem.KeyPair,
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
-) !Setup(Kem, Aead, Nh) {
-    return setupEncapped(Kem, Aead, Nh, try Kem.authEncapDeterministic(pkR, skS, eph), .auth_psk, info, psk, psk_id);
+) SetupSError!void {
+    return burn.run(burn.kem_burn, SetupSError!void, setupS, .{ Kem, Aead, Nh, out, &pkR, skS, eph, .auth_psk, info, psk, psk_id });
 }
 
 /// RFC 9180 §5.1 `SetupAuthPSKR(enc, skR, info, psk, psk_id, pkS)` — the
@@ -610,14 +690,15 @@ pub fn setupAuthPskR(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
+    out: *Context(Aead, Nh),
     enc: Kem.EncappedKey,
-    skR: Kem.KeyPair,
+    skR: *const Kem.KeyPair,
     pkS: Kem.PublicKey,
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
-) !Context(Aead, Nh) {
-    return setupDecapped(Kem, Aead, Nh, try Kem.authDecap(enc, skR, pkS), .auth_psk, info, psk, psk_id);
+) SetupRError!void {
+    return burn.run(burn.kem_burn, SetupRError!void, setupR, .{ Kem, Aead, Nh, out, &enc, skR, &pkS, .auth_psk, info, psk, psk_id });
 }
 
 /// RFC 9180 §6.1 `SealBase(pkR, info, aad, pt)`: `Encap(pkR)` (a
@@ -635,8 +716,11 @@ pub fn sealBase(
     aad: []const u8,
     pt: []const u8,
     out: []u8,
-) !Sealed(Kem) {
-    return sealBaseDeterministic(Kem, Aead, Nh, pkR, Kem.generateKeyPair(io), info, aad, pt, out);
+) SealOnceError!Sealed(Kem) {
+    var eph: Kem.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+    Kem.generateKeyPair(&eph, io);
+    return sealBaseDeterministic(Kem, Aead, Nh, pkR, &eph, info, aad, pt, out);
 }
 
 /// `sealBase` with the ephemeral keypair injected instead of drawn from
@@ -649,13 +733,13 @@ pub fn sealBaseDeterministic(
     comptime Aead: type,
     comptime Nh: usize,
     pkR: Kem.PublicKey,
-    eph: Kem.KeyPair,
+    eph: *const Kem.KeyPair,
     info: []const u8,
     aad: []const u8,
     pt: []const u8,
     out: []u8,
-) !Sealed(Kem) {
-    return sealEncapped(Kem, Aead, Nh, try Kem.encapDeterministic(pkR, eph), .base, info, "", "", aad, pt, out);
+) SealOnceError!Sealed(Kem) {
+    return burn.run(burn.kem_burn, SealOnceError!Sealed(Kem), sealOnce, .{ Kem, Aead, Nh, &pkR, null, eph, .base, info, "", "", aad, pt, out });
 }
 
 /// RFC 9180 §6.1 `OpenBase(enc, skR, info, aad, ct)`: the receiver mirror
@@ -666,13 +750,13 @@ pub fn openBase(
     comptime Aead: type,
     comptime Nh: usize,
     enc: Kem.EncappedKey,
-    skR: Kem.KeyPair,
+    skR: *const Kem.KeyPair,
     info: []const u8,
     aad: []const u8,
     ct: []const u8,
     out: []u8,
-) !void {
-    return openDecapped(Kem, Aead, Nh, try Kem.decap(enc, skR), .base, info, "", "", aad, ct, out);
+) OpenOnceError!void {
+    return burn.run(burn.kem_burn, OpenOnceError!void, openOnce, .{ Kem, Aead, Nh, &enc, skR, null, .base, info, "", "", aad, ct, out });
 }
 
 // ── single-shot psk / auth / auth_psk wrappers (RFC 9180 §6.1) ──────────
@@ -681,7 +765,7 @@ pub fn openBase(
 // OpenAuthPSK as exactly SealBase/OpenBase with (a) the mode byte, (b) the
 // psk/psk_id pair, and (c) the KEM's authenticated fold swapped in. Every
 // one of them is therefore the SAME three-step composition, and they share
-// the `sealEncapped`/`openDecapped` bodies below rather than each carrying
+// the `sealOnce`/`openOnce` bodies below rather than each carrying
 // its own copy of the key-schedule + seal lines — a per-mode copy is
 // precisely where a `mode` argument or a `psk` argument silently goes
 // missing, and (unlike a KAT mismatch) a sender and recipient making the
@@ -693,19 +777,21 @@ pub fn openBase(
 // `psk`/`psk_id` next to the other key-schedule input (`info`). `aad`, `pt`
 // / `ct` and `out` stay last, unchanged.
 
-/// The post-KEM half of every single-shot `Seal*`: `setupEncapped` (§5.1
-/// `KeySchedule`) then exactly ONE `Context.Seal(aad, pt)` — literally
-/// `setup*S` immediately followed by one seal, discarding the `Context`
-/// afterward. `mode`'s consistency with `psk`/`psk_id` is not re-checked
-/// here — `keySchedule` (reached through `setupEncapped`) owns RFC 9180
-/// §5.1's `VerifyPSKInputs` (plus §5.1.2's PSK floor) and rejects a wrong
-/// combination with `KeyScheduleError`, so a duplicate check in each
-/// wrapper would only be a second place to get the rule wrong.
-fn sealEncapped(
+/// The body of every single-shot `Seal*`: `setupS` (§5.1 `KeySchedule`)
+/// then exactly ONE `Context.Seal(aad, pt)` — literally `setup*S`
+/// immediately followed by one seal, the `Context` wiped afterward.
+/// `mode`'s consistency with `psk`/`psk_id` is not re-checked here —
+/// `keySchedule` owns RFC 9180 §5.1's `VerifyPSKInputs` (plus §5.1.2's PSK
+/// floor) and rejects a wrong combination with `KeyScheduleError`, so a
+/// duplicate check in each wrapper would only be a second place to get the
+/// rule wrong.
+fn sealOnce(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
-    encapped: Kem.Encapped,
+    pkR: *const Kem.PublicKey,
+    skS: ?*const Kem.KeyPair,
+    eph: *const Kem.KeyPair,
     mode: suite.Mode,
     info: []const u8,
     psk: []const u8,
@@ -713,19 +799,22 @@ fn sealEncapped(
     aad: []const u8,
     pt: []const u8,
     out: []u8,
-) !Sealed(Kem) {
-    var setup = try setupEncapped(Kem, Aead, Nh, encapped, mode, info, psk, psk_id);
-    try setup.context.seal(aad, pt, out);
+) SealOnceError!Sealed(Kem) {
+    var setup: Setup(Kem, Aead, Nh) = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&setup));
+    try setupS(Kem, Aead, Nh, &setup, pkR, skS, eph, mode, info, psk, psk_id);
+    try setup.context.sealBody(aad, pt, out);
     return .{ .enc = setup.enc };
 }
 
-/// The post-KEM half of every single-shot `Open*` — the mirror of
-/// `sealEncapped`: `setupDecapped` then exactly ONE `Context.Open`.
-fn openDecapped(
+/// The body of every single-shot `Open*` — the mirror of `sealOnce`.
+fn openOnce(
     comptime Kem: type,
     comptime Aead: type,
     comptime Nh: usize,
-    shared_secret: [Kem.Nsecret]u8,
+    enc: *const Kem.EncappedKey,
+    skR: *const Kem.KeyPair,
+    pkS: ?*const Kem.PublicKey,
     mode: suite.Mode,
     info: []const u8,
     psk: []const u8,
@@ -733,9 +822,11 @@ fn openDecapped(
     aad: []const u8,
     ct: []const u8,
     out: []u8,
-) !void {
-    var context = try setupDecapped(Kem, Aead, Nh, shared_secret, mode, info, psk, psk_id);
-    try context.open(aad, ct, out);
+) OpenOnceError!void {
+    var context: Context(Aead, Nh) = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&context));
+    try setupR(Kem, Aead, Nh, &context, enc, skR, pkS, mode, info, psk, psk_id);
+    try context.openBody(aad, ct, out);
 }
 
 /// RFC 9180 §6.1 `SealPSK(pkR, info, aad, pt, psk, psk_id)`: `Encap(pkR)`
@@ -758,8 +849,11 @@ pub fn sealPsk(
     aad: []const u8,
     pt: []const u8,
     out: []u8,
-) !Sealed(Kem) {
-    return sealPskDeterministic(Kem, Aead, Nh, pkR, Kem.generateKeyPair(io), info, psk, psk_id, aad, pt, out);
+) SealOnceError!Sealed(Kem) {
+    var eph: Kem.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+    Kem.generateKeyPair(&eph, io);
+    return sealPskDeterministic(Kem, Aead, Nh, pkR, &eph, info, psk, psk_id, aad, pt, out);
 }
 
 /// `sealPsk` with the ephemeral keypair injected instead of drawn from
@@ -770,15 +864,15 @@ pub fn sealPskDeterministic(
     comptime Aead: type,
     comptime Nh: usize,
     pkR: Kem.PublicKey,
-    eph: Kem.KeyPair,
+    eph: *const Kem.KeyPair,
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
     aad: []const u8,
     pt: []const u8,
     out: []u8,
-) !Sealed(Kem) {
-    return sealEncapped(Kem, Aead, Nh, try Kem.encapDeterministic(pkR, eph), .psk, info, psk, psk_id, aad, pt, out);
+) SealOnceError!Sealed(Kem) {
+    return burn.run(burn.kem_burn, SealOnceError!Sealed(Kem), sealOnce, .{ Kem, Aead, Nh, &pkR, null, eph, .psk, info, psk, psk_id, aad, pt, out });
 }
 
 /// RFC 9180 §6.1 `OpenPSK(enc, skR, info, aad, ct, psk, psk_id)` — the
@@ -791,15 +885,15 @@ pub fn openPsk(
     comptime Aead: type,
     comptime Nh: usize,
     enc: Kem.EncappedKey,
-    skR: Kem.KeyPair,
+    skR: *const Kem.KeyPair,
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
     aad: []const u8,
     ct: []const u8,
     out: []u8,
-) !void {
-    return openDecapped(Kem, Aead, Nh, try Kem.decap(enc, skR), .psk, info, psk, psk_id, aad, ct, out);
+) OpenOnceError!void {
+    return burn.run(burn.kem_burn, OpenOnceError!void, openOnce, .{ Kem, Aead, Nh, &enc, skR, null, .psk, info, psk, psk_id, aad, ct, out });
 }
 
 /// RFC 9180 §6.1 `SealAuth(pkR, info, aad, pt, skS)`: `AuthEncap(pkR, skS)`
@@ -814,14 +908,17 @@ pub fn sealAuth(
     comptime Aead: type,
     comptime Nh: usize,
     pkR: Kem.PublicKey,
-    skS: Kem.KeyPair,
+    skS: *const Kem.KeyPair,
     io: std.Io,
     info: []const u8,
     aad: []const u8,
     pt: []const u8,
     out: []u8,
-) !Sealed(Kem) {
-    return sealAuthDeterministic(Kem, Aead, Nh, pkR, skS, Kem.generateKeyPair(io), info, aad, pt, out);
+) SealOnceError!Sealed(Kem) {
+    var eph: Kem.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+    Kem.generateKeyPair(&eph, io);
+    return sealAuthDeterministic(Kem, Aead, Nh, pkR, skS, &eph, info, aad, pt, out);
 }
 
 /// `sealAuth` with the ephemeral keypair injected — the KAT seam. Note the
@@ -833,14 +930,14 @@ pub fn sealAuthDeterministic(
     comptime Aead: type,
     comptime Nh: usize,
     pkR: Kem.PublicKey,
-    skS: Kem.KeyPair,
-    eph: Kem.KeyPair,
+    skS: *const Kem.KeyPair,
+    eph: *const Kem.KeyPair,
     info: []const u8,
     aad: []const u8,
     pt: []const u8,
     out: []u8,
-) !Sealed(Kem) {
-    return sealEncapped(Kem, Aead, Nh, try Kem.authEncapDeterministic(pkR, skS, eph), .auth, info, "", "", aad, pt, out);
+) SealOnceError!Sealed(Kem) {
+    return burn.run(burn.kem_burn, SealOnceError!Sealed(Kem), sealOnce, .{ Kem, Aead, Nh, &pkR, skS, eph, .auth, info, "", "", aad, pt, out });
 }
 
 /// RFC 9180 §6.1 `OpenAuth(enc, skR, info, aad, ct, pkS)` — the receiver
@@ -853,14 +950,14 @@ pub fn openAuth(
     comptime Aead: type,
     comptime Nh: usize,
     enc: Kem.EncappedKey,
-    skR: Kem.KeyPair,
+    skR: *const Kem.KeyPair,
     pkS: Kem.PublicKey,
     info: []const u8,
     aad: []const u8,
     ct: []const u8,
     out: []u8,
-) !void {
-    return openDecapped(Kem, Aead, Nh, try Kem.authDecap(enc, skR, pkS), .auth, info, "", "", aad, ct, out);
+) OpenOnceError!void {
+    return burn.run(burn.kem_burn, OpenOnceError!void, openOnce, .{ Kem, Aead, Nh, &enc, skR, &pkS, .auth, info, "", "", aad, ct, out });
 }
 
 /// RFC 9180 §6.1 `SealAuthPSK(pkR, info, aad, pt, psk, psk_id, skS)`: both
@@ -873,7 +970,7 @@ pub fn sealAuthPsk(
     comptime Aead: type,
     comptime Nh: usize,
     pkR: Kem.PublicKey,
-    skS: Kem.KeyPair,
+    skS: *const Kem.KeyPair,
     io: std.Io,
     info: []const u8,
     psk: []const u8,
@@ -881,8 +978,11 @@ pub fn sealAuthPsk(
     aad: []const u8,
     pt: []const u8,
     out: []u8,
-) !Sealed(Kem) {
-    return sealAuthPskDeterministic(Kem, Aead, Nh, pkR, skS, Kem.generateKeyPair(io), info, psk, psk_id, aad, pt, out);
+) SealOnceError!Sealed(Kem) {
+    var eph: Kem.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+    Kem.generateKeyPair(&eph, io);
+    return sealAuthPskDeterministic(Kem, Aead, Nh, pkR, skS, &eph, info, psk, psk_id, aad, pt, out);
 }
 
 /// `sealAuthPsk` with the ephemeral keypair injected — the KAT seam.
@@ -891,16 +991,16 @@ pub fn sealAuthPskDeterministic(
     comptime Aead: type,
     comptime Nh: usize,
     pkR: Kem.PublicKey,
-    skS: Kem.KeyPair,
-    eph: Kem.KeyPair,
+    skS: *const Kem.KeyPair,
+    eph: *const Kem.KeyPair,
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
     aad: []const u8,
     pt: []const u8,
     out: []u8,
-) !Sealed(Kem) {
-    return sealEncapped(Kem, Aead, Nh, try Kem.authEncapDeterministic(pkR, skS, eph), .auth_psk, info, psk, psk_id, aad, pt, out);
+) SealOnceError!Sealed(Kem) {
+    return burn.run(burn.kem_burn, SealOnceError!Sealed(Kem), sealOnce, .{ Kem, Aead, Nh, &pkR, skS, eph, .auth_psk, info, psk, psk_id, aad, pt, out });
 }
 
 /// RFC 9180 §6.1 `OpenAuthPSK(enc, skR, info, aad, ct, psk, psk_id, pkS)` —
@@ -911,7 +1011,7 @@ pub fn openAuthPsk(
     comptime Aead: type,
     comptime Nh: usize,
     enc: Kem.EncappedKey,
-    skR: Kem.KeyPair,
+    skR: *const Kem.KeyPair,
     pkS: Kem.PublicKey,
     info: []const u8,
     psk: []const u8,
@@ -919,8 +1019,8 @@ pub fn openAuthPsk(
     aad: []const u8,
     ct: []const u8,
     out: []u8,
-) !void {
-    return openDecapped(Kem, Aead, Nh, try Kem.authDecap(enc, skR, pkS), .auth_psk, info, psk, psk_id, aad, ct, out);
+) OpenOnceError!void {
+    return burn.run(burn.kem_burn, OpenOnceError!void, openOnce, .{ Kem, Aead, Nh, &enc, skR, &pkS, .auth_psk, info, psk, psk_id, aad, ct, out });
 }
 
 // ── tests ─────────────────────────────────────────────────────────────
@@ -952,22 +1052,23 @@ test "keySchedule: VerifyPSKInputs rejects every inconsistent mode/psk combinati
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
     const ss = [_]u8{0x42} ** 32;
+    var ctx: Context(Aes128Gcm, 32) = undefined;
     // base mode with a PSK supplied.
-    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, .base, &suite_id, &ss, "", &test_psk, "some id"));
+    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, &ctx, .base, &suite_id, &ss, "", &test_psk, "some id"));
     // psk mode with no PSK.
-    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", "", ""));
+    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, &ctx, .psk, &suite_id, &ss, "", "", ""));
     // psk without psk_id (and vice versa).
-    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", &test_psk, ""));
-    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", "", "some id"));
+    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, &ctx, .psk, &suite_id, &ss, "", &test_psk, ""));
+    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, &ctx, .psk, &suite_id, &ss, "", "", "some id"));
     // A too-short PSK in an otherwise-CONSISTENT combination is still
     // reported as an inconsistency, not a length problem — the mode/PSK
     // shape rules are checked first (see keySchedule).
-    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, .auth, &suite_id, &ss, "", "short", "some id"));
+    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, &ctx, .auth, &suite_id, &ss, "", "short", "some id"));
     // Consistent combinations construct fine.
-    _ = try keySchedule(Aes128Gcm, 32, .base, &suite_id, &ss, "", "", "");
-    _ = try keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", &test_psk, "some id");
-    _ = try keySchedule(Aes128Gcm, 32, .auth, &suite_id, &ss, "", "", "");
-    _ = try keySchedule(Aes128Gcm, 32, .auth_psk, &suite_id, &ss, "", &test_psk, "some id");
+    try keySchedule(Aes128Gcm, 32, &ctx, .base, &suite_id, &ss, "", "", "");
+    try keySchedule(Aes128Gcm, 32, &ctx, .psk, &suite_id, &ss, "", &test_psk, "some id");
+    try keySchedule(Aes128Gcm, 32, &ctx, .auth, &suite_id, &ss, "", "", "");
+    try keySchedule(Aes128Gcm, 32, &ctx, .auth_psk, &suite_id, &ss, "", &test_psk, "some id");
 }
 
 test "keySchedule: RFC 9180 §5.1.2 PSK floor — a psk shorter than Nh fails closed with error.PskTooShort" {
@@ -979,22 +1080,24 @@ test "keySchedule: RFC 9180 §5.1.2 PSK floor — a psk shorter than Nh fails cl
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
     const ss = [_]u8{0x42} ** 32;
+    var ctx: Context(Aes128Gcm, 32) = undefined;
     for ([_]usize{ 1, 8, 16, 31 }) |n| {
         const short = ([_]u8{0xcd} ** 32)[0..n];
-        try testing.expectError(error.PskTooShort, keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", short, "some id"));
-        try testing.expectError(error.PskTooShort, keySchedule(Aes128Gcm, 32, .auth_psk, &suite_id, &ss, "", short, "some id"));
+        try testing.expectError(error.PskTooShort, keySchedule(Aes128Gcm, 32, &ctx, .psk, &suite_id, &ss, "", short, "some id"));
+        try testing.expectError(error.PskTooShort, keySchedule(Aes128Gcm, 32, &ctx, .auth_psk, &suite_id, &ss, "", short, "some id"));
     }
     // Exactly Nh bytes is accepted (the floor is inclusive) — and the RFC's
     // own Appendix A PSK vectors are exactly 32 bytes, so a stricter floor
     // would reject the spec's own test vectors.
-    _ = try keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", ([_]u8{0xcd} ** 32)[0..32], "some id");
+    try keySchedule(Aes128Gcm, 32, &ctx, .psk, &suite_id, &ss, "", ([_]u8{0xcd} ** 32)[0..32], "some id");
 }
 
 test "Context.seal/.open: round trip, seq advances, tampered ct rejected WITHOUT advancing seq" {
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
     const ss = [_]u8{0x42} ** 32;
-    var sender = try keySchedule(Aes128Gcm, 32, .base, &suite_id, &ss, "seq test", "", "");
+    var sender: Context(Aes128Gcm, 32) = undefined;
+    try keySchedule(Aes128Gcm, 32, &sender, .base, &suite_id, &ss, "seq test", "", "");
     var receiver = sender;
 
     const pt = "attack at dawn";
@@ -1030,7 +1133,8 @@ test "Context.seal/.open: wrong-length out buffer fails closed with error.Invali
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
     const ss = [_]u8{0x42} ** 32;
-    var sender = try keySchedule(Aes128Gcm, 32, .base, &suite_id, &ss, "", "", "");
+    var sender: Context(Aes128Gcm, 32) = undefined;
+    try keySchedule(Aes128Gcm, 32, &sender, .base, &suite_id, &ss, "", "", "");
     var receiver = sender;
 
     const pt = "wrong length out";
@@ -1063,7 +1167,8 @@ test "Context.seal/.open: fail closed at seq == maxInt(u64) BEFORE producing/con
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
     const ss = [_]u8{0x42} ** 32;
-    var ctx = try keySchedule(Aes128Gcm, 32, .base, &suite_id, &ss, "", "", "");
+    var ctx: Context(Aes128Gcm, 32) = undefined;
+    try keySchedule(Aes128Gcm, 32, &ctx, .base, &suite_id, &ss, "", "", "");
     ctx.seq = std.math.maxInt(u64);
     var ct: [1 + Aes128Gcm.tag_length]u8 = undefined;
     try testing.expectError(error.MessageLimitReached, ctx.seal("", "x", &ct));
@@ -1073,43 +1178,45 @@ test "Context.seal/.open: fail closed at seq == maxInt(u64) BEFORE producing/con
 }
 
 test "sealBase -> openBase: end-to-end round trip on fresh random keys (X25519 + AES-128-GCM)" {
-    const dhkem = @import("dhkem.zig");
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const skR = dhkem.X25519Kem.generateKeyPair(io);
+    var skR: dhkem.X25519Kem.KeyPair = undefined;
+
+    dhkem.X25519Kem.generateKeyPair(&skR, io);
     const pt = "one-shot HPKE round trip";
     var ct: [pt.len + Aes128Gcm.tag_length]u8 = undefined;
     const sealed = try sealBase(dhkem.X25519Kem, Aes128Gcm, 32, skR.public_key, io, "round-trip info", "round-trip aad", pt, &ct);
 
     var out: [pt.len]u8 = undefined;
-    try openBase(dhkem.X25519Kem, Aes128Gcm, 32, sealed.enc, skR, "round-trip info", "round-trip aad", &ct, &out);
+    try openBase(dhkem.X25519Kem, Aes128Gcm, 32, sealed.enc, &skR, "round-trip info", "round-trip aad", &ct, &out);
     try testing.expectEqualSlices(u8, pt, &out);
 
     // Mismatched info must fail authentication (different key schedule).
-    try testing.expectError(error.DecryptionFailed, openBase(dhkem.X25519Kem, Aes128Gcm, 32, sealed.enc, skR, "DIFFERENT info", "round-trip aad", &ct, &out));
+    try testing.expectError(error.DecryptionFailed, openBase(dhkem.X25519Kem, Aes128Gcm, 32, sealed.enc, &skR, "DIFFERENT info", "round-trip aad", &ct, &out));
 }
 
 test "sealBase -> openBase: end-to-end round trip on fresh random keys (P-256 + ChaCha20Poly1305)" {
     // Cross-pairing on purpose: exercises the P-256 KEM path and the
     // ChaCha AEAD width (Nk=32) through the same single-shot wrappers.
-    const dhkem = @import("dhkem.zig");
     const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const skR = dhkem.P256Kem.generateKeyPair(io);
+    var skR: dhkem.P256Kem.KeyPair = undefined;
+
+    dhkem.P256Kem.generateKeyPair(&skR, io);
     const pt = "p256 + chacha round trip";
     var ct: [pt.len + ChaCha20Poly1305.tag_length]u8 = undefined;
     const sealed = try sealBase(dhkem.P256Kem, ChaCha20Poly1305, 32, skR.public_key, io, "", "", pt, &ct);
 
     var out: [pt.len]u8 = undefined;
-    try openBase(dhkem.P256Kem, ChaCha20Poly1305, 32, sealed.enc, skR, "", "", &ct, &out);
+    try openBase(dhkem.P256Kem, ChaCha20Poly1305, 32, sealed.enc, &skR, "", "", &ct, &out);
     try testing.expectEqualSlices(u8, pt, &out);
 }
 
@@ -1119,7 +1226,6 @@ test "sealPsk/sealAuth/sealAuthPsk -> matching open: round trip on fresh random 
     // (a round trip alone cannot catch a misreading both sides share).
     // What this test adds is the negative half: each authenticator actually
     // has to match for the open to succeed.
-    const dhkem = @import("dhkem.zig");
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const Kem = dhkem.X25519Kem;
 
@@ -1127,9 +1233,13 @@ test "sealPsk/sealAuth/sealAuthPsk -> matching open: round trip on fresh random 
     defer threaded.deinit();
     const io = threaded.io();
 
-    const skR = Kem.generateKeyPair(io);
-    const skS = Kem.generateKeyPair(io);
-    const wrong_sender = Kem.generateKeyPair(io);
+    var skR: Kem.KeyPair = undefined;
+
+    Kem.generateKeyPair(&skR, io);
+    var skS: Kem.KeyPair = undefined;
+    Kem.generateKeyPair(&skS, io);
+    var wrong_sender: Kem.KeyPair = undefined;
+    Kem.generateKeyPair(&wrong_sender, io);
     const psk_id = "psk id";
     const wrong_psk = [_]u8{0xcd} ** 32;
 
@@ -1140,35 +1250,35 @@ test "sealPsk/sealAuth/sealAuthPsk -> matching open: round trip on fresh random 
     // mode_psk
     {
         const sealed = try sealPsk(Kem, Aes128Gcm, 32, skR.public_key, io, "info", &test_psk, psk_id, "aad", pt, &ct);
-        try openPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, "info", &test_psk, psk_id, "aad", &ct, &out);
+        try openPsk(Kem, Aes128Gcm, 32, sealed.enc, &skR, "info", &test_psk, psk_id, "aad", &ct, &out);
         try testing.expectEqualSlices(u8, pt, &out);
-        try testing.expectError(error.DecryptionFailed, openPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, "info", &wrong_psk, psk_id, "aad", &ct, &out));
-        try testing.expectError(error.DecryptionFailed, openPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, "info", &test_psk, "other id", "aad", &ct, &out));
+        try testing.expectError(error.DecryptionFailed, openPsk(Kem, Aes128Gcm, 32, sealed.enc, &skR, "info", &wrong_psk, psk_id, "aad", &ct, &out));
+        try testing.expectError(error.DecryptionFailed, openPsk(Kem, Aes128Gcm, 32, sealed.enc, &skR, "info", &test_psk, "other id", "aad", &ct, &out));
         // A too-short PSK is rejected by the key schedule before any AEAD work.
         try testing.expectError(error.PskTooShort, sealPsk(Kem, Aes128Gcm, 32, skR.public_key, io, "info", "short", psk_id, "aad", pt, &ct));
     }
 
     // mode_auth
     {
-        const sealed = try sealAuth(Kem, Aes128Gcm, 32, skR.public_key, skS, io, "info", "aad", pt, &ct);
-        try openAuth(Kem, Aes128Gcm, 32, sealed.enc, skR, skS.public_key, "info", "aad", &ct, &out);
+        const sealed = try sealAuth(Kem, Aes128Gcm, 32, skR.public_key, &skS, io, "info", "aad", pt, &ct);
+        try openAuth(Kem, Aes128Gcm, 32, sealed.enc, &skR, skS.public_key, "info", "aad", &ct, &out);
         try testing.expectEqualSlices(u8, pt, &out);
         // Wrong sender public key: the whole point of the mode.
-        try testing.expectError(error.DecryptionFailed, openAuth(Kem, Aes128Gcm, 32, sealed.enc, skR, wrong_sender.public_key, "info", "aad", &ct, &out));
+        try testing.expectError(error.DecryptionFailed, openAuth(Kem, Aes128Gcm, 32, sealed.enc, &skR, wrong_sender.public_key, "info", "aad", &ct, &out));
         // And base-mode open must NOT accept an auth-mode ciphertext.
-        try testing.expectError(error.DecryptionFailed, openBase(Kem, Aes128Gcm, 32, sealed.enc, skR, "info", "aad", &ct, &out));
+        try testing.expectError(error.DecryptionFailed, openBase(Kem, Aes128Gcm, 32, sealed.enc, &skR, "info", "aad", &ct, &out));
     }
 
     // mode_auth_psk
     {
-        const sealed = try sealAuthPsk(Kem, Aes128Gcm, 32, skR.public_key, skS, io, "info", &test_psk, psk_id, "aad", pt, &ct);
-        try openAuthPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, skS.public_key, "info", &test_psk, psk_id, "aad", &ct, &out);
+        const sealed = try sealAuthPsk(Kem, Aes128Gcm, 32, skR.public_key, &skS, io, "info", &test_psk, psk_id, "aad", pt, &ct);
+        try openAuthPsk(Kem, Aes128Gcm, 32, sealed.enc, &skR, skS.public_key, "info", &test_psk, psk_id, "aad", &ct, &out);
         try testing.expectEqualSlices(u8, pt, &out);
-        try testing.expectError(error.DecryptionFailed, openAuthPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, wrong_sender.public_key, "info", &test_psk, psk_id, "aad", &ct, &out));
-        try testing.expectError(error.DecryptionFailed, openAuthPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, skS.public_key, "info", &wrong_psk, psk_id, "aad", &ct, &out));
+        try testing.expectError(error.DecryptionFailed, openAuthPsk(Kem, Aes128Gcm, 32, sealed.enc, &skR, wrong_sender.public_key, "info", &test_psk, psk_id, "aad", &ct, &out));
+        try testing.expectError(error.DecryptionFailed, openAuthPsk(Kem, Aes128Gcm, 32, sealed.enc, &skR, skS.public_key, "info", &wrong_psk, psk_id, "aad", &ct, &out));
         // auth (no PSK) must not open an auth_psk ciphertext: different mode
         // byte in key_schedule_context, hence a different key.
-        try testing.expectError(error.DecryptionFailed, openAuth(Kem, Aes128Gcm, 32, sealed.enc, skR, skS.public_key, "info", "aad", &ct, &out));
+        try testing.expectError(error.DecryptionFailed, openAuth(Kem, Aes128Gcm, 32, sealed.enc, &skR, skS.public_key, "info", "aad", &ct, &out));
     }
 }
 
@@ -1176,7 +1286,6 @@ test "single-shot wrappers: P-256 + ChaCha20Poly1305 cross-pairing round-trips i
     // Same cross-pairing rationale as the base-mode P-256/ChaCha test above:
     // proves the wrappers are generic over the KEM's key widths (Npk=65) and
     // the AEAD's key width (Nk=32), not accidentally X25519/AES-specific.
-    const dhkem = @import("dhkem.zig");
     const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
     const Kem = dhkem.P256Kem;
 
@@ -1184,21 +1293,24 @@ test "single-shot wrappers: P-256 + ChaCha20Poly1305 cross-pairing round-trips i
     defer threaded.deinit();
     const io = threaded.io();
 
-    const skR = Kem.generateKeyPair(io);
-    const skS = Kem.generateKeyPair(io);
+    var skR: Kem.KeyPair = undefined;
+
+    Kem.generateKeyPair(&skR, io);
+    var skS: Kem.KeyPair = undefined;
+    Kem.generateKeyPair(&skS, io);
     const pt = "p256 + chacha, non-base modes";
     var ct: [pt.len + ChaCha20Poly1305.tag_length]u8 = undefined;
     var out: [pt.len]u8 = undefined;
 
     const s1 = try sealPsk(Kem, ChaCha20Poly1305, 32, skR.public_key, io, "", &test_psk, "id", "", pt, &ct);
-    try openPsk(Kem, ChaCha20Poly1305, 32, s1.enc, skR, "", &test_psk, "id", "", &ct, &out);
+    try openPsk(Kem, ChaCha20Poly1305, 32, s1.enc, &skR, "", &test_psk, "id", "", &ct, &out);
     try testing.expectEqualSlices(u8, pt, &out);
 
-    const s2 = try sealAuth(Kem, ChaCha20Poly1305, 32, skR.public_key, skS, io, "", "", pt, &ct);
-    try openAuth(Kem, ChaCha20Poly1305, 32, s2.enc, skR, skS.public_key, "", "", &ct, &out);
+    const s2 = try sealAuth(Kem, ChaCha20Poly1305, 32, skR.public_key, &skS, io, "", "", pt, &ct);
+    try openAuth(Kem, ChaCha20Poly1305, 32, s2.enc, &skR, skS.public_key, "", "", &ct, &out);
     try testing.expectEqualSlices(u8, pt, &out);
 
-    const s3 = try sealAuthPsk(Kem, ChaCha20Poly1305, 32, skR.public_key, skS, io, "", &test_psk, "id", "", pt, &ct);
-    try openAuthPsk(Kem, ChaCha20Poly1305, 32, s3.enc, skR, skS.public_key, "", &test_psk, "id", "", &ct, &out);
+    const s3 = try sealAuthPsk(Kem, ChaCha20Poly1305, 32, skR.public_key, &skS, io, "", &test_psk, "id", "", pt, &ct);
+    try openAuthPsk(Kem, ChaCha20Poly1305, 32, s3.enc, &skR, skS.public_key, "", &test_psk, "id", "", &ct, &out);
     try testing.expectEqualSlices(u8, pt, &out);
 }

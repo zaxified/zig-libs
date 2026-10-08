@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the ECDSA P-256 sealer/signer
+  moved off `std.crypto.sign.ecdsa.EcdsaP256Sha256` onto `p256.EcdsaP256Sha256` (burned wrapper). Measured
+  BEFORE with the new `src/stackprobe_test.zig` (ReleaseFast, per 5 calls, `goose.build` and
+  `acse.signToken` alike): the private key `d` 65 times, the nonce `k` 20, `k⁻¹` 20, `r·d` 10, `e+r·d` 10,
+  down to 31 KiB below the call — `k` next to the published signature is the private key. After: 0 residues
+  in both calls (negative control 0, positive control found). API: `Sealer.ecdsa_p256_sha256.key_pair` and
+  `Signer.ecdsa_p256_sha256.key_pair` are now `*const EcdsaP256.KeyPair` (was the pair by value, copied through
+  `build` → `buildWithTagBuf` → `seal` and `signToken`'s by-value `Signer`); the pair must outlive the call.
+  `KeyPair` is p256's type (same fields as std's); build it with `generateDeterministicInto` /
+  `fromSecretKeyInto`. The `rsa_pss_sha256` key is still carried by value (rsa's concern, unchanged).
+
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the ACSE and GOOSE RSA-PSS signers pass the key to
   `rsa.signPss` by pointer, and the test key fixtures build through rsa's out-param constructors
   (rsa 2026-10-08).

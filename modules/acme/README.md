@@ -56,10 +56,12 @@ var transport = http.Client.init(io, gpa, .{});
 defer transport.deinit();
 
 // The account key IS the account identity — generate once, persist:
-const account_key = acme.jws.generateKeyPair(io); // fail-closed; NOT std's KeyPair.generate
+var account_key: acme.jws.KeyPair = undefined;
+acme.jws.generateKeyPair(&account_key, io); // fail-closed; NOT std's KeyPair.generate
+defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
 // persist: acme.x509.ecPrivateKeyToPem / load: acme.x509.ecPrivateKeyFromPem
 
-var client = acme.Client.init(io, gpa, &transport, account_key, .{
+var client = acme.Client.init(io, gpa, &transport, &account_key, .{
     .contact = &.{"mailto:ops@example.org"},
     // staging by default; production is explicit (see above)
 });
@@ -103,7 +105,7 @@ const Zone = struct {
         _ = .{ ctx, name, value }; // remove exactly that value
     }
 };
-var client = acme.Client.init(io, gpa, &http_client, account_key, .{
+var client = acme.Client.init(io, gpa, &http_client, &account_key, .{
     .challenge_type = .dns_01,
     .dns_publisher = .{ .present = Zone.present, .cleanup = Zone.cleanup },
 });
@@ -135,7 +137,7 @@ up and serve that certificate under that ALPN protocol — running that
 listener is app-side (out of scope for this module):
 
 ```zig
-var client = acme.Client.init(io, gpa, &transport, account_key, .{
+var client = acme.Client.init(io, gpa, &transport, &account_key, .{
     .challenge_type = .tls_alpn_01,
 });
 defer client.deinit();

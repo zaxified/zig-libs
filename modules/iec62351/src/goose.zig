@@ -100,7 +100,10 @@ const ber = @import("ber.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
-const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+/// p256's burned wrapper, not std's: std's signer leaves the private key and
+/// the nonce on the dead stack after every signature (measured 2026-10-08,
+/// `stackprobe_test.zig`).
+const EcdsaP256 = @import("p256").EcdsaP256Sha256;
 
 // ── frame geometry ──────────────────────────────────────────────────────────
 
@@ -681,7 +684,10 @@ pub const Sealer = union(enum) {
     /// ECDSA over P-256 with SHA-256, fixed-width (r‖s) 64-octet signature.
     /// Not in the 2007 profile — offered because 62351-4's end-to-end profile
     /// lists `ecdsa-with-SHA256` and the same domain is signed either way.
-    ecdsa_p256_sha256: struct { key_pair: EcdsaP256.KeyPair, noise: ?[EcdsaP256.noise_length]u8 = null },
+    /// The key pair is held by pointer so that no copy of the private key lands
+    /// in `build`'s frames (a `Sealer` travels by value through three of them);
+    /// it must outlive the `build` call.
+    ecdsa_p256_sha256: struct { key_pair: *const EcdsaP256.KeyPair, noise: ?[EcdsaP256.noise_length]u8 = null },
     raw: RawSealer,
 
     /// Tag length this sealer produces. Needed *before* sealing, because the
@@ -1426,14 +1432,16 @@ test "RSASSA-PSS/SHA-256 signature profile round-trips and rejects tampering" {
 
 test "ECDSA P-256/SHA-256 signature profile round-trips and rejects tampering" {
     const seed = [_]u8{0x17} ** EcdsaP256.KeyPair.seed_length;
-    const kp = EcdsaP256.KeyPair.generateDeterministic(seed) catch unreachable;
+    var kp: EcdsaP256.KeyPair = undefined;
+    EcdsaP256.KeyPair.generateDeterministicInto(&kp, &seed) catch unreachable;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
 
     var out: [512]u8 = undefined;
     const frame_bytes = try build(&out, .{
         .appid = 0x3003,
         .apdu = &sample_apdu,
         .auth = .{ .key_id = 9, .tag = &.{} },
-    }, .{ .ecdsa_p256_sha256 = .{ .key_pair = kp, .noise = [_]u8{0x5c} ** EcdsaP256.noise_length } });
+    }, .{ .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = [_]u8{0x5c} ** EcdsaP256.noise_length } });
 
     const r = try verify(frame_bytes, .ed2020, .{ .ecdsa_p256_sha256 = kp.public_key });
     try testing.expectEqual(@as(usize, 64), r.tag.len);

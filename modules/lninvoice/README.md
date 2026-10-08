@@ -82,7 +82,7 @@ const str = try lninvoice.encode(allocator, .{
         break :blk @intCast(ts.sec);
     },
     .fields = &fields,
-}, .{ .private_key = my_privkey });
+}, .{ .private_key = &my_privkey });
 defer allocator.free(str);
 
 // -- BOLT#12: decode an offer (parse only, unsigned) --

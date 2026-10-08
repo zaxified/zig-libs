@@ -51,25 +51,27 @@ fn goodKeyEntries(pk: *const ctap2pin.PublicKey) [5]MapEntry {
 }
 
 fn authKey() ctap2pin.PublicKey {
-    return ctap2pin.publicKeyFromScalar(auth_scalar) catch unreachable;
+    return ctap2pin.publicKeyFromScalar(&auth_scalar) catch unreachable;
 }
 
 /// `00 || {2: enc(token)}` under the secret both sides derive from the fixed scalars.
 fn tokenResp(protocol: ctap2pin.Protocol, token: []const u8) ![]u8 {
-    const platform_pub = try ctap2pin.publicKeyFromScalar(platform_scalar);
+    const platform_pub = try ctap2pin.publicKeyFromScalar(&platform_scalar);
     var ct: [64]u8 = undefined;
     var n: usize = 0;
     switch (protocol) {
         .one => {
-            const e = try ctap2pin.One.encapsulate(auth_scalar, platform_pub);
-            try ctap2pin.One.encrypt(e.shared_secret, ct[0..token.len], token);
+            var e: ctap2pin.One.Encaps = undefined;
+            try ctap2pin.One.encapsulate(&e, &auth_scalar, platform_pub);
+            try ctap2pin.One.encrypt(&e.shared_secret, ct[0..token.len], token);
             n = token.len;
         },
         .two => {
-            const e = try ctap2pin.Two.encapsulate(auth_scalar, platform_pub);
+            var e: ctap2pin.Two.Encaps = undefined;
+            try ctap2pin.Two.encapsulate(&e, &auth_scalar, platform_pub);
             const iv: [16]u8 = @splat(7);
             n = ctap2pin.Two.encryptedLength(token.len);
-            try ctap2pin.Two.encrypt(e.shared_secret, iv, ct[0..n], token);
+            try ctap2pin.Two.encrypt(&e.shared_secret, iv, ct[0..n], token);
         },
     }
     const entries = [_]MapEntry{.{ .key = .{ .uint = 2 }, .value = .{ .bytes = ct[0..n] } }};

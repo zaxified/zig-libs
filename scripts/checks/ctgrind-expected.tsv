@@ -792,12 +792,12 @@ adaptor	ReleaseFast	extract	1	3	7d366f432911736c	76dc1be38fd7746f
 # combMulBaseFastWithTable, isBasePointRepr — now under `P256.mulUnburned` instead of an
 # inlined `P256.mul`; the contexts whose top frame was the inlined `P256.mul` itself are
 # gone because `mul` is now a branch-free wrapper. No new class, no new file.
-spake2plus	ReleaseFast	w0w1	1	4	7adcd93a7e0fa428	5530136493ed4097
-spake2plus	ReleaseFast	computel	1	3	7adcd93a7e0fa428	37d06a2f53487905
-spake2plus	ReleaseFast	proverstart	1	6	7adcd93a7e0fa428	5b3e4131495365d6
-spake2plus	ReleaseFast	verifierstart	1	6	7adcd93a7e0fa428	ce61814fc8e1b2b7
-spake2plus	ReleaseFast	proverfinish	1	9	7adcd93a7e0fa428	5cdf0fe20429a208
-spake2plus	ReleaseFast	verifierfinish	1	7	7adcd93a7e0fa428	dbdff43379a90cf5
+spake2plus	ReleaseFast	w0w1	1	4	5fc46cbd1c34d900	5530136493ed4097
+spake2plus	ReleaseFast	computel	1	3	5fc46cbd1c34d900	37d06a2f53487905
+spake2plus	ReleaseFast	proverstart	1	6	5fc46cbd1c34d900	5b3e4131495365d6
+spake2plus	ReleaseFast	verifierstart	1	6	5fc46cbd1c34d900	ce61814fc8e1b2b7
+spake2plus	ReleaseFast	proverfinish	1	9	5fc46cbd1c34d900	5cdf0fe20429a208
+spake2plus	ReleaseFast	verifierfinish	1	7	5fc46cbd1c34d900	dbdff43379a90cf5
 # bbs proofgen 9 -> 15 (re-pin 2026-10-06, draft-04 -> draft-12): the proof gained
 # two public points (D, T2) -- serialized into the challenge (bbs.zig:387, 5 points
 # now), made affine (:632-634, :640) and encoded (:153 via :653) -- plus the
@@ -808,13 +808,13 @@ bbs	ReleaseFast	proofgen	1	15	834e6ec3418616b7	464ac571cf1943c2
 coconut	ReleaseFast	authority_sign	1	2	5dad63b38553aba7	3492f1201b641f09
 coconut	ReleaseFast	user_issue	1	21	a6281f1d04b2a243	af24664cb307a403
 coconut	ReleaseFast	user_show	1	27	5dad63b38553aba7	286e5ea12d924b29
-hpke	ReleaseFast	x25519_decap	1	1	ceef922c5fee3703	c0cee0a8c6bf72c3
-hpke	ReleaseFast	x25519_authdecap	1	2	ceef922c5fee3703	05af25d1d0e3943d
-hpke	ReleaseFast	p256_decap	1	1	ceef922c5fee3703	851ee3406999dacc
-hpke	ReleaseFast	p256_authdecap	1	2	ceef922c5fee3703	4b0f0c964acb8411
-hpke	ReleaseFast	p384_decap	1	2	ceef922c5fee3703	6b70bba9cc229a39
-hpke	ReleaseFast	p384_authdecap	1	4	ceef922c5fee3703	2741ac2ff5069767
-hpke	ReleaseFast	open	1	1	cd2271d9a14497cf	59883c70dcd08ee6
+hpke	ReleaseFast	x25519_decap	1	1	70580704771bebd1	c0cee0a8c6bf72c3
+hpke	ReleaseFast	x25519_authdecap	1	2	70580704771bebd1	05af25d1d0e3943d
+hpke	ReleaseFast	p256_decap	1	1	70580704771bebd1	851ee3406999dacc
+hpke	ReleaseFast	p256_authdecap	1	2	70580704771bebd1	4b0f0c964acb8411
+hpke	ReleaseFast	p384_decap	1	2	70580704771bebd1	6b70bba9cc229a39
+hpke	ReleaseFast	p384_authdecap	1	4	70580704771bebd1	2741ac2ff5069767
+hpke	ReleaseFast	open	1	1	20613c6a01ac63e7	59883c70dcd08ee6
 signal	ReleaseFast	sign	1	1	0b85e553109d6bbe	b2a0053066d93a75
 signal	ReleaseFast	ratchet	1	2	dc09967e5dddb5c2	92ab00fad0ce5c41
 # sphinx construct 10 -> 8 (re-pin 2026-09-15): its two ECDH `k256.mul` calls
@@ -840,10 +840,10 @@ bolt3	ReleaseFast	derive	1	8	52ab0dff277b351b	c0fc92c5fbd8fb55
 bolt3	ReleaseFast	revocation	1	10	52ab0dff277b351b	bc9bf12a55a312c4
 bolt3	ReleaseFast	shachain	1	0	52ab0dff277b351b	0516122e43713a52
 bolt3	ReleaseFast	shachain_index	1	1	52ab0dff277b351b	21055013990ce08a
-ctap2pin	ReleaseFast	ecdh	1	3	6327ad34d43a8fe8	4596df5a3f29ae3b
-ctap2pin	ReleaseFast	one	1	6	6327ad34d43a8fe8	12de2588e792c80e
-ctap2pin	ReleaseFast	two	1	6	6327ad34d43a8fe8	4f76909ff534c3cc
-ctap2pin	ReleaseFast	token	1	0	6327ad34d43a8fe8	076a3a6729a924b0
+ctap2pin	ReleaseFast	ecdh	1	3	6b900732a0820e66	4596df5a3f29ae3b
+ctap2pin	ReleaseFast	one	1	6	6b900732a0820e66	12de2588e792c80e
+ctap2pin	ReleaseFast	two	1	6	6b900732a0820e66	4f76909ff534c3cc
+ctap2pin	ReleaseFast	token	1	0	6b900732a0820e66	076a3a6729a924b0
 fss	ReleaseFast	gen	1	0	3a5ad9154e5aa436	b40b02f9cf423f05
 # Was `>=1` and a confirmed defect: `dpf.zig:326`'s xorMasked compiled to
 # `test $0x1,%r9b` / `je` on the secret control bit at THIS call site while

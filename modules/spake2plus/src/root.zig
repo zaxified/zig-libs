@@ -127,6 +127,7 @@ const std = @import("std");
 const P256 = @import("p256").P256;
 const scalar_mod = P256.scalar;
 const Scalar = scalar_mod.Scalar;
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -243,26 +244,56 @@ pub fn hash(msg: []const u8) [hash_length]u8 {
 /// MAC(K_confirmP, shareV)`, `confirmV = MAC(K_confirmV, shareP)`, RFC
 /// 9383 §3.4) and, transitively, inside `kdf` below (HKDF is built on
 /// HMAC).
+///
+/// The tag is returned by value because it is the PUBLIC confirmation
+/// message (`confirmP`/`confirmV`) when `key` is a confirmation key and
+/// `msg` the peer's share; the HMAC key pads, however, are derived from the
+/// secret `key`, so the body runs under a burn. Internal callers use
+/// `macInto` and wipe a tag that did not verify (it would be a valid forgery
+/// for the peer's confirmation).
 pub fn mac(key: []const u8, msg: []const u8) [hash_length]u8 {
+    return burn.run(burn.hash_burn, [hash_length]u8, macBody, .{ key, msg });
+}
+
+noinline fn macBody(key: []const u8, msg: []const u8) [hash_length]u8 {
     var out: [hash_length]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&out, msg, key);
+    macInto(&out, key, msg);
     return out;
+}
+
+fn macInto(out: *[hash_length]u8, key: []const u8, msg: []const u8) void {
+    std.crypto.auth.hmac.sha2.HmacSha256.create(out, msg, key);
 }
 
 /// `KDF(salt, IKM, info)` for this ciphersuite: HKDF-SHA256 (RFC 9383
 /// §4's `KDF` column), Extract-then-Expand (RFC 5869). REAL — a thin
 /// composition of `std.crypto.kdf.hkdf.HkdfSha256.extract`/`.expand`;
-/// `len` is comptime so the caller gets a value type back, matching the
-/// fixed-size outputs `deriveKeys` needs (64 bytes for the
+/// `len` is comptime so the output buffer is a fixed-size array, matching
+/// the fixed-size outputs `deriveKeys` needs (64 bytes for the
 /// `K_confirmP || K_confirmV` pair, 32 bytes for `K_shared`). RFC 9383
 /// §3.4/§3.5 always calls this with `salt = nil` (the empty string, NOT
 /// omitted — HKDF-Extract still runs, with an empty-string salt) — every
 /// call site in this module passes `""` for `salt`.
-pub fn kdf(comptime len: usize, salt: []const u8, ikm: []const u8, info: []const u8) [len]u8 {
-    var out: [len]u8 = undefined;
+///
+/// The derived key goes into `out` (never a return value: the temporary of a
+/// by-value result lives in the caller's frame and is never wiped), and the
+/// body — PRK and HMAC state — runs under a burn.
+pub fn kdf(comptime len: usize, out: *[len]u8, salt: []const u8, ikm: []const u8, info: []const u8) void {
+    burn.run(burn.hash_burn, void, KdfBody(len).f, .{ out, salt, ikm, info });
+}
+
+fn KdfBody(comptime len: usize) type {
+    return struct {
+        noinline fn f(out: *[len]u8, salt: []const u8, ikm: []const u8, info: []const u8) void {
+            kdfInto(len, out, salt, ikm, info);
+        }
+    };
+}
+
+/// `kdf` without its own burn, for callers that already run under one.
+fn kdfInto(comptime len: usize, out: *[len]u8, salt: []const u8, ikm: []const u8, info: []const u8) void {
     const prk = std.crypto.kdf.hkdf.HkdfSha256.extract(salt, ikm);
-    std.crypto.kdf.hkdf.HkdfSha256.expand(&out, info, prk);
-    return out;
+    std.crypto.kdf.hkdf.HkdfSha256.expand(out, info, prk);
 }
 
 // ── transcript encoder (RFC 9383 §3.4 / Appendix A.3) — REAL ───────────
@@ -310,6 +341,11 @@ pub fn kdf(comptime len: usize, salt: []const u8, ikm: []const u8, info: []const
 /// vector's published `TT` (570 bytes for that vector) — see
 /// `kat_test.zig`'s "REAL TODAY" section, which passes right now, with
 /// no core implemented (this function has no stub dependency).
+///
+/// `z`, `v` and `w0` are SECRET (the transcript is a one-call pre-image of
+/// `K_shared`), so they are taken by pointer and the copy into the returned
+/// buffer is the only one; the body runs under a burn. The result is
+/// allocator-owned and secret: the caller wipes it before freeing.
 pub fn computeTranscript(
     allocator: std.mem.Allocator,
     context: []const u8,
@@ -317,9 +353,23 @@ pub fn computeTranscript(
     id_verifier: []const u8,
     share_p: [share_length]u8,
     share_v: [share_length]u8,
-    z: [share_length]u8,
-    v: [share_length]u8,
-    w0: [scalar_length]u8,
+    z: *const [share_length]u8,
+    v: *const [share_length]u8,
+    w0: *const [scalar_length]u8,
+) std.mem.Allocator.Error![]u8 {
+    return burn.run(burn.hash_burn, std.mem.Allocator.Error![]u8, transcriptBody, .{ allocator, context, id_prover, id_verifier, &share_p, &share_v, z, v, w0 });
+}
+
+noinline fn transcriptBody(
+    allocator: std.mem.Allocator,
+    context: []const u8,
+    id_prover: []const u8,
+    id_verifier: []const u8,
+    share_p: *const [share_length]u8,
+    share_v: *const [share_length]u8,
+    z: *const [share_length]u8,
+    v: *const [share_length]u8,
+    w0: *const [scalar_length]u8,
 ) std.mem.Allocator.Error![]u8 {
     const m_bytes = mPoint().toUncompressedSec1();
     const n_bytes = nPoint().toUncompressedSec1();
@@ -342,11 +392,11 @@ pub fn computeTranscript(
     offset = writeField(out, offset, id_verifier);
     offset = writeField(out, offset, &m_bytes);
     offset = writeField(out, offset, &n_bytes);
-    offset = writeField(out, offset, &share_p);
-    offset = writeField(out, offset, &share_v);
-    offset = writeField(out, offset, &z);
-    offset = writeField(out, offset, &v);
-    offset = writeField(out, offset, &w0);
+    offset = writeField(out, offset, share_p);
+    offset = writeField(out, offset, share_v);
+    offset = writeField(out, offset, z);
+    offset = writeField(out, offset, v);
+    offset = writeField(out, offset, w0);
     std.debug.assert(offset == total);
     return out;
 }
@@ -357,7 +407,7 @@ pub fn computeTranscript(
 /// Free a transcript this module allocated and never hands to the caller —
 /// `verifierConfirm`'s, and either `*Finish`'s on `ConfirmationMismatch`.
 /// `TT` ends in `w0` and is a one-call pre-image of `K_shared`
-/// (`deriveKeys(tt).k_shared`), so it is zeroed before the memory goes back:
+/// (`deriveKeys(&keys, tt)`, then `keys.k_shared`), so it is zeroed before the memory goes back:
 /// `Allocator.free` only overwrites it in safe modes, never in ReleaseFast.
 /// The `tt` a successful `*Finish` returns is the caller's to wipe (see
 /// SPEC § "Threat model").
@@ -423,18 +473,28 @@ pub const ComputeW0W1Error = error{
 /// here — via `group_order`/`Scalar.fromBytes48`'s own well-defined
 /// semantics — so a correct implementation is unambiguous even without
 /// a published KAT.
-pub fn computeW0W1(pbkdf_output: []const u8) ComputeW0W1Error!W0W1 {
-    if (pbkdf_output.len != 80) return error.InvalidPbkdfOutputLength;
+///
+/// `pbkdf_output` is the password-derived material: taken by slice (a
+/// pointer), and the wide-reduction scratch and the `Scalar`s live in the
+/// body's frame, which the entry point burns. The scalars go into `out`
+/// (never a return value); `out` is zeroed on error.
+pub fn computeW0W1(out: *W0W1, pbkdf_output: []const u8) ComputeW0W1Error!void {
+    return burn.run(burn.hash_burn, ComputeW0W1Error!void, computeW0W1Body, .{ out, pbkdf_output });
+}
+
+noinline fn computeW0W1Body(out: *W0W1, pbkdf_output: []const u8) ComputeW0W1Error!void {
+    if (pbkdf_output.len != 80) {
+        std.crypto.secureZero(u8, std.mem.asBytes(out));
+        return error.InvalidPbkdfOutputLength;
+    }
     // Each 40-byte big-endian half, zero-padded with 8 LEADING zero
     // bytes to 48, then wide-reduced mod p via Scalar.fromBytes48 (the
     // widen-and-wide-reduce pattern — see the doc comment above).
-    var out: W0W1 = undefined;
     var wide = [_]u8{0} ** 48;
     @memcpy(wide[8..48], pbkdf_output[0..40]);
     out.w0 = Scalar.fromBytes48(wide, .big).toBytes(.big);
     @memcpy(wide[8..48], pbkdf_output[40..80]);
     out.w1 = Scalar.fromBytes48(wide, .big).toBytes(.big);
-    return out;
 }
 
 pub const ComputeLError = error{
@@ -458,11 +518,19 @@ pub const ComputeLError = error{
 ///
 /// Byte-exact target: RFC 9383 Appendix C's official P-256/SHA-256
 /// vector's published `L` (`kat_test.zig`).
-pub fn computeL(w1: [scalar_length]u8) ComputeLError![share_length]u8 {
+///
+/// `w1` is taken by pointer; the multiply is `P256.mulInto` (constant-time,
+/// burned) and the body runs under a burn. `L` is public and returned.
+pub fn computeL(w1: *const [scalar_length]u8) ComputeLError![share_length]u8 {
+    return burn.run(burn.core_burn, ComputeLError![share_length]u8, computeLBody, .{w1});
+}
+
+noinline fn computeLBody(w1: *const [scalar_length]u8) ComputeLError![share_length]u8 {
     // Canonical range check (rejects w1 >= p); zero is canonical but
     // yields the identity, which mul itself rejects below.
-    scalar_mod.rejectNonCanonical(w1, .big) catch return error.InvalidScalar;
-    const l = P256.basePoint.mul(w1, .big) catch return error.InvalidScalar;
+    scalar_mod.rejectNonCanonical(w1.*, .big) catch return error.InvalidScalar;
+    var l: P256 = undefined;
+    P256.basePoint.mulInto(&l, w1, .big) catch return error.InvalidScalar;
     return l.toUncompressedSec1();
 }
 
@@ -498,11 +566,21 @@ pub const ProverStartError = error{
 ///
 /// Byte-exact target: RFC 9383 Appendix C's official vector's published
 /// `shareP` (`kat_test.zig`).
-pub fn proverStart(x: [scalar_length]u8, w0: [scalar_length]u8) ProverStartError![share_length]u8 {
-    scalar_mod.rejectNonCanonical(x, .big) catch return error.InvalidScalar;
-    scalar_mod.rejectNonCanonical(w0, .big) catch return error.InvalidScalar;
-    const x_p = P256.basePoint.mul(x, .big) catch return error.InvalidScalar;
-    const w0_m = mPoint().mul(w0, .big) catch return error.InvalidScalar;
+///
+/// `x` and `w0` are taken by pointer; both multiplies are `P256.mulInto`
+/// (constant-time, burned) and the body runs under a burn. `X` is public and
+/// returned.
+pub fn proverStart(x: *const [scalar_length]u8, w0: *const [scalar_length]u8) ProverStartError![share_length]u8 {
+    return burn.run(burn.core_burn, ProverStartError![share_length]u8, proverStartBody, .{ x, w0 });
+}
+
+noinline fn proverStartBody(x: *const [scalar_length]u8, w0: *const [scalar_length]u8) ProverStartError![share_length]u8 {
+    scalar_mod.rejectNonCanonical(x.*, .big) catch return error.InvalidScalar;
+    scalar_mod.rejectNonCanonical(w0.*, .big) catch return error.InvalidScalar;
+    var x_p: P256 = undefined;
+    var w0_m: P256 = undefined;
+    P256.basePoint.mulInto(&x_p, x, .big) catch return error.InvalidScalar;
+    mPoint().mulInto(&w0_m, w0, .big) catch return error.InvalidScalar;
     const share = x_p.add(w0_m);
     share.rejectIdentity() catch return error.InvalidScalar;
     return share.toUncompressedSec1();
@@ -535,11 +613,19 @@ pub const VerifierStartError = error{
 ///
 /// Byte-exact target: RFC 9383 Appendix C's official vector's published
 /// `shareV` (`kat_test.zig`).
-pub fn verifierStart(y: [scalar_length]u8, w0: [scalar_length]u8) VerifierStartError![share_length]u8 {
-    scalar_mod.rejectNonCanonical(y, .big) catch return error.InvalidScalar;
-    scalar_mod.rejectNonCanonical(w0, .big) catch return error.InvalidScalar;
-    const y_p = P256.basePoint.mul(y, .big) catch return error.InvalidScalar;
-    const w0_n = nPoint().mul(w0, .big) catch return error.InvalidScalar;
+///
+/// Pointers and burn exactly as `proverStart`.
+pub fn verifierStart(y: *const [scalar_length]u8, w0: *const [scalar_length]u8) VerifierStartError![share_length]u8 {
+    return burn.run(burn.core_burn, VerifierStartError![share_length]u8, verifierStartBody, .{ y, w0 });
+}
+
+noinline fn verifierStartBody(y: *const [scalar_length]u8, w0: *const [scalar_length]u8) VerifierStartError![share_length]u8 {
+    scalar_mod.rejectNonCanonical(y.*, .big) catch return error.InvalidScalar;
+    scalar_mod.rejectNonCanonical(w0.*, .big) catch return error.InvalidScalar;
+    var y_p: P256 = undefined;
+    var w0_n: P256 = undefined;
+    P256.basePoint.mulInto(&y_p, y, .big) catch return error.InvalidScalar;
+    nPoint().mulInto(&w0_n, w0, .big) catch return error.InvalidScalar;
     const share = y_p.add(w0_n);
     share.rejectIdentity() catch return error.InvalidScalar;
     return share.toUncompressedSec1();
@@ -584,15 +670,28 @@ pub const DerivedKeys = struct {
 ///
 /// Byte-exact target: RFC 9383 Appendix C's official vector's published
 /// `K_main`, `K_confirmP`, `K_confirmV`, `K_shared` (`kat_test.zig`).
-pub fn deriveKeys(tt: []const u8) DerivedKeys {
-    const k_main = hash(tt);
-    const confirm = kdf(64, "", &k_main, "ConfirmationKeys");
-    return .{
-        .k_main = k_main,
-        .k_confirm_p = confirm[0..32].*,
-        .k_confirm_v = confirm[32..64].*,
-        .k_shared = kdf(32, "", &k_main, "SharedKey"),
-    };
+///
+/// All four keys go into `out` (never a return value), which the caller owns
+/// and wipes; the body runs under a burn. `K_main` is hashed straight into
+/// `out`, not through the by-value `hash`.
+pub fn deriveKeys(out: *DerivedKeys, tt: []const u8) void {
+    burn.run(burn.hash_burn, void, deriveKeysBody, .{ out, tt });
+}
+
+noinline fn deriveKeysBody(out: *DerivedKeys, tt: []const u8) void {
+    deriveKeysInto(out, tt);
+}
+
+/// `deriveKeys` without its own burn, for the finish bodies that already run
+/// under one.
+fn deriveKeysInto(out: *DerivedKeys, tt: []const u8) void {
+    std.crypto.hash.sha2.Sha256.hash(tt, &out.k_main, .{});
+    var confirm: [64]u8 = undefined;
+    kdfInto(64, &confirm, "", &out.k_main, "ConfirmationKeys");
+    out.k_confirm_p = confirm[0..32].*;
+    out.k_confirm_v = confirm[32..64].*;
+    std.crypto.secureZero(u8, &confirm);
+    kdfInto(32, &out.k_shared, "", &out.k_main, "SharedKey");
 }
 
 pub const ProverFinishError = error{
@@ -684,57 +783,93 @@ pub const ProverFinishResult = struct {
 /// Byte-exact target: RFC 9383 Appendix C's official vector's `Z`, `V`,
 /// `TT`, `K_main`, `K_confirmP`, `K_confirmV`, `confirmP`, and
 /// `K_shared` — all in one call (`kat_test.zig`).
+///
+/// **Secret hygiene.** `w0`, `w1` and `x` are taken by pointer; the result
+/// goes into `out` (never a return value, and never inside the error union,
+/// whose temporary would live in the caller's frame); `out` is zeroed on
+/// error (`out.tt` becomes the empty slice). Every multiply is
+/// `P256.mulInto`, and the body runs under a burn. A successful `out` holds
+/// secrets — `k_*`, `z`, `v`, `tt` — and is the caller's to wipe.
 pub fn proverFinish(
+    out: *ProverFinishResult,
     allocator: std.mem.Allocator,
     context: []const u8,
     id_prover: []const u8,
     id_verifier: []const u8,
-    w0: [scalar_length]u8,
-    w1: [scalar_length]u8,
-    x: [scalar_length]u8,
+    w0: *const [scalar_length]u8,
+    w1: *const [scalar_length]u8,
+    x: *const [scalar_length]u8,
     share_p: [share_length]u8,
     share_v: [share_length]u8,
     received_confirm_v: [hash_length]u8,
-) ProverFinishError!ProverFinishResult {
-    scalar_mod.rejectNonCanonical(w0, .big) catch return error.InvalidScalar;
-    scalar_mod.rejectNonCanonical(w1, .big) catch return error.InvalidScalar;
-    scalar_mod.rejectNonCanonical(x, .big) catch return error.InvalidScalar;
+) ProverFinishError!void {
+    burn.run(burn.core_burn, ProverFinishError!void, proverFinishBody, .{
+        out, allocator, context, id_prover, id_verifier, w0, w1, x, &share_p, &share_v, &received_confirm_v,
+    }) catch |e| {
+        clearProverFinish(out);
+        return e;
+    };
+}
+
+fn clearProverFinish(out: *ProverFinishResult) void {
+    std.crypto.secureZero(u8, std.mem.asBytes(out));
+    out.tt = &.{};
+}
+
+noinline fn proverFinishBody(
+    out: *ProverFinishResult,
+    allocator: std.mem.Allocator,
+    context: []const u8,
+    id_prover: []const u8,
+    id_verifier: []const u8,
+    w0: *const [scalar_length]u8,
+    w1: *const [scalar_length]u8,
+    x: *const [scalar_length]u8,
+    share_p: *const [share_length]u8,
+    share_v: *const [share_length]u8,
+    received_confirm_v: *const [hash_length]u8,
+) ProverFinishError!void {
+    scalar_mod.rejectNonCanonical(w0.*, .big) catch return error.InvalidScalar;
+    scalar_mod.rejectNonCanonical(w1.*, .big) catch return error.InvalidScalar;
+    scalar_mod.rejectNonCanonical(x.*, .big) catch return error.InvalidScalar;
 
     // RFC 9383 §6 group-membership check on the received share Y:
     // parses, on-curve, not the identity (h = 1 — see cofactor_h).
-    const y_point = P256.fromSec1(&share_v) catch return error.InvalidShareV;
+    const y_point = P256.fromSec1(share_v) catch return error.InvalidShareV;
     y_point.rejectIdentity() catch return error.InvalidShareV;
 
     // Z = h*x*(Y - w0*N), V = h*w1*(Y - w0*N) — h = 1; compute the
     // shared (Y - w0*N) term once. w0/x/w1 are secret -> constant-time mul.
-    const w0_n = nPoint().mul(w0, .big) catch return error.InvalidScalar;
+    var w0_n: P256 = undefined;
+    nPoint().mulInto(&w0_n, w0, .big) catch return error.InvalidScalar;
     const diff = y_point.sub(w0_n);
-    const z_point = diff.mul(x, .big) catch return error.InvalidScalar;
-    const v_point = diff.mul(w1, .big) catch return error.InvalidScalar;
-    const z = z_point.toUncompressedSec1();
-    const v = v_point.toUncompressedSec1();
+    var z_point: P256 = undefined;
+    var v_point: P256 = undefined;
+    diff.mulInto(&z_point, x, .big) catch return error.InvalidScalar;
+    diff.mulInto(&v_point, w1, .big) catch return error.InvalidScalar;
+    out.z = z_point.toUncompressedSec1();
+    out.v = v_point.toUncompressedSec1();
 
-    const tt = try computeTranscript(allocator, context, id_prover, id_verifier, share_p, share_v, z, v, w0);
+    const tt = try transcriptBody(allocator, context, id_prover, id_verifier, share_p, share_v, &out.z, &out.v, w0);
     errdefer freeTranscript(allocator, tt);
 
-    const keys = deriveKeys(tt);
+    var keys: DerivedKeys = undefined;
+    deriveKeysInto(&keys, tt);
 
     // RFC 9383 §3.3's mandatory key-confirmation check, constant-time.
-    const expected_confirm_v = mac(&keys.k_confirm_v, &share_p);
-    if (!std.crypto.timing_safe.eql([hash_length]u8, expected_confirm_v, received_confirm_v)) {
-        return error.ConfirmationMismatch;
-    }
+    // A tag that did not verify is a valid forgery for the peer: wiped.
+    var expected_confirm_v: [hash_length]u8 = undefined;
+    macInto(&expected_confirm_v, &keys.k_confirm_v, share_p);
+    const ok = std.crypto.timing_safe.eql([hash_length]u8, expected_confirm_v, received_confirm_v.*);
+    std.crypto.secureZero(u8, &expected_confirm_v);
+    if (!ok) return error.ConfirmationMismatch;
 
-    return .{
-        .confirm_p = mac(&keys.k_confirm_p, &share_v),
-        .k_shared = keys.k_shared,
-        .z = z,
-        .v = v,
-        .tt = tt,
-        .k_main = keys.k_main,
-        .k_confirm_p = keys.k_confirm_p,
-        .k_confirm_v = keys.k_confirm_v,
-    };
+    macInto(&out.confirm_p, &keys.k_confirm_p, share_v);
+    out.k_shared = keys.k_shared;
+    out.tt = tt;
+    out.k_main = keys.k_main;
+    out.k_confirm_p = keys.k_confirm_p;
+    out.k_confirm_v = keys.k_confirm_v;
 }
 
 pub const VerifierFinishError = error{
@@ -897,25 +1032,45 @@ pub const VerifierConfirmResult = struct {
 /// key schedule fed by `Z`/`V`/`TT`, so pinning it pins all of them —
 /// and `verifierFinish`'s own KAT pins those intermediates individually,
 /// on the same inputs, where returning them is safe.
+///
+/// **Secret hygiene.** `w0` and `y` are taken by pointer; nothing secret is
+/// returned (`confirm_v` is the public confirmation message); every multiply
+/// is `P256.mulInto` and the body runs under a burn.
 pub fn verifierConfirm(
     allocator: std.mem.Allocator,
     context: []const u8,
     id_prover: []const u8,
     id_verifier: []const u8,
-    w0: [scalar_length]u8,
+    w0: *const [scalar_length]u8,
     l: [share_length]u8,
-    y: [scalar_length]u8,
+    y: *const [scalar_length]u8,
     share_p: [share_length]u8,
     share_v: [share_length]u8,
 ) VerifierConfirmError!VerifierConfirmResult {
-    scalar_mod.rejectNonCanonical(w0, .big) catch return error.InvalidScalar;
-    scalar_mod.rejectNonCanonical(y, .big) catch return error.InvalidScalar;
+    return burn.run(burn.core_burn, VerifierConfirmError!VerifierConfirmResult, verifierConfirmBody, .{
+        allocator, context, id_prover, id_verifier, w0, &l, y, &share_p, &share_v,
+    });
+}
+
+noinline fn verifierConfirmBody(
+    allocator: std.mem.Allocator,
+    context: []const u8,
+    id_prover: []const u8,
+    id_verifier: []const u8,
+    w0: *const [scalar_length]u8,
+    l: *const [share_length]u8,
+    y: *const [scalar_length]u8,
+    share_p: *const [share_length]u8,
+    share_v: *const [share_length]u8,
+) VerifierConfirmError!VerifierConfirmResult {
+    scalar_mod.rejectNonCanonical(w0.*, .big) catch return error.InvalidScalar;
+    scalar_mod.rejectNonCanonical(y.*, .big) catch return error.InvalidScalar;
 
     // RFC 9383 §6 group-membership checks: the received share X, and this
     // Verifier's own stored registration record L.
-    const x_point = P256.fromSec1(&share_p) catch return error.InvalidShareP;
+    const x_point = P256.fromSec1(share_p) catch return error.InvalidShareP;
     x_point.rejectIdentity() catch return error.InvalidShareP;
-    const l_point = P256.fromSec1(&l) catch return error.InvalidShareP;
+    const l_point = P256.fromSec1(l) catch return error.InvalidShareP;
     l_point.rejectIdentity() catch return error.InvalidShareP;
 
     // Z = h*y*(X - w0*M), V = h*y*L — h = 1; y/w0 are secret ->
@@ -924,23 +1079,31 @@ pub fn verifierConfirm(
     // this file's own convention keeps each RFC-pseudocode step
     // legible/self-contained, matching proverStart/proverFinish's
     // sibling split above).
-    const w0_m = mPoint().mul(w0, .big) catch return error.InvalidScalar;
+    var w0_m: P256 = undefined;
+    mPoint().mulInto(&w0_m, w0, .big) catch return error.InvalidScalar;
     const diff = x_point.sub(w0_m);
-    const z_point = diff.mul(y, .big) catch return error.InvalidScalar;
-    const v_point = l_point.mul(y, .big) catch return error.InvalidScalar;
-    const z = z_point.toUncompressedSec1();
-    const v = v_point.toUncompressedSec1();
+    var z_point: P256 = undefined;
+    var v_point: P256 = undefined;
+    diff.mulInto(&z_point, y, .big) catch return error.InvalidScalar;
+    l_point.mulInto(&v_point, y, .big) catch return error.InvalidScalar;
+    var z = z_point.toUncompressedSec1();
+    var v = v_point.toUncompressedSec1();
 
     // Freed here, not returned: see `VerifierConfirmResult`'s doc comment —
     // `TT` is a one-call pre-image of `K_shared`, which this step must not
     // hand back. Wiped first: `free` does not clear memory in ReleaseFast,
     // and `TT` also carries `w0` (see `freeTranscript`).
-    const tt = try computeTranscript(allocator, context, id_prover, id_verifier, share_p, share_v, z, v, w0);
+    const tt = try transcriptBody(allocator, context, id_prover, id_verifier, share_p, share_v, &z, &v, w0);
     defer freeTranscript(allocator, tt);
+    std.crypto.secureZero(u8, &z);
+    std.crypto.secureZero(u8, &v);
 
-    const keys = deriveKeys(tt);
+    var keys: DerivedKeys = undefined;
+    deriveKeysInto(&keys, tt);
 
-    return .{ .confirm_v = mac(&keys.k_confirm_v, &share_p) };
+    var res: VerifierConfirmResult = undefined;
+    macInto(&res.confirm_v, &keys.k_confirm_v, share_p);
+    return res;
 }
 
 /// RFC 9383 §3.3 / Appendix A.2 `VerifierFinish`'s `Z`/`V` half (the
@@ -979,59 +1142,92 @@ pub fn verifierConfirm(
 /// Byte-exact target: RFC 9383 Appendix C's official vector's `Z`, `V`,
 /// `TT`, `K_main`, `K_confirmP`, `K_confirmV`, `confirmV`, and
 /// `K_shared` — all in one call (`kat_test.zig`).
+///
+/// **Secret hygiene.** As `proverFinish`: `w0` and `y` by pointer, the
+/// result into `out` (zeroed on error), constant-time `mulInto`, body under a
+/// burn.
 pub fn verifierFinish(
+    out: *VerifierFinishResult,
     allocator: std.mem.Allocator,
     context: []const u8,
     id_prover: []const u8,
     id_verifier: []const u8,
-    w0: [scalar_length]u8,
+    w0: *const [scalar_length]u8,
     l: [share_length]u8,
-    y: [scalar_length]u8,
+    y: *const [scalar_length]u8,
     share_p: [share_length]u8,
     share_v: [share_length]u8,
     received_confirm_p: [hash_length]u8,
-) VerifierFinishError!VerifierFinishResult {
-    scalar_mod.rejectNonCanonical(w0, .big) catch return error.InvalidScalar;
-    scalar_mod.rejectNonCanonical(y, .big) catch return error.InvalidScalar;
+) VerifierFinishError!void {
+    burn.run(burn.core_burn, VerifierFinishError!void, verifierFinishBody, .{
+        out, allocator, context, id_prover, id_verifier, w0, &l, y, &share_p, &share_v, &received_confirm_p,
+    }) catch |e| {
+        clearVerifierFinish(out);
+        return e;
+    };
+}
+
+fn clearVerifierFinish(out: *VerifierFinishResult) void {
+    std.crypto.secureZero(u8, std.mem.asBytes(out));
+    out.tt = &.{};
+}
+
+noinline fn verifierFinishBody(
+    out: *VerifierFinishResult,
+    allocator: std.mem.Allocator,
+    context: []const u8,
+    id_prover: []const u8,
+    id_verifier: []const u8,
+    w0: *const [scalar_length]u8,
+    l: *const [share_length]u8,
+    y: *const [scalar_length]u8,
+    share_p: *const [share_length]u8,
+    share_v: *const [share_length]u8,
+    received_confirm_p: *const [hash_length]u8,
+) VerifierFinishError!void {
+    scalar_mod.rejectNonCanonical(w0.*, .big) catch return error.InvalidScalar;
+    scalar_mod.rejectNonCanonical(y.*, .big) catch return error.InvalidScalar;
 
     // RFC 9383 §6 group-membership checks: the received share X, and this
     // Verifier's own stored registration record L.
-    const x_point = P256.fromSec1(&share_p) catch return error.InvalidShareP;
+    const x_point = P256.fromSec1(share_p) catch return error.InvalidShareP;
     x_point.rejectIdentity() catch return error.InvalidShareP;
-    const l_point = P256.fromSec1(&l) catch return error.InvalidShareP;
+    const l_point = P256.fromSec1(l) catch return error.InvalidShareP;
     l_point.rejectIdentity() catch return error.InvalidShareP;
 
     // Z = h*y*(X - w0*M), V = h*y*L — h = 1; y/w0 are secret ->
     // constant-time mul. NOTE the Verifier's V route uses L, never w1
     // (the augmentation — see VerifierFinishResult.v's doc comment).
-    const w0_m = mPoint().mul(w0, .big) catch return error.InvalidScalar;
+    var w0_m: P256 = undefined;
+    mPoint().mulInto(&w0_m, w0, .big) catch return error.InvalidScalar;
     const diff = x_point.sub(w0_m);
-    const z_point = diff.mul(y, .big) catch return error.InvalidScalar;
-    const v_point = l_point.mul(y, .big) catch return error.InvalidScalar;
-    const z = z_point.toUncompressedSec1();
-    const v = v_point.toUncompressedSec1();
+    var z_point: P256 = undefined;
+    var v_point: P256 = undefined;
+    diff.mulInto(&z_point, y, .big) catch return error.InvalidScalar;
+    l_point.mulInto(&v_point, y, .big) catch return error.InvalidScalar;
+    out.z = z_point.toUncompressedSec1();
+    out.v = v_point.toUncompressedSec1();
 
-    const tt = try computeTranscript(allocator, context, id_prover, id_verifier, share_p, share_v, z, v, w0);
+    const tt = try transcriptBody(allocator, context, id_prover, id_verifier, share_p, share_v, &out.z, &out.v, w0);
     errdefer freeTranscript(allocator, tt);
 
-    const keys = deriveKeys(tt);
+    var keys: DerivedKeys = undefined;
+    deriveKeysInto(&keys, tt);
 
     // RFC 9383 §3.3's mandatory key-confirmation check, constant-time.
-    const expected_confirm_p = mac(&keys.k_confirm_p, &share_v);
-    if (!std.crypto.timing_safe.eql([hash_length]u8, expected_confirm_p, received_confirm_p)) {
-        return error.ConfirmationMismatch;
-    }
+    // A tag that did not verify is a valid forgery for the peer: wiped.
+    var expected_confirm_p: [hash_length]u8 = undefined;
+    macInto(&expected_confirm_p, &keys.k_confirm_p, share_v);
+    const ok = std.crypto.timing_safe.eql([hash_length]u8, expected_confirm_p, received_confirm_p.*);
+    std.crypto.secureZero(u8, &expected_confirm_p);
+    if (!ok) return error.ConfirmationMismatch;
 
-    return .{
-        .confirm_v = mac(&keys.k_confirm_v, &share_p),
-        .k_shared = keys.k_shared,
-        .z = z,
-        .v = v,
-        .tt = tt,
-        .k_main = keys.k_main,
-        .k_confirm_p = keys.k_confirm_p,
-        .k_confirm_v = keys.k_confirm_v,
-    };
+    macInto(&out.confirm_v, &keys.k_confirm_v, share_p);
+    out.k_shared = keys.k_shared;
+    out.tt = tt;
+    out.k_main = keys.k_main;
+    out.k_confirm_p = keys.k_confirm_p;
+    out.k_confirm_v = keys.k_confirm_v;
 }
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -1044,6 +1240,7 @@ test {
     _ = @import("kat_test.zig");
     _ = @import("bssl_w0w1_vectors.zig");
     _ = @import("bssl_w0w1_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names RFC 9383 / SPAKE2+ (not RFC 9382 / plain SPAKE2)" {
@@ -1165,19 +1362,21 @@ fn fuzzShareDecode(_: void, smith: *std.testing.Smith) !void {
     // And the real entry point behind it: parse, RFC 9383 §6 group check,
     // then the secret-touching arithmetic and the transcript allocation.
     const w = [_]u8{0x2a} ** scalar_length;
+    var res: ProverFinishResult = undefined;
     if (proverFinish(
+        &res,
         std.testing.allocator,
         "fuzz",
         "p",
         "v",
-        w,
-        w,
-        w,
+        &w,
+        &w,
+        &w,
         share,
         share,
         [_]u8{0} ** hash_length,
-    )) |ok| {
-        std.testing.allocator.free(ok.tt);
+    )) {
+        freeTranscript(std.testing.allocator, res.tt);
     } else |_| {}
 }
 test "fuzz the share-decode boundary and the entry point behind it" {

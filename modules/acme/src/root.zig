@@ -23,8 +23,9 @@
 //! const acme = @import("acme");
 //!
 //! var transport = http.Client.init(io, gpa, .{});
-//! const account_key = acme.jws.generateKeyPair(io); // persist via x509.ecPrivateKeyToPem
-//! var client = acme.Client.init(io, gpa, &transport, account_key, .{});
+//! var account_key: acme.jws.KeyPair = undefined;
+//! acme.jws.generateKeyPair(&account_key, io); // persist via x509.ecPrivateKeyToPem
+//! var client = acme.Client.init(io, gpa, &transport, &account_key, .{});
 //!
 //! // Serve the challenge (the CA dials port 80 of the ordered domains):
 //! try app_router.use(client.challengeResponder().middleware());
@@ -55,7 +56,7 @@ pub const meta = .{
     .model_after = "golang.org/x/crypto/acme + certbot flow semantics; RFC 8555/7515/7638/8737 wire",
     // entropy: the seed behind `jws.generateKeyPair` — the account key and
     // every certificate key this client mints.
-    .deps = .{ "http", "router", "entropy" }, // also uses std.crypto (ecdsa P-256, Certificate), std.json
+    .deps = .{ "http", "router", "entropy", "p256" }, // p256: the burned ECDSA P-256 wrapper; also uses std.crypto.Certificate, std.json
 };
 
 /// The ACME protocol client — see `Client.init` / `Client.obtain`.
@@ -111,6 +112,7 @@ test {
     _ = Client;
     // External anchor: Pebble's answers, replayed (tools/pebble.sh).
     _ = @import("pebble_replay_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "needsRenewal: boundary at exactly within_days, expiry, malformed input" {

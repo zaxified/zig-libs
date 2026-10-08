@@ -201,7 +201,7 @@ fn platformScalar(comptime domain: []const u8) [32]u8 {
 /// — see "the second p256 path" above.
 fn peerKey() ctap2pin.PublicKey {
     const scalar = platformScalar("ctgrind-ctap2pin-harness-PUBLIC-peer-scalar-v1");
-    return ctap2pin.publicKeyFromScalar(scalar) catch unreachable;
+    return ctap2pin.publicKeyFromScalar(&scalar) catch unreachable;
 }
 
 const Target = enum { ecdh, one, two, token };
@@ -237,7 +237,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintIf(tainted, &scalar);
             const s = reloadVolatile(32, &scalar);
 
-            const z = try ctap2pin.ecdhZ(s, peer);
+            var z: [32]u8 = undefined;
+            try ctap2pin.ecdhZ(&z, &s, peer);
             std.debug.print("z={x}\n", .{z});
         },
         .one => {
@@ -249,7 +250,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintIf(tainted, &scalar);
             const s = reloadVolatile(32, &scalar);
 
-            const enc = try ctap2pin.One.encapsulate(s, peer);
+            var enc: ctap2pin.One.Encaps = undefined;
+            try ctap2pin.One.encapsulate(&enc, &s, peer);
             std.debug.print("pk.x={x} secret={x}\n", .{ enc.platform_key_agreement.x, enc.shared_secret });
         },
         .two => {
@@ -260,7 +262,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintIf(tainted, &scalar);
             const s = reloadVolatile(32, &scalar);
 
-            const enc = try ctap2pin.Two.encapsulate(s, peer);
+            var enc: ctap2pin.Two.Encaps = undefined;
+            try ctap2pin.Two.encapsulate(&enc, &s, peer);
             std.debug.print("pk.x={x} secret={x}\n", .{ enc.platform_key_agreement.x, enc.shared_secret });
         },
         .token => {

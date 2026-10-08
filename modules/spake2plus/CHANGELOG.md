@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** every secret path left
+  the password-derived scalars, the ephemerals, `Z`/`V` and the whole key schedule on the dead stack,
+  in the module's frames and in the caller's (by-value scalar params, by-value results, a result
+  inside an error union). New ReleaseFast probe `src/stackprobe_test.zig` (5 calls per entry point,
+  two cases, negative + positive control), BEFORE the fix, residues per entry point (case 0 / 5
+  calls): `computeW0W1` pbkdf 15, `w0` 10, `w1` 30; `computeL` `w1` 10; `proverStart` `x` 10, `w0` 5;
+  `verifierStart` `y` 10, `w0` 5; `deriveKeys` `K_main` 20, `K_confirmP` 20, `K_confirmV` 20,
+  `K_shared` 20, `TT` 5, `w0` 5; `kdf(64)` confirmation keys 30; `mac` HMAC key pad 10;
+  `proverFinish` `w0` 5, `w1` 10, `x` 10, `V` 10, `TT` 70, `K_main` 20, `K_confirmP` 30,
+  `K_confirmV` 20, `K_shared` 20 (reaching 2.4 KiB down, i.e. into the caller's frames);
+  `verifierConfirm` `y` 10, `Z` 5, `V` 5, `TT` 30, all four keys 10-20; `verifierFinish` `y` 10,
+  `Z` 10, `V` 10, `TT` 60, all four keys 20-30. AFTER: 0 residues in all ten, NEG=0, POS>=1.
+  API (all in-repo callers, the example, README and the ctgrind harness' call sites migrated):
+  `w0`/`w1`/`x`/`y` are `*const [32]u8`; `computeW0W1(out: *W0W1, pbkdf_output)`,
+  `deriveKeys(out: *DerivedKeys, tt)`, `kdf(comptime len, out: *[len]u8, salt, ikm, info)`,
+  `proverFinish(out: *ProverFinishResult, allocator, ..., w0, w1, x, ...)` and
+  `verifierFinish(out: *VerifierFinishResult, ...)` return `!void` and zero `out` (and set
+  `out.tt = &.{}`) on error; `computeTranscript` takes `z`, `v`, `w0` by pointer. Public results
+  (`computeL`'s `L`, the shares, `verifierConfirm`'s `confirm_v`) stay return values. Every
+  secret-touching entry point runs its body under a burn (`src/burn.zig`: 32 KiB for the
+  multiplying cores, measured 8.6-10.8 KiB deep before; 4 KiB for hash/MAC/KDF, measured
+  0.9-1.7 KiB); multiplies are `P256.mulInto`. Kept value-shaped: `mac` (its tag is the public
+  confirmation message; its key pads are burned) and `hash`. Internally a tag that failed the
+  confirmation compare is wiped (it is a valid forgery for the peer's confirmation).
+
 - **2026-10-05** — **Fix (secret hygiene, no API change):** `verifierConfirm`, and `proverFinish`/
   `verifierFinish` on `ConfirmationMismatch`, freed their own transcript `TT` (which ends in `w0`
   and is a one-call pre-image of `K_shared`) without zeroing it; in ReleaseFast `free` leaves the

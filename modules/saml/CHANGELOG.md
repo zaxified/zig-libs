@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secret on the dead stack):** `SigningKey.rsa` is now `*const rsa.SecretKey` instead of an `rsa.SecretKey` by value. By value, every options struct carrying a `SigningKey` (`sign_with` of `SpMetadataOptions`/`LogoutRequestOptions`/`LogoutResponseOptions`/`ArtifactResolveOptions`, `key` of `BuildSignedRedirectQueryOptions`) copied the whole 11.8 KiB key — `p`, `q`, `d`, the CRT values — into the caller's frame and every frame the struct passed through, where nothing wiped it (found by reading the code during the dead-stack sweep; the copy happens before `rsa`'s own burned entry points are reached, so `rsa`'s probe could not see it). Callers write `.{ .rsa = &sk }`; the key must outlive the call. New ReleaseFast probe `src/stackprobe_test.zig` (`buildLogoutRequest` with `sign_with`, `buildSignedRedirectQuery`): 0 residues of any key image.
+
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** signing passes the RSA key to `rsa.signPkcs1v15`
   by pointer and the test key fixtures build through rsa's out-param constructors (rsa 2026-10-08).
 - **2026-10-06** — ADDED: the three gaps the 2026-09-30 survey filed; Scope mvp -> core.

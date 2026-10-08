@@ -143,21 +143,24 @@ pub fn kemSuiteId(kem_id: u16) [5]u8 {
 /// labeled IKM through `Hkdf`'s incremental HMAC (`extractInit`/`update`/
 /// `final`) rather than concatenating into a fixed buffer, so `ikm` (a KEM
 /// DH output, or an application-supplied PSK) may be any length.
+///
+/// The PRK goes into `out`, not a return value: for a secret `ikm` it is a
+/// secret, and a returned array is a temporary in the caller's frame.
 pub fn labeledExtract(
     comptime Hkdf: type,
+    out: *[Hkdf.prk_length]u8,
     suite_id: []const u8,
     salt: []const u8,
     label: []const u8,
     ikm: []const u8,
-) [Hkdf.prk_length]u8 {
+) void {
     var hmac_state = Hkdf.extractInit(salt);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&hmac_state));
     hmac_state.update("HPKE-v1");
     hmac_state.update(suite_id);
     hmac_state.update(label);
     hmac_state.update(ikm);
-    var prk: [Hkdf.prk_length]u8 = undefined;
-    hmac_state.final(&prk);
-    return prk;
+    hmac_state.final(out);
 }
 
 /// Labeled-info assembly overflowed the internal scratch buffer — only
@@ -177,7 +180,7 @@ pub const LabeledExpandError = error{LabelTooLong};
 pub fn labeledExpand(
     comptime Hkdf: type,
     suite_id: []const u8,
-    prk: [Hkdf.prk_length]u8,
+    prk: *const [Hkdf.prk_length]u8,
     label: []const u8,
     info: []const u8,
     out: []u8,
@@ -189,7 +192,7 @@ pub fn labeledExpand(
     w.writeAll(suite_id) catch return error.LabelTooLong;
     w.writeAll(label) catch return error.LabelTooLong;
     w.writeAll(info) catch return error.LabelTooLong;
-    Hkdf.expand(out, w.buffered(), prk);
+    Hkdf.expand(out, w.buffered(), prk.*);
 }
 
 // ── tests (real — pure arithmetic / composition, no crypto core needed) ──
@@ -237,9 +240,11 @@ test "labeledExtract/labeledExpand: RFC 9180 A.1.1 key_schedule_context + secret
 
     // psk_id_hash = LabeledExtract(suite_id, "", "psk_id_hash", "") — base
     // mode's psk_id is the empty string.
-    const psk_id_hash = labeledExtract(HkdfSha256, &suite_id, "", "psk_id_hash", "");
+    var psk_id_hash: [HkdfSha256.prk_length]u8 = undefined;
+    labeledExtract(HkdfSha256, &psk_id_hash, &suite_id, "", "psk_id_hash", "");
     // info_hash = LabeledExtract(suite_id, "", "info_hash", info)
-    const info_hash = labeledExtract(HkdfSha256, &suite_id, "", "info_hash", info);
+    var info_hash: [HkdfSha256.prk_length]u8 = undefined;
+    labeledExtract(HkdfSha256, &info_hash, &suite_id, "", "info_hash", info);
 
     // key_schedule_context = mode(1) || psk_id_hash(32) || info_hash(32)
     var ksc: [65]u8 = undefined;
@@ -254,21 +259,22 @@ test "labeledExtract/labeledExpand: RFC 9180 A.1.1 key_schedule_context + secret
     // psk is the empty string; shared_secret is the A.1.1 vector value
     // (published directly, so this does NOT need to run Encap).
     const shared_secret = hexBytes(32, "fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc");
-    const secret = labeledExtract(HkdfSha256, &suite_id, &shared_secret, "secret", "");
+    var secret: [HkdfSha256.prk_length]u8 = undefined;
+    labeledExtract(HkdfSha256, &secret, &suite_id, &shared_secret, "secret", "");
     const want_secret = hexBytes(32, "12fff91991e93b48de37e7daddb52981084bd8aa64289c3788471d9a9712f397");
     try testing.expectEqualSlices(u8, &want_secret, &secret);
 
     // key/base_nonce/exporter_secret = LabeledExpand(secret, ..., ksc, N)
     var key: [16]u8 = undefined;
-    try labeledExpand(HkdfSha256, &suite_id, secret, "key", &ksc, &key);
+    try labeledExpand(HkdfSha256, &suite_id, &secret, "key", &ksc, &key);
     try testing.expectEqualSlices(u8, &hexBytes(16, "4531685d41d65f03dc48f6b8302c05b0"), &key);
 
     var base_nonce: [12]u8 = undefined;
-    try labeledExpand(HkdfSha256, &suite_id, secret, "base_nonce", &ksc, &base_nonce);
+    try labeledExpand(HkdfSha256, &suite_id, &secret, "base_nonce", &ksc, &base_nonce);
     try testing.expectEqualSlices(u8, &hexBytes(12, "56d890e5accaaf011cff4b7d"), &base_nonce);
 
     var exporter_secret: [32]u8 = undefined;
-    try labeledExpand(HkdfSha256, &suite_id, secret, "exp", &ksc, &exporter_secret);
+    try labeledExpand(HkdfSha256, &suite_id, &secret, "exp", &ksc, &exporter_secret);
     try testing.expectEqualSlices(u8, &hexBytes(32, "45ff1c2e220db587171952c0592d5f5ebe103f1561a2614e38f2ffd47e99e3f8"), &exporter_secret);
 }
 

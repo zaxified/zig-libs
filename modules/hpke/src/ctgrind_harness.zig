@@ -218,9 +218,12 @@ fn reloadVolatile(comptime n: usize, s: *const [n]u8) [n]u8 {
 /// `encapDeterministic`/`decap` shape, so one generic function drives all
 /// three `*_decap` targets.
 fn kemDecap(comptime Kem: type, taint: bool, recipient_ikm: []const u8, eph_ikm: []const u8) !void {
-    const skR_clean = Kem.deriveKeyPair(recipient_ikm);
-    const eph = Kem.deriveKeyPair(eph_ikm);
-    const encapped = try Kem.encapDeterministic(skR_clean.public_key, eph);
+    var skR_clean: Kem.KeyPair = undefined;
+    Kem.deriveKeyPair(&skR_clean, recipient_ikm);
+    var eph: Kem.KeyPair = undefined;
+    Kem.deriveKeyPair(&eph, eph_ikm);
+    var encapped: Kem.Encapped = undefined;
+    try Kem.encapDeterministic(&encapped, skR_clean.public_key, &eph);
 
     var skR = skR_clean;
     if (taint) std.valgrind.memcheck.makeMemUndefined(&skR.secret_key);
@@ -228,7 +231,8 @@ fn kemDecap(comptime Kem: type, taint: bool, recipient_ikm: []const u8, eph_ikm:
 
     // The call under test: `enc` is wire data (a genuine on-curve point,
     // not tainted); `skR.secret_key` is the tainted recipient private key.
-    const shared_secret = try Kem.decap(encapped.enc, skR);
+    var shared_secret: [Kem.Nsecret]u8 = undefined;
+    try Kem.decap(&shared_secret, encapped.enc, &skR);
     // Propagation witness: hex formatting is not constant-time.
     std.debug.print("shared_secret={x}\n", .{shared_secret});
 }
@@ -238,10 +242,14 @@ fn kemDecap(comptime Kem: type, taint: bool, recipient_ikm: []const u8, eph_ikm:
 /// folded into `authEncapDeterministic` alongside the ephemeral, then the
 /// same taint-recipient-secret-key + call-real-`authDecap` shape.
 fn kemAuthDecap(comptime Kem: type, taint: bool, recipient_ikm: []const u8, sender_ikm: []const u8, eph_ikm: []const u8) !void {
-    const skR_clean = Kem.deriveKeyPair(recipient_ikm);
-    const skS = Kem.deriveKeyPair(sender_ikm);
-    const eph = Kem.deriveKeyPair(eph_ikm);
-    const encapped = try Kem.authEncapDeterministic(skR_clean.public_key, skS, eph);
+    var skR_clean: Kem.KeyPair = undefined;
+    Kem.deriveKeyPair(&skR_clean, recipient_ikm);
+    var skS: Kem.KeyPair = undefined;
+    Kem.deriveKeyPair(&skS, sender_ikm);
+    var eph: Kem.KeyPair = undefined;
+    Kem.deriveKeyPair(&eph, eph_ikm);
+    var encapped: Kem.Encapped = undefined;
+    try Kem.authEncapDeterministic(&encapped, skR_clean.public_key, &skS, &eph);
 
     var skR = skR_clean;
     if (taint) std.valgrind.memcheck.makeMemUndefined(&skR.secret_key);
@@ -251,7 +259,8 @@ fn kemAuthDecap(comptime Kem: type, taint: bool, recipient_ikm: []const u8, send
     // `skR.secret_key` is tainted. `authDecap` computes DH(skR,enc) AND
     // DH(skR,pkS) — both against the SAME tainted scalar — so this target
     // covers both halves of the `dh || dh2` fold in one run.
-    const shared_secret = try Kem.authDecap(encapped.enc, skR, skS.public_key);
+    var shared_secret: [Kem.Nsecret]u8 = undefined;
+    try Kem.authDecap(&shared_secret, encapped.enc, &skR, skS.public_key);
     std.debug.print("shared_secret={x}\n", .{shared_secret});
 }
 
@@ -285,14 +294,16 @@ fn openTarget(taint: bool) !void {
     // REAL ciphertext `open` below can authenticate -- without this, a
     // tainted key/nonce would make every `open` fail at the tag compare
     // before the AEAD body under test ever runs.
-    var sealer = try schedule.keySchedule(Aead, Nh, .base, &suite_id, shared_secret, info, "", "");
+    var sealer: schedule.Context(Aead, Nh) = undefined;
+    try schedule.keySchedule(Aead, Nh, &sealer, .base, &suite_id, shared_secret, info, "", "");
     var ct: [pt.len + Aead.tag_length]u8 = undefined;
     try sealer.seal(&aad, pt, &ct);
 
     // The call under test: a fresh Context from the SAME derivation (so its
     // key/base_nonce bit pattern matches `sealer`'s exactly), with
     // `ctx.key`/`ctx.base_nonce` tainted in place before `open`.
-    var ctx = try schedule.keySchedule(Aead, Nh, .base, &suite_id, shared_secret, info, "", "");
+    var ctx: schedule.Context(Aead, Nh) = undefined;
+    try schedule.keySchedule(Aead, Nh, &ctx, .base, &suite_id, shared_secret, info, "", "");
     if (taint) {
         std.valgrind.memcheck.makeMemUndefined(&ctx.key);
         std.valgrind.memcheck.makeMemUndefined(&ctx.base_nonce);

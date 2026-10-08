@@ -54,17 +54,23 @@ fn runProtocol(comptime protocol: ctap2pin.Protocol, auth_scalar: [32]u8, platfo
     const Impl = ctap2pin.Impl(protocol);
 
     // ── key agreement: both sides derive the SAME shared secret ────────
-    const authenticator_pub = try ctap2pin.publicKeyFromScalar(auth_scalar);
+    const authenticator_pub = try ctap2pin.publicKeyFromScalar(&auth_scalar);
 
     // Platform side: encapsulate against the authenticator's public key.
-    var platform_enc = try Impl.encapsulate(platform_scalar, authenticator_pub);
+    // Secrets go in by pointer and come out through an out-param, so no copy
+    // of them lands in a stack frame this code cannot wipe.
+    var platform_enc: Impl.Encaps = undefined;
+    try Impl.encapsulate(&platform_enc, &platform_scalar, authenticator_pub);
     defer std.crypto.secureZero(u8, &platform_enc.shared_secret);
 
     // Authenticator side: independently compute Z against the platform's
     // public key (the one it just received), then this protocol's kdf.
-    const z_auth = try ctap2pin.ecdhZ(auth_scalar, platform_enc.platform_key_agreement);
-    var auth_secret = Impl.kdf(z_auth);
+    var z_auth: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &z_auth);
+    try ctap2pin.ecdhZ(&z_auth, &auth_scalar, platform_enc.platform_key_agreement);
+    var auth_secret: Impl.SharedSecret = undefined;
     defer std.crypto.secureZero(u8, &auth_secret);
+    Impl.kdf(&auth_secret, &z_auth);
 
     if (!std.mem.eql(u8, &platform_enc.shared_secret, &auth_secret)) return error.SharedSecretMismatch;
     std.debug.print("protocol {s}: platform and authenticator agree on the shared secret independently\n", .{@tagName(protocol)});
@@ -76,9 +82,9 @@ fn runProtocol(comptime protocol: ctap2pin.Protocol, auth_scalar: [32]u8, platfo
 
     if (protocol == .one) {
         var ciphertext: [32]u8 = undefined;
-        try Impl.encrypt(auth_secret, &ciphertext, &token);
+        try Impl.encrypt(&auth_secret, &ciphertext, &token);
         var recovered: [32]u8 = undefined;
-        try Impl.decrypt(platform_enc.shared_secret, &recovered, &ciphertext);
+        try Impl.decrypt(&platform_enc.shared_secret, &recovered, &ciphertext);
         if (!std.mem.eql(u8, &token, &recovered)) return error.TokenMismatch;
     } else {
         // Protocol Two: caller-supplied IV (the module takes it as a
@@ -87,9 +93,9 @@ fn runProtocol(comptime protocol: ctap2pin.Protocol, auth_scalar: [32]u8, platfo
         // as real key material.
         const iv = [_]u8{0xa5} ** 16;
         var ciphertext: [16 + 32]u8 = undefined;
-        try Impl.encrypt(auth_secret, iv, &ciphertext, &token);
+        try Impl.encrypt(&auth_secret, iv, &ciphertext, &token);
         var recovered: [32]u8 = undefined;
-        try Impl.decrypt(platform_enc.shared_secret, &recovered, &ciphertext);
+        try Impl.decrypt(&platform_enc.shared_secret, &recovered, &ciphertext);
         if (!std.mem.eql(u8, &token, &recovered)) return error.TokenMismatch;
     }
     std.debug.print("protocol {s}: pinUvAuthToken survives encrypt (authenticator) -> decrypt (platform)\n", .{@tagName(protocol)});
@@ -127,7 +133,8 @@ fn runProtocol(comptime protocol: ctap2pin.Protocol, auth_scalar: [32]u8, platfo
 fn checkBadPeerKeyRejected() !void {
     const platform_scalar = [_]u8{0x02} ** 32;
     const bogus_peer = ctap2pin.PublicKey{ .x = [_]u8{0} ** 32, .y = [_]u8{0} ** 32 };
-    if (ctap2pin.ecdhZ(platform_scalar, bogus_peer)) |_| {
+    var z: [32]u8 = undefined;
+    if (ctap2pin.ecdhZ(&z, &platform_scalar, bogus_peer)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.InvalidPublicKey => std.debug.print("ecdhZ against a bogus (0,0) peer key: InvalidPublicKey (expected) -- no shared secret, right or wrong, is ever produced\n", .{}),
@@ -140,7 +147,7 @@ fn checkBadPeerKeyRejected() !void {
 /// producing the point at infinity.
 fn checkZeroScalarRejected() !void {
     const zero_scalar = [_]u8{0} ** 32;
-    if (ctap2pin.publicKeyFromScalar(zero_scalar)) |_| {
+    if (ctap2pin.publicKeyFromScalar(&zero_scalar)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.InvalidScalar => std.debug.print("publicKeyFromScalar(0): InvalidScalar (expected)\n", .{}),

@@ -117,7 +117,10 @@ fn replayScenario(name: []const u8, domains: []const []const u8, challenge: acme
 
     var transport = http.Client.init(io, testing.allocator, .{});
     defer transport.deinit();
-    var client = acme.Client.init(io, testing.allocator, &transport, try acme.jws.Es256.KeyPair.generateDeterministic(@splat(7)), .{
+    var account_key: acme.jws.KeyPair = undefined;
+    try acme.jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(7)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var client = acme.Client.init(io, testing.allocator, &transport, &account_key, .{
         .directory_url = dir_url,
         .challenge_type = challenge,
         .dns_publisher = if (challenge == .dns_01) .{ .present = Zone.present, .cleanup = Zone.cleanup } else null,

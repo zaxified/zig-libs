@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const burn = @import("burn.zig");
 
 /// Test-only: the corpus format `Smith.slice` actually reads. A corpus entry is
 /// not the frame — the length draw reads a little-endian `u32` first, so a raw
@@ -24,7 +25,10 @@ const Allocator = std.mem.Allocator;
 const testkit = @import("testkit");
 const seedHex = testkit.fuzz.seedHex;
 
-pub const Es256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+/// p256's burned wrapper, not std's: std's signer leaves the private key and
+/// the nonce on the dead stack after every signature (measured 2026-10-08,
+/// `stackprobe_test.zig`).
+pub const Es256 = @import("p256").EcdsaP256Sha256;
 
 // ── DER encoding (bottom-up, arena-backed) ──────────────────────────────────
 
@@ -124,7 +128,7 @@ pub const CsrError = error{ OutOfMemory, ValueTooLarge, InvalidDomain, SigningFa
 /// extensionRequest attribute carrying subjectAltName = dNSName list.
 /// A wildcard (`*.example.org`) is a valid dNSName here; whether it can be
 /// validated is the order flow's business. Caller owns the returned bytes.
-pub fn csrDer(gpa: Allocator, key_pair: Es256.KeyPair, domains: []const []const u8) CsrError![]u8 {
+pub fn csrDer(gpa: Allocator, key_pair: *const Es256.KeyPair, domains: []const []const u8) CsrError![]u8 {
     if (domains.len == 0) return error.InvalidDomain;
     for (domains) |name| {
         if (!isValidDomain(name) and !isValidWildcardDomain(name)) return error.InvalidDomain;
@@ -228,7 +232,7 @@ pub const TlsAlpnCert = struct {
 /// / `not_after` are ASN.1 UTCTime strings. Caller owns the returned bytes.
 pub fn tlsAlpnCertDer(
     gpa: Allocator,
-    key_pair: Es256.KeyPair,
+    key_pair: *const Es256.KeyPair,
     domain: []const u8,
     acme_identifier: [32]u8,
     serial: []const u8,
@@ -317,9 +321,10 @@ pub fn tlsAlpnCert(
 ) TlsAlpnError!TlsAlpnCert {
     var seed: [32]u8 = undefined;
     random.bytes(&seed);
-    var key_pair = Es256.KeyPair.generateDeterministic(seed) catch return error.SigningFailed;
+    defer std.crypto.secureZero(u8, &seed);
+    var key_pair: Es256.KeyPair = undefined;
+    Es256.KeyPair.generateDeterministicInto(&key_pair, &seed) catch return error.SigningFailed;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&key_pair));
-    std.crypto.secureZero(u8, &seed);
 
     // 16-byte positive, minimal serial: force the top byte to 0x01..0x7f so
     // it is nonzero and has no leading-zero / high-bit ambiguity.
@@ -329,7 +334,7 @@ pub fn tlsAlpnCert(
 
     const cert_der = try tlsAlpnCertDer(
         gpa,
-        key_pair,
+        &key_pair,
         domain,
         acme_identifier,
         &serial,
@@ -337,7 +342,7 @@ pub fn tlsAlpnCert(
         tls_alpn_not_after,
     );
     errdefer gpa.free(cert_der);
-    const key_pem = try ecPrivateKeyToPem(gpa, key_pair);
+    const key_pem = try ecPrivateKeyToPem(gpa, &key_pair);
     return .{ .cert_der = cert_der, .key_pem = key_pem };
 }
 
@@ -606,12 +611,22 @@ pub const KeyPemError = error{ OutOfMemory, MissingPemBlock, InvalidPem, Malform
 
 /// Serialize a P-256 key pair as an openssl-compatible `EC PRIVATE KEY`
 /// PEM (RFC 5915: version 1, private scalar, curve OID, public point).
-pub fn ecPrivateKeyToPem(gpa: Allocator, key_pair: Es256.KeyPair) error{OutOfMemory}![]u8 {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const d: Der = .{ .a = arena.allocator() };
+pub fn ecPrivateKeyToPem(gpa: Allocator, key_pair: *const Es256.KeyPair) error{OutOfMemory}![]u8 {
+    const r = ecPrivateKeyToPemUnburned(gpa, key_pair);
+    burn.stack(burn.key_burn);
+    return r;
+}
 
-    const sk = key_pair.secret_key.toBytes();
+noinline fn ecPrivateKeyToPemUnburned(gpa: Allocator, key_pair: *const Es256.KeyPair) error{OutOfMemory}![]u8 {
+    // The DER holds the private scalar: build it in a stack buffer and wipe
+    // that, not in an arena whose freed pages would keep it.
+    var der_buf: [1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, &der_buf);
+    var fba = std.heap.FixedBufferAllocator.init(&der_buf);
+    const d: Der = .{ .a = fba.allocator() };
+
+    var sk = key_pair.secret_key.toBytes();
+    defer std.crypto.secureZero(u8, &sk);
     const pub_sec1 = key_pair.public_key.toUncompressedSec1();
     const ec = ecKeyDer(d, &sk, &pub_sec1) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -631,24 +646,37 @@ fn ecKeyDer(d: Der, sk: []const u8, pub_sec1: []const u8) DerEncodeError![]const
 
 /// Load a P-256 key pair from an `EC PRIVATE KEY` PEM (RFC 5915 — the
 /// format `ecPrivateKeyToPem` and `openssl ecparam -genkey` write; PKCS#8
-/// `PRIVATE KEY` wrapping is not supported). `gpa` is scratch only.
-pub fn ecPrivateKeyFromPem(gpa: Allocator, text: []const u8) KeyPemError!Es256.KeyPair {
+/// `PRIVATE KEY` wrapping is not supported). `gpa` is scratch only. The pair
+/// goes into `out` (zeroed on error), never through a return value: a
+/// returned pair would sit in the caller's error-union temporary.
+pub fn ecPrivateKeyFromPem(out: *Es256.KeyPair, gpa: Allocator, text: []const u8) KeyPemError!void {
     const der_bytes = try pemDecode(gpa, "EC PRIVATE KEY", text);
-    defer gpa.free(der_bytes);
-    return ecPrivateKeyFromDer(der_bytes) catch error.MalformedKey;
+    defer {
+        std.crypto.secureZero(u8, der_bytes);
+        gpa.free(der_bytes);
+    }
+    const r = ecPrivateKeyFromDerBurned(out, der_bytes);
+    return r catch error.MalformedKey;
 }
 
-fn ecPrivateKeyFromDer(bytes: []const u8) (ReadError || error{MalformedKey})!Es256.KeyPair {
+fn ecPrivateKeyFromDerBurned(out: *Es256.KeyPair, bytes: []const u8) (ReadError || error{MalformedKey})!void {
+    const r = ecPrivateKeyFromDer(out, bytes);
+    burn.stack(burn.key_burn);
+    return r;
+}
+
+noinline fn ecPrivateKeyFromDer(out: *Es256.KeyPair, bytes: []const u8) (ReadError || error{MalformedKey})!void {
+    errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
     const seq = try expectElem(bytes, 0, 0x30);
     const version = try expectElem(bytes, seq.start, 0x02);
     if (!std.mem.eql(u8, version.content(bytes), "\x01")) return error.MalformedKey;
     const priv = try expectElem(bytes, version.end, 0x04);
     const raw = priv.content(bytes);
     if (raw.len == 0 or raw.len > 32) return error.MalformedKey;
-    var sk_bytes: [32]u8 = @splat(0);
-    @memcpy(sk_bytes[32 - raw.len ..], raw); // RFC 5915 fixes the length; tolerate short
-    const sk = Es256.SecretKey.fromBytes(sk_bytes) catch return error.MalformedKey;
-    return Es256.KeyPair.fromSecretKey(sk) catch error.MalformedKey;
+    var sk: Es256.SecretKey = .{ .bytes = @splat(0) };
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&sk));
+    @memcpy(sk.bytes[32 - raw.len ..], raw); // RFC 5915 fixes the length; tolerate short
+    Es256.KeyPair.fromSecretKeyInto(out, &sk) catch return error.MalformedKey;
 }
 
 // ── certificate notAfter ────────────────────────────────────────────────────
@@ -673,8 +701,19 @@ pub fn certNotAfter(gpa: Allocator, cert_pem: []const u8) CertError!u64 {
 
 const testing = std.testing;
 
-fn testKeyPair(comptime seed_byte: u8) Es256.KeyPair {
-    return Es256.KeyPair.generateDeterministic(@splat(seed_byte)) catch unreachable;
+/// A fixed, non-secret test key pair per seed byte, in static storage (one
+/// derivation per seed), so tests pass it by pointer like production code.
+fn testKeyPair(comptime seed_byte: u8) *const Es256.KeyPair {
+    const S = struct {
+        var kp: Es256.KeyPair = undefined;
+        var ready = false;
+    };
+    if (!S.ready) {
+        const seed: [Es256.KeyPair.seed_length]u8 = @splat(seed_byte);
+        Es256.KeyPair.generateDeterministicInto(&S.kp, &seed) catch unreachable;
+        S.ready = true;
+    }
+    return &S.kp;
 }
 
 test "DER: header length forms (short, 0x81, 0x82)" {
@@ -882,7 +921,9 @@ test "TLS-ALPN-01 cert: tlsAlpnCert convenience generates a usable key + cert" {
     try testing.expect(std.mem.indexOf(u8, cert.cert_der, "\x82\x0b" ++ "example.com") != null);
 
     // The emitted key PEM parses back and matches the cert's SPKI point.
-    const kp = try ecPrivateKeyFromPem(testing.allocator, cert.key_pem);
+    var kp: Es256.KeyPair = undefined;
+    try ecPrivateKeyFromPem(&kp, testing.allocator, cert.key_pem);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
     const point = kp.public_key.toUncompressedSec1();
     try testing.expect(std.mem.indexOf(u8, cert.cert_der, &point) != null);
 }
@@ -1022,7 +1063,9 @@ test "EC private key PEM: round-trip ours, parse openssl's" {
     const kp = testKeyPair(45);
     const pem = try ecPrivateKeyToPem(testing.allocator, kp);
     defer testing.allocator.free(pem);
-    const back = try ecPrivateKeyFromPem(testing.allocator, pem);
+    var back: Es256.KeyPair = undefined;
+    try ecPrivateKeyFromPem(&back, testing.allocator, pem);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&back));
     try testing.expectEqualSlices(u8, &kp.secret_key.toBytes(), &back.secret_key.toBytes());
     try testing.expectEqualSlices(
         u8,
@@ -1039,7 +1082,9 @@ test "EC private key PEM: round-trip ours, parse openssl's" {
         \\-----END EC PRIVATE KEY-----
         \\
     ;
-    const parsed = try ecPrivateKeyFromPem(testing.allocator, openssl_key);
+    var parsed: Es256.KeyPair = undefined;
+    try ecPrivateKeyFromPem(&parsed, testing.allocator, openssl_key);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&parsed));
     // The [1] public-key BIT STRING in the fixture must match the point we
     // re-derive from the private scalar (cross-checks scalar-mult too).
     const der_bytes = try pemDecode(testing.allocator, "EC PRIVATE KEY", openssl_key);
@@ -1047,8 +1092,10 @@ test "EC private key PEM: round-trip ours, parse openssl's" {
     const derived = parsed.public_key.toUncompressedSec1();
     try testing.expect(std.mem.indexOf(u8, der_bytes, &derived) != null);
 
-    try testing.expectError(error.MissingPemBlock, ecPrivateKeyFromPem(testing.allocator, "no pem here"));
+    var scratch: Es256.KeyPair = undefined;
+    try testing.expectError(error.MissingPemBlock, ecPrivateKeyFromPem(&scratch, testing.allocator, "no pem here"));
     try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(
+        &scratch,
         testing.allocator,
         "-----BEGIN EC PRIVATE KEY-----\nMAA=\n-----END EC PRIVATE KEY-----\n",
     ));
@@ -1300,7 +1347,7 @@ test "parseCsr: trailing bytes, a foreign version or algorithm, and a nonzero un
 
 /// `csrDer`'s structure with two knobs it never sets: an explicit
 /// `critical` flag on the SAN extension, and an extra iPAddress GeneralName.
-fn csrVariant(gpa: Allocator, key_pair: Es256.KeyPair, critical: bool, ip: bool) ![]u8 {
+fn csrVariant(gpa: Allocator, key_pair: *const Es256.KeyPair, critical: bool, ip: bool) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const d: Der = .{ .a = arena.allocator() };
@@ -1364,10 +1411,11 @@ test "ecPrivateKeyFromPem: version must be 1 and the private octets at most 32" 
     der_bytes[v_at] = 2;
     const pem_v2 = try pemEncode(testing.allocator, "EC PRIVATE KEY", der_bytes);
     defer testing.allocator.free(pem_v2);
-    try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(testing.allocator, pem_v2));
+    var scratch: Es256.KeyPair = undefined;
+    try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(&scratch, testing.allocator, pem_v2));
 
     const long_priv = "\x30\x26\x02\x01\x01\x04\x21" ++ "\x01" ** 33;
     const pem_long = try pemEncode(testing.allocator, "EC PRIVATE KEY", long_priv);
     defer testing.allocator.free(pem_long);
-    try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(testing.allocator, pem_long));
+    try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(&scratch, testing.allocator, pem_long));
 }

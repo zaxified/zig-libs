@@ -83,7 +83,10 @@ const std = @import("std");
 const rsa = @import("rsa");
 const ber = @import("ber.zig");
 
-const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+/// p256's burned wrapper, not std's: std's signer leaves the private key and
+/// the nonce on the dead stack after every signature (measured 2026-10-08,
+/// `stackprobe_test.zig`).
+const EcdsaP256 = @import("p256").EcdsaP256Sha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 // ── tags ────────────────────────────────────────────────────────────────────
@@ -589,7 +592,10 @@ pub const SignedToken = struct {
 
 pub const Signer = union(enum) {
     rsa_pss_sha256: struct { key: rsa.SecretKey, random: std.Random },
-    ecdsa_p256_sha256: struct { key_pair: EcdsaP256.KeyPair, noise: ?[EcdsaP256.noise_length]u8 = null },
+    /// The key pair is held by pointer so that no copy of the private key lands
+    /// in `signToken`'s frame (a `Signer` travels by value); it must outlive
+    /// the call.
+    ecdsa_p256_sha256: struct { key_pair: *const EcdsaP256.KeyPair, noise: ?[EcdsaP256.noise_length]u8 = null },
 };
 
 pub const TokenVerifier = union(enum) {
@@ -989,23 +995,32 @@ test "signed token: RSASSA-PSS round-trip through the authentication-value" {
     try testing.expectEqual(test_now_s, got.time_s);
 }
 
+fn testKeyPair(kp: *EcdsaP256.KeyPair, comptime seed_byte: u8) void {
+    const seed: [EcdsaP256.KeyPair.seed_length]u8 = @splat(seed_byte);
+    EcdsaP256.KeyPair.generateDeterministicInto(kp, &seed) catch unreachable;
+}
+
 test "signed token: ECDSA round-trip" {
-    const kp = try EcdsaP256.KeyPair.generateDeterministic([_]u8{0x21} ** EcdsaP256.KeyPair.seed_length);
+    var kp: EcdsaP256.KeyPair = undefined;
+    testKeyPair(&kp, 0x21);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
     var sig_buf: [64]u8 = undefined;
     var token_buf: [512]u8 = undefined;
     const token = try signToken(&token_buf, &sig_buf, .{
-        .ecdsa_p256_sha256 = .{ .key_pair = kp, .noise = [_]u8{0x9e} ** EcdsaP256.noise_length },
+        .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = [_]u8{0x9e} ** EcdsaP256.noise_length },
     }, 1, test_now_s, "ied-7");
     const got = try verifyToken(token, .{ .ecdsa_p256_sha256 = kp.public_key }, test_now_s, .{});
     try testing.expectEqualSlices(u8, "ied-7", got.identity);
 }
 
 test "signed token: tampering with any covered field breaks the signature" {
-    const kp = try EcdsaP256.KeyPair.generateDeterministic([_]u8{0x21} ** EcdsaP256.KeyPair.seed_length);
+    var kp: EcdsaP256.KeyPair = undefined;
+    testKeyPair(&kp, 0x21);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
     var sig_buf: [64]u8 = undefined;
     var token_buf: [512]u8 = undefined;
     const token = try signToken(&token_buf, &sig_buf, .{
-        .ecdsa_p256_sha256 = .{ .key_pair = kp, .noise = [_]u8{0x9e} ** EcdsaP256.noise_length },
+        .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = [_]u8{0x9e} ** EcdsaP256.noise_length },
     }, 1, test_now_s, "ied-7");
 
     // Flip a byte of the identity...
@@ -1033,11 +1048,13 @@ test "signed token: tampering with any covered field breaks the signature" {
 }
 
 test "signed token: a valid signature does not survive the freshness window" {
-    const kp = try EcdsaP256.KeyPair.generateDeterministic([_]u8{0x21} ** EcdsaP256.KeyPair.seed_length);
+    var kp: EcdsaP256.KeyPair = undefined;
+    testKeyPair(&kp, 0x21);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
     var sig_buf: [64]u8 = undefined;
     var token_buf: [512]u8 = undefined;
     const token = try signToken(&token_buf, &sig_buf, .{
-        .ecdsa_p256_sha256 = .{ .key_pair = kp, .noise = [_]u8{0x9e} ** EcdsaP256.noise_length },
+        .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = [_]u8{0x9e} ** EcdsaP256.noise_length },
     }, 1, test_now_s, "ied-7");
     const v: TokenVerifier = .{ .ecdsa_p256_sha256 = kp.public_key };
 
@@ -1049,12 +1066,16 @@ test "signed token: a valid signature does not survive the freshness window" {
 }
 
 test "signed token: the wrong public key fails" {
-    const kp = try EcdsaP256.KeyPair.generateDeterministic([_]u8{0x21} ** EcdsaP256.KeyPair.seed_length);
-    const other = try EcdsaP256.KeyPair.generateDeterministic([_]u8{0x22} ** EcdsaP256.KeyPair.seed_length);
+    var kp: EcdsaP256.KeyPair = undefined;
+    testKeyPair(&kp, 0x21);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+    var other: EcdsaP256.KeyPair = undefined;
+    testKeyPair(&other, 0x22);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&other));
     var sig_buf: [64]u8 = undefined;
     var token_buf: [512]u8 = undefined;
     const token = try signToken(&token_buf, &sig_buf, .{
-        .ecdsa_p256_sha256 = .{ .key_pair = kp, .noise = null },
+        .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = null },
     }, 1, test_now_s, "ied-7");
     try testing.expectError(error.SignatureInvalid, verifyToken(
         token,
@@ -1065,11 +1086,13 @@ test "signed token: the wrong public key fails" {
 }
 
 test "signed token: an unknown version is rejected before the signature is trusted" {
-    const kp = try EcdsaP256.KeyPair.generateDeterministic([_]u8{0x21} ** EcdsaP256.KeyPair.seed_length);
+    var kp: EcdsaP256.KeyPair = undefined;
+    testKeyPair(&kp, 0x21);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
     var sig_buf: [64]u8 = undefined;
     var token_buf: [512]u8 = undefined;
     const token = try signToken(&token_buf, &sig_buf, .{
-        .ecdsa_p256_sha256 = .{ .key_pair = kp, .noise = null },
+        .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = null },
     }, 9, test_now_s, "ied-7");
     try testing.expectError(error.UnsupportedVersion, verifyToken(
         token,
@@ -1174,13 +1197,15 @@ test "fuzz: token parsing never panics and never verifies garbage" {
     // truncations and a one-octet corruption. The point of the harness is that
     // nothing here verifies against the harness's own key; a corpus of tokens
     // that at least PARSE is what makes that claim mean anything.
-    const signer_kp = EcdsaP256.KeyPair.generateDeterministic([_]u8{0x37} ** EcdsaP256.KeyPair.seed_length) catch unreachable;
+    var signer_kp: EcdsaP256.KeyPair = undefined;
+    testKeyPair(&signer_kp, 0x37);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&signer_kp));
     var tok_buf: [256]u8 = undefined;
     var sig_buf: [128]u8 = undefined;
     const token = try signToken(
         &tok_buf,
         &sig_buf,
-        .{ .ecdsa_p256_sha256 = .{ .key_pair = signer_kp, .noise = null } },
+        .{ .ecdsa_p256_sha256 = .{ .key_pair = &signer_kp, .noise = null } },
         1,
         test_now_s,
         "operator@substation",
@@ -1200,7 +1225,9 @@ test "fuzz: token parsing never panics and never verifies garbage" {
 }
 
 fn fuzzToken(_: void, smith: *std.testing.Smith) !void {
-    const kp = EcdsaP256.KeyPair.generateDeterministic([_]u8{0x21} ** EcdsaP256.KeyPair.seed_length) catch unreachable;
+    var kp: EcdsaP256.KeyPair = undefined;
+    testKeyPair(&kp, 0x21);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
     var buf: [128]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then

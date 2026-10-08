@@ -218,6 +218,20 @@ deterministic entry points take the ephemeral `KeyPair` as a parameter
 rather than drawing one from `std.Io` internally; `encap`/`authEncap` are
 thin `generateKeyPair(io)` + `*Deterministic` wrappers for real callers.
 
+**No secret on the dead stack, the caller's frame included (2026-10-08).**
+Private keys are taken as `*const KeyPair`; key pairs, shared secrets,
+`Context`/`Setup` and `labeledExtract`'s PRK are written into `out` pointers
+(zeroed on error), never returned — a by-value argument or a returned value is
+a copy in the caller's frame that nothing wipes. Every public entry point that
+touches a secret runs its body one frame down and zeroes the stack it used
+(`src/burn.zig`: 32 KiB for anything that reaches a KEM, 8 KiB for
+`Context.seal`/`open`/`exportSecret` and `keySchedule`).
+`src/stackprobe_test.zig` (ReleaseFast) checks every DHKEM operation of all
+three KEMs, `setupBaseR`, `Context.seal`/`exportSecret`, `sealBase`/`openBase`
+against the keys, DH outputs (both coordinates), `eae_prk`, the shared secret,
+the key schedule's `secret`, the AEAD key, AES round keys and GHASH key, and the
+exporter secret.
+
 ## Threat model
 
 - **Nonce reuse under `Context.seal`.** RFC 9180 §5.2 derives each

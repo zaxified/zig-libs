@@ -203,8 +203,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var failures: usize = 0;
     for (scenarios, 0..) |sc, i| {
         try mark(&transport, sc.name);
-        const account_key = try acme.jws.Es256.KeyPair.generateDeterministic(@splat(@intCast(0x40 + i)));
-        var client = acme.Client.init(io, gpa, &transport, account_key, .{
+        var account_key: acme.jws.KeyPair = undefined;
+        try acme.jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(@intCast(0x40 + i))));
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+        var client = acme.Client.init(io, gpa, &transport, &account_key, .{
             .directory_url = "https://localhost:14001/dir",
             .challenge_type = sc.challenge,
             .dns_publisher = if (sc.challenge == .dns_01) .{ .ctx = &mgmt, .present = Mgmt.present, .cleanup = Mgmt.cleanup } else null,

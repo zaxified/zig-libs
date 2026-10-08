@@ -30,7 +30,9 @@ pub fn main() !void {
 
     // The account key IS the account identity (see the module README) —
     // deterministic here only so the example is reproducible byte-for-byte.
-    const account_key = try acme.jws.Es256.KeyPair.generateDeterministic(@splat(0x42));
+    var account_key: acme.jws.KeyPair = undefined;
+    try acme.jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(0x42)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
 
     // ── prove control: RFC 8555 §8.1 key authorization ─────────────────
     // The CA hands out `token`; the client answers with `token + "." +
@@ -43,7 +45,7 @@ pub fn main() !void {
     // ── client side: sign a POST-as-GET the way `Client` would ─────────
     // `kid = null` embeds the account's `jwk` — the shape `newAccount`
     // uses before the CA has assigned an account URL.
-    const request = try acme.jws.sign(gpa, account_key, "", .{
+    const request = try acme.jws.sign(gpa, &account_key, "", .{
         .nonce = "server-issued-nonce-abc123",
         .url = "https://ca.example.org/acme/new-account",
     });
@@ -63,7 +65,9 @@ pub fn main() !void {
     // has on file for that `kid`. A signature that verifies under the
     // embedded key must NOT also verify under some other account's key —
     // that would let one account forge requests for another.
-    const other_key = try acme.jws.Es256.KeyPair.generateDeterministic(@splat(0x99));
+    var other_key: acme.jws.KeyPair = undefined;
+    try acme.jws.Es256.KeyPair.generateDeterministicInto(&other_key, &@as([32]u8, @splat(0x99)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&other_key));
     _ = acme.jws.verifyFlattened(gpa, request, other_key.public_key) catch |err| switch (err) {
         error.BadSignature => {
             std.debug.print("rejected: BadSignature (signed by a different account key)\n", .{});

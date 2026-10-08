@@ -361,7 +361,7 @@ way to recognise it.
 | [`aaa-gate`](modules/aaa-gate/README.md) | 3 (S,E,H,P) | Bearer + API-key auth (constant-time) + audit hook + denied-request throttle | any | router, http |
 | [`abuseguard`](modules/abuseguard/README.md) | 3 (S,E,P) | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | posix | http, netaddr, router |
 | [`accesslog`](modules/accesslog/README.md) | 3 (S,H,P) | Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge; thread-safe group-commit `Sink` for one shared log file | any | http |
-| [`acme`](modules/acme/README.md) | 3 (S,H,P) | Let's Encrypt / ACME v2 (RFC 8555) — HTTP-01, TLS-ALPN-01 and DNS-01 (wildcard) issuance + renewal, ES256 JWS, CSR | any | http, router, entropy |
+| [`acme`](modules/acme/README.md) | 3 (S,H,P) | Let's Encrypt / ACME v2 (RFC 8555) — HTTP-01, TLS-ALPN-01 and DNS-01 (wildcard) issuance + renewal, ES256 JWS, CSR | any | http, router, entropy, p256 |
 | [`aescbc`](modules/aescbc/README.md) | 3 (S,H,P) | Raw AES-CBC (NIST SP800-38A) + PKCS#7/XML-Enc padding helpers, zero-alloc; padding-oracle caveat — consumers own authenticate-before-unpad | any | — |
 | [`aeskw`](modules/aeskw/README.md) | 3 (S,H,P) | RFC 3394 AES Key Wrap (AES-128/256 KEK) — constant-time integrity check + scratch zeroization, byte-exact vs RFC 3394 test vectors | any | — |
 | [`brotli`](modules/brotli/README.md) | 3 (S,P) | Pure-Zig Brotli (RFC 7932) — byte-exact decompressor + a compressing encoder (LZ77 + Huffman, ~2.8x on text); the `Content-Encoding: br` companion to std gzip | any | — |
@@ -428,7 +428,7 @@ way to recognise it.
 | [`icmp`](modules/icmp/README.md) | 2 (S,E,A) | ICMP echo (ping) engine — v4/v6 codec, batched socket, pacing | **linux** | seqmap, netaddr |
 | [`iec104`](modules/iec104/README.md) | 3 (S,H,P) | IEC 60870-5-104 telecontrol — APCI/APDU framing, I/S/U formats with k/w flow control, ASDU codec, transport-agnostic master (controlling station) | any | — |
 | [`iec61850`](modules/iec61850/README.md) | 3 (S,H,P) | IEC 61850 substation automation — MMS (ISO 9506) client over ISO-on-TCP with the ACSI object model, plus GOOSE publish/subscribe + SV sampled values | any | xml |
-| [`iec62351`](modules/iec62351/README.md) | 3 (S,E,H,P) | IEC 62351 power-systems security — GOOSE/SV authentication (62351-6) over caller-supplied PDU bytes, MMS application authentication (62351-4), checkable TLS policy | any | x509, rsa |
+| [`iec62351`](modules/iec62351/README.md) | 3 (S,E,H,P) | IEC 62351 power-systems security — GOOSE/SV authentication (62351-6) over caller-supplied PDU bytes, MMS application authentication (62351-4), checkable TLS policy | any | x509, rsa, p256 |
 | [`imap`](modules/imap/README.md) | 4 (S) | IMAP4rev2 (RFC 9051) client — mailbox-name codec, wire grammar, FETCH/ENVELOPE/BODYSTRUCTURE, SEARCH, IDLE; transport-agnostic (owns no socket, speaks no TLS) | any | — |
 | [`isis`](modules/isis/README.md) | 4 (S) | IS-IS (ISO/IEC 10589) PDU codec — common header + TLV framework + IIH/LSP PDUs + SPB (802.1aq) TLVs; pure bounds-checked encode/decode, wire foundation for an SPB control plane | any | — |
 | [`isis-adj`](modules/isis-adj/README.md) | 4 (S) | IS-IS point-to-point adjacency state machine (ISO 10589 §8.2 + RFC 5303) — pure time-injected FSM driving one P2P neighbour Down→Init→Up from IIH PDUs | any | isis |

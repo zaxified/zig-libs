@@ -49,18 +49,19 @@ call before it; nothing is known in advance:
 // Offline registration (once, out of band): derive w0/w1 from the
 // password (computeW0W1 — RFC 9383 §3.2), then compute L for the
 // Verifier's database.
-const w0w1 = try spake2plus.computeW0W1(pbkdf_output); // 80-byte PBKDF output
-const l = try spake2plus.computeL(w0w1.w1); // Verifier stores w0 + l; NEVER w1
+var w0w1: spake2plus.W0W1 = undefined;
+try spake2plus.computeW0W1(&w0w1, pbkdf_output); // 80-byte PBKDF output
+const l = try spake2plus.computeL(&w0w1.w1); // Verifier stores w0 + l; NEVER w1
 
 // Round 1: shares — neither side needs anything from the other yet.
-const share_p = try spake2plus.proverStart(x, w0w1.w0);   // Prover   -> Verifier: share_p
-const share_v = try spake2plus.verifierStart(y, w0w1.w0); // Verifier -> Prover:   share_v
+const share_p = try spake2plus.proverStart(&x, &w0w1.w0);   // Prover   -> Verifier: share_p
+const share_v = try spake2plus.verifierStart(&y, &w0w1.w0); // Verifier -> Prover:   share_v
 
 // Round 2a: the Verifier goes FIRST — it emits confirmV with no Prover
 // confirmation in existence yet (RFC 9383 Appendix A.5).
 const verifier_confirm = try spake2plus.verifierConfirm(
     allocator, context, id_prover, id_verifier,
-    w0w1.w0, l, y, share_p, share_v,
+    &w0w1.w0, l, &y, share_p, share_v,
 );
 // verifier_confirm.confirm_v -> Verifier -> Prover: confirmV
 // This result carries confirm_v and NOTHING else -- no transcript to free,
@@ -68,23 +69,40 @@ const verifier_confirm = try spake2plus.verifierConfirm(
 
 // Round 2b: the Prover validates the confirmV it just received, and only
 // on success computes its own confirmP and the shared secret.
-const prover_result = try spake2plus.proverFinish(
-    allocator, context, id_prover, id_verifier,
-    w0w1.w0, w0w1.w1, x, share_p, share_v, verifier_confirm.confirm_v,
+var prover_result: spake2plus.ProverFinishResult = undefined;
+try spake2plus.proverFinish(
+    &prover_result, allocator, context, id_prover, id_verifier,
+    &w0w1.w0, &w0w1.w1, &x, share_p, share_v, verifier_confirm.confirm_v,
 );
-defer allocator.free(prover_result.tt);
+// prover_result holds secrets (k_*, z, v, tt): wipe it, and tt, when done.
+defer {
+    std.crypto.secureZero(u8, prover_result.tt);
+    allocator.free(prover_result.tt);
+    std.crypto.secureZero(u8, std.mem.asBytes(&prover_result));
+}
 // prover_result.confirm_p -> Prover -> Verifier: confirmP
 // prover_result.k_shared  -> the authenticated shared secret
 
 // Round 2c: the Verifier validates the confirmP it just received, and
 // only on success obtains the matching shared secret.
-const verifier_result = try spake2plus.verifierFinish(
-    allocator, context, id_prover, id_verifier,
-    w0w1.w0, l, y, share_p, share_v, prover_result.confirm_p,
+var verifier_result: spake2plus.VerifierFinishResult = undefined;
+try spake2plus.verifierFinish(
+    &verifier_result, allocator, context, id_prover, id_verifier,
+    &w0w1.w0, l, &y, share_p, share_v, prover_result.confirm_p,
 );
-defer allocator.free(verifier_result.tt);
+defer {
+    std.crypto.secureZero(u8, verifier_result.tt);
+    allocator.free(verifier_result.tt);
+    std.crypto.secureZero(u8, std.mem.asBytes(&verifier_result));
+}
 // verifier_result.k_shared == prover_result.k_shared
 ```
+
+Secret scalars (`w0`, `w1`, `x`, `y`) go in by pointer and secret results
+(`W0W1`, `DerivedKeys`, the `*Finish` results, `kdf` output) come out through
+an `out` parameter, zeroed on error; every secret-touching entry point runs
+its body under a stack burn, so no secret stays on the dead stack of the
+module or of the caller (`src/stackprobe_test.zig`).
 
 `x`/`y` (the ephemeral per-session scalars) and the peer's
 key-confirmation MAC arguments (`verifier_confirm.confirm_v` fed into

@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** a ReleaseFast stack probe
+  (`src/stackprobe_test.zig`, new) found, 5 calls each, after: `publicKeyFromScalar` the scalar
+  `d` (x10); `ecdhZ` `d`, shared x/y in big-endian and field form (up to 343 B below the call,
+  dirty depth 8.8 KiB); `One.encapsulate` `d`, shared x, `Z`, `kdf` output; `Two.encapsulate` `d`,
+  `Z`, `prk`, `hmacKey`, `aesKey` (up to 1.2 KiB deep); `One.kdf` `Z` + secret; `One.`/`Two.`
+  `encrypt`/`decrypt` the AES key and its encrypt/decrypt key schedules; `authenticate`/`verify`
+  the HMAC opad block. (`Two.kdf`, `Two.authenticate` and the Two.* positive controls were not
+  measured BEFORE: the first probe version's control was unarmed.) Now 0 residues in all.
+  API: secrets in by `*const`, secrets out through an out-param (zeroed on error):
+  `publicKeyFromScalar(*const [32]u8)`, `ecdhZ(out: *[32]u8, *const [32]u8, peer)`,
+  `One/Two.kdf(out: *SharedSecret, z: *const [32]u8)`,
+  `One/Two.encapsulate(out: *Encaps, *const [32]u8, peer)`,
+  `One/Two.encrypt/decrypt(key: *const SharedSecret, ...)` (the M3 by-value copy is gone),
+  `Aes256Cbc.encrypt/decrypt(..., key: *const [32]u8, iv)`. ECDH goes through `P256.mulInto`;
+  `ecdhZ` wipes the shared point. Bodies run one frame down (`noinline`) and are burned
+  (`src/burn.zig`: ECDH 8 KiB, kdf 4 KiB, AES 1 KiB twice, HMAC 2 KiB). The AES wrapper is
+  burned twice (an outer burn covers the middle frame that held a 16 B key image) and its body
+  escapes the key pointer so LLVM argument promotion cannot copy the key into the wrapper.
+  `authenticate`/`verify` keep their signatures. `ctap2` migrated.
+
 - **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** test-only. The print-only
   dead-stack probe `src/stackprobe_test.zig` (A1 M3) is deleted: it asserted
   nothing and its stderr failed the CI lane in ReleaseFast. M3 stays the

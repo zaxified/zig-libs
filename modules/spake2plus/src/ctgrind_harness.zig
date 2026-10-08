@@ -161,7 +161,9 @@ fn passwordBytes(label: []const u8) [80]u8 {
 /// scalar, through public API.
 fn deriveW0W1(label: []const u8) spake2plus.W0W1 {
     const pwd = passwordBytes(label);
-    return spake2plus.computeW0W1(&pwd) catch unreachable; // 80 bytes by construction
+    var out: spake2plus.W0W1 = undefined;
+    spake2plus.computeW0W1(&out, &pwd) catch unreachable; // 80 bytes by construction
+    return out;
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -182,7 +184,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var pwd = passwordBytes("registration");
         taintBytes(t, pwd[0..]);
         const tpwd = reloadVolatile(80, &pwd);
-        const w0w1 = try spake2plus.computeW0W1(&tpwd);
+        var w0w1: spake2plus.W0W1 = undefined;
+        try spake2plus.computeW0W1(&w0w1, &tpwd);
         std.debug.print("w0={x} w1={x}\n", .{ w0w1.w0, w0w1.w1 });
         return;
     }
@@ -192,7 +195,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var w1 = reg.w1;
         taintBytes(t, w1[0..]);
         const tw1 = reloadVolatile(32, &w1);
-        const l = try spake2plus.computeL(tw1);
+        const l = try spake2plus.computeL(&tw1);
         std.debug.print("L={x}\n", .{l});
         return;
     }
@@ -206,7 +209,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         taintBytes(t, x[0..]);
         const tw0 = reloadVolatile(32, &w0);
         const tx = reloadVolatile(32, &x);
-        const share = try spake2plus.proverStart(tx, tw0);
+        const share = try spake2plus.proverStart(&tx, &tw0);
         std.debug.print("X={x}\n", .{share});
         return;
     }
@@ -220,7 +223,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         taintBytes(t, y[0..]);
         const tw0 = reloadVolatile(32, &w0);
         const ty = reloadVolatile(32, &y);
-        const share = try spake2plus.verifierStart(ty, tw0);
+        const share = try spake2plus.verifierStart(&ty, &tw0);
         std.debug.print("Y={x}\n", .{share});
         return;
     }
@@ -234,15 +237,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const eph_x = deriveW0W1("ephemeral-x").w0;
     const eph_y = deriveW0W1("ephemeral-y").w1;
 
-    const l = try spake2plus.computeL(reg.w1); // public registration record
-    const share_p = try spake2plus.proverStart(eph_x, reg.w0); // X, public
-    const share_v = try spake2plus.verifierStart(eph_y, reg.w0); // Y, public
+    const l = try spake2plus.computeL(&reg.w1); // public registration record
+    const share_p = try spake2plus.proverStart(&eph_x, &reg.w0); // X, public
+    const share_v = try spake2plus.verifierStart(&eph_y, &reg.w0); // Y, public
 
     if (std.mem.eql(u8, target, "proverfinish")) {
         // The Verifier's real confirmV, so the compare below actually
         // matches and the function runs to completion instead of erroring
         // out at the ConfirmationMismatch line.
-        const vconfirm = try spake2plus.verifierConfirm(gpa, "ctgrind", "prover", "verifier", reg.w0, l, eph_y, share_p, share_v);
+        const vconfirm = try spake2plus.verifierConfirm(gpa, "ctgrind", "prover", "verifier", &reg.w0, l, &eph_y, share_p, share_v);
 
         var w0 = reg.w0;
         var w1 = reg.w1;
@@ -254,14 +257,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const tw1 = reloadVolatile(32, &w1);
         const tx = reloadVolatile(32, &x);
 
-        const result = try spake2plus.proverFinish(
+        var result: spake2plus.ProverFinishResult = undefined;
+        try spake2plus.proverFinish(
+            &result,
             gpa,
             "ctgrind",
             "prover",
             "verifier",
-            tw0,
-            tw1,
-            tx,
+            &tw0,
+            &tw1,
+            &tx,
             share_p,
             share_v,
             vconfirm.confirm_v,
@@ -274,8 +279,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (std.mem.eql(u8, target, "verifierfinish")) {
         // The Prover's real confirmP, from an untainted full proverFinish
         // run, so verifierFinish's own compare below matches.
-        const vconfirm = try spake2plus.verifierConfirm(gpa, "ctgrind", "prover", "verifier", reg.w0, l, eph_y, share_p, share_v);
-        const pfinish = try spake2plus.proverFinish(gpa, "ctgrind", "prover", "verifier", reg.w0, reg.w1, eph_x, share_p, share_v, vconfirm.confirm_v);
+        const vconfirm = try spake2plus.verifierConfirm(gpa, "ctgrind", "prover", "verifier", &reg.w0, l, &eph_y, share_p, share_v);
+        var pfinish: spake2plus.ProverFinishResult = undefined;
+        try spake2plus.proverFinish(&pfinish, gpa, "ctgrind", "prover", "verifier", &reg.w0, &reg.w1, &eph_x, share_p, share_v, vconfirm.confirm_v);
         defer gpa.free(pfinish.tt);
 
         var w0 = reg.w0;
@@ -285,14 +291,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const tw0 = reloadVolatile(32, &w0);
         const ty = reloadVolatile(32, &y);
 
-        const result = try spake2plus.verifierFinish(
+        var result: spake2plus.VerifierFinishResult = undefined;
+        try spake2plus.verifierFinish(
+            &result,
             gpa,
             "ctgrind",
             "prover",
             "verifier",
-            tw0,
+            &tw0,
             l,
-            ty,
+            &ty,
             share_p,
             share_v,
             pfinish.confirm_p,

@@ -245,7 +245,7 @@ self-consistency check; it closed audit finding F1.
   the caller already frees it) belongs on this list too, not just
   `K_main`: `VerifierConfirmResult`'s own doc comment establishes that
   `TT` is a ONE-CALL pre-image of `K_shared` through this module's public
-  `deriveKeys` (`deriveKeys(tt).k_shared == K_shared`), exactly the same
+  `deriveKeys` (`deriveKeys(&keys, tt)`, then `keys.k_shared == K_shared`), exactly the same
   distance as `K_main` — the caller-owned buffer it frees is exactly as
   sensitive as the fixed-size key material next to it, and freeing it is
   not the same as zeroing it first.
@@ -256,6 +256,20 @@ self-consistency check; it closed audit finding F1.
   module has no way to enforce (mirrors `adaptor.preVerify`'s note that
   binding an adaptor point to the right protocol context is the
   caller's job, not the primitive's).
+- **Dead-stack hygiene (2026-10-08).** No secret stays on the stack after a call,
+  neither in this module's frames nor in the caller's. Secret scalars (`w0`, `w1`,
+  `x`, `y`; `z`, `v`, `w0` for `computeTranscript`) are taken by `*const` pointer;
+  secret results (`W0W1`, `DerivedKeys`, `kdf`'s output, `ProverFinishResult`,
+  `VerifierFinishResult`) leave through an `out` parameter, zeroed on error. Every
+  secret-touching entry point runs its body one frame down and then zeroes the stack
+  that body dirtied (`src/burn.zig`; 32 KiB for the multiplying cores, 4 KiB for the
+  hash/MAC/KDF ones). `mac` still returns its tag by value: it is the public
+  confirmation message (the HMAC key pads, the only secret in it, are burned);
+  `hash` is a plain digest of caller data. `src/stackprobe_test.zig` (ReleaseFast
+  only) measures it per entry point: 0 residues of the scalars, the points
+  `x*P`/`y*P`/`w0*M`/`w0*N`, `Z`, `V`, `TT`'s secret tail, `K_main`, `K_confirmP/V`,
+  `K_shared`, with a negative and a positive control in the same binary. The
+  caller's own copies — the `out` structs, `tt` — are the caller's to wipe.
 
 ## The seven crypto cores (all implemented)
 
@@ -339,7 +353,7 @@ protocol).
 first version of this function got it wrong.** It also returned `tt` and
 `k_main` "for KAT visibility", and each of those is a one-call pre-image of
 `K_shared` through this module's own public `deriveKeys`/`kdf` — measured
-2026-09-01: both `deriveKeys(vc.tt).k_shared` and
+2026-09-01: both `deriveKeys(tt).k_shared` (the by-value form then) and
 `kdf(32, "", &vc.k_main, "SharedKey")` equal the real `K_shared`, at the
 moment the Verifier has never seen a `confirmP`. `Z`/`V` were two calls
 away by the same route. All of them now stay inside the call, which frees

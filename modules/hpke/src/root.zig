@@ -162,6 +162,7 @@ test {
     _ = dhkem;
     _ = schedule;
     _ = @import("kat_rfc9180.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.deps is exactly {p256, chachapoly, entropy} (the P-256 group + the ChaCha AEAD + the fail-closed key draw; else std only)" {

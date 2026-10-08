@@ -35,7 +35,7 @@ module (certificate extensions). See `/NOTICE`.
 | platform | `.any` |
 | role | `.util` |
 | concurrency | `.reentrant` |
-| deps | `x509`, `rsa` |
+| deps | `x509`, `rsa`, `p256` |
 
 ## Import
 
@@ -230,10 +230,12 @@ cannot be corrupted by passing through it.
 For a signed assertion instead of a password:
 
 ```zig
+// `kp`: a `p256.EcdsaP256Sha256.KeyPair`, held by pointer (derive it with
+// `KeyPair.generateDeterministicInto` / `fromSecretKeyInto`).
 var sig_buf: [64]u8 = undefined;
 var token_buf: [512]u8 = undefined;
 const token = try acse.signToken(&token_buf, &sig_buf, .{
-    .ecdsa_p256_sha256 = .{ .key_pair = kp },
+    .ecdsa_p256_sha256 = .{ .key_pair = &kp },
 }, 1, now_s, "substation-A/client1");
 
 // ...carried in `.value = .{ .other = .{ .mechanism = oid, .value = token } }`

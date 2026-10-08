@@ -26,6 +26,38 @@ const Aes256Cbc = ctap2pin.Aes256Cbc;
 const One = ctap2pin.One;
 const Two = ctap2pin.Two;
 
+// ── helpers over the pointer / out-param API ────────────────────────────────
+// Test-side only: they return secrets by value, which the library API
+// deliberately does not.
+
+fn ecdhZv(d: [32]u8, peer: ctap2pin.PublicKey) ctap2pin.EcdhError![32]u8 {
+    var z: [32]u8 = undefined;
+    try ctap2pin.ecdhZ(&z, &d, peer);
+    return z;
+}
+
+fn pkOf(d: [32]u8) ctap2pin.EcdhError!ctap2pin.PublicKey {
+    return ctap2pin.publicKeyFromScalar(&d);
+}
+
+fn kdf1(z: [32]u8) One.SharedSecret {
+    var out: One.SharedSecret = undefined;
+    One.kdf(&out, &z);
+    return out;
+}
+
+fn kdf2(z: [32]u8) Two.SharedSecret {
+    var out: Two.SharedSecret = undefined;
+    Two.kdf(&out, &z);
+    return out;
+}
+
+fn encap(comptime P: type, d: [32]u8, peer: ctap2pin.PublicKey) ctap2pin.EcdhError!P.Encaps {
+    var out: P.Encaps = undefined;
+    try P.encapsulate(&out, &d, peer);
+    return out;
+}
+
 /// Hex → bytes for the comptime-known vectors (all of which are valid hex,
 /// asserted by the well-formedness test in `kat_vectors.zig`).
 fn hx(comptime hex_str: []const u8) [hex_str.len / 2]u8 {
@@ -43,46 +75,46 @@ const cbc_ct = hx(v.nist_sp800_38a_cbc_aes256.ciphertext);
 
 test "NIST SP 800-38A F.2.5: AES-256-CBC encrypt byte-exact" {
     var out: [64]u8 = undefined;
-    try Aes256Cbc.encrypt(&out, &cbc_pt, cbc_key, cbc_iv);
+    try Aes256Cbc.encrypt(&out, &cbc_pt, &cbc_key, cbc_iv);
     try t.expectEqualSlices(u8, &cbc_ct, &out);
 }
 
 test "NIST SP 800-38A F.2.6: AES-256-CBC decrypt byte-exact" {
     var out: [64]u8 = undefined;
-    try Aes256Cbc.decrypt(&out, &cbc_ct, cbc_key, cbc_iv);
+    try Aes256Cbc.decrypt(&out, &cbc_ct, &cbc_key, cbc_iv);
     try t.expectEqualSlices(u8, &cbc_pt, &out);
 }
 
 test "AES-256-CBC: chaining — an n-block prefix encrypts to the CT prefix" {
     inline for (.{ 16, 32, 48 }) |len| {
         var out: [len]u8 = undefined;
-        try Aes256Cbc.encrypt(&out, cbc_pt[0..len], cbc_key, cbc_iv);
+        try Aes256Cbc.encrypt(&out, cbc_pt[0..len], &cbc_key, cbc_iv);
         try t.expectEqualSlices(u8, cbc_ct[0..len], &out);
     }
 }
 
 test "AES-256-CBC: exact in-place encrypt and decrypt" {
     var buf: [64]u8 = cbc_pt;
-    try Aes256Cbc.encrypt(&buf, &buf, cbc_key, cbc_iv);
+    try Aes256Cbc.encrypt(&buf, &buf, &cbc_key, cbc_iv);
     try t.expectEqualSlices(u8, &cbc_ct, &buf);
-    try Aes256Cbc.decrypt(&buf, &buf, cbc_key, cbc_iv);
+    try Aes256Cbc.decrypt(&buf, &buf, &cbc_key, cbc_iv);
     try t.expectEqualSlices(u8, &cbc_pt, &buf);
 }
 
 test "AES-256-CBC: empty input is a no-op, not an error" {
     var out: [0]u8 = undefined;
-    try Aes256Cbc.encrypt(&out, "", cbc_key, cbc_iv);
-    try Aes256Cbc.decrypt(&out, "", cbc_key, cbc_iv);
+    try Aes256Cbc.encrypt(&out, "", &cbc_key, cbc_iv);
+    try Aes256Cbc.decrypt(&out, "", &cbc_key, cbc_iv);
 }
 
 test "AES-256-CBC: length validation (typed errors, no panic)" {
     var out: [64]u8 = undefined;
     // Input not a multiple of the block length.
-    try t.expectError(error.InvalidLength, Aes256Cbc.encrypt(out[0..15], cbc_pt[0..15], cbc_key, cbc_iv));
-    try t.expectError(error.InvalidLength, Aes256Cbc.decrypt(out[0..17], cbc_ct[0..17], cbc_key, cbc_iv));
+    try t.expectError(error.InvalidLength, Aes256Cbc.encrypt(out[0..15], cbc_pt[0..15], &cbc_key, cbc_iv));
+    try t.expectError(error.InvalidLength, Aes256Cbc.decrypt(out[0..17], cbc_ct[0..17], &cbc_key, cbc_iv));
     // Destination size mismatch.
-    try t.expectError(error.InvalidLength, Aes256Cbc.encrypt(out[0..32], cbc_pt[0..16], cbc_key, cbc_iv));
-    try t.expectError(error.InvalidLength, Aes256Cbc.decrypt(out[0..16], cbc_ct[0..32], cbc_key, cbc_iv));
+    try t.expectError(error.InvalidLength, Aes256Cbc.encrypt(out[0..32], cbc_pt[0..16], &cbc_key, cbc_iv));
+    try t.expectError(error.InvalidLength, Aes256Cbc.decrypt(out[0..16], cbc_ct[0..32], &cbc_key, cbc_iv));
 }
 
 // ── HKDF-SHA-256 vs RFC 5869 A.1 ───────────────────────────────────────────
@@ -114,18 +146,18 @@ const gi = ctap2pin.PublicKey{ .x = hx(v.rfc5903_p256.gix), .y = hx(v.rfc5903_p2
 const gr = ctap2pin.PublicKey{ .x = hx(v.rfc5903_p256.grx), .y = hx(v.rfc5903_p256.gry) };
 
 test "RFC 5903 8.1: P-256 public keys derive from the private scalars" {
-    const gi_derived = try ctap2pin.publicKeyFromScalar(i_priv);
+    const gi_derived = try pkOf(i_priv);
     try t.expectEqualSlices(u8, &gi.x, &gi_derived.x);
     try t.expectEqualSlices(u8, &gi.y, &gi_derived.y);
-    const gr_derived = try ctap2pin.publicKeyFromScalar(r_priv);
+    const gr_derived = try pkOf(r_priv);
     try t.expectEqualSlices(u8, &gr.x, &gr_derived.x);
     try t.expectEqualSlices(u8, &gr.y, &gr_derived.y);
 }
 
 test "RFC 5903 8.1: ECDH shared secret Z byte-exact, both directions" {
     const girx = hx(v.rfc5903_p256.girx);
-    const z_initiator = try ctap2pin.ecdhZ(i_priv, gr);
-    const z_responder = try ctap2pin.ecdhZ(r_priv, gi);
+    const z_initiator = try ecdhZv(i_priv, gr);
+    const z_responder = try ecdhZv(r_priv, gi);
     try t.expectEqualSlices(u8, &girx, &z_initiator);
     try t.expectEqualSlices(u8, &girx, &z_responder);
 }
@@ -135,15 +167,15 @@ test "ECDH: invalid inputs are typed errors, no panic" {
     // vector) not on the curve.
     var off_curve = gi;
     off_curve.y[31] +%= 1;
-    try t.expectError(error.InvalidPublicKey, ctap2pin.ecdhZ(i_priv, off_curve));
+    try t.expectError(error.InvalidPublicKey, ecdhZv(i_priv, off_curve));
     // Non-canonical coordinate (all 0xff >= p).
     const bad_coord = ctap2pin.PublicKey{ .x = @splat(0xff), .y = gi.y };
-    try t.expectError(error.InvalidPublicKey, ctap2pin.ecdhZ(i_priv, bad_coord));
+    try t.expectError(error.InvalidPublicKey, ecdhZv(i_priv, bad_coord));
     // Zero and non-canonical private scalars.
-    try t.expectError(error.InvalidScalar, ctap2pin.ecdhZ(@splat(0), gi));
-    try t.expectError(error.InvalidScalar, ctap2pin.ecdhZ(@splat(0xff), gi));
-    try t.expectError(error.InvalidScalar, ctap2pin.publicKeyFromScalar(@splat(0)));
-    try t.expectError(error.InvalidScalar, ctap2pin.publicKeyFromScalar(@splat(0xff)));
+    try t.expectError(error.InvalidScalar, ecdhZv(@splat(0), gi));
+    try t.expectError(error.InvalidScalar, ecdhZv(@splat(0xff), gi));
+    try t.expectError(error.InvalidScalar, pkOf(@splat(0)));
+    try t.expectError(error.InvalidScalar, pkOf(@splat(0xff)));
 }
 
 test "PublicKey.toPoint rejects the point at infinity, by name" {
@@ -180,41 +212,41 @@ test "protocol one: kdf(Z) is SHA-256(Z)" {
     const z = hx(v.rfc5903_p256.girx);
     var expected: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&z, &expected, .{});
-    try t.expectEqualSlices(u8, &expected, &One.kdf(z));
+    try t.expectEqualSlices(u8, &expected, &kdf1(z));
 }
 
 test "protocol one: encapsulate agrees on both sides" {
     // Platform = RFC 5903 initiator, authenticator = responder.
-    const platform = try One.encapsulate(i_priv, gr);
+    const platform = try encap(One, i_priv, gr);
     try t.expectEqualSlices(u8, &gi.x, &platform.platform_key_agreement.x);
     try t.expectEqualSlices(u8, &gi.y, &platform.platform_key_agreement.y);
     // The authenticator derives the same secret from the platform's key.
-    const authenticator = try One.encapsulate(r_priv, platform.platform_key_agreement);
+    const authenticator = try encap(One, r_priv, platform.platform_key_agreement);
     try t.expectEqualSlices(u8, &platform.shared_secret, &authenticator.shared_secret);
     // And it is kdf of the published Z.
-    try t.expectEqualSlices(u8, &One.kdf(hx(v.rfc5903_p256.girx)), &platform.shared_secret);
+    try t.expectEqualSlices(u8, &kdf1(hx(v.rfc5903_p256.girx)), &platform.shared_secret);
 }
 
 test "protocol one: encrypt is zero-IV AES-256-CBC; decrypt round-trips" {
-    const key = One.kdf(hx(v.rfc5903_p256.girx));
+    const key = kdf1(hx(v.rfc5903_p256.girx));
     const msg = "0123456789abcdef0123456789abcdefTHIRD-BLOCK-...!"; // 48 bytes
     var ct: [48]u8 = undefined;
-    try One.encrypt(key, &ct, msg);
+    try One.encrypt(&key, &ct, msg);
     // Same bytes as the raw CBC primitive with an all-zero IV.
     var ct_raw: [48]u8 = undefined;
-    try Aes256Cbc.encrypt(&ct_raw, msg, key, @splat(0));
+    try Aes256Cbc.encrypt(&ct_raw, msg, &key, @splat(0));
     try t.expectEqualSlices(u8, &ct_raw, &ct);
     // Round-trip.
     var pt: [48]u8 = undefined;
-    try One.decrypt(key, &pt, &ct);
+    try One.decrypt(&key, &pt, &ct);
     try t.expectEqualSlices(u8, msg, &pt);
     // Wrong lengths are typed errors.
-    try t.expectError(error.InvalidLength, One.encrypt(key, ct[0..15], msg[0..15]));
-    try t.expectError(error.InvalidLength, One.decrypt(key, pt[0..32], &ct));
+    try t.expectError(error.InvalidLength, One.encrypt(&key, ct[0..15], msg[0..15]));
+    try t.expectError(error.InvalidLength, One.decrypt(&key, pt[0..32], &ct));
 }
 
 test "protocol one: authenticate/verify, tamper and wrong-length rejection" {
-    const key = One.kdf(hx(v.rfc5903_p256.girx));
+    const key = kdf1(hx(v.rfc5903_p256.girx));
     const msg = "ctap2 pinUvAuthToken payload";
     const sig = try One.authenticate(&key, msg);
     try t.expectEqual(@as(usize, 16), sig.len);
@@ -257,10 +289,10 @@ test "protocol one: authenticate/verify, tamper and wrong-length rejection" {
 test "protocol one: tampered ciphertext fails MAC verification" {
     // CBC alone is malleable; CTAP2 integrity = authenticate over the
     // ciphertext. Tampering must flip verify to false.
-    const key = One.kdf(hx(v.rfc5903_p256.girx));
+    const key = kdf1(hx(v.rfc5903_p256.girx));
     const msg = "0123456789abcdef0123456789abcdef";
     var ct: [32]u8 = undefined;
-    try One.encrypt(key, &ct, msg);
+    try One.encrypt(&key, &ct, msg);
     const sig = try One.authenticate(&key, &ct);
     try t.expect(One.verify(&key, &ct, &sig));
     ct[7] ^= 0x40;
@@ -284,7 +316,7 @@ test "protocol one: an empty key is rejected, not silently authenticated (audit 
 test "protocol two: kdf is zero-salt HKDF with the CTAP2 info strings" {
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
     const z = hx(v.rfc5903_p256.girx);
-    const secret = Two.kdf(z);
+    const secret = kdf2(z);
     const salt: [32]u8 = @splat(0);
     const prk = Hkdf.extract(&salt, &z);
     var hmac_key: [32]u8 = undefined;
@@ -298,42 +330,42 @@ test "protocol two: kdf is zero-salt HKDF with the CTAP2 info strings" {
 }
 
 test "protocol two: encapsulate agrees on both sides" {
-    const platform = try Two.encapsulate(i_priv, gr);
+    const platform = try encap(Two, i_priv, gr);
     try t.expectEqualSlices(u8, &gi.x, &platform.platform_key_agreement.x);
     try t.expectEqualSlices(u8, &gi.y, &platform.platform_key_agreement.y);
-    const authenticator = try Two.encapsulate(r_priv, platform.platform_key_agreement);
+    const authenticator = try encap(Two, r_priv, platform.platform_key_agreement);
     try t.expectEqualSlices(u8, &platform.shared_secret, &authenticator.shared_secret);
-    try t.expectEqualSlices(u8, &Two.kdf(hx(v.rfc5903_p256.girx)), &platform.shared_secret);
+    try t.expectEqualSlices(u8, &kdf2(hx(v.rfc5903_p256.girx)), &platform.shared_secret);
 }
 
 test "protocol two: encrypt emits IV || CBC(aesKey); decrypt round-trips" {
-    const key = Two.kdf(hx(v.rfc5903_p256.girx));
+    const key = kdf2(hx(v.rfc5903_p256.girx));
     const iv = hx(v.nist_sp800_38a_cbc_aes256.iv); // any fixed 16 bytes
     const msg = "0123456789abcdef0123456789abcdef"; // 32 bytes
     try t.expectEqual(@as(usize, 48), Two.encryptedLength(msg.len));
     var ct: [48]u8 = undefined;
-    try Two.encrypt(key, iv, &ct, msg);
+    try Two.encrypt(&key, iv, &ct, msg);
     // Framing: leading IV, then CBC under the AES-key half.
     try t.expectEqualSlices(u8, &iv, ct[0..16]);
     var ct_raw: [32]u8 = undefined;
-    try Aes256Cbc.encrypt(&ct_raw, msg, key[32..64].*, iv);
+    try Aes256Cbc.encrypt(&ct_raw, msg, key[32..64], iv);
     try t.expectEqualSlices(u8, &ct_raw, ct[16..48]);
     // Round-trip.
     try t.expectEqual(@as(usize, 32), try Two.decryptedLength(ct.len));
     var pt: [32]u8 = undefined;
-    try Two.decrypt(key, &pt, &ct);
+    try Two.decrypt(&key, &pt, &ct);
     try t.expectEqualSlices(u8, msg, &pt);
     // A different IV yields a different ciphertext for the same plaintext.
     var ct2: [48]u8 = undefined;
-    try Two.encrypt(key, @splat(0xa5), &ct2, msg);
+    try Two.encrypt(&key, @splat(0xa5), &ct2, msg);
     try t.expect(!std.mem.eql(u8, ct[16..48], ct2[16..48]));
     var pt2: [32]u8 = undefined;
-    try Two.decrypt(key, &pt2, &ct2);
+    try Two.decrypt(&key, &pt2, &ct2);
     try t.expectEqualSlices(u8, msg, &pt2);
 }
 
 test "protocol two: wrong-length inputs are typed errors, no panic" {
-    const key = Two.kdf(hx(v.rfc5903_p256.girx));
+    const key = kdf2(hx(v.rfc5903_p256.girx));
     var buf: [48]u8 = undefined;
     var pt: [32]u8 = undefined;
     // Ciphertext shorter than the IV, or trailing partial block.
@@ -351,21 +383,21 @@ test "protocol two: wrong-length inputs are typed errors, no panic" {
     // check has nowhere left to hide.
     try t.expectError(error.InvalidLength, Two.decryptedLength(17));
     try t.expectError(error.InvalidLength, Two.decryptedLength(33));
-    try t.expectError(error.InvalidLength, Two.decrypt(key, pt[0..0], buf[0..15]));
-    try t.expectError(error.InvalidLength, Two.decrypt(key, pt[0..1], buf[0..17]));
-    try t.expectError(error.InvalidLength, Two.decrypt(key, pt[0..8], buf[0..40]));
+    try t.expectError(error.InvalidLength, Two.decrypt(&key, pt[0..0], buf[0..15]));
+    try t.expectError(error.InvalidLength, Two.decrypt(&key, pt[0..1], buf[0..17]));
+    try t.expectError(error.InvalidLength, Two.decrypt(&key, pt[0..8], buf[0..40]));
     // IV-only ciphertext = empty plaintext, valid.
     const empty_ct = [_]u8{0x11} ** 16;
-    try Two.decrypt(key, pt[0..0], &empty_ct);
+    try Two.decrypt(&key, pt[0..0], &empty_ct);
     // Destination mismatches.
-    try t.expectError(error.InvalidLength, Two.decrypt(key, pt[0..16], &buf));
-    try t.expectError(error.InvalidLength, Two.encrypt(key, @splat(0), buf[0..32], "0123456789abcdef0123456789abcdef"));
+    try t.expectError(error.InvalidLength, Two.decrypt(&key, pt[0..16], &buf));
+    try t.expectError(error.InvalidLength, Two.encrypt(&key, @splat(0), buf[0..32], "0123456789abcdef0123456789abcdef"));
     // Non-block plaintext.
-    try t.expectError(error.InvalidLength, Two.encrypt(key, @splat(0), buf[0..31], "not-a-block-multiple"));
+    try t.expectError(error.InvalidLength, Two.encrypt(&key, @splat(0), buf[0..31], "not-a-block-multiple"));
 }
 
 test "protocol two: authenticate/verify, tamper and wrong-length rejection" {
-    const key = Two.kdf(hx(v.rfc5903_p256.girx));
+    const key = kdf2(hx(v.rfc5903_p256.girx));
     const msg = "ctap2 clientPin command payload";
     const sig = Two.authenticate(key[0..32], msg);
     try t.expectEqual(@as(usize, 32), sig.len);
@@ -397,10 +429,10 @@ test "protocol two: authenticate/verify, tamper and wrong-length rejection" {
 }
 
 test "protocol two: tampered ciphertext (incl. IV) fails MAC verification" {
-    const key = Two.kdf(hx(v.rfc5903_p256.girx));
+    const key = kdf2(hx(v.rfc5903_p256.girx));
     const msg = "0123456789abcdef0123456789abcdef";
     var ct: [48]u8 = undefined;
-    try Two.encrypt(key, @splat(0x3c), &ct, msg);
+    try Two.encrypt(&key, @splat(0x3c), &ct, msg);
     const sig = Two.authenticate(key[0..32], &ct);
     try t.expect(Two.verify(key[0..32], &ct, &sig));
     ct[0] ^= 0x01; // tamper the IV
@@ -424,7 +456,7 @@ test "Impl(): comptime dispatch maps the wire enum to the namespaces" {
     // of calling both the same way.
     inline for (.{ .one, .two }) |p| {
         const P = ctap2pin.Impl(p);
-        const enc = try P.encapsulate(i_priv, gr);
+        const enc = try encap(P, i_priv, gr);
         if (p == .one) {
             const sig = try P.authenticate(&enc.shared_secret, "m");
             try t.expect(P.verify(&enc.shared_secret, "m", &sig));

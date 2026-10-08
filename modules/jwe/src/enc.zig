@@ -22,6 +22,7 @@
 //! the B.2 vector below; its CBC half has no std cipher to call).
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const aead = std.crypto.aead.aes_gcm;
 const aescbc = @import("aescbc");
 
@@ -55,7 +56,25 @@ pub const max_tag_len: usize = 32;
 /// CBC-HMAC: up to one block of PKCS#7 padding larger — size for
 /// `plaintext.len + 16` if you need to support both). Returns the written
 /// ciphertext length.
+///
+/// Runs one frame down and burns the stack the std AES-GCM / AES-CBC + HMAC
+/// code dirtied (key schedules, GHASH keys, ipad / opad: the CEK in several
+/// images), so no CEK copy survives on the dead stack.
 pub fn encrypt(
+    enc: Enc,
+    cek: []const u8,
+    iv: []const u8,
+    aad: []const u8,
+    plaintext: []const u8,
+    ciphertext_out: []u8,
+    tag_out: []u8,
+) Error!usize {
+    const r = encryptUnburned(enc, cek, iv, aad, plaintext, ciphertext_out, tag_out);
+    burn.stack(burn.content_burn);
+    return r;
+}
+
+noinline fn encryptUnburned(
     enc: Enc,
     cek: []const u8,
     iv: []const u8,
@@ -68,8 +87,23 @@ pub fn encrypt(
     return cbc_hmac.encrypt(enc, cek, iv, aad, plaintext, ciphertext_out, tag_out);
 }
 
-/// Decrypt + verify. Returns the written plaintext length.
+/// Decrypt + verify. Returns the written plaintext length. Burned like
+/// `encrypt`.
 pub fn decrypt(
+    enc: Enc,
+    cek: []const u8,
+    iv: []const u8,
+    aad: []const u8,
+    ciphertext: []const u8,
+    tag: []const u8,
+    plaintext_out: []u8,
+) Error!usize {
+    const r = decryptUnburned(enc, cek, iv, aad, ciphertext, tag, plaintext_out);
+    burn.stack(burn.content_burn);
+    return r;
+}
+
+noinline fn decryptUnburned(
     enc: Enc,
     cek: []const u8,
     iv: []const u8,

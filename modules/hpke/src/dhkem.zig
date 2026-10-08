@@ -33,6 +33,7 @@ const suite = @import("suite.zig");
 // point either takes the ephemeral keypair as a parameter or derives from a
 // caller-supplied `ikm`.
 const entropy = @import("entropy");
+const burn = @import("burn.zig");
 // P-256 curve group for the DHKEM(P-256, …) suite from the asm-accelerated
 // `p256` module (byte-exact to `std.crypto.ecc.P256`). The X25519 KEM path
 // stays on std (p256 covers only the P-256 curve). P-384 has no local
@@ -93,17 +94,17 @@ fn extractAndExpand(
     comptime Hkdf: type,
     comptime kem_id: u16,
     comptime Nsecret: usize,
+    out: *[Nsecret]u8,
     dh: []const u8,
     kem_context: []const u8,
-) [Nsecret]u8 {
+) void {
     const kem_suite_id = comptime suite.kemSuiteId(kem_id);
-    const eae_prk = suite.labeledExtract(Hkdf, &kem_suite_id, "", "eae_prk", dh);
-    var shared_secret: [Nsecret]u8 = undefined;
+    var eae_prk: [Hkdf.prk_length]u8 = undefined;
+    suite.labeledExtract(Hkdf, &eae_prk, &kem_suite_id, "", "eae_prk", dh);
     // kem_context tops out at 291 bytes (P-384 auth mode: 3 × 97-byte SEC1
     // points) — far inside labeledExpand's 512-byte scratch, so
     // error.LabelTooLong is structurally unreachable here.
-    suite.labeledExpand(Hkdf, &kem_suite_id, eae_prk, "shared_secret", kem_context, &shared_secret) catch unreachable;
-    return shared_secret;
+    suite.labeledExpand(Hkdf, &kem_suite_id, &eae_prk, "shared_secret", kem_context, out) catch unreachable;
 }
 
 // ── DHKEM(X25519, HKDF-SHA256) — RFC 9180 §7.1, kem_id 0x0020 ───────────
@@ -144,11 +145,11 @@ pub const X25519Kem = struct {
     /// Routing through `deriveKeyPair` instead of open-coding std's
     /// retry loop also puts the KEYGEN path under this file's RFC 9180
     /// A.1.1 known-answer test, which `KeyPair.generate` never was.
-    pub fn generateKeyPair(io: std.Io) KeyPair {
+    pub fn generateKeyPair(out: *KeyPair, io: std.Io) void {
         var ikm: [Nsk]u8 = undefined;
         defer std.crypto.secureZero(u8, &ikm);
         entropy.fill(io, &ikm);
-        return deriveKeyPair(&ikm);
+        deriveKeyPair(out, &ikm);
     }
 
     /// RFC 9180 §7.1.3 `DeriveKeyPair(ikm)` for X25519: `dkp_prk =
@@ -165,23 +166,31 @@ pub const X25519Kem = struct {
     /// `skRm`/`pkRm` from `ikmR`) byte-exact — proving std stores the
     /// derived seed as `secret_key` verbatim (unclamped at rest, clamped
     /// at use inside `scalarmult`, exactly the RFC's serialization).
-    pub fn deriveKeyPair(ikm: []const u8) KeyPair {
+    pub fn deriveKeyPair(out: *KeyPair, ikm: []const u8) void {
+        burn.run(burn.kem_burn, void, deriveKeyPairBody, .{ out, ikm });
+    }
+
+    fn deriveKeyPairBody(out: *KeyPair, ikm: []const u8) void {
         const kem_suite_id = comptime suite.kemSuiteId(kem_id);
-        const dkp_prk = suite.labeledExtract(HkdfSha256, &kem_suite_id, "", "dkp_prk", ikm);
+        var dkp_prk: [HkdfSha256.prk_length]u8 = undefined;
+        suite.labeledExtract(HkdfSha256, &dkp_prk, &kem_suite_id, "", "dkp_prk", ikm);
         var sk: [Nsk]u8 = undefined;
         // Empty info + tiny label: LabelTooLong structurally unreachable.
-        suite.labeledExpand(HkdfSha256, &kem_suite_id, dkp_prk, "sk", "", &sk) catch unreachable;
+        suite.labeledExpand(HkdfSha256, &kem_suite_id, &dkp_prk, "sk", "", &sk) catch unreachable;
         // A clamped X25519 scalar (high bit pattern forced by RFC 7748
         // clamping) times the basepoint can never land on the identity, so
         // generateDeterministic's IdentityElementError is unreachable.
-        return KeyPair.generateDeterministic(sk) catch unreachable;
+        out.* = KeyPair.generateDeterministic(sk) catch unreachable;
     }
 
     /// RFC 9180 §4.1 `Encap(pkR)`, real-randomness entry point: draw a
     /// fresh ephemeral keypair via `io`, then defer to
     /// `encapDeterministic`.
-    pub fn encap(pkR: PublicKey, io: std.Io) EncapError!Encapped {
-        return encapDeterministic(pkR, generateKeyPair(io));
+    pub fn encap(out: *Encapped, pkR: PublicKey, io: std.Io) EncapError!void {
+        var eph: KeyPair = undefined;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+        generateKeyPair(&eph, io);
+        return encapDeterministic(out, pkR, &eph);
     }
 
     /// RFC 9180 §4.1 `Encap(pkR)`, ephemeral-injected for KAT
@@ -210,15 +219,17 @@ pub const X25519Kem = struct {
     /// (`IdentityElementError`), mapped to `error.DhFailed` here.
     ///
     /// KAT: RFC 9180 A.1.1 `enc`/`shared_secret`, byte-exact.
-    pub fn encapDeterministic(pkR: PublicKey, eph: KeyPair) EncapError!Encapped {
-        const dh = std.crypto.dh.X25519.scalarmult(eph.secret_key, pkR) catch return error.DhFailed;
+    pub fn encapDeterministic(out: *Encapped, pkR: PublicKey, eph: *const KeyPair) EncapError!void {
+        return burn.run(burn.kem_burn, EncapError!void, encapBody, .{ out, &pkR, eph });
+    }
+
+    fn encapBody(out: *Encapped, pkR: *const PublicKey, eph: *const KeyPair) EncapError!void {
+        const dh = std.crypto.dh.X25519.scalarmult(eph.secret_key, pkR.*) catch return error.DhFailed;
         var kem_context: [2 * Npk]u8 = undefined;
         kem_context[0..Npk].* = eph.public_key;
-        kem_context[Npk..].* = pkR;
-        return .{
-            .shared_secret = extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context),
-            .enc = eph.public_key,
-        };
+        kem_context[Npk..].* = pkR.*;
+        extractAndExpand(HkdfSha256, kem_id, Nsecret, &out.shared_secret, &dh, &kem_context);
+        out.enc = eph.public_key;
     }
 
     /// RFC 9180 §4.1 `Decap(enc, skR)` — the mirror of `encapDeterministic`:
@@ -232,12 +243,16 @@ pub const X25519Kem = struct {
     /// Must produce the IDENTICAL `shared_secret` `encapDeterministic`
     /// computed for the matching `(skE, pkR)` pair — the round-trip
     /// invariant the A.1.1 KAT checks.
-    pub fn decap(enc: EncappedKey, skR: KeyPair) DecapError![Nsecret]u8 {
-        const dh = std.crypto.dh.X25519.scalarmult(skR.secret_key, enc) catch return error.DhFailed;
+    pub fn decap(out: *[Nsecret]u8, enc: EncappedKey, skR: *const KeyPair) DecapError!void {
+        return burn.run(burn.kem_burn, DecapError!void, decapBody, .{ out, &enc, skR });
+    }
+
+    fn decapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair) DecapError!void {
+        const dh = std.crypto.dh.X25519.scalarmult(skR.secret_key, enc.*) catch return error.DhFailed;
         var kem_context: [2 * Npk]u8 = undefined;
-        kem_context[0..Npk].* = enc;
+        kem_context[0..Npk].* = enc.*;
         kem_context[Npk..].* = skR.public_key;
-        return extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context);
+        extractAndExpand(HkdfSha256, kem_id, Nsecret, out, &dh, &kem_context);
     }
 
     /// RFC 9180 §4.1 `AuthEncap(pkR, skS)` (auth / auth_psk modes): adds a
@@ -254,18 +269,20 @@ pub const X25519Kem = struct {
     /// Ephemeral-injected for KAT reproducibility, matching
     /// `encapDeterministic`. `dh || dh2` is ONE 64-byte ikm to
     /// `LabeledExtract`, not two separate extractions.
-    pub fn authEncapDeterministic(pkR: PublicKey, skS: KeyPair, eph: KeyPair) EncapError!Encapped {
+    pub fn authEncapDeterministic(out: *Encapped, pkR: PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        return burn.run(burn.kem_burn, EncapError!void, authEncapBody, .{ out, &pkR, skS, eph });
+    }
+
+    fn authEncapBody(out: *Encapped, pkR: *const PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
         var dh: [64]u8 = undefined;
-        dh[0..32].* = std.crypto.dh.X25519.scalarmult(eph.secret_key, pkR) catch return error.DhFailed;
-        dh[32..].* = std.crypto.dh.X25519.scalarmult(skS.secret_key, pkR) catch return error.DhFailed;
+        dh[0..32].* = std.crypto.dh.X25519.scalarmult(eph.secret_key, pkR.*) catch return error.DhFailed;
+        dh[32..].* = std.crypto.dh.X25519.scalarmult(skS.secret_key, pkR.*) catch return error.DhFailed;
         var kem_context: [3 * Npk]u8 = undefined;
         kem_context[0..Npk].* = eph.public_key;
-        kem_context[Npk .. 2 * Npk].* = pkR;
+        kem_context[Npk .. 2 * Npk].* = pkR.*;
         kem_context[2 * Npk ..].* = skS.public_key;
-        return .{
-            .shared_secret = extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context),
-            .enc = eph.public_key,
-        };
+        extractAndExpand(HkdfSha256, kem_id, Nsecret, &out.shared_secret, &dh, &kem_context);
+        out.enc = eph.public_key;
     }
 
     /// RFC 9180 §4.1 `AuthDecap(enc, skR, pkS)` — the mirror:
@@ -276,15 +293,19 @@ pub const X25519Kem = struct {
     /// kem_context = enc || pk(skR) || pkS
     /// shared_secret = ExtractAndExpand(dh || dh2, kem_context)
     /// ```
-    pub fn authDecap(enc: EncappedKey, skR: KeyPair, pkS: PublicKey) DecapError![Nsecret]u8 {
+    pub fn authDecap(out: *[Nsecret]u8, enc: EncappedKey, skR: *const KeyPair, pkS: PublicKey) DecapError!void {
+        return burn.run(burn.kem_burn, DecapError!void, authDecapBody, .{ out, &enc, skR, &pkS });
+    }
+
+    fn authDecapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair, pkS: *const PublicKey) DecapError!void {
         var dh: [64]u8 = undefined;
-        dh[0..32].* = std.crypto.dh.X25519.scalarmult(skR.secret_key, enc) catch return error.DhFailed;
-        dh[32..].* = std.crypto.dh.X25519.scalarmult(skR.secret_key, pkS) catch return error.DhFailed;
+        dh[0..32].* = std.crypto.dh.X25519.scalarmult(skR.secret_key, enc.*) catch return error.DhFailed;
+        dh[32..].* = std.crypto.dh.X25519.scalarmult(skR.secret_key, pkS.*) catch return error.DhFailed;
         var kem_context: [3 * Npk]u8 = undefined;
-        kem_context[0..Npk].* = enc;
+        kem_context[0..Npk].* = enc.*;
         kem_context[Npk .. 2 * Npk].* = skR.public_key;
-        kem_context[2 * Npk ..].* = pkS;
-        return extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context);
+        kem_context[2 * Npk ..].* = pkS.*;
+        extractAndExpand(HkdfSha256, kem_id, Nsecret, out, &dh, &kem_context);
     }
 };
 
@@ -328,11 +349,11 @@ pub const P256Kem = struct {
     /// that loop here, all three KEMs go through the RFC's own
     /// `DeriveKeyPair`, whose rejection sampling this file already owns
     /// and A.3.3 already pins.
-    pub fn generateKeyPair(io: std.Io) KeyPair {
+    pub fn generateKeyPair(out: *KeyPair, io: std.Io) void {
         var ikm: [Nsk]u8 = undefined;
         defer std.crypto.secureZero(u8, &ikm);
         entropy.fill(io, &ikm);
-        return deriveKeyPair(&ikm);
+        deriveKeyPair(out, &ikm);
     }
 
     /// RFC 9180 §7.1.3 `DeriveKeyPair(ikm)` for P-256: same `dkp_prk`/
@@ -351,20 +372,26 @@ pub const P256Kem = struct {
     /// cryptographically unreachable; this implementation fails closed
     /// with a panic there rather than widening the signature with an
     /// error no caller could meaningfully handle.
-    pub fn deriveKeyPair(ikm: []const u8) KeyPair {
+    pub fn deriveKeyPair(out: *KeyPair, ikm: []const u8) void {
+        burn.run(burn.kem_burn, void, deriveKeyPairBody, .{ out, ikm });
+    }
+
+    fn deriveKeyPairBody(out: *KeyPair, ikm: []const u8) void {
         const kem_suite_id = comptime suite.kemSuiteId(kem_id);
-        const dkp_prk = suite.labeledExtract(HkdfSha256, &kem_suite_id, "", "dkp_prk", ikm);
+        var dkp_prk: [HkdfSha256.prk_length]u8 = undefined;
+        suite.labeledExtract(HkdfSha256, &dkp_prk, &kem_suite_id, "", "dkp_prk", ikm);
         var counter: u16 = 0;
         while (counter <= 255) : (counter += 1) {
             const ctr = suite.i2osp(1, counter);
             var candidate: [Nsk]u8 = undefined;
-            suite.labeledExpand(HkdfSha256, &kem_suite_id, dkp_prk, "candidate", &ctr, &candidate) catch unreachable;
+            suite.labeledExpand(HkdfSha256, &kem_suite_id, &dkp_prk, "candidate", &ctr, &candidate) catch unreachable;
             candidate[0] &= 0xff; // RFC 9180 §7.1.3 bitmask (0xFF for P-256)
             P256.scalar.rejectNonCanonical(candidate, .big) catch continue; // sk >= n
             if (std.mem.allEqual(u8, &candidate, 0)) continue; // sk == 0
             // basePoint * nonzero canonical scalar never hits the identity.
             const pk_point = P256.basePoint.mul(candidate, .big) catch unreachable;
-            return .{ .secret_key = candidate, .public_key = pk_point.toUncompressedSec1() };
+            out.* = .{ .secret_key = candidate, .public_key = pk_point.toUncompressedSec1() };
+            return;
         }
         @panic("hpke: P-256 DeriveKeyPair exhausted 256 candidates (probability ~2^-8192; RFC 9180 7.1.3 DeriveKeyPairError)");
     }
@@ -386,41 +413,54 @@ pub const P256Kem = struct {
     /// ```
     ///
     /// KAT: RFC 9180 A.3 `enc`/`shared_secret`, byte-exact.
-    pub fn encapDeterministic(pkR: PublicKey, eph: KeyPair) EncapError!Encapped {
-        const pkR_point = P256.fromSec1(&pkR) catch return error.DeserializeError;
+    pub fn encapDeterministic(out: *Encapped, pkR: PublicKey, eph: *const KeyPair) EncapError!void {
+        return burn.run(burn.kem_burn, EncapError!void, encapBody, .{ out, &pkR, eph });
+    }
+
+    fn encapBody(out: *Encapped, pkR: *const PublicKey, eph: *const KeyPair) EncapError!void {
+        const pkR_point = P256.fromSec1(pkR) catch return error.DeserializeError;
         const shared_point = pkR_point.mul(eph.secret_key, .big) catch return error.DhFailed;
         const dh = shared_point.affineCoordinates().x.toBytes(.big);
         var kem_context: [2 * Npk]u8 = undefined;
         kem_context[0..Npk].* = eph.public_key;
-        kem_context[Npk..].* = pkR;
-        return .{
-            .shared_secret = extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context),
-            .enc = eph.public_key,
-        };
+        kem_context[Npk..].* = pkR.*;
+        extractAndExpand(HkdfSha256, kem_id, Nsecret, &out.shared_secret, &dh, &kem_context);
+        out.enc = eph.public_key;
     }
 
-    pub fn encap(pkR: PublicKey, io: std.Io) EncapError!Encapped {
-        return encapDeterministic(pkR, generateKeyPair(io));
+    pub fn encap(out: *Encapped, pkR: PublicKey, io: std.Io) EncapError!void {
+        var eph: KeyPair = undefined;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+        generateKeyPair(&eph, io);
+        return encapDeterministic(out, pkR, &eph);
     }
 
     /// Mirror of `encapDeterministic`: `dh = P256.fromSec1(&enc).mul(skR.secret_key,
     /// .big).affineCoordinates().x.toBytes(.big)`; `kem_context = enc ||
     /// skR.public_key`.
-    pub fn decap(enc: EncappedKey, skR: KeyPair) DecapError![Nsecret]u8 {
-        const enc_point = P256.fromSec1(&enc) catch return error.DeserializeError;
+    pub fn decap(out: *[Nsecret]u8, enc: EncappedKey, skR: *const KeyPair) DecapError!void {
+        return burn.run(burn.kem_burn, DecapError!void, decapBody, .{ out, &enc, skR });
+    }
+
+    fn decapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair) DecapError!void {
+        const enc_point = P256.fromSec1(enc) catch return error.DeserializeError;
         const shared_point = enc_point.mul(skR.secret_key, .big) catch return error.DhFailed;
         const dh = shared_point.affineCoordinates().x.toBytes(.big);
         var kem_context: [2 * Npk]u8 = undefined;
-        kem_context[0..Npk].* = enc;
+        kem_context[0..Npk].* = enc.*;
         kem_context[Npk..].* = skR.public_key;
-        return extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context);
+        extractAndExpand(HkdfSha256, kem_id, Nsecret, out, &dh, &kem_context);
     }
 
     /// RFC 9180 §4.1 `AuthEncap(pkR, skS)` for P-256 — same `dh || dh2`
     /// fold as `X25519Kem.authEncapDeterministic`, with each `dh`/`dh2`
     /// being the 32-byte X coordinate (not the raw scalarmult output).
-    pub fn authEncapDeterministic(pkR: PublicKey, skS: KeyPair, eph: KeyPair) EncapError!Encapped {
-        const pkR_point = P256.fromSec1(&pkR) catch return error.DeserializeError;
+    pub fn authEncapDeterministic(out: *Encapped, pkR: PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        return burn.run(burn.kem_burn, EncapError!void, authEncapBody, .{ out, &pkR, skS, eph });
+    }
+
+    fn authEncapBody(out: *Encapped, pkR: *const PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        const pkR_point = P256.fromSec1(pkR) catch return error.DeserializeError;
         var dh: [64]u8 = undefined;
         const p1 = pkR_point.mul(eph.secret_key, .big) catch return error.DhFailed;
         dh[0..32].* = p1.affineCoordinates().x.toBytes(.big);
@@ -428,27 +468,29 @@ pub const P256Kem = struct {
         dh[32..].* = p2.affineCoordinates().x.toBytes(.big);
         var kem_context: [3 * Npk]u8 = undefined;
         kem_context[0..Npk].* = eph.public_key;
-        kem_context[Npk .. 2 * Npk].* = pkR;
+        kem_context[Npk .. 2 * Npk].* = pkR.*;
         kem_context[2 * Npk ..].* = skS.public_key;
-        return .{
-            .shared_secret = extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context),
-            .enc = eph.public_key,
-        };
+        extractAndExpand(HkdfSha256, kem_id, Nsecret, &out.shared_secret, &dh, &kem_context);
+        out.enc = eph.public_key;
     }
 
-    pub fn authDecap(enc: EncappedKey, skR: KeyPair, pkS: PublicKey) DecapError![Nsecret]u8 {
-        const enc_point = P256.fromSec1(&enc) catch return error.DeserializeError;
-        const pkS_point = P256.fromSec1(&pkS) catch return error.DeserializeError;
+    pub fn authDecap(out: *[Nsecret]u8, enc: EncappedKey, skR: *const KeyPair, pkS: PublicKey) DecapError!void {
+        return burn.run(burn.kem_burn, DecapError!void, authDecapBody, .{ out, &enc, skR, &pkS });
+    }
+
+    fn authDecapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair, pkS: *const PublicKey) DecapError!void {
+        const enc_point = P256.fromSec1(enc) catch return error.DeserializeError;
+        const pkS_point = P256.fromSec1(pkS) catch return error.DeserializeError;
         var dh: [64]u8 = undefined;
         const p1 = enc_point.mul(skR.secret_key, .big) catch return error.DhFailed;
         dh[0..32].* = p1.affineCoordinates().x.toBytes(.big);
         const p2 = pkS_point.mul(skR.secret_key, .big) catch return error.DhFailed;
         dh[32..].* = p2.affineCoordinates().x.toBytes(.big);
         var kem_context: [3 * Npk]u8 = undefined;
-        kem_context[0..Npk].* = enc;
+        kem_context[0..Npk].* = enc.*;
         kem_context[Npk .. 2 * Npk].* = skR.public_key;
-        kem_context[2 * Npk ..].* = pkS;
-        return extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context);
+        kem_context[2 * Npk ..].* = pkS.*;
+        extractAndExpand(HkdfSha256, kem_id, Nsecret, out, &dh, &kem_context);
     }
 };
 
@@ -503,11 +545,11 @@ pub const P384Kem = struct {
     /// vector (see this type's doc comment), so unlike its two siblings the
     /// keygen path here gains no external anchor from the move — only the
     /// fail-closed draw and one shape across all three KEMs.
-    pub fn generateKeyPair(io: std.Io) KeyPair {
+    pub fn generateKeyPair(out: *KeyPair, io: std.Io) void {
         var ikm: [Nsk]u8 = undefined;
         defer std.crypto.secureZero(u8, &ikm);
         entropy.fill(io, &ikm);
-        return deriveKeyPair(&ikm);
+        deriveKeyPair(out, &ikm);
     }
 
     /// RFC 9180 §7.1.3 `DeriveKeyPair(ikm)` for P-384 — the same
@@ -517,20 +559,26 @@ pub const P384Kem = struct {
     /// except P-521, which needs 0x01 to narrow a 528-bit encoding down to
     /// P-521's 521-bit order — P-384's Nsk=48 bytes = 384 bits already
     /// matches its order's bit length, same reasoning as P-256).
-    pub fn deriveKeyPair(ikm: []const u8) KeyPair {
+    pub fn deriveKeyPair(out: *KeyPair, ikm: []const u8) void {
+        burn.run(burn.kem_burn, void, deriveKeyPairBody, .{ out, ikm });
+    }
+
+    fn deriveKeyPairBody(out: *KeyPair, ikm: []const u8) void {
         const kem_suite_id = comptime suite.kemSuiteId(kem_id);
-        const dkp_prk = suite.labeledExtract(HkdfSha384, &kem_suite_id, "", "dkp_prk", ikm);
+        var dkp_prk: [HkdfSha384.prk_length]u8 = undefined;
+        suite.labeledExtract(HkdfSha384, &dkp_prk, &kem_suite_id, "", "dkp_prk", ikm);
         var counter: u16 = 0;
         while (counter <= 255) : (counter += 1) {
             const ctr = suite.i2osp(1, counter);
             var candidate: [Nsk]u8 = undefined;
-            suite.labeledExpand(HkdfSha384, &kem_suite_id, dkp_prk, "candidate", &ctr, &candidate) catch unreachable;
+            suite.labeledExpand(HkdfSha384, &kem_suite_id, &dkp_prk, "candidate", &ctr, &candidate) catch unreachable;
             candidate[0] &= 0xff; // RFC 9180 §7.1.3 bitmask (0xFF for P-384)
             P384.scalar.rejectNonCanonical(candidate, .big) catch continue; // sk >= n
             if (std.mem.allEqual(u8, &candidate, 0)) continue; // sk == 0
             // basePoint * nonzero canonical scalar never hits the identity.
             const pk_point = P384.basePoint.mul(candidate, .big) catch unreachable;
-            return .{ .secret_key = candidate, .public_key = pk_point.toUncompressedSec1() };
+            out.* = .{ .secret_key = candidate, .public_key = pk_point.toUncompressedSec1() };
+            return;
         }
         @panic("hpke: P-384 DeriveKeyPair exhausted 256 candidates (probability ~2^-8192; RFC 9180 7.1.3 DeriveKeyPairError)");
     }
@@ -538,38 +586,51 @@ pub const P384Kem = struct {
     /// RFC 9180 §4.1/§7.1.2 `Encap(pkR)` for P-384 — same shape as
     /// `P256Kem.encapDeterministic`: x-coordinate-only ECDH, `Nsecret=48`
     /// via `HkdfSha384`.
-    pub fn encapDeterministic(pkR: PublicKey, eph: KeyPair) EncapError!Encapped {
-        const pkR_point = P384.fromSec1(&pkR) catch return error.DeserializeError;
+    pub fn encapDeterministic(out: *Encapped, pkR: PublicKey, eph: *const KeyPair) EncapError!void {
+        return burn.run(burn.kem_burn, EncapError!void, encapBody, .{ out, &pkR, eph });
+    }
+
+    fn encapBody(out: *Encapped, pkR: *const PublicKey, eph: *const KeyPair) EncapError!void {
+        const pkR_point = P384.fromSec1(pkR) catch return error.DeserializeError;
         const shared_point = pkR_point.mul(eph.secret_key, .big) catch return error.DhFailed;
         const dh = shared_point.affineCoordinates().x.toBytes(.big);
         var kem_context: [2 * Npk]u8 = undefined;
         kem_context[0..Npk].* = eph.public_key;
-        kem_context[Npk..].* = pkR;
-        return .{
-            .shared_secret = extractAndExpand(HkdfSha384, kem_id, Nsecret, &dh, &kem_context),
-            .enc = eph.public_key,
-        };
+        kem_context[Npk..].* = pkR.*;
+        extractAndExpand(HkdfSha384, kem_id, Nsecret, &out.shared_secret, &dh, &kem_context);
+        out.enc = eph.public_key;
     }
 
-    pub fn encap(pkR: PublicKey, io: std.Io) EncapError!Encapped {
-        return encapDeterministic(pkR, generateKeyPair(io));
+    pub fn encap(out: *Encapped, pkR: PublicKey, io: std.Io) EncapError!void {
+        var eph: KeyPair = undefined;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+        generateKeyPair(&eph, io);
+        return encapDeterministic(out, pkR, &eph);
     }
 
     /// Mirror of `encapDeterministic`.
-    pub fn decap(enc: EncappedKey, skR: KeyPair) DecapError![Nsecret]u8 {
-        const enc_point = P384.fromSec1(&enc) catch return error.DeserializeError;
+    pub fn decap(out: *[Nsecret]u8, enc: EncappedKey, skR: *const KeyPair) DecapError!void {
+        return burn.run(burn.kem_burn, DecapError!void, decapBody, .{ out, &enc, skR });
+    }
+
+    fn decapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair) DecapError!void {
+        const enc_point = P384.fromSec1(enc) catch return error.DeserializeError;
         const shared_point = enc_point.mul(skR.secret_key, .big) catch return error.DhFailed;
         const dh = shared_point.affineCoordinates().x.toBytes(.big);
         var kem_context: [2 * Npk]u8 = undefined;
-        kem_context[0..Npk].* = enc;
+        kem_context[0..Npk].* = enc.*;
         kem_context[Npk..].* = skR.public_key;
-        return extractAndExpand(HkdfSha384, kem_id, Nsecret, &dh, &kem_context);
+        extractAndExpand(HkdfSha384, kem_id, Nsecret, out, &dh, &kem_context);
     }
 
     /// RFC 9180 §4.1 `AuthEncap(pkR, skS)` for P-384 — same `dh || dh2`
     /// fold as `P256Kem.authEncapDeterministic`.
-    pub fn authEncapDeterministic(pkR: PublicKey, skS: KeyPair, eph: KeyPair) EncapError!Encapped {
-        const pkR_point = P384.fromSec1(&pkR) catch return error.DeserializeError;
+    pub fn authEncapDeterministic(out: *Encapped, pkR: PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        return burn.run(burn.kem_burn, EncapError!void, authEncapBody, .{ out, &pkR, skS, eph });
+    }
+
+    fn authEncapBody(out: *Encapped, pkR: *const PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        const pkR_point = P384.fromSec1(pkR) catch return error.DeserializeError;
         var dh: [2 * Nsk]u8 = undefined;
         const p1 = pkR_point.mul(eph.secret_key, .big) catch return error.DhFailed;
         dh[0..Nsk].* = p1.affineCoordinates().x.toBytes(.big);
@@ -577,27 +638,29 @@ pub const P384Kem = struct {
         dh[Nsk..].* = p2.affineCoordinates().x.toBytes(.big);
         var kem_context: [3 * Npk]u8 = undefined;
         kem_context[0..Npk].* = eph.public_key;
-        kem_context[Npk .. 2 * Npk].* = pkR;
+        kem_context[Npk .. 2 * Npk].* = pkR.*;
         kem_context[2 * Npk ..].* = skS.public_key;
-        return .{
-            .shared_secret = extractAndExpand(HkdfSha384, kem_id, Nsecret, &dh, &kem_context),
-            .enc = eph.public_key,
-        };
+        extractAndExpand(HkdfSha384, kem_id, Nsecret, &out.shared_secret, &dh, &kem_context);
+        out.enc = eph.public_key;
     }
 
-    pub fn authDecap(enc: EncappedKey, skR: KeyPair, pkS: PublicKey) DecapError![Nsecret]u8 {
-        const enc_point = P384.fromSec1(&enc) catch return error.DeserializeError;
-        const pkS_point = P384.fromSec1(&pkS) catch return error.DeserializeError;
+    pub fn authDecap(out: *[Nsecret]u8, enc: EncappedKey, skR: *const KeyPair, pkS: PublicKey) DecapError!void {
+        return burn.run(burn.kem_burn, DecapError!void, authDecapBody, .{ out, &enc, skR, &pkS });
+    }
+
+    fn authDecapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair, pkS: *const PublicKey) DecapError!void {
+        const enc_point = P384.fromSec1(enc) catch return error.DeserializeError;
+        const pkS_point = P384.fromSec1(pkS) catch return error.DeserializeError;
         var dh: [2 * Nsk]u8 = undefined;
         const p1 = enc_point.mul(skR.secret_key, .big) catch return error.DhFailed;
         dh[0..Nsk].* = p1.affineCoordinates().x.toBytes(.big);
         const p2 = pkS_point.mul(skR.secret_key, .big) catch return error.DhFailed;
         dh[Nsk..].* = p2.affineCoordinates().x.toBytes(.big);
         var kem_context: [3 * Npk]u8 = undefined;
-        kem_context[0..Npk].* = enc;
+        kem_context[0..Npk].* = enc.*;
         kem_context[Npk .. 2 * Npk].* = skR.public_key;
-        kem_context[2 * Npk ..].* = pkS;
-        return extractAndExpand(HkdfSha384, kem_id, Nsecret, &dh, &kem_context);
+        kem_context[2 * Npk ..].* = pkS.*;
+        extractAndExpand(HkdfSha384, kem_id, Nsecret, out, &dh, &kem_context);
     }
 };
 
@@ -638,20 +701,24 @@ test "DHKEM X25519 Encap/Decap: RFC 9180 A.1.1 enc/shared_secret, byte-exact" {
     // this test borrows them rather than duplicating the hex constants.
     const a1 = @import("kat_rfc9180.zig").a1;
     const eph = X25519Kem.KeyPair{ .secret_key = a1.skEm, .public_key = a1.pkEm };
-    const got = try X25519Kem.encapDeterministic(a1.pkRm, eph);
+    var got: X25519Kem.Encapped = undefined;
+    try X25519Kem.encapDeterministic(&got, a1.pkRm, &eph);
     try testing.expectEqualSlices(u8, &a1.enc, &got.enc);
     try testing.expectEqualSlices(u8, &a1.shared_secret, &got.shared_secret);
     const skR = X25519Kem.KeyPair{ .secret_key = a1.skRm, .public_key = a1.pkRm };
-    const dec = try X25519Kem.decap(got.enc, skR);
+    var dec: [X25519Kem.Nsecret]u8 = undefined;
+    try X25519Kem.decap(&dec, got.enc, &skR);
     try testing.expectEqualSlices(u8, &a1.shared_secret, &dec);
 }
 
 test "DHKEM X25519 deriveKeyPair: RFC 9180 A.1.1 skEm/pkEm from ikmE (and skRm/pkRm from ikmR), byte-exact" {
     const a1 = @import("kat_rfc9180.zig").a1;
-    const kpE = X25519Kem.deriveKeyPair(&a1.ikmE);
+    var kpE: X25519Kem.KeyPair = undefined;
+    X25519Kem.deriveKeyPair(&kpE, &a1.ikmE);
     try testing.expectEqualSlices(u8, &a1.skEm, &kpE.secret_key);
     try testing.expectEqualSlices(u8, &a1.pkEm, &kpE.public_key);
-    const kpR = X25519Kem.deriveKeyPair(&a1.ikmR);
+    var kpR: X25519Kem.KeyPair = undefined;
+    X25519Kem.deriveKeyPair(&kpR, &a1.ikmR);
     try testing.expectEqualSlices(u8, &a1.skRm, &kpR.secret_key);
     try testing.expectEqualSlices(u8, &a1.pkRm, &kpR.public_key);
 }
@@ -663,9 +730,15 @@ test "DHKEM X25519 Encap: low-order pkR (all-zero DH output) fails closed with e
     const a1 = @import("kat_rfc9180.zig").a1;
     const low_order_pk = [_]u8{0} ** 32;
     const eph = X25519Kem.KeyPair{ .secret_key = a1.skEm, .public_key = a1.pkEm };
-    try testing.expectError(error.DhFailed, X25519Kem.encapDeterministic(low_order_pk, eph));
+    try testing.expectError(error.DhFailed, blk: {
+        var o: X25519Kem.Encapped = undefined;
+        break :blk X25519Kem.encapDeterministic(&o, low_order_pk, &eph);
+    });
     const skR = X25519Kem.KeyPair{ .secret_key = a1.skRm, .public_key = a1.pkRm };
-    try testing.expectError(error.DhFailed, X25519Kem.decap(low_order_pk, skR));
+    try testing.expectError(error.DhFailed, blk: {
+        var o: [X25519Kem.Nsecret]u8 = undefined;
+        break :blk X25519Kem.decap(&o, low_order_pk, &skR);
+    });
 }
 
 test "DHKEM X25519 AuthEncap/AuthDecap: self-consistency round trip + wrong-pkS divergence" {
@@ -676,28 +749,37 @@ test "DHKEM X25519 AuthEncap/AuthDecap: self-consistency round trip + wrong-pkS 
     // bearing rather than decorative. Round-trip agreement alone would
     // prove nothing about spec conformance (both sides could share one
     // misreading), which is exactly why the vectors came first.
-    const skR = X25519Kem.deriveKeyPair("hpke auth-mode test receiver ikm");
-    const skS = X25519Kem.deriveKeyPair("hpke auth-mode test sender ikm");
-    const eph = X25519Kem.deriveKeyPair("hpke auth-mode test ephemeral ikm");
-    const got = try X25519Kem.authEncapDeterministic(skR.public_key, skS, eph);
+    var skR: X25519Kem.KeyPair = undefined;
+    X25519Kem.deriveKeyPair(&skR, "hpke auth-mode test receiver ikm");
+    var skS: X25519Kem.KeyPair = undefined;
+    X25519Kem.deriveKeyPair(&skS, "hpke auth-mode test sender ikm");
+    var eph: X25519Kem.KeyPair = undefined;
+    X25519Kem.deriveKeyPair(&eph, "hpke auth-mode test ephemeral ikm");
+    var got: X25519Kem.Encapped = undefined;
+    try X25519Kem.authEncapDeterministic(&got, skR.public_key, &skS, &eph);
     try testing.expectEqualSlices(u8, &eph.public_key, &got.enc);
-    const dec = try X25519Kem.authDecap(got.enc, skR, skS.public_key);
+    var dec: [X25519Kem.Nsecret]u8 = undefined;
+    try X25519Kem.authDecap(&dec, got.enc, &skR, skS.public_key);
     try testing.expectEqualSlices(u8, &got.shared_secret, &dec);
     // A wrong sender key must NOT decap to the same secret (the auth
     // binding is real, not decorative).
-    const wrong = X25519Kem.deriveKeyPair("hpke auth-mode test WRONG sender");
-    const dec_wrong = try X25519Kem.authDecap(got.enc, skR, wrong.public_key);
+    var wrong: X25519Kem.KeyPair = undefined;
+    X25519Kem.deriveKeyPair(&wrong, "hpke auth-mode test WRONG sender");
+    var dec_wrong: [X25519Kem.Nsecret]u8 = undefined;
+    try X25519Kem.authDecap(&dec_wrong, got.enc, &skR, wrong.public_key);
     try testing.expect(!std.mem.eql(u8, &got.shared_secret, &dec_wrong));
 }
 
 test "DHKEM P-256 Encap/Decap: RFC 9180 A.3 enc/shared_secret, byte-exact" {
     const a3 = @import("kat_rfc9180.zig").a3;
     const eph = P256Kem.KeyPair{ .secret_key = a3.skEm, .public_key = a3.pkEm };
-    const got = try P256Kem.encapDeterministic(a3.pkRm, eph);
+    var got: P256Kem.Encapped = undefined;
+    try P256Kem.encapDeterministic(&got, a3.pkRm, &eph);
     try testing.expectEqualSlices(u8, &a3.enc, &got.enc);
     try testing.expectEqualSlices(u8, &a3.shared_secret, &got.shared_secret);
     const skR = P256Kem.KeyPair{ .secret_key = a3.skRm, .public_key = a3.pkRm };
-    const dec = try P256Kem.decap(got.enc, skR);
+    var dec: [P256Kem.Nsecret]u8 = undefined;
+    try P256Kem.decap(&dec, got.enc, &skR);
     try testing.expectEqualSlices(u8, &a3.shared_secret, &dec);
 }
 
@@ -706,36 +788,55 @@ test "DHKEM P-256 Encap/Decap: malformed SEC1 pkR fails closed with error.Deseri
     const eph = P256Kem.KeyPair{ .secret_key = a3.skEm, .public_key = a3.pkEm };
     var bad = a3.pkRm;
     bad[0] = 0x05; // not a valid SEC1 tag
-    try testing.expectError(error.DeserializeError, P256Kem.encapDeterministic(bad, eph));
+    try testing.expectError(error.DeserializeError, blk: {
+        var o: P256Kem.Encapped = undefined;
+        break :blk P256Kem.encapDeterministic(&o, bad, &eph);
+    });
     const skR = P256Kem.KeyPair{ .secret_key = a3.skRm, .public_key = a3.pkRm };
-    try testing.expectError(error.DeserializeError, P256Kem.decap(bad, skR));
+    try testing.expectError(error.DeserializeError, blk: {
+        var o: [P256Kem.Nsecret]u8 = undefined;
+        break :blk P256Kem.decap(&o, bad, &skR);
+    });
 }
 
 test "DHKEM P-256 deriveKeyPair: deterministic, on-curve, distinct per ikm (byte-exact anchor lives in the A.3.2/A.3.3/A.3.4 KATs)" {
-    const kp1 = P256Kem.deriveKeyPair("hpke p256 derive test ikm 1");
-    const kp1_again = P256Kem.deriveKeyPair("hpke p256 derive test ikm 1");
+    var kp1: P256Kem.KeyPair = undefined;
+    P256Kem.deriveKeyPair(&kp1, "hpke p256 derive test ikm 1");
+    var kp1_again: P256Kem.KeyPair = undefined;
+    P256Kem.deriveKeyPair(&kp1_again, "hpke p256 derive test ikm 1");
     try testing.expectEqualSlices(u8, &kp1.secret_key, &kp1_again.secret_key);
     try testing.expectEqualSlices(u8, &kp1.public_key, &kp1_again.public_key);
-    const kp2 = P256Kem.deriveKeyPair("hpke p256 derive test ikm 2");
+    var kp2: P256Kem.KeyPair = undefined;
+    P256Kem.deriveKeyPair(&kp2, "hpke p256 derive test ikm 2");
     try testing.expect(!std.mem.eql(u8, &kp1.secret_key, &kp2.secret_key));
     // public_key is a valid SEC1 point AND actually sk*G (Encap/Decap
     // round trip through it works).
     try testing.expectEqual(@as(u8, 0x04), kp1.public_key[0]);
-    const eph = P256Kem.deriveKeyPair("hpke p256 derive test ephemeral");
-    const got = try P256Kem.encapDeterministic(kp1.public_key, eph);
-    const dec = try P256Kem.decap(got.enc, kp1);
+    var eph: P256Kem.KeyPair = undefined;
+    P256Kem.deriveKeyPair(&eph, "hpke p256 derive test ephemeral");
+    var got: P256Kem.Encapped = undefined;
+    try P256Kem.encapDeterministic(&got, kp1.public_key, &eph);
+    var dec: [P256Kem.Nsecret]u8 = undefined;
+    try P256Kem.decap(&dec, got.enc, &kp1);
     try testing.expectEqualSlices(u8, &got.shared_secret, &dec);
 }
 
 test "DHKEM P-256 AuthEncap/AuthDecap: self-consistency round trip" {
-    const skR = P256Kem.deriveKeyPair("hpke p256 auth test receiver");
-    const skS = P256Kem.deriveKeyPair("hpke p256 auth test sender");
-    const eph = P256Kem.deriveKeyPair("hpke p256 auth test ephemeral");
-    const got = try P256Kem.authEncapDeterministic(skR.public_key, skS, eph);
-    const dec = try P256Kem.authDecap(got.enc, skR, skS.public_key);
+    var skR: P256Kem.KeyPair = undefined;
+    P256Kem.deriveKeyPair(&skR, "hpke p256 auth test receiver");
+    var skS: P256Kem.KeyPair = undefined;
+    P256Kem.deriveKeyPair(&skS, "hpke p256 auth test sender");
+    var eph: P256Kem.KeyPair = undefined;
+    P256Kem.deriveKeyPair(&eph, "hpke p256 auth test ephemeral");
+    var got: P256Kem.Encapped = undefined;
+    try P256Kem.authEncapDeterministic(&got, skR.public_key, &skS, &eph);
+    var dec: [P256Kem.Nsecret]u8 = undefined;
+    try P256Kem.authDecap(&dec, got.enc, &skR, skS.public_key);
     try testing.expectEqualSlices(u8, &got.shared_secret, &dec);
-    const wrong = P256Kem.deriveKeyPair("hpke p256 auth test WRONG sender");
-    const dec_wrong = try P256Kem.authDecap(got.enc, skR, wrong.public_key);
+    var wrong: P256Kem.KeyPair = undefined;
+    P256Kem.deriveKeyPair(&wrong, "hpke p256 auth test WRONG sender");
+    var dec_wrong: [P256Kem.Nsecret]u8 = undefined;
+    try P256Kem.authDecap(&dec_wrong, got.enc, &skR, wrong.public_key);
     try testing.expect(!std.mem.eql(u8, &got.shared_secret, &dec_wrong));
 }
 
@@ -765,47 +866,72 @@ test "P384Kem: basePoint.mul + toUncompressedSec1 wiring produces a well-formed 
 }
 
 test "DHKEM P-384 Encap/Decap: self-consistency round trip" {
-    const skR = P384Kem.deriveKeyPair("hpke p384 test receiver");
-    const eph = P384Kem.deriveKeyPair("hpke p384 test ephemeral");
-    const got = try P384Kem.encapDeterministic(skR.public_key, eph);
+    var skR: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&skR, "hpke p384 test receiver");
+    var eph: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&eph, "hpke p384 test ephemeral");
+    var got: P384Kem.Encapped = undefined;
+    try P384Kem.encapDeterministic(&got, skR.public_key, &eph);
     try testing.expectEqualSlices(u8, &eph.public_key, &got.enc);
-    const dec = try P384Kem.decap(got.enc, skR);
+    var dec: [P384Kem.Nsecret]u8 = undefined;
+    try P384Kem.decap(&dec, got.enc, &skR);
     try testing.expectEqualSlices(u8, &got.shared_secret, &dec);
 }
 
 test "DHKEM P-384 Encap/Decap: malformed SEC1 pkR fails closed with error.DeserializeError" {
-    const skR = P384Kem.deriveKeyPair("hpke p384 test receiver 3");
-    const eph = P384Kem.deriveKeyPair("hpke p384 test ephemeral 3");
+    var skR: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&skR, "hpke p384 test receiver 3");
+    var eph: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&eph, "hpke p384 test ephemeral 3");
     var bad: P384Kem.PublicKey = undefined;
     bad[0] = 0x05; // not a valid SEC1 tag
-    try testing.expectError(error.DeserializeError, P384Kem.encapDeterministic(bad, eph));
-    try testing.expectError(error.DeserializeError, P384Kem.decap(bad, skR));
+    try testing.expectError(error.DeserializeError, blk: {
+        var o: P384Kem.Encapped = undefined;
+        break :blk P384Kem.encapDeterministic(&o, bad, &eph);
+    });
+    try testing.expectError(error.DeserializeError, blk: {
+        var o: [P384Kem.Nsecret]u8 = undefined;
+        break :blk P384Kem.decap(&o, bad, &skR);
+    });
 }
 
 test "DHKEM P-384 deriveKeyPair: deterministic, on-curve, distinct per ikm" {
-    const kp1 = P384Kem.deriveKeyPair("hpke p384 derive test ikm 1");
-    const kp1_again = P384Kem.deriveKeyPair("hpke p384 derive test ikm 1");
+    var kp1: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&kp1, "hpke p384 derive test ikm 1");
+    var kp1_again: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&kp1_again, "hpke p384 derive test ikm 1");
     try testing.expectEqualSlices(u8, &kp1.secret_key, &kp1_again.secret_key);
     try testing.expectEqualSlices(u8, &kp1.public_key, &kp1_again.public_key);
-    const kp2 = P384Kem.deriveKeyPair("hpke p384 derive test ikm 2");
+    var kp2: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&kp2, "hpke p384 derive test ikm 2");
     try testing.expect(!std.mem.eql(u8, &kp1.secret_key, &kp2.secret_key));
     try testing.expectEqual(@as(u8, 0x04), kp1.public_key[0]);
     // public_key is actually sk*G: Encap/Decap round trip through it works.
-    const eph = P384Kem.deriveKeyPair("hpke p384 derive test ephemeral");
-    const got = try P384Kem.encapDeterministic(kp1.public_key, eph);
-    const dec = try P384Kem.decap(got.enc, kp1);
+    var eph: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&eph, "hpke p384 derive test ephemeral");
+    var got: P384Kem.Encapped = undefined;
+    try P384Kem.encapDeterministic(&got, kp1.public_key, &eph);
+    var dec: [P384Kem.Nsecret]u8 = undefined;
+    try P384Kem.decap(&dec, got.enc, &kp1);
     try testing.expectEqualSlices(u8, &got.shared_secret, &dec);
 }
 
 test "DHKEM P-384 AuthEncap/AuthDecap: self-consistency round trip + wrong-pkS divergence" {
-    const skR = P384Kem.deriveKeyPair("hpke p384 auth test receiver");
-    const skS = P384Kem.deriveKeyPair("hpke p384 auth test sender");
-    const eph = P384Kem.deriveKeyPair("hpke p384 auth test ephemeral");
-    const got = try P384Kem.authEncapDeterministic(skR.public_key, skS, eph);
-    const dec = try P384Kem.authDecap(got.enc, skR, skS.public_key);
+    var skR: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&skR, "hpke p384 auth test receiver");
+    var skS: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&skS, "hpke p384 auth test sender");
+    var eph: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&eph, "hpke p384 auth test ephemeral");
+    var got: P384Kem.Encapped = undefined;
+    try P384Kem.authEncapDeterministic(&got, skR.public_key, &skS, &eph);
+    var dec: [P384Kem.Nsecret]u8 = undefined;
+    try P384Kem.authDecap(&dec, got.enc, &skR, skS.public_key);
     try testing.expectEqualSlices(u8, &got.shared_secret, &dec);
-    const wrong = P384Kem.deriveKeyPair("hpke p384 auth test WRONG sender");
-    const dec_wrong = try P384Kem.authDecap(got.enc, skR, wrong.public_key);
+    var wrong: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&wrong, "hpke p384 auth test WRONG sender");
+    var dec_wrong: [P384Kem.Nsecret]u8 = undefined;
+    try P384Kem.authDecap(&dec_wrong, got.enc, &skR, wrong.public_key);
     try testing.expect(!std.mem.eql(u8, &got.shared_secret, &dec_wrong));
 }
 
@@ -1000,10 +1126,12 @@ fn fuzzedSec1Bytes(comptime N: usize, smith: *std.testing.Smith, buf: *[N]u8) vo
 }
 
 fn fuzzP256Decap(_: void, smith: *std.testing.Smith) !void {
-    const skR = P256Kem.deriveKeyPair("hpke fuzz decap receiver");
+    var skR: P256Kem.KeyPair = undefined;
+    P256Kem.deriveKeyPair(&skR, "hpke fuzz decap receiver");
     var enc: P256Kem.EncappedKey = undefined;
     fuzzedSec1Bytes(P256Kem.Npk, smith, &enc);
-    _ = P256Kem.decap(enc, skR) catch {};
+    var ss: [P256Kem.Nsecret]u8 = undefined;
+    P256Kem.decap(&ss, enc, &skR) catch {};
 }
 
 test "fuzz: P256Kem.authDecap never panics on arbitrary enc/pkS bytes" {
@@ -1012,12 +1140,14 @@ test "fuzz: P256Kem.authDecap never panics on arbitrary enc/pkS bytes" {
 }
 
 fn fuzzP256AuthDecap(_: void, smith: *std.testing.Smith) !void {
-    const skR = P256Kem.deriveKeyPair("hpke fuzz auth-decap receiver");
+    var skR: P256Kem.KeyPair = undefined;
+    P256Kem.deriveKeyPair(&skR, "hpke fuzz auth-decap receiver");
     var enc: P256Kem.EncappedKey = undefined;
     fuzzedSec1Bytes(P256Kem.Npk, smith, &enc);
     var pkS: P256Kem.PublicKey = undefined;
     fuzzedSec1Bytes(P256Kem.Npk, smith, &pkS);
-    _ = P256Kem.authDecap(enc, skR, pkS) catch {};
+    var ss: [P256Kem.Nsecret]u8 = undefined;
+    P256Kem.authDecap(&ss, enc, &skR, pkS) catch {};
 }
 
 // ── fuzz: P384Kem.decap/authDecap never panic on arbitrary enc/pkS bytes ──
@@ -1031,10 +1161,12 @@ test "fuzz: P384Kem.decap never panics on arbitrary enc bytes" {
 }
 
 fn fuzzP384Decap(_: void, smith: *std.testing.Smith) !void {
-    const skR = P384Kem.deriveKeyPair("hpke fuzz p384 decap receiver");
+    var skR: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&skR, "hpke fuzz p384 decap receiver");
     var enc: P384Kem.EncappedKey = undefined;
     fuzzedSec1Bytes(P384Kem.Npk, smith, &enc);
-    _ = P384Kem.decap(enc, skR) catch {};
+    var ss: [P384Kem.Nsecret]u8 = undefined;
+    P384Kem.decap(&ss, enc, &skR) catch {};
 }
 
 test "fuzz: P384Kem.authDecap never panics on arbitrary enc/pkS bytes" {
@@ -1043,12 +1175,14 @@ test "fuzz: P384Kem.authDecap never panics on arbitrary enc/pkS bytes" {
 }
 
 fn fuzzP384AuthDecap(_: void, smith: *std.testing.Smith) !void {
-    const skR = P384Kem.deriveKeyPair("hpke fuzz p384 auth-decap receiver");
+    var skR: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&skR, "hpke fuzz p384 auth-decap receiver");
     var enc: P384Kem.EncappedKey = undefined;
     fuzzedSec1Bytes(P384Kem.Npk, smith, &enc);
     var pkS: P384Kem.PublicKey = undefined;
     fuzzedSec1Bytes(P384Kem.Npk, smith, &pkS);
-    _ = P384Kem.authDecap(enc, skR, pkS) catch {};
+    var ss: [P384Kem.Nsecret]u8 = undefined;
+    P384Kem.authDecap(&ss, enc, &skR, pkS) catch {};
 }
 
 /// Counts one corpus's worth of `fuzzedSec1Bytes` draws through the real
@@ -1090,7 +1224,8 @@ fn Sec1Tally(comptime Kem: type, comptime cap: usize) type {
 test "corpus: the P-256 enc/pkS seeds reach decap, and the counts are pinned" {
     var decap_corpus: P256Corpus = .{};
     var d: Sec1Tally(P256Kem, 16) = .{};
-    const skR = P256Kem.deriveKeyPair("hpke fuzz decap receiver");
+    var skR: P256Kem.KeyPair = undefined;
+    P256Kem.deriveKeyPair(&skR, "hpke fuzz decap receiver");
 
     // The "before" state, executable rather than asserted in prose: with no
     // corpus these targets ran exactly one input, the empty one, and this is
@@ -1101,7 +1236,10 @@ test "corpus: the P-256 enc/pkS seeds reach decap, and the counts are pinned" {
         var enc: P256Kem.EncappedKey = undefined;
         fuzzedSec1Bytes(P256Kem.Npk, &smith, &enc);
         try testing.expectEqual(@as(u8, 0), enc[0]);
-        try testing.expectError(error.DeserializeError, P256Kem.decap(enc, skR));
+        try testing.expectError(error.DeserializeError, blk: {
+            var o: [P256Kem.Nsecret]u8 = undefined;
+            break :blk P256Kem.decap(&o, enc, &skR);
+        });
     }
 
     for (p256DecapSeeds(&decap_corpus)) |sd| {
@@ -1109,7 +1247,9 @@ test "corpus: the P-256 enc/pkS seeds reach decap, and the counts are pinned" {
         var enc: P256Kem.EncappedKey = undefined;
         fuzzedSec1Bytes(P256Kem.Npk, &smith, &enc);
         d.tags[enc[0]] = true;
-        d.record(P256Kem.decap(enc, skR) catch continue);
+        var ss: [P256Kem.Nsecret]u8 = undefined;
+        P256Kem.decap(&ss, enc, &skR) catch continue;
+        d.record(ss);
     }
     try testing.expectEqual(@as(usize, 5), d.distinctTags()); // 0x00 0x02 0x03 0x04 0x99
     try testing.expectEqual(@as(usize, 3), d.accepted);
@@ -1117,7 +1257,8 @@ test "corpus: the P-256 enc/pkS seeds reach decap, and the counts are pinned" {
 
     var auth_corpus: P256Corpus = .{};
     var a: Sec1Tally(P256Kem, 16) = .{};
-    const authR = P256Kem.deriveKeyPair("hpke fuzz auth-decap receiver");
+    var authR: P256Kem.KeyPair = undefined;
+    P256Kem.deriveKeyPair(&authR, "hpke fuzz auth-decap receiver");
     for (p256AuthDecapSeeds(&auth_corpus)) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var enc: P256Kem.EncappedKey = undefined;
@@ -1126,7 +1267,9 @@ test "corpus: the P-256 enc/pkS seeds reach decap, and the counts are pinned" {
         fuzzedSec1Bytes(P256Kem.Npk, &smith, &pkS);
         a.tags[enc[0]] = true;
         a.tags[pkS[0]] = true;
-        a.record(P256Kem.authDecap(enc, authR, pkS) catch continue);
+        var ss: [P256Kem.Nsecret]u8 = undefined;
+        P256Kem.authDecap(&ss, enc, &authR, pkS) catch continue;
+        a.record(ss);
     }
     try testing.expectEqual(@as(usize, 5), a.distinctTags());
     try testing.expectEqual(@as(usize, 3), a.accepted);
@@ -1136,13 +1279,16 @@ test "corpus: the P-256 enc/pkS seeds reach decap, and the counts are pinned" {
 test "corpus: the P-384 enc/pkS seeds reach decap, and the counts are pinned" {
     var decap_corpus: P384Corpus = .{};
     var d: Sec1Tally(P384Kem, 16) = .{};
-    const skR = P384Kem.deriveKeyPair("hpke fuzz p384 decap receiver");
+    var skR: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&skR, "hpke fuzz p384 decap receiver");
     for (p384DecapSeeds(&decap_corpus)) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var enc: P384Kem.EncappedKey = undefined;
         fuzzedSec1Bytes(P384Kem.Npk, &smith, &enc);
         d.tags[enc[0]] = true;
-        d.record(P384Kem.decap(enc, skR) catch continue);
+        var ss: [P384Kem.Nsecret]u8 = undefined;
+        P384Kem.decap(&ss, enc, &skR) catch continue;
+        d.record(ss);
     }
     try testing.expectEqual(@as(usize, 5), d.distinctTags()); // 0x00 0x02 0x03 0x04 0x99
     try testing.expectEqual(@as(usize, 3), d.accepted);
@@ -1150,7 +1296,8 @@ test "corpus: the P-384 enc/pkS seeds reach decap, and the counts are pinned" {
 
     var auth_corpus: P384Corpus = .{};
     var a: Sec1Tally(P384Kem, 16) = .{};
-    const authR = P384Kem.deriveKeyPair("hpke fuzz p384 auth-decap receiver");
+    var authR: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&authR, "hpke fuzz p384 auth-decap receiver");
     for (p384AuthDecapSeeds(&auth_corpus)) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var enc: P384Kem.EncappedKey = undefined;
@@ -1159,7 +1306,9 @@ test "corpus: the P-384 enc/pkS seeds reach decap, and the counts are pinned" {
         fuzzedSec1Bytes(P384Kem.Npk, &smith, &pkS);
         a.tags[enc[0]] = true;
         a.tags[pkS[0]] = true;
-        a.record(P384Kem.authDecap(enc, authR, pkS) catch continue);
+        var ss: [P384Kem.Nsecret]u8 = undefined;
+        P384Kem.authDecap(&ss, enc, &authR, pkS) catch continue;
+        a.record(ss);
     }
     try testing.expectEqual(@as(usize, 5), a.distinctTags());
     try testing.expectEqual(@as(usize, 3), a.accepted);
@@ -1203,9 +1352,12 @@ test "P384Kem: type widths and PRK width match RFC 9180 §7.1 Table 2" {
 // `suite.labeledExtract`'s streaming HMAC that the implementation uses. Both
 // the hash choice and the labeled-input layout have to agree for it to pass.
 test "P384Kem's internal KDF is HKDF-SHA384: shared_secret matches an independent labeled-HKDF derivation" {
-    const skR = P384Kem.deriveKeyPair("hpke p384 kdf-discriminator receiver");
-    const eph = P384Kem.deriveKeyPair("hpke p384 kdf-discriminator ephemeral");
-    const got = try P384Kem.encapDeterministic(skR.public_key, eph);
+    var skR: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&skR, "hpke p384 kdf-discriminator receiver");
+    var eph: P384Kem.KeyPair = undefined;
+    P384Kem.deriveKeyPair(&eph, "hpke p384 kdf-discriminator ephemeral");
+    var got: P384Kem.Encapped = undefined;
+    try P384Kem.encapDeterministic(&got, skR.public_key, &eph);
 
     // dh, recomputed here from the curve rather than taken from the KEM.
     const shared_point = try (try P384.fromSec1(&skR.public_key)).mul(eph.secret_key, .big);

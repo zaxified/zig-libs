@@ -175,22 +175,24 @@ const Directory = struct {
 
 /// `io` must support net + concurrency operations (e.g. `std.Io.Threaded`);
 /// `http_client` stays caller-owned (share it with other subsystems freely).
-/// Generate `account_key` once via `jws.generateKeyPair(io)` and persist it
-/// with `x509.ecPrivateKeyToPem` — the account key IS the account identity.
-/// Not `jws.KeyPair.generate(io)`: that is std's, and it seeds from
-/// `io.random` (see `jws.generateKeyPair`).
+/// Generate `account_key` once via `jws.generateKeyPair(&key, io)` and persist
+/// it with `x509.ecPrivateKeyToPem` — the account key IS the account identity.
+/// Not `jws.KeyPair.generate(io)`: that seeds from `io.random` (see
+/// `jws.generateKeyPair`). `account_key` is taken by pointer (no by-value copy
+/// of the private key in the caller's frame) and copied into the client, which
+/// wipes its copy in `deinit`; wipe the caller's own pair after this call.
 pub fn init(
     io: std.Io,
     gpa: Allocator,
     http_client: *http.Client,
-    account_key: jws.KeyPair,
+    account_key: *const jws.KeyPair,
     options: Options,
 ) Client {
     return .{
         .io = io,
         .gpa = gpa,
         .http_client = http_client,
-        .account_key = account_key,
+        .account_key = account_key.*,
         .options = options,
         .dir = null,
         .kid = null,
@@ -367,9 +369,10 @@ pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
     // at scope exit rather than left resident for the rest of the request.
     // Fail-closed draw: this key is what the issued certificate will
     // attest to, and it goes on to terminate TLS for the domain.
-    var cert_key = jws.generateKeyPair(c.io);
+    var cert_key: jws.KeyPair = undefined;
+    jws.generateKeyPair(&cert_key, c.io);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
-    const csr_der = x509.csrDer(a, cert_key, domains) catch |err| switch (err) {
+    const csr_der = x509.csrDer(a, &cert_key, domains) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidDomain => return error.InvalidDomain,
         error.SigningFailed, error.ValueTooLarge => return error.SigningFailed,
@@ -406,7 +409,7 @@ pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
 
     const chain_pem = try c.gpa.dupe(u8, cpr.body);
     errdefer c.gpa.free(chain_pem);
-    const key_pem = try x509.ecPrivateKeyToPem(c.gpa, cert_key);
+    const key_pem = try x509.ecPrivateKeyToPem(c.gpa, &cert_key);
     return .{ .chain_pem = chain_pem, .key_pem = key_pem, .not_after = not_after };
 }
 
@@ -509,7 +512,8 @@ fn publishTlsAlpn01(c: *Client, a: Allocator, domain: []const u8, token: []const
         return error.MalformedResponse; // CA sent a non-token
     // Short-lived and never published, but it still signs a certificate a
     // TLS client is about to accept — same draw as the issuance key above.
-    var cert_key = jws.generateKeyPair(c.io);
+    var cert_key: jws.KeyPair = undefined;
+    jws.generateKeyPair(&cert_key, c.io);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
 
     // Deterministic positive, minimal serial derived from the identifier.
@@ -518,7 +522,7 @@ fn publishTlsAlpn01(c: *Client, a: Allocator, domain: []const u8, token: []const
 
     const cert_der = x509.tlsAlpnCertDer(
         a,
-        cert_key,
+        &cert_key,
         domain,
         acme_id,
         &serial,
@@ -529,7 +533,7 @@ fn publishTlsAlpn01(c: *Client, a: Allocator, domain: []const u8, token: []const
         error.InvalidDomain => return error.InvalidDomain,
         error.SigningFailed, error.ValueTooLarge => return error.SigningFailed,
     };
-    const key_pem = x509.ecPrivateKeyToPem(a, cert_key) catch return error.OutOfMemory;
+    const key_pem = x509.ecPrivateKeyToPem(a, &cert_key) catch return error.OutOfMemory;
     try c.tls_alpn.set(domain, cert_der, key_pem);
 }
 
@@ -846,7 +850,7 @@ fn postJws(c: *Client, a: Allocator, url: []const u8, payload: []const u8, mode:
     while (true) {
         const nonce = try c.takeNonce();
         defer c.gpa.free(nonce);
-        const body_json = jws.sign(c.gpa, c.account_key, payload, .{
+        const body_json = jws.sign(c.gpa, &c.account_key, payload, .{
             .nonce = nonce,
             .url = url,
             .kid = kid,
@@ -2088,13 +2092,15 @@ test "integration: full issuance against a mock ACME CA (dogfood, JWS-verified)"
     // ── the real ACME client under test ──
     var transport = http.Client.init(io, testing.allocator, .{});
     defer transport.deinit();
-    const account_key = try jws.Es256.KeyPair.generateDeterministic(@splat(11));
+    var account_key: jws.KeyPair = undefined;
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(11)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
 
     var dir_url_buf: [64]u8 = undefined;
     const dir_url = try std.fmt.bufPrint(&dir_url_buf, "http://127.0.0.1:{d}/dir", .{
         ca_server.boundAddress().getPort(),
     });
-    var client = Client.init(io, testing.allocator, &transport, account_key, .{
+    var client = Client.init(io, testing.allocator, &transport, &account_key, .{
         .directory_url = dir_url,
         .contact = &.{"mailto:ops@acme-poc.example"},
         .poll_interval_ms = 10,
@@ -2147,8 +2153,9 @@ test "integration: full issuance against a mock ACME CA (dogfood, JWS-verified)"
     // Client-side results.
     try testing.expectEqualStrings(x509.test_cert_pem ++ x509.test_root_cert_pem, cert.chain_pem);
     try testing.expectEqual(x509.test_cert_not_after, cert.not_after);
-    const key = try x509.ecPrivateKeyFromPem(testing.allocator, cert.key_pem);
-    _ = key; // parses back — a usable leaf key
+    var key: jws.KeyPair = undefined;
+    try x509.ecPrivateKeyFromPem(&key, testing.allocator, cert.key_pem); // parses back — a usable leaf key
+    std.crypto.secureZero(u8, std.mem.asBytes(&key));
     try testing.expectEqualStrings(mock.account_url, client.accountUrl().?);
     // Tokens are cleaned up after each authorization.
     try testing.expectEqual(@as(usize, 0), client.challengeResponder().count());
@@ -2203,9 +2210,11 @@ test "integration: a wildcard certificate over DNS-01 against the mock CA" {
 
     var transport = http.Client.init(io, testing.allocator, .{});
     defer transport.deinit();
-    const account_key = try jws.Es256.KeyPair.generateDeterministic(@splat(12));
+    var account_key: jws.KeyPair = undefined;
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(12)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
 
-    var client = Client.init(io, testing.allocator, &transport, account_key, .{
+    var client = Client.init(io, testing.allocator, &transport, &account_key, .{
         .directory_url = mock.dir_url,
         .challenge_type = .dns_01,
         .dns_publisher = zone.publisher(),
@@ -2240,16 +2249,18 @@ test "DNS-01 preconditions: wildcard needs dns_01, dns_01 needs a publisher, a r
     const io = threaded.io();
     var transport = http.Client.init(io, testing.allocator, .{});
     defer transport.deinit();
-    const account_key = try jws.Es256.KeyPair.generateDeterministic(@splat(13));
+    var account_key: jws.KeyPair = undefined;
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(13)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
 
     // Refused before any network I/O: the directory URL is never contacted.
     {
-        var c = Client.init(io, testing.allocator, &transport, account_key, .{ .directory_url = "http://127.0.0.1:1/dir" });
+        var c = Client.init(io, testing.allocator, &transport, &account_key, .{ .directory_url = "http://127.0.0.1:1/dir" });
         defer c.deinit();
         try testing.expectError(error.InvalidDomain, c.obtain(&.{"*.example.org"}));
     }
     {
-        var c = Client.init(io, testing.allocator, &transport, account_key, .{
+        var c = Client.init(io, testing.allocator, &transport, &account_key, .{
             .directory_url = "http://127.0.0.1:1/dir",
             .challenge_type = .dns_01,
         });

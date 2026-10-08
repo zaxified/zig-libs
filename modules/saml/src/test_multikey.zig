@@ -146,7 +146,7 @@ test "rollover: LogoutRequest verifies under an additional key (CONSTRUCTED)" {
         .issue_instant = "2024-06-01T12:00:00Z",
         .issuer = fx.idp_entity_id,
         .name_id = "alice@example.org",
-        .sign_with = .{ .rsa = signer.secret_key },
+        .sign_with = .{ .rsa = &signer.secret_key },
     });
     defer alloc.free(req);
     var c: saml.LogoutRequestConfig = .{

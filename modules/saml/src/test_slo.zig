@@ -85,7 +85,7 @@ test "LogoutRequest: signed build -> POST-field consume round-trips (CONSTRUCTED
         .destination = "https://sp.example.org/slo",
         .name_id = "alice@example.org",
         .session_indexes = &.{"sess-42"},
-        .sign_with = .{ .rsa = kp.secret_key },
+        .sign_with = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(req);
     try testing.expect(std.mem.indexOf(u8, req, "ds:Signature") != null);
@@ -113,7 +113,7 @@ test "LogoutRequest: Issuer mismatch rejected" {
         .issue_instant = issue_instant,
         .issuer = "https://not-the-idp.example.org",
         .name_id = "alice@example.org",
-        .sign_with = .{ .rsa = kp.secret_key },
+        .sign_with = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(req);
     try testing.expectError(
@@ -131,7 +131,7 @@ test "LogoutRequest: expired (NotOnOrAfter in the past) rejected" {
         .issuer = idp_entity_id,
         .name_id = "alice@example.org",
         .not_on_or_after = "2020-01-01T00:00:00Z", // long past `t_now`
-        .sign_with = .{ .rsa = kp.secret_key },
+        .sign_with = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(req);
     try testing.expectError(
@@ -198,7 +198,7 @@ test "LogoutRequest: flipped SignatureValue -> SignatureInvalid (distinct from S
         .issue_instant = issue_instant,
         .issuer = idp_entity_id,
         .name_id = "alice@example.org",
-        .sign_with = .{ .rsa = kp.secret_key },
+        .sign_with = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(req);
 
@@ -229,7 +229,7 @@ test "LogoutRequest XSW: signature moved to the top level, referencing a buried 
         .issue_instant = issue_instant,
         .issuer = idp_entity_id,
         .name_id = "victim@example.org",
-        .sign_with = .{ .rsa = kp.secret_key },
+        .sign_with = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(orig);
 
@@ -353,7 +353,7 @@ test "LogoutResponse: signed build -> POST-field consume round-trips (CONSTRUCTE
         .issuer = idp_entity_id,
         .destination = "https://sp.example.org/slo/response",
         .in_response_to = "_lr_out_42",
-        .sign_with = .{ .rsa = kp.secret_key },
+        .sign_with = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(resp);
 
@@ -399,7 +399,7 @@ test "LogoutResponse: non-Success status -> StatusNotSuccess (checked, not assum
         .issuer = idp_entity_id,
         .in_response_to = "_lr_out_1",
         .status_code = "urn:oasis:names:tc:SAML:2.0:status:Requester",
-        .sign_with = .{ .rsa = kp.secret_key },
+        .sign_with = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(resp);
     try testing.expectError(
@@ -416,7 +416,7 @@ test "LogoutResponse: InResponseTo mismatch rejected" {
         .issue_instant = issue_instant,
         .issuer = idp_entity_id,
         .in_response_to = "_lr_out_actual",
-        .sign_with = .{ .rsa = kp.secret_key },
+        .sign_with = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(resp);
     try testing.expectError(

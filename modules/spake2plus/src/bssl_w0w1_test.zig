@@ -36,13 +36,19 @@ test "BoringSSL anchor: the frozen corpus is actually populated" {
     try std.testing.expectEqual(@as(usize, 6), bssl.boundaries.len);
 }
 
+fn computeW0W1(pbkdf_output: []const u8) !spake2plus.W0W1 {
+    var out: spake2plus.W0W1 = undefined;
+    try spake2plus.computeW0W1(&out, pbkdf_output);
+    return out;
+}
+
 test "BoringSSL anchor: computeW0W1 reproduces Register()'s w0/w1 byte-exact" {
     for (bssl.registrations, 0..) |vec, i| {
         errdefer std.debug.print(
             "\nBoringSSL registration vector [{d}] disagreed: {s}\n",
             .{ i, vec.note },
         );
-        const got = try spake2plus.computeW0W1(&hexN(80, vec.pbkdf_output));
+        const got = try computeW0W1(&hexN(80, vec.pbkdf_output));
         try std.testing.expectEqualSlices(u8, &hexN(32, vec.w0), &got.w0);
         try std.testing.expectEqualSlices(u8, &hexN(32, vec.w1), &got.w1);
     }
@@ -58,8 +64,8 @@ test "BoringSSL anchor: computeL(w1) reproduces Register()'s registration record
             "\nBoringSSL registration vector [{d}] disagreed on L: {s}\n",
             .{ i, vec.note },
         );
-        const w0w1 = try spake2plus.computeW0W1(&hexN(80, vec.pbkdf_output));
-        const l = try spake2plus.computeL(w0w1.w1);
+        const w0w1 = try computeW0W1(&hexN(80, vec.pbkdf_output));
+        const l = try spake2plus.computeL(&w0w1.w1);
         try std.testing.expectEqualSlices(u8, &hexN(65, vec.l), &l);
     }
 }
@@ -75,7 +81,7 @@ test "BoringSSL anchor: computeW0W1 matches BoringSSL's reduction at the modular
             "\nBoringSSL boundary vector [{d}] disagreed: {s}\n",
             .{ i, vec.note },
         );
-        const got = try spake2plus.computeW0W1(&hexN(80, vec.pbkdf_output));
+        const got = try computeW0W1(&hexN(80, vec.pbkdf_output));
         try std.testing.expectEqualSlices(u8, &hexN(32, vec.w0), &got.w0);
         try std.testing.expectEqualSlices(u8, &hexN(32, vec.w1), &got.w1);
     }

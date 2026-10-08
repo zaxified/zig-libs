@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **Migrated to ctap2pin's pointer / out-param API** (secrets on the dead stack,
+  see ctap2pin's changelog): `openSession`, `SharedSecret.encrypt`/`decryptToken`, tests and the
+  example. No behaviour change.
+
 - **2026-10-03** — Audit (review + mutation, 87 mutants). Fix: `ctaphid.Channel.open`
   now refuses a device that allocates CID 0 or the broadcast CID (`TransportFailed`), and
   skips an INIT response carrying another client's nonce instead of failing (§11.2.3).

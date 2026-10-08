@@ -19,7 +19,7 @@
 //!     `error.InvalidKey`).
 //!
 //! Const-time notes: both scalar multiplications are std's constant-time
-//! ladders (`P256.mul`, X25519's clamped Montgomery ladder — never the
+//! ladders (`P256.mulInto`, X25519's clamped Montgomery ladder — never the
 //! `mulPublic` variable-time variants); the Concat KDF hashes `Z` plus
 //! public-only inputs (alg name, apu/apv, keydatalen) with no
 //! secret-dependent branching. Ephemeral key generation takes the CALLER's
@@ -31,6 +31,7 @@ pub const Entropy = @import("entropy.zig").Entropy;
 // P-256 curve group from the asm-accelerated `p256` module (byte-exact to
 // `std.crypto.ecc.P256`); X25519 stays on std (p256 covers only P-256).
 const P256 = @import("p256").P256;
+const burn = @import("burn.zig");
 const X25519 = std.crypto.dh.X25519;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -152,7 +153,16 @@ pub const EphemeralKeyPair = struct {
 /// `std.Random`: see `entropy.zig`. P-256 rejection-samples a canonical
 /// nonzero scalar (uniform over the group order); X25519 takes any 32 random
 /// bytes (clamping happens in the scalar mult, per RFC 7748).
-pub fn generateEphemeral(curve: Curve, entropy: Entropy) EphemeralKeyPair {
+///
+/// The key pair comes back through `out`, never as a return value: a returned
+/// struct lives in the caller's frame, out of reach of any burn here. The body
+/// runs one frame down and is burned.
+pub fn generateEphemeral(out: *EphemeralKeyPair, curve: Curve, entropy: Entropy) void {
+    generateEphemeralUnburned(out, curve, entropy);
+    burn.stack(burn.ecdh_burn);
+}
+
+noinline fn generateEphemeralUnburned(out: *EphemeralKeyPair, curve: Curve, entropy: Entropy) void {
     // Unwrapped here rather than through an accessor on `Entropy` — see the
     // note at the bottom of `entropy.zig`.
     const random: std.Random = switch (entropy) {
@@ -162,22 +172,25 @@ pub fn generateEphemeral(curve: Curve, entropy: Entropy) EphemeralKeyPair {
     switch (curve) {
         .p256 => {
             while (true) {
-                var d: [coordinate_len]u8 = undefined;
-                random.bytes(&d);
-                P256.scalar.rejectNonCanonical(d, .big) catch continue;
-                // `mul` errors iff the result is the identity — i.e. d == 0.
-                const point = P256.basePoint.mul(d, .big) catch continue;
-                return .{ .private = .{ .p256 = d }, .public = .{ .p256 = point } };
+                out.private = .{ .p256 = undefined };
+                random.bytes(&out.private.p256);
+                P256.scalar.rejectNonCanonical(out.private.p256, .big) catch continue;
+                // `mulInto` errors iff the result is the identity — i.e. d == 0.
+                var point: P256 = undefined;
+                P256.basePoint.mulInto(&point, &out.private.p256, .big) catch continue;
+                out.public = .{ .p256 = point };
+                return;
             }
         },
         .x25519 => {
             while (true) {
-                var sk: [coordinate_len]u8 = undefined;
-                random.bytes(&sk);
+                out.private = .{ .x25519 = undefined };
+                random.bytes(&out.private.x25519);
                 // Clamped-scalar identity output is not reachable from
                 // random bytes, but the error union exists — resample.
-                const pk = X25519.recoverPublicKey(sk) catch continue;
-                return .{ .private = .{ .x25519 = sk }, .public = .{ .x25519 = pk } };
+                const pk = X25519.recoverPublicKey(out.private.x25519) catch continue;
+                out.public = .{ .x25519 = pk };
+                return;
             }
         },
     }
@@ -188,23 +201,38 @@ pub fn generateEphemeral(curve: Curve, entropy: Entropy) EphemeralKeyPair {
 /// (recipient-static private, header `epk`). P-256: `Z` = the X coordinate
 /// of `d·Q`, big-endian, 32 bytes (SEC1 §3.3.1); X25519: the RFC 7748
 /// function output. Returns the `Z` slice into `out` — callers should
-/// `secureZero` it after the KDF. Cross-curve inputs are the typed
-/// `error.CurveMismatch`.
-pub fn deriveZ(private: PrivateKey, peer: PublicKey, out: *[max_z_len]u8) Error![]const u8 {
-    if (@as(Curve, private) != @as(Curve, peer)) return error.CurveMismatch;
-    switch (private) {
-        .p256 => |d| {
-            P256.scalar.rejectNonCanonical(d, .big) catch return error.InvalidKey;
+/// `secureZero` it after the KDF (`out` is zeroed on every error).
+/// Cross-curve inputs are the typed `error.CurveMismatch`.
+///
+/// The private key is taken by pointer: a by-value 32-byte union would be
+/// copied into the caller's frame and never wiped. The body runs one frame
+/// down and is burned, the P-256 multiply goes through `P256.mulInto`, and
+/// the shared point is wiped before returning.
+pub fn deriveZ(private: *const PrivateKey, peer: PublicKey, out: *[max_z_len]u8) Error![]const u8 {
+    const r = deriveZUnburned(private, peer, out);
+    burn.stack(burn.ecdh_burn);
+    return r;
+}
+
+noinline fn deriveZUnburned(private: *const PrivateKey, peer: PublicKey, out: *[max_z_len]u8) Error![]const u8 {
+    errdefer std.crypto.secureZero(u8, out);
+    if (std.meta.activeTag(private.*) != std.meta.activeTag(peer)) return error.CurveMismatch;
+    switch (private.*) {
+        .p256 => |*d| {
+            P256.scalar.rejectNonCanonical(d.*, .big) catch return error.InvalidKey;
             // Constant-time scalar mult; rejects an identity peer point and
             // an identity result (d == 0).
-            const shared = peer.p256.mul(d, .big) catch return error.InvalidKey;
+            var shared: P256 = undefined;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&shared));
+            peer.p256.mulInto(&shared, d, .big) catch return error.InvalidKey;
             out.* = shared.affineCoordinates().x.toBytes(.big);
             return out[0..coordinate_len];
         },
-        .x25519 => |sk| {
+        .x25519 => |*sk| {
             // std rejects the identity/all-zero output — RFC 7748's
-            // low-order-point check.
-            out.* = X25519.scalarmult(sk, peer.x25519) catch return error.InvalidKey;
+            // low-order-point check. std takes the scalar by value; that copy
+            // lives in this (burned) frame.
+            out.* = X25519.scalarmult(sk.*, peer.x25519) catch return error.InvalidKey;
             return out[0..coordinate_len];
         },
     }
@@ -228,6 +256,17 @@ pub fn deriveZ(private: PrivateKey, peer: PublicKey, out: *[max_z_len]u8) Error!
 /// round runs, but the counter loop is general (A256CBC-HS512 direct needs
 /// two rounds). Byte-exact against RFC 7518 Appendix C (test below).
 pub fn concatKdfSha256(
+    z: []const u8,
+    alg_id: []const u8,
+    apu: []const u8,
+    apv: []const u8,
+    derived: []u8,
+) void {
+    concatKdfSha256Unburned(z, alg_id, apu, apv, derived);
+    burn.stack(burn.kdf_burn);
+}
+
+noinline fn concatKdfSha256Unburned(
     z: []const u8,
     alg_id: []const u8,
     apu: []const u8,
@@ -296,12 +335,12 @@ test "RFC 7518 Appendix C KAT — P-256 ECDH Z, byte-exact, both directions" {
 
     // Encrypt side: Z = ECDH(alice ephemeral private, bob static public).
     var z_buf: [max_z_len]u8 = undefined;
-    const z1 = try deriveZ(.{ .p256 = b64dFixed(32, appc_alice_d) }, bob_pub, &z_buf);
+    const z1 = try deriveZ(&.{ .p256 = b64dFixed(32, appc_alice_d) }, bob_pub, &z_buf);
     try testing.expectEqualSlices(u8, &appc_z, z1);
 
     // Decrypt side: Z = ECDH(bob static private, alice's epk) — same Z.
     var z_buf2: [max_z_len]u8 = undefined;
-    const z2 = try deriveZ(.{ .p256 = b64dFixed(32, appc_bob_d) }, alice_pub, &z_buf2);
+    const z2 = try deriveZ(&.{ .p256 = b64dFixed(32, appc_bob_d) }, alice_pub, &z_buf2);
     try testing.expectEqualSlices(u8, &appc_z, z2);
 }
 
@@ -364,12 +403,14 @@ test "Concat KDF counter loop — 64-byte output is round-1 digest ‖ round-2 d
 test "ephemeral generation + agreement — both curves, both directions agree" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x37} ** 32);
     inline for (.{ Curve.p256, Curve.x25519 }) |curve| {
-        const a = generateEphemeral(curve, .{ .fixed_for_test = csprng.random() });
-        const b = generateEphemeral(curve, .{ .fixed_for_test = csprng.random() });
+        var a: EphemeralKeyPair = undefined;
+        generateEphemeral(&a, curve, .{ .fixed_for_test = csprng.random() });
+        var b: EphemeralKeyPair = undefined;
+        generateEphemeral(&b, curve, .{ .fixed_for_test = csprng.random() });
         var za_buf: [max_z_len]u8 = undefined;
         var zb_buf: [max_z_len]u8 = undefined;
-        const za = try deriveZ(a.private, b.public, &za_buf);
-        const zb = try deriveZ(b.private, a.public, &zb_buf);
+        const za = try deriveZ(&a.private, b.public, &za_buf);
+        const zb = try deriveZ(&b.private, a.public, &zb_buf);
         try testing.expectEqualSlices(u8, za, zb);
         try testing.expect(!std.mem.allEqual(u8, za, 0));
 
@@ -377,18 +418,20 @@ test "ephemeral generation + agreement — both curves, both directions agree" {
         const coords = a.public.coordinates();
         const back = try PublicKey.fromCoordinates(curve, &coords.x, if (coords.y) |*y| y else null);
         var zc_buf: [max_z_len]u8 = undefined;
-        const zc = try deriveZ(b.private, back, &zc_buf);
+        const zc = try deriveZ(&b.private, back, &zc_buf);
         try testing.expectEqualSlices(u8, za, zc);
     }
 }
 
 test "cross-curve agreement is a typed CurveMismatch, never a wrong-key derivation" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x38} ** 32);
-    const p = generateEphemeral(.p256, .{ .fixed_for_test = csprng.random() });
-    const x = generateEphemeral(.x25519, .{ .fixed_for_test = csprng.random() });
+    var p: EphemeralKeyPair = undefined;
+    generateEphemeral(&p, .p256, .{ .fixed_for_test = csprng.random() });
+    var x: EphemeralKeyPair = undefined;
+    generateEphemeral(&x, .x25519, .{ .fixed_for_test = csprng.random() });
     var z_buf: [max_z_len]u8 = undefined;
-    try testing.expectError(error.CurveMismatch, deriveZ(p.private, x.public, &z_buf));
-    try testing.expectError(error.CurveMismatch, deriveZ(x.private, p.public, &z_buf));
+    try testing.expectError(error.CurveMismatch, deriveZ(&p.private, x.public, &z_buf));
+    try testing.expectError(error.CurveMismatch, deriveZ(&x.private, p.public, &z_buf));
 }
 
 test "invalid peer material is rejected: off-curve point, bad lengths, missing y" {
@@ -406,18 +449,21 @@ test "invalid peer material is rejected: off-curve point, bad lengths, missing y
 
 test "invalid private scalars: zero / non-canonical P-256 d, low-order X25519 peer" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x39} ** 32);
-    const peer = generateEphemeral(.p256, .{ .fixed_for_test = csprng.random() });
+    var peer: EphemeralKeyPair = undefined;
+    generateEphemeral(&peer, .p256, .{ .fixed_for_test = csprng.random() });
     var z_buf: [max_z_len]u8 = undefined;
-    try testing.expectError(error.InvalidKey, deriveZ(.{ .p256 = [_]u8{0} ** 32 }, peer.public, &z_buf));
-    try testing.expectError(error.InvalidKey, deriveZ(.{ .p256 = [_]u8{0xff} ** 32 }, peer.public, &z_buf));
+    try testing.expectError(error.InvalidKey, deriveZ(&.{ .p256 = [_]u8{0} ** 32 }, peer.public, &z_buf));
+    try testing.expectError(error.InvalidKey, deriveZ(&.{ .p256 = [_]u8{0xff} ** 32 }, peer.public, &z_buf));
 
     // X25519 low-order peer (the all-zero point) must fail, not yield Z=0.
-    const xkp = generateEphemeral(.x25519, .{ .fixed_for_test = csprng.random() });
-    try testing.expectError(error.InvalidKey, deriveZ(xkp.private, .{ .x25519 = [_]u8{0} ** 32 }, &z_buf));
+    var xkp: EphemeralKeyPair = undefined;
+    generateEphemeral(&xkp, .x25519, .{ .fixed_for_test = csprng.random() });
+    try testing.expectError(error.InvalidKey, deriveZ(&xkp.private, .{ .x25519 = [_]u8{0} ** 32 }, &z_buf));
 }
 
 test "PrivateKey.wipe zeroes the scalar" {
-    var kp = generateEphemeral(.p256, blk: {
+    var kp: EphemeralKeyPair = undefined;
+    generateEphemeral(&kp, .p256, blk: {
         const S = struct {
             var csprng = std.Random.DefaultCsprng.init([_]u8{0x3a} ** 32);
         };

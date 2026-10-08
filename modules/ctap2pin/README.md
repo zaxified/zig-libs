@@ -52,7 +52,8 @@ transaction; fresh IV per protocol-Two encryption) — no internal RNG.
 ```zig
 const P = ctap2pin.Impl(.two); // or use ctap2pin.One / ctap2pin.Two directly
 const peer = ctap2pin.PublicKey{ .x = cose_x, .y = cose_y }; // authenticator's COSE key
-const enc = try P.encapsulate(fresh_random_scalar, peer);
+var enc: P.Encaps = undefined;
+try P.encapsulate(&enc, &fresh_random_scalar, peer); // secrets by pointer / out-param
 // enc.platform_key_agreement → send to the authenticator
 // enc.shared_secret          → One: [32]u8; Two: [64]u8 (hmacKey ‖ aesKey)
 ```
@@ -61,12 +62,12 @@ const enc = try P.encapsulate(fresh_random_scalar, peer);
 
 ```zig
 // Protocol One: zero IV, ciphertext only.
-try ctap2pin.One.encrypt(secret, ct[0..pt.len], pt);
-try ctap2pin.One.decrypt(secret, pt2[0..ct.len], ct);
+try ctap2pin.One.encrypt(&secret, ct[0..pt.len], pt);
+try ctap2pin.One.decrypt(&secret, pt2[0..ct.len], ct);
 
 // Protocol Two: caller-supplied random IV, output = IV ‖ ciphertext.
-try ctap2pin.Two.encrypt(secret, fresh_iv, ct[0..pt.len + 16], pt);
-try ctap2pin.Two.decrypt(secret, pt2[0..try ctap2pin.Two.decryptedLength(ct.len)], ct);
+try ctap2pin.Two.encrypt(&secret, fresh_iv, ct[0..pt.len + 16], pt);
+try ctap2pin.Two.decrypt(&secret, pt2[0..try ctap2pin.Two.decryptedLength(ct.len)], ct);
 ```
 
 **Authenticate / verify** (verify is constant-time, fail-closed). CTAP2 calls
@@ -90,8 +91,8 @@ if (!ctap2pin.Two.verify(secret[0..32], msg, sig)) return error.PinAuthInvalid;
 **Raw CBC** (the std-gap primitive, usable on its own):
 
 ```zig
-try ctap2pin.Aes256Cbc.encrypt(dst, plaintext, key, iv);
-try ctap2pin.Aes256Cbc.decrypt(dst, ciphertext, key, iv);
+try ctap2pin.Aes256Cbc.encrypt(dst, plaintext, &key, iv);
+try ctap2pin.Aes256Cbc.decrypt(dst, ciphertext, &key, iv);
 ```
 
 ## Test

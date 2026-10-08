@@ -386,7 +386,10 @@ fn expandWithContext(
 /// published in `GroupInfo` so a non-member can join by external Commit;
 /// the private key is held by the whole group.
 pub fn externalKeyPair(comptime S: type, external_secret: [S.Nh]u8) S.Kem.KeyPair {
-    return S.Kem.deriveKeyPair(&external_secret);
+    // mls sweep (dead-stack, open): the pair is still returned by value.
+    var kp: S.Kem.KeyPair = undefined;
+    S.Kem.deriveKeyPair(&kp, &external_secret);
+    return kp;
 }
 
 // ── §8.3: external initialization ─────────────────────────────────────────
@@ -466,7 +469,9 @@ pub fn externalInitSender(
     external_pub: S.Kem.PublicKey,
     io: std.Io,
 ) !ExternalInit(S) {
-    const setup = try hpke.setupBaseS(S.Kem, S.Aead, S.Nh, external_pub, io, "");
+    var setup: hpke.Setup(S.Kem, S.Aead, S.Nh) = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&setup.context));
+    try hpke.setupBaseS(S.Kem, S.Aead, S.Nh, &setup, external_pub, io, "");
     var init_secret: [S.Nh]u8 = undefined;
     try setup.context.exportSecret(&hpkeSuiteId(S), label_external_init, &init_secret);
     return .{ .kem_output = setup.enc, .init_secret = init_secret };
@@ -481,7 +486,9 @@ pub fn externalInitSenderDeterministic(
     external_pub: S.Kem.PublicKey,
     ephemeral: S.Kem.KeyPair,
 ) !ExternalInit(S) {
-    const setup = try hpke.schedule.setupBaseSDeterministic(S.Kem, S.Aead, S.Nh, external_pub, ephemeral, "");
+    var setup: hpke.Setup(S.Kem, S.Aead, S.Nh) = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&setup.context));
+    try hpke.schedule.setupBaseSDeterministic(S.Kem, S.Aead, S.Nh, &setup, external_pub, &ephemeral, "");
     var init_secret: [S.Nh]u8 = undefined;
     try setup.context.exportSecret(&hpkeSuiteId(S), label_external_init, &init_secret);
     return .{ .kem_output = setup.enc, .init_secret = init_secret };
@@ -508,7 +515,9 @@ pub fn externalInitReceiver(
     kem_output: S.Kem.EncappedKey,
     external_key_pair: S.Kem.KeyPair,
 ) ![S.Nh]u8 {
-    var context = try hpke.setupBaseR(S.Kem, S.Aead, S.Nh, kem_output, external_key_pair, "");
+    var context: hpke.Context(S.Aead, S.Nh) = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&context));
+    try hpke.setupBaseR(S.Kem, S.Aead, S.Nh, &context, kem_output, &external_key_pair, "");
     var init_secret: [S.Nh]u8 = undefined;
     try context.exportSecret(&hpkeSuiteId(S), label_external_init, &init_secret);
     return init_secret;

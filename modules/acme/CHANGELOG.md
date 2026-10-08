@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** ES256 moved off
+  `std.crypto.sign.ecdsa.EcdsaP256Sha256` onto `p256.EcdsaP256Sha256` (burned wrapper); every secret key
+  pair / seed / secret key is taken by pointer and every secret result goes into an out-param. Measured
+  BEFORE with the new `src/stackprobe_test.zig` (ReleaseFast, per 5 calls): `jws.sign` left `d` 55×, `k` 10×,
+  `k⁻¹` 20×, `r·d` 10×, `e+r·d` 10× on the dead stack (down to 2.8 KiB below the call); `x509.csrDer` and
+  `x509.tlsAlpnCertDer` the same (`d` 55×, `k` 10×, `k⁻¹` 20×, `r·d` 10×, `e+r·d` 10×, to 3.9 / 4.5 KiB);
+  `jws.generateKeyPair` `d` 60× and the seed 20×; `x509.ecPrivateKeyToPem` `d` 20×;
+  `x509.ecPrivateKeyFromPem` `d` 50× — `k` next to a published signature is the private key. After: 0 residues
+  in all six, negative control 0, positive control found.
+  - **API:** `jws.generateKeyPair(out: *KeyPair, io)` (was `generateKeyPair(io) KeyPair`);
+    `jws.sign(gpa, key_pair: *const KeyPair, …)`; `x509.csrDer`, `x509.tlsAlpnCertDer`,
+    `x509.ecPrivateKeyToPem` take `*const Es256.KeyPair`; `x509.ecPrivateKeyFromPem(out: *KeyPair, gpa, text)`
+    (was returning the pair; `out` is zeroed on error); `Client.init(…, account_key: *const jws.KeyPair, …)`
+    copies the pair into the client (the field is wiped in `deinit`, as before). `jws.KeyPair` / `Es256` are
+    p256's types (same fields as std's). Library code builds pairs with `generateDeterministicInto` /
+    `fromSecretKeyInto`.
+  - Key mint and the RFC 5915 codec run their bodies one frame down and burn it (`src/burn.zig`, 8 KiB; the
+    ECDSA signer burns its own frames inside p256). `ecPrivateKeyToPem` now builds the DER (it holds the
+    scalar) in a wiped stack buffer instead of a heap arena; `ecPrivateKeyFromPem` wipes the decoded DER.
+
 - **2026-10-06** — **Anchoring: Pebble** (`tools/pebble.sh`, `tools/interop.zig`, `tools/pebble_helper`,
   `src/pebble_replay_test.zig`): the client against Let's Encrypt's ACME test CA in `-strict` mode —
   HTTP-01 (one and two names), DNS-01 wildcard, TLS-ALPN-01, an unreachable name and a blocked one,

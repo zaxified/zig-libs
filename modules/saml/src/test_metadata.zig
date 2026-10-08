@@ -168,7 +168,7 @@ test "SP metadata: full document is the pinned, XSD-valid bytes" {
     try testing.expectEqualStrings(full_md_xml, out);
 }
 
-fn signedOpts(sk: rsa.SecretKey) saml.SpMetadataOptions {
+fn signedOpts(sk: *const rsa.SecretKey) saml.SpMetadataOptions {
     var o = fullOpts();
     o.id = "_sp-metadata.1";
     o.sign_with = .{ .rsa = sk };
@@ -179,7 +179,7 @@ test "SP metadata: signed document is the pinned bytes xmlsec1 verified" {
     var sk: rsa.SecretKey = undefined;
     try rsa.SecretKey.fromPem(&sk, ext.sp_priv_pem);
     defer sk.deinit();
-    const out = try saml.buildSpMetadata(testing.allocator, signedOpts(sk));
+    const out = try saml.buildSpMetadata(testing.allocator, signedOpts(&sk));
     defer testing.allocator.free(out);
     try testing.expectEqualStrings(signed_md_xml, out);
 }
@@ -267,7 +267,7 @@ test "SP metadata: the signature verifies through xmldsig and is pinned to the E
     var sk: rsa.SecretKey = undefined;
     try rsa.SecretKey.fromPem(&sk, ext.sp_priv_pem);
     defer sk.deinit();
-    const out = try saml.buildSpMetadata(alloc, signedOpts(sk));
+    const out = try saml.buildSpMetadata(alloc, signedOpts(&sk));
     defer alloc.free(out);
 
     var doc = try xml.parse(alloc, out, .{ .id_attr_names = &.{"ID"} });
@@ -367,7 +367,7 @@ test "SP metadata: invalid options are refused with typed errors" {
     var sk: rsa.SecretKey = undefined;
     try rsa.SecretKey.fromPem(&sk, ext.sp_priv_pem);
     defer sk.deinit();
-    try testing.expectError(error.InvalidId, saml.buildSpMetadata(alloc, .{ .entity_id = "e", .assertion_consumer_services = acs, .sign_with = .{ .rsa = sk } }));
+    try testing.expectError(error.InvalidId, saml.buildSpMetadata(alloc, .{ .entity_id = "e", .assertion_consumer_services = acs, .sign_with = .{ .rsa = &sk } }));
     for ([_][]const u8{ "", "1abc", "a\"b", "a b", "#x", "a&b", "\u{e9}" }) |bad| {
         try testing.expectError(error.InvalidId, saml.buildSpMetadata(alloc, .{ .entity_id = "e", .assertion_consumer_services = acs, .id = bad }));
     }
@@ -403,5 +403,5 @@ test "SP metadata: no allocation is leaked on any failure path" {
             const out = try saml.buildSpMetadata(a, o);
             a.free(out);
         }
-    }.run, .{signedOpts(sk)});
+    }.run, .{signedOpts(&sk)});
 }

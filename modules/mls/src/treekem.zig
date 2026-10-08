@@ -761,7 +761,9 @@ pub fn processUpdatePath(
             // key pair = KEM.DeriveKeyPair(node_secret).
             if (kps.path_secret.len != S.Nh) return error.WrongKeyLength;
             const node_secret = try crypto.DeriveSecret(S, kps.path_secret[0..S.Nh].*, "node");
-            key_pair = S.Kem.deriveKeyPair(&node_secret);
+            var derived_kp: S.Kem.KeyPair = undefined;
+            S.Kem.deriveKeyPair(&derived_kp, &node_secret);
+            key_pair = derived_kp;
             ct_pos = i;
             break :outer;
         }
@@ -796,7 +798,8 @@ pub fn processUpdatePath(
     while (i < fdp.len) : (i += 1) {
         if (i > overlap) path_secret = try crypto.DeriveSecret(S, path_secret, "path");
         const node_secret = try crypto.DeriveSecret(S, path_secret, "node");
-        const node_kp = S.Kem.deriveKeyPair(&node_secret);
+        var node_kp: S.Kem.KeyPair = undefined;
+        S.Kem.deriveKeyPair(&node_kp, &node_secret);
         if (!std.mem.eql(u8, &node_kp.public_key, update_path.nodes[i].encryption_key)) return error.Malformed;
         const owned = try allocator.dupe(u8, &path_secret);
         derived.append(allocator, .{ .node = fdp[i].node, .path_secret = owned }) catch |e| {
@@ -1089,7 +1092,8 @@ pub fn stageUpdatePath(
     for (fdp, nodes, 0..) |e, *slot, i| {
         if (i > 0) secret = try crypto.DeriveSecret(S, secret, "path");
         const node_secret = try crypto.DeriveSecret(S, secret, "node");
-        const kp = S.Kem.deriveKeyPair(&node_secret);
+        var kp: S.Kem.KeyPair = undefined;
+        S.Kem.deriveKeyPair(&kp, &node_secret);
         slot.* = .{
             .node = e.node,
             .copath_child = e.copath_child,

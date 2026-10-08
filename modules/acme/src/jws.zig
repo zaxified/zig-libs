@@ -12,9 +12,13 @@
 
 const std = @import("std");
 const entropy = @import("entropy");
+const burn = @import("burn.zig");
 
-/// The one JWS algorithm ACME accounts use here: ECDSA P-256 + SHA-256.
-pub const Es256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+/// The one JWS algorithm ACME accounts use here: ECDSA P-256 + SHA-256, over
+/// p256's burned wrapper rather than std's signer (which leaves the private
+/// key and the nonce on the dead stack after every signature — measured
+/// 2026-10-08, `stackprobe_test.zig`).
+pub const Es256 = @import("p256").EcdsaP256Sha256;
 pub const KeyPair = Es256.KeyPair;
 
 /// Mint an account or certificate key. **Use this, not
@@ -29,18 +33,27 @@ pub const KeyPair = Es256.KeyPair;
 /// fact — a weak account key is a CA that will happily take orders from
 /// whoever else derives it.
 ///
-/// Body-identical to `std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.
-/// generate` otherwise; the retry loop is std's, absorbing the seed whose
+/// Otherwise the same as std's ECDSA `KeyPair.generate`; the retry loop is std's, absorbing the seed whose
 /// derived scalar lands on the identity element.
-pub fn generateKeyPair(io: std.Io) KeyPair {
+///
+/// The pair goes into `out` (zeroed on error), not through a return value: a
+/// returned pair would sit in the caller's frame temporary, where nothing
+/// wipes it. The seed's frames are burned (`burn.zig`).
+pub fn generateKeyPair(out: *KeyPair, io: std.Io) void {
+    generateKeyPairUnburned(out, io);
+    burn.stack(burn.key_burn);
+}
+
+noinline fn generateKeyPairUnburned(out: *KeyPair, io: std.Io) void {
     var seed: [KeyPair.seed_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &seed);
     while (true) {
         entropy.fill(io, &seed);
-        return KeyPair.generateDeterministic(seed) catch {
+        KeyPair.generateDeterministicInto(out, &seed) catch {
             @branchHint(.unlikely);
             continue;
         };
+        return;
     }
 }
 
@@ -222,7 +235,7 @@ pub const SignError = error{ OutOfMemory, SigningFailed };
 /// (`{"protected","payload","signature"}`). Caller owns the returned JSON.
 pub fn sign(
     gpa: std.mem.Allocator,
-    key_pair: KeyPair,
+    key_pair: *const KeyPair,
     payload: []const u8,
     header: Header,
 ) SignError![]u8 {
@@ -278,7 +291,7 @@ fn writeProtected(js: *std.json.Stringify, public_key: Es256.PublicKey, header: 
 fn appendJws(
     gpa: std.mem.Allocator,
     w: *std.Io.Writer,
-    key_pair: KeyPair,
+    key_pair: *const KeyPair,
     protected: []const u8,
     payload: []const u8,
 ) (SignError || std.Io.Writer.Error)!void {
@@ -453,10 +466,34 @@ const rfc7515_signing_input = "eyJhbGciOiJFUzI1NiJ9" ++ "." ++
 const rfc7515_signature = "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSA" ++
     "pmWQxfKTUJqPP3-Kg6NU1Q";
 
-fn rfc7515KeyPair() !KeyPair {
-    var d: [32]u8 = undefined;
-    try b64.Decoder.decode(&d, rfc7515_d);
-    return KeyPair.fromSecretKey(try Es256.SecretKey.fromBytes(d));
+/// The RFC 7515 A.3 key pair (a published test key, not a secret), in static
+/// storage so tests pass it by pointer like production code.
+fn rfc7515KeyPair() !*const KeyPair {
+    const S = struct {
+        var kp: KeyPair = undefined;
+        var ready = false;
+    };
+    if (!S.ready) {
+        var sk: Es256.SecretKey = undefined;
+        try b64.Decoder.decode(&sk.bytes, rfc7515_d);
+        try KeyPair.fromSecretKeyInto(&S.kp, &sk);
+        S.ready = true;
+    }
+    return &S.kp;
+}
+
+/// A fixed non-secret test pair per seed byte, static storage.
+fn seedKeyPair(comptime seed_byte: u8) *const KeyPair {
+    const S = struct {
+        var kp: KeyPair = undefined;
+        var ready = false;
+    };
+    if (!S.ready) {
+        const seed: [KeyPair.seed_length]u8 = @splat(seed_byte);
+        KeyPair.generateDeterministicInto(&S.kp, &seed) catch unreachable;
+        S.ready = true;
+    }
+    return &S.kp;
 }
 
 test "base64url: RFC 4648 behavior, no padding, url-safe alphabet" {
@@ -625,7 +662,7 @@ test "sign → verifyFlattened (kid mode + POST-as-GET empty payload)" {
     try testing.expect(v.jwk_key == null);
 
     // The wrong key must not verify.
-    const other = try Es256.KeyPair.generateDeterministic(@splat(7));
+    const other = seedKeyPair(7);
     try testing.expectError(
         error.BadSignature,
         verifyFlattened(testing.allocator, jws_json, other.public_key),
@@ -664,13 +701,17 @@ test "RNG seam: generateKeyPair really draws entropy, and round-trips end to end
     // `entropy.fill` left `zig build test-megolm` green. Not re-measured
     // here, but the seed above is one buffer filled the same way, so the
     // same failure mode applies.
-    const kp1 = generateKeyPair(io);
-    const kp2 = generateKeyPair(io);
+    var kp1: KeyPair = undefined;
+    var kp2: KeyPair = undefined;
+    generateKeyPair(&kp1, io);
+    generateKeyPair(&kp2, io);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp1));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp2));
     try testing.expect(!std.mem.eql(u8, &kp1.secret_key.bytes, &kp2.secret_key.bytes));
 
     // And the production path is a working path, not just a typed one:
     // sign with the freshly drawn key, verify with its own embedded jwk.
-    const jws_json = try sign(testing.allocator, kp1, "{}", .{
+    const jws_json = try sign(testing.allocator, &kp1, "{}", .{
         .nonce = "n",
         .url = "https://ca.example/x",
     });
@@ -708,7 +749,7 @@ test "verifyFlattened: malformed and tampered inputs never verify" {
 /// A flattened JWS with a hand-written protected header, genuinely ES256-
 /// signed by `kp` over `b64(protected) "." b64(payload)` — so the only
 /// thing wrong with it is whatever the header says.
-fn craftJws(a: std.mem.Allocator, kp: KeyPair, protected: []const u8, sig_extra: []const u8) ![]u8 {
+fn craftJws(a: std.mem.Allocator, kp: *const KeyPair, protected: []const u8, sig_extra: []const u8) ![]u8 {
     const p64 = try base64UrlEncodeAlloc(a, protected);
     const input = try std.mem.concat(a, u8, &.{ p64, "." });
     const sig = try kp.sign(input, null);
@@ -750,7 +791,7 @@ test "verifyFlattened refuses a validly signed JWS whose header breaks RFC 8555 
     try testing.expectError(error.MalformedJws, verifyFlattened(testing.allocator, long_sig, null));
 
     // An attacker's own key, embedded as jwk, against the account key.
-    const attacker = try KeyPair.generateDeterministic(@splat(9));
+    const attacker = seedKeyPair(9);
     var ajwk_buf: [256]u8 = undefined;
     const ajwk = canonicalJwk(&ajwk_buf, attacker.public_key);
     const forged = try craftJws(a, attacker, try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{ajwk}), "");

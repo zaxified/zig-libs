@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** a ReleaseFast stack probe
+  (`src/stackprobe_test.zig`, new) found, 5 calls each, after: `ecdhes.generateEphemeral(.p256)`
+  the ephemeral scalar x40 (up to 1 KiB deep); `deriveZ(p256)` `d` x20, `Z` and the shared y
+  (594 B deep); `encryptCompact` ECDH-ES the scalar x20 and, for direct mode, the CEK x35 up to 24.5 KiB
+  deep (std AES-GCM frames); `decryptCompact` ECDH-ES direct the CEK x25 (2.6 KiB) and `d` x10.
+  (The Concat KDF alone was not measured BEFORE: the first probe version's control was unarmed.)
+  Now 0 residues in all. API: `ecdhes.generateEphemeral(out: *EphemeralKeyPair, curve, entropy)`,
+  `ecdhes.deriveZ(private: *const PrivateKey, peer, out)`, `KeyMaterial.ec_private` is
+  `*const ecdhes.PrivateKey` (borrowed). P-256 goes through `P256.mulInto`, the shared point is
+  wiped, `generateEphemeral`/`deriveZ`/`concatKdfSha256` run one frame down and are burned
+  (`src/burn.zig`: 8 KiB, 8 KiB, 4 KiB); the ECDH-ES arm of `encryptCompact` is its own noinline
+  helper burned afterwards, `enc.encrypt`/`enc.decrypt` burn 32 KiB (CEK in std key schedules),
+  and `encryptCompact` now wipes its CEK buffer on return (it did not). X25519 shows no residue
+  with the same wrapper (std takes the scalar by value; the copy lives in the burned body).
+
 - **2026-10-08** — **BREAKING:** `alg.rsaOaepUnwrap(sk: *const rsa.SecretKey, …)` takes the key by
   pointer, following rsa's 2026-10-08 API: by value, the 11.8 KiB key was copied into the
   caller's frame on every call, where nothing wipes it. Internal callers and tests updated.

@@ -78,22 +78,36 @@ const suite_id = hpke.suite.suiteId(0x0020, 0x0001, 0x0001); // X25519 + HKDF-SH
 const kem_suite_id = hpke.suite.kemSuiteId(0x0020);
 
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
-const prk = hpke.suite.labeledExtract(HkdfSha256, &kem_suite_id, "", "eae_prk", dh_output);
+var prk: [HkdfSha256.prk_length]u8 = undefined;
+hpke.suite.labeledExtract(HkdfSha256, &prk, &kem_suite_id, "", "eae_prk", dh_output);
 var shared_secret: [32]u8 = undefined;
-try hpke.suite.labeledExpand(HkdfSha256, &kem_suite_id, prk, "shared_secret", kem_context, &shared_secret);
+try hpke.suite.labeledExpand(HkdfSha256, &kem_suite_id, &prk, "shared_secret", kem_context, &shared_secret);
 ```
 
 **KEM** (`dhkem.zig`, re-exported as `hpke.X25519Kem`/`hpke.P256Kem`/
 `hpke.P384Kem`):
 
 ```zig
-const kp = hpke.X25519Kem.generateKeyPair(io); // fresh random keypair
-const kp2 = hpke.X25519Kem.deriveKeyPair(ikm); // RFC 9180 §7.1.3, ikm-seeded
-const encapped = try hpke.X25519Kem.encap(kp.public_key, io); // {shared_secret, enc}
-const ss = try hpke.X25519Kem.decap(encapped.enc, kp); // == encapped.shared_secret
+var kp: hpke.X25519Kem.KeyPair = undefined;
+hpke.X25519Kem.generateKeyPair(&kp, io); // fresh random keypair
+var kp2: hpke.X25519Kem.KeyPair = undefined;
+hpke.X25519Kem.deriveKeyPair(&kp2, ikm); // RFC 9180 §7.1.3, ikm-seeded
+var encapped: hpke.X25519Kem.Encapped = undefined;
+try hpke.X25519Kem.encap(&encapped, kp.public_key, io); // {shared_secret, enc}
+var ss: [hpke.X25519Kem.Nsecret]u8 = undefined;
+try hpke.X25519Kem.decap(&ss, encapped.enc, &kp); // == encapped.shared_secret
 ```
 
-`hpke.P384Kem` is the same shape (`kp = hpke.P384Kem.generateKeyPair(io)`,
+**Secrets never travel by value.** Every private key is taken as
+`*const KeyPair`, and every secret result — a key pair, a shared secret, a
+`Context`, a `Setup` — is written into an `out` pointer (zeroed on error),
+never returned: a by-value argument or a returned value is a copy in the
+caller's frame that nothing wipes. Every entry point that touches a secret
+also zeroes the stack its body used before it returns (`src/burn.zig`); a
+ReleaseFast probe (`src/stackprobe_test.zig`) checks all of it, the caller's
+frame included.
+
+`hpke.P384Kem` is the same shape (`hpke.P384Kem.generateKeyPair(&kp, io)`,
 `Npk`=97/`Nsk`=48/`Nsecret`=48 instead of P-256's 65/32/32) — pass it to
 `sealBase`/`setupBaseS`/etc. in place of `X25519Kem`/`P256Kem` below; the
 outer `Nh` (key-schedule KDF width) is unrelated and picked the same way
@@ -108,7 +122,7 @@ const sealed = try hpke.sealBase(hpke.X25519Kem, Aes128Gcm, 32, pkR, io, info, a
 // send sealed.enc || ct_buf to the receiver holding skR
 
 var pt_buf: [pt.len]u8 = undefined;
-try hpke.openBase(hpke.X25519Kem, Aes128Gcm, 32, sealed.enc, skR, info, aad, ct_buf[0..], &pt_buf);
+try hpke.openBase(hpke.X25519Kem, Aes128Gcm, 32, sealed.enc, &skR, info, aad, ct_buf[0..], &pt_buf);
 ```
 
 The other three modes are the same call with their extra inputs — the
@@ -118,15 +132,15 @@ sender's static keypair (`skS`, next to the other KEM key) and/or
 ```zig
 // mode_psk: recipient is assured the sender held `psk` (>= 32 bytes, §5.1.2)
 const s = try hpke.sealPsk(hpke.X25519Kem, Aes128Gcm, 32, pkR, io, info, psk, psk_id, aad, pt, &ct_buf);
-try hpke.openPsk(hpke.X25519Kem, Aes128Gcm, 32, s.enc, skR, info, psk, psk_id, aad, ct_buf[0..], &pt_buf);
+try hpke.openPsk(hpke.X25519Kem, Aes128Gcm, 32, s.enc, &skR, info, psk, psk_id, aad, ct_buf[0..], &pt_buf);
 
 // mode_auth: recipient is assured the sender held the private key for pkS
-const s2 = try hpke.sealAuth(hpke.X25519Kem, Aes128Gcm, 32, pkR, skS, io, info, aad, pt, &ct_buf);
-try hpke.openAuth(hpke.X25519Kem, Aes128Gcm, 32, s2.enc, skR, skS.public_key, info, aad, ct_buf[0..], &pt_buf);
+const s2 = try hpke.sealAuth(hpke.X25519Kem, Aes128Gcm, 32, pkR, &skS, io, info, aad, pt, &ct_buf);
+try hpke.openAuth(hpke.X25519Kem, Aes128Gcm, 32, s2.enc, &skR, skS.public_key, info, aad, ct_buf[0..], &pt_buf);
 
 // mode_auth_psk: both at once
-const s3 = try hpke.sealAuthPsk(hpke.X25519Kem, Aes128Gcm, 32, pkR, skS, io, info, psk, psk_id, aad, pt, &ct_buf);
-try hpke.openAuthPsk(hpke.X25519Kem, Aes128Gcm, 32, s3.enc, skR, skS.public_key, info, psk, psk_id, aad, ct_buf[0..], &pt_buf);
+const s3 = try hpke.sealAuthPsk(hpke.X25519Kem, Aes128Gcm, 32, pkR, &skS, io, info, psk, psk_id, aad, pt, &ct_buf);
+try hpke.openAuthPsk(hpke.X25519Kem, Aes128Gcm, 32, s3.enc, &skR, skS.public_key, info, psk, psk_id, aad, ct_buf[0..], &pt_buf);
 ```
 
 `mode_auth` authenticates the sender **to this recipient only** — the
@@ -142,10 +156,12 @@ single-shot wrappers minus `aad`/`pt`/`out`) hand back the encapsulation and
 the `Context`, not a consumed one-shot ciphertext:
 
 ```zig
-const setup = try hpke.setupBaseS(hpke.X25519Kem, Aes128Gcm, 32, pkR, io, info);
+var setup: hpke.Setup(hpke.X25519Kem, Aes128Gcm, 32) = undefined;
+try hpke.setupBaseS(hpke.X25519Kem, Aes128Gcm, 32, &setup, pkR, io, info);
 // send setup.enc to the receiver holding skR
 
-var context = try hpke.setupBaseR(hpke.X25519Kem, Aes128Gcm, 32, setup.enc, skR, info);
+var context: hpke.Context(Aes128Gcm, 32) = undefined;
+try hpke.setupBaseR(hpke.X25519Kem, Aes128Gcm, 32, &context, setup.enc, &skR, info);
 
 // repeated seal/open over the SAME context:
 try setup.context.seal(aad, pt, &ct_buf);

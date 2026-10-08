@@ -49,6 +49,7 @@ const Aes256 = std.crypto.core.aes.Aes256;
 // P-256 curve group from the asm-accelerated `p256` module (byte-exact to
 // `std.crypto.ecc.P256`) — the COSE ECDH + ES256 primitives.
 const P256 = @import("p256").P256;
+const burn = @import("burn.zig");
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -93,10 +94,32 @@ pub const Aes256Cbc = struct {
 
     /// `c_i = E_key(p_i XOR c_{i-1})`, with `c_0` chaining from `iv`.
     /// `dst.len` must equal `plaintext.len`, a multiple of 16 (0 is fine).
-    pub fn encrypt(dst: []u8, plaintext: []const u8, key: [key_length]u8, iv: [block_length]u8) CbcError!void {
+    ///
+    /// The key is taken by pointer (a by-value 32-byte param is copied into
+    /// the caller's frame and never wiped), and the key schedule this builds
+    /// is burned off the stack on the way out.
+    pub fn encrypt(dst: []u8, plaintext: []const u8, key: *const [key_length]u8, iv: [block_length]u8) CbcError!void {
+        const r = encryptBurned(dst, plaintext, key, iv);
+        burn.stack(burn.aes_burn);
+        return r;
+    }
+
+    /// A second burn one frame down: the middle frame (which holds the
+    /// arguments of the body call) is then below the outer burn's start.
+    noinline fn encryptBurned(dst: []u8, plaintext: []const u8, key: *const [key_length]u8, iv: [block_length]u8) CbcError!void {
+        const r = encryptUnburned(dst, plaintext, key, iv);
+        burn.stack(burn.aes_burn);
+        return r;
+    }
+
+    noinline fn encryptUnburned(dst: []u8, plaintext: []const u8, key: *const [key_length]u8, iv: [block_length]u8) CbcError!void {
         if (plaintext.len % block_length != 0 or dst.len != plaintext.len)
             return error.InvalidLength;
-        const ctx = Aes256.initEnc(key);
+        // Pointer escapes on purpose: LLVM's argument promotion turned this
+        // pointer into a by-value copy made in the (unburned) wrapper's frame
+        // (stack probe, 2026-10-08: the key at 95..143 B below the call).
+        std.mem.doNotOptimizeAway(key);
+        const ctx = Aes256.initEnc(key.*);
         var prev: [block_length]u8 = iv;
         var i: usize = 0;
         while (i < plaintext.len) : (i += block_length) {
@@ -109,10 +132,29 @@ pub const Aes256Cbc = struct {
 
     /// `p_i = D_key(c_i) XOR c_{i-1}`, with `c_0` chaining from `iv`.
     /// `dst.len` must equal `ciphertext.len`, a multiple of 16 (0 is fine).
-    pub fn decrypt(dst: []u8, ciphertext: []const u8, key: [key_length]u8, iv: [block_length]u8) CbcError!void {
+    /// Key by pointer and burned key schedule: see `encrypt`.
+    pub fn decrypt(dst: []u8, ciphertext: []const u8, key: *const [key_length]u8, iv: [block_length]u8) CbcError!void {
+        const r = decryptBurned(dst, ciphertext, key, iv);
+        burn.stack(burn.aes_burn);
+        return r;
+    }
+
+    /// A second burn one frame down: the middle frame (which holds the
+    /// arguments of the body call) is then below the outer burn's start.
+    noinline fn decryptBurned(dst: []u8, ciphertext: []const u8, key: *const [key_length]u8, iv: [block_length]u8) CbcError!void {
+        const r = decryptUnburned(dst, ciphertext, key, iv);
+        burn.stack(burn.aes_burn);
+        return r;
+    }
+
+    noinline fn decryptUnburned(dst: []u8, ciphertext: []const u8, key: *const [key_length]u8, iv: [block_length]u8) CbcError!void {
         if (ciphertext.len % block_length != 0 or dst.len != ciphertext.len)
             return error.InvalidLength;
-        const ctx = Aes256.initDec(key);
+        // Pointer escapes on purpose: LLVM's argument promotion turned this
+        // pointer into a by-value copy made in the (unburned) wrapper's frame
+        // (stack probe, 2026-10-08: the key at 95..143 B below the call).
+        std.mem.doNotOptimizeAway(key);
+        const ctx = Aes256.initDec(key.*);
         var prev: [block_length]u8 = iv;
         var i: usize = 0;
         while (i < ciphertext.len) : (i += block_length) {
@@ -163,9 +205,21 @@ pub const PublicKey = struct {
 /// Derive the public key for a private scalar (big-endian, 32 bytes):
 /// `scalar * G`. Rejects a zero or non-canonical scalar with
 /// `error.InvalidScalar` — per CTAP 2.1, regenerate the random scalar.
-pub fn publicKeyFromScalar(private_scalar: [32]u8) EcdhError!PublicKey {
-    P256.scalar.rejectNonCanonical(private_scalar, .big) catch return error.InvalidScalar;
-    const p = P256.basePoint.mul(private_scalar, .big) catch return error.InvalidScalar;
+///
+/// The scalar is taken by pointer, never by value: a by-value 32-byte param is
+/// copied into the caller's frame and never wiped. The multiply runs through
+/// `P256.mulInto` (burned), and this body is burned too. The result is the
+/// PUBLIC key, so it may be returned by value.
+pub fn publicKeyFromScalar(private_scalar: *const [32]u8) EcdhError!PublicKey {
+    const r = publicKeyFromScalarUnburned(private_scalar);
+    burn.stack(burn.ecdh_burn);
+    return r;
+}
+
+noinline fn publicKeyFromScalarUnburned(private_scalar: *const [32]u8) EcdhError!PublicKey {
+    P256.scalar.rejectNonCanonical(private_scalar.*, .big) catch return error.InvalidScalar;
+    var p: P256 = undefined;
+    P256.basePoint.mulInto(&p, private_scalar, .big) catch return error.InvalidScalar;
     const aff = p.affineCoordinates();
     return .{ .x = aff.x.toBytes(.big), .y = aff.y.toBytes(.big) };
 }
@@ -173,8 +227,20 @@ pub fn publicKeyFromScalar(private_scalar: [32]u8) EcdhError!PublicKey {
 /// `Z = ECDH(private, peer)`: the big-endian x-coordinate (32 bytes) of
 /// `private_scalar * peerPoint` (CTAP 2.1 §6.5.6 `ecdh`, minus the
 /// protocol-specific `kdf` step — feed the result to `One.kdf`/`Two.kdf`).
-pub fn ecdhZ(private_scalar: [32]u8, peer: PublicKey) EcdhError![32]u8 {
-    P256.scalar.rejectNonCanonical(private_scalar, .big) catch return error.InvalidScalar;
+///
+/// Secret scalar in by pointer, secret `Z` out through `out` (zeroed on every
+/// error): a by-value scalar or a returned `[32]u8` would live in the caller's
+/// frame, out of reach of any burn here. The multiply runs through
+/// `P256.mulInto` (burned) and the shared point is wiped before returning.
+pub fn ecdhZ(out: *[32]u8, private_scalar: *const [32]u8, peer: PublicKey) EcdhError!void {
+    const r = ecdhZUnburned(out, private_scalar, peer);
+    burn.stack(burn.ecdh_burn);
+    return r;
+}
+
+noinline fn ecdhZUnburned(out: *[32]u8, private_scalar: *const [32]u8, peer: PublicKey) EcdhError!void {
+    errdefer std.crypto.secureZero(u8, out);
+    P256.scalar.rejectNonCanonical(private_scalar.*, .big) catch return error.InvalidScalar;
     // ⛔ NOT `std.mem.allEqual(u8, &private_scalar, 0)`, which is what this was
     // until 2026-09-09 (audit finding L1). That is a naive byte loop with an
     // early return: for a real scalar it stops after ~1 byte, for the all-zero
@@ -190,10 +256,12 @@ pub fn ecdhZ(private_scalar: [32]u8, peer: PublicKey) EcdhError![32]u8 {
     // `timing_safe.eql` promises it instead, which is what the line 35 lines
     // above already does deliberately — and `scripts/check-ct-compare.py` now
     // pins the call so it cannot be swapped back unnoticed.
-    if (std.crypto.timing_safe.eql([32]u8, private_scalar, [_]u8{0} ** 32)) return error.InvalidScalar;
+    if (std.crypto.timing_safe.eql([32]u8, private_scalar.*, [_]u8{0} ** 32)) return error.InvalidScalar;
     const point = try peer.toPoint();
-    const shared = point.mul(private_scalar, .big) catch return error.InvalidPublicKey;
-    return shared.affineCoordinates().x.toBytes(.big);
+    var shared: P256 = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&shared));
+    point.mulInto(&shared, private_scalar, .big) catch return error.InvalidPublicKey;
+    out.* = shared.affineCoordinates().x.toBytes(.big);
 }
 
 // ── protocol selector ───────────────────────────────────────────────────────
@@ -244,21 +312,34 @@ pub const One = struct {
     pub const Encaps = Encapsulation(SharedSecret);
 
     /// §6.5.7 `kdf(Z) = SHA-256(Z)`.
-    pub fn kdf(z: [32]u8) SharedSecret {
-        var out: SharedSecret = undefined;
-        Sha256.hash(&z, &out, .{});
-        return out;
+    ///
+    /// `Z` in by pointer, the secret out through `out`: by-value `Z` / a
+    /// returned secret would live in the caller's frame, out of reach of the
+    /// burn.
+    pub fn kdf(out: *SharedSecret, z: *const [32]u8) void {
+        kdfUnburned(out, z);
+        burn.stack(burn.kdf_burn);
+    }
+
+    noinline fn kdfUnburned(out: *SharedSecret, z: *const [32]u8) void {
+        Sha256.hash(z, out, .{});
     }
 
     /// §6.5.6 `encapsulate(peerCoseKey)`: ECDH with the caller-supplied
     /// random platform scalar, then this protocol's `kdf`. Returns the
     /// platform public key + the shared secret; both sides of the same
     /// exchange derive the identical secret.
-    pub fn encapsulate(platform_scalar: [32]u8, peer: PublicKey) EcdhError!Encaps {
-        return .{
-            .platform_key_agreement = try publicKeyFromScalar(platform_scalar),
-            .shared_secret = kdf(try ecdhZ(platform_scalar, peer)),
-        };
+    ///
+    /// The scalar comes in by pointer and the result goes out through `out`
+    /// (zeroed on error): see `ecdhZ`. `Z` lives in this frame only between
+    /// `ecdhZ` and `kdf` and is wiped before returning.
+    pub fn encapsulate(out: *Encaps, platform_scalar: *const [32]u8, peer: PublicKey) EcdhError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+        out.platform_key_agreement = try publicKeyFromScalar(platform_scalar);
+        var z: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &z);
+        try ecdhZ(&z, platform_scalar, peer);
+        kdf(&out.shared_secret, &z);
     }
 
     /// §6.5.7 `encrypt(key, demPlaintext)`: AES-256-CBC with an all-zero
@@ -271,18 +352,17 @@ pub const One = struct {
     /// doc comment asks for) never reaches — that copy is a different
     /// address, on a frame this function owns. Zero this function's own
     /// copy before returning.
-    pub fn encrypt(key_: SharedSecret, dst: []u8, plaintext: []const u8) CbcError!void {
-        var key = key_;
-        defer std.crypto.secureZero(u8, &key);
+    ///
+    /// `key` is taken by pointer (the M3 by-value copy above is gone with the
+    /// by-value parameter) — the only copies are `Aes256Cbc`'s, which burns.
+    pub fn encrypt(key: *const SharedSecret, dst: []u8, plaintext: []const u8) CbcError!void {
         try Aes256Cbc.encrypt(dst, plaintext, key, @splat(0));
     }
 
     /// §6.5.7 `decrypt(key, demCiphertext)`: inverse of `encrypt`
     /// (`dst.len == ciphertext.len`, a multiple of 16). See `encrypt`'s doc
     /// comment (M3) for why `key` is re-bound to a `var` and zeroed here.
-    pub fn decrypt(key_: SharedSecret, dst: []u8, ciphertext: []const u8) CbcError!void {
-        var key = key_;
-        defer std.crypto.secureZero(u8, &key);
+    pub fn decrypt(key: *const SharedSecret, dst: []u8, ciphertext: []const u8) CbcError!void {
         try Aes256Cbc.decrypt(dst, ciphertext, key, @splat(0));
     }
 
@@ -305,6 +385,14 @@ pub const One = struct {
     /// keys differ in length, so this cannot be typed as `SharedSecret`.
     pub fn authenticate(key: []const u8, message: []const u8) AuthenticateError![signature_length]u8 {
         if (key.len == 0) return error.EmptyKey;
+        const r = authenticateUnburned(key, message);
+        burn.stack(burn.mac_burn);
+        return r;
+    }
+
+    /// `HmacSha256.create` copies the key into its ipad / opad blocks on the
+    /// stack; this body runs one frame down so `authenticate` can burn them.
+    noinline fn authenticateUnburned(key: []const u8, message: []const u8) [signature_length]u8 {
         var mac: [HmacSha256.mac_length]u8 = undefined;
         HmacSha256.create(&mac, message, key);
         return mac[0..signature_length].*;
@@ -335,27 +423,34 @@ pub const Two = struct {
     /// §6.5.8 `kdf(Z)`: HKDF-SHA-256 with a 32-zero-byte salt, expanded
     /// once with info `"CTAP2 HMAC key"` and once with `"CTAP2 AES key"`
     /// (32 bytes each); the shared secret is `hmacKey || aesKey`.
-    pub fn kdf(z: [32]u8) SharedSecret {
+    ///
+    /// `Z` by pointer, the secret out through `out`: see `One.kdf`.
+    pub fn kdf(out: *SharedSecret, z: *const [32]u8) void {
+        kdfUnburned(out, z);
+        burn.stack(burn.kdf_burn);
+    }
+
+    noinline fn kdfUnburned(out: *SharedSecret, z: *const [32]u8) void {
         const salt: [32]u8 = @splat(0);
-        var prk = HkdfSha256.extract(&salt, &z);
+        var prk = HkdfSha256.extract(&salt, z);
         // Audit finding M3 (2026-09-05): `prk` regenerates BOTH halves of
         // the shared secret and the caller never sees it at all (only the
         // expanded `out` below) — nothing a caller does, however carefully,
         // can reach it. Zero it here, the only place that can.
         defer std.crypto.secureZero(u8, &prk);
-        var out: SharedSecret = undefined;
         HkdfSha256.expand(out[0..32], "CTAP2 HMAC key", prk);
         HkdfSha256.expand(out[32..64], "CTAP2 AES key", prk);
-        return out;
     }
 
     /// §6.5.6 `encapsulate(peerCoseKey)` with this protocol's `kdf` —
     /// see `One.encapsulate`.
-    pub fn encapsulate(platform_scalar: [32]u8, peer: PublicKey) EcdhError!Encaps {
-        return .{
-            .platform_key_agreement = try publicKeyFromScalar(platform_scalar),
-            .shared_secret = kdf(try ecdhZ(platform_scalar, peer)),
-        };
+    pub fn encapsulate(out: *Encaps, platform_scalar: *const [32]u8, peer: PublicKey) EcdhError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+        out.platform_key_agreement = try publicKeyFromScalar(platform_scalar);
+        var z: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &z);
+        try ecdhZ(&z, platform_scalar, peer);
+        kdf(&out.shared_secret, &z);
     }
 
     /// Output size of `encrypt`: `IV || ciphertext`.
@@ -379,23 +474,20 @@ pub const Two = struct {
     /// Audit finding M3 (2026-09-05): see `One.encrypt`'s doc comment —
     /// same by-value-parameter copy, same fix, and this half (the AES key)
     /// is exactly `n.aes_key` in the dead-stack probe.
-    pub fn encrypt(key_: SharedSecret, iv: [iv_length]u8, dst: []u8, plaintext: []const u8) CbcError!void {
-        var key = key_;
-        defer std.crypto.secureZero(u8, &key);
+    /// `key` by pointer: see `One.encrypt`.
+    pub fn encrypt(key: *const SharedSecret, iv: [iv_length]u8, dst: []u8, plaintext: []const u8) CbcError!void {
         if (dst.len != encryptedLength(plaintext.len)) return error.InvalidLength;
-        try Aes256Cbc.encrypt(dst[iv_length..], plaintext, key[32..64].*, iv);
+        try Aes256Cbc.encrypt(dst[iv_length..], plaintext, key[32..64], iv);
         dst[0..iv_length].* = iv;
     }
 
     /// §6.5.8 `decrypt(key, demCiphertext)`: split off the leading 16-byte
     /// IV, AES-256-CBC-decrypt the rest with the AES-key half. `dst.len`
     /// must equal `decryptedLength(ciphertext.len)`. M3: see `encrypt` above.
-    pub fn decrypt(key_: SharedSecret, dst: []u8, ciphertext: []const u8) CbcError!void {
-        var key = key_;
-        defer std.crypto.secureZero(u8, &key);
+    pub fn decrypt(key: *const SharedSecret, dst: []u8, ciphertext: []const u8) CbcError!void {
         const plaintext_len = try decryptedLength(ciphertext.len);
         if (dst.len != plaintext_len) return error.InvalidLength;
-        try Aes256Cbc.decrypt(dst, ciphertext[iv_length..], key[32..64].*, ciphertext[0..iv_length].*);
+        try Aes256Cbc.decrypt(dst, ciphertext[iv_length..], key[32..64], ciphertext[0..iv_length].*);
     }
 
     /// §6.5.8 `authenticate(key, message)`: the full 32-byte
@@ -412,6 +504,13 @@ pub const Two = struct {
     /// `getPinToken`. The compiler now rejects a wrong-length key at the
     /// call site instead of this function reading past a short one.
     pub fn authenticate(key: *const [32]u8, message: []const u8) [signature_length]u8 {
+        const r = authenticateUnburned(key, message);
+        burn.stack(burn.mac_burn);
+        return r;
+    }
+
+    /// See `One.authenticateUnburned`.
+    noinline fn authenticateUnburned(key: *const [32]u8, message: []const u8) [signature_length]u8 {
         var mac: [signature_length]u8 = undefined;
         HmacSha256.create(&mac, message, key);
         return mac;
@@ -433,6 +532,7 @@ test {
     _ = @import("kat_test.zig");
     _ = @import("pin_protocol_oracle_vectors.zig");
     _ = @import("pin_protocol_oracle_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 // ── fuzz: untrusted-wire decoders never panic/OOB on arbitrary bytes ──────
@@ -527,7 +627,7 @@ fn fuzzTwoDecrypt(_: void, smith: *std.testing.Smith) !void {
     // return a typed error, never panic/OOB, before any AES runs.
     const plaintext_len = Two.decryptedLength(ciphertext.len) catch return;
     var dst: [256]u8 = undefined;
-    Two.decrypt(key_buf, dst[0..plaintext_len], ciphertext) catch return;
+    Two.decrypt(&key_buf, dst[0..plaintext_len], ciphertext) catch return;
 }
 test "fuzz Two.decrypt never panics" {
     try std.testing.fuzz({}, fuzzTwoDecrypt, .{ .corpus = &decrypt_seeds });
@@ -550,7 +650,7 @@ test "corpus: the decrypt seeds reach the cipher, and the counts are pinned" {
         const plaintext_len = Two.decryptedLength(cipher_len) catch continue;
         accepted_length += 1;
         var dst: [256]u8 = undefined;
-        Two.decrypt(key_buf, dst[0..plaintext_len], cipher_buf[0..cipher_len]) catch continue;
+        Two.decrypt(&key_buf, dst[0..plaintext_len], cipher_buf[0..cipher_len]) catch continue;
         plaintext_octets += plaintext_len;
     }
     try std.testing.expectEqual(decrypt_seeds.len - 1, nonempty); // all but the empty seed
