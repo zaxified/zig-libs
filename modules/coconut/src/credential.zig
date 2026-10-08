@@ -46,6 +46,7 @@ const bls = @import("bls12_381");
 const gate = @import("gate.zig");
 const lagrange = @import("lagrange.zig");
 const keys = @import("keys.zig");
+const burn = @import("burn.zig");
 const params_mod = @import("params.zig");
 
 const g1 = bls.g1;
@@ -253,19 +254,31 @@ pub const ShowProof = struct {
 // ── REAL mechanical oracles (harness teeth) ─────────────────────────────────
 
 /// The signing exponent `x + Σ mᵢ yᵢ` for a KNOWN secret key — the scalar
-/// half of a PS signature. REAL.
-pub fn signingExponent(sk: SecretKey, attributes: []const Fr) Fr {
-    std.debug.assert(sk.ys.len == attributes.len);
-    var e = sk.x;
-    for (sk.ys, attributes) |y, m| e = e.add(y.mul(m));
-    return e;
+/// half of a PS signature, itself a secret: written to `out`, the key comes
+/// in by pointer. The body runs one frame down and the stack it dirtied is
+/// zeroed after it (`burn.zig`). REAL.
+pub fn signingExponent(out: *Fr, sk: *const SecretKey, attributes: []const Fr) void {
+    burn.run(burn.sign_burn, void, signingExponentBody, .{ out, &sk.x, sk.ys, attributes });
+}
+
+fn signingExponentBody(out: *Fr, x: *const Fr, ys: []const Fr, attributes: []const Fr) void {
+    std.debug.assert(ys.len == attributes.len);
+    out.* = x.*;
+    for (ys, attributes) |y, m| out.* = out.add(y.mul(m));
 }
 
 /// A single-signer PS credential `σ = (h, [x + Σ mᵢ yᵢ] h)` from a KNOWN
 /// secret key. REAL, mechanical — the oracle a correct threshold
-/// aggregation must reproduce byte-for-byte.
-pub fn psSignWithSecret(sk: SecretKey, h: g1.Affine, attributes: []const Fr) Credential {
-    const e = signingExponent(sk, attributes);
+/// aggregation must reproduce byte-for-byte. The key comes in by pointer;
+/// the body runs one frame down and the stack it dirtied is zeroed after it
+/// (`burn.zig`).
+pub fn psSignWithSecret(sk: *const SecretKey, h: g1.Affine, attributes: []const Fr) Credential {
+    return burn.run(burn.sign_burn, Credential, psSignBody, .{ sk, h, attributes });
+}
+
+fn psSignBody(sk: *const SecretKey, h: g1.Affine, attributes: []const Fr) Credential {
+    var e: Fr = undefined;
+    signingExponentBody(&e, &sk.x, sk.ys, attributes);
     const s = g1.Jacobian.fromAffine(h).scalarMul(e).toAffine();
     return .{ .h = h, .s = s };
 }
@@ -392,7 +405,10 @@ fn showChallenge(
 /// the caller-supplied common base `h` (`params.commonBase` — every
 /// authority MUST use the same `h` or the partials cannot be Lagrange-
 /// combined). GATED core.
-pub fn signPartial(share: SecretKeyShare, h: g1.Affine, attributes: []const Fr) CoconutError!PartialCredential {
+///
+/// The share comes in by pointer; the body runs one frame down and the stack
+/// it dirtied is zeroed after it (`burn.zig`).
+pub fn signPartial(share: *const SecretKeyShare, h: g1.Affine, attributes: []const Fr) CoconutError!PartialCredential {
     if (share.ys.len != attributes.len) return error.MismatchedAttributes;
     // `h` must be `Parameters.commonBase(attributes)` (a hash-to-curve point,
     // so in G1 and never reused across attribute vectors: two PS signatures
@@ -404,8 +420,12 @@ pub fn signPartial(share: SecretKeyShare, h: g1.Affine, attributes: []const Fr) 
     // partial signing exponent is the SAME `x + Σ mᵢ yᵢ` form over the
     // share's scalars — Lagrange over these exponents reconstructs the
     // group exponent by linearity.
-    const as_sk = SecretKey{ .x = share.x, .ys = share.ys };
-    const e = signingExponent(as_sk, attributes);
+    return burn.run(burn.sign_burn, PartialCredential, signPartialBody, .{ share, h, attributes });
+}
+
+fn signPartialBody(share: *const SecretKeyShare, h: g1.Affine, attributes: []const Fr) PartialCredential {
+    var e: Fr = undefined;
+    signingExponentBody(&e, &share.x, share.ys, attributes);
     const s = g1.Jacobian.fromAffine(h).scalarMul(e).toAffine();
     return .{ .index = share.index, .h = h, .s = s };
 }
@@ -514,21 +534,34 @@ fn proveCredentialFrom(
     const q = parameters.q;
     if (attributes.len != q or vk.betas.len != q) return error.MismatchedAttributes;
     if (disclosed.len != q) return error.InvalidDisclosure;
+    return burn.run(burn.prove_burn, CoconutError!ShowProof, proveBody, .{ allocator, entropy, parameters, vk, cred, attributes, disclosed, context });
+}
+
+fn proveBody(
+    allocator: std.mem.Allocator,
+    entropy: keys.Entropy,
+    parameters: Parameters,
+    vk: VerificationKey,
+    cred: Credential,
+    attributes: []const Fr,
+    disclosed: []const bool,
+    context: []const u8,
+) CoconutError!ShowProof {
     var revealed: usize = 0;
     for (disclosed) |d| revealed += @intFromBool(d);
-    const hidden = q - revealed;
+    const hidden = parameters.q - revealed;
 
     // Re-randomise σ → σ' = ([r'] h, [r'] s). r' MUST be nonzero or σ₁'
     // degenerates to the identity (which VerifyCred rejects — e(1, κ)
     // is trivially satisfiable).
-    var r_prime = blk: {
-        while (true) {
-            const c = entropy.scalar();
-            if (!c.isZero()) break :blk c;
-        }
-    };
+    var r_prime: Fr = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&r_prime));
-    var r = entropy.scalar();
+    while (true) {
+        entropy.scalar(&r_prime);
+        if (!r_prime.isZero()) break;
+    }
+    var r: Fr = undefined;
+    entropy.scalar(&r);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&r));
     const sigma1_jac = g1.Jacobian.fromAffine(cred.h).scalarMul(r_prime);
     const sigma1 = sigma1_jac.toAffine();
@@ -543,14 +576,15 @@ fn proveCredentialFrom(
     // blinding r, one per HIDDEN attribute:
     //   Aw = [r̃] g2 + Σ_{hidden j} [m̃ⱼ] βⱼ   (the κ-side witness)
     //   Bw = [r̃] σ₁'                          (the ν-side witness)
-    var r_tilde = entropy.scalar();
+    var r_tilde: Fr = undefined;
+    entropy.scalar(&r_tilde);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&r_tilde));
     const m_tilde = try allocator.alloc(Fr, hidden);
     defer {
         std.crypto.secureZero(u8, std.mem.sliceAsBytes(m_tilde));
         allocator.free(m_tilde);
     }
-    for (m_tilde) |*m| m.* = entropy.scalar();
+    for (m_tilde) |*m| entropy.scalar(m);
 
     var aw_acc = g2gen.scalarMul(r_tilde);
     {
@@ -711,12 +745,13 @@ test "psSignWithSecret / psVerifyPlain: valid credential accepted, tamper reject
     const p = try Parameters.generate(allocator, 3);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0x5151);
-    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 3, 2, 3);
+    var kk: keys.ThresholdKeys = undefined;
+    try keys.keygenSeededForTest(&kk, allocator, prng.random(), 3, 2, 3);
     defer kk.deinit(allocator);
 
     const attrs = [_]Fr{ frOf(10), frOf(20), frOf(30) };
     const h = p.commonBase(&attrs);
-    const cred = psSignWithSecret(kk.master_sk, h, &attrs);
+    const cred = psSignWithSecret(&kk.master_sk, h, &attrs);
 
     try std.testing.expect(psVerifyPlain(kk.master_vk, cred, &attrs));
 
@@ -773,7 +808,8 @@ test "SOUNDNESS: a point outside G1 is no credential (no authority signed anythi
     const p = try Parameters.generate(allocator, 2);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0x7070);
-    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 2, 2, 3);
+    var kk: keys.ThresholdKeys = undefined;
+    try keys.keygenSeededForTest(&kk, allocator, prng.random(), 2, 2, 3);
     defer kk.deinit(allocator);
 
     const t = cofactorTorsionPoint();
@@ -788,7 +824,7 @@ test "SOUNDNESS: a point outside G1 is no credential (no authority signed anythi
     try std.testing.expectError(error.InvalidEncoding, Credential.fromBytes(forged.toBytes()));
     // An authority asked to sign under T would hand out `[e] T`, i.e. its
     // signing exponent mod the order of T.
-    try std.testing.expectError(error.InvalidEncoding, signPartial(kk.sk_shares[0], t, &attrs));
+    try std.testing.expectError(error.InvalidEncoding, signPartial(&kk.sk_shares[0], t, &attrs));
 
     // Show proof from public data only: σ₁' = T, σ₂' = ν = 1, blinding r = 0
     // (so ν = [0] T and no scalar is reduced mod r against a point of another
@@ -847,9 +883,11 @@ const Fixture = struct {
         const p = try Parameters.generate(allocator, 3);
         errdefer p.deinit(allocator);
         var prng = std.Random.DefaultPrng.init(seed);
-        const kk = try keys.keygenSeededForTest(allocator, prng.random(), 3, 2, 3);
+        var kk: keys.ThresholdKeys = undefined;
+        try keys.keygenSeededForTest(&kk, allocator, prng.random(), 3, 2, 3);
+        errdefer kk.deinit(allocator);
         const attrs = [_]Fr{ frOf(10), frOf(20), frOf(30) };
-        const c = psSignWithSecret(kk.master_sk, p.commonBase(&attrs), &attrs);
+        const c = psSignWithSecret(&kk.master_sk, p.commonBase(&attrs), &attrs);
         return .{ .p = p, .kk = kk, .attrs = attrs, .cred = c };
     }
 
@@ -878,16 +916,16 @@ test "signPartial refuses the identity base and an attribute vector shorter than
     const allocator = std.testing.allocator;
     var f = try Fixture.init(allocator, 0xA002);
     defer f.deinit(allocator);
-    try std.testing.expectError(error.InvalidEncoding, signPartial(f.kk.sk_shares[0], g1.Affine.identity, &f.attrs));
-    try std.testing.expectError(error.MismatchedAttributes, signPartial(f.kk.sk_shares[0], f.cred.h, f.attrs[0..2]));
+    try std.testing.expectError(error.InvalidEncoding, signPartial(&f.kk.sk_shares[0], g1.Affine.identity, &f.attrs));
+    try std.testing.expectError(error.MismatchedAttributes, signPartial(&f.kk.sk_shares[0], f.cred.h, f.attrs[0..2]));
 }
 
 test "aggregateCredential refuses t == 0 and partials whose bases differ only in y" {
     const allocator = std.testing.allocator;
     var f = try Fixture.init(allocator, 0xA003);
     defer f.deinit(allocator);
-    const a = try signPartial(f.kk.sk_shares[0], f.cred.h, &f.attrs);
-    const b = try signPartial(f.kk.sk_shares[1], f.cred.h, &f.attrs);
+    const a = try signPartial(&f.kk.sk_shares[0], f.cred.h, &f.attrs);
+    const b = try signPartial(&f.kk.sk_shares[1], f.cred.h, &f.attrs);
     try std.testing.expectError(error.NotEnoughPartials, aggregateCredential(allocator, &.{ a, b }, 0));
     var neg_b = b;
     neg_b.h = g1.Jacobian.fromAffine(b.h).negate().toAffine();
@@ -1015,11 +1053,12 @@ test "Credential / PartialCredential codec round-trips" {
     const p = try Parameters.generate(allocator, 2);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(7);
-    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 2, 2, 3);
+    var kk: keys.ThresholdKeys = undefined;
+    try keys.keygenSeededForTest(&kk, allocator, prng.random(), 2, 2, 3);
     defer kk.deinit(allocator);
     const attrs = [_]Fr{ frOf(3), frOf(4) };
     const h = p.commonBase(&attrs);
-    const cred = psSignWithSecret(kk.master_sk, h, &attrs);
+    const cred = psSignWithSecret(&kk.master_sk, h, &attrs);
 
     const back = try Credential.fromBytes(cred.toBytes());
     try std.testing.expect(g1Eql(back.h, cred.h) and g1Eql(back.s, cred.s));

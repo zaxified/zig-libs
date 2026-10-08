@@ -73,10 +73,13 @@ test "KAT -12 §8.x.1: keyGen(key_material, key_info, key_dst) and skToPk" {
             defer testing.allocator.free(key_dst);
             try testing.expectEqualStrings(S.keygen_dst, key_dst);
         }
-        const sk = try keys.keyGenWith(S, key_material, key_info, null);
+        var sk: keys.SecretKey = undefined;
+        try keys.keyGenWith(S, &sk, key_material, key_info, null);
         const expected_sk = try hexToArray(32, V.keypair.sk);
-        try testing.expectEqualSlices(u8, &expected_sk, &sk.toBytes());
-        try testing.expectEqualSlices(u8, &(try hexToArray(96, V.keypair.pk)), &keys.skToPk(sk).toBytes());
+        var sk_bytes: [32]u8 = undefined;
+        sk.toBytes(&sk_bytes);
+        try testing.expectEqualSlices(u8, &expected_sk, &sk_bytes);
+        try testing.expectEqualSlices(u8, &(try hexToArray(96, V.keypair.pk)), &keys.skToPk(&sk).toBytes());
     }
 }
 
@@ -163,8 +166,9 @@ test "KAT -12 §8.x.4 + D.x.1: sign is byte-exact on the valid cases, verify agr
                 return error.TestUnexpectedResult;
             }
             if (case.valid) {
-                const sk = try keys.SecretKey.fromBytes(try hexToArray(32, case.sk.?));
-                const got = try B.sign(testing.allocator, sk, pk, header, msgs);
+                var sk: keys.SecretKey = undefined;
+                try keys.SecretKey.fromBytes(&sk, &(try hexToArray(32, case.sk.?)));
+                const got = try B.sign(testing.allocator, &sk, pk, header, msgs);
                 try testing.expectEqualSlices(u8, &sig, &got);
                 valid_seen += 1;
             } else invalid_seen += 1;
@@ -213,7 +217,7 @@ test "KAT -12 §8.x.5 + D.x.2: proofGen byte-exact under the mocked RNG, proofVe
             inline for (5..16) |n| {
                 if (n == rs.len) @memcpy(rs, &S.mockedRandomScalars(n, seed));
             }
-            const proof = try B.proofGen(testing.allocator, pk, sig, header, ph, msgs, case.disclosed_indexes, rs);
+            const proof = try B.proofGen(testing.allocator, pk, &sig, header, ph, msgs, case.disclosed_indexes, rs);
             defer testing.allocator.free(proof);
             if (!std.mem.eql(u8, expected, proof)) {
                 std.debug.print("case {s}: proofGen differs\n", .{case.name});

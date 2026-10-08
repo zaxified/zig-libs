@@ -61,7 +61,8 @@ pub fn main() !void {
     const gpa = gpa_state.allocator();
 
     // ── the issuer ───────────────────────────────────────────────────────
-    var sk = bbs.keyGen(&issuer_key_material, "dvla-issuance-2026", null) catch |err| switch (err) {
+    var sk: bbs.SecretKey = undefined;
+    bbs.keyGen(&sk, &issuer_key_material, "dvla-issuance-2026", null) catch |err| switch (err) {
         // The draft's own reject conditions on the key derivation. An issuer
         // that hits one re-derives with different key_info rather than
         // shipping a key it cannot use.
@@ -71,9 +72,9 @@ pub fn main() !void {
         },
     };
     defer sk.deinit();
-    const pk = bbs.skToPk(sk);
+    const pk = bbs.skToPk(&sk);
 
-    const signature = try bbs.sign(gpa, sk, pk, header, &attributes);
+    const signature = try bbs.sign(gpa, &sk, pk, header, &attributes);
     std.debug.print("issued credential: {d} attributes, {d}-byte signature\n", .{
         attributes.len,
         signature.len,
@@ -95,12 +96,14 @@ pub fn main() !void {
     const undisclosed = attributes.len - disclosed_indexes.len;
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
-    const random_scalars = bbs.ciphersuite.calculateRandomScalars(5 + undisclosed, io);
+    var random_scalars: [5 + undisclosed]bbs.ciphersuite.Fr = undefined;
+    bbs.ciphersuite.calculateRandomScalars(&random_scalars, io);
+    defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(random_scalars[0..]));
 
     const proof = bbs.proofGen(
         gpa,
         pk,
-        signature,
+        &signature,
         header,
         presentation_header,
         &attributes,

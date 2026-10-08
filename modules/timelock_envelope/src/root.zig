@@ -84,6 +84,7 @@ test {
     _ = @import("security_test.zig");
     _ = stream;
     _ = @import("stream_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.deps is exactly {tlock, hqc, chachapoly, entropy}" {

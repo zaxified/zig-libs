@@ -107,7 +107,9 @@ pub fn main() !void {
     // across both sessions below (only the per-seal randomness changes).
     var seed_kem: [32]u8 = undefined;
     for (&seed_kem, 0..) |*b, i| b.* = @intCast(i + 1);
-    const bob = hqc.Hqc128.keypair(&seed_kem);
+    var bob: hqc.Hqc128.KeyPair = undefined;
+    hqc.Hqc128.keypair(&bob, &seed_kem);
+    defer bob.wipe();
 
     // ── Session 1 ────────────────────────────────────────────────────
     const round1: u64 = 500_000;
@@ -117,7 +119,7 @@ pub fn main() !void {
     for (&rnd1.kem_coins, 0..) |*b, i| b.* = @intCast(i + 1);
 
     const plaintext1 = "the launch codes are 12345";
-    const sealed1 = try Envelope128.seal(gpa, plaintext1, bob.ek, p_pub, round1, rnd1);
+    const sealed1 = try Envelope128.seal(gpa, plaintext1, &bob.ek, p_pub, round1, &rnd1);
     defer gpa.free(sealed1);
     std.debug.print("session1: sealed {d} bytes for round {d}\n", .{ sealed1.len, round1 });
 
@@ -126,7 +128,7 @@ pub fn main() !void {
     // vantage point). ───────────────────────────────────────────────
     {
         const too_early_signature = beacon.signRound(round1 - 1);
-        if (Envelope128.open(gpa, sealed1, bob.dk, too_early_signature)) |pt| {
+        if (Envelope128.open(gpa, sealed1, &bob.dk, too_early_signature)) |pt| {
             gpa.free(pt);
             return error.UnexpectedAccept;
         } else |err| switch (err) {
@@ -138,7 +140,7 @@ pub fn main() !void {
     // ── The round is reached: the beacon publishes round1's signature,
     // and BOTH locks now open. ──────────────────────────────────────
     const round1_signature = beacon.signRound(round1);
-    const opened1 = try Envelope128.open(gpa, sealed1, bob.dk, round1_signature);
+    const opened1 = try Envelope128.open(gpa, sealed1, &bob.dk, round1_signature);
     defer gpa.free(opened1);
     must(std.mem.eql(u8, opened1, plaintext1), @src());
     std.debug.print("session1: opened after round {d}: {s}\n", .{ round1, opened1 });
@@ -147,7 +149,8 @@ pub fn main() !void {
     // s_pq the same way `seal` did internally (pure function of the SAME
     // ek/coins), and hand Python everything it needs to recompute
     // deriveKeys + decrypt the actual sealed bytes. ─────────────────
-    const enc1 = hqc.Hqc128.encaps(bob.ek, &rnd1.kem_coins);
+    var enc1: struct { ct: hqc.Hqc128.Ciphertext, ss: hqc.Hqc128.SharedSecret } = undefined;
+    hqc.Hqc128.encaps(&enc1.ct, &enc1.ss, &bob.ek, &rnd1.kem_coins);
     printHex("session1 s_time", &rnd1.s_time);
     printHex("session1 s_pq", &enc1.ss);
     printHex("session1 sealed envelope", sealed1);
@@ -164,10 +167,10 @@ pub fn main() !void {
     must(!std.mem.eql(u8, &rnd1.s_time, &rnd2.s_time), @src());
 
     const plaintext2 = "second message: transfer control now";
-    const sealed2 = try Envelope128.seal(gpa, plaintext2, bob.ek, p_pub, round2, rnd2);
+    const sealed2 = try Envelope128.seal(gpa, plaintext2, &bob.ek, p_pub, round2, &rnd2);
     defer gpa.free(sealed2);
     const round2_signature = beacon.signRound(round2);
-    const opened2 = try Envelope128.open(gpa, sealed2, bob.dk, round2_signature);
+    const opened2 = try Envelope128.open(gpa, sealed2, &bob.dk, round2_signature);
     defer gpa.free(opened2);
     must(std.mem.eql(u8, opened2, plaintext2), @src());
     std.debug.print("session2: sealed + opened round {d}: {s}\n", .{ round2, opened2 });
@@ -182,8 +185,9 @@ pub fn main() !void {
     {
         var wrong_seed: [32]u8 = undefined;
         for (&wrong_seed, 0..) |*b, i| b.* = @intCast(i + 77);
-        const eve = hqc.Hqc128.keypair(&wrong_seed);
-        if (Envelope128.open(gpa, sealed1, eve.dk, round1_signature)) |pt| {
+        var eve: hqc.Hqc128.KeyPair = undefined;
+        hqc.Hqc128.keypair(&eve, &wrong_seed);
+        if (Envelope128.open(gpa, sealed1, &eve.dk, round1_signature)) |pt| {
             gpa.free(pt);
             return error.UnexpectedAccept;
         } else |err| switch (err) {
@@ -199,7 +203,7 @@ pub fn main() !void {
         var tampered = try gpa.dupe(u8, sealed1);
         defer gpa.free(tampered);
         tampered[timelock_envelope.envelope.header_bytes + Envelope128.time_lock_bytes] ^= 0x01;
-        if (Envelope128.open(gpa, tampered, bob.dk, round1_signature)) |pt| {
+        if (Envelope128.open(gpa, tampered, &bob.dk, round1_signature)) |pt| {
             gpa.free(pt);
             return error.UnexpectedAccept;
         } else |err| switch (err) {
@@ -214,8 +218,9 @@ pub fn main() !void {
     {
         var eve192_seed: [32]u8 = undefined;
         @memset(&eve192_seed, 0xEE);
-        const eve192 = hqc.Hqc192.keypair(&eve192_seed);
-        if (Envelope192.open(gpa, sealed1, eve192.dk, round1_signature)) |pt| {
+        var eve192: hqc.Hqc192.KeyPair = undefined;
+        hqc.Hqc192.keypair(&eve192, &eve192_seed);
+        if (Envelope192.open(gpa, sealed1, &eve192.dk, round1_signature)) |pt| {
             gpa.free(pt);
             return error.UnexpectedAccept;
         } else |err| switch (err) {

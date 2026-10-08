@@ -55,6 +55,14 @@
 //! two-transcript Sigma-protocol argument, which is precisely what selective
 //! disclosure exists to prevent.
 //!
+//! ## Secrets on the stack
+//!
+//! The secret entry points take keys and shares by pointer and write secret
+//! results through an out-param (`keygen(out, …)`, `signingExponent(out, …)`);
+//! their bodies run one frame down and the stack they dirtied is zeroed after
+//! them (`burn.zig`, checked by `stackprobe_test.zig`). `ThresholdKeys.deinit`
+//! wipes the master key and every share before freeing.
+//!
 //! Coconut has no published byte-exact test vector (SPEC §3), so nothing
 //! outside this repo needs a deterministic issuance. This module's own suites
 //! get one from `keygenSeededForTest` / `proveCredentialSeededForTest` —
@@ -134,6 +142,7 @@ test {
     _ = credential;
     _ = @import("harness_test.zig");
     _ = @import("interop_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names Coconut" {

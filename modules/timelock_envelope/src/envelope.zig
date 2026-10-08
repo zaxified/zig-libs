@@ -58,6 +58,7 @@ const hqc = @import("hqc");
 const chachapoly = @import("chachapoly");
 const entropy = @import("entropy");
 const stream = @import("stream.zig");
+const burn = @import("burn.zig");
 
 const bls12_381 = tlock.bls12_381;
 const g1 = bls12_381.g1;
@@ -164,18 +165,33 @@ pub const DerivedKeys = struct {
 /// yields a different, non-opening key (proven by this file's
 /// positive-control tests). No crypto is hand-rolled: extraction and
 /// expansion are `std.crypto.kdf.hkdf`.
+///
+/// The keys are written to `out`; the secrets come in by pointer, and the
+/// body runs one frame down and is burned after (`burn.zig`).
 pub fn deriveKeys(
-    s_time: [time_secret_bytes]u8,
-    s_pq: [hqc.params.shared_secret_bytes]u8,
+    out: *DerivedKeys,
+    s_time: *const [time_secret_bytes]u8,
+    s_pq: *const [hqc.params.shared_secret_bytes]u8,
     suite_id: u8,
     round: u64,
-) DerivedKeys {
+) void {
+    burn.run(burn.kdf_burn, void, deriveKeysBody, .{ out, s_time, s_pq, suite_id, round });
+}
+
+fn deriveKeysBody(
+    out: *DerivedKeys,
+    s_time: *const [time_secret_bytes]u8,
+    s_pq: *const [hqc.params.shared_secret_bytes]u8,
+    suite_id: u8,
+    round: u64,
+) void {
     var ikm: [time_secret_bytes + hqc.params.shared_secret_bytes]u8 = undefined;
     defer std.crypto.secureZero(u8, &ikm);
-    @memcpy(ikm[0..time_secret_bytes], &s_time);
-    @memcpy(ikm[time_secret_bytes..], &s_pq);
+    @memcpy(ikm[0..time_secret_bytes], s_time);
+    @memcpy(ikm[time_secret_bytes..], s_pq);
 
-    const prk = Hkdf.extract(kdf_salt, &ikm);
+    var prk = Hkdf.extract(kdf_salt, &ikm);
+    defer std.crypto.secureZero(u8, &prk);
 
     // info = label || version || suite_id || round (big-endian): binds
     // the derived key to the logical context (which round, which suite,
@@ -190,10 +206,8 @@ pub fn deriveKeys(
     defer std.crypto.secureZero(u8, &okm);
     Hkdf.expand(&okm, &info, prk);
 
-    return .{
-        .key = okm[0..32].*,
-        .nonce = okm[32..][0..nonce_bytes].*,
-    };
+    out.key = okm[0..32].*;
+    out.nonce = okm[32..][0..nonce_bytes].*;
 }
 
 /// The hybrid two-lock envelope specialised for one HQC parameter set.
@@ -251,14 +265,18 @@ pub fn Envelope(comptime Kem: type) type {
             /// `entropy.fill` and not `io.random` precisely because of the
             /// reuse consequence above: a degraded seed repeats these three
             /// values across `seal` calls, which is the break this doc
-            /// comment describes. `generate` returns a value, so the
-            /// alternative to aborting is producing one silently.
-            pub fn generate(io: std.Io) SealRandomness {
-                var r: SealRandomness = undefined;
-                entropy.fill(io, &r.s_time);
-                entropy.fill(io, &r.tlock_sigma);
-                entropy.fill(io, &r.kem_coins);
-                return r;
+            /// comment describes. `generate` has no error channel, so the
+            /// alternative to aborting is producing a value silently. Drawn
+            /// straight into `out` (every field is a secret).
+            pub fn generate(out: *SealRandomness, io: std.Io) void {
+                entropy.fill(io, &out.s_time);
+                entropy.fill(io, &out.tlock_sigma);
+                entropy.fill(io, &out.kem_coins);
+            }
+
+            /// Zero all three secrets once the envelope is sealed.
+            pub fn wipe(self: *SealRandomness) void {
+                std.crypto.secureZero(u8, std.mem.asBytes(self));
             }
         };
 
@@ -270,13 +288,28 @@ pub fn Envelope(comptime Kem: type) type {
         /// - `p_pub` — the drand beacon master public key (`G2`).
         /// - `round` — the future round `R` the time lock opens at.
         /// - `rnd` — the per-seal randomness (see `SealRandomness`).
+        ///
+        /// `recipient_ek` and `rnd` come in by pointer (`rnd` is all secret,
+        /// the key is ~2–7 KiB); the body runs one frame down and is burned
+        /// after (`burn.zig`).
         pub fn seal(
             allocator: std.mem.Allocator,
             plaintext: []const u8,
-            recipient_ek: Kem.EncapsKey,
+            recipient_ek: *const Kem.EncapsKey,
             p_pub: g2.Affine,
             round: u64,
-            rnd: SealRandomness,
+            rnd: *const SealRandomness,
+        ) SealError![]u8 {
+            return burn.run(burn.envelope_burn, SealError![]u8, sealBody, .{ allocator, plaintext, recipient_ek, p_pub, round, rnd });
+        }
+
+        fn sealBody(
+            allocator: std.mem.Allocator,
+            plaintext: []const u8,
+            recipient_ek: *const Kem.EncapsKey,
+            p_pub: g2.Affine,
+            round: u64,
+            rnd: *const SealRandomness,
         ) SealError![]u8 {
             if (plaintext.len > std.math.maxInt(u32)) return error.PlaintextTooLarge;
 
@@ -285,10 +318,13 @@ pub fn Envelope(comptime Kem: type) type {
             const tl_bytes = tl.toBytes();
 
             // Lock 2 (PQ): encapsulate s_pq to the recipient.
-            const enc = Kem.encaps(recipient_ek, &rnd.kem_coins);
+            var enc: struct { ct: Kem.Ciphertext, ss: Kem.SharedSecret } = undefined;
+            defer std.crypto.secureZero(u8, &enc.ss);
+            Kem.encaps(&enc.ct, &enc.ss, recipient_ek, &rnd.kem_coins);
 
             // Bind both locks' secrets into the content key + nonce.
-            var keys = deriveKeys(rnd.s_time, enc.ss, suite_id, round);
+            var keys: DerivedKeys = undefined;
+            deriveKeysBody(&keys, &rnd.s_time, &enc.ss, suite_id, round);
             defer std.crypto.secureZero(u8, std.mem.asBytes(&keys));
 
             const out = try allocator.alloc(u8, overhead + plaintext.len);
@@ -369,10 +405,22 @@ pub fn Envelope(comptime Kem: type) type {
         /// `recipient_dk` must be the HQC secret key matching the
         /// encapsulation key it was sealed for. Returns a freshly
         /// allocated plaintext the caller owns, or a typed `OpenError`.
+        ///
+        /// `recipient_dk` comes in by pointer; the body runs one frame down and
+        /// is burned after (`burn.zig`).
         pub fn open(
             allocator: std.mem.Allocator,
             envelope: []const u8,
-            recipient_dk: Kem.DecapsKey,
+            recipient_dk: *const Kem.DecapsKey,
+            round_signature: g1.Affine,
+        ) OpenError![]u8 {
+            return burn.run(burn.envelope_burn, OpenError![]u8, openBody, .{ allocator, envelope, recipient_dk, round_signature });
+        }
+
+        fn openBody(
+            allocator: std.mem.Allocator,
+            envelope: []const u8,
+            recipient_dk: *const Kem.DecapsKey,
             round_signature: g1.Affine,
         ) OpenError![]u8 {
             const p = try parse(envelope);
@@ -390,10 +438,12 @@ pub fn Envelope(comptime Kem: type) type {
             // Lock 2 (PQ): decapsulate s_pq. HQC never errors here
             // (implicit rejection returns a pseudo-random secret for a
             // wrong key); a wrong s_pq surfaces below as an AEAD failure.
-            var s_pq = Kem.decaps(recipient_dk, p.pq_lock.*);
+            var s_pq: Kem.SharedSecret = undefined;
+            Kem.decaps(&s_pq, recipient_dk, p.pq_lock);
             defer std.crypto.secureZero(u8, &s_pq);
 
-            var keys = deriveKeys(s_time, s_pq, suite_id, p.round);
+            var keys: DerivedKeys = undefined;
+            deriveKeysBody(&keys, &s_time, &s_pq, suite_id, p.round);
             defer std.crypto.secureZero(u8, std.mem.asBytes(&keys));
 
             const pt = try allocator.alloc(u8, p.pt_len);
@@ -448,29 +498,29 @@ test "overhead accounting matches the concrete field sizes" {
 test "deriveKeys: dropping s_time changes the derived key (time secret is load-bearing)" {
     const s_time = [_]u8{0xA1} ** time_secret_bytes;
     const s_pq = [_]u8{0xB2} ** hqc.params.shared_secret_bytes;
-    const full = deriveKeys(s_time, s_pq, 16, 42);
+    const full = deriveKeysV(s_time, s_pq, 16, 42);
 
     // A KDF that dropped s_time (used all-zero in its place) must yield a
     // DIFFERENT key — otherwise the time lock would not affect K at all.
-    const dropped = deriveKeys([_]u8{0} ** time_secret_bytes, s_pq, 16, 42);
+    const dropped = deriveKeysV([_]u8{0} ** time_secret_bytes, s_pq, 16, 42);
     try testing.expect(!std.mem.eql(u8, &full.key, &dropped.key));
 }
 
 test "deriveKeys: dropping s_pq changes the derived key (PQ secret is load-bearing)" {
     const s_time = [_]u8{0xA1} ** time_secret_bytes;
     const s_pq = [_]u8{0xB2} ** hqc.params.shared_secret_bytes;
-    const full = deriveKeys(s_time, s_pq, 16, 42);
+    const full = deriveKeysV(s_time, s_pq, 16, 42);
 
-    const dropped = deriveKeys(s_time, [_]u8{0} ** hqc.params.shared_secret_bytes, 16, 42);
+    const dropped = deriveKeysV(s_time, [_]u8{0} ** hqc.params.shared_secret_bytes, 16, 42);
     try testing.expect(!std.mem.eql(u8, &full.key, &dropped.key));
 }
 
 test "deriveKeys: round, suite and version all separate the key" {
     const s_time = [_]u8{0xA1} ** time_secret_bytes;
     const s_pq = [_]u8{0xB2} ** hqc.params.shared_secret_bytes;
-    const base = deriveKeys(s_time, s_pq, 16, 42);
-    const other_round = deriveKeys(s_time, s_pq, 16, 43);
-    const other_suite = deriveKeys(s_time, s_pq, 32, 42);
+    const base = deriveKeysV(s_time, s_pq, 16, 42);
+    const other_round = deriveKeysV(s_time, s_pq, 16, 43);
+    const other_suite = deriveKeysV(s_time, s_pq, 32, 42);
     try testing.expect(!std.mem.eql(u8, &base.key, &other_round.key));
     try testing.expect(!std.mem.eql(u8, &base.key, &other_suite.key));
 }
@@ -483,7 +533,7 @@ test "deriveKeys matches an independent Python HKDF recomputation (salt, version
     // "separates" tests above stayed green.
     const s_time = [_]u8{0xA1} ** time_secret_bytes;
     const s_pq = [_]u8{0xB2} ** hqc.params.shared_secret_bytes;
-    const k = deriveKeys(s_time, s_pq, 16, 42);
+    const k = deriveKeysV(s_time, s_pq, 16, 42);
     var want_key: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&want_key, "d102cf0c3b0f168a67877302ed2e212482c701580f056baee580da9885ad5c34");
     var want_nonce: [nonce_bytes]u8 = undefined;
@@ -535,4 +585,12 @@ test "parse rejects truncated / bad-magic / wrong-version / wrong-suite / wrong-
 test "an all-but-one-byte-short buffer is Truncated, not a panic" {
     const buf = [_]u8{0} ** (header_bytes - 1);
     try testing.expectError(error.Truncated, Envelope128.parse(&buf));
+}
+
+/// Test helper: the derived keys as a value (tests compare them; library
+/// code never returns them through the stack).
+fn deriveKeysV(s_time: [time_secret_bytes]u8, s_pq: [hqc.params.shared_secret_bytes]u8, suite: u8, round: u64) DerivedKeys {
+    var k: DerivedKeys = undefined;
+    deriveKeys(&k, &s_time, &s_pq, suite, round);
+    return k;
 }

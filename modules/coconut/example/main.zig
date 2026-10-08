@@ -70,7 +70,9 @@ pub fn main() !void {
     defer parameters.deinit(gpa);
 
     // ── the dealer: split the committee's signing key ────────────────────
-    var committee = coconut.keygen(gpa, io, attribute_count, threshold, authority_count) catch |err| switch (err) {
+    // The key set is written into `committee`, never returned through the stack.
+    var committee: coconut.ThresholdKeys = undefined;
+    coconut.keygen(&committee, gpa, io, attribute_count, threshold, authority_count) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.InvalidThreshold => {
             std.debug.print("threshold configuration is impossible ({d}-of-{d})\n", .{ threshold, authority_count });
@@ -100,7 +102,7 @@ pub fn main() !void {
 
     // ── two authorities issue, independently ─────────────────────────────
     var partials: [threshold]coconut.PartialCredential = undefined;
-    for (committee.sk_shares[0..threshold], &partials) |share, *out| {
+    for (committee.sk_shares[0..threshold], &partials) |*share, *out| {
         out.* = coconut.signPartial(share, base, &attributes) catch |err| switch (err) {
             // An authority handed an attribute vector of the wrong width
             // refuses rather than signing something it cannot interpret.

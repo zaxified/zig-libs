@@ -5,11 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** follows tlock's pointer/out-param API
-  (`tlock.encrypt(…, &s_time, &sigma)`, `tlock.decrypt(&s_time, …)`, `PayloadStream.init(&ps,
-  &key)`); the derived stream key is now held in a wiped local instead of a by-value temporary.
-  This module's own dead-stack sweep (SealRandomness by value, s_pq, the content/stream key
-  derivation) is SPEC backlog.
+- **2026-10-09** — **BREAKING, HIGH: the envelope left its secrets in its callers' frames.**
+  New ReleaseFast stack probe (`stackprobe_test.zig`), 5 calls each, before → after: `seal`
+  the KEM message / s_time 15 and the AEAD key 10; `open` the AEAD key 10; `sealStream` s_time
+  / KEM message 15; `deriveKeys` the AEAD key 10; `deriveStreamKey` s_time 5, s_pq 10 and the
+  stream key 10; `SealRandomness.generate` the drawn secrets 40 — all now 0. Secrets in by
+  pointer, out through an out-param, bodies one frame down and burned (`burn.zig`); tlock and
+  hqc burn their own frames below (both swept 2026-10-09):
+  - `seal`/`sealStream(…, recipient_ek: *const EncapsKey, …, rnd: *const SealRandomness)`;
+    `open`/`openStream(…, recipient_dk: *const DecapsKey, …)`;
+  - `SealRandomness.generate(out, io)` (+ `wipe`);
+  - `deriveKeys(out: *DerivedKeys, s_time: *const, s_pq: *const, suite_id, round)`;
+    `deriveStreamKey(out: *[32]u8, s_time: *const, s_pq: *const, suite_id, round,
+    transcript_hash: *const [32]u8)`.
+  - Follows tlock's and hqc's pointer/out-param APIs.
 - **2026-10-06** — **ADDED (new wire version, version 1 unchanged):** a streaming format for
   payloads of any size in bounded memory: `Envelope(Kem).sealStream(gpa, writer, reader, ek,
   p_pub, round, rnd)` / `.openStream(gpa, writer, reader, dk, round_signature)` over

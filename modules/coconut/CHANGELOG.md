@@ -5,6 +5,32 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING, HIGH: key generation, partial signing and the show left
+  the authority and user secrets on the dead stack.** New ReleaseFast stack probe
+  (`stackprobe_test.zig`: known randomness through the seeded path, the heap `keygen` and the
+  prover used scanned too), 5 calls each, before → after: `keygen` the shares' `x` 30, `y` 20 and
+  the Shamir coefficients 50; `VerificationKey.fromSecret` `x` 20, `y` 10;
+  `VerificationKeyShare.fromShare` share `x` 20, `y` 10; `psSignWithSecret` `x` 10 and the
+  signing exponent 10; `signPartial` share `x` 20 and the exponent 10; `proveCredential` a hidden
+  attribute 5 and `r'`/`r`/`r~`/`m~_j` 30 — all now 0 (negative control 0, positive control found).
+  Heap: 0 before and after. Secrets in by pointer, results out through an out-param,
+  bodies one frame down and burned (`burn.zig`, 12-32 KiB):
+  - `keygen(out: *ThresholdKeys, allocator, io, q, t, n)` and `keygenSeededForTest(out, …)`
+    (`out` is written only on success); `Entropy.scalar(self, out: *Fr)`;
+    `evalPoly(out: *Fr, poly, x)`;
+  - `VerificationKey.fromSecret(allocator, *const SecretKey)`,
+    `VerificationKeyShare.fromShare(allocator, *const SecretKeyShare)`;
+  - `signingExponent(out: *Fr, *const SecretKey, attributes)`,
+    `psSignWithSecret(*const SecretKey, h, attributes)`,
+    `signPartial(*const SecretKeyShare, h, attributes)`;
+  - `proveCredential` keeps its signature (the attributes were already a slice) but its body is
+    burned now.
+  - Also fixed: `keygen` freed the Shamir polynomial table twice (and its never-allocated slots)
+    when an allocation failed part-way; now only what was allocated, wiped, once.
+  - Not in the module: blind issuance (ElGamal key, blinding factors, unblinding), so there is no
+    such secret to sweep (SPEC "Backlog / deferred" already tracks it).
+  - ctgrind: `scripts/checks/ctgrind-expected.tsv` and the pinned source digests are not
+    re-pinned here (outside the module); the harness calls follow the new API.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the `coconut-crypto` cross-check of the PS core and threshold aggregation moves from "Where we are behind" to "Where we are ahead".
 - **2026-10-05** — Mutation run: 30 of 36 killed, 6 equivalent; 7 tests added and
   1 extended (the σ₁' = 1 universal forgery, a ν and an `s` with an order-3

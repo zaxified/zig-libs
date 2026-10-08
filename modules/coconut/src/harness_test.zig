@@ -47,9 +47,10 @@ const show_context = "harness-gate/nonce-0001";
 /// Shamir share of `(x, y_i)`, over common base `h` — the mechanical
 /// stand-in for the (gated) `credential.signPartial`, used only by the
 /// positive control.
-fn partialSignMech(share: keys.SecretKeyShare, h: g1.Affine, attributes: []const Fr) cred.PartialCredential {
+fn partialSignMech(share: *const keys.SecretKeyShare, h: g1.Affine, attributes: []const Fr) cred.PartialCredential {
     const as_sk = keys.SecretKey{ .x = share.x, .ys = share.ys };
-    const e = cred.signingExponent(as_sk, attributes);
+    var e: Fr = undefined;
+    cred.signingExponent(&e, &as_sk, attributes);
     return .{ .index = share.index, .h = h, .s = g1.Jacobian.fromAffine(h).scalarMul(e).toAffine() };
 }
 
@@ -77,7 +78,8 @@ test "POSITIVE CONTROL: psVerifyPlain accepts Lagrange aggregation, rejects Lagr
     const p = try Parameters.generate(allocator, 3);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0xF00D);
-    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 3, 2, 4); // t=2, n=4
+    var kk: keys.ThresholdKeys = undefined;
+    try keys.keygenSeededForTest(&kk, allocator, prng.random(), 3, 2, 4); // t=2, n=4
     defer kk.deinit(allocator);
 
     const attrs = [_]Fr{ frOf(5), frOf(6), frOf(7) };
@@ -85,8 +87,8 @@ test "POSITIVE CONTROL: psVerifyPlain accepts Lagrange aggregation, rejects Lagr
 
     // Two authorities (indices 1,3) produce partials over the common base.
     const partials = [_]cred.PartialCredential{
-        partialSignMech(kk.sk_shares[0], h, &attrs),
-        partialSignMech(kk.sk_shares[2], h, &attrs),
+        partialSignMech(&kk.sk_shares[0], h, &attrs),
+        partialSignMech(&kk.sk_shares[2], h, &attrs),
     };
     const indices = [_]u64{ partials[0].index, partials[1].index };
 
@@ -94,7 +96,7 @@ test "POSITIVE CONTROL: psVerifyPlain accepts Lagrange aggregation, rejects Lagr
     const good = try BrokenCoconut.aggregateLagrange(&indices, &partials);
     try std.testing.expect(cred.psVerifyPlain(kk.master_vk, good, &attrs));
     // ...and byte-matches the single-signer oracle (Lagrange reconstructs x+Σmᵢyᵢ).
-    const oracle = cred.psSignWithSecret(kk.master_sk, h, &attrs);
+    const oracle = cred.psSignWithSecret(&kk.master_sk, h, &attrs);
     try std.testing.expect(g1Eql(good.s, oracle.s));
 
     // The Lagrange-ignoring aggregation is CAUGHT by the pairing check.
@@ -107,21 +109,22 @@ test "POSITIVE CONTROL: any two distinct t-subsets aggregate to the same credent
     const p = try Parameters.generate(allocator, 2);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0xABCD);
-    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 2, 3, 5); // t=3, n=5
+    var kk: keys.ThresholdKeys = undefined;
+    try keys.keygenSeededForTest(&kk, allocator, prng.random(), 2, 3, 5); // t=3, n=5
     defer kk.deinit(allocator);
     const attrs = [_]Fr{ frOf(42), frOf(99) };
     const h = p.commonBase(&attrs);
 
     const subsetA = [_]cred.PartialCredential{
-        partialSignMech(kk.sk_shares[0], h, &attrs),
-        partialSignMech(kk.sk_shares[2], h, &attrs),
-        partialSignMech(kk.sk_shares[4], h, &attrs),
+        partialSignMech(&kk.sk_shares[0], h, &attrs),
+        partialSignMech(&kk.sk_shares[2], h, &attrs),
+        partialSignMech(&kk.sk_shares[4], h, &attrs),
     };
     const idxA = [_]u64{ subsetA[0].index, subsetA[1].index, subsetA[2].index };
     const subsetB = [_]cred.PartialCredential{
-        partialSignMech(kk.sk_shares[1], h, &attrs),
-        partialSignMech(kk.sk_shares[2], h, &attrs),
-        partialSignMech(kk.sk_shares[3], h, &attrs),
+        partialSignMech(&kk.sk_shares[1], h, &attrs),
+        partialSignMech(&kk.sk_shares[2], h, &attrs),
+        partialSignMech(&kk.sk_shares[3], h, &attrs),
     };
     const idxB = [_]u64{ subsetB[0].index, subsetB[1].index, subsetB[2].index };
 
@@ -139,15 +142,16 @@ test "ANCHOR (gated): threshold-issue → aggregate → show → verify PASSES" 
     const p = try Parameters.generate(allocator, 3);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0x1234);
-    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 3, 2, 4);
+    var kk: keys.ThresholdKeys = undefined;
+    try keys.keygenSeededForTest(&kk, allocator, prng.random(), 3, 2, 4);
     defer kk.deinit(allocator);
 
     const attrs = [_]Fr{ frOf(1), frOf(2), frOf(3) };
     const h = p.commonBase(&attrs);
 
     const partials = [_]cred.PartialCredential{
-        try cred.signPartial(kk.sk_shares[0], h, &attrs),
-        try cred.signPartial(kk.sk_shares[2], h, &attrs),
+        try cred.signPartial(&kk.sk_shares[0], h, &attrs),
+        try cred.signPartial(&kk.sk_shares[2], h, &attrs),
     };
     const credential = try cred.aggregateCredential(allocator, &partials, 2);
     try std.testing.expect(cred.psVerifyPlain(kk.master_vk, credential, &attrs));
@@ -167,14 +171,15 @@ test "SOUNDNESS (gated): tampered credential / wrong disclosed value / mutated c
     const p = try Parameters.generate(allocator, 2);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0x9999);
-    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 2, 2, 3);
+    var kk: keys.ThresholdKeys = undefined;
+    try keys.keygenSeededForTest(&kk, allocator, prng.random(), 2, 2, 3);
     defer kk.deinit(allocator);
 
     const attrs = [_]Fr{ frOf(11), frOf(22) };
     const h = p.commonBase(&attrs);
     const partials = [_]cred.PartialCredential{
-        try cred.signPartial(kk.sk_shares[0], h, &attrs),
-        try cred.signPartial(kk.sk_shares[1], h, &attrs),
+        try cred.signPartial(&kk.sk_shares[0], h, &attrs),
+        try cred.signPartial(&kk.sk_shares[1], h, &attrs),
     };
     const credential = try cred.aggregateCredential(allocator, &partials, 2);
     const disclosed = [_]bool{ true, false };
@@ -214,7 +219,8 @@ test "SOUNDNESS (gated): a show proof answers only the verifier's context and th
     const p = try Parameters.generate(allocator, 3);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0xC7C7);
-    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 3, 2, 3);
+    var kk: keys.ThresholdKeys = undefined;
+    try keys.keygenSeededForTest(&kk, allocator, prng.random(), 3, 2, 3);
     defer kk.deinit(allocator);
 
     // Attributes 0 and 2 carry the same value, so a revealed VALUE alone
@@ -222,8 +228,8 @@ test "SOUNDNESS (gated): a show proof answers only the verifier's context and th
     const attrs = [_]Fr{ frOf(5), frOf(9), frOf(5) };
     const h = p.commonBase(&attrs);
     const partials = [_]cred.PartialCredential{
-        try cred.signPartial(kk.sk_shares[0], h, &attrs),
-        try cred.signPartial(kk.sk_shares[1], h, &attrs),
+        try cred.signPartial(&kk.sk_shares[0], h, &attrs),
+        try cred.signPartial(&kk.sk_shares[1], h, &attrs),
     };
     const credential = try cred.aggregateCredential(allocator, &partials, 2);
 
@@ -254,13 +260,14 @@ test "THRESHOLD (gated): fewer than t partials fails aggregation" {
     const p = try Parameters.generate(allocator, 2);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0x2468);
-    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 2, 3, 5); // t=3
+    var kk: keys.ThresholdKeys = undefined;
+    try keys.keygenSeededForTest(&kk, allocator, prng.random(), 2, 3, 5); // t=3
     defer kk.deinit(allocator);
     const attrs = [_]Fr{ frOf(7), frOf(8) };
     const h = p.commonBase(&attrs);
     const too_few = [_]cred.PartialCredential{
-        try cred.signPartial(kk.sk_shares[0], h, &attrs),
-        try cred.signPartial(kk.sk_shares[1], h, &attrs),
+        try cred.signPartial(&kk.sk_shares[0], h, &attrs),
+        try cred.signPartial(&kk.sk_shares[1], h, &attrs),
     };
     try std.testing.expectError(error.NotEnoughPartials, cred.aggregateCredential(allocator, &too_few, 3));
 }

@@ -77,6 +77,7 @@
 const std = @import("std");
 const bls = @import("bls12_381");
 const entropy = @import("entropy");
+const burn = @import("burn.zig");
 
 pub const G1 = bls.G1;
 pub const G2 = bls.G2;
@@ -110,12 +111,9 @@ fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
 /// generator; no separate constant is needed.
 pub const BP2: G2.Affine = G2.Affine.generator;
 
-/// `calculate_random_scalars(count)` (draft §4.2.1): `count` INDEPENDENT
+/// `calculate_random_scalars(count)` (draft §4.2.1): `out.len` INDEPENDENT
 /// draws of `OS2IP(get_random(expand_len)) mod r` from a real CSPRNG —
-/// the entropy `ProofGen` needs in normal (non-test) operation. `count`
-/// is `comptime` so the return type is a plain array (no allocator);
-/// every real call site (a future `proofGen` wrapper computing `5 + U`
-/// undisclosed messages) knows `U` at the call site already. REAL — pure
+/// the entropy `ProofGen` needs in normal (non-test) operation. REAL — pure
 /// `std.Io` entropy draw + `Fr.reduceWide`, no ZK judgment (mirrors
 /// `bls12_381.scalar.Fr.random`'s `io: std.Io` convention, NOT an
 /// internal `getrandom(2)` call — see `../README.md`'s "Randomness"
@@ -123,19 +121,28 @@ pub const BP2: G2.Affine = G2.Affine.generator;
 /// explicit parameter rather than reading global/internal entropy,
 /// unlike `bulletproofs`).
 ///
+/// The scalars are secrets (`proofGen`'s blinding factors), so they are
+/// written into the caller's `out` — `5 + U` of them, see
+/// `bbs.randomScalarCount` — never returned through the stack; the draw runs
+/// one frame down and the stack it dirtied (the raw entropy) is zeroed after
+/// it (`burn.zig`). The caller wipes `out` once the proof is made.
+///
 /// Fail-closed (`entropy.fill`, not `io.random`): these are `proofGen`'s
 /// blinding scalars, and predicting them de-anonymises the proof —
 /// linking presentations back to one credential is exactly what this
-/// scheme exists to prevent. The return type is an array, so a degraded
+/// scheme exists to prevent. There is no error channel, so a degraded
 /// draw has nowhere to surface.
-pub fn calculateRandomScalars(comptime count: usize, io: std.Io) [count]Fr {
-    var out: [count]Fr = undefined;
-    for (&out) |*r| {
+pub fn calculateRandomScalars(out: []Fr, io: std.Io) void {
+    burn.run(burn.rng_burn, void, drawScalars, .{ out, io });
+}
+
+fn drawScalars(out: []Fr, io: std.Io) void {
+    for (out) |*r| {
         var buf: [expand_len]u8 = undefined;
         entropy.fill(io, &buf);
         r.* = Fr.reduceWide(&buf);
+        std.crypto.secureZero(u8, &buf);
     }
-    return out;
 }
 
 /// The two ciphersuites of draft-12 §7.2: BLS12-381-SHA-256 (§7.2.2) and

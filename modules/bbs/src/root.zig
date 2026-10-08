@@ -60,8 +60,9 @@
 //! `proofGen` takes `random_scalars: []const Fr` as a PLAIN PARAMETER —
 //! the caller supplies it, sourced from either:
 //!
-//! - `ciphersuite.calculateRandomScalars(comptime count, io: std.Io)` —
-//!   real entropy (draft §4.2.1), for production callers.
+//! - `ciphersuite.calculateRandomScalars(out: []Fr, io: std.Io)` —
+//!   real entropy (draft §4.2.1) written into the caller's array (secret:
+//!   never returned by value), for production callers.
 //! - `ciphersuite.mockedRandomScalars(comptime count, seed: []const u8)`
 //!   — the deterministic mock RNG (draft §7.1), for KAT reproducibility.
 //!
@@ -133,6 +134,7 @@ pub const meta = .{
 // here too.
 
 const kat_test = @import("kat_test.zig");
+const stackprobe_test = @import("stackprobe_test.zig");
 
 test {
     _ = ciphersuite;
@@ -140,6 +142,7 @@ test {
     _ = gate;
     _ = bbs_mod;
     _ = kat_test;
+    _ = stackprobe_test;
 }
 
 test "meta.model_after names the bbs-signatures draft" {

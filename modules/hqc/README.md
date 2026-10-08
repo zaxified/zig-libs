@@ -69,14 +69,20 @@ const hqc = @import("hqc");
 
 var seed_kem: [32]u8 = undefined;
 std.crypto.random.bytes(&seed_kem);
-const kp = hqc.Hqc128.keypair(&seed_kem); // { ek, dk }
+// Secrets (the key pair, both shared secrets) are written in place.
+var kp: hqc.Hqc128.KeyPair = undefined;
+hqc.Hqc128.keypair(&kp, &seed_kem);
+defer kp.wipe();
 
 var coins: [hqc.Hqc128.coins_bytes]u8 = undefined; // m || salt
 std.crypto.random.bytes(&coins);
-const enc = hqc.Hqc128.encaps(kp.ek, &coins); // { ct, ss }
+var ct: hqc.Hqc128.Ciphertext = undefined;
+var ss_enc: hqc.Hqc128.SharedSecret = undefined;
+hqc.Hqc128.encaps(&ct, &ss_enc, &kp.ek, &coins);
 
-const ss = hqc.Hqc128.decaps(kp.dk, enc.ct);
-// ss == enc.ss
+var ss: hqc.Hqc128.SharedSecret = undefined;
+hqc.Hqc128.decaps(&ss, &kp.dk, &ct);
+// ss == ss_enc
 ```
 
 Lower-level access (the ring/PRNG primitives Parts 1-2 build on) is still

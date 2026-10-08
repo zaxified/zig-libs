@@ -198,7 +198,8 @@ fn secretSk(comptime domain: []const u8, tainted: bool) !keys.SecretKey {
     var raw = secretBytes(keys.SecretKey.encoded_bytes, domain);
     var r = reloadVolatile(keys.SecretKey.encoded_bytes, &raw);
     r[0] = 0;
-    var sk = try keys.SecretKey.fromBytes(r);
+    var sk: keys.SecretKey = undefined;
+    try keys.SecretKey.fromBytes(&sk, &r);
     if (tainted) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&sk));
     return sk;
 }
@@ -267,7 +268,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // publishes `pk` once, well before/independently of any given
             // `sign` call, so it must not carry the taint under test.
             const pk_sk = try secretSk("ctgrind-bbs-harness-sk-v1", false);
-            const pk = keys.skToPk(pk_sk);
+            const pk = keys.skToPk(&pk_sk);
 
             // The tainted issuer signing key entering `sign`.
             const sk = try secretSk("ctgrind-bbs-harness-sk-v1", tainted);
@@ -277,7 +278,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 "bbs-ctgrind-issuer-message-1",
                 "bbs-ctgrind-issuer-message-2",
             };
-            const sig_bytes = try bbs_mod.sign(allocator, sk, pk, header, &messages);
+            const sig_bytes = try bbs_mod.sign(allocator, &sk, pk, header, &messages);
 
             // Propagation witness: downstream of the tainted sk.
             std.debug.print("sig={x}\n", .{sig_bytes});
@@ -288,15 +289,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // `Signature.fromBytes` structural check passes and the
             // measured call is the real thing, not an early-return error
             // path. ──────────────────────────────────────────────────────
-            const setup_sk = try keys.keyGen("ctgrind-bbs-harness-issuer-key-material-v1!", "", null);
-            const pk = keys.skToPk(setup_sk);
+            var setup_sk: keys.SecretKey = undefined;
+            try keys.keyGen(&setup_sk, "ctgrind-bbs-harness-issuer-key-material-v1!", "", null);
+            const pk = keys.skToPk(&setup_sk);
 
             var setup_msgs: [total_messages][msg_len]u8 = undefined;
             for (&setup_msgs, 0..) |*m, i| m.* = secretBytesIndexed(msg_len, "ctgrind-bbs-harness-msg-v1", i);
             var setup_slices: [total_messages][]const u8 = undefined;
             for (&setup_slices, &setup_msgs) |*s, *m| s.* = m;
 
-            const signature = try bbs_mod.sign(allocator, setup_sk, pk, header, &setup_slices);
+            const signature = try bbs_mod.sign(allocator, &setup_sk, pk, header, &setup_slices);
 
             // ── the measured call: re-taint the UNDISCLOSED messages
             // ({1,2}) and every `random_scalars` entry (the proof's
@@ -321,7 +323,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const proof = try bbs_mod.proofGen(
                 allocator,
                 pk,
-                signature,
+                &signature,
                 header,
                 ph,
                 &run_slices,

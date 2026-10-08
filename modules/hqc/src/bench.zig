@@ -57,8 +57,8 @@ test "bench (opt-in via HQC_BENCH)" {
     const seed = [_]u8{0x5a} ** 32;
     const coins = [_]u8{0xa5} ** Kem.coins_bytes;
 
-    const kp = Kem.keypair(&seed);
-    const enc = Kem.encaps(kp.ek, &coins);
+    const kp = keypairV(Kem, &seed);
+    const enc = encapsV(Kem, kp.ek, &coins);
 
     const S = struct {
         var kp_ek: Kem.EncapsKey = undefined;
@@ -68,15 +68,15 @@ test "bench (opt-in via HQC_BENCH)" {
         var cn: [Kem.coins_bytes]u8 = undefined;
 
         fn benchKeypair() void {
-            const r = Kem.keypair(&sd);
+            const r = keypairV(Kem, &sd);
             std.mem.doNotOptimizeAway(r.ek[0]);
         }
         fn benchEncaps() void {
-            const r = Kem.encaps(kp_ek, &cn);
+            const r = encapsV(Kem, kp_ek, &cn);
             std.mem.doNotOptimizeAway(r.ct[0]);
         }
         fn benchDecaps() void {
-            const r = Kem.decaps(kp_dk, ct);
+            const r = decapsV(Kem, kp_dk, ct);
             std.mem.doNotOptimizeAway(r[0]);
         }
     };
@@ -132,19 +132,19 @@ test "profile workload for perf (opt-in via HQC_PROFILE)" {
         var cn: [Kem.coins_bytes]u8 = [_]u8{0xa5} ** Kem.coins_bytes;
 
         noinline fn profKeypair(n: usize) void {
-            for (0..n) |_| std.mem.doNotOptimizeAway(Kem.keypair(&sd).ek[0]);
+            for (0..n) |_| std.mem.doNotOptimizeAway(keypairV(Kem, &sd).ek[0]);
         }
         noinline fn profEncaps(n: usize) void {
-            for (0..n) |_| std.mem.doNotOptimizeAway(Kem.encaps(ek, &cn).ct[0]);
+            for (0..n) |_| std.mem.doNotOptimizeAway(encapsV(Kem, ek, &cn).ct[0]);
         }
         noinline fn profDecaps(n: usize) void {
-            for (0..n) |_| std.mem.doNotOptimizeAway(Kem.decaps(dk, ct)[0]);
+            for (0..n) |_| std.mem.doNotOptimizeAway(decapsV(Kem, dk, ct)[0]);
         }
     };
-    const kp = Kem.keypair(&P.sd);
+    const kp = keypairV(Kem, &P.sd);
     P.ek = kp.ek;
     P.dk = kp.dk;
-    P.ct = Kem.encaps(kp.ek, &P.cn).ct;
+    P.ct = encapsV(Kem, kp.ek, &P.cn).ct;
 
     const n = 4000;
     const ops = [_]struct { name: []const u8, run: *const fn (usize) void }{
@@ -160,4 +160,22 @@ test "profile workload for perf (opt-in via HQC_PROFILE)" {
         // KVM guest is large; it is a sanity check, not a benchmark.
         std.debug.print("\nhqc-128 profile workload: {s} x{d}, {d} ns/op\n", .{ op.name, n, (nowNs() - t0) / n });
     }
+}
+
+// Value-returning wrappers over the pointer/out-param KEM API, for tests and
+// benchmarks that compare values; library callers use the real API.
+fn keypairV(comptime K: type, seed: *const [32]u8) K.KeyPair {
+    var kp: K.KeyPair = undefined;
+    K.keypair(&kp, seed);
+    return kp;
+}
+fn encapsV(comptime K: type, ek: K.EncapsKey, coins: *const [K.coins_bytes]u8) struct { ct: K.Ciphertext, ss: K.SharedSecret } {
+    var r: struct { ct: K.Ciphertext, ss: K.SharedSecret } = undefined;
+    K.encaps(&r.ct, &r.ss, &ek, coins);
+    return .{ .ct = r.ct, .ss = r.ss };
+}
+fn decapsV(comptime K: type, dk: K.DecapsKey, ct: K.Ciphertext) K.SharedSecret {
+    var ss: K.SharedSecret = undefined;
+    K.decaps(&ss, &dk, &ct);
+    return ss;
 }

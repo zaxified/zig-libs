@@ -23,6 +23,7 @@
 const std = @import("std");
 const bls = @import("bls12_381");
 const lagrange = @import("lagrange.zig");
+const burn = @import("burn.zig");
 
 const g2 = bls.g2;
 const Fr = bls.Fr;
@@ -71,18 +72,23 @@ pub const Entropy = union(enum) {
     seeded_for_test: std.Random,
 
     /// A uniformly-random `Fr` (rejection sampling — a raw wide reduction
-    /// would bias the sample, see `Fr.random`'s doc comment).
-    pub fn scalar(self: Entropy) Fr {
-        return switch (self) {
-            .io => |io| Fr.random(io),
-            .seeded_for_test => |random| blk: {
+    /// would bias the sample, see `Fr.random`'s doc comment), written to
+    /// `out`: the scalar is a secret and is not returned through the stack.
+    /// The caller's frame is the caller's to burn (`keygen` and
+    /// `proveCredential` run this inside their burned bodies).
+    pub fn scalar(self: Entropy, out: *Fr) void {
+        switch (self) {
+            .io => |io| out.* = Fr.random(io),
+            .seeded_for_test => |random| {
                 var buf: [32]u8 = undefined;
+                defer std.crypto.secureZero(u8, &buf);
                 while (true) {
                     random.bytes(&buf);
-                    break :blk Fr.fromBytes(buf) catch continue;
+                    out.* = Fr.fromBytes(buf) catch continue;
+                    break;
                 }
             },
-        };
+        }
     }
 };
 
@@ -107,8 +113,14 @@ pub const VerificationKey = struct {
     alpha: g2.Affine,
     betas: []g2.Affine,
 
-    /// Derive `vk` from a `SecretKey` (REAL: `g2^x`, `g2^{y_i}`).
-    pub fn fromSecret(allocator: std.mem.Allocator, sk: SecretKey) std.mem.Allocator.Error!VerificationKey {
+    /// Derive `vk` from a `SecretKey` (REAL: `g2^x`, `g2^{y_i}`). The key
+    /// comes in by pointer; the body runs one frame down and the stack it
+    /// dirtied is zeroed after it (`burn.zig`).
+    pub fn fromSecret(allocator: std.mem.Allocator, sk: *const SecretKey) std.mem.Allocator.Error!VerificationKey {
+        return burn.run(burn.key_burn, std.mem.Allocator.Error!VerificationKey, fromSecretBody, .{ allocator, sk });
+    }
+
+    fn fromSecretBody(allocator: std.mem.Allocator, sk: *const SecretKey) std.mem.Allocator.Error!VerificationKey {
         const betas = try allocator.alloc(g2.Affine, sk.ys.len);
         errdefer allocator.free(betas);
         const g2base = g2.Jacobian.fromAffine(g2.Affine.generator);
@@ -143,7 +155,13 @@ pub const VerificationKeyShare = struct {
     alpha: g2.Affine,
     betas: []g2.Affine,
 
-    pub fn fromShare(allocator: std.mem.Allocator, share: SecretKeyShare) std.mem.Allocator.Error!VerificationKeyShare {
+    /// The share comes in by pointer; the body runs one frame down and the
+    /// stack it dirtied is zeroed after it (`burn.zig`).
+    pub fn fromShare(allocator: std.mem.Allocator, share: *const SecretKeyShare) std.mem.Allocator.Error!VerificationKeyShare {
+        return burn.run(burn.key_burn, std.mem.Allocator.Error!VerificationKeyShare, fromShareBody, .{ allocator, share });
+    }
+
+    fn fromShareBody(allocator: std.mem.Allocator, share: *const SecretKeyShare) std.mem.Allocator.Error!VerificationKeyShare {
         const betas = try allocator.alloc(g2.Affine, share.ys.len);
         errdefer allocator.free(betas);
         const g2base = g2.Jacobian.fromAffine(g2.Affine.generator);
@@ -198,14 +216,21 @@ pub const ThresholdKeys = struct {
 /// entire system; the `t`-of-`n` threshold split becomes decoration, because
 /// the dealer's secret never needed to be reassembled from shares. Tests that
 /// need a reproducible key use `keygenSeededForTest`.
+///
+/// **Secrets.** The key set is written to `out` (untouched on error: it is
+/// only written once everything succeeded), never returned through the
+/// stack; the body runs one frame down and the stack it dirtied is zeroed
+/// after it (`burn.zig`). The polynomial coefficients are wiped before they
+/// are freed; `out.deinit` wipes the master key and every share.
 pub fn keygen(
+    out: *ThresholdKeys,
     allocator: std.mem.Allocator,
     io: std.Io,
     q: usize,
     t: u64,
     n: u64,
-) KeysError!ThresholdKeys {
-    return keygenFrom(allocator, .{ .io = io }, q, t, n);
+) KeysError!void {
+    return keygenFrom(out, allocator, .{ .io = io }, q, t, n);
 }
 
 /// **TEST ONLY** — `keygen` over a caller-seeded `std.Random`, so a suite can
@@ -215,41 +240,55 @@ pub fn keygen(
 /// seed: using it in production hands every credential in the system to
 /// whoever recovers that seed. Production callers want `keygen`.
 pub fn keygenSeededForTest(
+    out: *ThresholdKeys,
     allocator: std.mem.Allocator,
     random: std.Random,
     q: usize,
     t: u64,
     n: u64,
-) KeysError!ThresholdKeys {
-    return keygenFrom(allocator, .{ .seeded_for_test = random }, q, t, n);
+) KeysError!void {
+    return keygenFrom(out, allocator, .{ .seeded_for_test = random }, q, t, n);
 }
 
 fn keygenFrom(
+    out: *ThresholdKeys,
     allocator: std.mem.Allocator,
     entropy: Entropy,
     q: usize,
     t: u64,
     n: u64,
-) KeysError!ThresholdKeys {
+) KeysError!void {
     if (t == 0 or n == 0 or t > n or q == 0) return error.InvalidThreshold;
+    return burn.run(burn.key_burn, KeysError!void, keygenBody, .{ out, allocator, entropy, q, t, n });
+}
 
+fn keygenBody(
+    out: *ThresholdKeys,
+    allocator: std.mem.Allocator,
+    entropy: Entropy,
+    q: usize,
+    t: u64,
+    n: u64,
+) KeysError!void {
     // q+1 polynomials of degree t-1: poly[c][0] = the master secret for
     // component c, poly[c][1..t] = random blinding coefficients.
     const ncoef: usize = @intCast(t);
     var polys = try allocator.alloc([]Fr, q + 1);
+    var allocated: usize = 0;
     defer {
         // The polynomial coefficients ARE the secret key components
-        // (poly[c][0]) plus their blinding — zero before free.
-        for (polys) |p| std.crypto.secureZero(u8, std.mem.sliceAsBytes(p));
-        for (polys) |p| allocator.free(p);
+        // (poly[c][0]) plus their blinding — zero before free (only the
+        // ones allocated: the rest of `polys` is uninitialised).
+        for (polys[0..allocated]) |p| {
+            std.crypto.secureZero(u8, std.mem.sliceAsBytes(p));
+            allocator.free(p);
+        }
         allocator.free(polys);
     }
-    var allocated: usize = 0;
-    errdefer for (polys[0..allocated]) |p| allocator.free(p);
     for (polys) |*p| {
         p.* = try allocator.alloc(Fr, ncoef);
         allocated += 1;
-        for (p.*) |*c| c.* = entropy.scalar();
+        for (p.*) |*c| entropy.scalar(c);
     }
 
     var master_sk = SecretKey{
@@ -261,7 +300,7 @@ fn keygenFrom(
         },
     };
     errdefer master_sk.deinit(allocator);
-    const master_vk = try VerificationKey.fromSecret(allocator, master_sk);
+    const master_vk = try VerificationKey.fromSecret(allocator, &master_sk);
     errdefer master_vk.deinit(allocator);
 
     const sk_shares = try allocator.alloc(SecretKeyShare, @intCast(n));
@@ -273,8 +312,9 @@ fn keygenFrom(
     for (sk_shares, 1..) |*share, idx| {
         const xi = lagrange.indexScalar(@intCast(idx));
         const ys = try allocator.alloc(Fr, q);
-        share.* = .{ .index = @intCast(idx), .x = evalPoly(polys[0], xi), .ys = ys };
-        for (ys, 0..) |*y, c| y.* = evalPoly(polys[c + 1], xi);
+        share.* = .{ .index = @intCast(idx), .x = undefined, .ys = ys };
+        evalPolyBody(&share.x, polys[0], xi);
+        for (ys, 0..) |*y, c| evalPolyBody(y, polys[c + 1], xi);
         sk_done += 1;
     }
 
@@ -284,12 +324,12 @@ fn keygenFrom(
         for (vk_shares[0..vk_done]) |s| s.deinit(allocator);
         allocator.free(vk_shares);
     }
-    for (vk_shares, sk_shares) |*vks, sks| {
+    for (vk_shares, sk_shares) |*vks, *sks| {
         vks.* = try VerificationKeyShare.fromShare(allocator, sks);
         vk_done += 1;
     }
 
-    return .{
+    out.* = .{
         .q = q,
         .t = t,
         .n = n,
@@ -301,15 +341,20 @@ fn keygenFrom(
 }
 
 /// Horner evaluation of `poly` (low-to-high coefficients) at `x` over
-/// `Fr`.
-pub fn evalPoly(poly: []const Fr, x: Fr) Fr {
-    var acc = Fr.zero;
+/// `Fr`. The coefficients are secret, and so is the value (a Shamir share):
+/// written to `out`; the body runs one frame down and the stack it dirtied is
+/// zeroed after it (`burn.zig`).
+pub fn evalPoly(out: *Fr, poly: []const Fr, x: Fr) void {
+    burn.run(burn.eval_burn, void, evalPolyBody, .{ out, poly, x });
+}
+
+fn evalPolyBody(out: *Fr, poly: []const Fr, x: Fr) void {
+    out.* = Fr.zero;
     var i: usize = poly.len;
     while (i > 0) {
         i -= 1;
-        acc = acc.mul(x).add(poly[i]);
+        out.* = out.mul(x).add(poly[i]);
     }
-    return acc;
 }
 
 /// Lagrange-in-EXPONENT aggregation of any `t` verification-key shares
@@ -353,7 +398,8 @@ pub fn aggregateVerificationKeys(
 test "keygen: any t shares Lagrange-reconstruct the master secret key vector" {
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xC0C0);
-    var keys = try keygenSeededForTest(allocator, prng.random(), 3, 2, 4);
+    var keys: ThresholdKeys = undefined;
+    try keygenSeededForTest(&keys, allocator, prng.random(), 3, 2, 4);
     defer keys.deinit(allocator);
 
     // Reconstruct x and each y_j in the SCALAR field from shares {2,3}.
@@ -374,7 +420,8 @@ test "keygen: any t shares Lagrange-reconstruct the master secret key vector" {
 test "aggregateVerificationKeys: Lagrange-in-exponent recovers the master vk" {
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xBEEF);
-    var keys = try keygenSeededForTest(allocator, prng.random(), 2, 3, 5);
+    var keys: ThresholdKeys = undefined;
+    try keygenSeededForTest(&keys, allocator, prng.random(), 2, 3, 5);
     defer keys.deinit(allocator);
 
     // Aggregate a t=3 subset of vk shares (indices 1,3,5).
@@ -418,9 +465,11 @@ test "aggregateVerificationKeys: refuses shares with different attribute counts"
     // Mutation run 2026-10-05: removing the check survived.
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xBEF0);
-    var two = try keygenSeededForTest(allocator, prng.random(), 2, 2, 3);
+    var two: ThresholdKeys = undefined;
+    try keygenSeededForTest(&two, allocator, prng.random(), 2, 2, 3);
     defer two.deinit(allocator);
-    var three = try keygenSeededForTest(allocator, prng.random(), 3, 2, 3);
+    var three: ThresholdKeys = undefined;
+    try keygenSeededForTest(&three, allocator, prng.random(), 3, 2, 3);
     defer three.deinit(allocator);
     const subset = [_]VerificationKeyShare{ two.vk_shares[0], three.vk_shares[1] };
     try std.testing.expectError(error.MismatchedAttributes, aggregateVerificationKeys(allocator, &subset));
@@ -429,9 +478,10 @@ test "aggregateVerificationKeys: refuses shares with different attribute counts"
 test "keygen: rejects invalid thresholds" {
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(1);
-    try std.testing.expectError(error.InvalidThreshold, keygenSeededForTest(allocator, prng.random(), 2, 0, 3));
-    try std.testing.expectError(error.InvalidThreshold, keygenSeededForTest(allocator, prng.random(), 2, 4, 3));
-    try std.testing.expectError(error.InvalidThreshold, keygenSeededForTest(allocator, prng.random(), 0, 2, 3));
+    var tmp: ThresholdKeys = undefined;
+    try std.testing.expectError(error.InvalidThreshold, keygenSeededForTest(&tmp, allocator, prng.random(), 2, 0, 3));
+    try std.testing.expectError(error.InvalidThreshold, keygenSeededForTest(&tmp, allocator, prng.random(), 2, 4, 3));
+    try std.testing.expectError(error.InvalidThreshold, keygenSeededForTest(&tmp, allocator, prng.random(), 0, 2, 3));
 }
 
 fn g2Eql(a: g2.Affine, b: g2.Affine) bool {
@@ -457,14 +507,14 @@ test "keygen takes std.Io; the seeded form exists only under a name that says so
     // `keygen`'s draws go through `Entropy.scalar` → `Fr.random`, fail-closed
     // on `std.Io.randomSecure` (`entropy.fill`), not the silently-degrading
     // `std.Io.random`. If this ever flips back to a bare `std.Random`,
-    // `keygen(alloc, prng.random(), …)` compiles again and the Coldcard-shaped
+    // `keygen(&out, alloc, prng.random(), …)` compiles again and the Coldcard-shaped
     // mistake is one line away for every consumer.
-    try std.testing.expectEqual(std.Io, gen_params[1].type.?);
+    try std.testing.expectEqual(std.Io, gen_params[2].type.?);
     // The seeded form still exists, but only under a name that says out loud
     // what it is — it can never be reached by a consumer who merely followed
     // the happy path.
     const test_params = @typeInfo(@TypeOf(keygenSeededForTest)).@"fn".params;
-    try std.testing.expectEqual(std.Random, test_params[1].type.?);
+    try std.testing.expectEqual(std.Random, test_params[2].type.?);
 }
 
 test "keygen draws a fresh authority master secret on every call" {
@@ -473,9 +523,11 @@ test "keygen draws a fresh authority master secret on every call" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var k1 = try keygen(allocator, io, 2, 2, 3);
+    var k1: ThresholdKeys = undefined;
+    try keygen(&k1, allocator, io, 2, 2, 3);
     defer k1.deinit(allocator);
-    var k2 = try keygen(allocator, io, 2, 2, 3);
+    var k2: ThresholdKeys = undefined;
+    try keygen(&k2, allocator, io, 2, 2, 3);
     defer k2.deinit(allocator);
 
     // Two calls, one `io`: a seed-derived master secret would repeat here.
@@ -483,4 +535,20 @@ test "keygen draws a fresh authority master secret on every call" {
     try std.testing.expect(!k1.master_sk.ys[0].eql(k2.master_sk.ys[0]));
     // The Shamir blinding is redrawn too (share 0 is x(1), not x).
     try std.testing.expect(!k1.sk_shares[0].x.eql(k2.sk_shares[0].x));
+}
+
+test "keygen: an allocation failure at any point leaks nothing and frees only what was allocated" {
+    // The polynomial table used to be freed in full (including slots that were
+    // never allocated) on a partial failure, and twice by the `errdefer`.
+    var prng = std.Random.DefaultPrng.init(0x00F0);
+    var fail_at: usize = 0;
+    while (fail_at < 64) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_at });
+        var kk: ThresholdKeys = undefined;
+        if (keygenSeededForTest(&kk, failing.allocator(), prng.random(), 2, 2, 3)) |_| {
+            kk.deinit(failing.allocator());
+            break;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+    }
+    try std.testing.expect(fail_at > 3 and fail_at < 64);
 }

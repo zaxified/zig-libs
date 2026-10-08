@@ -63,17 +63,17 @@ fn Ours(comptime Kem: type) type {
     return struct {
         const Ctx = struct { seed: *const [32]u8, coins: *const [Kem.coins_bytes]u8, kp: *const Kem.KeyPair, ct: *const Kem.Ciphertext };
         fn keygen(c: Ctx) usize {
-            const r = Kem.keypair(c.seed);
+            const r = keypairV(Kem, c.seed);
             std.mem.doNotOptimizeAway(&r);
             return r.ek.len;
         }
         fn encaps(c: Ctx) usize {
-            const r = Kem.encaps(c.kp.ek, c.coins);
+            const r = encapsV(Kem, c.kp.ek, c.coins);
             std.mem.doNotOptimizeAway(&r);
             return r.ct.len;
         }
         fn decaps(c: Ctx) usize {
-            const r = Kem.decaps(c.kp.dk, c.ct.*);
+            const r = decapsV(Kem, c.kp.dk, c.ct.*);
             std.mem.doNotOptimizeAway(&r);
             return r.len;
         }
@@ -175,10 +175,10 @@ pub fn main(init: std.process.Init) !u8 {
         var prng = hqc.prng.Prng.init(&seed, &.{});
         var seed_kem: [32]u8 = undefined;
         prng.getBytes(&seed_kem);
-        const kp = Kem.keypair(&seed_kem);
+        const kp = keypairV(Kem, &seed_kem);
         var coins: [Kem.coins_bytes]u8 = undefined;
         prng.getBytes(&coins);
-        const enc = Kem.encaps(kp.ek, &coins);
+        const enc = encapsV(Kem, kp.ek, &coins);
         inline for (lanes) |lane| {
             const tag = vr.label ++ "_" ++ lane.name;
             const pk = try dir.readFileAlloc(io, tag ++ ".pk", arena, .limited(1 << 16));
@@ -192,7 +192,7 @@ pub fn main(init: std.process.Init) !u8 {
                 return 1;
             }
             if (ct.len != Kem.ct_bytes) return 1;
-            const dec = Kem.decaps(kp.dk, ct[0..Kem.ct_bytes].*);
+            const dec = decapsV(Kem, kp.dk, ct[0..Kem.ct_bytes].*);
             if (!std.mem.eql(u8, &dec, ss)) {
                 std.debug.print("bench-hqc: FAILED -- {s}: we decapsulate the reference's ciphertext to a different secret\n", .{tag});
                 return 1;
@@ -215,10 +215,10 @@ pub fn main(init: std.process.Init) !u8 {
         var prng = hqc.prng.Prng.init(&seed, &.{});
         var seed_kem: [32]u8 = undefined;
         prng.getBytes(&seed_kem);
-        const kp = Kem.keypair(&seed_kem);
+        const kp = keypairV(Kem, &seed_kem);
         var coins: [Kem.coins_bytes]u8 = undefined;
         prng.getBytes(&coins);
-        const enc = Kem.encaps(kp.ek, &coins);
+        const enc = encapsV(Kem, kp.ek, &coins);
         const O = Ours(Kem);
         const ctx: O.Ctx = .{ .seed = &seed_kem, .coins = &coins, .kp = &kp, .ct = &enc.ct };
         inline for (.{ "keygen", "encaps", "decaps" }) |wl| {
@@ -246,4 +246,22 @@ pub fn main(init: std.process.Init) !u8 {
     try w.print("card: **Performance:** ref {d:.2}–{d:.2}× HQC v5.0.0 `ref` lane · fastest {d:.2}–{d:.2}× HQC v5.0.0 `x86_64/avx256` lane (measured 2026-10-07)\n", .{ best, worst, best_a, worst_a });
     try w.flush();
     return 0;
+}
+
+// Value-returning wrappers over the pointer/out-param KEM API, for tests and
+// benchmarks that compare values; library callers use the real API.
+fn keypairV(comptime K: type, seed: *const [32]u8) K.KeyPair {
+    var kp: K.KeyPair = undefined;
+    K.keypair(&kp, seed);
+    return kp;
+}
+fn encapsV(comptime K: type, ek: K.EncapsKey, coins: *const [K.coins_bytes]u8) struct { ct: K.Ciphertext, ss: K.SharedSecret } {
+    var r: struct { ct: K.Ciphertext, ss: K.SharedSecret } = undefined;
+    K.encaps(&r.ct, &r.ss, &ek, coins);
+    return .{ .ct = r.ct, .ss = r.ss };
+}
+fn decapsV(comptime K: type, dk: K.DecapsKey, ct: K.Ciphertext) K.SharedSecret {
+    var ss: K.SharedSecret = undefined;
+    K.decaps(&ss, &dk, &ct);
+    return ss;
 }

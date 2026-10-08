@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING, HIGH: HQC-KEM left its secrets on the dead stack.** New
+  ReleaseFast stack probe (`stackprobe_test.zig`, all three sets), 5 calls each, before → after
+  (HQC-128 / HQC-256): `keypair` the seed, the PKE seed 30, sigma 25 and the secret half of dk
+  65 / 105 windows; `encaps` m 15 / 30, the shared secret K 20, the PKE randomness seed theta
+  30; `decaps` m' 25 / 50, K 10, theta' 20, the implicit-rejection key K_bar 10 and sigma —
+  all now 0 (the `secureZero`s already in `decaps` covered its own locals, not the frames
+  below). Secrets in by pointer, out through an out-param, bodies one frame down and burned with
+  a per-set size (`burn.zig`):
+  - `keypair(out: *KeyPair, seed_kem: *const [32]u8)`;
+    `encaps(ct_out: *Ciphertext, ss_out: *SharedSecret, ek: *const EncapsKey, coins)`;
+    `decaps(ss_out: *SharedSecret, dk: *const DecapsKey, ct: *const Ciphertext)`;
+    new `KeyPair.wipe`.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
   bodies are now generic over their source and run by testkit's deterministic
   driver `HQC_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in

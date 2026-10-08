@@ -34,8 +34,9 @@ const coconut = @import("coconut");
 // Setup + trusted-dealer threshold keygen (t-of-n over q attributes).
 const p = try coconut.Parameters.generate(allocator, q);
 defer p.deinit(allocator);
-const keys = try coconut.keygen(allocator, io, q, t, n); // io: std.Io — draws fail closed
-defer keys.deinit(allocator);
+var keys: coconut.ThresholdKeys = undefined; // the secrets are written here, not returned
+try coconut.keygen(&keys, allocator, io, q, t, n); // io: std.Io — draws fail closed
+defer keys.deinit(allocator); // wipes the master key and every share
 
 // Group verification key from any t vk shares (Lagrange-in-exponent) — REAL.
 const vk = try coconut.aggregateVerificationKeys(allocator, keys.vk_shares[0..t]);
@@ -45,7 +46,7 @@ defer vk.deinit(allocator);
 const h = p.commonBase(&attributes);
 
 // Fable cores (threshold-issue → aggregate → selective-disclosure show → verify):
-const partial = try coconut.signPartial(keys.sk_shares[j], h, &attributes);
+const partial = try coconut.signPartial(&keys.sk_shares[j], h, &attributes); // the share by pointer
 const cred    = try coconut.aggregateCredential(allocator, partials, t);
 // `context` = the verifier's fresh nonce + its name; the proof answers only that.
 const proof   = try coconut.proveCredential(allocator, io, p, vk, cred, &attributes, &disclosed, context);

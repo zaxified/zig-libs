@@ -33,7 +33,10 @@ pub fn main() !void {
 
     var seed: [32]u8 = undefined; // params.seed_bytes
     random.bytes(&seed);
-    const kp = Kem.keypair(&seed);
+    // The key pair and the shared secrets are secrets: written in place.
+    var kp: Kem.KeyPair = undefined;
+    Kem.keypair(&kp, &seed);
+    defer kp.wipe();
 
     std.debug.print("Hqc128: ek={d}B dk={d}B ct={d}B ss={d}B coins={d}B\n", .{
         Kem.ek_bytes, Kem.dk_bytes, Kem.ct_bytes, Kem.ss_bytes, Kem.coins_bytes,
@@ -42,20 +45,24 @@ pub fn main() !void {
     // Bob encapsulates to Alice's encapsulation key.
     var coins: [Kem.coins_bytes]u8 = undefined;
     random.bytes(&coins);
-    const encapsed = Kem.encaps(kp.ek, &coins);
+    var ct: Kem.Ciphertext = undefined;
+    var ss_bob: Kem.SharedSecret = undefined;
+    Kem.encaps(&ct, &ss_bob, &kp.ek, &coins);
 
     // Alice decapsulates with her decapsulation key.
-    const ss_alice = Kem.decaps(kp.dk, encapsed.ct);
-    if (!std.mem.eql(u8, &ss_alice, &encapsed.ss)) @panic("shared secrets must agree on a genuine exchange");
+    var ss_alice: Kem.SharedSecret = undefined;
+    Kem.decaps(&ss_alice, &kp.dk, &ct);
+    if (!std.mem.eql(u8, &ss_alice, &ss_bob)) @panic("shared secrets must agree on a genuine exchange");
     std.debug.print("shared secret agreed, {d} bytes\n", .{ss_alice.len});
 
     // Tamper with one ciphertext byte and decapsulate again. No error is
     // raised -- decaps has no fallible return at all, by design (implicit
     // rejection) -- but the recovered secret must silently diverge from
     // the genuine one, which is the only signal a caller gets.
-    var tampered_ct = encapsed.ct;
+    var tampered_ct = ct;
     tampered_ct[0] ^= 0x01;
-    const ss_tampered = Kem.decaps(kp.dk, tampered_ct);
-    if (std.mem.eql(u8, &ss_tampered, &encapsed.ss)) @panic("a tampered ciphertext must not decapsulate to the genuine secret");
+    var ss_tampered: Kem.SharedSecret = undefined;
+    Kem.decaps(&ss_tampered, &kp.dk, &tampered_ct);
+    if (std.mem.eql(u8, &ss_tampered, &ss_bob)) @panic("a tampered ciphertext must not decapsulate to the genuine secret");
     std.debug.print("tampered ciphertext correctly diverged (implicit rejection, no error raised)\n", .{});
 }

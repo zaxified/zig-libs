@@ -125,6 +125,20 @@ one code path via two different scalar SOURCES
 follows `frost`'s "nonces are an explicit input" convention
 (`frost/src/root.zig`).
 
+## Secrets: pointers in, out-params out, burned bodies
+
+(2026-10-09) The secret entry points — `keyGen`, `skToPk`, `SecretKey`'s
+codec, `sign`, `proofGen`, `ciphersuite.calculateRandomScalars` — take a secret
+by pointer and return one through an out-param (zeroed on error). Each body is
+a `never_inline` frame and the stack it dirtied is zeroed afterwards
+(`burn.zig`, sizes there with measured depths); `sign`/`proofGen` allocate their
+scratch (message scalars, the `SK || msgs` hash input) through a
+`WipeAllocator`, and only `proofGen`'s returned proof comes from the caller's
+allocator. `stackprobe_test.zig` is the gate: it goes red when a body outgrows
+its burn. The curve arithmetic in `bls12_381` keeps its value API (the burns
+cover its frames). `mockedRandomScalars` returns by value because its output is
+public by construction.
+
 ## Deserialization subgroup-checks every untrusted point
 
 Same pitfall class `bls12_381`'s own `SPEC.md` centers its threat
@@ -211,6 +225,7 @@ check refuses it, and dropping that check survived every KAT.
 
 - ~~**Move the pin from draft-04 to the current draft**~~ — DONE 2026-10-06 (-12, the draft's own vectors byte-exact).
 - ~~**SHAKE-256 ciphersuite**~~ — DONE 2026-10-06 (`bbs.shake256`; `expand_message_xof` in `bls12_381`).
+- **Dead-stack: `verify`/`proofVerify` and the callers' own copies.** Out of scope of the 2026-10-09 sweep: the verifier side holds no secret of its own; `random_scalars`, the messages and the caller's `SecretKey` copies are the caller's to wipe (the example does it for the scalars).
 - **Blind BBS signatures (`draft-irtf-cfrg-bbs-blind-signatures`)** (survey 2026-09-30): lets a holder hide messages from the signer; zkryptium ships it. This SPEC's `commitment` parameter note (draft §5.11) is the hook. Effort: medium. Fits §2.
 - **Pseudonyms / per-verifier linkability (`draft-irtf-cfrg-bbs-per-verifier-linkability`)** (survey 2026-09-30): unlinkable-but-consistent identifiers per verifier, in zkryptium. Effort: medium; depends on the pin move above. Fits §2.
 

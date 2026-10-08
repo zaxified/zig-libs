@@ -40,6 +40,7 @@ const std = @import("std");
 const tlock = @import("tlock");
 const hqc = @import("hqc");
 const envelope = @import("envelope.zig");
+const burn = @import("burn.zig");
 
 const bls12_381 = tlock.bls12_381;
 const g1 = bls12_381.g1;
@@ -96,17 +97,32 @@ pub const StreamOpenError = std.mem.Allocator.Error || error{
 /// `HKDF-SHA256` over `ikm = s_time || s_pq`, `info = label || version ||
 /// suite_id || u64be(round) || transcript_hash`, 32 octets: the STREAM key.
 /// `transcript_hash` is `SHA-256` of the header and both lock ciphertexts.
+///
+/// The key is written to `out`; the secrets come in by pointer, and the body
+/// runs one frame down and is burned after (`burn.zig`).
 pub fn deriveStreamKey(
-    s_time: [envelope.time_secret_bytes]u8,
-    s_pq: [hqc.params.shared_secret_bytes]u8,
+    out: *[32]u8,
+    s_time: *const [envelope.time_secret_bytes]u8,
+    s_pq: *const [hqc.params.shared_secret_bytes]u8,
     suite_id: u8,
     round: u64,
-    transcript_hash: [Sha256.digest_length]u8,
-) [32]u8 {
+    transcript_hash: *const [Sha256.digest_length]u8,
+) void {
+    burn.run(burn.kdf_burn, void, deriveStreamKeyBody, .{ out, s_time, s_pq, suite_id, round, transcript_hash });
+}
+
+fn deriveStreamKeyBody(
+    out: *[32]u8,
+    s_time: *const [envelope.time_secret_bytes]u8,
+    s_pq: *const [hqc.params.shared_secret_bytes]u8,
+    suite_id: u8,
+    round: u64,
+    transcript_hash: *const [Sha256.digest_length]u8,
+) void {
     var ikm: [envelope.time_secret_bytes + hqc.params.shared_secret_bytes]u8 = undefined;
     defer std.crypto.secureZero(u8, &ikm);
-    @memcpy(ikm[0..envelope.time_secret_bytes], &s_time);
-    @memcpy(ikm[envelope.time_secret_bytes..], &s_pq);
+    @memcpy(ikm[0..envelope.time_secret_bytes], s_time);
+    @memcpy(ikm[envelope.time_secret_bytes..], s_pq);
     var prk = Hkdf.extract(stream_kdf_salt, &ikm);
     defer std.crypto.secureZero(u8, &prk);
 
@@ -116,11 +132,9 @@ pub fn deriveStreamKey(
     info[l] = stream_version;
     info[l + 1] = suite_id;
     std.mem.writeInt(u64, info[l + 2 ..][0..8], round, .big);
-    @memcpy(info[l + 10 ..], &transcript_hash);
+    @memcpy(info[l + 10 ..], transcript_hash);
 
-    var key: [32]u8 = undefined;
-    Hkdf.expand(&key, &info, prk);
-    return key;
+    Hkdf.expand(out, &info, prk);
 }
 
 /// The streaming seal/open pair for one HQC parameter set; reached as
@@ -143,10 +157,22 @@ pub fn Stream(comptime Kem: type) type {
             gpa: std.mem.Allocator,
             writer: *std.Io.Writer,
             reader: *std.Io.Reader,
-            recipient_ek: Kem.EncapsKey,
+            recipient_ek: *const Kem.EncapsKey,
             p_pub: g2.Affine,
             round: u64,
-            rnd: Env.SealRandomness,
+            rnd: *const Env.SealRandomness,
+        ) StreamSealError!void {
+            return burn.run(burn.envelope_burn, StreamSealError!void, sealBody, .{ gpa, writer, reader, recipient_ek, p_pub, round, rnd });
+        }
+
+        fn sealBody(
+            gpa: std.mem.Allocator,
+            writer: *std.Io.Writer,
+            reader: *std.Io.Reader,
+            recipient_ek: *const Kem.EncapsKey,
+            p_pub: g2.Affine,
+            round: u64,
+            rnd: *const Env.SealRandomness,
         ) StreamSealError!void {
             const buf = try gpa.alloc(u8, chunk_bytes + 1 + sealed_chunk_bytes);
             defer {
@@ -155,7 +181,9 @@ pub fn Stream(comptime Kem: type) type {
             }
 
             const tl = tlock.encrypt(p_pub, round, &rnd.s_time, &rnd.tlock_sigma);
-            const enc = Kem.encaps(recipient_ek, &rnd.kem_coins);
+            var enc: struct { ct: Kem.Ciphertext, ss: Kem.SharedSecret } = undefined;
+            defer std.crypto.secureZero(u8, &enc.ss);
+            Kem.encaps(&enc.ct, &enc.ss, recipient_ek, &rnd.kem_coins);
 
             var prefix: [prefix_bytes]u8 = undefined;
             @memcpy(prefix[0..4], &envelope.magic);
@@ -168,7 +196,8 @@ pub fn Stream(comptime Kem: type) type {
 
             var th: [Sha256.digest_length]u8 = undefined;
             Sha256.hash(&prefix, &th, .{});
-            var stream_key = deriveStreamKey(rnd.s_time, enc.ss, Env.suite_id, round, th);
+            var stream_key: [32]u8 = undefined;
+            deriveStreamKeyBody(&stream_key, &rnd.s_time, &enc.ss, Env.suite_id, round, &th);
             defer std.crypto.secureZero(u8, &stream_key);
             var ps: PayloadStream = undefined;
             ps.init(&stream_key);
@@ -202,7 +231,17 @@ pub fn Stream(comptime Kem: type) type {
             gpa: std.mem.Allocator,
             writer: *std.Io.Writer,
             reader: *std.Io.Reader,
-            recipient_dk: Kem.DecapsKey,
+            recipient_dk: *const Kem.DecapsKey,
+            round_signature: g1.Affine,
+        ) StreamOpenError!void {
+            return burn.run(burn.envelope_burn, StreamOpenError!void, openBody, .{ gpa, writer, reader, recipient_dk, round_signature });
+        }
+
+        fn openBody(
+            gpa: std.mem.Allocator,
+            writer: *std.Io.Writer,
+            reader: *std.Io.Reader,
+            recipient_dk: *const Kem.DecapsKey,
             round_signature: g1.Affine,
         ) StreamOpenError!void {
             var prefix: [prefix_bytes]u8 = undefined;
@@ -221,12 +260,14 @@ pub fn Stream(comptime Kem: type) type {
             defer std.crypto.secureZero(u8, &s_time);
             // Implicit rejection: a wrong key gives a pseudo-random s_pq,
             // which surfaces as AuthFailed on the first chunk.
-            var s_pq = Kem.decaps(recipient_dk, prefix[stream_header_bytes + Env.time_lock_bytes ..][0..Env.pq_lock_bytes].*);
+            var s_pq: Kem.SharedSecret = undefined;
+            Kem.decaps(&s_pq, recipient_dk, prefix[stream_header_bytes + Env.time_lock_bytes ..][0..Env.pq_lock_bytes]);
             defer std.crypto.secureZero(u8, &s_pq);
 
             var th: [Sha256.digest_length]u8 = undefined;
             Sha256.hash(&prefix, &th, .{});
-            var stream_key = deriveStreamKey(s_time, s_pq, Env.suite_id, round, th);
+            var stream_key: [32]u8 = undefined;
+            deriveStreamKeyBody(&stream_key, &s_time, &s_pq, Env.suite_id, round, &th);
             defer std.crypto.secureZero(u8, &stream_key);
             var ps: PayloadStream = undefined;
             ps.init(&stream_key);
@@ -267,21 +308,32 @@ test "deriveStreamKey matches an independent Python HKDF recomputation" {
     // Python hmac/hashlib, 2026-10-06: HKDF-SHA256(salt = stream_kdf_salt,
     // ikm = 0xA1^16 || 0xB2^32, info = "TLE2-stream-key" || 0x02 || 0x10 ||
     // be64(42) || 0xC3^32), 32 octets.
-    const k = deriveStreamKey([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 42, [_]u8{0xC3} ** 32);
+    const k = deriveStreamKeyV([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 42, [_]u8{0xC3} ** 32);
     var want: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&want, "01c4b91de51f4744107c149831848382412854ed7747b20f9130711bbbeaa44d");
     try testing.expectEqualSlices(u8, &want, &k);
 }
 
 test "deriveStreamKey: each input separates the key, and it never equals version 1's" {
-    const base = deriveStreamKey([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 42, [_]u8{0xC3} ** 32);
+    const base = deriveStreamKeyV([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 42, [_]u8{0xC3} ** 32);
     const variants = [_][32]u8{
-        deriveStreamKey([_]u8{0} ** 16, [_]u8{0xB2} ** 32, 16, 42, [_]u8{0xC3} ** 32),
-        deriveStreamKey([_]u8{0xA1} ** 16, [_]u8{0} ** 32, 16, 42, [_]u8{0xC3} ** 32),
-        deriveStreamKey([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 32, 42, [_]u8{0xC3} ** 32),
-        deriveStreamKey([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 43, [_]u8{0xC3} ** 32),
-        deriveStreamKey([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 42, [_]u8{0xC4} ** 32),
-        envelope.deriveKeys([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 42).key,
+        deriveStreamKeyV([_]u8{0} ** 16, [_]u8{0xB2} ** 32, 16, 42, [_]u8{0xC3} ** 32),
+        deriveStreamKeyV([_]u8{0xA1} ** 16, [_]u8{0} ** 32, 16, 42, [_]u8{0xC3} ** 32),
+        deriveStreamKeyV([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 32, 42, [_]u8{0xC3} ** 32),
+        deriveStreamKeyV([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 43, [_]u8{0xC3} ** 32),
+        deriveStreamKeyV([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 42, [_]u8{0xC4} ** 32),
+        blk: {
+            var k: envelope.DerivedKeys = undefined;
+            envelope.deriveKeys(&k, &([_]u8{0xA1} ** 16), &([_]u8{0xB2} ** 32), 16, 42);
+            break :blk k.key;
+        },
     };
     for (variants) |v| try testing.expect(!std.mem.eql(u8, &base, &v));
+}
+
+/// Test helper: the stream key as a value.
+fn deriveStreamKeyV(s_time: [envelope.time_secret_bytes]u8, s_pq: [hqc.params.shared_secret_bytes]u8, suite: u8, round: u64, th: [Sha256.digest_length]u8) [32]u8 {
+    var k: [32]u8 = undefined;
+    deriveStreamKey(&k, &s_time, &s_pq, suite, round, &th);
+    return k;
 }

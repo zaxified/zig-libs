@@ -49,7 +49,7 @@ fn checkKat(comptime Kem: type, vec: v.Vector) !void {
 
     var seed_kem: [params.seed_bytes]u8 = undefined;
     rsp_prng.getBytes(&seed_kem);
-    const kp = Kem.keypair(&seed_kem);
+    const kp = keypairV(Kem, &seed_kem);
 
     const want_pk = hexBytes(Kem.ek_bytes, vec.pk);
     try testing.expectEqualSlices(u8, &want_pk, &kp.ek);
@@ -58,7 +58,7 @@ fn checkKat(comptime Kem: type, vec: v.Vector) !void {
 
     var coins: [Kem.coins_bytes]u8 = undefined;
     rsp_prng.getBytes(&coins);
-    const enc = Kem.encaps(kp.ek, &coins);
+    const enc = encapsV(Kem, kp.ek, &coins);
 
     const want_ct = hexBytes(Kem.ct_bytes, vec.ct);
     try testing.expectEqualSlices(u8, &want_ct, &enc.ct);
@@ -69,7 +69,7 @@ fn checkKat(comptime Kem: type, vec: v.Vector) !void {
     // .rsp itself doesn't publish this as a separate field -- it's what
     // main_kat.c's own internal `memcmp(ss, ss1, ...)` self-check
     // verifies -- so this is us reproducing that self-check).
-    const dec_ss = Kem.decaps(kp.dk, enc.ct);
+    const dec_ss = decapsV(Kem, kp.dk, enc.ct);
     try testing.expectEqualSlices(u8, &want_ss, &dec_ss);
 }
 
@@ -93,13 +93,13 @@ fn testRoundTrip(comptime Kem: type, seed_val: u64) !void {
 
     var seed_kem: [params.seed_bytes]u8 = undefined;
     random.bytes(&seed_kem);
-    const kp = Kem.keypair(&seed_kem);
+    const kp = keypairV(Kem, &seed_kem);
 
     var coins: [Kem.coins_bytes]u8 = undefined;
     random.bytes(&coins);
-    const enc = Kem.encaps(kp.ek, &coins);
+    const enc = encapsV(Kem, kp.ek, &coins);
 
-    const dec_ss = Kem.decaps(kp.dk, enc.ct);
+    const dec_ss = decapsV(Kem, kp.dk, enc.ct);
     try testing.expectEqualSlices(u8, &enc.ss, &dec_ss);
 }
 
@@ -123,30 +123,30 @@ fn testImplicitReject(comptime Kem: type, seed_val: u64) !void {
 
     var seed_kem: [params.seed_bytes]u8 = undefined;
     random.bytes(&seed_kem);
-    const kp = Kem.keypair(&seed_kem);
+    const kp = keypairV(Kem, &seed_kem);
 
     var coins: [Kem.coins_bytes]u8 = undefined;
     random.bytes(&coins);
-    const enc = Kem.encaps(kp.ek, &coins);
+    const enc = encapsV(Kem, kp.ek, &coins);
 
     // Flip one bit inside u (the ciphertext's leading component) --
     // decaps must not crash, and must NOT recover the real ss.
     var corrupted = enc.ct;
     corrupted[0] ^= 0x01;
 
-    const rejected_ss = Kem.decaps(kp.dk, corrupted);
+    const rejected_ss = decapsV(Kem, kp.dk, corrupted);
     try testing.expect(!std.mem.eql(u8, &rejected_ss, &enc.ss));
 
     // The implicit-reject value is J(H(ek), sigma, ct) -- a deterministic
     // hash, not randomness -- so decapsing the same corrupted ct twice
     // must yield the identical rejection value both times.
-    const rejected_ss2 = Kem.decaps(kp.dk, corrupted);
+    const rejected_ss2 = decapsV(Kem, kp.dk, corrupted);
     try testing.expectEqualSlices(u8, &rejected_ss, &rejected_ss2);
 
     // Also corrupt the salt (the ciphertext's tail) -- same contract.
     var corrupted_salt = enc.ct;
     corrupted_salt[corrupted_salt.len - 1] ^= 0x80;
-    const rejected_salt_ss = Kem.decaps(kp.dk, corrupted_salt);
+    const rejected_salt_ss = decapsV(Kem, kp.dk, corrupted_salt);
     try testing.expect(!std.mem.eql(u8, &rejected_salt_ss, &enc.ss));
 }
 
@@ -170,10 +170,10 @@ fn testRejectionKeyIsJ(comptime Kem: type, seed_val: u64) !void {
     const random = rng.random();
     var seed_kem: [params.seed_bytes]u8 = undefined;
     random.bytes(&seed_kem);
-    const kp = Kem.keypair(&seed_kem);
+    const kp = keypairV(Kem, &seed_kem);
     var coins: [Kem.coins_bytes]u8 = undefined;
     random.bytes(&coins);
-    const enc = Kem.encaps(kp.ek, &coins);
+    const enc = encapsV(Kem, kp.ek, &coins);
 
     var corrupted = enc.ct;
     corrupted[Kem.Ring.n_bytes + 3] ^= 0x10; // inside v
@@ -185,13 +185,13 @@ fn testRejectionKeyIsJ(comptime Kem: type, seed_val: u64) !void {
     prng.hashH(&h_ek, &kp.ek);
     var want: [Kem.ss_bytes]u8 = undefined;
     prng.hashJ(&want, &h_ek, sigma, &corrupted);
-    try testing.expectEqualSlices(u8, &want, &Kem.decaps(kp.dk, corrupted));
+    try testing.expectEqualSlices(u8, &want, &decapsV(Kem, kp.dk, corrupted));
 
     // A different sigma changes the rejection key and nothing else.
     var dk2 = kp.dk;
     dk2[sigma_off] ^= 0x01;
-    try testing.expect(!std.mem.eql(u8, &want, &Kem.decaps(dk2, corrupted)));
-    try testing.expectEqualSlices(u8, &enc.ss, &Kem.decaps(dk2, enc.ct));
+    try testing.expect(!std.mem.eql(u8, &want, &decapsV(Kem, dk2, corrupted)));
+    try testing.expectEqualSlices(u8, &enc.ss, &decapsV(Kem, dk2, enc.ct));
 }
 
 test "implicit reject: the rejection key is J(H(ek), sigma, c) over the received ciphertext" {
@@ -220,11 +220,11 @@ fn testImplicitRejectEveryComponent(comptime Kem: type, seed_val: u64) !void {
 
     var seed_kem: [params.seed_bytes]u8 = undefined;
     random.bytes(&seed_kem);
-    const kp = Kem.keypair(&seed_kem);
+    const kp = keypairV(Kem, &seed_kem);
 
     var coins: [Kem.coins_bytes]u8 = undefined;
     random.bytes(&coins);
-    const enc = Kem.encaps(kp.ek, &coins);
+    const enc = encapsV(Kem, kp.ek, &coins);
 
     const u_bytes = Kem.Ring.n_bytes;
     const v_bytes = Kem.Pke.Code.codeword_len;
@@ -245,7 +245,7 @@ fn testImplicitRejectEveryComponent(comptime Kem: type, seed_val: u64) !void {
         while (pos < r.end) : (pos += step) {
             var corrupted = enc.ct;
             corrupted[pos] ^= 0x01;
-            const rejected = Kem.decaps(kp.dk, corrupted);
+            const rejected = decapsV(Kem, kp.dk, corrupted);
             t.expect(!std.mem.eql(u8, &rejected, &enc.ss)) catch |err| {
                 std.debug.print("component {s} byte {d}: decaps accepted the corrupted ciphertext as genuine\n", .{ r.name, pos });
                 return err;
@@ -281,15 +281,15 @@ fn testImplicitRejectNotSigma(comptime Kem: type, seed_val: u64) !void {
 
     var seed_kem: [params.seed_bytes]u8 = undefined;
     random.bytes(&seed_kem);
-    const kp = Kem.keypair(&seed_kem);
+    const kp = keypairV(Kem, &seed_kem);
 
     var coins: [Kem.coins_bytes]u8 = undefined;
     random.bytes(&coins);
-    const enc = Kem.encaps(kp.ek, &coins);
+    const enc = encapsV(Kem, kp.ek, &coins);
 
     var corrupted = enc.ct;
     corrupted[0] ^= 0x01;
-    const rejected = Kem.decaps(kp.dk, corrupted);
+    const rejected = decapsV(Kem, kp.dk, corrupted);
 
     // dk_kem = ek || dk_pke(seed_bytes) || sigma(security_bytes) || seed_kem
     // (kem.zig's `keypair` doc). `sigma` is the implicit-rejection secret;
@@ -312,11 +312,11 @@ fn testImplicitRejectDependsOnCt(comptime Kem: type, seed_val: u64) !void {
 
     var seed_kem: [params.seed_bytes]u8 = undefined;
     random.bytes(&seed_kem);
-    const kp = Kem.keypair(&seed_kem);
+    const kp = keypairV(Kem, &seed_kem);
 
     var coins: [Kem.coins_bytes]u8 = undefined;
     random.bytes(&coins);
-    const enc = Kem.encaps(kp.ek, &coins);
+    const enc = encapsV(Kem, kp.ek, &coins);
 
     const u_bytes = Kem.Ring.n_bytes;
     const v_bytes = Kem.Pke.Code.codeword_len;
@@ -328,9 +328,9 @@ fn testImplicitRejectDependsOnCt(comptime Kem: type, seed_val: u64) !void {
     var corrupt_salt = enc.ct;
     corrupt_salt[u_bytes + v_bytes] ^= 0x01; // inside salt
 
-    const reject_u = Kem.decaps(kp.dk, corrupt_u);
-    const reject_v = Kem.decaps(kp.dk, corrupt_v);
-    const reject_salt = Kem.decaps(kp.dk, corrupt_salt);
+    const reject_u = decapsV(Kem, kp.dk, corrupt_u);
+    const reject_v = decapsV(Kem, kp.dk, corrupt_v);
+    const reject_salt = decapsV(Kem, kp.dk, corrupt_salt);
 
     // Three DIFFERENT corrupted ciphertexts must produce three DIFFERENT
     // rejection values. An honest implementation hashes over the literal
@@ -368,7 +368,7 @@ var fuzz_kp: ?Kem128.KeyPair = null;
 fn fuzzKeypair() Kem128.KeyPair {
     if (fuzz_kp) |kp| return kp;
     const seed_kem = [_]u8{0x37} ** params.seed_bytes;
-    fuzz_kp = Kem128.keypair(&seed_kem);
+    fuzz_kp = keypairV(Kem128, &seed_kem);
     return fuzz_kp.?;
 }
 
@@ -393,22 +393,22 @@ pub fn decapsHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     src.bytes(&ct);
     switch (src.index(3)) {
         0 => {
-            _ = Kem128.decaps(kp.dk, ct);
+            _ = decapsV(Kem128, kp.dk, ct);
             fuzz_test.mark(.arbitrary);
         },
         else => |mode| {
             var coins: [Kem128.coins_bytes]u8 = undefined;
             src.bytes(&coins);
-            const enc = Kem128.encaps(kp.ek, &coins);
+            const enc = encapsV(Kem128, kp.ek, &coins);
             if (mode == 1) {
-                const ss = Kem128.decaps(kp.dk, enc.ct);
+                const ss = decapsV(Kem128, kp.dk, enc.ct);
                 if (!std.mem.eql(u8, &ss, &enc.ss)) return error.GenuineCiphertextDecapsDiffers;
                 fuzz_test.mark(.roundtrip);
             } else {
                 var bad = enc.ct;
                 const bit = src.index(bad.len * 8);
                 bad[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
-                const ss = Kem128.decaps(kp.dk, bad);
+                const ss = decapsV(Kem128, kp.dk, bad);
                 if (std.mem.eql(u8, &ss, &enc.ss)) return error.TamperedCiphertextAccepted;
                 fuzz_test.mark(.implicit_reject);
             }
@@ -418,4 +418,22 @@ pub fn decapsHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
 
 test "fuzz: decaps never panics on arbitrary ciphertext bytes" {
     try std.testing.fuzz({}, fuzzDecaps, .{});
+}
+
+// Value-returning wrappers over the pointer/out-param KEM API, for tests and
+// benchmarks that compare values; library callers use the real API.
+fn keypairV(comptime K: type, seed: *const [32]u8) K.KeyPair {
+    var kp: K.KeyPair = undefined;
+    K.keypair(&kp, seed);
+    return kp;
+}
+fn encapsV(comptime K: type, ek: K.EncapsKey, coins: *const [K.coins_bytes]u8) struct { ct: K.Ciphertext, ss: K.SharedSecret } {
+    var r: struct { ct: K.Ciphertext, ss: K.SharedSecret } = undefined;
+    K.encaps(&r.ct, &r.ss, &ek, coins);
+    return .{ .ct = r.ct, .ss = r.ss };
+}
+fn decapsV(comptime K: type, dk: K.DecapsKey, ct: K.Ciphertext) K.SharedSecret {
+    var ss: K.SharedSecret = undefined;
+    K.decaps(&ss, &dk, &ct);
+    return ss;
 }

@@ -282,7 +282,7 @@ fn runAuthoritySign(allocator: std.mem.Allocator, tainted: bool) !void {
     // (the same reason `ct25519`/`bls12_381`'s harnesses do not scrub
     // their secrets either); production callers still own that contract.
     const share = coconut.SecretKeyShare{ .index = 1, .x = x, .ys = &ys };
-    const partial = try coconut.signPartial(share, h, &attrs);
+    const partial = try coconut.signPartial(&share, h, &attrs);
 
     std.debug.print("partial.s={x}\n", .{bls.g1.toBytesCompressed(partial.s)});
 }
@@ -319,11 +319,12 @@ fn runUserShow(allocator: std.mem.Allocator, tainted: bool) !void {
     defer p.deinit(allocator);
 
     var prng = std.Random.DefaultPrng.init(0xC0C0_C0C0);
-    var kk = try coconut.keygenSeededForTest(allocator, prng.random(), q, 2, 3);
+    var kk: coconut.ThresholdKeys = undefined;
+    try coconut.keygenSeededForTest(&kk, allocator, prng.random(), q, 2, 3);
     defer kk.deinit(allocator);
     const setup_attrs = [_]Fr{ frOf(1), frOf(2), frOf(3), frOf(4) };
     const setup_h = p.commonBase(&setup_attrs);
-    const cred = coconut.psSignWithSecret(kk.master_sk, setup_h, &setup_attrs);
+    const cred = coconut.psSignWithSecret(&kk.master_sk, setup_h, &setup_attrs);
 
     var attrs: [q]Fr = undefined;
     for (&attrs, 0..) |*m, i| m.* = try secretFr("ctgrind-coconut-user-show-attr-v1", @as(u64, i), tainted);

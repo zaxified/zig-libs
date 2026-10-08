@@ -260,6 +260,7 @@ them. Do not use either outside a test.
 
 ## Backlog / deferred
 
+- **Dead-stack sweep of blind issuance** (2026-10-09): when blind issuance lands, the user's ElGamal secret key, the blinding factors `o`/`k`, the hidden attributes in the request and the unblinding all need the same treatment as `keygen`/`proveCredential` (pointer in, out-param out, burned body, a probe needle for each); `stackprobe_test.zig` has no needle for them because the module has none of these paths yet. Also open: the `Entropy.io` arm is not probed (it differs from the seeded one only in `Fr.random`, swept in `bls12_381`).
 - **Blind issuance (paper §4.3) — ElGamal-encrypted private attributes, formation NIZK `pi_s`, `blindSign`, `unblind`** (survey 2026-09-30): this is the reason to pick Coconut over threshold PS; without it the issuing authorities learn every attribute, so the privacy claim is only "hidden from the verifier". Already SPEC §6 "Deferred increments"; `params.hs` is already carried for it. Effort: medium (a new NIZK with its own transcript; the most soundness-critical new code). Fits CONVENTIONS §2.
 - **Dealer-free key generation for BLS12-381** (survey 2026-09-30): `keygen` is a trusted dealer; `dkg` targets secp256k1 only. A Pedersen/Feldman DKG over `Fr` of `bls12_381` (the shape `dkg` already has) would remove the dealer. Effort: medium; fits §2.
 

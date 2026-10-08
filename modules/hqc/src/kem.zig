@@ -49,6 +49,7 @@ const params = @import("params.zig");
 const gf2x = @import("gf2x.zig");
 const prng = @import("prng.zig");
 const pke = @import("pke.zig");
+const burn = @import("burn.zig");
 
 /// The HQC-KEM scheme for one parameter set.
 pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) type {
@@ -80,7 +81,17 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
         pub const Ciphertext = [ct_bytes]u8;
         pub const SharedSecret = [ss_bytes]u8;
 
-        pub const KeyPair = struct { ek: EncapsKey, dk: DecapsKey };
+        pub const KeyPair = struct {
+            ek: EncapsKey,
+            dk: DecapsKey,
+
+            /// Zero the whole pair (`dk` is secret; `ek` is cheap to wipe too).
+            pub fn wipe(self: *KeyPair) void {
+                std.crypto.secureZero(u8, std.mem.asBytes(self));
+            }
+        };
+
+        const burns = burn.sizes(security_bytes);
 
         comptime {
             std.debug.assert(dk_bytes == ek_bytes + params.seed_bytes + security_bytes + params.seed_bytes);
@@ -96,7 +107,14 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
         ///   (ek_pke, dk_pke) = Pke.keygen(seed_pke)
         ///   ek_kem = ek_pke
         ///   dk_kem = ek_kem || dk_pke || sigma || seed_kem
-        pub fn keypair(seed_kem: *const [params.seed_bytes]u8) KeyPair {
+        ///
+        /// The key pair is written to `out`; the body runs one frame down and
+        /// the stack it dirtied is zeroed after it (`burn.zig`).
+        pub fn keypair(out: *KeyPair, seed_kem: *const [params.seed_bytes]u8) void {
+            burn.run(burns.keypair, void, keypairBody, .{ out, seed_kem });
+        }
+
+        fn keypairBody(out: *KeyPair, seed_kem: *const [params.seed_bytes]u8) void {
             var xof = prng.Xof.init(seed_kem);
             var seed_pke: [params.seed_bytes]u8 = undefined;
             xof.getBytes(&seed_pke);
@@ -105,7 +123,7 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
 
             const pke_kp = Pke.keygen(&seed_pke);
 
-            var dk: DecapsKey = undefined;
+            const dk = &out.dk;
             var off: usize = 0;
             @memcpy(dk[off..][0..ek_bytes], &pke_kp.ek);
             off += ek_bytes;
@@ -114,8 +132,7 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
             @memcpy(dk[off..][0..security_bytes], &sigma);
             off += security_bytes;
             @memcpy(dk[off..][0..params.seed_bytes], seed_kem);
-
-            return .{ .ek = pke_kp.ek, .dk = dk };
+            out.ek = pke_kp.ek;
         }
 
         fn serializeCt(u: Ring.Elem, v: Pke.Code.Codeword, salt: [params.salt_bytes]u8) Ciphertext {
@@ -153,24 +170,28 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
         ///   c = Pke.encrypt(ek, m, theta)
         ///   ct = u || v || salt
         ///   ss = K
-        pub fn encaps(ek: EncapsKey, coins: *const [coins_bytes]u8) struct { ct: Ciphertext, ss: SharedSecret } {
+        ///
+        /// The ciphertext and the shared secret are written to `ct_out` and
+        /// `ss_out`; the body runs one frame down and the stack it dirtied
+        /// (m, K, theta, the PKE randomness) is zeroed after it.
+        pub fn encaps(ct_out: *Ciphertext, ss_out: *SharedSecret, ek: *const EncapsKey, coins: *const [coins_bytes]u8) void {
+            burn.run(burns.encaps, void, encapsBody, .{ ct_out, ss_out, ek, coins });
+        }
+
+        fn encapsBody(ct_out: *Ciphertext, ss_out: *SharedSecret, ek: *const EncapsKey, coins: *const [coins_bytes]u8) void {
             const m: Message = coins[0..security_bytes].*;
             const salt: [params.salt_bytes]u8 = coins[security_bytes..coins_bytes].*;
 
             var h_ek: [params.seed_bytes]u8 = undefined;
-            prng.hashH(&h_ek, &ek);
+            prng.hashH(&h_ek, ek);
 
             var k_theta: [64]u8 = undefined;
             prng.hashG(&k_theta, &h_ek, &m, &salt);
             const theta = k_theta[32..64];
 
-            const c = Pke.encrypt(ek, m, theta);
-            const ct = serializeCt(c.u, c.v, salt);
-
-            var ss: SharedSecret = undefined;
-            @memcpy(&ss, k_theta[0..32]);
-
-            return .{ .ct = ct, .ss = ss };
+            const c = Pke.encrypt(ek.*, m, theta);
+            ct_out.* = serializeCt(c.u, c.v, salt);
+            @memcpy(ss_out, k_theta[0..32]);
         }
 
         /// crypto_kem_dec: parse dk_kem = ek || dk_pke || sigma ||
@@ -183,7 +204,15 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
         ///   c' = Pke.encrypt(ek, m', theta'); ct' = u' || v' || salt
         ///   K_bar = J(H_ek, sigma, ct)              [the ORIGINAL ct]
         ///   ss = (ct' == ct) ? K' : K_bar            [constant-time]
-        pub fn decaps(dk: DecapsKey, ct: Ciphertext) SharedSecret {
+        ///
+        /// The shared secret is written to `ss_out`; `dk` and `ct` come in by
+        /// pointer. The body runs one frame down and the stack it dirtied is
+        /// zeroed after it (`burn.zig`).
+        pub fn decaps(ss_out: *SharedSecret, dk: *const DecapsKey, ct: *const Ciphertext) void {
+            burn.run(burns.decaps, void, decapsBody, .{ ss_out, dk, ct });
+        }
+
+        fn decapsBody(ss_out: *SharedSecret, dk: *const DecapsKey, ct: *const Ciphertext) void {
             var off: usize = 0;
             const ek: EncapsKey = dk[off..][0..ek_bytes].*;
             off += ek_bytes;
@@ -196,7 +225,7 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
             var sigma: [security_bytes]u8 = dk[off..][0..security_bytes].*;
             defer std.crypto.secureZero(u8, &sigma);
 
-            const parsed = deserializeCt(ct);
+            const parsed = deserializeCt(ct.*);
             var m_prime = Pke.decrypt(dk_pke, .{ .u = parsed.u, .v = parsed.v });
             defer std.crypto.secureZero(u8, &m_prime);
 
@@ -213,18 +242,16 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
 
             var k_bar: SharedSecret = undefined;
             defer std.crypto.secureZero(u8, &k_bar);
-            prng.hashJ(&k_bar, &h_ek, &sigma, &ct);
+            prng.hashJ(&k_bar, &h_ek, &sigma, ct);
 
             // result: 0 if ct'==ct (match), 1 otherwise — then wrapped
             // -1 so match -> 0xFF (select K'), mismatch -> 0x00 (select
             // K_bar), matching the reference's mask arithmetic exactly.
-            const result: u8 = vectCompare(&ct_prime, &ct) -% 1;
+            const result: u8 = vectCompare(&ct_prime, ct) -% 1;
 
-            var ss: SharedSecret = undefined;
-            for (&ss, k_theta_prime[0..32], k_bar) |*o, kp, kb| {
+            for (ss_out, k_theta_prime[0..32], k_bar) |*o, kp, kb| {
                 o.* = (kp & result) ^ (kb & ~result);
             }
-            return ss;
         }
     };
 }

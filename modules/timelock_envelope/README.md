@@ -59,20 +59,22 @@ const Env = timelock_envelope.Envelope128; // = Envelope(hqc.Hqc128)
 
 // SEAL — needs the recipient's HQC encapsulation key, the beacon master
 // public key, the future round R, and per-seal randomness.
-const rnd = Env.SealRandomness.generate(io);          // production entropy
-const wire = try Env.seal(allocator, plaintext, recipient_ek, p_pub, round, rnd);
+var rnd: Env.SealRandomness = undefined;             // all three fields are secrets
+rnd.generate(io);                                    // production entropy
+defer rnd.wipe();
+const wire = try Env.seal(allocator, plaintext, &recipient_ek, p_pub, round, &rnd);
 defer allocator.free(wire);
 
 // OPEN — needs the recipient's HQC secret key AND the beacon's published
 // signature for `round` (available only at/after R). Returns a typed
 // error, never a garbage plaintext, if either lock is unsatisfied or any
 // byte was tampered with.
-const plaintext = try Env.open(allocator, wire, recipient_dk, round_signature);
+const plaintext = try Env.open(allocator, wire, &recipient_dk, round_signature);
 defer allocator.free(plaintext);
 ```
 
 - `recipient_ek` / `recipient_dk` — an `hqc` KEM keypair
-  (`hqc.Hqc128.keypair(&seed)`), the PQ lock's public/secret halves.
+  (`hqc.Hqc128.keypair(&kp, &seed)`), the PQ lock's public/secret halves.
 - `p_pub` — the drand beacon master public key (`G2`), caller-supplied
   exactly as `tlock` requires (e.g. League-of-Entropy quicknet's).
 - `round_signature` — the beacon's published threshold-BLS signature
@@ -88,13 +90,13 @@ signature), `AuthFailed` (wrong HQC key, or tampered content/header),
 
 ```zig
 // SEAL from any std.Io.Reader to any std.Io.Writer, ~128 KiB of memory.
-try Env.sealStream(gpa, &file_writer.interface, &file_reader.interface, recipient_ek, p_pub, round, rnd);
+try Env.sealStream(gpa, &file_writer.interface, &file_reader.interface, &recipient_ek, p_pub, round, &rnd);
 try file_writer.interface.flush();
 
 // OPEN chunk by chunk. ⚠ Each written chunk is authentic and in order, but
 // the plaintext is COMPLETE only when openStream returns without error —
 // on an error, discard what was written.
-try Env.openStream(gpa, &out_writer.interface, &in_reader.interface, recipient_dk, round_signature);
+try Env.openStream(gpa, &out_writer.interface, &in_reader.interface, &recipient_dk, round_signature);
 ```
 
 Same two locks and the same AND; the content is an age-style STREAM
@@ -110,7 +112,7 @@ the other's wire with `UnsupportedVersion`.
 
 Per the repo convention (`tlock`/`hqc`/`bbs`), `seal`'s randomness is an
 explicit input (`Env.SealRandomness`) so tests are deterministic. Use
-`Env.SealRandomness.generate(io)` in production; supply fixed bytes in a
+`rnd.generate(io)` in production; supply fixed bytes in a
 test. It bundles the time secret, `tlock`'s FO pad, and the HQC encaps
 coins.
 

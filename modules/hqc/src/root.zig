@@ -150,4 +150,5 @@ test {
     _ = @import("kem_kat_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("bench.zig");
+    _ = @import("stackprobe_test.zig");
 }

@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING, HIGH: every BBS entry point left its secrets on the dead stack
+  or in freed heap.** New ReleaseFast stack probe (`stackprobe_test.zig`: stack window plus a
+  scanned heap arena), 5 calls each, before → after: `keyGen` SK 40, the key material 5 and the
+  derive buffer 10; `sign` SK 10 and `1/(SK+e)` 10 on the stack, the message scalars 40 in freed
+  heap; `calculateRandomScalars` the raw entropy 15 and the scalars 170; `proofGen` r1 15, r2 20,
+  e~ 10, r1~ 20, r3~ 20, m~ 20, r3 = 1/r2 20, r1*r2 10, the signature's `e` 30 and `A` 75 on the
+  stack, the undisclosed messages' scalars 20 in freed heap — all now 0 (`skToPk` was 0 before;
+  its API follows the rule). Secrets in by pointer, out through an out-param, bodies one frame
+  down and burned, scratch heap through a `WipeAllocator` (`burn.zig`):
+  - `keyGen(out: *SecretKey, key_material, key_info, key_dst) KeyGenError!void` and
+    `keyGenWith(Suite, out, ..)` (`out` zeroed on error); `skToPk(sk: *const SecretKey)`;
+    `SecretKey.fromBytes(out: *SecretKey, bytes: *const [32]u8)` and
+    `SecretKey.toBytes(self: *const SecretKey, out: *[32]u8)`.
+  - `sign(allocator, sk: *const SecretKey, pk, header, messages)`; `proofGen(allocator, pk,
+    signature: *const [80]u8, header, ph, messages, disclosed_indexes, random_scalars)` (the
+    signature's `A` and `e` link presentations). Same shapes on `Scheme(Suite)`.
+  - `ciphersuite.calculateRandomScalars(out: []Fr, io)` fills the caller's array (was a
+    `comptime count` and a by-value return); the caller wipes it after `proofGen`.
+    `mockedRandomScalars` still returns by value: its output is public by definition.
+  - Not covered: the caller's own copies of `random_scalars` and of the messages, and
+    `expand_message`'s internal hash blocks beyond the burn (not recomputable through the public
+    API; the burn covers them, the probe has no needle for them).
+
 - **2026-10-06** — **ADDED:** the draft's second ciphersuite, **BLS12-381-SHAKE-256**
   (`BBS_BLS12381G1_XOF:SHAKE-256_SSWU_RO_`, draft-12 §7.2.1): `bbs.shake256.sign/verify/proofGen/
   proofVerify`, `bbs.Scheme(Suite)`, `bbs.sha256` (= the top-level functions), `keyGenWith(Suite,

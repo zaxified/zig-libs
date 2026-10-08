@@ -41,8 +41,10 @@ const bbs = @import("bbs");
 ## API
 
 ```zig
-const sk = try bbs.keyGen(key_material, key_info, null); // KeyGen, draft §3.4.1
-const pk = bbs.skToPk(sk);                                 // SkToPk, draft §3.4.2
+var sk: bbs.SecretKey = undefined;
+try bbs.keyGen(&sk, key_material, key_info, null); // KeyGen, draft §3.4.1
+defer sk.deinit();
+const pk = bbs.skToPk(&sk);                        // SkToPk, draft §3.4.2
 
 var gens = try bbs.ciphersuite.createGenerators(allocator, messages.len + 1);
 defer allocator.free(gens);
@@ -58,12 +60,14 @@ const domain = try bbs.ciphersuite.calculateDomain(allocator, pk.toBytes(), q1, 
 The four end-to-end functions are implemented:
 
 ```zig
-const sig = try bbs.sign(allocator, sk, pk, header, messages);       // §3.5.1
+const sig = try bbs.sign(allocator, &sk, pk, header, messages);      // §3.5.1
 const ok = try bbs.verify(allocator, pk, sig, header, messages);     // §3.5.2
 
 // Selective disclosure: reveal only `disclosed_indexes`, hide the rest.
-const rs = bbs.ciphersuite.calculateRandomScalars(5 + u, io);        // bbs.randomScalarCount(u)
-const proof = try bbs.proofGen(allocator, pk, sig, header, ph, messages, disclosed_indexes, &rs);
+var rs: [5 + u]bbs.ciphersuite.Fr = undefined;                       // bbs.randomScalarCount(u)
+bbs.ciphersuite.calculateRandomScalars(&rs, io);
+defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(rs[0..]));
+const proof = try bbs.proofGen(allocator, pk, &sig, header, ph, messages, disclosed_indexes, &rs);
 defer allocator.free(proof);
 const proof_ok = try bbs.proofVerify(allocator, pk, proof, header, ph, disclosed_messages, disclosed_indexes);
 ```
@@ -77,8 +81,9 @@ The top-level functions are BLS12-381-SHA-256 (`bbs.sha256`). The draft's
 second suite, BLS12-381-SHAKE-256, has the same four functions:
 
 ```zig
-const sk = try bbs.keyGenWith(bbs.ciphersuite.Shake256, key_material, key_info, null);
-const sig = try bbs.shake256.sign(allocator, sk, pk, header, messages);
+var sk: bbs.SecretKey = undefined;
+try bbs.keyGenWith(bbs.ciphersuite.Shake256, &sk, key_material, key_info, null);
+const sig = try bbs.shake256.sign(allocator, &sk, pk, header, messages);
 const ok = try bbs.shake256.verify(allocator, pk, sig, header, messages);
 // bbs.shake256.proofGen / bbs.shake256.proofVerify likewise.
 ```
@@ -94,11 +99,24 @@ reading `std.Io`/internal entropy directly — see `root.zig`'s
 
 ```zig
 // Real entropy (production):
-const random_scalars = bbs.ciphersuite.calculateRandomScalars(5 + u, io);
+var random_scalars: [5 + u]bbs.ciphersuite.Fr = undefined;
+bbs.ciphersuite.calculateRandomScalars(&random_scalars, io); // fills the array; wipe it after proofGen
 
 // Deterministic mock RNG (KAT reproducibility, draft §7.1):
 const random_scalars = bbs.ciphersuite.mockedRandomScalars(5 + u, seed);
 ```
+
+## Secrets and the stack
+
+The secret entry points take secrets by pointer (`sk: *const SecretKey`,
+`signature: *const [80]u8`) and hand them back through an out-param
+(`keyGen`, `SecretKey.fromBytes`/`toBytes`, `calculateRandomScalars`), so no
+secret travels through a return slot or an argument copy. Their bodies run one
+frame down and the stack they dirtied is zeroed after them; the heap scratch
+that held message scalars is wiped before it is freed (`src/burn.zig`).
+`src/stackprobe_test.zig` (ReleaseFast) scans the dead stack and a heap arena
+for every secret the entry points handle. What stays with the caller: the
+`random_scalars` array, the messages and its own copy of the key.
 
 ## Import graph
 

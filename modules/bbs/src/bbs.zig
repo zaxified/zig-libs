@@ -38,13 +38,14 @@
 //! at this boundary: `kat_test.zig`'s gated `proofGen` tests pass a
 //! `mockedRandomScalars(5 + U, seed)` slice and assert the exact
 //! resulting proof bytes; a real caller would instead pass
-//! `&calculateRandomScalars(5 + U, io)`.
+//! ``calculateRandomScalars(&rs, io)` into an `[5 + U]Fr`.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const cs = @import("ciphersuite.zig");
 const keys = @import("keys.zig");
 const gate = @import("gate.zig");
+const burn = @import("burn.zig");
 const bls = @import("bls12_381");
 
 pub const G1 = cs.G1;
@@ -506,7 +507,18 @@ pub fn Scheme(comptime Suite: type) type {
         /// ```
         /// Byte-exact against draft-12 §8.4.4 (single and ten messages) and
         /// Appendix D.2.1.1 (no header) — see `kat_test.zig`.
-        pub fn sign(allocator: std.mem.Allocator, sk: SecretKey, pk: PublicKey, header: []const u8, messages: []const []const u8) BbsError![Signature.encoded_bytes]u8 {
+        ///
+        /// `sk` comes in by pointer. The body runs one frame down and the stack
+        /// it dirtied (`SK`, the message scalars, `e`, `1/(SK+e)`) is zeroed
+        /// after it; the heap scratch goes through a `WipeAllocator`
+        /// (`burn.zig`).
+        pub fn sign(allocator: std.mem.Allocator, sk: *const SecretKey, pk: PublicKey, header: []const u8, messages: []const []const u8) BbsError![Signature.encoded_bytes]u8 {
+            return burn.run(burn.sign_burn, BbsError![Signature.encoded_bytes]u8, signBody, .{ allocator, sk, pk, header, messages });
+        }
+
+        fn signBody(backing: std.mem.Allocator, sk: *const SecretKey, pk: PublicKey, header: []const u8, messages: []const []const u8) BbsError![Signature.encoded_bytes]u8 {
+            var wipe: burn.WipeAllocator = .{ .child = backing };
+            const allocator = wipe.allocator();
             const message_scalars = try Suite.messagesToScalars(allocator, messages);
             defer allocator.free(message_scalars);
             const generators = try Suite.createGenerators(allocator, messages.len + 1);
@@ -517,11 +529,8 @@ pub fn Scheme(comptime Suite: type) type {
             // api_id || "H2S_") — draft-12 §3.6.1 step 2; `serialize` per §4.2.4.1
             // is each scalar's 32-byte big-endian encoding, concatenated.
             var e_input: std.ArrayList(u8) = .empty;
-            defer {
-                std.crypto.secureZero(u8, e_input.items); // holds SK
-                e_input.deinit(allocator);
-            }
-            try e_input.appendSlice(allocator, &sk.toBytes());
+            defer e_input.deinit(allocator); // holds SK; `wipe` zeroes every buffer it frees
+            try e_input.appendSlice(allocator, &sk.scalar.toBytes());
             for (message_scalars) |m| try e_input.appendSlice(allocator, &m.toBytes());
             try e_input.appendSlice(allocator, &domain.toBytes());
             const e = Suite.hashToScalar(e_input.items, Suite.h2s_dst);
@@ -633,22 +642,44 @@ pub fn Scheme(comptime Suite: type) type {
         /// ```
         /// Byte-exact (under the draft's mocked RNG, `kat_vectors.mocked_rng`)
         /// against draft-12 §8.4.5 and Appendix D.2.2 — see `kat_test.zig`.
+        ///
+        /// `signature` (its `A` and `e` link presentations) comes in by pointer;
+        /// `random_scalars` is the caller's, who wipes it afterwards. The body
+        /// runs one frame down and the stack it dirtied (the blinding scalars,
+        /// `r3`, the undisclosed messages' scalars) is zeroed after it; the
+        /// heap scratch goes through a `WipeAllocator`, only the returned
+        /// proof is allocated from `allocator` itself (`burn.zig`).
         pub fn proofGen(
             allocator: std.mem.Allocator,
             pk: PublicKey,
-            signature: [Signature.encoded_bytes]u8,
+            signature: *const [Signature.encoded_bytes]u8,
             header: []const u8,
             ph: []const u8,
             messages: []const []const u8,
             disclosed_indexes: []const usize,
             random_scalars: []const Fr,
         ) BbsError![]u8 {
+            return burn.run(burn.proof_burn, BbsError![]u8, proofGenBody, .{ allocator, pk, signature, header, ph, messages, disclosed_indexes, random_scalars });
+        }
+
+        fn proofGenBody(
+            out_allocator: std.mem.Allocator,
+            pk: PublicKey,
+            signature: *const [Signature.encoded_bytes]u8,
+            header: []const u8,
+            ph: []const u8,
+            messages: []const []const u8,
+            disclosed_indexes: []const usize,
+            random_scalars: []const Fr,
+        ) BbsError![]u8 {
+            var wipe: burn.WipeAllocator = .{ .child = out_allocator };
+            const allocator = wipe.allocator();
             if (disclosed_indexes.len > messages.len) return error.TooManyDisclosedIndexes;
             for (disclosed_indexes) |i| if (i >= messages.len) return error.DisclosedIndexOutOfRange;
             const undisclosed_count = messages.len - disclosed_indexes.len;
             if (random_scalars.len != randomScalarCount(undisclosed_count)) return error.RandomScalarCountMismatch;
 
-            const sig = try Signature.fromBytes(signature);
+            const sig = try Signature.fromBytes(signature.*);
 
             const message_scalars = try Suite.messagesToScalars(allocator, messages);
             defer allocator.free(message_scalars);
@@ -712,7 +743,7 @@ pub fn Scheme(comptime Suite: type) type {
             }
 
             const out: Proof = .{ .abar = abar, .bbar = bbar, .d = d, .e_hat = e_hat, .r1_hat = r1_hat, .r3_hat = r3_hat, .m_hat = m_hat, .c = challenge };
-            return try out.toBytes(allocator);
+            return try out.toBytes(out_allocator);
         }
 
         /// FABLE CORE — `ProofVerify(PK, proof, header, ph, disclosed_messages,
@@ -811,6 +842,19 @@ pub const proofVerify = sha256.proofVerify;
 // ── tests (REAL, ungated — Signature/Proof codec only) ───────────────────
 
 const testing = std.testing;
+
+// Test helpers over the pointer/out-param API: tests compare values, library
+// code never returns a secret through the stack.
+fn testSecretKey(bytes: [SecretKey.encoded_bytes]u8) !SecretKey {
+    var sk: SecretKey = undefined;
+    try SecretKey.fromBytes(&sk, &bytes);
+    return sk;
+}
+fn testRandomScalars(comptime count: usize, io: std.Io) [count]Fr {
+    var out: [count]Fr = undefined;
+    cs.calculateRandomScalars(&out, io);
+    return out;
+}
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 /// framing helpers.
 const testkit = @import("testkit");
@@ -908,14 +952,14 @@ test "proofGen validates disclosed_indexes/random_scalars count before touching 
     sig_bytes[G1.compressed_bytes..].* = e_bytes;
     var sk_bytes = [_]u8{0} ** 32;
     sk_bytes[31] = 1;
-    const sk = try SecretKey.fromBytes(sk_bytes);
-    const pk = keys.skToPk(sk);
+    const sk = try testSecretKey(sk_bytes);
+    const pk = keys.skToPk(&sk);
 
     // Too many disclosed indexes: caught before the panic.
     try testing.expectError(error.TooManyDisclosedIndexes, proofGen(
         testing.allocator,
         pk,
-        sig_bytes,
+        &sig_bytes,
         "",
         "",
         &messages,
@@ -927,7 +971,7 @@ test "proofGen validates disclosed_indexes/random_scalars count before touching 
     try testing.expectError(error.DisclosedIndexOutOfRange, proofGen(
         testing.allocator,
         pk,
-        sig_bytes,
+        &sig_bytes,
         "",
         "",
         &messages,
@@ -939,7 +983,7 @@ test "proofGen validates disclosed_indexes/random_scalars count before touching 
     try testing.expectError(error.RandomScalarCountMismatch, proofGen(
         testing.allocator,
         pk,
-        sig_bytes,
+        &sig_bytes,
         "",
         "",
         &messages,
@@ -965,8 +1009,8 @@ test "proofGen REJECTS a duplicate disclosed index instead of silently under-cou
     sig_bytes[G1.compressed_bytes..].* = e_bytes;
     var sk_bytes = [_]u8{0} ** 32;
     sk_bytes[31] = 1;
-    const sk = try SecretKey.fromBytes(sk_bytes);
-    const pk = keys.skToPk(sk);
+    const sk = try testSecretKey(sk_bytes);
+    const pk = keys.skToPk(&sk);
 
     // NONZERO scalars throughout — critically r1, r2 != 0, so this
     // exercises the duplicate-index guard itself rather than the separate
@@ -978,7 +1022,7 @@ test "proofGen REJECTS a duplicate disclosed index instead of silently under-cou
     try testing.expectError(error.RandomScalarCountMismatch, proofGen(
         testing.allocator,
         pk,
-        sig_bytes,
+        &sig_bytes,
         "",
         "",
         &messages,
@@ -990,8 +1034,8 @@ test "proofGen REJECTS a duplicate disclosed index instead of silently under-cou
 test "proofVerify validates disclosed_messages/disclosed_indexes count before touching the core" {
     var sk_bytes = [_]u8{0} ** 32;
     sk_bytes[31] = 1;
-    const sk = try SecretKey.fromBytes(sk_bytes);
-    const pk = keys.skToPk(sk);
+    const sk = try testSecretKey(sk_bytes);
+    const pk = keys.skToPk(&sk);
     try testing.expectError(error.DisclosedMessageCountMismatch, proofVerify(
         testing.allocator,
         pk,
@@ -1012,8 +1056,8 @@ const g1_identity_compressed: [G1.compressed_bytes]u8 = .{0xc0} ++ .{0} ** (G1.c
 fn testKeyPair() !struct { sk: SecretKey, pk: PublicKey } {
     var sk_bytes = [_]u8{0} ** 32;
     sk_bytes[31] = 5;
-    const sk = try SecretKey.fromBytes(sk_bytes);
-    return .{ .sk = sk, .pk = keys.skToPk(sk) };
+    const sk = try testSecretKey(sk_bytes);
+    return .{ .sk = sk, .pk = keys.skToPk(&sk) };
 }
 
 test "Signature/Proof decoders refuse the identity and a point outside G1" {
@@ -1022,7 +1066,7 @@ test "Signature/Proof decoders refuse the identity and a point outside G1" {
 
     const kp = try testKeyPair();
     const messages = [_][]const u8{ "a", "b", "c" };
-    const sig = try sign(testing.allocator, kp.sk, kp.pk, "h", &messages);
+    const sig = try sign(testing.allocator, &kp.sk, kp.pk, "h", &messages);
     _ = try Signature.fromBytes(sig);
     var bad_sig = sig;
     bad_sig[0..G1.compressed_bytes].* = g1_identity_compressed;
@@ -1031,7 +1075,7 @@ test "Signature/Proof decoders refuse the identity and a point outside G1" {
     try testing.expectError(error.InvalidSignatureEncoding, Signature.fromBytes(bad_sig));
 
     const random_scalars = cs.mockedRandomScalars(7, "decoder refusals");
-    const proof = try proofGen(testing.allocator, kp.pk, sig, "h", "", &messages, &.{0}, &random_scalars);
+    const proof = try proofGen(testing.allocator, kp.pk, &sig, "h", "", &messages, &.{0}, &random_scalars);
     defer testing.allocator.free(proof);
     (try Proof.fromBytes(testing.allocator, proof)).deinit(testing.allocator);
     const bad = try testing.allocator.dupe(u8, proof);
@@ -1048,10 +1092,10 @@ test "Signature/Proof decoders refuse the identity and a point outside G1" {
 test "proofGen refuses index == L and too MANY random scalars" {
     const kp = try testKeyPair();
     const messages = [_][]const u8{ "a", "b", "c" };
-    const sig = try sign(testing.allocator, kp.sk, kp.pk, "", &messages);
+    const sig = try sign(testing.allocator, &kp.sk, kp.pk, "", &messages);
     const eight = cs.mockedRandomScalars(8, "too many");
-    try testing.expectError(error.DisclosedIndexOutOfRange, proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{3}, eight[0..7]));
-    try testing.expectError(error.RandomScalarCountMismatch, proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{0}, &eight));
+    try testing.expectError(error.DisclosedIndexOutOfRange, proofGen(testing.allocator, kp.pk, &sig, "", "", &messages, &.{3}, eight[0..7]));
+    try testing.expectError(error.RandomScalarCountMismatch, proofGen(testing.allocator, kp.pk, &sig, "", "", &messages, &.{0}, &eight));
 }
 
 test "proofGen refuses a zero r1 or r2 instead of emitting an identity Abar/Bbar/D" {
@@ -1061,23 +1105,23 @@ test "proofGen refuses a zero r1 or r2 instead of emitting an identity Abar/Bbar
     // 2026-10-06 mutation run found the r1 check unpinned.
     const kp = try testKeyPair();
     const messages = [_][]const u8{ "a", "b", "c" };
-    const sig = try sign(testing.allocator, kp.sk, kp.pk, "", &messages);
+    const sig = try sign(testing.allocator, &kp.sk, kp.pk, "", &messages);
     var rs = cs.mockedRandomScalars(7, "zero blinding");
-    const ok = try proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{0}, &rs);
+    const ok = try proofGen(testing.allocator, kp.pk, &sig, "", "", &messages, &.{0}, &rs);
     testing.allocator.free(ok);
     for ([_]usize{ 0, 1 }) |k| {
         var bad = rs;
         bad[k] = Fr.zero;
-        try testing.expectError(error.RandomScalarCountMismatch, proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{0}, &bad));
+        try testing.expectError(error.RandomScalarCountMismatch, proofGen(testing.allocator, kp.pk, &sig, "", "", &messages, &.{0}, &bad));
     }
 }
 
 test "proofVerify refuses more messages than indexes, index == L, a duplicate index, and a proof over a forged signature" {
     const kp = try testKeyPair();
     const messages = [_][]const u8{ "a", "b", "c" };
-    const sig = try sign(testing.allocator, kp.sk, kp.pk, "", &messages);
+    const sig = try sign(testing.allocator, &kp.sk, kp.pk, "", &messages);
     const random_scalars = cs.mockedRandomScalars(7, "verify refusals");
-    const proof = try proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{0}, &random_scalars);
+    const proof = try proofGen(testing.allocator, kp.pk, &sig, "", "", &messages, &.{0}, &random_scalars);
     defer testing.allocator.free(proof);
     try testing.expect(try proofVerify(testing.allocator, kp.pk, proof, "", "", &.{"a"}, &.{0}));
 
@@ -1094,7 +1138,7 @@ test "proofVerify refuses more messages than indexes, index == L, a duplicate in
     e = e.add(Fr.one);
     forged[G1.compressed_bytes..].* = e.toBytes();
     try testing.expect(!try verify(testing.allocator, kp.pk, forged, "", &messages));
-    const forged_proof = try proofGen(testing.allocator, kp.pk, forged, "", "", &messages, &.{0}, &random_scalars);
+    const forged_proof = try proofGen(testing.allocator, kp.pk, &forged, "", "", &messages, &.{0}, &random_scalars);
     defer testing.allocator.free(forged_proof);
     try testing.expect(!try proofVerify(testing.allocator, kp.pk, forged_proof, "", "", &.{"a"}, &.{0}));
 }
@@ -1129,8 +1173,8 @@ test "RNG seam: calculateRandomScalars really draws entropy, and round-trips thr
     // 128 drawn bytes right after `entropy.fill` left `zig build
     // test-megolm` green on an assertion of this same shape. Not
     // re-measured here, but each scalar's buffer is filled the same way.
-    const scalars1 = cs.calculateRandomScalars(5, io);
-    const scalars2 = cs.calculateRandomScalars(5, io);
+    const scalars1 = testRandomScalars(5, io);
+    const scalars2 = testRandomScalars(5, io);
     var any_differs = false;
     for (scalars1, scalars2) |a, b| {
         if (!a.eql(b)) any_differs = true;
@@ -1143,17 +1187,17 @@ test "RNG seam: calculateRandomScalars really draws entropy, and round-trips thr
     // scalars — r1, r2, e~, r1~, r3~).
     var sk_bytes = [_]u8{0} ** 32;
     sk_bytes[31] = 1;
-    const sk = try SecretKey.fromBytes(sk_bytes);
-    const pk = keys.skToPk(sk);
+    const sk = try testSecretKey(sk_bytes);
+    const pk = keys.skToPk(&sk);
     const messages = [_][]const u8{"only message"};
-    const sig = try sign(testing.allocator, sk, pk, "header", &messages);
+    const sig = try sign(testing.allocator, &sk, pk, "header", &messages);
     try testing.expect(try verify(testing.allocator, pk, sig, "header", &messages));
 
-    const random_scalars = cs.calculateRandomScalars(5, io);
+    const random_scalars = testRandomScalars(5, io);
     const proof = try proofGen(
         testing.allocator,
         pk,
-        sig,
+        &sig,
         "header",
         "",
         &messages,
@@ -1194,22 +1238,22 @@ const Fixtures = struct {
     fn build(self: *Fixtures) void {
         var sk_bytes = [_]u8{0} ** 32;
         sk_bytes[31] = 1;
-        const sk = SecretKey.fromBytes(sk_bytes) catch unreachable;
-        const pk = keys.skToPk(sk);
+        const sk = testSecretKey(sk_bytes) catch unreachable;
+        const pk = keys.skToPk(&sk);
         self.pk = pk.toBytes();
 
         const one = [_][]const u8{"only message"};
-        self.sig = sign(testing.allocator, sk, pk, "header", &one) catch unreachable;
+        self.sig = sign(testing.allocator, &sk, pk, "header", &one) catch unreachable;
 
         const rs0 = cs.mockedRandomScalars(5, "corpus");
-        const p0 = proofGen(testing.allocator, pk, self.sig, "header", "", &one, &.{0}, &rs0) catch unreachable;
+        const p0 = proofGen(testing.allocator, pk, &self.sig, "header", "", &one, &.{0}, &rs0) catch unreachable;
         defer testing.allocator.free(p0);
         @memcpy(&self.proof_u0, p0);
 
         const three = [_][]const u8{ "m0", "m1", "m2" };
-        const sig3 = sign(testing.allocator, sk, pk, "header", &three) catch unreachable;
+        const sig3 = sign(testing.allocator, &sk, pk, "header", &three) catch unreachable;
         const rs2 = cs.mockedRandomScalars(7, "corpus");
-        const p2 = proofGen(testing.allocator, pk, sig3, "header", "", &three, &.{0}, &rs2) catch unreachable;
+        const p2 = proofGen(testing.allocator, pk, &sig3, "header", "", &three, &.{0}, &rs2) catch unreachable;
         defer testing.allocator.free(p2);
         @memcpy(&self.proof_u2, p2);
     }

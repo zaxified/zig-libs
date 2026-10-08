@@ -89,7 +89,9 @@ pub fn fixedRandomness() Env.SealRandomness {
 }
 
 pub fn recipientKeypair(seed_byte: u8) Kem.KeyPair {
-    return Kem.keypair(&[_]u8{seed_byte} ** 32);
+    var kp: Kem.KeyPair = undefined;
+    Kem.keypair(&kp, &[_]u8{seed_byte} ** 32);
+    return kp;
 }
 
 const plaintext = "the launch codes expire at dawn";
@@ -99,12 +101,12 @@ const plaintext = "the launch codes expire at dawn";
 test "round-trip: seal then open recovers the exact plaintext with both locks satisfied" {
     const kp = recipientKeypair(0x01);
 
-    const env = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    const env = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness());
     defer testing.allocator.free(env);
 
     try testing.expectEqual(Env.overhead + plaintext.len, env.len);
 
-    const opened = try Env.open(testing.allocator, env, kp.dk, round1000Signature());
+    const opened = try Env.open(testing.allocator, env, &kp.dk, round1000Signature());
     defer testing.allocator.free(opened);
 
     try testing.expectEqualSlices(u8, plaintext, opened);
@@ -118,15 +120,16 @@ test "round-trip works across all three HQC parameter sets" {
     }) |pair| {
         const E = pair[0];
         const K = pair[1];
-        const kp = K.keypair(&[_]u8{0x07} ** 32);
+        var kp: K.KeyPair = undefined;
+        K.keypair(&kp, &[_]u8{0x07} ** 32);
         const rnd: E.SealRandomness = .{
             .s_time = [_]u8{0x44} ** envelope.time_secret_bytes,
             .tlock_sigma = [_]u8{0x55} ** envelope.time_secret_bytes,
             .kem_coins = [_]u8{0x66} ** K.coins_bytes,
         };
-        const env = try E.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, rnd);
+        const env = try E.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &rnd);
         defer testing.allocator.free(env);
-        const opened = try E.open(testing.allocator, env, kp.dk, round1000Signature());
+        const opened = try E.open(testing.allocator, env, &kp.dk, round1000Signature());
         defer testing.allocator.free(opened);
         try testing.expectEqualSlices(u8, plaintext, opened);
     }
@@ -134,9 +137,9 @@ test "round-trip works across all three HQC parameter sets" {
 
 test "empty plaintext round-trips" {
     const kp = recipientKeypair(0x02);
-    const env = try Env.seal(testing.allocator, "", kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    const env = try Env.seal(testing.allocator, "", &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness());
     defer testing.allocator.free(env);
-    const opened = try Env.open(testing.allocator, env, kp.dk, round1000Signature());
+    const opened = try Env.open(testing.allocator, env, &kp.dk, round1000Signature());
     defer testing.allocator.free(opened);
     try testing.expectEqual(@as(usize, 0), opened.len);
 }
@@ -174,8 +177,10 @@ test "entropy seam: generate draws all three fields afresh, and two seals differ
     // `zig build test-megolm` green on an assertion of this same shape. Not
     // re-measured here, but all three fields here are plain byte arrays
     // filled the same way, each with room for a partial fill.
-    const r1 = Env.SealRandomness.generate(io);
-    const r2 = Env.SealRandomness.generate(io);
+    var r1: Env.SealRandomness = undefined;
+    r1.generate(io);
+    var r2: Env.SealRandomness = undefined;
+    r2.generate(io);
 
     // All THREE fields are asserted SEPARATELY, and that separation is the
     // point: a whole-envelope diff stays green with any one of them frozen,
@@ -195,15 +200,15 @@ test "entropy seam: generate draws all three fields afresh, and two seals differ
     // independently generated randomness, differ on the wire and both still
     // open.
     const kp = recipientKeypair(0x09);
-    const env1 = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, r1);
+    const env1 = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &r1);
     defer testing.allocator.free(env1);
-    const env2 = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, r2);
+    const env2 = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &r2);
     defer testing.allocator.free(env2);
     try testing.expect(!std.mem.eql(u8, env1, env2));
 
-    const opened1 = try Env.open(testing.allocator, env1, kp.dk, round1000Signature());
+    const opened1 = try Env.open(testing.allocator, env1, &kp.dk, round1000Signature());
     defer testing.allocator.free(opened1);
-    const opened2 = try Env.open(testing.allocator, env2, kp.dk, round1000Signature());
+    const opened2 = try Env.open(testing.allocator, env2, &kp.dk, round1000Signature());
     defer testing.allocator.free(opened2);
     try testing.expectEqualSlices(u8, plaintext, opened1);
     try testing.expectEqualSlices(u8, plaintext, opened2);
@@ -213,39 +218,39 @@ test "entropy seam: generate draws all three fields afresh, and two seals differ
 
 test "AND #1: correct PQ key but the time gate is still closed (wrong signature) → TimeGateClosed" {
     const kp = recipientKeypair(0x03);
-    const env = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    const env = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness());
     defer testing.allocator.free(env);
 
     // Right recipient key, but no valid round signature (models "before
     // round R"): the time lock must not open.
-    try testing.expectError(error.TimeGateClosed, Env.open(testing.allocator, env, kp.dk, wrongSignature()));
+    try testing.expectError(error.TimeGateClosed, Env.open(testing.allocator, env, &kp.dk, wrongSignature()));
 }
 
 test "AND #2: time gate open but wrong HQC secret key → AuthFailed" {
     const kp = recipientKeypair(0x04);
     const other = recipientKeypair(0x05); // different keypair entirely
-    const env = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    const env = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness());
     defer testing.allocator.free(env);
 
     // Correct round signature, but the wrong PQ secret key: HQC's
     // implicit rejection yields a pseudo-random s_pq → wrong K → the
     // AEAD tag rejects. Never a garbage plaintext.
-    try testing.expectError(error.AuthFailed, Env.open(testing.allocator, env, other.dk, round1000Signature()));
+    try testing.expectError(error.AuthFailed, Env.open(testing.allocator, env, &other.dk, round1000Signature()));
 }
 
 test "AND #3: signature is for a DIFFERENT round than the envelope → TimeGateClosed" {
     const kp = recipientKeypair(0x06);
     // Seal to round 1001, but the only signature we hold is round 1000's.
-    const env = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), 1001, fixedRandomness());
+    const env = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), 1001, &fixedRandomness());
     defer testing.allocator.free(env);
 
-    try testing.expectError(error.TimeGateClosed, Env.open(testing.allocator, env, kp.dk, round1000Signature()));
+    try testing.expectError(error.TimeGateClosed, Env.open(testing.allocator, env, &kp.dk, round1000Signature()));
 }
 
 // ── tamper detection (per region) ─────────────────────────────────────
 
 fn expectOpenIsError(env: []const u8, dk: Kem.DecapsKey, sig: g1.Affine) !void {
-    if (Env.open(testing.allocator, env, dk, sig)) |pt| {
+    if (Env.open(testing.allocator, env, &dk, sig)) |pt| {
         testing.allocator.free(pt);
         return error.TestUnexpectedlyOpened;
     } else |_| {}
@@ -253,7 +258,7 @@ fn expectOpenIsError(env: []const u8, dk: Kem.DecapsKey, sig: g1.Affine) !void {
 
 test "tamper: flipping a byte in any region makes open fail with a typed error, never a wrong plaintext" {
     const kp = recipientKeypair(0x08);
-    const base = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    const base = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness());
     defer testing.allocator.free(base);
 
     // Representative offsets: round field, tlock ct, hqc ct, tag, aead ct.
@@ -282,7 +287,7 @@ test "F1: tampering the flags byte (offset 6) is rejected — the only AAD-EXCLU
     // that actually exercises "the AAD binding matters", as opposed to being
     // shadowed by some other check that would catch the same offset anyway.
     const kp = recipientKeypair(0x0D);
-    const base = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    const base = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness());
     defer testing.allocator.free(base);
 
     const dup = try testing.allocator.dupe(u8, base);
@@ -293,48 +298,48 @@ test "F1: tampering the flags byte (offset 6) is rejected — the only AAD-EXCLU
 
 test "tamper: corrupting the magic / version / suite bytes is rejected at parse" {
     const kp = recipientKeypair(0x09);
-    const base = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    const base = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness());
     defer testing.allocator.free(base);
 
     {
         const dup = try testing.allocator.dupe(u8, base);
         defer testing.allocator.free(dup);
         dup[0] ^= 0xFF;
-        try testing.expectError(error.BadMagic, Env.open(testing.allocator, dup, kp.dk, round1000Signature()));
+        try testing.expectError(error.BadMagic, Env.open(testing.allocator, dup, &kp.dk, round1000Signature()));
     }
     {
         const dup = try testing.allocator.dupe(u8, base);
         defer testing.allocator.free(dup);
         dup[4] ^= 0xFF;
-        try testing.expectError(error.UnsupportedVersion, Env.open(testing.allocator, dup, kp.dk, round1000Signature()));
+        try testing.expectError(error.UnsupportedVersion, Env.open(testing.allocator, dup, &kp.dk, round1000Signature()));
     }
     {
         const dup = try testing.allocator.dupe(u8, base);
         defer testing.allocator.free(dup);
         dup[5] = 32; // hqc-256's suite id
-        try testing.expectError(error.SuiteMismatch, Env.open(testing.allocator, dup, kp.dk, round1000Signature()));
+        try testing.expectError(error.SuiteMismatch, Env.open(testing.allocator, dup, &kp.dk, round1000Signature()));
     }
 }
 
 test "tamper: truncating the envelope is rejected, never a panic" {
     const kp = recipientKeypair(0x0A);
-    const base = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    const base = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness());
     defer testing.allocator.free(base);
 
-    try testing.expectError(error.LengthMismatch, Env.open(testing.allocator, base[0 .. base.len - 1], kp.dk, round1000Signature()));
-    try testing.expectError(error.Truncated, Env.open(testing.allocator, base[0..3], kp.dk, round1000Signature()));
+    try testing.expectError(error.LengthMismatch, Env.open(testing.allocator, base[0 .. base.len - 1], &kp.dk, round1000Signature()));
+    try testing.expectError(error.Truncated, Env.open(testing.allocator, base[0..3], &kp.dk, round1000Signature()));
 }
 
 test "tamper: an undecodable time-lock point is MalformedTimeLock, not TimeGateClosed" {
     // Mutation run 2026-10-05: the generic tamper test above accepts any
     // error, so mapping this case to TimeGateClosed survived.
     const kp = recipientKeypair(0x0E);
-    const base = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    const base = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness());
     defer testing.allocator.free(base);
     const dup = try testing.allocator.dupe(u8, base);
     defer testing.allocator.free(dup);
     dup[envelope.header_bytes] &= 0x7f; // clear U's compression flag
-    try testing.expectError(error.MalformedTimeLock, Env.open(testing.allocator, dup, kp.dk, round1000Signature()));
+    try testing.expectError(error.MalformedTimeLock, Env.open(testing.allocator, dup, &kp.dk, round1000Signature()));
 }
 
 test "seal refuses a plaintext longer than the u32 length field before touching it" {
@@ -343,7 +348,7 @@ test "seal refuses a plaintext longer than the u32 length field before touching 
     const byte: [1]u8 = .{0};
     const huge = @as([*]const u8, &byte)[0 .. @as(usize, std.math.maxInt(u32)) + 1];
     const kp = recipientKeypair(0x0F);
-    try testing.expectError(error.PlaintextTooLarge, Env.seal(testing.failing_allocator, huge, kp.ek, quicknetPubkey(), seal_round, fixedRandomness()));
+    try testing.expectError(error.PlaintextTooLarge, Env.seal(testing.failing_allocator, huge, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness()));
 }
 
 // ── positive control (proves the negatives actually detect a broken AND) ──
@@ -360,7 +365,7 @@ test "positive control: a KDF that dropped s_pq would let the PQ-lock negative p
     const zero_pq = [_]u8{0} ** hqc.params.shared_secret_bytes;
 
     // Broken seal: key ignores s_pq.
-    const broken_keys = envelope.deriveKeys(rnd.s_time, zero_pq, Env.suite_id, seal_round);
+    const broken_keys = deriveKeysV(rnd.s_time, zero_pq, Env.suite_id, seal_round);
     var ct: [plaintext.len]u8 = undefined;
     var tag: [envelope.tag_bytes]u8 = undefined;
     Aead.encrypt(&ct, &tag, plaintext, "", broken_keys.nonce, broken_keys.key);
@@ -370,7 +375,7 @@ test "positive control: a KDF that dropped s_pq would let the PQ-lock negative p
     const tl = tlock.encrypt(quicknetPubkey(), seal_round, &rnd.s_time, &rnd.tlock_sigma);
     var s_time_recovered: [tlock.block_bytes]u8 = undefined;
     try tlock.decrypt(&s_time_recovered, round1000Signature(), tl);
-    const attacker_keys = envelope.deriveKeys(s_time_recovered, zero_pq, Env.suite_id, seal_round);
+    const attacker_keys = deriveKeysV(s_time_recovered, zero_pq, Env.suite_id, seal_round);
 
     var dec: [plaintext.len]u8 = undefined;
     try Aead.decrypt(&dec, &ct, tag, "", attacker_keys.nonce, attacker_keys.key);
@@ -384,11 +389,12 @@ test "positive control: the REAL construction binds s_pq (attacker without it ca
     const kp = recipientKeypair(0x0B);
     const rnd = fixedRandomness();
 
-    const enc = Kem.encaps(kp.ek, &rnd.kem_coins);
-    const real_keys = envelope.deriveKeys(rnd.s_time, enc.ss, Env.suite_id, seal_round);
+    var enc: struct { ct: Kem.Ciphertext, ss: Kem.SharedSecret } = undefined;
+    Kem.encaps(&enc.ct, &enc.ss, &kp.ek, &rnd.kem_coins);
+    const real_keys = deriveKeysV(rnd.s_time, enc.ss, Env.suite_id, seal_round);
 
     const zero_pq = [_]u8{0} ** hqc.params.shared_secret_bytes;
-    const attacker_keys = envelope.deriveKeys(rnd.s_time, zero_pq, Env.suite_id, seal_round);
+    const attacker_keys = deriveKeysV(rnd.s_time, zero_pq, Env.suite_id, seal_round);
 
     try testing.expect(!std.mem.eql(u8, &real_keys.key, &attacker_keys.key));
 }
@@ -440,7 +446,7 @@ fn fuzzOpen(ctx: *const FuzzCtx, smith: *std.testing.Smith) anyerror!void {
         }
     };
 
-    if (Env.open(testing.allocator, input, ctx.dk, ctx.sig)) |pt| {
+    if (Env.open(testing.allocator, input, &ctx.dk, ctx.sig)) |pt| {
         defer testing.allocator.free(pt);
         // A successful open is only possible for a byte-identical copy of
         // the base envelope; assert it really is the original plaintext.
@@ -453,7 +459,7 @@ fn fuzzOpen(ctx: *const FuzzCtx, smith: *std.testing.Smith) anyerror!void {
 
 test "fuzz: open never panics / OOBs / hangs on arbitrary or mutated input" {
     const kp = recipientKeypair(0x0C);
-    const base = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    const base = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness());
     defer testing.allocator.free(base);
 
     const ctx = FuzzCtx{ .dk = kp.dk, .sig = round1000Signature(), .base = base };
@@ -492,7 +498,7 @@ fn openSeed(comptime script: []const u8, comptime mode: u64) []const u8 {
 
 test "corpus: the open seeds drive both arms, and the counts are pinned" {
     const kp = recipientKeypair(0x0C);
-    const base = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    const base = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness());
     defer testing.allocator.free(base);
     const ctx = FuzzCtx{ .dk = kp.dk, .sig = round1000Signature(), .base = base };
 
@@ -526,7 +532,7 @@ test "corpus: the open seeds drive both arms, and the counts are pinned" {
             }
             break :blk buf[0..n];
         };
-        if (Env.open(testing.allocator, input, ctx.dk, ctx.sig)) |pt| {
+        if (Env.open(testing.allocator, input, &ctx.dk, ctx.sig)) |pt| {
             defer testing.allocator.free(pt);
             opened += 1;
             try testing.expectEqualSlices(u8, plaintext, pt);
@@ -540,4 +546,10 @@ test "corpus: the open seeds drive both arms, and the counts are pinned" {
     try testing.expectEqual(@as(usize, 5), mutate_arm);
     try testing.expectEqual(@as(usize, 11), flips_total);
     try testing.expectEqual(@as(usize, 1), opened);
+}
+
+fn deriveKeysV(s_time: [envelope.time_secret_bytes]u8, s_pq: [hqc.params.shared_secret_bytes]u8, suite: u8, round: u64) envelope.DerivedKeys {
+    var k: envelope.DerivedKeys = undefined;
+    envelope.deriveKeys(&k, &s_time, &s_pq, suite, round);
+    return k;
 }

@@ -35,7 +35,7 @@ fn sealAlloc(pt: []const u8, kp: Kem.KeyPair) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     errdefer aw.deinit();
     var r: std.Io.Reader = .fixed(pt);
-    try Env.sealStream(testing.allocator, &aw.writer, &r, kp.ek, fx.quicknetPubkey(), fx.seal_round, fx.fixedRandomness());
+    try Env.sealStream(testing.allocator, &aw.writer, &r, &kp.ek, fx.quicknetPubkey(), fx.seal_round, &fx.fixedRandomness());
     return aw.toOwnedSlice();
 }
 
@@ -50,7 +50,7 @@ fn openCollect(wire: []const u8, dk: Kem.DecapsKey, sig: tlock.bls12_381.g1.Affi
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     errdefer aw.deinit();
     var r: std.Io.Reader = .fixed(wire);
-    const result = Env.openStream(testing.allocator, &aw.writer, &r, dk, sig);
+    const result = Env.openStream(testing.allocator, &aw.writer, &r, &dk, sig);
     return .{ .result = result, .written = try aw.toOwnedSlice() };
 }
 
@@ -92,7 +92,9 @@ test "the payload is byte-exactly tlock.age's whole-buffer STREAM under the deri
     // here from the documented derivation, not taken from `sealStream`.
     const kp = fx.recipientKeypair(0x01);
     const rnd = fx.fixedRandomness();
-    const ss = Kem.encaps(kp.ek, &rnd.kem_coins).ss;
+    var enc_ct: Kem.Ciphertext = undefined;
+    var ss: Kem.SharedSecret = undefined;
+    Kem.encaps(&enc_ct, &ss, &kp.ek, &rnd.kem_coins);
     for (sizes) |len| {
         const pt = try pattern(testing.allocator, len);
         defer testing.allocator.free(pt);
@@ -101,7 +103,8 @@ test "the payload is byte-exactly tlock.age's whole-buffer STREAM under the deri
 
         var th: [32]u8 = undefined;
         Sha256.hash(wire[0..prefix_bytes], &th, .{});
-        const key = stream.deriveStreamKey(rnd.s_time, ss, Env.suite_id, fx.seal_round, th);
+        var key: [32]u8 = undefined;
+        stream.deriveStreamKey(&key, &rnd.s_time, &ss, Env.suite_id, fx.seal_round, &th);
 
         const want = try testing.allocator.alloc(u8, age.sealedLen(len));
         defer testing.allocator.free(want);
@@ -123,7 +126,8 @@ test "stream round-trips across all three HQC parameter sets" {
     }) |pair| {
         const E = pair[0];
         const K = pair[1];
-        const kp = K.keypair(&[_]u8{0x07} ** 32);
+        var kp: K.KeyPair = undefined;
+        K.keypair(&kp, &[_]u8{0x07} ** 32);
         const rnd: E.SealRandomness = .{
             .s_time = [_]u8{0x44} ** envelope.time_secret_bytes,
             .tlock_sigma = [_]u8{0x55} ** envelope.time_secret_bytes,
@@ -133,12 +137,12 @@ test "stream round-trips across all three HQC parameter sets" {
         var aw: std.Io.Writer.Allocating = .init(testing.allocator);
         defer aw.deinit();
         var r: std.Io.Reader = .fixed(pt);
-        try E.sealStream(testing.allocator, &aw.writer, &r, kp.ek, fx.quicknetPubkey(), fx.seal_round, rnd);
+        try E.sealStream(testing.allocator, &aw.writer, &r, &kp.ek, fx.quicknetPubkey(), fx.seal_round, &rnd);
 
         var out: std.Io.Writer.Allocating = .init(testing.allocator);
         defer out.deinit();
         var r2: std.Io.Reader = .fixed(aw.written());
-        try E.openStream(testing.allocator, &out.writer, &r2, kp.dk, fx.round1000Signature());
+        try E.openStream(testing.allocator, &out.writer, &r2, &kp.dk, fx.round1000Signature());
         try testing.expectEqualSlices(u8, pt, out.written());
     }
 }
@@ -238,7 +242,7 @@ test "streaming release: chunks before a tampered one are written, authentic and
 
 test "version 1 and version 2 each refuse the other's wire" {
     const kp = fx.recipientKeypair(0x01);
-    const v1 = try Env.seal(testing.allocator, "secret", kp.ek, fx.quicknetPubkey(), fx.seal_round, fx.fixedRandomness());
+    const v1 = try Env.seal(testing.allocator, "secret", &kp.ek, fx.quicknetPubkey(), fx.seal_round, &fx.fixedRandomness());
     defer testing.allocator.free(v1);
     try expectOpenError(v1, kp.dk, fx.round1000Signature(), &.{error.UnsupportedVersion});
 
@@ -251,11 +255,12 @@ test "a stream sealed for one HQC set is SuiteMismatch for another" {
     const kp = fx.recipientKeypair(0x01);
     const wire = try sealAlloc("secret", kp);
     defer testing.allocator.free(wire);
-    const kp256 = hqc.Hqc256.keypair(&[_]u8{0x01} ** 32);
+    var kp256: hqc.Hqc256.KeyPair = undefined;
+    hqc.Hqc256.keypair(&kp256, &[_]u8{0x01} ** 32);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     var r: std.Io.Reader = .fixed(wire);
-    try testing.expectError(error.SuiteMismatch, envelope.Envelope256.openStream(testing.allocator, &out.writer, &r, kp256.dk, fx.round1000Signature()));
+    try testing.expectError(error.SuiteMismatch, envelope.Envelope256.openStream(testing.allocator, &out.writer, &r, &kp256.dk, fx.round1000Signature()));
 }
 
 test "sealStream and openStream release their memory on allocation failure" {
@@ -266,7 +271,7 @@ test "sealStream and openStream release their memory on allocation failure" {
         var aw: std.Io.Writer.Allocating = .init(testing.allocator);
         defer aw.deinit();
         var r: std.Io.Reader = .fixed(pt);
-        try testing.expectError(error.OutOfMemory, Env.sealStream(fa.allocator(), &aw.writer, &r, kp.ek, fx.quicknetPubkey(), fx.seal_round, fx.fixedRandomness()));
+        try testing.expectError(error.OutOfMemory, Env.sealStream(fa.allocator(), &aw.writer, &r, &kp.ek, fx.quicknetPubkey(), fx.seal_round, &fx.fixedRandomness()));
     }
     const wire = try sealAlloc(pt, kp);
     defer testing.allocator.free(wire);
@@ -274,5 +279,5 @@ test "sealStream and openStream release their memory on allocation failure" {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     var r: std.Io.Reader = .fixed(wire);
-    try testing.expectError(error.OutOfMemory, Env.openStream(fa.allocator(), &aw.writer, &r, kp.dk, fx.round1000Signature()));
+    try testing.expectError(error.OutOfMemory, Env.openStream(fa.allocator(), &aw.writer, &r, &kp.dk, fx.round1000Signature()));
 }

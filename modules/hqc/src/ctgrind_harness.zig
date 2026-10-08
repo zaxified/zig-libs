@@ -74,27 +74,34 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.debug.print("valgrind_support={} target={s}\n", .{ builtin.valgrind_support, target });
 
     var seed: [32]u8 = [_]u8{0x5A} ** 32;
-    var kp = Kem.keypair(&seed);
+    var kp: Kem.KeyPair = undefined;
+    Kem.keypair(&kp, &seed);
     var coins: [Kem.coins_bytes]u8 = [_]u8{0x21} ** Kem.coins_bytes;
-    const enc = Kem.encaps(kp.ek, &coins);
+    var enc_ct: Kem.Ciphertext = undefined;
+    var enc_ss: Kem.SharedSecret = undefined;
+    Kem.encaps(&enc_ct, &enc_ss, &kp.ek, &coins);
 
     if (std.mem.eql(u8, target, "decaps")) {
         // Taint the SECRET half of the decapsulation key: dk_pke (= seed_dk,
         // from which `y` is re-derived on every call) and sigma (the
         // implicit-rejection secret). `ek` and `seed_kem` stay public.
         taint(t, kp.dk[Kem.ek_bytes .. Kem.ek_bytes + params.seed_bytes + Kem.security_bytes]);
-        const ss = Kem.decaps(kp.dk, enc.ct);
+        var ss: Kem.SharedSecret = undefined;
+        Kem.decaps(&ss, &kp.dk, &enc_ct);
         std.debug.print("ss={x}\n", .{ss});
     } else if (std.mem.eql(u8, target, "keygen")) {
         taint(t, seed[0..]);
-        const kp2 = Kem.keypair(&seed);
+        var kp2: Kem.KeyPair = undefined;
+        Kem.keypair(&kp2, &seed);
         std.debug.print("ek={x}\n", .{kp2.ek[0..32]});
     } else if (std.mem.eql(u8, target, "encaps")) {
         // `coins` = m ‖ salt; `m` is the secret the Fujisaki-Okamoto transform
         // protects, so only its first `security_bytes` are tainted.
         taint(t, coins[0..Kem.security_bytes]);
-        const e2 = Kem.encaps(kp.ek, &coins);
-        std.debug.print("ct={x}\n", .{e2.ct[0..32]});
+        var e2_ct: Kem.Ciphertext = undefined;
+        var e2_ss: Kem.SharedSecret = undefined;
+        Kem.encaps(&e2_ct, &e2_ss, &kp.ek, &coins);
+        std.debug.print("ct={x}\n", .{e2_ct[0..32]});
     } else if (std.mem.eql(u8, target, "sampler")) {
         // The hottest secret path in the module: the fixed-weight sampler that
         // scatters the long-term secret vector `y`, run on every decapsulation.
