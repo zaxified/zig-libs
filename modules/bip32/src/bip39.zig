@@ -48,6 +48,11 @@ pub const Error = error{
 /// Writes the space-separated lowercase mnemonic into `out` (no allocation)
 /// and returns the written slice.
 pub fn entropyToMnemonic(entropy: []const u8, out: []u8) Error![]const u8 {
+    defer burnStack();
+    return entropyToMnemonicBody(entropy, out);
+}
+
+noinline fn entropyToMnemonicBody(entropy: []const u8, out: []u8) Error![]const u8 {
     switch (entropy.len) {
         16, 20, 24, 28, 32 => {},
         else => return error.InvalidEntropyLength,
@@ -83,6 +88,11 @@ pub fn entropyToMnemonic(entropy: []const u8, out: []u8) Error![]const u8 {
 /// a bad word count, unknown word, or checksum mismatch is a typed error,
 /// never a best-effort partial result.
 pub fn mnemonicToEntropy(mnemonic: []const u8, out: []u8) Error![]const u8 {
+    defer burnStack();
+    return mnemonicToEntropyBody(mnemonic, out);
+}
+
+noinline fn mnemonicToEntropyBody(mnemonic: []const u8, out: []u8) Error![]const u8 {
     var idxs: [max_words]u11 = undefined;
     var count: usize = 0;
     // `splitScalar`, not `tokenizeScalar`: tokenize silently collapses
@@ -159,6 +169,11 @@ pub fn mnemonicToEntropy(mnemonic: []const u8, out: []u8) Error![]const u8 {
 /// Validates `mnemonic` (word count, wordlist membership, checksum) without
 /// returning the entropy.
 pub fn validateMnemonic(mnemonic: []const u8) Error!void {
+    defer burnStack();
+    return validateMnemonicBody(mnemonic);
+}
+
+noinline fn validateMnemonicBody(mnemonic: []const u8) Error!void {
     var buf: [max_entropy_bytes]u8 = undefined;
     // CONVENTIONS §2.1 Z1 / audit finding `bip32` H2: `buf` holds the
     // reconstructed BIP-39 entropy — the value the whole key tree is
@@ -168,7 +183,7 @@ pub fn validateMnemonic(mnemonic: []const u8) Error!void {
     // derived bytes is wiped; this one was not. `defer` runs whether
     // `mnemonicToEntropy` succeeds or returns an error.
     defer std.crypto.secureZero(u8, &buf);
-    _ = try mnemonicToEntropy(mnemonic, &buf);
+    _ = try mnemonicToEntropyBody(mnemonic, &buf);
 }
 
 /// Generous bound on the passphrase `mnemonicToSeed` accepts (real BIP-39
@@ -183,6 +198,11 @@ pub const SeedError = error{PassphraseTooLong};
 /// text, valid or not — validity is a separate, optional check via
 /// `validateMnemonic`). The passphrase buffer is zeroized before return.
 pub fn mnemonicToSeed(mnemonic: []const u8, passphrase: []const u8, out: *[64]u8) SeedError!void {
+    defer burnStack();
+    return mnemonicToSeedBody(mnemonic, passphrase, out);
+}
+
+noinline fn mnemonicToSeedBody(mnemonic: []const u8, passphrase: []const u8, out: *[64]u8) SeedError!void {
     if (passphrase.len > max_passphrase_len) return error.PassphraseTooLong;
     var salt_buf: [8 + max_passphrase_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &salt_buf);
@@ -197,6 +217,27 @@ pub fn mnemonicToSeed(mnemonic: []const u8, passphrase: []const u8, out: *[64]u8
 }
 
 // ── internal helpers ─────────────────────────────────────────────────────
+
+/// Review 2026-10-08 (HIGH). Measured with `stackprobe_test.zig`
+/// (ReleaseFast): `entropyToMnemonic`, `mnemonicToEntropy` and
+/// `validateMnemonic` each left the entropy — the wallet itself — in a dead
+/// frame, and `mnemonicToSeed` the SHA-512 of the mnemonic, which is the
+/// PBKDF2-HMAC key for any phrase longer than one block (24 words). Same fix
+/// as `bip32.zig`'s `burnStack`: the body runs one frame down (`noinline`),
+/// then `stack_burn` bytes at that depth are zeroed.
+noinline fn burnStack() void {
+    // Volatile word stores, not `secureZero`: that is a volatile byte memset,
+    // and without libc the memset behind it moves ~3 B/ns — 2.5 µs per 8 KiB
+    // against 0.3 µs for this loop (ReleaseFast, 2026-10-08). `volatile`
+    // keeps the dead stores and keeps them from becoming a memset call.
+    var buf: [stack_burn / 8]u64 = undefined;
+    const p: [*]volatile u64 = &buf;
+    for (0..buf.len) |i| p[i] = 0;
+}
+
+/// The deepest body (`mnemonicToSeed`) dirtied 3.5 KiB in ReleaseFast
+/// (2026-10-08); `stackprobe_test.zig` goes red when it outgrows this.
+const stack_burn = 8 * 1024;
 
 /// Read an 11-bit big-endian group starting at absolute bit `bit_pos` from
 /// the logical `entropy ‖ checksum` bitstream.

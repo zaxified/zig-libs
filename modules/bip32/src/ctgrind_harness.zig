@@ -79,6 +79,20 @@ fn taintBytes(buf: []u8, out: []u8, taint: Taint) void {
 
 /// The payload of `r`, without a branch on its tag; the tag itself is checked
 /// on a declassified copy. See the module doc comment.
+/// `settle` takes an error union; the out-parameter API is wrapped back into
+/// one here so the declassification below stays the same.
+fn masterValue(seed: []const u8) bip32.MasterError!bip32.ExtendedPrivKey {
+    var k: bip32.ExtendedPrivKey = undefined;
+    try bip32.masterFromSeed(seed, &k);
+    return k;
+}
+
+fn derivePathValue(master: *const bip32.ExtendedPrivKey, path: []const u32) bip32.CkdError!bip32.ExtendedPrivKey {
+    var k: bip32.ExtendedPrivKey = undefined;
+    try bip32.derivePath(master, path, &k);
+    return k;
+}
+
 fn settle(r: anytype) !@typeInfo(@TypeOf(r)).error_union.payload {
     const payload = r catch undefined;
     var copy = r;
@@ -110,16 +124,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var raw = fixedSeed();
             var seed: [64]u8 = undefined;
             taintBytes(&raw, &seed, taint);
-            const m = try settle(bip32.masterFromSeed(&seed));
+            const m = try settle(masterValue(&seed));
             std.debug.print("privkey={x}\nchain_code={x}\n", .{ m.privkey, m.chain_code });
         },
         .derive => {
-            var master = try bip32.masterFromSeed(&fixedSeed()); // untainted setup
+            var master: bip32.ExtendedPrivKey = undefined;
+            try bip32.masterFromSeed(&fixedSeed(), &master); // untainted setup
             var raw = master.privkey;
             taintBytes(&raw, &master.privkey, taint);
             const h = bip32.hardened_offset;
             const path = [_]u32{ 44 + h, 0 + h, 0 + h, 0, 0 };
-            const child = try settle(bip32.derivePath(master, &path));
+            const child = try settle(derivePathValue(&master, &path));
             std.debug.print("privkey={x}\nchain_code={x}\n", .{ child.privkey, child.chain_code });
         },
         .seed => {

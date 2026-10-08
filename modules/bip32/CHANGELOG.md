@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** measured with the new
+  ReleaseFast stack probe, every entry point that touches a secret left it in dead stack frames
+  although each named buffer was wiped: `masterFromSeed` the seed, master key and chain code;
+  `ckdPriv` the parent key and up to four copies of the child key; `derivePath` the leaf key;
+  `parseExtended` the parsed key; `entropyToMnemonic`/`mnemonicToEntropy`/`validateMnemonic`
+  the entropy; `mnemonicToSeed` the SHA-512 of the mnemonic (the PBKDF2 key). Every entry point
+  now runs one frame down and zeroes the stack below it. API changes, so no copy is made outside
+  that region:
+  - `ExtendedPrivKey` is taken by pointer: `ckdPriv(&parent, i, &out)`,
+    `ckdPrivWithParentPub(&parent, pub, i, &out)`, `derivePath(&master, path, &out)`,
+    `neuter(&k)`, `serializePriv(&k, network, buf)` (a 77-byte by-value parameter is copied at
+    the call boundary, outside any wipe).
+  - Secret results go to an out-parameter: `masterFromSeed(seed, &out)`, `ckdPriv`,
+    `ckdPrivWithParentPub`, `derivePath`, `parseExtended(s, network, &out)` return `!void`.
+    Returned by value, the error union lands in a temporary of the CALLER's frame, which the
+    caller cannot wipe (measured: one copy of the result key per call). `out` may alias the
+    parent (`ckdPriv(&k, i, &k)`).
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** A1 finding M6-CT. `bip39.zig`'s `wordIndex`
   (BIP-39 wordlist lookup) was a binary search that branched and indexed
   `wordlist.english[mid]` directly on the secret mnemonic word at every step — a cache/

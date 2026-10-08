@@ -148,7 +148,12 @@ pub const MasterError = error{
 /// `IL >= n` or `IL == 0` (probability ~2^-127; the reference implementation
 /// re-seeds and retries — this module reports it as a typed error instead,
 /// leaving the retry policy to the caller).
-pub fn masterFromSeed(seed: []const u8) MasterError!ExtendedPrivKey {
+pub fn masterFromSeed(seed: []const u8, out: *ExtendedPrivKey) MasterError!void {
+    defer burnStack();
+    return masterFromSeedBody(seed, out);
+}
+
+noinline fn masterFromSeedBody(seed: []const u8, out: *ExtendedPrivKey) MasterError!void {
     if (seed.len < min_seed_bytes or seed.len > max_seed_bytes) return error.InvalidSeedLength;
 
     var i: [64]u8 = undefined;
@@ -163,7 +168,7 @@ pub fn masterFromSeed(seed: []const u8) MasterError!ExtendedPrivKey {
     var ir = i[32..64].*;
     defer std.crypto.secureZero(u8, &ir);
 
-    return masterFromIL(il, ir);
+    out.* = try masterFromIL(il, ir);
 }
 
 /// The master-key math from `IL`/`IR` onward, split out as a test-only seam
@@ -215,26 +220,35 @@ pub fn fingerprint(compressed_pubkey: [33]u8) [4]u8 {
 /// cost, and it is the SAME value on every sibling derived from one parent —
 /// deriving 1000 addresses under one account key recomputes the identical
 /// `k·G` 1000 times. A caller deriving many siblings from the same parent
-/// should compute `neuter(parent).pubkey` once and call
+/// should compute `neuter(&parent).pubkey` once and call
 /// `ckdPrivWithParentPub` instead; measured 15.2x faster over 1000 siblings
 /// (44.6ms -> 2.94ms projected). This function is unchanged for callers who
 /// derive a single child, or who don't have the parent pubkey handy.
-pub fn ckdPriv(parent: ExtendedPrivKey, index: u32) CkdError!ExtendedPrivKey {
-    // Computed once and reused for both the non-hardened HMAC input and the
-    // parent fingerprint below — `pubkeyFromPriv` is a scalar EC multiply,
-    // not free, and the parent scalar does not change within this call.
-    const parent_pub = pubkeyFromPriv(parent.privkey) catch return error.InvalidChildKey;
-    return ckdPrivWithParentPub(parent, parent_pub, index);
+pub fn ckdPriv(parent: *const ExtendedPrivKey, index: u32, out: *ExtendedPrivKey) CkdError!void {
+    defer burnStack();
+    return ckdPrivBody(parent, null, index, out);
 }
 
 /// `ckdPriv`, but takes the parent's compressed SEC1 pubkey instead of
 /// recomputing it — see `ckdPriv`'s doc comment (audit finding `bip32` H5).
-/// `parent_pub` MUST be `(try neuter(parent)).pubkey`; passing any other
+/// `parent_pub` MUST be `(try neuter(&parent)).pubkey`; passing any other
 /// value silently derives a wrong fingerprint (hardened children) or a wrong
 /// child key (normal children), because both are computed FROM it here
 /// exactly as `ckdPriv` computes them from its own freshly-derived copy —
 /// this function trusts the caller's copy instead of re-deriving it.
-pub fn ckdPrivWithParentPub(parent: ExtendedPrivKey, parent_pub: [33]u8, index: u32) CkdError!ExtendedPrivKey {
+pub fn ckdPrivWithParentPub(parent: *const ExtendedPrivKey, parent_pub: [33]u8, index: u32, out: *ExtendedPrivKey) CkdError!void {
+    defer burnStack();
+    return ckdPrivBody(parent, parent_pub, index, out);
+}
+
+/// `ckdPriv`'s body, one frame down so `burnStack` reaches what it left.
+/// `known_pub` null: compute the parent's public key here.
+/// `out` may alias `parent`: it is written once, after the last read.
+noinline fn ckdPrivBody(parent: *const ExtendedPrivKey, known_pub: ?[33]u8, index: u32, out: *ExtendedPrivKey) CkdError!void {
+    // Computed once and reused for both the non-hardened HMAC input and the
+    // parent fingerprint below — `pubkeyFromPriv` is a scalar EC multiply,
+    // not free, and the parent scalar does not change within this call.
+    const parent_pub = known_pub orelse (pubkeyFromPriv(parent.privkey) catch return error.InvalidChildKey);
     const hardened = index >= hardened_offset;
 
     var data: [37]u8 = undefined;
@@ -258,7 +272,8 @@ pub fn ckdPrivWithParentPub(parent: ExtendedPrivKey, parent_pub: [33]u8, index: 
     var ir = i[32..64].*;
     defer std.crypto.secureZero(u8, &ir);
 
-    return ckdPrivFromIL(parent, parent_pub, index, il, ir);
+    const child = try ckdPrivFromIL(parent, parent_pub, index, il, ir);
+    out.* = child;
 }
 
 /// The `CKDpriv` math from `IL`/`IR` onward, split out as a test-only seam
@@ -269,7 +284,7 @@ pub fn ckdPrivWithParentPub(parent: ExtendedPrivKey, parent_pub: [33]u8, index: 
 /// since the caller knows the parent scalar) to exercise the guard directly.
 /// Not `pub` outside the module — call `ckdPriv`/`ckdPrivWithParentPub` for
 /// real derivation.
-fn ckdPrivFromIL(parent: ExtendedPrivKey, parent_pub: [33]u8, index: u32, il: [32]u8, ir: [32]u8) CkdError!ExtendedPrivKey {
+fn ckdPrivFromIL(parent: *const ExtendedPrivKey, parent_pub: [33]u8, index: u32, il: [32]u8, ir: [32]u8) CkdError!ExtendedPrivKey {
     var child_priv = Secp256k1.scalar.add(parent.privkey, il, .big) catch return error.InvalidChildKey;
     defer std.crypto.secureZero(u8, &child_priv);
     if (std.mem.allEqual(u8, &child_priv, 0)) return error.InvalidChildKey;
@@ -324,7 +339,7 @@ fn ckdPubFromIL(parent: ExtendedPubKey, index: u32, il: [32]u8, ir: [32]u8) CkdE
 
 /// "Neuter" an extended private key into its public counterpart (drops the
 /// private scalar, keeping depth/fingerprint/child-number/chain-code).
-pub fn neuter(priv: ExtendedPrivKey) std.crypto.errors.IdentityElementError!ExtendedPubKey {
+pub fn neuter(priv: *const ExtendedPrivKey) std.crypto.errors.IdentityElementError!ExtendedPubKey {
     return .{
         .depth = priv.depth,
         .parent_fingerprint = priv.parent_fingerprint,
@@ -346,7 +361,12 @@ fn writeHeader(payload: *[serialized_payload_len]u8, version: u32, depth: u8, pa
 
 /// Serialize an extended private key as `xprv...` (mainnet) or `tprv...`
 /// (testnet), Base58Check.
-pub fn serializePriv(k: ExtendedPrivKey, network: Network, out: []u8) bech32.base58.Error![]const u8 {
+pub fn serializePriv(k: *const ExtendedPrivKey, network: Network, out: []u8) bech32.base58.Error![]const u8 {
+    defer burnStack();
+    return serializePrivBody(k, network, out);
+}
+
+noinline fn serializePrivBody(k: *const ExtendedPrivKey, network: Network, out: []u8) bech32.base58.Error![]const u8 {
     var payload: [serialized_payload_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &payload); // carries the secret privkey
     writeHeader(&payload, network.privVersion(), k.depth, k.parent_fingerprint, k.child_number, k.chain_code);
@@ -396,7 +416,12 @@ pub const ParsedKey = union(enum) {
 /// violation, bad checksum, unknown version) is a distinct typed error, not
 /// a best-effort partial parse. Only `network`'s version bytes are accepted;
 /// the other network's are `error.WrongNetwork`.
-pub fn parseExtended(s: []const u8, network: Network) ParseError!ParsedKey {
+pub fn parseExtended(s: []const u8, network: Network, out: *ParsedKey) ParseError!void {
+    defer burnStack();
+    return parseExtendedBody(s, network, out);
+}
+
+noinline fn parseExtendedBody(s: []const u8, network: Network, out: *ParsedKey) ParseError!void {
     var buf: [bech32.base58.max_payload_len]u8 = undefined;
     // CONVENTIONS §2.1 Z1: for an xprv, `buf` holds the decoded private
     // scalar. The `defer` is registered *before* the fallible decode and
@@ -443,18 +468,19 @@ pub fn parseExtended(s: []const u8, network: Network) ParseError!ParsedKey {
         if (!canonical or std.mem.allEqual(u8, &priv, 0)) {
             return error.PrivateKeyOutOfRange;
         }
-        return .{ .private = .{
+        out.* = .{ .private = .{
             .depth = depth,
             .parent_fingerprint = parent_fp,
             .child_number = child_number,
             .chain_code = chain_code,
             .privkey = priv,
         } };
+        return;
     }
     var pk: [33]u8 = undefined;
     @memcpy(&pk, payload[45..78]);
     _ = Secp256k1.fromSec1(&pk) catch return error.InvalidPublicKey;
-    return .{ .public = .{
+    out.* = .{ .public = .{
         .depth = depth,
         .parent_fingerprint = parent_fp,
         .child_number = child_number,
@@ -530,55 +556,101 @@ pub fn parsePath(path: []const u8, out: []u32) PathError![]const u32 {
 
 /// Derive `master` along `path` (raw indices, e.g. from `parsePath`) via
 /// repeated `ckdPriv`.
-pub fn derivePath(master: ExtendedPrivKey, path: []const u32) CkdError!ExtendedPrivKey {
-    var cur = master;
-    for (path) |idx| cur = try ckdPriv(cur, idx);
-    return cur;
+pub fn derivePath(master: *const ExtendedPrivKey, path: []const u32, out: *ExtendedPrivKey) CkdError!void {
+    defer burnStack();
+    return derivePathBody(master, path, out);
 }
+
+/// `out` may alias `master`: it is written once, after the last read.
+noinline fn derivePathBody(master: *const ExtendedPrivKey, path: []const u32, out: *ExtendedPrivKey) CkdError!void {
+    var cur = master.*;
+    defer cur.deinit();
+    for (path) |idx| try ckdPrivBody(&cur, null, idx, &cur);
+    out.* = cur;
+}
+
+// ── dead-stack burn ──────────────────────────────────────────────────────
+
+/// Review 2026-10-08 (HIGH). Zeroing named buffers (Z1) did not keep keys off
+/// the stack: measured with `stackprobe_test.zig` (ReleaseFast), every entry
+/// point that touches a private key left it in dead callee frames the source
+/// has no name for — `masterFromSeed` the seed and the master key (big- and
+/// little-endian, SHA-512 word image) and chain code, `ckdPriv` the parent key
+/// and up to four copies of the child key, `derivePath` the leaf key,
+/// `parseExtended` the parsed key. Part of it was the `ExtendedPrivKey`
+/// parameter passed by value (77 B, copied at the call boundary, outside any
+/// wipe), hence the `*const` parameters. The rest is the `bip340` F2 fix:
+/// every public entry point runs its body one frame down (`noinline`), then
+/// zeroes `stack_burn` bytes at that depth. `noinline` on both is
+/// load-bearing.
+noinline fn burnStack() void {
+    // Volatile word stores, not `secureZero`: that is a volatile byte memset,
+    // and without libc the memset behind it moves ~3 B/ns — 2.5 µs per 8 KiB
+    // against 0.3 µs for this loop (ReleaseFast, 2026-10-08). `volatile`
+    // keeps the dead stores and keeps them from becoming a memset call.
+    var buf: [stack_burn / 8]u64 = undefined;
+    const p: [*]volatile u64 = &buf;
+    for (0..buf.len) |i| p[i] = 0;
+}
+
+/// The deepest body (`ckdPriv`, with `k256`'s own 8 KiB burn under it)
+/// dirtied 8.9 KiB in ReleaseFast (2026-10-08); `stackprobe_test.zig` goes
+/// red when a call tree outgrows this.
+const stack_burn = 16 * 1024;
 
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
+/// Destination for calls a test expects to fail.
+var scratch_key: ExtendedPrivKey = undefined;
+var scratch_parsed: ParsedKey = undefined;
+
 test "masterFromSeed + serializePriv/serializePub round-trip via parseExtended" {
     const seed = [_]u8{0x01} ** 32;
-    var master = try masterFromSeed(&seed);
+    var master: ExtendedPrivKey = undefined;
+    try masterFromSeed(&seed, &master);
     defer master.deinit();
 
     var priv_buf: [max_serialized_len]u8 = undefined;
-    const xprv = try serializePriv(master, .mainnet, &priv_buf);
+    const xprv = try serializePriv(&master, .mainnet, &priv_buf);
 
-    const pub_key = try neuter(master);
+    const pub_key = try neuter(&master);
     var pub_buf: [max_serialized_len]u8 = undefined;
     const xpub = try serializePub(pub_key, .mainnet, &pub_buf);
 
-    const parsed_priv = try parseExtended(xprv, .mainnet);
+    var parsed_priv: ParsedKey = undefined;
+    try parseExtended(xprv, .mainnet, &parsed_priv);
     try testing.expect(parsed_priv == .private);
     try testing.expectEqualSlices(u8, &master.privkey, &parsed_priv.private.privkey);
     try testing.expectEqualSlices(u8, &master.chain_code, &parsed_priv.private.chain_code);
 
-    const parsed_pub = try parseExtended(xpub, .mainnet);
+    var parsed_pub: ParsedKey = undefined;
+    try parseExtended(xpub, .mainnet, &parsed_pub);
     try testing.expect(parsed_pub == .public);
     try testing.expectEqualSlices(u8, &pub_key.pubkey, &parsed_pub.public.pubkey);
 }
 
 test "ckdPriv hardened vs normal both derive, and neuter(ckdPriv) == ckdPub(neuter) for normal" {
     const seed = [_]u8{0xab} ** 32;
-    var master = try masterFromSeed(&seed);
+    var master: ExtendedPrivKey = undefined;
+    try masterFromSeed(&seed, &master);
     defer master.deinit();
-    const master_pub = try neuter(master);
+    const master_pub = try neuter(&master);
 
-    var hardened_child = try ckdPriv(master, hardened_offset + 0);
+    var hardened_child: ExtendedPrivKey = undefined;
+    try ckdPriv(&master, hardened_offset + 0, &hardened_child);
     defer hardened_child.deinit();
     try testing.expectEqual(@as(u8, 1), hardened_child.depth);
 
-    var normal_child = try ckdPriv(master, 5);
+    var normal_child: ExtendedPrivKey = undefined;
+    try ckdPriv(&master, 5, &normal_child);
     defer normal_child.deinit();
     try testing.expectEqual(@as(u8, 1), normal_child.depth);
 
     // Public derivation only works for the normal child (CKDpub can't
     // reproduce a hardened child — it never sees the private key).
-    const via_priv = try neuter(normal_child);
+    const via_priv = try neuter(&normal_child);
     const via_pub = try ckdPub(master_pub, 5);
     try testing.expectEqualSlices(u8, &via_priv.pubkey, &via_pub.pubkey);
     try testing.expectEqualSlices(u8, &via_priv.chain_code, &via_pub.chain_code);
@@ -592,21 +664,26 @@ test "ckdPrivWithParentPub matches ckdPriv exactly, for both hardened and normal
     // recompute; it must be bit-for-bit interchangeable with ckdPriv when
     // given the correct parent pubkey, for both derivation kinds.
     const seed = [_]u8{0x5e} ** 32;
-    var master = try masterFromSeed(&seed);
+    var master: ExtendedPrivKey = undefined;
+    try masterFromSeed(&seed, &master);
     defer master.deinit();
-    const master_pub = try neuter(master);
+    const master_pub = try neuter(&master);
 
-    var via_ckdpriv_h = try ckdPriv(master, hardened_offset + 3);
+    var via_ckdpriv_h: ExtendedPrivKey = undefined;
+    try ckdPriv(&master, hardened_offset + 3, &via_ckdpriv_h);
     defer via_ckdpriv_h.deinit();
-    var via_seam_h = try ckdPrivWithParentPub(master, master_pub.pubkey, hardened_offset + 3);
+    var via_seam_h: ExtendedPrivKey = undefined;
+    try ckdPrivWithParentPub(&master, master_pub.pubkey, hardened_offset + 3, &via_seam_h);
     defer via_seam_h.deinit();
     try testing.expectEqualSlices(u8, &via_ckdpriv_h.privkey, &via_seam_h.privkey);
     try testing.expectEqualSlices(u8, &via_ckdpriv_h.chain_code, &via_seam_h.chain_code);
     try testing.expectEqualSlices(u8, &via_ckdpriv_h.parent_fingerprint, &via_seam_h.parent_fingerprint);
 
-    var via_ckdpriv_n = try ckdPriv(master, 3);
+    var via_ckdpriv_n: ExtendedPrivKey = undefined;
+    try ckdPriv(&master, 3, &via_ckdpriv_n);
     defer via_ckdpriv_n.deinit();
-    var via_seam_n = try ckdPrivWithParentPub(master, master_pub.pubkey, 3);
+    var via_seam_n: ExtendedPrivKey = undefined;
+    try ckdPrivWithParentPub(&master, master_pub.pubkey, 3, &via_seam_n);
     defer via_seam_n.deinit();
     try testing.expectEqualSlices(u8, &via_ckdpriv_n.privkey, &via_seam_n.privkey);
     try testing.expectEqualSlices(u8, &via_ckdpriv_n.chain_code, &via_seam_n.chain_code);
@@ -620,9 +697,10 @@ test "ckdPub rejects a non-canonical IL (IL >= n, BIP-32 CKDpub step 3)" {
     // integer is far above the secp256k1 order n
     // (0xFFFF...FFFE BAAEDCE6 AF48A03B BFD25E8C D0364141).
     const seed = [_]u8{0xcd} ** 32;
-    var master = try masterFromSeed(&seed);
+    var master: ExtendedPrivKey = undefined;
+    try masterFromSeed(&seed, &master);
     defer master.deinit();
-    const master_pub = try neuter(master);
+    const master_pub = try neuter(&master);
 
     const non_canonical_il = [_]u8{0xff} ** 32;
     const ir = [_]u8{0x11} ** 32;
@@ -640,17 +718,19 @@ const u256_max_hex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 test "masterFromSeed rejects seeds outside BIP-32's 128-512-bit range (H3)" {
     // BIP-32 "Master key generation": seed length must be 128-512 bits.
     // Before this guard `masterFromSeed` took any length, including 0.
-    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{}));
-    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** 1));
-    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** (min_seed_bytes - 1)));
-    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** (max_seed_bytes + 1)));
-    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** 256));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{}, &scratch_key));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** 1, &scratch_key));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** (min_seed_bytes - 1), &scratch_key));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** (max_seed_bytes + 1), &scratch_key));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** 256, &scratch_key));
 
     // Positive control: the boundary lengths BIP-32 allows must still work —
     // both are real BIP-32 test vector lengths (vector 1 = 16B, vector 3/2 = 64B).
-    var min_ok = try masterFromSeed(&[_]u8{0x01} ** min_seed_bytes);
+    var min_ok: ExtendedPrivKey = undefined;
+    try masterFromSeed(&[_]u8{0x01} ** min_seed_bytes, &min_ok);
     min_ok.deinit();
-    var max_ok = try masterFromSeed(&[_]u8{0x01} ** max_seed_bytes);
+    var max_ok: ExtendedPrivKey = undefined;
+    try masterFromSeed(&[_]u8{0x01} ** max_seed_bytes, &max_ok);
     max_ok.deinit();
 }
 
@@ -662,7 +742,8 @@ test "parseExtended rejects private keys beyond n: a ladder, not just n and 0 (H
     // This builds the missing rungs directly: n+1, n+2, and 2^256-1, plus a
     // positive control at n-1 (the largest value the range check must ACCEPT).
     const seed = [_]u8{0x01} ** 32;
-    var master = try masterFromSeed(&seed);
+    var master: ExtendedPrivKey = undefined;
+    try masterFromSeed(&seed, &master);
     defer master.deinit();
 
     const Case = struct { hex: []const u8, want_error: bool };
@@ -683,11 +764,12 @@ test "parseExtended rejects private keys beyond n: a ladder, not just n and 0 (H
             .privkey = priv,
         };
         var buf: [max_serialized_len]u8 = undefined;
-        const xprv = try serializePriv(forged, .mainnet, &buf);
+        const xprv = try serializePriv(&forged, .mainnet, &buf);
         if (c.want_error) {
-            try testing.expectError(error.PrivateKeyOutOfRange, parseExtended(xprv, .mainnet));
+            try testing.expectError(error.PrivateKeyOutOfRange, parseExtended(xprv, .mainnet, &scratch_parsed));
         } else {
-            const parsed = try parseExtended(xprv, .mainnet);
+            var parsed: ParsedKey = undefined;
+            try parseExtended(xprv, .mainnet, &parsed);
             try testing.expect(parsed == .private);
         }
     }
@@ -699,9 +781,10 @@ test "ckdPub rejects IL near n, not just an all-0xFF pattern (M2 weaken-resistan
     // il[31]==0xff`) still passes it. n itself and n+1 are the values
     // actually adjacent to the boundary the guard exists to enforce.
     const seed = [_]u8{0xcd} ** 32;
-    var master = try masterFromSeed(&seed);
+    var master: ExtendedPrivKey = undefined;
+    try masterFromSeed(&seed, &master);
     defer master.deinit();
-    const master_pub = try neuter(master);
+    const master_pub = try neuter(&master);
     const ir = [_]u8{0x11} ** 32;
 
     var il_n: [32]u8 = undefined;
@@ -734,13 +817,14 @@ test "ckdPriv's child_priv==0 reject is live code, not a dead branch (M1)" {
     // because the test knows the parent scalar — no honest HMAC output will
     // ever land on it.
     const seed = [_]u8{0x77} ** 32;
-    var master = try masterFromSeed(&seed);
+    var master: ExtendedPrivKey = undefined;
+    try masterFromSeed(&seed, &master);
     defer master.deinit();
-    const master_pub = try neuter(master);
+    const master_pub = try neuter(&master);
 
     const il_neg = try Secp256k1.scalar.neg(master.privkey, .big);
     const ir = [_]u8{0x33} ** 32;
-    try testing.expectError(error.InvalidChildKey, ckdPrivFromIL(master, master_pub.pubkey, 0, il_neg, ir));
+    try testing.expectError(error.InvalidChildKey, ckdPrivFromIL(&master, master_pub.pubkey, 0, il_neg, ir));
 }
 
 test "ckdPubFromIL's rejectIdentity reject is live code, distinct from rejectNonCanonical (M1)" {
@@ -749,9 +833,10 @@ test "ckdPubFromIL's rejectIdentity reject is live code, distinct from rejectNon
     // point, which is a DIFFERENT guard (`rejectIdentity`) from the IL>=n
     // check the M2 test above exercises.
     const seed = [_]u8{0x77} ** 32;
-    var master = try masterFromSeed(&seed);
+    var master: ExtendedPrivKey = undefined;
+    try masterFromSeed(&seed, &master);
     defer master.deinit();
-    const master_pub = try neuter(master);
+    const master_pub = try neuter(&master);
 
     const il_neg = try Secp256k1.scalar.neg(master.privkey, .big);
     const ir = [_]u8{0x44} ** 32;
@@ -767,16 +852,18 @@ test "parseExtended rejects non-78-byte payloads regardless of checksum validity
         var payload: [plen]u8 = [_]u8{0} ** plen;
         if (plen >= 4) std.mem.writeInt(u32, payload[0..4], version_mainnet_priv, .big);
         const s = try bech32.base58.checkEncode(&payload, &enc_buf);
-        try testing.expectError(error.InvalidLength, parseExtended(s, .mainnet));
+        try testing.expectError(error.InvalidLength, parseExtended(s, .mainnet, &scratch_parsed));
     }
     // Positive control: the real length still parses (any other test already
     // covers this; repeated here so this test alone proves 78 is special).
     const seed = [_]u8{0x09} ** 32;
-    var master = try masterFromSeed(&seed);
+    var master: ExtendedPrivKey = undefined;
+    try masterFromSeed(&seed, &master);
     defer master.deinit();
     var buf: [max_serialized_len]u8 = undefined;
-    const xprv = try serializePriv(master, .mainnet, &buf);
-    const parsed = try parseExtended(xprv, .mainnet);
+    const xprv = try serializePriv(&master, .mainnet, &buf);
+    var parsed: ParsedKey = undefined;
+    try parseExtended(xprv, .mainnet, &parsed);
     try testing.expect(parsed == .private);
 }
 
@@ -837,17 +924,20 @@ test "parsePath rejects unbounded leading zeros: m/7 and m/007 must not be the s
 
 test "derivePath matches manual chained ckdPriv" {
     const seed = [_]u8{0x42} ** 32;
-    var master = try masterFromSeed(&seed);
+    var master: ExtendedPrivKey = undefined;
+    try masterFromSeed(&seed, &master);
     defer master.deinit();
 
     var out: [max_path_depth]u32 = undefined;
     const path = try parsePath("m/0'/1/2'", &out);
 
-    var manual = try ckdPriv(master, hardened_offset + 0);
-    manual = try ckdPriv(manual, 1);
-    manual = try ckdPriv(manual, hardened_offset + 2);
+    var manual: ExtendedPrivKey = undefined;
+    try ckdPriv(&master, hardened_offset + 0, &manual);
+    try ckdPriv(&manual, 1, &manual); // out aliasing parent is allowed
+    try ckdPriv(&manual, hardened_offset + 2, &manual);
 
-    var via_path = try derivePath(master, path);
+    var via_path: ExtendedPrivKey = undefined;
+    try derivePath(&master, path, &via_path);
     defer via_path.deinit();
     try testing.expectEqualSlices(u8, &manual.privkey, &via_path.privkey);
     try testing.expectEqualSlices(u8, &manual.chain_code, &via_path.chain_code);
@@ -857,6 +947,7 @@ test "parseExtended rejects a bad-length / bad-checksum string" {
     try testing.expectError(error.ChecksumMismatch, parseExtended(
         "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHL",
         .mainnet,
+        &scratch_parsed,
     ));
 }
 
@@ -888,21 +979,23 @@ const XKeyCorpus = struct {
 
     fn build(self: *XKeyCorpus) ![]const []const u8 {
         const master_seed = [_]u8{0x01} ** 32;
-        var master = try masterFromSeed(&master_seed);
+        var master: ExtendedPrivKey = undefined;
+        try masterFromSeed(&master_seed, &master);
         defer master.deinit();
 
         var priv_buf: [max_serialized_len]u8 = undefined;
-        const xprv = try serializePriv(master, .mainnet, &priv_buf);
-        const pub_key = try neuter(master);
+        const xprv = try serializePriv(&master, .mainnet, &priv_buf);
+        const pub_key = try neuter(&master);
         var pub_buf: [max_serialized_len]u8 = undefined;
         const xpub = try serializePub(pub_key, .mainnet, &pub_buf);
 
         // A derived child, so the depth/child-number/fingerprint fields are
         // non-zero on at least one seed rather than all-zero everywhere.
-        var child = try ckdPriv(master, hardened_offset + 44);
+        var child: ExtendedPrivKey = undefined;
+        try ckdPriv(&master, hardened_offset + 44, &child);
         defer child.deinit();
         var child_buf: [max_serialized_len]u8 = undefined;
-        const child_xprv = try serializePriv(child, .mainnet, &child_buf);
+        const child_xprv = try serializePriv(&child, .mainnet, &child_buf);
 
         var mutant: [xkey_fuzz_buf_len]u8 = undefined;
 
@@ -948,7 +1041,8 @@ fn fuzzParseExtended(_: void, smith: *std.testing.Smith) !void {
     // 0 keys parsed before, 7 of 8 non-empty (one seed IS the empty string)
     // and 3 parsed after.**
     const len: usize = smith.slice(&buf);
-    _ = parseExtended(buf[0..len], .mainnet) catch return;
+    var k: ParsedKey = undefined;
+    parseExtended(buf[0..len], .mainnet, &k) catch return;
 }
 
 test "corpus: every xkey seed reaches parseExtended, and the parsed count is pinned" {
@@ -971,7 +1065,9 @@ test "corpus: every xkey seed reaches parseExtended, and the parsed count is pin
         var buf: [xkey_fuzz_buf_len]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
-        if (parseExtended(buf[0..len], .mainnet)) |k| {
+        var parsed: ParsedKey = undefined;
+        if (parseExtended(buf[0..len], .mainnet, &parsed)) |_| {
+            const k = parsed;
             switch (k) {
                 .private => |p| {
                     var m = p;

@@ -126,6 +126,20 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## Threat model / scope caveats
 
+- **Secret residue on the dead stack** (review 2026-10-08, `src/stackprobe_test.zig`,
+  ReleaseFast). Wiping named buffers did not keep secrets off the stack: before the fix every
+  secret-handling entry point left its secret in dead callee frames (seed, master key and chain
+  code ×1-2 per call in big-/little-endian and SHA-512 word image; `ckdPriv` the parent key and
+  the child key ×4; `parseExtended` the parsed key; the bip39 functions the entropy or
+  `SHA-512(mnemonic)`). Fix, in two parts measured separately: (1) every public entry point
+  runs its body one frame down (`noinline`) and then zeroes `stack_burn` bytes (16 KiB bip32,
+  8 KiB bip39, volatile `u64` stores) at that depth — that removed all but one copy of the
+  RESULT key per call; (2) that last copy sat in the caller's own frame (the inlined wrapper's
+  error-union temporary, seen in the disassembly), so secret results go to an out-parameter
+  and `ExtendedPrivKey` parameters are pointers. After both: 0 residues in 30 needles over
+  11 entry points × 3 calls, negative control 0, positive control 1. The probe asserts it in
+  the ReleaseFast lane (skips in Debug/ReleaseSafe, where `undefined` is filled). What it does
+  not cover: the caller's own `ExtendedPrivKey` (its `deinit` is the caller's), and registers.
 - **Secret-material handling**: every stack buffer this module allocates
   that can hold private-key-derived bytes (`HMAC-SHA512` outputs in
   `masterFromSeed`/`ckdPriv`, the hardened-derivation `0x00 ‖ privkey ‖
@@ -159,8 +173,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
   | target | tainted | total | in-file | witness |
   |---|---|---|---|---|
-  | `master` — `masterFromSeed` | seed | 5 | 1 | 4 |
-  | `derive` — `derivePath` `m/44'/0'/0'/0/0` | master private scalar | 9 | 5 | 4 |
+  | `master` — `masterFromSeed` | seed | 6 | 2 | 4 |
+  | `derive` — `derivePath` `m/44'/0'/0'/0/0` | master private scalar | 29 | 25 | 4 |
   | `seed` — `mnemonicToSeed` | mnemonic | 2 | **0** | 2 |
   | `mnemonic` — `mnemonicToEntropy` | mnemonic | 5 | **3** | 2 |
 
@@ -173,6 +187,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     verdict on the scalars `scalar.add` parses (`common.zig:75`, 2) — the
     classes `k256`'s own rows already document. The contexts of all five
     derivation steps share these addresses.
+  - Re-measured 2026-10-08 after the dead-stack fix: `master` 2 is the same
+    `IL == 0` test (`bip32.zig:181`) inlined into `masterFromIL` and compiled
+    to two branches; `derive` 25 is the same five source contexts reached
+    from five return addresses (LLVM unrolled `derivePathBody`'s loop in the
+    harness build, so memcheck stops merging the five steps). No new source
+    line; context diff in `scripts/checks/ctgrind-expected.tsv`.
   - `seed`: PBKDF2-HMAC-SHA512 over the mnemonic is branch-free.
   - `mnemonic` 3 in-file, 2 witness (2026-09-16, finding M6-CT — `wordIndex`
     rewritten from a binary search to a full 2048-entry linear scan with a

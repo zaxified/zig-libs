@@ -87,6 +87,7 @@ test {
     _ = @import("bip32_vectors.zig");
     _ = @import("bip39_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names BIP-39 and BIP-32" {

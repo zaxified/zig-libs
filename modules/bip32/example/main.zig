@@ -81,24 +81,26 @@ pub fn main() !void {
 
     // ── BIP-32: seed -> master -> account -> receive address ──────────────
 
-    var master = try bip32.masterFromSeed(&seed);
+    var master: bip32.ExtendedPrivKey = undefined;
+    try bip32.masterFromSeed(&seed, &master);
     defer master.deinit();
     must(master.isMaster(), @src());
 
     var path_buf: [bip32.max_path_depth]u32 = undefined;
     const receive_indices = try bip32.parsePath(receive_path, &path_buf);
-    var receive_key = try bip32.derivePath(master, receive_indices);
+    var receive_key: bip32.ExtendedPrivKey = undefined;
+    try bip32.derivePath(&master, receive_indices, &receive_key);
     defer receive_key.deinit();
 
     var xprv_buf: [bip32.max_serialized_len]u8 = undefined;
-    const xprv = try bip32.serializePriv(receive_key, .mainnet, &xprv_buf);
+    const xprv = try bip32.serializePriv(&receive_key, .mainnet, &xprv_buf);
     // ACTUALLY RUN: the from-spec Python re-implementation (see file doc
     // comment), sanity-checked against BIP-32 Test Vector 1 first.
     const expected_xprv = "xprvA44AZhTuxqQYC15kQX4LrXdNFZaMZMaHXdgMS76DnTR4dASrhsrr7RscrS6UatP3v7oXTu8RvjPwQYzZPyNyoUD9uahvacPajSmyMyx7a59";
     must(std.mem.eql(u8, xprv, expected_xprv), @src());
     std.debug.print("receive xprv: {s}\n", .{xprv});
 
-    const receive_pub = try bip32.neuter(receive_key);
+    const receive_pub = try bip32.neuter(&receive_key);
     var xpub_buf: [bip32.max_serialized_len]u8 = undefined;
     const xpub = try bip32.serializePub(receive_pub, .mainnet, &xpub_buf);
     const expected_xpub = "xpub6H3WyCzooCxqQVADWYbMDfa6obQqxpJ8trbxEVVqLnx3Vxn1FRB6fEC6hjtXLJ6Djp7fkwxT1Qd1GgXLahjtcN8eSV4e94u8Jt3PCwEfGe8";
@@ -108,12 +110,14 @@ pub fn main() !void {
     // Round-trip both through the untrusted-text parser a wallet uses when
     // IMPORTING a key a user pasted in.
     {
-        const parsed = try bip32.parseExtended(xprv, .mainnet);
+        var parsed: bip32.ParsedKey = undefined;
+        try bip32.parseExtended(xprv, .mainnet, &parsed);
         must(parsed == .private, @src());
         must(std.mem.eql(u8, &parsed.private.privkey, &receive_key.privkey), @src());
     }
     {
-        const parsed = try bip32.parseExtended(xpub, .mainnet);
+        var parsed: bip32.ParsedKey = undefined;
+        try bip32.parseExtended(xpub, .mainnet, &parsed);
         must(parsed == .public, @src());
         must(std.mem.eql(u8, &parsed.public.pubkey, &receive_pub.pubkey), @src());
     }
@@ -122,16 +126,18 @@ pub fn main() !void {
     // receive addresses from it with no private key in reach ─────────────
     {
         const account_indices = try bip32.parsePath(account_path, &path_buf);
-        var account_key = try bip32.derivePath(master, account_indices);
+        var account_key: bip32.ExtendedPrivKey = undefined;
+        try bip32.derivePath(&master, account_indices, &account_key);
         defer account_key.deinit();
-        const account_pub = try bip32.neuter(account_key);
+        const account_pub = try bip32.neuter(&account_key);
 
         // The public helper a wallet UI uses to label "derived from key
         // with fingerprint XXXXXXXX" — checked against the actual parent
         // link BIP-32 recorded on a direct child of master (fingerprints
         // are only meaningful one level up, not across the full account path).
-        const master_pub = try bip32.neuter(master);
-        var purpose_key = try bip32.ckdPriv(master, bip32.hardened_offset + 44);
+        const master_pub = try bip32.neuter(&master);
+        var purpose_key: bip32.ExtendedPrivKey = undefined;
+        try bip32.ckdPriv(&master, bip32.hardened_offset + 44, &purpose_key);
         defer purpose_key.deinit();
         must(std.mem.eql(u8, &bip32.fingerprint(master_pub.pubkey), &purpose_key.parent_fingerprint), @src());
 
@@ -246,7 +252,8 @@ pub fn main() !void {
             if (c != last) break c;
         } else unreachable;
 
-        if (bip32.parseExtended(typo[0..xprv.len], .mainnet)) |_| {
+        var parsed: bip32.ParsedKey = undefined;
+        if (bip32.parseExtended(typo[0..xprv.len], .mainnet, &parsed)) |_| {
             return error.UnexpectedAccept;
         } else |err| switch (err) {
             error.ChecksumMismatch => std.debug.print("xprv checksum typo: ChecksumMismatch (expected)\n", .{}),
@@ -270,7 +277,8 @@ pub fn main() !void {
         var addr_buf: [bip32.max_serialized_len]u8 = undefined;
         const fake_tpub = try bech32.base58.checkEncode(&payload, &addr_buf);
 
-        if (bip32.parseExtended(fake_tpub, .mainnet)) |_| {
+        var parsed: bip32.ParsedKey = undefined;
+        if (bip32.parseExtended(fake_tpub, .mainnet, &parsed)) |_| {
             return error.UnexpectedAccept;
         } else |err| switch (err) {
             error.WrongNetwork => std.debug.print("testnet tpub pasted into mainnet parser: WrongNetwork (expected)\n", .{}),

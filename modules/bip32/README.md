@@ -46,16 +46,19 @@ try bip32.mnemonic.mnemonicToSeed(phrase, "my passphrase", &seed); // PBKDF2-HMA
 **BIP-32 — master key + child derivation:**
 
 ```zig
-var master = try bip32.masterFromSeed(&seed);
+var master: bip32.ExtendedPrivKey = undefined;
+try bip32.masterFromSeed(&seed, &master);
 defer master.deinit(); // zeroes the secret privkey/chain_code fields
 
-var hardened_child = try bip32.ckdPriv(master, bip32.hardened_offset + 0); // m/0'
+var hardened_child: bip32.ExtendedPrivKey = undefined;
+try bip32.ckdPriv(&master, bip32.hardened_offset + 0, &hardened_child); // m/0'
 defer hardened_child.deinit();
 
-var normal_child = try bip32.ckdPriv(master, 5); // m/5
+var normal_child: bip32.ExtendedPrivKey = undefined;
+try bip32.ckdPriv(&master, 5, &normal_child); // m/5
 defer normal_child.deinit();
 
-const pubkey_only = try bip32.neuter(master); // drop the private key
+const pubkey_only = try bip32.neuter(&master); // drop the private key
 const via_pub = try bip32.ckdPub(pubkey_only, 5); // watch-only derivation, normal children only
 ```
 
@@ -64,7 +67,8 @@ const via_pub = try bip32.ckdPub(pubkey_only, 5); // watch-only derivation, norm
 ```zig
 var path_buf: [bip32.max_path_depth]u32 = undefined;
 const path = try bip32.parsePath("m/44'/0'/0'/0/0", &path_buf);
-var derived = try bip32.derivePath(master, path);
+var derived: bip32.ExtendedPrivKey = undefined;
+try bip32.derivePath(&master, path, &derived);
 defer derived.deinit();
 ```
 
@@ -72,14 +76,15 @@ defer derived.deinit();
 
 ```zig
 var out: [bip32.max_serialized_len]u8 = undefined;
-const xprv = try bip32.serializePriv(master, .mainnet, &out);
+const xprv = try bip32.serializePriv(&master, .mainnet, &out);
 
-const pub_key = try bip32.neuter(master);
+const pub_key = try bip32.neuter(&master);
 const xpub = try bip32.serializePub(pub_key, .mainnet, &out);
 
 // ParsedKey union(enum) { private, public }; a key from the other network is
 // error.WrongNetwork, never silently read as this one.
-const parsed = try bip32.parseExtended(xprv, .mainnet);
+var parsed: bip32.ParsedKey = undefined;
+try bip32.parseExtended(xprv, .mainnet, &parsed);
 switch (parsed) {
     .private => |k| { /* ExtendedPrivKey */ },
     .public => |k| { /* ExtendedPubKey */ },
