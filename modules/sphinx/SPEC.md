@@ -114,6 +114,18 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## Threat model / limits
 
+- **Secret residue on the dead stack** (review 2026-10-08, `src/stackprobe_test.zig`,
+  ReleaseFast, BOLT#4 vector inputs). Before: `deriveHopSecrets` left blinded ephemeral scalars
+  and a blinding factor in dead frames, `construct` additionally `rho`/`mu`/`pad` keys and the
+  session key, `process` the node's private key and the hop's `mu` (one ephemeral scalar plus the
+  public blinding chain is the whole route's key schedule). Fix (BREAKING): the three entry
+  points take the secret 32-byte key by pointer (`*const [32]u8` — an array passed by value is
+  copied into the CALLER's frame) and run their body one frame down, followed by a 40 KiB zeroing
+  at that depth (volatile `u64` stores; `process` dirties 32 KiB, `k256`'s 16 KiB `mul` burn
+  included). After: 0 over 31 needles (session key, node key, `e_1..e_4` BE+LE, blinding
+  factors, every `ss_i`/`rho_i`/`mu_i`, pad key) × 4 calls × 3 repeats, negative 0, positive 1.
+  Not covered: `generateKey`/`generateCipherStream` called directly (the ChaCha20 state holds
+  `rho`; same class as `chachapoly`'s backlog "Key copies on the dead stack").
 - **Per-hop unlinkability is the module's entire reason to exist.** Two
   distinct properties, both required, neither sufficient alone:
   - **Ephemeral-key blinding** (`deriveHopSecrets`'s blinding-factor chain,
@@ -187,7 +199,11 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     construction like the HMAC gate (`core.zig:437`). Re-measured 2026-10-06:
     `process` 40 in-file contexts before and after, line for line the same;
     the one at `core.zig:480` is the branch on the verdict (the hop's own
-    forward-or-deliver decision), not the comparison.
+    forward-or-deliver decision), not the comparison. Re-measured
+    2026-10-08 after the dead-stack fix: `construct` 7 (k256's comb identity
+    rejection 2 -> 1), `process` 44 — the +4 are memcpy contexts on the same
+    source line as before (the next `hop_payloads` copied from the decrypted
+    frame's offset), chunked differently; diff in `ctgrind-expected.tsv`.
 - **Out of scope for this module** (left to whatever protocol layer wires
   it in): the `payload` TLV field's own value semantics (`amt_to_forward`,
   `short_channel_id`, `payment_data`, etc. — BOLT#4's own payload-format

@@ -72,11 +72,11 @@ WITHOUT their bigsize length prefix — `construct` adds it per hop):
 
 ```zig
 var secrets: [n]sphinx.HopSecret = undefined;
-try sphinx.deriveHopSecrets(session_key, hop_pubkeys, &secrets);
+try sphinx.deriveHopSecrets(&session_key, hop_pubkeys, &secrets);
 
-const pkt = try sphinx.construct(session_key, hop_pubkeys, hop_payloads, associated_data);
+const pkt = try sphinx.construct(&session_key, hop_pubkeys, hop_payloads, associated_data);
 
-const result = try sphinx.process(node_privkey, pkt, associated_data);
+const result = try sphinx.process(&node_privkey, pkt, associated_data);
 const this_hops_tlv = result.payload();
 if (result.next_packet) |next| {
     // forward next.toBytes() to the next hop

@@ -172,7 +172,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             const associated_data = hexN(32, v.associated_data);
 
-            const pkt = try sphinx.construct(session_key, &pk_storage, &tlvs, &associated_data);
+            const pkt = try sphinx.construct(&session_key, &pk_storage, &tlvs, &associated_data);
 
             // Propagation witness: both fields are downstream of the whole
             // forward chain + reverse wrap loop.
@@ -196,7 +196,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // runs its "false" path against a real, non-degenerate
             // `next_hmac` -- the exact branch the audit brief flagged as the
             // interesting one (it decides "deliver here" vs. "forward").
-            const result = try sphinx.process(node_privkey, pkt, &associated_data);
+            const result = try sphinx.process(&node_privkey, pkt, &associated_data);
 
             // ⚠ TWO ways of reaching the payload are wrong here, both measured
             // on 2026-09-09 rather than reasoned about:

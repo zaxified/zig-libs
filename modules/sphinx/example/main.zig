@@ -90,7 +90,7 @@ pub fn main() !void {
     // helper — see its doc comment) so this example can print + cross-
     // check its output against an independent oracle below. ────────────
     var hop_secrets: [num_hops]sphinx.HopSecret = undefined;
-    try sphinx.deriveHopSecrets(session_key, &node_pubkeys, &hop_secrets);
+    try sphinx.deriveHopSecrets(&session_key, &node_pubkeys, &hop_secrets);
     printHex("node_pubkey_0", &node_pubkeys[0]);
     printHex("hop0 ephemeral_pubkey (epk_0 = session_key*G)", &hop_secrets[0].ephemeral_pubkey);
     printHex("hop0 shared_secret", &hop_secrets[0].shared_secret);
@@ -99,14 +99,14 @@ pub fn main() !void {
     // ── Build the full onion, put it "on the wire", and peel it hop by
     // hop — each iteration re-parses from bytes, the way a real
     // forwarding node receives it, never touching `session_key` again. ──
-    const packet = try sphinx.construct(session_key, &node_pubkeys, &payloads, &associated_data);
+    const packet = try sphinx.construct(&session_key, &node_pubkeys, &payloads, &associated_data);
     must(std.mem.eql(u8, &packet.public_key, &hop_secrets[0].ephemeral_pubkey), @src());
 
     var wire = packet.toBytes();
     var hop: usize = 0;
     while (hop < num_hops) : (hop += 1) {
         const received = try sphinx.OnionPacket.fromSlice(&wire);
-        const result = try sphinx.process(node_privkeys[hop], received, &associated_data);
+        const result = try sphinx.process(&node_privkeys[hop], received, &associated_data);
         must(std.mem.eql(u8, result.payload(), payloads[hop]), @src());
         std.debug.print("hop {d}: recovered its own payload ({d} bytes), next_packet={s}\n", .{ hop, result.payload().len, if (result.next_packet != null) "present" else "null (final hop)" });
 
@@ -153,7 +153,7 @@ pub fn main() !void {
     {
         var tampered = packet;
         tampered.hop_payloads[0] ^= 0x01;
-        if (sphinx.process(node_privkeys[0], tampered, &associated_data)) |_| {
+        if (sphinx.process(&node_privkeys[0], tampered, &associated_data)) |_| {
             return error.UnexpectedAccept;
         } else |err| switch (err) {
             error.IntegrityCheckFailed => std.debug.print("tampered hop_payloads byte: IntegrityCheckFailed (expected)\n", .{}),
@@ -162,7 +162,7 @@ pub fn main() !void {
     }
     {
         // hop 2's key trying to process the packet meant for hop 0.
-        if (sphinx.process(node_privkeys[2], packet, &associated_data)) |_| {
+        if (sphinx.process(&node_privkeys[2], packet, &associated_data)) |_| {
             return error.UnexpectedAccept;
         } else |err| switch (err) {
             error.IntegrityCheckFailed => std.debug.print("wrong hop key (hop2 processing hop0's packet): IntegrityCheckFailed (expected)\n", .{}),

@@ -117,6 +117,7 @@ test {
     _ = core;
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names BOLT#4" {

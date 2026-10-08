@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** measured with the new
+  ReleaseFast stack probe, `deriveHopSecrets`, `construct` and `process` left the session key or
+  node key, blinded ephemeral scalars, blinding factors and `rho`/`mu`/`pad` keys in dead stack
+  frames. Each now runs one frame down and zeroes 40 KiB at that depth; the secret key comes in
+  by pointer: `deriveHopSecrets(&session_key, …)`, `construct(&session_key, …)`,
+  `process(&node_privkey, …)`. (`loopix`'s routing test updated.)
 - **2026-10-06** — **NO BEHAVIOURAL CHANGE (constant time by construction):** `process`'s
   final-hop test compares the deobfuscated `next_hmac` with zero through
   `std.crypto.timing_safe.eql` instead of `std.mem.allEqual`, whose constant time was an accident

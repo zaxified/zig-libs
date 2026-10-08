@@ -138,11 +138,11 @@ test "sphinx plumbing: a real onion carries (next_hop, delay) per hop and peels 
 
     const session_key = [_]u8{0x42} ** 32;
     const ad = "loopix-mix";
-    var pkt = try sphinx.construct(session_key, &pubs, &payloads, ad);
+    var pkt = try sphinx.construct(&session_key, &pubs, &payloads, ad);
 
     // Peel the onion mix by mix; each recovers its own instruction.
     for (0..3) |i| {
-        const res = try sphinx.process(privs[i], pkt, ad);
+        const res = try sphinx.process(&privs[i], pkt, ad);
         const inst = HopInstruction.decode(res.payload());
         const expect_next: NodeId = if (i + 1 < 3) route_mixes[i + 1] else dest;
         try testing.expectEqual(expect_next, inst.next_hop);

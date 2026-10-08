@@ -154,10 +154,10 @@ fn katPayloadTlvs(storage: *[5][300]u8) ![5][]const u8 {
     return out;
 }
 
-test "KAT: deriveHopSecrets(session_key, pubkeys) equals kat_vectors.shared_secrets[0..5]" {
+test "KAT: deriveHopSecrets(&session_key, pubkeys) equals kat_vectors.shared_secrets[0..5]" {
     const hop_pubkeys = katPubkeys();
     var out: [5]sphinx.HopSecret = undefined;
-    try sphinx.deriveHopSecrets(hexN(32, v.session_key), &hop_pubkeys, &out);
+    try sphinx.deriveHopSecrets(&hexN(32, v.session_key), &hop_pubkeys, &out);
     inline for (v.shared_secrets, 0..) |expected_hex, i| {
         try testing.expectEqualSlices(u8, &hexN(32, expected_hex), &out[i].shared_secret);
     }
@@ -168,20 +168,20 @@ test "KAT: deriveHopSecrets(session_key, pubkeys) equals kat_vectors.shared_secr
     try testing.expect(!std.mem.eql(u8, &hop_pubkeys[1], &out[1].ephemeral_pubkey));
 }
 
-test "KAT: construct(...) equals kat_vectors.onion byte-exact" {
+test "KAT: construct(&...) equals kat_vectors.onion byte-exact" {
     const hop_pubkeys = katPubkeys();
     var storage: [5][300]u8 = undefined;
     const tlvs = try katPayloadTlvs(&storage);
     const associated_data = hexN(32, v.associated_data);
 
-    const pkt = try sphinx.construct(hexN(32, v.session_key), &hop_pubkeys, &tlvs, &associated_data);
+    const pkt = try sphinx.construct(&hexN(32, v.session_key), &hop_pubkeys, &tlvs, &associated_data);
     try testing.expectEqualSlices(u8, &hexN(sphinx.packet_len, v.onion), &pkt.toBytes());
 }
 
-test "KAT: process(node_privkeys[0], onion, associated_data) extracts payloads[0]'s TLV content" {
+test "KAT: process(&node_privkeys[0], onion, associated_data) extracts payloads[0]'s TLV content" {
     const pkt = try sphinx.OnionPacket.fromBytes(hexN(sphinx.packet_len, v.onion));
     const associated_data = hexN(32, v.associated_data);
-    const result = try sphinx.process(hexN(32, v.node_privkeys[0]), pkt, &associated_data);
+    const result = try sphinx.process(&hexN(32, v.node_privkeys[0]), pkt, &associated_data);
 
     // payloads[0] is bigsize(18) ++ 18-byte TLV; process returns the TLV.
     var storage: [5][300]u8 = undefined;
@@ -196,9 +196,9 @@ test "KAT: full construct -> process round-trip peels all 5 hops" {
     const tlvs = try katPayloadTlvs(&storage);
     const associated_data = hexN(32, v.associated_data);
 
-    var pkt = try sphinx.construct(hexN(32, v.session_key), &hop_pubkeys, &tlvs, &associated_data);
+    var pkt = try sphinx.construct(&hexN(32, v.session_key), &hop_pubkeys, &tlvs, &associated_data);
     inline for (v.node_privkeys, 0..) |privkey_hex, i| {
-        const result = try sphinx.process(hexN(32, privkey_hex), pkt, &associated_data);
+        const result = try sphinx.process(&hexN(32, privkey_hex), pkt, &associated_data);
         try testing.expectEqualSlices(u8, tlvs[i], result.payload());
         if (i + 1 < v.node_privkeys.len) {
             try testing.expect(result.next_packet != null);
@@ -218,14 +218,14 @@ test "KAT: a 1-bit hmac tamper on the official onion is IntegrityCheckFailed" {
     const associated_data = hexN(32, v.associated_data);
     try testing.expectError(
         error.IntegrityCheckFailed,
-        sphinx.process(hexN(32, v.node_privkeys[0]), pkt, &associated_data),
+        sphinx.process(&hexN(32, v.node_privkeys[0]), pkt, &associated_data),
     );
 
     // Same for the wrong node key: not the intended recipient -> fail closed.
     const good = try sphinx.OnionPacket.fromBytes(hexN(sphinx.packet_len, v.onion));
     try testing.expectError(
         error.IntegrityCheckFailed,
-        sphinx.process(hexN(32, v.node_privkeys[1]), good, &associated_data),
+        sphinx.process(&hexN(32, v.node_privkeys[1]), good, &associated_data),
     );
 }
 
@@ -258,6 +258,6 @@ test "KAT: a hop_payloads tamper that would decode to a RESERVED bigsize length 
     const associated_data = hexN(32, v.associated_data);
     try testing.expectError(
         error.IntegrityCheckFailed,
-        sphinx.process(hexN(32, v.node_privkeys[0]), pkt, &associated_data),
+        sphinx.process(&hexN(32, v.node_privkeys[0]), pkt, &associated_data),
     );
 }
