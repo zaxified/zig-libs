@@ -51,16 +51,18 @@ const shared = try bolt8.Secp256k1DH.dh(my_secret, remote_pub_33_bytes); // [32]
 var csprng = std.Random.DefaultCsprng.init(seed_from_getrandom);
 const entropy: bolt8.handshake.Ephemeral = .{ .csprng = csprng.random() };
 
-var initiator = bolt8.Initiator.init(my_static_keypair, responder_static_pubkey);
+var initiator = bolt8.Initiator.init(&my_static_keypair, responder_static_pubkey);
 const act1 = try initiator.genAct1(entropy);
 try initiator.readAct2(act2_from_wire);
-const done = try initiator.genAct3();
-// done.msg -> send over the wire; done.result -> bolt8.Transport.init(done.result)
+var done: bolt8.HandshakeResult = undefined; // transport keys: an out-parameter, see SPEC
+const act3 = try initiator.genAct3(&done);
+// act3 -> send over the wire; done -> bolt8.Transport.init(done)
 
-var responder = bolt8.Responder.init(my_static_keypair);
+var responder = bolt8.Responder.init(&my_static_keypair);
 try responder.readAct1(act1_from_wire);
 const act2 = try responder.genAct2(entropy);
-const result = try responder.readAct3(act3_from_wire);
+var result: bolt8.HandshakeResult = undefined;
+try responder.readAct3(act3_from_wire, &result);
 // result.remote_static is the PEER's static public key (in Lightning, its
 // node id) -- the one output of the handshake's authentication step. Check
 // it against whatever identity you expected to reach before trusting the

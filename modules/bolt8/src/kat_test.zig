@@ -12,6 +12,9 @@
 
 const std = @import("std");
 const testing = std.testing;
+
+/// Destination for act-three calls a test expects to fail.
+var scratch_result: handshake.HandshakeResult = undefined;
 const kv = @import("kat_vectors.zig");
 const dh = @import("dh.zig");
 const act = @import("act.zig");
@@ -22,7 +25,7 @@ const transport = @import("transport.zig");
 /// the state every "initiator receives Act Two" test starts from.
 fn initiatorAfterAct1() !handshake.Initiator {
     const ls = try dh.KeyPair.generateDeterministic(kv.init_ls_priv.*);
-    var initiator = handshake.Initiator.init(ls, kv.resp_ls_pub.*);
+    var initiator = handshake.Initiator.init(&ls, kv.resp_ls_pub.*);
     // Appendix A fixes `e.priv`, so this goes through the test-build-only
     // `genAct1WithEphemeral` hook — the ONLY way to pin the ephemeral since
     // the B6 seam audit; `genAct1` itself always draws from its `Ephemeral`.
@@ -38,7 +41,7 @@ fn initiatorAfterAct1() !handshake.Initiator {
 /// Act Three" test starts from.
 fn responderAfterAct2() !handshake.Responder {
     const ls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
-    var responder = handshake.Responder.init(ls);
+    var responder = handshake.Responder.init(&ls);
     try responder.readAct1(try act.Act1.fromBytes(kv.act1_bytes));
     const a2 = try responder.genAct2WithEphemeral(
         try dh.KeyPair.generateDeterministic(kv.resp_e_priv.*),
@@ -60,7 +63,8 @@ test "KAT: full 'transport-initiator successful handshake' — act1/act2/act3 + 
     // Act Three, initiator side: byte-exact wire message + published
     // transport keys (sk/rk from the INITIATOR's perspective) + the
     // post-split ck that seeds the rotation ratchet.
-    const a3 = try initiator.genAct3();
+    var a3: struct { msg: act.Act3, result: handshake.HandshakeResult } = undefined;
+    a3.msg = try initiator.genAct3(&a3.result);
     try testing.expectEqualSlices(u8, kv.act3_bytes, &a3.msg.toBytes());
     try testing.expectEqual(kv.init_sk.*, a3.result.sk);
     try testing.expectEqual(kv.init_rk.*, a3.result.rk);
@@ -70,7 +74,8 @@ test "KAT: full 'transport-initiator successful handshake' — act1/act2/act3 + 
     // responder's `rk` receives what the initiator's `sk` sends), same
     // ck, same final handshake hash, and the initiator's static key
     // correctly recovered from the encrypted `c` field.
-    const r = try responder.readAct3(try act.Act3.fromBytes(kv.act3_bytes));
+    var r: handshake.HandshakeResult = undefined;
+    try responder.readAct3(try act.Act3.fromBytes(kv.act3_bytes), &r);
     try testing.expectEqual(a3.result.sk, r.rk);
     try testing.expectEqual(a3.result.rk, r.sk);
     try testing.expectEqual(kv.init_sk.*, r.rk);
@@ -118,18 +123,18 @@ test "KAT: 'transport-initiator act2 bad MAC test' — readAct2 must fail closed
 
 test "KAT: 'transport-responder act1 bad MAC test' — readAct1 must fail closed with DecryptionFailed" {
     const ls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
-    var responder = handshake.Responder.init(ls);
+    var responder = handshake.Responder.init(&ls);
     try testing.expectError(error.DecryptionFailed, responder.readAct1(try act.Act1.fromBytes(kv.act1_bad_mac)));
 }
 
 test "KAT: 'transport-responder act3 bad MAC for ciphertext test' — readAct3 must fail closed on the c field" {
     var responder = try responderAfterAct2();
-    try testing.expectError(error.DecryptionFailed, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_ciphertext)));
+    try testing.expectError(error.DecryptionFailed, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_ciphertext), &scratch_result));
 }
 
 test "KAT: 'transport-responder act3 bad MAC test' — readAct3 must fail closed on the t field" {
     var responder = try responderAfterAct2();
-    try testing.expectError(error.DecryptionFailed, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_tag)));
+    try testing.expectError(error.DecryptionFailed, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_tag), &scratch_result));
 }
 
 // ── F5: a failed act kills the object, not just the one call ───────────────
@@ -140,7 +145,7 @@ test "F5: readAct3 failing on the t field does NOT leave rs_pub set, and re-ente
     // Same vector as the KAT test above: `c` (carrying rs) decrypts fine —
     // rs_pub gets set from a VALIDATED key — and only the final tag over
     // the whole transcript fails.
-    try testing.expectError(error.DecryptionFailed, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_tag)));
+    try testing.expectError(error.DecryptionFailed, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_tag), &scratch_result));
     // Before the fix: rs_pub stayed set to the peer's (unauthenticated,
     // since the handshake never actually completed) static key, and
     // `state` stayed `.awaiting_act3` -- re-enterable over a
@@ -150,8 +155,8 @@ test "F5: readAct3 failing on the t field does NOT leave rs_pub set, and re-ente
     // The object is dead now, not just "still waiting": neither a retry of
     // the failed act nor the genuine one that would have worked is let
     // through.
-    try testing.expectError(error.WrongState, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_tag)));
-    try testing.expectError(error.WrongState, responder.readAct3(try act.Act3.fromBytes(kv.act3_bytes)));
+    try testing.expectError(error.WrongState, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_tag), &scratch_result));
+    try testing.expectError(error.WrongState, responder.readAct3(try act.Act3.fromBytes(kv.act3_bytes), &scratch_result));
 }
 
 test "F5: readAct2 failing kills the initiator too, even though the transcript already moved" {
@@ -178,14 +183,14 @@ test "F5: Act One failing on a malformed rs, and readAct1 failing on a bad MAC, 
     // `h` already holding the first ephemeral -- a retry would run Act One
     // again over a transcript the responder can never match.
     const ls = try dh.KeyPair.generateDeterministic(kv.init_ls_priv.*);
-    var initiator = handshake.Initiator.init(ls, kv.bad_pubkey_serialization.*);
+    var initiator = handshake.Initiator.init(&ls, kv.bad_pubkey_serialization.*);
     const e = try dh.KeyPair.generateDeterministic(kv.init_e_priv.*);
     try testing.expectError(error.InvalidPublicKey, initiator.genAct1WithEphemeral(e));
     try testing.expectEqual(handshake.Initiator.State.failed, initiator.state);
     try testing.expectError(error.WrongState, initiator.genAct1WithEphemeral(e));
 
     const rls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
-    var responder = handshake.Responder.init(rls);
+    var responder = handshake.Responder.init(&rls);
     try testing.expectError(error.DecryptionFailed, responder.readAct1(try act.Act1.fromBytes(kv.act1_bad_mac)));
     try testing.expectEqual(handshake.Responder.State.failed, responder.state);
     try testing.expectError(error.WrongState, responder.readAct1(try act.Act1.fromBytes(kv.act1_bytes)));
@@ -196,7 +201,7 @@ test "KAT: 'transport-responder act1 bad key serialization test' — readAct1 mu
     // was the one embedded nowhere and exercised nowhere. The module
     // rejects it correctly today -- this pins that against regression.
     const ls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
-    var responder = handshake.Responder.init(ls);
+    var responder = handshake.Responder.init(&ls);
     try testing.expectError(error.InvalidPublicKey, responder.readAct1(try act.Act1.fromBytes(kv.act1_bad_key_serialization)));
     // Sanity check on the vector itself: exactly one byte different from
     // the accepted `act1_bytes` (the e.pub SEC1 prefix, index 1), so this
@@ -219,7 +224,7 @@ test "KAT: 'transport-responder act3 bad rs test' — a decryptable-but-unparsea
     // (same rejection class as kv.bad_recovered_static_key, real-tested
     // standalone in dh.zig).
     var responder = try responderAfterAct2();
-    try testing.expectError(error.InvalidPublicKey, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_rs_message)));
+    try testing.expectError(error.InvalidPublicKey, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_rs_message), &scratch_result));
     // The unvalidated key must NOT have been stored.
     try testing.expectEqual(@as(?[33]u8, null), responder.rs_pub);
 }
@@ -334,8 +339,8 @@ test "differential: BOLT#8 message-test frames are byte-identical under chachapo
 test "wiring sanity: Initiator.init/Responder.init from the published identities agree (delegates to handshake.zig's own KAT)" {
     const init_ls = try dh.KeyPair.generateDeterministic(kv.init_ls_priv.*);
     const resp_ls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
-    const initiator = handshake.Initiator.init(init_ls, kv.resp_ls_pub.*);
-    const responder = handshake.Responder.init(resp_ls);
+    const initiator = handshake.Initiator.init(&init_ls, kv.resp_ls_pub.*);
+    const responder = handshake.Responder.init(&resp_ls);
     try testing.expectEqual(initiator.ss.h, responder.ss.h);
     try testing.expectEqualSlices(u8, kv.ck_after_init, &initiator.ss.ck);
 }

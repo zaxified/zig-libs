@@ -107,26 +107,30 @@ pub fn main(init: std.process.Init.Minimal) !void {
     } else if (std.mem.eql(u8, target, "act3")) {
         // Responder Act Three: decrypts the peer's static key under temp_k2 and
         // runs one ECDH with its own ephemeral secret.
-        var i = root.Initiator.init(ils, rls.public_key);
-        var r = root.Responder.init(rls);
+        var i = root.Initiator.init(&ils, rls.public_key);
+        var r = root.Responder.init(&rls);
         const a1 = try i.genAct1(e);
         try r.readAct1(a1);
         const a2 = try r.genAct2(e);
         try i.readAct2(a2);
-        const fin = try i.genAct3();
+        var fin: struct { msg: root.act.Act3, result: root.HandshakeResult } = undefined;
+        fin.msg = try i.genAct3(&fin.result);
         taint(t, r.ephemeral.?.secret_key[0..]);
         taint(t, r.ss.cipher_state.k[0..]);
-        const res = try r.readAct3(fin.msg);
+        var res: root.HandshakeResult = undefined;
+        try r.readAct3(fin.msg, &res);
         std.debug.print("rk={x}\n", .{res.rk});
     } else if (std.mem.eql(u8, target, "transport")) {
-        var i = root.Initiator.init(ils, rls.public_key);
-        var r = root.Responder.init(rls);
+        var i = root.Initiator.init(&ils, rls.public_key);
+        var r = root.Responder.init(&rls);
         const a1 = try i.genAct1(e);
         try r.readAct1(a1);
         const a2 = try r.genAct2(e);
         try i.readAct2(a2);
-        const fin = try i.genAct3();
-        const rres = try r.readAct3(fin.msg);
+        var fin: struct { msg: root.act.Act3, result: root.HandshakeResult } = undefined;
+        fin.msg = try i.genAct3(&fin.result);
+        var rres: root.HandshakeResult = undefined;
+        try r.readAct3(fin.msg, &rres);
         var tx = root.Transport.init(fin.result);
         var rx = root.Transport.init(rres);
         // The transport keys and the rotation chaining key are the secrets.

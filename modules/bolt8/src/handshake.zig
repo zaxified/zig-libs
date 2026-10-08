@@ -247,8 +247,15 @@ pub const Initiator = struct {
     /// 3. The initiator mixes in the RESPONDER's known static public key:
     ///    `h = SHA256(h || rs.pub.serializeCompressed())`
     ///    (`.mixHash(&rs_pub)`).
-    pub fn init(ls: dh.KeyPair, rs_pub: [33]u8) Initiator {
-        var self = Initiator{ .ls = ls, .rs_pub = rs_pub };
+    pub fn init(ls: *const dh.KeyPair, rs_pub: [33]u8) Initiator {
+        defer burnStack();
+        return initBody(ls, rs_pub);
+    }
+
+    /// `var self` is a named copy of the static key: it stays in this frame
+    /// after the return, hence one frame down and burned like the acts.
+    noinline fn initBody(ls: *const dh.KeyPair, rs_pub: [33]u8) Initiator {
+        var self = Initiator{ .ls = ls.*, .rs_pub = rs_pub };
         self.ss.initializeSymmetric(protocol_name);
         self.ss.mixHash(prologue);
         self.ss.mixHash(&rs_pub);
@@ -272,6 +279,11 @@ pub const Initiator = struct {
     /// 7. Return `act.Act1{ .e_pub = e.pub, .tag = c }` for the caller to
     ///    send as `0 || e.pub || c` (`Act1.toBytes`).
     pub fn genAct1(self: *Initiator, ephemeral: Ephemeral) HandshakeError!act.Act1 {
+        defer burnStack();
+        return self.genAct1Body(ephemeral);
+    }
+
+    noinline fn genAct1Body(self: *Initiator, ephemeral: Ephemeral) HandshakeError!act.Act1 {
         return self.act1(dh.KeyPair.generate(ephemeral.source()));
     }
 
@@ -280,10 +292,11 @@ pub const Initiator = struct {
     /// Appendix A's fixed-`e.priv` vectors are reproduced byte-exact.
     pub const genAct1WithEphemeral = testOnly(genAct1WithEphemeralImpl);
     fn genAct1WithEphemeralImpl(self: *Initiator, e: dh.KeyPair) HandshakeError!act.Act1 {
+        defer burnStack();
         return self.act1(e);
     }
 
-    fn act1(self: *Initiator, e: dh.KeyPair) HandshakeError!act.Act1 {
+    noinline fn act1(self: *Initiator, e: dh.KeyPair) HandshakeError!act.Act1 {
         if (self.state != .start) return error.WrongState;
         errdefer self.state = .failed;
         self.ephemeral = e;
@@ -312,6 +325,11 @@ pub const Initiator = struct {
     ///    connection with no further messages).
     /// 6. `h = SHA256(h || c)` — automatic, inside `decryptAndHash`.
     pub fn readAct2(self: *Initiator, msg: act.Act2) HandshakeError!void {
+        defer burnStack();
+        return self.readAct2Body(msg);
+    }
+
+    noinline fn readAct2Body(self: *Initiator, msg: act.Act2) HandshakeError!void {
         if (self.state != .awaiting_act2) return error.WrongState;
         errdefer self.state = .failed;
         self.ss.mixHash(&msg.e_pub);
@@ -354,7 +372,17 @@ pub const Initiator = struct {
     /// 7. `rn = sn = 0` — true by construction: `split()`'s two
     ///    `CipherState`s both start at `n = 0`.
     /// 8. `rck = sck = ck` — `HandshakeResult.ck = ss.ck` (see step 6).
-    pub fn genAct3(self: *Initiator) HandshakeError!struct { msg: act.Act3, result: HandshakeResult } {
+    ///
+    /// The transport keys go to `out` rather than into the return value: a
+    /// returned `HandshakeResult` lands in a temporary of the CALLER's frame
+    /// that no wipe here reaches (see `burnStack`). `out` is written only on
+    /// success.
+    pub fn genAct3(self: *Initiator, out: *HandshakeResult) HandshakeError!act.Act3 {
+        defer burnStack();
+        return self.genAct3Body(out);
+    }
+
+    noinline fn genAct3Body(self: *Initiator, out: *HandshakeResult) HandshakeError!act.Act3 {
         if (self.state != .ready_act3) return error.WrongState;
         errdefer self.state = .failed;
         // Step 1: encrypt the local static key at nonce 1 — `ss` is STILL
@@ -372,16 +400,14 @@ pub const Initiator = struct {
         // `rck = sck = ck` value (doc comment steps 6-8).
         const pair = self.ss.split();
         self.state = .done;
-        return .{
-            .msg = .{ .c = c, .t = t },
-            .result = .{
-                .sk = pair[0].k,
-                .rk = pair[1].k,
-                .ck = self.ss.ck,
-                .handshake_hash = self.ss.getHandshakeHash(),
-                .remote_static = self.rs_pub,
-            },
+        out.* = .{
+            .sk = pair[0].k,
+            .rk = pair[1].k,
+            .ck = self.ss.ck,
+            .handshake_hash = self.ss.getHandshakeHash(),
+            .remote_static = self.rs_pub,
         };
+        return .{ .c = c, .t = t };
     }
 };
 
@@ -423,8 +449,14 @@ pub const Responder = struct {
     /// ls.pub.serializeCompressed())`") rather than a remote one — both
     /// sides end up mixing in the SAME bytes (the responder's static
     /// key), just from their own local/remote perspective.
-    pub fn init(ls: dh.KeyPair) Responder {
-        var self = Responder{ .ls = ls };
+    pub fn init(ls: *const dh.KeyPair) Responder {
+        defer burnStack();
+        return initBody(ls);
+    }
+
+    /// See `Initiator.initBody`.
+    noinline fn initBody(ls: *const dh.KeyPair) Responder {
+        var self = Responder{ .ls = ls.* };
         self.ss.initializeSymmetric(protocol_name);
         self.ss.mixHash(prologue);
         self.ss.mixHash(&ls.public_key);
@@ -448,6 +480,11 @@ pub const Responder = struct {
     ///    key"; spec: MUST terminate with no further messages).
     /// 7. `h = SHA256(h || c)` — automatic.
     pub fn readAct1(self: *Responder, msg: act.Act1) HandshakeError!void {
+        defer burnStack();
+        return self.readAct1Body(msg);
+    }
+
+    noinline fn readAct1Body(self: *Responder, msg: act.Act1) HandshakeError!void {
         if (self.state != .start) return error.WrongState;
         errdefer self.state = .failed;
         self.ss.mixHash(&msg.e_pub);
@@ -474,6 +511,11 @@ pub const Responder = struct {
     ///    (`ss.encryptAndHash(&.{}, &c_out)`).
     /// 6. `h = SHA256(h || c)` — automatic.
     pub fn genAct2(self: *Responder, ephemeral: Ephemeral) HandshakeError!act.Act2 {
+        defer burnStack();
+        return self.genAct2Body(ephemeral);
+    }
+
+    noinline fn genAct2Body(self: *Responder, ephemeral: Ephemeral) HandshakeError!act.Act2 {
         return self.act2(dh.KeyPair.generate(ephemeral.source()));
     }
 
@@ -482,10 +524,11 @@ pub const Responder = struct {
     /// `Initiator.genAct1WithEphemeral`.
     pub const genAct2WithEphemeral = testOnly(genAct2WithEphemeralImpl);
     fn genAct2WithEphemeralImpl(self: *Responder, e: dh.KeyPair) HandshakeError!act.Act2 {
+        defer burnStack();
         return self.act2(e);
     }
 
-    fn act2(self: *Responder, e: dh.KeyPair) HandshakeError!act.Act2 {
+    noinline fn act2(self: *Responder, e: dh.KeyPair) HandshakeError!act.Act2 {
         if (self.state != .ready_act2) return error.WrongState;
         errdefer self.state = .failed;
         self.ephemeral = e;
@@ -536,7 +579,15 @@ pub const Responder = struct {
     /// 10. `rck = sck = ck` — `HandshakeResult.ck = ss.ck` (same
     ///     post-`split()`-is-unmutated property as `Initiator.genAct3`
     ///     step 6 relies on).
-    pub fn readAct3(self: *Responder, msg: act.Act3) HandshakeError!HandshakeResult {
+    ///
+    /// The transport keys go to `out` — see `Initiator.genAct3`. `out` is
+    /// written only on success.
+    pub fn readAct3(self: *Responder, msg: act.Act3, out: *HandshakeResult) HandshakeError!void {
+        defer burnStack();
+        return self.readAct3Body(msg, out);
+    }
+
+    noinline fn readAct3Body(self: *Responder, msg: act.Act3, out: *HandshakeResult) HandshakeError!void {
         if (self.state != .awaiting_act3) return error.WrongState;
         errdefer self.state = .failed;
         // Step 3: decrypt the initiator's static key at nonce 1 — `ss` is
@@ -566,7 +617,7 @@ pub const Responder = struct {
         // step 8).
         const pair = self.ss.split();
         self.state = .done;
-        return .{
+        out.* = .{
             .sk = pair[1].k,
             .rk = pair[0].k,
             .ck = self.ss.ck,
@@ -576,9 +627,34 @@ pub const Responder = struct {
     }
 };
 
+/// Review 2026-10-08 (HIGH; SPEC § Backlog "Dead-stack copies", until then
+/// unmeasured). `deinit` wipes what the handshake objects own, and nothing
+/// wiped the copies in dead frames: measured with `stackprobe_test.zig`
+/// (ReleaseFast), every act left its private keys, DH outputs, chaining and
+/// cipher keys there — `genAct3`/`readAct3` the transport keys `sk` ×4 and
+/// `rk` ×3 per handshake. Every act now runs one frame down (`noinline`) and
+/// then zeroes `stack_burn` bytes at that depth; the keypairs come in by
+/// pointer and the transport keys go out through `out`. Volatile word
+/// stores, not `secureZero`: without libc the memset behind it moves ~3 B/ns
+/// — 2.5 µs per 8 KiB against 0.3 µs for this loop (2026-10-08). `noinline`
+/// is load-bearing.
+noinline fn burnStack() void {
+    var buf: [stack_burn / 8]u64 = undefined;
+    const p: [*]volatile u64 = &buf;
+    for (0..buf.len) |i| p[i] = 0;
+}
+
+/// The deepest act (`k256`'s own 16 KiB `mul` burn under it) dirtied
+/// 17.7 KiB in ReleaseFast (2026-10-08); `stackprobe_test.zig` goes red when
+/// a call tree outgrows this.
+const stack_burn = 24 * 1024;
+
 // ── tests ─────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// Destination for act-three calls a test expects to fail.
+var scratch_result: HandshakeResult = undefined;
 
 test "Suite(dh, ChaChaPoly, SHA256) type-checks and its SymmetricState is DH-agnostic (see module doc comment)" {
     try testing.expectEqual(@as(usize, 32), Suite.HASHLEN);
@@ -608,8 +684,8 @@ test "Initiator.init / Responder.init: BOLT#8 'Handshake State Initialization' m
     const init_ls = try dh.KeyPair.generateDeterministic([_]u8{0x11} ** 32);
     const resp_ls = try dh.KeyPair.generateDeterministic([_]u8{0x21} ** 32);
 
-    const initiator = Initiator.init(init_ls, resp_ls.public_key);
-    const responder = Responder.init(resp_ls);
+    const initiator = Initiator.init(&init_ls, resp_ls.public_key);
+    const responder = Responder.init(&resp_ls);
 
     // Both sides mix in the SAME bytes (the responder's static key) as
     // their final pre-message step, so their running `h`/`ck` must match
@@ -673,7 +749,7 @@ test "genAct1/genAct2 ALWAYS draw: the stored ephemeral is an output, and pre-se
     const attacker_fixed = try dh.KeyPair.generateDeterministic([_]u8{0x42} ** 32);
 
     var prng = std.Random.DefaultPrng.init(0xb01783);
-    var initiator = Initiator.init(ls, rs.public_key);
+    var initiator = Initiator.init(&ls, rs.public_key);
     initiator.ephemeral = attacker_fixed; // inert since B6: never read as input
     const a1 = try initiator.genAct1(.{ .seeded_for_test = prng.random() });
 
@@ -687,17 +763,17 @@ test "genAct1/genAct2 ALWAYS draw: the stored ephemeral is an output, and pre-se
     // seed reproduces it, a different seed does not. (Without this half the
     // test would also pass against a hardcoded key.)
     var same = std.Random.DefaultPrng.init(0xb01783);
-    var i_same = Initiator.init(ls, rs.public_key);
+    var i_same = Initiator.init(&ls, rs.public_key);
     const a1_same = try i_same.genAct1(.{ .seeded_for_test = same.random() });
     try testing.expectEqual(a1.e_pub, a1_same.e_pub);
 
     var other = std.Random.DefaultPrng.init(0xb01784);
-    var i_other = Initiator.init(ls, rs.public_key);
+    var i_other = Initiator.init(&ls, rs.public_key);
     const a1_other = try i_other.genAct1(.{ .seeded_for_test = other.random() });
     try testing.expect(!std.mem.eql(u8, &a1.e_pub, &a1_other.e_pub));
 
     // Same three properties on the responder side.
-    var responder = Responder.init(rs);
+    var responder = Responder.init(&rs);
     try responder.readAct1(a1);
     responder.ephemeral = attacker_fixed;
     var rprng = std.Random.DefaultPrng.init(0xdeadbeef);
@@ -712,10 +788,10 @@ test "act ordering is enforced: no second genAct1/genAct2 can silently reuse the
     var prng = std.Random.DefaultPrng.init(0x60177);
     const rnd: Ephemeral = .{ .seeded_for_test = prng.random() };
 
-    var initiator = Initiator.init(ls, rs.public_key);
+    var initiator = Initiator.init(&ls, rs.public_key);
     // Out of order the other way: Act Two / Act Three before Act One.
     try testing.expectError(error.WrongState, initiator.readAct2(.{ .e_pub = rs.public_key, .tag = @splat(0) }));
-    try testing.expectError(error.WrongState, initiator.genAct3());
+    try testing.expectError(error.WrongState, initiator.genAct3(&scratch_result));
 
     const a1 = try initiator.genAct1(rnd);
     // The R2 case: a retry that forgets to rebuild the handshake. Before the
@@ -723,7 +799,7 @@ test "act ordering is enforced: no second genAct1/genAct2 can silently reuse the
     try testing.expectError(error.WrongState, initiator.genAct1(rnd));
     try testing.expectError(error.WrongState, initiator.genAct1WithEphemeral(ls));
 
-    var responder = Responder.init(rs);
+    var responder = Responder.init(&rs);
     try testing.expectError(error.WrongState, responder.genAct2(rnd));
     try responder.readAct1(a1);
     try testing.expectError(error.WrongState, responder.readAct1(a1));
@@ -735,13 +811,15 @@ test "act ordering is enforced: no second genAct1/genAct2 can silently reuse the
     // two sides agree on the transport keys, which is the end-to-end proof
     // that `genAct1`/`genAct2`'s rewrite kept the protocol intact.
     try initiator.readAct2(a2);
-    const fin = try initiator.genAct3();
-    const rres = try responder.readAct3(fin.msg);
+    var fin: struct { msg: act.Act3, result: HandshakeResult } = undefined;
+    fin.msg = try initiator.genAct3(&fin.result);
+    var rres: HandshakeResult = undefined;
+    try responder.readAct3(fin.msg, &rres);
     try testing.expectEqual(fin.result.sk, rres.rk);
     try testing.expectEqual(fin.result.rk, rres.sk);
     try testing.expectEqual(fin.result.ck, rres.ck);
     try testing.expectEqual(fin.result.handshake_hash, rres.handshake_hash);
     try testing.expectEqual(Initiator.State.done, initiator.state);
     try testing.expectEqual(Responder.State.done, responder.state);
-    try testing.expectError(error.WrongState, responder.readAct3(fin.msg));
+    try testing.expectError(error.WrongState, responder.readAct3(fin.msg, &scratch_result));
 }

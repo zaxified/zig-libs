@@ -357,6 +357,19 @@ it, which is how two real routing holes in `decrypt` and `stream` were found.
 
 ## Non-goals / backlog
 
+- **Key copies on the dead stack (found 2026-10-08, from `bolt8`'s stack probe; MEDIUM,
+  undecided).** After an `encrypt`/`decrypt` returns, a dead frame still holds the 32-byte key —
+  measured through `bolt8`'s `Transport` (ReleaseFast): 2 copies per `sendMessage` (length frame +
+  body), 1 per `recvLength`+`recvMessage`, on the short path (std's AEAD, ≤ 128 bytes). The
+  ChaCha20 state is the key's eight words, so every caller of this AEAD (noise, bolt8, wireguard,
+  sealedbox, …) leaves one per call; the wide path was not measured separately. Severity is lower
+  than the signing-key residue in the k256 family: the key also lives in the caller's cipher
+  object for the whole session, so the copy matters only after that object's `deinit`. Fix shape
+  if taken: the `bip340` F2 burn (`noinline` body + zeroing at its depth) on both paths, which
+  costs on EVERY call — measure first (a 1 KiB burn by volatile `u64` stores ≈ 40 ns against
+  ~0.5 µs for a short packet), and decide per path; libsodium wipes its ChaCha state
+  (`sodium_memzero`) for the same reason. Probe: `bolt8/src/stackprobe_test.zig`'s
+  `stepSend`/`stepRecv`, or a module-local probe in the same shape.
 - **AVX-512 (L = 8) is correctness-tested but perf-unmeasured** — no AVX-512
   hardware here. The selection is comptime, so a host that has it takes the
   8-lane path untested for *speed*; it is not untested for *correctness*.

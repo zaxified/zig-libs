@@ -36,8 +36,8 @@ pub fn main() !void {
 
     // The initiator must know the responder's static public key in
     // advance — BOLT#8 is `Noise_XK`, so it is never sent on the wire.
-    var initiator = bolt8.Initiator.init(init_ls, resp_ls.public_key);
-    var responder = bolt8.Responder.init(resp_ls);
+    var initiator = bolt8.Initiator.init(&init_ls, resp_ls.public_key);
+    var responder = bolt8.Responder.init(&resp_ls);
 
     // Act One: initiator -> responder.
     const a1 = try initiator.genAct1(.{ .seeded_for_test = init_rng.random() });
@@ -51,13 +51,15 @@ pub fn main() !void {
 
     // Act Three: initiator -> responder. Both sides now hold the transport
     // keys; a real caller would tear down the `Initiator`/`Responder` here.
-    const a3 = try initiator.genAct3();
-    const rresult = try responder.readAct3(a3.msg);
-    std.debug.print("act3 sent: {d} bytes\n", .{a3.msg.toBytes().len});
-    std.debug.print("handshake hash matches on both sides: {}\n", .{std.mem.eql(u8, &a3.result.handshake_hash, &rresult.handshake_hash)});
+    var iresult: bolt8.HandshakeResult = undefined; // out-parameter: see SPEC "dead stack"
+    const a3 = try initiator.genAct3(&iresult);
+    var rresult: bolt8.HandshakeResult = undefined;
+    try responder.readAct3(a3, &rresult);
+    std.debug.print("act3 sent: {d} bytes\n", .{a3.toBytes().len});
+    std.debug.print("handshake hash matches on both sides: {}\n", .{std.mem.eql(u8, &iresult.handshake_hash, &rresult.handshake_hash)});
 
     // ── post-handshake transport ────────────────────────────────────────
-    var itx = bolt8.Transport.init(a3.result);
+    var itx = bolt8.Transport.init(iresult);
     var rtx = bolt8.Transport.init(rresult);
 
     const plaintext = "0100"; // a stand-in for a real Lightning message's 2-byte type + body
