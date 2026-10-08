@@ -493,6 +493,16 @@ self-hosted backend is for the edit loop only and no lane uses it. CI runs the
 push lane (`changed`, default mode) on every push and the `ReleaseSafe` and
 `ReleaseFast` full lanes on a tag or `workflow_dispatch`.
 
+**ReleaseFast-only tests run on every push too (2026-10-08).** A dead-stack
+probe skips in Debug and ReleaseSafe (both fill `undefined`), so before this
+nothing between two tags ran it — a regression of bip340's A1 F2 sat red at HEAD
+for a day with every lane green. `changed` now runs, after the module step, the
+whole suite of every module in its set whose `src/` holds such a skip
+(`RF_ONLY_RE` in `test.sh`: `mode != .ReleaseFast` or `mode == .Debug or
+… mode == .ReleaseSafe` before `return error.SkipZigTest`) again with
+`-Doptimize=ReleaseFast`. Locally, after touching such a module:
+`scripts/modtest <m> -Doptimize=ReleaseFast`.
+
 ## Privileged tests
 
 `scripts/test.sh vm` (and `scripts/vm/run.sh <module> [platform]`) runs a

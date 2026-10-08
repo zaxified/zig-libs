@@ -509,6 +509,54 @@ run_examples_for() {
 
 ZL_RUN_EXAMPLES=1
 
+# ⭐ RELEASEFAST-ONLY TESTS, RUN WHERE A CHANGE IS TESTED (2026-10-08).
+#
+# A dead-stack probe (`stackprobe_test.zig` and its kin) can only see a dead
+# frame where `undefined` is left alone, so it skips in Debug and ReleaseSafe:
+# `if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return
+# error.SkipZigTest`, or `mode != .ReleaseFast`. The `changed` lane runs in the
+# default mode, so between two tags NOTHING ran these tests. That is how a
+# regression of bip340's A1 F2 (the signing key copied into `sign`'s own frame,
+# 359a678d) sat red at HEAD for a day with every lane green -- the probe written
+# for exactly that finding was failing and no lane executed it (review
+# 2026-10-08, R1).
+#
+# So every module of the set that has such a test is run AGAIN in ReleaseFast,
+# whole suite (a `-Dtest-filter` binary is a different binary, and the probe's
+# verdict is about the binary). Detected from source rather than listed, so a
+# probe added tomorrow is covered without anyone remembering this function.
+# Skipped where the lane already builds ReleaseFast or ReleaseSmall.
+RF_ONLY_RE='mode != \.ReleaseFast\) return error\.SkipZigTest|mode == \.Debug or [A-Za-z_.@"()]*mode == \.ReleaseSafe\) return error\.SkipZigTest'
+
+rf_only_modules() {
+    local m out=""
+    for m in $1; do
+        [[ -d "modules/$m/src" ]] || continue
+        grep -rqE --include='*.zig' "$RF_ONLY_RE" "modules/$m/src" && out="$out $m"
+    done
+    echo "${out# }"
+}
+
+run_rf_only() {
+    local mods a
+    local -a rf_args=()
+    for a in ${EXTRA_ZIG_ARGS[@]+"${EXTRA_ZIG_ARGS[@]}"}; do
+        case "$a" in
+            -Doptimize=ReleaseFast|-Doptimize=ReleaseSmall|--release=fast|--release=small)
+                return 0 ;;   # the lane itself already runs them
+            -Doptimize=*|--release*) ;;
+            *) rf_args+=("$a") ;;
+        esac
+    done
+    mods="$(rf_only_modules "$1")"
+    [[ -z "${mods// /}" ]] && return 0
+    echo "releasefast-only tests: $mods — running these suites again in ReleaseFast"
+    local -a saved=(${EXTRA_ZIG_ARGS[@]+"${EXTRA_ZIG_ARGS[@]}"})
+    EXTRA_ZIG_ARGS=(${rf_args[@]+"${rf_args[@]}"} -Doptimize=ReleaseFast)
+    ZL_RUN_EXAMPLES=0 run_modules "$mods"
+    EXTRA_ZIG_ARGS=(${saved[@]+"${saved[@]}"})
+}
+
 run_modules() {
     local mods="$1"
     [[ -z "${mods// /}" ]] && return 0
@@ -1439,6 +1487,7 @@ cmd_changed() {
         # Every check already ran in the smoke set; only modules are left.
         if [[ -n "${closure// /}" ]]; then
             run_modules "$closure"
+            run_rf_only "$closure"
             stamps_record "$closure" "$lane"
         fi
         summary
@@ -1612,6 +1661,7 @@ cmd_changed() {
     fi
 
     run_modules "$closure"
+    run_rf_only "$closure"
     stamps_record "$closure" "$lane"
     summary
 }
