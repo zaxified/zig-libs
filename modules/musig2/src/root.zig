@@ -865,6 +865,21 @@ pub const SignError = SessionError || SecNonceError || error{
 ///      `error.SignatureVerificationFailed` otherwise, never the
 ///      unverified `s`.
 pub fn sign(secnonce: *SecNonce, sk: bip340.SecretKey, ctx: SessionContext) SignError!PartialSignature {
+    const result = signBurned(secnonce, &sk, ctx);
+    burnSignStack();
+    return result;
+}
+
+/// Audit 2026-10-08 (HIGH). `sign` had no stack burn: measured with
+/// `stackprobe_test.zig` (ReleaseFast), every partial signature left the
+/// secret key `d'` once and each secret nonce `k1'`/`k2'` four times on the
+/// dead stack, and either nonce next to the published `s` and the public
+/// session values is the key. Same fix as `bip340.sign` and `adaptor.preSign`:
+/// the work runs one `noinline` frame down and `sign_stack_burn` bytes at
+/// that depth are zeroed after it returns, on the error path too. `sign`
+/// passes the key by pointer, so its own frame holds no copy.
+noinline fn signBurned(secnonce: *SecNonce, sk_ptr: *const bip340.SecretKey, ctx: SessionContext) SignError!PartialSignature {
+    const sk = sk_ptr;
     // Consume the caller's secnonce before anything can fail (BIP327 `Sign`
     // overwrites secnonce[0:64]; libsecp256k1 clears it on entry too): a
     // failed attempt must not leave a nonce that a retry with different
@@ -915,6 +930,19 @@ pub fn sign(secnonce: *SecNonce, sk: bip340.SecretKey, ctx: SessionContext) Sign
     partialSigVerifyInternal(psig, pubnonce, .{ .bytes = pk_bytes }, ctx) catch return error.SignatureVerificationFailed;
 
     return psig;
+}
+
+/// Stack zeroed below `sign`'s frame after the work returns. The probe printed
+/// 16.3 KB dirtied below a `sign` call (2026-10-08, ReleaseFast), self-verify
+/// included; `stackprobe_test.zig` fails on any residue and prints the depth.
+const sign_stack_burn = 32 * 1024;
+
+/// `noinline` is load-bearing (as `bip340`'s `burnSignStack`): inlined, the
+/// buffer lands in `sign`'s frame, above the region to clear. `secureZero`
+/// writes through a volatile slice, so the dead store stays.
+noinline fn burnSignStack() void {
+    var buf: [sign_stack_burn]u8 = undefined;
+    std.crypto.secureZero(u8, &buf);
 }
 
 // ── PartialSigVerify (BIP327 §"Partial Signature Verification") ───────────
@@ -1048,6 +1076,7 @@ pub fn partialSigAgg(psigs: []const PartialSignature, ctx: SessionContext) Parti
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names BIP327 and the sibling bip340 dep" {

@@ -771,7 +771,7 @@ ibe	ReleaseFast	fp12pow	1	0	140a7d3db097ec1b	d2e187260f9f18a2
 # lists commitments from an untainted twin of the nonce inputs.
 frost	ReleaseFast	commit	1	8	1f161bef1eb3307a	94a2e96655c4ce21
 frost	ReleaseFast	sign	1	13	1f161bef1eb3307a	1da8c496388f45b0
-musig2	ReleaseFast	sign	1	<=101	8e1380b257b52af1	2a2f275cd0c5c7c5
+musig2	ReleaseFast	sign	1	<=101	da7d330ea45297b0	2a2f275cd0c5c7c5
 # taproot secret 10 -> 9 (re-pin 2026-09-15). The row was already stale at
 # 0c0ef527: a --stacks run of that tree reads 9, with the SAME context set as
 # today. The source pin never moved, so the drop came from a dependency before

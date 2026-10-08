@@ -6,7 +6,7 @@
 
 **Scope:** core — libsecp256k1 v0.8.0 `musig` module (BIP327) (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-08 · mutation 2026-10-08 (39/41, 2 eq) · src 7c82c39ebdba2253
+**Audit:** review 2026-10-08 · mutation 2026-10-08 (39/41, 2 eq) · src fa0e93d42519a5dd
 
 **Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
 
@@ -358,8 +358,14 @@ Two findings, fixed:
 - **LOW — `partialSigVerify` indexed `pubkeys`/`pubnonces` with an unchecked `signer_index`**:
   an index past either list panicked in safe builds and was out of bounds in ReleaseFast. Now an
   error.
-Not changed, noted: `sign`'s locals (`d'`, `d`, the selected nonces) are not burned — the
-dead-stack class bip340/k256 measure with `stackprobe_test.zig`; unmeasured here.
+- **HIGH — the key and both nonces on the dead stack after `sign`** (found the same day, after
+  the same probe found the nonce in the sibling `adaptor.preSign`). The new
+  `src/stackprobe_test.zig` (bip340's method, negative and positive control; needles `d'`,
+  `n−d'`, `k1'`, `k2'` and their negations in three images) found per partial signature `d'`
+  once and `k1'`/`k2'` four times each — either nonce with the published `s` is the key. Fixed
+  as `bip340.sign`: the work in `noinline signBurned` (the key passed by pointer, so `sign`'s
+  frame holds none), `sign_stack_burn` (32 KiB; 16.3 KB measured dirty) zeroed after it
+  returns. Probe green; the burn removed in a copy of the tree → residue again.
 
 Mutation schemata (ReleaseSafe, one binary): 41 mutants over `root.zig` — the secnonce
 consumption, parity select, `d` (without `g`, without `gacc`), `s` without `b`, the coefficient,

@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — Security (HIGH, no API change): `sign` left the secret key and both secret
+  nonces on the dead stack — measured with the new `src/stackprobe_test.zig` (ReleaseFast): `d'`
+  once and `k1'`/`k2'` four times each per partial signature. The work now runs one `noinline`
+  frame down (the key passed by pointer) and 32 KiB of stack are burned after it returns.
 - **2026-10-08** — **BREAKING:** `sign(secnonce: *SecNonce, sk, ctx)` takes the secret nonce by
   pointer and zeroes it on entry, on every call, failed ones included — BIP327's `Sign`
   overwrites `secnonce[0:64]` and libsecp256k1's `musig_partial_sign` clears it the same way. Before,
