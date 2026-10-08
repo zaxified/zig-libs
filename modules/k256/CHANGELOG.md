@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **FIX (secret on the dead stack; NO API CHANGE):** `Secp256k1.combMulBase`
+  left the little-endian image of its SECRET scalar on the dead stack once per call — under
+  every public-key derivation built on it (bip32, taproot, frost, dkg). It now runs one frame
+  down and zeroes 8 KiB at that depth (~0.3 µs), like `mul`; a new ReleaseFast stack probe
+  covers it.
 - **2026-10-08** — **FIX (secret on the dead stack; NO API CHANGE):** `sign.bip340Sign` (the
   README's Schnorr example) left the effective scalar `d` and the nonce `k'` on the dead stack —
   a nonce next to its signature is the private key. It now runs one frame down and zeroes

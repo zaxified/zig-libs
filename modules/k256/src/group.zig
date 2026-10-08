@@ -386,7 +386,31 @@ pub const Secp256k1 = struct {
     /// table already carries the `2^(w·i)` factor. `error.IdentityElement` iff
     /// `s ≡ 0 (mod n)`. See the comb section below for the CT-gather contract.
     pub fn combMulBase(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        const result = combMulBaseInner(s_, endian);
+        burnCombStack();
+        return result;
+    }
+
+    /// `combMulBase`'s body, one frame down so `burnCombStack` can reach what
+    /// it left.
+    noinline fn combMulBaseInner(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
         return combMulBaseWithTable(&comb_table, s_, endian);
+    }
+
+    /// Review 2026-10-08. Same class as `mul`'s A1 R1: the comb multiply left
+    /// the little-endian image of the SECRET scalar on the dead stack once per
+    /// call (ReleaseFast, `stackprobe_test.zig`), under every key derivation
+    /// built on it (bip32, taproot, frost/dkg shares). Same fix: zero
+    /// `comb_stack_burn` bytes at `combMulBaseInner`'s depth. `noinline` on
+    /// both is load-bearing.
+    noinline fn burnCombStack() void {
+        // Volatile word stores, not `secureZero`: that is a volatile byte memset,
+        // and without libc the memset behind it moves ~3 B/ns — 2.5 µs per 8 KiB
+        // against 0.3 µs for this loop (ReleaseFast, 2026-10-08). `volatile`
+        // keeps the dead stores and keeps them from becoming a memset call.
+        var buf: [comb_stack_burn / 8]u64 = undefined;
+        const p: [*]volatile u64 = &buf;
+        for (0..buf.len) |i| p[i] = 0;
     }
 
     /// `combMulBase` parameterised on the table, so the positive-control test in
@@ -697,6 +721,11 @@ pub const VarBaseTable = [comb_teeth]Secp256k1;
 /// (A1 R1). Sized against the probe's measured call-tree depth, see
 /// `stackprobe_test.zig` "A1 R1".
 const mul_stack_burn = 16 * 1024;
+
+/// Bytes `Secp256k1.burnCombStack` zeroes below `combMulBase`'s frame after
+/// every call. Its call tree reached 1.3 KiB in ReleaseFast (2026-10-08);
+/// `stackprobe_test.zig` goes red when it outgrows this.
+const comb_stack_burn = 8 * 1024;
 
 const SignedDigit = struct { mag: u64, is_neg: u64 };
 

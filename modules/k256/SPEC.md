@@ -364,6 +364,18 @@ lines shifted by the inserted text. `sign.bip340Sign` got the same shape on
 signature; with the burn, 0 in twelve representations over 5 repeats, both
 even-y arms; ctgrind `sign` 11 in-file before and after.
 
+**`Secp256k1.combMulBase` (review 2026-10-08).** The claim below that the comb
+multiply left nothing ("`combMulBase` after F5: 0") no longer held: measured with
+the new probe "combMulBase" (ReleaseFast), the little-endian image of the SECRET
+scalar **once per call** (5 of 5), the call tree dirtying 1.3 KiB. Every key
+derivation in the family runs it on a secret (bip32's `pubkeyFromPriv`, taproot
+tweaks, frost/dkg shares). Same shape as `mul`: `noinline` `combMulBaseInner`,
+then `comb_stack_burn` = 8 KiB zeroed at that depth; probe 5 → 0 over 5 calls in
+three representations (BE, LE, `Scalar` image), negative control 0, positive 1.
+The burn is volatile `u64` stores, not `secureZero`: without libc the memset
+behind `secureZero` runs at ~3 B/ns (2.5 µs per 8 KiB), the word loop 0.3 µs.
+`combMulBaseWithTable` (the test seam) does not burn.
+
 **`Secp256k1.mul`, the ECDH path (A1 R1, re-audit 2026-09-15).** The windowed
 multiply (F5) left the u256 image of the SECRET scalar on the dead stack **twice
 per call** at ReleaseFast (the ladder before it: once; `combMulBase` after F5:

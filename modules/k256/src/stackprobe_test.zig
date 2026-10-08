@@ -372,3 +372,57 @@ test "STACKPROBE (review 2026-10-08): no key or nonce residue on the dead stack 
         for (hits) |h| try std.testing.expectEqual(@as(usize, 0), h);
     }
 }
+
+// ── review 2026-10-08: `Secp256k1.combMulBase` ───────────────────────────────
+//
+// The fixed-base multiply every key derivation runs on a SECRET scalar
+// (bip32's `pubkeyFromPriv`, taproot's tweak, frost/dkg shares). `mul` burns
+// its stack (A1 R1); `combMulBase` shares its recoding, so the same compiler
+// copies of the wide shifts can be left behind. Measured before the fix
+// (ReleaseFast): the little-endian image of the scalar, once per call.
+
+noinline fn callCombMulBase(s: [32]u8) group.Secp256k1 {
+    return group.Secp256k1.combMulBase(s, .big) catch unreachable;
+}
+
+test "STACKPROBE (review 2026-10-08): no scalar residue on the dead stack after Secp256k1.combMulBase" {
+    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+
+    var s: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("k256 stackprobe combMulBase secret scalar", &s, .{});
+    s[0] &= 0x7f;
+    const s_le = le(s);
+    const s_mem = memImage(try Scalar.fromBytes(s, .big));
+
+    paint();
+    std.mem.doNotOptimizeAway(callInnocent(@splat(0x5a)));
+    const neg = scanOne(&s) + scanOne(&s_le) + scanOne(&s_mem);
+    paint();
+    std.mem.doNotOptimizeAway(callLeaky(s_le));
+    const pos = scanOne(&s_le);
+
+    var be_hits: usize = 0;
+    var le_hits: usize = 0;
+    var mem_hits: usize = 0;
+    for (0..5) |_| {
+        paint();
+        std.mem.doNotOptimizeAway(callCombMulBase(s));
+        be_hits += scanOne(&s);
+        paint();
+        std.mem.doNotOptimizeAway(callCombMulBase(s));
+        le_hits += scanOne(&s_le);
+        paint();
+        std.mem.doNotOptimizeAway(callCombMulBase(s));
+        mem_hits += scanOne(&s_mem);
+    }
+    paint();
+    std.mem.doNotOptimizeAway(callCombMulBase(s));
+    const depth = dirtyDepth();
+    errdefer std.debug.print("\n=== STACKPROBE k256 combMulBase ({t}) NEG={d} POS={d} BE={d} LE={d} MEM={d} (5 calls each), non-paint below the call {d} B ===\n", .{ builtin.mode, neg, pos, be_hits, le_hits, mem_hits, depth });
+
+    try std.testing.expectEqual(@as(usize, 0), neg);
+    try std.testing.expect(pos >= 1);
+    try std.testing.expectEqual(@as(usize, 0), be_hits);
+    try std.testing.expectEqual(@as(usize, 0), le_hits);
+    try std.testing.expectEqual(@as(usize, 0), mem_hits);
+}
