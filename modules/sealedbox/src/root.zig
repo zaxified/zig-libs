@@ -259,8 +259,13 @@ pub fn parseSecretKeyBase64(out: *[secret_length]u8, text: []const u8) KeyEncodi
 
 /// Encode a secret key as lowercase hex (64 chars). **SECRET material** —
 /// `wipe` the returned buffer when done with it.
-pub fn encodeSecretKeyHex(sk: [secret_length]u8) [hex_sk_len]u8 {
-    return encodeSecretKeyHexCt(sk);
+///
+/// Pointers in, no value out (BREAKING 2026-10-08), like
+/// `encodeSecretKeyBase64`: by value, the key stayed in the caller's frame
+/// (`stackprobe_test.zig`, direct-region engine).
+pub fn encodeSecretKeyHex(out: *[hex_sk_len]u8, sk: *const [secret_length]u8) void {
+    encodeSecretKeyHexCt(out, sk);
+    burnCodecStack();
 }
 
 /// Parse a hex-encoded secret key (**SECRET material**) into `out`. Same strict
@@ -501,13 +506,11 @@ noinline fn parseSecretKeyBase64Ct(out: *[secret_length]u8, text: []const u8) Ke
 }
 
 /// Constant-time lowercase-hex encode of SECRET key material.
-fn encodeSecretKeyHexCt(key: [secret_length]u8) [hex_sk_len]u8 {
-    var out: [hex_sk_len]u8 = undefined;
+noinline fn encodeSecretKeyHexCt(out: *[hex_sk_len]u8, key: *const [secret_length]u8) void {
     for (key, 0..) |b, i| {
         out[2 * i] = ctHexChar(@as(u16, b) >> 4);
         out[2 * i + 1] = ctHexChar(@as(u16, b) & 0x0f);
     }
-    return out;
 }
 
 /// Constant-time hex decode of SECRET key material. Either case, exactly 64
@@ -780,7 +783,9 @@ test "KAT: secret key (RFC 7748 Alice) base64 + hex + public recompute" {
     try std.testing.expectEqualStrings("dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=", &b64);
     try std.testing.expectEqual(sk, try testParseSecretKeyBase64(&b64));
 
-    const hex = encodeSecretKeyHex(sk);
+    var hex: [hex_sk_len]u8 = undefined;
+
+    encodeSecretKeyHex(&hex, &sk);
     try std.testing.expectEqualStrings(sk_hex, &hex);
     try std.testing.expectEqual(sk, try testParseSecretKeyHex(&hex));
 
@@ -802,12 +807,15 @@ test "round-trip: generated keys survive text serialization; rebuilt keypair ope
 
     // secret key: base64 + hex round-trip
     try std.testing.expectEqual(kp.secret_key, try testParseSecretKeyBase64(&testEncodeSecretKeyBase64(kp.secret_key)));
-    try std.testing.expectEqual(kp.secret_key, try testParseSecretKeyHex(&encodeSecretKeyHex(kp.secret_key)));
+    var hex_roundtrip: [hex_sk_len]u8 = undefined;
+    encodeSecretKeyHex(&hex_roundtrip, &kp.secret_key);
+    try std.testing.expectEqual(kp.secret_key, try testParseSecretKeyHex(&hex_roundtrip));
 
     // end-to-end: serialize both keys → parse back → seal to parsed public key
     // → open with a keypair rebuilt from the stored secret
     const pk_stored = encodePublicKeyBase64(kp.public_key);
-    const sk_stored = encodeSecretKeyHex(kp.secret_key);
+    var sk_stored: [hex_sk_len]u8 = undefined;
+    encodeSecretKeyHex(&sk_stored, &kp.secret_key);
     const pk_back = try parsePublicKeyBase64(&pk_stored);
     const kp_back = try keyPairFromSecretKey(try testParseSecretKeyHex(&sk_stored));
     try std.testing.expectEqual(kp.public_key, kp_back.public_key);
@@ -944,7 +952,9 @@ test "constant-time codecs: agree with the std-backed public path on 512 keys" {
         const std_b64 = encodePublicKeyBase64(key);
         try std.testing.expectEqualStrings(&std_b64, &ct_b64);
 
-        const ct_hex = encodeSecretKeyHex(key);
+        var ct_hex: [hex_sk_len]u8 = undefined;
+
+        encodeSecretKeyHex(&ct_hex, &key);
         const std_hex = encodePublicKeyHex(key);
         try std.testing.expectEqualStrings(&std_hex, &ct_hex);
 
@@ -961,7 +971,8 @@ test "constant-time parsers reject exactly what the std-backed ones reject" {
     var key: [secret_length]u8 = undefined;
     for (&key, 0..) |*b, i| b.* = @intCast(i);
     const b64 = testEncodeSecretKeyBase64(key);
-    const hex = encodeSecretKeyHex(key);
+    var hex: [hex_sk_len]u8 = undefined;
+    encodeSecretKeyHex(&hex, &key);
 
     // A bad character in EVERY position, checked against the public parser.
     for (0..b64.len) |i| {
@@ -1005,7 +1016,9 @@ test "wipe: the encoded secret really is gone from the buffer" {
     wipe(&text);
     for (text) |c| try std.testing.expectEqual(@as(u8, 0), c);
 
-    var hex_text = encodeSecretKeyHex(sk);
+    var hex_text: [hex_sk_len]u8 = undefined;
+
+    encodeSecretKeyHex(&hex_text, &sk);
     try std.testing.expectEqual(sk, try testParseSecretKeyHex(&hex_text));
     wipe(&hex_text);
     for (hex_text) |c| try std.testing.expectEqual(@as(u8, 0), c);

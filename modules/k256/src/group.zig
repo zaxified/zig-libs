@@ -297,6 +297,23 @@ pub const Secp256k1 = struct {
         return result;
     }
 
+    /// `mul` with the scalar by pointer and the product into `out` (zeroed on
+    /// error). `mul` keeps std's curve shape (std's `Ecdsa(Curve)` calls
+    /// `Curve.basePoint.mul(k, .big)`), so the caller's frame keeps a copy of
+    /// the scalar it passed (`stackprobe_test.zig`, direct-region engine,
+    /// 2026-10-08); this form leaves none. Burned like `mul`.
+    pub fn mulInto(p: Secp256k1, out: *Secp256k1, s_: *const [32]u8, endian: std.builtin.Endian) IdentityElementError!void {
+        const result = mulIntoInner(p, out, s_, endian);
+        burnMulStack();
+        return result;
+    }
+
+    noinline fn mulIntoInner(p: Secp256k1, out: *Secp256k1, s_: *const [32]u8, endian: std.builtin.Endian) IdentityElementError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+        const tab = p.varBaseTable();
+        out.* = try mulWithTable(&tab, s_.*, endian);
+    }
+
     /// `mul`'s body, one frame down so `burnMulStack` can reach what it left.
     noinline fn mulInner(p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
         const tab = p.varBaseTable();

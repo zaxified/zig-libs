@@ -346,7 +346,7 @@ pub fn signMerkle(
 ) SignError![64]u8 {
     const root = try merkleRoot(allocator, tlv_stream);
     const digest = bip340.taggedHash(tag, &root);
-    return bip340.sign(secret_key, &digest, aux_rand, io);
+    return bip340.sign(&secret_key, &digest, aux_rand, io);
 }
 
 pub const VerifyError = MerkleError || error{InvalidPublicKey};
@@ -1313,7 +1313,8 @@ test "BOLT#12 round-trip: build+sign+decode+verify an invoice_request" {
     const io = threaded.io();
 
     const sk = try bip340.SecretKey.fromBytes([_]u8{0x11} ** 32);
-    const kp = try bip340.KeyPair.fromSecretKey(sk);
+    var kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp, &sk);
     var payer_id: [33]u8 = undefined;
     payer_id[0] = 0x02; // BIP-340 pubkey is always even-y
     payer_id[1..33].* = kp.public.x;
@@ -1336,7 +1337,8 @@ test "BOLT#12 round-trip: build+sign+decode+verify an invoice_request" {
 
     // Wrong signer: swap in a different valid pubkey → verify fails.
     const sk2 = try bip340.SecretKey.fromBytes([_]u8{0x22} ** 32);
-    const kp2 = try bip340.KeyPair.fromSecretKey(sk2);
+    var kp2: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp2, &sk2);
     var other = payer_id;
     other[1..33].* = kp2.public.x;
     ir.invreq_payer_id = other;
@@ -1350,7 +1352,8 @@ test "A1 F11 x lninvoice (round-2 Q4): a payer_id with a non-SEC1 prefix from th
     const io = threaded.io();
 
     const sk = try bip340.SecretKey.fromBytes([_]u8{0x11} ** 32);
-    const kp = try bip340.KeyPair.fromSecretKey(sk);
+    var kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp, &sk);
     var payer_id: [33]u8 = undefined;
     payer_id[0] = 0x02;
     payer_id[1..33].* = kp.public.x;
@@ -1390,7 +1393,8 @@ test "BOLT#12 round-trip: build+sign+decode+verify an invoice" {
     const io = threaded.io();
 
     const sk = try bip340.SecretKey.fromBytes([_]u8{0x33} ** 32);
-    const kp = try bip340.KeyPair.fromSecretKey(sk);
+    var kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp, &sk);
     var node_id: [33]u8 = undefined;
     node_id[0] = 0x02;
     node_id[1..33].* = kp.public.x;

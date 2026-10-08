@@ -13,10 +13,13 @@
 //! looks for the secret. Measured at ReleaseFast: `secureZero` 0/5, plain
 //! `@memset` (audit mutant M10) 5/5, a no-op (M11) 5/5.
 //!
-//! Method as `bip340`'s and `k256`'s probes: paint a stack window, call at
-//! that depth, claim an equally large UNINITIALISED buffer there and count the
-//! needle. ReleaseFast/ReleaseSmall only — Debug and ReleaseSafe fill
-//! `undefined` with 0xaa, so the scan cannot see a dead frame there.
+//! Method as `p256`'s `stackprobe_test.zig` (direct region, 2026-10-08: the
+//! earlier "scan a local buffer at the call's depth" form was blind to the top
+//! few hundred bytes of the measured call): paint a stack region below the
+//! probe, run one call under a `PAD`-deep shim, snapshot the region and count
+//! the needle in the snapshot. ReleaseFast/ReleaseSmall only — Debug and
+//! ReleaseSafe fill `undefined` with 0xaa, so the scan cannot see a dead frame
+//! there.
 //!
 //! ⛔ A zero is only readable next to the two controls in the same binary: a
 //! NEGATIVE control (a call that never sees the secret, must find 0) and a
@@ -31,24 +34,73 @@ const WINDOW = 64 * 1024;
 // Module-level, so the only stack copy of the secret is the one under test.
 var secret: [sb.base64_sk_len]u8 = undefined;
 
-noinline fn paint() void {
-    var buf: [WINDOW]u8 = undefined;
-    @memset(&buf, 0xC7);
-    std.mem.doNotOptimizeAway(&buf);
+const PAD = 2048;
+
+var region_lo: usize = 0;
+var snap: [WINDOW]u8 = undefined;
+
+/// An address inside a frame called from the probe, at the depth
+/// `paint`/`shim`/`snapshot` start at.
+noinline fn stackHere() usize {
+    var x: u8 = 0;
+    std.mem.doNotOptimizeAway(&x);
+    return @intFromPtr(&x);
 }
 
-/// Count `needle` in one uninitialised window claimed at the depth the
-/// previous call used. Volatile reads so the buffer cannot be folded away.
-noinline fn scan(needle: []const u8) usize {
-    var buf: [WINDOW]u8 = undefined;
-    const p: [*]volatile u8 = @ptrCast(&buf);
+noinline fn paint() void {
+    const p: [*]volatile u8 = @ptrFromInt(region_lo);
+    for (0..WINDOW) |i| p[i] = 0xC7;
+}
+
+/// Run `call` `PAD` bytes deeper than the probe, so its frames lie inside the
+/// region. `pad` is touched after the call too, so it cannot be a tail call.
+noinline fn shim(call: *const fn () void) void {
+    var pad: [PAD]u8 = undefined;
+    std.mem.doNotOptimizeAway(&pad);
+    call();
+    std.mem.doNotOptimizeAway(&pad);
+}
+
+noinline fn snapshot() void {
+    const p: [*]const volatile u8 = @ptrFromInt(region_lo);
+    for (&snap, 0..) |*d, i| d.* = p[i];
+}
+
+/// How deep the last call's frames reached below the region's top.
+fn dirtyDepth() usize {
+    var i: usize = 0;
+    while (i < WINDOW and snap[i] == 0xC7) : (i += 1) {}
+    return WINDOW - i;
+}
+
+/// Zero the callee-saved registers before a measured call: they still hold
+/// the TEST's values (needles it just computed) and the call's prologue
+/// spills them into its frame, where the scan would credit them to the call.
+inline fn scrubCalleeSaved() void {
+    if (builtin.cpu.arch == .x86_64) asm volatile (
+        \\xorl %%ebx, %%ebx
+        \\xorl %%r12d, %%r12d
+        \\xorl %%r13d, %%r13d
+        \\xorl %%r14d, %%r14d
+        \\xorl %%r15d, %%r15d
+        ::: .{ .rbx = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true });
+}
+
+/// `inline`: as its own frame it would run the call deeper than the region top.
+inline fn measure(call: *const fn () void) void {
+    scrubCalleeSaved();
+    paint();
+    shim(call);
+    snapshot();
+}
+
+/// Count `needle` in the last snapshot.
+fn scan(needle: []const u8) usize {
     var hits: usize = 0;
     var i: usize = 0;
-    outer: while (i + needle.len <= WINDOW) : (i += 1) {
-        for (needle, 0..) |b, j| if (p[i + j] != b) continue :outer;
-        hits += 1;
+    while (i + needle.len <= WINDOW) : (i += 1) {
+        if (std.mem.eql(u8, snap[i..][0..needle.len], needle)) hits += 1;
     }
-    std.mem.doNotOptimizeAway(&buf);
     return hits;
 }
 
@@ -79,17 +131,16 @@ test "STACKPROBE (A1 L4): wipe's zeroing survives the optimiser on a buffer noth
     if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
     for (&secret, 0..) |*b, i| b.* = @truncate(0x41 + (i * 7) % 26);
 
-    paint();
-    callInnocent();
+    region_lo = stackHere() - PAD - WINDOW;
+
+    measure(callInnocent);
     const neg = scan(&secret);
-    paint();
-    holdNoWipe();
+    measure(holdNoWipe);
     const pos = scan(&secret);
 
     var wiped: usize = 0;
     for (0..5) |_| {
-        paint();
-        holdThenWipe();
+        measure(holdThenWipe);
         wiped += scan(&secret);
     }
     // Printed only when an assertion below fails: the lane treats stderr from
@@ -124,7 +175,8 @@ noinline fn encodeB64AndWipe() void {
 }
 
 noinline fn encodeHexAndWipe() void {
-    var text = sb.encodeSecretKeyHex(codec_sk);
+    var text: [sb.hex_sk_len]u8 = undefined;
+    sb.encodeSecretKeyHex(&text, &codec_sk);
     sb.wipe(&text);
 }
 
@@ -157,13 +209,13 @@ test "STACKPROBE (A1 L4): the secret-key codecs leave neither the text nor the k
     if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
     for (&codec_sk, 0..) |*b, i| b.* = @truncate(i * 13 + 5);
     sb.encodeSecretKeyBase64(&codec_b64, &codec_sk);
-    codec_hex = sb.encodeSecretKeyHex(codec_sk);
+    sb.encodeSecretKeyHex(&codec_hex, &codec_sk);
 
-    paint();
-    callInnocent();
+    region_lo = stackHere() - PAD - WINDOW;
+
+    measure(callInnocent);
     const neg = scan(&codec_sk) + scan(&codec_b64) + scan(&codec_hex);
-    paint();
-    parkKey();
+    measure(parkKey);
     const pos = scan(&codec_sk);
     // Printed only when an assertion fails, as in the test above.
     errdefer std.debug.print("\n=== STACKPROBE sealedbox L4 codecs ({t}): NEG={d} POS(key parked)={d} ===\n", .{ builtin.mode, neg, pos });
@@ -184,14 +236,11 @@ test "STACKPROBE (A1 L4): the secret-key codecs leave neither the text nor the k
         var b64: usize = 0;
         var hex: usize = 0;
         for (0..5) |_| {
-            paint();
-            call.f();
+            measure(call.f);
             key += scan(&codec_sk);
-            paint();
-            call.f();
+            measure(call.f);
             b64 += scan(&codec_b64);
-            paint();
-            call.f();
+            measure(call.f);
             hex += scan(&codec_hex);
         }
         row.* = .{ key, b64, hex };

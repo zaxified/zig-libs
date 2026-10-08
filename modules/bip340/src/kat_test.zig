@@ -113,10 +113,11 @@ test "KAT: KeyPair/PublicKey derivation from secret key matches the published pu
 
         const want_pk = try hex32(vec.public_key);
 
-        const kp = try bip340.KeyPair.fromSecretKey(sk);
+        var kp: bip340.KeyPair = undefined;
+        try bip340.KeyPair.fromSecretKey(&kp, &sk);
         try std.testing.expectEqualSlices(u8, &want_pk, &kp.public.toBytes());
 
-        const pk = try bip340.PublicKey.fromSecretKey(sk);
+        const pk = try bip340.PublicKey.fromSecretKey(&sk);
         try std.testing.expectEqualSlices(u8, &want_pk, &pk.xonly.toBytes());
 
         _ = gpa;
@@ -134,7 +135,7 @@ test "KAT: sign reproduces the expected signature for every secret-key vector" {
         const aux = try hex32(vec.aux_rand.?);
         const msg = try hexAlloc(gpa, vec.message);
         defer gpa.free(msg);
-        const got = try bip340.sign(sk, msg, aux, io);
+        const got = try bip340.sign(&sk, msg, aux, io);
         try std.testing.expectEqualSlices(u8, &(try hex64(vec.signature)), &got);
     }
 }
@@ -151,7 +152,8 @@ test "KAT: signWithKeyPair gives sign's bytes; forged key pairs never sign" {
         const aux = try hex32(vec.aux_rand.?);
         const msg = try hexAlloc(gpa, vec.message);
         defer gpa.free(msg);
-        var kp = try bip340.KeyPair.fromSecretKey(sk);
+        var kp: bip340.KeyPair = undefined;
+        try bip340.KeyPair.fromSecretKey(&kp, &sk);
         defer kp.deinit();
         const got = try bip340.signWithKeyPair(&kp, msg, aux, io);
         try std.testing.expectEqualSlices(u8, &(try hex64(vec.signature)), &got);
@@ -495,9 +497,10 @@ test "batch: sizes across verifyBatch's chunks (1..25) accept; a bad item in any
         skb[31] = @intCast(i + 1);
         skb[0] = 0x5A;
         const sk = try bip340.SecretKey.fromBytes(skb);
-        const kp = try bip340.KeyPair.fromSecretKey(sk);
+        var kp: bip340.KeyPair = undefined;
+        try bip340.KeyPair.fromSecretKey(&kp, &sk);
         msgs[i] = [_]u8{@intCast(i)} ** 32;
-        const sig = try bip340.sign(sk, &msgs[i], [_]u8{0xA5} ** 32, io);
+        const sig = try bip340.sign(&sk, &msgs[i], [_]u8{0xA5} ** 32, io);
         items[i] = .{ .pubkey = kp.public, .msg = &msgs[i], .sig = try bip340.Signature.fromBytes(sig) };
     }
     for ([_]usize{ 1, 2, 7, 8, 9, 16, 17, 25 }) |n| {
@@ -523,16 +526,18 @@ test "batch: a random-linear-combination forgery (cancelling +d/-d pair) is REJE
 
     const sk1 = try bip340.SecretKey.fromBytes([_]u8{0xa1} ** 32);
     const sk2 = try bip340.SecretKey.fromBytes([_]u8{0xb2} ** 32);
-    var kp1 = try bip340.KeyPair.fromSecretKey(sk1);
+    var kp1: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp1, &sk1);
     defer kp1.deinit();
-    var kp2 = try bip340.KeyPair.fromSecretKey(sk2);
+    var kp2: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp2, &sk2);
     defer kp2.deinit();
     const m1 = [_]u8{0x11} ** 32;
     const m2 = [_]u8{0x22} ** 32;
     const aux = [_]u8{0} ** 32;
 
-    const sig1 = try bip340.sign(sk1, &m1, aux, io);
-    const sig2 = try bip340.sign(sk2, &m2, aux, io);
+    const sig1 = try bip340.sign(&sk1, &m1, aux, io);
+    const sig2 = try bip340.sign(&sk2, &m2, aux, io);
     const p1 = try bip340.Signature.fromBytes(sig1);
     const p2 = try bip340.Signature.fromBytes(sig2);
 
@@ -607,7 +612,7 @@ test "F4: verify() re-checks the pubkey lifts on a hand-constructed XOnlyPublicK
     const io = threaded.io();
     const sk_one = try bip340.SecretKey.fromBytes([_]u8{0} ** 31 ++ [_]u8{1});
     const msg = "F4 lift-check witness";
-    const sig_bytes = try bip340.sign(sk_one, msg, [_]u8{0} ** 32, io);
+    const sig_bytes = try bip340.sign(&sk_one, msg, [_]u8{0} ** 32, io);
     const sig = try bip340.Signature.fromBytes(sig_bytes);
 
     try std.testing.expect(!bip340.verify(hand_built_pk, msg, sig));

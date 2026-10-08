@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** tests follow bip340's out-param
+  `KeyPair.fromSecretKey` (bip340 2026-10-08).
 - **2026-09-30** — **NO CONSUMER-VISIBLE CHANGE:** a new test file cross-checks `taproot`'s script-tree
   builder against this module's consensus verifier (`tapscript.tapleafHash`, `verifyCommitment` accept
   every built control block and reject flipped parity, path, key and script); `taproot` is a test-only

@@ -149,8 +149,11 @@ pub const PublicKey = struct {
 
     /// `d * G`, serialized x-only (BIP340 §"Public Key Conversion":
     /// `pk = bytes(x(d'*G))`).
-    pub fn fromSecretKey(sk: SecretKey) SecretKeyError!PublicKey {
-        return .{ .xonly = (try KeyPair.fromSecretKey(sk)).public };
+    pub fn fromSecretKey(sk: *const SecretKey) SecretKeyError!PublicKey {
+        var kp: KeyPair = undefined;
+        defer kp.deinit();
+        try KeyPair.fromSecretKey(&kp, sk);
+        return .{ .xonly = kp.public };
     }
 };
 
@@ -164,10 +167,19 @@ pub const KeyPair = struct {
     secret: [32]u8,
     public: XOnlyPublicKey,
 
-    pub fn fromSecretKey(sk: SecretKey) SecretKeyError!KeyPair {
-        const result = derive(&sk);
+    /// The key by pointer, the pair into `out` (zeroed on error; BREAKING
+    /// 2026-10-08): by value and returned in an error union, the caller's
+    /// frame kept the key, `d` and `n − d` (`stackprobe_test.zig`,
+    /// direct-region engine).
+    pub fn fromSecretKey(out: *KeyPair, sk: *const SecretKey) SecretKeyError!void {
+        const result = deriveInto(out, sk);
         burnKeyPairStack();
         return result;
+    }
+
+    noinline fn deriveInto(out: *KeyPair, sk: *const SecretKey) SecretKeyError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+        out.* = try derive(sk);
     }
 
     /// Review 2026-10-08 R2 (HIGH). `fromSecretKey` had no burn of its own:
@@ -333,7 +345,7 @@ pub const SignError = error{
 /// future variant that synthesizes `aux_rand` itself) — the BIP340
 /// algorithm above, once `aux_rand` is in hand, is fully deterministic and
 /// does not consume `io`.
-pub fn sign(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io) SignError![64]u8 {
+pub fn sign(secret_key: *const SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io) SignError![64]u8 {
     _ = io; // deterministic once aux_rand is in hand (see doc comment)
     const result = signFromSecretKey(secret_key, msg, aux_rand);
     burnSignStack();
@@ -348,8 +360,8 @@ pub fn sign(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io
 /// key on the dead stack per signature, the A1 F2 class again. So `sign` holds
 /// nothing: the key reaches this frame one level down, and `sign` burns it
 /// after the return. `noinline` is load-bearing, as on `computeUnverified`.
-noinline fn signFromSecretKey(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
-    return signImpl(.{ .secret = &secret_key }, msg, aux_rand, computeUnverified);
+noinline fn signFromSecretKey(secret_key: *const SecretKey, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
+    return signImpl(.{ .secret = secret_key }, msg, aux_rand, computeUnverified);
 }
 
 /// `sign` with steps 1-2 already done: `key_pair` is what
@@ -784,7 +796,7 @@ test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL productio
     // Positive control: signImpl with the real computation is exactly what
     // sign() does -- same bytes, no regression from the seam.
     const honest = try signImpl(.{ .secret = &sk }, msg, aux_rand, computeUnverified);
-    const via_sign = try sign(sk, msg, aux_rand, undefined);
+    const via_sign = try sign(&sk, msg, aux_rand, undefined);
     try std.testing.expectEqualSlices(u8, &honest, &via_sign);
 
     // The actual regression: inject the fault INTO THE COMPUTE STEP itself
@@ -825,12 +837,14 @@ test "KeyPair.fromSecretKey REJECTS a hand-constructed all-zero SecretKey (defen
     // hand-constructed bypassing fromBytes's own zero-check entirely —
     // KeyPair.fromSecretKey re-validates for exactly this reason.
     const zero_sk = SecretKey{ .bytes = [_]u8{0} ** 32 };
-    try std.testing.expectError(error.InvalidSecretKey, KeyPair.fromSecretKey(zero_sk));
+    var zero_kp: KeyPair = undefined;
+    try std.testing.expectError(error.InvalidSecretKey, KeyPair.fromSecretKey(&zero_kp, &zero_sk));
 }
 
 test "KeyPair.deinit zeroizes the effective signing scalar but leaves public untouched (regression: fails if secureZero is removed)" {
     const sk = try SecretKey.fromBytes([_]u8{0x01} ** 32);
-    var kp = try KeyPair.fromSecretKey(sk);
+    var kp: KeyPair = undefined;
+    try KeyPair.fromSecretKey(&kp, &sk);
     const zero: [32]u8 = [_]u8{0} ** 32;
     try std.testing.expect(!std.mem.eql(u8, &kp.secret, &zero));
     kp.deinit();
@@ -838,8 +852,8 @@ test "KeyPair.deinit zeroizes the effective signing scalar but leaves public unt
     try std.testing.expect(!std.mem.eql(u8, &kp.public.x, &zero));
 }
 
-noinline fn stackprobeComputeAndBurn(sk: SecretKey, aux: [32]u8) void {
-    const result = computeAndBurn(.{ .secret = &sk }, @import("stackprobe_test.zig").msg, aux, computeUnverified) catch unreachable;
+noinline fn stackprobeComputeAndBurn(sk: *const SecretKey, aux: *const [32]u8) void {
+    const result = computeAndBurn(.{ .secret = sk }, @import("stackprobe_test.zig").msg, aux.*, computeUnverified) catch unreachable;
     std.mem.doNotOptimizeAway(&result);
 }
 

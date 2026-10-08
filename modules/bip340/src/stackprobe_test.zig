@@ -4,11 +4,11 @@
 //! per `CONVENTIONS.md` §9: the instrument that checks one module lives with
 //! that module, not in an audit note.
 //!
-//! Method (same as `k256`'s `stackprobe_test.zig`): paint a large stack
-//! window, call the signer at that depth, then claim an equally large
-//! UNINITIALISED buffer at the same depth and count 32-byte needles in it.
-//! ReleaseFast/ReleaseSmall only — Debug and ReleaseSafe fill `undefined` with
-//! 0xaa, so the scan cannot see a dead frame there.
+//! Method (2026-10-08): the direct-region engine of `p256`'s probe (painted
+//! region below the probe, call under a `PAD`-deep shim, snapshot scanned for
+//! 32-byte needles) — the earlier "scan a local buffer" form was
+//! blind to the top few hundred bytes of the measured call. ReleaseFast/
+//! ReleaseSmall only — Debug and ReleaseSafe fill `undefined` with 0xaa.
 //!
 //! The needles are every secret `sign` derives, in every representation the
 //! signing path holds it in: the effective scalar `d` and `n-d`, the nonce
@@ -71,56 +71,132 @@ fn keyEndingIn(last: u8) [32]u8 {
     return sk;
 }
 
+// ── the measured region (2026-10-08) ────────────────────────────────────────
+//
+// Direct-region engine, as `p256`'s probe: the region lies `PAD` bytes below
+// the probe's own stack position and the measured call runs as `shim(call)`
+// under a `PAD`-deep frame. The earlier "scan a local buffer" form
+// was blind to the top few hundred bytes (the scanner's own header and
+// locals), i.e. to the callers' and wrappers' frames. Calls are no-argument
+// `noinline fn`s: inputs come from module-level `var`s and results go into
+// module-level `var`s, so the harness's own locals never hold the secret.
+const PAD = 2048;
+
+var region_lo: usize = 0;
+var snap: [WINDOW]u8 = undefined;
+
+/// An address inside a frame called from the probe, at the depth
+/// `paint`/`shim`/`snapshot` start at.
+noinline fn stackHere() usize {
+    var x: u8 = 0;
+    std.mem.doNotOptimizeAway(&x);
+    return @intFromPtr(&x);
+}
+
 noinline fn paint() void {
-    var buf: [WINDOW]u8 = undefined;
-    @memset(&buf, 0xC7);
-    std.mem.doNotOptimizeAway(&buf);
+    const p: [*]volatile u8 = @ptrFromInt(region_lo);
+    for (0..WINDOW) |i| p[i] = 0xC7;
 }
 
-/// Count every needle in one uninitialised window claimed at the depth the
-/// previous call used. Volatile reads so the buffer cannot be folded away.
-noinline fn scan(needles: *const Needles) [needle_count]usize {
-    var buf: [WINDOW]u8 = undefined;
-    const p: [*]volatile u8 = @ptrCast(&buf);
-    var hits: [needle_count]usize = @splat(0);
-    var i: usize = 0;
-    while (i + 32 <= WINDOW) : (i += 1) {
-        for (needles, &hits) |*nd, *h| {
-            var j: usize = 0;
-            while (j < 32 and p[i + j] == nd[j]) : (j += 1) {}
-            if (j == 32) h.* += 1;
-        }
-    }
-    std.mem.doNotOptimizeAway(&buf);
-    return hits;
+/// Run `call` `PAD` bytes deeper than the probe; `pad` is touched after the
+/// call too, so it cannot be a tail call.
+noinline fn shim(call: *const fn () void) void {
+    var pad: [PAD]u8 = undefined;
+    std.mem.doNotOptimizeAway(&pad);
+    call();
+    std.mem.doNotOptimizeAway(&pad);
 }
 
-/// How many bytes below the scan frame's top the previous call left different
-/// from the paint — how deep its call tree reached, burn included. Sizes
-/// `root.zig`'s `sign_stack_burn`; printed, not asserted.
-noinline fn dirtyDepth() usize {
-    var buf: [WINDOW]u8 = undefined;
-    const p: [*]volatile u8 = @ptrCast(&buf);
+noinline fn snapshot() void {
+    const p: [*]const volatile u8 = @ptrFromInt(region_lo);
+    for (&snap, 0..) |*d, i| d.* = p[i];
+}
+
+/// Zero the callee-saved registers before a measured call: they still hold the
+/// test's own values (needles it just computed) and the call's prologue spills
+/// them into its frame, where the scan would credit them to the call.
+inline fn scrubCalleeSaved() void {
+    if (builtin.cpu.arch == .x86_64) asm volatile (
+        \\xorl %%ebx, %%ebx
+        \\xorl %%r12d, %%r12d
+        \\xorl %%r13d, %%r13d
+        \\xorl %%r14d, %%r14d
+        \\xorl %%r15d, %%r15d
+        ::: .{ .rbx = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true });
+}
+
+/// Paint the region, run `call` under `shim`, snapshot the region into `snap`.
+/// `inline`: the region top is computed in the caller's own frame, and as a
+/// frame of its own it would run the call deeper than that top.
+inline fn measure(call: *const fn () void) void {
+    region_lo = stackHere() - PAD - WINDOW;
+    scrubCalleeSaved();
+    paint();
+    shim(call);
+    snapshot();
+}
+
+/// How deep the last call's frames reached below the region's top.
+fn dirtyDepth() usize {
     var i: usize = 0;
-    while (i < WINDOW and p[i] == 0xC7) : (i += 1) {}
-    std.mem.doNotOptimizeAway(&buf);
+    while (i < WINDOW and snap[i] == 0xC7) : (i += 1) {}
     return WINDOW - i;
 }
 
+/// Bytes below the region's top of the shallowest / deepest needle hit seen by
+/// `countIn` since the last `resetDepths`.
+var hit_min_depth: usize = 0;
+var hit_max_depth: usize = 0;
+
+fn resetDepths() void {
+    hit_min_depth = 0;
+    hit_max_depth = 0;
+}
+
+/// Occurrences of the 32-byte `needle` in the last snapshot.
+fn countIn(needle: *const [32]u8) usize {
+    var hits: usize = 0;
+    var i: usize = 0;
+    while (i + 32 <= WINDOW) : (i += 1) {
+        if (snap[i] == needle[0] and std.mem.eql(u8, snap[i..][0..32], needle)) {
+            hits += 1;
+            const d = WINDOW - i;
+            if (hit_min_depth == 0 or d < hit_min_depth) hit_min_depth = d;
+            if (d > hit_max_depth) hit_max_depth = d;
+        }
+    }
+    return hits;
+}
+
+var leak_src: [32]u8 = undefined;
+var cur_sk: bip340.SecretKey = undefined;
+var cur_aux: [32]u8 = undefined;
+var hash_sink: [32]u8 = undefined;
+
 /// Negative control: public data only, same depth.
-noinline fn callInnocent(h: [32]u8) [32]u8 {
-    var out: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(&h, &out, .{});
-    return out;
+noinline fn callInnocent() void {
+    std.crypto.hash.sha2.Sha256.hash(&cur_aux, &hash_sink, .{});
+    std.mem.doNotOptimizeAway(&hash_sink);
 }
 
 /// Positive control: parks a secret in a stack local and returns.
-noinline fn callLeaky(secret: [32]u8) u8 {
+noinline fn callLeaky() void {
     var local: [512]u8 = undefined;
     @memset(&local, 0);
-    local[100..132].* = secret;
+    local[100..132].* = leak_src;
     std.mem.doNotOptimizeAway(&local);
-    return local[100];
+}
+
+/// Sum of occurrences of every needle in the last snapshot; `hits` gets the
+/// per-needle counts added.
+fn countAll(needles: *const Needles, hits: *[needle_count]usize) usize {
+    var sum: usize = 0;
+    for (needles, hits) |*nd, *h| {
+        const c = countIn(nd);
+        h.* += c;
+        sum += c;
+    }
+    return sum;
 }
 
 fn le(be: [32]u8) [32]u8 {
@@ -137,7 +213,8 @@ fn memImage(s: Scalar) [32]u8 {
 /// probe knows what to look for. Runs before `paint`, so its own copies are
 /// painted over before the measured call.
 fn needlesFor(sk_bytes: [32]u8, aux: [32]u8) !Needles {
-    var kp = try bip340.KeyPair.fromSecretKey(try bip340.SecretKey.fromBytes(sk_bytes));
+    var kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp, &(try bip340.SecretKey.fromBytes(sk_bytes)));
     defer kp.deinit();
     const d = try Scalar.fromBytes(kp.secret, .big);
     const aux_hash = bip340.taggedHash(bip340.hash.aux_tag, &aux);
@@ -161,102 +238,110 @@ fn needlesFor(sk_bytes: [32]u8, aux: [32]u8) !Needles {
     };
 }
 
-/// Paint, `call`, scan — five times per key — beside a negative and a
-/// positive control, and fail on any secret found. `call` signs `msg` with
-/// the given key and aux; it must be `noinline` so its frames sit below the
-/// caller at the depth `scan` claims.
-pub fn expectNoResidue(label: []const u8, comptime call: fn (bip340.SecretKey, [32]u8) void) !void {
+/// Measure `call` (a no-argument `noinline fn` reading `cur_sk`/`cur_aux`)
+/// five times per key beside a negative and a positive control, and fail on
+/// any secret found.
+fn runCases(label: []const u8, call: *const fn () void) !void {
     if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
 
-    for (cases) |case| {
-        const sk = try bip340.SecretKey.fromBytes(case.sk);
+    for (cases, 0..) |case, ci| {
+        cur_case = ci;
+        cur_sk = try bip340.SecretKey.fromBytes(case.sk);
+        cur_aux = case.aux;
         const needles = try needlesFor(case.sk, case.aux);
+        leak_src = needles[0];
 
-        paint();
-        std.mem.doNotOptimizeAway(callInnocent(case.aux));
-        const neg = scan(&needles);
-
-        paint();
-        std.mem.doNotOptimizeAway(callLeaky(needles[0]));
-        const pos = scan(&needles);
+        var scratch: [needle_count]usize = @splat(0);
+        measure(callInnocent);
+        const neg = countAll(&needles, &scratch);
+        measure(callLeaky);
+        const pos = countIn(&needles[0]);
 
         var total: [needle_count]usize = @splat(0);
+        var sum: usize = 0;
+        resetDepths();
         for (0..5) |_| {
-            paint();
-            call(sk, case.aux);
-            for (&total, scan(&needles)) |*t, x| t.* += x;
+            measure(call);
+            sum += countAll(&needles, &total);
         }
-        paint();
-        call(sk, case.aux);
+        measure(call);
         const depth = dirtyDepth();
 
         // Printed only when an assertion below fails: the lane treats stderr
         // from a passing test as a FAIL (scripts/lib/test-lib.sh).
         errdefer {
             std.debug.print("\n=== STACKPROBE bip340 F2: {s} ({t}, window {d} KiB) ===\n", .{ label, builtin.mode, WINDOW / 1024 });
-            std.debug.print("  key ..{x:0>2}: NEG={any} POS(d)={d} dirty below the call={d} B\n", .{ case.sk[31], neg, pos[0], depth });
+            std.debug.print("  key ..{x:0>2}: NEG={d} POS(d)={d} dirty below the call={d} B, hits {d}..{d} B\n", .{ case.sk[31], neg, pos, depth, hit_min_depth, hit_max_depth });
             for (needle_names, total) |name, h| {
                 if (h != 0) std.debug.print("    RESIDUE {s:<28} {d} (5 calls)\n", .{ name, h });
             }
         }
-        for (neg) |h| try std.testing.expectEqual(@as(usize, 0), h);
-        try std.testing.expect(pos[0] >= 1); // the scan can see a parked secret
-        for (total) |h| try std.testing.expectEqual(@as(usize, 0), h);
+        try std.testing.expectEqual(@as(usize, 0), neg);
+        try std.testing.expect(pos >= 1); // the scan can see a parked secret
+        try std.testing.expectEqual(@as(usize, 0), sum);
     }
+}
+
+var cur_case: usize = 0;
+
+/// Shared with `root.zig`, which checks `computeAndBurn` alone through a
+/// `fn (*const SecretKey, *const [32]u8) void`: a thunk passes pointers to the
+/// statics (by value, the thunk's own argument copies were counted).
+pub fn expectNoResidue(label: []const u8, comptime call: fn (*const bip340.SecretKey, *const [32]u8) void) !void {
+    const T = struct {
+        noinline fn run() void {
+            call(&cur_sk, &cur_aux);
+        }
+    };
+    try runCases(label, T.run);
 }
 
 var sign_io: std.Io = undefined;
 
-noinline fn callSign(sk: bip340.SecretKey, aux: [32]u8) void {
-    const sig = bip340.sign(sk, msg, aux, sign_io) catch unreachable;
-    std.mem.doNotOptimizeAway(&sig);
+noinline fn callSign() void {
+    sig_sink = bip340.sign(&cur_sk, msg, cur_aux, sign_io) catch unreachable;
+    std.mem.doNotOptimizeAway(&sig_sink);
 }
+
+var sig_sink: [64]u8 = undefined;
 
 test "STACKPROBE (A1 F2): no key or nonce residue on the dead stack after sign()" {
     var th = std.Io.Threaded.init(std.testing.allocator, .{});
     defer th.deinit();
     sign_io = th.io();
-    try expectNoResidue("sign", callSign);
+    try runCases("sign", callSign);
 }
 
 /// Key pairs for `callSignWithKeyPair`, built before the probe paints, in
-/// static memory the stack scan never reads: the probe measures what signing
-/// leaves behind, not the caller's own copy of the pair.
+/// static memory: the probe measures what signing leaves behind, not the
+/// caller's own copy of the pair.
 var probe_pairs: [cases.len]bip340.KeyPair = undefined;
 
-/// Picks the pair by `aux` (public, different per case), never by `sk`:
-/// comparing the key bytes put a copy of the key in THIS frame, and the probe
-/// counted the harness's own copy (measured 2026-10-08 in another build).
-noinline fn callSignWithKeyPair(sk: bip340.SecretKey, aux: [32]u8) void {
-    _ = sk;
-    for (cases, &probe_pairs) |case, *kp| {
-        if (case.aux[0] != aux[0]) continue;
-        const sig = bip340.signWithKeyPair(kp, msg, aux, sign_io) catch unreachable;
-        std.mem.doNotOptimizeAway(&sig);
-        return;
-    }
-    unreachable;
+noinline fn callSignWithKeyPair() void {
+    sig_sink = bip340.signWithKeyPair(&probe_pairs[cur_case], msg, cur_aux, sign_io) catch unreachable;
+    std.mem.doNotOptimizeAway(&sig_sink);
 }
 
 test "STACKPROBE: no key or nonce residue on the dead stack after signWithKeyPair()" {
     var th = std.Io.Threaded.init(std.testing.allocator, .{});
     defer th.deinit();
     sign_io = th.io();
-    for (cases, &probe_pairs) |case, *kp| kp.* = try bip340.KeyPair.fromSecretKey(try bip340.SecretKey.fromBytes(case.sk));
+    for (cases, &probe_pairs) |case, *kp| try bip340.KeyPair.fromSecretKey(kp, &(try bip340.SecretKey.fromBytes(case.sk)));
     defer for (&probe_pairs) |*kp| kp.deinit();
-    try expectNoResidue("signWithKeyPair", callSignWithKeyPair);
+    try runCases("signWithKeyPair", callSignWithKeyPair);
 }
 
-noinline fn callKeyPairFromSecretKey(sk: bip340.SecretKey, aux: [32]u8) void {
-    _ = aux;
-    var kp = bip340.KeyPair.fromSecretKey(sk) catch unreachable;
-    std.mem.doNotOptimizeAway(&kp.public);
-    kp.deinit();
+var kp_sink: bip340.KeyPair = undefined;
+
+noinline fn callKeyPairFromSecretKey() void {
+    bip340.KeyPair.fromSecretKey(&kp_sink, &cur_sk) catch unreachable;
+    std.mem.doNotOptimizeAway(&kp_sink.public);
+    kp_sink.deinit();
 }
 
 // `signWithKeyPair` moves steps 1-2 out of `sign`'s burned frame into the
 // caller's own `KeyPair.fromSecretKey` call, so that call is now a signing
 // path of its own and gets the same probe.
 test "STACKPROBE: no key residue on the dead stack after KeyPair.fromSecretKey()" {
-    try expectNoResidue("KeyPair.fromSecretKey", callKeyPairFromSecretKey);
+    try runCases("KeyPair.fromSecretKey", callKeyPairFromSecretKey);
 }

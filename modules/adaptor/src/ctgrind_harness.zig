@@ -215,7 +215,7 @@ fn buildFixture(io: std.Io) !Fixture {
     const aux_rand = secretBytes(32, "ctgrind-adaptor-harness-fixture-aux-rand-v1");
     const msg = "ctgrind harness message";
 
-    const presig = try adaptor.preSign(sk, msg, aux_rand, adaptor_point, io);
+    const presig = try adaptor.preSign(&sk, msg, aux_rand, adaptor_point, io);
     const sig_bytes = try adaptor.adapt(presig, t_bytes);
     const full_sig = try bip340.Signature.fromBytes(sig_bytes);
 
@@ -258,7 +258,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const msg = "ctgrind harness message";
             const aux_rand = secretBytes(32, "ctgrind-adaptor-harness-presign-aux-rand-v1");
 
-            const presig = try adaptor.preSign(sk, msg, aux_rand, adaptor_point, io);
+            const presig = try adaptor.preSign(&sk, msg, aux_rand, adaptor_point, io);
             std.debug.print("r={x} s_prime={x} needs_negation={}\n", .{ presig.r, presig.s_prime, presig.needs_negation });
         },
         .adapt => {

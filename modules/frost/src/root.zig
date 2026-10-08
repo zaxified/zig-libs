@@ -367,15 +367,18 @@ pub fn nonceGenerate(random_bytes: [32]u8, secret: Scalar) Scalar {
 /// generated from a source of secure randomness") — passing the same
 /// bytes for both, or a predictable value, breaks the scheme exactly as
 /// badly as ECDSA/Schnorr nonce reuse does elsewhere.
-pub fn generateNonces(signing_share: SigningShare, hiding_random: [32]u8, binding_random: [32]u8) SigningNonces {
-    const nonces = generateNoncesBurned(signing_share, hiding_random, binding_random);
+///
+/// The share by pointer and the nonces into `out` (BREAKING 2026-10-08): by
+/// value both ways, the caller's frame kept the share and this wrapper's frame
+/// the nonces (`stackprobe_test.zig`, direct-region engine).
+pub fn generateNonces(out: *SigningNonces, signing_share: *const SigningShare, hiding_random: [32]u8, binding_random: [32]u8) void {
+    generateNoncesBurned(out, signing_share, hiding_random, binding_random);
     burnStack();
-    return nonces;
 }
 
-noinline fn generateNoncesBurned(signing_share: SigningShare, hiding_random: [32]u8, binding_random: [32]u8) SigningNonces {
+noinline fn generateNoncesBurned(out: *SigningNonces, signing_share: *const SigningShare, hiding_random: [32]u8, binding_random: [32]u8) void {
     const secret = signing_share.scalar();
-    return .{
+    out.* = .{
         .hiding = nonceGenerate(hiding_random, secret),
         .binding = nonceGenerate(binding_random, secret),
     };
@@ -1012,7 +1015,7 @@ pub const Round2SignError = error{
 pub fn round2Sign(
     allocator: std.mem.Allocator,
     identifier: Identifier,
-    signing_share: SigningShare,
+    signing_share: *const SigningShare,
     group_public_key: GroupPublicKey,
     nonces: *const SigningNonces,
     msg: []const u8,
@@ -1026,7 +1029,7 @@ pub fn round2Sign(
 noinline fn round2SignBurned(
     allocator: std.mem.Allocator,
     identifier: Identifier,
-    signing_share: SigningShare,
+    signing_share: *const SigningShare,
     group_public_key: GroupPublicKey,
     nonces_ptr: *const SigningNonces,
     msg: []const u8,
@@ -1038,7 +1041,7 @@ noinline fn round2SignBurned(
     // to erase.
     var n = nonces;
     defer n.deinit();
-    var sk_i = signing_share;
+    var sk_i = signing_share.*;
     defer sk_i.deinit();
 
     // RFC 9591 §5.2's MUST: this signer's own round-1 commitments are the

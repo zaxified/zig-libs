@@ -45,7 +45,7 @@ test "BIP340 official vectors: sign byte-exact + verify TRUE/FALSE" {
         if (vec.secret_key) |sk_hex| {
             const sk = hex32(sk_hex);
             const aux = hex32(vec.aux_rand.?);
-            const produced = try sign.bip340Sign(sk, msg, aux);
+            const produced = try sign.bip340Sign(&sk, msg, aux);
             try std.testing.expectEqualSlices(u8, &sig, &produced);
         }
 

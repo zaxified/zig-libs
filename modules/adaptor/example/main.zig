@@ -65,14 +65,15 @@ pub fn main() !void {
     const io = threaded.io();
 
     const secret_key = try bip340.SecretKey.fromBytes(sk_bytes);
-    const kp = try bip340.KeyPair.fromSecretKey(secret_key);
+    var kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp, &secret_key);
 
     // T = t*G — the public adaptor point the presigner binds to, without
     // ever learning t itself.
     const adaptor_point = try adaptor.AdaptorPoint.fromSecret(t_bytes);
 
     // ── PreSign: produce a pre-signature bound to T, no knowledge of t ────
-    const presig = try adaptor.preSign(secret_key, &msg, aux_rand, adaptor_point, io);
+    const presig = try adaptor.preSign(&secret_key, &msg, aux_rand, adaptor_point, io);
     std.debug.print("preSign: pre-signature produced, needs_negation={}\n", .{presig.needs_negation});
 
     // ── PreVerify: anyone can check it, still without knowing t ──────────

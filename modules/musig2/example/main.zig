@@ -143,7 +143,7 @@ pub fn main() !void {
 
     var psigs: [2]musig2.PartialSignature = undefined;
     for (&signers, &psigs) |*s, *out| {
-        out.* = musig2.sign(&s.secnonce, s.sk, ctx) catch |err| switch (err) {
+        out.* = musig2.sign(&s.secnonce, &s.sk, ctx) catch |err| switch (err) {
             // The mandatory self-check. A signer never publishes an
             // unverified partial signature, because a faulty one leaks
             // information about the secret key.
@@ -197,7 +197,7 @@ pub fn main() !void {
     //    leak (two signatures, one nonce: two equations, two unknowns). `sign`
     //    consumed each signer's secnonce above, so a retry is refused by name
     //    instead of producing a second partial signature.
-    if (musig2.sign(&signers[0].secnonce, signers[0].sk, ctx)) |_| {
+    if (musig2.sign(&signers[0].secnonce, &signers[0].sk, ctx)) |_| {
         return error.NonceReuseAccepted;
     } else |err| switch (err) {
         error.InvalidSecNonce => std.debug.print("second use of a consumed secnonce rejected\n", .{}),
@@ -220,7 +220,7 @@ pub fn main() !void {
     );
     var outsider_secnonce = outsider_nonce.secnonce;
     defer outsider_secnonce.deinit();
-    if (musig2.sign(&outsider_secnonce, outsider_sk, ctx)) |_| {
+    if (musig2.sign(&outsider_secnonce, &outsider_sk, ctx)) |_| {
         return error.OutsiderSignatureAccepted;
     } else |err| switch (err) {
         error.PubkeyNotInSession => std.debug.print("signer outside the session rejected\n", .{}),

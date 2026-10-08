@@ -306,7 +306,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const msg = "ctgrind harness message";
             const aux_rand = secretBytes(32, "ctgrind-k256-harness-aux-rand-v1");
 
-            const sig = try sign.bip340Sign(secret_key, msg, aux_rand);
+            const sig = try sign.bip340Sign(&secret_key, msg, aux_rand);
             std.debug.print("sig={x}\n", .{sig});
         },
         .ecdsa => {
@@ -321,7 +321,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             const hash32 = secretBytes(32, "ctgrind-k256-harness-ecdsa-message-hash-v1");
 
-            const sig = try ecdsa_recover.sign(privkey, hash32);
+            const sig = try ecdsa_recover.sign(&privkey, hash32);
             std.debug.print("r={x} s={x} recid={d}\n", .{ sig.r, sig.s, sig.recid });
         },
     }

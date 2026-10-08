@@ -89,9 +89,11 @@ pub fn main() !void {
     // ── setup: two independent signers ──────────────────────────────────
     const alice_sk = try bip340.SecretKey.fromBytes(alice_sk_bytes);
     const bob_sk = try bip340.SecretKey.fromBytes(bob_sk_bytes);
-    var alice_kp = try bip340.KeyPair.fromSecretKey(alice_sk);
+    var alice_kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&alice_kp, &alice_sk);
     defer alice_kp.deinit();
-    var bob_kp = try bip340.KeyPair.fromSecretKey(bob_sk);
+    var bob_kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&bob_kp, &bob_sk);
     defer bob_kp.deinit();
     must(std.mem.eql(u8, &alice_kp.public.x, &expected_alice_pub), @src());
     must(std.mem.eql(u8, &bob_kp.public.x, &expected_bob_pub), @src());
@@ -101,9 +103,9 @@ pub fn main() !void {
     // ── session 1: alice signs msg1, bob signs the same msg1 ────────────
     // Two independently keyed sessions over one message — the shape a
     // multi-party protocol checks each contribution against.
-    const alice_sig1 = try bip340.sign(alice_sk, &msg1, alice_aux1, io);
+    const alice_sig1 = try bip340.sign(&alice_sk, &msg1, alice_aux1, io);
     must(std.mem.eql(u8, &alice_sig1, &expected_alice_sig1), @src());
-    const bob_sig1 = try bip340.sign(bob_sk, &msg1, bob_aux1, io);
+    const bob_sig1 = try bip340.sign(&bob_sk, &msg1, bob_aux1, io);
     must(bip340.verify(alice_kp.public, &msg1, try bip340.Signature.fromBytes(alice_sig1)), @src());
     must(bip340.verify(bob_kp.public, &msg1, try bip340.Signature.fromBytes(bob_sig1)), @src());
     std.debug.print("session 1: both signatures verify\n", .{});
@@ -113,7 +115,7 @@ pub fn main() !void {
     // that would surface leftover state (bip340 keeps none: `sign` takes
     // everything by value and returns a plain array, so there is nothing to
     // carry between calls).
-    const alice_sig2 = try bip340.sign(alice_sk, &msg2, alice_aux2, io);
+    const alice_sig2 = try bip340.sign(&alice_sk, &msg2, alice_aux2, io);
     must(bip340.verify(alice_kp.public, &msg2, try bip340.Signature.fromBytes(alice_sig2)), @src());
     // Cross-session confusion must fail: session 1's signature does not
     // verify against session 2's message, even under the same key.

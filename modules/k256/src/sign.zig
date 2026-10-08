@@ -60,7 +60,10 @@ pub const SignError = error{ InvalidSecretKey, InvalidNonce };
 /// private key. Same shape as `ecdsa_recover.sign` (A1 G2): the computation
 /// runs one frame down, then `bip340_stack_burn` bytes at that depth are
 /// zeroed.
-pub fn bip340Sign(secret_key: [32]u8, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
+///
+/// The key by pointer (BREAKING 2026-10-08): by value, the caller's frame kept
+/// a copy of it (`stackprobe_test.zig`, direct-region engine).
+pub fn bip340Sign(secret_key: *const [32]u8, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
     const result = bip340SignInner(secret_key, msg, aux_rand);
     burnBip340Stack();
     return result;
@@ -84,7 +87,9 @@ noinline fn burnBip340Stack() void {
     for (0..buf.len) |i| p[i] = @splat(0);
 }
 
-noinline fn bip340SignInner(secret_key: [32]u8, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
+noinline fn bip340SignInner(secret_key_ptr: *const [32]u8, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
+    // The copy lives in this burned frame, not in `bip340Sign`'s.
+    const secret_key = secret_key_ptr.*;
     // d' = int(sk), 0 < d' < n.
     const dp = Scalar.fromBytes(secret_key, .big) catch return error.InvalidSecretKey;
     if (dp.isZero()) return error.InvalidSecretKey;
@@ -302,7 +307,7 @@ const Bip340Corpus = struct {
         const sk = [_]u8{0} ** 31 ++ [_]u8{1};
         const pk = Secp256k1.basePoint.affineCoordinates().x.toBytes(.big);
         const msg = [_]u8{0xAB} ** 32;
-        const sig = bip340Sign(sk, &msg, [_]u8{0} ** 32) catch unreachable;
+        const sig = bip340Sign(&sk, &msg, [_]u8{0} ** 32) catch unreachable;
         self.push(pk, sig, &msg); // a real signature over a real key
         var flipped = sig;
         flipped[63] ^= 0x01; // one octet in `s`: still parses, fails the equation

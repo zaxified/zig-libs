@@ -274,13 +274,13 @@ test "bench (opt-in via K256_BENCH)" {
 
         // k256 BIP340 sign/verify (no direct std analog; report standalone).
         const sk = [_]u8{3} ** 32;
-        const bsig = sign.bip340Sign(sk, msg, [_]u8{0} ** 32) catch return;
+        const bsig = sign.bip340Sign(&sk, msg, [_]u8{0} ** 32) catch return;
         const pub_xonly = (Secp256k1.basePoint.mul(sk, .big) catch return).affineCoordinates().x.toBytes(.big);
         sink = 0;
         t0 = nowNs();
         i = 0;
         while (i < sig_iters) : (i += 1) {
-            const s2 = sign.bip340Sign(sk, msg, [_]u8{0} ** 32) catch continue;
+            const s2 = sign.bip340Sign(&sk, msg, [_]u8{0} ** 32) catch continue;
             sink ^= s2[0];
         }
         dt = nowNs() - t0;
@@ -307,14 +307,14 @@ test "bench (opt-in via K256_BENCH)" {
         t0 = nowNs();
         i = 0;
         while (i < sig_iters) : (i += 1) {
-            const s2 = ecdsa_recover.sign(ec_privkey, ec_hash) catch continue;
+            const s2 = ecdsa_recover.sign(&ec_privkey, ec_hash) catch continue;
             sink ^= s2.r[0];
         }
         dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
         std.debug.print("{s} ecdsa_recover.sign (RFC6979): {d:>8} ns/op\n", .{ k256_label, dt / sig_iters });
 
-        const ec_sig = ecdsa_recover.sign(ec_privkey, ec_hash) catch unreachable;
+        const ec_sig = ecdsa_recover.sign(&ec_privkey, ec_hash) catch unreachable;
         sink = 0;
         t0 = nowNs();
         i = 0;

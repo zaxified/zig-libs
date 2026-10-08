@@ -51,7 +51,8 @@ const consensus_taproot: ScriptFlags = .{
 
 fn keypair(seed: u8) !struct { sk: bip340.SecretKey, x: [32]u8 } {
     const sk = try bip340.SecretKey.fromBytes([_]u8{seed} ** 32);
-    const kp = try bip340.KeyPair.fromSecretKey(sk);
+    var kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp, &sk);
     return .{ .sk = sk, .x = kp.public.x };
 }
 
@@ -123,7 +124,7 @@ fn signLeaf(a: std.mem.Allocator, sk: bip340.SecretKey, s: *const Setup, aux: u8
     var exec: tapscript.ExecData = .{ .tapleaf_hash = s.tapleaf_hash, .codesep_pos = 0xffffffff };
     const sighash = try tapscript.sighash(a, s.tx, 0, tapscript.SIGHASH_DEFAULT, s.spent, &exec);
     const io: std.Io = undefined;
-    return bip340.sign(sk, &sighash, [_]u8{aux} ** 32, io);
+    return bip340.sign(&sk, &sighash, [_]u8{aux} ** 32, io);
 }
 
 // ── 1. script-path CHECKSIG spend ────────────────────────────────────────

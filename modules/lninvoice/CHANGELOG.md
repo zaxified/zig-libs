@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** BOLT11 signing follows k256's pointer `ecdsa_recover.sign`; BOLT12 signing and tests follow bip340's pointer
+  `sign` and out-param `KeyPair.fromSecretKey` (bip340 2026-10-08).
 - **2026-09-15** — **Internal only, no behaviour change:** `bech32_raw.zig`'s own copies of the
   BCH-checksum generator, `charValue`, `toLower` and HRP expansion (54 non-comment lines,
   byte-for-byte the same algorithm as `bech32`'s) are gone — it now imports `bech32.polymod`/

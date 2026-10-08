@@ -216,7 +216,8 @@ test "e2e: real P2TR key-path spend verifies via BIP341 sighash + BIP340 Schnorr
     const a = arena.allocator();
 
     const sk = try bip340.SecretKey.fromBytes([_]u8{0x33} ** 32);
-    const kp = try bip340.KeyPair.fromSecretKey(sk);
+    var kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp, &sk);
     const program = kp.public.x; // untweaked internal key used directly as the output key (module doc comment)
 
     var script_pubkey: [34]u8 = undefined;
@@ -233,7 +234,7 @@ test "e2e: real P2TR key-path spend verifies via BIP341 sighash + BIP340 Schnorr
     const sighash = try bitcointx.bip341.sighash(a, spend_tx, 0, bitcointx.bip341.SIGHASH_DEFAULT, &spent);
 
     const io_undefined: std.Io = undefined;
-    const sig64 = try bip340.sign(sk, &sighash, [_]u8{0x44} ** 32, io_undefined);
+    const sig64 = try bip340.sign(&sk, &sighash, [_]u8{0x44} ** 32, io_undefined);
 
     const witness = [_][]const u8{&sig64};
     const ctx: txctx.TxContext = .{ .tx = spend_tx, .input_index = 0, .spent_outputs = &spent };

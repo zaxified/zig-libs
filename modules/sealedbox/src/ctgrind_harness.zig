@@ -154,7 +154,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var sk = secretKeyBytes();
             if (tainted) std.valgrind.memcheck.makeMemUndefined(&sk);
             const key = reloadVolatile(secret_length, &sk);
-            const text = root.encodeSecretKeyHex(key);
+            var text: [root.hex_sk_len]u8 = undefined;
+            root.encodeSecretKeyHex(&text, &key);
             std.debug.print("ctgrind_result={x}\n", .{text});
         },
         .b64enc => {
@@ -169,7 +170,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // is the parse, and an encode inside the tainted region would fold its
         // own contexts into this row's count.
         .hexdec => {
-            var text = root.encodeSecretKeyHex(secretKeyBytes());
+            var text: [root.hex_sk_len]u8 = undefined;
+            root.encodeSecretKeyHex(&text, &secretKeyBytes());
             if (tainted) std.valgrind.memcheck.makeMemUndefined(&text);
             const input = reloadVolatile(root.hex_sk_len, &text);
             var key: [secret_length]u8 = undefined;

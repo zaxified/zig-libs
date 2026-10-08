@@ -637,7 +637,7 @@ pub fn encode(allocator: Allocator, params: EncodeParams, sign_input: SignInput)
 
     const sig: ecdsa.Signature = switch (sign_input) {
         .signature => |s| s,
-        .private_key => |pk| try ecdsa.sign(pk, hash),
+        .private_key => |pk| try ecdsa.sign(&pk, hash),
     };
 
     var sig_bytes: [65]u8 = undefined;
@@ -1101,7 +1101,7 @@ test "RFC6979 byte-exact re-derivation: signing the donation vector's own hash w
     // both halves: the spec's field is minimal, and it was this module's own
     // encoder that mis-sized it -- see the KAT below.)
     const hash = hexToBytes(32, "6daf4d488be41ce7cbb487cab1ef2975e5efcea879b20d421f0ef86b07cbb987");
-    const sig = try ecdsa.sign(spec_privkey, hash);
+    const sig = try ecdsa.sign(&spec_privkey, hash);
     try testing.expectEqualSlices(u8, &hexToBytes(32, "8d3ce9e28357337f62da0162d9454df827f83cfe499aeb1c1db349d4d8112742"), &sig.r);
     try testing.expectEqualSlices(u8, &hexToBytes(32, "5e434ca29929406c23bba1ae8ac6ca32880b38d4bf6ff874024cac34ba9625f1"), &sig.s);
     try testing.expectEqual(@as(u2, 1), sig.recid);

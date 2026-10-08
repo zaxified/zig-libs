@@ -864,8 +864,8 @@ pub const SignError = SessionError || SecNonceError || error{
 ///      `partialSigVerifyInternal(s, pubnonce, pk, ctx)` must accept;
 ///      `error.SignatureVerificationFailed` otherwise, never the
 ///      unverified `s`.
-pub fn sign(secnonce: *SecNonce, sk: bip340.SecretKey, ctx: SessionContext) SignError!PartialSignature {
-    const result = signBurned(secnonce, &sk, ctx);
+pub fn sign(secnonce: *SecNonce, sk: *const bip340.SecretKey, ctx: SessionContext) SignError!PartialSignature {
+    const result = signBurned(secnonce, sk, ctx);
     burnSignStack();
     return result;
 }

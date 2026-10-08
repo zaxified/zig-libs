@@ -61,7 +61,8 @@ const Ctx = struct {
 };
 
 fn doKeypair(c: Ctx) usize {
-    const kp = bip340.KeyPair.fromSecretKey(c.sk) catch unreachable;
+    var kp: bip340.KeyPair = undefined;
+    bip340.KeyPair.fromSecretKey(&kp, &c.sk) catch unreachable;
     std.mem.doNotOptimizeAway(&kp);
     return 1;
 }
@@ -123,7 +124,8 @@ pub fn main(init: std.process.Init) !u8 {
     r.bytes(&msg);
     r.bytes(&aux);
     const sk = try bip340.SecretKey.fromBytes(sk_bytes);
-    const kp = try bip340.KeyPair.fromSecretKey(sk);
+    var kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp, &sk);
     const sig_bytes = try bip340.sign(sk, &msg, aux, io);
     const sig = try bip340.Signature.fromBytes(sig_bytes);
     try dir.writeFile(io, .{ .sub_path = "sk.bin", .data = &sk_bytes });
@@ -189,7 +191,8 @@ pub fn main(init: std.process.Init) !u8 {
         r.bytes(&b);
         r.bytes(&m);
         r.bytes(&a);
-        const k = try bip340.KeyPair.fromSecretKey(try bip340.SecretKey.fromBytes(b));
+        var k: bip340.KeyPair = undefined;
+        try bip340.KeyPair.fromSecretKey(&k, &(try bip340.SecretKey.fromBytes(b)));
         const s = try bip340.sign(try bip340.SecretKey.fromBytes(b), &m, a, io);
         it.* = .{ .pubkey = k.public, .msg = try arena.dupe(u8, &m), .sig = try bip340.Signature.fromBytes(s) };
     }

@@ -139,7 +139,10 @@ pub const Signature = struct { r: [32]u8, s: [32]u8, recid: u2 };
 ///
 /// On return, the stack below this frame that the signing computation used
 /// has been overwritten with zeros (see `burnSignStack`).
-pub fn sign(privkey: [32]u8, hash32: [32]u8) SignError!Signature {
+///
+/// The key by pointer (BREAKING 2026-10-08): by value, the caller's frame kept
+/// a copy of it (`stackprobe_test.zig`, direct-region engine).
+pub fn sign(privkey: *const [32]u8, hash32: [32]u8) SignError!Signature {
     const result = signInner(privkey, hash32, Secp256k1.combMulBase);
     burnSignStack();
     return result;
@@ -193,7 +196,9 @@ noinline fn burnSignStack() void {
     for (0..buf.len) |i| p[i] = @splat(0);
 }
 
-noinline fn signInner(privkey: [32]u8, hash32: [32]u8, comptime commit: CommitFn) SignError!Signature {
+noinline fn signInner(privkey_ptr: *const [32]u8, hash32: [32]u8, comptime commit: CommitFn) SignError!Signature {
+    // The copy lives in this burned frame, not in `sign`'s.
+    const privkey = privkey_ptr.*;
     const d = Scalar.fromBytes(privkey, .big) catch return error.InvalidPrivateKey;
     if (d.isZero()) return error.InvalidPrivateKey;
     const e = reduceToScalar(hash32);
@@ -309,7 +314,7 @@ test "sign then recoverPubkey round-trips to the signer's own pubkey" {
         Sha256.hash(&msg, &hash, .{});
 
         const want_pub = Secp256k1.combMulBase(privkey, .big) catch continue;
-        const sig = try sign(privkey, hash);
+        const sig = try sign(&privkey, hash);
         const recovered = try recoverPubkey(hash, sig.r, sig.s, sig.recid);
         try testing.expect(want_pub.equivalent(recovered));
 
@@ -331,7 +336,7 @@ test "recoverPubkey: a bit-flipped signature recovers a DIFFERENT (or non-recove
     hash[31] = 0x99;
 
     const want_pub = try Secp256k1.combMulBase(privkey, .big);
-    const sig = try sign(privkey, hash);
+    const sig = try sign(&privkey, hash);
     const good = try recoverPubkey(hash, sig.r, sig.s, sig.recid);
     try testing.expect(want_pub.equivalent(good));
 
@@ -363,7 +368,7 @@ test "recoverPubkey: r=0 and s=0 are rejected (error.InvalidScalar), not silentl
     var hash: [32]u8 = undefined;
     @memset(&hash, 0);
     hash[31] = 0x99;
-    const sig = try sign(privkey, hash);
+    const sig = try sign(&privkey, hash);
 
     const zero = [_]u8{0} ** 32;
     try testing.expectError(error.InvalidScalar, recoverPubkey(hash, zero, sig.s, sig.recid));
@@ -438,7 +443,7 @@ test "RFC 6979 nonce anchor: BOLT#11's own worked example signs to its published
     //     nonce for this (key, hash). Any change to the nonce derivation —
     //     a constant nonce, a different DRBG personalisation, dropping the
     //     `bits2octets` reduction — moves `r` completely.
-    const sig = try sign(spec_privkey, spec_hash);
+    const sig = try sign(&spec_privkey, spec_hash);
     try testing.expectEqualSlices(u8, &spec_r, &sig.r);
     try testing.expectEqualSlices(u8, &spec_s, &sig.s);
     try testing.expectEqual(spec_recid, sig.recid);
@@ -552,7 +557,7 @@ test "G7: sign sets recid bit 1 and reduces r when R.x >= n (R injected through 
     for (&privkey, 0..) |*b, i| b.* = @intCast(0x21 +% i);
     const hash = beOf(0x6b_32_35_36_47_37);
 
-    const sig = signInner(privkey, hash, Injected.commit) catch |err| {
+    const sig = signInner(&privkey, hash, Injected.commit) catch |err| {
         std.debug.print("G7 sign seam: signInner returned error.{t} for R.x >= n\n", .{err});
         return err;
     };
@@ -570,7 +575,7 @@ test "G7: sign sets recid bit 1 and reduces r when R.x >= n (R injected through 
 
     // Positive control on the seam: the production commitment on the same key
     // and hash gives an ordinary signature, recid bit 1 clear.
-    const real = try sign(privkey, hash);
+    const real = try sign(&privkey, hash);
     try testing.expect(real.recid & 2 == 0);
 }
 
@@ -585,12 +590,12 @@ test "sign refuses a private key of 0, n, or above n" {
     var n1_bytes: [32]u8 = undefined;
     std.mem.writeInt(u256, &n1_bytes, scalarmod.field_order + 1, .big);
     for ([_][32]u8{ @splat(0), n_bytes, n1_bytes, @splat(0xff) }) |k| {
-        try testing.expectError(error.InvalidPrivateKey, sign(k, hash));
+        try testing.expectError(error.InvalidPrivateKey, sign(&k, hash));
     }
     // Positive control: n − 1 is the largest valid key.
     var top: [32]u8 = undefined;
     std.mem.writeInt(u256, &top, scalarmod.field_order - 1, .big);
-    _ = try sign(top, hash);
+    _ = try sign(&top, hash);
 }
 
 // Mutation run 2026-10-05: dropping the `x_wide >= p` check left the suite

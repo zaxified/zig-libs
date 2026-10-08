@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets in the caller's frame):** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
+  engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
+  through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised
+  buffer" engine could not see the top ~250–450 B of the call — the caller's and the wrappers'
+  frames. It found `d'` in the
+  caller's frame after `sign` (by-value argument). `sign(secnonce, sk: *const bip340.SecretKey,
+  ctx)`. 0 residues after.
 - **2026-10-08** — **FIX (secrets on the dead stack):** the dead-stack burn's buffer is now
   16-aligned instead of the vector type's natural 32. At 32 the burn's frame was realigned, and
   the up to 56 bytes between its saved frame pointer and the buffer — the top of the frame the

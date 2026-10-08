@@ -3,17 +3,13 @@
 //! Dead-stack residue probe for `blind` (audit findings B6 and B9), kept in
 //! the module per `CONVENTIONS.md` §9.
 //!
-//! Method (as `bip340`'s, `bulletproofs`' and `xmss`'s probes): paint a stack
-//! window, call `blind` at that depth, then copy an equally large
-//! UNINITIALISED buffer claimed there to the heap BEFORE anything else runs,
-//! and search the copy. ReleaseFast/ReleaseSmall only: Debug and ReleaseSafe
-//! fill `undefined` with 0xaa, so a dead frame is not readable there.
-//!
-//! ⛔ Why the copy, and why this probe replaced the in-`root.zig` one it grew
-//! from: that version scanned the live stack and built its needles in the
-//! SAME frame, inside the window it was scanning — so it counted its own
-//! needle buffers. Measured while fixing B6: it reported 2 / 2 / 1 hits where
-//! this one reports what the call actually left.
+//! Method as `p256`'s `stackprobe_test.zig` (direct region, 2026-10-08: the
+//! earlier "scan a local buffer at the call's depth" form was blind to the top
+//! few hundred bytes of the measured call): paint a stack region below the
+//! probe, run one call under a `PAD`-deep shim, snapshot the region into a
+//! static buffer and search the snapshot. ReleaseFast/ReleaseSmall only: Debug
+//! and ReleaseSafe fill `undefined` with 0xaa, so a dead frame is not readable
+//! there.
 //!
 //! ⛔ A zero is only readable next to the two controls in the same binary: a
 //! NEGATIVE control (a call that never sees the secret, must find 0) and a
@@ -38,7 +34,6 @@ const MAX = kat.r.len;
 /// Mirrors `root.zig`'s `sign_stack_burn`, for reading the offsets below.
 const sign_burn_bytes = 512 * 1024;
 
-var dead: *[WINDOW]u8 = undefined;
 var pk: rsa.PublicKey = undefined;
 var ctx: brsa.Context = undefined;
 var blinded: [MAX]u8 = undefined;
@@ -57,19 +52,64 @@ const DeadStackFixedRandom = struct {
     }
 };
 
-noinline fn paint() void {
-    var buf: [WINDOW]u8 = undefined;
-    @memset(&buf, 0xC7);
-    std.mem.doNotOptimizeAway(&buf);
+const PAD = 2048;
+
+var region_lo: usize = 0;
+var snap: [WINDOW]u8 = undefined;
+
+/// An address inside a frame called from the probe, at the depth
+/// `paint`/`shim`/`snapshot` start at.
+noinline fn stackHere() usize {
+    var x: u8 = 0;
+    std.mem.doNotOptimizeAway(&x);
+    return @intFromPtr(&x);
 }
 
-/// Copy the uninitialised window at the depth the previous call used to the
-/// heap. Volatile reads so the buffer cannot be folded away.
+noinline fn paint() void {
+    const p: [*]volatile u8 = @ptrFromInt(region_lo);
+    for (0..WINDOW) |i| p[i] = 0xC7;
+}
+
+/// Run `call` `PAD` bytes deeper than the probe, so its frames lie inside the
+/// region. `pad` is touched after the call too, so it cannot be a tail call.
+noinline fn shim(call: *const fn () void) void {
+    var pad: [PAD]u8 = undefined;
+    std.mem.doNotOptimizeAway(&pad);
+    call();
+    std.mem.doNotOptimizeAway(&pad);
+}
+
 noinline fn snapshot() void {
-    var buf: [WINDOW]u8 = undefined;
-    const p: [*]volatile u8 = @ptrCast(&buf);
-    for (dead, 0..) |*d, i| d.* = p[i];
-    std.mem.doNotOptimizeAway(&buf);
+    const p: [*]const volatile u8 = @ptrFromInt(region_lo);
+    for (&snap, 0..) |*d, i| d.* = p[i];
+}
+
+/// How deep the last call's frames reached below the region's top.
+fn dirtyDepth() usize {
+    var i: usize = 0;
+    while (i < WINDOW and snap[i] == 0xC7) : (i += 1) {}
+    return WINDOW - i;
+}
+
+/// Zero the callee-saved registers before a measured call: they still hold
+/// the TEST's values (needles it just computed) and the call's prologue
+/// spills them into its frame, where the scan would credit them to the call.
+inline fn scrubCalleeSaved() void {
+    if (builtin.cpu.arch == .x86_64) asm volatile (
+        \\xorl %%ebx, %%ebx
+        \\xorl %%r12d, %%r12d
+        \\xorl %%r13d, %%r13d
+        \\xorl %%r14d, %%r14d
+        \\xorl %%r15d, %%r15d
+        ::: .{ .rbx = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true });
+}
+
+/// `inline`: as its own frame it would run the call deeper than the region top.
+inline fn measure(call: *const fn () void) void {
+    scrubCalleeSaved();
+    paint();
+    shim(call);
+    snapshot();
 }
 
 noinline fn runBlind() void {
@@ -116,7 +156,7 @@ fn hitOffsets(needle: []const u8, buf: []u8) []const u8 {
     var i: usize = 0;
     var n: usize = 0;
     while (i + needle.len <= WINDOW) : (i += 1) {
-        if (std.mem.eql(u8, dead[i..][0..needle.len], needle)) {
+        if (std.mem.eql(u8, snap[i..][0..needle.len], needle)) {
             w.print("{s}{d}", .{ if (n == 0) "" else ", ", i }) catch break;
             n += 1;
         }
@@ -129,24 +169,13 @@ fn count(needle: []const u8) usize {
     var hits: usize = 0;
     var i: usize = 0;
     while (i + needle.len <= WINDOW) : (i += 1) {
-        if (std.mem.eql(u8, dead[i..][0..needle.len], needle)) hits += 1;
+        if (std.mem.eql(u8, snap[i..][0..needle.len], needle)) hits += 1;
     }
     return hits;
 }
 
-/// Bytes below the snapshot frame's top the previous call left different from
-/// the paint, burn included. Sizes `blind_stack_burn`; printed, not asserted.
-fn dirtyBytes() usize {
-    var i: usize = 0;
-    while (i < WINDOW and dead[i] == 0xC7) : (i += 1) {}
-    return WINDOW - i;
-}
-
 test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead stack" {
     if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
-    const gpa = std.testing.allocator;
-    dead = try gpa.create([WINDOW]u8);
-    defer gpa.destroy(dead);
     pk = try kat.publicKey();
 
     // Needle A: `r` big-endian — the `r_bytes` buffer `blindCore` wipes. This
@@ -162,22 +191,18 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
     // treats stderr from a passing test as a FAIL (scripts/lib/test-lib.sh).
     errdefer std.debug.print("\n=== STACKPROBE blindrsa B6/B9 ({t}, window {d} KiB) ===\n", .{ builtin.mode, WINDOW / 1024 });
 
-    paint();
-    callInnocent();
-    snapshot();
+    region_lo = stackHere() - PAD - WINDOW;
+
+    measure(callInnocent);
     const neg = count(r_be) + count(r_le);
-    paint();
-    callLeaky();
-    snapshot();
+    measure(callLeaky);
     const pos = count(r_be);
     errdefer std.debug.print("  NEG control {d}, POS control (r parked) {d}\n", .{ neg, pos });
     try std.testing.expectEqual(@as(usize, 0), neg);
     try std.testing.expect(pos >= 1);
 
     for (0..3) |round| {
-        paint();
-        runBlind();
-        snapshot();
+        measure(runBlind);
 
         // Needles C/D: the masked `v = r·u mod n` that `maskedInvert` feeds to
         // `feInvert`'s variable-time Euclid arena — B9's second half, which
@@ -194,7 +219,7 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
         const hits_r_le = count(r_le);
         const hits_v_be = count(v_be[0..32]);
         const hits_v_le = count(v_le[0..32]);
-        const dirty = dirtyBytes();
+        const dirty = dirtyDepth();
         errdefer std.debug.print("  blind #{d}: r big-endian={d} r limbs={d} v=r^2 big-endian={d} v limbs={d}; dirty below the call {d} B\n", .{
             round, hits_r_be, hits_r_le, hits_v_be, hits_v_le, dirty,
         });
@@ -215,9 +240,7 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
     for (kat.p, 0..) |c, idx| p_rev[kat.p.len - 1 - idx] = c;
     var q_rev: [kat.q.len]u8 = undefined;
     for (kat.q, 0..) |c, idx| q_rev[kat.q.len - 1 - idx] = c;
-    paint();
-    copyKeyOnly();
-    snapshot();
+    measure(copyKeyOnly);
     var offbuf: [256]u8 = undefined;
     const ctl_p = count(kat.p[0..32]) + count(p_rev[0..32]);
     const ctl_q = count(kat.q[0..32]) + count(q_rev[0..32]);
@@ -225,9 +248,7 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
     errdefer std.debug.print("  key-copy control: p={d} q={d}; p limb hits at {s}\n", .{ ctl_p, ctl_q, ctl_offsets });
 
     for (0..3) |round| {
-        paint();
-        runSign();
-        snapshot();
+        measure(runSign);
 
         const r_fe = rsa.Fe.fromBytes(pk.n, &kat.r, .big) catch unreachable;
         const v_fe = pk.n.mul(r_fe, r_fe);
@@ -244,7 +265,7 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
         const hits_q = count(kat.q[0..32]) + count(q_rev[0..32]);
         var ob: [256]u8 = undefined;
         const offsets = hitOffsets(p_rev[0..32], &ob);
-        const dirty = dirtyBytes();
+        const dirty = dirtyDepth();
         errdefer std.debug.print("  blindSign #{d}: b big-endian={d} b limbs={d} v=b^2 big-endian={d} v limbs={d}; key p={d} q={d}; p limb hits at {s}; dirty below the call {d} B (burn starts at {d})\n", .{
             round,     hits_b_be,                hits_b_le, hits_v_be,
             hits_v_le, hits_p,                   hits_q,    offsets,

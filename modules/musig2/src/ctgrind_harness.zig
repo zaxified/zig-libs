@@ -337,7 +337,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var secnonce = musig2.SecNonce.fromBytes(secnonce_reloaded);
 
     // The call under test.
-    const psig = musig2.sign(&secnonce, sk, ctx) catch |err| {
+    const psig = musig2.sign(&secnonce, &sk, ctx) catch |err| {
         std.debug.print("sign failed: {t}\n", .{err});
         return err;
     };

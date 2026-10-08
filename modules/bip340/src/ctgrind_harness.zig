@@ -173,6 +173,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const msg = "ctgrind harness message";
     const aux_rand = secretBytes(32, "ctgrind-bip340-harness-aux-rand-v1");
 
-    const sig = try bip340.sign(sk, msg, aux_rand, io);
+    const sig = try bip340.sign(&sk, msg, aux_rand, io);
     std.debug.print("sig={x}\n", .{sig});
 }

@@ -3,11 +3,13 @@
 //! Dead-stack residue probe for the signing path (`presign.Party` rounds,
 //! `finish`, `signShare`), kept in the module per `CONVENTIONS.md` §9.
 //!
-//! Method (as `bip340`'s and `k256`'s `stackprobe_test.zig`): paint a large
-//! stack window, make the call at that depth, then claim an equally large
-//! UNINITIALISED buffer at the same depth and look for secrets in it.
-//! ReleaseFast/ReleaseSmall only — Debug and ReleaseSafe fill `undefined` with
-//! 0xaa, so the scan cannot see a dead frame there.
+//! Method as `p256`'s `stackprobe_test.zig` (direct region, 2026-10-08: the
+//! earlier "scan a local buffer at the call's depth" form was blind to the top
+//! few hundred bytes of the measured call): paint a stack region below the
+//! probe, run one call under a `PAD`-deep shim, snapshot the region and look for
+//! secrets in the snapshot. ReleaseFast/ReleaseSmall only — Debug and
+//! ReleaseSafe fill `undefined` with 0xaa, so the scan cannot see a dead frame
+//! there.
 //!
 //! The needles differ from bip340's fixed list: a party draws dozens of
 //! secrets per round (nonces, Paillier randomness, proof masks), too many to
@@ -64,27 +66,64 @@ var recorder: Recorder = undefined;
 
 // ── stack window ─────────────────────────────────────────────────────────
 
+const PAD = 2048;
+
+var region_lo: usize = 0;
 var snap: [WINDOW]u8 = undefined;
 
+/// An address inside a frame called from the probe, at the depth
+/// `paint`/`shim`/`snapshot` start at.
+noinline fn stackHere() usize {
+    var x: u8 = 0;
+    std.mem.doNotOptimizeAway(&x);
+    return @intFromPtr(&x);
+}
+
 noinline fn paint() void {
-    var buf: [WINDOW]u8 = undefined;
-    @memset(&buf, 0xC7);
-    std.mem.doNotOptimizeAway(&buf);
+    const p: [*]volatile u8 = @ptrFromInt(region_lo);
+    for (0..WINDOW) |i| p[i] = 0xC7;
 }
 
-/// Copies the uninitialised window at the depth the previous call used into
-/// `snap`, with volatile reads so the buffer cannot be folded away.
+/// Run `call` `PAD` bytes deeper than the probe, so its frames lie inside the
+/// region. `pad` is touched after the call too, so it cannot be a tail call.
+noinline fn shim(call: *const fn () void) void {
+    var pad: [PAD]u8 = undefined;
+    std.mem.doNotOptimizeAway(&pad);
+    call();
+    std.mem.doNotOptimizeAway(&pad);
+}
+
 noinline fn snapshot() void {
-    var buf: [WINDOW]u8 = undefined;
-    const p: [*]volatile u8 = @ptrCast(&buf);
-    for (0..WINDOW) |i| snap[i] = p[i];
-    std.mem.doNotOptimizeAway(&buf);
+    const p: [*]const volatile u8 = @ptrFromInt(region_lo);
+    for (&snap, 0..) |*d, i| d.* = p[i];
 }
 
+/// How deep the last call's frames reached below the region's top.
 fn dirtyDepth() usize {
     var i: usize = 0;
     while (i < WINDOW and snap[i] == 0xC7) : (i += 1) {}
     return WINDOW - i;
+}
+
+/// Zero the callee-saved registers before a measured call: they still hold
+/// the TEST's values (needles it just computed) and the call's prologue
+/// spills them into its frame, where the scan would credit them to the call.
+inline fn scrubCalleeSaved() void {
+    if (builtin.cpu.arch == .x86_64) asm volatile (
+        \\xorl %%ebx, %%ebx
+        \\xorl %%r12d, %%r12d
+        \\xorl %%r13d, %%r13d
+        \\xorl %%r14d, %%r14d
+        \\xorl %%r15d, %%r15d
+        ::: .{ .rbx = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true });
+}
+
+/// `inline`: as its own frame it would run the call deeper than the region top.
+inline fn measure(call: *const fn () void) void {
+    scrubCalleeSaved();
+    paint();
+    shim(call);
+    snapshot();
 }
 
 // ── needles ──────────────────────────────────────────────────────────────
@@ -231,16 +270,19 @@ noinline fn anchor() void {
 
 // ── controls ─────────────────────────────────────────────────────────────
 
-noinline fn callInnocent(h: [32]u8) void {
+const innocent_in: [32]u8 = @splat(0x11);
+var leak_src: [32]u8 = undefined;
+
+noinline fn callInnocent() void {
     var out: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(&h, &out, .{});
+    std.crypto.hash.sha2.Sha256.hash(&innocent_in, &out, .{});
     std.mem.doNotOptimizeAway(&out);
 }
 
-noinline fn callLeaky(secret: *const [32]u8) void {
+noinline fn callLeaky() void {
     var local: [512]u8 = undefined;
     @memset(&local, 0);
-    local[100..132].* = secret.*;
+    local[100..132].* = leak_src;
     std.mem.doNotOptimizeAway(&local);
 }
 
@@ -257,15 +299,21 @@ const probe_msg = "threshold_ecdsa dead-stack probe";
 var probe_shares: []root.KeyShare = undefined;
 var probe_indices: [t]u32 = undefined;
 
-noinline fn callInit(i: usize) void {
+/// The party index of the next `callX()` (the measured calls take no argument).
+var cur_i: usize = 0;
+
+noinline fn callInit() void {
+    const i = cur_i;
     presign.Party.init(std.testing.allocator, &probe_shares[i], &probe_indices, @splat(0x33), &parties[i]) catch @panic("init");
 }
 
-noinline fn callAdvance(i: usize) void {
+noinline fn callAdvance() void {
+    const i = cur_i;
     outs[i] = parties[i].advance(inboxes[i].items, recorder.random()) catch @panic("advance");
 }
 
-noinline fn callFinish(i: usize) void {
+noinline fn callFinish() void {
+    const i = cur_i;
     parties[i].finish(inboxes[i].items, &presigs[i]) catch @panic("finish");
 }
 
@@ -287,7 +335,8 @@ noinline fn callPoolTake() void {
     if (!(pool.take(std.testing.allocator, pool_id, &presigs[1]) catch @panic("pool.take"))) @panic("pool.take: missing");
 }
 
-noinline fn callSignShare(i: usize) void {
+noinline fn callSignShare() void {
+    const i = cur_i;
     share_bytes[i] = presigs[i].signShare(.{ .bytes = probe_msg }) catch @panic("signShare");
 }
 
@@ -307,7 +356,6 @@ test "STACKPROBE: no secret on the dead stack after presign rounds, finish and s
 
     probe_shares = kg.key_shares;
     probe_indices = .{ kg.key_shares[0].index, kg.key_shares[1].index };
-    const sid: presign.SessionId = @splat(0x33);
     defer for (&inboxes) |*b| b.deinit(allocator);
 
     var total: usize = 0;
@@ -316,9 +364,9 @@ test "STACKPROBE: no secret on the dead stack after presign rounds, finish and s
         var n = Needles.init();
         defer n.deinit();
         n.addKeyShare(&kg.key_shares[i]);
-        paint();
-        callInit(i);
-        snapshot();
+        cur_i = i;
+        region_lo = stackHere() - PAD - WINDOW;
+        measure(callInit);
         total += analyse(try std.fmt.bufPrint(&label_buf, "init party {d}", .{i}), &n).copies;
     }
     defer for (&parties) |*p| p.deinit();
@@ -328,14 +376,11 @@ test "STACKPROBE: no secret on the dead stack after presign rounds, finish and s
         var n = Needles.init();
         defer n.deinit();
         n.addParty(&parties[0]);
-        paint();
-        callInnocent(sid);
-        snapshot();
+        region_lo = stackHere() - PAD - WINDOW;
+        measure(callInnocent);
         try std.testing.expectEqual(@as(usize, 0), analyse("NEG control", &n).copies);
-        const x = parties[0].share.secret_share.toBytes(.big);
-        paint();
-        callLeaky(&x);
-        snapshot();
+        leak_src = parties[0].share.secret_share.toBytes(.big);
+        measure(callLeaky);
         quiet = true;
         defer quiet = false;
         try std.testing.expect(analyse("POS control", &n).copies >= 1);
@@ -343,9 +388,9 @@ test "STACKPROBE: no secret on the dead stack after presign rounds, finish and s
 
     for (1..7) |round| {
         for (0..t) |i| {
-            paint();
-            callAdvance(i);
-            snapshot();
+            cur_i = i;
+            region_lo = stackHere() - PAD - WINDOW;
+            measure(callAdvance);
             var n = Needles.init();
             defer n.deinit();
             n.addParty(&parties[i]);
@@ -370,9 +415,9 @@ test "STACKPROBE: no secret on the dead stack after presign rounds, finish and s
         defer n.deinit();
         n.addParty(&parties[i]);
         n.addRng();
-        paint();
-        callFinish(i);
-        snapshot();
+        cur_i = i;
+        region_lo = stackHere() - PAD - WINDOW;
+        measure(callFinish);
         n.addScalar("presig k_i", presigs[i].k);
         n.addScalar("presig sigma_i", presigs[i].sigma);
         total += analyse(try std.fmt.bufPrint(&label_buf, "finish party {d}", .{i}), &n).copies;
@@ -395,9 +440,8 @@ test "STACKPROBE: no secret on the dead stack after presign rounds, finish and s
         else
             [2]struct { []const u8, *const fn () void }{ .{ "PresignaturePool.put", callPoolPut }, .{ "PresignaturePool.take", callPoolTake } };
         for (steps) |step| {
-            paint();
-            step[1]();
-            snapshot();
+            region_lo = stackHere() - PAD - WINDOW;
+            measure(step[1]);
             total += analyse(step[0], &n).copies;
         }
     }
@@ -410,9 +454,9 @@ test "STACKPROBE: no secret on the dead stack after presign rounds, finish and s
         n.addScalar("presig k_i", presigs[i].k);
         n.addScalar("presig sigma_i", presigs[i].sigma);
         n.addRng();
-        paint();
-        callSignShare(i);
-        snapshot();
+        cur_i = i;
+        region_lo = stackHere() - PAD - WINDOW;
+        measure(callSignShare);
         total += analyse(try std.fmt.bufPrint(&label_buf, "signShare party {d}", .{i}), &n).copies;
     }
     for (held_rounds) |r| for (r) |o| if (o) |b| b.deinit(allocator);
@@ -650,9 +694,8 @@ fn probeCall(label: []const u8, comptime call: fn () void, comptime fill: fn (*N
 /// encoding, whose windows are not needles (see `Needles.dropPublic`).
 fn probeCallPublic(label: []const u8, comptime call: fn () void, comptime fill: fn (*Needles) void, comptime public: ?fn () []const u8) usize {
     const start = recorder.log.items.len;
-    paint();
-    call();
-    snapshot();
+    region_lo = stackHere() - PAD - WINDOW;
+    measure(call);
     var n = Needles.init();
     defer n.deinit();
     fill(&n);
@@ -851,13 +894,16 @@ var abort_outs: [t]?presign.Outbox = @splat(null);
 var abort_inboxes: [t]std.ArrayList([]const u8) = @splat(.empty);
 var verdicts: [t]presign.Abort = undefined;
 
-noinline fn callOpenAbort(i: usize) void {
+noinline fn callOpenAbort() void {
+    const i = cur_i;
     abort_outs[i] = parties[i].openAbort(recorder.random()) catch @panic("openAbort");
 }
-noinline fn callEchoOpenings(i: usize) void {
+noinline fn callEchoOpenings() void {
+    const i = cur_i;
     abort_outs[i] = parties[i].echoOpenings(abort_inboxes[i].items) catch @panic("echoOpenings");
 }
-noinline fn callIdentify(i: usize) void {
+noinline fn callIdentify() void {
+    const i = cur_i;
     verdicts[i] = parties[i].identify(abort_inboxes[i].items) catch @panic("identify");
 }
 
@@ -896,7 +942,10 @@ test "STACKPROBE: no secret on the dead stack after the abort opening rounds and
     probe_indices = .{ kg.key_shares[0].index, kg.key_shares[1].index };
     inboxes = @splat(.empty);
     outs = @splat(null);
-    for (0..t) |i| callInit(i);
+    for (0..t) |i| {
+        cur_i = i;
+        callInit();
+    }
     defer for (&parties) |*p| p.deinit();
     defer for (&inboxes) |*b| b.deinit(allocator);
     defer for (&abort_inboxes) |*b| b.deinit(allocator);
@@ -944,7 +993,7 @@ test "STACKPROBE: no secret on the dead stack after the abort opening rounds and
     };
 
     var total: usize = 0;
-    const steps = [_]struct { []const u8, *const fn (usize) void }{
+    const steps = [_]struct { []const u8, *const fn () void }{
         .{ "openAbort", callOpenAbort },
         .{ "echoOpenings", callEchoOpenings },
         .{ "identify", callIdentify },
@@ -956,9 +1005,9 @@ test "STACKPROBE: no secret on the dead stack after the abort opening rounds and
             defer n.deinit();
             n.addParty(&parties[i]); // before: identify wipes the secrets
             n.addRng();
-            paint();
-            step[1](i);
-            snapshot();
+            cur_i = i;
+            region_lo = stackHere() - PAD - WINDOW;
+            measure(step[1]);
             total += analyse(try std.fmt.bufPrint(&label_buf, "{s} party {d}", .{ step[0], i }), &n).copies;
         }
         try routeBroadcasts(allocator, &abort_outs, &held);
@@ -975,9 +1024,8 @@ test "STACKPROBE: no secret on the dead stack after the abort opening rounds and
         defer n.deinit();
         for (&sws_shares) |*sh| n.addKeyShare(sh);
         const start = recorder.log.items.len;
-        paint();
-        callSignWithShares();
-        snapshot();
+        region_lo = stackHere() - PAD - WINDOW;
+        measure(callSignWithShares);
         // The first 32 bytes drawn are the session id, which is public.
         n.add("RNG stream (seeds)", recorder.log.items[start + @sizeOf(presign.SessionId) ..]);
         rng_base = start + @sizeOf(presign.SessionId);

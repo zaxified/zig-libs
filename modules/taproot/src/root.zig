@@ -288,7 +288,8 @@ noinline fn tweakSecretKeyBody(internal_sk: *const bip340.SecretKey, merkle_root
     // normalized d, kp.public.x = the even-y x-only encoding). fromSecretKey
     // fails only on a zero/non-canonical scalar — bip340.SecretKey.fromBytes
     // already rejects those, so this is a defensive re-check.
-    var kp = bip340.KeyPair.fromSecretKey(internal_sk.*) catch return error.InvalidInternalKey;
+    var kp: bip340.KeyPair = undefined;
+    bip340.KeyPair.fromSecretKey(&kp, internal_sk) catch return error.InvalidInternalKey;
     defer kp.deinit(); // zeroizes kp.secret (the normalized internal scalar d0/d source)
     var d = Scalar.fromBytes(kp.secret, .big) catch unreachable; // canonical by construction
     defer std.crypto.secureZero(u8, std.mem.asBytes(&d));
@@ -389,7 +390,8 @@ test "tweakSecretKey's internal bip340.KeyPair.deinit zeroizes the normalized sc
     // this test exercises that same deinit path directly so a regression
     // in bip340's secureZero call is caught from taproot's own test
     // binary too, not only bip340's.
-    var kp = try bip340.KeyPair.fromSecretKey(try bip340.SecretKey.fromBytes([_]u8{0x02} ** 32));
+    var kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp, &(try bip340.SecretKey.fromBytes([_]u8{0x02} ** 32)));
     const zero: [32]u8 = [_]u8{0} ** 32;
     try std.testing.expect(!std.mem.eql(u8, &kp.secret, &zero));
     kp.deinit();

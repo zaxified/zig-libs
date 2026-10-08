@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
+  engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
+  through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised
+  buffer" engine could not see the top ~250–450 B of the call — the caller's and the wrappers'
+  frames. 0 residues, caller's frame included.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** follows rsa's 2026-10-08 API — `rsa.rsasp1` now takes
   the key by pointer (the `rsasp1Ptr` it used is folded into it) and the KAT key fixture, the
   example and the bench build their keys through rsa's out-param constructors.

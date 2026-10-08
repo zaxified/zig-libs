@@ -60,7 +60,7 @@ test "KAT: preSign byte-exact (r, s_prime, needs_negation) against all 6 vectors
         const aux_rand = hexN(32, vec.aux_rand);
         const t_point = try adaptor.AdaptorPoint.fromBytes(hexN(33, vec.adaptor_point));
 
-        const presig = try adaptor.preSign(sk, vec.msg, aux_rand, t_point, io);
+        const presig = try adaptor.preSign(&sk, vec.msg, aux_rand, t_point, io);
 
         try std.testing.expectEqualSlices(u8, &hexN(32, vec.r), &presig.r);
         try std.testing.expectEqualSlices(u8, &hexN(32, vec.s_prime), &presig.s_prime);
@@ -77,7 +77,7 @@ test "KAT: adapt byte-exact 64-byte signature against all 6 vectors" {
         const sk = try bip340.SecretKey.fromBytes(hexN(32, vec.sk));
         const aux_rand = hexN(32, vec.aux_rand);
         const t_point = try adaptor.AdaptorPoint.fromBytes(hexN(33, vec.adaptor_point));
-        const presig = try adaptor.preSign(sk, vec.msg, aux_rand, t_point, io);
+        const presig = try adaptor.preSign(&sk, vec.msg, aux_rand, t_point, io);
 
         const sig = try adaptor.adapt(presig, hexN(32, vec.t));
         try std.testing.expectEqualSlices(u8, &hexN(64, vec.sig), &sig);
@@ -93,7 +93,7 @@ test "KAT: extract recovers the exact adaptor secret (byte-identical to vec.t) f
         const sk = try bip340.SecretKey.fromBytes(hexN(32, vec.sk));
         const aux_rand = hexN(32, vec.aux_rand);
         const t_point = try adaptor.AdaptorPoint.fromBytes(hexN(33, vec.adaptor_point));
-        const presig = try adaptor.preSign(sk, vec.msg, aux_rand, t_point, io);
+        const presig = try adaptor.preSign(&sk, vec.msg, aux_rand, t_point, io);
         const sig_bytes = try adaptor.adapt(presig, hexN(32, vec.t));
         const full_sig = try bip340.Signature.fromBytes(sig_bytes);
 
@@ -131,7 +131,7 @@ test "property: full pipeline — preSign -> preVerify -> adapt -> bip340.verify
         const t_secret = hexN(32, vec.t);
 
         // PreSign -> PreVerify.
-        const presig = try adaptor.preSign(sk, vec.msg, aux_rand, t_point, io);
+        const presig = try adaptor.preSign(&sk, vec.msg, aux_rand, t_point, io);
         try std.testing.expect(adaptor.preVerify(px, vec.msg, t_point, presig));
 
         // Adapt -> plain bip340.verify (the scheme's headline property:
@@ -221,7 +221,7 @@ test "property: extract REJECTS a genuine (r-matching) full signature adapted wi
     const vec = v.vectors[2];
     const sk = try bip340.SecretKey.fromBytes(hexN(32, vec.sk));
     const t_point = try adaptor.AdaptorPoint.fromBytes(hexN(33, vec.adaptor_point));
-    const presig = try adaptor.preSign(sk, vec.msg, hexN(32, vec.aux_rand), t_point, io);
+    const presig = try adaptor.preSign(&sk, vec.msg, hexN(32, vec.aux_rand), t_point, io);
     const sig_bytes = try adaptor.adapt(presig, hexN(32, vec.t));
     const full_sig = try bip340.Signature.fromBytes(sig_bytes);
 
@@ -248,7 +248,7 @@ test "audit F2: extract REJECTS a forged (r-matching) signature whose recovered 
     const vec = v.vectors[2];
     const sk = try bip340.SecretKey.fromBytes(hexN(32, vec.sk));
     const t_point = try adaptor.AdaptorPoint.fromBytes(hexN(33, vec.adaptor_point));
-    const presig = try adaptor.preSign(sk, vec.msg, hexN(32, vec.aux_rand), t_point, io);
+    const presig = try adaptor.preSign(&sk, vec.msg, hexN(32, vec.aux_rand), t_point, io);
 
     // Genuine adapt first, to confirm the baseline is honest and n != t.
     const genuine_sig = try adaptor.adapt(presig, hexN(32, vec.t));

@@ -268,7 +268,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const signing_share = taintedShare("ctgrind-frost-harness-commit-share-v1", tainted);
             const hiding_random = taintedRandom32("ctgrind-frost-harness-commit-hiding-random-v1", tainted);
             const binding_random = taintedRandom32("ctgrind-frost-harness-commit-binding-random-v1", tainted);
-            const nonces = frost.generateNonces(signing_share, hiding_random, binding_random);
+            var nonces: frost.SigningNonces = undefined;
+            frost.generateNonces(&nonces, &signing_share, hiding_random, binding_random);
 
             const pair = try frost.round1Commit(&nonces);
 
@@ -292,15 +293,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const signing_share = taintedShare("ctgrind-frost-harness-sign-share-v1", tainted);
             const hiding_random = taintedRandom32("ctgrind-frost-harness-sign-hiding-random-v1", tainted);
             const binding_random = taintedRandom32("ctgrind-frost-harness-sign-binding-random-v1", tainted);
-            const nonces = frost.generateNonces(signing_share, hiding_random, binding_random);
+            var nonces: frost.SigningNonces = undefined;
+            frost.generateNonces(&nonces, &signing_share, hiding_random, binding_random);
 
             // The signer's own published commitments, computed from an
             // UNTAINTED twin of the same inputs (same bytes, never marked):
             // the values `round2Sign` must find in the list, with no taint
             // and no harness-side ladder in this row's count (see the module
             // doc comment).
-            const own_nonces = frost.generateNonces(
-                taintedShare("ctgrind-frost-harness-sign-share-v1", false),
+            var own_nonces: frost.SigningNonces = undefined;
+            frost.generateNonces(
+                &own_nonces,
+                &taintedShare("ctgrind-frost-harness-sign-share-v1", false),
                 taintedRandom32("ctgrind-frost-harness-sign-hiding-random-v1", false),
                 taintedRandom32("ctgrind-frost-harness-sign-binding-random-v1", false),
             );
@@ -327,7 +331,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const sig_share = try frost.round2Sign(
                 std.heap.page_allocator, // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
                 identifier,
-                signing_share,
+                &signing_share,
                 group_public_key,
                 &nonces,
                 msg,

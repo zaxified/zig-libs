@@ -124,8 +124,10 @@ fn verifyOneInputCost(gpa: std.mem.Allocator, n: usize, kind: Kind, use_pre: boo
             // check out, or execution never reaches the leaf's CHECKSIG and
             // no BIP341/342 sighash is ever computed). The leaf signature is
             // bogus — again, the sighash is computed before it fails.
-            const internal = try bip340.KeyPair.fromSecretKey(try bip340.SecretKey.fromBytes([_]u8{0x66} ** 32));
-            const leaf_key = try bip340.KeyPair.fromSecretKey(try bip340.SecretKey.fromBytes([_]u8{0x55} ** 32));
+            var internal: bip340.KeyPair = undefined;
+            try bip340.KeyPair.fromSecretKey(&internal, &(try bip340.SecretKey.fromBytes([_]u8{0x66} ** 32)));
+            var leaf_key: bip340.KeyPair = undefined;
+            try bip340.KeyPair.fromSecretKey(&leaf_key, &(try bip340.SecretKey.fromBytes([_]u8{0x55} ** 32)));
             const leaf_script = try a.dupe(u8, &([_]u8{0x20} ++ [_]u8{0} ** 32 ++ [_]u8{0xac}));
             @memcpy(leaf_script[1..33], &leaf_key.public.x);
             const out = taprootOutput(internal.public.x, tapscript.tapleafHash(0xc0, leaf_script));
@@ -256,14 +258,17 @@ test "bytes: one cache, three inputs, three sighash algorithms — every real si
 
     // --- input 1: P2TR key-path (internal key used directly as output key)
     const key_sk = try bip340.SecretKey.fromBytes([_]u8{0x33} ** 32);
-    const key_kp = try bip340.KeyPair.fromSecretKey(key_sk);
+    var key_kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&key_kp, &key_sk);
     const p2tr_key_spk = try a.dupe(u8, &([_]u8{ 0x51, 0x20 } ++ [_]u8{0} ** 32));
     @memcpy(p2tr_key_spk[2..], &key_kp.public.x);
 
     // --- input 2: P2TR script-path, single leaf `<pk> OP_CHECKSIG`
     const leaf_sk = try bip340.SecretKey.fromBytes([_]u8{0x55} ** 32);
-    const leaf_kp = try bip340.KeyPair.fromSecretKey(leaf_sk);
-    const internal_kp = try bip340.KeyPair.fromSecretKey(try bip340.SecretKey.fromBytes([_]u8{0x66} ** 32));
+    var leaf_kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&leaf_kp, &leaf_sk);
+    var internal_kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&internal_kp, &(try bip340.SecretKey.fromBytes([_]u8{0x66} ** 32)));
     const leaf_script = try a.dupe(u8, &([_]u8{0x20} ++ [_]u8{0} ** 32 ++ [_]u8{0xac}));
     @memcpy(leaf_script[1..33], &leaf_kp.public.x);
     const leaf_hash = tapscript.tapleafHash(0xc0, leaf_script);
@@ -302,11 +307,11 @@ test "bytes: one cache, three inputs, three sighash algorithms — every real si
 
     const io: std.Io = undefined;
     const sh1 = try bitcointx.bip341.sighash(a, tx, 1, bitcointx.bip341.SIGHASH_DEFAULT, spent);
-    const sig1 = try bip340.sign(key_sk, &sh1, [_]u8{0x44} ** 32, io);
+    const sig1 = try bip340.sign(&key_sk, &sh1, [_]u8{0x44} ** 32, io);
 
     var exec: tapscript.ExecData = .{ .tapleaf_hash = leaf_hash, .codesep_pos = 0xffffffff };
     const sh2 = try tapscript.sighash(a, tx, 2, tapscript.SIGHASH_DEFAULT, spent, &exec);
-    const sig2 = try bip340.sign(leaf_sk, &sh2, [_]u8{0x77} ** 32, io);
+    const sig2 = try bip340.sign(&leaf_sk, &sh2, [_]u8{0x77} ** 32, io);
 
     const w0 = [_][]const u8{ sig0, &ec_pub };
     const w1 = [_][]const u8{&sig1};

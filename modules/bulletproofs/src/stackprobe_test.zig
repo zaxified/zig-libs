@@ -4,12 +4,13 @@
 //! module per `CONVENTIONS.md` §9: the instrument that checks one module lives
 //! with that module, not in an audit note.
 //!
-//! Method (same as `bip340`'s, `k256`'s and `xmss`'s probes): paint a stack
-//! window, call `prove` at that depth, then copy an equally large
-//! UNINITIALISED buffer claimed there to the heap — before anything else runs,
-//! because recomputing a needle (`z`) would overwrite the window — and search
-//! the copy. ReleaseFast/ReleaseSmall only: Debug and ReleaseSafe fill
-//! `undefined` with 0xaa, so the scan cannot see a dead frame there.
+//! Method as `p256`'s `stackprobe_test.zig` (direct region, 2026-10-08: the
+//! earlier "scan a local buffer at the call's depth" form was blind to the top
+//! few hundred bytes of the measured call): paint a stack region below the
+//! probe, run one call under a `PAD`-deep shim, snapshot the region into a
+//! static buffer and search the snapshot. ReleaseFast/ReleaseSmall only: Debug
+//! and ReleaseSafe fill `undefined` with 0xaa, so the scan cannot see a dead
+//! frame there.
 //!
 //! Needles: the witness `v` (8-byte little-endian) and its 32-byte scalar
 //! `v_bytes`, the blinding factor `γ`, `z²·γ` (with the public challenge `z`
@@ -42,21 +43,65 @@ var secret_v: u64 = 0x7ae2_c519_0f6b_83d4;
 var gens: bp.Generators = undefined;
 var last_a: bp.Ristretto255 = undefined;
 var last_s: bp.Ristretto255 = undefined;
-var dead: *[WINDOW]u8 = undefined;
 
-noinline fn paint() void {
-    var buf: [WINDOW]u8 = undefined;
-    @memset(&buf, 0xC7);
-    std.mem.doNotOptimizeAway(&buf);
+const PAD = 2048;
+
+var region_lo: usize = 0;
+var snap: [WINDOW]u8 = undefined;
+
+/// An address inside a frame called from the probe, at the depth
+/// `paint`/`shim`/`snapshot` start at.
+noinline fn stackHere() usize {
+    var x: u8 = 0;
+    std.mem.doNotOptimizeAway(&x);
+    return @intFromPtr(&x);
 }
 
-/// Copy the uninitialised window at the depth the previous call used to the
-/// heap. Volatile reads so the buffer cannot be folded away.
+noinline fn paint() void {
+    const p: [*]volatile u8 = @ptrFromInt(region_lo);
+    for (0..WINDOW) |i| p[i] = 0xC7;
+}
+
+/// Run `call` `PAD` bytes deeper than the probe, so its frames lie inside the
+/// region. `pad` is touched after the call too, so it cannot be a tail call.
+noinline fn shim(call: *const fn () void) void {
+    var pad: [PAD]u8 = undefined;
+    std.mem.doNotOptimizeAway(&pad);
+    call();
+    std.mem.doNotOptimizeAway(&pad);
+}
+
 noinline fn snapshot() void {
-    var buf: [WINDOW]u8 = undefined;
-    const p: [*]volatile u8 = @ptrCast(&buf);
-    for (dead, 0..) |*d, i| d.* = p[i];
-    std.mem.doNotOptimizeAway(&buf);
+    const p: [*]const volatile u8 = @ptrFromInt(region_lo);
+    for (&snap, 0..) |*d, i| d.* = p[i];
+}
+
+/// How deep the last call's frames reached below the region's top.
+fn dirtyDepth() usize {
+    var i: usize = 0;
+    while (i < WINDOW and snap[i] == 0xC7) : (i += 1) {}
+    return WINDOW - i;
+}
+
+/// Zero the callee-saved registers before a measured call: they still hold
+/// the TEST's values (needles it just computed) and the call's prologue
+/// spills them into its frame, where the scan would credit them to the call.
+inline fn scrubCalleeSaved() void {
+    if (builtin.cpu.arch == .x86_64) asm volatile (
+        \\xorl %%ebx, %%ebx
+        \\xorl %%r12d, %%r12d
+        \\xorl %%r13d, %%r13d
+        \\xorl %%r14d, %%r14d
+        \\xorl %%r15d, %%r15d
+        ::: .{ .rbx = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true });
+}
+
+/// `inline`: as its own frame it would run the call deeper than the region top.
+inline fn measure(call: *const fn () void) void {
+    scrubCalleeSaved();
+    paint();
+    shim(call);
+    snapshot();
 }
 
 noinline fn runProve() void {
@@ -86,17 +131,9 @@ fn count(needle: []const u8) usize {
     var hits: usize = 0;
     var i: usize = 0;
     while (i + needle.len <= WINDOW) : (i += 1) {
-        if (std.mem.eql(u8, dead[i..][0..needle.len], needle)) hits += 1;
+        if (std.mem.eql(u8, snap[i..][0..needle.len], needle)) hits += 1;
     }
     return hits;
-}
-
-/// Bytes below the snapshot frame's top the previous call left different from
-/// the paint, burn included. Sizes `prove_stack_burn`; printed, not asserted.
-fn dirtyBytes() usize {
-    var i: usize = 0;
-    while (i < WINDOW and dead[i] == 0xC7) : (i += 1) {}
-    return WINDOW - i;
 }
 
 fn vBytes() [32]u8 {
@@ -124,8 +161,6 @@ test "STACKPROBE (A1 B12): no witness or blinding secret on the dead stack after
 
     gens = try bp.Generators.init(gpa, 64);
     defer gens.deinit(gpa);
-    dead = try gpa.create([WINDOW]u8);
-    defer gpa.destroy(dead);
 
     var v8: [8]u8 = undefined;
     std.mem.writeInt(u64, &v8, secret_v, .little);
@@ -135,13 +170,11 @@ test "STACKPROBE (A1 B12): no witness or blinding secret on the dead stack after
     // treats stderr from a passing test as a FAIL (scripts/lib/test-lib.sh).
     errdefer std.debug.print("\n=== STACKPROBE bulletproofs B12 ({t}, window {d} KiB) ===\n", .{ builtin.mode, WINDOW / 1024 });
 
-    paint();
-    callInnocent();
-    snapshot();
+    region_lo = stackHere() - PAD - WINDOW;
+
+    measure(callInnocent);
     const neg = count(&v8) + count(&vb) + count(&secret_gamma);
-    paint();
-    callLeaky();
-    snapshot();
+    measure(callLeaky);
     const pos = count(&secret_gamma);
     errdefer std.debug.print("  NEG control {d}, POS control (gamma parked) {d}\n", .{ neg, pos });
     try std.testing.expectEqual(@as(usize, 0), neg);
@@ -149,9 +182,7 @@ test "STACKPROBE (A1 B12): no witness or blinding secret on the dead stack after
 
     for (0..3) |round| {
         rangeproof.test_random_count = 0;
-        paint();
-        runProve();
-        snapshot();
+        measure(runProve);
 
         const v8_hits = count(&v8);
         const vb_hits = count(&vb);
@@ -165,7 +196,7 @@ test "STACKPROBE (A1 B12): no witness or blinding secret on the dead stack after
             if (c > 0) randoms_present += 1;
         }
         const random_count = rangeproof.test_random_count;
-        const dirty = dirtyBytes();
+        const dirty = dirtyDepth();
         errdefer std.debug.print("  prove #{d}: v={d} v_bytes={d} gamma={d} z2gamma={d} randoms {d}/{d} present ({d} copies); dirty below the call {d} B\n", .{
             round, v8_hits, vb_hits, gamma_hits, z2g_hits, randoms_present, random_count, random_hits, dirty,
         });

@@ -103,7 +103,7 @@ pub fn main() !void {
 
     for (quorum, 0..) |share_idx, k| {
         const share = dealt.shares[share_idx];
-        nonces[k] = frost.generateNonces(share.signing_share, nonce_seeds[2 * k], nonce_seeds[2 * k + 1]);
+        frost.generateNonces(&nonces[k], &share.signing_share, nonce_seeds[2 * k], nonce_seeds[2 * k + 1]);
         pairs[k] = frost.round1Commit(&nonces[k]) catch |err| switch (err) {
             // A zero nonce is negligible but not impossible; a signer that
             // hits it retries with fresh randomness rather than shipping a
@@ -133,7 +133,7 @@ pub fn main() !void {
         sig_shares[k] = frost.round2Sign(
             gpa,
             share.identifier,
-            share.signing_share,
+            &share.signing_share,
             group_public_key,
             &nonces[k],
             payload,

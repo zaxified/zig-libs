@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack residue probe for `deriveHopSecrets`, `construct` and `process`
-//! (review 2026-10-08), kept in the module per `CONVENTIONS.md` §9. Same
-//! method as `bip340`'s `stackprobe_test.zig`: paint a large stack window, run
-//! one call at that depth, then claim an equally large UNINITIALISED buffer at
-//! the same depth and count 32-byte needles in it. ReleaseFast/ReleaseSmall
-//! only — Debug and ReleaseSafe fill `undefined` with 0xaa, so the scan cannot
-//! see a dead frame there (the push lane runs it in ReleaseFast: `test.sh`'s
-//! `run_rf_only`).
+//! (review 2026-10-08), kept in the module per `CONVENTIONS.md` §9. Method as
+//! `p256`'s `stackprobe_test.zig` (direct region, 2026-10-08: the earlier
+//! "scan a local buffer at the call's depth" form was blind to the
+//! top few hundred bytes of the measured call): paint a stack region below the
+//! probe, run one call under a `PAD`-deep shim, snapshot the region and count
+//! 32-byte needles in the snapshot. ReleaseFast/ReleaseSmall only — Debug and
+//! ReleaseSafe fill `undefined` with 0xaa, so the scan cannot see a dead frame
+//! there (the push lane runs it in ReleaseFast: `test.sh`'s `run_rf_only`).
 //!
 //! Inputs are the BOLT#4 vector (`kat_vectors.zig`). The needles are every
 //! secret of the route: the session key, the blinded ephemeral scalars
@@ -29,6 +30,7 @@ const Secp256k1 = @import("k256").Secp256k1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const WINDOW = 256 * 1024;
+const PAD = 2048;
 const hops = v.pubkeys.len;
 
 const Needle = struct { name: []const u8, bytes: [32]u8 };
@@ -60,35 +62,71 @@ fn hex32(s: []const u8) [32]u8 {
     return out;
 }
 
-noinline fn paint() void {
-    var buf: [WINDOW]u8 = undefined;
-    @memset(&buf, 0xC7);
-    std.mem.doNotOptimizeAway(&buf);
+var region_lo: usize = 0;
+var snap: [WINDOW]u8 = undefined;
+
+/// An address inside a frame called from the probe, at the depth
+/// `paint`/`shim`/`snapshot` start at.
+noinline fn stackHere() usize {
+    var x: u8 = 0;
+    std.mem.doNotOptimizeAway(&x);
+    return @intFromPtr(&x);
 }
 
-noinline fn scan(needles: []const Needle, hits: []usize) void {
-    var buf: [WINDOW]u8 = undefined;
-    const p: [*]volatile u8 = @ptrCast(&buf);
+noinline fn paint() void {
+    const p: [*]volatile u8 = @ptrFromInt(region_lo);
+    for (0..WINDOW) |i| p[i] = 0xC7;
+}
+
+/// Run `call` `PAD` bytes deeper than the probe, so its frames lie inside the
+/// region. `pad` is touched after the call too, so it cannot be a tail call.
+noinline fn shim(call: *const fn () void) void {
+    var pad: [PAD]u8 = undefined;
+    std.mem.doNotOptimizeAway(&pad);
+    call();
+    std.mem.doNotOptimizeAway(&pad);
+}
+
+noinline fn snapshot() void {
+    const p: [*]const volatile u8 = @ptrFromInt(region_lo);
+    for (&snap, 0..) |*d, i| d.* = p[i];
+}
+
+fn scan(needles: []const Needle, hits: []usize) void {
     var i: usize = 0;
     while (i + 32 <= WINDOW) : (i += 1) {
         for (needles, hits) |*nd, *h| {
-            var j: usize = 0;
-            while (j < 32 and p[i + j] == nd.bytes[j]) : (j += 1) {}
-            if (j == 32) h.* += 1;
+            if (std.mem.eql(u8, snap[i..][0..32], &nd.bytes)) h.* += 1;
         }
     }
-    std.mem.doNotOptimizeAway(&buf);
 }
 
-/// How deep the previous call dirtied the stack below the scan frame's top.
-/// Printed, not asserted.
-noinline fn dirtyDepth() usize {
-    var buf: [WINDOW]u8 = undefined;
-    const p: [*]volatile u8 = @ptrCast(&buf);
+/// How deep the last call's frames reached below the region's top.
+fn dirtyDepth() usize {
     var i: usize = 0;
-    while (i < WINDOW and p[i] == 0xC7) : (i += 1) {}
-    std.mem.doNotOptimizeAway(&buf);
+    while (i < WINDOW and snap[i] == 0xC7) : (i += 1) {}
     return WINDOW - i;
+}
+
+/// Zero the callee-saved registers before a measured call: they still hold
+/// the TEST's values (needles it just computed) and the call's prologue
+/// spills them into its frame, where the scan would credit them to the call.
+inline fn scrubCalleeSaved() void {
+    if (builtin.cpu.arch == .x86_64) asm volatile (
+        \\xorl %%ebx, %%ebx
+        \\xorl %%r12d, %%r12d
+        \\xorl %%r13d, %%r13d
+        \\xorl %%r14d, %%r14d
+        \\xorl %%r15d, %%r15d
+        ::: .{ .rbx = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true });
+}
+
+/// `inline`: as its own frame it would run the call deeper than the region top.
+inline fn measure(call: *const fn () void) void {
+    scrubCalleeSaved();
+    paint();
+    shim(call);
+    snapshot();
 }
 
 /// Negative control: public data only, same depth.
@@ -186,22 +224,21 @@ test "STACKPROBE (review 2026-10-08): no key or shared-secret residue on the dea
     const nd = needles.slice();
     leaky_secret = node_priv[1];
 
+    region_lo = stackHere() - PAD - WINDOW;
+
     var neg: [max_needles]usize = @splat(0);
-    paint();
-    callInnocent();
+    measure(callInnocent);
     scan(nd, neg[0..nd.len]);
 
     var pos: [max_needles]usize = @splat(0);
-    paint();
-    callLeaky();
+    measure(callLeaky);
     scan(nd, pos[0..nd.len]);
 
     var hits: [probes.len][max_needles]usize = @splat(@splat(0));
     var depth: [probes.len]usize = @splat(0);
     for (0..3) |_| {
         for (probes, &hits, &depth) |pr, *h, *d| {
-            paint();
-            pr.call();
+            measure(pr.call);
             d.* = @max(d.*, dirtyDepth());
             scan(nd, h[0..nd.len]);
         }

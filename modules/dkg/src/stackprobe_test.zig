@@ -4,13 +4,14 @@
 //! secret (the two dealing polynomials, the shares sent and accepted, the
 //! output share), kept in the module per `CONVENTIONS.md` §9.
 //!
-//! Method and engine as `threshold_ecdsa`'s `stackprobe_test.zig`: paint a
-//! large stack window, make the call at that depth, then copy the
-//! UNINITIALISED window at the same depth and look for secrets in it — every
-//! 16-byte window of every secret's big-endian, little-endian and in-memory
-//! image, and of every byte the call drew from its `std.Random`.
-//! ReleaseFast/ReleaseSmall only — Debug and ReleaseSafe fill `undefined` with
-//! 0xaa.
+//! Method as `p256`'s `stackprobe_test.zig` (direct region, 2026-10-08: the
+//! earlier "scan a local buffer at the call's depth" form was blind to the top
+//! few hundred bytes of the measured call): paint a stack region below the
+//! probe, run one call under a `PAD`-deep shim, snapshot the region and look for
+//! secrets in the snapshot — every 16-byte window of every secret's big-endian,
+//! little-endian and in-memory image, and of every byte the call drew from its
+//! `std.Random`. ReleaseFast/ReleaseSmall only — Debug and ReleaseSafe fill
+//! `undefined` with 0xaa.
 //!
 //! ⛔ A zero is only readable next to the two controls in the same binary: a
 //! NEGATIVE control (a call that never sees a secret, must find 0) and a
@@ -58,27 +59,64 @@ var recorder: Recorder = undefined;
 
 // ── stack window ─────────────────────────────────────────────────────────
 
+const PAD = 2048;
+
+var region_lo: usize = 0;
 var snap: [WINDOW]u8 = undefined;
 
+/// An address inside a frame called from the probe, at the depth
+/// `paint`/`shim`/`snapshot` start at.
+noinline fn stackHere() usize {
+    var x: u8 = 0;
+    std.mem.doNotOptimizeAway(&x);
+    return @intFromPtr(&x);
+}
+
 noinline fn paint() void {
-    var buf: [WINDOW]u8 = undefined;
-    @memset(&buf, 0xC7);
-    std.mem.doNotOptimizeAway(&buf);
+    const p: [*]volatile u8 = @ptrFromInt(region_lo);
+    for (0..WINDOW) |i| p[i] = 0xC7;
 }
 
-/// Copies the uninitialised window at the depth the previous call used into
-/// `snap`, with volatile reads so the buffer cannot be folded away.
+/// Run `call` `PAD` bytes deeper than the probe, so its frames lie inside the
+/// region. `pad` is touched after the call too, so it cannot be a tail call.
+noinline fn shim(call: *const fn () void) void {
+    var pad: [PAD]u8 = undefined;
+    std.mem.doNotOptimizeAway(&pad);
+    call();
+    std.mem.doNotOptimizeAway(&pad);
+}
+
 noinline fn snapshot() void {
-    var buf: [WINDOW]u8 = undefined;
-    const p: [*]volatile u8 = @ptrCast(&buf);
-    for (0..WINDOW) |i| snap[i] = p[i];
-    std.mem.doNotOptimizeAway(&buf);
+    const p: [*]const volatile u8 = @ptrFromInt(region_lo);
+    for (&snap, 0..) |*d, i| d.* = p[i];
 }
 
+/// How deep the last call's frames reached below the region's top.
 fn dirtyDepth() usize {
     var i: usize = 0;
     while (i < WINDOW and snap[i] == 0xC7) : (i += 1) {}
     return WINDOW - i;
+}
+
+/// Zero the callee-saved registers before a measured call: they still hold
+/// the TEST's values (needles it just computed) and the call's prologue
+/// spills them into its frame, where the scan would credit them to the call.
+inline fn scrubCalleeSaved() void {
+    if (builtin.cpu.arch == .x86_64) asm volatile (
+        \\xorl %%ebx, %%ebx
+        \\xorl %%r12d, %%r12d
+        \\xorl %%r13d, %%r13d
+        \\xorl %%r14d, %%r14d
+        \\xorl %%r15d, %%r15d
+        ::: .{ .rbx = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true });
+}
+
+/// `inline`: as its own frame it would run the call deeper than the region top.
+inline fn measure(call: *const fn () void) void {
+    scrubCalleeSaved();
+    paint();
+    shim(call);
+    snapshot();
 }
 
 // ── needles ──────────────────────────────────────────────────────────────
@@ -194,16 +232,19 @@ noinline fn anchor() void {
 
 // ── controls ─────────────────────────────────────────────────────────────
 
-noinline fn callInnocent(h: [32]u8) void {
+const innocent_in: [32]u8 = @splat(0x11);
+var leak_src: [32]u8 = undefined;
+
+noinline fn callInnocent() void {
     var out: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(&h, &out, .{});
+    std.crypto.hash.sha2.Sha256.hash(&innocent_in, &out, .{});
     std.mem.doNotOptimizeAway(&out);
 }
 
-noinline fn callLeaky(secret: *const [32]u8) void {
+noinline fn callLeaky() void {
     var local: [512]u8 = undefined;
     @memset(&local, 0);
-    local[100..132].* = secret.*;
+    local[100..132].* = leak_src;
     std.mem.doNotOptimizeAway(&local);
 }
 
@@ -244,9 +285,8 @@ fn addParticipant(n: *Needles, p: *const Participant) void {
 
 fn probeParty(label: []const u8, comptime call: fn () void) usize {
     const start = recorder.log.items.len;
-    paint();
-    call();
-    snapshot();
+    region_lo = stackHere() - PAD - WINDOW;
+    measure(call);
     var n = Needles.init();
     defer n.deinit();
     for (&parties) |*p| addParticipant(&n, p);
@@ -280,14 +320,11 @@ test "STACKPROBE: no secret on the dead stack after any GJKR participant call" {
         var n = Needles.init();
         defer n.deinit();
         for (&parties) |*p| addParticipant(&n, p);
-        paint();
-        callInnocent(@splat(0x11));
-        snapshot();
+        region_lo = stackHere() - PAD - WINDOW;
+        measure(callInnocent);
         try std.testing.expectEqual(@as(usize, 0), analyse("NEG control", &n).copies);
-        const x = parties[0].a[0].toBytes(.big);
-        paint();
-        callLeaky(&x);
-        snapshot();
+        leak_src = parties[0].a[0].toBytes(.big);
+        measure(callLeaky);
         quiet = true;
         defer quiet = false;
         try std.testing.expect(analyse("POS control", &n).copies >= 1);
@@ -421,13 +458,12 @@ fn Driver(comptime P: type) type {
         fn probe(comptime op: Op, p: *P, label: []const u8, comptime fill: fn (*Needles) void) usize {
             probe_target = p;
             const start_at = recorder.log.items.len;
-            paint();
-            switch (op) {
-                .start => start(),
-                .advance => advance(),
-                .handle => handle(),
-            }
-            snapshot();
+            region_lo = stackHere() - PAD - WINDOW;
+            measure(switch (op) {
+                .start => start,
+                .advance => advance,
+                .handle => handle,
+            });
             var n = Needles.init();
             defer n.deinit();
             fill(&n);
@@ -515,9 +551,8 @@ test "STACKPROBE: no secret on the dead stack after any reshare dealer or receiv
     for (0..2) |i| {
         cur_party = i;
         const start_at = recorder.log.items.len;
-        paint();
-        callDealerInit();
-        snapshot();
+        region_lo = stackHere() - PAD - WINDOW;
+        measure(callDealerInit);
         var n = Needles.init();
         defer n.deinit();
         addSecretsOf(&n, reshare.ReshareDealer, &dealers[i]);
@@ -620,9 +655,8 @@ noinline fn callRefreshTake() void {
 
 fn probePlain(label: []const u8, comptime call: fn () void, comptime fill: fn (*Needles) void) usize {
     const start_at = recorder.log.items.len;
-    paint();
-    call();
-    snapshot();
+    region_lo = stackHere() - PAD - WINDOW;
+    measure(call);
     var n = Needles.init();
     defer n.deinit();
     fill(&n);

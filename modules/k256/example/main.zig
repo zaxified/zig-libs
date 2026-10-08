@@ -29,7 +29,7 @@ pub fn main() !void {
 
     // ── BIP340 Schnorr: sign, verify, then show a tampered message fails ──
     const aux_rand = [_]u8{0xAB} ** 32;
-    const schnorr_sig = try k256.sign.bip340Sign(privkey, msg, aux_rand);
+    const schnorr_sig = try k256.sign.bip340Sign(&privkey, msg, aux_rand);
     const schnorr_ok = k256.sign.bip340Verify(pubkey_xonly, msg, schnorr_sig);
     std.debug.print("bip340 verify (genuine msg): {}\n", .{schnorr_ok});
     if (!schnorr_ok) return error.VerifyFailed;
@@ -39,7 +39,7 @@ pub fn main() !void {
     if (tampered_ok) return error.ShouldHaveFailed;
 
     // `bip340Sign` names its precondition failure: an all-zero secret key.
-    _ = k256.sign.bip340Sign([_]u8{0} ** 32, msg, aux_rand) catch |err| switch (err) {
+    _ = k256.sign.bip340Sign(&([_]u8{0} ** 32), msg, aux_rand) catch |err| switch (err) {
         error.InvalidSecretKey => std.debug.print("zero secret key correctly rejected\n", .{}),
         error.InvalidNonce => return err,
     };
@@ -48,7 +48,7 @@ pub fn main() !void {
     var hash32: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(msg, &hash32, .{});
 
-    const compact_sig = try k256.ecdsa_recover.sign(privkey, hash32);
+    const compact_sig = try k256.ecdsa_recover.sign(&privkey, hash32);
     std.debug.print("compact sig: recid={d} low-S={}\n", .{
         compact_sig.recid, k256.ecdsa_recover.isLowS(compact_sig.s),
     });

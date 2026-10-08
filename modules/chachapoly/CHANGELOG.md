@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
+  engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
+  through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised
+  buffer" engine could not see the top ~250–450 B of the call — the caller's and the wrappers'
+  frames. 0 residues, caller's frame included.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** instruction-count cases for
   `scripts/count-insns` (`src/count.zig`, opt-in via `ZIGLIBS_COUNT`; AEAD seal at 64 B, 1 KiB,
   16 KiB), baseline `tools/count.tsv`, held by the CI `count amd64` lane.

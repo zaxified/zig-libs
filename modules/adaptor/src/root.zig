@@ -288,7 +288,7 @@ pub const PreSignError = error{
 /// `io` is threaded through for API symmetry with the sibling modules'
 /// `sign` functions (unused: deterministic once `aux_rand` is in hand).
 pub fn preSign(
-    secret_key: bip340.SecretKey,
+    secret_key: *const bip340.SecretKey,
     msg: []const u8,
     aux_rand: [32]u8,
     adaptor_point: AdaptorPoint,
@@ -309,12 +309,12 @@ pub fn preSign(
 /// the computation one more (`computeUnverified`), and both are burned after
 /// they return. `preSign`'s own frame holds nothing secret.
 noinline fn preSignFromSecretKey(
-    secret_key: bip340.SecretKey,
+    secret_key: *const bip340.SecretKey,
     msg: []const u8,
     aux_rand: [32]u8,
     adaptor_point: AdaptorPoint,
 ) PreSignError!PreSignature {
-    return preSignImpl(secret_key, msg, aux_rand, adaptor_point, computeUnverified);
+    return preSignImpl(secret_key.*, msg, aux_rand, adaptor_point, computeUnverified);
 }
 
 /// How much stack below the burning frame is zeroed after steps 1-8. The
@@ -403,7 +403,8 @@ noinline fn computeUnverified(
     // carried both calls all along, still finds `d` twice — but omitting the
     // calls here left THREE, and the doc comment promises the sibling's exact
     // steps, not a weaker version of them.
-    var kp = bip340.KeyPair.fromSecretKey(secret_key) catch return error.InvalidSecretKey;
+    var kp: bip340.KeyPair = undefined;
+    bip340.KeyPair.fromSecretKey(&kp, &secret_key) catch return error.InvalidSecretKey;
     defer kp.deinit();
     var d_bytes = kp.secret;
     defer std.crypto.secureZero(u8, &d_bytes);
@@ -827,7 +828,7 @@ test "A1 F5 (round-2 follow-up): preSignImpl enforces step 9 on the REAL product
     // Positive control: preSignImpl with the real computation is exactly
     // what preSign() does -- same fields, no regression from the seam.
     const honest = try preSignImpl(sk, msg, aux_rand, adaptor_point, computeUnverified);
-    const via_presign = try preSign(sk, msg, aux_rand, adaptor_point, undefined);
+    const via_presign = try preSign(&sk, msg, aux_rand, adaptor_point, undefined);
     try std.testing.expectEqualSlices(u8, &honest.r, &via_presign.r);
     try std.testing.expectEqualSlices(u8, &honest.s_prime, &via_presign.s_prime);
     try std.testing.expectEqual(honest.needs_negation, via_presign.needs_negation);

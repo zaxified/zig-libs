@@ -134,7 +134,9 @@ pub fn main() !void {
     const pk_back = try sealedbox.parsePublicKeyBase64(&pk_text);
     must(std.mem.eql(u8, &kp.public_key, &pk_back), @src());
 
-    var sk_text = sealedbox.encodeSecretKeyHex(kp.secret_key);
+    var sk_text: [sealedbox.hex_sk_len]u8 = undefined;
+
+    sealedbox.encodeSecretKeyHex(&sk_text, &kp.secret_key);
     var sk_back: [sealedbox.secret_length]u8 = undefined;
     try sealedbox.parseSecretKeyHex(&sk_back, &sk_text);
     must(std.mem.eql(u8, &kp.secret_key, &sk_back), @src());
