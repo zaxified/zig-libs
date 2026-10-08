@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **FIX (key on the dead stack; NO API CHANGE):** `CipherState.encryptWithAd`/
+  `decryptWithAd`/`rekey` copied the key into a dead frame on every call (the AEAD takes it by
+  value). Each now runs one frame down and zeroes 1 KiB below it (~10 ns).
 - **2026-10-04** — **mvp → core.** The whole rev-34 pattern catalog: one-way
   `N`/`K`/`X`, the twelve fundamental and the twenty-three deferred patterns
   (`patterns.catalog`, `patterns.byName`). PSK modifiers (`withPsk` at

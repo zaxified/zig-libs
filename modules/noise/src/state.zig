@@ -67,6 +67,27 @@ fn hashName(comptime T: type) []const u8 {
 /// with a 32-byte key, 12-byte nonce and 16-byte tag (its nonce counter is
 /// big-endian iff its name is `AESGCM`, spec §12); a hash the std hash
 /// shape with a 32- or 64-byte digest.
+/// Review 2026-10-08 (found through `bolt8`'s transport probe). `Cipher`'s
+/// encrypt/decrypt take the key BY VALUE (std's AEAD shape), so every
+/// `CipherState` call copies `k` into its own frame to pass it — measured in
+/// `bolt8`'s Transport (ReleaseFast): the transport key left once per send and
+/// twice per receive, after the AEAD itself had been made to burn its own
+/// call tree (`chachapoly`). `CipherState`'s three keyed calls therefore run
+/// one frame down and zero `cipher_burn` bytes at that depth: enough for this
+/// module's own frame, NOT for an AEAD that leaves copies deeper — `chachapoly`
+/// burns its own; std's AEADs (e.g. a suite on `aes_gcm`) do not.
+noinline fn burnStack() void {
+    const V = @Vector(4, u64);
+    var buf: [cipher_burn / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
+}
+
+/// Covers `encryptWithAdBody`'s frame and the argument copies it makes;
+/// `bolt8/src/stackprobe_test.zig` goes red when that outgrows it. Volatile
+/// 32-byte vector stores, ~10 ns (`secureZero` runs ~3 B/ns without libc).
+const cipher_burn = 1024;
+
 pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type {
     return struct {
         /// The DH function type this suite was bound with (spec §4.1).
@@ -193,6 +214,16 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 plaintext: []const u8,
                 out: []u8,
             ) error{ NonceExhausted, BufferTooSmall }!void {
+                defer burnStack();
+                return self.encryptWithAdBody(ad, plaintext, out);
+            }
+
+            noinline fn encryptWithAdBody(
+                self: *CipherState,
+                ad: []const u8,
+                plaintext: []const u8,
+                out: []u8,
+            ) error{ NonceExhausted, BufferTooSmall }!void {
                 if (!self.has_key) {
                     if (out.len < plaintext.len) return error.BufferTooSmall;
                     @memcpy(out[0..plaintext.len], plaintext);
@@ -224,6 +255,16 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 ciphertext: []const u8,
                 out: []u8,
             ) error{ DecryptionFailed, NonceExhausted, BufferTooSmall }!void {
+                defer burnStack();
+                return self.decryptWithAdBody(ad, ciphertext, out);
+            }
+
+            noinline fn decryptWithAdBody(
+                self: *CipherState,
+                ad: []const u8,
+                ciphertext: []const u8,
+                out: []u8,
+            ) error{ DecryptionFailed, NonceExhausted, BufferTooSmall }!void {
                 if (!self.has_key) {
                     if (out.len < ciphertext.len) return error.BufferTooSmall;
                     @memcpy(out[0..ciphertext.len], ciphertext);
@@ -247,6 +288,11 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             /// §5.1 `Rekey()`: `k = ENCRYPT(k, 2^64-1, zerolen, zeros[32])`
             /// truncated to 32 bytes — the optional key-update procedure.
             pub fn rekey(self: *CipherState) void {
+                defer burnStack();
+                self.rekeyBody();
+            }
+
+            noinline fn rekeyBody(self: *CipherState) void {
                 std.debug.assert(self.has_key);
                 var ct: [32 + TAGLEN]u8 = undefined;
                 Cipher.encrypt(

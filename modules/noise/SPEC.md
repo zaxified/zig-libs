@@ -138,6 +138,17 @@ equivalent (longest-prefix choice, lower-case filter vs longest, the explicit
 removed; 1 killed by a new test (a pre-message `e` without the key). 0 surviving.
 Dependents `tenantkex` and `bolt8` pass their modtests.
 
+## Secret residue on the dead stack
+
+Review 2026-10-08 (`bolt8/src/stackprobe_test.zig`, ReleaseFast). `Cipher.encrypt`/`decrypt`
+take the key by value, so `CipherState.encryptWithAd`/`decryptWithAd` copied `k` into their own
+frame on every call: the transport key left once per `bolt8` send and twice per receive, after
+the AEAD had been made to burn its own call tree. The three keyed `CipherState` calls
+(`encryptWithAd`, `decryptWithAd`, `rekey`) now run one frame down and zero 1 KiB below it
+(~10 ns, vector stores). That covers this module's frame only: `chachapoly` burns its own call
+tree, std's AEADs do not, so a suite on `std.crypto.aead.aes_gcm` still leaves std's copies.
+`SymmetricState`'s HKDF (`mixKey`, `split`) is not probed here; `bolt8` burns around every act.
+
 ## Backlog / deferred
 
 **2026-10-04:** the catalog, PSK modifiers with name parsing, and pluggable DH naming are **done**.
