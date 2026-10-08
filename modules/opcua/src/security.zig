@@ -236,7 +236,8 @@ pub const ClientCredentials = struct {
         random: std.Random,
         options: GenerateSelfSignedOptions,
     ) GenerateSelfSignedError!ClientCredentials {
-        const kp = try rsa.generate(random, options.modulus_bits, options.public_exponent);
+        var kp: rsa.KeyPair = undefined;
+        try rsa.generate(&kp, random, options.modulus_bits, options.public_exponent);
 
         var san_buf: [1]rsa.SubjectAltName = undefined;
         const sans: []const rsa.SubjectAltName = if (options.application_uri) |app_uri| blk: {
@@ -493,7 +494,7 @@ pub const AsymmetricDecryptError = std.mem.Allocator.Error || rsa.DecryptOaepErr
 /// with this client's private key (the OPN response body's asymmetric-
 /// decryption algorithm, Basic256Sha256). Returned plaintext is
 /// `allocator`-owned.
-pub fn asymmetricDecrypt(allocator: std.mem.Allocator, ciphertext: []const u8, private_key: rsa.SecretKey) AsymmetricDecryptError![]u8 {
+pub fn asymmetricDecrypt(allocator: std.mem.Allocator, ciphertext: []const u8, private_key: *const rsa.SecretKey) AsymmetricDecryptError![]u8 {
     const k = modulusByteLen(private_key.n.bits());
     if (k <= oaep_sha1_overhead) return error.DecryptionError;
     if (ciphertext.len == 0 or ciphertext.len % k != 0) return error.DecryptionError;
@@ -526,7 +527,7 @@ pub const AsymmetricSignError = std.mem.Allocator.Error || rsa.SignPkcs1v15Error
 /// message) with this client's private key (Basic256Sha256's asymmetric-
 /// signature algorithm). Returned signature (modulus-length) is
 /// `allocator`-owned.
-pub fn asymmetricSign(allocator: std.mem.Allocator, message: []const u8, private_key: rsa.SecretKey) AsymmetricSignError![]u8 {
+pub fn asymmetricSign(allocator: std.mem.Allocator, message: []const u8, private_key: *const rsa.SecretKey) AsymmetricSignError![]u8 {
     const k = modulusByteLen(private_key.n.bits());
     const out = try allocator.alloc(u8, k);
     errdefer allocator.free(out);
@@ -917,7 +918,7 @@ pub fn sealAsymmetricMessage(
     }
     const sig_start = plain.len - sig_len;
     std.debug.assert(p == sig_start);
-    _ = try rsa.signPkcs1v15(credentials.private_key, Sha256, plain[0..sig_start], plain[sig_start..]);
+    _ = try rsa.signPkcs1v15(&credentials.private_key, Sha256, plain[0..sig_start], plain[sig_start..]);
 
     // Encrypt SequenceHeader..signature per OAEP block into the wire buffer.
     const out = try allocator.alloc(u8, wire_len);
@@ -974,7 +975,7 @@ pub fn openAsymmetricMessage(
     var plen: usize = 8 + enc_offset;
     var i: usize = 0;
     while (i < blocks) : (i += 1) {
-        const m = rsa.decryptOaep(private_key, Sha1, chunk_body[enc_offset + i * k ..][0..k], "", plain[plen..][0..plain_block]) catch |err| switch (err) {
+        const m = rsa.decryptOaep(&private_key, Sha1, chunk_body[enc_offset + i * k ..][0..k], "", plain[plen..][0..plain_block]) catch |err| switch (err) {
             error.BufferTooSmall => unreachable, // chunk is exactly the max message length
             error.DecryptionError => return error.DecryptionError,
         };
@@ -1066,7 +1067,7 @@ pub fn decryptUserTokenSecret(
     private_key: rsa.SecretKey,
     expected_server_nonce: []const u8,
 ) UserTokenSecretError![]u8 {
-    const plain = asymmetricDecrypt(allocator, ciphertext, private_key) catch |err| switch (err) {
+    const plain = asymmetricDecrypt(allocator, ciphertext, &private_key) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DecryptionError, error.BufferTooSmall => return error.DecryptionError,
     };
@@ -1292,7 +1293,8 @@ test "deriveKeys: directions differ, deterministic, matches raw P-SHA256 layout"
 test "asymmetricEncrypt -> asymmetricDecrypt round-trip (multi-block)" {
     var prng = std.Random.DefaultCsprng.init([_]u8{7} ** 32);
     const random = prng.random();
-    const kp = try rsa.generate(random, 512, 65537); // k = 64, plain block = 22 -> multi-block fast
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, random, 512, 65537); // k = 64, plain block = 22 -> multi-block fast
 
     const msg = "a message noticeably longer than one 22-byte OAEP block, spanning several RSA blocks";
     const ct = try asymmetricEncrypt(testing.allocator, msg, kp.public_key, random);
@@ -1300,7 +1302,7 @@ test "asymmetricEncrypt -> asymmetricDecrypt round-trip (multi-block)" {
     try testing.expectEqual(@as(usize, 0), ct.len % 64);
     try testing.expect(ct.len / 64 == (msg.len + 21) / 22);
 
-    const pt = try asymmetricDecrypt(testing.allocator, ct, kp.secret_key);
+    const pt = try asymmetricDecrypt(testing.allocator, ct, &kp.secret_key);
     defer testing.allocator.free(pt);
     try testing.expectEqualSlices(u8, msg, pt);
 
@@ -1308,18 +1310,19 @@ test "asymmetricEncrypt -> asymmetricDecrypt round-trip (multi-block)" {
     const bad = try testing.allocator.dupe(u8, ct);
     defer testing.allocator.free(bad);
     bad[10] ^= 0x01;
-    try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, bad, kp.secret_key));
+    try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, bad, &kp.secret_key));
     // Non-whole-block ciphertext is structurally invalid.
-    try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, ct[0 .. ct.len - 1], kp.secret_key));
+    try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, ct[0 .. ct.len - 1], &kp.secret_key));
 }
 
 test "asymmetricSign -> asymmetricVerify round-trip + tamper" {
     var prng = std.Random.DefaultCsprng.init([_]u8{9} ** 32);
     const random = prng.random();
-    const kp = try rsa.generate(random, 512, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, random, 512, 65537);
 
     const msg = "OPN message bytes to be signed";
-    const sig = try asymmetricSign(testing.allocator, msg, kp.secret_key);
+    const sig = try asymmetricSign(testing.allocator, msg, &kp.secret_key);
     defer testing.allocator.free(sig);
     try testing.expectEqual(@as(usize, 64), sig.len);
     try asymmetricVerify(msg, sig, kp.public_key);
@@ -1650,8 +1653,10 @@ test "viewAsymmetricHeader: borrows the three plaintext fields, refuses truncati
 test "user identity token secret: encrypt -> decrypt, replayed nonce and wrong key rejected" {
     var prng = std.Random.DefaultCsprng.init([_]u8{0x21} ** 32);
     const random = prng.random();
-    const server_kp = try rsa.generate(random, 512, 65537);
-    const other_kp = try rsa.generate(random, 512, 65537);
+    var server_kp: rsa.KeyPair = undefined;
+    try rsa.generate(&server_kp, random, 512, 65537);
+    var other_kp: rsa.KeyPair = undefined;
+    try rsa.generate(&other_kp, random, 512, 65537);
 
     const server_nonce = "server-nonce-0123456789abcdefghi"; // 32 bytes
     const password = "correct horse battery staple";

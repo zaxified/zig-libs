@@ -850,7 +850,7 @@ fn seal(sealer: Sealer, domain: []const u8, iv: ?[12]u8, out: []u8) SealError!vo
         .mac => |m| _ = try computeMac(m.algorithm, m.key, domain, iv, out),
         .rsa_pss_sha256 => |r| {
             const Sha256 = std.crypto.hash.sha2.Sha256;
-            _ = rsa.signPss(r.key, Sha256, r.random, domain, Sha256.digest_length, out) catch
+            _ = rsa.signPss(&r.key, Sha256, r.random, domain, Sha256.digest_length, out) catch
                 return error.SignatureFailed;
         },
         .ecdsa_p256_sha256 => |e| {

@@ -2244,7 +2244,7 @@ fn signProtocolMessage(
     defer alloc.free(si_canon);
 
     var sig_buf: [rsa.max_modulus_len]u8 = undefined;
-    const sig = rsa.signPkcs1v15(sk, Sha256, si_canon, &sig_buf) catch |e| switch (e) {
+    const sig = rsa.signPkcs1v15(&sk, Sha256, si_canon, &sig_buf) catch |e| switch (e) {
         error.EncodedMessageTooShort, error.BufferTooSmall, error.FaultDetected => return error.SigningFailed,
     };
     const sig_b64 = try base64EncodeAlloc(alloc, sig);
@@ -2722,7 +2722,7 @@ pub fn buildSignedRedirectQuery(alloc: std.mem.Allocator, opts: BuildSignedRedir
     try appendRedirectSigningInput(alloc, &q, opts.kind, opts.message_field, opts.relay_state, sig_alg_rsa_sha256);
 
     var sig_buf: [rsa.max_modulus_len]u8 = undefined;
-    const sig = rsa.signPkcs1v15(sk, Sha256, q.items, &sig_buf) catch |e| switch (e) {
+    const sig = rsa.signPkcs1v15(&sk, Sha256, q.items, &sig_buf) catch |e| switch (e) {
         error.EncodedMessageTooShort, error.BufferTooSmall, error.FaultDetected => return error.SigningFailed,
     };
     const sig_b64 = try base64EncodeAlloc(alloc, sig);

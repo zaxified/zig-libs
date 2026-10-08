@@ -67,8 +67,8 @@ pub fn main() !void {
     // ── two independent VRF holders ───────────────────────────────────
     const alice_sk = keyFromLabel("zig-libs ecvrf example alice secret key");
     const bob_sk = keyFromLabel("zig-libs ecvrf example bob secret key");
-    const alice_pk = ecvrf.publicKey(alice_sk);
-    const bob_pk = ecvrf.publicKey(bob_sk);
+    const alice_pk = ecvrf.publicKey(&alice_sk);
+    const bob_pk = ecvrf.publicKey(&bob_sk);
     std.debug.print("alice pk: {x}\n", .{alice_pk});
     std.debug.print("bob pk:   {x}\n", .{bob_pk});
 
@@ -76,7 +76,7 @@ pub fn main() !void {
     const round2_alpha = "zig-libs ecvrf example: round 2 seed / block height 1001";
 
     // ── round 1: alice proves, a relying party verifies ──────────────────
-    const pi1 = ecvrf.prove(alice_sk, round1_alpha);
+    const pi1 = ecvrf.prove(&alice_sk, round1_alpha);
     const beta1_direct = try ecvrf.proofToHash(pi1);
     const beta1_verify = try ecvrf.verify(alice_pk, round1_alpha, pi1);
     must(std.mem.eql(u8, &beta1_direct, &beta1_verify), @src());
@@ -85,12 +85,12 @@ pub fn main() !void {
     // Determinism (RFC 9381's uniqueness property, and the module's own
     // "no hidden state" property — same (sk, alpha) in, byte-identical pi
     // out, every time; nothing carried between calls).
-    const pi1_again = ecvrf.prove(alice_sk, round1_alpha);
+    const pi1_again = ecvrf.prove(&alice_sk, round1_alpha);
     must(std.mem.eql(u8, &pi1, &pi1_again), @src());
     std.debug.print("round 1: prove is deterministic (same pi both times)\n", .{});
 
     // ── round 2: the SAME key, a DIFFERENT round's input ──────────────
-    const pi2 = ecvrf.prove(alice_sk, round2_alpha);
+    const pi2 = ecvrf.prove(&alice_sk, round2_alpha);
     const beta2 = try ecvrf.verify(alice_pk, round2_alpha, pi2);
     must(!std.mem.eql(u8, &beta1_direct, &beta2), @src());
     std.debug.print("round 2: fresh beta, distinct from round 1\n", .{});
@@ -98,7 +98,7 @@ pub fn main() !void {
     // ── bob proves over round 1's SAME alpha, under his OWN key ─────────
     // The unbiasable property a relying party depends on: two different
     // keys over the identical input do not collide.
-    const pi_bob = ecvrf.prove(bob_sk, round1_alpha);
+    const pi_bob = ecvrf.prove(&bob_sk, round1_alpha);
     const beta_bob = try ecvrf.verify(bob_pk, round1_alpha, pi_bob);
     must(!std.mem.eql(u8, &beta1_direct, &beta_bob), @src());
     std.debug.print("round 1, bob's key: fresh beta, distinct from alice's\n", .{});

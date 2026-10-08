@@ -65,7 +65,7 @@ test "KAT: SK -> PK (publicKey) matches RFC 9381 Appendix B.3 for every example"
     for (v.vectors) |vec| {
         const sk = try hex32(vec.sk);
         const want_pk = try hex32(vec.pk);
-        try std.testing.expectEqualSlices(u8, &want_pk, &ecvrf.publicKey(sk));
+        try std.testing.expectEqualSlices(u8, &want_pk, &ecvrf.publicKey(&sk));
     }
 }
 
@@ -137,7 +137,7 @@ test "KAT: prove(SK, alpha) -> pi matches RFC 9381 Appendix B.3, byte-exact (80 
         const alpha = try hexAlloc(gpa, vec.alpha);
         defer gpa.free(alpha);
         const want_pi = try hex80(vec.pi);
-        const got_pi = ecvrf.prove(sk, alpha);
+        const got_pi = ecvrf.prove(&sk, alpha);
         try std.testing.expectEqualSlices(u8, &want_pi, &got_pi);
 
         // pi = Gamma(32) || c(16) || s(32) — cross-check the U/V-derived
@@ -411,15 +411,15 @@ test "KeyPair: public key and proofs match publicKey/prove byte for byte on ever
         const sk = try hex32(vec.sk);
         const alpha = try hexAlloc(gpa, vec.alpha);
         defer gpa.free(alpha);
-        const kp = ecvrf.KeyPair.fromSecretKey(sk);
+        const kp = ecvrf.KeyPair.fromSecretKey(&sk);
         try std.testing.expectEqualSlices(u8, &(try hex32(vec.pk)), &kp.public_key);
         try std.testing.expectEqualSlices(u8, &(try hex80(vec.pi)), &kp.prove(alpha));
     }
 }
 
 test "KeyPair: a public_key filled in by hand makes proofs no key verifies (E10)" {
-    const a = ecvrf.KeyPair.fromSecretKey(try hex32(v.vectors[0].sk));
-    const b = ecvrf.KeyPair.fromSecretKey(try hex32(v.vectors[1].sk));
+    const a = ecvrf.KeyPair.fromSecretKey(&(try hex32(v.vectors[0].sk)));
+    const b = ecvrf.KeyPair.fromSecretKey(&(try hex32(v.vectors[1].sk)));
     const lying: ecvrf.KeyPair = .{ .secret_key = a.secret_key, .public_key = b.public_key };
     const pi = lying.prove("input");
     try std.testing.expectError(error.InvalidProof, ecvrf.verify(a.public_key, "input", pi));

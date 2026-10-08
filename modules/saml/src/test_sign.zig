@@ -162,7 +162,8 @@ fn signAssembled(alloc: std.mem.Allocator, seed: u64, assembled: []const u8) !Si
     var prng = std.Random.DefaultPrng.init(seed);
     // 1024-bit is ample for RSA-SHA256 enveloped signing (min modulus ~62 bytes)
     // and keeps deterministic keygen fast across the many minted-fixture tests.
-    const kp = try rsa.generate(prng.random(), 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
 
     // Pass 1 — reference digest over the document with the Signature omitted.
     var doc1 = try xml.parse(alloc, assembled, .{ .id_attr_names = &.{"ID"} });
@@ -187,7 +188,7 @@ fn signAssembled(alloc: std.mem.Allocator, seed: u64, assembled: []const u8) !Si
     defer alloc.free(si_canon);
 
     var sig_buf: [512]u8 = undefined; // 2048-bit modulus = 256 bytes
-    const sig = try rsa.signPkcs1v15(kp.secret_key, Sha256, si_canon, &sig_buf);
+    const sig = try rsa.signPkcs1v15(&kp.secret_key, Sha256, si_canon, &sig_buf);
     const sig_b64 = try b64(alloc, sig);
     defer alloc.free(sig_b64);
 

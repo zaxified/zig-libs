@@ -733,7 +733,7 @@ pub fn blindSign(
         // documented, reachable failure into a Debug/ReleaseSafe panic and
         // ReleaseFast UB instead. Range is still guaranteed (mb_bytes is a
         // mod-n product), so the only realistic error left is the fault.
-        var sb_bytes = rsa.rsasp1Ptr(max_modulus_len, mb_bytes, sk) catch return error.SigningFailure;
+        var sb_bytes = rsa.rsasp1(max_modulus_len, mb_bytes, sk) catch return error.SigningFailure;
         defer std.crypto.secureZero(u8, &sb_bytes);
         const s_b = rsa.Fe.fromBytes(sk.n, &sb_bytes, .big) catch unreachable; // < n canonical
 

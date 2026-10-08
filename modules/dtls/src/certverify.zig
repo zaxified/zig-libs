@@ -435,9 +435,9 @@ fn signRsaPss(scheme: SignatureScheme, sk: rsa.SecretKey, content: []const u8, r
     // rsa.signPss hashes `content` internally (RFC 8017 §9.1.1 step 2) and
     // draws the fresh salt from `random` itself.
     const result = switch (scheme) {
-        .rsa_pss_rsae_sha256 => rsa.signPss(sk, sha2.Sha256, random, content, sha2.Sha256.digest_length, out),
-        .rsa_pss_rsae_sha384 => rsa.signPss(sk, sha2.Sha384, random, content, sha2.Sha384.digest_length, out),
-        .rsa_pss_rsae_sha512 => rsa.signPss(sk, sha2.Sha512, random, content, sha2.Sha512.digest_length, out),
+        .rsa_pss_rsae_sha256 => rsa.signPss(&sk, sha2.Sha256, random, content, sha2.Sha256.digest_length, out),
+        .rsa_pss_rsae_sha384 => rsa.signPss(&sk, sha2.Sha384, random, content, sha2.Sha384.digest_length, out),
+        .rsa_pss_rsae_sha512 => rsa.signPss(&sk, sha2.Sha512, random, content, sha2.Sha512.digest_length, out),
         else => return error.UnsupportedScheme, // `sign` only routes rsa_pss_rsae_* here
     };
     return result catch |err| switch (err) {

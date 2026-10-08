@@ -176,7 +176,8 @@ test "HoK KeyValue: RSAKeyValue not matching presented rsa key -> HolderOfKeyMis
     defer s.deinit(alloc);
 
     var prng = std.Random.DefaultPrng.init(0xDEAD5555);
-    const other = try rsa.generate(prng.random(), 1024, 65537);
+    var other: rsa.KeyPair = undefined;
+    try rsa.generate(&other, prng.random(), 1024, 65537);
 
     var cfg = baseConfig(s.key);
     cfg.subject_confirmation = .holder_of_key;
@@ -299,7 +300,8 @@ test "HoK KeyValue: confirmation is X509 but only a bare key configured -> Holde
     defer s.deinit(alloc);
 
     var prng = std.Random.DefaultPrng.init(0x1111);
-    const key = try rsa.generate(prng.random(), 1024, 65537);
+    var key: rsa.KeyPair = undefined;
+    try rsa.generate(&key, prng.random(), 1024, 65537);
     var cfg = baseConfig(s.key);
     cfg.subject_confirmation = .holder_of_key;
     cfg.presented_holder_key = .{ .rsa = key.public_key };

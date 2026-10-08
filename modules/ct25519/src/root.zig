@@ -92,6 +92,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const burn = @import("burn.zig");
 
 /// Re-exported so callers can name the types without a second std path.
 pub const Edwards25519 = std.crypto.ecc.Edwards25519;
@@ -406,6 +407,7 @@ pub const X25519 = struct {
         /// Generate a new, random key pair.
         pub fn generate(io: std.Io) KeyPair {
             var random_seed: [seed_length]u8 = undefined;
+            defer std.crypto.secureZero(u8, &random_seed);
             while (true) {
                 io.random(&random_seed);
                 return generateDeterministic(random_seed) catch {
@@ -432,7 +434,37 @@ pub const X25519 = struct {
     /// including `error.IdentityElement` for an all-zero result (which, for
     /// a clamped scalar, happens iff `public_key` is a small-order point).
     /// The backend is fixed at compile time: `x25519_backend`.
+    ///
+    /// Burned (`burn.zig`): the ladder left the shared secret on the dead
+    /// stack twice per call (`stackprobe_test.zig`, 2026-10-08).
+    ///
+    /// std's shape is a contract (qap's TLS shim swaps this type in for
+    /// std's): the key goes in by value and the secret comes back in an error
+    /// union, so the caller's frame keeps a copy of both (measured by
+    /// `stackprobe_test.zig`, 2026-10-08) — the body's own frames are burned.
+    /// A caller that owns its frame should use `scalarmultInto`.
     pub fn scalarmult(secret_key: [secret_length]u8, public_key: [public_length]u8) IdentityElementError![shared_length]u8 {
+        var out: [shared_length]u8 = undefined;
+        try scalarmultInto(&out, &secret_key, public_key);
+        return out;
+    }
+
+    /// `scalarmult` with the key by pointer and the shared secret into `out`
+    /// (zeroed on error): no copy of either lands in the caller's frame, and
+    /// the body's frames are burned (`stackprobe_test.zig`, 2026-10-08).
+    pub fn scalarmultInto(out: *[shared_length]u8, secret_key: *const [secret_length]u8, public_key: [public_length]u8) IdentityElementError!void {
+        const r = scalarmultUnburned(out, secret_key, public_key);
+        burn.stack(burn.x25519_burn);
+        return r;
+    }
+
+    noinline fn scalarmultUnburned(out: *[shared_length]u8, secret_key_ptr: *const [secret_length]u8, public_key: [public_length]u8) IdentityElementError!void {
+        errdefer std.crypto.secureZero(u8, out);
+        const secret_key = secret_key_ptr.*;
+        out.* = try scalarmultValue(secret_key, public_key);
+    }
+
+    fn scalarmultValue(secret_key: [secret_length]u8, public_key: [public_length]u8) IdentityElementError![shared_length]u8 {
         const b: X25519Backend = if (builtin.is_test) (test_hooks.forced orelse x25519_backend) else x25519_backend;
         switch (b) {
             .stdlib => return Std.scalarmult(secret_key, public_key),
@@ -1103,7 +1135,16 @@ const msm_chunk = 8;
 /// Points are not validated (module doc comment). `scalars.len` must equal
 /// `points.len`; a mismatch is a caller bug and panics — the lengths are
 /// public, but an error union here would be the shape this module refuses.
+///
+/// Burned (`burn.zig`): the Straus pass left every scalar on the dead stack
+/// (`stackprobe_test.zig`, 2026-10-08).
 pub fn mulMultiRistretto(scalars: []const [32]u8, points: []const Ristretto255) Ristretto255 {
+    const r = mulMultiRistrettoUnburned(scalars, points);
+    burn.stack(burn.msm_burn);
+    return r;
+}
+
+noinline fn mulMultiRistrettoUnburned(scalars: []const [32]u8, points: []const Ristretto255) Ristretto255 {
     if (scalars.len != points.len) @panic("ct25519.mulMultiRistretto: scalars.len != points.len");
     var total = Edwards25519.identityElement;
     var start: usize = 0;
@@ -1142,6 +1183,7 @@ const scalar = Edwards25519.scalar;
 test {
     // Opt-in micro-benchmark (audit C9); skips unless CT25519_BENCH is set.
     _ = @import("bench.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 /// Deterministic scalars — this module has no RNG and its tests must be
@@ -1567,8 +1609,8 @@ test "X25519: RFC 7748 §6.1's published key pairs and shared secret" {
     try testing.expectEqualSlices(u8, &alice_pk, &alice.public_key);
     try testing.expectEqualSlices(u8, &bob_pk, &bob.public_key);
     try testing.expectEqualSlices(u8, &alice_sk, &alice.secret_key);
-    try testing.expectEqualSlices(u8, &shared, &(try X25519.scalarmult(alice.secret_key, bob.public_key)));
-    try testing.expectEqualSlices(u8, &shared, &(try X25519.scalarmult(bob.secret_key, alice.public_key)));
+    try testing.expectEqualSlices(u8, &shared, &(try x25519Value(&alice.secret_key, bob.public_key)));
+    try testing.expectEqualSlices(u8, &shared, &(try x25519Value(&bob.secret_key, alice.public_key)));
 }
 
 test "X25519: recoverPublicKey is bit-exact with std over random and edge seeds" {
@@ -1592,7 +1634,7 @@ test "X25519: a key pair from the comb agrees with a std key pair on the shared 
     const seed_b: [32]u8 = @splat(0x24);
     const ours = try X25519.KeyPair.generateDeterministic(seed_a);
     const theirs = try std.crypto.dh.X25519.KeyPair.generateDeterministic(seed_b);
-    const k1 = try X25519.scalarmult(ours.secret_key, theirs.public_key);
+    const k1 = try x25519Value(&ours.secret_key, theirs.public_key);
     const k2 = try std.crypto.dh.X25519.scalarmult(theirs.secret_key, ours.public_key);
     try testing.expectEqualSlices(u8, &k1, &k2);
     try testing.expectEqual(X25519.KeyPair, @TypeOf(X25519.KeyPair.generate(testing.io)));
@@ -1648,11 +1690,11 @@ test "P6 X25519: RFC 7748 §5.2 vectors and the 1 / 1,000 iteration chains, ever
     for (all_x25519_backends) |b| {
         if (!test_hooks.available(b)) continue;
         test_hooks.forced = b;
-        for (vectors) |v| try testing.expectEqualSlices(u8, &v.out, &(try X25519.scalarmult(v.k, v.u)));
+        for (vectors) |v| try testing.expectEqualSlices(u8, &v.out, &(try x25519Value(&v.k, v.u)));
         var k: [32]u8 = [_]u8{9} ++ [_]u8{0} ** 31;
         var u = k;
         for (1..1001) |i| {
-            const out = try X25519.scalarmult(k, u);
+            const out = try x25519Value(&k, u);
             u = k;
             k = out;
             if (i == 1) try testing.expectEqualSlices(u8, &one, &k);
@@ -1671,7 +1713,7 @@ test "P6 X25519: RFC 7748 §5.2 1,000,000 iterations (opt-in: CT25519_RFC7748_MI
     var k: [32]u8 = [_]u8{9} ++ [_]u8{0} ** 31;
     var u = k;
     for (0..1_000_000) |_| {
-        const out = try X25519.scalarmult(k, u);
+        const out = try x25519Value(&k, u);
         u = k;
         k = out;
     }
@@ -1690,19 +1732,26 @@ test "P6 X25519: RFC 7748 §6.1 Diffie-Hellman, every backend" {
         if (!test_hooks.available(b)) continue;
         test_hooks.forced = b;
         // the public keys through the LADDER over u = 9, not the comb
-        try testing.expectEqualSlices(u8, &alice_pk, &(try X25519.scalarmult(alice_sk, nine)));
-        try testing.expectEqualSlices(u8, &bob_pk, &(try X25519.scalarmult(bob_sk, nine)));
-        try testing.expectEqualSlices(u8, &shared, &(try X25519.scalarmult(alice_sk, bob_pk)));
-        try testing.expectEqualSlices(u8, &shared, &(try X25519.scalarmult(bob_sk, alice_pk)));
+        try testing.expectEqualSlices(u8, &alice_pk, &(try x25519Value(&alice_sk, nine)));
+        try testing.expectEqualSlices(u8, &bob_pk, &(try x25519Value(&bob_sk, nine)));
+        try testing.expectEqualSlices(u8, &shared, &(try x25519Value(&alice_sk, bob_pk)));
+        try testing.expectEqualSlices(u8, &shared, &(try x25519Value(&bob_sk, alice_pk)));
     }
 }
 
 /// `std.crypto.dh.X25519.scalarmult` and the forced backend agree on the
 /// value AND on `error.IdentityElement`.
+/// Test convenience: `X25519.scalarmult` through its out-param, as a value.
+fn x25519Value(k: *const [32]u8, u: [32]u8) X25519.IdentityElementError![32]u8 {
+    var out: [32]u8 = undefined;
+    try X25519.scalarmultInto(&out, k, u);
+    return out;
+}
+
 fn expectScalarmultMatchesStd(b: X25519Backend, k: [32]u8, u: [32]u8) !void {
     const want = std.crypto.dh.X25519.scalarmult(k, u);
     test_hooks.forced = b;
-    const got = X25519.scalarmult(k, u);
+    const got = x25519Value(&k, u);
     if (want) |w| {
         if (got) |g| {
             if (std.mem.eql(u8, &w, &g)) return;

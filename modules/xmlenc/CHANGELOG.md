@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** RSA-OAEP unwrapping passes the key to rsa by pointer,
+  and the test key fixtures and the example build through rsa's out-param constructors
+  (rsa 2026-10-08).
 - **2026-09-11** — A1 fix campaign round 2 (`QUESTIONS-ROUND-2.md` Q4,
   cross-module with `rsa` — one commit, both modules). **F3's OAEP arm,
   closed.** `rsaOaepUnwrap` used to `try rsa.decryptOaepH(...)`: a failed

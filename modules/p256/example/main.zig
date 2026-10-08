@@ -21,7 +21,7 @@ pub fn main() !void {
     const key_pair = Ecdsa.KeyPair.generate(io);
 
     const payload = "{\"sub\":\"user-42\",\"exp\":1999999999}";
-    const sig = try Ecdsa.KeyPair.sign(key_pair, payload, null);
+    const sig = try Ecdsa.KeyPair.sign(&key_pair, payload, null);
 
     // The raw fixed-width r||s encoding is what a JWS ES256 signature
     // segment carries (base64url elsewhere is the caller's job, not this
@@ -48,7 +48,7 @@ pub fn main() !void {
     // from caller randomness, so signing the same payload again with the
     // same key reproduces the exact same signature bytes — no nonce-reuse
     // hazard for a caller that signs the same claims twice.
-    const sig_again = try Ecdsa.KeyPair.sign(key_pair, payload, null);
+    const sig_again = try Ecdsa.KeyPair.sign(&key_pair, payload, null);
     if (!std.mem.eql(u8, &raw, &sig_again.toBytes())) return error.DeterministicSignatureUnexpectedlyDiffered;
     std.debug.print("re-sign same payload: identical bytes\n", .{});
 }

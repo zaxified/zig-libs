@@ -610,7 +610,7 @@ pub fn signToken(
     var input_buf: [768]u8 = undefined;
     const input = try SignedToken.signingInput(&input_buf, version, time_s, identity);
     const sig: []const u8 = switch (signer) {
-        .rsa_pss_sha256 => |r| rsa.signPss(r.key, Sha256, r.random, input, Sha256.digest_length, sig_buf) catch
+        .rsa_pss_sha256 => |r| rsa.signPss(&r.key, Sha256, r.random, input, Sha256.digest_length, sig_buf) catch
             return error.SigningFailed,
         .ecdsa_p256_sha256 => |e| blk: {
             const s = e.key_pair.sign(input, e.noise) catch return error.SigningFailed;

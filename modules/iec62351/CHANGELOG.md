@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the ACSE and GOOSE RSA-PSS signers pass the key to
+  `rsa.signPss` by pointer, and the test key fixtures build through rsa's out-param constructors
+  (rsa 2026-10-08).
 - **2026-09-13** — **BREAKING:** A1 finding N3. `replay.GooseIdentity` gains the required
   `time_allowed_to_live_ms`, and `GooseGuard` now rejects a frame arriving later than the
   previous accepted frame's `timeAllowedtoLive` (`reject_idle_gap`) — the heartbeat path had no

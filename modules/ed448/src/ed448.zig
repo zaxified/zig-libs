@@ -33,6 +33,7 @@ const std = @import("std");
 const entropy = @import("entropy");
 const field = @import("field.zig");
 const scalar = @import("scalar.zig");
+const burn = @import("burn.zig");
 const Fe = field.Fe;
 const Shake256 = std.crypto.hash.sha3.Shake256;
 const fuzz_test = @import("fuzz_test.zig");
@@ -203,7 +204,15 @@ pub const Point = struct {
     /// built from `p` (public: base point for sign/keygen; the input
     /// element for decaf448) and only the SCALAR is secret, so building
     /// the table is data-independent regardless.
+    ///
+    /// Burned (`burn.zig`): the scalar is secret for decaf448's callers.
     pub fn mul(p: Point, s: scalar.CompressedScalar) Point {
+        const r = mulUnburned(p, &s);
+        burn.stack(burn.point_burn);
+        return r;
+    }
+
+    noinline fn mulUnburned(p: Point, s: *const scalar.CompressedScalar) Point {
         var table: [16]Point = undefined;
         table[0] = identityElement;
         table[1] = p;
@@ -264,7 +273,15 @@ pub const Point = struct {
     /// `mul`: the secret nibble drives a masked scan (`ctSelectPoint`),
     /// never a secret-dependent load or branch. Used by `KeyPair.create`
     /// and `signInternal` for their `[s]B` / `[r]B` base-point mults.
+    ///
+    /// Burned like `mul`.
     pub fn mulBasePoint(s: scalar.CompressedScalar) Point {
+        const r = mulBasePointUnburned(&s);
+        burn.stack(burn.point_burn);
+        return r;
+    }
+
+    noinline fn mulBasePointUnburned(s: *const scalar.CompressedScalar) Point {
         var acc = identityElement;
         inline for (0..112) |w| {
             const shift = w * 4;
@@ -519,17 +536,26 @@ pub const KeyPair = struct {
     ///    the clamped `s` is used UN-reduced, bit 447 set — see
     ///    `Point.mul`'s doc comment).
     /// 4. Public key = `A.toBytes()`.
-    pub fn create(seed: [57]u8) KeyPair {
+    ///
+    /// Burned (`burn.zig`): before, every call left the seed and `h` on the
+    /// dead stack (`stackprobe_test.zig`, 2026-10-08).
+    pub fn create(seed: *const [57]u8) KeyPair {
+        const r = createUnburned(seed);
+        burn.stack(burn.sign_burn);
+        return r;
+    }
+
+    noinline fn createUnburned(seed: *const [57]u8) KeyPair {
         var h: [114]u8 = undefined;
         defer std.crypto.secureZero(u8, &h);
-        Shake256.hash(&seed, &h, .{});
+        Shake256.hash(seed, &h, .{});
         var s = h[0..57].*;
         defer std.crypto.secureZero(u8, &s);
         scalar.clamp(&s);
         const a_point = Point.mulBasePoint(s);
         return .{
             .public_key = PublicKey.fromBytes(a_point.toBytes()),
-            .secret_key = SecretKey.fromBytes(seed),
+            .secret_key = SecretKey.fromBytes(seed.*),
         };
     }
 
@@ -541,7 +567,8 @@ pub const KeyPair = struct {
     pub fn generate(io: std.Io) KeyPair {
         var seed: [57]u8 = undefined;
         entropy.fill(io, &seed);
-        return create(seed);
+        defer std.crypto.secureZero(u8, &seed);
+        return create(&seed);
     }
 
     /// Zeroize `secret_key` in place; `public_key` is left untouched (it
@@ -568,7 +595,18 @@ pub const SignError = ContextError;
 ///    mod L`.
 /// 5. `S = (r + k*s) mod L` (`scalar.mulAdd`).
 /// 6. `signature = r_bytes || bytes(S)`.
-fn signInternal(kp: KeyPair, ph_message: []const u8, ctx: []const u8, phflag: u1) SignError!Signature {
+///
+/// Burned (`burn.zig`): the `secureZero` defers below wipe this frame only;
+/// before the burn every call left the seed, `s`, `prefix`, the nonce `r` and
+/// `k·s` on the dead stack in the callees' frames (`stackprobe_test.zig`,
+/// 2026-10-08) — `r` beside the published signature is the key.
+fn signInternal(kp: *const KeyPair, ph_message: []const u8, ctx: []const u8, phflag: u1) SignError!Signature {
+    const r = signInternalUnburned(kp, ph_message, ctx, phflag);
+    burn.stack(burn.sign_burn);
+    return r;
+}
+
+noinline fn signInternalUnburned(kp: *const KeyPair, ph_message: []const u8, ctx: []const u8, phflag: u1) SignError!Signature {
     var h: [114]u8 = undefined;
     defer std.crypto.secureZero(u8, &h);
     Shake256.hash(&kp.secret_key.bytes, &h, .{});
@@ -592,7 +630,7 @@ fn signInternal(kp: KeyPair, ph_message: []const u8, ctx: []const u8, phflag: u1
 }
 
 /// Ed448 (`phflag = 0`, `PH` = identity — RFC 8032 §5.2 Table 2).
-pub fn sign(kp: KeyPair, msg: []const u8, ctx: []const u8) SignError!Signature {
+pub fn sign(kp: *const KeyPair, msg: []const u8, ctx: []const u8) SignError!Signature {
     return signInternal(kp, msg, ctx, 0);
 }
 
@@ -600,7 +638,7 @@ pub fn sign(kp: KeyPair, msg: []const u8, ctx: []const u8) SignError!Signature {
 /// "Ed448ph is the same but with PH being SHAKE256(x, 64) and phflag
 /// being 1"). REAL: the prehash itself is a plain SHAKE256 call, no
 /// curve/scalar math.
-pub fn signPh(kp: KeyPair, msg: []const u8, ctx: []const u8) SignError!Signature {
+pub fn signPh(kp: *const KeyPair, msg: []const u8, ctx: []const u8) SignError!Signature {
     var ph: [64]u8 = undefined;
     Shake256.hash(msg, &ph, .{});
     return signInternal(kp, &ph, ctx, 1);
@@ -787,9 +825,9 @@ test "RFC 8032 §7.4 Ed448 test vector (empty message): keygen public key, byte-
         "1da1342485a70e1f8a0ea75d80e96778" ++
         "edf124769b46c7061bd6783df1e50f6c" ++
         "d1fa1abeafe8256180");
-    const kp = KeyPair.create(seed);
+    const kp = KeyPair.create(&seed);
     try std.testing.expectEqualSlices(u8, &expected_pk, &kp.public_key.bytes);
-    const sig = try sign(kp, "", "");
+    const sig = try sign(&kp, "", "");
     try verify(sig, "", "", kp.public_key);
 }
 
@@ -805,7 +843,7 @@ test "KeyPair.deinit zeroizes secret_key.bytes but leaves public_key untouched (
         "6c929f34ddfa8c9f63c9960ef6e348a3" ++
         "528c8a3fcc2f044e39a3fc5b94492f8f" ++
         "032e7549a20098f95b");
-    var kp = KeyPair.create(seed);
+    var kp = KeyPair.create(&seed);
     const zero: [57]u8 = [_]u8{0} ** 57;
     try std.testing.expect(!std.mem.eql(u8, &kp.secret_key.bytes, &zero));
     kp.deinit();
@@ -886,8 +924,8 @@ test "verify rejects an identity public key (universal forgery)" {
 
     // A genuine signature must still verify — the guard must not be a blanket
     // rejection that would make this test pass for the wrong reason.
-    const kp = KeyPair.create([_]u8{7} ** 57);
-    const good = try sign(kp, "hello", "");
+    const kp = KeyPair.create(&([_]u8{7} ** 57));
+    const good = try sign(&kp, "hello", "");
     try verify(good, "hello", "", kp.public_key);
 
     // The public-key guard on its own: with A' = O the [k]A' term vanishes,
@@ -931,7 +969,7 @@ test "verify rejects a small-order R even from the key holder (this module's pol
     // S = k·s). `verifyInternal` refuses small-order R before the equation as
     // defence in depth; this pins that choice. Without the guard both sides
     // of the cofactored equation are the identity and it verifies.
-    const kp = KeyPair.create([_]u8{7} ** 57);
+    const kp = KeyPair.create(&([_]u8{7} ** 57));
     const r_bytes = Point.identityElement.toBytes();
     const k = scalar.reduceWide(try shake114(0, "", &.{ &r_bytes, &kp.public_key.bytes, "hello" }));
     const sig: Signature = .{ .r = r_bytes, .s = scalar.mulAdd(k, testSecretScalar(kp), scalar.zero) };
@@ -948,7 +986,7 @@ test "verify is cofactored: an order-4 component on R is accepted (RFC 8032 §5.
     try std.testing.expect(t4.clearCofactor().equivalent(Point.identityElement));
     try std.testing.expect(!t4.dbl().equivalent(Point.identityElement));
 
-    const kp = KeyPair.create([_]u8{5} ** 57);
+    const kp = KeyPair.create(&([_]u8{5} ** 57));
     var r = scalar.zero;
     r[0] = 42;
     const r_bytes = Point.mulBasePoint(r).add(t4).toBytes();
@@ -961,8 +999,8 @@ test "verify rejects S >= L in a Signature built field by field (RFC 8032 §5.2.
     // S + L is the same scalar mod L, so without the range check inside
     // verify the equation holds: a second valid encoding of one signature.
     // `Signature.fromBytes` rejects it, but the struct's fields are public.
-    const kp = KeyPair.create([_]u8{9} ** 57);
-    const good = try sign(kp, "msg", "");
+    const kp = KeyPair.create(&([_]u8{9} ** 57));
+    const good = try sign(&kp, "msg", "");
     try verify(good, "msg", "", kp.public_key);
 
     var s_plus_l: [57]u8 = undefined;
@@ -991,10 +1029,10 @@ test "Point.equivalent tells P from -P" {
 test "a context of exactly 255 octets signs and verifies (RFC 8032 §5.2)" {
     // RFC 8032 §5.2: the context is "an octet string of at most 255 octets".
     const ctx = [_]u8{0xab} ** max_context_length;
-    const kp = KeyPair.create([_]u8{3} ** 57);
-    const sig = try sign(kp, "m", &ctx);
+    const kp = KeyPair.create(&([_]u8{3} ** 57));
+    const sig = try sign(&kp, "m", &ctx);
     try verify(sig, "m", &ctx, kp.public_key);
-    try std.testing.expectError(error.ContextTooLong, sign(kp, "m", &([_]u8{0xab} ** (max_context_length + 1))));
+    try std.testing.expectError(error.ContextTooLong, sign(&kp, "m", &([_]u8{0xab} ** (max_context_length + 1))));
 }
 
 // ── the RNG seam (entropy re-audit 2026-08-13) ──────────────────────────────
@@ -1034,6 +1072,6 @@ test "RNG seam: KeyPair.generate really draws entropy, and round-trips end to en
 
     // And the production path is a working path, not just a typed one:
     // sign with the freshly drawn key, verify with its own public key.
-    const sig = try sign(kp1, "message under a freshly drawn key", "");
+    const sig = try sign(&kp1, "message under a freshly drawn key", "");
     try verify(sig, "message under a freshly drawn key", "", kp1.public_key);
 }

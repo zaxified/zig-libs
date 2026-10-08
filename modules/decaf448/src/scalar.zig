@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const ed448 = @import("ed448");
+const burn = @import("burn.zig");
 
 /// 56-byte little-endian wire encoding of a decaf448 scalar (RFC 9496
 /// §5.4) — narrower than `ed448.scalar.CompressedScalar`'s 57 bytes; see
@@ -127,8 +128,18 @@ const l_minus_2: CompressedScalar = blk: {
 /// `invert(0)` returns `0` (there is no inverse; `0^(l-2) == 0`). A caller
 /// for which a zero scalar is an error must check for it — e.g. RFC 9497's
 /// `Blind` redraws a zero blind before it is ever inverted.
+///
+/// Burned (`burn.zig`): the square-and-multiply chain left both `a` and its
+/// inverse on the dead stack (`stackprobe_test.zig`, 2026-10-08) — the
+/// inverse of a blind is as secret as the blind.
 pub fn invert(a: CompressedScalar) CompressedScalar {
-    const a57 = toEd448(a);
+    const r = invertUnburned(&a);
+    burn.stack(burn.scalar_burn);
+    return r;
+}
+
+noinline fn invertUnburned(a: *const CompressedScalar) CompressedScalar {
+    const a57 = toEd448(a.*);
     var acc = toEd448(one);
     var bit: usize = 8 * encoded_bytes;
     while (bit > 0) {
@@ -176,7 +187,24 @@ pub const RandomError = std.Io.RandomSecureError;
 /// wide-reduced by `fromWide`. Constant-time; may return `0` with
 /// probability `~2^-446`. Errors are `randomSecure`'s own
 /// (`EntropyUnavailable`, `Canceled`), passed through to the caller.
-pub fn random(io: std.Io) RandomError!CompressedScalar {
+///
+/// Burned like `invert`: the reduction left the result on the dead stack
+/// (`stackprobe_test.zig`, 2026-10-08).
+///
+/// Into `out` (zeroed on error; BREAKING 2026-10-08): returned in an error
+/// union, the scalar sat in the caller's temporary.
+pub fn random(out: *CompressedScalar, io: std.Io) RandomError!void {
+    const r = randomUnburned(out, io);
+    burn.stack(burn.scalar_burn);
+    return r;
+}
+
+noinline fn randomUnburned(out: *CompressedScalar, io: std.Io) RandomError!void {
+    errdefer std.crypto.secureZero(u8, out);
+    out.* = try randomValue(io);
+}
+
+fn randomValue(io: std.Io) RandomError!CompressedScalar {
     var buf: [114]u8 = undefined;
     try io.randomSecure(&buf);
     defer std.crypto.secureZero(u8, &buf);
@@ -331,13 +359,18 @@ test "random: canonical and (overwhelmingly) distinct" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const a = try random(io);
-    const b = try random(io);
+    var a: CompressedScalar = undefined;
+    var b: CompressedScalar = undefined;
+    try random(&a, io);
+    try random(&b, io);
     try rejectNonCanonical(a);
     try rejectNonCanonical(b);
     try std.testing.expect(!std.mem.eql(u8, &a, &b)); // collide w/ prob ~2^-446
 }
 
 test "random: entropy failure is reported, not papered over" {
-    try std.testing.expectError(error.EntropyUnavailable, random(std.Io.failing));
+    var out: CompressedScalar = @splat(0xa5);
+    try std.testing.expectError(error.EntropyUnavailable, random(&out, std.Io.failing));
+    // The failed draw leaves `out` zeroed, not holding a stale scalar.
+    try std.testing.expectEqualSlices(u8, &zero, &out);
 }

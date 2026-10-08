@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the A1 E4 hand probe was not
+  kept; its durable form (`src/stackprobe_test.zig`) found the nonce `k` after `prove` and
+  `KeyPair.prove` (with the proof's public `c` and `s` it yields `x`) and the seed after `prove` and
+  `KeyPair.fromSecretKey` — the per-frame wipes of E4 do not reach the callees' frames. `prove`,
+  `KeyPair.prove` and `publicKey` now burn their stack (`burn.zig`), and `prove`, `publicKey` and
+  `KeyPair.fromSecretKey` take `sk: *const SecretKey` (by value, the caller's frame kept the seed).
+  0 residues after, caller's frame included.
 - **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** test-only. The print-only
   dead-stack probe `src/zeroize_probe_test.zig` (A1 E4) is deleted: it
   asserted nothing and its stderr failed the CI lane in ReleaseFast. SPEC.md's

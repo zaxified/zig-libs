@@ -24,12 +24,13 @@ pub fn main() !void {
     var prng = std.Random.DefaultPrng.init(0xC0FFEE_1234_5678);
     const random = prng.random();
 
-    var kp = try rsa.generate(random, 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, random, 1024, 65537);
     defer kp.secret_key.deinit();
 
     const doc = "invoice #4021: pay 1200.00 EUR by 2026-09-01";
     var sig_buf: [rsa.max_modulus_len]u8 = undefined;
-    const sig = try rsa.signPkcs1v15(kp.secret_key, Sha256, doc, &sig_buf);
+    const sig = try rsa.signPkcs1v15(&kp.secret_key, Sha256, doc, &sig_buf);
     try rsa.verifyPkcs1v15(kp.public_key, Sha256, doc, sig);
     std.debug.print("PKCS1v15/SHA-256 signature verified over {d} bytes\n", .{doc.len});
 
@@ -49,13 +50,14 @@ pub fn main() !void {
     const ct = try rsa.encryptOaep(kp.public_key, Sha256, random, secret, "", &ct_buf);
 
     var pt_buf: [rsa.max_modulus_len]u8 = undefined;
-    const pt = try rsa.decryptOaep(kp.secret_key, Sha256, ct, "", &pt_buf);
+    const pt = try rsa.decryptOaep(&kp.secret_key, Sha256, ct, "", &pt_buf);
     if (!std.mem.eql(u8, secret, pt)) return error.OaepRoundTripMismatch;
     std.debug.print("OAEP round-trip matches original\n", .{});
 
     // Generation itself validates its own parameters and names the
     // rejection rather than panicking on a caller mistake (odd bit count).
-    if (rsa.generate(random, 513, 65537)) |_| {
+    var rejected: rsa.KeyPair = undefined;
+    if (rsa.generate(&rejected, random, 513, 65537)) |_| {
         return error.OddBitCountKeyUnexpectedlyGenerated;
     } else |err| switch (err) {
         error.InvalidBits => std.debug.print("odd bit count correctly rejected (InvalidBits)\n", .{}),

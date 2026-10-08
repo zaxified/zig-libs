@@ -26,6 +26,7 @@
 const std = @import("std");
 const entropy = @import("entropy");
 const field = @import("field.zig");
+const burn = @import("burn.zig");
 const Fe = field.Fe;
 
 pub const meta = .{
@@ -172,19 +173,35 @@ fn ladder(clamped_scalar: [scalar_length]u8, u: Fe) Fe {
 /// fromBytes` for the equivalent 25519 case — see `../SPEC.md`'s threat
 /// model for the rationale (silently masking a high bit that changes a
 /// peer's intended input is a worse failure mode than a hard reject).
-pub fn scalarmult(k: [scalar_length]u8, u: [public_length]u8) field.FieldError![shared_length]u8 {
-    var clamped = k;
+///
+/// Burned (`burn.zig`): the ladder left the clamped scalar on the dead stack
+/// (`stackprobe_test.zig`, 2026-10-08).
+///
+/// Key by pointer, shared secret into `out` (zeroed on error): by value, the
+/// caller's frame kept a copy of the key and of the returned secret
+/// (`stackprobe_test.zig`, 2026-10-08). BREAKING (2026-10-08).
+pub fn scalarmult(out: *[shared_length]u8, k: *const [scalar_length]u8, u: [public_length]u8) field.FieldError!void {
+    const r = scalarmultUnburned(out, k, &u);
+    burn.stack(burn.x448_burn);
+    return r;
+}
+
+noinline fn scalarmultUnburned(out: *[shared_length]u8, k: *const [scalar_length]u8, u: *const [public_length]u8) field.FieldError!void {
+    errdefer std.crypto.secureZero(u8, out);
+    var clamped = k.*;
     defer std.crypto.secureZero(u8, &clamped);
     clamp(&clamped);
-    const u_fe = try Fe.fromBytes(u);
+    const u_fe = try Fe.fromBytes(u.*);
     const result = ladder(clamped, u_fe);
-    return result.toBytes();
+    out.* = result.toBytes();
 }
 
 /// Compute the public key for a given private (scalar) key:
 /// `X448(secret_key, base_u)`.
-pub fn recoverPublicKey(secret_key: [scalar_length]u8) field.FieldError![public_length]u8 {
-    return scalarmult(secret_key, base_u);
+pub fn recoverPublicKey(secret_key: *const [scalar_length]u8) field.FieldError![public_length]u8 {
+    var pk: [public_length]u8 = undefined;
+    try scalarmult(&pk, secret_key, base_u);
+    return pk;
 }
 
 /// An X448 key pair.
@@ -195,18 +212,21 @@ pub const KeyPair = struct {
     /// Deterministically derive a key pair from a secret seed. As with
     /// `std.crypto.dh.X25519.KeyPair.generateDeterministic`, applications
     /// should generally prefer `generate()` for fresh keys.
-    pub fn generateDeterministic(seed: [seed_length]u8) field.FieldError!KeyPair {
-        return .{
-            .public_key = try recoverPublicKey(seed),
-            .secret_key = seed,
-        };
+    ///
+    /// Into `out` (BREAKING 2026-10-08): returned in an error union, the pair —
+    /// secret half included — sat in the caller's temporary.
+    pub fn generateDeterministic(out: *KeyPair, seed: *const [seed_length]u8) field.FieldError!void {
+        out.public_key = try recoverPublicKey(seed);
+        out.secret_key = seed.*;
     }
 
     /// Generate a new, random key pair. The seed IS the X448 private
     /// scalar, so it fails closed (`entropy.fill`) — `generate` returns a
     /// `KeyPair`, not an error union, and a predictable seed here hands
     /// over every DH shared secret this key ever computes.
-    pub fn generate(io: std.Io) KeyPair {
+    ///
+    /// Into `out`, like `generateDeterministic` (BREAKING 2026-10-08).
+    pub fn generate(out: *KeyPair, io: std.Io) void {
         var seed: [seed_length]u8 = undefined;
         entropy.fill(io, &seed);
         // recoverPublicKey/scalarmult cannot fail on a freshly-clamped,
@@ -216,7 +236,8 @@ pub const KeyPair = struct {
         // base_u never is) — mirrors X25519.KeyPair.generate's
         // retry-on-error loop shape, simplified because X448's base
         // point can never itself trigger that error.
-        return generateDeterministic(seed) catch unreachable;
+        defer std.crypto.secureZero(u8, &seed);
+        generateDeterministic(out, &seed) catch unreachable;
     }
 
     /// Zeroize `secret_key` in place; `public_key` is left untouched (it
@@ -268,7 +289,8 @@ test "RFC 7748 §5.2 X448 test vector 1: scalarmult, byte-exact" {
     var expected: [56]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "ce3e4ff95a60dc6697da1db1d85e6afbdf79b50a2412d7546d5f239f" ++
         "e14fbaadeb445fc66a01b0779d98223961111e21766282f73dd96b6f");
-    const out = try scalarmult(scalar, u);
+    var out: [shared_length]u8 = undefined;
+    try scalarmult(&out, &scalar, u);
     try std.testing.expectEqualSlices(u8, &expected, &out);
 }
 
@@ -276,7 +298,8 @@ test "KeyPair.deinit zeroizes secret_key in place (regression: fails if secureZe
     var seed: [56]u8 = undefined;
     _ = try std.fmt.hexToBytes(&seed, "3d262fddf9ec8e88495266fea19a34d28882acef045104d0d1aae121" ++
         "700a779c984c24f8cdd78fbff44943eba368f54b29259a4f1c600ad3");
-    var kp = try KeyPair.generateDeterministic(seed);
+    var kp: KeyPair = undefined;
+    try KeyPair.generateDeterministic(&kp, &seed);
     const zero_scalar = [_]u8{0} ** scalar_length;
     try std.testing.expect(!std.mem.eql(u8, &kp.secret_key, &zero_scalar));
     kp.deinit();
@@ -315,16 +338,22 @@ test "RNG seam: KeyPair.generate really draws entropy, and round-trips end to en
     // `entropy.fill` left `zig build test-megolm` green under an assertion
     // of this same shape. Not re-measured here, but this module's seed is
     // one buffer filled the same way.
-    const kp1 = KeyPair.generate(io);
-    const kp2 = KeyPair.generate(io);
+    var kp1: KeyPair = undefined;
+    KeyPair.generate(&kp1, io);
+    var kp2: KeyPair = undefined;
+    KeyPair.generate(&kp2, io);
     try std.testing.expect(!std.mem.eql(u8, &kp1.secret_key, &kp2.secret_key));
 
     // And the production path is a working path, not just a typed one: a
     // freshly drawn key pair on each side of a DH exchange must agree on
     // the shared secret.
-    const alice = KeyPair.generate(io);
-    const bob = KeyPair.generate(io);
-    const alice_shared = try scalarmult(alice.secret_key, bob.public_key);
-    const bob_shared = try scalarmult(bob.secret_key, alice.public_key);
+    var alice: KeyPair = undefined;
+    KeyPair.generate(&alice, io);
+    var bob: KeyPair = undefined;
+    KeyPair.generate(&bob, io);
+    var alice_shared: [shared_length]u8 = undefined;
+    try scalarmult(&alice_shared, &alice.secret_key, bob.public_key);
+    var bob_shared: [shared_length]u8 = undefined;
+    try scalarmult(&bob_shared, &bob.secret_key, alice.public_key);
     try std.testing.expectEqualSlices(u8, &alice_shared, &bob_shared);
 }

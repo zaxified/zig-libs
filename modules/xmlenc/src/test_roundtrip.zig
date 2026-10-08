@@ -34,7 +34,9 @@ const plaintext_assertion =
 // keys only — deterministic generation is explicitly allowed for tests).
 fn makeKey() !rsa.KeyPair {
     var prng = std.Random.DefaultPrng.init(0x5A_11_E0_DE);
-    return rsa.generate(prng.random(), 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
+    return kp;
 }
 
 fn b64(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
@@ -728,7 +730,8 @@ test "teeth: wrong private key -> DecryptionError" {
     const kp = try makeKey();
     // A different key (different seed) whose modulus differs.
     var prng = std.Random.DefaultPrng.init(0xDEADBEEF);
-    const other = try rsa.generate(prng.random(), 1024, 65537);
+    var other: rsa.KeyPair = undefined;
+    try rsa.generate(&other, prng.random(), 1024, 65537);
     const cek = [_]u8{0xC5} ** 32;
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);

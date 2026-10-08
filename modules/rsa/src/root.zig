@@ -93,6 +93,7 @@ const std = @import("std");
 /// Fast constant-time Montgomery modexp backend for the RSA hot path
 /// (private CRT op, non-CRT private op, public op). See `montint`'s SPEC.md.
 const montint = @import("montint");
+const burn = @import("burn.zig");
 
 /// Blowfish + OpenBSD bcrypt_pbkdf (P4b support primitives), re-exported
 /// for callers that need the KDF stand-alone.
@@ -365,7 +366,20 @@ pub const SecretKey = struct {
     /// `std.crypto.ff` `Modulus` carriers (`sk.p`, `sk.q`); SPEC Backlog.
     /// Cost: a few milliseconds at 4096-bit width (the gcd and lcm run at the
     /// full `max_modulus_bits` capacity, whatever the key size).
-    pub fn fromPrimes(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) FromPrimesError!SecretKey {
+    pub fn fromPrimes(out: *SecretKey, p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) FromPrimesError!void {
+        const r = fromPrimesUnburned(out, p_bytes, q_bytes, e_bytes);
+        burn.stack(burn.private_op_burn);
+        return r;
+    }
+
+    noinline fn fromPrimesUnburned(out: *SecretKey, p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) FromPrimesError!void {
+        out.* = fromPrimesValue(p_bytes, q_bytes, e_bytes) catch |err| {
+            std.crypto.secureZero(u8, std.mem.asBytes(out));
+            return err;
+        };
+    }
+
+    fn fromPrimesValue(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) FromPrimesError!SecretKey {
         return fromPrimesImpl(p_bytes, q_bytes, e_bytes) catch error.InvalidPrivateKey;
     }
 
@@ -379,7 +393,20 @@ pub const SecretKey = struct {
     /// and routed through `fromPrimes`, which re-derives `n`/`d`/the CRT
     /// parameters itself rather than trusting the on-disk ones (see
     /// `fromPrimes`'s doc comment).
-    pub fn fromDer(bytes: []const u8) FromDerError!SecretKey {
+    pub fn fromDer(out: *SecretKey, bytes: []const u8) FromDerError!void {
+        const r = fromDerUnburned(out, bytes);
+        burn.stack(burn.private_op_burn);
+        return r;
+    }
+
+    noinline fn fromDerUnburned(out: *SecretKey, bytes: []const u8) FromDerError!void {
+        out.* = fromDerValue(bytes) catch |err| {
+            std.crypto.secureZero(u8, std.mem.asBytes(out));
+            return err;
+        };
+    }
+
+    fn fromDerValue(bytes: []const u8) FromDerError!SecretKey {
         return secretKeyFromPkcs1Impl(bytes) catch |err| switch (err) {
             error.InvalidPrivateKey => error.InvalidPrivateKey,
             else => error.InvalidDer,
@@ -393,13 +420,26 @@ pub const SecretKey = struct {
     /// out of scope and OpenSSH (`OPENSSH PRIVATE KEY`) blocks belong to
     /// the module-level `fromOpenSSH`; both report
     /// `error.UnsupportedPemLabel` here, never silently misparsed.
-    pub fn fromPem(text: []const u8) PemError!SecretKey {
+    pub fn fromPem(out: *SecretKey, text: []const u8) PemError!void {
+        const r = fromPemUnburned(out, text);
+        burn.stack(burn.private_op_burn);
+        return r;
+    }
+
+    noinline fn fromPemUnburned(out: *SecretKey, text: []const u8) PemError!void {
+        out.* = fromPemValue(text) catch |err| {
+            std.crypto.secureZero(u8, std.mem.asBytes(out));
+            return err;
+        };
+    }
+
+    fn fromPemValue(text: []const u8) PemError!SecretKey {
         const block = try pemDecodeBody(text);
         if (std.mem.eql(u8, block.label, "PRIVATE KEY")) {
-            return try fromPkcs8(block.der());
+            return try fromPkcs8Value(block.der());
         }
         if (std.mem.eql(u8, block.label, "RSA PRIVATE KEY")) {
-            return try SecretKey.fromDer(block.der());
+            return try SecretKey.fromDerValue(block.der());
         }
         return error.UnsupportedPemLabel;
     }
@@ -668,10 +708,6 @@ fn publicOp(pk: PublicKey, in: []const u8, out: []u8) PrimitiveError!void {
     writeMontResult(out, res); // out.len == byteLen(n); res is < n
 }
 
-fn privateOp(sk: SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
-    return privateOpPtr(&sk, in, out);
-}
-
 fn privateOpPtr(sk: *const SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
     const c = sk.n_mont.elemFromBytesBE(in) catch return error.MessageRepresentativeOutOfRange;
     // Secret exponent -> constant-time montint modexp; d is validated non-zero
@@ -783,14 +819,6 @@ fn invModN(n_be: []const u8, r_be: []const u8, out: *[max_modulus_len]u8) ?[]con
     return out[0..];
 }
 
-/// By-value form, kept for the existing public API. ⚠ The copy it makes lives
-/// in the CALLER's frame, where nothing this module runs can zero it (audit
-/// `blindrsa` B20, and `paillier` F2 before it) — a caller that cares reaches
-/// for the `*Ptr` entry points instead.
-fn privateOpCrt(sk: SecretKey, in: []const u8, out: []u8, blinding: Blinding) PrimitiveError!void {
-    return privateOpCrtPtr(&sk, in, out, blinding);
-}
-
 fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Blinding) PrimitiveError!void {
     // OS2IP + range check on the PUBLIC input; from here on every value is
     // a montint element (see "montint backend" above for why not `ff`).
@@ -866,10 +894,16 @@ pub fn rsavp1(comptime modulus_len: usize, s: [modulus_len]u8, pk: PublicKey) Pr
 
 /// RSADP: m = c^d mod n (RFC 8017 §5.1.2, form (1) — non-CRT), the decryption
 /// primitive.
-pub fn rsadp(comptime modulus_len: usize, c: [modulus_len]u8, sk: SecretKey) PrimitiveError![modulus_len]u8 {
+pub fn rsadp(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
+    const r = rsadpUnburned(modulus_len, c, sk);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn rsadpUnburned(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
     comptime std.debug.assert(modulus_len <= max_modulus_len);
     var out: [modulus_len]u8 = undefined;
-    try privateOp(sk, &c, &out);
+    try privateOpPtr(sk, &c, &out);
     return out;
 }
 
@@ -879,62 +913,40 @@ pub fn rsadp(comptime modulus_len: usize, c: [modulus_len]u8, sk: SecretKey) Pri
 /// Runs with F2 base blinding **OFF** (`Blinding.none`) — see `Blinding` for
 /// what that costs and why the default is this way. Use `rsadpCrtBlinded` to
 /// supply a CSPRNG when `c` is attacker-chosen.
-pub fn rsadpCrt(comptime modulus_len: usize, c: [modulus_len]u8, sk: SecretKey) PrimitiveError![modulus_len]u8 {
+pub fn rsadpCrt(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
+    const r = rsadpCrtUnburned(modulus_len, c, sk);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn rsadpCrtUnburned(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
     return rsadpCrtBlinded(modulus_len, c, sk, .none);
 }
 
 /// `rsadpCrt` with an explicit F2 base-blinding choice.
-pub fn rsadpCrtBlinded(comptime modulus_len: usize, c: [modulus_len]u8, sk: SecretKey, blinding: Blinding) PrimitiveError![modulus_len]u8 {
-    comptime std.debug.assert(modulus_len <= max_modulus_len);
-    var out: [modulus_len]u8 = undefined;
-    try privateOpCrt(sk, &c, &out, blinding);
-    return out;
+pub fn rsadpCrtBlinded(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey, blinding: Blinding) PrimitiveError![modulus_len]u8 {
+    const r = rsadpCrtBlindedUnburned(modulus_len, c, sk, blinding);
+    burn.stack(burn.private_op_burn);
+    return r;
 }
 
-/// RSASP1: signature primitive, same math as `rsadp` (RFC 8017 §5.2.1).
-/// The real implementation should route through `rsadpCrt` for performance.
-pub fn rsasp1(comptime modulus_len: usize, m: [modulus_len]u8, sk: SecretKey) PrimitiveError![modulus_len]u8 {
-    return rsadpCrt(modulus_len, m, sk);
-}
-
-// ── the same three primitives, with the key BY POINTER ──────────────────────
-//
-// ⛔ WHY THEY EXIST, measured twice. Passing a `SecretKey` by value makes an
-// ABI-level copy AT THE CALL SITE, i.e. in the caller's own frame. Neither
-// side can zero it: the caller does not know where the ABI put it, and the
-// callee's zeroing only reaches its own copy. `paillier` F2 hit this exact
-// wall (a 512 B `Fe` crossing into `std.crypto.ff`) and closed it by taking
-// pointers; `blindrsa`'s probe then measured the same thing one layer up —
-// `p` and `q` readable in the caller's frame after `blindSign`, with a stack
-// burn and without it, at the same offsets.
-//
-// These are ADDITIVE: every existing signature is untouched, so this costs no
-// consumer anything (zig-libs DECISIONS.md P3).
-
-/// `rsadp` with the key by pointer — see the note above.
-pub fn rsadpPtr(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
-    comptime std.debug.assert(modulus_len <= max_modulus_len);
-    var out: [modulus_len]u8 = undefined;
-    try privateOpPtr(sk, &c, &out);
-    return out;
-}
-
-/// `rsadpCrt` with the key by pointer — see the note above.
-pub fn rsadpCrtPtr(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
-    return rsadpCrtBlindedPtr(modulus_len, c, sk, .none);
-}
-
-/// `rsadpCrtBlinded` with the key by pointer — see the note above.
-pub fn rsadpCrtBlindedPtr(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey, blinding: Blinding) PrimitiveError![modulus_len]u8 {
+noinline fn rsadpCrtBlindedUnburned(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey, blinding: Blinding) PrimitiveError![modulus_len]u8 {
     comptime std.debug.assert(modulus_len <= max_modulus_len);
     var out: [modulus_len]u8 = undefined;
     try privateOpCrtPtr(sk, &c, &out, blinding);
     return out;
 }
 
-/// `rsasp1` with the key by pointer — see the note above.
-pub fn rsasp1Ptr(comptime modulus_len: usize, m: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
-    return rsadpCrtPtr(modulus_len, m, sk);
+/// RSASP1: signature primitive, same math as `rsadp` (RFC 8017 §5.2.1).
+/// The real implementation should route through `rsadpCrt` for performance.
+pub fn rsasp1(comptime modulus_len: usize, m: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
+    const r = rsasp1Unburned(modulus_len, m, sk);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn rsasp1Unburned(comptime modulus_len: usize, m: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
+    return rsadpCrt(modulus_len, m, sk);
 }
 
 // ── P1: EMSA-PKCS1-v1_5 sign / verify (RFC 8017 §8.2, §9.2) ─────────────────
@@ -1007,14 +1019,26 @@ pub const SignPkcs1v15Error = EmsaEncodeError || error{ BufferTooSmall, FaultDet
 /// factor, so a caller who signs attacker-supplied messages with a long-lived
 /// key can pass a CSPRNG through `signPkcs1v15Blinded` and get byte-identical
 /// signatures with the masking on — see `Blinding`.
-pub fn signPkcs1v15(sk: SecretKey, comptime Hash: type, msg: []const u8, out: []u8) SignPkcs1v15Error![]u8 {
+pub fn signPkcs1v15(sk: *const SecretKey, comptime Hash: type, msg: []const u8, out: []u8) SignPkcs1v15Error![]u8 {
+    const r = signPkcs1v15Unburned(sk, Hash, msg, out);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn signPkcs1v15Unburned(sk: *const SecretKey, comptime Hash: type, msg: []const u8, out: []u8) SignPkcs1v15Error![]u8 {
     return signPkcs1v15Blinded(sk, Hash, .none, msg, out);
 }
 
 /// `signPkcs1v15` with an explicit F2 base-blinding choice. The emitted
 /// signature is identical either way (blinding is undone before output);
 /// only the side-channel posture of the private op differs.
-pub fn signPkcs1v15Blinded(sk: SecretKey, comptime Hash: type, blinding: Blinding, msg: []const u8, out: []u8) SignPkcs1v15Error![]u8 {
+pub fn signPkcs1v15Blinded(sk: *const SecretKey, comptime Hash: type, blinding: Blinding, msg: []const u8, out: []u8) SignPkcs1v15Error![]u8 {
+    const r = signPkcs1v15BlindedUnburned(sk, Hash, blinding, msg, out);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn signPkcs1v15BlindedUnburned(sk: *const SecretKey, comptime Hash: type, blinding: Blinding, msg: []const u8, out: []u8) SignPkcs1v15Error![]u8 {
     const k = byteLen(sk.n.bits());
     if (out.len < k) return error.BufferTooSmall;
     var em_buf: [max_modulus_len]u8 = undefined;
@@ -1023,7 +1047,7 @@ pub fn signPkcs1v15Blinded(sk: SecretKey, comptime Hash: type, blinding: Blindin
     // EM starts with 0x00 0x01, so its integer value is < n by construction;
     // the range check inside the primitive cannot fail. A Bellcore fault (F3)
     // is surfaced on either blinding setting, never signed over.
-    privateOpCrt(sk, em, out[0..k], blinding) catch |err| switch (err) {
+    privateOpCrtPtr(sk, em, out[0..k], blinding) catch |err| switch (err) {
         error.MessageRepresentativeOutOfRange => unreachable,
         error.FaultDetected => return error.FaultDetected,
     };
@@ -1184,13 +1208,25 @@ pub const DecryptOaepError = error{ DecryptionError, BufferTooSmall };
 ///
 /// Uses a single `Hash` for both the label digest (`lHash`) and MGF1; a thin
 /// wrapper over `decryptOaepH` with `LabelHash == MgfHash == Hash`.
-pub fn decryptOaep(sk: SecretKey, comptime Hash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
+pub fn decryptOaep(sk: *const SecretKey, comptime Hash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
+    const r = decryptOaepUnburned(sk, Hash, ct, label, out);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn decryptOaepUnburned(sk: *const SecretKey, comptime Hash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
     return decryptOaepHBlinded(sk, Hash, Hash, .none, ct, label, out);
 }
 
 /// `decryptOaep` with an explicit F2 base-blinding choice. The recovered
 /// plaintext and every error are identical either way.
-pub fn decryptOaepBlinded(sk: SecretKey, comptime Hash: type, blinding: Blinding, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
+pub fn decryptOaepBlinded(sk: *const SecretKey, comptime Hash: type, blinding: Blinding, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
+    const r = decryptOaepBlindedUnburned(sk, Hash, blinding, ct, label, out);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn decryptOaepBlindedUnburned(sk: *const SecretKey, comptime Hash: type, blinding: Blinding, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
     return decryptOaepHBlinded(sk, Hash, Hash, blinding, ct, label, out);
 }
 
@@ -1202,13 +1238,25 @@ pub fn decryptOaepBlinded(sk: SecretKey, comptime Hash: type, blinding: Blinding
 /// same constant-time / single-generic-error posture as `decryptOaep` applies
 /// (all padding-decode failures collapse to `error.DecryptionError`), F2 base
 /// blinding **OFF** included — `decryptOaepHBlinded` is the opt-in.
-pub fn decryptOaepH(sk: SecretKey, comptime LabelHash: type, comptime MgfHash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
+pub fn decryptOaepH(sk: *const SecretKey, comptime LabelHash: type, comptime MgfHash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
+    const r = decryptOaepHUnburned(sk, LabelHash, MgfHash, ct, label, out);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn decryptOaepHUnburned(sk: *const SecretKey, comptime LabelHash: type, comptime MgfHash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
     return decryptOaepHBlinded(sk, LabelHash, MgfHash, .none, ct, label, out);
 }
 
 /// `decryptOaepH` with an explicit F2 base-blinding choice — the one entry
 /// point through which every other OAEP-decrypt path reaches the private op.
-pub fn decryptOaepHBlinded(sk: SecretKey, comptime LabelHash: type, comptime MgfHash: type, blinding: Blinding, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
+pub fn decryptOaepHBlinded(sk: *const SecretKey, comptime LabelHash: type, comptime MgfHash: type, blinding: Blinding, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
+    const r = decryptOaepHBlindedUnburned(sk, LabelHash, MgfHash, blinding, ct, label, out);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn decryptOaepHBlindedUnburned(sk: *const SecretKey, comptime LabelHash: type, comptime MgfHash: type, blinding: Blinding, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
     const h_len = LabelHash.digest_length;
     const k = byteLen(sk.n.bits());
     // §7.1.2 step 1: ciphertext must be exactly k octets and k >= 2 hLen + 2.
@@ -1225,7 +1273,7 @@ pub fn decryptOaepHBlinded(sk: SecretKey, comptime LabelHash: type, comptime Mgf
     // entry points, `.csprng` when they opted in. The F3 fault check runs
     // either way, and a fault maps to the same generic DecryptionError (no
     // oracle), as does a blinded run.
-    privateOpCrt(sk, ct, em, blinding) catch return error.DecryptionError;
+    privateOpCrtPtr(sk, ct, em, blinding) catch return error.DecryptionError;
 
     // step 3: EME-OAEP decode, branch-free. EM = Y || maskedSeed || maskedDB.
     // hLen is the label hash length; MGF1 uses `MgfHash`.
@@ -1327,7 +1375,23 @@ pub const OaepUnwrapResult = struct {
 /// at least `k` bytes (the modulus byte length); `out` at least `want`
 /// bytes.
 pub fn decryptOaepHNoFail(
-    sk: SecretKey,
+    sk: *const SecretKey,
+    comptime LabelHash: type,
+    comptime MgfHash: type,
+    blinding: Blinding,
+    ct: []const u8,
+    label: []const u8,
+    want: usize,
+    out: []u8,
+    raw_out: []u8,
+) DecryptOaepError!OaepUnwrapResult {
+    const r = decryptOaepHNoFailUnburned(sk, LabelHash, MgfHash, blinding, ct, label, want, out, raw_out);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn decryptOaepHNoFailUnburned(
+    sk: *const SecretKey,
     comptime LabelHash: type,
     comptime MgfHash: type,
     blinding: Blinding,
@@ -1353,7 +1417,7 @@ pub fn decryptOaepHNoFail(
     const em = em_buf[0..k];
     // c >= n is public (the ciphertext is public), same reasoning as
     // `decryptOaepHBlinded`'s identical early return.
-    privateOpCrt(sk, ct, em, blinding) catch return error.DecryptionError;
+    privateOpCrtPtr(sk, ct, em, blinding) catch return error.DecryptionError;
     // Preserve the raw block past this function's own `defer`-scheduled
     // zeroing, for the caller's decoy derivation.
     @memcpy(raw_out[0..k], em);
@@ -1464,7 +1528,13 @@ pub const SignPssError = EmsaEncodeError || error{ BufferTooSmall, FaultDetected
 /// `salt_len == 0`). `random` MUST be cryptographically secure. `out` must be at least as
 /// long as the modulus (`sk.n` byte length); returns the written
 /// (modulus-length) signature subslice.
-pub fn signPss(sk: SecretKey, comptime Hash: type, random: std.Random, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
+pub fn signPss(sk: *const SecretKey, comptime Hash: type, random: std.Random, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
+    const r = signPssUnburned(sk, Hash, random, msg, salt_len, out);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn signPssUnburned(sk: *const SecretKey, comptime Hash: type, random: std.Random, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
     const k = byteLen(sk.n.bits());
     if (out.len < k) return error.BufferTooSmall;
     const em_bits = sk.n.bits() - 1;
@@ -1490,7 +1560,7 @@ pub fn signPss(sk: SecretKey, comptime Hash: type, random: std.Random, msg: []co
     // cleared the top bits), so the primitive's range check cannot fail.
     // `random` also drives F2 base blinding inside the CRT op; a Bellcore
     // fault (F3) is surfaced, never signed over.
-    privateOpCrt(sk, em_buf[0..k], out[0..k], .{ .csprng = random }) catch |err| switch (err) {
+    privateOpCrtPtr(sk, em_buf[0..k], out[0..k], .{ .csprng = random }) catch |err| switch (err) {
         error.MessageRepresentativeOutOfRange => unreachable,
         error.FaultDetected => return error.FaultDetected,
     };
@@ -1694,7 +1764,7 @@ fn secretKeyFromPkcs1Impl(bytes: []const u8) !SecretKey {
 
     // n/d/dP/dQ/qInv are on-the-wire CRT bookkeeping `fromPrimes` re-derives
     // and cross-checks itself (see its doc comment) — only p, q, e feed it.
-    return SecretKey.fromPrimes(derView(bytes, p), derView(bytes, q), derView(bytes, e)) catch error.InvalidPrivateKey;
+    return SecretKey.fromPrimesValue(derView(bytes, p), derView(bytes, q), derView(bytes, e)) catch error.InvalidPrivateKey;
 }
 
 pub const FromPkcs8Error = error{ InvalidDer, InvalidPrivateKey };
@@ -1705,7 +1775,20 @@ pub const FromPkcs8Error = error{ InvalidDer, InvalidPrivateKey };
 /// (`ENCRYPTED PRIVATE KEY` in PEM) is a distinct ASN.1 structure entirely
 /// and out of scope (passphrase-protected keys are supported in the OpenSSH
 /// format instead, via `fromOpenSSH`).
-pub fn fromPkcs8(bytes: []const u8) FromPkcs8Error!SecretKey {
+pub fn fromPkcs8(out: *SecretKey, bytes: []const u8) FromPkcs8Error!void {
+    const r = fromPkcs8Unburned(out, bytes);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn fromPkcs8Unburned(out: *SecretKey, bytes: []const u8) FromPkcs8Error!void {
+    out.* = fromPkcs8Value(bytes) catch |err| {
+        std.crypto.secureZero(u8, std.mem.asBytes(out));
+        return err;
+    };
+}
+
+fn fromPkcs8Value(bytes: []const u8) FromPkcs8Error!SecretKey {
     return fromPkcs8Impl(bytes) catch |err| switch (err) {
         error.InvalidPrivateKey => error.InvalidPrivateKey,
         else => error.InvalidDer,
@@ -1889,7 +1972,20 @@ const OpensshCipher = enum {
 /// only `p`, `q`, `e` are taken from the file — `n`/`d`/CRT values are
 /// re-derived by `SecretKey.fromPrimes` (the on-disk `n` is then required
 /// to match the derived one as an integrity cross-check).
-pub fn fromOpenSSH(text: []const u8, passphrase: []const u8) FromOpenSSHError!SecretKey {
+pub fn fromOpenSSH(out: *SecretKey, text: []const u8, passphrase: []const u8) FromOpenSSHError!void {
+    const r = fromOpenSSHUnburned(out, text, passphrase);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn fromOpenSSHUnburned(out: *SecretKey, text: []const u8, passphrase: []const u8) FromOpenSSHError!void {
+    out.* = fromOpenSSHValue(text, passphrase) catch |err| {
+        std.crypto.secureZero(u8, std.mem.asBytes(out));
+        return err;
+    };
+}
+
+fn fromOpenSSHValue(text: []const u8, passphrase: []const u8) FromOpenSSHError!SecretKey {
     const block = pemDecodeBody(text) catch |err| return switch (err) {
         error.MissingPemBlock => error.MissingPemBlock,
         else => error.InvalidPem,
@@ -2012,7 +2108,9 @@ fn parsePrivateSection(section: []const u8, cipher: OpensshCipher, encrypted: bo
         if (b != i + 1) return error.InvalidOpenSSH;
     }
 
-    const sk = SecretKey.fromPrimes(
+    var sk: SecretKey = undefined;
+    SecretKey.fromPrimes(
+        &sk,
         stripLeadingZeros(p_wire),
         stripLeadingZeros(q_wire),
         stripLeadingZeros(e_wire),
@@ -2190,7 +2288,20 @@ pub const GenerateError = error{
 /// generator is acceptable only for tests. `bits` must be even, between 512
 /// and `max_modulus_bits`; expect roughly quadratic slowdown as `bits`
 /// grows (2048+ is noticeably slow in Debug builds).
-pub fn generate(random: std.Random, bits: usize, e: u64) GenerateError!KeyPair {
+pub fn generate(out: *KeyPair, random: std.Random, bits: usize, e: u64) GenerateError!void {
+    const r = generateUnburned(out, random, bits, e);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn generateUnburned(out: *KeyPair, random: std.Random, bits: usize, e: u64) GenerateError!void {
+    out.* = generateValue(random, bits, e) catch |err| {
+        std.crypto.secureZero(u8, std.mem.asBytes(out));
+        return err;
+    };
+}
+
+fn generateValue(random: std.Random, bits: usize, e: u64) GenerateError!KeyPair {
     if (bits < min_modulus_bits or bits > max_modulus_bits or bits % 2 != 0) return error.InvalidBits;
     if (e < 3 or e & 1 == 0 or e > std.math.maxInt(u32)) return error.InvalidExponent;
 
@@ -2219,7 +2330,8 @@ pub fn generate(random: std.Random, bits: usize, e: u64) GenerateError!KeyPair {
         // positive slipped through (probability <= 2^-128 per prime) and
         // tripped its qInv self-check — restart the search instead of
         // surfacing an error for an input the caller never chose.
-        const sk = SecretKey.fromPrimes(p_bytes, q_bytes, &e_bytes) catch continue;
+        var sk: SecretKey = undefined;
+        SecretKey.fromPrimes(&sk, p_bytes, q_bytes, &e_bytes) catch continue;
 
         // Both primes have their top two bits set, so
         // n >= (3·2^(half-2))^2 = 9·2^(bits-4) > 2^(bits-1): exactly `bits`
@@ -2606,7 +2718,7 @@ pub fn selfSignedCert(
     // unreachable in practice but stays in `SelfSignedCertError` for type
     // honesty (it is `signPkcs1v15`'s real error set).
     var sig_buf: [max_modulus_len]u8 = undefined;
-    const sig = try signPkcs1v15(sk, Hash, tbs_certificate, &sig_buf);
+    const sig = try signPkcs1v15(&sk, Hash, tbs_certificate, &sig_buf);
 
     const cert = try d.seq(&.{
         tbs_certificate,
@@ -2622,6 +2734,7 @@ pub fn selfSignedCert(
 // is referenced from a `test { _ = ...; }` block here.
 test {
     _ = openssh;
+    _ = @import("stackprobe_test.zig");
 }
 
 //
@@ -2656,6 +2769,10 @@ test {
 
 const testing = std.testing;
 
+/// Destination for the error-path tests of the out-param constructors.
+var test_sk_out: SecretKey = undefined;
+var test_kp_out: KeyPair = undefined;
+
 fn hexLit(comptime hex: []const u8) [hex.len / 2]u8 {
     comptime {
         @setEvalBranchQuota(100_000);
@@ -2681,7 +2798,7 @@ const kat2048 = struct {
     const sig_sha512 = hexLit("96157c8091612c24c99acc6f1cc0d91146e91c6a65940c6657bde957c600b23ec232eeda4f9a5e837770c430b1d8b372a0f093f5375983eb8655c5ca63f5229b981af95fea37c9d35e9400eb91d501adb877fad6ddf4f4dbd8576a137cd97c445a3602a1c8238e1f3ca43bfb65a5acb33c506befc6f6927135c130cc1f618bf9be056b6dd0e8a8c7fb8988fcee35ed11107ed85a462f71d7b12c94caf820e2189f770f5e6b8a2b160e0929ee753cfa1a3c4072603ca79803a571257d8ed72eba50a96c38bf4ed5f3d30bd703502a1c3915029fb35a2dcf8ffd1b78945a5bfa7de8bfc057578fd569487ba97d73c248ac5f9511e0a924556720d9db99915d79a4");
 
     fn secretKey() !SecretKey {
-        return SecretKey.fromPrimes(&p, &q, &e);
+        return SecretKey.fromPrimesValue(&p, &q, &e);
     }
 
     fn publicKey() !PublicKey {
@@ -2699,7 +2816,8 @@ const kat512 = struct {
 };
 
 test "fromPrimes derives textbook parameters (p=61, q=53, e=17)" {
-    const sk = try SecretKey.fromPrimes(&.{61}, &.{53}, &.{17});
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk, &.{61}, &.{53}, &.{17});
     try testing.expectEqual(3233, try sk.n.v.toPrimitive(u32));
     try testing.expectEqual(413, try sk.d.toPrimitive(u32)); // e⁻¹ mod λ = e⁻¹ mod 780
     try testing.expectEqual(53, try sk.dp.toPrimitive(u32)); // 413 mod 60
@@ -2711,18 +2829,19 @@ test "fromPrimes derives textbook parameters (p=61, q=53, e=17)" {
 
 test "fromPrimes rejects invalid inputs" {
     // p == q
-    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&.{61}, &.{61}, &.{17}));
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&test_sk_out, &.{61}, &.{61}, &.{17}));
     // even e / e < 3
-    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&.{61}, &.{53}, &.{16}));
-    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&.{61}, &.{53}, &.{1}));
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&test_sk_out, &.{61}, &.{53}, &.{16}));
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&test_sk_out, &.{61}, &.{53}, &.{1}));
     // gcd(e, λ) != 1: λ(61·53) = 780 = 2²·3·5·13 -> e = 13 shares a factor
-    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&.{61}, &.{53}, &.{13}));
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&test_sk_out, &.{61}, &.{53}, &.{13}));
     // even "prime"
-    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&.{62}, &.{53}, &.{17}));
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&test_sk_out, &.{62}, &.{53}, &.{17}));
 }
 
 test "SecretKey.deinit zeroes all key material (audit F4)" {
-    var sk = try SecretKey.fromPrimes(&.{61}, &.{53}, &.{17});
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk, &.{61}, &.{53}, &.{17});
     const bytes = std.mem.asBytes(&sk);
     var any_nonzero = false;
     for (bytes) |b| {
@@ -2734,31 +2853,33 @@ test "SecretKey.deinit zeroes all key material (audit F4)" {
 }
 
 test "rsaep/rsadp/rsadpCrt textbook KAT and round-trip" {
-    const sk = try SecretKey.fromPrimes(&.{61}, &.{53}, &.{17});
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk, &.{61}, &.{53}, &.{17});
     const pk = PublicKey{ .n = sk.n, .e = try Fe.fromPrimitive(u32, sk.n, 17), .n_mont = sk.n_mont };
 
     // 65^17 mod 3233 = 2790 (0x0ae6)
     const c = try rsaep(2, .{ 0x00, 0x41 }, pk);
     try testing.expectEqualSlices(u8, &.{ 0x0a, 0xe6 }, &c);
 
-    const m_plain = try rsadp(2, c, sk);
-    const m_crt = try rsadpCrt(2, c, sk);
+    const m_plain = try rsadp(2, c, &sk);
+    const m_crt = try rsadpCrt(2, c, &sk);
     try testing.expectEqualSlices(u8, &.{ 0x00, 0x41 }, &m_plain);
     try testing.expectEqualSlices(u8, &m_plain, &m_crt);
 
     // rsavp1/rsasp1 are the same math with the RFC's signature naming.
-    const s = try rsasp1(2, .{ 0x00, 0x41 }, sk);
+    const s = try rsasp1(2, .{ 0x00, 0x41 }, &sk);
     const v = try rsavp1(2, s, pk);
     try testing.expectEqualSlices(u8, &.{ 0x00, 0x41 }, &v);
 }
 
 test "primitives reject representative >= n" {
-    const sk = try SecretKey.fromPrimes(&.{61}, &.{53}, &.{17});
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk, &.{61}, &.{53}, &.{17});
     const pk = PublicKey{ .n = sk.n, .e = try Fe.fromPrimitive(u32, sk.n, 17), .n_mont = sk.n_mont };
     // n = 3233 = 0x0ca1
     try testing.expectError(error.MessageRepresentativeOutOfRange, rsaep(2, .{ 0x0c, 0xa1 }, pk));
-    try testing.expectError(error.MessageRepresentativeOutOfRange, rsadp(2, .{ 0xff, 0xff }, sk));
-    try testing.expectError(error.MessageRepresentativeOutOfRange, rsadpCrt(2, .{ 0x0c, 0xa1 }, sk));
+    try testing.expectError(error.MessageRepresentativeOutOfRange, rsadp(2, .{ 0xff, 0xff }, &sk));
+    try testing.expectError(error.MessageRepresentativeOutOfRange, rsadpCrt(2, .{ 0x0c, 0xa1 }, &sk));
 }
 
 test "fromPrimes reproduces the OpenSSL 2048-bit key exactly" {
@@ -2786,13 +2907,13 @@ test "signPkcs1v15 matches OpenSSL known answers (SHA-256/384/512)" {
     const sha2 = std.crypto.hash.sha2;
     var out: [max_modulus_len]u8 = undefined;
 
-    const s256 = try signPkcs1v15(sk, sha2.Sha256, kat2048.msg, &out);
+    const s256 = try signPkcs1v15(&sk, sha2.Sha256, kat2048.msg, &out);
     try testing.expectEqualSlices(u8, &kat2048.sig_sha256, s256);
 
-    const s384 = try signPkcs1v15(sk, sha2.Sha384, kat2048.msg, &out);
+    const s384 = try signPkcs1v15(&sk, sha2.Sha384, kat2048.msg, &out);
     try testing.expectEqualSlices(u8, &kat2048.sig_sha384, s384);
 
-    const s512 = try signPkcs1v15(sk, sha2.Sha512, kat2048.msg, &out);
+    const s512 = try signPkcs1v15(&sk, sha2.Sha512, kat2048.msg, &out);
     try testing.expectEqualSlices(u8, &kat2048.sig_sha512, s512);
 }
 
@@ -2839,19 +2960,19 @@ test "sign/verify round-trip on fresh messages, incl. SHA-1/SHA-224" {
         std.crypto.hash.sha2.Sha256,
         std.crypto.hash.sha2.Sha512,
     }) |Hash| {
-        const sig = try signPkcs1v15(sk, Hash, "fresh round-trip message", &out);
+        const sig = try signPkcs1v15(&sk, Hash, "fresh round-trip message", &out);
         try verifyPkcs1v15(pk, Hash, "fresh round-trip message", sig);
         try testing.expectError(error.SignatureVerificationFailed, verifyPkcs1v15(pk, Hash, "some other message", sig));
     }
 
     var small: [64]u8 = undefined;
-    try testing.expectError(error.BufferTooSmall, signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, "m", &small));
+    try testing.expectError(error.BufferTooSmall, signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, "m", &small));
 }
 
 test "std.crypto.Certificate.rsa verifies our signature (oracle cross-check)" {
     const sk = try kat2048.secretKey();
     var out: [max_modulus_len]u8 = undefined;
-    const sig = try signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, kat2048.msg, &out);
+    const sig = try signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, kat2048.msg, &out);
 
     const std_rsa = std.crypto.Certificate.rsa;
     const std_pk = try std_rsa.PublicKey.fromBytes(&kat2048.e, &kat2048.n);
@@ -2867,8 +2988,8 @@ test "rsadpCrt equals rsadp on the 2048-bit key" {
     m[0] = 0; // keep the representative < n
 
     const c = try rsaep(256, m, pk);
-    const via_plain = try rsadp(256, c, sk);
-    const via_crt = try rsadpCrt(256, c, sk);
+    const via_plain = try rsadp(256, c, &sk);
+    const via_crt = try rsadpCrt(256, c, &sk);
     try testing.expectEqualSlices(u8, &m, &via_plain);
     try testing.expectEqualSlices(u8, &via_plain, &via_crt);
 }
@@ -2878,7 +2999,8 @@ test "rsadpCrt equals rsadp on the 2048-bit key" {
 // encryption check, so the op must return `error.FaultDetected` instead of the
 // factoring-oracle value. RED if the F3 check is removed from `privateOpCrt`.
 test "privateOpCrt Bellcore check rejects a faulted CRT half (audit F3)" {
-    var sk = try SecretKey.fromPrimes(&kat512.p, &kat512.q, &kat512.e);
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk, &kat512.p, &kat512.q, &kat512.e);
     const k = byteLen(sk.n.bits());
 
     // A representative safely < n (top byte zero).
@@ -2888,16 +3010,16 @@ test "privateOpCrt Bellcore check rejects a faulted CRT half (audit F3)" {
 
     var out: [max_modulus_len]u8 = undefined;
     // Baseline: the intact key produces a value and passes the check.
-    try privateOpCrt(sk, msg[0..k], out[0..k], .none);
+    try privateOpCrtPtr(&sk, msg[0..k], out[0..k], .none);
 
     // Inject a persistent single-half fault: dP <- dP + 1 (mod p). Now
     // m1 = c^(dP+1) mod p is wrong, so the recombined m ≢ c^d and m^e ≢ c.
     sk.dp = sk.p.add(sk.dp, sk.p.one());
-    try testing.expectError(error.FaultDetected, privateOpCrt(sk, msg[0..k], out[0..k], .none));
+    try testing.expectError(error.FaultDetected, privateOpCrtPtr(&sk, msg[0..k], out[0..k], .none));
 
     // Same rejection on the blinded path (blinding must not mask a real fault).
     var prng = std.Random.DefaultPrng.init(0xfa17_1717_c0de_0003);
-    try testing.expectError(error.FaultDetected, privateOpCrt(sk, msg[0..k], out[0..k], .{ .csprng = prng.random() }));
+    try testing.expectError(error.FaultDetected, privateOpCrtPtr(&sk, msg[0..k], out[0..k], .{ .csprng = prng.random() }));
 }
 
 // A faulted key also fails at the public sign entry points (fault propagates as
@@ -2906,7 +3028,7 @@ test "signPkcs1v15 surfaces a CRT fault as error.FaultDetected (audit F3)" {
     var sk = try kat2048.secretKey();
     sk.dq = sk.q.add(sk.dq, sk.q.one()); // fault the other CRT half this time
     var out: [max_modulus_len]u8 = undefined;
-    try testing.expectError(error.FaultDetected, signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, "faulted", &out));
+    try testing.expectError(error.FaultDetected, signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, "faulted", &out));
 }
 
 // audit F2 — CRT base blinding. The blinded op (rng supplied) must round-trip to
@@ -2918,7 +3040,8 @@ test "CRT base blinding round-trips and matches the unblinded result (audit F2)"
     var prng = std.Random.DefaultPrng.init(0xb11d_0000_5eed_0002);
     const random = prng.random();
 
-    const sk512 = try SecretKey.fromPrimes(&kat512.p, &kat512.q, &kat512.e);
+    var sk512: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk512, &kat512.p, &kat512.q, &kat512.e);
     const sk2048 = try kat2048.secretKey();
     for ([_]SecretKey{ sk512, sk2048 }) |sk| {
         const k = byteLen(sk.n.bits());
@@ -2929,9 +3052,9 @@ test "CRT base blinding round-trips and matches the unblinded result (audit F2)"
         var out_plain: [max_modulus_len]u8 = undefined;
         var out_blind1: [max_modulus_len]u8 = undefined;
         var out_blind2: [max_modulus_len]u8 = undefined;
-        try privateOpCrt(sk, msg[0..k], out_plain[0..k], .none);
-        try privateOpCrt(sk, msg[0..k], out_blind1[0..k], .{ .csprng = random });
-        try privateOpCrt(sk, msg[0..k], out_blind2[0..k], .{ .csprng = random });
+        try privateOpCrtPtr(&sk, msg[0..k], out_plain[0..k], .none);
+        try privateOpCrtPtr(&sk, msg[0..k], out_blind1[0..k], .{ .csprng = random });
+        try privateOpCrtPtr(&sk, msg[0..k], out_blind2[0..k], .{ .csprng = random });
         // Blinding with two independent random r's yields the same plaintext.
         try testing.expectEqualSlices(u8, out_plain[0..k], out_blind1[0..k]);
         try testing.expectEqualSlices(u8, out_plain[0..k], out_blind2[0..k]);
@@ -2996,8 +3119,8 @@ test "the blinded twins reach makeBlinding from the PUBLIC API, and produce iden
 
     var plain_unblinded: [max_modulus_len]u8 = undefined;
     var plain_blinded: [max_modulus_len]u8 = undefined;
-    const got_unblinded = try decryptOaep(sk, Sha256, ct_slice, "", &plain_unblinded);
-    const got_blinded = try decryptOaepBlinded(sk, Sha256, .{ .csprng = used.random() }, ct_slice, "", &plain_blinded);
+    const got_unblinded = try decryptOaep(&sk, Sha256, ct_slice, "", &plain_unblinded);
+    const got_blinded = try decryptOaepBlinded(&sk, Sha256, .{ .csprng = used.random() }, ct_slice, "", &plain_blinded);
     try testing.expectEqualSlices(u8, secret, got_unblinded);
     try testing.expectEqualSlices(u8, secret, got_blinded);
     try drawnFrom(&used, &untouched);
@@ -3005,7 +3128,7 @@ test "the blinded twins reach makeBlinding from the PUBLIC API, and produce iden
     // The decoupled-hash twin is the one every other OAEP path funnels
     // through, so it gets its own case rather than riding on the wrapper.
     used = std.Random.DefaultPrng.init(seed);
-    const got_h = try decryptOaepHBlinded(sk, Sha256, Sha256, .{ .csprng = used.random() }, ct_slice, "", &plain_blinded);
+    const got_h = try decryptOaepHBlinded(&sk, Sha256, Sha256, .{ .csprng = used.random() }, ct_slice, "", &plain_blinded);
     try testing.expectEqualSlices(u8, secret, got_h);
     try drawnFrom(&used, &untouched);
 
@@ -3014,7 +3137,7 @@ test "the blinded twins reach makeBlinding from the PUBLIC API, and produce iden
     var bad: [max_modulus_len]u8 = undefined;
     @memcpy(bad[0..k], ct_slice);
     bad[k - 1] ^= 0x01;
-    try testing.expectError(error.DecryptionError, decryptOaepBlinded(sk, Sha256, .{ .csprng = used.random() }, bad[0..k], "", &plain_blinded));
+    try testing.expectError(error.DecryptionError, decryptOaepBlinded(&sk, Sha256, .{ .csprng = used.random() }, bad[0..k], "", &plain_blinded));
 
     // (2) PKCS#1 v1.5 signing — deterministic by definition, so the emitted
     // signature must be byte-identical with the masking on. It is also the
@@ -3022,8 +3145,8 @@ test "the blinded twins reach makeBlinding from the PUBLIC API, and produce iden
     used = std.Random.DefaultPrng.init(seed);
     var sig_plain: [max_modulus_len]u8 = undefined;
     var sig_blind: [max_modulus_len]u8 = undefined;
-    const s_plain = try signPkcs1v15(sk, Sha256, kat2048.msg, &sig_plain);
-    const s_blind = try signPkcs1v15Blinded(sk, Sha256, .{ .csprng = used.random() }, kat2048.msg, &sig_blind);
+    const s_plain = try signPkcs1v15(&sk, Sha256, kat2048.msg, &sig_plain);
+    const s_blind = try signPkcs1v15Blinded(&sk, Sha256, .{ .csprng = used.random() }, kat2048.msg, &sig_blind);
     try testing.expectEqualSlices(u8, &kat2048.sig_sha256, s_plain);
     try testing.expectEqualSlices(u8, s_plain, s_blind);
     try drawnFrom(&used, &untouched);
@@ -3032,8 +3155,8 @@ test "the blinded twins reach makeBlinding from the PUBLIC API, and produce iden
     used = std.Random.DefaultPrng.init(seed);
     var c_fixed: [256]u8 = @splat(0);
     c_fixed[255] = 0x2a;
-    const m_plain = try rsadpCrt(256, c_fixed, sk);
-    const m_blind = try rsadpCrtBlinded(256, c_fixed, sk, .{ .csprng = used.random() });
+    const m_plain = try rsadpCrt(256, c_fixed, &sk);
+    const m_blind = try rsadpCrtBlinded(256, c_fixed, &sk, .{ .csprng = used.random() });
     try testing.expectEqualSlices(u8, &m_plain, &m_blind);
     try drawnFrom(&used, &untouched);
 }
@@ -3081,7 +3204,7 @@ test "widening path: 2048-bit key through max_modulus_len primitives (writeMontR
     // Sign at max width (rsasp1 -> CRT private op) then verify at max width
     // (rsavp1 -> publicOp -> writeMontResult, the exact crash site): the
     // round-trip m -> s^d -> s^e must recover the original representative.
-    const s_wide = try rsasp1(max_modulus_len, m_wide, sk);
+    const s_wide = try rsasp1(max_modulus_len, m_wide, &sk);
     // High bytes above the modulus width must be zero (big-endian left pad).
     try testing.expect(std.mem.allEqual(u8, s_wide[0 .. max_modulus_len - k], 0));
     const back = try rsavp1(max_modulus_len, s_wide, pk);
@@ -3090,25 +3213,26 @@ test "widening path: 2048-bit key through max_modulus_len primitives (writeMontR
 
     // Cross-check: signing at the key's NATURAL width yields the identical
     // low-k bytes — the max-width path only prepends leading zeros.
-    const s_narrow = try rsasp1(k, m_wide[max_modulus_len - k ..].*, sk);
+    const s_narrow = try rsasp1(k, m_wide[max_modulus_len - k ..].*, &sk);
     try testing.expectEqualSlices(u8, s_wide[max_modulus_len - k ..], &s_narrow);
     // And rsaep at max width round-trips through rsadp (public/private widen).
     const c_wide = try rsaep(max_modulus_len, m_wide, pk);
-    const dec = try rsadp(max_modulus_len, c_wide, sk);
+    const dec = try rsadp(max_modulus_len, c_wide, &sk);
     try testing.expectEqualSlices(u8, &m_wide, &dec);
 }
 
 test "512-bit key: SHA-256 round-trips, SHA-512 encoding is too short" {
-    const sk = try SecretKey.fromPrimes(&kat512.p, &kat512.q, &kat512.e);
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk, &kat512.p, &kat512.q, &kat512.e);
     const pk = try PublicKey.fromBytes(&kat512.n, &kat512.e);
     var out: [max_modulus_len]u8 = undefined;
 
-    const sig = try signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, "small key", &out);
+    const sig = try signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, "small key", &out);
     try testing.expectEqual(64, sig.len);
     try verifyPkcs1v15(pk, std.crypto.hash.sha2.Sha256, "small key", sig);
 
     // k = 64 < tLen(SHA-512) + 11 = 94 -> RFC 8017 §9.2 step 3.
-    try testing.expectError(error.EncodedMessageTooShort, signPkcs1v15(sk, std.crypto.hash.sha2.Sha512, "small key", &out));
+    try testing.expectError(error.EncodedMessageTooShort, signPkcs1v15(&sk, std.crypto.hash.sha2.Sha512, "small key", &out));
 }
 
 // ── P2 (OAEP) tests ──────────────────────────────────────────────────────────
@@ -3151,13 +3275,13 @@ test "decryptOaep matches OpenSSL known answers (SHA-256, SHA-1, labeled)" {
     const sha2 = std.crypto.hash.sha2;
     var out: [max_modulus_len]u8 = undefined;
 
-    const m256 = try decryptOaep(sk, sha2.Sha256, &kat2048_oaep.ct_sha256, "", &out);
+    const m256 = try decryptOaep(&sk, sha2.Sha256, &kat2048_oaep.ct_sha256, "", &out);
     try testing.expectEqualStrings(kat2048_oaep.msg, m256);
 
-    const m1 = try decryptOaep(sk, std.crypto.hash.Sha1, &kat2048_oaep.ct_sha1, "", &out);
+    const m1 = try decryptOaep(&sk, std.crypto.hash.Sha1, &kat2048_oaep.ct_sha1, "", &out);
     try testing.expectEqualStrings(kat2048_oaep.msg, m1);
 
-    const mlab = try decryptOaep(sk, sha2.Sha256, &kat2048_oaep.ct_sha256_label, kat2048_oaep.label, &out);
+    const mlab = try decryptOaep(&sk, sha2.Sha256, &kat2048_oaep.ct_sha256_label, kat2048_oaep.label, &out);
     try testing.expectEqualStrings(kat2048_oaep.msg, mlab);
 }
 
@@ -3168,7 +3292,7 @@ test "decryptOaepHNoFail: valid ciphertext -> ok=true, matches decryptOaep's KAT
     var raw: [max_modulus_len]u8 = undefined;
 
     const want = kat2048_oaep.msg.len;
-    const r = try decryptOaepHNoFail(sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", want, &out, &raw);
+    const r = try decryptOaepHNoFail(&sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", want, &out, &raw);
     try testing.expect(r.ok);
     try testing.expectEqualStrings(kat2048_oaep.msg, r.msg);
     try testing.expectEqual(@as(usize, 256), r.raw.len); // k for the 2048-bit key
@@ -3186,7 +3310,7 @@ test "decryptOaepHNoFail: padding failure -> ok=false, no error, raw still popul
     // erroring.
     var corrupt = kat2048_oaep.ct_sha256;
     corrupt[100] ^= 0x01;
-    const r = try decryptOaepHNoFail(sk, sha2.Sha256, sha2.Sha256, .none, &corrupt, "", kat2048_oaep.msg.len, &out, &raw);
+    const r = try decryptOaepHNoFail(&sk, sha2.Sha256, sha2.Sha256, .none, &corrupt, "", kat2048_oaep.msg.len, &out, &raw);
     try testing.expect(!r.ok);
     try testing.expectEqual(@as(usize, 0), r.msg.len);
     // `raw` is populated either way -- it is the caller's decoy-derivation
@@ -3194,7 +3318,7 @@ test "decryptOaepHNoFail: padding failure -> ok=false, no error, raw still popul
     try testing.expect(!std.mem.allEqual(u8, r.raw, 0));
 
     // Wrong label: same padding-failure shape, same non-error contract.
-    const r2 = try decryptOaepHNoFail(sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "wrong-label", kat2048_oaep.msg.len, &out, &raw);
+    const r2 = try decryptOaepHNoFail(&sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "wrong-label", kat2048_oaep.msg.len, &out, &raw);
     try testing.expect(!r2.ok);
 }
 
@@ -3209,14 +3333,14 @@ test "decryptOaepHNoFail: want-length mismatch is folded into validity, not a se
     var out: [max_modulus_len]u8 = undefined;
     var raw: [max_modulus_len]u8 = undefined;
 
-    const r = try decryptOaepHNoFail(sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", kat2048_oaep.msg.len + 1, &out, &raw);
+    const r = try decryptOaepHNoFail(&sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", kat2048_oaep.msg.len + 1, &out, &raw);
     try testing.expect(!r.ok);
 
-    const r2 = try decryptOaepHNoFail(sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", kat2048_oaep.msg.len - 1, &out, &raw);
+    const r2 = try decryptOaepHNoFail(&sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", kat2048_oaep.msg.len - 1, &out, &raw);
     try testing.expect(!r2.ok);
 
     // The exact length still succeeds (sanity: this isn't just "always false").
-    const r3 = try decryptOaepHNoFail(sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", kat2048_oaep.msg.len, &out, &raw);
+    const r3 = try decryptOaepHNoFail(&sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", kat2048_oaep.msg.len, &out, &raw);
     try testing.expect(r3.ok);
 }
 
@@ -3233,7 +3357,7 @@ test "decryptOaepHNoFail: decoupled hash (LabelHash != MgfHash) round-trips too"
 
     const msg = "decoupled hash, no-fail variant";
     const c = try encryptOaepH(pk, Sha256, Sha1, random, msg, "xmlenc-label", &ct);
-    const r = try decryptOaepHNoFail(sk, Sha256, Sha1, .none, c, "xmlenc-label", msg.len, &out, &raw);
+    const r = try decryptOaepHNoFail(&sk, Sha256, Sha1, .none, c, "xmlenc-label", msg.len, &out, &raw);
     try testing.expect(r.ok);
     try testing.expectEqualStrings(msg, r.msg);
 }
@@ -3258,7 +3382,7 @@ test "encryptOaep/decryptOaep round-trip (hashes x labels x message lengths)" {
                 const msg = big_msg[0..msg_len];
                 const c = try encryptOaep(pk, Hash, random, msg, label, &ct);
                 try testing.expectEqual(256, c.len);
-                const m = try decryptOaep(sk, Hash, c, label, &pt);
+                const m = try decryptOaep(&sk, Hash, c, label, &pt);
                 try testing.expectEqualSlices(u8, msg, m);
             }
         }
@@ -3295,25 +3419,25 @@ test "encryptOaepH/decryptOaepH decoupled hash (LabelHash != MgfHash)" {
         for ([_][]const u8{ "", "digest != mgf oaep", "x" }) |msg| {
             const c = try encryptOaepH(pk, Sha256, Sha1, random, msg, label, &ct);
             try testing.expectEqual(256, c.len);
-            const m = try decryptOaepH(sk, Sha256, Sha1, c, label, &pt);
+            const m = try decryptOaepH(&sk, Sha256, Sha1, c, label, &pt);
             try testing.expectEqualSlices(u8, msg, m);
 
             // The mismatched-hash ciphertext is a genuinely different padding:
             // the coupled (equal-hash) decrypt cannot decode it under either
             // the digest hash or the MGF hash.
-            try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, c, label, &pt));
-            try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha1, c, label, &pt));
+            try testing.expectError(error.DecryptionError, decryptOaep(&sk, Sha256, c, label, &pt));
+            try testing.expectError(error.DecryptionError, decryptOaep(&sk, Sha1, c, label, &pt));
         }
     }
 
     // Constant-time posture preserved: a wrong label or a corrupted ciphertext
     // still collapses to the single generic error (never a distinct one).
     const secret = try encryptOaepH(pk, Sha256, Sha1, random, "top secret", "right", &ct);
-    try testing.expectError(error.DecryptionError, decryptOaepH(sk, Sha256, Sha1, secret, "wrong", &pt));
+    try testing.expectError(error.DecryptionError, decryptOaepH(&sk, Sha256, Sha1, secret, "wrong", &pt));
     var corrupt: [256]u8 = undefined;
     @memcpy(&corrupt, secret);
     corrupt[100] ^= 0x40;
-    try testing.expectError(error.DecryptionError, decryptOaepH(sk, Sha256, Sha1, &corrupt, "right", &pt));
+    try testing.expectError(error.DecryptionError, decryptOaepH(&sk, Sha256, Sha1, &corrupt, "right", &pt));
 
     // Wrapper equivalence: with LabelHash == MgfHash and the SAME seed,
     // encryptOaepH is byte-identical to the coupled encryptOaep — the coupled
@@ -3335,27 +3459,27 @@ test "decryptOaep rejects corruption, wrong label/hash, wrong length (one generi
     // Bit-flip anywhere in the ciphertext.
     var bad = kat2048_oaep.ct_sha256;
     bad[0] ^= 0x01;
-    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &bad, "", &out));
+    try testing.expectError(error.DecryptionError, decryptOaep(&sk, Sha256, &bad, "", &out));
     bad = kat2048_oaep.ct_sha256;
     bad[255] ^= 0x80;
-    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &bad, "", &out));
+    try testing.expectError(error.DecryptionError, decryptOaep(&sk, Sha256, &bad, "", &out));
 
     // Label mismatch in both directions — while the same ciphertexts decrypt
     // fine under the correct label (previous test).
-    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &kat2048_oaep.ct_sha256, kat2048_oaep.label, &out));
-    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &kat2048_oaep.ct_sha256_label, "", &out));
+    try testing.expectError(error.DecryptionError, decryptOaep(&sk, Sha256, &kat2048_oaep.ct_sha256, kat2048_oaep.label, &out));
+    try testing.expectError(error.DecryptionError, decryptOaep(&sk, Sha256, &kat2048_oaep.ct_sha256_label, "", &out));
 
     // Wrong hash function.
-    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &kat2048_oaep.ct_sha1, "", &out));
+    try testing.expectError(error.DecryptionError, decryptOaep(&sk, Sha256, &kat2048_oaep.ct_sha1, "", &out));
 
     // Wrong ciphertext length (RFC 8017 §7.1.2 step 1.b).
-    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, kat2048_oaep.ct_sha256[0..255], "", &out));
+    try testing.expectError(error.DecryptionError, decryptOaep(&sk, Sha256, kat2048_oaep.ct_sha256[0..255], "", &out));
     const long_ct = kat2048_oaep.ct_sha256 ++ [_]u8{0};
-    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &long_ct, "", &out));
+    try testing.expectError(error.DecryptionError, decryptOaep(&sk, Sha256, &long_ct, "", &out));
 
     // Undersized output buffer (public-length check, distinct error is fine).
     var small: [189]u8 = undefined; // max mLen for k=256/SHA-256 is 190
-    try testing.expectError(error.BufferTooSmall, decryptOaep(sk, Sha256, &kat2048_oaep.ct_sha256, "", &small));
+    try testing.expectError(error.BufferTooSmall, decryptOaep(&sk, Sha256, &kat2048_oaep.ct_sha256, "", &small));
 }
 
 test "decryptOaep rejects EM with nonzero leading byte (Y != 0x00)" {
@@ -3381,13 +3505,13 @@ test "decryptOaep rejects EM with nonzero leading byte (Y != 0x00)" {
 
     var out: [max_modulus_len]u8 = undefined;
     const ct_bad_y = try rsaep(256, em, pk);
-    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &ct_bad_y, "", &out));
+    try testing.expectError(error.DecryptionError, decryptOaep(&sk, Sha256, &ct_bad_y, "", &out));
 
     // Control: the identical EM with Y = 0x00 decrypts — proving the
     // rejection above was the Y check and nothing else.
     em[0] = 0x00;
     const ct_ok = try rsaep(256, em, pk);
-    try testing.expectEqualStrings("msg", try decryptOaep(sk, Sha256, &ct_ok, "", &out));
+    try testing.expectEqualStrings("msg", try decryptOaep(&sk, Sha256, &ct_ok, "", &out));
 }
 
 test "encryptOaep rejects oversize messages and undersized buffers/keys" {
@@ -3411,11 +3535,12 @@ test "encryptOaep rejects oversize messages and undersized buffers/keys" {
     try testing.expectError(error.MessageTooLong, encryptOaep(pk512, Sha256, random, "", "", &ct));
 
     // SHA-1 on the 512-bit key fits up to 64 - 2*20 - 2 = 22 bytes.
-    const sk512 = try SecretKey.fromPrimes(&kat512.p, &kat512.q, &kat512.e);
+    var sk512: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk512, &kat512.p, &kat512.q, &kat512.e);
     var pt: [max_modulus_len]u8 = undefined;
     const c = try encryptOaep(pk512, std.crypto.hash.Sha1, random, "22-byte msg for sha1..", "", &ct);
     try testing.expectEqual(64, c.len);
-    try testing.expectEqualStrings("22-byte msg for sha1..", try decryptOaep(sk512, std.crypto.hash.Sha1, c, "", &pt));
+    try testing.expectEqualStrings("22-byte msg for sha1..", try decryptOaep(&sk512, std.crypto.hash.Sha1, c, "", &pt));
     try testing.expectError(error.MessageTooLong, encryptOaep(pk512, std.crypto.hash.Sha1, random, "23-byte msg for sha-1..", "", &ct));
 }
 
@@ -3473,7 +3598,7 @@ test "signPss with salt_len = 0 matches the deterministic OpenSSL answer" {
     // against OpenSSL's answer proves the PRNG below is never material.
     var prng = std.Random.DefaultPrng.init(0);
     var out: [max_modulus_len]u8 = undefined;
-    const sig = try signPss(sk, std.crypto.hash.sha2.Sha256, prng.random(), kat2048_pss.msg, 0, &out);
+    const sig = try signPss(&sk, std.crypto.hash.sha2.Sha256, prng.random(), kat2048_pss.msg, 0, &out);
     try testing.expectEqualSlices(u8, &kat2048_pss.sig_sha256_s0, sig);
 }
 
@@ -3490,7 +3615,7 @@ test "signPss/verifyPss round-trip (hashes x salt lengths), 2048-bit key" {
         std.crypto.hash.sha2.Sha512,
     }) |Hash| {
         for ([_]usize{ 0, Hash.digest_length, 20 }) |s_len| {
-            const sig = try signPss(sk, Hash, random, "fresh PSS round-trip message", s_len, &out);
+            const sig = try signPss(&sk, Hash, random, "fresh PSS round-trip message", s_len, &out);
             try testing.expectEqual(256, sig.len);
             try verifyPss(pk, Hash, "fresh PSS round-trip message", sig, s_len);
             try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Hash, "some other message", sig, s_len));
@@ -3500,8 +3625,8 @@ test "signPss/verifyPss round-trip (hashes x salt lengths), 2048-bit key" {
     // PSS with sLen > 0 is randomized: two signatures over the same message
     // differ (fresh salt each call) yet both verify.
     var out2: [max_modulus_len]u8 = undefined;
-    const s1 = try signPss(sk, std.crypto.hash.sha2.Sha256, random, "same message", 32, &out);
-    const s2 = try signPss(sk, std.crypto.hash.sha2.Sha256, random, "same message", 32, &out2);
+    const s1 = try signPss(&sk, std.crypto.hash.sha2.Sha256, random, "same message", 32, &out);
+    const s2 = try signPss(&sk, std.crypto.hash.sha2.Sha256, random, "same message", 32, &out2);
     try testing.expect(!std.mem.eql(u8, s1, s2));
     try verifyPss(pk, std.crypto.hash.sha2.Sha256, "same message", s1, 32);
     try verifyPss(pk, std.crypto.hash.sha2.Sha256, "same message", s2, 32);
@@ -3511,7 +3636,8 @@ test "signPss/verifyPss round-trip on the 512-bit key (top-bit clearing path)" {
     // modBits = 512 -> emBits = 511: emLen == k and exactly one leading bit
     // of maskedDB is cleared/checked, exercising §9.1.1 step 11 / §9.1.2
     // step 6 with a nontrivial mask.
-    const sk = try SecretKey.fromPrimes(&kat512.p, &kat512.q, &kat512.e);
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk, &kat512.p, &kat512.q, &kat512.e);
     const pk = try PublicKey.fromBytes(&kat512.n, &kat512.e);
     var prng = std.Random.DefaultPrng.init(0x353132626974);
     const random = prng.random();
@@ -3519,15 +3645,15 @@ test "signPss/verifyPss round-trip on the 512-bit key (top-bit clearing path)" {
 
     // Max sLen for k=64/SHA-256: emLen - hLen - 2 = 64 - 32 - 2 = 30.
     for ([_]usize{ 0, 20, 30 }) |s_len| {
-        const sig = try signPss(sk, std.crypto.hash.sha2.Sha256, random, "small key", s_len, &out);
+        const sig = try signPss(&sk, std.crypto.hash.sha2.Sha256, random, "small key", s_len, &out);
         try testing.expectEqual(64, sig.len);
         try verifyPss(pk, std.crypto.hash.sha2.Sha256, "small key", sig, s_len);
     }
 
     // sLen = 31 exceeds the §9.1.1 step 3 bound.
-    try testing.expectError(error.EncodedMessageTooShort, signPss(sk, std.crypto.hash.sha2.Sha256, random, "small key", 31, &out));
+    try testing.expectError(error.EncodedMessageTooShort, signPss(&sk, std.crypto.hash.sha2.Sha256, random, "small key", 31, &out));
     // SHA-512 cannot fit at all: emLen = 64 < hLen + 2 = 66.
-    try testing.expectError(error.EncodedMessageTooShort, signPss(sk, std.crypto.hash.sha2.Sha512, random, "small key", 0, &out));
+    try testing.expectError(error.EncodedMessageTooShort, signPss(&sk, std.crypto.hash.sha2.Sha512, random, "small key", 0, &out));
 }
 
 test "verifyPss rejects tampering, wrong message/hash/salt_len/length" {
@@ -3589,20 +3715,20 @@ test "verifyPss rejects a wrong trailer byte and nonzero top bits" {
 
     // Control: the untouched EM signs and verifies — proving the rejections
     // below are the trailer/top-bit checks and nothing else.
-    const sig_ok = try rsasp1(256, em, sk);
+    const sig_ok = try rsasp1(256, em, &sk);
     try verifyPss(pk, Sha256, msg, &sig_ok, 32);
 
     // Trailer != 0xbc (§9.1.2 step 4).
     var em_bad = em;
     em_bad[255] = 0xcc;
-    const sig_bad_trailer = try rsasp1(256, em_bad, sk);
+    const sig_bad_trailer = try rsasp1(256, em_bad, &sk);
     try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Sha256, msg, &sig_bad_trailer, 32));
 
     // Nonzero leftmost bit of maskedDB (§9.1.2 step 6). Still < n (n's top
     // byte is 0xa2), so only the top-bit check can reject it.
     em_bad = em;
     em_bad[0] |= 0x80;
-    const sig_bad_top = try rsasp1(256, em_bad, sk);
+    const sig_bad_top = try rsasp1(256, em_bad, &sk);
     try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Sha256, msg, &sig_bad_top, 32));
 }
 
@@ -3610,7 +3736,7 @@ test "signPss rejects an undersized output buffer" {
     const sk = try kat2048.secretKey();
     var prng = std.Random.DefaultPrng.init(7);
     var small: [255]u8 = undefined;
-    try testing.expectError(error.BufferTooSmall, signPss(sk, std.crypto.hash.sha2.Sha256, prng.random(), "m", 32, &small));
+    try testing.expectError(error.BufferTooSmall, signPss(&sk, std.crypto.hash.sha2.Sha256, prng.random(), "m", 32, &small));
 }
 
 // ── P4a (DER/PEM key parsing) tests ──────────────────────────────────────────
@@ -3772,32 +3898,36 @@ test "PublicKey.fromPem parses PUBLIC KEY and RSA PUBLIC KEY PEM, matches kat204
 }
 
 test "SecretKey.fromDer parses bare PKCS#1 RSAPrivateKey DER, matches kat2048 and signs" {
-    const sk = try SecretKey.fromDer(&kat2048_der.priv_pkcs1);
+    var sk: SecretKey = undefined;
+    try SecretKey.fromDer(&sk, &kat2048_der.priv_pkcs1);
     try expectMatchesKat2048SecretKey(sk);
 
     var out: [max_modulus_len]u8 = undefined;
-    const sig = try signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, kat2048.msg, &out);
+    const sig = try signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, kat2048.msg, &out);
     try testing.expectEqualSlices(u8, &kat2048.sig_sha256, sig); // deterministic -> byte-exact
 }
 
 test "fromPkcs8 parses PKCS#8 PrivateKeyInfo DER, matches kat2048 and signs" {
-    const sk = try fromPkcs8(&kat2048_der.priv_pkcs8);
+    var sk: SecretKey = undefined;
+    try fromPkcs8(&sk, &kat2048_der.priv_pkcs8);
     try expectMatchesKat2048SecretKey(sk);
 
     var out: [max_modulus_len]u8 = undefined;
-    const sig = try signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, kat2048.msg, &out);
+    const sig = try signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, kat2048.msg, &out);
     try testing.expectEqualSlices(u8, &kat2048.sig_sha256, sig);
 }
 
 test "SecretKey.fromPem parses RSA PRIVATE KEY and PRIVATE KEY PEM, matches kat2048" {
-    const from_pkcs1 = try SecretKey.fromPem(kat2048_pem.priv_pkcs1);
+    var from_pkcs1: SecretKey = undefined;
+    try SecretKey.fromPem(&from_pkcs1, kat2048_pem.priv_pkcs1);
     try expectMatchesKat2048SecretKey(from_pkcs1);
 
-    const from_pkcs8 = try SecretKey.fromPem(kat2048_pem.priv_pkcs8);
+    var from_pkcs8: SecretKey = undefined;
+    try SecretKey.fromPem(&from_pkcs8, kat2048_pem.priv_pkcs8);
     try expectMatchesKat2048SecretKey(from_pkcs8);
 
     var out: [max_modulus_len]u8 = undefined;
-    const sig = try signPkcs1v15(from_pkcs1, std.crypto.hash.sha2.Sha256, kat2048.msg, &out);
+    const sig = try signPkcs1v15(&from_pkcs1, std.crypto.hash.sha2.Sha256, kat2048.msg, &out);
     try verifyPkcs1v15(try PublicKey.fromPem(kat2048_pem.pub_spki), std.crypto.hash.sha2.Sha256, kat2048.msg, sig);
 }
 
@@ -3811,13 +3941,13 @@ test "PublicKey.fromDer/SecretKey.fromDer/fromPkcs8 reject truncated DER" {
     {
         var l: usize = 0;
         while (l < kat2048_der.priv_pkcs1.len) : (l += 11) {
-            try testing.expectError(error.InvalidDer, SecretKey.fromDer(kat2048_der.priv_pkcs1[0..l]));
+            try testing.expectError(error.InvalidDer, SecretKey.fromDer(&test_sk_out, kat2048_der.priv_pkcs1[0..l]));
         }
     }
     {
         var l: usize = 0;
         while (l < kat2048_der.priv_pkcs8.len) : (l += 11) {
-            try testing.expectError(error.InvalidDer, fromPkcs8(kat2048_der.priv_pkcs8[0..l]));
+            try testing.expectError(error.InvalidDer, fromPkcs8(&test_sk_out, kat2048_der.priv_pkcs8[0..l]));
         }
     }
 }
@@ -3841,7 +3971,7 @@ test "PublicKey.fromDer/fromPkcs8 reject a wrong AlgorithmIdentifier OID" {
     var corrupt8 = kat2048_der.priv_pkcs8;
     const idx8 = std.mem.indexOf(u8, &corrupt8, &oid_rsa_encryption).?;
     corrupt8[idx8] ^= 0xff;
-    try testing.expectError(error.InvalidDer, fromPkcs8(&corrupt8));
+    try testing.expectError(error.InvalidDer, fromPkcs8(&test_sk_out, &corrupt8));
 }
 
 test "SecretKey.fromDer rejects a corrupted version field" {
@@ -3850,12 +3980,12 @@ test "SecretKey.fromDer rejects a corrupted version field" {
     // its content byte (must be 0x00) sits at offset 6.
     try testing.expectEqual(@as(u8, 0x00), corrupt[6]);
     corrupt[6] = 0x01; // multi-prime (version 1): rejected, not supported
-    try testing.expectError(error.InvalidDer, SecretKey.fromDer(&corrupt));
+    try testing.expectError(error.InvalidDer, SecretKey.fromDer(&test_sk_out, &corrupt));
 }
 
 test "PublicKey.fromPem/SecretKey.fromPem: missing block, corrupted base64, encrypted/OpenSSH labels" {
     try testing.expectError(error.MissingPemBlock, PublicKey.fromPem("no pem here"));
-    try testing.expectError(error.MissingPemBlock, SecretKey.fromPem("no pem here"));
+    try testing.expectError(error.MissingPemBlock, SecretKey.fromPem(&test_sk_out, "no pem here"));
 
     try testing.expectError(error.InvalidPem, PublicKey.fromPem(
         "-----BEGIN PUBLIC KEY-----\n!!!!not base64!!!!\n-----END PUBLIC KEY-----\n",
@@ -3868,14 +3998,16 @@ test "PublicKey.fromPem/SecretKey.fromPem: missing block, corrupted base64, encr
     // rejected with a specific error (P4b territory) rather than being
     // misparsed as cleartext DER or panicking on the OpenSSH blob shape.
     try testing.expectError(error.UnsupportedPemLabel, SecretKey.fromPem(
+        &test_sk_out,
         "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n",
     ));
     try testing.expectError(error.UnsupportedPemLabel, SecretKey.fromPem(
+        &test_sk_out,
         "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
     ));
     // Right key material, wrong accessor (a public PEM handed to fromPem for
     // secret keys, and vice versa) is also a label mismatch, not a crash.
-    try testing.expectError(error.UnsupportedPemLabel, SecretKey.fromPem(kat2048_pem.pub_spki));
+    try testing.expectError(error.UnsupportedPemLabel, SecretKey.fromPem(&test_sk_out, kat2048_pem.pub_spki));
     try testing.expectError(error.UnsupportedPemLabel, PublicKey.fromPem(kat2048_pem.priv_pkcs1));
 }
 
@@ -4125,18 +4257,18 @@ test "generate: rejects invalid bits and exponents" {
     const random = prng.random();
 
     // Too small, too large, odd — all before any prime search starts.
-    try testing.expectError(error.InvalidBits, generate(random, 0, 65537));
-    try testing.expectError(error.InvalidBits, generate(random, 256, 65537));
-    try testing.expectError(error.InvalidBits, generate(random, 511, 65537));
-    try testing.expectError(error.InvalidBits, generate(random, 513, 65537));
-    try testing.expectError(error.InvalidBits, generate(random, max_modulus_bits + 2, 65537));
+    try testing.expectError(error.InvalidBits, generate(&test_kp_out, random, 0, 65537));
+    try testing.expectError(error.InvalidBits, generate(&test_kp_out, random, 256, 65537));
+    try testing.expectError(error.InvalidBits, generate(&test_kp_out, random, 511, 65537));
+    try testing.expectError(error.InvalidBits, generate(&test_kp_out, random, 513, 65537));
+    try testing.expectError(error.InvalidBits, generate(&test_kp_out, random, max_modulus_bits + 2, 65537));
 
     // e must be odd, >= 3, and < 2^32 (the module-wide public-exponent cap).
-    try testing.expectError(error.InvalidExponent, generate(random, 512, 0));
-    try testing.expectError(error.InvalidExponent, generate(random, 512, 1));
-    try testing.expectError(error.InvalidExponent, generate(random, 512, 2));
-    try testing.expectError(error.InvalidExponent, generate(random, 512, 65536));
-    try testing.expectError(error.InvalidExponent, generate(random, 512, 1 << 33));
+    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 512, 0));
+    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 512, 1));
+    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 512, 2));
+    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 512, 65536));
+    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 512, 1 << 33));
 }
 
 /// n == p·q cross-check via `std.math.big.int` (an arithmetic path fully
@@ -4170,7 +4302,8 @@ test "generate: 512-bit key structure (n exactly 512 bits, p/q prime, p != q, n 
     var prng = std.Random.DefaultPrng.init(0x7273615f67656e35); // "rsa_gen5"
     const random = prng.random();
 
-    const kp = try generate(random, 512, 65537);
+    var kp: KeyPair = undefined;
+    try generate(&kp, random, 512, 65537);
     const sk = kp.secret_key;
     const pk = kp.public_key;
 
@@ -4197,7 +4330,8 @@ test "generate: honors a non-default exponent (e = 3)" {
     var prng = std.Random.DefaultPrng.init(0x655f6571735f33); // "e_eqs_3"
     const random = prng.random();
 
-    const kp = try generate(random, 512, 3);
+    var kp: KeyPair = undefined;
+    try generate(&kp, random, 512, 3);
     try testing.expectEqual(@as(u32, 3), try kp.public_key.e.toPrimitive(u32));
     try testing.expectEqual(@as(usize, 512), kp.secret_key.n.bits());
     try testing.expect(isProbablePrime(kp.secret_key.p, random));
@@ -4212,7 +4346,8 @@ test "generate: 1024-bit key round-trips P1 sign/verify, P2 OAEP, and P6 selfSig
     // 1024 bits: the smallest size std.crypto.Certificate's RSA verifier
     // accepts (its modulus-length switch starts at 128 bytes), so the P6
     // oracle below exercises the generated key end-to-end.
-    const kp = try generate(random, 1024, 65537);
+    var kp: KeyPair = undefined;
+    try generate(&kp, random, 1024, 65537);
     const sk = kp.secret_key;
     const pk = kp.public_key;
     try testing.expectEqual(@as(usize, 1024), sk.n.bits());
@@ -4222,7 +4357,7 @@ test "generate: 1024-bit key round-trips P1 sign/verify, P2 OAEP, and P6 selfSig
     // message under this fresh key.
     const msg = "generated-key end-to-end message";
     var sig_buf: [max_modulus_len]u8 = undefined;
-    const sig = try signPkcs1v15(sk, Sha256, msg, &sig_buf);
+    const sig = try signPkcs1v15(&sk, Sha256, msg, &sig_buf);
     try verifyPkcs1v15(pk, Sha256, msg, sig);
     try testing.expectError(error.SignatureVerificationFailed, verifyPkcs1v15(pk, Sha256, "another message", sig));
 
@@ -4231,7 +4366,7 @@ test "generate: 1024-bit key round-trips P1 sign/verify, P2 OAEP, and P6 selfSig
     var ct_buf: [max_modulus_len]u8 = undefined;
     const ct = try encryptOaep(pk, Sha256, random, secret, "", &ct_buf);
     var pt_buf: [max_modulus_len]u8 = undefined;
-    const pt = try decryptOaep(sk, Sha256, ct, "", &pt_buf);
+    const pt = try decryptOaep(&sk, Sha256, ct, "", &pt_buf);
     try testing.expectEqualStrings(secret, pt);
 
     // P6: a self-signed certificate for the generated key must fully verify
@@ -4367,22 +4502,25 @@ const openssh_fixture_cbc =
 ;
 
 test "fromOpenSSH: unencrypted key parses, signs and verifies (P1 round-trip)" {
-    const sk = try fromOpenSSH(openssh_fixture_plain, "");
+    var sk: SecretKey = undefined;
+    try fromOpenSSH(&sk, openssh_fixture_plain, "");
     const pk = PublicKey{ .n = sk.n, .e = try Fe.fromPrimitive(u32, sk.n, 65537), .n_mont = sk.n_mont };
     const msg = "zig-libs rsa: P4b openssh fixture";
     var sig_buf: [max_modulus_len]u8 = undefined;
-    const sig = try signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, msg, &sig_buf);
+    const sig = try signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, msg, &sig_buf);
     try verifyPkcs1v15(pk, std.crypto.hash.sha2.Sha256, msg, sig);
 }
 
 test "fromOpenSSH: bcrypt/aes256-ctr and aes256-cbc decrypt to the unencrypted sibling" {
-    const sk_plain = try fromOpenSSH(openssh_fixture_plain, "");
+    var sk_plain: SecretKey = undefined;
+    try fromOpenSSH(&sk_plain, openssh_fixture_plain, "");
     const k = byteLen(sk_plain.n.bits());
     var n_plain: [max_modulus_len]u8 = undefined;
     try sk_plain.n.toBytes(n_plain[0..k], .big);
 
     inline for (.{ openssh_fixture_ctr, openssh_fixture_cbc }) |fixture| {
-        const sk = try fromOpenSSH(fixture, "hunter2");
+        var sk: SecretKey = undefined;
+        try fromOpenSSH(&sk, fixture, "hunter2");
         try testing.expectEqual(sk_plain.n.bits(), sk.n.bits());
         var n_enc: [max_modulus_len]u8 = undefined;
         try sk.n.toBytes(n_enc[0..k], .big);
@@ -4391,9 +4529,9 @@ test "fromOpenSSH: bcrypt/aes256-ctr and aes256-cbc decrypt to the unencrypted s
 }
 
 test "fromOpenSSH: wrong or empty passphrase is IncorrectPassphrase" {
-    try testing.expectError(error.IncorrectPassphrase, fromOpenSSH(openssh_fixture_ctr, "hunter3"));
-    try testing.expectError(error.IncorrectPassphrase, fromOpenSSH(openssh_fixture_ctr, ""));
-    try testing.expectError(error.IncorrectPassphrase, fromOpenSSH(openssh_fixture_cbc, "HUNTER2"));
+    try testing.expectError(error.IncorrectPassphrase, fromOpenSSH(&test_sk_out, openssh_fixture_ctr, "hunter3"));
+    try testing.expectError(error.IncorrectPassphrase, fromOpenSSH(&test_sk_out, openssh_fixture_ctr, ""));
+    try testing.expectError(error.IncorrectPassphrase, fromOpenSSH(&test_sk_out, openssh_fixture_cbc, "HUNTER2"));
 }
 
 /// Test helper: assemble a synthetic openssh-key-v1 binary image from SSH
@@ -4434,27 +4572,27 @@ test "fromOpenSSH: rejects bad magic, truncation, nkeys != 1, trailing garbage" 
     { // wrong magic
         var b = OpensshTestBuilder{};
         _ = b.raw("openssh-key-v2\x00").str("none").str("none").str("").int(1).str("").str("");
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), ""));
     }
     { // truncated container: stops after kdfname
         var b = OpensshTestBuilder{};
         _ = b.raw("openssh-key-v1\x00").str("none").str("none");
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), ""));
     }
     { // truncated string: private section claims more bytes than exist
         var b = OpensshTestBuilder{};
         _ = b.raw("openssh-key-v1\x00").str("none").str("none").str("").int(1).str("").int(64);
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), ""));
     }
     { // nkeys != 1
         var b = OpensshTestBuilder{};
         _ = b.raw("openssh-key-v1\x00").str("none").str("none").str("").int(2).str("").str("");
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), ""));
     }
     { // trailing garbage after the private section
         var b = OpensshTestBuilder{};
         _ = b.raw("openssh-key-v1\x00").str("none").str("none").str("").int(1).str("").str("").raw("x");
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), ""));
     }
 }
 
@@ -4464,21 +4602,22 @@ test "fromOpenSSH: rejects unsupported cipher/kdf and foreign PEM labels" {
     { // cipher this module does not speak
         var b = OpensshTestBuilder{};
         _ = b.raw("openssh-key-v1\x00").str("chacha20-poly1305@openssh.com").str("bcrypt").str("").int(1).str("").str("");
-        try testing.expectError(error.UnsupportedCipher, fromOpenSSH(b.pem(&pem_buf), "pw"));
+        try testing.expectError(error.UnsupportedCipher, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), "pw"));
     }
     { // unknown kdf
         var b = OpensshTestBuilder{};
         _ = b.raw("openssh-key-v1\x00").str("aes256-ctr").str("argon2id").str("").int(1).str("").str("");
-        try testing.expectError(error.UnsupportedKdf, fromOpenSSH(b.pem(&pem_buf), "pw"));
+        try testing.expectError(error.UnsupportedKdf, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), "pw"));
     }
     { // inconsistent: encryption without a kdf
         var b = OpensshTestBuilder{};
         _ = b.raw("openssh-key-v1\x00").str("aes256-ctr").str("none").str("").int(1).str("").str("");
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), "pw"));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), "pw"));
     }
 
-    try testing.expectError(error.MissingPemBlock, fromOpenSSH("no pem block here", ""));
+    try testing.expectError(error.MissingPemBlock, fromOpenSSH(&test_sk_out, "no pem block here", ""));
     try testing.expectError(error.UnsupportedPemLabel, fromOpenSSH(
+        &test_sk_out,
         "-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----\n",
         "",
     ));
@@ -4492,14 +4631,14 @@ test "fromOpenSSH: rejects checkint mismatch and non-RSA key types" {
         _ = priv.int(0xdeadbeef).int(0xdeadbee0);
         var b = OpensshTestBuilder{};
         _ = b.raw("openssh-key-v1\x00").str("none").str("none").str("").int(1).str("").str(priv.buf[0..priv.len]);
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), ""));
     }
     { // well-formed container holding an ssh-ed25519 key
         var priv = OpensshTestBuilder{};
         _ = priv.int(7).int(7).str("ssh-ed25519");
         var b = OpensshTestBuilder{};
         _ = b.raw("openssh-key-v1\x00").str("none").str("none").str("").int(1).str("").str(priv.buf[0..priv.len]);
-        try testing.expectError(error.UnsupportedKeyType, fromOpenSSH(b.pem(&pem_buf), ""));
+        try testing.expectError(error.UnsupportedKeyType, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), ""));
     }
 }
 
@@ -4550,7 +4689,7 @@ test "verify refuses a signature that is not exactly k octets, even one equal in
 
     var prng = std.Random.DefaultPrng.init(3);
     var sig_buf: [256]u8 = undefined;
-    const sig = try signPss(sk, Sha256, prng.random(), "pss length", 32, &sig_buf);
+    const sig = try signPss(&sk, Sha256, prng.random(), "pss length", 32, &sig_buf);
     try verifyPss(pk, Sha256, "pss length", sig, 32); // control
     long[1..].* = sig[0..256].*;
     try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Sha256, "pss length", &long, 32));
@@ -4583,7 +4722,7 @@ test "verifyPss refuses a nonzero PS octet and a wrong separator octet" {
     const salt = [_]u8{0x5a} ** 32;
     var em: [256]u8 = undefined;
     try emsaPssEncode(Sha256, msg, &salt, 2047, &em);
-    const good = try rsasp1(256, em, sk);
+    const good = try rsasp1(256, em, &sk);
     try verifyPss(pk, Sha256, msg, &good, 32); // control
 
     // ps_len = 256 − 32 − 32 − 2 = 190; DB[190] is the 0x01 separator.
@@ -4602,7 +4741,7 @@ test "verifyPss refuses a nonzero PS octet and a wrong separator octet" {
     for (edits) |edit| {
         var bad = em;
         pssEditDb(Sha256, &bad, 2047, edit);
-        const sig = try rsasp1(256, bad, sk);
+        const sig = try rsasp1(256, bad, &sk);
         try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Sha256, msg, &sig, 32));
     }
 }
@@ -4624,7 +4763,8 @@ test "verifyPss refuses a representative wider than emLen when modBits ≡ 1 mod
     // signature. So the octet in front of EM must be zero — even when the
     // rest is a perfectly valid encoding, as built here.
     const Sha256 = std.crypto.hash.sha2.Sha256;
-    const sk = try SecretKey.fromPrimes(&kat521.p, &kat521.q, &kat521.e);
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk, &kat521.p, &kat521.q, &kat521.e);
     const pk = try PublicKey.fromBytes(&kat521.n, &kat521.e);
     try testing.expectEqual(@as(usize, 521), pk.n.bits());
     const msg = "emLen = k - 1";
@@ -4638,10 +4778,10 @@ test "verifyPss refuses a representative wider than emLen when modBits ≡ 1 mod
         if (x[1] < 0xe0) break;
     }
     x[0] = 0x00;
-    const good = try rsasp1(66, x, sk);
+    const good = try rsasp1(66, x, &sk);
     try verifyPss(pk, Sha256, msg, &good, 16); // control
     x[0] = 0x01;
-    const bad = try rsasp1(66, x, sk);
+    const bad = try rsasp1(66, x, &sk);
     try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Sha256, msg, &bad, 16));
 }
 
@@ -4677,25 +4817,25 @@ test "OAEP decryption refuses a stray PS octet and a missing separator (both ent
     db[db.len - 4] = 0x01;
     @memcpy(db[db.len - 3 ..], "msg");
     const ok_ct = try oaepCraft(0x00, &db); // control
-    try testing.expectEqualStrings("msg", try decryptOaep(sk, Sha256, &ok_ct, "", &out));
-    const r_ok = try decryptOaepHNoFail(sk, Sha256, Sha256, .none, &ok_ct, "", 3, &out, &raw);
+    try testing.expectEqualStrings("msg", try decryptOaep(&sk, Sha256, &ok_ct, "", &out));
+    const r_ok = try decryptOaepHNoFail(&sk, Sha256, Sha256, .none, &ok_ct, "", 3, &out, &raw);
     try testing.expect(r_ok.ok);
 
     var stray = db;
     stray[40] = 0x02;
     const stray_ct = try oaepCraft(0x00, &stray);
-    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &stray_ct, "", &out));
-    try testing.expect(!(try decryptOaepHNoFail(sk, Sha256, Sha256, .none, &stray_ct, "", 3, &out, &raw)).ok);
+    try testing.expectError(error.DecryptionError, decryptOaep(&sk, Sha256, &stray_ct, "", &out));
+    try testing.expect(!(try decryptOaepHNoFail(&sk, Sha256, Sha256, .none, &stray_ct, "", 3, &out, &raw)).ok);
 
     var no_sep = db;
     @memset(no_sep[32..], 0);
     const no_sep_ct = try oaepCraft(0x00, &no_sep);
-    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &no_sep_ct, "", &out));
+    try testing.expectError(error.DecryptionError, decryptOaep(&sk, Sha256, &no_sep_ct, "", &out));
 
     // Y ≠ 0 (§7.1.2 step 3g, "if Y is nonzero") through the no-fail entry
     // point (the erroring one has its own test above).
     const y_ct = try oaepCraft(0x01, &db);
-    try testing.expect(!(try decryptOaepHNoFail(sk, Sha256, Sha256, .none, &y_ct, "", 3, &out, &raw)).ok);
+    try testing.expect(!(try decryptOaepHNoFail(&sk, Sha256, Sha256, .none, &y_ct, "", 3, &out, &raw)).ok);
 }
 
 test "OAEP decryption checks its output buffers up front, from public sizes only" {
@@ -4711,9 +4851,9 @@ test "OAEP decryption checks its output buffers up front, from public sizes only
     const max_msg = 256 - 2 * 32 - 2;
     var out: [max_modulus_len]u8 = undefined;
     var raw: [max_modulus_len]u8 = undefined;
-    try testing.expectError(error.BufferTooSmall, decryptOaep(sk, Sha256, ct, "", out[0 .. max_msg - 1]));
-    try testing.expectEqualStrings("short", try decryptOaep(sk, Sha256, ct, "", out[0..max_msg]));
-    try testing.expectError(error.BufferTooSmall, decryptOaepHNoFail(sk, Sha256, Sha256, .none, ct, "", max_msg + 1, &out, &raw));
+    try testing.expectError(error.BufferTooSmall, decryptOaep(&sk, Sha256, ct, "", out[0 .. max_msg - 1]));
+    try testing.expectEqualStrings("short", try decryptOaep(&sk, Sha256, ct, "", out[0..max_msg]));
+    try testing.expectError(error.BufferTooSmall, decryptOaepHNoFail(&sk, Sha256, Sha256, .none, ct, "", max_msg + 1, &out, &raw));
 }
 
 /// `der` with `extra` appended INSIDE its outer SEQUENCE. Every fixture here
@@ -4742,7 +4882,7 @@ test "DER keys: trailing bytes, extra fields, unused bits and a v2 PKCS#8 are re
     }
     @memcpy(buf[0..kat2048_der.priv_pkcs1.len], &kat2048_der.priv_pkcs1);
     buf[kat2048_der.priv_pkcs1.len] = 0x00;
-    try testing.expectError(error.InvalidDer, SecretKey.fromDer(buf[0 .. kat2048_der.priv_pkcs1.len + 1]));
+    try testing.expectError(error.InvalidDer, SecretKey.fromDer(&test_sk_out, buf[0 .. kat2048_der.priv_pkcs1.len + 1]));
 
     // RSAPublicKey is SEQUENCE { modulus, publicExponent } (RFC 8017 A.1.1)
     // and SubjectPublicKeyInfo SEQUENCE { algorithm, subjectPublicKey }
@@ -4751,7 +4891,7 @@ test "DER keys: trailing bytes, extra fields, unused bits and a v2 PKCS#8 are re
     try testing.expectError(error.InvalidDer, PublicKey.fromDer(derAppendInTop(&kat2048_der.pub_spki, &.{ 0x05, 0x00 }, &buf)));
     // RSAPrivateKey version 0 has no otherPrimeInfos (RFC 8017 A.1.2: "version
     // SHALL be 0 if there are only two primes").
-    try testing.expectError(error.InvalidDer, SecretKey.fromDer(derAppendInTop(&kat2048_der.priv_pkcs1, &.{ 0x30, 0x00 }, &buf)));
+    try testing.expectError(error.InvalidDer, SecretKey.fromDer(&test_sk_out, derAppendInTop(&kat2048_der.priv_pkcs1, &.{ 0x30, 0x00 }, &buf)));
 
     // The BIT STRING wrapping RSAPublicKey carries whole octets: its
     // unused-bits octet (X.690 §8.6.2.2) must be 0. Offset 23 = outer header
@@ -4766,7 +4906,7 @@ test "DER keys: trailing bytes, extra fields, unused bits and a v2 PKCS#8 are re
     var p8 = kat2048_der.priv_pkcs8;
     try testing.expectEqualSlices(u8, &.{ 0x02, 0x01, 0x00 }, p8[4..7]);
     p8[6] = 0x01;
-    try testing.expectError(error.InvalidDer, fromPkcs8(&p8));
+    try testing.expectError(error.InvalidDer, fromPkcs8(&test_sk_out, &p8));
 }
 
 test "PEM: a block with no base64 payload is a PEM error, not a DER one" {
@@ -4814,24 +4954,24 @@ test "fromOpenSSH: one bad field in an otherwise valid container is refused" {
     { // control: the rebuilt container parses
         var b = OpensshTestBuilder{};
         plain.build(&b, 1, "");
-        _ = try fromOpenSSH(b.pem(&pem_buf), "");
+        try fromOpenSSH(&test_sk_out, b.pem(&pem_buf), "");
     }
     { // nkeys = 2 with the single key's fields intact
         var b = OpensshTestBuilder{};
         plain.build(&b, 2, "");
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), ""));
     }
     { // a byte after a valid private section
         var b = OpensshTestBuilder{};
         plain.build(&b, 1, "x");
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), ""));
     }
     { // cipher none with a bcrypt kdf
         var p = plain;
         p.kdf = "bcrypt";
         var b = OpensshTestBuilder{};
         p.build(&b, 1, "");
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), ""));
     }
     // The fixture's section ends `… 'b' 01 02 03` (comment, then padding).
     const sec = plain.private;
@@ -4844,7 +4984,7 @@ test "fromOpenSSH: one bad field in an otherwise valid container is refused" {
         p.private = sec_buf[0..sec.len];
         var b = OpensshTestBuilder{};
         p.build(&b, 1, "");
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), ""));
     }
     { // padding 1…11: a correct sequence, but a full block (8) or more of it
         @memcpy(sec_buf[0..sec.len], sec);
@@ -4853,7 +4993,7 @@ test "fromOpenSSH: one bad field in an otherwise valid container is refused" {
         p.private = sec_buf[0 .. sec.len + 8];
         var b = OpensshTestBuilder{};
         p.build(&b, 1, "");
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), ""));
     }
 
     const cbc_block = try pemDecodeBody(openssh_fixture_cbc);
@@ -4861,7 +5001,7 @@ test "fromOpenSSH: one bad field in an otherwise valid container is refused" {
     { // control
         var b = OpensshTestBuilder{};
         cbc.build(&b, 1, "");
-        _ = try fromOpenSSH(b.pem(&pem_buf), "hunter2");
+        try fromOpenSSH(&test_sk_out, b.pem(&pem_buf), "hunter2");
     }
     { // bcrypt options with a byte after `rounds`
         var opts: [64]u8 = undefined;
@@ -4871,7 +5011,7 @@ test "fromOpenSSH: one bad field in an otherwise valid container is refused" {
         p.kdfopts = opts[0 .. cbc.kdfopts.len + 1];
         var b = OpensshTestBuilder{};
         p.build(&b, 1, "");
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), "hunter2"));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), "hunter2"));
     }
     { // an encrypted section one byte past a whole number of AES blocks
         @memcpy(sec_buf[0..cbc.private.len], cbc.private);
@@ -4880,7 +5020,7 @@ test "fromOpenSSH: one bad field in an otherwise valid container is refused" {
         p.private = sec_buf[0 .. cbc.private.len + 1];
         var b = OpensshTestBuilder{};
         p.build(&b, 1, "");
-        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), "hunter2"));
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), "hunter2"));
     }
 }
 
@@ -4921,7 +5061,8 @@ fn ffPrivateOpCrt(sk: SecretKey, in: []const u8, out: []u8) void {
 
 fn benchRsa(comptime bits: usize, random: std.Random) void {
     const klen = bits / 8;
-    const kp = generate(random, bits, 65537) catch {
+    var kp: KeyPair = undefined;
+    generate(&kp, random, bits, 65537) catch {
         std.debug.print("rsa-{d}: keygen failed\n", .{bits});
         return;
     };
@@ -4944,7 +5085,7 @@ fn benchRsa(comptime bits: usize, random: std.Random) void {
         const t0 = benchNowNs();
         var i: usize = 0;
         while (i < sign_iters) : (i += 1) {
-            sig = rsasp1(klen, msg, sk) catch unreachable;
+            sig = rsasp1(klen, msg, &sk) catch unreachable;
             sink ^= sig[klen - 1];
         }
         const dt = benchNowNs() - t0;
@@ -5167,7 +5308,8 @@ fn fuzzSecretKeyFromDer(_: void, smith: *std.testing.Smith) !void {
     // minimum, so an over-long seed reads back as the EMPTY one.
     var buf: [2048]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    var sk = SecretKey.fromDer(buf[0..len]) catch return;
+    var sk: SecretKey = undefined;
+    SecretKey.fromDer(&sk, buf[0..len]) catch return;
     defer sk.deinit();
     std.mem.doNotOptimizeAway(sk.n.bits());
 }
@@ -5185,7 +5327,8 @@ test "corpus: SecretKey.fromDer seeds reach the parser, counts pinned" {
         var buf: [2048]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
-        var sk = SecretKey.fromDer(buf[0..len]) catch continue;
+        var sk: SecretKey = undefined;
+        SecretKey.fromDer(&sk, buf[0..len]) catch continue;
         defer sk.deinit();
         accepted += 1;
         try moduli.add(sk.n);
@@ -5226,7 +5369,8 @@ fn fuzzFromPkcs8(_: void, smith: *std.testing.Smith) !void {
     // octets, so 1024 could not carry it (see `fuzzSecretKeyFromDer`).
     var buf: [2048]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    var sk = fromPkcs8(buf[0..len]) catch return;
+    var sk: SecretKey = undefined;
+    fromPkcs8(&sk, buf[0..len]) catch return;
     defer sk.deinit();
     std.mem.doNotOptimizeAway(sk.n.bits());
 }
@@ -5244,7 +5388,8 @@ test "corpus: fromPkcs8 seeds reach the parser, counts pinned" {
         var buf: [2048]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
-        var sk = fromPkcs8(buf[0..len]) catch continue;
+        var sk: SecretKey = undefined;
+        fromPkcs8(&sk, buf[0..len]) catch continue;
         defer sk.deinit();
         accepted += 1;
         try moduli.add(sk.n);
@@ -5337,7 +5482,8 @@ fn fuzzSecretKeyFromPem(_: void, smith: *std.testing.Smith) !void {
     // seed longer than the buffer reads back EMPTY, silently.
     var buf: [2048]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    var sk = SecretKey.fromPem(buf[0..len]) catch return;
+    var sk: SecretKey = undefined;
+    SecretKey.fromPem(&sk, buf[0..len]) catch return;
     defer sk.deinit();
     std.mem.doNotOptimizeAway(sk.n.bits());
 }
@@ -5355,7 +5501,8 @@ test "corpus: SecretKey.fromPem seeds reach the parser, counts pinned" {
         var buf: [2048]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
-        var sk = SecretKey.fromPem(buf[0..len]) catch continue;
+        var sk: SecretKey = undefined;
+        SecretKey.fromPem(&sk, buf[0..len]) catch continue;
         defer sk.deinit();
         accepted += 1;
         try moduli.add(sk.n);
@@ -5436,7 +5583,8 @@ fn fuzzFromOpenSSH(_: void, smith: *std.testing.Smith) !void {
     const len: usize = smith.slice(&buf);
     var pass: [64]u8 = undefined;
     const plen: usize = smith.slice(&pass);
-    var sk = fromOpenSSH(buf[0..len], pass[0..plen]) catch return;
+    var sk: SecretKey = undefined;
+    fromOpenSSH(&sk, buf[0..len], pass[0..plen]) catch return;
     defer sk.deinit();
     std.mem.doNotOptimizeAway(sk.n.bits());
 }
@@ -5463,7 +5611,8 @@ test "corpus: fromOpenSSH seeds reach the parser, counts pinned" {
         var pass: [64]u8 = undefined;
         const plen: usize = smith.slice(&pass);
         if (plen != 0) with_pass += 1;
-        var sk = fromOpenSSH(buf[0..len], pass[0..plen]) catch continue;
+        var sk: SecretKey = undefined;
+        fromOpenSSH(&sk, buf[0..len], pass[0..plen]) catch continue;
         defer sk.deinit();
         accepted += 1;
         try moduli.add(sk.n);

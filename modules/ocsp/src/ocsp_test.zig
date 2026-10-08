@@ -123,7 +123,7 @@ fn buildLeafCert(
         leaf_spki,
     });
     var out: [512]u8 = undefined;
-    const sig = try rsa.signPkcs1v15(issuer_sk, Sha256, tbs, &out);
+    const sig = try rsa.signPkcs1v15(&issuer_sk, Sha256, tbs, &out);
     const cert = try b.seq(&.{
         tbs,
         try b.seq(&.{ try b.oid(&oid_sha256_rsa), try b.null() }),
@@ -134,7 +134,8 @@ fn buildLeafCert(
 
 fn makeRsaFixture(gpa: std.mem.Allocator) !RsaFixture {
     var prng = std.Random.DefaultPrng.init(0x0c005eed);
-    const kp = try rsa.generate(prng.random(), 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
     const issuer = try rsa.selfSignedCert(gpa, kp.secret_key, kp.public_key, Sha256, .{
         .common_name = "zig-libs OCSP test CA",
         .serial = 1,
@@ -308,11 +309,11 @@ fn buildResponseImpl(gpa: std.mem.Allocator, spec: RespSpec, with_decoy: bool) !
     var signature: []const u8 = undefined;
     if (spec.sign_rsa) |sk| {
         var out: [512]u8 = undefined;
-        signature = try rsa.signPkcs1v15(sk, Sha256, tbs, &out);
+        signature = try rsa.signPkcs1v15(&sk, Sha256, tbs, &out);
         signature = try b.a.dupe(u8, signature);
         sig_alg = try b.seq(&.{ try b.oid(&oid_sha256_rsa), try b.null() });
     } else if (spec.sign_ecdsa) |sk| {
-        const rs = try p256.sign.ecdsaSign(sk, tbs, [_]u8{0x2b} ** 32);
+        const rs = try p256.sign.ecdsaSign(&sk, tbs, &([_]u8{0x2b} ** 32));
         signature = try ecdsaRsToDer(b, rs);
         sig_alg = try b.seq(&.{try b.oid(&oid_ecdsa_sha256)});
     } else return error.NoSigner;
@@ -424,7 +425,7 @@ fn buildDelegateCertValidity(
     const tbs = try b.seq(tbs_parts.items);
 
     var out: [512]u8 = undefined;
-    const sig = try rsa.signPkcs1v15(issuer_sk, Sha256, tbs, &out);
+    const sig = try rsa.signPkcs1v15(&issuer_sk, Sha256, tbs, &out);
     const cert = try b.seq(&.{
         tbs,
         try b.seq(&.{ try b.oid(&oid_sha256_rsa), try b.null() }),
@@ -848,7 +849,8 @@ test "verify: delegated responder with OCSPSigning EKU accepted" {
 
     // Delegate has its own RSA key; its cert is signed by the issuer.
     var prng = std.Random.DefaultPrng.init(0xde1e6a7e);
-    const dkp = try rsa.generate(prng.random(), 1024, 65537);
+    var dkp: rsa.KeyPair = undefined;
+    try rsa.generate(&dkp, prng.random(), 1024, 65537);
     const delegate_self = try rsa.selfSignedCert(gpa, dkp.secret_key, dkp.public_key, Sha256, .{
         .common_name = "delegated responder",
         .serial = 7,
@@ -888,7 +890,8 @@ test "verify: delegated responder WITHOUT OCSPSigning EKU rejected" {
     const subject = try extractBits(fx.subject_der);
 
     var prng = std.Random.DefaultPrng.init(0x00badecc);
-    const dkp = try rsa.generate(prng.random(), 1024, 65537);
+    var dkp: rsa.KeyPair = undefined;
+    try rsa.generate(&dkp, prng.random(), 1024, 65537);
     const delegate_self = try rsa.selfSignedCert(gpa, dkp.secret_key, dkp.public_key, Sha256, .{
         .common_name = "no-eku responder",
         .serial = 8,
@@ -938,7 +941,8 @@ test "verify: delegated responder carrying anyExtendedKeyUsage instead of id-kp-
     const subject = try extractBits(fx.subject_der);
 
     var prng = std.Random.DefaultPrng.init(0xa11e6ce7);
-    const dkp = try rsa.generate(prng.random(), 1024, 65537);
+    var dkp: rsa.KeyPair = undefined;
+    try rsa.generate(&dkp, prng.random(), 1024, 65537);
     const delegate_self = try rsa.selfSignedCert(gpa, dkp.secret_key, dkp.public_key, Sha256, .{
         .common_name = "any-eku responder",
         .serial = 11,
@@ -1036,7 +1040,8 @@ test "verify: delegated responder cert outside its validity window → Responder
     const subject = try extractBits(fx.subject_der);
 
     var prng = std.Random.DefaultPrng.init(0xe401eed);
-    const dkp = try rsa.generate(prng.random(), 1024, 65537);
+    var dkp: rsa.KeyPair = undefined;
+    try rsa.generate(&dkp, prng.random(), 1024, 65537);
     const delegate_self = try rsa.selfSignedCert(gpa, dkp.secret_key, dkp.public_key, Sha256, .{
         .common_name = "expired responder",
         .serial = 11,
@@ -1133,7 +1138,8 @@ test "verify: subject not issued by the supplied issuer → IssuerMismatch" {
 
     // CA-B: a different CA, with its own key and its own name.
     var prng = std.Random.DefaultPrng.init(0xca0fbeef);
-    const kp_b = try rsa.generate(prng.random(), 1024, 65537);
+    var kp_b: rsa.KeyPair = undefined;
+    try rsa.generate(&kp_b, prng.random(), 1024, 65537);
     const ca_b = try rsa.selfSignedCert(gpa, kp_b.secret_key, kp_b.public_key, Sha256, .{
         .common_name = "zig-libs OCSP test CA B",
         .serial = 2,
@@ -1266,7 +1272,8 @@ const ParseCorpus = struct {
         });
 
         var prng = std.Random.DefaultPrng.init(0xf0e1d2c3);
-        const dkp = try rsa.generate(prng.random(), 1024, 65537);
+        var dkp: rsa.KeyPair = undefined;
+        try rsa.generate(&dkp, prng.random(), 1024, 65537);
         const delegate_self = try rsa.selfSignedCert(gpa, dkp.secret_key, dkp.public_key, Sha256, .{
             .common_name = "fuzz delegated responder",
             .serial = 9,
@@ -1392,7 +1399,8 @@ test "fuzz: verify's certificate and delegate parsers on damaged input" {
     const subject = try extractBits(fx.subject_der);
 
     var prng = std.Random.DefaultPrng.init(0xf0e1d2c3);
-    const dkp = try rsa.generate(prng.random(), 1024, 65537);
+    var dkp: rsa.KeyPair = undefined;
+    try rsa.generate(&dkp, prng.random(), 1024, 65537);
     const delegate_self = try rsa.selfSignedCert(gpa, dkp.secret_key, dkp.public_key, Sha256, .{
         .common_name = "fuzz delegated responder",
         .serial = 9,
@@ -1674,7 +1682,8 @@ test "TEETH: no byte of a response, its embedded delegate certificate included, 
     const subject = try extractBits(fx.subject_der);
 
     var prng = std.Random.DefaultPrng.init(0xf0e1d2c3);
-    const dkp = try rsa.generate(prng.random(), 1024, 65537);
+    var dkp: rsa.KeyPair = undefined;
+    try rsa.generate(&dkp, prng.random(), 1024, 65537);
     const delegate_self = try rsa.selfSignedCert(gpa, dkp.secret_key, dkp.public_key, Sha256, .{
         .common_name = "fuzz delegated responder",
         .serial = 9,

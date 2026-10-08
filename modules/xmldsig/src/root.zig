@@ -838,7 +838,8 @@ const SignedDoc = struct {
 };
 
 fn buildSignedRsaDoc(a: std.mem.Allocator, tamper_content: bool, tamper_sig: bool) !SignedDoc {
-    var sk = try rsa.SecretKey.fromPem(test_rsa_priv_pem);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, test_rsa_priv_pem);
     defer sk.deinit();
 
     // The signer always signs the ORIGINAL content; tampering happens only in
@@ -895,7 +896,7 @@ fn buildSignedRsaDoc(a: std.mem.Allocator, tamper_content: bool, tamper_sig: boo
     defer a.free(si_canon);
 
     var sig_buf: [256]u8 = undefined;
-    const sig_slice = try rsa.signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, si_canon, &sig_buf);
+    const sig_slice = try rsa.signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, si_canon, &sig_buf);
     if (tamper_sig) sig_slice[0] ^= 0x01;
     var sig_b64_buf: [512]u8 = undefined;
     const sig_b64 = std.base64.standard.Encoder.encode(&sig_b64_buf, sig_slice);
@@ -931,7 +932,8 @@ test "verify: valid RSA-SHA256 enveloped signature round-trips" {
 /// ambiguous. That is the attack shape: an untouched, genuinely valid signature
 /// over a reference that no longer names one element.
 fn buildDupIdDoc(a: std.mem.Allocator, with_decoy: bool) ![]u8 {
-    var sk = try rsa.SecretKey.fromPem(test_rsa_priv_pem);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, test_rsa_priv_pem);
     defer sk.deinit();
 
     const tmpl =
@@ -971,7 +973,7 @@ fn buildDupIdDoc(a: std.mem.Allocator, with_decoy: bool) ![]u8 {
     const si_canon = try c14n.canonicalize(a, si, .{ .mode = .exclusive });
     defer a.free(si_canon);
     var sig_buf: [256]u8 = undefined;
-    const sig_slice = try rsa.signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, si_canon, &sig_buf);
+    const sig_slice = try rsa.signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, si_canon, &sig_buf);
     var sig_b64_buf: [512]u8 = undefined;
     const sig_b64 = std.base64.standard.Encoder.encode(&sig_b64_buf, sig_slice);
 
@@ -1257,7 +1259,7 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     defer a.free(si_canon);
 
     const nonce = [_]u8{0x42} ** 32;
-    const rs = try p256.sign.ecdsaSign(sk, si_canon, nonce);
+    const rs = try p256.sign.ecdsaSign(&sk, si_canon, &nonce);
     var sb64: [128]u8 = undefined;
     const sig_b64 = std.base64.standard.Encoder.encode(&sb64, &rs);
 
@@ -1704,7 +1706,8 @@ test "verify: KeyInfo X509Certificate is exposed but not trusted" {
     // The cert DER is surfaced for pinning; verification still uses the
     // configured key. Here we supply the RIGHT key AND a KeyInfo cert blob.
     const a = testing.allocator;
-    var sk = try rsa.SecretKey.fromPem(test_rsa_priv_pem);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, test_rsa_priv_pem);
     defer sk.deinit();
 
     const doc_template =
@@ -1748,7 +1751,7 @@ test "verify: KeyInfo X509Certificate is exposed but not trusted" {
     const si_canon = try c14n.canonicalize(a, si2, .{ .mode = .exclusive });
     defer a.free(si_canon);
     var sig_buf: [256]u8 = undefined;
-    const sig_slice = try rsa.signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, si_canon, &sig_buf);
+    const sig_slice = try rsa.signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, si_canon, &sig_buf);
     var sb64: [512]u8 = undefined;
     const sig_b64 = std.base64.standard.Encoder.encode(&sb64, sig_slice);
 
@@ -2236,7 +2239,8 @@ test "the xmldsig fuzz harness reaches verify's digest and signature checks (rea
 /// `<ds:Transform>` list and the mode its digest is computed under chosen by
 /// the caller (URI="" with the enveloped transform first, as there).
 fn buildSignedRsaDocCustom(a: std.mem.Allocator, envelope_open: []const u8, transforms: []const u8, ref_mode: c14n.Mode) ![]u8 {
-    var sk = try rsa.SecretKey.fromPem(test_rsa_priv_pem);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, test_rsa_priv_pem);
     defer sk.deinit();
     const Asm = struct {
         fn doc(al: std.mem.Allocator, env: []const u8, tr: []const u8, digest: []const u8, sig: []const u8) ![]u8 {
@@ -2268,7 +2272,7 @@ fn buildSignedRsaDocCustom(a: std.mem.Allocator, envelope_open: []const u8, tran
     const si_canon = try c14n.canonicalize(a, childByName(childByName(d2.root, "Signature").?, "SignedInfo").?, .{ .mode = .exclusive });
     defer a.free(si_canon);
     var sig_buf: [256]u8 = undefined;
-    const sig = try rsa.signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, si_canon, &sig_buf);
+    const sig = try rsa.signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, si_canon, &sig_buf);
     var sb: [512]u8 = undefined;
     return Asm.doc(a, envelope_open, transforms, digest_b64, std.base64.standard.Encoder.encode(&sb, sig));
 }

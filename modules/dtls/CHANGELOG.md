@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** CertificateVerify signing passes the RSA key to
+  `rsa.signPss` by pointer, and the KAT key fixture builds through rsa's out-param `fromPrimes`
+  (rsa 2026-10-08).
 - **2026-10-06** — ⛔ **Fixed: Ed25519 `sign` with a secret key whose embedded public half is not its own went ahead in ReleaseFast.** It relied on `std`'s `Ed25519.KeyPair.fromSecretKey`, which checks the embedded public key only under `std.debug.runtime_safety` (signing one message under two public keys gives away the secret scalar). It now derives the pair from the seed and compares in every mode (`error.KeyMismatch`). Same defect as webhooksig's, found by grepping siblings; new test, teeth checked in ReleaseFast.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: resumption/0-RTT (and key update/CCM) read "not yet — see Backlog" instead of "out of scope, by design"; the stale "once `pskBinder` is implemented" note now records the existing constant-time server-side binder check.
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** the application-epoch

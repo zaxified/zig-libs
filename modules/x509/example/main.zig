@@ -39,7 +39,8 @@ pub fn main() !void {
     // deployment's key material must come from a cryptographically secure
     // source instead.
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
-    const keys = try rsa.generate(prng.random(), 1024, 65537);
+    var keys: rsa.KeyPair = undefined;
+    try rsa.generate(&keys, prng.random(), 1024, 65537);
 
     // ── a valid, currently-in-window self-signed CA cert, pinned as its
     //    own trust anchor (the OPC-UA-style single-application-cert case) ──

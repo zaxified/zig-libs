@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** `ocsp_test.zig` follows p256's `ecdsaSign`, which now takes
+  the key and nonce by pointer, and rsa's 2026-10-08 API (keys by pointer, out-param
+  constructors).
 - **2026-09-30** — **ECDSA P-384 responders, and SHA-384/512 with either curve.** The responder's
   curve is read from its SPKI `namedCurve` (RFC 5480); P-256/SHA-256 keeps the `p256` verifier, every
   other pair (P-384 with SHA-256/384/512, P-256 with SHA-384/512) goes to `std.crypto.sign.ecdsa`

@@ -1046,7 +1046,8 @@ test "F7: an RS256 credential key below 2048 bits is rejected, not merely small-
 
     // 512 bits: passes rsa's own floor (512) and is a completely valid,
     // freshly generated RSA key — the ONLY thing wrong with it is its size.
-    const kp = try rsa.generate(random, 512, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, random, 512, 65537);
     var n_buf: [rsa.max_modulus_len]u8 = undefined;
     kp.public_key.n.toBytes(&n_buf, .big) catch unreachable;
     var e_buf: [rsa.max_modulus_len]u8 = undefined;
@@ -1054,7 +1055,7 @@ test "F7: an RS256 credential key below 2048 bits is rejected, not merely small-
 
     const msg = "webauthn F7 regression";
     var sig_buf: [rsa.max_modulus_len]u8 = undefined;
-    const sig = try rsa.signPkcs1v15(kp.secret_key, std.crypto.hash.sha2.Sha256, msg, &sig_buf);
+    const sig = try rsa.signPkcs1v15(&kp.secret_key, std.crypto.hash.sha2.Sha256, msg, &sig_buf);
 
     // Sanity: `rsa` itself is happy with this key (it is a real, valid
     // 512-bit RSA key and a real signature) — proves the rejection below

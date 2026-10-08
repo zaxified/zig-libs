@@ -45,7 +45,8 @@ test "RFC 7516 A.1: RSA-OAEP + A256GCM — decrypt direction, byte-exact plainte
     const e = e_buf[0..try dec.calcSizeForSlice(e_b64)];
     try dec.decode(e, e_b64);
 
-    const sk = try rsa.SecretKey.fromPrimes(p, q, e);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimes(&sk, p, q, e);
 
     // The full compact token from §A.1.7, line breaks removed.
     const token = "eyJhbGciOiJSU0EtT0FFUCIsImVuYyI6IkEyNTZHQ00ifQ." ++

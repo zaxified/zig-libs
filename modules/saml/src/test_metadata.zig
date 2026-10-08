@@ -176,7 +176,8 @@ fn signedOpts(sk: rsa.SecretKey) saml.SpMetadataOptions {
 }
 
 test "SP metadata: signed document is the pinned bytes xmlsec1 verified" {
-    var sk = try rsa.SecretKey.fromPem(ext.sp_priv_pem);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, ext.sp_priv_pem);
     defer sk.deinit();
     const out = try saml.buildSpMetadata(testing.allocator, signedOpts(sk));
     defer testing.allocator.free(out);
@@ -263,7 +264,8 @@ test "SP metadata: parses back with the declared structure and the escaped value
 
 test "SP metadata: the signature verifies through xmldsig and is pinned to the EntityDescriptor" {
     const alloc = testing.allocator;
-    var sk = try rsa.SecretKey.fromPem(ext.sp_priv_pem);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, ext.sp_priv_pem);
     defer sk.deinit();
     const out = try saml.buildSpMetadata(alloc, signedOpts(sk));
     defer alloc.free(out);
@@ -362,7 +364,8 @@ test "SP metadata: invalid options are refused with typed errors" {
 
     // Signing needs an ID, and the ID must be an ASCII NCName (it is written
     // into the `#id` reference unescaped).
-    var sk = try rsa.SecretKey.fromPem(ext.sp_priv_pem);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, ext.sp_priv_pem);
     defer sk.deinit();
     try testing.expectError(error.InvalidId, saml.buildSpMetadata(alloc, .{ .entity_id = "e", .assertion_consumer_services = acs, .sign_with = .{ .rsa = sk } }));
     for ([_][]const u8{ "", "1abc", "a\"b", "a b", "#x", "a&b", "\u{e9}" }) |bad| {
@@ -392,7 +395,8 @@ test "SP metadata: characters XML cannot carry are refused, whitespace survives 
 }
 
 test "SP metadata: no allocation is leaked on any failure path" {
-    var sk = try rsa.SecretKey.fromPem(ext.sp_priv_pem);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, ext.sp_priv_pem);
     defer sk.deinit();
     try testing.checkAllAllocationFailures(testing.allocator, struct {
         fn run(a: std.mem.Allocator, o: saml.SpMetadataOptions) !void {

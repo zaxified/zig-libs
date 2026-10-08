@@ -371,7 +371,7 @@ pub const Session = struct {
             defer session.allocator.free(to_sign);
             @memcpy(to_sign[0..server_cert.len], server_cert);
             @memcpy(to_sign[server_cert.len..], server_nonce);
-            signature_bytes = try security.asymmetricSign(session.allocator, to_sign, sec.credentials.?.private_key);
+            signature_bytes = try security.asymmetricSign(session.allocator, to_sign, &sec.credentials.?.private_key);
             client_signature = .{
                 .algorithm = security.signature_algorithm_rsa_sha256,
                 .signature = signature_bytes,

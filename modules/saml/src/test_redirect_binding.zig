@@ -44,7 +44,9 @@ test "encodeRedirectField <-> decodeRedirectField: self round-trip" {
 
 fn makeKey(seed: u64) !rsa.KeyPair {
     var prng = std.Random.DefaultPrng.init(seed);
-    return rsa.generate(prng.random(), 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
+    return kp;
 }
 
 test "buildSignedRedirectQuery -> verifyRedirectSignature round-trips (CONSTRUCTED, self-signed)" {

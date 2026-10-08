@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the new ReleaseFast stack
+  probe (`src/stackprobe_test.zig`) found the seed, the clamped `s`, `prefix`, the nonce `r` (digest
+  and scalar) and `k·s` in dead frames after every `sign`/`signPh` — the bodies' `secureZero` defers
+  wipe their own frame only, not the callees' — the seed and `h` after `KeyPair.create`, and the
+  clamped scalar after `x448.scalarmult`. `r` beside the signature is the key. `sign`/`signPh`,
+  `KeyPair.create`, `Point.mul`, `Point.mulBasePoint` and `x448.scalarmult` now burn their stack
+  (`burn.zig`), and secrets cross the API by pointer with secret results in out-params, so no copy
+  lands in the caller's frame either: `sign`/`signPh(kp: *const KeyPair, …)`,
+  `KeyPair.create(seed: *const [57]u8)`, `x448.scalarmult(out, k: *const, u) !void`,
+  `x448.recoverPublicKey(k: *const)`, `x448.KeyPair.generateDeterministic(out, seed: *const) !void`,
+  `x448.KeyPair.generate(out, io)`. 0 residues after, caller's frame included.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
   bodies are now generic over their source and run by testkit's deterministic
   driver `ED448_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in

@@ -65,7 +65,9 @@ pub const q1024 = [_]u8{
 };
 
 pub fn rsa2048SecretKey() !rsa.SecretKey {
-    return rsa.SecretKey.fromPrimes(&p2048, &q2048, &e);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimes(&sk, &p2048, &q2048, &e);
+    return sk;
 }
 
 pub fn rsa2048PublicKey() !rsa.PublicKey {
@@ -77,7 +79,9 @@ pub fn rsa2048PublicKey() !rsa.PublicKey {
 }
 
 pub fn rsa1024SecretKey() !rsa.SecretKey {
-    return rsa.SecretKey.fromPrimes(&p1024, &q1024, &e);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimes(&sk, &p1024, &q1024, &e);
+    return sk;
 }
 
 pub fn rsa1024PublicKey() !rsa.PublicKey {
@@ -99,7 +103,7 @@ test "fixture keys reconstruct and sign/verify" {
     var sig: [rsa.max_modulus_len]u8 = undefined;
     const Sha256 = std.crypto.hash.sha2.Sha256;
     var prng = std.Random.DefaultPrng.init(1);
-    const s = try rsa.signPss(sk, Sha256, prng.random(), "iec62351", Sha256.digest_length, &sig);
+    const s = try rsa.signPss(&sk, Sha256, prng.random(), "iec62351", Sha256.digest_length, &sig);
     try rsa.verifyPss(pk, Sha256, "iec62351", s, Sha256.digest_length);
 
     const pk1024 = try rsa1024PublicKey();

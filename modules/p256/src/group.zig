@@ -33,6 +33,7 @@ const builtin = @import("builtin");
 const gate = @import("gate.zig");
 const field = @import("field.zig");
 const scalarmod = @import("scalar.zig");
+const burn = @import("burn.zig");
 
 const IdentityElementError = std.crypto.errors.IdentityElementError;
 const EncodingError = std.crypto.errors.EncodingError;
@@ -308,7 +309,17 @@ pub const P256 = struct {
     }
 
     /// Return affine coordinates (one field inversion).
+    ///
+    /// Burned like `mul`: on an ECDH result the point is the shared secret,
+    /// and the inversion left its `y` on the dead stack (`stackprobe_test.zig`,
+    /// 2026-10-08). The burn is ~1 % of the inversion's cost.
     pub fn affineCoordinates(p: P256) AffineCoordinates {
+        const r = affineCoordinatesUnburned(p);
+        burn.stack(burn.affine_burn);
+        return r;
+    }
+
+    noinline fn affineCoordinatesUnburned(p: P256) AffineCoordinates {
         const affine_0 = @intFromBool(p.x.equivalent(AffineCoordinates.identityElement.x)) &
             (@intFromBool(p.y.isZero()) | @intFromBool(p.y.equivalent(AffineCoordinates.identityElement.y)));
         const is_identity = @intFromBool(p.z.isZero()) | affine_0;
@@ -343,7 +354,34 @@ pub const P256 = struct {
     /// Dispatches to the gated fast windowed core when
     /// `gate.fast_scalarmul_implemented`, else the proven double-and-add ladder.
     /// `error.IdentityElement` if the result is the neutral element.
+    ///
+    /// Burned: the body runs one frame down and the stack it dirtied is zeroed
+    /// after it (`burn.zig`). Without it, ECDH left the secret scalar and the
+    /// shared point's `y` on the dead stack (`stackprobe_test.zig`, 2026-10-08).
     pub fn mul(p: P256, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
+        const r = mulUnburned(p, s_, endian);
+        burn.stack(burn.mul_burn);
+        return r;
+    }
+
+    /// `mul` with the scalar by pointer and the product into `out` (zeroed on
+    /// error) — for a caller whose scalar or product is secret (ECDH). `mul`
+    /// keeps std's curve shape (std's `Ecdsa` calls `Curve.basePoint.mul(k,
+    /// .big)`), so the caller's frame keeps a copy of the scalar it passed
+    /// and of the point it got back; this form leaves neither
+    /// (`stackprobe_test.zig`, 2026-10-08). Burned like `mul`.
+    pub fn mulInto(p: P256, out: *P256, s_: *const [32]u8, endian: std.builtin.Endian) IdentityElementError!void {
+        const r = mulIntoUnburned(p, out, s_, endian);
+        burn.stack(burn.mul_burn);
+        return r;
+    }
+
+    noinline fn mulIntoUnburned(p: P256, out: *P256, s_: *const [32]u8, endian: std.builtin.Endian) IdentityElementError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+        out.* = try mulUnburned(p, s_.*, endian);
+    }
+
+    noinline fn mulUnburned(p: P256, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
         // `s·G` has a dedicated fixed-base comb roughly 4x faster than the
         // variable-base path below, and this is the only door to it for the
         // most important caller there is: `std.crypto.sign.ecdsa.Ecdsa.sign`
@@ -360,7 +398,7 @@ pub const P256 = struct {
         // secret. So this adds no secret-dependent branch. `combMulBase` is
         // pinned bit-for-bit to `mulDoubleAddCt` by the gated differential, so
         // it cannot answer differently either.
-        if (p.isBasePointRepr()) return combMulBase(s_, endian);
+        if (p.isBasePointRepr()) return combMulBaseUnburned(s_, endian);
         if (comptime gate.fast_scalarmul_implemented) {
             return mulCtWindowed(p, s_, endian);
         }
@@ -487,7 +525,14 @@ pub const P256 = struct {
     /// Dispatches to the gated comb core when `gate.fast_scalarmul_implemented`,
     /// else the double-and-add ladder over `G`. `error.IdentityElement` iff
     /// `s ≡ 0 (mod n)`.
+    /// Burned like `mul`.
     pub fn combMulBase(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
+        const r = combMulBaseUnburned(s_, endian);
+        burn.stack(burn.mul_burn);
+        return r;
+    }
+
+    noinline fn combMulBaseUnburned(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
         if (builtin.is_test) comb_calls_for_testing += 1;
         if (comptime gate.fast_scalarmul_implemented) {
             return combMulBaseFast(s_, endian);

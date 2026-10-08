@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the new ReleaseFast stack
+  probe (`src/stackprobe_test.zig`; the nonce is solved from the returned signature, so std's own
+  nonce is covered) found the secret key, the nonce `k`, `k⁻¹`, `r·d` and `e + r·d` in dead frames
+  after every signature — `ecdsaSign`, `ecdsaSignDeterministic` and `EcdsaP256Sha256.KeyPair.sign`
+  with and without noise — the key after `KeyPair.fromSecretKey`, and the key and the shared
+  point's `y` after an ECDH `P256.mul` + `affineCoordinates`. `k` beside the signature is the
+  private key. `P256.mul`, `combMulBase` and `affineCoordinates` now burn their stack
+  (`burn.zig`; std's `Ecdsa` reaches them through `Curve.basePoint.mul`), `ecdsaSign`/
+  `ecdsaSignDeterministic` take the key and nonce by pointer and burn, and `EcdsaP256Sha256` is
+  now a wrapper over std's `Ecdsa(P256, Sha256)` rather than an alias: same declarations, its
+  own `KeyPair` type (same fields) whose `sign`/`signPrehashed`/`signer` take `*const KeyPair`
+  (`kp.sign(...)` reads the same) and burn, as do `Signer.finalize`, `generateDeterministic` and
+  `fromSecretKey`. The std-shaped forms (`P256.mul` is std's curve interface, `KeyPair` std's
+  surface) still leave by-value copies in the caller's frame; new, additive:
+  `P256.mulInto(p, out, s: *const, endian)` for ECDH, `KeyPair.fromSecretKeyInto(out, sk: *const)`
+  and `KeyPair.generateDeterministicInto(out, seed: *const)`, which leave none.
 - **2026-09-29** — **Performance: the RFC 6979 nonce derivation keys HMAC-SHA-256 once per K.**
   `ecdsaSignDeterministic`'s DRBG called `HmacSha256.create` for every step, re-absorbing the
   key's inner and outer pads each time although K changes only twice per nonce. A private

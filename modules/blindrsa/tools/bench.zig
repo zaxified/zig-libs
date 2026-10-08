@@ -154,7 +154,7 @@ pub fn main(init: std.process.Init) !u8 {
         const key_file = try std.fmt.allocPrint(arena, "key{d}.der", .{bits});
         const pub_file = try std.fmt.allocPrint(arena, "pub{d}.der", .{bits});
         const sk = try arena.create(rsa.SecretKey);
-        sk.* = try rsa.SecretKey.fromDer(try dir.readFileAlloc(io, key_file, arena, .limited(1 << 14)));
+        try rsa.SecretKey.fromDer(sk, try dir.readFileAlloc(io, key_file, arena, .limited(1 << 14)));
         const pk = try rsa.PublicKey.fromDer(try dir.readFileAlloc(io, pub_file, arena, .limited(1 << 14)));
         for (variants) |va| {
             const tag = try std.fmt.allocPrint(arena, "{d}_{s}", .{ bits, va.name });

@@ -110,6 +110,7 @@ test {
     _ = ecvrf;
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.deps is exactly {ct25519} (the constant-time secret-scalar ladder)" {

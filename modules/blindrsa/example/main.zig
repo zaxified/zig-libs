@@ -73,8 +73,10 @@ pub fn main() !void {
     // pair for each option" (audit finding B8; see SPEC.md's "Threat model
     // / limits"). `kp` serves the two `-PSS-Randomized` requests below;
     // `kp_psszero` serves the `-PSSZERO-Deterministic` one.
-    const kp = try rsa.generate(random, 1024, 65537);
-    const kp_psszero = try rsa.generate(random, 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, random, 1024, 65537);
+    var kp_psszero: rsa.KeyPair = undefined;
+    try rsa.generate(&kp_psszero, random, 1024, 65537);
 
     // ── request 1: RSABSSA-SHA384-PSS-Randomized ────────────────────────
     const msg1 = "anonymous-token request #1";

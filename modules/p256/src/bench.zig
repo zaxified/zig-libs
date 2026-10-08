@@ -184,7 +184,7 @@ test "bench (opt-in via P256_BENCH)" {
         t0 = nowNs();
         i = 0;
         while (i < sig_iters) : (i += 1) {
-            const s2 = sign.ecdsaSign(sk, msg, nonce) catch continue;
+            const s2 = sign.ecdsaSign(&sk, msg, &nonce) catch continue;
             sink ^= s2[0];
         }
         dt = nowNs() - t0;

@@ -144,7 +144,9 @@ pub const rsa_pss_sha256_server = struct {
     pub const signature = hexLit("2a1d24af4161f2c5599c928928651f4b70a6194e50cc0bf837d5b5d855c20ce78371360866baa2c41d8cd90b0a2eb72e9c1ae5a08c0e306ec9f02c882798115c9e1fc7dfe8ebf0a77a5dd97a764a6d0bd13233928572117e0b0ca5d3b78fa5aa41fc2edd41231904b304a0bb70e34457cb7f4a61bd47701c8fc363b131abee4ec230abfcf5f80c864026330a98d16ad22a9e929cabeda659239875777dbcb2b44b1831a5ebd5456d96cbfaa661370798af424afd5c1273e812203b4f7293524e19e5f095b5da4a147be918b2fbc9c46d894dbdca11d5a524669357f75c34e5647e21d3a7a3ce8ee6a36d70e6ccb4d8d0eab9f9deeae1496512bd98b3be17ec28");
 
     pub fn secretKey() !rsa.SecretKey {
-        return rsa.SecretKey.fromPrimes(&p, &q, &e);
+        var sk: rsa.SecretKey = undefined;
+        try rsa.SecretKey.fromPrimes(&sk, &p, &q, &e);
+        return sk;
     }
     pub fn publicKey() !rsa.PublicKey {
         return rsa.PublicKey.fromBytes(&n, &e);

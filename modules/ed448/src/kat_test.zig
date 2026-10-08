@@ -14,35 +14,40 @@ const v = @import("kat_vectors.zig");
 
 test "RFC 7748 §5.2: X448 scalarmult test vector 1, byte-exact" {
     const vec = v.x448.scalarmult_vectors[0];
-    const out = try x448.scalarmult(vec.scalar, vec.u);
+    var out: [x448.shared_length]u8 = undefined;
+    try x448.scalarmult(&out, &vec.scalar, vec.u);
     try std.testing.expectEqualSlices(u8, &vec.output, &out);
 }
 
 test "RFC 7748 §5.2: X448 scalarmult test vector 2, byte-exact" {
     const vec = v.x448.scalarmult_vectors[1];
-    const out = try x448.scalarmult(vec.scalar, vec.u);
+    var out: [x448.shared_length]u8 = undefined;
+    try x448.scalarmult(&out, &vec.scalar, vec.u);
     try std.testing.expectEqualSlices(u8, &vec.output, &out);
 }
 
 test "RFC 7748 §5.2: X448 iterated test, one iteration, byte-exact" {
     // Initial k = u = base_u (the byte value 5 followed by zeros).
-    const out = try x448.scalarmult(x448.base_u, x448.base_u);
+    var out: [x448.shared_length]u8 = undefined;
+    try x448.scalarmult(&out, &x448.base_u, x448.base_u);
     try std.testing.expectEqualSlices(u8, &v.x448.iterated_1, &out);
 }
 
 test "RFC 7748 §6.2: X448 Diffie-Hellman example — Alice/Bob public keys, byte-exact" {
-    const alice_pub = try x448.recoverPublicKey(v.x448.dh.alice_private);
+    const alice_pub = try x448.recoverPublicKey(&v.x448.dh.alice_private);
     try std.testing.expectEqualSlices(u8, &v.x448.dh.alice_public, &alice_pub);
 
-    const bob_pub = try x448.recoverPublicKey(v.x448.dh.bob_private);
+    const bob_pub = try x448.recoverPublicKey(&v.x448.dh.bob_private);
     try std.testing.expectEqualSlices(u8, &v.x448.dh.bob_public, &bob_pub);
 }
 
 test "RFC 7748 §6.2: X448 Diffie-Hellman example — shared secret, byte-exact, both directions" {
-    const k_alice = try x448.scalarmult(v.x448.dh.alice_private, v.x448.dh.bob_public);
+    var k_alice: [x448.shared_length]u8 = undefined;
+    try x448.scalarmult(&k_alice, &v.x448.dh.alice_private, v.x448.dh.bob_public);
     try std.testing.expectEqualSlices(u8, &v.x448.dh.shared, &k_alice);
 
-    const k_bob = try x448.scalarmult(v.x448.dh.bob_private, v.x448.dh.alice_public);
+    var k_bob: [x448.shared_length]u8 = undefined;
+    try x448.scalarmult(&k_bob, &v.x448.dh.bob_private, v.x448.dh.alice_public);
     try std.testing.expectEqualSlices(u8, &v.x448.dh.shared, &k_bob);
 }
 
@@ -58,7 +63,8 @@ test "RFC 7748 §5: X448 of a small-order u (0, 1, p - 1) is all zeros" {
     one[0] = 1;
     const zero = [_]u8{0} ** 56;
     for ([_][56]u8{ zero, one, p_minus_1 }) |u| {
-        const out = try x448.scalarmult(v.x448.dh.alice_private, u);
+        var out: [x448.shared_length]u8 = undefined;
+        try x448.scalarmult(&out, &v.x448.dh.alice_private, u);
         try std.testing.expectEqualSlices(u8, &zero, &out);
     }
 }
@@ -66,10 +72,10 @@ test "RFC 7748 §5: X448 of a small-order u (0, 1, p - 1) is all zeros" {
 // ── Ed448 / Ed448ph (RFC 8032 §7.4, §7.5) ───────────────────────────────
 
 fn checkEd448Vector(vec: v.ed448.Vec) !void {
-    const kp = ed448.KeyPair.create(vec.sk);
+    const kp = ed448.KeyPair.create(&vec.sk);
     try std.testing.expectEqualSlices(u8, &vec.pk, &kp.public_key.bytes);
 
-    const sig = try ed448.sign(kp, vec.msg, vec.ctx);
+    const sig = try ed448.sign(&kp, vec.msg, vec.ctx);
     try std.testing.expectEqualSlices(u8, &vec.sig, &sig.toBytes());
 
     try ed448.verify(sig, vec.msg, vec.ctx, kp.public_key);
@@ -116,18 +122,18 @@ test "RFC 8032 §7.4/§7.5: the variable-base Point.mul reproduces the public ke
 
 test "RFC 8032 §7.4: context binding — a signature made under one context fails to verify under another" {
     const vec = v.ed448.one_octet_with_context;
-    const kp = ed448.KeyPair.create(vec.sk);
-    const sig = try ed448.sign(kp, vec.msg, vec.ctx);
+    const kp = ed448.KeyPair.create(&vec.sk);
+    const sig = try ed448.sign(&kp, vec.msg, vec.ctx);
     try std.testing.expectError(error.SignatureVerificationFailed, ed448.verify(sig, vec.msg, "bar", kp.public_key));
     try std.testing.expectError(error.SignatureVerificationFailed, ed448.verify(sig, vec.msg, "", kp.public_key));
 }
 
 test "RFC 8032 §7.5: Ed448ph 'TEST abc' vector — keygen + signPh + verifyPh, byte-exact" {
     const vec = v.ed448.ph_test_abc;
-    const kp = ed448.KeyPair.create(vec.sk);
+    const kp = ed448.KeyPair.create(&vec.sk);
     try std.testing.expectEqualSlices(u8, &vec.pk, &kp.public_key.bytes);
 
-    const sig = try ed448.signPh(kp, vec.msg, vec.ctx);
+    const sig = try ed448.signPh(&kp, vec.msg, vec.ctx);
     try std.testing.expectEqualSlices(u8, &vec.sig, &sig.toBytes());
 
     try ed448.verifyPh(sig, vec.msg, vec.ctx, kp.public_key);
@@ -139,7 +145,7 @@ test "RFC 8032 §7.4: Ed448 plain 'verify' rejects a signature made for Ed448ph,
     // under one is not valid under the other, even for the same
     // underlying message bytes and key pair.
     const vec = v.ed448.ph_test_abc;
-    const kp = ed448.KeyPair.create(vec.sk);
-    const sig_ph = try ed448.signPh(kp, vec.msg, vec.ctx);
+    const kp = ed448.KeyPair.create(&vec.sk);
+    const sig_ph = try ed448.signPh(&kp, vec.msg, vec.ctx);
     try std.testing.expectError(error.SignatureVerificationFailed, ed448.verify(sig_ph, vec.msg, vec.ctx, kp.public_key));
 }

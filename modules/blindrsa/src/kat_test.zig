@@ -679,7 +679,8 @@ test "full round-trip: fresh rsa.generate() keypair, blind -> blindSign -> final
     // (em_len >= hLen + sLen + 2 = 48 + 48 + 2 = 98 bytes => >= 784 bits);
     // rounded up for test speed (rsa.generate is exercised elsewhere at
     // realistic sizes in the rsa module's own test suite).
-    const kp = try rsa.generate(random, 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, random, 1024, 65537);
 
     const msg = "blindrsa round-trip smoke test";
     var prep_buf: [blindrsa.randomizer_len + msg.len]u8 = undefined;
@@ -721,8 +722,10 @@ test "full round-trip: fresh rsa.generate() keypair, blind -> blindSign -> final
 test "B8: separate keys per encoding option round-trip independently (RFC 9474 SS6.2, audit finding B8)" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x25} ** 32);
     const random = csprng.random();
-    const kp_pss = try rsa.generate(random, 1024, 65537);
-    const kp_psszero = try rsa.generate(random, 1024, 65537);
+    var kp_pss: rsa.KeyPair = undefined;
+    try rsa.generate(&kp_pss, random, 1024, 65537);
+    var kp_psszero: rsa.KeyPair = undefined;
+    try rsa.generate(&kp_psszero, random, 1024, 65537);
     try testing.expect(!kp_pss.public_key.n.v.eql(kp_psszero.public_key.n.v)); // genuinely distinct keys
 
     // -PSS-Randomized under kp_pss.

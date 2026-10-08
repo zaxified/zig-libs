@@ -114,7 +114,8 @@ pub fn main() !void {
     defer if (gpa_state.deinit() == .leak) @panic("leak");
     const gpa = gpa_state.allocator();
 
-    const sk = try rsa.SecretKey.fromPem(sp_priv_pem);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, sp_priv_pem);
 
     // A real xmlsec1-encrypted document: RSA-OAEP key transport wrapping an
     // AES-256-GCM content key, decrypted back to the exact plaintext

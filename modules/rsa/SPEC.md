@@ -53,19 +53,21 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `decryptOaepHBlinded`) is unchanged — additive only, per `QUESTIONS-ROUND-2.md` Q4 ("aditivní
   nová funkce v `rsa`, dnešní API se nemění").
 - **P3** `signPss`/`verifyPss` (RSASSA-PSS, RFC 8017 §8.1, branch-clean verify).
-- **Secret-key entry points come in two shapes, and the pointer one is not
-  decoration.** `rsadp`/`rsadpCrt`/`rsadpCrtBlinded`/`rsasp1` take a
-  `SecretKey` BY VALUE; `rsadpPtr`/`rsadpCrtPtr`/`rsadpCrtBlindedPtr`/
-  `rsasp1Ptr` take `*const SecretKey` and are otherwise identical. A by-value
-  argument is copied by the ABI **at the call site**, i.e. into the CALLER's
-  own frame, where neither side can zero it: the callee does not know the
-  address, and the caller does not know the layout. Measured by `blindrsa`'s
-  dead-stack probe (audit B20): with `blindSign` calling `rsasp1` by value the
-  prime factors `p` and `q` were readable after the call, 2 hits each, and a
-  stack burn made no difference because the copy sits ABOVE the callee's
-  frames; through `rsasp1Ptr` the same probe reads 0. `paillier` F2 hit the
-  identical wall one layer down and closed it the same way. Prefer the `*Ptr`
-  forms wherever the key is long-lived.
+- **The secret key crosses the API by pointer, and keys are built into the
+  caller's storage (2026-10-08, BREAKING).** Every entry point that uses a
+  secret key — `signPkcs1v15*`, `signPss`, `decryptOaep*`, `rsadp`,
+  `rsadpCrt*`, `rsasp1` — takes `*const SecretKey`; every constructor —
+  `SecretKey.fromPrimes`/`fromDer`/`fromPem`, `fromPkcs8`, `fromOpenSSH`,
+  `generate` — writes into an `out` pointer (zeroed on error). A by-value
+  argument is copied by the ABI **at the call site**, into the CALLER's own
+  frame, where neither side can zero it, and a returned key sits in the
+  caller's error-union temporary the same way: the dead-stack probe
+  (`src/stackprobe_test.zig`, 2026-10-08) found the whole 11.8 KiB key there
+  on every call. The 2026-09-16 additive `*Ptr` forms (audit B20, `blindrsa`)
+  are folded into the main names. Every entry point also burns the stack its
+  body used (`burn.zig`): `std.crypto.ff` passes its 4096-bit-capacity
+  `Modulus` by value into every operation, and before the burn a signature
+  left `p`, `q`, `d`, `dP`, `dQ`, `qInv` and the CRT halves dozens of times.
 
 - **P4a** DER/PEM key parsing (`PublicKey.fromDer`/`fromPem`, `SecretKey.fromDer`/`fromPkcs8`/
   `fromPem`, cleartext PEM only).

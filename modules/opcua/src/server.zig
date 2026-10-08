@@ -2075,7 +2075,7 @@ pub const Connection = struct {
             @memcpy(to_sign[client_cert.len..], client_nonce);
             server_signature = .{
                 .algorithm = security.signature_algorithm_rsa_sha256,
-                .signature = security.asymmetricSign(ctx.arena, to_sign, sec.credentials.private_key) catch |err| switch (err) {
+                .signature = security.asymmetricSign(ctx.arena, to_sign, &sec.credentials.private_key) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => {
                         try sendFault(ctx, status.bad_internal_error);
@@ -4053,7 +4053,7 @@ const TestRig = struct {
         defer rig.gpa.free(signed);
         @memcpy(signed[0..server_certificate.len], server_certificate);
         @memcpy(signed[server_certificate.len..], nonce);
-        buf.* = try security.asymmetricSign(rig.gpa, signed, client.private_key);
+        buf.* = try security.asymmetricSign(rig.gpa, signed, &client.private_key);
         return .{ .algorithm = security.signature_algorithm_rsa_sha256, .signature = buf.* };
     }
 

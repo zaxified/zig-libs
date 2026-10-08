@@ -712,7 +712,7 @@ fn unwrapCek(
             // the fallible unwrap call so a failed/rejected unwrap still
             // wipes whatever the RSA op wrote.
             defer std.crypto.secureZero(u8, &oaep_buf);
-            const got = try alg.rsaOaepUnwrap(sk, hash, encrypted_key, &oaep_buf);
+            const got = try alg.rsaOaepUnwrap(&sk, hash, encrypted_key, &oaep_buf);
             if (got.len != cek_len) return error.InvalidKey;
             @memcpy(cek, got[0..cek_len]);
         },
@@ -1615,7 +1615,8 @@ test "unwrapCek: wrapped CEKs of the wrong length and GCMKW iv/tag of the wrong 
     var cek: [16]u8 = undefined;
 
     var prng = std.Random.DefaultPrng.init(0x6a77_655f_6d75_7421);
-    const kp = try rsa.generate(prng.random(), 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
     const rsa_parsed = try header.parse(a, "{\"alg\":\"RSA-OAEP\",\"enc\":\"A128GCM\"}");
     const cek17 = [_]u8{0x5a} ** 17;
     for ([_]usize{ 15, 17 }) |n| {

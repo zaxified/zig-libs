@@ -51,6 +51,7 @@
 //! own policy header for when an entry is/isn't required).
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const ed448 = @import("ed448");
 const scalar = @import("scalar.zig");
 
@@ -262,8 +263,19 @@ pub const Element = struct {
     /// build without `-fvalgrind`. Re-introducing an `if (nibble != 0)`
     /// table lookup in `Point.mul` moves it to 4 in-file, exit 99. See
     /// `SPEC.md`'s "Constant-time note (measured)" for the full table.
-    pub fn scalarMul(a: Element, s: scalar.CompressedScalar) Element {
-        return .{ .p = Point.mul(a.p, scalar.toEd448(s)) };
+    ///
+    /// Scalar by pointer (BREAKING 2026-10-08): by value, the caller's frame
+    /// kept a copy of it (`stackprobe_test.zig`). The multiply itself is
+    /// burned in ed448's `Point.mul`.
+    pub fn scalarMul(a: Element, s: *const scalar.CompressedScalar) Element {
+        const r = scalarMulUnburned(a, s);
+        burn.stack(burn.scalar_burn);
+        return r;
+    }
+
+    /// The widened copy of `s` lives here, in a burned frame.
+    noinline fn scalarMulUnburned(a: Element, s: *const scalar.CompressedScalar) Element {
+        return .{ .p = Point.mul(a.p, scalar.toEd448(s.*)) };
     }
 
     /// Group equality (RFC 9496 §5.3.3): for internal representations
@@ -593,7 +605,7 @@ test "repeated addition matches RFC 9496 Appendix B.1's own recipe shape: [k]G v
     while (k < 5) : (k += 1) {
         var s = scalar.zero;
         s[0] = k;
-        const via_scalar_mul = Element.scalarMul(Element.generator, s);
+        const via_scalar_mul = Element.scalarMul(Element.generator, &s);
         try testing.expect(acc.equals(via_scalar_mul));
         acc = Element.add(acc, Element.generator);
     }
@@ -609,10 +621,10 @@ test "feFromBytesReduced: MAP's input reduction accepts values >= p (RFC 9496 §
 }
 
 test "scalarMul: [0]G == identity, [1]G == G" {
-    try testing.expect(Element.scalarMul(Element.generator, scalar.zero).equals(Element.identity));
+    try testing.expect(Element.scalarMul(Element.generator, &scalar.zero).equals(Element.identity));
     var one = scalar.zero;
     one[0] = 1;
-    try testing.expect(Element.scalarMul(Element.generator, one).equals(Element.generator));
+    try testing.expect(Element.scalarMul(Element.generator, &one).equals(Element.generator));
 }
 
 // ── fuzz harness (untrusted-wire decoder) ───────────────────────────────

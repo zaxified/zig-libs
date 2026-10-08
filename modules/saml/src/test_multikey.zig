@@ -22,7 +22,8 @@ const xmldsig = @import("xmldsig");
 
 fn otherRsaKey(seed: u64) !xmldsig.VerifyKey {
     var prng = std.Random.DefaultPrng.init(seed);
-    const kp = try rsa.generate(prng.random(), 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
     return .{ .rsa = kp.public_key };
 }
 
@@ -137,7 +138,8 @@ test "rollover: an unsigned response is SignatureMissing regardless of the key s
 test "rollover: LogoutRequest verifies under an additional key (CONSTRUCTED)" {
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5011_0009);
-    const signer = try rsa.generate(prng.random(), 1024, 65537);
+    var signer: rsa.KeyPair = undefined;
+    try rsa.generate(&signer, prng.random(), 1024, 65537);
     const old = try otherRsaKey(0x5011_000A);
     const req = try saml.buildLogoutRequest(alloc, .{
         .id = "_lr_roll",

@@ -126,13 +126,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintIf(tainted, &seed);
             const sk_seed = reloadVolatile(57, &seed);
 
-            const kp = ed448.KeyPair.create(sk_seed);
-            const sig = try ed448.sign(kp, msg, ctx);
+            const kp = ed448.KeyPair.create(&sk_seed);
+            const sig = try ed448.sign(&kp, msg, ctx);
 
             var k = secretBytes(56, "ctgrind-ed448-harness-x448-scalar-v1");
             taintIf(tainted, &k);
             const x_scalar = reloadVolatile(56, &k);
-            const shared = try x448.scalarmult(x_scalar, x448.base_u);
+            var shared: [x448.shared_length]u8 = undefined;
+            try x448.scalarmult(&shared, &x_scalar, x448.base_u);
 
             // Propagation witnesses: hex formatting is not constant-time.
             std.debug.print("pk={x}\n", .{kp.public_key.toBytes()});

@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (taint == .yes) std.valgrind.memcheck.makeMemUndefined(&s);
     const secret = reloadVolatile(&s);
 
-    const q = Element.generator.scalarMul(secret);
+    const q = Element.generator.scalarMul(&secret);
 
     std.debug.print("x={x}\n", .{q.p.x.toBytes()});
     std.debug.print("y={x}\n", .{q.p.y.toBytes()});

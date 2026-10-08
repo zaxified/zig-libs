@@ -168,7 +168,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         taintBytes(taint, &q);
         const pr = reloadVolatile([kat_p.len]u8, &p);
         const qr = reloadVolatile([kat_q.len]u8, &q);
-        var key = try rsa.SecretKey.fromPrimes(&pr, &qr, &kat_e);
+        var key: rsa.SecretKey = undefined;
+        try rsa.SecretKey.fromPrimes(&key, &pr, &qr, &kat_e);
         defer key.deinit();
         var d_out: [modulus_len]u8 = undefined;
         try key.d.toBytes(&d_out, .big);
@@ -179,7 +180,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // For `crt`/`noncrt`, key construction runs on the UNTAINTED fixed KAT
     // bytes — the per-operation path is what those targets measure; the
     // import itself is target `keygen`'s.
-    var sk = try rsa.SecretKey.fromPrimes(&kat_p, &kat_q, &kat_e);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimes(&sk, &kat_p, &kat_q, &kat_e);
     const pk = try rsa.PublicKey.fromBytes(&kat_n, &kat_e);
 
     // A fixed, public "attacker-chosen" ciphertext: encrypt a fixed message
@@ -219,8 +221,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var out: [modulus_len]u8 = undefined;
     switch (target) {
-        .crt => out = try rsa.rsadpCrt(modulus_len, c, sk_reloaded),
-        .noncrt => out = try rsa.rsadp(modulus_len, c, sk_reloaded),
+        .crt => out = try rsa.rsadpCrt(modulus_len, c, &sk_reloaded),
+        .noncrt => out = try rsa.rsadp(modulus_len, c, &sk_reloaded),
         .keygen => unreachable,
     }
 

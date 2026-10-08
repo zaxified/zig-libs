@@ -164,22 +164,22 @@ test "RFC 9497 A.2: contextString / HashToGroup DST match the published groupDST
 test "RFC 9497 A.2: DeriveKeyPair reproduces skSm (OPRF) and skSm/pkSm (VOPRF) — hashToScalar" {
     try testing.expectEqualSlices(u8, &oprf_sk, &(try deriveSecretKey(0x00)));
     try testing.expectEqualSlices(u8, &voprf_sk, &(try deriveSecretKey(0x01)));
-    try testing.expectEqualSlices(u8, &voprf_pk, &Element.generator.scalarMul(voprf_sk).encode());
+    try testing.expectEqualSlices(u8, &voprf_pk, &Element.generator.scalarMul(&voprf_sk).encode());
 }
 
 test "RFC 9497 A.2 OPRF vectors 1-2: Blind/Evaluate/Finalize — hashToElement, scalarMul, invert" {
     for (oprf_vectors) |v| {
         // Blind: blindedElement = blind * HashToGroup(input)
         const h = try hash.hashToElement(v.input, &group_dst);
-        const blinded = h.scalarMul(v.blind);
+        const blinded = h.scalarMul(&v.blind);
         try testing.expectEqualSlices(u8, &v.blinded, &blinded.encode());
 
         // BlindEvaluate: evaluatedElement = skS * blindedElement
-        const evaluated = (try Element.decode(v.blinded)).scalarMul(oprf_sk);
+        const evaluated = (try Element.decode(v.blinded)).scalarMul(&oprf_sk);
         try testing.expectEqualSlices(u8, &v.evaluated, &evaluated.encode());
 
         // Finalize: N = blind^-1 * evaluatedElement, then the output hash
-        const n = (try Element.decode(v.evaluated)).scalarMul(scalar.invert(v.blind));
+        const n = (try Element.decode(v.evaluated)).scalarMul(&scalar.invert(v.blind));
         const unblinded = n.encode();
         var sh = std.crypto.hash.sha3.Shake256.init(.{});
         var len_be: [2]u8 = undefined;
@@ -195,6 +195,6 @@ test "RFC 9497 A.2 OPRF vectors 1-2: Blind/Evaluate/Finalize — hashToElement, 
         try testing.expectEqualSlices(u8, &v.output, &out);
 
         // and the unblinded element is skS * HashToGroup(input) directly
-        try testing.expect(n.equals(h.scalarMul(oprf_sk)));
+        try testing.expect(n.equals(h.scalarMul(&oprf_sk)));
     }
 }

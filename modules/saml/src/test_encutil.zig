@@ -19,7 +19,9 @@ const saml_ns = "urn:oasis:names:tc:SAML:2.0:assertion";
 /// A 1024-bit SP key, generated deterministically (test material only).
 pub fn makeSpKey(seed: u64) !rsa.KeyPair {
     var prng = std.Random.DefaultPrng.init(seed);
-    return rsa.generate(prng.random(), 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
+    return kp;
 }
 
 fn b64(alloc: std.mem.Allocator, data: []const u8) ![]u8 {

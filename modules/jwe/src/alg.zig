@@ -75,7 +75,7 @@ pub fn rsaOaepWrap(pk: rsa.PublicKey, hash: OaepHash, entropy: Entropy, cek: []c
 
 /// Unwrap the JWE Encrypted Key under an RSA private key (§4.3) — real,
 /// thin wiring over `rsa.decryptOaep`.
-pub fn rsaOaepUnwrap(sk: rsa.SecretKey, hash: OaepHash, encrypted_key: []const u8, out: []u8) Error![]u8 {
+pub fn rsaOaepUnwrap(sk: *const rsa.SecretKey, hash: OaepHash, encrypted_key: []const u8, out: []u8) Error![]u8 {
     return switch (hash) {
         .sha1 => rsa.decryptOaep(sk, std.crypto.hash.Sha1, encrypted_key, "", out) catch return error.UnwrapFailed,
         .sha256 => rsa.decryptOaep(sk, std.crypto.hash.sha2.Sha256, encrypted_key, "", out) catch return error.UnwrapFailed,
@@ -209,7 +209,8 @@ test "RSA-OAEP-256 wrap/unwrap real round-trip (RFC 7516 A.1's 2048-bit key, SHA
     const e = [_]u8{ 0x01, 0x00, 0x01 };
 
     const pk = try rsa.PublicKey.fromBytes(n, &e);
-    const sk = try rsa.SecretKey.fromPrimes(p, q, &e);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimes(&sk, p, q, &e);
 
     const cek = [_]u8{0x77} ** 32;
     var wrapped: [256]u8 = undefined;
@@ -217,7 +218,7 @@ test "RSA-OAEP-256 wrap/unwrap real round-trip (RFC 7516 A.1's 2048-bit key, SHA
     const ek = try rsaOaepWrap(pk, .sha256, .{ .fixed_for_test = csprng.random() }, &cek, &wrapped);
 
     var recovered: [256]u8 = undefined;
-    const got = try rsaOaepUnwrap(sk, .sha256, ek, &recovered);
+    const got = try rsaOaepUnwrap(&sk, .sha256, ek, &recovered);
     try std.testing.expectEqualSlices(u8, &cek, got);
 }
 

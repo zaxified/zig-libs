@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING:** `security.asymmetricDecrypt` and `security.asymmetricSign` take
+  `private_key: *const rsa.SecretKey`, following rsa's 2026-10-08 API: by value, the 11.8 KiB key
+  was copied into the caller's frame on every call, where nothing wipes it. `generateCredentials`
+  builds the pair through rsa's out-param `generate`.
 - **2026-10-06** — **BEHAVIOURAL, not breaking:** client hardening against a
   hostile server (review 2026-10-06, open item (b)). `Channel.recvService` now
   frees everything it decoded when it refuses a response — a string-typed

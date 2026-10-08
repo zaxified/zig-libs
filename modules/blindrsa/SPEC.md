@@ -247,7 +247,8 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
   on to `rsa.rsasp1` the same way, the prime factors `p` and `q` were readable
   after the call, 2 hits each, with the burn and without it, at the same
   offsets. `blindSign` now takes `*const rsa.SecretKey` and calls
-  `rsa.rsasp1Ptr`, so no copy is made on either boundary: the same probe reads
+  `rsa.rsasp1` (`rsasp1Ptr` until rsa folded the pointer form into the main
+  name, 2026-10-08), so no copy is made on either boundary: the same probe reads
   0 for both, while its key-copy control (a call that only copies the key and
   returns) still finds 1 each, so the zero is the call being clean rather than
   the scan going blind. Restoring either half brings them back.

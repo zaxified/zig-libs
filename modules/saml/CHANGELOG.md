@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** signing passes the RSA key to `rsa.signPkcs1v15`
+  by pointer and the test key fixtures build through rsa's out-param constructors (rsa 2026-10-08).
 - **2026-10-06** — ADDED: the three gaps the 2026-09-30 survey filed; Scope mvp -> core.
   Additive only — every new field has a default and default options emit the same bytes
   as before (no BREAKING, no BEHAVIOURAL change).

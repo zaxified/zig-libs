@@ -501,7 +501,8 @@ const rsa = @import("rsa");
 /// instead of only hand-built byte fixtures.
 fn testCert(gpa: std.mem.Allocator, is_ca: bool) ![]u8 {
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
-    const kp = try rsa.generate(prng.random(), 512, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 512, 65537);
     return rsa.selfSignedCert(gpa, kp.secret_key, kp.public_key, std.crypto.hash.sha2.Sha256, .{
         .common_name = "x509 extensions test",
         .not_before = "260101000000Z",

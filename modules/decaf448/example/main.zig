@@ -113,8 +113,8 @@ pub fn main() !void {
         const bob_label = std.fmt.bufPrint(&bob_label_buf, "decaf448 example bob sk session {d}", .{session}) catch unreachable;
         const bob_sk = scalarFromLabel(bob_label);
 
-        const alice_pub = Element.scalarMul(G, alice_sk);
-        const bob_pub = Element.scalarMul(G, bob_sk);
+        const alice_pub = Element.scalarMul(G, &alice_sk);
+        const bob_pub = Element.scalarMul(G, &bob_sk);
 
         // Over the "wire": encode, then decode on the peer's side — the
         // real shape a network exchange takes, not a direct in-memory pass.
@@ -123,8 +123,8 @@ pub fn main() !void {
         const alice_pub_recv = try Element.decode(bob_pub_wire); // Bob's key, as Alice receives it
         const bob_pub_recv = try Element.decode(alice_pub_wire); // Alice's key, as Bob receives it
 
-        const alice_shared = Element.scalarMul(alice_pub_recv, alice_sk);
-        const bob_shared = Element.scalarMul(bob_pub_recv, bob_sk);
+        const alice_shared = Element.scalarMul(alice_pub_recv, &alice_sk);
+        const bob_shared = Element.scalarMul(bob_pub_recv, &bob_sk);
         must(alice_shared.equals(bob_shared), @src());
 
         const shared_wire = alice_shared.encode();
@@ -141,7 +141,7 @@ pub fn main() !void {
         // multiplication over addition, computed independently of the DH
         // exchange above: [a+b]G == [a]G + [b]G.
         const sum_sk = decaf448.scalar.add(alice_sk, bob_sk);
-        const lhs = Element.scalarMul(G, sum_sk);
+        const lhs = Element.scalarMul(G, &sum_sk);
         const rhs = Element.add(alice_pub, bob_pub);
         must(lhs.equals(rhs), @src());
     }
@@ -158,7 +158,7 @@ pub fn main() !void {
 
     const m = scalarFromLabel("decaf448 example pedersen message m=42");
     const r = scalarFromLabel("decaf448 example pedersen blinding r, run 1");
-    const commitment = Element.add(Element.scalarMul(G, m), Element.scalarMul(H, r));
+    const commitment = Element.add(Element.scalarMul(G, &m), Element.scalarMul(H, &r));
 
     // Prover -> verifier: only the commitment travels first (binding, not
     // yet hiding-broken); the opening (m, r) travels later.
@@ -167,14 +167,14 @@ pub fn main() !void {
 
     // Verifier, given the real opening, recomputes and checks equality —
     // never trusts the prover's own claim of what the commitment encodes.
-    const reopened = Element.add(Element.scalarMul(G, m), Element.scalarMul(H, r));
+    const reopened = Element.add(Element.scalarMul(G, &m), Element.scalarMul(H, &r));
     must(commitment_recv.equals(reopened), @src());
     std.debug.print("Pedersen commitment: correct opening accepted\n", .{});
 
     // A dishonest prover claiming a DIFFERENT message for the SAME
     // commitment must be rejected — the binding property.
     const wrong_m = scalarFromLabel("decaf448 example pedersen message m=43 (wrong)");
-    const wrong_reopened = Element.add(Element.scalarMul(G, wrong_m), Element.scalarMul(H, r));
+    const wrong_reopened = Element.add(Element.scalarMul(G, &wrong_m), Element.scalarMul(H, &r));
     must(!commitment_recv.equals(wrong_reopened), @src());
     std.debug.print("Pedersen commitment: wrong opening rejected\n", .{});
 

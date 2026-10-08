@@ -29,7 +29,9 @@ const t_now: i64 = 1717243200 + 30; // just after issue_instant
 
 fn makeIdpKey(seed: u64) !rsa.KeyPair {
     var prng = std.Random.DefaultPrng.init(seed);
-    return rsa.generate(prng.random(), 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
+    return kp;
 }
 
 // ── LogoutRequest: build (unsigned), structural round-trip ──────────────────

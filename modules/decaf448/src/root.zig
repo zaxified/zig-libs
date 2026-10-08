@@ -80,6 +80,7 @@ test {
     _ = @import("kat_vectors.zig");
     _ = @import("hash_kat_test.zig");
     _ = @import("kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta names RFC 9496 and its deps include ed448" {

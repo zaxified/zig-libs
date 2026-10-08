@@ -52,7 +52,9 @@ fn block(hay: []const u8, open: []const u8, close: []const u8) []const u8 {
 /// A 1024-bit SP key, generated deterministically (test material only).
 fn makeSpKey(seed: u64) !rsa.KeyPair {
     var prng = std.Random.DefaultPrng.init(seed);
-    return rsa.generate(prng.random(), 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
+    return kp;
 }
 
 fn b64(alloc: std.mem.Allocator, data: []const u8) ![]u8 {

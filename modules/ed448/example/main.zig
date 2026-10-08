@@ -25,7 +25,7 @@ pub fn main() !void {
     const message = "deploy release v3 to the edge fleet";
     const ctx = "example-protocol-v1";
 
-    const sig = try ed448.ed448.sign(kp, message, ctx);
+    const sig = try ed448.ed448.sign(&kp, message, ctx);
     try ed448.ed448.verify(sig, message, ctx, kp.public_key);
     std.debug.print("signature verified over {d} bytes\n", .{message.len});
 
@@ -44,7 +44,7 @@ pub fn main() !void {
     // reject an oversized one rather than truncate it silently (silent
     // truncation would let two different contexts collide).
     var huge_ctx: [ed448.ed448.max_context_length + 1]u8 = @splat('x');
-    if (ed448.ed448.sign(kp, message, &huge_ctx)) |_| {
+    if (ed448.ed448.sign(&kp, message, &huge_ctx)) |_| {
         return error.OversizedContextUnexpectedlySigned;
     } else |err| switch (err) {
         error.ContextTooLong => std.debug.print("oversized context correctly rejected (ContextTooLong)\n", .{}),
@@ -52,13 +52,18 @@ pub fn main() !void {
 
     // X448 side: an ephemeral Diffie-Hellman exchange between two parties,
     // the Montgomery-form sibling of the same curve family.
-    var alice = ed448.x448.KeyPair.generate(io);
+    var alice: ed448.x448.KeyPair = undefined;
+    ed448.x448.KeyPair.generate(&alice, io);
     defer alice.deinit();
-    var bob = ed448.x448.KeyPair.generate(io);
+    var bob: ed448.x448.KeyPair = undefined;
+    ed448.x448.KeyPair.generate(&bob, io);
     defer bob.deinit();
 
-    const alice_shared = try ed448.x448.scalarmult(alice.secret_key, bob.public_key);
-    const bob_shared = try ed448.x448.scalarmult(bob.secret_key, alice.public_key);
+    var alice_shared: [ed448.x448.shared_length]u8 = undefined;
+
+    try ed448.x448.scalarmult(&alice_shared, &alice.secret_key, bob.public_key);
+    var bob_shared: [ed448.x448.shared_length]u8 = undefined;
+    try ed448.x448.scalarmult(&bob_shared, &bob.secret_key, alice.public_key);
     if (!std.mem.eql(u8, &alice_shared, &bob_shared)) return error.X448SharedSecretMismatch;
     std.debug.print("X448 shared secret agrees\n", .{});
 }

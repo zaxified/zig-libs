@@ -161,7 +161,8 @@ pub const HostKey = union(enum) {
         const key_type = pk_cur.string() catch return error.InvalidOpenSSH;
 
         if (std.mem.eql(u8, key_type, "ssh-rsa")) {
-            const sk = try rsa.fromOpenSSH(text, passphrase orelse "");
+            var sk: rsa.SecretKey = undefined;
+            try rsa.fromOpenSSH(&sk, text, passphrase orelse "");
             // Public (e, n) from the container's (always-plaintext) public
             // blob: string "ssh-rsa" || mpint e || mpint n.
             const e_wire = pk_cur.string() catch return error.InvalidOpenSSH;
@@ -252,8 +253,8 @@ pub const HostKey = union(enum) {
             .rsa => |r| {
                 var sbuf: [rsa.max_modulus_len]u8 = undefined;
                 const raw = switch (r.hash) {
-                    .sha2_256 => rsa.signPkcs1v15(r.secret_key, Sha256, exchange_hash, &sbuf),
-                    .sha2_512 => rsa.signPkcs1v15(r.secret_key, Sha512, exchange_hash, &sbuf),
+                    .sha2_256 => rsa.signPkcs1v15(&r.secret_key, Sha256, exchange_hash, &sbuf),
+                    .sha2_512 => rsa.signPkcs1v15(&r.secret_key, Sha512, exchange_hash, &sbuf),
                 } catch @panic("rsa host-key signing failed on a validated key");
                 messages.writeString(&w, self.algorithmName()) catch unreachable;
                 messages.writeString(&w, raw) catch unreachable;

@@ -62,7 +62,9 @@ pub const sp_priv_pem =
 ;
 
 fn spKey() !rsa.SecretKey {
-    return rsa.SecretKey.fromPem(sp_priv_pem);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, sp_priv_pem);
+    return sk;
 }
 
 // The Response with its cleartext `<saml:Assertion>` swapped for a real
@@ -201,7 +203,8 @@ test "EXTERNAL anchor: rollover — the decrypted assertion verifies under an AD
     // inner (openssl/lxml-made) signature is accepted only because its signer
     // is in `additional_idp_keys`, and `idp_key_index` says so.
     var prng = std.Random.DefaultPrng.init(0x5011_E001);
-    const old = try rsa.generate(prng.random(), 1024, 65537);
+    var old: rsa.KeyPair = undefined;
+    try rsa.generate(&old, prng.random(), 1024, 65537);
     var cfg = baseConfig(fx.t_valid);
     cfg.sp_decrypt_key = try spKey();
     cfg.idp_key = .{ .rsa = old.public_key };

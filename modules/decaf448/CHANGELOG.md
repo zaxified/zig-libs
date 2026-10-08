@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, MEDIUM):** the new ReleaseFast stack
+  probe (`src/stackprobe_test.zig`) found the scalar and its inverse in dead frames after
+  `scalar.invert`, and the result after `scalar.random`; both now burn their stack (`burn.zig`).
+  `Element.scalarMul(a, s: *const CompressedScalar)` takes the scalar by pointer and
+  `scalar.random(out, io) !void` writes into `out` (zeroed on error) — by value, the caller's frame
+  kept a copy. 0 residues after, caller's frame included.
 - **2026-10-06** — ADDED: the scalar field — `scalar.sub`, `negate`, `invert`
   (Fermat, constant-time), `reduce(n, bytes)`/`fromWide` (wide reduction mod `l`),
   `random(io)` (`io.randomSecure`, fail-closed) and `scalar.one`; and hashing —

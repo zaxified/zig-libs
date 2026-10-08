@@ -68,7 +68,9 @@ const expected_plaintext =
     "ID=\"_a1b2\" Version=\"2.0\">the recovered assertion body</saml:Assertion>";
 
 fn spKey() !rsa.SecretKey {
-    return rsa.SecretKey.fromPem(sp_priv_pem);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, sp_priv_pem);
+    return sk;
 }
 
 // ── fixture 1: xmlsec1-encrypted, RSA-OAEP-mgf1p key transport + AES-256-GCM

@@ -59,7 +59,9 @@ pub const r = hexLit("55f2053e9a4309ac61ac4da7f3a314e626f362e95f30337962d12f08b3
 const rsa = @import("rsa");
 
 pub fn secretKey() !rsa.SecretKey {
-    return rsa.SecretKey.fromPrimes(&p, &q, &e);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimes(&sk, &p, &q, &e);
+    return sk;
 }
 
 pub fn publicKey() !rsa.PublicKey {

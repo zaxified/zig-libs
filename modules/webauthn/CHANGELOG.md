@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** a test signs through rsa's pointer API and builds its
+  key through the out-param `generate` (rsa 2026-10-08).
 - **2026-10-05** — Tests: first dated mutation run (54 mutants, all killed after 7 new tests;
   `SPEC.md` § "Mutation run 2026-10-05"). No defect; the gaps were the attestation-certificate
   arms the W3C corpus never reaches (Ed25519, RSA, P-384 keys; the AAGUID extension), key/alg

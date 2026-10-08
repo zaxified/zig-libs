@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **FIX (secrets on the dead stack, MEDIUM) + additive API:** the new ReleaseFast
+  stack probe (`src/stackprobe_test.zig`, all secret-scalar entry points) found every scalar in dead
+  frames after `mulMultiRistretto` and the shared secret after `X25519.scalarmult`; `mul`, `mulBase`,
+  `mulRistretto`, `mulRistrettoBase` and `recoverPublicKey` measured clean. Both now burn their stack
+  (`burn.zig`). `X25519` keeps std's shape (qap's TLS shim swaps it in for std's), which leaves the
+  key and the result in the caller's frame; the new `X25519.scalarmultInto(out, sk: *const, pk)`
+  leaves neither.
 - **2026-09-29** — **`X25519.scalarmult` on a 4×64-bit field core in x86-64
   MULX/ADX assembly (P6).** No API change: same signature, same bytes,
   `error.IdentityElement` on an all-zero result as std. Dispatch at compile

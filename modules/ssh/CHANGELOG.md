@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the host-key signature passes the RSA key to
+  `rsa.signPkcs1v15` by pointer, and the test key loads through rsa's out-param `fromPem`
+  (rsa 2026-10-08).
 - **2026-10-06** — **Review of the new code, fixes (no API change beyond two constants).** ⛔ Fixed:
   a failed OPEN_CONFIRMATION send in `serveConnection` freed the channel twice (H1); a client's
   message on a channel we had already closed ended the whole connection instead of being dropped

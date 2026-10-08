@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the new ReleaseFast stack
+  probe (`src/stackprobe_test.zig`) found `p`, `q`, `d`, `dP`, `dQ`, `qInv` and the CRT halves of
+  the operation in dead frames after every `signPkcs1v15`, `signPss` and `decryptOaep` — dozens of
+  copies, because `std.crypto.ff` passes its 4096-bit-capacity `Modulus` by value into every
+  operation — and the whole 11.8 KiB `SecretKey` in the CALLER's frame on every call (by-value
+  argument) and after every key load (error-union return). Every secret entry point now burns its
+  stack (`burn.zig`, 200 KiB, ~2 µs against a ~1 ms private operation), every one that uses a key
+  takes `sk: *const SecretKey` (`signPkcs1v15*`, `signPss`, `decryptOaep*`, `rsadp`, `rsadpCrt*`,
+  `rsasp1`; the 2026-09-16 `*Ptr` forms are folded in and removed), and every constructor writes
+  into an out-param zeroed on error: `SecretKey.fromPrimes/fromDer/fromPem(out, …)`,
+  `fromPkcs8(out, …)`, `fromOpenSSH(out, …)`, `generate(out: *KeyPair, …)`. 0 residues after,
+  caller's frame included.
 - **2026-10-04** — Tests: mutation schemata run (59 mutants, 55 killed, 4 equivalent).
   Ten new negative tests, each breaking exactly one property of an otherwise valid
   input: over-long signatures (both verifiers), the PKCS#1 v1.5 PS ≥ 8 bound, a

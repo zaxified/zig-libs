@@ -92,7 +92,7 @@ test "ECDSA: p256-produced signatures verify under BOTH p256 and std" {
         rand.bytes(&k);
         rand.bytes(&msg);
 
-        const sig = sign.ecdsaSign(sk, &msg, k) catch continue; // skip degenerate k
+        const sig = sign.ecdsaSign(&sk, &msg, &k) catch continue; // skip degenerate k
         produced += 1;
 
         // p256's own verifier accepts it.

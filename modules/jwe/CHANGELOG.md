@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING:** `alg.rsaOaepUnwrap(sk: *const rsa.SecretKey, …)` takes the key by
+  pointer, following rsa's 2026-10-08 API: by value, the 11.8 KiB key was copied into the
+  caller's frame on every call, where nothing wipes it. Internal callers and tests updated.
 - **2026-10-05** — **Fix (RFC 7516 §5.2 step 10):** `decryptCompact` with `alg: dir` now refuses a
   non-empty Encrypted Key segment (`error.MalformedToken`), as the ECDH-ES branch already did.
   The segment is outside the AAD, so before this a `dir` token could be altered there and still

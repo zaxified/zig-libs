@@ -114,7 +114,8 @@ test "buildArtifactResolveSoap: unsigned, well-formed SOAP structure" {
 test "buildArtifactResolveSoap: signed output verifies through xmldsig.verify directly (independent verifier)" {
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xA47_0001);
-    const kp = try rsa.generate(prng.random(), 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
     const artifact_b64 = try saml.encodeArtifactBase64(alloc, .{
         .endpoint_index = 0,
         .source_id = saml.sourceIdFromEntityId("https://sp.example.org/metadata"),
@@ -151,7 +152,8 @@ test "buildArtifactResolveSoap: signed output verifies through xmldsig.verify di
 /// to" (e.g. a minimal `<samlp:Response>`).
 fn signArtifactResponse(alloc: std.mem.Allocator, seed: u64, id: []const u8, in_response_to: []const u8, status_code: []const u8, enclosed: []const u8) !struct { xml: []u8, key: rsa.PublicKey } {
     var prng = std.Random.DefaultPrng.init(seed);
-    const kp = try rsa.generate(prng.random(), 1024, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
     const digest_placeholder = "__TEST_DIGEST_PLACEHOLDER__";
 
     const assembled = try std.fmt.allocPrint(alloc, "<samlp:ArtifactResponse xmlns:samlp=\"{s}\" xmlns:saml=\"{s}\" ID=\"{s}\" Version=\"2.0\" " ++
@@ -195,7 +197,7 @@ fn signArtifactResponse(alloc: std.mem.Allocator, seed: u64, id: []const u8, in_
     defer alloc.free(si_canon);
 
     var sig_buf: [rsa.max_modulus_len]u8 = undefined;
-    const sig = try rsa.signPkcs1v15(kp.secret_key, Sha256, si_canon, &sig_buf);
+    const sig = try rsa.signPkcs1v15(&kp.secret_key, Sha256, si_canon, &sig_buf);
     const sig_b64 = try b64(alloc, sig);
     defer alloc.free(sig_b64);
 
@@ -392,7 +394,8 @@ test "F12: exclusive-C14N extraction breaks an inner signature that used INCLUSI
     // against a signature legitimately valid before it.
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xA47_00F1);
-    const inner_kp = try rsa.generate(prng.random(), 1024, 65537);
+    var inner_kp: rsa.KeyPair = undefined;
+    try rsa.generate(&inner_kp, prng.random(), 1024, 65537);
 
     const inner_id = "_resp_inclusive";
     const digest_placeholder = "__INNER_DIGEST__";
@@ -447,7 +450,7 @@ test "F12: exclusive-C14N extraction breaks an inner signature that used INCLUSI
     const si_canon = try xmldsig.c14n.canonicalize(alloc, si2, .{ .mode = .inclusive });
     defer alloc.free(si_canon);
     var sig_buf: [rsa.max_modulus_len]u8 = undefined;
-    const sig_bytes = try rsa.signPkcs1v15(inner_kp.secret_key, Sha256, si_canon, &sig_buf);
+    const sig_bytes = try rsa.signPkcs1v15(&inner_kp.secret_key, Sha256, si_canon, &sig_buf);
     const sig_b64 = try b64(alloc, sig_bytes);
     defer alloc.free(sig_b64);
 

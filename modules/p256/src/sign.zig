@@ -32,6 +32,7 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const P256 = group.P256;
 const Scalar = scalarmod.Scalar;
 const Fe = @import("field.zig").Fe;
+const burn = @import("burn.zig");
 
 /// Std-compatible ECDSA-P256/SHA-256, instantiated over p256's fast curve.
 /// This is `std.crypto.sign.ecdsa.Ecdsa` driven by `group.P256`, so it reuses
@@ -54,7 +55,155 @@ const Fe = @import("field.zig").Fe;
 /// evidence, and in any case said nothing about `ecdsaVerify` below, a
 /// separate implementation. Both are now run against all 241 Wycheproof
 /// P1363 vectors in `wycheproof_kat_test.zig`.
-pub const EcdsaP256Sha256 = std.crypto.sign.ecdsa.Ecdsa(P256, Sha256);
+///
+/// Wrapped, not aliased: std's signer keeps the secret key, the nonce and its
+/// inverse in its own frames and never wipes them — measured 2026-10-08, every
+/// `KeyPair.sign` left `d` and `k` on the dead stack (`stackprobe_test.zig`),
+/// and `k` next to the published signature is the private key. The wrapper
+/// runs each secret-touching std call one frame down and burns its depth
+/// (`burn.zig`). Same surface as std, with two differences: `KeyPair` is this
+/// wrapper's own type (same fields), and `sign`/`signPrehashed`/`signer` take
+/// it by `*const` — `kp.sign(...)` still reads the same at the call site, but
+/// no by-value copy of the key lands in the caller's frame.
+pub const EcdsaP256Sha256 = struct {
+    const Std = std.crypto.sign.ecdsa.Ecdsa(P256, Sha256);
+
+    pub const noise_length = Std.noise_length;
+    pub const SecretKey = Std.SecretKey;
+    pub const PublicKey = Std.PublicKey;
+    pub const Signature = Std.Signature;
+    pub const Verifier = Std.Verifier;
+
+    const StdSignError = std.crypto.errors.IdentityElementError || std.crypto.errors.NonCanonicalError;
+
+    /// Incremental signer; `finalize` is burned like `KeyPair.sign`. Holds the
+    /// secret key until finalized.
+    pub const Signer = struct {
+        inner: Std.Signer,
+
+        pub fn update(self: *Signer, data: []const u8) void {
+            self.inner.update(data);
+        }
+
+        pub fn finalize(self: *Signer) StdSignError!Signature {
+            const r = finalizeUnburned(self);
+            burn.stack(burn.sign_burn);
+            return r;
+        }
+
+        noinline fn finalizeUnburned(self: *Signer) StdSignError!Signature {
+            const r = self.inner.finalize();
+            std.crypto.secureZero(u8, std.mem.asBytes(&self.inner));
+            return r;
+        }
+    };
+
+    /// An ECDSA key pair — std's fields, burned methods.
+    pub const KeyPair = struct {
+        pub const seed_length = Std.KeyPair.seed_length;
+
+        /// Public part.
+        public_key: PublicKey,
+        /// Secret scalar.
+        secret_key: SecretKey,
+
+        /// Deterministically derive a key pair from a cryptographically secure
+        /// secret seed (std's derivation, byte for byte).
+        pub fn generateDeterministic(seed: [seed_length]u8) std.crypto.errors.IdentityElementError!KeyPair {
+            const r = generateDeterministicUnburned(&seed);
+            burn.stack(burn.sign_burn);
+            return r;
+        }
+
+        noinline fn generateDeterministicUnburned(seed: *const [seed_length]u8) std.crypto.errors.IdentityElementError!KeyPair {
+            return fromStd(try Std.KeyPair.generateDeterministic(seed.*));
+        }
+
+        /// Generate a new, random key pair.
+        pub fn generate(io: std.Io) KeyPair {
+            var seed: [seed_length]u8 = undefined;
+            defer std.crypto.secureZero(u8, &seed);
+            while (true) {
+                io.random(&seed);
+                return generateDeterministic(seed) catch continue;
+            }
+        }
+
+        /// Return the key pair for `secret_key`.
+        pub fn fromSecretKey(secret_key: SecretKey) std.crypto.errors.IdentityElementError!KeyPair {
+            const r = fromSecretKeyUnburned(&secret_key);
+            burn.stack(burn.sign_burn);
+            return r;
+        }
+
+        noinline fn fromSecretKeyUnburned(secret_key: *const SecretKey) std.crypto.errors.IdentityElementError!KeyPair {
+            return fromStd(try Std.KeyPair.fromSecretKey(secret_key.*));
+        }
+
+        /// `generateDeterministic` with the seed by pointer and the pair into
+        /// `out` (zeroed on error): the std-shaped form leaves the pair —
+        /// secret half included — in the caller's error-union temporary.
+        pub fn generateDeterministicInto(out: *KeyPair, seed: *const [seed_length]u8) std.crypto.errors.IdentityElementError!void {
+            const r = generateDeterministicIntoUnburned(out, seed);
+            burn.stack(burn.sign_burn);
+            return r;
+        }
+
+        noinline fn generateDeterministicIntoUnburned(out: *KeyPair, seed: *const [seed_length]u8) std.crypto.errors.IdentityElementError!void {
+            errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+            out.* = fromStd(try Std.KeyPair.generateDeterministic(seed.*));
+        }
+
+        /// `fromSecretKey` with the key by pointer and the pair into `out`
+        /// (zeroed on error), for the same reason.
+        pub fn fromSecretKeyInto(out: *KeyPair, secret_key: *const SecretKey) std.crypto.errors.IdentityElementError!void {
+            const r = fromSecretKeyIntoUnburned(out, secret_key);
+            burn.stack(burn.sign_burn);
+            return r;
+        }
+
+        noinline fn fromSecretKeyIntoUnburned(out: *KeyPair, secret_key: *const SecretKey) std.crypto.errors.IdentityElementError!void {
+            errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+            out.* = fromStd(try Std.KeyPair.fromSecretKey(secret_key.*));
+        }
+
+        /// Sign `msg`. `noise` null gives a deterministic signature; random
+        /// noise hardens against fault attacks (std's construction).
+        pub fn sign(key_pair: *const KeyPair, msg: []const u8, noise: ?[noise_length]u8) StdSignError!Signature {
+            const r = signUnburned(key_pair, msg, if (noise) |*n| n else null);
+            burn.stack(burn.sign_burn);
+            return r;
+        }
+
+        noinline fn signUnburned(key_pair: *const KeyPair, msg: []const u8, noise: ?*const [noise_length]u8) StdSignError!Signature {
+            return toStd(key_pair).sign(msg, if (noise) |n| n.* else null);
+        }
+
+        /// Sign a message already hashed with SHA-256.
+        pub fn signPrehashed(key_pair: *const KeyPair, msg_hash: [Sha256.digest_length]u8, noise: ?[noise_length]u8) StdSignError!Signature {
+            const r = signPrehashedUnburned(key_pair, &msg_hash, if (noise) |*n| n else null);
+            burn.stack(burn.sign_burn);
+            return r;
+        }
+
+        noinline fn signPrehashedUnburned(key_pair: *const KeyPair, msg_hash: *const [Sha256.digest_length]u8, noise: ?*const [noise_length]u8) StdSignError!Signature {
+            return toStd(key_pair).signPrehashed(msg_hash.*, if (noise) |n| n.* else null);
+        }
+
+        /// An incremental signer over this key pair.
+        pub fn signer(key_pair: *const KeyPair, noise: ?[noise_length]u8) !Signer {
+            return .{ .inner = try toStd(key_pair).signer(noise) };
+        }
+
+        inline fn toStd(key_pair: *const KeyPair) Std.KeyPair {
+            return .{ .public_key = key_pair.public_key, .secret_key = key_pair.secret_key };
+        }
+
+        inline fn fromStd(kp: Std.KeyPair) KeyPair {
+            return .{ .public_key = kp.public_key, .secret_key = kp.secret_key };
+        }
+    };
+};
 
 pub const SignError = error{ InvalidSecretKey, InvalidNonce };
 
@@ -76,14 +225,24 @@ fn reduceToScalar(bytes32: [32]u8) Scalar {
 /// nonce is a parameter (not derived here) to keep the scaffold free of an
 /// RFC 6979 HMAC-DRBG; the test harness supplies random nonces and cross-checks
 /// every signature against std's verifier.
-pub fn ecdsaSign(secret_key: [32]u8, msg: []const u8, nonce_k: [32]u8) SignError![64]u8 {
-    const d = Scalar.fromBytes(secret_key, .big) catch return error.InvalidSecretKey;
+///
+/// Key and nonce by pointer, body burned (`burn.zig`): in value form every
+/// call left `d`, `k`, `k⁻¹` and `r·d` on the dead stack (`stackprobe_test.zig`,
+/// 2026-10-08).
+pub fn ecdsaSign(secret_key: *const [32]u8, msg: []const u8, nonce_k: *const [32]u8) SignError![64]u8 {
+    const r = ecdsaSignUnburned(secret_key, msg, nonce_k);
+    burn.stack(burn.sign_burn);
+    return r;
+}
+
+noinline fn ecdsaSignUnburned(secret_key: *const [32]u8, msg: []const u8, nonce_k: *const [32]u8) SignError![64]u8 {
+    const d = Scalar.fromBytes(secret_key.*, .big) catch return error.InvalidSecretKey;
     if (d.isZero()) return error.InvalidSecretKey;
-    const k = Scalar.fromBytes(nonce_k, .big) catch return error.InvalidNonce;
+    const k = Scalar.fromBytes(nonce_k.*, .big) catch return error.InvalidNonce;
     if (k.isZero()) return error.InvalidNonce;
 
     // R = k·G (constant-time fixed-base); r = x(R) mod n.
-    const R = P256.combMulBase(nonce_k, .big) catch return error.InvalidNonce;
+    const R = P256.combMulBase(nonce_k.*, .big) catch return error.InvalidNonce;
     const rx = R.affineCoordinates().x.toBytes(.big);
     const r = reduceToScalar(rx);
     if (r.isZero()) return error.InvalidNonce;
@@ -312,11 +471,20 @@ const KeyedHmac = struct {
 /// `k` yourself: a nonce that repeats across two different messages leaks the
 /// private key outright, and deriving it from the key and message removes that
 /// failure mode along with any dependence on the platform's RNG.
-pub fn ecdsaSignDeterministic(secret_key: [32]u8, msg: []const u8) SignError![64]u8 {
-    _ = Scalar.fromBytes(secret_key, .big) catch return error.InvalidSecretKey;
+///
+/// Key by pointer, body burned like `ecdsaSign`.
+pub fn ecdsaSignDeterministic(secret_key: *const [32]u8, msg: []const u8) SignError![64]u8 {
+    const r = ecdsaSignDeterministicUnburned(secret_key, msg);
+    burn.stack(burn.sign_burn);
+    return r;
+}
+
+noinline fn ecdsaSignDeterministicUnburned(secret_key: *const [32]u8, msg: []const u8) SignError![64]u8 {
+    _ = Scalar.fromBytes(secret_key.*, .big) catch return error.InvalidSecretKey;
     var h: [32]u8 = undefined;
     Sha256.hash(msg, &h, .{});
-    return ecdsaSign(secret_key, msg, rfc6979Nonce(secret_key, h).toBytes(.big));
+    const k = rfc6979Nonce(secret_key.*, h).toBytes(.big);
+    return ecdsaSignUnburned(secret_key, msg, &k);
 }
 
 /// Verify a P-256 ECDSA signature over SHA-256(`msg`). `pubkey_sec1` is a
@@ -362,7 +530,7 @@ test "ecdsa sign→verify round-trip (fixed key + nonce)" {
     const sk = [_]u8{0x11} ** 32;
     const k = [_]u8{0x22} ** 32;
     const msg = "p256 scaffold smoke";
-    const sig = try ecdsaSign(sk, msg, k);
+    const sig = try ecdsaSign(&sk, msg, &k);
     const pk = (P256.combMulBase(sk, .big) catch unreachable).toUncompressedSec1();
     try std.testing.expect(ecdsaVerify(&pk, msg, sig));
     // tamper → reject.
@@ -387,7 +555,7 @@ test "ecdsaVerify: r=0 and s=0 are rejected explicitly (never fed to any test be
     const sk = [_]u8{0x11} ** 32;
     const k = [_]u8{0x22} ** 32;
     const msg = "p256 zero r/s smoke";
-    const sig = try ecdsaSign(sk, msg, k);
+    const sig = try ecdsaSign(&sk, msg, &k);
     const pk = (P256.combMulBase(sk, .big) catch unreachable).toUncompressedSec1();
 
     var zero_r = sig;
@@ -556,10 +724,11 @@ test "ecdsaSignDeterministic: signature bytes unchanged vs the old nonce" {
         rnd.bytes(&sk);
         rnd.bytes(&msg);
         const m = msg[0..rnd.uintAtMost(usize, msg.len)];
-        const sig = ecdsaSignDeterministic(sk, m) catch continue; // sk >= n: not a key
+        const sig = ecdsaSignDeterministic(&sk, m) catch continue; // sk >= n: not a key
         var h: [32]u8 = undefined;
         Sha256.hash(m, &h, .{});
-        const old_sig = try ecdsaSign(sk, m, rfc6979NonceOld(sk, h).toBytes(.big));
+        const old_k = rfc6979NonceOld(sk, h).toBytes(.big);
+        const old_sig = try ecdsaSign(&sk, m, &old_k);
         try std.testing.expectEqualSlices(u8, &old_sig, &sig);
     }
 }

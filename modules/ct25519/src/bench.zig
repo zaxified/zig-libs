@@ -57,7 +57,9 @@ var peer_u: [32]u8 = undefined;
 fn dh(b: anytype, s: [32]u8) [32]u8 {
     ct.test_hooks.forced = b;
     defer ct.test_hooks.forced = null;
-    return ct.X25519.scalarmult(s, peer_u) catch unreachable;
+    var out: [32]u8 = undefined;
+    ct.X25519.scalarmultInto(&out, &s, peer_u) catch unreachable;
+    return out;
 }
 
 fn run(op: Op, iters: usize, scalars: *const [nscalars][32]u8, pv: Ristretto255) u8 {

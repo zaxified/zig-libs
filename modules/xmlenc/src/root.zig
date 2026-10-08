@@ -432,12 +432,12 @@ fn rsaOaepUnwrap(
     defer std.crypto.secureZero(u8, &raw_buf);
     const r = switch (hashes.digest) {
         .sha1 => switch (hashes.mgf) {
-            .sha1 => rsa.decryptOaepHNoFail(sk, Sha1, Sha1, .none, wrapped, label, want, &msg_buf, &raw_buf),
-            .sha256 => rsa.decryptOaepHNoFail(sk, Sha1, Sha256, .none, wrapped, label, want, &msg_buf, &raw_buf),
+            .sha1 => rsa.decryptOaepHNoFail(&sk, Sha1, Sha1, .none, wrapped, label, want, &msg_buf, &raw_buf),
+            .sha256 => rsa.decryptOaepHNoFail(&sk, Sha1, Sha256, .none, wrapped, label, want, &msg_buf, &raw_buf),
         },
         .sha256 => switch (hashes.mgf) {
-            .sha1 => rsa.decryptOaepHNoFail(sk, Sha256, Sha1, .none, wrapped, label, want, &msg_buf, &raw_buf),
-            .sha256 => rsa.decryptOaepHNoFail(sk, Sha256, Sha256, .none, wrapped, label, want, &msg_buf, &raw_buf),
+            .sha1 => rsa.decryptOaepHNoFail(&sk, Sha256, Sha1, .none, wrapped, label, want, &msg_buf, &raw_buf),
+            .sha256 => rsa.decryptOaepHNoFail(&sk, Sha256, Sha256, .none, wrapped, label, want, &msg_buf, &raw_buf),
         },
     } catch |e| switch (e) {
         // BufferTooSmall is a structural/public-data precondition (`want` vs
@@ -563,7 +563,7 @@ fn rsaRawPrivate(sk: rsa.SecretKey, wrapped: []const u8, out: *[rsa.max_modulus_
         if (k == L) {
             var c: [L]u8 = undefined;
             @memcpy(&c, wrapped[0..L]);
-            const m = rsa.rsadpCrt(L, c, sk) catch return error.DecryptionError;
+            const m = rsa.rsadpCrt(L, c, &sk) catch return error.DecryptionError;
             @memcpy(out[0..L], &m);
             return out[0..L];
         }
@@ -923,7 +923,9 @@ test "RFC 3394 §4.1 AES key unwrap (byte-exact)" {
 /// Deterministic test keys (test-only use of a seeded PRNG, as elsewhere here).
 fn v15TestKey(comptime bits: usize) !rsa.KeyPair {
     var prng = std.Random.DefaultPrng.init(0x15_C0_DE_15);
-    return rsa.generate(prng.random(), bits, 65537);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), bits, 65537);
+    return kp;
 }
 
 /// Build an EM block of exactly `k` bytes: `b0 || b1 || PS || sep || M`, where

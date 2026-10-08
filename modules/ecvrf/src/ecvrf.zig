@@ -81,6 +81,7 @@
 
 const std = @import("std");
 const ct25519 = @import("ct25519");
+const burn = @import("burn.zig");
 const Edwards25519 = std.crypto.ecc.Edwards25519;
 const scalar = Edwards25519.scalar;
 const Sha512 = std.crypto.hash.sha2.Sha512;
@@ -209,8 +210,17 @@ pub fn secretScalar(sk: SecretKey) [32]u8 {
 /// RFC 8032 §5.1.5's public-key derivation. `ct25519.mulBase`, not
 /// `Edwards25519.mul`: `x` is secret and std's `mul` ends in a branch on
 /// whether `[x]B` is the identity (see the module doc comment).
-pub fn publicKey(sk: SecretKey) PublicKey {
-    const x = secretScalar(sk);
+///
+/// Burned (`burn.zig`), like `prove`.
+pub fn publicKey(sk: *const SecretKey) PublicKey {
+    const r = publicKeyUnburned(sk);
+    burn.stack(burn.key_burn);
+    return r;
+}
+
+noinline fn publicKeyUnburned(sk: *const SecretKey) PublicKey {
+    var x = expandSecretKey(sk.*).x;
+    defer std.crypto.secureZero(u8, &x);
     return ct25519.mulBase(x).toBytes();
 }
 
@@ -368,15 +378,26 @@ pub fn validateKey(pk_string: PublicKey) Error!Edwards25519 {
 /// is not passed separately — this ciphersuite fixes it to `PK_string`
 /// (§5.5), derived internally from `SK`. A caller proving many inputs
 /// under one key should use `KeyPair.prove`, which does not recompute `Y`.
-pub fn prove(sk: SecretKey, alpha_string: []const u8) Proof {
-    var exp = expandSecretKey(sk);
+///
+/// Burned (`burn.zig`): the per-frame wipes of A1 E4 left the nonce `k` and
+/// the seed on the dead stack in the callees' frames (`stackprobe_test.zig`,
+/// 2026-10-08) — `k` beside the proof's `s` and `c` is the secret scalar.
+pub fn prove(sk: *const SecretKey, alpha_string: []const u8) Proof {
+    const r = proveUnburned(sk, alpha_string);
+    burn.stack(burn.prove_burn);
+    return r;
+}
+
+noinline fn proveUnburned(sk_ptr: *const SecretKey, alpha_string: []const u8) Proof {
+    const sk = sk_ptr;
+    var exp = expandSecretKey(sk.*);
     defer std.crypto.secureZero(u8, &exp.x);
     defer std.crypto.secureZero(u8, &exp.prefix);
 
     // Step 1: x, Y = x*B. `ct25519.mulBase` (constant-time, no error union)
     // — `x` is the VRF secret scalar; see the module doc comment for why
     // std's `mul` is not usable on a secret here.
-    return proveExpanded(&sk, &exp, ct25519.mulBase(exp.x).toBytes(), alpha_string);
+    return proveExpanded(sk, &exp, ct25519.mulBase(exp.x).toBytes(), alpha_string);
 }
 
 /// A secret key with its public key derived once (A1 E10). `prove` spends
@@ -392,12 +413,20 @@ pub const KeyPair = struct {
     secret_key: SecretKey,
     public_key: PublicKey,
 
-    pub fn fromSecretKey(sk: SecretKey) KeyPair {
-        return .{ .secret_key = sk, .public_key = publicKey(sk) };
+    pub fn fromSecretKey(sk: *const SecretKey) KeyPair {
+        return .{ .secret_key = sk.*, .public_key = publicKey(sk) };
     }
 
     /// `ECVRF_prove` under this key pair; the same 80 bytes `prove` returns.
+    ///
+    /// Burned like the free `prove`.
     pub fn prove(kp: *const KeyPair, alpha_string: []const u8) Proof {
+        const r = keyPairProveUnburned(kp, alpha_string);
+        burn.stack(burn.prove_burn);
+        return r;
+    }
+
+    noinline fn keyPairProveUnburned(kp: *const KeyPair, alpha_string: []const u8) Proof {
         var exp = expandSecretKey(kp.secret_key);
         defer std.crypto.secureZero(u8, &exp.x);
         defer std.crypto.secureZero(u8, &exp.prefix);
@@ -595,13 +624,13 @@ test "prove -> verify round-trips and recovers the same beta as proofToHash" {
         var sk_wide: [64]u8 = undefined;
         Sha512.hash(&[_]u8{ 'e', 'c', 'v', 'r', 'f', 's', 'k', i }, &sk_wide, .{});
         const sk: SecretKey = sk_wide[0..32].*;
-        const pk = publicKey(sk);
+        const pk = publicKey(&sk);
 
         var alpha_wide: [64]u8 = undefined;
         Sha512.hash(&[_]u8{ 'e', 'c', 'v', 'r', 'f', 'a', 'l', i }, &alpha_wide, .{});
         const alpha: [4]u8 = alpha_wide[0..4].*;
 
-        const pi = prove(sk, &alpha);
+        const pi = prove(&sk, &alpha);
         const beta_direct = try proofToHash(pi);
         const beta_verify = try verify(pk, &alpha, pi);
         try std.testing.expectEqualSlices(u8, &beta_direct, &beta_verify);
@@ -633,9 +662,9 @@ test "verify: no longer re-decodes pi to reach proofToHash's tail (audit E10 poi
     var sk_wide: [64]u8 = undefined;
     Sha512.hash("ecvrf-e10-perf-sk", &sk_wide, .{});
     const sk: SecretKey = sk_wide[0..32].*;
-    const pk = publicKey(sk);
+    const pk = publicKey(&sk);
     const alpha = "ecvrf-e10-perf-alpha";
-    const pi = prove(sk, alpha);
+    const pi = prove(&sk, alpha);
 
     const iters = 400;
     const start = std.Io.Clock.Timestamp.now(io, .awake);
