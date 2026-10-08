@@ -409,6 +409,7 @@ test {
     _ = certauth;
     _ = @import("wolfssl_replay.zig");
     _ = @import("fuzz_corpus.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\"} (certverify.zig's RSASSA-PSS dispatch + certauth.zig's cert parsing + Connection.zig's ChaCha20-Poly1305 suite; the PSK flight engine itself needs no sibling modules)" {

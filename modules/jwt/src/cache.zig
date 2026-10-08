@@ -816,7 +816,7 @@ test "VerifiedCache: ES256 end to end -- the hit returns what the verify derived
     defer set.deinit();
     const token = try root.encodeJson(testing.allocator,
         \\{"iss":"https://issuer.test","aud":"api://a","sub":"bob","scope":"read","exp":5000}
-    , .{ .es256 = kp }, .{ .kid = "e" });
+    , .{ .es256 = &kp }, .{ .kid = "e" });
     defer testing.allocator.free(token);
 
     var cache: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 16 });

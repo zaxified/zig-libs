@@ -170,7 +170,8 @@ fn clientAttempt(io: Io, gpa: std.mem.Allocator, server: net.IpAddress, st: *Sta
 
     var pbuf: [16 * 1024]u8 = undefined;
     try t.requestService("ssh-userauth", &pbuf);
-    try ssh.userauth.authenticatePublickey(&t, gpa, "alice", userKey(), .{});
+    const key = userKey();
+    try ssh.userauth.authenticatePublickey(&t, gpa, "alice", &key, .{});
     const res = try ssh.exec(&t, gpa, "report", .{ .stdin = "from-the-client" });
     defer gpa.free(res.stdout);
     defer gpa.free(res.stderr);

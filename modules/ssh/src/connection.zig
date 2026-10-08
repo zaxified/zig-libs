@@ -2118,21 +2118,21 @@ const ClientCtx = struct {
             },
             .wrong_session_id => {
                 const bogus = "not this connection's session id";
-                const e = userauth.authenticatePublickeyBoundTo(&t, gpa, "alice", key, .{}, bogus);
+                const e = userauth.authenticatePublickeyBoundTo(&t, gpa, "alice", &key, .{}, bogus);
                 try std.testing.expectError(error.AuthenticationFailed, e);
                 try t.sendDisconnect(.no_more_auth_methods_available, "give up");
                 return;
             },
             .unauthorized_key => {
                 const other = testKey(0x22);
-                const e = userauth.authenticatePublickey(&t, gpa, "alice", other, .{});
+                const e = userauth.authenticatePublickey(&t, gpa, "alice", &other, .{});
                 try std.testing.expectError(error.AuthenticationFailed, e);
                 try t.sendDisconnect(.no_more_auth_methods_available, "give up");
                 return;
             },
             .password => try userauth.authenticatePassword(&t, gpa, "alice", "correct horse", .{ .banner = self.bannerHandler() }),
-            .happy_no_probe => try userauth.authenticatePublickey(&t, gpa, "alice", key, .{ .probe_first = false }),
-            else => try userauth.authenticatePublickey(&t, gpa, "alice", key, .{ .banner = self.bannerHandler() }),
+            .happy_no_probe => try userauth.authenticatePublickey(&t, gpa, "alice", &key, .{ .probe_first = false }),
+            else => try userauth.authenticatePublickey(&t, gpa, "alice", &key, .{ .banner = self.bannerHandler() }),
         }
 
         if (self.case == .request_after_close) {
@@ -2459,7 +2459,8 @@ fn liveOurClientExec(client_key_type: []const u8, sshd_pubkey_algorithms: []cons
     // Our client-side key, loaded from the openssh-key-v1 private file.
     const ck_text = cwd.readFileAlloc(io, ck_path, gpa, .limited(16384)) catch return error.SkipZigTest;
     defer gpa.free(ck_text);
-    const client_key = userauth.AuthKey.fromOpenSSH(ck_text, null) catch return error.SkipZigTest;
+    var client_key: userauth.AuthKey = undefined;
+    userauth.AuthKey.fromOpenSSH(&client_key, ck_text, null) catch return error.SkipZigTest;
 
     var portbuf: [2]u8 = undefined;
     testFillRandom(&portbuf);
@@ -2520,7 +2521,7 @@ fn liveOurClientExec(client_key_type: []const u8, sshd_pubkey_algorithms: []cons
     var t = try transport.connect(&sr.interface, &sw.interface, gpa, accept_any_host_key);
     // RFC 4252 publickey against a real sshd — the session-id binding has to
     // be byte-exact or OpenSSH rejects the signature.
-    try userauth.authenticate(&t, gpa, user, client_key);
+    try userauth.authenticate(&t, gpa, user, &client_key);
 
     // RFC 4254 §6.5 exec + §6.10 exit-status against a real sshd. `sh -c` so
     // the command text is shell-independent (sshd runs it through the

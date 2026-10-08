@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const rsa = @import("rsa");
+const burn = @import("burn.zig");
 
 const Ecdsa = std.crypto.sign.ecdsa;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -186,11 +187,16 @@ pub const PublicKey = union(enum) {
 
 /// A CertificateVerify-capable secret (signing) key, tagged by key family --
 /// see `PublicKey`'s doc comment for the family/scheme pairing rule.
+///
+/// Every variant BORROWS the key: the pointee must outlive every use of the
+/// union. A key held by value would be copied with every pass of the union
+/// (an `rsa.SecretKey` alone is 11.8 KiB) and each copy is a secret left on
+/// the dead stack of the frame that received it.
 pub const SecretKey = union(enum) {
-    rsa: rsa.SecretKey,
-    ecdsa_p256: Ecdsa.EcdsaP256Sha256.SecretKey,
-    ecdsa_p384: Ecdsa.EcdsaP384Sha384.SecretKey,
-    ed25519: Ed25519.SecretKey,
+    rsa: *const rsa.SecretKey,
+    ecdsa_p256: *const Ecdsa.EcdsaP256Sha256.SecretKey,
+    ecdsa_p384: *const Ecdsa.EcdsaP384Sha384.SecretKey,
+    ed25519: *const Ed25519.SecretKey,
 };
 
 // ── candidateSchemes: signature_algorithms negotiation support ──────────
@@ -373,7 +379,7 @@ pub fn sign(
             const rnd = random orelse return error.RandomRequired;
             const modulus_len = (sk.n.bits() + 7) / 8;
             if (out.len < modulus_len) return error.BufferTooSmall;
-            break :blk signRsaPss(scheme, sk, content, rnd, out);
+            break :blk burn.run(burn.rsa_burn, SignError![]u8, signRsaPss, .{ scheme, sk, content, rnd, out });
         },
         .ecdsa_secp256r1_sha256 => blk: {
             const sk = switch (secret_key) {
@@ -381,7 +387,7 @@ pub fn sign(
                 else => return error.KeyMismatch,
             };
             if (out.len < Ecdsa.EcdsaP256Sha256.Signature.der_encoded_length_max) return error.BufferTooSmall;
-            break :blk signEcdsaP256(sk, content, random, out);
+            break :blk burn.run(burn.ecdsa_burn, SignError![]u8, signEcdsaP256, .{ sk, content, random, out });
         },
         .ecdsa_secp384r1_sha384 => blk: {
             const sk = switch (secret_key) {
@@ -389,7 +395,7 @@ pub fn sign(
                 else => return error.KeyMismatch,
             };
             if (out.len < Ecdsa.EcdsaP384Sha384.Signature.der_encoded_length_max) return error.BufferTooSmall;
-            break :blk signEcdsaP384(sk, content, random, out);
+            break :blk burn.run(burn.ecdsa_burn, SignError![]u8, signEcdsaP384, .{ sk, content, random, out });
         },
         .ed25519 => blk: {
             const sk = switch (secret_key) {
@@ -397,7 +403,7 @@ pub fn sign(
                 else => return error.KeyMismatch,
             };
             if (out.len < Ed25519.Signature.encoded_length) return error.BufferTooSmall;
-            break :blk signEd25519(sk, content, random, out);
+            break :blk burn.run(burn.ed25519_burn, SignError![]u8, signEd25519, .{ sk, content, random, out });
         },
         _ => error.UnsupportedScheme,
     };
@@ -428,16 +434,16 @@ fn verifyRsaPss(scheme: SignatureScheme, pk: rsa.PublicKey, content: []const u8,
     };
 }
 
-fn signRsaPss(scheme: SignatureScheme, sk: rsa.SecretKey, content: []const u8, random: std.Random, out: []u8) SignError![]u8 {
+fn signRsaPss(scheme: SignatureScheme, sk: *const rsa.SecretKey, content: []const u8, random: std.Random, out: []u8) SignError![]u8 {
     const sha2 = std.crypto.hash.sha2;
     // RFC 8446 §4.2.3: salt_len == Hash.digest_length, always randomized
     // (`random` non-null is enforced by `sign` before dispatching here).
     // rsa.signPss hashes `content` internally (RFC 8017 §9.1.1 step 2) and
     // draws the fresh salt from `random` itself.
     const result = switch (scheme) {
-        .rsa_pss_rsae_sha256 => rsa.signPss(&sk, sha2.Sha256, random, content, sha2.Sha256.digest_length, out),
-        .rsa_pss_rsae_sha384 => rsa.signPss(&sk, sha2.Sha384, random, content, sha2.Sha384.digest_length, out),
-        .rsa_pss_rsae_sha512 => rsa.signPss(&sk, sha2.Sha512, random, content, sha2.Sha512.digest_length, out),
+        .rsa_pss_rsae_sha256 => rsa.signPss(sk, sha2.Sha256, random, content, sha2.Sha256.digest_length, out),
+        .rsa_pss_rsae_sha384 => rsa.signPss(sk, sha2.Sha384, random, content, sha2.Sha384.digest_length, out),
+        .rsa_pss_rsae_sha512 => rsa.signPss(sk, sha2.Sha512, random, content, sha2.Sha512.digest_length, out),
         else => return error.UnsupportedScheme, // `sign` only routes rsa_pss_rsae_* here
     };
     return result catch |err| switch (err) {
@@ -464,11 +470,11 @@ fn verifyEcdsaP256(pk: Ecdsa.EcdsaP256Sha256.PublicKey, content: []const u8, sig
     sig.verify(content, pk) catch return error.InvalidSignature;
 }
 
-fn signEcdsaP256(sk: Ecdsa.EcdsaP256Sha256.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
+fn signEcdsaP256(sk: *const Ecdsa.EcdsaP256Sha256.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
     const Scheme = Ecdsa.EcdsaP256Sha256;
     // fromSecretKey/sign only fail on a degenerate secret key (identity /
     // non-canonical scalar) -- a key problem, mapped to KeyMismatch.
-    const key_pair = Scheme.KeyPair.fromSecretKey(sk) catch return error.KeyMismatch;
+    const key_pair = Scheme.KeyPair.fromSecretKey(sk.*) catch return error.KeyMismatch;
     var noise_buf: [Scheme.noise_length]u8 = undefined;
     const noise: ?[Scheme.noise_length]u8 = if (random) |rnd| blk: {
         rnd.bytes(&noise_buf);
@@ -486,12 +492,12 @@ fn verifyEcdsaP384(pk: Ecdsa.EcdsaP384Sha384.PublicKey, content: []const u8, sig
     sig.verify(content, pk) catch return error.InvalidSignature;
 }
 
-fn signEcdsaP384(sk: Ecdsa.EcdsaP384Sha384.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
+fn signEcdsaP384(sk: *const Ecdsa.EcdsaP384Sha384.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
     // Same shape as signEcdsaP256, over the P-384/SHA-384 instantiation
     // (noise_length is 48 here -- the curve's scalar length, not the caller's
     // concern: it comes from the Scheme type).
     const Scheme = Ecdsa.EcdsaP384Sha384;
-    const key_pair = Scheme.KeyPair.fromSecretKey(sk) catch return error.KeyMismatch;
+    const key_pair = Scheme.KeyPair.fromSecretKey(sk.*) catch return error.KeyMismatch;
     var noise_buf: [Scheme.noise_length]u8 = undefined;
     const noise: ?[Scheme.noise_length]u8 = if (random) |rnd| blk: {
         rnd.bytes(&noise_buf);
@@ -514,7 +520,7 @@ fn verifyEd25519(pk: Ed25519.PublicKey, content: []const u8, signature: []const 
     sig.verifyStrict(content, pk) catch return error.InvalidSignature;
 }
 
-fn signEd25519(sk: Ed25519.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
+fn signEd25519(sk: *const Ed25519.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
     // fromSecretKey/sign fail only on a degenerate or internally-inconsistent
     // secret key (identity/non-canonical/weak public half, or a secret key
     // whose embedded public key doesn't match -- std's KeyMismatchError) --
@@ -638,8 +644,9 @@ test "SignatureScheme: RFC 8446 §4.2.3 wire code points" {
 // -- candidateSchemes: real, complete --
 
 test "candidateSchemes: an RSA key offers all three rsa_pss_rsae_* schemes" {
-    const sk = try kat.rsa_pss_sha256_server.secretKey();
-    const schemes = candidateSchemes(.{ .rsa = sk });
+    var sk: rsa.SecretKey = undefined;
+    try kat.rsa_pss_sha256_server.secretKey(&sk);
+    const schemes = candidateSchemes(.{ .rsa = &sk });
     try testing.expectEqual(@as(usize, 3), schemes.len);
     try testing.expectEqual(SignatureScheme.rsa_pss_rsae_sha256, schemes[0]);
     try testing.expectEqual(SignatureScheme.rsa_pss_rsae_sha384, schemes[1]);
@@ -648,11 +655,11 @@ test "candidateSchemes: an RSA key offers all three rsa_pss_rsae_* schemes" {
 
 test "candidateSchemes: ECDSA/Ed25519 keys each offer exactly their one paired scheme" {
     const p256_sk = try kat.ecdsa_p256_server.secretKey();
-    try testing.expectEqualSlices(SignatureScheme, &.{.ecdsa_secp256r1_sha256}, candidateSchemes(.{ .ecdsa_p256 = p256_sk }));
+    try testing.expectEqualSlices(SignatureScheme, &.{.ecdsa_secp256r1_sha256}, candidateSchemes(.{ .ecdsa_p256 = &p256_sk }));
     const p384_sk = try kat.ecdsa_p384_server.secretKey();
-    try testing.expectEqualSlices(SignatureScheme, &.{.ecdsa_secp384r1_sha384}, candidateSchemes(.{ .ecdsa_p384 = p384_sk }));
+    try testing.expectEqualSlices(SignatureScheme, &.{.ecdsa_secp384r1_sha384}, candidateSchemes(.{ .ecdsa_p384 = &p384_sk }));
     const ed_kp = try kat.ed25519_client.keyPair();
-    try testing.expectEqualSlices(SignatureScheme, &.{.ed25519}, candidateSchemes(.{ .ed25519 = ed_kp.secret_key }));
+    try testing.expectEqualSlices(SignatureScheme, &.{.ed25519}, candidateSchemes(.{ .ed25519 = &ed_kp.secret_key }));
 }
 
 // -- verify/sign reject-path dispatch: real, complete, never touches the
@@ -677,19 +684,23 @@ test "verify: rejects an unrecognized SignatureScheme wire value" {
 }
 
 test "sign: rejects a key-family mismatch before reaching the crypto stub" {
-    const wrong_key = SecretKey{ .ed25519 = try std.crypto.sign.Ed25519.SecretKey.fromBytes(kat.ed25519_client.secret_key_bytes) };
+    const ed_sk = try std.crypto.sign.Ed25519.SecretKey.fromBytes(kat.ed25519_client.secret_key_bytes);
+    const wrong_key = SecretKey{ .ed25519 = &ed_sk };
     var out: [max_signed_content_len]u8 = undefined;
     try testing.expectError(error.KeyMismatch, sign(.ecdsa_secp256r1_sha256, wrong_key, .server, &kat.ecdsa_p256_server.transcript_hash, null, &out));
 }
 
 test "sign: RSA-PSS schemes require a random source (RFC 8446 §4.2.3 forbids salt_len = 0)" {
-    const sk = SecretKey{ .rsa = try kat.rsa_pss_sha256_server.secretKey() };
+    var rsa_sk: rsa.SecretKey = undefined;
+    try kat.rsa_pss_sha256_server.secretKey(&rsa_sk);
+    const sk = SecretKey{ .rsa = &rsa_sk };
     var out: [rsa.max_modulus_len]u8 = undefined;
     try testing.expectError(error.RandomRequired, sign(.rsa_pss_rsae_sha256, sk, .server, &kat.rsa_pss_sha256_server.transcript_hash, null, &out));
 }
 
 test "sign: rejects an undersized output buffer before reaching the crypto stub" {
-    const sk = SecretKey{ .ecdsa_p256 = try kat.ecdsa_p256_server.secretKey() };
+    const ec_sk = try kat.ecdsa_p256_server.secretKey();
+    const sk = SecretKey{ .ecdsa_p256 = &ec_sk };
     var too_small: [4]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, sign(.ecdsa_secp256r1_sha256, sk, .server, &kat.ecdsa_p256_server.transcript_hash, null, &too_small));
 }
@@ -717,7 +728,9 @@ test "KAT: rsa_pss_rsae_sha256 verify rejects a tampered signature" {
 }
 
 test "KAT: rsa_pss_rsae_sha256 sign/verify round-trip with a fresh random salt" {
-    const sk = SecretKey{ .rsa = try kat.rsa_pss_sha256_server.secretKey() };
+    var rsa_sk: rsa.SecretKey = undefined;
+    try kat.rsa_pss_sha256_server.secretKey(&rsa_sk);
+    const sk = SecretKey{ .rsa = &rsa_sk };
     const pk = PublicKey{ .rsa = try kat.rsa_pss_sha256_server.publicKey() };
     var prng = std.Random.DefaultPrng.init(0x63657274766572);
     var out: [rsa.max_modulus_len]u8 = undefined;
@@ -738,7 +751,8 @@ test "KAT: ecdsa_secp256r1_sha256 verify rejects a tampered signature" {
 }
 
 test "KAT: ecdsa_secp256r1_sha256 sign reproduces the deterministic DER vector byte-exact" {
-    const sk = SecretKey{ .ecdsa_p256 = try kat.ecdsa_p256_server.secretKey() };
+    const ec_sk = try kat.ecdsa_p256_server.secretKey();
+    const sk = SecretKey{ .ecdsa_p256 = &ec_sk };
     var out: [Ecdsa.EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
     const sig = try sign(.ecdsa_secp256r1_sha256, sk, .server, &kat.ecdsa_p256_server.transcript_hash, null, &out);
     try testing.expectEqualSlices(u8, &kat.ecdsa_p256_server.signature_der, sig);
@@ -750,7 +764,8 @@ test "KAT: ecdsa_secp384r1_sha384 verify accepts the self-generated-deterministi
 }
 
 test "KAT: ecdsa_secp384r1_sha384 sign reproduces the deterministic DER vector byte-exact" {
-    const sk = SecretKey{ .ecdsa_p384 = try kat.ecdsa_p384_server.secretKey() };
+    const ec_sk = try kat.ecdsa_p384_server.secretKey();
+    const sk = SecretKey{ .ecdsa_p384 = &ec_sk };
     var out: [Ecdsa.EcdsaP384Sha384.Signature.der_encoded_length_max]u8 = undefined;
     const sig = try sign(.ecdsa_secp384r1_sha384, sk, .server, &kat.ecdsa_p384_server.transcript_hash, null, &out);
     try testing.expectEqualSlices(u8, &kat.ecdsa_p384_server.signature_der, sig);
@@ -773,13 +788,15 @@ test "sign: an Ed25519 secret key whose embedded public half is not its own is K
     // safety; the ReleaseFast lane is the one that proves ours runs anyway.
     var bytes = kat.ed25519_client.secret_key_bytes;
     bytes[63] ^= 0x01; // flip a bit of the public half, keep the seed
-    const sk = SecretKey{ .ed25519 = try Ed25519.SecretKey.fromBytes(bytes) };
+    const ed_sk = try Ed25519.SecretKey.fromBytes(bytes);
+    const sk = SecretKey{ .ed25519 = &ed_sk };
     var out: [Ed25519.Signature.encoded_length]u8 = undefined;
     try testing.expectError(error.KeyMismatch, sign(.ed25519, sk, .client, &kat.ed25519_client.transcript_hash, null, &out));
 }
 
 test "KAT: ed25519 sign reproduces the cryptography-cross-checked vector byte-exact" {
-    const sk = SecretKey{ .ed25519 = try Ed25519.SecretKey.fromBytes(kat.ed25519_client.secret_key_bytes) };
+    const ed_sk = try Ed25519.SecretKey.fromBytes(kat.ed25519_client.secret_key_bytes);
+    const sk = SecretKey{ .ed25519 = &ed_sk };
     var out: [Ed25519.Signature.encoded_length]u8 = undefined;
     const sig = try sign(.ed25519, sk, .client, &kat.ed25519_client.transcript_hash, null, &out);
     try testing.expectEqualSlices(u8, &kat.ed25519_client.signature, sig);

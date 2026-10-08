@@ -2429,7 +2429,7 @@ pub const Transport = struct {
             .client => &server_host_key_algorithms,
             .server => blk: {
                 const n = @min(t.server_host_keys.len, hk_buf.len);
-                for (t.server_host_keys[0..n], hk_buf[0..n]) |hk, *name| name.* = hk.algorithmName();
+                for (t.server_host_keys[0..n], hk_buf[0..n]) |*hk, *name| name.* = hk.algorithmName();
                 break :blk hk_buf[0..n];
             },
         };

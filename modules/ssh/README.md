@@ -127,12 +127,13 @@ var t = ssh.transport.connect(&reader, &writer, gpa, .{
 
 // RFC 4252 publickey (requests the ssh-userauth service, then authenticates;
 // the signature is bound to t.session_id).
-const key = try ssh.userauth.AuthKey.fromOpenSSH(id_ed25519_text, null);
-try ssh.authenticate(&t, gpa, "alice", key);
+var key: ssh.userauth.AuthKey = undefined; // holds the private key: load it in place, pass a pointer
+try ssh.userauth.AuthKey.fromOpenSSH(&key, id_ed25519_text, null);
+try ssh.authenticate(&t, gpa, "alice", &key);
 // ...or step-by-step / other methods — and this is the form that can show the
 // server's RFC 4252 §5.4 banner, which `authenticate` above has nowhere to put:
 // try t.requestService("ssh-userauth", &buf);
-// try ssh.userauth.authenticatePublickey(&t, gpa, "alice", key, .{ .banner = my_banner });
+// try ssh.userauth.authenticatePublickey(&t, gpa, "alice", &key, .{ .banner = my_banner });
 // try ssh.userauth.authenticatePassword(&t, gpa, "alice", secret, .{});
 
 // RFC 4254 exec: one call, stdout + stderr + exit status.

@@ -5,6 +5,32 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** CertificateVerify signing
+  (`certverify.sign`, all four key families) left the private key and the signing nonce on the dead stack,
+  and `certverify.SecretKey` carried the keys BY VALUE (an `rsa.SecretKey` alone is 11.8 KiB), copied with
+  every `CertConfig` pass. Measured BEFORE with the new `src/stackprobe_test.zig` (ReleaseFast, per 5 calls,
+  key held in a `var`, one key case shown): ECDSA P-256 left `d` 75×, `k` 35×, `k⁻¹` 20×, `r·d` 10×,
+  `e+r·d` 10× (down to 34.5 KiB below the call; the same with noise); ECDSA P-384 `d` 110×, `k` 40×, `k⁻¹` 25×,
+  `r·d` 15×, `e+r·d` 15× (32.2 KiB); Ed25519 the seed 30×, `SHA-512(seed)` 10×, the clamped scalar 10×, the
+  prefix 5×, the nonce `r` 30× (+20× its 64-byte form; 30.7 KiB); RSA-PSS `p` 30×, `q` 40×, and the key
+  struct's `p`/`q`/`d`/`dP`/`dQ`/`qInv` images 80–200× each plus 340×/310× `p`/`q` Montgomery constants
+  (26.9 KiB, from 0.5 KiB below the call: the by-value key copies in the caller's and `sign`'s frames). `k`
+  next to a published signature is the private key. After: 0 residues in all six cases, negative control 0,
+  positive control found.
+  - **API:** every `certverify.SecretKey` variant is now a pointer (`rsa: *const rsa.SecretKey`,
+    `ecdsa_p256: *const Ecdsa.EcdsaP256Sha256.SecretKey`, `ecdsa_p384: *const …P384Sha384.SecretKey`,
+    `ed25519: *const Ed25519.SecretKey`). The key is BORROWED and must outlive every use of the union —
+    for `Connection`, the connection (`CertConfig.private_key` doc says so). `certverify.sign` keeps its
+    signature; callers write `.{ .ecdsa_p256 = &sk }` with `sk` in a `var`/`const` that has an address.
+  - `sign` runs each family's signing body one frame down and zeroes the stack it dirtied (`src/burn.zig`:
+    48 KiB ECDSA, 40 KiB Ed25519, 8 KiB RSA-PSS above rsa's own burn). Zeroing is a handful of vector
+    stores per KiB, small next to a scalar multiplication.
+  - Tests: `kat.rsa_pss_sha256_server.secretKey(out)` is an out-param now. The "CSPRNG requirement is
+    load-bearing" test compared the whole 96-byte `EcdheKeyPair.secret`, whose tail is undefined for
+    X25519/P-256 — it passed only while the stack under it happened to be equal; it now compares the 32
+    written bytes (found because the burn changed that stack).
+  - Not covered (SPEC "Backlog / deferred"): the `Connection` path itself (not driven by the probe) and
+    the ECDHE scalars, key schedule and record keys.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** CertificateVerify signing passes the RSA key to
   `rsa.signPss` by pointer, and the KAT key fixture builds through rsa's out-param `fromPrimes`
   (rsa 2026-10-08).

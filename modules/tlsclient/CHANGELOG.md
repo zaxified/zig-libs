@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING, HIGH: the client-certificate signature left the
+  key and the nonce on the dead stack; the P-256/P-384 ECDHE secret was
+  multiplied in variable time.** New ReleaseFast stack probe
+  (`stackprobe_test.zig`), 5 calls each, before → after: P-256 `d` 45, `k` 20,
+  `k⁻¹` 20, `r·d`/`e+r·d` 10 each; P-384 `d` 60, `k` 30, `k⁻¹` 25, `r·d` 15,
+  `e+r·d` 10; Ed25519 seed 10, scalar 15, prefix 15, nonce 60 — all now 0
+  (they sat in std's signer frames, below the locals we already wiped).
+  `signCertificateVerify` runs its body one frame down and zeroes 16 KiB after
+  it (`burn.zig`; bodies dirtied ≤ 7.3 KiB). `ClientAuth.key` is now
+  `*const ClientAuth.PrivateKey` (BREAKING: `.key = &key`), so `Options` copies
+  never carry the key. The P-256/P-384 key share used std's `mulPublic` on our
+  ephemeral scalar — documented "IN VARIABLE TIME", for public scalars; an
+  inherited std bug — now `mul`. Not covered yet: the key shares' own secrets
+  in std's frames (SPEC "Backlog / deferred").
+
 - **2026-10-04** — **mvp → core.** Two opt-in additions to std's client, every
   edit marked `zig-libs tlsclient`; with default options the handshake is std's
   byte for byte (tested against std's own ClientHello). **ALPN** (RFC 7301):

@@ -11,6 +11,8 @@ const native_endian = builtin.cpu.arch.endian();
 
 const std = @import("std");
 const verify = @import("verify.zig");
+// zig-libs tlsclient: dead-stack burn around the client-certificate signature.
+const burn = @import("burn.zig");
 const tls = std.crypto.tls;
 const Client = @This();
 const mem = std.mem;
@@ -181,9 +183,9 @@ pub const max_client_auth_len = 16 * 1024;
 pub const ClientAuth = struct {
     /// DER certificates, leaf first. Borrowed during `init`.
     certificate_chain: []const []const u8,
-    /// The leaf's private key. Copied into short-lived locals while signing
-    /// and wiped after; the caller owns (and wipes) this value.
-    key: PrivateKey,
+    /// The leaf's private key, borrowed for the connection: the caller owns
+    /// (and wipes) it. A pointer, so `Options` copies never carry the key.
+    key: *const PrivateKey,
 
     pub const PrivateKey = union(enum) {
         /// P-256 scalar, big-endian (SEC1). Signs `ecdsa_secp256r1_sha256`.
@@ -1233,7 +1235,7 @@ fn clientAuthMessages(buf: *[max_client_auth_len]u8, req: *const CertRequest, au
     @memcpy(msg[content.len..][0..th.len], &th);
     const signed = msg[0 .. content.len + th.len];
     var sig_buf: [160]u8 = undefined;
-    const sig = try signCertificateVerify(&sig_buf, &auth.key, signed);
+    const sig = try signCertificateVerify(&sig_buf, auth.key, signed);
     if (w.end + 4 + 4 + sig.len > buf.len) return error.ClientCertificateTooLarge;
     w.writeByte(@intFromEnum(tls.HandshakeType.certificate_verify)) catch unreachable;
     w.writeInt(u24, @intCast(4 + sig.len), .big) catch unreachable;
@@ -1244,10 +1246,17 @@ fn clientAuthMessages(buf: *[max_client_auth_len]u8, req: *const CertRequest, au
     return w.buffered();
 }
 
-/// Sign with the client key; every copy of the secret made here is wiped
-/// before return. ECDSA is RFC 6979 deterministic (no noise), DER-encoded
-/// as TLS wants; Ed25519 is RFC 8032.
-fn signCertificateVerify(out: *[160]u8, key: *const ClientAuth.PrivateKey, msg: []const u8) error{ClientKeyInvalid}![]const u8 {
+/// Sign with the client key. ECDSA is RFC 6979 deterministic (no noise),
+/// DER-encoded as TLS wants; Ed25519 is RFC 8032. The body runs one frame
+/// down and the stack it dirtied is zeroed after it: the `secureZero`s below
+/// wipe this frame's copies, but std's signers leave the key and the nonce
+/// in their own frames (2026-10-09 stack probe). `pub` for
+/// `stackprobe_test.zig`.
+pub fn signCertificateVerify(out: *[160]u8, key: *const ClientAuth.PrivateKey, msg: []const u8) error{ClientKeyInvalid}![]const u8 {
+    return burn.run(burn.sign_burn, error{ClientKeyInvalid}![]const u8, signCertificateVerifyBody, .{ out, key, msg });
+}
+
+fn signCertificateVerifyBody(out: *[160]u8, key: *const ClientAuth.PrivateKey, msg: []const u8) error{ClientKeyInvalid}![]const u8 {
     switch (key.*) {
         inline .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 => |*raw, tag| {
             const E = if (tag == .ecdsa_secp256r1_sha256) crypto.sign.ecdsa.EcdsaP256Sha256 else crypto.sign.ecdsa.EcdsaP384Sha384;
@@ -1737,7 +1746,10 @@ const KeyShare = struct {
             .secp256r1 => {
                 const PublicKey = crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey;
                 const pk = PublicKey.fromSec1(server_pub_key) catch return error.TlsDecryptFailure;
-                const mul = pk.p.mulPublic(ks.secp256r1_kp.secret_key.bytes, .big) catch
+                // zig-libs tlsclient: `mul`, not std's `mulPublic` — that one is
+                // variable-time ("for a *PUBLIC* scalar") and this scalar is our
+                // ephemeral ECDHE secret.
+                const mul = pk.p.mul(ks.secp256r1_kp.secret_key.bytes, .big) catch
                     return error.TlsDecryptFailure;
                 const sk = mul.affineCoordinates().x.toBytes(.big);
                 @memcpy(ks.sk_buf[0..sk.len], &sk);
@@ -1746,7 +1758,10 @@ const KeyShare = struct {
             .secp384r1 => {
                 const PublicKey = crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey;
                 const pk = PublicKey.fromSec1(server_pub_key) catch return error.TlsDecryptFailure;
-                const mul = pk.p.mulPublic(ks.secp384r1_kp.secret_key.bytes, .big) catch
+                // zig-libs tlsclient: `mul`, not std's `mulPublic` — that one is
+                // variable-time ("for a *PUBLIC* scalar") and this scalar is our
+                // ephemeral ECDHE secret.
+                const mul = pk.p.mul(ks.secp384r1_kp.secret_key.bytes, .big) catch
                     return error.TlsDecryptFailure;
                 const sk = mul.affineCoordinates().x.toBytes(.big);
                 @memcpy(ks.sk_buf[0..sk.len], &sk);
@@ -2065,7 +2080,8 @@ test "CertificateVerify: the RFC 8446 §4.4.3 content, verified with the public 
     req.context_len = 0;
     const seed = [_]u8{7} ** 32;
     const kp = try crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
-    const auth: ClientAuth = .{ .certificate_chain = &.{"\x30\x00"}, .key = .{ .ed25519 = seed } };
+    const key: ClientAuth.PrivateKey = .{ .ed25519 = seed };
+    const auth: ClientAuth = .{ .certificate_chain = &.{"\x30\x00"}, .key = &key };
     var th = crypto.hash.sha2.Sha256.init(.{});
     th.update("transcript so far");
     var buf: [max_client_auth_len]u8 = undefined;
@@ -2093,7 +2109,8 @@ test "CertificateVerify: the RFC 8446 §4.4.3 content, verified with the public 
 test "client Certificate echoes the request context (RFC 8446 §4.4.2)" {
     var req: CertRequest = .{ .scheme_ok = false, .context_len = 3 };
     @memcpy(req.context[0..3], "xyz");
-    const auth: ClientAuth = .{ .certificate_chain = &.{"\x30\x00"}, .key = .{ .ed25519 = [_]u8{7} ** 32 } };
+    const key: ClientAuth.PrivateKey = .{ .ed25519 = [_]u8{7} ** 32 };
+    const auth: ClientAuth = .{ .certificate_chain = &.{"\x30\x00"}, .key = &key };
     var th = crypto.hash.sha2.Sha256.init(.{});
     var buf: [max_client_auth_len]u8 = undefined;
     // Empty Certificate: type 0b, length 7 = 1 + 3 (context) + 3 (empty list).

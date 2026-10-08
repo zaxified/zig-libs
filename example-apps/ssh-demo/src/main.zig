@@ -465,159 +465,25 @@ fn loadHostKeys(
             gpa.free(text);
         }
 
-        const key = ssh.server.HostKey.fromOpenSSH(text, null) catch |err| switch (err) {
-            error.UnsupportedKeyType => {
-                try loadUnsupportedHostKey(gpa, path, text, out);
-                continue;
-            },
-            else => {
-                std.debug.print("ssh-demo: cannot load host key {s}: {t}\n", .{ path, err });
-                continue;
-            },
+        // Loaded straight into its slot: a `HostKey` holds the private key by
+        // value, so it is never returned through (or copied onto) the stack.
+        const i = out.items.len;
+        ssh.server.HostKey.fromOpenSSH(try out.addOne(gpa), text, null) catch |err| {
+            _ = out.pop();
+            std.debug.print("ssh-demo: cannot load host key {s}: {t}\n", .{ path, err });
+            continue;
         };
 
-        switch (key) {
-            // One RSA key is TWO offers. `fromOpenSSH` pins `.hash` to
-            // `.sha2_256` because the openssh-key-v1 container does not encode
-            // which rsa-sha2-* variant to sign with — RFC 8332 leaves that to
-            // negotiation. The field is public precisely so a caller can do
-            // this, and OpenSSH offers both names off one key too.
-            .rsa => {
-                var stronger = key;
-                stronger.rsa.hash = .sha2_512;
-                try out.append(gpa, stronger);
-                try out.append(gpa, key);
-            },
-            else => try out.append(gpa, key),
+        // One RSA key is TWO offers. `fromOpenSSH` pins `.hash` to
+        // `.sha2_256` because the openssh-key-v1 container does not encode
+        // which rsa-sha2-* variant to sign with — RFC 8332 leaves that to
+        // negotiation. The field is public precisely so a caller can do
+        // this, and OpenSSH offers both names off one key too.
+        if (out.items[i] == .rsa) {
+            (try out.addOne(gpa)).* = out.items[i];
+            out.items[i].rsa.hash = .sha2_512;
         }
     }
-}
-
-/// ⚠ MODULE GAP, worked around here rather than fought.
-///
-/// `ssh.server.HostKey.fromOpenSSH` dispatches on the key type named inside
-/// the openssh-key-v1 container and handles `ssh-rsa` and `ssh-ed25519` only,
-/// so an `ssh-keygen -t ecdsa` host key comes back `error.UnsupportedKeyType`
-/// — even though `HostKey` HAS an `.ecdsa_p256` variant, `publicBlob` and
-/// `sign` both implement it, and `ecdsa-sha2-nistp256` is on the module's own
-/// offered algorithm list. **The loader is the gap, not the algorithm.** So
-/// this example parses that one container shape itself and hands the module
-/// the variant it already knows what to do with.
-///
-/// The parse is checked before it is trusted: the public blob rebuilt from the
-/// parsed private scalar has to equal the container's own (always plaintext)
-/// public blob, byte for byte. A key that does not round-trip is not offered.
-fn loadUnsupportedHostKey(
-    gpa: Allocator,
-    path: []const u8,
-    text: []const u8,
-    out: *std.ArrayList(ssh.server.HostKey),
-) !void {
-    const kp = parseEcdsaP256OpenSSH(gpa, text) catch |err| {
-        std.debug.print(
-            \\ssh-demo: {s}: `HostKey.fromOpenSSH` reports UnsupportedKeyType, and this
-            \\  example's own ecdsa fallback could not read it either ({t}). Loadable
-            \\  host key types: ssh-ed25519, ssh-rsa, and ecdsa-sha2-nistp256 through
-            \\  the fallback below.
-            \\
-        , .{ path, err });
-        return;
-    };
-    std.debug.print(
-        "ssh-demo: {s}: loaded through this example's own ecdsa-sha2-nistp256 parser " ++
-            "(HostKey.fromOpenSSH cannot — module gap; K_S verified against the container's own public blob)\n",
-        .{path},
-    );
-    try out.append(gpa, .{ .ecdsa_p256 = kp });
-}
-
-const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-
-/// Parse an unencrypted `openssh-key-v1` container holding one
-/// `ecdsa-sha2-nistp256` private key (OpenSSH `PROTOCOL.key`):
-///
-///     "openssh-key-v1\0" || string ciphername || string kdfname ||
-///     string kdfoptions || uint32 nkeys || string publickey ||
-///     string (checkint || checkint || string keytype || string curve ||
-///             string Q || string d || string comment || padding)
-fn parseEcdsaP256OpenSSH(gpa: Allocator, text: []const u8) !EcdsaP256.KeyPair {
-    const bin = try pemDecodeOpenssh(gpa, text);
-    defer {
-        std.crypto.secureZero(u8, bin);
-        gpa.free(bin);
-    }
-
-    const magic = "openssh-key-v1\x00";
-    if (bin.len < magic.len or !std.mem.eql(u8, bin[0..magic.len], magic)) return error.NotAnOpensshKey;
-
-    var cur: ssh.messages.Cursor = .{ .b = bin[magic.len..] };
-    const ciphername = try cur.string();
-    const kdfname = try cur.string();
-    _ = try cur.string(); // kdfoptions
-    // A host key with a passphrase is not something a daemon can use anyway,
-    // and bcrypt-pbkdf is not this example's business.
-    if (!std.mem.eql(u8, ciphername, "none") or !std.mem.eql(u8, kdfname, "none"))
-        return error.EncryptedKeyUnsupported;
-    if (try cur.uint32() != 1) return error.MultipleKeysUnsupported;
-
-    const public_blob = try cur.string();
-    const private_section = try cur.string();
-
-    var priv: ssh.messages.Cursor = .{ .b = private_section };
-    const check1 = try priv.uint32();
-    const check2 = try priv.uint32();
-    // The two check words are the container's own "did this decrypt?" test.
-    if (check1 != check2) return error.InvalidPrivateKey;
-
-    const key_type = try priv.string();
-    if (!std.mem.eql(u8, key_type, "ecdsa-sha2-nistp256")) return error.UnsupportedKeyType;
-    const curve = try priv.string();
-    if (!std.mem.eql(u8, curve, "nistp256")) return error.UnsupportedCurve;
-    _ = try priv.string(); // Q, rebuilt from d below and compared instead
-    const d = try priv.string();
-
-    // `d` is stored the mpint way: big-endian, with a leading zero byte when
-    // the top bit would otherwise read as a sign bit. Right-align it.
-    var scalar: [32]u8 = @splat(0);
-    const trimmed = std.mem.trimStart(u8, d, &.{0});
-    if (trimmed.len > scalar.len or trimmed.len == 0) return error.InvalidPrivateKey;
-    @memcpy(scalar[scalar.len - trimmed.len ..], trimmed);
-    defer std.crypto.secureZero(u8, &scalar);
-
-    const secret = try EcdsaP256.SecretKey.fromBytes(scalar);
-    const kp = try EcdsaP256.KeyPair.fromSecretKey(secret);
-
-    // Do not trust our own parse: rebuild `K_S` through the module's own
-    // `publicBlob` and require it to match what the container says the public
-    // half is. A misparsed scalar would produce a key that signs fine and that
-    // no client can verify — a failure that would surface only over the wire.
-    const rebuilt = try (ssh.server.HostKey{ .ecdsa_p256 = kp }).publicBlob(gpa);
-    defer gpa.free(rebuilt);
-    if (!std.mem.eql(u8, rebuilt, public_blob)) return error.PublicKeyMismatch;
-
-    return kp;
-}
-
-/// Base64 body of a `-----BEGIN OPENSSH PRIVATE KEY-----` block, decoded.
-fn pemDecodeOpenssh(gpa: Allocator, text: []const u8) ![]u8 {
-    const begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
-    const end = "-----END OPENSSH PRIVATE KEY-----";
-    const bi = std.mem.indexOf(u8, text, begin) orelse return error.MissingPemBlock;
-    const body_start = bi + begin.len;
-    const ei = std.mem.indexOfPos(u8, text, body_start, end) orelse return error.MissingPemBlock;
-
-    var packed_b64: std.ArrayList(u8) = .empty;
-    defer packed_b64.deinit(gpa);
-    for (text[body_start..ei]) |ch| {
-        if (!std.ascii.isWhitespace(ch)) try packed_b64.append(gpa, ch);
-    }
-
-    const dec = std.base64.standard.Decoder;
-    const n = dec.calcSizeForSlice(packed_b64.items) catch return error.InvalidBase64;
-    const out = try gpa.alloc(u8, n);
-    errdefer gpa.free(out);
-    dec.decode(out, packed_b64.items) catch return error.InvalidBase64;
-    return out;
 }
 
 /// The fingerprints a reader checks against `ssh-keygen -lf`, and the algorithm
@@ -627,7 +493,7 @@ fn pemDecodeOpenssh(gpa: Allocator, text: []const u8) ![]u8 {
 /// algorithm names — the fingerprint is over `K_S`, which RFC 8332 §3 types
 /// `ssh-rsa` for both, while only the SIGNATURE names the hash.
 fn printHostKeys(gpa: Allocator, keys: []const ssh.server.HostKey) void {
-    for (keys) |hk| {
+    for (keys) |*hk| {
         const blob = hk.publicBlob(gpa) catch continue;
         defer gpa.free(blob);
         var fp_buf: [64]u8 = undefined;
@@ -2157,8 +2023,10 @@ fn authenticateClient(
     }
 
     if (!opts.force_password) {
-        if (loadIdentity(gpa, io, opts.identity)) |key| {
-            if (ssh.userauth.authenticatePublickey(transport, gpa, opts.user, key, .{
+        var key: ssh.userauth.AuthKey = undefined;
+        if (loadIdentity(&key, gpa, io, opts.identity)) {
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&key));
+            if (ssh.userauth.authenticatePublickey(transport, gpa, opts.user, &key, .{
                 .banner = banner_printer,
             })) |_| {
                 std.debug.print("debug1: Authentication succeeded (publickey).\n", .{});
@@ -2212,10 +2080,10 @@ fn authenticateClient(
 /// ed25519 and rsa keys both just work; an `ecdsa` private key is rejected
 /// with `error.UnsupportedKeyType` even though the module can *sign* with
 /// `AuthKey.ecdsa_p256` — the loader is the gap, not the algorithm.
-fn loadIdentity(gpa: Allocator, io: std.Io, path: []const u8) ?ssh.userauth.AuthKey {
+fn loadIdentity(out: *ssh.userauth.AuthKey, gpa: Allocator, io: std.Io, path: []const u8) bool {
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch |err| {
         std.debug.print("debug1: no usable identity at {s}: {t}\n", .{ path, err });
-        return null;
+        return false;
     };
     defer {
         // Private key material: do not leave it in the heap for the next
@@ -2223,10 +2091,11 @@ fn loadIdentity(gpa: Allocator, io: std.Io, path: []const u8) ?ssh.userauth.Auth
         std.crypto.secureZero(u8, text);
         gpa.free(text);
     }
-    return ssh.userauth.AuthKey.fromOpenSSH(text, null) catch |err| {
+    ssh.userauth.AuthKey.fromOpenSSH(out, text, null) catch |err| {
         std.debug.print("debug1: cannot load {s}: {t}\n", .{ path, err });
-        return null;
+        return false;
     };
+    return true;
 }
 
 /// Prompt without echoing. Turning `ECHO` off is the caller's job in every

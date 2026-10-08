@@ -134,7 +134,8 @@ pub const Sshd = struct {
 
         const ck_text = cwd.readFileAlloc(io, ck_path, gpa, .limited(16384)) catch return error.SkipZigTest;
         defer gpa.free(ck_text);
-        const client_key = userauth.AuthKey.fromOpenSSH(ck_text, null) catch return error.SkipZigTest;
+        var client_key: userauth.AuthKey = undefined;
+        userauth.AuthKey.fromOpenSSH(&client_key, ck_text, null) catch return error.SkipZigTest;
 
         var portbuf: [2]u8 = undefined;
         fillRandom(&portbuf);
@@ -202,7 +203,7 @@ pub const Sshd = struct {
         self.t.offer_strict_kex = opts.strict;
         errdefer self.t.deinit();
         try self.t.clientHandshake(gpa, accept_any_host_key);
-        if (opts.authenticate) try userauth.authenticate(&self.t, gpa, user, client_key);
+        if (opts.authenticate) try userauth.authenticate(&self.t, gpa, user, &client_key);
         return self;
     }
 

@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING (HIGH, secret residue): token signing and HS\* verification left keys,
+  nonces and keyed HMAC state on the dead stack; `SigningKey` now borrows its key pairs.**
+  Found by a new stack probe (`src/stackprobe_test.zig`, ReleaseFast, 16-byte windows of every secret
+  image, 2 keys × 5 `encodeJson` / `verify` calls each; BEFORE counts are over those 10 calls).
+  Before: ES256 `d` 40 (by-value key copies; the nonce was already burned inside p256); **ES384** `d` 60 (std P-384, no burn);
+  **Ed25519** seed 20; **ML-DSA**
+  (44 / 65 / 87): `K` 20, the NTT-domain `s1`/`s2`/`t0` copies 2560 / 3200–3840 / 4480–5120
+  windows each, `ρ'` 40 (ML-DSA-87 reached past the 256 KiB probe window; its `SigningKey` copy is
+  ~100 KiB per pass, three passes deep); **HS256/384/512 verification**: the `key ⊕ opad` block 30 /
+  55 / 60 and the inner hash state 10 / 40 / 40 on every verify (success or not); HS signing showed 0
+  in this run (luck of what the base64 step overwrote afterwards, not a guarantee). After: 0 for every
+  needle, NEG 0, POS ≥ 1, in all of them.
+  - `SigningKey` key-pair variants are pointers: `es256`, `es384`, `ed25519`, `ml_dsa_44/65/87` are
+    `*const …KeyPair` (borrowed for the call, never copied into a frame of ours). HMAC variants
+    stay `[]const u8`. Migrate `.{ .es256 = kp }` to `.{ .es256 = &kp }` (the pair must outlive the
+    call, so keep it in a `var`/`const` of its own, not a temporary).
+  - Signing runs one frame down per algorithm family (`src/burn.zig`) and the stack that frame dirtied
+    is zeroed afterwards: HMAC 4 KiB (body dirties 2.4 KiB), ES256/ES384/Ed25519 16 KiB (9.6 / 5.5 /
+    4.2 KiB), ML-DSA 112 / 192 / 288 KiB for set 44 / 65 / 87 (96.6 / 166.2 / 262.9 KiB) — sized per
+    set because a burn deeper than the body is stack the caller may not have. ML-DSA signs through
+    the streaming `signer` on the borrowed pair (std's `KeyPair.sign` copies the ~100 KiB pair by
+    value, twice). The HMAC compare of `verify` (HS256/384/512) runs the same way, 4 KiB.
+  - ⚠ Out of reach here, in the caller: the caller's own key storage and anything it copies the pair
+    into; std's `EcdsaP384Sha384` / `Ed25519` / `MlDsa*` key generation (not part of this module).
+
 - **2026-10-04** — Tests: first dated mutation run (111 mutants, 105 killed, 6 equivalent;
   `SPEC.md` § "Mutation run 2026-10-04"). No defect; 12 new tests close the 29 test gaps it found
   — case-sensitive `alg`, inclusive `nbf`/`iat` edges, exact `iss`/`aud`/scope matching, exact

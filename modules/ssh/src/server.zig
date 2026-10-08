@@ -39,6 +39,7 @@ const builtin = @import("builtin");
 const transport = @import("transport.zig");
 const messages = @import("messages.zig");
 const rsa = @import("rsa");
+const burn = @import("burn.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
@@ -88,6 +89,13 @@ fn stripLeadingZeros(s: []const u8) []const u8 {
 /// `verifySignature` — this is the signing mirror of that function, one
 /// variant per host-key algorithm the server can offer in `KexInit`'s
 /// `server_host_key_algorithms`.
+///
+/// A `HostKey` holds the private key BY VALUE (the `rsa` variant is ~12 KiB),
+/// so it lives in one place — the caller's storage, `ServerConfig.host_keys`
+/// — and everything here takes `*const HostKey`: a by-value pass copied the
+/// whole key into every frame on the way, and nothing ever wiped those
+/// copies (2026-10-09 stack probe). `sign` and `fromOpenSSH` run one frame
+/// down and zero the stack they dirtied (`burn.zig`).
 pub const HostKey = union(enum) {
     /// `ssh-ed25519` (RFC 8709). Signing is `std.crypto.sign.Ed25519` — no
     /// wire-format parsing needed once the `KeyPair` is in memory.
@@ -117,10 +125,16 @@ pub const HostKey = union(enum) {
     /// algorithms" name-list intentionally equals the key-blob type name for
     /// every algorithm this module offers, except rsa-sha2-* whose key blob
     /// is still typed `"ssh-rsa"` per RFC 8332 §3).
-    pub fn algorithmName(self: HostKey) []const u8 {
-        return switch (self) {
+    pub fn algorithmName(self: *const HostKey) []const u8 {
+        return self.algorithmNameFor(null);
+    }
+
+    /// `algorithmName`, with an rsa key named for `rsa_hash` instead of its
+    /// own `.hash` (`null`: its own). Other key types ignore `rsa_hash`.
+    pub fn algorithmNameFor(self: *const HostKey, rsa_hash: ?RsaHash) []const u8 {
+        return switch (self.*) {
             .ed25519 => "ssh-ed25519",
-            .rsa => |r| switch (r.hash) {
+            .rsa => |*r| switch (rsa_hash orelse r.hash) {
                 .sha2_256 => "rsa-sha2-256",
                 .sha2_512 => "rsa-sha2-512",
             },
@@ -151,7 +165,17 @@ pub const HostKey = union(enum) {
     /// `parseEcdsaP256OpenSSH` (both unencrypted containers only — real
     /// deployed host keys are unencrypted; an encrypted container of either
     /// type is rejected with `error.UnsupportedCipher`).
-    pub fn fromOpenSSH(text: []const u8, passphrase: ?[]const u8) FromOpenSSHError!HostKey {
+    ///
+    /// The key is written to `out` (no copy of it is returned through the
+    /// stack); on error `out` is zeroed.
+    pub fn fromOpenSSH(out: *HostKey, text: []const u8, passphrase: ?[]const u8) FromOpenSSHError!void {
+        burn.run(burn.load_burn, FromOpenSSHError!void, fromOpenSSHBody, .{ out, text, passphrase }) catch |e| {
+            std.crypto.secureZero(u8, std.mem.asBytes(out));
+            return e;
+        };
+    }
+
+    fn fromOpenSSHBody(out: *HostKey, text: []const u8, passphrase: ?[]const u8) FromOpenSSHError!void {
         var bin_buf: [16 * 1024]u8 = undefined;
         defer std.crypto.secureZero(u8, &bin_buf);
         const bin = try pemDecodeOpensshBlock(text, &bin_buf);
@@ -161,8 +185,10 @@ pub const HostKey = union(enum) {
         const key_type = pk_cur.string() catch return error.InvalidOpenSSH;
 
         if (std.mem.eql(u8, key_type, "ssh-rsa")) {
-            var sk: rsa.SecretKey = undefined;
-            try rsa.fromOpenSSH(&sk, text, passphrase orelse "");
+            out.* = .{ .rsa = undefined };
+            const r = &out.rsa;
+            const sk = &r.secret_key;
+            try rsa.fromOpenSSH(sk, text, passphrase orelse "");
             // Public (e, n) from the container's (always-plaintext) public
             // blob: string "ssh-rsa" || mpint e || mpint n.
             const e_wire = pk_cur.string() catch return error.InvalidOpenSSH;
@@ -173,13 +199,17 @@ pub const HostKey = union(enum) {
             sk.n.toBytes(&n_sk, .big) catch return error.InvalidPrivateKey;
             if (!std.mem.eql(u8, stripLeadingZeros(&n_sk), stripLeadingZeros(n_wire)))
                 return error.InvalidPrivateKey;
-            return .{ .rsa = .{ .secret_key = sk, .public_key = pk, .hash = .sha2_256 } };
+            r.public_key = pk;
+            r.hash = .sha2_256;
+            return;
         }
         if (std.mem.eql(u8, key_type, "ssh-ed25519")) {
-            return .{ .ed25519 = try parseEd25519OpenSSH(bin, passphrase orelse "") };
+            out.* = .{ .ed25519 = undefined };
+            return parseEd25519Body(&out.ed25519, bin);
         }
         if (std.mem.eql(u8, key_type, "ecdsa-sha2-nistp256")) {
-            return .{ .ecdsa_p256 = try parseEcdsaP256OpenSSH(bin, passphrase orelse "") };
+            out.* = .{ .ecdsa_p256 = undefined };
+            return parseEcdsaP256Body(&out.ecdsa_p256, bin);
         }
         return error.UnsupportedKeyType;
     }
@@ -195,15 +225,15 @@ pub const HostKey = union(enum) {
     ///   - ecdsa_p256: `string("ecdsa-sha2-nistp256") ||
     ///     string("nistp256") || string(SEC1 uncompressed point Q)`
     ///     (RFC 5656 §3.1).
-    pub fn publicBlob(self: HostKey, gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+    pub fn publicBlob(self: *const HostKey, gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         var buf: [1024]u8 = undefined; // rsa-4096 K_S is ~535 bytes; others far less
         var w: std.Io.Writer = .fixed(&buf);
-        switch (self) {
-            .ed25519 => |kp| {
+        switch (self.*) {
+            .ed25519 => |*kp| {
                 messages.writeString(&w, "ssh-ed25519") catch unreachable;
                 messages.writeString(&w, &kp.public_key.toBytes()) catch unreachable;
             },
-            .rsa => |r| {
+            .rsa => |*r| {
                 var eb: [rsa.max_modulus_len]u8 = undefined;
                 var nb: [rsa.max_modulus_len]u8 = undefined;
                 r.public_key.e.toBytes(&eb, .big) catch unreachable;
@@ -212,7 +242,7 @@ pub const HostKey = union(enum) {
                 messages.writeMpint(&w, &eb) catch unreachable;
                 messages.writeMpint(&w, &nb) catch unreachable;
             },
-            .ecdsa_p256 => |kp| {
+            .ecdsa_p256 => |*kp| {
                 const q = kp.public_key.toUncompressedSec1();
                 messages.writeString(&w, "ecdsa-sha2-nistp256") catch unreachable;
                 messages.writeString(&w, "nistp256") catch unreachable;
@@ -240,27 +270,39 @@ pub const HostKey = union(enum) {
     /// successfully (the std/rsa sign paths only fail on malformed key
     /// material or too-small moduli, both rejected at load time), so they
     /// panic rather than widening the error set.
-    pub fn sign(self: HostKey, gpa: std.mem.Allocator, exchange_hash: []const u8) std.mem.Allocator.Error![]u8 {
+    pub fn sign(self: *const HostKey, gpa: std.mem.Allocator, exchange_hash: []const u8) std.mem.Allocator.Error![]u8 {
+        return self.signWithHash(gpa, exchange_hash, null);
+    }
+
+    /// `sign`, with an rsa key signing under `rsa_hash` instead of its own
+    /// `.hash` (`null`: its own) — how `userauth` honours RFC 8308
+    /// `server-sig-algs` without copying the key. Other key types ignore it.
+    pub fn signWithHash(self: *const HostKey, gpa: std.mem.Allocator, data: []const u8, rsa_hash: ?RsaHash) std.mem.Allocator.Error![]u8 {
         var buf: [1024]u8 = undefined; // rsa-4096 signature blob is ~532 bytes
-        var w: std.Io.Writer = .fixed(&buf);
-        switch (self) {
-            .ed25519 => |kp| {
-                const sig = kp.sign(exchange_hash, null) catch
+        const blob = burn.run(burn.sign_burn, []const u8, signBody, .{ self, data, rsa_hash, &buf });
+        return gpa.dupe(u8, blob);
+    }
+
+    fn signBody(self: *const HostKey, data: []const u8, rsa_hash: ?RsaHash, buf: *[1024]u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        switch (self.*) {
+            .ed25519 => |*kp| {
+                const sig = kp.sign(data, null) catch
                     @panic("ed25519 host-key signing failed on a validated key");
                 messages.writeString(&w, "ssh-ed25519") catch unreachable;
                 messages.writeString(&w, &sig.toBytes()) catch unreachable;
             },
-            .rsa => |r| {
+            .rsa => |*r| {
                 var sbuf: [rsa.max_modulus_len]u8 = undefined;
-                const raw = switch (r.hash) {
-                    .sha2_256 => rsa.signPkcs1v15(&r.secret_key, Sha256, exchange_hash, &sbuf),
-                    .sha2_512 => rsa.signPkcs1v15(&r.secret_key, Sha512, exchange_hash, &sbuf),
+                const raw = switch (rsa_hash orelse r.hash) {
+                    .sha2_256 => rsa.signPkcs1v15(&r.secret_key, Sha256, data, &sbuf),
+                    .sha2_512 => rsa.signPkcs1v15(&r.secret_key, Sha512, data, &sbuf),
                 } catch @panic("rsa host-key signing failed on a validated key");
-                messages.writeString(&w, self.algorithmName()) catch unreachable;
+                messages.writeString(&w, self.algorithmNameFor(rsa_hash)) catch unreachable;
                 messages.writeString(&w, raw) catch unreachable;
             },
-            .ecdsa_p256 => |kp| {
-                const sig = kp.sign(exchange_hash, null) catch
+            .ecdsa_p256 => |*kp| {
+                const sig = kp.sign(data, null) catch
                     @panic("ecdsa host-key signing failed on a validated key");
                 var inner_buf: [80]u8 = undefined;
                 var iw: std.Io.Writer = .fixed(&inner_buf);
@@ -270,7 +312,7 @@ pub const HostKey = union(enum) {
                 messages.writeString(&w, iw.buffered()) catch unreachable;
             },
         }
-        return gpa.dupe(u8, w.buffered());
+        return w.buffered();
     }
 };
 
@@ -348,8 +390,17 @@ fn parseContainerHeader(bin: []const u8) HostKey.FromOpenSSHError!ContainerHeade
 /// `string` 32-byte pubkey, `string` 64-byte (seed || pubkey) — exactly the
 /// `std.crypto.sign.Ed25519.SecretKey` encoding — `string` comment, then
 /// deterministic padding bytes `0x01, 0x02, ...`.
-pub fn parseEd25519OpenSSH(bin: []const u8, passphrase: []const u8) HostKey.FromOpenSSHError!Ed25519.KeyPair {
+///
+/// The key pair is written to `out`; on error `out` is zeroed.
+pub fn parseEd25519OpenSSH(out: *Ed25519.KeyPair, bin: []const u8, passphrase: []const u8) HostKey.FromOpenSSHError!void {
     _ = passphrase; // encrypted containers are rejected below, never decrypted
+    burn.run(burn.load_burn, HostKey.FromOpenSSHError!void, parseEd25519Body, .{ out, bin }) catch |e| {
+        std.crypto.secureZero(u8, std.mem.asBytes(out));
+        return e;
+    };
+}
+
+fn parseEd25519Body(out: *Ed25519.KeyPair, bin: []const u8) HostKey.FromOpenSSHError!void {
     const hdr = try parseContainerHeader(bin);
     if (!std.mem.eql(u8, hdr.ciphername, "none")) return error.UnsupportedCipher;
     if (!std.mem.eql(u8, hdr.kdfname, "none") or hdr.kdfoptions.len != 0)
@@ -381,11 +432,10 @@ pub fn parseEd25519OpenSSH(bin: []const u8, passphrase: []const u8) HostKey.From
 
     const sk = Ed25519.SecretKey.fromBytes(priv_bytes[0..64].*) catch
         return error.InvalidPrivateKey;
-    const kp = Ed25519.KeyPair.fromSecretKey(sk) catch return error.InvalidPrivateKey;
+    out.* = Ed25519.KeyPair.fromSecretKey(sk) catch return error.InvalidPrivateKey;
     // fromSecretKey re-derives the public key from the seed; require it to
     // match the container's copy.
-    if (!std.mem.eql(u8, &kp.public_key.toBytes(), pub_bytes)) return error.InvalidPrivateKey;
-    return kp;
+    if (!std.mem.eql(u8, &out.public_key.toBytes(), pub_bytes)) return error.InvalidPrivateKey;
 }
 
 /// Parse an `ecdsa-sha2-nistp256` private key from an **unencrypted**
@@ -407,8 +457,17 @@ pub fn parseEd25519OpenSSH(bin: []const u8, passphrase: []const u8) HostKey.From
 /// its own copy of exactly this parser to work around it (`main.zig`'s
 /// `parseEcdsaP256OpenSSH`, marked "MODULE GAP, worked around here rather
 /// than fought") — this closes the gap at its source instead.
-pub fn parseEcdsaP256OpenSSH(bin: []const u8, passphrase: []const u8) HostKey.FromOpenSSHError!EcdsaP256.KeyPair {
+///
+/// The key pair is written to `out`; on error `out` is zeroed.
+pub fn parseEcdsaP256OpenSSH(out: *EcdsaP256.KeyPair, bin: []const u8, passphrase: []const u8) HostKey.FromOpenSSHError!void {
     _ = passphrase; // encrypted containers are rejected below, never decrypted
+    burn.run(burn.load_burn, HostKey.FromOpenSSHError!void, parseEcdsaP256Body, .{ out, bin }) catch |e| {
+        std.crypto.secureZero(u8, std.mem.asBytes(out));
+        return e;
+    };
+}
+
+fn parseEcdsaP256Body(out: *EcdsaP256.KeyPair, bin: []const u8) HostKey.FromOpenSSHError!void {
     const hdr = try parseContainerHeader(bin);
     if (!std.mem.eql(u8, hdr.ciphername, "none")) return error.UnsupportedCipher;
     if (!std.mem.eql(u8, hdr.kdfname, "none") or hdr.kdfoptions.len != 0)
@@ -448,7 +507,7 @@ pub fn parseEcdsaP256OpenSSH(bin: []const u8, passphrase: []const u8) HostKey.Fr
     defer std.crypto.secureZero(u8, &scalar);
 
     const sk = EcdsaP256.SecretKey.fromBytes(scalar) catch return error.InvalidPrivateKey;
-    const kp = EcdsaP256.KeyPair.fromSecretKey(sk) catch return error.InvalidPrivateKey;
+    out.* = EcdsaP256.KeyPair.fromSecretKey(sk) catch return error.InvalidPrivateKey;
     // Do not trust the parsed `d` (or the container's own `Q`, which is never
     // even read into a value above): rebuild K_S through publicBlob and
     // require it to equal the container's plaintext public blob byte for
@@ -458,9 +517,8 @@ pub fn parseEcdsaP256OpenSSH(bin: []const u8, passphrase: []const u8) HostKey.Fr
     var pb_w: std.Io.Writer = .fixed(&pb_buf);
     messages.writeString(&pb_w, "ecdsa-sha2-nistp256") catch unreachable;
     messages.writeString(&pb_w, "nistp256") catch unreachable;
-    messages.writeString(&pb_w, &kp.public_key.toUncompressedSec1()) catch unreachable;
+    messages.writeString(&pb_w, &out.public_key.toUncompressedSec1()) catch unreachable;
     if (!std.mem.eql(u8, pb_w.buffered(), hdr.public_blob)) return error.InvalidPrivateKey;
-    return kp;
 }
 
 // ── server configuration ────────────────────────────────────────────────────
@@ -528,7 +586,7 @@ pub fn curve25519KexServer(
     server_kexinit_payload: []const u8,
     client_id: []const u8,
     server_id: []const u8,
-    host_key: HostKey,
+    host_key: *const HostKey,
     gpa: std.mem.Allocator,
 ) transport.TransportError!transport.KexResult {
     // SSH_MSG_KEX_ECDH_INIT: byte || string Q_C.
@@ -617,7 +675,7 @@ pub fn dhGroupKexServer(
     server_kexinit_payload: []const u8,
     client_id: []const u8,
     server_id: []const u8,
-    host_key: HostKey,
+    host_key: *const HostKey,
     gpa: std.mem.Allocator,
     kex_name: []const u8,
 ) transport.TransportError!transport.KexResult {
@@ -713,7 +771,7 @@ pub fn mlkem768x25519KexServer(
     server_kexinit_payload: []const u8,
     client_id: []const u8,
     server_id: []const u8,
-    host_key: HostKey,
+    host_key: *const HostKey,
     gpa: std.mem.Allocator,
 ) transport.TransportError!transport.KexResult {
     // SSH_MSG_KEX_ECDH_INIT: byte || string C.
@@ -962,9 +1020,9 @@ pub fn serverKexRound(
     // 3. Negotiate (client-preference order per RFC 4253 §7.1).
     const kex_name = pickFirst(client_kex.kex_algorithms, &transport.kex_algorithms) orelse
         return error.UnsupportedAlgorithm;
-    var host_key: ?HostKey = null;
+    var host_key: ?*const HostKey = null;
     outer: for (client_kex.server_host_key_algorithms) |name| {
-        for (t.server_host_keys) |hk| {
+        for (t.server_host_keys) |*hk| {
             if (std.mem.eql(u8, name, hk.algorithmName())) {
                 host_key = hk;
                 break :outer;
@@ -1108,73 +1166,14 @@ test "ServerConfig is constructible with a default server_software" {
     _ = &seed;
 }
 
-// Throwaway, purpose-generated test fixtures (ssh-keygen -N "" -C
-// "zig-libs-ssh-test-fixture"); never used outside this test file.
-const fixture_ed25519_key =
-    \\-----BEGIN OPENSSH PRIVATE KEY-----
-    \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-    \\QyNTUxOQAAACAbXh+0xX5CqQGbodRtCemLNds0YSHGSbliNLhNrJtVowAAAKBLNuLfSzbi
-    \\3wAAAAtzc2gtZWQyNTUxOQAAACAbXh+0xX5CqQGbodRtCemLNds0YSHGSbliNLhNrJtVow
-    \\AAAEAT1J99c1Kuebn+/em6EEfb1f4ugX6800dEkxIiGL7b1hteH7TFfkKpAZuh1G0J6Ys1
-    \\2zRhIcZJuWI0uE2sm1WjAAAAGXppZy1saWJzLXNzaC10ZXN0LWZpeHR1cmUBAgME
-    \\-----END OPENSSH PRIVATE KEY-----
-    \\
-;
-const fixture_ed25519_pub_b64 = "AAAAC3NzaC1lZDI1NTE5AAAAIBteH7TFfkKpAZuh1G0J6Ys12zRhIcZJuWI0uE2sm1Wj";
-
-const fixture_rsa_key =
-    \\-----BEGIN OPENSSH PRIVATE KEY-----
-    \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
-    \\NhAAAAAwEAAQAAAQEAsTT0LyOIfVddUOIh7ipZkRnSCOkePGSxxPc/2vu1OlM+JT+igdyT
-    \\b9h42yQTw9vG2P2uStEmiaasYGAjENl+eK1bOzTWMUwlBUi4zVXN9CxxWUZmLl59u9Y9uz
-    \\uM0wDMdEWSQ5iLSOfcIHMnJwy5tKBZj71ejcNFkfAlcN8kT9jR1eqlMBfhH8OJLRLUbLXr
-    \\Jlnjyi9Ao6Ki3HoP+65KZKCma0powh1Vo0crCNc0cYdG4vnoBUYOvg7iL3GtW99Yg8pg7z
-    \\h7GAq2+gKPnCEoZMjOu+NZ4yQw8dW25SeahszGNxLRteoek6d9lJHvbtrdzMLE/ci7/Pe0
-    \\cveoowVLwwAAA9DfoGmR36BpkQAAAAdzc2gtcnNhAAABAQCxNPQvI4h9V11Q4iHuKlmRGd
-    \\II6R48ZLHE9z/a+7U6Uz4lP6KB3JNv2HjbJBPD28bY/a5K0SaJpqxgYCMQ2X54rVs7NNYx
-    \\TCUFSLjNVc30LHFZRmYuXn271j27O4zTAMx0RZJDmItI59wgcycnDLm0oFmPvV6Nw0WR8C
-    \\Vw3yRP2NHV6qUwF+Efw4ktEtRstesmWePKL0CjoqLceg/7rkpkoKZrSmjCHVWjRysI1zRx
-    \\h0bi+egFRg6+DuIvca1b31iDymDvOHsYCrb6Ao+cIShkyM6741njJDDx1bblJ5qGzMY3Et
-    \\G16h6Tp32Uke9u2t3MwsT9yLv897Ry96ijBUvDAAAAAwEAAQAAAQAtWwZcwlV+70t9FkPk
-    \\94XxM5CkozYP8x3k8fuwCti50vCHDCCF6HT8HYXhYPyGFsxwYY2orJuWg8h+6lxPRbuvG3
-    \\/MSZvBBmI7Vf+m3p1WL8HbPb+NgrXfy9gFAhrrLrslz2C+WF7eDCo1TAPrZMBrUNdbiPaY
-    \\hjBaSALtPs/Gd6Tl34dr7sf0egcJhEInYtYV5HwOMvVlyZ4oQWejvV9mr9dPd/46YZtAno
-    \\JktXCjtkqAoWClgp1QUb5vbb+HMtuzHVFUtzyQ3iTFA4Nw0uMuumNyNgHIPIEoNZrK2ugU
-    \\ylXZOX8PSJuD4kXvd6Pa9cyuQKsqGuS3gxy0dx3Sa9IxAAAAgH/wPnFcrOrAPoLklNtk/b
-    \\mudndObm73psJlWpiqv5R6Ydxa3Lnk4pcijFx/QoddlEHPKXEsCXXSwDyQSkPzY6/Zm/Gh
-    \\lQNpJpXfvF237eJ4N3/x4FdvP30XV2LM15P16a9rTGDU9/lfspx3DWskKDvMN8XjSoEleE
-    \\2D6w732aSfAAAAgQDnZIzPFadc1axuEv7Duj2KsVEGoYHK6zcJuhMtlelqi+nlgx9roPSS
-    \\oXxc5wQEG/tPh7pTfETpp4OTAcih2e1bHy1RjLjuDa6ClXkYt3ex7IfQ9FCly/uHNKPBJi
-    \\EKR8mqwC+FuAs0U+7LnNLRI7FKreiwHGZ7KnjBCPZyYJoF/QAAAIEAxA0+QV7uVgb4MWvk
-    \\VORUlLPAZu5kk3gnKl3mE7yIHYiSJ+8bfM2mT2lNALDcO9LsO94S2AoZbc+nEvfgEGhMuO
-    \\Yb4M407p9NvfmEe2+hUBuPjlRTLzAPw+MAhvg7K+uV0tsbNiAAQ9Piquu6D9D7fWMU6LtR
-    \\+MAP9t6jMgYUZL8AAAAZemlnLWxpYnMtc3NoLXRlc3QtZml4dHVyZQEC
-    \\-----END OPENSSH PRIVATE KEY-----
-    \\
-;
-const fixture_rsa_pub_b64 =
-    "AAAAB3NzaC1yc2EAAAADAQABAAABAQCxNPQvI4h9V11Q4iHuKlmRGdII6R48ZLHE9z/a+7U6" ++
-    "Uz4lP6KB3JNv2HjbJBPD28bY/a5K0SaJpqxgYCMQ2X54rVs7NNYxTCUFSLjNVc30LHFZRmYu" ++
-    "Xn271j27O4zTAMx0RZJDmItI59wgcycnDLm0oFmPvV6Nw0WR8CVw3yRP2NHV6qUwF+Efw4kt" ++
-    "EtRstesmWePKL0CjoqLceg/7rkpkoKZrSmjCHVWjRysI1zRxh0bi+egFRg6+DuIvca1b31iD" ++
-    "ymDvOHsYCrb6Ao+cIShkyM6741njJDDx1bblJ5qGzMY3EtG16h6Tp32Uke9u2t3MwsT9yLv8" ++
-    "97Ry96ijBUvD";
-
-const fixture_ecdsa_p256_key =
-    \\-----BEGIN OPENSSH PRIVATE KEY-----
-    \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
-    \\1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQhQ4cvIpboplGvcFaBMW/jRedkPGqA
-    \\788x4sH6ZuTBr50cBzpO6S9EcxxJZRQ1ECG/aPPtAXnR6u2RRv87CKlWAAAAuOihgOPooY
-    \\DjAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCFDhy8iluimUa9w
-    \\VoExb+NF52Q8aoDvzzHiwfpm5MGvnRwHOk7pL0RzHEllFDUQIb9o8+0BedHq7ZFG/zsIqV
-    \\YAAAAgTLRrzZQ6+kQBqIBZfCRC//prU3BuTHo0BDNBErPc11cAAAAZemlnLWxpYnMtc3No
-    \\LXRlc3QtZml4dHVyZQECAwQFBgc=
-    \\-----END OPENSSH PRIVATE KEY-----
-    \\
-;
-const fixture_ecdsa_p256_pub_b64 =
-    "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCFDhy8iluimUa9wVoExb+NF" ++
-    "52Q8aoDvzzHiwfpm5MGvnRwHOk7pL0RzHEllFDUQIb9o8+0BedHq7ZFG/zsIqVY=";
+// Host-key fixtures, shared with `stackprobe_test.zig`.
+const vectors = @import("hostkey_vectors.zig");
+const fixture_ed25519_key = vectors.ed25519_key;
+const fixture_ed25519_pub_b64 = vectors.ed25519_pub_b64;
+const fixture_rsa_key = vectors.rsa_key;
+const fixture_rsa_pub_b64 = vectors.rsa_pub_b64;
+const fixture_ecdsa_p256_key = vectors.ecdsa_p256_key;
+const fixture_ecdsa_p256_pub_b64 = vectors.ecdsa_p256_pub_b64;
 
 fn decodeFixturePub(b64: []const u8, buf: []u8) ![]u8 {
     const dec = std.base64.standard.Decoder;
@@ -1185,7 +1184,8 @@ fn decodeFixturePub(b64: []const u8, buf: []u8) ![]u8 {
 
 test "HostKey.fromOpenSSH: ed25519 fixture parses; K_S matches ssh-keygen's .pub blob" {
     const t = std.testing;
-    const hk = try HostKey.fromOpenSSH(fixture_ed25519_key, null);
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
     try t.expectEqualStrings("ssh-ed25519", hk.algorithmName());
 
     const blob = try hk.publicBlob(t.allocator);
@@ -1209,7 +1209,8 @@ test "HostKey.fromOpenSSH: ed25519 fixture parses; K_S matches ssh-keygen's .pub
 
 test "HostKey.fromOpenSSH: rsa fixture parses; K_S matches .pub; sha2-256 and sha2-512 signatures verify" {
     const t = std.testing;
-    var hk = try HostKey.fromOpenSSH(fixture_rsa_key, null);
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_rsa_key, null);
     try t.expectEqualStrings("rsa-sha2-256", hk.algorithmName());
 
     const blob = try hk.publicBlob(t.allocator);
@@ -1246,7 +1247,8 @@ test "HostKey.fromOpenSSH: ecdsa-p256 fixture parses; K_S matches ssh-keygen's .
     // the variant fully -- the loader was the only gap. `example-apps/ssh-demo`
     // carried its own copy of this parser to work around it.
     const t = std.testing;
-    const hk = try HostKey.fromOpenSSH(fixture_ecdsa_p256_key, null);
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_ecdsa_p256_key, null);
     try t.expectEqualStrings("ecdsa-sha2-nistp256", hk.algorithmName());
 
     const blob = try hk.publicBlob(t.allocator);
@@ -1302,7 +1304,8 @@ test "parseEcdsaP256OpenSSH: a curve other than nistp256 is UnsupportedKeyType, 
     try messages.writeString(&w, ""); // public blob (unchecked before the curve check)
     try messages.writeString(&w, pw.buffered());
 
-    try t.expectError(error.UnsupportedKeyType, parseEcdsaP256OpenSSH(w.buffered(), ""));
+    var kp: EcdsaP256.KeyPair = undefined;
+    try t.expectError(error.UnsupportedKeyType, parseEcdsaP256OpenSSH(&kp, w.buffered(), ""));
 }
 
 test "HostKey.sign/publicBlob: ecdsa-p256 mpint(r)||mpint(s) wire shape verifies" {
@@ -1348,7 +1351,8 @@ test "parseEd25519OpenSSH rejects an encrypted container with a clear error" {
     try w.writeAll(&[_]u8{ 0, 0, 0, 1 }); // nkeys
     try messages.writeString(&w, ""); // public blob (unchecked before cipher)
     try messages.writeString(&w, ""); // private section
-    try t.expectError(error.UnsupportedCipher, parseEd25519OpenSSH(w.buffered(), "pw"));
+    var kp: Ed25519.KeyPair = undefined;
+    try t.expectError(error.UnsupportedCipher, parseEd25519OpenSSH(&kp, w.buffered(), "pw"));
 }
 
 test "HostKey.fromOpenSSH rejects a key type none of the three loaders handle" {
@@ -1381,7 +1385,8 @@ test "HostKey.fromOpenSSH rejects a key type none of the three loaders handle" {
         .{body},
     );
     defer t.allocator.free(text);
-    try t.expectError(error.UnsupportedKeyType, HostKey.fromOpenSSH(text, null));
+    var hk: HostKey = undefined;
+    try t.expectError(error.UnsupportedKeyType, HostKey.fromOpenSSH(&hk, text, null));
 }
 
 // ── self-consistency: our client ↔ our server over loopback TCP ─────────────
@@ -1571,7 +1576,7 @@ const SelfTestClient = struct {
     }
 };
 
-fn selfConsistency(host_key: HostKey) !void {
+fn selfConsistency(host_key: *const HostKey) !void {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1593,8 +1598,8 @@ fn selfConsistency(host_key: HostKey) !void {
     var sr = stream.reader(io, &rbuf);
     var sw = stream.writer(io, &wbuf);
 
-    const keys = [_]HostKey{host_key};
-    var t = try accept(&sr.interface, &sw.interface, gpa, .{ .host_keys = &keys });
+    const keys: []const HostKey = host_key[0..1];
+    var t = try accept(&sr.interface, &sw.interface, gpa, .{ .host_keys = keys });
 
     // The client's encrypted probe must decrypt on our side...
     var pbuf: [8192]u8 = undefined;
@@ -1620,13 +1625,15 @@ fn selfConsistency(host_key: HostKey) !void {
 }
 
 test "self-consistency: our client ↔ our server (ed25519 host key)" {
-    const hk = try HostKey.fromOpenSSH(fixture_ed25519_key, null);
-    try selfConsistency(hk);
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
+    try selfConsistency(&hk);
 }
 
 test "self-consistency: our client ↔ our server (rsa host key)" {
-    const hk = try HostKey.fromOpenSSH(fixture_rsa_key, null);
-    try selfConsistency(hk);
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_rsa_key, null);
+    try selfConsistency(&hk);
 }
 
 // The default handshake above negotiates `mlkem768x25519-sha256` (first in
@@ -1718,9 +1725,11 @@ fn directDhConsistency(kex_name: []const u8) !void {
     var sr = stream.reader(io, &rbuf);
     var sw = stream.writer(io, &wbuf);
 
-    const hk = try HostKey.fromOpenSSH(fixture_ed25519_key, null);
+    var hk: HostKey = undefined;
+
+    try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
     var none: transport.CipherState = .plaintext;
-    var res = try dhGroupKexServer(&sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, hk, gpa, kex_name);
+    var res = try dhGroupKexServer(&sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, &hk, gpa, kex_name);
     defer res.zeroize();
 
     th.join();
@@ -1778,10 +1787,11 @@ test "dhGroupKex (client): rejects a genuine rsa-sha2-256 host-key signature whe
     // Freshly loaded, `.hash` is pinned to `.sha2_256` (see `HostKey.
     // fromOpenSSH`'s doc comment) — this key signs "rsa-sha2-256", never
     // "rsa-sha2-512".
-    const hk = try HostKey.fromOpenSSH(fixture_rsa_key, null);
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_rsa_key, null);
     try std.testing.expectEqualStrings("rsa-sha2-256", hk.algorithmName());
     var none: transport.CipherState = .plaintext;
-    var res = try dhGroupKexServer(&sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, hk, gpa, kex_name);
+    var res = try dhGroupKexServer(&sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, &hk, gpa, kex_name);
     defer res.zeroize();
 
     th.join();
@@ -1807,7 +1817,8 @@ fn fakeKexdhInit(e_mag: []const u8, out: []u8) ![]const u8 {
 test "dhGroupKexServer: rejects a KEXDH_INIT carrying e == p or e == p-1 (F1 regression)" {
     const kex_name = "diffie-hellman-group14-sha256";
     const group = transport.DhGroup.forName(kex_name).?;
-    const hk = try HostKey.fromOpenSSH(fixture_ed25519_key, null);
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
     const gpa = std.testing.allocator;
 
     for ([_][]const u8{ group.prime, group.prime_minus_1 }) |degenerate_e| {
@@ -1821,7 +1832,7 @@ test "dhGroupKexServer: rejects a KEXDH_INIT carrying e == p or e == p-1 (F1 reg
 
         try std.testing.expectError(
             error.KexFailed,
-            dhGroupKexServer(&r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", hk, gpa, kex_name),
+            dhGroupKexServer(&r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", &hk, gpa, kex_name),
         );
     }
 }
@@ -1972,8 +1983,9 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
     // 5. The REAL KEX, honestly, under group14 — the algorithm the client
     // actually negotiates. Proves the discard ate exactly one packet, not
     // zero and not two.
-    const hk = try HostKey.fromOpenSSH(fixture_ed25519_key, null);
-    var res = try dhGroupKexServer(&sr.interface, &sw.interface, .{ .r = &none_r, .w = &none_w }, .os, i_c, i_s, v_c, v_s, hk, gpa, "diffie-hellman-group14-sha256");
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
+    var res = try dhGroupKexServer(&sr.interface, &sw.interface, .{ .r = &none_r, .w = &none_w }, .os, i_c, i_s, v_c, v_s, &hk, gpa, "diffie-hellman-group14-sha256");
     defer res.zeroize();
 
     // 6. NEWKEYS both ways.
@@ -2073,7 +2085,8 @@ fn liveOpensshClient(keygen_type: []const u8, hostkey_algo: []const u8, kex_name
 
     const key_text = try cwd.readFileAlloc(io, hk_path, gpa, .limited(16384));
     defer gpa.free(key_text);
-    var hk = try HostKey.fromOpenSSH(key_text, null);
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, key_text, null);
     if (std.mem.eql(u8, hostkey_algo, "rsa-sha2-512")) hk.rsa.hash = .sha2_512;
     try std.testing.expectEqualStrings(hostkey_algo, hk.algorithmName());
 

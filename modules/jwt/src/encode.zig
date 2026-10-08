@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const burn = @import("burn.zig");
 
 const hmac_sha2 = std.crypto.auth.hmac.sha2;
 const b64 = std.base64.url_safe_no_pad.Encoder;
@@ -25,19 +26,25 @@ const b64 = std.base64.url_safe_no_pad.Encoder;
 /// A signing key. The variant IS the algorithm: `encode` writes the `alg`
 /// that belongs to it, so a caller cannot label an HMAC token ES256 or the
 /// reverse.
+///
+/// Every variant is BORROWED for the call: the secret stays in the caller's
+/// own storage and is never copied into a frame of this module's (a key pair
+/// by value would leave one copy per call on the dead stack — ML-DSA-87's is
+/// ~100 KiB in memory). Signing runs one frame down and zeroes the stack it
+/// dirtied (`burn.zig`).
 pub const SigningKey = union(enum) {
-    /// Shared secrets. Borrowed for the call. At least 32/48/64 bytes.
+    /// Shared secrets. At least 32/48/64 bytes.
     hs256: []const u8,
     hs384: []const u8,
     hs512: []const u8,
-    es256: root.EcdsaP256Sha256.KeyPair,
-    es384: root.EcdsaP384Sha384.KeyPair,
+    es256: *const root.EcdsaP256Sha256.KeyPair,
+    es384: *const root.EcdsaP384Sha384.KeyPair,
     /// EdDSA (RFC 8037) over Ed25519.
-    ed25519: root.Ed25519.KeyPair,
+    ed25519: *const root.Ed25519.KeyPair,
     /// RFC 9964, empty context string (as the RFC requires).
-    ml_dsa_44: root.MlDsa44.KeyPair,
-    ml_dsa_65: root.MlDsa65.KeyPair,
-    ml_dsa_87: root.MlDsa87.KeyPair,
+    ml_dsa_44: *const root.MlDsa44.KeyPair,
+    ml_dsa_65: *const root.MlDsa65.KeyPair,
+    ml_dsa_87: *const root.MlDsa87.KeyPair,
 
     pub fn alg(k: SigningKey) root.Alg {
         return switch (k) {
@@ -153,20 +160,39 @@ fn checkKey(key: SigningKey) EncodeError!void {
     if (secret.len < min) return error.InvalidKey;
 }
 
+/// The signing step. Each algorithm family has a body of its own, run one
+/// frame down and followed by a burn of the stack that frame dirtied (sizes
+/// and measurements in `burn.zig`). The bodies are separate so that one
+/// frame does not grow to the largest algorithm's (ML-DSA's locals are
+/// hundreds of KiB): a burn only reaches as deep as its body is wide.
 fn sign(key: SigningKey, input: []const u8, buf: []u8) EncodeError![]const u8 {
+    const R = EncodeError![]const u8;
     switch (key) {
-        .hs256 => |s| return mac(hmac_sha2.HmacSha256, s, input, buf),
-        .hs384 => |s| return mac(hmac_sha2.HmacSha384, s, input, buf),
-        .hs512 => |s| return mac(hmac_sha2.HmacSha512, s, input, buf),
-        // JWS ECDSA signatures are the raw fixed-width R‖S (RFC 7518 §3.4),
-        // which is what `Signature.toBytes` yields — not DER.
-        .es256 => |kp| return put(buf, &((kp.sign(input, null) catch return error.SigningFailed).toBytes())),
-        .es384 => |kp| return put(buf, &((kp.sign(input, null) catch return error.SigningFailed).toBytes())),
-        .ed25519 => |kp| return put(buf, &((kp.sign(input, null) catch return error.SigningFailed).toBytes())),
-        .ml_dsa_44 => |kp| return put(buf, &((kp.sign(input, null) catch return error.SigningFailed).toBytes())),
-        .ml_dsa_65 => |kp| return put(buf, &((kp.sign(input, null) catch return error.SigningFailed).toBytes())),
-        .ml_dsa_87 => |kp| return put(buf, &((kp.sign(input, null) catch return error.SigningFailed).toBytes())),
+        .hs256 => |s| return burn.run(burn.hmac_burn, R, mac, .{ hmac_sha2.HmacSha256, s, input, buf }),
+        .hs384 => |s| return burn.run(burn.hmac_burn, R, mac, .{ hmac_sha2.HmacSha384, s, input, buf }),
+        .hs512 => |s| return burn.run(burn.hmac_burn, R, mac, .{ hmac_sha2.HmacSha512, s, input, buf }),
+        .es256 => |kp| return burn.run(burn.ec_burn, R, signEc, .{ kp, input, buf }),
+        .es384 => |kp| return burn.run(burn.ec_burn, R, signEc, .{ kp, input, buf }),
+        .ed25519 => |kp| return burn.run(burn.ec_burn, R, signEc, .{ kp, input, buf }),
+        .ml_dsa_44 => |kp| return burn.run(burn.mldsa44_burn, R, signMlDsa, .{ kp, input, buf }),
+        .ml_dsa_65 => |kp| return burn.run(burn.mldsa65_burn, R, signMlDsa, .{ kp, input, buf }),
+        .ml_dsa_87 => |kp| return burn.run(burn.mldsa87_burn, R, signMlDsa, .{ kp, input, buf }),
     }
+}
+
+/// ES256 / ES384 / Ed25519. JWS ECDSA signatures are the raw fixed-width R‖S
+/// (RFC 7518 §3.4), which is what `Signature.toBytes` yields — not DER.
+fn signEc(kp: anytype, input: []const u8, buf: []u8) EncodeError![]const u8 {
+    return put(buf, &((kp.sign(input, null) catch return error.SigningFailed).toBytes()));
+}
+
+/// ML-DSA through the streaming signer, which reads the secret key in place:
+/// `KeyPair.sign` takes the pair by value (~100 KiB for ML-DSA-87) and std
+/// copies it again inside.
+fn signMlDsa(kp: anytype, input: []const u8, buf: []u8) EncodeError![]const u8 {
+    var st = kp.signer(null) catch return error.SigningFailed;
+    st.update(input);
+    return put(buf, &st.finalize().toBytes());
 }
 
 fn mac(comptime H: type, secret: []const u8, input: []const u8, buf: []u8) []const u8 {
@@ -215,12 +241,18 @@ test "encode: every algorithm round-trips through parseAndVerify, alg from the k
     try roundTrip(.{ .hs384 = secret64[0..48] }, .{ .kid = "k\"1" }); // kid is JSON-escaped
     try roundTrip(.{ .hs512 = &secret64 }, .{ .typ = null });
     const seed32 = [_]u8{7} ** 32;
-    try roundTrip(.{ .es256 = try root.EcdsaP256Sha256.KeyPair.generateDeterministic(seed32) }, .{ .kid = "ec" });
-    try roundTrip(.{ .es384 = try root.EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{7} ** root.EcdsaP384Sha384.KeyPair.seed_length) }, .{});
-    try roundTrip(.{ .ed25519 = try root.Ed25519.KeyPair.generateDeterministic(seed32) }, .{});
-    try roundTrip(.{ .ml_dsa_44 = try root.MlDsa44.KeyPair.generateDeterministic(seed32) }, .{});
-    try roundTrip(.{ .ml_dsa_65 = try root.MlDsa65.KeyPair.generateDeterministic(seed32) }, .{});
-    try roundTrip(.{ .ml_dsa_87 = try root.MlDsa87.KeyPair.generateDeterministic(seed32) }, .{});
+    const es256 = try root.EcdsaP256Sha256.KeyPair.generateDeterministic(seed32);
+    try roundTrip(.{ .es256 = &es256 }, .{ .kid = "ec" });
+    const es384 = try root.EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{7} ** root.EcdsaP384Sha384.KeyPair.seed_length);
+    try roundTrip(.{ .es384 = &es384 }, .{});
+    const ed = try root.Ed25519.KeyPair.generateDeterministic(seed32);
+    try roundTrip(.{ .ed25519 = &ed }, .{});
+    const ml44 = try root.MlDsa44.KeyPair.generateDeterministic(seed32);
+    try roundTrip(.{ .ml_dsa_44 = &ml44 }, .{});
+    const ml65 = try root.MlDsa65.KeyPair.generateDeterministic(seed32);
+    try roundTrip(.{ .ml_dsa_65 = &ml65 }, .{});
+    const ml87 = try root.MlDsa87.KeyPair.generateDeterministic(seed32);
+    try roundTrip(.{ .ml_dsa_87 = &ml87 }, .{});
 }
 
 test "encode: a token signed with one key does not verify with another" {

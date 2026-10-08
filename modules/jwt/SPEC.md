@@ -68,7 +68,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   than the hash output are refused (RFC 7518 §3.2 MUST); `encodeJson` refuses a payload that is
   not one JSON object. Signatures are deterministic (ECDSA per RFC 6979, Ed25519, ML-DSA with an
   empty context per RFC 9964). Every algorithm is tested by a round trip through
-  `parseAndVerify`.
+  `parseAndVerify`. **Secrets and the dead stack** (2026-10-09): the `SigningKey` key-pair variants
+  are `*const` (borrowed, never copied), signing runs in a `burn.run` body per algorithm family and
+  the HMAC compare of `verify` for HS256/384/512 does too (`burn.zig`); `stackprobe_test.zig`
+  (ReleaseFast) asserts 0 residue of the keys, nonces and keyed HMAC state, with NEG/POS controls.
 
 - **Verified-token cache** (2026-09-28, requested by qap): `VerifiedCache(Value)` in
   `cache.zig`, opt-in. See § "Verified-token cache" below for the argument that a hit answers
@@ -348,6 +351,12 @@ key (a hit re-runs `checkTimes`, which applies it).
 
 ## Backlog / deferred
 
+- **Dead-stack residue not yet probed or burned (found 2026-10-09 while sweeping signing):** the
+  `kty:"oct"` secret in `parseJwks` (`jwkMaterial` decodes `k` through arena/stack buffers before
+  it becomes `Key.hmac`); `VerifiedCache`'s SipHash `mac_key` (zeroed by `defer`, but the SipHash
+  state it keys is not burned; the key is not a bearer credential, only a cache-poisoning one);
+  ML-DSA/ES384/Ed25519 *key generation* in the caller's frame (std). `buildTokenRequest`'s
+  `client_secret` is a borrowed slice and only copied into the request body.
 - ~~`Provider` measures its JWKS intervals on the wall clock~~ — **fixed 2026-09-29** without an
   API change (qap research register H6): a `now_s` before the recorded fetch/attempt counts as the
   interval having passed, so a backward step triggers one re-fetch that re-bases the marks instead

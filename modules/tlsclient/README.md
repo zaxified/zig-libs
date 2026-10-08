@@ -43,12 +43,13 @@ excludes serverAuth. `http.Client` uses this module for every https dial.
 ## Additions (off by default; with the defaults the handshake is std's, byte for byte)
 
 ```zig
+const key: tls.Client.ClientAuth.PrivateKey = .{ .ecdsa_secp256r1_sha256 = scalar }; // or .ecdsa_secp384r1_sha384 / .ed25519
 var client = try tls.Client.init(&r.interface, &w.interface, .{
     // ... std's options ...
     .alpn_protocols = &.{ "h2", "http/1.1" },          // RFC 7301 offer
     .client_auth = .{                                   // TLS 1.3 client certificate
         .certificate_chain = &.{ leaf_der, intermediate_der },
-        .key = .{ .ecdsa_secp256r1_sha256 = scalar },   // or .ecdsa_secp384r1_sha384 / .ed25519
+        .key = &key,                                    // borrowed for the connection
     },
 });
 const proto = client.alpn_protocol; // ?[]const u8, one of ours

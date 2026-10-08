@@ -72,6 +72,22 @@ const Config = conn_mod.Config;
 const Entropy = conn_mod.Entropy;
 const cert_kat = @import("certauth_kat_vectors.zig");
 
+// `certverify.SecretKey` borrows its key: container-level storage, refilled on
+// each call (the configs built from it outlive the building function's frame).
+const certverify = @import("certverify.zig");
+var client_ecdsa_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
+var server_ecdsa_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
+
+fn clientKey() certverify.SecretKey {
+    client_ecdsa_sk = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.client_secret_key_bytes) catch unreachable;
+    return .{ .ecdsa_p256 = &client_ecdsa_sk };
+}
+
+fn serverKey() certverify.SecretKey {
+    server_ecdsa_sk = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.server_secret_key_bytes) catch unreachable;
+    return .{ .ecdsa_p256 = &server_ecdsa_sk };
+}
+
 const transcript = @embedFile("testdata/wolfssl_transcript.txt");
 
 /// The number of cases the recorder emits. A floor, not a mirror: `--capture`
@@ -236,7 +252,7 @@ const Recorded = struct {
                 .now_sec = self.now_sec,
                 .cert = if (self.client_cert) .{
                     .chain = &.{&cert_kat.client_cert_der},
-                    .private_key = .{ .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.client_secret_key_bytes) catch unreachable },
+                    .private_key = clientKey(),
                 } else null,
                 .key_share_group = @enumFromInt(self.offer_group),
             },
@@ -246,7 +262,7 @@ const Recorded = struct {
                 .cipher_suites = &.{.aes_128_gcm_sha256},
                 .cert = .{
                     .chain = &.{&cert_kat.server_cert_der},
-                    .private_key = .{ .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.server_secret_key_bytes) catch unreachable },
+                    .private_key = serverKey(),
                 },
             },
         };

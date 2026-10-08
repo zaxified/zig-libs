@@ -241,6 +241,9 @@ pub const CertConfig = struct {
     /// intermediate }` for a one-hop chain. Each entry is raw DER, not PEM.
     chain: []const []const u8,
     /// This side's private key for `certverify.sign`'s CertificateVerify.
+    /// BORROWED (every `certverify.SecretKey` variant is a pointer): the key
+    /// must outlive the connection, and `Config`/`CertConfig` copies stay
+    /// small instead of carrying an up to 11.8 KiB RSA key by value.
     /// The `SignatureScheme` actually used is NEGOTIATED at handshake time
     /// (`selectSignatureScheme`, RFC 8446 §4.2.3), not fixed here — it is
     /// whichever of `certverify.candidateSchemes(private_key)` (the schemes
@@ -6148,11 +6151,18 @@ test "handshake: dropped ClientHello retransmits via poll (fake clock), then com
 
 const cert_kat = @import("certauth_kat_vectors.zig");
 
+// `certverify.SecretKey` borrows its key, so the keys need storage that
+// outlives the handshake: container-level vars, (re)filled on each call.
+var server_ecdsa_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
+var client_ecdsa_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
+
 fn serverEcdsaKeyPair() certverify.SecretKey {
-    return .{ .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.server_secret_key_bytes) catch unreachable };
+    server_ecdsa_sk = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.server_secret_key_bytes) catch unreachable;
+    return .{ .ecdsa_p256 = &server_ecdsa_sk };
 }
 fn clientEcdsaKeyPair() certverify.SecretKey {
-    return .{ .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.client_secret_key_bytes) catch unreachable };
+    client_ecdsa_sk = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.client_secret_key_bytes) catch unreachable;
+    return .{ .ecdsa_p256 = &client_ecdsa_sk };
 }
 
 // ── signature_algorithms negotiation (RFC 8446 §4.2.3): direct unit tests
@@ -7881,11 +7891,13 @@ test "the CSPRNG requirement is load-bearing: a seeded RNG reproduces the ECDHE 
     // from generators in the same state derive the SAME x25519 ephemeral
     // secret, so anyone who knows the seed recovers the shared secret and
     // decrypts every recorded session, retroactively.
+    // Only the first 32 bytes of `secret` are written for these two groups; the
+    // tail is undefined (stack residue), so it is never compared.
     var a = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
     var b = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
     const ka = try ecdheGenerate(x25519_group, .{ .seeded_for_test = a.random() });
     const kb = try ecdheGenerate(x25519_group, .{ .seeded_for_test = b.random() });
-    try testing.expectEqualSlices(u8, &ka.secret, &kb.secret);
+    try testing.expectEqualSlices(u8, ka.secret[0..32], kb.secret[0..32]);
     try testing.expectEqualSlices(u8, ka.public[0..ka.public_len], kb.public[0..kb.public_len]);
 
     // ... and it really is the generator that decides, not a constant in the
@@ -7893,7 +7905,7 @@ test "the CSPRNG requirement is load-bearing: a seeded RNG reproduces the ECDHE 
     // the first alone would also pass if `ecdheGenerate` returned a fixed key.
     var c = std.Random.DefaultCsprng.init([_]u8{0x6B} ** 32);
     const kc = try ecdheGenerate(x25519_group, .{ .seeded_for_test = c.random() });
-    try testing.expect(!std.mem.eql(u8, &ka.secret, &kc.secret));
+    try testing.expect(!std.mem.eql(u8, ka.secret[0..32], kc.secret[0..32]));
 
     // The ARM is not what decides the bytes — `.csprng` over the same seeded
     // generator gives the identical key. That is the honest statement of what
@@ -7901,7 +7913,7 @@ test "the CSPRNG requirement is load-bearing: a seeded RNG reproduces the ECDHE 
     // make a bad generator good.
     var f = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
     const kf = try ecdheGenerate(x25519_group, .{ .csprng = f.random() });
-    try testing.expectEqualSlices(u8, &ka.secret, &kf.secret);
+    try testing.expectEqualSlices(u8, ka.secret[0..32], kf.secret[0..32]);
 
     // Same for P-256, whose rejection-sampling loop could plausibly have
     // masked the dependency.
@@ -7909,7 +7921,7 @@ test "the CSPRNG requirement is load-bearing: a seeded RNG reproduces the ECDHE 
     var e = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
     const kd = try ecdheGenerate(secp256r1_group, .{ .seeded_for_test = d.random() });
     const ke = try ecdheGenerate(secp256r1_group, .{ .seeded_for_test = e.random() });
-    try testing.expectEqualSlices(u8, &kd.secret, &ke.secret);
+    try testing.expectEqualSlices(u8, kd.secret[0..32], ke.secret[0..32]);
 }
 
 test "doc: every entry point where randomness enters states the CSPRNG requirement" {

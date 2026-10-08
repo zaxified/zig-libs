@@ -398,14 +398,21 @@ const Fixtures = struct {
         return out;
     }
 
+    // `certverify.SecretKey` borrows its key: the storage must outlive the
+    // `Config` built from it, so it lives at container level.
+    var client_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
+    var server_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
+
     fn clientKey(self: *const Fixtures) certverify.SecretKey {
         const P256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-        return .{ .ecdsa_p256 = P256.SecretKey.fromBytes(scalar32(self.client_secret_key_bytes)) catch unreachable };
+        client_sk = P256.SecretKey.fromBytes(scalar32(self.client_secret_key_bytes)) catch unreachable;
+        return .{ .ecdsa_p256 = &client_sk };
     }
 
     fn serverKey(self: *const Fixtures) certverify.SecretKey {
         const P256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-        return .{ .ecdsa_p256 = P256.SecretKey.fromBytes(scalar32(self.server_secret_key_bytes)) catch unreachable };
+        server_sk = P256.SecretKey.fromBytes(scalar32(self.server_secret_key_bytes)) catch unreachable;
+        return .{ .ecdsa_p256 = &server_sk };
     }
 
     /// SEC1 `ECPrivateKey` DER (RFC 5915) for the fixture P-256 leaf, built

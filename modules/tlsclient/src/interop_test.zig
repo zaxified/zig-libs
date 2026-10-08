@@ -318,7 +318,8 @@ test "interop: client certificates -- P-256, P-384 and Ed25519 verified by opens
     inline for (cases) |c| {
         var srv = try Server.startWith(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-Verify", "1", "-CAfile", "client-ca.pem", "-rev" });
         defer srv.stop(io);
-        const s = try session(io, srv.port, &bundle, .{ .client_auth = .{ .certificate_chain = &.{c[0]}, .key = c[1] } });
+        const key: Client.ClientAuth.PrivateKey = c[1];
+        const s = try session(io, srv.port, &bundle, .{ .client_auth = .{ .certificate_chain = &.{c[0]}, .key = &key } });
         try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
         try testing.expect(srv.reported(io, c[2]));
     }
@@ -335,7 +336,8 @@ test "interop: a CertificateRequest without our scheme gets an empty Certificate
     defer tmp.cleanup();
     var bundle = try rootBundle(io, tmp.dir);
     defer bundle.deinit(testing.allocator);
-    const auth: Client.ClientAuth = .{ .certificate_chain = &.{derFromPem(@embedFile("testdata/client-p256.pem"))}, .key = p256Key() };
+    const key = p256Key();
+    const auth: Client.ClientAuth = .{ .certificate_chain = &.{derFromPem(@embedFile("testdata/client-p256.pem"))}, .key = &key };
     {
         var srv = try Server.startWith(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-verify", "1", "-CAfile", "client-ca.pem", "-client_sigalgs", "ECDSA+SHA384", "-rev" });
         defer srv.stop(io);

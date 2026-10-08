@@ -81,8 +81,12 @@ The additions, each marked `zig-libs tlsclient` in `Client.zig`:
   stay on the transcript through the server Finished; the client Finished
   covers our two messages. All three go out as TLS 1.3 records under the
   client handshake key, sequence 0, 1, … (`writeHandshakeRecords`, split at
-  2^14 - 1 bytes). Key copies (`SecretKey`, `KeyPair`) are wiped with
-  `secureZero` after signing; the caller owns `ClientAuth.key`.
+  2^14 - 1 bytes). `ClientAuth.key` is a pointer (borrowed for the
+  connection, so `Options` copies never carry the key); the signature runs
+  one frame down and the stack it dirtied is zeroed (`burn.zig`) — std's
+  signers leave the key and the nonce in their own frames, which the
+  `secureZero` of our locals never reached. `stackprobe_test.zig`
+  (ReleaseFast) checks all three key types for 0 residue.
   `max_client_auth_len` (16 KiB) bounds our messages.
 
 **Not here, on purpose:** revocation (OCSP/CRL), certificate transparency --
@@ -161,6 +165,13 @@ the handshake, and their tests at the end of the file. The offline test
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## Backlog / deferred
+
+**2026-10-09:** the ECDHE key shares (`KeyShare`: ML-KEM-768, X25519, P-256,
+P-384 generated per handshake) and the key schedule leave their secrets in
+std's dead frames — inherited from std's file, not burned; needs a probe
+driving one handshake per group. (The P-256/P-384 shared-secret multiply
+itself was variable-time in std — `mulPublic` on our ephemeral scalar — and
+is `mul` here since 2026-10-09.)
 
 **2026-10-04:** ALPN and TLS 1.3 client certificates are **done**. Still
 deferred: session-ticket resumption (a PSK/ticket state machine and a session

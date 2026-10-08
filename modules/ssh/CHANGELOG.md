@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING, HIGH: host and user keys left the dead stack full of key material.**
+  New ReleaseFast stack probe (`stackprobe_test.zig`), 5 calls each, before → after:
+  `HostKey.sign` ed25519 left the scalar `a`, the nonce prefix and the nonce `r` (≤ 40 hits),
+  ecdsa-p256 `d` 35, `k` 20, `k⁻¹` 20, `r·d`/`e+r·d` 10 each, rsa-sha2-256/512 p, q, d, dP, dQ,
+  qInv and the p/q Montgomery constants (≈ 750 hits — `HostKey` was passed BY VALUE, so the
+  12 KiB rsa key was copied into every frame on the way, never wiped); `HostKey.fromOpenSSH` left
+  the key and the whole decoded container (base64 and binary; 165 hits for ed25519, ≈ 1500 for rsa) — all now 0. The
+  same by-value copies ran through every server handshake (host-key negotiation, the three KEX
+  responders, the client's KEXINIT name list) and every `userauth` call.
+  - `HostKey.algorithmName`/`publicBlob`/`sign` take `*const HostKey` (method-call syntax on a
+    variable is unchanged); `HostKey.fromOpenSSH(out: *HostKey, text, passphrase)`,
+    `server.parseEd25519OpenSSH(out, bin, passphrase)`, `server.parseEcdsaP256OpenSSH(out, bin,
+    passphrase)` write through an out-param, zeroed on error.
+  - New `HostKey.signWithHash`/`algorithmNameFor`: an rsa key signs/names under a given rsa-sha2
+    hash without being copied (`userauth` used to re-tag a copy of the key for `server-sig-algs`).
+  - `userauth.authenticate`, `authenticatePublickey`, `authenticatePublickeyBoundTo` take
+    `key: *const AuthKey`.
+  - Signing and loading run one frame down and zero what they dirtied (`burn.zig`: 16 KiB around a
+    signature, 64 KiB around a load).
+  - Migrated: simio's ssh pilot, `example-apps/ssh-demo` (which also drops its own ecdsa container
+    parser — `fromOpenSSH` has loaded ecdsa-p256 since A1).
+  - Not covered yet: the key exchange's own secrets in std's frames (SPEC "Backlog / deferred").
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the host-key signature passes the RSA key to
   `rsa.signPkcs1v15` by pointer, and the test key loads through rsa's out-param `fromPem`
   (rsa 2026-10-08).

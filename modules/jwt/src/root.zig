@@ -884,6 +884,7 @@ pub const EncodeError = encode_mod.EncodeError;
 pub const encode = encode_mod.encode;
 pub const encodeJson = encode_mod.encodeJson;
 const encode_mod = @import("encode.zig");
+const burn = @import("burn.zig");
 
 /// A bounded, thread-safe cache of tokens that verified, keyed by a MAC of
 /// the exact token bytes, the claim policy and the key set's `id`, and good
@@ -925,13 +926,21 @@ fn verifyHmac(comptime Mac: type, parsed: *const ParsedToken, key: Key) VerifyEr
     if (secret.len == 0) return error.InvalidKey;
     // Length is public information — checking it early leaks nothing.
     if (parsed.signature.len != Mac.mac_length) return error.BadSignature;
-    var expected: [Mac.mac_length]u8 = undefined;
-    Mac.create(&expected, parsed.signing_input, secret);
-    if (!std.crypto.timing_safe.eql(
-        [Mac.mac_length]u8,
-        expected,
-        parsed.signature[0..Mac.mac_length].*,
-    )) return error.BadSignature;
+    // The keyed HMAC state (key ⊕ ipad / opad, the hash states derived from
+    // them) and the expected MAC live in the body's frame, which is burned.
+    const Check = HmacCheck(Mac);
+    if (!burn.run(burn.hmac_burn, bool, Check.matches, .{ secret, parsed.signing_input, parsed.signature[0..Mac.mac_length] }))
+        return error.BadSignature;
+}
+
+fn HmacCheck(comptime Mac: type) type {
+    return struct {
+        fn matches(secret: []const u8, input: []const u8, sig: *const [Mac.mac_length]u8) bool {
+            var expected: [Mac.mac_length]u8 = undefined;
+            Mac.create(&expected, input, secret);
+            return std.crypto.timing_safe.eql([Mac.mac_length]u8, expected, sig.*);
+        }
+    };
 }
 
 /// ES256/ES384: the JWS signature is the raw fixed-width big-endian `R‖S`
@@ -4475,6 +4484,7 @@ test {
     _ = @import("rfc9964_vectors.zig");
     _ = @import("encode.zig");
     _ = @import("cache.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "verify: ML-DSA-65 round-trip through a full token (RFC 9964)" {

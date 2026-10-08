@@ -20,7 +20,7 @@
 //!
 //! RFC 8308 is what decides which signature algorithm a `publickey` request
 //! names. The transport layer records the server's `server-sig-algs` on
-//! `Transport.server_sig_algs`; `signingKeyFor` below turns that into the
+//! `Transport.server_sig_algs`; `rsaHashFor` below turns that into the
 //! algorithm this key signs with, which matters for exactly one key type —
 //! an `ssh-rsa` blob names no hash, so `rsa-sha2-256` and `rsa-sha2-512` are
 //! both valid for it and a peer has to say which it will take.
@@ -210,12 +210,12 @@ pub const PublickeyOptions = struct {
 ///
 /// The signature algorithm is NOT simply `key.algorithmName()`: if the server
 /// sent `server-sig-algs` (RFC 8308 §3.1), the strongest name it accepts for
-/// this key's type is used instead. See `signingKeyFor`.
+/// this key's type is used instead. See `rsaHashFor`.
 pub fn authenticatePublickey(
     t: *transport.Transport,
     gpa: std.mem.Allocator,
     user: []const u8,
-    key: AuthKey,
+    key: *const AuthKey,
     opts: PublickeyOptions,
 ) UserauthError!void {
     return authenticatePublickeyBoundTo(t, gpa, user, key, opts, try sessionId(t));
@@ -233,7 +233,7 @@ pub fn authenticatePublickeyBoundTo(
     t: *transport.Transport,
     gpa: std.mem.Allocator,
     user: []const u8,
-    key: AuthKey,
+    key: *const AuthKey,
     opts: PublickeyOptions,
     session_id: []const u8,
 ) UserauthError!void {
@@ -248,9 +248,9 @@ pub fn authenticatePublickeyBoundTo(
     // a choice at all (their blob type names no hash), and `fromOpenSSH` pins
     // those to `rsa-sha2-256` — so a server that accepts `rsa-sha2-512` now
     // gets SHA-512 without the caller having to reach into the key.
-    const signing_key = signingKeyFor(key, t.server_sig_algs);
-    const algorithm = signing_key.algorithmName();
-    const blob = try signing_key.publicBlob(gpa);
+    const rsa_hash = rsaHashFor(key, t.server_sig_algs);
+    const algorithm = key.algorithmNameFor(rsa_hash);
+    const blob = try key.publicBlob(gpa);
     defer gpa.free(blob);
 
     if (opts.probe_first) {
@@ -272,7 +272,7 @@ pub fn authenticatePublickeyBoundTo(
     defer gpa.free(to_sign);
     var bw: std.Io.Writer = .fixed(to_sign);
     try signedBlob(&bw, session_id, user, opts.service, algorithm, blob);
-    const signature = try signing_key.sign(gpa, bw.buffered());
+    const signature = try key.signWithHash(gpa, bw.buffered(), rsa_hash);
     defer gpa.free(signature);
 
     try sendPublickeyRequest(t, gpa, user, opts.service, algorithm, blob, signature);
@@ -283,8 +283,10 @@ pub fn authenticatePublickeyBoundTo(
     }
 }
 
-/// `key`, with its RFC 4252 §7 signature algorithm chosen against the
-/// server's RFC 8308 §3.1 `server-sig-algs` instead of blindly.
+/// The rsa-sha2 hash `key` signs with, chosen against the server's RFC 8308
+/// §3.1 `server-sig-algs` instead of blindly (`null`: the key's own). A hash,
+/// not a re-tagged copy of the key: a copy put the whole private key in this
+/// frame (2026-10-09).
 ///
 /// Only the `ssh-rsa` variant can differ from `key` itself: `ssh-ed25519` and
 /// `ecdsa-sha2-nistp256` each have exactly one signature algorithm name,
@@ -300,14 +302,12 @@ pub fn authenticatePublickeyBoundTo(
 /// allows a client to "send a user authentication request using a public key
 /// algorithm not included in server-sig-algs", and one refused attempt is a
 /// better answer than refusing to try.
-fn signingKeyFor(key: AuthKey, server_sig_algs: ?transport.ServerSigAlgs) AuthKey {
-    const algs = server_sig_algs orelse return key;
-    if (key != .rsa) return key;
+fn rsaHashFor(key: *const AuthKey, server_sig_algs: ?transport.ServerSigAlgs) ?AuthKey.RsaHash {
+    const algs = server_sig_algs orelse return null;
+    if (key.* != .rsa) return null;
     // Strongest first — `pick` walks in the caller's preference order.
-    const chosen = algs.pick(&.{ "rsa-sha2-512", "rsa-sha2-256" }) orelse return key;
-    var out = key;
-    out.rsa.hash = if (std.mem.eql(u8, chosen, "rsa-sha2-512")) .sha2_512 else .sha2_256;
-    return out;
+    const chosen = algs.pick(&.{ "rsa-sha2-512", "rsa-sha2-256" }) orelse return null;
+    return if (std.mem.eql(u8, chosen, "rsa-sha2-512")) .sha2_512 else .sha2_256;
 }
 
 /// Client: authenticate as `user` with `password` (RFC 4252 §8). Same
@@ -365,7 +365,7 @@ pub fn authenticate(
     t: *transport.Transport,
     gpa: std.mem.Allocator,
     user: []const u8,
-    key: AuthKey,
+    key: *const AuthKey,
 ) UserauthError!void {
     const scratch = try gpa.alloc(u8, scratch_len);
     defer gpa.free(scratch);
