@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: MIT
+
+//! Dead-stack residue probe for `preSign` (audit 2026-10-08), kept in the
+//! module per `CONVENTIONS.md` §9. Same method as `bip340`'s
+//! `stackprobe_test.zig`: paint a large stack window, call the pre-signer at
+//! that depth, then claim an equally large UNINITIALISED buffer at the same
+//! depth and count 32-byte needles in it. ReleaseFast/ReleaseSmall only —
+//! Debug and ReleaseSafe fill `undefined` with 0xaa, so the scan cannot see a
+//! dead frame there (the push lane runs it in ReleaseFast: `test.sh`'s
+//! `run_rf_only`).
+//!
+//! The needles are every secret `preSign` derives, in every representation
+//! its steps hold it in: the effective scalar `d` and `n-d`, the masked key
+//! `t_pad = d xor H(aux)` (the key itself to anyone who knows `aux`), the
+//! nonce hash `rand`, both nonce candidates `k0` and `n-k0`, and the secret
+//! key. A nonce next to the published pre-signature yields the key, exactly
+//! as for a plain signature.
+//!
+//! ⛔ A zero is only readable next to the two controls in the same binary: a
+//! NEGATIVE control (a call that never sees a secret, must find 0) and a
+//! POSITIVE control (a call that parks `d` in a local, must find it).
+
+const std = @import("std");
+const builtin = @import("builtin");
+const adaptor = @import("root.zig");
+const bip340 = @import("bip340");
+const Scalar = @import("k256").Secp256k1.scalar.Scalar;
+
+const WINDOW = 256 * 1024;
+const needle_count = 14;
+const Needles = [needle_count][32]u8;
+const needle_names = [needle_count][]const u8{
+    "d, big-endian",
+    "d, little-endian",
+    "d, Scalar in-memory",
+    "n-d, big-endian",
+    "t_pad = d xor H(aux)",
+    "rand = H(t_pad||P||T||m)",
+    "k0, big-endian",
+    "k0, little-endian",
+    "k0, Scalar in-memory",
+    "n-k0, big-endian",
+    "n-k0, little-endian",
+    "n-k0, Scalar in-memory",
+    "secret key, big-endian",
+    "secret key, little-endian",
+};
+
+const msg = "adaptor preSign dead-stack probe message";
+
+/// Two probe-local keys (not from any wallet or vector): one odd-y `d'·G`
+/// (effective scalar `n - d'`), one even. Both arms of the normalization.
+const cases = [_]struct { sk: [32]u8, aux: [32]u8 }{
+    .{ .sk = keyEndingIn(0x02), .aux = @splat(0x5e) },
+    .{ .sk = keyEndingIn(0x03), .aux = @splat(0xa1) },
+};
+
+fn keyEndingIn(last: u8) [32]u8 {
+    var sk: [32]u8 = @splat(0);
+    sk[0] = 0x10;
+    sk[31] = last;
+    return sk;
+}
+
+/// The adaptor point every probed call pre-signs under: public, fixed.
+var probe_t: adaptor.AdaptorPoint = undefined;
+
+noinline fn paint() void {
+    var buf: [WINDOW]u8 = undefined;
+    @memset(&buf, 0xC7);
+    std.mem.doNotOptimizeAway(&buf);
+}
+
+noinline fn scan(needles: *const Needles) [needle_count]usize {
+    var buf: [WINDOW]u8 = undefined;
+    const p: [*]volatile u8 = @ptrCast(&buf);
+    var hits: [needle_count]usize = @splat(0);
+    var i: usize = 0;
+    while (i + 32 <= WINDOW) : (i += 1) {
+        for (needles, &hits) |*nd, *h| {
+            var j: usize = 0;
+            while (j < 32 and p[i + j] == nd[j]) : (j += 1) {}
+            if (j == 32) h.* += 1;
+        }
+    }
+    std.mem.doNotOptimizeAway(&buf);
+    return hits;
+}
+
+/// How deep the previous call dirtied the stack below the scan frame's top.
+/// Sizes `root.zig`'s `presign_stack_burn`; printed, not asserted.
+noinline fn dirtyDepth() usize {
+    var buf: [WINDOW]u8 = undefined;
+    const p: [*]volatile u8 = @ptrCast(&buf);
+    var i: usize = 0;
+    while (i < WINDOW and p[i] == 0xC7) : (i += 1) {}
+    std.mem.doNotOptimizeAway(&buf);
+    return WINDOW - i;
+}
+
+/// Negative control: public data only, same depth.
+noinline fn callInnocent(h: [32]u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&h, &out, .{});
+    return out;
+}
+
+/// Positive control: parks a secret in a stack local and returns.
+noinline fn callLeaky(secret: [32]u8) u8 {
+    var local: [512]u8 = undefined;
+    @memset(&local, 0);
+    local[100..132].* = secret;
+    std.mem.doNotOptimizeAway(&local);
+    return local[100];
+}
+
+fn le(be: [32]u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    std.mem.writeInt(u256, &out, std.mem.readInt(u256, &be, .big), .little);
+    return out;
+}
+
+fn memImage(s: Scalar) [32]u8 {
+    return std.mem.asBytes(&s).*;
+}
+
+/// `preSign`'s steps 1-4 re-derived from the exported pieces, so the probe
+/// knows what to look for. Runs before `paint`.
+fn needlesFor(sk_bytes: [32]u8, aux: [32]u8) !Needles {
+    var kp = try bip340.KeyPair.fromSecretKey(try bip340.SecretKey.fromBytes(sk_bytes));
+    defer kp.deinit();
+    const d = try Scalar.fromBytes(kp.secret, .big);
+    const aux_hash = bip340.taggedHash(adaptor.aux_tag, &aux);
+    var t_pad: [32]u8 = undefined;
+    for (&t_pad, kp.secret, aux_hash) |*ti, di, ai| ti.* = di ^ ai;
+    var nh = bip340.hash.taggedHasher(adaptor.nonce_tag);
+    nh.update(&t_pad);
+    nh.update(&kp.public.x);
+    nh.update(&probe_t.toBytes());
+    nh.update(msg);
+    const rand = nh.finalResult();
+    var wide: [48]u8 = @splat(0);
+    wide[16..48].* = rand;
+    const k0 = Scalar.fromBytes48(wide, .big);
+    const k_neg = k0.neg();
+    return .{
+        kp.secret,             le(kp.secret),           memImage(d),
+        d.neg().toBytes(.big), t_pad,                   rand,
+        k0.toBytes(.big),      le(k0.toBytes(.big)),    memImage(k0),
+        k_neg.toBytes(.big),   le(k_neg.toBytes(.big)), memImage(k_neg),
+        sk_bytes,              le(sk_bytes),
+    };
+}
+
+var presign_io: std.Io = undefined;
+
+noinline fn callPreSign(sk: bip340.SecretKey, aux: [32]u8) void {
+    const ps = adaptor.preSign(sk, msg, aux, probe_t, presign_io) catch unreachable;
+    std.mem.doNotOptimizeAway(&ps);
+}
+
+test "STACKPROBE (audit 2026-10-08): no key or nonce residue on the dead stack after preSign()" {
+    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    var th = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer th.deinit();
+    presign_io = th.io();
+    probe_t = try adaptor.AdaptorPoint.fromSecret(@splat(0x37));
+
+    for (cases) |case| {
+        const sk = try bip340.SecretKey.fromBytes(case.sk);
+        const needles = try needlesFor(case.sk, case.aux);
+
+        paint();
+        std.mem.doNotOptimizeAway(callInnocent(case.aux));
+        const neg = scan(&needles);
+
+        paint();
+        std.mem.doNotOptimizeAway(callLeaky(needles[0]));
+        const pos = scan(&needles);
+
+        var total: [needle_count]usize = @splat(0);
+        for (0..5) |_| {
+            paint();
+            callPreSign(sk, case.aux);
+            for (&total, scan(&needles)) |*t, x| t.* += x;
+        }
+        paint();
+        callPreSign(sk, case.aux);
+        const depth = dirtyDepth();
+
+        // Printed only when an assertion below fails: the lane treats stderr
+        // from a passing test as a FAIL (scripts/lib/test-lib.sh).
+        errdefer {
+            std.debug.print("\n=== STACKPROBE adaptor preSign ({t}, window {d} KiB) ===\n", .{ builtin.mode, WINDOW / 1024 });
+            std.debug.print("  key ..{x:0>2}: NEG={any} POS(d)={d} dirty below the call={d} B\n", .{ case.sk[31], neg, pos[0], depth });
+            for (needle_names, total) |name, h| {
+                if (h != 0) std.debug.print("    RESIDUE {s:<28} {d} (5 calls)\n", .{ name, h });
+            }
+        }
+        for (neg) |h| try std.testing.expectEqual(@as(usize, 0), h);
+        try std.testing.expect(pos[0] >= 1);
+        for (total) |h| try std.testing.expectEqual(@as(usize, 0), h);
+    }
+}

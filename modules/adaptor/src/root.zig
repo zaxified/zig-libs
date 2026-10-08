@@ -295,7 +295,42 @@ pub fn preSign(
     io: std.Io,
 ) PreSignError!PreSignature {
     _ = io; // deterministic once aux_rand is in hand (see doc comment)
+    const result = preSignFromSecretKey(secret_key, msg, aux_rand, adaptor_point);
+    burnPreSignStack();
+    return result;
+}
+
+/// Audit 2026-10-08 (HIGH). `preSign` had no stack burn: measured with
+/// `stackprobe_test.zig` (ReleaseFast), every pre-signature left the nonce
+/// `k0` and its hash `rand` on the dead stack, and the nonce next to the
+/// published `s_prime` and the public challenge is the secret key
+/// (`d = (s_prime - k)/e`). The shape is `bip340.sign`'s after its A1 F2 and
+/// review R1 fixes: the key reaches this frame one level down (`noinline`),
+/// the computation one more (`computeUnverified`), and both are burned after
+/// they return. `preSign`'s own frame holds nothing secret.
+noinline fn preSignFromSecretKey(
+    secret_key: bip340.SecretKey,
+    msg: []const u8,
+    aux_rand: [32]u8,
+    adaptor_point: AdaptorPoint,
+) PreSignError!PreSignature {
     return preSignImpl(secret_key, msg, aux_rand, adaptor_point, computeUnverified);
+}
+
+/// How much stack below the burning frame is zeroed after steps 1-8. The
+/// probe printed 21.6 KB dirtied below a `preSign` call (2026-10-08,
+/// ReleaseFast), self-check included; the steps alone use less.
+/// `stackprobe_test.zig` fails on any residue and prints the depth, so a
+/// call tree that outgrows this goes red there.
+const presign_stack_burn = 32 * 1024;
+
+/// Zero `presign_stack_burn` bytes at the depth the computation used.
+/// `noinline` is load-bearing (as `bip340`'s `burnSignStack`): inlined, the
+/// buffer lands in the caller's frame, above the region to clear.
+/// `secureZero` writes through a volatile slice, so the dead store stays.
+noinline fn burnPreSignStack() void {
+    var buf: [presign_stack_burn]u8 = undefined;
+    std.crypto.secureZero(u8, &buf);
 }
 
 /// The (steps 1-8, no self-check) result `computeUnverified` — or a test's
@@ -331,15 +366,19 @@ fn preSignImpl(
     adaptor_point: AdaptorPoint,
     compute: *const fn (bip340.SecretKey, []const u8, [32]u8, AdaptorPoint) PreSignError!ComputeResult,
 ) PreSignError!PreSignature {
-    const computed = try compute(secret_key, msg, aux_rand, adaptor_point);
-    if (!preVerify(computed.pubkey, msg, adaptor_point, computed.presig)) return error.PreSignatureVerificationFailed;
-    return computed.presig;
+    const computed = compute(secret_key, msg, aux_rand, adaptor_point);
+    // Burn the steps' frames before anything reads the result, on the error
+    // path too (see `preSignFromSecretKey`).
+    burnPreSignStack();
+    const ok = try computed;
+    if (!preVerify(ok.pubkey, msg, adaptor_point, ok.presig)) return error.PreSignatureVerificationFailed;
+    return ok.presig;
 }
 
 /// Steps 1-8 of `preSign` (no self-check) — the real computation
 /// `preSignImpl` runs in production, and the honest baseline the F5 test's
 /// corrupted stand-in derives from.
-fn computeUnverified(
+noinline fn computeUnverified(
     secret_key: bip340.SecretKey,
     msg: []const u8,
     aux_rand: [32]u8,
@@ -665,6 +704,7 @@ test {
     _ = @import("kat_test.zig");
     _ = @import("interop_vectors.zig");
     _ = @import("interop_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names the scriptless-scripts construction and the sibling bip340 dep" {

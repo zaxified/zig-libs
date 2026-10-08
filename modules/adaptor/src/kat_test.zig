@@ -534,4 +534,10 @@ test "range checks: r >= p and s' >= n in PreSignature.fromBytes, s' >= n and t 
     _ = try adaptor.extract(good, full, t_point);
     full.s = n_bytes;
     try std.testing.expectError(error.InvalidSignature, adaptor.extract(good, full, t_point));
+
+    // s' >= n in extract: a hand-built pre-signature is refused as such, not
+    // reduced mod n and reported as a mismatch (the reduction survived the
+    // 2026-10-08 mutation run: nothing called extract with a bad s').
+    full = try bip340.Signature.fromBytes(sig);
+    try std.testing.expectError(error.InvalidPreSignature, adaptor.extract(bad_s, full, t_point));
 }

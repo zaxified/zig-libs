@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — Security (HIGH, no API change): `preSign` left the nonce on the dead stack.
+  Measured with the new `src/stackprobe_test.zig` (ReleaseFast): every pre-signature left `k0` and
+  its hash `rand` behind — and the nonce next to the published `s_prime` and the public challenge
+  is the secret key. Fixed in `bip340.sign`'s shape: the key one `noinline` frame down
+  (`preSignFromSecretKey`), the steps another (`computeUnverified`), 32 KiB of stack burned after
+  each returns; the probe asserts zero residue (both burns removed: residue again; either alone
+  suffices in the measured build). `extract` with a hand-built pre-signature whose `s'` ≥ n is
+  tested to be `InvalidPreSignature`. Audit 2026-10-08 (`SPEC.md`).
+
 - **2026-10-05** — Tests: first dated mutation run (25 mutants, 22 killed, 3 equivalent; `SPEC.md`
   § "Mutation run 2026-10-05"). No defect; one new test pins the range checks of
   `PreSignature.fromBytes`, `adapt` and `extract`. No source change.
