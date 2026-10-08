@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **FIX (key on the dead stack, MEDIUM; NO API CHANGE):** `ChaCha20Poly1305.encrypt`/
+  `decrypt` and `ChaCha20.xor`/`stream` left the key and/or the one-time Poly1305 key in a dead
+  frame on every call. Each now runs one frame down and zeroes 2 KiB (short path) or 4 KiB (wide
+  path) below it with vector stores. Cost: +5–8 % per AEAD call up to 1 KiB, +10–21 % per bare
+  `xor`, within noise at 4 KiB (SPEC § "Secret residue on the dead stack").
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** Wycheproof `chacha20_poly1305_test.json`
   anchors the module (`tools/wycheproof.py` → `src/testdata/wycheproof.zig`): 256 valid
   vectors seal and open exactly and 60 invalid ones are refused with the output zeroed,

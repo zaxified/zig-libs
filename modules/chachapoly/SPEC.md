@@ -286,6 +286,39 @@ Beyond that measurement this is a *structural* CT argument (no secret-dependent
 control flow exists in the source), not a machine-checked-disassembly audit like
 `montint`/`k256`.
 
+## Secret residue on the dead stack
+
+Review 2026-10-08, found through `bolt8`'s transport probe; `src/stackprobe_test.zig`,
+ReleaseFast, AVX2. Every `encrypt`, `decrypt`, `xor` and `stream` left the 32-byte key and/or
+the AEAD's one-time Poly1305 key `r ‖ s` in a dead frame, once per call, at every length and on
+both engines (std's short path and the wide one) — at depths that moved between builds, so no
+named-local wipe can be relied on. Severity MEDIUM: the key also lives in the caller's cipher
+object for the session, so the copy matters after that object is wiped.
+
+Fix: each public entry point runs its body one frame down (`noinline`) and then zeroes the stack
+below it — 2 KiB after std's short path (dirtied ≤ 1.4 KiB), 4 KiB after the wide engine
+(≤ 3.1 KiB), chosen by the same PUBLIC length test the body makes. The AEAD calls the cipher's
+body directly, so it burns once. After: 0 over 3 needles × 4 entry points × 5 lengths × both
+engines × 3 calls; negative control 0, positive 1.
+
+The burn runs on every call, so its speed is the price. Volatile 32-byte vector stores: 3 KiB in
+30 ns, against 115 ns for volatile `u64` stores and ~1 µs for `secureZero` (a volatile byte
+memset, ~3 B/ns without libc). Measured cost, ns per call (min of runs, ±5 % noise):
+
+| length | AEAD before → after | `ChaCha20.xor` before → after |
+|---|---|---|
+| 16 B | 261 → 281 (+8 %) | 105 → 124 (+18 %) |
+| 64 B | 322 → 344 (+7 %) | 138 → 158 (+14 %) |
+| 128 B | 409 → 431 (+5 %) | 209 → 254 (+21 %) |
+| 256 B | 516 → 557 (+8 %) | 213 → 253 (+19 %) |
+| 1 KiB | 902 → 946 (+5 %) | 416 → 459 (+10 %) |
+| 4 KiB | within noise | within noise |
+
+**Not covered here:** the key copy a CALLER makes to pass `k` by value (the std-compatible API
+shape) — it sits in the caller's frame, above any burn of ours (seen in `bolt8`'s disassembly:
+`noise`'s `CipherState` copied `self.k` before the call). `noise` burns its own frame for that;
+other direct callers own theirs. `Poly1305` used directly is not probed.
+
 ## Verification
 
 - **RFC 8439 KATs**, byte-exact, Debug + ReleaseFast: §2.3.2 (ChaCha20 block /
@@ -357,19 +390,6 @@ it, which is how two real routing holes in `decrypt` and `stream` were found.
 
 ## Non-goals / backlog
 
-- **Key copies on the dead stack (found 2026-10-08, from `bolt8`'s stack probe; MEDIUM,
-  undecided).** After an `encrypt`/`decrypt` returns, a dead frame still holds the 32-byte key —
-  measured through `bolt8`'s `Transport` (ReleaseFast): 2 copies per `sendMessage` (length frame +
-  body), 1 per `recvLength`+`recvMessage`, on the short path (std's AEAD, ≤ 128 bytes). The
-  ChaCha20 state is the key's eight words, so every caller of this AEAD (noise, bolt8, wireguard,
-  sealedbox, …) leaves one per call; the wide path was not measured separately. Severity is lower
-  than the signing-key residue in the k256 family: the key also lives in the caller's cipher
-  object for the whole session, so the copy matters only after that object's `deinit`. Fix shape
-  if taken: the `bip340` F2 burn (`noinline` body + zeroing at its depth) on both paths, which
-  costs on EVERY call — measure first (a 1 KiB burn by volatile `u64` stores ≈ 40 ns against
-  ~0.5 µs for a short packet), and decide per path; libsodium wipes its ChaCha state
-  (`sodium_memzero`) for the same reason. Probe: `bolt8/src/stackprobe_test.zig`'s
-  `stepSend`/`stepRecv`, or a module-local probe in the same shape.
 - **AVX-512 (L = 8) is correctness-tested but perf-unmeasured** — no AVX-512
   hardware here. The selection is comptime, so a host that has it takes the
   8-lane path untested for *speed*; it is not untested for *correctness*.

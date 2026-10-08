@@ -385,6 +385,13 @@ pub const ChaCha20 = struct {
     /// overlapping slices are not supported — the fused path reads a whole
     /// 64-byte block before writing it, as std's block-buffered `xor` does.
     pub fn xor(out: []u8, in: []const u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
+        defer burnFor(in.len <= delegateLimit(delegate_max_bytes));
+        xorBody(out, in, counter, key, nonce);
+    }
+
+    /// `xor`'s body, one frame down so `burnFor` reaches what it left (see
+    /// `burnStack`). The AEAD calls this directly and burns once itself.
+    noinline fn xorBody(out: []u8, in: []const u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
         std.debug.assert(out.len == in.len);
         // In EVERY build — see `counterWouldWrap`.
         if (counterWouldWrap(in.len, counter)) @panic(counter_wrap_message);
@@ -453,6 +460,11 @@ pub const ChaCha20 = struct {
 
     /// Write the raw ChaCha20 keystream (starting at block `counter`) into `out`.
     pub fn stream(out: []u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
+        defer burnFor(out.len <= delegateLimit(delegate_max_bytes));
+        streamBody(out, counter, key, nonce);
+    }
+
+    noinline fn streamBody(out: []u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
         // See `counterWouldWrap`: in every build, not just the safe ones.
         if (counterWouldWrap(out.len, counter)) @panic(counter_wrap_message);
         // Short whole call -> std; see the matching note in `xor`.
@@ -485,6 +497,38 @@ pub const ChaCha20 = struct {
         }
     }
 };
+
+// ── dead-stack burn ──────────────────────────────────────────────────────────
+
+/// Review 2026-10-08 (MEDIUM; found through `bolt8`'s transport probe).
+/// Measured with `stackprobe_test.zig` (ReleaseFast): every `encrypt`,
+/// `decrypt`, `xor` and `stream` left the 32-byte key and/or the AEAD's
+/// one-time Poly1305 key `r ‖ s` in a dead frame — on std's short path and on
+/// the wide one alike, at depths that move with the build's frame layout, so
+/// no wipe of a named local can be relied on. Each public entry point runs
+/// its body one frame down (`noinline`) and then zeroes the stack below it.
+///
+/// The size follows the path the PUBLIC length selects: std's short path
+/// dirtied at most 1.4 KiB, the wide engine 3.1 KiB (ReleaseFast, AVX2,
+/// 2026-10-08). Volatile 32-byte vector stores: a 4 KiB burn is ~40 ns, where
+/// `secureZero` (a volatile byte memset, ~3 B/ns without libc) would be
+/// ~1.3 µs and volatile `u64` stores ~150 ns — the burn runs on EVERY call,
+/// so its speed is the price of the fix. `noinline` is load-bearing.
+noinline fn burnStack(comptime bytes: usize) void {
+    const V = @Vector(4, u64);
+    var buf: [bytes / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
+}
+
+/// `short`: the call took std's short path (the public length test the body
+/// makes). `stackprobe_test.zig` goes red when either path outgrows its size.
+inline fn burnFor(short: bool) void {
+    if (short) burnStack(short_path_burn) else burnStack(wide_path_burn);
+}
+
+const short_path_burn = 2 * 1024;
+const wide_path_burn = 4 * 1024;
 
 // ── ChaCha20-Poly1305 AEAD (RFC 8439 §2.8) ───────────────────────────────────
 
@@ -539,6 +583,12 @@ pub const ChaCha20Poly1305 = struct {
 
     /// Encrypt `m` into `c` (`c.len == m.len`) and write the auth tag to `tag`.
     pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
+        defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
+        encryptBody(c, tag, m, ad, npub, k);
+    }
+
+    /// `encrypt`'s body, one frame down so `burnFor` reaches what it left.
+    noinline fn encryptBody(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
         std.debug.assert(c.len == m.len);
 
         // Short total -> run std's AEAD unchanged. See `aead_delegate_max`.
@@ -554,9 +604,9 @@ pub const ChaCha20Poly1305 = struct {
         note(&aead_path, .wide);
 
         var poly_key = [_]u8{0} ** 32;
-        ChaCha20.xor(poly_key[0..], poly_key[0..], 0, k, npub);
+        ChaCha20.xorBody(poly_key[0..], poly_key[0..], 0, k, npub);
 
-        ChaCha20.xor(c[0..m.len], m, 1, k, npub);
+        ChaCha20.xorBody(c[0..m.len], m, 1, k, npub);
 
         var mac = Poly1305.init(poly_key[0..]);
         mac.update(ad);
@@ -573,6 +623,11 @@ pub const ChaCha20Poly1305 = struct {
     /// Verify `tag` and decrypt `c` into `m` (`c.len == m.len`).
     /// On failure returns `error.AuthenticationFailed` and `m` is zeroed.
     pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
+        defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
+        return decryptBody(m, c, tag, ad, npub, k);
+    }
+
+    noinline fn decryptBody(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
         std.debug.assert(c.len == m.len);
 
         // Short total -> std's AEAD. Same public-length branch as `encrypt`;
@@ -597,7 +652,7 @@ pub const ChaCha20Poly1305 = struct {
         note(&aead_path, .wide);
 
         var poly_key = [_]u8{0} ** 32;
-        ChaCha20.xor(poly_key[0..], poly_key[0..], 0, k, npub);
+        ChaCha20.xorBody(poly_key[0..], poly_key[0..], 0, k, npub);
 
         var mac = Poly1305.init(poly_key[0..]);
         mac.update(ad);
@@ -621,7 +676,7 @@ pub const ChaCha20Poly1305 = struct {
             std.crypto.secureZero(u8, m);
             return error.AuthenticationFailed;
         }
-        ChaCha20.xor(m[0..c.len], c, 1, k, npub);
+        ChaCha20.xorBody(m[0..c.len], c, 1, k, npub);
     }
 };
 
@@ -640,6 +695,7 @@ const testing = std.testing;
 test {
     _ = @import("poly1305.zig");
     _ = @import("bench.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 // RFC 8439 §2.3.2 — ChaCha20 block function (counter = 1).

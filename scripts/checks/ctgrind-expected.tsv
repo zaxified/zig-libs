@@ -191,8 +191,8 @@ chachapoly	ReleaseSafe	poly1305	1	>=1	2a6dacfd1a726319	ff3ba8f00b851bdf
 # is consumed in Debug, and CONVENTIONS §7.1 narrowed the Debug CI lane to
 # compile-only in 2026-08-15 on the same kind of measurement. See
 # `scripts/checks/ctgrind.sh` § MODES.
-chachapoly	ReleaseFast	aead	1	4	af92603a6e5ed4e7	870a36cbebbc4588
-chachapoly	ReleaseSafe	aead	1	>=1	af92603a6e5ed4e7	870a36cbebbc4588
+chachapoly	ReleaseFast	aead	1	4	5b5fff5d04d031c0	870a36cbebbc4588
+chachapoly	ReleaseSafe	aead	1	>=1	5b5fff5d04d031c0	870a36cbebbc4588
 # oscore — added 2026-09-08. SPEC.md § "Threat model / limits" claims the key
 # material is routed ONLY through std's constant-time HMAC/AES-CCM, with no
 # comparison or branch on key bytes in this module's own code; until today that
