@@ -3632,8 +3632,19 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   same bytes or the same error (`decoder_test.zig`); the rule itself
   changes no output, so mutants of its thresholds are equivalent by
   construction (what they change is measured above, not tested).
-- **Z35 — Decoder: the sequence loop in assembly (x86-64, aarch64).**
-  Approved by the user 2026-10-07, then deferred by them in favour of Z34
+- ~~**Z35 — Decoder: the sequence loop in assembly (x86-64, aarch64).**~~
+  Done 2026-10-09 for x86-64 (user, for the P3 → P2 push), together with
+  libzstd's Huffman four-stream loops (`src/huf_asm.zig`, a port of
+  `huf_decompress_amd64.S`): `src/seq_fast.zig` runs after Z34's
+  prefetching loop when that one does not take the block, LLVM builds with
+  BMI2 only; `rbp` is no longer used (the match length lives in
+  `FastSeq.seq_ml`), so builds that keep a frame pointer are safe. Both are
+  checked against the Zig loops on every corpus frame at levels 1, 3 and 19
+  and 8 damaged copies of each, equal bytes or equal errors
+  (`decoder_test.zig`), with a count that the assembly ran. Silesia
+  decoding after both, cycles: x-ray d3 1.066× → 0.94×, ooffice d3 1.04× →
+  0.96×, dickens d3 1.04× → 1.02×. aarch64 not written. History:
+  approved by the user 2026-10-07, then deferred by them in favour of Z34
   after the numbers: a BMI2 x86-64 loop (decode with `shrx`/`bzhi`, no
   branch per read; 32-byte literal copies; the Zig `execSequence` for
   anything outside the margins) decoded the 36 Silesia frames of levels 1,

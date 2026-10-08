@@ -83,6 +83,8 @@ Translated (source, restructured into Zig but decision-for-decision the same):
                                       sequence tables, sequence execution   -> src/dblock.zig
   lib/decompress/huf_decompress.c     Huffman decoding tables and streams,
                                       incl. the fast four-stream loop       -> src/huf_dec.zig
+  lib/decompress/huf_decompress_amd64.S  the four-stream loops' bodies,
+                                      x86-64 BMI2 assembly                  -> src/huf_asm.zig
   lib/common/entropy_common.c         FSE_readNCount, HUF_readStats         -> src/dbits.zig, src/huf_dec.zig
   lib/common/fse_decompress.c, lib/common/bitstream.h
                                       FSE decoding, bit reader              -> src/dbits.zig

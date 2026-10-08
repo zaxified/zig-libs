@@ -23,6 +23,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const fill = @import("fill.zig");
+const seq_fast = @import("seq_fast.zig");
 const dbits = @import("dbits.zig");
 const huf = @import("huf_dec.zig");
 const seqs = @import("sequences.zig");
@@ -831,6 +832,86 @@ inline fn prefetchMatch(out: []u8, pos: usize, seq: Seq) void {
     @prefetch(@as([*]const u8, @ptrFromInt(addr +% 64)), .{ .rw = .read, .locality = 3, .cache = .data });
 }
 
+/// Test hook: the suite decodes with and without `seq_fast` and compares.
+/// A constant outside tests.
+const fast_seq_toggle = if (builtin.is_test) struct {
+    var on: bool = true;
+} else struct {
+    const on: bool = true;
+};
+/// Void outside tests (see `setPrefetchForTest`).
+pub const setFastSeqForTest = if (builtin.is_test) setFastSeq else {};
+fn setFastSeq(on: bool) void {
+    fast_seq_toggle.on = on;
+}
+pub const fast_seq_supported = seq_fast.supported;
+pub const fastSeqEntriesForTest = if (builtin.is_test) fastSeqEntries else {};
+fn fastSeqEntries() usize {
+    return seq_fast.entries.n;
+}
+
+const FastSeqResult = struct { ss: SeqState, op: usize, lit_pos: usize, nb_seq: u32 };
+
+/// Hands the sequences to `seq_fast.run` while it takes them, executing
+/// each one it leaves pending through `execSequence`, then returns where
+/// the Zig loop goes on from. By value in and out, as `decodeAhead`: an
+/// address handed to a call would put the loop's state back in memory.
+noinline fn runFastSeq(ss_in: SeqState, hl: History, op_in: usize, oend: usize, lit_in: LitCursor, nb_seq_in: u32) Error!FastSeqResult {
+    var ss = ss_in;
+    var lit = lit_in;
+    var op = op_in;
+    const out = @intFromPtr(hl.out.ptr);
+    const buf = @intFromPtr(ss.d.buf.ptr);
+    const lsrc = @intFromPtr(lit.src.ptr);
+    var a: seq_fast.FastSeq = .{
+        .container = ss.d.container,
+        .bits = ss.d.bits_consumed,
+        .ptr = buf + ss.d.ptr,
+        .limit = buf + ss.d.start + seq_fast.stream_margin,
+        .ll_state = ss.ll.state,
+        .ml_state = ss.ml.state,
+        .of_state = ss.of.state,
+        .ll_cells = @intFromPtr(&ss.ll.table.cells),
+        .ml_cells = @intFromPtr(&ss.ml.table.cells),
+        .of_cells = @intFromPtr(&ss.of.table.cells),
+        .prev = .{ ss.prev[0], ss.prev[1], ss.prev[2] },
+        .lit = lsrc + lit.pos,
+        .lit_end = lsrc + lit.end,
+        .op = out + op,
+        .oend_w = out + oend - wildcopy_overlength,
+        .prefix = out + hl.prefix,
+        .nb_seq = nb_seq_in,
+        .seq_ll = 0,
+        .seq_ml = 0,
+        .seq_off = 0,
+        .status = .stopped,
+        .dec = @intFromPtr(&seq_fast.dec_tables),
+    };
+    while (true) {
+        seq_fast.run(&a);
+        lit.pos = a.lit - lsrc;
+        op = a.op - out;
+        switch (a.status) {
+            .stopped => break,
+            .corrupt => return error.CorruptionDetected,
+            .pending => {
+                const seq: Seq = .{ .lit_length = @intCast(a.seq_ll), .match_length = @intCast(a.seq_ml), .offset = @intCast(a.seq_off) };
+                op += try execSequence(&hl, op, oend, seq, &lit);
+                a.lit = lsrc + lit.pos;
+                a.op = out + op;
+            },
+        }
+    }
+    ss.d.container = a.container;
+    ss.d.bits_consumed = @intCast(a.bits);
+    ss.d.ptr = a.ptr - buf;
+    ss.ll.state = @intCast(a.ll_state);
+    ss.ml.state = @intCast(a.ml_state);
+    ss.of.state = @intCast(a.of_state);
+    ss.prev = .{ @intCast(a.prev[0]), @intCast(a.prev[1]), @intCast(a.prev[2]) };
+    return .{ .ss = ss, .op = op, .lit_pos = lit.pos, .nb_seq = @intCast(a.nb_seq) };
+}
+
 /// `ZSTD_decompressSequences_body`. Writes at `h.out[op0..op0 + capacity]`.
 fn decompressSequences(st: *State, h: *const History, op0: usize, capacity: usize, src: []const u8, nb_seq_in: u32) Error!usize {
     var op = op0;
@@ -858,6 +939,13 @@ fn decompressSequences(st: *State, h: *const History, op0: usize, capacity: usiz
             op = r.op;
             lit.pos = r.lit_pos;
             nb_seq = 0;
+        }
+        if (seq_fast.supported and fast_seq_toggle.on and nb_seq != 0 and oend >= wildcopy_overlength and !ss.d.overflowed) {
+            const r = try runFastSeq(ss, hl, op, oend, lit, nb_seq);
+            ss = r.ss;
+            op = r.op;
+            lit.pos = r.lit_pos;
+            nb_seq = r.nb_seq;
         }
         while (nb_seq != 0) : (nb_seq -= 1) {
             const seq = decodeSequence(&ss, nb_seq == 1);

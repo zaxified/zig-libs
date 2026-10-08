@@ -547,3 +547,101 @@ test "the prefetching sequence loop decodes as the plain one, valid and damaged 
     }
     try std.testing.expect(frames > 50);
 }
+
+const huf_dec = @import("huf_dec.zig");
+
+fn decodeAsm(on: bool, src: []const u8) Outcome {
+    huf_dec.setAsmForTest(on);
+    return if (decodeAll(src)) |out| .{ .ok = out } else |e| .{ .err = e };
+}
+
+test "the assembly Huffman loops decode as the Zig ones, valid and damaged frames" {
+    if (!huf_dec.asm_supported) return error.SkipZigTest;
+    defer huf_dec.setAsmForTest(true);
+    var prng: std.Random.DefaultPrng = .init(0x5eed_4a53);
+    const rnd = prng.random();
+    const entries0 = huf_dec.asmEntriesForTest();
+    var frames: usize = 0;
+    for (corpus.cases) |case| {
+        if (case.len > 300_000) continue;
+        const src = try gpa.alloc(u8, case.len);
+        defer gpa.free(src);
+        corpus.generate(case, src);
+        for ([_]i32{ 1, 3, 19 }) |level| {
+            const z = try zstd.compressAlloc(gpa, src, .{ .level = level });
+            defer gpa.free(z);
+            frames += 1;
+            for (0..9) |round| {
+                const damaged = try gpa.dupe(u8, z);
+                defer gpa.free(damaged);
+                if (round > 0) damaged[rnd.uintLessThan(usize, damaged.len)] ^= @as(u8, 1) << rnd.int(u3);
+                const a = decodeAsm(true, damaged);
+                defer if (a == .ok) gpa.free(a.ok);
+                const b = decodeAsm(false, damaged);
+                defer if (b == .ok) gpa.free(b.ok);
+                switch (a) {
+                    .ok => |out| {
+                        try std.testing.expect(b == .ok);
+                        try std.testing.expectEqualSlices(u8, b.ok, out);
+                        if (round == 0) try std.testing.expectEqualSlices(u8, src, out);
+                    },
+                    .err => |e| {
+                        try std.testing.expect(b == .err);
+                        try std.testing.expectEqual(b.err, e);
+                    },
+                }
+            }
+        }
+    }
+    try std.testing.expect(frames > 50);
+    // Teeth: the assembly ran (both table kinds are exercised by the corpus;
+    // a loop that never entered would make every comparison above vacuous).
+    try std.testing.expect(huf_dec.asmEntriesForTest() - entries0 > 100);
+}
+
+fn decodeFastSeq(on: bool, src: []const u8) Outcome {
+    dblock.setFastSeqForTest(on);
+    return if (decodeAll(src)) |out| .{ .ok = out } else |e| .{ .err = e };
+}
+
+test "the assembly sequence loop decodes as the Zig one, valid and damaged frames" {
+    if (!dblock.fast_seq_supported) return error.SkipZigTest;
+    defer dblock.setFastSeqForTest(true);
+    var prng: std.Random.DefaultPrng = .init(0x5eed_2035);
+    const rnd = prng.random();
+    const entries0 = dblock.fastSeqEntriesForTest();
+    var frames: usize = 0;
+    for (corpus.cases) |case| {
+        if (case.len > 300_000) continue;
+        const src = try gpa.alloc(u8, case.len);
+        defer gpa.free(src);
+        corpus.generate(case, src);
+        for ([_]i32{ 1, 3, 19 }) |level| {
+            const z = try zstd.compressAlloc(gpa, src, .{ .level = level });
+            defer gpa.free(z);
+            frames += 1;
+            for (0..9) |round| {
+                const damaged = try gpa.dupe(u8, z);
+                defer gpa.free(damaged);
+                if (round > 0) damaged[rnd.uintLessThan(usize, damaged.len)] ^= @as(u8, 1) << rnd.int(u3);
+                const a = decodeFastSeq(true, damaged);
+                defer if (a == .ok) gpa.free(a.ok);
+                const b = decodeFastSeq(false, damaged);
+                defer if (b == .ok) gpa.free(b.ok);
+                switch (a) {
+                    .ok => |out| {
+                        try std.testing.expect(b == .ok);
+                        try std.testing.expectEqualSlices(u8, b.ok, out);
+                        if (round == 0) try std.testing.expectEqualSlices(u8, src, out);
+                    },
+                    .err => |e| {
+                        try std.testing.expect(b == .err);
+                        try std.testing.expectEqual(b.err, e);
+                    },
+                }
+            }
+        }
+    }
+    try std.testing.expect(frames > 50);
+    try std.testing.expect(dblock.fastSeqEntriesForTest() - entries0 > 100);
+}

@@ -15,6 +15,7 @@ const std = @import("std");
 const fill = @import("fill.zig");
 const builtin = @import("builtin");
 const dbits = @import("dbits.zig");
+const huf_asm = @import("huf_asm.zig");
 const DStream = dbits.DStream;
 const readLE16 = dbits.readLE16;
 const readLE64 = dbits.readLE64;
@@ -162,10 +163,25 @@ pub fn readDTableX1(dt: *DTable, src: []const u8) Error!usize {
         const symbol_count = rank_val[w];
         const length: u32 = (@as(u32, 1) << @intCast(w)) >> 1;
         const nb_bits: u16 = @intCast(table_log + 1 - w);
+        // libzstd's fill, by run length: one, two or four cells in one
+        // store, 8 and up in 64-bit stores (four cells each), instead of a
+        // 16-bit store per cell.
+        // (Native order: the four cells are equal, so a word of them is the
+        // same bytes as the cells themselves on either endianness.)
+        const bytes = std.mem.sliceAsBytes(cells);
+        const native = comptime builtin.cpu.arch.endian();
         var s: u32 = 0;
         while (s < symbol_count) : (s += 1) {
             const cell: u16 = (@as(u16, symbols[symbol + s]) << 8) | nb_bits;
-            @memset(cells[start..][0..length], cell);
+            const x4: u64 = @as(u64, cell) * 0x0001_0001_0001_0001;
+            switch (length) {
+                1 => cells[start] = cell,
+                2 => std.mem.writeInt(u32, bytes[2 * start ..][0..4], @truncate(x4), native),
+                else => {
+                    var k: usize = 0;
+                    while (k < length) : (k += 4) std.mem.writeInt(u64, bytes[2 * (start + k) ..][0..8], x4, native);
+                },
+            }
             start += length;
         }
         symbol += symbol_count;
@@ -326,6 +342,43 @@ fn initRemaining(src: []const u8, a: *const FastArgs, s: usize, segment_end: usi
     };
 }
 
+/// Test hook: the suite decodes with the assembly loops on and off and
+/// compares. A constant outside tests.
+const asm_toggle = if (builtin.is_test) struct {
+    var on: bool = true;
+} else struct {
+    const on: bool = true;
+};
+/// Void outside tests (a `@compileError` body would trip the gates that
+/// reference every public declaration).
+pub const setAsmForTest = if (builtin.is_test) setAsm else {};
+fn setAsm(on: bool) void {
+    asm_toggle.on = on;
+}
+pub const asm_supported = huf_asm.supported;
+pub const asmEntriesForTest = if (builtin.is_test) asmEntries else {};
+fn asmEntries() usize {
+    return huf_asm.entries.n;
+}
+
+/// One run of `huf_asm`'s loop from the index cursors here and back.
+inline fn runAsm(comptime x2: bool, dst: []u8, src: []const u8, cells: usize, olimit: usize, ip: *[4]usize, op: *[4]usize, bits: *[4]u64) void {
+    var a: huf_asm.Args = undefined;
+    for (0..4) |s| {
+        a.ip[s] = @intFromPtr(src.ptr) + ip[s];
+        a.op[s] = @intFromPtr(dst.ptr) + op[s];
+    }
+    a.bits = bits.*;
+    a.dt = cells;
+    a.olimit = @intFromPtr(dst.ptr) + olimit;
+    if (x2) huf_asm.loopX2(&a) else huf_asm.loopX1(&a);
+    for (0..4) |s| {
+        ip[s] = a.ip[s] - @intFromPtr(src.ptr);
+        op[s] = a.op[s] - @intFromPtr(dst.ptr);
+    }
+    bits.* = a.bits;
+}
+
 /// `HUF_decompress4X1_usingDTable_internal_fast_c_loop`.
 fn fastLoopX1(dst: []u8, src: []const u8, cells: *const [2 << tablelog_max]u16, a: *FastArgs) void {
     var bits = a.bits;
@@ -340,6 +393,10 @@ fn fastLoopX1(dst: []u8, src: []const u8, cells: *const [2 << tablelog_max]u16, 
         if (op[3] == olimit) break;
         for (1..4) |s| {
             if (ip[s] < ip[s - 1]) break :outer;
+        }
+        if (huf_asm.supported and asm_toggle.on) {
+            runAsm(false, dst, src, @intFromPtr(cells), olimit, &ip, &op, &bits);
+            continue;
         }
         while (true) {
             inline for (0..5) |k| {
@@ -646,6 +703,10 @@ fn fastLoopX2(dst: []u8, src: []const u8, cells: *const [1 << tablelog_max]u32, 
         if (op[3] == olimit) break;
         for (1..4) |s| {
             if (ip[s] < ip[s - 1]) break :outer;
+        }
+        if (huf_asm.supported and asm_toggle.on) {
+            runAsm(true, dst, src, @intFromPtr(cells), olimit, &ip, &op, &bits);
+            continue;
         }
         while (true) {
             inline for (0..5) |_| {

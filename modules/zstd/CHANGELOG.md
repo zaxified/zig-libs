@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Faster decoding on x86-64 with BMI2 (Z35, the same output
+  and errors): the sequence loop and libzstd's four-stream Huffman loops
+  (`huf_decompress_amd64.S`, ported) run in assembly in LLVM builds; the Zig
+  loops stay for every other target and are the tests' oracle. Single-symbol
+  Huffman tables are filled four cells per store (`HUF_readDTableX1_wksp`).
+  Silesia: x-ray level 3 1.07× → 0.94× libzstd's cycles, ooffice 1.04× →
+  0.96×.
+
 - **2026-10-09** — Faster compression of poorly compressible input (the same
   output): byte histograms are counted in four tables at once (libzstd's
   `HIST_count_parallel_wksp`), Huffman literals are coded through a packed
