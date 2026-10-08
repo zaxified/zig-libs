@@ -17,9 +17,14 @@
 //! xml, x-ray: medical image, ooffice: executable), each compressed one-shot at
 //! levels 1, 3 and 19 and its level-3 and level-19 frames decompressed, every
 //! side on one reused context. Both sides double the batch until it takes over
-//! 100 ms and keep the best of five. A compressed size must equal libzstd's to
-//! the byte (the module emits libzstd's frames), a decompressed size the
-//! input's; otherwise the run fails.
+//! 100 ms and keep the best of five; per workload the two sides alternate for
+//! three rounds (`ZSTD_BENCH_ROUNDS=<n>`) and each keeps its best. A compressed
+//! size must equal libzstd's to the byte (the module emits libzstd's frames), a
+//! decompressed size the input's; otherwise the run fails.
+//!
+//! Arguments, if any, keep only the workloads whose name (`x-ray.c1`) contains
+//! one of them: `zig build bench-zstd -- x-ray.c1 d3`. The card's line needs
+//! the full run.
 
 const std = @import("std");
 const zstd = @import("zstd");
@@ -36,7 +41,42 @@ const ops = [_]Op{
     .{ .tag = "d19", .decompress = true, .level = 19 },
 };
 
-const Row = struct { ns: f64, count: u64 };
+fn selected(filters: []const [:0]const u8, file: []const u8, op: Op) bool {
+    if (filters.len == 0) return true;
+    var buf: [64]u8 = undefined;
+    const name = std.fmt.bufPrint(&buf, "{s}.{s}", .{ file, op.tag }) catch return true;
+    for (filters) |f| if (std.mem.indexOf(u8, name, f) != null) return true;
+    return false;
+}
+
+/// `cycles` is user-mode CPU cycles per op, 0 when the counter is
+/// unavailable (`perf_event_paranoid` > 2, not Linux, no PMU).
+const Row = struct { ns: f64, cycles: f64 = 0, count: u64 };
+
+/// This thread's user-mode cycle counter (`perf stat -e cycles:u`).
+const Cycles = struct {
+    fd: ?i32,
+
+    fn open() Cycles {
+        if (@import("builtin").os.tag != .linux) return .{ .fd = null };
+        const linux = std.os.linux;
+        var attr: linux.perf_event_attr = .{
+            .type = .HARDWARE,
+            .config = @intFromEnum(linux.PERF.COUNT.HW.CPU_CYCLES),
+            .flags = .{ .exclude_kernel = true, .exclude_hv = true },
+        };
+        const rc = linux.perf_event_open(&attr, 0, -1, -1, 0);
+        if (linux.errno(rc) != .SUCCESS) return .{ .fd = null };
+        return .{ .fd = @intCast(rc) };
+    }
+
+    fn read(c: Cycles) u64 {
+        const fd = c.fd orelse return 0;
+        var v: u64 = 0;
+        _ = std.os.linux.read(fd, @ptrCast(&v), @sizeOf(u64));
+        return v;
+    }
+};
 
 const Ctx = struct {
     c: *zstd.Compressor,
@@ -52,7 +92,7 @@ fn once(x: Ctx) usize {
     return x.c.compress(x.out, x.src, .{ .level = x.op.level }) catch unreachable;
 }
 
-fn timeIt(io: std.Io, x: Ctx) Row {
+fn timeIt(io: std.Io, cyc: Cycles, x: Ctx) Row {
     var n: usize = 1;
     while (true) {
         const t = std.Io.Clock.Timestamp.now(io, .awake);
@@ -61,13 +101,17 @@ fn timeIt(io: std.Io, x: Ctx) Row {
         n *= 2;
     }
     var best: i96 = std.math.maxInt(i96);
+    var best_cycles: u64 = std.math.maxInt(u64);
     var count: usize = 0;
     for (0..5) |_| {
         const t = std.Io.Clock.Timestamp.now(io, .awake);
+        const c0 = cyc.read();
         for (0..n) |_| count = once(x);
+        best_cycles = @min(best_cycles, cyc.read() - c0);
         best = @min(best, t.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
     }
-    return .{ .ns = @as(f64, @floatFromInt(best)) / @as(f64, @floatFromInt(n)), .count = count };
+    const nf: f64 = @floatFromInt(n);
+    return .{ .ns = @as(f64, @floatFromInt(best)) / nf, .cycles = @as(f64, @floatFromInt(best_cycles)) / nf, .count = count };
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -84,13 +128,12 @@ pub fn main(init: std.process.Init) !u8 {
     try cwd.createDirPath(io, work_dir);
     const abs = try cwd.realPathFileAlloc(io, work_dir, arena);
 
-    var list: std.Io.Writer.Allocating = .init(arena);
-    for (files) |f| for (ops) |op| {
-        try list.writer.print("{s}.{s}\t{s}\t{d}\t{s}/{s}\n", .{ f, op.tag, if (op.decompress) "d" else "c", op.level, corpus_abs, f });
-    };
+    const args = try init.minimal.args.toSlice(arena);
+    const filters = if (args.len > 1) args[1..] else &[_][:0]const u8{};
+
+    const rounds: usize = if (init.environ_map.get("ZSTD_BENCH_ROUNDS")) |r| try std.fmt.parseInt(usize, r, 10) else 3;
     var dir = try cwd.openDir(io, work_dir, .{});
     defer dir.close(io);
-    try dir.writeFile(io, .{ .sub_path = "workloads.tsv", .data = list.written() });
 
     const so = init.environ_map.get("LIBZSTD_SO") orelse default_so;
     const exe = try std.fmt.allocPrint(arena, "{s}/libzstd_bench", .{abs});
@@ -100,22 +143,8 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("bench-zstd: zig cc failed:\n{s}\n", .{cc.stderr});
         return 1;
     }
-    std.debug.print("bench-zstd: libzstd (minutes) ...\n", .{});
-    const res = try std.process.run(arena, io, .{ .argv = &.{ exe, abs } });
-    if (res.term != .exited or res.term.exited != 0) {
-        std.debug.print("bench-zstd: libzstd side failed:\n{s}\n", .{res.stderr});
-        return 1;
-    }
-    var rows: std.StringHashMapUnmanaged(Row) = .empty;
-    var lines = std.mem.tokenizeScalar(u8, res.stdout, '\n');
-    while (lines.next()) |line| {
-        var f = std.mem.tokenizeScalar(u8, line, '\t');
-        const name = f.next() orelse continue;
-        const ns = try std.fmt.parseFloat(f64, f.next() orelse return error.BadForeignOutput);
-        const count = try std.fmt.parseInt(u64, f.next() orelse return error.BadForeignOutput, 10);
-        try rows.put(arena, name, .{ .ns = ns, .count = count });
-    }
 
+    const cyc: Cycles = .open();
     var c: zstd.Compressor = .init(gpa);
     defer c.deinit();
     var d = try zstd.Decompressor.init(gpa, .{});
@@ -124,12 +153,13 @@ pub fn main(init: std.process.Init) !u8 {
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
-    try w.print("reference: {s}", .{res.stderr});
-    try w.print("{s:<12} {s:>14} {s:>14} {s:>10}  bytes\n", .{ "workload", "ours ns/op", "libzstd ns/op", "ours/lib" });
+    try w.print("{s:<12} {s:>14} {s:>14} {s:>14} {s:>14} {s:>8} {s:>8}  bytes\n", .{ "workload", "ours ns/op", "libzstd ns/op", "ours cyc/op", "libzstd cyc/op", "ns", "cycles" });
     try w.flush();
     var worst: f64 = 0;
     var best: f64 = std.math.inf(f64);
     var mismatch = false;
+    var metric_cycles = true;
+    var reference: []const u8 = "";
     for (files) |fname| {
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ corpus_abs, fname });
         const src = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 30));
@@ -137,27 +167,64 @@ pub fn main(init: std.process.Init) !u8 {
         const out = try gpa.alloc(u8, zstd.compressBound(src.len));
         defer gpa.free(out);
         for (ops) |op| {
+            if (!selected(filters, fname, op)) continue;
+            const name = try std.fmt.allocPrint(arena, "{s}.{s}", .{ fname, op.tag });
             const frame_buf = try gpa.alloc(u8, zstd.compressBound(src.len));
             defer gpa.free(frame_buf);
             const flen = try c.compress(frame_buf, src, .{ .level = op.level });
-            const ours = timeIt(io, .{ .c = &c, .d = &d, .src = src, .frame = frame_buf[0..flen], .out = out, .op = op });
-            const name = try std.fmt.allocPrint(arena, "{s}.{s}", .{ fname, op.tag });
-            const t = rows.get(name) orelse return error.MissingRow;
-            const ratio = ours.ns / t.ns;
+            const line = try std.fmt.allocPrint(arena, "{s}\t{s}\t{d}\t{s}\n", .{ name, if (op.decompress) "d" else "c", op.level, path });
+            try dir.writeFile(io, .{ .sub_path = "workloads.tsv", .data = line });
+            // The two sides alternate, `rounds` times, each keeping its best:
+            // timed one after the other they would see different loads of a
+            // shared machine (measured: ±10 % on decoding between two runs).
+            const inf = std.math.inf(f64);
+            var ours: Row = .{ .ns = inf, .cycles = inf, .count = 0 };
+            var t: Row = .{ .ns = inf, .cycles = inf, .count = 0 };
+            for (0..rounds) |_| {
+                const res = try std.process.run(arena, io, .{ .argv = &.{ exe, abs } });
+                if (res.term != .exited or res.term.exited != 0) {
+                    std.debug.print("bench-zstd: libzstd side failed:\n{s}\n", .{res.stderr});
+                    return 1;
+                }
+                reference = res.stderr;
+                var f = std.mem.tokenizeScalar(u8, std.mem.trimEnd(u8, res.stdout, "\n"), '\t');
+                if (!std.mem.eql(u8, f.next() orelse return error.BadForeignOutput, name)) return error.BadForeignOutput;
+                const ns = try std.fmt.parseFloat(f64, f.next() orelse return error.BadForeignOutput);
+                t.count = try std.fmt.parseInt(u64, f.next() orelse return error.BadForeignOutput, 10);
+                t.ns = @min(t.ns, ns);
+                t.cycles = @min(t.cycles, try std.fmt.parseFloat(f64, f.next() orelse return error.BadForeignOutput));
+                const r = timeIt(io, cyc, .{ .c = &c, .d = &d, .src = src, .frame = frame_buf[0..flen], .out = out, .op = op });
+                ours.count = r.count;
+                ours.ns = @min(ours.ns, r.ns);
+                ours.cycles = @min(ours.cycles, r.cycles);
+            }
+            // Cycles when both sides counted them: they do not move with the
+            // clock frequency, which a shared, thermally limited machine does.
+            const by_cycles = ours.cycles > 0 and t.cycles > 0;
+            const ratio_ns = ours.ns / t.ns;
+            const ratio_cyc = if (by_cycles) ours.cycles / t.cycles else 0;
+            const ratio = if (by_cycles) ratio_cyc else ratio_ns;
+            metric_cycles = metric_cycles and by_cycles;
             worst = @max(worst, ratio);
             best = @min(best, ratio);
             const same = ours.count == t.count;
             if (!same) mismatch = true;
-            try w.print("{s:<12} {d:>14.0} {d:>14.0} {d:>10.2}  {d}{s}\n", .{ name, ours.ns, t.ns, ratio, ours.count, if (same) "" else " ≠ libzstd" });
+            try w.print("{s:<12} {d:>14.0} {d:>14.0} {d:>14.0} {d:>14.0} {d:>8.3} {d:>8.3}  {d}{s}\n", .{ name, ours.ns, t.ns, ours.cycles, t.cycles, ratio_ns, ratio_cyc, ours.count, if (same) "" else " ≠ libzstd" });
             try w.flush();
         }
     }
+    try w.print("reference: {s}rounds: {d}; ratios below by {s}\n", .{ reference, rounds, if (metric_cycles) "user-mode cycles" else "wall time (no cycle counter)" });
     if (mismatch) {
         try w.writeAll("bench-zstd: FAILED -- an output size differs from libzstd's\n");
         try w.flush();
         return 1;
     }
     try w.print("\nworst ours/libzstd = {d:.2} (best {d:.2})\n", .{ worst, best });
+    if (filters.len > 0) {
+        try w.writeAll("(filtered run: not a card line)\n");
+        try w.flush();
+        return 0;
+    }
     try w.print("card: **Performance:** ref {d:.2}–{d:.2}× libzstd <version> · fastest ref (measured <today>)\n", .{ best, worst });
     try w.flush();
     return 0;

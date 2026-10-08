@@ -1267,7 +1267,7 @@ inline fn lazyPrefixGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart
         }
 
         // store sequence
-        ss.store(w.bytes(anchor, start), off_base, match_length);
+        w.storeSeq(ss, anchor, start, off_base, match_length);
         ip = start + match_length;
         anchor = ip;
         if (ms.lazy_skipping) {
@@ -1446,7 +1446,7 @@ fn lazyExtDictGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32,
         }
 
         // store sequence
-        ss.store(w.bytes(anchor, start), off_base, match_length);
+        w.storeSeq(ss, anchor, start, off_base, match_length);
         ip = start + match_length;
         anchor = ip;
         if (ms.lazy_skipping) {

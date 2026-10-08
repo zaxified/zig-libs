@@ -107,6 +107,27 @@ pub const SeqStore = struct {
         s.storeOnly(literals.len, off_base, match_length);
     }
 
+    /// `store` with `ZSTD_storeSeq`'s literal copy: 16 bytes at a time, past
+    /// the run's end, when `room` bytes are readable at `literals.ptr` and the
+    /// literal buffer has the same slack (libzstd keeps `WILDCOPY_OVERLENGTH`
+    /// spare in it; here the last runs of a full block take `@memcpy`).
+    /// Bytes past `n_lit` are scratch, overwritten by the next run.
+    pub inline fn storeWild(s: *SeqStore, literals: []const u8, room: usize, off_base: u32, match_length: usize) void {
+        const len = literals.len;
+        if (room >= len + 16 and s.lits.len - s.n_lit >= len + 16) {
+            const src = literals.ptr[0..room];
+            const dst = s.lits[s.n_lit..];
+            var i: usize = 0;
+            while (true) {
+                dst[i..][0..16].* = src[i..][0..16].*;
+                i += 16;
+                if (i >= len) break;
+            }
+        } else @memcpy(s.lits[s.n_lit..][0..len], literals);
+        s.n_lit += len;
+        s.storeOnly(len, off_base, match_length);
+    }
+
     /// `ZSTD_storeSeqOnly`.
     pub inline fn storeOnly(s: *SeqStore, lit_length: usize, off_base: u32, match_length: usize) void {
         std.debug.assert(s.n_seq < s.seqs.len);

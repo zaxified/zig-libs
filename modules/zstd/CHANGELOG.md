@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Faster compression of poorly compressible input (the same
+  output): byte histograms are counted in four tables at once (libzstd's
+  `HIST_count_parallel_wksp`), Huffman literals are coded through a packed
+  table, unrolled per table log with two bit containers (libzstd's
+  `HUF_compress1X_usingCTable_internal_body`), the fast strategies copy a
+  sequence's literals 16 bytes at a time, and the block pre-splitter clears
+  its tables through `fill.zig`. Silesia at level 1: x-ray 1.34× → 0.93×
+  libzstd, ooffice 1.32× → 1.00×. `zig build bench-zstd` now alternates the
+  two sides per workload (three rounds, best kept), compares user-mode cycles
+  where the CPU counts them, and takes workload filters as arguments.
+
 - **2026-10-07** — **Fixed (found by the new deterministic fuzz driver):** a
   decoder that had failed inside a raw last block (content size short of the
   frame header's) and was then fed again without a reset took the next byte as

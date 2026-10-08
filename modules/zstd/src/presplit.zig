@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const hist = @import("hist.zig");
+const fill = @import("fill.zig");
 
 const threshold_penalty_rate = 16;
 const threshold_base = threshold_penalty_rate - 2;
@@ -38,7 +39,7 @@ fn hash2(p: []const u8, hash_log: u32) u32 {
 }
 
 fn recordFingerprint(fp: *Fingerprint, src: []const u8, sampling_rate: usize, hash_log: u32) void {
-    @memset(fp.events[0 .. @as(usize, 1) << @intCast(hash_log)], 0);
+    fill.zero(u32, fp.events[0 .. @as(usize, 1) << @intCast(hash_log)]);
     fp.nb_events = 0;
     const limit = src.len - hash_length + 1;
     var n: usize = 0;
@@ -76,6 +77,14 @@ fn mergeEvents(acc: *Fingerprint, newfp: *const Fingerprint) void {
 const Stats = struct {
     past: Fingerprint = .{},
     new: Fingerprint = .{},
+
+    /// `initStats`, `stats.* = .{}` without the byte-wise memset (`fill.zig`).
+    fn clear(st: *Stats) void {
+        fill.zero(u32, &st.past.events);
+        fill.zero(u32, &st.new.events);
+        st.past.nb_events = 0;
+        st.new.nb_events = 0;
+    }
 };
 
 fn splitByChunks(block: []const u8, level: u32, stats: *Stats) usize {
@@ -85,7 +94,7 @@ fn splitByChunks(block: []const u8, level: u32, stats: *Stats) usize {
     const rate = rates[level];
     const hlog = hash_params[level];
     var penalty: u32 = threshold_penalty;
-    stats.* = .{};
+    stats.clear();
     recordFingerprint(&stats.past, block[0..chunk_size], rate, hlog);
     var pos: usize = chunk_size;
     while (pos <= block.len - chunk_size) : (pos += chunk_size) {
@@ -99,8 +108,9 @@ fn splitByChunks(block: []const u8, level: u32, stats: *Stats) usize {
 
 fn splitFromBorders(block: []const u8, stats: *Stats) usize {
     std.debug.assert(block.len == full_block);
-    stats.* = .{};
-    var middle: Fingerprint = .{};
+    stats.clear();
+    var middle: Fingerprint = .{ .events = undefined };
+    fill.zero(u32, &middle.events);
     hist.add(&stats.past.events, block[0..segment_size]);
     hist.add(&stats.new.events, block[block.len - segment_size ..]);
     stats.past.nb_events = segment_size;

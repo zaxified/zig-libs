@@ -500,6 +500,11 @@ pub const Base = struct {
     pub inline fn bytes(b: Base, from: usize, to: usize) []const u8 {
         return b.ptr(from, to - from)[0 .. to - from];
     }
+    /// `SeqStore.store` of the prefix bytes `from`..`to` as the sequence's
+    /// literals, through the 16-byte copy where the prefix has room past `to`.
+    pub inline fn storeSeq(b: Base, ss: *sequences.SeqStore, from: usize, to: usize, off_base: u32, match_length: usize) void {
+        ss.storeWild(b.bytes(from, to), b.hi - from, off_base, match_length);
+    }
     /// `ZSTD_hashPtrSalted` (see `MatchState.hashSalted`).
     pub inline fn hashSalted(b: Base, idx: usize, h_bits: u32, comptime mls: u32, salt: u64) usize {
         const sh: u6 = @intCast(64 - h_bits);
@@ -901,7 +906,7 @@ fn fastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size
 
         // _match: count the forward length
         m_length += w.count(ip0 + m_length, match0 + m_length, iend);
-        ss.store(w.bytes(anchor, ip0), offcode, m_length);
+        w.storeSeq(ss, anchor, ip0, offcode, m_length);
         ip0 += m_length;
         anchor = ip0;
 
@@ -1005,7 +1010,7 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
             if (offset_1 > 0 and w.read32(ip + 1 - offset_1) == w.read32(ip + 1)) {
                 m_length = w.count(ip + 1 + 4, ip + 1 + 4 - offset_1, iend) + 4;
                 ip += 1;
-                ss.store(w.bytes(anchor, ip), 1, m_length);
+                w.storeSeq(ss, anchor, ip, 1, m_length);
                 break :search .stored;
             }
 
@@ -1075,7 +1080,7 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
                 // Write next hash table entry: it's already calculated.
                 hash_long[hl1] = @intCast(ip1);
             }
-            ss.store(w.bytes(anchor, ip), offset + sequences.rep_num, m_length);
+            w.storeSeq(ss, anchor, ip, offset + sequences.rep_num, m_length);
         }
 
         // _match_stored
@@ -1273,7 +1278,7 @@ fn fastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, s
 
         // _match: count the forward length
         m_length += w.count2Segments(ip0 + m_length, match0 + m_length, iend, match_end, prefix_start);
-        ss.store(w.bytes(anchor, ip0), offcode, m_length);
+        w.storeSeq(ss, anchor, ip0, offcode, m_length);
         ip0 += m_length;
         anchor = ip0;
 
@@ -1357,7 +1362,7 @@ fn dfastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
             const rep_match_end: usize = if (rep_index < prefix_start_index) dict_end else iend;
             m_length = w.count2Segments(ip + 1 + 4, @as(usize, rep_index) + 4, iend, rep_match_end, prefix_start) + 4;
             ip += 1;
-            ss.store(w.bytes(anchor, ip), 1, m_length);
+            w.storeSeq(ss, anchor, ip, 1, m_length);
         } else {
             if (match_long_index > dict_start_index and w.read64Seg(match_long_index, prefix_start) == w.read64(ip)) {
                 const match_end: usize = if (match_long_index < prefix_start_index) dict_end else iend;
@@ -1372,7 +1377,7 @@ fn dfastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
                 }
                 offset_2 = offset_1;
                 offset_1 = offset;
-                ss.store(w.bytes(anchor, ip), offset + sequences.rep_num, m_length);
+                w.storeSeq(ss, anchor, ip, offset + sequences.rep_num, m_length);
             } else if (match_index > dict_start_index and w.read32Seg(match_index, prefix_start) == w.read32(ip)) {
                 const h3 = w.hash(ip + 1, h_bits_l, 8);
                 const match_index3 = hash_long[h3];
@@ -1404,7 +1409,7 @@ fn dfastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
                 }
                 offset_2 = offset_1;
                 offset_1 = offset;
-                ss.store(w.bytes(anchor, ip), offset + sequences.rep_num, m_length);
+                w.storeSeq(ss, anchor, ip, offset + sequences.rep_num, m_length);
             } else {
                 ip += ((ip - anchor) >> search_strength) + 1;
                 continue;
@@ -1558,7 +1563,7 @@ fn fastDictMatchStateBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart:
                     else
                         w.count(ip0 + 1 + 4, rep_index + 4, iend) + 4;
                     ip0 += 1;
-                    ss.store(w.bytes(anchor, ip0), 1, m_length);
+                    w.storeSeq(ss, anchor, ip0, 1, m_length);
                     offcode = 1;
                     break :search .rep;
                 }
@@ -1606,7 +1611,7 @@ fn fastDictMatchStateBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart:
                 rep_offset2 = rep_offset1;
                 rep_offset1 = offset;
                 offcode = offset + sequences.rep_num;
-                ss.store(w.bytes(anchor, ip0), offcode, m_length);
+                w.storeSeq(ss, anchor, ip0, offcode, m_length);
             },
             .prefix => {
                 var match0: usize = match_idx;
@@ -1620,7 +1625,7 @@ fn fastDictMatchStateBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart:
                 rep_offset2 = rep_offset1;
                 rep_offset1 = offset;
                 offcode = offset + sequences.rep_num;
-                ss.store(w.bytes(anchor, ip0), offcode, m_length);
+                w.storeSeq(ss, anchor, ip0, offcode, m_length);
             },
         }
 
@@ -1736,7 +1741,7 @@ fn dfastDictMatchStateBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart
             else
                 w.count(ip + 1 + 4, rep_index + 4, iend) + 4;
             ip += 1;
-            ss.store(w.bytes(anchor, ip), 1, m_length);
+            w.storeSeq(ss, anchor, ip, 1, m_length);
             stored = true;
         }
 
@@ -1849,7 +1854,7 @@ fn dfastDictMatchStateBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart
         if (!stored) {
             offset_2 = offset_1;
             offset_1 = offset;
-            ss.store(w.bytes(anchor, ip), offset + sequences.rep_num, m_length);
+            w.storeSeq(ss, anchor, ip, offset + sequences.rep_num, m_length);
         }
 
         // _match_stored

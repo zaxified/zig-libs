@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (2,000–40,000 runs clean per target, 6 targets, ZSTD_FUZZ; found the stale raw-block underflow, fixed) · ct n/a — compression only (keyword review, 2026-10-07)
 
-**Performance:** ref 0.92–1.43× libzstd 1.5.7 · fastest ref (measured 2026-10-07)
+**Performance:** ref 0.88–1.07× libzstd 1.5.7 · fastest ref (measured 2026-10-09)
 
 **Known defects:** none recorded
 
@@ -3408,7 +3408,7 @@ below is this module's own, beyond that gate:
 
 ## Backlog / deferred
 
-- **Speed: level 1 on binary input 1.43× libzstd** *(bench 2026-10-07, `zig build bench-zstd`, Silesia: x-ray c1; every other workload 0.92–1.14×, frames byte-identical)*. The fast strategy on poorly compressible data is where the gap is; decompression is 1.03–1.11× on the four files. Caps the performance axis at 3. Effort: profile first (`perf` against libzstd on x-ray at level 1).
+- **Speed: decoding 1.01–1.07× libzstd, a few compression workloads 1.01–1.06×** *(bench 2026-10-09, `zig build bench-zstd`, user-mode cycles, both sides alternating, best of 3 rounds; frames byte-identical)*. Caps the performance axis at 3 (P2 needs every workload ≤ 1.0×). Was 1.43× at level 1 on x-ray (2026-10-07): the byte histogram was counted in one table (libzstd: four, `HIST_count_parallel_wksp`) and Huffman literals were coded one masked code at a time (libzstd: `HUF_CElt` packed, unrolled per table log, two containers) -- both ported 2026-10-09, x-ray c1 now 0.93×, ooffice c1 1.32× → 1.00×. What is left, by `perf` against a symbolised libzstd 1.5.7: (a) **x-ray d3 1.07×** -- the four-stream X2 Huffman loop takes ~18 M cycles where libzstd's `HUF_decompress4X2_usingDTable_internal_fast_asm_loop` takes ~15 M; its assembly keeps 4 bit containers, 4 output and 3 input cursors in registers and reads a cell's bit count with its own byte load, LLVM spills (tried 2026-10-09 and reverted: pointer cursors, no change; three loads per cell, +4 %, more spills). Closing it means that loop in assembly (cf. Z35). (b) **text decoding (dickens d3 1.04×)**: the sequence loop, Z33/Z34's ground. (c) **compression xml c3 1.055×, c1 1.03×, dickens c3 1.03×**: `dfastBlock` equals libzstd's `ZSTD_compressBlock_doubleFast` in cycles; the rest is spread (seq coding, block driver) -- not profiled to the end yet.
 
 Toward the goal above. "Session" ≈ one working session of the size of the
 level-22/LDM port (≈ 500 lines of Zig with its goldens, diff runs and

@@ -500,22 +500,160 @@ pub fn compress1X(dst: []u8, src: []const u8, ct: *const CTable) usize {
 
 /// `HUF_compress4X_usingCTable_internal`: jump table + four 1X streams.
 pub fn compress4X(dst: []u8, src: []const u8, ct: *const CTable) usize {
+    return compress4XWith(dst, src, ct, compress1X);
+}
+
+fn compress4XWith(dst: []u8, src: []const u8, ct: anytype, comptime one: anytype) usize {
     const segment_size = (src.len + 3) / 4;
     if (dst.len < 6 + 1 + 1 + 1 + 8) return 0; // minimum space to compress successfully
     if (src.len < 12) return 0; // no saving possible: input too small
     var op: usize = 6; // jump table
     var ip: usize = 0;
     for (0..3) |k| {
-        const c_size = compress1X(dst[op..], src[ip .. ip + segment_size], ct);
+        const c_size = one(dst[op..], src[ip .. ip + segment_size], ct);
         if (c_size == 0 or c_size > 65535) return 0;
         std.mem.writeInt(u16, dst[2 * k ..][0..2], @intCast(c_size), .little);
         op += c_size;
         ip += segment_size;
     }
-    const c_size = compress1X(dst[op..], src[ip..], ct);
+    const c_size = one(dst[op..], src[ip..], ct);
     if (c_size == 0 or c_size > 65535) return 0;
     op += c_size;
     return op;
+}
+
+// ── the unrolled encoder (HUF_CStream_t) ────────────────────────────────────
+//
+// libzstd's `HUF_compress1X_usingCTable_internal_body`: the same bits as
+// `compress1X`, written faster. Each code is a `PackedTable` entry (`HUF_CElt`):
+// the code length in bits 0..3 and the code in the top `nb_bits` bits, so a
+// code is added with one shift, one or, one add. The container fills from the
+// top; a flush stores its top bits. A second container takes every other run
+// of `unroll` codes with no dependency on the first, and is merged into it.
+//
+// The table is packed per call (`packTable`, 256 entries), so this path is
+// taken for literal sections where that is noise (`packed_min_len`).
+
+/// `HUF_CElt` for every byte, built from a `CTable` by `packTable`.
+const PackedTable = struct {
+    table_log: u32,
+    elt: [symbol_value_max + 1]u64,
+};
+
+/// Below this many literals the plain loop is kept: packing costs 256 entries.
+const packed_min_len = 1024;
+
+fn packTable(p: *PackedTable, ct: *const CTable) void {
+    p.table_log = ct.table_log;
+    for (&p.elt, ct.elt) |*o, e| {
+        // nb_bits == 0: a byte without a code, as `HUF_setValue` leaves it.
+        const v: u64 = if (e.nb_bits == 0) 0 else @as(u64, e.value) << @intCast(64 - @as(u32, e.nb_bits));
+        o.* = v | e.nb_bits;
+    }
+}
+
+const end_mark: u64 = (1 << 63) | 1; // `HUF_endMark`: the 1-bit code 1
+
+const HufStream = struct {
+    c: [2]u64 = .{ 0, 0 },
+    /// Only the low 8 bits count: the fast path adds whole entries.
+    pos: [2]u64 = .{ 0, 0 },
+    buf: []u8,
+    ptr: usize = 0,
+    end: usize,
+
+    /// `HUF_addBits`. `fast`: at least 4 bits stay free after this code, so
+    /// its length bits may stay in the container's (still unused) low bits.
+    inline fn add(s: *HufStream, elt: u64, comptime idx: usize, comptime fast: bool) void {
+        s.c[idx] >>= @as(u6, @truncate(elt)); // bits 4..5 of an entry are 0
+        s.c[idx] |= if (fast) elt else elt & ~@as(u64, 0xF);
+        s.pos[idx] +%= if (fast) elt else elt & 0xF;
+        std.debug.assert(s.pos[idx] & 0xFF <= 64);
+    }
+
+    /// `HUF_mergeIndex1`.
+    inline fn merge(s: *HufStream) void {
+        const n1 = s.pos[1] & 0xFF;
+        std.debug.assert(n1 < 64);
+        s.c[0] >>= @intCast(n1);
+        s.c[0] |= s.c[1];
+        s.pos[0] +%= s.pos[1];
+        std.debug.assert(s.pos[0] & 0xFF <= 64);
+    }
+
+    /// `HUF_flushBits`. `fast`: the caller knows the output cannot overrun.
+    inline fn flush(s: *HufStream, comptime fast: bool) void {
+        const nb_bits = s.pos[0] & 0xFF;
+        std.debug.assert(nb_bits > 0 and nb_bits <= 64);
+        const bits = s.c[0] >> @intCast(64 - nb_bits);
+        s.pos[0] &= 7;
+        std.debug.assert(s.ptr <= s.end);
+        std.mem.writeInt(u64, s.buf[s.ptr..][0..8], bits, .little);
+        s.ptr += nb_bits >> 3;
+        std.debug.assert(!fast or s.ptr <= s.end);
+        if (!fast and s.ptr > s.end) s.ptr = s.end;
+    }
+
+    /// `HUF_closeCStream`: 0 when the stream did not fit.
+    fn close(s: *HufStream) usize {
+        s.add(end_mark, 0, false);
+        s.flush(false);
+        if (s.ptr >= s.end) return 0;
+        return s.ptr + @intFromBool(s.pos[0] & 0xFF > 0);
+    }
+};
+
+/// `HUF_compress1X_usingCTable_internal_body_loop`.
+inline fn encodeLoop(s: *HufStream, src: []const u8, t: *const [symbol_value_max + 1]u64, comptime unroll: usize, comptime fast_flush: bool, comptime last_fast: bool) void {
+    var n = src.len;
+    // Join to `unroll`.
+    var rem = n % unroll;
+    if (rem > 0) {
+        while (rem > 0) : (rem -= 1) {
+            n -= 1;
+            s.add(t[src[n]], 0, false);
+        }
+        s.flush(fast_flush);
+    }
+    // Join to `2 * unroll`.
+    if (n % (2 * unroll) != 0) {
+        inline for (1..unroll) |u| s.add(t[src[n - u]], 0, true);
+        s.add(t[src[n - unroll]], 0, last_fast);
+        s.flush(fast_flush);
+        n -= unroll;
+    }
+    while (n > 0) : (n -= 2 * unroll) {
+        inline for (1..unroll) |u| s.add(t[src[n - u]], 0, true);
+        s.add(t[src[n - unroll]], 0, last_fast);
+        s.flush(fast_flush);
+        // The second run fills container 1 with no dependency on container 0.
+        s.c[1] = 0;
+        s.pos[1] = 0;
+        inline for (1..unroll) |u| s.add(t[src[n - unroll - u]], 1, true);
+        s.add(t[src[n - 2 * unroll]], 1, last_fast);
+        s.merge();
+        s.flush(fast_flush);
+    }
+}
+
+/// `HUF_compress1X_usingCTable_internal_body` over a packed table: the same
+/// bytes as `compress1X`.
+fn compress1XPacked(dst: []u8, src: []const u8, p: *const PackedTable) usize {
+    if (dst.len <= 8) return 0;
+    var s: HufStream = .{ .buf = dst, .end = dst.len - 8 };
+    const t = &p.elt;
+    // `HUF_tightCompressBound`: with this much room no flush can overrun.
+    if (dst.len < ((src.len * p.table_log) >> 3) + 8 or p.table_log > 11) {
+        encodeLoop(&s, src, t, 4, false, false);
+    } else switch (p.table_log) {
+        11 => encodeLoop(&s, src, t, 5, true, false),
+        10 => encodeLoop(&s, src, t, 5, true, true),
+        9 => encodeLoop(&s, src, t, 6, true, false),
+        8 => encodeLoop(&s, src, t, 7, true, false),
+        7 => encodeLoop(&s, src, t, 8, true, false),
+        else => encodeLoop(&s, src, t, 9, true, true),
+    }
+    return s.close();
 }
 
 pub const Streams = enum { single, four };
@@ -524,9 +662,16 @@ pub const Streams = enum { single, four };
 /// `dst[0..table_size]` (the serialised table, or 0 when reusing).
 fn compressWithTable(dst: []u8, table_size: usize, src: []const u8, streams: Streams, ct: *const CTable) usize {
     const out = dst[table_size..];
-    const c_size = switch (streams) {
+    const c_size = if (src.len < packed_min_len) switch (streams) {
         .single => compress1X(out, src, ct),
         .four => compress4X(out, src, ct),
+    } else blk: {
+        var p: PackedTable = undefined;
+        packTable(&p, ct);
+        break :blk switch (streams) {
+            .single => compress1XPacked(out, src, &p),
+            .four => compress4XWith(out, src, &p, compress1XPacked),
+        };
     };
     if (c_size == 0) return 0;
     const total = table_size + c_size;
@@ -593,6 +738,53 @@ pub fn compress(dst: []u8, src: []const u8, huff_log_in: u32, streams: Streams, 
     repeat.* = .none;
     old.* = ct;
     return compressWithTable(dst, h_size, src, streams, old);
+}
+
+test "the unrolled encoder writes compress1X's bytes at every table log and room" {
+    var prng = std.Random.DefaultPrng.init(0x4e7f_c0de);
+    const r = prng.random();
+    var src: [5000]u8 = undefined;
+    var want: [8000]u8 = undefined;
+    var got: [8000]u8 = undefined;
+    // Alphabet sizes and skews that land on every table log 1..12 (the max
+    // table log is a parameter; skew makes the long codes), lengths around
+    // every unroll (4..9, and twice that), and output room from the exact size
+    // (the guarded flushes, `ptr` clamped at the end) up to plenty (the fast
+    // flushes of the tight bound).
+    const lens = [_]usize{ 1, 2, 3, 7, 17, 18, 35, 36, 1023, 1024, 1025, 4999 };
+    var logs_seen: u16 = 0;
+    for (2..table_log_max + 1) |max_log| for (lens, 0..) |len, round| {
+        const alpha: u32 = if (round % 3 == 0) 255 else r.intRangeAtMost(u32, 1, 255);
+        var counts: [256]u32 = @splat(0);
+        for (src[0..len]) |*b| {
+            // Geometric skew: the deep trees that reach the larger table logs.
+            const s = @min(alpha, @as(u32, @ctz(r.int(u32) | (@as(u32, 1) << 31))) * (alpha / 16 + 1) + r.uintAtMost(u32, alpha / 16));
+            b.* = @intCast(s);
+            counts[s] += 1;
+        }
+        var m: u32 = 255;
+        while (counts[m] == 0) m -= 1;
+        if (std.mem.max(u32, &counts) == len) continue; // one symbol: never Huffman-coded
+        var ct: CTable = .{};
+        const log = buildCTable(&ct, &counts, m, @max(@as(u32, @intCast(max_log)), fse.highbit32(m) + 1)) catch continue;
+        logs_seen |= @as(u16, 1) << @intCast(log);
+        var p: PackedTable = undefined;
+        packTable(&p, &ct);
+        const plenty = compress1X(&want, src[0..len], &ct);
+        try std.testing.expect(plenty != 0);
+        for ([_]usize{ want.len, plenty + 8, plenty + 1, plenty, plenty -| 1, ((len * log) >> 3) + 8, ((len * log) >> 3) + 7 }) |room| {
+            const a = compress1X(want[0..@min(room, want.len)], src[0..len], &ct);
+            const b = compress1XPacked(got[0..@min(room, got.len)], src[0..len], &p);
+            try std.testing.expectEqual(a, b);
+            try std.testing.expectEqualSlices(u8, want[0..a], got[0..b]);
+            const a4 = compress4X(want[0..@min(room, want.len)], src[0..len], &ct);
+            const b4 = compress4XWith(got[0..@min(room, got.len)], src[0..len], &p, compress1XPacked);
+            try std.testing.expectEqual(a4, b4);
+            try std.testing.expectEqualSlices(u8, want[0..a4], got[0..b4]);
+        }
+    };
+    // Every table log from 2 up was exercised (1 needs a two-symbol alphabet).
+    try std.testing.expect(logs_seen & 0b1_1111_1111_1100 == 0b1_1111_1111_1100);
 }
 
 test "two-symbol alphabet codes each symbol in one bit" {
