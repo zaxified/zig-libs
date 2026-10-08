@@ -76,6 +76,20 @@ const commit = @import("commit.zig");
 const core = @import("core.zig");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const receiver_init_stack_burn = 24 * 1024;
+const receiver_handle_stack_burn = 24 * 1024;
+const receiver_advance_stack_burn = 32 * 1024;
+const dealer_init_stack_burn = 24 * 1024;
+const dealer_init_with_coefficients_stack_burn = 24 * 1024;
+const dealer_start_stack_burn = 24 * 1024;
+const dealer_handle_stack_burn = 24 * 1024;
+const dealer_advance_stack_burn = 24 * 1024;
 
 pub const Scalar = types.Scalar;
 pub const Element = types.Element;
@@ -148,23 +162,43 @@ pub const ReshareDealer = struct {
 
     /// Old party `old_share.index` reshares its share to the `new` committee;
     /// draws the `new.t − 1` random coefficients from `random`.
-    pub fn init(allocator: Allocator, old_share: DkgShareOutput, new: Config, random: std.Random) DealerInitError!ReshareDealer {
+    pub fn init(allocator: Allocator, old_share: *const DkgShareOutput, new: Config, random: std.Random) DealerInitError!ReshareDealer {
+        const result = initUnburned(allocator, old_share, new, random);
+        burn.stack(dealer_init_stack_burn);
+        return result;
+    }
+
+    noinline fn initUnburned(allocator: Allocator, old_share: *const DkgShareOutput, new: Config, random: std.Random) DealerInitError!ReshareDealer {
+        return initByValue(allocator, old_share.*, new, random);
+    }
+
+    fn initByValue(allocator: Allocator, old_share: DkgShareOutput, new: Config, random: std.Random) DealerInitError!ReshareDealer {
         if (!new.valid()) return error.InvalidConfig;
         const coeffs = try allocator.alloc(Scalar, new.t - 1);
         defer {
             std.crypto.secureZero(u8, std.mem.sliceAsBytes(coeffs));
             allocator.free(coeffs);
         }
-        for (coeffs) |*c| c.* = commit.randomScalar(random);
-        return initWithCoefficients(allocator, old_share, new, coeffs);
+        for (coeffs) |*c| commit.randomScalar(random, c);
+        return initWithCoefficients(allocator, &old_share, new, coeffs);
     }
 
     /// Deterministic entry point (tests, recorded transcripts): `coeffs` are
     /// `g_i`'s coefficients above the constant term, length `new.t − 1`.
-    pub fn initWithCoefficients(allocator: Allocator, old_share: DkgShareOutput, new: Config, coeffs: []const Scalar) DealerInitError!ReshareDealer {
+    pub fn initWithCoefficients(allocator: Allocator, old_share: *const DkgShareOutput, new: Config, coeffs: []const Scalar) DealerInitError!ReshareDealer {
+        const result = initWithCoefficientsUnburned(allocator, old_share, new, coeffs);
+        burn.stack(dealer_init_with_coefficients_stack_burn);
+        return result;
+    }
+
+    noinline fn initWithCoefficientsUnburned(allocator: Allocator, old_share: *const DkgShareOutput, new: Config, coeffs: []const Scalar) DealerInitError!ReshareDealer {
+        return initWithCoefficientsByValue(allocator, old_share.*, new, coeffs);
+    }
+
+    fn initWithCoefficientsByValue(allocator: Allocator, old_share: DkgShareOutput, new: Config, coeffs: []const Scalar) DealerInitError!ReshareDealer {
         if (!new.valid() or coeffs.len != new.t - 1 or old_share.index < 1) return error.InvalidConfig;
         // The share must be the one its own verifying share commits to.
-        const xg = commit.feldmanEvalShare(old_share.secret_share) catch return error.InvalidShare;
+        const xg = commit.feldmanEvalShare(&old_share.secret_share) catch return error.InvalidShare;
         if (!std.mem.eql(u8, &xg.toBytes(), &old_share.verifying_share.toBytes())) return error.InvalidShare;
 
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -197,6 +231,12 @@ pub const ReshareDealer = struct {
 
     /// Deal: the Feldman broadcast and one share frame per new party.
     pub fn start(self: *ReshareDealer) (error{WrongRound} || commit.CommitError || Allocator.Error)!void {
+        const result = startUnburned(self);
+        burn.stack(dealer_start_stack_burn);
+        return result;
+    }
+
+    noinline fn startUnburned(self: *ReshareDealer) (error{WrongRound} || commit.CommitError || Allocator.Error)!void {
         if (self.phase_ != .new) return error.WrongRound;
         const b = try commit.feldmanCommitVector(self.arena.allocator(), self.g);
         const fb: types.FeldmanBroadcast = .{ .dealer = self.me, .commitments = b };
@@ -211,11 +251,13 @@ pub const ReshareDealer = struct {
     }
 
     fn pushShare(self: *ReshareDealer, to: Target, kind: wire.Kind, receiver: u32) Allocator.Error!void {
-        const sm: types.ScalarShareMsg = .{
+        var sm: types.ScalarShareMsg = .{
             .dealer = self.me,
             .receiver = receiver,
-            .s = commit.evalPoly(self.g, commit.scalarFromIndex(receiver)),
+            .s = Scalar.zero,
         };
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&sm));
+        commit.evalPoly(self.g, commit.scalarFromIndex(receiver), &sm.s);
         var bytes = sm.toBytes();
         defer std.crypto.secureZero(u8, &bytes);
         try wire.pushFrame(&self.outbox, self.allocator, to, kind, &bytes);
@@ -223,6 +265,12 @@ pub const ReshareDealer = struct {
 
     /// Feed a complaint frame from new party `from`.
     pub fn handle(self: *ReshareDealer, from: u32, bytes: []const u8) MessageError!void {
+        const result = handleUnburned(self, from, bytes);
+        burn.stack(dealer_handle_stack_burn);
+        return result;
+    }
+
+    noinline fn handleUnburned(self: *ReshareDealer, from: u32, bytes: []const u8) MessageError!void {
         switch (self.phase_) {
             .done => return error.Finished,
             .new => return error.WrongRound,
@@ -244,6 +292,12 @@ pub const ReshareDealer = struct {
     /// complained (unless `new.t` or more did — then this dealer is excluded
     /// anyway and must not leak).
     pub fn advance(self: *ReshareDealer) DealerAdvanceError!void {
+        const result = advanceUnburned(self);
+        burn.stack(dealer_advance_stack_burn);
+        return result;
+    }
+
+    noinline fn advanceUnburned(self: *ReshareDealer) DealerAdvanceError!void {
         switch (self.phase_) {
             .new => return error.WrongRound,
             .done => return error.Finished,
@@ -322,6 +376,12 @@ pub const ReshareReceiver = struct {
 
     /// New party `index` (1-based in the NEW committee).
     pub fn init(allocator: Allocator, rc: ReshareConfig, index: u32) ReceiverInitError!ReshareReceiver {
+        const result = initUnburned(allocator, rc, index);
+        burn.stack(receiver_init_stack_burn);
+        return result;
+    }
+
+    noinline fn initUnburned(allocator: Allocator, rc: ReshareConfig, index: u32) ReceiverInitError!ReshareReceiver {
         try rc.validate();
         if (index < 1 or index > rc.new.n) return error.InvalidIndex;
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -417,6 +477,12 @@ pub const ReshareReceiver = struct {
     /// `B_0 = X_j` is public), win first-wins and get the honest dealer
     /// excluded (review 2026-10-01, F7).
     pub fn handle(self: *ReshareReceiver, from: Sender, bytes: []const u8) MessageError!void {
+        const result = handleUnburned(self, from, bytes);
+        burn.stack(receiver_handle_stack_burn);
+        return result;
+    }
+
+    noinline fn handleUnburned(self: *ReshareReceiver, from: Sender, bytes: []const u8) MessageError!void {
         switch (self.phase_) {
             .done => return error.Finished,
             .aborted => return error.Aborted,
@@ -504,13 +570,19 @@ pub const ReshareReceiver = struct {
         const b = self.bcast[pos] orelse return error.Unsolicited;
         const m = types.ScalarShareMsg.fromBytes(body[0..types.ScalarShareMsg.encoded_length].*) catch return error.Malformed;
         self.defense_seen.items[k] = true;
-        const ok = core.verifyFeldmanShare(b, complainant, m.s);
+        const ok = core.verifyFeldmanShare(b, complainant, &m.s);
         self.defense_valid.items[k] = ok;
         if (ok and complainant == self.me) self.accepted[pos] = m.s;
     }
 
     /// Close the current round and move to the next.
     pub fn advance(self: *ReshareReceiver) ReceiverAdvanceError!void {
+        const result = advanceUnburned(self);
+        burn.stack(receiver_advance_stack_burn);
+        return result;
+    }
+
+    noinline fn advanceUnburned(self: *ReshareReceiver) ReceiverAdvanceError!void {
         switch (self.phase_) {
             .shares => return self.advanceShares(),
             .complaints => self.phase_ = .defenses,
@@ -523,7 +595,7 @@ pub const ReshareReceiver = struct {
     fn advanceShares(self: *ReshareReceiver) ReceiverAdvanceError!void {
         for (self.rc.dealers, 0..) |d, pos| {
             const b = self.bcast[pos] orelse continue; // never (validly) broadcast: excluded later
-            const ok = if (self.wire_s[pos]) |s| core.verifyFeldmanShare(b, self.me, s) else false;
+            const ok = if (self.wire_s[pos] != null) core.verifyFeldmanShare(b, self.me, &self.wire_s[pos].?) else false;
             if (ok) {
                 self.accepted[pos] = self.wire_s[pos];
             } else {
@@ -592,7 +664,7 @@ pub const ReshareReceiver = struct {
         if (!std.mem.eql(u8, &fk[0].toBytes(), &self.rc.group_public_key.toBytes())) {
             return self.abort(error.GroupKeyMismatch);
         }
-        const xg = try commit.feldmanEvalShare(x_new);
+        const xg = try commit.feldmanEvalShare(&x_new);
         const public = try commit.evalCommitmentAt(fk, self.me);
         if (!std.mem.eql(u8, &xg.toBytes(), &public.toBytes())) return self.abort(error.ShareMismatch);
 
@@ -615,6 +687,7 @@ const tecdsa = @import("threshold_ecdsa");
 const protocol = @import("protocol.zig");
 const checks = @import("checks.zig");
 const tn = @import("testnet.zig");
+
 const Action = tn.Action;
 
 fn freeOutputs(allocator: Allocator, outs: []DkgShareOutput) void {
@@ -639,7 +712,7 @@ pub const Rig = struct {
             allocator.free(dealers);
         }
         for (rc.dealers) |id| {
-            dealers[nd] = try ReshareDealer.init(allocator, old[id - 1], rc.new, random);
+            dealers[nd] = try ReshareDealer.init(allocator, &old[id - 1], rc.new, random);
             nd += 1;
         }
         const receivers = try allocator.alloc(ReshareReceiver, rc.new.n);
@@ -769,8 +842,10 @@ test "reshare 3-of-3(t=2) to n'=5, t'=3: same key, new shares reconstruct it, mi
         .{ .index = new[3].index, .scalar = new[3].secret_share },
         .{ .index = new[4].index, .scalar = new[4].secret_share },
     };
-    const x_old = try tecdsa.reconstructSecret(&old_ss);
-    const x_new = try tecdsa.reconstructSecret(&new_ss);
+    var x_old: tecdsa.Scalar = undefined;
+    try tecdsa.reconstructSecret(&old_ss, &x_old);
+    var x_new: tecdsa.Scalar = undefined;
+    try tecdsa.reconstructSecret(&new_ss, &x_new);
     try testing.expectEqualSlices(u8, &x_old.toBytes(.big), &x_new.toBytes(.big));
 
     // Below the new threshold nothing reconstructs.
@@ -895,15 +970,15 @@ test "a dealer that deals something other than its published share is refused (B
     var forged = old[0];
     forged.secret_share = forged.secret_share.add(Scalar.one);
     var prng = std.Random.DefaultPrng.init(0xD16_300A);
-    try testing.expectError(error.InvalidShare, ReshareDealer.init(allocator, forged, cfg, prng.random()));
+    try testing.expectError(error.InvalidShare, ReshareDealer.init(allocator, &forged, cfg, prng.random()));
 
     // One that is self-consistent but not what was published (x_1 + 1 with its
     // own matching X): receivers see B_0 != X_1 and refuse the broadcast.
-    forged.verifying_share = try commit.feldmanEvalShare(forged.secret_share);
+    forged.verifying_share = try commit.feldmanEvalShare(&forged.secret_share);
     var rig = try Rig.init(allocator, rc, old, prng.random());
     defer rig.deinit();
     rig.dealers[0].deinit();
-    rig.dealers[0] = try ReshareDealer.init(allocator, forged, cfg, prng.random());
+    rig.dealers[0] = try ReshareDealer.init(allocator, &forged, cfg, prng.random());
     try rig.run();
     try testing.expect(rig.refused >= 3); // every receiver refused dealer 1's broadcast
     for (rig.receivers) |*r| try testing.expectEqualSlices(u32, &.{ 2, 3 }, r.usedDealers().?);
@@ -951,7 +1026,7 @@ test "config and role validation" {
     try testing.expectError(error.InvalidIndex, ReshareReceiver.init(allocator, good, 0));
     try testing.expectError(error.InvalidIndex, ReshareReceiver.init(allocator, good, 4));
     var prng = std.Random.DefaultPrng.init(1);
-    try testing.expectError(error.InvalidConfig, ReshareDealer.init(allocator, old[0], .{ .t = 0, .n = 2 }, prng.random()));
+    try testing.expectError(error.InvalidConfig, ReshareDealer.init(allocator, &old[0], .{ .t = 0, .n = 2 }, prng.random()));
 }
 
 test "receiver and dealer refuse malformed, misrouted, replayed and out-of-round frames" {
@@ -962,7 +1037,7 @@ test "receiver and dealer refuse malformed, misrouted, replayed and out-of-round
     var xs: [3]Element = undefined;
     const rc = configFor(old, cfg, cfg, &.{ 1, 2 }, &xs);
     var prng = std.Random.DefaultPrng.init(0xD16_300F);
-    var d1 = try ReshareDealer.init(allocator, old[0], cfg, prng.random());
+    var d1 = try ReshareDealer.init(allocator, &old[0], cfg, prng.random());
     defer d1.deinit();
     var r1 = try ReshareReceiver.init(allocator, rc, 1);
     defer r1.deinit();
@@ -1037,7 +1112,8 @@ test "receiver and dealer refuse malformed, misrouted, replayed and out-of-round
     // dealer's broadcast was accepted above: it verifies and is recorded.
     var df: [1 + types.ScalarShareMsg.encoded_length]u8 = undefined;
     df[0] = @intFromEnum(wire.Kind.reshare_defense);
-    const sm: types.ScalarShareMsg = .{ .dealer = 1, .receiver = 2, .s = commit.evalPoly(d1.g, commit.scalarFromIndex(2)) };
+    var sm: types.ScalarShareMsg = .{ .dealer = 1, .receiver = 2, .s = Scalar.zero };
+    commit.evalPoly(d1.g, commit.scalarFromIndex(2), &sm.s);
     @memcpy(df[1..], &sm.toBytes());
     try testing.expectError(error.SenderMismatch, r1.handle(.{ .dealer = 2 }, &df)); // the frame names dealer 1
     var df2 = df;
@@ -1047,7 +1123,7 @@ test "receiver and dealer refuse malformed, misrouted, replayed and out-of-round
     try r1.handle(.{ .dealer = 1 }, &df);
     try testing.expectError(error.DuplicateMessage, r1.handle(.{ .dealer = 1 }, &df));
     // Dealer: complaint handling.
-    var d2 = try ReshareDealer.init(allocator, old[1], cfg, prng.random());
+    var d2 = try ReshareDealer.init(allocator, &old[1], cfg, prng.random());
     defer d2.deinit();
     try d2.start();
     wire.freeOutgoing(allocator, try d2.takeOutgoing());
@@ -1107,7 +1183,7 @@ test "replaying the recorded resharing transcript reproduces the oracle's commit
     for (rs.dealer_polys) |dp| {
         var c: [8]Scalar = undefined;
         for (dp.c, 0..) |hx, k| c[k] = try tn.hexScalar(hx);
-        dealers[nd] = try ReshareDealer.initWithCoefficients(allocator, old[dp.id - 1], new_cfg, c[0 .. new_cfg.t - 1]);
+        dealers[nd] = try ReshareDealer.initWithCoefficients(allocator, &old[dp.id - 1], new_cfg, c[0 .. new_cfg.t - 1]);
         nd += 1;
     }
     const receivers = try allocator.alloc(ReshareReceiver, rs.new_n);
@@ -1170,11 +1246,13 @@ const FuzzWorld = struct {
         // 2-of-3 sharing f(z) = 5 + 3z, built directly (no DKG run per input).
         const cfg: Config = .{ .t = 2, .n = 3 };
         const f = [_]Scalar{ commit.scalarFromIndex(5), commit.scalarFromIndex(3) };
-        const gpk = try commit.feldmanEvalShare(f[0]);
+        const gpk = try commit.feldmanEvalShare(&f[0]);
         for (&w.old, &w.xs, 0..) |*o, *x, i| {
-            const s = commit.evalPoly(&f, commit.scalarFromIndex(@intCast(i + 1)));
-            x.* = try commit.feldmanEvalShare(s);
-            o.* = .{ .index = @intCast(i + 1), .secret_share = s, .group_public_key = gpk, .verifying_share = x.* };
+            o.index = @intCast(i + 1);
+            commit.evalPoly(&f, commit.scalarFromIndex(@intCast(i + 1)), &o.secret_share);
+            x.* = try commit.feldmanEvalShare(&o.secret_share);
+            o.group_public_key = gpk;
+            o.verifying_share = x.*;
         }
         const rc: ReshareConfig = .{
             .old = cfg,

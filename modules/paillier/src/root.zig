@@ -54,6 +54,22 @@
 //!     against.
 
 const std = @import("std");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const generate_stack_burn = 176 * 1024;
+const from_primes_stack_burn = 176 * 1024;
+const secret_key_from_bytes_stack_burn = 240 * 1024;
+const encrypt_stack_burn = 88 * 1024;
+const encrypt_random_stack_burn = 104 * 1024;
+const decrypt_stack_burn = 120 * 1024;
+const add_plaintext_stack_burn = 72 * 1024;
+const mul_plaintext_stack_burn = 80 * 1024;
+const lambda_to_bytes_stack_burn = 4 * 1024;
+const mu_to_bytes_stack_burn = 4 * 1024;
 
 /// Fast constant-time Montgomery modexp backend for the Paillier hot paths
 /// (encrypt `r^n mod n²`, decrypt `c^λ mod n²` and its CRT halves `mod p²/q²`).
@@ -404,7 +420,17 @@ pub const SecretKey = struct {
     /// primes — that is `fromPrimes`'s job; this is pure mechanical parsing
     /// plus the same mechanical `n_sq = n*n` re-derivation
     /// `PublicKey.fromBytes` does, and the same `min_modulus_bits` floor.
-    pub fn fromBytes(n_bytes: []const u8, lambda_bytes: []const u8, mu_bytes: []const u8) FromBytesError!SecretKey {
+    pub fn fromBytes(n_bytes: []const u8, lambda_bytes: []const u8, mu_bytes: []const u8, out: *SecretKey) FromBytesError!void {
+        const result = fromBytesUnburned(n_bytes, lambda_bytes, mu_bytes, out);
+        burn.stack(secret_key_from_bytes_stack_burn);
+        return result;
+    }
+
+    noinline fn fromBytesUnburned(n_bytes: []const u8, lambda_bytes: []const u8, mu_bytes: []const u8, out: *SecretKey) FromBytesError!void {
+        out.* = try fromBytesByValue(n_bytes, lambda_bytes, mu_bytes);
+    }
+
+    fn fromBytesByValue(n_bytes: []const u8, lambda_bytes: []const u8, mu_bytes: []const u8) FromBytesError!SecretKey {
         return fromBytesImpl(n_bytes, lambda_bytes, mu_bytes, .enforced) catch error.InvalidPrivateKey;
     }
 
@@ -446,12 +472,24 @@ pub const SecretKey = struct {
 
     /// `lambda` is canonical mod `n_sq`; `out.len` should be sized
     /// accordingly (see the "Fe construction contract" note above).
-    pub fn lambdaToBytes(self: SecretKey, out: []u8) ByteError!void {
+    pub fn lambdaToBytes(self: *const SecretKey, out: []u8) ByteError!void {
+        const result = lambdaToBytesUnburned(self, out);
+        burn.stack(lambda_to_bytes_stack_burn);
+        return result;
+    }
+
+    noinline fn lambdaToBytesUnburned(self: *const SecretKey, out: []u8) ByteError!void {
         return self.lambda.toBytes(out, .big);
     }
 
     /// `mu` is canonical mod `n`.
-    pub fn muToBytes(self: SecretKey, out: []u8) ByteError!void {
+    pub fn muToBytes(self: *const SecretKey, out: []u8) ByteError!void {
+        const result = muToBytesUnburned(self, out);
+        burn.stack(mu_to_bytes_stack_burn);
+        return result;
+    }
+
+    noinline fn muToBytesUnburned(self: *const SecretKey, out: []u8) ByteError!void {
         return self.mu.toBytes(out, .big);
     }
 
@@ -547,7 +585,17 @@ pub const GenerateError = FromPrimesError || error{InvalidBits};
 /// Since 2026-10-03 every step on p, q is montint limb arithmetic,
 /// constant-time in their values up to the verdicts, except building the
 /// `std.crypto.ff` carriers of `p²`, `q²` (SPEC Backlog).
-pub fn fromPrimes(p_bytes: []const u8, q_bytes: []const u8) FromPrimesError!KeyPair {
+pub fn fromPrimes(p_bytes: []const u8, q_bytes: []const u8, out: *KeyPair) FromPrimesError!void {
+    const result = fromPrimesUnburned(p_bytes, q_bytes, out);
+    burn.stack(from_primes_stack_burn);
+    return result;
+}
+
+noinline fn fromPrimesUnburned(p_bytes: []const u8, q_bytes: []const u8, out: *KeyPair) FromPrimesError!void {
+    out.* = try fromPrimesByValue(p_bytes, q_bytes);
+}
+
+fn fromPrimesByValue(p_bytes: []const u8, q_bytes: []const u8) FromPrimesError!KeyPair {
     return fromPrimesImpl(p_bytes, q_bytes, .checked) catch |err| switch (err) {
         error.Overflow => error.Overflow,
         else => error.InvalidPrimes,
@@ -940,7 +988,17 @@ pub const min_generate_bits = 512;
 /// for tests. `bits` must be even and in [`min_generate_bits`,
 /// `modulus_bits`]; expect a slow search as `bits` grows (2048 is
 /// noticeably slow in Debug builds).
-pub fn generate(random: std.Random, bits: usize) GenerateError!KeyPair {
+pub fn generate(random: std.Random, bits: usize, out: *KeyPair) GenerateError!void {
+    const result = generateUnburned(random, bits, out);
+    burn.stack(generate_stack_burn);
+    return result;
+}
+
+noinline fn generateUnburned(random: std.Random, bits: usize, out: *KeyPair) GenerateError!void {
+    out.* = try generateByValue(random, bits);
+}
+
+fn generateByValue(random: std.Random, bits: usize) GenerateError!KeyPair {
     if (bits < min_generate_bits or bits > modulus_bits or bits % 2 != 0) return error.InvalidBits;
     const half = bits / 2;
     const half_len = byteLen(half);
@@ -1049,7 +1107,17 @@ fn gPowElem(pk: *const PublicKey, m: *const Fe) MontElem {
 /// is the public modulus (the *base* `r` is still processed in constant
 /// time), and `r` is never legitimately zero (gcd(0,n) = n != 1), so no
 /// zero-exponent case can arise there.
-pub fn encrypt(pk: PublicKey, m: Fe, r: Fe) EncryptError!Ciphertext {
+pub fn encrypt(pk: PublicKey, m: *const Fe, r: *const Fe) EncryptError!Ciphertext {
+    const result = encryptUnburned(pk, m, r);
+    burn.stack(encrypt_stack_burn);
+    return result;
+}
+
+noinline fn encryptUnburned(pk: PublicKey, m: *const Fe, r: *const Fe) EncryptError!Ciphertext {
+    return encryptByValue(pk, m.*, r.*);
+}
+
+fn encryptByValue(pk: PublicKey, m: Fe, r: Fe) EncryptError!Ciphertext {
     // `r = 0` never produces anything `decrypt` will accept (gcd(0,n) = n)
     // — reject it here rather than let the caller discover a dead
     // ciphertext later (paillier F11, wave-3 audit).
@@ -1075,8 +1143,20 @@ pub fn encrypt(pk: PublicKey, m: Fe, r: Fe) EncryptError!Ciphertext {
 /// this (or equivalent care drawing `r`) for every real encryption —
 /// Paillier's IND-CPA security lives entirely in the fresh uniform `r`;
 /// see SPEC.md.
-pub fn encryptRandom(pk: PublicKey, m: Fe, random: std.Random) EncryptError!Ciphertext {
-    return encrypt(pk, m, sampleNonzeroLtN(pk, random));
+pub fn encryptRandom(pk: PublicKey, m: *const Fe, random: std.Random) EncryptError!Ciphertext {
+    const result = encryptRandomUnburned(pk, m, random);
+    burn.stack(encrypt_random_stack_burn);
+    return result;
+}
+
+noinline fn encryptRandomUnburned(pk: PublicKey, m: *const Fe, random: std.Random) EncryptError!Ciphertext {
+    return encryptRandomByValue(pk, m.*, random);
+}
+
+fn encryptRandomByValue(pk: PublicKey, m: Fe, random: std.Random) EncryptError!Ciphertext {
+    var r = sampleNonzeroLtN(pk, random);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&r));
+    return encrypt(pk, &m, &r);
 }
 
 fn sampleNonzeroLtN(pk: PublicKey, random: std.Random) Fe {
@@ -1174,7 +1254,17 @@ fn decryptCrtX(n_sq: *const MontParams, crt: *const CrtParams, c: *const MontEle
     return n_sq.add(&xp, &n_sq.mul(&ps.m, &u));
 }
 
-pub fn decrypt(sk_in: SecretKey, c: Ciphertext) DecryptError!Fe {
+pub fn decrypt(sk_in: *const SecretKey, c: Ciphertext, out: *Fe) DecryptError!void {
+    const result = decryptUnburned(sk_in, c, out);
+    burn.stack(decrypt_stack_burn);
+    return result;
+}
+
+noinline fn decryptUnburned(sk_in: *const SecretKey, c: Ciphertext, out: *Fe) DecryptError!void {
+    out.* = try decryptByValue(sk_in.*, c);
+}
+
+fn decryptByValue(sk_in: SecretKey, c: Ciphertext) DecryptError!Fe {
     // `sk_in` is this function's one unavoidable by-value copy (the public
     // signature stays call-compatible — see the module doc's Fe construction
     // contract note; no consumer needs to change). Shadowed as `var` so it
@@ -1249,7 +1339,17 @@ pub fn addCiphertexts(pk: PublicKey, c1: Ciphertext, c2: Ciphertext) Ciphertext 
 /// canonical mod `pk.n_sq` (Fe construction contract, see module doc
 /// comment). The `g^m` term goes through `gPow` (binomial shortcut for the
 /// standard `g = n+1`, `m = 0` handled — see there).
-pub fn addPlaintext(pk: PublicKey, c: Ciphertext, m: Fe) HomomorphicError!Ciphertext {
+pub fn addPlaintext(pk: PublicKey, c: Ciphertext, m: *const Fe) HomomorphicError!Ciphertext {
+    const result = addPlaintextUnburned(pk, c, m);
+    burn.stack(add_plaintext_stack_burn);
+    return result;
+}
+
+noinline fn addPlaintextUnburned(pk: PublicKey, c: Ciphertext, m: *const Fe) HomomorphicError!Ciphertext {
+    return addPlaintextByValue(pk, c, m.*);
+}
+
+fn addPlaintextByValue(pk: PublicKey, c: Ciphertext, m: Fe) HomomorphicError!Ciphertext {
     var gm = gPowElem(&pk, &m);
     defer std.crypto.secureZero(u64, &gm);
     return .{ .c = elemToFe(pk.n_sq, &pk.n_sq_mont.mul(&feToElem(&c.c), &gm)) };
@@ -1274,7 +1374,17 @@ pub fn addPlaintext(pk: PublicKey, c: Ciphertext, m: Fe) HomomorphicError!Cipher
 /// ladder, no early exit on leading zero bits) — not the variable-time-in-
 /// k's-actual-bit-width trim the audit flagged as a separate, undecided
 /// optimization.
-pub fn mulPlaintext(pk: PublicKey, c: Ciphertext, k: Fe) HomomorphicError!Ciphertext {
+pub fn mulPlaintext(pk: PublicKey, c: Ciphertext, k: *const Fe) HomomorphicError!Ciphertext {
+    const result = mulPlaintextUnburned(pk, c, k);
+    burn.stack(mul_plaintext_stack_burn);
+    return result;
+}
+
+noinline fn mulPlaintextUnburned(pk: PublicKey, c: Ciphertext, k: *const Fe) HomomorphicError!Ciphertext {
+    return mulPlaintextByValue(pk, c, k.*);
+}
+
+fn mulPlaintextByValue(pk: PublicKey, c: Ciphertext, k: Fe) HomomorphicError!Ciphertext {
     var k_el = feToElem(&k);
     defer std.crypto.secureZero(u64, &k_el);
     return .{ .c = elemToFe(pk.n_sq, &pk.n_sq_mont.pow(&feToElem(&c.c), &k_el)) };
@@ -1310,6 +1420,13 @@ const kat_n = [_]u8{187};
 const kat_lambda = [_]u8{80};
 const kat_g = [_]u8{188};
 const kat_mu = [_]u8{180};
+
+/// Test-only convenience for expressions that need the plaintext inline.
+fn decryptTest(sk: *const SecretKey, c: Ciphertext) DecryptError!Fe {
+    var m: Fe = undefined;
+    try decrypt(sk, c, &m);
+    return m;
+}
 
 test "PublicKey.fromBytes derives n_sq and the standard generator g=n+1" {
     const pk = try PublicKey.fromBytesImpl(&kat_n, null, .unchecked);
@@ -1377,7 +1494,8 @@ test "SecretKey.deinit zeroes lambda/mu (no-crt key, e.g. loaded via fromBytes)"
 }
 
 test "SecretKey.deinit zeroes lambda/mu/crt (fromPrimes key, factorization-bearing block present)" {
-    var kp = try fromPrimes(&.{61}, &.{53});
+    var kp: KeyPair = undefined;
+    try fromPrimes(&.{61}, &.{53}, &kp);
     try testing.expect(kp.secret.crt != null);
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&kp.secret.lambda), 0));
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&kp.secret.mu), 0));
@@ -1433,13 +1551,15 @@ test "fromBytes refuses an n below min_modulus_bits; the floor-free parser is th
     const one = [_]u8{1};
 
     try testing.expectEqual(@as(usize, 512), (try PublicKey.fromBytes(&at_floor, null)).n.bits());
-    try testing.expectEqual(@as(usize, 512), (try SecretKey.fromBytes(&at_floor, &one, &one)).n.bits());
+    var sk_floor: SecretKey = undefined;
+    try SecretKey.fromBytes(&at_floor, &one, &one, &sk_floor);
+    try testing.expectEqual(@as(usize, 512), sk_floor.n.bits());
 
     // Below the floor, then the toy KAT modulus, a prime n and a 4-bit n.
     for ([_][]const u8{ &below_floor, &below_padded, &kat_n, &[_]u8{3}, &[_]u8{15} }) |n| {
         try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(n, null));
         try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(n, &[_]u8{2}));
-        try testing.expectError(error.InvalidPrivateKey, SecretKey.fromBytes(n, &one, &one));
+        try testing.expectError(error.InvalidPrivateKey, SecretKey.fromBytes(n, &one, &one, &sk_floor));
         // The same bytes parse without the floor, so the floor is what refused them.
         _ = try PublicKey.fromBytesImpl(n, null, .unchecked);
         _ = try SecretKey.fromBytesImpl(n, &one, &one, .unchecked);
@@ -1449,7 +1569,8 @@ test "fromBytes refuses an n below min_modulus_bits; the floor-free parser is th
 // ── crypto-core tests ─────────────────────────────────────────────────────
 
 test "fromPrimes derives the phe-cross-checked toy key exactly (p=11, q=17)" {
-    const kp = try fromPrimes(&kat_p, &kat_q);
+    var kp: KeyPair = undefined;
+    try fromPrimes(&kat_p, &kat_q, &kp);
     try testing.expectEqual(@as(u32, 187), try kp.public.n.v.toPrimitive(u32));
     try testing.expectEqual(@as(u32, 34969), try kp.public.n_sq.v.toPrimitive(u32));
     try testing.expectEqual(@as(u32, 188), try kp.public.g.toPrimitive(u32));
@@ -1476,21 +1597,23 @@ test "fromPrimes derives the phe-cross-checked toy key exactly (p=11, q=17)" {
 // confirmed gaps; no new pin needed since this test already exercises every
 // case the census covered.
 test "fromPrimes rejects p == q, degenerate factors, and oversized products" {
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&kat_p, &kat_p)); // p == q
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{0}, &kat_q));
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{1}, &kat_q));
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{2}, &kat_q)); // n even
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{}, &kat_q));
+    var scratch_kp: KeyPair = undefined;
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&kat_p, &kat_p, &scratch_kp)); // p == q
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{0}, &kat_q, &scratch_kp));
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{1}, &kat_q, &scratch_kp));
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{2}, &kat_q, &scratch_kp)); // n even
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{}, &kat_q, &scratch_kp));
 
     // Two full-width odd values: product needs 2*modulus_bits > modulus_bits.
     var big1: [modulus_bytes]u8 = undefined;
     @memset(&big1, 0xff);
     var big2 = big1;
     big2[modulus_bytes - 1] = 0xfd; // differ from big1, still odd
-    try testing.expectError(error.Overflow, fromPrimes(&big1, &big2));
+    try testing.expectError(error.Overflow, fromPrimes(&big1, &big2, &scratch_kp));
 }
 
 test "fromPrimes closeness guard: |p − q| = 2^(nlen/2 − 100) exactly is refused" {
+    var scratch_kp: KeyPair = undefined;
     // Two 256-bit primes exactly 2^156 apart (n is 512 bits, so the bound
     // is 2^(256 − 100)); FIPS 186-5 wants |p − q| > 2^156. Found offline
     // (Python, 40-round Miller-Rabin); the mutation run of 2026-10-03 had
@@ -1499,7 +1622,7 @@ test "fromPrimes closeness guard: |p − q| = 2^(nlen/2 − 100) exactly is refu
     var q: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&p, "efc9a3c047a982350a5df5ac011898c389262496b8913f664dd15c52eefb6ba5");
     _ = try std.fmt.hexToBytes(&q, "efc9a3c047a982350a5df5ac111898c389262496b8913f664dd15c52eefb6ba5");
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&p, &q));
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&p, &q, &scratch_kp));
     // Control: `.generated` skips the guard and derives a key from the same
     // pair, so the refusal above is the closeness check.
     _ = try fromPrimesImpl(&p, &q, .generated);
@@ -1514,7 +1637,8 @@ test "fromPrimes CRT exponents are λ mod p(p−1) exactly (factors of unequal s
     var q: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&p, "ad78dc4bfb9e8ddb");
     _ = try std.fmt.hexToBytes(&q, "ac6f9f32ccf71d1ae7fe9bb833a10b7c9c83c19d6fb3c23f19b78bf9dacfedd7");
-    var kp = try fromPrimes(&p, &q);
+    var kp: KeyPair = undefined;
+    try fromPrimes(&p, &q, &kp);
     defer kp.secret.deinit();
     var want_dp = [_]u8{0} ** modulus_bytes;
     _ = try std.fmt.hexToBytes(want_dp[modulus_bytes - 16 ..], "4776ec7037a754bd972d839646d9666a");
@@ -1585,8 +1709,9 @@ test "isProbablePrime rejects known base-2 strong pseudoprimes at the real mr_ro
 }
 
 test "fromPrimes refuses a base-2 strong pseudoprime that the derivation's structural self-check alone accepts (F7 m7)" {
+    var scratch_kp: KeyPair = undefined;
     const pb = std.mem.toBytes(std.mem.nativeToBig(u32, @as(u32, 2047))); // 23 * 89, composite
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&pb, &kat_q));
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&pb, &kat_q, &scratch_kp));
     // Control: without the primality check (generate's internal path) the
     // same factors still derive a key — so the refusal above is that check.
     const kp = try fromPrimesImpl(&pb, &kat_q, .generated);
@@ -1600,8 +1725,9 @@ test "fromPrimes refuses a base-2 strong pseudoprime that the derivation's struc
     var m_val: u16 = 0;
     while (m_val < 20) : (m_val += 1) {
         const m_fe = try Fe.fromPrimitive(u16, kp.public.n_sq, m_val);
-        const c = try encryptRandom(kp.public, m_fe, random);
-        const got = decrypt(kp.secret, c) catch {
+        const c = try encryptRandom(kp.public, &m_fe, random);
+        var got: Fe = undefined;
+        decrypt(&kp.secret, c, &got) catch {
             mismatches += 1;
             continue;
         };
@@ -1611,6 +1737,7 @@ test "fromPrimes refuses a base-2 strong pseudoprime that the derivation's struc
 }
 
 test "fromPrimes refuses two Fermat-factorably-close primes, which the derivation alone accepts (F7 m8)" {
+    var scratch_kp: KeyPair = undefined;
     // Two DISTINCT, genuinely prime, adjacent-ish 128-bit values found by
     // linear search from a fixed seed (deterministic: the search AND every
     // isProbablePrime witness draw both come from the same seeded prng).
@@ -1654,7 +1781,7 @@ test "fromPrimes refuses two Fermat-factorably-close primes, which the derivatio
     try testing.expect(gap_steps < 10_000); // a magnitude 2^28 below the 100-bit closeness threshold at this size
     try testing.expect(topBitsMatch(&p_bytes, &q_bytes)); // exactly what generate()'s call site checks before accepting q
 
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&p_bytes, &q_bytes));
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&p_bytes, &q_bytes, &scratch_kp));
     // Control: the unchecked derivation still accepts them, so the refusal is
     // the closeness check (both factors are prime — isProbablePrime said so).
     const kp = try fromPrimesImpl(&p_bytes, &q_bytes, .generated);
@@ -1703,6 +1830,7 @@ const CountingRandom = struct {
 };
 
 test "generate refuses a Fermat-close q offered as its very first candidate (F7 m8 at the call site, paillier F14)" {
+    var scratch_kp: KeyPair = undefined;
     // The test above pins `fromPrimes`; this one pins the `topBitsMatch` call
     // inside `generate`, which goes through `fromPrimesImpl(.generated)` and
     // so has no other closeness guard behind it.
@@ -1734,7 +1862,7 @@ test "generate refuses a Fermat-close q offered as its very first candidate (F7 
     }
     try testing.expect(topBitsMatch(&p, &q_close));
     // Control: the checked path refuses this pair on its own.
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&p, &q_close));
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&p, &q_close, &scratch_kp));
 
     // Real run: `p` comes out as in the dry run, and the first q candidate
     // `generatePrime` draws is exactly `q_close` (prime, so it is accepted
@@ -1745,7 +1873,8 @@ test "generate refuses a Fermat-close q offered as its very first candidate (F7 
         .prefix_calls = counter.calls,
         .inject = &q_close,
     };
-    const kp = try generate(splice.random(), bits);
+    var kp: KeyPair = undefined;
+    try generate(splice.random(), bits, &kp);
     try testing.expect(splice.calls > counter.calls + 1); // the splice was reached and passed
 
     // Recover q = n / p. `p` divides n: `generate` kept the first prime.
@@ -1767,35 +1896,36 @@ test "generate refuses a Fermat-close q offered as its very first candidate (F7 
     // checked path refuses; with it, q is a later draw and the pair passes.
     try testing.expect(!std.mem.eql(u8, &q, &q_close));
     try testing.expect(!topBitsMatch(&p, &q));
-    _ = try fromPrimes(&p, &q);
+    try fromPrimes(&p, &q, &scratch_kp);
 }
 
 test "fromPrimes checks every factor: 32 pseudoprime pairings, composites, tiny primes, and a far-apart prime pair (F7)" {
+    var scratch_kp: KeyPair = undefined;
     // All 16 base-2 strong pseudoprimes paired with kat_q, both orders — the
     // audit measured 24 of these 32 accepted before the check.
     const pseudoprimes_base2 = [_]u32{ 2047, 3277, 4033, 4681, 8321, 15841, 29341, 42799, 49141, 52633, 65281, 74665, 80581, 85489, 88357, 90751 };
     for (pseudoprimes_base2) |pp| {
         const pb = std.mem.toBytes(std.mem.nativeToBig(u32, pp));
-        try testing.expectError(error.InvalidPrimes, fromPrimes(&pb, &kat_q));
-        try testing.expectError(error.InvalidPrimes, fromPrimes(&kat_q, &pb));
+        try testing.expectError(error.InvalidPrimes, fromPrimes(&pb, &kat_q, &scratch_kp));
+        try testing.expectError(error.InvalidPrimes, fromPrimes(&kat_q, &pb, &scratch_kp));
     }
     // The audit's `p = 9` (composite), `q = 5`.
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{9}, &[_]u8{5}));
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{9}, &[_]u8{5}, &scratch_kp));
     // Every value above is <= 32 bits, i.e. the exact trial-division path.
     // Composites above 32 bits reach the keyed Miller-Rabin: the square of a
     // prime past the sieve, and 3825123056546413051 = 149491·747451·34233211,
     // a strong pseudoprime to every prime base 2..23 (fixed small bases pass it).
     const square = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1000003) * 1000003));
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&square, &kat_q));
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&square, &kat_q, &scratch_kp));
     const spsp_2_to_23 = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 3825123056546413051)));
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&spsp_2_to_23, &kat_q));
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&spsp_2_to_23, &kat_q, &scratch_kp));
     // p = 3 used to be the one value `isProbablePrime` cannot take (empty
     // witness range); the small-factor path answers it.
-    _ = fromPrimes(&[_]u8{3}, &[_]u8{11}) catch {};
+    fromPrimes(&[_]u8{3}, &[_]u8{11}, &scratch_kp) catch {};
 
     // Controls: primes still pass — the toy KAT pair, and two 128-bit primes
     // from independent seeds (far apart, so closeness does not apply).
-    _ = try fromPrimes(&kat_p, &kat_q);
+    try fromPrimes(&kat_p, &kat_q, &scratch_kp);
     var pair: [2][16]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(0xFA2A_0001);
     const random = prng.random();
@@ -1807,7 +1937,7 @@ test "fromPrimes checks every factor: 32 pseudoprime pairings, composites, tiny 
             if (isProbablePrime(Modulus.fromBytes(out, .big) catch unreachable, random)) break;
         }
     }
-    _ = try fromPrimes(&pair[0], &pair[1]);
+    try fromPrimes(&pair[0], &pair[1], &scratch_kp);
 }
 
 // F7's fifth named mutation, `m14` (delete `n_bytes.len > modulus_bytes`
@@ -1828,6 +1958,7 @@ test "squareModulus's Overflow independently catches what the explicit length bo
 }
 
 test "fromPrimes rejects composite factors that pass every earlier structural check (F7/F10, m11 refuted)" {
+    var scratch_kp: KeyPair = undefined;
     // p=15 (=3*5), q=91 (=7*13): both composite, p != q, both >= 3, n=1365
     // is odd and well within modulus_bits — every check *before* the
     // invertibility self-check (root.zig ~line 790, Paillier 1999 Theorem 2's
@@ -1847,13 +1978,14 @@ test "fromPrimes rejects composite factors that pass every earlier structural ch
     // the rejecting; not traced further here — this test pins the observable
     // behavior (composite factors of this shape get rejected), not which
     // line does it. Not exhaustive: only composites <= 99 were swept.
-    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{15}, &[_]u8{91}));
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{15}, &[_]u8{91}, &scratch_kp));
 }
 
 test "round-trip: decrypt(encrypt(m, r)) == m, fixed small p,q,r (phe-cross-checked)" {
     // Vectors verified against phe (python-paillier) 1.5.0 for the p=11,
     // q=17 key above -- see NOTICE.
-    const kp = try fromPrimes(&kat_p, &kat_q);
+    var kp: KeyPair = undefined;
+    try fromPrimes(&kat_p, &kat_q, &kp);
     const pk = kp.public;
     const sk = kp.secret;
 
@@ -1868,9 +2000,10 @@ test "round-trip: decrypt(encrypt(m, r)) == m, fixed small p,q,r (phe-cross-chec
         // m/r constructed mod pk.n_sq per the Fe construction contract.
         const m_fe = try Fe.fromPrimitive(u32, pk.n_sq, v.m);
         const r_fe = try Fe.fromPrimitive(u32, pk.n_sq, v.r);
-        const c = try encrypt(pk, m_fe, r_fe);
+        const c = try encrypt(pk, &m_fe, &r_fe);
         try testing.expectEqual(@as(u32, v.c), try c.c.toPrimitive(u32));
-        const m2 = try decrypt(sk, c);
+        var m2: Fe = undefined;
+        try decrypt(&sk, c, &m2);
         try testing.expectEqual(@as(u32, v.m), try m2.toPrimitive(u32));
     }
 }
@@ -1878,40 +2011,42 @@ test "round-trip: decrypt(encrypt(m, r)) == m, fixed small p,q,r (phe-cross-chec
 test "homomorphic properties: add(E(m1),E(m2)), addPlaintext, mulPlaintext" {
     // m1=5,r1=3 -> c1=28873; m2=9,r2=7 -> c2=9466 (phe-cross-checked, see
     // NOTICE). n=187.
-    const kp = try fromPrimes(&kat_p, &kat_q);
+    var kp: KeyPair = undefined;
+    try fromPrimes(&kat_p, &kat_q, &kp);
     const pk = kp.public;
     const sk = kp.secret;
 
     const m1 = try Fe.fromPrimitive(u32, pk.n_sq, 5);
     const r1 = try Fe.fromPrimitive(u32, pk.n_sq, 3);
-    const c1 = try encrypt(pk, m1, r1);
+    const c1 = try encrypt(pk, &m1, &r1);
     try testing.expectEqual(@as(u32, 28873), try c1.c.toPrimitive(u32));
 
     const m2 = try Fe.fromPrimitive(u32, pk.n_sq, 9);
     const r2 = try Fe.fromPrimitive(u32, pk.n_sq, 7);
-    const c2 = try encrypt(pk, m2, r2);
+    const c2 = try encrypt(pk, &m2, &r2);
     try testing.expectEqual(@as(u32, 9466), try c2.c.toPrimitive(u32));
 
     // decrypt(add(E(m1),E(m2))) == m1+m2 mod n
     const c_add = addCiphertexts(pk, c1, c2);
     try testing.expectEqual(@as(u32, 29083), try c_add.c.toPrimitive(u32));
-    try testing.expectEqual(@as(u32, (5 + 9) % 187), try (try decrypt(sk, c_add)).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, (5 + 9) % 187), try (try decryptTest(&sk, c_add)).toPrimitive(u32));
 
     // decrypt(mulPlaintext(E(m1),k)) == k*m1 mod n
     const k = try Fe.fromPrimitive(u32, pk.n_sq, 4);
-    const c_mul = try mulPlaintext(pk, c1, k);
+    const c_mul = try mulPlaintext(pk, c1, &k);
     try testing.expectEqual(@as(u32, 24535), try c_mul.c.toPrimitive(u32));
-    try testing.expectEqual(@as(u32, (5 * 4) % 187), try (try decrypt(sk, c_mul)).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, (5 * 4) % 187), try (try decryptTest(&sk, c_mul)).toPrimitive(u32));
 
     // decrypt(addPlaintext(E(m1),m2plain)) == m1+m2plain mod n
     const m2plain = try Fe.fromPrimitive(u32, pk.n_sq, 6);
-    const c_addpt = try addPlaintext(pk, c1, m2plain);
+    const c_addpt = try addPlaintext(pk, c1, &m2plain);
     try testing.expectEqual(@as(u32, 8116), try c_addpt.c.toPrimitive(u32));
-    try testing.expectEqual(@as(u32, (5 + 6) % 187), try (try decrypt(sk, c_addpt)).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, (5 + 6) % 187), try (try decryptTest(&sk, c_addpt)).toPrimitive(u32));
 }
 
 test "homomorphic edge cases: m=0 operands, k=0/k=1 scaling, wrap-around mod n" {
-    const kp = try fromPrimes(&kat_p, &kat_q);
+    var kp: KeyPair = undefined;
+    try fromPrimes(&kat_p, &kat_q, &kp);
     const pk = kp.public;
     const sk = kp.secret;
     var prng = std.Random.DefaultPrng.init(42);
@@ -1920,36 +2055,36 @@ test "homomorphic edge cases: m=0 operands, k=0/k=1 scaling, wrap-around mod n" 
     // Wrap-around: m1 + m2 >= n (100 + 150 = 250 ≡ 63 mod 187).
     const m1 = try Fe.fromPrimitive(u32, pk.n_sq, 100);
     const m2 = try Fe.fromPrimitive(u32, pk.n_sq, 150);
-    const c1 = try encryptRandom(pk, m1, random);
-    const c2 = try encryptRandom(pk, m2, random);
-    try testing.expectEqual(@as(u32, (100 + 150) % 187), try (try decrypt(sk, addCiphertexts(pk, c1, c2))).toPrimitive(u32));
+    const c1 = try encryptRandom(pk, &m1, random);
+    const c2 = try encryptRandom(pk, &m2, random);
+    try testing.expectEqual(@as(u32, (100 + 150) % 187), try (try decryptTest(&sk, addCiphertexts(pk, c1, c2))).toPrimitive(u32));
 
     // E(n-1) + E(1) wraps to exactly 0.
     const m_max = try Fe.fromPrimitive(u32, pk.n_sq, 186);
     const m_one = try Fe.fromPrimitive(u32, pk.n_sq, 1);
-    const c_max = try encryptRandom(pk, m_max, random);
-    const c_one = try encryptRandom(pk, m_one, random);
-    try testing.expectEqual(@as(u32, 0), try (try decrypt(sk, addCiphertexts(pk, c_max, c_one))).toPrimitive(u32));
+    const c_max = try encryptRandom(pk, &m_max, random);
+    const c_one = try encryptRandom(pk, &m_one, random);
+    try testing.expectEqual(@as(u32, 0), try (try decryptTest(&sk, addCiphertexts(pk, c_max, c_one))).toPrimitive(u32));
 
     // addPlaintext: m = 0 is the identity; wrap-around matches mod-n sum.
     const zero = try Fe.fromPrimitive(u32, pk.n_sq, 0);
-    try testing.expectEqual(@as(u32, 100), try (try decrypt(sk, try addPlaintext(pk, c1, zero))).toPrimitive(u32));
-    try testing.expectEqual(@as(u32, (100 + 150) % 187), try (try decrypt(sk, try addPlaintext(pk, c1, m2))).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, 100), try (try decryptTest(&sk, try addPlaintext(pk, c1, &zero))).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, (100 + 150) % 187), try (try decryptTest(&sk, try addPlaintext(pk, c1, &m2))).toPrimitive(u32));
 
     // mulPlaintext: k = 0 is the deterministic unblinded E(0) (c^0 = 1,
     // matching phe's pow(c, 0, n²) = 1) and decrypts to 0.
-    const c_k0 = try mulPlaintext(pk, c1, zero);
+    const c_k0 = try mulPlaintext(pk, c1, &zero);
     try testing.expectEqual(@as(u32, 1), try c_k0.c.toPrimitive(u32));
-    try testing.expectEqual(@as(u32, 0), try (try decrypt(sk, c_k0)).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, 0), try (try decryptTest(&sk, c_k0)).toPrimitive(u32));
     // k = 1 is the identity; k = 5 wraps: 100*5 = 500 ≡ 126 mod 187.
-    try testing.expectEqual(@as(u32, 100), try (try decrypt(sk, try mulPlaintext(pk, c1, m_one))).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, 100), try (try decryptTest(&sk, try mulPlaintext(pk, c1, &m_one))).toPrimitive(u32));
     const k5 = try Fe.fromPrimitive(u32, pk.n_sq, 5);
-    try testing.expectEqual(@as(u32, (100 * 5) % 187), try (try decrypt(sk, try mulPlaintext(pk, c1, k5))).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, (100 * 5) % 187), try (try decryptTest(&sk, try mulPlaintext(pk, c1, &k5))).toPrimitive(u32));
 
     // m = 0 as an *encrypted* value composes homomorphically too.
-    const c_zero = try encryptRandom(pk, zero, random);
-    try testing.expectEqual(@as(u32, 0), try (try decrypt(sk, c_zero)).toPrimitive(u32));
-    try testing.expectEqual(@as(u32, 100), try (try decrypt(sk, addCiphertexts(pk, c1, c_zero))).toPrimitive(u32));
+    const c_zero = try encryptRandom(pk, &zero, random);
+    try testing.expectEqual(@as(u32, 0), try (try decryptTest(&sk, c_zero)).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, 100), try (try decryptTest(&sk, addCiphertexts(pk, c1, c_zero))).toPrimitive(u32));
 }
 
 test "encryptRandom is genuinely fresh: repeated calls on the same key/message never collide (F7 m5)" {
@@ -1970,7 +2105,8 @@ test "encryptRandom is genuinely fresh: repeated calls on the same key/message n
     // chance is not a real possibility; a constant-r mutant still fails on
     // draw 2.
     var keygen_prng = std.Random.DefaultPrng.init(0xf7f5);
-    const kp = try generate(keygen_prng.random(), 512);
+    var kp: KeyPair = undefined;
+    try generate(keygen_prng.random(), 512, &kp);
     const pk = kp.public;
     const m = try Fe.fromPrimitive(u32, pk.n_sq, 42);
     var prng = std.Random.DefaultPrng.init(1234);
@@ -1980,7 +2116,7 @@ test "encryptRandom is genuinely fresh: repeated calls on the same key/message n
     defer seen.deinit();
     var c_buf: [modulus_sq_bytes]u8 = undefined;
     for (0..128) |_| {
-        const c = try encryptRandom(pk, m, random);
+        const c = try encryptRandom(pk, &m, random);
         c.c.toBytes(&c_buf, .big) catch unreachable; // canonical mod n_sq, exact-size buffer
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(&c_buf, &digest, .{});
@@ -1996,44 +2132,48 @@ test "encrypt/decrypt round-trips every residue of the toy key (exhaustive m in 
     // factor with n is ~1/p + 1/q ≈ 15% per draw (negligible only for real
     // key sizes — see SPEC.md), and decrypt correctly *rejects* such
     // non-unit ciphertexts as error.InvalidCiphertext.
-    const kp = try fromPrimes(&kat_p, &kat_q);
+    var kp: KeyPair = undefined;
+    try fromPrimes(&kat_p, &kat_q, &kp);
     const r_pool = [_]u32{ 3, 5, 7, 13, 19, 23, 29, 31 }; // all coprime to 187 = 11*17
     var m: u32 = 0;
     while (m < 187) : (m += 1) {
         const m_fe = try Fe.fromPrimitive(u32, kp.public.n_sq, m);
         const r_fe = try Fe.fromPrimitive(u32, kp.public.n_sq, r_pool[m % r_pool.len]);
-        const c = try encrypt(kp.public, m_fe, r_fe);
-        try testing.expectEqual(m, try (try decrypt(kp.secret, c)).toPrimitive(u32));
+        const c = try encrypt(kp.public, &m_fe, &r_fe);
+        try testing.expectEqual(m, try (try decryptTest(&kp.secret, c)).toPrimitive(u32));
     }
 }
 
 test "decrypt rejects invalid ciphertexts (zero and non-units mod n)" {
-    const kp = try fromPrimes(&kat_p, &kat_q);
+    var scratch_fe: Fe = undefined;
+    var kp: KeyPair = undefined;
+    try fromPrimes(&kat_p, &kat_q, &kp);
     const sk = kp.secret;
     const zero_c = Ciphertext{ .c = try Fe.fromPrimitive(u32, sk.n_sq, 0) };
-    try testing.expectError(error.InvalidCiphertext, decrypt(sk, zero_c));
+    try testing.expectError(error.InvalidCiphertext, decrypt(&sk, zero_c, &scratch_fe));
     // c = n: c^lambda ≡ 0 (mod n²) — L is undefined.
     const n_c = Ciphertext{ .c = try Fe.fromPrimitive(u32, sk.n_sq, 187) };
-    try testing.expectError(error.InvalidCiphertext, decrypt(sk, n_c));
+    try testing.expectError(error.InvalidCiphertext, decrypt(&sk, n_c, &scratch_fe));
     // c = p (shares the factor 11 with n): x ≢ 1 (mod n), exactness check fires.
     const p_c = Ciphertext{ .c = try Fe.fromPrimitive(u32, sk.n_sq, 11) };
-    try testing.expectError(error.InvalidCiphertext, decrypt(sk, p_c));
+    try testing.expectError(error.InvalidCiphertext, decrypt(&sk, p_c, &scratch_fe));
 }
 
 test "encrypt rejects r = 0 (paillier F11)" {
     // r = 0 can only ever produce a ciphertext decrypt itself then rejects
     // (gcd(0, n) = n != 1) — encrypt now catches it up front instead of
     // silently manufacturing a dead ciphertext.
-    const kp = try fromPrimes(&kat_p, &kat_q);
+    var kp: KeyPair = undefined;
+    try fromPrimes(&kat_p, &kat_q, &kp);
     const m_fe = try Fe.fromPrimitive(u32, kp.public.n_sq, 7);
     const zero_r = try Fe.fromPrimitive(u32, kp.public.n_sq, 0);
-    try testing.expectError(error.InvalidRandomness, encrypt(kp.public, m_fe, zero_r));
+    try testing.expectError(error.InvalidRandomness, encrypt(kp.public, &m_fe, &zero_r));
 
     // Positive control: r = 1 is still ACCEPTED (a real, documented
     // weakness — F11's other half — not something this fix touches).
     const one_r = try Fe.fromPrimitive(u32, kp.public.n_sq, 1);
-    const c = try encrypt(kp.public, m_fe, one_r);
-    try testing.expectEqual(@as(u32, 7), try (try decrypt(kp.secret, c)).toPrimitive(u32));
+    const c = try encrypt(kp.public, &m_fe, &one_r);
+    try testing.expectEqual(@as(u32, 7), try (try decryptTest(&kp.secret, c)).toPrimitive(u32));
 }
 
 test "decrypt via non-CRT fallback (fromBytes key, no factors) matches phe vectors" {
@@ -2049,8 +2189,8 @@ test "decrypt via non-CRT fallback (fromBytes key, no factors) matches phe vecto
     for (vectors) |v| {
         const m_fe = try Fe.fromPrimitive(u32, pk.n_sq, v.m);
         const r_fe = try Fe.fromPrimitive(u32, pk.n_sq, v.r);
-        const c = try encrypt(pk, m_fe, r_fe);
-        try testing.expectEqual(v.m, try (try decrypt(sk, c)).toPrimitive(u32));
+        const c = try encrypt(pk, &m_fe, &r_fe);
+        try testing.expectEqual(v.m, try (try decryptTest(&sk, c)).toPrimitive(u32));
     }
 }
 
@@ -2063,7 +2203,8 @@ test "CRT and non-CRT decrypt agree at a real 512-bit key size" {
     // single-modulus modexp.
     var prng = std.Random.DefaultPrng.init(0x1d0c7e51);
     const random = prng.random();
-    const kp = try generate(random, 512);
+    var kp: KeyPair = undefined;
+    try generate(random, 512, &kp);
     try testing.expect(kp.secret.crt != null);
 
     // Rebuild the same secret key from n/λ/µ only → no CRT block.
@@ -2073,13 +2214,16 @@ test "CRT and non-CRT decrypt agree at a real 512-bit key size" {
     try kp.secret.nToBytes(&n_b);
     try kp.secret.lambdaToBytes(&lam_b);
     try kp.secret.muToBytes(&mu_b);
-    const sk_nocrt = try SecretKey.fromBytes(&n_b, &lam_b, &mu_b);
+    var sk_nocrt: SecretKey = undefined;
+    try SecretKey.fromBytes(&n_b, &lam_b, &mu_b, &sk_nocrt);
     try testing.expect(sk_nocrt.crt == null);
 
     const m = try Fe.fromPrimitive(u64, kp.public.n_sq, 0x00C0FFEE_1234_5678);
-    const c = try encryptRandom(kp.public, m, random);
-    const via_crt = try decrypt(kp.secret, c);
-    const via_full = try decrypt(sk_nocrt, c);
+    const c = try encryptRandom(kp.public, &m, random);
+    var via_crt: Fe = undefined;
+    try decrypt(&kp.secret, c, &via_crt);
+    var via_full: Fe = undefined;
+    try decrypt(&sk_nocrt, c, &via_full);
     try testing.expectEqual(@as(u64, 0x00C0FFEE_1234_5678), try via_crt.toPrimitive(u64));
     try testing.expect(via_crt.eql(via_full));
 }
@@ -2121,12 +2265,13 @@ test "topBitsMatch: FIPS 186-5 closeness guard fires exactly at the 100-bit boun
 }
 
 test "generate rejects invalid bit sizes" {
+    var scratch_kp: KeyPair = undefined;
     var prng = std.Random.DefaultPrng.init(1);
     const random = prng.random();
-    try testing.expectError(error.InvalidBits, generate(random, 0));
-    try testing.expectError(error.InvalidBits, generate(random, min_generate_bits - 2));
-    try testing.expectError(error.InvalidBits, generate(random, min_generate_bits + 1)); // odd
-    try testing.expectError(error.InvalidBits, generate(random, modulus_bits + 2));
+    try testing.expectError(error.InvalidBits, generate(random, 0, &scratch_kp));
+    try testing.expectError(error.InvalidBits, generate(random, min_generate_bits - 2, &scratch_kp));
+    try testing.expectError(error.InvalidBits, generate(random, min_generate_bits + 1, &scratch_kp)); // odd
+    try testing.expectError(error.InvalidBits, generate(random, modulus_bits + 2, &scratch_kp));
 }
 
 test "generate: 512-bit keygen round-trips encrypt/decrypt + homomorphic add" {
@@ -2134,16 +2279,19 @@ test "generate: 512-bit keygen round-trips encrypt/decrypt + homomorphic add" {
     // full modulus_bits path is exercised by the (slow) test below.
     var prng = std.Random.DefaultPrng.init(0x5041494c);
     const random = prng.random();
-    const kp = try generate(random, 512);
+    var kp: KeyPair = undefined;
+    try generate(random, 512, &kp);
     try testing.expectEqual(@as(usize, 512), kp.public.n.bits());
 
     const m = try Fe.fromPrimitive(u64, kp.public.n_sq, 0xdeadbeef12345678);
-    const c = try encryptRandom(kp.public, m, random);
-    const m_back = try decrypt(kp.secret, c);
+    const c = try encryptRandom(kp.public, &m, random);
+    var m_back: Fe = undefined;
+    try decrypt(&kp.secret, c, &m_back);
     try testing.expectEqual(@as(u64, 0xdeadbeef12345678), try m_back.toPrimitive(u64));
 
     // E(m) + E(m) decrypts to 2m (fits well below a 512-bit n).
-    const two_m = try decrypt(kp.secret, addCiphertexts(kp.public, c, c));
+    var two_m: Fe = undefined;
+    try decrypt(&kp.secret, addCiphertexts(kp.public, c, c), &two_m);
     try testing.expectEqual(@as(u128, 2 * @as(u128, 0xdeadbeef12345678)), try two_m.toPrimitive(u128));
 }
 
@@ -2157,7 +2305,8 @@ test "sampleNonzeroLtN draws land strictly below n, never n_sq (paillier F1)" {
     // test lives in the same file.
     var prng = std.Random.DefaultPrng.init(0xF1F1F1F1);
     const random = prng.random();
-    const kp = try generate(random, 512);
+    var kp: KeyPair = undefined;
+    try generate(random, 512, &kp);
     const pk = kp.public;
     const n_len = pk.nByteLen();
     var n_be: [modulus_bytes]u8 = undefined;
@@ -2185,16 +2334,17 @@ test "sampleNonzeroLtN draws land strictly below n, never n_sq (paillier F1)" {
 test "generate: full 2048-bit keygen round-trips (slow; the size this module is designed for)" {
     var prng = std.Random.DefaultPrng.init(0x70616c6c);
     const random = prng.random();
-    const kp = try generate(random, modulus_bits);
+    var kp: KeyPair = undefined;
+    try generate(random, modulus_bits, &kp);
     try testing.expectEqual(@as(usize, modulus_bits), kp.public.n.bits());
 
     const m = try Fe.fromPrimitive(u64, kp.public.n_sq, 0x123456789abcdef);
-    const c = try encryptRandom(kp.public, m, random);
-    try testing.expectEqual(@as(u64, 0x123456789abcdef), try (try decrypt(kp.secret, c)).toPrimitive(u64));
+    const c = try encryptRandom(kp.public, &m, random);
+    try testing.expectEqual(@as(u64, 0x123456789abcdef), try (try decryptTest(&kp.secret, c)).toPrimitive(u64));
 
     const k = try Fe.fromPrimitive(u32, kp.public.n_sq, 3);
-    const c3 = try mulPlaintext(kp.public, c, k);
-    try testing.expectEqual(@as(u128, 3 * @as(u128, 0x123456789abcdef)), try (try decrypt(kp.secret, c3)).toPrimitive(u128));
+    const c3 = try mulPlaintext(kp.public, c, &k);
+    try testing.expectEqual(@as(u128, 3 * @as(u128, 0x123456789abcdef)), try (try decryptTest(&kp.secret, c3)).toPrimitive(u128));
 }
 
 test "smoke: module compiles and constants are sane" {
@@ -2370,7 +2520,8 @@ const Corpus = struct {
         // drawn from bytes would ever be one.
         var prng = std.Random.DefaultPrng.init(0x66757a7a); // "fuzz"
         const random = prng.random();
-        const kp = try generate(random, 512);
+        var kp: KeyPair = undefined;
+        try generate(random, 512, &kp);
         self.n_len = kp.public.nByteLen();
         try kp.public.nToBytes(self.n[0..self.n_len]);
         try kp.public.gToBytes(&self.g);
@@ -2380,7 +2531,7 @@ const Corpus = struct {
         @memcpy(self.padded_n[zero_run..][0..self.n_len], self.n[0..self.n_len]);
 
         const m = try Fe.fromPrimitive(u64, kp.public.n_sq, 0xdeadbeef12345678);
-        const c = try encryptRandom(kp.public, m, random);
+        const c = try encryptRandom(kp.public, &m, random);
         try c.toBytes(&self.ct);
 
         const real_n = self.n[0..self.n_len];
@@ -2539,7 +2690,8 @@ fn fuzzSecretKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     var mu_buf: [modulus_bytes + 16]u8 = undefined;
     const mu_bytes = fuzzedFieldBytes(smith, &mu_buf);
 
-    var sk = SecretKey.fromBytes(n_bytes, lambda_bytes, mu_bytes) catch return;
+    var sk: SecretKey = undefined;
+    SecretKey.fromBytes(n_bytes, lambda_bytes, mu_bytes, &sk) catch return;
     sk.deinit();
 }
 
@@ -2562,7 +2714,8 @@ test "corpus: the SecretKey seeds reach the parser, and the counts are pinned" {
         var mu_buf: [modulus_bytes + 16]u8 = undefined;
         const mu_bytes = fuzzedFieldBytes(&smith, &mu_buf);
         if (n_bytes.len != 0) nonempty += 1;
-        var sk = SecretKey.fromBytes(n_bytes, lambda_bytes, mu_bytes) catch continue;
+        var sk: SecretKey = undefined;
+        SecretKey.fromBytes(n_bytes, lambda_bytes, mu_bytes, &sk) catch continue;
         defer sk.deinit();
         accepted += 1;
         const bits = sk.n.bits();
@@ -2650,7 +2803,8 @@ fn fuzzDecryptPathsAgree(_: void, smith: *std.testing.Smith) !void {
     // Toy KAT key (n=187) so this stays cheap per fuzz iteration; the CRT
     // vs non-CRT split under test does not depend on key size (the 512-bit
     // test above already covers the multi-limb case once).
-    const kp = fromPrimes(&kat_p, &kat_q) catch unreachable;
+    var kp: KeyPair = undefined;
+    fromPrimes(&kat_p, &kat_q, &kp) catch unreachable;
     try testing.expect(kp.secret.crt != null);
 
     // An independent decrypt path to the SAME n/λ/µ: round-tripped through
@@ -2674,10 +2828,12 @@ fn fuzzDecryptPathsAgree(_: void, smith: *std.testing.Smith) !void {
     const bytes = fuzzedFieldBytes(smith, &buf);
     const ct = Ciphertext.fromBytes(kp.public, bytes) catch return; // not a well-formed ciphertext under this key; nothing to compare
 
-    const r_crt = decrypt(kp.secret, ct);
-    const r_noncrt = decrypt(sk_noncrt, ct);
-    if (r_crt) |v_crt| {
-        const v_noncrt = r_noncrt catch return error.CrtNonCrtDisagree;
+    var v_crt: Fe = undefined;
+    const r_crt = decrypt(&kp.secret, ct, &v_crt);
+    var v_noncrt: Fe = undefined;
+    const r_noncrt = decrypt(&sk_noncrt, ct, &v_noncrt);
+    if (r_crt) |_| {
+        r_noncrt catch return error.CrtNonCrtDisagree;
         if (!v_crt.eql(v_noncrt)) return error.CrtNonCrtDisagree;
     } else |_| {
         if (r_noncrt) |_| return error.CrtNonCrtDisagree else |_| {}
@@ -2753,7 +2909,8 @@ test "decrypt: no secret full-value copy survives on the dead stack (paillier F2
     if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest; // undefined poisoning (ReleaseSafe/Debug) defeats this probe
     var prng = std.Random.DefaultPrng.init(0x57ac4);
     const random = prng.random();
-    var kp = try generate(random, 1024);
+    var kp: KeyPair = undefined;
+    try generate(random, 1024, &kp);
     const pk = kp.public;
 
     // Extract every search pattern BEFORE painting, so the extraction's own
@@ -2776,7 +2933,7 @@ test "decrypt: no secret full-value copy survives on the dead stack (paillier F2
     var pt: [64]u8 = undefined;
     for (&pt, 0..) |*b, i| b.* = @truncate(0xA0 +% i *% 7);
     const m = try Fe.fromBytes(pk.n_sq, &pt, .big);
-    const c = try encryptRandom(pk, m, random);
+    const c = try encryptRandom(pk, &m, random);
 
     const Pattern = struct { name: []const u8, bytes: []const u8, allow: usize };
     // `Fe` holds little-endian u64 limbs, so both the limb image and the
@@ -2797,7 +2954,8 @@ test "decrypt: no secret full-value copy survives on the dead stack (paillier F2
     defer testing.allocator.free(image);
 
     stackProbePaint(0x5A);
-    const back = try decrypt(kp.secret, c);
+    var back: Fe = undefined;
+    try decrypt(&kp.secret, c, &back);
     std.mem.doNotOptimizeAway(&back);
     kp.secret.deinit();
     stackProbeSnapshot(image[0..stack_probe_region]);
@@ -2807,4 +2965,8 @@ test "decrypt: no secret full-value copy survives on the dead stack (paillier F2
         errdefer std.debug.print("paillier F2 probe: {s} — expected <= {d} full-value copies, found {d}\n", .{ p.name, p.allow, full_hits });
         try testing.expect(full_hits <= p.allow);
     }
+}
+
+test {
+    _ = @import("stackprobe_test.zig");
 }

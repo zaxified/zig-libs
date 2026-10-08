@@ -50,6 +50,13 @@
 const std = @import("std");
 const root = @import("root.zig");
 const zkproofs = @import("zkproofs.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const prove_stack_burn = 240 * 1024;
 
 const AuxFe = root.AuxFe;
 const AuxModulus = root.AuxModulus;
@@ -182,6 +189,19 @@ pub const ProveError = root.AuxParams.ValidateError || error{InvalidStatement};
 /// index`). `p`, `q` are big-endian and SECRET; the caller vouches that
 /// `p·q == n0` (a mismatch yields a proof that does not verify).
 pub fn prove(
+    n0: AuxModulus,
+    p: []const u8,
+    q: []const u8,
+    verifier_aux: root.AuxParams,
+    context: []const u8,
+    random: std.Random,
+) ProveError!FacProof {
+    const result = proveUnburned(n0, p, q, verifier_aux, context, random);
+    burn.stack(prove_stack_burn);
+    return result;
+}
+
+noinline fn proveUnburned(
     n0: AuxModulus,
     p: []const u8,
     q: []const u8,

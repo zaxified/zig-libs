@@ -174,6 +174,24 @@ internal serialization, real and round-trip-tested, not a standard.
 
 ## Threat model / out of scope
 
+- **Secret residue on the dead stack** (sweep 2026-10-08, `src/stackprobe_test.zig`,
+  ReleaseFast). Wiping named buffers did not keep secrets off the stack: compiler copies,
+  by-value parameters and results, and callee frames left them in dead stack memory. Fix,
+  as `bip32`/`k256` (2026-10-08): (1) every public entry point that touches a secret runs its
+  body one frame down (`noinline`) and then zeroes, at that depth, a region a little deeper than
+  the body was measured to reach (`burn.zig`: volatile 32-byte vector stores into a 16-aligned
+  buffer — 32-aligned, the frame realigned and left up to 56 bytes unzeroed, which held half a
+  secret); (2) a secret never crosses the API by value: secret parameters are pointers, secret
+  results go to an out-parameter, because the copy a by-value argument or result makes lives in
+  the CALLER's frame, where no burn of the callee reaches. The probe paints a window, makes one
+  call, copies the uninitialised window at the same depth and looks for every 16-byte window of
+  every secret's big-endian, little-endian and in-memory image and of every byte the call drew
+  from its `std.Random` (published bytes excluded); negative and positive controls in the same
+  binary. `verbose = true` prints each call's depth, to resize a burn after a change.
+  Before: 141 copies on the signing path (rounds 1-6, `finish`, `signShare`; round 3 left the
+  whole Paillier secret key, 21-23 copies per party) and 354 over 28 building blocks; after: 0
+  over 61 calls (presigning, the §4.3 opening, the codec and pool, `signWithShares`, MtA, every
+  prover, key generation and the codecs). Stack cost: up to ~1.3 MiB below `proveWellFormed*`.
 - **`secret_share` (x_i) and `paillier_secret` are SECRET** — as sensitive
   as any raw ECDSA/Paillier private key. `KeyShare` does not add any
   handling beyond what `Scalar`/`paillier.SecretKey` already provide

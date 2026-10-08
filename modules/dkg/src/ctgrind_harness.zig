@@ -254,7 +254,8 @@ fn runCombine(tainted: bool) !void {
         }
     }
 
-    const x_j = combineKeyShare(&qualified, &received) catch |err| {
+    var x_j: Scalar = undefined;
+    combineKeyShare(&qualified, &received, &x_j) catch |err| {
         std.debug.print("combine aborted: {t}\n", .{err});
         return;
     };

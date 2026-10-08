@@ -153,9 +153,9 @@ pub fn signWithSharesOptions(
         slot.csprng = .init(seed);
         if (threaded) slot.arena = .init(std.heap.page_allocator); // global-alloc-ok: worker threads need a thread-safe backing allocator and the caller's need not be one (documented on `SignOptions.threads`)
     }
-    for (slots, shares) |*slot, share| {
+    for (slots, shares) |*slot, *share| {
         const party_alloc = if (slot.arena) |*a| a.allocator() else allocator;
-        slot.party = presign.Party.init(party_alloc, share, indices, sid) catch |e| return mapError(e);
+        presign.Party.init(party_alloc, share, indices, sid, &slot.party) catch |e| return mapError(e);
         slot.live = true;
     }
 
@@ -206,7 +206,7 @@ pub fn signWithSharesOptions(
         allocator.free(presigs);
     }
     for (slots) |*s| {
-        presigs[made] = s.party.finish(s.inbox.items) catch |e| return mapError(e);
+        s.party.finish(s.inbox.items, &presigs[made]) catch |e| return mapError(e);
         made += 1;
     }
     const sig_shares = try allocator.alloc([]u8, t);
@@ -287,7 +287,8 @@ fn sampleFeBelow(m: root.AuxModulus, random: std.Random) root.AuxFe {
 }
 
 pub fn testAuxParams(random: std.Random) !root.AuxParams {
-    const nt_kp = try paillier.generate(random, 2048);
+    var nt_kp: paillier.KeyPair = undefined;
+    try paillier.generate(random, 2048, &nt_kp);
     var nt_buf: [paillier.modulus_bytes]u8 = undefined;
     const nt_len = nt_kp.public.nByteLen();
     try nt_kp.public.nToBytes(nt_buf[0..nt_len]);
@@ -317,7 +318,7 @@ pub fn testKeygen(allocator: std.mem.Allocator, random: std.Random, t: u32, n: u
     const aux_params = try allocator.alloc(root.AuxParams, n);
     defer allocator.free(aux_params);
     for (0..n) |i| {
-        paillier_keys[i] = try paillier.generate(random, 2048);
+        try paillier.generate(random, 2048, &paillier_keys[i]);
         aux_params[i] = try testAuxParams(random);
     }
     const secret = randomScalar(random);
@@ -327,7 +328,7 @@ pub fn testKeygen(allocator: std.mem.Allocator, random: std.Random, t: u32, n: u
     const message_seeds = try allocator.alloc([32]u8, n);
     defer allocator.free(message_seeds);
     for (message_seeds) |*sd| random.bytes(sd);
-    const key_shares = try root.keygenTrustedDealer(allocator, t, n, secret, coefficients, paillier_keys, aux_params, message_seeds);
+    const key_shares = try root.keygenTrustedDealer(allocator, t, n, &secret, coefficients, paillier_keys, aux_params, message_seeds);
     return .{ .key_shares = key_shares };
 }
 

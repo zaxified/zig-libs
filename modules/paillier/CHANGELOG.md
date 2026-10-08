@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the new ReleaseFast stack
+  probe (`src/stackprobe_test.zig`) found 122 copies of secrets in dead stack frames over 10 entry
+  points (`generate` 78: the factors, `λ`, `μ`, the CRT block; `decrypt` 26 with CRT; `encrypt`
+  the plaintext and randomness; `SecretKey.fromBytes`, `lambdaToBytes`, `muToBytes`). Each entry
+  point now burns its stack (`burn.zig`) and secrets cross the API by pointer: `generate(…, out:
+  *KeyPair)`, `fromPrimes(…, out)`, `SecretKey.fromBytes(…, out)`, `decrypt(sk: *const SecretKey,
+  c, out: *Fe)`, `encrypt(pk, m: *const Fe, r: *const Fe)`, `encryptRandom(pk, m: *const Fe, …)`,
+  `addPlaintext`/`mulPlaintext` (plaintext by pointer), `lambdaToBytes`/`muToBytes` take
+  `*const SecretKey`. 0 residues after. Callers: `threshold_ecdsa`, `dkg` (migrated).
 - **2026-10-03** — **`fromPrimes`/`generate` are constant-time in the primes.**
   λ by `montint.nt.lcm`, `µ = λ⁻¹ mod n` by `DynModint.inverse` (the closed form
   of `L(g^λ mod n²)⁻¹` for `g = n+1`; no more `g^λ` through `std.crypto.ff`'s

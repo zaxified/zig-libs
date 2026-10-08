@@ -33,6 +33,17 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const pedersen_commit_stack_burn = 24 * 1024;
+const prove_pedersen_stack_burn = 24 * 1024;
+const prove_st_stack_burn = 24 * 1024;
+const prove_schnorr_stack_burn = 24 * 1024;
+const prove_dleq_stack_burn = 24 * 1024;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Scalar = root.Scalar;
@@ -66,7 +77,17 @@ pub fn pedersenH() Element {
 
 /// `σ·G + ℓ·H` — the Phase-3 commitment `T`. Constant-time in `σ`, `ℓ`.
 /// `error.InvalidElement` only for the identity (probability ~2⁻²⁵⁶).
-pub fn pedersenCommit(sigma: Scalar, ell: Scalar) root.ElementError!Element {
+pub fn pedersenCommit(sigma: *const Scalar, ell: *const Scalar) root.ElementError!Element {
+    const result = pedersenCommitUnburned(sigma, ell);
+    burn.stack(pedersen_commit_stack_burn);
+    return result;
+}
+
+noinline fn pedersenCommitUnburned(sigma: *const Scalar, ell: *const Scalar) root.ElementError!Element {
+    return pedersenCommitByValue(sigma.*, ell.*);
+}
+
+fn pedersenCommitByValue(sigma: Scalar, ell: Scalar) root.ElementError!Element {
     const h = pedersenH().point() catch unreachable;
     const sg = Secp256k1.basePoint.mul(sigma.toBytes(.big), .big) catch return error.InvalidElement;
     const lh = h.mul(ell.toBytes(.big), .big) catch return error.InvalidElement;
@@ -156,7 +177,17 @@ fn pedersenChallenge(context: []const u8, t_point: Element, alpha: Element) Scal
     return c.finish();
 }
 
-pub fn provePedersen(sigma: Scalar, ell: Scalar, t_point: Element, context: []const u8, random: std.Random) PedersenProof {
+pub fn provePedersen(sigma: *const Scalar, ell: *const Scalar, t_point: Element, context: []const u8, random: std.Random) PedersenProof {
+    const result = provePedersenUnburned(sigma, ell, t_point, context, random);
+    burn.stack(prove_pedersen_stack_burn);
+    return result;
+}
+
+noinline fn provePedersenUnburned(sigma: *const Scalar, ell: *const Scalar, t_point: Element, context: []const u8, random: std.Random) PedersenProof {
+    return provePedersenByValue(sigma.*, ell.*, t_point, context, random);
+}
+
+fn provePedersenByValue(sigma: Scalar, ell: Scalar, t_point: Element, context: []const u8, random: std.Random) PedersenProof {
     while (true) {
         var a = randomScalar(random);
         var b = randomScalar(random);
@@ -164,7 +195,7 @@ pub fn provePedersen(sigma: Scalar, ell: Scalar, t_point: Element, context: []co
             std.crypto.secureZero(u8, std.mem.asBytes(&a));
             std.crypto.secureZero(u8, std.mem.asBytes(&b));
         }
-        const alpha = pedersenCommit(a, b) catch continue;
+        const alpha = pedersenCommit(&a, &b) catch continue;
         const c = pedersenChallenge(context, t_point, alpha);
         return .{ .alpha = alpha, .t = a.add(c.mul(sigma)), .u = b.add(c.mul(ell)) };
     }
@@ -226,6 +257,32 @@ fn stChallenge(context: []const u8, r_point: Element, s_point: Element, t_point:
 /// `error.InvalidElement` only for an `r_point` that does not decode (the
 /// caller's `R` is always a valid non-identity point).
 pub fn proveSt(
+    sigma: *const Scalar,
+    ell: *const Scalar,
+    r_point: Element,
+    s_point: Element,
+    t_point: Element,
+    context: []const u8,
+    random: std.Random,
+) root.ElementError!StProof {
+    const result = proveStUnburned(sigma, ell, r_point, s_point, t_point, context, random);
+    burn.stack(prove_st_stack_burn);
+    return result;
+}
+
+noinline fn proveStUnburned(
+    sigma: *const Scalar,
+    ell: *const Scalar,
+    r_point: Element,
+    s_point: Element,
+    t_point: Element,
+    context: []const u8,
+    random: std.Random,
+) root.ElementError!StProof {
+    return proveStByValue(sigma.*, ell.*, r_point, s_point, t_point, context, random);
+}
+
+fn proveStByValue(
     sigma: Scalar,
     ell: Scalar,
     r_point: Element,
@@ -244,7 +301,7 @@ pub fn proveSt(
         }
         const alpha_pt = r_pt.mul(a.toBytes(.big), .big) catch continue;
         const alpha = Element.fromPoint(alpha_pt) catch continue;
-        const beta = pedersenCommit(a, b) catch continue;
+        const beta = pedersenCommit(&a, &b) catch continue;
         const c = stChallenge(context, r_point, s_point, t_point, alpha, beta);
         return .{ .alpha = alpha, .beta = beta, .t = a.add(c.mul(sigma)), .u = b.add(c.mul(ell)) };
     }
@@ -302,7 +359,17 @@ fn schnorrChallenge(context: []const u8, x_point: Element, r_point: Element) Sca
     return c.finish();
 }
 
-pub fn proveSchnorr(x: Scalar, x_point: Element, context: []const u8, random: std.Random) SchnorrProof {
+pub fn proveSchnorr(x: *const Scalar, x_point: Element, context: []const u8, random: std.Random) SchnorrProof {
+    const result = proveSchnorrUnburned(x, x_point, context, random);
+    burn.stack(prove_schnorr_stack_burn);
+    return result;
+}
+
+noinline fn proveSchnorrUnburned(x: *const Scalar, x_point: Element, context: []const u8, random: std.Random) SchnorrProof {
+    return proveSchnorrByValue(x.*, x_point, context, random);
+}
+
+fn proveSchnorrByValue(x: Scalar, x_point: Element, context: []const u8, random: std.Random) SchnorrProof {
     while (true) {
         var k = randomScalar(random);
         defer std.crypto.secureZero(u8, std.mem.asBytes(&k));
@@ -363,7 +430,17 @@ fn dleqChallenge(context: []const u8, r_point: Element, s_point: Element, sigma_
 
 /// Proves `log_R(S) = log_G(Σ) = σ`. `error.InvalidElement` only for an
 /// `r_point` that does not decode.
-pub fn proveDleq(sigma: Scalar, r_point: Element, s_point: Element, sigma_point: Element, context: []const u8, random: std.Random) root.ElementError!DleqProof {
+pub fn proveDleq(sigma: *const Scalar, r_point: Element, s_point: Element, sigma_point: Element, context: []const u8, random: std.Random) root.ElementError!DleqProof {
+    const result = proveDleqUnburned(sigma, r_point, s_point, sigma_point, context, random);
+    burn.stack(prove_dleq_stack_burn);
+    return result;
+}
+
+noinline fn proveDleqUnburned(sigma: *const Scalar, r_point: Element, s_point: Element, sigma_point: Element, context: []const u8, random: std.Random) root.ElementError!DleqProof {
+    return proveDleqByValue(sigma.*, r_point, s_point, sigma_point, context, random);
+}
+
+fn proveDleqByValue(sigma: Scalar, r_point: Element, s_point: Element, sigma_point: Element, context: []const u8, random: std.Random) root.ElementError!DleqProof {
     const r_pt = try r_point.point();
     while (true) {
         var a = randomScalar(random);
@@ -409,11 +486,12 @@ test "PedersenProof: honest accepts; wrong T, wrong context, every mangled field
     const random = prng.random();
     const sigma = randomScalar(random);
     const ell = randomScalar(random);
-    const t_point = try pedersenCommit(sigma, ell);
-    const proof = provePedersen(sigma, ell, t_point, "ctx", random);
+    const t_point = try pedersenCommit(&sigma, &ell);
+    const proof = provePedersen(&sigma, &ell, t_point, "ctx", random);
     try testing.expect(verifyPedersen(proof, t_point, "ctx"));
     try testing.expect(!verifyPedersen(proof, t_point, "ctx2"));
-    try testing.expect(!verifyPedersen(proof, try pedersenCommit(sigma, ell.add(Scalar.one)), "ctx"));
+    const ell1 = ell.add(Scalar.one);
+    try testing.expect(!verifyPedersen(proof, try pedersenCommit(&sigma, &ell1), "ctx"));
 
     var bad = proof;
     bad.t = bad.t.add(Scalar.one);
@@ -426,7 +504,7 @@ test "PedersenProof: honest accepts; wrong T, wrong context, every mangled field
     try testing.expect(!verifyPedersen(bad, t_point, "ctx"));
 
     // A prover who does not know (σ, ℓ) for T: a proof for another T.
-    const other = provePedersen(sigma, ell.add(Scalar.one), try pedersenCommit(sigma, ell.add(Scalar.one)), "ctx", random);
+    const other = provePedersen(&sigma, &ell1, try pedersenCommit(&sigma, &ell1), "ctx", random);
     try testing.expect(!verifyPedersen(other, t_point, "ctx"));
 
     const back = try PedersenProof.fromBytes(proof.toBytes());
@@ -458,20 +536,20 @@ test "StProof: honest accepts; S from another σ, T from another σ, wrong R, ma
     const r_point = pointOf(randomScalar(random));
     const r_pt = try r_point.point();
     const s_point = try Element.fromPoint(try r_pt.mul(sigma.toBytes(.big), .big));
-    const t_point = try pedersenCommit(sigma, ell);
+    const t_point = try pedersenCommit(&sigma, &ell);
 
-    const proof = try proveSt(sigma, ell, r_point, s_point, t_point, "ctx", random);
+    const proof = try proveSt(&sigma, &ell, r_point, s_point, t_point, "ctx", random);
     try testing.expect(verifySt(proof, r_point, s_point, t_point, "ctx"));
     try testing.expect(!verifySt(proof, r_point, s_point, t_point, "other"));
 
     // The cheat this proof exists for: S built from σ' ≠ σ (T still honest).
     const sigma2 = sigma.add(Scalar.one);
     const s_bad = try Element.fromPoint(try r_pt.mul(sigma2.toBytes(.big), .big));
-    const cheat = try proveSt(sigma2, ell, r_point, s_bad, t_point, "ctx", random);
+    const cheat = try proveSt(&sigma2, &ell, r_point, s_bad, t_point, "ctx", random);
     try testing.expect(!verifySt(cheat, r_point, s_bad, t_point, "ctx"));
     try testing.expect(!verifySt(proof, r_point, s_bad, t_point, "ctx"));
     try testing.expect(!verifySt(proof, pointOf(Scalar.one), s_point, t_point, "ctx"));
-    try testing.expect(!verifySt(proof, r_point, s_point, try pedersenCommit(sigma2, ell), "ctx"));
+    try testing.expect(!verifySt(proof, r_point, s_point, try pedersenCommit(&sigma2, &ell), "ctx"));
 
     var bad = proof;
     bad.t = bad.t.add(Scalar.one);
@@ -497,7 +575,8 @@ test "StProof: honest accepts; S from another σ, T from another σ, wrong R, ma
     for ([_]bool{ true, false }) |break_alpha| {
         const alpha_nonce = if (break_alpha) a.add(Scalar.one) else a;
         const alpha = try Element.fromPoint(try r_pt.mul(alpha_nonce.toBytes(.big), .big));
-        const beta = try pedersenCommit(a, if (break_alpha) b else b.add(Scalar.one));
+        const b_used = if (break_alpha) b else b.add(Scalar.one);
+        const beta = try pedersenCommit(&a, &b_used);
         const c = stChallenge("ctx", r_point, s_point, t_point, alpha, beta);
         const half: StProof = .{ .alpha = alpha, .beta = beta, .t = a.add(c.mul(sigma)), .u = b.add(c.mul(ell)) };
         try testing.expect(!verifySt(half, r_point, s_point, t_point, "ctx"));
@@ -509,7 +588,7 @@ test "SchnorrProof: honest accepts; foreign point, wrong context, mangled fields
     const random = prng.random();
     const x = randomScalar(random);
     const x_point = pointOf(x);
-    const proof = proveSchnorr(x, x_point, "ctx", random);
+    const proof = proveSchnorr(&x, x_point, "ctx", random);
     try testing.expect(verifySchnorr(proof, x_point, "ctx"));
     try testing.expect(!verifySchnorr(proof, x_point, "ctx2"));
     try testing.expect(!verifySchnorr(proof, pointOf(x.add(Scalar.one)), "ctx"));
@@ -530,7 +609,7 @@ test "DleqProof: honest accepts; S or Σ from another σ, wrong R, wrong context
     const r_point = pointOf(randomScalar(random));
     const s_point = try Element.fromPoint(try (try r_point.point()).mul(sigma.toBytes(.big), .big));
     const sigma_point = pointOf(sigma);
-    const proof = try proveDleq(sigma, r_point, s_point, sigma_point, "ctx", random);
+    const proof = try proveDleq(&sigma, r_point, s_point, sigma_point, "ctx", random);
     try testing.expect(verifyDleq(proof, r_point, s_point, sigma_point, "ctx"));
     try testing.expect(!verifyDleq(proof, r_point, s_point, sigma_point, "ctx2"));
     try testing.expect(!verifyDleq(proof, r_point, s_point, pointOf(sigma.add(Scalar.one)), "ctx"));
@@ -538,7 +617,8 @@ test "DleqProof: honest accepts; S or Σ from another σ, wrong R, wrong context
     try testing.expect(!verifyDleq(proof, r_point, s_other, sigma_point, "ctx"));
     try testing.expect(!verifyDleq(proof, pointOf(Scalar.one), s_point, sigma_point, "ctx"));
     // A prover whose σ is not the one behind Σ cannot make a proof that verifies.
-    const lying = try proveDleq(sigma.add(Scalar.one), r_point, s_point, sigma_point, "ctx", random);
+    const sigma_lie = sigma.add(Scalar.one);
+    const lying = try proveDleq(&sigma_lie, r_point, s_point, sigma_point, "ctx", random);
     try testing.expect(!verifyDleq(lying, r_point, s_point, sigma_point, "ctx"));
     var bad = proof;
     bad.t = bad.t.add(Scalar.one);
@@ -580,13 +660,13 @@ test "DleqProof: each equation is load-bearing, and the challenge binds Σ" {
     const s_true = try Element.fromPoint(try (try r_point.point()).mul(sigma.toBytes(.big), .big));
     const s_other = try Element.fromPoint(try (try r_point.point()).mul(other.toBytes(.big), .big));
     // The witness matches Σ = σ'·G but S = σ·R: only S R-equation can refuse.
-    const split_s = try proveDleq(other, r_point, s_true, pointOf(other), "ctx", random);
+    const split_s = try proveDleq(&other, r_point, s_true, pointOf(other), "ctx", random);
     try testing.expect(!verifyDleq(split_s, r_point, s_true, pointOf(other), "ctx"));
     // The witness matches S = σ'·R but Σ = σ·G: only the G-equation can refuse.
-    const split_g = try proveDleq(other, r_point, s_other, pointOf(sigma), "ctx", random);
+    const split_g = try proveDleq(&other, r_point, s_other, pointOf(sigma), "ctx", random);
     try testing.expect(!verifyDleq(split_g, r_point, s_other, pointOf(sigma), "ctx"));
     // Control: a consistent statement verifies.
-    const ok = try proveDleq(other, r_point, s_other, pointOf(other), "ctx", random);
+    const ok = try proveDleq(&other, r_point, s_other, pointOf(other), "ctx", random);
     try testing.expect(verifyDleq(ok, r_point, s_other, pointOf(other), "ctx"));
     // The challenge depends on Σ.
     const a = pointOf(Scalar.one);

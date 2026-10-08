@@ -73,6 +73,19 @@ const root = @import("root.zig");
 const zkproofs = @import("zkproofs.zig");
 const montint = @import("montint");
 const gate = @import("gate.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const piprm_prove_stack_burn = 640 * 1024;
+const piprm_prove_bound_stack_burn = 640 * 1024;
+const pimod_prove_stack_burn = 640 * 1024;
+const pimod_prove_bound_stack_burn = 640 * 1024;
+const prove_paillier_stack_burn = 576 * 1024;
+const prove_well_formed_stack_burn = 1280 * 1024;
+const prove_well_formed_bound_stack_burn = 1280 * 1024;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -804,6 +817,26 @@ pub const Piprm = struct {
     pub fn prove(
         allocator: std.mem.Allocator,
         aux: root.AuxParams,
+        trapdoor: *const root.AuxTrapdoor,
+        random: std.Random,
+    ) ProveError!PrmProof {
+        const result = proveUnburned(allocator, aux, trapdoor, random);
+        burn.stack(piprm_prove_stack_burn);
+        return result;
+    }
+
+    noinline fn proveUnburned(
+        allocator: std.mem.Allocator,
+        aux: root.AuxParams,
+        trapdoor: *const root.AuxTrapdoor,
+        random: std.Random,
+    ) ProveError!PrmProof {
+        return proveByValue(allocator, aux, trapdoor.*, random);
+    }
+
+    fn proveByValue(
+        allocator: std.mem.Allocator,
+        aux: root.AuxParams,
         trapdoor: root.AuxTrapdoor,
         random: std.Random,
     ) ProveError!PrmProof {
@@ -813,6 +846,28 @@ pub const Piprm = struct {
     /// `prove`, bound to the prover's `context` (`session id || prover
     /// index`): verifies only under `verifyBound` with the same context.
     pub fn proveBound(
+        allocator: std.mem.Allocator,
+        aux: root.AuxParams,
+        trapdoor: *const root.AuxTrapdoor,
+        context: []const u8,
+        random: std.Random,
+    ) ProveError!PrmProof {
+        const result = proveBoundUnburned(allocator, aux, trapdoor, context, random);
+        burn.stack(piprm_prove_bound_stack_burn);
+        return result;
+    }
+
+    noinline fn proveBoundUnburned(
+        allocator: std.mem.Allocator,
+        aux: root.AuxParams,
+        trapdoor: *const root.AuxTrapdoor,
+        context: []const u8,
+        random: std.Random,
+    ) ProveError!PrmProof {
+        return proveBoundByValue(allocator, aux, trapdoor.*, context, random);
+    }
+
+    fn proveBoundByValue(
         allocator: std.mem.Allocator,
         aux: root.AuxParams,
         trapdoor: root.AuxTrapdoor,
@@ -1033,6 +1088,26 @@ pub const Pimod = struct {
     pub fn prove(
         allocator: std.mem.Allocator,
         aux: root.AuxParams,
+        trapdoor: *const root.AuxTrapdoor,
+        random: std.Random,
+    ) ProveError!ModProof {
+        const result = proveUnburned(allocator, aux, trapdoor, random);
+        burn.stack(pimod_prove_stack_burn);
+        return result;
+    }
+
+    noinline fn proveUnburned(
+        allocator: std.mem.Allocator,
+        aux: root.AuxParams,
+        trapdoor: *const root.AuxTrapdoor,
+        random: std.Random,
+    ) ProveError!ModProof {
+        return proveByValue(allocator, aux, trapdoor.*, random);
+    }
+
+    fn proveByValue(
+        allocator: std.mem.Allocator,
+        aux: root.AuxParams,
         trapdoor: root.AuxTrapdoor,
         random: std.Random,
     ) ProveError!ModProof {
@@ -1042,6 +1117,28 @@ pub const Pimod = struct {
     /// `prove`, bound to the prover's `context` (`session id || prover
     /// index`): verifies only under `verifyBound` with the same context.
     pub fn proveBound(
+        allocator: std.mem.Allocator,
+        aux: root.AuxParams,
+        trapdoor: *const root.AuxTrapdoor,
+        context: []const u8,
+        random: std.Random,
+    ) ProveError!ModProof {
+        const result = proveBoundUnburned(allocator, aux, trapdoor, context, random);
+        burn.stack(pimod_prove_bound_stack_burn);
+        return result;
+    }
+
+    noinline fn proveBoundUnburned(
+        allocator: std.mem.Allocator,
+        aux: root.AuxParams,
+        trapdoor: *const root.AuxTrapdoor,
+        context: []const u8,
+        random: std.Random,
+    ) ProveError!ModProof {
+        return proveBoundByValue(allocator, aux, trapdoor.*, context, random);
+    }
+
+    fn proveBoundByValue(
         allocator: std.mem.Allocator,
         aux: root.AuxParams,
         trapdoor: root.AuxTrapdoor,
@@ -1057,6 +1154,19 @@ pub const Pimod = struct {
     /// other parties trust an `N` they did not generate (CGGMP21 §4, Fig.16;
     /// the BitForge class without it). `p`/`q` are big-endian, SECRET.
     pub fn provePaillier(
+        allocator: std.mem.Allocator,
+        n: root.AuxModulus,
+        p: []const u8,
+        q: []const u8,
+        context: []const u8,
+        random: std.Random,
+    ) ProveError!ModProof {
+        const result = provePaillierUnburned(allocator, n, p, q, context, random);
+        burn.stack(prove_paillier_stack_burn);
+        return result;
+    }
+
+    noinline fn provePaillierUnburned(
         allocator: std.mem.Allocator,
         n: root.AuxModulus,
         p: []const u8,
@@ -1376,12 +1486,32 @@ pub const VerifyError = error{
 pub fn proveWellFormed(
     allocator: std.mem.Allocator,
     aux: root.AuxParams,
+    trapdoor: *const root.AuxTrapdoor,
+    random: std.Random,
+) ProveError!WellFormedProof {
+    const result = proveWellFormedUnburned(allocator, aux, trapdoor, random);
+    burn.stack(prove_well_formed_stack_burn);
+    return result;
+}
+
+noinline fn proveWellFormedUnburned(
+    allocator: std.mem.Allocator,
+    aux: root.AuxParams,
+    trapdoor: *const root.AuxTrapdoor,
+    random: std.Random,
+) ProveError!WellFormedProof {
+    return proveWellFormedByValue(allocator, aux, trapdoor.*, random);
+}
+
+fn proveWellFormedByValue(
+    allocator: std.mem.Allocator,
+    aux: root.AuxParams,
     trapdoor: root.AuxTrapdoor,
     random: std.Random,
 ) ProveError!WellFormedProof {
     return .{
-        .prm = try Piprm.prove(allocator, aux, trapdoor, random),
-        .mod = try Pimod.prove(allocator, aux, trapdoor, random),
+        .prm = try Piprm.prove(allocator, aux, &trapdoor, random),
+        .mod = try Pimod.prove(allocator, aux, &trapdoor, random),
     };
 }
 
@@ -1391,13 +1521,35 @@ pub fn proveWellFormed(
 pub fn proveWellFormedBound(
     allocator: std.mem.Allocator,
     aux: root.AuxParams,
+    trapdoor: *const root.AuxTrapdoor,
+    context: []const u8,
+    random: std.Random,
+) ProveError!WellFormedProof {
+    const result = proveWellFormedBoundUnburned(allocator, aux, trapdoor, context, random);
+    burn.stack(prove_well_formed_bound_stack_burn);
+    return result;
+}
+
+noinline fn proveWellFormedBoundUnburned(
+    allocator: std.mem.Allocator,
+    aux: root.AuxParams,
+    trapdoor: *const root.AuxTrapdoor,
+    context: []const u8,
+    random: std.Random,
+) ProveError!WellFormedProof {
+    return proveWellFormedBoundByValue(allocator, aux, trapdoor.*, context, random);
+}
+
+fn proveWellFormedBoundByValue(
+    allocator: std.mem.Allocator,
+    aux: root.AuxParams,
     trapdoor: root.AuxTrapdoor,
     context: []const u8,
     random: std.Random,
 ) ProveError!WellFormedProof {
     return .{
-        .prm = try Piprm.proveBound(allocator, aux, trapdoor, context, random),
-        .mod = try Pimod.proveBound(allocator, aux, trapdoor, context, random),
+        .prm = try Piprm.proveBound(allocator, aux, &trapdoor, context, random),
+        .mod = try Pimod.proveBound(allocator, aux, &trapdoor, context, random),
     };
 }
 
@@ -1606,7 +1758,7 @@ test "F1 soundness (a) — 3-prime n_tilde: Pimod.verify REJECTS it (documents t
         .lambda = aux.h1, // placeholder — this scenario is about n_tilde's factorization shape
     };
 
-    const maybe_proof = Pimod.prove(allocator, aux, fake_trapdoor, random);
+    const maybe_proof = Pimod.prove(allocator, aux, &fake_trapdoor, random);
     if (maybe_proof) |proof| {
         try testing.expect(!Pimod.verify(aux, proof));
     } else |_| {
@@ -1685,10 +1837,11 @@ test "Πprm+Πmod completeness: honest generateAuxParamsWithTrapdoor -> proveWel
     const random = prng.random();
 
     const bits: usize = 128; // fast test size; production uses root.aux_modulus_bits
-    const gen = try root.generateAuxParamsWithTrapdoor(allocator, random, bits);
+    var gen: root.AuxParamsWithTrapdoor = undefined;
+    try root.generateAuxParamsWithTrapdoor(allocator, random, bits, &gen);
     defer gen.trapdoor.deinit(allocator);
 
-    const proof = try proveWellFormed(allocator, gen.params, gen.trapdoor, random);
+    const proof = try proveWellFormed(allocator, gen.params, &gen.trapdoor, random);
     try verifyProofs(gen.params, proof);
 }
 
@@ -1698,22 +1851,23 @@ test "bound Πprm/Πmod over Ñ: verify only under the prover's context, never a
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x626f756e64); // "bound"
     const random = prng.random();
-    const gen = try root.generateAuxParamsWithTrapdoor(allocator, random, 128);
+    var gen: root.AuxParamsWithTrapdoor = undefined;
+    try root.generateAuxParamsWithTrapdoor(allocator, random, 128, &gen);
     defer gen.trapdoor.deinit(allocator);
     const aux = gen.params;
     const ctx_a = "session-7" ++ [_]u8{ 0, 0, 0, 1 };
     const ctx_b = "session-7" ++ [_]u8{ 0, 0, 0, 2 };
 
-    const prm = try Piprm.proveBound(allocator, aux, gen.trapdoor, ctx_a, random);
+    const prm = try Piprm.proveBound(allocator, aux, &gen.trapdoor, ctx_a, random);
     try testing.expect(Piprm.verifyBound(aux, ctx_a, prm));
     try testing.expect(!Piprm.verifyBound(aux, ctx_b, prm));
     try testing.expect(!Piprm.verify(aux, prm));
-    const mod = try Pimod.proveBound(allocator, aux, gen.trapdoor, ctx_a, random);
+    const mod = try Pimod.proveBound(allocator, aux, &gen.trapdoor, ctx_a, random);
     try testing.expect(Pimod.verifyBound(aux, ctx_a, mod));
     try testing.expect(!Pimod.verifyBound(aux, ctx_b, mod));
     try testing.expect(!Pimod.verify(aux, mod));
     // …and an unbound proof does not pass as a bound one.
-    const unbound = try proveWellFormed(allocator, aux, gen.trapdoor, random);
+    const unbound = try proveWellFormed(allocator, aux, &gen.trapdoor, random);
     try testing.expect(!Piprm.verifyBound(aux, ctx_a, unbound.prm));
     try testing.expect(!Pimod.verifyBound(aux, ctx_a, unbound.mod));
 }
@@ -1728,10 +1882,11 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
     const random = prng.random();
 
     const bits: usize = 128;
-    const gen = try root.generateAuxParamsWithTrapdoor(allocator, random, bits);
+    var gen: root.AuxParamsWithTrapdoor = undefined;
+    try root.generateAuxParamsWithTrapdoor(allocator, random, bits, &gen);
     defer gen.trapdoor.deinit(allocator);
 
-    const proof = try proveWellFormed(allocator, gen.params, gen.trapdoor, random);
+    const proof = try proveWellFormed(allocator, gen.params, &gen.trapdoor, random);
     try verifyProofs(gen.params, proof); // sanity: the honest proof accepts
 
     const nt = gen.params.n_tilde;
@@ -1880,9 +2035,11 @@ test "F10: an honest proof over a tuple below the q⁷ floor passes the proofs b
     var prng = std.Random.DefaultPrng.init(0xF10_0001);
     const random = prng.random();
 
-    const gen = try root.generateAuxParamsWithTrapdoor(allocator, random, 128);
+    var gen: root.AuxParamsWithTrapdoor = undefined;
+
+    try root.generateAuxParamsWithTrapdoor(allocator, random, 128, &gen);
     defer gen.trapdoor.deinit(allocator);
-    const proof = try proveWellFormed(allocator, gen.params, gen.trapdoor, random);
+    const proof = try proveWellFormed(allocator, gen.params, &gen.trapdoor, random);
 
     try verifyProofs(gen.params, proof); // Πprm and Πmod both hold …
     try testing.expectError(error.InvalidAuxParams, gen.params.validate(random)); // … over a tuple validate refuses
@@ -1901,7 +2058,7 @@ test "F10: verifyWellFormed accepts an honest tuple above the q⁷ floor, and st
     const gen = try floorAuxWithTrapdoor(allocator, random);
     defer gen.trapdoor.deinit(allocator);
     try gen.params.validate(random); // the fixture itself clears the floor
-    const proof = try proveWellFormed(allocator, gen.params, gen.trapdoor, random);
+    const proof = try proveWellFormed(allocator, gen.params, &gen.trapdoor, random);
     try verifyWellFormed(gen.params, proof, random);
 
     var tampered = proof;
@@ -2076,7 +2233,8 @@ fn tssPaillier(party: usize, p: *[128]u8, q: *[128]u8) !root.AuxModulus {
     const pp = tss_vectors.tsslib_keygen.parties[party];
     _ = try std.fmt.hexToBytes(p, pp.paillier_p);
     _ = try std.fmt.hexToBytes(q, pp.paillier_q);
-    const kp = try @import("paillier").fromPrimes(p, q);
+    var kp: @import("paillier").KeyPair = undefined;
+    try @import("paillier").fromPrimes(p, q, &kp);
     return root.paillierModulusAsAux(kp.public) orelse error.TestUnexpectedResult;
 }
 
@@ -2104,7 +2262,8 @@ test "Πmod/Paillier: tss-lib's 2048-bit N verifies, bound to its context and it
 test "Πmod/Paillier: generatePaillierBlum keys are Blum and prove" {
     var prng = std.Random.DefaultPrng.init(0x6d6f_6432);
     const random = prng.random();
-    var key = try root.generatePaillierBlum(random, 512);
+    var key: root.PaillierBlumKey = undefined;
+    try root.generatePaillierBlum(random, 512, &key);
     defer key.wipe();
     try testing.expectEqual(@as(u8, 3), key.p()[key.p().len - 1] & 3);
     try testing.expectEqual(@as(u8, 3), key.q()[key.q().len - 1] & 3);
@@ -2113,8 +2272,9 @@ test "Πmod/Paillier: generatePaillierBlum keys are Blum and prove" {
     const proof = try Pimod.provePaillier(testing.allocator, n, key.p(), key.q(), "c", random);
     try testing.expect(Pimod.verifyPaillier(n, "c", proof));
 
-    try testing.expectError(error.InvalidBits, root.generatePaillierBlum(random, 511));
-    try testing.expectError(error.InvalidBits, root.generatePaillierBlum(random, 256));
+    var scratch_key: root.PaillierBlumKey = undefined;
+    try testing.expectError(error.InvalidBits, root.generatePaillierBlum(random, 511, &scratch_key));
+    try testing.expectError(error.InvalidBits, root.generatePaillierBlum(random, 256, &scratch_key));
 }
 
 test "Πmod/Paillier TEETH: a modulus with a factor ≡ 1 (mod 4) is refused" {
@@ -2184,11 +2344,12 @@ test "mutation audit: verifyWellFormedBound runs the structural floor, honest bo
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x666c6f6f72); // "floor"
     const random = prng.random();
-    const gen = try root.generateAuxParamsWithTrapdoor(allocator, random, 128);
+    var gen: root.AuxParamsWithTrapdoor = undefined;
+    try root.generateAuxParamsWithTrapdoor(allocator, random, 128, &gen);
     defer gen.trapdoor.deinit(allocator);
     const aux = gen.params;
     const ctx = "floor-ctx";
-    const proof = try proveWellFormedBound(allocator, aux, gen.trapdoor, ctx, random);
+    const proof = try proveWellFormedBound(allocator, aux, &gen.trapdoor, ctx, random);
     // Both proofs verify on their own (a 128-bit Ñ is a fine toy modulus)…
     try testing.expect(Piprm.verifyBound(aux, ctx, proof.prm));
     try testing.expect(Pimod.verifyBound(aux, ctx, proof.mod));

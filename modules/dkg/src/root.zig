@@ -41,6 +41,13 @@
 //! discriminates (it still catches the poisoned key).
 
 const std = @import("std");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const assemble_key_shares_stack_burn = 80 * 1024;
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -154,6 +161,19 @@ pub fn assembleKeyShares(
     aux_params: []const tecdsa.AuxParams,
     message_seeds: []const [32]u8,
 ) AssembleError![]tecdsa.KeyShare {
+    const result = assembleKeySharesUnburned(allocator, outputs, t, paillier_keys, aux_params, message_seeds);
+    burn.stack(assemble_key_shares_stack_burn);
+    return result;
+}
+
+noinline fn assembleKeySharesUnburned(
+    allocator: std.mem.Allocator,
+    outputs: []const DkgShareOutput,
+    t: u32,
+    paillier_keys: []const paillier.KeyPair,
+    aux_params: []const tecdsa.AuxParams,
+    message_seeds: []const [32]u8,
+) AssembleError![]tecdsa.KeyShare {
     const n = outputs.len;
     if (paillier_keys.len != n or aux_params.len != n or message_seeds.len != n) return error.LengthMismatch;
 
@@ -210,7 +230,8 @@ fn sampleFeBelow(m: tecdsa.AuxModulus, random: std.Random) tecdsa.AuxFe {
 }
 
 fn testAuxParams(random: std.Random) !tecdsa.AuxParams {
-    const nt_kp = try paillier.generate(random, 2048);
+    var nt_kp: paillier.KeyPair = undefined;
+    try paillier.generate(random, 2048, &nt_kp);
     var nt_buf: [paillier.modulus_bytes]u8 = undefined;
     const nt_len = nt_kp.public.nByteLen();
     try nt_kp.public.nToBytes(nt_buf[0..nt_len]);
@@ -248,7 +269,7 @@ test "END-TO-END ANCHOR: DKG shares -> threshold sign -> std ECDSA verify under 
     defer allocator.free(message_seeds);
     for (message_seeds, 1..) |*sd, i| sd.* = @splat(@intCast(i));
     for (0..cfg.n) |i| {
-        paillier_keys[i] = try paillier.generate(random, 2048);
+        try paillier.generate(random, 2048, &paillier_keys[i]);
         aux_params[i] = try testAuxParams(random);
     }
     const key_shares = try assembleKeyShares(allocator, outs, cfg.t, paillier_keys, aux_params, message_seeds);
@@ -293,7 +314,7 @@ test "END-TO-END (per-participant): DKG over frames -> sign -> refresh -> sign a
     defer allocator.free(message_seeds);
     for (message_seeds, 1..) |*sd, i| sd.* = @splat(@intCast(i));
     for (0..cfg.n) |i| {
-        paillier_keys[i] = try paillier.generate(random, 2048);
+        try paillier.generate(random, 2048, &paillier_keys[i]);
         aux_params[i] = try testAuxParams(random);
     }
     const ecdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
@@ -348,4 +369,5 @@ test {
     _ = wire;
     _ = participant;
     _ = reshare;
+    _ = @import("stackprobe_test.zig");
 }

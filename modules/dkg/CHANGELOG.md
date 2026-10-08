@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the new ReleaseFast stack
+  probe (`src/stackprobe_test.zig`, five tests: every GJKR participant call, every reshare dealer
+  and receiver call, every ECDSA keygen and refresh call, the commitment/share-check/driver
+  functions) found the dealing polynomials, the shares and the output share in dead frames after
+  `init`, `start`, `handle` and `advance`, and the new `KeyShare` (share, Paillier key, seed) after
+  the last keygen/refresh round. Each entry point now burns its stack (`burn.zig`, sized from the
+  measured depth — up to ~2 MiB for `EcdsaKeygen.start`, whose announcement runs the aux proofs),
+  and secrets cross the API by pointer: `ReshareDealer.init`/`initWithCoefficients(old_share:
+  *const DkgShareOutput)`, `EcdsaRefresh.init(current: *const KeyShare)`,
+  `verifyPedersenShare`/`verifyFeldmanShare` (shares by pointer), `combineKeyShare(…, out)`,
+  `commit.randomScalar(random, out)`, `commit.evalPoly(coeffs, x, out)`,
+  `pedersenEvalShare`/`feldmanEvalShare` (shares by pointer). `takeKeyShare(out) bool` now also
+  wipes the copy it keeps (setting the optional to null left it in the struct). 0 residues after.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: "Out of scope" no longer calls the GJKR recovery branch a hard error — it landed 2026-10-01, as the Backlog already records.
 - **2026-10-04** — `EcdsaRefresh` refuses new aux material that repeats a modulus or the
   message key of the old table — this party's own at `start`, a peer's in the announce round

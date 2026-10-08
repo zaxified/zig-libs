@@ -62,6 +62,16 @@ const reshare = @import("reshare.zig");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
 const ecdsa_keygen = @import("ecdsa_keygen.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const init_stack_burn = 192 * 1024;
+const start_stack_burn = 1984 * 1024;
+const handle_stack_burn = 768 * 1024;
+const advance_stack_burn = 1408 * 1024;
 
 const aux_info = tecdsa.aux_info;
 const fac_proof = tecdsa.fac_proof;
@@ -138,6 +148,28 @@ pub const EcdsaRefresh = struct {
     /// CSPRNG.
     pub fn init(
         allocator: std.mem.Allocator,
+        current: *const tecdsa.KeyShare,
+        session_id: []const u8,
+        local: *const aux_info.LocalAux,
+        random: std.Random,
+    ) InitError!EcdsaRefresh {
+        const result = initUnburned(allocator, current, session_id, local, random);
+        burn.stack(init_stack_burn);
+        return result;
+    }
+
+    noinline fn initUnburned(
+        allocator: std.mem.Allocator,
+        current: *const tecdsa.KeyShare,
+        session_id: []const u8,
+        local: *const aux_info.LocalAux,
+        random: std.Random,
+    ) InitError!EcdsaRefresh {
+        return initByValue(allocator, current.*, session_id, local, random);
+    }
+
+    fn initByValue(
+        allocator: std.mem.Allocator,
         current: tecdsa.KeyShare,
         session_id: []const u8,
         local: *const aux_info.LocalAux,
@@ -160,12 +192,14 @@ pub const EcdsaRefresh = struct {
             .group_public_key = current.group_public_key,
             .old_verifying_shares = old_xs,
         };
-        var dealer = try reshare.ReshareDealer.init(allocator, .{
+        var old_out: types.DkgShareOutput = .{
             .index = current.index,
             .secret_share = current.secret_share,
             .group_public_key = current.group_public_key,
             .verifying_share = current.verifying_share,
-        }, cfg, random);
+        };
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&old_out));
+        var dealer = try reshare.ReshareDealer.init(allocator, &old_out, cfg, random);
         errdefer dealer.deinit();
         var receiver = try reshare.ReshareReceiver.init(allocator, rc, current.index);
         errdefer receiver.deinit();
@@ -236,11 +270,19 @@ pub const EcdsaRefresh = struct {
     /// after every party confirmed the same key table. The caller frees
     /// `share.public_keys.entries` with the allocator given to `init`, and
     /// erases the old share it replaces.
-    pub fn takeKeyShare(self: *EcdsaRefresh) ?tecdsa.KeyShare {
-        if (self.phase_ != .done) return null;
-        const s = self.share orelse return null;
+    ///
+    /// Moves the share into `out` and returns true, or returns false with
+    /// `out` untouched. The copy kept here is wiped: setting the optional to
+    /// null alone left the key share, Paillier secret key and message seed in
+    /// this struct's memory. Out-param, not a return value: a `KeyShare`
+    /// returned by value leaves a copy in the caller's frame.
+    pub fn takeKeyShare(self: *EcdsaRefresh, out: *tecdsa.KeyShare) bool {
+        if (self.phase_ != .done) return false;
+        if (self.share == null) return false;
+        out.* = self.share.?;
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.share.?));
         self.share = null;
-        return s;
+        return true;
     }
 
     /// Everything queued to send; free with `wire.freeOutgoing(allocator, msgs)`.
@@ -250,6 +292,12 @@ pub const EcdsaRefresh = struct {
 
     /// Round 1: broadcast this party's new announcement.
     pub fn start(self: *EcdsaRefresh) StartError!void {
+        const result = startUnburned(self);
+        burn.stack(start_stack_burn);
+        return result;
+    }
+
+    noinline fn startUnburned(self: *EcdsaRefresh) StartError!void {
         if (self.phase_ != .new) return error.WrongRound;
         var ctx_buf: [ecdsa_keygen.EcdsaKeygen.ctx_max]u8 = undefined;
         const ann = try self.local.announce(self.allocator, self.context(&ctx_buf, self.me), self.random);
@@ -265,6 +313,12 @@ pub const EcdsaRefresh = struct {
     /// round is refused with `WrongRound` (hold it, redeliver after
     /// `advance`); a refused frame changes nothing.
     pub fn handle(self: *EcdsaRefresh, from: u32, tagged: []const u8) reshare.MessageError!void {
+        const result = handleUnburned(self, from, tagged);
+        burn.stack(handle_stack_burn);
+        return result;
+    }
+
+    noinline fn handleUnburned(self: *EcdsaRefresh, from: u32, tagged: []const u8) reshare.MessageError!void {
         switch (self.phase_) {
             .done => return error.Finished,
             .aborted => return error.Aborted,
@@ -311,6 +365,12 @@ pub const EcdsaRefresh = struct {
     /// Close the current round and move on. Any error leaves the party
     /// `.aborted`.
     pub fn advance(self: *EcdsaRefresh) AdvanceError!void {
+        const result = advanceUnburned(self);
+        burn.stack(advance_stack_burn);
+        return result;
+    }
+
+    noinline fn advanceUnburned(self: *EcdsaRefresh) AdvanceError!void {
         const r = switch (self.phase_) {
             .new => return error.WrongRound,
             .announce => self.advanceAnnounce(),
@@ -408,12 +468,14 @@ pub const EcdsaRefresh = struct {
     fn advanceDefenses(self: *EcdsaRefresh) AdvanceError!void {
         try self.receiver.advance(); // defenses -> done
         const out = self.receiver.output() orelse return error.Inconsistent;
-        const share = try aux_info.assembleKeyShare(
+        var share: tecdsa.KeyShare = undefined;
+        try aux_info.assembleKeyShare(
             self.allocator,
             self.checked.?.verified().?, // every check passed in the earlier rounds
-            out.secret_share,
+            &out.secret_share,
             self.receiver.publicCommitments().?,
             self.local,
+            &share,
         );
         if (!std.mem.eql(u8, &share.group_public_key.toBytes(), &self.group_public_key.toBytes())) {
             self.allocator.free(share.public_keys.entries);
@@ -540,9 +602,11 @@ const testing = std.testing;
 
 /// Test-only `LocalAux` from Blum primes (see `ecdsa_keygen.zig`'s twin).
 fn quickLocal(allocator: std.mem.Allocator, random: std.Random) !aux_info.LocalAux {
-    var key = try tecdsa.generatePaillierBlum(random, 2048);
+    var key: tecdsa.PaillierBlumKey = undefined;
+    try tecdsa.generatePaillierBlum(random, 2048, &key);
     errdefer key.wipe();
-    var ring = try tecdsa.generatePaillierBlum(random, 2048);
+    var ring: tecdsa.PaillierBlumKey = undefined;
+    try tecdsa.generatePaillierBlum(random, 2048, &ring);
     defer ring.wipe();
     const nt = ring.modulus();
     var buf: [tecdsa.aux_modulus_bytes]u8 = undefined;
@@ -558,7 +622,11 @@ fn quickLocal(allocator: std.mem.Allocator, random: std.Random) !aux_info.LocalA
     const q = try allocator.dupe(u8, ring.q());
     var seed: [32]u8 = undefined;
     random.bytes(&seed);
-    return aux_info.LocalAux.fromParts(key, .{ .n_tilde = nt, .h1 = h1, .h2 = h2 }, .{ .p = p, .q = q, .lambda = lambda }, seed);
+    const aux: tecdsa.AuxParams = .{ .n_tilde = nt, .h1 = h1, .h2 = h2 };
+    var trapdoor: tecdsa.AuxTrapdoor = .{ .p = p, .q = q, .lambda = lambda };
+    var local: aux_info.LocalAux = undefined;
+    aux_info.LocalAux.fromParts(&key, aux, &trapdoor, &seed, &local);
+    return local;
 }
 
 /// Lockstep driver over any party type with `start`/`advance`/`handle`/
@@ -599,7 +667,7 @@ fn keygen(allocator: std.mem.Allocator, random: std.Random, locals: []aux_info.L
     while (inited < 3) : (inited += 1) parties[inited] = try ecdsa_keygen.EcdsaKeygen.init(allocator, cfg, @intCast(inited + 1), sid, &locals[inited], random);
     try testing.expectEqual(@as(usize, 0), try runAll(ecdsa_keygen.EcdsaKeygen, allocator, &parties, null));
     var out: [3]tecdsa.KeyShare = undefined;
-    for (&parties, &out) |*p, *s| s.* = p.takeKeyShare().?;
+    for (&parties, &out) |*p, *s| try testing.expect(p.takeKeyShare(s));
     return out;
 }
 
@@ -607,7 +675,7 @@ fn refresh(allocator: std.mem.Allocator, random: std.Random, old: []const tecdsa
     var parties: [3]EcdsaRefresh = undefined;
     var inited: usize = 0;
     defer for (parties[0..inited]) |*p| p.deinit();
-    while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, old[inited], sid, &locals[inited], random);
+    while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, &old[inited], sid, &locals[inited], random);
     const refused = try runAll(EcdsaRefresh, allocator, &parties, null);
     // Only the excluded dealer's frames are refused (its broadcast, and its
     // shares and anything after, by each of the two other receivers).
@@ -619,7 +687,7 @@ fn refresh(allocator: std.mem.Allocator, random: std.Random, old: []const tecdsa
         if (excluded) |x| try testing.expect(std.mem.indexOfScalar(u32, used, x) == null);
     }
     var out: [3]tecdsa.KeyShare = undefined;
-    for (&parties, &out) |*p, *s| s.* = p.takeKeyShare().?;
+    for (&parties, &out) |*p, *s| try testing.expect(p.takeKeyShare(s));
     return out;
 }
 
@@ -733,7 +801,7 @@ test "refresh: a missing, replayed or tampered frame and a shared modulus abort 
         var parties: [3]EcdsaRefresh = undefined;
         var inited: usize = 0;
         defer for (parties[0..inited]) |*p| p.deinit();
-        while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, kg.key_shares[inited], "refresh-fault-1", &locals[inited], random);
+        while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, &kg.key_shares[inited], "refresh-fault-1", &locals[inited], random);
         for (&parties) |*p| try p.start();
         const from1 = try parties[0].takeOutgoing();
         defer wire.freeOutgoing(allocator, from1);
@@ -753,7 +821,7 @@ test "refresh: a missing, replayed or tampered frame and a shared modulus abort 
         var parties: [3]EcdsaRefresh = undefined;
         var inited: usize = 0;
         defer for (parties[0..inited]) |*p| p.deinit();
-        while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, kg.key_shares[inited], "refresh-fault-2", &locals[inited], random);
+        while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, &kg.key_shares[inited], "refresh-fault-2", &locals[inited], random);
         for (&parties) |*p| try p.start();
         try deliverAll(allocator, &parties, null);
         for (&parties) |*p| try p.advance();
@@ -779,7 +847,7 @@ test "refresh: a missing, replayed or tampered frame and a shared modulus abort 
         var parties: [3]EcdsaRefresh = undefined;
         var inited: usize = 0;
         defer for (parties[0..inited]) |*p| p.deinit();
-        while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, kg.key_shares[inited], "refresh-fault-3", if (inited == 2) &twin else &locals[inited], random);
+        while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, &kg.key_shares[inited], "refresh-fault-3", if (inited == 2) &twin else &locals[inited], random);
         for (&parties) |*p| try p.start();
         try deliverAll(allocator, &parties, null);
         try testing.expectError(error.DuplicateModulus, parties[0].advance());
@@ -798,13 +866,13 @@ test "refresh: frames of another session or of a keygen are refused by the run t
     while (made < 3) : (made += 1) locals[made] = try quickLocal(allocator, random);
 
     // Run "epoch-7a" aborted; its frames must not count in the retry "epoch-7b".
-    var old_run = try EcdsaRefresh.init(allocator, kg.key_shares[1], "epoch-7a", &locals[1], random);
+    var old_run = try EcdsaRefresh.init(allocator, &kg.key_shares[1], "epoch-7a", &locals[1], random);
     defer old_run.deinit();
     try old_run.start();
     const stale = try old_run.takeOutgoing();
     defer wire.freeOutgoing(allocator, stale);
 
-    var retry = try EcdsaRefresh.init(allocator, kg.key_shares[0], "epoch-7b", &locals[0], random);
+    var retry = try EcdsaRefresh.init(allocator, &kg.key_shares[0], "epoch-7b", &locals[0], random);
     defer retry.deinit();
     try retry.start();
     try testing.expectError(error.WrongSession, retry.handle(2, stale[0].bytes));
@@ -839,7 +907,7 @@ test "refresh: parties that end with different key tables abort in the confirmat
     var parties: [3]EcdsaRefresh = undefined;
     var inited: usize = 0;
     defer for (parties[0..inited]) |*p| p.deinit();
-    while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, kg.key_shares[inited], "refresh-split", &locals[inited], random);
+    while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, &kg.key_shares[inited], "refresh-split", &locals[inited], random);
     for (&parties) |*p| try p.start();
 
     // A transport that hides dealer 2 from party 3 (and only from party 3):
@@ -870,7 +938,8 @@ test "refresh: parties that end with different key tables abort in the confirmat
         // Nobody finished: whoever saw the split stopped, and its peers then
         // missed its confirmation (or saw a different one).
         try testing.expect(p.phase() != .done);
-        try testing.expect(p.takeKeyShare() == null);
+        var scratch: tecdsa.KeyShare = undefined;
+        try testing.expect(!p.takeKeyShare(&scratch));
         if (e) |err| {
             if (err == error.ConfirmationMismatch) mismatches += 1;
         }
@@ -891,16 +960,16 @@ test "refresh: aux material of the old table is refused, from this party and fro
 
     // This party starts with its old LocalAux: refused before anything is sent.
     {
-        var p = try EcdsaRefresh.init(allocator, old[0], "stale-1", &locals[0], random);
+        var p = try EcdsaRefresh.init(allocator, &old[0], "stale-1", &locals[0], random);
         defer p.deinit();
         try testing.expectError(error.StaleAuxMaterial, p.start());
     }
     // Peer 2 announces its old material (a valid announcement under this
     // run's context, so every proof passes): party 1 refuses it, naming 2.
     {
-        var p1 = try EcdsaRefresh.init(allocator, old[0], "stale-2", &locals[3], random);
+        var p1 = try EcdsaRefresh.init(allocator, &old[0], "stale-2", &locals[3], random);
         defer p1.deinit();
-        var p3 = try EcdsaRefresh.init(allocator, old[2], "stale-2", &locals[4], random);
+        var p3 = try EcdsaRefresh.init(allocator, &old[2], "stale-2", &locals[4], random);
         defer p3.deinit();
         try p1.start();
         try p3.start();

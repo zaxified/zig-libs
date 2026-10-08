@@ -48,19 +48,40 @@ pub const LocalAux = struct {
     /// Generate a 2048-bit Paillier-Blum key, a 2048-bit ring-Pedersen
     /// tuple with its trapdoor and a message-signing seed. Slow (two safe
     /// primes); `random` MUST be a CSPRNG. Free with `deinit`.
-    pub fn generate(allocator: std.mem.Allocator, random: std.Random) (root.GeneratePaillierBlumError || std.mem.Allocator.Error)!LocalAux {
-        var key = try root.generatePaillierBlum(random, paillier.modulus_bits);
+    pub fn generate(allocator: std.mem.Allocator, random: std.Random, out: *LocalAux) (root.GeneratePaillierBlumError || std.mem.Allocator.Error)!void {
+        const result = generateUnburned(allocator, random, out);
+        burn.stack(generate_stack_burn);
+        return result;
+    }
+
+    noinline fn generateUnburned(allocator: std.mem.Allocator, random: std.Random, out: *LocalAux) (root.GeneratePaillierBlumError || std.mem.Allocator.Error)!void {
+        out.* = try generateByValue(allocator, random);
+    }
+
+    fn generateByValue(allocator: std.mem.Allocator, random: std.Random) (root.GeneratePaillierBlumError || std.mem.Allocator.Error)!LocalAux {
+        var key: root.PaillierBlumKey = undefined;
+        try root.generatePaillierBlum(random, paillier.modulus_bits, &key);
         errdefer key.wipe();
-        const at = try root.generateAuxParamsWithTrapdoor(allocator, random, root.aux_modulus_bits);
+        var at: root.AuxParamsWithTrapdoor = undefined;
+        try root.generateAuxParamsWithTrapdoor(allocator, random, root.aux_modulus_bits, &at);
         var seed: [32]u8 = undefined;
         random.bytes(&seed);
         return .{ .paillier = key, .aux = at.params, .trapdoor = at.trapdoor, .message_seed = seed };
     }
 
-    /// From material generated earlier (precomputed primes). Takes
-    /// ownership of `trapdoor`.
-    pub fn fromParts(key: root.PaillierBlumKey, aux: root.AuxParams, trapdoor: root.AuxTrapdoor, message_seed: [32]u8) LocalAux {
-        return .{ .paillier = key, .aux = aux, .trapdoor = trapdoor, .message_seed = message_seed };
+    /// From material generated earlier (precomputed primes), written to
+    /// `out`. MOVES the secrets: `key` and `message_seed` are wiped and
+    /// `trapdoor` is emptied (its `p`/`q` buffers now belong to `out`, its
+    /// `lambda` is zeroed). Pointers in and out because these values passed
+    /// or returned by value leave copies in the caller's frame
+    /// (`stackprobe_test.zig`).
+    pub fn fromParts(key: *root.PaillierBlumKey, aux: root.AuxParams, trapdoor: *root.AuxTrapdoor, message_seed: *[32]u8, out: *LocalAux) void {
+        out.* = .{ .paillier = key.*, .aux = aux, .trapdoor = trapdoor.*, .message_seed = message_seed.* };
+        key.wipe();
+        std.crypto.secureZero(u8, message_seed);
+        std.crypto.secureZero(u8, std.mem.asBytes(&trapdoor.lambda));
+        trapdoor.p = &.{};
+        trapdoor.q = &.{};
     }
 
     /// Wipes the Paillier factors and secret key and the aux trapdoor. A
@@ -82,7 +103,7 @@ pub const LocalAux = struct {
             // A clamped Ed25519 scalar is never zero: no seed fails here.
             .message_key = root.messagePublicKey(self.message_seed) catch unreachable,
             .aux = self.aux,
-            .aux_proof = try aux_proofs.proveWellFormedBound(allocator, self.aux, self.trapdoor, context, random),
+            .aux_proof = try aux_proofs.proveWellFormedBound(allocator, self.aux, &self.trapdoor, context, random),
             .paillier_proof = try aux_proofs.Pimod.provePaillier(allocator, self.paillier.modulus(), self.paillier.p(), self.paillier.q(), context, random),
         };
     }
@@ -356,6 +377,30 @@ var verified_token: u8 = 0;
 pub fn assembleKeyShare(
     allocator: std.mem.Allocator,
     verified: Verified,
+    secret_share: *const root.Scalar,
+    group_commitments: []const root.Element,
+    own: *const LocalAux,
+    out: *root.KeyShare,
+) AssembleError!void {
+    const result = assembleKeyShareUnburned(allocator, verified, secret_share, group_commitments, own, out);
+    burn.stack(assemble_key_share_stack_burn);
+    return result;
+}
+
+noinline fn assembleKeyShareUnburned(
+    allocator: std.mem.Allocator,
+    verified: Verified,
+    secret_share: *const root.Scalar,
+    group_commitments: []const root.Element,
+    own: *const LocalAux,
+    out: *root.KeyShare,
+) AssembleError!void {
+    out.* = try assembleKeyShareByValue(allocator, verified, secret_share.*, group_commitments, own);
+}
+
+fn assembleKeyShareByValue(
+    allocator: std.mem.Allocator,
+    verified: Verified,
     secret_share: root.Scalar,
     group_commitments: []const root.Element,
     own: *const LocalAux,
@@ -423,6 +468,14 @@ fn readLenPrefixed(bytes: []const u8, offset: *usize) error{InvalidEncoding}![]c
 
 const testing = std.testing;
 const vectors = @import("tsslib_vectors.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const generate_stack_burn = 16 * 1024;
+const assemble_key_share_stack_burn = 576 * 1024;
 fn unhexAlloc(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, (hex.len + 1) / 2);
     errdefer allocator.free(out);
@@ -443,7 +496,8 @@ fn tssLocal(allocator: std.mem.Allocator, i: usize) !LocalAux {
     defer allocator.free(pp);
     const pq = try unhexAlloc(allocator, p.paillier_q);
     defer allocator.free(pq);
-    var key = try root.paillierBlumFromPrimes(pp, pq);
+    var key: root.PaillierBlumKey = undefined;
+    try root.paillierBlumFromPrimes(pp, pq, &key);
     errdefer key.wipe();
     const nt_bytes = try unhexAlloc(allocator, p.n_tilde);
     defer allocator.free(nt_bytes);
@@ -460,13 +514,15 @@ fn tssLocal(allocator: std.mem.Allocator, i: usize) !LocalAux {
     const tq = try unhexAlloc(allocator, p.aux_q_safe);
     errdefer allocator.free(tq);
     // tss-lib ships Alpha = log_{h1} h2; this module's trapdoor is its inverse.
-    const lambda = try root.auxLogInverse(nt, tp, tq, try fe(allocator, nt, p.aux_lambda));
-    return LocalAux.fromParts(
-        key,
-        .{ .n_tilde = nt, .h1 = try fe(allocator, nt, p.h1), .h2 = try fe(allocator, nt, p.h2) },
-        .{ .p = tp, .q = tq, .lambda = lambda },
-        @splat(@intCast(i + 1)), // distinct per party; a test seed
-    );
+    const alpha = try fe(allocator, nt, p.aux_lambda);
+    var lambda: root.AuxFe = undefined;
+    try root.auxLogInverse(nt, tp, tq, &alpha, &lambda);
+    const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = try fe(allocator, nt, p.h1), .h2 = try fe(allocator, nt, p.h2) };
+    var trapdoor: root.AuxTrapdoor = .{ .p = tp, .q = tq, .lambda = lambda };
+    var seed: [32]u8 = @splat(@intCast(i + 1)); // distinct per party; a test seed
+    var local: LocalAux = undefined;
+    LocalAux.fromParts(&key, aux, &trapdoor, &seed, &local);
+    return local;
 }
 
 fn ctxFor(i: u32) [12]u8 {
@@ -569,13 +625,14 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
     // module's own test runs the real protocol end to end).
     const secret = try root.Scalar.fromBytes([_]u8{0} ** 31 ++ [_]u8{42}, .big);
     const coeff = [_]root.Scalar{try root.Scalar.fromBytes([_]u8{0} ** 31 ++ [_]u8{7}, .big)};
-    const split = try root.splitSecretKey(allocator, secret, 2, 3, &coeff);
+    const split = try root.splitSecretKey(allocator, &secret, 2, 3, &coeff);
     defer allocator.free(split.shares);
     defer allocator.free(split.commitments.commitments);
     const commits = split.commitments.commitments;
 
     for (split.shares, 1..) |sh, i| {
-        const share = try assembleKeyShare(allocator, sets[i - 1].verified().?, sh.scalar, commits, &locals[i - 1]);
+        var share: root.KeyShare = undefined;
+        try assembleKeyShare(allocator, sets[i - 1].verified().?, &sh.scalar, commits, &locals[i - 1], &share);
         defer allocator.free(share.public_keys.entries);
         try testing.expectEqual(@as(u32, 2), share.t);
         try testing.expectEqual(@as(u32, 3), share.n);
@@ -587,16 +644,17 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
     }
     // A share that does not belong to the commitments, and someone else's
     // announcement in this party's slot.
-    try testing.expectError(error.ShareMismatch, assembleKeyShare(allocator, sets[0].verified().?, split.shares[1].scalar, commits, &locals[0]));
-    try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, sets[0].verified().?, split.shares[0].scalar, commits, &locals[1]));
+    var scratch_ks: root.KeyShare = undefined;
+    try testing.expectError(error.ShareMismatch, assembleKeyShare(allocator, sets[0].verified().?, &split.shares[1].scalar, commits, &locals[0], &scratch_ks));
+    try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, sets[0].verified().?, &split.shares[0].scalar, commits, &locals[1], &scratch_ks));
     // Same moduli and ring-Pedersen tuple, another message-signing seed (mutation audit).
     var other_seed = locals[0];
     other_seed.message_seed = @splat(0x55);
-    try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, sets[0].verified().?, split.shares[0].scalar, commits, &other_seed));
+    try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, sets[0].verified().?, &split.shares[0].scalar, commits, &other_seed, &scratch_ks));
     // A `Verified` written by hand over the same announcements (review F13).
     var not_the_token: u8 = 0;
     const forged: Verified = .{ .all = sets[0].verified().?.all, .me = 1, .seal = &not_the_token };
-    try testing.expectError(error.InvalidParameters, assembleKeyShare(allocator, forged, split.shares[0].scalar, commits, &locals[0]));
+    try testing.expectError(error.InvalidParameters, assembleKeyShare(allocator, forged, &split.shares[0].scalar, commits, &locals[0], &scratch_ks));
 }
 
 test "aux_info: a copied Ñ with its proofs fails under the copier's context; findDuplicate is the second line" {
@@ -629,7 +687,8 @@ test "aux_info: verifyAnnouncement refuses a Paillier key below the floor" {
     var full = try tssLocal(allocator, 0);
     defer full.deinit(allocator);
     // 1808 bits: above the q⁷ floor (~1792), below the 2048 Πfac is sized for.
-    var small = try root.generatePaillierBlum(random, 1808);
+    var small: root.PaillierBlumKey = undefined;
+    try root.generatePaillierBlum(random, 1808, &small);
     defer small.wipe();
     try testing.expect(root.paillierNMeetsFloor(small.key.public));
     const ctx = ctxFor(1);
@@ -637,7 +696,7 @@ test "aux_info: verifyAnnouncement refuses a Paillier key below the floor" {
         .paillier_pk = small.key.public,
         .message_key = try root.messagePublicKey(full.message_seed),
         .aux = full.aux,
-        .aux_proof = try aux_proofs.proveWellFormedBound(allocator, full.aux, full.trapdoor, &ctx, random),
+        .aux_proof = try aux_proofs.proveWellFormedBound(allocator, full.aux, &full.trapdoor, &ctx, random),
         .paillier_proof = try aux_proofs.Pimod.provePaillier(allocator, small.modulus(), small.p(), small.q(), &ctx, random),
     };
     try testing.expectError(error.InvalidPaillierKey, verifyAnnouncement(ann, &ctx, random));
@@ -664,11 +723,14 @@ test "aux_info: verifyAnnouncement refuses a Paillier key below the floor" {
 test "findDuplicate: a party whose Paillier N doubles as its own Ñ" {
     var prng = std.Random.DefaultPrng.init(0x6175_7834);
     const random = prng.random();
-    var k1 = try root.generatePaillierBlum(random, 512);
+    var k1: root.PaillierBlumKey = undefined;
+    try root.generatePaillierBlum(random, 512, &k1);
     defer k1.wipe();
-    var k2 = try root.generatePaillierBlum(random, 512);
+    var k2: root.PaillierBlumKey = undefined;
+    try root.generatePaillierBlum(random, 512, &k2);
     defer k2.wipe();
-    var k3 = try root.generatePaillierBlum(random, 512);
+    var k3: root.PaillierBlumKey = undefined;
+    try root.generatePaillierBlum(random, 512, &k3);
     defer k3.wipe();
     const h = k1.modulus().one();
     var a: Announcement = undefined;
@@ -690,7 +752,8 @@ test "findDuplicate: a party whose Paillier N doubles as its own Ñ" {
     try testing.expectEqual(@as(usize, 0), dup2[0]);
     try testing.expectEqual(@as(usize, 1), dup2[1]);
     // Only a's Ñ equals b's N (b's Ñ is a stranger): both of a's moduli are compared (mutation audit).
-    var k4 = try root.generatePaillierBlum(random, 512);
+    var k4: root.PaillierBlumKey = undefined;
+    try root.generatePaillierBlum(random, 512, &k4);
     defer k4.wipe();
     b.aux.n_tilde = k4.modulus();
     b.paillier_pk = k2.key.public;
@@ -708,7 +771,8 @@ test "aux_info: verifyAnnouncement refuses a ring-Pedersen modulus that is not 2
 
     // A 1808-bit Blum Ñ (above the q⁷ floor) with a real trapdoor:
     // h2 = r², h1 = h2^λ, so Πprm and Πmod are genuinely valid.
-    var small = try root.generatePaillierBlum(random, 1808);
+    var small: root.PaillierBlumKey = undefined;
+    try root.generatePaillierBlum(random, 1808, &small);
     defer small.wipe();
     const nt = small.modulus();
     const r = try root.AuxFe.fromBytes(nt, &[_]u8{ 0x05, 0x39 }, .big);
@@ -720,7 +784,7 @@ test "aux_info: verifyAnnouncement refuses a ring-Pedersen modulus that is not 2
     const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = h1, .h2 = h2 };
     const td: root.AuxTrapdoor = .{ .p = small.p(), .q = small.q(), .lambda = lambda };
     const ctx = ctxFor(1);
-    const aux_proof = try aux_proofs.proveWellFormedBound(allocator, aux, td, &ctx, random);
+    const aux_proof = try aux_proofs.proveWellFormedBound(allocator, aux, &td, &ctx, random);
     // The proofs hold; only the width is wrong.
     try aux_proofs.verifyWellFormedBound(aux, &ctx, aux_proof, random);
 
@@ -737,13 +801,17 @@ test "aux_info: verifyAnnouncement refuses a ring-Pedersen modulus that is not 2
 test "findDuplicate: two parties announcing one message key" {
     var prng = std.Random.DefaultPrng.init(0x6175_7837);
     const random = prng.random();
-    var k1 = try root.generatePaillierBlum(random, 512);
+    var k1: root.PaillierBlumKey = undefined;
+    try root.generatePaillierBlum(random, 512, &k1);
     defer k1.wipe();
-    var k2 = try root.generatePaillierBlum(random, 512);
+    var k2: root.PaillierBlumKey = undefined;
+    try root.generatePaillierBlum(random, 512, &k2);
     defer k2.wipe();
-    var k3 = try root.generatePaillierBlum(random, 512);
+    var k3: root.PaillierBlumKey = undefined;
+    try root.generatePaillierBlum(random, 512, &k3);
     defer k3.wipe();
-    var k4 = try root.generatePaillierBlum(random, 512);
+    var k4: root.PaillierBlumKey = undefined;
+    try root.generatePaillierBlum(random, 512, &k4);
     defer k4.wipe();
     const h = k1.modulus().one();
     var a: Announcement = undefined;

@@ -159,7 +159,8 @@ fn sampleFeBelow(m: root.AuxModulus, random: std.Random) root.AuxFe {
 /// ARITHMETIC (which is what this harness measures), not a claim about
 /// `generateAuxParams`'s real safe-prime search.
 fn fixtureAuxParams(random: std.Random) !root.AuxParams {
-    const nt_kp = try paillier.generate(random, 2048);
+    var nt_kp: paillier.KeyPair = undefined;
+    try paillier.generate(random, 2048, &nt_kp);
     var nt_buf: [paillier.modulus_bytes]u8 = undefined;
     const nt_len = nt_kp.public.nByteLen();
     try nt_kp.public.nToBytes(nt_buf[0..nt_len]);
@@ -193,7 +194,7 @@ fn buildFixture(allocator: std.mem.Allocator, setup_random: std.Random) !Fixture
     var paillier_keys: [2]paillier.KeyPair = undefined;
     var aux_params: [2]root.AuxParams = undefined;
     for (0..n) |i| {
-        paillier_keys[i] = try paillier.generate(setup_random, 2048);
+        try paillier.generate(setup_random, 2048, &paillier_keys[i]);
         aux_params[i] = try fixtureAuxParams(setup_random);
     }
 
@@ -203,7 +204,7 @@ fn buildFixture(allocator: std.mem.Allocator, setup_random: std.Random) !Fixture
 
     var message_seeds: [n][32]u8 = undefined;
     for (&message_seeds) |*sd| setup_random.bytes(sd);
-    const key_shares = try root.keygenTrustedDealer(allocator, t, n, secret, &coefficients, &paillier_keys, &aux_params, &message_seeds);
+    const key_shares = try root.keygenTrustedDealer(allocator, t, n, &secret, &coefficients, &paillier_keys, &aux_params, &message_seeds);
     return .{ .key_shares = key_shares };
 }
 
@@ -287,7 +288,7 @@ fn runProtocol(allocator: std.mem.Allocator, shares: []const KeyShare, randoms: 
     const sid = [_]u8{0x5a} ** 32;
 
     var parties: [2]presign.Party = undefined;
-    for (0..t) |i| parties[i] = try presign.Party.init(allocator, shares[i], indices[0..t], sid);
+    for (0..t) |i| try presign.Party.init(allocator, &shares[i], indices[0..t], sid, &parties[i]);
     defer for (parties[0..t]) |*p| p.deinit();
 
     var inboxes: [2]std.ArrayList([]const u8) = @splat(.empty);
@@ -316,7 +317,7 @@ fn runProtocol(allocator: std.mem.Allocator, shares: []const KeyShare, randoms: 
     var made: usize = 0;
     defer for (presigs[0..made]) |*p| p.deinit();
     for (0..t) |i| {
-        presigs[i] = try parties[i].finish(inboxes[i].items);
+        try parties[i].finish(inboxes[i].items, &presigs[i]);
         made += 1;
     }
     var sig_shares: [2][]u8 = undefined;
@@ -360,7 +361,8 @@ fn runFac(tainted: bool) !void {
     var q: [128]u8 = undefined;
     _ = try std.fmt.hexToBytes(&p, pp.paillier_p);
     _ = try std.fmt.hexToBytes(&q, pp.paillier_q);
-    var key = try root.paillierBlumFromPrimes(&p, &q);
+    var key: root.PaillierBlumKey = undefined;
+    try root.paillierBlumFromPrimes(&p, &q, &key);
     defer key.wipe();
     const n0 = key.modulus();
     var buf: [root.aux_modulus_bytes]u8 = undefined;
@@ -393,7 +395,8 @@ fn runPimod(allocator: std.mem.Allocator, tainted: bool) !void {
     var q: [128]u8 = undefined;
     _ = try std.fmt.hexToBytes(&p, pp.paillier_p);
     _ = try std.fmt.hexToBytes(&q, pp.paillier_q);
-    var key = try root.paillierBlumFromPrimes(&p, &q);
+    var key: root.PaillierBlumKey = undefined;
+    try root.paillierBlumFromPrimes(&p, &q, &key);
     defer key.wipe();
     const n0 = key.modulus();
     if (tainted) {
@@ -447,7 +450,7 @@ fn runPiprm(allocator: std.mem.Allocator, tainted: bool) !void {
     }
     std.mem.doNotOptimizeAway(&trapdoor);
     var prng = std.Random.DefaultPrng.init(0x7069_7072_6d); // "piprm"
-    const proof = try root.aux_proofs.Piprm.proveBound(allocator, aux, trapdoor, "ctgrind", prng.random());
+    const proof = try root.aux_proofs.Piprm.proveBound(allocator, aux, &trapdoor, "ctgrind", prng.random());
     // XOR of every z_i: the rounds with e_i = 1 carry λ's taint (z_i = a_i
     // alone when e_i = 0, untainted), so one fold is the witness for all.
     var acc = [_]u8{0} ** root.aux_modulus_bytes;
@@ -479,7 +482,8 @@ fn runAuxgen(allocator: std.mem.Allocator, tainted: bool) !void {
         std.valgrind.memcheck.makeMemUndefined(&q);
     }
     var prng = std.Random.DefaultPrng.init(0x6175_7867_656e); // "auxgen"
-    const gen = try root.auxParamsWithTrapdoorFromSafePrimes(allocator, &p, &q, prng.random());
+    var gen: root.AuxParamsWithTrapdoor = undefined;
+    try root.auxParamsWithTrapdoorFromSafePrimes(allocator, &p, &q, prng.random(), &gen);
     defer gen.trapdoor.deinit(allocator);
     var hb: [root.aux_modulus_bytes]u8 = undefined;
     try gen.params.h1.toBytes(&hb, .big);
@@ -499,15 +503,17 @@ fn runOpen7(tainted: bool) !void {
     var q: [128]u8 = undefined;
     _ = try std.fmt.hexToBytes(&p, pp.paillier_p);
     _ = try std.fmt.hexToBytes(&q, pp.paillier_q);
-    var kp = try paillier.fromPrimes(&p, &q);
+    var kp: paillier.KeyPair = undefined;
+    try paillier.fromPrimes(&p, &q, &kp);
     var m_buf = [_]u8{0} ** 32;
     m_buf[31] = 0x2a;
     var r_buf = [_]u8{0} ** 32;
     r_buf[31] = 0x07;
-    const c = try paillier.encrypt(kp.public, try paillier.Fe.fromBytes(kp.public.n_sq, &m_buf, .big), try paillier.Fe.fromBytes(kp.public.n_sq, &r_buf, .big));
+    const c = try paillier.encrypt(kp.public, &(try paillier.Fe.fromBytes(kp.public.n_sq, &m_buf, .big)), &(try paillier.Fe.fromBytes(kp.public.n_sq, &r_buf, .big)));
     if (tainted) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&kp.secret.lambda.v.limbs_buffer));
     std.mem.doNotOptimizeAway(&kp);
-    const opened = try root.mta.decryptWithRandomness(kp.secret, kp.public, c);
+    var opened: root.mta.DecryptionWithRandomness = undefined;
+    try root.mta.decryptWithRandomness(&kp.secret, kp.public, c, &opened);
     var rb: [paillier.modulus_sq_bytes]u8 = undefined;
     try opened.rho.toBytes(&rb, .big);
     std.debug.print("ctgrind_result={x}\n", .{rb[rb.len - 16 ..]});

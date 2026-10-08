@@ -48,6 +48,16 @@ const tecdsa = @import("threshold_ecdsa");
 const participant = @import("participant.zig");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const init_stack_burn = 192 * 1024;
+const start_stack_burn = 1984 * 1024;
+const handle_stack_burn = 768 * 1024;
+const advance_stack_burn = 1408 * 1024;
 
 const aux_info = tecdsa.aux_info;
 const fac_proof = tecdsa.fac_proof;
@@ -109,6 +119,19 @@ pub const EcdsaKeygen = struct {
         local: *const aux_info.LocalAux,
         random: std.Random,
     ) InitError!EcdsaKeygen {
+        const result = initUnburned(allocator, cfg, index, session_id, local, random);
+        burn.stack(init_stack_burn);
+        return result;
+    }
+
+    noinline fn initUnburned(
+        allocator: std.mem.Allocator,
+        cfg: types.Config,
+        index: u32,
+        session_id: []const u8,
+        local: *const aux_info.LocalAux,
+        random: std.Random,
+    ) InitError!EcdsaKeygen {
         if (session_id.len == 0) return error.EmptySessionId;
         var inner = try Participant.init(allocator, cfg, index, random);
         errdefer inner.deinit();
@@ -160,13 +183,21 @@ pub const EcdsaKeygen = struct {
         return self.culprit_ orelse self.inner.culprit();
     }
 
-    /// The finished `KeyShare`, handed over once (null before `.done` and
+    /// The finished `KeyShare`, handed over once (false before `.done` and
     /// after the first call). The caller frees
     /// `share.public_keys.entries` with the allocator given to `init`.
-    pub fn takeKeyShare(self: *EcdsaKeygen) ?tecdsa.KeyShare {
-        const s = self.share orelse return null;
+    ///
+    /// Moves the share into `out` and returns true, or returns false with
+    /// `out` untouched. The copy kept here is wiped: setting the optional to
+    /// null alone left the key share, Paillier secret key and message seed in
+    /// this struct's memory. Out-param, not a return value: a `KeyShare`
+    /// returned by value leaves a copy in the caller's frame.
+    pub fn takeKeyShare(self: *EcdsaKeygen, out: *tecdsa.KeyShare) bool {
+        if (self.share == null) return false;
+        out.* = self.share.?;
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.share.?));
         self.share = null;
-        return s;
+        return true;
     }
 
     /// True when every frame this phase waits for is in (`.dkg` defers to
@@ -188,6 +219,12 @@ pub const EcdsaKeygen = struct {
 
     /// Round 1: broadcast this party's announcement.
     pub fn start(self: *EcdsaKeygen) StartError!void {
+        const result = startUnburned(self);
+        burn.stack(start_stack_burn);
+        return result;
+    }
+
+    noinline fn startUnburned(self: *EcdsaKeygen) StartError!void {
         if (self.phase_ != .new) return error.WrongRound;
         var ctx_buf: [ctx_max]u8 = undefined;
         const ann = try self.local.announce(self.allocator, self.context(&ctx_buf, self.me), self.random);
@@ -201,6 +238,12 @@ pub const EcdsaKeygen = struct {
     /// Feed one frame from the authenticated peer `from`. A refused frame
     /// changes nothing.
     pub fn handle(self: *EcdsaKeygen, from: u32, tagged: []const u8) MessageError!void {
+        const result = handleUnburned(self, from, tagged);
+        burn.stack(handle_stack_burn);
+        return result;
+    }
+
+    noinline fn handleUnburned(self: *EcdsaKeygen, from: u32, tagged: []const u8) MessageError!void {
         switch (self.phase_) {
             .done => return error.Finished,
             .aborted => return error.Aborted,
@@ -237,6 +280,12 @@ pub const EcdsaKeygen = struct {
     /// Close the current round and move on. Any error leaves the party
     /// `.aborted`.
     pub fn advance(self: *EcdsaKeygen) AdvanceError!void {
+        const result = advanceUnburned(self);
+        burn.stack(advance_stack_burn);
+        return result;
+    }
+
+    noinline fn advanceUnburned(self: *EcdsaKeygen) AdvanceError!void {
         const r = switch (self.phase_) {
             .new => return error.WrongRound,
             .announce => self.advanceAnnounce(),
@@ -312,13 +361,16 @@ pub const EcdsaKeygen = struct {
         if (self.inner.phase() != .done) return;
         var out = self.inner.output().?;
         defer out.deinit();
-        self.share = try aux_info.assembleKeyShare(
+        var share: tecdsa.KeyShare = undefined;
+        try aux_info.assembleKeyShare(
             self.allocator,
             self.checked.?.verified().?, // every check passed in the earlier rounds
-            out.secret_share,
+            &out.secret_share,
             self.inner.publicCommitments().?,
             self.local,
+            &share,
         );
+        self.share = share;
         self.phase_ = .done;
     }
 
@@ -422,9 +474,11 @@ const testing = std.testing;
 /// which take minutes; Πprm/Πmod hold over any Blum modulus with a known
 /// `λ`, so the proofs and every check run for real).
 fn quickLocal(allocator: std.mem.Allocator, random: std.Random) !aux_info.LocalAux {
-    var key = try tecdsa.generatePaillierBlum(random, 2048);
+    var key: tecdsa.PaillierBlumKey = undefined;
+    try tecdsa.generatePaillierBlum(random, 2048, &key);
     errdefer key.wipe();
-    var ring = try tecdsa.generatePaillierBlum(random, 2048);
+    var ring: tecdsa.PaillierBlumKey = undefined;
+    try tecdsa.generatePaillierBlum(random, 2048, &ring);
     defer ring.wipe();
     const nt = ring.modulus();
     var buf: [tecdsa.aux_modulus_bytes]u8 = undefined;
@@ -440,7 +494,11 @@ fn quickLocal(allocator: std.mem.Allocator, random: std.Random) !aux_info.LocalA
     const q = try allocator.dupe(u8, ring.q());
     var seed: [32]u8 = undefined;
     random.bytes(&seed);
-    return aux_info.LocalAux.fromParts(key, .{ .n_tilde = nt, .h1 = h1, .h2 = h2 }, .{ .p = p, .q = q, .lambda = lambda }, seed);
+    const aux: tecdsa.AuxParams = .{ .n_tilde = nt, .h1 = h1, .h2 = h2 };
+    var trapdoor: tecdsa.AuxTrapdoor = .{ .p = p, .q = q, .lambda = lambda };
+    var local: aux_info.LocalAux = undefined;
+    aux_info.LocalAux.fromParts(&key, aux, &trapdoor, &seed, &local);
+    return local;
 }
 
 const Rig = struct {
@@ -499,10 +557,11 @@ test "dealer-free keygen: 2-of-3 over frames -> KeyShares -> threshold sign -> s
     var shares: [3]tecdsa.KeyShare = undefined;
     for (&parties, &shares) |*p, *s| {
         try testing.expectEqual(Phase.done, p.phase());
-        s.* = p.takeKeyShare().?;
+        try testing.expect(p.takeKeyShare(s));
     }
     defer for (shares) |s| allocator.free(s.public_keys.entries);
-    try testing.expect(parties[0].takeKeyShare() == null);
+    var scratch: tecdsa.KeyShare = undefined;
+    try testing.expect(!parties[0].takeKeyShare(&scratch));
     for (shares[1..]) |s| try testing.expectEqualSlices(u8, &shares[0].group_public_key.toBytes(), &s.group_public_key.toBytes());
 
     const ecdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;

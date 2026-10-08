@@ -60,6 +60,29 @@
 const std = @import("std");
 const paillier = @import("paillier");
 const montint = @import("montint");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const keygen_trusted_dealer_stack_burn = 64 * 1024;
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const split_secret_key_stack_burn = 16 * 1024;
+const reconstruct_secret_stack_burn = 4 * 1024;
+const paillier_blum_from_primes_stack_burn = 256 * 1024;
+const generate_paillier_blum_stack_burn = 256 * 1024;
+const aux_log_inverse_stack_burn = 40 * 1024;
+const aux_params_with_trapdoor_from_safe_primes_stack_burn = 128 * 1024;
+const generate_aux_params_with_trapdoor_stack_burn = 128 * 1024;
+const generate_aux_params_stack_burn = 128 * 1024;
+const message_public_key_stack_burn = 8 * 1024;
+const key_share_to_bytes_stack_burn = 32 * 1024;
+const key_share_from_bytes_stack_burn = 256 * 1024;
 
 /// The MtA (multiplicative-to-additive) share-conversion protocol — I2
 /// Phase 2b's semi-honest core. Converts a product `a·b` of two parties'
@@ -367,6 +390,28 @@ pub const SplitResult = struct {
 /// exactly as retaining `secret_key` itself would).
 pub fn splitSecretKey(
     allocator: std.mem.Allocator,
+    secret_key: *const Scalar,
+    t: u32,
+    n: u32,
+    coefficients: []const Scalar,
+) SplitError!SplitResult {
+    const result = splitSecretKeyUnburned(allocator, secret_key, t, n, coefficients);
+    burn.stack(split_secret_key_stack_burn);
+    return result;
+}
+
+noinline fn splitSecretKeyUnburned(
+    allocator: std.mem.Allocator,
+    secret_key: *const Scalar,
+    t: u32,
+    n: u32,
+    coefficients: []const Scalar,
+) SplitError!SplitResult {
+    return splitSecretKeyByValue(allocator, secret_key.*, t, n, coefficients);
+}
+
+fn splitSecretKeyByValue(
+    allocator: std.mem.Allocator,
     secret_key: Scalar,
     t: u32,
     n: u32,
@@ -440,7 +485,17 @@ pub const ReconstructError = error{ InsufficientShares, DuplicateIndex, ZeroInde
 /// `x` is never reconstructed in one place during ordinary operation;
 /// Phase 2c (signing) computes a threshold ECDSA signature WITHOUT ever
 /// calling this function. See `SPEC.md`'s threat model.
-pub fn reconstructSecret(shares: []const ShamirShare) ReconstructError!Scalar {
+pub fn reconstructSecret(shares: []const ShamirShare, out: *Scalar) ReconstructError!void {
+    const result = reconstructSecretUnburned(shares, out);
+    burn.stack(reconstruct_secret_stack_burn);
+    return result;
+}
+
+noinline fn reconstructSecretUnburned(shares: []const ShamirShare, out: *Scalar) ReconstructError!void {
+    out.* = try reconstructSecretByValue(shares);
+}
+
+fn reconstructSecretByValue(shares: []const ShamirShare) ReconstructError!Scalar {
     if (shares.len == 0) return error.InsufficientShares;
     for (shares, 0..) |a, idx| {
         if (a.index == 0) return error.ZeroIndex;
@@ -940,7 +995,17 @@ pub const GeneratePaillierBlumError = paillier.FromPrimesError || error{InvalidB
 /// `aux_modulus_bits`; a real key is `paillier.modulus_bits` (2048). The two
 /// primes are refused when their top 100 bits coincide (Fermat closeness, as
 /// `paillier.generate` does). `random` MUST be a CSPRNG for real keys.
-pub fn generatePaillierBlum(random: std.Random, bits: usize) GeneratePaillierBlumError!PaillierBlumKey {
+pub fn generatePaillierBlum(random: std.Random, bits: usize, out: *PaillierBlumKey) GeneratePaillierBlumError!void {
+    const result = generatePaillierBlumUnburned(random, bits, out);
+    burn.stack(generate_paillier_blum_stack_burn);
+    return result;
+}
+
+noinline fn generatePaillierBlumUnburned(random: std.Random, bits: usize, out: *PaillierBlumKey) GeneratePaillierBlumError!void {
+    out.* = try generatePaillierBlumByValue(random, bits);
+}
+
+fn generatePaillierBlumByValue(random: std.Random, bits: usize) GeneratePaillierBlumError!PaillierBlumKey {
     if (bits % 16 != 0 or bits < paillier.min_modulus_bits or bits > aux_modulus_bits) return error.InvalidBits;
     const half = bits / 2;
     var out: PaillierBlumKey = undefined;
@@ -957,7 +1022,7 @@ pub fn generatePaillierBlum(random: std.Random, bits: usize) GeneratePaillierBlu
             generateBlumPrime(random, half, q_bytes);
             if (!topHundredBitsMatch(p_bytes, q_bytes)) break;
         }
-        out.key = paillier.fromPrimes(p_bytes, q_bytes) catch |err| switch (err) {
+        paillier.fromPrimes(p_bytes, q_bytes, &out.key) catch |err| switch (err) {
             error.InvalidPrimes => continue, // a Miller-Rabin false positive: search again
             else => return err,
         };
@@ -971,7 +1036,17 @@ pub const PaillierBlumFromPrimesError = paillier.FromPrimesError || error{NotBlu
 /// primes, as tss-lib's "pre-params" are; or test vectors). Both must be
 /// ≡ 3 (mod 4) and at most `paillier_blum_prime_bytes` long;
 /// `paillier.fromPrimes` checks primality and closeness.
-pub fn paillierBlumFromPrimes(p_in: []const u8, q_in: []const u8) PaillierBlumFromPrimesError!PaillierBlumKey {
+pub fn paillierBlumFromPrimes(p_in: []const u8, q_in: []const u8, out: *PaillierBlumKey) PaillierBlumFromPrimesError!void {
+    const result = paillierBlumFromPrimesUnburned(p_in, q_in, out);
+    burn.stack(paillier_blum_from_primes_stack_burn);
+    return result;
+}
+
+noinline fn paillierBlumFromPrimesUnburned(p_in: []const u8, q_in: []const u8, out: *PaillierBlumKey) PaillierBlumFromPrimesError!void {
+    out.* = try paillierBlumFromPrimesByValue(p_in, q_in);
+}
+
+fn paillierBlumFromPrimesByValue(p_in: []const u8, q_in: []const u8) PaillierBlumFromPrimesError!PaillierBlumKey {
     const p_bytes = stripLeadingZeros(p_in);
     const q_bytes = stripLeadingZeros(q_in);
     const len = @max(p_bytes.len, q_bytes.len);
@@ -987,7 +1062,7 @@ pub fn paillierBlumFromPrimes(p_in: []const u8, q_in: []const u8) PaillierBlumFr
     @memset(&out.q_buf, 0);
     @memcpy(out.p_buf[len - p_bytes.len .. len], p_bytes);
     @memcpy(out.q_buf[len - q_bytes.len .. len], q_bytes);
-    out.key = try paillier.fromPrimes(p_bytes, q_bytes);
+    try paillier.fromPrimes(p_bytes, q_bytes, &out.key);
     if (paillierModulusAsAux(out.key.public) == null) return error.InvalidPrimes;
     return out;
 }
@@ -1207,7 +1282,17 @@ pub const AuxTrapdoor = struct {
 /// `log_{h2} h1` and tss-lib's `LocalPreParams.Alpha = log_{h1} h2`, either
 /// way (the two are inverse mod the squares' order `p'·q'`). For interop
 /// tooling and fixtures; constant-time like `montint.DynModint.inverse`.
-pub fn auxLogInverse(n_tilde: AuxModulus, p_safe: []const u8, q_safe: []const u8, x: AuxFe) error{ NotInvertible, InvalidTrapdoor }!AuxFe {
+pub fn auxLogInverse(n_tilde: AuxModulus, p_safe: []const u8, q_safe: []const u8, x: *const AuxFe, out: *AuxFe) error{ NotInvertible, InvalidTrapdoor }!void {
+    const result = auxLogInverseUnburned(n_tilde, p_safe, q_safe, x, out);
+    burn.stack(aux_log_inverse_stack_burn);
+    return result;
+}
+
+noinline fn auxLogInverseUnburned(n_tilde: AuxModulus, p_safe: []const u8, q_safe: []const u8, x: *const AuxFe, out: *AuxFe) error{ NotInvertible, InvalidTrapdoor }!void {
+    out.* = try auxLogInverseByValue(n_tilde, p_safe, q_safe, x.*);
+}
+
+fn auxLogInverseByValue(n_tilde: AuxModulus, p_safe: []const u8, q_safe: []const u8, x: AuxFe) error{ NotInvertible, InvalidTrapdoor }!AuxFe {
     const D = montint.DynModint(aux_modulus_bits);
     var pp = D.loadBE(p_safe) catch return error.InvalidTrapdoor;
     defer std.crypto.secureZero(u64, &pp);
@@ -1246,7 +1331,17 @@ pub const AuxParamsWithTrapdoor = struct {
 /// alone. The primes are NOT checked: wrong ones give a tuple whose Πprm/Πmod
 /// a correct verifier refuses. The trapdoor's `p`/`q` are copies owned by
 /// `allocator` (free with `trapdoor.deinit`).
-pub fn auxParamsWithTrapdoorFromSafePrimes(allocator: std.mem.Allocator, p: []const u8, q: []const u8, random: std.Random) std.mem.Allocator.Error!AuxParamsWithTrapdoor {
+pub fn auxParamsWithTrapdoorFromSafePrimes(allocator: std.mem.Allocator, p: []const u8, q: []const u8, random: std.Random, out: *AuxParamsWithTrapdoor) std.mem.Allocator.Error!void {
+    const result = auxParamsWithTrapdoorFromSafePrimesUnburned(allocator, p, q, random, out);
+    burn.stack(aux_params_with_trapdoor_from_safe_primes_stack_burn);
+    return result;
+}
+
+noinline fn auxParamsWithTrapdoorFromSafePrimesUnburned(allocator: std.mem.Allocator, p: []const u8, q: []const u8, random: std.Random, out: *AuxParamsWithTrapdoor) std.mem.Allocator.Error!void {
+    out.* = try auxParamsWithTrapdoorFromSafePrimesByValue(allocator, p, q, random);
+}
+
+fn auxParamsWithTrapdoorFromSafePrimesByValue(allocator: std.mem.Allocator, p: []const u8, q: []const u8, random: std.Random) std.mem.Allocator.Error!AuxParamsWithTrapdoor {
     // The bit length comes from the public byte length, not from the secret
     // top byte (`@clz(p[0])` made every loop bound below depend on p̃).
     std.debug.assert(p.len == q.len and p.len > 0);
@@ -1270,7 +1365,17 @@ pub fn auxParamsWithTrapdoorFromSafePrimes(allocator: std.mem.Allocator, p: []co
 /// any other private-key material (SECRET, zero/free promptly after use).
 /// `random` MUST be cryptographically secure for real parameters; `bits`
 /// constraints are identical to `generateAuxParams`.
-pub fn generateAuxParamsWithTrapdoor(allocator: std.mem.Allocator, random: std.Random, bits: usize) std.mem.Allocator.Error!AuxParamsWithTrapdoor {
+pub fn generateAuxParamsWithTrapdoor(allocator: std.mem.Allocator, random: std.Random, bits: usize, out: *AuxParamsWithTrapdoor) std.mem.Allocator.Error!void {
+    const result = generateAuxParamsWithTrapdoorUnburned(allocator, random, bits, out);
+    burn.stack(generate_aux_params_with_trapdoor_stack_burn);
+    return result;
+}
+
+noinline fn generateAuxParamsWithTrapdoorUnburned(allocator: std.mem.Allocator, random: std.Random, bits: usize, out: *AuxParamsWithTrapdoor) std.mem.Allocator.Error!void {
+    out.* = try generateAuxParamsWithTrapdoorByValue(allocator, random, bits);
+}
+
+fn generateAuxParamsWithTrapdoorByValue(allocator: std.mem.Allocator, random: std.Random, bits: usize) std.mem.Allocator.Error!AuxParamsWithTrapdoor {
     const gen = try generateAuxParamsInternal(random, bits, allocator);
     return .{
         .params = gen.params,
@@ -1327,6 +1432,12 @@ pub fn generateAuxParamsWithTrapdoor(allocator: std.mem.Allocator, random: std.R
 /// `AuxModulus.pow`, mirroring `paillier.fromPrimes`'s `g^lambda mod n²`
 /// step. All secret buffers are `secureZero`'d.
 pub fn generateAuxParams(random: std.Random, bits: usize) AuxParams {
+    const result = generateAuxParamsUnburned(random, bits);
+    burn.stack(generate_aux_params_stack_burn);
+    return result;
+}
+
+noinline fn generateAuxParamsUnburned(random: std.Random, bits: usize) AuxParams {
     const gen = generateAuxParamsInternal(random, bits, null) catch unreachable; // retain_allocator == null never allocates
     // lambda (gen.lambda) is a stack AuxFe, discarded with this frame; its
     // byte-level source buffer is already secureZero'd inside the internal
@@ -1531,6 +1642,12 @@ test "decodeMessageKey refuses small-order keys (review F10) and takes a real on
 
 /// The Ed25519 public key of a message-signing seed (`KeyShare.message_seed`).
 pub fn messagePublicKey(seed: [32]u8) error{InvalidParameters}![32]u8 {
+    const result = messagePublicKeyUnburned(seed);
+    burn.stack(message_public_key_stack_burn);
+    return result;
+}
+
+noinline fn messagePublicKeyUnburned(seed: [32]u8) error{InvalidParameters}![32]u8 {
     const kp = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch return error.InvalidParameters;
     return kp.public_key.toBytes();
 }
@@ -1699,7 +1816,17 @@ pub const KeyShare = struct {
     /// already-real sub-codecs (`paillier.SecretKey`'s own
     /// `nToBytes`/`lambdaToBytes`/`muToBytes`, `Element.toBytes`,
     /// `PublicKeys.toBytesAlloc`).
-    pub fn toBytesAlloc(self: KeyShare, allocator: std.mem.Allocator) AllocError![]u8 {
+    pub fn toBytesAlloc(self: *const KeyShare, allocator: std.mem.Allocator) AllocError![]u8 {
+        const result = toBytesAllocUnburned(self, allocator);
+        burn.stack(key_share_to_bytes_stack_burn);
+        return result;
+    }
+
+    noinline fn toBytesAllocUnburned(self: *const KeyShare, allocator: std.mem.Allocator) AllocError![]u8 {
+        return toBytesAllocByValue(self.*, allocator);
+    }
+
+    fn toBytesAllocByValue(self: KeyShare, allocator: std.mem.Allocator) AllocError![]u8 {
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(allocator);
 
@@ -1745,7 +1872,17 @@ pub const KeyShare = struct {
 
     /// Inverse of `toBytesAlloc`. Allocates `public_keys.entries`;
     /// caller frees with `allocator`.
-    pub fn fromBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) (std.mem.Allocator.Error || FromBytesError)!KeyShare {
+    pub fn fromBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8, out: *KeyShare) (std.mem.Allocator.Error || FromBytesError)!void {
+        const result = fromBytesAllocUnburned(allocator, bytes, out);
+        burn.stack(key_share_from_bytes_stack_burn);
+        return result;
+    }
+
+    noinline fn fromBytesAllocUnburned(allocator: std.mem.Allocator, bytes: []const u8, out: *KeyShare) (std.mem.Allocator.Error || FromBytesError)!void {
+        out.* = try fromBytesAllocByValue(allocator, bytes);
+    }
+
+    fn fromBytesAllocByValue(allocator: std.mem.Allocator, bytes: []const u8) (std.mem.Allocator.Error || FromBytesError)!KeyShare {
         if (bytes.len < 12 + Ns + Ne + Ne + 32) return error.InvalidEncoding;
         const index = std.mem.readInt(u32, bytes[0..4], .big);
         const t = std.mem.readInt(u32, bytes[4..8], .big);
@@ -1764,7 +1901,8 @@ pub const KeyShare = struct {
         const sk_n_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
         const lambda_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
         const mu_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-        const paillier_secret = try paillier.SecretKey.fromBytes(sk_n_bytes, lambda_bytes, mu_bytes);
+        var paillier_secret: paillier.SecretKey = undefined;
+        try paillier.SecretKey.fromBytes(sk_n_bytes, lambda_bytes, mu_bytes, &paillier_secret);
 
         const pubkeys_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
         if (offset != bytes.len) return error.InvalidEncoding;
@@ -1824,6 +1962,34 @@ pub fn keygenTrustedDealer(
     allocator: std.mem.Allocator,
     t: u32,
     n: u32,
+    secret_key: *const Scalar,
+    coefficients: []const Scalar,
+    paillier_keys: []const paillier.KeyPair,
+    aux_params: []const AuxParams,
+    message_seeds: []const [32]u8,
+) KeygenError![]KeyShare {
+    const result = keygenTrustedDealerUnburned(allocator, t, n, secret_key, coefficients, paillier_keys, aux_params, message_seeds);
+    burn.stack(keygen_trusted_dealer_stack_burn);
+    return result;
+}
+
+noinline fn keygenTrustedDealerUnburned(
+    allocator: std.mem.Allocator,
+    t: u32,
+    n: u32,
+    secret_key: *const Scalar,
+    coefficients: []const Scalar,
+    paillier_keys: []const paillier.KeyPair,
+    aux_params: []const AuxParams,
+    message_seeds: []const [32]u8,
+) KeygenError![]KeyShare {
+    return keygenTrustedDealerByValue(allocator, t, n, secret_key.*, coefficients, paillier_keys, aux_params, message_seeds);
+}
+
+fn keygenTrustedDealerByValue(
+    allocator: std.mem.Allocator,
+    t: u32,
+    n: u32,
     secret_key: Scalar,
     coefficients: []const Scalar,
     paillier_keys: []const paillier.KeyPair,
@@ -1832,7 +1998,7 @@ pub fn keygenTrustedDealer(
 ) KeygenError![]KeyShare {
     if (paillier_keys.len != n or aux_params.len != n or message_seeds.len != n) return error.InvalidParameters;
 
-    const split = try splitSecretKey(allocator, secret_key, t, n, coefficients);
+    const split = try splitSecretKey(allocator, &secret_key, t, n, coefficients);
     defer allocator.free(split.shares);
     defer allocator.free(split.commitments.commitments);
 
@@ -1927,7 +2093,7 @@ test "splitSecretKey: a ZERO secret key is rejected (group public key would be t
     // guard the surrounding doc comments suggest.
     const allocator = testing.allocator;
     const coeffs = [_]Scalar{testScalar(2)};
-    try testing.expectError(error.InvalidElement, splitSecretKey(allocator, Scalar.zero, 2, 3, &coeffs));
+    try testing.expectError(error.InvalidElement, splitSecretKey(allocator, &Scalar.zero, 2, 3, &coeffs));
 }
 
 test "splitSecretKey (t=2,n=3): any 2 shares Lagrange-reconstruct the secret; X == x*G" {
@@ -1935,7 +2101,7 @@ test "splitSecretKey (t=2,n=3): any 2 shares Lagrange-reconstruct the secret; X 
     const secret = testScalar(1);
     const coeffs = [_]Scalar{testScalar(2)};
 
-    const split = try splitSecretKey(allocator, secret, 2, 3, &coeffs);
+    const split = try splitSecretKey(allocator, &secret, 2, 3, &coeffs);
     defer allocator.free(split.shares);
     defer allocator.free(split.commitments.commitments);
 
@@ -1950,7 +2116,8 @@ test "splitSecretKey (t=2,n=3): any 2 shares Lagrange-reconstruct the secret; X 
     const subsets = [_][2]usize{ .{ 0, 1 }, .{ 0, 2 }, .{ 1, 2 } };
     for (subsets) |pair| {
         const pair_shares = [_]ShamirShare{ split.shares[pair[0]], split.shares[pair[1]] };
-        const reconstructed = try reconstructSecret(&pair_shares);
+        var reconstructed: Scalar = undefined;
+        try reconstructSecret(&pair_shares, &reconstructed);
         try testing.expectEqualSlices(u8, &secret.toBytes(.big), &reconstructed.toBytes(.big));
     }
 }
@@ -1960,7 +2127,7 @@ test "splitSecretKey (t=3,n=5): Feldman consistency X_i == x_i*G for every share
     const secret = testScalar(3);
     const coeffs = [_]Scalar{ testScalar(4), testScalar(5) };
 
-    const split = try splitSecretKey(allocator, secret, 3, 5, &coeffs);
+    const split = try splitSecretKey(allocator, &secret, 3, 5, &coeffs);
     defer allocator.free(split.shares);
     defer allocator.free(split.commitments.commitments);
 
@@ -1972,7 +2139,8 @@ test "splitSecretKey (t=3,n=5): Feldman consistency X_i == x_i*G for every share
 
     // Any 3 (of 5) shares also reconstruct the secret.
     const three = [_]ShamirShare{ split.shares[0], split.shares[2], split.shares[4] };
-    const reconstructed = try reconstructSecret(&three);
+    var reconstructed: Scalar = undefined;
+    try reconstructSecret(&three, &reconstructed);
     try testing.expectEqualSlices(u8, &secret.toBytes(.big), &reconstructed.toBytes(.big));
 
     // Below threshold: 2 shares do NOT reconstruct the true secret (a
@@ -1980,31 +2148,33 @@ test "splitSecretKey (t=3,n=5): Feldman consistency X_i == x_i*G for every share
     // `frost.deriveInterpolatingValue`/`bls12_381.threshold
     // .combineSignatures`'s doc comments carry).
     const two = [_]ShamirShare{ split.shares[0], split.shares[1] };
-    const wrong = try reconstructSecret(&two);
+    var wrong: Scalar = undefined;
+    try reconstructSecret(&two, &wrong);
     try testing.expect(!std.mem.eql(u8, &secret.toBytes(.big), &wrong.toBytes(.big)));
 }
 
 test "reconstructSecret rejects too few, duplicate, or zero-indexed shares" {
-    try testing.expectError(error.InsufficientShares, reconstructSecret(&.{}));
+    var scratch: Scalar = undefined;
+    try testing.expectError(error.InsufficientShares, reconstructSecret(&.{}, &scratch));
 
     const dup = [_]ShamirShare{
         .{ .index = 1, .scalar = testScalar(1) },
         .{ .index = 1, .scalar = testScalar(2) },
     };
-    try testing.expectError(error.DuplicateIndex, reconstructSecret(&dup));
+    try testing.expectError(error.DuplicateIndex, reconstructSecret(&dup, &scratch));
 
     const zero = [_]ShamirShare{
         .{ .index = 0, .scalar = testScalar(1) },
         .{ .index = 2, .scalar = testScalar(2) },
     };
-    try testing.expectError(error.ZeroIndex, reconstructSecret(&zero));
+    try testing.expectError(error.ZeroIndex, reconstructSecret(&zero, &scratch));
 }
 
 test "FeldmanCommitments toBytesAlloc/fromBytesAlloc round-trip" {
     const allocator = testing.allocator;
     const secret = testScalar(6);
     const coeffs = [_]Scalar{testScalar(7)};
-    const split = try splitSecretKey(allocator, secret, 2, 2, &coeffs);
+    const split = try splitSecretKey(allocator, &secret, 2, 2, &coeffs);
     defer allocator.free(split.shares);
     defer allocator.free(split.commitments.commitments);
 
@@ -2058,9 +2228,12 @@ test "generate-based Paillier keygen wiring: keygenTrustedDealer wires distinct 
     // Small-but-real Paillier keypairs (paillier.min_generate_bits, kept
     // fast for every-run testing — same rationale as paillier's own
     // "generate: 512-bit keygen" test).
-    const kp1 = try paillier.generate(random, paillier.min_generate_bits);
-    const kp2 = try paillier.generate(random, paillier.min_generate_bits);
-    const kp3 = try paillier.generate(random, paillier.min_generate_bits);
+    var kp1: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp1);
+    var kp2: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp2);
+    var kp3: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp3);
     const paillier_keys = [_]paillier.KeyPair{ kp1, kp2, kp3 };
 
     const aux = toyAuxParams();
@@ -2069,7 +2242,7 @@ test "generate-based Paillier keygen wiring: keygenTrustedDealer wires distinct 
     const secret = testScalar(9);
     const coeffs = [_]Scalar{testScalar(10)};
 
-    const key_shares = try keygenTrustedDealer(allocator, t, n, secret, &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..n]);
+    const key_shares = try keygenTrustedDealer(allocator, t, n, &secret, &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..n]);
     // LIFO defer order matters: `entries` is reached THROUGH
     // `key_shares[0]`, so it must be freed BEFORE `key_shares` itself —
     // meaning its `defer` must be declared AFTER (so it runs first).
@@ -2111,7 +2284,8 @@ test "generate-based Paillier keygen wiring: keygenTrustedDealer wires distinct 
         .{ .index = key_shares[0].index, .scalar = key_shares[0].secret_share },
         .{ .index = key_shares[1].index, .scalar = key_shares[1].secret_share },
     };
-    const reconstructed = try reconstructSecret(&two);
+    var reconstructed: Scalar = undefined;
+    try reconstructSecret(&two, &reconstructed);
     try testing.expectEqualSlices(u8, &secret.toBytes(.big), &reconstructed.toBytes(.big));
 }
 
@@ -2120,8 +2294,10 @@ test "KeyShare toBytesAlloc/fromBytesAlloc round-trip" {
     var prng = std.Random.DefaultPrng.init(0x6b657973686172);
     const random = prng.random();
 
-    const kp1 = try paillier.generate(random, paillier.min_generate_bits);
-    const kp2 = try paillier.generate(random, paillier.min_generate_bits);
+    var kp1: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp1);
+    var kp2: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp2);
     const paillier_keys = [_]paillier.KeyPair{ kp1, kp2 };
 
     const aux = toyAuxParams();
@@ -2129,13 +2305,14 @@ test "KeyShare toBytesAlloc/fromBytesAlloc round-trip" {
 
     const secret = testScalar(11);
     const coeffs = [_]Scalar{testScalar(12)}; // t=2 needs exactly t-1=1 coefficient
-    const key_shares = try keygenTrustedDealer(allocator, 2, 2, secret, &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..2]);
+    const key_shares = try keygenTrustedDealer(allocator, 2, 2, &secret, &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..2]);
     defer allocator.free(key_shares);
     defer allocator.free(key_shares[0].public_keys.entries);
 
     const bytes = try key_shares[0].toBytesAlloc(allocator);
     defer allocator.free(bytes);
-    const back = try KeyShare.fromBytesAlloc(allocator, bytes);
+    var back: KeyShare = undefined;
+    try KeyShare.fromBytesAlloc(allocator, bytes, &back);
     defer allocator.free(back.public_keys.entries);
 
     try testing.expectEqual(key_shares[0].index, back.index);
@@ -2152,8 +2329,10 @@ test "KeyShare.fromBytesAlloc rejects a tuple whose own index is missing from pu
     var prng = std.Random.DefaultPrng.init(0x66325f6869676832); // "f2_high2"
     const random = prng.random();
 
-    const kp1 = try paillier.generate(random, paillier.min_generate_bits);
-    const kp2 = try paillier.generate(random, paillier.min_generate_bits);
+    var kp1: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp1);
+    var kp2: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp2);
     const paillier_keys = [_]paillier.KeyPair{ kp1, kp2 };
 
     const aux = toyAuxParams();
@@ -2161,7 +2340,7 @@ test "KeyShare.fromBytesAlloc rejects a tuple whose own index is missing from pu
 
     const secret = testScalar(41);
     const coeffs = [_]Scalar{testScalar(42)}; // t=2 needs exactly t-1=1 coefficient
-    const key_shares = try keygenTrustedDealer(allocator, 2, 2, secret, &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..2]);
+    const key_shares = try keygenTrustedDealer(allocator, 2, 2, &secret, &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..2]);
     defer allocator.free(key_shares);
     defer allocator.free(key_shares[0].public_keys.entries);
 
@@ -2183,7 +2362,8 @@ test "KeyShare.fromBytesAlloc rejects a tuple whose own index is missing from pu
     const bytes = try stripped.toBytesAlloc(allocator);
     defer allocator.free(bytes);
 
-    try testing.expectError(error.InvalidEncoding, KeyShare.fromBytesAlloc(allocator, bytes));
+    var scratch_ks: KeyShare = undefined;
+    try testing.expectError(error.InvalidEncoding, KeyShare.fromBytesAlloc(allocator, bytes, &scratch_ks));
 }
 
 test "smoke: module compiles and constants are sane" {
@@ -2410,6 +2590,7 @@ test {
     _ = presign;
     _ = ecproofs;
     _ = @import("tsslib_interop.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 // Pull the `aux_proofs` submodule's tests into this module's test binary —
@@ -2436,7 +2617,8 @@ test "generateAuxParamsWithTrapdoor: retains p̃/q̃/lambda; p̃*q̃ == n_tilde 
     const random = prng.random();
 
     const bits: usize = 128;
-    const gen = try generateAuxParamsWithTrapdoor(allocator, random, bits);
+    var gen: AuxParamsWithTrapdoor = undefined;
+    try generateAuxParamsWithTrapdoor(allocator, random, bits, &gen);
     defer gen.trapdoor.deinit(allocator);
 
     // p̃, q̃ nonzero and distinct.
@@ -2545,13 +2727,15 @@ const Corpus = struct {
 
         // ── FeldmanCommitments: real Feldman VSS commitments from this
         //    module's own `splitSecretKey`, at two thresholds.
-        const c2 = try splitSecretKey(allocator, testScalar(6), 2, 2, &[_]Scalar{testScalar(7)});
+        const sk6 = testScalar(6);
+        const c2 = try splitSecretKey(allocator, &sk6, 2, 2, &[_]Scalar{testScalar(7)});
         defer allocator.free(c2.shares);
         defer allocator.free(c2.commitments.commitments);
         const f2 = try c2.commitments.toBytesAlloc(allocator);
         defer allocator.free(f2);
 
-        const c3 = try splitSecretKey(allocator, testScalar(9), 3, 3, &[_]Scalar{ testScalar(4), testScalar(5) });
+        const sk9 = testScalar(9);
+        const c3 = try splitSecretKey(allocator, &sk9, 3, 3, &[_]Scalar{ testScalar(4), testScalar(5) });
         defer allocator.free(c3.shares);
         defer allocator.free(c3.commitments.commitments);
         const f3 = try c3.commitments.toBytesAlloc(allocator);
@@ -2592,14 +2776,17 @@ const Corpus = struct {
         //    `AuxParams` block.
         var prng = std.Random.DefaultPrng.init(0x74686665656c64);
         const random = prng.random();
-        const kp1 = try paillier.generate(random, paillier.min_generate_bits);
-        const kp2 = try paillier.generate(random, paillier.min_generate_bits);
+        var kp1: paillier.KeyPair = undefined;
+        try paillier.generate(random, paillier.min_generate_bits, &kp1);
+        var kp2: paillier.KeyPair = undefined;
+        try paillier.generate(random, paillier.min_generate_bits, &kp2);
         const aux = toyAuxParams();
+        const sk11 = testScalar(11);
         const key_shares = try keygenTrustedDealer(
             allocator,
             2,
             2,
-            testScalar(11),
+            &sk11,
             &[_]Scalar{testScalar(12)},
             &[_]paillier.KeyPair{ kp1, kp2 },
             &[_]AuxParams{ aux, aux },
@@ -2683,7 +2870,8 @@ const Corpus = struct {
 
         // ── AuxParams: a REAL ring-Pedersen triple, `h1 = h2^lambda mod Ñ`,
         //    from this module's own generator; plus the toy triple.
-        const gen = try generateAuxParamsWithTrapdoor(allocator, random, 128);
+        var gen: AuxParamsWithTrapdoor = undefined;
+        try generateAuxParamsWithTrapdoor(allocator, random, 128, &gen);
         defer gen.trapdoor.deinit(allocator);
         const real_aux = try gen.params.toBytesAlloc(allocator);
         defer allocator.free(real_aux);
@@ -2857,7 +3045,8 @@ fn fuzzKeyShareFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
     var buf: [Corpus.ks_buf_bytes]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    const result = KeyShare.fromBytesAlloc(allocator, buf[0..len]) catch return;
+    var result: KeyShare = undefined;
+    KeyShare.fromBytesAlloc(allocator, buf[0..len], &result) catch return;
     defer allocator.free(result.public_keys.entries);
 }
 
@@ -2874,7 +3063,8 @@ test "corpus: the KeyShare seeds reach the decoder, only the well-formed one is 
         var buf: [Corpus.ks_buf_bytes]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
-        const result = KeyShare.fromBytesAlloc(testing.allocator, buf[0..len]) catch continue;
+        var result: KeyShare = undefined;
+        KeyShare.fromBytesAlloc(testing.allocator, buf[0..len], &result) catch continue;
         defer testing.allocator.free(result.public_keys.entries);
         accepted += 1;
     }
@@ -2964,19 +3154,23 @@ test "KeyShare.fromBytesAlloc rejects a message seed that is not the one behind 
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6d73_6773_6565_64);
     const random = prng.random();
-    const kp1 = try paillier.generate(random, paillier.min_generate_bits);
-    const kp2 = try paillier.generate(random, paillier.min_generate_bits);
+    var kp1: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp1);
+    var kp2: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp2);
     const paillier_keys = [_]paillier.KeyPair{ kp1, kp2 };
     const aux = toyAuxParams();
     const aux_params = [_]AuxParams{ aux, aux };
     const coeffs = [_]Scalar{testScalar(12)};
-    const key_shares = try keygenTrustedDealer(allocator, 2, 2, testScalar(11), &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..2]);
+    const sk11 = testScalar(11);
+    const key_shares = try keygenTrustedDealer(allocator, 2, 2, &sk11, &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..2]);
     defer allocator.free(key_shares);
     defer allocator.free(key_shares[0].public_keys.entries);
 
     const bytes = try key_shares[0].toBytesAlloc(allocator);
     defer allocator.free(bytes);
-    const back = try KeyShare.fromBytesAlloc(allocator, bytes);
+    var back: KeyShare = undefined;
+    try KeyShare.fromBytesAlloc(allocator, bytes, &back);
     allocator.free(back.public_keys.entries);
     // The seed of party 1 is 32 x 0x01 (`test_message_seeds`); the announced
     // keys are derived from it. Change the seed in the encoding only.
@@ -2984,5 +3178,6 @@ test "KeyShare.fromBytesAlloc rejects a message seed that is not the one behind 
     const bad = try allocator.dupe(u8, bytes);
     defer allocator.free(bad);
     bad[at] ^= 0x01;
-    try testing.expectError(error.InvalidEncoding, KeyShare.fromBytesAlloc(allocator, bad));
+    var scratch_ks: KeyShare = undefined;
+    try testing.expectError(error.InvalidEncoding, KeyShare.fromBytesAlloc(allocator, bad, &scratch_ks));
 }

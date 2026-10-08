@@ -66,12 +66,14 @@ pub fn main() !void {
     {
         var prng = std.Random.DefaultPrng.init(0xC0FFEE_1234_5678);
         const random = prng.random();
-        var kp_gen = try paillier.generate(random, paillier.min_generate_bits);
+        var kp_gen: paillier.KeyPair = undefined;
+        try paillier.generate(random, paillier.min_generate_bits, &kp_gen);
         defer kp_gen.secret.deinit();
 
         const probe = try Fe.fromPrimitive(u64, kp_gen.public.n_sq, 42);
-        const ct = try paillier.encryptRandom(kp_gen.public, probe, random);
-        const pt = try paillier.decrypt(kp_gen.secret, ct);
+        const ct = try paillier.encryptRandom(kp_gen.public, &probe, random);
+        var pt: paillier.Fe = undefined;
+        try paillier.decrypt(&kp_gen.secret, ct, &pt);
         must(pt.eql(try Fe.fromPrimitive(u64, kp_gen.secret.n, 42)), @src());
         std.debug.print("real generate({d} bits): keygen + encrypt/decrypt round-trip OK\n", .{paillier.min_generate_bits});
     }
@@ -85,7 +87,8 @@ pub fn main() !void {
     var q_be: [8]u8 = undefined;
     std.mem.writeInt(u64, &q_be, 2147483647, .big); // 2^31 - 1
 
-    const kp = try paillier.fromPrimes(&p_be, &q_be);
+    var kp: paillier.KeyPair = undefined;
+    try paillier.fromPrimes(&p_be, &q_be, &kp);
     const pk = kp.public;
     const sk = kp.secret;
 
@@ -100,8 +103,12 @@ pub fn main() !void {
     const r1: u64 = 12_345;
     const r2: u64 = 67_890;
 
-    const ct1 = try paillier.encrypt(pk, try Fe.fromPrimitive(u64, pk.n_sq, salary1), try Fe.fromPrimitive(u64, pk.n_sq, r1));
-    const ct2 = try paillier.encrypt(pk, try Fe.fromPrimitive(u64, pk.n_sq, salary2), try Fe.fromPrimitive(u64, pk.n_sq, r2));
+    const salary1_fe = try Fe.fromPrimitive(u64, pk.n_sq, salary1);
+    const r1_fe = try Fe.fromPrimitive(u64, pk.n_sq, r1);
+    const salary2_fe = try Fe.fromPrimitive(u64, pk.n_sq, salary2);
+    const r2_fe = try Fe.fromPrimitive(u64, pk.n_sq, r2);
+    const ct1 = try paillier.encrypt(pk, &salary1_fe, &r1_fe);
+    const ct2 = try paillier.encrypt(pk, &salary2_fe, &r2_fe);
 
     var ct1_buf: [paillier.modulus_sq_bytes]u8 = undefined;
     try ct1.toBytes(&ct1_buf);
@@ -111,7 +118,8 @@ pub fn main() !void {
     printHex("ct2 = E(salary2, r2)", &ct2_buf);
 
     const sum_ct = paillier.addCiphertexts(pk, ct1, ct2); // cannot fail
-    const round1_total = try paillier.decrypt(sk, sum_ct);
+    var round1_total: paillier.Fe = undefined;
+    try paillier.decrypt(&sk, sum_ct, &round1_total);
     const expected_round1 = try Fe.fromPrimitive(u64, sk.n, salary1 + salary2);
     must(round1_total.eql(expected_round1), @src());
     std.debug.print("round1: decrypt(E(s1)*E(s2)) == s1+s2 ({d})\n", .{salary1 + salary2});
@@ -124,14 +132,17 @@ pub fn main() !void {
     const bonus: u64 = 5_000;
     const match_multiplier: u64 = 2;
 
-    const ct_with_bonus = try paillier.addPlaintext(pk, sum_ct, try Fe.fromPrimitive(u64, pk.n_sq, bonus));
-    const ct_matched = try paillier.mulPlaintext(pk, ct_with_bonus, try Fe.fromPrimitive(u64, pk.n_sq, match_multiplier));
+    const bonus_fe = try Fe.fromPrimitive(u64, pk.n_sq, bonus);
+    const match_fe = try Fe.fromPrimitive(u64, pk.n_sq, match_multiplier);
+    const ct_with_bonus = try paillier.addPlaintext(pk, sum_ct, &bonus_fe);
+    const ct_matched = try paillier.mulPlaintext(pk, ct_with_bonus, &match_fe);
 
     var ct_matched_buf: [paillier.modulus_sq_bytes]u8 = undefined;
     try ct_matched.toBytes(&ct_matched_buf);
     printHex("ct_matched = ((E(s1)*E(s2))*g^bonus)^match_multiplier", &ct_matched_buf);
 
-    const final_total = try paillier.decrypt(sk, ct_matched);
+    var final_total: paillier.Fe = undefined;
+    try paillier.decrypt(&sk, ct_matched, &final_total);
     const expected_final = (salary1 + salary2 + bonus) * match_multiplier;
     const expected_final_fe = try Fe.fromPrimitive(u64, sk.n, expected_final);
     must(final_total.eql(expected_final_fe), @src());
@@ -157,7 +168,8 @@ pub fn main() !void {
         var tampered = ct1_buf;
         tampered[tampered.len - 1] ^= 0x01;
         const bad_ct = try paillier.Ciphertext.fromBytes(pk, &tampered);
-        const decrypted_garbage = try paillier.decrypt(sk, bad_ct);
+        var decrypted_garbage: paillier.Fe = undefined;
+        try paillier.decrypt(&sk, bad_ct, &decrypted_garbage);
         must(!decrypted_garbage.eql(try Fe.fromPrimitive(u64, sk.n, salary1)), @src());
         std.debug.print("tampered ct1 (one flipped byte): decrypted CLEANLY to a different value (Paillier has no ciphertext integrity — expected, not a defect)\n", .{});
     }
@@ -169,7 +181,8 @@ pub fn main() !void {
     // in place of a real ciphertext). ──────────────────────────────────
     {
         const degenerate_c: paillier.Ciphertext = .{ .c = try Fe.fromPrimitive(u64, pk.n_sq, 2305843009213693951) };
-        if (paillier.decrypt(sk, degenerate_c)) |_| {
+        var degenerate_out: paillier.Fe = undefined;
+        if (paillier.decrypt(&sk, degenerate_c, &degenerate_out)) |_| {
             return error.UnexpectedAccept;
         } else |err| switch (err) {
             error.InvalidCiphertext => std.debug.print("c = p (shares a factor with n): InvalidCiphertext (expected)\n", .{}),
@@ -182,7 +195,8 @@ pub fn main() !void {
     // time rather than decrypt time, a different failure point than
     // negative path 1. ──────────────────────────────────────────────────
     {
-        const other_kp = try paillier.fromPrimes(&[_]u8{23}, &[_]u8{29});
+        var other_kp: paillier.KeyPair = undefined;
+        try paillier.fromPrimes(&[_]u8{23}, &[_]u8{29}, &other_kp);
         if (paillier.Ciphertext.fromBytes(other_kp.public, &ct1_buf)) |_| {
             return error.UnexpectedAccept;
         } else |err| switch (err) {

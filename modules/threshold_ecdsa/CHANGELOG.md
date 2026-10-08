@@ -5,6 +5,30 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** measured with the new
+  ReleaseFast stack probe (`src/stackprobe_test.zig`), every entry point that touches a secret
+  left it in dead stack frames although each named buffer was wiped: the presigning rounds
+  (nonces `k`, `γ`, `σ`, `δ`, `ℓ`, `r_k`; round 3 the whole Paillier secret key, 21-23 copies per
+  party), `finish`/`signShare` (`k`, `σ`, message seed), the MtA (`α`, `β`, `β'`, `r_a`, `r_b`, the
+  Paillier key), the ZK and Sigma provers (witnesses), key generation and the codecs (`x_i`, the
+  Paillier factors, `λ`, `μ`, the CRT block, the ring-Pedersen trapdoor) — 141 copies on the
+  signing path and 354 over 28 building blocks before the fix, 0 after (61 calls, three tests).
+  Fix as in `bip32`: each public entry point runs its body one frame down and burns the stack
+  at that depth (`burn.zig`, sized from the measured depth), and secrets no longer cross an API
+  by value — secret parameters are pointers, secret results go to an out-parameter:
+  `Party.init(…, share: *const KeyShare, …, out: *Party)`, `Party.finish(inbox, out)`,
+  `Presignature.fromBytesAlloc(…, out)`, `PresignaturePool.take(…, out) !bool`,
+  `mta.*` (`a`/`b`/`alice_sk` by pointer; `mtaAliceInitChecked`, `mtaBobResponse*`,
+  `mtaAliceFinalize*`, `decryptWithRandomness` write `out`), `zkproofs.prove*` and
+  `ecproofs.prove*`/`pedersenCommit` (scalars and Paillier randomness by pointer),
+  `splitSecretKey`/`keygenTrustedDealer` (`secret_key` by pointer), `reconstructSecret(…, out)`,
+  `generatePaillierBlum`/`paillierBlumFromPrimes(…, out)`, `auxLogInverse(…, x: *const, out)`,
+  `generateAuxParamsWithTrapdoor`/`auxParamsWithTrapdoorFromSafePrimes(…, out)`,
+  `KeyShare.fromBytesAlloc(…, out)`, `aux_proofs` provers (`trapdoor` by pointer),
+  `aux_info.LocalAux.generate(…, out)`, `LocalAux.fromParts` (moves: wipes its sources) and
+  `assembleKeyShare(…, secret_share: *const, …, out)`. Callers: `dkg` (migrated).
+  The burn's buffer is 16-aligned: 32-aligned, the frame realigned and up to 56 bytes between the
+  saved frame pointer and the buffer stayed unzeroed — half of `α` survived there.
 - **2026-10-04** — **BREAKING (API): review 2026-10-03 F5, F11, F13, F15.** The §4.3
   opening gains an echo round: `openAbort` → `echoOpenings(openings)` (returns the round-9 echo)
   → `identify(echoes)`; an opening shown two ways names its signer (`equivocation`).

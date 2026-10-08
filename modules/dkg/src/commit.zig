@@ -15,6 +15,18 @@
 
 const std = @import("std");
 const tecdsa = @import("threshold_ecdsa");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const random_scalar_stack_burn = 4 * 1024;
+const eval_poly_stack_burn = 8 * 1024;
+const pedersen_eval_share_stack_burn = 24 * 1024;
+const feldman_eval_share_stack_burn = 24 * 1024;
+const feldman_commit_vector_stack_burn = 24 * 1024;
+const pedersen_commit_vector_stack_burn = 24 * 1024;
 
 pub const Secp256k1 = tecdsa.Secp256k1;
 pub const Scalar = tecdsa.Scalar;
@@ -35,7 +47,17 @@ pub fn scalarFromIndex(index: u32) Scalar {
 /// (48 bytes reduced mod the group order, so the bias is ~2^-128). The
 /// intermediate buffer is wiped. Draw order matters for reproducibility: the
 /// lockstep driver and the per-participant API both draw with THIS shape.
-pub fn randomScalar(random: std.Random) Scalar {
+pub fn randomScalar(random: std.Random, out: *Scalar) void {
+    const result = randomScalarUnburned(random, out);
+    burn.stack(random_scalar_stack_burn);
+    return result;
+}
+
+noinline fn randomScalarUnburned(random: std.Random, out: *Scalar) void {
+    out.* = randomScalarByValue(random);
+}
+
+fn randomScalarByValue(random: std.Random) Scalar {
     var buf: [48]u8 = undefined;
     defer std.crypto.secureZero(u8, &buf);
     random.bytes(&buf);
@@ -68,7 +90,17 @@ pub fn scaleElement(e: Element, k: Scalar) CommitError!Element {
 /// `f(x) = coeffs[0] + coeffs[1]·x + … + coeffs[t-1]·x^{t-1}` via Horner
 /// (constant term `coeffs[0]` added last). `coeffs` and the output are
 /// SECRET; every op goes through `Scalar`'s constant-time arithmetic.
-pub fn evalPoly(coeffs: []const Scalar, x: Scalar) Scalar {
+pub fn evalPoly(coeffs: []const Scalar, x: Scalar, out: *Scalar) void {
+    const result = evalPolyUnburned(coeffs, x, out);
+    burn.stack(eval_poly_stack_burn);
+    return result;
+}
+
+noinline fn evalPolyUnburned(coeffs: []const Scalar, x: Scalar, out: *Scalar) void {
+    out.* = evalPolyByValue(coeffs, x);
+}
+
+fn evalPolyByValue(coeffs: []const Scalar, x: Scalar) Scalar {
     std.debug.assert(coeffs.len >= 1);
     var acc = Scalar.zero;
     var k: usize = coeffs.len;
@@ -112,6 +144,12 @@ pub fn pedersenH() Element {
 /// `commitments[0] = g^{a_0}`. Owned; caller frees. REAL (per-coefficient
 /// `basePoint.mul`, the `threshold_ecdsa.splitSecretKey` shape).
 pub fn feldmanCommitVector(allocator: std.mem.Allocator, a: []const Scalar) (std.mem.Allocator.Error || CommitError)![]Element {
+    const result = feldmanCommitVectorUnburned(allocator, a);
+    burn.stack(feldman_commit_vector_stack_burn);
+    return result;
+}
+
+noinline fn feldmanCommitVectorUnburned(allocator: std.mem.Allocator, a: []const Scalar) (std.mem.Allocator.Error || CommitError)![]Element {
     const out = try allocator.alloc(Element, a.len);
     errdefer allocator.free(out);
     for (out, a) |*slot, coeff| {
@@ -125,6 +163,17 @@ pub fn feldmanCommitVector(allocator: std.mem.Allocator, a: []const Scalar) (std
 /// commitment vector. `a.len` must equal `b.len`. Owned; caller frees.
 /// REAL.
 pub fn pedersenCommitVector(
+    allocator: std.mem.Allocator,
+    a: []const Scalar,
+    b: []const Scalar,
+    h: Element,
+) (std.mem.Allocator.Error || CommitError)![]Element {
+    const result = pedersenCommitVectorUnburned(allocator, a, b, h);
+    burn.stack(pedersen_commit_vector_stack_burn);
+    return result;
+}
+
+noinline fn pedersenCommitVectorUnburned(
     allocator: std.mem.Allocator,
     a: []const Scalar,
     b: []const Scalar,
@@ -165,7 +214,17 @@ pub fn evalCommitmentAt(commitments: []const Element, index: u32) CommitError!El
 /// Pedersen verification equation (a received share `(s, s')` is valid iff
 /// this equals `evalCommitmentAt(C, j)`). REAL; the core decides how the
 /// comparison drives complaints/QUAL.
-pub fn pedersenEvalShare(s: Scalar, s_prime: Scalar, h: Element) CommitError!Element {
+pub fn pedersenEvalShare(s: *const Scalar, s_prime: *const Scalar, h: Element) CommitError!Element {
+    const result = pedersenEvalShareUnburned(s, s_prime, h);
+    burn.stack(pedersen_eval_share_stack_burn);
+    return result;
+}
+
+noinline fn pedersenEvalShareUnburned(s: *const Scalar, s_prime: *const Scalar, h: Element) CommitError!Element {
+    return pedersenEvalShareByValue(s.*, s_prime.*, h);
+}
+
+fn pedersenEvalShareByValue(s: Scalar, s_prime: Scalar, h: Element) CommitError!Element {
     const g_s = Secp256k1.basePoint.mul(s.toBytes(.big), .big) catch return error.IdentityElement;
     const h_sp = (try h.point()).mul(s_prime.toBytes(.big), .big) catch return error.IdentityElement;
     return Element.fromPoint(g_s.add(h_sp));
@@ -173,7 +232,17 @@ pub fn pedersenEvalShare(s: Scalar, s_prime: Scalar, h: Element) CommitError!Ele
 
 /// `g^s` for a single share — the left-hand side of the Feldman
 /// verification equation. REAL.
-pub fn feldmanEvalShare(s: Scalar) CommitError!Element {
+pub fn feldmanEvalShare(s: *const Scalar) CommitError!Element {
+    const result = feldmanEvalShareUnburned(s);
+    burn.stack(feldman_eval_share_stack_burn);
+    return result;
+}
+
+noinline fn feldmanEvalShareUnburned(s: *const Scalar) CommitError!Element {
+    return feldmanEvalShareByValue(s.*);
+}
+
+fn feldmanEvalShareByValue(s: Scalar) CommitError!Element {
     const g_s = Secp256k1.basePoint.mul(s.toBytes(.big), .big) catch return error.IdentityElement;
     return Element.fromPoint(g_s);
 }
@@ -189,13 +258,14 @@ test "evalPoly matches manual Horner and evalCommitmentAt in the exponent" {
     const coeffs = [_]Scalar{ c0, c1, c2 };
 
     // f(4) = 3 + 20 + 32 = 55
-    const at4 = evalPoly(&coeffs, scalarFromIndex(4));
+    var at4: Scalar = undefined;
+    evalPoly(&coeffs, scalarFromIndex(4), &at4);
     try testing.expectEqualSlices(u8, &scalarFromIndex(55).toBytes(.big), &at4.toBytes(.big));
 
     // g^{f(4)} must equal evalCommitmentAt(Feldman(coeffs), 4)
     const feld = try feldmanCommitVector(allocator, &coeffs);
     defer allocator.free(feld);
-    const lhs = try feldmanEvalShare(at4);
+    const lhs = try feldmanEvalShare(&at4);
     const rhs = try evalCommitmentAt(feld, 4);
     try testing.expectEqualSlices(u8, &lhs.toBytes(), &rhs.toBytes());
 }
@@ -224,9 +294,11 @@ test "pedersen commitment opens consistently at a point" {
     defer allocator.free(C);
 
     const j: u32 = 3;
-    const s = evalPoly(&a, scalarFromIndex(j));
-    const sp = evalPoly(&b, scalarFromIndex(j));
-    const lhs = try pedersenEvalShare(s, sp, h);
+    var s: Scalar = undefined;
+    var sp: Scalar = undefined;
+    evalPoly(&a, scalarFromIndex(j), &s);
+    evalPoly(&b, scalarFromIndex(j), &sp);
+    const lhs = try pedersenEvalShare(&s, &sp, h);
     const rhs = try evalCommitmentAt(C, j);
     // g^{f(j)} h^{f'(j)} == Π C_k^{j^k}
     try testing.expectEqualSlices(u8, &lhs.toBytes(), &rhs.toBytes());

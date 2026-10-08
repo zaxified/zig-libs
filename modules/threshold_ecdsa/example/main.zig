@@ -42,7 +42,7 @@ pub fn main() !void {
     const secret_key = Scalar.random(io);
     const coefficients = [_]Scalar{Scalar.random(io)};
 
-    const split = try threshold_ecdsa.splitSecretKey(gpa, secret_key, 2, 3, &coefficients);
+    const split = try threshold_ecdsa.splitSecretKey(gpa, &secret_key, 2, 3, &coefficients);
     defer gpa.free(split.shares);
     defer gpa.free(split.commitments.commitments);
 
@@ -56,7 +56,8 @@ pub fn main() !void {
 
     // A quorum of 2 (of 3) shares reconstructs the original secret.
     const quorum = [_]threshold_ecdsa.ShamirShare{ split.shares[0], split.shares[2] };
-    const reconstructed = try threshold_ecdsa.reconstructSecret(&quorum);
+    var reconstructed: Scalar = undefined;
+    try threshold_ecdsa.reconstructSecret(&quorum, &reconstructed);
     must(reconstructed.toBytes(.big).len == secret_key.toBytes(.big).len, @src());
     must(std.mem.eql(u8, &reconstructed.toBytes(.big), &secret_key.toBytes(.big)), @src());
     std.debug.print("reconstructed secret matches the dealt one\n", .{});
@@ -65,7 +66,7 @@ pub fn main() !void {
     // silently-wrong arithmetic — the reconstruction has no way to detect a
     // logic bug that hands it the same party twice, so it must refuse.
     const duplicate = [_]threshold_ecdsa.ShamirShare{ split.shares[0], split.shares[0] };
-    if (threshold_ecdsa.reconstructSecret(&duplicate)) |_| {
+    if (threshold_ecdsa.reconstructSecret(&duplicate, &reconstructed)) |_| {
         unreachable;
     } else |err| switch (err) {
         error.DuplicateIndex => std.debug.print("duplicate share index correctly rejected\n", .{}),
@@ -74,7 +75,7 @@ pub fn main() !void {
 
     // A malformed (t, n) pair must fail the same way, before any Shamir
     // arithmetic runs.
-    if (threshold_ecdsa.splitSecretKey(gpa, secret_key, 5, 3, &coefficients)) |bad| {
+    if (threshold_ecdsa.splitSecretKey(gpa, &secret_key, 5, 3, &coefficients)) |bad| {
         gpa.free(bad.shares);
         gpa.free(bad.commitments.commitments);
         unreachable;

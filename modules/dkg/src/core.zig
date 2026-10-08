@@ -31,6 +31,15 @@
 const std = @import("std");
 const commit = @import("commit.zig");
 const types = @import("types.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const verify_pedersen_share_stack_burn = 24 * 1024;
+const verify_feldman_share_stack_burn = 24 * 1024;
+const combine_key_share_stack_burn = 8 * 1024;
 
 pub const Scalar = types.Scalar;
 pub const Element = types.Element;
@@ -60,6 +69,28 @@ pub const Error = commit.CommitError || error{ EmptyQual, LengthMismatch };
 pub fn verifyPedersenShare(
     commitments: []const Element,
     receiver: u32,
+    s: *const Scalar,
+    s_prime: *const Scalar,
+    h: Element,
+) bool {
+    const result = verifyPedersenShareUnburned(commitments, receiver, s, s_prime, h);
+    burn.stack(verify_pedersen_share_stack_burn);
+    return result;
+}
+
+noinline fn verifyPedersenShareUnburned(
+    commitments: []const Element,
+    receiver: u32,
+    s: *const Scalar,
+    s_prime: *const Scalar,
+    h: Element,
+) bool {
+    return verifyPedersenShareByValue(commitments, receiver, s.*, s_prime.*, h);
+}
+
+fn verifyPedersenShareByValue(
+    commitments: []const Element,
+    receiver: u32,
     s: Scalar,
     s_prime: Scalar,
     h: Element,
@@ -67,7 +98,7 @@ pub fn verifyPedersenShare(
     // Reject-don't-panic on adversarial shapes: an empty commitment vector
     // would trip evalCommitmentAt's precondition assert.
     if (commitments.len == 0) return false;
-    const lhs = commit.pedersenEvalShare(s, s_prime, h) catch return false;
+    const lhs = commit.pedersenEvalShare(&s, &s_prime, h) catch return false;
     const rhs = commit.evalCommitmentAt(commitments, receiver) catch return false;
     return std.crypto.timing_safe.eql([types.Ne]u8, lhs.toBytes(), rhs.toBytes());
 }
@@ -89,10 +120,28 @@ pub fn verifyPedersenShare(
 pub fn verifyFeldmanShare(
     commitments: []const Element,
     receiver: u32,
+    s: *const Scalar,
+) bool {
+    const result = verifyFeldmanShareUnburned(commitments, receiver, s);
+    burn.stack(verify_feldman_share_stack_burn);
+    return result;
+}
+
+noinline fn verifyFeldmanShareUnburned(
+    commitments: []const Element,
+    receiver: u32,
+    s: *const Scalar,
+) bool {
+    return verifyFeldmanShareByValue(commitments, receiver, s.*);
+}
+
+fn verifyFeldmanShareByValue(
+    commitments: []const Element,
+    receiver: u32,
     s: Scalar,
 ) bool {
     if (commitments.len == 0) return false;
-    const lhs = commit.feldmanEvalShare(s) catch return false;
+    const lhs = commit.feldmanEvalShare(&s) catch return false;
     const rhs = commit.evalCommitmentAt(commitments, receiver) catch return false;
     return std.crypto.timing_safe.eql([types.Ne]u8, lhs.toBytes(), rhs.toBytes());
 }
@@ -195,6 +244,24 @@ pub fn deriveGroupPublicKey(
 /// `x = Σ_{i∈QUAL} a_i0`, with `x·G == Q` and any `t` such shares Lagrange-
 /// reconstructing `x`.
 pub fn combineKeyShare(
+    qualified: []const bool,
+    received: []const ?Scalar,
+    out: *Scalar,
+) Error!void {
+    const result = combineKeyShareUnburned(qualified, received, out);
+    burn.stack(combine_key_share_stack_burn);
+    return result;
+}
+
+noinline fn combineKeyShareUnburned(
+    qualified: []const bool,
+    received: []const ?Scalar,
+    out: *Scalar,
+) Error!void {
+    out.* = try combineKeyShareByValue(qualified, received);
+}
+
+fn combineKeyShareByValue(
     qualified: []const bool,
     received: []const ?Scalar,
 ) Error!Scalar {

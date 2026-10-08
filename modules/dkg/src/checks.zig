@@ -15,6 +15,13 @@
 const std = @import("std");
 const tecdsa = @import("threshold_ecdsa");
 const types = @import("types.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const reconstructs_to_q_stack_burn = 24 * 1024;
 
 pub const Secp256k1 = tecdsa.Secp256k1;
 pub const Scalar = tecdsa.Scalar;
@@ -47,6 +54,12 @@ pub fn verifyingShareConsistent(o: DkgShareOutput) bool {
 /// `error`/`false` distinctly: a genuine reconstruction failure is `false`
 /// (the teeth firing), not a thrown error.
 pub fn reconstructsToQ(allocator: std.mem.Allocator, shares: []const DkgShareOutput) !bool {
+    const result = reconstructsToQUnburned(allocator, shares);
+    burn.stack(reconstructs_to_q_stack_burn);
+    return result;
+}
+
+noinline fn reconstructsToQUnburned(allocator: std.mem.Allocator, shares: []const DkgShareOutput) !bool {
     if (shares.len == 0) return false;
     const ss = try allocator.alloc(tecdsa.ShamirShare, shares.len);
     defer {
@@ -55,7 +68,8 @@ pub fn reconstructsToQ(allocator: std.mem.Allocator, shares: []const DkgShareOut
     }
     for (ss, shares) |*dst, src| dst.* = .{ .index = src.index, .scalar = src.secret_share };
 
-    const x = tecdsa.reconstructSecret(ss) catch return false;
+    var x: tecdsa.Scalar = undefined;
+    tecdsa.reconstructSecret(ss, &x) catch return false;
     const p = Secp256k1.basePoint.mul(x.toBytes(.big), .big) catch return false;
     const xg = (Element.fromPoint(p) catch return false).toBytes();
     return std.mem.eql(u8, &xg, &shares[0].group_public_key.toBytes());

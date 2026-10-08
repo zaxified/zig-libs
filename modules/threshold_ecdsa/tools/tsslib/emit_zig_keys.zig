@@ -40,10 +40,10 @@ pub fn main(init: std.process.Init) !void {
     var keys: [n]paillier.KeyPair = undefined;
     var aux_params: [n]tecdsa.AuxParams = undefined;
     for (0..n) |i| {
-        auxes[i] = try tecdsa.generateAuxParamsWithTrapdoor(gpa, random, tecdsa.aux_modulus_bits);
+        try tecdsa.generateAuxParamsWithTrapdoor(gpa, random, tecdsa.aux_modulus_bits, &auxes[i]);
         aux_params[i] = auxes[i].params;
-        pail_gen[i] = try tecdsa.generateAuxParamsWithTrapdoor(gpa, random, paillier.modulus_bits);
-        keys[i] = try paillier.fromPrimes(pail_gen[i].trapdoor.p, pail_gen[i].trapdoor.q);
+        try tecdsa.generateAuxParamsWithTrapdoor(gpa, random, paillier.modulus_bits, &pail_gen[i]);
+        try paillier.fromPrimes(pail_gen[i].trapdoor.p, pail_gen[i].trapdoor.q, &keys[i]);
         std.debug.print("party {d}: primes done\n", .{i + 1});
     }
     defer for (0..n) |i| {
@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
     const coefficient = tecdsa.Scalar.random(init.io);
     var message_seeds: [n][32]u8 = undefined;
     for (&message_seeds) |*sd| sd.* = tecdsa.Scalar.random(init.io).toBytes(.big);
-    const shares = try tecdsa.keygenTrustedDealer(gpa, 2, n, secret, &.{coefficient}, &keys, &aux_params, &message_seeds);
+    const shares = try tecdsa.keygenTrustedDealer(gpa, 2, n, &secret, &.{coefficient}, &keys, &aux_params, &message_seeds);
     defer gpa.free(shares);
     defer gpa.free(shares[0].public_keys.entries);
 
@@ -90,7 +90,9 @@ pub fn main(init: std.process.Init) !void {
         // tss-lib's Alpha (h2 = h1^Alpha) is the inverse of this module's
         // trapdoor (h1 = h2^lambda, since 2026-10-03).
         const td = auxes[i].trapdoor;
-        try auxFeHex(w, try tecdsa.auxLogInverse(aux_params[i].n_tilde, td.p, td.q, td.lambda));
+        var alpha: tecdsa.AuxFe = undefined;
+        try tecdsa.auxLogInverse(aux_params[i].n_tilde, td.p, td.q, &td.lambda, &alpha);
+        try auxFeHex(w, alpha);
         try w.print("\"\n    }}{s}\n", .{if (i + 1 < n) "," else ""});
     }
     try w.writeAll("  ]\n}\n");

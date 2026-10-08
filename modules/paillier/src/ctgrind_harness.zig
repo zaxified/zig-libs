@@ -226,7 +226,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         taintBytes(taint, &q);
         const pr = reloadVolatile([harness_p.len]u8, &p);
         const qr = reloadVolatile([harness_q.len]u8, &q);
-        var key = try paillier.fromPrimes(&pr, &qr);
+        var key: paillier.KeyPair = undefined;
+        try paillier.fromPrimes(&pr, &qr, &key);
         defer key.secret.deinit();
         printFe("lambda", key.secret.lambda);
         return;
@@ -235,7 +236,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // For the other targets the one-time key derivation runs on the
     // UNTAINTED fixed primes above — the per-operation path is what they
     // measure; the derivation itself is target `keygen`'s.
-    const kp = try paillier.fromPrimes(&harness_p, &harness_q);
+    var kp: paillier.KeyPair = undefined;
+    try paillier.fromPrimes(&harness_p, &harness_q, &kp);
     const pk = kp.public;
 
     // A fixed, public "attacker-chosen" ciphertext for the decrypt targets,
@@ -243,7 +245,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // — both built with the PUBLIC key, before any taint exists.
     const m0 = try Fe.fromPrimitive(u64, pk.n_sq, 0x1234_5678_9abc_def0);
     const r0 = try Fe.fromPrimitive(u64, pk.n_sq, 0x0fed_cba9_8765_4321);
-    const c0 = try paillier.encrypt(pk, m0, r0);
+    const c0 = try paillier.encrypt(pk, &m0, &r0);
 
     switch (target) {
         .crt => {
@@ -265,9 +267,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&mp.digit_bits));
                 std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&mp.nbits));
             };
-            const sk_reloaded = reloadVolatile(paillier.SecretKey, &sk);
 
-            const m = try paillier.decrypt(sk_reloaded, c0);
+            // The key is passed by pointer, so `decrypt` reads the tainted
+            // object itself — no by-value reload is needed.
+            var m: Fe = undefined;
+            try paillier.decrypt(&sk, c0, &m);
             printFe("m", m);
         },
         .noncrt => {
@@ -283,13 +287,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var mu_buf: [paillier.modulus_bytes]u8 = undefined;
             try kp.secret.muToBytes(mu_buf[0..n_len]);
 
-            var sk = try paillier.SecretKey.fromBytes(n_buf[0..n_len], &lambda_buf, mu_buf[0..n_len]);
+            var sk: paillier.SecretKey = undefined;
+            try paillier.SecretKey.fromBytes(n_buf[0..n_len], &lambda_buf, mu_buf[0..n_len], &sk);
             std.debug.assert(sk.crt == null);
             taintBytes(taint, std.mem.asBytes(&sk.lambda));
             taintBytes(taint, std.mem.asBytes(&sk.mu));
-            const sk_reloaded = reloadVolatile(paillier.SecretKey, &sk);
 
-            const m = try paillier.decrypt(sk_reloaded, c0);
+            var m: Fe = undefined;
+            try paillier.decrypt(&sk, c0, &m);
             printFe("m", m);
         },
         .mul => {
@@ -298,9 +303,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // ciphertext operand `c0` is the fixed public one, untainted.
             var k = try Fe.fromPrimitive(u64, pk.n_sq, 0x9e37_79b9_7f4a_7c15);
             taintBytes(taint, std.mem.asBytes(&k));
-            const k_reloaded = reloadVolatile(Fe, &k);
 
-            const c = try paillier.mulPlaintext(pk, c0, k_reloaded);
+            const c = try paillier.mulPlaintext(pk, c0, &k);
             printCiphertext("c", c);
         },
         .addm => {
@@ -309,9 +313,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // SPEC.md claims never branches on `m` at all.
             var m = try Fe.fromPrimitive(u64, pk.n_sq, 0x4242_4242_4242_4242);
             taintBytes(taint, std.mem.asBytes(&m));
-            const m_reloaded = reloadVolatile(Fe, &m);
 
-            const c = try paillier.addPlaintext(pk, c0, m_reloaded);
+            const c = try paillier.addPlaintext(pk, c0, &m);
             printCiphertext("c", c);
         },
         .keygen => unreachable, // returned above

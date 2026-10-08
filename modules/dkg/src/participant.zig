@@ -69,6 +69,17 @@ const commit = @import("commit.zig");
 const core = @import("core.zig");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const init_stack_burn = 24 * 1024;
+const init_with_polynomials_stack_burn = 24 * 1024;
+const start_stack_burn = 24 * 1024;
+const handle_stack_burn = 24 * 1024;
+const advance_stack_burn = 24 * 1024;
 
 pub const Scalar = types.Scalar;
 pub const Element = types.Element;
@@ -151,6 +162,12 @@ pub const Participant = struct {
     /// Party `index` (1-based) of a `cfg` run; draws its two secret polynomials
     /// from `random`.
     pub fn init(allocator: std.mem.Allocator, cfg: Config, index: u32, random: std.Random) InitError!Participant {
+        const result = initUnburned(allocator, cfg, index, random);
+        burn.stack(init_stack_burn);
+        return result;
+    }
+
+    noinline fn initUnburned(allocator: std.mem.Allocator, cfg: Config, index: u32, random: std.Random) InitError!Participant {
         if (!cfg.valid()) return error.InvalidConfig;
         if (!cfg.honestMajority()) return error.NoHonestMajority;
         const t: usize = cfg.t;
@@ -164,8 +181,8 @@ pub const Participant = struct {
             std.crypto.secureZero(u8, std.mem.sliceAsBytes(b));
             allocator.free(b);
         }
-        for (a) |*c| c.* = commit.randomScalar(random);
-        for (b) |*c| c.* = commit.randomScalar(random);
+        for (a) |*c| commit.randomScalar(random, c);
+        for (b) |*c| commit.randomScalar(random, c);
         return initWithPolynomials(allocator, cfg, index, a, b);
     }
 
@@ -174,6 +191,18 @@ pub const Participant = struct {
     /// polynomial, both of length `cfg.t`). For tests and recorded
     /// transcripts; a deployment uses `init`.
     pub fn initWithPolynomials(
+        allocator: std.mem.Allocator,
+        cfg: Config,
+        index: u32,
+        a_in: []const Scalar,
+        b_in: []const Scalar,
+    ) InitError!Participant {
+        const result = initWithPolynomialsUnburned(allocator, cfg, index, a_in, b_in);
+        burn.stack(init_with_polynomials_stack_burn);
+        return result;
+    }
+
+    noinline fn initWithPolynomialsUnburned(
         allocator: std.mem.Allocator,
         cfg: Config,
         index: u32,
@@ -348,6 +377,12 @@ pub const Participant = struct {
     /// Round 1: deal. Queues the Pedersen broadcast and one `share` frame per
     /// peer.
     pub fn start(self: *Participant) StartError!void {
+        const result = startUnburned(self);
+        burn.stack(start_stack_burn);
+        return result;
+    }
+
+    noinline fn startUnburned(self: *Participant) StartError!void {
         if (self.phase_ != .new) return error.WrongRound;
         const aa = self.arena.allocator();
         const me = self.me;
@@ -356,7 +391,8 @@ pub const Participant = struct {
         self.ped[mi] = try commit.pedersenCommitVector(aa, self.a, self.b, self.h);
         self.fel[mi] = try commit.feldmanCommitVector(aa, self.a);
         self.present[mi] = true;
-        self.accepted[mi] = commit.evalPoly(self.a, commit.scalarFromIndex(me));
+        self.accepted[mi] = Scalar.zero;
+        commit.evalPoly(self.a, commit.scalarFromIndex(me), &self.accepted[mi].?);
 
         const pb: types.PedersenBroadcast = .{ .dealer = me, .commitments = self.ped[mi].? };
         const body = try pb.toBytesAlloc(self.allocator);
@@ -367,14 +403,15 @@ pub const Participant = struct {
         while (j <= self.cfg.n) : (j += 1) {
             if (j == me) continue;
             const x = commit.scalarFromIndex(j);
-            const sm: types.ShareMsg = .{
+            var sm: types.ShareMsg = .{
                 .dealer = me,
                 .receiver = j,
-                .s = commit.evalPoly(self.a, x),
-                .s_prime = commit.evalPoly(self.b, x),
+                .s = Scalar.zero,
+                .s_prime = Scalar.zero,
             };
-            var sm_wipe = sm;
-            defer std.crypto.secureZero(u8, std.mem.asBytes(&sm_wipe));
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&sm));
+            commit.evalPoly(self.a, x, &sm.s);
+            commit.evalPoly(self.b, x, &sm.s_prime);
             var bytes = sm.toBytes();
             defer std.crypto.secureZero(u8, &bytes);
             try self.push(.{ .party = j }, .share, &bytes);
@@ -385,6 +422,12 @@ pub const Participant = struct {
     /// Feed one frame from the authenticated peer `from`. A refused frame
     /// changes nothing.
     pub fn handle(self: *Participant, from: u32, bytes: []const u8) MessageError!void {
+        const result = handleUnburned(self, from, bytes);
+        burn.stack(handle_stack_burn);
+        return result;
+    }
+
+    noinline fn handleUnburned(self: *Participant, from: u32, bytes: []const u8) MessageError!void {
         switch (self.phase_) {
             .done => return error.Finished,
             .aborted => return error.Aborted,
@@ -433,6 +476,12 @@ pub const Participant = struct {
     /// half-done transition (say, an allocation failure midway) is never
     /// retried, so it cannot queue a frame twice.
     pub fn advance(self: *Participant) AdvanceError!void {
+        const result = advanceUnburned(self);
+        burn.stack(advance_stack_burn);
+        return result;
+    }
+
+    noinline fn advanceUnburned(self: *Participant) AdvanceError!void {
         const r = switch (self.phase_) {
             .new => return error.WrongRound,
             .shares => self.advanceShares(),
@@ -521,7 +570,7 @@ pub const Participant = struct {
         const ped = self.ped[from - 1] orelse return error.Unsolicited;
         const m = types.ShareMsg.fromBytes(body[0..types.ShareMsg.encoded_length].*) catch return error.Malformed;
         self.defense_seen.items[k] = true;
-        const ok = core.verifyPedersenShare(ped, complainant, m.s, m.s_prime, self.h);
+        const ok = core.verifyPedersenShare(ped, complainant, &m.s, &m.s_prime, self.h);
         self.defense_valid.items[k] = ok;
         // A defense opens the disputed share in public: if it was ours, that
         // opening replaces the bad wire share.
@@ -550,9 +599,9 @@ pub const Participant = struct {
         if (!self.qualified[accused - 1]) return error.Unsolicited;
         const m = types.ShareMsg.fromBytes(body[0..types.ShareMsg.encoded_length].*) catch return error.Malformed;
         const ped = self.ped[accused - 1] orelse return error.Unsolicited;
-        if (!core.verifyPedersenShare(ped, from, m.s, m.s_prime, self.h)) return error.Unverified;
+        if (!core.verifyPedersenShare(ped, from, &m.s, &m.s_prime, self.h)) return error.Unverified;
         if (self.fel[accused - 1]) |fel| {
-            if (core.verifyFeldmanShare(fel, from, m.s)) return error.Unverified;
+            if (core.verifyFeldmanShare(fel, from, &m.s)) return error.Unverified;
         }
         self.exposed[accused - 1] = true;
     }
@@ -568,7 +617,7 @@ pub const Participant = struct {
         const slot = &self.revealed[(dealer - 1) * @as(usize, self.cfg.n) + (from - 1)];
         if (slot.* != null) return error.DuplicateMessage;
         const m = types.ShareMsg.fromBytes(body[0..types.ShareMsg.encoded_length].*) catch return error.Malformed;
-        if (!core.verifyPedersenShare(self.ped[dealer - 1].?, from, m.s, m.s_prime, self.h)) return error.Unverified;
+        if (!core.verifyPedersenShare(self.ped[dealer - 1].?, from, &m.s, &m.s_prime, self.h)) return error.Unverified;
         slot.* = m.s;
     }
 
@@ -599,8 +648,8 @@ pub const Participant = struct {
                 continue;
             };
             self.present[di] = true;
-            const ok = if (self.wire_s[di]) |s|
-                core.verifyPedersenShare(ped, self.me, s, self.wire_sp[di].?, self.h)
+            const ok = if (self.wire_s[di] != null)
+                core.verifyPedersenShare(ped, self.me, &self.wire_s[di].?, &self.wire_sp[di].?, self.h)
             else
                 false;
             if (ok) {
@@ -621,12 +670,14 @@ pub const Participant = struct {
             if (c.accused != self.me) continue;
             // Defend by opening the disputed share publicly.
             const x = commit.scalarFromIndex(c.complainant);
-            const sm: types.ShareMsg = .{
+            var sm: types.ShareMsg = .{
                 .dealer = self.me,
                 .receiver = c.complainant,
-                .s = commit.evalPoly(self.a, x),
-                .s_prime = commit.evalPoly(self.b, x),
+                .s = Scalar.zero,
+                .s_prime = Scalar.zero,
             };
+            commit.evalPoly(self.a, x, &sm.s);
+            commit.evalPoly(self.b, x, &sm.s_prime);
             const bytes = sm.toBytes();
             try self.push(.broadcast, .defense, &bytes);
             // Our own broadcast is never delivered back to us.
@@ -673,10 +724,10 @@ pub const Participant = struct {
                 self.exposed[d] = true;
                 continue;
             };
-            const s = self.accepted[d] orelse return self.abort(@intCast(d + 1), error.Inconsistent);
-            if (core.verifyFeldmanShare(fel, self.me, s)) continue;
+            if (self.accepted[d] == null) return self.abort(@intCast(d + 1), error.Inconsistent);
+            if (core.verifyFeldmanShare(fel, self.me, &self.accepted[d].?)) continue;
             self.exposed[d] = true;
-            var sm: types.ShareMsg = .{ .dealer = @intCast(d + 1), .receiver = self.me, .s = s, .s_prime = self.accepted_sp[d].? };
+            var sm: types.ShareMsg = .{ .dealer = @intCast(d + 1), .receiver = self.me, .s = self.accepted[d].?, .s_prime = self.accepted_sp[d].? };
             defer std.crypto.secureZero(u8, std.mem.asBytes(&sm));
             var bytes = sm.toBytes();
             defer std.crypto.secureZero(u8, &bytes);
@@ -699,7 +750,7 @@ pub const Participant = struct {
             if (!self.exposed[d]) continue;
             const s = self.accepted[d].?;
             self.revealed[d * n + (self.me - 1)] = s;
-            const sm: types.ShareMsg = .{ .dealer = @intCast(d + 1), .receiver = self.me, .s = s, .s_prime = self.accepted_sp[d].? };
+            const sm: types.ShareMsg = .{ .dealer = @intCast(d + 1), .receiver = self.me, .s = self.accepted[d].?, .s_prime = self.accepted_sp[d].? };
             const bytes = sm.toBytes();
             try self.push(.broadcast, .reveal, &bytes);
         }
@@ -728,7 +779,10 @@ pub const Participant = struct {
             }
             if (k < t) return self.abort(@intCast(d + 1), error.ReconstructionFailed);
             const coeffs = try interpolate(aa, xs, ys);
-            if (!commit.evalPoly(coeffs, commit.scalarFromIndex(self.me)).equivalent(self.accepted[d].?)) {
+            var at_me: Scalar = undefined;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&at_me));
+            commit.evalPoly(coeffs, commit.scalarFromIndex(self.me), &at_me);
+            if (!at_me.equivalent(self.accepted[d].?)) {
                 return self.abort(@intCast(d + 1), error.Inconsistent);
             }
             self.recovered[d] = coeffs;
@@ -777,7 +831,8 @@ pub const Participant = struct {
         const received = try aa.alloc(?Scalar, n);
         defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(received));
         for (0..n) |d| received[d] = if (self.qualified[d]) self.accepted[d] else null;
-        var x_j = try core.combineKeyShare(self.qualified, received);
+        var x_j: Scalar = undefined;
+        try core.combineKeyShare(self.qualified, received, &x_j);
         defer std.crypto.secureZero(u8, std.mem.asBytes(&x_j));
         const xg = commit.Secp256k1.basePoint.mul(x_j.toBytes(.big), .big) catch return error.IdentityElement;
 
@@ -841,6 +896,7 @@ const testing = std.testing;
 const protocol = @import("protocol.zig");
 const checks = @import("checks.zig");
 const tn = @import("testnet.zig");
+
 const TestNet = tn.TestNet;
 const Action = tn.Action;
 const freeOutputs = tn.freeOutputs;
@@ -1185,7 +1241,9 @@ test "a dealer cannot make some honest parties finish with a wrong key while the
     {
         const f = net.parties[4].a;
         const xs = [_]u32{ 0, 1, 2 };
-        const ys = [_]Scalar{ commit.scalarFromIndex(7777), commit.evalPoly(f, commit.scalarFromIndex(1)), commit.evalPoly(f, commit.scalarFromIndex(2)) };
+        var ys = [_]Scalar{ commit.scalarFromIndex(7777), undefined, undefined };
+        commit.evalPoly(f, commit.scalarFromIndex(1), &ys[1]);
+        commit.evalPoly(f, commit.scalarFromIndex(2), &ys[2]);
         const g = try interpolate(allocator, &xs, &ys);
         defer allocator.free(g);
         const vec = try commit.feldmanCommitVector(allocator, g);

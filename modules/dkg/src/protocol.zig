@@ -31,8 +31,17 @@ const core = @import("core.zig");
 const types = @import("types.zig");
 const checks = @import("checks.zig");
 const gate = @import("gate.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const dkg_run_stack_burn = 80 * 1024;
+const broken_dkg_run_stack_burn = 80 * 1024;
 
 const tecdsa = @import("threshold_ecdsa");
+
 pub const Secp256k1 = tecdsa.Secp256k1;
 pub const Scalar = tecdsa.Scalar;
 pub const Element = tecdsa.Element;
@@ -112,10 +121,10 @@ fn deal(arena: std.mem.Allocator, cfg: Config, corr: Corruption, random: std.Ran
         open_sp[d] = try arena.alloc(Scalar, n);
         for (0..n) |r| {
             const rid: u32 = @intCast(r + 1);
-            const s = commit.evalPoly(a, commit.scalarFromIndex(rid));
-            const sp = commit.evalPoly(b, commit.scalarFromIndex(rid));
-            open_s[d][r] = s;
-            open_sp[d][r] = sp;
+            commit.evalPoly(a, commit.scalarFromIndex(rid), &open_s[d][r]);
+            commit.evalPoly(b, commit.scalarFromIndex(rid), &open_sp[d][r]);
+            const s = open_s[d][r];
+            const sp = open_sp[d][r];
 
             const is_bad = corr.bad_dealer != null and
                 corr.bad_dealer.? == d + 1 and
@@ -160,6 +169,17 @@ pub const Dkg = struct {
         corr: Corruption,
         random: std.Random,
     ) DriverError![]DkgShareOutput {
+        const result = runUnburned(allocator, cfg, corr, random);
+        burn.stack(dkg_run_stack_burn);
+        return result;
+    }
+
+    noinline fn runUnburned(
+        allocator: std.mem.Allocator,
+        cfg: Config,
+        corr: Corruption,
+        random: std.Random,
+    ) DriverError![]DkgShareOutput {
         if (!cfg.valid()) return error.InvalidConfig;
         if (!cfg.honestMajority()) return error.NoHonestMajority;
         var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -179,8 +199,8 @@ pub const Dkg = struct {
                 const ok = core.verifyPedersenShare(
                     dealing.C[d],
                     rid,
-                    dealing.wire_s[d][r],
-                    dealing.wire_sp[d][r],
+                    &dealing.wire_s[d][r],
+                    &dealing.wire_sp[d][r],
                     dealing.h,
                 );
                 if (!ok) {
@@ -190,8 +210,8 @@ pub const Dkg = struct {
                     const defended = core.verifyPedersenShare(
                         dealing.C[d],
                         rid,
-                        dealing.open_s[d][r],
-                        dealing.open_sp[d][r],
+                        &dealing.open_s[d][r],
+                        &dealing.open_sp[d][r],
                         dealing.h,
                     );
                     try defense_valid.append(arena, defended);
@@ -212,7 +232,7 @@ pub const Dkg = struct {
             for (0..n) |d| {
                 if (!qualified[d]) continue;
                 const s = acceptedShare(&dealing, d, r, complaints.items, defense_valid.items, rid);
-                const ok = core.verifyFeldmanShare(dealing.A[d], rid, s);
+                const ok = core.verifyFeldmanShare(dealing.A[d], rid, &s);
                 if (!ok) return error.ProtocolError;
             }
         }
@@ -233,14 +253,11 @@ pub const Dkg = struct {
                 else
                     null;
             }
-            const x_j = try core.combineKeyShare(qualified, received);
-            const xg = Secp256k1.basePoint.mul(x_j.toBytes(.big), .big) catch return error.ProtocolError;
-            out[r] = .{
-                .index = rid,
-                .secret_share = x_j,
-                .group_public_key = Q,
-                .verifying_share = Element.fromPoint(xg) catch return error.ProtocolError,
-            };
+            out[r].index = rid;
+            try core.combineKeyShare(qualified, received, &out[r].secret_share);
+            const xg = Secp256k1.basePoint.mul(out[r].secret_share.toBytes(.big), .big) catch return error.ProtocolError;
+            out[r].group_public_key = Q;
+            out[r].verifying_share = Element.fromPoint(xg) catch return error.ProtocolError;
         }
         return out;
     }
@@ -275,6 +292,17 @@ fn acceptedShare(
 /// proves the teeth discriminate, independent of the real core's path.
 pub const BrokenDkg = struct {
     pub fn run(
+        allocator: std.mem.Allocator,
+        cfg: Config,
+        corr: Corruption,
+        random: std.Random,
+    ) DriverError![]DkgShareOutput {
+        const result = runUnburned(allocator, cfg, corr, random);
+        burn.stack(broken_dkg_run_stack_burn);
+        return result;
+    }
+
+    noinline fn runUnburned(
         allocator: std.mem.Allocator,
         cfg: Config,
         corr: Corruption,

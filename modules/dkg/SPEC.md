@@ -282,6 +282,26 @@ complain, since `t'` public openings would reveal its share.
 
 ## Verification harness (the teeth)
 
+- **Secret residue on the dead stack** (sweep 2026-10-08,
+  `src/stackprobe_test.zig`, five tests covering every participant, reshare, ECDSA keygen and
+  refresh call and the free functions;
+  ReleaseFast). Wiping named buffers did not keep secrets off the stack: compiler copies,
+  by-value parameters and results, and callee frames left them in dead stack memory. Fix,
+  as `bip32`/`k256` (2026-10-08): (1) every public entry point that touches a secret runs its
+  body one frame down (`noinline`) and then zeroes, at that depth, a region a little deeper than
+  the body was measured to reach (`burn.zig`: volatile 32-byte vector stores into a 16-aligned
+  buffer — 32-aligned, the frame realigned and left up to 56 bytes unzeroed, which held half a
+  secret); (2) a secret never crosses the API by value: secret parameters are pointers, secret
+  results go to an out-parameter, because the copy a by-value argument or result makes lives in
+  the CALLER's frame, where no burn of the callee reaches. The probe paints a window, makes one
+  call, copies the uninitialised window at the same depth and looks for every 16-byte window of
+  every secret's big-endian, little-endian and in-memory image and of every byte the call drew
+  from its `std.Random` (published bytes excluded); negative and positive controls in the same
+  binary. `verbose = true` prints each call's depth, to resize a burn after a change.
+  Every residue found (the polynomials, the shares, the output share, the assembled
+  `KeyShare`) is gone; `takeKeyShare` also wipes the copy it kept. Stack cost: ~2 MiB below
+  `EcdsaKeygen.start`/`EcdsaRefresh.start` (the aux proofs).
+
 - **End-to-end anchor (best teeth).** Run the DKG → `assembleKeyShares` (attach
   Paillier/aux) → `threshold_ecdsa.signWithShares` → verify with std ECDSA under
   `Q`. A DKG whose key yields a valid std-verifiable signature is correct and

@@ -83,7 +83,8 @@ fn load(allocator: std.mem.Allocator, set: vectors.KeySet) !Loaded {
         defer allocator.free(pp);
         const pq = try unhex(allocator, p.paillier_q);
         defer allocator.free(pq);
-        const kp = try paillier.fromPrimes(pp, pq);
+        var kp: paillier.KeyPair = undefined;
+        try paillier.fromPrimes(pp, pq, &kp);
         const nt_bytes = try unhex(allocator, p.n_tilde);
         defer allocator.free(nt_bytes);
         const nt = try root.AuxModulus.fromBytes(nt_bytes, .big);
@@ -104,7 +105,10 @@ fn load(allocator: std.mem.Allocator, set: vectors.KeySet) !Loaded {
         errdefer allocator.free(tp);
         const tq = try unhex(allocator, p.aux_q_safe);
         // `aux_lambda` is tss-lib's Alpha (h2 = h1^Alpha); the trapdoor is its inverse.
-        trapdoors[i] = .{ .p = tp, .q = tq, .lambda = try root.auxLogInverse(nt, tp, tq, try auxFe(allocator, nt, p.aux_lambda)) };
+        const alpha = try auxFe(allocator, nt, p.aux_lambda);
+        var lambda: root.AuxFe = undefined;
+        try root.auxLogInverse(nt, tp, tq, &alpha, &lambda);
+        trapdoors[i] = .{ .p = tp, .q = tq, .lambda = lambda };
         made += 1;
         shares[i] = .{
             .index = p.index,
@@ -155,7 +159,7 @@ test "tss-lib keygen output: this module signs with it; tss-lib's ring-Pedersen 
     // tss-lib's N-tilde are Blum products with ⟨h1⟩ = ⟨h2⟩: our proofs of
     // correct generation (h1 ∈ ⟨h2⟩), made from tss-lib's trapdoor, verify.
     for (loaded.entries, loaded.trapdoors) |e, td| {
-        const proof = try aux_proofs.proveWellFormed(allocator, e.aux, td, random);
+        const proof = try aux_proofs.proveWellFormed(allocator, e.aux, &td, random);
         try aux_proofs.verifyWellFormed(e.aux, proof, random);
     }
 }
@@ -186,7 +190,8 @@ test "auxParamsWithTrapdoorFromSafePrimes: tss-lib's safe primes give tss-lib's 
     _ = try std.fmt.hexToBytes(&q, pp.aux_q_safe);
     var prng = std.Random.DefaultPrng.init(0x6175_7867_656e);
     const random = prng.random();
-    const gen = try root.auxParamsWithTrapdoorFromSafePrimes(allocator, &p, &q, random);
+    var gen: root.AuxParamsWithTrapdoor = undefined;
+    try root.auxParamsWithTrapdoorFromSafePrimes(allocator, &p, &q, random, &gen);
     defer gen.trapdoor.deinit(allocator);
 
     var want: [256]u8 = undefined;
@@ -195,6 +200,6 @@ test "auxParamsWithTrapdoorFromSafePrimes: tss-lib's safe primes give tss-lib's 
     try gen.params.n_tilde.toBytes(&got, .big);
     try testing.expectEqualSlices(u8, want_s, got[got.len - want_s.len ..]);
 
-    const proof = try aux_proofs.proveWellFormedBound(allocator, gen.params, gen.trapdoor, "auxgen", random);
+    const proof = try aux_proofs.proveWellFormedBound(allocator, gen.params, &gen.trapdoor, "auxgen", random);
     try aux_proofs.verifyWellFormedBound(gen.params, "auxgen", proof, random);
 }

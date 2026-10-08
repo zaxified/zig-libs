@@ -184,6 +184,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 const paillier = @import("paillier");
 const root = @import("root.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const prove_alice_range_stack_burn = 240 * 1024;
+const prove_pdl_stack_burn = 240 * 1024;
+const prove_bob_mta_stack_burn = 240 * 1024;
+const prove_bob_mta_wc_stack_burn = 240 * 1024;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -1181,6 +1191,32 @@ fn validateReceivedParams(
 /// coins only. See SPEC.md's timing note.
 pub fn proveAliceRange(
     allocator: std.mem.Allocator,
+    a: *const Scalar,
+    r_a: *const paillier.Fe,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    context: []const u8,
+    random: std.Random,
+) ProveError!RangeProof {
+    const result = proveAliceRangeUnburned(allocator, a, r_a, alice_pk, verifier_aux, context, random);
+    burn.stack(prove_alice_range_stack_burn);
+    return result;
+}
+
+noinline fn proveAliceRangeUnburned(
+    allocator: std.mem.Allocator,
+    a: *const Scalar,
+    r_a: *const paillier.Fe,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    context: []const u8,
+    random: std.Random,
+) ProveError!RangeProof {
+    return proveAliceRangeByValue(allocator, a.*, r_a.*, alice_pk, verifier_aux, context, random);
+}
+
+fn proveAliceRangeByValue(
+    allocator: std.mem.Allocator,
     a: Scalar,
     r_a: paillier.Fe,
     alice_pk: paillier.PublicKey,
@@ -1274,12 +1310,12 @@ fn proveAliceRangeInner(
     // u = Enc_A(alpha; beta) — alpha < q³ < N for any >= 1024-bit key.
     const alpha_fe = feFromSecretBytes(nsq, paillier.Fe, &alpha);
     const beta_nsq = feFromSecretBytes(nsq, paillier.Fe, beta); // < N < N²
-    const u = paillier.encrypt(alice_pk, alpha_fe, beta_nsq) catch unreachable; // beta nonzero by construction
+    const u = paillier.encrypt(alice_pk, &alpha_fe, &beta_nsq) catch unreachable; // beta nonzero by construction
     const w = pedersenCt(nt, verifier_aux.h1, &alpha, verifier_aux.h2, gamma);
 
     // 3. Fiat-Shamir challenge over the ciphertext this witness produces.
     const m_fe = feFromSecretBytes(nsq, paillier.Fe, m_bytes); // caller contract: m < N
-    const c_a = paillier.encrypt(alice_pk, m_fe, r_a) catch unreachable; // r_a nonzero per witness contract
+    const c_a = paillier.encrypt(alice_pk, &m_fe, &r_a) catch unreachable; // r_a nonzero per witness contract
     const e = if (ec) |st|
         pdlProofChallenge(verifier_aux, alice_pk, c_a, z, u, w, st, u_point.?)
     else
@@ -1486,6 +1522,36 @@ pub const PdlProof = struct {
 /// VERIFIER's tuple — same ownership rule as `proveAliceRange`). Validates
 /// the received tuple and key first (audit F1/F2/F3), like every prover here.
 pub fn provePdl(
+    allocator: std.mem.Allocator,
+    k: *const Scalar,
+    r_a: *const paillier.Fe,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    base: root.Element,
+    point: root.Element,
+    context: []const u8,
+    random: std.Random,
+) ProveError!PdlProof {
+    const result = provePdlUnburned(allocator, k, r_a, alice_pk, verifier_aux, base, point, context, random);
+    burn.stack(prove_pdl_stack_burn);
+    return result;
+}
+
+noinline fn provePdlUnburned(
+    allocator: std.mem.Allocator,
+    k: *const Scalar,
+    r_a: *const paillier.Fe,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    base: root.Element,
+    point: root.Element,
+    context: []const u8,
+    random: std.Random,
+) ProveError!PdlProof {
+    return provePdlByValue(allocator, k.*, r_a.*, alice_pk, verifier_aux, base, point, context, random);
+}
+
+fn provePdlByValue(
     allocator: std.mem.Allocator,
     k: Scalar,
     r_a: paillier.Fe,
@@ -1726,6 +1792,38 @@ pub const MtaProof = struct {
 /// zeroes it. Audit F5: this used to take a `Scalar`, i.e. a `Zq` blind.
 pub fn proveBobMta(
     allocator: std.mem.Allocator,
+    b: *const Scalar,
+    beta_prime: *const [beta_prime_bytes]u8,
+    r_b: *const paillier.Fe,
+    c_a: paillier.Ciphertext,
+    c_b: paillier.Ciphertext,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    context: []const u8,
+    random: std.Random,
+) ProveError!MtaProof {
+    const result = proveBobMtaUnburned(allocator, b, beta_prime, r_b, c_a, c_b, alice_pk, verifier_aux, context, random);
+    burn.stack(prove_bob_mta_stack_burn);
+    return result;
+}
+
+noinline fn proveBobMtaUnburned(
+    allocator: std.mem.Allocator,
+    b: *const Scalar,
+    beta_prime: *const [beta_prime_bytes]u8,
+    r_b: *const paillier.Fe,
+    c_a: paillier.Ciphertext,
+    c_b: paillier.Ciphertext,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    context: []const u8,
+    random: std.Random,
+) ProveError!MtaProof {
+    return proveBobMtaByValue(allocator, b.*, beta_prime, r_b.*, c_a, c_b, alice_pk, verifier_aux, context, random);
+}
+
+fn proveBobMtaByValue(
+    allocator: std.mem.Allocator,
     b: Scalar,
     beta_prime: *const [beta_prime_bytes]u8,
     r_b: paillier.Fe,
@@ -1824,7 +1922,7 @@ fn proveBobInner(
     // the standard-generator binomial identity is valid for any gamma < N²).
     const gamma_fe = feFromSecretBytes(nsq, paillier.Fe, &gamma);
     const beta_nsq = feFromSecretBytes(nsq, paillier.Fe, beta);
-    const enc_gamma = paillier.encrypt(alice_pk, gamma_fe, beta_nsq) catch unreachable; // beta nonzero
+    const enc_gamma = paillier.encrypt(alice_pk, &gamma_fe, &beta_nsq) catch unreachable; // beta nonzero
     const v: paillier.Ciphertext = .{ .c = mulCt(nsq, powCt(nsq, c_a.c, &alpha), enc_gamma.c) };
     const w = pedersenCt(nt, verifier_aux.h1, &gamma, verifier_aux.h2, tau);
 
@@ -2057,6 +2155,40 @@ pub const MtaProofWc = struct {
 /// `b_point = B = b·G`) instead of `mtaProofChallenge`.
 pub fn proveBobMtaWc(
     allocator: std.mem.Allocator,
+    b: *const Scalar,
+    beta_prime: *const [beta_prime_bytes]u8,
+    r_b: *const paillier.Fe,
+    c_a: paillier.Ciphertext,
+    c_b: paillier.Ciphertext,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    b_point: root.Element,
+    context: []const u8,
+    random: std.Random,
+) ProveError!MtaProofWc {
+    const result = proveBobMtaWcUnburned(allocator, b, beta_prime, r_b, c_a, c_b, alice_pk, verifier_aux, b_point, context, random);
+    burn.stack(prove_bob_mta_wc_stack_burn);
+    return result;
+}
+
+noinline fn proveBobMtaWcUnburned(
+    allocator: std.mem.Allocator,
+    b: *const Scalar,
+    beta_prime: *const [beta_prime_bytes]u8,
+    r_b: *const paillier.Fe,
+    c_a: paillier.Ciphertext,
+    c_b: paillier.Ciphertext,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    b_point: root.Element,
+    context: []const u8,
+    random: std.Random,
+) ProveError!MtaProofWc {
+    return proveBobMtaWcByValue(allocator, b.*, beta_prime, r_b.*, c_a, c_b, alice_pk, verifier_aux, b_point, context, random);
+}
+
+fn proveBobMtaWcByValue(
+    allocator: std.mem.Allocator,
     b: Scalar,
     beta_prime: *const [beta_prime_bytes]u8,
     r_b: paillier.Fe,
@@ -2213,7 +2345,8 @@ test "Transcript: length-prefixing prevents ambiguous concatenation" {
 
 fn toyAuxAndKey(seed: u8) struct { aux: root.AuxParams, pk: paillier.KeyPair } {
     var kprng = std.Random.DefaultPrng.init(@as(u64, 0x7a6b70_726f6f66) ^ @as(u64, seed)); // "zkproof"-ish
-    const kp = paillier.generate(kprng.random(), 1024) catch unreachable;
+    var kp: paillier.KeyPair = undefined;
+    paillier.generate(kprng.random(), 1024, &kp) catch unreachable;
 
     // Toy (non-secure) hand-built AuxParams, same shape mta.zig's own
     // "compose over real KeyShare material" test uses — only the STRUCT/
@@ -2235,7 +2368,7 @@ test "RangeProof: toBytesAlloc/fromBytesAlloc round-trip on hand-built values" {
 
     var prng = std.Random.DefaultPrng.init(0x72616e6765);
     const random = prng.random();
-    const c = paillier.encryptRandom(setup.pk.public, paillier.Fe.fromBytes(setup.pk.public.n_sq, &[_]u8{7}, .big) catch unreachable, random) catch unreachable;
+    const c = paillier.encryptRandom(setup.pk.public, &(paillier.Fe.fromBytes(setup.pk.public.n_sq, &[_]u8{7}, .big) catch unreachable), random) catch unreachable;
 
     const proof: RangeProof = .{
         .z = setup.aux.h1,
@@ -2266,7 +2399,7 @@ test "MtaProof: toBytesAlloc/fromBytesAlloc round-trip on hand-built values" {
 
     var prng = std.Random.DefaultPrng.init(0x6d7461707266);
     const random = prng.random();
-    const c = paillier.encryptRandom(setup.pk.public, paillier.Fe.fromBytes(setup.pk.public.n_sq, &[_]u8{11}, .big) catch unreachable, random) catch unreachable;
+    const c = paillier.encryptRandom(setup.pk.public, &(paillier.Fe.fromBytes(setup.pk.public.n_sq, &[_]u8{11}, .big) catch unreachable), random) catch unreachable;
 
     const proof: MtaProof = .{
         .z = setup.aux.h1,
@@ -2301,7 +2434,7 @@ test "MtaProofWc: toBytesAlloc/fromBytesAlloc round-trip on hand-built values" {
 
     var prng = std.Random.DefaultPrng.init(0x6d7461777072);
     const random = prng.random();
-    const c = paillier.encryptRandom(setup.pk.public, paillier.Fe.fromBytes(setup.pk.public.n_sq, &[_]u8{3}, .big) catch unreachable, random) catch unreachable;
+    const c = paillier.encryptRandom(setup.pk.public, &(paillier.Fe.fromBytes(setup.pk.public.n_sq, &[_]u8{3}, .big) catch unreachable), random) catch unreachable;
 
     const base: MtaProof = .{
         .z = setup.aux.h1,
@@ -2343,8 +2476,10 @@ test "MtaProofWc: toBytesAlloc/fromBytesAlloc round-trip on hand-built values" {
 fn realAuxAndKey(seed: u64) !struct { kp: paillier.KeyPair, aux: root.AuxParams } {
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
-    const kp = try paillier.generate(random, 2048);
-    const nt_kp = try paillier.generate(random, 2048);
+    var kp: paillier.KeyPair = undefined;
+    try paillier.generate(random, 2048, &kp);
+    var nt_kp: paillier.KeyPair = undefined;
+    try paillier.generate(random, 2048, &nt_kp);
 
     var nt_buf: [paillier.modulus_bytes]u8 = undefined;
     const nt_len = nt_kp.public.nByteLen();
@@ -2387,8 +2522,8 @@ fn scalarToTestFe(s: Scalar, pk: paillier.PublicKey) paillier.Fe {
 fn buildCb(pk: paillier.PublicKey, c_a: paillier.Ciphertext, x_bytes: []const u8, y_bytes: []const u8, r_b: paillier.Fe) paillier.Ciphertext {
     const x_fe = paillier.Fe.fromBytes(pk.n_sq, stripLeadingZeros(x_bytes), .big) catch unreachable;
     const y_fe = paillier.Fe.fromBytes(pk.n_sq, stripLeadingZeros(y_bytes), .big) catch unreachable;
-    const c_ax = paillier.mulPlaintext(pk, c_a, x_fe) catch unreachable;
-    const enc_y = paillier.encrypt(pk, y_fe, r_b) catch unreachable;
+    const c_ax = paillier.mulPlaintext(pk, c_a, &x_fe) catch unreachable;
+    const enc_y = paillier.encrypt(pk, &y_fe, &r_b) catch unreachable;
     return paillier.addCiphertexts(pk, c_ax, enc_y);
 }
 
@@ -2407,9 +2542,9 @@ test "GG18 A.1 honest accept: Alice's range proof verifies, and re-verifies afte
     const a = scalarFromU64(0xa11ce);
     const r_a = testPaillierRandomness(pk, random);
     // c_a is the SAME (a, r_a) pair proveAliceRange is given as witness.
-    const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
+    const c_a = paillier.encrypt(pk, &(scalarToTestFe(a, pk)), &r_a) catch unreachable;
 
-    const proof = try proveAliceRange(allocator, a, r_a, pk, setup.aux, test_ctx, random);
+    const proof = try proveAliceRange(allocator, &a, &r_a, pk, setup.aux, test_ctx, random);
     defer proof.deinit(allocator);
     try testing.expect(verifyAliceRange(proof, c_a, pk, setup.aux, test_ctx));
     // Bound to its context (relation audit LOW 1): no replay across sessions or provers.
@@ -2445,7 +2580,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): out-of-range a fails the range check 
     const m_big = comptime comptimeIntBytes(97, 2 * (q_int * q_int * q_int)); // 2q³ < N (1024-bit)
     const r_a = testPaillierRandomness(pk, random);
     const m_fe = paillier.Fe.fromBytes(pk.n_sq, &m_big, .big) catch unreachable;
-    const c_a = paillier.encrypt(pk, m_fe, r_a) catch unreachable;
+    const c_a = paillier.encrypt(pk, &m_fe, &r_a) catch unreachable;
 
     const proof = (try proveAliceRangeInner(allocator, &m_big, r_a, pk, setup.aux, test_ctx, null, random)).proof;
     defer proof.deinit(allocator);
@@ -2455,8 +2590,8 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): out-of-range a fails the range check 
     // the reject above is the range check, not a broken fixture).
     const a_ok = scalarFromU64(0x5eed);
     const r_ok = testPaillierRandomness(pk, random);
-    const c_ok = paillier.encrypt(pk, scalarToTestFe(a_ok, pk), r_ok) catch unreachable;
-    const proof_ok = try proveAliceRange(allocator, a_ok, r_ok, pk, setup.aux, test_ctx, random);
+    const c_ok = paillier.encrypt(pk, &(scalarToTestFe(a_ok, pk)), &r_ok) catch unreachable;
+    const proof_ok = try proveAliceRange(allocator, &a_ok, &r_ok, pk, setup.aux, test_ctx, random);
     defer proof_ok.deinit(allocator);
     try testing.expect(verifyAliceRange(proof_ok, c_ok, pk, setup.aux, test_ctx));
 }
@@ -2521,7 +2656,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
     a_big.toConst().writeTwosComplement(&a_bytes, .big);
 
     const r_a = testPaillierRandomness(pk, random);
-    const c_a = paillier.encrypt(pk, paillier.Fe.fromBytes(nsq, &a_bytes, .big) catch unreachable, r_a) catch unreachable;
+    const c_a = paillier.encrypt(pk, &(paillier.Fe.fromBytes(nsq, &a_bytes, .big) catch unreachable), &r_a) catch unreachable;
 
     // Commitments for a claimed plaintext 0.
     var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
@@ -2544,7 +2679,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
     const beta_fe = feFromSecretBytes(nsq, paillier.Fe, beta);
 
     const z = pedersenCt(nt, setup.aux.h1, &[_]u8{0}, setup.aux.h2, rho);
-    const u_honest = paillier.encrypt(pk, feFromSecretBytes(nsq, paillier.Fe, &alpha), beta_fe) catch unreachable;
+    const u_honest = paillier.encrypt(pk, &(feFromSecretBytes(nsq, paillier.Fe, &alpha)), &beta_fe) catch unreachable;
     const p_sq_n = powPub(nsq, p_sq, n_bytes);
     const u = paillier.Ciphertext{ .c = nsq.mul(u_honest.c, p_sq_n) };
     const w = pedersenCt(nt, setup.aux.h1, &alpha, setup.aux.h2, gamma);
@@ -2569,7 +2704,8 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
     var beta_prime: [96]u8 = undefined;
     _ = sampleBelow(random, &q3_bytes, &beta_prime);
     const c_b = buildCb(pk, c_a, &b_bytes, &beta_prime, testPaillierRandomness(pk, random));
-    const dec = try paillier.decrypt(setup.kp.secret, c_b);
+    var dec: paillier.Fe = undefined;
+    try paillier.decrypt(&setup.kp.secret, c_b, &dec);
     var dec_buf: [paillier.modulus_sq_bytes]u8 = undefined;
     try dec.toBytes(&dec_buf, .big);
     var dec_big = try testBigFromBytes(allocator, stripLeadingZeros(&dec_buf));
@@ -2597,14 +2733,14 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): tampered c_a and every mangled proof 
 
     const a = scalarFromU64(0xfeed);
     const r_a = testPaillierRandomness(pk, random);
-    const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
-    const proof = try proveAliceRange(allocator, a, r_a, pk, setup.aux, test_ctx, random);
+    const c_a = paillier.encrypt(pk, &(scalarToTestFe(a, pk)), &r_a) catch unreachable;
+    const proof = try proveAliceRange(allocator, &a, &r_a, pk, setup.aux, test_ctx, random);
     defer proof.deinit(allocator);
     try testing.expect(verifyAliceRange(proof, c_a, pk, setup.aux, test_ctx)); // control
 
     // Tampered ciphertext: same proof, homomorphically-shifted c_a.
     const one_fe = paillier.Fe.fromPrimitive(u64, pk.n_sq, 1) catch unreachable;
-    const c_bad = paillier.addPlaintext(pk, c_a, one_fe) catch unreachable;
+    const c_bad = paillier.addPlaintext(pk, c_a, &one_fe) catch unreachable;
     try testing.expect(!verifyAliceRange(proof, c_bad, pk, setup.aux, test_ctx));
 
     // Every field mangled (value-level perturbations that keep each field
@@ -2662,12 +2798,12 @@ test "GG18 A.3 honest accept: Bob's MtA proof over checked-MtA-shaped ciphertext
     const beta_prime = scalarFromU64(0xb14b);
     const r_a = testPaillierRandomness(pk, random);
     const r_b = testPaillierRandomness(pk, random);
-    const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
+    const c_a = paillier.encrypt(pk, &(scalarToTestFe(a, pk)), &r_a) catch unreachable;
     const b_bytes = b.toBytes(.big);
     const bp_bytes = beta_prime.toBytes(.big);
     const c_b = buildCb(pk, c_a, &b_bytes, &bp_bytes, r_b);
 
-    const proof = try proveBobMta(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, test_ctx, random);
+    const proof = try proveBobMta(allocator, &b, &bpWide(beta_prime), &r_b, c_a, c_b, pk, setup.aux, test_ctx, random);
     defer proof.deinit(allocator);
     try testing.expect(verifyBobMta(proof, c_a, c_b, pk, setup.aux, test_ctx));
     try testing.expect(!verifyBobMta(proof, c_a, c_b, pk, setup.aux, other_session_ctx));
@@ -2699,7 +2835,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): out-of-range b (s1 > q³) and out-of-
 
     const a = scalarFromU64(0xa);
     const r_a = testPaillierRandomness(pk, random);
-    const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
+    const c_a = paillier.encrypt(pk, &(scalarToTestFe(a, pk)), &r_a) catch unreachable;
 
     // x = 2q³ (out of range), y in range.
     const x_big = comptime comptimeIntBytes(97, 2 * (q_int * q_int * q_int));
@@ -2754,7 +2890,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): a non-unit s with a matching non-unit
     const n_bytes = n_buf[0..n_len];
 
     const r_a = testPaillierRandomness(pk, random);
-    const c_a = paillier.encrypt(pk, scalarToTestFe(scalarFromU64(0xa11ce), pk), r_a) catch unreachable;
+    const c_a = paillier.encrypt(pk, &(scalarToTestFe(scalarFromU64(0xa11ce), pk)), &r_a) catch unreachable;
     const x_bytes = scalarFromU64(0xb0b5ec7e7).toBytes(.big);
     const y_bytes = scalarFromU64(0xb14b).toBytes(.big);
     const r_b = testPaillierRandomness(pk, random);
@@ -2795,7 +2931,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): a non-unit s with a matching non-unit
     const t_commit = pedersenCt(nt, setup.aux.h1, &y_bytes, setup.aux.h2, sigma);
     const gamma_fe = feFromSecretBytes(nsq, paillier.Fe, &gamma);
     const beta_nsq = feFromSecretBytes(nsq, paillier.Fe, beta);
-    const enc_gamma = paillier.encrypt(pk, gamma_fe, beta_nsq) catch unreachable;
+    const enc_gamma = paillier.encrypt(pk, &gamma_fe, &beta_nsq) catch unreachable;
     const v_honest = mulCt(nsq, powCt(nsq, c_a.c, &alpha), enc_gamma.c);
     const p_sq_n = powPub(nsq, p_sq, n_bytes); // (P²)^N mod N²
     const v: paillier.Ciphertext = .{ .c = nsq.mul(v_honest, p_sq_n) };
@@ -2836,29 +2972,30 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): tampered c_b, wrong beta' witness, an
     const beta_prime = scalarFromU64(0x3333);
     const r_a = testPaillierRandomness(pk, random);
     const r_b = testPaillierRandomness(pk, random);
-    const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
+    const c_a = paillier.encrypt(pk, &(scalarToTestFe(a, pk)), &r_a) catch unreachable;
     const b_bytes = b.toBytes(.big);
     const bp_bytes = beta_prime.toBytes(.big);
     const c_b = buildCb(pk, c_a, &b_bytes, &bp_bytes, r_b);
 
-    const proof = try proveBobMta(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, test_ctx, random);
+    const proof = try proveBobMta(allocator, &b, &bpWide(beta_prime), &r_b, c_a, c_b, pk, setup.aux, test_ctx, random);
     defer proof.deinit(allocator);
     try testing.expect(verifyBobMta(proof, c_a, c_b, pk, setup.aux, test_ctx)); // control
 
     // Tampered c_b after the proof was produced (equation 5).
     const one_fe = paillier.Fe.fromPrimitive(u64, pk.n_sq, 1) catch unreachable;
-    const c_b_bad = paillier.addPlaintext(pk, c_b, one_fe) catch unreachable;
+    const c_b_bad = paillier.addPlaintext(pk, c_b, &one_fe) catch unreachable;
     try testing.expect(!verifyBobMta(proof, c_a, c_b_bad, pk, setup.aux, test_ctx));
 
     // Wrong beta' witness: prover claims a beta' different from the one
     // actually folded into c_b (equations 4/5).
     const wrong_bp = scalarFromU64(0x4444);
-    const proof_wrong = try proveBobMta(allocator, b, &bpWide(wrong_bp), r_b, c_a, c_b, pk, setup.aux, test_ctx, random);
+    const proof_wrong = try proveBobMta(allocator, &b, &bpWide(wrong_bp), &r_b, c_a, c_b, pk, setup.aux, test_ctx, random);
     defer proof_wrong.deinit(allocator);
     try testing.expect(!verifyBobMta(proof_wrong, c_a, c_b, pk, setup.aux, test_ctx));
 
     // Wrong b witness too, for completeness (equations 3/5).
-    const proof_wrong_b = try proveBobMta(allocator, scalarFromU64(0x5555), &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, test_ctx, random);
+    const wrong_b = scalarFromU64(0x5555);
+    const proof_wrong_b = try proveBobMta(allocator, &wrong_b, &bpWide(beta_prime), &r_b, c_a, c_b, pk, setup.aux, test_ctx, random);
     defer proof_wrong_b.deinit(allocator);
     try testing.expect(!verifyBobMta(proof_wrong_b, c_a, c_b, pk, setup.aux, test_ctx));
 
@@ -2910,7 +3047,7 @@ test "GG18 A.2 MtAwc: honest accept; wrong B, tampered u1, and cross-protocol pr
     const beta_prime = scalarFromU64(0xcccc);
     const r_a = testPaillierRandomness(pk, random);
     const r_b = testPaillierRandomness(pk, random);
-    const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
+    const c_a = paillier.encrypt(pk, &(scalarToTestFe(a, pk)), &r_a) catch unreachable;
     const b_bytes = b.toBytes(.big);
     const bp_bytes = beta_prime.toBytes(.big);
     const c_b = buildCb(pk, c_a, &b_bytes, &bp_bytes, r_b);
@@ -2918,7 +3055,7 @@ test "GG18 A.2 MtAwc: honest accept; wrong B, tampered u1, and cross-protocol pr
     // B = b·G — the public point the proof must tie Bob's MtA input to.
     const b_point = root.Element.fromPoint(root.Secp256k1.basePoint.mul(b.toBytes(.big), .big) catch unreachable) catch unreachable;
 
-    const proof = try proveBobMtaWc(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, b_point, test_ctx, random);
+    const proof = try proveBobMtaWc(allocator, &b, &bpWide(beta_prime), &r_b, c_a, c_b, pk, setup.aux, b_point, test_ctx, random);
     defer proof.deinit(allocator);
     try testing.expect(verifyBobMtaWc(proof, c_a, c_b, pk, setup.aux, b_point, test_ctx));
     try testing.expect(!verifyBobMtaWc(proof, c_a, c_b, pk, setup.aux, b_point, other_session_ctx));
@@ -2977,7 +3114,7 @@ test "GG18 A.2 MtAwc check 6 in isolation: b does not match the agreed B, transc
     const beta_prime = scalarFromU64(0xcccc);
     const r_a = testPaillierRandomness(pk, random);
     const r_b = testPaillierRandomness(pk, random);
-    const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
+    const c_a = paillier.encrypt(pk, &(scalarToTestFe(a, pk)), &r_a) catch unreachable;
     const b_bytes = b.toBytes(.big);
     const bp_bytes = beta_prime.toBytes(.big);
     const c_b = buildCb(pk, c_a, &b_bytes, &bp_bytes, r_b);
@@ -2989,7 +3126,7 @@ test "GG18 A.2 MtAwc check 6 in isolation: b does not match the agreed B, transc
     try testing.expect(!std.mem.eql(u8, &b_mismatch.toBytes(.big), &b.toBytes(.big)));
     const wrong_point = root.Element.fromPoint(root.Secp256k1.basePoint.mul(b_mismatch.toBytes(.big), .big) catch unreachable) catch unreachable;
 
-    const proof = try proveBobMtaWc(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, wrong_point, test_ctx, random);
+    const proof = try proveBobMtaWc(allocator, &b, &bpWide(beta_prime), &r_b, c_a, c_b, pk, setup.aux, wrong_point, test_ctx, random);
     defer proof.deinit(allocator);
 
     // Equations 3-5 hold (same challenge on both sides, real Paillier
@@ -3000,7 +3137,7 @@ test "GG18 A.2 MtAwc check 6 in isolation: b does not match the agreed B, transc
     // that genuinely IS `b`'s discrete log passes — proves the rejection
     // above is about the b/B mismatch, not a broken predicate.
     const true_point = root.Element.fromPoint(root.Secp256k1.basePoint.mul(b.toBytes(.big), .big) catch unreachable) catch unreachable;
-    const proof_honest = try proveBobMtaWc(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, true_point, test_ctx, random);
+    const proof_honest = try proveBobMtaWc(allocator, &b, &bpWide(beta_prime), &r_b, c_a, c_b, pk, setup.aux, true_point, test_ctx, random);
     defer proof_honest.deinit(allocator);
     try testing.expect(verifyBobMtaWc(proof_honest, c_a, c_b, pk, setup.aux, true_point, test_ctx));
 }
@@ -3015,7 +3152,9 @@ test "GG18 A.2 MtAwc check 6 in isolation: b does not match the agreed B, transc
 // ReleaseFast (no 2048-bit keygen on the reject path).
 
 fn toyPaillierPk() paillier.PublicKey {
-    return (paillier.fromPrimes(&[_]u8{11}, &[_]u8{17}) catch unreachable).public; // N = 187 ≪ q⁷
+    var kp: paillier.KeyPair = undefined;
+    paillier.fromPrimes(&[_]u8{11}, &[_]u8{17}, &kp) catch unreachable;
+    return kp.public; // N = 187 ≪ q⁷
 }
 
 fn auxFromBytes(nt_byte: u8, h1_byte: u8, h2_byte: u8) root.AuxParams {
@@ -3037,11 +3176,11 @@ test "audit F1: proveAliceRange/proveBobMta fail-close on a crafted bad received
     const r_a = paillier.Fe.fromPrimitive(u32, pk.n_sq, 3) catch unreachable;
 
     // Ñ = 251 is PRIME -> Miller-Rabin composite check rejects.
-    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(251, 2, 4), test_ctx, random));
+    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, &a, &r_a, pk, auxFromBytes(251, 2, 4), test_ctx, random));
     // h1 = 1 (out of range) on a composite Ñ.
-    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(187, 1, 16), test_ctx, random));
+    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, &a, &r_a, pk, auxFromBytes(187, 1, 16), test_ctx, random));
     // h1 = 5 is a quadratic NON-residue mod 187 (Jacobi -1).
-    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(187, 5, 4), test_ctx, random));
+    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, &a, &r_a, pk, auxFromBytes(187, 5, 4), test_ctx, random));
 
     // Same fail-closed gate on Bob's prover (shares validateReceivedParams).
     const b = scalarFromU64(6);
@@ -3049,8 +3188,8 @@ test "audit F1: proveAliceRange/proveBobMta fail-close on a crafted bad received
     const r_b = paillier.Fe.fromPrimitive(u32, pk.n_sq, 5) catch unreachable;
     const one_fe = paillier.Fe.fromPrimitive(u32, pk.n_sq, 1) catch unreachable;
     const two_fe = paillier.Fe.fromPrimitive(u32, pk.n_sq, 2) catch unreachable;
-    const c_dummy = paillier.encrypt(pk, one_fe, two_fe) catch unreachable;
-    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, b, &bpWide(bp), r_b, c_dummy, c_dummy, pk, auxFromBytes(251, 2, 4), test_ctx, random));
+    const c_dummy = paillier.encrypt(pk, &one_fe, &two_fe) catch unreachable;
+    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, &b, &bpWide(bp), &r_b, c_dummy, c_dummy, pk, auxFromBytes(251, 2, 4), test_ctx, random));
 }
 
 test "audit F2: prove entry points fail-close on a sub-q⁷ modulus on the checked path" {
@@ -3064,7 +3203,7 @@ test "audit F2: prove entry points fail-close on a sub-q⁷ modulus on the check
     {
         const pk = toyPaillierPk();
         const r_a = paillier.Fe.fromPrimitive(u32, pk.n_sq, 3) catch unreachable;
-        try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(187, 4, 16), test_ctx, random));
+        try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, &a, &r_a, pk, auxFromBytes(187, 4, 16), test_ctx, random));
     }
 
     // (b) VALID > q⁷ aux (a genuine ~2000-bit composite with perfect-square
@@ -3081,21 +3220,21 @@ test "audit F2: prove entry points fail-close on a sub-q⁷ modulus on the check
         };
         const pk = toyPaillierPk();
         const r_a = paillier.Fe.fromPrimitive(u32, pk.n_sq, 3) catch unreachable;
-        try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, good_aux, test_ctx, random));
+        try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, &a, &r_a, pk, good_aux, test_ctx, random));
 
         // And the verify-side F2 floor (defense-in-depth): a proof "verified"
         // against a sub-floor Paillier key is rejected outright. Build a
         // syntactically-valid RangeProof over the toy pk and assert reject.
         const dummy: RangeProof = .{
             .z = good_aux.h1,
-            .u = paillier.encrypt(pk, paillier.Fe.fromPrimitive(u32, pk.n_sq, 1) catch unreachable, paillier.Fe.fromPrimitive(u32, pk.n_sq, 2) catch unreachable) catch unreachable,
+            .u = paillier.encrypt(pk, &(paillier.Fe.fromPrimitive(u32, pk.n_sq, 1) catch unreachable), &(paillier.Fe.fromPrimitive(u32, pk.n_sq, 2) catch unreachable)) catch unreachable,
             .w = good_aux.h2,
             .s = paillier.Fe.fromPrimitive(u32, pk.n_sq, 3) catch unreachable,
             .s1 = try allocator.dupe(u8, &[_]u8{1}),
             .s2 = try allocator.dupe(u8, &[_]u8{1}),
         };
         defer dummy.deinit(allocator);
-        const c_dummy = paillier.encrypt(pk, paillier.Fe.fromPrimitive(u32, pk.n_sq, 4) catch unreachable, paillier.Fe.fromPrimitive(u32, pk.n_sq, 5) catch unreachable) catch unreachable;
+        const c_dummy = paillier.encrypt(pk, &(paillier.Fe.fromPrimitive(u32, pk.n_sq, 4) catch unreachable), &(paillier.Fe.fromPrimitive(u32, pk.n_sq, 5) catch unreachable)) catch unreachable;
         try testing.expect(!verifyAliceRange(dummy, c_dummy, pk, good_aux, test_ctx));
     }
 }
@@ -3124,7 +3263,9 @@ test "audit F3 (a): the FS challenge binds the Paillier generator Γ, not just N
     // supplied explicitly (control — must hash identically), and Γ = 4.
     // `PublicKey.fromBytes` refuses an n below `paillier.min_modulus_bits`, so
     // the toy key comes from `fromPrimes` and Γ is swapped in by hand.
-    const pk_std = (paillier.fromPrimes(&[_]u8{11}, &[_]u8{17}) catch unreachable).public;
+    var kp_std: paillier.KeyPair = undefined;
+    paillier.fromPrimes(&[_]u8{11}, &[_]u8{17}, &kp_std) catch unreachable;
+    const pk_std = kp_std.public;
     var pk_same = pk_std;
     pk_same.g = paillier.Fe.fromBytes(pk_std.n_sq, &[_]u8{188}, .big) catch unreachable;
     var pk_alt = pk_std;
@@ -3138,9 +3279,9 @@ test "audit F3 (a): the FS challenge binds the Paillier generator Γ, not just N
             return paillier.Fe.fromPrimitive(u32, pk.n_sq, x) catch unreachable;
         }
     };
-    const c_a = paillier.encrypt(pk_std, fe.v(pk_std, 3), fe.v(pk_std, 5)) catch unreachable;
-    const c_b = paillier.encrypt(pk_std, fe.v(pk_std, 7), fe.v(pk_std, 9)) catch unreachable;
-    const u_ct = paillier.encrypt(pk_std, fe.v(pk_std, 11), fe.v(pk_std, 13)) catch unreachable;
+    const c_a = paillier.encrypt(pk_std, &(fe.v(pk_std, 3)), &(fe.v(pk_std, 5))) catch unreachable;
+    const c_b = paillier.encrypt(pk_std, &(fe.v(pk_std, 7)), &(fe.v(pk_std, 9))) catch unreachable;
+    const u_ct = paillier.encrypt(pk_std, &(fe.v(pk_std, 11)), &(fe.v(pk_std, 13))) catch unreachable;
     const point = root.Element.fromPoint(root.Secp256k1.basePoint) catch unreachable;
 
     // Alice's range proof.
@@ -3188,7 +3329,7 @@ test "audit F3 (b): prove and verify entry points fail-close on a non-standard P
 
     const a = scalarFromU64(7);
     const r_bad = paillier.Fe.fromPrimitive(u32, pk_bad.n_sq, 3) catch unreachable;
-    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_bad, pk_bad, good_aux, test_ctx, random));
+    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, &a, &r_bad, pk_bad, good_aux, test_ctx, random));
 
     // Positive control — Γ is provably the SOLE cause of that rejection:
     // `validateReceivedParams` has exactly three gates, and the other two
@@ -3201,8 +3342,8 @@ test "audit F3 (b): prove and verify entry points fail-close on a non-standard P
     // ⇒ only gate 3 (audit F3, asserted false above) can be rejecting.
 
     // Bob's prover shares `validateReceivedParams`.
-    const c_dummy_bad = paillier.encrypt(pk_bad, paillier.Fe.fromPrimitive(u32, pk_bad.n_sq, 1) catch unreachable, r_bad) catch unreachable;
-    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, a, &bpWide(a), r_bad, c_dummy_bad, c_dummy_bad, pk_bad, good_aux, test_ctx, random));
+    const c_dummy_bad = paillier.encrypt(pk_bad, &(paillier.Fe.fromPrimitive(u32, pk_bad.n_sq, 1) catch unreachable), &r_bad) catch unreachable;
+    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, &a, &bpWide(a), &r_bad, c_dummy_bad, c_dummy_bad, pk_bad, good_aux, test_ctx, random));
 
     // Verify side (defense in depth): both verifiers reject outright.
     const dummy_range: RangeProof = .{
@@ -3262,7 +3403,7 @@ test "audit: a proof-legal beta' that crosses 2^512 keeps the MtA identity alpha
     const a_val: u64 = 1000;
     const a = scalarFromU64(a_val);
     const r_a = testPaillierRandomness(pk, random);
-    const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
+    const c_a = paillier.encrypt(pk, &(scalarToTestFe(a, pk)), &r_a) catch unreachable;
     const x_ok = scalarFromU64(1).toBytes(.big); // Bob's b = 1
 
     inline for (.{ 2000, 500 }) |X| {
@@ -3277,7 +3418,8 @@ test "audit: a proof-legal beta' that crosses 2^512 keeps the MtA identity alpha
 
         // ...so the checked finalize runs, and its result must satisfy the
         // module's whole invariant.
-        const alpha = try mta_mod.mtaAliceFinalizeChecked(c_a, c_b, out.proof, sk, pk, setup.aux, test_ctx);
+        var alpha: Scalar = undefined;
+        try mta_mod.mtaAliceFinalizeChecked(c_a, c_b, out.proof, &sk, pk, setup.aux, test_ctx, &alpha);
         const beta = scalarFromWide(&y_big).neg();
         try testing.expectEqualSlices(u8, &a.toBytes(.big), &alpha.add(beta).toBytes(.big));
     }
@@ -3300,8 +3442,8 @@ test "audit: an over-long s2 is refused before it is used as an exponent" {
 
     const a = scalarFromU64(7);
     const r_a = testPaillierRandomness(pk, random);
-    const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
-    const proof = try proveAliceRange(allocator, a, r_a, pk, setup.aux, test_ctx, random);
+    const c_a = paillier.encrypt(pk, &(scalarToTestFe(a, pk)), &r_a) catch unreachable;
+    const proof = try proveAliceRange(allocator, &a, &r_a, pk, setup.aux, test_ctx, random);
     defer proof.deinit(allocator);
 
     // The honest proof still verifies, and its `s2` sits at the cap's own
@@ -3348,7 +3490,8 @@ const DecoderFixture = struct {
 fn buildDecoderFixture() DecoderFixture {
     var prng = std.Random.DefaultPrng.init(0x646563666978); // "decfix"
     const random = prng.random();
-    const kp = paillier.generate(random, paillier.min_generate_bits) catch unreachable;
+    var kp: paillier.KeyPair = undefined;
+    paillier.generate(random, paillier.min_generate_bits, &kp) catch unreachable;
     const n_tilde = root.AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable;
     return .{ .n_tilde = n_tilde, .alice_pk = kp.public };
 }
@@ -3513,12 +3656,12 @@ test "PdlProof: honest accepts (and after a codec round trip); every false state
 
     const k = scalarFromU64(0x1234_5678_9abc);
     const r_a = testPaillierRandomness(pk, random);
-    const c_a = paillier.encrypt(pk, scalarToTestFe(k, pk), r_a) catch unreachable;
+    const c_a = paillier.encrypt(pk, &(scalarToTestFe(k, pk)), &r_a) catch unreachable;
     const base = mulBase(root.Element.fromPoint(root.Secp256k1.basePoint) catch unreachable, scalarFromU64(77));
     const point = mulBase(base, k);
     const ctx = "sid||1";
 
-    const proof = try provePdl(allocator, k, r_a, pk, setup.aux, base, point, ctx, random);
+    const proof = try provePdl(allocator, &k, &r_a, pk, setup.aux, base, point, ctx, random);
     defer proof.deinit(allocator);
     try testing.expect(verifyPdl(proof, c_a, pk, setup.aux, base, point, ctx));
 
@@ -3535,14 +3678,14 @@ test "PdlProof: honest accepts (and after a codec round trip); every false state
     try testing.expect(!verifyPdl(proof, c_a, pk, setup.aux, base, mulBase(base, k.add(Scalar.one)), ctx));
     try testing.expect(!verifyPdl(proof, c_a, pk, setup.aux, mulBase(base, scalarFromU64(2)), point, ctx));
     try testing.expect(!verifyPdl(proof, c_a, pk, setup.aux, base, point, "sid||2"));
-    const c_other = paillier.encrypt(pk, scalarToTestFe(k.add(Scalar.one), pk), r_a) catch unreachable;
+    const c_other = paillier.encrypt(pk, &(scalarToTestFe(k.add(Scalar.one), pk)), &r_a) catch unreachable;
     try testing.expect(!verifyPdl(proof, c_other, pk, setup.aux, base, point, ctx));
     // The A.1 range proof alone is not a PdlProof (different challenge).
     try testing.expect(!verifyAliceRange(proof.range, c_a, pk, setup.aux, test_ctx));
 
     // A prover whose ciphertext holds k but whose R̄ claims k+1: the curve
     // equation fails even though the Paillier side is honest.
-    const lie = try provePdl(allocator, k, r_a, pk, setup.aux, base, mulBase(base, k.add(Scalar.one)), ctx, random);
+    const lie = try provePdl(allocator, &k, &r_a, pk, setup.aux, base, mulBase(base, k.add(Scalar.one)), ctx, random);
     defer lie.deinit(allocator);
     try testing.expect(!verifyPdl(lie, c_a, pk, setup.aux, base, mulBase(base, k.add(Scalar.one)), ctx));
 
@@ -3551,7 +3694,7 @@ test "PdlProof: honest accepts (and after a codec round trip); every false state
     // challenge, `base' = (s1 mod q)⁻¹·(e·p_false + u_point)`. Only binding
     // `base` into the challenge makes that solution useless.
     const p_false = mulBase(base, scalarFromU64(999));
-    const forged = try provePdl(allocator, k, r_a, pk, setup.aux, base, p_false, ctx, random);
+    const forged = try provePdl(allocator, &k, &r_a, pk, setup.aux, base, p_false, ctx, random);
     defer forged.deinit(allocator);
     const e = pdlProofChallenge(setup.aux, pk, c_a, forged.range.z, forged.range.u, forged.range.w, .{ .base = base, .point = p_false, .context = ctx }, forged.u_point);
     const rhs = (p_false.point() catch unreachable).mul(e.toBytes(.big), .big) catch unreachable;
@@ -3581,7 +3724,7 @@ test "PdlProof reject (SECURITY-CRITICAL): an out-of-range exponent (s1 > q³) f
     // 2q³ + 5: above q³, below N, and ≢ 0 (mod q) so `m·base` is a point.
     const m_big = comptime comptimeIntBytes(97, 2 * (q_int * q_int * q_int) + 5);
     const r_a = testPaillierRandomness(pk, random);
-    const c_a = paillier.encrypt(pk, paillier.Fe.fromBytes(pk.n_sq, &m_big, .big) catch unreachable, r_a) catch unreachable;
+    const c_a = paillier.encrypt(pk, &(paillier.Fe.fromBytes(pk.n_sq, &m_big, .big) catch unreachable), &r_a) catch unreachable;
     const base = root.Element.fromPoint(root.Secp256k1.basePoint) catch unreachable;
     const point = mulBase(base, scalarFromWide(&m_big)); // m mod q: the curve side is consistent
     const out = try proveAliceRangeInner(allocator, &m_big, r_a, pk, setup.aux, "c", .{ .base = base, .point = point, .context = "c" }, random);

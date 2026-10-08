@@ -96,6 +96,7 @@
 const std = @import("std");
 const paillier = @import("paillier");
 const root = @import("root.zig");
+const burn = @import("burn.zig");
 const mta = @import("mta.zig");
 const zkproofs = @import("zkproofs.zig");
 const ecproofs = @import("ecproofs.zig");
@@ -110,6 +111,18 @@ const Ns = root.Ns;
 const Ne = root.Ne;
 
 pub const SessionId = [32]u8;
+
+// Dead-stack burns of the public entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+// A round decrypts with the Paillier secret key and runs the Paillier proofs.
+const round_stack_burn = 288 * 1024;
+const init_stack_burn = 64 * 1024;
+const finish_stack_burn = 32 * 1024;
+const echo_stack_burn = 32 * 1024;
+const sign_share_stack_burn = 16 * 1024;
+const codec_stack_burn = 16 * 1024;
 
 pub const wire_version: u8 = 2;
 /// `version(1) || round(1) || sid(32) || from(4) || to(4)`; `to == 0` marks a
@@ -472,7 +485,22 @@ pub const Party = struct {
     /// the group key, so inconsistent key material fails here rather than
     /// as an unattributed abort later. `share` is borrowed: its
     /// `public_keys` must outlive the party.
-    pub fn init(allocator: std.mem.Allocator, share: root.KeyShare, signers: []const u32, sid: SessionId) Error!Party {
+    ///
+    /// The party is written to `out`, and `share` is read through a pointer:
+    /// a `KeyShare` (key share, Paillier secret key, message seed) passed or
+    /// returned by value leaves a copy in the CALLER's frame, where no burn of
+    /// this call reaches (measured, `stackprobe_test.zig`).
+    pub fn init(allocator: std.mem.Allocator, share: *const root.KeyShare, signers: []const u32, sid: SessionId, out: *Party) Error!void {
+        const result = Party.initUnburned(allocator, share, signers, sid, out);
+        burn.stack(init_stack_burn);
+        return result;
+    }
+
+    noinline fn initUnburned(allocator: std.mem.Allocator, share: *const root.KeyShare, signers: []const u32, sid: SessionId, out: *Party) Error!void {
+        out.* = try initInner(allocator, share, signers, sid);
+    }
+
+    fn initInner(allocator: std.mem.Allocator, share: *const root.KeyShare, signers: []const u32, sid: SessionId) Error!Party {
         if (signers.len < 2 or signers.len < share.t or signers.len > share.n) return error.InvalidParameters;
         const sorted = try allocator.dupe(u32, signers);
         errdefer allocator.free(sorted);
@@ -546,7 +574,7 @@ pub const Party = struct {
         @memset(open, .{});
         return .{
             .allocator = allocator,
-            .share = share,
+            .share = share.*,
             .sid = ssid,
             .signers = sorted,
             .me = me,
@@ -626,6 +654,12 @@ pub const Party = struct {
     /// else (`OutOfMemory`, a misuse) with `abort == null` — the round's
     /// accumulators would be half-updated, so it cannot be retried.
     pub fn advance(self: *Party, inbox: []const []const u8, random: std.Random) Error!Outbox {
+        const result = self.advanceUnburned(inbox, random);
+        burn.stack(round_stack_burn);
+        return result;
+    }
+
+    noinline fn advanceUnburned(self: *Party, inbox: []const []const u8, random: std.Random) Error!Outbox {
         const result = switch (self.state) {
             .round1 => if (inbox.len != 0) error.InvalidParameters else self.round1(random),
             .round2 => self.round2(inbox, random),
@@ -805,7 +839,8 @@ pub const Party = struct {
             break;
         }
         me.commitment = commitGamma(self.sid, me.index, me.big_gamma, self.secrets.gamma_blind);
-        const init_k = mta.mtaAliceInitChecked(self.secrets.k, me.pk, random) catch return self.fail(me.index, .invalid_peer_keys);
+        var init_k: mta.AliceInitChecked = undefined;
+        mta.mtaAliceInitChecked(&self.secrets.k, me.pk, random, &init_k) catch return self.fail(me.index, .invalid_peer_keys);
         me.c_k = init_k.c_a;
         self.secrets.r_k = init_k.r_a;
 
@@ -821,7 +856,7 @@ pub const Party = struct {
         const my_ctx = self.myCtx();
         for (self.peers, 0..) |p, pos| {
             if (pos == self.me) continue;
-            const proof = zkproofs.proveAliceRange(self.allocator, self.secrets.k, self.secrets.r_k, me.pk, p.aux, &my_ctx, random) catch |e|
+            const proof = zkproofs.proveAliceRange(self.allocator, &self.secrets.k, &self.secrets.r_k, me.pk, p.aux, &my_ctx, random) catch |e|
                 return self.proveFailed(p.index, e);
             defer proof.deinit(self.allocator);
             const bytes = proof.toBytesAlloc(self.allocator) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else unreachable;
@@ -873,16 +908,18 @@ pub const Party = struct {
             payload.clearRetainingCapacity();
 
             // MtA for k_j·γ_i: this party is Bob.
-            var g = mta.mtaBobResponseChecked(self.secrets.gamma, p.c_k, p.pk, random) catch |e| return self.proveFailed(p.index, e);
+            var g: mta.BobResponseChecked = undefined;
+            mta.mtaBobResponseChecked(&self.secrets.gamma, p.c_k, p.pk, random, &g) catch |e| return self.proveFailed(p.index, e);
             defer std.crypto.secureZero(u8, std.mem.asBytes(&g));
-            const g_proof = zkproofs.proveBobMta(self.allocator, self.secrets.gamma, &g.beta_prime, g.r_b, p.c_k, g.c_b, p.pk, p.aux, &my_ctx, random) catch |e|
+            const g_proof = zkproofs.proveBobMta(self.allocator, &self.secrets.gamma, &g.beta_prime, &g.r_b, p.c_k, g.c_b, p.pk, p.aux, &my_ctx, random) catch |e|
                 return self.proveFailed(p.index, e);
             defer g_proof.deinit(self.allocator);
 
             // MtAwc for k_j·w_i, bound to W_i.
-            var x = mta.mtaBobResponseChecked(self.secrets.w, p.c_k, p.pk, random) catch |e| return self.proveFailed(p.index, e);
+            var x: mta.BobResponseChecked = undefined;
+            mta.mtaBobResponseChecked(&self.secrets.w, p.c_k, p.pk, random, &x) catch |e| return self.proveFailed(p.index, e);
             defer std.crypto.secureZero(u8, std.mem.asBytes(&x));
-            const x_proof = zkproofs.proveBobMtaWc(self.allocator, self.secrets.w, &x.beta_prime, x.r_b, p.c_k, x.c_b, p.pk, p.aux, me.w_point, &my_ctx, random) catch |e|
+            const x_proof = zkproofs.proveBobMtaWc(self.allocator, &self.secrets.w, &x.beta_prime, &x.r_b, p.c_k, x.c_b, p.pk, p.aux, me.w_point, &my_ctx, random) catch |e|
                 return self.proveFailed(p.index, e);
             defer x_proof.deinit(self.allocator);
 
@@ -923,7 +960,7 @@ pub const Party = struct {
             if (self.open[pos].round2 == null) self.open[pos].round2 = try self.allocator.dupe(u8, raw);
         }
         const me = &self.peers[self.me];
-        const sk = self.share.paillier_secret;
+        const sk = &self.share.paillier_secret;
 
         for (self.peers, 0..) |p, pos| {
             if (pos == self.me) continue;
@@ -946,8 +983,10 @@ pub const Party = struct {
             const p_ctx = proofContext(self.sid, p.index);
             if (!zkproofs.verifyBobMta(g_proof, me.c_k, c_g, me.pk, me.aux, &p_ctx)) return self.fail(p.index, .mta_proof);
             if (!zkproofs.verifyBobMtaWc(x_proof, me.c_k, c_x, me.pk, me.aux, p.w_point, &p_ctx)) return self.fail(p.index, .mtawc_proof);
-            var alpha = mta.mtaAliceFinalizeVerified(c_g, sk) catch return self.fail(p.index, .mta_proof);
-            var mu = mta.mtaAliceFinalizeVerified(c_x, sk) catch return self.fail(p.index, .mtawc_proof);
+            var alpha: Scalar = undefined;
+            mta.mtaAliceFinalizeVerified(c_g, sk, &alpha) catch return self.fail(p.index, .mta_proof);
+            var mu: Scalar = undefined;
+            mta.mtaAliceFinalizeVerified(c_x, sk, &mu) catch return self.fail(p.index, .mtawc_proof);
             self.secrets.delta = self.secrets.delta.add(alpha);
             self.secrets.sigma = self.secrets.sigma.add(mu);
             std.crypto.secureZero(u8, std.mem.asBytes(&alpha));
@@ -958,12 +997,12 @@ pub const Party = struct {
 
         while (true) {
             self.secrets.ell = randomScalar(random);
-            me.t_point = ecproofs.pedersenCommit(self.secrets.sigma, self.secrets.ell) catch continue;
+            me.t_point = ecproofs.pedersenCommit(&self.secrets.sigma, &self.secrets.ell) catch continue;
             break;
         }
         me.delta = self.secrets.delta;
         const ctx = self.myCtx();
-        const proof = ecproofs.provePedersen(self.secrets.sigma, self.secrets.ell, me.t_point, &ctx, random);
+        const proof = ecproofs.provePedersen(&self.secrets.sigma, &self.secrets.ell, me.t_point, &ctx, random);
 
         var payload: [Ns + Ne + ecproofs.PedersenProof.encoded_length]u8 = undefined;
         payload[0..Ns].* = me.delta.toBytes(.big);
@@ -1000,7 +1039,7 @@ pub const Party = struct {
 
         const me = &self.peers[self.me];
         const ctx = self.myCtx();
-        const proof = ecproofs.proveSchnorr(self.secrets.gamma, me.big_gamma, &ctx, random);
+        const proof = ecproofs.proveSchnorr(&self.secrets.gamma, me.big_gamma, &ctx, random);
         var payload: [Ne + 32 + ecproofs.SchnorrProof.encoded_length]u8 = undefined;
         payload[0..Ne].* = me.big_gamma.toBytes();
         payload[Ne..][0..32].* = self.secrets.gamma_blind;
@@ -1059,7 +1098,7 @@ pub const Party = struct {
         const ctx = self.myCtx();
         for (self.peers, 0..) |p, pos| {
             if (pos == self.me) continue;
-            const proof = zkproofs.provePdl(self.allocator, self.secrets.k, self.secrets.r_k, me.pk, p.aux, self.r_point, me.r_bar, &ctx, random) catch |e|
+            const proof = zkproofs.provePdl(self.allocator, &self.secrets.k, &self.secrets.r_k, me.pk, p.aux, self.r_point, me.r_bar, &ctx, random) catch |e|
                 return self.proveFailed(p.index, e);
             defer proof.deinit(self.allocator);
             const bytes = proof.toBytesAlloc(self.allocator) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else unreachable;
@@ -1098,7 +1137,7 @@ pub const Party = struct {
         const s_pt = r_pt.mul(self.secrets.sigma.toBytes(.big), .big) catch return self.fail(null, .degenerate);
         me.s_point = Element.fromPoint(s_pt) catch return self.fail(null, .degenerate);
         const ctx = self.myCtx();
-        const proof = ecproofs.proveSt(self.secrets.sigma, self.secrets.ell, self.r_point, me.s_point, me.t_point, &ctx, random) catch unreachable;
+        const proof = ecproofs.proveSt(&self.secrets.sigma, &self.secrets.ell, self.r_point, me.s_point, me.t_point, &ctx, random) catch unreachable;
 
         var payload: [Ne + ecproofs.StProof.encoded_length]u8 = undefined;
         payload[0..Ne].* = me.s_point.toBytes();
@@ -1115,9 +1154,18 @@ pub const Party = struct {
     /// Consumes the Phase-6 messages, checks `Σ S_j = X`, and moves this
     /// party's secrets into the returned `Presignature` (the party keeps
     /// none; only `deinit` remains to be called on it).
-    pub fn finish(self: *Party, inbox: []const []const u8) Error!Presignature {
+    ///
+    /// The presignature is written to `out`: returned by value, its secrets
+    /// would stay in the caller's frame (measured, `stackprobe_test.zig`).
+    pub fn finish(self: *Party, inbox: []const []const u8, out: *Presignature) Error!void {
+        const result = self.finishUnburned(inbox, out);
+        burn.stack(finish_stack_burn);
+        return result;
+    }
+
+    noinline fn finishUnburned(self: *Party, inbox: []const []const u8, out: *Presignature) Error!void {
         if (self.state != .finish) return error.InvalidState;
-        return self.finishInner(inbox) catch |e| {
+        out.* = self.finishInner(inbox) catch |e| {
             if (self.state != .opening) {
                 self.state = .aborted;
                 self.wipe();
@@ -1211,6 +1259,12 @@ pub const Party = struct {
     /// Then hand every peer's opening to `echoOpenings`, and every peer's
     /// echo to `identify`.
     pub fn openAbort(self: *Party, random: std.Random) Error!Outbox {
+        const result = self.openAbortUnburned(random);
+        burn.stack(round_stack_burn);
+        return result;
+    }
+
+    noinline fn openAbortUnburned(self: *Party, random: std.Random) Error!Outbox {
         if (self.state != .opening) return error.InvalidState;
         const fault = self.abort.?.fault;
         const me = self.peers[self.me];
@@ -1234,14 +1288,15 @@ pub const Party = struct {
                 try appendLenPrefixed(&payload, self.allocator, &fe_buf);
             }
         } else {
-            const sk = self.share.paillier_secret;
+            const sk = &self.share.paillier_secret;
             const n_len = me.pk.nByteLen();
             for (self.open, 0..) |o, pos| {
                 if (pos == self.me) continue;
                 try appendLenPrefixed(&payload, self.allocator, o.round2.?);
                 const fields = round2Fields(o.round2.?, self.peers.len) orelse unreachable; // checked in round 3
                 const c_w = paillier.Ciphertext.fromBytes(me.pk, fields[2]) catch unreachable;
-                const opened = mta.decryptWithRandomness(sk, me.pk, c_w) catch return error.InvalidParameters;
+                var opened: mta.DecryptionWithRandomness = undefined;
+                mta.decryptWithRandomness(sk, me.pk, c_w, &opened) catch return error.InvalidParameters;
                 var m_buf: [paillier.modulus_bytes]u8 = undefined;
                 opened.m.toBytes(m_buf[0..n_len], .big) catch unreachable;
                 try appendLenPrefixed(&payload, self.allocator, m_buf[0..n_len]);
@@ -1250,7 +1305,7 @@ pub const Party = struct {
             }
             const sigma_pt = Secp256k1.basePoint.mul(self.secrets.sigma.toBytes(.big), .big) catch return error.InvalidParameters;
             const sigma_el = Element.fromPoint(sigma_pt) catch return error.InvalidParameters;
-            const proof = ecproofs.proveDleq(self.secrets.sigma, self.r_point, me.s_point, sigma_el, &self.myCtx(), random) catch unreachable;
+            const proof = ecproofs.proveDleq(&self.secrets.sigma, self.r_point, me.s_point, sigma_el, &self.myCtx(), random) catch unreachable;
             try payload.appendSlice(self.allocator, &proof.toBytes());
         }
         var out: OutboxBuilder = .{ .allocator = self.allocator };
@@ -1267,6 +1322,12 @@ pub const Party = struct {
     /// whose opening is missing or unsigned is named here (`ProtocolAbort`,
     /// the verdict in `abort`; the party is done, its secrets wiped).
     pub fn echoOpenings(self: *Party, inbox: []const []const u8) Error!Outbox {
+        const result = self.echoOpeningsUnburned(inbox);
+        burn.stack(echo_stack_burn);
+        return result;
+    }
+
+    noinline fn echoOpeningsUnburned(self: *Party, inbox: []const []const u8) Error!Outbox {
         if (self.state != .echo) return error.InvalidState;
         return self.echoInner(inbox) catch |e| {
             if (self.state != .aborted) {
@@ -1320,6 +1381,12 @@ pub const Party = struct {
     /// its secrets wiped. A peer whose echo is missing or unsigned, or whose
     /// opening is malformed, is the culprit.
     pub fn identify(self: *Party, inbox: []const []const u8) Error!Abort {
+        const result = self.identifyUnburned(inbox);
+        burn.stack(round_stack_burn);
+        return result;
+    }
+
+    noinline fn identifyUnburned(self: *Party, inbox: []const []const u8) Error!Abort {
         if (self.state != .identify) return error.InvalidState;
         const fault = self.abort.?.fault;
         const verdict = self.identifyInner(inbox, fault) catch |e| switch (e) {
@@ -1378,7 +1445,8 @@ pub const Party = struct {
     fn checkNonce(self: *const Party, o: Opening, i: usize) bool {
         const pk = self.peers[i].pk;
         const r_k = paillier.Fe.fromBytes(pk.n_sq, o.r_k, .big) catch return false;
-        const c = paillier.encrypt(pk, mta.scalarToFe(o.k, pk), r_k) catch return false;
+        const k_fe = mta.scalarToFe(o.k, pk);
+        const c = paillier.encrypt(pk, &k_fe, &r_k) catch return false;
         return std.mem.eql(u8, &ciphertextBytes(c), &ciphertextBytes(self.peers[i].c_k));
     }
 
@@ -1398,8 +1466,9 @@ pub const Party = struct {
             const bob = sections[b * n + a];
             const r = paillier.Fe.fromBytes(pk.n_sq, bob.rand, .big) catch return self.signers[b];
             const beta_fe = zkproofs.feFromSecretBytes(pk.n_sq, paillier.Fe, bob.mask);
-            const scaled = paillier.mulPlaintext(pk, self.peers[a].c_k, mta.scalarToFe(openings[b].gamma, pk)) catch return self.signers[b];
-            const masked = paillier.encrypt(pk, beta_fe, r) catch return self.signers[b];
+            const gamma_fe = mta.scalarToFe(openings[b].gamma, pk);
+            const scaled = paillier.mulPlaintext(pk, self.peers[a].c_k, &gamma_fe) catch return self.signers[b];
+            const masked = paillier.encrypt(pk, &beta_fe, &r) catch return self.signers[b];
             const want = paillier.addCiphertexts(pk, scaled, masked);
             if (!std.mem.eql(u8, fields[0], &ciphertextBytes(want))) return self.signers[b];
         };
@@ -1440,7 +1509,7 @@ pub const Party = struct {
             // a's decryption of c_w, with its randomness: re-encrypt and compare.
             const m_fe = paillier.Fe.fromBytes(pk.n_sq, alice.plain, .big) catch return self.signers[a];
             const rho = paillier.Fe.fromBytes(pk.n_sq, alice.rand, .big) catch return self.signers[a];
-            const again = paillier.encrypt(pk, m_fe, rho) catch return self.signers[a];
+            const again = paillier.encrypt(pk, &m_fe, &rho) catch return self.signers[a];
             if (!std.mem.eql(u8, fields[2], &ciphertextBytes(again))) return self.signers[a];
             mu[a * n + b] = mta.centeredModQ(alice.plain, n_buf[0..n_len]);
         };
@@ -1683,6 +1752,12 @@ pub const Presignature = struct {
     /// Phase 7: `s_i = m·k_i + r·σ_i` as a broadcast message (owned by the
     /// caller). Wipes `k_i`, `σ_i`; a second call is `PresignatureUsed`.
     pub fn signShare(self: *Presignature, message: Message) Error![]u8 {
+        const result = self.signShareUnburned(message);
+        burn.stack(sign_share_stack_burn);
+        return result;
+    }
+
+    noinline fn signShareUnburned(self: *Presignature, message: Message) Error![]u8 {
         if (self.used) return error.PresignatureUsed;
         self.used = true;
         defer self.wipe();
@@ -1714,6 +1789,12 @@ pub const Presignature = struct {
     /// R̄[n] || S[n] || Phase-6 attestations[n] || message keys[n] || k || σ ||
     /// message seed`, integers big-endian.
     pub fn toBytesAlloc(self: *Presignature, allocator: std.mem.Allocator) Error![]u8 {
+        const result = self.toBytesAllocUnburned(allocator);
+        burn.stack(codec_stack_burn);
+        return result;
+    }
+
+    noinline fn toBytesAllocUnburned(self: *Presignature, allocator: std.mem.Allocator) Error![]u8 {
         if (self.used) return error.PresignatureUsed;
         const pb = &self.public;
         const n = pb.signers.len;
@@ -1764,7 +1845,18 @@ pub const Presignature = struct {
     /// `k` does not belong to). Not a substitute for authenticated
     /// encryption at rest: whoever can write a record can write a coherent
     /// one. Allocates with `allocator`.
-    pub fn fromBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!Presignature {
+    /// The presignature is written to `out` (see `Party.finish`).
+    pub fn fromBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8, out: *Presignature) DecodeError!void {
+        const result = Presignature.fromBytesAllocUnburned(allocator, bytes, out);
+        burn.stack(codec_stack_burn);
+        return result;
+    }
+
+    noinline fn fromBytesAllocUnburned(allocator: std.mem.Allocator, bytes: []const u8, out: *Presignature) DecodeError!void {
+        out.* = try decode(allocator, bytes);
+    }
+
+    fn decode(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!Presignature {
         const fixed = 1 + 32 + 4 + Ne + 4;
         if (bytes.len < fixed or bytes[0] != codec_version) return error.InvalidEncoding;
         const index = std.mem.readInt(u32, bytes[33..37], .big);
@@ -1931,21 +2023,22 @@ pub const PresignaturePool = struct {
         return presig_id;
     }
 
-    /// The presignature filed under `id`, removed from the store; null when
-    /// it is not there (never stored, or taken before). Deinit the result.
-    pub fn take(self: PresignaturePool, allocator: std.mem.Allocator, presig_id: [32]u8) anyerror!?Presignature {
-        const bytes = (try self.store.vtable.take(self.store.ptr, presig_id, allocator)) orelse return null;
+    /// Writes the presignature filed under `id` to `out` and removes it from
+    /// the store; false (and `out` untouched) when it is not there (never
+    /// stored, or taken before). Deinit `out` after a true. Written through
+    /// `out`, not returned, for the reason `Party.finish` gives.
+    pub fn take(self: PresignaturePool, allocator: std.mem.Allocator, presig_id: [32]u8, out: *Presignature) anyerror!bool {
+        const bytes = (try self.store.vtable.take(self.store.ptr, presig_id, allocator)) orelse return false;
         defer {
             std.crypto.secureZero(u8, bytes);
             allocator.free(bytes);
         }
-        const presig = try Presignature.fromBytesAlloc(allocator, bytes);
-        if (!std.mem.eql(u8, &presig.id(), &presig_id)) {
-            var p = presig;
-            p.deinit();
+        try Presignature.fromBytesAlloc(allocator, bytes, out);
+        if (!std.mem.eql(u8, &out.id(), &presig_id)) {
+            out.deinit();
             return error.InvalidEncoding;
         }
-        return presig;
+        return true;
     }
 };
 
@@ -2177,7 +2270,7 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
     random.bytes(&sid);
 
     var parties: [8]Party = undefined;
-    for (0..t) |i| parties[i] = try Party.init(allocator, shares[i], indices[0..t], sid);
+    for (0..t) |i| try Party.init(allocator, &shares[i], indices[0..t], sid, &parties[i]);
     defer for (parties[0..t]) |*p| p.deinit();
     const cheat = indices[1];
     const cheat_pos = for (parties[0..t], 0..) |p, i| {
@@ -2342,7 +2435,7 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
         allocator.free(presigs);
     }
     for (0..t) |i| {
-        presigs[i] = parties[i].finish(inboxes[i].items) catch |e| switch (e) {
+        parties[i].finish(inboxes[i].items, &presigs[i]) catch |e| switch (e) {
             error.ProtocolAbort => {
                 try aborts.append(allocator, .{ .observer = parties[i].myIndex(), .abort = parties[i].abort.? });
                 continue;
@@ -2798,7 +2891,8 @@ test "presign: a pooled presignature survives encoding, is taken at most once, a
     try testing.expectError(error.PresignatureUsed, res.presigs[1].toBytesAlloc(allocator));
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&res.presigs[1].k), 0));
     {
-        var back = try Presignature.fromBytesAlloc(allocator, bytes);
+        var back: Presignature = undefined;
+        try Presignature.fromBytesAlloc(allocator, bytes, &back);
         defer back.deinit();
         try testing.expectEqualSlices(u8, &res.presigs[1].id(), &back.id());
         try testing.expect(back.k.equivalent(k_orig) and back.sigma.equivalent(sigma_orig));
@@ -2806,21 +2900,22 @@ test "presign: a pooled presignature survives encoding, is taken at most once, a
         defer allocator.free(again);
         try testing.expectEqualSlices(u8, bytes, again);
     }
+    var scratch_presig: Presignature = undefined;
     const bad = try allocator.dupe(u8, bytes);
     defer allocator.free(bad);
     bad[0] = 9; // version
-    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad));
-    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bytes[0 .. bytes.len - 1]));
+    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad, &scratch_presig));
+    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bytes[0 .. bytes.len - 1], &scratch_presig));
     @memcpy(bad, bytes);
     bad[bad.len - 1] ^= 0x01; // a message seed that is not this signer's key
-    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad));
+    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad, &scratch_presig));
     @memcpy(bad, bytes);
     const signers_at = 1 + 32 + 4 + Ne + 4;
     std.mem.writeInt(u32, bad[signers_at..][0..4], std.mem.readInt(u32, bad[signers_at + 4 ..][0..4], .big), .big); // signers not ascending
-    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad));
+    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad, &scratch_presig));
     @memcpy(bad, bytes);
     std.mem.writeInt(u32, bad[signers_at..][0..4], 0, .big); // signer index 0 (still ascending)
-    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad));
+    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad, &scratch_presig));
     {
         // A small-order message key for the other signer (not this one's own).
         const n = res.presigs[1].public.signers.len;
@@ -2828,7 +2923,7 @@ test "presign: a pooled presignature survives encoding, is taken at most once, a
         @memcpy(bad, bytes);
         @memset(bad[keys_at..][0..32], 0);
         bad[keys_at] = 1; // the identity point
-        try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad));
+        try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad, &scratch_presig));
     }
     // Review F4: well-formed fields that break the relations of a finished
     // session — r, each R̄_j and S_j, k, σ — are refused.
@@ -2856,7 +2951,7 @@ test "presign: a pooled presignature survives encoding, is taken at most once, a
                 const v = Scalar.fromBytes(bad[at..][0..Ns].*, .big) catch unreachable;
                 bad[at..][0..Ns].* = v.add(Scalar.one).toBytes(.big);
             } else bad[at..][0..Ne].* = g_bytes;
-            try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad));
+            try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad, &scratch_presig));
         }
     }
 
@@ -2864,13 +2959,14 @@ test "presign: a pooled presignature survives encoding, is taken at most once, a
     // it once. (The original was consumed by the encoding above: start from
     // its bytes.)
     res.presigs[1].deinit();
-    res.presigs[1] = try Presignature.fromBytesAlloc(allocator, bytes);
+    try Presignature.fromBytesAlloc(allocator, bytes, &res.presigs[1]);
     var mem = MemoryPresignatureStore.init(allocator);
     defer mem.deinit();
     const pool: PresignaturePool = .{ .store = mem.store() };
     const presig_id = try pool.put(allocator, &res.presigs[1]);
-    res.presigs[1] = (try pool.take(allocator, presig_id)).?; // res.deinit frees it
-    try testing.expect((try pool.take(allocator, presig_id)) == null);
+    try testing.expect(try pool.take(allocator, presig_id, &res.presigs[1])); // res.deinit frees it
+    var none: Presignature = undefined;
+    try testing.expect(!try pool.take(allocator, presig_id, &none));
 
     var abort: ?Abort = null;
     const sig = try signAll(allocator, res.presigs, .{ .bytes = "from the pool" }, &abort);
@@ -2886,7 +2982,8 @@ test "fuzz: Presignature.fromBytesAlloc never panics" {
 fn fuzzPresigDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [1200]u8 = undefined;
     const bytes = buf[0..smith.slice(&buf)];
-    var p = Presignature.fromBytesAlloc(testing.allocator, bytes) catch return;
+    var p: Presignature = undefined;
+    Presignature.fromBytesAlloc(testing.allocator, bytes, &p) catch return;
     p.deinit();
 }
 
@@ -3001,21 +3098,22 @@ test "presign: init refuses a bad signer set" {
     defer kg.deinit(allocator);
     const sid = [_]u8{7} ** 32;
     const share = kg.key_shares[0];
-    try testing.expectError(error.InvalidParameters, Party.init(allocator, share, &[_]u32{1}, sid));
-    try testing.expectError(error.InvalidParameters, Party.init(allocator, share, &[_]u32{ 2, 3 }, sid));
-    try testing.expectError(error.InvalidParameters, Party.init(allocator, share, &[_]u32{ 1, 1 }, sid));
-    try testing.expectError(error.InvalidParameters, Party.init(allocator, share, &[_]u32{ 1, 4 }, sid));
-    try testing.expectError(error.InvalidParameters, Party.init(allocator, share, &[_]u32{ 1, 2, 3, 4 }, sid));
+    var scratch: Party = undefined;
+    try testing.expectError(error.InvalidParameters, Party.init(allocator, &share, &[_]u32{1}, sid, &scratch));
+    try testing.expectError(error.InvalidParameters, Party.init(allocator, &share, &[_]u32{ 2, 3 }, sid, &scratch));
+    try testing.expectError(error.InvalidParameters, Party.init(allocator, &share, &[_]u32{ 1, 1 }, sid, &scratch));
+    try testing.expectError(error.InvalidParameters, Party.init(allocator, &share, &[_]u32{ 1, 4 }, sid, &scratch));
+    try testing.expectError(error.InvalidParameters, Party.init(allocator, &share, &[_]u32{ 1, 2, 3, 4 }, sid, &scratch));
     // Fewer signers than the threshold the share was dealt for.
     var t3 = share;
     t3.t = 3;
-    try testing.expectError(error.InvalidParameters, Party.init(allocator, t3, &[_]u32{ 1, 2 }, sid));
+    try testing.expectError(error.InvalidParameters, Party.init(allocator, &t3, &[_]u32{ 1, 2 }, sid, &scratch));
     // A public-keys list naming signer 2 twice.
     const dup = try std.mem.concat(allocator, root.PartyPublicKeys, &.{ share.public_keys.entries, share.public_keys.entries[1..2] });
     defer allocator.free(dup);
     var dup_share = share;
     dup_share.public_keys = .{ .entries = dup };
-    try testing.expectError(error.InvalidParameters, Party.init(allocator, dup_share, &[_]u32{ 1, 2 }, sid));
+    try testing.expectError(error.InvalidParameters, Party.init(allocator, &dup_share, &[_]u32{ 1, 2 }, sid, &scratch));
     // Signer 2's announced X_2 replaced: signer 1's own share is fine, but
     // Σ λ_j·X_j over {1, 2} is no longer the group key.
     const bad_x = try allocator.dupe(root.PartyPublicKeys, share.public_keys.entries);
@@ -3023,16 +3121,18 @@ test "presign: init refuses a bad signer set" {
     bad_x[1].verifying_share = try Element.fromPoint(Secp256k1.basePoint);
     var bad_x_share = share;
     bad_x_share.public_keys = .{ .entries = bad_x };
-    try testing.expectError(error.InvalidParameters, Party.init(allocator, bad_x_share, &[_]u32{ 1, 2 }, sid));
+    try testing.expectError(error.InvalidParameters, Party.init(allocator, &bad_x_share, &[_]u32{ 1, 2 }, sid, &scratch));
     // Public material intact, but signer 1's secret share is not the x_1
     // behind X_1: only the own-share check can see it.
     var bad_secret = share;
     bad_secret.secret_share = share.secret_share.add(Scalar.one);
-    try testing.expectError(error.InvalidParameters, Party.init(allocator, bad_secret, &[_]u32{ 1, 2 }, sid));
-    var p = try Party.init(allocator, share, &[_]u32{ 3, 1 }, sid);
+    try testing.expectError(error.InvalidParameters, Party.init(allocator, &bad_secret, &[_]u32{ 1, 2 }, sid, &scratch));
+    var p: Party = undefined;
+    try Party.init(allocator, &share, &[_]u32{ 3, 1 }, sid, &p);
     defer p.deinit();
     try testing.expectError(error.InvalidParameters, p.advance(&[_][]const u8{"x"}, random));
-    try testing.expectError(error.InvalidState, p.finish(&.{}));
+    var presig: Presignature = undefined;
+    try testing.expectError(error.InvalidState, p.finish(&.{}, &presig));
 }
 
 test "presign: a message signature binds its whole header; peekHeader refuses a foreign version and sender 0" {
@@ -3070,13 +3170,18 @@ test "presign: the session id binds the signer set, the threshold and the public
     const sid = [_]u8{3} ** 32;
     const share = kg.key_shares[0];
 
-    var base = try Party.init(allocator, share, &[_]u32{ 1, 2 }, sid);
+    var base: Party = undefined;
+
+    try Party.init(allocator, &share, &[_]u32{ 1, 2 }, sid, &base);
     defer base.deinit();
-    var same = try Party.init(allocator, share, &[_]u32{ 2, 1 }, sid); // the order of the set does not matter
+    var same: Party = undefined;
+    try Party.init(allocator, &share, &[_]u32{ 2, 1 }, sid, &same); // the order of the set does not matter
     defer same.deinit();
     try testing.expectEqualSlices(u8, &base.sid, &same.sid);
 
-    var other_set = try Party.init(allocator, share, &[_]u32{ 1, 3 }, sid);
+    var other_set: Party = undefined;
+
+    try Party.init(allocator, &share, &[_]u32{ 1, 3 }, sid, &other_set);
     defer other_set.deinit();
     try testing.expect(!std.mem.eql(u8, &base.sid, &other_set.sid));
 
@@ -3086,16 +3191,19 @@ test "presign: the session id binds the signer set, the threshold and the public
     entries[1].message_key = try root.messagePublicKey(@splat(9));
     var other_table_share = share;
     other_table_share.public_keys = .{ .entries = entries };
-    var other_table = try Party.init(allocator, other_table_share, &[_]u32{ 1, 2 }, sid);
+    var other_table: Party = undefined;
+    try Party.init(allocator, &other_table_share, &[_]u32{ 1, 2 }, sid, &other_table);
     defer other_table.deinit();
     try testing.expect(!std.mem.eql(u8, &base.sid, &other_table.sid));
 
     // The same three signers under another threshold.
-    var all3 = try Party.init(allocator, share, &[_]u32{ 1, 2, 3 }, sid);
+    var all3: Party = undefined;
+    try Party.init(allocator, &share, &[_]u32{ 1, 2, 3 }, sid, &all3);
     defer all3.deinit();
     var t3_share = share;
     t3_share.t = 3;
-    var all3_t3 = try Party.init(allocator, t3_share, &[_]u32{ 1, 2, 3 }, sid);
+    var all3_t3: Party = undefined;
+    try Party.init(allocator, &t3_share, &[_]u32{ 1, 2, 3 }, sid, &all3_t3);
     defer all3_t3.deinit();
     try testing.expect(!std.mem.eql(u8, &all3.sid, &all3_t3.sid));
 }
@@ -3147,7 +3255,8 @@ test "presign: round 1 refuses a party whose own aux tuple or Paillier key fails
         entries[0].aux.h1 = entries[0].aux.n_tilde.one();
         var share = kg.key_shares[0];
         share.public_keys = .{ .entries = entries };
-        var p = try Party.init(allocator, share, &[_]u32{ 1, 2 }, sid);
+        var p: Party = undefined;
+        try Party.init(allocator, &share, &[_]u32{ 1, 2 }, sid, &p);
         defer p.deinit();
         try testing.expectError(error.InvalidParameters, p.advance(&.{}, random));
     }
@@ -3158,7 +3267,8 @@ test "presign: round 1 refuses a party whose own aux tuple or Paillier key fails
         entries[1].paillier_pk.g = paillier.Fe.fromBytes(entries[1].paillier_pk.n_sq, &[_]u8{4}, .big) catch unreachable;
         var share = kg.key_shares[1];
         share.public_keys = .{ .entries = entries };
-        var p = try Party.init(allocator, share, &[_]u32{ 1, 2 }, sid);
+        var p: Party = undefined;
+        try Party.init(allocator, &share, &[_]u32{ 1, 2 }, sid, &p);
         defer p.deinit();
         try testing.expectError(error.InvalidParameters, p.advance(&.{}, random));
     }
@@ -3179,17 +3289,20 @@ test "presign: the pool refuses a duplicate id, and a record filed under another
     var mem = MemoryPresignatureStore.init(allocator);
     defer mem.deinit();
     const pool: PresignaturePool = .{ .store = mem.store() };
-    var first = try Presignature.fromBytesAlloc(allocator, bytes);
+    var first: Presignature = undefined;
+    try Presignature.fromBytesAlloc(allocator, bytes, &first);
     const presig_id = try pool.put(allocator, &first);
     // The same presignature again: the store refuses the id (and `put` still
     // wipes what it was handed).
-    var second = try Presignature.fromBytesAlloc(allocator, bytes);
+    var second: Presignature = undefined;
+    try Presignature.fromBytesAlloc(allocator, bytes, &second);
     try testing.expectError(error.DuplicateId, pool.put(allocator, &second));
     // A record that decodes fine but sits under another presignature's id is
     // not handed out.
     const other_id: [32]u8 = @splat(7);
     try mem.store().vtable.put(mem.store().ptr, other_id, bytes);
-    try testing.expectError(error.InvalidEncoding, pool.take(allocator, other_id));
-    var back = (try pool.take(allocator, presig_id)).?;
+    var back: Presignature = undefined;
+    try testing.expectError(error.InvalidEncoding, pool.take(allocator, other_id, &back));
+    try testing.expect(try pool.take(allocator, presig_id, &back));
     back.deinit();
 }

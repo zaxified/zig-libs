@@ -82,7 +82,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var prng = std.Random.DefaultPrng.init(0x0AC1E5);
     const random = prng.random();
-    const kp = try paillier.generate(random, bits);
+    var kp: paillier.KeyPair = undefined;
+    try paillier.generate(random, bits, &kp);
     const pk = kp.public;
     const sk = kp.secret;
 
@@ -104,8 +105,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (std.mem.allEqual(u8, rb[0..n_len], 0)) rb[n_len - 1] = 3;
         const m = try paillier.Fe.fromBytes(pk.n_sq, mb[0..n_len], .big);
         const r = try paillier.Fe.fromBytes(pk.n_sq, rb[0..n_len], .big);
-        const c = try paillier.encrypt(pk, m, r);
-        const dec = paillier.decrypt(sk, c) catch {
+        const c = try paillier.encrypt(pk, &m, &r);
+        var dec: paillier.Fe = undefined;
+        paillier.decrypt(&sk, c, &dec) catch {
             p("SKIP encrypt-produced-nonunit trial={d}\n", .{t});
             continue;
         };
@@ -125,35 +127,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (std.mem.allEqual(u8, rb[0..n_len], 0)) rb[n_len - 1] = 5;
             const m2 = try paillier.Fe.fromBytes(pk.n_sq, mb[0..n_len], .big);
             const r2 = try paillier.Fe.fromBytes(pk.n_sq, rb[0..n_len], .big);
-            const c2 = try paillier.encrypt(pk, m2, r2);
+            const c2 = try paillier.encrypt(pk, &m2, &r2);
 
             const cadd = paillier.addCiphertexts(pk, c, c2);
-            if (paillier.decrypt(sk, cadd)) |d| {
+            var d_cadd: paillier.Fe = undefined;
+            if (paillier.decrypt(&sk, cadd, &d_cadd)) |_| {
                 p("A", .{});
                 feHexInline(c.c);
                 feHexInline(c2.c);
                 feHexInline(cadd.c);
-                feHexInline(d);
+                feHexInline(d_cadd);
                 p("\n", .{});
             } else |_| {}
 
-            const cpt = try paillier.addPlaintext(pk, c, m2);
-            if (paillier.decrypt(sk, cpt)) |d| {
+            const cpt = try paillier.addPlaintext(pk, c, &m2);
+            var d_cpt: paillier.Fe = undefined;
+            if (paillier.decrypt(&sk, cpt, &d_cpt)) |_| {
                 p("P", .{});
                 feHexInline(c.c);
                 feHexInline(m2);
                 feHexInline(cpt.c);
-                feHexInline(d);
+                feHexInline(d_cpt);
                 p("\n", .{});
             } else |_| {}
 
-            const cmul = try paillier.mulPlaintext(pk, c, m2);
-            if (paillier.decrypt(sk, cmul)) |d| {
+            const cmul = try paillier.mulPlaintext(pk, c, &m2);
+            var d_cmul: paillier.Fe = undefined;
+            if (paillier.decrypt(&sk, cmul, &d_cmul)) |_| {
                 p("M", .{});
                 feHexInline(c.c);
                 feHexInline(m2);
                 feHexInline(cmul.c);
-                feHexInline(d);
+                feHexInline(d_cmul);
                 p("\n", .{});
             } else |_| {}
         }

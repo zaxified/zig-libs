@@ -179,6 +179,21 @@ silently assumed.
 
 ## Threat model / out of scope
 
+- **Secret residue on the dead stack** (sweep 2026-10-08, `src/stackprobe_test.zig`,
+  ReleaseFast). Wiping named buffers did not keep secrets off the stack: compiler copies,
+  by-value parameters and results, and callee frames left them in dead stack memory. Fix,
+  as `bip32`/`k256` (2026-10-08): (1) every public entry point that touches a secret runs its
+  body one frame down (`noinline`) and then zeroes, at that depth, a region a little deeper than
+  the body was measured to reach (`burn.zig`: volatile 32-byte vector stores into a 16-aligned
+  buffer — 32-aligned, the frame realigned and left up to 56 bytes unzeroed, which held half a
+  secret); (2) a secret never crosses the API by value: secret parameters are pointers, secret
+  results go to an out-parameter, because the copy a by-value argument or result makes lives in
+  the CALLER's frame, where no burn of the callee reaches. The probe paints a window, makes one
+  call, copies the uninitialised window at the same depth and looks for every 16-byte window of
+  every secret's big-endian, little-endian and in-memory image and of every byte the call drew
+  from its `std.Random` (published bytes excluded); negative and positive controls in the same
+  binary. `verbose = true` prints each call's depth, to resize a burn after a change.
+  Before: 122 copies over 10 entry points (`generate` 78, CRT `decrypt` 26); after: 0.
 - **Key strength = factoring `n`,** exactly like RSA. `generate` draws two `bits/2`-bit
   probable primes (top two bits set → `n` is exactly `bits` bits; 64 Miller-Rabin rounds →
   ≤ 2⁻¹²⁸ worst-case acceptance error per prime; FIPS 186-5 §A.1.3 top-100-bits closeness

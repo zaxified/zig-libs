@@ -102,6 +102,20 @@ const paillier = @import("paillier");
 const montint = @import("montint");
 const root = @import("root.zig");
 const zkproofs = @import("zkproofs.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack burns of the secret entry points (`burn.zig`), each a little
+// above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
+// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// that no secret survives, which a body outgrowing its burn would break.
+const mta_alice_init_stack_burn = 112 * 1024;
+const mta_alice_init_checked_stack_burn = 112 * 1024;
+const mta_bob_response_stack_burn = 112 * 1024;
+const mta_bob_response_checked_stack_burn = 112 * 1024;
+const mta_alice_finalize_stack_burn = 144 * 1024;
+const mta_alice_finalize_verified_stack_burn = 144 * 1024;
+const mta_alice_finalize_checked_stack_burn = 176 * 1024;
+const decrypt_with_randomness_stack_burn = 176 * 1024;
 
 /// secp256k1 scalar field Zq — the domain of MtA's inputs `a`, `b` and
 /// additive outputs `α`, `β`. Same type `threshold_ecdsa`'s root module
@@ -155,9 +169,19 @@ pub const AliceInit = struct {
 /// **Alice, round 1.** `c_A = Enc_A(a)` under Alice's OWN Paillier public
 /// key, freshly blinded (IND-CPA randomness sampled internally via
 /// `paillier.encryptRandom`). Send `result.c_a` to Bob.
-pub fn mtaAliceInit(a: Scalar, alice_pk: paillier.PublicKey, random: std.Random) MtaError!AliceInit {
+pub fn mtaAliceInit(a: *const Scalar, alice_pk: paillier.PublicKey, random: std.Random) MtaError!AliceInit {
+    const result = mtaAliceInitUnburned(a, alice_pk, random);
+    burn.stack(mta_alice_init_stack_burn);
+    return result;
+}
+
+noinline fn mtaAliceInitUnburned(a: *const Scalar, alice_pk: paillier.PublicKey, random: std.Random) MtaError!AliceInit {
+    return mtaAliceInitByValue(a.*, alice_pk, random);
+}
+
+fn mtaAliceInitByValue(a: Scalar, alice_pk: paillier.PublicKey, random: std.Random) MtaError!AliceInit {
     const a_fe = scalarToFe(a, alice_pk);
-    const c_a = try paillier.encryptRandom(alice_pk, a_fe, random);
+    const c_a = try paillier.encryptRandom(alice_pk, &a_fe, random);
     return .{ .c_a = c_a };
 }
 
@@ -188,6 +212,28 @@ pub const BobResponse = struct {
 /// key). A malicious Bob could pick `β'` out of range to attack Alice; the
 /// checked path (`mtaBobResponseChecked` + `zkproofs`) is what forbids that.
 pub fn mtaBobResponse(
+    b: *const Scalar,
+    c_a: paillier.Ciphertext,
+    alice_pk: paillier.PublicKey,
+    random: std.Random,
+    out: *BobResponse,
+) MtaError!void {
+    const result = mtaBobResponseUnburned(b, c_a, alice_pk, random, out);
+    burn.stack(mta_bob_response_stack_burn);
+    return result;
+}
+
+noinline fn mtaBobResponseUnburned(
+    b: *const Scalar,
+    c_a: paillier.Ciphertext,
+    alice_pk: paillier.PublicKey,
+    random: std.Random,
+    out: *BobResponse,
+) MtaError!void {
+    out.* = try mtaBobResponseByValue(b.*, c_a, alice_pk, random);
+}
+
+fn mtaBobResponseByValue(
     b: Scalar,
     c_a: paillier.Ciphertext,
     alice_pk: paillier.PublicKey,
@@ -199,8 +245,8 @@ pub fn mtaBobResponse(
     // then homomorphically add β'. (b = 0 is handled by mulPlaintext's k=0
     // case → Enc(0).)
     const b_fe = scalarToFe(b, alice_pk);
-    const c_ab = try paillier.mulPlaintext(alice_pk, c_a, b_fe);
-    const c_b = try paillier.addPlaintext(alice_pk, c_ab, bp_fe);
+    const c_ab = try paillier.mulPlaintext(alice_pk, c_a, &b_fe);
+    const c_b = try paillier.addPlaintext(alice_pk, c_ab, &bp_fe);
 
     // β = −β' (mod q): the negation that makes α + β cancel β'.
     var wide: [paillier.modulus_sq_bytes]u8 = undefined;
@@ -230,7 +276,17 @@ fn sampleBetaPrime(random: std.Random, out: *[zkproofs.beta_prime_bytes]u8) void
 ///
 /// The plaintext `α' < q² + q < 2^512` fits in 64 bytes; `Scalar.fromBytes64`
 /// performs the constant-time `mod q` reduction.
-pub fn mtaAliceFinalize(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey) MtaError!Scalar {
+pub fn mtaAliceFinalize(c_b: paillier.Ciphertext, alice_sk: *const paillier.SecretKey, out: *Scalar) MtaError!void {
+    const result = mtaAliceFinalizeUnburned(c_b, alice_sk, out);
+    burn.stack(mta_alice_finalize_stack_burn);
+    return result;
+}
+
+noinline fn mtaAliceFinalizeUnburned(c_b: paillier.Ciphertext, alice_sk: *const paillier.SecretKey, out: *Scalar) MtaError!void {
+    out.* = try mtaAliceFinalizeByValue(c_b, alice_sk.*);
+}
+
+fn mtaAliceFinalizeByValue(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey) MtaError!Scalar {
     return finalizeLift(c_b, alice_sk, false);
 }
 
@@ -238,12 +294,23 @@ pub fn mtaAliceFinalize(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey) 
 /// plaintext is lifted to its centered representative in `(−N/2, N/2]`
 /// (`centeredModQ`), because the proof bounds `|β'|` but not its sign. Not
 /// for the semi-honest path, whose `β'` is uniform in `[1, N)`.
-pub fn mtaAliceFinalizeVerified(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey) MtaError!Scalar {
+pub fn mtaAliceFinalizeVerified(c_b: paillier.Ciphertext, alice_sk: *const paillier.SecretKey, out: *Scalar) MtaError!void {
+    const result = mtaAliceFinalizeVerifiedUnburned(c_b, alice_sk, out);
+    burn.stack(mta_alice_finalize_verified_stack_burn);
+    return result;
+}
+
+noinline fn mtaAliceFinalizeVerifiedUnburned(c_b: paillier.Ciphertext, alice_sk: *const paillier.SecretKey, out: *Scalar) MtaError!void {
+    out.* = try mtaAliceFinalizeVerifiedByValue(c_b, alice_sk.*);
+}
+
+fn mtaAliceFinalizeVerifiedByValue(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey) MtaError!Scalar {
     return finalizeLift(c_b, alice_sk, true);
 }
 
 fn finalizeLift(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey, centered: bool) MtaError!Scalar {
-    const alpha_fe = try paillier.decrypt(alice_sk, c_b); // = a·b + β' (mod n)
+    var alpha_fe: paillier.Fe = undefined;
+    try paillier.decrypt(&alice_sk, c_b, &alpha_fe); // = a·b + β' (mod n)
 
     // decrypt's Fe is backed by the FULL modulus width, so it must be
     // serialized into an `n`-wide buffer (Fe.toBytes rejects a buffer smaller
@@ -320,8 +387,19 @@ pub fn centeredModQ(alpha: []const u8, n: []const u8) Scalar {
 /// `N⁻¹ mod λ` (λ even) and the power run on montint, constant-time in λ.
 pub const DecryptionWithRandomness = struct { m: paillier.Fe, rho: paillier.Fe };
 
-pub fn decryptWithRandomness(sk: paillier.SecretKey, pk: paillier.PublicKey, c: paillier.Ciphertext) (MtaError || error{InvalidKey})!DecryptionWithRandomness {
-    const m = try paillier.decrypt(sk, c);
+pub fn decryptWithRandomness(sk: *const paillier.SecretKey, pk: paillier.PublicKey, c: paillier.Ciphertext, out: *DecryptionWithRandomness) (MtaError || error{InvalidKey})!void {
+    const result = decryptWithRandomnessUnburned(sk, pk, c, out);
+    burn.stack(decrypt_with_randomness_stack_burn);
+    return result;
+}
+
+noinline fn decryptWithRandomnessUnburned(sk: *const paillier.SecretKey, pk: paillier.PublicKey, c: paillier.Ciphertext, out: *DecryptionWithRandomness) (MtaError || error{InvalidKey})!void {
+    out.* = try decryptWithRandomnessByValue(sk.*, pk, c);
+}
+
+fn decryptWithRandomnessByValue(sk: paillier.SecretKey, pk: paillier.PublicKey, c: paillier.Ciphertext) (MtaError || error{InvalidKey})!DecryptionWithRandomness {
+    var m: paillier.Fe = undefined;
+    try paillier.decrypt(&sk, c, &m);
     const D = montint.DynModint(paillier.max_bits);
     const n_len = sk.nByteLen();
     var n_buf: [paillier.modulus_bytes]u8 = undefined;
@@ -430,10 +508,20 @@ pub const AliceInitChecked = struct {
 /// `zkproofs.proveAliceRange`. Produces the exact same `c_a` distribution
 /// as `mtaAliceInit` — this is not a different protocol, just a version
 /// that keeps a value the semi-honest path doesn't need.
-pub fn mtaAliceInitChecked(a: Scalar, alice_pk: paillier.PublicKey, random: std.Random) MtaError!AliceInitChecked {
+pub fn mtaAliceInitChecked(a: *const Scalar, alice_pk: paillier.PublicKey, random: std.Random, out: *AliceInitChecked) MtaError!void {
+    const result = mtaAliceInitCheckedUnburned(a, alice_pk, random, out);
+    burn.stack(mta_alice_init_checked_stack_burn);
+    return result;
+}
+
+noinline fn mtaAliceInitCheckedUnburned(a: *const Scalar, alice_pk: paillier.PublicKey, random: std.Random, out: *AliceInitChecked) MtaError!void {
+    out.* = try mtaAliceInitCheckedByValue(a.*, alice_pk, random);
+}
+
+fn mtaAliceInitCheckedByValue(a: Scalar, alice_pk: paillier.PublicKey, random: std.Random) MtaError!AliceInitChecked {
     const a_fe = scalarToFe(a, alice_pk);
     const r_a = samplePaillierRandomness(alice_pk, random);
-    const c_a = try paillier.encrypt(alice_pk, a_fe, r_a);
+    const c_a = try paillier.encrypt(alice_pk, &a_fe, &r_a);
     return .{ .c_a = c_a, .r_a = r_a };
 }
 
@@ -489,6 +577,28 @@ pub const BobResponseChecked = struct {
 /// Fails with `error.PaillierModulusBelowFloor` unless `N > q⁷`, the same
 /// floor the proofs enforce, so `a·b + β' < q² + q⁵` cannot wrap.
 pub fn mtaBobResponseChecked(
+    b: *const Scalar,
+    c_a: paillier.Ciphertext,
+    alice_pk: paillier.PublicKey,
+    random: std.Random,
+    out: *BobResponseChecked,
+) MtaError!void {
+    const result = mtaBobResponseCheckedUnburned(b, c_a, alice_pk, random, out);
+    burn.stack(mta_bob_response_checked_stack_burn);
+    return result;
+}
+
+noinline fn mtaBobResponseCheckedUnburned(
+    b: *const Scalar,
+    c_a: paillier.Ciphertext,
+    alice_pk: paillier.PublicKey,
+    random: std.Random,
+    out: *BobResponseChecked,
+) MtaError!void {
+    out.* = try mtaBobResponseCheckedByValue(b.*, c_a, alice_pk, random);
+}
+
+fn mtaBobResponseCheckedByValue(
     b: Scalar,
     c_a: paillier.Ciphertext,
     alice_pk: paillier.PublicKey,
@@ -502,8 +612,8 @@ pub fn mtaBobResponseChecked(
     const bp_fe = zkproofs.feFromSecretBytes(alice_pk.n_sq, paillier.Fe, &beta_prime); // < q⁵ < N < N²
     const r_b = samplePaillierRandomness(alice_pk, random);
 
-    const c_ab = try paillier.mulPlaintext(alice_pk, c_a, b_fe);
-    const bp_enc = try paillier.encrypt(alice_pk, bp_fe, r_b);
+    const c_ab = try paillier.mulPlaintext(alice_pk, c_a, &b_fe);
+    const bp_enc = try paillier.encrypt(alice_pk, &bp_fe, &r_b);
     const c_b = paillier.addCiphertexts(alice_pk, c_ab, bp_enc);
 
     const beta = zkproofs.scalarFromWide(&beta_prime).neg();
@@ -547,6 +657,36 @@ pub fn mtaAliceFinalizeChecked(
     c_a: paillier.Ciphertext,
     c_b: paillier.Ciphertext,
     proof: zkproofs.MtaProof,
+    alice_sk: *const paillier.SecretKey,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    /// The context Bob's proof was made under (session id, Bob's index).
+    context: []const u8,
+    out: *Scalar,
+) MtaCheckedError!void {
+    const result = mtaAliceFinalizeCheckedUnburned(c_a, c_b, proof, alice_sk, alice_pk, verifier_aux, context, out);
+    burn.stack(mta_alice_finalize_checked_stack_burn);
+    return result;
+}
+
+noinline fn mtaAliceFinalizeCheckedUnburned(
+    c_a: paillier.Ciphertext,
+    c_b: paillier.Ciphertext,
+    proof: zkproofs.MtaProof,
+    alice_sk: *const paillier.SecretKey,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    /// The context Bob's proof was made under (session id, Bob's index).
+    context: []const u8,
+    out: *Scalar,
+) MtaCheckedError!void {
+    out.* = try mtaAliceFinalizeCheckedByValue(c_a, c_b, proof, alice_sk.*, alice_pk, verifier_aux, context);
+}
+
+fn mtaAliceFinalizeCheckedByValue(
+    c_a: paillier.Ciphertext,
+    c_b: paillier.Ciphertext,
+    proof: zkproofs.MtaProof,
     alice_sk: paillier.SecretKey,
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
@@ -556,7 +696,9 @@ pub fn mtaAliceFinalizeChecked(
     if (!zkproofs.verifyBobMta(proof, c_a, c_b, alice_pk, verifier_aux, context)) {
         return error.InvalidMtaProof;
     }
-    return mtaAliceFinalizeVerified(c_b, alice_sk);
+    var out: Scalar = undefined;
+    try mtaAliceFinalizeVerified(c_b, &alice_sk, &out);
+    return out;
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -585,9 +727,11 @@ fn runMta(
     sk: paillier.SecretKey,
     random: std.Random,
 ) !struct { alpha: Scalar, beta: Scalar } {
-    const alice = try mtaAliceInit(a, pk, random);
-    const bob = try mtaBobResponse(b, alice.c_a, pk, random);
-    const alpha = try mtaAliceFinalize(bob.c_b, sk);
+    const alice = try mtaAliceInit(&a, pk, random);
+    var bob: BobResponse = undefined;
+    try mtaBobResponse(&b, alice.c_a, pk, random, &bob);
+    var alpha: Scalar = undefined;
+    try mtaAliceFinalize(bob.c_b, &sk, &alpha);
     return .{ .alpha = alpha, .beta = bob.beta };
 }
 
@@ -603,7 +747,8 @@ test "MtA correctness: α + β ≡ a·b (mod q) over many random (a,b)" {
     // homomorphic sum a·b+β' never wraps for full-range a,b). Kept fast by
     // reusing the key across every (a,b) draw.
     var kprng = std.Random.DefaultPrng.init(0x6d7461_6b6579); // "mta key"
-    const kp = try paillier.generate(kprng.random(), 1024);
+    var kp: paillier.KeyPair = undefined;
+    try paillier.generate(kprng.random(), 1024, &kp);
 
     var prng = std.Random.DefaultPrng.init(0x6d74615f72616e64); // "mta_rand"
     const random = prng.random();
@@ -619,7 +764,8 @@ test "MtA correctness: α + β ≡ a·b (mod q) over many random (a,b)" {
 
 test "MtA correctness: edge cases a/b ∈ {0, 1, q-1}" {
     var kprng = std.Random.DefaultPrng.init(0x656467_65); // "edge"
-    const kp = try paillier.generate(kprng.random(), 1024);
+    var kp: paillier.KeyPair = undefined;
+    try paillier.generate(kprng.random(), 1024, &kp);
     var prng = std.Random.DefaultPrng.init(0x6564676572616e64);
     const random = prng.random();
 
@@ -658,8 +804,10 @@ test "MtA composes over real keygenTrustedDealer KeyShare Paillier material" {
 
     // Two parties, each a real (small-but-real) 1024-bit Paillier keypair —
     // large enough that even full-range a·b never wraps mod N.
-    const kp_alice = try paillier.generate(krandom, 1024);
-    const kp_bob = try paillier.generate(krandom, 1024);
+    var kp_alice: paillier.KeyPair = undefined;
+    try paillier.generate(krandom, 1024, &kp_alice);
+    var kp_bob: paillier.KeyPair = undefined;
+    try paillier.generate(krandom, 1024, &kp_bob);
     const paillier_keys = [_]paillier.KeyPair{ kp_alice, kp_bob };
 
     // Toy aux params (MtA's semi-honest core doesn't consume them; they only
@@ -675,7 +823,7 @@ test "MtA composes over real keygenTrustedDealer KeyShare Paillier material" {
 
     const secret = scalarFromU64(0xa11ce);
     const coeffs = [_]Scalar{scalarFromU64(0xb0b)};
-    const key_shares = try root.keygenTrustedDealer(allocator, 2, 2, secret, &coeffs, &paillier_keys, &aux_params, &.{ @splat(1), @splat(2) });
+    const key_shares = try root.keygenTrustedDealer(allocator, 2, 2, &secret, &coeffs, &paillier_keys, &aux_params, &.{ @splat(1), @splat(2) });
     defer allocator.free(key_shares);
     defer allocator.free(key_shares[0].public_keys.entries);
 
@@ -694,9 +842,11 @@ test "MtA composes over real keygenTrustedDealer KeyShare Paillier material" {
     const a = scalarFromU64(0xdeadbeef);
     const b = scalarFromU64(0xfeedface);
 
-    const alice = try mtaAliceInit(a, alice_pk, random);
-    const bob = try mtaBobResponse(b, alice.c_a, bobs_view_of_alice_pk, random);
-    const alpha = try mtaAliceFinalize(bob.c_b, alice_sk);
+    const alice = try mtaAliceInit(&a, alice_pk, random);
+    var bob: BobResponse = undefined;
+    try mtaBobResponse(&b, alice.c_a, bobs_view_of_alice_pk, random, &bob);
+    var alpha: Scalar = undefined;
+    try mtaAliceFinalize(bob.c_b, &alice_sk, &alpha);
     try expectAdditiveShare(a, b, alpha, bob.beta);
 }
 
@@ -715,7 +865,8 @@ test "Phase 2c checked init/response compose correctly: α + β ≡ a·b (mod q)
     // lane is ReleaseSafe; skipped only under -Dstrict-debug.
     if (builtin.mode == .Debug) return error.SkipZigTest;
     var kprng = std.Random.DefaultPrng.init(0x636865636b6564); // "checked"
-    const kp = try paillier.generate(kprng.random(), 2048);
+    var kp: paillier.KeyPair = undefined;
+    try paillier.generate(kprng.random(), 2048, &kp);
 
     var prng = std.Random.DefaultPrng.init(0x636b645f72616e64); // "ckd_rand"
     const random = prng.random();
@@ -725,9 +876,13 @@ test "Phase 2c checked init/response compose correctly: α + β ≡ a·b (mod q)
         const a = randomScalar(random);
         const b = randomScalar(random);
 
-        const alice = try mtaAliceInitChecked(a, kp.public, random);
-        const bob = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
-        const alpha = try mtaAliceFinalize(bob.c_b, kp.secret); // Phase-2b finalize; correctness is randomness-independent
+        var alice: AliceInitChecked = undefined;
+
+        try mtaAliceInitChecked(&a, kp.public, random, &alice);
+        var bob: BobResponseChecked = undefined;
+        try mtaBobResponseChecked(&b, alice.c_a, kp.public, random, &bob);
+        var alpha: Scalar = undefined;
+        try mtaAliceFinalize(bob.c_b, &kp.secret, &alpha); // Phase-2b finalize; correctness is randomness-independent
         try expectAdditiveShare(a, b, alpha, bob.beta);
     }
 }
@@ -735,7 +890,8 @@ test "Phase 2c checked init/response compose correctly: α + β ≡ a·b (mod q)
 test "Phase 2c: mtaBobResponseChecked's c_b differs byte-for-byte from mtaBobResponse's (fresh r_b changes the ciphertext, not the plaintext)" {
     if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit, see above
     var kprng = std.Random.DefaultPrng.init(0x64696666_6572); // "differ"
-    const kp = try paillier.generate(kprng.random(), 2048);
+    var kp: paillier.KeyPair = undefined;
+    try paillier.generate(kprng.random(), 2048, &kp);
 
     var prng = std.Random.DefaultPrng.init(0x646966665f726e64); // "diff_rnd"
     const random = prng.random();
@@ -744,10 +900,13 @@ test "Phase 2c: mtaBobResponseChecked's c_b differs byte-for-byte from mtaBobRes
     const b = scalarFromU64(0x5678);
 
     // Same c_a fed to both the semi-honest and checked Bob-response paths.
-    const alice = try mtaAliceInit(a, kp.public, random);
+    const alice = try mtaAliceInit(&a, kp.public, random);
 
-    const bob_semi = try mtaBobResponse(b, alice.c_a, kp.public, random);
-    const bob_checked = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
+    var bob_semi: BobResponse = undefined;
+
+    try mtaBobResponse(&b, alice.c_a, kp.public, random, &bob_semi);
+    var bob_checked: BobResponseChecked = undefined;
+    try mtaBobResponseChecked(&b, alice.c_a, kp.public, random, &bob_checked);
 
     var semi_buf: [paillier.modulus_sq_bytes]u8 = undefined;
     try bob_semi.c_b.toBytes(&semi_buf);
@@ -760,7 +919,8 @@ test "Phase 2c: mtaBobResponseChecked's c_b differs byte-for-byte from mtaBobRes
     // Both still decrypt to a valid additive sharing of a*b (with their
     // OWN respective beta), proving the differently-randomized c_b is
     // still a correct ciphertext, not just a differently-shaped one.
-    const alpha_checked = try mtaAliceFinalize(bob_checked.c_b, kp.secret);
+    var alpha_checked: Scalar = undefined;
+    try mtaAliceFinalize(bob_checked.c_b, &kp.secret, &alpha_checked);
     try expectAdditiveShare(a, b, alpha_checked, bob_checked.beta);
 }
 
@@ -777,7 +937,8 @@ test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResp
     if (builtin.mode == .Debug) return error.SkipZigTest;
     var kprng = std.Random.DefaultPrng.init(0x66696e616c697a65); // "finalize"
     const krandom = kprng.random();
-    const kp = try paillier.generate(krandom, 2048);
+    var kp: paillier.KeyPair = undefined;
+    try paillier.generate(krandom, 2048, &kp);
     var prng = std.Random.DefaultPrng.init(0x66696e5f72616e64); // "fin_rand"
     const random = prng.random();
 
@@ -788,7 +949,8 @@ test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResp
     // Shared by both verification directions in this test; in a real
     // deployment each VERIFIER uses its own tuple (see zkproofs.zig's
     // ownership note).
-    const nt_kp = try paillier.generate(krandom, 2048);
+    var nt_kp: paillier.KeyPair = undefined;
+    try paillier.generate(krandom, 2048, &nt_kp);
     var nt_buf: [paillier.modulus_bytes]u8 = undefined;
     const nt_len = nt_kp.public.nByteLen();
     nt_kp.public.nToBytes(nt_buf[0..nt_len]) catch unreachable;
@@ -811,47 +973,53 @@ test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResp
 
     // Alice round 1 + her range proof; Bob verifies it before doing any
     // homomorphic work on c_a (his fail-closed gate).
-    const alice = try mtaAliceInitChecked(a, kp.public, random);
-    const alice_proof = try zkproofs.proveAliceRange(testing.allocator, a, alice.r_a, kp.public, aux, test_ctx, random);
+    var alice: AliceInitChecked = undefined;
+    try mtaAliceInitChecked(&a, kp.public, random, &alice);
+    const alice_proof = try zkproofs.proveAliceRange(testing.allocator, &a, &alice.r_a, kp.public, aux, test_ctx, random);
     defer alice_proof.deinit(testing.allocator);
     try testing.expect(zkproofs.verifyAliceRange(alice_proof, alice.c_a, kp.public, aux, test_ctx));
 
     // Bob round 2 + his MtA proof (beta_prime = the q⁵-range blind
     // mtaBobResponseChecked folded into c_b).
-    const bob = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
+    var bob: BobResponseChecked = undefined;
+    try mtaBobResponseChecked(&b, alice.c_a, kp.public, random, &bob);
     // Alice's decryption, with its proof: re-encrypting the plaintext under
     // the recovered randomness gives c_B back byte for byte; a shifted
     // plaintext does not.
     {
-        const opened = try decryptWithRandomness(kp.secret, kp.public, bob.c_b);
-        const again = try paillier.encrypt(kp.public, opened.m, opened.rho);
+        var opened: DecryptionWithRandomness = undefined;
+        try decryptWithRandomness(&kp.secret, kp.public, bob.c_b, &opened);
+        const again = try paillier.encrypt(kp.public, &opened.m, &opened.rho);
         var want: [paillier.modulus_sq_bytes]u8 = undefined;
         var got: [paillier.modulus_sq_bytes]u8 = undefined;
         try bob.c_b.toBytes(&want);
         try again.toBytes(&got);
         try testing.expectEqualSlices(u8, &want, &got);
-        const shifted = try paillier.encrypt(kp.public, scalarToFe(Scalar.one, kp.public), opened.rho);
+        const shifted = try paillier.encrypt(kp.public, &(scalarToFe(Scalar.one, kp.public)), &opened.rho);
         try shifted.toBytes(&got);
         try testing.expect(!std.mem.eql(u8, &want, &got));
     }
     const beta_prime = &bob.beta_prime;
-    const bob_proof = try zkproofs.proveBobMta(testing.allocator, b, beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, test_ctx, random);
+    const bob_proof = try zkproofs.proveBobMta(testing.allocator, &b, beta_prime, &bob.r_b, alice.c_a, bob.c_b, kp.public, aux, test_ctx, random);
     defer bob_proof.deinit(testing.allocator);
 
     // Alice finalize: verify-then-decrypt, and the additive sharing holds.
-    const alpha = try mtaAliceFinalizeChecked(alice.c_a, bob.c_b, bob_proof, kp.secret, kp.public, aux, test_ctx);
+    var alpha: Scalar = undefined;
+    try mtaAliceFinalizeChecked(alice.c_a, bob.c_b, bob_proof, &kp.secret, kp.public, aux, test_ctx, &alpha);
     try expectAdditiveShare(a, b, alpha, bob.beta);
 
     // Fail-closed: a tampered c_b (proof no longer matches) must be
     // REFUSED before decryption, not decrypted-then-shrugged-at.
     const one_fe = paillier.Fe.fromPrimitive(u64, kp.public.n_sq, 1) catch unreachable;
-    const c_b_bad = try paillier.addPlaintext(kp.public, bob.c_b, one_fe);
-    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, c_b_bad, bob_proof, kp.secret, kp.public, aux, test_ctx));
+    const c_b_bad = try paillier.addPlaintext(kp.public, bob.c_b, &one_fe);
+    var scratch: Scalar = undefined;
+    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, c_b_bad, bob_proof, &kp.secret, kp.public, aux, test_ctx, &scratch));
 
     // Fail-closed: a proof produced for a DIFFERENT b must be refused too.
-    const bad_proof = try zkproofs.proveBobMta(testing.allocator, b.add(Scalar.one), beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, test_ctx, random);
+    const b_off = b.add(Scalar.one);
+    const bad_proof = try zkproofs.proveBobMta(testing.allocator, &b_off, beta_prime, &bob.r_b, alice.c_a, bob.c_b, kp.public, aux, test_ctx, random);
     defer bad_proof.deinit(testing.allocator);
-    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, bob.c_b, bad_proof, kp.secret, kp.public, aux, test_ctx));
+    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, bob.c_b, bad_proof, &kp.secret, kp.public, aux, test_ctx, &scratch));
 }
 
 // ── audit F5 (2026-09-16): the plaintext Alice decrypts must hide Bob's b ──
@@ -877,7 +1045,8 @@ fn aliceRecoversBobsInput(
     a: Scalar,
     b: Scalar,
 ) !bool {
-    const plaintext = try paillier.decrypt(sk, c_b);
+    var plaintext: paillier.Fe = undefined;
+    try paillier.decrypt(&sk, c_b, &plaintext);
     const n_len = sk.nByteLen();
     var buf: [paillier.modulus_bytes]u8 = [_]u8{0} ** paillier.modulus_bytes;
     try plaintext.toBytes(buf[0..n_len], .big);
@@ -914,15 +1083,19 @@ test "audit F5: Alice's own decryption of c_B must not reveal Bob's b (the β' b
     // Semi-honest path (Phase 2b), 1024-bit key.
     {
         var kprng = std.Random.DefaultPrng.init(0xF5_0001);
-        const kp = try paillier.generate(kprng.random(), 1024);
+        var kp: paillier.KeyPair = undefined;
+        try paillier.generate(kprng.random(), 1024, &kp);
         for (0..trials) |_| {
             const a = randomScalar(random);
             const b = randomScalar(random);
-            const alice = try mtaAliceInit(a, kp.public, random);
-            const bob = try mtaBobResponse(b, alice.c_a, kp.public, random);
+            const alice = try mtaAliceInit(&a, kp.public, random);
+            var bob: BobResponse = undefined;
+            try mtaBobResponse(&b, alice.c_a, kp.public, random, &bob);
             if (try aliceRecoversBobsInput(allocator, bob.c_b, kp.secret, a, b)) recovered[0] += 1;
             // Positive control: the sharing itself still holds.
-            try expectAdditiveShare(a, b, try mtaAliceFinalize(bob.c_b, kp.secret), bob.beta);
+            var alpha: Scalar = undefined;
+            try mtaAliceFinalize(bob.c_b, &kp.secret, &alpha);
+            try expectAdditiveShare(a, b, alpha, bob.beta);
         }
     }
 
@@ -930,14 +1103,19 @@ test "audit F5: Alice's own decryption of c_B must not reveal Bob's b (the β' b
     // lane is ReleaseSafe; skipped only under -Dstrict-debug.
     if (builtin.mode != .Debug) {
         var kprng = std.Random.DefaultPrng.init(0xF5_0002);
-        const kp = try paillier.generate(kprng.random(), 2048);
+        var kp: paillier.KeyPair = undefined;
+        try paillier.generate(kprng.random(), 2048, &kp);
         for (0..trials) |_| {
             const a = randomScalar(random);
             const b = randomScalar(random);
-            const alice = try mtaAliceInitChecked(a, kp.public, random);
-            const bob = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
+            var alice: AliceInitChecked = undefined;
+            try mtaAliceInitChecked(&a, kp.public, random, &alice);
+            var bob: BobResponseChecked = undefined;
+            try mtaBobResponseChecked(&b, alice.c_a, kp.public, random, &bob);
             if (try aliceRecoversBobsInput(allocator, bob.c_b, kp.secret, a, b)) recovered[1] += 1;
-            try expectAdditiveShare(a, b, try mtaAliceFinalize(bob.c_b, kp.secret), bob.beta);
+            var alpha: Scalar = undefined;
+            try mtaAliceFinalize(bob.c_b, &kp.secret, &alpha);
+            try expectAdditiveShare(a, b, alpha, bob.beta);
         }
     }
 
@@ -975,7 +1153,8 @@ test "mutation audit: the verified finalize centres a wrapped plaintext; the che
     if (builtin.mode == .Debug) return error.SkipZigTest;
     var kprng = std.Random.DefaultPrng.init(0x6d75_7461_7564_6974);
     const krandom = kprng.random();
-    const kp = try paillier.generate(krandom, 2048);
+    var kp: paillier.KeyPair = undefined;
+    try paillier.generate(krandom, 2048, &kp);
     var prng = std.Random.DefaultPrng.init(0x6d75_7461_7564_3032);
     const random = prng.random();
 
@@ -999,13 +1178,17 @@ test "mutation audit: the verified finalize centres a wrapped plaintext; the che
         }
     }
     const m_fe = try paillier.Fe.fromBytes(kp.public.n_sq, n_buf[0..n_len], .big);
-    const c = try paillier.encrypt(kp.public, m_fe, samplePaillierRandomness(kp.public, random));
+    const c = try paillier.encrypt(kp.public, &m_fe, &(samplePaillierRandomness(kp.public, random)));
     const want = zkproofs.scalarFromWide(&[_]u8{ 0x01, 0xf4 }).neg(); // -500 mod q
-    try testing.expect((try mtaAliceFinalizeVerified(c, kp.secret)).equivalent(want));
-    try testing.expect(!(try mtaAliceFinalize(c, kp.secret)).equivalent(want));
+    var fin: Scalar = undefined;
+    try mtaAliceFinalizeVerified(c, &kp.secret, &fin);
+    try testing.expect(fin.equivalent(want));
+    try mtaAliceFinalize(c, &kp.secret, &fin);
+    try testing.expect(!fin.equivalent(want));
 
     // (2) mtaAliceFinalizeChecked verifies under the context it is given.
-    const nt_kp = try paillier.generate(krandom, 2048);
+    var nt_kp: paillier.KeyPair = undefined;
+    try paillier.generate(krandom, 2048, &nt_kp);
     var nt_buf: [paillier.modulus_bytes]u8 = undefined;
     const nt_len = nt_kp.public.nByteLen();
     nt_kp.public.nToBytes(nt_buf[0..nt_len]) catch unreachable;
@@ -1024,10 +1207,13 @@ test "mutation audit: the verified finalize centres a wrapped plaintext; the che
 
     const a = scalarFromU64(0xa11ce);
     const b = scalarFromU64(0xb0b);
-    const alice = try mtaAliceInitChecked(a, kp.public, random);
-    const bob = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
-    const proof = try zkproofs.proveBobMta(testing.allocator, b, &bob.beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, test_ctx, random);
+    var alice: AliceInitChecked = undefined;
+    try mtaAliceInitChecked(&a, kp.public, random, &alice);
+    var bob: BobResponseChecked = undefined;
+    try mtaBobResponseChecked(&b, alice.c_a, kp.public, random, &bob);
+    const proof = try zkproofs.proveBobMta(testing.allocator, &b, &bob.beta_prime, &bob.r_b, alice.c_a, bob.c_b, kp.public, aux, test_ctx, random);
     defer proof.deinit(testing.allocator);
-    _ = try mtaAliceFinalizeChecked(alice.c_a, bob.c_b, proof, kp.secret, kp.public, aux, test_ctx);
-    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, bob.c_b, proof, kp.secret, kp.public, aux, "another-context"));
+    var fin_out: Scalar = undefined;
+    try mtaAliceFinalizeChecked(alice.c_a, bob.c_b, proof, &kp.secret, kp.public, aux, test_ctx, &fin_out);
+    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, bob.c_b, proof, &kp.secret, kp.public, aux, "another-context", &fin_out));
 }
