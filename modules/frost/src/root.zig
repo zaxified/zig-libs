@@ -368,6 +368,12 @@ pub fn nonceGenerate(random_bytes: [32]u8, secret: Scalar) Scalar {
 /// bytes for both, or a predictable value, breaks the scheme exactly as
 /// badly as ECDSA/Schnorr nonce reuse does elsewhere.
 pub fn generateNonces(signing_share: SigningShare, hiding_random: [32]u8, binding_random: [32]u8) SigningNonces {
+    const nonces = generateNoncesBurned(signing_share, hiding_random, binding_random);
+    burnStack();
+    return nonces;
+}
+
+noinline fn generateNoncesBurned(signing_share: SigningShare, hiding_random: [32]u8, binding_random: [32]u8) SigningNonces {
     const secret = signing_share.scalar();
     return .{
         .hiding = nonceGenerate(hiding_random, secret),
@@ -918,7 +924,19 @@ pub const Round1CommitError = error{
 /// against a fixed nonce pair. Byte-exact target: RFC 9591 Appendix
 /// E.5's `P1`/`P3` `hiding_nonce_commitment`/`binding_nonce_commitment`
 /// (`kat_test.zig`).
-pub fn round1Commit(nonces: SigningNonces) Round1CommitError!NonceCommitmentPair {
+///
+/// `nonces` by pointer (audit 2026-10-08): passed by value, the 64-byte pair
+/// was copied at the call boundary into a frame no burn reaches, and
+/// `stackprobe_test.zig` found it there once per call (frost-core takes
+/// `&SigningNonces` too).
+pub fn round1Commit(nonces: *const SigningNonces) Round1CommitError!NonceCommitmentPair {
+    const result = round1CommitBurned(nonces);
+    burnStack();
+    return result;
+}
+
+noinline fn round1CommitBurned(nonces_ptr: *const SigningNonces) Round1CommitError!NonceCommitmentPair {
+    const nonces = nonces_ptr.*;
     // Local copy zeroed on every exit path (RFC 9591 §5.1: a nonce pair
     // MUST NOT be reused; the caller's own copy is its own to erase).
     var n = nonces;
@@ -989,15 +1007,32 @@ pub const Round2SignError = error{
 /// (`kat_test.zig`) — this is the strongest available check on
 /// `computeChallenge`/`h2` for this ciphersuite (see the module doc
 /// comment's "what the vectors do NOT cover" note).
+///
+/// `nonces` by pointer, for the reason given at `round1Commit`.
 pub fn round2Sign(
     allocator: std.mem.Allocator,
     identifier: Identifier,
     signing_share: SigningShare,
     group_public_key: GroupPublicKey,
-    nonces: SigningNonces,
+    nonces: *const SigningNonces,
     msg: []const u8,
     commitment_list: []const SigningCommitments,
 ) Round2SignError!SignatureShare {
+    const result = round2SignBurned(allocator, identifier, signing_share, group_public_key, nonces, msg, commitment_list);
+    burnStack();
+    return result;
+}
+
+noinline fn round2SignBurned(
+    allocator: std.mem.Allocator,
+    identifier: Identifier,
+    signing_share: SigningShare,
+    group_public_key: GroupPublicKey,
+    nonces_ptr: *const SigningNonces,
+    msg: []const u8,
+    commitment_list: []const SigningCommitments,
+) Round2SignError!SignatureShare {
+    const nonces = nonces_ptr.*;
     // Local copies zeroed on every exit path — see `SigningNonces`/
     // `SigningShare`'s doc comments; the caller's own copies are its own
     // to erase.
@@ -1012,7 +1047,7 @@ pub fn round2Sign(
     const own = for (commitment_list) |entry| {
         if (std.mem.eql(u8, &entry.identifier.bytes, &identifier.bytes)) break entry;
     } else return error.InvalidCommitmentList;
-    const mine = round1Commit(n) catch return error.IncorrectCommitment;
+    const mine = round1CommitBurned(&n) catch return error.IncorrectCommitment;
     if (!std.mem.eql(u8, &mine.hiding.bytes, &own.hiding.bytes) or
         !std.mem.eql(u8, &mine.binding.bytes, &own.binding.bytes))
         return error.IncorrectCommitment;
@@ -1039,6 +1074,26 @@ pub fn round2Sign(
         .add(n.binding.mul(binding_factor))
         .add(lambda_i.mul(sk_i.scalar()).mul(challenge));
     return SignatureShare.fromScalar(sig_share);
+}
+
+/// Audit 2026-10-08 (HIGH). `generateNonces`, `round1Commit` and
+/// `round2Sign` had no stack burn: measured with `stackprobe_test.zig`
+/// (ReleaseFast), each left the signing share and/or the secret nonces on
+/// the dead stack — and a nonce next to the published signature share is
+/// `lambda_i·sk_i`, i.e. the share. Same fix as `bip340.sign`: each runs its
+/// work one `noinline` frame down (secrets passed on by value — taking a
+/// parameter's address makes Zig copy it into the public function's own
+/// frame, above the burn, as bip340's review R1 measured) and `stack_burn` bytes at that depth
+/// are zeroed after it returns. `stackprobe_test.zig` asserts zero residue
+/// and prints how deep each call dirtied the stack (19 KB for `round2Sign`).
+const stack_burn = 32 * 1024;
+
+/// `noinline` is load-bearing (as `bip340`'s `burnSignStack`): inlined, the
+/// buffer lands in the caller's frame, above the region to clear.
+/// `secureZero` writes through a volatile slice, so the dead store stays.
+noinline fn burnStack() void {
+    var buf: [stack_burn]u8 = undefined;
+    std.crypto.secureZero(u8, &buf);
 }
 
 pub const AggregateError = error{
@@ -1410,6 +1465,7 @@ pub fn secretShareCombine(shares: []const ParticipantShare) SecretShareCombineEr
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names RFC 9591 and the secp256k1 ciphersuite" {

@@ -102,8 +102,8 @@ frost.sortCommitmentsByIdentifier(commitment_list: []SigningCommitments) void
 frost.deriveInterpolatingValue(participant_list: []const Identifier, x_i: Identifier) !Scalar
 frost.computeBindingFactors(allocator, group_public_key, commitment_list, msg) ![]BindingFactor
 frost.computeGroupCommitment(commitment_list, binding_factor_list) !Element
-frost.round1Commit(nonces: SigningNonces) !NonceCommitmentPair
-frost.round2Sign(allocator, identifier, signing_share, group_public_key, nonces, msg, commitment_list) !SignatureShare
+frost.round1Commit(nonces: *const SigningNonces) !NonceCommitmentPair
+frost.round2Sign(allocator, identifier, signing_share, group_public_key, &nonces, msg, commitment_list) !SignatureShare
 frost.aggregate(allocator, commitment_list, msg, group_public_key, sig_shares) !Signature
 frost.verifySignatureShare(allocator, identifier, verifying_share, comm_i, sig_share_i, commitment_list, group_public_key, msg) !bool
 frost.verify(msg, sig: Signature, group_public_key: GroupPublicKey) bool
@@ -119,11 +119,11 @@ const keygen = try frost.trustedDealerKeygen(allocator, secret, &coefficients, 3
 
 // Round 1 (each of 2 chosen signers):
 const nonces = frost.generateNonces(share.signing_share, hiding_random, binding_random);
-const comm = try frost.round1Commit(nonces);
+const comm = try frost.round1Commit(&nonces);
 // ... exchange SigningCommitments{identifier, comm.hiding, comm.binding} via the Coordinator ...
 
 // Round 2 (each signer, given the full sorted commitment_list):
-const sig_share = try frost.round2Sign(allocator, identifier, share.signing_share, keygen.group_public_key, nonces, msg, commitment_list);
+const sig_share = try frost.round2Sign(allocator, identifier, share.signing_share, keygen.group_public_key, &nonces, msg, commitment_list);
 
 // Aggregation (the Coordinator):
 const sig = try frost.aggregate(allocator, commitment_list, msg, keygen.group_public_key, sig_shares);

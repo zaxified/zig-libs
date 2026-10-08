@@ -168,7 +168,7 @@ test "round1Commit(P1 nonces) reproduces P1's published commitments" {
         .hiding = scalarFromHex(v.round1_p1.hiding_nonce),
         .binding = scalarFromHex(v.round1_p1.binding_nonce),
     };
-    const comm = try frost.round1Commit(nonces);
+    const comm = try frost.round1Commit(&nonces);
     try std.testing.expectEqualSlices(u8, &hexN(33, v.round1_p1.hiding_nonce_commitment), &comm.hiding.toBytes());
     try std.testing.expectEqualSlices(u8, &hexN(33, v.round1_p1.binding_nonce_commitment), &comm.binding.toBytes());
 }
@@ -178,7 +178,7 @@ test "round1Commit(P3 nonces) reproduces P3's published commitments" {
         .hiding = scalarFromHex(v.round1_p3.hiding_nonce),
         .binding = scalarFromHex(v.round1_p3.binding_nonce),
     };
-    const comm = try frost.round1Commit(nonces);
+    const comm = try frost.round1Commit(&nonces);
     try std.testing.expectEqualSlices(u8, &hexN(33, v.round1_p3.hiding_nonce_commitment), &comm.hiding.toBytes());
     try std.testing.expectEqualSlices(u8, &hexN(33, v.round1_p3.binding_nonce_commitment), &comm.binding.toBytes());
 }
@@ -292,7 +292,7 @@ test "round2Sign reproduces P1's published sig_share" {
         .binding = scalarFromHex(v.round1_p1.binding_nonce),
     };
 
-    const share = try frost.round2Sign(gpa, identifierFromU16(1), signingShareFromHex(v.participant_shares.p1), group_public_key, nonces, &msg, &commitment_list);
+    const share = try frost.round2Sign(gpa, identifierFromU16(1), signingShareFromHex(v.participant_shares.p1), group_public_key, &nonces, &msg, &commitment_list);
     try std.testing.expectEqualSlices(u8, &hexN(32, v.round2.p1_sig_share), &share.toBytes());
 }
 
@@ -307,7 +307,7 @@ test "round2Sign reproduces P3's published sig_share" {
         .binding = scalarFromHex(v.round1_p3.binding_nonce),
     };
 
-    const share = try frost.round2Sign(gpa, identifierFromU16(3), signingShareFromHex(v.participant_shares.p3), group_public_key, nonces, &msg, &commitment_list);
+    const share = try frost.round2Sign(gpa, identifierFromU16(3), signingShareFromHex(v.participant_shares.p3), group_public_key, &nonces, &msg, &commitment_list);
     try std.testing.expectEqualSlices(u8, &hexN(32, v.round2.p3_sig_share), &share.toBytes());
 }
 
@@ -326,13 +326,13 @@ test "round2Sign refuses a commitment list that does not carry its own round-1 c
 
     var swapped = vectorCommitmentList();
     swapped[0].hiding = swapped[1].hiding;
-    try std.testing.expectError(error.IncorrectCommitment, frost.round2Sign(gpa, identifierFromU16(1), sk, group_public_key, nonces, &msg, &swapped));
+    try std.testing.expectError(error.IncorrectCommitment, frost.round2Sign(gpa, identifierFromU16(1), sk, group_public_key, &nonces, &msg, &swapped));
     var swapped_binding = vectorCommitmentList();
     swapped_binding[0].binding = swapped_binding[1].binding;
-    try std.testing.expectError(error.IncorrectCommitment, frost.round2Sign(gpa, identifierFromU16(1), sk, group_public_key, nonces, &msg, &swapped_binding));
+    try std.testing.expectError(error.IncorrectCommitment, frost.round2Sign(gpa, identifierFromU16(1), sk, group_public_key, &nonces, &msg, &swapped_binding));
     // Absent from the list altogether.
     const list = vectorCommitmentList();
-    try std.testing.expectError(error.InvalidCommitmentList, frost.round2Sign(gpa, identifierFromU16(2), sk, group_public_key, nonces, &msg, &list));
+    try std.testing.expectError(error.InvalidCommitmentList, frost.round2Sign(gpa, identifierFromU16(2), sk, group_public_key, &nonces, &msg, &list));
 }
 
 test "trustedDealerKeygen at t = 3: every share passes the Feldman check against vss_commitment" {
@@ -542,7 +542,7 @@ test "end-to-end (2,3) round trip: keygen -> commit -> sign -> aggregate -> veri
         random.bytes(&binding_random);
         const share = keygen.shares[idx];
         nonces_list[slot] = frost.generateNonces(share.signing_share, hiding_random, binding_random);
-        const comm = try frost.round1Commit(nonces_list[slot]);
+        const comm = try frost.round1Commit(&nonces_list[slot]);
         commitment_list[slot] = .{ .identifier = share.identifier, .hiding = comm.hiding, .binding = comm.binding };
     }
     frost.sortCommitmentsByIdentifier(&commitment_list);
@@ -556,7 +556,7 @@ test "end-to-end (2,3) round trip: keygen -> commit -> sign -> aggregate -> veri
         for (signer_indices, 0..) |idx2, slot2| {
             if (idx2 == idx) nonces = nonces_list[slot2];
         }
-        sig_shares[slot] = try frost.round2Sign(gpa, share.identifier, share.signing_share, keygen.group_public_key, nonces, msg, &commitment_list);
+        sig_shares[slot] = try frost.round2Sign(gpa, share.identifier, share.signing_share, keygen.group_public_key, &nonces, msg, &commitment_list);
     }
 
     const sig = try frost.aggregate(gpa, &commitment_list, msg, keygen.group_public_key, &sig_shares);

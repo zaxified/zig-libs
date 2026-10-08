@@ -6,7 +6,7 @@
 
 **Scope:** mvp — ZcashFoundation/frost frost-core 3.0.0, secp256k1 suite only (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-08 · mutation 2026-10-08 (38/39, 1 eq) · src 512e7137dabda8a9
+**Audit:** review 2026-10-08 · mutation 2026-10-08 (38/39, 1 eq) · src 03a554e37047d716
 
 **Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
 
@@ -217,9 +217,19 @@ Review against RFC 9591 (secp256k1 ciphersuite) and frost-core 3.0.0, over the k
 - **LOW — `trustedDealerKeygen` accepted `min_participants = 1`** (RFC 9591 Appendix C.1 raises
   for `< 2`): a constant polynomial, every share equal to the group secret.
 - **LOW — `trustedDealerKeygen`'s error path freed the shares without zeroing them.**
-Not changed, noted: `round2Sign` takes `SigningNonces` by value and wipes only its own copy —
-the same shape as frost-core's `sign(&SigningNonces)` (no single-use enforcement there either; see
-"Nonce reuse" above); dead-stack copies of nonces/shares are unmeasured.
+- **HIGH — the share and the nonces on the dead stack** (found the same day, after the same probe
+  found the nonce in `adaptor.preSign` and the key and nonces in `musig2.sign`). The new
+  `src/stackprobe_test.zig` (bip340's method, negative and positive control; needles `sk_i`,
+  the hiding and binding nonces, their negations, three images each) found residue after
+  `generateNonces` (`sk_i` from `nonce_generate`'s preimage, both nonces), `round1Commit` (both
+  nonces) and `round2Sign` (`sk_i`, both nonces) — a nonce next to the published signature share
+  is `lambda_i·sk_i`. Fixed as `bip340.sign`: each runs its work in a `noinline` inner function and
+  burns 32 KiB after it (19 KB measured dirty for `round2Sign`). One copy per call survived that:
+  the 64-byte `SigningNonces` passed BY VALUE was copied at the call boundary, outside any burn;
+  `round1Commit`/`round2Sign` now take `*const SigningNonces` (frost-core takes `&SigningNonces`
+  too) — breaking. Probe green; all burns removed in a copy of the tree → residue in all three.
+Not changed, noted: no single-use enforcement for `SigningNonces` (frost-core has none either; see
+"Nonce reuse" above).
 
 Mutation schemata (ReleaseSafe, one binary): 39 mutants over `root.zig` — the new commitment
 checks, `expand_message_xmd` (length, zero byte, DST length, `b0 ⊕ b1`, `b2`), H4/H5 labels,

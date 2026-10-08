@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING:** `round1Commit(nonces: *const SigningNonces)` and `round2Sign(…,
+  nonces: *const SigningNonces, …)` take the nonce pair by pointer, as frost-core's `&SigningNonces`.
+  Security (HIGH): `generateNonces`, `round1Commit` and `round2Sign` left the signing share and the
+  secret nonces on the dead stack — measured with the new `src/stackprobe_test.zig` (ReleaseFast) —
+  and a nonce next to the published signature share is the share. Each now runs its work one
+  `noinline` frame down and burns 32 KiB after it; the by-value pair was copied at the call
+  boundary, outside any burn, hence the pointer. Migration: pass `&nonces`.
 - **2026-10-08** — **BREAKING (error set):** `round2Sign` checks RFC 9591 §5.2's MUST that
   `commitment_list` carries this signer's own round-1 commitments (`nonces·G`), as frost-core's
   `sign` does: new `Round2SignError.IncorrectCommitment` when the listed hiding or binding

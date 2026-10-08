@@ -270,7 +270,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const binding_random = taintedRandom32("ctgrind-frost-harness-commit-binding-random-v1", tainted);
             const nonces = frost.generateNonces(signing_share, hiding_random, binding_random);
 
-            const pair = try frost.round1Commit(nonces);
+            const pair = try frost.round1Commit(&nonces);
 
             // Propagation witness: format the (tainted, if taint=yes)
             // public commitments through a non-constant-time path.
@@ -299,11 +299,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // the values `round2Sign` must find in the list, with no taint
             // and no harness-side ladder in this row's count (see the module
             // doc comment).
-            const own = frost.round1Commit(frost.generateNonces(
+            const own_nonces = frost.generateNonces(
                 taintedShare("ctgrind-frost-harness-sign-share-v1", false),
                 taintedRandom32("ctgrind-frost-harness-sign-hiding-random-v1", false),
                 taintedRandom32("ctgrind-frost-harness-sign-binding-random-v1", false),
-            )) catch unreachable; // fixed seeds, nonzero nonces
+            );
+            const own = frost.round1Commit(&own_nonces) catch unreachable; // fixed seeds, nonzero nonces
 
             // PUBLIC group info + a one-entry commitment list (this signer's
             // own, declassified commitments).
@@ -328,7 +329,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 identifier,
                 signing_share,
                 group_public_key,
-                nonces,
+                &nonces,
                 msg,
                 &commitment_list,
             );

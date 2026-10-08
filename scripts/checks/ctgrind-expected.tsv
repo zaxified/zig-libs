@@ -769,8 +769,8 @@ ibe	ReleaseFast	fp12pow	1	0	140a7d3db097ec1b	d2e187260f9f18a2
 # counts), plus 2 eqlBytes and 2 branches comparing them with the listed,
 # public commitments. Diffed context by context against 50d173d8; the harness
 # lists commitments from an untainted twin of the nonce inputs.
-frost	ReleaseFast	commit	1	8	1f161bef1eb3307a	94a2e96655c4ce21
-frost	ReleaseFast	sign	1	13	1f161bef1eb3307a	1da8c496388f45b0
+frost	ReleaseFast	commit	1	8	cf9057532c7afd0e	94a2e96655c4ce21
+frost	ReleaseFast	sign	1	13	cf9057532c7afd0e	1da8c496388f45b0
 musig2	ReleaseFast	sign	1	<=101	da7d330ea45297b0	2a2f275cd0c5c7c5
 # taproot secret 10 -> 9 (re-pin 2026-09-15). The row was already stale at
 # 0c0ef527: a --stacks run of that tree reads 9, with the SAME context set as
