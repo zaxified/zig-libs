@@ -2,4 +2,6 @@
 # valgrind: valgrind-3.26.0
 # cpu: x86_64_v3
 # case	rounds	instructions per round (scripts/count-insns)
-crc32c-4KiB	2000	1631.0
+aead-seal-64B	2000	2302.0
+aead-seal-1KiB	500	7671.1
+aead-seal-16KiB	50	91251.6

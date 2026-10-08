@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** `tools/count.tsv` rewritten, 2139 → 1631
+  instructions per 4 KiB round (−24 %): the 2026-10-07 `crc32q` chain change below, which the
+  baseline had not recorded — found by the new `count amd64` lane on its first local run.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the test-only `ScriptSource` (the fuzz harness's cursor source) drops `pub` from its two methods; it was never reachable from outside, and the textual consumer-example trigger (CONVENTIONS.md §7.2) counted them as state methods.
 - **2026-10-07** — Performance, not breaking: the x86-64 `crc32q` chains stay
   64-bit (no narrowing and widening around every instruction): against Go

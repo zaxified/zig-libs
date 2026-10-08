@@ -701,6 +701,7 @@ test {
     _ = @import("poly1305.zig");
     _ = @import("bench.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("count.zig");
 }
 
 // RFC 8439 §2.3.2 — ChaCha20 block function (counter = 1).

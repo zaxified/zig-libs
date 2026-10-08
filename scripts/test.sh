@@ -1880,6 +1880,49 @@ cmd_checks() {
 # is `zig build interop-<m> -- --capture`, which a human runs after reading the
 # mismatch. So this leaves a clean tree and goes red on divergence -- a lane
 # that silently rewrote its own anchor would be a lane that can never fail.
+cmd_count() {
+    # PRE-RELEASE ONLY, like `ctgrind`: hold every module's instruction counts
+    # per operation to its committed baseline (`modules/<m>/tools/count.tsv`,
+    # `scripts/count-insns`). A count moves only when the code a case runs
+    # changed, so a move is either a regression or an improvement nobody
+    # wrote down -- both need a commit that rewrites the baseline and says why.
+    #
+    # Evaluated 2026-10-08 before it was wired: no false alarm over 14
+    # non-performance commits of chachapoly's history, every one of its four
+    # real performance commits flagged, and on the day it was wired it caught
+    # crc32c's 2026-10-07 speed-up (-24 %) that no baseline had recorded.
+    #
+    # `--advisory`: report a move as a `::warning::` and stay green. The lane
+    # starts advisory because the baselines were taken on an Intel desktop and
+    # the runner is an AMD EPYC; once its counts are shown to match, the flag
+    # goes and a move fails the lane. Needs valgrind
+    # (`scripts/lib/ci-environment.sh ctgrind` installs it).
+    local advisory=0 a m rc failed=0
+    for a in "$@"; do [[ "$a" == --advisory ]] && advisory=1; done
+    local mods=()
+    for m in modules/*/tools/count.tsv; do
+        [[ -e "$m" ]] || continue
+        m="${m#modules/}"
+        mods+=("${m%%/*}")
+    done
+    echo "count: ${#mods[@]} module(s) with a baseline: ${mods[*]}"
+    for m in "${mods[@]}"; do
+        rc=0
+        ./scripts/count-insns "$m" || rc=$?
+        if (( rc != 0 )); then
+            failed=1
+            if (( advisory )); then
+                echo "::warning::count-insns $m exited $rc (advisory lane: not failing)"
+            fi
+        fi
+    done
+    if (( failed && ! advisory )); then
+        echo "count: a case moved or could not be judged -- see above" >&2
+        return 1
+    fi
+    return 0
+}
+
 cmd_ctgrind() {
     # PRE-RELEASE ONLY. Runs the constant-time measurement itself -- the thing
     # `zig build check-ctgrind` deliberately does NOT do.
@@ -2380,6 +2423,11 @@ Usage: scripts/test.sh [subcommand] [args]
                         can find that something new we send provokes a
                         different reaction, or that the peer moved. Needs
                         `scripts/lib/ci-environment.sh interop`.
+  count [--advisory]    PRE-RELEASE ONLY — hold every module's instruction
+                        counts per operation (`modules/<m>/tools/count.tsv`)
+                        to their baseline via `scripts/count-insns`; a move of
+                        more than 2 % either way fails (`--advisory`: warns).
+                        Needs valgrind.
   ctgrind               PRE-RELEASE ONLY — take the constant-time measurement.
                         Runs `scripts/checks/ctgrind.sh --check`: every committed
                         `modules/<m>/src/ctgrind_harness.zig` under
@@ -2443,6 +2491,7 @@ main() {
         examples) cmd_examples "${rest[@]:-}" ;;
         interop) cmd_interop "${rest[@]:-}" ;;
         ctgrind) cmd_ctgrind "${rest[@]:-}" ;;
+        count) cmd_count "${rest[@]:-}" ;;
         time) cmd_time "${rest[@]:-}" ;;
         vm) cmd_vm "${rest[@]:-}" ;;
         -h|--help|help) usage ;;

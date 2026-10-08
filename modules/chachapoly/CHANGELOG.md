@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** instruction-count cases for
+  `scripts/count-insns` (`src/count.zig`, opt-in via `ZIGLIBS_COUNT`; AEAD seal at 64 B, 1 KiB,
+  16 KiB), baseline `tools/count.tsv`, held by the CI `count amd64` lane.
 - **2026-10-08** — **FIX (secrets on the dead stack):** the dead-stack burn's buffer is now
   16-aligned instead of the vector type's natural 32. At 32 the burn's frame was realigned, and
   the up to 56 bytes between its saved frame pointer and the buffer — the top of the frame the

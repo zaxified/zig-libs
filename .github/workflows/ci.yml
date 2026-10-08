@@ -723,6 +723,19 @@ jobs:
           # lowered once a green run has measured the cost.
           lanes+=('{"name":"ctgrind amd64","args":"","cmd":"ctgrind","cachekey":"ctgrind","cache":false,"runner":"ubuntu-26.04","peers":"ctgrind","tc":false,"timeout":90,"skip_live":""}')
 
+          # ⭐ INSTRUCTION COUNTS, added 2026-10-08 (scripts/count-insns, evaluated
+          # in CML's maturity tasks § AE): every module with a
+          # `tools/count.tsv` is held to its counts per operation under
+          # cachegrind -- a number the shared, noisy runner cannot move, unlike
+          # a timing. ADVISORY for now (`--advisory`: a move is a ::warning::,
+          # the lane stays green): the baselines were taken on an Intel desktop
+          # and this runner is an AMD EPYC. When a run shows the counts agree,
+          # drop the flag and a move fails the lane; if they do not, the
+          # baselines become this lane's own. `peers: ctgrind` installs the
+          # same valgrind (3.26.0) the baselines name. amd64 only: the counts
+          # are a property of x86_64 code.
+          lanes+=('{"name":"count amd64","args":"--advisory","cmd":"count","cachekey":"count","cache":false,"runner":"ubuntu-26.04","peers":"ctgrind","tc":false,"timeout":30,"skip_live":""}')
+
           # Every shard set must cover the whole collection: per `base`, the
           # union of its `-Dgroup=` values must equal every primary lib in
           # module-graph (column 6). Lanes without `base` are not sharded.
