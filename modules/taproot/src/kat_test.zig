@@ -77,7 +77,8 @@ test "KAT: tweakSecretKey matches the published tweakedPrivkey" {
     for (v.vectors) |vec| {
         const sk = try bip340.SecretKey.fromBytes(try hex32(vec.internal_privkey));
         const merkle_root: ?[32]u8 = if (vec.merkle_root) |mr| try hex32(mr) else null;
-        const got = try taproot.tweakSecretKey(sk, merkle_root);
+        var got: [32]u8 = undefined;
+        try taproot.tweakSecretKey(&sk, merkle_root, &got);
 
         const want = try hex32(vec.tweaked_privkey);
         try std.testing.expectEqualSlices(u8, &want, &got);
@@ -105,7 +106,8 @@ test "tweaked key pair signs and verifies: bip340.sign under q verifies against 
         const merkle_root: ?[32]u8 = if (vec.merkle_root) |mr| try hex32(mr) else null;
 
         const result = try taproot.tweakPublicKey(internal, merkle_root);
-        const q_bytes = try taproot.tweakSecretKey(sk, merkle_root);
+        var q_bytes: [32]u8 = undefined;
+        try taproot.tweakSecretKey(&sk, merkle_root, &q_bytes);
 
         // Structural agreement: q's own derived x-only public key IS the
         // tweaked output key's x (bip340's derivation even-y-normalizes q

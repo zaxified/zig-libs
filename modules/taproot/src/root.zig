@@ -268,13 +268,27 @@ pub fn tweakPublicKey(internal: bip340.XOnlyPublicKey, merkle_root: ?[32]u8) Twe
 /// `internalPrivkey` + `merkleRoot` → the exact published `tweakedPrivkey`
 /// scalar, plus a sign→verify round-trip: `bip340.sign` under this `q`
 /// verifies against `tweakPublicKey`'s output key for every vector.
-pub fn tweakSecretKey(internal_sk: bip340.SecretKey, merkle_root: ?[32]u8) TweakError![32]u8 {
+///
+/// **Dead stack (review 2026-10-08, HIGH).** Measured with
+/// `stackprobe_test.zig` (ReleaseFast), the by-value form left the internal
+/// key ×2, the normalised `d` ×2 and `q` ×3 per call in dead frames,
+/// although `kp` and `d` were wiped. Hence the shape: the key comes in by
+/// pointer, `q` goes out through `out` (a returned `[32]u8` lands in a
+/// temporary of the CALLER's frame, which no wipe here can reach), and the
+/// body runs one frame down, followed by a `stack_burn`-byte zeroing at that
+/// depth. On error `out` is left untouched.
+pub fn tweakSecretKey(internal_sk: *const bip340.SecretKey, merkle_root: ?[32]u8, out: *[32]u8) TweakError!void {
+    defer burnStack();
+    return tweakSecretKeyBody(internal_sk, merkle_root, out);
+}
+
+noinline fn tweakSecretKeyBody(internal_sk: *const bip340.SecretKey, merkle_root: ?[32]u8, out: *[32]u8) TweakError!void {
     // Steps 1-3: even-y normalization + internal_x = bytes(x(d*G)), exactly
     // bip340.KeyPair.fromSecretKey's own computation (kp.secret = the
     // normalized d, kp.public.x = the even-y x-only encoding). fromSecretKey
     // fails only on a zero/non-canonical scalar — bip340.SecretKey.fromBytes
     // already rejects those, so this is a defensive re-check.
-    var kp = bip340.KeyPair.fromSecretKey(internal_sk) catch return error.InvalidInternalKey;
+    var kp = bip340.KeyPair.fromSecretKey(internal_sk.*) catch return error.InvalidInternalKey;
     defer kp.deinit(); // zeroizes kp.secret (the normalized internal scalar d0/d source)
     var d = Scalar.fromBytes(kp.secret, .big) catch unreachable; // canonical by construction
     defer std.crypto.secureZero(u8, std.mem.asBytes(&d));
@@ -289,8 +303,23 @@ pub fn tweakSecretKey(internal_sk: bip340.SecretKey, merkle_root: ?[32]u8) Tweak
     // zeroized (defers above) AFTER this expression is evaluated but
     // before the caller-visible return — the returned `q` itself is the
     // useful output and is intentionally left intact.
-    return d.add(t).toBytes(.big);
+    out.* = d.add(t).toBytes(.big);
 }
+
+/// Zero `stack_burn` bytes at the depth `tweakSecretKeyBody` used. Volatile
+/// word stores, not `secureZero`: that is a volatile byte memset, and without
+/// libc the memset behind it moves ~3 B/ns — 2.5 µs per 8 KiB against 0.3 µs
+/// for this loop (ReleaseFast, 2026-10-08). `noinline` is load-bearing.
+noinline fn burnStack() void {
+    var buf: [stack_burn / 8]u64 = undefined;
+    const p: [*]volatile u64 = &buf;
+    for (0..buf.len) |i| p[i] = 0;
+}
+
+/// `tweakSecretKeyBody`'s call tree (with `bip340.KeyPair.fromSecretKey`'s
+/// own 8 KiB burn under it) — see `stackprobe_test.zig`, which goes red when
+/// it outgrows this.
+const stack_burn = 16 * 1024;
 
 // ── script trees (BIP341 §"Constructing and Spending Taproot Outputs") ──
 
@@ -321,6 +350,7 @@ test {
     _ = @import("tree.zig");
     _ = @import("tree_vectors.zig");
     _ = @import("tree_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names BIP341" {

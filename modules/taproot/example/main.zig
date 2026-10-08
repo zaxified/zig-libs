@@ -108,7 +108,9 @@ pub fn main() !void {
         must(tweak.output.parity == 1, @src());
         std.debug.print("key-path-only output key: {x} parity={d}\n", .{ tweak.output.x, tweak.output.parity });
 
-        const q_bytes = try taproot.tweakSecretKey(internal_sk, null);
+        var q_bytes: [32]u8 = undefined;
+
+        try taproot.tweakSecretKey(&internal_sk, null, &q_bytes);
         const q_sk = try bip340.SecretKey.fromBytes(q_bytes);
         const sig = try bip340.sign(q_sk, &message, aux_rand, io);
         must(bip340.verify(tweak.output.asXOnly(), &message, try bip340.Signature.fromBytes(sig)), @src());
@@ -127,7 +129,9 @@ pub fn main() !void {
         must(tweak.output.parity == 1, @src());
         std.debug.print("script-committed output key: {x} parity={d}\n", .{ tweak.output.x, tweak.output.parity });
 
-        const q_bytes = try taproot.tweakSecretKey(internal_sk, merkle_root_bytes);
+        var q_bytes: [32]u8 = undefined;
+
+        try taproot.tweakSecretKey(&internal_sk, merkle_root_bytes, &q_bytes);
         const q_sk = try bip340.SecretKey.fromBytes(q_bytes);
         const sig = try bip340.sign(q_sk, &message, aux_rand, io);
         must(bip340.verify(tweak.output.asXOnly(), &message, try bip340.Signature.fromBytes(sig)), @src());

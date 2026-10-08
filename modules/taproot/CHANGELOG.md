@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** `tweakSecretKey` left
+  the internal key ×2, its even-y normalisation ×2 and the tweaked key `q` ×3 per call on the
+  dead stack (ReleaseFast stack probe). New signature
+  `tweakSecretKey(&internal_sk, merkle_root, &out) TweakError!void`: the key by pointer, `q`
+  through `out` (a returned `[32]u8` lands in a temporary of the caller's frame no wipe can
+  reach), and the body is followed by a 16 KiB stack burn.
 - **2026-10-05** — Tests: first dated mutation run (29 mutants, 21 killed, 8 equivalent or
   unobservable; `SPEC.md` § "Mutation run 2026-10-05"). No defect; one new test pins the leaf
   CompactSize edges (252, 253, 65535, 65536 bytes). Backlog: `tweakSecretKey`'s wipes are not

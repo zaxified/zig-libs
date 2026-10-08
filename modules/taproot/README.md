@@ -54,7 +54,8 @@ BIP341 algorithm each implements):
 
 ```zig
 const result = try taproot.tweakPublicKey(internal_xonly, merkle_root); // -> TweakResult{ .output, .tweak }
-const q_bytes = try taproot.tweakSecretKey(internal_sk, merkle_root); // -> [32]u8, the tweaked signing scalar
+var q_bytes: [32]u8 = undefined;
+try taproot.tweakSecretKey(&internal_sk, merkle_root, &q_bytes); // -> [32]u8, the tweaked signing scalar
 ```
 
 A caller signs the output key's messages with `q_bytes` via

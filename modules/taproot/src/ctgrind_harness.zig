@@ -242,7 +242,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // The call under test — taproot's ONLY secret-data path. Produces the
     // "tweaked private key" q the task brief asks to taint/observe.
-    const q = try taproot.tweakSecretKey(internal_sk, merkle_root);
+    var q: [32]u8 = undefined;
+    try taproot.tweakSecretKey(&internal_sk, merkle_root, &q);
 
     // Propagation witness: format the (tainted, if taint=yes) tweaked scalar
     // through a non-constant-time path. See the module doc comment above.
