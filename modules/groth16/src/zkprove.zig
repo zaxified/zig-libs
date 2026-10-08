@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const bn254 = @import("bn254");
+const burn = @import("burn.zig");
 const fft = @import("fft.zig");
 const domain = @import("domain.zig");
 const msm = @import("msm.zig");
@@ -55,7 +56,16 @@ pub const ProveError = error{
 /// draw both uniformly at random for every proof (`Fr.random(io)`); reusing
 /// them across two proofs of different witnesses leaks the witness
 /// difference.
-pub fn prove(allocator: Allocator, z: ZKey, witness: []const Fr, rand: prover.Randomizers) ProveError!Proof {
+///
+/// `rand` is taken by pointer and never copied; the caller wipes it (and the
+/// witness). The body runs one frame down and the stack it dirtied is zeroed
+/// after it; the heap scratch (evaluations, the Pippenger limbs and buckets) is
+/// wiped before it goes back to `allocator`.
+pub fn prove(allocator: Allocator, z: ZKey, witness: []const Fr, rand: *const prover.Randomizers) ProveError!Proof {
+    return burn.run(burn.zkprove_burn, ProveError!Proof, proveBody, .{ allocator, z, witness, rand });
+}
+
+fn proveBody(allocator: Allocator, z: ZKey, witness: []const Fr, rand: *const prover.Randomizers) ProveError!Proof {
     if (witness.len != z.n_vars) return error.WitnessMismatch;
     const log_n = z.power();
     if (log_n + 1 > domain.max_log_size) return error.DomainTooLarge;
@@ -96,10 +106,8 @@ pub fn prove(allocator: Allocator, z: ZKey, witness: []const Fr, rand: prover.Ra
     for (a, b, c) |*av, bv, cv| av.* = av.mul(bv).sub(cv);
     const h = a;
 
-    var r = rand.r;
-    var s = rand.s;
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&r));
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&s));
+    const r = rand.r;
+    const s = rand.s;
     const delta1 = G1.Jacobian.fromAffine(z.delta_g1);
 
     var pi_a = G1.Jacobian.fromAffine(z.alpha_g1);

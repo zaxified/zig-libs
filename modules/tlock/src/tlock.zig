@@ -103,6 +103,7 @@ const std = @import("std");
 const bls12_381 = @import("bls12_381");
 const ciphersuite = @import("ciphersuite.zig");
 const gate = @import("gate.zig");
+const burn = @import("burn.zig");
 
 const g1 = bls12_381.g1;
 const g2 = bls12_381.g2;
@@ -339,14 +340,22 @@ pub const DecryptError = error{
 /// `msg`/`sigma` drand/kyber's own `EncryptCCAonG2` allows (bounded
 /// only by `sha256.digest_length`) — this module targets drand's ACTUAL
 /// wire format, not kyber's more general primitive.
-pub fn encrypt(p_pub: g2.Affine, round: u64, message: [block_bytes]u8, sigma: [block_bytes]u8) Ciphertext {
+///
+/// `message` and `sigma` are secrets, so they come in by pointer; the body
+/// runs one frame down and the stack it dirtied (`r`, the pairing value,
+/// both masks) is zeroed after it (`burn.zig`).
+pub fn encrypt(p_pub: g2.Affine, round: u64, message: *const [block_bytes]u8, sigma: *const [block_bytes]u8) Ciphertext {
+    return burn.run(burn.crypt_burn, Ciphertext, encryptBody, .{ p_pub, round, message, sigma });
+}
+
+fn encryptBody(p_pub: g2.Affine, round: u64, message: *const [block_bytes]u8, sigma: *const [block_bytes]u8) Ciphertext {
     // Steps 1-3: identity -> Qid -> Gid. `pairing.pairing` takes
     // `(G1, G2)` in exactly drand/kyber's `s.Pair(Qid, master)` order.
     const qid = ciphersuite.h1(ciphersuite.beaconId(round));
     const gid = pairing.pairing(qid, p_pub);
 
     // Step 5: r = H3(sigma, M) — the FO-transform binding scalar.
-    const r = ciphersuite.h3(&sigma, &message);
+    const r = ciphersuite.h3(sigma, message);
 
     // Step 6: U = r * G2_generator (constant-time scalarMul).
     const u = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r).toAffine();
@@ -360,7 +369,7 @@ pub fn encrypt(p_pub: g2.Affine, round: u64, message: [block_bytes]u8, sigma: [b
     for (&v, sigma) |*b, s| b.* ^= s;
 
     // Step 9: W = M XOR H4(sigma).
-    var w = ciphersuite.h4(block_bytes, &sigma);
+    var w = ciphersuite.h4(block_bytes, sigma);
     for (&w, message) |*b, m| b.* ^= m;
 
     return .{ .u = u, .v = v, .w = w };
@@ -385,7 +394,17 @@ pub fn encrypt(p_pub: g2.Affine, round: u64, message: [block_bytes]u8, sigma: [b
 /// `U' != ct.u` — the CCA-rejection path; see this file's module doc
 /// comment, step 4, for why this check is security-critical and must
 /// run on every call, unconditionally.
-pub fn decrypt(round_signature: g1.Affine, ct: Ciphertext) DecryptError![block_bytes]u8 {
+///
+/// The plaintext is written to `out` (zeroed on error). The body runs one
+/// frame down and the stack it dirtied is zeroed after it (`burn.zig`).
+pub fn decrypt(out: *[block_bytes]u8, round_signature: g1.Affine, ct: Ciphertext) DecryptError!void {
+    burn.run(burn.crypt_burn, DecryptError!void, decryptBody, .{ out, round_signature, ct }) catch |e| {
+        std.crypto.secureZero(u8, out);
+        return e;
+    };
+}
+
+fn decryptBody(out: *[block_bytes]u8, round_signature: g1.Affine, ct: Ciphertext) DecryptError!void {
     // Step 1: gid_r = e(round_signature, U) — ONE pairing call
     // reconstructs encrypt's Gid^r by bilinearity (see the module doc
     // comment). This is also where a drand-produced ciphertext pins
@@ -405,8 +424,9 @@ pub fn decrypt(round_signature: g1.Affine, ct: Ciphertext) DecryptError![block_b
     for (&sigma, ct.v) |*b, x| b.* ^= x;
 
     // Step 3: message = W XOR H4(sigma).
-    var message = ciphersuite.h4(block_bytes, &sigma);
-    for (&message, ct.w) |*b, x| b.* ^= x;
+    const message = out;
+    message.* = ciphersuite.h4(block_bytes, &sigma);
+    for (message, ct.w) |*b, x| b.* ^= x;
 
     // Step 4: FO/CCA consistency — recompute r' = H3(sigma, message)
     // and reject unless U == r' * G2_generator. Compare via the
@@ -418,17 +438,15 @@ pub fn decrypt(round_signature: g1.Affine, ct: Ciphertext) DecryptError![block_b
     // (the FO-transform binding scalar, recomputed only to validate `ct.u`)
     // and is wiped unconditionally; `message` is wiped ONLY on the reject
     // path below — the success path returns it as the decrypted plaintext.
-    var r_check = ciphersuite.h3(&sigma, &message);
+    var r_check = ciphersuite.h3(&sigma, message);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&r_check));
     const u_check = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r_check).toAffine();
     if (!std.mem.eql(u8, &g2.toBytesCompressed(u_check), &g2.toBytesCompressed(ct.u))) {
         // CCA-reject: never leave a partially/wrongly-decrypted plaintext
         // resident in memory once it is being discarded as invalid.
-        std.crypto.secureZero(u8, &message);
+        std.crypto.secureZero(u8, message);
         return error.FoCheckFailed;
     }
-
-    return message;
 }
 
 // ── tests: Ciphertext codec (REAL, ungated) ─────────────────────────

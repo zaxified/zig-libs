@@ -48,6 +48,7 @@
 //! the required attribution ships beside this source as ./NOTICE.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -206,17 +207,23 @@ fn Params(comptime logn_: u5, comptime sig_bound_: u64) type {
             pub const encoded_length = 1 + 2 * fg_len + big_f_len;
 
             /// Decode from the standard encoding: 0x50+logn header +
-            /// trimmed f + trimmed g + trimmed F.
-            pub fn fromBytes(bytes: *const [encoded_length]u8) error{InvalidSecretKey}!@This() {
-                if (bytes[0] != 0x50 + @as(u8, logn_)) return error.InvalidSecretKey;
-                var sk: @This() = undefined;
-                Codec.trimI8Decode(&sk.f, fg_bits, bytes[1 .. 1 + fg_len]) catch return error.InvalidSecretKey;
-                Codec.trimI8Decode(&sk.g, fg_bits, bytes[1 + fg_len .. 1 + 2 * fg_len]) catch return error.InvalidSecretKey;
-                Codec.trimI8Decode(&sk.big_f, big_f_bits, bytes[1 + 2 * fg_len ..]) catch return error.InvalidSecretKey;
-                return sk;
+            /// trimmed f + trimmed g + trimmed F, into the caller's `out`
+            /// (zeroed on error). The decode runs one frame down and the
+            /// stack it dirtied is zeroed (`burn.zig`).
+            pub fn fromBytes(out: *@This(), bytes: *const [encoded_length]u8) error{InvalidSecretKey}!void {
+                return burn.run(burn.by(logn_, burn.codec_burn), error{InvalidSecretKey}!void, fromBytesBody, .{ out, bytes });
             }
 
-            /// Recompute the public key h = g * f^-1 mod q.
+            fn fromBytesBody(out: *@This(), bytes: *const [encoded_length]u8) error{InvalidSecretKey}!void {
+                errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+                if (bytes[0] != 0x50 + @as(u8, logn_)) return error.InvalidSecretKey;
+                Codec.trimI8Decode(&out.f, fg_bits, bytes[1 .. 1 + fg_len]) catch return error.InvalidSecretKey;
+                Codec.trimI8Decode(&out.g, fg_bits, bytes[1 + fg_len .. 1 + 2 * fg_len]) catch return error.InvalidSecretKey;
+                Codec.trimI8Decode(&out.big_f, big_f_bits, bytes[1 + 2 * fg_len ..]) catch return error.InvalidSecretKey;
+            }
+
+            /// Recompute the public key h = g * f^-1 mod q. The secret-derived
+            /// work is in `Ring.computePublic`, which burns its own frames.
             pub fn publicKey(sk: *const @This()) error{InvalidSecretKey}!Self.PublicKey {
                 const h = Ring.computePublic(&sk.f, &sk.g) catch return error.InvalidSecretKey;
                 var pk = Self.PublicKey{ .h = h, .h_ntt = h };
@@ -252,19 +259,22 @@ fn Params(comptime logn_: u5, comptime sig_bound_: u64) type {
 
         pub const KeygenError = error{NotInvertible};
 
-        /// Generate a fresh Falcon key pair. `rng` is the entropy
+        /// Generate a fresh Falcon key pair into the caller's `sk_out` /
+        /// `pk_out` (`sk_out` is zeroed on error). `rng` is the entropy
         /// source: a real CSPRNG for production, or `sign.ShakePrng`
         /// seeded with the 48 bytes the NIST-KAT DRBG hands
         /// `crypto_sign_keypair` for byte-exact KAT reproduction (see
-        /// `keygen_sign_test.zig`).
-        pub fn generateKeyPair(rng: std.Random) Self.KeygenError!struct {
-            signing_key: Self.SigningKey,
-            public_key: Self.PublicKey,
-        } {
-            const kp = try Self.Keygen.generate(rng);
-            var pk = Self.PublicKey{ .h = kp.public_key_h, .h_ntt = kp.public_key_h };
-            Ring.ntt(&pk.h_ntt);
-            return .{ .signing_key = kp.signing_key, .public_key = pk };
+        /// `keygen_sign_test.zig`). The signing key is never returned by
+        /// value, and the stack the generation dirtied is zeroed
+        /// (`burn.zig`).
+        pub fn generateKeyPair(
+            rng: std.Random,
+            sk_out: *Self.SigningKey,
+            pk_out: *Self.PublicKey,
+        ) Self.KeygenError!void {
+            try Self.Keygen.generate(rng, sk_out, &pk_out.h);
+            pk_out.h_ntt = pk_out.h;
+            Ring.ntt(&pk_out.h_ntt);
         }
 
         /// Randomized signing (production entry point): draws the nonce
@@ -428,4 +438,5 @@ test {
     _ = @import("kat_test.zig");
     _ = @import("keygen_sign_test.zig");
     _ = @import("kat_sign_test.zig");
+    _ = @import("stackprobe_test.zig");
 }

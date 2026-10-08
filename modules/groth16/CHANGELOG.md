@@ -5,6 +5,35 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING, HIGH: dead-stack sweep of the prover's secret entry
+  points.** A new ReleaseFast stack probe (`stackprobe_test.zig`, engine of
+  `bls12_381`'s) found every one of them leaving its secrets in dead frames. Before
+  (per 5 calls, 2 key sets): `prover.setup` left α, β, γ, δ, γ⁻¹, δ⁻¹, `Z(τ)`, the
+  `τ` powers, `uᵢ(τ)`/`wᵢ(τ)`, the combined `β·uᵢ+α·vᵢ+wᵢ` (+ its `/γ`, `/δ` forms) and
+  an `H` scalar (≈190 windows over a 12.4 KiB-deep body); `prover.prove` the witness,
+  `r`, `s`, `r·s`, a QAP evaluation and the Jacobian/affine images of `r·δ`, `s·δ`
+  (G1, G2) and `r·s·δ` (≈130, 12.7 KiB); `zkprove.prove` the same plus the coset
+  quotient `H` and C evaluations, and 80 windows of freed heap (the Pippenger limbs
+  and buckets went back to the allocator unwiped; ≈190 + 80, 14.8 KiB);
+  `phase2.contribute` `x`, `s`, `s·x` (30, 10.1 KiB). After: 0, NEG=0, POS≥1. The
+  `r·δ`-type points are recomputable through the public API (`scalarMul` of the
+  key's δ) and are needles: knowing `r·δ·G1` next to `πA` hands out `α+L`.
+  - **API (BREAKING):** secrets by pointer — `prover.setup(…, tw: *const ToxicWaste)`
+    (no longer copies and wipes its own copy; the caller's `tw.deinit()` is the only
+    wipe), `prover.prove(…, rand: *const Randomizers)`, `zkprove.prove(…, rand: *const
+    Randomizers)`, `phase2.contribute(gpa, z, x: *const Fr, s: *const Fr, name)`.
+    Call sites: `&.{ .r = …, .s = … }`, `&tw`, `&x`. New `circom.freeWitness(gpa, w)`
+    wipes a `parseWitness` result before freeing it.
+  - **Burns** (`src/burn.zig`, bodies one frame down + zeroing after): setup 32 KiB
+    (body depth 12.3 KiB), prove 32 KiB (14.8 KiB), zkprove 40 KiB (17.6 KiB),
+    contribute 24 KiB (10.8 KiB), parseWitness 4 KiB (1.3 KiB); setup/prove add 512 B
+    per domain point (their arrays sit in the body's frame).
+  - **Heap:** `msm.pippengerG1/G2` wipe the scalar limbs and the buckets (which of
+    the bases sit in which bucket is the scalars' digits) before freeing them.
+  - Not covered (SPEC § Backlog): the generic helpers that take a witness slice
+    (`r1cs.System.isSatisfied`/`evalConstraint`, `qap.checkDivisible`, `msmG1/G2`,
+    `circom.writeWitness`) run in the caller's frames un-burned; `Fr.random` returns
+    its scalar by value (bn254 backlog).
 - **2026-10-05** — Re-survey: scope mvp → core. Since the 2026-09-30 survey, A8
   (2026-10-02) made the main use case work and checked it against snarkjs in both
   directions — circom `.r1cs`/`.wtns` and snarkjs `.zkey`/`.ptau` readers, `zkprove`

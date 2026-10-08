@@ -74,7 +74,8 @@ test "round trip: setup -> extract -> encrypt -> decrypt recovers the message, s
     var threaded = testIo();
     defer threaded.deinit();
     const io = threaded.io();
-    const kp = ibe.setup(io);
+    var kp: ibe.KeyPair = undefined;
+    ibe.setup(&kp, io);
 
     const cases = [_]struct { id: []const u8, msg: u8, sig: u8 }{
         .{ .id = "alice@example.com", .msg = 0x01, .sig = 0x11 },
@@ -85,12 +86,12 @@ test "round trip: setup -> extract -> encrypt -> decrypt recovers the message, s
     };
 
     for (cases) |c| {
-        const d_id = ibe.extract(kp.msk, c.id);
+        const d_id = testExtract(ibe.Default, kp.msk, c.id);
         const message = [_]u8{c.msg} ** ibe.block_bytes;
         const sigma = [_]u8{c.sig} ** ibe.block_bytes;
 
-        const ct = ibe.encrypt(kp.mpk, c.id, message, sigma);
-        const recovered = try ibe.decrypt(d_id, ct);
+        const ct = testEncrypt(ibe.Default, kp.mpk, c.id, message, sigma);
+        const recovered = try testDecrypt(ibe.Default, d_id, ct);
         try std.testing.expectEqualSlices(u8, &message, &recovered);
     }
 }
@@ -99,15 +100,17 @@ test "round trip: sigma sourced from randomSigma (production entropy path)" {
     var threaded = testIo();
     defer threaded.deinit();
     const io = threaded.io();
-    const kp = ibe.setup(io);
+    var kp: ibe.KeyPair = undefined;
+    ibe.setup(&kp, io);
 
     const id = "alice@example.com";
-    const d_id = ibe.extract(kp.msk, id);
+    const d_id = testExtract(ibe.Default, kp.msk, id);
     const message = [_]u8{0x5a} ** ibe.block_bytes;
-    const sigma = ciphersuite.randomSigma(io);
+    var sigma: [ciphersuite.block_bytes]u8 = undefined;
+    ciphersuite.randomSigma(&sigma, io);
 
-    const ct = ibe.encrypt(kp.mpk, id, message, sigma);
-    const recovered = try ibe.decrypt(d_id, ct);
+    const ct = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
+    const recovered = try testDecrypt(ibe.Default, d_id, ct);
     try std.testing.expectEqualSlices(u8, &message, &recovered);
 }
 
@@ -146,8 +149,10 @@ test "entropy seam: randomSigma really draws, and two encryptions of one message
     // fails when that is frozen, as does this module's own test "setup draws
     // distinct msk across calls (not a fixed constant)" in `ibe.zig`.
     // `sigma` was the uncovered half of the two.
-    const s1 = ciphersuite.randomSigma(io);
-    const s2 = ciphersuite.randomSigma(io);
+    var s1: [ciphersuite.block_bytes]u8 = undefined;
+    ciphersuite.randomSigma(&s1, io);
+    var s2: [ciphersuite.block_bytes]u8 = undefined;
+    ciphersuite.randomSigma(&s2, io);
     try std.testing.expect(!std.mem.eql(u8, &s1, &s2));
 
     // A liveness pin on `randomSigma` alone would still pass over an
@@ -157,12 +162,17 @@ test "entropy seam: randomSigma really draws, and two encryptions of one message
     // exactly that — so with every other input held fixed, a fresh `sigma`
     // is the ONLY thing that can make two ciphertexts differ. Under a
     // constant one they are byte-identical, which is the IND-CPA break.
-    const kp = ibe.setup(io);
+    var kp: ibe.KeyPair = undefined;
+    ibe.setup(&kp, io);
     const id = "alice@example.com";
     const message = [_]u8{0x5a} ** ibe.block_bytes;
 
-    const ct1 = ibe.encrypt(kp.mpk, id, message, ciphersuite.randomSigma(io));
-    const ct2 = ibe.encrypt(kp.mpk, id, message, ciphersuite.randomSigma(io));
+    var sigma1: [ciphersuite.block_bytes]u8 = undefined;
+    ciphersuite.randomSigma(&sigma1, io);
+    var sigma2: [ciphersuite.block_bytes]u8 = undefined;
+    ciphersuite.randomSigma(&sigma2, io);
+    const ct1 = testEncrypt(ibe.Default, kp.mpk, id, message, sigma1);
+    const ct2 = testEncrypt(ibe.Default, kp.mpk, id, message, sigma2);
     try std.testing.expect(!std.mem.eql(u8, &ct1.toBytes(), &ct2.toBytes()));
     // Every component moves, not just one: U (= r·G₂ with r = H3(sigma, M)),
     // V (the masked `sigma` itself) and W (the message masked by H4(sigma)).
@@ -176,9 +186,9 @@ test "entropy seam: randomSigma really draws, and two encryptions of one message
 
     // And the production path is a WORKING path, not merely a varying one —
     // a distinctness assertion over a broken pipeline proves nothing.
-    const d_id = ibe.extract(kp.msk, id);
-    const back1 = try ibe.decrypt(d_id, ct1);
-    const back2 = try ibe.decrypt(d_id, ct2);
+    const d_id = testExtract(ibe.Default, kp.msk, id);
+    const back1 = try testDecrypt(ibe.Default, d_id, ct1);
+    const back2 = try testDecrypt(ibe.Default, d_id, ct2);
     try std.testing.expectEqualSlices(u8, &message, &back1);
     try std.testing.expectEqualSlices(u8, &message, &back2);
 }
@@ -186,14 +196,15 @@ test "entropy seam: randomSigma really draws, and two encryptions of one message
 test "encrypt is deterministic given fixed (mpk, id, message, sigma)" {
     var threaded = testIo();
     defer threaded.deinit();
-    const kp = ibe.setup(threaded.io());
+    var kp: ibe.KeyPair = undefined;
+    ibe.setup(&kp, threaded.io());
 
     const id = "alice@example.com";
     const message = [_]u8{0x33} ** ibe.block_bytes;
     const sigma = [_]u8{0x44} ** ibe.block_bytes;
 
-    const ct1 = ibe.encrypt(kp.mpk, id, message, sigma);
-    const ct2 = ibe.encrypt(kp.mpk, id, message, sigma);
+    const ct1 = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
+    const ct2 = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
     try std.testing.expectEqualSlices(u8, &ct1.toBytes(), &ct2.toBytes());
 }
 
@@ -202,10 +213,11 @@ test "encrypt is deterministic given fixed (mpk, id, message, sigma)" {
 test "pairing consistency: e(d_id, U) == fp12Pow(Gid, r) directly, on a known case" {
     var threaded = testIo();
     defer threaded.deinit();
-    const kp = ibe.setup(threaded.io());
+    var kp: ibe.KeyPair = undefined;
+    ibe.setup(&kp, threaded.io());
 
     const id = "alice@example.com";
-    const d_id = ibe.extract(kp.msk, id);
+    const d_id = testExtract(ibe.Default, kp.msk, id);
     const message = [_]u8{0x12} ** ibe.block_bytes;
     const sigma = [_]u8{0x34} ** ibe.block_bytes;
 
@@ -223,9 +235,9 @@ test "pairing consistency: e(d_id, U) == fp12Pow(Gid, r) directly, on a known ca
     // Sanity: this identity is exactly what encrypt/decrypt rely on —
     // confirm it also equals the ciphertext's actual gid_r by running
     // the real encrypt/decrypt and checking the recovered message.
-    const ct = ibe.encrypt(kp.mpk, id, message, sigma);
+    const ct = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
     try std.testing.expect(ct.u.x.eql(u.x));
-    const recovered = try ibe.decrypt(d_id, ct);
+    const recovered = try testDecrypt(ibe.Default, d_id, ct);
     try std.testing.expectEqualSlices(u8, &message, &recovered);
 }
 
@@ -236,10 +248,11 @@ test "pairing consistency: e(d_id, G2gen) == e(H1(id), mpk) — the Extract corr
     // verification against the beacon public key).
     var threaded = testIo();
     defer threaded.deinit();
-    const kp = ibe.setup(threaded.io());
+    var kp: ibe.KeyPair = undefined;
+    ibe.setup(&kp, threaded.io());
 
     const id = "alice@example.com";
-    const d_id = ibe.extract(kp.msk, id);
+    const d_id = testExtract(ibe.Default, kp.msk, id);
     const qid = ciphersuite.h1(id);
 
     // e(d_id, G2gen) == e(qid, mpk)  <=>  e(-d_id, G2gen) * e(qid, mpk) == 1
@@ -272,99 +285,106 @@ test "fp12Pow matches pairing bilinearity: e(P,Q)^r == e(rP,Q) (KAT, module-expo
 test "soundness: tampered U is rejected by the FO check" {
     var threaded = testIo();
     defer threaded.deinit();
-    const kp = ibe.setup(threaded.io());
+    var kp: ibe.KeyPair = undefined;
+    ibe.setup(&kp, threaded.io());
     const id = "alice@example.com";
-    const d_id = ibe.extract(kp.msk, id);
+    const d_id = testExtract(ibe.Default, kp.msk, id);
     const message = [_]u8{0x01} ** ibe.block_bytes;
     const sigma = [_]u8{0x02} ** ibe.block_bytes;
 
-    var ct = ibe.encrypt(kp.mpk, id, message, sigma);
+    var ct = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
     // Corrupt U by using a different point (the generator scaled by a
     // different, unrelated scalar) — still a valid G2 encoding, so this
     // exercises the FO check rather than the codec's format rejection.
     ct.u = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(Fr.one.add(Fr.one)).toAffine();
 
-    try std.testing.expectError(error.FoCheckFailed, ibe.decrypt(d_id, ct));
+    try std.testing.expectError(error.FoCheckFailed, testDecrypt(ibe.Default, d_id, ct));
 }
 
 test "soundness: tampered V is rejected by the FO check" {
     var threaded = testIo();
     defer threaded.deinit();
-    const kp = ibe.setup(threaded.io());
+    var kp: ibe.KeyPair = undefined;
+    ibe.setup(&kp, threaded.io());
     const id = "alice@example.com";
-    const d_id = ibe.extract(kp.msk, id);
+    const d_id = testExtract(ibe.Default, kp.msk, id);
     const message = [_]u8{0x01} ** ibe.block_bytes;
     const sigma = [_]u8{0x02} ** ibe.block_bytes;
 
-    var ct = ibe.encrypt(kp.mpk, id, message, sigma);
+    var ct = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
     ct.v[0] ^= 0xff;
 
-    try std.testing.expectError(error.FoCheckFailed, ibe.decrypt(d_id, ct));
+    try std.testing.expectError(error.FoCheckFailed, testDecrypt(ibe.Default, d_id, ct));
 }
 
 test "soundness: tampered W is rejected by the FO check" {
     var threaded = testIo();
     defer threaded.deinit();
-    const kp = ibe.setup(threaded.io());
+    var kp: ibe.KeyPair = undefined;
+    ibe.setup(&kp, threaded.io());
     const id = "alice@example.com";
-    const d_id = ibe.extract(kp.msk, id);
+    const d_id = testExtract(ibe.Default, kp.msk, id);
     const message = [_]u8{0x01} ** ibe.block_bytes;
     const sigma = [_]u8{0x02} ** ibe.block_bytes;
 
-    var ct = ibe.encrypt(kp.mpk, id, message, sigma);
+    var ct = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
     ct.w[0] ^= 0xff;
 
-    try std.testing.expectError(error.FoCheckFailed, ibe.decrypt(d_id, ct));
+    try std.testing.expectError(error.FoCheckFailed, testDecrypt(ibe.Default, d_id, ct));
 }
 
 test "soundness: a random G1 point as d_id is rejected (not the identity's real key)" {
     var threaded = testIo();
     defer threaded.deinit();
     const io = threaded.io();
-    const kp = ibe.setup(io);
+    var kp: ibe.KeyPair = undefined;
+    ibe.setup(&kp, io);
     const id = "alice@example.com";
     const message = [_]u8{0x01} ** ibe.block_bytes;
     const sigma = [_]u8{0x02} ** ibe.block_bytes;
-    const ct = ibe.encrypt(kp.mpk, id, message, sigma);
+    const ct = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
 
     // A random scalar multiple of H1(id) that is NOT msk*H1(id).
     const wrong_scalar = Fr.random(io);
     const qid = ciphersuite.h1(id);
     const wrong_d_id = g1.Jacobian.fromAffine(qid).scalarMul(wrong_scalar).toAffine();
 
-    try std.testing.expectError(error.FoCheckFailed, ibe.decrypt(wrong_d_id, ct));
+    try std.testing.expectError(error.FoCheckFailed, testDecrypt(ibe.Default, wrong_d_id, ct));
 }
 
 test "soundness: extract for id_A cannot decrypt a ciphertext encrypted to id_B" {
     var threaded = testIo();
     defer threaded.deinit();
-    const kp = ibe.setup(threaded.io());
+    var kp: ibe.KeyPair = undefined;
+    ibe.setup(&kp, threaded.io());
 
     const id_a = "alice@example.com";
     const id_b = "bob@example.com";
-    const d_id_a = ibe.extract(kp.msk, id_a);
+    const d_id_a = testExtract(ibe.Default, kp.msk, id_a);
 
     const message = [_]u8{0x77} ** ibe.block_bytes;
     const sigma = [_]u8{0x88} ** ibe.block_bytes;
-    const ct_for_b = ibe.encrypt(kp.mpk, id_b, message, sigma);
+    const ct_for_b = testEncrypt(ibe.Default, kp.mpk, id_b, message, sigma);
 
-    try std.testing.expectError(error.FoCheckFailed, ibe.decrypt(d_id_a, ct_for_b));
+    try std.testing.expectError(error.FoCheckFailed, testDecrypt(ibe.Default, d_id_a, ct_for_b));
 }
 
 test "soundness: a different PKG's msk (different setup) cannot extract a working key" {
     var threaded = testIo();
     defer threaded.deinit();
     const io = threaded.io();
-    const kp_real = ibe.setup(io);
-    const kp_other = ibe.setup(io);
+    var kp_real: ibe.KeyPair = undefined;
+    ibe.setup(&kp_real, io);
+    var kp_other: ibe.KeyPair = undefined;
+    ibe.setup(&kp_other, io);
 
     const id = "alice@example.com";
     const message = [_]u8{0x55} ** ibe.block_bytes;
     const sigma = [_]u8{0x66} ** ibe.block_bytes;
-    const ct = ibe.encrypt(kp_real.mpk, id, message, sigma);
+    const ct = testEncrypt(ibe.Default, kp_real.mpk, id, message, sigma);
 
-    const d_id_wrong_pkg = ibe.extract(kp_other.msk, id);
-    try std.testing.expectError(error.FoCheckFailed, ibe.decrypt(d_id_wrong_pkg, ct));
+    const d_id_wrong_pkg = testExtract(ibe.Default, kp_other.msk, id);
+    try std.testing.expectError(error.FoCheckFailed, testDecrypt(ibe.Default, d_id_wrong_pkg, ct));
 }
 
 // ── 5. drand-parameterised interop anchor (THE external oracle) ──────
@@ -550,7 +570,8 @@ test "drand anchor: the transcribed fixture constants are mutually consistent (n
 }
 
 test "drand anchor: ibe's own encrypt reproduces a genuine Go-tle ciphertext byte-exactly" {
-    const ct = DrandIbe.encrypt(
+    const ct = testEncrypt(
+        DrandIbe,
         quicknetTPubkey(),
         &interopIdentity(),
         hexBytes(16, interop_filekey_hex),
@@ -561,7 +582,7 @@ test "drand anchor: ibe's own encrypt reproduces a genuine Go-tle ciphertext byt
 
 test "drand anchor: ibe's own decrypt recovers the Go-tle file key byte-exactly" {
     const ct = try DrandIbe.Ciphertext.fromBytes(hexBytes(128, interop_ct_hex));
-    const filekey = try DrandIbe.decrypt(interopRoundSignature(), ct);
+    const filekey = try testDecrypt(DrandIbe, interopRoundSignature(), ct);
     try std.testing.expectEqualSlices(u8, &hexBytes(16, interop_filekey_hex), &filekey);
 }
 
@@ -572,7 +593,7 @@ test "drand anchor: the genuine fixture is rejected under a wrong private key (F
     // wrong file key.
     const ct = try DrandIbe.Ciphertext.fromBytes(hexBytes(128, interop_ct_hex));
     const wrong = g1.Jacobian.fromAffine(interopRoundSignature()).double().toAffine();
-    try std.testing.expectError(error.FoCheckFailed, DrandIbe.decrypt(wrong, ct));
+    try std.testing.expectError(error.FoCheckFailed, testDecrypt(DrandIbe, wrong, ct));
 }
 
 // ── fuzz: Ciphertext.fromBytes / decrypt on hostile ciphertext bytes ────
@@ -623,8 +644,8 @@ const CtCorpus = struct {
         const message = [_]u8{0xAB} ** ibe.block_bytes;
         const sigma = [_]u8{0x11} ** ibe.block_bytes;
         return .{
-            .d_id = ibe.extract(msk, id),
-            .bytes = ibe.encrypt(mpk, id, message, sigma).toBytes(),
+            .d_id = testExtract(ibe.Default, msk, id),
+            .bytes = testEncrypt(ibe.Default, mpk, id, message, sigma).toBytes(),
         };
     }
 
@@ -689,7 +710,7 @@ fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
     @memcpy(bytes[0..n], buf[0..n]);
 
     const corrupted = ibe.Ciphertext.fromBytes(bytes) catch return;
-    _ = ibe.decrypt(f.d_id, corrupted) catch return;
+    _ = testDecrypt(ibe.Default, f.d_id, corrupted) catch return;
 }
 
 test "fuzz: Ciphertext.fromBytes/decrypt never panics on corrupted ciphertext bytes" {
@@ -729,7 +750,7 @@ test "corpus: every ciphertext seed reaches fromBytes, and the outcomes are pinn
             continue;
         };
         parsed += 1;
-        _ = ibe.decrypt(f.d_id, ct) catch continue;
+        _ = testDecrypt(ibe.Default, f.d_id, ct) catch continue;
         decrypted += 1;
     }
     // Measured 2026-09-07. Before: 1 round, 1 input, 0 octets corrupted,
@@ -742,4 +763,20 @@ test "corpus: every ciphertext seed reaches fromBytes, and the outcomes are pinn
     try std.testing.expectEqual(@as(usize, 5), refused_by_decode); // seeds 1, 2, 3, 6 and 7
     try std.testing.expectEqual(@as(usize, 3), parsed); // seeds 0, 4 and 5
     try std.testing.expectEqual(@as(usize, 1), decrypted);
+}
+
+// Test helpers over the pointer/out-param API: tests compare values, library
+// code never returns a secret through the stack.
+fn testExtract(comptime S: type, msk: Fr, ident: []const u8) g1.Affine {
+    var d: g1.Affine = undefined;
+    S.extract(&d, &msk, ident);
+    return d;
+}
+fn testEncrypt(comptime S: type, mpk: g2.Affine, ident: []const u8, m: [S.block_bytes]u8, sigma: [S.block_bytes]u8) S.Ciphertext {
+    return S.encrypt(mpk, ident, &m, &sigma);
+}
+fn testDecrypt(comptime S: type, d_id: g1.Affine, ct: S.Ciphertext) ![S.block_bytes]u8 {
+    var out: [S.block_bytes]u8 = undefined;
+    try S.decrypt(&out, &d_id, ct);
+    return out;
 }

@@ -117,6 +117,7 @@
 const std = @import("std");
 const bls12_381 = @import("bls12_381");
 const ciphersuite = @import("ciphersuite.zig");
+const burn = @import("burn.zig");
 
 const g1 = bls12_381.g1;
 const g2 = bls12_381.g2;
@@ -155,10 +156,16 @@ pub const KeyPair = struct {
 /// comment), `mpk = msk · G2_generator`. This is the ONLY randomness
 /// `ibe`'s PKG-side API needs; `Extract` is fully deterministic given
 /// `msk`.
-pub fn setup(io: std.Io) KeyPair {
-    const msk = Fr.random(io);
-    const mpk = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(msk).toAffine();
-    return .{ .msk = msk, .mpk = mpk };
+///
+/// The key pair is written to `out`; the body runs one frame down and the
+/// stack it dirtied is zeroed after it (`burn.zig`).
+pub fn setup(out: *KeyPair, io: std.Io) void {
+    burn.run(burn.key_burn, void, setupBody, .{ out, io });
+}
+
+fn setupBody(out: *KeyPair, io: std.Io) void {
+    out.msk = Fr.random(io);
+    out.mpk = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(out.msk).toAffine();
 }
 
 // `extract`, `Ciphertext`, `encrypt` and `decrypt` are the four
@@ -344,9 +351,16 @@ pub fn Scheme(comptime cs: type) type {
         /// contacted the PKG; `Extract` reproduces the matching key on
         /// demand, exactly like `tlock`'s round-signature beacon
         /// publishes the same signature no matter when it's fetched).
-        pub fn extract(msk: Fr, id: []const u8) g1.Affine {
+        ///
+        /// `d_id` is a secret: written to `out`, never returned through the
+        /// stack.
+        pub fn extract(out: *g1.Affine, msk: *const Fr, id: []const u8) void {
+            burn.run(burn.key_burn, void, extractBody, .{ out, msk, id });
+        }
+
+        fn extractBody(out: *g1.Affine, msk: *const Fr, id: []const u8) void {
             const qid = cs.h1(id);
-            return g1.Jacobian.fromAffine(qid).scalarMul(msk).toAffine();
+            out.* = g1.Jacobian.fromAffine(qid).scalarMul(msk.*).toAffine();
         }
 
         /// The `(U, V, W)` BF-IBE ciphertext (Boneh-Franklin §4.2's
@@ -416,14 +430,22 @@ pub fn Scheme(comptime cs: type) type {
         /// `message.len`/`sigma.len` are both fixed to `block_bytes`
         /// (32 for the default instantiation — see
         /// `ciphersuite.block_bytes`'s doc comment).
-        pub fn encrypt(mpk: g2.Affine, id: []const u8, message: [cs.block_bytes]u8, sigma: [cs.block_bytes]u8) Self.Ciphertext {
+        ///
+        /// `message` and `sigma` are secrets, so they come in by pointer; the
+        /// body runs one frame down and the stack it dirtied (`r`, `Gid^r`,
+        /// both masks) is zeroed after it (`burn.zig`).
+        pub fn encrypt(mpk: g2.Affine, id: []const u8, message: *const [cs.block_bytes]u8, sigma: *const [cs.block_bytes]u8) Self.Ciphertext {
+            return burn.run(burn.crypt_burn, Self.Ciphertext, encryptBody, .{ mpk, id, message, sigma });
+        }
+
+        fn encryptBody(mpk: g2.Affine, id: []const u8, message: *const [cs.block_bytes]u8, sigma: *const [cs.block_bytes]u8) Self.Ciphertext {
             // Steps 1-2: identity -> Qid -> Gid. `pairing.pairing` takes
             // `(G1, G2)`.
             const qid = cs.h1(id);
             const gid = pairing.pairing(qid, mpk);
 
             // Step 4: r = H3(sigma, M) — the FO-transform binding scalar.
-            const r = cs.h3(&sigma, &message);
+            const r = cs.h3(sigma, message);
 
             // Step 5: U = r * G2_generator (constant-time scalarMul).
             const u = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r).toAffine();
@@ -440,7 +462,7 @@ pub fn Scheme(comptime cs: type) type {
             for (&v, sigma) |*b, s| b.* ^= s;
 
             // Step 8: W = M XOR H4(sigma).
-            var w = cs.h4(&sigma);
+            var w = cs.h4(sigma);
             for (&w, message) |*b, m| b.* ^= m;
 
             return .{ .u = u, .v = v, .w = w };
@@ -462,12 +484,23 @@ pub fn Scheme(comptime cs: type) type {
         /// which applies here unchanged). Returns
         /// `error.FoCheckFailed` (never a garbage `message`) if the
         /// recomputed `U' != ct.u` — the CCA-rejection path.
-        pub fn decrypt(d_id: g1.Affine, ct: Self.Ciphertext) DecryptError![cs.block_bytes]u8 {
+        ///
+        /// The plaintext is written to `out` (zeroed on error); `d_id` comes
+        /// in by pointer. The body runs one frame down and the stack it
+        /// dirtied is zeroed after it (`burn.zig`).
+        pub fn decrypt(out: *[cs.block_bytes]u8, d_id: *const g1.Affine, ct: Self.Ciphertext) DecryptError!void {
+            burn.run(burn.crypt_burn, DecryptError!void, decryptBody, .{ out, d_id, ct }) catch |e| {
+                std.crypto.secureZero(u8, out);
+                return e;
+            };
+        }
+
+        fn decryptBody(out: *[cs.block_bytes]u8, d_id: *const g1.Affine, ct: Self.Ciphertext) DecryptError!void {
             // Step 1: gid_r = e(d_id, U) — ONE pairing call reconstructs
             // encrypt's Gid^r by bilinearity (see the module doc
             // comment). The SAME canonical pairing representation
             // `encrypt` fed to h2 above.
-            const gid_r = pairing.pairing(d_id, ct.u);
+            const gid_r = pairing.pairing(d_id.*, ct.u);
 
             // Step 2: sigma = V XOR H2(gid_r). Purely internal scratch —
             // never returned — so it is wiped on every exit (success or
@@ -477,8 +510,9 @@ pub fn Scheme(comptime cs: type) type {
             defer std.crypto.secureZero(u8, &sigma);
 
             // Step 3: message = W XOR H4(sigma).
-            var message = cs.h4(&sigma);
-            for (&message, ct.w) |*b, x| b.* ^= x;
+            const message = out;
+            message.* = cs.h4(&sigma);
+            for (message, ct.w) |*b, x| b.* ^= x;
 
             // Step 4: FO/CCA consistency — recompute r' = H3(sigma,
             // message) and reject unless U == r' * G2_generator. Compare
@@ -490,14 +524,12 @@ pub fn Scheme(comptime cs: type) type {
             // wipe the (untrusted, about-to-be-discarded) recovered
             // `message` before returning the error instead of leaving it
             // sitting on the stack.
-            const r_check = cs.h3(&sigma, &message);
+            const r_check = cs.h3(&sigma, message);
             const u_check = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r_check).toAffine();
             if (!std.mem.eql(u8, &g2.toBytesCompressed(u_check), &g2.toBytesCompressed(ct.u))) {
-                std.crypto.secureZero(u8, &message);
+                std.crypto.secureZero(u8, message);
                 return error.FoCheckFailed;
             }
-
-            return message;
         }
     };
 }
@@ -557,7 +589,8 @@ fn testIo() std.Io.Threaded {
 test "setup produces mpk = msk * G2_generator" {
     var threaded = testIo();
     defer threaded.deinit();
-    const kp = setup(threaded.io());
+    var kp: KeyPair = undefined;
+    setup(&kp, threaded.io());
     const expected = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(kp.msk).toAffine();
     try std.testing.expect(kp.mpk.x.eql(expected.x));
     try std.testing.expect(kp.mpk.y.eql(expected.y));
@@ -567,15 +600,18 @@ test "setup draws distinct msk across calls (not a fixed constant)" {
     var threaded = testIo();
     defer threaded.deinit();
     const io = threaded.io();
-    const kp1 = setup(io);
-    const kp2 = setup(io);
+    var kp1: KeyPair = undefined;
+    setup(&kp1, io);
+    var kp2: KeyPair = undefined;
+    setup(&kp2, io);
     try std.testing.expect(!kp1.msk.eql(kp2.msk));
 }
 
 test "KeyPair.deinit zeroes msk but leaves mpk untouched" {
     var threaded = testIo();
     defer threaded.deinit();
-    var kp = setup(threaded.io());
+    var kp: KeyPair = undefined;
+    setup(&kp, threaded.io());
     const mpk_before = kp.mpk;
     try std.testing.expect(!kp.msk.eql(Fr.zero));
     kp.deinit();
@@ -587,17 +623,18 @@ test "KeyPair.deinit zeroes msk but leaves mpk untouched" {
 test "decrypt zeroes the recovered message on FO-check failure" {
     var threaded = testIo();
     defer threaded.deinit();
-    const kp = setup(threaded.io());
+    var kp: KeyPair = undefined;
+    setup(&kp, threaded.io());
     const id = "alice@example.com";
-    const d_id = extract(kp.msk, id);
+    const d_id = testExtract(Default, kp.msk, id);
 
     const message = [_]u8{0xAB} ** block_bytes;
     const sigma = [_]u8{0x11} ** block_bytes;
-    var ct = encrypt(kp.mpk, id, message, sigma);
+    var ct = testEncrypt(Default, kp.mpk, id, message, sigma);
     // Tamper with V so the recovered (sigma, message) no longer matches U.
     ct.v[0] ^= 0xFF;
 
-    try std.testing.expectError(error.FoCheckFailed, decrypt(d_id, ct));
+    try std.testing.expectError(error.FoCheckFailed, testDecrypt(Default, d_id, ct));
     // The function itself leaves no live copy of the garbage message behind
     // (verified indirectly: the reject path is exercised without panicking
     // or leaking a value — `decrypt`'s local `message`/`sigma` are wiped
@@ -607,9 +644,10 @@ test "decrypt zeroes the recovered message on FO-check failure" {
 test "extract is deterministic in (msk, id)" {
     var threaded = testIo();
     defer threaded.deinit();
-    const kp = setup(threaded.io());
-    const d1 = extract(kp.msk, "alice@example.com");
-    const d2 = extract(kp.msk, "alice@example.com");
+    var kp: KeyPair = undefined;
+    setup(&kp, threaded.io());
+    const d1 = testExtract(Default, kp.msk, "alice@example.com");
+    const d2 = testExtract(Default, kp.msk, "alice@example.com");
     try std.testing.expect(d1.x.eql(d2.x));
     try std.testing.expect(d1.y.eql(d2.y));
 }
@@ -617,17 +655,19 @@ test "extract is deterministic in (msk, id)" {
 test "extract yields distinct keys for distinct identities under the same msk" {
     var threaded = testIo();
     defer threaded.deinit();
-    const kp = setup(threaded.io());
-    const d_alice = extract(kp.msk, "alice@example.com");
-    const d_bob = extract(kp.msk, "bob@example.com");
+    var kp: KeyPair = undefined;
+    setup(&kp, threaded.io());
+    const d_alice = testExtract(Default, kp.msk, "alice@example.com");
+    const d_bob = testExtract(Default, kp.msk, "bob@example.com");
     try std.testing.expect(!d_alice.x.eql(d_bob.x));
 }
 
 test "extract yields a point on-curve and in the order-r G1 subgroup" {
     var threaded = testIo();
     defer threaded.deinit();
-    const kp = setup(threaded.io());
-    const d_id = extract(kp.msk, "alice@example.com");
+    var kp: KeyPair = undefined;
+    setup(&kp, threaded.io());
+    const d_id = testExtract(Default, kp.msk, "alice@example.com");
     try std.testing.expect(g1.Jacobian.fromAffine(d_id).isOnCurve());
     try std.testing.expect(g1.Jacobian.fromAffine(d_id).subgroupCheck());
 }
@@ -716,4 +756,20 @@ test "fp12Pow is multiplicative in the exponent: base^a * base^b == base^(a+b)" 
 
     const gt = pairing.pairing(g1.Affine.generator, g2.Affine.generator);
     try std.testing.expect(fp12Pow(gt, a).mul(fp12Pow(gt, b)).eql(fp12Pow(gt, ab)));
+}
+
+// Test helpers over the pointer/out-param API: tests compare values, library
+// code never returns a secret through the stack.
+fn testExtract(comptime S: type, msk: Fr, ident: []const u8) g1.Affine {
+    var d: g1.Affine = undefined;
+    S.extract(&d, &msk, ident);
+    return d;
+}
+fn testEncrypt(comptime S: type, mpk: g2.Affine, ident: []const u8, m: [S.block_bytes]u8, sigma: [S.block_bytes]u8) S.Ciphertext {
+    return S.encrypt(mpk, ident, &m, &sigma);
+}
+fn testDecrypt(comptime S: type, d_id: g1.Affine, ct: S.Ciphertext) ![S.block_bytes]u8 {
+    var out: [S.block_bytes]u8 = undefined;
+    try S.decrypt(&out, &d_id, ct);
+    return out;
 }

@@ -48,12 +48,16 @@ pub fn mergeFft(logn: u5, f0: []const f64, f1: []const f64, out: []f64) void {
 /// (`do_sign_dyn` semantics), so this is O(n) copying.
 pub fn buildTree(
     comptime Ring: type,
+    out: *Tree(Ring),
     f: *const [Ring.n]i8,
     g: *const [Ring.n]i8,
     big_f: *const [Ring.n]i8,
     big_g: *const [Ring.n]i8,
-) Tree(Ring) {
-    return .{ .f = f.*, .g = g.*, .big_f = big_f.*, .big_g = big_g.* };
+) void {
+    out.f = f.*;
+    out.g = g.*;
+    out.big_f = big_f.*;
+    out.big_g = big_g.*;
 }
 
 /// One drawn signature candidate (s1, s2) before the norm-bound check.
@@ -126,6 +130,9 @@ fn ffSamplingDyntree(
 /// (reference `crypto_sign`: `randombytes(seed,48)` after the nonce), from
 /// which the ChaCha20 signer PRNG is initialised via SHAKE256.
 ///
+/// The candidate is written into the caller's `out`: before the norm check it
+/// is a secret-dependent short vector, so it is not returned by value.
+///
 /// This performs ONE `do_sign_dyn` pass and always returns; the norm-bound
 /// accept/reject retry lives in `sign.signWithRng`. (The reference instead
 /// re-inits its PRNG from the same SHAKE context on reject; for Falcon-512/
@@ -139,7 +146,8 @@ pub fn sampleSignature(
     tree: *const Tree(Ring),
     c: *const Ring.Poly,
     rng: std.Random,
-) SignatureCandidate(Ring) {
+    out: *SignatureCandidate(Ring),
+) void {
     const n = Ring.n;
     const logn = Ring.logn;
 
@@ -257,7 +265,6 @@ pub fn sampleSignature(
     fft.ifftRaw(&t0, logn);
     fft.ifftRaw(&t1, logn);
 
-    var out: SignatureCandidate(Ring) = undefined;
     for (0..n) |u| {
         const z: i32 = @as(i32, c[u]) - @as(i32, @intCast(fpr.rint(t0[u])));
         out.s1[u] = @intCast(z);
@@ -265,7 +272,6 @@ pub fn sampleSignature(
     for (0..n) |u| {
         out.s2[u] = @intCast(-fpr.rint(t1[u]));
     }
-    return out;
 }
 
 test "Tree(Ring) instantiates for both parameter sets" {

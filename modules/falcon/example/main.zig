@@ -44,7 +44,10 @@ pub fn main() !void {
     var prng = std.Random.DefaultPrng.init(0x8f2a_1c73_55d0_9e41);
     const rng = prng.random();
 
-    const pair = falcon.generateKeyPair(rng) catch |err| switch (err) {
+    var signing_key: falcon.SigningKey = undefined;
+    defer signing_key.secureZero();
+    var public_key: falcon.PublicKey = undefined;
+    falcon.generateKeyPair(rng, &signing_key, &public_key) catch |err| switch (err) {
         // Keygen rejects a candidate `f` that is not invertible mod q and
         // normally retries internally; surfacing it means the draw was
         // pathological, and the caller's move is to draw again.
@@ -56,7 +59,7 @@ pub fn main() !void {
 
     // What goes into ROM: header byte + 14-bit-packed h. Fixed size, so a
     // device can reserve the slot at link time.
-    const rom_key: [falcon.PublicKey.encoded_length]u8 = pair.public_key.toBytes();
+    const rom_key: [falcon.PublicKey.encoded_length]u8 = public_key.toBytes();
     std.debug.print("public key: {d} bytes burned into ROM\n", .{rom_key.len});
 
     // ── build server: sign ───────────────────────────────────────────────
@@ -65,7 +68,7 @@ pub fn main() !void {
     // so the caller can size a static buffer.
     var nonce: [falcon.nonce_length]u8 = undefined;
     var sig_buf: [falcon.max_sig_field_length]u8 = undefined;
-    const sig_len = falcon.signRandomized(&pair.signing_key, manifest, rng, &nonce, &sig_buf) catch |err| switch (err) {
+    const sig_len = falcon.signRandomized(&signing_key, manifest, rng, &nonce, &sig_buf) catch |err| switch (err) {
         // Cannot happen with `max_sig_field_length`, but nameable from out
         // here, which is the point of this file.
         error.NoSpaceLeft => return err,
@@ -83,7 +86,7 @@ pub fn main() !void {
     // manifest instead.
     var second_nonce: [falcon.nonce_length]u8 = undefined;
     var second_buf: [falcon.max_sig_field_length]u8 = undefined;
-    const second_len = try falcon.signRandomized(&pair.signing_key, manifest, rng, &second_nonce, &second_buf);
+    const second_len = try falcon.signRandomized(&signing_key, manifest, rng, &second_nonce, &second_buf);
     if (std.mem.eql(u8, sig_field, second_buf[0..second_len])) return error.SigningWasDeterministic;
 
     // ── device: decode the ROM key ───────────────────────────────────────
@@ -135,8 +138,12 @@ pub fn main() !void {
     // produces one; the wire encoding deliberately omits the `G` half of the
     // basis, and nothing here recovers it. So an appliance that restarts has
     // to keep the generated key in memory for its whole life, or rotate.
-    const stored: [falcon.SecretKey.encoded_length]u8 = pair.signing_key.toSecretKeyBytes();
-    const reloaded = falcon.SecretKey.fromBytes(&stored) catch |err| switch (err) {
+    var stored: [falcon.SecretKey.encoded_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &stored);
+    signing_key.toSecretKeyBytes(&stored);
+    var reloaded: falcon.SecretKey = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&reloaded));
+    falcon.SecretKey.fromBytes(&reloaded, &stored) catch |err| switch (err) {
         error.InvalidSecretKey => {
             std.debug.print("stored private key is corrupt\n", .{});
             return;

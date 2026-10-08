@@ -165,7 +165,7 @@ fn readersHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
             if (!std.mem.eql(u8, once, twice)) return error.WriteNotIdempotent;
             if (intact and !std.mem.eql(u8, once, in)) return error.IntactNotReproduced;
             if (z.n_vars == witness.?.len) {
-                _ = zkprove.prove(gpa, z, witness.?, .{ .r = Fr.one, .s = Fr.one }) catch |e| switch (e) {
+                _ = zkprove.prove(gpa, z, witness.?, &.{ .r = Fr.one, .s = Fr.one }) catch |e| switch (e) {
                     error.OutOfMemory => return e,
                     else => {},
                 };

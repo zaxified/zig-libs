@@ -16,6 +16,7 @@
 //! kept for backward compatibility with existing Falcon-512 call sites.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 /// The Falcon modulus (shared by every parameter set).
 pub const q: u32 = 12289;
@@ -150,22 +151,33 @@ pub fn Ring(comptime logn_: u5) type {
             }
         }
 
-        /// Lift a small (signed byte) polynomial into [0, q).
-        pub fn fromSmall(src: *const [Self.n]i8) Self.Poly {
-            var out: Self.Poly = undefined;
-            for (&out, src) |*x, s| {
+        /// Lift a small (signed byte) polynomial into [0, q). `out` is the
+        /// caller's: a lifted secret polynomial is a secret, so it is not
+        /// returned by value.
+        pub fn fromSmall(out: *Self.Poly, src: *const [Self.n]i8) void {
+            for (out, src) |*x, s| {
                 const v: i32 = s;
                 x.* = @intCast(if (v < 0) v + @as(i32, q) else v);
             }
-            return out;
         }
 
         /// Recompute the public key h = g * f^-1 mod q (plain domain), as
         /// the reference `compute_public` does. Errors if f is not
         /// invertible.
+        ///
+        /// The secret-derived work (the lifted and NTT-domain f, g) runs one
+        /// frame down and the stack it dirtied is zeroed (`burn.zig`); the
+        /// result is public.
         pub fn computePublic(f: *const [Self.n]i8, g: *const [Self.n]i8) error{NotInvertible}!Self.Poly {
-            var hf = Self.fromSmall(f);
-            var hg = Self.fromSmall(g);
+            return burn.run(burn.by(logn_, burn.public_burn), error{NotInvertible}!Self.Poly, computePublicBody, .{ f, g });
+        }
+
+        fn computePublicBody(f: *const [Self.n]i8, g: *const [Self.n]i8) error{NotInvertible}!Self.Poly {
+            var hf: Self.Poly = undefined;
+            var hg: Self.Poly = undefined;
+            defer std.crypto.secureZero(u16, &hg);
+            Self.fromSmall(&hf, f);
+            Self.fromSmall(&hg, g);
             Self.ntt(&hf);
             Self.ntt(&hg);
             try Self.pointwiseDiv(&hf, &hg); // hf = hg * hf^-1

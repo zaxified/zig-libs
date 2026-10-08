@@ -89,17 +89,19 @@ pub fn main() !void {
     const mpk1 = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(msk1).toAffine();
 
     const alice_id = "alice@example.com";
-    const d_id_alice = ibe.extract(msk1, alice_id);
+    var d_id_alice: g1.Affine = undefined;
+    ibe.extract(&d_id_alice, &msk1, alice_id);
 
     const message1 = [_]u8{0xAB} ** 32; // stands in for a 256-bit symmetric key
     const sigma1 = [_]u8{0x11} ** 32; // production draws this via ciphersuite.randomSigma(io); fixed here for reproducibility
 
-    const ct1 = ibe.encrypt(mpk1, alice_id, message1, sigma1);
+    const ct1 = ibe.encrypt(mpk1, alice_id, &message1, &sigma1);
 
     // "Over the wire": a real recipient receives bytes, not a live struct.
     const wire1 = ct1.toBytes();
     const received1 = try ibe.Ciphertext.fromBytes(wire1);
-    const pt1 = try ibe.decrypt(d_id_alice, received1);
+    var pt1: [ibe.block_bytes]u8 = undefined;
+    try ibe.decrypt(&pt1, &d_id_alice, received1);
     must(std.mem.eql(u8, &pt1, &message1), @src());
     std.debug.print("round1: alice decrypted her message ({d} bytes)\n", .{pt1.len});
 
@@ -120,15 +122,19 @@ pub fn main() !void {
     // of cross-round state a single vector test never exercises. ───────
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
-    var kp2 = ibe.setup(io);
+    var kp2: ibe.KeyPair = undefined;
+    ibe.setup(&kp2, io);
     defer kp2.deinit(); // zeroes msk on scope exit
 
     const bob_id = "bob@example.com";
-    const d_id_bob2 = ibe.extract(kp2.msk, bob_id);
+    var d_id_bob2: g1.Affine = undefined;
+    ibe.extract(&d_id_bob2, &kp2.msk, bob_id);
     const message2 = [_]u8{0xCD} ** 32;
-    const sigma2 = ibe.ciphersuite.randomSigma(io); // the real production randomness path
-    const ct2 = ibe.encrypt(kp2.mpk, bob_id, message2, sigma2);
-    const pt2 = try ibe.decrypt(d_id_bob2, ct2);
+    var sigma2: [ibe.block_bytes]u8 = undefined;
+    ibe.ciphersuite.randomSigma(&sigma2, io); // the real production randomness path
+    const ct2 = ibe.encrypt(kp2.mpk, bob_id, &message2, &sigma2);
+    var pt2: [ibe.block_bytes]u8 = undefined;
+    try ibe.decrypt(&pt2, &d_id_bob2, ct2);
     must(std.mem.eql(u8, &pt2, &message2), @src());
     std.debug.print("round2 (new PKG epoch): bob decrypted his message ({d} bytes)\n", .{pt2.len});
 
@@ -140,8 +146,10 @@ pub fn main() !void {
     // (1) Wrong identity: Bob's round-1 key trying to open Alice's
     // round-1 ciphertext.
     {
-        const d_id_bob1 = ibe.extract(msk1, bob_id);
-        if (ibe.decrypt(d_id_bob1, received1)) |_| {
+        var d_id_bob1: g1.Affine = undefined;
+        ibe.extract(&d_id_bob1, &msk1, bob_id);
+        var junk: [ibe.block_bytes]u8 = undefined;
+        if (ibe.decrypt(&junk, &d_id_bob1, received1)) |_| {
             return error.UnexpectedAccept;
         } else |err| switch (err) {
             error.FoCheckFailed => std.debug.print("bob's key opening alice's ciphertext: FoCheckFailed (expected)\n", .{}),
@@ -153,7 +161,8 @@ pub fn main() !void {
     {
         var tampered = received1;
         tampered.w[0] ^= 0x01;
-        if (ibe.decrypt(d_id_alice, tampered)) |_| {
+        var junk: [ibe.block_bytes]u8 = undefined;
+        if (ibe.decrypt(&junk, &d_id_alice, tampered)) |_| {
             return error.UnexpectedAccept;
         } else |err| switch (err) {
             error.FoCheckFailed => std.debug.print("tampered ciphertext (correct key): FoCheckFailed (expected)\n", .{}),
@@ -165,8 +174,10 @@ pub fn main() !void {
     // reused across a PKG rotation must NOT let the new epoch read old
     // traffic.
     {
-        const d_id_alice2 = ibe.extract(kp2.msk, alice_id);
-        if (ibe.decrypt(d_id_alice2, received1)) |_| {
+        var d_id_alice2: g1.Affine = undefined;
+        ibe.extract(&d_id_alice2, &kp2.msk, alice_id);
+        var junk: [ibe.block_bytes]u8 = undefined;
+        if (ibe.decrypt(&junk, &d_id_alice2, received1)) |_| {
             return error.UnexpectedAccept;
         } else |err| switch (err) {
             error.FoCheckFailed => std.debug.print("post-rotation key opening pre-rotation ciphertext: FoCheckFailed (expected)\n", .{}),

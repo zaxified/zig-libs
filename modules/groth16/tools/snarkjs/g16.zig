@@ -65,11 +65,14 @@ pub fn main(init: std.process.Init) !void {
         defer z.deinit(gpa);
         const wbytes = try cwd.readFileAlloc(io, a[1], gpa, .limited(max_file));
         const w = try groth16.circom.parseWitness(gpa, wbytes);
+        std.crypto.secureZero(u8, wbytes);
         gpa.free(wbytes);
-        defer gpa.free(w);
+        defer groth16.circom.freeWitness(gpa, w);
         std.debug.print("load {d} ms (n_vars {d}, domain {d})\n", .{ t.untilNow(io, .awake).toMilliseconds(), z.n_vars, z.domain_size });
         t = std.Io.Timestamp.now(io, .awake);
-        const proof = try groth16.zkprove.prove(gpa, z, w, .{ .r = Fr.random(io), .s = Fr.random(io) });
+        var rand: groth16.Randomizers = .{ .r = Fr.random(io), .s = Fr.random(io) };
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&rand));
+        const proof = try groth16.zkprove.prove(gpa, z, w, &rand);
         std.debug.print("prove {d} ms\n", .{t.untilNow(io, .awake).toMilliseconds()});
         const pj = try groth16.snarkjs_export.proofJson(gpa, proof);
         defer gpa.free(pj);
@@ -104,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
         defer std.crypto.secureZero(u8, std.mem.asBytes(&x));
         defer std.crypto.secureZero(u8, std.mem.asBytes(&s));
         const t = std.Io.Timestamp.now(io, .awake);
-        try groth16.phase2.contribute(gpa, &z, x, s, a[2]);
+        try groth16.phase2.contribute(gpa, &z, &x, &s, a[2]);
         std.debug.print("contribute {d} ms\n", .{t.untilNow(io, .awake).toMilliseconds()});
         const out = try groth16.zkey.toBytes(gpa, z);
         defer gpa.free(out);

@@ -239,7 +239,7 @@ fn fixtureCiphertext() tlock.Ciphertext {
     const p_pub = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(fixtureSk()).toAffine();
     const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
     const sigma = [_]u8{0x11} ** ciphersuite.block_bytes;
-    return tlock.encrypt(p_pub, fixture_round, message, sigma);
+    return tlock.encrypt(p_pub, fixture_round, &message, &sigma);
 }
 
 const Target = enum { fp12pow, decrypt };
@@ -275,7 +275,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const message = secretBlock("ctgrind-tlock-harness-message-v1", tainted);
             const sigma = secretBlock("ctgrind-tlock-harness-sigma-v1", tainted);
 
-            const ct = tlock.encrypt(p_pub, round, message, sigma);
+            const ct = tlock.encrypt(p_pub, round, &message, &sigma);
             // Propagation witness: non-constant-time hex formatting of the
             // (tainted, if taint=yes) ciphertext bytes.
             std.debug.print("ct={x}\n", .{ct.toBytes()});
@@ -283,7 +283,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .decrypt => {
             const round_signature = secretRoundSignature(tainted);
             const ct = fixtureCiphertext();
-            if (tlock.decrypt(round_signature, ct)) |message| {
+            var message: [ciphersuite.block_bytes]u8 = undefined;
+            if (tlock.decrypt(&message, round_signature, ct)) |_| {
                 // The expected outcome: `round_signature` genuinely corresponds
                 // to `ct`'s identity (see `fixtureCiphertext`'s doc comment), so
                 // the FO check accepts and `message` — real tainted plaintext —

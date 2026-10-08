@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** follows tlock's pointer/out-param API
+  (`tlock.encrypt(…, &s_time, &sigma)`, `tlock.decrypt(&s_time, …)`, `PayloadStream.init(&ps,
+  &key)`); the derived stream key is now held in a wiped local instead of a by-value temporary.
+  This module's own dead-stack sweep (SealRandomness by value, s_pq, the content/stream key
+  derivation) is SPEC backlog.
 - **2026-10-06** — **ADDED (new wire version, version 1 unchanged):** a streaming format for
   payloads of any size in bounded memory: `Envelope(Kem).sealStream(gpa, writer, reader, ek,
   p_pub, round, rnd)` / `.openStream(gpa, writer, reader, dk, round_signature)` over

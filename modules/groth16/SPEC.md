@@ -376,7 +376,28 @@ from a header count. Second run: 160 000 inputs clean in 74 s.
 
 **How it got there.** 2026-08-02: snarkjs judged this module's toy-setup proof (`snarkjs_kat_test.zig`). 2026-10-02 (A8): the file formats were established black-box (§ 4a), then checked both directions — our prover on snarkjs keys, snarkjs's prover on our keys (`newZkey` and after `contribute`), at 10 000 constraints as well as on the committed fixture. Mutation 2026-10-02: 49 mutants over the new code, 46 killed; two equivalent (the small-MSM threshold changes only speed; the B₂ size check before allocation is unreachable because sections 5 and 6 pin `n_vars` first) and one undecided (`verify`'s G2 subgroup check on δ₂: the off-subgroup point we can build fails the δ same-ratio check anyway — kept as defence in depth). The run asked for 24 tests, all added.
 
+**7. Secrets leave nothing on the dead stack (2026-10-09).** `prover.setup`,
+`prover.prove`, `zkprove.prove`, `phase2.contribute` and `circom.parseWitness` take
+their secrets by pointer (`*const ToxicWaste`, `*const Randomizers`, `*const Fr`),
+run their bodies one frame down and zero the stack that body dirtied
+(`src/burn.zig`); `msm.pippengerG1/G2` wipe their limb and bucket scratch before
+freeing it. `src/stackprobe_test.zig` (ReleaseFast only) pins it: toxic waste and
+everything derived from it, the witness, `r`, `s`, `r·s`, the QAP evaluations and
+quotient and the `r·δ`/`s·δ`/`r·s·δ` points as needles — 0 residues, with a negative
+and a positive control in the same binary. The caller's own copies (the `Randomizers`
+and `ToxicWaste` variables, the witness vector) are the caller's to wipe;
+`circom.freeWitness` does it for the `parseWitness` result. Out of reach: the `.wtns`
+and `.zkey` file bytes the caller read in.
+
 ## Backlog / deferred
+
+0. **Secret hygiene beyond the five entry points** (sweep 2026-10-09): the helpers
+   that take a witness slice and run in the caller's frames — `r1cs.System.isSatisfied`/
+   `evalConstraint`, `qap.checkDivisible`, `msm.msmG1/G2`, `circom.writeWitness` — are
+   not burned (a consumer that calls them on a real witness should do its own
+   `burn.run`-style wrapper); `Fr.random` (bn254) returns the scalar by value, so
+   `Randomizers` built from it leave a copy in the caller's frame (bn254 backlog:
+   `Fr.randomInto(out, io)`); `phase2.newZkey` handles public data only.
 
 Re-ranked by the 2026-10-05 re-survey. Missing and it matters, most-hit first:
 

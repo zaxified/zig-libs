@@ -54,6 +54,7 @@ const chachapoly = @import("chachapoly");
 const entropy = @import("entropy");
 const bls12_381 = @import("bls12_381");
 const tlock_mod = @import("tlock.zig");
+const burn = @import("burn.zig");
 
 const g1 = bls12_381.g1;
 const g2 = bls12_381.g2;
@@ -304,7 +305,9 @@ fn chunkNonce(counter: u64, last: bool) [Aead.nonce_length]u8 {
 
 /// Sealed size of a `len`-byte plaintext (one tag per chunk, at least one chunk).
 pub fn sealedLen(len: usize) usize {
-    const chunks = @max(1, std.math.divCeil(usize, len, chunk_bytes) catch unreachable);
+    // `usize`, not inferred: at comptime `@max` narrows to the smallest type
+    // holding both values (`u1` for one chunk) and the multiply overflowed.
+    const chunks: usize = @max(1, std.math.divCeil(usize, len, chunk_bytes) catch unreachable);
     return len + chunks * tag_bytes;
 }
 
@@ -337,8 +340,10 @@ pub const PayloadStream = struct {
     counter: u64 = 0,
     finished: bool = false,
 
-    pub fn init(key: [Aead.key_length]u8) PayloadStream {
-        return .{ .key = key };
+    /// Into `out`: the stream holds the key, so returning one by value
+    /// would leave a copy of the key in the caller's frame.
+    pub fn init(out: *PayloadStream, key: *const [Aead.key_length]u8) void {
+        out.* = .{ .key = key.* };
     }
 
     /// Seal one chunk: `out.len == plaintext.len + tag_bytes`.
@@ -379,9 +384,15 @@ pub const PayloadStream = struct {
 
 /// The whole STREAM payload (nonce excluded) of `plaintext` under `key`:
 /// `out.len == sealedLen(plaintext.len)`.
-pub fn sealPayload(out: []u8, key: [Aead.key_length]u8, plaintext: []const u8) void {
+/// The body runs one frame down and is burned after (`burn.zig`).
+pub fn sealPayload(out: []u8, key: *const [Aead.key_length]u8, plaintext: []const u8) void {
+    burn.run(burn.payload_burn, void, sealPayloadBody, .{ out, key, plaintext });
+}
+
+fn sealPayloadBody(out: []u8, key: *const [Aead.key_length]u8, plaintext: []const u8) void {
     std.debug.assert(out.len == sealedLen(plaintext.len));
-    var stream = PayloadStream.init(key);
+    var stream: PayloadStream = undefined;
+    stream.init(key);
     defer stream.wipe();
     var in_off: usize = 0;
     var out_off: usize = 0;
@@ -397,9 +408,15 @@ pub fn sealPayload(out: []u8, key: [Aead.key_length]u8, plaintext: []const u8) v
 
 /// Open a whole STREAM payload (nonce excluded): `out.len ==
 /// try openedLen(sealed.len)`. On failure every byte already written is wiped.
-pub fn openPayload(out: []u8, key: [Aead.key_length]u8, sealed: []const u8) error{ MalformedPayload, PayloadAuthenticationFailed }!void {
+/// The body runs one frame down and is burned after (`burn.zig`).
+pub fn openPayload(out: []u8, key: *const [Aead.key_length]u8, sealed: []const u8) error{ MalformedPayload, PayloadAuthenticationFailed }!void {
+    return burn.run(burn.payload_burn, error{ MalformedPayload, PayloadAuthenticationFailed }!void, openPayloadBody, .{ out, key, sealed });
+}
+
+fn openPayloadBody(out: []u8, key: *const [Aead.key_length]u8, sealed: []const u8) error{ MalformedPayload, PayloadAuthenticationFailed }!void {
     std.debug.assert(out.len == try openedLen(sealed.len));
-    var stream = PayloadStream.init(key);
+    var stream: PayloadStream = undefined;
+    stream.init(key);
     defer stream.wipe();
     var in_off: usize = 0;
     var out_off: usize = 0;
@@ -427,13 +444,17 @@ pub const Randomness = struct {
     sigma: [tlock_mod.block_bytes]u8,
     nonce: [nonce_bytes]u8,
 
-    /// Production: all three from `entropy.fill` (fail-closed CSPRNG).
-    pub fn draw(io: std.Io) Randomness {
-        var r: Randomness = undefined;
-        entropy.fill(io, &r.file_key);
-        entropy.fill(io, &r.sigma);
-        entropy.fill(io, &r.nonce);
-        return r;
+    /// Production: all three from `entropy.fill` (fail-closed CSPRNG),
+    /// drawn straight into `out` (the file key and sigma are secrets).
+    pub fn draw(out: *Randomness, io: std.Io) void {
+        entropy.fill(io, &out.file_key);
+        entropy.fill(io, &out.sigma);
+        entropy.fill(io, &out.nonce);
+    }
+
+    /// Zero the secrets (`file_key`, `sigma`) once the file is written.
+    pub fn wipe(self: *Randomness) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
     }
 };
 
@@ -463,11 +484,19 @@ pub fn encrypt(
     p_pub: g2.Affine,
     round: u64,
     chain_hash: [chain_hash_bytes]u8,
-    rnd: Randomness,
+    rnd: *const Randomness,
 ) error{NoSpaceLeft}![]u8 {
     const total = encryptedLen(round, plaintext.len);
     if (out.len < total) return error.NoSpaceLeft;
-    const ct = tlock_mod.encrypt(p_pub, round, rnd.file_key, rnd.sigma).toBytes();
+    // The body runs one frame down and is burned after (`burn.zig`): it holds
+    // the file key, the header-MAC and payload keys.
+    burn.run(burn.crypt_burn, void, encryptBody, .{ out[0..total], plaintext, p_pub, round, chain_hash, rnd });
+    return out[0..total];
+}
+
+fn encryptBody(out: []u8, plaintext: []const u8, p_pub: g2.Affine, round: u64, chain_hash: [chain_hash_bytes]u8, rnd: *const Randomness) void {
+    const total = out.len;
+    const ct = tlock_mod.encrypt(p_pub, round, &rnd.file_key, &rnd.sigma).toBytes();
 
     var w: std.Io.Writer = .fixed(out[0..total]);
     const chain_hex = std.fmt.bytesToHex(chain_hash, .lower);
@@ -489,8 +518,7 @@ pub fn encrypt(
 
     var key = payloadKey(rnd.file_key, rnd.nonce);
     defer std.crypto.secureZero(u8, &key);
-    sealPayload(out[w.end..total], key, plaintext);
-    return out[0..total];
+    sealPayloadBody(out[w.end..total], &key, plaintext);
 }
 
 pub const EncryptOptions = struct {
@@ -505,7 +533,7 @@ pub fn encryptAlloc(
     p_pub: g2.Affine,
     round: u64,
     chain_hash: [chain_hash_bytes]u8,
-    rnd: Randomness,
+    rnd: *const Randomness,
     opts: EncryptOptions,
 ) error{OutOfMemory}![]u8 {
     const bin = try gpa.alloc(u8, encryptedLen(round, plaintext.len));
@@ -536,7 +564,13 @@ pub fn decryptedLen(file: []const u8) DecryptError!usize {
 /// round its `tlock` stanza names (`Header.parse(file).recipient.round`).
 /// Order: header syntax, chain hash, stanza (FO check), header MAC, then the
 /// payload chunk by chunk. Returns `out[0..decryptedLen(file)]`.
+///
+/// The key schedule runs one frame down and is burned after (`burn.zig`).
 pub fn decrypt(out: []u8, file: []const u8, round_signature: g1.Affine, opts: DecryptOptions) DecryptError![]u8 {
+    return burn.run(burn.crypt_burn, DecryptError![]u8, decryptBody, .{ out, file, round_signature, opts });
+}
+
+fn decryptBody(out: []u8, file: []const u8, round_signature: g1.Affine, opts: DecryptOptions) DecryptError![]u8 {
     const h = try Header.parse(file);
     if (opts.chain_hash) |want| {
         if (!std.mem.eql(u8, &want, &h.recipient.chain_hash)) return error.WrongChainHash;
@@ -546,14 +580,15 @@ pub fn decrypt(out: []u8, file: []const u8, round_signature: g1.Affine, opts: De
     const n = try openedLen(sealed.len);
     if (out.len < n) return error.NoSpaceLeft;
 
-    var file_key = try tlock_mod.decrypt(round_signature, h.recipient.ciphertext);
+    var file_key: [file_key_bytes]u8 = undefined;
+    try tlock_mod.decrypt(&file_key, round_signature, h.recipient.ciphertext);
     defer std.crypto.secureZero(u8, &file_key);
     const mac = headerMac(file_key, file[0..h.mac_input_len]);
     if (!std.crypto.timing_safe.eql([mac_bytes]u8, mac, h.mac)) return error.HeaderMacMismatch;
 
     var key = payloadKey(file_key, file[h.len..][0..nonce_bytes].*);
     defer std.crypto.secureZero(u8, &key);
-    try openPayload(out[0..n], key, sealed);
+    try openPayloadBody(out[0..n], &key, sealed);
     return out[0..n];
 }
 
@@ -709,7 +744,7 @@ fn roundTrip(len: usize, armored: bool) !void {
     defer gpa.free(pt);
     for (pt, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
 
-    const file = try encryptAlloc(gpa, pt, pub1000(), 1000, quicknet_chain, fixed_rnd, .{ .armor = armored });
+    const file = try encryptAlloc(gpa, pt, pub1000(), 1000, quicknet_chain, &fixed_rnd, .{ .armor = armored });
     defer gpa.free(file);
     try testing.expectEqual(armored, isArmored(file));
 
@@ -722,7 +757,7 @@ test "age: tlock stanza body is the genuine tle fixture's 128 bytes (EXTERNAL), 
     const p_pub = try g2.fromBytesCompressed(hexBytes(96, qt_pub));
     const rnd: Randomness = .{ .file_key = hexBytes(16, qt_file_key), .sigma = hexBytes(16, qt_sigma), .nonce = [_]u8{0} ** 16 };
     var buf: [1024]u8 = undefined;
-    const file = try encrypt(&buf, "lorem", p_pub, qt_round, hexBytes(32, qt_chain_hex), rnd);
+    const file = try encrypt(&buf, "lorem", p_pub, qt_round, hexBytes(32, qt_chain_hex), &rnd);
 
     // The stanza line and body exactly as the age grammar and `tle` lay them out.
     const want_body = hexBytes(128, qt_stanza_body);
@@ -776,7 +811,7 @@ test "age: STREAM nonce layout — 11-byte big-endian counter, then the last-chu
 test "age: payload tampering, truncation and extension are all refused, and nothing leaks" {
     const gpa = testing.allocator;
     const pt = [_]u8{0xab} ** (chunk_bytes + 100);
-    const file = try encryptAlloc(gpa, &pt, pub1000(), 1000, quicknet_chain, fixed_rnd, .{});
+    const file = try encryptAlloc(gpa, &pt, pub1000(), 1000, quicknet_chain, &fixed_rnd, .{});
     defer gpa.free(file);
     const out = try gpa.alloc(u8, file.len);
     defer gpa.free(out);
@@ -808,7 +843,7 @@ test "age: payload tampering, truncation and extension are all refused, and noth
 
 test "age: header MAC binds every header byte; wrong signature and wrong chain are refused" {
     const gpa = testing.allocator;
-    const file = try encryptAlloc(gpa, "secret", pub1000(), 1000, quicknet_chain, fixed_rnd, .{});
+    const file = try encryptAlloc(gpa, "secret", pub1000(), 1000, quicknet_chain, &fixed_rnd, .{});
     defer gpa.free(file);
     var out: [64]u8 = undefined;
 
@@ -942,16 +977,18 @@ test "age: dearmor accepts surrounding whitespace and CRLF, refuses everything e
 
 test "age: encrypt is deterministic under fixed randomness, and draw() really varies" {
     const gpa = testing.allocator;
-    const a = try encryptAlloc(gpa, "x", pub1000(), 1000, quicknet_chain, fixed_rnd, .{});
+    const a = try encryptAlloc(gpa, "x", pub1000(), 1000, quicknet_chain, &fixed_rnd, .{});
     defer gpa.free(a);
-    const b = try encryptAlloc(gpa, "x", pub1000(), 1000, quicknet_chain, fixed_rnd, .{});
+    const b = try encryptAlloc(gpa, "x", pub1000(), 1000, quicknet_chain, &fixed_rnd, .{});
     defer gpa.free(b);
     try testing.expectEqualSlices(u8, a, b);
 
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
-    const r1 = Randomness.draw(threaded.io());
-    const r2 = Randomness.draw(threaded.io());
+    var r1: Randomness = undefined;
+    r1.draw(threaded.io());
+    var r2: Randomness = undefined;
+    r2.draw(threaded.io());
     try testing.expect(!std.mem.eql(u8, &r1.file_key, &r2.file_key));
     try testing.expect(!std.mem.eql(u8, &r1.nonce, &r2.nonce));
     try testing.expect(!std.mem.eql(u8, &r1.sigma, &r2.sigma));
@@ -961,7 +998,7 @@ test "age: encrypt is deterministic under fixed randomness, and draw() really va
 test "age: inspectAlloc reads the round from binary and armored files" {
     const gpa = testing.allocator;
     for ([_]bool{ false, true }) |arm| {
-        const f = try encryptAlloc(gpa, "abc", pub1000(), 1000, quicknet_chain, fixed_rnd, .{ .armor = arm });
+        const f = try encryptAlloc(gpa, "abc", pub1000(), 1000, quicknet_chain, &fixed_rnd, .{ .armor = arm });
         defer gpa.free(f);
         const r = try inspectAlloc(gpa, f);
         try testing.expectEqual(@as(u64, 1000), r.round);
@@ -997,7 +1034,7 @@ fn fuzzDecoders(_: void, smith: *std.testing.Smith) !void {
     _ = dearmor(&out, input) catch {};
     const key = [_]u8{7} ** 32;
     if (openedLen(input.len)) |m| {
-        openPayload(out[0..m], key, input) catch {};
+        openPayload(out[0..m], &key, input) catch {};
     } else |_| {}
 }
 
@@ -1024,7 +1061,8 @@ test "corpus: the age fuzz seeds reach past the first check" {
 
 test "PayloadStream.openChunk refuses every chunk-shape violation before touching the AEAD" {
     const key = [_]u8{0x42} ** Aead.key_length;
-    var sealer = PayloadStream.init(key);
+    var sealer: PayloadStream = undefined;
+    sealer.init(&key);
     var full: [sealed_chunk_bytes]u8 = undefined;
     const pt = [_]u8{0x07} ** chunk_bytes;
     sealer.sealChunk(&full, &pt, false);
@@ -1033,7 +1071,8 @@ test "PayloadStream.openChunk refuses every chunk-shape violation before touchin
 
     var out: [chunk_bytes]u8 = undefined;
     // A short non-last chunk.
-    var o = PayloadStream.init(key);
+    var o: PayloadStream = undefined;
+    o.init(&key);
     try std.testing.expectError(error.MalformedPayload, o.openChunk(out[0 .. chunk_bytes - 1], full[0 .. sealed_chunk_bytes - 1], false));
     // Shorter than a tag.
     try std.testing.expectError(error.MalformedPayload, o.openChunk(out[0..0], full[0 .. tag_bytes - 1], true));
@@ -1044,14 +1083,17 @@ test "PayloadStream.openChunk refuses every chunk-shape violation before touchin
     try std.testing.expectEqualSlices(u8, &pt, &out);
     try std.testing.expectError(error.MalformedPayload, o.openChunk(out[0..0], &tail, true));
     // Nothing after the last chunk.
-    var e = PayloadStream.init(key);
+    var e: PayloadStream = undefined;
+    e.init(&key);
     var empty: [tag_bytes]u8 = undefined;
-    var es = PayloadStream.init(key);
+    var es: PayloadStream = undefined;
+    es.init(&key);
     es.sealChunk(&empty, "", true);
     try e.openChunk(out[0..0], &empty, true);
     try std.testing.expectError(error.MalformedPayload, e.openChunk(out[0..0], &empty, true));
     // The last flag is authenticated: a full chunk sealed as non-last does
     // not open as the last one (truncation at a chunk boundary).
-    var t = PayloadStream.init(key);
+    var t: PayloadStream = undefined;
+    t.init(&key);
     try std.testing.expectError(error.PayloadAuthenticationFailed, t.openChunk(&out, &full, true));
 }

@@ -121,9 +121,12 @@ fn powm(base: u32, exp: u32) u32 {
 }
 
 fn computeG(comptime Ring: type, f: *const [Ring.n]i8, g: *const [Ring.n]i8, big_f: *const [Ring.n]i8) ![Ring.n]i8 {
-    var ff = Ring.fromSmall(f);
-    var gg = Ring.fromSmall(g);
-    var ff2 = Ring.fromSmall(big_f);
+    var ff: Ring.Poly = undefined;
+    var gg: Ring.Poly = undefined;
+    var ff2: Ring.Poly = undefined;
+    Ring.fromSmall(&ff, f);
+    Ring.fromSmall(&gg, g);
+    Ring.fromSmall(&ff2, big_f);
     Ring.ntt(&ff);
     Ring.ntt(&gg);
     Ring.ntt(&ff2);
@@ -183,13 +186,13 @@ fn runVector(comptime Ring: type, comptime Codec: type, comptime Signer: type, s
     drbg.bytes(rng_stream[falcon.nonce_length..]); // sign seed (48)
 
     // Decode the secret basis and recover G.
-    const dsk = if (Ring.logn == 9)
-        try falcon.SecretKey.fromBytes(sk[0..falcon.SecretKey.encoded_length])
-    else
-        try falcon.SecretKey1024.fromBytes(sk[0..falcon.SecretKey1024.encoded_length]);
+    const SK = if (Ring.logn == 9) falcon.SecretKey else falcon.SecretKey1024;
+    var dsk: SK = undefined;
+    try SK.fromBytes(&dsk, sk[0..SK.encoded_length]);
     const big_g = try computeG(Ring, &dsk.f, &dsk.g, &dsk.big_f);
 
-    const tree = falcon.ffsampling.buildTree(Ring, &dsk.f, &dsk.g, &dsk.big_f, &big_g);
+    var tree: falcon.ffsampling.Tree(Ring) = undefined;
+    falcon.ffsampling.buildTree(Ring, &tree, &dsk.f, &dsk.g, &dsk.big_f, &big_g);
 
     // Sign with the replayed randomness.
     var fixed = FixedRng{ .buf = &rng_stream };
@@ -234,9 +237,11 @@ fn signVerifyRoundTrip(
     const gpa = std.testing.allocator;
     const sk = try hexAlloc(gpa, vec.sk);
     defer gpa.free(sk);
-    const dsk = try SecretKey.fromBytes(sk[0..SecretKey.encoded_length]);
+    var dsk: SecretKey = undefined;
+    try SecretKey.fromBytes(&dsk, sk[0..SecretKey.encoded_length]);
     const big_g = try computeG(Ring, &dsk.f, &dsk.g, &dsk.big_f);
-    const tree = falcon.ffsampling.buildTree(Ring, &dsk.f, &dsk.g, &dsk.big_f, &big_g);
+    var tree: falcon.ffsampling.Tree(Ring) = undefined;
+    falcon.ffsampling.buildTree(Ring, &tree, &dsk.f, &dsk.g, &dsk.big_f, &big_g);
     const pk: PublicKey = try dsk.publicKey();
 
     var prng = std.Random.DefaultPrng.init(0xfa1c04);

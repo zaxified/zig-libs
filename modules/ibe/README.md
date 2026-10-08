@@ -52,21 +52,28 @@ const ibe = @import("ibe");
 ```zig
 // Setup: generate a fresh PKG keypair. msk MUST stay secret (whoever
 // holds it can extract a private key for ANY identity).
-const kp = ibe.setup(io); // kp.msk: Fr, kp.mpk: g2.Affine
+// Secrets (msk, d_id, sigma, the plaintext) are written in place and passed
+// by pointer, never returned through the stack.
+var kp: ibe.KeyPair = undefined;
+ibe.setup(&kp, io); // kp.msk: Fr, kp.mpk: g2.Affine
+defer kp.deinit();
 
 // Extract: derive an identity's private key. Deterministic in (msk, id).
-const d_id = ibe.extract(kp.msk, "alice@example.com"); // g1.Affine
+var d_id: g1.Affine = undefined;
+ibe.extract(&d_id, &kp.msk, "alice@example.com");
 
 // Encrypt: anyone with mpk can encrypt to any identity string, even
 // before that identity has ever contacted the PKG.
 // message/sigma: fixed 32-byte blocks (ibe.block_bytes) — wide enough
 // to carry a 256-bit symmetric key directly (KEM-then-DEM for larger
 // payloads).
-const sigma = ibe.ciphersuite.randomSigma(io); // production entropy
-const ct = ibe.encrypt(kp.mpk, "alice@example.com", message, sigma);
+var sigma: [ibe.block_bytes]u8 = undefined;
+ibe.ciphersuite.randomSigma(&sigma, io); // production entropy
+const ct = ibe.encrypt(kp.mpk, "alice@example.com", &message, &sigma);
 
 // Decrypt: only the identity's private key can recover the message.
-const plaintext = try ibe.decrypt(d_id, ct);
+var plaintext: [ibe.block_bytes]u8 = undefined;
+try ibe.decrypt(&plaintext, &d_id, ct);
 // Returns error.FoCheckFailed (never a garbage plaintext) if the
 // ciphertext was tampered with or d_id doesn't match the identity ct
 // was encrypted under.
@@ -84,7 +91,8 @@ read from `std.Io` inside `encrypt` itself — mirroring `tlock`/`bbs`/
 
 ```zig
 // Real entropy (production):
-const sigma = ibe.ciphersuite.randomSigma(io);
+var sigma: [ibe.block_bytes]u8 = undefined;
+ibe.ciphersuite.randomSigma(&sigma, io);
 
 // A fixed value (KAT reproducibility / deterministic ciphertext pinning):
 const sigma = [_]u8{0x11} ** ibe.block_bytes;

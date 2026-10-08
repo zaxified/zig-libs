@@ -137,6 +137,7 @@ test {
     _ = tlock_mod;
     _ = age;
     _ = kat_test;
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names drand/tlock and drand/kyber" {

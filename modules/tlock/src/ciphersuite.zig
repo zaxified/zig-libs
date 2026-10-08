@@ -283,10 +283,10 @@ pub fn h4(comptime len: usize, sigma: []const u8) [len]u8 {
 /// unlocks a timelock ciphertext before its round, which is the one
 /// property the whole construction sells. Nothing in this signature can
 /// return an error, so the draw either succeeds or aborts.
-pub fn randomSigma(io: std.Io) [block_bytes]u8 {
-    var buf: [block_bytes]u8 = undefined;
-    entropy.fill(io, &buf);
-    return buf;
+pub fn randomSigma(out: *[block_bytes]u8, io: std.Io) void {
+    // Drawn straight into `out`: a returned copy would be one more secret
+    // left in the caller's frame.
+    entropy.fill(io, out);
 }
 
 pub const meta_deps_note = "bls12_381"; // see root.zig's meta.deps

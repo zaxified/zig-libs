@@ -78,7 +78,8 @@ test "NIST Round-3 KAT: secret key decodes and reproduces the public key" {
         const d = try Decoded.init(gpa, vec);
         defer d.deinit(gpa);
 
-        const sk = try falcon.SecretKey.fromBytes(d.sk_bytes[0..1281]);
+        var sk: falcon.SecretKey = undefined;
+        try falcon.SecretKey.fromBytes(&sk, d.sk_bytes[0..1281]);
         const pk_from_sk = try sk.publicKey();
         const pk = try falcon.PublicKey.fromBytes(d.pk_bytes[0..897]);
         try std.testing.expectEqualSlices(u16, &pk.h, &pk_from_sk.h);
@@ -198,10 +199,13 @@ test "bad key headers are rejected" {
         falcon.PublicKey.fromBytes(d.pk_bytes[0..897]),
     );
     d.sk_bytes[0] = 0x5a;
+    var sk: falcon.SecretKey = undefined;
     try std.testing.expectError(
         error.InvalidSecretKey,
-        falcon.SecretKey.fromBytes(d.sk_bytes[0..1281]),
+        falcon.SecretKey.fromBytes(&sk, d.sk_bytes[0..1281]),
     );
+    // zeroed on error
+    try std.testing.expect(std.mem.allEqual(i8, &sk.f, 0));
 }
 
 // ---- Falcon-1024: the same battery against falcon1024-KAT.rsp. ----
@@ -248,7 +252,8 @@ test "NIST Round-3 KAT (1024): secret key decodes and reproduces the public key"
         const d = try Decoded.init(gpa, vec);
         defer d.deinit(gpa);
 
-        const sk = try falcon.SecretKey1024.fromBytes(d.sk_bytes[0..sk1024_len]);
+        var sk: falcon.SecretKey1024 = undefined;
+        try falcon.SecretKey1024.fromBytes(&sk, d.sk_bytes[0..sk1024_len]);
         const pk_from_sk = try sk.publicKey();
         const pk = try falcon.PublicKey1024.fromBytes(d.pk_bytes[0..pk1024_len]);
         try std.testing.expectEqualSlices(u16, &pk.h, &pk_from_sk.h);
@@ -368,9 +373,10 @@ test "bad key headers are rejected (1024)" {
         falcon.PublicKey1024.fromBytes(d.pk_bytes[0..pk1024_len]),
     );
     d.sk_bytes[0] = 0x59;
+    var sk: falcon.SecretKey1024 = undefined;
     try std.testing.expectError(
         error.InvalidSecretKey,
-        falcon.SecretKey1024.fromBytes(d.sk_bytes[0..sk1024_len]),
+        falcon.SecretKey1024.fromBytes(&sk, d.sk_bytes[0..sk1024_len]),
     );
 }
 

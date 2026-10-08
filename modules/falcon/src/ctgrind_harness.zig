@@ -126,7 +126,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var prng = std.Random.DefaultPrng.init(0xfa1c04_5ec4e7_5eed);
     const rng = prng.random();
 
-    var pair = falcon.generateKeyPair(rng) catch |err| {
+    var signing_key: falcon.SigningKey = undefined;
+    var public_key: falcon.PublicKey = undefined;
+    falcon.generateKeyPair(rng, &signing_key, &public_key) catch |err| {
         // Reachable only if the fixed seed draws a non-invertible `f`,
         // which it does not today. Handled anyway so a future seed or
         // NTRUGen change fails loudly instead of silently skipping the
@@ -137,10 +139,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Taint (or not) exactly the four arrays `sampleSignature` dereferences
     // through `sk.tree` — see the module doc's "What is tainted" section.
-    taintAndReload(t, &pair.signing_key.tree.f);
-    taintAndReload(t, &pair.signing_key.tree.g);
-    taintAndReload(t, &pair.signing_key.tree.big_f);
-    taintAndReload(t, &pair.signing_key.tree.big_g);
+    taintAndReload(t, &signing_key.tree.f);
+    taintAndReload(t, &signing_key.tree.g);
+    taintAndReload(t, &signing_key.tree.big_f);
+    taintAndReload(t, &signing_key.tree.big_g);
 
     const msg = "ctgrind-falcon-harness-message-v1";
     var nonce: [falcon.nonce_length]u8 = undefined;
@@ -152,7 +154,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // shadow "defined" bits), so this succeeds identically whether `t` is
     // `.yes` or `.no` — the norm-bound retry loop and NTRU basis are both
     // real and valid either way.
-    const sig_len = falcon.signRandomized(&pair.signing_key, msg, rng, &nonce, &sig_buf) catch |err| {
+    const sig_len = falcon.signRandomized(&signing_key, msg, rng, &nonce, &sig_buf) catch |err| {
         std.debug.print("signRandomized failed: {t}\n", .{err});
         return err;
     };

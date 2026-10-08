@@ -5,6 +5,30 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING, HIGH: key generation, secret-key decode/encode and signing left the secret basis, the seed-derived state and the sampled short vector on the dead stack.**
+  New ReleaseFast stack probe (`stackprobe_test.zig`; Falcon-512 and Falcon-1024; 5 calls each; needles = seed,
+  SHAKE256 stream, encoded secret key, f/g/F/G as small ints, lifted polynomials, NTT forms, FFT doubles, the
+  sampler's Gram matrix, the per-signature RNG seed, the ChaCha seed/state, the accepted s1/s2), hits before → after:
+  `generateKeyPair` f 930 / g 930 / F 420 / G 960 / sk bytes 540 / NTT(g) 320 at 512 (1770 / 1740 / 960 / 1920 / 960 / 640 at 1024) — the
+  `SigningKey` was returned BY VALUE through `Keygen.generate`, `Ntru.generate` (`Basis`) and `buildTree` (`Tree`), a
+  copy per frame; `SigningKey.toSecretKeyBytes` returned the encoded key by value (650 hits at 512, 1060 at 1024) and left the
+  trim-encoder's accumulators; `SecretKey.fromBytes` returned f/g/F by value (85 / 155 / 155 / 75 at 512, 155 / 295 / 290 / 165 at 1024);
+  `SecretKey.publicKey` / `poly.computePublic` left NTT(g) (320 / 640); `signRandomized` left the per-signature seed (15), the ChaCha
+  seed (30) and state (180) and the candidate s1/s2 (960 + 960 at 512, 1920 + 1920 at 1024). Totals 7835 (512) and 15040 (1024) → 0.
+  The FFT/Gram scratch inside `sampleSignature` was already wiped by its `defer`s; what survived was the candidate copies and the RNG.
+  - `generateKeyPair(rng, sk_out: *SigningKey, pk_out: *PublicKey)` (was: returns `{ signing_key, public_key }`); `sk_out` is
+    zeroed on error. Same for `generateKeyPair1024`. `keygen.Keygen.generate(rng, sk, h)`, `ntru.Ntru.generate(rng, out: *Basis)`.
+  - `SecretKey.fromBytes(out: *SecretKey, bytes)` (was: returns the key; `out` zeroed on error), same for `SecretKey1024`.
+  - `SigningKey.toSecretKeyBytes(sk, out: *[encoded_length]u8)` (was: returns the array).
+  - `sign.ShakePrng.init(self: *ShakePrng, seed)` seeds in place (was: returns the state by value); new `deinit` wipes it.
+  - `poly.Ring.fromSmall(out: *Poly, src)`; `ffsampling.buildTree(Ring, out: *Tree, f, g, F, G)`;
+    `ffsampling.sampleSignature(Ring, tree, c, rng, out: *SignatureCandidate)`.
+  - Key generation, signing, secret-key decode/encode, `computePublic` and the SHAKE256 absorb/squeeze run one frame down and zero
+    what they dirtied (`burn.zig`; measured depths 55.3 / 104.4 KiB keygen, 71.5 / 138.3 KiB sign at 512 / 1024, burns 80 / 144 and
+    96 / 176 KiB). `signWithRng` wipes each attempt's candidate.
+  - No heap is involved (the module does not allocate). `check-fp-freedom.sh` and the KATs are unchanged. The ctgrind harness
+    (`ctgrind_harness.zig`) only changed its keygen call; the source digests of the falcon row need the coordinator's re-pin.
+
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added, tainting the NTRU trapdoor `sk.tree.{f,g,big_f,big_g}` through `signRandomized`. ⛔⛔ This reverses `SPEC.md`'s standing decision that the module should NOT have such a row, and the measurement is what reversed it. That argument was entirely about the sampler — `berExp`'s early break and the reject loop's value-dependent trip count, both deliberate reference design — so a row would be "a permanent red that measures the reference design rather than a defect". Measured ReleaseFast: **133 in-file contexts, of which the sampler is 16** (`gaussian.zig:208`, `:228`). The other **112 are `fpr.zig`** — `pack` 62, `half` 42, `add` 8 — which the same SPEC.md describes as a "branchless integer emulation of binary64" with "no data-dependent branch". ⚠ Not claimed: that those 112 are a real leak; claimed: the sentence finally has an instrument, and `check-fp-freedom.sh` could never have seen it (it objdumps for hardware FP instructions, and nothing here executes one). The row is pinned as a bound (`<=133`), since only the direction is load-bearing.
 
 - **2026-09-07** — Fuzz reach: `fuzzVerify`'s corruption was one fixed octet. The flip

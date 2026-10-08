@@ -44,6 +44,7 @@
 const std = @import("std");
 const bn254 = @import("bn254");
 const bin = @import("snarkjs_bin.zig");
+const burn = @import("burn.zig");
 const zkey_mod = @import("zkey.zig");
 const circom = @import("circom.zig");
 const ptau_mod = @import("ptau.zig");
@@ -287,9 +288,17 @@ pub fn circuitHash(z: ZKey) [64]u8 {
 /// and appends a record carrying a proof of knowledge of `x`. `x` and `s`
 /// must be fresh uniform secrets (`Fr.random(io)`) that the caller destroys
 /// afterwards — the ceremony's security is that SOME contributor's `x` is
-/// gone. `name` is stored in the record (≤ 255 bytes). This function's own
-/// copies of `x` are wiped; the caller wipes theirs.
-pub fn contribute(allocator: Allocator, z: *ZKey, x: Fr, s: Fr, name: []const u8) (error{ TrivialSecret, NameTooLong } || Allocator.Error)!void {
+/// gone. `name` is stored in the record (≤ 255 bytes). `x` and `s` are taken by
+/// pointer and never copied out of this call's burned frames (`x`, `x⁻¹`,
+/// `s·x` and the multiplication frames are zeroed on return); the caller
+/// wipes theirs.
+pub fn contribute(allocator: Allocator, z: *ZKey, x: *const Fr, s: *const Fr, name: []const u8) (error{ TrivialSecret, NameTooLong } || Allocator.Error)!void {
+    return burn.run(burn.contribute_burn, (error{ TrivialSecret, NameTooLong } || Allocator.Error)!void, contributeBody, .{ allocator, z, x, s, name });
+}
+
+fn contributeBody(allocator: Allocator, z: *ZKey, x_ptr: *const Fr, s_ptr: *const Fr, name: []const u8) (error{ TrivialSecret, NameTooLong } || Allocator.Error)!void {
+    const x = x_ptr.*;
+    const s = s_ptr.*;
     // x = 1 would add a record that moved nothing.
     if (x.isZero() or x.eql(Fr.one) or s.isZero()) return error.TrivialSecret;
     if (name.len > 255) return error.NameTooLong;
@@ -459,7 +468,7 @@ test "verifyContribution: a δ that the proof of knowledge does not account for"
     defer z.deinit(testing.allocator);
     const x = Fr.reduceWide(&[_]u8{7} ** 32);
     const s = Fr.reduceWide(&[_]u8{9} ** 32);
-    try contribute(testing.allocator, &z, x, s, "mallory");
+    try contribute(testing.allocator, &z, &x, &s, "mallory");
     try testing.expect(verifyContribution(z, 0));
 
     var rec = &z.contributions[0];

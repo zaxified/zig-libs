@@ -72,10 +72,12 @@ const groth16 = @import("groth16");
 var z = try groth16.zkey.parse(gpa, zkey_bytes); // snarkjs `.zkey`
 defer z.deinit(gpa);
 const w = try groth16.circom.parseWitness(gpa, wtns_bytes); // circom `.wtns`
-defer gpa.free(w);
+defer groth16.circom.freeWitness(gpa, w); // wipes, then frees
 
-// Fresh r, s for EVERY proof.
-const proof = try groth16.zkprove.prove(gpa, z, w, .{ .r = groth16.Fr.random(io), .s = groth16.Fr.random(io) });
+// Fresh r, s for EVERY proof. Secrets go in by pointer; the caller wipes them.
+var rand: groth16.Randomizers = .{ .r = groth16.Fr.random(io), .s = groth16.Fr.random(io) };
+defer std.crypto.secureZero(u8, std.mem.asBytes(&rand));
+const proof = try groth16.zkprove.prove(gpa, z, w, &rand);
 std.debug.assert(try groth16.verify(z.verifyingKey(), proof, w[1 .. z.n_public + 1]));
 const json = try groth16.snarkjs_export.proofJson(gpa, proof); // what `snarkjs groth16 verify` reads
 ```
@@ -93,7 +95,7 @@ switch (try groth16.phase2.verify(gpa, io, r, p, z)) {
 ```
 
 Making a key yourself: `phase2.newZkey(gpa, r, p)`, then one
-`phase2.contribute(gpa, &z, x, s, "name")` per participant with fresh secrets
+`phase2.contribute(gpa, &z, &x, &s, "name")` per participant with fresh secrets
 they destroy afterwards. `tools/snarkjs/g16.zig` is all of this as a command
 line. ⚠ snarkjs's own `zkey verify` rejects keys made or contributed here
 (SPEC.md § 4b); its prover and verifier accept them.
@@ -113,9 +115,9 @@ _ = groth16.qap.checkDivisible(2, sys, &witness); // true
 
 // Proving:
 const toxic_waste = groth16.ToxicWaste{ .tau = tau, .alpha = alpha, .beta = beta, .gamma = gamma, .delta = delta };
-const kp = try groth16.setup(2, allocator, sys, 1, toxic_waste);
+const kp = try groth16.setup(2, allocator, sys, 1, &toxic_waste);
 defer groth16.freeKeyPair(allocator, kp);
-const pf = groth16.prove(2, kp.pk, sys, 1, &witness, .{ .r = r, .s = s });
+const pf = groth16.prove(2, kp.pk, sys, 1, &witness, &.{ .r = r, .s = s });
 try std.testing.expect(try @import("bn254").groth16Verify(kp.vk, pf, witness[1..2]));
 ```
 

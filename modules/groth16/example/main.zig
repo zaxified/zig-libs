@@ -103,7 +103,8 @@ pub fn main() !void {
     // a caller tell "bad ceremony input" apart from "out of memory".
     var degenerate = toxic;
     degenerate.delta = Fr.zero;
-    if (groth16.setup(domain_size, gpa, sys, num_public, degenerate)) |kp| {
+    defer degenerate.deinit();
+    if (groth16.setup(domain_size, gpa, sys, num_public, &degenerate)) |kp| {
         groth16.freeKeyPair(gpa, kp);
         return error.DegenerateSetupAccepted;
     } else |err| switch (err) {
@@ -116,7 +117,7 @@ pub fn main() !void {
         error.DomainTooSmall => return err,
     }
 
-    const keys = try groth16.setup(domain_size, gpa, sys, num_public, toxic);
+    const keys = try groth16.setup(domain_size, gpa, sys, num_public, &toxic);
     defer groth16.freeKeyPair(gpa, keys);
     // The five scalars have served their purpose; a real ceremony destroys
     // them, and so does this.
@@ -133,7 +134,7 @@ pub fn main() !void {
     // `r` and `s` are the zero-knowledge randomizers: fresh per proof in a
     // deployment (two proofs of the same statement must not be equal), fixed
     // here so this program is reproducible.
-    const proof = try groth16.prove(domain_size, keys.pk, sys, num_public, &witness, .{
+    const proof = try groth16.prove(domain_size, keys.pk, sys, num_public, &witness, &.{
         .r = groth16.field.frFromU64(23),
         .s = groth16.field.frFromU64(29),
     });

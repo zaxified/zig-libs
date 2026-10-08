@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING, HIGH: the BF-IBE core and the age layer left their secrets on the
+  dead stack.** New ReleaseFast stack probe (`stackprobe_test.zig`; the round signature is public
+  and not a needle), 5 calls each, before → after: `encrypt` the message 10, sigma 10, the FO
+  scalar r 20, the pairing value 630 (+540 in drand's cubed form) and both masks; `decrypt` the
+  same, recovered (r 20, pairing value 420 + 180); `age.encrypt` the file key 30 and the BF-IBE
+  core's r and pairing value; `age.decrypt` the file key and the pairing value; `Randomness.draw`
+  the file key/sigma 30 — all now 0 (the payload layer was already clean). Secrets in by pointer,
+  out through an out-param, bodies one frame down and burned (`burn.zig`):
+  - `encrypt(p_pub, round, message: *const [16]u8, sigma: *const [16]u8)`;
+    `decrypt(out: *[16]u8, round_signature, ct) DecryptError!void` (`out` zeroed on error);
+    `ciphersuite.randomSigma(out, io)`;
+  - `age.Randomness.draw(out, io)` (+ `wipe`), `age.encrypt`/`encryptAlloc(…, rnd: *const
+    Randomness, …)`, `age.PayloadStream.init(out, key: *const [32]u8)`,
+    `age.sealPayload(out, key: *const [32]u8, pt)`, `age.openPayload(out, key: *const [32]u8, …)`.
+  - Fixed: `age.sealedLen` failed at comptime (`@max` narrowed the chunk count to `u1`).
 - **2026-10-06** — **API ADDED, NO BEHAVIOURAL CHANGE:** `age.PayloadStream` — the age STREAM
   one chunk at a time (`init(key)`, `sealChunk(out, plaintext, last)`, `openChunk(out, sealed,
   last)` refusing chunk-shape violations with `MalformedPayload`, `wipe`), for callers that

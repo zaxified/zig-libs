@@ -153,7 +153,7 @@ test "zkey: write(parse(file)) reproduces both snarkjs files byte for byte" {
 
 test "wtns and r1cs: values, and the witness satisfies the circuit" {
     const w = try circom.parseWitness(testing.allocator, t_wtns);
-    defer testing.allocator.free(w);
+    defer circom.freeWitness(testing.allocator, w);
     const want = [_]u64{ 1, 108, 3, 5, 7, 15 }; // [1, out, a, b, c, t]
     try testing.expectEqual(want.len, w.len);
     for (want, w) |e, g| try testing.expect(g.eql(field.frFromU64(e)));
@@ -215,18 +215,18 @@ test "zkprove: our proof from snarkjs's key and circom's witness verifies" {
     var z = try zkey.parse(testing.allocator, t1_zkey);
     defer z.deinit(testing.allocator);
     const w = try circom.parseWitness(testing.allocator, t_wtns);
-    defer testing.allocator.free(w);
-    const proof = try zkprove.prove(testing.allocator, z, w, .{ .r = field.frFromU64(11), .s = field.frFromU64(13) });
+    defer circom.freeWitness(testing.allocator, w);
+    const proof = try zkprove.prove(testing.allocator, z, w, &.{ .r = field.frFromU64(11), .s = field.frFromU64(13) });
     try testing.expect(try bn254.groth16Verify(z.verifyingKey(), proof, w[1..3]));
 
     // An unsatisfying witness gives a proof that does not verify.
     var bad = try testing.allocator.dupe(Fr, w);
     defer testing.allocator.free(bad);
     bad[5] = bad[5].add(Fr.one);
-    const bad_proof = try zkprove.prove(testing.allocator, z, bad, .{ .r = field.frFromU64(11), .s = field.frFromU64(13) });
+    const bad_proof = try zkprove.prove(testing.allocator, z, bad, &.{ .r = field.frFromU64(11), .s = field.frFromU64(13) });
     try testing.expect(!try bn254.groth16Verify(z.verifyingKey(), bad_proof, bad[1..3]));
 
-    try testing.expectError(error.WitnessMismatch, zkprove.prove(testing.allocator, z, w[0..5], .{ .r = Fr.one, .s = Fr.one }));
+    try testing.expectError(error.WitnessMismatch, zkprove.prove(testing.allocator, z, w[0..5], &.{ .r = Fr.one, .s = Fr.one }));
 }
 
 test "zkprove: our proof is the one snarkjs accepted" {
@@ -238,8 +238,8 @@ test "zkprove: our proof is the one snarkjs accepted" {
     var z = try zkey.parse(testing.allocator, t1_zkey);
     defer z.deinit(testing.allocator);
     const w = try circom.parseWitness(testing.allocator, t_wtns);
-    defer testing.allocator.free(w);
-    const proof = try zkprove.prove(testing.allocator, z, w, .{ .r = field.frFromU64(11), .s = field.frFromU64(13) });
+    defer circom.freeWitness(testing.allocator, w);
+    const proof = try zkprove.prove(testing.allocator, z, w, &.{ .r = field.frFromU64(11), .s = field.frFromU64(13) });
     const js = try @import("snarkjs_export.zig").proofJson(testing.allocator, proof);
     defer testing.allocator.free(js);
     try testing.expectEqualStrings(std.mem.trimEnd(u8, @embedFile("testdata/snarkjs/ours_proof.json"), "\n"), js);
@@ -321,7 +321,7 @@ test "phase2.contribute over a snarkjs key: still valid, provable, and its proof
     defer z.deinit(testing.allocator);
     const old_delta = z.delta_g2;
 
-    try phase2.contribute(testing.allocator, &z, field.frFromU64(123456789), field.frFromU64(987654321), "zig");
+    try phase2.contribute(testing.allocator, &z, &field.frFromU64(123456789), &field.frFromU64(987654321), "zig");
     try testing.expectEqual(@as(usize, 2), z.contributions.len);
     try testing.expectEqualStrings("zig", z.contributions[1].name().?);
     try testing.expect(!g2Eq(z.delta_g2, old_delta));
@@ -331,8 +331,8 @@ test "phase2.contribute over a snarkjs key: still valid, provable, and its proof
     try testing.expect(!phase2.verifyContribution(z, 0));
 
     const w = try circom.parseWitness(testing.allocator, t_wtns);
-    defer testing.allocator.free(w);
-    const proof = try zkprove.prove(testing.allocator, z, w, .{ .r = field.frFromU64(5), .s = field.frFromU64(6) });
+    defer circom.freeWitness(testing.allocator, w);
+    const proof = try zkprove.prove(testing.allocator, z, w, &.{ .r = field.frFromU64(5), .s = field.frFromU64(6) });
     try testing.expect(try bn254.groth16Verify(z.verifyingKey(), proof, w[1..3]));
 
     // The written file parses back to the same key.
@@ -350,9 +350,9 @@ test "phase2.contribute over a snarkjs key: still valid, provable, and its proof
 test "phase2.contribute refuses a trivial secret, verifyContribution an index past the end" {
     var z = try zkey.parse(testing.allocator, t0_zkey);
     defer z.deinit(testing.allocator);
-    try testing.expectError(error.TrivialSecret, phase2.contribute(testing.allocator, &z, Fr.zero, Fr.one, "x"));
-    try testing.expectError(error.TrivialSecret, phase2.contribute(testing.allocator, &z, Fr.one, Fr.one, "x"));
-    try testing.expectError(error.TrivialSecret, phase2.contribute(testing.allocator, &z, field.frFromU64(2), Fr.zero, "x"));
+    try testing.expectError(error.TrivialSecret, phase2.contribute(testing.allocator, &z, &Fr.zero, &Fr.one, "x"));
+    try testing.expectError(error.TrivialSecret, phase2.contribute(testing.allocator, &z, &Fr.one, &Fr.one, "x"));
+    try testing.expectError(error.TrivialSecret, phase2.contribute(testing.allocator, &z, &field.frFromU64(2), &Fr.zero, "x"));
     try testing.expectEqual(@as(usize, 0), z.contributions.len);
     try testing.expect(!phase2.verifyContribution(z, 0));
 }
@@ -579,7 +579,7 @@ test "phase2.verify: a moved δ with no contribution record is a chain mismatch"
     defer f.r.deinit(testing.allocator);
     var z = try zkey.parse(testing.allocator, t0_zkey);
     defer z.deinit(testing.allocator);
-    try phase2.contribute(testing.allocator, &z, field.frFromU64(3), field.frFromU64(4), "x");
+    try phase2.contribute(testing.allocator, &z, &field.frFromU64(3), &field.frFromU64(4), "x");
     // Hide the record: a consistent, correctly divided key whose δ the
     // (empty) chain does not account for.
     const recs = z.contributions;
@@ -591,7 +591,7 @@ test "phase2.verify: a moved δ with no contribution record is a chain mismatch"
 test "phase2.verifyContribution: the record's name is bound by its transcript" {
     var z = try zkey.parse(testing.allocator, t0_zkey);
     defer z.deinit(testing.allocator);
-    try phase2.contribute(testing.allocator, &z, field.frFromU64(3), field.frFromU64(4), "alice");
+    try phase2.contribute(testing.allocator, &z, &field.frFromU64(3), &field.frFromU64(4), "alice");
     try testing.expect(phase2.verifyContribution(z, 0));
     const params: []u8 = @constCast(z.contributions[0].params);
     params[2] = 'A';

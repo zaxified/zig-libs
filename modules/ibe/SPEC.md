@@ -40,15 +40,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 ## The construction (Boneh-Franklin "FullIdent", CRYPTO 2001 §4.2)
 
 ```
-setup(io):                                [REAL — ibe.setup]
+setup(out, io):                           [REAL — ibe.setup]
   msk = Fr.random(io)
   mpk = msk · G2_generator
 
-extract(msk, id):                         [REAL — ibe.extract]
+extract(out, &msk, id):                   [REAL — ibe.extract]
   Qid = H1(id) = hashToCurveG1(id, dst_g1)
   return msk · Qid                        ∈ G1
 
-encrypt(mpk, id, M, sigma):                [REAL — ibe.encrypt]
+encrypt(mpk, id, &M, &sigma):              [REAL — ibe.encrypt]
   Qid   = H1(id)
   Gid   = pairing(Qid, mpk) ∈ Gt
   r     = H3(sigma, M) ∈ Fr
@@ -58,7 +58,7 @@ encrypt(mpk, id, M, sigma):                [REAL — ibe.encrypt]
   W     = M XOR H4(sigma)
   return (U, V, W)
 
-decrypt(d_id, (U,V,W)):                    [REAL — ibe.decrypt]
+decrypt(out, &d_id, (U,V,W)):              [REAL — ibe.decrypt]
   gid_r = pairing(d_id, U) ∈ Gt           (ONE pairing call — bilinearity gives gid_r for free)
   sigma = V XOR H2(gid_r)
   M     = W XOR H4(sigma)

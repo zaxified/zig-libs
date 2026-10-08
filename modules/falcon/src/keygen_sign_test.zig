@@ -49,11 +49,17 @@ test "Falcon-512 KAT: deterministic keygen reproduces pk/sk byte-exact" {
         var drbg = kst.Drbg.init(seed[0..48]);
         var kgseed: [48]u8 = undefined;
         drbg.bytes(&kgseed); // draw 1: the keygen seed
-        var prng = falcon.sign.ShakePrng.init(&kgseed);
-        const kp = try falcon.generateKeyPair(prng.random());
+        var prng: falcon.sign.ShakePrng = undefined;
+        prng.init(&kgseed);
+        defer prng.deinit();
+        var sk: falcon.SigningKey = undefined;
+        var pk: falcon.PublicKey = undefined;
+        try falcon.generateKeyPair(prng.random(), &sk, &pk);
 
-        try std.testing.expectEqualSlices(u8, want_pk, &kp.public_key.toBytes());
-        try std.testing.expectEqualSlices(u8, want_sk, &kp.signing_key.toSecretKeyBytes());
+        try std.testing.expectEqualSlices(u8, want_pk, &pk.toBytes());
+        var got_sk: [1281]u8 = undefined;
+        sk.toSecretKeyBytes(&got_sk);
+        try std.testing.expectEqualSlices(u8, want_sk, &got_sk);
     }
 }
 
@@ -73,11 +79,17 @@ test "Falcon-1024 KAT: deterministic keygen reproduces pk/sk byte-exact" {
         var drbg = kst.Drbg.init(seed[0..48]);
         var kgseed: [48]u8 = undefined;
         drbg.bytes(&kgseed);
-        var prng = falcon.sign.ShakePrng.init(&kgseed);
-        const kp = try falcon.generateKeyPair1024(prng.random());
+        var prng: falcon.sign.ShakePrng = undefined;
+        prng.init(&kgseed);
+        defer prng.deinit();
+        var sk: falcon.SigningKey1024 = undefined;
+        var pk: falcon.PublicKey1024 = undefined;
+        try falcon.generateKeyPair1024(prng.random(), &sk, &pk);
 
-        try std.testing.expectEqualSlices(u8, want_pk, &kp.public_key.toBytes());
-        try std.testing.expectEqualSlices(u8, want_sk, &kp.signing_key.toSecretKeyBytes());
+        try std.testing.expectEqualSlices(u8, want_pk, &pk.toBytes());
+        var got_sk: [2305]u8 = undefined;
+        sk.toSecretKeyBytes(&got_sk);
+        try std.testing.expectEqualSlices(u8, want_sk, &got_sk);
     }
 }
 
@@ -109,13 +121,17 @@ test "Falcon-512 KAT: full pipeline — keygen + sign from seed reproduces the s
         drbg.bytes(rng_stream[0..falcon.nonce_length]); // draw 2: nonce
         drbg.bytes(rng_stream[falcon.nonce_length..]); // draw 3: sign seed
 
-        var prng = falcon.sign.ShakePrng.init(&kgseed);
-        const kp = try falcon.generateKeyPair(prng.random());
+        var prng: falcon.sign.ShakePrng = undefined;
+        prng.init(&kgseed);
+        defer prng.deinit();
+        var sk: falcon.SigningKey = undefined;
+        var pk: falcon.PublicKey = undefined;
+        try falcon.generateKeyPair(prng.random(), &sk, &pk);
 
         var fixed = kst.FixedRng{ .buf = &rng_stream };
         var nonce_out: [falcon.nonce_length]u8 = undefined;
         var sig_out: [2000]u8 = undefined;
-        const len = try Signer.signWithRng(&kp.signing_key.tree, msg, fixed.random(), &nonce_out, &sig_out, falcon.sig_bound);
+        const len = try Signer.signWithRng(&sk.tree, msg, fixed.random(), &nonce_out, &sig_out, falcon.sig_bound);
 
         try std.testing.expectEqualSlices(u8, want_nonce, &nonce_out);
         try std.testing.expectEqualSlices(u8, want_sig, sig_out[0..len]);
@@ -131,12 +147,14 @@ test "randomized keygen -> sign -> verify round trip, fresh key" {
     // should seed from the OS.)
     var prng = std.Random.DefaultPrng.init(0xfa1c05eed);
     const rng = prng.random();
-    const kp = try falcon.generateKeyPair(rng);
+    var sk: falcon.SigningKey = undefined;
+    var pk: falcon.PublicKey = undefined;
+    try falcon.generateKeyPair(rng, &sk, &pk);
     const message = "falcon keygen round-trip";
     var nonce: [falcon.nonce_length]u8 = undefined;
     var sig_buf: [falcon.max_sig_field_length]u8 = undefined;
-    const len = try falcon.signRandomized(&kp.signing_key, message, rng, &nonce, &sig_buf);
-    try kp.public_key.verify(message, &nonce, sig_buf[0..len]);
+    const len = try falcon.signRandomized(&sk, message, rng, &nonce, &sig_buf);
+    try pk.verify(message, &nonce, sig_buf[0..len]);
 }
 
 test "TEETH: an undersized sig_out is REFUSED, not spun on forever" {
@@ -152,7 +170,9 @@ test "TEETH: an undersized sig_out is REFUSED, not spun on forever" {
     // compressed Falcon-512 signature this key can produce.
     var prng = std.Random.DefaultPrng.init(0x5170e);
     const rng = prng.random();
-    const kp = try falcon.generateKeyPair(rng);
+    var sk: falcon.SigningKey = undefined;
+    var pk: falcon.PublicKey = undefined;
+    try falcon.generateKeyPair(rng, &sk, &pk);
     const message = "short buffer";
     var nonce: [falcon.nonce_length]u8 = undefined;
     var buf: [falcon.max_sig_field_length]u8 = undefined;
@@ -160,13 +180,13 @@ test "TEETH: an undersized sig_out is REFUSED, not spun on forever" {
     for ([_]usize{ 1, 64, 600 }) |n| {
         try std.testing.expectError(
             error.NoSpaceLeft,
-            falcon.signRandomized(&kp.signing_key, message, rng, &nonce, buf[0..n]),
+            falcon.signRandomized(&sk, message, rng, &nonce, buf[0..n]),
         );
     }
     // And the full-size buffer still signs, so the ceiling did not simply
     // break signing for everyone.
-    const len = try falcon.signRandomized(&kp.signing_key, message, rng, &nonce, &buf);
-    try kp.public_key.verify(message, &nonce, buf[0..len]);
+    const len = try falcon.signRandomized(&sk, message, rng, &nonce, &buf);
+    try pk.verify(message, &nonce, buf[0..len]);
 }
 
 test "TEETH: signing with a zeroed key terminates instead of spinning" {
@@ -175,13 +195,15 @@ test "TEETH: signing with a zeroed key terminates instead of spinning" {
     // rejection arm — a wiped key was an availability hazard, not an error.
     var prng = std.Random.DefaultPrng.init(0x2e40ed);
     const rng = prng.random();
-    var kp = try falcon.generateKeyPair(rng);
-    kp.signing_key.secureZero();
+    var sk: falcon.SigningKey = undefined;
+    var pk: falcon.PublicKey = undefined;
+    try falcon.generateKeyPair(rng, &sk, &pk);
+    sk.secureZero();
 
     var nonce: [falcon.nonce_length]u8 = undefined;
     var buf: [falcon.max_sig_field_length]u8 = undefined;
     // Either wall is acceptable — the point is that it hits one of them.
-    const r = falcon.signRandomized(&kp.signing_key, "after wipe", rng, &nonce, &buf);
+    const r = falcon.signRandomized(&sk, "after wipe", rng, &nonce, &buf);
     try std.testing.expect(std.meta.isError(r));
 }
 
@@ -195,14 +217,16 @@ test "randomized keygen -> sign -> verify: a tampered message is rejected by Pub
     // be caught by any of them.
     var prng = std.Random.DefaultPrng.init(0xfa1c05eed);
     const rng = prng.random();
-    const kp = try falcon.generateKeyPair(rng);
+    var sk: falcon.SigningKey = undefined;
+    var pk: falcon.PublicKey = undefined;
+    try falcon.generateKeyPair(rng, &sk, &pk);
     const message = "falcon keygen round-trip";
     var nonce: [falcon.nonce_length]u8 = undefined;
     var sig_buf: [falcon.max_sig_field_length]u8 = undefined;
-    const len = try falcon.signRandomized(&kp.signing_key, message, rng, &nonce, &sig_buf);
+    const len = try falcon.signRandomized(&sk, message, rng, &nonce, &sig_buf);
 
     try std.testing.expectError(
         error.SignatureVerificationFailed,
-        kp.public_key.verify("a different message entirely", &nonce, sig_buf[0..len]),
+        pk.verify("a different message entirely", &nonce, sig_buf[0..len]),
     );
 }

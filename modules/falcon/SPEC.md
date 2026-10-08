@@ -185,6 +185,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   that say nothing about this module. Keygen (`ntru.zig`) likewise preserves the
   reference's structure and now shares the integer `fpr`; it runs once per
   key, so its side-channel exposure is far smaller than the signer's.
+- Dead stack (2026-10-09): secrets cross the API by pointer and results by
+  out-param (`generateKeyPair`, `SecretKey.fromBytes`, `toSecretKeyBytes`,
+  `ShakePrng.init`); keygen, signing, decode/encode, `computePublic` and the
+  SHAKE256 absorb/squeeze run one frame down with the dirtied stack zeroed
+  (`src/burn.zig`); `src/stackprobe_test.zig` (ReleaseFast) guards it for both
+  degrees. Not covered, see Backlog: the caller's own `rng`/CSPRNG state and a
+  hardware-register or swap-level residue.
 - Verification and public-key handling touch public data only, so no
   constant-time claims are made or needed for that surface. Secret-key
   *decode* is not constant-time — treat `SecretKey.fromBytes` as a
@@ -299,6 +306,14 @@ it pins the trapdoor sampler and keygen sampling, whose failure mode is
   offers it for repeated signing under one key; here every signature rebuilds the
   Gram matrix and LDL tree, and the integer-emulated FP is already ~5× slower than
   native. Moderate, pure Zig; worth it only for a signing-heavy consumer.
+
+- **Dead-stack probe of the internals below the public entry points** *(2026-10-09)*.
+  The probe sees the entry points only; the FFT-domain scratch inside
+  `ffsampling.sampleSignature` and NTRUSolve's RNS pool are wiped by their own
+  `defer`s and by the burns above them, but no needle covers NTRUSolve's
+  intermediate big-integer limbs (the F/G recursion levels). Add needles for
+  the RNS limbs of f, g at the top level if a consumer needs the claim.
+  Small.
 
 ## Anchoring
 

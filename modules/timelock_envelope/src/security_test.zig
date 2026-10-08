@@ -367,8 +367,9 @@ test "positive control: a KDF that dropped s_pq would let the PQ-lock negative p
 
     // Attacker path: recover s_time from the time lock (post-R), derive
     // the broken key WITHOUT any PQ secret, and open.
-    const tl = tlock.encrypt(quicknetPubkey(), seal_round, rnd.s_time, rnd.tlock_sigma);
-    const s_time_recovered = try tlock.decrypt(round1000Signature(), tl);
+    const tl = tlock.encrypt(quicknetPubkey(), seal_round, &rnd.s_time, &rnd.tlock_sigma);
+    var s_time_recovered: [tlock.block_bytes]u8 = undefined;
+    try tlock.decrypt(&s_time_recovered, round1000Signature(), tl);
     const attacker_keys = envelope.deriveKeys(s_time_recovered, zero_pq, Env.suite_id, seal_round);
 
     var dec: [plaintext.len]u8 = undefined;

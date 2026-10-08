@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const bn254 = @import("bn254");
+const burn = @import("burn.zig");
 const gate = @import("gate.zig");
 const field = @import("field.zig");
 const poly = @import("poly.zig");
@@ -196,12 +197,27 @@ fn columnEvalAtTau(comptime n: usize, sys: r1cs.System, which: Matrix, wire: usi
 ///   - `h_query[j] = (τʲ·Z(τ)/δ)·G1`, `j = 0..n−2` (the `H(x)` bases)
 ///
 /// Key slices are heap-allocated with `allocator`; free with `freeKeyPair`.
+///
+/// `tw` is read through the pointer and never copied: the caller owns the five
+/// scalars and wipes them (`ToxicWaste.deinit`) once `setup` has returned. The
+/// body runs one frame down and the stack it dirtied (the inverses of γ and δ,
+/// every `uᵢ(τ)`/`vᵢ(τ)`/`wᵢ(τ)`, the `H` scalars) is zeroed after it.
 pub fn setup(
     comptime n: usize,
     allocator: std.mem.Allocator,
     sys: r1cs.System,
     num_public: usize,
-    tw: ToxicWaste,
+    tw: *const ToxicWaste,
+) SetupError!KeyPair {
+    return burn.run(burn.setup_burn + n * burn.per_point_burn, SetupError!KeyPair, setupBody, .{ n, allocator, sys, num_public, tw });
+}
+
+fn setupBody(
+    comptime n: usize,
+    allocator: std.mem.Allocator,
+    sys: r1cs.System,
+    num_public: usize,
+    tw: *const ToxicWaste,
 ) SetupError!KeyPair {
     comptime std.debug.assert(gate.prover_core_implemented);
     // ⛔ NOT an assert. `std.debug.assert` is compiled out in ReleaseFast — the
@@ -227,16 +243,8 @@ pub fn setup(
     if (sys.constraints.len > n) return error.DomainTooSmall;
     std.debug.assert(num_public + 1 <= sys.num_vars);
 
-    // `tw` arrives by value (a local copy already, independent of the
-    // caller's own copy) and is never returned — only the `[scalar]·G`
-    // group elements derived from it are. Wipe this local copy on every
-    // exit once it's been fully consumed, on top of the caller's own
-    // responsibility to `deinit()` theirs.
-    var tw_local = tw;
-    defer tw_local.deinit();
-
-    const gamma_inv = tw_local.gamma.inv() catch return error.DegenerateToxicWaste;
-    const delta_inv = tw_local.delta.inv() catch return error.DegenerateToxicWaste;
+    const gamma_inv = tw.gamma.inv() catch return error.DegenerateToxicWaste;
+    const delta_inv = tw.delta.inv() catch return error.DegenerateToxicWaste;
 
     const m = sys.num_vars; // wire count, including the constant wire 0
     const num_priv = m - num_public - 1;
@@ -255,14 +263,14 @@ pub fn setup(
     errdefer allocator.free(ic);
 
     for (0..m) |i| {
-        const ui = columnEvalAtTau(n, sys, .a, i, tw_local.tau);
-        const vi = columnEvalAtTau(n, sys, .b, i, tw_local.tau);
-        const wi = columnEvalAtTau(n, sys, .c, i, tw_local.tau);
+        const ui = columnEvalAtTau(n, sys, .a, i, tw.tau);
+        const vi = columnEvalAtTau(n, sys, .b, i, tw.tau);
+        const wi = columnEvalAtTau(n, sys, .c, i, tw.tau);
         a_query[i] = g1Mul(ui);
         b_g1_query[i] = g1Mul(vi);
         b_g2_query[i] = g2Mul(vi);
         // β·uᵢ(τ) + α·vᵢ(τ) + wᵢ(τ) — the combined public/private base.
-        const combined = tw_local.beta.mul(ui).add(tw_local.alpha.mul(vi)).add(wi);
+        const combined = tw.beta.mul(ui).add(tw.alpha.mul(vi)).add(wi);
         if (i <= num_public) {
             ic[i] = g1Mul(combined.mul(gamma_inv));
         } else {
@@ -271,22 +279,22 @@ pub fn setup(
     }
 
     // H-query bases (τʲ·Z(τ)/δ)·G1 for j = 0..n−2, where Z(τ) = τⁿ − 1.
-    const z_tau = domain.Domain(n).vanishingEval(tw_local.tau);
+    const z_tau = domain.Domain(n).vanishingEval(tw.tau);
     {
         var tau_pow = Fr.one;
         for (0..n - 1) |j| {
             h_query[j] = g1Mul(tau_pow.mul(z_tau).mul(delta_inv));
-            tau_pow = tau_pow.mul(tw_local.tau);
+            tau_pow = tau_pow.mul(tw.tau);
         }
     }
 
     return .{
         .pk = .{
-            .alpha_g1 = g1Mul(tw_local.alpha),
-            .beta_g1 = g1Mul(tw_local.beta),
-            .delta_g1 = g1Mul(tw_local.delta),
-            .beta_g2 = g2Mul(tw_local.beta),
-            .delta_g2 = g2Mul(tw_local.delta),
+            .alpha_g1 = g1Mul(tw.alpha),
+            .beta_g1 = g1Mul(tw.beta),
+            .delta_g1 = g1Mul(tw.delta),
+            .beta_g2 = g2Mul(tw.beta),
+            .delta_g2 = g2Mul(tw.delta),
             .a_query = a_query,
             .b_g1_query = b_g1_query,
             .b_g2_query = b_g2_query,
@@ -295,10 +303,10 @@ pub fn setup(
             .domain_size = n,
         },
         .vk = .{
-            .alpha_g1 = g1Mul(tw_local.alpha),
-            .beta_g2 = g2Mul(tw_local.beta),
-            .gamma_g2 = g2Mul(tw_local.gamma),
-            .delta_g2 = g2Mul(tw_local.delta),
+            .alpha_g1 = g1Mul(tw.alpha),
+            .beta_g2 = g2Mul(tw.beta),
+            .gamma_g2 = g2Mul(tw.gamma),
+            .delta_g2 = g2Mul(tw.delta),
             .ic = ic,
         },
     };
@@ -317,13 +325,29 @@ pub fn setup(
 ///   - `πB = (β + R + s·δ)·G2`      = `beta_g2  + Σ wᵢ·b_g2_query[i] + s·delta_g2`
 ///   - `πC = Σ_{priv} wᵢ·l_query[i] + Σⱼ Hⱼ·h_query[j] + s·πA + r·πB_g1 − r·s·δ·G1`
 ///     where `πB_g1 = (β + R + s·δ)·G1` is `B` computed in `G1`.
+///
+/// `rand` is taken by pointer and never copied; the caller wipes it. The body
+/// runs one frame down and the stack it dirtied (the witness-derived
+/// evaluations, the quotient, `r·s`, the `r·δ`/`s·δ` points and the MSM
+/// frames) is zeroed after it.
 pub fn prove(
     comptime n: usize,
     pk: ProvingKey,
     sys: r1cs.System,
     num_public: usize,
     witness: []const Fr,
-    rand: Randomizers,
+    rand: *const Randomizers,
+) ProveError!Proof {
+    return burn.run(burn.prove_burn + n * burn.per_point_burn, ProveError!Proof, proveBody, .{ n, pk, sys, num_public, witness, rand });
+}
+
+fn proveBody(
+    comptime n: usize,
+    pk: ProvingKey,
+    sys: r1cs.System,
+    num_public: usize,
+    witness: []const Fr,
+    rand: *const Randomizers,
 ) ProveError!Proof {
     comptime std.debug.assert(gate.prover_core_implemented);
     // See `setup` for why this is a refusal and not an assert.
@@ -467,13 +491,11 @@ test "setup+prove+verify smoke: knowledge of a square root (1 public input)" {
         .gamma = field.frFromU64(17),
         .delta = field.frFromU64(19),
     };
-    const kp = try setup(2, alloc, sys, 1, tw);
+    const kp = try setup(2, alloc, sys, 1, &tw);
     defer freeKeyPair(alloc, kp);
 
-    const proof = try prove(2, kp.pk, sys, 1, &witness, .{
-        .r = field.frFromU64(3),
-        .s = field.frFromU64(4),
-    });
+    const rand: Randomizers = .{ .r = field.frFromU64(3), .s = field.frFromU64(4) };
+    const proof = try prove(2, kp.pk, sys, 1, &witness, &rand);
     try std.testing.expect(try bn254.groth16Verify(kp.vk, proof, witness[1..2]));
 }
 
@@ -490,10 +512,10 @@ test "setup rejects degenerate toxic waste (gamma or delta zero)" {
     };
     var zero_gamma = base;
     zero_gamma.gamma = Fr.zero;
-    try std.testing.expectError(error.DegenerateToxicWaste, setup(2, std.testing.allocator, sys, 1, zero_gamma));
+    try std.testing.expectError(error.DegenerateToxicWaste, setup(2, std.testing.allocator, sys, 1, &zero_gamma));
     var zero_delta = base;
     zero_delta.delta = Fr.zero;
-    try std.testing.expectError(error.DegenerateToxicWaste, setup(2, std.testing.allocator, sys, 1, zero_delta));
+    try std.testing.expectError(error.DegenerateToxicWaste, setup(2, std.testing.allocator, sys, 1, &zero_delta));
 }
 
 test "ToxicWaste.deinit zeroes all five secret scalars" {

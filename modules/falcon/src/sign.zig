@@ -22,6 +22,7 @@
 const std = @import("std");
 const codec = @import("codec.zig");
 const ffsampling = @import("ffsampling.zig");
+const burn = @import("burn.zig");
 
 pub const nonce_length = 40;
 
@@ -43,16 +44,33 @@ pub const nonce_length = 40;
 /// IS, however, exactly the reference's SHAKE256 keygen RNG: seed it
 /// with the DRBG's 48-byte keypair draw and `generateKeyPair`
 /// reproduces the KAT pk/sk byte-for-byte (`keygen_sign_test.zig`).
+///
+/// The seed is a key-generation secret, so `init` seeds in place (`self` is
+/// the caller's) instead of returning the state by value, and both the
+/// absorb and every squeeze run one frame down with the stack they dirtied
+/// zeroed (`burn.zig`). `deinit` wipes the state.
 pub const ShakePrng = struct {
     state: std.crypto.hash.sha3.Shake256,
 
-    pub fn init(seed: []const u8) ShakePrng {
-        var st = std.crypto.hash.sha3.Shake256.init(.{});
-        st.update(seed);
-        return .{ .state = st };
+    pub fn init(self: *ShakePrng, seed: []const u8) void {
+        burn.run(burn.shake_burn, void, initBody, .{ self, seed });
+    }
+
+    fn initBody(self: *ShakePrng, seed: []const u8) void {
+        self.state = std.crypto.hash.sha3.Shake256.init(.{});
+        self.state.update(seed);
+    }
+
+    /// Wipe the state; the PRNG is unusable until `init` is called again.
+    pub fn deinit(self: *ShakePrng) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
     }
 
     fn fill(self: *ShakePrng, buf: []u8) void {
+        burn.run(burn.shake_burn, void, fillBody, .{ self, buf });
+    }
+
+    fn fillBody(self: *ShakePrng, buf: []u8) void {
         self.state.squeeze(buf);
     }
 
@@ -112,7 +130,22 @@ pub fn Signer(comptime Ring: type) type {
         /// (|coefficient| <= 2047); the spec's own analysis says this
         /// essentially never iterates more than once or twice for an
         /// honest sampler.
+        ///
+        /// The signing runs one frame down and the stack it dirtied (the
+        /// Gram matrix, the FFT scratch, the ChaCha state, the candidate
+        /// short vector) is zeroed (`burn.zig`).
         pub fn signWithRng(
+            tree: *const ffsampling.Tree(Ring),
+            msg: []const u8,
+            rng: std.Random,
+            nonce_out: *[nonce_length]u8,
+            sig_out: []u8,
+            sig_bound: u64,
+        ) SignError!usize {
+            return burn.run(burn.by(Ring.logn, burn.sign_burn), SignError!usize, signBody, .{ tree, msg, rng, nonce_out, sig_out, sig_bound });
+        }
+
+        fn signBody(
             tree: *const ffsampling.Tree(Ring),
             msg: []const u8,
             rng: std.Random,
@@ -130,7 +163,9 @@ pub fn Signer(comptime Ring: type) type {
                 var c: Ring.Poly = undefined;
                 Codec.hashToPoint(nonce_out, msg, &c); // REUSED
 
-                const samp = ffsampling.sampleSignature(Ring, tree, &c, rng);
+                var samp: ffsampling.SignatureCandidate(Ring) = undefined;
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&samp));
+                ffsampling.sampleSignature(Ring, tree, &c, rng, &samp);
 
                 var norm: u64 = 0;
                 for (samp.s1, samp.s2) |a, b| {
@@ -169,9 +204,15 @@ test "Signer(Ring).sig_header matches root.zig's existing sig_header constants" 
 }
 
 test "ShakePrng: deterministic given the same seed, different given a different one" {
-    var a = ShakePrng.init("seed-a");
-    var b = ShakePrng.init("seed-a");
-    var c = ShakePrng.init("seed-b");
+    var a: ShakePrng = undefined;
+    var b: ShakePrng = undefined;
+    var c: ShakePrng = undefined;
+    a.init("seed-a");
+    b.init("seed-a");
+    c.init("seed-b");
+    defer a.deinit();
+    defer b.deinit();
+    defer c.deinit();
     var buf_a: [32]u8 = undefined;
     var buf_b: [32]u8 = undefined;
     var buf_c: [32]u8 = undefined;

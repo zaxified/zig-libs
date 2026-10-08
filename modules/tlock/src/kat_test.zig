@@ -155,8 +155,8 @@ test "encrypt/decrypt round trip against a real quicknet round signature" {
     const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
     const sigma = [_]u8{0x11} ** ciphersuite.block_bytes;
 
-    const ct = tlock.encrypt(p_pub, round, message, sigma);
-    const recovered = try tlock.decrypt(sig, ct);
+    const ct = testEncrypt(p_pub, round, message, sigma);
+    const recovered = try testDecrypt(sig, ct);
     try std.testing.expectEqualSlices(u8, &message, &recovered);
 }
 
@@ -170,8 +170,8 @@ test "decrypt rejects a wrong round signature (FO consistency check fires)" {
     // A signature for a DIFFERENT identity entirely (reuse the same
     // round-1000 signature but pretend it is for round 1001's
     // ciphertext) must fail the FO check, not silently decrypt.
-    const ct_wrong_round = tlock.encrypt(p_pub, 1001, message, sigma);
-    try std.testing.expectError(error.FoCheckFailed, tlock.decrypt(round1000Signature(), ct_wrong_round));
+    const ct_wrong_round = testEncrypt(p_pub, 1001, message, sigma);
+    try std.testing.expectError(error.FoCheckFailed, testDecrypt(round1000Signature(), ct_wrong_round));
 }
 
 test "decrypt rejects a tampered ciphertext (V flipped)" {
@@ -180,10 +180,10 @@ test "decrypt rejects a tampered ciphertext (V flipped)" {
     const p_pub = quicknetPubkey();
     const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
     const sigma = [_]u8{0x11} ** ciphersuite.block_bytes;
-    var ct = tlock.encrypt(p_pub, 1000, message, sigma);
+    var ct = testEncrypt(p_pub, 1000, message, sigma);
     ct.v[0] ^= 0xff;
 
-    try std.testing.expectError(error.FoCheckFailed, tlock.decrypt(round1000Signature(), ct));
+    try std.testing.expectError(error.FoCheckFailed, testDecrypt(round1000Signature(), ct));
 }
 
 test "decrypt rejects a tampered ciphertext (W flipped)" {
@@ -192,10 +192,10 @@ test "decrypt rejects a tampered ciphertext (W flipped)" {
     const p_pub = quicknetPubkey();
     const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
     const sigma = [_]u8{0x11} ** ciphersuite.block_bytes;
-    var ct = tlock.encrypt(p_pub, 1000, message, sigma);
+    var ct = testEncrypt(p_pub, 1000, message, sigma);
     ct.w[0] ^= 0xff;
 
-    try std.testing.expectError(error.FoCheckFailed, tlock.decrypt(round1000Signature(), ct));
+    try std.testing.expectError(error.FoCheckFailed, testDecrypt(round1000Signature(), ct));
 }
 
 test "encrypt with a fixed sigma is deterministic (pins the ciphertext for a future byte-exact KAT)" {
@@ -205,8 +205,8 @@ test "encrypt with a fixed sigma is deterministic (pins the ciphertext for a fut
     const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
     const sigma = [_]u8{0x11} ** ciphersuite.block_bytes;
 
-    const ct1 = tlock.encrypt(p_pub, 1000, message, sigma);
-    const ct2 = tlock.encrypt(p_pub, 1000, message, sigma);
+    const ct1 = testEncrypt(p_pub, 1000, message, sigma);
+    const ct2 = testEncrypt(p_pub, 1000, message, sigma);
     try std.testing.expectEqualSlices(u8, &ct1.toBytes(), &ct2.toBytes());
 }
 
@@ -243,8 +243,10 @@ test "entropy seam: randomSigma really draws, and two encryptions of one message
     // assertion of this same shape. Not re-measured here, and `sigma` is
     // smaller than `megolm`'s buffer, but it is still a plain byte array
     // filled the same way, with room for a partial fill.
-    const s1 = ciphersuite.randomSigma(io);
-    const s2 = ciphersuite.randomSigma(io);
+    var s1: [tlock.block_bytes]u8 = undefined;
+    ciphersuite.randomSigma(&s1, io);
+    var s2: [tlock.block_bytes]u8 = undefined;
+    ciphersuite.randomSigma(&s2, io);
     try std.testing.expect(!std.mem.eql(u8, &s1, &s2));
 
     // A liveness pin on `randomSigma` alone would still pass over an
@@ -258,8 +260,12 @@ test "entropy seam: randomSigma really draws, and two encryptions of one message
     const p_pub = quicknetPubkey();
     const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
 
-    const ct1 = tlock.encrypt(p_pub, 1000, message, ciphersuite.randomSigma(io));
-    const ct2 = tlock.encrypt(p_pub, 1000, message, ciphersuite.randomSigma(io));
+    var sigma1: [tlock.block_bytes]u8 = undefined;
+    ciphersuite.randomSigma(&sigma1, io);
+    var sigma2: [tlock.block_bytes]u8 = undefined;
+    ciphersuite.randomSigma(&sigma2, io);
+    const ct1 = testEncrypt(p_pub, 1000, message, sigma1);
+    const ct2 = testEncrypt(p_pub, 1000, message, sigma2);
     try std.testing.expect(!std.mem.eql(u8, &ct1.toBytes(), &ct2.toBytes()));
     // All three components move, not just one: U (= r·G₂ with
     // r = H3(sigma, M)), V (the masked `sigma`) and W (M ⊕ H4(sigma)).
@@ -274,8 +280,8 @@ test "entropy seam: randomSigma really draws, and two encryptions of one message
     // And the production path is a WORKING path, not merely a varying one:
     // both still open under the genuine round-1000 signature.
     const sig = round1000Signature();
-    const back1 = try tlock.decrypt(sig, ct1);
-    const back2 = try tlock.decrypt(sig, ct2);
+    const back1 = try testDecrypt(sig, ct1);
+    const back2 = try testDecrypt(sig, ct2);
     try std.testing.expectEqualSlices(u8, &message, &back1);
     try std.testing.expectEqualSlices(u8, &message, &back2);
 }
@@ -384,14 +390,14 @@ test "drand interop: decrypt a genuine Go-tle-produced ciphertext byte-exactly (
     if (!gate.core_implemented) return error.SkipZigTest;
 
     const ct = try tlock.Ciphertext.fromBytes(hexBytes(128, interop_ct_hex));
-    const filekey = try tlock.decrypt(interopRoundSignature(), ct);
+    const filekey = try testDecrypt(interopRoundSignature(), ct);
     try std.testing.expectEqualSlices(u8, &hexBytes(16, interop_filekey_hex), &filekey);
 }
 
 test "drand interop: re-encrypting the recovered (filekey, sigma) reproduces the Go ciphertext byte-exactly" {
     if (!gate.core_implemented) return error.SkipZigTest;
 
-    const ct = tlock.encrypt(
+    const ct = testEncrypt(
         quicknetTPubkey(),
         interop_round,
         hexBytes(16, interop_filekey_hex),
@@ -444,7 +450,7 @@ test "drand interop: the fixture rejects under a mismatched round signature (FO 
     // G1 point — but not the private key for THIS ciphertext's
     // identity, so decrypt must reject, never emit a wrong file key.
     const ct = try tlock.Ciphertext.fromBytes(hexBytes(128, interop_ct_hex));
-    try std.testing.expectError(error.FoCheckFailed, tlock.decrypt(round1000Signature(), ct));
+    try std.testing.expectError(error.FoCheckFailed, testDecrypt(round1000Signature(), ct));
 }
 
 // ── fuzz: Ciphertext.fromBytes / decrypt on hostile ciphertext bytes ────
@@ -518,7 +524,7 @@ const DamageSubject = struct {
         const sigma = [_]u8{0x22} ** tlock.block_bytes;
         return .{
             .round_signature = round_signature,
-            .bytes = tlock.encrypt(p_pub, round, message, sigma).toBytes(),
+            .bytes = testEncrypt(p_pub, round, message, sigma).toBytes(),
         };
     }
 };
@@ -553,7 +559,7 @@ fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
     _ = applyDamage(script[0..n], &bytes);
 
     const corrupted = tlock.Ciphertext.fromBytes(bytes) catch return;
-    _ = tlock.decrypt(subject.round_signature, corrupted) catch return;
+    _ = testDecrypt(subject.round_signature, corrupted) catch return;
 }
 
 test "corpus: every damage script actually damages, and the counts are pinned" {
@@ -586,7 +592,7 @@ test "corpus: every damage script actually damages, and the counts are pinned" {
 
         const ct = tlock.Ciphertext.fromBytes(bytes) catch continue;
         decoded += 1;
-        _ = tlock.decrypt(subject.round_signature, ct) catch continue;
+        _ = testDecrypt(subject.round_signature, ct) catch continue;
         decrypted += 1;
     }
     // Measured 2026-09-07: with the flip count drawn as a ranged value, 0
@@ -598,4 +604,15 @@ test "corpus: every damage script actually damages, and the counts are pinned" {
     // but outside G2, and the checked decoder refuses them before `decrypt`.
     try std.testing.expectEqual(@as(usize, 6), decoded);
     try std.testing.expectEqual(@as(usize, 1), decrypted);
+}
+
+// Test helpers over the pointer/out-param API: tests compare values, library
+// code never returns a secret through the stack.
+fn testEncrypt(p_pub: g2.Affine, round: u64, m: [tlock.block_bytes]u8, sigma: [tlock.block_bytes]u8) tlock.Ciphertext {
+    return tlock.encrypt(p_pub, round, &m, &sigma);
+}
+fn testDecrypt(round_signature: g1.Affine, ct: tlock.Ciphertext) ![tlock.block_bytes]u8 {
+    var out: [tlock.block_bytes]u8 = undefined;
+    try tlock.decrypt(&out, round_signature, ct);
+    return out;
 }

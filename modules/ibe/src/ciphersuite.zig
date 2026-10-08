@@ -163,11 +163,10 @@ pub fn h4(sigma: []const u8) [block_bytes]u8 {
 /// Fail-closed (`entropy.fill`, not `io.random`): `sigma` is the FO
 /// transform's only secret input, so IND-CCA rests entirely on it being
 /// unpredictable, and this signature returns a value with no error
-/// channel to say the draw degraded.
-pub fn randomSigma(io: std.Io) [block_bytes]u8 {
-    var buf: [block_bytes]u8 = undefined;
-    entropy.fill(io, &buf);
-    return buf;
+/// channel to say the draw degraded. Drawn straight into `out`: a returned
+/// copy would be one more secret left in the caller's frame.
+pub fn randomSigma(out: *[block_bytes]u8, io: std.Io) void {
+    entropy.fill(io, out);
 }
 
 // ── tests: REAL, ungated ──────────────────────────────────────────────

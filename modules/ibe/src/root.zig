@@ -128,6 +128,7 @@ test {
     _ = ciphersuite;
     _ = ibe_mod;
     _ = kat_test;
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names Boneh-Franklin CRYPTO 2001" {

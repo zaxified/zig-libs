@@ -281,7 +281,7 @@ pub fn Envelope(comptime Kem: type) type {
             if (plaintext.len > std.math.maxInt(u32)) return error.PlaintextTooLarge;
 
             // Lock 1 (time): timelock-encrypt s_time to round R.
-            const tl = tlock.encrypt(p_pub, round, rnd.s_time, rnd.tlock_sigma);
+            const tl = tlock.encrypt(p_pub, round, &rnd.s_time, &rnd.tlock_sigma);
             const tl_bytes = tl.toBytes();
 
             // Lock 2 (PQ): encapsulate s_pq to the recipient.
@@ -382,7 +382,8 @@ pub fn Envelope(comptime Kem: type) type {
             // the time gate.
             const tl = tlock.Ciphertext.fromBytes(p.time_lock.*) catch
                 return error.MalformedTimeLock;
-            var s_time = tlock.decrypt(round_signature, tl) catch
+            var s_time: [tlock.block_bytes]u8 = undefined;
+            tlock.decrypt(&s_time, round_signature, tl) catch
                 return error.TimeGateClosed;
             defer std.crypto.secureZero(u8, &s_time);
 

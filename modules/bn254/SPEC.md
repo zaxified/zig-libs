@@ -957,8 +957,24 @@ Note that memcheck cannot distinguish a conditional jump from a `cmov`, so a
 context is a place to look, not a proven branch — which is why the fix above
 is justified by the count CHANGING, not by the count existing.
 
+## Secret-holding entry points (dead-stack sweep, 2026-10-09)
+
+None. `bn254` is arithmetic, the pairing, the EIP-196/197 precompiles (`ecMul`
+takes its scalar from public calldata) and a Groth16 *verifier* (public proof, public
+inputs, trusted key). It has no key generation, signing, ECDH or prover; the only
+secrets it ever sees are scalars handed to the generic `G1`/`G2` `scalarMul`, `Fr`
+arithmetic and `Fr.random` by a consumer, which serves public and secret scalars
+alike and keeps its value API (same split as `bls12_381`'s curve layer). A consumer
+that multiplies by a secret owns its frame hygiene; the Groth16 prover in `groth16`
+does it (`groth16/src/burn.zig`, stack probe). Checked with `rg -n 'pub fn'
+modules/bn254/src` — no function takes or returns a key, nonce, or witness by name or
+role.
+
 ## Backlog
 
+- **`Fr.randomInto(out: *Fr, io)`** *(sweep 2026-10-09)*: `Fr.random` returns the
+  fresh scalar by value, so a prover's `r`/`s` or a key made from it is copied into the
+  caller's frame. `bls12_381` has the same item (its backlog item 0). Effort: small.
 - Part 3 (`G1`/`G2` group arithmetic — Jacobian/affine points,
   constant-time scalar multiplication, on-curve + subgroup checks):
   **done** (`g1.zig`/`g2.zig`).

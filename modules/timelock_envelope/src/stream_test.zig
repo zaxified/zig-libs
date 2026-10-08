@@ -105,12 +105,12 @@ test "the payload is byte-exactly tlock.age's whole-buffer STREAM under the deri
 
         const want = try testing.allocator.alloc(u8, age.sealedLen(len));
         defer testing.allocator.free(want);
-        age.sealPayload(want, key, pt);
+        age.sealPayload(want, &key, pt);
         try testing.expectEqualSlices(u8, want, wire[prefix_bytes..]);
 
         const back = try testing.allocator.alloc(u8, try age.openedLen(wire.len - prefix_bytes));
         defer testing.allocator.free(back);
-        try age.openPayload(back, key, wire[prefix_bytes..]);
+        try age.openPayload(back, &key, wire[prefix_bytes..]);
         try testing.expectEqualSlices(u8, pt, back);
     }
 }

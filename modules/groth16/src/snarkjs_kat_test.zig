@@ -235,8 +235,8 @@ fn buildKatFixture(alloc: std.mem.Allocator) !struct {
     const w = ntWitness();
     std.debug.assert(sys.isSatisfied(&w));
 
-    const kp = try prover.setup(nt_domain, alloc, sys, nt_num_public, ntToxicWaste());
-    const proof = try prover.prove(nt_domain, kp.pk, sys, nt_num_public, &w, .{
+    const kp = try prover.setup(nt_domain, alloc, sys, nt_num_public, &ntToxicWaste());
+    const proof = try prover.prove(nt_domain, kp.pk, sys, nt_num_public, &w, &.{
         .r = field.frFromU64(123),
         .s = field.frFromU64(456),
     });

@@ -78,7 +78,7 @@ Setup (external, caller-supplied):
 id = beaconId(round) = SHA-256(BigEndian64(round))     — REAL (ciphersuite.zig)
 Qid = H1(id) = hashToCurveG1(id, dst_g1)                — REAL
 
-encrypt(P_pub, round, M, sigma):        [FABLE CORE — tlock.encrypt]
+encrypt(P_pub, round, &M, &sigma):      [FABLE CORE — tlock.encrypt]
   Gid   = pairing(Qid, P_pub) ∈ Gt
   r     = H3(sigma, M) ∈ Fr
   U     = r · G2_generator ∈ G2
@@ -87,7 +87,7 @@ encrypt(P_pub, round, M, sigma):        [FABLE CORE — tlock.encrypt]
   W     = M XOR H4(sigma)
   return (U, V, W)
 
-decrypt(σ_round, (U,V,W)):              [FABLE CORE — tlock.decrypt]
+decrypt(out, σ_round, (U,V,W)):         [FABLE CORE — tlock.decrypt]
   gid_r = pairing(σ_round, U) ∈ Gt      (ONE pairing call — bilinearity gives gid_r for free)
   sigma = V XOR H2(gid_r)
   M     = W XOR H4(sigma)

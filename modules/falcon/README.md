@@ -67,7 +67,8 @@ try pk.verify(message, nonce, sig_field); // error.InvalidSignature | error.Sign
 const msg = try falcon.openNistSignedMessage(&pk, sm);
 
 // Secret-key decode + consistency check against the public key.
-const sk = try falcon.SecretKey.fromBytes(sk_bytes[0..1281]);
+var sk: falcon.SecretKey = undefined; // secrets go through out-params, never by value
+try falcon.SecretKey.fromBytes(&sk, sk_bytes[0..1281]);
 const pk2 = try sk.publicKey(); // h = g * f^-1 mod q
 
 // Falcon-1024: identical shape, `_1024`-suffixed types/entry points.
@@ -77,11 +78,14 @@ const msg10 = try falcon.openNistSignedMessage1024(&pk10, sm);
 
 // Keygen + sign (see the constant-time caveat above before production
 // signing). `rng` is any std.Random backed by a CSPRNG.
-const kp = try falcon.generateKeyPair(rng);
+var signing_key: falcon.SigningKey = undefined;
+var public_key: falcon.PublicKey = undefined;
+try falcon.generateKeyPair(rng, &signing_key, &public_key);
+defer signing_key.secureZero();
 var nonce_buf: [falcon.nonce_length]u8 = undefined;
 var sig_buf: [falcon.max_sig_field_length]u8 = undefined;
-const len = try falcon.signRandomized(&kp.signing_key, message, rng, &nonce_buf, &sig_buf);
-try kp.public_key.verify(message, &nonce_buf, sig_buf[0..len]);
+const len = try falcon.signRandomized(&signing_key, message, rng, &nonce_buf, &sig_buf);
+try public_key.verify(message, &nonce_buf, sig_buf[0..len]);
 // Falcon-1024: falcon.generateKeyPair1024 / signRandomized1024, same shape.
 ```
 

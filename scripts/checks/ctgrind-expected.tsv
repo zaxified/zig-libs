@@ -435,7 +435,7 @@ rsa	ReleaseFast	noncrt	1	0	4c52c48432f3b855	d4057b00f9df7b56
 rsa	ReleaseFast	keygen	1	<=173	4c52c48432f3b855	2cb28867b78d48a6
 slhdsa	ReleaseFast	seed	1	4	8df59dd9b6015673	e0fdde7f5c62a2d6
 slhdsa	ReleaseFast	prf	1	8	8df59dd9b6015673	e0fdde7f5c62a2d6
-falcon	ReleaseFast	sign	1	<=133	d6b62d587b79541c	3f5a6dbb61a76d9d
+falcon	ReleaseFast	sign	1	<=133	ced123e2ab52d8b3	3f5a6dbb61a76d9d
 bls12_381	ReleaseFast	field	1	1	3747e93eca1a8b27	c1e8a3c184eada53
 # 2026-10-02 — Fr off std.crypto.ff, bls12_381 ctSelect + Fp2.isZero barriers.
 # `Fr` (bls12_381, bn254) is now `montint.Field`; ff branched on secrets in
@@ -758,11 +758,11 @@ paillier	ReleaseFast	keygen	1	<=314	291eddbe64eb8500	61a35e2d95a376cf
 # fp12pow, and :397 (pairing final-exp inv), :421, :423, :424 (the FO
 # re-encryption compare: toBytesCompressed + mem.eql) for decrypt; the leaves
 # are in bls12_381 (field/fp/fp2/g2.zig) since tlock moved onto it.
-tlock	ReleaseFast	fp12pow	1	5	bb25a5198dbaac47	b904bd817d356db7
-tlock	ReleaseFast	decrypt	1	8	bb25a5198dbaac47	3a939f7ff5b39d03
-ibe	ReleaseFast	extract	1	1	140a7d3db097ec1b	686f0732e74c5ef7
-ibe	ReleaseFast	decrypt	1	10	ba4d234657626842	fb52b6c55cc51706
-ibe	ReleaseFast	fp12pow	1	0	140a7d3db097ec1b	d2e187260f9f18a2
+tlock	ReleaseFast	fp12pow	1	5	0152f8858627d296	b904bd817d356db7
+tlock	ReleaseFast	decrypt	1	8	0152f8858627d296	3a939f7ff5b39d03
+ibe	ReleaseFast	extract	1	1	a6e90ea318021603	686f0732e74c5ef7
+ibe	ReleaseFast	decrypt	1	10	171884ea14542550	fb52b6c55cc51706
+ibe	ReleaseFast	fp12pow	1	0	a6e90ea318021603	d2e187260f9f18a2
 # frost sign 5 -> 13 (audit 2026-10-08): round2Sign now recomputes its own
 # commitments (RFC 9591 §5.2's MUST check) -- the two combMulBase ladders and
 # two Element.fromPoint of round1Commit (the classes the commit row already

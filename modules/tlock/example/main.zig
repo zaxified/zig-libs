@@ -102,16 +102,18 @@ fn roundA(gpa: std.mem.Allocator) !void {
 
     // A production caller draws sigma from real entropy rather than a fixed
     // constant -- exercising the `entropy` dep this module declares.
-    const sigma = tlock.ciphersuite.randomSigma(io);
-    const ct = tlock.encrypt(p_pub, round, message, sigma);
+    var sigma: [tlock.block_bytes]u8 = undefined;
+    tlock.ciphersuite.randomSigma(&sigma, io);
+    const ct = tlock.encrypt(p_pub, round, &message, &sigma);
 
     // Wrong signature first: nobody has round 1000's genuine private key
     // (its beacon signature) except by fetching it from the network -- the
     // temporal secret this scheme sells. Standing in for "not reached yet",
     // a signature for a NEIGHBORING round is offered instead and rejected
     // by the Fiat-Shamir-Okamoto consistency check, by name.
-    const ct_wrong_round = tlock.encrypt(p_pub, round + 1, message, sigma);
-    if (tlock.decrypt(round1000Signature(), ct_wrong_round)) |_| {
+    const ct_wrong_round = tlock.encrypt(p_pub, round + 1, &message, &sigma);
+    var rejected: [tlock.block_bytes]u8 = undefined;
+    if (tlock.decrypt(&rejected, round1000Signature(), ct_wrong_round)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.FoCheckFailed => std.debug.print(
@@ -124,7 +126,8 @@ fn roundA(gpa: std.mem.Allocator) !void {
     // same way -- a bit-flip in V, not a wrong round.
     var tampered = ct;
     tampered.v[0] ^= 0xff;
-    if (tlock.decrypt(round1000Signature(), tampered)) |_| {
+    var rejected2: [tlock.block_bytes]u8 = undefined;
+    if (tlock.decrypt(&rejected2, round1000Signature(), tampered)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.FoCheckFailed => std.debug.print("round A: tampered ciphertext (V flipped): FoCheckFailed (expected)\n", .{}),
@@ -132,7 +135,8 @@ fn roundA(gpa: std.mem.Allocator) !void {
 
     // Now the genuine round-1000 signature: this is "the round has been
     // reached and the beacon published" -- the ciphertext opens.
-    const recovered = try tlock.decrypt(round1000Signature(), ct);
+    var recovered: [tlock.block_bytes]u8 = undefined;
+    try tlock.decrypt(&recovered, round1000Signature(), ct);
     if (!std.mem.eql(u8, &message, &recovered)) return error.WrongPlaintext;
     std.debug.print("round A: decrypted under the genuine published round-1000 signature -- plaintext matches\n", .{});
 }
@@ -175,7 +179,8 @@ fn roundB() !void {
     // The mainnet quicknet round-1000 signature is a perfectly valid G1
     // point -- but it is not this ciphertext's round's private key, so it
     // must be rejected, never silently emit a wrong file key.
-    if (tlock.decrypt(round1000Signature(), ct)) |_| {
+    var rejected3: [tlock.block_bytes]u8 = undefined;
+    if (tlock.decrypt(&rejected3, round1000Signature(), ct)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.FoCheckFailed => std.debug.print(
@@ -187,7 +192,8 @@ fn roundB() !void {
     // The genuine testnet round-5423142 signature: decrypts a ciphertext
     // this example never produced, byte-exactly, to drand's own recorded
     // plaintext.
-    const filekey = try tlock.decrypt(interopRoundSignature(), ct);
+    var filekey: [tlock.block_bytes]u8 = undefined;
+    try tlock.decrypt(&filekey, interopRoundSignature(), ct);
     const expected = hexBytes(16, interop_filekey_hex);
     if (!std.mem.eql(u8, &expected, &filekey)) return error.WrongPlaintext;
     std.debug.print("round B: genuine drand-Go-tle ciphertext decrypted byte-exactly to the published file key\n", .{});

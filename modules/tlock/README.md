@@ -50,10 +50,11 @@ const tlock = @import("tlock");
 //          ciphersuite.block_bytes's doc comment for why 16, not arbitrary).
 // sigma: BF-IBE's random padding — an EXPLICIT parameter (see "Randomness"
 //        below), sourced from ciphersuite.randomSigma(io) in production.
-const ct = tlock.encrypt(p_pub, round, message, sigma);
+const ct = tlock.encrypt(p_pub, round, &message, &sigma); // secrets by pointer
 
 // Once `round` is reached and the beacon publishes its signature:
-const plaintext = try tlock.decrypt(round_signature, ct);
+var plaintext: [tlock.block_bytes]u8 = undefined;
+try tlock.decrypt(&plaintext, round_signature, ct);
 // round_signature: the beacon's published G1 threshold-BLS signature
 // for `round` — this IS the BF-IBE private key. decrypt returns
 // error.FoCheckFailed (never a garbage plaintext) if the ciphertext
@@ -77,8 +78,11 @@ the file itself with age's STREAM (ChaCha20-Poly1305, 64 KiB chunks).
 ```zig
 const age = tlock.age;
 
-// Encrypt (rnd = age.Randomness.draw(io) in production):
-const file = try age.encryptAlloc(gpa, plaintext, p_pub, round, chain_hash, rnd, .{ .armor = true });
+// Encrypt (`rnd.draw(io)` in production; it holds the file key — wipe it after):
+var rnd: age.Randomness = undefined;
+rnd.draw(io);
+defer rnd.wipe();
+const file = try age.encryptAlloc(gpa, plaintext, p_pub, round, chain_hash, &rnd, .{ .armor = true });
 defer gpa.free(file);
 
 // Which round must be published before this opens?
@@ -118,7 +122,8 @@ read from `std.Io`/internal entropy directly — mirroring `bbs`/
 
 ```zig
 // Real entropy (production):
-const sigma = tlock.ciphersuite.randomSigma(io);
+var sigma: [tlock.block_bytes]u8 = undefined;
+tlock.ciphersuite.randomSigma(&sigma, io);
 
 // A fixed value (KAT reproducibility / deterministic ciphertext pinning):
 const sigma = [_]u8{0x11} ** tlock.block_bytes;

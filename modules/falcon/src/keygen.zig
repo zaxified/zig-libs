@@ -13,6 +13,7 @@ const std = @import("std");
 const codec = @import("codec.zig");
 const ntru = @import("ntru.zig");
 const ffsampling = @import("ffsampling.zig");
+const burn = @import("burn.zig");
 
 /// Key generation, specialized to one `poly.Ring(logn)` degree.
 pub fn Keygen(comptime Ring: type) type {
@@ -48,13 +49,20 @@ pub fn Keygen(comptime Ring: type) type {
             /// `SecretKey.fromBytes` decodes (already NIST-KAT-verified),
             /// so a generated key round-trips through the existing
             /// decode path unchanged.
-            pub fn toSecretKeyBytes(sk: *const SigningKey) [Self.secret_key_encoded_length]u8 {
-                var out: [Self.secret_key_encoded_length]u8 = undefined;
+            ///
+            /// The encoding is written into the caller's `out` (the encoded
+            /// secret key is a secret, so it is not returned by value); the
+            /// encoder runs one frame down and the stack it dirtied is
+            /// zeroed (`burn.zig`).
+            pub fn toSecretKeyBytes(sk: *const SigningKey, out: *[Self.secret_key_encoded_length]u8) void {
+                burn.run(burn.by(Ring.logn, burn.codec_burn), void, encodeBody, .{ sk, out });
+            }
+
+            fn encodeBody(sk: *const SigningKey, out: *[Self.secret_key_encoded_length]u8) void {
                 out[0] = 0x50 + @as(u8, Ring.logn);
                 Codec.trimI8Encode(fg_bits, out[1 .. 1 + fg_len], &sk.f);
                 Codec.trimI8Encode(fg_bits, out[1 + fg_len .. 1 + 2 * fg_len], &sk.g);
                 Codec.trimI8Encode(big_f_bits, out[1 + 2 * fg_len ..], &sk.big_f);
-                return out;
             }
 
             /// Zero the secret NTRU basis (f, g, F, G — both the direct
@@ -100,23 +108,25 @@ pub fn Keygen(comptime Ring: type) type {
         /// `ntru.generate`'s own acceptance loop already rules that out
         /// before returning, so this is a belt-and-suspenders check
         /// mirroring `root.zig`'s existing `SecretKey.publicKey`.
-        pub fn generate(rng: std.Random) error{NotInvertible}!struct {
-            signing_key: SigningKey,
-            public_key_h: Ring.Poly,
-        } {
-            const basis = N.generate(rng); // NTRUGen + NTRUSolve (ntru.zig)
-            const h = try Ring.computePublic(&basis.f, &basis.g); // REUSED, already KAT-verified
-            const tree = ffsampling.buildTree(Ring, &basis.f, &basis.g, &basis.big_f, &basis.big_g);
-            return .{
-                .signing_key = .{
-                    .f = basis.f,
-                    .g = basis.g,
-                    .big_f = basis.big_f,
-                    .big_g = basis.big_g,
-                    .tree = tree,
-                },
-                .public_key_h = h,
-            };
+        ///
+        /// The key goes into the caller's `sk` (zeroed on error), the public
+        /// polynomial into `h`. The generation runs one frame down and the
+        /// stack it dirtied is zeroed (`burn.zig`).
+        pub fn generate(rng: std.Random, sk: *SigningKey, h: *Ring.Poly) error{NotInvertible}!void {
+            return burn.run(burn.by(Ring.logn, burn.keygen_burn), error{NotInvertible}!void, generateBody, .{ rng, sk, h });
+        }
+
+        fn generateBody(rng: std.Random, sk: *SigningKey, h: *Ring.Poly) error{NotInvertible}!void {
+            errdefer sk.secureZero();
+            var basis: N.Basis = undefined;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&basis));
+            N.generate(rng, &basis); // NTRUGen + NTRUSolve (ntru.zig)
+            h.* = try Ring.computePublic(&basis.f, &basis.g); // REUSED, already KAT-verified
+            sk.f = basis.f;
+            sk.g = basis.g;
+            sk.big_f = basis.big_f;
+            sk.big_g = basis.big_g;
+            ffsampling.buildTree(Ring, &sk.tree, &basis.f, &basis.g, &basis.big_f, &basis.big_g);
         }
     };
 }
@@ -150,9 +160,10 @@ test "Keygen(Ring).SigningKey.toSecretKeyBytes round-trips through root.zig's Se
     for (&sk.big_f) |*x| x.* = @intCast(random.intRangeAtMost(i16, -127, 127)); // 8-bit range
     sk.big_g = std.mem.zeroes([poly.Ring512.n]i8); // unused by toSecretKeyBytes
 
-    const bytes = sk.toSecretKeyBytes();
-    try std.testing.expectEqual(@as(usize, 1281), bytes.len);
-    const decoded = try falcon.SecretKey.fromBytes(&bytes);
+    var bytes: [1281]u8 = undefined;
+    sk.toSecretKeyBytes(&bytes);
+    var decoded: falcon.SecretKey = undefined;
+    try falcon.SecretKey.fromBytes(&decoded, &bytes);
     try std.testing.expectEqualSlices(i8, &sk.f, &decoded.f);
     try std.testing.expectEqualSlices(i8, &sk.g, &decoded.g);
     try std.testing.expectEqualSlices(i8, &sk.big_f, &decoded.big_f);

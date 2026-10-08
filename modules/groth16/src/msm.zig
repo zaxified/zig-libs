@@ -171,7 +171,11 @@ fn Pippenger(comptime J: type, comptime A: type) type {
 
             // Canonical scalars as little-endian limbs, once.
             const limbs = try allocator.alloc([4]u64, n);
-            defer allocator.free(limbs);
+            defer {
+                // The scalars may be a witness; so may the buckets they chose.
+                std.crypto.secureZero(u8, std.mem.sliceAsBytes(limbs));
+                allocator.free(limbs);
+            }
             for (scalars, limbs) |s, *l| {
                 const be = s.toBytes();
                 for (0..4) |k| l[k] = std.mem.readInt(u64, be[32 - 8 * (k + 1) ..][0..8], .big);
@@ -179,7 +183,11 @@ fn Pippenger(comptime J: type, comptime A: type) type {
 
             const c = windowBits(n);
             const buckets = try allocator.alloc(J, (@as(usize, 1) << c) - 1);
-            defer allocator.free(buckets);
+            defer {
+                // Which bases sit in which bucket is the scalars' digits.
+                std.crypto.secureZero(u8, std.mem.sliceAsBytes(buckets));
+                allocator.free(buckets);
+            }
 
             const scalar_bits = 254; // r < 2^254
             const windows = (scalar_bits + @as(usize, c) - 1) / c;

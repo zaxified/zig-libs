@@ -154,7 +154,7 @@ pub fn Stream(comptime Kem: type) type {
                 gpa.free(buf);
             }
 
-            const tl = tlock.encrypt(p_pub, round, rnd.s_time, rnd.tlock_sigma);
+            const tl = tlock.encrypt(p_pub, round, &rnd.s_time, &rnd.tlock_sigma);
             const enc = Kem.encaps(recipient_ek, &rnd.kem_coins);
 
             var prefix: [prefix_bytes]u8 = undefined;
@@ -168,7 +168,10 @@ pub fn Stream(comptime Kem: type) type {
 
             var th: [Sha256.digest_length]u8 = undefined;
             Sha256.hash(&prefix, &th, .{});
-            var ps = PayloadStream.init(deriveStreamKey(rnd.s_time, enc.ss, Env.suite_id, round, th));
+            var stream_key = deriveStreamKey(rnd.s_time, enc.ss, Env.suite_id, round, th);
+            defer std.crypto.secureZero(u8, &stream_key);
+            var ps: PayloadStream = undefined;
+            ps.init(&stream_key);
             defer ps.wipe();
 
             try writer.writeAll(&prefix);
@@ -213,7 +216,8 @@ pub fn Stream(comptime Kem: type) type {
 
             const tl = tlock.Ciphertext.fromBytes(prefix[stream_header_bytes..][0..Env.time_lock_bytes].*) catch
                 return error.MalformedTimeLock;
-            var s_time = tlock.decrypt(round_signature, tl) catch return error.TimeGateClosed;
+            var s_time: [tlock.block_bytes]u8 = undefined;
+            tlock.decrypt(&s_time, round_signature, tl) catch return error.TimeGateClosed;
             defer std.crypto.secureZero(u8, &s_time);
             // Implicit rejection: a wrong key gives a pseudo-random s_pq,
             // which surfaces as AuthFailed on the first chunk.
@@ -222,7 +226,10 @@ pub fn Stream(comptime Kem: type) type {
 
             var th: [Sha256.digest_length]u8 = undefined;
             Sha256.hash(&prefix, &th, .{});
-            var ps = PayloadStream.init(deriveStreamKey(s_time, s_pq, Env.suite_id, round, th));
+            var stream_key = deriveStreamKey(s_time, s_pq, Env.suite_id, round, th);
+            defer std.crypto.secureZero(u8, &stream_key);
+            var ps: PayloadStream = undefined;
+            ps.init(&stream_key);
             defer ps.wipe();
 
             const buf = try gpa.alloc(u8, sealed_chunk_bytes + 1 + chunk_bytes);

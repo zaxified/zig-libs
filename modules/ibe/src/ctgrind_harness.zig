@@ -207,10 +207,11 @@ fn buildDecryptFixture() !struct { d_id: g1.Affine, ct: ibe_mod.Ciphertext } {
     const msk = try secretFr("ctgrind-ibe-harness-fixture-msk-v1", .no);
     const mpk = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(msk).toAffine();
     const id = "ctgrind-ibe-harness-identity@example.com";
-    const d_id = ibe_mod.extract(msk, id);
+    var d_id: g1.Affine = undefined;
+    ibe_mod.extract(&d_id, &msk, id);
     const message = [_]u8{0xAB} ** ibe_mod.block_bytes;
     const sigma = [_]u8{0x11} ** ibe_mod.block_bytes;
-    const ct = ibe_mod.encrypt(mpk, id, message, sigma);
+    const ct = ibe_mod.encrypt(mpk, id, &message, &sigma);
     return .{ .d_id = d_id, .ct = ct };
 }
 
@@ -243,7 +244,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // fixed public identity string — never tainted.
             const msk = try secretFr("ctgrind-ibe-harness-msk-v1", taint);
             const id = "ctgrind-ibe-harness-identity@example.com";
-            const d = ibe_mod.extract(msk, id);
+            var d: g1.Affine = undefined;
+            ibe_mod.extract(&d, &msk, id);
 
             // Propagation proof.
             std.debug.print("d.x={x}\n", .{d.x.toBytes()});
@@ -257,7 +259,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var d_id = reloadVolatile(g1.Affine, &fixture.d_id);
             taintBytes(taint, std.mem.asBytes(&d_id));
 
-            const message = ibe_mod.decrypt(d_id, fixture.ct) catch |err| {
+            var message: [ibe_mod.block_bytes]u8 = undefined;
+            ibe_mod.decrypt(&message, &d_id, fixture.ct) catch |err| {
                 // Reachable only if the fixture's own (msk, id, message,
                 // sigma) ever stop agreeing with each other, which the
                 // fixed values above do not. Handled anyway so a future

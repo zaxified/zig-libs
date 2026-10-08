@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack sweep (wave 6): **no secret-holding entry point** — no
+  key generation, signing, ECDH or prover here (the Groth16 prover is `groth16`'s, and
+  is swept there); `ecMul` takes a public scalar. The curve layer keeps its value API.
+  SPEC records the finding and the one follow-up (`Fr.randomInto`). Docs only.
 - **2026-10-03** — **Fast `G2` subgroup check:** `g2.Jacobian.subgroupCheck` is
   `ψ(Q) == [6x²]Q` after the twist equation — one variable-time multiplication by
   a public 127-bit constant instead of the 254-bit constant-time ladder by `r`

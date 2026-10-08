@@ -20,14 +20,28 @@
 const std = @import("std");
 const bn254 = @import("bn254");
 const bin = @import("snarkjs_bin.zig");
+const burn = @import("burn.zig");
 const r1cs = @import("r1cs.zig");
 
 const Fr = bn254.Fr;
 const Allocator = std.mem.Allocator;
 pub const Error = bin.ParseError || Allocator.Error;
 
-/// Parses a `.wtns` into a freshly allocated witness vector.
+/// Parses a `.wtns` into a freshly allocated witness vector. The vector is
+/// secret: release it with `freeWitness`, which wipes it first. The decode runs
+/// one frame down and its stack is zeroed after it; `bytes` (the file) is the
+/// caller's to wipe.
 pub fn parseWitness(allocator: Allocator, bytes: []const u8) Error![]Fr {
+    return burn.run(burn.witness_burn, Error![]Fr, parseWitnessBody, .{ allocator, bytes });
+}
+
+/// Wipes a witness returned by `parseWitness`, then frees it.
+pub fn freeWitness(allocator: Allocator, witness: []Fr) void {
+    std.crypto.secureZero(u8, std.mem.sliceAsBytes(witness));
+    allocator.free(witness);
+}
+
+fn parseWitnessBody(allocator: Allocator, bytes: []const u8) Error![]Fr {
     const f = try bin.BinFile.parse(bytes, "wtns");
     if (f.version != 2) return error.UnsupportedVersion;
     var hc: bin.Cursor = .{ .bytes = try f.get(1) };

@@ -1800,21 +1800,25 @@ pub fn Ntru(comptime Ring: type) type {
         /// equation solvable) retries internally until a valid basis is
         /// found — the spec's own analysis says a few tries suffice, so
         /// no iteration cap is exposed here.
-        pub fn generate(rng: std.Random) Basis {
+        ///
+        /// The basis is written into the caller's `out` (a secret, so it is
+        /// not returned by value); `out` holds rejected candidates while the
+        /// loop runs and the accepted basis on return.
+        pub fn generate(rng: std.Random, out: *Basis) void {
             const logn = Ring.logn;
             const n = Ring.n;
             comptime std.debug.assert(Ring.n == @as(usize, 1) << Ring.logn);
 
             const primes = computePrimes();
-            var basis: Basis = undefined;
+            const basis = out;
             // Shared u32 pool for all of NTRUSolve; 8n limbs covers the
             // deepest make_fg layout (6n at the top step, offset 2*209)
             // and every solver level (see the per-level layouts above).
             // `pool`/`rt1`/`rt2`/`rt3` are scratch that carries the secret
             // (f, g) basis through NTRUSolve's big-integer descent and the
-            // FP Gram-Schmidt norm check; wiped on return. `basis` itself
-            // is NOT wiped here — it is the function's return value (the
-            // actual signing key material the caller still needs).
+            // FP Gram-Schmidt norm check; wiped on return. `basis` (= `out`)
+            // is NOT wiped here — it is the actual signing key material the
+            // caller still needs.
             var pool: [8 * n + 64]u32 = undefined;
             defer std.crypto.secureZero(u32, &pool);
             var rt1: [n]f64 = undefined;
@@ -1875,7 +1879,7 @@ pub fn Ntru(comptime Ring: type) type {
                     continue;
                 }
 
-                return basis;
+                return;
             }
         }
     };
@@ -1926,7 +1930,8 @@ test "NTRUSolve reproduces the Falcon-512 KAT secret key's F byte-exact" {
     const sk = try gpa.alloc(u8, v.falcon512[0].sk.len / 2);
     defer gpa.free(sk);
     _ = try std.fmt.hexToBytes(sk, v.falcon512[0].sk);
-    const dsk = try falcon.SecretKey.fromBytes(sk[0..falcon.SecretKey.encoded_length]);
+    var dsk: falcon.SecretKey = undefined;
+    try falcon.SecretKey.fromBytes(&dsk, sk[0..falcon.SecretKey.encoded_length]);
 
     const primes = computePrimes();
     var pool: [8 * 512 + 64]u32 = undefined;
@@ -1946,7 +1951,8 @@ test "NTRUSolve reproduces the Falcon-1024 KAT secret key's F byte-exact" {
     const sk = try gpa.alloc(u8, v.falcon1024[0].sk.len / 2);
     defer gpa.free(sk);
     _ = try std.fmt.hexToBytes(sk, v.falcon1024[0].sk);
-    const dsk = try falcon.SecretKey1024.fromBytes(sk[0..falcon.SecretKey1024.encoded_length]);
+    var dsk: falcon.SecretKey1024 = undefined;
+    try falcon.SecretKey1024.fromBytes(&dsk, sk[0..falcon.SecretKey1024.encoded_length]);
 
     const primes = computePrimes();
     var pool: [8 * 1024 + 64]u32 = undefined;

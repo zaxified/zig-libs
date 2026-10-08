@@ -136,6 +136,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("harness_test.zig");
     _ = @import("snarkjs_kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta names the Groth16 construction and the bn254 dep" {
