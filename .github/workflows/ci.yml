@@ -62,6 +62,7 @@ on:
           - examples ReleaseSafe arm64
           - interop ReleaseSafe amd64
           - ctgrind amd64
+          - count amd64
 
 # Least privilege. The gate reads the repository and nothing else — it opens no
 # issue, pushes no tag, publishes no package — so saying so here means a
