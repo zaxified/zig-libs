@@ -974,3 +974,37 @@ test "the local seed helper produces what Smith.slice reads back" {
     const n = smith.slice(&buf);
     try std.testing.expectEqualStrings("abcdef", buf[0..n]);
 }
+
+// Mutation run 2026-10-08: dropping either carry of `add`'s select, or the
+// carry of `mulSmall`'s fold, left the suite green — random draws reach a sum
+// in [p, 2^256) or a fold that overflows 2^256 with probability ~2^-220. These
+// inputs reach each case on purpose; std is the oracle.
+test "add/mulSmall: sums in [p, 2^256), sums past 2^256, folds past 2^256" {
+    const c: u256 = c_fold;
+    const add_cases = [_][2]u256{
+        .{ field_order - 1, 1 }, // = p: no 257th bit, must reduce to 0
+        .{ field_order - 1, c }, // = 2^256 − 1: no 257th bit, ≥ p
+        .{ field_order - 1, field_order - 1 }, // past 2^256
+        .{ 1 << 255, 1 << 255 }, // exactly 2^256
+        .{ field_order - 2, 2 },
+    };
+    for (add_cases) |ab| {
+        const a = Fe{ ._limbs = fromU256(ab[0]) };
+        const b = Fe{ ._limbs = fromU256(ab[1]) };
+        var sa: [32]u8 = undefined;
+        var sb: [32]u8 = undefined;
+        std.mem.writeInt(u256, &sa, ab[0], .big);
+        std.mem.writeInt(u256, &sb, ab[1], .big);
+        const want = (try StdFe.fromBytes(sa, .big)).add(try StdFe.fromBytes(sb, .big));
+        try std.testing.expectEqualSlices(u8, &want.toBytes(.big), &a.add(b).toBytes(.big));
+        try std.testing.expectEqualSlices(u8, &want.toBytes(.big), &b.add(a).toBytes(.big));
+    }
+    // a = ⌊(j·2^256 + 2^256 − 1)/21⌋: 21·a has high word j and a low word
+    // within 21 of 2^256, so `lo + j·c` carries out for every j ≥ 1.
+    for (0..21) |j| {
+        const a_int: u256 = @intCast(((@as(u512, j) << 256) + ((@as(u512, 1) << 256) - 1)) / 21);
+        if (a_int >= field_order) continue;
+        const a = Fe{ ._limbs = fromU256(a_int) };
+        try std.testing.expectEqual(a.mul(try Fe.fromInt(21)).toInt(), a.mulSmall(21).toInt());
+    }
+}

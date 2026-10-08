@@ -672,3 +672,40 @@ test "affineCoordinatesPublic == affineCoordinates (random projective points, id
     try std.testing.expectEqual(o.affineCoordinates().x.toInt(), o.affineCoordinatesPublic().x.toInt());
     try std.testing.expectEqual(o.affineCoordinates().y.toInt(), o.affineCoordinatesPublic().y.toInt());
 }
+
+// Mutation run 2026-10-08: with G as the SECOND base the dispatch could pass
+// the two scalars swapped and the suite stayed green — every caller puts G
+// first. Distinct scalars, G in either position, against the double-add oracle.
+test "mulDoubleBasePublic: G as the second base takes its own scalar" {
+    var kb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &kb, 0xC0DE_F00D_1234, .big);
+    const p = try Secp256k1.basePoint.mulPublic(kb, .big);
+    const g = Secp256k1.basePoint;
+    var s1: [32]u8 = undefined;
+    var s2: [32]u8 = undefined;
+    std.mem.writeInt(u256, &s1, 0x1111_2222_3333, .big);
+    std.mem.writeInt(u256, &s2, 0x9999_8888_7777_6666, .big);
+    const want = (try Secp256k1.mulDoubleBasePublicDoubleAdd(p, s1, g, s2, .big)).affineCoordinates();
+    const got = (try Secp256k1.mulDoubleBasePublic(p, s1, g, s2, .big)).affineCoordinates();
+    try std.testing.expectEqual(want.x.toInt(), got.x.toInt());
+    try std.testing.expectEqual(want.y.toInt(), got.y.toInt());
+    const got_g_first = (try Secp256k1.mulDoubleBasePublic(g, s2, p, s1, .big)).affineCoordinates();
+    try std.testing.expectEqual(want.x.toInt(), got_g_first.x.toInt());
+}
+
+// Mutation run 2026-10-08: the `z = 0` test in `affineCoordinatesPublic` could
+// go and the suite stayed green, because the only identity it saw was the
+// constant `(0 : 1 : 0)`, which the affine-(0, 1) test also catches. The
+// complete law's `P + (−P)` is `(0 : Y : 0)` with any `Y`.
+test "affineCoordinatesPublic: an identity with z = 0 and y ∉ {0, 1}" {
+    var kb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &kb, 0xABCDEF, .big);
+    const p = try Secp256k1.basePoint.mulPublic(kb, .big);
+    const o = p.add(p.neg());
+    try std.testing.expect(o.z.isZero());
+    try std.testing.expect(!o.y.isZero() and !o.y.equivalent(Fe.one));
+    const want = o.affineCoordinates();
+    const got = o.affineCoordinatesPublic();
+    try std.testing.expectEqual(want.x.toInt(), got.x.toInt());
+    try std.testing.expectEqual(want.y.toInt(), got.y.toInt());
+}

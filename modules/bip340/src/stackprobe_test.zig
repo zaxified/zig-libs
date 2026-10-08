@@ -224,9 +224,13 @@ test "STACKPROBE (A1 F2): no key or nonce residue on the dead stack after sign()
 /// leaves behind, not the caller's own copy of the pair.
 var probe_pairs: [cases.len]bip340.KeyPair = undefined;
 
+/// Picks the pair by `aux` (public, different per case), never by `sk`:
+/// comparing the key bytes put a copy of the key in THIS frame, and the probe
+/// counted the harness's own copy (measured 2026-10-08 in another build).
 noinline fn callSignWithKeyPair(sk: bip340.SecretKey, aux: [32]u8) void {
+    _ = sk;
     for (cases, &probe_pairs) |case, *kp| {
-        if (!std.mem.eql(u8, &case.sk, &sk.bytes)) continue;
+        if (case.aux[0] != aux[0]) continue;
         const sig = bip340.signWithKeyPair(kp, msg, aux, sign_io) catch unreachable;
         std.mem.doNotOptimizeAway(&sig);
         return;
