@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **FIX (secrets on the dead stack):** the dead-stack burn's buffer is now
+  16-aligned instead of the vector type's natural 32. At 32 the burn's frame was realigned, and
+  the up to 56 bytes between its saved frame pointer and the buffer — the top of the frame the
+  burned body had used — stayed unzeroed (found by `threshold_ecdsa`'s stack probe: half of a
+  secret survived there). No API change.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (speed):** the dead-stack burn added earlier
   today zeroes with volatile 32-byte vector stores instead of `u64` stores (~4× faster per KiB).
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** measured with the new
