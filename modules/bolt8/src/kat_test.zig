@@ -171,6 +171,26 @@ test "F5: readAct2 failing kills the initiator too, even though the transcript a
     try testing.expectError(error.WrongState, initiator.readAct2(try act.Act2.fromBytes(kv.act2_bytes)));
 }
 
+test "F5: Act One failing on a malformed rs, and readAct1 failing on a bad MAC, kill the object too" {
+    // Act One's only failure is the DH against `rs`, which `init` takes
+    // unvalidated. Its `.failed` errdefer had no test: dropping it survived
+    // the 2026-10-08 mutation run, leaving the initiator in `.start` with
+    // `h` already holding the first ephemeral -- a retry would run Act One
+    // again over a transcript the responder can never match.
+    const ls = try dh.KeyPair.generateDeterministic(kv.init_ls_priv.*);
+    var initiator = handshake.Initiator.init(ls, kv.bad_pubkey_serialization.*);
+    const e = try dh.KeyPair.generateDeterministic(kv.init_e_priv.*);
+    try testing.expectError(error.InvalidPublicKey, initiator.genAct1WithEphemeral(e));
+    try testing.expectEqual(handshake.Initiator.State.failed, initiator.state);
+    try testing.expectError(error.WrongState, initiator.genAct1WithEphemeral(e));
+
+    const rls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
+    var responder = handshake.Responder.init(rls);
+    try testing.expectError(error.DecryptionFailed, responder.readAct1(try act.Act1.fromBytes(kv.act1_bad_mac)));
+    try testing.expectEqual(handshake.Responder.State.failed, responder.state);
+    try testing.expectError(error.WrongState, responder.readAct1(try act.Act1.fromBytes(kv.act1_bytes)));
+}
+
 test "KAT: 'transport-responder act1 bad key serialization test' — readAct1 must reject a malformed e.pub prefix" {
     // Audit finding F4 (2026-09-05): of BOLT#8's 16 named test vectors, this
     // was the one embedded nowhere and exercised nowhere. The module
