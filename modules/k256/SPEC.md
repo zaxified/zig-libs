@@ -359,8 +359,10 @@ tree dirties 2 608 B; with it: **0 residues in all eight representations over
 and ReleaseSafe, where `undefined` is filled and the scan cannot see a dead
 frame — measured: at ReleaseSafe its positive control read 0. The burn adds no
 branch: the `ecdsa` ctgrind row read 15/10/5/0 before and after, same source
-lines shifted by the inserted text. `bip340Sign` was not converted and is not
-covered by this claim.
+lines shifted by the inserted text. `sign.bip340Sign` got the same shape on
+2026-10-08 (review R3): unconverted, it left `d` once and the nonce up to twice per
+signature; with the burn, 0 in twelve representations over 5 repeats, both
+even-y arms; ctgrind `sign` 11 in-file before and after.
 
 **`Secp256k1.mul`, the ECDH path (A1 R1, re-audit 2026-09-15).** The windowed
 multiply (F5) left the u256 image of the SECRET scalar on the dead stack **twice
@@ -575,6 +577,24 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
 
 ## Backlog (the Fable phase + beyond)
 
+- **Reviewed 2026-10-08** (line-by-line review of the current `src/`, after the 2026-10-07/08
+  speed work). One HIGH finding, fixed:
+  - **R3 (HIGH, fixed 2026-10-08)**: `sign.bip340Sign` left `d` and the nonce `k'`/`n − k'` on
+    the dead stack (see "Secret residue on the dead stack"). Known since A1 as "not covered by
+    this claim", never measured; the README and the example present it as the Schnorr API.
+  - Checked clean: `safegcd` limb by limb against libsecp256k1's `modinv64_impl.h`
+    (`divsteps_62_var`, `update_de_62`, `update_fg_62_var`, `normalize_62`, the `modinv64_var`
+    loop, `modulus_inv62`); the `invert`/`sqrt` addition chains (libsecp's, and tested against
+    `powConst`); `Fe.add`'s two-chain select and `mulSmall`'s single fold; the amd64 asm
+    product rows and the Solinas finish (fold-1 excess < 2^34, CF2 and `T`'s carry disjoint,
+    `W < 2^256 + 2^67 < 2p`); `ecmult` — dbl-2009-l, the mixed addition and its `h = 0` cases,
+    the global-Z table (z-ratios walked back), the frame algebra of `addGeScaled` and the
+    Straus prefix/suffix scales, wNAF bounds (no u256 overflow below `n + 2^w`, indices inside
+    the tables), the homogeneous ↔ Jacobian maps; `mulMultiBasePublic`'s chunking.
+  - Note, not a defect: `oddMultiplesGlobalZ` panics when a table hits `a = ±2a`, impossible on
+    secp256k1 (prime order) but reachable by a hand-built `Secp256k1{…}` that is off the curve
+    — every decoder (`fromSec1`, `fromAffineCoordinates`, `recoverY`) checks the curve, so only
+    a caller bypassing them gets there. The RCB path gives a wrong point there instead.
 - **Speed toward libsecp256k1.** 2026-10-07 perf over BIP340 verify: point add 36 %, double
   33 %, `lift_x` square root + affine inversion ~25 %. Done 2026-10-07: addition-chain
   inversion/sqrt, two-fold asm reduction, `ecmult` (Jacobian + mixed adds + affine G table)

@@ -53,7 +53,29 @@ fn reduceToScalar(bytes32: [32]u8) Scalar {
 pub const SignError = error{ InvalidSecretKey, InvalidNonce };
 
 /// BIP340 "Default Signing". Returns the 64-byte `r || s` signature.
+///
+/// Review 2026-10-08 R3 (HIGH): the dead stack held the effective scalar `d`
+/// once and the nonce `k'`/`n − k'` up to twice per signature (ReleaseFast,
+/// `stackprobe_test.zig`) — and a nonce next to its published signature is the
+/// private key. Same shape as `ecdsa_recover.sign` (A1 G2): the computation
+/// runs one frame down, then `bip340_stack_burn` bytes at that depth are
+/// zeroed.
 pub fn bip340Sign(secret_key: [32]u8, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
+    const result = bip340SignInner(secret_key, msg, aux_rand);
+    burnBip340Stack();
+    return result;
+}
+
+/// `bip340SignInner`'s call tree reached 2.7 KiB in ReleaseFast (2026-10-08);
+/// `stackprobe_test.zig` goes red when it outgrows this.
+const bip340_stack_burn = 16 * 1024;
+
+noinline fn burnBip340Stack() void {
+    var buf: [bip340_stack_burn]u8 = undefined;
+    std.crypto.secureZero(u8, &buf);
+}
+
+noinline fn bip340SignInner(secret_key: [32]u8, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
     // d' = int(sk), 0 < d' < n.
     const dp = Scalar.fromBytes(secret_key, .big) catch return error.InvalidSecretKey;
     if (dp.isZero()) return error.InvalidSecretKey;

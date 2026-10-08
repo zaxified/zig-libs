@@ -165,6 +165,21 @@ pub const KeyPair = struct {
     public: XOnlyPublicKey,
 
     pub fn fromSecretKey(sk: SecretKey) SecretKeyError!KeyPair {
+        const result = derive(&sk);
+        burnKeyPairStack();
+        return result;
+    }
+
+    /// Review 2026-10-08 R2 (HIGH). `fromSecretKey` had no burn of its own:
+    /// it ran inside `sign`'s burned frame only, until `signWithKeyPair`
+    /// made the caller's own `fromSecretKey` call the documented way to
+    /// sign. Measured with `stackprobe_test.zig` (ReleaseFast): the
+    /// effective scalar `d` was left in the call tree below it, once per
+    /// call. Same fix as `sign`'s F2: the work runs one frame down
+    /// (`noinline`), then `keypair_stack_burn` bytes at that depth are
+    /// zeroed. `computeUnverified` calls `derive` directly: it is already
+    /// under `sign`'s burn.
+    noinline fn derive(sk: *const SecretKey) SecretKeyError!KeyPair {
         const d = Scalar.fromBytes(sk.bytes, .big) catch return error.InvalidSecretKey;
         if (d.isZero()) return error.InvalidSecretKey;
         const p = Secp256k1.combMulBase(sk.bytes, .big) catch return error.InvalidSecretKey;
@@ -203,6 +218,17 @@ pub const KeyPair = struct {
         for (&effective, sk.bytes, negated) |*ei, even, odd| ei.* = (even & ~mask) | (odd & mask);
         return .{ .secret = effective, .public = .{ .x = xy.x.toBytes(.big) } };
     }
+
+    /// Zero `keypair_stack_burn` bytes at the depth `derive` used. `noinline`
+    /// for the same reason as `burnSignStack`.
+    noinline fn burnKeyPairStack() void {
+        var buf: [keypair_stack_burn]u8 = undefined;
+        std.crypto.secureZero(u8, &buf);
+    }
+
+    /// `derive`'s call tree reached 1.8 KiB in ReleaseFast (2026-10-08);
+    /// `stackprobe_test.zig` goes red when it outgrows this.
+    const keypair_stack_burn = 8 * 1024;
 
     /// Zeroize the effective signing scalar (`secret`) in place; `public`
     /// is left untouched (it is not secret). Idempotent. Hygiene only —
@@ -300,7 +326,21 @@ pub const SignError = error{
 /// does not consume `io`.
 pub fn sign(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io) SignError![64]u8 {
     _ = io; // deterministic once aux_rand is in hand (see doc comment)
-    return signImpl(.{ .secret = secret_key }, msg, aux_rand, computeUnverified);
+    const result = signFromSecretKey(secret_key, msg, aux_rand);
+    burnSignStack();
+    return result;
+}
+
+/// Review 2026-10-08 R1 (HIGH). Whatever `sign`'s own frame holds sits ABOVE
+/// the region `computeAndBurn` zeroes, and since `359a678d` it held a copy of
+/// the secret key: first the `SignKey` union built by value, then — with the
+/// union made of pointers — the copy Zig makes of a parameter whose address is
+/// taken. Measured with `stackprobe_test.zig` (ReleaseFast): one copy of the
+/// key on the dead stack per signature, the A1 F2 class again. So `sign` holds
+/// nothing: the key reaches this frame one level down, and `sign` burns it
+/// after the return. `noinline` is load-bearing, as on `computeUnverified`.
+noinline fn signFromSecretKey(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
+    return signImpl(.{ .secret = &secret_key }, msg, aux_rand, computeUnverified);
 }
 
 /// `sign` with steps 1-2 already done: `key_pair` is what
@@ -322,8 +362,9 @@ pub fn signWithKeyPair(key_pair: *const KeyPair, msg: []const u8, aux_rand: [32]
 
 /// The key `signImpl` signs with: a secret key (steps 1-2 run inside the
 /// burned frame) or a caller's ready `KeyPair`. Which variant is used is
-/// the caller's choice of API, public.
-const SignKey = union(enum) { secret: SecretKey, pair: *const KeyPair };
+/// the caller's choice of API, public. Both arms are pointers, so building
+/// one copies no key (see `signFromSecretKey`).
+const SignKey = union(enum) { secret: *const SecretKey, pair: *const KeyPair };
 
 /// The (steps 1-9, no self-check) result `computeUnverified` — or a test's
 /// deliberately-corrupted stand-in — hands to `signImpl`.
@@ -419,7 +460,7 @@ noinline fn computeUnverified(key: SignKey, msg: []const u8, aux_rand: [32]u8) S
     // Steps 1-2: even-y-normalized effective scalar d + x-only public key
     // (or the caller's pair, which already holds them; the copy is zeroed).
     var kp = switch (key) {
-        .secret => |sk| try KeyPair.fromSecretKey(sk),
+        .secret => |sk| try KeyPair.derive(sk),
         .pair => |p| p.*,
     };
     defer kp.deinit();
@@ -725,7 +766,7 @@ test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL productio
 
     // Positive control: signImpl with the real computation is exactly what
     // sign() does -- same bytes, no regression from the seam.
-    const honest = try signImpl(.{ .secret = sk }, msg, aux_rand, computeUnverified);
+    const honest = try signImpl(.{ .secret = &sk }, msg, aux_rand, computeUnverified);
     const via_sign = try sign(sk, msg, aux_rand, undefined);
     try std.testing.expectEqualSlices(u8, &honest, &via_sign);
 
@@ -742,7 +783,7 @@ test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL productio
             return r;
         }
     }.call;
-    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = sk }, msg, aux_rand, corruptS));
+    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = &sk }, msg, aux_rand, corruptS));
 
     // Same for a fault in R (the first 32 bytes, step 5-6's output).
     const corruptR = struct {
@@ -752,7 +793,7 @@ test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL productio
             return r;
         }
     }.call;
-    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = sk }, msg, aux_rand, corruptR));
+    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = &sk }, msg, aux_rand, corruptR));
 }
 
 test "SecretKey.fromBytes REJECTS the all-zero scalar (d == 0 is not in [1, n-1])" {
@@ -781,7 +822,7 @@ test "KeyPair.deinit zeroizes the effective signing scalar but leaves public unt
 }
 
 noinline fn stackprobeComputeAndBurn(sk: SecretKey, aux: [32]u8) void {
-    const result = computeAndBurn(.{ .secret = sk }, @import("stackprobe_test.zig").msg, aux, computeUnverified) catch unreachable;
+    const result = computeAndBurn(.{ .secret = &sk }, @import("stackprobe_test.zig").msg, aux, computeUnverified) catch unreachable;
     std.mem.doNotOptimizeAway(&result);
 }
 

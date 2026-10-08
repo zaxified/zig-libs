@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **FIX (secret on the dead stack; NO API CHANGE):** `sign.bip340Sign` (the
+  README's Schnorr example) left the effective scalar `d` and the nonce `k'` on the dead stack —
+  a nonce next to its signature is the private key. It now runs one frame down and zeroes
+  16 KiB at that depth, like `ecdsa_recover.sign`; the ReleaseFast stack probe covers it.
 - **2026-10-07** — **NEW API:** `Fe.invertPublic` (VARIABLE-TIME safegcd inversion for public
   values; Bernstein–Yang divsteps in libsecp256k1's `modinv64_var` form, signed 62-bit limbs)
   and `Secp256k1.affineCoordinatesPublic` on top of it. The verifiers (`bip340Verify`,

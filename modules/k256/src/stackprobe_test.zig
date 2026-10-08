@@ -295,3 +295,80 @@ test "STACKPROBE (A1 R1): no scalar residue on the dead stack after Secp256k1.mu
     try std.testing.expectEqual(@as(usize, 0), be_hits);
     try std.testing.expectEqual(@as(usize, 0), le_hits);
 }
+
+// ── review 2026-10-08: `sign.bip340Sign` ─────────────────────────────────────
+//
+// The README's and the example's Schnorr signer, until now outside every
+// probe (SPEC "Secret residue on the dead stack": "not covered by this
+// claim"). Same method; the needles are BIP340's secrets re-derived here: the
+// key, the effective scalar `d` and the nonce `k'`, in the representations the
+// path holds them in.
+
+const sign_mod = @import("sign.zig");
+
+fn taggedHash(comptime tag: []const u8, parts: []const []const u8) [32]u8 {
+    var td: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(tag, &td, .{});
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(&td);
+    h.update(&td);
+    for (parts) |p| h.update(p);
+    return h.finalResult();
+}
+
+noinline fn callBip340Sign(sk: [32]u8, msg: []const u8, aux: [32]u8) [64]u8 {
+    return sign_mod.bip340Sign(sk, msg, aux) catch unreachable;
+}
+
+test "STACKPROBE (review 2026-10-08): no key or nonce residue on the dead stack after sign.bip340Sign" {
+    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+
+    const msg = "k256 bip340Sign dead-stack probe";
+    // Two keys, so both arms of the even-y select run: `d = d'` and `d = n − d'`.
+    for ([_]u8{ 0x02, 0x03 }) |last| {
+        var sk: [32]u8 = @splat(0);
+        sk[0] = 0x21;
+        sk[31] = last;
+        const aux: [32]u8 = @splat(last);
+
+        const dp = try Scalar.fromBytes(sk, .big);
+        const P = (try group.Secp256k1.combMulBase(sk, .big)).affineCoordinates();
+        const d = if (P.y.isOdd()) dp.neg() else dp;
+        const px = P.x.toBytes(.big);
+        const aux_h = taggedHash("BIP0340/aux", &.{&aux});
+        var t: [32]u8 = undefined;
+        for (&t, d.toBytes(.big), aux_h) |*ti, di, ai| ti.* = di ^ ai;
+        const rand = taggedHash("BIP0340/nonce", &.{ &t, &px, msg });
+        const k0 = reduce32(rand);
+        const needles = [_][32]u8{
+            sk,                    le(sk),       memImage(d),            d.toBytes(.big),
+            d.neg().toBytes(.big), t,            rand,                   k0.toBytes(.big),
+            le(k0.toBytes(.big)),  memImage(k0), k0.neg().toBytes(.big), memImage(k0.neg()),
+        };
+
+        var neg: usize = 0;
+        paint();
+        std.mem.doNotOptimizeAway(callInnocent(aux));
+        for (&needles) |*nd| neg += scanOne(nd);
+        paint();
+        std.mem.doNotOptimizeAway(callLeaky(needles[0]));
+        const pos = scanOne(&needles[0]);
+
+        var hits = [_]usize{0} ** needles.len;
+        for (0..5) |_| {
+            for (&needles, &hits) |*nd, *h| {
+                paint();
+                std.mem.doNotOptimizeAway(callBip340Sign(sk, msg, aux));
+                h.* += scanOne(nd);
+            }
+        }
+        paint();
+        std.mem.doNotOptimizeAway(callBip340Sign(sk, msg, aux));
+        const depth = dirtyDepth();
+        errdefer std.debug.print("\n=== STACKPROBE k256 bip340Sign ({t}) key ..{x:0>2}: NEG={d} POS={d} per-needle={any} (5 calls each), non-paint below the call {d} B ===\n", .{ builtin.mode, last, neg, pos, hits, depth });
+
+        try std.testing.expectEqual(@as(usize, 0), neg);
+        try std.testing.expect(pos >= 1);
+        for (hits) |h| try std.testing.expectEqual(@as(usize, 0), h);
+    }
+}

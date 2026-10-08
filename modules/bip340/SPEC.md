@@ -284,4 +284,23 @@ beyond the BIP340 specification text itself and `std.crypto.ecc.Secp256k1`
 
 ## Backlog / deferred
 
+- **Reviewed 2026-10-08** (line-by-line review of the current `src/`, after the 2026-10-07
+  speed work: `signWithKeyPair`, the multi-base `verifyBatch`, `affineCoordinatesPublic` in
+  `verify`). Two HIGH findings, both the A1 F2 class (a secret on the dead stack), fixed:
+  - **R1 (HIGH, fixed 2026-10-08)**: `sign` held a copy of the secret key in its OWN frame —
+    first the `SignKey` union built by value (`359a678d`), then, with the union made of pointers,
+    the copy Zig makes of a parameter whose address is taken — above the region
+    `computeAndBurn` zeroes. The F2 probe went red on it (one key copy per signature,
+    ReleaseFast); it was not seen because the probe skips in Debug/ReleaseSafe and no
+    ReleaseFast lane ran between `359a678d` and this review. Fix: `sign` holds nothing; the
+    key enters `signFromSecretKey` one frame down and `sign` burns after the return.
+  - **R2 (HIGH, fixed 2026-10-08)**: `KeyPair.fromSecretKey` zeroed no stack: `d` once per call.
+    Harmless while it only ran inside `sign`'s burn; `signWithKeyPair` made the caller's own
+    call the documented path. Fix: `derive` one frame down + `keypair_stack_burn`.
+  - New probes: `signWithKeyPair` (pair built outside the window) and `KeyPair.fromSecretKey`.
+  - Checked clean: `signWithKeyPair` on forged pairs (zero, `≥ n`, wrong parity, wrong public —
+    never a signature; KAT test), its zeroing of the pair copy; `verifyBatch` signs
+    (`a·s·G − a·R − a·e·P`), G's scalar only in the last chunk, an identity partial sum
+    contributes nothing, randomizers from `randomSecure` drawn after the batch is fixed;
+    `verify` with `affineCoordinatesPublic` (public inputs only).
 - 2026-10-07: slower than the reference on every measured operation (`tools/bench.zig`, libsecp256k1 v0.8.0): keypair 1.56×, verify 2.56×, sign 7.37× (was 2.00/3.39/9.30 before the same-day k256 field change). `sign` = two fixed-base multiplies (public key per call, nonce point) + the BIP340 self-verification, which the owner decided to KEEP (2026-10-07: fault-injection guard; speed comes from the arithmetic, not from dropping it). The curve arithmetic is `k256`'s (MULX/ADX field, GLV, comb), not std's; profiled verify (perf, 2026-10-07): point add 36 %, double 33 %, the two exponentiations (`lift_x` square root, affine inversion) ~25 %. Next levers are in k256's backlog: a precomputed affine G table for the double-base verify, a variable-time safegcd inversion, lazy reduction. `verifyBatch` per signature (64-item batch) was no faster than a single `verify`. **2026-10-07 later (k256 `ecmult`, `signWithKeyPair`, multi-base batch):** keypair 1.31×, verify 1.77×, sign 4.43× (from a ready `KeyPair`; with safegcd the same night verify 1.57×, sign 3.99×, as libsecp's `schnorrsig_sign32`), `verifyBatch` 51 µs/sig = 0.87× a single verify.

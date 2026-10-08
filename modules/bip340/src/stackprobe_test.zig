@@ -218,3 +218,41 @@ test "STACKPROBE (A1 F2): no key or nonce residue on the dead stack after sign()
     sign_io = th.io();
     try expectNoResidue("sign", callSign);
 }
+
+/// Key pairs for `callSignWithKeyPair`, built before the probe paints, in
+/// static memory the stack scan never reads: the probe measures what signing
+/// leaves behind, not the caller's own copy of the pair.
+var probe_pairs: [cases.len]bip340.KeyPair = undefined;
+
+noinline fn callSignWithKeyPair(sk: bip340.SecretKey, aux: [32]u8) void {
+    for (cases, &probe_pairs) |case, *kp| {
+        if (!std.mem.eql(u8, &case.sk, &sk.bytes)) continue;
+        const sig = bip340.signWithKeyPair(kp, msg, aux, sign_io) catch unreachable;
+        std.mem.doNotOptimizeAway(&sig);
+        return;
+    }
+    unreachable;
+}
+
+test "STACKPROBE: no key or nonce residue on the dead stack after signWithKeyPair()" {
+    var th = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer th.deinit();
+    sign_io = th.io();
+    for (cases, &probe_pairs) |case, *kp| kp.* = try bip340.KeyPair.fromSecretKey(try bip340.SecretKey.fromBytes(case.sk));
+    defer for (&probe_pairs) |*kp| kp.deinit();
+    try expectNoResidue("signWithKeyPair", callSignWithKeyPair);
+}
+
+noinline fn callKeyPairFromSecretKey(sk: bip340.SecretKey, aux: [32]u8) void {
+    _ = aux;
+    var kp = bip340.KeyPair.fromSecretKey(sk) catch unreachable;
+    std.mem.doNotOptimizeAway(&kp.public);
+    kp.deinit();
+}
+
+// `signWithKeyPair` moves steps 1-2 out of `sign`'s burned frame into the
+// caller's own `KeyPair.fromSecretKey` call, so that call is now a signing
+// path of its own and gets the same probe.
+test "STACKPROBE: no key residue on the dead stack after KeyPair.fromSecretKey()" {
+    try expectNoResidue("KeyPair.fromSecretKey", callKeyPairFromSecretKey);
+}

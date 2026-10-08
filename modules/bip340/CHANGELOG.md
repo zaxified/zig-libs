@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **FIX (secret on the dead stack; NO API CHANGE):** since `signWithKeyPair`
+  (2026-10-07) `sign` held a copy of the secret key in its own frame, above the region it zeroes,
+  and left it on the dead stack after every signature; `KeyPair.fromSecretKey`, now the documented
+  way to get a pair, zeroed nothing and left the effective scalar `d` behind. Both now run their
+  work one frame down and zero the stack it used (the A1 F2 shape). The ReleaseFast stack probe
+  covers `sign`, `signWithKeyPair` and `KeyPair.fromSecretKey`. `sign` costs one more 16 KiB
+  zeroing (well under 1 µs).
 - **2026-10-07** — **NO API CHANGE (faster):** `verify` converts `s·G − e·P` with k256's
   variable-time `affineCoordinatesPublic` (safegcd): verify 59.2 → 53.2 µs (1.57×
   libsecp256k1), sign 3.99× (its self-check). ctgrind `sign` 83 → 90, all in that inversion.
