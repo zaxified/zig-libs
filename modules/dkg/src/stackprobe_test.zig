@@ -45,8 +45,8 @@ const Recorder = struct {
     fn fill(ptr: *anyopaque, buf: []u8) void {
         const self: *Recorder = @ptrCast(@alignCast(ptr));
         self.csprng.fill(buf);
-        self.draws.append(std.heap.page_allocator, .{ .at = self.log.items.len, .len = buf.len, .ret = @returnAddress() }) catch @panic("probe OOM");
-        self.log.appendSlice(std.heap.page_allocator, buf) catch @panic("probe OOM");
+        self.draws.append(std.heap.page_allocator, .{ .at = self.log.items.len, .len = buf.len, .ret = @returnAddress() }) catch @panic("probe OOM"); // global-alloc-ok: the probe's recorder and needle index must not allocate from the allocator of the call it measures (testing.allocator), and live outside any test block
+        self.log.appendSlice(std.heap.page_allocator, buf) catch @panic("probe OOM"); // global-alloc-ok: the probe's recorder and needle index must not allocate from the allocator of the call it measures (testing.allocator), and live outside any test block
     }
 
     fn random(self: *Recorder) std.Random {
@@ -91,7 +91,7 @@ const Needles = struct {
     map: std.AutoHashMapUnmanaged(u128, Loc) = .empty,
 
     fn init() Needles {
-        return .{ .arena = .init(std.heap.page_allocator) };
+        return .{ .arena = .init(std.heap.page_allocator) }; // global-alloc-ok: the probe's recorder and needle index must not allocate from the allocator of the call it measures (testing.allocator), and live outside any test block
     }
 
     fn deinit(self: *Needles) void {
