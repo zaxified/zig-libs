@@ -1892,10 +1892,10 @@ cmd_count() {
     # real performance commits flagged, and on the day it was wired it caught
     # crc32c's 2026-10-07 speed-up (-24 %) that no baseline had recorded.
     #
-    # `--advisory`: report a move as a `::warning::` and stay green. The lane
-    # starts advisory because the baselines were taken on an Intel desktop and
-    # the runner is an AMD EPYC; once its counts are shown to match, the flag
-    # goes and a move fails the lane. Needs valgrind
+    # `--advisory`: report a move as a `::warning::` and stay green (for a new
+    # baseline whose counts on the runner are not yet known). The CI lane is
+    # blocking: its first run, on an AMD EPYC, counted exactly what the Intel
+    # baselines say (2026-10-08). Needs valgrind
     # (`scripts/lib/ci-environment.sh ctgrind` installs it).
     local advisory=0 a m rc failed=0
     for a in "$@"; do [[ "$a" == --advisory ]] && advisory=1; done
