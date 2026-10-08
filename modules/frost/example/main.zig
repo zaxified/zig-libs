@@ -148,6 +148,12 @@ pub fn main() !void {
                 std.debug.print("signer {d}: refusing, not bound to this session\n", .{share_idx + 1});
                 return;
             },
+            // The list names this signer but with commitments it never made:
+            // signing would let the coordinator pick this signer's part of R.
+            error.IncorrectCommitment => {
+                std.debug.print("signer {d}: refusing, the listed commitments are not mine\n", .{share_idx + 1});
+                return;
+            },
         };
     }
 

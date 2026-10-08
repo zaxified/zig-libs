@@ -940,8 +940,16 @@ pub fn round1Commit(nonces: SigningNonces) Round1CommitError!NonceCommitmentPair
 pub const Round2SignError = error{
     OutOfMemory,
     /// A sub-step (`computeBindingFactors`, `computeGroupCommitment`,
-    /// `deriveInterpolatingValue`) failed.
+    /// `deriveInterpolatingValue`) failed, or `identifier` is not in
+    /// `commitment_list`.
     InvalidCommitmentList,
+    /// The commitments `commitment_list` lists for `identifier` are not the
+    /// ones `nonces` commit to (RFC 9591 §5.2: each participant MUST ensure
+    /// that its identifier AND commitments from the first round appear in
+    /// `commitment_list`; frost-core's `IncorrectCommitment`). Signing over
+    /// a commitment the signer never made would let the Coordinator choose
+    /// this signer's part of `R`.
+    IncorrectCommitment,
 };
 
 /// RFC 9591 §5.2 `sign` — a single participant's round-2 signature
@@ -968,13 +976,14 @@ pub const Round2SignError = error{
 /// multiplication/addition chain is exactly the kind of secret-touching
 /// arithmetic `Secp256k1.scalar`'s constant-time ops exist for).
 ///
-/// `identifier` MUST be present in `commitment_list` (RFC 9591 §5.2:
-/// "each participant MUST ensure that its identifier and commitments ...
-/// appear in commitment_list" — this function does not itself validate
-/// that its `nonces`/`signing_share` correspond to THIS `identifier`;
-/// that binding is the caller's responsibility, same as the RFC's own
-/// division of labor between "the signer validates its input" (§5.2's
-/// prose, before calling `sign`) and `sign` itself).
+/// `identifier` MUST be present in `commitment_list` with exactly the two
+/// commitments `nonces` produce (RFC 9591 §5.2: "each participant MUST
+/// ensure that its identifier and commitments (from the first round)
+/// appear in commitment_list"). Checked here, as frost-core's `sign` does:
+/// `error.InvalidCommitmentList` when the identifier is absent,
+/// `error.IncorrectCommitment` when its listed commitments differ from
+/// `nonces·G`. That `signing_share` belongs to `identifier` remains the
+/// caller's (no key package here to check it against).
 ///
 /// Byte-exact target: RFC 9591 Appendix E.5's `P1`/`P3` `sig_share`
 /// (`kat_test.zig`) — this is the strongest available check on
@@ -996,6 +1005,17 @@ pub fn round2Sign(
     defer n.deinit();
     var sk_i = signing_share;
     defer sk_i.deinit();
+
+    // RFC 9591 §5.2's MUST: this signer's own round-1 commitments are the
+    // ones listed for it. The commitments are public; the comparison is on
+    // public values (combMulBase is constant-time in the nonce).
+    const own = for (commitment_list) |entry| {
+        if (std.mem.eql(u8, &entry.identifier.bytes, &identifier.bytes)) break entry;
+    } else return error.InvalidCommitmentList;
+    const mine = round1Commit(n) catch return error.IncorrectCommitment;
+    if (!std.mem.eql(u8, &mine.hiding.bytes, &own.hiding.bytes) or
+        !std.mem.eql(u8, &mine.binding.bytes, &own.binding.bytes))
+        return error.IncorrectCommitment;
 
     const binding_factor_list = try computeBindingFactors(allocator, group_public_key, commitment_list, msg);
     defer allocator.free(binding_factor_list);
@@ -1225,8 +1245,10 @@ pub const TrustedDealerKeygenResult = struct {
 
 pub const TrustedDealerKeygenError = error{
     OutOfMemory,
-    /// `min_participants` is 0, or `coefficients.len !=
-    /// min_participants - 1`, or `max_participants < min_participants`.
+    /// `min_participants` < 2 (RFC 9591 Appendix C.1: a threshold of 1
+    /// hands every participant the group secret itself), or
+    /// `coefficients.len != min_participants - 1`, or `max_participants <
+    /// min_participants`, or a zero secret/coefficient.
     InvalidParameters,
 };
 
@@ -1262,7 +1284,7 @@ pub fn trustedDealerKeygen(
     max_participants: u16,
     min_participants: u16,
 ) TrustedDealerKeygenError!TrustedDealerKeygenResult {
-    if (min_participants == 0) return error.InvalidParameters;
+    if (min_participants < 2) return error.InvalidParameters;
     if (max_participants < min_participants) return error.InvalidParameters;
     if (coefficients.len != @as(usize, min_participants) - 1) return error.InvalidParameters;
 
@@ -1272,7 +1294,12 @@ pub fn trustedDealerKeygen(
     // the secret are SECRET — the loop bounds and indices are public
     // (participant count), and every field op is constant-time.
     const shares = try allocator.alloc(ParticipantShare, max_participants);
-    errdefer allocator.free(shares);
+    // Every share is filled before anything below can fail; a failure there
+    // must not hand the allocator secret shares to recycle.
+    errdefer {
+        for (shares) |*s| s.deinit();
+        allocator.free(shares);
+    }
     var i: u16 = 1;
     while (i <= max_participants) : (i += 1) {
         const id = Identifier.fromU16(i) catch unreachable; // i >= 1

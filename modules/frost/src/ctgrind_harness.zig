@@ -38,25 +38,19 @@
 //!   as `k256/sign`'s BIP340 nonce/key arithmetic.
 //!
 //! **What is deliberately NEVER tainted**, per the task brief: `identifier`
-//! (public participant index), `group_public_key`, `msg`, and every entry of
-//! `commitment_list` (including the harness's own participant's published
-//! hiding/binding commitments). These are constructed from INDEPENDENT
-//! scalars that are never passed through `taintIf` at all — not "tainted
-//! then declassified", just never marked, so there is no taint to leak into
-//! `computeBindingFactors`/`computeGroupCommitment`/`computeChallenge`
-//! (`round2Sign`'s first four sub-steps, all public-only per RFC 9591 §4.4-
-//! §4.6) in the first place. This is deliberate decoupling: a real signer's
-//! own published commitment is DERIVED from the same nonce pair it later
-//! feeds to `round2Sign`, but reusing `commit`'s tainted output here would
-//! make `binding_factor`/`group_commitment`/`challenge` carry taint too
-//! (memcheck tracks byte provenance, not "this became public once
-//! serialized"), contaminating `sign`'s in-file count with contexts that
-//! are really `commit`'s own combMulBase ladder re-counted under a
-//! different name. `round2Sign` does not itself check that its
-//! `nonces`/`signing_share` correspond to the `identifier` whose entry sits
-//! in `commitment_list` (`root.zig:971-977`'s own doc comment says this is
-//! the caller's job), so a `commitment_list` built from unrelated public
-//! material still exercises every real branch `sign` has.
+//! (public participant index), `group_public_key`, `msg`, and the other
+//! entries of `commitment_list`. The harness's OWN entry is different since
+//! the 2026-10-08 audit: `round2Sign` now checks (RFC 9591 §5.2's MUST) that
+//! the list carries the commitments its `nonces` make, so that entry is
+//! `round1Commit` over an UNTAINTED twin of the same nonce inputs (the same
+//! bytes, never marked) — a published value carrying no taint. Deriving it
+//! from the tainted nonces instead would charge every public sub-step of `round2Sign`
+//! (`computeBindingFactors`, `computeGroupCommitment`, `computeChallenge`,
+//! all over public data per RFC 9591 §4.4-§4.6) to the secret: memcheck
+//! tracks byte provenance, not "this became public once serialized". What
+//! the declassification does NOT hide is `round2Sign`'s own recomputation of
+//! the commitments (two `combMulBase` ladders on the tainted nonces) and its
+//! comparison against the listed ones — both are counted in `sign`.
 //!
 //! ## Own code vs. the `k256` delegate
 //!
@@ -300,10 +294,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const binding_random = taintedRandom32("ctgrind-frost-harness-sign-binding-random-v1", tainted);
             const nonces = frost.generateNonces(signing_share, hiding_random, binding_random);
 
-            // PUBLIC group info + a one-entry commitment list, built from
-            // material that is NEVER tainted and NEVER derived from
-            // `signing_share`/`nonces` above — see the module doc comment's
-            // "own code vs. the k256 delegate" / decoupling rationale.
+            // The signer's own published commitments, computed from an
+            // UNTAINTED twin of the same inputs (same bytes, never marked):
+            // the values `round2Sign` must find in the list, with no taint
+            // and no harness-side ladder in this row's count (see the module
+            // doc comment).
+            const own = frost.round1Commit(frost.generateNonces(
+                taintedShare("ctgrind-frost-harness-sign-share-v1", false),
+                taintedRandom32("ctgrind-frost-harness-sign-hiding-random-v1", false),
+                taintedRandom32("ctgrind-frost-harness-sign-binding-random-v1", false),
+            )) catch unreachable; // fixed seeds, nonzero nonces
+
+            // PUBLIC group info + a one-entry commitment list (this signer's
+            // own, declassified commitments).
             // A one-participant commitment list makes
             // `deriveInterpolatingValue`'s lambda_i trivially 1 (RFC 9591
             // §4.2: the loop over `participant_list \ {x_i}` is empty),
@@ -314,8 +317,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const group_public_key: frost.GroupPublicKey = publicElement("ctgrind-frost-harness-group-pk-v1");
             var commitment_list = [_]frost.SigningCommitments{.{
                 .identifier = identifier,
-                .hiding = publicElement("ctgrind-frost-harness-list-hiding-v1"),
-                .binding = publicElement("ctgrind-frost-harness-list-binding-v1"),
+                .hiding = own.hiding,
+                .binding = own.binding,
             }};
 
             const msg = "ctgrind frost harness message";

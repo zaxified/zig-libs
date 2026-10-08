@@ -763,8 +763,14 @@ tlock	ReleaseFast	decrypt	1	8	bb25a5198dbaac47	3a939f7ff5b39d03
 ibe	ReleaseFast	extract	1	1	140a7d3db097ec1b	686f0732e74c5ef7
 ibe	ReleaseFast	decrypt	1	10	ba4d234657626842	fb52b6c55cc51706
 ibe	ReleaseFast	fp12pow	1	0	140a7d3db097ec1b	d2e187260f9f18a2
-frost	ReleaseFast	commit	1	8	cf6d181343529b92	94a2e96655c4ce21
-frost	ReleaseFast	sign	1	5	cf6d181343529b92	8484bd50690a78db
+# frost sign 5 -> 13 (audit 2026-10-08): round2Sign now recomputes its own
+# commitments (RFC 9591 §5.2's MUST check) -- the two combMulBase ladders and
+# two Element.fromPoint of round1Commit (the classes the commit row already
+# counts), plus 2 eqlBytes and 2 branches comparing them with the listed,
+# public commitments. Diffed context by context against 50d173d8; the harness
+# lists commitments from an untainted twin of the nonce inputs.
+frost	ReleaseFast	commit	1	8	1f161bef1eb3307a	94a2e96655c4ce21
+frost	ReleaseFast	sign	1	13	1f161bef1eb3307a	1da8c496388f45b0
 musig2	ReleaseFast	sign	1	<=101	8e1380b257b52af1	2a2f275cd0c5c7c5
 # taproot secret 10 -> 9 (re-pin 2026-09-15). The row was already stale at
 # 0c0ef527: a --stacks run of that tree reads 9, with the SAME context set as

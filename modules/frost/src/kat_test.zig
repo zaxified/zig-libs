@@ -311,6 +311,98 @@ test "round2Sign reproduces P3's published sig_share" {
     try std.testing.expectEqualSlices(u8, &hexN(32, v.round2.p3_sig_share), &share.toBytes());
 }
 
+test "round2Sign refuses a commitment list that does not carry its own round-1 commitments (RFC 9591 §5.2)" {
+    // A Coordinator that swaps P1's listed commitments chooses P1's part of
+    // R. RFC 9591 §5.2 makes the signer check (MUST), frost-core returns
+    // IncorrectCommitment; until the 2026-10-08 audit this module signed.
+    const gpa = std.testing.allocator;
+    const group_public_key = elementFromHex(v.group.public_key);
+    const msg = hexN(4, v.group.message);
+    const nonces = frost.SigningNonces{
+        .hiding = scalarFromHex(v.round1_p1.hiding_nonce),
+        .binding = scalarFromHex(v.round1_p1.binding_nonce),
+    };
+    const sk = signingShareFromHex(v.participant_shares.p1);
+
+    var swapped = vectorCommitmentList();
+    swapped[0].hiding = swapped[1].hiding;
+    try std.testing.expectError(error.IncorrectCommitment, frost.round2Sign(gpa, identifierFromU16(1), sk, group_public_key, nonces, &msg, &swapped));
+    var swapped_binding = vectorCommitmentList();
+    swapped_binding[0].binding = swapped_binding[1].binding;
+    try std.testing.expectError(error.IncorrectCommitment, frost.round2Sign(gpa, identifierFromU16(1), sk, group_public_key, nonces, &msg, &swapped_binding));
+    // Absent from the list altogether.
+    const list = vectorCommitmentList();
+    try std.testing.expectError(error.InvalidCommitmentList, frost.round2Sign(gpa, identifierFromU16(2), sk, group_public_key, nonces, &msg, &list));
+}
+
+test "trustedDealerKeygen at t = 3: every share passes the Feldman check against vss_commitment" {
+    // share_i·G == Σ_k vss_commitment[k]·i^k (RFC 9591 Appendix C.2's
+    // vss_verify). The published vector has t = 2, a single coefficient, so
+    // the coefficient ORDER in the Horner loop and which coefficient each
+    // commitment is taken from were invisible to it: both survived the
+    // 2026-10-08 mutation run, and combining t shares recovers `s` either
+    // way. A t = 3 sharing with distinct coefficients sees both.
+    const gpa = std.testing.allocator;
+    const secret_key = scalarFromHex(v.group.secret_key);
+    const coefficients = [_]frost.Scalar{
+        frost.Scalar.fromBytes48([_]u8{0x31} ** 48, .big),
+        frost.Scalar.fromBytes48([_]u8{0x47} ** 48, .big),
+    };
+    const dealt = try frost.trustedDealerKeygen(gpa, secret_key, &coefficients, 5, 3);
+    defer gpa.free(dealt.shares);
+    defer gpa.free(dealt.vss_commitment);
+    try std.testing.expectEqual(@as(usize, 3), dealt.vss_commitment.len);
+
+    for (dealt.shares) |share| {
+        const x = share.identifier.scalar();
+        var want = frost.Secp256k1.identityElement;
+        var x_pow = frost.Scalar.one;
+        for (dealt.vss_commitment) |c| {
+            const term = try (try c.point()).mulPublic(x_pow.toBytes(.big), .big);
+            want = want.add(term);
+            x_pow = x_pow.mul(x);
+        }
+        const got = try frost.Secp256k1.combMulBase(share.signing_share.toBytes(), .big);
+        try std.testing.expect(got.equivalent(want));
+    }
+    // And any 3 shares still reconstruct the secret.
+    const got = try frost.secretShareCombine(dealt.shares[1..4]);
+    try std.testing.expectEqualSlices(u8, &secret_key.toBytes(.big), &got.toBytes(.big));
+}
+
+test "secretShareCombine refuses a single share and a repeated identifier" {
+    // Appendix C.1's "invalid parameters". A repeated identifier makes a
+    // Lagrange denominator zero (and invert(0) = 0): a garbage "secret", not
+    // an error, without the check. Both checks had no test before the
+    // 2026-10-08 mutation run.
+    const p1: frost.ParticipantShare = .{ .identifier = identifierFromU16(1), .signing_share = signingShareFromHex(v.participant_shares.p1) };
+    const p3: frost.ParticipantShare = .{ .identifier = identifierFromU16(3), .signing_share = signingShareFromHex(v.participant_shares.p3) };
+    try std.testing.expectError(error.InvalidParameters, frost.secretShareCombine(&.{p1}));
+    try std.testing.expectError(error.InvalidParameters, frost.secretShareCombine(&.{ p1, p3, p1 }));
+}
+
+test "Identifier.fromBytes refuses zero and Element.fromPoint refuses the identity" {
+    // RFC 9591 §3.1: an identifier is a NonZeroScalar, and SerializeElement
+    // is undefined on the identity. Neither refusal had a test.
+    try std.testing.expectError(error.InvalidIdentifier, frost.Identifier.fromBytes([_]u8{0} ** 32));
+    try std.testing.expectError(error.InvalidElement, frost.Element.fromPoint(frost.Secp256k1.identityElement));
+}
+
+test "trustedDealerKeygen refuses a threshold below 2 (RFC 9591 Appendix C.1)" {
+    // min_participants = 1 is a constant polynomial: every share IS the
+    // group secret. RFC 9591 Appendix C.1 raises "invalid parameters" for
+    // MIN_PARTICIPANTS < 2; until the 2026-10-08 audit only 0 was refused.
+    const gpa = std.testing.allocator;
+    const secret_key = scalarFromHex(v.group.secret_key);
+    try std.testing.expectError(error.InvalidParameters, frost.trustedDealerKeygen(gpa, secret_key, &.{}, 3, 1));
+    try std.testing.expectError(error.InvalidParameters, frost.trustedDealerKeygen(gpa, secret_key, &.{}, 3, 0));
+    // 2 is the smallest legal threshold.
+    const c = [_]frost.Scalar{scalarFromHex(v.group.secret_key)};
+    const ok = try frost.trustedDealerKeygen(gpa, secret_key, &c, 2, 2);
+    defer gpa.free(ok.shares);
+    defer gpa.free(ok.vss_commitment);
+}
+
 test "verify accepts the published aggregate signature" {
     const group_public_key = elementFromHex(v.group.public_key);
     const msg = hexN(4, v.group.message);

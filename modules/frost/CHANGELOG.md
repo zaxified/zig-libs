@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **BREAKING (error set):** `round2Sign` checks RFC 9591 §5.2's MUST that
+  `commitment_list` carries this signer's own round-1 commitments (`nonces·G`), as frost-core's
+  `sign` does: new `Round2SignError.IncorrectCommitment` when the listed hiding or binding
+  commitment differs (a Coordinator could otherwise choose this signer's part of `R`);
+  `InvalidCommitmentList` when the identifier is absent. An exhaustive `switch` over the error set
+  needs the new arm. `trustedDealerKeygen` refuses `min_participants < 2` (RFC 9591 Appendix C.1;
+  a threshold of 1 hands every participant the group secret) and zeroes the shares before freeing
+  them on an error path. ctgrind `sign` 5 → 13 (the commitment recomputation and comparison).
+  Audit 2026-10-08 (`SPEC.md`).
+
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: other ciphersuites, DKG and `vssVerify` in Out of scope (and DKG in Threat model) now read "not yet — see Backlog", matching the survey Backlog.
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **commit 8 / sign 5**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ SPEC.md's "this module introduces no additional branches on secret scalars in its REAL code" is CONFIRMED: the `sign` target shows zero contexts in curve arithmetic — the whole signature-share equation (`root.zig:1018-1020`) is clean, and all five contexts are std's scalar-canonicality check at the "turn secret bytes into a Scalar" API boundary, disassembled to a real `jne` rather than assumed. `commit`'s eight split 4 `rejectIdentity`-shaped (two k256's, two this module's own redundant re-check) and 4 canonicality. ⚠ Not adjusted for single-process over-taint.
 
