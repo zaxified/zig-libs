@@ -177,9 +177,15 @@ pub fn create(out: *[mac_length]u8, msg: []const u8, key: *const [key_length]u8)
         h = mul(1, add(1, h, b), r1, s1);
     }
 
-    // Full reduction mod 2^130-5, then add the pad mod 2^128.
     var f: [5]u64 = undefined;
     inline for (0..5) |k| f[k] = h[k][0];
+    mem.writeInt(u128, out, finish(f, mem.readInt(u128, key[16..32], .little)), .little);
+}
+
+/// Full reduction mod 2^130-5 of `h` as `carry` leaves it (every limb < 2^26
+/// except limb 1, <= 2^26 + 2^11), then add the pad `s` mod 2^128.
+fn finish(h: [5]u64, s: u128) u128 {
+    var f = h;
     var c: u64 = f[1] >> 26;
     f[1] &= mask26;
     f[2] += c;
@@ -211,8 +217,7 @@ pub fn create(out: *[mac_length]u8, msg: []const u8, key: *const [key_length]u8)
 
     const acc: u128 = @as(u128, f[0]) | (@as(u128, f[1]) << 26) | (@as(u128, f[2]) << 52) |
         (@as(u128, f[3]) << 78) | (@as(u128, f[4]) << 104);
-    const tag = acc +% mem.readInt(u128, key[16..32], .little);
-    mem.writeInt(u128, out, tag, .little);
+    return acc +% s;
 }
 
 // ── differential tests against std ───────────────────────────────────────────
@@ -247,6 +252,42 @@ test "RFC 8439 2.5.2 vector" {
     var got: [16]u8 = undefined;
     create(&got, "Cryptographic Forum Research Group", &key);
     try std.testing.expectEqual(want, got);
+}
+
+test "finish reduces every limb state carry can leave, edge states included" {
+    // Random messages never reach the states where the full reduction's last
+    // carry (limb 0 into limb 1) fires: it needs limbs 2..4 all ones AND limb 1
+    // at 2^26 with limb 0 near the top. Dropping that carry survived the
+    // 2026-10-08 mutation run, so the edges are driven directly here against a
+    // wide-integer reference: (sum f_k 2^(26k)) mod 2^130-5, + s mod 2^128.
+    const M: u64 = mask26;
+    const p: u256 = (1 << 130) - 5;
+    const edges = [_][5]u64{
+        .{ M - 2, 1 << 26, M, M, M }, // 2^130 + 2^26 - 3: limb 0 carries into limb 1
+        .{ M, (1 << 26) + (1 << 11), M, M, M }, // the largest state carry allows
+        .{ M - 4, M, M, M, M }, // p
+        .{ M - 5, M, M, M, M }, // p - 1
+        .{ M, M, M, M, M }, // p + 4
+        .{ 0, 1 << 26, M, M, M }, // 2^130: limb 1 alone ripples into limb 4
+        .{ 0, 0, 0, 0, 0 },
+    };
+    var prng = std.Random.DefaultPrng.init(0xf1415);
+    const r = prng.random();
+    for (0..edges.len + 2000) |i| {
+        var f: [5]u64 = undefined;
+        if (i < edges.len) {
+            f = edges[i];
+        } else {
+            for (&f) |*x| x.* = r.intRangeAtMost(u64, M - 8, M);
+            f[1] = r.intRangeAtMost(u64, M - 8, (1 << 26) + (1 << 11));
+            if (r.boolean()) f[0] = r.int(u64) & M;
+        }
+        const s = r.int(u128);
+        var v: u256 = 0;
+        for (f, 0..) |x, k| v += @as(u256, x) << @intCast(26 * k);
+        const want: u128 = @truncate((v % p) + s);
+        try std.testing.expectEqual(want, finish(f, s));
+    }
 }
 
 test "h near the modulus takes the reduced branch" {

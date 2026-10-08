@@ -845,6 +845,39 @@ test "malformed key text: typed errors, no panic" {
     try std.testing.expectError(error.InvalidKeyEncoding, testParseSecretKeyHex("g" ++ good_hex[1..]));
 }
 
+test "secret parsers zero `out` on every error, after decoding into it" {
+    // The parsers decode every character into `out` before they reject (the
+    // constant-time shape), so a rejected text has already left most of a key
+    // there. The doc promises `out` is zeroed on any error; nothing checked it,
+    // and dropping the base64 parser's zeroing survived the 2026-10-08 mutation
+    // run. The bad character is LAST, so all of the key is decoded first.
+    const good_b64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const good_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const zero: [secret_length]u8 = @splat(0);
+    var out: [secret_length]u8 = undefined;
+
+    const b64_cases = [_]struct { text: []const u8, err: KeyEncodingError }{
+        .{ .text = good_b64[0..43] ++ "A", .err = error.InvalidKeyEncoding }, // padding
+        .{ .text = good_b64[0..42] ++ "9=", .err = error.InvalidKeyEncoding }, // non-canonical tail bits
+        .{ .text = good_b64[0..41] ++ "*" ++ good_b64[42..], .err = error.InvalidKeyEncoding },
+        .{ .text = good_b64[0..43], .err = error.InvalidLength },
+    };
+    for (b64_cases) |case| {
+        @memset(&out, 0xaa);
+        try std.testing.expectError(case.err, parseSecretKeyBase64(&out, case.text));
+        try std.testing.expectEqualSlices(u8, &zero, &out);
+    }
+    const hex_cases = [_]struct { text: []const u8, err: KeyEncodingError }{
+        .{ .text = good_hex[0..63] ++ "g", .err = error.InvalidKeyEncoding },
+        .{ .text = good_hex[0..62], .err = error.InvalidLength },
+    };
+    for (hex_cases) |case| {
+        @memset(&out, 0xaa);
+        try std.testing.expectError(case.err, parseSecretKeyHex(&out, case.text));
+        try std.testing.expectEqualSlices(u8, &zero, &out);
+    }
+}
+
 test "constant-time codecs: EXHAUSTIVE agreement with std over every input byte" {
     // ⭐ Exhaustive rather than sampled, and it is cheap: 64 + 256 + 16 + 256
     // cases. The `hqc` precedent is the reason -- there, a table lookup and its
