@@ -71,8 +71,12 @@ pub fn bip340Sign(secret_key: [32]u8, msg: []const u8, aux_rand: [32]u8) SignErr
 const bip340_stack_burn = 16 * 1024;
 
 noinline fn burnBip340Stack() void {
-    var buf: [bip340_stack_burn]u8 = undefined;
-    std.crypto.secureZero(u8, &buf);
+    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+    const V = @Vector(4, u64);
+    var buf: [bip340_stack_burn / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
 }
 
 noinline fn bip340SignInner(secret_key: [32]u8, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {

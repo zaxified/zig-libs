@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (speed):** the dead-stack burn zeroes with
+  volatile 32-byte vector stores instead of `std.crypto.secureZero` (a volatile byte memset,
+  ~3 B/ns without libc): ~30× faster per KiB burned. Same size, same depth; the ReleaseFast stack
+  probe still reads 0.
 - **2026-10-08** — Security (HIGH, no API change): `sign` left the secret key and both secret
   nonces on the dead stack — measured with the new `src/stackprobe_test.zig` (ReleaseFast): `d'`
   once and `k1'`/`k2'` four times each per partial signature. The work now runs one `noinline`

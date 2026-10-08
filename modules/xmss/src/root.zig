@@ -308,11 +308,14 @@ const stack_burn = 32 * 1024;
 /// in the caller's frame, above the region the computation used, and the test
 /// finds chain values again. On the `*Inner` functions it is a guard, not a
 /// measured necessity: dropping it left the test green (the compiler does not
-/// inline them today). `secureZero` writes through a volatile slice, so the
-/// dead store survives optimisation.
+/// inline them today). Volatile stores keep the dead store.
 noinline fn burnStack() void {
-    var buf: [stack_burn]u8 = undefined;
-    std.crypto.secureZero(u8, &buf);
+    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+    const V = @Vector(4, u64);
+    var buf: [stack_burn / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
 }
 
 /// RAND_HASH (§4.1.4, Algorithm 7): the randomized tree-node hash.

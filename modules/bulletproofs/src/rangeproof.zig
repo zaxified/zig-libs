@@ -511,11 +511,14 @@ const prove_stack_burn = 128 * 1024;
 /// Zero `prove_stack_burn` bytes at the depth `proveInner`'s frames
 /// occupied. `noinline` here is load-bearing, measured: made `inline`, this
 /// buffer lands in the caller's frame, above the region the proof used, and
-/// the probe finds blinding scalars again. `secureZero` writes through a
-/// volatile slice, so the dead store survives optimisation.
+/// the probe finds blinding scalars again. Volatile stores keep the dead store.
 noinline fn burnStack() void {
-    var buf: [prove_stack_burn]u8 = undefined;
-    std.crypto.secureZero(u8, &buf);
+    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+    const V = @Vector(4, u64);
+    var buf: [prove_stack_burn / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
 }
 
 /// Steps 1-10 of `prove`, for `m = values.len` values ("Aggregation" in the

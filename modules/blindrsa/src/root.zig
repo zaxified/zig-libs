@@ -461,10 +461,14 @@ const sign_stack_burn = 512 * 1024;
 /// frames occupied. `noinline` is load-bearing in the sibling modules that
 /// use this pattern: inlined, the buffer lands in the CALLER's frame, above
 /// the region the computation used, and the probe finds the secret again.
-/// `secureZero` writes through a volatile slice, so the dead store survives.
+/// Volatile stores keep the dead store.
 noinline fn burnStack(comptime bytes: usize) void {
-    var buf: [bytes]u8 = undefined;
-    std.crypto.secureZero(u8, &buf);
+    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+    const V = @Vector(4, u64);
+    var buf: [bytes / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
 }
 
 pub fn blind(

@@ -327,10 +327,14 @@ const presign_stack_burn = 32 * 1024;
 /// Zero `presign_stack_burn` bytes at the depth the computation used.
 /// `noinline` is load-bearing (as `bip340`'s `burnSignStack`): inlined, the
 /// buffer lands in the caller's frame, above the region to clear.
-/// `secureZero` writes through a volatile slice, so the dead store stays.
+/// Volatile stores keep the dead store.
 noinline fn burnPreSignStack() void {
-    var buf: [presign_stack_burn]u8 = undefined;
-    std.crypto.secureZero(u8, &buf);
+    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+    const V = @Vector(4, u64);
+    var buf: [presign_stack_burn / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
 }
 
 /// The (steps 1-8, no self-check) result `computeUnverified` — or a test's

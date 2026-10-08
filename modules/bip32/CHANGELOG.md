@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (speed):** the dead-stack burn added earlier
+  today zeroes with volatile 32-byte vector stores instead of `u64` stores (~4× faster per KiB).
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** measured with the new
   ReleaseFast stack probe, every entry point that touches a secret left it in dead stack frames
   although each named buffer was wiped: `masterFromSeed` the seed, master key and chain code;

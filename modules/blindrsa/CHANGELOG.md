@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (speed):** the dead-stack burn zeroes with
+  volatile 32-byte vector stores instead of `std.crypto.secureZero` (a volatile byte memset,
+  ~3 B/ns without libc): ~30× faster per KiB burned. Same size, same depth; the ReleaseFast stack
+  probe still reads 0.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
   bodies are now generic over their source and run by testkit's deterministic
   driver `BLINDRSA_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in

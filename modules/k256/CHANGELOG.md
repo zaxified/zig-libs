@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (speed):** every dead-stack burn (`ecdsa_recover.sign`,
+  `sign.bip340Sign`, `mul`, `combMulBase`) zeroes with volatile 32-byte vector stores instead of
+  `secureZero` (a volatile byte memset, ~3 B/ns without libc). Measured: ECDSA sign −5.6 %,
+  BIP340 sign −9 %, `mul` −7 % (SPEC § "Secret residue on the dead stack").
 - **2026-10-08** — **FIX (secret on the dead stack; NO API CHANGE):** `Secp256k1.combMulBase`
   left the little-endian image of its SECRET scalar on the dead stack once per call — under
   every public-key derivation built on it (bip32, taproot, frost, dkg). It now runs one frame

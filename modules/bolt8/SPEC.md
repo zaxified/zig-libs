@@ -497,7 +497,7 @@ measured run.
   `init` the static key ×2, each act its private key and DH output (`readAct2` also `temp_k2`),
   `genAct3`/`readAct3` the static/ephemeral key, `se`, `ck`, and the transport keys `sk` ×4 and
   `rk` ×3 per handshake. Fix (BREAKING): `init`s and every act run one frame down and then zero
-  24 KiB at that depth (volatile `u64` stores; `k256`'s 16 KiB `mul` burn sits under it);
+  24 KiB at that depth (volatile vector stores; `k256`'s 16 KiB `mul` burn sits under it);
   `Initiator.init`/`Responder.init` take the `KeyPair` by pointer; `genAct3(&out)` returns the
   `Act3` and writes the `HandshakeResult` to `out`, `readAct3(msg, &out)` likewise (a returned
   result lands in a temporary of the caller's frame no wipe here reaches). After: 0 over 9 steps

@@ -280,11 +280,14 @@ pub fn parseSecretKeyHex(out: *[secret_length]u8, text: []const u8) KeyEncodingE
 /// guard, not a measured necessity: with the codecs writing into caller
 /// buffers, removing this call or the codecs' `noinline` left
 /// `stackprobe_test.zig` at zero. It keeps whatever a codec's frames may hold
-/// in a future build off the dead stack. `secureZero` writes through a volatile
-/// slice, so the dead store survives optimisation.
+/// in a future build off the dead stack. Volatile stores keep the dead store.
 noinline fn burnCodecStack() void {
-    var buf: [1024]u8 = undefined;
-    std.crypto.secureZero(u8, &buf);
+    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+    const V = @Vector(4, u64);
+    var buf: [1024 / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
 }
 
 /// Recompute the public key from a stored secret key (X25519 base-point

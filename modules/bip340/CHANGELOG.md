@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (speed):** the dead-stack burn zeroes with
+  volatile 32-byte vector stores instead of `std.crypto.secureZero` (a volatile byte memset,
+  ~3 B/ns without libc): ~30× faster per KiB burned. Same size, same depth; the ReleaseFast stack
+  probe still reads 0.
 - **2026-10-08** — **FIX (secret on the dead stack; NO API CHANGE):** since `signWithKeyPair`
   (2026-10-07) `sign` held a copy of the secret key in its own frame, above the region it zeroes,
   and left it on the dead stack after every signature; `KeyPair.fromSecretKey`, now the documented

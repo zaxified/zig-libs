@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (speed):** the dead-stack burn zeroes with
+  volatile 32-byte vector stores instead of `std.crypto.secureZero` (a volatile byte memset,
+  ~3 B/ns without libc): ~30× faster per KiB burned. Same size, same depth; the ReleaseFast stack
+  probe still reads 0.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Compared with no longer says no LMS/HSS module exists — it points to the sibling `lms` module (grade 2).
 - **2026-10-05** — Mutation run: 23 of 24 killed, 1 equivalent; 1 test extended
   (the external-vector KAT rejects 2048 tampered randomizers, so `verify`'s

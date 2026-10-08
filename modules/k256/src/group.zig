@@ -311,8 +311,12 @@ pub const Secp256k1 = struct {
     /// on the region: zero `mul_stack_burn` bytes at `mulInner`'s depth.
     /// `noinline` on both is load-bearing. Pinned by `stackprobe_test.zig`.
     noinline fn burnMulStack() void {
-        var buf: [mul_stack_burn]u8 = undefined;
-        std.crypto.secureZero(u8, &buf);
+        // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+        // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+        const V = @Vector(4, u64);
+        var buf: [mul_stack_burn / @sizeOf(V)]V = undefined;
+        const p: [*]volatile V = &buf;
+        for (0..buf.len) |i| p[i] = @splat(0);
     }
 
     /// The per-point table `mul` gathers from: `tab[j] = (j+1)·p`, projective.
@@ -404,13 +408,12 @@ pub const Secp256k1 = struct {
     /// `comb_stack_burn` bytes at `combMulBaseInner`'s depth. `noinline` on
     /// both is load-bearing.
     noinline fn burnCombStack() void {
-        // Volatile word stores, not `secureZero`: that is a volatile byte memset,
-        // and without libc the memset behind it moves ~3 B/ns — 2.5 µs per 8 KiB
-        // against 0.3 µs for this loop (ReleaseFast, 2026-10-08). `volatile`
-        // keeps the dead stores and keeps them from becoming a memset call.
-        var buf: [comb_stack_burn / 8]u64 = undefined;
-        const p: [*]volatile u64 = &buf;
-        for (0..buf.len) |i| p[i] = 0;
+        // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+        // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+        const V = @Vector(4, u64);
+        var buf: [comb_stack_burn / @sizeOf(V)]V = undefined;
+        const p: [*]volatile V = &buf;
+        for (0..buf.len) |i| p[i] = @splat(0);
     }
 
     /// `combMulBase` parameterised on the table, so the positive-control test in

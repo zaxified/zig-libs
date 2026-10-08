@@ -306,14 +306,15 @@ noinline fn tweakSecretKeyBody(internal_sk: *const bip340.SecretKey, merkle_root
     out.* = d.add(t).toBytes(.big);
 }
 
-/// Zero `stack_burn` bytes at the depth `tweakSecretKeyBody` used. Volatile
-/// word stores, not `secureZero`: that is a volatile byte memset, and without
-/// libc the memset behind it moves ~3 B/ns — 2.5 µs per 8 KiB against 0.3 µs
-/// for this loop (ReleaseFast, 2026-10-08). `noinline` is load-bearing.
+/// Zero `stack_burn` bytes at the depth `tweakSecretKeyBody` used. `noinline`
+/// is load-bearing.
 noinline fn burnStack() void {
-    var buf: [stack_burn / 8]u64 = undefined;
-    const p: [*]volatile u64 = &buf;
-    for (0..buf.len) |i| p[i] = 0;
+    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+    const V = @Vector(4, u64);
+    var buf: [stack_burn / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
 }
 
 /// `tweakSecretKeyBody`'s call tree (with `bip340.KeyPair.fromSecretKey`'s

@@ -133,7 +133,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   the child key ×4; `parseExtended` the parsed key; the bip39 functions the entropy or
   `SHA-512(mnemonic)`). Fix, in two parts measured separately: (1) every public entry point
   runs its body one frame down (`noinline`) and then zeroes `stack_burn` bytes (16 KiB bip32,
-  8 KiB bip39, volatile `u64` stores) at that depth — that removed all but one copy of the
+  8 KiB bip39, volatile vector stores) at that depth — that removed all but one copy of the
   RESULT key per call; (2) that last copy sat in the caller's own frame (the inlined wrapper's
   error-union temporary, seen in the disassembly), so secret results go to an out-parameter
   and `ExtendedPrivKey` parameters are pointers. After both: 0 residues in 30 needles over

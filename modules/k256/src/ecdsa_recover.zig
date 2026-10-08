@@ -178,11 +178,14 @@ const sign_stack_burn = 16 * 1024;
 /// Zero `sign_stack_burn` bytes starting at the depth `signInner`'s frame
 /// occupied. `noinline` on both functions is load-bearing: inlined, the
 /// signing frames would merge into `sign`'s own frame, ABOVE this buffer, and
-/// the burn would clear nothing that held a secret. `secureZero` writes
-/// through a volatile slice, so the dead store survives optimisation.
+/// the burn would clear nothing that held a secret. Volatile stores keep the dead store.
 noinline fn burnSignStack() void {
-    var buf: [sign_stack_burn]u8 = undefined;
-    std.crypto.secureZero(u8, &buf);
+    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+    const V = @Vector(4, u64);
+    var buf: [sign_stack_burn / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
 }
 
 noinline fn signInner(privkey: [32]u8, hash32: [32]u8, comptime commit: CommitFn) SignError!Signature {

@@ -56,8 +56,12 @@ const HssPublicKey = core.HssPublicKey;
 const stack_burn = 16 * 1024;
 
 noinline fn burnStack() void {
-    var buf: [stack_burn]u8 = undefined;
-    std.crypto.secureZero(u8, &buf);
+    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+    const V = @Vector(4, u64);
+    var buf: [stack_burn / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
 }
 
 /// Nodes at heights below `cacheHeight` are recomputed per signature; see the

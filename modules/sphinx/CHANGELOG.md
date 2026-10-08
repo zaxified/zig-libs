@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (speed):** the dead-stack burn added earlier
+  today zeroes with volatile 32-byte vector stores instead of `u64` stores (~4× faster per KiB).
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** measured with the new
   ReleaseFast stack probe, `deriveHopSecrets`, `construct` and `process` left the session key or
   node key, blinded ephemeral scalars, blinding factors and `rho`/`mu`/`pad` keys in dead stack

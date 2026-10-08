@@ -226,13 +226,12 @@ noinline fn mnemonicToSeedBody(mnemonic: []const u8, passphrase: []const u8, out
 /// as `bip32.zig`'s `burnStack`: the body runs one frame down (`noinline`),
 /// then `stack_burn` bytes at that depth are zeroed.
 noinline fn burnStack() void {
-    // Volatile word stores, not `secureZero`: that is a volatile byte memset,
-    // and without libc the memset behind it moves ~3 B/ns — 2.5 µs per 8 KiB
-    // against 0.3 µs for this loop (ReleaseFast, 2026-10-08). `volatile`
-    // keeps the dead stores and keeps them from becoming a memset call.
-    var buf: [stack_burn / 8]u64 = undefined;
-    const p: [*]volatile u64 = &buf;
-    for (0..buf.len) |i| p[i] = 0;
+    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+    const V = @Vector(4, u64);
+    var buf: [stack_burn / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
 }
 
 /// The deepest body (`mnemonicToSeed`) dirtied 3.5 KiB in ReleaseFast

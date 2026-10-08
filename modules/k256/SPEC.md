@@ -372,8 +372,12 @@ derivation in the family runs it on a secret (bip32's `pubkeyFromPriv`, taproot
 tweaks, frost/dkg shares). Same shape as `mul`: `noinline` `combMulBaseInner`,
 then `comb_stack_burn` = 8 KiB zeroed at that depth; probe 5 → 0 over 5 calls in
 three representations (BE, LE, `Scalar` image), negative control 0, positive 1.
-The burn is volatile `u64` stores, not `secureZero`: without libc the memset
-behind `secureZero` runs at ~3 B/ns (2.5 µs per 8 KiB), the word loop 0.3 µs.
+**Burn speed (2026-10-08).** Every burn in this module (and in the family built on it) is
+volatile 32-byte vector stores, not `secureZero`: without libc the volatile byte memset behind
+`secureZero` runs at ~3 B/ns (2.5 µs per 8 KiB), vector stores at ~100 B/ns. Measured on the
+switch (ReleaseFast, ns per call, min of 9 × 3000): `ecdsa_recover.sign` 77 029 → 72 692,
+`sign.bip340Sign` 66 218 → 60 289, `mul` 80 968 → 75 492, `combMulBase` 21 229 → 20 707
+(that one was already on `u64` stores). Probes unchanged at 0.
 `combMulBaseWithTable` (the test seam) does not burn.
 
 **`Secp256k1.mul`, the ECDH path (A1 R1, re-audit 2026-09-15).** The windowed

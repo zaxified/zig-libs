@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (speed):** the dead-stack burn zeroes with
+  volatile 32-byte vector stores instead of `std.crypto.secureZero` (a volatile byte memset,
+  ~3 B/ns without libc): ~30× faster per KiB burned. Same size, same depth; the ReleaseFast stack
+  probe still reads 0.
 - **2026-10-03** — **NO CONSUMER-VISIBLE CHANGE:** first audit (review + schemata mutation run,
   67 mutants: 60 killed, 7 equivalent; 7 survived the first pass and are now killed). Eight tests
   added: the persist hook runs before any signature byte exists, an allocation failure while

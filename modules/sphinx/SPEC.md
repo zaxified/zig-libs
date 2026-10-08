@@ -121,7 +121,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   public blinding chain is the whole route's key schedule). Fix (BREAKING): the three entry
   points take the secret 32-byte key by pointer (`*const [32]u8` — an array passed by value is
   copied into the CALLER's frame) and run their body one frame down, followed by a 40 KiB zeroing
-  at that depth (volatile `u64` stores; `process` dirties 32 KiB, `k256`'s 16 KiB `mul` burn
+  at that depth (volatile vector stores; `process` dirties 32 KiB, `k256`'s 16 KiB `mul` burn
   included). After: 0 over 31 needles (session key, node key, `e_1..e_4` BE+LE, blinding
   factors, every `ss_i`/`rho_i`/`mu_i`, pad key) × 4 calls × 3 repeats, negative 0, positive 1.
   Not covered: `generateKey`/`generateCipherStream` called directly (the ChaCha20 state holds

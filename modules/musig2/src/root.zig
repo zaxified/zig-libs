@@ -938,11 +938,15 @@ noinline fn signBurned(secnonce: *SecNonce, sk_ptr: *const bip340.SecretKey, ctx
 const sign_stack_burn = 32 * 1024;
 
 /// `noinline` is load-bearing (as `bip340`'s `burnSignStack`): inlined, the
-/// buffer lands in `sign`'s frame, above the region to clear. `secureZero`
-/// writes through a volatile slice, so the dead store stays.
+/// buffer lands in `sign`'s frame, above the region to clear.
+/// Volatile stores keep the dead store.
 noinline fn burnSignStack() void {
-    var buf: [sign_stack_burn]u8 = undefined;
-    std.crypto.secureZero(u8, &buf);
+    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+    const V = @Vector(4, u64);
+    var buf: [sign_stack_burn / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
 }
 
 // ── PartialSigVerify (BIP327 §"Partial Signature Verification") ───────────

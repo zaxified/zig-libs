@@ -107,7 +107,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   it returned, dead frames held the internal key ×2, the normalised `d` ×2 and `q` ×3 per call
   (`kp`/`d` were wiped by name — the copies were the compiler's and the caller's). Now the key
   comes in by pointer, `q` goes out through `out`, and the body runs one frame down followed by
-  a 16 KiB zeroing at that depth (volatile `u64` stores). Probe: 0 in fifteen representations
+  a 16 KiB zeroing at that depth (volatile vector stores). Probe: 0 in fifteen representations
   (key, `d`, `n−d`, `q`, `n−q`; BE, LE, `Scalar` image) over 5 calls, both even-y arms,
   negative control 0, positive control 1. What it does not cover: the caller's own copy of `q`.
 - **A wrong tweak is a fund-loss bug, not a correctness nitpick.** Two

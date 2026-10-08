@@ -222,8 +222,12 @@ pub const KeyPair = struct {
     /// Zero `keypair_stack_burn` bytes at the depth `derive` used. `noinline`
     /// for the same reason as `burnSignStack`.
     noinline fn burnKeyPairStack() void {
-        var buf: [keypair_stack_burn]u8 = undefined;
-        std.crypto.secureZero(u8, &buf);
+        // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+        // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+        const V = @Vector(4, u64);
+        var buf: [keypair_stack_burn / @sizeOf(V)]V = undefined;
+        const p: [*]volatile V = &buf;
+        for (0..buf.len) |i| p[i] = @splat(0);
     }
 
     /// `derive`'s call tree reached 1.8 KiB in ReleaseFast (2026-10-08);
@@ -446,11 +450,14 @@ const sign_stack_burn = 16 * 1024;
 /// probe finds `d` and the nonce again. On `computeUnverified` it is a guard,
 /// not a measured necessity: `sign` reaches it through a function pointer the
 /// compiler does not inline today, and dropping the keyword left the probe
-/// green. `secureZero` writes through a volatile slice, so the dead store
-/// survives optimisation.
+/// green. Volatile stores keep the dead store.
 noinline fn burnSignStack() void {
-    var buf: [sign_stack_burn]u8 = undefined;
-    std.crypto.secureZero(u8, &buf);
+    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
+    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
+    const V = @Vector(4, u64);
+    var buf: [sign_stack_burn / @sizeOf(V)]V = undefined;
+    const p: [*]volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
 }
 
 /// Steps 1-9 of `sign` (no self-check) — the real computation `signImpl`

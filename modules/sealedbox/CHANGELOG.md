@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (speed):** the dead-stack burn zeroes with
+  volatile 32-byte vector stores instead of `std.crypto.secureZero` (a volatile byte memset,
+  ~3 B/ns without libc): ~30× faster per KiB burned. Same size, same depth; the ReleaseFast stack
+  probe still reads 0.
 - **2026-10-08** — **FIX (targets with ≥ 1024-bit vectors only):** the 2026-10-07
   XSalsa20 batch width came straight from `std.simd.suggestVectorLength(u32)`; at 32+
   lanes (Hexagon HVX, RISC-V zvl1024b+) the keystream was never applied to messages
