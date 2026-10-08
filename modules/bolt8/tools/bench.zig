@@ -63,19 +63,19 @@ const Keys = struct {
 const Both = struct { ini: bolt8.HandshakeResult, rsp: bolt8.HandshakeResult };
 
 fn handshake(k: *Keys, acts: *[166]u8) !Both {
-    var ini = bolt8.Initiator.init(k.ls_i, k.ls_r.public_key);
-    var rsp = bolt8.Responder.init(k.ls_r);
+    var ini = bolt8.Initiator.init(&k.ls_i, k.ls_r.public_key);
+    var rsp = bolt8.Responder.init(&k.ls_r);
     const a1 = (try ini.genAct1(.{ .seeded_for_test = k.e_i.random() })).toBytes();
     try rsp.readAct1(try bolt8.act.Act1.fromBytes(&a1));
     const a2 = (try rsp.genAct2(.{ .seeded_for_test = k.e_r.random() })).toBytes();
     try ini.readAct2(try bolt8.act.Act2.fromBytes(&a2));
-    const fin = try ini.genAct3();
-    const a3 = fin.msg.toBytes();
-    const rr = try rsp.readAct3(try bolt8.act.Act3.fromBytes(&a3));
+    var both: Both = undefined;
+    const a3 = (try ini.genAct3(&both.ini)).toBytes();
+    try rsp.readAct3(try bolt8.act.Act3.fromBytes(&a3), &both.rsp);
     @memcpy(acts[0..50], &a1);
     @memcpy(acts[50..100], &a2);
     @memcpy(acts[100..166], &a3);
-    return .{ .ini = fin.result, .rsp = rr };
+    return both;
 }
 
 const HsCtx = struct {

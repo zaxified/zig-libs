@@ -41,15 +41,17 @@ fn timeIt(io: std.Io, ctx: anytype, comptime f: anytype) f64 {
 
 const msg = [_]u8{0x5a} ** 64;
 
-fn doSign(kp: ed.KeyPair) ed.Signature {
+fn doSign(kp: *const ed.KeyPair) ed.Signature {
     return ed.sign(kp, &msg, "") catch unreachable;
 }
 fn doVerify(sig: ed.Signature, pk: ed.PublicKey) bool {
     ed.verify(sig, &msg, "", pk) catch return false;
     return true;
 }
-fn doDerive(sk: [x448.scalar_length]u8, pk: [x448.public_length]u8) [x448.shared_length]u8 {
-    return x448.scalarmult(sk, pk) catch unreachable;
+fn doDerive(sk: *const [x448.scalar_length]u8, pk: [x448.public_length]u8) [x448.shared_length]u8 {
+    var out: [x448.shared_length]u8 = undefined;
+    x448.scalarmult(&out, sk, pk) catch unreachable;
+    return out;
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -91,16 +93,18 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
 
-    const kp = ed.KeyPair.create([_]u8{7} ** 57);
-    const sig = doSign(kp);
+    const kp = ed.KeyPair.create(&([_]u8{7} ** 57));
+    const sig = doSign(&kp);
     if (!doVerify(sig, kp.public_key)) return error.OwnSignatureDoesNotVerify;
-    const a = try x448.KeyPair.generateDeterministic([_]u8{9} ** x448.seed_length);
-    const b = try x448.KeyPair.generateDeterministic([_]u8{3} ** x448.seed_length);
+    var a: x448.KeyPair = undefined;
+    try x448.KeyPair.generateDeterministic(&a, &([_]u8{9} ** x448.seed_length));
+    var b: x448.KeyPair = undefined;
+    try x448.KeyPair.generateDeterministic(&b, &([_]u8{3} ** x448.seed_length));
 
     const rows = [_]struct { name: []const u8, ours: f64, theirs: f64 }{
-        .{ .name = "sign", .ours = timeIt(io, .{kp}, doSign), .theirs = 1e9 / sign_rate.? },
+        .{ .name = "sign", .ours = timeIt(io, .{&kp}, doSign), .theirs = 1e9 / sign_rate.? },
         .{ .name = "verify", .ours = timeIt(io, .{ sig, kp.public_key }, doVerify), .theirs = 1e9 / verify_rate.? },
-        .{ .name = "x448", .ours = timeIt(io, .{ a.secret_key, b.public_key }, doDerive), .theirs = 1e9 / derive_rate.? },
+        .{ .name = "x448", .ours = timeIt(io, .{ &a.secret_key, b.public_key }, doDerive), .theirs = 1e9 / derive_rate.? },
     };
 
     var buf: [4096]u8 = undefined;

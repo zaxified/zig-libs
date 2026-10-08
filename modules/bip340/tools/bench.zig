@@ -126,7 +126,7 @@ pub fn main(init: std.process.Init) !u8 {
     const sk = try bip340.SecretKey.fromBytes(sk_bytes);
     var kp: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&kp, &sk);
-    const sig_bytes = try bip340.sign(sk, &msg, aux, io);
+    const sig_bytes = try bip340.sign(&sk, &msg, aux, io);
     const sig = try bip340.Signature.fromBytes(sig_bytes);
     try dir.writeFile(io, .{ .sub_path = "sk.bin", .data = &sk_bytes });
     try dir.writeFile(io, .{ .sub_path = "msg.bin", .data = &msg });
@@ -192,8 +192,9 @@ pub fn main(init: std.process.Init) !u8 {
         r.bytes(&m);
         r.bytes(&a);
         var k: bip340.KeyPair = undefined;
-        try bip340.KeyPair.fromSecretKey(&k, &(try bip340.SecretKey.fromBytes(b)));
-        const s = try bip340.sign(try bip340.SecretKey.fromBytes(b), &m, a, io);
+        const item_sk = try bip340.SecretKey.fromBytes(b);
+        try bip340.KeyPair.fromSecretKey(&k, &item_sk);
+        const s = try bip340.sign(&item_sk, &m, a, io);
         it.* = .{ .pubkey = k.public, .msg = try arena.dupe(u8, &m), .sig = try bip340.Signature.fromBytes(s) };
     }
 
