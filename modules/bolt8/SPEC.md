@@ -490,7 +490,7 @@ measured run.
 
 ## Backlog / deferred
 
-- **Dead-stack copies — handshake MEASURED AND FIXED 2026-10-08 (HIGH); transport open.**
+- **Dead-stack copies — MEASURED AND FIXED 2026-10-08 (handshake HIGH, transport MEDIUM).**
   `src/stackprobe_test.zig` (ReleaseFast; needles: both static and both ephemeral keys, `es`/`ee`/
   `se` and their shared-point x, `ck` and the cipher key after each act, `sk`/`rk`; every step on
   global state so the objects' own fields are never scanned). Before: every step left secrets —
@@ -501,9 +501,9 @@ measured run.
   `Initiator.init`/`Responder.init` take the `KeyPair` by pointer; `genAct3(&out)` returns the
   `Act3` and writes the `HandshakeResult` to `out`, `readAct3(msg, &out)` likewise (a returned
   result lands in a temporary of the caller's frame no wipe here reaches). After: 0 over 9 steps
-  × 3 handshakes, negative 0, positive 1. **Still open:** `sendMessage` leaves the transport key
-  ×2 and `recvLength`+`recvMessage` ×1 per message — the ChaCha20 state the AEAD builds from the
-  key, not this module's code; tracked in `chachapoly`'s backlog "Key copies on the dead stack".
+  × 3 handshakes, negative 0, positive 1. Transport (same day): `sendMessage` left the transport key ×2 and `recvLength`+`recvMessage`
+  ×1 per message — inside `chachapoly`'s AEAD and in `noise`'s `CipherState` frame (the key passed
+  by value); both now burn (see their SPECs) and the probe covers both steps: 0.
   `Direction.rotate`'s `SymmetricState` shell runs once per 1000 messages and was not probed.
 
 - 2026-10-07 (bench-bolt8): 1.06–1.13× slower than lnd brontide on the transport (ChaCha20-Poly1305 over 1 KiB and 64 KiB messages; brontide's Go `x/crypto` has amd64 assembly for it (checked: `chacha20poly1305_amd64.s` in x/crypto v0.57.0), ours uses the Zig std AEAD), while the handshake is 0.79× (1.27× faster). The gap sits in the AEAD, not in this module's framing; closing it belongs to the `chachapoly` module, not here.

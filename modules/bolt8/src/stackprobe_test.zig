@@ -191,19 +191,11 @@ const steps = [_]struct { name: []const u8, call: *const fn () void }{
     .{ .name = "genAct3", .call = stepGenAct3 },
     .{ .name = "readAct3", .call = stepReadAct3 },
     .{ .name = "Transport.init", .call = stepTransportInit },
-    // ⚠ Not here: `sendMessage`/`recvMessage`. Measured 2026-10-08: each
-    // leaves the transport key once or twice in a dead frame — the ChaCha20
-    // state the AEAD builds from the key (std's below 129 bytes, the
-    // `chachapoly` module's above), not this module's code. Tracked in
-    // `chachapoly`'s SPEC backlog ("Key copies on the dead stack"); this
-    // module's SPEC backlog points there. `stepSend`/`stepRecv` stay for
-    // that measurement.
+    // Each left the transport key once or twice per message until
+    // `chachapoly`'s AEAD got its own stack burn (2026-10-08).
+    .{ .name = "sendMessage", .call = stepSend },
+    .{ .name = "recvLength+recvMessage", .call = stepRecv },
 };
-
-comptime {
-    _ = &stepSend;
-    _ = &stepRecv;
-}
 
 fn sharedX(secret: [32]u8, remote: [33]u8) ![32]u8 {
     const p = try (try Secp256k1.fromSec1(&remote)).mul(secret, .big);

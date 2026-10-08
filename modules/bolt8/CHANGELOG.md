@@ -11,8 +11,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   per handshake. Each now runs one frame down and zeroes 24 KiB at that depth. API:
   `Initiator.init(&keypair, rs_pub)`, `Responder.init(&keypair)`; `genAct3(&result) !Act3` and
   `readAct3(msg, &result) !void` write the `HandshakeResult` to an out-parameter instead of
-  returning it (a returned result lands in a caller temporary nothing can wipe). Not fixed here:
-  the per-message transport-key copy inside the ChaCha20-Poly1305 AEAD (`chachapoly` backlog).
+  returning it (a returned result lands in a caller temporary nothing can wipe). The per-message
+  transport-key copies were in `chachapoly` and `noise`, fixed there the same day; the probe now
+  covers `sendMessage`/`recvMessage` too.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the five `testing.fuzz`
   harnesses (acts 1–3, transport length and message) are generic over their
   source and run by testkit's deterministic driver `BOLT8_FUZZ` (new
