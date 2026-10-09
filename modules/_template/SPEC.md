@@ -74,8 +74,11 @@
                  `fastest ref` when the reference IS the fastest. A range `a–b` is
                  read as b. `not measured`, or `n/a — <why>` where speed is not
                  what a user picks this module for.
-                 1 = x ≤ 1 and y ≤ 1.25 · 2 = x ≤ 1 · 3 = x ≤ 2, or not measured
-                 · 4 = x > 2.
+                 1 = x ≤ 1 and y ≤ 1.25 · 2 = x ≤ 1.1 · 3 = x ≤ 2, or not
+                 measured · 4 = x > 2. (P2's 10 % is the noise of a worst-of-N
+                 ratio at parity; it holds only for a bench that alternates
+                 the sides and keeps each one's best of several rounds —
+                 CONVENTIONS.md §9, kind 3.)
      Evidence (E) — class C/D only (no outside truth; class A/B take E from the
                  anchor grade below — EXTERNAL with a live `tools/interop.zig`
                  oracle 1, frozen EXTERNAL 2, MIXED 3, REDERIVED 4, SELF 5):

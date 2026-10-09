@@ -1004,7 +1004,11 @@ that reaches it can notice.
      `**Performance:**` ratio or an `**Ahead:** speed` claim in the maturity card (added
      2026-10-07 with grading v2). Like the oracle it drives the module only through its
      public API, so it survives refactoring — and without it the ratio is a number nobody
-     can re-check, which is exactly what kind 1 forbids for a golden.
+     can re-check, which is exactly what kind 1 forbids for a golden. It alternates the
+     two sides per workload and keeps each side's best of several rounds (user-mode
+     cycles where the CPU counts them): timed one after the other on a shared machine they
+     see different loads, measured at ±10 % (zstd, 2026-10-09). The grade's 10 % tolerance
+     for P2 (`p2_ref_tolerance` in `build.zig`) assumes this method.
 
   All three go to `modules/<name>/tools/`, each with a header saying what it needs and what it
   produces. Mutation runners, probes for one finding, benchmarks of a fixed regression and

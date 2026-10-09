@@ -4229,6 +4229,11 @@ fn moduleAnchorGrade(b: *std.Build, io: std.Io, name: []const u8) ?AnchorGrade {
 /// The grade answers both objections: it is computed from named axes by the rule
 /// in `maturityGrade` -- never chosen by feel -- and the axes are printed beside
 /// it as a profile, so a 3 says what would make it a 2.
+/// The worst-workload ratio to the reference that still grades P2
+/// (`maturityGrade`). Valid only for a bench that alternates the two sides
+/// and keeps each one's best of several rounds (CONVENTIONS.md §9, kind 3).
+const p2_ref_tolerance = 1.10;
+
 const Maturity = struct {
     name: []const u8,
     path: []const u8,
@@ -4804,10 +4809,17 @@ fn maturityGrade(b: *std.Build, m: Maturity, today: i64) ?MaturityGrade {
     axes[4] = switch (m.perf) {
         .na => null,
         .not_measured => .{ .letter = 'P', .n = 3, .why = "performance (not measured)" },
+        // P2 tolerates up to 10 % behind the reference (user, 2026-10-09): the
+        // ratio is the WORST of a bench's workloads, and the worst of ~20
+        // noisy ratios sits a few percent above 1.0 at true parity -- zstd at
+        // 0.90–1.04×, crc32c at 0.72–1.01×. A strict 1.0 graded the noise.
+        // P1 keeps x ≤ 1.0: at the top grade the reference is matched outright.
         .measured => |p| if (p.ref > 2.0)
             .{ .letter = 'P', .n = 4, .why = "performance (over 2× slower than the reference)" }
+        else if (p.ref > p2_ref_tolerance)
+            .{ .letter = 'P', .n = 3, .why = "performance (over 1.1× the reference)" }
         else if (p.ref > 1.0)
-            .{ .letter = 'P', .n = 3, .why = "performance (slower than the reference)" }
+            .{ .letter = 'P', .n = 2, .why = "performance (within 1.1× of the reference, not at it)" }
         else if (p.fastest == null)
             .{ .letter = 'P', .n = 2, .why = "performance (fastest in the field not measured)" }
         else if (p.fastest.? > 1.25)
