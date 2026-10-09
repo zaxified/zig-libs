@@ -31,6 +31,7 @@ const std = @import("std");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
 const testkit = @import("testkit");
 const ratchet_mod = @import("ratchet.zig");
+const burn = @import("burn.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
 
@@ -54,6 +55,9 @@ pub const DecodeError = error{
     InvalidSignature,
 };
 
+/// Errors of the base64 entry points (`fromBase64`).
+pub const FromBase64Error = DecodeError || std.mem.Allocator.Error || std.base64.Error;
+
 /// The unsigned session-export format.
 pub const ExportedSessionKey = struct {
     ratchet_index: u32,
@@ -67,27 +71,43 @@ pub const ExportedSessionKey = struct {
         @memcpy(out[1 + index_len + ratchet_mod.ratchet_len ..][0..pubkey_len], &self.signing_key);
     }
 
-    pub fn encode(self: *const ExportedSessionKey) [export_len]u8 {
-        var out: [export_len]u8 = undefined;
-        self.encodeSignedPart(export_version, &out);
-        return out;
+    /// The wire bytes go through `out` (they carry the ratchet); the caller
+    /// owns them and should `secureZero` them once sent.
+    pub fn encode(self: *const ExportedSessionKey, out: *[export_len]u8) void {
+        self.encodeSignedPart(export_version, out);
     }
 
-    pub fn decode(bytes: []const u8) DecodeError!ExportedSessionKey {
+    /// The key goes through `out`, written only on success.
+    pub fn decode(bytes: []const u8, out: *ExportedSessionKey) DecodeError!void {
+        return burn.run(burn.export_decode_burn, DecodeError!void, decodeBody, .{ bytes, out });
+    }
+
+    fn decodeBody(bytes: []const u8, out: *ExportedSessionKey) DecodeError!void {
         if (bytes.len != export_len) return error.WrongLength;
         if (bytes[0] != export_version) return error.UnsupportedVersion;
-        return decodeSignedPartUnchecked(bytes[0..signed_part_len]);
+        decodeSignedPartUnchecked(bytes[0..signed_part_len], out);
     }
 
+    /// The raw bytes on the stack are wiped before return.
     pub fn toBase64(self: *const ExportedSessionKey, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
-        const raw = self.encode();
+        var raw: [export_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &raw);
+        self.encode(&raw);
         return base64Encode(allocator, &raw);
     }
 
-    pub fn fromBase64(allocator: std.mem.Allocator, s: []const u8) (DecodeError || std.mem.Allocator.Error || std.base64.Error)!ExportedSessionKey {
+    /// The key goes through `out`, written only on success.
+    pub fn fromBase64(allocator: std.mem.Allocator, s: []const u8, out: *ExportedSessionKey) FromBase64Error!void {
+        return burn.run(burn.export_decode_burn, FromBase64Error!void, fromBase64Body, .{ allocator, s, out });
+    }
+
+    fn fromBase64Body(allocator: std.mem.Allocator, s: []const u8, out: *ExportedSessionKey) FromBase64Error!void {
         const raw = try base64Decode(allocator, s);
-        defer allocator.free(raw);
-        return decode(raw);
+        defer {
+            std.crypto.secureZero(u8, raw);
+            allocator.free(raw);
+        }
+        try decodeBody(raw, out);
     }
 
     pub fn secureZero(self: *ExportedSessionKey) void {
@@ -100,11 +120,11 @@ pub const SessionKey = struct {
     inner: ExportedSessionKey,
     signature: [signature_len]u8,
 
-    pub fn encode(self: *const SessionKey) [share_len]u8 {
-        var out: [share_len]u8 = undefined;
+    /// The wire bytes go through `out` (they carry the ratchet); the caller
+    /// owns them and should `secureZero` them once sent.
+    pub fn encode(self: *const SessionKey, out: *[share_len]u8) void {
         self.inner.encodeSignedPart(share_version, out[0..signed_part_len]);
         @memcpy(out[signed_part_len..], &self.signature);
-        return out;
     }
 
     /// Decode AND verify: the embedded `Kpub` must validate the trailing
@@ -113,30 +133,50 @@ pub const SessionKey = struct {
     /// without a separate out-of-band authentication step, PROVIDED the
     /// channel it arrived over authenticates the sender at all — see the
     /// module doc comment and SPEC.md's threat model).
-    pub fn decode(bytes: []const u8) DecodeError!SessionKey {
+    ///
+    /// The key goes through `out`, written only on success. The signature is
+    /// checked before the ratchet is copied anywhere, so a rejected key never
+    /// leaves its ratchet in `out` or in a local.
+    pub fn decode(bytes: []const u8, out: *SessionKey) DecodeError!void {
+        return burn.run(burn.key_decode_burn, DecodeError!void, decodeBody, .{ bytes, out });
+    }
+
+    fn decodeBody(bytes: []const u8, out: *SessionKey) DecodeError!void {
         if (bytes.len != share_len) return error.WrongLength;
         if (bytes[0] != share_version) return error.UnsupportedVersion;
 
         const signed_part = bytes[0..signed_part_len];
         const sig_bytes = bytes[signed_part_len..][0..signature_len].*;
-        const inner = try decodeSignedPartUnchecked(signed_part);
+        const signing_key = signed_part[1 + index_len + ratchet_mod.ratchet_len ..][0..pubkey_len];
 
-        const pk = Ed25519.PublicKey.fromBytes(inner.signing_key) catch return error.InvalidPublicKey;
+        const pk = Ed25519.PublicKey.fromBytes(signing_key.*) catch return error.InvalidPublicKey;
         const sig = Ed25519.Signature.fromBytes(sig_bytes);
         sig.verify(signed_part, pk) catch return error.InvalidSignature;
 
-        return .{ .inner = inner, .signature = sig_bytes };
+        decodeSignedPartUnchecked(signed_part, &out.inner);
+        out.signature = sig_bytes;
     }
 
+    /// The raw bytes on the stack are wiped before return.
     pub fn toBase64(self: *const SessionKey, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
-        const raw = self.encode();
+        var raw: [share_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &raw);
+        self.encode(&raw);
         return base64Encode(allocator, &raw);
     }
 
-    pub fn fromBase64(allocator: std.mem.Allocator, s: []const u8) (DecodeError || std.mem.Allocator.Error || std.base64.Error)!SessionKey {
+    /// The key goes through `out`, written only on success.
+    pub fn fromBase64(allocator: std.mem.Allocator, s: []const u8, out: *SessionKey) FromBase64Error!void {
+        return burn.run(burn.key_decode_burn, FromBase64Error!void, fromBase64Body, .{ allocator, s, out });
+    }
+
+    fn fromBase64Body(allocator: std.mem.Allocator, s: []const u8, out: *SessionKey) FromBase64Error!void {
         const raw = try base64Decode(allocator, s);
-        defer allocator.free(raw);
-        return decode(raw);
+        defer {
+            std.crypto.secureZero(u8, raw);
+            allocator.free(raw);
+        }
+        try decodeBody(raw, out);
     }
 
     pub fn secureZero(self: *SessionKey) void {
@@ -144,11 +184,12 @@ pub const SessionKey = struct {
     }
 };
 
-fn decodeSignedPartUnchecked(bytes: *const [signed_part_len]u8) DecodeError!ExportedSessionKey {
-    const index = std.mem.readInt(u32, bytes[1..][0..index_len], .big);
-    const ratchet: [ratchet_mod.ratchet_len]u8 = bytes[1 + index_len ..][0..ratchet_mod.ratchet_len].*;
-    const signing_key: [pubkey_len]u8 = bytes[1 + index_len + ratchet_mod.ratchet_len ..][0..pubkey_len].*;
-    return .{ .ratchet_index = index, .ratchet = ratchet, .signing_key = signing_key };
+/// Field-by-field into `out`: the ratchet is copied once, from the wire bytes
+/// to its destination, never through a local.
+fn decodeSignedPartUnchecked(bytes: *const [signed_part_len]u8, out: *ExportedSessionKey) void {
+    out.ratchet_index = std.mem.readInt(u32, bytes[1..][0..index_len], .big);
+    out.ratchet = bytes[1 + index_len ..][0..ratchet_mod.ratchet_len].*;
+    out.signing_key = bytes[1 + index_len + ratchet_mod.ratchet_len ..][0..pubkey_len].*;
 }
 
 fn base64Encode(allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error![]u8 {
@@ -162,7 +203,10 @@ fn base64Decode(allocator: std.mem.Allocator, s: []const u8) (std.mem.Allocator.
     const codec = std.base64.standard_no_pad;
     const size = try codec.Decoder.calcSizeForSlice(s);
     const out = try allocator.alloc(u8, size);
-    errdefer allocator.free(out);
+    errdefer {
+        std.crypto.secureZero(u8, out);
+        allocator.free(out);
+    }
     try codec.Decoder.decode(out, s);
     return out;
 }
@@ -170,6 +214,7 @@ fn base64Decode(allocator: std.mem.Allocator, s: []const u8) (std.mem.Allocator.
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const compat = @import("test_shim.zig");
 
 test "ExportedSessionKey encode/decode round-trip" {
     var key = ExportedSessionKey{
@@ -177,21 +222,21 @@ test "ExportedSessionKey encode/decode round-trip" {
         .ratchet = [_]u8{0x77} ** ratchet_mod.ratchet_len,
         .signing_key = [_]u8{0x33} ** pubkey_len,
     };
-    const raw = key.encode();
+    const raw = compat.encodeExported(&key);
     try testing.expectEqual(@as(usize, export_len), raw.len);
     try testing.expectEqual(export_version, raw[0]);
 
-    const decoded = try ExportedSessionKey.decode(&raw);
+    const decoded = try compat.decodeExported(&raw);
     try testing.expectEqual(key.ratchet_index, decoded.ratchet_index);
     try testing.expectEqualSlices(u8, &key.ratchet, &decoded.ratchet);
     try testing.expectEqualSlices(u8, &key.signing_key, &decoded.signing_key);
 }
 
 test "ExportedSessionKey rejects wrong length and wrong version" {
-    try testing.expectError(error.WrongLength, ExportedSessionKey.decode(&[_]u8{0} ** (export_len - 1)));
+    try testing.expectError(error.WrongLength, compat.decodeExported(&[_]u8{0} ** (export_len - 1)));
     var bad_version = [_]u8{0} ** export_len;
     bad_version[0] = share_version; // 0x02 instead of 0x01
-    try testing.expectError(error.UnsupportedVersion, ExportedSessionKey.decode(&bad_version));
+    try testing.expectError(error.UnsupportedVersion, compat.decodeExported(&bad_version));
 }
 
 test "SessionKey signs itself and self-verifies on decode" {
@@ -210,9 +255,9 @@ test "SessionKey signs itself and self-verifies on decode" {
     const sig = try kp.sign(&signed_part, null);
 
     const key = SessionKey{ .inner = inner, .signature = sig.toBytes() };
-    const raw = key.encode();
+    const raw = compat.encodeShared(&key);
 
-    const decoded = try SessionKey.decode(&raw);
+    const decoded = try compat.decodeShared(&raw);
     try testing.expectEqual(inner.ratchet_index, decoded.inner.ratchet_index);
     try testing.expectEqualSlices(u8, &inner.ratchet, &decoded.inner.ratchet);
 }
@@ -233,10 +278,10 @@ test "SessionKey rejects a tampered signature" {
     const sig = try kp.sign(&signed_part, null);
 
     const key = SessionKey{ .inner = inner, .signature = sig.toBytes() };
-    var raw = key.encode();
+    var raw = compat.encodeShared(&key);
     raw[raw.len - 1] ^= 0xFF; // tamper one byte of the trailing signature
 
-    try testing.expectError(error.InvalidSignature, SessionKey.decode(&raw));
+    try testing.expectError(error.InvalidSignature, compat.decodeShared(&raw));
 }
 
 test "SessionKey rejects a signature that doesn't match the embedded ratchet (tampered payload)" {
@@ -255,10 +300,10 @@ test "SessionKey rejects a signature that doesn't match the embedded ratchet (ta
     const sig = try kp.sign(&signed_part, null);
 
     const key = SessionKey{ .inner = inner, .signature = sig.toBytes() };
-    var raw = key.encode();
+    var raw = compat.encodeShared(&key);
     raw[10] ^= 0xFF; // tamper a ratchet byte -- signature no longer matches
 
-    try testing.expectError(error.InvalidSignature, SessionKey.decode(&raw));
+    try testing.expectError(error.InvalidSignature, compat.decodeShared(&raw));
 }
 
 fn testIo() std.Io.Threaded {
@@ -327,11 +372,11 @@ const SessionKeyCorpus = struct {
             .ratchet = [_]u8{0x77} ** ratchet_mod.ratchet_len,
             .signing_key = kp.public_key.toBytes(),
         };
-        const exported = inner.encode();
+        const exported = compat.encodeExported(&inner);
         var signed_part: [signed_part_len]u8 = undefined;
         inner.encodeSignedPart(share_version, &signed_part);
         const sig = kp.sign(&signed_part, null) catch unreachable;
-        const shared = (SessionKey{ .inner = inner, .signature = sig.toBytes() }).encode();
+        const shared = compat.encodeShared(&SessionKey{ .inner = inner, .signature = sig.toBytes() });
 
         // ⛔ `.exact_export`/`.exact_share` are word 0 and 1; the version knob
         // `1` is `.exp` and `0` is `.share`. Both are picked to MATCH the
@@ -401,8 +446,8 @@ test "corpus: the session-key seeds drive the length sweep, and the counts are p
                 .any => smith.value(u8),
             };
         }
-        if (ExportedSessionKey.decode(buf[0..len])) |_| exports += 1 else |_| {}
-        if (SessionKey.decode(buf[0..len])) |_| shares += 1 else |_| {}
+        if (compat.decodeExported(buf[0..len])) |_| exports += 1 else |_| {}
+        if (compat.decodeShared(buf[0..len])) |_| shares += 1 else |_| {}
         // ⚠ The last three knobs, drawn after everything above. Mirrored here
         // rather than left unmeasured: `boolWeighted(3, 1)` is the one that
         // decides whether `base64Decode`'s own reject path is ever entered.
@@ -412,8 +457,8 @@ test "corpus: the session-key seeds drive the length sweep, and the counts are p
             b64[smith.index(b64.len)] = smith.value(u8);
             b64_corrupted += 1;
         }
-        _ = ExportedSessionKey.fromBase64(testing.allocator, b64) catch {};
-        _ = SessionKey.fromBase64(testing.allocator, b64) catch {};
+        _ = compat.exportedFromBase64(testing.allocator, b64) catch {};
+        _ = compat.sessionKeyFromBase64(testing.allocator, b64) catch {};
     }
     // ⛔ Before this, `mode` was always `.exact_export` and `len` always 165 —
     // `len_total` would have been 10 * 165 = 1650 with all-zero content, and
@@ -465,12 +510,12 @@ fn fuzzSessionKeyDecode(_: void, smith: *std.testing.Smith) !void {
     }
     const bytes = buf[0..len];
 
-    _ = ExportedSessionKey.decode(bytes) catch {};
-    _ = SessionKey.decode(bytes) catch {};
+    _ = compat.decodeExported(bytes) catch {};
+    _ = compat.decodeShared(bytes) catch {};
 
     const b64 = try base64Encode(allocator, bytes);
     defer allocator.free(b64);
     if (b64.len > 0 and smith.boolWeighted(3, 1)) b64[smith.index(b64.len)] = smith.value(u8);
-    _ = ExportedSessionKey.fromBase64(allocator, b64) catch {};
-    _ = SessionKey.fromBase64(allocator, b64) catch {};
+    _ = compat.exportedFromBase64(allocator, b64) catch {};
+    _ = compat.sessionKeyFromBase64(allocator, b64) catch {};
 }

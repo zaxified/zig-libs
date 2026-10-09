@@ -10,6 +10,8 @@ const std = @import("std");
 const session = @import("session.zig");
 const pickle = @import("pickle.zig");
 const session_key = @import("session_key.zig");
+const ratchet = @import("ratchet.zig");
+const cipher = @import("cipher.zig");
 
 const Out = session.OutboundSession;
 const In = session.InboundGroupSession;
@@ -65,4 +67,58 @@ pub fn inboundFromSealedPickle(bytes: []const u8, key: *const pickle.PickleKey) 
     var s: In = undefined;
     try In.fromSealedPickle(bytes, key, &s);
     return s;
+}
+
+pub fn ratchetInit(data: *const [ratchet.ratchet_len]u8, counter: u32) ratchet.Ratchet {
+    var r: ratchet.Ratchet = undefined;
+    ratchet.Ratchet.init(data, counter, &r);
+    return r;
+}
+
+pub fn ratchetGenerate(io: std.Io) ratchet.Ratchet {
+    var r: ratchet.Ratchet = undefined;
+    ratchet.Ratchet.generate(io, &r);
+    return r;
+}
+
+pub fn deriveKeys(ratchet_bytes: *const [ratchet.ratchet_len]u8) cipher.Keys {
+    var k: cipher.Keys = undefined;
+    cipher.deriveKeys(ratchet_bytes, &k);
+    return k;
+}
+
+pub fn encodeExported(key: *const session_key.ExportedSessionKey) [session_key.export_len]u8 {
+    var out: [session_key.export_len]u8 = undefined;
+    key.encode(&out);
+    return out;
+}
+
+pub fn encodeShared(key: *const session_key.SessionKey) [session_key.share_len]u8 {
+    var out: [session_key.share_len]u8 = undefined;
+    key.encode(&out);
+    return out;
+}
+
+pub fn decodeExported(bytes: []const u8) session_key.DecodeError!session_key.ExportedSessionKey {
+    var k: session_key.ExportedSessionKey = undefined;
+    try session_key.ExportedSessionKey.decode(bytes, &k);
+    return k;
+}
+
+pub fn decodeShared(bytes: []const u8) session_key.DecodeError!session_key.SessionKey {
+    var k: session_key.SessionKey = undefined;
+    try session_key.SessionKey.decode(bytes, &k);
+    return k;
+}
+
+pub fn exportedFromBase64(allocator: std.mem.Allocator, s: []const u8) session_key.FromBase64Error!session_key.ExportedSessionKey {
+    var k: session_key.ExportedSessionKey = undefined;
+    try session_key.ExportedSessionKey.fromBase64(allocator, s, &k);
+    return k;
+}
+
+pub fn sessionKeyFromBase64(allocator: std.mem.Allocator, s: []const u8) session_key.FromBase64Error!session_key.SessionKey {
+    var k: session_key.SessionKey = undefined;
+    try session_key.SessionKey.fromBase64(allocator, s, &k);
+    return k;
 }

@@ -93,15 +93,13 @@ pub const OutboundSession = struct {
     }
 
     fn initBody(io: std.Io, out: *OutboundSession) void {
-        out.* = .{
-            // Fail-closed already — see `Ratchet.generate`.
-            .ratchet = Ratchet.generate(io),
-            // The other half of the same session, and it had been left on
-            // `io.random`: this key signs every session-sharing blob and
-            // every message frame, so a weak draw here lets an attacker
-            // forge into the group even with a perfect ratchet.
-            .signing_key = generateSigningKey(io),
-        };
+        // Fail-closed already — see `Ratchet.generate`.
+        Ratchet.generate(io, &out.ratchet);
+        // The other half of the same session, and it had been left on
+        // `io.random`: this key signs every session-sharing blob and every
+        // message frame, so a weak draw here lets an attacker forge into the
+        // group even with a perfect ratchet.
+        out.signing_key = generateSigningKey(io);
     }
 
     pub fn deinit(self: *OutboundSession) void {
@@ -153,7 +151,8 @@ pub const OutboundSession = struct {
     }
 
     fn encryptBody(self: *OutboundSession, allocator: std.mem.Allocator, plaintext: []const u8) !Message {
-        var keys = cipher_mod.deriveKeys(&self.ratchet.data);
+        var keys: cipher_mod.Keys = undefined;
+        cipher_mod.deriveKeys(&self.ratchet.data, &keys);
         defer keys.deinit();
 
         const ciphertext = try cipher_mod.encryptCbc(allocator, &keys, plaintext);
@@ -262,8 +261,10 @@ pub const InboundGroupSession = struct {
 
     fn fromSessionKeyBody(key: *const SessionKey, out: *InboundGroupSession) !void {
         const pk = try Ed25519.PublicKey.fromBytes(key.inner.signing_key);
-        const r = Ratchet.init(key.inner.ratchet, key.inner.ratchet_index);
-        out.* = .{ .initial_ratchet = r, .latest_ratchet = r, .signing_key = pk, .signing_key_verified = true };
+        Ratchet.init(&key.inner.ratchet, key.inner.ratchet_index, &out.initial_ratchet);
+        out.latest_ratchet = out.initial_ratchet;
+        out.signing_key = pk;
+        out.signing_key_verified = true;
     }
 
     /// **Caution**: an `ExportedSessionKey` carries no signature (see
@@ -276,8 +277,10 @@ pub const InboundGroupSession = struct {
 
     fn fromExportedKeyBody(key: *const ExportedSessionKey, out: *InboundGroupSession) !void {
         const pk = try Ed25519.PublicKey.fromBytes(key.signing_key);
-        const r = Ratchet.init(key.ratchet, key.ratchet_index);
-        out.* = .{ .initial_ratchet = r, .latest_ratchet = r, .signing_key = pk, .signing_key_verified = false };
+        Ratchet.init(&key.ratchet, key.ratchet_index, &out.initial_ratchet);
+        out.latest_ratchet = out.initial_ratchet;
+        out.signing_key = pk;
+        out.signing_key_verified = false;
     }
 
     pub fn deinit(self: *InboundGroupSession) void {
@@ -344,7 +347,8 @@ pub const InboundGroupSession = struct {
 
         const ratchet = self.findRatchet(msg.message_index) orelse return error.MessageIndexTooOld;
 
-        var keys = cipher_mod.deriveKeys(&ratchet.data);
+        var keys: cipher_mod.Keys = undefined;
+        cipher_mod.deriveKeys(&ratchet.data, &keys);
         defer keys.deinit();
 
         const mac_bytes = try msg.macBytes(allocator);

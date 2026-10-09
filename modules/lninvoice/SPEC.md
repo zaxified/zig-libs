@@ -338,6 +338,20 @@ behavior. See both functions' own doc comments.
 
 Run: `zig build test-lninvoice` (Debug and `-Doptimize=ReleaseFast`).
 
+## Secret residue on the dead stack
+
+Review 2026-10-09 (`src/stackprobe_test.zig`, ReleaseFast only): BOLT#11 `encode` with
+`.private_key`, BOLT#12 `signMerkle`, `encodeSignedInvoiceRequest`, `encodeSignedInvoice`, each
+under a painted 256 KiB window. Needles: the private key big-/little-endian and as the scalar
+field holds it; for BOLT#11 the RFC 6979 nonce `k`, `n-k` and `k^-1`, recovered from the published
+signature; for BOLT#12 the BIP340 `t`, `rand`, `k'`, `n-k'` and `n-d`. Each nonce is checked
+against the published `R` before the scan (a wrong needle would make the zero meaningless).
+NEG 0, POS 1; 0 residue as shipped (dirty depth 17-22 KiB, all inside the `k256`/`bip340` burns —
+the signing keys reach this module by pointer since 2026-10-08).
+
+NOT covered: the caller's own key storage (`SignInput.private_key`, the `bip340.SecretKey`); the
+heap (the encoders allocate only public TLV/bech32 buffers).
+
 ## Status
 
 `any (pure codec, no I/O) · codec · reentrant` + deps: `bech32`, `k256`, `lnwire`, `bip340` —

@@ -103,6 +103,7 @@ direction is cross-checked by decoding both this module's own request and `wg`'s
 equal semantic `Device`.
 
 ## Backlog / deferred
+- **`setDeviceFrom(*const Config)` (2026-10-09)** — the copy-free twin of `setDevice`, beside it as `buildSetRequestsFrom` sits beside `buildSetRequests`: `setDevice(cfg: Config)` leaves the by-value argument (with the private key) in the caller's dead frame. Additive; then axp-core can switch. Effort: small.
 The root-gated live test's `runIp()` helper shells out to the `ip` binary — the one external-process
 use in the whole repo (zig-libs is otherwise 100% pure-Zig/no-exec). Flagged as a known item
 in this module's own backlog (pure-Zig-invariant audit): either replace with a direct rtnetlink
@@ -325,13 +326,47 @@ Burned (`src/burn.zig`, body one frame down, then volatile vector stores): `Keyp
 8 KiB; `seal`/`open` 1 KiB (per packet, ~10 ns). Secrets no longer travel by value: private keys by
 `*const`, results through `out` (see CHANGELOG, BREAKING). `chachapoly` burns its own tree.
 
+Wave 9b (2026-10-09, second test of `src/stackprobe_test.zig`; ReleaseFast): the cookie layer, the key
+text and the control plane. Needles: the cookie secret `Rm` (fixed, and the one `init`/`refresh` draw
+under a RECORDING `std.Io`), the cookie it derives, the interface private key and a pre-shared key
+(raw), the private key's base64 text; NEG 0, POS 1. Heap blocks are checked too: the control plane
+runs on a bump allocator that never reuses or resizes, and the whole arena is scanned after the last
+`deinit`. Before (hits per 3 runs, 126 in all): `initWithSecret` 3 (`Rm`), `init` 9 and `refresh` 3
+(the drawn `Rm`), `cookieFor` 12, `checkMac2`/`createReply`/`createReplyWithNonce`/`consumeReply`/
+`admit (accept)` 3 each and `admit (cookie_reply)` 6 (the cookie), `keyFromBase64` 6 + 3 (key, base64
+text), `buildSetRequests` 6 + 3 (key, PSK), `DeviceParser.feed` 3 + 9, `finish` 6; heap after free: private
+key 9, PSK 9 + 15. Dirty depth before: `initWithSecret` 0.6 KiB, `init` 1.4, `refresh` 1.2, `cookieFor` 0.6,
+`checkMac2` 0.6, `createReply` 1.5, `createReplyWithNonce` 1.0, `admit` 0.9-1.7, `consumeReply` 0.75,
+`keyFromBase64` 0.3, `buildSetRequests` 1.5, `feed` 0.75, `finish` 0.4. After: 0 stack and 0 heap hits
+in every probed call; the one exception is the by-value `buildSetRequests` (the argument copy of
+`Config`, in the CALLER's frame, 191 B below the call: reported as known, see below).
+
+Burned (`burn.cp_burn`, 4 KiB = 2.3x the deepest, bodies one frame down): `CookieChecker.init`/
+`initWithSecret`/`refresh`/`cookieFor`/`checkMac2`/`createReplyWithNonce` (`createReply` and `admit`
+only call these), `PeerCookie.consumeReply`, `keyFromBase64Into`, `buildSetRequests`/`...From`,
+`DeviceParser.feed`/`finishInto`. `Rm` goes in by `*const`, the checker and the cookie come out
+through `out` (see CHANGELOG). `PeerCookie.current`, `Handshake.computeMac2` and `createInitiation`
+with a cookie measured 0 before and are left as they were (cookie by value).
+Heap: `buildSetRequests` builds in a `WipingAllocator` (`src/wipe.zig`: `free` and every shrink zero
+what they release, a growing `remap` is refused so the caller's alloc + copy + free path wipes the old
+block); `SetRequests.deinit` zeroes `buf` before freeing; `Device.deinit` and `DeviceParser.deinit`
+zero the peer table (pre-shared keys) and the device (private key); the parser's peer table grows and
+finishes through blocks it wipes itself (`appendPeer`, `finishInto`).
+
 NOT covered, honestly:
-- the caller-built `Handshake` literal (`static_keypair`, `preshared_key`, `local_ephemeral` are
-  fields the caller fills by value) and the caller's `Keypair`/`TransportKeys`/`Session` values;
-- `CookieChecker` (`init`/`initWithSecret`/`refresh`/`cookieFor`/`createReply`: the rotating
-  cookie secret and the cookie it derives) and `PeerCookie`: not probed. The cookie is a
-  rate-limiting MAC secret that rotates every two minutes, not a session key;
-- the control plane in `root.zig` (`Config.private_key`, `buildSetRequests`, `Wireguard.setDevice`, the device parser: the interface private key is a by-value `Key` that is encoded into netlink buffers and parsed back);
+- the caller-built `Handshake` literal (`static_keypair`, `preshared_key`, `local_ephemeral`, `cookie`
+  are fields the caller fills by value) and the caller's `Keypair`/`TransportKeys`/`Session` values;
+- `PeerCookie.init`/`recordSent` hold public values only (a key derived from the peer's static PUBLIC key,
+  a mac1 that is on the wire) and were not probed; the cookie reply's XChaCha20 key and nonce are public
+  too (`HASH(LABEL_COOKIE || static_public)`, the nonce is in the reply), so they are not needles;
+- the control plane, by reasoning only: `Wireguard.setDevice` and `getDevice`/`getDeviceInto` need a netlink
+  socket. `setDevice(cfg: Config)` takes `Config` BY VALUE (the shape is fixed: axp-core builds it as a
+  literal), so the argument copy of the private key stays in the caller's dead frame; so does the one of
+  the by-value `buildSetRequests`, measured (3 hits per 3 runs, 191 B below the call). `buildSetRequestsFrom`
+  and `getDeviceInto`/`finishInto`/`keyFromBase64Into` are the copy-free forms; `getDevice`, `finish` and
+  `keyFromBase64` return the key by value and keep a copy in their own dead frame. The genetlink socket's
+  receive buffer holds the GET reply (the private key in plain text) after `getDevice` and is not wiped
+  here (it belongs to `genetlink`; backlog item there, 2026-10-09);
 - the `Handshake` struct itself keeps `chaining_key`/`hash` until `deriveTransportKeys` wipes them
   (by design).
 

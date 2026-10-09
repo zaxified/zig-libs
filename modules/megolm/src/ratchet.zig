@@ -98,8 +98,12 @@ pub const Ratchet = struct {
     /// Build a ratchet from already-known bytes at a known index — the
     /// shape every decoder in this module (`SessionKey`/`ExportedSessionKey`
     /// import) constructs from wire bytes.
-    pub fn init(data: [ratchet_len]u8, counter: u32) Ratchet {
-        return .{ .data = data, .counter = counter };
+    ///
+    /// `data` by pointer and the ratchet through `out` (written in place, so no
+    /// by-value copy of the secret sits in a temporary on the stack).
+    pub fn init(data: *const [ratchet_len]u8, counter: u32, out: *Ratchet) void {
+        out.data = data.*;
+        out.counter = counter;
     }
 
     /// A fresh outbound ratchet: 1024 bits (128 bytes) of randomness at
@@ -108,13 +112,17 @@ pub const Ratchet = struct {
     /// These 128 bytes ARE the session key — every message key the group
     /// will ever use is a hash of them, and they are shared out verbatim
     /// in the session-sharing format. `entropy.fill` rather than
-    /// `io.random` because the signature returns a `Ratchet`, not an
-    /// error union, so a degraded seed would become a whole group's
-    /// history with nothing to report it.
-    pub fn generate(io: std.Io) Ratchet {
-        var data: [ratchet_len]u8 = undefined;
-        entropy.fill(io, &data);
-        return .{ .data = data, .counter = 0 };
+    /// `io.random` because the signature has no error union, so a degraded
+    /// seed would become a whole group's history with nothing to report it.
+    ///
+    /// The draw lands directly in `out.data` (no local copy of the secret).
+    pub fn generate(io: std.Io, out: *Ratchet) void {
+        burn.run(burn.generate_burn, void, generateBody, .{ io, out });
+    }
+
+    fn generateBody(io: std.Io, out: *Ratchet) void {
+        entropy.fill(io, &out.data);
+        out.counter = 0;
     }
 
     /// Zero the ratchet's secret bytes. Does not zero `counter` (not
@@ -260,6 +268,7 @@ pub const Ratchet = struct {
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const compat = @import("test_shim.zig");
 
 test "advanceStep and advanceTo(counter+1) agree, at every boundary depth" {
     // `advanceStep` (the "single message" path) and `advanceToUnchecked`
@@ -280,8 +289,8 @@ test "advanceStep and advanceTo(counter+1) agree, at every boundary depth" {
         0x00FFFFFF, // -> 0x01000000, crosses h=0 (part 0's 2^24 boundary)
     };
     for (starting_counters) |c| {
-        var a = Ratchet.init([_]u8{0} ** ratchet_len, c);
-        var b = Ratchet.init([_]u8{0} ** ratchet_len, c);
+        var a = compat.ratchetInit(&([_]u8{0} ** ratchet_len), c);
+        var b = compat.ratchetInit(&([_]u8{0} ** ratchet_len), c);
         a.advanceStep();
         try b.advanceTo(c + 1);
         try testing.expectEqual(a.counter, b.counter);
@@ -290,7 +299,7 @@ test "advanceStep and advanceTo(counter+1) agree, at every boundary depth" {
 }
 
 test "advanceTo refuses to move backward" {
-    var r = Ratchet.init([_]u8{0xAB} ** ratchet_len, 5);
+    var r = compat.ratchetInit(&([_]u8{0xAB} ** ratchet_len), 5);
     const before = r.data;
     try testing.expectError(error.CannotRatchetBackward, r.advanceTo(3));
     // Fail-closed: the rejected call must not have mutated anything.
@@ -299,7 +308,7 @@ test "advanceTo refuses to move backward" {
 }
 
 test "advanceTo(same index) is a no-op, not an error" {
-    var r = Ratchet.init([_]u8{0x11} ** ratchet_len, 7);
+    var r = compat.ratchetInit(&([_]u8{0x11} ** ratchet_len), 7);
     const before = r.data;
     try r.advanceTo(7);
     try testing.expectEqual(@as(u32, 7), r.counter);
@@ -307,7 +316,7 @@ test "advanceTo(same index) is a no-op, not an error" {
 }
 
 test "advanceStep at a high counter does not panic (no overflow trap)" {
-    var r = Ratchet.init([_]u8{0} ** ratchet_len, 0x00FFFFFF);
+    var r = compat.ratchetInit(&([_]u8{0} ** ratchet_len), 0x00FFFFFF);
     r.advanceStep();
     try testing.expectEqual(@as(u32, 0x01000000), r.counter);
 }

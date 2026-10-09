@@ -515,3 +515,407 @@ test "STACKPROBE wireguard (wave 9): no key, DH or KDF residue on the dead stack
     }
     if (bad) return error.TestUnexpectedResult;
 }
+
+// ══ wave 9b: CookieChecker / PeerCookie, key text and the control plane ═════
+//
+// Second test of this file, same engine. Needles are variable-length here (the
+// cookie is 16 bytes, a base64 key 44). Calls with a secret drawn INTERNALLY
+// (`CookieChecker.init`/`refresh`, the cookie reply nonce) run under a
+// RECORDING `std.Io` (a copy of `Threaded`'s vtable whose `randomSecure` is
+// deterministic, as megolm's and signal's probes do); what they drew is read
+// back from the result (`extra` needles of a step). Heap blocks of the
+// control plane are checked too: the call runs on a bump allocator that never
+// reuses or resizes, so every superseded block stays visible, and after the
+// last `deinit` of a sequence the whole arena is scanned for the keys.
+//
+// NOT probed, by reasoning: `PeerCookie.init`/`recordSent` (only public values:
+// a key derived from the peer's static PUBLIC key, a mac1 that is on the wire),
+// and the XChaCha20 key, subkey and nonce of the cookie reply: the key is
+// `HASH(LABEL_COOKIE || our_static_public)` and the nonce travels in the reply,
+// so neither is secret. `Wireguard.setDevice`/`getDevice` need a netlink socket.
+
+const Needle2 = struct { name: []const u8, bytes: []const u8 };
+
+fn countBytes(needle: []const u8) usize {
+    var hits: usize = 0;
+    var i: usize = 0;
+    while (i + needle.len <= WINDOW) : (i += 1) {
+        if (snap[i] == needle[0] and std.mem.eql(u8, snap[i..][0..needle.len], needle)) {
+            hits += 1;
+            const d = WINDOW - i;
+            if (hit_min_depth == 0 or d < hit_min_depth) hit_min_depth = d;
+            if (d > hit_max_depth) hit_max_depth = d;
+        }
+    }
+    return hits;
+}
+
+fn countHeap(needle: []const u8) usize {
+    var hits: usize = 0;
+    var i: usize = 0;
+    while (i + needle.len <= heap_buf.len) : (i += 1) {
+        if (heap_buf[i] == needle[0] and std.mem.eql(u8, heap_buf[i..][0..needle.len], needle)) hits += 1;
+    }
+    return hits;
+}
+
+// recording Io
+
+var cp_threaded: std.Io.Threaded = undefined;
+var rec_vtable: std.Io.VTable = undefined;
+var rec_counter: usize = 0;
+var rec_io: std.Io = undefined;
+
+fn recSecure(_: ?*anyopaque, buf: []u8) std.Io.RandomSecureError!void {
+    var o: usize = 0;
+    var blk: usize = 0;
+    var h: [64]u8 = undefined;
+    while (o < buf.len) : (blk += 1) {
+        var s = std.crypto.hash.sha2.Sha512.init(.{});
+        s.update("wireguard-cookie-probe-draw");
+        s.update(std.mem.asBytes(&rec_counter));
+        s.update(std.mem.asBytes(&blk));
+        s.final(&h);
+        const k = @min(64, buf.len - o);
+        @memcpy(buf[o..][0..k], h[0..k]);
+        o += k;
+    }
+    rec_counter += 1;
+}
+
+// bump heap that never reuses
+
+var heap_buf: [64 * 1024]u8 align(16) = undefined;
+var heap_top: usize = 0;
+
+fn bumpAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+    const a = alignment.toByteUnits();
+    const start = std.mem.alignForward(usize, heap_top, a);
+    if (start + len > heap_buf.len) return null;
+    heap_top = start + len;
+    return heap_buf[start..].ptr;
+}
+fn bumpResize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+    return false;
+}
+fn bumpRemap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+    return null;
+}
+fn bumpFree(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {}
+const bump_vtable: std.mem.Allocator.VTable = .{ .alloc = bumpAlloc, .resize = bumpResize, .remap = bumpRemap, .free = bumpFree };
+var bump_dummy: u8 = 0;
+fn bump() std.mem.Allocator {
+    return .{ .ptr = &bump_dummy, .vtable = &bump_vtable };
+}
+
+// fixed inputs and state
+
+const addr_bytes = [_]u8{ 0xc0, 0x00, 0x02, 0x4d, 0xca, 0x6c };
+var sec_a: [32]u8 = undefined;
+var sec_c: [32]u8 = undefined;
+var cookie_a: noise.Mac = undefined;
+var rpub: [32]u8 = undefined;
+var ck_a: hs.CookieChecker = undefined;
+var ck_b: hs.CookieChecker = undefined;
+var ck_c: hs.CookieChecker = undefined;
+var msg_valid: [148]u8 = undefined; // mac1 + a mac2 under cookie_a
+var msg_plain: [148]u8 = undefined; // mac1 + all-zero mac2
+var reply_g: hs.CookieReply = undefined;
+var pc_a: hs.PeerCookie = undefined; // recordSent done, reply not consumed
+var pc_b: hs.PeerCookie = undefined; // reply consumed
+var cookie_out: noise.Mac = undefined;
+var cookie_cur: ?noise.Mac = undefined;
+var mac_out: noise.Mac = undefined;
+var bool_out: bool = undefined;
+var adm_out: hs.Admission = undefined;
+var reply_out: hs.CookieReply = undefined;
+var h_ck: hs.Handshake = undefined;
+var m_ck: hs.MessageInitiation = undefined;
+
+const cfg_priv_seed = "cfg private key";
+var cfg_priv: wg.Key = undefined;
+var cfg_psk: wg.Key = undefined;
+var cfg_pub: wg.Key = undefined;
+var cfg_b64: [wg.key_b64_len]u8 = undefined;
+var key_out: wg.Key = undefined;
+var reqs_g: wg.SetRequests = undefined;
+var dump_buf: [1024]u8 = undefined; // canned GET payload
+var dump_len: usize = 0;
+var parser_g: wg.DeviceParser = undefined;
+var dev_g: wg.Device = undefined;
+
+fn buildMsg(out: *[148]u8, idx: u32, mac2_cookie: ?noise.Mac) void {
+    @memset(out, 0);
+    std.mem.writeInt(u32, out[0..4], 1, .little);
+    std.mem.writeInt(u32, out[4..8], idx, .little);
+    const k1 = noise.mac1Key(rpub);
+    out[116..132].* = noise.keyedMac(&k1, out[0..116]);
+    if (mac2_cookie) |c| out[132..148].* = noise.keyedMac(&c, out[0..132]);
+}
+
+var cfg_g: wg.Config = undefined;
+var cfg_ips: [1]wg.AllowedIp = undefined;
+var cfg_peers: [1]wg.PeerConfig = undefined;
+fn cfgForProbe() wg.Config {
+    cfg_ips[0] = wg.AllowedIp.v4(.{ 10, 0, 0, 0 }, 24);
+    cfg_peers[0] = .{ .public_key = cfg_pub, .preshared_key = cfg_psk, .allowed_ips = &cfg_ips };
+    return .{ .ifname = "wg0", .private_key = cfg_priv, .listen_port = 51820, .peers = &cfg_peers };
+}
+
+fn cpReset() void {
+    heap_top = 0;
+    @memset(&heap_buf, 0);
+    rec_counter = 0;
+    apiMakeCheckers();
+    cfg_g = cfgForProbe();
+    ck_b = undefined;
+    buildMsg(&msg_valid, 0x5151, cookie_a);
+    buildMsg(&msg_plain, 0x5152, null);
+    const f = hs.macFields(&msg_plain) catch unreachable;
+    reply_g = ck_a.createReplyWithNonce(std.testing.io, 1000, f, &addr_bytes, @splat(0x42));
+    pc_a = hs.PeerCookie.init(rpub);
+    pc_a.recordSent(&msg_plain) catch unreachable;
+    pc_b = pc_a;
+    pc_b.consumeReply(reply_g, 1000) catch unreachable;
+    h_ck = .{ .static_keypair = k_si, .remote_static_public = k_sr.public, .preshared_key = psk, .local_ephemeral = k_ei, .local_index = 0x1111, .cookie = cookie_a };
+    // The canned GET dump: our own SET request's payload (same attribute grammar).
+    var r = wg.buildSetRequests(std.testing.allocator, 0x1c, 1, cfgForProbe(), wg.default_max_msg_len) catch unreachable;
+    defer r.deinit(std.testing.allocator);
+    const mlen = std.mem.readInt(u32, r.buf[0..4], builtin.cpu.arch.endian());
+    dump_len = mlen - 16; // past the 16-byte nlmsghdr
+    @memcpy(dump_buf[0..dump_len], r.buf[16..mlen]);
+    parser_g = wg.DeviceParser.init(bump());
+}
+
+// adapters: the ONLY block that changes with the cookie/control-plane API
+fn apiMakeCheckers() void {
+    hs.CookieChecker.initWithSecret(rpub, &sec_a, 1000, &ck_a);
+    hs.CookieChecker.initWithSecret(rpub, &sec_c, 1000, &ck_c);
+}
+fn apiInitWithSecret() void {
+    hs.CookieChecker.initWithSecret(rpub, &sec_a, 1000, &ck_b);
+}
+fn apiInit() void {
+    hs.CookieChecker.init(rpub, rec_io, 1000, &ck_b);
+}
+fn apiRefresh() void {
+    ck_c.refresh(rec_io, 2000);
+}
+fn apiCookieFor() void {
+    ck_a.cookieFor(rec_io, 1000, &addr_bytes, &cookie_out);
+}
+fn apiCurrent() void {
+    cookie_cur = pc_b.current(1001);
+}
+fn apiKeyFromB64() void {
+    wg.keyFromBase64Into(&cfg_b64, &key_out) catch unreachable;
+}
+
+noinline fn cpInitWithSecret() void {
+    apiInitWithSecret();
+}
+noinline fn cpInit() void {
+    apiInit();
+}
+noinline fn cpRefresh() void {
+    apiRefresh();
+}
+noinline fn cpCookieFor() void {
+    apiCookieFor();
+}
+noinline fn cpCheckMac2() void {
+    const f = hs.macFields(&msg_valid) catch unreachable;
+    bool_out = ck_a.checkMac2(rec_io, 1000, f, &addr_bytes);
+}
+noinline fn cpCreateReply() void {
+    const f = hs.macFields(&msg_plain) catch unreachable;
+    reply_out = ck_a.createReply(rec_io, 1000, f, &addr_bytes);
+}
+noinline fn cpCreateReplyNonce() void {
+    const f = hs.macFields(&msg_plain) catch unreachable;
+    reply_out = ck_a.createReplyWithNonce(rec_io, 1000, f, &addr_bytes, @splat(0x43));
+}
+noinline fn cpAdmitReply() void {
+    adm_out = ck_a.admit(rec_io, 1000, &msg_plain, &addr_bytes, true);
+}
+noinline fn cpAdmitAccept() void {
+    adm_out = ck_a.admit(rec_io, 1000, &msg_valid, &addr_bytes, true);
+}
+noinline fn cpConsumeReply() void {
+    pc_a.consumeReply(reply_g, 1000) catch unreachable;
+}
+noinline fn cpCurrent() void {
+    apiCurrent();
+}
+noinline fn cpCreateInitiationCookie() void {
+    m_ck = h_ck.createInitiation(rec_io, ts) catch unreachable;
+}
+noinline fn cpComputeMac2() void {
+    mac_out = h_ck.computeMac2(&addr_bytes, cookie_a);
+}
+noinline fn cpBuildSet() void {
+    reqs_g = wg.buildSetRequests(bump(), 0x1c, 1, cfg_g, wg.default_max_msg_len) catch unreachable;
+}
+noinline fn cpBuildSetFrom() void {
+    reqs_g = wg.buildSetRequestsFrom(bump(), 0x1c, 1, &cfg_g, wg.default_max_msg_len) catch unreachable;
+}
+noinline fn cpDeinitSet() void {
+    reqs_g.deinit(bump());
+}
+noinline fn cpFeed() void {
+    parser_g.feed(dump_buf[0..dump_len]) catch unreachable;
+}
+noinline fn cpFinish() void {
+    parser_g.finishInto(&dev_g) catch unreachable;
+}
+noinline fn cpDevDeinit() void {
+    dev_g.deinit(bump());
+    parser_g.deinit();
+}
+noinline fn cpKeyFromB64() void {
+    apiKeyFromB64();
+}
+
+const Extra = struct { n: usize = 0, items: [4]Needle2 = undefined };
+fn extraBSecret(e: *Extra) void {
+    e.items[0] = .{ .name = "drawn Rm (init)", .bytes = &ck_b.secret };
+    e.n = 1;
+}
+fn extraCSecret(e: *Extra) void {
+    e.items[0] = .{ .name = "drawn Rm (refresh)", .bytes = &ck_c.secret };
+    e.n = 1;
+}
+var cookie_b_dyn: noise.Mac = undefined;
+fn extraBCookie(e: *Extra) void {
+    cookie_b_dyn = noise.keyedMac(&ck_b.secret, &addr_bytes);
+    e.items[0] = .{ .name = "cookie under drawn Rm", .bytes = &cookie_b_dyn };
+    e.items[1] = .{ .name = "drawn Rm (init)", .bytes = &ck_b.secret };
+    e.n = 2;
+}
+
+const Step2 = struct { name: []const u8, call: *const fn () void, extra: ?*const fn (*Extra) void = null, heap_check: bool = false, known: bool = false };
+const steps2 = [_]Step2{
+    .{ .name = "CookieChecker.initWithSecret", .call = cpInitWithSecret },
+    .{ .name = "CookieChecker.init", .call = cpInit, .extra = extraBSecret },
+    .{ .name = "CookieChecker.refresh", .call = cpRefresh, .extra = extraCSecret },
+    .{ .name = "CookieChecker.cookieFor", .call = cpCookieFor },
+    .{ .name = "CookieChecker.checkMac2", .call = cpCheckMac2 },
+    .{ .name = "CookieChecker.createReply", .call = cpCreateReply },
+    .{ .name = "CookieChecker.createReplyWithNonce", .call = cpCreateReplyNonce },
+    .{ .name = "CookieChecker.admit (cookie_reply)", .call = cpAdmitReply },
+    .{ .name = "CookieChecker.admit (accept)", .call = cpAdmitAccept },
+    .{ .name = "PeerCookie.consumeReply", .call = cpConsumeReply },
+    .{ .name = "PeerCookie.current", .call = cpCurrent },
+    .{ .name = "createInitiation (with cookie)", .call = cpCreateInitiationCookie },
+    .{ .name = "Handshake.computeMac2", .call = cpComputeMac2 },
+    .{ .name = "keyFromBase64Into", .call = cpKeyFromB64 },
+    .{ .name = "buildSetRequests (by-value cfg: arg copy)", .call = cpBuildSet, .known = true },
+    .{ .name = "SetRequests.deinit (1)", .call = cpDeinitSet },
+    .{ .name = "buildSetRequestsFrom", .call = cpBuildSetFrom },
+    .{ .name = "SetRequests.deinit", .call = cpDeinitSet, .heap_check = true },
+    .{ .name = "DeviceParser.feed", .call = cpFeed },
+    .{ .name = "DeviceParser.finish", .call = cpFinish },
+    .{ .name = "Device.deinit + DeviceParser.deinit", .call = cpDevDeinit, .heap_check = true },
+};
+
+const verbose2 = false;
+
+test "STACKPROBE wireguard (wave 9b): no cookie, cookie-secret, key-text or interface-key residue on the dead stack or the freed heap" {
+    try skipUnlessOptimized();
+
+    cp_threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer cp_threaded.deinit();
+    const base = cp_threaded.io();
+    rec_vtable = base.vtable.*;
+    rec_vtable.randomSecure = recSecure;
+    rec_io = .{ .userdata = base.userdata, .vtable = &rec_vtable };
+
+    var p: hs.PrivateKey = hash("static I");
+    try hs.Keypair.fromPrivateKey(&p, &k_si);
+    p = hash("static R");
+    try hs.Keypair.fromPrivateKey(&p, &k_sr);
+    p = hash("eph I");
+    try hs.Keypair.fromPrivateKey(&p, &k_ei);
+    psk = hash("psk");
+    rpub = k_sr.public;
+    sec_a = hash("cookie secret A");
+    sec_c = hash("cookie secret C");
+    cookie_a = noise.keyedMac(&sec_a, &addr_bytes);
+    cfg_priv = hash(cfg_priv_seed);
+    cfg_psk = hash("cfg preshared key");
+    cfg_pub = hash("cfg peer public");
+    cfg_b64 = wg.keyToBase64(cfg_priv);
+    control = hash("control");
+
+    const fixed = [_]Needle2{
+        .{ .name = "cookie A", .bytes = &cookie_a },
+        .{ .name = "Rm A", .bytes = &sec_a },
+        .{ .name = "Rm C (old)", .bytes = &sec_c },
+        .{ .name = "cfg private key", .bytes = &cfg_priv },
+        .{ .name = "cfg preshared key", .bytes = &cfg_psk },
+        .{ .name = "cfg private key base64", .bytes = &cfg_b64 },
+        .{ .name = "control", .bytes = &control },
+    };
+    const ctl = fixed.len - 1;
+
+    var neg: [fixed.len]usize = @splat(0);
+    measure(callInnocent);
+    for (fixed, &neg) |nd, *h| h.* += countBytes(nd.bytes);
+    var pos: [fixed.len]usize = @splat(0);
+    measure(callLeaky);
+    for (fixed, &pos) |nd, *h| h.* += countBytes(nd.bytes);
+
+    var total: usize = 0;
+    var bad = pos[ctl] < 1;
+    for (neg) |x| bad = bad or x != 0;
+
+    var lines: [steps2.len][fixed.len + 4]usize = @splat(@splat(0));
+    var depth: [steps2.len]usize = @splat(0);
+    var heap_hits: [steps2.len][3]usize = @splat(@splat(0));
+    var hmin: [steps2.len]usize = @splat(0);
+    var hmax: [steps2.len]usize = @splat(0);
+    for (0..3) |_| {
+        cpReset();
+        for (steps2, 0..) |st, si| {
+            resetDepths();
+            measure(st.call);
+            depth[si] = @max(depth[si], dirtyDepth());
+            for (fixed[0 .. fixed.len - 1], 0..) |nd, ni| lines[si][ni] += countBytes(nd.bytes);
+            if (st.extra) |ex| {
+                var e: Extra = .{};
+                ex(&e);
+                for (e.items[0..e.n], 0..) |nd, ni| lines[si][fixed.len + ni] += countBytes(nd.bytes);
+            }
+            hmin[si] = hit_min_depth;
+            hmax[si] = @max(hmax[si], hit_max_depth);
+            if (st.heap_check) {
+                heap_hits[si][0] += countHeap(&cfg_priv);
+                heap_hits[si][1] += countHeap(&cfg_psk);
+                heap_hits[si][2] += countHeap(&cfg_b64);
+            }
+        }
+    }
+    for (&lines, steps2) |*l, st| for (l) |x| {
+        if (!st.known) total += x;
+    };
+    for (heap_hits) |hh| for (hh) |x| {
+        total += x;
+    };
+    bad = bad or total != 0;
+    if (verbose2 or bad) {
+        std.debug.print("\n=== STACKPROBE wireguard 9b ({t}, window {d} KiB) NEG={any} POS(control)={d} total residue={d} ===\n", .{ builtin.mode, WINDOW / 1024, neg, pos[ctl], total });
+        for (steps2, 0..) |st, si| {
+            std.debug.print("  {s:<38} dirty={d} B, hits at {d}..{d} B\n", .{ st.name, depth[si], hmin[si], hmax[si] });
+            for (fixed[0 .. fixed.len - 1], 0..) |nd, ni| {
+                if (lines[si][ni] != 0) std.debug.print("    RESIDUE {s:<30} {d} (3 runs)\n", .{ nd.name, lines[si][ni] });
+            }
+            for (0..4) |ni| {
+                if (lines[si][fixed.len + ni] != 0) std.debug.print("    RESIDUE extra#{d} {d} (3 runs)\n", .{ ni, lines[si][fixed.len + ni] });
+            }
+            if (st.heap_check) {
+                std.debug.print("    HEAP after free: private key {d}, psk {d}, base64 {d} (3 runs)\n", .{ heap_hits[si][0], heap_hits[si][1], heap_hits[si][2] });
+            }
+        }
+    }
+    if (bad) return error.TestUnexpectedResult;
+}

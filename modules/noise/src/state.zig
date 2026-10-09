@@ -51,18 +51,56 @@ fn hashName(comptime T: type) []const u8 {
     @compileError("noise: no spec §8 protocol name for hash type " ++ @typeName(T) ++ " (declare `pub const noise_name`)");
 }
 
-const burn = @import("burn.zig");
+// ── stack depth per primitive (sizes the dead-stack burns per suite) ─────
+//
+// The deepest stack a primitive's own calls dirty (ReleaseFast): the DH's
+// `generateDeterministic` / `scalarmult`, the AEAD's `encrypt` / `decrypt`,
+// `Hmac(Hash).create`. Measured 2026-10-09 (ReleaseFast, x86_64): X25519 1.8 KiB,
+// std ChaChaPoly 0.5 KiB, AES-256-GCM 1.4 KiB, HMAC-SHA256 0.8 KiB,
+// HMAC-SHA512 1.5 KiB, HMAC-BLAKE2s 0.6 KiB, HMAC-BLAKE2b 1.0 KiB.
+// A primitive outside `std` (and `chachapoly`) declares
+// its own, `pub const noise_stack_bytes = 12 * 1024;`; without it the burn
+// assumes `unknown_*_stack`. The `std` values are upper bounds checked by
+// `stackprobe_test.zig` (red when a std release outgrows them).
 
-/// Review 2026-10-08 (found through `bolt8`'s transport probe). `Cipher`'s
-/// encrypt/decrypt take the key BY VALUE (std's AEAD shape), so every
-/// `CipherState` call copies `k` into its own frame to pass it. The three keyed
-/// calls therefore run one frame down and zero `cipher_burn` bytes at that
-/// depth: enough for this module's own frame, NOT for an AEAD that leaves copies
-/// deeper — `chachapoly` burns its own; std's AEADs (e.g. a suite on `aes_gcm`)
-/// do not.
-fn burnStack() void {
-    burn.stack(burn.cipher_burn);
-}
+/// Assumed for a DH that declares no `noise_stack_bytes`: over three times
+/// std's P-384 (`mul` dirties 11.3 KiB, ReleaseFast 2026-10-09). Burned once
+/// per handshake message (~1.6 us at this size).
+const unknown_dh_stack = 40 * 1024;
+/// Assumed for an AEAD that declares none: twice std's deepest AEAD. Runs per
+/// transport message, so it is kept small.
+const unknown_cipher_stack = 4 * 1024;
+/// Assumed for a hash that declares none: twice std's deepest HMAC.
+const unknown_hash_stack = 4 * 1024;
+
+pub const stack_bytes = struct {
+    pub fn dh(comptime T: type) usize {
+        if (@hasDecl(T, "noise_stack_bytes")) return T.noise_stack_bytes;
+        if (T == std.crypto.dh.X25519) return 2048;
+        return unknown_dh_stack;
+    }
+
+    /// 0 for `chachapoly`: it burns its own tree, so the stack it dirties is
+    /// already zero when it returns.
+    pub fn cipher(comptime T: type) usize {
+        if (@hasDecl(T, "noise_stack_bytes")) return T.noise_stack_bytes;
+        if (T == chachapoly.ChaCha20Poly1305) return 0;
+        if (T == std.crypto.aead.chacha_poly.ChaCha20Poly1305) return 1024;
+        if (T == std.crypto.aead.aes_gcm.Aes256Gcm) return 2048;
+        return unknown_cipher_stack;
+    }
+
+    pub fn hash(comptime T: type) usize {
+        if (@hasDecl(T, "noise_stack_bytes")) return T.noise_stack_bytes;
+        if (T == std.crypto.hash.sha2.Sha256) return 1024;
+        if (T == std.crypto.hash.sha2.Sha512) return 2048;
+        if (T == std.crypto.hash.blake2.Blake2s256) return 1024;
+        if (T == std.crypto.hash.blake2.Blake2b512) return 2048;
+        return unknown_hash_stack;
+    }
+};
+
+const burn = @import("burn.zig");
 
 /// Bind a Noise cipher suite: `DH` (spec §4.1, e.g. `std.crypto.dh.X25519`),
 /// `Cipher` (spec §4.2 AEAD, e.g.
@@ -79,7 +117,9 @@ fn burnStack() void {
 /// and `scalarmult(secret, public) ![shared]u8`; an AEAD the std AEAD shape
 /// with a 32-byte key, 12-byte nonce and 16-byte tag (its nonce counter is
 /// big-endian iff its name is `AESGCM`, spec §12); a hash the std hash
-/// shape with a 32- or 64-byte digest.
+/// shape with a 32- or 64-byte digest. Such a type should also declare
+/// `pub const noise_stack_bytes` (the stack its calls dirty, ReleaseFast) so
+/// the dead-stack burns fit it; without it they assume `unknown_*_stack`.
 pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type {
     return struct {
         /// The DH function type this suite was bound with (spec §4.1).
@@ -122,6 +162,21 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
         }
 
         const Hmac = std.crypto.auth.hmac.Hmac(Hash);
+
+        /// This suite's dead-stack burn sizes (`burn.Sizes`), from the stack
+        /// its three primitives dirty (`stack_bytes`).
+        pub const burns = burn.Sizes.of(stack_bytes.dh(DH), stack_bytes.cipher(Cipher), stack_bytes.hash(Hash));
+
+        /// Review 2026-10-08 (found through `bolt8`'s transport probe).
+        /// `Cipher`'s encrypt/decrypt take the key BY VALUE (std's AEAD
+        /// shape), so every `CipherState` call copies `k` into its own frame
+        /// to pass it. The three keyed calls therefore run one frame down and
+        /// zero `burns.cipher` bytes at that depth: this module's frame plus
+        /// what the AEAD dirties (nothing for `chachapoly`, which burns its own
+        /// tree; std's AEADs do not).
+        fn burnStack() void {
+            burn.stack(burns.cipher);
+        }
         const max_nonce: u64 = std.math.maxInt(u64);
 
         /// Spec §5.1 nonce encoding into the AEAD's 96-bit nonce: 4 zero
@@ -328,7 +383,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             /// new `ck` plus `temp_k`; re-initializes the embedded
             /// `CipherState` with `temp_k` truncated to 32 bytes.
             pub fn mixKey(self: *SymmetricState, input_key_material: []const u8) void {
-                burn.run(burn.hkdf_burn, void, mixKeyBody, .{ self, input_key_material });
+                burn.run(burns.hkdf, void, mixKeyBody, .{ self, input_key_material });
             }
 
             fn mixKeyBody(self: *SymmetricState, input_key_material: []const u8) void {
@@ -353,7 +408,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             /// the `CipherState` key from the third output (truncated to
             /// 32 bytes).
             pub fn mixKeyAndHash(self: *SymmetricState, input_key_material: []const u8) void {
-                burn.run(burn.hkdf_burn, void, mixKeyAndHashBody, .{ self, input_key_material });
+                burn.run(burns.hkdf, void, mixKeyAndHashBody, .{ self, input_key_material });
             }
 
             fn mixKeyAndHashBody(self: *SymmetricState, input_key_material: []const u8) void {
@@ -409,7 +464,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             /// written to `out` (not returned: a returned pair of transport
             /// keys is a copy in the caller's dead frame).
             pub fn split(self: *SymmetricState, out: *[2]CipherState) void {
-                burn.run(burn.hkdf_burn, void, splitBody, .{ self, out });
+                burn.run(burns.hkdf, void, splitBody, .{ self, out });
             }
 
             fn splitBody(self: *SymmetricState, pair: *[2]CipherState) void {
@@ -620,7 +675,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 prologue: []const u8,
                 keys: *const Keys,
             ) void {
-                burn.run(burn.init_burn, void, initializeBody, .{ self, pattern, initiator, prologue, keys });
+                burn.run(burns.init, void, initializeBody, .{ self, pattern, initiator, prologue, keys });
             }
 
             fn initializeBody(
@@ -733,7 +788,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 out: []u8,
                 transport: *[2]CipherState,
             ) WriteError!Step {
-                return burn.run(burn.hs_burn, WriteError!Step, writeMessageBody, .{ self, random, payload, out, transport });
+                return burn.run(burns.hs, WriteError!Step, writeMessageBody, .{ self, random, payload, out, transport });
             }
 
             fn writeMessageBody(
@@ -810,7 +865,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 out: []u8,
                 transport: *[2]CipherState,
             ) ReadError!Step {
-                return burn.run(burn.hs_burn, ReadError!Step, readMessageBody, .{ self, message, out, transport });
+                return burn.run(burns.hs, ReadError!Step, readMessageBody, .{ self, message, out, transport });
             }
 
             fn readMessageBody(

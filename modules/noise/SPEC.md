@@ -151,17 +151,30 @@ on the completing calls: i2r 12 / r2i 9) and in `SymmetricState.mixKey`/`mixKeyA
 2.6 KiB, the HKDF steps 1.3 KiB. After: 0 in every probed call.
 
 What is burned (`src/burn.zig`, one frame down, then volatile vector stores): the three keyed
-`CipherState` calls (1 KiB), `SymmetricState.mixKey`/`mixKeyAndHash`/`split` (4 KiB),
-`HandshakeState.init`/`initialize` (4 KiB), `writeMessage`/`readMessage` (8 KiB; this covers the
-default suite's X25519 + SHA-256 tree 2.5x). Secret inputs and outputs no longer travel by value:
+`CipherState` calls, `SymmetricState.mixKey`/`mixKeyAndHash`/`split`, `HandshakeState.init`/
+`initialize`, `writeMessage`/`readMessage`. Secret inputs and outputs no longer travel by value:
 `initializeKey` takes `*const [32]u8`; `Keys.s`/`Keys.e` are `?*const KeyPair` and `init`/
 `initialize` take `*const Keys` and initialize the state in place; `split` and `writeMessage`/
 `readMessage` write the transport pair to an out-parameter (`Step` is `{ len, complete }`).
 
+Burn sizes are per suite (2026-10-09): `Suite.burns` = `burn.Sizes.of(dh, cipher, hash)`, from the
+stack each primitive dirties (`state.stack_bytes`; measured ReleaseFast x86_64: X25519 1.8 KiB,
+std ChaChaPoly 0.5, AES-256-GCM 1.4, HMAC-SHA256 0.8, -SHA512 1.5, -BLAKE2s 0.6, -BLAKE2b 1.0 KiB;
+`chachapoly` counts 0, it burns its own tree), doubled, plus this module's frames, with the
+default suite's sizes as floors (cipher 1 KiB, HKDF 4 KiB, init 4 KiB, handshake 8 KiB). A
+primitive outside std declares `pub const noise_stack_bytes`; without it the fallback is DH
+40 KiB, AEAD/hash 4 KiB. The probe checks (a) each std primitive within its claimed size (red
+when a std release grows one) and (b) each burned entry point's dirty depth within its burn +
+512 B, on all twelve std suites (X25519 × 3 AEADs × 4 hashes) and a P-384 adapter (11.3 KiB;
+declared 16 KiB → handshake burn 33 KiB; undeclared → 81 KiB). (b) compares depths, not
+needles: needles run on the default suite only.
+
 NOT covered, honestly:
-- a suite whose DH or AEAD leaves more than 8 KiB on the stack (a P-384 DH dirties ~12 KiB; std's
-  `aes_gcm` leaves its own round keys and the key copy): the burn is sized for the default suite
-  (X25519, `chachapoly`, SHA-256/512, BLAKE2). `chachapoly` burns its own tree; std's AEADs do not.
+- a non-std primitive that declares a `noise_stack_bytes` smaller than what it dirties, or dirties
+  more than the fallback without declaring: the size is the declarer's claim;
+- (b) cannot see a body overrunning its burn by less than 512 B (the entry point's own frame
+  between the calibrated offset and the body); the doubling leaves at least 2x headroom on
+  every measured suite;
 - the caller's own copies: the `Keys` literal, the `KeyPair` it points to, and the transport
   `CipherState`s the caller receives are the caller's to wipe.
 - `getHandshakeHash`, `mixHash`, `encryptAndHash`/`decryptAndHash` (the keyed work happens in the

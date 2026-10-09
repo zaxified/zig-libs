@@ -50,3 +50,9 @@ pub const hs_burn = 8 * 1024;
 /// residue sat 0.1-0.3 KiB below the top. `chachapoly` burns its own tree.
 /// Per packet, so kept small: ~10 ns.
 pub const seal_burn = 1024;
+
+/// The cookie layer (`CookieChecker`/`PeerCookie`) and the control-plane
+/// private-key paths (`keyFromBase64Into`, `buildSetRequests`,
+/// `DeviceParser`): 1.7 KiB deepest measured (`admit`), the HMAC/BLAKE2s keyed
+/// state and the netlink builder frames.
+pub const cp_burn = 4 * 1024;

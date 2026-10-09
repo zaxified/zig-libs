@@ -365,6 +365,14 @@ var msg_sink: megolm.Message = undefined;
 var dec_sink: megolm.session.DecryptedMessage = undefined;
 var bool_sink: bool = undefined;
 var rt_sink: megolm.Ratchet = undefined;
+var keys_sink: megolm.cipher.Keys = undefined;
+var share_raw: [megolm.session_key.share_len]u8 = undefined;
+var export_raw: [megolm.session_key.export_len]u8 = undefined;
+var share_sink: [megolm.session_key.share_len]u8 = undefined;
+var export_sink: [megolm.session_key.export_len]u8 = undefined;
+var skey_b64: []u8 = undefined;
+var xkey_b64: []u8 = undefined;
+var b64_sink: []u8 = undefined;
 
 // ADAPTER: the only block that depends on the call shapes of the module API.
 noinline fn callInit() void {
@@ -422,6 +430,40 @@ noinline fn callFromSealedOut() void {
 noinline fn callFromSealedIn() void {
     InboundGroupSession.fromSealedPickle(&sealed_in, &pickle_key, &i_sink) catch unreachable;
 }
+noinline fn callDeriveKeys() void {
+    megolm.cipher.deriveKeys(&out_pristine.ratchet.data, &keys_sink);
+}
+noinline fn callRatchetInit() void {
+    megolm.Ratchet.init(&in_pristine.initial_ratchet.data, 7, &rt_sink);
+}
+noinline fn callRatchetGenerate() void {
+    rewind();
+    megolm.Ratchet.generate(rec_io, &rt_sink);
+}
+noinline fn callEncodeShare() void {
+    skey.encode(&share_sink);
+}
+noinline fn callEncodeExport() void {
+    xkey.encode(&export_sink);
+}
+noinline fn callToBase64Share() void {
+    b64_sink = skey.toBase64(alloc()) catch unreachable;
+}
+noinline fn callToBase64Export() void {
+    b64_sink = xkey.toBase64(alloc()) catch unreachable;
+}
+noinline fn callDecodeShare() void {
+    megolm.SessionKey.decode(&share_raw, &skey_sink) catch unreachable;
+}
+noinline fn callDecodeExport() void {
+    megolm.ExportedSessionKey.decode(&export_raw, &xkey_sink) catch unreachable;
+}
+noinline fn callFromBase64Share() void {
+    megolm.SessionKey.fromBase64(alloc(), skey_b64, &skey_sink) catch unreachable;
+}
+noinline fn callFromBase64Export() void {
+    megolm.ExportedSessionKey.fromBase64(alloc(), xkey_b64, &xkey_sink) catch unreachable;
+}
 // END ADAPTER
 
 fn setUp(ci: u8) !void {
@@ -434,6 +476,10 @@ fn setUp(ci: u8) !void {
     in_pristine = try compat.fromSessionKey(skey);
     in_s = in_pristine;
     xkey = compat.exportAt(&in_s, 3).?;
+    share_raw = compat.encodeShared(&skey);
+    export_raw = compat.encodeExported(&xkey);
+    skey_b64 = skey.toBase64(fbaKeep()) catch unreachable;
+    xkey_b64 = xkey.toBase64(fbaKeep()) catch unreachable;
     // The wire message under test is at `target_index`: encrypt up to it.
     var enc = out_pristine;
     var i: u32 = 0;
@@ -466,7 +512,7 @@ fn addRatchet(n: *Needles, name: []const u8, r: *const megolm.Ratchet) void {
 }
 
 fn addKeys(n: *Needles, r: *const megolm.Ratchet) void {
-    const k = megolm.cipher.deriveKeys(&r.data);
+    const k = compat.deriveKeys(&r.data);
     n.addBytes("aes key", &k.aes_key);
     n.addBytes("hmac key", &k.hmac_key);
     n.addBytes("iv", &k.iv);
@@ -552,6 +598,41 @@ test "STACKPROBE: no ratchet, key or signing-key residue on the dead stack (mego
         bad += try runProbe("InboundGroupSession.exportAt", callExportAt, &n);
         bad += try runProbe("InboundGroupSession.forgetBefore", callForgetBefore, &n);
         bad += try runProbe("Ratchet.advanceTo", callAdvanceTo, &n);
+
+        // New in wave 10: deriveKeys, Ratchet.init / generate, the key codecs.
+        n = .{};
+        addRatchet(&n, "R", r0);
+        addKeys(&n, r0);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("cipher.deriveKeys", callDeriveKeys, &n);
+        n = .{};
+        addRatchet(&n, "R", &in_pristine.initial_ratchet);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("Ratchet.init", callRatchetInit, &n);
+        n = .{};
+        n.addBytes("R0", &r0.data);
+        for (0..4) |p| n.addBytes("R0", r0.data[p * 32 ..][0..32]);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("Ratchet.generate", callRatchetGenerate, &n);
+        n = .{};
+        addRatchet(&n, "R", r0);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("SessionKey.encode", callEncodeShare, &n);
+        bad += try runProbe("SessionKey.toBase64", callToBase64Share, &n);
+        bad += try runProbe("SessionKey.decode", callDecodeShare, &n);
+        bad += try runProbe("SessionKey.fromBase64", callFromBase64Share, &n);
+        n = .{};
+        addRatchet(&n, "R", &rx);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("ExportedSessionKey.encode", callEncodeExport, &n);
+        bad += try runProbe("ExportedSessionKey.toBase64", callToBase64Export, &n);
+        bad += try runProbe("ExportedSessionKey.decode", callDecodeExport, &n);
+        bad += try runProbe("ExportedSessionKey.fromBase64", callFromBase64Export, &n);
 
         // pickles.
         n = .{};

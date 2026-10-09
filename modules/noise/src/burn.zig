@@ -33,21 +33,44 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
     return r;
 }
 
-/// `CipherState`'s three keyed calls: this module's own frame plus the
-/// argument copies the AEAD call makes (the AEAD burns its own tree where it
-/// is `chachapoly`).
-pub const cipher_burn = 1024;
+/// The burn sizes for one suite, from the stack its primitives dirty
+/// (`state.stack_bytes`) plus this module's own frames, doubled for headroom
+/// and rounded up to 1 KiB. The floors are the 2026-10-09 sizes of the default
+/// suite (X25519, ChaChaPoly, SHA-256), so that suite's burns are unchanged.
+/// `stackprobe_test.zig` checks, for every std suite and a P-384 adapter, that
+/// each burn reaches under its body.
+pub const Sizes = struct {
+    /// `CipherState`'s three keyed calls: this module's frame plus the AEAD.
+    cipher: usize,
+    /// The HKDF behind `mixKey`/`mixKeyAndHash`/`split`: HMAC state, the
+    /// `temp_key` and the outputs (1.3 KiB measured on SHA-256).
+    hkdf: usize,
+    /// `HandshakeState.init`/`initialize`: the key pairs copied into the
+    /// frame, the `MixHash` of the prologue and the pre-message keys.
+    init: usize,
+    /// `HandshakeState.writeMessage`/`readMessage`: key generation, the DH,
+    /// and the already burned HKDF / cipher calls nested under it (3.2 KiB
+    /// measured on the default suite).
+    hs: usize,
 
-/// The HKDF behind `mixKey`/`mixKeyAndHash`/`split`: HMAC state, the `temp_key`
-/// and the outputs. 1.3 KiB measured on SHA-256 (ReleaseFast, 2026-10-09);
-/// SHA-512/BLAKE2b states are about twice as large.
-pub const hkdf_burn = 4 * 1024;
+    pub fn of(dh: usize, cipher: usize, hash: usize) Sizes {
+        const c = sized(1024, own_frame + cipher);
+        const k = sized(4 * 1024, own_frame + hash);
+        return .{
+            .cipher = c,
+            .hkdf = k,
+            .init = sized(4 * 1024, own_frame + hash),
+            // The nested HKDF and cipher burns are exact sizes, not estimates:
+            // they only need this module's frames on top, not doubling.
+            .hs = @max(sized(8 * 1024, own_frame + dh), 2 * own_frame + @max(k, c)),
+        };
+    }
 
-/// `HandshakeState.init`/`initialize`: the key pairs copied into the frame.
-pub const init_burn = 4 * 1024;
+    /// This module's frames above a primitive call.
+    const own_frame = 512;
 
-/// `HandshakeState.writeMessage`/`readMessage`: the DH (std's X25519, scalar
-/// clamp + ladder), key generation, the HKDF and the `Split()`. 3.2 KiB
-/// measured on the default suite (ReleaseFast, 2026-10-09). A pluggable DH with
-/// a deeper stack (a P-384 DH dirties ~12 KiB) needs a larger burn on top.
-pub const hs_burn = 8 * 1024;
+    fn sized(floor: usize, need: usize) usize {
+        const kib = 1024;
+        return @max(floor, (2 * need + kib - 1) / kib * kib);
+    }
+};

@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING + FIX (secrets on the dead stack, second wave):** the remaining by-value secrets (before: `deriveKeys` left AES key, HMAC key, IV and round-key
+  residue, `Ratchet.generate` R0 and `SessionKey.decode` / `fromBase64` R left residue, 0
+  after): `cipher.deriveKeys(&ratchet, &out)` (was `deriveKeys(&ratchet) Keys`),
+  `Ratchet.init(&data, counter, &out)` (was `init(data, counter) Ratchet`),
+  `Ratchet.generate(io, &out)` (was `generate(io) Ratchet`),
+  `SessionKey.encode(&out_229)` / `ExportedSessionKey.encode(&out_165)` (were `[N]u8`
+  returns), `SessionKey.decode(bytes, &out)` / `ExportedSessionKey.decode(bytes, &out)` and
+  `fromBase64(allocator, s, &out)` on both (were struct returns; error set unchanged, new
+  `session_key.FromBase64Error`). `toBase64` keeps its signature but wipes its raw buffer;
+  `fromBase64` wipes its heap scratch. `decodeSignedPartUnchecked` is private and now fills
+  `out`. Migrated: tests (by-value adapters in `src/test_shim.zig`), example, README.
+
 - **2026-10-09** — **Breaking:** dead-stack burn for the session entry points
   (`stackprobe_test.zig`: 11 of 16 probed calls left ratchet / signing-key / AES key /
   round-key residue before; 0 after). Secret results go through `out` instead of a return

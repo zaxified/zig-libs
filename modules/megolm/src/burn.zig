@@ -50,3 +50,20 @@ pub const session_burn = 12 * 1024;
 /// `InboundGroupSession.decrypt` (7.3 KiB) and the sealed pickle openers
 /// (5.2 KiB): key derivation, AES key schedule, ChaCha20-Poly1305.
 pub const decrypt_burn = 16 * 1024;
+
+/// `cipher.deriveKeys`: HKDF extract + expand (PRK, 80-byte OKM), 1.6 KiB
+/// measured (ReleaseFast 2026-10-09).
+pub const derive_burn = 4 * 1024;
+
+/// `Ratchet.generate`: the `entropy.fill` draw into `out.data`, 1.2 KiB
+/// measured (left R0 behind at 0.4 KiB before the burn).
+pub const generate_burn = 3 * 1024;
+
+/// `SessionKey.decode` / `fromBase64`: 7.0 / 7.1 KiB measured. The depth is the
+/// Ed25519 verify, whose SHA-512 message schedule holds the signed part and
+/// with it the ratchet (left R at 3.0..3.1 KiB before the burn).
+pub const key_decode_burn = 16 * 1024;
+
+/// `ExportedSessionKey.decode` / `fromBase64`: 63 / 219 B measured, no residue
+/// (the ratchet is copied once, wire bytes to `out`); a token burn only.
+pub const export_decode_burn = 1024;

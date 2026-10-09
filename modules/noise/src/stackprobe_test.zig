@@ -455,3 +455,292 @@ test "STACKPROBE noise (wave 9): no key, DH or HKDF residue on the dead stack af
     }
     if (bad) return error.TestUnexpectedResult;
 }
+
+// ── burn sizes per suite (2026-10-09) ────────────────────────────────────────
+//
+// The needle probe above runs the default suite only. The burns are sized per
+// suite (`burn.Sizes`, from `state.stack_bytes`), so this part checks the
+// sizing itself, on every std suite plus a P-384 adapter: (1) each std
+// primitive dirties no more than `stack_bytes` claims; (2) each burned entry
+// point's dirty depth stays within its burn. (2) cannot tell zeros the burn
+// wrote from bytes the body wrote, so it compares depths: the burn starts
+// `burn_offset` below the region top (calibrated with a known burn under the
+// same step/shim frames) and the body may not reach more than `burn_slack`
+// below its end — the entry point's own frame sits between the two.
+
+const state = @import("state.zig");
+const burn_mod = @import("burn.zig");
+const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+const StdChaCha = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+const sha2 = std.crypto.hash.sha2;
+const blake2 = std.crypto.hash.blake2;
+
+const burn_slack = 512;
+
+/// A P-384 DH in the Noise DH shape (test-only, not a spec name): the deeper
+/// pluggable DH the fixed 8 KiB handshake burn could not cover.
+fn P384Dh(comptime declared: usize) type {
+    return struct {
+        const P384 = std.crypto.ecc.P384;
+        pub const noise_name = "P384";
+        pub const noise_stack_bytes = declared;
+        pub const public_length = 49;
+        pub const seed_length = 48;
+        pub const KeyPair = struct {
+            public_key: [49]u8,
+            secret_key: [48]u8,
+            pub fn generateDeterministic(seed: [48]u8) !KeyPair {
+                const p = try P384.basePoint.mul(seed, .big);
+                return .{ .public_key = p.toCompressedSec1(), .secret_key = seed };
+            }
+        };
+        pub fn scalarmult(secret: [48]u8, public: [49]u8) ![49]u8 {
+            const p = try P384.fromSec1(&public);
+            return (try p.mul(secret, .big)).toCompressedSec1();
+        }
+    };
+}
+
+/// The same DH with no `noise_stack_bytes`: the burn falls back to
+/// `unknown_dh_stack`.
+const P384Undeclared = struct {
+    const D = P384Dh(0);
+    pub const noise_name = D.noise_name;
+    pub const public_length = D.public_length;
+    pub const seed_length = D.seed_length;
+    pub const KeyPair = D.KeyPair;
+    pub const scalarmult = D.scalarmult;
+};
+
+/// AES-256-GCM under a declared name and no `noise_stack_bytes`: the
+/// fallback cipher size.
+const AesUndeclared = struct {
+    pub const noise_name = "AESGCM";
+    pub const key_length = Aes256Gcm.key_length;
+    pub const nonce_length = Aes256Gcm.nonce_length;
+    pub const tag_length = Aes256Gcm.tag_length;
+    pub const encrypt = Aes256Gcm.encrypt;
+    pub const decrypt = Aes256Gcm.decrypt;
+};
+
+var cal_offset: usize = 0;
+var chachapoly_depth: usize = 0;
+noinline fn calBody() void {
+    var x: [64]u8 = undefined;
+    std.mem.doNotOptimizeAway(&x);
+}
+noinline fn calEntry() void {
+    burn_mod.run(4096, void, calBody, .{});
+}
+noinline fn stepCal() void {
+    calEntry();
+}
+
+/// The depth the burns start at under `measure` + a step function.
+fn calibrate() void {
+    measure(stepCal);
+    cal_offset = dirtyDepth() - 4096;
+}
+
+fn Coverage(comptime S: type) type {
+    return struct {
+        const HSs = S.HandshakeState;
+        const CSs = S.CipherState;
+        const SSs = S.SymmetricState;
+        const B = S.burns;
+
+        var si: S.KeyPair = undefined;
+        var sr: S.KeyPair = undefined;
+        var psks: [1][32]u8 = undefined;
+        var hi: HSs = undefined;
+        var hr: HSs = undefined;
+        var ri: std.Random.DefaultPrng = undefined;
+        var rr: std.Random.DefaultPrng = undefined;
+        var w: [512]u8 = undefined;
+        var wl: usize = 0;
+        var p: [128]u8 = undefined;
+        var ti: [2]CSs = undefined;
+        var tr: [2]CSs = undefined;
+        var c: [plaintext.len + 16]u8 = undefined;
+        var b: [plaintext.len]u8 = undefined;
+        var ssx: SSs = undefined;
+        var tx: [2]CSs = undefined;
+
+        fn seed(comptime label: []const u8) [S.Dh.seed_length]u8 {
+            var out: [S.Dh.seed_length]u8 = undefined;
+            std.crypto.hash.sha3.Shake256.hash("noise-probe/" ++ label, &out, .{});
+            return out;
+        }
+
+        noinline fn initI() void {
+            hi.init(pattern, true, "", &.{ .s = &si, .psks = &psks }) catch unreachable;
+        }
+        noinline fn initR() void {
+            hr.init(pattern, false, "", &.{ .s = &sr, .psks = &psks }) catch unreachable;
+        }
+        noinline fn writeI() void {
+            wl = (hi.writeMessage(ri.random(), "", &w, &ti) catch unreachable).len;
+        }
+        noinline fn readR() void {
+            _ = hr.readMessage(w[0..wl], &p, &tr) catch unreachable;
+        }
+        noinline fn writeR() void {
+            wl = (hr.writeMessage(rr.random(), "", &w, &tr) catch unreachable).len;
+        }
+        noinline fn readI() void {
+            _ = hi.readMessage(w[0..wl], &p, &ti) catch unreachable;
+        }
+        noinline fn encrypt() void {
+            ti[0].encryptWithAd("", plaintext, &c) catch unreachable;
+        }
+        noinline fn decrypt() void {
+            tr[0].decryptWithAd("", &c, &b) catch unreachable;
+        }
+        noinline fn rekey() void {
+            ti[1].rekey();
+        }
+        noinline fn mixKey() void {
+            ssx.mixKey("probe ikm");
+        }
+        noinline fn mixKeyAndHash() void {
+            ssx.mixKeyAndHash("probe ikm");
+        }
+        noinline fn split() void {
+            ssx.split(&tx);
+        }
+
+        const Step = struct { name: []const u8, call: *const fn () void, burn: usize };
+        const cov_steps = [_]Step{
+            .{ .name = "init (I)", .call = initI, .burn = B.init },
+            .{ .name = "init (R)", .call = initR, .burn = B.init },
+            .{ .name = "writeMessage 1 (I)", .call = writeI, .burn = B.hs },
+            .{ .name = "readMessage 1 (R)", .call = readR, .burn = B.hs },
+            .{ .name = "writeMessage 2 (R)", .call = writeR, .burn = B.hs },
+            .{ .name = "readMessage 2 (I)", .call = readI, .burn = B.hs },
+            .{ .name = "writeMessage 3 (I)", .call = writeI, .burn = B.hs },
+            .{ .name = "readMessage 3 (R)", .call = readR, .burn = B.hs },
+            .{ .name = "encryptWithAd", .call = encrypt, .burn = B.cipher },
+            .{ .name = "decryptWithAd", .call = decrypt, .burn = B.cipher },
+            .{ .name = "rekey", .call = rekey, .burn = B.cipher },
+            .{ .name = "mixKey", .call = mixKey, .burn = B.hkdf },
+            .{ .name = "mixKeyAndHash", .call = mixKeyAndHash, .burn = B.hkdf },
+            .{ .name = "split", .call = split, .burn = B.hkdf },
+        };
+
+        /// Returns the number of steps whose body outgrew its burn.
+        fn check() !usize {
+            si = try S.KeyPair.generateDeterministic(seed("static I"));
+            sr = try S.KeyPair.generateDeterministic(seed("static R"));
+            psks[0] = hash("psk");
+            ri = .init(0x7015_0011);
+            rr = .init(0x7015_0012);
+            ssx = .{};
+            var over: usize = 0;
+            const name = "Noise_XXpsk3" ++ S.name_suffix;
+            if (verbose) std.debug.print("  {s}: burns cipher {d} hkdf {d} init {d} hs {d}\n", .{ name, B.cipher, B.hkdf, B.init, B.hs });
+            for (cov_steps) |st| {
+                measure(st.call);
+                const d = dirtyDepth();
+                // `chachapoly` zeroes its own tree (its own probe checks
+                // that), so under a cipher step the deepest bytes are its
+                // burn, not this module's.
+                const own = if (st.burn == B.cipher and S.AeadCipher == noise.ChaCha20Poly1305) @max(st.burn, chachapoly_depth) else st.burn;
+                const limit = cal_offset + own + burn_slack;
+                if (verbose or d > limit) std.debug.print("    {s:<22} dirty {d} B, burn {d} B, limit {d} B{s}\n", .{ st.name, d, st.burn, limit, if (d > limit) "  OUTGROWN" else "" });
+                if (d > limit) over += 1;
+            }
+            return over;
+        }
+    };
+}
+
+fn primitiveDepth(call: *const fn () void) usize {
+    measure(call);
+    return dirtyDepth() - cal_offset;
+}
+
+fn DhDepth(comptime D: type) type {
+    return struct {
+        var kp: D.KeyPair = undefined;
+        var out: [D.public_length]u8 = undefined;
+        noinline fn gen() void {
+            kp = D.KeyPair.generateDeterministic(@splat(0x42)) catch unreachable;
+        }
+        noinline fn mul() void {
+            out = D.scalarmult(kp.secret_key, kp.public_key) catch unreachable;
+        }
+    };
+}
+
+fn AeadDepth(comptime A: type) type {
+    return struct {
+        var key: [32]u8 = @splat(7);
+        var c: [plaintext.len]u8 = undefined;
+        var t: [16]u8 = undefined;
+        var m: [plaintext.len]u8 = undefined;
+        noinline fn enc() void {
+            A.encrypt(&c, &t, plaintext, "", @splat(0), key);
+        }
+        noinline fn dec() void {
+            A.decrypt(&m, &c, t, "", @splat(0), key) catch unreachable;
+        }
+    };
+}
+
+fn HmacDepth(comptime H: type) type {
+    return struct {
+        const M = std.crypto.auth.hmac.Hmac(H);
+        var key: [H.digest_length]u8 = @splat(7);
+        var out: [H.digest_length]u8 = undefined;
+        noinline fn mac() void {
+            M.create(&out, "probe message", &key);
+        }
+    };
+}
+
+var over_claims: usize = 0;
+fn expectWithin(comptime name: []const u8, used: usize, claimed: usize) void {
+    if (verbose or used > claimed) std.debug.print("  {s:<44} {d} B (claimed {d} B){s}\n", .{ name, used, claimed, if (used > claimed) "  OVER" else "" });
+    if (used > claimed) over_claims += 1;
+}
+
+test "STACKPROBE noise: std primitives dirty no more stack than state.stack_bytes claims" {
+    try skipUnlessOptimized();
+    calibrate();
+    over_claims = 0;
+    const X = DhDepth(X25519);
+    expectWithin("X25519 generateDeterministic", primitiveDepth(X.gen), state.stack_bytes.dh(X25519));
+    expectWithin("X25519 scalarmult", primitiveDepth(X.mul), state.stack_bytes.dh(X25519));
+    const P = DhDepth(P384Dh(0));
+    // Not a std type: only printed, to size the adapter's declaration below.
+    if (verbose) std.debug.print("  P-384 adapter: generate {d} B, scalarmult {d} B\n", .{ primitiveDepth(P.gen), primitiveDepth(P.mul) });
+    inline for (.{ .{ "std ChaChaPoly", StdChaCha }, .{ "AES-256-GCM", Aes256Gcm } }) |a| {
+        const D = AeadDepth(a[1]);
+        expectWithin(a[0] ++ " encrypt", primitiveDepth(D.enc), state.stack_bytes.cipher(a[1]));
+        expectWithin(a[0] ++ " decrypt", primitiveDepth(D.dec), state.stack_bytes.cipher(a[1]));
+    }
+    inline for (.{ .{ "SHA256", sha2.Sha256 }, .{ "SHA512", sha2.Sha512 }, .{ "BLAKE2s", blake2.Blake2s256 }, .{ "BLAKE2b", blake2.Blake2b512 } }) |h| {
+        expectWithin("HMAC-" ++ h[0], primitiveDepth(HmacDepth(h[1]).mac), state.stack_bytes.hash(h[1]));
+    }
+    try std.testing.expectEqual(@as(usize, 0), over_claims);
+}
+
+test "STACKPROBE noise: every burned entry point stays within its burn, on every std suite and a P-384 DH" {
+    try skipUnlessOptimized();
+    calibrate();
+    chachapoly_depth = primitiveDepth(AeadDepth(noise.ChaCha20Poly1305).dec);
+    if (verbose) std.debug.print("\n=== STACKPROBE noise burn sizes ({t}), burn offset {d} B ===\n", .{ builtin.mode, cal_offset });
+    var over: usize = 0;
+    inline for (.{ chachapolyType(), StdChaCha, Aes256Gcm }) |A| {
+        inline for (.{ sha2.Sha256, sha2.Sha512, blake2.Blake2s256, blake2.Blake2b512 }) |H| {
+            over += try Coverage(state.Suite(X25519, A, H)).check();
+        }
+    }
+    over += try Coverage(state.Suite(P384Dh(16 * 1024), Aes256Gcm, sha2.Sha512)).check();
+    over += try Coverage(state.Suite(P384Undeclared, AesUndeclared, sha2.Sha512)).check();
+    try std.testing.expectEqual(@as(usize, 0), over);
+}
+
+fn chachapolyType() type {
+    return noise.ChaCha20Poly1305;
+}

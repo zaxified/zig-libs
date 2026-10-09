@@ -58,6 +58,8 @@ const linux = std.os.linux;
 const netlink = @import("netlink");
 const codec = netlink.codec;
 const netaddr = @import("netaddr");
+const burn = @import("burn.zig");
+const wipe = @import("wipe.zig");
 // Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 // helpers, in the format `std.testing.Smith` actually reads.
 const testkit = @import("testkit");
@@ -196,14 +198,30 @@ pub const AllowedIpParseError = error{InvalidAllowedIp};
 
 /// Parse a wg base64 key string into raw bytes. Strict: exactly 44 chars
 /// and canonical encoding (re-encodes to the same string), like `wg` itself.
+///
+/// The key comes back BY VALUE, so a copy of it stays in this function's dead
+/// frame. For a private key use `keyFromBase64Into`.
 pub fn keyFromBase64(s: []const u8) KeyParseError!Key {
-    if (s.len != key_b64_len) return error.InvalidKey;
     var key: Key = undefined;
-    std.base64.standard.Decoder.decode(&key, s) catch return error.InvalidKey;
-    // Reject non-canonical trailing bits (e.g. "…B=" where "…A=" is meant).
-    const back = keyToBase64(key);
-    if (!std.mem.eql(u8, &back, s)) return error.InvalidKey;
+    try keyFromBase64Into(s, &key);
     return key;
+}
+
+/// `keyFromBase64`, writing the key to `out` (left zeroed on error) and
+/// burning the decoder's and the re-encoder's scratch (the key's base64 text
+/// among it) off the dead stack. Use it for private and pre-shared keys.
+pub fn keyFromBase64Into(s: []const u8, out: *Key) KeyParseError!void {
+    return burn.run(burn.cp_burn, KeyParseError!void, keyFromBase64Body, .{ s, out });
+}
+
+fn keyFromBase64Body(s: []const u8, out: *Key) KeyParseError!void {
+    errdefer std.crypto.secureZero(u8, out);
+    if (s.len != key_b64_len) return error.InvalidKey;
+    std.base64.standard.Decoder.decode(out, s) catch return error.InvalidKey;
+    // Reject non-canonical trailing bits (e.g. "…B=" where "…A=" is meant).
+    var back = keyToBase64(out.*);
+    defer std.crypto.secureZero(u8, &back);
+    if (!std.mem.eql(u8, &back, s)) return error.InvalidKey;
 }
 
 // ── typed model ─────────────────────────────────────────────────────────────
@@ -326,9 +344,13 @@ pub const Device = struct {
         return d.name_buf[0..d.name_len];
     }
 
+    /// Frees the peers and wipes what held keys: the device's private key
+    /// and every peer's pre-shared key (`peers` block and `*d` itself).
     pub fn deinit(d: *Device, gpa: std.mem.Allocator) void {
         for (d.peers) |p| gpa.free(p.allowed_ips);
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(d.peers));
         gpa.free(d.peers);
+        std.crypto.secureZero(u8, std.mem.asBytes(d));
         d.* = undefined;
     }
 };
@@ -354,13 +376,19 @@ pub const DeviceParser = struct {
 
     pub fn deinit(p: *DeviceParser) void {
         for (p.peers.items) |peer| p.gpa.free(peer.allowed_ips);
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(p.peers.allocatedSlice()));
         p.peers.deinit(p.gpa);
+        std.crypto.secureZero(u8, std.mem.asBytes(&p.dev));
         p.* = undefined;
     }
 
     /// Feed one genetlink message payload (genlmsghdr + WGDEVICE_A_*
     /// attributes). Malformed bytes yield a typed error — never a panic.
     pub fn feed(p: *DeviceParser, payload: []const u8) ParseError!void {
+        return burn.run(burn.cp_burn, ParseError!void, feedBody, .{ p, payload });
+    }
+
+    fn feedBody(p: *DeviceParser, payload: []const u8) ParseError!void {
         const g = try genl.splitPayload(payload);
         var it: codec.AttrIterator = .{ .buf = g.attrs };
         var first_peer_in_msg = true;
@@ -389,11 +417,49 @@ pub const DeviceParser = struct {
 
     /// Hand over the accumulated Device. The parser is left empty (finish
     /// then deinit is safe); the caller frees the Device with `deinit`.
+    ///
+    /// The Device comes back BY VALUE (a copy of its private key stays in this
+    /// function's dead frame); `finishInto` does not.
     pub fn finish(p: *DeviceParser) error{OutOfMemory}!Device {
-        p.dev.peers = try p.peers.toOwnedSlice(p.gpa);
-        const dev = p.dev;
-        p.dev = .{};
+        var dev: Device = undefined;
+        try p.finishInto(&dev);
         return dev;
+    }
+
+    /// `finish`, writing the Device to `out`; the stack scratch is burned and
+    /// the parser's own copies of the keys (peer table, device) are wiped.
+    pub fn finishInto(p: *DeviceParser, out: *Device) error{OutOfMemory}!void {
+        return burn.run(burn.cp_burn, error{OutOfMemory}!void, finishBody, .{ p, out });
+    }
+
+    fn finishBody(p: *DeviceParser, out: *Device) error{OutOfMemory}!void {
+        // An exact-size block, so the peer table is never `remap`ped in place
+        // and the old (key-bearing) block can be wiped before it is freed.
+        const peers = try p.gpa.alloc(Peer, p.peers.items.len);
+        @memcpy(peers, p.peers.items);
+        const old = p.peers.allocatedSlice();
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(old));
+        p.gpa.free(old);
+        p.peers = .empty;
+        out.* = p.dev;
+        out.peers = peers;
+        std.crypto.secureZero(u8, std.mem.asBytes(&p.dev));
+        p.dev = .{};
+    }
+
+    /// `ArrayList.append`, except that growth wipes the block it leaves behind
+    /// (peers carry pre-shared keys).
+    fn appendPeer(p: *DeviceParser, peer: Peer) error{OutOfMemory}!void {
+        if (p.peers.items.len == p.peers.capacity) {
+            const cap = @max(4, p.peers.capacity * 2);
+            const fresh = try p.gpa.alloc(Peer, cap);
+            @memcpy(fresh[0..p.peers.items.len], p.peers.items);
+            const old = p.peers.allocatedSlice();
+            std.crypto.secureZero(u8, std.mem.sliceAsBytes(old));
+            p.gpa.free(old);
+            p.peers = .{ .items = fresh[0..p.peers.items.len], .capacity = cap };
+        }
+        p.peers.appendAssumeCapacity(peer);
     }
 
     fn feedPeer(p: *DeviceParser, entry: codec.Attr, first_in_msg: bool) ParseError!void {
@@ -447,7 +513,7 @@ pub const DeviceParser = struct {
         }
         peer.allowed_ips = try p.gpa.dupe(AllowedIp, ips.items);
         errdefer p.gpa.free(peer.allowed_ips);
-        try p.peers.append(p.gpa, peer);
+        try p.appendPeer(peer);
     }
 };
 
@@ -566,7 +632,10 @@ pub const SetRequests = struct {
     buf: []u8,
     msg_count: u32,
 
+    /// Wipes `buf` (it carries the interface private key and the peers'
+    /// pre-shared keys) before freeing it.
     pub fn deinit(r: *SetRequests, gpa: std.mem.Allocator) void {
+        std.crypto.secureZero(u8, r.buf);
         gpa.free(r.buf);
         r.* = undefined;
     }
@@ -580,6 +649,15 @@ pub const SetRequests = struct {
 /// allowed-ips (never re-sending REPLACE_* flags, which would undo earlier
 /// fragments). `max_msg_len` is a soft ceiling: a single indivisible
 /// attribute group never splits, so one message may exceed it slightly.
+///
+/// The request is built in blocks that are wiped when released (the list
+/// grows by reallocation and would otherwise leave earlier copies of the
+/// private key in freed heap), and `cfg` is read through a pointer to the
+/// caller's copy so no further copy of it lands on this call's stack.
+///
+/// `cfg` is taken BY VALUE, so the argument copy of the private key (in the
+/// caller's outgoing-argument area) outlives the call: `buildSetRequestsFrom`
+/// reads the caller's own `Config` through a pointer and adds no copy.
 pub fn buildSetRequests(
     gpa: std.mem.Allocator,
     family_id: u16,
@@ -587,6 +665,30 @@ pub fn buildSetRequests(
     cfg: Config,
     max_msg_len: usize,
 ) BuildError!SetRequests {
+    return buildSetRequestsFrom(gpa, family_id, first_seq, &cfg, max_msg_len);
+}
+
+/// `buildSetRequests` over a `Config` the caller keeps (and wipes) itself.
+pub fn buildSetRequestsFrom(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    first_seq: u32,
+    cfg: *const Config,
+    max_msg_len: usize,
+) BuildError!SetRequests {
+    return burn.run(burn.cp_burn, BuildError!SetRequests, buildSetRequestsBody, .{ gpa, family_id, first_seq, cfg, max_msg_len });
+}
+
+fn buildSetRequestsBody(
+    child: std.mem.Allocator,
+    family_id: u16,
+    first_seq: u32,
+    cfg_ptr: *const Config,
+    max_msg_len: usize,
+) BuildError!SetRequests {
+    const cfg = cfg_ptr.*;
+    var wiper = wipe.WipingAllocator.init(child);
+    const gpa = wiper.allocator();
     if (cfg.ifname.len == 0 and cfg.ifindex == 0) return error.InvalidConfig;
     if (cfg.ifname.len >= ifnamsiz) return error.InvalidConfig;
     for (cfg.peers) |p| for (p.allowed_ips) |ip| if (!ip.valid()) return error.InvalidConfig;
@@ -908,7 +1010,17 @@ pub const Wireguard = struct {
     /// Fetch a device's full configuration + runtime state (peers with
     /// allowed-ips, handshake times, transfer counters). Needs
     /// CAP_NET_ADMIN. Free the result with `Device.deinit`.
+    ///
+    /// The Device is returned BY VALUE, so a copy of its private key stays in
+    /// this call's dead frame; `getDeviceInto` does not do that.
     pub fn getDevice(wg: *Wireguard, ifname: []const u8) GetError!Device {
+        var dev: Device = undefined;
+        try wg.getDeviceInto(ifname, &dev);
+        return dev;
+    }
+
+    /// `getDevice`, writing the result to `out` (valid only on success).
+    pub fn getDeviceInto(wg: *Wireguard, ifname: []const u8, out: *Device) GetError!void {
         if (ifname.len == 0 or ifname.len >= ifnamsiz) return error.InvalidRequest;
         const gpa = wg.sock.gpa;
         const seq = wg.sock.nextSeq();
@@ -939,7 +1051,7 @@ pub const Wireguard = struct {
             while (it.next() catch return error.MalformedReply) |m| {
                 if (m.pid != wg.sock.portid or m.seq != seq) continue;
                 switch (m.type) {
-                    codec.NLMSG_DONE => return parser.finish(),
+                    codec.NLMSG_DONE => return parser.finishInto(out),
                     codec.NLMSG_ERROR => {
                         const code = m.errorCode() catch return error.MalformedReply;
                         if (code == 0) continue; // stray ACK
@@ -965,7 +1077,7 @@ pub const Wireguard = struct {
     pub fn setDevice(wg: *Wireguard, cfg: Config) SetError!void {
         const gpa = wg.sock.gpa;
         const first_seq = wg.sock.nextSeq();
-        var reqs = try buildSetRequests(gpa, wg.family_id, first_seq, cfg, default_max_msg_len);
+        var reqs = try buildSetRequestsFrom(gpa, wg.family_id, first_seq, &cfg, default_max_msg_len);
         defer reqs.deinit(gpa);
         wg.sock.seq = first_seq +% (reqs.msg_count - 1);
 
@@ -1080,6 +1192,45 @@ fn patternKey(comptime base: u8) Key {
     var key: Key = undefined;
     for (&key, 0..) |*b, i| b.* = @intCast(base + i);
     return key;
+}
+
+test "key-safe variants agree with the by-value ones and wipe on failure" {
+    const gpa = testing.allocator;
+    const priv = comptime patternKey(0x10);
+    const text = keyToBase64(priv);
+    var out: Key = undefined;
+    try keyFromBase64Into(&text, &out);
+    try testing.expectEqual(priv, out);
+    try testing.expectEqual(priv, try keyFromBase64(&text));
+    out = priv;
+    try testing.expectError(error.InvalidKey, keyFromBase64Into("short", &out));
+    try testing.expectEqual(@as(Key, @splat(0)), out);
+
+    const cfg: Config = .{ .ifname = "wg0", .private_key = priv, .peers = &.{.{
+        .public_key = patternKey(0x40),
+        .preshared_key = patternKey(0x50),
+    }} };
+    var a = try buildSetRequests(gpa, 0x1c, 1, cfg, default_max_msg_len);
+    defer a.deinit(gpa);
+    var b = try buildSetRequestsFrom(gpa, 0x1c, 1, &cfg, default_max_msg_len);
+    defer b.deinit(gpa);
+    try testing.expectEqualSlices(u8, a.buf, b.buf);
+
+    var p1: DeviceParser = .init(gpa);
+    defer p1.deinit();
+    var p2: DeviceParser = .init(gpa);
+    defer p2.deinit();
+    try p1.feed(a.buf[codec.header_len..]);
+    try p2.feed(a.buf[codec.header_len..]);
+    var d1 = try p1.finish();
+    defer d1.deinit(gpa);
+    var d2: Device = undefined;
+    try p2.finishInto(&d2);
+    defer d2.deinit(gpa);
+    try testing.expectEqual(priv, d1.private_key.?);
+    try testing.expectEqual(d1.private_key, d2.private_key);
+    try testing.expectEqual(@as(usize, 1), d2.peers.len);
+    try testing.expectEqual(patternKey(0x50), d2.peers[0].preshared_key.?);
 }
 
 test "golden: WG_CMD_SET_DEVICE request bytes (device + peer + allowed-ip)" {

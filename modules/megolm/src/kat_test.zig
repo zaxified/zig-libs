@@ -71,7 +71,7 @@ const libolm_seed = buildLibolmSeed();
 // ── EXTERNAL ANCHOR (grade 1): libolm `Megolm::advance` ─────────────────
 
 test "libolm vector: single-step advance from index 0" {
-    var r = Ratchet.init(libolm_seed, 0);
+    var r = shim.ratchetInit(&libolm_seed, 0);
     r.advanceStep();
     try testing.expectEqual(@as(u32, 1), r.counter);
 
@@ -89,14 +89,14 @@ test "libolm vector: single-step advance from index 0" {
 
     // "repeat with complex advance" -- advanceTo(1) from index 0 must land
     // on the identical bytes as one advanceStep().
-    var r2 = Ratchet.init(libolm_seed, 0);
+    var r2 = shim.ratchetInit(&libolm_seed, 0);
     try r2.advanceTo(1);
     try testing.expectEqual(@as(u32, 1), r2.counter);
     try testing.expectEqualSlices(u8, &expected, &r2.data);
 }
 
 test "libolm vector: advanceTo crossing a 2^24 boundary" {
-    var r = Ratchet.init(libolm_seed, 0);
+    var r = shim.ratchetInit(&libolm_seed, 0);
     try r.advanceTo(0x1000000);
     try testing.expectEqual(@as(u32, 0x1000000), r.counter);
 
@@ -130,11 +130,11 @@ test "libolm vector: advanceTo crossing a 2^24 boundary" {
 }
 
 test "libolm vector: advanceToUnchecked wraparound (counter 0xffffffff -> 0x1000000 == fresh -> 0x2000000)" {
-    var r1 = Ratchet.init(libolm_seed, 0xffffffff);
+    var r1 = shim.ratchetInit(&libolm_seed, 0xffffffff);
     r1.advanceToUnchecked(0x1000000);
     try testing.expectEqual(@as(u32, 0x1000000), r1.counter);
 
-    var r2 = Ratchet.init(libolm_seed, 0);
+    var r2 = shim.ratchetInit(&libolm_seed, 0);
     r2.advanceToUnchecked(0x2000000);
     try testing.expectEqual(@as(u32, 0x2000000), r2.counter);
 
@@ -142,11 +142,11 @@ test "libolm vector: advanceToUnchecked wraparound (counter 0xffffffff -> 0x1000
 }
 
 test "libolm vector: advanceToUnchecked overflow by one (0xffffffff -> 0 == a single advanceStep)" {
-    var r1 = Ratchet.init(libolm_seed, 0xffffffff);
+    var r1 = shim.ratchetInit(&libolm_seed, 0xffffffff);
     r1.advanceToUnchecked(0);
     try testing.expectEqual(@as(u32, 0), r1.counter);
 
-    var r2 = Ratchet.init(libolm_seed, 0xffffffff);
+    var r2 = shim.ratchetInit(&libolm_seed, 0xffffffff);
     r2.advanceStep();
     try testing.expectEqual(@as(u32, 0), r2.counter);
 
@@ -154,12 +154,12 @@ test "libolm vector: advanceToUnchecked overflow by one (0xffffffff -> 0 == a si
 }
 
 test "libolm vector: advanceToUnchecked double wraparound" {
-    var r1 = Ratchet.init(libolm_seed, 1);
+    var r1 = shim.ratchetInit(&libolm_seed, 1);
     r1.advanceToUnchecked(0x80000000);
     r1.advanceToUnchecked(0);
     try testing.expectEqual(@as(u32, 0), r1.counter);
 
-    var r2 = Ratchet.init(libolm_seed, 1);
+    var r2 = shim.ratchetInit(&libolm_seed, 1);
     r2.advanceToUnchecked(0);
     try testing.expectEqual(@as(u32, 0), r2.counter);
 
@@ -194,7 +194,7 @@ test "libolm vector: real session-key + message decrypts to plaintext 'Message' 
         "AwgAEhAcbh6UpbByoyZxufQ+h2B+8XHMjhR69G8F4+qjMaFlnIXusJZX3r8LnRORG9T3D" ++
         "XFdbVuvIWrLyRfm4i8QRbe8VPwGRFG57B1CtmxanuP8bHtnnYqlwPsD";
 
-    const key = try SessionKey.fromBase64(testing.allocator, session_key_b64);
+    const key = try shim.sessionKeyFromBase64(testing.allocator, session_key_b64);
     var session = try shim.fromSessionKey(key);
     defer session.deinit();
     try testing.expectEqual(@as(u32, 0), session.firstKnownIndex());
@@ -246,7 +246,7 @@ test "W2-33: a non-minimal-varint remake of the real libolm message is REJECTED"
     @memcpy(mal[4..], raw[3..]);
     try testing.expectEqual(@as(usize, 94), mal.len);
 
-    const key = try SessionKey.fromBase64(testing.allocator, session_key_b64);
+    const key = try shim.sessionKeyFromBase64(testing.allocator, session_key_b64);
     var session = try shim.fromSessionKey(key);
     defer session.deinit();
 
@@ -287,7 +287,7 @@ test "libolm vector: tampered final byte (part of the signature) is rejected as 
         "AwgAEhAcbh6UpbByoyZxufQ+h2B+8XHMjhR69G8nP4pNZGl/3QMgrzCZPmP+F2aPLyKPz" ++
         "xRPBMUkeXRJ6Iqm5NeOdx2eERgTW7P20CM+lL3Xpk+ZUOOPvsSQNaBF";
 
-    const key = try SessionKey.fromBase64(testing.allocator, session_key_b64);
+    const key = try shim.sessionKeyFromBase64(testing.allocator, session_key_b64);
     var session = try shim.fromSessionKey(key);
     defer session.deinit();
 
@@ -345,7 +345,7 @@ test "InvalidMac is reachable and distinct from InvalidSignature (honest constru
 test "CannotRatchetBackward (Ratchet primitive) is distinct from MessageIndexTooOld (session level)" {
     // Primitive-level: a direct caller of Ratchet.advanceTo trying to move
     // backward gets a typed error, fail-closed (state untouched).
-    var r = Ratchet.init(libolm_seed, 10);
+    var r = shim.ratchetInit(&libolm_seed, 10);
     const before = r.data;
     try testing.expectError(error.CannotRatchetBackward, r.advanceTo(3));
     try testing.expectEqual(@as(u32, 10), r.counter);

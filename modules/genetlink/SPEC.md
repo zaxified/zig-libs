@@ -255,6 +255,7 @@ previous commit), not by inspection.
 
 - **`ListFamilies` (survey 2026-09-30)** — `CTRL_CMD_GETFAMILY` with `NLM_F_DUMP`, returning every registered family (id, name, version); mdlayher/genetlink has it and it is how a tool discovers what a kernel offers. Effort: small; fits CONVENTIONS §2.
 - **Family metadata (survey 2026-09-30)** — `CTRL_ATTR_VERSION`, `HDRSIZE`, `MAXATTR` from the same reply that yields the id, so a client can check version compatibility. Effort: small.
+- **Wipe the receive buffer for secret-carrying replies (2026-10-09, from `wireguard`'s dead-stack review)** — `wireguard`'s `getDevice` reads the interface private key and the peers' pre-shared keys out of a `WG_CMD_GET_DEVICE` reply that stays in the socket's receive buffer after parsing; nothing here can zero it. Wanted: a `Socket.wipeRecvBuffer()` (or a socket option that zeroes it after each `recvDatagram`), so a consumer that parsed a secret can clear the plaintext copy. Effort: small (the buffer is the transport's own). Consumer today documents it as NOT covered (`wireguard/SPEC.md` § "Secret residue on the dead stack").
 - **Policy introspection (survey 2026-09-30)** — `CTRL_CMD_GETPOLICY` (kernel 5.2+), letting a client validate attribute types against the kernel's own policy. None of the surveyed libraries appears to expose it *(inferred)*; nice-to-have. Effort: medium.
 
 ## Status

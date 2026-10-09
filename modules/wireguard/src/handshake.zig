@@ -887,20 +887,36 @@ pub const CookieChecker = struct {
     /// own doc says it — a predictable `Rm` makes every cookie forgeable,
     /// which is the whole security of this layer — and this signature
     /// returns a `CookieChecker`, so a weak draw could not be reported.
-    pub fn init(our_static_public: PublicKey, io: std.Io, now_s: u64) CookieChecker {
-        var self = initWithSecret(our_static_public, undefined, now_s);
-        entropy.fill(io, &self.secret);
-        return self;
+    ///
+    /// The checker is written to `out`, not returned: `Rm` returned by value
+    /// is a copy in the caller's dead frame.
+    pub fn init(our_static_public: PublicKey, io: std.Io, now_s: u64, out: *CookieChecker) void {
+        burn.run(burn.cp_burn, void, initBody, .{ our_static_public, io, now_s, out });
+    }
+
+    fn initBody(our_static_public: PublicKey, io: std.Io, now_s: u64, out: *CookieChecker) void {
+        out.* = .{
+            .mac1_key = noise.mac1Key(our_static_public),
+            .cookie_key = noise.cookieKey(our_static_public),
+            .secret = undefined,
+            .secret_born_s = now_s,
+        };
+        entropy.fill(io, &out.secret);
     }
 
     /// Deterministic-test seam: a checker with a caller-chosen `Rm`. Use
     /// `init` in production — a predictable secret makes every cookie
     /// forgeable, which is the whole security of this layer.
-    pub fn initWithSecret(our_static_public: PublicKey, secret: [32]u8, now_s: u64) CookieChecker {
-        return .{
+    /// `Rm` comes in by `*const` and the checker goes out through `out`.
+    pub fn initWithSecret(our_static_public: PublicKey, secret: *const [32]u8, now_s: u64, out: *CookieChecker) void {
+        burn.run(burn.cp_burn, void, initWithSecretBody, .{ our_static_public, secret, now_s, out });
+    }
+
+    fn initWithSecretBody(our_static_public: PublicKey, secret: *const [32]u8, now_s: u64, out: *CookieChecker) void {
+        out.* = .{
             .mac1_key = noise.mac1Key(our_static_public),
             .cookie_key = noise.cookieKey(our_static_public),
-            .secret = secret,
+            .secret = secret.*,
             .secret_born_s = now_s,
         };
     }
@@ -917,6 +933,10 @@ pub const CookieChecker = struct {
     /// failure mode worth avoiding here, and re-rolling only costs the peers
     /// one extra round trip.
     pub fn refresh(self: *CookieChecker, io: std.Io, now_s: u64) void {
+        burn.run(burn.cp_burn, void, refreshBody, .{ self, io, now_s });
+    }
+
+    fn refreshBody(self: *CookieChecker, io: std.Io, now_s: u64) void {
         if (now_s >= self.secret_born_s and
             now_s - self.secret_born_s < cookie_secret_lifetime_s) return;
         // Same fail-closed reason as `init` — rotating onto a guessable
@@ -931,14 +951,28 @@ pub const CookieChecker = struct {
     /// plus the 2 port bytes). It only has to be the SAME bytes when the
     /// cookie is issued and when a later mac2 is checked; anything that varies
     /// per packet would issue cookies that can never be used.
+    ///
+    /// The cookie is written to `out`, not returned (it is the key of the
+    /// mac2 the initiator must produce).
     pub fn cookieFor(
         self: *CookieChecker,
         io: std.Io,
         now_s: u64,
         source_address: []const u8,
-    ) noise.Mac {
-        self.refresh(io, now_s);
-        return noise.keyedMac(&self.secret, source_address);
+        out: *noise.Mac,
+    ) void {
+        burn.run(burn.cp_burn, void, cookieForBody, .{ self, io, now_s, source_address, out });
+    }
+
+    fn cookieForBody(
+        self: *CookieChecker,
+        io: std.Io,
+        now_s: u64,
+        source_address: []const u8,
+        out: *noise.Mac,
+    ) void {
+        self.refreshBody(io, now_s);
+        out.* = noise.keyedMac(&self.secret, source_address);
     }
 
     /// Constant-time mac1 check — the cheap "is this even addressed to us"
@@ -958,7 +992,18 @@ pub const CookieChecker = struct {
         f: MacFields,
         source_address: []const u8,
     ) bool {
-        const cookie = self.cookieFor(io, now_s, source_address);
+        return burn.run(burn.cp_burn, bool, checkMac2Body, .{ self, io, now_s, f, source_address });
+    }
+
+    fn checkMac2Body(
+        self: *CookieChecker,
+        io: std.Io,
+        now_s: u64,
+        f: MacFields,
+        source_address: []const u8,
+    ) bool {
+        var cookie: noise.Mac = undefined;
+        self.cookieForBody(io, now_s, source_address, &cookie);
         const expected = noise.keyedMac(&cookie, f.mac2_input);
         return std.crypto.timing_safe.eql(noise.Mac, expected, f.mac2);
     }
@@ -992,7 +1037,19 @@ pub const CookieChecker = struct {
         source_address: []const u8,
         nonce: [noise.XAead.nonce_length]u8,
     ) CookieReply {
-        const cookie = self.cookieFor(io, now_s, source_address);
+        return burn.run(burn.cp_burn, CookieReply, createReplyWithNonceBody, .{ self, io, now_s, f, source_address, nonce });
+    }
+
+    fn createReplyWithNonceBody(
+        self: *CookieChecker,
+        io: std.Io,
+        now_s: u64,
+        f: MacFields,
+        source_address: []const u8,
+        nonce: [noise.XAead.nonce_length]u8,
+    ) CookieReply {
+        var cookie: noise.Mac = undefined;
+        self.cookieForBody(io, now_s, source_address, &cookie);
         var reply: CookieReply = .{
             .type = @intFromEnum(MessageType.cookie_reply),
             .receiver_index = f.sender_index,
@@ -1083,6 +1140,11 @@ pub const PeerCookie = struct {
         reply: CookieReply,
         now_s: u64,
     ) ConsumeReplyError!void {
+        return burn.run(burn.cp_burn, ConsumeReplyError!void, consumeReplyBody, .{ self, &reply, now_s });
+    }
+
+    fn consumeReplyBody(self: *PeerCookie, reply_ptr: *const CookieReply, now_s: u64) ConsumeReplyError!void {
+        const reply = reply_ptr.*;
         const aad = self.last_sent_mac1 orelse return error.NoPendingMessage;
         var cookie: noise.Mac = undefined;
         noise.XAead.decrypt(
@@ -1119,6 +1181,21 @@ fn kpFrom(priv: PrivateKey) error{IdentityElement}!Keypair {
     var kp: Keypair = undefined;
     try Keypair.fromPrivateKey(&priv, &kp);
     return kp;
+}
+fn ckWith(our_pub: PublicKey, secret: [32]u8, now_s: u64) CookieChecker {
+    var c: CookieChecker = undefined;
+    CookieChecker.initWithSecret(our_pub, &secret, now_s, &c);
+    return c;
+}
+fn ckNew(our_pub: PublicKey, io: std.Io, now_s: u64) CookieChecker {
+    var c: CookieChecker = undefined;
+    CookieChecker.init(our_pub, io, now_s, &c);
+    return c;
+}
+fn ckFor(c: *CookieChecker, io: std.Io, now_s: u64, addr: []const u8) noise.Mac {
+    var out: noise.Mac = undefined;
+    c.cookieFor(io, now_s, addr, &out);
+    return out;
 }
 fn kpGen(io: std.Io) Keypair {
     var kp: Keypair = undefined;
@@ -1640,8 +1717,8 @@ test "KAT: cookie reply and mac2 byte-exact against the independent reference" {
     try testing.expectEqual(cookie_kat.responder_pub, rpub);
     try testing.expectEqual(cookie_kat.cookie_key, noise.cookieKey(rpub));
 
-    var checker = CookieChecker.initWithSecret(rpub, cookie_kat.secret, 1_000);
-    try testing.expectEqual(cookie_kat.cookie, checker.cookieFor(io, 1_000, &cookie_kat.addr));
+    var checker = ckWith(rpub, cookie_kat.secret, 1_000);
+    try testing.expectEqual(cookie_kat.cookie, ckFor(&checker, io, 1_000, &cookie_kat.addr));
 
     const reply = checker.createReplyWithNonce(io, 1_000, f, &cookie_kat.addr, cookie_kat.nonce);
     try testing.expectEqualSlices(u8, &cookie_kat.reply, std.mem.asBytes(&reply));
@@ -1701,7 +1778,7 @@ test "cookie reply: our decryptor opens the independent reference's bytes, and i
 test "admit: a mac1-only flood is shed under load until the cookie round trip completes" {
     const io = std.testing.io;
     const rpub = (try kpFrom(kat.sr_priv)).public;
-    var checker = CookieChecker.init(rpub, io, 1_000); // random secret, as in production
+    var checker = ckNew(rpub, io, 1_000); // random secret, as in production
     defer checker.wipe();
 
     var ini = kat.initiator();
@@ -1775,23 +1852,23 @@ test "cookie secret rotates after two minutes, on both sides of the exchange" {
     try testing.expectEqual(@as(u64, 120), cookie_secret_lifetime_s);
     try testing.expectEqual(@as(u64, 120), cookie_lifetime_s);
 
-    var checker = CookieChecker.initWithSecret(rpub, cookie_kat.secret, 1_000);
-    const at_0 = checker.cookieFor(io, 1_000, &cookie_kat.addr);
+    var checker = ckWith(rpub, cookie_kat.secret, 1_000);
+    const at_0 = ckFor(&checker, io, 1_000, &cookie_kat.addr);
     try testing.expectEqual(cookie_kat.cookie, at_0);
 
     // 119 s in: same secret, same cookie.
-    try testing.expectEqual(at_0, checker.cookieFor(io, 1_119, &cookie_kat.addr));
+    try testing.expectEqual(at_0, ckFor(&checker, io, 1_119, &cookie_kat.addr));
     try testing.expectEqual(cookie_kat.secret, checker.secret);
 
     // 120 s in: rolled, and every cookie issued under the old secret dies.
-    const at_120 = checker.cookieFor(io, 1_120, &cookie_kat.addr);
+    const at_120 = ckFor(&checker, io, 1_120, &cookie_kat.addr);
     try testing.expect(!std.mem.eql(u8, &at_0, &at_120));
     try testing.expect(!std.mem.eql(u8, &cookie_kat.secret, &checker.secret));
     try testing.expectEqual(@as(u64, 1_120), checker.secret_born_s);
 
     // A clock that jumps backwards rolls it too, rather than extending its life.
     const rolled = checker.secret;
-    _ = checker.cookieFor(io, 999, &cookie_kat.addr);
+    _ = ckFor(&checker, io, 999, &cookie_kat.addr);
     try testing.expect(!std.mem.eql(u8, &rolled, &checker.secret));
 
     // wipe() ends the secret's life immediately.
@@ -1911,8 +1988,8 @@ test "entropy seam: the keypair seed, the first cookie secret and the reply nonc
     // input that can differ. A predictable `Rm` makes every cookie forgeable,
     // which is the whole security of this layer.
     const rpub = cookie_kat.responder_pub;
-    var c1 = CookieChecker.init(rpub, io, 1_000);
-    var c2 = CookieChecker.init(rpub, io, 1_000);
+    var c1 = ckNew(rpub, io, 1_000);
+    var c2 = ckNew(rpub, io, 1_000);
     try testing.expect(!std.mem.eql(u8, &c1.secret, &c2.secret));
     c1.wipe();
     c2.wipe();
@@ -1925,7 +2002,7 @@ test "entropy seam: the keypair seed, the first cookie secret and the reply nonc
     // varying input — which is what makes the ciphertext assertion below a
     // consequence of the draw and not of anything incidental.
     const f = try macFields(&kat.msg1);
-    var checker = CookieChecker.initWithSecret(rpub, cookie_kat.secret, 1_000);
+    var checker = ckWith(rpub, cookie_kat.secret, 1_000);
     const rep1 = checker.createReply(io, 1_000, f, &cookie_kat.addr);
     const rep2 = checker.createReply(io, 1_000, f, &cookie_kat.addr);
     try testing.expectEqual(cookie_kat.secret, checker.secret); // no rotation happened

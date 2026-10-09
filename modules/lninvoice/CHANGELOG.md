@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **TEST ONLY, NO API CHANGE:** dead-stack stack probe (`src/stackprobe_test.zig`, ReleaseFast) over BOLT#11 `encode` with `.private_key`, `signMerkle`, `encodeSignedInvoiceRequest`, `encodeSignedInvoice`: the private key and the ECDSA / BIP340 nonce material in every representation, needles self-checked against the published `R`. 0 residue as shipped (the signers are burned in `k256`/`bip340`; this module's frames hold only pointers).
+
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** BOLT11 signing follows k256's pointer `ecdsa_recover.sign`; BOLT12 signing and tests follow bip340's pointer
   `sign` and out-param `KeyPair.fromSecretKey` (bip340 2026-10-08).
 - **2026-09-15** — **Internal only, no behaviour change:** `bech32_raw.zig`'s own copies of the

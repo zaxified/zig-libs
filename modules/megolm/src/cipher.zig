@@ -23,6 +23,7 @@
 const std = @import("std");
 const aescbc = @import("aescbc");
 const ratchet_mod = @import("ratchet.zig");
+const burn = @import("burn.zig");
 
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -57,17 +58,22 @@ pub const Keys = struct {
 
 /// `HKDF(salt=0, IKM=ratchet, "MEGOLM_KEYS", 80)`, split per the spec's
 /// `AES_KEY || HMAC_KEY || AES_IV` order.
-pub fn deriveKeys(ratchet_bytes: *const [ratchet_mod.ratchet_len]u8) Keys {
-    const prk = HkdfSha256.extract(&.{}, ratchet_bytes);
-    var out: [kdf_output_len]u8 = undefined;
-    HkdfSha256.expand(&out, kdf_info, prk);
-    defer std.crypto.secureZero(u8, &out);
+///
+/// The keys go through `out` (not a return value); the PRK and the 80-byte
+/// OKM live in the body's frame, which is burned before return.
+pub fn deriveKeys(ratchet_bytes: *const [ratchet_mod.ratchet_len]u8, out: *Keys) void {
+    burn.run(burn.derive_burn, void, deriveKeysBody, .{ ratchet_bytes, out });
+}
 
-    var keys: Keys = undefined;
-    @memcpy(&keys.aes_key, out[0..aes_key_len]);
-    @memcpy(&keys.hmac_key, out[aes_key_len..][0..hmac_key_len]);
-    @memcpy(&keys.iv, out[aes_key_len + hmac_key_len ..][0..iv_len]);
-    return keys;
+fn deriveKeysBody(ratchet_bytes: *const [ratchet_mod.ratchet_len]u8, out: *Keys) void {
+    const prk = HkdfSha256.extract(&.{}, ratchet_bytes);
+    var okm: [kdf_output_len]u8 = undefined;
+    HkdfSha256.expand(&okm, kdf_info, prk);
+    defer std.crypto.secureZero(u8, &okm);
+
+    @memcpy(&out.aes_key, okm[0..aes_key_len]);
+    @memcpy(&out.hmac_key, okm[aes_key_len..][0..hmac_key_len]);
+    @memcpy(&out.iv, okm[aes_key_len + hmac_key_len ..][0..iv_len]);
 }
 
 /// Full (untruncated) HMAC-SHA-256 over `data`, keyed by `hmac_key`. The
@@ -131,12 +137,13 @@ pub fn decryptCbc(allocator: std.mem.Allocator, keys: *const Keys, ciphertext: [
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const compat = @import("test_shim.zig");
 
 test "deriveKeys is deterministic and produces distinct key material" {
     const ratchet_bytes = [_]u8{0x42} ** ratchet_mod.ratchet_len;
-    var k1 = deriveKeys(&ratchet_bytes);
+    var k1 = compat.deriveKeys(&ratchet_bytes);
     defer k1.deinit();
-    var k2 = deriveKeys(&ratchet_bytes);
+    var k2 = compat.deriveKeys(&ratchet_bytes);
     defer k2.deinit();
 
     try testing.expectEqualSlices(u8, &k1.aes_key, &k2.aes_key);
@@ -150,7 +157,7 @@ test "deriveKeys is deterministic and produces distinct key material" {
 
 test "encryptCbc/decryptCbc round-trip, various lengths crossing the block boundary" {
     const ratchet_bytes = [_]u8{0x07} ** ratchet_mod.ratchet_len;
-    var keys = deriveKeys(&ratchet_bytes);
+    var keys = compat.deriveKeys(&ratchet_bytes);
     defer keys.deinit();
 
     const lengths = [_]usize{ 0, 1, 15, 16, 17, 31, 32, 100 };
@@ -171,7 +178,7 @@ test "encryptCbc/decryptCbc round-trip, various lengths crossing the block bound
 
 test "verifyTruncatedMac rejects a tampered tag and a tampered message" {
     const ratchet_bytes = [_]u8{0x99} ** ratchet_mod.ratchet_len;
-    var keys = deriveKeys(&ratchet_bytes);
+    var keys = compat.deriveKeys(&ratchet_bytes);
     defer keys.deinit();
 
     const data = "the quick brown fox";
@@ -187,7 +194,7 @@ test "verifyTruncatedMac rejects a tampered tag and a tampered message" {
 
 test "decryptCbc rejects a corrupted-padding ciphertext" {
     const ratchet_bytes = [_]u8{0x55} ** ratchet_mod.ratchet_len;
-    var keys = deriveKeys(&ratchet_bytes);
+    var keys = compat.deriveKeys(&ratchet_bytes);
     defer keys.deinit();
 
     const ct = try encryptCbc(testing.allocator, &keys, "hello megolm");

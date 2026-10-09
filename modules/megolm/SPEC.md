@@ -341,28 +341,41 @@ post-mutation source text instead.
 
 `OutboundSession.init` / `encrypt` / `sessionKey`, `InboundGroupSession`
 `fromSessionKey` / `fromExportedKey` / `decrypt` / `exportAt` / `forgetBefore`,
-the unsealed and sealed pickle readers, and `Ratchet.advanceStep` /
-`advanceToUnchecked` run their body one frame down (`burn.run`) and then zero the
-stack that body dirtied (`burn.zig`: 4 KiB for the ratchet advance, 12 KiB for
-the session calls, 16 KiB for `decrypt` and the sealed openers). Measured body
-depth, ReleaseFast, 2026-10-09: 0.9 KiB (`advanceTo`) .. 7.3 KiB (`decrypt`);
-the burns are about 2x that. Results that carry the ratchet or the signing key
-(`OutboundSession`, `SessionKey`, `ExportedSessionKey`, a restored session) go
-through `out` rather than a return value.
+the unsealed and sealed pickle readers, `Ratchet.advanceStep` /
+`advanceToUnchecked` / `generate`, `cipher.deriveKeys` and the key decoders
+(`SessionKey` / `ExportedSessionKey` `decode` and `fromBase64`) run their body one
+frame down (`burn.run`) and then zero the stack that body dirtied (`burn.zig`:
+4 KiB for the ratchet advance and `deriveKeys`, 3 KiB for `generate`, 12 KiB for
+the session calls, 16 KiB for `decrypt`, the sealed openers and `SessionKey`
+decoding, 1 KiB for the `ExportedSessionKey` decoders). Measured body depth,
+ReleaseFast, 2026-10-09: 0.9 KiB (`advanceTo`) .. 7.3 KiB (`decrypt`); the burns
+are about 2x that. Results that carry the ratchet or the signing key
+(`OutboundSession`, `Ratchet`, `Keys`, `SessionKey`, `ExportedSessionKey`, a
+restored session) go through `out` rather than a return value, and every input
+that carries one (`Ratchet.init`'s bytes, `deriveKeys`' ratchet) is a `*const`.
+`SessionKey.decode` checks the Ed25519 signature before the ratchet is copied
+anywhere (the ratchet is part of the signed bytes, so the verify itself left it in
+the dead stack: R at 3.0 KiB before the burn); the decoders then copy it once,
+wire bytes to `out`. `toBase64` wipes its raw buffer; the base64 decoders wipe
+their heap scratch before `free`.
 
 `src/stackprobe_test.zig` scans, after each call, for the ratchet (whole and per
 32-byte part, at the starting and the target index), R0 and the signing seed drawn
 by a RECORDING `std.Io`, the Ed25519 secret key, the AES key / HMAC key / IV, the
 AES encryption and decryption round keys and the pickle key; each set has a control
-needle. ReleaseFast only.
+needle. ReleaseFast only. It also probes `Ratchet.init` / `generate`,
+`cipher.deriveKeys`, and `encode` / `toBase64` / `decode` / `fromBase64` of both
+key types.
 
 Not covered: the long-lived sessions (`ratchet`, `signing_key` live in the
-`OutboundSession` / `InboundGroupSession` by design, zeroed by `deinit`);
-`cipher.deriveKeys` and `Ratchet.init` / `generate`, which return secrets by value
-and are the caller's frame to clean when called directly; `SessionKey.encode` /
-`toBase64` and the other encoders (their output is the secret); `pickle` /
-`pickleSealed` (probed clean as shipped, no new burn); the AES-CBC key schedule
-inside `aescbc` (sibling module, sits inside `decrypt`'s burn); the heap.
+`OutboundSession` / `InboundGroupSession` by design, zeroed by `deinit`); the
+`encode` output buffers and the `toBase64` / `Message.toBase64` strings (the
+caller's memory: the output IS the secret, the caller wipes it); `pickle` /
+`pickleSealed` (probed clean as shipped, no new burn); the by-value
+`pickle.decodeOutbound` / `decodeInbound` return (internal; only reachable
+inside the burned `fromPickle` bodies); the AES-CBC key schedule inside
+`aescbc` (sibling module, sits inside `decrypt`'s burn); the heap beyond the
+decoders' scratch.
 
 ## Backlog / deferred
 

@@ -202,7 +202,10 @@ pub fn decodeOutbound(bytes: []const u8) PickleError!OutboundSession {
         std.crypto.secureZero(u8, &kp.secret_key.bytes);
         return error.InconsistentState;
     }
-    return .{ .ratchet = Ratchet.init(data.*, counter), .signing_key = kp };
+    var s: OutboundSession = undefined;
+    Ratchet.init(data, counter, &s.ratchet);
+    s.signing_key = kp;
+    return s;
 }
 
 // ── inbound ──────────────────────────────────────────────────────────────
@@ -224,10 +227,12 @@ pub fn encodeInbound(s: *const InboundGroupSession, out: *[inbound_len]u8) void 
 pub fn decodeInbound(bytes: []const u8) PickleError!InboundGroupSession {
     try checkFrame(bytes, .inbound, inbound_len);
     var at: usize = header_len;
-    var initial = Ratchet.init(bytes[at + counter_len ..][0..ratchet_len].*, std.mem.readInt(u32, bytes[at..][0..counter_len], .big));
+    var initial: Ratchet = undefined;
+    Ratchet.init(bytes[at + counter_len ..][0..ratchet_len], std.mem.readInt(u32, bytes[at..][0..counter_len], .big), &initial);
     errdefer initial.secureZero();
     at += counter_len + ratchet_len;
-    var latest = Ratchet.init(bytes[at + counter_len ..][0..ratchet_len].*, std.mem.readInt(u32, bytes[at..][0..counter_len], .big));
+    var latest: Ratchet = undefined;
+    Ratchet.init(bytes[at + counter_len ..][0..ratchet_len], std.mem.readInt(u32, bytes[at..][0..counter_len], .big), &latest);
     errdefer latest.secureZero();
     at += counter_len + ratchet_len;
     const pk = Ed25519.PublicKey.fromBytes(bytes[at..][0..pk_len].*) catch return error.InvalidSigningKey;
@@ -641,7 +646,7 @@ const PickleCorpus = struct {
     fn build(self: *PickleCorpus, io: std.Io) []const []const u8 {
         // Fixed state so the guard below can pin what decodes.
         var out = OutboundSession{
-            .ratchet = Ratchet.init([_]u8{0x33} ** ratchet_len, 0x1ff),
+            .ratchet = shim.ratchetInit(&([_]u8{0x33} ** ratchet_len), 0x1ff),
             .signing_key = Ed25519.KeyPair.generateDeterministic([_]u8{0x11} ** seed_len) catch unreachable,
         };
         defer out.deinit();

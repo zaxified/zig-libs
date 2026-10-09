@@ -92,4 +92,5 @@ test {
     _ = ecdsa_recover;
     _ = bolt11;
     _ = bolt12;
+    _ = @import("stackprobe_test.zig");
 }

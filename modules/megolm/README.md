@@ -60,7 +60,8 @@ defer msg.deinit(allocator);
 const wire = try msg.toBase64(allocator); // send this + out.sessionId()
 
 // Recipient, after receiving `session_key_b64` over the secure channel:
-const key = try megolm.SessionKey.fromBase64(allocator, session_key_b64); // self-verifies its signature
+var key: megolm.SessionKey = undefined;
+try megolm.SessionKey.fromBase64(allocator, session_key_b64, &key); // self-verifies its signature
 var in: megolm.InboundGroupSession = undefined;
 try megolm.InboundGroupSession.fromSessionKey(&key, &in);
 defer in.deinit();
