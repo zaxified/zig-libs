@@ -3,8 +3,8 @@
 **Zstandard (RFC 8878) compressor** for every level — 1–22 and the negative
 ("fast") levels — emitting **exactly the bytes libzstd 1.5.7 emits** for the same input
 and level, and a **decoder** ported from libzstd's, one-shot and streaming (also as a
-`std.Io.Reader`): 1.0× its CPU cycles on the Silesia corpus at level 3 and
-0.95× at level 19 (SPEC.md, Z33/Z34), checksums verified,
+`std.Io.Reader`): 0.93–1.04× its CPU cycles on the Silesia corpus at levels
+3 and 19 (`zig build bench-zstd`, 2026-10-09; SPEC.md, Z33–Z35), checksums verified,
 concatenated and skippable frames, the frame size queries. std's `std.compress.zstd.Decompress` takes 30× libzstd's time,
 leaves checksum verification as a TODO panic and defaults to an 8 MB window.
 
@@ -63,7 +63,10 @@ libc.
   out by hand for one compressor boundary each: 2038 frames), and against
   libzstd at level 22 on 64–140 MB inputs and on a 4.4 GB input past the
   3500 MiB index limit.
-- **Speed:** within about 10 % of libzstd at every level, one-shot and
+- **Speed:** within about 5 % of libzstd at every level: on the Silesia
+  corpus 0.90–1.04× its CPU cycles compressing at levels 1, 3 and 19 and
+  decoding (`zig build bench-zstd`, 2026-10-09; x86-64 decoding runs
+  libzstd's assembly loops, Z35). Earlier, one-shot and
   streaming: 0.87–1.15× its CPU cycles (min of 3 runs on a pinned core,
   ReleaseFast, 3–12 MB text/CSV/ELF inputs, levels −5…19; the upper end on
   a loaded machine, 1.03–1.07× on a quieter one) and 0.95–1.15× its
