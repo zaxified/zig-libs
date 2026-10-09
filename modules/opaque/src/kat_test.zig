@@ -25,6 +25,7 @@
 const std = @import("std");
 const testing = std.testing;
 const opaque_pake = @import("root.zig");
+const shim = @import("test_shim.zig");
 const kat = @import("kat_vectors.zig");
 
 const vectors = [_]kat.RealVector{ kat.real_1, kat.real_2 };
@@ -36,10 +37,10 @@ fn identitiesOf(v: kat.RealVector) opaque_pake.Identities {
 /// Runs the vector's registration flow and returns the record + export
 /// key (asserting every published output on the way).
 fn registerFromVector(v: kat.RealVector) !opaque_pake.FinalizeRegistrationResult {
-    const request = try opaque_pake.createRegistrationRequest(v.password, v.blind_registration);
+    const request = try shim.createRegistrationRequest(v.password, v.blind_registration);
     try testing.expectEqualSlices(u8, &v.registration_request, &request.toBytes());
 
-    const response = try opaque_pake.createRegistrationResponse(
+    const response = try shim.createRegistrationResponse(
         request,
         v.server_public_key,
         v.credential_identifier,
@@ -47,7 +48,7 @@ fn registerFromVector(v: kat.RealVector) !opaque_pake.FinalizeRegistrationResult
     );
     try testing.expectEqualSlices(u8, &v.registration_response, &response.toBytes());
 
-    const finalized = try opaque_pake.finalizeRegistrationRequest(
+    const finalized = try shim.finalizeRegistrationRequest(
         v.password,
         v.blind_registration,
         response,
@@ -80,7 +81,7 @@ test "login: KE1, KE2, KE3, session_key, export_key match C.1.1 + C.1.2 on both 
     for (vectors) |v| {
         const record = opaque_pake.RegistrationRecord.fromBytes(v.registration_upload);
 
-        const client = try opaque_pake.generateKE1(
+        const client = try shim.generateKE1(
             v.password,
             v.blind_login,
             v.client_nonce,
@@ -88,7 +89,7 @@ test "login: KE1, KE2, KE3, session_key, export_key match C.1.1 + C.1.2 on both 
         );
         try testing.expectEqualSlices(u8, &v.ke1, &client.ke1.toBytes());
 
-        const server = try opaque_pake.generateKE2(
+        const server = try shim.generateKE2(
             v.server_private_key,
             v.server_public_key,
             record,
@@ -103,14 +104,14 @@ test "login: KE1, KE2, KE3, session_key, export_key match C.1.1 + C.1.2 on both 
         );
         try testing.expectEqualSlices(u8, &v.ke2, &server.ke2.toBytes());
 
-        const finished = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
+        const finished = try shim.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
         try testing.expectEqualSlices(u8, &v.ke3, &finished.ke3.toBytes());
         // (3) client-side outputs match the vector...
         try testing.expectEqualSlices(u8, &v.session_key, &finished.session_key);
         try testing.expectEqualSlices(u8, &v.export_key, &finished.export_key);
 
         // ...and the server independently derives the SAME session_key.
-        const server_session_key = try opaque_pake.serverFinish(server.state, finished.ke3);
+        const server_session_key = try shim.serverFinish(server.state, finished.ke3);
         try testing.expectEqualSlices(u8, &v.session_key, &server_session_key);
         try testing.expectEqualSlices(u8, &finished.session_key, &server_session_key);
     }
@@ -121,8 +122,8 @@ test "login: KE1, KE2, KE3, session_key, export_key match C.1.1 + C.1.2 on both 
 test "tampered KE2 server_mac fails closed on the client (ServerAuthentication)" {
     const v = kat.real_1;
     const record = opaque_pake.RegistrationRecord.fromBytes(v.registration_upload);
-    const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
-    const server = try opaque_pake.generateKE2(
+    const client = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    const server = try shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         record,
@@ -139,15 +140,15 @@ test "tampered KE2 server_mac fails closed on the client (ServerAuthentication)"
     tampered.auth_response.server_mac[0] ^= 0x01;
     try testing.expectError(
         error.ServerAuthentication,
-        opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, tampered, .identity),
+        shim.generateKE3(client.state, identitiesOf(v), v.context, tampered, .identity),
     );
 }
 
 test "tampered KE3 client_mac fails closed on the server (ClientAuthentication)" {
     const v = kat.real_1;
     const record = opaque_pake.RegistrationRecord.fromBytes(v.registration_upload);
-    const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
-    const server = try opaque_pake.generateKE2(
+    const client = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    const server = try shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         record,
@@ -160,22 +161,22 @@ test "tampered KE3 client_mac fails closed on the server (ClientAuthentication)"
         v.server_nonce,
         v.server_keyshare_seed,
     );
-    const finished = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
+    const finished = try shim.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
     var tampered = finished.ke3;
     tampered.client_mac[tampered.client_mac.len - 1] ^= 0x80;
-    try testing.expectError(error.ClientAuthentication, opaque_pake.serverFinish(server.state, tampered));
+    try testing.expectError(error.ClientAuthentication, shim.serverFinish(server.state, tampered));
 }
 
 test "wrong password fails closed on the client (EnvelopeRecovery)" {
     const v = kat.real_1;
     const record = opaque_pake.RegistrationRecord.fromBytes(v.registration_upload);
-    const client = try opaque_pake.generateKE1(
+    const client = try shim.generateKE1(
         "definitely not the password",
         v.blind_login,
         v.client_nonce,
         v.client_keyshare_seed,
     );
-    const server = try opaque_pake.generateKE2(
+    const server = try shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         record,
@@ -190,7 +191,7 @@ test "wrong password fails closed on the client (EnvelopeRecovery)" {
     );
     try testing.expectError(
         error.EnvelopeRecovery,
-        opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity),
+        shim.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity),
     );
 }
 
@@ -200,8 +201,8 @@ test "mismatched identities fail closed on the client (EnvelopeRecovery)" {
     const v = kat.real_1;
     const record = opaque_pake.RegistrationRecord.fromBytes(v.registration_upload);
     const wrong_identities = opaque_pake.Identities{ .client = "mallory", .server = null };
-    const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
-    const server = try opaque_pake.generateKE2(
+    const client = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    const server = try shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         record,
@@ -216,7 +217,7 @@ test "mismatched identities fail closed on the client (EnvelopeRecovery)" {
     );
     try testing.expectError(
         error.EnvelopeRecovery,
-        opaque_pake.generateKE3(client.state, wrong_identities, v.context, server.ke2, .identity),
+        shim.generateKE3(client.state, wrong_identities, v.context, server.ke2, .identity),
     );
 }
 
@@ -230,11 +231,11 @@ test "identity-element client_public_keyshare in KE1 is rejected (InvalidPublicK
     // keyshare, so this path was previously unexercised.
     const v = kat.real_1;
     const record = opaque_pake.RegistrationRecord.fromBytes(v.registration_upload);
-    const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    const client = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
     var poisoned_ke1 = client.ke1;
     poisoned_ke1.auth_request.client_public_keyshare = [_]u8{0} ** opaque_pake.Npk; // identity element
 
-    try testing.expectError(error.InvalidPublicKey, opaque_pake.generateKE2(
+    try testing.expectError(error.InvalidPublicKey, shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         record,
@@ -255,8 +256,8 @@ test "identity-element server_public_keyshare in KE2 is rejected (InvalidPublicK
     // than deriving a degenerate DH1/DH3 shared secret from it.
     const v = kat.real_1;
     const record = opaque_pake.RegistrationRecord.fromBytes(v.registration_upload);
-    const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
-    const server = try opaque_pake.generateKE2(
+    const client = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    const server = try shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         record,
@@ -274,7 +275,7 @@ test "identity-element server_public_keyshare in KE2 is rejected (InvalidPublicK
 
     try testing.expectError(
         error.InvalidPublicKey,
-        opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, poisoned_ke2, .identity),
+        shim.generateKE3(client.state, identitiesOf(v), v.context, poisoned_ke2, .identity),
     );
 }
 
@@ -286,12 +287,12 @@ test "fresh end-to-end registration + login agree on session_key and export_key"
     // these fresh from a CSPRNG).
     var wide: [64]u8 = undefined;
     for (&wide, 0..) |*b, i| b.* = @truncate(i *% 101 +% 7);
-    const blind_reg = opaque_pake.scalarFromWideBytes(wide);
+    const blind_reg = shim.scalarFromWideBytes(wide);
     for (&wide, 0..) |*b, i| b.* = @truncate(i *% 59 +% 3);
-    const blind_login = opaque_pake.scalarFromWideBytes(wide);
+    const blind_login = shim.scalarFromWideBytes(wide);
 
     const server_key_seed = [_]u8{0xa7} ** 32;
-    const server_keys = try opaque_pake.deriveAkeKeyPair(server_key_seed);
+    const server_keys = try shim.deriveAkeKeyPair(server_key_seed);
     const oprf_seed = [_]u8{0x5c} ** 64;
     const credential_identifier = "user-42";
     const password = "hunter2, but longer";
@@ -299,14 +300,14 @@ test "fresh end-to-end registration + login agree on session_key and export_key"
     const context = "zig-libs opaque test";
 
     // Registration.
-    const request = try opaque_pake.createRegistrationRequest(password, blind_reg);
-    const response = try opaque_pake.createRegistrationResponse(
+    const request = try shim.createRegistrationRequest(password, blind_reg);
+    const response = try shim.createRegistrationResponse(
         request,
         server_keys.public_key,
         credential_identifier,
         oprf_seed,
     );
-    const registered = try opaque_pake.finalizeRegistrationRequest(
+    const registered = try shim.finalizeRegistrationRequest(
         password,
         blind_reg,
         response,
@@ -316,13 +317,13 @@ test "fresh end-to-end registration + login agree on session_key and export_key"
     );
 
     // Login.
-    const client = try opaque_pake.generateKE1(
+    const client = try shim.generateKE1(
         password,
         blind_login,
         [_]u8{0x22} ** 32, // client_nonce
         [_]u8{0x33} ** 32, // client_keyshare_seed
     );
-    const server = try opaque_pake.generateKE2(
+    const server = try shim.generateKE2(
         server_keys.private_key,
         server_keys.public_key,
         registered.record,
@@ -335,8 +336,8 @@ test "fresh end-to-end registration + login agree on session_key and export_key"
         [_]u8{0x55} ** 32, // server_nonce
         [_]u8{0x66} ** 32, // server_keyshare_seed
     );
-    const finished = try opaque_pake.generateKE3(client.state, identities, context, server.ke2, .identity);
-    const server_session_key = try opaque_pake.serverFinish(server.state, finished.ke3);
+    const finished = try shim.generateKE3(client.state, identities, context, server.ke2, .identity);
+    const server_session_key = try shim.serverFinish(server.state, finished.ke3);
 
     // Both sides agree on the session key; the login-recovered
     // export_key equals the registration-time export_key.
@@ -397,25 +398,25 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
 
     var wide: [64]u8 = undefined;
     for (&wide, 0..) |*b, i| b.* = @truncate(i *% 101 +% 7);
-    const blind_reg = opaque_pake.scalarFromWideBytes(wide);
+    const blind_reg = shim.scalarFromWideBytes(wide);
     for (&wide, 0..) |*b, i| b.* = @truncate(i *% 59 +% 3);
-    const blind_login = opaque_pake.scalarFromWideBytes(wide);
+    const blind_login = shim.scalarFromWideBytes(wide);
     const server_key_seed = [_]u8{0xa7} ** 32;
-    const server_keys = try opaque_pake.deriveAkeKeyPair(server_key_seed);
+    const server_keys = try shim.deriveAkeKeyPair(server_key_seed);
     const oprf_seed = [_]u8{0x5c} ** 64;
     const credential_identifier = "user-42";
     const password = "hunter2, but longer";
     const identities = opaque_pake.Identities{ .client = "user-42", .server = "example.com" };
     const context = "zig-libs opaque test";
 
-    const request = try opaque_pake.createRegistrationRequest(password, blind_reg);
-    const response = try opaque_pake.createRegistrationResponse(
+    const request = try shim.createRegistrationRequest(password, blind_reg);
+    const response = try shim.createRegistrationResponse(
         request,
         server_keys.public_key,
         credential_identifier,
         oprf_seed,
     );
-    const registered = try opaque_pake.finalizeRegistrationRequest(
+    const registered = try shim.finalizeRegistrationRequest(
         password,
         blind_reg,
         response,
@@ -424,13 +425,13 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
         argon2.ksf(),
     );
 
-    const client = try opaque_pake.generateKE1(
+    const client = try shim.generateKE1(
         password,
         blind_login,
         [_]u8{0x22} ** 32,
         [_]u8{0x33} ** 32,
     );
-    const server = try opaque_pake.generateKE2(
+    const server = try shim.generateKE2(
         server_keys.private_key,
         server_keys.public_key,
         registered.record,
@@ -444,8 +445,8 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
         [_]u8{0x66} ** 32,
     );
     // Matching Argon2id on both sides: still a normal, successful login.
-    const finished = try opaque_pake.generateKE3(client.state, identities, context, server.ke2, argon2.ksf());
-    const server_session_key = try opaque_pake.serverFinish(server.state, finished.ke3);
+    const finished = try shim.generateKE3(client.state, identities, context, server.ke2, argon2.ksf());
+    const server_session_key = try shim.serverFinish(server.state, finished.ke3);
     try testing.expectEqualSlices(u8, &finished.session_key, &server_session_key);
     try testing.expectEqualSlices(u8, &registered.export_key, &finished.export_key);
 
@@ -458,8 +459,8 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
     // A mismatched KSF between registration and login is exactly as fatal
     // as a wrong password (`randomized_password` differs either way) --
     // fails closed via the existing envelope MAC, not a new failure mode.
-    const wrong_client = try opaque_pake.generateKE1(password, blind_login, [_]u8{0x22} ** 32, [_]u8{0x33} ** 32);
-    const wrong_server = try opaque_pake.generateKE2(
+    const wrong_client = try shim.generateKE1(password, blind_login, [_]u8{0x22} ** 32, [_]u8{0x33} ** 32);
+    const wrong_server = try shim.generateKE2(
         server_keys.private_key,
         server_keys.public_key,
         registered.record,
@@ -474,7 +475,7 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
     );
     try testing.expectError(
         error.EnvelopeRecovery,
-        opaque_pake.generateKE3(wrong_client.state, identities, context, wrong_server.ke2, .identity), // .identity, not argon2
+        shim.generateKE3(wrong_client.state, identities, context, wrong_server.ke2, .identity), // .identity, not argon2
     );
 }
 
@@ -491,17 +492,17 @@ test "M6: a failing KSF propagates error.KsfFailed, not silently swallowed or pa
 
     var wide: [64]u8 = undefined;
     for (&wide, 0..) |*b, i| b.* = @truncate(i *% 101 +% 7);
-    const blind_reg = opaque_pake.scalarFromWideBytes(wide);
+    const blind_reg = shim.scalarFromWideBytes(wide);
     const server_key_seed = [_]u8{0xa7} ** 32;
-    const server_keys = try opaque_pake.deriveAkeKeyPair(server_key_seed);
+    const server_keys = try shim.deriveAkeKeyPair(server_key_seed);
     const oprf_seed = [_]u8{0x5c} ** 64;
     const identities = opaque_pake.Identities{ .client = "user-42", .server = "example.com" };
 
-    const request = try opaque_pake.createRegistrationRequest("hunter2", blind_reg);
-    const response = try opaque_pake.createRegistrationResponse(request, server_keys.public_key, "user-42", oprf_seed);
+    const request = try shim.createRegistrationRequest("hunter2", blind_reg);
+    const response = try shim.createRegistrationResponse(request, server_keys.public_key, "user-42", oprf_seed);
     try testing.expectError(
         error.KsfFailed,
-        opaque_pake.finalizeRegistrationRequest(
+        shim.finalizeRegistrationRequest(
             "hunter2",
             blind_reg,
             response,
@@ -539,8 +540,8 @@ test "H1: every byte of the envelope auth_tag is checked, not just some" {
         var tampered_record = base.record;
         tampered_record.envelope.auth_tag[i] ^= 0x01;
 
-        const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
-        const server = try opaque_pake.generateKE2(
+        const client = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+        const server = try shim.generateKE2(
             v.server_private_key,
             v.server_public_key,
             tampered_record,
@@ -555,12 +556,12 @@ test "H1: every byte of the envelope auth_tag is checked, not just some" {
         );
         try testing.expectError(
             error.EnvelopeRecovery,
-            opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity),
+            shim.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity),
         );
     }
     // Positive control: the untampered record still logs in.
-    const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
-    const server = try opaque_pake.generateKE2(
+    const client = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    const server = try shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         base.record,
@@ -573,14 +574,14 @@ test "H1: every byte of the envelope auth_tag is checked, not just some" {
         v.server_nonce,
         v.server_keyshare_seed,
     );
-    _ = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
+    _ = try shim.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
 }
 
 test "H1: every byte of KE2's server_mac is checked, not just byte 0" {
     const v = kat.real_1;
     const base = try registerFromVector(v);
-    const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
-    const server = try opaque_pake.generateKE2(
+    const client = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    const server = try shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         base.record,
@@ -599,18 +600,18 @@ test "H1: every byte of KE2's server_mac is checked, not just byte 0" {
         tampered.auth_response.server_mac[i] ^= 0x01;
         try testing.expectError(
             error.ServerAuthentication,
-            opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, tampered, .identity),
+            shim.generateKE3(client.state, identitiesOf(v), v.context, tampered, .identity),
         );
     }
     // Positive control: the untampered KE2 still completes.
-    _ = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
+    _ = try shim.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
 }
 
 test "H1: every byte of KE3's client_mac is checked, not just the last byte" {
     const v = kat.real_1;
     const base = try registerFromVector(v);
-    const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
-    const server = try opaque_pake.generateKE2(
+    const client = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    const server = try shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         base.record,
@@ -623,15 +624,15 @@ test "H1: every byte of KE3's client_mac is checked, not just the last byte" {
         v.server_nonce,
         v.server_keyshare_seed,
     );
-    const finished = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
+    const finished = try shim.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
     var i: usize = 0;
     while (i < opaque_pake.Nm) : (i += 1) {
         var tampered = finished.ke3;
         tampered.client_mac[i] ^= 0x01;
-        try testing.expectError(error.ClientAuthentication, opaque_pake.serverFinish(server.state, tampered));
+        try testing.expectError(error.ClientAuthentication, shim.serverFinish(server.state, tampered));
     }
     // Positive control: the untampered KE3 still completes.
-    _ = try opaque_pake.serverFinish(server.state, finished.ke3);
+    _ = try shim.serverFinish(server.state, finished.ke3);
 }
 
 // ── (7) RFC 9807 Appendix C.2.1 -- the FAKE (unregistered-user) vector ───
@@ -680,7 +681,7 @@ test "RFC 9807 C.2.1 fake credential response reproduces KE2 byte-exact" {
         .envelope = opaque_pake.Envelope.fromBytes([_]u8{0} ** opaque_pake.Envelope.encoded_length),
     };
     const ke1_msg = opaque_pake.KE1.fromBytes(ke1);
-    const res = try opaque_pake.generateKE2(
+    const res = try shim.generateKE2(
         server_private_key,
         server_public_key,
         record,
@@ -712,7 +713,7 @@ test "M2: an identity/context past 0xffff bytes is a typed error, not a panic or
 
     try testing.expectError(
         error.IdentityTooLong,
-        opaque_pake.finalizeRegistrationRequest(
+        shim.finalizeRegistrationRequest(
             v.password,
             v.blind_registration,
             opaque_pake.RegistrationResponse.fromBytes(v.registration_response),
@@ -723,10 +724,10 @@ test "M2: an identity/context past 0xffff bytes is a typed error, not a panic or
     );
 
     const record = opaque_pake.RegistrationRecord.fromBytes(v.registration_upload);
-    const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    const client = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
     try testing.expectError(
         error.IdentityTooLong,
-        opaque_pake.generateKE2(
+        shim.generateKE2(
             v.server_private_key,
             v.server_public_key,
             record,
@@ -742,7 +743,7 @@ test "M2: an identity/context past 0xffff bytes is a typed error, not a panic or
     );
     try testing.expectError(
         error.IdentityTooLong,
-        opaque_pake.generateKE2(
+        shim.generateKE2(
             v.server_private_key,
             v.server_public_key,
             record,
@@ -758,7 +759,7 @@ test "M2: an identity/context past 0xffff bytes is a typed error, not a panic or
     );
 
     // Positive control: an ordinary vector-sized identity/context is fine.
-    _ = try opaque_pake.generateKE2(
+    _ = try shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         record,

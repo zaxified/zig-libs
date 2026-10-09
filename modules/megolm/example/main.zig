@@ -43,8 +43,10 @@ pub fn main() !void {
     defer outbound.deinit();
 
     // ── session setup: share the key with the room ────────────────────
-    const shared_key = try outbound.sessionKey();
-    var inbound = try megolm.InboundGroupSession.fromSessionKey(shared_key);
+    var shared_key: megolm.SessionKey = undefined;
+    try outbound.sessionKey(&shared_key);
+    var inbound: megolm.InboundGroupSession = undefined;
+    try megolm.InboundGroupSession.fromSessionKey(&shared_key, &inbound);
     defer inbound.deinit();
     std.debug.print("first_known_index: {d}\n", .{inbound.firstKnownIndex()});
 
@@ -64,8 +66,10 @@ pub fn main() !void {
     // at when they're given the key (index 2, after two encrypts) — but
     // can still decrypt everything sent AFTER that point, fast-forwarding
     // from their own starting state without replaying key-by-key.
-    const late_key = try outbound.sessionKey();
-    var late_inbound = try megolm.InboundGroupSession.fromSessionKey(late_key);
+    var late_key: megolm.SessionKey = undefined;
+    try outbound.sessionKey(&late_key);
+    var late_inbound: megolm.InboundGroupSession = undefined;
+    try megolm.InboundGroupSession.fromSessionKey(&late_key, &late_inbound);
     defer late_inbound.deinit();
 
     var msg2 = try outbound.encrypt(gpa, "message the late joiner CAN see");
@@ -92,7 +96,8 @@ pub fn main() !void {
     var tampered = try outbound.encrypt(gpa, "trip the alarm");
     defer tampered.deinit(gpa);
     tampered.ciphertext[0] ^= 0xff;
-    var tamper_target = try megolm.InboundGroupSession.fromSessionKey(late_key);
+    var tamper_target: megolm.InboundGroupSession = undefined;
+    try megolm.InboundGroupSession.fromSessionKey(&late_key, &tamper_target);
     defer tamper_target.deinit();
     if (tamper_target.decrypt(gpa, &tampered)) |bad| {
         var b = bad;

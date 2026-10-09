@@ -48,6 +48,7 @@
 //! reactive "we already forgot that state" outcome at the session level).
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const entropy = @import("entropy");
 const ratchet_mod = @import("ratchet.zig");
 const cipher_mod = @import("cipher.zig");
@@ -84,8 +85,15 @@ pub const OutboundSession = struct {
     ratchet: Ratchet,
     signing_key: Ed25519.KeyPair,
 
-    pub fn init(io: std.Io) OutboundSession {
-        return .{
+    ///
+    /// The session goes through `out`, not a return value; the stack the draw
+    /// used is burned before the call returns.
+    pub fn init(io: std.Io, out: *OutboundSession) void {
+        burn.run(burn.session_burn, void, initBody, .{ io, out });
+    }
+
+    fn initBody(io: std.Io, out: *OutboundSession) void {
+        out.* = .{
             // Fail-closed already — see `Ratchet.generate`.
             .ratchet = Ratchet.generate(io),
             // The other half of the same session, and it had been left on
@@ -117,7 +125,14 @@ pub const OutboundSession = struct {
     /// The signed session-sharing format at the CURRENT ratchet index —
     /// what gets sent to other participants so they can build an
     /// `InboundGroupSession`.
-    pub fn sessionKey(self: *const OutboundSession) !SessionKey {
+    ///
+    /// The key (it carries the ratchet) goes through `out`, written only on
+    /// success.
+    pub fn sessionKey(self: *const OutboundSession, out: *SessionKey) !void {
+        return burn.runInferred(burn.session_burn, sessionKeyBody, .{ self, out });
+    }
+
+    fn sessionKeyBody(self: *const OutboundSession, out: *SessionKey) !void {
         const inner = ExportedSessionKey{
             .ratchet_index = self.ratchet.counter,
             .ratchet = self.ratchet.data,
@@ -126,7 +141,7 @@ pub const OutboundSession = struct {
         var signed_part: [session_key_mod.signed_part_len]u8 = undefined;
         inner.encodeSignedPart(session_key_mod.share_version, &signed_part);
         const sig = try self.signing_key.sign(&signed_part, null);
-        return .{ .inner = inner, .signature = sig.toBytes() };
+        out.* = .{ .inner = inner, .signature = sig.toBytes() };
     }
 
     /// Encrypt `plaintext` at the current index, sign, then advance the
@@ -134,6 +149,10 @@ pub const OutboundSession = struct {
     /// ratchet is advanced"). Caller owns the returned `Message`
     /// (`msg.deinit(allocator)`).
     pub fn encrypt(self: *OutboundSession, allocator: std.mem.Allocator, plaintext: []const u8) !Message {
+        return burn.runInferred(burn.session_burn, encryptBody, .{ self, allocator, plaintext });
+    }
+
+    fn encryptBody(self: *OutboundSession, allocator: std.mem.Allocator, plaintext: []const u8) !Message {
         var keys = cipher_mod.deriveKeys(&self.ratchet.data);
         defer keys.deinit();
 
@@ -178,14 +197,24 @@ pub const OutboundSession = struct {
 
     /// Restore a session from `pickle`'s output. Strict: exact length, no
     /// trailing bytes, and the stored public key must match the seed.
-    pub fn fromPickle(bytes: []const u8) pickle_mod.PickleError!OutboundSession {
-        return pickle_mod.decodeOutbound(bytes);
+    ///
+    /// The session goes through `out`, written only on success.
+    pub fn fromPickle(bytes: []const u8, out: *OutboundSession) pickle_mod.PickleError!void {
+        return burn.run(burn.session_burn, pickle_mod.PickleError!void, fromPickleBody, .{ bytes, out });
+    }
+
+    fn fromPickleBody(bytes: []const u8, out: *OutboundSession) pickle_mod.PickleError!void {
+        out.* = try pickle_mod.decodeOutbound(bytes);
     }
 
     /// Restore a session from `pickleSealed`'s output; a wrong key or any
     /// altered byte is `error.AuthenticationFailed`.
-    pub fn fromSealedPickle(bytes: []const u8, key: *const pickle_mod.PickleKey) pickle_mod.PickleError!OutboundSession {
-        return pickle_mod.openOutbound(bytes, key);
+    pub fn fromSealedPickle(bytes: []const u8, key: *const pickle_mod.PickleKey, out: *OutboundSession) pickle_mod.PickleError!void {
+        return burn.run(burn.decrypt_burn, pickle_mod.PickleError!void, fromSealedPickleBody, .{ bytes, key, out });
+    }
+
+    fn fromSealedPickleBody(bytes: []const u8, key: *const pickle_mod.PickleKey, out: *OutboundSession) pickle_mod.PickleError!void {
+        out.* = try pickle_mod.openOutbound(bytes, key);
     }
 };
 
@@ -224,20 +253,31 @@ pub const InboundGroupSession = struct {
     /// does — mirrors vodozemac's identical distinction).
     signing_key_verified: bool,
 
-    pub fn fromSessionKey(key: SessionKey) !InboundGroupSession {
+    ///
+    /// `key` by pointer and the session through `out`, written only on
+    /// success; stack burned before return.
+    pub fn fromSessionKey(key: *const SessionKey, out: *InboundGroupSession) !void {
+        return burn.runInferred(burn.session_burn, fromSessionKeyBody, .{ key, out });
+    }
+
+    fn fromSessionKeyBody(key: *const SessionKey, out: *InboundGroupSession) !void {
         const pk = try Ed25519.PublicKey.fromBytes(key.inner.signing_key);
         const r = Ratchet.init(key.inner.ratchet, key.inner.ratchet_index);
-        return .{ .initial_ratchet = r, .latest_ratchet = r, .signing_key = pk, .signing_key_verified = true };
+        out.* = .{ .initial_ratchet = r, .latest_ratchet = r, .signing_key = pk, .signing_key_verified = true };
     }
 
     /// **Caution**: an `ExportedSessionKey` carries no signature (see
     /// session_key.zig's module doc comment) — authenticating the
     /// embedded `signing_key` is entirely this caller's responsibility if
     /// it matters for the caller's threat model.
-    pub fn fromExportedKey(key: ExportedSessionKey) !InboundGroupSession {
+    pub fn fromExportedKey(key: *const ExportedSessionKey, out: *InboundGroupSession) !void {
+        return burn.runInferred(burn.session_burn, fromExportedKeyBody, .{ key, out });
+    }
+
+    fn fromExportedKeyBody(key: *const ExportedSessionKey, out: *InboundGroupSession) !void {
         const pk = try Ed25519.PublicKey.fromBytes(key.signing_key);
         const r = Ratchet.init(key.ratchet, key.ratchet_index);
-        return .{ .initial_ratchet = r, .latest_ratchet = r, .signing_key = pk, .signing_key_verified = false };
+        out.* = .{ .initial_ratchet = r, .latest_ratchet = r, .signing_key = pk, .signing_key_verified = false };
     }
 
     pub fn deinit(self: *InboundGroupSession) void {
@@ -293,6 +333,10 @@ pub const InboundGroupSession = struct {
     /// `fromExportedKey` must check `signing_key_verified` itself before
     /// trusting the result; this function will not do it for them.
     pub fn decrypt(self: *InboundGroupSession, allocator: std.mem.Allocator, msg: *const Message) DecryptError!DecryptedMessage {
+        return burn.run(burn.decrypt_burn, DecryptError!DecryptedMessage, decryptBody, .{ self, allocator, msg });
+    }
+
+    fn decryptBody(self: *InboundGroupSession, allocator: std.mem.Allocator, msg: *const Message) DecryptError!DecryptedMessage {
         const sig_bytes = try msg.signatureBytes(allocator);
         defer allocator.free(sig_bytes);
         const sig = Ed25519.Signature.fromBytes(msg.signature);
@@ -319,6 +363,10 @@ pub const InboundGroupSession = struct {
     /// stored ratchet values"). Returns `false` (no-op) if `index` is not
     /// past the current `firstKnownIndex()`.
     pub fn forgetBefore(self: *InboundGroupSession, index: u32) bool {
+        return burn.run(burn.advance_burn, bool, forgetBeforeBody, .{ self, index });
+    }
+
+    fn forgetBeforeBody(self: *InboundGroupSession, index: u32) bool {
         if (self.initial_ratchet.counter >= index) return false;
         self.initial_ratchet.advanceTo(index) catch unreachable; // always forward here
         if (self.latest_ratchet.counter < index) self.latest_ratchet = self.initial_ratchet;
@@ -328,9 +376,17 @@ pub const InboundGroupSession = struct {
     /// Export the ratchet state at `index` (must be `>= firstKnownIndex()`)
     /// as an `ExportedSessionKey` — e.g. to hand a less-trusted party the
     /// ability to decrypt from `index` onward but not before.
-    pub fn exportAt(self: *InboundGroupSession, index: u32) ?ExportedSessionKey {
-        const r = self.findRatchet(index) orelse return null;
-        return .{ .ratchet_index = r.counter, .ratchet = r.data, .signing_key = self.signing_key.toBytes() };
+    ///
+    /// Returns whether `index` was reachable; the exported key (it carries the
+    /// ratchet) goes through `out`, written only when it was.
+    pub fn exportAt(self: *InboundGroupSession, index: u32, out: *ExportedSessionKey) bool {
+        return burn.run(burn.advance_burn, bool, exportAtBody, .{ self, index, out });
+    }
+
+    fn exportAtBody(self: *InboundGroupSession, index: u32, out: *ExportedSessionKey) bool {
+        const r = self.findRatchet(index) orelse return false;
+        out.* = .{ .ratchet_index = r.counter, .ratchet = r.data, .signing_key = self.signing_key.toBytes() };
+        return true;
     }
 
     /// Serialise the whole session — first-known ratchet, the fast-forward
@@ -351,14 +407,24 @@ pub const InboundGroupSession = struct {
     /// Restore a session from `pickle`'s output. Strict: exact length, no
     /// trailing bytes, reserved flag bits zero, and the cached ratchet must
     /// be the first-known one fast-forwarded (else `error.InconsistentState`).
-    pub fn fromPickle(bytes: []const u8) pickle_mod.PickleError!InboundGroupSession {
-        return pickle_mod.decodeInbound(bytes);
+    ///
+    /// The session goes through `out`, written only on success.
+    pub fn fromPickle(bytes: []const u8, out: *InboundGroupSession) pickle_mod.PickleError!void {
+        return burn.run(burn.session_burn, pickle_mod.PickleError!void, fromPickleBody, .{ bytes, out });
+    }
+
+    fn fromPickleBody(bytes: []const u8, out: *InboundGroupSession) pickle_mod.PickleError!void {
+        out.* = try pickle_mod.decodeInbound(bytes);
     }
 
     /// Restore a session from `pickleSealed`'s output; a wrong key or any
     /// altered byte is `error.AuthenticationFailed`.
-    pub fn fromSealedPickle(bytes: []const u8, key: *const pickle_mod.PickleKey) pickle_mod.PickleError!InboundGroupSession {
-        return pickle_mod.openInbound(bytes, key);
+    pub fn fromSealedPickle(bytes: []const u8, key: *const pickle_mod.PickleKey, out: *InboundGroupSession) pickle_mod.PickleError!void {
+        return burn.run(burn.decrypt_burn, pickle_mod.PickleError!void, fromSealedPickleBody, .{ bytes, key, out });
+    }
+
+    fn fromSealedPickleBody(bytes: []const u8, key: *const pickle_mod.PickleKey, out: *InboundGroupSession) pickle_mod.PickleError!void {
+        out.* = try pickle_mod.openInbound(bytes, key);
     }
 };
 
@@ -381,14 +447,16 @@ fn testIo() std.Io.Threaded {
     return std.Io.Threaded.init(testing.allocator, .{});
 }
 
+const shim = @import("test_shim.zig");
+
 test "outbound encrypt -> inbound decrypt round-trip, several messages" {
     var threaded = testIo();
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
 
     const plaintexts = [_][]const u8{ "hello", "megolm group ratchet", "", "the quick brown fox jumps over the lazy dog, twice, to cross a block boundary reliably" };
@@ -438,9 +506,9 @@ test "RNG seam: OutboundSession.init really draws entropy for both the ratchet a
     // same reasoning applies to the 32-byte signing-key seed asserted right
     // under it, not separately measured but drawn into one buffer the same
     // way.
-    var out1 = OutboundSession.init(io);
+    var out1 = shim.outboundInit(io);
     defer out1.deinit();
-    var out2 = OutboundSession.init(io);
+    var out2 = shim.outboundInit(io);
     defer out2.deinit();
     try testing.expect(!std.mem.eql(u8, &out1.ratchet.data, &out2.ratchet.data));
     try testing.expect(!std.mem.eql(
@@ -453,7 +521,7 @@ test "RNG seam: OutboundSession.init really draws entropy for both the ratchet a
     // encrypt under the freshly drawn session and decrypt on the other
     // side, which also exercises the freshly drawn signing key (the
     // session-sharing blob and the message frame are both signed with it).
-    var in = try InboundGroupSession.fromSessionKey(try out1.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out1));
     defer in.deinit();
     var msg = try out1.encrypt(testing.allocator, "entropy seam round-trip");
     defer msg.deinit(testing.allocator);
@@ -467,9 +535,9 @@ test "out-of-order delivery: inbound session fast-forwards correctly" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
 
     var msg0 = try out.encrypt(testing.allocator, "first");
@@ -499,7 +567,7 @@ test "session sharing at a nonzero index: recipient cannot decrypt earlier messa
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
 
     var early = try out.encrypt(testing.allocator, "before sharing");
@@ -508,7 +576,7 @@ test "session sharing at a nonzero index: recipient cannot decrypt earlier messa
     defer late.deinit(testing.allocator);
 
     // Share the session key only NOW (index 2).
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
     try testing.expectEqual(@as(u32, 2), in.firstKnownIndex());
 
@@ -527,9 +595,9 @@ test "exportAt then import: imported session can't decrypt what was forgotten" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
 
     var first = try out.encrypt(testing.allocator, "first secret");
@@ -540,8 +608,8 @@ test "exportAt then import: imported session can't decrypt what was forgotten" {
     var d = try in.decrypt(testing.allocator, &first);
     d.deinit(testing.allocator);
 
-    const exported = in.exportAt(1) orelse return error.TestUnexpectedResult;
-    var imported = try InboundGroupSession.fromExportedKey(exported);
+    const exported = shim.exportAt(&in, 1) orelse return error.TestUnexpectedResult;
+    var imported = try shim.fromExportedKey(exported);
     defer imported.deinit();
     try testing.expect(!imported.signing_key_verified);
 
@@ -564,9 +632,9 @@ test "forgetBefore: an index below the new floor is MessageIndexTooOld after the
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
 
     var m0 = try out.encrypt(testing.allocator, "zero");
@@ -604,9 +672,9 @@ test "tampered ciphertext byte is rejected as an invalid signature" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
 
     var msg = try out.encrypt(testing.allocator, "authentic message");
@@ -625,9 +693,9 @@ test "tampered signature byte is rejected" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
 
     var msg = try out.encrypt(testing.allocator, "authentic message");

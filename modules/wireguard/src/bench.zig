@@ -170,7 +170,8 @@ test "bench (opt-in via WIREGUARD_BENCH)" {
     //    in; the AEAD-only lines above are its lower bound. Still no socket
     //    and no routing table. ──
     {
-        var s = transport.SendSession.init(key, 0xDEADBEEF, bench_now_s);
+        var s: transport.SendSession = undefined;
+        s.init(&key, 0xDEADBEEF, bench_now_s);
         var t0 = nowNs();
         for (0..iters) |_| {
             const r = s.seal(&sealed_scratch, &packet, bench_now_s) catch unreachable;
@@ -182,11 +183,13 @@ test "bench (opt-in via WIREGUARD_BENCH)" {
         // Open needs distinct counters (a replay is rejected by design), so
         // pre-seal a small ring and reset the receiver once per lap. The
         // reset is a `.{}` assignment amortised over `ring_len` opens.
-        var ring_sender = transport.SendSession.init(key, 0xDEADBEEF, bench_now_s);
+        var ring_sender: transport.SendSession = undefined;
+        ring_sender.init(&key, 0xDEADBEEF, bench_now_s);
         for (&open_ring) |*slot| _ = ring_sender.seal(slot, &packet, bench_now_s) catch unreachable;
         const msg_len = transport.sealedLen(mtu);
 
-        var r = transport.RecvSession.init(key, 0xDEADBEEF, bench_now_s);
+        var r: transport.RecvSession = undefined;
+        r.init(&key, 0xDEADBEEF, bench_now_s);
         t0 = nowNs();
         var done: usize = 0;
         while (done < iters) : (done += open_ring.len) {

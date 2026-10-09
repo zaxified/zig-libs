@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **Breaking:** dead-stack burn for every secret-handling
+  entry point (`stackprobe_test.zig`: every one of the 13 probed calls left
+  seed / key / blind / nonce / unblinded-element / output residue before; 0
+  after). Secrets in by `*const`, secret outputs through `out`:
+  `scalarFromWideBytes(&wide, &out)`, `deriveKeyPair(mode, &seed, info, &out)`,
+  `generateProof(mode, &k, a, b, c, d, &r)`, `blind(mode, input, &blind)`,
+  `blindEvaluate(&sk, ..)`, `finalize(input, &blind, ev, &out)`,
+  `evaluate(mode, &sk, input, &out)`, `blindEvaluateVerifiable[Batch](&sk, ..,
+  &proof_r)`, `finalizeVerifiable(.., &out)`, `blindPoprf(.., &blind)`,
+  `blindEvaluatePoprf[Batch](&sk, .., &proof_r)`, `finalizePoprf(.., &out)`,
+  `finalizePoprfUnverified(.., &out)`, `evaluatePoprf(&sk, input, info, &out)`.
+  Migrated: this module's tests (via `src/test_shim.zig`, by-value test
+  adapters), example, README; the one consumer, `opaque`, in the same change.
+
 - **2026-10-05** — Mutation run: 21 of 25 killed, 4 equivalent; 3 tests added
   (`verifyProof` refuses `s + L` and a C/D length mismatch, `finalize` refuses
   a non-canonical blind, POPRF `InverseError` and the identity tweaked key).

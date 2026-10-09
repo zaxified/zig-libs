@@ -142,6 +142,7 @@ const Sha512 = std.crypto.hash.sha2.Sha512;
 const HmacSha512 = std.crypto.auth.hmac.sha2.HmacSha512;
 const HkdfSha512 = std.crypto.kdf.hkdf.HkdfSha512;
 const timing_safe = std.crypto.timing_safe;
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -497,8 +498,21 @@ fn checkIdentities(identities: Identities, context: []const u8) error{IdentityTo
 /// `DeriveKeyPair(seed, "OPAQUE-DeriveDiffieHellmanKeyPair")` in the
 /// base-OPRF-mode context — via `voprf.deriveKeyPair`. Public because
 /// servers use it to create their long-term AKE key pair at setup.
-pub fn deriveAkeKeyPair(seed: [Nseed]u8) error{DeriveKeyPairFailed}!AkeKeyPair {
-    const kp = try voprf.deriveKeyPair(.oprf, seed, "OPAQUE-DeriveDiffieHellmanKeyPair");
+///
+/// `seed` by pointer and the key pair through `out` (written only on
+/// success); the derivation's stack is burned before the call returns.
+pub fn deriveAkeKeyPair(seed: *const [Nseed]u8, out: *AkeKeyPair) error{DeriveKeyPairFailed}!void {
+    return burn.run(burn.small_burn, error{DeriveKeyPairFailed}!void, deriveAkeKeyPairBody, .{ seed, out });
+}
+
+fn deriveAkeKeyPairBody(seed: *const [Nseed]u8, out: *AkeKeyPair) error{DeriveKeyPairFailed}!void {
+    out.* = try akeKeyPair(seed);
+}
+
+/// The by-value form for callers that already run inside a burned frame.
+fn akeKeyPair(seed: *const [Nseed]u8) error{DeriveKeyPairFailed}!AkeKeyPair {
+    var kp: voprf.KeyPair = undefined;
+    try voprf.deriveKeyPair(.oprf, seed, "OPAQUE-DeriveDiffieHellmanKeyPair", &kp);
     return .{ .private_key = kp.sk, .public_key = kp.pk.toBytes() };
 }
 
@@ -509,7 +523,8 @@ fn deriveOprfKey(oprf_seed: [Nh]u8, credential_identifier: []const u8) error{Der
     var seed: [Nok]u8 = undefined;
     defer std.crypto.secureZero(u8, &seed);
     expandMulti(&seed, &oprf_seed, &.{ credential_identifier, "OprfKey" });
-    const kp = try voprf.deriveKeyPair(.oprf, seed, "OPAQUE-DeriveKeyPair");
+    var kp: voprf.KeyPair = undefined;
+    try voprf.deriveKeyPair(.oprf, &seed, "OPAQUE-DeriveKeyPair", &kp);
     return kp.sk;
 }
 
@@ -588,7 +603,8 @@ fn randomizedPassword(
     ksf: Ksf,
 ) (error{ InvalidMessage, InvalidBlind } || error{KsfFailed})![Nx]u8 {
     const evaluated = voprf.Element.fromBytes(evaluated_message) catch return error.InvalidMessage;
-    var oprf_output = try voprf.finalize(password, blind, evaluated);
+    var oprf_output: [Nh]u8 = undefined;
+    try voprf.finalize(password, &blind, evaluated, &oprf_output);
     defer std.crypto.secureZero(u8, &oprf_output);
     var stretched = try ksf.stretch(oprf_output);
     defer std.crypto.secureZero(u8, &stretched);
@@ -660,7 +676,7 @@ fn store(
     // never leaves this function (only `kp.public_key` is returned), so
     // zeroing it here is free and closes exactly the stack residue the
     // audit's `stackscan` probe measured.
-    var kp = try deriveAkeKeyPair(seed);
+    var kp = try akeKeyPair(&seed);
     defer std.crypto.secureZero(u8, &kp.private_key);
 
     const server_identity = identities.server orelse &server_public_key;
@@ -700,7 +716,7 @@ fn recover(
     var seed: [Nseed]u8 = undefined;
     defer std.crypto.secureZero(u8, &seed);
     expandMulti(&seed, randomized_password, &.{ &envelope.nonce, "PrivateKey" });
-    const kp = deriveAkeKeyPair(seed) catch return error.EnvelopeRecovery;
+    const kp = akeKeyPair(&seed) catch return error.EnvelopeRecovery;
 
     const server_identity = identities.server orelse &server_public_key;
     const client_identity = identities.client orelse &kp.public_key;
@@ -724,8 +740,12 @@ fn recover(
 /// `finalizeRegistrationRequest`.
 pub fn createRegistrationRequest(
     password: []const u8,
-    blind: [Ns]u8,
+    blind: *const [Ns]u8,
 ) voprf.BlindError!RegistrationRequest {
+    return burn.run(burn.mul_burn, voprf.BlindError!RegistrationRequest, createRegistrationRequestBody, .{ password, blind });
+}
+
+fn createRegistrationRequestBody(password: []const u8, blind: *const [Ns]u8) voprf.BlindError!RegistrationRequest {
     const blinded = try voprf.blind(.oprf, password, blind);
     return .{ .blinded_message = blinded.toBytes() };
 }
@@ -741,13 +761,22 @@ pub fn createRegistrationResponse(
     request: RegistrationRequest,
     server_public_key: [Npk]u8,
     credential_identifier: []const u8,
-    oprf_seed: [Nh]u8,
+    oprf_seed: *const [Nh]u8,
+) CreateRegistrationResponseError!RegistrationResponse {
+    return burn.run(burn.mul_burn, CreateRegistrationResponseError!RegistrationResponse, createRegistrationResponseBody, .{ request, server_public_key, credential_identifier, oprf_seed });
+}
+
+fn createRegistrationResponseBody(
+    request: RegistrationRequest,
+    server_public_key: [Npk]u8,
+    credential_identifier: []const u8,
+    oprf_seed: *const [Nh]u8,
 ) CreateRegistrationResponseError!RegistrationResponse {
     // A1/opaque.md H2: per-client OPRF key, never returned to the caller.
-    var oprf_key = try deriveOprfKey(oprf_seed, credential_identifier);
+    var oprf_key = try deriveOprfKey(oprf_seed.*, credential_identifier);
     defer std.crypto.secureZero(u8, &oprf_key);
     const blinded = voprf.Element.fromBytes(request.blinded_message) catch return error.InvalidMessage;
-    const evaluated = voprf.blindEvaluate(oprf_key, blinded);
+    const evaluated = voprf.blindEvaluate(&oprf_key, blinded);
     return .{
         .evaluated_message = evaluated.toBytes(),
         .server_public_key = server_public_key,
@@ -772,19 +801,35 @@ pub const FinalizeRegistrationResult = struct {
 /// then §4.1.2 `Store` with the caller-supplied `envelope_nonce` (the
 /// RFC samples it inside `Store`; fresh random per registration).
 /// `identities` must match what logins will use.
+///
+/// `blind` by pointer; the record and the `export_key` go through `out`
+/// (written only on success). Stack burned before return.
 pub fn finalizeRegistrationRequest(
     password: []const u8,
-    blind: [Ns]u8,
+    blind: *const [Ns]u8,
     response: RegistrationResponse,
     identities: Identities,
     envelope_nonce: [Nn]u8,
     ksf: Ksf,
-) FinalizeRegistrationError!FinalizeRegistrationResult {
+    out: *FinalizeRegistrationResult,
+) FinalizeRegistrationError!void {
+    return burn.run(burn.reg_burn, FinalizeRegistrationError!void, finalizeRegistrationRequestBody, .{ password, blind, response, identities, envelope_nonce, ksf, out });
+}
+
+fn finalizeRegistrationRequestBody(
+    password: []const u8,
+    blind: *const [Ns]u8,
+    response: RegistrationResponse,
+    identities: Identities,
+    envelope_nonce: [Nn]u8,
+    ksf: Ksf,
+    out: *FinalizeRegistrationResult,
+) FinalizeRegistrationError!void {
     try checkIdentities(identities, "");
-    var rp = try randomizedPassword(password, blind, response.evaluated_message, ksf);
+    var rp = try randomizedPassword(password, blind.*, response.evaluated_message, ksf);
     defer std.crypto.secureZero(u8, &rp);
     const stored = try store(&rp, response.server_public_key, identities, envelope_nonce);
-    return .{
+    out.* = .{
         .record = .{
             .client_public_key = stored.client_public_key,
             .masking_key = stored.masking_key,
@@ -829,14 +874,30 @@ pub const GenerateKE1Result = struct {
 /// random scalar), `client_nonce` (fresh Nn bytes), and
 /// `client_keyshare_seed` (fresh Nseed bytes; the ephemeral keyshare
 /// is derived from it per §6.4.1.1).
+///
+/// `blind` and the keyshare seed by pointer; the result (whose `state` holds
+/// the blind and the ephemeral key by design) through `out`, written only on
+/// success. Stack burned before return.
 pub fn generateKE1(
     password: []const u8,
-    blind: [Ns]u8,
+    blind: *const [Ns]u8,
     client_nonce: [Nn]u8,
-    client_keyshare_seed: [Nseed]u8,
-) GenerateKE1Error!GenerateKE1Result {
+    client_keyshare_seed: *const [Nseed]u8,
+    out: *GenerateKE1Result,
+) GenerateKE1Error!void {
+    return burn.run(burn.mul_burn, GenerateKE1Error!void, generateKE1Body, .{ password, blind, client_nonce, client_keyshare_seed, out });
+}
+
+fn generateKE1Body(
+    password: []const u8,
+    blind: *const [Ns]u8,
+    client_nonce: [Nn]u8,
+    client_keyshare_seed: *const [Nseed]u8,
+    out: *GenerateKE1Result,
+) GenerateKE1Error!void {
     const blinded = try voprf.blind(.oprf, password, blind);
-    const keyshare = try deriveAkeKeyPair(client_keyshare_seed);
+    var keyshare = try akeKeyPair(client_keyshare_seed);
+    defer std.crypto.secureZero(u8, &keyshare.private_key);
     const ke1 = KE1{
         .credential_request = .{ .blinded_message = blinded.toBytes() },
         .auth_request = .{
@@ -844,9 +905,9 @@ pub fn generateKE1(
             .client_public_keyshare = keyshare.public_key,
         },
     };
-    return .{ .ke1 = ke1, .state = .{
+    out.* = .{ .ke1 = ke1, .state = .{
         .password = password,
-        .blind = blind,
+        .blind = blind.*,
         .client_secret = keyshare.private_key,
         .ke1 = ke1,
     } };
@@ -867,27 +928,49 @@ pub const GenerateKE2Result = struct {
 /// shared context string (§7; both sides must agree; may be empty).
 /// For an UNREGISTERED user, pass the server's one persistent fake
 /// record (§6.3.2.2) — see the module doc comment.
+///
+/// The server key, `oprf_seed` and the keyshare seed by pointer; the result
+/// (whose `state` holds the expected client MAC and the session key by design)
+/// through `out`, written only on success. Stack burned before return.
 pub fn generateKE2(
-    server_private_key: [Nsk]u8,
+    server_private_key: *const [Nsk]u8,
     server_public_key: [Npk]u8,
     record: RegistrationRecord,
     credential_identifier: []const u8,
-    oprf_seed: [Nh]u8,
+    oprf_seed: *const [Nh]u8,
     ke1: KE1,
     identities: Identities,
     context: []const u8,
     masking_nonce: [Nn]u8,
     server_nonce: [Nn]u8,
-    server_keyshare_seed: [Nseed]u8,
-) GenerateKE2Error!GenerateKE2Result {
+    server_keyshare_seed: *const [Nseed]u8,
+    out: *GenerateKE2Result,
+) GenerateKE2Error!void {
+    return burn.run(burn.reg_burn, GenerateKE2Error!void, generateKE2Body, .{ server_private_key, server_public_key, record, credential_identifier, oprf_seed, ke1, identities, context, masking_nonce, server_nonce, server_keyshare_seed, out });
+}
+
+fn generateKE2Body(
+    server_private_key: *const [Nsk]u8,
+    server_public_key: [Npk]u8,
+    record: RegistrationRecord,
+    credential_identifier: []const u8,
+    oprf_seed: *const [Nh]u8,
+    ke1: KE1,
+    identities: Identities,
+    context: []const u8,
+    masking_nonce: [Nn]u8,
+    server_nonce: [Nn]u8,
+    server_keyshare_seed: *const [Nseed]u8,
+    out: *GenerateKE2Result,
+) GenerateKE2Error!void {
     try checkIdentities(identities, context);
     // §6.3.2.2 CreateCredentialResponse.
     // A1/opaque.md H2: per-client OPRF key, never returned to the caller.
-    var oprf_key = try deriveOprfKey(oprf_seed, credential_identifier);
+    var oprf_key = try deriveOprfKey(oprf_seed.*, credential_identifier);
     defer std.crypto.secureZero(u8, &oprf_key);
     const blinded = voprf.Element.fromBytes(ke1.credential_request.blinded_message) catch
         return error.InvalidMessage;
-    const evaluated = voprf.blindEvaluate(oprf_key, blinded);
+    const evaluated = voprf.blindEvaluate(&oprf_key, blinded);
 
     var masked = credentialResponsePad(&record.masking_key, masking_nonce);
     const plaintext = server_public_key ++ record.envelope.toBytes();
@@ -903,10 +986,10 @@ pub fn generateKE2(
     // A1/opaque.md H2: the server's ephemeral keyshare private key; only
     // `keyshare.public_key` (below) and the DH outputs it feeds (already
     // zeroed via `ikm`) leave this function.
-    var keyshare = try deriveAkeKeyPair(server_keyshare_seed);
+    var keyshare = try akeKeyPair(server_keyshare_seed);
     defer std.crypto.secureZero(u8, &keyshare.private_key);
     const dh1 = try diffieHellman(keyshare.private_key, ke1.auth_request.client_public_keyshare);
-    const dh2 = try diffieHellman(server_private_key, ke1.auth_request.client_public_keyshare);
+    const dh2 = try diffieHellman(server_private_key.*, ke1.auth_request.client_public_keyshare);
     const dh3 = try diffieHellman(keyshare.private_key, record.client_public_key);
     var ikm = dh1 ++ dh2 ++ dh3;
     defer std.crypto.secureZero(u8, &ikm);
@@ -924,7 +1007,7 @@ pub fn generateKE2(
         keyshare.public_key,
     );
 
-    return .{
+    out.* = .{
         .ke2 = .{
             .credential_response = credential_response,
             .auth_response = .{
@@ -971,13 +1054,29 @@ pub const GenerateKE3Result = struct {
 /// `EnvelopeRecovery`, same as a wrong password —
 /// `randomized_password` differs either way).
 /// `identities` and `context` must match the server's.
+///
+/// `state` by pointer (no by-value copy of the blind and the ephemeral key in
+/// the callee's frame); the session key and export key go through `out`,
+/// written only after the server MAC verified. Stack burned before return.
 pub fn generateKE3(
-    state: ClientLoginState,
+    state: *const ClientLoginState,
     identities: Identities,
     context: []const u8,
     ke2: KE2,
     ksf: Ksf,
-) GenerateKE3Error!GenerateKE3Result {
+    out: *GenerateKE3Result,
+) GenerateKE3Error!void {
+    return burn.run(burn.ke3_burn, GenerateKE3Error!void, generateKE3Body, .{ state, identities, context, ke2, ksf, out });
+}
+
+fn generateKE3Body(
+    state: *const ClientLoginState,
+    identities: Identities,
+    context: []const u8,
+    ke2: KE2,
+    ksf: Ksf,
+    out: *GenerateKE3Result,
+) GenerateKE3Error!void {
     try checkIdentities(identities, context);
     // §6.3.2.3 RecoverCredentials.
     var rp = try randomizedPassword(state.password, state.blind, ke2.credential_response.evaluated_message, ksf);
@@ -1025,7 +1124,7 @@ pub fn generateKE3(
     if (!timing_safe.eql([Nm]u8, ke2.auth_response.server_mac, schedule.server_mac))
         return error.ServerAuthentication;
 
-    return .{
+    out.* = .{
         .ke3 = .{ .client_mac = schedule.client_mac },
         .session_key = schedule.session_key,
         .export_key = credentials.export_key,
@@ -1037,10 +1136,16 @@ pub fn generateKE3(
 /// it matches (`error.ClientAuthentication` otherwise, fail closed —
 /// this check is what gives full forward secrecy against active
 /// attackers, §6.2.4).
-pub fn serverFinish(state: ServerLoginState, ke3: KE3) ClientAuthenticationError![Nx]u8 {
+/// `state` by pointer; the session key goes through `out` (written only on
+/// success).
+pub fn serverFinish(state: *const ServerLoginState, ke3: KE3, out: *[Nx]u8) ClientAuthenticationError!void {
+    return burn.run(burn.small_burn, ClientAuthenticationError!void, serverFinishBody, .{ state, ke3, out });
+}
+
+fn serverFinishBody(state: *const ServerLoginState, ke3: KE3, out: *[Nx]u8) ClientAuthenticationError!void {
     if (!timing_safe.eql([Nm]u8, ke3.client_mac, state.expected_client_mac))
         return error.ClientAuthentication;
-    return state.session_key;
+    out.* = state.session_key;
 }
 
 // ── credential masking (§6.3.2.2/§6.3.2.3) ───────────────────────────────
@@ -1150,6 +1255,7 @@ fn runKeySchedule(
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 // ── constant-time regression: the 3DH multiply does not report `k` ───────
@@ -1162,6 +1268,8 @@ test {
 // symptom was that a degenerate local key produced a distinct error instead
 // of a group element. Restore the `.mul(...) catch ...` shape and this
 // test goes red.
+const shim = @import("test_shim.zig");
+
 test "diffieHellman REPORTS NOTHING about a degenerate private key (ct25519)" {
     // A perfectly valid, non-identity peer element.
     const peer = voprf.Element.generator.toBytes();
@@ -1176,7 +1284,7 @@ test "diffieHellman REPORTS NOTHING about a degenerate private key (ct25519)" {
 
     // And a nonzero key still agrees with std byte-for-byte, so the swap
     // changed the leak and nothing else.
-    const k = voprf.scalarFromWideBytes([_]u8{0x3c} ** 64);
+    const k = shim.scalarFromWideBytes([_]u8{0x3c} ** 64);
     const want = try point.p.mul(k);
     try std.testing.expectEqualSlices(u8, &want.toBytes(), &(try diffieHellman(k, peer)));
 }
@@ -1298,7 +1406,7 @@ fn fuzzCreateRegistrationResponseOnHostileRequest(_: void, smith: *std.testing.S
     var buf: [RegistrationRequest.encoded_length]u8 = undefined;
     smith.bytes(&buf);
     const request = RegistrationRequest.fromBytes(buf);
-    if (createRegistrationResponse(request, v.server_public_key, v.credential_identifier, v.oprf_seed)) |r| {
+    if (shim.createRegistrationResponse(request, v.server_public_key, v.credential_identifier, v.oprf_seed)) |r| {
         std.mem.doNotOptimizeAway(&r);
     } else |_| {}
 }
@@ -1312,7 +1420,7 @@ fn fuzzGenerateKE2OnHostileKE1(_: void, smith: *std.testing.Smith) !void {
     var buf: [KE1.encoded_length]u8 = undefined;
     smith.bytes(&buf);
     const ke1 = KE1.fromBytes(buf);
-    if (generateKE2(
+    if (shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         record,
@@ -1334,11 +1442,11 @@ test "fuzz generateKE2 never panics on a hostile KE1" {
 
 fn fuzzGenerateKE3OnHostileKE2(_: void, smith: *std.testing.Smith) !void {
     const v = kat_vectors.real_1;
-    const login = generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed) catch return;
+    const login = shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed) catch return;
     var buf: [KE2.encoded_length]u8 = undefined;
     smith.bytes(&buf);
     const ke2 = KE2.fromBytes(buf);
-    if (generateKE3(login.state, .{}, v.context, ke2, .identity)) |r| {
+    if (shim.generateKE3(login.state, .{}, v.context, ke2, .identity)) |r| {
         std.mem.doNotOptimizeAway(&r);
     } else |_| {}
 }
@@ -1360,16 +1468,16 @@ test "M4: createRegistrationResponse rejects a non-canonical blinded_message" {
     const request = RegistrationRequest{ .blinded_message = [_]u8{0xFF} ** 32 };
     try std.testing.expectError(
         error.InvalidMessage,
-        createRegistrationResponse(request, v.server_public_key, v.credential_identifier, v.oprf_seed),
+        shim.createRegistrationResponse(request, v.server_public_key, v.credential_identifier, v.oprf_seed),
     );
 }
 
 test "M4: generateKE2 rejects a non-canonical blinded_message in a hostile KE1" {
     const v = kat_vectors.real_1;
     const record = RegistrationRecord.fromBytes(v.registration_upload);
-    var login = try generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    var login = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
     login.ke1.credential_request.blinded_message = [_]u8{0xFF} ** 32;
-    try std.testing.expectError(error.InvalidMessage, generateKE2(
+    try std.testing.expectError(error.InvalidMessage, shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         record,
@@ -1387,8 +1495,8 @@ test "M4: generateKE2 rejects a non-canonical blinded_message in a hostile KE1" 
 test "M4: generateKE3 rejects a non-canonical server_public_keyshare in a hostile KE2" {
     const v = kat_vectors.real_1;
     const record = RegistrationRecord.fromBytes(v.registration_upload);
-    const login = try generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
-    var ke2 = (try generateKE2(
+    const login = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    var ke2 = (try shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
         record,
@@ -1404,7 +1512,7 @@ test "M4: generateKE3 rejects a non-canonical server_public_keyshare in a hostil
     ke2.auth_response.server_public_keyshare = [_]u8{0xFF} ** 32;
     try std.testing.expectError(
         error.InvalidPublicKey,
-        generateKE3(login.state, .{}, v.context, ke2, .identity),
+        shim.generateKE3(login.state, .{}, v.context, ke2, .identity),
     );
 }
 
@@ -1518,7 +1626,7 @@ test "audit L4: an independent §6.3.3 preamble construction reproduces C.1.1/C.
     for ([_]kat_vectors.RealVector{ kat_vectors.real_1, kat_vectors.real_2 }) |v| {
         // Real, RFC-pinned client ephemeral keyshare + KE1 -- reused, not
         // reimplemented (already checked byte-exact against v.ke1 above).
-        const login = try generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+        const login = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
 
         // credential_response / server_nonce / server_public_keyshare come
         // straight out of the RFC's OWN published KE2 bytes -- this test
@@ -1579,7 +1687,7 @@ test "audit L4: the independent preamble construction is NOT a silent no-op -- d
     // couldn't (SHA-512 is not that coincidental), which is exactly what
     // this proves rather than assumes.
     const v = kat_vectors.real_1;
-    const login = try generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    const login = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
     const ke2 = KE2.fromBytes(v.ke2);
     var rp = try randomizedPassword(v.password, v.blind_login, ke2.credential_response.evaluated_message, .identity);
     defer std.crypto.secureZero(u8, &rp);

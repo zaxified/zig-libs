@@ -17,24 +17,33 @@ KAT-validated byte-exact against RFC 9807 Appendix C.1.1 + C.1.2
 ```zig
 const opaque_pake = @import("opaque");
 
-// Registration (over a confidential, server-authenticated channel)
-const request = try opaque_pake.createRegistrationRequest(password, blind_reg);
+// Registration (over a confidential, server-authenticated channel).
+// Secrets go in by pointer, secret results come back through `out`.
+const request = try opaque_pake.createRegistrationRequest(password, &blind_reg);
 const response = try opaque_pake.createRegistrationResponse(
-    request, server_keys.public_key, credential_identifier, oprf_seed);
-const registered = try opaque_pake.finalizeRegistrationRequest(
-    password, blind_reg, response, identities, envelope_nonce);
+    request, server_keys.public_key, credential_identifier, &oprf_seed);
+var registered: opaque_pake.FinalizeRegistrationResult = undefined;
+try opaque_pake.finalizeRegistrationRequest(
+    password, &blind_reg, response, identities, envelope_nonce, ksf, &registered);
 // server stores registered.record; client may use registered.export_key
 
 // Login (any channel)
-const client = try opaque_pake.generateKE1(password, blind_login, client_nonce, client_keyshare_seed);
-const server = try opaque_pake.generateKE2(
-    server_keys.private_key, server_keys.public_key, record,
-    credential_identifier, oprf_seed, client.ke1, identities, context,
-    masking_nonce, server_nonce, server_keyshare_seed);
-const finished = try opaque_pake.generateKE3(client.state, identities, context, server.ke2);
-const session_key = try opaque_pake.serverFinish(server.state, finished.ke3);
+var client: opaque_pake.GenerateKE1Result = undefined;
+try opaque_pake.generateKE1(password, &blind_login, client_nonce, &client_keyshare_seed, &client);
+var server: opaque_pake.GenerateKE2Result = undefined;
+try opaque_pake.generateKE2(
+    &server_keys.private_key, server_keys.public_key, record,
+    credential_identifier, &oprf_seed, client.ke1, identities, context,
+    masking_nonce, server_nonce, &server_keyshare_seed, &server);
+var finished: opaque_pake.GenerateKE3Result = undefined;
+try opaque_pake.generateKE3(&client.state, identities, context, server.ke2, ksf, &finished);
+var session_key: [opaque_pake.Nx]u8 = undefined;
+try opaque_pake.serverFinish(&server.state, finished.ke3, &session_key);
 // finished.session_key == session_key; finished.export_key == registered.export_key
 ```
+
+Every secret-handling entry point burns the stack it used before it returns
+(`SPEC.md` § Secret residue on the dead stack).
 
 Wrong password ⇒ `error.EnvelopeRecovery` (client side); tampered or
 mis-keyed MACs ⇒ `error.ServerAuthentication` / 

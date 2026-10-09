@@ -51,6 +51,19 @@ fn hashName(comptime T: type) []const u8 {
     @compileError("noise: no spec §8 protocol name for hash type " ++ @typeName(T) ++ " (declare `pub const noise_name`)");
 }
 
+const burn = @import("burn.zig");
+
+/// Review 2026-10-08 (found through `bolt8`'s transport probe). `Cipher`'s
+/// encrypt/decrypt take the key BY VALUE (std's AEAD shape), so every
+/// `CipherState` call copies `k` into its own frame to pass it. The three keyed
+/// calls therefore run one frame down and zero `cipher_burn` bytes at that
+/// depth: enough for this module's own frame, NOT for an AEAD that leaves copies
+/// deeper — `chachapoly` burns its own; std's AEADs (e.g. a suite on `aes_gcm`)
+/// do not.
+fn burnStack() void {
+    burn.stack(burn.cipher_burn);
+}
+
 /// Bind a Noise cipher suite: `DH` (spec §4.1, e.g. `std.crypto.dh.X25519`),
 /// `Cipher` (spec §4.2 AEAD, e.g.
 /// `std.crypto.aead.chacha_poly.ChaCha20Poly1305` or
@@ -67,32 +80,6 @@ fn hashName(comptime T: type) []const u8 {
 /// with a 32-byte key, 12-byte nonce and 16-byte tag (its nonce counter is
 /// big-endian iff its name is `AESGCM`, spec §12); a hash the std hash
 /// shape with a 32- or 64-byte digest.
-/// Review 2026-10-08 (found through `bolt8`'s transport probe). `Cipher`'s
-/// encrypt/decrypt take the key BY VALUE (std's AEAD shape), so every
-/// `CipherState` call copies `k` into its own frame to pass it — measured in
-/// `bolt8`'s Transport (ReleaseFast): the transport key left once per send and
-/// twice per receive, after the AEAD itself had been made to burn its own
-/// call tree (`chachapoly`). `CipherState`'s three keyed calls therefore run
-/// one frame down and zero `cipher_burn` bytes at that depth: enough for this
-/// module's own frame, NOT for an AEAD that leaves copies deeper — `chachapoly`
-/// burns its own; std's AEADs (e.g. a suite on `aes_gcm`) do not.
-noinline fn burnStack() void {
-    const V = @Vector(4, u64);
-    // align(16), not `V`'s natural 32: a 32-aligned buffer makes the frame
-    // realign, and the up to 56 bytes between the saved frame pointer and
-    // the buffer stayed unzeroed — a callee's secret survived there
-    // (threshold_ecdsa stack probe, 2026-10-08). At 16 the buffer ends at
-    // the saved frame pointer.
-    var buf: [cipher_burn / @sizeOf(V)]V align(16) = undefined;
-    const p: [*]align(16) volatile V = &buf;
-    for (0..buf.len) |i| p[i] = @splat(0);
-}
-
-/// Covers `encryptWithAdBody`'s frame and the argument copies it makes;
-/// `bolt8/src/stackprobe_test.zig` goes red when that outgrows it. Volatile
-/// 32-byte vector stores, ~10 ns (`secureZero` runs ~3 B/ns without libc).
-const cipher_burn = 1024;
-
 pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type {
     return struct {
         /// The DH function type this suite was bound with (spec §4.1).
@@ -182,9 +169,10 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             n: u64 = 0,
             has_key: bool = false,
 
-            /// §5.1 `InitializeKey(key)`: sets `k = key`, `n = 0`.
-            pub fn initializeKey(self: *CipherState, key: [32]u8) void {
-                self.k = key;
+            /// §5.1 `InitializeKey(key)`: sets `k = key`, `n = 0`. The key is
+            /// taken by pointer so the call leaves no copy in a dead frame.
+            pub fn initializeKey(self: *CipherState, key: *const [32]u8) void {
+                self.k = key.*;
                 self.n = 0;
                 self.has_key = true;
             }
@@ -340,9 +328,13 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             /// new `ck` plus `temp_k`; re-initializes the embedded
             /// `CipherState` with `temp_k` truncated to 32 bytes.
             pub fn mixKey(self: *SymmetricState, input_key_material: []const u8) void {
+                burn.run(burn.hkdf_burn, void, mixKeyBody, .{ self, input_key_material });
+            }
+
+            fn mixKeyBody(self: *SymmetricState, input_key_material: []const u8) void {
                 var out = noiseHkdf(2, &self.ck, input_key_material);
                 self.ck = out[0];
-                self.cipher_state.initializeKey(out[1][0..32].*);
+                self.cipher_state.initializeKey(out[1][0..32]);
                 std.crypto.secureZero(u8, std.mem.asBytes(&out));
             }
 
@@ -361,10 +353,14 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             /// the `CipherState` key from the third output (truncated to
             /// 32 bytes).
             pub fn mixKeyAndHash(self: *SymmetricState, input_key_material: []const u8) void {
+                burn.run(burn.hkdf_burn, void, mixKeyAndHashBody, .{ self, input_key_material });
+            }
+
+            fn mixKeyAndHashBody(self: *SymmetricState, input_key_material: []const u8) void {
                 var out = noiseHkdf(3, &self.ck, input_key_material);
                 self.ck = out[0];
                 self.mixHash(&out[1]);
-                self.cipher_state.initializeKey(out[2][0..32].*);
+                self.cipher_state.initializeKey(out[2][0..32]);
                 std.crypto.secureZero(u8, std.mem.asBytes(&out));
             }
 
@@ -409,14 +405,19 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
 
             /// §5.2 `Split()`: derives the pair of transport `CipherState`s
             /// (`[0]` = initiator-to-responder, `[1]` = the reverse) via
-            /// `HKDF(ck, zerolen, 2)`, ending the handshake phase.
-            pub fn split(self: *SymmetricState) [2]CipherState {
+            /// `HKDF(ck, zerolen, 2)`, ending the handshake phase. The pair is
+            /// written to `out` (not returned: a returned pair of transport
+            /// keys is a copy in the caller's dead frame).
+            pub fn split(self: *SymmetricState, out: *[2]CipherState) void {
+                burn.run(burn.hkdf_burn, void, splitBody, .{ self, out });
+            }
+
+            fn splitBody(self: *SymmetricState, pair: *[2]CipherState) void {
                 var out = noiseHkdf(2, &self.ck, "");
-                var pair = [2]CipherState{ .{}, .{} };
-                pair[0].initializeKey(out[0][0..32].*);
-                pair[1].initializeKey(out[1][0..32].*);
+                pair.* = .{ .{}, .{} };
+                pair[0].initializeKey(out[0][0..32]);
+                pair[1].initializeKey(out[1][0..32]);
                 std.crypto.secureZero(u8, std.mem.asBytes(&out));
-                return pair;
             }
         };
 
@@ -482,23 +483,30 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             };
 
             /// Result of one `writeMessage`/`readMessage` step: how many
-            /// bytes were produced in `out`, plus — once the final message
-            /// pattern has been processed — `Split()`'s two transport
-            /// `CipherState`s (`[0]` = initiator→responder, `[1]` = the
-            /// reverse; both parties receive the same pair and pick their
-            /// sending direction by role). `transport` is `null` while
-            /// more handshake messages remain.
+            /// bytes were produced in `out`, and whether the final message
+            /// pattern has just been processed. When `complete`, `Split()`'s
+            /// two transport `CipherState`s (`[0]` = initiator→responder,
+            /// `[1]` = the reverse; both parties receive the same pair and pick
+            /// their sending direction by role) were written to the call's
+            /// `transport` out-parameter; while more messages remain, that
+            /// parameter is left untouched. (The pair is an out-parameter, not
+            /// a field here: a secret returned by value inside an error union
+            /// is a copy in the caller's dead frame.)
             pub const Step = struct {
                 len: usize,
-                transport: ?[2]CipherState,
+                complete: bool,
             };
 
             /// The keys `init` takes. `e` is the spec's testing hook (leave
             /// it null: `writeMessage` generates the ephemeral); `psks` holds
-            /// one 32-byte key per `psk` token, in order.
+            /// one 32-byte key per `psk` token, in order. The private key
+            /// pairs are POINTERS to the caller's storage: a `Keys` literal
+            /// built with `s = my_pair` by value would be one more copy of
+            /// the private key in the caller's frame, which no burn here can
+            /// reach.
             pub const Keys = struct {
-                s: ?KeyPair = null,
-                e: ?KeyPair = null,
+                s: ?*const KeyPair = null,
+                e: ?*const KeyPair = null,
                 rs: ?[DHLEN]u8 = null,
                 re: ?[DHLEN]u8 = null,
                 psks: []const [32]u8 = &.{},
@@ -523,19 +531,23 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             /// reach a missing key or PSK (which `initialize` alone would
             /// meet as a null unwrap or an out-of-bounds index). Use this
             /// for any pattern built or parsed at run time.
+            ///
+            /// Initializes `self` in place and takes the keys by pointer
+            /// (neither a `HandshakeState` nor a `KeyPair` is returned or
+            /// passed by value, so no copy of a private key stays in a dead
+            /// frame). `keys` itself is the caller's: wipe it when done.
             pub fn init(
+                self: *HandshakeState,
                 pattern: patterns.HandshakePattern,
                 initiator: bool,
                 prologue: []const u8,
-                keys: Keys,
-            ) InitError!HandshakeState {
+                keys: *const Keys,
+            ) InitError!void {
                 try checkPattern(pattern, initiator, keys);
-                var hs: HandshakeState = .{};
-                hs.initialize(pattern, initiator, prologue, keys.s, keys.e, keys.rs, keys.re, keys.psks);
-                return hs;
+                self.initialize(pattern, initiator, prologue, keys);
             }
 
-            fn checkPattern(pattern: patterns.HandshakePattern, initiator: bool, keys: Keys) InitError!void {
+            fn checkPattern(pattern: patterns.HandshakePattern, initiator: bool, keys: *const Keys) InitError!void {
                 if (pattern.message_patterns.len == 0) return error.InvalidPattern;
                 if (pattern.name.len + 6 + name_suffix.len > 128) return error.InvalidPattern;
                 // Which public keys exist so far: [0] initiator, [1] responder.
@@ -590,7 +602,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             }
 
             /// §5.3 `Initialize(handshake_pattern, initiator, prologue,
-            /// s, e, rs, re)`: derives the protocol name (spec §8,
+            /// s, e, rs, re)` (the keys travel in `keys`, by pointer): derives the protocol name (spec §8,
             /// `"Noise_" ++ pattern.name ++ "_25519_ChaChaPoly_SHA256"`
             /// etc.) into `SymmetricState.initializeSymmetric`, mixes in
             /// `prologue`, records the known keys, and processes the
@@ -606,20 +618,26 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 pattern: patterns.HandshakePattern,
                 initiator: bool,
                 prologue: []const u8,
-                s: ?KeyPair,
-                e: ?KeyPair,
-                rs: ?[DHLEN]u8,
-                re: ?[DHLEN]u8,
-                psks: []const [32]u8,
+                keys: *const Keys,
+            ) void {
+                burn.run(burn.init_burn, void, initializeBody, .{ self, pattern, initiator, prologue, keys });
+            }
+
+            fn initializeBody(
+                self: *HandshakeState,
+                pattern: patterns.HandshakePattern,
+                initiator: bool,
+                prologue: []const u8,
+                keys: *const Keys,
             ) void {
                 self.* = .{
-                    .s = s,
-                    .e = e,
-                    .rs = rs,
-                    .re = re,
+                    .s = if (keys.s) |p| p.* else null,
+                    .e = if (keys.e) |p| p.* else null,
+                    .rs = keys.rs,
+                    .re = keys.re,
                     .initiator = initiator,
                     .pattern = pattern,
-                    .psks = psks,
+                    .psks = keys.psks,
                 };
                 outer: for (pattern.message_patterns) |mp| for (mp) |t| {
                     if (t == .psk) {
@@ -665,17 +683,17 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             /// so which *local* key participates depends on `initiator`.
             /// Identical for writing and reading.
             fn mixDh(self: *HandshakeState, token: Token) error{DhFailed}!void {
-                const local: KeyPair, const remote_pub: [DHLEN]u8 = switch (token) {
-                    .ee => .{ self.e.?, self.re.? },
-                    .ss => .{ self.s.?, self.rs.? },
+                const local: *const KeyPair, const remote_pub: [DHLEN]u8 = switch (token) {
+                    .ee => .{ &self.e.?, self.re.? },
+                    .ss => .{ &self.s.?, self.rs.? },
                     .es => if (self.initiator)
-                        .{ self.e.?, self.rs.? }
+                        .{ &self.e.?, self.rs.? }
                     else
-                        .{ self.s.?, self.re.? },
+                        .{ &self.s.?, self.re.? },
                     .se => if (self.initiator)
-                        .{ self.s.?, self.re.? }
+                        .{ &self.s.?, self.re.? }
                     else
-                        .{ self.e.?, self.rs.? },
+                        .{ &self.e.?, self.rs.? },
                     else => unreachable,
                 };
                 var shared = DH.scalarmult(local.secret_key, remote_pub) catch
@@ -701,9 +719,10 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             /// for PSK patterns); `s` appends the encrypted static key;
             /// `ee`/`es`/`se`/`ss` mix the corresponding DH output; `psk`
             /// mixes the next pre-shared key — then appends
-            /// `EncryptAndHash(payload)`. Returns the message length and,
-            /// once the final message pattern has been processed,
-            /// `Split()`'s transport pair. `random` must be
+            /// `EncryptAndHash(payload)`. Returns the message length and
+            /// whether the final message pattern has just been processed; if
+            /// so, `Split()`'s transport pair was written to `transport`
+            /// (otherwise `transport` is untouched). `random` must be
             /// cryptographically secure in production (e.g.
             /// `std.Random.IoSource`); it is only drawn from when an `e`
             /// token fires with no pre-set ephemeral.
@@ -712,6 +731,17 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 random: std.Random,
                 payload: []const u8,
                 out: []u8,
+                transport: *[2]CipherState,
+            ) WriteError!Step {
+                return burn.run(burn.hs_burn, WriteError!Step, writeMessageBody, .{ self, random, payload, out, transport });
+            }
+
+            fn writeMessageBody(
+                self: *HandshakeState,
+                random: std.Random,
+                payload: []const u8,
+                out: []u8,
+                transport: *[2]CipherState,
             ) WriteError!Step {
                 if (self.message_index >= self.pattern.message_patterns.len)
                     return error.HandshakeComplete;
@@ -757,11 +787,11 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
 
                 self.message_index += 1;
                 if (self.message_index == self.pattern.message_patterns.len) {
-                    const pair = self.symmetric_state.split();
+                    self.symmetric_state.split(transport);
                     self.wipe();
-                    return .{ .len = w, .transport = pair };
+                    return .{ .len = w, .complete = true };
                 }
-                return .{ .len = w, .transport = null };
+                return .{ .len = w, .complete = false };
             }
 
             /// §5.3 `ReadMessage(message)`: the mirror of `writeMessage` —
@@ -769,14 +799,25 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             /// (`e`/`s` from the wire, DH/psk tokens from state) and
             /// decrypts the trailing payload into `out` (the whole
             /// `message` slice is one handshake message; the payload is
-            /// whatever follows the tokens). Returns the payload length
-            /// and, once the final message pattern has been processed,
-            /// `Split()`'s transport pair. On any error the message must
+            /// whatever follows the tokens). Returns the payload length and
+            /// whether the final message pattern has just been processed; if
+            /// so, `Split()`'s transport pair was written to `transport`
+            /// (otherwise `transport` is untouched). On any error the message must
             /// be discarded and the handshake aborted.
             pub fn readMessage(
                 self: *HandshakeState,
                 message: []const u8,
                 out: []u8,
+                transport: *[2]CipherState,
+            ) ReadError!Step {
+                return burn.run(burn.hs_burn, ReadError!Step, readMessageBody, .{ self, message, out, transport });
+            }
+
+            fn readMessageBody(
+                self: *HandshakeState,
+                message: []const u8,
+                out: []u8,
+                transport: *[2]CipherState,
             ) ReadError!Step {
                 if (self.message_index >= self.pattern.message_patterns.len)
                     return error.HandshakeComplete;
@@ -815,11 +856,11 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
 
                 self.message_index += 1;
                 if (self.message_index == self.pattern.message_patterns.len) {
-                    const pair = self.symmetric_state.split();
+                    self.symmetric_state.split(transport);
                     self.wipe();
-                    return .{ .len = payload_len, .transport = pair };
+                    return .{ .len = payload_len, .complete = true };
                 }
-                return .{ .len = payload_len, .transport = null };
+                return .{ .len = payload_len, .complete = false };
             }
         };
     };
@@ -911,7 +952,7 @@ test "CipherState: nonce = 4 zero bytes || LE64(n) for ChaChaPoly; n increments"
     const Aead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
     const key = [_]u8{0xab} ** 32;
     var cs: TestSuite.CipherState = .{};
-    cs.initializeKey(key);
+    cs.initializeKey(&key);
     cs.setNonce(7);
 
     var got: [9 + 16]u8 = undefined;
@@ -933,7 +974,7 @@ test "CipherState: nonce = 4 zero bytes || LE64(n) for ChaChaPoly; n increments"
 
 test "CipherState: auth failure leaves n unchanged; nonce 2^64-1 exhausts" {
     var cs: TestSuite.CipherState = .{};
-    cs.initializeKey([_]u8{1} ** 32);
+    cs.initializeKey(&([_]u8{1} ** 32));
     var ct: [3 + 16]u8 = undefined;
     try cs.encryptWithAd("", "abc", &ct);
     ct[0] ^= 1;
@@ -953,8 +994,8 @@ test "CipherState: rekey matches spec formula and keeps both directions in sync"
     const key = [_]u8{0x42} ** 32;
     var a: TestSuite.CipherState = .{};
     var b: TestSuite.CipherState = .{};
-    a.initializeKey(key);
-    b.initializeKey(key);
+    a.initializeKey(&key);
+    b.initializeKey(&key);
 
     a.rekey();
     // Spec §4.2: REKEY(k) = ENCRYPT(k, 2^64-1, zerolen, zeros[32])[0..32].
@@ -1033,7 +1074,8 @@ test "SymmetricState: Noise HKDF == RFC 5869 HKDF with empty info (mixKey/mixKey
     const prk2 = Hkdf.extract(&ck, "");
     var okm2: [64]u8 = undefined;
     Hkdf.expand(&okm2, "", prk2);
-    const pair = ss.split();
+    var pair: [2]TestSuite.CipherState = undefined;
+    ss.split(&pair);
     try testing.expectEqualSlices(u8, okm2[0..32], &pair[0].k);
     try testing.expectEqualSlices(u8, okm2[32..64], &pair[1].k);
     try testing.expectEqual(@as(u64, 0), pair[0].n);
@@ -1138,25 +1180,28 @@ fn runKatBothChaChaAeads(comptime Hash: type, comptime v: Kat) !void {
 fn runKat(comptime S: type, comptime v: Kat) !void {
     var ini: S.HandshakeState = .{};
     var rsp: S.HandshakeState = .{};
+    const init_s = katKeyPair(S, v.init_static);
+    const init_e = katKeyPair(S, v.init_ephemeral);
+    const resp_s = katKeyPair(S, v.resp_static);
+    const resp_e = katKeyPair(S, v.resp_ephemeral);
     ini.initialize(
         v.pattern,
         true,
         v.prologue,
-        katKeyPair(S, v.init_static),
-        katKeyPair(S, v.init_ephemeral),
-        katPub(S, v.init_remote_static),
-        null,
-        &.{},
+        &.{
+            .s = if (init_s) |*k| k else null,
+            .e = if (init_e) |*k| k else null,
+            .rs = katPub(S, v.init_remote_static),
+        },
     );
     rsp.initialize(
         v.pattern,
         false,
         v.prologue,
-        katKeyPair(S, v.resp_static),
-        katKeyPair(S, v.resp_ephemeral),
-        null,
-        null,
-        &.{},
+        &.{
+            .s = if (resp_s) |*k| k else null,
+            .e = if (resp_e) |*k| k else null,
+        },
     );
 
     const n_hs = v.pattern.message_patterns.len;
@@ -1172,20 +1217,20 @@ fn runKat(comptime S: type, comptime v: Kat) !void {
             const reader = if (from_initiator) &rsp else &ini;
             var wire: [512]u8 = undefined;
             var plain: [512]u8 = undefined;
-            const wr = try writer.writeMessage(no_random, m.payload, &wire);
+            var wt: [2]S.CipherState = undefined;
+            var rt: [2]S.CipherState = undefined;
+            const wr = try writer.writeMessage(no_random, m.payload, &wire, &wt);
             try testing.expectEqualSlices(u8, m.ciphertext, wire[0..wr.len]);
-            const rr = try reader.readMessage(m.ciphertext, &plain);
+            const rr = try reader.readMessage(m.ciphertext, &plain, &rt);
             try testing.expectEqualSlices(u8, m.payload, plain[0..rr.len]);
             if (i == n_hs - 1) {
-                const wt = wr.transport orelse return error.TestExpectedTransport;
-                const rt = rr.transport orelse return error.TestExpectedTransport;
+                if (!wr.complete or !rr.complete) return error.TestExpectedTransport;
                 try testing.expectEqualSlices(u8, &wt[0].k, &rt[0].k);
                 try testing.expectEqualSlices(u8, &wt[1].k, &rt[1].k);
                 t_ini = if (from_initiator) wt else rt;
                 t_rsp = if (from_initiator) rt else wt;
             } else {
-                try testing.expectEqual(@as(?[2]S.CipherState, null), wr.transport);
-                try testing.expectEqual(@as(?[2]S.CipherState, null), rr.transport);
+                try testing.expect(!wr.complete and !rr.complete);
             }
         } else {
             // Transport phase: [0] carries initiator→responder.
@@ -1369,36 +1414,32 @@ fn selfConsistency(
         pat,
         true,
         "prologue",
-        if (init_has_s) init_s else null,
-        null,
-        if (init_knows_rs) resp_s.public_key else null,
-        null,
-        &.{},
+        &.{
+            .s = if (init_has_s) &init_s else null,
+            .rs = if (init_knows_rs) resp_s.public_key else null,
+        },
     );
     rsp.initialize(
         pat,
         false,
         "prologue",
-        if (resp_has_s) resp_s else null,
-        null,
-        null,
-        null,
-        &.{},
+        &.{ .s = if (resp_has_s) &resp_s else null },
     );
 
-    var transport: ?[2]S.CipherState = null;
+    var transport: [2]S.CipherState = undefined;
     inline for (0..pat.message_patterns.len) |i| {
         const writer = if (i % 2 == 0) &ini else &rsp;
         const reader = if (i % 2 == 0) &rsp else &ini;
         var wire: [512]u8 = undefined;
         var plain: [64]u8 = undefined;
         const payload = "handshake payload";
-        const wr = try writer.writeMessage(random, payload, &wire);
-        const rr = try reader.readMessage(wire[0..wr.len], &plain);
+        var wt: [2]S.CipherState = undefined;
+        var rt: [2]S.CipherState = undefined;
+        const wr = try writer.writeMessage(random, payload, &wire, &wt);
+        const rr = try reader.readMessage(wire[0..wr.len], &plain, &rt);
         try testing.expectEqualSlices(u8, payload, plain[0..rr.len]);
         if (i == pat.message_patterns.len - 1) {
-            const wt = wr.transport orelse return error.TestExpectedTransport;
-            const rt = rr.transport orelse return error.TestExpectedTransport;
+            if (!wr.complete or !rr.complete) return error.TestExpectedTransport;
             try testing.expectEqualSlices(u8, &wt[0].k, &rt[0].k);
             try testing.expectEqualSlices(u8, &wt[1].k, &rt[1].k);
             transport = wt;
@@ -1411,7 +1452,7 @@ fn selfConsistency(
 
     // Transport both ways off the split pair (each side owns a copy; the
     // keys are identical, so one pair suffices for the roundtrip check).
-    var pair = transport.?;
+    var pair = transport;
     var wire: [64 + 16]u8 = undefined;
     var plain: [64]u8 = undefined;
     try pair[0].encryptWithAd("", "initiator->responder", wire[0..36]);
@@ -1440,31 +1481,33 @@ test "self-consistency: tampered handshake message fails authentication" {
 
     var ini: S.HandshakeState = .{};
     var rsp: S.HandshakeState = .{};
-    ini.initialize(patterns.NN, true, "", null, null, null, null, &.{});
-    rsp.initialize(patterns.NN, false, "", null, null, null, null, &.{});
+    ini.initialize(patterns.NN, true, "", &.{});
+    rsp.initialize(patterns.NN, false, "", &.{});
 
     var m0: [64]u8 = undefined;
     var m1: [64]u8 = undefined;
     var plain: [64]u8 = undefined;
-    const w0 = try ini.writeMessage(random, "", &m0);
-    _ = try rsp.readMessage(m0[0..w0.len], &plain);
-    const w1 = try rsp.writeMessage(random, "hello", &m1);
+    var tp: [2]S.CipherState = undefined;
+    const w0 = try ini.writeMessage(random, "", &m0, &tp);
+    _ = try rsp.readMessage(m0[0..w0.len], &plain, &tp);
+    const w1 = try rsp.writeMessage(random, "hello", &m1, &tp);
 
     // Message 2 of NN carries an AEAD-protected payload — flip one bit.
     m1[w1.len - 1] ^= 0x01;
     try testing.expectError(
         error.DecryptionFailed,
-        ini.readMessage(m1[0..w1.len], &plain),
+        ini.readMessage(m1[0..w1.len], &plain, &tp),
     );
 }
 
 test "HandshakeState: reading a truncated message fails cleanly" {
     const S = TestSuite;
     var rsp: S.HandshakeState = .{};
-    rsp.initialize(patterns.NN, false, "", null, null, null, null, &.{});
+    rsp.initialize(patterns.NN, false, "", &.{});
     var plain: [64]u8 = undefined;
     // First NN message needs at least DHLEN bytes for the `e` token.
-    try testing.expectError(error.MessageTooShort, rsp.readMessage(&[_]u8{1} ** 16, &plain));
+    var tp: [2]S.CipherState = undefined;
+    try testing.expectError(error.MessageTooShort, rsp.readMessage(&[_]u8{1} ** 16, &plain, &tp));
 }
 
 test "HandshakeState: identity-point remote static key is rejected (invalid-point DH)" {
@@ -1483,9 +1526,10 @@ test "HandshakeState: identity-point remote static key is rejected (invalid-poin
     // NK's pre-message gives the initiator the responder's static key
     // out of band; plant the identity element there so message 1's
     // `es` token (DH(e, rs)) computes against it.
-    ini.initialize(patterns.NK, true, "", null, null, zero_rs, null, &.{});
+    ini.initialize(patterns.NK, true, "", &.{ .rs = zero_rs });
     var m: [64]u8 = undefined;
-    try testing.expectError(error.DhFailed, ini.writeMessage(random, "", &m));
+    var tp: [2]S.CipherState = undefined;
+    try testing.expectError(error.DhFailed, ini.writeMessage(random, "", &m, &tp));
 }
 
 // ⚠ And it never read a message. The harness opened `smith.bytes(&msg)` and
@@ -1519,9 +1563,10 @@ const ReadCorpus = struct {
         // the harness's responder is: `e || payload`, no AEAD yet, which is
         // why the responder accepts it without knowing the initiator.
         var ini: S.HandshakeState = .{};
-        ini.initialize(patterns.NN, true, "", null, null, null, null, &.{});
+        ini.initialize(patterns.NN, true, "", &.{});
         var m: [cap]u8 = undefined;
-        const step = try ini.writeMessage(prng.random(), "hello noise", &m);
+        var tp: [2]S.CipherState = undefined;
+        const step = try ini.writeMessage(prng.random(), "hello noise", &m, &tp);
         const real = m[0..step.len];
 
         var t: [cap]u8 = undefined;
@@ -1570,12 +1615,13 @@ fn fuzzReadMessage(_: void, smith: *std.testing.Smith) !void {
     const len: usize = smith.slice(&msg);
     const S = TestSuite;
     var rsp: S.HandshakeState = .{};
-    rsp.initialize(patterns.NN, false, "", null, null, null, null, &.{});
+    rsp.initialize(patterns.NN, false, "", &.{});
     var out: [256]u8 = undefined;
     // The wire-facing decoder for an in-progress handshake: arbitrary bytes
     // must only ever yield a typed error (short message / bad auth tag /
     // handshake already complete), never a panic or OOB write into `out`.
-    _ = rsp.readMessage(msg[0..len], &out) catch return;
+    var tp: [2]S.CipherState = undefined;
+    _ = rsp.readMessage(msg[0..len], &out, &tp) catch return;
 }
 
 test "fuzz: HandshakeState.readMessage never panics on arbitrary bytes" {
@@ -1602,9 +1648,10 @@ test "corpus: every handshake seed reaches readMessage, and the payload recovere
         if (len != 0) nonempty += 1;
         const S = TestSuite;
         var rsp: S.HandshakeState = .{};
-        rsp.initialize(patterns.NN, false, "", null, null, null, null, &.{});
+        rsp.initialize(patterns.NN, false, "", &.{});
         var out: [256]u8 = undefined;
-        const step = rsp.readMessage(msg[0..len], &out) catch continue;
+        var tp: [2]S.CipherState = undefined;
+        const step = rsp.readMessage(msg[0..len], &out, &tp) catch continue;
         accepted += 1;
         payload_octets += step.len;
     }

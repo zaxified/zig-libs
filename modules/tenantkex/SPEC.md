@@ -204,6 +204,23 @@ also checked mid-handshake and after an `UnknownInitiator` refusal.
 initiator — see § 5 "Mutual authentication". `Responder.init`/`initEphemeral` take the
 provisioned `initiator_static` key; `readMessage1` refuses any other.
 
+## Secret residue on the dead stack
+
+Review 2026-10-09 (`src/stackprobe_test.zig`, ReleaseFast only): a full IK handshake through the
+public API, one probed call per step, 28 needles (both static and ephemeral private keys raw and
+clamped, `es`/`ss`/`ee`/`se`, every HKDF `temp_key`, `ck`/`k` after each `MixKey`, both session
+keys, a control; NEG 0, POS 1). The `noise` layer below burns its own calls (see `noise/SPEC.md`);
+what was left were the session keys in this module's frame (the transport pair and the
+`SessionKeys` assembly): 12 hits per 3 runs after `writeMessage2` and `readMessage2`. Now the five
+handshake calls (`init`/`initEphemeral`, `writeMessage1`, `readMessage1`, `writeMessage2`,
+`readMessage2`) run their body one frame down and burn 2 KiB (the body frame is 0.4 KiB), key pairs
+travel by `*const KeyPair`, `init` is in place, and the session keys leave through a `*SessionKeys`.
+After: 0 in every probed call.
+
+NOT covered: the caller's `KeyPair`, `SessionKeys` and `Initiator`/`Responder` (the caller's to
+wipe: `wipe()`), `FabricContext` (public), and a `noise` build whose DH leaves more than the 8 KiB
+`noise` burns.
+
 ## Backlog / deferred
 
 - **IKpsk2 (PSK) mode** *(survey 2026-09-30)* — WireGuard runs IK with a PSK as a post-quantum hedge; `noise` already has the `psk` token. Effort: small; fits §2. (Listed in SPEC §6; survey: worth doing if the fabric wants the hedge.)

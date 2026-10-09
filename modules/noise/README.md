@@ -52,9 +52,12 @@ const S2 = noise.DefaultSuite;
 // The checked constructor: validates the pattern against the keys this
 // party holds (spec §7.3) — MissingKey, PskCountMismatch, InvalidPattern —
 // so writeMessage/readMessage can never reach a missing key or PSK.
-var hs = try S.HandshakeState.init(proto.pattern, true, prologue, .{ .s = my_static, .psks = &.{psk} });
-// hs.writeMessage(...) / hs.readMessage(...) drive the handshake; the last
-// message's Step.transport carries the two transport CipherStates.
+// In place, keys by pointer (no copy of a private key in a dead frame).
+var hs: S.HandshakeState = .{};
+try hs.init(proto.pattern, true, prologue, &.{ .s = &my_static, .psks = &.{psk} });
+// hs.writeMessage(random, payload, out, &transport) / hs.readMessage(msg, out,
+// &transport) drive the handshake; the call that returns `Step.complete` has
+// written the two transport CipherStates to `transport`.
 // (`initialize` remains, unchecked.)
 
 // Any other primitive joins a suite by declaring its spec §8 name, e.g. an

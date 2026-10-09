@@ -34,10 +34,10 @@
 //! `k_neg` — a real place for this module's own code to leak, independent
 //! of whatever ct25519 does. `target = .sign` exercises exactly this path.
 //!
-//! - **`target = .sign`** — `xeddsa.sign(montgomery_priv, msg, z)`, tainting
+//! - **`target = .sign`** — `shim.xeddsa.sign(montgomery_priv, msg, z)`, tainting
 //!   `montgomery_priv`: the identity-key or signed-prekey PRIVATE scalar
 //!   `x3dh.generateSignedPreKey` passes as `bob_ik.secret_key` (`x3dh.zig`
-//!   line ~503, `xeddsa.sign(bob_ik.secret_key, &kp.public_key, z)` — this
+//!   line ~503, `shim.xeddsa.sign(bob_ik.secret_key, &kp.public_key, z)` — this
 //!   harness's call is that call site, not a synthetic stand-in). Exercises
 //!   `calculateKeyPair`'s clamp/reduce/negate-select, both `hash1`/plain
 //!   SHA-512 derivations, `ct25519.mulBase` (twice: key point and nonce
@@ -114,6 +114,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const shim = @import("test_shim.zig");
 const xeddsa = @import("xeddsa.zig");
 const x3dh = @import("x3dh.zig");
 const ratchet = @import("ratchet.zig");
@@ -181,19 +182,19 @@ fn buildSession(allocator: std.mem.Allocator, io: std.Io) !struct { alice: ratch
         .one_time_prekey_id = bob_opk.id,
     };
 
-    const alice_out = try x3dh.initiateUnverified(allocator, alice_ik, bundle, "", io);
+    const alice_out = try shim.x3dh.initiateUnverified(allocator, alice_ik, bundle, "", io);
     defer alice_out.message.deinit(allocator);
-    const bob_out = try x3dh.respond(allocator, bob_ik, bob_spk, bob_opk, alice_out.message);
+    const bob_out = try shim.x3dh.respond(allocator, bob_ik, bob_spk, bob_opk, alice_out.message);
     defer allocator.free(bob_out.plaintext);
     const bob_agr = bob_out.agreement;
 
-    const alice = try ratchet.State.initAlice(
+    const alice = try shim.State.initAlice(
         alice_out.agreement.shared_secret,
         alice_out.agreement.associated_data,
         bob_spk_kp.public_key,
         io,
     );
-    const bob = ratchet.State.initBob(bob_agr.shared_secret, bob_agr.associated_data, bob_spk_kp);
+    const bob = shim.State.initBob(bob_agr.shared_secret, bob_agr.associated_data, bob_spk_kp);
     return .{ .alice = alice, .bob = bob };
 }
 
@@ -223,7 +224,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // Not tainted -- see the module doc comment.
             const z: xeddsa.RandomData = [_]u8{0x5A} ** 64;
 
-            const sig = xeddsa.sign(priv, msg, z);
+            const sig = shim.xeddsa.sign(priv, msg, z);
             // Propagation proof: std.debug.print is NOT constant-time.
             std.debug.print("sig={x}\n", .{sig});
         },

@@ -422,6 +422,35 @@ provided.
   X3DH `generateSignedPreKey` -> `initiate` -> `respond` end-to-end plus
   tampered-signature / substituted-prekey fail-closed cases.
 
+## Secret residue on the dead stack
+
+Every public entry point that touches a secret (`x3dh.generateKeyPair`,
+`generateSignedPreKey`, `xeddsa.sign` / `libsignal.sign`, `x3dh` and `pqxdh`
+`initiate[Unverified]` / `respond`, `pqxdh.generateKemPreKey`,
+`ratchet.State.initAlice` / `initBob` / `encrypt` / `decrypt`) runs its body one
+frame down (`burn.run`) and then zeroes the stack that body dirtied
+(`burn.zig`). Measured body depth, ReleaseFast, 2026-10-09: 2.5-7 KiB for the
+curve and ratchet calls, **89.5 KiB (`pqxdh.initiate`), 120 KiB
+(`pqxdh.respond`) and 135.5 KiB (`generateKemPreKey`)** for the ML-KEM-1024 ones;
+the burns are about 2x that (8-16 KiB, 192 / 256 / 288 KiB). Secret inputs
+(identity / prekey private keys, `sk`, the ratchet key pair) are `*const`;
+secret outputs (key pairs, `SignedPreKey`, `KemPreKey`, `InitiateOutput`,
+`RespondOutput`, the new `State`) go through `out`.
+
+`src/stackprobe_test.zig` drives every call with a RECORDING `std.Io` (a copy of
+`Threaded`'s vtable whose `randomSecure` logs and derives each draw), so the
+ephemeral keys, the KEM seed and the new ratchet key are needles, together with
+the four DH outputs, the KDF input and `prk`, `SK`, the AEAD key, XEdDSA's secret
+scalar and nonce, the ML-KEM decapsulation key (fragments), and the chain / message
+/ AEAD keys of the ratchet. Each set has a control needle. ReleaseFast only.
+
+Not covered: the long-lived `ratchet.State` (root / chain keys, the DH secret and
+the skipped-key store live there by design, zeroed by `deinit`); `z`, the
+caller-supplied XEdDSA randomness (hashed with the secret scalar, not a secret on
+its own); `initial_message.seal` / `open` and the codecs, which only run inside the
+burned bodies; a caller's own frames and the heap; registers and the red zone below
+the stack pointer.
+
 ## Backlog / deferred
 
 - **Signal-compatible wire messages and KDF strings** (`SignalMessage`/`PreKeySignalMessage` protobufs, AES-256-CBC + truncated HMAC-SHA256, libsignal's `info` labels) *(survey 2026-09-30)*: without this a session cannot talk to Signal servers or clients; the module chose ChaCha20-Poly1305 over a fixed header because the spec leaves the AEAD to the application (`interop_vectors.zig` header). It is a design choice for the spec-shaped core, but a compatibility layer is what a libsignal user expects. Effort: large (protobuf codec, prekey-message flow, version handling). Fits §2 if the protobuf codec is a sibling module.

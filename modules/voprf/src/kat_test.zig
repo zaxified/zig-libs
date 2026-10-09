@@ -8,6 +8,7 @@
 const std = @import("std");
 const testing = std.testing;
 const voprf = @import("root.zig");
+const shim = @import("test_shim.zig");
 const kat = @import("kat_vectors.zig");
 
 const Element = voprf.Element;
@@ -25,18 +26,18 @@ test "expandMessageXmd matches RFC 9380 Appendix K.3 (SHA-512, ell = 1)" {
 // ── DeriveKeyPair (§3.2.1) reproduces skSm/pkSm for all three modes ──────
 
 test "deriveKeyPair reproduces A.1.1 OPRF skSm" {
-    const kp = try voprf.deriveKeyPair(.oprf, kat.seed, &kat.key_info);
+    const kp = try shim.deriveKeyPair(.oprf, kat.seed, &kat.key_info);
     try testing.expectEqualSlices(u8, &kat.oprf_sk, &kp.sk);
 }
 
 test "deriveKeyPair reproduces A.1.2 VOPRF skSm and pkSm" {
-    const kp = try voprf.deriveKeyPair(.voprf, kat.seed, &kat.key_info);
+    const kp = try shim.deriveKeyPair(.voprf, kat.seed, &kat.key_info);
     try testing.expectEqualSlices(u8, &kat.voprf_sk, &kp.sk);
     try testing.expectEqualSlices(u8, &kat.voprf_pk, &kp.pk.toBytes());
 }
 
 test "deriveKeyPair reproduces A.1.3 POPRF skSm and pkSm" {
-    const kp = try voprf.deriveKeyPair(.poprf, kat.seed, &kat.key_info);
+    const kp = try shim.deriveKeyPair(.poprf, kat.seed, &kat.key_info);
     try testing.expectEqualSlices(u8, &kat.poprf_sk, &kp.sk);
     try testing.expectEqualSlices(u8, &kat.poprf_pk, &kp.pk.toBytes());
 }
@@ -47,19 +48,19 @@ test "OPRF A.1.1: blind, blindEvaluate, finalize, and direct evaluate all match"
     for (kat.oprf_vectors) |v| {
         // (2) Blind reproduces BlindedElement (also pins HashToGroup,
         // hence expandMessageXmd-64 and Ristretto255.fromUniform).
-        const blinded = try voprf.blind(.oprf, v.input, v.blind);
+        const blinded = try shim.blind(.oprf, v.input, v.blind);
         try testing.expectEqualSlices(u8, &v.blinded_element, &blinded.toBytes());
 
         // (3) BlindEvaluate reproduces EvaluationElement.
-        const evaluated = voprf.blindEvaluate(kat.oprf_sk, blinded);
+        const evaluated = shim.blindEvaluate(kat.oprf_sk, blinded);
         try testing.expectEqualSlices(u8, &v.evaluation_element, &evaluated.toBytes());
 
         // (6) Finalize reproduces Output.
-        const output = try voprf.finalize(v.input, v.blind, evaluated);
+        const output = try shim.finalize(v.input, v.blind, evaluated);
         try testing.expectEqualSlices(u8, &v.output, &output);
 
         // (7) The direct PRF agrees with the blinded round trip.
-        const direct = try voprf.evaluate(.oprf, kat.oprf_sk, v.input);
+        const direct = try shim.evaluate(.oprf, kat.oprf_sk, v.input);
         try testing.expectEqualSlices(u8, &v.output, &direct);
 
         // Wire-validation round trip for the transmitted elements.
@@ -73,12 +74,12 @@ test "OPRF A.1.1: blind, blindEvaluate, finalize, and direct evaluate all match"
 test "VOPRF A.1.2: blind, blindEvaluate+proof, verify, finalize all match" {
     const pk = try Element.fromBytes(kat.voprf_pk);
     for (kat.voprf_vectors) |v| {
-        const blinded = try voprf.blind(.voprf, v.input, v.blind);
+        const blinded = try shim.blind(.voprf, v.input, v.blind);
         try testing.expectEqualSlices(u8, &v.blinded_element, &blinded.toBytes());
 
         // (3)+(4) BlindEvaluate reproduces EvaluationElement AND the
         // DLEQ Proof byte-exact given the vector's ProofRandomScalar.
-        const eval = try voprf.blindEvaluateVerifiable(kat.voprf_sk, pk, blinded, v.proof_random_scalar);
+        const eval = try shim.blindEvaluateVerifiable(kat.voprf_sk, pk, blinded, v.proof_random_scalar);
         try testing.expectEqualSlices(u8, &v.evaluation_element, &eval.evaluated_element.toBytes());
         try testing.expectEqualSlices(u8, &v.proof, &eval.proof.toBytes());
 
@@ -126,7 +127,7 @@ test "VOPRF A.1.2: blind, blindEvaluate+proof, verify, finalize all match" {
         ));
 
         // (6) Verifiable Finalize (verify-then-unblind) reproduces Output.
-        const output = try voprf.finalizeVerifiable(
+        const output = try shim.finalizeVerifiable(
             v.input,
             v.blind,
             eval.evaluated_element,
@@ -137,7 +138,7 @@ test "VOPRF A.1.2: blind, blindEvaluate+proof, verify, finalize all match" {
         try testing.expectEqualSlices(u8, &v.output, &output);
 
         // finalizeVerifiable fails CLOSED on a bad proof (no output).
-        try testing.expectError(error.InvalidProof, voprf.finalizeVerifiable(
+        try testing.expectError(error.InvalidProof, shim.finalizeVerifiable(
             v.input,
             v.blind,
             eval.evaluated_element,
@@ -147,7 +148,7 @@ test "VOPRF A.1.2: blind, blindEvaluate+proof, verify, finalize all match" {
         ));
 
         // (7) The direct PRF agrees with the verified round trip.
-        const direct = try voprf.evaluate(.voprf, kat.voprf_sk, v.input);
+        const direct = try shim.evaluate(.voprf, kat.voprf_sk, v.input);
         try testing.expectEqualSlices(u8, &v.output, &direct);
     }
 }
@@ -158,12 +159,12 @@ test "VOPRF A.1.2.3: batch size 2 — one proof covers both evaluations" {
 
     var blinded: [2]Element = undefined;
     for (v.input, v.blind, 0..) |input, blind_scalar, i| {
-        blinded[i] = try voprf.blind(.voprf, input, blind_scalar);
+        blinded[i] = try shim.blind(.voprf, input, blind_scalar);
         try testing.expectEqualSlices(u8, &v.blinded_element[i], &blinded[i].toBytes());
     }
 
     var evaluated: [2]Element = undefined;
-    const proof = try voprf.blindEvaluateVerifiableBatch(
+    const proof = try shim.blindEvaluateVerifiableBatch(
         kat.voprf_sk,
         pk,
         &blinded,
@@ -178,7 +179,7 @@ test "VOPRF A.1.2.3: batch size 2 — one proof covers both evaluations" {
     // Client side: verify the batched proof once, then finalize each.
     try voprf.verifyProof(.voprf, Element.generator, pk, &blinded, &evaluated, proof);
     for (v.input, v.blind, evaluated, v.output) |input, blind_scalar, eval_element, expected| {
-        const output = try voprf.finalize(input, blind_scalar, eval_element);
+        const output = try shim.finalize(input, blind_scalar, eval_element);
         try testing.expectEqualSlices(u8, &expected, &output);
     }
 
@@ -204,7 +205,7 @@ test "VOPRF A.1.2.3: batch size 2 — one proof covers both evaluations" {
 test "blindEvaluateVerifiableBatch: empty batch and mismatched output length are errors, not asserts" {
     const pk = try Element.fromBytes(kat.voprf_pk);
     var no_elements: [0]Element = undefined;
-    try testing.expectError(error.EmptyBatch, voprf.blindEvaluateVerifiableBatch(
+    try testing.expectError(error.EmptyBatch, shim.blindEvaluateVerifiableBatch(
         kat.voprf_sk,
         pk,
         &no_elements,
@@ -214,7 +215,7 @@ test "blindEvaluateVerifiableBatch: empty batch and mismatched output length are
 
     const blinded = [_]Element{ Element.generator, Element.generator };
     var short_out: [1]Element = undefined;
-    try testing.expectError(error.MismatchedLengths, voprf.blindEvaluateVerifiableBatch(
+    try testing.expectError(error.MismatchedLengths, shim.blindEvaluateVerifiableBatch(
         kat.voprf_sk,
         pk,
         &blinded,
@@ -224,7 +225,7 @@ test "blindEvaluateVerifiableBatch: empty batch and mismatched output length are
 
     // Matched, non-empty lengths still work.
     var exact_out: [2]Element = undefined;
-    _ = try voprf.blindEvaluateVerifiableBatch(kat.voprf_sk, pk, &blinded, &exact_out, kat.voprf_batch.proof_random_scalar);
+    _ = try shim.blindEvaluateVerifiableBatch(kat.voprf_sk, pk, &blinded, &exact_out, kat.voprf_batch.proof_random_scalar);
 }
 
 // ── POPRF mode (A.1.3) ───────────────────────────────────────────────────
@@ -232,10 +233,10 @@ test "blindEvaluateVerifiableBatch: empty batch and mismatched output length are
 test "POPRF A.1.3: blind, blindEvaluate+proof, finalize all match" {
     const pk = try Element.fromBytes(kat.poprf_pk);
     for (kat.poprf_vectors) |v| {
-        const blind_result = try voprf.blindPoprf(v.input, v.info, pk, v.blind);
+        const blind_result = try shim.blindPoprf(v.input, v.info, pk, v.blind);
         try testing.expectEqualSlices(u8, &v.blinded_element, &blind_result.blinded_element.toBytes());
 
-        const eval = try voprf.blindEvaluatePoprf(
+        const eval = try shim.blindEvaluatePoprf(
             kat.poprf_sk,
             blind_result.blinded_element,
             v.info,
@@ -245,7 +246,7 @@ test "POPRF A.1.3: blind, blindEvaluate+proof, finalize all match" {
         try testing.expectEqualSlices(u8, &v.proof, &eval.proof.toBytes());
 
         const proof = try Proof.fromBytes(v.proof);
-        const output = try voprf.finalizePoprf(
+        const output = try shim.finalizePoprf(
             v.input,
             v.blind,
             eval.evaluated_element,
@@ -259,7 +260,7 @@ test "POPRF A.1.3: blind, blindEvaluate+proof, finalize all match" {
         // Fail closed on a tampered proof.
         var bad = proof;
         bad.c[5] ^= 0x80;
-        try testing.expectError(error.InvalidProof, voprf.finalizePoprf(
+        try testing.expectError(error.InvalidProof, shim.finalizePoprf(
             v.input,
             v.blind,
             eval.evaluated_element,
@@ -270,7 +271,7 @@ test "POPRF A.1.3: blind, blindEvaluate+proof, finalize all match" {
         ));
 
         // The direct POPRF agrees with the blinded round trip.
-        const direct = try voprf.evaluatePoprf(kat.poprf_sk, v.input, v.info);
+        const direct = try shim.evaluatePoprf(kat.poprf_sk, v.input, v.info);
         try testing.expectEqualSlices(u8, &v.output, &direct);
     }
 }
@@ -282,14 +283,14 @@ test "POPRF A.1.3.3: batch size 2 — one proof covers both evaluations" {
     var blinded: [2]Element = undefined;
     var tweaked_key: Element = undefined;
     for (v.input, v.blind, 0..) |input, blind_scalar, i| {
-        const res = try voprf.blindPoprf(input, v.info, pk, blind_scalar);
+        const res = try shim.blindPoprf(input, v.info, pk, blind_scalar);
         blinded[i] = res.blinded_element;
         tweaked_key = res.tweaked_key; // identical for both (same info/pkS)
         try testing.expectEqualSlices(u8, &v.blinded_element[i], &blinded[i].toBytes());
     }
 
     var evaluated: [2]Element = undefined;
-    const proof = try voprf.blindEvaluatePoprfBatch(
+    const proof = try shim.blindEvaluatePoprfBatch(
         kat.poprf_sk,
         &blinded,
         v.info,
@@ -304,7 +305,7 @@ test "POPRF A.1.3.3: batch size 2 — one proof covers both evaluations" {
     // Verify once (note the swapped composite lists), finalize each.
     try voprf.verifyProof(.poprf, Element.generator, tweaked_key, &evaluated, &blinded, proof);
     for (v.input, v.blind, evaluated, v.output) |input, blind_scalar, eval_element, expected| {
-        const output = try voprf.finalizePoprfUnverified(input, blind_scalar, eval_element, v.info);
+        const output = try shim.finalizePoprfUnverified(input, blind_scalar, eval_element, v.info);
         try testing.expectEqualSlices(u8, &expected, &output);
     }
 }
@@ -312,7 +313,7 @@ test "POPRF A.1.3.3: batch size 2 — one proof covers both evaluations" {
 // Same shape as blindEvaluateVerifiableBatch above, in blindEvaluatePoprfBatch.
 test "blindEvaluatePoprfBatch: empty batch and mismatched output length are errors, not asserts" {
     var no_elements: [0]Element = undefined;
-    try testing.expectError(error.EmptyBatch, voprf.blindEvaluatePoprfBatch(
+    try testing.expectError(error.EmptyBatch, shim.blindEvaluatePoprfBatch(
         kat.poprf_sk,
         &no_elements,
         kat.poprf_batch.info,
@@ -322,7 +323,7 @@ test "blindEvaluatePoprfBatch: empty batch and mismatched output length are erro
 
     const blinded = [_]Element{ Element.generator, Element.generator };
     var short_out: [1]Element = undefined;
-    try testing.expectError(error.MismatchedLengths, voprf.blindEvaluatePoprfBatch(
+    try testing.expectError(error.MismatchedLengths, shim.blindEvaluatePoprfBatch(
         kat.poprf_sk,
         &blinded,
         kat.poprf_batch.info,
@@ -332,39 +333,39 @@ test "blindEvaluatePoprfBatch: empty batch and mismatched output length are erro
 
     // Matched, non-empty lengths still work.
     var exact_out: [2]Element = undefined;
-    _ = try voprf.blindEvaluatePoprfBatch(kat.poprf_sk, &blinded, kat.poprf_batch.info, &exact_out, kat.poprf_batch.proof_random_scalar);
+    _ = try shim.blindEvaluatePoprfBatch(kat.poprf_sk, &blinded, kat.poprf_batch.info, &exact_out, kat.poprf_batch.proof_random_scalar);
 }
 
 // ── end-to-end round trips with fresh (non-vector) material ─────────────
 
 test "e2e OPRF: fresh key + fresh blind round-trips and agrees with evaluate" {
     const seed = [_]u8{0x7e} ** 32;
-    const kp = try voprf.deriveKeyPair(.oprf, seed, "e2e oprf");
+    const kp = try shim.deriveKeyPair(.oprf, seed, "e2e oprf");
     // Deterministic stand-ins for CSPRNG output (tests must not use RNG).
-    const blind_scalar = voprf.scalarFromWideBytes([_]u8{0x11} ** 64);
+    const blind_scalar = shim.scalarFromWideBytes([_]u8{0x11} ** 64);
     const input = "e2e private input";
 
-    const blinded = try voprf.blind(.oprf, input, blind_scalar);
-    const evaluated = voprf.blindEvaluate(kp.sk, blinded);
-    const output = try voprf.finalize(input, blind_scalar, evaluated);
-    const direct = try voprf.evaluate(.oprf, kp.sk, input);
+    const blinded = try shim.blind(.oprf, input, blind_scalar);
+    const evaluated = shim.blindEvaluate(kp.sk, blinded);
+    const output = try shim.finalize(input, blind_scalar, evaluated);
+    const direct = try shim.evaluate(.oprf, kp.sk, input);
     try testing.expectEqualSlices(u8, &direct, &output);
 
     // A different input must not collide.
-    const other = try voprf.evaluate(.oprf, kp.sk, "another input");
+    const other = try shim.evaluate(.oprf, kp.sk, "another input");
     try testing.expect(!std.mem.eql(u8, &other, &output));
 }
 
 test "e2e VOPRF: fresh key, verified round trip agrees with evaluate" {
     const seed = [_]u8{0x2b} ** 32;
-    const kp = try voprf.deriveKeyPair(.voprf, seed, "e2e voprf");
-    const blind_scalar = voprf.scalarFromWideBytes([_]u8{0x22} ** 64);
-    const proof_r = voprf.scalarFromWideBytes([_]u8{0x33} ** 64);
+    const kp = try shim.deriveKeyPair(.voprf, seed, "e2e voprf");
+    const blind_scalar = shim.scalarFromWideBytes([_]u8{0x22} ** 64);
+    const proof_r = shim.scalarFromWideBytes([_]u8{0x33} ** 64);
     const input = "e2e verifiable input";
 
-    const blinded = try voprf.blind(.voprf, input, blind_scalar);
-    const eval = try voprf.blindEvaluateVerifiable(kp.sk, kp.pk, blinded, proof_r);
-    const output = try voprf.finalizeVerifiable(
+    const blinded = try shim.blind(.voprf, input, blind_scalar);
+    const eval = try shim.blindEvaluateVerifiable(kp.sk, kp.pk, blinded, proof_r);
+    const output = try shim.finalizeVerifiable(
         input,
         blind_scalar,
         eval.evaluated_element,
@@ -372,13 +373,13 @@ test "e2e VOPRF: fresh key, verified round trip agrees with evaluate" {
         kp.pk,
         eval.proof,
     );
-    const direct = try voprf.evaluate(.voprf, kp.sk, input);
+    const direct = try shim.evaluate(.voprf, kp.sk, input);
     try testing.expectEqualSlices(u8, &direct, &output);
 
     // A proof made under a DIFFERENT key must be rejected by finalize.
-    const other_kp = try voprf.deriveKeyPair(.voprf, [_]u8{0x2c} ** 32, "e2e voprf");
-    const forged = try voprf.blindEvaluateVerifiable(other_kp.sk, other_kp.pk, blinded, proof_r);
-    try testing.expectError(error.InvalidProof, voprf.finalizeVerifiable(
+    const other_kp = try shim.deriveKeyPair(.voprf, [_]u8{0x2c} ** 32, "e2e voprf");
+    const forged = try shim.blindEvaluateVerifiable(other_kp.sk, other_kp.pk, blinded, proof_r);
+    try testing.expectError(error.InvalidProof, shim.finalizeVerifiable(
         input,
         blind_scalar,
         forged.evaluated_element,
@@ -390,15 +391,15 @@ test "e2e VOPRF: fresh key, verified round trip agrees with evaluate" {
 
 test "e2e POPRF: fresh key, verified round trip agrees with evaluate" {
     const seed = [_]u8{0x5d} ** 32;
-    const kp = try voprf.deriveKeyPair(.poprf, seed, "e2e poprf");
-    const blind_scalar = voprf.scalarFromWideBytes([_]u8{0x44} ** 64);
-    const proof_r = voprf.scalarFromWideBytes([_]u8{0x55} ** 64);
+    const kp = try shim.deriveKeyPair(.poprf, seed, "e2e poprf");
+    const blind_scalar = shim.scalarFromWideBytes([_]u8{0x44} ** 64);
+    const proof_r = shim.scalarFromWideBytes([_]u8{0x55} ** 64);
     const input = "e2e partially oblivious input";
     const info = "public metadata";
 
-    const blind_result = try voprf.blindPoprf(input, info, kp.pk, blind_scalar);
-    const eval = try voprf.blindEvaluatePoprf(kp.sk, blind_result.blinded_element, info, proof_r);
-    const output = try voprf.finalizePoprf(
+    const blind_result = try shim.blindPoprf(input, info, kp.pk, blind_scalar);
+    const eval = try shim.blindEvaluatePoprf(kp.sk, blind_result.blinded_element, info, proof_r);
+    const output = try shim.finalizePoprf(
         input,
         blind_scalar,
         eval.evaluated_element,
@@ -407,11 +408,11 @@ test "e2e POPRF: fresh key, verified round trip agrees with evaluate" {
         info,
         blind_result.tweaked_key,
     );
-    const direct = try voprf.evaluatePoprf(kp.sk, input, info);
+    const direct = try shim.evaluatePoprf(kp.sk, input, info);
     try testing.expectEqualSlices(u8, &direct, &output);
 
     // Different public info must change the output.
-    const other = try voprf.evaluatePoprf(kp.sk, input, "other metadata");
+    const other = try shim.evaluatePoprf(kp.sk, input, "other metadata");
     try testing.expect(!std.mem.eql(u8, &other, &output));
 }
 
@@ -440,12 +441,12 @@ test "finalize REJECTS a zero blind scalar (degenerate unblind, RFC 9497 Invalid
     // vector's/e2e test's blind scalar is a genuine nonzero value, so
     // this guard could be deleted without any existing test noticing.
     const seed = [_]u8{0x99} ** 32;
-    const kp = try voprf.deriveKeyPair(.oprf, seed, "zero blind test");
-    const real_blind = voprf.scalarFromWideBytes([_]u8{0x77} ** 64);
+    const kp = try shim.deriveKeyPair(.oprf, seed, "zero blind test");
+    const real_blind = shim.scalarFromWideBytes([_]u8{0x77} ** 64);
     const zero_blind = [_]u8{0} ** voprf.Ns;
     const input = "zero blind input";
 
-    const blinded = try voprf.blind(.oprf, input, real_blind);
-    const evaluated = voprf.blindEvaluate(kp.sk, blinded);
-    try testing.expectError(error.InvalidBlind, voprf.finalize(input, zero_blind, evaluated));
+    const blinded = try shim.blind(.oprf, input, real_blind);
+    const evaluated = shim.blindEvaluate(kp.sk, blinded);
+    try testing.expectError(error.InvalidBlind, shim.finalize(input, zero_blind, evaluated));
 }

@@ -73,6 +73,7 @@ const std = @import("std");
 const initial_message = @import("initial_message.zig");
 const xeddsa = @import("xeddsa.zig");
 const entropy = @import("entropy");
+const burn = @import("burn.zig");
 const X25519 = std.crypto.dh.X25519;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 
@@ -147,15 +148,23 @@ pub const OneTimePreKey = struct {
 /// `xeddsa.sign`'s `z` parameter — which is why `CONVENTIONS.md` §2.2 can
 /// name signal's KAT seam an `io.random` exception without that exception
 /// reaching any key minted here.
-pub fn generateKeyPair(io: std.Io) X25519.KeyPair {
+///
+/// The key pair goes through `out`, not a return value; the stack the draw
+/// used (the seed is the secret key) is burned before the call returns.
+pub fn generateKeyPair(io: std.Io, out: *X25519.KeyPair) void {
+    burn.run(burn.key_burn, void, generateKeyPairBody, .{ io, out });
+}
+
+fn generateKeyPairBody(io: std.Io, out: *X25519.KeyPair) void {
     var seed: [X25519.seed_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &seed);
     while (true) {
         entropy.fill(io, &seed);
-        return X25519.KeyPair.generateDeterministic(seed) catch {
+        out.* = X25519.KeyPair.generateDeterministic(seed) catch {
             @branchHint(.unlikely);
             continue;
         };
+        return;
     }
 }
 
@@ -402,17 +411,34 @@ pub const InitiateOutput = struct {
 /// 5. Seal `initial_plaintext` under a key derived from `SK`, with `AD` as
 ///    associated data, and package `(IKA_pub, EKA_pub, SPKB's id, OPKB's id
 ///    if used, that ciphertext)` into the `InitialMessage` Alice sends Bob.
+///
+/// `alice_ik` by pointer; the output (whose `agreement.shared_secret` is the
+/// session secret) through `out`, written only on success. The stack the
+/// handshake used is burned before the call returns.
 pub fn initiateUnverified(
     allocator: std.mem.Allocator,
-    alice_ik: IdentityKey,
+    alice_ik: *const IdentityKey,
     bob_bundle: PreKeyBundle,
     initial_plaintext: []const u8,
     io: std.Io,
-) (AgreementError || std.mem.Allocator.Error)!InitiateOutput {
+    out: *InitiateOutput,
+) (AgreementError || std.mem.Allocator.Error)!void {
+    return burn.run(burn.x3dh_burn, (AgreementError || std.mem.Allocator.Error)!void, initiateUnverifiedBody, .{ allocator, alice_ik, bob_bundle, initial_plaintext, io, out });
+}
+
+fn initiateUnverifiedBody(
+    allocator: std.mem.Allocator,
+    alice_ik: *const IdentityKey,
+    bob_bundle: PreKeyBundle,
+    initial_plaintext: []const u8,
+    io: std.Io,
+    out: *InitiateOutput,
+) (AgreementError || std.mem.Allocator.Error)!void {
     // `EKA` is single-use and feeds three of the four DHs — it is the only
     // secret Alice contributes to this session that is not her long-term
     // identity key, so it carries the run's forward secrecy on its own.
-    const ek = generateKeyPair(io);
+    var ek: X25519.KeyPair = undefined;
+    generateKeyPair(io, &ek);
 
     const dh1 = try dh(alice_ik.secret_key, bob_bundle.signed_prekey);
     const dh2 = try dh(ek.secret_key, bob_bundle.identity_key);
@@ -426,7 +452,7 @@ pub fn initiateUnverified(
     const ad = associatedData(alice_ik.public_key, bob_bundle.identity_key);
 
     const ciphertext_owned = try initial_message.seal(allocator, shared_secret, &ad, initial_plaintext);
-    return .{
+    out.* = .{
         .agreement = .{ .shared_secret = shared_secret, .associated_data = ad },
         .message = .{
             .identity_key = alice_ik.public_key,
@@ -444,14 +470,15 @@ pub fn initiateUnverified(
 /// then defers to `initiateUnverified`.
 pub fn initiate(
     allocator: std.mem.Allocator,
-    alice_ik: IdentityKey,
+    alice_ik: *const IdentityKey,
     bob_bundle: PreKeyBundle,
     initial_plaintext: []const u8,
     io: std.Io,
-) (InitiateError || std.mem.Allocator.Error)!InitiateOutput {
+    out: *InitiateOutput,
+) (InitiateError || std.mem.Allocator.Error)!void {
     if (!xeddsa.verify(bob_bundle.identity_key, &bob_bundle.signed_prekey, bob_bundle.signed_prekey_signature))
         return error.SignedPreKeyVerificationFailed;
-    return initiateUnverified(allocator, alice_ik, bob_bundle, initial_plaintext, io);
+    return initiateUnverified(allocator, alice_ik, bob_bundle, initial_plaintext, io, out);
 }
 
 pub const RespondError = AgreementError || initial_message.OpenError;
@@ -482,13 +509,28 @@ pub const RespondOutput = struct {
 /// ciphertext under `SK` and `AD`. If it does not authenticate, `SK` is zeroed
 /// and `error.InitialMessageAuthenticationFailed` returned — no `Agreement`
 /// escapes a handshake whose first message did not verify.
+///
+/// Bob's keys by pointer; the output (the session secret) through `out`,
+/// written only on success. Stack burned before the call returns.
 pub fn respond(
     allocator: std.mem.Allocator,
-    bob_ik: IdentityKey,
-    bob_spk: SignedPreKey,
-    bob_opk: ?OneTimePreKey,
+    bob_ik: *const IdentityKey,
+    bob_spk: *const SignedPreKey,
+    bob_opk: ?*const OneTimePreKey,
     alice_initial: InitialMessage,
-) RespondError!RespondOutput {
+    out: *RespondOutput,
+) RespondError!void {
+    return burn.run(burn.x3dh_burn, RespondError!void, respondBody, .{ allocator, bob_ik, bob_spk, bob_opk, alice_initial, out });
+}
+
+fn respondBody(
+    allocator: std.mem.Allocator,
+    bob_ik: *const IdentityKey,
+    bob_spk: *const SignedPreKey,
+    bob_opk: ?*const OneTimePreKey,
+    alice_initial: InitialMessage,
+    out: *RespondOutput,
+) RespondError!void {
     const dh1 = try dh(bob_spk.key_pair.secret_key, alice_initial.identity_key);
     const dh2 = try dh(bob_ik.secret_key, alice_initial.ephemeral_key);
     const dh3 = try dh(bob_spk.key_pair.secret_key, alice_initial.ephemeral_key);
@@ -503,7 +545,7 @@ pub fn respond(
         std.crypto.secureZero(u8, &shared_secret);
         return err;
     };
-    return .{
+    out.* = .{
         .agreement = .{ .shared_secret = shared_secret, .associated_data = ad },
         .plaintext = plaintext,
     };
@@ -521,12 +563,20 @@ pub fn respond(
 /// hashed together with the secret scalar and the message, never used
 /// alone — and passing it in is what makes the published vectors
 /// reproducible).
-pub fn generateSignedPreKey(bob_ik: IdentityKey, id: u32, z: xeddsa.RandomData, io: std.Io) SignedPreKey {
+///
+/// `bob_ik` by pointer; the new prekey (a secret key inside) through `out`.
+/// Stack burned before the call returns.
+pub fn generateSignedPreKey(bob_ik: *const IdentityKey, id: u32, z: xeddsa.RandomData, io: std.Io, out: *SignedPreKey) void {
+    burn.run(burn.sign_burn, void, generateSignedPreKeyBody, .{ bob_ik, id, z, io, out });
+}
+
+fn generateSignedPreKeyBody(bob_ik: *const IdentityKey, id: u32, z: xeddsa.RandomData, io: std.Io, out: *SignedPreKey) void {
     // `SPKB` is medium-term: it signs Bob's bundle for every session opened
     // between two rotations, so one weak draw compromises all of them.
-    const kp = generateKeyPair(io);
-    const sig = xeddsa.sign(bob_ik.secret_key, &kp.public_key, z);
-    return .{ .key_pair = kp, .signature = sig, .id = id };
+    var kp: X25519.KeyPair = undefined;
+    generateKeyPair(io, &kp);
+    const sig = xeddsa.sign(&bob_ik.secret_key, &kp.public_key, z);
+    out.* = .{ .key_pair = kp, .signature = sig, .id = id };
 }
 
 // ── tests ────────────────────────────────────────────────────────────

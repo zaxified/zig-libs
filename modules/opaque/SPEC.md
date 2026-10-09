@@ -234,6 +234,37 @@ Positive control: one branch on a secret byte inserted into
 `finalizeRegistrationRequest`, `generateKE3` and `generateKE2` adds exactly one
 context per target (4 → 5, 11 → 12, 2 → 3), at the inserted line.
 
+## Secret residue on the dead stack
+
+Every public entry point that touches a secret (`deriveAkeKeyPair`,
+`createRegistrationRequest`/`Response`, `finalizeRegistrationRequest`,
+`generateKE1`/`KE2`/`KE3`, `serverFinish`) runs its body one frame down
+(`burn.run`) and then zeroes the stack that body dirtied (`burn.zig`: 8 KiB
+for the key derivation and `serverFinish`, 20 KiB for the one-multiply calls,
+24 KiB for the finalize-registration and `generateKE2`, 28 KiB for
+`generateKE3`). Measured body depth, ReleaseFast, 2026-10-09: 0.2 KiB
+(`serverFinish`) .. 12.2 KiB (`generateKE3`); the burns are about 2x that. The
+`voprf` calls underneath burn their own frames as well.
+Secret inputs (`blind`, the key-share and AKE seeds, the server private key,
+`oprf_seed`, the login `state`) are taken by `*const`; secret outputs (the key
+pair, `GenerateKE1/2/3Result`, `FinalizeRegistrationResult`, the session key)
+go through `out`, never by value and never inside an error union.
+
+`src/stackprobe_test.zig` drives a full registration and login with fixed
+randomness (the module has no RNG) and scans the dead window after each call
+for the password, blind and its inverse, OPRF output, randomized password,
+masking / auth / export keys, the client's long-term and ephemeral keys and
+seeds, the server key, the per-client OPRF key, the three DH outputs, `ikm`,
+the key schedule's `prk` / handshake secret / `Km2` / `Km3` and the session key;
+each set carries a control needle that must be found. ReleaseFast/ReleaseSmall
+only (Debug fills `undefined` with `0xaa`).
+
+Not covered: a `Ksf` callback that dirties more than the entry point's burn
+(Argon2 and friends manage their own memory; the callback receives the OPRF
+output by value, as `Ksf.stretchFn`'s type dictates); the caller's copies of
+the results (`state`, `session_key`, `export_key` live in caller memory by
+design); registers and the red zone below the stack pointer.
+
 ## API discipline
 
 - **No internal RNG** (house rule, same as `voprf`): every blind,

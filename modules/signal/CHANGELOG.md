@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **Breaking:** dead-stack burn for every secret-handling entry point
+  (`stackprobe_test.zig`: 12 of 13 probed calls left key / DH / chain-key / message-key /
+  ML-KEM residue before — `generateKemPreKey` and the PQXDH calls dirtied 90-136 KiB; 0
+  after). Secrets in by `*const`, secret results through `out`:
+  `x3dh.generateKeyPair(io, &out)`, `generateSignedPreKey(&ik, id, z, io, &out)`,
+  `xeddsa.sign(&priv, msg, z)` / `xeddsa.libsignal.sign(&priv, ..)`,
+  `x3dh.initiate[Unverified](alloc, &ik, bundle, pt, io, &out)`,
+  `x3dh.respond(alloc, &ik, &spk, ?&opk, msg, &out)`, the `pqxdh` counterparts
+  (`generateKemPreKey(&ik, id, last_resort, z, io, &out)`, `respond(.., &kem, msg, &out)`),
+  `ratchet.State.initAlice(&sk, ad, pub, io, &out)`, `initBob(&sk, ad, &kp, &out)`.
+  `State.encrypt` / `decrypt` keep their signatures (the state is caller-owned) and burn.
+  Migrated: tests (via `src/test_shim.zig`), the ctgrind harness, example, README. No other
+  consumer in the tree.
+
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: header encryption and the session-persistence format move from "Out of scope" to "Not yet — see Backlog", matching the Backlog items.
 - **2026-10-05** — Mutation run: 29 of 30 killed, 1 equivalent; 5 tests added
   and 2 extended (skipped-key store at exactly its cap, no receiving chain is

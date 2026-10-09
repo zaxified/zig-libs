@@ -71,6 +71,7 @@
 //! about 2^32-message sessions, which is not a real deployment scenario).
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const entropy = @import("entropy");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
@@ -159,6 +160,10 @@ pub const Ratchet = struct {
     /// per-part-independent implementation passes trivially at index 1 but
     /// fails at 0x1000000.
     pub fn advanceStep(self: *Ratchet) void {
+        burn.run(burn.advance_burn, void, advanceStepBody, .{self});
+    }
+
+    fn advanceStepBody(self: *Ratchet) void {
         self.counter +%= 1;
 
         // Find `h`, the slowest (most-significant) part whose boundary the
@@ -191,6 +196,10 @@ pub const Ratchet = struct {
     /// `Ratchet::advance_to`; byte-for-byte anchored by libolm's own test
     /// vectors (`kat_test.zig`).
     pub fn advanceToUnchecked(self: *Ratchet, target: u32) void {
+        burn.run(burn.advance_burn, void, advanceToUncheckedBody, .{ self, target });
+    }
+
+    fn advanceToUncheckedBody(self: *Ratchet, target: u32) void {
         var j: usize = 0;
         while (j < num_parts) : (j += 1) {
             const shift: u5 = @intCast((num_parts - j - 1) * 8);

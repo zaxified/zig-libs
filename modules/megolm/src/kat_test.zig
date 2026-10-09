@@ -44,6 +44,7 @@
 //! misreading of the spec between this module and libolm's authors.
 
 const std = @import("std");
+const shim = @import("test_shim.zig");
 const testing = std.testing;
 
 const ratchet_mod = @import("ratchet.zig");
@@ -194,7 +195,7 @@ test "libolm vector: real session-key + message decrypts to plaintext 'Message' 
         "XFdbVuvIWrLyRfm4i8QRbe8VPwGRFG57B1CtmxanuP8bHtnnYqlwPsD";
 
     const key = try SessionKey.fromBase64(testing.allocator, session_key_b64);
-    var session = try InboundGroupSession.fromSessionKey(key);
+    var session = try shim.fromSessionKey(key);
     defer session.deinit();
     try testing.expectEqual(@as(u32, 0), session.firstKnownIndex());
 
@@ -246,7 +247,7 @@ test "W2-33: a non-minimal-varint remake of the real libolm message is REJECTED"
     try testing.expectEqual(@as(usize, 94), mal.len);
 
     const key = try SessionKey.fromBase64(testing.allocator, session_key_b64);
-    var session = try InboundGroupSession.fromSessionKey(key);
+    var session = try shim.fromSessionKey(key);
     defer session.deinit();
 
     // Control: the genuine bytes still decrypt (the fix is not a blanket
@@ -287,7 +288,7 @@ test "libolm vector: tampered final byte (part of the signature) is rejected as 
         "xRPBMUkeXRJ6Iqm5NeOdx2eERgTW7P20CM+lL3Xpk+ZUOOPvsSQNaBF";
 
     const key = try SessionKey.fromBase64(testing.allocator, session_key_b64);
-    var session = try InboundGroupSession.fromSessionKey(key);
+    var session = try shim.fromSessionKey(key);
     defer session.deinit();
 
     var msg_ok = try Message.fromBase64(testing.allocator, message_ok_b64);
@@ -319,9 +320,9 @@ test "InvalidMac is reachable and distinct from InvalidSignature (honest constru
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = session_mod.OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
 
     var msg = try out.encrypt(testing.allocator, "authentic content");
@@ -358,14 +359,14 @@ test "CannotRatchetBackward (Ratchet primitive) is distinct from MessageIndexToo
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = session_mod.OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
     var early = try out.encrypt(testing.allocator, "too early");
     defer early.deinit(testing.allocator);
     var skipped = try out.encrypt(testing.allocator, "skipped"); // advance past index 0
     skipped.deinit(testing.allocator);
 
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey()); // shared at index 2
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out)); // shared at index 2
     defer in.deinit();
     try testing.expectError(error.MessageIndexTooOld, in.decrypt(testing.allocator, &early));
 }
@@ -388,9 +389,9 @@ test "decrypt() checks the MAC before touching CBC/PKCS7 (no padding-oracle orde
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = session_mod.OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
 
     // "hello megolm" is 12 bytes -> PKCS7-pads to a single 16-byte block —

@@ -1896,4 +1896,5 @@ test {
     // External anchor: real handshakes and data packets exchanged with the
     // kernel's WireGuard (tools/interop.zig), replayed without root.
     _ = @import("kernel_handshake_replay.zig");
+    _ = @import("stackprobe_test.zig");
 }

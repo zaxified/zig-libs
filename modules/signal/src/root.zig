@@ -133,6 +133,7 @@ test {
     _ = pqxdh;
     _ = ratchet;
     _ = @import("kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.deps is exactly {chachapoly, ct25519, entropy} (the ratchet AEAD + the CT ladder + the fail-closed key draw)" {

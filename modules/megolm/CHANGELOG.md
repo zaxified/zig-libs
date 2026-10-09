@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **Breaking:** dead-stack burn for the session entry points
+  (`stackprobe_test.zig`: 11 of 16 probed calls left ratchet / signing-key / AES key /
+  round-key residue before; 0 after). Secret results go through `out` instead of a return
+  value: `OutboundSession.init(io, &out)`, `sessionKey(&out)`,
+  `InboundGroupSession.fromSessionKey(&key, &out)`, `fromExportedKey(&key, &out)`,
+  `exportAt(index, &out) bool` (was `?ExportedSessionKey`), `fromPickle(bytes, &out)` and
+  `fromSealedPickle(bytes, &key, &out)` on both session types. `encrypt`, `decrypt`,
+  `forgetBefore`, `Ratchet.advanceStep` / `advanceTo` keep their signatures and burn. Migrated:
+  tests (via `src/test_shim.zig`), example, README. No other consumer in the tree.
+
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** `pickle.zig` documents that restoring an
   old outbound pickle rewinds the ratchet and reuses message indices (review of PR #4).
 

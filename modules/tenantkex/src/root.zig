@@ -44,6 +44,7 @@
 
 const std = @import("std");
 const noise = @import("noise");
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -124,13 +125,6 @@ pub const SessionKeys = struct {
     }
 };
 
-/// Result of the initiator consuming msg2: the decrypted responder payload
-/// length plus the derived session keys.
-pub const InitiatorFinish = struct { payload_len: usize, keys: SessionKeys };
-/// Result of the responder producing msg2: the msg2 wire length plus the
-/// derived session keys.
-pub const ResponderFinish = struct { len: usize, keys: SessionKeys };
-
 /// Errors emitting a handshake message: `noise`'s write errors plus a
 /// state-machine guard, plus `HandshakeNotComplete` (see `ReadError`) --
 /// `writeMessage2` needs `Split()`'s transport pair exactly as `readMessage2`
@@ -174,17 +168,12 @@ pub fn message2Len(payload_len: usize) usize {
     return Suite.DHLEN + payload_len + Suite.TAGLEN;
 }
 
-fn keysFor(comptime is_initiator: bool, pair: [2]Suite.CipherState, h: [32]u8) SessionKeys {
-    // Noise split(): pair[0] = initiator->responder, pair[1] = responder->initiator.
-    return if (is_initiator) .{
-        .send_key = pair[0].k,
-        .recv_key = pair[1].k,
-        .transcript_hash = h,
-    } else .{
-        .send_key = pair[1].k,
-        .recv_key = pair[0].k,
-        .transcript_hash = h,
-    };
+/// Fill `out` from `Split()`'s pair. Noise split(): pair[0] = initiator->
+/// responder, pair[1] = responder->initiator.
+fn fillKeys(comptime is_initiator: bool, pair: *const [2]Suite.CipherState, h: [32]u8, out: *SessionKeys) void {
+    out.send_key = if (is_initiator) pair[0].k else pair[1].k;
+    out.recv_key = if (is_initiator) pair[1].k else pair[0].k;
+    out.transcript_hash = h;
 }
 
 /// Wipe every secret this module copied into a `noise` handshake state:
@@ -206,36 +195,42 @@ pub const Initiator = struct {
 
     const State = enum { start, awaiting_msg2, done };
 
-    /// Start an IK handshake. `static_kp` is this PE's static keypair;
-    /// `responder_static` is the peer's static public key (provisioned out of
-    /// band); `ctx` binds the tenant/PE identity into the prologue.
-    pub fn init(static_kp: KeyPair, responder_static: PublicKey, ctx: FabricContext) Initiator {
-        return initEphemeral(static_kp, responder_static, ctx, null);
+    /// Start an IK handshake in place. `static_kp` is this PE's static keypair
+    /// (by pointer: a by-value key pair is one more copy in the caller's
+    /// frame); `responder_static` is the peer's static public key (provisioned
+    /// out of band); `ctx` binds the tenant/PE identity into the prologue.
+    pub fn init(self: *Initiator, static_kp: *const KeyPair, responder_static: PublicKey, ctx: FabricContext) void {
+        self.initEphemeral(static_kp, responder_static, ctx, null);
     }
 
     /// As `init`, but with an explicit ephemeral keypair — a KAT/testing hook
     /// (mirrors `noise`'s own `e` injection). Pass `null` in production so a
     /// fresh ephemeral is drawn from `writeMessage1`'s RNG.
     pub fn initEphemeral(
-        static_kp: KeyPair,
+        self: *Initiator,
+        static_kp: *const KeyPair,
         responder_static: PublicKey,
         ctx: FabricContext,
-        ephemeral: ?KeyPair,
-    ) Initiator {
-        var self: Initiator = .{ .hs = .{} };
+        ephemeral: ?*const KeyPair,
+    ) void {
+        burn.run(burn.hs_burn, void, initiatorInitBody, .{ self, static_kp, responder_static, ctx, ephemeral });
+    }
+
+    fn initiatorInitBody(
+        self: *Initiator,
+        static_kp: *const KeyPair,
+        responder_static: PublicKey,
+        ctx: FabricContext,
+        ephemeral: ?*const KeyPair,
+    ) void {
+        self.* = .{ .hs = .{} };
         var pbuf: [FabricContext.prologue_len]u8 = undefined;
         ctx.writePrologue(&pbuf);
-        self.hs.initialize(
-            noise.patterns.IK,
-            true,
-            &pbuf,
-            static_kp,
-            ephemeral,
-            responder_static,
-            null,
-            &.{},
-        );
-        return self;
+        self.hs.initialize(noise.patterns.IK, true, &pbuf, &.{
+            .s = static_kp,
+            .e = ephemeral,
+            .rs = responder_static,
+        });
     }
 
     /// Destroy the private key material this initiator holds — the copy of the
@@ -257,9 +252,14 @@ pub const Initiator = struct {
     /// secure RNG in production (Noise draws the ephemeral from it); it is
     /// unused when an ephemeral was injected via `initEphemeral`.
     pub fn writeMessage1(self: *Initiator, random: std.Random, payload: []const u8, out: []u8) WriteError!usize {
+        return burn.run(burn.hs_burn, WriteError!usize, writeMessage1Body, .{ self, random, payload, out });
+    }
+
+    fn writeMessage1Body(self: *Initiator, random: std.Random, payload: []const u8, out: []u8) WriteError!usize {
         if (self.state != .start) return error.WrongState;
-        const step = try self.hs.writeMessage(random, payload, out);
-        if (step.transport != null) return error.UnexpectedHandshakeCompletion; // msg1 never completes IK
+        var pair: [2]Suite.CipherState = undefined;
+        const step = try self.hs.writeMessage(random, payload, out, &pair);
+        if (step.complete) return error.UnexpectedHandshakeCompletion; // msg1 never completes IK
         self.state = .awaiting_msg2;
         return step.len;
     }
@@ -268,16 +268,22 @@ pub const Initiator = struct {
     /// `payload_out`, and derive the session keys. A tampered message, a
     /// responder whose static key differs from `responder_static`, or a
     /// mismatched prologue (different I-SID/PE ids) fails with a typed error
-    /// and yields NO keys.
-    pub fn readMessage2(self: *Initiator, message: []const u8, payload_out: []u8) ReadError!InitiatorFinish {
+    /// and yields NO keys. Returns the decrypted payload length; the session
+    /// keys are written to `keys` (only on success — an out-parameter, because
+    /// keys returned by value inside an error union are a copy in the caller's
+    /// dead frame).
+    pub fn readMessage2(self: *Initiator, message: []const u8, payload_out: []u8, keys: *SessionKeys) ReadError!usize {
+        return burn.run(burn.hs_burn, ReadError!usize, readMessage2Body, .{ self, message, payload_out, keys });
+    }
+
+    fn readMessage2Body(self: *Initiator, message: []const u8, payload_out: []u8, keys: *SessionKeys) ReadError!usize {
         if (self.state != .awaiting_msg2) return error.WrongState;
-        const step = try self.hs.readMessage(message, payload_out);
-        const pair = step.transport orelse return error.HandshakeNotComplete; // msg2 completes IK
+        var pair: [2]Suite.CipherState = undefined;
+        const step = try self.hs.readMessage(message, payload_out, &pair);
+        if (!step.complete) return error.HandshakeNotComplete; // msg2 completes IK
         self.state = .done;
-        return .{
-            .payload_len = step.len,
-            .keys = keysFor(true, pair, self.hs.symmetric_state.getHandshakeHash()),
-        };
+        fillKeys(true, &pair, self.hs.symmetric_state.getHandshakeHash(), keys);
+        return step.len;
     }
 };
 
@@ -304,26 +310,27 @@ pub const Responder = struct {
     /// (the I-SID and PE ids in the prologue are not secrets). WireGuard, this
     /// module's model, looks the received key up among its configured peers;
     /// with one provisioned peer per PE pair, that is this single key.
-    pub fn init(static_kp: KeyPair, initiator_static: PublicKey, ctx: FabricContext) Responder {
-        return initEphemeral(static_kp, initiator_static, ctx, null);
+    ///
+    /// Initializes `self` in place; `static_kp` is passed by pointer (see
+    /// `Initiator.init`).
+    pub fn init(self: *Responder, static_kp: *const KeyPair, initiator_static: PublicKey, ctx: FabricContext) void {
+        self.initEphemeral(static_kp, initiator_static, ctx, null);
     }
 
     /// As `init`, with an explicit ephemeral keypair (KAT/testing hook).
-    pub fn initEphemeral(static_kp: KeyPair, initiator_static: PublicKey, ctx: FabricContext, ephemeral: ?KeyPair) Responder {
-        var self: Responder = .{ .hs = .{}, .expected_initiator = initiator_static };
+    pub fn initEphemeral(self: *Responder, static_kp: *const KeyPair, initiator_static: PublicKey, ctx: FabricContext, ephemeral: ?*const KeyPair) void {
+        burn.run(burn.hs_burn, void, responderInitBody, .{ self, static_kp, initiator_static, ctx, ephemeral });
+    }
+
+    fn responderInitBody(self: *Responder, static_kp: *const KeyPair, initiator_static: PublicKey, ctx: FabricContext, ephemeral: ?*const KeyPair) void {
+        self.* = .{ .hs = .{}, .expected_initiator = initiator_static };
         var pbuf: [FabricContext.prologue_len]u8 = undefined;
         ctx.writePrologue(&pbuf);
-        self.hs.initialize(
-            noise.patterns.IK,
-            false,
-            &pbuf,
-            static_kp,
-            ephemeral,
-            null, // responder learns the initiator's static from msg1
-            null,
-            &.{},
-        );
-        return self;
+        // The responder learns the initiator's static from msg1 (no `rs`).
+        self.hs.initialize(noise.patterns.IK, false, &pbuf, &.{
+            .s = static_kp,
+            .e = ephemeral,
+        });
     }
 
     /// Destroy the private key material this responder holds — see
@@ -340,9 +347,14 @@ pub const Responder = struct {
     /// (`UnknownInitiator`) — its payload is zeroed, the handshake state wiped,
     /// and the responder can no longer be driven.
     pub fn readMessage1(self: *Responder, message: []const u8, payload_out: []u8) ReadError!usize {
+        return burn.run(burn.hs_burn, ReadError!usize, readMessage1Body, .{ self, message, payload_out });
+    }
+
+    fn readMessage1Body(self: *Responder, message: []const u8, payload_out: []u8) ReadError!usize {
         if (self.state != .start) return error.WrongState;
-        const step = try self.hs.readMessage(message, payload_out);
-        if (step.transport != null) return error.UnexpectedHandshakeCompletion; // msg1 never completes IK
+        var pair: [2]Suite.CipherState = undefined;
+        const step = try self.hs.readMessage(message, payload_out, &pair);
+        if (step.complete) return error.UnexpectedHandshakeCompletion; // msg1 never completes IK
         const got = self.hs.rs orelse unreachable; // IK's msg1 always carries `s`
         if (!std.crypto.timing_safe.eql(PublicKey, got, self.expected_initiator)) {
             std.crypto.secureZero(u8, payload_out[0..step.len]);
@@ -356,15 +368,20 @@ pub const Responder = struct {
 
     /// Emit msg2 into `out` (needs `message2Len(payload.len)` bytes) and derive
     /// the session keys. Must be called only after a successful `readMessage1`.
-    pub fn writeMessage2(self: *Responder, random: std.Random, payload: []const u8, out: []u8) WriteError!ResponderFinish {
+    /// Returns the msg2 wire length; the session keys are written to `keys`
+    /// (only on success).
+    pub fn writeMessage2(self: *Responder, random: std.Random, payload: []const u8, out: []u8, keys: *SessionKeys) WriteError!usize {
+        return burn.run(burn.hs_burn, WriteError!usize, writeMessage2Body, .{ self, random, payload, out, keys });
+    }
+
+    fn writeMessage2Body(self: *Responder, random: std.Random, payload: []const u8, out: []u8, keys: *SessionKeys) WriteError!usize {
         if (self.state != .awaiting_write2) return error.WrongState;
-        const step = try self.hs.writeMessage(random, payload, out);
-        const pair = step.transport orelse return error.HandshakeNotComplete; // msg2 completes IK
+        var pair: [2]Suite.CipherState = undefined;
+        const step = try self.hs.writeMessage(random, payload, out, &pair);
+        if (!step.complete) return error.HandshakeNotComplete; // msg2 completes IK
         self.state = .done;
-        return .{
-            .len = step.len,
-            .keys = keysFor(false, pair, self.hs.symmetric_state.getHandshakeHash()),
-        };
+        fillKeys(false, &pair, self.hs.symmetric_state.getHandshakeHash(), keys);
+        return step.len;
     }
 };
 
@@ -392,6 +409,37 @@ fn testRandom(seed: u64) std.Random.DefaultPrng {
     return std.Random.DefaultPrng.init(seed);
 }
 
+/// Test-side shapes of the old by-value API (a copy of a test key or of
+/// derived test keys in a test frame proves nothing).
+const TFinish = struct { payload_len: usize, len: usize, keys: SessionKeys };
+
+fn tIniE(is: KeyPair, rs_pub: PublicKey, ctx: FabricContext, eph: ?KeyPair) Initiator {
+    var self: Initiator = undefined;
+    self.initEphemeral(&is, rs_pub, ctx, if (eph) |*e| e else null);
+    return self;
+}
+fn tIni(is: KeyPair, rs_pub: PublicKey, ctx: FabricContext) Initiator {
+    return tIniE(is, rs_pub, ctx, null);
+}
+fn tRspE(rs: KeyPair, is_pub: PublicKey, ctx: FabricContext, eph: ?KeyPair) Responder {
+    var self: Responder = undefined;
+    self.initEphemeral(&rs, is_pub, ctx, if (eph) |*e| e else null);
+    return self;
+}
+fn tRsp(rs: KeyPair, is_pub: PublicKey, ctx: FabricContext) Responder {
+    return tRspE(rs, is_pub, ctx, null);
+}
+fn read2(ini: *Initiator, message: []const u8, payload_out: []u8) ReadError!TFinish {
+    var keys: SessionKeys = undefined;
+    const n = try ini.readMessage2(message, payload_out, &keys);
+    return .{ .payload_len = n, .len = n, .keys = keys };
+}
+fn write2(rsp: *Responder, random: std.Random, payload: []const u8, out: []u8) WriteError!TFinish {
+    var keys: SessionKeys = undefined;
+    const n = try rsp.writeMessage2(random, payload, out, &keys);
+    return .{ .payload_len = n, .len = n, .keys = keys };
+}
+
 const demo_ctx = FabricContext{ .isid = 0xABCDEF, .initiator_pe = 1001, .responder_pe = 2002 };
 
 /// Run a full IK handshake with generated ephemerals and return both sides'
@@ -399,8 +447,8 @@ const demo_ctx = FabricContext{ .isid = 0xABCDEF, .initiator_pe = 1001, .respond
 fn runHandshake(ctx_i: FabricContext, ctx_r: FabricContext) !struct { i: SessionKeys, r: SessionKeys } {
     const is = kp(init_static_priv);
     const rs = kp(resp_static_priv);
-    var ini = Initiator.init(is, rs.public_key, ctx_i);
-    var rsp = Responder.init(rs, kp(init_static_priv).public_key, ctx_r);
+    var ini = tIni(is, rs.public_key, ctx_i);
+    var rsp = tRsp(rs, kp(init_static_priv).public_key, ctx_r);
 
     var prng_i = testRandom(0x1111);
     var prng_r = testRandom(0x2222);
@@ -414,9 +462,9 @@ fn runHandshake(ctx_i: FabricContext, ctx_r: FabricContext) !struct { i: Session
     const r1 = try rsp.readMessage1(m1[0..n1], &pl);
     try testing.expectEqualStrings("hello-r", pl[0..r1]);
 
-    const fin_r = try rsp.writeMessage2(prng_r.random(), "hello-i", m2[0..message2Len(7)]);
+    const fin_r = try write2(&rsp, prng_r.random(), "hello-i", m2[0..message2Len(7)]);
     try testing.expectEqual(message2Len(7), fin_r.len);
-    const fin_i = try ini.readMessage2(m2[0..fin_r.len], &pl);
+    const fin_i = try read2(&ini, m2[0..fin_r.len], &pl);
     try testing.expectEqualStrings("hello-i", pl[0..fin_i.payload_len]);
 
     return .{ .i = fin_i.keys, .r = fin_r.keys };
@@ -468,8 +516,8 @@ test "an initiator static key other than the provisioned one is UnknownInitiator
     // session keys on both sides.
     const rs = kp(resp_static_priv);
     const attacker = kp([_]u8{0x77} ** 32); // provisioned nowhere
-    var ini = Initiator.init(attacker, rs.public_key, demo_ctx);
-    var rsp = Responder.init(rs, kp(init_static_priv).public_key, demo_ctx);
+    var ini = tIni(attacker, rs.public_key, demo_ctx);
+    var rsp = tRsp(rs, kp(init_static_priv).public_key, demo_ctx);
     var prng = testRandom(0x7777);
     var m1: [256]u8 = undefined;
     var m2: [256]u8 = undefined;
@@ -477,7 +525,7 @@ test "an initiator static key other than the provisioned one is UnknownInitiator
     const n1 = try ini.writeMessage1(prng.random(), "sneaky", m1[0..message1Len(6)]);
     try testing.expectError(error.UnknownInitiator, rsp.readMessage1(m1[0..n1], &pl));
     try testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &pl); // the unauthorised payload is gone
-    try testing.expectError(error.WrongState, rsp.writeMessage2(prng.random(), "", m2[0..message2Len(0)]));
+    try testing.expectError(error.WrongState, write2(&rsp, prng.random(), "", m2[0..message2Len(0)]));
     try testing.expectError(error.WrongState, rsp.readMessage1(m1[0..n1], &pl));
 }
 
@@ -487,8 +535,8 @@ test "I-SID binding: different tenant I-SIDs make the handshake FAIL (tenant iso
 
     const is = kp(init_static_priv);
     const rs = kp(resp_static_priv);
-    var ini = Initiator.init(is, rs.public_key, a);
-    var rsp = Responder.init(rs, kp(init_static_priv).public_key, b); // responder thinks it's a DIFFERENT tenant
+    var ini = tIni(is, rs.public_key, a);
+    var rsp = tRsp(rs, kp(init_static_priv).public_key, b); // responder thinks it's a DIFFERENT tenant
 
     var prng = testRandom(0x3333);
     var m1: [256]u8 = undefined;
@@ -504,8 +552,8 @@ test "I-SID binding: matching PE ids too — mismatched PE id also fails" {
     const b = FabricContext{ .isid = 7, .initiator_pe = 10, .responder_pe = 999 };
     const is = kp(init_static_priv);
     const rs = kp(resp_static_priv);
-    var ini = Initiator.init(is, rs.public_key, a);
-    var rsp = Responder.init(rs, kp(init_static_priv).public_key, b);
+    var ini = tIni(is, rs.public_key, a);
+    var rsp = tRsp(rs, kp(init_static_priv).public_key, b);
     var prng = testRandom(0x4444);
     var m1: [256]u8 = undefined;
     var pl: [64]u8 = undefined;
@@ -526,27 +574,30 @@ test "positive control: WITHOUT the I-SID in the prologue, different tenants WRO
     var rsp: HS = .{};
     // Identical prologue on both sides, carrying NO tenant identity.
     const weak_prologue = prologue_label;
-    ini.initialize(noise.patterns.IK, true, weak_prologue, is, kp(init_eph_priv), rs.public_key, null, &.{});
-    rsp.initialize(noise.patterns.IK, false, weak_prologue, rs, kp(resp_eph_priv), null, null, &.{});
+    const ie = kp(init_eph_priv);
+    const re = kp(resp_eph_priv);
+    ini.initialize(noise.patterns.IK, true, weak_prologue, &.{ .s = &is, .e = &ie, .rs = rs.public_key });
+    rsp.initialize(noise.patterns.IK, false, weak_prologue, &.{ .s = &rs, .e = &re });
 
     var no_rng = testRandom(0);
     var m1: [256]u8 = undefined;
     var m2: [256]u8 = undefined;
     var pl: [64]u8 = undefined;
-    const w1 = try ini.writeMessage(no_rng.random(), "", &m1);
-    _ = try rsp.readMessage(m1[0..w1.len], &pl);
-    const w2 = try rsp.writeMessage(no_rng.random(), "", &m2);
-    const r2 = try ini.readMessage(m2[0..w2.len], &pl);
+    var tp: [2]Suite.CipherState = undefined;
+    const w1 = try ini.writeMessage(no_rng.random(), "", &m1, &tp);
+    _ = try rsp.readMessage(m1[0..w1.len], &pl, &tp);
+    const w2 = try rsp.writeMessage(no_rng.random(), "", &m2, &tp);
+    const r2 = try ini.readMessage(m2[0..w2.len], &pl, &tp);
     // Handshake completed despite the two ends conceptually being different
     // tenants: with no I-SID bound, nothing distinguishes them.
-    try testing.expect(r2.transport != null);
+    try testing.expect(r2.complete);
 }
 
 test "auth failure: tampered msg1 byte -> typed error, no keys" {
     const is = kp(init_static_priv);
     const rs = kp(resp_static_priv);
-    var ini = Initiator.init(is, rs.public_key, demo_ctx);
-    var rsp = Responder.init(rs, kp(init_static_priv).public_key, demo_ctx);
+    var ini = tIni(is, rs.public_key, demo_ctx);
+    var rsp = tRsp(rs, kp(init_static_priv).public_key, demo_ctx);
     var prng = testRandom(0x5555);
     var m1: [256]u8 = undefined;
     var pl: [64]u8 = undefined;
@@ -560,8 +611,8 @@ test "auth failure: wrong responder static key -> handshake fails" {
     const rs = kp(resp_static_priv);
     // Initiator expects a DIFFERENT responder static key than the responder holds.
     const wrong_pub = kp(init_static_priv).public_key;
-    var ini = Initiator.init(is, wrong_pub, demo_ctx);
-    var rsp = Responder.init(rs, kp(init_static_priv).public_key, demo_ctx);
+    var ini = tIni(is, wrong_pub, demo_ctx);
+    var rsp = tRsp(rs, kp(init_static_priv).public_key, demo_ctx);
     var prng = testRandom(0x6666);
     var m1: [256]u8 = undefined;
     var pl: [64]u8 = undefined;
@@ -586,28 +637,29 @@ test "KAT (noise as oracle): tenantkex == raw Noise_IK over the bound prologue, 
     demo_ctx.writePrologue(&pbuf);
     var rini: HS = .{};
     var rrsp: HS = .{};
-    rini.initialize(noise.patterns.IK, true, &pbuf, is, ie, rs.public_key, null, &.{});
-    rrsp.initialize(noise.patterns.IK, false, &pbuf, rs, re, null, null, &.{});
+    rini.initialize(noise.patterns.IK, true, &pbuf, &.{ .s = &is, .e = &ie, .rs = rs.public_key });
+    rrsp.initialize(noise.patterns.IK, false, &pbuf, &.{ .s = &rs, .e = &re });
     var no_rng = testRandom(0);
     var ref_m1: [256]u8 = undefined;
     var ref_m2: [256]u8 = undefined;
     var ref_pl: [64]u8 = undefined;
-    const rw1 = try rini.writeMessage(no_rng.random(), "p1", &ref_m1);
-    _ = try rrsp.readMessage(ref_m1[0..rw1.len], &ref_pl);
-    const rw2 = try rrsp.writeMessage(no_rng.random(), "p2", &ref_m2);
-    const rr2 = try rini.readMessage(ref_m2[0..rw2.len], &ref_pl);
-    const ref_pair = rr2.transport.?;
+    var ref_pair: [2]Suite.CipherState = undefined;
+    var ref_scratch: [2]Suite.CipherState = undefined;
+    const rw1 = try rini.writeMessage(no_rng.random(), "p1", &ref_m1, &ref_scratch);
+    _ = try rrsp.readMessage(ref_m1[0..rw1.len], &ref_pl, &ref_scratch);
+    const rw2 = try rrsp.writeMessage(no_rng.random(), "p2", &ref_m2, &ref_scratch);
+    _ = try rini.readMessage(ref_m2[0..rw2.len], &ref_pl, &ref_pair);
 
     // --- tenantkex with the same injected ephemerals ---
-    var ini = Initiator.initEphemeral(is, rs.public_key, demo_ctx, ie);
-    var rsp = Responder.initEphemeral(rs, is.public_key, demo_ctx, re);
+    var ini = tIniE(is, rs.public_key, demo_ctx, ie);
+    var rsp = tRspE(rs, is.public_key, demo_ctx, re);
     var m1: [256]u8 = undefined;
     var m2: [256]u8 = undefined;
     var pl: [64]u8 = undefined;
     const n1 = try ini.writeMessage1(no_rng.random(), "p1", m1[0..message1Len(2)]);
     _ = try rsp.readMessage1(m1[0..n1], &pl);
-    const fin_r = try rsp.writeMessage2(no_rng.random(), "p2", m2[0..message2Len(2)]);
-    const fin_i = try ini.readMessage2(m2[0..fin_r.len], &pl);
+    const fin_r = try write2(&rsp, no_rng.random(), "p2", m2[0..message2Len(2)]);
+    const fin_i = try read2(&ini, m2[0..fin_r.len], &pl);
 
     // Byte-exact wire equivalence with raw noise.
     try testing.expectEqualSlices(u8, ref_m1[0..rw1.len], m1[0..n1]);
@@ -642,16 +694,16 @@ test "F1: transcript_hash differs between two tenants that otherwise complete id
 
     const Run = struct {
         fn go(is_: KeyPair, rs_: KeyPair, ctx: FabricContext, seed: u64) !SessionKeys {
-            var ini = Initiator.init(is_, rs_.public_key, ctx);
-            var rsp = Responder.init(rs_, is_.public_key, ctx);
+            var ini = tIni(is_, rs_.public_key, ctx);
+            var rsp = tRsp(rs_, is_.public_key, ctx);
             var prng = testRandom(seed);
             var m1: [256]u8 = undefined;
             var m2: [256]u8 = undefined;
             var pl: [64]u8 = undefined;
             const n1 = try ini.writeMessage1(prng.random(), "", m1[0..message1Len(0)]);
             _ = try rsp.readMessage1(m1[0..n1], &pl);
-            const fin_r = try rsp.writeMessage2(prng.random(), "", m2[0..message2Len(0)]);
-            const fin_i = try ini.readMessage2(m2[0..fin_r.len], &pl);
+            const fin_r = try write2(&rsp, prng.random(), "", m2[0..message2Len(0)]);
+            const fin_i = try read2(&ini, m2[0..fin_r.len], &pl);
             try testing.expectEqualSlices(u8, &fin_i.keys.transcript_hash, &fin_r.keys.transcript_hash);
             return fin_i.keys;
         }
@@ -664,16 +716,16 @@ test "F1: transcript_hash differs between two tenants that otherwise complete id
 test "state machine: out-of-order calls are rejected with WrongState" {
     const is = kp(init_static_priv);
     const rs = kp(resp_static_priv);
-    var ini = Initiator.init(is, rs.public_key, demo_ctx);
-    var rsp = Responder.init(rs, kp(init_static_priv).public_key, demo_ctx);
+    var ini = tIni(is, rs.public_key, demo_ctx);
+    var rsp = tRsp(rs, kp(init_static_priv).public_key, demo_ctx);
     var prng = testRandom(0x7777);
     var buf: [256]u8 = undefined;
     var pl: [64]u8 = undefined;
 
     // Initiator cannot read msg2 before sending msg1.
-    try testing.expectError(error.WrongState, ini.readMessage2(&buf, &pl));
+    try testing.expectError(error.WrongState, read2(&ini, &buf, &pl));
     // Responder cannot write msg2 before reading msg1.
-    try testing.expectError(error.WrongState, rsp.writeMessage2(prng.random(), "", &buf));
+    try testing.expectError(error.WrongState, write2(&rsp, prng.random(), "", &buf));
 
     const n1 = try ini.writeMessage1(prng.random(), "", buf[0..message1Len(0)]);
     // Initiator cannot send msg1 twice.
@@ -722,8 +774,8 @@ test "Initiator/Responder.wipe destroys the copied long-term static secret key" 
     const i_kp = kp(init_static_priv);
     const r_kp = kp(resp_static_priv);
 
-    var ini = Initiator.init(i_kp, r_kp.public_key, demo_ctx);
-    var res = Responder.init(r_kp, i_kp.public_key, demo_ctx);
+    var ini = tIni(i_kp, r_kp.public_key, demo_ctx);
+    var res = tRsp(r_kp, i_kp.public_key, demo_ctx);
 
     // Drive a full handshake, so both sides hold live material when wiped —
     // this is the state a real caller finishes in.
@@ -734,8 +786,8 @@ test "Initiator/Responder.wipe destroys the copied long-term static secret key" 
     var pl: [64]u8 = undefined;
     const n1 = try ini.writeMessage1(prng_i.random(), "hi", m1[0..message1Len(2)]);
     _ = try res.readMessage1(m1[0..n1], &pl);
-    const fin_r = try res.writeMessage2(prng_r.random(), "hi", m2[0..message2Len(2)]);
-    _ = try ini.readMessage2(m2[0..fin_r.len], &pl);
+    const fin_r = try write2(&res, prng_r.random(), "hi", m2[0..message2Len(2)]);
+    _ = try read2(&ini, m2[0..fin_r.len], &pl);
 
     // Preconditions: `noise`'s own split-time wipe leaves `s` alone, so the
     // caller's long-term secret is still sitting in both structs right now.
@@ -799,7 +851,7 @@ const msg2_static_seeds = [_][]const u8{
 /// The msg1 an Initiator with the test static keys and `testRandom(0x1111)`
 /// actually writes. Deterministic, so it can be a corpus entry.
 fn genuineMessage1(out: []u8) []const u8 {
-    var ini = Initiator.init(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
+    var ini = tIni(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
     var prng = testRandom(0x1111);
     const n = ini.writeMessage1(prng.random(), "", out[0..msg1_len]) catch unreachable;
     return out[0..n];
@@ -810,17 +862,17 @@ fn genuineMessage1(out: []u8) []const u8 {
 /// `testRandom(0x9999)`, same empty payload. That is what makes it decrypt
 /// inside the harness rather than merely look like a message.
 fn genuineMessage2(out: []u8) []const u8 {
-    var ini = Initiator.init(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
+    var ini = tIni(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
     var prng_i = testRandom(0x9999);
     var m1: [wire_buf_len]u8 = undefined;
     const n1 = ini.writeMessage1(prng_i.random(), "", m1[0..msg1_len]) catch unreachable;
 
-    var rsp = Responder.init(kp(resp_static_priv), kp(init_static_priv).public_key, demo_ctx);
+    var rsp = tRsp(kp(resp_static_priv), kp(init_static_priv).public_key, demo_ctx);
     var payload: [wire_buf_len]u8 = undefined;
     _ = rsp.readMessage1(m1[0..n1], &payload) catch unreachable;
 
     var prng_r = testRandom(0x2222);
-    const fin = rsp.writeMessage2(prng_r.random(), "", out[0..msg2_len]) catch unreachable;
+    const fin = write2(&rsp, prng_r.random(), "", out[0..msg2_len]) catch unreachable;
     return out[0..fin.len];
 }
 
@@ -864,7 +916,7 @@ fn fuzzReadMessage1(_: void, smith: *std.testing.Smith) !void {
     // before; 8 and 1 after.
     const len: usize = smith.slice(&msg);
 
-    var rsp = Responder.init(kp(resp_static_priv), kp(init_static_priv).public_key, demo_ctx);
+    var rsp = tRsp(kp(resp_static_priv), kp(init_static_priv).public_key, demo_ctx);
     var payload_out: [wire_buf_len]u8 = undefined;
     // Arbitrary bytes must only ever yield a typed error (short message /
     // bad auth tag) or a successful decode, never a panic or OOB write.
@@ -884,13 +936,13 @@ fn fuzzReadMessage2(_: void, smith: *std.testing.Smith) !void {
     // A real Initiator that has genuinely sent msg1, so readMessage2 is
     // reached in the state where it actually does work (WrongState from
     // `.start` would make this a no-op fuzz target).
-    var ini = Initiator.init(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
+    var ini = tIni(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
     var prng = testRandom(0x9999);
     var m1: [wire_buf_len]u8 = undefined;
     _ = ini.writeMessage1(prng.random(), "", m1[0..msg1_len]) catch return;
 
     var payload_out: [wire_buf_len]u8 = undefined;
-    _ = ini.readMessage2(msg[0..len], &payload_out) catch return;
+    _ = read2(&ini, msg[0..len], &payload_out) catch return;
 }
 
 test "fuzz: Initiator.readMessage2 never panics on arbitrary bytes" {
@@ -913,7 +965,7 @@ test "corpus: both handshake targets read their seeds, and what each accepts is 
         var msg: [wire_buf_len]u8 = undefined;
         const len: usize = smith.slice(&msg);
         if (len != 0) nonempty1 += 1;
-        var rsp = Responder.init(kp(resp_static_priv), kp(init_static_priv).public_key, demo_ctx);
+        var rsp = tRsp(kp(resp_static_priv), kp(init_static_priv).public_key, demo_ctx);
         var payload_out: [wire_buf_len]u8 = undefined;
         if (rsp.readMessage1(msg[0..len], &payload_out)) |_| accepted1 += 1 else |_| {}
     }
@@ -927,12 +979,12 @@ test "corpus: both handshake targets read their seeds, and what each accepts is 
         var msg: [wire_buf_len]u8 = undefined;
         const len: usize = smith.slice(&msg);
         if (len != 0) nonempty2 += 1;
-        var ini = Initiator.init(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
+        var ini = tIni(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
         var prng = testRandom(0x9999);
         var m1: [wire_buf_len]u8 = undefined;
         _ = try ini.writeMessage1(prng.random(), "", m1[0..msg1_len]);
         var payload_out: [wire_buf_len]u8 = undefined;
-        if (ini.readMessage2(msg[0..len], &payload_out)) |_| accepted2 += 1 else |_| {}
+        if (read2(&ini, msg[0..len], &payload_out)) |_| accepted2 += 1 else |_| {}
     }
 
     // One seed in each corpus is deliberately the empty message.
@@ -951,7 +1003,7 @@ test "corpus: both handshake targets read their seeds, and what each accepts is 
 // both; wipe must clear them there.
 test "wipe mid-handshake clears the ephemeral secret and the chaining key" {
     const rs = kp(resp_static_priv);
-    var ini = Initiator.init(kp(init_static_priv), rs.public_key, demo_ctx);
+    var ini = tIni(kp(init_static_priv), rs.public_key, demo_ctx);
     var prng = testRandom(0x8888);
     var m1: [256]u8 = undefined;
     _ = try ini.writeMessage1(prng.random(), "", m1[0..message1Len(0)]);
@@ -962,11 +1014,15 @@ test "wipe mid-handshake clears the ephemeral secret and the chaining key" {
     try testing.expect(std.mem.allEqual(u8, &ini.hs.symmetric_state.ck, 0));
 
     // The refusal path wipes too: the responder's chaining key after msg1.
-    var ini2 = Initiator.init(kp([_]u8{0x77} ** 32), rs.public_key, demo_ctx);
-    var rsp = Responder.init(rs, kp(init_static_priv).public_key, demo_ctx);
+    var ini2 = tIni(kp([_]u8{0x77} ** 32), rs.public_key, demo_ctx);
+    var rsp = tRsp(rs, kp(init_static_priv).public_key, demo_ctx);
     const n1 = try ini2.writeMessage1(prng.random(), "", m1[0..message1Len(0)]);
     var pl: [8]u8 = undefined;
     try testing.expectError(error.UnknownInitiator, rsp.readMessage1(m1[0..n1], &pl));
     try testing.expect(std.mem.allEqual(u8, &rsp.hs.symmetric_state.ck, 0));
     try testing.expect(std.mem.allEqual(u8, &rsp.hs.s.?.secret_key, 0));
+}
+
+test {
+    _ = @import("stackprobe_test.zig");
 }

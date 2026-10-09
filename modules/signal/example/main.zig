@@ -28,14 +28,18 @@ pub fn main() !void {
     //
     // Bob is offline for everything below this line. That asynchrony is the
     // whole reason PQXDH exists rather than a live handshake.
-    const bob_ik = signal.x3dh.generateKeyPair(io);
+    var bob_ik: signal.IdentityKey = undefined;
+    signal.x3dh.generateKeyPair(io, &bob_ik);
     const signing_randomness: [64]u8 = @splat(0x5A); // from `io.random` in production
-    const bob_spk = signal.generateSignedPreKey(bob_ik, 1, signing_randomness, io);
-    const bob_opk_kp = signal.x3dh.generateKeyPair(io);
+    var bob_spk: signal.x3dh.SignedPreKey = undefined;
+    signal.generateSignedPreKey(&bob_ik, 1, signing_randomness, io, &bob_spk);
+    var bob_opk_kp: signal.IdentityKey = undefined;
+    signal.x3dh.generateKeyPair(io, &bob_opk_kp);
     // Every KEM prekey is signed, last-resort and one-time alike: a curve
     // prekey is authenticated by the DH against Bob's identity key, and a KEM
     // prekey has no such binding, so the signature is all there is.
-    const bob_kem = signal.generateKemPreKey(bob_ik, 100, true, signing_randomness, io);
+    var bob_kem: signal.KemPreKey = undefined;
+    signal.generateKemPreKey(&bob_ik, 100, true, signing_randomness, io, &bob_kem);
 
     const bundle: signal.PqPreKeyBundle = .{
         .identity_key = bob_ik.public_key,
@@ -50,13 +54,15 @@ pub fn main() !void {
     };
 
     // ── Alice: open the session ───────────────────────────────────────────
-    const alice_ik = signal.x3dh.generateKeyPair(io);
+    var alice_ik: signal.IdentityKey = undefined;
+    signal.x3dh.generateKeyPair(io, &alice_ik);
 
     // `pqInitiate` verifies BOTH of Bob's signatures before deriving
     // anything. Handling the two separately is worth the extra arm: they are
     // different keys on different rotation schedules, and "which one is
     // stale" is the first question when a bundle stops verifying.
-    const opened = signal.pqInitiate(gpa, alice_ik, bundle, "", io) catch |err| switch (err) {
+    var opened: signal.pqxdh.InitiateOutput = undefined;
+    signal.pqInitiate(gpa, &alice_ik, bundle, "", io, &opened) catch |err| switch (err) {
         error.KemPreKeyVerificationFailed => {
             std.debug.print("Bob's ML-KEM prekey signature is bad — refuse the bundle\n", .{});
             return;
@@ -75,11 +81,13 @@ pub fn main() !void {
     });
 
     // ── Alice: seed the ratchet and send ──────────────────────────────────
-    var alice_state = try signal.initAlice(
-        opened.agreement.shared_secret,
+    var alice_state: signal.ratchet.State = undefined;
+    try signal.ratchet.State.initAlice(
+        &opened.agreement.shared_secret,
         opened.agreement.ratchetAssociatedData(),
         bob_spk.key_pair.public_key,
         io,
+        &alice_state,
     );
     defer alice_state.deinit(gpa);
 
@@ -90,7 +98,9 @@ pub fn main() !void {
     // ── Bob, back online: reconstruct the same secret and read it ─────────
     // `pqRespond` also opens the initial message under SK and the full AD, and
     // refuses the whole handshake (zeroing SK) if it does not authenticate.
-    const bob_opened = try signal.pqRespond(gpa, bob_ik, bob_spk, .{ .key_pair = bob_opk_kp, .id = 7 }, bob_kem, opened.message);
+    const bob_opk: signal.x3dh.OneTimePreKey = .{ .key_pair = bob_opk_kp, .id = 7 };
+    var bob_opened: signal.pqxdh.RespondOutput = undefined;
+    try signal.pqRespond(gpa, &bob_ik, &bob_spk, &bob_opk, &bob_kem, opened.message, &bob_opened);
     defer gpa.free(bob_opened.plaintext);
     const bob_agreement = bob_opened.agreement;
     // `timing_safe.eql`, not `std.mem.eql` — both operands are local here, so
@@ -100,10 +110,12 @@ pub fn main() !void {
     if (!std.crypto.timing_safe.eql([32]u8, bob_agreement.shared_secret, opened.agreement.shared_secret))
         @panic("PQXDH disagreed across the two sides");
 
-    var bob_state = signal.initBob(
-        bob_agreement.shared_secret,
+    var bob_state: signal.ratchet.State = undefined;
+    signal.ratchet.State.initBob(
+        &bob_agreement.shared_secret,
         bob_agreement.ratchetAssociatedData(),
-        bob_spk.key_pair,
+        &bob_spk.key_pair,
+        &bob_state,
     );
     defer bob_state.deinit(gpa);
 

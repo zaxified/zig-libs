@@ -51,6 +51,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const opaque_pake = @import("root.zig");
+const shim = @import("test_shim.zig");
 const kat = @import("kat_vectors.zig");
 const memcheck = std.valgrind.memcheck;
 
@@ -114,8 +115,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     switch (target) {
         .register => {
             // Untainted server side: its response to the honest request.
-            const request0 = try opaque_pake.createRegistrationRequest(v.password, v.blind_registration);
-            const response = try opaque_pake.createRegistrationResponse(request0, v.server_public_key, v.credential_identifier, v.oprf_seed);
+            const request0 = try shim.createRegistrationRequest(v.password, v.blind_registration);
+            const response = try shim.createRegistrationResponse(request0, v.server_public_key, v.credential_identifier, v.oprf_seed);
 
             taintBytes(v.password, &pw_buf, &pw, taint);
             var blind_buf: [32]u8 = undefined;
@@ -123,8 +124,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintBytes(&v.blind_registration, &blind_buf, &blind, taint);
 
             // Measured.
-            const request = try settle(opaque_pake.createRegistrationRequest(&pw, blind));
-            const fin = try settle(opaque_pake.finalizeRegistrationRequest(&pw, blind, response, identities, v.envelope_nonce, .identity));
+            const request = try settle(shim.createRegistrationRequest(&pw, blind));
+            const fin = try settle(shim.finalizeRegistrationRequest(&pw, blind, response, identities, v.envelope_nonce, .identity));
 
             std.debug.print("registration_request={x}\n", .{request.toBytes()});
             std.debug.print("registration_upload={x}\n", .{fin.record.toBytes()});
@@ -133,8 +134,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .login => {
             // Untainted server side: KE2 for the honest KE1.
             const record = opaque_pake.RegistrationRecord.fromBytes(v.registration_upload);
-            const client0 = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
-            const server = try opaque_pake.generateKE2(
+            const client0 = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+            const server = try shim.generateKE2(
                 v.server_private_key,
                 v.server_public_key,
                 record,
@@ -157,8 +158,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintBytes(&v.client_keyshare_seed, &seed_buf, &seed, taint);
 
             // Measured.
-            const client = try settle(opaque_pake.generateKE1(&pw, blind, v.client_nonce, seed));
-            const fin = try settle(opaque_pake.generateKE3(client.state, identities, v.context, server.ke2, .identity));
+            const client = try settle(shim.generateKE1(&pw, blind, v.client_nonce, seed));
+            const fin = try settle(shim.generateKE3(client.state, identities, v.context, server.ke2, .identity));
 
             std.debug.print("ke1={x}\n", .{client.ke1.toBytes()});
             std.debug.print("ke3={x}\n", .{fin.ke3.toBytes()});
@@ -167,7 +168,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
         .serverke2 => {
             // Untainted client side.
-            const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+            const client = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
 
             var sk_buf: [32]u8 = undefined;
             var sk: [32]u8 = undefined;
@@ -185,7 +186,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintBytes(&record.masking_key, &mk_buf, &record.masking_key, taint);
 
             // Measured.
-            const server = try settle(opaque_pake.generateKE2(
+            const server = try settle(shim.generateKE2(
                 sk,
                 v.server_public_key,
                 record,

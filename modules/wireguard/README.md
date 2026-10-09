@@ -153,7 +153,8 @@ const transport = wireguard.transport;
 // From a completed handshake, in one call — this is what makes the
 // send/recv key and the local/remote index impossible to swap. `now_s` is
 // YOUR clock; it becomes the session's birth time.
-var sess = hs.transportSession(is_initiator, now_s);
+var sess: transport.Session = undefined;
+hs.transportSession(is_initiator, now_s, &sess);   // written in place, never returned
 
 // Outbound: `out` must be >= transport.sealedLen(packet.len) and must not
 // overlap `packet`. Every seal/open takes the current time — that is how

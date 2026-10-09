@@ -41,6 +41,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const entropy = @import("entropy");
+const burn = @import("burn.zig");
 const noise = @import("noise.zig");
 /// The transport-data (type 4) seal/open data plane the completed handshake
 /// keys. Imported one way only — `transport.zig` knows nothing about the
@@ -108,7 +109,14 @@ pub const Keypair = struct {
     /// signature returns a `Keypair`, so there is no error to report a bad
     /// draw on. The cookie secret and XChaCha nonce elsewhere in this
     /// module already fail closed; this was the remaining draw that did not.
-    pub fn generate(io: std.Io) Keypair {
+    ///
+    /// The pair is written to `out`, not returned: a private key returned by
+    /// value is a copy in the caller's dead frame.
+    pub fn generate(io: std.Io, out: *Keypair) void {
+        burn.run(burn.keypair_burn, void, generateBody, .{ io, out });
+    }
+
+    fn generateBody(io: std.Io, out: *Keypair) void {
         var seed: [noise.X25519.seed_length]u8 = undefined;
         defer std.crypto.secureZero(u8, &seed);
         while (true) {
@@ -117,14 +125,21 @@ pub const Keypair = struct {
                 @branchHint(.unlikely);
                 continue;
             };
-            return .{ .private = kp.secret_key, .public = kp.public_key };
+            out.* = .{ .private = kp.secret_key, .public = kp.public_key };
+            return;
         }
     }
 
     /// Rebuild a keypair from a stored private key (recomputes the public
-    /// key via X25519 base-point multiplication).
-    pub fn fromPrivateKey(private: PrivateKey) error{IdentityElement}!Keypair {
-        return .{ .private = private, .public = try noise.X25519.recoverPublicKey(private) };
+    /// key via X25519 base-point multiplication). Private key by pointer, pair
+    /// out through `out` (written only on success).
+    pub fn fromPrivateKey(private: *const PrivateKey, out: *Keypair) error{IdentityElement}!void {
+        return burn.run(burn.keypair_burn, error{IdentityElement}!void, fromPrivateKeyBody, .{ private, out });
+    }
+
+    fn fromPrivateKeyBody(private: *const PrivateKey, out: *Keypair) error{IdentityElement}!void {
+        const public = try noise.X25519.recoverPublicKey(private.*);
+        out.* = .{ .private = private.*, .public = public };
     }
 };
 
@@ -365,9 +380,20 @@ pub const Handshake = struct {
         io: std.Io,
         now_tai64n: [12]u8,
     ) InitiationError!MessageInitiation {
+        return burn.run(burn.hs_burn, InitiationError!MessageInitiation, createInitiationBody, .{ self, io, now_tai64n });
+    }
+
+    fn createInitiationBody(
+        self: *Handshake,
+        io: std.Io,
+        now_tai64n: [12]u8,
+    ) InitiationError!MessageInitiation {
         if (self.state != .idle) return error.AlreadyStarted;
-        const eph = self.local_ephemeral orelse Keypair.generate(io);
-        self.local_ephemeral = eph;
+        if (self.local_ephemeral == null) {
+            self.local_ephemeral = @as(Keypair, undefined);
+            Keypair.generate(io, &self.local_ephemeral.?);
+        }
+        const eph = self.local_ephemeral.?;
 
         var st = initialState(self.remote_static_public);
         var msg: MessageInitiation = undefined;
@@ -382,7 +408,8 @@ pub const Handshake = struct {
         // es: DH(Ei, Sr) → key for the encrypted static.
         var es = noise.X25519.scalarmult(eph.private, self.remote_static_public) catch
             return error.InvalidPublicKey;
-        var k = noise.mixKey(&st.ck, &es);
+        var k: noise.SymmetricKey = undefined;
+        noise.mixKey(&st.ck, &es, &k);
         std.crypto.secureZero(u8, &es);
         noise.Aead.encrypt(
             msg.encrypted_static[0..32],
@@ -397,7 +424,7 @@ pub const Handshake = struct {
         // ss: DH(Si, Sr) → key for the encrypted timestamp.
         var ss = noise.X25519.scalarmult(self.static_keypair.private, self.remote_static_public) catch
             return error.InvalidPublicKey;
-        k = noise.mixKey(&st.ck, &ss);
+        noise.mixKey(&st.ck, &ss, &k);
         std.crypto.secureZero(u8, &ss);
         noise.Aead.encrypt(
             msg.encrypted_timestamp[0..12],
@@ -436,6 +463,10 @@ pub const Handshake = struct {
     /// constructing a `Handshake` at all, which is the only ordering in which
     /// the cookie layer actually sheds a flood.
     pub fn consumeInitiation(self: *Handshake, msg: MessageInitiation) ConsumeInitiationError!void {
+        return burn.run(burn.hs_burn, ConsumeInitiationError!void, consumeInitiationBody, .{ self, msg });
+    }
+
+    fn consumeInitiationBody(self: *Handshake, msg: MessageInitiation) ConsumeInitiationError!void {
         std.debug.assert(self.state == .idle); // one attempt per Handshake
 
         // mac1 first — cheap rejection before any DH (keyed with OUR static
@@ -457,7 +488,8 @@ pub const Handshake = struct {
         // es: DH(Sr, Ei) → decrypt the initiator's static public key.
         var es = noise.X25519.scalarmult(self.static_keypair.private, msg.unencrypted_ephemeral) catch
             return error.DecryptionFailed;
-        var k = noise.mixKey(&st.ck, &es);
+        var k: noise.SymmetricKey = undefined;
+        noise.mixKey(&st.ck, &es, &k);
         std.crypto.secureZero(u8, &es);
         var peer_static: PublicKey = undefined;
         noise.Aead.decrypt(
@@ -475,7 +507,7 @@ pub const Handshake = struct {
         // ss: DH(Sr, Si) → decrypt + authenticate the timestamp.
         var ss = noise.X25519.scalarmult(self.static_keypair.private, peer_static) catch
             return error.DecryptionFailed;
-        k = noise.mixKey(&st.ck, &ss);
+        noise.mixKey(&st.ck, &ss, &k);
         std.crypto.secureZero(u8, &ss);
         var ts: [12]u8 = undefined;
         noise.Aead.decrypt(
@@ -505,14 +537,21 @@ pub const Handshake = struct {
     /// (A pre-seeded `local_ephemeral` is used instead of generating one —
     /// deterministic-test hook; leave it null in production.)
     pub fn createResponse(self: *Handshake, io: std.Io) ResponseError!MessageResponse {
+        return burn.run(burn.hs_burn, ResponseError!MessageResponse, createResponseBody, .{ self, io });
+    }
+
+    fn createResponseBody(self: *Handshake, io: std.Io) ResponseError!MessageResponse {
         switch (self.state) {
             .initiation_consumed => {},
             .idle, .initiation_sent => return error.NoInitiationConsumed,
             .complete => return error.AlreadyStarted,
         }
         const remote_eph = self.remote_ephemeral.?; // set by consumeInitiation
-        const eph = self.local_ephemeral orelse Keypair.generate(io);
-        self.local_ephemeral = eph;
+        if (self.local_ephemeral == null) {
+            self.local_ephemeral = @as(Keypair, undefined);
+            Keypair.generate(io, &self.local_ephemeral.?);
+        }
+        const eph = self.local_ephemeral.?;
 
         var msg: MessageResponse = undefined;
         msg.type = @intFromEnum(MessageType.handshake_response);
@@ -537,8 +576,10 @@ pub const Handshake = struct {
         std.crypto.secureZero(u8, &se);
 
         // psk2: (ck, tau, k) = KDF3(ck, psk); h = HASH(h || tau).
-        var psk_out = noise.kdf3(&self.chaining_key, &self.preshared_key);
-        noise.mixHash(&self.hash, &psk_out.out1);
+        var tau: noise.SymmetricKey = undefined;
+        var psk_k: noise.SymmetricKey = undefined;
+        noise.kdf3(&self.chaining_key, &self.preshared_key, &tau, &psk_k);
+        noise.mixHash(&self.hash, &tau);
 
         // Empty-plaintext AEAD — proves agreement on every key derived so far.
         noise.Aead.encrypt(
@@ -547,9 +588,10 @@ pub const Handshake = struct {
             "",
             &self.hash,
             counterNonce(0),
-            psk_out.out2,
+            psk_k,
         );
-        std.crypto.secureZero(u8, std.mem.asBytes(&psk_out));
+        std.crypto.secureZero(u8, &tau);
+        std.crypto.secureZero(u8, &psk_k);
         noise.mixHash(&self.hash, &msg.encrypted_nothing);
 
         msg.mac1 = self.computeMac1(std.mem.asBytes(&msg)[0..@offsetOf(MessageResponse, "mac1")]);
@@ -563,6 +605,10 @@ pub const Handshake = struct {
     /// the empty-payload AEAD tag. On success the handshake is complete and
     /// `deriveTransportKeys` may be called.
     pub fn consumeResponse(self: *Handshake, msg: MessageResponse) ConsumeResponseError!void {
+        return burn.run(burn.hs_burn, ConsumeResponseError!void, consumeResponseBody, .{ self, msg });
+    }
+
+    fn consumeResponseBody(self: *Handshake, msg: MessageResponse) ConsumeResponseError!void {
         if (self.state != .initiation_sent) return error.NoPendingInitiation;
         const eph = self.local_ephemeral.?; // set by createInitiation
 
@@ -595,9 +641,12 @@ pub const Handshake = struct {
         std.crypto.secureZero(u8, &se);
 
         // psk2 mix, then authenticate the empty payload.
-        var psk_out = noise.kdf3(&ck, &self.preshared_key);
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&psk_out));
-        noise.mixHash(&h, &psk_out.out1);
+        var tau: noise.SymmetricKey = undefined;
+        var psk_k: noise.SymmetricKey = undefined;
+        noise.kdf3(&ck, &self.preshared_key, &tau, &psk_k);
+        defer std.crypto.secureZero(u8, &tau);
+        defer std.crypto.secureZero(u8, &psk_k);
+        noise.mixHash(&h, &tau);
         var empty: [0]u8 = .{};
         noise.Aead.decrypt(
             &empty,
@@ -605,7 +654,7 @@ pub const Handshake = struct {
             msg.encrypted_nothing[0..16].*,
             &h,
             counterNonce(0),
-            psk_out.out2,
+            psk_k,
         ) catch return error.DecryptionFailed;
         noise.mixHash(&h, &msg.encrypted_nothing);
 
@@ -627,19 +676,28 @@ pub const Handshake = struct {
     /// played to call this correctly.
     /// Consumes the handshake: the chaining key, transcript hash and the
     /// ephemeral private key are wiped — only the returned keys survive.
-    pub fn deriveTransportKeys(self: *Handshake, is_initiator: bool) transport.TransportKeys {
+    ///
+    /// The keys are written to `out`, not returned: transport keys returned by
+    /// value are copies in the caller's dead frame.
+    pub fn deriveTransportKeys(self: *Handshake, is_initiator: bool, out: *transport.TransportKeys) void {
+        burn.run(burn.hs_burn, void, deriveTransportKeysBody, .{ self, is_initiator, out });
+    }
+
+    fn deriveTransportKeysBody(self: *Handshake, is_initiator: bool, out: *transport.TransportKeys) void {
         std.debug.assert(self.state == .complete);
         // Kdf2(ck, ε) = (T1, T2): kdf2 leaves T1 in the chaining key and
-        // returns T2.
-        const t2 = noise.kdf2(&self.chaining_key, "");
+        // writes T2.
+        var t2: noise.SymmetricKey = undefined;
+        noise.kdf2(&self.chaining_key, "", &t2);
         const t1 = self.chaining_key;
         std.crypto.secureZero(u8, &self.chaining_key);
         std.crypto.secureZero(u8, &self.hash);
         if (self.local_ephemeral) |*kp| std.crypto.secureZero(u8, &kp.private);
-        return if (is_initiator)
+        out.* = if (is_initiator)
             .{ .send = t1, .recv = t2 }
         else
             .{ .send = t2, .recv = t1 };
+        std.crypto.secureZero(u8, &t2);
     }
 
     /// The one-call bridge from a completed handshake to the data plane:
@@ -656,10 +714,19 @@ pub const Handshake = struct {
     /// optional: a session with no birth time is a session that never expires,
     /// and the same `now_s` convention already runs through this file's cookie
     /// layer (`CookieChecker.refresh`, `PeerCookie.current`).
-    pub fn transportSession(self: *Handshake, is_initiator: bool, now_s: u64) transport.Session {
+    ///
+    /// The session is written to `out` (it holds both keys; not returned).
+    pub fn transportSession(self: *Handshake, is_initiator: bool, now_s: u64, out: *transport.Session) void {
+        burn.run(burn.hs_burn, void, transportSessionBody, .{ self, is_initiator, now_s, out });
+    }
+
+    fn transportSessionBody(self: *Handshake, is_initiator: bool, now_s: u64, out: *transport.Session) void {
         const local = self.local_index;
         const remote = self.remote_index;
-        return transport.Session.init(self.deriveTransportKeys(is_initiator), local, remote, now_s);
+        var keys: transport.TransportKeys = undefined;
+        self.deriveTransportKeys(is_initiator, &keys);
+        out.init(&keys, local, remote, now_s);
+        std.crypto.secureZero(u8, std.mem.asBytes(&keys));
     }
 
     /// `MAC(mac1_key(remote_static_public), msg_bytes_before_mac1)` — the
@@ -1046,6 +1113,29 @@ pub const PeerCookie = struct {
 
 const testing = std.testing;
 
+/// By-value shapes of the out-parameter API, for the tests (a copy of a test
+/// key in a test frame proves nothing).
+fn kpFrom(priv: PrivateKey) error{IdentityElement}!Keypair {
+    var kp: Keypair = undefined;
+    try Keypair.fromPrivateKey(&priv, &kp);
+    return kp;
+}
+fn kpGen(io: std.Io) Keypair {
+    var kp: Keypair = undefined;
+    Keypair.generate(io, &kp);
+    return kp;
+}
+fn dtk(h: *Handshake, is_initiator: bool) transport.TransportKeys {
+    var k: transport.TransportKeys = undefined;
+    h.deriveTransportKeys(is_initiator, &k);
+    return k;
+}
+fn tsess(h: *Handshake, is_initiator: bool, now_s: u64) transport.Session {
+    var s: transport.Session = undefined;
+    h.transportSession(is_initiator, now_s, &s);
+    return s;
+}
+
 test "message type wire values" {
     try testing.expectEqual(@as(u32, 1), @intFromEnum(MessageType.handshake_initiation));
     try testing.expectEqual(@as(u32, 2), @intFromEnum(MessageType.handshake_response));
@@ -1122,21 +1212,21 @@ const kat = struct {
 
     fn initiator() Handshake {
         return .{
-            .static_keypair = Keypair.fromPrivateKey(si_priv) catch unreachable,
-            .remote_static_public = (Keypair.fromPrivateKey(sr_priv) catch unreachable).public,
+            .static_keypair = kpFrom(si_priv) catch unreachable,
+            .remote_static_public = (kpFrom(sr_priv) catch unreachable).public,
             .preshared_key = psk,
             .local_index = idx_i,
-            .local_ephemeral = Keypair.fromPrivateKey(ei_priv) catch unreachable,
+            .local_ephemeral = kpFrom(ei_priv) catch unreachable,
         };
     }
 
     fn responder() Handshake {
         return .{
-            .static_keypair = Keypair.fromPrivateKey(sr_priv) catch unreachable,
-            .remote_static_public = (Keypair.fromPrivateKey(si_priv) catch unreachable).public,
+            .static_keypair = kpFrom(sr_priv) catch unreachable,
+            .remote_static_public = (kpFrom(si_priv) catch unreachable).public,
             .preshared_key = psk,
             .local_index = idx_r,
-            .local_ephemeral = Keypair.fromPrivateKey(er_priv) catch unreachable,
+            .local_ephemeral = kpFrom(er_priv) catch unreachable,
         };
     }
 };
@@ -1164,8 +1254,8 @@ test "KAT: full handshake, byte-exact messages and transport keys" {
     try testing.expectEqual(ini.hash, rsp.hash);
     try testing.expectEqual(kat.idx_r, ini.remote_index);
 
-    const ki = ini.deriveTransportKeys(true);
-    const kr = rsp.deriveTransportKeys(false);
+    const ki = dtk(&ini, true);
+    const kr = dtk(&rsp, false);
     try testing.expectEqual(kat.t_initiator_send, ki.send);
     try testing.expectEqual(kat.t_initiator_recv, ki.recv);
     try testing.expectEqual(ki.send, kr.recv);
@@ -1247,7 +1337,8 @@ test "differential: the handshake KAT messages are identical under std's AEAD to
     noise.kdf1(&st.ck, &msg1.unencrypted_ephemeral);
     noise.mixHash(&st.h, &msg1.unencrypted_ephemeral);
     var es = try noise.X25519.scalarmult(ini.local_ephemeral.?.private, ini.remote_static_public);
-    var k = noise.mixKey(&st.ck, &es);
+    var k: noise.SymmetricKey = undefined;
+    noise.mixKey(&st.ck, &es, &k);
     std.crypto.secureZero(u8, &es);
     var enc_static: [48]u8 = undefined;
     noise.StdAead.encrypt(
@@ -1262,7 +1353,7 @@ test "differential: the handshake KAT messages are identical under std's AEAD to
     noise.mixHash(&st.h, &enc_static);
 
     var ss = try noise.X25519.scalarmult(ini.static_keypair.private, ini.remote_static_public);
-    k = noise.mixKey(&st.ck, &ss);
+    noise.mixKey(&st.ck, &ss, &k);
     std.crypto.secureZero(u8, &ss);
     var enc_ts: [28]u8 = undefined;
     noise.StdAead.encrypt(
@@ -1296,8 +1387,8 @@ test "handshake → data plane: the KAT session carries packets both ways" {
     const msg2 = try rsp.createResponse(io);
     try ini.consumeResponse(msg2);
 
-    var i_sess = ini.transportSession(true, kat_now_s);
-    var r_sess = rsp.transportSession(false, kat_now_s);
+    var i_sess = tsess(&ini, true, kat_now_s);
+    var r_sess = tsess(&rsp, false, kat_now_s);
 
     // Keys land on the half that uses them, against the KAT's fixed values.
     try testing.expectEqual(kat.t_initiator_send, i_sess.send.key);
@@ -1335,8 +1426,8 @@ test "handshake → data plane: the KAT session carries packets both ways" {
 
 test "self-consistency: full handshake with fresh random keys" {
     const io = std.testing.io;
-    const si = Keypair.generate(io);
-    const sr = Keypair.generate(io);
+    const si = kpGen(io);
+    const sr = kpGen(io);
     var psk: PresharedKey = undefined;
     io.random(&psk);
 
@@ -1362,8 +1453,8 @@ test "self-consistency: full handshake with fresh random keys" {
     try testing.expectEqual(ini.chaining_key, rsp.chaining_key);
     try testing.expectEqual(ini.hash, rsp.hash);
 
-    const ki = ini.deriveTransportKeys(true);
-    const kr = rsp.deriveTransportKeys(false);
+    const ki = dtk(&ini, true);
+    const kr = dtk(&rsp, false);
     try testing.expectEqual(ki.send, kr.recv);
     try testing.expectEqual(ki.recv, kr.send);
     try testing.expect(!std.mem.eql(u8, &ki.send, &ki.recv));
@@ -1393,7 +1484,7 @@ test "auth failures: tampering, wrong PSK, wrong peer are all rejected" {
     {
         var ini = kat.initiator();
         var rsp = kat.responder();
-        rsp.remote_static_public = (try Keypair.fromPrivateKey(kat.er_priv)).public;
+        rsp.remote_static_public = (try kpFrom(kat.er_priv)).public;
         const msg1 = try ini.createInitiation(io, kat.timestamp);
         try testing.expectError(error.UnknownPeer, rsp.consumeInitiation(msg1));
     }
@@ -1474,7 +1565,7 @@ test "auth failure does not corrupt pending initiator state" {
 
     // The genuine response still completes the handshake afterwards.
     try ini.consumeResponse(msg2);
-    const ki = ini.deriveTransportKeys(true);
+    const ki = dtk(&ini, true);
     try testing.expectEqual(kat.t_initiator_send, ki.send);
 }
 
@@ -1545,7 +1636,7 @@ test "KAT: cookie reply and mac2 byte-exact against the independent reference" {
     // which is exactly the case a loaded responder has to answer.
     try testing.expectEqual(@as(noise.Mac, @splat(0)), f.mac2);
 
-    const rpub = (try Keypair.fromPrivateKey(kat.sr_priv)).public;
+    const rpub = (try kpFrom(kat.sr_priv)).public;
     try testing.expectEqual(cookie_kat.responder_pub, rpub);
     try testing.expectEqual(cookie_kat.cookie_key, noise.cookieKey(rpub));
 
@@ -1609,7 +1700,7 @@ test "cookie reply: our decryptor opens the independent reference's bytes, and i
 
 test "admit: a mac1-only flood is shed under load until the cookie round trip completes" {
     const io = std.testing.io;
-    const rpub = (try Keypair.fromPrivateKey(kat.sr_priv)).public;
+    const rpub = (try kpFrom(kat.sr_priv)).public;
     var checker = CookieChecker.init(rpub, io, 1_000); // random secret, as in production
     defer checker.wipe();
 
@@ -1768,8 +1859,8 @@ test "entropy seam: the keypair seed, the first cookie secret and the reply nonc
     // ── site 1a: `Keypair.generate` in its STATIC-identity role ──────────
     // Both halves: a frozen seed repeats the private key, and
     // `generateDeterministic` makes the public key a function of it.
-    const si = Keypair.generate(io);
-    const sr = Keypair.generate(io);
+    const si = kpGen(io);
+    const sr = kpGen(io);
     try testing.expect(!std.mem.eql(u8, &si.private, &sr.private));
     try testing.expect(!std.mem.eql(u8, &si.public, &sr.public));
 
@@ -1810,8 +1901,8 @@ test "entropy seam: the keypair seed, the first cookie secret and the reply nonc
     const msg2 = try rsp.createResponse(io);
     try ini1.consumeResponse(msg2);
     try testing.expectEqual(ini1.chaining_key, rsp.chaining_key);
-    const ki = ini1.deriveTransportKeys(true);
-    const kr = rsp.deriveTransportKeys(false);
+    const ki = dtk(&ini1, true);
+    const kr = dtk(&rsp, false);
     try testing.expectEqual(ki.send, kr.recv);
     try testing.expectEqual(ki.recv, kr.send);
 
@@ -1947,8 +2038,8 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
     const io = threaded.io();
 
     // Fresh identities: ours (userspace responder) and the kernel's.
-    const our_kp = Keypair.generate(io);
-    const kernel_kp = Keypair.generate(io);
+    const our_kp = kpGen(io);
+    const kernel_kp = kpGen(io);
     var psk: PresharedKey = undefined;
     io.random(&psk);
 
@@ -2062,7 +2153,7 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
                 // Through the real data-plane API, not a hand-rolled AEAD
                 // call: this is what makes the kernel an oracle for
                 // `transport.zig`'s framing, not only for the handshake.
-                session = hs.transportSession(false, nowSeconds());
+                session = tsess(&hs, false, nowSeconds());
                 if (drop_first_response) {
                     // The injected loss. Everything above already ran, so the
                     // kernel's rekey timer is what has to rescue this — the

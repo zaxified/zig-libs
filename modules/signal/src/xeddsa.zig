@@ -78,6 +78,7 @@
 
 const std = @import("std");
 const ct25519 = @import("ct25519");
+const burn = @import("burn.zig");
 const Edwards25519 = std.crypto.ecc.Edwards25519;
 const Fe = Edwards25519.Fe;
 const scalar = Edwards25519.scalar;
@@ -217,8 +218,17 @@ fn calculateKeyPair(montgomery_priv: [32]u8) struct {
 /// 6. Return `R || s` — no sign bit is packed into `s`'s top bit (unlike
 ///    deployed libsignal's variant; see the module doc comment): `A`'s
 ///    sign is 0 by construction, so the verifier never needs to be told.
-pub fn sign(montgomery_priv: [32]u8, msg: []const u8, z: RandomData) Signature {
-    var kp = calculateKeyPair(montgomery_priv);
+///
+/// `montgomery_priv` by pointer; the stack the signing used (the secret
+/// scalar, the nonce, the hash state) is burned before the call returns.
+/// `z` is the caller's signing randomness: hashed together with the secret
+/// scalar, never a secret on its own.
+pub fn sign(montgomery_priv: *const [32]u8, msg: []const u8, z: RandomData) Signature {
+    return burn.run(burn.sign_burn, Signature, signBody, .{ montgomery_priv, msg, z });
+}
+
+fn signBody(montgomery_priv: *const [32]u8, msg: []const u8, z: RandomData) Signature {
+    var kp = calculateKeyPair(montgomery_priv.*);
     defer std.crypto.secureZero(u8, &kp.scalar);
 
     var st = Sha512.init(.{});
@@ -343,8 +353,12 @@ pub const libsignal = struct {
     /// always `< L < 2^253`, that bit is guaranteed zero beforehand, so
     /// OR-ing it in never collides with the scalar's own value — this is
     /// exactly the encoding `libsignal.verify` (and real Signal) expects.
-    pub fn sign(montgomery_priv: [32]u8, msg: []const u8, z: RandomData) Signature {
-        var kp = naturalKeyPair(montgomery_priv);
+    pub fn sign(montgomery_priv: *const [32]u8, msg: []const u8, z: RandomData) Signature {
+        return burn.run(burn.sign_burn, Signature, signBodyLibsignal, .{ montgomery_priv, msg, z });
+    }
+
+    fn signBodyLibsignal(montgomery_priv: *const [32]u8, msg: []const u8, z: RandomData) Signature {
+        var kp = naturalKeyPair(montgomery_priv.*);
         defer std.crypto.secureZero(u8, &kp.scalar);
         const sign_bit: u8 = kp.public[31] >> 7;
 
@@ -425,6 +439,8 @@ pub const libsignal = struct {
 // round-trip, tamper-rejection, libsignal known-answer vector (the
 // EXTERNAL anchor, exercised against both variants), and X3DH end-to-end
 // tests live in `kat_test.zig` (imported by `root.zig`'s aggregator).
+
+const shim = @import("test_shim.zig");
 
 test "a clamped X25519 seed can NEVER reduce to 0 mod L (the panic that was not)" {
     // Both secret base multiplications used to end in
@@ -528,7 +544,7 @@ test "libsignal variant round-trips (self-consistency, both sign-bit branches) a
         seen_sign_bit[natural_sign] = true;
 
         const msg = "libsignal-variant self round-trip";
-        const sig = libsignal.sign(seed, msg, z);
+        const sig = shim.xeddsa.libsignal.sign(seed, msg, z);
         try std.testing.expectEqual(natural_sign, sig[63] >> 7);
         try std.testing.expect(libsignal.verify((try std.crypto.dh.X25519.recoverPublicKey(seed)), msg, sig));
 
@@ -546,7 +562,7 @@ test "libsignal variant round-trips (self-consistency, both sign-bit branches) a
 test "verify refuses s + L, an order-2 key that satisfies the equation, and a partly matching R" {
     const priv = [_]u8{0x42} ** 32;
     const public = try std.crypto.dh.X25519.recoverPublicKey(priv);
-    const sig = sign(priv, "msg", [_]u8{7} ** 64);
+    const sig = shim.xeddsa.sign(priv, "msg", [_]u8{7} ** 64);
     try std.testing.expect(verify(public, "msg", sig));
 
     // `s + L` moves no point, so only the canonicity check refuses it.

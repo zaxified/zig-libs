@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING + FIX (secrets on the dead stack):** a new ReleaseFast stack probe (`src/stackprobe_test.zig`, a full IK handshake, 28 needles) found both session keys (`send_key`/`recv_key`) left in the driver's dead frame after `Responder.writeMessage2` and `Initiator.readMessage2` (12 hits per 3 runs; the `noise` layer under it was already clean after the same-day `noise` change). After: 0 everywhere. **API (BREAKING):** `Initiator.init`/`initEphemeral` and `Responder.init`/`initEphemeral` initialize in place and take the key pairs by pointer (`ini.init(&static_kp, responder_static, ctx)`; `ephemeral: ?*const KeyPair`); `Initiator.readMessage2(message, payload_out, keys: *SessionKeys)` returns the payload length and `Responder.writeMessage2(random, payload, out, keys: *SessionKeys)` returns the msg2 length — the session keys are written to `keys` (on success only); `InitiatorFinish` and `ResponderFinish` are removed. All five handshake calls run their body one frame down and burn 2 KiB (`src/burn.zig`).
+
 - **2026-10-05** — **BREAKING (security fix):** `Responder.init(static_kp, initiator_static, ctx)`
   and `Responder.initEphemeral(static_kp, initiator_static, ctx, ephemeral)` take the initiator
   PE's provisioned static public key, and `readMessage1` refuses msg1 under any other with the

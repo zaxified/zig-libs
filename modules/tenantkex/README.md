@@ -81,18 +81,22 @@ const tk = @import("tenantkex");
 const ctx = tk.FabricContext{ .isid = tenant_isid, .initiator_pe = a, .responder_pe = b };
 
 // Initiator side (knows the responder's static public key out of band):
-var ini = tk.Initiator.init(my_static_kp, responder_static_pub, ctx);
+var ini: tk.Initiator = undefined;
+ini.init(&my_static_kp, responder_static_pub, ctx);  // in place, key by pointer
 var m1: [tk.message1Len(0)]u8 = undefined;
 const n1 = try ini.writeMessage1(rng, "", &m1);      // send m1[0..n1]
 // ... receive m2 ...
-const fin = try ini.readMessage2(m2, &payload_buf);  // fin.keys = SessionKeys
+var keys: tk.SessionKeys = undefined;                // filled on success only
+const n = try ini.readMessage2(m2, &payload_buf, &keys); // payload length
 
 // Responder side:
 // ... knows the initiator PE's provisioned static public key, and accepts no other:
-var rsp = tk.Responder.init(my_static_kp, initiator_static_pub, ctx);
+var rsp: tk.Responder = undefined;
+rsp.init(&my_static_kp, initiator_static_pub, ctx);
 _ = try rsp.readMessage1(m1, &payload_buf);
 var m2: [tk.message2Len(0)]u8 = undefined;
-const rfin = try rsp.writeMessage2(rng, "", &m2);    // send m2, rfin.keys = SessionKeys
+var rkeys: tk.SessionKeys = undefined;
+const n2 = try rsp.writeMessage2(rng, "", &m2, &rkeys); // send m2[0..n2]
 ```
 
 `rng` must be a cryptographically secure `std.Random` in production (Noise draws

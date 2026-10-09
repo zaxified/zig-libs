@@ -62,9 +62,13 @@ const signal = @import("signal");
 
 ```zig
 // Bob publishes a bundle (server-side; this module doesn't touch transport).
-const bob_ik = signal.x3dh.generateKeyPair(io); // fail-closed draw, not std's KeyPair.generate
-const bob_spk = signal.generateSignedPreKey(bob_ik, /* id */ 1, z, io); // z: 64 bytes from io.random
-const bob_opk_kp = signal.x3dh.generateKeyPair(io);
+// Secrets go in by pointer, secret results come back through `out`.
+var bob_ik: signal.IdentityKey = undefined;
+signal.x3dh.generateKeyPair(io, &bob_ik); // fail-closed draw, not std's KeyPair.generate
+var bob_spk: signal.x3dh.SignedPreKey = undefined;
+signal.generateSignedPreKey(&bob_ik, /* id */ 1, z, io, &bob_spk); // z: 64 bytes from io.random
+var bob_opk_kp: signal.IdentityKey = undefined;
+signal.x3dh.generateKeyPair(io, &bob_opk_kp);
 
 const bundle = signal.PreKeyBundle{
     .identity_key = bob_ik.public_key,
@@ -76,15 +80,18 @@ const bundle = signal.PreKeyBundle{
 };
 
 // Alice fetches `bundle`, then initiates.
-const alice_ik = signal.x3dh.generateKeyPair(io);
-const out = try signal.initiate(allocator, alice_ik, bundle, initial_plaintext, io);
+var alice_ik: signal.IdentityKey = undefined;
+signal.x3dh.generateKeyPair(io, &alice_ik);
+var out: signal.x3dh.InitiateOutput = undefined;
+try signal.initiate(allocator, &alice_ik, bundle, initial_plaintext, io, &out);
 defer out.message.deinit(allocator);
 // out.agreement.shared_secret / out.agreement.associated_data feed Part 2 (Double Ratchet).
 // out.message is what Alice sends Bob over the wire (out.message.toBytes(allocator));
 // its ciphertext is initial_plaintext sealed under SK with AD.
 
 // Bob, on receiving out.message:
-const opened = try signal.respond(allocator, bob_ik, bob_spk, bob_opk, out.message);
+var opened: signal.x3dh.RespondOutput = undefined;
+try signal.respond(allocator, &bob_ik, &bob_spk, &bob_opk, out.message, &opened);
 defer allocator.free(opened.plaintext);
 // opened.agreement.shared_secret == out.agreement.shared_secret
 // error.InitialMessageAuthenticationFailed: the initial message did not open,
@@ -122,11 +129,13 @@ performs the DH ratchet that gives him a sending chain.
 
 ```zig
 // Alice (has SK/AD from x3dh.initiate + Bob's signed-prekey public):
-var alice = try signal.initAlice(sk, ad, bob_spk_public, io);
+var alice: signal.ratchet.State = undefined;
+try signal.ratchet.State.initAlice(&sk, ad, bob_spk_public, io, &alice);
 defer alice.deinit(allocator);
 
 // Bob (has SK/AD from x3dh.respond + his own signed-prekey keypair):
-var bob = signal.initBob(sk, ad, bob_spk_keypair);
+var bob: signal.ratchet.State = undefined;
+signal.ratchet.State.initBob(&sk, ad, &bob_spk_keypair, &bob);
 defer bob.deinit(allocator);
 
 var msg = try alice.encrypt(allocator, "hello");   // msg.header + msg.ciphertext

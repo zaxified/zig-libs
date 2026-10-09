@@ -337,6 +337,33 @@ post-mutation source text instead.
 
 [spec]: https://gitlab.matrix.org/matrix-org/olm/-/blob/master/docs/megolm.md
 
+## Secret residue on the dead stack
+
+`OutboundSession.init` / `encrypt` / `sessionKey`, `InboundGroupSession`
+`fromSessionKey` / `fromExportedKey` / `decrypt` / `exportAt` / `forgetBefore`,
+the unsealed and sealed pickle readers, and `Ratchet.advanceStep` /
+`advanceToUnchecked` run their body one frame down (`burn.run`) and then zero the
+stack that body dirtied (`burn.zig`: 4 KiB for the ratchet advance, 12 KiB for
+the session calls, 16 KiB for `decrypt` and the sealed openers). Measured body
+depth, ReleaseFast, 2026-10-09: 0.9 KiB (`advanceTo`) .. 7.3 KiB (`decrypt`);
+the burns are about 2x that. Results that carry the ratchet or the signing key
+(`OutboundSession`, `SessionKey`, `ExportedSessionKey`, a restored session) go
+through `out` rather than a return value.
+
+`src/stackprobe_test.zig` scans, after each call, for the ratchet (whole and per
+32-byte part, at the starting and the target index), R0 and the signing seed drawn
+by a RECORDING `std.Io`, the Ed25519 secret key, the AES key / HMAC key / IV, the
+AES encryption and decryption round keys and the pickle key; each set has a control
+needle. ReleaseFast only.
+
+Not covered: the long-lived sessions (`ratchet`, `signing_key` live in the
+`OutboundSession` / `InboundGroupSession` by design, zeroed by `deinit`);
+`cipher.deriveKeys` and `Ratchet.init` / `generate`, which return secrets by value
+and are the caller's frame to clean when called directly; `SessionKey.encode` /
+`toBase64` and the other encoders (their output is the secret); `pickle` /
+`pickleSealed` (probed clean as shipped, no new burn); the AES-CBC key schedule
+inside `aescbc` (sibling module, sits inside `decrypt`'s burn); the heap.
+
 ## Backlog / deferred
 
 - ~~Session state serialization for `OutboundSession` and `InboundGroupSession`~~ — done 2026-10-06 (`pickle.zig`; see "Session pickles" above).

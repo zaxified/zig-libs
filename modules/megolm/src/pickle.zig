@@ -327,6 +327,8 @@ fn expectSameMessage(a: anytype, b: anytype) !void {
     try testing.expectEqualSlices(u8, &a.signature, &b.signature);
 }
 
+const shim = @import("test_shim.zig");
+
 test "layout lengths are the documented ones" {
     try testing.expectEqual(@as(usize, 202), outbound_len);
     try testing.expectEqual(@as(usize, 303), inbound_len);
@@ -340,9 +342,9 @@ test "outbound pickle round trip mid-ratchet: the restored session continues ide
     const io = threaded.io();
     const a = testing.allocator;
 
-    var out = OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
     for (0..300) |_| { // cross a 2^8 boundary so a part-2 rehash is in the state
         var m = try out.encrypt(a, "warm-up");
@@ -355,9 +357,9 @@ test "outbound pickle round trip mid-ratchet: the restored session continues ide
     var sealed: [sealed_outbound_len]u8 = undefined;
     out.pickleSealed(io, &test_key, &sealed);
 
-    var restored = try OutboundSession.fromPickle(&plain);
+    var restored = try shim.outboundFromPickle(&plain);
     defer restored.deinit();
-    var restored_sealed = try OutboundSession.fromSealedPickle(&sealed, &test_key);
+    var restored_sealed = try shim.outboundFromSealedPickle(&sealed, &test_key);
     defer restored_sealed.deinit();
 
     try testing.expectEqual(@as(u32, 300), restored.messageIndex());
@@ -389,11 +391,11 @@ test "inbound pickle round trip mid-ratchet: decrypts and refusals continue iden
     const io = threaded.io();
     const a = testing.allocator;
 
-    var out = OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
     var early = try out.encrypt(a, "before share");
     defer early.deinit(a);
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
     try testing.expect(in.signing_key_verified);
 
@@ -415,9 +417,9 @@ test "inbound pickle round trip mid-ratchet: decrypts and refusals continue iden
     var sealed: [sealed_inbound_len]u8 = undefined;
     in.pickleSealed(io, &test_key, &sealed);
 
-    var r1 = try InboundGroupSession.fromPickle(&plain);
+    var r1 = try shim.inboundFromPickle(&plain);
     defer r1.deinit();
-    var r2 = try InboundGroupSession.fromSealedPickle(&sealed, &test_key);
+    var r2 = try shim.inboundFromSealedPickle(&sealed, &test_key);
     defer r2.deinit();
     for ([_]*InboundGroupSession{ &r1, &r2 }) |r| {
         try testing.expect(r.signing_key_verified);
@@ -439,11 +441,11 @@ test "inbound pickle round trip mid-ratchet: decrypts and refusals continue iden
 
     // An unverified session stays unverified (the flag is carried, not
     // re-derived), and a forgetBefore survives the round trip.
-    var imported = try InboundGroupSession.fromExportedKey(in.exportAt(2).?);
+    var imported = try shim.fromExportedKey(shim.exportAt(&in, 2).?);
     defer imported.deinit();
     try testing.expect(imported.forgetBefore(3));
     imported.pickle(&plain);
-    var r3 = try InboundGroupSession.fromPickle(&plain);
+    var r3 = try shim.inboundFromPickle(&plain);
     defer r3.deinit();
     try testing.expect(!r3.signing_key_verified);
     try testing.expectEqual(@as(u32, 3), r3.firstKnownIndex());
@@ -455,37 +457,37 @@ test "plain decoders: header, kind and length refusals" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
     var ob: [outbound_len]u8 = undefined;
     out.pickle(&ob);
     var ib: [inbound_len]u8 = undefined;
     in.pickle(&ib);
 
-    try testing.expectError(error.Truncated, OutboundSession.fromPickle(""));
-    try testing.expectError(error.Truncated, OutboundSession.fromPickle(ob[0 .. header_len - 1]));
-    try testing.expectError(error.Truncated, OutboundSession.fromPickle(ob[0 .. outbound_len - 1]));
-    try testing.expectError(error.Truncated, InboundGroupSession.fromPickle(ib[0 .. inbound_len - 1]));
+    try testing.expectError(error.Truncated, shim.outboundFromPickle(""));
+    try testing.expectError(error.Truncated, shim.outboundFromPickle(ob[0 .. header_len - 1]));
+    try testing.expectError(error.Truncated, shim.outboundFromPickle(ob[0 .. outbound_len - 1]));
+    try testing.expectError(error.Truncated, shim.inboundFromPickle(ib[0 .. inbound_len - 1]));
     var long: [inbound_len + 1]u8 = undefined;
     @memcpy(long[0..outbound_len], &ob);
     long[outbound_len] = 0;
-    try testing.expectError(error.TrailingBytes, OutboundSession.fromPickle(long[0 .. outbound_len + 1]));
+    try testing.expectError(error.TrailingBytes, shim.outboundFromPickle(long[0 .. outbound_len + 1]));
     @memcpy(long[0..inbound_len], &ib);
     long[inbound_len] = 0;
-    try testing.expectError(error.TrailingBytes, InboundGroupSession.fromPickle(&long));
+    try testing.expectError(error.TrailingBytes, shim.inboundFromPickle(&long));
 
-    try testing.expectError(error.WrongKind, OutboundSession.fromPickle(&ib));
-    try testing.expectError(error.WrongKind, InboundGroupSession.fromPickle(&ob));
-    try testing.expectError(error.WrongKind, OutboundSession.fromSealedPickle(&ob, &test_key));
+    try testing.expectError(error.WrongKind, shim.outboundFromPickle(&ib));
+    try testing.expectError(error.WrongKind, shim.inboundFromPickle(&ob));
+    try testing.expectError(error.WrongKind, shim.outboundFromSealedPickle(&ob, &test_key));
 
     var t = ob;
     t[0] ^= 1;
-    try testing.expectError(error.BadMagic, OutboundSession.fromPickle(&t));
+    try testing.expectError(error.BadMagic, shim.outboundFromPickle(&t));
     t = ob;
     t[magic.len] = 0x02;
-    try testing.expectError(error.UnsupportedVersion, OutboundSession.fromPickle(&t));
+    try testing.expectError(error.UnsupportedVersion, shim.outboundFromPickle(&t));
 }
 
 test "plain decoders: field refusals" {
@@ -493,19 +495,19 @@ test "plain decoders: field refusals" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
     var ob: [outbound_len]u8 = undefined;
     out.pickle(&ob);
     // Seed and public key disagree.
     var t = ob;
     t[outbound_len - 1] ^= 1;
-    try testing.expectError(error.InconsistentState, OutboundSession.fromPickle(&t));
+    try testing.expectError(error.InconsistentState, shim.outboundFromPickle(&t));
     t = ob;
     t[outbound_len - pk_len - 1] ^= 1;
-    try testing.expectError(error.InconsistentState, OutboundSession.fromPickle(&t));
+    try testing.expectError(error.InconsistentState, shim.outboundFromPickle(&t));
 
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
     var m = try out.encrypt(testing.allocator, "x");
     defer m.deinit(testing.allocator);
@@ -523,20 +525,20 @@ test "plain decoders: field refusals" {
 
     var u = ib;
     u[flags_at] = 0x02;
-    try testing.expectError(error.InvalidFlags, InboundGroupSession.fromPickle(&u));
+    try testing.expectError(error.InvalidFlags, shim.inboundFromPickle(&u));
     u = ib;
     u[pk_at..][0..pk_len].* = [_]u8{0xff} ** pk_len; // non-canonical point
-    try testing.expectError(error.InvalidSigningKey, InboundGroupSession.fromPickle(&u));
+    try testing.expectError(error.InvalidSigningKey, shim.inboundFromPickle(&u));
     u = ib;
     u[latest_data_at + 5] ^= 1; // cache bytes not derivable from initial
-    try testing.expectError(error.InconsistentState, InboundGroupSession.fromPickle(&u));
+    try testing.expectError(error.InconsistentState, shim.inboundFromPickle(&u));
     u = ib;
     std.mem.writeInt(u32, u[latest_counter_at..][0..4], 3, .big); // cache counter moved
-    try testing.expectError(error.InconsistentState, InboundGroupSession.fromPickle(&u));
+    try testing.expectError(error.InconsistentState, shim.inboundFromPickle(&u));
     // Cache BEHIND initial: would undo a forgetBefore.
     u = ib;
     std.mem.writeInt(u32, u[header_len..][0..4], 7, .big);
-    try testing.expectError(error.InconsistentState, InboundGroupSession.fromPickle(&u));
+    try testing.expectError(error.InconsistentState, shim.inboundFromPickle(&u));
 }
 
 test "sealed decoders: wrong key, every single-byte tamper and every truncation are refused" {
@@ -544,9 +546,9 @@ test "sealed decoders: wrong key, every single-byte tamper and every truncation 
     defer threaded.deinit();
     const io = threaded.io();
 
-    var out = OutboundSession.init(io);
+    var out = shim.outboundInit(io);
     defer out.deinit();
-    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    var in = try shim.fromSessionKey(try shim.sessionKey(&out));
     defer in.deinit();
     var so: [sealed_outbound_len]u8 = undefined;
     out.pickleSealed(io, &test_key, &so);
@@ -555,22 +557,22 @@ test "sealed decoders: wrong key, every single-byte tamper and every truncation 
 
     var wrong = test_key;
     wrong[31] ^= 1;
-    try testing.expectError(error.AuthenticationFailed, OutboundSession.fromSealedPickle(&so, &wrong));
-    try testing.expectError(error.AuthenticationFailed, InboundGroupSession.fromSealedPickle(&si, &wrong));
-    try testing.expectError(error.WrongKind, OutboundSession.fromSealedPickle(&si, &test_key));
-    try testing.expectError(error.WrongKind, InboundGroupSession.fromPickle(&si));
+    try testing.expectError(error.AuthenticationFailed, shim.outboundFromSealedPickle(&so, &wrong));
+    try testing.expectError(error.AuthenticationFailed, shim.inboundFromSealedPickle(&si, &wrong));
+    try testing.expectError(error.WrongKind, shim.outboundFromSealedPickle(&si, &test_key));
+    try testing.expectError(error.WrongKind, shim.inboundFromPickle(&si));
 
     // Two seals of the same session differ (fresh nonce) and both open.
     var so2: [sealed_outbound_len]u8 = undefined;
     out.pickleSealed(io, &test_key, &so2);
     try testing.expect(!std.mem.eql(u8, &so, &so2));
-    var again = try OutboundSession.fromSealedPickle(&so2, &test_key);
+    var again = try shim.outboundFromSealedPickle(&so2, &test_key);
     again.deinit();
 
     for (0..so.len) |i| {
         var t = so;
         t[i] ^= 0x01;
-        if (OutboundSession.fromSealedPickle(&t, &test_key)) |s| {
+        if (shim.outboundFromSealedPickle(&t, &test_key)) |s| {
             var ss = s;
             ss.deinit();
             return error.TestUnexpectedResult;
@@ -579,7 +581,7 @@ test "sealed decoders: wrong key, every single-byte tamper and every truncation 
     for (0..si.len) |i| {
         var t = si;
         t[i] ^= 0x80;
-        if (InboundGroupSession.fromSealedPickle(&t, &test_key)) |s| {
+        if (shim.inboundFromSealedPickle(&t, &test_key)) |s| {
             var ss = s;
             ss.deinit();
             return error.TestUnexpectedResult;
@@ -588,18 +590,18 @@ test "sealed decoders: wrong key, every single-byte tamper and every truncation 
     // Byte i past the header: always the AEAD that refuses.
     var t = si;
     t[header_len] ^= 1;
-    try testing.expectError(error.AuthenticationFailed, InboundGroupSession.fromSealedPickle(&t, &test_key));
+    try testing.expectError(error.AuthenticationFailed, shim.inboundFromSealedPickle(&t, &test_key));
     t = si;
     t[si.len - 1] ^= 1;
-    try testing.expectError(error.AuthenticationFailed, InboundGroupSession.fromSealedPickle(&t, &test_key));
+    try testing.expectError(error.AuthenticationFailed, shim.inboundFromSealedPickle(&t, &test_key));
 
     for (0..so.len) |n| {
-        try testing.expectError(error.Truncated, OutboundSession.fromSealedPickle(so[0..n], &test_key));
+        try testing.expectError(error.Truncated, shim.outboundFromSealedPickle(so[0..n], &test_key));
     }
     var long: [sealed_inbound_len + 1]u8 = undefined;
     @memcpy(long[0..sealed_inbound_len], &si);
     long[sealed_inbound_len] = 0;
-    try testing.expectError(error.TrailingBytes, InboundGroupSession.fromSealedPickle(&long, &test_key));
+    try testing.expectError(error.TrailingBytes, shim.inboundFromSealedPickle(&long, &test_key));
 }
 
 // ── fuzz: the pickle decoders ────────────────────────────────────────────

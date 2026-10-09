@@ -45,7 +45,9 @@ const now_s: u64 = 1_000;
 const ping_payload = "zig-libs wg ping";
 
 fn keypair(priv: [32]u8) hs.Keypair {
-    return hs.Keypair.fromPrivateKey(priv) catch unreachable;
+    var kp: hs.Keypair = undefined;
+    hs.Keypair.fromPrivateKey(&priv, &kp) catch unreachable;
+    return kp;
 }
 
 test "kernel replay A: the kernel's initiation is answered with the response it accepted; its keepalive opens" {
@@ -67,7 +69,8 @@ test "kernel replay A: the kernel's initiation is answered with the response it 
     _ = try std.fmt.hexToBytes(&want2, rec.a_response);
     try testing.expectEqualSlices(u8, &want2, std.mem.asBytes(&msg2));
 
-    var session = h.transportSession(false, now_s);
+    var session: transport.Session = undefined;
+    h.transportSession(false, now_s, &session);
     var ka: [transport.sealedLen(0)]u8 = undefined;
     _ = try std.fmt.hexToBytes(&ka, rec.a_keepalive);
     var empty: [0]u8 = .{};
@@ -123,7 +126,8 @@ test "kernel replay B: our initiation and ping are the bytes the kernel accepted
     try h.consumeResponse(msg2);
     try testing.expectEqual(msg2.sender_index, h.remote_index);
 
-    var session = h.transportSession(true, now_s);
+    var session: transport.Session = undefined;
+    h.transportSession(true, now_s, &session);
     const ping = echoRequest();
     var sealed: [transport.sealedLen(ping.len)]u8 = undefined;
     _ = try session.send.seal(&sealed, &ping, now_s);

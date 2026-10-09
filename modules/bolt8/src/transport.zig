@@ -47,7 +47,7 @@ pub const Direction = struct {
 
     pub fn init(key: [32]u8, chain: [32]u8) Direction {
         var cipher: CipherState = .{};
-        cipher.initializeKey(key);
+        cipher.initializeKey(&key);
         return .{ .cipher = cipher, .chain = chain };
     }
 

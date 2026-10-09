@@ -140,14 +140,32 @@ Dependents `tenantkex` and `bolt8` pass their modtests.
 
 ## Secret residue on the dead stack
 
-Review 2026-10-08 (`bolt8/src/stackprobe_test.zig`, ReleaseFast). `Cipher.encrypt`/`decrypt`
-take the key by value, so `CipherState.encryptWithAd`/`decryptWithAd` copied `k` into their own
-frame on every call: the transport key left once per `bolt8` send and twice per receive, after
-the AEAD had been made to burn its own call tree. The three keyed `CipherState` calls
-(`encryptWithAd`, `decryptWithAd`, `rekey`) now run one frame down and zero 1 KiB below it
-(~10 ns, vector stores). That covers this module's frame only: `chachapoly` burns its own call
-tree, std's AEADs do not, so a suite on `std.crypto.aead.aes_gcm` still leaves std's copies.
-`SymmetricState`'s HKDF (`mixKey`, `split`) is not probed here; `bolt8` burns around every act.
+Reviews 2026-10-08 (`bolt8`'s probe) and 2026-10-09 (this module's `src/stackprobe_test.zig`,
+ReleaseFast only; a full `XXpsk3` handshake on `DefaultSuite`, 41 needles: both static and both
+ephemeral private keys raw and as X25519 clamps them, `ee`/`es`/`se`, the PSK, every HKDF
+`temp_key`, `ck` and `k` after each `MixKey`, the `MixKeyAndHash` output, both transport keys,
+plus a control needle; NEG 0, POS 1). Before: residue in `HandshakeState.init`/`initialize` (the
+static key, 12 per 3 runs), in `writeMessage`/`readMessage` (the ephemeral key, the transport keys
+on the completing calls: i2r 12 / r2i 9) and in `SymmetricState.mixKey`/`mixKeyAndHash`/`split`
+(`ck`, `k`, the split keys). Depth measured: `writeMessage`/`readMessage` 3.2 KiB, `init`
+2.6 KiB, the HKDF steps 1.3 KiB. After: 0 in every probed call.
+
+What is burned (`src/burn.zig`, one frame down, then volatile vector stores): the three keyed
+`CipherState` calls (1 KiB), `SymmetricState.mixKey`/`mixKeyAndHash`/`split` (4 KiB),
+`HandshakeState.init`/`initialize` (4 KiB), `writeMessage`/`readMessage` (8 KiB; this covers the
+default suite's X25519 + SHA-256 tree 2.5x). Secret inputs and outputs no longer travel by value:
+`initializeKey` takes `*const [32]u8`; `Keys.s`/`Keys.e` are `?*const KeyPair` and `init`/
+`initialize` take `*const Keys` and initialize the state in place; `split` and `writeMessage`/
+`readMessage` write the transport pair to an out-parameter (`Step` is `{ len, complete }`).
+
+NOT covered, honestly:
+- a suite whose DH or AEAD leaves more than 8 KiB on the stack (a P-384 DH dirties ~12 KiB; std's
+  `aes_gcm` leaves its own round keys and the key copy): the burn is sized for the default suite
+  (X25519, `chachapoly`, SHA-256/512, BLAKE2). `chachapoly` burns its own tree; std's AEADs do not.
+- the caller's own copies: the `Keys` literal, the `KeyPair` it points to, and the transport
+  `CipherState`s the caller receives are the caller's to wipe.
+- `getHandshakeHash`, `mixHash`, `encryptAndHash`/`decryptAndHash` (the keyed work happens in the
+  already burned `CipherState` calls; the transcript hash is public).
 
 ## Backlog / deferred
 

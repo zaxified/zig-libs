@@ -126,7 +126,9 @@ const Udp = struct {
 };
 
 fn keypair(priv: [32]u8) hs.Keypair {
-    return hs.Keypair.fromPrivateKey(priv) catch unreachable;
+    var kp: hs.Keypair = undefined;
+    hs.Keypair.fromPrivateKey(&priv, &kp) catch unreachable;
+    return kp;
 }
 
 fn appendHex(gpa: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, bytes: []const u8) !void {
@@ -171,7 +173,8 @@ fn kernelInitiates(gpa: std.mem.Allocator, io: std.Io, out: *std.ArrayList(u8)) 
     try h.consumeInitiation(msg1);
     const msg2 = try h.createResponse(io);
     try appendHex(gpa, out, "a_response", std.mem.asBytes(&msg2));
-    var session = h.transportSession(false, now_s);
+    var session: transport.Session = undefined;
+    h.transportSession(false, now_s, &session);
     try udp.sendTo(std.mem.asBytes(&msg2), &from);
 
     const ka = try udp.recvType(&buf, @intFromEnum(hs.MessageType.transport_data), 10_000, &from);
@@ -251,7 +254,8 @@ fn weInitiate(gpa: std.mem.Allocator, io: std.Io, out: *std.ArrayList(u8)) !void
     var msg2: hs.MessageResponse = undefined;
     @memcpy(std.mem.asBytes(&msg2), resp);
     try h.consumeResponse(msg2);
-    var session = h.transportSession(true, now_s);
+    var session: transport.Session = undefined;
+    h.transportSession(true, now_s, &session);
 
     const ping = echoRequest();
     var sealed: [transport.sealedLen(ping.len)]u8 = undefined;

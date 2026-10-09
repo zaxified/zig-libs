@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
+const burn = @import("burn.zig");
 
 // Note: `pub const meta` is declared once, canonically, in `root.zig` (per
 // CONVENTIONS.md §4) — submodule files like this one do not repeat it.
@@ -128,18 +129,28 @@ pub const tag_len = Aead.tag_length;
 /// `DH(Er, Ei)`... — see `handshake.zig`'s `createResponse`/`consumeInitiation`
 /// step comments for exactly where).
 pub fn kdf1(ck: *ChainKey, input: []const u8) void {
+    burn.run(burn.kdf_burn, void, kdf1Body, .{ ck, input });
+}
+
+fn kdf1Body(ck: *ChainKey, input: []const u8) void {
     var t = kdf(1, ck, input);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&t));
     ck.* = t[0];
 }
 
 /// `Noise HKDF(ck, input, 2)`: ratchets `ck` in place and returns one
-/// derived 32-byte output key (e.g. the per-message AEAD key after a DH).
-pub fn kdf2(ck: *ChainKey, input: []const u8) SymmetricKey {
+/// derived 32-byte output key (e.g. the per-message AEAD key after a DH),
+/// written to `out` (not returned: a secret returned by value is a copy in the
+/// caller's dead frame).
+pub fn kdf2(ck: *ChainKey, input: []const u8, out: *SymmetricKey) void {
+    burn.run(burn.kdf_burn, void, kdf2Body, .{ ck, input, out });
+}
+
+fn kdf2Body(ck: *ChainKey, input: []const u8, out: *SymmetricKey) void {
     var t = kdf(2, ck, input);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&t));
     ck.* = t[0];
-    return t[1];
+    out.* = t[1];
 }
 
 /// `Noise HKDF(ck, input, 3)`: ratchets `ck` in place and returns two
@@ -148,11 +159,17 @@ pub fn kdf2(ck: *ChainKey, input: []const u8) SymmetricKey {
 /// (`ck, tau, k := Kdf3(ck, psk)`) and the final transport-key split
 /// (`T_send, T_recv := Kdf2(ck, empty)` is a `kdf2`, NOT this — see
 /// `Handshake.deriveTransportKeys`).
-pub fn kdf3(ck: *ChainKey, input: []const u8) struct { out1: SymmetricKey, out2: SymmetricKey } {
+/// The two outputs are written to `out1` and `out2`.
+pub fn kdf3(ck: *ChainKey, input: []const u8, out1: *SymmetricKey, out2: *SymmetricKey) void {
+    burn.run(burn.kdf_burn, void, kdf3Body, .{ ck, input, out1, out2 });
+}
+
+fn kdf3Body(ck: *ChainKey, input: []const u8, out1: *SymmetricKey, out2: *SymmetricKey) void {
     var t = kdf(3, ck, input);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&t));
     ck.* = t[0];
-    return .{ .out1 = t[1], .out2 = t[2] };
+    out1.* = t[1];
+    out2.* = t[2];
 }
 
 /// Core `Noise HKDF(key, input, n)` over HMAC-BLAKE2s, returning all `n`
@@ -192,8 +209,8 @@ pub fn mixHash(h: *HandshakeHash, data: []const u8) void {
 /// `ck := kdf2(ck, dh_output)` (the temp key is NOT mixed into `h` per the
 /// Noise spec; only DH outputs and ciphertexts extend `h`, via `mixHash`
 /// called separately by the caller for whatever goes on the wire).
-pub fn mixKey(ck: *ChainKey, dh_output: []const u8) SymmetricKey {
-    return kdf2(ck, dh_output);
+pub fn mixKey(ck: *ChainKey, dh_output: []const u8, out: *SymmetricKey) void {
+    kdf2(ck, dh_output, out);
 }
 
 // ── mac1 / mac2 (keyed BLAKE2s, WireGuard's cookie/DoS-mitigation layer) ───
@@ -302,14 +319,18 @@ test "kdf1/kdf2/kdf3 ratchet the chaining key consistently" {
     var ck2: ChainKey = start;
     var ck3: ChainKey = start;
     kdf1(&ck1, "input");
-    const k2 = kdf2(&ck2, "input");
-    const k3 = kdf3(&ck3, "input");
+    var k2: SymmetricKey = undefined;
+    kdf2(&ck2, "input", &k2);
+    var k3: struct { out1: SymmetricKey, out2: SymmetricKey } = undefined;
+    kdf3(&ck3, "input", &k3.out1, &k3.out2);
     try testing.expectEqual(ck1, ck2); // all ratchet ck to t1
     try testing.expectEqual(ck1, ck3);
     try testing.expect(!std.mem.eql(u8, &ck1, &start));
     try testing.expectEqual(k2, k3.out1); // t2 identical across variants
     var ck4: ChainKey = start;
-    try testing.expectEqual(k2, mixKey(&ck4, "input")); // mixKey == kdf2
+    var k4: SymmetricKey = undefined;
+    mixKey(&ck4, "input", &k4);
+    try testing.expectEqual(k2, k4); // mixKey == kdf2
     try testing.expectEqual(ck2, ck4);
 }
 

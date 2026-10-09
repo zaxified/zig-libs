@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **Breaking:** dead-stack burn for every secret-handling entry
+  point (`stackprobe_test.zig`: 7 of 8 probed calls left key / password / blind /
+  DH / session-key residue before; 0 after). Follows `voprf`'s breaking change
+  (same commit): secrets in by `*const`, secret results through `out`:
+  `deriveAkeKeyPair(&seed, &out)`, `createRegistrationRequest(pw, &blind)`,
+  `createRegistrationResponse(.., &oprf_seed)`,
+  `finalizeRegistrationRequest(.., ksf, &out)`,
+  `generateKE1(pw, &blind, nonce, &seed, &out)`,
+  `generateKE2(&server_sk, .., &oprf_seed, .., &keyshare_seed, &out)`,
+  `generateKE3(&state, .., ksf, &out)`, `serverFinish(&state, ke3, &out)`;
+  `scalarFromWideBytes(&wide, &out)`. Migrated: tests (via `src/test_shim.zig`),
+  the ctgrind harness, example, README. No other consumer in the tree.
+
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: "Consumers" no longer names `aaa-gate`/`sessions`, neither of which depends on `opaque`.
 - **2026-09-15** — First ctgrind harness, `src/ctgrind_harness.zig` (A1 M5); no library code
   changed. Targets `register` (client: password, blind), `login` (client: password, blind,

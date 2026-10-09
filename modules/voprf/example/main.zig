@@ -21,45 +21,53 @@
 const std = @import("std");
 const voprf = @import("voprf");
 
-fn randomScalar() [voprf.Ns]u8 {
+fn randomScalar(out: *[voprf.Ns]u8) void {
     var wide: [64]u8 = undefined;
     _ = std.os.linux.getrandom(&wide, wide.len, 0);
-    return voprf.scalarFromWideBytes(wide);
+    voprf.scalarFromWideBytes(&wide, out);
+    std.crypto.secureZero(u8, &wide);
 }
 
-fn randomSeed() [32]u8 {
-    var seed: [32]u8 = undefined;
-    _ = std.os.linux.getrandom(&seed, seed.len, 0);
-    return seed;
+fn randomSeed(seed: *[32]u8) void {
+    _ = std.os.linux.getrandom(seed, seed.len, 0);
 }
 
 pub fn main() !void {
     // ── server: derive a long-term VOPRF key pair ───────────────────────
-    const server_key = try voprf.deriveKeyPair(.voprf, randomSeed(), "voprf-example-v1");
+    var seed: [32]u8 = undefined;
+    randomSeed(&seed);
+    var server_key: voprf.KeyPair = undefined;
+    try voprf.deriveKeyPair(.voprf, &seed, "voprf-example-v1", &server_key);
+    std.crypto.secureZero(u8, &seed);
 
     // ── client: blind its private input ──────────────────────────────────
     const password = "correct horse battery staple";
-    const blind_scalar = randomScalar();
-    const blinded = try voprf.blind(.voprf, password, blind_scalar);
+    var blind_scalar: [voprf.Ns]u8 = undefined;
+    randomScalar(&blind_scalar);
+    const blinded = try voprf.blind(.voprf, password, &blind_scalar);
 
     // ── server: evaluate the blinded element and prove it used server_key ─
-    const proof_r = randomScalar();
-    const eval = try voprf.blindEvaluateVerifiable(server_key.sk, server_key.pk, blinded, proof_r);
+    var proof_r: [voprf.Ns]u8 = undefined;
+    randomScalar(&proof_r);
+    const eval = try voprf.blindEvaluateVerifiable(&server_key.sk, server_key.pk, blinded, &proof_r);
 
     // ── client: verify the proof, then finalize to the PRF output ────────
-    const output = try voprf.finalizeVerifiable(password, blind_scalar, eval.evaluated_element, blinded, server_key.pk, eval.proof);
+    var output: [voprf.Nh]u8 = undefined;
+    try voprf.finalizeVerifiable(password, &blind_scalar, eval.evaluated_element, blinded, server_key.pk, eval.proof, &output);
 
     // Cross-check: the server (or anyone holding sk) can compute the same
     // output directly, non-obliviously — the correctness property a VOPRF
     // has to have to be useful at all.
-    const direct = try voprf.evaluate(.voprf, server_key.sk, password);
+    var direct: [voprf.Nh]u8 = undefined;
+    try voprf.evaluate(.voprf, &server_key.sk, password, &direct);
     std.debug.print("oblivious output matches direct evaluate: {}\n", .{std.mem.eql(u8, &output, &direct)});
 
     // A tampered proof must be rejected by name, not accepted or panicked
     // on — the client's whole reason to run VOPRF instead of plain OPRF.
     var bad_proof = eval.proof;
     bad_proof.s[0] ^= 0x01;
-    _ = voprf.finalizeVerifiable(password, blind_scalar, eval.evaluated_element, blinded, server_key.pk, bad_proof) catch |err| switch (err) {
+    var rejected: [voprf.Nh]u8 = undefined;
+    voprf.finalizeVerifiable(password, &blind_scalar, eval.evaluated_element, blinded, server_key.pk, bad_proof, &rejected) catch |err| switch (err) {
         error.InvalidProof => std.debug.print("tampered proof correctly rejected\n", .{}),
         error.InvalidBlind => return err,
     };

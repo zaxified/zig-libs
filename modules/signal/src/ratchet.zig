@@ -69,6 +69,7 @@
 const std = @import("std");
 const chachapoly = @import("chachapoly");
 const x3dh = @import("x3dh.zig");
+const burn = @import("burn.zig");
 
 const X25519 = std.crypto.dh.X25519;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
@@ -245,20 +246,35 @@ pub const State = struct {
     /// initial ratchet public key (his signed prekey's public half from
     /// the X3DH bundle), so she immediately performs the first DH + root
     /// KDF and can send right away. `sk`/`ad` come from `x3dh.initiate`.
+    ///
+    /// `sk` by pointer, the state through `out` (written only on success);
+    /// stack burned before return.
     pub fn initAlice(
-        sk: [shared_secret_length]u8,
+        sk: *const [shared_secret_length]u8,
         ad: [associated_data_length]u8,
         bob_ratchet_pub: [key_length]u8,
         io: std.Io,
-    ) AgreementError!State {
+        out: *State,
+    ) AgreementError!void {
+        return burn.run(burn.ratchet_burn, AgreementError!void, initAliceBody, .{ sk, ad, bob_ratchet_pub, io, out });
+    }
+
+    fn initAliceBody(
+        sk: *const [shared_secret_length]u8,
+        ad: [associated_data_length]u8,
+        bob_ratchet_pub: [key_length]u8,
+        io: std.Io,
+        out: *State,
+    ) AgreementError!void {
         // Alice's first sending ratchet key. Everything after it is derived
         // from a chain this DH seeds, so a weak draw here is not recovered
         // by any later ratchet step.
-        const dhs = x3dh.generateKeyPair(io);
+        var dhs: X25519.KeyPair = undefined;
+        x3dh.generateKeyPair(io, &dhs);
         const dh_out = X25519.scalarmult(dhs.secret_key, bob_ratchet_pub) catch
             return error.KeyAgreementFailed;
-        const derived = kdfRk(sk, dh_out);
-        return .{
+        const derived = kdfRk(sk.*, dh_out);
+        out.* = .{
             .dhs = dhs,
             .dhr = bob_ratchet_pub,
             .rk = derived.rk,
@@ -277,15 +293,18 @@ pub const State = struct {
     /// the root key starts as `SK`, and he has NO sending chain yet — his
     /// first `decrypt` triggers the DH ratchet that gives him one. `sk`/
     /// `ad` come from `x3dh.respond` (identical to Alice's).
+    ///
+    /// `sk` and the ratchet key pair by pointer, the state through `out`.
     pub fn initBob(
-        sk: [shared_secret_length]u8,
+        sk: *const [shared_secret_length]u8,
         ad: [associated_data_length]u8,
-        bob_ratchet_keypair: X25519.KeyPair,
-    ) State {
-        return .{
-            .dhs = bob_ratchet_keypair,
+        bob_ratchet_keypair: *const X25519.KeyPair,
+        out: *State,
+    ) void {
+        out.* = .{
+            .dhs = bob_ratchet_keypair.*,
             .dhr = null,
-            .rk = sk,
+            .rk = sk.*,
             .cks = null,
             .ckr = null,
             .ns = 0,
@@ -318,6 +337,14 @@ pub const State = struct {
         allocator: std.mem.Allocator,
         plaintext: []const u8,
     ) EncryptError!Message {
+        return burn.run(burn.ratchet_burn, EncryptError!Message, encryptBody, .{ self, allocator, plaintext });
+    }
+
+    fn encryptBody(
+        self: *State,
+        allocator: std.mem.Allocator,
+        plaintext: []const u8,
+    ) EncryptError!Message {
         const cks = self.cks orelse return error.NotInitializedForSending;
         const step = kdfCk(cks);
         var mk = step.mk;
@@ -340,6 +367,16 @@ pub const State = struct {
     /// returns `error.MessageAuthenticationFailed` and leaves `self`
     /// untouched. Returns heap-owned plaintext (`allocator.free`).
     pub fn decrypt(
+        self: *State,
+        allocator: std.mem.Allocator,
+        header: Header,
+        ciphertext: []const u8,
+        io: std.Io,
+    ) DecryptError![]u8 {
+        return burn.run(burn.decrypt_burn, DecryptError![]u8, decryptBody, .{ self, allocator, header, ciphertext, io });
+    }
+
+    fn decryptBody(
         self: *State,
         allocator: std.mem.Allocator,
         header: Header,
@@ -499,7 +536,9 @@ fn dhRatchet(work: *Scalars, header: Header, io: std.Io) DecryptError!void {
     // The post-compromise-security half of the ratchet: this is the key
     // whose freshness is supposed to lock an attacker who learned the old
     // state back out. Drawn from a degraded seed it locks nobody out.
-    const new_dhs = x3dh.generateKeyPair(io);
+    var new_dhs: X25519.KeyPair = undefined;
+    x3dh.generateKeyPair(io, &new_dhs);
+    defer std.crypto.secureZero(u8, &new_dhs.secret_key);
     const dh_send = X25519.scalarmult(new_dhs.secret_key, header.dh) catch
         return error.KeyAgreementFailed;
 
@@ -656,6 +695,7 @@ fn aeadOpen(
 // ═══════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+const shim = @import("test_shim.zig");
 
 fn testIo() std.Io.Threaded {
     return std.Io.Threaded.init(testing.allocator, .{});
@@ -688,9 +728,9 @@ fn seedSession(io: std.Io) !struct { alice: State, bob: State } {
         .one_time_prekey_id = bob_opk.id,
     };
 
-    const alice_out = try x3dh.initiateUnverified(alloc, alice_ik, bundle, "", io);
+    const alice_out = try shim.x3dh.initiateUnverified(alloc, alice_ik, bundle, "", io);
     defer alice_out.message.deinit(alloc);
-    const bob_out = try x3dh.respond(alloc, bob_ik, bob_spk, bob_opk, alice_out.message);
+    const bob_out = try shim.x3dh.respond(alloc, bob_ik, bob_spk, bob_opk, alice_out.message);
     defer alloc.free(bob_out.plaintext);
     const bob_agr = bob_out.agreement;
 
@@ -700,13 +740,13 @@ fn seedSession(io: std.Io) !struct { alice: State, bob: State } {
         &bob_agr.shared_secret,
     );
 
-    const alice = try State.initAlice(
+    const alice = try shim.State.initAlice(
         alice_out.agreement.shared_secret,
         alice_out.agreement.associated_data,
         bob_spk_kp.public_key,
         io,
     );
-    const bob = State.initBob(bob_agr.shared_secret, bob_agr.associated_data, bob_spk_kp);
+    const bob = shim.State.initBob(bob_agr.shared_secret, bob_agr.associated_data, bob_spk_kp);
     return .{ .alice = alice, .bob = bob };
 }
 

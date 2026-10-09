@@ -305,6 +305,36 @@ literally *is* std's, via `chachapoly`'s delegation thresholds), ~1.1× at 144 B
 and 2.4–2.5× at 1420 B. Still no socket, no routing table and no queue in the timed region — a real
 tunnel adds a syscall (~1–2 µs) per packet on top, which will dominate.
 
+## Secret residue on the dead stack
+
+Review 2026-10-09 (`src/stackprobe_test.zig`, ReleaseFast only): Noise_IKpsk2 in both roles,
+`deriveTransportKeys`, the three session constructors, one `seal` and one `open`, the bare KDF
+calls, 47 needles (both static and both ephemeral private keys raw and as X25519 clamps them, the
+PSK, `es`/`ss`/`ee`/`se`, every HKDF `temp_key`, `ck` and the AEAD key after each step, the psk2
+`tau`/`k`, both transport keys, the session key, a control) plus two needles read post hoc (what
+`Keypair.generate` and the generated-ephemeral `createInitiation` drew); NEG 0, POS 1. Before:
+183 hits per 3 runs — `fromPrivateKey` (the clamped scalar), `generate`, every `Handshake` call
+(the ephemeral key, `es`/`ss`/`ee`/`se`, `tau`, the psk key), `deriveTransportKeys` (both
+transport keys and the split `temp_key`), `seal`/`open` (the session key, passed by value to the
+AEAD) and all four bare KDF calls. Depth: handshake calls 3.4 KiB, KDF 1.5 KiB, key generation
+2.0 KiB, `seal`/`open` frames 0.1-0.3 KiB. After: 0 in every probed call.
+
+Burned (`src/burn.zig`, body one frame down, then volatile vector stores): `Keypair.generate`/
+`fromPrivateKey` and `noise.kdf1`/`kdf2`/`kdf3`/`mixKey` 4 KiB; `createInitiation`/
+`consumeInitiation`/`createResponse`/`consumeResponse`/`deriveTransportKeys`/`transportSession`
+8 KiB; `seal`/`open` 1 KiB (per packet, ~10 ns). Secrets no longer travel by value: private keys by
+`*const`, results through `out` (see CHANGELOG, BREAKING). `chachapoly` burns its own tree.
+
+NOT covered, honestly:
+- the caller-built `Handshake` literal (`static_keypair`, `preshared_key`, `local_ephemeral` are
+  fields the caller fills by value) and the caller's `Keypair`/`TransportKeys`/`Session` values;
+- `CookieChecker` (`init`/`initWithSecret`/`refresh`/`cookieFor`/`createReply`: the rotating
+  cookie secret and the cookie it derives) and `PeerCookie`: not probed. The cookie is a
+  rate-limiting MAC secret that rotates every two minutes, not a session key;
+- the control plane in `root.zig` (`Config.private_key`, `buildSetRequests`, `Wireguard.setDevice`, the device parser: the interface private key is a by-value `Key` that is encoded into netlink buffers and parsed back);
+- the `Handshake` struct itself keeps `chaining_key`/`hash` until `deriveTransportKeys` wipes them
+  (by design).
+
 ## Status
 `gap · linux · client · reentrant` + deps: `netlink`, `genetlink`, `chachapoly`, `netaddr` —
 canonical source is `pub const meta` in src/root.zig. (The handshake + transport half above depends

@@ -36,6 +36,7 @@
 const std = @import("std");
 const x3dh = @import("x3dh.zig");
 const xeddsa = @import("xeddsa.zig");
+const shim = @import("test_shim.zig");
 const X25519 = std.crypto.dh.X25519;
 
 fn testIo() std.Io.Threaded {
@@ -74,10 +75,10 @@ test "X3DH: initiateUnverified <-> respond agree on SK/AD, WITH a one-time preke
         .one_time_prekey_id = bob_opk.id,
     };
 
-    const alice_out = try x3dh.initiateUnverified(std.testing.allocator, alice_ik, bundle, "hello bob", io);
+    const alice_out = try shim.x3dh.initiateUnverified(std.testing.allocator, alice_ik, bundle, "hello bob", io);
     defer alice_out.message.deinit(std.testing.allocator);
 
-    const bob_out = try x3dh.respond(std.testing.allocator, bob_ik, bob_spk, bob_opk, alice_out.message);
+    const bob_out = try shim.x3dh.respond(std.testing.allocator, bob_ik, bob_spk, bob_opk, alice_out.message);
     defer std.testing.allocator.free(bob_out.plaintext);
 
     try std.testing.expectEqualSlices(u8, &alice_out.agreement.shared_secret, &bob_out.agreement.shared_secret);
@@ -109,7 +110,7 @@ test "X3DH initial message: respond refuses a flipped, truncated or empty initia
         .one_time_prekey_id = bob_opk.id,
     };
 
-    const alice_out = try x3dh.initiateUnverified(alloc, alice_ik, bundle, "hello bob", io);
+    const alice_out = try shim.x3dh.initiateUnverified(alloc, alice_ik, bundle, "hello bob", io);
     defer alice_out.message.deinit(alloc);
     const ct = alice_out.message.ciphertext;
 
@@ -121,16 +122,16 @@ test "X3DH initial message: respond refuses a flipped, truncated or empty initia
         @memcpy(buf[0..ct.len], ct);
         buf[i] ^= 0x01;
         m.ciphertext = buf[0..ct.len];
-        try std.testing.expectError(error.InitialMessageAuthenticationFailed, x3dh.respond(alloc, bob_ik, bob_spk, bob_opk, m));
+        try std.testing.expectError(error.InitialMessageAuthenticationFailed, shim.x3dh.respond(alloc, bob_ik, bob_spk, bob_opk, m));
     }
     // Truncated by 1, 2, 4, 8 bytes, and down to nothing.
     for ([_]usize{ 1, 2, 4, 8, ct.len }) |n| {
         m.ciphertext = ct[0 .. ct.len - n];
-        try std.testing.expectError(error.InitialMessageAuthenticationFailed, x3dh.respond(alloc, bob_ik, bob_spk, bob_opk, m));
+        try std.testing.expectError(error.InitialMessageAuthenticationFailed, shim.x3dh.respond(alloc, bob_ik, bob_spk, bob_opk, m));
     }
 
     // Positive control: the untouched message opens.
-    const ok = try x3dh.respond(alloc, bob_ik, bob_spk, bob_opk, alice_out.message);
+    const ok = try shim.x3dh.respond(alloc, bob_ik, bob_spk, bob_opk, alice_out.message);
     defer alloc.free(ok.plaintext);
     try std.testing.expectEqualStrings("hello bob", ok.plaintext);
 }
@@ -155,12 +156,12 @@ test "X3DH: initiateUnverified <-> respond agree on SK/AD, WITHOUT a one-time pr
         .one_time_prekey_id = null,
     };
 
-    const alice_out = try x3dh.initiateUnverified(std.testing.allocator, alice_ik, bundle, "no opk today", io);
+    const alice_out = try shim.x3dh.initiateUnverified(std.testing.allocator, alice_ik, bundle, "no opk today", io);
     defer alice_out.message.deinit(std.testing.allocator);
 
     try std.testing.expect(alice_out.message.one_time_prekey_id == null);
 
-    const bob_out = try x3dh.respond(std.testing.allocator, bob_ik, bob_spk, null, alice_out.message);
+    const bob_out = try shim.x3dh.respond(std.testing.allocator, bob_ik, bob_spk, null, alice_out.message);
     defer std.testing.allocator.free(bob_out.plaintext);
 
     try std.testing.expectEqualSlices(u8, &alice_out.agreement.shared_secret, &bob_out.agreement.shared_secret);
@@ -186,17 +187,17 @@ test "X3DH: a DIFFERENT bob_ik derives a different SK and cannot open the initia
         .signed_prekey_signature = bob_spk.signature,
     };
 
-    const alice_out = try x3dh.initiateUnverified(std.testing.allocator, alice_ik, bundle, "msg", io);
+    const alice_out = try shim.x3dh.initiateUnverified(std.testing.allocator, alice_ik, bundle, "msg", io);
     defer alice_out.message.deinit(std.testing.allocator);
 
     // wrong_ik responds instead of the real bob_ik -> DH2 differs -> SK differs
     // (and AD's second term too) -> the initial message does not open.
     try std.testing.expectError(
         error.InitialMessageAuthenticationFailed,
-        x3dh.respond(std.testing.allocator, wrong_ik, bob_spk, null, alice_out.message),
+        shim.x3dh.respond(std.testing.allocator, wrong_ik, bob_spk, null, alice_out.message),
     );
     // Positive control: the real bob_ik opens it.
-    const right = try x3dh.respond(std.testing.allocator, bob_ik, bob_spk, null, alice_out.message);
+    const right = try shim.x3dh.respond(std.testing.allocator, bob_ik, bob_spk, null, alice_out.message);
     defer std.testing.allocator.free(right.plaintext);
     try std.testing.expectEqualStrings("msg", right.plaintext);
 }
@@ -235,7 +236,7 @@ test "X3DH: a low-order (identity-inducing) bob signed-prekey makes initiateUnve
 
     try std.testing.expectError(
         error.KeyAgreementFailed,
-        x3dh.initiateUnverified(std.testing.allocator, alice_ik, bundle, "msg", io),
+        shim.x3dh.initiateUnverified(std.testing.allocator, alice_ik, bundle, "msg", io),
     );
 }
 
@@ -406,7 +407,7 @@ test "XEdDSA: sign -> verify round-trip" {
     io.random(&z);
 
     const msg = "an X3DH signed prekey, encoded";
-    const sig = xeddsa.sign(kp.secret_key, msg, z);
+    const sig = shim.xeddsa.sign(kp.secret_key, msg, z);
     try std.testing.expect(xeddsa.verify(kp.public_key, msg, sig));
 }
 
@@ -419,7 +420,7 @@ test "XEdDSA: verify REJECTS a tampered message" {
     var z: xeddsa.RandomData = undefined;
     io.random(&z);
 
-    const sig = xeddsa.sign(kp.secret_key, "original message", z);
+    const sig = shim.xeddsa.sign(kp.secret_key, "original message", z);
     try std.testing.expect(!xeddsa.verify(kp.public_key, "tampered message", sig));
 }
 
@@ -433,7 +434,7 @@ test "XEdDSA: verify REJECTS a tampered signature" {
     io.random(&z);
 
     const msg = "a message";
-    var sig = xeddsa.sign(kp.secret_key, msg, z);
+    var sig = shim.xeddsa.sign(kp.secret_key, msg, z);
     sig[0] ^= 0x01;
     try std.testing.expect(!xeddsa.verify(kp.public_key, msg, sig));
 }
@@ -522,7 +523,7 @@ test "XEdDSA KAT: this module's spec-variant sign round-trips over the libsignal
     // signature) — it only checks this module's own sign/verify agree.
     var z: xeddsa.RandomData = undefined;
     for (&z, 0..) |*b, i| b.* = @intCast(i);
-    const sig = xeddsa.sign(ls_alice_priv, &ls_message, z);
+    const sig = shim.xeddsa.sign(ls_alice_priv, &ls_message, z);
     // Spec variant: s is canonical, top bit never smuggled.
     try std.testing.expectEqual(@as(u8, 0), sig[63] >> 7);
     try std.testing.expect(xeddsa.verify(ls_alice_pub, &ls_message, sig));
@@ -540,7 +541,7 @@ test "XEdDSA KAT: xeddsa.libsignal.sign self-round-trips over the libsignal vect
     // differ from `ls_signature`.
     var z: xeddsa.RandomData = undefined;
     for (&z, 0..) |*b, i| b.* = @intCast(255 - i);
-    const sig = xeddsa.libsignal.sign(ls_alice_priv, &ls_message, z);
+    const sig = shim.xeddsa.libsignal.sign(ls_alice_priv, &ls_message, z);
     try std.testing.expectEqual(@as(u8, 1), sig[63] >> 7);
     try std.testing.expect(xeddsa.libsignal.verify(ls_alice_pub, &ls_message, sig));
     // A sign-1 deployed-variant signature must NOT verify under the
@@ -578,7 +579,7 @@ test "XEdDSA cross-check: signatures verify under std.crypto.sign.Ed25519 with t
 
     for (seeds) |seed| {
         const msg = "cross-checked against std's own Ed25519 verifier";
-        const sig = xeddsa.sign(seed, msg, z);
+        const sig = shim.xeddsa.sign(seed, msg, z);
         const mont_pub = try X25519.recoverPublicKey(seed);
         try std.testing.expect(xeddsa.verify(mont_pub, msg, sig));
 
@@ -600,7 +601,7 @@ test "XEdDSA: verify fails closed (false, no panic) on malformed keys and signat
     var z: xeddsa.RandomData = undefined;
     io.random(&z);
     const msg = "fail closed";
-    const good = xeddsa.sign(kp.secret_key, msg, z);
+    const good = shim.xeddsa.sign(kp.secret_key, msg, z);
     try std.testing.expect(xeddsa.verify(kp.public_key, msg, good));
 
     // All-zero public key: maps to the order-2 point (0, -1) -> rejected.
@@ -635,7 +636,7 @@ test "X3DH end-to-end: generateSignedPreKey -> initiate (verifies XEdDSA) -> res
     const bob_ik = X25519.KeyPair.generate(io);
     var z: xeddsa.RandomData = undefined;
     io.random(&z);
-    const bob_spk = x3dh.generateSignedPreKey(bob_ik, 7, z, io);
+    const bob_spk = shim.x3dh.generateSignedPreKey(bob_ik, 7, z, io);
     const bob_opk = x3dh.OneTimePreKey{ .key_pair = X25519.KeyPair.generate(io), .id = 42 };
 
     const bundle = x3dh.PreKeyBundle{
@@ -647,10 +648,10 @@ test "X3DH end-to-end: generateSignedPreKey -> initiate (verifies XEdDSA) -> res
         .one_time_prekey_id = bob_opk.id,
     };
 
-    const alice_out = try x3dh.initiate(std.testing.allocator, alice_ik, bundle, "first ratchet msg", io);
+    const alice_out = try shim.x3dh.initiate(std.testing.allocator, alice_ik, bundle, "first ratchet msg", io);
     defer alice_out.message.deinit(std.testing.allocator);
 
-    const bob_out = try x3dh.respond(std.testing.allocator, bob_ik, bob_spk, bob_opk, alice_out.message);
+    const bob_out = try shim.x3dh.respond(std.testing.allocator, bob_ik, bob_spk, bob_opk, alice_out.message);
     defer std.testing.allocator.free(bob_out.plaintext);
     try std.testing.expectEqualSlices(u8, &alice_out.agreement.shared_secret, &bob_out.agreement.shared_secret);
     try std.testing.expectEqualSlices(u8, &alice_out.agreement.associated_data, &bob_out.agreement.associated_data);
@@ -666,7 +667,7 @@ test "X3DH.initiate fail-closes on a tampered signed-prekey signature AND on a s
     const bob_ik = X25519.KeyPair.generate(io);
     var z: xeddsa.RandomData = undefined;
     io.random(&z);
-    const bob_spk = x3dh.generateSignedPreKey(bob_ik, 1, z, io);
+    const bob_spk = shim.x3dh.generateSignedPreKey(bob_ik, 1, z, io);
 
     var bundle = x3dh.PreKeyBundle{
         .identity_key = bob_ik.public_key,
@@ -677,11 +678,11 @@ test "X3DH.initiate fail-closes on a tampered signed-prekey signature AND on a s
 
     // Tampered signature bit.
     bundle.signed_prekey_signature[0] ^= 0x01;
-    try std.testing.expectError(error.SignedPreKeyVerificationFailed, x3dh.initiate(std.testing.allocator, alice_ik, bundle, "msg", io));
+    try std.testing.expectError(error.SignedPreKeyVerificationFailed, shim.x3dh.initiate(std.testing.allocator, alice_ik, bundle, "msg", io));
     bundle.signed_prekey_signature[0] ^= 0x01;
 
     // Substituted signed prekey (the MITM move initiate exists to stop).
     const mitm_spk = X25519.KeyPair.generate(io);
     bundle.signed_prekey = mitm_spk.public_key;
-    try std.testing.expectError(error.SignedPreKeyVerificationFailed, x3dh.initiate(std.testing.allocator, alice_ik, bundle, "msg", io));
+    try std.testing.expectError(error.SignedPreKeyVerificationFailed, shim.x3dh.initiate(std.testing.allocator, alice_ik, bundle, "msg", io));
 }

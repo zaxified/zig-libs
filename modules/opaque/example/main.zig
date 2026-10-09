@@ -74,7 +74,11 @@ fn bytes64(label: []const u8) [64]u8 {
 /// A fresh OPRF blind scalar from a label — real callers draw this from a
 /// CSPRNG via `opq.scalarFromWideBytes` over genuine random bytes.
 fn blindFromLabel(label: []const u8) [opq.Ns]u8 {
-    return opq.scalarFromWideBytes(bytes64(label));
+    var wide = bytes64(label);
+    defer std.crypto.secureZero(u8, &wide);
+    var out: [opq.Ns]u8 = undefined;
+    opq.scalarFromWideBytes(&wide, &out);
+    return out;
 }
 
 pub fn main() !void {
@@ -84,56 +88,38 @@ pub fn main() !void {
     const context = "zig-libs opaque example v1";
 
     // ── server setup (once, long-term) ────────────────────────────────
-    const server_kp = try opq.deriveAkeKeyPair(bytes32("server ake seed"));
+    var server_kp: opq.AkeKeyPair = undefined;
+    try opq.deriveAkeKeyPair(&bytes32("server ake seed"), &server_kp);
     const oprf_seed = bytes64("server oprf seed (per-deployment, covers all credential_identifiers)");
 
     // ── registration ────────────────────────────────────────────────
     const reg_blind = blindFromLabel("alice registration blind");
-    const reg_request = try opq.createRegistrationRequest(password, reg_blind);
+    const reg_request = try opq.createRegistrationRequest(password, &reg_blind);
     const reg_response = try opq.createRegistrationResponse(
         reg_request,
         server_kp.public_key,
         credential_identifier,
-        oprf_seed,
+        &oprf_seed,
     );
-    const reg_finalized = try opq.finalizeRegistrationRequest(
-        password,
-        reg_blind,
-        reg_response,
-        identities,
-        bytes32("alice envelope nonce"),
-        .identity,
-    );
+    var reg_finalized: opq.FinalizeRegistrationResult = undefined;
+    try opq.finalizeRegistrationRequest(password, &reg_blind, reg_response, identities, bytes32("alice envelope nonce"), .identity, &reg_finalized);
     // What the server stores, per client — server never saw the password.
     const db_record = reg_finalized.record;
     const export_key_registration = reg_finalized.export_key;
     std.debug.print("registration complete, record stored server-side\n", .{});
 
     // ── login session 1 ─────────────────────────────────────────────
-    const ke1_res_1 = try opq.generateKE1(
-        password,
-        blindFromLabel("alice login-1 blind"),
-        bytes32("alice login-1 client nonce"),
-        bytes32("alice login-1 client keyshare seed"),
-    );
-    const ke2_res_1 = try opq.generateKE2(
-        server_kp.private_key,
-        server_kp.public_key,
-        db_record,
-        credential_identifier,
-        oprf_seed,
-        ke1_res_1.ke1,
-        identities,
-        context,
-        bytes32("server login-1 masking nonce"),
-        bytes32("server login-1 server nonce"),
-        bytes32("server login-1 keyshare seed"),
-    );
-    const ke3_res_1 = try opq.generateKE3(ke1_res_1.state, identities, context, ke2_res_1.ke2, .identity);
+    var ke1_res_1: opq.GenerateKE1Result = undefined;
+    try opq.generateKE1(password, &blindFromLabel("alice login-1 blind"), bytes32("alice login-1 client nonce"), &bytes32("alice login-1 client keyshare seed"), &ke1_res_1);
+    var ke2_res_1: opq.GenerateKE2Result = undefined;
+    try opq.generateKE2(&server_kp.private_key, server_kp.public_key, db_record, credential_identifier, &oprf_seed, ke1_res_1.ke1, identities, context, bytes32("server login-1 masking nonce"), bytes32("server login-1 server nonce"), &bytes32("server login-1 keyshare seed"), &ke2_res_1);
+    var ke3_res_1: opq.GenerateKE3Result = undefined;
+    try opq.generateKE3(&ke1_res_1.state, identities, context, ke2_res_1.ke2, .identity, &ke3_res_1);
     // The export_key is a client-only value, re-derived (not transmitted)
     // — it must match what registration produced, every successful login.
     must(std.mem.eql(u8, &export_key_registration, &ke3_res_1.export_key), @src());
-    const session_key_server_1 = try opq.serverFinish(ke2_res_1.state, ke3_res_1.ke3);
+    var session_key_server_1: [opq.Nx]u8 = undefined;
+    try opq.serverFinish(&ke2_res_1.state, ke3_res_1.ke3, &session_key_server_1);
     must(std.mem.eql(u8, &ke3_res_1.session_key, &session_key_server_1), @src());
     std.debug.print("login 1: client and server agree on session_key and export_key\n", .{});
 
@@ -142,28 +128,15 @@ pub fn main() !void {
     // `ServerLoginState` are plain caller-held values, never module-global
     // state, but the actual behavioural check is that two independent
     // sessions produce independent keys.
-    const ke1_res_2 = try opq.generateKE1(
-        password,
-        blindFromLabel("alice login-2 blind"),
-        bytes32("alice login-2 client nonce"),
-        bytes32("alice login-2 client keyshare seed"),
-    );
-    const ke2_res_2 = try opq.generateKE2(
-        server_kp.private_key,
-        server_kp.public_key,
-        db_record,
-        credential_identifier,
-        oprf_seed,
-        ke1_res_2.ke1,
-        identities,
-        context,
-        bytes32("server login-2 masking nonce"),
-        bytes32("server login-2 server nonce"),
-        bytes32("server login-2 keyshare seed"),
-    );
-    const ke3_res_2 = try opq.generateKE3(ke1_res_2.state, identities, context, ke2_res_2.ke2, .identity);
+    var ke1_res_2: opq.GenerateKE1Result = undefined;
+    try opq.generateKE1(password, &blindFromLabel("alice login-2 blind"), bytes32("alice login-2 client nonce"), &bytes32("alice login-2 client keyshare seed"), &ke1_res_2);
+    var ke2_res_2: opq.GenerateKE2Result = undefined;
+    try opq.generateKE2(&server_kp.private_key, server_kp.public_key, db_record, credential_identifier, &oprf_seed, ke1_res_2.ke1, identities, context, bytes32("server login-2 masking nonce"), bytes32("server login-2 server nonce"), &bytes32("server login-2 keyshare seed"), &ke2_res_2);
+    var ke3_res_2: opq.GenerateKE3Result = undefined;
+    try opq.generateKE3(&ke1_res_2.state, identities, context, ke2_res_2.ke2, .identity, &ke3_res_2);
     must(std.mem.eql(u8, &export_key_registration, &ke3_res_2.export_key), @src());
-    const session_key_server_2 = try opq.serverFinish(ke2_res_2.state, ke3_res_2.ke3);
+    var session_key_server_2: [opq.Nx]u8 = undefined;
+    try opq.serverFinish(&ke2_res_2.state, ke3_res_2.ke3, &session_key_server_2);
     must(std.mem.eql(u8, &ke3_res_2.session_key, &session_key_server_2), @src());
     // Two independent sessions must not share a session_key.
     must(!std.mem.eql(u8, &ke3_res_1.session_key, &ke3_res_2.session_key), @src());
@@ -175,26 +148,12 @@ pub fn main() !void {
     // client's own envelope recovery catches it, BEFORE any DH result is
     // trusted (module doc comment's Security notes).
     const wrong_password = "definitely not alice's password";
-    const ke1_res_w = try opq.generateKE1(
-        wrong_password,
-        blindFromLabel("alice wrong-password login blind"),
-        bytes32("alice wrong-password client nonce"),
-        bytes32("alice wrong-password client keyshare seed"),
-    );
-    const ke2_res_w = try opq.generateKE2(
-        server_kp.private_key,
-        server_kp.public_key,
-        db_record,
-        credential_identifier,
-        oprf_seed,
-        ke1_res_w.ke1,
-        identities,
-        context,
-        bytes32("server wrong-password masking nonce"),
-        bytes32("server wrong-password server nonce"),
-        bytes32("server wrong-password keyshare seed"),
-    );
-    if (opq.generateKE3(ke1_res_w.state, identities, context, ke2_res_w.ke2, .identity)) |_| {
+    var ke1_res_w: opq.GenerateKE1Result = undefined;
+    try opq.generateKE1(wrong_password, &blindFromLabel("alice wrong-password login blind"), bytes32("alice wrong-password client nonce"), &bytes32("alice wrong-password client keyshare seed"), &ke1_res_w);
+    var ke2_res_w: opq.GenerateKE2Result = undefined;
+    try opq.generateKE2(&server_kp.private_key, server_kp.public_key, db_record, credential_identifier, &oprf_seed, ke1_res_w.ke1, identities, context, bytes32("server wrong-password masking nonce"), bytes32("server wrong-password server nonce"), &bytes32("server wrong-password keyshare seed"), &ke2_res_w);
+    var scratch_ke1_res_w: opq.GenerateKE3Result = undefined;
+    if (opq.generateKE3(&ke1_res_w.state, identities, context, ke2_res_w.ke2, .identity, &scratch_ke1_res_w)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.EnvelopeRecovery => std.debug.print("wrong password: EnvelopeRecovery (expected)\n", .{}),
@@ -202,27 +161,13 @@ pub fn main() !void {
     }
 
     // ── failure path 2: tampered server_mac (named error, client-side) ─
-    const ke1_res_3 = try opq.generateKE1(
-        password,
-        blindFromLabel("alice login-3 blind"),
-        bytes32("alice login-3 client nonce"),
-        bytes32("alice login-3 client keyshare seed"),
-    );
-    var ke2_res_3 = try opq.generateKE2(
-        server_kp.private_key,
-        server_kp.public_key,
-        db_record,
-        credential_identifier,
-        oprf_seed,
-        ke1_res_3.ke1,
-        identities,
-        context,
-        bytes32("server login-3 masking nonce"),
-        bytes32("server login-3 server nonce"),
-        bytes32("server login-3 keyshare seed"),
-    );
+    var ke1_res_3: opq.GenerateKE1Result = undefined;
+    try opq.generateKE1(password, &blindFromLabel("alice login-3 blind"), bytes32("alice login-3 client nonce"), &bytes32("alice login-3 client keyshare seed"), &ke1_res_3);
+    var ke2_res_3: opq.GenerateKE2Result = undefined;
+    try opq.generateKE2(&server_kp.private_key, server_kp.public_key, db_record, credential_identifier, &oprf_seed, ke1_res_3.ke1, identities, context, bytes32("server login-3 masking nonce"), bytes32("server login-3 server nonce"), &bytes32("server login-3 keyshare seed"), &ke2_res_3);
     ke2_res_3.ke2.auth_response.server_mac[0] ^= 0x01;
-    if (opq.generateKE3(ke1_res_3.state, identities, context, ke2_res_3.ke2, .identity)) |_| {
+    var scratch_ke1_res_3: opq.GenerateKE3Result = undefined;
+    if (opq.generateKE3(&ke1_res_3.state, identities, context, ke2_res_3.ke2, .identity, &scratch_ke1_res_3)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.ServerAuthentication => std.debug.print("tampered server_mac: ServerAuthentication (expected)\n", .{}),
@@ -230,28 +175,15 @@ pub fn main() !void {
     }
 
     // ── failure path 3: tampered client_mac (named error, server-side) ─
-    const ke1_res_4 = try opq.generateKE1(
-        password,
-        blindFromLabel("alice login-4 blind"),
-        bytes32("alice login-4 client nonce"),
-        bytes32("alice login-4 client keyshare seed"),
-    );
-    const ke2_res_4 = try opq.generateKE2(
-        server_kp.private_key,
-        server_kp.public_key,
-        db_record,
-        credential_identifier,
-        oprf_seed,
-        ke1_res_4.ke1,
-        identities,
-        context,
-        bytes32("server login-4 masking nonce"),
-        bytes32("server login-4 server nonce"),
-        bytes32("server login-4 keyshare seed"),
-    );
-    var ke3_res_4 = try opq.generateKE3(ke1_res_4.state, identities, context, ke2_res_4.ke2, .identity);
+    var ke1_res_4: opq.GenerateKE1Result = undefined;
+    try opq.generateKE1(password, &blindFromLabel("alice login-4 blind"), bytes32("alice login-4 client nonce"), &bytes32("alice login-4 client keyshare seed"), &ke1_res_4);
+    var ke2_res_4: opq.GenerateKE2Result = undefined;
+    try opq.generateKE2(&server_kp.private_key, server_kp.public_key, db_record, credential_identifier, &oprf_seed, ke1_res_4.ke1, identities, context, bytes32("server login-4 masking nonce"), bytes32("server login-4 server nonce"), &bytes32("server login-4 keyshare seed"), &ke2_res_4);
+    var ke3_res_4: opq.GenerateKE3Result = undefined;
+    try opq.generateKE3(&ke1_res_4.state, identities, context, ke2_res_4.ke2, .identity, &ke3_res_4);
     ke3_res_4.ke3.client_mac[0] ^= 0x01;
-    if (opq.serverFinish(ke2_res_4.state, ke3_res_4.ke3)) |_| {
+    var scratch_finish: [opq.Nx]u8 = undefined;
+    if (opq.serverFinish(&ke2_res_4.state, ke3_res_4.ke3, &scratch_finish)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.ClientAuthentication => std.debug.print("tampered client_mac: ClientAuthentication (expected)\n", .{}),
@@ -264,18 +196,20 @@ pub fn main() !void {
     // computation, at `voprf.Element.fromBytes`'s canonical-decode check.
     var ke1_bad = ke1_res_2.ke1;
     ke1_bad.auth_request.client_public_keyshare = [_]u8{0xff} ** opq.Npk;
+    var scratch_ke2: opq.GenerateKE2Result = undefined;
     if (opq.generateKE2(
-        server_kp.private_key,
+        &server_kp.private_key,
         server_kp.public_key,
         db_record,
         credential_identifier,
-        oprf_seed,
+        &oprf_seed,
         ke1_bad,
         identities,
         context,
         bytes32("server bad-pubkey masking nonce"),
         bytes32("server bad-pubkey server nonce"),
-        bytes32("server bad-pubkey keyshare seed"),
+        &bytes32("server bad-pubkey keyshare seed"),
+        &scratch_ke2,
     )) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {

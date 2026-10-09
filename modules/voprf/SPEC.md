@@ -191,6 +191,36 @@ rejection in `hashToGroup` and the zero test and 256th round of
 value), and the canonicity check on the proof's `c` (it is compared byte
 for byte with a canonical hash output, so a non-canonical `c` fails anyway).
 
+## Secret residue on the dead stack
+
+Every public entry point that touches a secret (`scalarFromWideBytes`,
+`deriveKeyPair`, `generateProof`, `blind`, `blindEvaluate`, `finalize`,
+`evaluate`, `blindEvaluateVerifiable[Batch]`, `finalizeVerifiable`,
+`blindPoprf`, `blindEvaluatePoprf[Batch]`, `finalizePoprf[Unverified]`,
+`evaluatePoprf`) runs its body one frame down (`burn.run`) and then zeroes the
+stack that body dirtied (`burn.zig`: 2 KiB for the reduction, 8 KiB for
+`deriveKeyPair`, 20 KiB for the one-multiply calls, 28 KiB for the DLEQ
+prover and everything that verifies or proves). Measured body depth,
+ReleaseFast, 2026-10-09: 0.4 KiB (`scalarFromWideBytes`) .. 11.9 KiB
+(`finalizeVerifiable`/`finalizePoprf`); the burns are about 2x that.
+Secret inputs (`sk`, the blind, the proof nonce, the seed) are taken by
+`*const`; secret outputs (the key pair, the finalize/evaluate output, the
+reduced scalar) are returned through `out` — never by value, never inside an
+error union (the public `Proof`, `Element` and `VerifiableEvaluation` values
+are returned by value; they carry no secret).
+
+`src/stackprobe_test.zig` paints the stack, calls each entry point and scans
+the dead window for the seed, key, blind and its inverse, the unblinded
+element, the PRF output, the DLEQ nonce, `c*k`, `t = sk + m`, `t^-1` and the
+input; each set has a control needle that must be found. It runs only in
+ReleaseFast/ReleaseSmall (Debug fills `undefined` with `0xaa`).
+
+Not covered: the standalone helpers `hashToScalar`, `hashToGroup` and
+`expandMessageXmd` (public, defined over transcripts; they only see a secret
+when an entry point above calls them, inside its burned body); a secret the
+caller keeps in its own frame (`KeyPair`, the blind) — that is the caller's to
+erase; registers and the red zone below the stack pointer.
+
 ## Left out (deliberately)
 
 - **Other ciphersuites** — see above.

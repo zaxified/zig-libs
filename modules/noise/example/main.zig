@@ -37,31 +37,38 @@ pub fn main() !void {
     // XX: neither side knows the other's static key in advance (no `rs`);
     // both reveal their static key DURING the handshake. `init` checks the
     // pattern against the keys each side holds before anything runs ...
-    var initiator = try Suite.HandshakeState.init(proto.pattern, true, "", .{ .s = init_static, .psks = &psk });
-    var responder = try Suite.HandshakeState.init(proto.pattern, false, "", .{ .s = resp_static, .psks = &psk });
+    // The state is initialized in place and the keys travel by pointer: no copy
+    // of a private key is left behind in a dead stack frame.
+    var initiator: Suite.HandshakeState = .{};
+    var responder: Suite.HandshakeState = .{};
+    try initiator.init(proto.pattern, true, "", &.{ .s = &init_static, .psks = &psk });
+    try responder.init(proto.pattern, false, "", &.{ .s = &resp_static, .psks = &psk });
     // ... and refuses a session the pattern cannot run, here one without the PSK.
-    if (Suite.HandshakeState.init(proto.pattern, true, "", .{ .s = init_static })) |_| {
+    var scratch: Suite.HandshakeState = .{};
+    if (scratch.init(proto.pattern, true, "", &.{ .s = &init_static })) |_| {
         return error.ExpectedRefusal;
     } else |err| std.debug.print("{s} without its PSK: {t}\n", .{ proto.pattern.name, err });
 
     var wire: [256]u8 = undefined;
 
     // Message 1: initiator -> responder (-> e).
-    var step = try initiator.writeMessage(init_rng.random(), "", &wire);
-    _ = try responder.readMessage(wire[0..step.len], &wire);
+    // `transport` is written only by the call that completes the pattern.
+    var init_transport: [2]Suite.CipherState = undefined;
+    var resp_transport: [2]Suite.CipherState = undefined;
+    var step = try initiator.writeMessage(init_rng.random(), "", &wire, &init_transport);
+    _ = try responder.readMessage(wire[0..step.len], &wire, &resp_transport);
     std.debug.print("message 1: {d} bytes\n", .{step.len});
 
     // Message 2: responder -> initiator (<- e, ee, s, es).
-    step = try responder.writeMessage(resp_rng.random(), "", &wire);
-    _ = try initiator.readMessage(wire[0..step.len], &wire);
+    step = try responder.writeMessage(resp_rng.random(), "", &wire, &resp_transport);
+    _ = try initiator.readMessage(wire[0..step.len], &wire, &init_transport);
     std.debug.print("message 2: {d} bytes\n", .{step.len});
 
     // Message 3: initiator -> responder (-> s, se). This one completes the
-    // pattern, so both `Step.transport` fields are populated.
-    step = try initiator.writeMessage(init_rng.random(), "", &wire);
-    const init_transport = step.transport.?;
-    const resp_step = try responder.readMessage(wire[0..step.len], &wire);
-    const resp_transport = resp_step.transport.?;
+    // pattern, so both transport pairs are filled in (`Step.complete`).
+    step = try initiator.writeMessage(init_rng.random(), "", &wire, &init_transport);
+    const resp_step = try responder.readMessage(wire[0..step.len], &wire, &resp_transport);
+    if (!step.complete or !resp_step.complete) return error.HandshakeNotComplete;
     std.debug.print("message 3: {d} bytes\n", .{step.len});
 
     std.debug.print("handshake hash matches on both sides: {}\n", .{

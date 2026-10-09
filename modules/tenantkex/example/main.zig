@@ -24,9 +24,13 @@ pub fn main() !void {
 
     const ctx: tenantkex.FabricContext = .{ .isid = 0x00_10_20, .initiator_pe = 1, .responder_pe = 2 };
 
-    var initiator = tenantkex.Initiator.init(pe1_static, pe2_static.public_key, ctx);
+    // In place, static keys by pointer: no copy of a long-term key is left in
+    // a dead stack frame by the call.
+    var initiator: tenantkex.Initiator = undefined;
+    initiator.init(&pe1_static, pe2_static.public_key, ctx);
     defer initiator.wipe();
-    var responder = tenantkex.Responder.init(pe2_static, pe1_static.public_key, ctx);
+    var responder: tenantkex.Responder = undefined;
+    responder.init(&pe2_static, pe1_static.public_key, ctx);
     defer responder.wipe();
 
     var rng_i = std.Random.DefaultPrng.init(0xC0FFEE);
@@ -39,14 +43,15 @@ pub fn main() !void {
     const n1 = try initiator.writeMessage1(rng_i.random(), "", &msg1);
     _ = try responder.readMessage1(msg1[0..n1], &payload_out);
 
-    const fin_r = try responder.writeMessage2(rng_r.random(), "", &msg2);
-    var fin_r_keys = fin_r.keys;
+    // The session keys come back through out-parameters (filled on success).
+    var fin_r_keys: tenantkex.SessionKeys = undefined;
+    const n2 = try responder.writeMessage2(rng_r.random(), "", &msg2, &fin_r_keys);
     defer fin_r_keys.wipe();
-    const fin_i = try initiator.readMessage2(msg2[0..fin_r.len], &payload_out);
-    var fin_i_keys = fin_i.keys;
+    var fin_i_keys: tenantkex.SessionKeys = undefined;
+    _ = try initiator.readMessage2(msg2[0..n2], &payload_out, &fin_i_keys);
     defer fin_i_keys.wipe();
 
-    std.debug.print("session established, {d}-byte + {d}-byte handshake\n", .{ n1, fin_r.len });
+    std.debug.print("session established, {d}-byte + {d}-byte handshake\n", .{ n1, n2 });
     if (!std.mem.eql(u8, &fin_i_keys.send_key, &fin_r_keys.recv_key)) return error.SendRecvKeyMismatch;
     std.debug.print("initiator.send == responder.recv: true\n", .{});
     if (!std.mem.eql(u8, &fin_i_keys.recv_key, &fin_r_keys.send_key)) return error.RecvSendKeyMismatch;
@@ -59,9 +64,11 @@ pub fn main() !void {
     // encrypted static-key token's AEAD tag, which is exactly what scopes
     // a completed session to one tenant.
     const wrong_ctx: tenantkex.FabricContext = .{ .isid = 0x00_99_99, .initiator_pe = 1, .responder_pe = 2 };
-    var stray_initiator = tenantkex.Initiator.init(pe1_static, pe2_static.public_key, ctx);
+    var stray_initiator: tenantkex.Initiator = undefined;
+    stray_initiator.init(&pe1_static, pe2_static.public_key, ctx);
     defer stray_initiator.wipe();
-    var mismatched_responder = tenantkex.Responder.init(pe2_static, pe1_static.public_key, wrong_ctx);
+    var mismatched_responder: tenantkex.Responder = undefined;
+    mismatched_responder.init(&pe2_static, pe1_static.public_key, wrong_ctx);
     defer mismatched_responder.wipe();
 
     var rng2 = std.Random.DefaultPrng.init(0xABCDEF01);

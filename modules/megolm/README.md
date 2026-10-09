@@ -45,11 +45,13 @@ const megolm = @import("megolm");
 
 ```zig
 // Sender:
-var out = megolm.OutboundSession.init(io);
+var out: megolm.OutboundSession = undefined;
+megolm.OutboundSession.init(io, &out); // secret results come back through `out`
 defer out.deinit();
 
 // Share this with the group over a secure (e.g. Olm-encrypted) channel:
-const session_key = try out.sessionKey();
+var session_key: megolm.SessionKey = undefined;
+try out.sessionKey(&session_key);
 const session_key_b64 = try session_key.toBase64(allocator);
 defer allocator.free(session_key_b64);
 
@@ -59,7 +61,8 @@ const wire = try msg.toBase64(allocator); // send this + out.sessionId()
 
 // Recipient, after receiving `session_key_b64` over the secure channel:
 const key = try megolm.SessionKey.fromBase64(allocator, session_key_b64); // self-verifies its signature
-var in = try megolm.InboundGroupSession.fromSessionKey(key);
+var in: megolm.InboundGroupSession = undefined;
+try megolm.InboundGroupSession.fromSessionKey(&key, &in);
 defer in.deinit();
 
 var incoming = try megolm.Message.fromBase64(allocator, wire);
@@ -71,7 +74,7 @@ defer decrypted.deinit(allocator);
 
 Sharing your ability to decrypt history with someone else from a point
 forward, without handing over earlier messages, is `InboundGroupSession.
-exportAt(index)` → `ExportedSessionKey` (megolm.md's "session export
+exportAt(index, &out)` → `ExportedSessionKey` (megolm.md's "session export
 format" — identical to the session-sharing format minus the signature,
 since re-signing a ratcheted-forward copy isn't possible without the
 original private key).
@@ -91,12 +94,14 @@ const key: megolm.PickleKey = storage_key;
 var blob: [megolm.pickle.sealed_outbound_len]u8 = undefined;
 out.pickleSealed(io, &key, &blob); // fresh random nonce per call
 // ... after restart:
-var restored = try megolm.OutboundSession.fromSealedPickle(&blob, &key);
+var restored: megolm.OutboundSession = undefined;
+try megolm.OutboundSession.fromSealedPickle(&blob, &key, &restored);
 defer restored.deinit();
 
 var in_blob: [megolm.pickle.sealed_inbound_len]u8 = undefined;
 in.pickleSealed(io, &key, &in_blob);
-var in2 = try megolm.InboundGroupSession.fromSealedPickle(&in_blob, &key);
+var in2: megolm.InboundGroupSession = undefined;
+try megolm.InboundGroupSession.fromSealedPickle(&in_blob, &key, &in2);
 defer in2.deinit();
 ```
 

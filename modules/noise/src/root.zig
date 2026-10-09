@@ -111,6 +111,7 @@ test {
     _ = patterns;
     _ = state;
     _ = @import("vectors_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.deps is exactly {chachapoly} (the AEAD; NOT wireguard)" {
@@ -134,8 +135,8 @@ test "DefaultSuite binds the chachapoly sibling, and the spec §8 name is unchan
     );
     var ours: DefaultSuite.HandshakeState = .{};
     var theirs: StdSuite.HandshakeState = .{};
-    ours.initialize(patterns.NN, true, "", null, null, null, null, &.{});
-    theirs.initialize(patterns.NN, true, "", null, null, null, null, &.{});
+    ours.initialize(patterns.NN, true, "", &.{});
+    theirs.initialize(patterns.NN, true, "", &.{});
     try std.testing.expectEqualSlices(
         u8,
         &theirs.symmetric_state.getHandshakeHash(),

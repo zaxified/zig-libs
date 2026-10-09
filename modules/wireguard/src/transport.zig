@@ -78,6 +78,7 @@
 
 const std = @import("std");
 const noise = @import("noise.zig");
+const burn = @import("burn.zig");
 // Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 // helpers, in the format `std.testing.Smith` actually reads.
 const testkit = @import("testkit");
@@ -415,8 +416,10 @@ pub const SendSession = struct {
     /// all is `seekUnsafeForTest`, whose name says what it costs.
     counter: u64 = 0,
 
-    pub fn init(key: [32]u8, receiver_index: u32, now_s: u64) SendSession {
-        return .{ .key = key, .receiver_index = receiver_index, .born_s = now_s };
+    /// In place, key by pointer: neither a by-value key nor a returned session
+    /// (which holds the key) is a copy in the caller's dead frame.
+    pub fn init(self: *SendSession, key: *const [32]u8, receiver_index: u32, now_s: u64) void {
+        self.* = .{ .key = key.*, .receiver_index = receiver_index, .born_s = now_s };
     }
 
     /// Deterministic-test seam: place the counter at an arbitrary value so a
@@ -436,6 +439,10 @@ pub const SendSession = struct {
     /// `REJECT_AFTER_TIME` and reports `REKEY_AFTER_TIME`. Zero allocation; the
     /// padding and the AEAD are done in place inside `out`.
     pub fn seal(self: *SendSession, out: []u8, packet: []const u8, now_s: u64) SealError!SealResult {
+        return burn.run(burn.seal_burn, SealError!SealResult, sealBody, .{ self, out, packet, now_s });
+    }
+
+    fn sealBody(self: *SendSession, out: []u8, packet: []const u8, now_s: u64) SealError!SealResult {
         if (packet.len > max_payload) return error.PacketTooLarge;
         const ct_len = paddedLen(packet.len);
         const need = overhead + ct_len;
@@ -538,8 +545,9 @@ pub const RecvSession = struct {
     born_s: u64,
     window: Window = .{},
 
-    pub fn init(key: [32]u8, local_index: u32, now_s: u64) RecvSession {
-        return .{ .key = key, .local_index = local_index, .born_s = now_s };
+    /// In place, key by pointer (see `SendSession.init`).
+    pub fn init(self: *RecvSession, key: *const [32]u8, local_index: u32, now_s: u64) void {
+        self.* = .{ .key = key.*, .local_index = local_index, .born_s = now_s };
     }
 
     /// Open one transport-data message into `out`, returning the padded
@@ -575,6 +583,10 @@ pub const RecvSession = struct {
     /// peer actually sent, and rejecting an authentic packet for a framing
     /// nicety would be a rejection for the wrong reason.
     pub fn open(self: *RecvSession, out: []u8, msg: []const u8, now_s: u64) OpenError!OpenResult {
+        return burn.run(burn.seal_burn, OpenError!OpenResult, openBody, .{ self, out, msg, now_s });
+    }
+
+    fn openBody(self: *RecvSession, out: []u8, msg: []const u8, now_s: u64) OpenError!OpenResult {
         const h = try parseHeader(msg);
         if (h.receiver_index != self.local_index) return error.WrongReceiver;
         if (h.counter >= reject_after_messages) return error.MessageLimitReached;
@@ -641,11 +653,10 @@ pub const Session = struct {
     /// `now_s` is the caller's clock at the moment the handshake completed; it
     /// becomes both halves' `born_s` and is what `reject_after_time_s` /
     /// `rekey_after_time_s` are measured from.
-    pub fn init(keys: TransportKeys, local_index: u32, remote_index: u32, now_s: u64) Session {
-        return .{
-            .send = SendSession.init(keys.send, remote_index, now_s),
-            .recv = RecvSession.init(keys.recv, local_index, now_s),
-        };
+    /// In place, keys by pointer (see `SendSession.init`).
+    pub fn init(self: *Session, keys: *const TransportKeys, local_index: u32, remote_index: u32, now_s: u64) void {
+        self.send.init(&keys.send, remote_index, now_s);
+        self.recv.init(&keys.recv, local_index, now_s);
     }
 
     /// Whether the session has passed `reject_after_time_s` (both halves share
@@ -664,6 +675,24 @@ pub const Session = struct {
 // ── dark-tests: pulled into the aggregator via ../root.zig `test { }` ───────
 
 const testing = std.testing;
+
+/// By-value shapes of the in-place constructors, for the tests (a copy of a
+/// test key in a test frame proves nothing).
+fn tSend(key: [32]u8, receiver_index: u32, now_s: u64) SendSession {
+    var s: SendSession = undefined;
+    s.init(&key, receiver_index, now_s);
+    return s;
+}
+fn tRecv(key: [32]u8, local_index: u32, now_s: u64) RecvSession {
+    var r: RecvSession = undefined;
+    r.init(&key, local_index, now_s);
+    return r;
+}
+fn tSession(keys: TransportKeys, local_index: u32, remote_index: u32, now_s: u64) Session {
+    var s: Session = undefined;
+    s.init(&keys, local_index, remote_index, now_s);
+    return s;
+}
 
 fn testKey(seed: u8) [32]u8 {
     var k: [32]u8 = undefined;
@@ -730,8 +759,8 @@ test "delivered limits: a 65472-byte payload really seals, and 65473 does not" {
     // would silently refuse every packet between the new cap and a full
     // datagram while `sealedLen` still looked right.
     const key = testKey(30);
-    var s = SendSession.init(key, 0x4242, t0);
-    var r = RecvSession.init(key, 0x4242, t0);
+    var s = tSend(key, 0x4242, t0);
+    var r = tRecv(key, 0x4242, t0);
 
     const big = try testing.allocator.alloc(u8, 65473);
     defer testing.allocator.free(big);
@@ -758,8 +787,8 @@ test "delivered limits: the default window really reaches 8128 counters back" {
     // Behavioural twin of the `capacity == 8128` pin, expressed in literals so
     // a halved window drops these packets instead of moving the expectation.
     const key = testKey(31);
-    var s = SendSession.init(key, 5, t0);
-    var r = RecvSession.init(key, 5, t0);
+    var s = tSend(key, 5, t0);
+    var r = tRecv(key, 5, t0);
 
     var high: [overhead + 16]u8 = undefined; // counter 10_000
     s.seekUnsafeForTest(10_000);
@@ -834,7 +863,7 @@ test "padding: plaintext is zero-padded up to a multiple of 16, and 0 stays 0" {
         .{ .pt = 1419, .padded = 1424 },
         .{ .pt = 1420, .padded = 1424 },
     };
-    var s = SendSession.init(testKey(1), 0xAABBCCDD, t0);
+    var s = tSend(testKey(1), 0xAABBCCDD, t0);
     var buf: [2048]u8 = undefined;
     var pt: [1420]u8 = @splat(0x5A);
     for (cases) |c| {
@@ -851,7 +880,7 @@ test "padding: plaintext is zero-padded up to a multiple of 16, and 0 stays 0" {
 }
 
 test "header: byte-exact layout, type 4 with zero reserved bytes" {
-    var s = SendSession.init(testKey(2), 0x11223344, t0);
+    var s = tSend(testKey(2), 0x11223344, t0);
     s.seekUnsafeForTest(0x0102_0304_0506_0708);
     var buf: [64]u8 = undefined;
     const r = try s.seal(&buf, "hi", t0);
@@ -899,7 +928,7 @@ test "differential: the sealed message is byte-identical to an independent rebui
 
     for (lens) |len| {
         for (cases) |c| {
-            var s = SendSession.init(key, idx, t0);
+            var s = tSend(key, idx, t0);
             s.seekUnsafeForTest(c.counter);
             const r = try s.seal(&ours, payload[0..len], t0);
 
@@ -945,8 +974,8 @@ test "differential: the sealed message is byte-identical to an independent rebui
 test "round trip: a sealed packet opens under the matching receive session" {
     const keys = TransportKeys{ .send = testKey(4), .recv = testKey(5) };
     // A ↔ B: A's send key is B's receive key and vice versa.
-    var a = Session.init(keys, 0x0A0A0A0A, 0x0B0B0B0B, t0);
-    var b = Session.init(.{ .send = keys.recv, .recv = keys.send }, 0x0B0B0B0B, 0x0A0A0A0A, t0);
+    var a = tSession(keys, 0x0A0A0A0A, 0x0B0B0B0B, t0);
+    var b = tSession(.{ .send = keys.recv, .recv = keys.send }, 0x0B0B0B0B, 0x0A0A0A0A, t0);
 
     var wire: [2048]u8 = undefined;
     var out: [2048]u8 = undefined;
@@ -971,8 +1000,8 @@ test "round trip: a sealed packet opens under the matching receive session" {
 
 test "keepalive: an empty payload is a 32-byte message that opens to nothing" {
     const key = testKey(6);
-    var s = SendSession.init(key, 7, t0);
-    var r = RecvSession.init(key, 7, t0);
+    var s = tSend(key, 7, t0);
+    var r = tRecv(key, 7, t0);
     var wire: [64]u8 = undefined;
     const sr = try s.seal(&wire, "", t0);
     try testing.expectEqual(@as(usize, 32), sr.len);
@@ -985,7 +1014,7 @@ test "send and receive keys are NOT interchangeable" {
     // The failure this catches is invisible to a round trip: swapping the two
     // keys on BOTH ends round-trips perfectly and fails against a real peer.
     const keys = TransportKeys{ .send = testKey(7), .recv = testKey(8) };
-    var a = Session.init(keys, 1, 2, t0);
+    var a = tSession(keys, 1, 2, t0);
     var wire: [128]u8 = undefined;
     const sr = try a.send.seal(&wire, "payload", t0);
 
@@ -993,12 +1022,12 @@ test "send and receive keys are NOT interchangeable" {
     // The packet is addressed to the peer (index 2). A peer that hands its
     // receiver the WRONG half of the pair cannot open it — and the failure is
     // an authentication failure, not a framing error.
-    var wrong = RecvSession.init(keys.recv, 2, t0);
+    var wrong = tRecv(keys.recv, 2, t0);
     try testing.expectError(error.AuthenticationFailed, wrong.open(&out, wire[0..sr.len], t0));
     for (out[0..16]) |b| try testing.expectEqual(@as(u8, 0), b); // zeroed, not garbage
 
     // The correctly-paired peer can: our `send` key is its `recv` key.
-    var right = RecvSession.init(keys.send, 2, t0);
+    var right = tRecv(keys.send, 2, t0);
     _ = try right.open(&out, wire[0..sr.len], t0);
 
     // Session.init wires the pair: our sender holds `keys.send`, our receiver
@@ -1015,8 +1044,8 @@ test "send and receive keys are NOT interchangeable" {
 
 test "replay: a duplicate is rejected, out-of-order-within-window is accepted" {
     const key = testKey(9);
-    var s = SendSession.init(key, 3, t0);
-    var r = RecvSession.init(key, 3, t0);
+    var s = tSend(key, 3, t0);
+    var r = tRecv(key, 3, t0);
 
     var msgs: [8][overhead + 16]u8 = undefined;
     for (&msgs) |*m| _ = try s.seal(m, "packet", t0);
@@ -1037,8 +1066,8 @@ test "replay: a duplicate is rejected, out-of-order-within-window is accepted" {
 
 test "replay: a counter that fell off the trailing edge is rejected" {
     const key = testKey(10);
-    var s = SendSession.init(key, 3, t0);
-    var r = RecvSession.init(key, 3, t0);
+    var s = tSend(key, 3, t0);
+    var r = tRecv(key, 3, t0);
     const cap = RecvSession.Window.capacity;
 
     // Three packets, positioned relative to a high-water mark of 100 + cap:
@@ -1067,8 +1096,8 @@ test "replay: a counter that fell off the trailing edge is rejected" {
 
 test "replay: a forged packet cannot burn a legitimate counter's window slot" {
     const key = testKey(11);
-    var s = SendSession.init(key, 3, t0);
-    var r = RecvSession.init(key, 3, t0);
+    var s = tSend(key, 3, t0);
+    var r = tRecv(key, 3, t0);
     var good: [overhead + 16]u8 = undefined;
     _ = try s.seal(&good, "genuine", t0);
 
@@ -1149,7 +1178,7 @@ test "window: a jump clear of the whole bitmap resets it without stale bits" {
 
 test "seal refuses at REJECT_AFTER_MESSAGES instead of wrapping the nonce" {
     const key = testKey(12);
-    var s = SendSession.init(key, 3, t0);
+    var s = tSend(key, 3, t0);
     var buf: [64]u8 = undefined;
 
     // One below the limit still works …
@@ -1167,8 +1196,8 @@ test "seal refuses at REJECT_AFTER_MESSAGES instead of wrapping the nonce" {
 
 test "open refuses a counter at or past REJECT_AFTER_MESSAGES" {
     const key = testKey(13);
-    var s = SendSession.init(key, 3, t0);
-    var r = RecvSession.init(key, 3, t0);
+    var s = tSend(key, 3, t0);
+    var r = tRecv(key, 3, t0);
     var buf: [64]u8 = undefined;
     var out: [64]u8 = undefined;
 
@@ -1187,8 +1216,8 @@ test "open refuses a counter at or past REJECT_AFTER_MESSAGES" {
 
 test "rekey is signalled at REKEY_AFTER_MESSAGES, not silently continued" {
     const key = testKey(14);
-    var s = SendSession.init(key, 3, t0);
-    var r = RecvSession.init(key, 3, t0);
+    var s = tSend(key, 3, t0);
+    var r = tRecv(key, 3, t0);
     var buf: [64]u8 = undefined;
     var out: [64]u8 = undefined;
 
@@ -1223,7 +1252,7 @@ test "rekey is signalled at REKEY_AFTER_MESSAGES, not silently continued" {
 test "lifetime: seal refuses at 180 seconds, and 179 still works" {
     const key = testKey(20);
     const born: u64 = 1_000_000;
-    var s = SendSession.init(key, 9, born);
+    var s = tSend(key, 9, born);
     var buf: [64]u8 = undefined;
 
     _ = try s.seal(&buf, "at birth", born);
@@ -1242,8 +1271,8 @@ test "lifetime: seal refuses at 180 seconds, and 179 still works" {
 test "lifetime: open refuses at 180 seconds, and the packet is otherwise perfect" {
     const key = testKey(21);
     const born: u64 = 5_000;
-    var s = SendSession.init(key, 4, born);
-    var r = RecvSession.init(key, 4, born);
+    var s = tSend(key, 4, born);
+    var r = tRecv(key, 4, born);
     var out: [64]u8 = undefined;
 
     var early: [overhead + 16]u8 = undefined;
@@ -1259,15 +1288,15 @@ test "lifetime: open refuses at 180 seconds, and the packet is otherwise perfect
     try testing.expect(r.expired(born + 180));
     // Rejected on age BEFORE the AEAD ran, so the window never recorded it:
     // a receiver that is rekeyed rather than expired would still accept it.
-    var fresh = RecvSession.init(key, 4, born);
+    var fresh = tRecv(key, 4, born);
     _ = try fresh.open(&out, &late, born + 179);
 }
 
 test "lifetime: rekey is due at 120 seconds, well before the session dies" {
     const key = testKey(22);
     const born: u64 = 42;
-    var s = SendSession.init(key, 6, born);
-    var r = RecvSession.init(key, 6, born);
+    var s = tSend(key, 6, born);
+    var r = tRecv(key, 6, born);
     var buf: [64]u8 = undefined;
     var out: [64]u8 = undefined;
 
@@ -1297,8 +1326,8 @@ test "lifetime: a clock that runs backwards cannot age a session out" {
     // brand-new session; the saturating subtraction makes it age 0.
     const key = testKey(23);
     const born: u64 = 1_000_000;
-    var s = SendSession.init(key, 8, born);
-    var r = RecvSession.init(key, 8, born);
+    var s = tSend(key, 8, born);
+    var r = tRecv(key, 8, born);
     var buf: [64]u8 = undefined;
     var out: [64]u8 = undefined;
 
@@ -1315,7 +1344,7 @@ test "lifetime: a clock that runs backwards cannot age a session out" {
 test "lifetime: Session.init gives both halves one birth time" {
     const keys = TransportKeys{ .send = testKey(24), .recv = testKey(25) };
     const born: u64 = 777;
-    var a = Session.init(keys, 1, 2, born);
+    var a = tSession(keys, 1, 2, born);
     try testing.expectEqual(born, a.send.born_s);
     try testing.expectEqual(born, a.recv.born_s);
     try testing.expect(!a.expired(born + 179));
@@ -1354,8 +1383,8 @@ test "window: maxInt(u64) is refused, not an integer-overflow panic" {
 
 test "open rejects truncated, wrong-type, wrong-receiver and tampered messages" {
     const key = testKey(15);
-    var s = SendSession.init(key, 0x1234, t0);
-    var r = RecvSession.init(key, 0x1234, t0);
+    var s = tSend(key, 0x1234, t0);
+    var r = tRecv(key, 0x1234, t0);
     var buf: [overhead + 16]u8 = undefined;
     const n = (try s.seal(&buf, "twelve bytes", t0)).len;
     var out: [64]u8 = undefined;
@@ -1383,12 +1412,12 @@ test "open rejects truncated, wrong-type, wrong-receiver and tampered messages" 
     for ([_]usize{ header_len, n - 1, 8 }) |off| {
         var bad = buf;
         bad[off] +%= 1;
-        var fresh = RecvSession.init(key, 0x1234, t0);
+        var fresh = tRecv(key, 0x1234, t0);
         try testing.expectError(error.AuthenticationFailed, fresh.open(&out, bad[0..n], t0));
         for (out[0..16]) |b| try testing.expectEqual(@as(u8, 0), b);
     }
     // The untouched message still opens.
-    var fresh = RecvSession.init(key, 0x1234, t0);
+    var fresh = tRecv(key, 0x1234, t0);
     const orr = try fresh.open(&out, buf[0..n], t0);
     try testing.expectEqualSlices(u8, "twelve bytes", out[0..12]);
     try testing.expectEqual(@as(usize, 16), orr.len);
@@ -1396,7 +1425,7 @@ test "open rejects truncated, wrong-type, wrong-receiver and tampered messages" 
 
 test "buffer sizing: seal and open reject an undersized output buffer" {
     const key = testKey(16);
-    var s = SendSession.init(key, 1, t0);
+    var s = tSend(key, 1, t0);
     var too_small: [overhead + 16 - 1]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, s.seal(&too_small, "seventeen bytes!!", t0));
     // The exact size is enough (17 bytes pads to 32).
@@ -1404,7 +1433,7 @@ test "buffer sizing: seal and open reject an undersized output buffer" {
     const n = (try s.seal(&exact, "seventeen bytes!!", t0)).len;
     try testing.expectEqual(exact.len, n);
 
-    var r = RecvSession.init(key, 1, t0);
+    var r = tRecv(key, 1, t0);
     var out_small: [31]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, r.open(&out_small, exact[0..n], t0));
     var out_exact: [32]u8 = undefined;
@@ -1413,7 +1442,7 @@ test "buffer sizing: seal and open reject an undersized output buffer" {
 
 test "seal rejects a plaintext that cannot fit one UDP datagram" {
     const key = testKey(17);
-    var s = SendSession.init(key, 1, t0);
+    var s = tSend(key, 1, t0);
     const big = try testing.allocator.alloc(u8, max_payload + 1);
     defer testing.allocator.free(big);
     @memset(big, 0);
@@ -1454,7 +1483,7 @@ const OpenCorpus = struct {
     }
 
     fn build(self: *OpenCorpus) []const []const u8 {
-        var s = SendSession.init(fuzz_key, fuzz_index, t0);
+        var s = tSend(fuzz_key, fuzz_index, t0);
         var sealed: [128]u8 = undefined;
 
         // Two authentic messages, counters 0 and 1 — the second is what makes
@@ -1511,7 +1540,7 @@ const OpenTally = struct {
 
 fn walkOpen(msg: []const u8) !OpenTally {
     var out: [160]u8 = undefined;
-    var r = RecvSession.init(fuzz_key, fuzz_index, t0);
+    var r = tRecv(fuzz_key, fuzz_index, t0);
     // Arbitrary bytes must only ever yield a typed error or a plaintext length
     // <= input — never a panic, an OOB read, or an allocation.
     const orr = r.open(&out, msg, t0) catch return .{};

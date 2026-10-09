@@ -52,6 +52,7 @@ const entropy = @import("entropy");
 const initial_message = @import("initial_message.zig");
 const x3dh = @import("x3dh.zig");
 const xeddsa = @import("xeddsa.zig");
+const burn = @import("burn.zig");
 const X25519 = std.crypto.dh.X25519;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 
@@ -260,14 +261,30 @@ pub const InitiateOutput = struct {
 /// the KEM one specifically lets an attacker substitute a KEM prekey they
 /// hold the secret for, which removes the post-quantum protection entirely
 /// while leaving every other check passing.
+///
+/// `alice_ik` by pointer; the output (the session secret) through `out`,
+/// written only on success. Stack burned before the call returns.
 pub fn initiateUnverified(
     allocator: std.mem.Allocator,
-    alice_ik: IdentityKey,
+    alice_ik: *const IdentityKey,
     bob_bundle: PreKeyBundle,
     initial_plaintext: []const u8,
     io: std.Io,
-) (InitiateError || std.mem.Allocator.Error)!InitiateOutput {
-    const ek = x3dh.generateKeyPair(io);
+    out: *InitiateOutput,
+) (InitiateError || std.mem.Allocator.Error)!void {
+    return burn.run(burn.pq_initiate_burn, (InitiateError || std.mem.Allocator.Error)!void, initiateUnverifiedBody, .{ allocator, alice_ik, bob_bundle, initial_plaintext, io, out });
+}
+
+fn initiateUnverifiedBody(
+    allocator: std.mem.Allocator,
+    alice_ik: *const IdentityKey,
+    bob_bundle: PreKeyBundle,
+    initial_plaintext: []const u8,
+    io: std.Io,
+    out: *InitiateOutput,
+) (InitiateError || std.mem.Allocator.Error)!void {
+    var ek: X25519.KeyPair = undefined;
+    x3dh.generateKeyPair(io, &ek);
 
     const dh1 = try dh(alice_ik.secret_key, bob_bundle.signed_prekey);
     const dh2 = try dh(ek.secret_key, bob_bundle.identity_key);
@@ -291,7 +308,7 @@ pub fn initiateUnverified(
     const ad = associatedData(alice_ik.public_key, bob_bundle.identity_key, bob_bundle.kem_prekey);
 
     const ciphertext_owned = try initial_message.seal(allocator, shared_secret, &ad, initial_plaintext);
-    return .{
+    out.* = .{
         .agreement = .{ .shared_secret = shared_secret, .associated_data = ad },
         .message = .{
             .identity_key = alice_ik.public_key,
@@ -309,16 +326,17 @@ pub fn initiateUnverified(
 /// any key material is derived.
 pub fn initiate(
     allocator: std.mem.Allocator,
-    alice_ik: IdentityKey,
+    alice_ik: *const IdentityKey,
     bob_bundle: PreKeyBundle,
     initial_plaintext: []const u8,
     io: std.Io,
-) (InitiateError || std.mem.Allocator.Error)!InitiateOutput {
+    out: *InitiateOutput,
+) (InitiateError || std.mem.Allocator.Error)!void {
     if (!xeddsa.verify(bob_bundle.identity_key, &bob_bundle.signed_prekey, bob_bundle.signed_prekey_signature))
         return error.SignedPreKeyVerificationFailed;
     if (!xeddsa.verify(bob_bundle.identity_key, &bob_bundle.kem_prekey, bob_bundle.kem_prekey_signature))
         return error.KemPreKeyVerificationFailed;
-    return initiateUnverified(allocator, alice_ik, bob_bundle, initial_plaintext, io);
+    return initiateUnverified(allocator, alice_ik, bob_bundle, initial_plaintext, io, out);
 }
 
 pub const RespondOutput = struct {
@@ -355,14 +373,30 @@ pub const RespondError = AgreementError || initial_message.OpenError || error{
 /// does not authenticate, `SK` is zeroed and
 /// `error.InitialMessageAuthenticationFailed` returned (spec: "Bob aborts the
 /// protocol and deletes SK").
+///
+/// Bob's keys by pointer; the output (the session secret) through `out`,
+/// written only on success. Stack burned before the call returns.
 pub fn respond(
     allocator: std.mem.Allocator,
-    bob_ik: IdentityKey,
-    bob_spk: SignedPreKey,
-    bob_opk: ?OneTimePreKey,
-    bob_kem: KemPreKey,
+    bob_ik: *const IdentityKey,
+    bob_spk: *const SignedPreKey,
+    bob_opk: ?*const OneTimePreKey,
+    bob_kem: *const KemPreKey,
     alice_initial: InitialMessage,
-) RespondError!RespondOutput {
+    out: *RespondOutput,
+) RespondError!void {
+    return burn.run(burn.pq_respond_burn, RespondError!void, respondBody, .{ allocator, bob_ik, bob_spk, bob_opk, bob_kem, alice_initial, out });
+}
+
+fn respondBody(
+    allocator: std.mem.Allocator,
+    bob_ik: *const IdentityKey,
+    bob_spk: *const SignedPreKey,
+    bob_opk: ?*const OneTimePreKey,
+    bob_kem: *const KemPreKey,
+    alice_initial: InitialMessage,
+    out: *RespondOutput,
+) RespondError!void {
     const dh1 = try dh(bob_spk.key_pair.secret_key, alice_initial.identity_key);
     const dh2 = try dh(bob_ik.secret_key, alice_initial.ephemeral_key);
     const dh3 = try dh(bob_spk.key_pair.secret_key, alice_initial.ephemeral_key);
@@ -384,7 +418,7 @@ pub fn respond(
         std.crypto.secureZero(u8, &shared_secret);
         return err;
     };
-    return .{
+    out.* = .{
         .agreement = .{ .shared_secret = shared_secret, .associated_data = ad },
         .plaintext = plaintext,
     };
@@ -405,17 +439,18 @@ pub fn respond(
 ///
 /// The retry loop is std's, kept for std's reason: `generateDeterministic`
 /// rejects some seeds and the answer is another draw, not a failure.
-fn generateKemKeyPair(io: std.Io) Kem.KeyPair {
+fn generateKemKeyPair(io: std.Io, out: *Kem.KeyPair) void {
     var seed: [Kem.seed_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &seed);
     while (true) {
-        return Kem.KeyPair.generateDeterministic(blk: {
+        out.* = Kem.KeyPair.generateDeterministic(blk: {
             entropy.fill(io, &seed);
             break :blk seed;
         }) catch {
             @branchHint(.unlikely);
             continue;
         };
+        return;
     }
 }
 
@@ -424,26 +459,40 @@ fn generateKemKeyPair(io: std.Io) Kem.KeyPair {
 /// `x3dh.generateSignedPreKey` takes it: it makes published vectors
 /// reproducible, and XEdDSA hashes it together with the secret scalar rather
 /// than using it alone.
+///
+/// `bob_ik` by pointer; the new prekey (the ML-KEM decapsulation key inside)
+/// through `out`. Stack burned before the call returns (ML-KEM-1024 key
+/// generation dirties ~136 KiB).
 pub fn generateKemPreKey(
-    bob_ik: IdentityKey,
+    bob_ik: *const IdentityKey,
     id: u32,
     last_resort: bool,
     z: xeddsa.RandomData,
     io: std.Io,
-) KemPreKey {
-    const kp = generateKemKeyPair(io);
-    const pk_bytes = kp.public_key.toBytes();
-    return .{
-        .key_pair = kp,
-        .signature = xeddsa.sign(bob_ik.secret_key, &pk_bytes, z),
-        .id = id,
-        .last_resort = last_resort,
-    };
+    out: *KemPreKey,
+) void {
+    burn.run(burn.kem_gen_burn, void, generateKemPreKeyBody, .{ bob_ik, id, last_resort, z, io, out });
+}
+
+fn generateKemPreKeyBody(
+    bob_ik: *const IdentityKey,
+    id: u32,
+    last_resort: bool,
+    z: xeddsa.RandomData,
+    io: std.Io,
+    out: *KemPreKey,
+) void {
+    generateKemKeyPair(io, &out.key_pair);
+    const pk_bytes = out.key_pair.public_key.toBytes();
+    out.signature = xeddsa.sign(&bob_ik.secret_key, &pk_bytes, z);
+    out.id = id;
+    out.last_resort = last_resort;
 }
 
 // ── tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const shim = @import("test_shim.zig");
 const interop = @import("interop_vectors.zig");
 
 fn hexEq(want_hex: []const u8, got: []const u8) !void {
@@ -520,12 +569,12 @@ test "end to end: Alice initiates, Bob responds, both land on the same SK and AD
     defer threaded.deinit();
     const io = threaded.io();
 
-    const bob_ik = x3dh.generateKeyPair(io);
-    const alice_ik = x3dh.generateKeyPair(io);
+    const bob_ik = shim.x3dh.generateKeyPair(io);
+    const alice_ik = shim.x3dh.generateKeyPair(io);
     const z: xeddsa.RandomData = @splat(0x77);
-    const spk = x3dh.generateSignedPreKey(bob_ik, 7, z, io);
-    const kem = generateKemPreKey(bob_ik, 42, true, z, io);
-    const opk_kp = x3dh.generateKeyPair(io);
+    const spk = shim.x3dh.generateSignedPreKey(bob_ik, 7, z, io);
+    const kem = shim.pqxdh.generateKemPreKey(bob_ik, 42, true, z, io);
+    const opk_kp = shim.x3dh.generateKeyPair(io);
     const opk: OneTimePreKey = .{ .key_pair = opk_kp, .id = 9 };
 
     const bundle: PreKeyBundle = .{
@@ -540,10 +589,10 @@ test "end to end: Alice initiates, Bob responds, both land on the same SK and AD
         .kem_prekey_signature = kem.signature,
     };
 
-    const out = try initiate(testing.allocator, alice_ik, bundle, "hello", io);
+    const out = try shim.pqxdh.initiate(testing.allocator, alice_ik, bundle, "hello", io);
     defer testing.allocator.free(out.message.ciphertext);
 
-    const bob = try respond(testing.allocator, bob_ik, spk, opk, kem, out.message);
+    const bob = try shim.pqxdh.respond(testing.allocator, bob_ik, spk, opk, kem, out.message);
     defer testing.allocator.free(bob.plaintext);
     try testing.expectEqualSlices(u8, &out.agreement.shared_secret, &bob.agreement.shared_secret);
     try testing.expectEqualSlices(u8, &out.agreement.associated_data, &bob.agreement.associated_data);
@@ -568,11 +617,11 @@ test "fail-closed: a tampered KEM prekey signature is refused, and names WHICH k
     defer threaded.deinit();
     const io = threaded.io();
 
-    const bob_ik = x3dh.generateKeyPair(io);
-    const alice_ik = x3dh.generateKeyPair(io);
+    const bob_ik = shim.x3dh.generateKeyPair(io);
+    const alice_ik = shim.x3dh.generateKeyPair(io);
     const z: xeddsa.RandomData = @splat(0x77);
-    const spk = x3dh.generateSignedPreKey(bob_ik, 7, z, io);
-    const kem = generateKemPreKey(bob_ik, 42, true, z, io);
+    const spk = shim.x3dh.generateSignedPreKey(bob_ik, 7, z, io);
+    const kem = shim.pqxdh.generateKemPreKey(bob_ik, 42, true, z, io);
 
     var bundle: PreKeyBundle = .{
         .identity_key = bob_ik.public_key,
@@ -589,7 +638,7 @@ test "fail-closed: a tampered KEM prekey signature is refused, and names WHICH k
 
     try testing.expectError(
         error.KemPreKeyVerificationFailed,
-        initiate(testing.allocator, alice_ik, bundle, "hello", io),
+        shim.pqxdh.initiate(testing.allocator, alice_ik, bundle, "hello", io),
     );
 
     // The curve signature is still good, so the two failures are distinguished
@@ -598,7 +647,7 @@ test "fail-closed: a tampered KEM prekey signature is refused, and names WHICH k
     bundle.signed_prekey_signature[0] +%= 1;
     try testing.expectError(
         error.SignedPreKeyVerificationFailed,
-        initiate(testing.allocator, alice_ik, bundle, "hello", io),
+        shim.pqxdh.initiate(testing.allocator, alice_ik, bundle, "hello", io),
     );
 }
 
@@ -612,12 +661,12 @@ test "a substituted KEM prekey yields a DIFFERENT SK, and respond refuses the in
     defer threaded.deinit();
     const io = threaded.io();
 
-    const bob_ik = x3dh.generateKeyPair(io);
-    const alice_ik = x3dh.generateKeyPair(io);
+    const bob_ik = shim.x3dh.generateKeyPair(io);
+    const alice_ik = shim.x3dh.generateKeyPair(io);
     const z: xeddsa.RandomData = @splat(0x77);
-    const spk = x3dh.generateSignedPreKey(bob_ik, 7, z, io);
-    const kem = generateKemPreKey(bob_ik, 42, true, z, io);
-    const other_kem = generateKemPreKey(bob_ik, 43, false, z, io);
+    const spk = shim.x3dh.generateSignedPreKey(bob_ik, 7, z, io);
+    const kem = shim.pqxdh.generateKemPreKey(bob_ik, 42, true, z, io);
+    const other_kem = shim.pqxdh.generateKemPreKey(bob_ik, 43, false, z, io);
 
     const bundle: PreKeyBundle = .{
         .identity_key = bob_ik.public_key,
@@ -631,16 +680,16 @@ test "a substituted KEM prekey yields a DIFFERENT SK, and respond refuses the in
         .kem_prekey_signature = kem.signature,
     };
 
-    const out = try initiate(testing.allocator, alice_ik, bundle, "hello", io);
+    const out = try shim.pqxdh.initiate(testing.allocator, alice_ik, bundle, "hello", io);
     defer testing.allocator.free(out.message.ciphertext);
 
     try testing.expectError(
         error.InitialMessageAuthenticationFailed,
-        respond(testing.allocator, bob_ik, spk, null, other_kem, out.message),
+        shim.pqxdh.respond(testing.allocator, bob_ik, spk, null, other_kem, out.message),
     );
 
     // Positive control: the right KEM prekey opens the same message.
-    const right = try respond(testing.allocator, bob_ik, spk, null, kem, out.message);
+    const right = try shim.pqxdh.respond(testing.allocator, bob_ik, spk, null, kem, out.message);
     defer testing.allocator.free(right.plaintext);
     try testing.expectEqualStrings("hello", right.plaintext);
 }
@@ -679,19 +728,19 @@ test "a degraded io.random cannot reach any PQXDH secret" {
     // CONTROL. Under the same degraded `io`, the module's existing curve-key
     // source still produces distinct keys — so a collision below is a
     // statement about this file, not about a broken harness.
-    const c1 = x3dh.generateKeyPair(io);
-    const c2 = x3dh.generateKeyPair(io);
+    const c1 = shim.x3dh.generateKeyPair(io);
+    const c2 = shim.x3dh.generateKeyPair(io);
     try testing.expect(!std.mem.eql(u8, &c1.public_key, &c2.public_key));
 
-    const bob_ik = x3dh.generateKeyPair(io);
-    const alice_ik = x3dh.generateKeyPair(io);
+    const bob_ik = shim.x3dh.generateKeyPair(io);
+    const alice_ik = shim.x3dh.generateKeyPair(io);
     const z: xeddsa.RandomData = @splat(0x77);
-    const spk = x3dh.generateSignedPreKey(bob_ik, 7, z, io);
+    const spk = shim.x3dh.generateSignedPreKey(bob_ik, 7, z, io);
 
     // 1. Bob's ML-KEM prekey is long-lived and, when `last_resort`, reused
     //    until he rotates it. Two draws must not collide.
-    const k1 = generateKemPreKey(bob_ik, 1, true, z, io);
-    const k2 = generateKemPreKey(bob_ik, 2, true, z, io);
+    const k1 = shim.pqxdh.generateKemPreKey(bob_ik, 1, true, z, io);
+    const k2 = shim.pqxdh.generateKemPreKey(bob_ik, 2, true, z, io);
     try testing.expect(!std.mem.eql(u8, &k1.key_pair.public_key.toBytes(), &k2.key_pair.public_key.toBytes()));
 
     // 2. The encapsulation message determines `SS`. Two handshakes against the
@@ -708,9 +757,9 @@ test "a degraded io.random cannot reach any PQXDH secret" {
         .kem_prekey_id = k1.id,
         .kem_prekey_signature = k1.signature,
     };
-    const a = try initiate(testing.allocator, alice_ik, bundle, "hi", io);
+    const a = try shim.pqxdh.initiate(testing.allocator, alice_ik, bundle, "hi", io);
     defer testing.allocator.free(a.message.ciphertext);
-    const b = try initiate(testing.allocator, alice_ik, bundle, "hi", io);
+    const b = try shim.pqxdh.initiate(testing.allocator, alice_ik, bundle, "hi", io);
     defer testing.allocator.free(b.message.ciphertext);
     try testing.expect(!std.mem.eql(u8, &a.message.kem_ciphertext, &b.message.kem_ciphertext));
     try testing.expect(!std.mem.eql(u8, &a.agreement.shared_secret, &b.agreement.shared_secret));

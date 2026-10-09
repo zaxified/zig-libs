@@ -99,6 +99,7 @@
 const std = @import("std");
 const ct25519 = @import("ct25519");
 const Sha512 = std.crypto.hash.sha2.Sha512;
+const burn = @import("burn.zig");
 
 /// Re-exported: the std group backing this ciphersuite (see the module
 /// doc comment's recon finding for the exact API surface used).
@@ -278,8 +279,16 @@ pub fn deserializeScalar(bytes: [Ns]u8) DeserializeScalarError![Ns]u8 {
 /// random bits" recipe. This is the intended way for a caller with its
 /// own CSPRNG to produce the `blind` / proof-randomness scalars this
 /// module's API takes as parameters (this module has no internal RNG).
-pub fn scalarFromWideBytes(wide: [64]u8) [Ns]u8 {
-    return scalar.reduce64(wide);
+///
+/// Secret in, secret out: `wide` by pointer and the scalar through `out`, so
+/// neither lives in a returned-by-value temporary. The reduction's stack is
+/// burned before the call returns.
+pub fn scalarFromWideBytes(wide: *const [64]u8, out: *[Ns]u8) void {
+    burn.run(burn.wide_burn, void, wideBody, .{ wide, out });
+}
+
+fn wideBody(wide: *const [64]u8, out: *[Ns]u8) void {
+    out.* = scalar.reduce64(wide.*);
 }
 
 /// A DLEQ proof (RFC 9497 §2.2): two scalars `(c, s)`, serialized as
@@ -319,29 +328,40 @@ pub const DeriveKeyPairError = error{DeriveKeyPairFailed};
 /// || I2OSP(counter, 1))` with `DST = "DeriveKeyPair" || contextString`,
 /// retrying (counter 0..255) while the result is zero. Reproduces the
 /// Appendix A.1 `skSm`/`pkSm` values from `Seed`/`KeyInfo` (KAT).
-pub fn deriveKeyPair(comptime mode: Mode, seed: [32]u8, info: []const u8) DeriveKeyPairError!KeyPair {
-    std.debug.assert(info.len <= 0xffff);
-    const dst = "DeriveKeyPair" ++ comptime contextString(mode);
-    var info_len: [2]u8 = undefined;
-    std.mem.writeInt(u16, &info_len, @intCast(info.len), .big);
-    var counter: u16 = 0;
-    while (counter <= 255) : (counter += 1) {
-        const counter_byte = [1]u8{@intCast(counter)};
-        const sk = hashToScalarDst(&.{ &seed, &info_len, info, &counter_byte }, dst);
-        // skS == 0 → retry (this zero test is the RFC's own loop condition).
-        // `sk` is SECRET (the derived key itself): `std.mem.allEqual` compiles
-        // to a per-byte compare-and-branch-out loop (A1 N-CT1), an early exit
-        // whose timing reveals the index of the first nonzero byte. Compare
-        // against zero with `std.crypto.timing_safe.eql` instead — an
-        // OR-accumulation with a single branch on the final verdict, not on
-        // any individual byte.
-        if (std.crypto.timing_safe.eql([Ns]u8, sk, [_]u8{0} ** Ns)) continue;
-        // SECRET scalar: `ct25519.mulRistrettoBase`, not std's `mul` (see
-        // the Security notes). The `catch continue` this replaces was a
-        // second branch on `sk` on top of the RFC's own zero test.
-        return .{ .sk = sk, .pk = .{ .p = ct25519.mulRistrettoBase(sk) } };
-    }
-    return error.DeriveKeyPairFailed;
+/// `seed` by pointer and the key pair through `out` (written only on
+/// success); the derivation's stack is burned before the call returns.
+pub fn deriveKeyPair(comptime mode: Mode, seed: *const [32]u8, info: []const u8, out: *KeyPair) DeriveKeyPairError!void {
+    return burn.run(burn.derive_burn, DeriveKeyPairError!void, DeriveBody(mode).f, .{ seed, info, out });
+}
+
+fn DeriveBody(comptime mode: Mode) type {
+    return struct {
+        fn f(seed: *const [32]u8, info: []const u8, out: *KeyPair) DeriveKeyPairError!void {
+            std.debug.assert(info.len <= 0xffff);
+            const dst = "DeriveKeyPair" ++ comptime contextString(mode);
+            var info_len: [2]u8 = undefined;
+            std.mem.writeInt(u16, &info_len, @intCast(info.len), .big);
+            var counter: u16 = 0;
+            while (counter <= 255) : (counter += 1) {
+                const counter_byte = [1]u8{@intCast(counter)};
+                const sk = hashToScalarDst(&.{ seed, &info_len, info, &counter_byte }, dst);
+                // skS == 0 → retry (this zero test is the RFC's own loop condition).
+                // `sk` is SECRET (the derived key itself): `std.mem.allEqual` compiles
+                // to a per-byte compare-and-branch-out loop (A1 N-CT1), an early exit
+                // whose timing reveals the index of the first nonzero byte. Compare
+                // against zero with `std.crypto.timing_safe.eql` instead — an
+                // OR-accumulation with a single branch on the final verdict, not on
+                // any individual byte.
+                if (std.crypto.timing_safe.eql([Ns]u8, sk, [_]u8{0} ** Ns)) continue;
+                // SECRET scalar: `ct25519.mulRistrettoBase`, not std's `mul` (see
+                // the Security notes). The `catch continue` this replaces was a
+                // second branch on `sk` on top of the RFC's own zero test.
+                out.* = .{ .sk = sk, .pk = .{ .p = ct25519.mulRistrettoBase(sk) } };
+                return;
+            }
+            return error.DeriveKeyPairFailed;
+        }
+    };
 }
 
 // ── DLEQ proofs (RFC 9497 §2.2) ──────────────────────────────────────────
@@ -472,6 +492,33 @@ pub const GenerateProofError = error{ProofGenerationFailed};
 /// and of equal length; a batch produces one constant-size proof.
 pub fn generateProof(
     comptime mode: Mode,
+    k: *const [Ns]u8,
+    a: Element,
+    b: Element,
+    c_list: []const Element,
+    d_list: []const Element,
+    r: *const [Ns]u8,
+) GenerateProofError!Proof {
+    return burn.run(burn.proof_burn, GenerateProofError!Proof, GenerateProofBody(mode).f, .{ k, a, b, c_list, d_list, r });
+}
+
+fn GenerateProofBody(comptime mode: Mode) type {
+    return struct {
+        fn f(
+            k_ptr: *const [Ns]u8,
+            a: Element,
+            b: Element,
+            c_list: []const Element,
+            d_list: []const Element,
+            r_ptr: *const [Ns]u8,
+        ) GenerateProofError!Proof {
+            return generateProofImpl(mode, k_ptr.*, a, b, c_list, d_list, r_ptr.*);
+        }
+    };
+}
+
+fn generateProofImpl(
+    comptime mode: Mode,
     k: [Ns]u8,
     a: Element,
     b: Element,
@@ -576,10 +623,18 @@ pub const BlindError = error{InvalidInput};
 /// keeps `blind_scalar` for `finalize`. `comptime mode` selects the
 /// context (the same Blind is used by all three modes; POPRF callers
 /// normally use `blindPoprf`, which also derives the tweaked key).
-pub fn blind(comptime mode: Mode, input: []const u8, blind_scalar: [Ns]u8) BlindError!Element {
-    const input_element = try hashToGroup(mode, input);
-    // `blind_scalar` is the client's SECRET: constant-time multiply.
-    return .{ .p = ct25519.mulRistretto(input_element.p, blind_scalar) };
+pub fn blind(comptime mode: Mode, input: []const u8, blind_scalar: *const [Ns]u8) BlindError!Element {
+    return burn.run(burn.mul_burn, BlindError!Element, BlindBody(mode).f, .{ input, blind_scalar });
+}
+
+fn BlindBody(comptime mode: Mode) type {
+    return struct {
+        fn f(input: []const u8, blind_scalar: *const [Ns]u8) BlindError!Element {
+            const input_element = try hashToGroup(mode, input);
+            // `blind_scalar` is the client's SECRET: constant-time multiply.
+            return .{ .p = ct25519.mulRistretto(input_element.p, blind_scalar.*) };
+        }
+    };
 }
 
 /// RFC 9497 §3.3.1 `BlindEvaluate(skS, blindedElement)` — the OPRF-mode
@@ -592,8 +647,12 @@ pub fn blind(comptime mode: Mode, input: []const u8, blind_scalar: [Ns]u8) Blind
 /// never anything a client can induce. Reporting it would mean branching on
 /// `skS`. `deriveKeyPair` is what guarantees `skS != 0`, by the RFC's own
 /// rejection loop (§3.2.1).
-pub fn blindEvaluate(sk: [Ns]u8, blinded_element: Element) Element {
-    return .{ .p = ct25519.mulRistretto(blinded_element.p, sk) };
+pub fn blindEvaluate(sk: *const [Ns]u8, blinded_element: Element) Element {
+    return burn.run(burn.mul_burn, Element, blindEvaluateBody, .{ sk, blinded_element });
+}
+
+fn blindEvaluateBody(sk: *const [Ns]u8, blinded_element: Element) Element {
+    return .{ .p = ct25519.mulRistretto(blinded_element.p, sk.*) };
 }
 
 pub const FinalizeError = error{InvalidBlind};
@@ -601,9 +660,16 @@ pub const FinalizeError = error{InvalidBlind};
 /// RFC 9497 §3.3.1 `Finalize(input, blind, evaluatedElement)` — the
 /// OPRF-mode client output (no proof; use `finalizeVerifiable` for
 /// VOPRF): unblind with `blind^-1`, then the "Finalize" hash.
-pub fn finalize(input: []const u8, blind_scalar: [Ns]u8, evaluated_element: Element) FinalizeError![Nh]u8 {
-    const unblinded = try unblind(blind_scalar, evaluated_element);
-    return finalizeHash(input, null, unblinded);
+///
+/// The output goes through `out` (written only on success); `blind_scalar`
+/// is read by pointer. Stack burned before return.
+pub fn finalize(input: []const u8, blind_scalar: *const [Ns]u8, evaluated_element: Element, out: *[Nh]u8) FinalizeError!void {
+    return burn.run(burn.mul_burn, FinalizeError!void, finalizeBody, .{ input, blind_scalar, evaluated_element, out });
+}
+
+fn finalizeBody(input: []const u8, blind_scalar: *const [Ns]u8, evaluated_element: Element, out: *[Nh]u8) FinalizeError!void {
+    const unblinded = try unblind(blind_scalar.*, evaluated_element);
+    out.* = finalizeHash(input, null, unblinded);
 }
 
 pub const EvaluateError = error{InvalidInput}; // see blindEvaluate re: the dropped InvalidSecretKey
@@ -612,10 +678,19 @@ pub const EvaluateError = error{InvalidInput}; // see blindEvaluate re: the drop
 /// PRF, computable by anyone holding both `skS` and `input`. Used by
 /// the OPRF (`mode = .oprf`) and VOPRF (`mode = .voprf`) modes; the
 /// KATs assert it agrees with the blinded protocol round trip.
-pub fn evaluate(comptime mode: Mode, sk: [Ns]u8, input: []const u8) EvaluateError![Nh]u8 {
-    const input_element = try hashToGroup(mode, input);
-    const evaluated = ct25519.mulRistretto(input_element.p, sk); // SECRET sk
-    return finalizeHash(input, null, evaluated.toBytes());
+/// Output through `out` (written only on success), `sk` by pointer.
+pub fn evaluate(comptime mode: Mode, sk: *const [Ns]u8, input: []const u8, out: *[Nh]u8) EvaluateError!void {
+    return burn.run(burn.mul_burn, EvaluateError!void, EvaluateBody(mode).f, .{ sk, input, out });
+}
+
+fn EvaluateBody(comptime mode: Mode) type {
+    return struct {
+        fn f(sk: *const [Ns]u8, input: []const u8, out: *[Nh]u8) EvaluateError!void {
+            const input_element = try hashToGroup(mode, input);
+            const evaluated = ct25519.mulRistretto(input_element.p, sk.*); // SECRET sk
+            out.* = finalizeHash(input, null, evaluated.toBytes());
+        }
+    };
 }
 
 // ── VOPRF mode (RFC 9497 §3.3.2) ─────────────────────────────────────────
@@ -645,10 +720,10 @@ pub const VerifiableEvaluation = struct {
 /// is the proof randomness (`ProofRandomScalar` in the KATs) — MUST be
 /// fresh and uniformly random per call in production.
 pub fn blindEvaluateVerifiable(
-    sk: [Ns]u8,
+    sk: *const [Ns]u8,
     pk: Element,
     blinded_element: Element,
-    proof_r: [Ns]u8,
+    proof_r: *const [Ns]u8,
 ) BlindEvaluateVerifiableError!VerifiableEvaluation {
     var evaluated: [1]Element = undefined;
     const proof = try blindEvaluateVerifiableBatch(sk, pk, &.{blinded_element}, &evaluated, proof_r);
@@ -659,18 +734,28 @@ pub fn blindEvaluateVerifiable(
 /// into `evaluated_out` (same length, caller-allocated) and returns ONE
 /// constant-size DLEQ proof covering the whole batch.
 pub fn blindEvaluateVerifiableBatch(
-    sk: [Ns]u8,
+    sk: *const [Ns]u8,
     pk: Element,
     blinded: []const Element,
     evaluated_out: []Element,
-    proof_r: [Ns]u8,
+    proof_r: *const [Ns]u8,
+) BlindEvaluateVerifiableError!Proof {
+    return burn.run(burn.proof_burn, BlindEvaluateVerifiableError!Proof, blindEvaluateVerifiableBatchBody, .{ sk, pk, blinded, evaluated_out, proof_r });
+}
+
+fn blindEvaluateVerifiableBatchBody(
+    sk: *const [Ns]u8,
+    pk: Element,
+    blinded: []const Element,
+    evaluated_out: []Element,
+    proof_r: *const [Ns]u8,
 ) BlindEvaluateVerifiableError!Proof {
     if (blinded.len == 0) return error.EmptyBatch;
     if (evaluated_out.len != blinded.len) return error.MismatchedLengths;
     for (blinded, evaluated_out) |blinded_element, *out| {
-        out.* = blindEvaluate(sk, blinded_element);
+        out.* = blindEvaluateBody(sk, blinded_element);
     }
-    return generateProof(.voprf, sk, Element.generator, pk, blinded, evaluated_out, proof_r);
+    return generateProofImpl(.voprf, sk.*, Element.generator, pk, blinded, evaluated_out, proof_r.*);
 }
 
 pub const FinalizeVerifiableError = error{ InvalidBlind, InvalidProof };
@@ -684,14 +769,27 @@ pub const FinalizeVerifiableError = error{ InvalidBlind, InvalidProof };
 /// proof)` once, then `finalize` per element.
 pub fn finalizeVerifiable(
     input: []const u8,
-    blind_scalar: [Ns]u8,
+    blind_scalar: *const [Ns]u8,
     evaluated_element: Element,
     blinded_element: Element,
     pk: Element,
     proof: Proof,
-) FinalizeVerifiableError![Nh]u8 {
+    out: *[Nh]u8,
+) FinalizeVerifiableError!void {
+    return burn.run(burn.proof_burn, FinalizeVerifiableError!void, finalizeVerifiableBody, .{ input, blind_scalar, evaluated_element, blinded_element, pk, proof, out });
+}
+
+fn finalizeVerifiableBody(
+    input: []const u8,
+    blind_scalar: *const [Ns]u8,
+    evaluated_element: Element,
+    blinded_element: Element,
+    pk: Element,
+    proof: Proof,
+    out: *[Nh]u8,
+) FinalizeVerifiableError!void {
     try verifyProof(.voprf, Element.generator, pk, &.{blinded_element}, &.{evaluated_element}, proof);
-    return finalize(input, blind_scalar, evaluated_element);
+    try finalizeBody(input, blind_scalar, evaluated_element, out);
 }
 
 // ── POPRF mode (RFC 9497 §3.3.3) ─────────────────────────────────────────
@@ -719,13 +817,22 @@ pub fn blindPoprf(
     input: []const u8,
     info: []const u8,
     pk: Element,
-    blind_scalar: [Ns]u8,
+    blind_scalar: *const [Ns]u8,
+) BlindError!PoprfBlindResult {
+    return burn.run(burn.mul_burn, BlindError!PoprfBlindResult, blindPoprfBody, .{ input, info, pk, blind_scalar });
+}
+
+fn blindPoprfBody(
+    input: []const u8,
+    info: []const u8,
+    pk: Element,
+    blind_scalar: *const [Ns]u8,
 ) BlindError!PoprfBlindResult {
     const m = poprfInfoScalar(info);
     const t_point = Ristretto255.basePoint.mul(m) catch return error.InvalidInput;
     const tweaked = t_point.add(pk.p);
     tweaked.rejectIdentity() catch return error.InvalidInput;
-    const blinded = try blind(.poprf, input, blind_scalar);
+    const blinded = try BlindBody(.poprf).f(input, blind_scalar);
     return .{ .blinded_element = blinded, .tweaked_key = .{ .p = tweaked } };
 }
 
@@ -753,16 +860,26 @@ pub const PoprfEvaluateError = error{
 /// composite lists are SWAPPED relative to VOPRF, per the RFC (the
 /// proven relation is `t * evaluated[i] == blinded[i]`).
 pub fn blindEvaluatePoprfBatch(
-    sk: [Ns]u8,
+    sk: *const [Ns]u8,
     blinded: []const Element,
     info: []const u8,
     evaluated_out: []Element,
-    proof_r: [Ns]u8,
+    proof_r: *const [Ns]u8,
+) PoprfEvaluateError!Proof {
+    return burn.run(burn.proof_burn, PoprfEvaluateError!Proof, blindEvaluatePoprfBatchBody, .{ sk, blinded, info, evaluated_out, proof_r });
+}
+
+fn blindEvaluatePoprfBatchBody(
+    sk: *const [Ns]u8,
+    blinded: []const Element,
+    info: []const u8,
+    evaluated_out: []Element,
+    proof_r: *const [Ns]u8,
 ) PoprfEvaluateError!Proof {
     if (blinded.len == 0) return error.EmptyBatch;
     if (evaluated_out.len != blinded.len) return error.MismatchedLengths;
     const m = poprfInfoScalar(info);
-    const t = scalar.add(sk, m);
+    const t = scalar.add(sk.*, m);
     if (std.mem.allEqual(u8, &t, 0)) return error.InverseError;
     const t_inv = scalar.Scalar.fromBytes(t).invert().toBytes();
     for (blinded, evaluated_out) |blinded_element, *out| {
@@ -770,16 +887,16 @@ pub fn blindEvaluatePoprfBatch(
         out.* = .{ .p = ct25519.mulRistretto(blinded_element.p, t_inv) };
     }
     const tweaked = ct25519.mulRistrettoBase(t);
-    return generateProof(.poprf, t, Element.generator, .{ .p = tweaked }, evaluated_out, blinded, proof_r) catch
+    return generateProofImpl(.poprf, t, Element.generator, .{ .p = tweaked }, evaluated_out, blinded, proof_r.*) catch
         return error.ProofGenerationFailed;
 }
 
 /// Single-element §3.3.3 `BlindEvaluate` convenience wrapper.
 pub fn blindEvaluatePoprf(
-    sk: [Ns]u8,
+    sk: *const [Ns]u8,
     blinded_element: Element,
     info: []const u8,
-    proof_r: [Ns]u8,
+    proof_r: *const [Ns]u8,
 ) PoprfEvaluateError!VerifiableEvaluation {
     var evaluated: [1]Element = undefined;
     const proof = try blindEvaluatePoprfBatch(sk, &.{blinded_element}, info, &evaluated, proof_r);
@@ -795,15 +912,29 @@ pub fn blindEvaluatePoprf(
 /// then `finalizePoprfUnverified` per element.
 pub fn finalizePoprf(
     input: []const u8,
-    blind_scalar: [Ns]u8,
+    blind_scalar: *const [Ns]u8,
     evaluated_element: Element,
     blinded_element: Element,
     proof: Proof,
     info: []const u8,
     tweaked_key: Element,
-) FinalizeVerifiableError![Nh]u8 {
+    out: *[Nh]u8,
+) FinalizeVerifiableError!void {
+    return burn.run(burn.proof_burn, FinalizeVerifiableError!void, finalizePoprfBody, .{ input, blind_scalar, evaluated_element, blinded_element, proof, info, tweaked_key, out });
+}
+
+fn finalizePoprfBody(
+    input: []const u8,
+    blind_scalar: *const [Ns]u8,
+    evaluated_element: Element,
+    blinded_element: Element,
+    proof: Proof,
+    info: []const u8,
+    tweaked_key: Element,
+    out: *[Nh]u8,
+) FinalizeVerifiableError!void {
     try verifyProof(.poprf, Element.generator, tweaked_key, &.{evaluated_element}, &.{blinded_element}, proof);
-    return finalizePoprfUnverified(input, blind_scalar, evaluated_element, info);
+    try finalizePoprfUnverifiedBody(input, blind_scalar, evaluated_element, info, out);
 }
 
 /// The unblind+hash tail of POPRF Finalize, WITHOUT proof verification —
@@ -811,12 +942,23 @@ pub fn finalizePoprf(
 /// batch. Never skip verification on untrusted server output.
 pub fn finalizePoprfUnverified(
     input: []const u8,
-    blind_scalar: [Ns]u8,
+    blind_scalar: *const [Ns]u8,
     evaluated_element: Element,
     info: []const u8,
-) FinalizeError![Nh]u8 {
-    const unblinded = try unblind(blind_scalar, evaluated_element);
-    return finalizeHash(input, info, unblinded);
+    out: *[Nh]u8,
+) FinalizeError!void {
+    return burn.run(burn.mul_burn, FinalizeError!void, finalizePoprfUnverifiedBody, .{ input, blind_scalar, evaluated_element, info, out });
+}
+
+fn finalizePoprfUnverifiedBody(
+    input: []const u8,
+    blind_scalar: *const [Ns]u8,
+    evaluated_element: Element,
+    info: []const u8,
+    out: *[Nh]u8,
+) FinalizeError!void {
+    const unblinded = try unblind(blind_scalar.*, evaluated_element);
+    out.* = finalizeHash(input, info, unblinded);
 }
 
 pub const PoprfDirectEvaluateError = error{ InvalidInput, InverseError }; // see blindEvaluate re: the dropped InvalidSecretKey
@@ -824,14 +966,18 @@ pub const PoprfDirectEvaluateError = error{ InvalidInput, InverseError }; // see
 /// RFC 9497 §3.3.3 `Evaluate(skS, input, info)` — the direct
 /// (non-oblivious) POPRF, computable by anyone holding `skS`, `input`,
 /// and `info`. The KATs assert it agrees with the blinded round trip.
-pub fn evaluatePoprf(sk: [Ns]u8, input: []const u8, info: []const u8) PoprfDirectEvaluateError![Nh]u8 {
+pub fn evaluatePoprf(sk: *const [Ns]u8, input: []const u8, info: []const u8, out: *[Nh]u8) PoprfDirectEvaluateError!void {
+    return burn.run(burn.mul_burn, PoprfDirectEvaluateError!void, evaluatePoprfBody, .{ sk, input, info, out });
+}
+
+fn evaluatePoprfBody(sk: *const [Ns]u8, input: []const u8, info: []const u8, out: *[Nh]u8) PoprfDirectEvaluateError!void {
     const input_element = try hashToGroup(.poprf, input);
     const m = poprfInfoScalar(info);
-    const t = scalar.add(sk, m);
+    const t = scalar.add(sk.*, m);
     if (std.mem.allEqual(u8, &t, 0)) return error.InverseError;
     const t_inv = scalar.Scalar.fromBytes(t).invert().toBytes();
     const evaluated = ct25519.mulRistretto(input_element.p, t_inv); // SECRET t_inv
-    return finalizeHash(input, info, evaluated.toBytes());
+    out.* = finalizeHash(input, info, evaluated.toBytes());
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -839,6 +985,7 @@ pub fn evaluatePoprf(sk: [Ns]u8, input: []const u8, info: []const u8) PoprfDirec
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "wire sizes match RFC 9497 §4.1" {
@@ -883,7 +1030,7 @@ test "blind REPORTS NOTHING about a zero blind (constant-time, ct25519)" {
     // error.InvalidBlind` — an error whose presence is decided by the
     // client's SECRET blind. Now the product is simply the identity.
     const zero_blind = [_]u8{0} ** Ns;
-    const blinded = try blind(.oprf, "ct regression", zero_blind);
+    const blinded = try shim.blind(.oprf, "ct regression", zero_blind);
     try std.testing.expectEqualSlices(u8, &[_]u8{0} ** Ne, &blinded.toBytes());
     // And the same input under std's own multiply really does error —
     // pinning that this is a behaviour change, not a tautology.
@@ -891,12 +1038,14 @@ test "blind REPORTS NOTHING about a zero blind (constant-time, ct25519)" {
     try std.testing.expectError(error.IdentityElement, p.p.mul(zero_blind));
 }
 
+const shim = @import("test_shim.zig");
+
 test "blindEvaluate REPORTS NOTHING about a degenerate skS (constant-time)" {
     // Old shape: `blinded_element.p.mul(sk) catch return
     // error.InvalidSecretKey`. `deriveKeyPair` guarantees skS != 0, so this
     // path was unreachable in the protocol and existed only to leak.
-    const blinded = try blind(.oprf, "ct regression", scalarFromWideBytes([_]u8{0x5a} ** 64));
-    const evaluated = blindEvaluate([_]u8{0} ** Ns, blinded);
+    const blinded = try shim.blind(.oprf, "ct regression", shim.scalarFromWideBytes([_]u8{0x5a} ** 64));
+    const evaluated = shim.blindEvaluate([_]u8{0} ** Ns, blinded);
     try std.testing.expectEqualSlices(u8, &[_]u8{0} ** Ne, &evaluated.toBytes());
 }
 
@@ -925,9 +1074,9 @@ fn plusOrder(s: [Ns]u8) [Ns]u8 {
 }
 
 test "verifyProof refuses s + L (malleability) and a C/D length mismatch" {
-    const kp = try deriveKeyPair(.voprf, [_]u8{0x2b} ** 32, "verifyProof refusals");
-    const blinded = try blind(.voprf, "input", scalarFromWideBytes([_]u8{0x22} ** 64));
-    const ev = try blindEvaluateVerifiable(kp.sk, kp.pk, blinded, scalarFromWideBytes([_]u8{0x33} ** 64));
+    const kp = try shim.deriveKeyPair(.voprf, [_]u8{0x2b} ** 32, "verifyProof refusals");
+    const blinded = try shim.blind(.voprf, "input", shim.scalarFromWideBytes([_]u8{0x22} ** 64));
+    const ev = try shim.blindEvaluateVerifiable(kp.sk, kp.pk, blinded, shim.scalarFromWideBytes([_]u8{0x33} ** 64));
     try verifyProof(.voprf, Element.generator, kp.pk, &.{blinded}, &.{ev.evaluated_element}, ev.proof);
 
     // `s + L` multiplies every point exactly as `s` does, so only the
@@ -940,24 +1089,24 @@ test "verifyProof refuses s + L (malleability) and a C/D length mismatch" {
 }
 
 test "finalize refuses a non-canonical blind (blind + L)" {
-    const kp = try deriveKeyPair(.oprf, [_]u8{0x7e} ** 32, "non-canonical blind");
-    const b = scalarFromWideBytes([_]u8{0x11} ** 64);
-    const evaluated = blindEvaluate(kp.sk, try blind(.oprf, "input", b));
-    _ = try finalize("input", b, evaluated);
-    try std.testing.expectError(error.InvalidBlind, finalize("input", plusOrder(b), evaluated));
+    const kp = try shim.deriveKeyPair(.oprf, [_]u8{0x7e} ** 32, "non-canonical blind");
+    const b = shim.scalarFromWideBytes([_]u8{0x11} ** 64);
+    const evaluated = shim.blindEvaluate(kp.sk, try shim.blind(.oprf, "input", b));
+    _ = try shim.finalize("input", b, evaluated);
+    try std.testing.expectError(error.InvalidBlind, shim.finalize("input", plusOrder(b), evaluated));
 }
 
 test "POPRF: skS == -m is InverseError, and pkS == -m*G is a refused tweaked key" {
     const info = "inverse";
     const sk = scalar.neg(poprfInfoScalar(info));
-    const b = scalarFromWideBytes([_]u8{0x44} ** 64);
-    const blinded = try blind(.poprf, "input", b);
+    const b = shim.scalarFromWideBytes([_]u8{0x44} ** 64);
+    const blinded = try shim.blind(.poprf, "input", b);
     var out: [1]Element = undefined;
-    try std.testing.expectError(error.InverseError, blindEvaluatePoprfBatch(sk, &.{blinded}, info, &out, b));
-    try std.testing.expectError(error.InverseError, evaluatePoprf(sk, "input", info));
+    try std.testing.expectError(error.InverseError, shim.blindEvaluatePoprfBatch(sk, &.{blinded}, info, &out, b));
+    try std.testing.expectError(error.InverseError, shim.evaluatePoprf(sk, "input", info));
 
     const pk: Element = .{ .p = ct25519.mulRistrettoBase(sk) };
-    try std.testing.expectError(error.InvalidInput, blindPoprf("input", info, pk, b));
+    try std.testing.expectError(error.InvalidInput, shim.blindPoprf("input", info, pk, b));
 }
 
 // ── fuzz: Element.fromBytes / Proof.fromBytes never panic ─────────────────

@@ -291,7 +291,7 @@ test "README 'post-handshake transport' snippet, verbatim, with real types (F9 2
 // as a mismatched frame.
 fn bolt8SendSequence(comptime S: type, comptime n_msgs: usize, out_frames: *[n_msgs][18 + 5 + 16]u8) !void {
     var cipher: S.CipherState = .{};
-    cipher.initializeKey(kv.msg_test_sk.*);
+    cipher.initializeKey(kv.msg_test_sk);
     var chain: [32]u8 = kv.msg_test_ck.*;
 
     for (0..n_msgs) |i| {

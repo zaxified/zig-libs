@@ -75,14 +75,41 @@ fn psks(a: std.mem.Allocator, v: ?std.json.Value) ![]const [32]u8 {
     return out;
 }
 
+/// `Keys` with the private key pairs by value, for the tests (a copy of a test
+/// key in a test frame proves nothing); `mk` turns them into the pointers the
+/// library takes.
+fn TestKeys(comptime S: type) type {
+    return struct {
+        s: ?S.KeyPair = null,
+        e: ?S.KeyPair = null,
+        rs: ?[S.DHLEN]u8 = null,
+        re: ?[S.DHLEN]u8 = null,
+        psks: []const [32]u8 = &.{},
+    };
+}
+
+/// The checked `init` in the by-value shape the tests want.
+fn mk(comptime S: type, pattern: patterns.HandshakePattern, initiator: bool, prologue: []const u8, tk: TestKeys(S)) S.HandshakeState.InitError!S.HandshakeState {
+    var hs: S.HandshakeState = .{};
+    const keys: S.HandshakeState.Keys = .{
+        .s = if (tk.s) |*k| k else null,
+        .e = if (tk.e) |*k| k else null,
+        .rs = tk.rs,
+        .re = tk.re,
+        .psks = tk.psks,
+    };
+    try hs.init(pattern, initiator, prologue, &keys);
+    return hs;
+}
+
 fn runVector(comptime S: type, a: std.mem.Allocator, v: std.json.ObjectMap, pattern: patterns.HandshakePattern) !void {
-    var ini = try S.HandshakeState.init(pattern, true, (try hexAlloc(a, v.get("init_prologue"))).?, .{
+    var ini = try mk(S, pattern, true, (try hexAlloc(a, v.get("init_prologue"))).?, .{
         .s = try keyPair(S, a, v.get("init_static")),
         .e = try keyPair(S, a, v.get("init_ephemeral")),
         .rs = try pub32(S, a, v.get("init_remote_static")),
         .psks = try psks(a, v.get("init_psks")),
     });
-    var rsp = try S.HandshakeState.init(pattern, false, (try hexAlloc(a, v.get("resp_prologue"))).?, .{
+    var rsp = try mk(S, pattern, false, (try hexAlloc(a, v.get("resp_prologue"))).?, .{
         .s = try keyPair(S, a, v.get("resp_static")),
         .e = try keyPair(S, a, v.get("resp_ephemeral")),
         .rs = try pub32(S, a, v.get("resp_remote_static")),
@@ -103,17 +130,18 @@ fn runVector(comptime S: type, a: std.mem.Allocator, v: std.json.ObjectMap, patt
         if (i < n_hs) {
             const writer = if (from_initiator) &ini else &rsp;
             const reader = if (from_initiator) &rsp else &ini;
-            const wr = try writer.writeMessage(no_random, payload, &wire);
+            var wt: [2]S.CipherState = undefined;
+            var rt: [2]S.CipherState = undefined;
+            const wr = try writer.writeMessage(no_random, payload, &wire, &wt);
             try testing.expectEqualSlices(u8, ct, wire[0..wr.len]);
-            const rr = try reader.readMessage(ct, &plain);
+            const rr = try reader.readMessage(ct, &plain, &rt);
             try testing.expectEqualSlices(u8, payload, plain[0..rr.len]);
             if (i == n_hs - 1) {
-                const wt = wr.transport.?;
-                const rt = rr.transport.?;
+                try testing.expect(wr.complete and rr.complete);
                 t_ini = if (from_initiator) wt else rt;
                 t_rsp = if (from_initiator) rt else wt;
             } else {
-                try testing.expect(wr.transport == null and rr.transport == null);
+                try testing.expect(!wr.complete and !rr.complete);
             }
         } else {
             const send = if (from_initiator) &t_ini[0] else &t_rsp[1];
@@ -188,24 +216,24 @@ test "init: missing keys, PSK count and invalid patterns are refused before anyt
     const s1 = kp(1);
     const s2 = kp(2);
     // NK: the initiator must know the responder's static (pre-message).
-    try testing.expectError(error.MissingKey, S0.HandshakeState.init(patterns.NK, true, "", .{}));
-    _ = try S0.HandshakeState.init(patterns.NK, true, "", .{ .rs = s2.public_key });
-    try testing.expectError(error.MissingKey, S0.HandshakeState.init(patterns.NK, false, "", .{}));
+    try testing.expectError(error.MissingKey, mk(S0, patterns.NK, true, "", .{}));
+    _ = try mk(S0, patterns.NK, true, "", .{ .rs = s2.public_key });
+    try testing.expectError(error.MissingKey, mk(S0, patterns.NK, false, "", .{}));
     // XX: each side sends its static, so each needs one.
-    try testing.expectError(error.MissingKey, S0.HandshakeState.init(patterns.XX, true, "", .{}));
-    try testing.expectError(error.MissingKey, S0.HandshakeState.init(patterns.XX, false, "", .{}));
-    _ = try S0.HandshakeState.init(patterns.XX, false, "", .{ .s = s1 });
+    try testing.expectError(error.MissingKey, mk(S0, patterns.XX, true, "", .{}));
+    try testing.expectError(error.MissingKey, mk(S0, patterns.XX, false, "", .{}));
+    _ = try mk(S0, patterns.XX, false, "", .{ .s = s1 });
     // KN: the responder must know the initiator's static in advance.
-    try testing.expectError(error.MissingKey, S0.HandshakeState.init(patterns.KN, false, "", .{}));
-    _ = try S0.HandshakeState.init(patterns.KN, false, "", .{ .rs = s1.public_key });
+    try testing.expectError(error.MissingKey, mk(S0, patterns.KN, false, "", .{}));
+    _ = try mk(S0, patterns.KN, false, "", .{ .rs = s1.public_key });
     // NN with no key at all is fine; a responder's static is needed for `es`
     // in NK only on the responder side.
-    _ = try S0.HandshakeState.init(patterns.NN, true, "", .{});
+    _ = try mk(S0, patterns.NN, true, "", .{});
     // PSKs: exactly one per token.
     const xx3 = patterns.withPsk(patterns.XX, &.{3});
-    try testing.expectError(error.PskCountMismatch, S0.HandshakeState.init(xx3, true, "", .{ .s = s1 }));
-    try testing.expectError(error.PskCountMismatch, S0.HandshakeState.init(patterns.XX, true, "", .{ .s = s1, .psks = &.{[_]u8{0} ** 32} }));
-    _ = try S0.HandshakeState.init(xx3, true, "", .{ .s = s1, .psks = &.{[_]u8{0} ** 32} });
+    try testing.expectError(error.PskCountMismatch, mk(S0, xx3, true, "", .{ .s = s1 }));
+    try testing.expectError(error.PskCountMismatch, mk(S0, patterns.XX, true, "", .{ .s = s1, .psks = &.{[_]u8{0} ** 32} }));
+    _ = try mk(S0, xx3, true, "", .{ .s = s1, .psks = &.{[_]u8{0} ** 32} });
     // Invalid patterns (§7.3): a DH before its keys, a key sent twice, an
     // empty pattern, a DH token in a pre-message.
     const bad = [_]patterns.HandshakePattern{
@@ -219,7 +247,7 @@ test "init: missing keys, PSK count and invalid patterns are refused before anyt
         .{ .name = "X" ** 120, .message_patterns = &.{&.{.e}} },
     };
     for (bad) |p| {
-        try testing.expectError(error.InvalidPattern, S0.HandshakeState.init(p, true, "", .{ .s = s1, .rs = s2.public_key }));
+        try testing.expectError(error.InvalidPattern, mk(S0, p, true, "", .{ .s = s1, .rs = s2.public_key }));
     }
 }
 
@@ -243,9 +271,9 @@ test "a primitive declaring noise_name joins a suite; the name reaches the trans
     const Other = state.Suite(NamedDh("448"), chachapoly.ChaCha20Poly1305, sha2.Sha256);
     try testing.expectEqualStrings("_25519_ChaChaPoly_SHA256", Alias.name_suffix);
     try testing.expectEqualStrings("_448_ChaChaPoly_SHA256", Other.name_suffix);
-    const a = try Alias.HandshakeState.init(patterns.NN, true, "p", .{});
-    const b = try S0.HandshakeState.init(patterns.NN, true, "p", .{});
-    const c = try Other.HandshakeState.init(patterns.NN, true, "p", .{});
+    const a = try mk(Alias, patterns.NN, true, "p", .{});
+    const b = try mk(S0, patterns.NN, true, "p", .{});
+    const c = try mk(Other, patterns.NN, true, "p", .{});
     try testing.expectEqualSlices(u8, &b.symmetric_state.h, &a.symmetric_state.h);
     try testing.expect(!std.mem.eql(u8, &b.symmetric_state.h, &c.symmetric_state.h));
     var st: patterns.Storage = .{};
@@ -306,7 +334,7 @@ test "sweep: whatever init accepts runs to an agreed handshake" {
         const give_rs = r.boolean();
         const pre_e_i = std.mem.indexOfScalar(Token, p.pre_message_initiator, .e) != null;
         const pre_e_r = std.mem.indexOfScalar(Token, p.pre_message_responder, .e) != null;
-        var ini = S0.HandshakeState.init(p, true, "x", .{
+        var ini = mk(S0, p, true, "x", .{
             .s = if (give_is) i_s else null,
             .e = if (pre_e_i) i_e else null,
             .rs = if (give_rs) r_s.public_key else null,
@@ -316,7 +344,7 @@ test "sweep: whatever init accepts runs to an agreed handshake" {
             refused += 1;
             continue;
         };
-        var rsp = S0.HandshakeState.init(p, false, "x", .{
+        var rsp = mk(S0, p, false, "x", .{
             .s = if (give_rs) r_s else null,
             .e = if (pre_e_r) r_e else null,
             .rs = if (give_is) i_s.public_key else null,
@@ -329,19 +357,17 @@ test "sweep: whatever init accepts runs to an agreed handshake" {
         accepted += 1;
         var wire: [512]u8 = undefined;
         var plain: [64]u8 = undefined;
-        var last: ?[2]S0.CipherState = null;
-        var last_r: ?[2]S0.CipherState = null;
+        var last: [2]S0.CipherState = undefined;
+        var last_r: [2]S0.CipherState = undefined;
         for (0..p.message_patterns.len) |m| {
             const w = if (m % 2 == 0) &ini else &rsp;
             const rd = if (m % 2 == 0) &rsp else &ini;
-            const out = try w.writeMessage(prng_r.random(), "hi", &wire);
-            const in = try rd.readMessage(wire[0..out.len], &plain);
+            const out = try w.writeMessage(prng_r.random(), "hi", &wire, &last);
+            const in = try rd.readMessage(wire[0..out.len], &plain, &last_r);
             try testing.expectEqualStrings("hi", plain[0..in.len]);
-            last = out.transport;
-            last_r = in.transport;
         }
         try testing.expectEqualSlices(u8, &ini.symmetric_state.h, &rsp.symmetric_state.h);
-        try testing.expectEqualSlices(u8, &last.?[0].k, &last_r.?[0].k);
+        try testing.expectEqualSlices(u8, &last[0].k, &last_r[0].k);
         if (n_psk > 0) completed_with_psk += 1;
     }
     // Measured 2026-10-04 (see SPEC.md § Verification).
@@ -369,8 +395,9 @@ test "sweep: a damaged handshake message is refused, never a panic" {
             const r = prng.random();
             const psk1 = [_][32]u8{[_]u8{5} ** 32};
             const pk: []const [32]u8 = if (c[1]) &psk1 else &.{};
-            var ini = try S0.HandshakeState.init(p, true, "", .{ .s = i_s, .rs = r_s.public_key, .psks = pk });
-            var rsp = try S0.HandshakeState.init(p, false, "", .{ .s = r_s, .rs = i_s.public_key, .psks = pk });
+            var ini = try mk(S0, p, true, "", .{ .s = i_s, .rs = r_s.public_key, .psks = pk });
+            var rsp = try mk(S0, p, false, "", .{ .s = r_s, .rs = i_s.public_key, .psks = pk });
+            var tp: [2]S0.CipherState = undefined;
             const target = r.uintLessThan(usize, p.message_patterns.len);
             var forked = false;
             for (0..p.message_patterns.len) |m| {
@@ -379,12 +406,12 @@ test "sweep: a damaged handshake message is refused, never a panic" {
                 var wire: [512]u8 = undefined;
                 var plain: [64]u8 = undefined;
                 const keyed = rd.symmetric_state.cipher_state.hasKey() or m > 0 or c[1];
-                const out = try w.writeMessage(r, "payload", &wire);
+                const out = try w.writeMessage(r, "payload", &wire, &tp);
                 var len = out.len;
                 if (forked) {
                     // The transcripts differ since the undetected change:
                     // the first keyed message after it must fail.
-                    if (rd.readMessage(wire[0..len], &plain)) |_| return error.ForkNotCaught else |_| fork_caught += 1;
+                    if (rd.readMessage(wire[0..len], &plain, &tp)) |_| return error.ForkNotCaught else |_| fork_caught += 1;
                     break;
                 }
                 if (m == target) {
@@ -396,7 +423,7 @@ test "sweep: a damaged handshake message is refused, never a panic" {
                             len += 1;
                         },
                     }
-                    if (rd.readMessage(wire[0..len], &plain)) |_| {
+                    if (rd.readMessage(wire[0..len], &plain, &tp)) |_| {
                         // Only an unkeyed first message (NN/XX/NX `-> e`
                         // without PSK) can carry a change undetected — and
                         // then the transcripts have forked: the next keyed
@@ -408,7 +435,7 @@ test "sweep: a damaged handshake message is refused, never a panic" {
                     } else |_| detected += 1;
                     break;
                 }
-                _ = try rd.readMessage(wire[0..len], &plain);
+                _ = try rd.readMessage(wire[0..len], &plain, &tp);
             }
         }
     }
@@ -471,10 +498,10 @@ test "init: a pre-message ephemeral needs the key on both sides" {
     const p: patterns.HandshakePattern = .{ .name = "Pe", .pre_message_initiator = &.{.e}, .message_patterns = &.{&.{ .e, .ee }} };
     // The responder's view: the initiator's pre-message `e` is remote.
     const q: patterns.HandshakePattern = .{ .name = "Qe", .pre_message_initiator = &.{.e}, .message_patterns = &.{ &.{.s}, &.{ .e, .ee } } };
-    try testing.expectError(error.MissingKey, S0.HandshakeState.init(q, true, "", .{ .s = kp(1) }));
-    _ = try S0.HandshakeState.init(q, true, "", .{ .s = kp(1), .e = kp(3) });
-    try testing.expectError(error.MissingKey, S0.HandshakeState.init(q, false, "", .{}));
-    _ = try S0.HandshakeState.init(q, false, "", .{ .re = kp(3).public_key });
+    try testing.expectError(error.MissingKey, mk(S0, q, true, "", .{ .s = kp(1) }));
+    _ = try mk(S0, q, true, "", .{ .s = kp(1), .e = kp(3) });
+    try testing.expectError(error.MissingKey, mk(S0, q, false, "", .{}));
+    _ = try mk(S0, q, false, "", .{ .re = kp(3).public_key });
     // An `e` sent again after a pre-message `e` breaks §7.3.
-    try testing.expectError(error.InvalidPattern, S0.HandshakeState.init(p, true, "", .{ .e = kp(3) }));
+    try testing.expectError(error.InvalidPattern, mk(S0, p, true, "", .{ .e = kp(3) }));
 }
