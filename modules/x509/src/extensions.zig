@@ -48,13 +48,22 @@ pub fn parseElement(bytes: []const u8, index: u32) der.Element.ParseError!der.El
     // byte) to both be valid indices.
     if (idx + 1 >= bytes.len) return error.CertificateFieldHasInvalidLength;
     const size_byte = bytes[idx + 1];
+    // The element's end, computed here in u64 BEFORE std computes it in u32:
+    // std's `slice.end = start + length` overflows (a safety panic, or a
+    // wrapped end that passes the check below in ReleaseFast) for a long-form
+    // length near 2^32 (found by the ocsp fuzz driver, 2026-10-10).
+    var end: u64 = idx + 2 + @as(u64, size_byte);
     if ((size_byte >> 7) != 0) {
         // Long form: `size_byte`'s low 7 bits count the following
         // length-encoding bytes, which std itself will read one at a time.
         const len_size: usize = size_byte & 0x7f;
         if (len_size > @sizeOf(u32)) return error.CertificateFieldHasInvalidLength;
         if (idx + 2 + len_size > bytes.len) return error.CertificateFieldHasInvalidLength;
+        var length: u64 = 0;
+        for (bytes[idx + 2 ..][0..len_size]) |b| length = (length << 8) | b;
+        end = idx + 2 + len_size + length;
     }
+    if (end > bytes.len) return error.CertificateFieldHasInvalidLength;
     const elem = try der.Element.parse(bytes, index);
     if (elem.slice.start > elem.slice.end or elem.slice.end > bytes.len) {
         return error.CertificateFieldHasInvalidLength;
@@ -850,4 +859,24 @@ test "corpus: the extension seeds reach the DER walk, and the counts are pinned"
     try testing.expectEqual(@as(usize, 8), with_extensions);
     try testing.expectEqual(@as(usize, 35), walked);
     try testing.expectEqual(@as(usize, 15), parsed_values);
+}
+
+test "parseElement REJECT: a long-form length that overflows start + length in u32 is an error, not a panic" {
+    // std's `der.Element.parse` computes `slice.end = start + length` in u32;
+    // with a 4-octet length near 2^32 that overflows (safety panic; in
+    // ReleaseFast a wrapped end that passes the bounds check). Found by the
+    // ocsp fuzz driver 2026-10-10 through `ocsp.parseResponse`.
+    const cases = [_][]const u8{
+        &.{ 0x30, 0x84, 0xff, 0xff, 0xff, 0xff, 0x00 },
+        &.{ 0x30, 0x84, 0xff, 0xff, 0xff, 0xfa, 0x00, 0x00 },
+        &.{ 0x00, 0x00, 0x04, 0x84, 0xff, 0xff, 0xff, 0xfc, 0x01 }, // at index 2
+    };
+    for (cases, [_]u32{ 0, 0, 2 }) |bytes, at| {
+        try std.testing.expectError(error.CertificateFieldHasInvalidLength, parseElement(bytes, at));
+    }
+    // A long-form length that fits is still accepted.
+    const ok = [_]u8{ 0x04, 0x81, 0x02, 0xaa, 0xbb };
+    const e = try parseElement(&ok, 0);
+    try std.testing.expectEqual(@as(u32, 3), e.slice.start);
+    try std.testing.expectEqual(@as(u32, 5), e.slice.end);
 }

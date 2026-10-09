@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Fixed (SECURITY, DoS):** `extensions.parseElement` checked that a long-form length's
+  octets were in the buffer but not that `start + length` fits: std's `der.Element.parse` computes that
+  end in u32, so a 4-octet length near 2^32 overflowed — a safety panic (process abort) in safe builds,
+  a wrapped end that passed the bounds check in ReleaseFast. The end is now computed in u64 and
+  bounded before std sees the element. Reached through `ocsp.parseResponse` on an attacker-supplied
+  OCSP response (found by the ocsp deterministic fuzz driver); regression test red without the fix.
+
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** a test and the example build their RSA key through
   rsa's out-param constructors (rsa 2026-10-08).
 - **2026-09-30** — CRL checking wired into `chain.verifyChain`: opt-in `Options.revocation`
