@@ -31,11 +31,12 @@ fn KatPir(comptime v: anytype) type {
 test "DERIVED: query shares are byte-exact against the Python re-derivation" {
     inline for (kat_vectors.all) |v| {
         const P = KatPir(v);
-        const shares = try P.query(v.index, v.seed0, v.seed1);
+        var shares: [2]P.Share = undefined;
+        try P.query(v.index, &v.seed0, &v.seed1, &shares);
         var b0: [P.share_len]u8 = undefined;
         var b1: [P.share_len]u8 = undefined;
-        P.shareToBytes(shares[0], &b0);
-        P.shareToBytes(shares[1], &b1);
+        P.shareToBytes(&shares[0], &b0);
+        P.shareToBytes(&shares[1], &b1);
         try std.testing.expectEqualSlices(u8, v.share0, &b0);
         try std.testing.expectEqualSlices(u8, v.share1, &b1);
     }
@@ -47,14 +48,13 @@ test "DERIVED: server answers are byte-exact, computed from the recorded shares"
         const database = try db_mod.Database.init(v.db, v.record_len);
         try std.testing.expectEqual(v.count, database.count());
         const n_words = comptime P.answerWords(v.record_len);
-        const shares = [2]P.Share{
-            try P.shareFromBytes(v.share0),
-            try P.shareFromBytes(v.share1),
-        };
+        var shares: [2]P.Share = undefined;
+        try P.shareFromBytes(&shares[0], v.share0);
+        try P.shareFromBytes(&shares[1], v.share1);
         var w0: [n_words]P.Word = undefined;
         var w1: [n_words]P.Word = undefined;
-        try P.answer(0, shares[0], database, &w0);
-        try P.answer(1, shares[1], database, &w1);
+        try P.answer(0, &shares[0], database, &w0);
+        try P.answer(1, &shares[1], database, &w1);
         var a0: [n_words * v.word_bytes]u8 = undefined;
         var a1: [n_words * v.word_bytes]u8 = undefined;
         try P.answerToBytes(&w0, &a0);

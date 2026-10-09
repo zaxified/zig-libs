@@ -64,6 +64,7 @@
 //! no crypto of its own, only the state machine around it (see SPEC.md).
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const rsa = @import("rsa");
 const x509 = @import("x509");
 const encoding = @import("encoding.zig");
@@ -231,12 +232,28 @@ pub const ClientCredentials = struct {
     /// for real use (see `rsa.generate`'s doc comment) — a seeded
     /// deterministic generator is acceptable only for tests. Returned
     /// `certificate_der` is `allocator`-owned; free with `deinit`.
+    ///
+    /// The credentials are written through `out` (never returned: a returned
+    /// `ClientCredentials` holds the RSA secret key by value and would sit in
+    /// the caller's result slot, out of reach of the burn). `out` is untouched
+    /// on error.
     pub fn generateSelfSigned(
         allocator: std.mem.Allocator,
         random: std.Random,
         options: GenerateSelfSignedOptions,
-    ) GenerateSelfSignedError!ClientCredentials {
+        out: *ClientCredentials,
+    ) GenerateSelfSignedError!void {
+        return burn.run(burn.rsa_burn, GenerateSelfSignedError!void, generateSelfSignedBody, .{ allocator, random, options, out });
+    }
+
+    fn generateSelfSignedBody(
+        allocator: std.mem.Allocator,
+        random: std.Random,
+        options: GenerateSelfSignedOptions,
+        out: *ClientCredentials,
+    ) GenerateSelfSignedError!void {
         var kp: rsa.KeyPair = undefined;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
         try rsa.generate(&kp, random, options.modulus_bits, options.public_exponent);
 
         var san_buf: [1]rsa.SubjectAltName = undefined;
@@ -252,7 +269,7 @@ pub const ClientCredentials = struct {
             .subject_alt_names = sans,
         });
 
-        return .{
+        out.* = .{
             .certificate_der = certificate_der,
             .private_key = kp.secret_key,
             .public_key = kp.public_key,
@@ -551,6 +568,10 @@ pub fn asymmetricVerify(message: []const u8, signature: []const u8, public_key: 
 ///   output = HMAC(secret, A(1) ‖ seed) ‖ HMAC(secret, A(2) ‖ seed) ‖ …
 /// truncated to `out.len`.
 pub fn pSha256(secret: []const u8, seed: []const u8, out: []u8) void {
+    return burn.run(burn.prim_burn, void, pSha256Body, .{ secret, seed, out });
+}
+
+fn pSha256Body(secret: []const u8, seed: []const u8, out: []u8) void {
     var a: [HmacSha256.mac_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &a);
     HmacSha256.create(&a, seed, secret); // A(1)
@@ -603,6 +624,10 @@ pub fn deriveKeys(client_nonce: []const u8, server_nonce: []const u8, policy: Se
 /// In-place AES-256-CBC encryption. `data.len` must be a multiple of 16
 /// (the caller pads — OPC UA's padding footer, not PKCS#7).
 pub fn aes256CbcEncrypt(key: *const [32]u8, iv: *const [16]u8, data: []u8) void {
+    return burn.run(burn.prim_burn, void, aes256CbcEncryptBody, .{ key, iv, data });
+}
+
+fn aes256CbcEncryptBody(key: *const [32]u8, iv: *const [16]u8, data: []u8) void {
     std.debug.assert(data.len % aes_block_len == 0);
     const ctx = Aes256.initEnc(key.*);
     var prev: [aes_block_len]u8 = iv.*;
@@ -617,6 +642,10 @@ pub fn aes256CbcEncrypt(key: *const [32]u8, iv: *const [16]u8, data: []u8) void 
 
 /// In-place AES-256-CBC decryption (mirror of `aes256CbcEncrypt`).
 pub fn aes256CbcDecrypt(key: *const [32]u8, iv: *const [16]u8, data: []u8) void {
+    return burn.run(burn.prim_burn, void, aes256CbcDecryptBody, .{ key, iv, data });
+}
+
+fn aes256CbcDecryptBody(key: *const [32]u8, iv: *const [16]u8, data: []u8) void {
     std.debug.assert(data.len % aes_block_len == 0);
     const ctx = Aes256.initDec(key.*);
     var prev: [aes_block_len]u8 = iv.*;
@@ -647,7 +676,7 @@ pub fn symmetricSignAndEncrypt(
     msg_code: *const [3]u8,
     unsecured_body: []const u8,
     mode: SecurityMode,
-    keys: ChannelKeys,
+    keys: *const ChannelKeys,
     direction: Direction,
 ) SymmetricSignAndEncryptError![]u8 {
     return symmetricSealChunk(allocator, msg_code, 'F', unsecured_body, mode, keys, direction);
@@ -664,12 +693,24 @@ pub fn symmetricSealChunk(
     chunk_byte: u8,
     unsecured_body: []const u8,
     mode: SecurityMode,
-    keys: ChannelKeys,
+    keys: *const ChannelKeys,
+    direction: Direction,
+) SymmetricSignAndEncryptError![]u8 {
+    return burn.run(burn.chunk_burn, SymmetricSignAndEncryptError![]u8, symmetricSealChunkBody, .{ allocator, msg_code, chunk_byte, unsecured_body, mode, keys, direction });
+}
+
+fn symmetricSealChunkBody(
+    allocator: std.mem.Allocator,
+    msg_code: *const [3]u8,
+    chunk_byte: u8,
+    unsecured_body: []const u8,
+    mode: SecurityMode,
+    keys: *const ChannelKeys,
     direction: Direction,
 ) SymmetricSignAndEncryptError![]u8 {
     std.debug.assert(mode == .sign or mode == .sign_and_encrypt);
     std.debug.assert(unsecured_body.len >= 16); // ChannelId + TokenId + SequenceHeader
-    const dk = directionKeys(&keys, direction);
+    const dk = directionKeys(keys, direction);
 
     // Padding footer only when encrypting; sized so the encrypted region
     // (SequenceHeader.. = everything after body offset 8, message offset 16)
@@ -744,11 +785,22 @@ pub fn symmetricDecryptAndVerify(
     header_bytes: *const [8]u8,
     chunk_body: []const u8,
     mode: SecurityMode,
-    keys: ChannelKeys,
+    keys: *const ChannelKeys,
+    direction: Direction,
+) SymmetricDecryptAndVerifyError![]u8 {
+    return burn.run(burn.chunk_burn, SymmetricDecryptAndVerifyError![]u8, symmetricDecryptAndVerifyBody, .{ allocator, header_bytes, chunk_body, mode, keys, direction });
+}
+
+fn symmetricDecryptAndVerifyBody(
+    allocator: std.mem.Allocator,
+    header_bytes: *const [8]u8,
+    chunk_body: []const u8,
+    mode: SecurityMode,
+    keys: *const ChannelKeys,
     direction: Direction,
 ) SymmetricDecryptAndVerifyError![]u8 {
     std.debug.assert(mode == .sign or mode == .sign_and_encrypt);
-    const dk = directionKeys(&keys, direction);
+    const dk = directionKeys(keys, direction);
 
     // Minimum: ChannelId(4) + TokenId(4) + SequenceHeader(8) + signature.
     if (chunk_body.len < 16 + sym_signature_len) return error.InvalidSecureMessage;
@@ -877,7 +929,19 @@ pub fn sealAsymmetricMessage(
     msg_code: *const [3]u8,
     unsecured_body: []const u8,
     encrypted_region_offset: usize,
-    credentials: ClientCredentials,
+    credentials: *const ClientCredentials,
+    receiver_certificate: []const u8,
+) SealAsymmetricError![]u8 {
+    return burn.run(burn.rsa_burn, SealAsymmetricError![]u8, sealAsymmetricMessageBody, .{ allocator, random, msg_code, unsecured_body, encrypted_region_offset, credentials, receiver_certificate });
+}
+
+fn sealAsymmetricMessageBody(
+    allocator: std.mem.Allocator,
+    random: std.Random,
+    msg_code: *const [3]u8,
+    unsecured_body: []const u8,
+    encrypted_region_offset: usize,
+    credentials: *const ClientCredentials,
     receiver_certificate: []const u8,
 ) SealAsymmetricError![]u8 {
     std.debug.assert(encrypted_region_offset <= unsecured_body.len);
@@ -949,7 +1013,17 @@ pub fn openAsymmetricMessage(
     allocator: std.mem.Allocator,
     header_bytes: *const [8]u8,
     chunk_body: []const u8,
-    private_key: rsa.SecretKey,
+    private_key: *const rsa.SecretKey,
+    sender_certificate: []const u8,
+) OpenAsymmetricError![]u8 {
+    return burn.run(burn.rsa_burn, OpenAsymmetricError![]u8, openAsymmetricMessageBody, .{ allocator, header_bytes, chunk_body, private_key, sender_certificate });
+}
+
+fn openAsymmetricMessageBody(
+    allocator: std.mem.Allocator,
+    header_bytes: *const [8]u8,
+    chunk_body: []const u8,
+    private_key: *const rsa.SecretKey,
     sender_certificate: []const u8,
 ) OpenAsymmetricError![]u8 {
     if (chunk_body.len < 4) return error.InvalidSecureMessage;
@@ -975,7 +1049,7 @@ pub fn openAsymmetricMessage(
     var plen: usize = 8 + enc_offset;
     var i: usize = 0;
     while (i < blocks) : (i += 1) {
-        const m = rsa.decryptOaep(&private_key, Sha1, chunk_body[enc_offset + i * k ..][0..k], "", plain[plen..][0..plain_block]) catch |err| switch (err) {
+        const m = rsa.decryptOaep(private_key, Sha1, chunk_body[enc_offset + i * k ..][0..k], "", plain[plen..][0..plain_block]) catch |err| switch (err) {
             error.BufferTooSmall => unreachable, // chunk is exactly the max message length
             error.DecryptionError => return error.DecryptionError,
         };
@@ -1042,6 +1116,16 @@ pub fn encryptUserTokenSecret(
     receiver_public_key: rsa.PublicKey,
     random: std.Random,
 ) UserTokenSecretError![]u8 {
+    return burn.run(burn.rsa_burn, UserTokenSecretError![]u8, encryptUserTokenSecretBody, .{ allocator, secret, server_nonce, receiver_public_key, random });
+}
+
+fn encryptUserTokenSecretBody(
+    allocator: std.mem.Allocator,
+    secret: []const u8,
+    server_nonce: []const u8,
+    receiver_public_key: rsa.PublicKey,
+    random: std.Random,
+) UserTokenSecretError![]u8 {
     const plain = try allocator.alloc(u8, 4 + secret.len + server_nonce.len);
     defer {
         std.crypto.secureZero(u8, plain);
@@ -1064,10 +1148,19 @@ pub fn encryptUserTokenSecret(
 pub fn decryptUserTokenSecret(
     allocator: std.mem.Allocator,
     ciphertext: []const u8,
-    private_key: rsa.SecretKey,
+    private_key: *const rsa.SecretKey,
     expected_server_nonce: []const u8,
 ) UserTokenSecretError![]u8 {
-    const plain = asymmetricDecrypt(allocator, ciphertext, &private_key) catch |err| switch (err) {
+    return burn.run(burn.rsa_burn, UserTokenSecretError![]u8, decryptUserTokenSecretBody, .{ allocator, ciphertext, private_key, expected_server_nonce });
+}
+
+fn decryptUserTokenSecretBody(
+    allocator: std.mem.Allocator,
+    ciphertext: []const u8,
+    private_key: *const rsa.SecretKey,
+    expected_server_nonce: []const u8,
+) UserTokenSecretError![]u8 {
+    const plain = asymmetricDecrypt(allocator, ciphertext, private_key) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DecryptionError, error.BufferTooSmall => return error.DecryptionError,
     };
@@ -1206,13 +1299,19 @@ test "ClientCredentials.generateSelfSigned" {
     var prng = std.Random.DefaultCsprng.init(std.mem.zeroes([32]u8));
     const random = prng.random();
 
-    var creds = try ClientCredentials.generateSelfSigned(testing.allocator, random, .{
-        .modulus_bits = 512, // small, only to keep this test fast — see the option's own doc comment
-        .common_name = "opcua-security-test",
-        .not_before = "260101000000Z",
-        .not_after = "270101000000Z",
-        .application_uri = "urn:zig-libs:opcua:security-test",
-    });
+    var creds: ClientCredentials = undefined;
+    try ClientCredentials.generateSelfSigned(
+        testing.allocator,
+        random,
+        .{
+            .modulus_bits = 512, // small, only to keep this test fast — see the option's own doc comment
+            .common_name = "opcua-security-test",
+            .not_before = "260101000000Z",
+            .not_after = "270101000000Z",
+            .application_uri = "urn:zig-libs:opcua:security-test",
+        },
+        &creds,
+    );
     defer creds.deinit(testing.allocator);
 
     try testing.expect(creds.certificate_der.len > 0);
@@ -1350,7 +1449,7 @@ test "symmetricSignAndEncrypt -> symmetricDecryptAndVerify round-trip (both mode
             var body_buf: [64]u8 = undefined;
             const body = testChunkBody(&body_buf, "payload-bytes");
 
-            const wire = try symmetricSignAndEncrypt(testing.allocator, "MSG", body, mode, keys, dir);
+            const wire = try symmetricSignAndEncrypt(testing.allocator, "MSG", body, mode, &keys, dir);
             defer testing.allocator.free(wire);
             // Wire shape: header echoes the final size; encrypted region
             // whole AES blocks for SignAndEncrypt.
@@ -1363,13 +1462,13 @@ test "symmetricSignAndEncrypt -> symmetricDecryptAndVerify round-trip (both mode
                 try testing.expectEqual(body.len + 8 + 32, wire.len);
             }
 
-            const recovered = try symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8..], mode, keys, dir);
+            const recovered = try symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8..], mode, &keys, dir);
             defer testing.allocator.free(recovered);
             try testing.expectEqualSlices(u8, body, recovered);
 
             // Cross-direction keys must fail the signature.
             const other: Direction = if (dir == .client_to_server) .server_to_client else .client_to_server;
-            try testing.expectError(error.SignatureVerificationFailed, symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8..], mode, keys, other));
+            try testing.expectError(error.SignatureVerificationFailed, symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8..], mode, &keys, other));
         }
     }
 }
@@ -1378,7 +1477,7 @@ test "symmetricDecryptAndVerify negatives: tampered MAC / body / header, bad pad
     const keys = deriveKeys("client-nonce-0123456789abcdefghi", "server-nonce-0123456789abcdefghi", .basic256sha256);
     var body_buf: [64]u8 = undefined;
     const body = testChunkBody(&body_buf, "payload-bytes");
-    const wire = try symmetricSignAndEncrypt(testing.allocator, "MSG", body, .sign_and_encrypt, keys, .client_to_server);
+    const wire = try symmetricSignAndEncrypt(testing.allocator, "MSG", body, .sign_and_encrypt, &keys, .client_to_server);
     defer testing.allocator.free(wire);
 
     // Tampered ciphertext (flips plaintext bits after decrypt -> MAC fails).
@@ -1386,16 +1485,16 @@ test "symmetricDecryptAndVerify negatives: tampered MAC / body / header, bad pad
         const bad = try testing.allocator.dupe(u8, wire);
         defer testing.allocator.free(bad);
         bad[bad.len - 1] ^= 0x01;
-        try testing.expectError(error.SignatureVerificationFailed, symmetricDecryptAndVerify(testing.allocator, bad[0..8], bad[8..], .sign_and_encrypt, keys, .client_to_server));
+        try testing.expectError(error.SignatureVerificationFailed, symmetricDecryptAndVerify(testing.allocator, bad[0..8], bad[8..], .sign_and_encrypt, &keys, .client_to_server));
     }
     // Tampered (unencrypted) header — the signature covers it.
     {
         var bad_header: [8]u8 = wire[0..8].*;
         bad_header[4] ^= 0x01; // MessageSize
-        try testing.expectError(error.SignatureVerificationFailed, symmetricDecryptAndVerify(testing.allocator, &bad_header, wire[8..], .sign_and_encrypt, keys, .client_to_server));
+        try testing.expectError(error.SignatureVerificationFailed, symmetricDecryptAndVerify(testing.allocator, &bad_header, wire[8..], .sign_and_encrypt, &keys, .client_to_server));
     }
     // Structurally bad: encrypted region not whole AES blocks.
-    try testing.expectError(error.InvalidSecureMessage, symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8 .. wire.len - 1], .sign_and_encrypt, keys, .client_to_server));
+    try testing.expectError(error.InvalidSecureMessage, symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8 .. wire.len - 1], .sign_and_encrypt, &keys, .client_to_server));
 
     // Bad padding with a VALID signature: hand-craft a chunk whose
     // PaddingSize byte points past the message, sign it correctly, encrypt
@@ -1411,7 +1510,7 @@ test "symmetricDecryptAndVerify negatives: tampered MAC / body / header, bad pad
         @memset(raw[24..][0..24], 0xEE); // "padding" bytes + PaddingSize byte, value 0xEE = 238 > message length
         HmacSha256.create(raw[total - 32 ..][0..32], raw[0 .. total - 32], &keys.client_signing_key);
         aes256CbcEncrypt(&keys.client_encrypting_key, &keys.client_iv, raw[16..]);
-        try testing.expectError(error.InvalidSecureMessage, symmetricDecryptAndVerify(testing.allocator, raw[0..8], raw[8..], .sign_and_encrypt, keys, .client_to_server));
+        try testing.expectError(error.InvalidSecureMessage, symmetricDecryptAndVerify(testing.allocator, raw[0..8], raw[8..], .sign_and_encrypt, &keys, .client_to_server));
     }
 }
 
@@ -1419,19 +1518,31 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
     var prng = std.Random.DefaultCsprng.init([_]u8{5} ** 32);
     const random = prng.random();
 
-    var client = try ClientCredentials.generateSelfSigned(testing.allocator, random, .{
-        .modulus_bits = 512,
-        .common_name = "seal-open-client",
-        .not_before = "260101000000Z",
-        .not_after = "270101000000Z",
-    });
+    var client: ClientCredentials = undefined;
+    try ClientCredentials.generateSelfSigned(
+        testing.allocator,
+        random,
+        .{
+            .modulus_bits = 512,
+            .common_name = "seal-open-client",
+            .not_before = "260101000000Z",
+            .not_after = "270101000000Z",
+        },
+        &client,
+    );
     defer client.deinit(testing.allocator);
-    var server = try ClientCredentials.generateSelfSigned(testing.allocator, random, .{
-        .modulus_bits = 768, // deliberately a different size than the client's
-        .common_name = "seal-open-server",
-        .not_before = "260101000000Z",
-        .not_after = "270101000000Z",
-    });
+    var server: ClientCredentials = undefined;
+    try ClientCredentials.generateSelfSigned(
+        testing.allocator,
+        random,
+        .{
+            .modulus_bits = 768, // deliberately a different size than the client's
+            .common_name = "seal-open-server",
+            .not_before = "260101000000Z",
+            .not_after = "270101000000Z",
+        },
+        &server,
+    );
     defer server.deinit(testing.allocator);
 
     // Build a plausible OPN body: ChannelId + real asym header + SequenceHeader + payload.
@@ -1450,7 +1561,7 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
     try body_writer.writer.writeAll("opn-request-payload-bytes");
     const body = body_writer.writer.buffered();
 
-    const wire = try sealAsymmetricMessage(testing.allocator, random, "OPN", body, enc_offset, client, server.certificate_der);
+    const wire = try sealAsymmetricMessage(testing.allocator, random, "OPN", body, enc_offset, &client, server.certificate_der);
     defer testing.allocator.free(wire);
     try testing.expectEqualSlices(u8, "OPN", wire[0..3]);
     try testing.expectEqual(wire.len, std.mem.readInt(u32, wire[4..8], .little));
@@ -1460,7 +1571,7 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
     try testing.expectEqual(@as(usize, 0), (wire.len - 8 - enc_offset) % 96);
 
     // Server side: decrypt with the server key, verify with the client cert.
-    const recovered = try openAsymmetricMessage(testing.allocator, wire[0..8], wire[8..], server.private_key, client.certificate_der);
+    const recovered = try openAsymmetricMessage(testing.allocator, wire[0..8], wire[8..], &server.private_key, client.certificate_der);
     defer testing.allocator.free(recovered);
     try testing.expectEqualSlices(u8, body, recovered);
 
@@ -1469,10 +1580,10 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
         const bad = try testing.allocator.dupe(u8, wire);
         defer testing.allocator.free(bad);
         bad[bad.len - 1] ^= 0x01;
-        try testing.expectError(error.DecryptionError, openAsymmetricMessage(testing.allocator, bad[0..8], bad[8..], server.private_key, client.certificate_der));
+        try testing.expectError(error.DecryptionError, openAsymmetricMessage(testing.allocator, bad[0..8], bad[8..], &server.private_key, client.certificate_der));
     }
     // Wrong sender certificate must fail the signature.
-    try testing.expectError(error.SignatureVerificationFailed, openAsymmetricMessage(testing.allocator, wire[0..8], wire[8..], server.private_key, server.certificate_der));
+    try testing.expectError(error.SignatureVerificationFailed, openAsymmetricMessage(testing.allocator, wire[0..8], wire[8..], &server.private_key, server.certificate_der));
 }
 
 test "deriveKeys KAT: P-SHA256 over two fixed 32-byte nonces (OPC 10000-6 §6.7.5)" {
@@ -1526,10 +1637,10 @@ test "symmetricSealChunk: intermediate ('C') chunks are secured individually" {
     const body = testChunkBody(&body_buf, "chunk-payload");
 
     for ([_]u8{ 'C', 'F' }) |chunk_byte| {
-        const wire = try symmetricSealChunk(testing.allocator, "MSG", chunk_byte, body, .sign_and_encrypt, keys, .server_to_client);
+        const wire = try symmetricSealChunk(testing.allocator, "MSG", chunk_byte, body, .sign_and_encrypt, &keys, .server_to_client);
         defer testing.allocator.free(wire);
         try testing.expectEqual(chunk_byte, wire[3]);
-        const recovered = try symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8..], .sign_and_encrypt, keys, .server_to_client);
+        const recovered = try symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8..], .sign_and_encrypt, &keys, .server_to_client);
         defer testing.allocator.free(recovered);
         try testing.expectEqualSlices(u8, body, recovered);
 
@@ -1540,7 +1651,7 @@ test "symmetricSealChunk: intermediate ('C') chunks are secured individually" {
         forged[3] = if (chunk_byte == 'C') 'F' else 'C';
         try testing.expectError(
             error.SignatureVerificationFailed,
-            symmetricDecryptAndVerify(testing.allocator, &forged, wire[8..], .sign_and_encrypt, keys, .server_to_client),
+            symmetricDecryptAndVerify(testing.allocator, &forged, wire[8..], .sign_and_encrypt, &keys, .server_to_client),
         );
     }
 }
@@ -1560,7 +1671,7 @@ test "symmetric padding: every payload length across two AES-block boundaries ro
     for (0..payload.len + 1) |n| {
         var body_buf: [80]u8 = undefined;
         const body = testChunkBody(&body_buf, payload[0..n]);
-        const wire = try symmetricSignAndEncrypt(testing.allocator, "MSG", body, .sign_and_encrypt, keys, .client_to_server);
+        const wire = try symmetricSignAndEncrypt(testing.allocator, "MSG", body, .sign_and_encrypt, &keys, .client_to_server);
         defer testing.allocator.free(wire);
 
         // The encrypted region (message offset 16 onwards) must be whole
@@ -1572,7 +1683,7 @@ test "symmetric padding: every payload length across two AES-block boundaries ro
         try testing.expect(pad < 16);
         if (pad == 0) zero_padding_seen = true;
 
-        const recovered = try symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8..], .sign_and_encrypt, keys, .client_to_server);
+        const recovered = try symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8..], .sign_and_encrypt, &keys, .client_to_server);
         defer testing.allocator.free(recovered);
         try testing.expectEqualSlices(u8, body, recovered);
     }
@@ -1595,7 +1706,7 @@ test "maxSymmetricPayload: the advertised budget always fits the buffer" {
         defer testing.allocator.free(body);
         _ = testChunkBody(body, payload);
 
-        const wire = try symmetricSignAndEncrypt(testing.allocator, "MSG", body, mode, keys, .server_to_client);
+        const wire = try symmetricSignAndEncrypt(testing.allocator, "MSG", body, mode, &keys, .server_to_client);
         defer testing.allocator.free(wire);
         try testing.expect(wire.len <= capacity);
     }
@@ -1667,7 +1778,7 @@ test "user identity token secret: encrypt -> decrypt, replayed nonce and wrong k
     try testing.expectEqual(@as(usize, 0), blob.len % 64);
     try testing.expect(std.mem.indexOf(u8, blob, password) == null);
 
-    const recovered = try decryptUserTokenSecret(testing.allocator, blob, server_kp.secret_key, server_nonce);
+    const recovered = try decryptUserTokenSecret(testing.allocator, blob, &server_kp.secret_key, server_nonce);
     defer testing.allocator.free(recovered);
     try testing.expectEqualStrings(password, recovered);
 
@@ -1676,34 +1787,40 @@ test "user identity token secret: encrypt -> decrypt, replayed nonce and wrong k
     // session-bound rather than a reusable bearer secret.
     try testing.expectError(
         error.NonceMismatch,
-        decryptUserTokenSecret(testing.allocator, blob, server_kp.secret_key, "server-nonce-DIFFERENT-0123456789"[0..32]),
+        decryptUserTokenSecret(testing.allocator, blob, &server_kp.secret_key, "server-nonce-DIFFERENT-0123456789"[0..32]),
     );
     // Encrypted to us, decrypted with somebody else's key.
     try testing.expectError(
         error.DecryptionError,
-        decryptUserTokenSecret(testing.allocator, blob, other_kp.secret_key, server_nonce),
+        decryptUserTokenSecret(testing.allocator, blob, &other_kp.secret_key, server_nonce),
     );
     // Structurally broken ciphertext.
     try testing.expectError(
         error.DecryptionError,
-        decryptUserTokenSecret(testing.allocator, blob[0 .. blob.len - 1], server_kp.secret_key, server_nonce),
+        decryptUserTokenSecret(testing.allocator, blob[0 .. blob.len - 1], &server_kp.secret_key, server_nonce),
     );
     // An empty password is legal and must round-trip (some servers allow it).
     const empty = try encryptUserTokenSecret(testing.allocator, "", server_nonce, server_kp.public_key, random);
     defer testing.allocator.free(empty);
-    const empty_back = try decryptUserTokenSecret(testing.allocator, empty, server_kp.secret_key, server_nonce);
+    const empty_back = try decryptUserTokenSecret(testing.allocator, empty, &server_kp.secret_key, server_nonce);
     defer testing.allocator.free(empty_back);
     try testing.expectEqual(@as(usize, 0), empty_back.len);
 }
 
 test "certificateValidity: notBefore/notAfter come back out of a certificate we built" {
     var prng = std.Random.DefaultCsprng.init([_]u8{0x33} ** 32);
-    var creds = try ClientCredentials.generateSelfSigned(testing.allocator, prng.random(), .{
-        .modulus_bits = 512,
-        .common_name = "validity-test",
-        .not_before = "260101000000Z", // 2026-01-01T00:00:00Z
-        .not_after = "270101000000Z", // 2027-01-01T00:00:00Z
-    });
+    var creds: ClientCredentials = undefined;
+    try ClientCredentials.generateSelfSigned(
+        testing.allocator,
+        prng.random(),
+        .{
+            .modulus_bits = 512,
+            .common_name = "validity-test",
+            .not_before = "260101000000Z", // 2026-01-01T00:00:00Z
+            .not_after = "270101000000Z", // 2027-01-01T00:00:00Z
+        },
+        &creds,
+    );
     defer creds.deinit(testing.allocator);
 
     const v = try certificateValidity(creds.certificate_der);
@@ -1739,13 +1856,19 @@ test "hostile certificates: truncation, tampering and garbage are typed errors, 
     // server the certificate is entirely attacker-supplied — so the two
     // parsing helpers must be *total*. This is the test that keeps them so.
     var prng = std.Random.DefaultCsprng.init([_]u8{0x5A} ** 32);
-    var creds = try ClientCredentials.generateSelfSigned(testing.allocator, prng.random(), .{
-        .modulus_bits = 512,
-        .common_name = "hostile-cert-test",
-        .not_before = "260101000000Z",
-        .not_after = "270101000000Z",
-        .application_uri = "urn:zig-libs:opcua:hostile-test",
-    });
+    var creds: ClientCredentials = undefined;
+    try ClientCredentials.generateSelfSigned(
+        testing.allocator,
+        prng.random(),
+        .{
+            .modulus_bits = 512,
+            .common_name = "hostile-cert-test",
+            .not_before = "260101000000Z",
+            .not_after = "270101000000Z",
+            .application_uri = "urn:zig-libs:opcua:hostile-test",
+        },
+        &creds,
+    );
     defer creds.deinit(testing.allocator);
     // The genuine article still works — this test must not be vacuous.
     _ = try certificatePublicKey(creds.certificate_der);
@@ -1848,7 +1971,7 @@ fn buildCertificateCorpus(
 
 /// The credentials both the harness and its guard build their corpus from.
 /// Deterministic PRNG, 512-bit modulus: this is a fixture, not a key.
-fn certificateCorpusCredentials(allocator: std.mem.Allocator) !ClientCredentials {
+fn certificateCorpusCredentials(allocator: std.mem.Allocator, out: *ClientCredentials) !void {
     var prng = std.Random.DefaultCsprng.init([_]u8{0x5A} ** 32);
     return ClientCredentials.generateSelfSigned(allocator, prng.random(), .{
         .modulus_bits = 512,
@@ -1856,7 +1979,7 @@ fn certificateCorpusCredentials(allocator: std.mem.Allocator) !ClientCredentials
         .not_before = "260101000000Z",
         .not_after = "270101000000Z",
         .application_uri = "urn:zig-libs:opcua:fuzz-corpus",
-    });
+    }, out);
 }
 
 test "fuzz: arbitrary bytes through the certificate parsers" {
@@ -1865,7 +1988,8 @@ test "fuzz: arbitrary bytes through the certificate parsers" {
     // was the last unjudged target in the tree, and it carried exactly the
     // defect the gate names in its named-function neighbours. Named, so the
     // gate can see it.
-    var creds = try certificateCorpusCredentials(testing.allocator);
+    var creds: ClientCredentials = undefined;
+    try certificateCorpusCredentials(testing.allocator, &creds);
     defer creds.deinit(testing.allocator);
     var stores: [2][4 + certificate_fuzz_buf_len]u8 = undefined;
     var slots: [2 + static_certificate_seeds.len][]const u8 = undefined;
@@ -1898,7 +2022,8 @@ test "corpus: every certificate seed reaches the parsers, and the counts are pin
     // count of OPN bodies the header scanner accepted, and the empty input can
     // never produce one (it returns null below four octets), so `viewed` is
     // about reach rather than about legality.
-    var creds = try certificateCorpusCredentials(testing.allocator);
+    var creds: ClientCredentials = undefined;
+    try certificateCorpusCredentials(testing.allocator, &creds);
     defer creds.deinit(testing.allocator);
     var stores: [2][4 + certificate_fuzz_buf_len]u8 = undefined;
     var slots: [2 + static_certificate_seeds.len][]const u8 = undefined;

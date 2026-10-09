@@ -113,6 +113,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const entropy = @import("entropy");
 const params = @import("params.zig");
+const burn = @import("burn.zig");
 const ring = @import("ring.zig");
 const encode = @import("encode.zig");
 const gate = @import("gate.zig");
@@ -700,28 +701,35 @@ pub fn Bfv(comptime P: params.Params) type {
         /// out of the consumer's binary, decrypts every ciphertext ever
         /// produced under that key. See `keyGenForTest` for the reproducible
         /// twin the KATs use.
-        pub fn keyGen(self: *const Self, io: std.Io) KeyPair {
+        ///
+        /// The pair is written through `out`, never returned: a returned
+        /// `KeyPair` sits in the caller's result slot, out of reach of the burn.
+        pub fn keyGen(self: *const Self, io: std.Io, out: *KeyPair) void {
+            return burn.run(burn.rings(Ring, 16), void, keyGenBody, .{ self, io, out });
+        }
+
+        fn keyGenBody(self: *const Self, io: std.Io, out: *KeyPair) void {
             var src: entropy.SecureSource = .{ .io = io };
-            return self.keyGenInner(src.interface());
+            self.keyGenInner(src.interface(), out);
         }
 
         /// The key generation itself. PRIVATE, and private is load-bearing:
         /// see the `Test-only guards and where they may sit` note above.
-        fn keyGenInner(self: *const Self, random: std.Random) KeyPair {
+        fn keyGenInner(self: *const Self, random: std.Random, out: *KeyPair) void {
             const s = self.sampleTernary(random);
             const a = self.sampleUniform(random);
             const e = self.sampleTernary(random);
             var p0 = a.mul(&s, &self.engines); // a·s
             p0.addAssign(&e, &self.primes); // a·s + e
             p0.negate(&self.primes); // −(a·s + e)
-            return .{ .sk = .{ .s = s }, .pk = .{ .p0 = p0, .p1 = a } };
+            out.* = .{ .sk = .{ .s = s }, .pk = .{ .p0 = p0, .p1 = a } };
         }
 
         /// TEST/KAT ONLY — `keyGen` with caller-chosen draws, so the KATs can
         /// script the exact word sequence `s`, `a` and `e` are sampled from.
         /// A `std.Random` here may be `DefaultPrng.init(0)`, which as a *key*
         /// source is equivalent to publishing the key.
-        pub fn keyGenForTest(self: *const Self, random: std.Random) KeyPair {
+        pub fn keyGenForTest(self: *const Self, random: std.Random, out: *KeyPair) void {
             // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
             // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
             // becomes key material, so production must not be able to reach this
@@ -730,7 +738,7 @@ pub fn Bfv(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            return self.keyGenInner(random);
+            return burn.run(burn.rings(Ring, 16), void, keyGenInner, .{ self, random, out });
         }
 
         /// Encrypt `pt ∈ R_t`: `c0 = Δ·m + p0·u + e0`, `c1 = p1·u + e1`,
@@ -783,6 +791,10 @@ pub fn Bfv(comptime P: params.Params) type {
         /// `⌊(2·t·v + q)/(2q)⌋ mod t`. Handles `len ∈ {2,3}` (a 3-component
         /// ciphertext — post-multiply — needs the `c2·s²` term).
         pub fn decrypt(self: *const Self, sk: *const SecretKey, ct: *const Ciphertext) Plaintext {
+            return burn.run(burn.rings(Ring, 16), Plaintext, decryptBody, .{ self, sk, ct });
+        }
+
+        fn decryptBody(self: *const Self, sk: *const SecretKey, ct: *const Ciphertext) Plaintext {
             // phase = Σ_i c_i·s^i in R_q (c0 + c1·s [+ c2·s² …]).
             var acc = ct.components[0];
             if (ct.len >= 2) {
@@ -1048,17 +1060,23 @@ pub fn Bfv(comptime P: params.Params) type {
         /// stream the evaluator subtracts the known `a_i·s + e_i` and reads
         /// `w^i·s²` off directly, i.e. the key hands the secret key to the
         /// party it was meant to hide it from.
-        pub fn genRelinKey(self: *const Self, sk: *const SecretKey, io: std.Io) RelinKey {
+        ///
+        /// The key is written through `out` (it is built from `s²`, so it is
+        /// treated like key material), never returned.
+        pub fn genRelinKey(self: *const Self, sk: *const SecretKey, io: std.Io, out: *RelinKey) void {
+            return burn.run(burn.rings(Ring, 16), void, genRelinKeyBody, .{ self, sk, io, out });
+        }
+
+        fn genRelinKeyBody(self: *const Self, sk: *const SecretKey, io: std.Io, out: *RelinKey) void {
             var src: entropy.SecureSource = .{ .io = io };
-            return self.genRelinKeyInner(sk, src.interface());
+            self.genRelinKeyInner(sk, src.interface(), out);
         }
 
         /// The relin-key generation itself. PRIVATE, and private is
         /// load-bearing: see the `Test-only guards and where they may sit`
         /// note above.
-        fn genRelinKeyInner(self: *const Self, sk: *const SecretKey, random: std.Random) RelinKey {
+        fn genRelinKeyInner(self: *const Self, sk: *const SecretKey, random: std.Random, rlk: *RelinKey) void {
             const s2 = sk.s.mul(&sk.s, &self.engines);
-            var rlk: RelinKey = undefined;
             var w_pow: QU = 1; // w^i < q for all rows used (see relin_digits)
             for (0..relin_digits) |i| {
                 const a_i = self.sampleUniform(random);
@@ -1072,11 +1090,10 @@ pub fn Bfv(comptime P: params.Params) type {
                 const WPow = std.meta.Int(.unsigned, @as(u16, @bitSizeOf(QU)) + relin_base_log2);
                 w_pow = @intCast((@as(WPow, w_pow) << relin_base_log2) % @as(WPow, q_product));
             }
-            return rlk;
         }
 
         /// TEST/KAT ONLY — `genRelinKey` with caller-chosen draws.
-        pub fn genRelinKeyForTest(self: *const Self, sk: *const SecretKey, random: std.Random) RelinKey {
+        pub fn genRelinKeyForTest(self: *const Self, sk: *const SecretKey, random: std.Random, out: *RelinKey) void {
             // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
             // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
             // becomes key material, so production must not be able to reach this
@@ -1085,7 +1102,7 @@ pub fn Bfv(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            return self.genRelinKeyInner(sk, random);
+            return burn.run(burn.rings(Ring, 16), void, genRelinKeyInner, .{ self, sk, random, out });
         }
 
         /// Homomorphic multiply → a 3-component ciphertext (degree 2 in `s`).
@@ -1458,6 +1475,10 @@ pub fn Bfv(comptime P: params.Params) type {
         /// territory). Decryption stays exact while `t·‖v‖ + r_t·‖m‖ < q/2`,
         /// i.e. while the budget is comfortably above `log2 t`.
         pub fn noiseBudget(self: *const Self, sk: *const SecretKey, ct: *const Ciphertext) u32 {
+            return burn.run(burn.rings(Ring, 16), u32, noiseBudgetBody, .{ self, sk, ct });
+        }
+
+        fn noiseBudgetBody(self: *const Self, sk: *const SecretKey, ct: *const Ciphertext) u32 {
             // phase = Σ_i c_i·s^i in R_q (same accumulation as decrypt).
             var acc = ct.components[0];
             if (ct.len >= 2) {
@@ -1538,7 +1559,8 @@ test "SecretKey.deinit zeroes the secret ring" {
     const inst = try B.init();
     var prng = std.Random.DefaultPrng.init(0xBEEF);
     const rnd = prng.random();
-    var kp = inst.keyGenForTest(rnd);
+    var kp: @TypeOf(inst).KeyPair = undefined;
+    inst.keyGenForTest(rnd, &kp);
     // Sanity: the freshly generated ternary key is not all-zero (astronomically
     // unlikely for a real key, and this instance's seed is fixed).
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&kp.sk), 0));
@@ -1551,8 +1573,15 @@ test "SecretKey.deinit zeroes the secret ring" {
 /// Type of a function's LAST parameter, or `null` if that parameter is itself
 /// generic. Used by the seam test below to read a signature at comptime.
 fn lastParamType(comptime F: type) ?type {
+    return drawParamType(F, 0);
+}
+
+/// The type of the parameter `skip` places before the last one (the entry
+/// points that return key material through a trailing `out` pointer carry the
+/// randomness source just before it).
+fn drawParamType(comptime F: type, comptime skip: usize) ?type {
     const p = @typeInfo(F).@"fn".params;
-    return p[p.len - 1].type;
+    return p[p.len - 1 - skip].type;
 }
 
 test "RNG seam: keyGen/encrypt/genRelinKey take std.Io, only the ForTest twins take std.Random" {
@@ -1566,13 +1595,15 @@ test "RNG seam: keyGen/encrypt/genRelinKey take std.Io, only the ForTest twins t
     // `std.Random.IoSource`, which would bind the silently-degrading
     // `std.Io.random`. Reintroducing a bare `std.Random` parameter would make
     // the whole class of failure trivial again.
-    inline for (.{ @TypeOf(B.keyGen), @TypeOf(B.encrypt), @TypeOf(B.genRelinKey) }) |F| {
-        try testing.expect(lastParamType(F).? == std.Io);
-        try testing.expect(lastParamType(F).? != std.Random);
-    }
-    inline for (.{ @TypeOf(B.keyGenForTest), @TypeOf(B.encryptForTest), @TypeOf(B.genRelinKeyForTest) }) |F| {
-        try testing.expect(lastParamType(F).? == std.Random);
-    }
+    try testing.expect(drawParamType(@TypeOf(B.keyGen), 1).? == std.Io);
+    try testing.expect(lastParamType(@TypeOf(B.encrypt)).? == std.Io);
+    try testing.expect(drawParamType(@TypeOf(B.genRelinKey), 1).? == std.Io);
+    try testing.expect(drawParamType(@TypeOf(B.keyGen), 1).? != std.Random);
+    try testing.expect(lastParamType(@TypeOf(B.encrypt)).? != std.Random);
+    try testing.expect(drawParamType(@TypeOf(B.genRelinKey), 1).? != std.Random);
+    try testing.expect(drawParamType(@TypeOf(B.keyGenForTest), 1).? == std.Random);
+    try testing.expect(lastParamType(@TypeOf(B.encryptForTest)).? == std.Random);
+    try testing.expect(drawParamType(@TypeOf(B.genRelinKeyForTest), 1).? == std.Random);
 }
 
 test "RNG seam: the std.Io path really draws entropy, and round-trips end to end" {
@@ -1586,8 +1617,10 @@ test "RNG seam: the std.Io path really draws entropy, and round-trips end to end
     // keypairs from the same `io` must differ — `s` is a ternary vector of
     // length N=8 over 3 values plus a uniform mask `a` over the full modulus, so
     // an equal `pk` here means the entropy is not being read.
-    const kp1 = inst.keyGen(io);
-    const kp2 = inst.keyGen(io);
+    var kp1: @TypeOf(inst).KeyPair = undefined;
+    inst.keyGen(io, &kp1);
+    var kp2: @TypeOf(inst).KeyPair = undefined;
+    inst.keyGen(io, &kp2);
     try testing.expect(!kp1.pk.p0.eql(&kp2.pk.p0));
 
     // Same for `encrypt`: two encryptions of the SAME plaintext under the SAME
@@ -1604,7 +1637,9 @@ test "RNG seam: the std.Io path really draws entropy, and round-trips end to end
     try testing.expectEqualSlices(u64, &pt.coeffs, &back.coeffs);
 
     // `genRelinKey` too — rows drawn from `io` differ between two keys.
-    const rlk1 = inst.genRelinKey(&kp1.sk, io);
-    const rlk2 = inst.genRelinKey(&kp1.sk, io);
+    var rlk1: @TypeOf(inst).RelinKey = undefined;
+    inst.genRelinKey(&kp1.sk, io, &rlk1);
+    var rlk2: @TypeOf(inst).RelinKey = undefined;
+    inst.genRelinKey(&kp1.sk, io, &rlk2);
     try testing.expect(!rlk1.a[0].eql(&rlk2.a[0]));
 }

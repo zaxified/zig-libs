@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack burns (`CONVENTIONS.md` §2.1.1).
+  `SecureChannel.open(conn, allocator, options, out: *SecureChannel)` and
+  `ClientCredentials.generateSelfSigned(allocator, random, options, out:
+  *ClientCredentials)` write their result through `out` instead of returning it
+  (both hold key material by value). `security.sealAsymmetricMessage` takes
+  `credentials: *const ClientCredentials`, `openAsymmetricMessage` and
+  `decryptUserTokenSecret` take `private_key: *const rsa.SecretKey`, and
+  `symmetricSignAndEncrypt` / `symmetricSealChunk` / `symmetricDecryptAndVerify`
+  take `keys: *const ChannelKeys` (no by-value key copies in the callers'
+  frames). Burned entry points: the P-SHA256 / AES-256-CBC primitives, the
+  symmetric and asymmetric chunk seal/open, `encryptUserTokenSecret` /
+  `decryptUserTokenSecret`, `generateSelfSigned`, `SecureChannel.open`/`close`,
+  every `Session.*` / `Subscription.*` request method and `Connection.tick`.
+  New `src/burn.zig` and `stackprobe_test.zig` (`testkit.stackprobe`; the
+  request methods, `open` and `tick` need a live peer and are not probed).
+
 - **2026-10-08** — **BREAKING:** `security.asymmetricDecrypt` and `security.asymmetricSign` take
   `private_key: *const rsa.SecretKey`, following rsa's 2026-10-08 API: by value, the 11.8 KiB key
   was copied into the caller's frame on every call, where nothing wipes it. `generateCredentials`

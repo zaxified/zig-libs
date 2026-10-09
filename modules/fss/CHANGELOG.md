@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack burns (`CONVENTIONS.md` §2.1.1).
+  Every key, seed and evaluation entry point now takes secrets by pointer and
+  runs under a burn: `Dpf`/`Mpf` `genWithSeeds(…, s0: *const Seed, s1: *const
+  Seed, out: *[2]Key)` (keys written through `out`, no longer returned; `Mpf`
+  takes `*const [k]Seed`), `eval`, `evalEach`, `evalAll`, `evalFull`,
+  `evalFullWith`, `evalRangeWith`, `evalEachFullWith` (`key: *const Key`),
+  `Key.toBytes`/`toBytesTagged`/`serializeCw` (`self: *const Key`),
+  `Key.fromBytes(out: *Key, buf)` and `fromBytesTagged(out: *Key, buf)
+  KeyFormatError!void` (written through `out`, no longer returned). The
+  `prg` `expand`/`convert` primitives keep their by-value shape (per-node hot
+  calls under the walk's burn; `secret-api-ok`). New `src/burn.zig` and
+  `stackprobe_test.zig` (`testkit.stackprobe`).
+
 - **2026-10-06** — Mutation run: 39 of 40 killed, 1 equivalent; 2 tests
   added (`Aes128Mmo.convert` pinned to the long-hand `H_2 ‖ H_3` with the
   tweak in byte 0; `convert(L)` equals the low `L` bytes of `convert(32)` for

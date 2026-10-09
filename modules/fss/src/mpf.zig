@@ -102,6 +102,7 @@
 const std = @import("std");
 const prg_mod = @import("prg.zig");
 const dpf_mod = @import("dpf.zig");
+const burn = @import("burn.zig");
 
 const Seed = prg_mod.Seed;
 
@@ -170,8 +171,12 @@ pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
 
             /// Serialize: sub-key `0 || 1 || … || k-1`, each in `dpf`'s own
             /// `Key.toBytes` layout.
-            pub fn toBytes(self: Key, buf: *[serialized_len]u8) void {
-                for (self.keys, 0..) |key, j| {
+            pub fn toBytes(self: *const Key, buf: *[serialized_len]u8) void {
+                return burn.run(burn.codec_burn, void, toBytesBody, .{ self, buf });
+            }
+
+            fn toBytesBody(self: *const Key, buf: *[serialized_len]u8) void {
+                for (&self.keys, 0..) |*key, j| {
                     key.toBytes(buf[j * sub_serialized_len ..][0..sub_serialized_len]);
                 }
             }
@@ -182,19 +187,22 @@ pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             /// compile-time-known offset. Total on all `serialized_len`-byte
             /// inputs; an input that is not a real key decodes to a key that
             /// evaluates to garbage, which is not this layer's problem.
-            pub fn fromBytes(buf: *const [serialized_len]u8) Key {
-                var out: Key = undefined;
+            /// The key is written through `out`, never returned.
+            pub fn fromBytes(out: *Key, buf: *const [serialized_len]u8) void {
+                return burn.run(burn.codec_burn, void, fromBytesBody, .{ out, buf });
+            }
+
+            fn fromBytesBody(out: *Key, buf: *const [serialized_len]u8) void {
                 for (&out.keys, 0..) |*key, j| {
-                    key.* = Dpf.Key.fromBytes(buf[j * sub_serialized_len ..][0..sub_serialized_len]);
+                    Dpf.Key.fromBytes(key, buf[j * sub_serialized_len ..][0..sub_serialized_len]);
                 }
-                return out;
             }
         };
 
         /// Reject byte-identical seeds among the `2k` supplied. See the module
         /// doc for why this specific failure is worth a check when "use good
         /// randomness" is otherwise left to the caller.
-        fn requireDistinctSeeds(s0: [k]Seed, s1: [k]Seed) GenError!void {
+        fn requireDistinctSeeds(s0: *const [k]Seed, s1: *const [k]Seed) GenError!void {
             var all: [2 * k]Seed = undefined;
             for (s0, 0..) |s, j| all[j] = s;
             for (s1, 0..) |s, j| all[k + j] = s;
@@ -222,37 +230,50 @@ pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         pub fn genWithSeeds(
             alphas: [k]Index,
             betas: [k]Elem,
-            s0: [k]Seed,
-            s1: [k]Seed,
-        ) GenError![2]Key {
+            s0: *const [k]Seed,
+            s1: *const [k]Seed,
+            out: *[2]Key,
+        ) GenError!void {
+            return burn.run(burn.gen_burn, GenError!void, genBody, .{ alphas, betas, s0, s1, out });
+        }
+
+        fn genBody(
+            alphas: [k]Index,
+            betas: [k]Elem,
+            s0: *const [k]Seed,
+            s1: *const [k]Seed,
+            out: *[2]Key,
+        ) GenError!void {
             try requireDistinctSeeds(s0, s1);
-            var key0: Key = undefined;
-            var key1: Key = undefined;
             for (0..k) |j| {
-                const pair = Dpf.genWithSeeds(alphas[j], betas[j], s0[j], s1[j]);
-                key0.keys[j] = pair[0];
-                key1.keys[j] = pair[1];
+                var pair: [2]Dpf.Key = undefined;
+                Dpf.genWithSeeds(alphas[j], betas[j], &s0[j], &s1[j], &pair);
+                out[0].keys[j] = pair[0];
+                out[1].keys[j] = pair[1];
             }
-            return .{ key0, key1 };
         }
 
         /// **Eval** — party `b`'s share of `f_{A,B}(x)`: the group sum of the
         /// `k` instances' shares. `eval(0,K0,x) + eval(1,K1,x) == f_{A,B}(x)`.
-        pub fn eval(b: u1, key: Key, x: Index) Elem {
+        pub fn eval(b: u1, key: *const Key, x: Index) Elem {
+            return burn.run(burn.eval_burn, Elem, evalBody, .{ b, key, x });
+        }
+
+        fn evalBody(b: u1, key: *const Key, x: Index) Elem {
             var acc: Elem = 0;
-            for (key.keys) |sub| acc = G.add(acc, Dpf.eval(b, sub, x));
+            for (&key.keys) |*sub| acc = G.add(acc, Dpf.eval(b, sub, x));
             return acc;
         }
 
         /// Party `b`'s **per-instance** shares at `x`, unsummed:
-        /// `out[j] = Dpf.eval(b, key.keys[j], x)`.
+        /// `out[j] = Dpf.eval(b, &key.keys[j], x)`.
         ///
         /// Not a different security claim — the same key material, decomposed
         /// as it is stored. A consumer needing `k` separable results (rather
         /// than the multi-point function's single value) evaluates here and
         /// keeps the components apart; summing `out` reproduces `eval`.
-        pub fn evalEach(b: u1, key: Key, x: Index, out: *[k]Elem) void {
-            for (out, key.keys) |*o, sub| o.* = Dpf.eval(b, sub, x);
+        pub fn evalEach(b: u1, key: *const Key, x: Index, out: *[k]Elem) void {
+            for (out, &key.keys) |*o, *sub| o.* = Dpf.eval(b, sub, x);
         }
 
         /// **EvalAll** — `eval` at every domain point into `out`
@@ -261,10 +282,10 @@ pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         /// independent of the interleaved walk below, which makes it the
         /// differential oracle that walk is tested against. Use `evalFull`
         /// when you want the result fast.
-        pub fn evalAll(b: u1, key: Key, out: []Elem) void {
+        pub fn evalAll(b: u1, key: *const Key, out: []Elem) void {
             std.debug.assert(out.len == domain_size);
             var x: usize = 0;
-            while (x < domain_size) : (x += 1) out[x] = eval(b, key, @intCast(x));
+            while (x < domain_size) : (x += 1) out[x] = eval(b, key, @intCast(x)); // every `eval` burns itself
         }
 
         // ── interleaved prefix evaluation (one pass, k trees) ──────────────
@@ -299,19 +320,24 @@ pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         /// doc), but it must not do so on a small thread stack.
         pub fn evalEachFullWith(
             b: u1,
-            key: Key,
+            key: *const Key,
             count: usize,
             context: anytype,
             comptime emit: fn (@TypeOf(context), usize, *const [k]Elem) void,
         ) void {
-            std.debug.assert(count <= domain_size);
-            var s: [k]Seed = undefined;
-            var t: [k]u1 = undefined;
-            for (0..k) |j| {
-                s[j] = key.keys[j].seed;
-                t[j] = b;
-            }
-            walkPrefixEach(@TypeOf(context), emit, P.init(), &key, b, &s, &t, 0, 0, count, context);
+            const B = struct {
+                fn body(b_: u1, key_: *const Key, count_: usize, ctx: @TypeOf(context)) void {
+                    std.debug.assert(count_ <= domain_size);
+                    var s: [k]Seed = undefined;
+                    var t: [k]u1 = undefined;
+                    for (0..k) |j| {
+                        s[j] = key_.keys[j].seed;
+                        t[j] = b_;
+                    }
+                    walkPrefixEach(@TypeOf(context), emit, P.init(), key_, b_, &s, &t, 0, 0, count_, ctx);
+                }
+            };
+            return burn.run(burn.mpf_walk_burn, void, B.body, .{ b, key, count, context });
         }
 
         /// The interleaved walk under `evalEachFullWith`. Per level it applies
@@ -397,7 +423,7 @@ pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         /// aggregate query).
         pub fn evalFullWith(
             b: u1,
-            key: Key,
+            key: *const Key,
             count: usize,
             context: anytype,
             comptime emit: fn (@TypeOf(context), usize, Elem) void,
@@ -410,7 +436,7 @@ pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         /// `out`, in one interleaved walk. Materializing form of
         /// `evalFullWith`; `evalAll` is the naive full-domain oracle it is
         /// checked against.
-        pub fn evalFull(b: u1, key: Key, out: []Elem) void {
+        pub fn evalFull(b: u1, key: *const Key, out: []Elem) void {
             std.debug.assert(out.len <= domain_size);
             const sink = struct {
                 fn emit(o: []Elem, x: usize, v: Elem) void {

@@ -324,7 +324,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // The one target where the taint is applied INSIDE the entropy
             // source, not to a pre-built value — see "What is tainted" above.
             var entropy_src: SyntheticIo = .{ .inner = base_io, .taint = tainted };
-            const kp = instance.keyGen(entropy_src.io());
+            var kp: @TypeOf(instance).KeyPair = undefined;
+            instance.keyGen(entropy_src.io(), &kp);
             // Propagation witness: the public key is a function of the
             // (possibly tainted) s/a/e draws (`p0 = -(a*s+e)`, `p1 = a`).
             // Hex, not `{any}`: the output pin reads `name=<hex>`, and `{any}` on a
@@ -341,7 +342,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // not this claim's subject (see module doc: only `pt` is
             // tainted here).
             var clean_src: SyntheticIo = .{ .inner = base_io, .taint = false };
-            const kp = instance.keyGen(clean_src.io());
+            var kp: @TypeOf(instance).KeyPair = undefined;
+            instance.keyGen(clean_src.io(), &kp);
 
             var pt = BfvT.Plaintext.zero(P.t);
             for (&pt.coeffs, 0..) |*c, j| c.* = (@as(u64, j) * 7 + 3) % P.t;
@@ -366,7 +368,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // shape it would in production -- only `sk` is tainted, and only
             // just before the call under test.
             var clean_src: SyntheticIo = .{ .inner = base_io, .taint = false };
-            var kp = instance.keyGen(clean_src.io());
+            var kp: @TypeOf(instance).KeyPair = undefined;
+            instance.keyGen(clean_src.io(), &kp);
 
             var pt = BfvT.Plaintext.zero(P.t);
             for (&pt.coeffs, 0..) |*c, j| c.* = @as(u64, j) % P.t;

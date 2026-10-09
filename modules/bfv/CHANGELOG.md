@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack burns (`CONVENTIONS.md` §2.1.1).
+  `keyGen(io, out: *KeyPair)`, `keyGenForTest(random, out)` and
+  `genRelinKey(sk, io, out: *RelinKey)`, `genRelinKeyForTest(sk, random, out)`
+  now write their result through `out` instead of returning it (a returned
+  key pair sits in the caller's result slot, out of reach of a burn); `out` is
+  the LAST parameter, after the `io`/`random` argument. `keyGen`, `genRelinKey`,
+  `decrypt` and `noiseBudget` (and the `ForTest` twins) run under a burn sized
+  from the ring (`burn.rings`: 16 ring elements + 4 KiB). New `src/burn.zig`
+  and `stackprobe_test.zig` (`testkit.stackprobe`, probed at `bfv_toy`).
+
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the backlog lists byte codecs and parameter selection once each, and the fast-RNS item names only the step still open (the input CRT lift) now that `mulBehz` has landed.
 - **2026-10-05** — Mutation run: 18 of 23 killed, 5 equivalent; 2 tests added
   (an encrypt KAT that pins both fresh error terms, `Ntt.init` refusing a

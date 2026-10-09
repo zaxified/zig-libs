@@ -35,11 +35,12 @@ fn benchCase(
 ) !void {
     const s0 = [_]u8{0x3C} ** 16;
     const s1 = [_]u8{0xC3} ** 16;
-    const keys = D.genWithSeeds(alpha, 1, s0, s1);
+    var keys: [2]D.Key = undefined;
+    D.genWithSeeds(alpha, 1, &s0, &s1, &keys);
 
     // correctness first: both routes must agree, or the timing is of nothing
-    for (0..prefix_len) |x| naive[x] = D.eval(0, keys[0], @intCast(x));
-    D.evalFull(0, keys[0], fast[0..prefix_len]);
+    for (0..prefix_len) |x| naive[x] = D.eval(0, &keys[0], @intCast(x));
+    D.evalFull(0, &keys[0], fast[0..prefix_len]);
     try std.testing.expectEqualSlices(D.Elem, naive[0..prefix_len], fast[0..prefix_len]);
 
     const reps = 3;
@@ -48,9 +49,9 @@ fn benchCase(
     var sink: D.Elem = 0;
     for (0..reps) |_| {
         const a = nowNs();
-        for (0..prefix_len) |x| naive[x] = D.eval(0, keys[0], @intCast(x));
+        for (0..prefix_len) |x| naive[x] = D.eval(0, &keys[0], @intCast(x));
         const b = nowNs();
-        D.evalFull(0, keys[0], fast[0..prefix_len]);
+        D.evalFull(0, &keys[0], fast[0..prefix_len]);
         const c = nowNs();
         t_naive = @min(t_naive, b - a);
         t_fast = @min(t_fast, c - b);
@@ -93,7 +94,8 @@ fn benchMulti(
         s0[j] = @splat(@truncate(j * 2 + 1));
         s1[j] = @splat(@truncate(j * 2 + 128));
     }
-    const keys = try M.genWithSeeds(alphas, betas, s0, s1);
+    var keys: [2]M.Key = undefined;
+    try M.genWithSeeds(alphas, betas, &s0, &s1, &keys);
 
     const Sink = struct {
         out: []M.Elem,
@@ -105,14 +107,14 @@ fn benchMulti(
         fn run(key: M.Key, out: []M.Elem, count: usize) void {
             var each: [k]M.Elem = undefined;
             for (0..count) |x| {
-                M.evalEach(0, key, @intCast(x), &each);
+                M.evalEach(0, &key, @intCast(x), &each);
                 for (each, 0..) |v, j| out[x * k + j] = v;
             }
         }
     }.run;
 
     naiveRoute(keys[0], naive, prefix_len);
-    M.evalEachFullWith(0, keys[0], prefix_len, Sink{ .out = fast }, Sink.emit);
+    M.evalEachFullWith(0, &keys[0], prefix_len, Sink{ .out = fast }, Sink.emit);
     try std.testing.expectEqualSlices(M.Elem, naive[0 .. prefix_len * k], fast[0 .. prefix_len * k]);
 
     const reps = 3;
@@ -123,7 +125,7 @@ fn benchMulti(
         const a = nowNs();
         naiveRoute(keys[0], naive, prefix_len);
         const b = nowNs();
-        M.evalEachFullWith(0, keys[0], prefix_len, Sink{ .out = fast }, Sink.emit);
+        M.evalEachFullWith(0, &keys[0], prefix_len, Sink{ .out = fast }, Sink.emit);
         const c = nowNs();
         t_naive = @min(t_naive, b - a);
         t_fast = @min(t_fast, c - b);
@@ -178,7 +180,8 @@ fn benchPrgPair(comptime n_bits: usize) !void {
         for (0..reps) |_| {
             const a = nowNs();
             for (0..gens) |i| {
-                const keys = D.genWithSeeds(@intCast(i % D.domain_size), 1, s0, s1);
+                var keys: [2]D.Key = undefined;
+                D.genWithSeeds(@intCast(i % D.domain_size), 1, &s0, &s1, &keys);
                 acc ^= keys[0].cw[0].s_cw[0];
             }
             const b = nowNs();
@@ -187,11 +190,12 @@ fn benchPrgPair(comptime n_bits: usize) !void {
 
         // (c) evalFull over the whole (small) domain
         var out: [1 << n_bits]D.Elem = undefined;
-        const keys = D.genWithSeeds(7, 1, s0, s1);
+        var keys: [2]D.Key = undefined;
+        D.genWithSeeds(7, 1, &s0, &s1, &keys);
         var t_eval: u64 = std.math.maxInt(u64);
         for (0..reps) |_| {
             const a = nowNs();
-            for (0..16) |_| D.evalFull(0, keys[0], &out);
+            for (0..16) |_| D.evalFull(0, &keys[0], &out);
             const b = nowNs();
             t_eval = @min(t_eval, b - a);
         }

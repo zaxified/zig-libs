@@ -84,12 +84,13 @@ test "SELF: full-domain reconstruction for k=1..domain_size, incl. k == domain_s
             betas[j] = @intCast(j * 0x01010101 + 1);
         }
         const seeds = detSeeds(c.k, c.n * 31 + c.k);
-        const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+        var keys: [2]M.Key = undefined;
+        try M.genWithSeeds(alphas, betas, &seeds[0], &seeds[1], &keys);
 
         var e0: [M.domain_size]M.Elem = undefined;
         var e1: [M.domain_size]M.Elem = undefined;
-        M.evalAll(0, keys[0], &e0);
-        M.evalAll(1, keys[1], &e1);
+        M.evalAll(0, &keys[0], &e0);
+        M.evalAll(1, &keys[1], &e1);
         try testing.expectEqual(@as(?usize, null), M.firstMismatch(&e0, &e1, alphas, betas));
     }
 }
@@ -103,12 +104,13 @@ test "SELF: repeated indices sum, and that is the shared function's definition" 
     const alphas: [3]M.Index = .{ 5, 5, 2 }; // 5 twice
     const betas: [3]M.Elem = .{ 10, 32, 7 };
     const seeds = detSeeds(3, 777);
-    const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+    var keys: [2]M.Key = undefined;
+    try M.genWithSeeds(alphas, betas, &seeds[0], &seeds[1], &keys);
 
     var e0: [8]M.Elem = undefined;
     var e1: [8]M.Elem = undefined;
-    M.evalAll(0, keys[0], &e0);
-    M.evalAll(1, keys[1], &e1);
+    M.evalAll(0, &keys[0], &e0);
+    M.evalAll(1, &keys[1], &e1);
 
     const want = [8]M.Elem{ 0, 0, 7, 0, 0, 42, 0, 0 }; // 10+32 at index 5
     for (want, 0..) |w, x| try testing.expectEqual(w, e0[x] +% e1[x]);
@@ -119,11 +121,12 @@ test "SELF: repeated indices sum, and that is the shared function's definition" 
     const a1: [3]M1.Index = .{ 3, 3, 3 };
     const b1: [3]M1.Elem = .{ 1, 2, 4 };
     const s1 = detSeeds(3, 778);
-    const k1 = try M1.genWithSeeds(a1, b1, s1[0], s1[1]);
+    var k1: [2]M1.Key = undefined;
+    try M1.genWithSeeds(a1, b1, &s1[0], &s1[1], &k1);
     var f0: [4]M1.Elem = undefined;
     var f1: [4]M1.Elem = undefined;
-    M1.evalAll(0, k1[0], &f0);
-    M1.evalAll(1, k1[1], &f1);
+    M1.evalAll(0, &k1[0], &f0);
+    M1.evalAll(1, &k1[1], &f1);
     try testing.expectEqual(@as(M1.Elem, 7), f0[3] +% f1[3]);
     try testing.expectEqual(@as(M1.Elem, 0), f0[0] +% f1[0]);
 }
@@ -138,12 +141,13 @@ test "SELF: k=0 is a total no-op — zero-byte key, all-zero function" {
     const betas: [0]M.Elem = .{};
     const s0: [0]prg_mod.Seed = .{};
     const s1: [0]prg_mod.Seed = .{};
-    const keys = try M.genWithSeeds(alphas, betas, s0, s1);
+    var keys: [2]M.Key = undefined;
+    try M.genWithSeeds(alphas, betas, &s0, &s1, &keys);
 
     var e0: [16]M.Elem = undefined;
     var e1: [16]M.Elem = undefined;
-    M.evalAll(0, keys[0], &e0);
-    M.evalAll(1, keys[1], &e1);
+    M.evalAll(0, &keys[0], &e0);
+    M.evalAll(1, &keys[1], &e1);
     for (0..16) |x| {
         try testing.expectEqual(@as(M.Elem, 0), e0[x]);
         try testing.expectEqual(@as(M.Elem, 0), e1[x]);
@@ -153,7 +157,8 @@ test "SELF: k=0 is a total no-op — zero-byte key, all-zero function" {
     // The zero-byte key still round-trips through the codec.
     var buf: [0]u8 = undefined;
     keys[0].toBytes(&buf);
-    _ = M.Key.fromBytes(&buf);
+    var dummy: M.Key = undefined;
+    M.Key.fromBytes(&dummy, &buf);
 }
 
 test "DERIVED: k=1 is byte-for-byte the existing single-point path" {
@@ -167,8 +172,10 @@ test "DERIVED: k=1 is byte-for-byte the existing single-point path" {
     const s0 = detSeed(4001);
     const s1 = detSeed(4002);
 
-    const single = D.genWithSeeds(alpha, beta, s0, s1);
-    const multi = try M.genWithSeeds(.{alpha}, .{beta}, .{s0}, .{s1});
+    var single: [2]D.Key = undefined;
+    D.genWithSeeds(alpha, beta, &s0, &s1, &single);
+    var multi: [2]M.Key = undefined;
+    try M.genWithSeeds(.{alpha}, .{beta}, &.{s0}, &.{s1}, &multi);
 
     try testing.expectEqual(@as(usize, D.Key.serialized_len), M.Key.serialized_len);
     inline for (0..2) |b| {
@@ -182,10 +189,10 @@ test "DERIVED: k=1 is byte-for-byte the existing single-point path" {
     for (0..D.domain_size) |x| {
         const xi: D.Index = @intCast(x);
         var each: [1]M.Elem = undefined;
-        M.evalEach(0, multi[0], xi, &each);
-        try testing.expectEqual(D.eval(0, single[0], xi), M.eval(0, multi[0], xi));
-        try testing.expectEqual(D.eval(0, single[0], xi), each[0]);
-        try testing.expectEqual(D.eval(1, single[1], xi), M.eval(1, multi[1], xi));
+        M.evalEach(0, &multi[0], xi, &each);
+        try testing.expectEqual(D.eval(0, &single[0], xi), M.eval(0, &multi[0], xi));
+        try testing.expectEqual(D.eval(0, &single[0], xi), each[0]);
+        try testing.expectEqual(D.eval(1, &single[1], xi), M.eval(1, &multi[1], xi));
     }
 }
 
@@ -194,23 +201,24 @@ test "DERIVED: evalEach's components sum to eval, and each component is its own 
     const alphas: [4]M.Index = .{ 0, 17, 31, 8 };
     const betas: [4]M.Elem = .{ 1, 2, 3, 4 };
     const seeds = detSeeds(4, 909);
-    const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+    var keys: [2]M.Key = undefined;
+    try M.genWithSeeds(alphas, betas, &seeds[0], &seeds[1], &keys);
 
     for (0..M.domain_size) |x| {
         const xi: M.Index = @intCast(x);
         inline for (0..2) |b| {
             var each: [4]M.Elem = undefined;
-            M.evalEach(b, keys[b], xi, &each);
+            M.evalEach(b, &keys[b], xi, &each);
             var sum: M.Elem = 0;
             for (each) |e| sum +%= e;
-            try testing.expectEqual(M.eval(b, keys[b], xi), sum);
+            try testing.expectEqual(M.eval(b, &keys[b], xi), sum);
         }
         // Component j, taken alone across both parties, IS the point function
         // f_{α_j, β_j} — the property `pir`'s k-record retrieval depends on.
         var each0: [4]M.Elem = undefined;
         var each1: [4]M.Elem = undefined;
-        M.evalEach(0, keys[0], xi, &each0);
-        M.evalEach(1, keys[1], xi, &each1);
+        M.evalEach(0, &keys[0], xi, &each0);
+        M.evalEach(1, &keys[1], xi, &each1);
         for (0..4) |j| {
             const want: M.Elem = if (x == @as(usize, alphas[j])) betas[j] else 0;
             try testing.expectEqual(want, each0[j] +% each1[j]);
@@ -298,7 +306,8 @@ test "DERIVED: evalEachFullWith == evalEach, instance for instance, both parties
             betas[j] = @intCast(j * 0x01010101 + 1); // pairwise distinct
         }
         const seeds = detSeeds(c.k, c.n * 131 + c.k);
-        const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+        var keys: [2]M.Key = undefined;
+        try M.genWithSeeds(alphas, betas, &seeds[0], &seeds[1], &keys);
 
         inline for (.{ 0, 1 }) |b| {
             var vals: [M.domain_size * c.k]M.Elem = undefined;
@@ -307,7 +316,7 @@ test "DERIVED: evalEachFullWith == evalEach, instance for instance, both parties
             const Sink = EachSink(M);
             M.evalEachFullWith(
                 b,
-                keys[b],
+                &keys[b],
                 M.domain_size,
                 Sink{ .vals = &vals, .xs = &xs, .n = &n },
                 Sink.emit,
@@ -320,7 +329,7 @@ test "DERIVED: evalEachFullWith == evalEach, instance for instance, both parties
             // …and each emission is the naive per-point evaluation, per instance
             for (0..M.domain_size) |x| {
                 var want: [c.k]M.Elem = undefined;
-                M.evalEach(b, keys[b], @intCast(x), &want);
+                M.evalEach(b, &keys[b], @intCast(x), &want);
                 try testing.expectEqualSlices(
                     M.Elem,
                     &want,
@@ -348,7 +357,8 @@ test "DERIVED: the interleaved walk over a PREFIX matches evalEach, and never to
     for (point_sets, 0..) |alphas, t| {
         const betas: [3]M.Elem = .{ 1, 0xDEADBEEF, 0 }; // incl. β = 0
         const seeds = detSeeds(3, 31337 + t);
-        const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+        var keys: [2]M.Key = undefined;
+        try M.genWithSeeds(alphas, betas, &seeds[0], &seeds[1], &keys);
         inline for (.{ 0, 1 }) |b| {
             var vals: [prefix_len * 3]M.Elem = undefined;
             var xs: [prefix_len]usize = undefined;
@@ -356,7 +366,7 @@ test "DERIVED: the interleaved walk over a PREFIX matches evalEach, and never to
             const Sink = EachSink(M);
             M.evalEachFullWith(
                 b,
-                keys[b],
+                &keys[b],
                 prefix_len,
                 Sink{ .vals = &vals, .xs = &xs, .n = &n },
                 Sink.emit,
@@ -365,7 +375,7 @@ test "DERIVED: the interleaved walk over a PREFIX matches evalEach, and never to
             for (0..prefix_len) |x| {
                 try testing.expectEqual(x, xs[x]);
                 var want: [3]M.Elem = undefined;
-                M.evalEach(b, keys[b], @intCast(x), &want);
+                M.evalEach(b, &keys[b], @intCast(x), &want);
                 try testing.expectEqualSlices(M.Elem, &want, vals[x * 3 ..][0..3]);
             }
         }
@@ -380,7 +390,8 @@ test "SELF: prefix boundaries — 0, 1, a full subtree, a straddle, and the whol
     const alphas: [2]M.Index = .{ 3, 400 };
     const betas: [2]M.Elem = .{ 9, 11 };
     const seeds = detSeeds(2, 4242);
-    const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+    var keys: [2]M.Key = undefined;
+    try M.genWithSeeds(alphas, betas, &seeds[0], &seeds[1], &keys);
 
     for ([_]usize{ 0, 1, 2, 255, 256, 257, 511, 512 }) |count| {
         inline for (.{ 0, 1 }) |b| {
@@ -390,7 +401,7 @@ test "SELF: prefix boundaries — 0, 1, a full subtree, a straddle, and the whol
             const Sink = EachSink(M);
             M.evalEachFullWith(
                 b,
-                keys[b],
+                &keys[b],
                 count,
                 Sink{ .vals = &vals, .xs = &xs, .n = &n },
                 Sink.emit,
@@ -399,7 +410,7 @@ test "SELF: prefix boundaries — 0, 1, a full subtree, a straddle, and the whol
             for (0..count) |x| {
                 try testing.expectEqual(x, xs[x]);
                 var want: [2]M.Elem = undefined;
-                M.evalEach(b, keys[b], @intCast(x), &want);
+                M.evalEach(b, &keys[b], @intCast(x), &want);
                 try testing.expectEqualSlices(M.Elem, &want, vals[x * 2 ..][0..2]);
             }
         }
@@ -420,13 +431,14 @@ test "DERIVED: the summed forms (evalFull / evalFullWith) equal the naive evalAl
             betas[j] = @intCast(j * 0x02020202 + 3);
         }
         const seeds = detSeeds(c.k, c.n * 977 + c.k);
-        const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+        var keys: [2]M.Key = undefined;
+        try M.genWithSeeds(alphas, betas, &seeds[0], &seeds[1], &keys);
 
         inline for (.{ 0, 1 }) |b| {
             var naive: [M.domain_size]M.Elem = undefined;
             var fast: [M.domain_size]M.Elem = undefined;
-            M.evalAll(b, keys[b], &naive);
-            M.evalFull(b, keys[b], &fast);
+            M.evalAll(b, &keys[b], &naive);
+            M.evalFull(b, &keys[b], &fast);
             try testing.expectEqualSlices(M.Elem, &naive, &fast);
 
             // the streaming form emits the same values, in order, once each
@@ -436,7 +448,7 @@ test "DERIVED: the summed forms (evalFull / evalFullWith) equal the naive evalAl
             const Sink = ElemSink(M);
             M.evalFullWith(
                 b,
-                keys[b],
+                &keys[b],
                 M.domain_size,
                 Sink{ .vals = &vals, .xs = &xs, .n = &n },
                 Sink.emit,
@@ -448,8 +460,8 @@ test "DERIVED: the summed forms (evalFull / evalFullWith) equal the naive evalAl
         // and both parties' prefix evaluations still reconstruct f_{A,B}
         var f0: [M.domain_size]M.Elem = undefined;
         var f1: [M.domain_size]M.Elem = undefined;
-        M.evalFull(0, keys[0], &f0);
-        M.evalFull(1, keys[1], &f1);
+        M.evalFull(0, &keys[0], &f0);
+        M.evalFull(1, &keys[1], &f1);
         try testing.expectEqual(@as(?usize, null), M.firstMismatch(&f0, &f1, alphas, betas));
     }
 }
@@ -462,23 +474,26 @@ test "DERIVED: k=1's interleaved walk is dpf.evalFull; k=0 emits the prefix with
     const M1 = Mpf(7, 8, 1);
     const s0 = detSeed(6001);
     const s1 = detSeed(6002);
-    const single = D.genWithSeeds(55, 0x0BADF00DDEADBEEF, s0, s1);
-    const multi = try M1.genWithSeeds(.{55}, .{0x0BADF00DDEADBEEF}, .{s0}, .{s1});
+    var single: [2]D.Key = undefined;
+    D.genWithSeeds(55, 0x0BADF00DDEADBEEF, &s0, &s1, &single);
+    var multi: [2]M1.Key = undefined;
+    try M1.genWithSeeds(.{55}, .{0x0BADF00DDEADBEEF}, &.{s0}, &.{s1}, &multi);
     inline for (.{ 0, 1 }) |b| {
         var want: [D.domain_size]D.Elem = undefined;
         var got: [M1.domain_size]M1.Elem = undefined;
-        D.evalFull(b, single[b], &want);
-        M1.evalFull(b, multi[b], &got);
+        D.evalFull(b, &single[b], &want);
+        M1.evalFull(b, &multi[b], &got);
         try testing.expectEqualSlices(D.Elem, &want, &got);
     }
 
     const M0 = Mpf(5, 4, 0);
-    const keys0 = try M0.genWithSeeds(.{}, .{}, .{}, .{});
+    var keys0: [2]M0.Key = undefined;
+    try M0.genWithSeeds(.{}, .{}, &.{}, &.{}, &keys0);
     var xs: [32]usize = undefined;
     var vals: [0]M0.Elem = undefined;
     var n: usize = 0;
     const Sink = EachSink(M0);
-    M0.evalEachFullWith(0, keys0[0], 20, Sink{ .vals = &vals, .xs = &xs, .n = &n }, Sink.emit);
+    M0.evalEachFullWith(0, &keys0[0], 20, Sink{ .vals = &vals, .xs = &xs, .n = &n }, Sink.emit);
     try testing.expectEqual(@as(usize, 20), n);
     for (0..20) |x| try testing.expectEqual(x, xs[x]);
 }
@@ -502,13 +517,14 @@ test "SELF: the emitted index sequence is identical for every key and every part
 
     for (alpha_sets, 0..) |alphas, t| {
         const seeds = detSeeds(3, 808 + t);
-        const keys = try M.genWithSeeds(alphas, .{ 1, 1, 1 }, seeds[0], seeds[1]);
+        var keys: [2]M.Key = undefined;
+        try M.genWithSeeds(alphas, .{ 1, 1, 1 }, &seeds[0], &seeds[1], &keys);
         inline for (.{ 0, 1 }) |b| {
             var xs: [count]usize = undefined;
             var vals: [count * 3]M.Elem = undefined;
             var n: usize = 0;
             const Sink = EachSink(M);
-            M.evalEachFullWith(b, keys[b], count, Sink{ .vals = &vals, .xs = &xs, .n = &n }, Sink.emit);
+            M.evalEachFullWith(b, &keys[b], count, Sink{ .vals = &vals, .xs = &xs, .n = &n }, Sink.emit);
             try testing.expectEqual(@as(usize, count), n);
             if (have_reference) {
                 try testing.expectEqualSlices(usize, &reference, &xs);
@@ -522,12 +538,13 @@ test "SELF: the emitted index sequence is identical for every key and every part
     // …and for key material that is not a key at all.
     var buf: [M.Key.serialized_len]u8 = undefined;
     for (&buf, 0..) |*byte, i| byte.* = @truncate(i *% 197 +% 13);
-    const junk = M.Key.fromBytes(&buf);
+    var junk: M.Key = undefined;
+    M.Key.fromBytes(&junk, &buf);
     var xs: [count]usize = undefined;
     var vals: [count * 3]M.Elem = undefined;
     var n: usize = 0;
     const Sink = EachSink(M);
-    M.evalEachFullWith(1, junk, count, Sink{ .vals = &vals, .xs = &xs, .n = &n }, Sink.emit);
+    M.evalEachFullWith(1, &junk, count, Sink{ .vals = &vals, .xs = &xs, .n = &n }, Sink.emit);
     try testing.expectEqual(@as(usize, count), n);
     try testing.expectEqualSlices(usize, &reference, &xs);
 }
@@ -550,11 +567,13 @@ test "EXTERNAL: an Mpf key reproduces two independently-derived DPF KAT vectors"
 
     const alphas: [2]M.Index = .{ @intCast(v0.alpha), @intCast(v3.alpha) };
     const betas: [2]M.Elem = .{ @intCast(v0.beta), @intCast(v3.beta) };
-    const keys = try M.genWithSeeds(
+    var keys: [2]M.Key = undefined;
+    try M.genWithSeeds(
         alphas,
         betas,
-        .{ v0.seed0, v3.seed0 },
-        .{ v0.seed1, v3.seed1 },
+        &.{ v0.seed0, v3.seed0 },
+        &.{ v0.seed1, v3.seed1 },
+        &keys,
     );
 
     // Gen anchor: each sub-key's correction-word portion must be the recorded
@@ -586,8 +605,8 @@ test "EXTERNAL: an Mpf key reproduces two independently-derived DPF KAT vectors"
         const xi: M.Index = @intCast(x);
         var each0: [2]M.Elem = undefined;
         var each1: [2]M.Elem = undefined;
-        M.evalEach(0, keys[0], xi, &each0);
-        M.evalEach(1, keys[1], xi, &each1);
+        M.evalEach(0, &keys[0], xi, &each0);
+        M.evalEach(1, &keys[1], xi, &each1);
         try testing.expectEqual(v0.eval0[x], @as(u64, each0[0]));
         try testing.expectEqual(v3.eval0[x], @as(u64, each0[1]));
         try testing.expectEqual(v0.eval1[x], @as(u64, each1[0]));
@@ -595,7 +614,7 @@ test "EXTERNAL: an Mpf key reproduces two independently-derived DPF KAT vectors"
         // DERIVED: the summed eval is the sum of the anchored components.
         try testing.expectEqual(
             @as(M.Elem, @truncate(v0.eval0[x])) +% @as(M.Elem, @truncate(v3.eval0[x])),
-            M.eval(0, keys[0], xi),
+            M.eval(0, &keys[0], xi),
         );
     }
 }
@@ -614,7 +633,7 @@ test "SELF: the key encoding is a compile-time constant with no count field" {
         // The decoder's parameter type is a pointer to an array of exactly
         // that length: a compile-time fact, so a mismatched length cannot even
         // be expressed at the call site.
-        const Param = @typeInfo(@TypeOf(M.Key.fromBytes)).@"fn".params[0].type.?;
+        const Param = @typeInfo(@TypeOf(M.Key.fromBytes)).@"fn".params[1].type.?;
         try testing.expectEqual(
             @as(type, *const [M.Key.serialized_len]u8),
             Param,
@@ -636,7 +655,8 @@ test "SELF: key round-trips through the codec for arbitrary key material" {
     }
     var buf: [M.Key.serialized_len]u8 = undefined;
     key.toBytes(&buf);
-    const back = M.Key.fromBytes(&buf);
+    var back: M.Key = undefined;
+    M.Key.fromBytes(&back, &buf);
     var buf2: [M.Key.serialized_len]u8 = undefined;
     back.toBytes(&buf2);
     try testing.expectEqualSlices(u8, &buf, &buf2);
@@ -653,25 +673,26 @@ test "SELF: genWithSeeds rejects byte-identical seeds anywhere among the 2k" {
     const alphas: [3]M.Index = .{ 1, 2, 3 };
     const betas: [3]M.Elem = .{ 1, 1, 1 };
     const good = detSeeds(3, 12345);
-    _ = try M.genWithSeeds(alphas, betas, good[0], good[1]);
+    var scratch: [2]M.Key = undefined;
+    try M.genWithSeeds(alphas, betas, &good[0], &good[1], &scratch);
 
     // the same pair handed to two instances — the plumbing bug this catches
     var s0 = good[0];
     s0[2] = s0[0];
     var s1 = good[1];
     s1[2] = s1[0];
-    try testing.expectError(error.SeedReuse, M.genWithSeeds(alphas, betas, s0, s1));
+    try testing.expectError(error.SeedReuse, M.genWithSeeds(alphas, betas, &s0, &s1, &scratch));
 
     // a single duplicate on one side only
     var s0b = good[0];
     s0b[1] = s0b[0];
-    try testing.expectError(error.SeedReuse, M.genWithSeeds(alphas, betas, s0b, good[1]));
+    try testing.expectError(error.SeedReuse, M.genWithSeeds(alphas, betas, &s0b, &good[1], &scratch));
 
     // a party-0 seed equal to a party-1 seed (the within-pair reuse `dpf`
     // already forbids, checked here because the bundle is where it gets lost)
     var s1c = good[1];
     s1c[0] = good[0][0];
-    try testing.expectError(error.SeedReuse, M.genWithSeeds(alphas, betas, good[0], s1c));
+    try testing.expectError(error.SeedReuse, M.genWithSeeds(alphas, betas, &good[0], &s1c, &scratch));
 }
 
 test "LEAK: with seeds REUSED across instances, the shared index prefix is readable" {
@@ -692,8 +713,10 @@ test "LEAK: with seeds REUSED across instances, the shared index prefix is reada
     const b: D.Index = 0b10110010; // agrees with `a` on the top 6 bits
     const common_prefix = 6;
 
-    const ka = D.genWithSeeds(a, 1, s0, s1);
-    const kb = D.genWithSeeds(b, 1, s0, s1);
+    var ka: [2]D.Key = undefined;
+    D.genWithSeeds(a, 1, &s0, &s1, &ka);
+    var kb: [2]D.Key = undefined;
+    D.genWithSeeds(b, 1, &s0, &s1, &kb);
 
     var equal_levels: usize = 0;
     for (ka[0].cw, kb[0].cw) |ca, cb| {
@@ -717,7 +740,8 @@ test "SELF: with INDEPENDENT seeds, a shared index prefix leaves no matching byt
     const alphas: [2]M.Index = .{ 0b10110000, 0b10110010 };
     const betas: [2]M.Elem = .{ 1, 1 };
     const seeds = detSeeds(2, 6161);
-    const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+    var keys: [2]M.Key = undefined;
+    try M.genWithSeeds(alphas, betas, &seeds[0], &seeds[1], &keys);
 
     var any_equal_level = false;
     for (keys[0].keys[0].cw, keys[0].keys[1].cw) |ca, cb| {
@@ -730,7 +754,8 @@ test "SELF: with INDEPENDENT seeds, a shared index prefix leaves no matching byt
     const M2 = Mpf(8, 4, 2);
     const same: [2]M2.Index = .{ 99, 99 };
     const s2 = detSeeds(2, 6262);
-    const k2 = try M2.genWithSeeds(same, betas, s2[0], s2[1]);
+    var k2: [2]M2.Key = undefined;
+    try M2.genWithSeeds(same, betas, &s2[0], &s2[1], &k2);
     var cw_a: [M2.Dpf.Key.cw_serialized_len]u8 = undefined;
     var cw_b: [M2.Dpf.Key.cw_serialized_len]u8 = undefined;
     k2[0].keys[0].serializeCw(&cw_a);
@@ -790,9 +815,10 @@ test "SELF: a single key's evaluations do not spike at the shared points (heuris
         betas[j] = 1;
     }
     const seeds = detSeeds(5, 24680);
-    const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+    var keys: [2]M.Key = undefined;
+    try M.genWithSeeds(alphas, betas, &seeds[0], &seeds[1], &keys);
     var e0: [256]M.Elem = undefined;
-    M.evalAll(0, keys[0], &e0);
+    M.evalAll(0, &keys[0], &e0);
 
     var distinct: usize = 0;
     for (0..256) |i| {
@@ -875,7 +901,8 @@ const KeyCorpus = struct {
             alphas[j] = @intCast(j * 37 % dom);
             betas[j] = @intCast(j + 1);
         }
-        const keys = FuzzMpf.genWithSeeds(alphas, betas, seeds[0], seeds[1]) catch unreachable;
+        var keys: [2]FuzzMpf.Key = undefined;
+        FuzzMpf.genWithSeeds(alphas, betas, &seeds[0], &seeds[1], &keys) catch unreachable;
         var real0: [FuzzMpf.Key.serialized_len]u8 = undefined;
         keys[0].toBytes(&real0);
         var real1: [FuzzMpf.Key.serialized_len]u8 = undefined;
@@ -976,7 +1003,8 @@ fn fuzzKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     // evaluated, both summed and per-instance, over a domain walk.
     var buf: [FuzzMpf.Key.serialized_len]u8 = undefined;
     smith.bytes(&buf);
-    const key = FuzzMpf.Key.fromBytes(&buf);
+    var key: FuzzMpf.Key = undefined;
+    FuzzMpf.Key.fromBytes(&key, &buf);
 
     const party: u1 = @truncate(smith.valueRangeAtMost(u8, 0, 1));
 
@@ -990,7 +1018,7 @@ fn fuzzKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     const Sink = EachSink(FuzzMpf);
     FuzzMpf.evalEachFullWith(
         party,
-        key,
+        &key,
         count,
         Sink{ .vals = &fast, .xs = &fast_xs, .n = &emitted },
         Sink.emit,
@@ -1002,10 +1030,10 @@ fn fuzzKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     var x: usize = 0;
     while (x < FuzzMpf.domain_size) : (x += 1) {
         const xi: FuzzMpf.Index = @intCast(x);
-        FuzzMpf.evalEach(party, key, xi, &each);
+        FuzzMpf.evalEach(party, &key, xi, &each);
         var sum: FuzzMpf.Elem = 0;
         for (each) |e| sum +%= e;
-        try std.testing.expectEqual(FuzzMpf.eval(party, key, xi), sum);
+        try std.testing.expectEqual(FuzzMpf.eval(party, &key, xi), sum);
         if (x < count) {
             try std.testing.expectEqual(x, fast_xs[x]);
             try std.testing.expectEqualSlices(FuzzMpf.Elem, &each, fast[x * 3 ..][0..3]);
@@ -1023,7 +1051,8 @@ fn fuzzKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     // again is a fixed point.
     var out: [FuzzMpf.Key.serialized_len]u8 = undefined;
     key.toBytes(&out);
-    const again = FuzzMpf.Key.fromBytes(&out);
+    var again: FuzzMpf.Key = undefined;
+    FuzzMpf.Key.fromBytes(&again, &out);
     var out2: [FuzzMpf.Key.serialized_len]u8 = undefined;
     again.toBytes(&out2);
     try std.testing.expectEqualSlices(u8, &out, &out2);
@@ -1060,13 +1089,14 @@ fn fuzzGenSeeds(_: void, smith: *std.testing.Smith) !void {
     for (&alphas) |*a| a.* = @truncate(smith.value(u8));
     for (&betas) |*b| b.* = smith.value(u32);
 
-    const keys = M.genWithSeeds(alphas, betas, s0, s1) catch return;
+    var keys: [2]M.Key = undefined;
+    M.genWithSeeds(alphas, betas, &s0, &s1, &keys) catch return;
     // Whatever Gen accepted must still reconstruct: the guard rejects, it does
     // not silently degrade.
     var e0: [M.domain_size]M.Elem = undefined;
     var e1: [M.domain_size]M.Elem = undefined;
-    M.evalAll(0, keys[0], &e0);
-    M.evalAll(1, keys[1], &e1);
+    M.evalAll(0, &keys[0], &e0);
+    M.evalAll(1, &keys[1], &e1);
     try std.testing.expectEqual(@as(?usize, null), M.firstMismatch(&e0, &e1, alphas, betas));
 }
 test "fuzz Mpf gen over arbitrary seeds never panics" {
@@ -1094,7 +1124,8 @@ test "corpus: the key seeds drive party and count, and the counts are pinned" {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [FuzzMpf.Key.serialized_len]u8 = undefined;
         smith.bytes(&buf);
-        const key = FuzzMpf.Key.fromBytes(&buf);
+        var key: FuzzMpf.Key = undefined;
+        FuzzMpf.Key.fromBytes(&key, &buf);
         const party: u1 = @truncate(smith.valueRangeAtMost(u8, 0, 1));
         parties[party] = true;
         const count: usize = smith.valueRangeAtMost(u16, 0, FuzzMpf.domain_size);
@@ -1104,7 +1135,7 @@ test "corpus: the key seeds drive party and count, and the counts are pinned" {
         const Sink = EachSink(FuzzMpf);
         FuzzMpf.evalEachFullWith(
             party,
-            key,
+            &key,
             count,
             Sink{ .vals = &fast, .xs = &fast_xs, .n = &emitted },
             Sink.emit,
@@ -1147,15 +1178,16 @@ test "corpus: the Gen seeds get past the distinctness guard, and the counts are 
         var betas: [4]GenMpf.Elem = undefined;
         for (&alphas) |*a| a.* = @truncate(smith.value(u8));
         for (&betas) |*b| b.* = smith.value(u32);
-        const keys = GenMpf.genWithSeeds(alphas, betas, s0, s1) catch {
+        var keys: [2]GenMpf.Key = undefined;
+        GenMpf.genWithSeeds(alphas, betas, &s0, &s1, &keys) catch {
             refused += 1;
             continue;
         };
         accepted += 1;
         var e0: [GenMpf.domain_size]GenMpf.Elem = undefined;
         var e1: [GenMpf.domain_size]GenMpf.Elem = undefined;
-        GenMpf.evalAll(0, keys[0], &e0);
-        GenMpf.evalAll(1, keys[1], &e1);
+        GenMpf.evalAll(0, &keys[0], &e0);
+        GenMpf.evalAll(1, &keys[1], &e1);
         for (e0, e1) |x, y| {
             if (x +% y != 0) nonzero_points += 1;
         }

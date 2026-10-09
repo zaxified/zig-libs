@@ -130,6 +130,7 @@ pub const Sha256Prg = struct {
     }
 
     /// `G(seed)` — the length-doubling PRG. Deterministic; pure computation.
+    // secret-api-ok: PRG interface, called once per tree node (and per leaf) from dpf/mpf walks, which run under the entry point's burn; a burn per call would multiply the walk cost. Seeds are consumed by value on purpose (register-sized, same-frame copies die with the walk's frame).
     pub fn expand(_: Sha256Prg, seed: Seed) Expanded {
         var e0: [32]u8 = undefined;
         var e1: [32]u8 = undefined;
@@ -155,6 +156,7 @@ pub const Sha256Prg = struct {
 
     /// `convert(L, seed)` — map a leaf seed into the output group Z_{2^{8L}}.
     /// Returns an unsigned integer of `8*L` bits (little-endian of the hash).
+    // secret-api-ok: PRG interface, called once per tree node (and per leaf) from dpf/mpf walks, which run under the entry point's burn; a burn per call would multiply the walk cost. Seeds are consumed by value on purpose (register-sized, same-frame copies die with the walk's frame).
     pub fn convert(_: Sha256Prg, comptime L: usize, seed: Seed) std.meta.Int(.unsigned, 8 * L) {
         if (L > 32) @compileError("convert: L must be <= 32 (SHA-256 output width)");
         var cv: [32]u8 = undefined;
@@ -230,6 +232,7 @@ pub const Aes128Mmo = struct {
         return self.mmo(sigma(x));
     }
 
+    // secret-api-ok: PRG interface, called once per tree node (and per leaf) from dpf/mpf walks, which run under the entry point's burn; a burn per call would multiply the walk cost. Seeds are consumed by value on purpose (register-sized, same-frame copies die with the walk's frame).
     pub fn expand(self: Aes128Mmo, seed: Seed) Expanded {
         // Both children under the SAME key, so one wide call: on AES-NI the
         // two blocks pipeline instead of serializing on round latency.
@@ -260,6 +263,7 @@ pub const Aes128Mmo = struct {
         };
     }
 
+    // secret-api-ok: PRG interface, called once per tree node (and per leaf) from dpf/mpf walks, which run under the entry point's burn; a burn per call would multiply the walk cost. Seeds are consumed by value on purpose (register-sized, same-frame copies die with the walk's frame).
     pub fn convert(self: Aes128Mmo, comptime L: usize, seed: Seed) std.meta.Int(.unsigned, 8 * L) {
         if (L > 32) @compileError("convert: L must be <= 32 (two AES blocks)");
         const Int = std.meta.Int(.unsigned, 8 * L);

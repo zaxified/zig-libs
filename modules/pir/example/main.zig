@@ -43,7 +43,8 @@ pub fn main() !void {
     // requests even without colluding on content.
     const s0: fss.prg.Seed = [_]u8{0x11} ** 16;
     const s1: fss.prg.Seed = [_]u8{0x22} ** 16;
-    const shares = try P.query(want_index, s0, s1);
+    var shares: [2]P.Share = undefined;
+    try P.query(want_index, &s0, &s1, &shares);
     std.debug.print("query built: two {d}-byte shares, one per server\n", .{P.share_len});
 
     // Servers: each holds ONE share and the full (replicated) database.
@@ -51,8 +52,8 @@ pub fn main() !void {
     const n_words = P.answerWords(database.record_len);
     var a0: [1]P.Word = undefined;
     var a1: [1]P.Word = undefined;
-    try P.answer(0, shares[0], database, a0[0..n_words]);
-    try P.answer(1, shares[1], database, a1[0..n_words]);
+    try P.answer(0, &shares[0], database, a0[0..n_words]);
+    try P.answer(1, &shares[1], database, a1[0..n_words]);
 
     // Client: combine the two answers into the record. Neither answer
     // alone is readable; only their sum recovers anything.
@@ -101,11 +102,12 @@ pub fn main() !void {
     // here would correlate this lookup with the one above.
     const s0b: fss.prg.Seed = [_]u8{0x33} ** 16;
     const s1b: fss.prg.Seed = [_]u8{0x44} ** 16;
-    const kw_shares = try P.queryKeyword("carol", s0b, s1b);
+    var kw_shares: [2]P.Share = undefined;
+    try P.queryKeyword("carol", &s0b, &s1b, &kw_shares);
     var kwa0: [1]P.Word = undefined;
     var kwa1: [1]P.Word = undefined;
-    try P.answer(0, kw_shares[0], kw_database, kwa0[0..n_words_kw]);
-    try P.answer(1, kw_shares[1], kw_database, kwa1[0..n_words_kw]);
+    try P.answer(0, &kw_shares[0], kw_database, kwa0[0..n_words_kw]);
+    try P.answer(1, &kw_shares[1], kw_database, kwa1[0..n_words_kw]);
     var kw_got: [kw_record_len]u8 = undefined;
     try P.reconstruct(kwa0[0..n_words_kw], kwa1[0..n_words_kw], &kw_got);
     std.debug.print("keyword lookup \"carol\" recovered: key=\"{s}\" payload=\"{s}\"\n", .{
@@ -132,11 +134,12 @@ pub fn main() !void {
     const Vct = pir.VerifiedWith(fss.prg.Sha256Prg, 3, 16, 8);
     const s0c: fss.prg.Seed = [_]u8{0x55} ** 16;
     const s1c: fss.prg.Seed = [_]u8{0x66} ** 16;
-    const ct_shares = try Pct.query(want_index, s0c, s1c);
+    var ct_shares: [2]Pct.Share = undefined;
+    try Pct.query(want_index, &s0c, &s1c, &ct_shares);
     var c0: [1]Pct.Word = undefined;
     var c1: [1]Pct.Word = undefined;
-    try Pct.answer(0, ct_shares[0], database, c0[0..n_words]);
-    try Pct.answer(1, ct_shares[1], database, c1[0..n_words]);
+    try Pct.answer(0, &ct_shares[0], database, c0[0..n_words]);
+    try Pct.answer(1, &ct_shares[1], database, c1[0..n_words]);
     var ct_got: [record_len]u8 = undefined;
     try Pct.reconstruct(c0[0..n_words], c1[0..n_words], &ct_got);
     if (!std.mem.eql(u8, &ct_got, records[want_index])) return error.WrongRecord;

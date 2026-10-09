@@ -48,6 +48,7 @@
 //! binaries drive this server in `server_interop.zig`. See `NOTICE`.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const encoding = @import("encoding.zig");
 const transport = @import("transport.zig");
 const services = @import("services.zig");
@@ -654,6 +655,7 @@ pub const Server = struct {
     /// Refresh `Server_ServerStatus` (i=2256) + `CurrentTime` (i=2258) from
     /// the driver's clock — the "this server is alive" heartbeat a simulation
     /// calls from its own loop (this module owns no timer).
+    // secret-api-ok: writes the server-status nodes from the clock; no key or credential is read (the lint flags `Server` only because `config.security` holds the server key pair by pointer-reachable value).
     pub fn refreshTime(srv: *Server, now_ms: i64, start_time: encoding.DateTime) !void {
         try srv.store.refreshServerStatus(.{
             .start_time = start_time,
@@ -713,6 +715,7 @@ pub const Server = struct {
     /// `channel_id == 0` (a connection that never opened a channel) matches
     /// nothing: `CreateSession` refuses to run without a channel, so no
     /// session can carry that id.
+    // secret-api-ok: walks the session table and frees sessions in place (`Session.deinit`); nothing secret is copied or read.
     pub fn closeChannelSessions(srv: *Server, channel_id: u32) usize {
         if (channel_id == 0) return 0;
         var removed: usize = 0;
@@ -734,6 +737,7 @@ pub const Server = struct {
     /// Close every session whose `RevisedSessionTimeout` elapsed without a
     /// request (§5.6.2: the server "shall" delete it, along with its
     /// subscriptions).
+    // secret-api-ok: walks the session table and frees timed-out sessions in place (`Session.deinit`); nothing secret is copied or read.
     pub fn expireSessions(srv: *Server, now_ms: i64) void {
         var i: usize = 0;
         while (i < srv.sessions.items.len) {
@@ -1310,7 +1314,7 @@ pub const Connection = struct {
             c.server.allocator,
             header,
             wire_body,
-            sec.credentials.private_key,
+            &sec.credentials.private_key,
             client_cert,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1383,7 +1387,7 @@ pub const Connection = struct {
             header,
             wire_body,
             c.sec_mode,
-            keys,
+            &keys,
             .client_to_server,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1543,7 +1547,7 @@ pub const Connection = struct {
             @intFromEnum(chunk_type),
             body.writer.buffered(),
             c.sec_mode,
-            keys,
+            &keys,
             .server_to_client,
         );
         defer c.server.allocator.free(sealed);
@@ -1599,7 +1603,7 @@ pub const Connection = struct {
             transport.MessageType.open_secure_channel.code(),
             body.writer.buffered(),
             encrypted_region_offset,
-            sec.credentials,
+            &sec.credentials,
             client_cert,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1618,6 +1622,10 @@ pub const Connection = struct {
     /// driver's poll times out (`feed` already does it for the requests it
     /// processes).
     pub fn tick(c: *Connection, out: *std.Io.Writer, now_ms: i64) ServerError!void {
+        return burn.run(burn.tick_burn, ServerError!void, tickBody, .{ c, out, now_ms });
+    }
+
+    fn tickBody(c: *Connection, out: *std.Io.Writer, now_ms: i64) ServerError!void {
         if (c.state == .closed) return;
         c.server.expireSessions(now_ms);
         for (c.server.sessions.items) |session| {
@@ -2225,7 +2233,7 @@ pub const Connection = struct {
                 password = security.decryptUserTokenSecret(
                     ctx.arena,
                     password,
-                    sec.credentials.private_key,
+                    &sec.credentials.private_key,
                     &session.server_nonce,
                 ) catch |err| return switch (err) {
                     error.OutOfMemory => status.bad_out_of_memory,
@@ -3588,21 +3596,33 @@ const TestPki = struct {
         client_not_after: []const u8 = "300101000000Z",
     }) !TestPki {
         const random = prng.random();
-        const client = try security.Credentials.generateSelfSigned(gpa, random, .{
-            .modulus_bits = 512,
-            .common_name = "zig-libs opcua test client",
-            .not_before = opts.client_not_before,
-            .not_after = opts.client_not_after,
-            .application_uri = "urn:zig-libs:opcua:test-client",
-        });
+        var client: security.Credentials = undefined;
+        try security.Credentials.generateSelfSigned(
+            gpa,
+            random,
+            .{
+                .modulus_bits = 512,
+                .common_name = "zig-libs opcua test client",
+                .not_before = opts.client_not_before,
+                .not_after = opts.client_not_after,
+                .application_uri = "urn:zig-libs:opcua:test-client",
+            },
+            &client,
+        );
         errdefer client.deinit(gpa);
-        const server_creds = try security.Credentials.generateSelfSigned(gpa, random, .{
-            .modulus_bits = 512,
-            .common_name = "zig-libs opcua test server",
-            .not_before = opts.server_not_before,
-            .not_after = opts.server_not_after,
-            .application_uri = "urn:zig-libs:opcua:test-server",
-        });
+        var server_creds: security.Credentials = undefined;
+        try security.Credentials.generateSelfSigned(
+            gpa,
+            random,
+            .{
+                .modulus_bits = 512,
+                .common_name = "zig-libs opcua test server",
+                .not_before = opts.server_not_before,
+                .not_after = opts.server_not_after,
+                .application_uri = "urn:zig-libs:opcua:test-server",
+            },
+            &server_creds,
+        );
         return .{ .client = client, .server = server_creds, .prng = prng };
     }
 
@@ -6789,7 +6809,7 @@ test "secure negatives: tampered signature, wrong keys, malformed padding" {
         std.mem.writeInt(u32, body[8..12], 99, .little);
         std.mem.writeInt(u32, body[12..16], 99, .little);
         @memset(body[16..], 0);
-        const forged = try security.symmetricSignAndEncrypt(gpa, "MSG", &body, .sign_and_encrypt, wrong_keys, .client_to_server);
+        const forged = try security.symmetricSignAndEncrypt(gpa, "MSG", &body, .sign_and_encrypt, &wrong_keys, .client_to_server);
         defer gpa.free(forged);
         try rig.conn.feed(forged, &rig.server_out.writer, rig.now_ms);
         try rig.expectTransportError(status.bad_security_checks_failed);
@@ -6856,12 +6876,18 @@ test "secure negatives: the OpenSecureChannel gate" {
     {
         var endpoint_buf: [3]services.EndpointDescription = undefined;
         const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
-        const stranger = try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
-            .modulus_bits = 512,
-            .common_name = "a different server",
-            .not_before = "190101000000Z",
-            .not_after = "300101000000Z",
-        });
+        var stranger: security.Credentials = undefined;
+        try security.Credentials.generateSelfSigned(
+            gpa,
+            prng.random(),
+            .{
+                .modulus_bits = 512,
+                .common_name = "a different server",
+                .not_before = "190101000000Z",
+                .not_after = "300101000000Z",
+            },
+            &stranger,
+        );
         defer stranger.deinit(gpa);
 
         var rig: TestRig = undefined;
@@ -6992,12 +7018,18 @@ test "secure: the session's ClientSignature must cover serverCertificate + serve
 
     // (c) A well-formed signature made with somebody else's private key.
     {
-        const impostor = try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
-            .modulus_bits = 512,
-            .common_name = "impostor",
-            .not_before = "190101000000Z",
-            .not_after = "300101000000Z",
-        });
+        var impostor: security.Credentials = undefined;
+        try security.Credentials.generateSelfSigned(
+            gpa,
+            prng.random(),
+            .{
+                .modulus_bits = 512,
+                .common_name = "impostor",
+                .not_before = "190101000000Z",
+                .not_after = "300101000000Z",
+            },
+            &impostor,
+        );
         defer impostor.deinit(gpa);
 
         var rig: TestRig = undefined;
@@ -7017,12 +7049,18 @@ test "secure: the session's ClientSignature must cover serverCertificate + serve
 
     // (d) CreateSession presenting a certificate other than the channel's.
     {
-        const other = try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
-            .modulus_bits = 512,
-            .common_name = "other client",
-            .not_before = "190101000000Z",
-            .not_after = "300101000000Z",
-        });
+        var other: security.Credentials = undefined;
+        try security.Credentials.generateSelfSigned(
+            gpa,
+            prng.random(),
+            .{
+                .modulus_bits = 512,
+                .common_name = "other client",
+                .not_before = "190101000000Z",
+                .not_after = "300101000000Z",
+            },
+            &other,
+        );
         defer other.deinit(gpa);
 
         var rig: TestRig = undefined;

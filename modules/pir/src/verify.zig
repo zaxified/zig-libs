@@ -78,6 +78,7 @@
 const std = @import("std");
 const fss = @import("fss");
 const db_mod = @import("db.zig");
+const burn = @import("burn.zig");
 const pir_mod = @import("pir.zig");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 /// helpers, in the format `std.testing.Smith` actually reads.
@@ -241,13 +242,26 @@ pub fn VerifiedWith(
         /// reconstruct to zero (see the module doc).
         pub fn query(
             index: usize,
-            mac_rand: [tag_word_len]u8,
-            sv0: Seed,
-            sv1: Seed,
-            st0: Seed,
-            st1: Seed,
-        ) Error!Query {
-            const seeds = [4]Seed{ sv0, sv1, st0, st1 };
+            mac_rand: *const [tag_word_len]u8,
+            sv0: *const Seed,
+            sv1: *const Seed,
+            st0: *const Seed,
+            st1: *const Seed,
+            out: *Query,
+        ) Error!void {
+            return burn.run(burn.query_burn, Error!void, queryBody, .{ index, mac_rand, sv0, sv1, st0, st1, out });
+        }
+
+        fn queryBody(
+            index: usize,
+            mac_rand: *const [tag_word_len]u8,
+            sv0: *const Seed,
+            sv1: *const Seed,
+            st0: *const Seed,
+            st1: *const Seed,
+            out: *Query,
+        ) Error!void {
+            const seeds = [4]Seed{ sv0.*, sv1.*, st0.*, st1.* };
             for (0..seeds.len) |a| {
                 for (a + 1..seeds.len) |b| {
                     if (std.mem.eql(u8, &seeds[a], &seeds[b])) return error.SeedReuse;
@@ -255,13 +269,15 @@ pub fn VerifiedWith(
             }
             // Value channel: the base protocol verbatim (β = 1, index check
             // included).
-            const value_shares = try Value.query(index, sv0, sv1);
+            var value_shares: [2]Value.Share = undefined;
+            try Value.query(index, sv0, sv1, &value_shares);
             // Tag channel: β = m. The DPF hides β exactly as it hides α, so
             // handing the server this key does not hand it the MAC key.
-            var m: TagWord = std.mem.readInt(TagWord, &mac_rand, .little);
+            var m: TagWord = std.mem.readInt(TagWord, mac_rand, .little);
             m |= 1;
-            const tag_keys = TagDpf.genWithSeeds(@intCast(index), m, st0, st1);
-            return .{
+            var tag_keys: [2]TagDpf.Key = undefined;
+            TagDpf.genWithSeeds(@intCast(index), m, st0, st1, &tag_keys);
+            out.* = .{
                 .shares = .{
                     .{ .value = value_shares[0], .tag = tag_keys[0] },
                     .{ .value = value_shares[1], .tag = tag_keys[1] },
@@ -288,18 +304,19 @@ pub fn VerifiedWith(
         /// the record count) so a miss is a present-but-filler record.
         pub fn queryKeyword(
             keyword: []const u8,
-            mac_rand: [tag_word_len]u8,
-            sv0: Seed,
-            sv1: Seed,
-            st0: Seed,
-            st1: Seed,
-        ) Error!Query {
-            return query(Value.keywordIndex(keyword), mac_rand, sv0, sv1, st0, st1);
+            mac_rand: *const [tag_word_len]u8,
+            sv0: *const Seed,
+            sv1: *const Seed,
+            st0: *const Seed,
+            st1: *const Seed,
+            out: *Query,
+        ) Error!void {
+            return query(Value.keywordIndex(keyword), mac_rand, sv0, sv1, st0, st1, out);
         }
 
         /// Serialize a bundled share: value key then tag key, fixed offsets,
         /// no header — the same no-length-field discipline as the base codec.
-        pub fn shareToBytes(share: Ver.Share, buf: *[share_len]u8) void {
+        pub fn shareToBytes(share: *const Ver.Share, buf: *[share_len]u8) void {
             share.value.toBytes(buf[0..Value.share_len]);
             share.tag.toBytes(buf[Value.share_len..][0..TagDpf.Key.serialized_len]);
         }
@@ -307,12 +324,10 @@ pub fn VerifiedWith(
         /// Parse a bundled share. **Untrusted boundary** (a server parses a
         /// client's bytes): exactly one accepted length, every field a
         /// fixed-width read at a compile-time-known offset.
-        pub fn shareFromBytes(buf: []const u8) Error!Ver.Share {
+        pub fn shareFromBytes(out: *Ver.Share, buf: []const u8) Error!void {
             if (buf.len != share_len) return error.ShareLengthMismatch;
-            return .{
-                .value = try Value.shareFromBytes(buf[0..Value.share_len]),
-                .tag = TagDpf.Key.fromBytes(buf[Value.share_len..][0..TagDpf.Key.serialized_len]),
-            };
+            try Value.shareFromBytes(&out.value, buf[0..Value.share_len]);
+            TagDpf.Key.fromBytes(&out.tag, buf[Value.share_len..][0..TagDpf.Key.serialized_len]);
         }
 
         // ── server: answer computation ────────────────────────────────────
@@ -348,12 +363,12 @@ pub fn VerifiedWith(
         /// than forking its loop.
         pub fn answer(
             party: u1,
-            share: Ver.Share,
+            share: *const Ver.Share,
             database: Database,
             value_out: []Word,
             tag_out: []TagWord,
         ) Error!void {
-            try Value.answer(party, share.value, database, value_out);
+            try Value.answer(party, &share.value, database, value_out);
 
             if (tag_out.len != tagWords(database.record_len)) return error.AnswerLengthMismatch;
             const n = database.count();
@@ -370,7 +385,7 @@ pub fn VerifiedWith(
             const Ctx = struct { database: Database, tag_out: []TagWord, per: usize };
             TagDpf.evalFullWith(
                 party,
-                share.tag,
+                &share.tag,
                 n,
                 Ctx{ .database = database, .tag_out = tag_out, .per = per },
                 struct {
@@ -428,7 +443,18 @@ pub fn VerifiedWith(
         /// public. The DPF evaluation underneath keeps `fss`'s documented
         /// posture (control-bit-gated branches, scoped-out hardening there).
         pub fn reconstruct(
-            secret: Secret,
+            secret: *const Secret,
+            v0: []const Word,
+            v1: []const Word,
+            t0: []const TagWord,
+            t1: []const TagWord,
+            record_out: []u8,
+        ) Error!void {
+            return burn.run(burn.reconstruct_burn, Error!void, reconstructBody, .{ secret, v0, v1, t0, t1, record_out });
+        }
+
+        fn reconstructBody(
+            secret: *const Secret,
             v0: []const Word,
             v1: []const Word,
             t0: []const TagWord,
@@ -461,7 +487,18 @@ pub fn VerifiedWith(
         /// Verification reads words directly from the buffers, so no
         /// intermediate arrays (and no allocator) are needed.
         pub fn reconstructFromBytes(
-            secret: Secret,
+            secret: *const Secret,
+            v0: []const u8,
+            v1: []const u8,
+            t0: []const u8,
+            t1: []const u8,
+            record_out: []u8,
+        ) Error!void {
+            return burn.run(burn.reconstruct_burn, Error!void, reconstructFromBytesBody, .{ secret, v0, v1, t0, t1, record_out });
+        }
+
+        fn reconstructFromBytesBody(
+            secret: *const Secret,
             v0: []const u8,
             v1: []const u8,
             t0: []const u8,
@@ -572,22 +609,23 @@ const Run = struct {
     fn init(index: usize, tag: u64) !Run {
         var r: Run = undefined;
         fillDb(&r.db_bytes, t_record_len);
-        r.q = try V.query(
+        try V.query(
             index,
-            detMac(V.tag_word_len, tag),
-            detSeed(tag *% 4 + 0),
-            detSeed(tag *% 4 + 1),
-            detSeed(tag *% 4 + 2),
-            detSeed(tag *% 4 + 3),
+            &detMac(V.tag_word_len, tag),
+            &detSeed(tag *% 4 + 0),
+            &detSeed(tag *% 4 + 1),
+            &detSeed(tag *% 4 + 2),
+            &detSeed(tag *% 4 + 3),
+            &r.q,
         );
         for (0..2) |b| {
-            try V.answer(@intCast(b), r.q.shares[b], r.database(), &r.va[b], &r.ta[b]);
+            try V.answer(@intCast(b), &r.q.shares[b], r.database(), &r.va[b], &r.ta[b]);
         }
         return r;
     }
 
     fn reconstruct(self: *const Run, out: *[t_record_len]u8) Error!void {
-        return V.reconstruct(self.q.secret, &self.va[0], &self.va[1], &self.ta[0], &self.ta[1], out);
+        return V.reconstruct(&self.q.secret, &self.va[0], &self.va[1], &self.ta[0], &self.ta[1], out);
     }
 };
 
@@ -612,7 +650,8 @@ test "SOUNDNESS: the MAC scalar is forced ODD, whatever the caller supplies" {
     // An all-even `mac_rand`, i.e. the worst thing a caller can hand in.
     var mac_rand = [_]u8{0} ** W.tag_word_len;
     for (&mac_rand, 0..) |*b, i| b.* = @truncate((i * 2) & 0xFE);
-    const q = try W.query(0, mac_rand, seeds[0], seeds[1], seeds[2], seeds[3]);
+    var q: W.Query = undefined;
+    try W.query(0, &mac_rand, &seeds[0], &seeds[1], &seeds[2], &seeds[3], &q);
     try std.testing.expect(q.secret.m & 1 == 1);
 
     // And an already-odd one must be left alone apart from that bit, so the
@@ -620,7 +659,8 @@ test "SOUNDNESS: the MAC scalar is forced ODD, whatever the caller supplies" {
     var odd_rand = [_]u8{0} ** W.tag_word_len;
     for (&odd_rand, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
     const raw = std.mem.readInt(W.TagWord, &odd_rand, .little);
-    const q2 = try W.query(0, odd_rand, seeds[0], seeds[1], seeds[2], seeds[3]);
+    var q2: W.Query = undefined;
+    try W.query(0, &odd_rand, &seeds[0], &seeds[1], &seeds[2], &seeds[3], &q2);
     try std.testing.expectEqual(raw | 1, q2.secret.m);
 }
 
@@ -651,19 +691,21 @@ test "SELF: honest verified retrieval returns the right record for EVERY index, 
 
             for (0..c.count) |i| {
                 const t = @as(u64, c.bits) * 1_000_003 + i * 31 + record_len;
-                const q = try W.query(
+                var q: W.Query = undefined;
+                try W.query(
                     i,
-                    detMac(W.tag_word_len, t),
-                    detSeed(t * 4 + 0),
-                    detSeed(t * 4 + 1),
-                    detSeed(t * 4 + 2),
-                    detSeed(t * 4 + 3),
+                    &detMac(W.tag_word_len, t),
+                    &detSeed(t * 4 + 0),
+                    &detSeed(t * 4 + 1),
+                    &detSeed(t * 4 + 2),
+                    &detSeed(t * 4 + 3),
+                    &q,
                 );
                 for (0..2) |b| {
-                    try W.answer(@intCast(b), q.shares[b], database, va[b][0..per], ta[b][0..tw]);
+                    try W.answer(@intCast(b), &q.shares[b], database, va[b][0..per], ta[b][0..tw]);
                 }
                 try W.reconstruct(
-                    q.secret,
+                    &q.secret,
                     va[0][0..per],
                     va[1][0..per],
                     ta[0][0..tw],
@@ -709,11 +751,12 @@ test "SELF: wire round-trip — bundled share and both answers survive serializa
     const run = try Run.init(3, 77);
 
     var wire: [V.share_len]u8 = undefined;
-    V.shareToBytes(run.q.shares[0], &wire);
-    const parsed = try V.shareFromBytes(&wire);
+    V.shareToBytes(&run.q.shares[0], &wire);
+    var parsed: V.Share = undefined;
+    try V.shareFromBytes(&parsed, &wire);
     var va: [2]V.Word = undefined;
     var ta: [3]V.TagWord = undefined;
-    try V.answer(0, parsed, run.database(), &va, &ta);
+    try V.answer(0, &parsed, run.database(), &va, &ta);
     try testing.expectEqualSlices(V.Word, &run.va[0], &va);
     try testing.expectEqualSlices(V.TagWord, &run.ta[0], &ta);
 
@@ -729,7 +772,7 @@ test "SELF: wire round-trip — bundled share and both answers survive serializa
     try testing.expectEqualSlices(V.TagWord, &run.ta[1], &t_back);
 
     var got: [t_record_len]u8 = undefined;
-    try V.reconstructFromBytes(run.q.secret, &vb[0], &vb[1], &tb[0], &tb[1], &got);
+    try V.reconstructFromBytes(&run.q.secret, &vb[0], &vb[1], &tb[0], &tb[1], &got);
     try testing.expectEqualSlices(u8, run.database().record(3), &got);
 }
 
@@ -757,33 +800,37 @@ test "SELF: verified keyword lookup — a hit verifies; an UNPOPULATED slot reje
     // too — byte-identical bundled shares under the same inputs.
     {
         const database = try Database.init(&bytes, record_len);
-        const q = try W.queryKeyword(
+        var q: W.Query = undefined;
+        try W.queryKeyword(
             kw,
-            detMac(W.tag_word_len, 6001),
-            detSeed(6002),
-            detSeed(6003),
-            detSeed(6004),
-            detSeed(6005),
+            &detMac(W.tag_word_len, 6001),
+            &detSeed(6002),
+            &detSeed(6003),
+            &detSeed(6004),
+            &detSeed(6005),
+            &q,
         );
-        const q_idx = try W.query(
+        var q_idx: W.Query = undefined;
+        try W.query(
             idx,
-            detMac(W.tag_word_len, 6001),
-            detSeed(6002),
-            detSeed(6003),
-            detSeed(6004),
-            detSeed(6005),
+            &detMac(W.tag_word_len, 6001),
+            &detSeed(6002),
+            &detSeed(6003),
+            &detSeed(6004),
+            &detSeed(6005),
+            &q_idx,
         );
         var w_kw: [W.share_len]u8 = undefined;
         var w_idx: [W.share_len]u8 = undefined;
         for (0..2) |b| {
-            W.shareToBytes(q.shares[b], &w_kw);
-            W.shareToBytes(q_idx.shares[b], &w_idx);
+            W.shareToBytes(&q.shares[b], &w_kw);
+            W.shareToBytes(&q_idx.shares[b], &w_idx);
             try testing.expectEqualSlices(u8, &w_idx, &w_kw);
         }
         for (0..2) |b| {
-            try W.answer(@intCast(b), q.shares[b], database, va[b][0..per], ta[b][0..tw]);
+            try W.answer(@intCast(b), &q.shares[b], database, va[b][0..per], ta[b][0..tw]);
         }
-        try W.reconstruct(q.secret, va[0][0..per], va[1][0..per], ta[0][0..tw], ta[1][0..tw], &got);
+        try W.reconstruct(&q.secret, va[0][0..per], va[1][0..per], ta[0][0..tw], ta[1][0..tw], &got);
         try testing.expectEqualSlices(u8, kw, got[0..kw.len]);
     }
 
@@ -801,20 +848,22 @@ test "SELF: verified keyword lookup — a hit verifies; an UNPOPULATED slot reje
             const cand = std.fmt.bufPrint(&buf, "far-{d}", .{t}) catch unreachable;
             if (W.Value.keywordIndex(cand) >= 100) break cand;
         } else unreachable;
-        const q = try W.queryKeyword(
+        var q: W.Query = undefined;
+        try W.queryKeyword(
             far_kw,
-            detMac(W.tag_word_len, 6101),
-            detSeed(6102),
-            detSeed(6103),
-            detSeed(6104),
-            detSeed(6105),
+            &detMac(W.tag_word_len, 6101),
+            &detSeed(6102),
+            &detSeed(6103),
+            &detSeed(6104),
+            &detSeed(6105),
+            &q,
         );
         for (0..2) |b| {
-            try W.answer(@intCast(b), q.shares[b], small, va[b][0..per], ta[b][0..tw]);
+            try W.answer(@intCast(b), &q.shares[b], small, va[b][0..per], ta[b][0..tw]);
         }
         try testing.expectError(
             error.AnswerRejected,
-            W.reconstruct(q.secret, va[0][0..per], va[1][0..per], ta[0][0..tw], ta[1][0..tw], &got),
+            W.reconstruct(&q.secret, va[0][0..per], va[1][0..per], ta[0][0..tw], ta[1][0..tw], &got),
         );
     }
 }
@@ -887,7 +936,7 @@ test "ATTACK: BOTH servers zeroing everything is rejected — the presence word 
     const zt: [3 * V.tag_word_len]u8 = @splat(0);
     try testing.expectError(
         error.AnswerRejected,
-        V.reconstructFromBytes(run.q.secret, &zv, &zv, &zt, &zt, &got),
+        V.reconstructFromBytes(&run.q.secret, &zv, &zv, &zt, &zt, &got),
     );
 }
 
@@ -917,7 +966,7 @@ test "ATTACK: ONE server answering over a privately modified database is rejecte
 
     var tampered = run;
     tampered.db_bytes[2 * t_record_len] ^= 0x01;
-    try V.answer(1, tampered.q.shares[1], tampered.database(), &tampered.va[1], &tampered.ta[1]);
+    try V.answer(1, &tampered.q.shares[1], tampered.database(), &tampered.va[1], &tampered.ta[1]);
     tampered.db_bytes = run.db_bytes; // client-side state; servers already answered
     try testing.expectError(error.AnswerRejected, tampered.reconstruct(&got));
 
@@ -925,7 +974,7 @@ test "ATTACK: ONE server answering over a privately modified database is rejecte
     // divergence is detected regardless of whether the client's index is hit.
     var tampered2 = run;
     tampered2.db_bytes[9 * t_record_len] ^= 0x01;
-    try V.answer(1, tampered2.q.shares[1], tampered2.database(), &tampered2.va[1], &tampered2.ta[1]);
+    try V.answer(1, &tampered2.q.shares[1], tampered2.database(), &tampered2.va[1], &tampered2.ta[1]);
     tampered2.db_bytes = run.db_bytes;
     try testing.expectError(error.AnswerRejected, tampered2.reconstruct(&got));
 }
@@ -943,7 +992,7 @@ test "ATTACK NOT CAUGHT: both servers agreeing on the same wrong database is ACC
 
     run.db_bytes[2 * t_record_len] ^= 0x01; // both servers see the same DB'
     for (0..2) |b| {
-        try V.answer(@intCast(b), run.q.shares[b], run.database(), &run.va[b], &run.ta[b]);
+        try V.answer(@intCast(b), &run.q.shares[b], run.database(), &run.va[b], &run.ta[b]);
     }
     try run.reconstruct(&got); // accepted…
     try testing.expectEqualSlices(u8, run.database().record(2), &got); // …and it IS DB'[2]
@@ -1040,16 +1089,18 @@ test "EXACT: bundled share length is a constant — independent of index AND of 
     var wire: [V.share_len]u8 = undefined;
     for ([_]usize{ 0, 7, 15 }) |i| {
         for ([_]u64{ 1, 500, 999 }) |mt| {
-            const q = try V.query(
+            var q: V.Query = undefined;
+            try V.query(
                 i,
-                detMac(V.tag_word_len, mt),
-                detSeed(mt * 4 + 0),
-                detSeed(mt * 4 + 1),
-                detSeed(mt * 4 + 2),
-                detSeed(mt * 4 + 3),
+                &detMac(V.tag_word_len, mt),
+                &detSeed(mt * 4 + 0),
+                &detSeed(mt * 4 + 1),
+                &detSeed(mt * 4 + 2),
+                &detSeed(mt * 4 + 3),
+                &q,
             );
-            V.shareToBytes(q.shares[0], &wire); // compile-time length check IS the assertion
-            V.shareToBytes(q.shares[1], &wire);
+            V.shareToBytes(&q.shares[0], &wire); // compile-time length check IS the assertion
+            V.shareToBytes(&q.shares[1], &wire);
         }
     }
 }
@@ -1066,15 +1117,17 @@ test "EXACT: with seeds fixed, varying m changes ONLY the tag key's final output
     const s = [4]fss.prg.Seed{ detSeed(51), detSeed(52), detSeed(53), detSeed(54) };
     const index = 6;
 
-    const qa = try V.query(index, detMac(V.tag_word_len, 61), s[0], s[1], s[2], s[3]);
-    const qb = try V.query(index, detMac(V.tag_word_len, 62), s[0], s[1], s[2], s[3]);
+    var qa: V.Query = undefined;
+    try V.query(index, &detMac(V.tag_word_len, 61), &s[0], &s[1], &s[2], &s[3], &qa);
+    var qb: V.Query = undefined;
+    try V.query(index, &detMac(V.tag_word_len, 62), &s[0], &s[1], &s[2], &s[3], &qb);
     try testing.expect(qa.secret.m != qb.secret.m); // distinct m, or the test is vacuous
 
     for (0..2) |b| {
         var wa: [V.share_len]u8 = undefined;
         var wb: [V.share_len]u8 = undefined;
-        V.shareToBytes(qa.shares[b], &wa);
-        V.shareToBytes(qb.shares[b], &wb);
+        V.shareToBytes(&qa.shares[b], &wa);
+        V.shareToBytes(&qb.shares[b], &wb);
         // Everything up to the final tag CW is identical…
         const final_off = V.share_len - V.tag_word_len;
         try testing.expectEqualSlices(u8, wa[0..final_off], wb[0..final_off]);
@@ -1179,18 +1232,20 @@ test "F1: two-word (E,G) tampering is a carry-coupled selective-failure oracle a
             // Fresh, independent seeds AND `m` per query, exactly as the
             // protocol requires — only the adversary's (E,G) is held fixed.
             const tag = 700_000 + index * K + k;
-            const q = try LowS.query(
+            var q: LowS.Query = undefined;
+            try LowS.query(
                 index,
-                detMac(LowS.tag_word_len, tag),
-                detSeed(tag * 4 + 0),
-                detSeed(tag * 4 + 1),
-                detSeed(tag * 4 + 2),
-                detSeed(tag * 4 + 3),
+                &detMac(LowS.tag_word_len, tag),
+                &detSeed(tag * 4 + 0),
+                &detSeed(tag * 4 + 1),
+                &detSeed(tag * 4 + 2),
+                &detSeed(tag * 4 + 3),
+                &q,
             );
             var va: [2][2]LowS.Word = undefined;
             var ta: [2][3]LowS.TagWord = undefined;
             for (0..2) |b| {
-                try LowS.answer(@intCast(b), q.shares[b], database, &va[b], &ta[b]);
+                try LowS.answer(@intCast(b), &q.shares[b], database, &va[b], &ta[b]);
             }
             // One malicious server (party 1) adds the SAME error to BOTH value
             // words and the SAME guess to BOTH value-word tags — never the
@@ -1199,7 +1254,7 @@ test "F1: two-word (E,G) tampering is a carry-coupled selective-failure oracle a
             va[1][1] +%= E;
             ta[1][0] +%= G;
             ta[1][1] +%= G;
-            if (LowS.reconstruct(q.secret, &va[0], &va[1], &ta[0], &ta[1], &out)) |_| {
+            if (LowS.reconstruct(&q.secret, &va[0], &va[1], &ta[0], &ta[1], &out)) |_| {
                 if (index == 0) accepts_equal += 1 else accepts_unequal += 1;
             } else |_| {}
         }
@@ -1253,18 +1308,20 @@ test "EXACT: the tag channel's server access order is a function of the record c
         var have_reference = false;
 
         for ([_]usize{ 0, 3, 15 }) |index| {
-            const q = try V.query(
+            var q: V.Query = undefined;
+            try V.query(
                 index,
-                detMac(V.tag_word_len, index + 900),
-                detSeed(index * 4 + 100),
-                detSeed(index * 4 + 101),
-                detSeed(index * 4 + 102),
-                detSeed(index * 4 + 103),
+                &detMac(V.tag_word_len, index + 900),
+                &detSeed(index * 4 + 100),
+                &detSeed(index * 4 + 101),
+                &detSeed(index * 4 + 102),
+                &detSeed(index * 4 + 103),
+                &q,
             );
             inline for (.{ 0, 1 }) |party| {
                 var xs: [V.domain_size]usize = undefined;
                 var n: usize = 0;
-                V.TagDpf.evalFullWith(party, q.shares[party].tag, count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
+                V.TagDpf.evalFullWith(party, &q.shares[party].tag, count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
                 try testing.expectEqual(count, n);
                 for (0..count) |x| try testing.expectEqual(x, xs[x]);
                 if (have_reference) {
@@ -1280,10 +1337,11 @@ test "EXACT: the tag channel's server access order is a function of the record c
         // must not be able to steer the access pattern either.
         var buf: [V.TagDpf.Key.serialized_len]u8 = undefined;
         for (&buf, 0..) |*b, i| b.* = @truncate(i *% 197 +% 31);
-        const junk = V.TagDpf.Key.fromBytes(&buf);
+        var junk: V.TagDpf.Key = undefined;
+        V.TagDpf.Key.fromBytes(&junk, &buf);
         var xs: [V.domain_size]usize = undefined;
         var n: usize = 0;
-        V.TagDpf.evalFullWith(1, junk, count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
+        V.TagDpf.evalFullWith(1, &junk, count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
         try testing.expectEqual(count, n);
         try testing.expectEqualSlices(usize, reference[0..count], xs[0..count]);
     }
@@ -1294,51 +1352,54 @@ test "EXACT: the tag channel's server access order is a function of the record c
 test "SELF: geometry errors are returned, never asserted" {
     const seeds = [4]fss.prg.Seed{ detSeed(0), detSeed(1), detSeed(2), detSeed(3) };
     const mac = detMac(V.tag_word_len, 9);
+    var scratch: V.Query = undefined;
 
     try testing.expectError(
         error.IndexOutOfDomain,
-        V.query(16, mac, seeds[0], seeds[1], seeds[2], seeds[3]),
+        V.query(16, &mac, &seeds[0], &seeds[1], &seeds[2], &seeds[3], &scratch),
     );
     // seed reuse anywhere in the four — including ACROSS the two channels,
     // where reuse would correlate the value and tag trees
-    try testing.expectError(error.SeedReuse, V.query(0, mac, seeds[0], seeds[0], seeds[2], seeds[3]));
-    try testing.expectError(error.SeedReuse, V.query(0, mac, seeds[0], seeds[1], seeds[0], seeds[3]));
-    try testing.expectError(error.SeedReuse, V.query(0, mac, seeds[0], seeds[1], seeds[2], seeds[1]));
+    try testing.expectError(error.SeedReuse, V.query(0, &mac, &seeds[0], &seeds[0], &seeds[2], &seeds[3], &scratch));
+    try testing.expectError(error.SeedReuse, V.query(0, &mac, &seeds[0], &seeds[1], &seeds[0], &seeds[3], &scratch));
+    try testing.expectError(error.SeedReuse, V.query(0, &mac, &seeds[0], &seeds[1], &seeds[2], &seeds[1], &scratch));
 
-    const q = try V.query(0, mac, seeds[0], seeds[1], seeds[2], seeds[3]);
+    var q: V.Query = undefined;
+    try V.query(0, &mac, &seeds[0], &seeds[1], &seeds[2], &seeds[3], &q);
     var db_bytes: [t_count * t_record_len]u8 = undefined;
     fillDb(&db_bytes, t_record_len);
     const database = try Database.init(&db_bytes, t_record_len);
 
     var va: [2]V.Word = undefined;
     var ta: [3]V.TagWord = undefined;
-    try testing.expectError(error.AnswerLengthMismatch, V.answer(0, q.shares[0], database, va[0..1], &ta));
-    try testing.expectError(error.AnswerLengthMismatch, V.answer(0, q.shares[0], database, &va, ta[0..2]));
+    try testing.expectError(error.AnswerLengthMismatch, V.answer(0, &q.shares[0], database, va[0..1], &ta));
+    try testing.expectError(error.AnswerLengthMismatch, V.answer(0, &q.shares[0], database, &va, ta[0..2]));
 
-    try testing.expectError(error.ShareLengthMismatch, V.shareFromBytes(&[_]u8{0} ** 3));
+    var sc_v: V.Share = undefined;
+    try testing.expectError(error.ShareLengthMismatch, V.shareFromBytes(&sc_v, &[_]u8{0} ** 3));
     try testing.expectError(
         error.ShareLengthMismatch,
-        V.shareFromBytes(&[_]u8{0} ** (V.share_len + 1)),
+        V.shareFromBytes(&sc_v, &[_]u8{0} ** (V.share_len + 1)),
     );
 
     var rec: [t_record_len]u8 = undefined;
     try testing.expectError(
         error.AnswerLengthMismatch,
-        V.reconstruct(q.secret, va[0..1], &va, &ta, &ta, &rec),
+        V.reconstruct(&q.secret, va[0..1], &va, &ta, &ta, &rec),
     );
     try testing.expectError(
         error.AnswerLengthMismatch,
-        V.reconstruct(q.secret, &va, &va, ta[0..2], &ta, &rec),
+        V.reconstruct(&q.secret, &va, &va, ta[0..2], &ta, &rec),
     );
     // each tag operand is checked on its own (mutation run 2026-10-06)
     try testing.expectError(
         error.AnswerLengthMismatch,
-        V.reconstruct(q.secret, &va, &va, &ta, ta[0..2], &rec),
+        V.reconstruct(&q.secret, &va, &va, &ta, ta[0..2], &rec),
     );
     var buf: [7]u8 = undefined;
     try testing.expectError(
         error.AnswerLengthMismatch,
-        V.reconstructFromBytes(q.secret, &buf, &buf, &buf, &buf, &rec),
+        V.reconstructFromBytes(&q.secret, &buf, &buf, &buf, &buf, &rec),
     );
 }
 
@@ -1348,7 +1409,8 @@ test "EXACT: each channel's keys carry that channel's own seeds" {
     // server 0 two keys with the same root seed — the cross-channel reuse
     // `query`'s SeedReuse check exists to refuse from the caller.
     const seeds = [4]fss.prg.Seed{ detSeed(40), detSeed(41), detSeed(42), detSeed(43) };
-    const q = try V.query(3, detMac(V.tag_word_len, 40), seeds[0], seeds[1], seeds[2], seeds[3]);
+    var q: V.Query = undefined;
+    try V.query(3, &detMac(V.tag_word_len, 40), &seeds[0], &seeds[1], &seeds[2], &seeds[3], &q);
     for (0..2) |b| {
         try testing.expectEqualSlices(u8, &seeds[b], &q.shares[b].value.seed);
         try testing.expectEqualSlices(u8, &seeds[2 + b], &q.shares[b].tag.seed);
@@ -1372,7 +1434,7 @@ test "SELF: exhaustive length sweep over the verified untrusted boundaries" {
         const per = W.Value.answerWords(rl);
         const v_need = per * 2;
         const t_need = (per + 1) * 4;
-        const r = W.reconstructFromBytes(sec, v[0..lv], v[0..lv], t[0..lt], t[0..lt], rec[0..rl]);
+        const r = W.reconstructFromBytes(&sec, v[0..lv], v[0..lv], t[0..lt], t[0..lt], rec[0..rl]);
         if (lv == v_need and lt == t_need) {
             // geometry accepted; the MAC verdict on garbage bytes is
             // (almost always) a reject, but it must be THE reject error,
@@ -1386,9 +1448,10 @@ test "SELF: exhaustive length sweep over the verified untrusted boundaries" {
     var big: [W.share_len + 8]u8 = undefined;
     for (&big, 0..) |*b, i| b.* = @truncate(i);
     for (0..big.len + 1) |n| {
-        const r = W.shareFromBytes(big[0..n]);
+        var sh: W.Share = undefined;
+        const r = W.shareFromBytes(&sh, big[0..n]);
         if (n == W.share_len) {
-            _ = try r;
+            try r;
         } else {
             try testing.expectError(error.ShareLengthMismatch, r);
         }
@@ -1433,19 +1496,20 @@ const FuzzRun = struct {
     fn build(self: *FuzzRun, tag: u64) void {
         fillDb(&self.db_bytes, record_len);
         const database = Database.init(&self.db_bytes, record_len) catch unreachable;
-        self.q = FuzzVer.query(
+        FuzzVer.query(
             index,
-            detMac(FuzzVer.tag_word_len, tag),
-            detSeed(tag *% 4 + 0),
-            detSeed(tag *% 4 + 1),
-            detSeed(tag *% 4 + 2),
-            detSeed(tag *% 4 + 3),
+            &detMac(FuzzVer.tag_word_len, tag),
+            &detSeed(tag *% 4 + 0),
+            &detSeed(tag *% 4 + 1),
+            &detSeed(tag *% 4 + 2),
+            &detSeed(tag *% 4 + 3),
+            &self.q,
         ) catch unreachable;
-        FuzzVer.shareToBytes(self.q.shares[0], &self.share);
+        FuzzVer.shareToBytes(&self.q.shares[0], &self.share);
         for (0..2) |p| {
             var va: [2]FuzzVer.Word = undefined;
             var ta: [3]FuzzVer.TagWord = undefined;
-            FuzzVer.answer(@intCast(p), self.q.shares[p], database, &va, &ta) catch unreachable;
+            FuzzVer.answer(@intCast(p), &self.q.shares[p], database, &va, &ta) catch unreachable;
             FuzzVer.Value.answerToBytes(&va, &self.v[p]) catch unreachable;
             FuzzVer.tagAnswerToBytes(&ta, &self.t[p]) catch unreachable;
         }
@@ -1471,7 +1535,7 @@ const VerShareCorpus = struct {
         var a = run.share;
         self.push(&a);
         var b: [FuzzVer.share_len]u8 = undefined;
-        FuzzVer.shareToBytes(run.q.shares[1], &b);
+        FuzzVer.shareToBytes(&run.q.shares[1], &b);
         self.push(&b);
         // One octet off inside the TAG half of the bundle — the half a
         // value-only corpus would never touch, and the half `m` is hidden in.
@@ -1494,9 +1558,10 @@ fn fuzzVerShareFromBytes(_: void, smith: *std.testing.Smith) !void {
     // length, so this target had returned `ShareLengthMismatch` every round it
     // ever ran, with the bundle sitting unread in `buf`.
     const len: usize = smith.slice(&buf);
-    const share = FuzzVer.shareFromBytes(buf[0..len]) catch return;
+    var share: FuzzVer.Share = undefined;
+    FuzzVer.shareFromBytes(&share, buf[0..len]) catch return;
     var out: [FuzzVer.share_len]u8 = undefined;
-    FuzzVer.shareToBytes(share, &out);
+    FuzzVer.shareToBytes(&share, &out);
     std.mem.doNotOptimizeAway(&out);
 }
 test "fuzz verified shareFromBytes never panics" {
@@ -1516,10 +1581,11 @@ test "corpus: every verified share seed reaches the parser, and the counts are p
         var buf: [FuzzVer.share_len + 8]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
-        const share = FuzzVer.shareFromBytes(buf[0..len]) catch continue;
+        var share: FuzzVer.Share = undefined;
+        FuzzVer.shareFromBytes(&share, buf[0..len]) catch continue;
         accepted += 1;
         var out: [FuzzVer.share_len]u8 = undefined;
-        FuzzVer.shareToBytes(share, &out);
+        FuzzVer.shareToBytes(&share, &out);
         var known = false;
         for (seen[0..distinct]) |prev| {
             if (std.mem.eql(u8, &prev, &out)) known = true;
@@ -1583,8 +1649,8 @@ const VerAnswerCorpus = struct {
         run.build(9090);
         var a: [FuzzVer.share_len]u8 = undefined;
         var b: [FuzzVer.share_len]u8 = undefined;
-        FuzzVer.shareToBytes(run.q.shares[0], &a);
-        FuzzVer.shareToBytes(run.q.shares[1], &b);
+        FuzzVer.shareToBytes(&run.q.shares[0], &a);
+        FuzzVer.shareToBytes(&run.q.shares[1], &b);
         self.push(&a, 48, 6, 8, 0);
         self.push(&b, 48, 6, 8, 1); // the party-1 half, never run before
         self.push(&a, 40, 5, 8, 0); // record_len not a whole word
@@ -1600,7 +1666,8 @@ fn fuzzVerAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     // BOTH channels' answers with arbitrary key material.
     var key_buf: [FuzzVer.share_len]u8 = undefined;
     smith.bytes(&key_buf);
-    const share = FuzzVer.shareFromBytes(&key_buf) catch return;
+    var share: FuzzVer.Share = undefined;
+    FuzzVer.shareFromBytes(&share, &key_buf) catch return;
 
     var db_bytes: [96]u8 = undefined;
     const db_len: usize = smith.slice(&db_bytes);
@@ -1614,7 +1681,7 @@ fn fuzzVerAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     var va: [3]FuzzVer.Word = undefined;
     var ta: [4]FuzzVer.TagWord = undefined;
     const per = FuzzVer.Value.answerWords(record_len);
-    try FuzzVer.answer(party, share, database, va[0..per], ta[0 .. per + 1]);
+    try FuzzVer.answer(party, &share, database, va[0..per], ta[0 .. per + 1]);
 
     var wire: [4 * FuzzVer.tag_word_len]u8 = undefined;
     try FuzzVer.tagAnswerToBytes(ta[0 .. per + 1], wire[0 .. (per + 1) * FuzzVer.tag_word_len]);
@@ -1637,7 +1704,8 @@ test "corpus: the verified hostile-share seeds reach both parties, counts pinned
         var smith: std.testing.Smith = .{ .in = sd };
         var key_buf: [FuzzVer.share_len]u8 = undefined;
         smith.bytes(&key_buf);
-        const share = FuzzVer.shareFromBytes(&key_buf) catch continue;
+        var share: FuzzVer.Share = undefined;
+        FuzzVer.shareFromBytes(&share, &key_buf) catch continue;
         var db_bytes: [96]u8 = undefined;
         const db_len: usize = smith.slice(&db_bytes);
         const record_len: usize = @intCast(1 + smith.value(u64) % 12);
@@ -1649,7 +1717,7 @@ test "corpus: the verified hostile-share seeds reach both parties, counts pinned
         var va: [3]FuzzVer.Word = undefined;
         var ta: [4]FuzzVer.TagWord = undefined;
         const per = FuzzVer.Value.answerWords(record_len);
-        try FuzzVer.answer(party, share, database, va[0..per], ta[0 .. per + 1]);
+        try FuzzVer.answer(party, &share, database, va[0..per], ta[0 .. per + 1]);
         answered += 1;
         records += database.count();
     }
@@ -1750,7 +1818,7 @@ fn fuzzVerReconstruct(_: void, smith: *std.testing.Smith) !void {
     var rec: [24]u8 = undefined;
 
     FuzzVer.reconstructFromBytes(
-        .{ .m = m },
+        &.{ .m = m },
         v0[0..lv0],
         v1[0..lv1],
         t0[0..lt0],
@@ -1801,7 +1869,7 @@ test "corpus: the verified reconstruct seeds carry real bundles, counts pinned" 
         widest_record = @max(widest_record, record_len);
         var rec: [24]u8 = undefined;
         FuzzVer.reconstructFromBytes(
-            .{ .m = m },
+            &.{ .m = m },
             v0[0..lv0],
             v1[0..lv1],
             t0[0..lt0],

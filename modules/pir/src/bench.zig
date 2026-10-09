@@ -50,7 +50,8 @@ fn benchShardOverhead(
 
     const s0 = [_]u8{0x11} ** 16;
     const s1 = [_]u8{0x22} ** 16;
-    const shares = try P.query(count / 3, s0, s1);
+    var shares: [2]P.Share = undefined;
+    try P.query(count / 3, &s0, &s1, &shares);
 
     const want = try gpa.alloc(P.Word, n_words);
     defer gpa.free(want);
@@ -64,7 +65,7 @@ fn benchShardOverhead(
     var t_full: u64 = std.math.maxInt(u64);
     for (0..reps) |_| {
         const a = nowNs();
-        try P.answer(0, shares[0], database, want);
+        try P.answer(0, &shares[0], database, want);
         const b = nowNs();
         t_full = @min(t_full, b - a);
     }
@@ -84,7 +85,7 @@ fn benchShardOverhead(
                 const remaining = count - lo;
                 const len = (remaining + remaining_shards - 1) / remaining_shards;
                 const hi = @min(lo + len, count);
-                try P.answerRange(0, shares[0], database, lo, hi, part);
+                try P.answerRange(0, &shares[0], database, lo, hi, part);
                 try P.accumulate(got, part);
                 lo = hi;
             }

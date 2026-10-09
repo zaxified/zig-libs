@@ -143,12 +143,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (tainted) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&index));
             const i = reloadVolatileUsize(&index);
 
-            const shares = try P.query(i, detSeed("v0"), detSeed("v1"));
+            var shares: [2]P.Share = undefined;
+            try P.query(i, &detSeed("v0"), &detSeed("v1"), &shares);
 
             // Witness: the share bytes are a deterministic function of the
             // tainted index, so the formatter walks secret-derived data.
             var buf: [P.share_len]u8 = undefined;
-            P.shareToBytes(shares[0], &buf);
+            P.shareToBytes(&shares[0], &buf);
             std.debug.print("ctgrind_result={x}\n", .{buf});
         },
         .reconstruct => {
@@ -160,13 +161,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const md = detSeed("mac");
             @memcpy(&mac_rand, md[0..mac_rand.len]);
 
-            const q = try V.query(
+            var q: V.Query = undefined;
+            try V.query(
                 index,
-                mac_rand,
-                detSeed("v0"),
-                detSeed("v1"),
-                detSeed("t0"),
-                detSeed("t1"),
+                &mac_rand,
+                &detSeed("v0"),
+                &detSeed("v1"),
+                &detSeed("t0"),
+                &detSeed("t1"),
+                &q,
             );
 
             const per = P.answerWords(record_len);
@@ -174,8 +177,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var v1: [64]P.Word = undefined;
             var t0: [65]V.TagWord = undefined;
             var t1: [65]V.TagWord = undefined;
-            try V.answer(0, q.shares[0], database, v0[0..per], t0[0 .. per + 1]);
-            try V.answer(1, q.shares[1], database, v1[0..per], t1[0 .. per + 1]);
+            try V.answer(0, &q.shares[0], database, v0[0..per], t0[0 .. per + 1]);
+            try V.answer(1, &q.shares[1], database, v1[0..per], t1[0 .. per + 1]);
 
             var secret = q.secret;
             if (tainted) {
@@ -191,7 +194,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // here: it is the abort the protocol publishes by definition, so a
             // real client writes exactly this. Hiding it would measure a caller
             // nobody writes.
-            V.reconstruct(secret, v0[0..per], v1[0..per], t0[0 .. per + 1], t1[0 .. per + 1], &out) catch |err| {
+            V.reconstruct(&secret, v0[0..per], v1[0..per], t0[0 .. per + 1], t1[0 .. per + 1], &out) catch |err| {
                 std.debug.print("rejected: {t}\n", .{err});
                 return;
             };

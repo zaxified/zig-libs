@@ -65,6 +65,7 @@
 const std = @import("std");
 const fss = @import("fss");
 const db_mod = @import("db.zig");
+const burn = @import("burn.zig");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 /// helpers, in the format `std.testing.Smith` actually reads.
 const testkit = @import("testkit");
@@ -141,13 +142,19 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
         /// `index < db.count()`; querying a valid-but-unpopulated index is not
         /// an error and yields an all-zero reconstruction.
         ///
-        /// Returns `.{ share_for_server_0, share_for_server_1 }`.
-        pub fn query(index: usize, s0: Seed, s1: Seed) Error![2]Share {
+        /// Writes `.{ share_for_server_0, share_for_server_1 }` through `out`
+        /// (never returned: a returned share pair sits in the caller's result
+        /// slot, out of reach of the burn).
+        pub fn query(index: usize, s0: *const Seed, s1: *const Seed, out: *[2]Share) Error!void {
+            return burn.run(burn.query_burn, Error!void, queryBody, .{ index, s0, s1, out });
+        }
+
+        fn queryBody(index: usize, s0: *const Seed, s1: *const Seed, out: *[2]Share) Error!void {
             if (index >= domain_size) return error.IndexOutOfDomain;
             // β = 1: the point function is a pure selector. Any other β would
             // scale the retrieved record by β in the ring, which is not what
             // retrieval means.
-            return Dpf.genWithSeeds(@intCast(index), 1, s0, s1);
+            Dpf.genWithSeeds(@intCast(index), 1, s0, s1, out);
         }
 
         // ── client: keyword lookup ────────────────────────────────────────
@@ -195,13 +202,13 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
         /// record count — and the client detects the miss locally by
         /// comparing the record's own key field. See `SPEC.md` §"Keyword
         /// lookup" for the full leakage statement.
-        pub fn queryKeyword(keyword: []const u8, s0: Seed, s1: Seed) Error![2]Share {
-            return query(keywordIndex(keyword), s0, s1);
+        pub fn queryKeyword(keyword: []const u8, s0: *const Seed, s1: *const Seed, out: *[2]Share) Error!void {
+            return query(keywordIndex(keyword), s0, s1, out);
         }
 
         /// Serialize a share for the wire. Fixed length, no header, no length
         /// field — see `SPEC.md` §"The codec has no length fields".
-        pub fn shareToBytes(share: Share, buf: *[share_len]u8) void {
+        pub fn shareToBytes(share: *const Share, buf: *[share_len]u8) void {
             share.toBytes(buf);
         }
 
@@ -215,9 +222,9 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
         /// and produces a garbage-but-harmless answer. That is intended:
         /// nothing in two-server PIR lets a server *validate* a share (see
         /// `SPEC.md` §"What this does not do").
-        pub fn shareFromBytes(buf: []const u8) Error!Share {
+        pub fn shareFromBytes(out: *Share, buf: []const u8) Error!void {
             if (buf.len != share_len) return error.ShareLengthMismatch;
-            return Dpf.Key.fromBytes(buf[0..share_len]);
+            Dpf.Key.fromBytes(out, buf[0..share_len]);
         }
 
         // ── server: answer computation ────────────────────────────────────
@@ -294,7 +301,7 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
         /// partitioning the deployment already chose, and per-shard work is
         /// exactly `hi - lo` regardless of `i`, the same way `answer`'s
         /// per-database work is exactly `count()` regardless of `i`.
-        pub fn answerRange(party: u1, share: Share, database: Database, lo: usize, hi: usize, out: []Word) Error!void {
+        pub fn answerRange(party: u1, share: *const Share, database: Database, lo: usize, hi: usize, out: []Word) Error!void {
             if (out.len != answerWords(database.record_len)) return error.AnswerLengthMismatch;
             const n = database.count();
             if (n > domain_size) return error.DomainTooSmall;
@@ -326,7 +333,7 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
         /// comment for the walk this drives (`fss.Dpf.evalRangeWith`, one
         /// walk over the `[0, count())` prefix, ~1 PRG call per record) and
         /// for the sharding this module now exposes on top of it.
-        pub fn answer(party: u1, share: Share, database: Database, out: []Word) Error!void {
+        pub fn answer(party: u1, share: *const Share, database: Database, out: []Word) Error!void {
             return answerRange(party, share, database, 0, database.count(), out);
         }
 
@@ -349,7 +356,7 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
         /// never read, and the shard's answer is correct. A full sharded run
         /// covers `[0, count())`, so the union of the shards still rejects
         /// it; `answerSlices` (the one-shard case) still rejects it outright.
-        pub fn answerSlicesRange(party: u1, share: Share, records: []const []const u8, lo: usize, hi: usize, out: []Word) Error!void {
+        pub fn answerSlicesRange(party: u1, share: *const Share, records: []const []const u8, lo: usize, hi: usize, out: []Word) Error!void {
             if (records.len == 0) return error.EmptyDatabase;
             if (records.len > domain_size) return error.DomainTooSmall;
             const record_len = records[0].len;
@@ -372,7 +379,7 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
         /// `answer` over a slice of records rather than one flat buffer.
         /// Exactly `answerSlicesRange(party, share, records, 0, records.len,
         /// out)` — see `answerSlicesRange`.
-        pub fn answerSlices(party: u1, share: Share, records: []const []const u8, out: []Word) Error!void {
+        pub fn answerSlices(party: u1, share: *const Share, records: []const []const u8, out: []Word) Error!void {
             return answerSlicesRange(party, share, records, 0, records.len, out);
         }
 
@@ -546,7 +553,11 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
                 /// `k` records pads with dummy indices — every share hides its
                 /// own index, so any padding value works, and this is how a
                 /// deployment hides how many records a client actually wanted.
-                pub fn query(indices: [k]usize, s0: [k]Mul.Seed, s1: [k]Mul.Seed) Error![2]Mul.Share {
+                pub fn query(indices: [k]usize, s0: *const [k]Mul.Seed, s1: *const [k]Mul.Seed, out: *[2]Mul.Share) Error!void {
+                    return burn.run(burn.query_burn, Error!void, multiQueryBody, .{ indices, s0, s1, out });
+                }
+
+                fn multiQueryBody(indices: [k]usize, s0: *const [k]Mul.Seed, s1: *const [k]Mul.Seed, out: *[2]Mul.Share) Error!void {
                     var alphas: [k]Mpf.Index = undefined;
                     for (indices, &alphas) |i, *a| {
                         if (i >= Mul.domain_size) return error.IndexOutOfDomain;
@@ -555,11 +566,11 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
                     // β = 1 for every point, for the single-index reason: any
                     // other value scales that block's record in the ring.
                     const betas: [k]Mul.Word = @splat(1);
-                    return Mpf.genWithSeeds(alphas, betas, s0, s1);
+                    return Mpf.genWithSeeds(alphas, betas, s0, s1, out);
                 }
 
                 /// Serialize a share. Fixed length, no header, no count.
-                pub fn shareToBytes(share: Mul.Share, buf: *[Mul.share_len]u8) void {
+                pub fn shareToBytes(share: *const Mul.Share, buf: *[Mul.share_len]u8) void {
                     share.toBytes(buf);
                 }
 
@@ -570,9 +581,9 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
                 /// — no count or length is ever taken from the input. In
                 /// particular `k` is *not* read from the bytes: it is this
                 /// server's own compile-time parameter.
-                pub fn shareFromBytes(buf: []const u8) Error!Mul.Share {
+                pub fn shareFromBytes(out: *Mul.Share, buf: []const u8) Error!void {
                     if (buf.len != Mul.share_len) return error.ShareLengthMismatch;
-                    return Mpf.Key.fromBytes(buf[0..Mul.share_len]);
+                    Mpf.Key.fromBytes(out, buf[0..Mul.share_len]);
                 }
 
                 /// `Word`s per retrieval answer: `k` blocks of
@@ -607,7 +618,7 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
                 /// components are folded into `out` as the walk produces them
                 /// and no `count()`-sized buffer exists. The domain's unused
                 /// tail past `count()` is never evaluated.
-                pub fn answer(party: u1, share: Mul.Share, database: Database, out: []Mul.Word) Error!void {
+                pub fn answer(party: u1, share: *const Mul.Share, database: Database, out: []Mul.Word) Error!void {
                     const per = Single.answerWords(database.record_len);
                     if (out.len != try Mul.answerWords(database.record_len)) {
                         return error.AnswerLengthMismatch;
@@ -706,7 +717,7 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
                 ///
                 /// Repeated indices count with multiplicity here — `.{7, 7}`
                 /// aggregates to `2·record[7]`.
-                pub fn answerAggregate(party: u1, share: Mul.Share, database: Database, out: []Mul.Word) Error!void {
+                pub fn answerAggregate(party: u1, share: *const Mul.Share, database: Database, out: []Mul.Word) Error!void {
                     if (out.len != Mul.aggregateWords(database.record_len)) {
                         return error.AnswerLengthMismatch;
                     }
@@ -848,12 +859,13 @@ test "SELF: PirWith actually threads the PRG through, not just compiles — cons
     const seeds = detSeeds(777);
     const index = 5;
 
-    const shares = try P.query(index, seeds[0], seeds[1]);
+    var shares: [2]P.Share = undefined;
+    try P.query(index, &seeds[0], &seeds[1], &shares);
     var a0: [8]P.Word = undefined;
     var a1: [8]P.Word = undefined;
     const n_words = P.answerWords(record_len);
-    try P.answer(0, shares[0], database, a0[0..n_words]);
-    try P.answer(1, shares[1], database, a1[0..n_words]);
+    try P.answer(0, &shares[0], database, a0[0..n_words]);
+    try P.answer(1, &shares[1], database, a1[0..n_words]);
     var out: [record_len]u8 = undefined;
     try P.reconstruct(a0[0..n_words], a1[0..n_words], &out);
     try testing.expectEqualSlices(u8, database.record(index), &out);
@@ -883,16 +895,17 @@ test "SELF: a shard validates raggedness over what it READS, and the whole slice
     records[4] = "short"; // ragged, and OUTSIDE the first shard
 
     const seeds = detSeeds(4242);
-    const shares = try P.query(1, seeds[0], seeds[1]);
+    var shares: [2]P.Share = undefined;
+    try P.query(1, &seeds[0], &seeds[1], &shares);
     var out: [8]P.Word = undefined;
     const n = P.answerWords(good.len);
 
     // shard [0, 3) never reads records[4] -- it answers.
-    try P.answerSlicesRange(0, shares[0], &records, 0, 3, out[0..n]);
+    try P.answerSlicesRange(0, &shares[0], &records, 0, 3, out[0..n]);
     // shard [3, 6) does -- it rejects.
-    try testing.expectError(error.RaggedRecords, P.answerSlicesRange(0, shares[0], &records, 3, 6, out[0..n]));
+    try testing.expectError(error.RaggedRecords, P.answerSlicesRange(0, &shares[0], &records, 3, 6, out[0..n]));
     // and the unsharded call, which is the shard [0, records.len), rejects.
-    try testing.expectError(error.RaggedRecords, P.answerSlices(0, shares[0], &records, out[0..n]));
+    try testing.expectError(error.RaggedRecords, P.answerSlices(0, &shares[0], &records, out[0..n]));
 
     // `records[0]` is the reference length whatever the shard, so a ragged
     // FIRST record fails every shard, including one that does not contain
@@ -900,7 +913,7 @@ test "SELF: a shard validates raggedness over what it READS, and the whole slice
     // not against its neighbour.
     var first_short = [_][]const u8{ "shrt", good, good, good };
     const n_short = P.answerWords(4);
-    try testing.expectError(error.RaggedRecords, P.answerSlicesRange(0, shares[0], &first_short, 1, 4, out[0..n_short]));
+    try testing.expectError(error.RaggedRecords, P.answerSlicesRange(0, &shares[0], &first_short, 1, 4, out[0..n_short]));
 }
 
 test "SELF: retrieval returns the right record for EVERY index, across awkward sizes" {
@@ -937,9 +950,10 @@ test "SELF: retrieval returns the right record for EVERY index, across awkward s
             for (0..c.count) |i| {
                 const seeds = detSeeds(@as(u64, c.bits) * 1_000_003 +
                     @as(u64, @intCast(i)) * 31 + @as(u64, @intCast(record_len)));
-                const shares = try P.query(i, seeds[0], seeds[1]);
-                try P.answer(0, shares[0], database, a0[0..n_words]);
-                try P.answer(1, shares[1], database, a1[0..n_words]);
+                var shares: [2]P.Share = undefined;
+                try P.query(i, &seeds[0], &seeds[1], &shares);
+                try P.answer(0, &shares[0], database, a0[0..n_words]);
+                try P.answer(1, &shares[1], database, a1[0..n_words]);
                 try P.reconstruct(a0[0..n_words], a1[0..n_words], got[0..record_len]);
                 try testing.expectEqualSlices(u8, database.record(i), got[0..record_len]);
             }
@@ -977,11 +991,12 @@ test "DERIVED: the answer equals the PIR definition computed without any DPF" {
 
         // Route B — through the DPF.
         const seeds = detSeeds(4242 + i);
-        const shares = try P.query(i, seeds[0], seeds[1]);
+        var shares: [2]P.Share = undefined;
+        try P.query(i, &seeds[0], &seeds[1], &shares);
         var a0: [3]P.Word = undefined;
         var a1: [3]P.Word = undefined;
-        try P.answer(0, shares[0], database, a0[0..n_words]);
-        try P.answer(1, shares[1], database, a1[0..n_words]);
+        try P.answer(0, &shares[0], database, a0[0..n_words]);
+        try P.answer(1, &shares[1], database, a1[0..n_words]);
 
         for (0..n_words) |j| {
             try testing.expectEqual(want[j], a0[j] +% a1[j]);
@@ -1004,9 +1019,10 @@ test "SELF: word_bytes 1 and 16 retrieve the same record as word_bytes 4" {
         var a1: [record_len]P.Word = undefined;
         var got: [record_len]u8 = undefined;
         for (0..count) |i| {
-            const shares = try P.query(i, seeds[0], seeds[1]);
-            try P.answer(0, shares[0], database, a0[0..n_words]);
-            try P.answer(1, shares[1], database, a1[0..n_words]);
+            var shares: [2]P.Share = undefined;
+            try P.query(i, &seeds[0], &seeds[1], &shares);
+            try P.answer(0, &shares[0], database, a0[0..n_words]);
+            try P.answer(1, &shares[1], database, a1[0..n_words]);
             try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
             try testing.expectEqualSlices(u8, database.record(i), &got);
         }
@@ -1024,11 +1040,12 @@ test "SELF: answerSlices agrees with answer over the flat database" {
 
     const n_words = P.answerWords(record_len);
     const seeds = detSeeds(99);
-    const shares = try P.query(6, seeds[0], seeds[1]);
+    var shares: [2]P.Share = undefined;
+    try P.query(6, &seeds[0], &seeds[1], &shares);
     var flat: [2]P.Word = undefined;
     var sliced: [2]P.Word = undefined;
-    try P.answer(0, shares[0], database, flat[0..n_words]);
-    try P.answerSlices(0, shares[0], &recs, sliced[0..n_words]);
+    try P.answer(0, &shares[0], database, flat[0..n_words]);
+    try P.answerSlices(0, &shares[0], &recs, sliced[0..n_words]);
     try testing.expectEqualSlices(P.Word, flat[0..n_words], sliced[0..n_words]);
 }
 
@@ -1044,21 +1061,26 @@ test "SELF: wire round-trip — share and answer survive serialization" {
     const seeds = detSeeds(1234);
     const i = 37;
 
-    const shares = try P.query(i, seeds[0], seeds[1]);
+    var shares: [2]P.Share = undefined;
+    try P.query(i, &seeds[0], &seeds[1], &shares);
 
     // client → servers
     var wire0: [P.share_len]u8 = undefined;
     var wire1: [P.share_len]u8 = undefined;
-    P.shareToBytes(shares[0], &wire0);
-    P.shareToBytes(shares[1], &wire1);
+    P.shareToBytes(&shares[0], &wire0);
+    P.shareToBytes(&shares[1], &wire1);
 
     // servers parse and answer
     var words: [3]P.Word = undefined;
     var ans0: [48]u8 = undefined;
     var ans1: [48]u8 = undefined;
-    try P.answer(0, try P.shareFromBytes(&wire0), database, words[0..n_words]);
+    var parsed0: P.Share = undefined;
+    try P.shareFromBytes(&parsed0, &wire0);
+    try P.answer(0, &parsed0, database, words[0..n_words]);
     try P.answerToBytes(words[0..n_words], ans0[0..n_bytes]);
-    try P.answer(1, try P.shareFromBytes(&wire1), database, words[0..n_words]);
+    var parsed1: P.Share = undefined;
+    try P.shareFromBytes(&parsed1, &wire1);
+    try P.answer(1, &parsed1, database, words[0..n_words]);
     try P.answerToBytes(words[0..n_words], ans1[0..n_bytes]);
 
     // servers → client
@@ -1086,16 +1108,17 @@ test "SELF: every database record influences the answer (no index-dependent acce
     var bytes: [count * record_len]u8 = undefined;
     fillDb(&bytes, record_len);
     const seeds = detSeeds(555);
-    const shares = try P.query(3, seeds[0], seeds[1]);
+    var shares: [2]P.Share = undefined;
+    try P.query(3, &seeds[0], &seeds[1], &shares);
     const n_words = P.answerWords(record_len);
 
     var base: [2]P.Word = undefined;
-    try P.answer(0, shares[0], try Database.init(&bytes, record_len), base[0..n_words]);
+    try P.answer(0, &shares[0], try Database.init(&bytes, record_len), base[0..n_words]);
 
     for (0..count) |x| {
         bytes[x * record_len] ^= 0x01;
         var perturbed: [2]P.Word = undefined;
-        try P.answer(0, shares[0], try Database.init(&bytes, record_len), perturbed[0..n_words]);
+        try P.answer(0, &shares[0], try Database.init(&bytes, record_len), perturbed[0..n_words]);
         bytes[x * record_len] ^= 0x01;
         try testing.expect(!std.mem.eql(P.Word, base[0..n_words], perturbed[0..n_words]));
     }
@@ -1129,12 +1152,13 @@ test "DERIVED: summing answerRange shards reproduces answer bit-for-bit, over se
         const query_indices = [_]usize{ 0, c.count / 2, c.count - 1 };
         for (query_indices) |qi| {
             const seeds = detSeeds(@as(u64, c.bits) * 7_919 + qi);
-            const shares = try P.query(qi, seeds[0], seeds[1]);
+            var shares: [2]P.Share = undefined;
+            try P.query(qi, &seeds[0], &seeds[1], &shares);
 
             var want0: [3]P.Word = undefined;
             var want1: [3]P.Word = undefined;
-            try P.answer(0, shares[0], database, want0[0..n_words]);
-            try P.answer(1, shares[1], database, want1[0..n_words]);
+            try P.answer(0, &shares[0], database, want0[0..n_words]);
+            try P.answer(1, &shares[1], database, want1[0..n_words]);
 
             // Shard counts: 1 (degenerate single shard), 2 (divides evenly
             // for even counts), 3 (does not divide most of these), and a
@@ -1157,8 +1181,8 @@ test "DERIVED: summing answerRange shards reproduces answer bit-for-bit, over se
 
                     var part0: [3]P.Word = undefined;
                     var part1: [3]P.Word = undefined;
-                    try P.answerRange(0, shares[0], database, lo, hi, part0[0..n_words]);
-                    try P.answerRange(1, shares[1], database, lo, hi, part1[0..n_words]);
+                    try P.answerRange(0, &shares[0], database, lo, hi, part0[0..n_words]);
+                    try P.answerRange(1, &shares[1], database, lo, hi, part1[0..n_words]);
                     try P.accumulate(got0[0..n_words], part0[0..n_words]);
                     try P.accumulate(got1[0..n_words], part1[0..n_words]);
                     lo = hi;
@@ -1198,14 +1222,15 @@ test "SELF: answerRange explicit len-0 (start/middle/end) and len-1 shards, boun
     const n_words = P.answerWords(record_len);
     const qi = 9;
     const seeds = detSeeds(24601);
-    const shares = try P.query(qi, seeds[0], seeds[1]);
+    var shares: [2]P.Share = undefined;
+    try P.query(qi, &seeds[0], &seeds[1], &shares);
 
     // len-0 at the very start, exactly at the query index (both edges), and
     // at the database end — a shard with nothing to do must be a no-op, not
     // a partial or garbage contribution.
     for ([_][2]usize{ .{ 0, 0 }, .{ qi, qi }, .{ qi + 1, qi + 1 }, .{ count, count } }) |range| {
         var out: [2]P.Word = @splat(0xAB); // poison, so a stray write is visible
-        try P.answerRange(0, shares[0], database, range[0], range[1], out[0..n_words]);
+        try P.answerRange(0, &shares[0], database, range[0], range[1], out[0..n_words]);
         try testing.expectEqualSlices(P.Word, &(([2]P.Word){ 0, 0 }), out[0..n_words]);
     }
 
@@ -1216,8 +1241,8 @@ test "SELF: answerRange explicit len-0 (start/middle/end) and len-1 shards, boun
     {
         var a0: [2]P.Word = undefined;
         var a1: [2]P.Word = undefined;
-        try P.answerRange(0, shares[0], database, qi, qi + 1, a0[0..n_words]);
-        try P.answerRange(1, shares[1], database, qi, qi + 1, a1[0..n_words]);
+        try P.answerRange(0, &shares[0], database, qi, qi + 1, a0[0..n_words]);
+        try P.answerRange(1, &shares[1], database, qi, qi + 1, a1[0..n_words]);
         var got: [record_len]u8 = undefined;
         try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
         try testing.expectEqualSlices(u8, database.record(qi), &got);
@@ -1227,8 +1252,8 @@ test "SELF: answerRange explicit len-0 (start/middle/end) and len-1 shards, boun
     for ([_][2]usize{ .{ qi - 1, qi }, .{ qi + 1, qi + 2 } }) |range| {
         var a0: [2]P.Word = undefined;
         var a1: [2]P.Word = undefined;
-        try P.answerRange(0, shares[0], database, range[0], range[1], a0[0..n_words]);
-        try P.answerRange(1, shares[1], database, range[0], range[1], a1[0..n_words]);
+        try P.answerRange(0, &shares[0], database, range[0], range[1], a0[0..n_words]);
+        try P.answerRange(1, &shares[1], database, range[0], range[1], a1[0..n_words]);
         var got: [record_len]u8 = undefined;
         try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
         try testing.expectEqualSlices(u8, &[_]u8{0} ** record_len, &got);
@@ -1244,18 +1269,19 @@ test "SELF: every record in a shard's range influences that shard's answer (no i
     var bytes: [count * record_len]u8 = undefined;
     fillDb(&bytes, record_len);
     const seeds = detSeeds(556);
-    const shares = try P.query(15, seeds[0], seeds[1]);
+    var shares: [2]P.Share = undefined;
+    try P.query(15, &seeds[0], &seeds[1], &shares);
     const n_words = P.answerWords(record_len);
     const lo = 6;
     const hi = 17;
 
     var base: [2]P.Word = undefined;
-    try P.answerRange(0, shares[0], try Database.init(&bytes, record_len), lo, hi, base[0..n_words]);
+    try P.answerRange(0, &shares[0], try Database.init(&bytes, record_len), lo, hi, base[0..n_words]);
 
     for (lo..hi) |x| {
         bytes[x * record_len] ^= 0x01;
         var perturbed: [2]P.Word = undefined;
-        try P.answerRange(0, shares[0], try Database.init(&bytes, record_len), lo, hi, perturbed[0..n_words]);
+        try P.answerRange(0, &shares[0], try Database.init(&bytes, record_len), lo, hi, perturbed[0..n_words]);
         bytes[x * record_len] ^= 0x01;
         try testing.expect(!std.mem.eql(P.Word, base[0..n_words], perturbed[0..n_words]));
     }
@@ -1284,12 +1310,13 @@ test "SELF: answerSlicesRange agrees with answerRange over the flat database" {
     const n_words = P.answerWords(record_len);
 
     const seeds = detSeeds(7331);
-    const shares = try P.query(12, seeds[0], seeds[1]);
+    var shares: [2]P.Share = undefined;
+    try P.query(12, &seeds[0], &seeds[1], &shares);
     for ([_][2]usize{ .{ 0, count }, .{ 3, 11 }, .{ 0, 0 }, .{ 19, 20 } }) |range| {
         var flat: [2]P.Word = undefined;
         var sliced: [2]P.Word = undefined;
-        try P.answerRange(0, shares[0], database, range[0], range[1], flat[0..n_words]);
-        try P.answerSlicesRange(0, shares[0], &recs, range[0], range[1], sliced[0..n_words]);
+        try P.answerRange(0, &shares[0], database, range[0], range[1], flat[0..n_words]);
+        try P.answerSlicesRange(0, &shares[0], &recs, range[0], range[1], sliced[0..n_words]);
         try testing.expectEqualSlices(P.Word, flat[0..n_words], sliced[0..n_words]);
     }
 }
@@ -1302,14 +1329,15 @@ test "SELF: answerRange rejects a malformed [lo, hi) instead of computing garbag
     const database = try Database.init(&bytes, record_len);
     const n_words = P.answerWords(record_len);
     const seeds = detSeeds(404);
-    const shares = try P.query(2, seeds[0], seeds[1]);
+    var shares: [2]P.Share = undefined;
+    try P.query(2, &seeds[0], &seeds[1], &shares);
     var out: [2]P.Word = undefined;
 
-    try testing.expectError(error.InvalidRange, P.answerRange(0, shares[0], database, 5, 3, out[0..n_words])); // lo > hi
-    try testing.expectError(error.InvalidRange, P.answerRange(0, shares[0], database, 0, 11, out[0..n_words])); // hi > count()
-    try testing.expectError(error.InvalidRange, P.answerRange(0, shares[0], database, 11, 11, out[0..n_words])); // lo == hi but both past count()
+    try testing.expectError(error.InvalidRange, P.answerRange(0, &shares[0], database, 5, 3, out[0..n_words])); // lo > hi
+    try testing.expectError(error.InvalidRange, P.answerRange(0, &shares[0], database, 0, 11, out[0..n_words])); // hi > count()
+    try testing.expectError(error.InvalidRange, P.answerRange(0, &shares[0], database, 11, 11, out[0..n_words])); // lo == hi but both past count()
     // hi == count() exactly is the valid boundary, not an error.
-    try P.answerRange(0, shares[0], database, 0, 10, out[0..n_words]);
+    try P.answerRange(0, &shares[0], database, 0, 10, out[0..n_words]);
 }
 
 test "SELF: an index inside the domain but past the database reconstructs to zero" {
@@ -1321,11 +1349,12 @@ test "SELF: an index inside the domain but past the database reconstructs to zer
     fillDb(&bytes, record_len);
     const database = try Database.init(&bytes, record_len);
     const seeds = detSeeds(31337);
-    const shares = try P.query(11, seeds[0], seeds[1]); // 5 <= 11 < 16
+    var shares: [2]P.Share = undefined;
+    try P.query(11, &seeds[0], &seeds[1], &shares); // 5 <= 11 < 16
     var a0: [2]P.Word = undefined;
     var a1: [2]P.Word = undefined;
-    try P.answer(0, shares[0], database, &a0);
-    try P.answer(1, shares[1], database, &a1);
+    try P.answer(0, &shares[0], database, &a0);
+    try P.answer(1, &shares[1], database, &a1);
     var got: [record_len]u8 = undefined;
     try P.reconstruct(&a0, &a1, &got);
     try testing.expectEqualSlices(u8, &[_]u8{0} ** record_len, &got);
@@ -1334,25 +1363,28 @@ test "SELF: an index inside the domain but past the database reconstructs to zer
 test "SELF: geometry errors are returned, never asserted" {
     const P = Pir(3, 4);
     const seeds = detSeeds(1);
-    try testing.expectError(error.IndexOutOfDomain, P.query(8, seeds[0], seeds[1]));
-    const shares = try P.query(0, seeds[0], seeds[1]);
+    var scratch: [2]P.Share = undefined;
+    try testing.expectError(error.IndexOutOfDomain, P.query(8, &seeds[0], &seeds[1], &scratch));
+    var shares: [2]P.Share = undefined;
+    try P.query(0, &seeds[0], &seeds[1], &shares);
 
     var bytes: [4 * 6]u8 = undefined;
     fillDb(&bytes, 6);
     const database = try Database.init(&bytes, 6);
     var out: [2]P.Word = undefined;
-    try testing.expectError(error.AnswerLengthMismatch, P.answer(0, shares[0], database, out[0..1]));
+    try testing.expectError(error.AnswerLengthMismatch, P.answer(0, &shares[0], database, out[0..1]));
 
     // a database bigger than the domain
     var big: [9 * 6]u8 = undefined;
     fillDb(&big, 6);
     try testing.expectError(
         error.DomainTooSmall,
-        P.answer(0, shares[0], try Database.init(&big, 6), &out),
+        P.answer(0, &shares[0], try Database.init(&big, 6), &out),
     );
 
-    try testing.expectError(error.ShareLengthMismatch, P.shareFromBytes(&[_]u8{0} ** 3));
-    try testing.expectError(error.ShareLengthMismatch, P.shareFromBytes(&[_]u8{0} ** (P.share_len + 1)));
+    var sc_p: P.Share = undefined;
+    try testing.expectError(error.ShareLengthMismatch, P.shareFromBytes(&sc_p, &[_]u8{0} ** 3));
+    try testing.expectError(error.ShareLengthMismatch, P.shareFromBytes(&sc_p, &[_]u8{0} ** (P.share_len + 1)));
 
     var buf: [7]u8 = undefined;
     try testing.expectError(error.AnswerLengthMismatch, P.answerFromBytes(&buf, &out));
@@ -1370,11 +1402,11 @@ test "SELF: geometry errors are returned, never asserted" {
     try testing.expectError(error.AnswerLengthMismatch, P.accumulate(out[0..1], &out));
 
     const empty: [0][]const u8 = .{};
-    try testing.expectError(error.EmptyDatabase, P.answerSlices(0, shares[0], &empty, &out));
+    try testing.expectError(error.EmptyDatabase, P.answerSlices(0, &shares[0], &empty, &out));
     const ragged = [_][]const u8{ &[_]u8{ 1, 2, 3 }, &[_]u8{ 1, 2 } };
-    try testing.expectError(error.RaggedRecords, P.answerSlices(0, shares[0], &ragged, out[0..1]));
+    try testing.expectError(error.RaggedRecords, P.answerSlices(0, &shares[0], &ragged, out[0..1]));
     const zero_len = [_][]const u8{ &[_]u8{}, &[_]u8{} };
-    try testing.expectError(error.ZeroRecordLen, P.answerSlices(0, shares[0], &zero_len, out[0..0]));
+    try testing.expectError(error.ZeroRecordLen, P.answerSlices(0, &shares[0], &zero_len, out[0..0]));
 }
 
 test "SELF: answerBytesLen rejects a record_len whose word count overflows the byte multiply, instead of panicking" {
@@ -1425,9 +1457,10 @@ test "SELF: exhaustive length sweep over every untrusted boundary" {
     var big: [2 * P.share_len]u8 = undefined;
     for (&big, 0..) |*b, i| b.* = @truncate(i);
     for (0..big.len + 1) |n| {
-        const r = P.shareFromBytes(big[0..n]);
+        var sh: P.Share = undefined;
+        const r = P.shareFromBytes(&sh, big[0..n]);
         if (n == P.share_len) {
-            _ = try r;
+            try r;
         } else {
             try testing.expectError(error.ShareLengthMismatch, r);
         }
@@ -1486,9 +1519,10 @@ test "SELF: multi-index retrieval returns all k records, across awkward geometri
                 for (&indices, 0..) |*idx, j| idx.* = (t + j * 3) % c.count;
                 const seeds = detSeedsK(c.k, @as(u64, c.bits) * 7919 +
                     @as(u64, @intCast(t)) * 31 + @as(u64, @intCast(record_len)));
-                const shares = try M.query(indices, seeds[0], seeds[1]);
-                try M.answer(0, shares[0], database, a0[0..n_words]);
-                try M.answer(1, shares[1], database, a1[0..n_words]);
+                var shares: [2]M.Share = undefined;
+                try M.query(indices, &seeds[0], &seeds[1], &shares);
+                try M.answer(0, &shares[0], database, a0[0..n_words]);
+                try M.answer(1, &shares[1], database, a1[0..n_words]);
                 try M.reconstruct(
                     a0[0..n_words],
                     a1[0..n_words],
@@ -1521,11 +1555,12 @@ test "SELF: repeated indices retrieve the same record in each block" {
 
     for ([_][3]usize{ .{ 7, 7, 7 }, .{ 2, 9, 2 }, .{ 0, 0, 5 } }) |indices| {
         const seeds = detSeedsK(3, indices[0] * 101 + indices[1]);
-        const shares = try M.query(indices, seeds[0], seeds[1]);
+        var shares: [2]M.Share = undefined;
+        try M.query(indices, &seeds[0], &seeds[1], &shares);
         var a0: [9]M.Word = undefined;
         var a1: [9]M.Word = undefined;
-        try M.answer(0, shares[0], database, a0[0..n_words]);
-        try M.answer(1, shares[1], database, a1[0..n_words]);
+        try M.answer(0, &shares[0], database, a0[0..n_words]);
+        try M.answer(1, &shares[1], database, a1[0..n_words]);
         var got: [3 * record_len]u8 = undefined;
         try M.reconstruct(a0[0..n_words], a1[0..n_words], record_len, &got);
         for (indices, 0..) |idx, j| {
@@ -1545,19 +1580,21 @@ test "SELF: k=0 is a defined no-op — zero-byte share, empty answer" {
     fillDb(&bytes, 8);
     const database = try Database.init(&bytes, 8);
 
-    const shares = try M.query(.{}, .{}, .{});
+    var shares: [2]M.Share = undefined;
+    try M.query(.{}, &.{}, &.{}, &shares);
     try testing.expectEqual(@as(usize, 0), try M.answerWords(8));
     var out: [0]M.Word = undefined;
-    try M.answer(0, shares[0], database, &out);
+    try M.answer(0, &shares[0], database, &out);
     var got: [0]u8 = undefined;
     try M.reconstruct(&out, &out, 8, &got);
 
     // The zero-length share still round-trips the wire boundary, and a
     // non-empty buffer is still rejected.
     var wire: [0]u8 = undefined;
-    M.shareToBytes(shares[0], &wire);
-    _ = try M.shareFromBytes(&wire);
-    try testing.expectError(error.ShareLengthMismatch, M.shareFromBytes(&[_]u8{0}));
+    M.shareToBytes(&shares[0], &wire);
+    var parsed: M.Share = undefined;
+    try M.shareFromBytes(&parsed, &wire);
+    try testing.expectError(error.ShareLengthMismatch, M.shareFromBytes(&parsed, &[_]u8{0}));
 }
 
 test "DERIVED: k=1 multi-index is byte-identical to the single-index path" {
@@ -1576,19 +1613,21 @@ test "DERIVED: k=1 multi-index is byte-identical to the single-index path" {
 
     for (0..count) |i| {
         const seeds = detSeeds(@as(u64, @intCast(i)) + 31337);
-        const single = try P.query(i, seeds[0], seeds[1]);
-        const multi = try M.query(.{i}, .{seeds[0]}, .{seeds[1]});
+        var single: [2]P.Share = undefined;
+        try P.query(i, &seeds[0], &seeds[1], &single);
+        var multi: [2]M.Share = undefined;
+        try M.query(.{i}, &.{seeds[0]}, &.{seeds[1]}, &multi);
 
         var w_single: [P.share_len]u8 = undefined;
         var w_multi: [M.share_len]u8 = undefined;
-        P.shareToBytes(single[0], &w_single);
-        M.shareToBytes(multi[0], &w_multi);
+        P.shareToBytes(&single[0], &w_single);
+        M.shareToBytes(&multi[0], &w_multi);
         try testing.expectEqualSlices(u8, &w_single, &w_multi);
 
         var as0: [4]P.Word = undefined;
         var am0: [4]M.Word = undefined;
-        try P.answer(0, single[0], database, as0[0..n_words]);
-        try M.answer(0, multi[0], database, am0[0..n_words]);
+        try P.answer(0, &single[0], database, as0[0..n_words]);
+        try M.answer(0, &multi[0], database, am0[0..n_words]);
         try testing.expectEqualSlices(P.Word, as0[0..n_words], am0[0..n_words]);
     }
 }
@@ -1610,15 +1649,17 @@ test "DERIVED: block j equals an independent single-index query on instance j's 
 
     const indices = [k]usize{ 29, 0, 13, 13 };
     const seeds = detSeedsK(k, 4242);
-    const shares = try M.query(indices, seeds[0], seeds[1]);
+    var shares: [2]M.Share = undefined;
+    try M.query(indices, &seeds[0], &seeds[1], &shares);
 
     var multi_answer: [k * 2]M.Word = undefined;
-    try M.answer(0, shares[0], database, multi_answer[0 .. k * per]);
+    try M.answer(0, &shares[0], database, multi_answer[0 .. k * per]);
 
     for (indices, 0..) |idx, j| {
-        const single = try P.query(idx, seeds[0][j], seeds[1][j]);
+        var single: [2]P.Share = undefined;
+        try P.query(idx, &seeds[0][j], &seeds[1][j], &single);
         var block: [2]P.Word = undefined;
-        try P.answer(0, single[0], database, block[0..per]);
+        try P.answer(0, &single[0], database, block[0..per]);
         try testing.expectEqualSlices(
             P.Word,
             block[0..per],
@@ -1652,7 +1693,7 @@ fn answerNaive(
     var sel: [k]P.Word = undefined;
     var x: usize = 0;
     while (x < database.count()) : (x += 1) {
-        M.Mpf.evalEach(party, share, @intCast(x), &sel);
+        M.Mpf.evalEach(party, &share, @intCast(x), &sel);
         const rec = database.record(x);
         for (0..per) |w| {
             const word = P.wordAt(rec, w);
@@ -1674,7 +1715,7 @@ fn aggregateNaive(
     @memset(out, 0);
     var x: usize = 0;
     while (x < database.count()) : (x += 1) {
-        const sel = M.Mpf.eval(party, share, @intCast(x));
+        const sel = M.Mpf.eval(party, &share, @intCast(x));
         const rec = database.record(x);
         for (out, 0..) |*w, j| w.* +%= sel *% P.wordAt(rec, j);
     }
@@ -1711,18 +1752,19 @@ test "DERIVED: the interleaved server loop reproduces the naive per-record loop,
             var indices: [c.k]usize = undefined;
             for (&indices, 0..) |*idx, j| idx.* = (j * 5 + 1) % c.count;
             const seeds = detSeedsK(c.k, @as(u64, c.bits) * 65537 + record_len);
-            const shares = try M.query(indices, seeds[0], seeds[1]);
+            var shares: [2]M.Share = undefined;
+            try M.query(indices, &seeds[0], &seeds[1], &shares);
 
             inline for (.{ 0, 1 }) |party| {
                 var fast: [c.k * 4]M.Word = undefined;
                 var slow: [c.k * 4]M.Word = undefined;
-                try M.answer(party, shares[party], database, fast[0..n_words]);
+                try M.answer(party, &shares[party], database, fast[0..n_words]);
                 answerNaive(P, c.k, party, shares[party], database, slow[0..n_words]);
                 try testing.expectEqualSlices(M.Word, slow[0..n_words], fast[0..n_words]);
 
                 var agg_fast: [4]M.Word = undefined;
                 var agg_slow: [4]M.Word = undefined;
-                try M.answerAggregate(party, shares[party], database, agg_fast[0..per]);
+                try M.answerAggregate(party, &shares[party], database, agg_fast[0..per]);
                 aggregateNaive(P, c.k, party, shares[party], database, agg_slow[0..per]);
                 try testing.expectEqualSlices(M.Word, agg_slow[0..per], agg_fast[0..per]);
             }
@@ -1749,17 +1791,18 @@ test "DERIVED: the interleaved loop matches the naive one on key material Gen ne
     for (0..8) |t| {
         var buf: [M.share_len]u8 = undefined;
         for (&buf, 0..) |*b, i| b.* = @truncate(i *% (31 + t * 2) +% t *% 97 +% 5);
-        const share = try M.shareFromBytes(&buf);
+        var share: M.Share = undefined;
+        try M.shareFromBytes(&share, &buf);
         inline for (.{ 0, 1 }) |party| {
             var fast: [k * 2]M.Word = undefined;
             var slow: [k * 2]M.Word = undefined;
-            try M.answer(party, share, database, fast[0..n_words]);
+            try M.answer(party, &share, database, fast[0..n_words]);
             answerNaive(P, k, party, share, database, slow[0..n_words]);
             try testing.expectEqualSlices(M.Word, slow[0..n_words], fast[0..n_words]);
 
             var agg_fast: [2]M.Word = undefined;
             var agg_slow: [2]M.Word = undefined;
-            try M.answerAggregate(party, share, database, agg_fast[0..per]);
+            try M.answerAggregate(party, &share, database, agg_fast[0..per]);
             aggregateNaive(P, k, party, share, database, agg_slow[0..per]);
             try testing.expectEqualSlices(M.Word, agg_slow[0..per], agg_fast[0..per]);
         }
@@ -1783,12 +1826,13 @@ test "DERIVED: the aggregate answer is Σ record[α_j], computed without any DPF
 
     const indices = [k]usize{ 3, 11, 19 };
     const seeds = detSeedsK(k, 909090);
-    const shares = try M.query(indices, seeds[0], seeds[1]);
+    var shares: [2]M.Share = undefined;
+    try M.query(indices, &seeds[0], &seeds[1], &shares);
 
     var a0: [3]M.Word = undefined;
     var a1: [3]M.Word = undefined;
-    try M.answerAggregate(0, shares[0], database, a0[0..n_words]);
-    try M.answerAggregate(1, shares[1], database, a1[0..n_words]);
+    try M.answerAggregate(0, &shares[0], database, a0[0..n_words]);
+    try M.answerAggregate(1, &shares[1], database, a1[0..n_words]);
 
     // Route A: add the three records word-wise, no secret sharing involved.
     var want: [3]M.Word = @splat(0);
@@ -1814,9 +1858,10 @@ test "DERIVED: the aggregate answer is Σ record[α_j], computed without any DPF
     for (0..n_words) |j| sum_a[j] = a0[j] +% a1[j];
     const swapped = [k]usize{ 19, 3, 11 }; // same multiset, different order
     const seeds2 = detSeedsK(k, 121212);
-    const shares2 = try M.query(swapped, seeds2[0], seeds2[1]);
-    try M.answerAggregate(0, shares2[0], database, a0[0..n_words]);
-    try M.answerAggregate(1, shares2[1], database, a1[0..n_words]);
+    var shares2: [2]M.Share = undefined;
+    try M.query(swapped, &seeds2[0], &seeds2[1], &shares2);
+    try M.answerAggregate(0, &shares2[0], database, a0[0..n_words]);
+    try M.answerAggregate(1, &shares2[1], database, a1[0..n_words]);
     for (0..n_words) |j| sum_b[j] = a0[j] +% a1[j];
     try testing.expectEqualSlices(M.Word, sum_a[0..n_words], sum_b[0..n_words]);
 
@@ -1838,19 +1883,24 @@ test "SELF: multi-index wire round-trip through both untrusted boundaries" {
     const indices = [k]usize{ 49, 7, 0 };
     const seeds = detSeedsK(k, 5150);
 
-    const shares = try M.query(indices, seeds[0], seeds[1]);
+    var shares: [2]M.Share = undefined;
+    try M.query(indices, &seeds[0], &seeds[1], &shares);
 
     var wire0: [M.share_len]u8 = undefined;
     var wire1: [M.share_len]u8 = undefined;
-    M.shareToBytes(shares[0], &wire0);
-    M.shareToBytes(shares[1], &wire1);
+    M.shareToBytes(&shares[0], &wire0);
+    M.shareToBytes(&shares[1], &wire1);
 
     var words: [k * 3]M.Word = undefined;
     var ans0: [k * 48]u8 = undefined;
     var ans1: [k * 48]u8 = undefined;
-    try M.answer(0, try M.shareFromBytes(&wire0), database, words[0..n_words]);
+    var parsed0: M.Share = undefined;
+    try M.shareFromBytes(&parsed0, &wire0);
+    try M.answer(0, &parsed0, database, words[0..n_words]);
     try P.answerToBytes(words[0..n_words], ans0[0..n_bytes]);
-    try M.answer(1, try M.shareFromBytes(&wire1), database, words[0..n_words]);
+    var parsed1: M.Share = undefined;
+    try M.shareFromBytes(&parsed1, &wire1);
+    try M.answer(1, &parsed1, database, words[0..n_words]);
     try P.answerToBytes(words[0..n_words], ans1[0..n_bytes]);
 
     var got: [k * record_len]u8 = undefined;
@@ -1883,17 +1933,18 @@ test "SELF: every record influences every block of a multi-index answer" {
     var bytes: [count * record_len]u8 = undefined;
     fillDb(&bytes, record_len);
     const seeds = detSeedsK(3, 8888);
-    const shares = try M.query(.{ 3, 14, 0 }, seeds[0], seeds[1]);
+    var shares: [2]M.Share = undefined;
+    try M.query(.{ 3, 14, 0 }, &seeds[0], &seeds[1], &shares);
     const per = 2;
     const n_words = try M.answerWords(record_len);
 
     var base: [3 * per]M.Word = undefined;
-    try M.answer(0, shares[0], try Database.init(&bytes, record_len), base[0..n_words]);
+    try M.answer(0, &shares[0], try Database.init(&bytes, record_len), base[0..n_words]);
 
     for (0..count) |x| {
         bytes[x * record_len] ^= 0x01;
         var perturbed: [3 * per]M.Word = undefined;
-        try M.answer(0, shares[0], try Database.init(&bytes, record_len), perturbed[0..n_words]);
+        try M.answer(0, &shares[0], try Database.init(&bytes, record_len), perturbed[0..n_words]);
         bytes[x * record_len] ^= 0x01;
         for (0..3) |j| {
             try testing.expect(!std.mem.eql(
@@ -1910,40 +1961,43 @@ test "SELF: multi-index geometry errors are returned, never asserted" {
     const seeds = detSeedsK(2, 1);
 
     // an index outside the domain, in either slot
-    try testing.expectError(error.IndexOutOfDomain, M.query(.{ 8, 0 }, seeds[0], seeds[1]));
-    try testing.expectError(error.IndexOutOfDomain, M.query(.{ 0, 8 }, seeds[0], seeds[1]));
+    var scratch: [2]M.Share = undefined;
+    try testing.expectError(error.IndexOutOfDomain, M.query(.{ 8, 0 }, &seeds[0], &seeds[1], &scratch));
+    try testing.expectError(error.IndexOutOfDomain, M.query(.{ 0, 8 }, &seeds[0], &seeds[1], &scratch));
 
     // seed reuse across the two instances — the leak guard, surfaced here
     var dup0 = seeds[0];
     dup0[1] = dup0[0];
     var dup1 = seeds[1];
     dup1[1] = dup1[0];
-    try testing.expectError(error.SeedReuse, M.query(.{ 0, 1 }, dup0, dup1));
+    try testing.expectError(error.SeedReuse, M.query(.{ 0, 1 }, &dup0, &dup1, &scratch));
 
-    const shares = try M.query(.{ 0, 1 }, seeds[0], seeds[1]);
+    var shares: [2]M.Share = undefined;
+    try M.query(.{ 0, 1 }, &seeds[0], &seeds[1], &shares);
 
     var bytes: [4 * 6]u8 = undefined;
     fillDb(&bytes, 6);
     const database = try Database.init(&bytes, 6);
     var out: [4]M.Word = undefined;
-    try testing.expectError(error.AnswerLengthMismatch, M.answer(0, shares[0], database, out[0..3]));
+    try testing.expectError(error.AnswerLengthMismatch, M.answer(0, &shares[0], database, out[0..3]));
 
     var big: [9 * 6]u8 = undefined;
     fillDb(&big, 6);
     try testing.expectError(
         error.DomainTooSmall,
-        M.answer(0, shares[0], try Database.init(&big, 6), &out),
+        M.answer(0, &shares[0], try Database.init(&big, 6), &out),
     );
 
-    try testing.expectError(error.ShareLengthMismatch, M.shareFromBytes(&[_]u8{0} ** 3));
+    var sc_m: M.Share = undefined;
+    try testing.expectError(error.ShareLengthMismatch, M.shareFromBytes(&sc_m, &[_]u8{0} ** 3));
     try testing.expectError(
         error.ShareLengthMismatch,
-        M.shareFromBytes(&[_]u8{0} ** (M.share_len + 1)),
+        M.shareFromBytes(&sc_m, &[_]u8{0} ** (M.share_len + 1)),
     );
     // exactly one share's worth is NOT enough for a two-instance share
     try testing.expectError(
         error.ShareLengthMismatch,
-        M.shareFromBytes(&[_]u8{0} ** (M.share_len / 2)),
+        M.shareFromBytes(&sc_m, &[_]u8{0} ** (M.share_len / 2)),
     );
 
     var rec: [2 * 6]u8 = undefined;
@@ -1964,7 +2018,7 @@ test "SELF: multi-index geometry errors are returned, never asserted" {
     var agg: [2]M.Word = undefined;
     try testing.expectError(
         error.DomainTooSmall,
-        M.answerAggregate(0, shares[0], try Database.init(&big, 6), &agg),
+        M.answerAggregate(0, &shares[0], try Database.init(&big, 6), &agg),
     );
 }
 
@@ -2002,8 +2056,9 @@ test "SELF: exhaustive length sweep over the multi-index untrusted boundaries" {
     var big: [3 * M.share_len]u8 = undefined;
     for (&big, 0..) |*b, i| b.* = @truncate(i);
     for (0..big.len + 1) |n| {
-        const r = M.shareFromBytes(big[0..n]);
-        if (n == M.share_len) _ = try r else try testing.expectError(error.ShareLengthMismatch, r);
+        var sh: M.Share = undefined;
+        const r = M.shareFromBytes(&sh, big[0..n]);
+        if (n == M.share_len) try r else try testing.expectError(error.ShareLengthMismatch, r);
     }
 }
 
@@ -2029,13 +2084,15 @@ test "SELF: keywordIndex is deterministic, in-domain; queryKeyword is exactly qu
         // Definitional, pinned as bytes: the keyword wrapper adds NOTHING to
         // the query — same seeds, byte-identical shares.
         const seeds = detSeeds(424242 + i);
-        const via_kw = try P.queryKeyword(kw, seeds[0], seeds[1]);
-        const via_idx = try P.query(idx, seeds[0], seeds[1]);
+        var via_kw: [2]P.Share = undefined;
+        try P.queryKeyword(kw, &seeds[0], &seeds[1], &via_kw);
+        var via_idx: [2]P.Share = undefined;
+        try P.query(idx, &seeds[0], &seeds[1], &via_idx);
         var b_kw: [P.share_len]u8 = undefined;
         var b_idx: [P.share_len]u8 = undefined;
         for (0..2) |b| {
-            P.shareToBytes(via_kw[b], &b_kw);
-            P.shareToBytes(via_idx[b], &b_idx);
+            P.shareToBytes(&via_kw[b], &b_kw);
+            P.shareToBytes(&via_idx[b], &b_idx);
             try testing.expectEqualSlices(u8, &b_idx, &b_kw);
         }
     }
@@ -2094,9 +2151,10 @@ test "SELF: keyword retrieval — a hit returns the record; a miss is the SAME c
     // Hits: retrieval by keyword, key field matches locally.
     for (kws, idxs, 0..) |kw, ix, i| {
         const seeds = detSeeds(9000 + i);
-        const shares = try P.queryKeyword(kw, seeds[0], seeds[1]);
-        try P.answer(0, shares[0], database, a0[0..n_words]);
-        try P.answer(1, shares[1], database, a1[0..n_words]);
+        var shares: [2]P.Share = undefined;
+        try P.queryKeyword(kw, &seeds[0], &seeds[1], &shares);
+        try P.answer(0, &shares[0], database, a0[0..n_words]);
+        try P.answer(1, &shares[1], database, a1[0..n_words]);
         try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
         try testing.expectEqualSlices(u8, kw, got[0..kw.len]);
         try testing.expectEqual(@as(u8, @truncate(ix)), got[8]);
@@ -2109,9 +2167,10 @@ test "SELF: keyword retrieval — a hit returns the record; a miss is the SAME c
         const ix = P.keywordIndex(kw);
         for (idxs) |occupied| try testing.expect(ix != occupied); // it IS a miss
         const seeds = detSeeds(9100);
-        const shares = try P.queryKeyword(kw, seeds[0], seeds[1]);
-        try P.answer(0, shares[0], database, a0[0..n_words]);
-        try P.answer(1, shares[1], database, a1[0..n_words]);
+        var shares: [2]P.Share = undefined;
+        try P.queryKeyword(kw, &seeds[0], &seeds[1], &shares);
+        try P.answer(0, &shares[0], database, a0[0..n_words]);
+        try P.answer(1, &shares[1], database, a1[0..n_words]);
         try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
         try testing.expect(!std.mem.eql(u8, kw, got[0..kw.len])); // filler came back
     }
@@ -2130,9 +2189,10 @@ test "SELF: keyword retrieval — a hit returns the record; a miss is the SAME c
             if (P.keywordIndex(cand) >= 100) break cand;
         } else unreachable;
         const seeds = detSeeds(9200);
-        const shares = try P.queryKeyword(kw, seeds[0], seeds[1]);
-        try P.answer(0, shares[0], small, a0[0..n_words]);
-        try P.answer(1, shares[1], small, a1[0..n_words]);
+        var shares: [2]P.Share = undefined;
+        try P.queryKeyword(kw, &seeds[0], &seeds[1], &shares);
+        try P.answer(0, &shares[0], small, a0[0..n_words]);
+        try P.answer(1, &shares[1], small, a1[0..n_words]);
         try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
         try testing.expectEqualSlices(u8, &[_]u8{0} ** record_len, &got);
     }
@@ -2188,9 +2248,10 @@ test "SELF: colliding keywords — the occupant comes back for BOTH; the loser g
     inline for (.{ .{ &got_a, 1111 }, .{ &got_b, 2222 } }, 0..) |case, which| {
         const kw = if (which == 0) kw_a else kw_b;
         const seeds = detSeeds(case[1]);
-        const shares = try P.queryKeyword(kw, seeds[0], seeds[1]);
-        try P.answer(0, shares[0], database, a0[0..n_words]);
-        try P.answer(1, shares[1], database, a1[0..n_words]);
+        var shares: [2]P.Share = undefined;
+        try P.queryKeyword(kw, &seeds[0], &seeds[1], &shares);
+        try P.answer(0, &shares[0], database, a0[0..n_words]);
+        try P.answer(1, &shares[1], database, a1[0..n_words]);
         try P.reconstruct(a0[0..n_words], a1[0..n_words], case[0]);
     }
     // Both got the occupant's record — byte-identical answers.
@@ -2232,10 +2293,11 @@ test "SELF: what must NOT be built — an existence precheck makes presence obse
     var emitted: usize = 0;
     inline for (.{ "alpha", "zulu" }, 0..) |kw, i| {
         const seeds = detSeeds(7700 + i);
-        const shares = try P.queryKeyword(kw, seeds[0], seeds[1]);
+        var shares: [2]P.Share = undefined;
+        try P.queryKeyword(kw, &seeds[0], &seeds[1], &shares);
         emitted += 1;
         var w: [P.share_len]u8 = undefined;
-        P.shareToBytes(shares[0], &w); // same compile-time length either way
+        P.shareToBytes(&shares[0], &w); // same compile-time length either way
     }
     try testing.expectEqual(@as(usize, 2), emitted);
 }
@@ -2268,9 +2330,10 @@ fn seedTail(store: []u8, at: usize, v: u64) usize {
 /// pseudo-random output and no literal could be written by hand.
 fn realShare(party: u1, index: usize, tag: u64) [FuzzPir.share_len]u8 {
     const seeds = detSeeds(tag);
-    const shares = FuzzPir.query(index, seeds[0], seeds[1]) catch unreachable;
+    var shares: [2]FuzzPir.Share = undefined;
+    FuzzPir.query(index, &seeds[0], &seeds[1], &shares) catch unreachable;
     var buf: [FuzzPir.share_len]u8 = undefined;
-    FuzzPir.shareToBytes(shares[party], &buf);
+    FuzzPir.shareToBytes(&shares[party], &buf);
     return buf;
 }
 
@@ -2322,9 +2385,10 @@ fn fuzzShareFromBytes(_: void, smith: *std.testing.Smith) !void {
     // `ShareLengthMismatch` on every round it had ever run, with the share
     // sitting unread in `buf`.
     const len: usize = smith.slice(&buf);
-    const share = FuzzPir.shareFromBytes(buf[0..len]) catch return;
+    var share: FuzzPir.Share = undefined;
+    FuzzPir.shareFromBytes(&share, buf[0..len]) catch return;
     var out: [FuzzPir.share_len]u8 = undefined;
-    FuzzPir.shareToBytes(share, &out);
+    FuzzPir.shareToBytes(&share, &out);
     std.mem.doNotOptimizeAway(&out);
 }
 test "fuzz shareFromBytes never panics" {
@@ -2348,10 +2412,11 @@ test "corpus: every share seed reaches shareFromBytes, and the counts are pinned
         var buf: [FuzzPir.share_len + 8]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
-        const share = FuzzPir.shareFromBytes(buf[0..len]) catch continue;
+        var share: FuzzPir.Share = undefined;
+        FuzzPir.shareFromBytes(&share, buf[0..len]) catch continue;
         accepted += 1;
         var out: [FuzzPir.share_len]u8 = undefined;
-        FuzzPir.shareToBytes(share, &out);
+        FuzzPir.shareToBytes(&share, &out);
         var known = false;
         for (seen[0..distinct]) |prev| {
             if (std.mem.eql(u8, &prev, &out)) known = true;
@@ -2439,7 +2504,8 @@ fn fuzzAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     // answer computation must survive arbitrary key material.
     var key_buf: [FuzzPir.share_len]u8 = undefined;
     smith.bytes(&key_buf);
-    const share = FuzzPir.shareFromBytes(&key_buf) catch return;
+    var share: FuzzPir.Share = undefined;
+    FuzzPir.shareFromBytes(&share, &key_buf) catch return;
 
     var db_bytes: [128]u8 = undefined;
     const db_len: usize = smith.slice(&db_bytes);
@@ -2452,7 +2518,7 @@ fn fuzzAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     var out: [16]FuzzPir.Word = undefined;
     const n_words = FuzzPir.answerWords(record_len);
     const party: u1 = @truncate(smith.value(u64));
-    try FuzzPir.answer(party, share, database, out[0..n_words]);
+    try FuzzPir.answer(party, &share, database, out[0..n_words]);
 
     var wire: [64]u8 = undefined;
     try FuzzPir.answerToBytes(out[0..n_words], wire[0 .. n_words * 4]);
@@ -2477,7 +2543,8 @@ test "corpus: the hostile-share answer seeds reach both parties, counts pinned" 
         var smith: std.testing.Smith = .{ .in = sd };
         var key_buf: [FuzzPir.share_len]u8 = undefined;
         smith.bytes(&key_buf);
-        const share = FuzzPir.shareFromBytes(&key_buf) catch continue;
+        var share: FuzzPir.Share = undefined;
+        FuzzPir.shareFromBytes(&share, &key_buf) catch continue;
         parsed += 1;
         var db_bytes: [128]u8 = undefined;
         const db_len: usize = smith.slice(&db_bytes);
@@ -2489,7 +2556,7 @@ test "corpus: the hostile-share answer seeds reach both parties, counts pinned" 
         const n_words = FuzzPir.answerWords(record_len);
         const party: u1 = @truncate(smith.value(u64));
         if (party == 1) party1 += 1;
-        try FuzzPir.answer(party, share, database, out[0..n_words]);
+        try FuzzPir.answer(party, &share, database, out[0..n_words]);
         answered += 1;
         records += database.count();
     }
@@ -2538,11 +2605,12 @@ const ReconCorpus = struct {
         fillDb(&self.db_bytes, record_len);
         const database = Database.init(&self.db_bytes, record_len) catch unreachable;
         const seeds = detSeeds(31337);
-        const shares = FuzzPir.query(index, seeds[0], seeds[1]) catch unreachable;
+        var shares: [2]FuzzPir.Share = undefined;
+        FuzzPir.query(index, &seeds[0], &seeds[1], &shares) catch unreachable;
         var wire: [2][8]u8 = undefined;
         for (0..2) |p| {
             var words: [2]FuzzPir.Word = undefined;
-            FuzzPir.answer(@intCast(p), shares[p], database, &words) catch unreachable;
+            FuzzPir.answer(@intCast(p), &shares[p], database, &words) catch unreachable;
             FuzzPir.answerToBytes(&words, &wire[p]) catch unreachable;
         }
         return wire;
@@ -2654,9 +2722,10 @@ fn realMultiShare(party: u1, indices: [3]usize, tag: u64) [FuzzMulti.share_len]u
         s0[j] = pair[0];
         s1[j] = pair[1];
     }
-    const shares = FuzzMulti.query(indices, s0, s1) catch unreachable;
+    var shares: [2]FuzzMulti.Share = undefined;
+    FuzzMulti.query(indices, &s0, &s1, &shares) catch unreachable;
     var buf: [FuzzMulti.share_len]u8 = undefined;
-    FuzzMulti.shareToBytes(shares[party], &buf);
+    FuzzMulti.shareToBytes(&shares[party], &buf);
     return buf;
 }
 
@@ -2698,9 +2767,10 @@ fn fuzzMultiShareFromBytes(_: void, smith: *std.testing.Smith) !void {
     // every round, so the only length this parser accepts had never been
     // presented to it.
     const len: usize = smith.slice(&buf);
-    const share = FuzzMulti.shareFromBytes(buf[0..len]) catch return;
+    var share: FuzzMulti.Share = undefined;
+    FuzzMulti.shareFromBytes(&share, buf[0..len]) catch return;
     var out: [FuzzMulti.share_len]u8 = undefined;
-    FuzzMulti.shareToBytes(share, &out);
+    FuzzMulti.shareToBytes(&share, &out);
     std.mem.doNotOptimizeAway(&out);
 }
 test "fuzz multi-index shareFromBytes never panics" {
@@ -2720,10 +2790,11 @@ test "corpus: every multi-index share seed reaches the parser, counts pinned" {
         var buf: [FuzzMulti.share_len + 8]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
-        const share = FuzzMulti.shareFromBytes(buf[0..len]) catch continue;
+        var share: FuzzMulti.Share = undefined;
+        FuzzMulti.shareFromBytes(&share, buf[0..len]) catch continue;
         accepted += 1;
         var out: [FuzzMulti.share_len]u8 = undefined;
-        FuzzMulti.shareToBytes(share, &out);
+        FuzzMulti.shareToBytes(&share, &out);
         var known = false;
         for (seen[0..distinct]) |prev| {
             if (std.mem.eql(u8, &prev, &out)) known = true;
@@ -2799,7 +2870,8 @@ fn fuzzMultiAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     // nonsense.
     var key_buf: [FuzzMulti.share_len]u8 = undefined;
     smith.bytes(&key_buf);
-    const share = FuzzMulti.shareFromBytes(&key_buf) catch return;
+    var share: FuzzMulti.Share = undefined;
+    FuzzMulti.shareFromBytes(&share, &key_buf) catch return;
 
     var db_bytes: [128]u8 = undefined;
     const db_len: usize = smith.slice(&db_bytes);
@@ -2811,11 +2883,11 @@ fn fuzzMultiAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
 
     var out: [3 * 16]FuzzMulti.Word = undefined;
     const n_words = try FuzzMulti.answerWords(record_len);
-    try FuzzMulti.answer(party, share, database, out[0..n_words]);
+    try FuzzMulti.answer(party, &share, database, out[0..n_words]);
 
     var agg: [16]FuzzMulti.Word = undefined;
     const agg_words = FuzzMulti.aggregateWords(record_len);
-    try FuzzMulti.answerAggregate(party, share, database, agg[0..agg_words]);
+    try FuzzMulti.answerAggregate(party, &share, database, agg[0..agg_words]);
 
     var wire: [3 * 64]u8 = undefined;
     try FuzzPir.answerToBytes(out[0..n_words], wire[0 .. n_words * 4]);
@@ -2835,7 +2907,8 @@ test "corpus: the multi-index hostile-share seeds reach both parties, counts pin
         var smith: std.testing.Smith = .{ .in = sd };
         var key_buf: [FuzzMulti.share_len]u8 = undefined;
         smith.bytes(&key_buf);
-        const share = FuzzMulti.shareFromBytes(&key_buf) catch continue;
+        var share: FuzzMulti.Share = undefined;
+        FuzzMulti.shareFromBytes(&share, &key_buf) catch continue;
         var db_bytes: [128]u8 = undefined;
         const db_len: usize = smith.slice(&db_bytes);
         const record_len: usize = @intCast(1 + smith.value(u64) % 16);
@@ -2846,7 +2919,7 @@ test "corpus: the multi-index hostile-share seeds reach both parties, counts pin
         if (party == 1) party1 += 1;
         var out: [3 * 16]FuzzMulti.Word = undefined;
         const n_words = try FuzzMulti.answerWords(record_len);
-        try FuzzMulti.answer(party, share, database, out[0..n_words]);
+        try FuzzMulti.answer(party, &share, database, out[0..n_words]);
         answered += 1;
         records += database.count();
     }
@@ -2890,11 +2963,12 @@ const MultiReconCorpus = struct {
             s0[j] = pair[0];
             s1[j] = pair[1];
         }
-        const shares = FuzzMulti.query(indices, s0, s1) catch unreachable;
+        var shares: [2]FuzzMulti.Share = undefined;
+        FuzzMulti.query(indices, &s0, &s1, &shares) catch unreachable;
         var wire: [2][24]u8 = undefined;
         for (0..2) |p| {
             var words: [6]FuzzMulti.Word = undefined;
-            FuzzMulti.answer(@intCast(p), shares[p], database, &words) catch unreachable;
+            FuzzMulti.answer(@intCast(p), &shares[p], database, &words) catch unreachable;
             FuzzPir.answerToBytes(&words, &wire[p]) catch unreachable;
         }
         return wire;

@@ -52,7 +52,8 @@ pub fn main() !void {
     rand.bytes(&s0);
     rand.bytes(&s1);
 
-    const keys = D.genWithSeeds(alpha, beta, s0, s1);
+    var keys: [2]D.Key = undefined;
+    D.genWithSeeds(alpha, beta, &s0, &s1, &keys);
     const k0 = keys[0];
     const k1 = keys[1];
 
@@ -61,8 +62,8 @@ pub fn main() !void {
     // bigger than one `eval` call per record would tolerate).
     var share0: [D.domain_size]D.Elem = undefined;
     var share1: [D.domain_size]D.Elem = undefined;
-    D.evalFull(0, k0, &share0);
-    D.evalFull(1, k1, &share1);
+    D.evalFull(0, &k0, &share0);
+    D.evalFull(1, &k1, &share1);
 
     // Reconstruct: at every point except alpha the two shares cancel to
     // zero; at alpha they sum to beta. A third party sees only one share,
@@ -83,20 +84,23 @@ pub fn main() !void {
     // Wire round trip: a key travels to its server as tagged bytes.
     var buf0: [D.Key.tagged_len]u8 = undefined;
     k0.toBytesTagged(&buf0);
-    const decoded0 = try D.Key.fromBytesTagged(&buf0);
-    std.debug.print("decoded key reproduces eval(0, k0, alpha): {}\n", .{D.eval(0, decoded0, alpha) == D.eval(0, k0, alpha)});
+    var decoded0: D.Key = undefined;
+    try D.Key.fromBytesTagged(&decoded0, &buf0);
+    std.debug.print("decoded key reproduces eval(0, k0, alpha): {}\n", .{D.eval(0, &decoded0, alpha) == D.eval(0, &k0, alpha)});
 
     // A key produced by the OTHER PRG instantiation must be rejected by
     // name, not silently decoded into a garbage (but same-length) key —
     // this is exactly what the format tag exists to catch.
     const DSha = fss.DpfWith(fss.prg.Sha256Prg, 8, 4);
-    const sha_keys = DSha.genWithSeeds(alpha, beta, s0, s1);
+    var sha_keys: [2]DSha.Key = undefined;
+    DSha.genWithSeeds(alpha, beta, &s0, &s1, &sha_keys);
     var sha_buf: [DSha.Key.tagged_len]u8 = undefined;
     sha_keys[0].toBytesTagged(&sha_buf);
     // Same tagged length as the AES instantiation, so only the tag byte
     // stands between this and silently wrong bytes.
     must(sha_buf.len == buf0.len, @src());
-    _ = D.Key.fromBytesTagged(&sha_buf) catch |err| switch (err) {
+    var rejected: D.Key = undefined;
+    D.Key.fromBytesTagged(&rejected, &sha_buf) catch |err| switch (err) {
         error.UnsupportedKeyFormat => std.debug.print("cross-PRG key correctly rejected by its format tag\n", .{}),
     };
 }

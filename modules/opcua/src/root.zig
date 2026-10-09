@@ -17,6 +17,7 @@
 //! only, no source copied. See `NOTICE` for the full provenance note.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 // Skip diagnostics are opt-in: `zig build test` must be silent on
 // success (any stderr triggers the build runner's `failed command:`
@@ -95,6 +96,7 @@ test {
     _ = server;
     _ = @import("server_interop.zig");
     _ = @import("asyncua_replay.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 // ── F2: Secure Channel (SecurityPolicy#None) ────────────────────────────────
@@ -136,7 +138,16 @@ pub const SecureChannel = struct {
     /// channel renewal is out of F2's scope) and return the opened channel.
     /// `conn` must already have completed the Hello/Acknowledge handshake
     /// (`transport.connect`/`Connection.hello`).
-    pub fn open(conn: *transport.Connection, allocator: std.mem.Allocator, options: OpenOptions) services.ServiceError!SecureChannel {
+    ///
+    /// The channel is written through `out`, never returned: it holds the
+    /// derived symmetric keys, and a returned `SecureChannel` sits in the
+    /// caller's result slot, out of reach of the burn. `out` is untouched on
+    /// error.
+    pub fn open(conn: *transport.Connection, allocator: std.mem.Allocator, options: OpenOptions, out: *SecureChannel) services.ServiceError!void {
+        return burn.run(burn.open_burn, services.ServiceError!void, openBody, .{ conn, allocator, options, out });
+    }
+
+    fn openBody(conn: *transport.Connection, allocator: std.mem.Allocator, options: OpenOptions, out: *SecureChannel) services.ServiceError!void {
         var ch: SecureChannel = .{ .io = .{ .conn = conn, .allocator = allocator, .security = options.security } };
 
         const security_mode: services.MessageSecurityMode = if (options.security) |sec| sec.mode else .none;
@@ -187,7 +198,10 @@ pub const SecureChannel = struct {
             // before the deferred free above releases it.
             std.crypto.secureZero(u8, @constCast(server_nonce));
         }
-        return ch;
+        out.* = ch;
+        // The local copy holds the derived keys: wipe it (the frame is burned
+        // too, but this is the copy we know about).
+        if (ch.io.security) |*sec| if (sec.keys) |*keys| keys.wipe();
     }
 
     /// Send the CloseSecureChannel request in a CLO chunk. Per OPC 10000-6
@@ -197,6 +211,10 @@ pub const SecureChannel = struct {
     /// — this does not wait for or expect one; the caller is expected to
     /// close the underlying socket next.
     pub fn close(ch: *SecureChannel) services.ServiceError!void {
+        return burn.run(burn.req_burn, services.ServiceError!void, closeBody, .{ch});
+    }
+
+    fn closeBody(ch: *SecureChannel) services.ServiceError!void {
         // The derived channel keys die with the channel — wiped whether or
         // not the CLO send itself succeeds.
         defer if (ch.io.security) |*sec| {
@@ -407,6 +425,10 @@ pub const Session = struct {
 
     /// Perform the CloseSession request/response.
     pub fn close(session: *Session, delete_subscriptions: bool) services.ServiceError!void {
+        return burn.run(burn.req_burn, services.ServiceError!void, closeBody, .{ session, delete_subscriptions });
+    }
+
+    fn closeBody(session: *Session, delete_subscriptions: bool) services.ServiceError!void {
         const request: services.CloseSessionRequest = .{
             .request_header = session.channel.io.nextRequestHeader(session.authentication_token, 10_000),
             .delete_subscriptions = delete_subscriptions,
@@ -469,6 +491,10 @@ pub const Session = struct {
     /// values by NodeId. See `readAttribute` for the common one-node/one-
     /// attribute case.
     pub fn read(session: *Session, nodes_to_read: []const services.ReadValueId, options: ReadOptions) services.ServiceError!services.ReadResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.ReadResponse, readBody, .{ session, nodes_to_read, options });
+    }
+
+    fn readBody(session: *Session, nodes_to_read: []const services.ReadValueId, options: ReadOptions) services.ServiceError!services.ReadResponse {
         const request: services.ReadRequest = .{
             .request_header = session.channel.io.nextRequestHeader(session.authentication_token, options.timeout_hint_ms),
             .max_age = options.max_age,
@@ -525,6 +551,10 @@ pub const Session = struct {
     /// The Write service (OPC 10000-4 §5.10.4): set one or more attribute
     /// values by NodeId.
     pub fn write(session: *Session, nodes_to_write: []const services.WriteValue) services.ServiceError!services.WriteResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.WriteResponse, writeBody, .{ session, nodes_to_write });
+    }
+
+    fn writeBody(session: *Session, nodes_to_write: []const services.WriteValue) services.ServiceError!services.WriteResponse {
         const request: services.WriteRequest = .{
             .request_header = session.channel.io.nextRequestHeader(session.authentication_token, 10_000),
             .nodes_to_write = nodes_to_write,
@@ -555,6 +585,10 @@ pub const Session = struct {
     /// The Browse service (OPC 10000-4 §5.8.2): enumerate a node's
     /// references (children/parents/type hierarchy).
     pub fn browse(session: *Session, nodes_to_browse: []const services.BrowseDescription, options: BrowseOptions) services.ServiceError!services.BrowseResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.BrowseResponse, browseBody, .{ session, nodes_to_browse, options });
+    }
+
+    fn browseBody(session: *Session, nodes_to_browse: []const services.BrowseDescription, options: BrowseOptions) services.ServiceError!services.BrowseResponse {
         const request: services.BrowseRequest = .{
             .request_header = session.channel.io.nextRequestHeader(session.authentication_token, options.timeout_hint_ms),
             .view = options.view,
@@ -581,6 +615,10 @@ pub const Session = struct {
     /// references (the client-side equivalent of "I'm done paging, free
     /// your cursor").
     pub fn browseNext(session: *Session, continuation_points: []const ?[]const u8, release: bool) services.ServiceError!services.BrowseNextResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.BrowseNextResponse, browseNextBody, .{ session, continuation_points, release });
+    }
+
+    fn browseNextBody(session: *Session, continuation_points: []const ?[]const u8, release: bool) services.ServiceError!services.BrowseNextResponse {
         const request: services.BrowseNextRequest = .{
             .request_header = session.channel.io.nextRequestHeader(session.authentication_token, 10_000),
             .release_continuation_points = release,
@@ -602,6 +640,10 @@ pub const Session = struct {
 
     /// The Call service (OPC 10000-4 §5.11.2): invoke a method node.
     pub fn call(session: *Session, methods_to_call: []const services.CallMethodRequest) services.ServiceError!services.CallResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.CallResponse, callBody, .{ session, methods_to_call });
+    }
+
+    fn callBody(session: *Session, methods_to_call: []const services.CallMethodRequest) services.ServiceError!services.CallResponse {
         const request: services.CallRequest = .{
             .request_header = session.channel.io.nextRequestHeader(session.authentication_token, 10_000),
             .methods_to_call = methods_to_call,
@@ -629,6 +671,10 @@ pub const Session = struct {
 
     /// SetPublishingMode (OPC 10000-4 §5.13.4) for one or more subscriptions.
     pub fn setPublishingMode(session: *Session, subscription_ids: []const u32, enabled: bool) services.ServiceError!services.SetPublishingModeResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.SetPublishingModeResponse, setPublishingModeBody, .{ session, subscription_ids, enabled });
+    }
+
+    fn setPublishingModeBody(session: *Session, subscription_ids: []const u32, enabled: bool) services.ServiceError!services.SetPublishingModeResponse {
         const request: services.SetPublishingModeRequest = .{
             .request_header = session.channel.io.nextRequestHeader(session.authentication_token, 10_000),
             .publishing_enabled = enabled,
@@ -651,6 +697,10 @@ pub const Session = struct {
     /// DeleteSubscriptions (OPC 10000-4 §5.13.8) for one or more
     /// subscriptions.
     pub fn deleteSubscriptions(session: *Session, subscription_ids: []const u32) services.ServiceError!services.DeleteSubscriptionsResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.DeleteSubscriptionsResponse, deleteSubscriptionsBody, .{ session, subscription_ids });
+    }
+
+    fn deleteSubscriptionsBody(session: *Session, subscription_ids: []const u32) services.ServiceError!services.DeleteSubscriptionsResponse {
         const request: services.DeleteSubscriptionsRequest = .{
             .request_header = session.channel.io.nextRequestHeader(session.authentication_token, 10_000),
             .subscription_ids = subscription_ids,
@@ -879,6 +929,10 @@ pub const Subscription = struct {
 
     /// CreateSubscription (OPC 10000-4 §5.13.2).
     pub fn create(session: *Session, allocator: std.mem.Allocator, options: CreateOptions) services.ServiceError!Subscription {
+        return burn.run(burn.req_burn, services.ServiceError!Subscription, createBody, .{ session, allocator, options });
+    }
+
+    fn createBody(session: *Session, allocator: std.mem.Allocator, options: CreateOptions) services.ServiceError!Subscription {
         var sub: Subscription = .{ .session = session, .allocator = allocator };
         const request: services.CreateSubscriptionRequest = .{
             .request_header = session.channel.io.nextRequestHeader(session.authentication_token, options.timeout_hint_ms),
@@ -920,6 +974,10 @@ pub const Subscription = struct {
 
     /// ModifySubscription (OPC 10000-4 §5.13.3).
     pub fn modify(sub: *Subscription, options: ModifyOptions) services.ServiceError!void {
+        return burn.run(burn.req_burn, services.ServiceError!void, modifyBody, .{ sub, options });
+    }
+
+    fn modifyBody(sub: *Subscription, options: ModifyOptions) services.ServiceError!void {
         const request: services.ModifySubscriptionRequest = .{
             .request_header = sub.session.channel.io.nextRequestHeader(sub.session.authentication_token, options.timeout_hint_ms),
             .subscription_id = sub.subscription_id,
@@ -951,6 +1009,10 @@ pub const Subscription = struct {
     /// the service itself operates on a list (see `Session.setPublishingMode`
     /// for the multi-subscription form).
     pub fn setPublishingMode(sub: *Subscription, enabled: bool) services.ServiceError!void {
+        return burn.run(burn.req_burn, services.ServiceError!void, setPublishingModeBody, .{ sub, enabled });
+    }
+
+    fn setPublishingModeBody(sub: *Subscription, enabled: bool) services.ServiceError!void {
         const response = try sub.session.setPublishingMode(&.{sub.subscription_id}, enabled);
         services.freeSetPublishingModeResponse(sub.allocator, response);
     }
@@ -959,6 +1021,10 @@ pub const Subscription = struct {
     /// After this call `sub` no longer names anything server-side; only
     /// `deinit` (freeing local bookkeeping) is safe to call on it.
     pub fn delete(sub: *Subscription) services.ServiceError!void {
+        return burn.run(burn.req_burn, services.ServiceError!void, deleteBody, .{sub});
+    }
+
+    fn deleteBody(sub: *Subscription) services.ServiceError!void {
         const response = try sub.session.deleteSubscriptions(&.{sub.subscription_id});
         services.freeDeleteSubscriptionsResponse(sub.allocator, response);
     }
@@ -990,6 +1056,10 @@ pub const Subscription = struct {
     /// status_code` came back Bad). Caller frees the returned response with
     /// `services.freeCreateMonitoredItemsResponse`.
     pub fn createMonitoredItems(sub: *Subscription, specs: []const MonitoredItemSpec, timestamps_to_return: services.TimestampsToReturn) services.ServiceError!services.CreateMonitoredItemsResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.CreateMonitoredItemsResponse, createMonitoredItemsBody, .{ sub, specs, timestamps_to_return });
+    }
+
+    fn createMonitoredItemsBody(sub: *Subscription, specs: []const MonitoredItemSpec, timestamps_to_return: services.TimestampsToReturn) services.ServiceError!services.CreateMonitoredItemsResponse {
         var items = try std.ArrayList(services.MonitoredItemCreateRequest).initCapacity(sub.allocator, specs.len);
         defer items.deinit(sub.allocator);
         for (specs) |spec| {
@@ -1047,6 +1117,10 @@ pub const Subscription = struct {
     /// frees the returned response with `services.
     /// freeDeleteMonitoredItemsResponse`.
     pub fn deleteMonitoredItems(sub: *Subscription, monitored_item_ids: []const u32) services.ServiceError!services.DeleteMonitoredItemsResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.DeleteMonitoredItemsResponse, deleteMonitoredItemsBody, .{ sub, monitored_item_ids });
+    }
+
+    fn deleteMonitoredItemsBody(sub: *Subscription, monitored_item_ids: []const u32) services.ServiceError!services.DeleteMonitoredItemsResponse {
         const request: services.DeleteMonitoredItemsRequest = .{
             .request_header = sub.session.channel.io.nextRequestHeader(sub.session.authentication_token, 10_000),
             .subscription_id = sub.subscription_id,
@@ -1112,6 +1186,10 @@ pub const Subscription = struct {
     /// `PublishResult` with `freePublishResult` — acknowledgement bookkeeping
     /// is handled automatically on the *next* call.
     pub fn publish(sub: *Subscription, options: PublishOptions) services.ServiceError!PublishResult {
+        return burn.run(burn.req_burn, services.ServiceError!PublishResult, publishBody, .{ sub, options });
+    }
+
+    fn publishBody(sub: *Subscription, options: PublishOptions) services.ServiceError!PublishResult {
         var acks = try std.ArrayList(services.SubscriptionAcknowledgement).initCapacity(sub.allocator, sub.pending_acks.items.len);
         defer acks.deinit(sub.allocator);
         for (sub.pending_acks.items) |seq| acks.appendAssumeCapacity(.{ .subscription_id = sub.subscription_id, .sequence_number = seq });
@@ -1180,6 +1258,10 @@ pub const Subscription = struct {
     /// result — this queues its sequence number onto `pending_acks` the same
     /// way.
     pub fn republish(sub: *Subscription, retransmit_sequence_number: u32, options: RepublishOptions) services.ServiceError!PublishResult {
+        return burn.run(burn.req_burn, services.ServiceError!PublishResult, republishBody, .{ sub, retransmit_sequence_number, options });
+    }
+
+    fn republishBody(sub: *Subscription, retransmit_sequence_number: u32, options: RepublishOptions) services.ServiceError!PublishResult {
         const request: services.RepublishRequest = .{
             .request_header = sub.session.channel.io.nextRequestHeader(sub.session.authentication_token, options.timeout_hint_ms),
             .subscription_id = sub.subscription_id,
@@ -1396,7 +1478,8 @@ test "full offline flow: OPN -> CreateSession -> ActivateSession -> CloseSession
     var client_in_r: std.Io.Reader = .fixed(server_w.buffered());
     var conn = transport.Connection.init(&client_in_r, &client_out_w);
 
-    var ch = try SecureChannel.open(&conn, testing.allocator, .{});
+    var ch: SecureChannel = undefined;
+    try SecureChannel.open(&conn, testing.allocator, .{}, &ch);
     try testing.expectEqual(@as(u32, 7), ch.io.channel_id);
     try testing.expectEqual(@as(u32, 3), ch.io.token_id);
 
@@ -1536,20 +1619,32 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
 
     // Small keys keep this fast in Debug; nothing below hardcodes 2048-bit
     // lengths (they're all derived from the certificates' moduli).
-    var client_creds = try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
-        .modulus_bits = 512,
-        .common_name = "secure-selftest-client",
-        .not_before = "260101000000Z",
-        .not_after = "270101000000Z",
-        .application_uri = "urn:zig-libs:opcua:client",
-    });
+    var client_creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(
+        testing.allocator,
+        random,
+        .{
+            .modulus_bits = 512,
+            .common_name = "secure-selftest-client",
+            .not_before = "260101000000Z",
+            .not_after = "270101000000Z",
+            .application_uri = "urn:zig-libs:opcua:client",
+        },
+        &client_creds,
+    );
     defer client_creds.deinit(testing.allocator);
-    var server_creds = try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
-        .modulus_bits = 768,
-        .common_name = "secure-selftest-server",
-        .not_before = "260101000000Z",
-        .not_after = "270101000000Z",
-    });
+    var server_creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(
+        testing.allocator,
+        random,
+        .{
+            .modulus_bits = 768,
+            .common_name = "secure-selftest-server",
+            .not_before = "260101000000Z",
+            .not_after = "270101000000Z",
+        },
+        &server_creds,
+    );
     defer server_creds.deinit(testing.allocator);
 
     const server_nonce = "server-nonce-abcdefghijklmnopqrs"; // 32 bytes
@@ -1582,7 +1677,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
         transport.MessageType.open_secure_channel.code(),
         opn_resp_alloc.writer.buffered(),
         opn_resp_enc_offset,
-        server_creds, // the server signs with ITS key…
+        &server_creds, // the server signs with ITS key…
         client_creds.certificate_der, // …and encrypts to the CLIENT's certificate
     );
     defer testing.allocator.free(sealed_opn_resp);
@@ -1593,15 +1688,21 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
     var client_in_r: std.Io.Reader = .fixed(sealed_opn_resp);
     var conn = transport.Connection.init(&client_in_r, &client_out_w);
 
-    var ch = try SecureChannel.open(&conn, testing.allocator, .{
-        .security = .{
-            .policy = .basic256sha256,
-            .mode = .sign_and_encrypt,
-            .credentials = client_creds,
-            .server_certificate = server_creds.certificate_der,
-            .random = random,
+    var ch: SecureChannel = undefined;
+    try SecureChannel.open(
+        &conn,
+        testing.allocator,
+        .{
+            .security = .{
+                .policy = .basic256sha256,
+                .mode = .sign_and_encrypt,
+                .credentials = client_creds,
+                .server_certificate = server_creds.certificate_der,
+                .random = random,
+            },
         },
-    });
+        &ch,
+    );
     try testing.expectEqual(@as(u32, 7), ch.io.channel_id);
     try testing.expectEqual(@as(u32, 3), ch.io.token_id);
     try testing.expect(ch.io.security.?.keys != null);
@@ -1615,7 +1716,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
         testing.allocator,
         opn_req_wire[0..8],
         opn_req_wire[8..],
-        server_creds.private_key,
+        &server_creds.private_key,
         client_creds.certificate_der,
     );
     defer testing.allocator.free(opn_req_plain);
@@ -1661,7 +1762,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
         transport.MessageType.message.code(),
         msg_resp_alloc.writer.buffered(),
         .sign_and_encrypt,
-        server_keys,
+        &server_keys,
         .server_to_client,
     );
     defer testing.allocator.free(sealed_msg_resp);
@@ -1693,7 +1794,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
         msg_req_wire[0..8],
         msg_req_wire[8..],
         .sign_and_encrypt,
-        server_keys,
+        &server_keys,
         .client_to_server,
     );
     defer testing.allocator.free(msg_req_plain);
@@ -1988,7 +2089,8 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
         .endpoint_url = live_endpoint_url,
     });
 
-    var ch = try SecureChannel.open(&conn, gpa, .{});
+    var ch: SecureChannel = undefined;
+    try SecureChannel.open(&conn, gpa, .{}, &ch);
     defer ch.close() catch {}; // CLO: fire-and-forget, no response read
 
     var session = try Session.create(&ch, gpa, .{
@@ -2161,7 +2263,8 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
         .endpoint_url = live_endpoint_url,
     });
 
-    var ch = try SecureChannel.open(&conn, gpa, .{});
+    var ch: SecureChannel = undefined;
+    try SecureChannel.open(&conn, gpa, .{}, &ch);
     defer ch.close() catch {};
 
     var session = try Session.create(&ch, gpa, .{
@@ -2385,15 +2488,21 @@ fn liveSecureSequence(
         .endpoint_url = live_endpoint_url,
     });
 
-    var ch = try SecureChannel.open(&conn, gpa, .{
-        .security = .{
-            .policy = .basic256sha256,
-            .mode = mode,
-            .credentials = credentials,
-            .server_certificate = server_certificate,
-            .random = random,
+    var ch: SecureChannel = undefined;
+    try SecureChannel.open(
+        &conn,
+        gpa,
+        .{
+            .security = .{
+                .policy = .basic256sha256,
+                .mode = mode,
+                .credentials = credentials,
+                .server_certificate = server_certificate,
+                .random = random,
+            },
         },
-    });
+        &ch,
+    );
     defer ch.close() catch {};
     try testing.expect(ch.io.security.?.keys != null);
     dumpSecureKeys(io, capture_tag, ch.io.security.?.keys.?);
@@ -2507,13 +2616,19 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
 
     // 2048-bit: the conventional Basic256Sha256 application-certificate
     // size (`SecurityLengths.basic256sha256`'s documented shape).
-    var credentials = try security.ClientCredentials.generateSelfSigned(gpa, random, .{
-        .modulus_bits = 2048,
-        .common_name = "zig-libs opcua secure interop test",
-        .not_before = "260101000000Z",
-        .not_after = "270101000000Z",
-        .application_uri = "urn:zig-libs:opcua:client",
-    });
+    var credentials: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(
+        gpa,
+        random,
+        .{
+            .modulus_bits = 2048,
+            .common_name = "zig-libs opcua secure interop test",
+            .not_before = "260101000000Z",
+            .not_after = "270101000000Z",
+            .application_uri = "urn:zig-libs:opcua:client",
+        },
+        &credentials,
+    );
     defer credentials.deinit(gpa);
 
     // Get the client certificate into the server's trust-list folder:

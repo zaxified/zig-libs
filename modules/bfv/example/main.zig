@@ -59,14 +59,16 @@ pub fn main() !void {
     };
 
     // ── customer: keys ───────────────────────────────────────────────────
-    var keys = engine.keyGen(io);
+    var keys: @TypeOf(engine).KeyPair = undefined;
+    engine.keyGen(io, &keys);
     defer keys.sk.deinit(); // wipe the ternary secret polynomial
 
     // The relinearisation key lets the SERVICE multiply. It is derived from
     // the secret key but is not itself a decryption key — this is the one
     // extra artifact a consumer has to know to ship, and forgetting it means
     // ciphertexts grow a component per multiply until nothing can decrypt.
-    const relin_key = engine.genRelinKey(&keys.sk, io);
+    var relin_key: @TypeOf(engine).RelinKey = undefined;
+    engine.genRelinKey(&keys.sk, io, &relin_key);
 
     // ── customer: encrypt two counters ───────────────────────────────────
     // Integer encoding: little-endian base-`t` digits. `error.Overflow` when

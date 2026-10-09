@@ -19,7 +19,7 @@
 //!
 //! ## Entry points
 //!   - `Dpf(n, L)` — a DPF over domain `{0,1}^n`, output group `Z_{2^{8L}}`.
-//!     `.genWithSeeds(α, β, s0, s1)` → `[2]Key`; `.eval(b, key, x)`;
+//!     `.genWithSeeds(α, β, &s0, &s1, &out)` → `[2]Key` through `out`; `.eval(b, key, x)`;
 //!     `.evalFull(b, key, out)` — tree-reuse evaluation of the domain
 //!     **prefix** `[0, out.len)` in ~`out.len` PRG calls (vs `eval`'s
 //!     `O(n)` each), with `.evalFullWith(...)` the allocation-free streaming
@@ -30,7 +30,7 @@
 //!     no failure probability, no new cryptographic surface, key size linear in
 //!     `k`; see `mpf.zig` for the trade-off against the cuckoo/batch-code
 //!     constructions and for what would justify revisiting it.
-//!     `.genWithSeeds(αs, βs, s0s, s1s)`, `.eval` (the summed multi-point
+//!     `.genWithSeeds(αs, βs, &s0s, &s1s, &out)`, `.eval` (the summed multi-point
 //!     value) and `.evalEach` (the `k` components, unsummed — what a consumer
 //!     wanting `k` *separate* results needs), plus the prefix evaluators
 //!     `.evalEachFullWith` / `.evalFullWith` / `.evalFull`: ONE interleaved
@@ -104,6 +104,7 @@ test {
     _ = @import("kat_test.zig");
     _ = @import("mpf_test.zig");
     _ = @import("bench.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names the BGI DPF construction" {

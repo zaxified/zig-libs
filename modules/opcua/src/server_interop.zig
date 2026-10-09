@@ -239,13 +239,19 @@ const Driver = struct {
             // Basic256Sha256, and what a real third-party client expects to
             // meet. `not_before`/`not_after` bracket a decade so the test
             // does not rot.
-            const creds = try security.Credentials.generateSelfSigned(gpa, d.prng.random(), .{
-                .modulus_bits = 2048,
-                .common_name = "zig-libs opcua interop server",
-                .not_before = "200101000000Z",
-                .not_after = "350101000000Z",
-                .application_uri = "urn:zig-libs:opcua:interop-server",
-            });
+            var creds: security.Credentials = undefined;
+            try security.Credentials.generateSelfSigned(
+                gpa,
+                d.prng.random(),
+                .{
+                    .modulus_bits = 2048,
+                    .common_name = "zig-libs opcua interop server",
+                    .not_before = "200101000000Z",
+                    .not_after = "350101000000Z",
+                    .application_uri = "urn:zig-libs:opcua:interop-server",
+                },
+                &creds,
+            );
             d.creds = creds;
             d.endpoint_storage[0] = server.noneEndpointWithEncryptedUserTokens(options.endpoint_url, app, creds.certificate_der);
             d.endpoint_storage[1] = server.secureEndpoint(options.endpoint_url, app, .sign, creds.certificate_der, 10);
@@ -1031,7 +1037,8 @@ test "LIVE loopback: this module's own client drives this module's own server ov
     });
     try testing.expect(ack.receive_buffer_size >= 8192);
 
-    var channel = try root.SecureChannel.open(&conn, gpa, .{});
+    var channel: root.SecureChannel = undefined;
+    try root.SecureChannel.open(&conn, gpa, .{}, &channel);
     defer channel.close() catch {};
 
     var session = try root.Session.create(&channel, gpa, .{
@@ -2043,12 +2050,12 @@ test "golden (self-derived): symmetric MSG chunks at Sign and SignAndEncrypt" {
         const expected = try std.fmt.hexToBytes(&expected_buf, c.hex);
 
         // Re-encode: the module must still produce exactly these bytes.
-        const produced = try security.symmetricSignAndEncrypt(gpa, "MSG", body, c.mode, keys, .server_to_client);
+        const produced = try security.symmetricSignAndEncrypt(gpa, "MSG", body, c.mode, &keys, .server_to_client);
         defer gpa.free(produced);
         try testing.expectEqualSlices(u8, expected, produced);
 
         // Decode: the frozen bytes must open back to exactly the input body.
-        const opened = try security.symmetricDecryptAndVerify(gpa, expected[0..8], expected[8..], c.mode, keys, .server_to_client);
+        const opened = try security.symmetricDecryptAndVerify(gpa, expected[0..8], expected[8..], c.mode, &keys, .server_to_client);
         defer gpa.free(opened);
         try testing.expectEqualSlices(u8, body, opened);
     }
@@ -2127,21 +2134,33 @@ test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel han
     // 1. The key material is reproducible from its seed, certificates included.
     var prng = std.Random.DefaultCsprng.init(golden_key_seed);
     const rnd = prng.random();
-    const client = try security.Credentials.generateSelfSigned(gpa, rnd, .{
-        .modulus_bits = 512,
-        .common_name = "golden client",
-        .not_before = "200101000000Z",
-        .not_after = "350101000000Z",
-        .application_uri = "urn:zig-libs:opcua:golden-client",
-    });
+    var client: security.Credentials = undefined;
+    try security.Credentials.generateSelfSigned(
+        gpa,
+        rnd,
+        .{
+            .modulus_bits = 512,
+            .common_name = "golden client",
+            .not_before = "200101000000Z",
+            .not_after = "350101000000Z",
+            .application_uri = "urn:zig-libs:opcua:golden-client",
+        },
+        &client,
+    );
     defer client.deinit(gpa);
-    const srv = try security.Credentials.generateSelfSigned(gpa, rnd, .{
-        .modulus_bits = 512,
-        .common_name = "golden server",
-        .not_before = "200101000000Z",
-        .not_after = "350101000000Z",
-        .application_uri = "urn:zig-libs:opcua:golden-server",
-    });
+    var srv: security.Credentials = undefined;
+    try security.Credentials.generateSelfSigned(
+        gpa,
+        rnd,
+        .{
+            .modulus_bits = 512,
+            .common_name = "golden server",
+            .not_before = "200101000000Z",
+            .not_after = "350101000000Z",
+            .application_uri = "urn:zig-libs:opcua:golden-server",
+        },
+        &srv,
+    );
     defer srv.deinit(gpa);
 
     var cert_buf: [512]u8 = undefined;
@@ -2173,7 +2192,7 @@ test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel han
         "OPN",
         plain_body,
         encrypted_region_offset,
-        client,
+        &client,
         srv.certificate_der,
     );
     defer gpa.free(produced);
@@ -2198,7 +2217,7 @@ test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel han
     try testing.expectEqualSlices(u8, &thumbprint, view.receiver_certificate_thumbprint.?);
     try testing.expectEqual(encrypted_region_offset, view.encrypted_region_offset);
 
-    const opened = try security.openAsymmetricMessage(gpa, expected[0..8], expected[8..], srv.private_key, client.certificate_der);
+    const opened = try security.openAsymmetricMessage(gpa, expected[0..8], expected[8..], &srv.private_key, client.certificate_der);
     defer gpa.free(opened);
     try testing.expectEqualSlices(u8, plain_body, opened);
 }
@@ -2444,19 +2463,19 @@ test "golden (captured, live open62541 server_ctt): symmetric MSG chunks (Read i
         // Decode + verify + decrypt real `open62541 server_ctt` bytes with
         // the ACTUAL session keys this exchange derived (dumped straight out
         // of `ch.io.security.?.keys` — see `root.zig`'s `dumpSecureKeys`).
-        const opened_req = try security.symmetricDecryptAndVerify(gpa, req[0..8], req[8..], c.mode, c.keys, .client_to_server);
+        const opened_req = try security.symmetricDecryptAndVerify(gpa, req[0..8], req[8..], c.mode, &c.keys, .client_to_server);
         defer gpa.free(opened_req);
-        const opened_resp = try security.symmetricDecryptAndVerify(gpa, resp[0..8], resp[8..], c.mode, c.keys, .server_to_client);
+        const opened_resp = try security.symmetricDecryptAndVerify(gpa, resp[0..8], resp[8..], c.mode, &c.keys, .server_to_client);
         defer gpa.free(opened_resp);
 
         // Re-encode: AES-256-CBC/HMAC-SHA256 are deterministic given the same
         // key/IV/plaintext, so this reproduces the real wire bytes exactly —
         // a true byte-identical round trip against genuine third-party
         // ciphertext, not just a decode check.
-        const produced_req = try security.symmetricSignAndEncrypt(gpa, "MSG", opened_req, c.mode, c.keys, .client_to_server);
+        const produced_req = try security.symmetricSignAndEncrypt(gpa, "MSG", opened_req, c.mode, &c.keys, .client_to_server);
         defer gpa.free(produced_req);
         try testing.expectEqualSlices(u8, req, produced_req);
-        const produced_resp = try security.symmetricSignAndEncrypt(gpa, "MSG", opened_resp, c.mode, c.keys, .server_to_client);
+        const produced_resp = try security.symmetricSignAndEncrypt(gpa, "MSG", opened_resp, c.mode, &c.keys, .server_to_client);
         defer gpa.free(produced_resp);
         try testing.expectEqualSlices(u8, resp, produced_resp);
     }

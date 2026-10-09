@@ -52,9 +52,10 @@ test "EXACT: a query share's serialized length is a constant, whatever the index
     const seeds = detSeeds(1);
     for (0..P.domain_size) |i| {
         var buf: [P.share_len]u8 = undefined;
-        const shares = try P.query(i, seeds[0], seeds[1]);
-        P.shareToBytes(shares[0], &buf);
-        P.shareToBytes(shares[1], &buf);
+        var shares: [2]P.Share = undefined;
+        try P.query(i, &seeds[0], &seeds[1], &shares);
+        P.shareToBytes(&shares[0], &buf);
+        P.shareToBytes(&shares[1], &buf);
         try testing.expectEqual(@as(usize, 16 + 7 * (16 + 2) + 4), buf.len);
     }
 }
@@ -73,8 +74,9 @@ test "EXACT: an answer's length depends only on the database geometry" {
         const n_words = P.answerWords(record_len);
         for (0..20) |i| {
             const seeds = detSeeds(@intCast(100 + i));
-            const shares = try P.query(i, seeds[0], seeds[1]);
-            try P.answer(0, shares[0], database, out[0..n_words]);
+            var shares: [2]P.Share = undefined;
+            try P.query(i, &seeds[0], &seeds[1], &shares);
+            try P.answer(0, &shares[0], database, out[0..n_words]);
             // A buffer sized from the geometry alone must fit every index's
             // answer exactly — no index needs one byte more or fewer.
             try P.answerToBytes(out[0..n_words], wire[0..expected]);
@@ -89,7 +91,8 @@ test "EXACT: party b's share embeds exactly the caller's seed, for every index" 
     const P = pir.Pir(6, 4);
     const seeds = detSeeds(2);
     for (0..P.domain_size) |i| {
-        const shares = try P.query(i, seeds[0], seeds[1]);
+        var shares: [2]P.Share = undefined;
+        try P.query(i, &seeds[0], &seeds[1], &shares);
         try testing.expectEqualSlices(u8, &seeds[0], &shares[0].seed);
         try testing.expectEqualSlices(u8, &seeds[1], &shares[1].seed);
     }
@@ -104,7 +107,8 @@ test "EXACT: the two shares differ ONLY in the root seed — why collusion is fa
     const P = pir.Pir(6, 4);
     const seeds = detSeeds(3);
     const target = 41;
-    const shares = try P.query(target, seeds[0], seeds[1]);
+    var shares: [2]P.Share = undefined;
+    try P.query(target, &seeds[0], &seeds[1], &shares);
 
     var cw0: [P.Dpf.Key.cw_serialized_len]u8 = undefined;
     var cw1: [P.Dpf.Key.cw_serialized_len]u8 = undefined;
@@ -117,8 +121,8 @@ test "EXACT: the two shares differ ONLY in the root seed — why collusion is fa
     // index. No cryptanalysis, no work beyond a full-domain scan.
     var recovered: ?usize = null;
     for (0..P.domain_size) |x| {
-        const sum = P.Dpf.eval(0, shares[0], @intCast(x)) +%
-            P.Dpf.eval(1, shares[1], @intCast(x));
+        const sum = P.Dpf.eval(0, &shares[0], @intCast(x)) +%
+            P.Dpf.eval(1, &shares[1], @intCast(x));
         if (sum != 0) {
             try testing.expect(recovered == null); // exactly one spike
             recovered = x;
@@ -141,7 +145,8 @@ test "EXACT: level-1 control-bit CW parity is index-independent (BGI re-derivati
     const seeds = detSeeds(4);
     var expected: ?u1 = null;
     for (0..P.domain_size) |i| {
-        const shares = try P.query(i, seeds[0], seeds[1]);
+        var shares: [2]P.Share = undefined;
+        try P.query(i, &seeds[0], &seeds[1], &shares);
         const c = shares[0].cw[0];
         const parity: u1 = c.t_cw_l ^ c.t_cw_r;
         if (expected) |p| {
@@ -169,7 +174,8 @@ test "EXACT: the level-1 seed CW *does* depend on the top index bit — privacy 
     var s_cw_top0: ?[16]u8 = null;
     var s_cw_top1: ?[16]u8 = null;
     for (0..P.domain_size) |i| {
-        const shares = try P.query(i, seeds[0], seeds[1]);
+        var shares: [2]P.Share = undefined;
+        try P.query(i, &seeds[0], &seeds[1], &shares);
         const s_cw = shares[0].cw[0].s_cw;
         const top_bit = (i >> (5 - 1)) & 1;
         const slot = if (top_bit == 0) &s_cw_top0 else &s_cw_top1;
@@ -239,8 +245,9 @@ fn sampleCounts(index: usize, stream: u64, leak: Leak, counts: *[share_bits]u32)
     var buf: [P8.share_len]u8 = undefined;
     for (0..m) |t| {
         const seeds = detSeeds(stream *% 1_000_003 +% @as(u64, @intCast(t)));
-        const shares = try P8.query(index, seeds[0], seeds[1]);
-        P8.shareToBytes(shares[0], &buf);
+        var shares: [2]P8.Share = undefined;
+        try P8.query(index, &seeds[0], &seeds[1], &shares);
+        P8.shareToBytes(&shares[0], &buf);
         switch (leak) {
             .none => {},
             // NEGATIVE CONTROL 1: the index copied verbatim into the share.
@@ -378,10 +385,12 @@ test "EXACT: k IS revealed by the share length — and that is the whole leak of
     const seeds = detSeedsK(3, 71);
     var buf_a: [M.share_len]u8 = undefined;
     var buf_b: [M.share_len]u8 = undefined;
-    const real = try M.query(.{ 11, 42, 99 }, seeds[0], seeds[1]); // 3 wanted
-    const padded = try M.query(.{ 11, 11, 11 }, seeds[0], seeds[1]); // 1 wanted
-    M.shareToBytes(real[0], &buf_a);
-    M.shareToBytes(padded[0], &buf_b);
+    var real: [2]M.Share = undefined;
+    try M.query(.{ 11, 42, 99 }, &seeds[0], &seeds[1], &real); // 3 wanted
+    var padded: [2]M.Share = undefined;
+    try M.query(.{ 11, 11, 11 }, &seeds[0], &seeds[1], &padded); // 1 wanted
+    M.shareToBytes(&real[0], &buf_a);
+    M.shareToBytes(&padded[0], &buf_b);
     try testing.expectEqual(buf_a.len, buf_b.len);
     // …and the two are not byte-equal, i.e. padding is not a detectable
     // constant pattern in the share.
@@ -414,7 +423,8 @@ test "EXACT: each instance's root seed is the caller's, and the k seeds are all 
     const M = P.Multi(k);
     const indices = [k]usize{ 41, 0, 63 };
     const seeds = detSeedsK(k, 5);
-    const shares = try M.query(indices, seeds[0], seeds[1]);
+    var shares: [2]M.Share = undefined;
+    try M.query(indices, &seeds[0], &seeds[1], &shares);
 
     for (0..k) |j| {
         try testing.expectEqualSlices(u8, &seeds[0][j], &shares[0].keys[j].seed);
@@ -432,8 +442,8 @@ test "EXACT: each instance's root seed is the caller's, and the k seeds are all 
     var sel1: [k]M.Word = undefined;
     var recovered: [k]?usize = @splat(null);
     for (0..M.domain_size) |x| {
-        M.Mpf.evalEach(0, shares[0], @intCast(x), &sel0);
-        M.Mpf.evalEach(1, shares[1], @intCast(x), &sel1);
+        M.Mpf.evalEach(0, &shares[0], @intCast(x), &sel0);
+        M.Mpf.evalEach(1, &shares[1], @intCast(x), &sel1);
         for (0..k) |j| {
             if (sel0[j] +% sel1[j] != 0) {
                 try testing.expect(recovered[j] == null); // exactly one spike
@@ -463,7 +473,8 @@ test "EXACT: no correction word is shared between instances, even for related in
     };
     for (pairs, 0..) |pair, t| {
         const seeds = detSeedsK(2, 6100 + t);
-        const shares = try M.query(pair, seeds[0], seeds[1]);
+        var shares: [2]M.Share = undefined;
+        try M.query(pair, &seeds[0], &seeds[1], &shares);
         var cw_a: [M.Mpf.Dpf.Key.cw_serialized_len]u8 = undefined;
         var cw_b: [M.Mpf.Dpf.Key.cw_serialized_len]u8 = undefined;
         shares[0].keys[0].serializeCw(&cw_a);
@@ -491,13 +502,15 @@ test "EXACT: seed reuse across instances is rejected — the leak it would cause
     var dup1 = seeds[1];
     dup0[1] = dup0[0];
     dup1[1] = dup1[0];
-    try testing.expectError(error.SeedReuse, M.query(.{ 0b10110000, 0b10110010 }, dup0, dup1));
+    var dup_out: [2]M.Share = undefined;
+    try testing.expectError(error.SeedReuse, M.query(.{ 0b10110000, 0b10110010 }, &dup0, &dup1, &dup_out));
     // and the honest scope of the guard: distinct-but-correlated seeds pass it.
     // It catches the plumbing bug, not bad randomness.
     var near0 = seeds[0];
     near0[1] = near0[0];
     near0[1][15] ^= 0x01; // one bit apart — accepted
-    _ = try M.query(.{ 0, 1 }, near0, seeds[1]);
+    var near_out: [2]M.Share = undefined;
+    try M.query(.{ 0, 1 }, &near0, &seeds[1], &near_out);
 }
 
 test "EXACT: per-instance level-1 CW parity is index-independent; the seed CW is not" {
@@ -514,7 +527,8 @@ test "EXACT: per-instance level-1 CW parity is index-independent; the seed CW is
 
     for (0..M.domain_size) |i| {
         // vary both slots together so every instance sees every index
-        const shares = try M.query(.{ i, M.domain_size - 1 - i }, seeds[0], seeds[1]);
+        var shares: [2]M.Share = undefined;
+        try M.query(.{ i, M.domain_size - 1 - i }, &seeds[0], &seeds[1], &shares);
         for (0..2) |j| {
             const c = shares[0].keys[j].cw[0];
             const p: u1 = c.t_cw_l ^ c.t_cw_r;
@@ -574,11 +588,12 @@ test "EXACT: the multi-index server's record access order is a function of the r
         };
         for (index_sets, 0..) |indices, t| {
             const seeds = detSeedsK(k, 4700 + t);
-            const shares = try M.query(indices, seeds[0], seeds[1]);
+            var shares: [2]M.Share = undefined;
+            try M.query(indices, &seeds[0], &seeds[1], &shares);
             inline for (.{ 0, 1 }) |party| {
                 var xs: [256]usize = undefined;
                 var n: usize = 0;
-                M.Mpf.evalEachFullWith(party, shares[party], count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
+                M.Mpf.evalEachFullWith(party, &shares[party], count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
                 try testing.expectEqual(count, n);
                 for (0..count) |x| try testing.expectEqual(x, xs[x]);
                 if (have_reference) {
@@ -594,10 +609,11 @@ test "EXACT: the multi-index server's record access order is a function of the r
         // client must not be able to steer the access pattern either.
         var buf: [M.share_len]u8 = undefined;
         for (&buf, 0..) |*b, i| b.* = @truncate(i *% 211 +% 17);
-        const junk = try M.shareFromBytes(&buf);
+        var junk: M.Share = undefined;
+        try M.shareFromBytes(&junk, &buf);
         var xs: [256]usize = undefined;
         var n: usize = 0;
-        M.Mpf.evalEachFullWith(1, junk, count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
+        M.Mpf.evalEachFullWith(1, &junk, count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
         try testing.expectEqual(count, n);
         try testing.expectEqualSlices(usize, reference[0..count], xs[0..count]);
     }
@@ -632,11 +648,12 @@ test "EXACT: the single-index server's record access order is a function of the 
 
         for ([_]usize{ 0, 128, 255 }) |index| {
             const seeds = detSeeds(5900 + index);
-            const shares = try P.query(index, seeds[0], seeds[1]);
+            var shares: [2]P.Share = undefined;
+            try P.query(index, &seeds[0], &seeds[1], &shares);
             inline for (.{ 0, 1 }) |party| {
                 var xs: [256]usize = undefined;
                 var n: usize = 0;
-                P.Dpf.evalFullWith(party, shares[party], count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
+                P.Dpf.evalFullWith(party, &shares[party], count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
                 try testing.expectEqual(count, n);
                 for (0..count) |x| try testing.expectEqual(x, xs[x]);
                 if (have_reference) {
@@ -652,10 +669,11 @@ test "EXACT: the single-index server's record access order is a function of the 
         // must not be able to steer the access pattern either.
         var buf: [P.share_len]u8 = undefined;
         for (&buf, 0..) |*b, i| b.* = @truncate(i *% 173 +% 41);
-        const junk = try P.shareFromBytes(&buf);
+        var junk: P.Share = undefined;
+        try P.shareFromBytes(&junk, &buf);
         var xs: [256]usize = undefined;
         var n: usize = 0;
-        P.Dpf.evalFullWith(1, junk, count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
+        P.Dpf.evalFullWith(1, &junk, count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
         try testing.expectEqual(count, n);
         try testing.expectEqualSlices(usize, reference[0..count], xs[0..count]);
     }
@@ -688,8 +706,9 @@ fn sampleMultiCounts(
     var buf: [PM.share_len]u8 = undefined;
     for (0..m) |t| {
         const seeds = detSeedsK(2, stream *% 1_000_003 +% @as(u64, @intCast(t)));
-        const shares = try PM.query(indices, seeds[0], seeds[1]);
-        PM.shareToBytes(shares[0], &buf);
+        var shares: [2]PM.Share = undefined;
+        try PM.query(indices, &seeds[0], &seeds[1], &shares);
+        PM.shareToBytes(&shares[0], &buf);
         switch (leak) {
             .none => {},
             .indices_equal_bit => buf[0] = (buf[0] & 0xFE) |
@@ -757,8 +776,9 @@ test "EXACT: a multi-index share's constant bits are the single-index census, ti
     var buf: [PM.share_len]u8 = undefined;
     for (0..256) |t| {
         const seeds = detSeedsK(2, 90000 + t);
-        const shares = try PM.query(.{ t & 0xFF, (t * 7 + 3) & 0xFF }, seeds[0], seeds[1]);
-        PM.shareToBytes(shares[0], &buf);
+        var shares: [2]PM.Share = undefined;
+        try PM.query(.{ t & 0xFF, (t * 7 + 3) & 0xFF }, &seeds[0], &seeds[1], &shares);
+        PM.shareToBytes(&shares[0], &buf);
         for (buf, 0..) |byte, i| {
             for (0..8) |q| {
                 const pos = i * 8 + q;
@@ -796,8 +816,9 @@ test "EXACT: which bits of a serialized share are structurally constant" {
     var buf: [P8.share_len]u8 = undefined;
     for (0..256) |t| {
         const seeds = detSeeds(@intCast(90000 + t));
-        const shares = try P8.query(t & 0xFF, seeds[0], seeds[1]);
-        P8.shareToBytes(shares[0], &buf);
+        var shares: [2]P8.Share = undefined;
+        try P8.query(t & 0xFF, &seeds[0], &seeds[1], &shares);
+        P8.shareToBytes(&shares[0], &buf);
         for (buf, 0..) |byte, i| {
             for (0..8) |k| {
                 const pos = i * 8 + k;

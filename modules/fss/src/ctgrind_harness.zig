@@ -185,7 +185,8 @@ fn runGen(taint: Taint) void {
 
     const beta: D.Elem = 0xDEADBEEF; // public payload; out of this harness's taint scope
 
-    const keys = D.genWithSeeds(alpha_r, beta, s0_r, s1_r);
+    var keys: [2]D.Key = undefined;
+    D.genWithSeeds(alpha_r, beta, &s0_r, &s1_r, &keys);
 
     // Propagation proof: format (tainted-if-yes) output through a
     // non-constant-time path.
@@ -207,7 +208,8 @@ fn runEval(taint: Taint) void {
     const fixed_beta: D.Elem = 0x01020304;
     const fixed_s0: fss.prg.Seed = [_]u8{0x11} ** 16;
     const fixed_s1: fss.prg.Seed = [_]u8{0x22} ** 16;
-    const keys = D.genWithSeeds(fixed_alpha, fixed_beta, fixed_s0, fixed_s1);
+    var keys: [2]D.Key = undefined;
+    D.genWithSeeds(fixed_alpha, fixed_beta, &fixed_s0, &fixed_s1, &keys);
     var key = keys[0];
 
     if (taint == .yes) {
@@ -219,7 +221,7 @@ fn runEval(taint: Taint) void {
     // tainted — see the module doc comment and the task that specified this
     // harness. `b` (party index) is likewise public.
     const x: D.Index = 42;
-    const share = D.eval(0, key_r, x);
+    const share = D.eval(0, &key_r, x);
 
     std.debug.print("eval ctgrind_result={x}\n", .{std.mem.toBytes(share)});
 }

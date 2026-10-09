@@ -31,7 +31,8 @@ const opcua = @import("opcua");
 // over a byte buffer for offline tests.
 var conn = opcua.transport.Connection.init(&reader, &writer);
 _ = try conn.hello(.{ .protocol_version = 0, .endpoint_url = "opc.tcp://host:4840", ... });
-var channel = try opcua.SecureChannel.open(&conn, gpa, .{});
+var channel: opcua.SecureChannel = undefined;
+try opcua.SecureChannel.open(&conn, gpa, .{}, &channel);
 var session = try opcua.Session.create(&channel, gpa, .{ .endpoint_url = url, ... });
 try session.activate(null);
 const value = try session.readAttribute(node_id, opcua.services.attribute_id.value);

@@ -74,8 +74,10 @@ const product = engine.mulNegacyclic(a, b); // a·b mod (X^1024 + 1)
 // `…ForTest` twins take a `std.Random` for KAT reproducibility.
 const B = bfv.Bfv(bfv.params.test_mul);
 const inst = try B.init();
-const kp = inst.keyGen(io);
-const rlk = inst.genRelinKey(&kp.sk, io);
+var kp: B.KeyPair = undefined;
+inst.keyGen(io, &kp);
+var rlk: B.RelinKey = undefined;
+inst.genRelinKey(&kp.sk, io, &rlk);
 const ca = inst.encrypt(&kp.pk, &pa, io);
 const cb = inst.encrypt(&kp.pk, &pb, io);
 const sum = inst.add(&ca, &cb);                   // Dec == a+b (mod t)

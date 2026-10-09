@@ -31,18 +31,18 @@
 //! ## Entry points
 //!
 //!   - `Pir(domain_bits, word_bytes)` — the protocol.
-//!     `.query(i, s0, s1)` → two shares · `.answer(party, share, db, out)` ·
+//!     `.query(i, &s0, &s1)` → two shares · `.answer(party, &share, db, out)` ·
 //!     `.reconstruct(a0, a1, record_out)`, plus the wire codecs
 //!     `shareToBytes`/`shareFromBytes`/`answerToBytes`/`answerFromBytes`/
 //!     `reconstructFromBytes`. The server side runs on `fss`'s tree-reuse
 //!     `evalFull` — ~1 PRG call per record, never touching the domain's
-//!     unused tail. `.answerRange(party, share, db, lo, hi, out)` shards
+//!     unused tail. `.answerRange(party, &share, db, lo, hi, out)` shards
 //!     that same walk by index range — `.answer` is now its `[0, count())`
 //!     special case — so a caller with `T` cores can split a server's
 //!     `O(N)` answer computation across them (each shard: `O((hi-lo) +
 //!     domain_bits)`, not `O(N)` per shard) and combine the partial answers
 //!     with `.accumulate`. This module still starts no threads itself.
-//!   - `Pir(...).queryKeyword(kw, s0, s1)` — **lookup by keyword**: exactly
+//!   - `Pir(...).queryKeyword(kw, &s0, &s1)` — **lookup by keyword**: exactly
 //!     `query(keywordIndex(kw), …)`, where `keywordIndex` is a public, total,
 //!     deterministic SHA-256→index map. A miss is the same call as a hit —
 //!     PROVIDED the caller never skips a query and never retries; collisions
@@ -147,6 +147,7 @@ test {
     _ = @import("privacy_test.zig");
     _ = @import("kat_test.zig");
     _ = @import("bench.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "SELF: the README's end-to-end example compiles and retrieves" {
@@ -170,14 +171,15 @@ test "SELF: the README's end-to-end example compiles and retrieves" {
     // Client: two fresh seeds (production: a CSPRNG, one pair per query).
     const s0: fss.prg.Seed = [_]u8{0x11} ** 16;
     const s1: fss.prg.Seed = [_]u8{0x22} ** 16;
-    const shares = try P.query(want_index, s0, s1);
+    var shares: [2]P.Share = undefined;
+    try P.query(want_index, &s0, &s1, &shares);
 
     // Servers (each holds one share and the same database).
     const n_words = P.answerWords(database.record_len);
     var a0: [1]P.Word = undefined;
     var a1: [1]P.Word = undefined;
-    try P.answer(0, shares[0], database, a0[0..n_words]);
-    try P.answer(1, shares[1], database, a1[0..n_words]);
+    try P.answer(0, &shares[0], database, a0[0..n_words]);
+    try P.answer(1, &shares[1], database, a1[0..n_words]);
 
     // Client.
     var got: [13]u8 = undefined;

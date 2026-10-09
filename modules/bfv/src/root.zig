@@ -133,6 +133,7 @@ test {
     _ = bfv_mod;
     _ = kat_vectors;
     _ = @import("kat_test.zig");
+    _ = @import("stackprobe_test.zig");
     _ = @import("bench.zig"); // opt-in via BFV_BENCH; SKIPs otherwise
 }
 

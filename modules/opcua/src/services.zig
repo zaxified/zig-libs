@@ -2612,6 +2612,7 @@ pub const UserNameIdentityToken = struct {
     encryption_algorithm: ?[]const u8,
 };
 
+// secret-api-ok: `UserNameIdentityToken` holds only slices (heap / the caller's buffers); a by-value copy copies pointers, not the password bytes, and this function only encodes them into the caller's Encoder.
 pub fn encodeUserNameIdentityToken(e: *encoding.Encoder, v: UserNameIdentityToken) encoding.EncodeError!void {
     try e.encodeString(v.policy_id);
     try e.encodeString(v.user_name);
@@ -2628,6 +2629,7 @@ pub fn decodeUserNameIdentityToken(d: *encoding.Decoder) encoding.DecodeError!Us
     };
 }
 
+// secret-api-ok: `UserNameIdentityToken` holds only slices; a by-value copy copies pointers, and this function only frees the heap allocations they point to.
 pub fn freeUserNameIdentityToken(a: std.mem.Allocator, v: UserNameIdentityToken) void {
     freeOptStr(a, v.policy_id);
     freeOptStr(a, v.user_name);
@@ -3175,12 +3177,12 @@ pub const Channel = struct {
                         message_type.code(),
                         body,
                         opn_encrypted_region_offset,
-                        sec.credentials.?,
+                        &sec.credentials.?,
                         sec.server_certificate.?,
                     );
                 },
                 .message, .close_secure_channel => blk: {
-                    const keys = sec.keys orelse @panic("opcua security: SecurityMode != none requires derived ChannelKeys");
+                    const keys: *const security.ChannelKeys = if (sec.keys) |*k| k else @panic("opcua security: SecurityMode != none requires derived ChannelKeys");
                     break :blk try security.symmetricSignAndEncrypt(ch.allocator, message_type.code(), body, sec.mode, keys, .client_to_server);
                 },
                 else => unreachable,
@@ -3250,10 +3252,10 @@ pub const Channel = struct {
                     .open_secure_channel => blk: {
                         const creds = sec.credentials orelse @panic("opcua security: SecurityMode != none requires ClientCredentials");
                         const server_cert = sec.server_certificate orelse @panic("opcua security: SecurityMode != none requires a pinned server certificate");
-                        break :blk try security.openAsymmetricMessage(ch.allocator, &header_bytes, chunk.body, creds.private_key, server_cert);
+                        break :blk try security.openAsymmetricMessage(ch.allocator, &header_bytes, chunk.body, &creds.private_key, server_cert);
                     },
                     .message, .close_secure_channel => blk: {
-                        const keys = sec.keys orelse @panic("opcua security: SecurityMode != none requires derived ChannelKeys");
+                        const keys: *const security.ChannelKeys = if (sec.keys) |*k| k else @panic("opcua security: SecurityMode != none requires derived ChannelKeys");
                         break :blk try security.symmetricDecryptAndVerify(ch.allocator, &header_bytes, chunk.body, sec.mode, keys, .server_to_client);
                     },
                     else => unreachable,
@@ -4745,7 +4747,7 @@ test "hostile server: on a signed channel the response SequenceNumber must be th
     const sequence = [_]u32{ 5, 5, 7, 6 };
     for (sequence) |n| {
         var body_buf: [1024]u8 = undefined;
-        const sealed = try security.symmetricSignAndEncrypt(testing.allocator, "MSG", hostile_response.body(&body_buf, n, payload), .sign, keys, .server_to_client);
+        const sealed = try security.symmetricSignAndEncrypt(testing.allocator, "MSG", hostile_response.body(&body_buf, n, payload), .sign, &keys, .server_to_client);
         defer testing.allocator.free(sealed);
         try wire.appendSlice(testing.allocator, sealed);
     }

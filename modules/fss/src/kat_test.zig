@@ -87,11 +87,12 @@ test "full-domain correctness: Gen+EvalAll reconstruct f_{α,β} exhaustively" {
             p0.* = @truncate(i * 31 + j * 3 + 1);
             p1.* = @truncate(i * 17 + j * 5 + 200);
         }
-        const keys = D.genWithSeeds(c.a, c.b, s0, s1);
+        var keys: [2]D.Key = undefined;
+        D.genWithSeeds(c.a, c.b, &s0, &s1, &keys);
         var b0: [D.domain_size]D.Elem = undefined;
         var b1: [D.domain_size]D.Elem = undefined;
-        D.evalAll(0, keys[0], &b0);
-        D.evalAll(1, keys[1], &b1);
+        D.evalAll(0, &keys[0], &b0);
+        D.evalAll(1, &keys[1], &b1);
         try std.testing.expectEqual(@as(?usize, null), D.firstMismatch(&b0, &b1, c.a, c.b));
     }
 }
@@ -102,7 +103,8 @@ test "byte-exact KAT vs independent reference vectors (anti-self-consistency)" {
         const D = KatDpf(v.n, v.out_bytes);
         const alpha: D.Index = @intCast(v.alpha);
         const beta: D.Elem = @intCast(v.beta);
-        const keys = D.genWithSeeds(alpha, beta, v.seed0, v.seed1);
+        var keys: [2]D.Key = undefined;
+        D.genWithSeeds(alpha, beta, &v.seed0, &v.seed1, &keys);
         // Gen anchor: serialized CW portion must match byte-exact.
         var cw_buf: [D.Key.cw_serialized_len]u8 = undefined;
         keys[0].serializeCw(&cw_buf);
@@ -119,8 +121,8 @@ test "byte-exact KAT vs independent reference vectors (anti-self-consistency)" {
         if (v.eval0.len != 0) {
             var b0: [D.domain_size]D.Elem = undefined;
             var b1: [D.domain_size]D.Elem = undefined;
-            D.evalAll(0, keys[0], &b0);
-            D.evalAll(1, keys[1], &b1);
+            D.evalAll(0, &keys[0], &b0);
+            D.evalAll(1, &keys[1], &b1);
             for (0..D.domain_size) |x| {
                 try std.testing.expectEqual(v.eval0[x], @as(u64, b0[x]));
                 try std.testing.expectEqual(v.eval1[x], @as(u64, b1[x]));
@@ -128,8 +130,8 @@ test "byte-exact KAT vs independent reference vectors (anti-self-consistency)" {
         } else {
             for (v.spot) |sp| {
                 const x: D.Index = @intCast(sp[0]);
-                try std.testing.expectEqual(sp[1], @as(u64, D.eval(0, keys[0], x)));
-                try std.testing.expectEqual(sp[2], @as(u64, D.eval(1, keys[1], x)));
+                try std.testing.expectEqual(sp[1], @as(u64, D.eval(0, &keys[0], x)));
+                try std.testing.expectEqual(sp[2], @as(u64, D.eval(1, &keys[1], x)));
             }
         }
     }
@@ -145,9 +147,10 @@ test "security smell test: a single key's EvalAll is ~uniform (heuristic)" {
     const beta: D.Elem = 0x01020304;
     const s0 = [_]u8{0x5A} ** 16;
     const s1 = [_]u8{0xA5} ** 16;
-    const keys = D.genWithSeeds(alpha, beta, s0, s1);
+    var keys: [2]D.Key = undefined;
+    D.genWithSeeds(alpha, beta, &s0, &s1, &keys);
     var b0: [D.domain_size]D.Elem = undefined;
-    D.evalAll(0, keys[0], &b0);
+    D.evalAll(0, &keys[0], &b0);
     // count distinct values — a pseudorandom share vector over 256 points
     // should be nearly all-distinct; certainly far more than 2 distinct.
     var distinct: usize = 0;
@@ -174,18 +177,19 @@ test "positive control (stronger, GATED): flipping one CW bit breaks reconstruct
     const beta: D.Elem = 0x0BADF00D;
     const s0 = [_]u8{0x11} ** 16;
     const s1 = [_]u8{0x22} ** 16;
-    var keys = D.genWithSeeds(alpha, beta, s0, s1);
+    var keys: [2]D.Key = undefined;
+    D.genWithSeeds(alpha, beta, &s0, &s1, &keys);
     // sanity: unperturbed keys reconstruct
     var b0: [D.domain_size]D.Elem = undefined;
     var b1: [D.domain_size]D.Elem = undefined;
-    D.evalAll(0, keys[0], &b0);
-    D.evalAll(1, keys[1], &b1);
+    D.evalAll(0, &keys[0], &b0);
+    D.evalAll(1, &keys[1], &b1);
     try std.testing.expectEqual(@as(?usize, null), D.firstMismatch(&b0, &b1, alpha, beta));
     // flip one control-bit CW at the first level in BOTH keys (they share CWs)
     keys[0].cw[0].t_cw_l ^= 1;
     keys[1].cw[0].t_cw_l ^= 1;
-    D.evalAll(0, keys[0], &b0);
-    D.evalAll(1, keys[1], &b1);
+    D.evalAll(0, &keys[0], &b0);
+    D.evalAll(1, &keys[1], &b1);
     try std.testing.expect(D.firstMismatch(&b0, &b1, alpha, beta) != null);
 }
 
@@ -217,12 +221,13 @@ test "evalFull == evalAll element-for-element over the FULL domain (both parties
         const betas = [_]D.Elem{ 1, 0xDEADBEEF, 0 };
         for (alphas, betas, 0..) |alpha, beta, i| {
             const seeds = efSeeds(@intCast(i * 7 + D.n));
-            const keys = D.genWithSeeds(alpha, beta, seeds[0], seeds[1]);
+            var keys: [2]D.Key = undefined;
+            D.genWithSeeds(alpha, beta, &seeds[0], &seeds[1], &keys);
             inline for (.{ 0, 1 }) |b| {
                 var naive: [D.domain_size]D.Elem = undefined;
                 var fast: [D.domain_size]D.Elem = undefined;
-                D.evalAll(b, keys[b], &naive);
-                D.evalFull(b, keys[b], &fast);
+                D.evalAll(b, &keys[b], &naive);
+                D.evalFull(b, &keys[b], &fast);
                 try std.testing.expectEqualSlices(D.Elem, &naive, &fast);
             }
         }
@@ -241,11 +246,12 @@ test "evalFull over a PREFIX matches eval point-for-point (out.len far below 2^n
     var fast: [prefix_len]D.Elem = undefined;
     for (alphas, 0..) |alpha, i| {
         const seeds = efSeeds(@intCast(100 + i));
-        const keys = D.genWithSeeds(alpha, 0xC0FFEE, seeds[0], seeds[1]);
+        var keys: [2]D.Key = undefined;
+        D.genWithSeeds(alpha, 0xC0FFEE, &seeds[0], &seeds[1], &keys);
         inline for (.{ 0, 1 }) |b| {
-            D.evalFull(b, keys[b], &fast);
+            D.evalFull(b, &keys[b], &fast);
             for (0..prefix_len) |x| {
-                try std.testing.expectEqual(D.eval(b, keys[b], @intCast(x)), fast[x]);
+                try std.testing.expectEqual(D.eval(b, &keys[b], @intCast(x)), fast[x]);
             }
         }
     }
@@ -254,11 +260,12 @@ test "evalFull over a PREFIX matches eval point-for-point (out.len far below 2^n
     {
         const seeds = efSeeds(200);
         const alpha: D.Index = 150;
-        const keys = D.genWithSeeds(alpha, 42, seeds[0], seeds[1]);
+        var keys: [2]D.Key = undefined;
+        D.genWithSeeds(alpha, 42, &seeds[0], &seeds[1], &keys);
         var f0: [prefix_len]D.Elem = undefined;
         var f1: [prefix_len]D.Elem = undefined;
-        D.evalFull(0, keys[0], &f0);
-        D.evalFull(1, keys[1], &f1);
+        D.evalFull(0, &keys[0], &f0);
+        D.evalFull(1, &keys[1], &f1);
         for (0..prefix_len) |x| {
             const want: D.Elem = if (x == alpha) 42 else 0;
             try std.testing.expectEqual(want, D.G.add(f0[x], f1[x]));
@@ -270,20 +277,21 @@ test "evalFull prefix boundary cases: len 0, len 1, and a non-power-of-two strad
     if (!gate.core_implemented) return error.SkipZigTest;
     const D = Dpf(10, 4);
     const seeds = efSeeds(50);
-    const keys = D.genWithSeeds(700, 9, seeds[0], seeds[1]);
+    var keys: [2]D.Key = undefined;
+    D.genWithSeeds(700, 9, &seeds[0], &seeds[1], &keys);
     inline for (.{ 0, 1 }) |b| {
         // len 0: a defined no-op.
         var empty: [0]D.Elem = undefined;
-        D.evalFull(b, keys[b], &empty);
+        D.evalFull(b, &keys[b], &empty);
         // len 1: only the leftmost path.
         var one: [1]D.Elem = undefined;
-        D.evalFull(b, keys[b], &one);
-        try std.testing.expectEqual(D.eval(b, keys[b], 0), one[0]);
+        D.evalFull(b, &keys[b], &one);
+        try std.testing.expectEqual(D.eval(b, &keys[b], 0), one[0]);
         // 257 = 2^8 + 1 leaves: a full subtree plus a lone straddling leaf.
         var odd: [257]D.Elem = undefined;
-        D.evalFull(b, keys[b], &odd);
+        D.evalFull(b, &keys[b], &odd);
         for (0..odd.len) |x| {
-            try std.testing.expectEqual(D.eval(b, keys[b], @intCast(x)), odd[x]);
+            try std.testing.expectEqual(D.eval(b, &keys[b], @intCast(x)), odd[x]);
         }
     }
 }
@@ -292,7 +300,8 @@ test "evalFullWith streams the same values, each index exactly once, in order" {
     if (!gate.core_implemented) return error.SkipZigTest;
     const D = Dpf(8, 4);
     const seeds = efSeeds(77);
-    const keys = D.genWithSeeds(33, 0xABCD, seeds[0], seeds[1]);
+    var keys: [2]D.Key = undefined;
+    D.genWithSeeds(33, 0xABCD, &seeds[0], &seeds[1], &keys);
     const count = 100;
     const Ctx = struct {
         vals: *[count]D.Elem,
@@ -308,10 +317,10 @@ test "evalFullWith streams the same values, each index exactly once, in order" {
     inline for (.{ 0, 1 }) |b| {
         var vals: [count]D.Elem = undefined;
         var next: usize = 0;
-        D.evalFullWith(b, keys[b], count, Ctx{ .vals = &vals, .next = &next }, Ctx.emit);
+        D.evalFullWith(b, &keys[b], count, Ctx{ .vals = &vals, .next = &next }, Ctx.emit);
         try std.testing.expectEqual(@as(usize, count), next);
         var buf: [count]D.Elem = undefined;
-        D.evalFull(b, keys[b], &buf);
+        D.evalFull(b, &keys[b], &buf);
         try std.testing.expectEqualSlices(D.Elem, &buf, &vals);
     }
 }
@@ -328,11 +337,12 @@ test "evalRangeWith(0, hi) reproduces evalFullWith(hi) — the lo=0 case is not 
     if (!gate.core_implemented) return error.SkipZigTest;
     const D = Dpf(9, 4);
     const seeds = efSeeds(61);
-    const keys = D.genWithSeeds(200, 0x1357, seeds[0], seeds[1]);
+    var keys: [2]D.Key = undefined;
+    D.genWithSeeds(200, 0x1357, &seeds[0], &seeds[1], &keys);
     const count = 300;
     inline for (.{ 0, 1 }) |b| {
         var full: [count]D.Elem = undefined;
-        D.evalFull(b, keys[b], &full);
+        D.evalFull(b, &keys[b], &full);
 
         var ranged: [count]D.Elem = undefined;
         const Ctx = struct {
@@ -341,7 +351,7 @@ test "evalRangeWith(0, hi) reproduces evalFullWith(hi) — the lo=0 case is not 
                 ctx.out[x] = v;
             }
         };
-        D.evalRangeWith(b, keys[b], 0, count, Ctx{ .out = &ranged }, Ctx.emit);
+        D.evalRangeWith(b, &keys[b], 0, count, Ctx{ .out = &ranged }, Ctx.emit);
         try std.testing.expectEqualSlices(D.Elem, &full, &ranged);
     }
 }
@@ -352,11 +362,12 @@ test "evalRangeWith: disjoint shards sum to evalFull, over several shard counts 
     // don't divide it evenly are the common case, not a special one.
     const D = Dpf(10, 4);
     const seeds = efSeeds(88);
-    const keys = D.genWithSeeds(137, 0xF00D, seeds[0], seeds[1]);
+    var keys: [2]D.Key = undefined;
+    D.genWithSeeds(137, 0xF00D, &seeds[0], &seeds[1], &keys);
     const n = 200;
 
     var want: [n]D.Elem = undefined;
-    D.evalFull(0, keys[0], &want);
+    D.evalFull(0, &keys[0], &want);
 
     // shard_counts includes 1 (degenerate: one shard, the whole range),
     // 2 and 3 (2 divides 200 evenly, 3 does not — 200/3 leaves a remainder
@@ -382,7 +393,7 @@ test "evalRangeWith: disjoint shards sum to evalFull, over several shard counts 
             const remaining = n - lo;
             const len = (remaining + remaining_shards - 1) / remaining_shards;
             const hi = @min(lo + len, n);
-            D.evalRangeWith(0, keys[0], lo, hi, Ctx{ .out = &got }, Ctx.emit);
+            D.evalRangeWith(0, &keys[0], lo, hi, Ctx{ .out = &got }, Ctx.emit);
             for (lo..hi) |x| {
                 try std.testing.expect(!saw[x]); // each leaf touched by exactly one shard
                 saw[x] = true;
@@ -399,7 +410,8 @@ test "evalRangeWith: explicit len-0 and len-1 shards at the domain start, middle
     if (!gate.core_implemented) return error.SkipZigTest;
     const D = Dpf(8, 4);
     const seeds = efSeeds(99);
-    const keys = D.genWithSeeds(0, 5, seeds[0], seeds[1]); // α at the very first index
+    var keys: [2]D.Key = undefined;
+    D.genWithSeeds(0, 5, &seeds[0], &seeds[1], &keys); // α at the very first index
     const Ctx = struct {
         calls: *usize,
         last_x: *usize,
@@ -414,28 +426,28 @@ test "evalRangeWith: explicit len-0 and len-1 shards at the domain start, middle
         {
             var calls: usize = 0;
             var last_x: usize = 0;
-            D.evalRangeWith(b, keys[b], 0, 0, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
+            D.evalRangeWith(b, &keys[b], 0, 0, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
             try std.testing.expectEqual(@as(usize, 0), calls);
         }
         // len 0 in the middle (lo == hi, both nonzero): no emits.
         {
             var calls: usize = 0;
             var last_x: usize = 0;
-            D.evalRangeWith(b, keys[b], 40, 40, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
+            D.evalRangeWith(b, &keys[b], 40, 40, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
             try std.testing.expectEqual(@as(usize, 0), calls);
         }
         // len 0 at the domain end: no emits.
         {
             var calls: usize = 0;
             var last_x: usize = 0;
-            D.evalRangeWith(b, keys[b], D.domain_size, D.domain_size, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
+            D.evalRangeWith(b, &keys[b], D.domain_size, D.domain_size, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
             try std.testing.expectEqual(@as(usize, 0), calls);
         }
         // len 1 exactly on α (index 0): the on-path single-leaf shard.
         {
             var calls: usize = 0;
             var last_x: usize = 0;
-            D.evalRangeWith(b, keys[b], 0, 1, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
+            D.evalRangeWith(b, &keys[b], 0, 1, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
             try std.testing.expectEqual(@as(usize, 1), calls);
             try std.testing.expectEqual(@as(usize, 0), last_x);
         }
@@ -443,7 +455,7 @@ test "evalRangeWith: explicit len-0 and len-1 shards at the domain start, middle
         {
             var calls: usize = 0;
             var last_x: usize = 0;
-            D.evalRangeWith(b, keys[b], D.domain_size - 1, D.domain_size, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
+            D.evalRangeWith(b, &keys[b], D.domain_size - 1, D.domain_size, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
             try std.testing.expectEqual(@as(usize, 1), calls);
             try std.testing.expectEqual(D.domain_size - 1, last_x);
         }
@@ -462,14 +474,14 @@ test "evalRangeWith: explicit len-0 and len-1 shards at the domain start, middle
                 ctx.out.* = v;
             }
         };
-        D.evalRangeWith(0, keys[0], 0, 1, OnCtx{ .out = &a0_on }, OnCtx.emit);
-        D.evalRangeWith(1, keys[1], 0, 1, OnCtx{ .out = &a1_on }, OnCtx.emit);
+        D.evalRangeWith(0, &keys[0], 0, 1, OnCtx{ .out = &a0_on }, OnCtx.emit);
+        D.evalRangeWith(1, &keys[1], 0, 1, OnCtx{ .out = &a1_on }, OnCtx.emit);
         try std.testing.expectEqual(@as(D.Elem, 5), D.G.add(a0_on, a1_on));
 
         var a0_off: D.Elem = undefined;
         var a1_off: D.Elem = undefined;
-        D.evalRangeWith(0, keys[0], 1, 2, OnCtx{ .out = &a0_off }, OnCtx.emit);
-        D.evalRangeWith(1, keys[1], 1, 2, OnCtx{ .out = &a1_off }, OnCtx.emit);
+        D.evalRangeWith(0, &keys[0], 1, 2, OnCtx{ .out = &a0_off }, OnCtx.emit);
+        D.evalRangeWith(1, &keys[1], 1, 2, OnCtx{ .out = &a1_off }, OnCtx.emit);
         try std.testing.expectEqual(@as(D.Elem, 0), D.G.add(a0_off, a1_off));
     }
 }

@@ -53,6 +53,7 @@
 const std = @import("std");
 const prg_mod = @import("prg.zig");
 const group = @import("group.zig");
+const burn = @import("burn.zig");
 
 const Seed = prg_mod.Seed;
 const seed_len = prg_mod.seed_len;
@@ -167,7 +168,11 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             /// Serialize the CW portion (shared between k0/k1): for each level
             /// `s_cw(16) || t_cw_l(1) || t_cw_r(1)`, then `cw_final` (LE). This
             /// is the byte layout the external KAT vectors pin. REAL/ungated.
-            pub fn serializeCw(self: Key, buf: *[cw_serialized_len]u8) void {
+            pub fn serializeCw(self: *const Key, buf: *[cw_serialized_len]u8) void {
+                return burn.run(burn.codec_burn, void, serializeCwBody, .{ self, buf });
+            }
+
+            fn serializeCwBody(self: *const Key, buf: *[cw_serialized_len]u8) void {
                 var off: usize = 0;
                 for (self.cw) |c| {
                     @memcpy(buf[off .. off + seed_len], &c.s_cw);
@@ -181,14 +186,24 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             }
 
             /// Serialize a full key: `seed(16) || serializeCw`. REAL/ungated.
-            pub fn toBytes(self: Key, buf: *[serialized_len]u8) void {
-                @memcpy(buf[0..seed_len], &self.seed);
-                self.serializeCw(buf[seed_len..][0..cw_serialized_len]);
+            pub fn toBytes(self: *const Key, buf: *[serialized_len]u8) void {
+                return burn.run(burn.codec_burn, void, toBytesBody, .{ self, buf });
             }
 
-            /// Decode a full key from `toBytes` output. REAL/ungated.
-            pub fn fromBytes(buf: *const [serialized_len]u8) Key {
-                var key: Key = undefined;
+            fn toBytesBody(self: *const Key, buf: *[serialized_len]u8) void {
+                @memcpy(buf[0..seed_len], &self.seed);
+                self.serializeCwBody(buf[seed_len..][0..cw_serialized_len]);
+            }
+
+            /// Decode a full key from `toBytes` output into `out`. REAL/ungated.
+            /// The key is written through `out`, never returned: a returned
+            /// key sits in the caller's result slot, out of reach of the burn.
+            pub fn fromBytes(out: *Key, buf: *const [serialized_len]u8) void {
+                return burn.run(burn.codec_burn, void, fromBytesBody, .{ out, buf });
+            }
+
+            fn fromBytesBody(out: *Key, buf: *const [serialized_len]u8) void {
+                const key = out;
                 key.seed = buf[0..seed_len].*;
                 var off: usize = seed_len;
                 for (&key.cw) |*c| {
@@ -200,7 +215,6 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
                     off += 1;
                 }
                 key.cw_final = std.mem.readInt(Elem, buf[off..][0..out_bytes], .little);
-                return key;
             }
 
             /// Serialize for STORAGE: `format_tag(1) || toBytes`.
@@ -217,7 +231,7 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             /// On the wire, the PRG is protocol geometry exactly like `n`, `L`
             /// and (in `Mpf`) `k` — none of which are in the bytes either, and
             /// all of which both parties must agree on out of band.
-            pub fn toBytesTagged(self: Key, buf: *[tagged_len]u8) void {
+            pub fn toBytesTagged(self: *const Key, buf: *[tagged_len]u8) void {
                 buf[0] = format_tag;
                 self.toBytes(buf[1..][0..serialized_len]);
             }
@@ -226,9 +240,10 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             /// different PRG instead of decoding it into silent garbage. This
             /// is the whole point of the tag: the payload lengths are equal
             /// across instantiations, so nothing else would catch it.
-            pub fn fromBytesTagged(buf: *const [tagged_len]u8) KeyFormatError!Key {
+            /// The key is written through `out` (untouched on error).
+            pub fn fromBytesTagged(out: *Key, buf: *const [tagged_len]u8) KeyFormatError!void {
                 if (buf[0] != format_tag) return error.UnsupportedKeyFormat;
-                return fromBytes(buf[1..][0..serialized_len]);
+                fromBytes(out, buf[1..][0..serialized_len]);
             }
         };
 
@@ -264,7 +279,17 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         ///   `s_b^i   = s^b_Keep ⊕ t_b^{i-1}·s_cw`
         ///   `t_b^i   = t^b_Keep ⊕ t_b^{i-1}·t_cw_Keep`
         /// Final word: `cw_final = (-1)^{t1^n}·(β − Convert(s0^n) + Convert(s1^n))`.
-        pub fn genWithSeeds(alpha: Index, beta: Elem, s0: Seed, s1: Seed) [2]Key {
+        ///
+        /// The keys are written through `out`, never returned: a returned
+        /// `[2]Key` sits in the caller's result slot, out of reach of the burn
+        /// (the stack probe found the root seeds there, 2026-10-09).
+        pub fn genWithSeeds(alpha: Index, beta: Elem, s0: *const Seed, s1: *const Seed, out: *[2]Key) void {
+            return burn.run(burn.gen_burn, void, genBody, .{ alpha, beta, s0, s1, out });
+        }
+
+        fn genBody(alpha: Index, beta: Elem, s0p: *const Seed, s1p: *const Seed, out: *[2]Key) void {
+            const s0 = s0p.*;
+            const s1 = s1p.*;
             // PRG setup (AES key expansion) hoisted out of the level loop.
             const p = P.init();
             var cur0 = s0;
@@ -315,10 +340,8 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             const neg_mask: Elem = 0 -% @as(Elem, t1);
             const cw_final: Elem = (G.neg(raw) & neg_mask) | (raw & ~neg_mask);
 
-            return .{
-                .{ .seed = s0, .cw = cw, .cw_final = cw_final },
-                .{ .seed = s1, .cw = cw, .cw_final = cw_final },
-            };
+            out[0] = .{ .seed = s0, .cw = cw, .cw_final = cw_final };
+            out[1] = .{ .seed = s1, .cw = cw, .cw_final = cw_final };
         }
 
         /// **Eval** — evaluate party `b`'s share of `f_{α,β}` at input `x`.
@@ -329,7 +352,11 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         /// then per level expand with the PRG, XOR in the level CW iff the
         /// running control bit `t` is 1, and descend by `x_i` (MSB-first).
         /// At the leaf: `share = (-1)^b · (Convert(s) + t·cw_final)`.
-        pub fn eval(b: u1, key: Key, x: Index) Elem {
+        pub fn eval(b: u1, key: *const Key, x: Index) Elem {
+            return burn.run(burn.eval_burn, Elem, evalBody, .{ b, key, x });
+        }
+
+        fn evalBody(b: u1, key: *const Key, x: Index) Elem {
             const p = P.init();
             var s = key.seed;
             var t: u1 = b;
@@ -362,11 +389,15 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         /// tree-reuse walk, which makes it the differential oracle the
         /// equivalence tests compare `evalFull` against. Use `evalFull` when
         /// you want the result fast.
-        pub fn evalAll(b: u1, key: Key, out: []Elem) void {
+        pub fn evalAll(b: u1, key: *const Key, out: []Elem) void {
+            return burn.run(burn.walk_burn, void, evalAllBody, .{ b, key, out });
+        }
+
+        fn evalAllBody(b: u1, key: *const Key, out: []Elem) void {
             std.debug.assert(out.len == domain_size);
             var x: usize = 0;
             while (x < domain_size) : (x += 1) {
-                out[x] = eval(b, key, @intCast(x));
+                out[x] = evalBody(b, key, @intCast(x));
             }
         }
 
@@ -385,14 +416,18 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         /// subtree lying entirely at/past `out.len` is skipped BEFORE its PRG
         /// call, so the tail costs zero hashes and the cost is `O(out.len)`,
         /// not `O(2^n)`.
-        pub fn evalFull(b: u1, key: Key, out: []Elem) void {
+        pub fn evalFull(b: u1, key: *const Key, out: []Elem) void {
+            return burn.run(burn.walk_burn, void, evalFullBody, .{ b, key, out });
+        }
+
+        fn evalFullBody(b: u1, key: *const Key, out: []Elem) void {
             std.debug.assert(out.len <= domain_size);
             const sink = struct {
                 fn emit(o: []Elem, x: usize, v: Elem) void {
                     o[x] = v;
                 }
             };
-            walkRange([]Elem, sink.emit, P.init(), &key, b, key.seed, b, 0, 0, 0, out.len, out);
+            walkRange([]Elem, sink.emit, P.init(), key, b, key.seed, b, 0, 0, 0, out.len, out);
         }
 
         /// **EvalFullWith** — the same tree-reuse prefix walk as `evalFull`,
@@ -403,13 +438,18 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         /// walk produces it, so no `count`-sized buffer exists anywhere.
         pub fn evalFullWith(
             b: u1,
-            key: Key,
+            key: *const Key,
             count: usize,
             context: anytype,
             comptime emit: fn (@TypeOf(context), usize, Elem) void,
         ) void {
-            std.debug.assert(count <= domain_size);
-            walkRange(@TypeOf(context), emit, P.init(), &key, b, key.seed, b, 0, 0, 0, count, context);
+            const B = struct {
+                fn body(b_: u1, key_: *const Key, count_: usize, ctx: @TypeOf(context)) void {
+                    std.debug.assert(count_ <= domain_size);
+                    walkRange(@TypeOf(context), emit, P.init(), key_, b_, key_.seed, b_, 0, 0, 0, count_, ctx);
+                }
+            };
+            return burn.run(burn.walk_burn, void, B.body, .{ b, key, count, context });
         }
 
         /// **EvalRangeWith** — the tree-reuse walk restricted to
@@ -450,15 +490,20 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         /// `[0, count)`, just also enforced on the left edge.
         pub fn evalRangeWith(
             b: u1,
-            key: Key,
+            key: *const Key,
             lo: usize,
             hi: usize,
             context: anytype,
             comptime emit: fn (@TypeOf(context), usize, Elem) void,
         ) void {
-            std.debug.assert(lo <= hi);
-            std.debug.assert(hi <= domain_size);
-            walkRange(@TypeOf(context), emit, P.init(), &key, b, key.seed, b, 0, 0, lo, hi, context);
+            const B = struct {
+                fn body(b_: u1, key_: *const Key, lo_: usize, hi_: usize, ctx: @TypeOf(context)) void {
+                    std.debug.assert(lo_ <= hi_);
+                    std.debug.assert(hi_ <= domain_size);
+                    walkRange(@TypeOf(context), emit, P.init(), key_, b_, key_.seed, b_, 0, 0, lo_, hi_, ctx);
+                }
+            };
+            return burn.run(burn.walk_burn, void, B.body, .{ b, key, lo, hi, context });
         }
 
         /// The shared walk under `evalFull`/`evalFullWith`/`evalRangeWith`.
@@ -547,7 +592,8 @@ test "Key serialize/deserialize round-trips (REAL, no core)" {
 
     var buf: [D.Key.serialized_len]u8 = undefined;
     key.toBytes(&buf);
-    const back = D.Key.fromBytes(&buf);
+    var back: D.Key = undefined;
+    D.Key.fromBytes(&back, &buf);
 
     try std.testing.expectEqualSlices(u8, &key.seed, &back.seed);
     try std.testing.expectEqual(key.cw_final, back.cw_final);
@@ -577,8 +623,12 @@ test "a key from the OTHER PRG is different bytes, and the tagged codec rejects 
     const s0: Seed = [_]u8{0x11} ** 16;
     const s1: Seed = [_]u8{0x22} ** 16;
 
-    const ka = A.genWithSeeds(37, 0xDEADBEEF, s0, s1)[0];
-    const ks = S.genWithSeeds(37, 0xDEADBEEF, s0, s1)[0];
+    var pa: [2]A.Key = undefined;
+    var ps: [2]S.Key = undefined;
+    A.genWithSeeds(37, 0xDEADBEEF, &s0, &s1, &pa);
+    S.genWithSeeds(37, 0xDEADBEEF, &s0, &s1, &ps);
+    const ka = pa[0];
+    const ks = ps[0];
 
     // Identical inputs, identical lengths, different keys: an old stored key
     // fed to the new evaluator would reconstruct garbage, not fail.
@@ -589,20 +639,24 @@ test "a key from the OTHER PRG is different bytes, and the tagged codec rejects 
     try std.testing.expect(!std.mem.eql(u8, &ba, &bs));
     // and untagged decoding really does accept the wrong one silently —
     // stated as an executed fact, since it is the reason for `toBytesTagged`
-    _ = A.Key.fromBytes(&bs);
+    var wrong: A.Key = undefined;
+    A.Key.fromBytes(&wrong, &bs);
 
     // The tagged storage form is what catches it.
     var ta: [A.Key.tagged_len]u8 = undefined;
     var ts: [S.Key.tagged_len]u8 = undefined;
+    var scratch: A.Key = undefined;
+    var scratch_s: S.Key = undefined;
     ka.toBytesTagged(&ta);
     ks.toBytesTagged(&ts);
     try std.testing.expectEqual(@as(u8, 0x02), ta[0]);
     try std.testing.expectEqual(@as(u8, 0x01), ts[0]);
-    try std.testing.expectError(error.UnsupportedKeyFormat, A.Key.fromBytesTagged(&ts));
-    try std.testing.expectError(error.UnsupportedKeyFormat, S.Key.fromBytesTagged(&ta));
+    try std.testing.expectError(error.UnsupportedKeyFormat, A.Key.fromBytesTagged(&scratch, &ts));
+    try std.testing.expectError(error.UnsupportedKeyFormat, S.Key.fromBytesTagged(&scratch_s, &ta));
 
     // and the right one round-trips through the tag
-    const back = try A.Key.fromBytesTagged(&ta);
+    var back: A.Key = undefined;
+    try A.Key.fromBytesTagged(&back, &ta);
     try std.testing.expectEqualSlices(u8, &ka.seed, &back.seed);
     try std.testing.expectEqual(ka.cw_final, back.cw_final);
 }
@@ -616,11 +670,12 @@ test "both PRG instantiations are correct DPFs over the full domain" {
         const s1: Seed = [_]u8{0x5A} ** 16;
         for ([_]D.Index{ 0, 1, 63, 100, 127 }) |alpha| {
             const beta: D.Elem = 0x01020304;
-            const keys = D.genWithSeeds(alpha, beta, s0, s1);
+            var keys: [2]D.Key = undefined;
+            D.genWithSeeds(alpha, beta, &s0, &s1, &keys);
             var e0: [D.domain_size]D.Elem = undefined;
             var e1: [D.domain_size]D.Elem = undefined;
-            D.evalAll(0, keys[0], &e0);
-            D.evalAll(1, keys[1], &e1);
+            D.evalAll(0, &keys[0], &e0);
+            D.evalAll(1, &keys[1], &e1);
             try std.testing.expectEqual(@as(?usize, null), D.firstMismatch(&e0, &e1, alpha, beta));
         }
     }

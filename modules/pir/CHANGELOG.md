@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack burns (`CONVENTIONS.md` §2.1.1),
+  following `fss`. Secrets go in by pointer and results come out through
+  `out` parameters: `Pir.query(index, *const Seed, *const Seed, out: *[2]Share)`,
+  `queryKeyword` likewise, `Multi.query(indices, *const [k]Seed, *const [k]Seed,
+  out)`, `Verified.query`/`queryKeyword(…, mac_rand: *const […]u8, four
+  `*const Seed`, out: *Query)` (all `Error!void`, burned);
+  `shareFromBytes(out: *Share, buf) Error!void` on all three layers;
+  `shareToBytes`, `answer`, `answerRange`, `answerSlices(Range)`,
+  `answerAggregate` and `Verified.answer` take the share as `*const Share`;
+  `Verified.reconstruct`/`reconstructFromBytes(secret: *const Secret, …)` run
+  under a burn. New `src/burn.zig` and `stackprobe_test.zig`
+  (`testkit.stackprobe`).
+
 - **2026-10-06** — Mutation run: 52 of 53 killed, 1 equivalent; 1 test added
   and 4 extended (each `Verified` channel's keys carry its own seeds; the
   coordinated all-zero transcript through `Verified.reconstructFromBytes`;

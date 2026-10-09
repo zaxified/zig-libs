@@ -61,12 +61,13 @@ const P = pir.Pir(3, 16);       // 2^3 indices, 16-byte arithmetic words
 
 // 3. CLIENT — one share per server. s0/s1 must be fresh, independent,
 //    cryptographically random 16-byte seeds, never reused for another query.
-const shares = try P.query(want_index, s0, s1);
+var shares: [2]P.Share = undefined;
+try P.query(want_index, &s0, &s1, &shares);
 
 // 4. SERVERS — server b holds shares[b] and the same database.
 const n_words = P.answerWords(database.record_len);
-try P.answer(0, shares[0], database, a0[0..n_words]);
-try P.answer(1, shares[1], database, a1[0..n_words]);
+try P.answer(0, &shares[0], database, a0[0..n_words]);
+try P.answer(1, &shares[1], database, a1[0..n_words]);
 
 // 5. CLIENT — combine.
 try P.reconstruct(a0[0..n_words], a1[0..n_words], &record_out);
@@ -89,12 +90,13 @@ const M = P.Multi(3);   // 3 records per round trip; k is comptime
 // CLIENT — 2k seeds: one INDEPENDENT pair per instance, never reused.
 // Byte-identical seeds are rejected (error.SeedReuse) because reusing a pair
 // across instances would make the two indices' shared prefix readable.
-const shares = try M.query(.{ 4, 1, 6 }, seeds0, seeds1);
+var shares: [2]M.Share = undefined;
+try M.query(.{ 4, 1, 6 }, &seeds0, &seeds1, &shares);
 
 // SERVERS — one message each, k record-sized blocks wide.
 const n_words = try M.answerWords(database.record_len);
-try M.answer(0, shares[0], database, a0[0..n_words]);
-try M.answer(1, shares[1], database, a1[0..n_words]);
+try M.answer(0, &shares[0], database, a0[0..n_words]);
+try M.answer(1, &shares[1], database, a1[0..n_words]);
 
 // CLIENT — all three records, laid end to end (block j at j*record_len).
 try M.reconstruct(a0[0..n_words], a1[0..n_words], record_len, &records_out);
@@ -124,7 +126,8 @@ blocks); in the *aggregate* the same points add, to `2·record[7]`.
 // gives every record its own key field so the client can check the match.
 
 // CLIENT — one unconditional query per lookup. Nothing else.
-const shares = try P.queryKeyword("alpha", s0, s1);
+var shares: [2]P.Share = undefined;
+try P.queryKeyword("alpha", &s0, &s1, &shares);
 // …servers answer, client reconstructs exactly as above, then checks the
 // record's own key field LOCALLY: match → hit; mismatch/filler → absent.
 ```
@@ -168,8 +171,9 @@ const shares = try P.queryKeyword("alpha", s0, s1);
 Four codecs, all fixed-length, none with a length field or header:
 
 ```zig
-P.shareToBytes(share, &buf);                    // client → server, P.share_len bytes
-const share = try P.shareFromBytes(bytes);      // server parses (untrusted)
+P.shareToBytes(&share, &buf);                    // client → server, P.share_len bytes
+var share: P.Share = undefined;
+try P.shareFromBytes(&share, bytes);            // server parses (untrusted)
 try P.answerToBytes(words, buf);                // server → client
 try P.answerFromBytes(bytes, words_out);        // client parses (untrusted)
 try P.reconstructFromBytes(a0, a1, &record);    // parse + combine, no intermediate
@@ -206,16 +210,17 @@ when the answers don't carry the matching tags.
 const W = pir.Verified(3, 16, 8);        // == pir.Pir(3, 16).Verified(8)
 
 // CLIENT — four independent seeds + fresh MAC randomness, per query.
-const q = try W.query(want_index, mac_rand, s0, s1, s2, s3);
+var q: W.Query = undefined;
+try W.query(want_index, &mac_rand, &s0, &s1, &s2, &s3, &q);
 
 // SERVERS — two answers each: the base value answer plus the tag answer.
 const per = W.Value.answerWords(database.record_len);
 const tw = W.tagWords(database.record_len);
-try W.answer(0, q.shares[0], database, v0[0..per], t0[0..tw]);
-try W.answer(1, q.shares[1], database, v1[0..per], t1[0..tw]);
+try W.answer(0, &q.shares[0], database, v0[0..per], t0[0..tw]);
+try W.answer(1, &q.shares[1], database, v1[0..per], t1[0..tw]);
 
 // CLIENT — verify-then-reconstruct; error.AnswerRejected on any lie.
-try W.reconstruct(q.secret, v0[0..per], v1[0..per], t0[0..tw], t1[0..tw], &record_out);
+try W.reconstruct(&q.secret, v0[0..per], v1[0..per], t0[0..tw], t1[0..tw], &record_out);
 ```
 
 Read the security statement before relying on it (`SPEC.md`

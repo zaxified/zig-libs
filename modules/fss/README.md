@@ -46,28 +46,29 @@ const D = fss.Dpf(8, 4); // domain {0,1}^8 = 256 points, output group Z_{2^32}
 
 // Caller supplies two independent, secret, cryptographically-random 16-byte
 // seeds (the DPF's only randomness — see Caveats). Same seeds ⇒ same keys.
-const keys = D.genWithSeeds(alpha, beta, seed0, seed1); // [2]D.Key
+var keys: [2]D.Key = undefined;
+D.genWithSeeds(alpha, beta, &seed0, &seed1, &keys);
 const k0 = keys[0];
 const k1 = keys[1];
 
 // Single-point evaluation (O(n)); the two shares reconstruct f_{α,β}(x):
-const share0 = D.eval(0, k0, x);
-const share1 = D.eval(1, k1, x);
+const share0 = D.eval(0, &k0, x);
+const share1 = D.eval(1, &k1, x);
 const y = D.G.add(share0, share1); // == beta if x==alpha else 0
 
 // Full-domain evaluation (into a caller buffer of D.domain_size elements):
 var out0: [D.domain_size]D.Elem = undefined;
-D.evalAll(0, k0, &out0);
+D.evalAll(0, &k0, &out0);
 
 // Tree-reuse evaluation of a domain PREFIX [0, out.len), out.len <= 2^n:
 // ~out.len PRG calls total instead of eval's O(n) per point, and subtrees
 // past the prefix are never expanded (cost follows out.len, not 2^n).
 // Produces bit-for-bit what eval produces at each point.
 var fast: [300]D.Elem = undefined;
-D.evalFull(0, k0, &fast);
+D.evalFull(0, &k0, &fast);
 // Streaming form for allocator-free consumers (pir's server loop): emits
 // (x, value) for each x in [0, count), ascending, materializing nothing.
-D.evalFullWith(0, k0, n_records, ctx, myEmitFn);
+D.evalFullWith(0, &k0, n_records, ctx, myEmitFn);
 
 // Verification oracle: first x where the two evals fail to reconstruct, or null.
 const bad = D.firstMismatch(&out0, &out1, alpha, beta);
@@ -75,13 +76,15 @@ const bad = D.firstMismatch(&out0, &out1, alpha, beta);
 // Keys serialize compactly; k0 and k1 share the CW portion, differ only in seed:
 var buf: [D.Key.serialized_len]u8 = undefined;
 k0.toBytes(&buf);
-const restored = D.Key.fromBytes(&buf);
+var restored: D.Key = undefined;
+D.Key.fromBytes(&restored, &buf);
 
 // STORAGE form: one leading byte naming the PRG, so a key written by a build
 // with a different PRG is rejected instead of decoding into garbage.
 var stored: [D.Key.tagged_len]u8 = undefined;
 k0.toBytesTagged(&stored);
-const reloaded = try D.Key.fromBytesTagged(&stored); // error.UnsupportedKeyFormat
+var reloaded: D.Key = undefined;
+try D.Key.fromBytesTagged(&reloaded, &stored); // error.UnsupportedKeyFormat
 
 // The PRG is a parameter. `Dpf(n,L)` is the fixed-key-AES default; the
 // SHA-256 instantiation (slower, constant-time on every target, and what the
@@ -96,7 +99,8 @@ const M = fss.Mpf(8, 4, 3); // 3 points over {0,1}^8, output group Z_{2^32}
 
 // 2k seeds: one INDEPENDENT pair per instance. Byte-identical seeds are
 // rejected with error.SeedReuse — see Caveats for why this one is enforced.
-const keys = try M.genWithSeeds(alphas, betas, seeds0, seeds1); // [2]M.Key
+var keys: [2]M.Key = undefined;
+try M.genWithSeeds(alphas, betas, &seeds0, &seeds1, &keys);
 
 // eval = the multi-point function itself (the k instances summed):
 const y = M.eval(0, keys[0], x) +% M.eval(1, keys[1], x); // == Σ_j β_j·1{x==α_j}

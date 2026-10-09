@@ -179,13 +179,18 @@ const Fixture = struct {
             .implementation = echoMethod,
         });
 
-        f.creds = try security.Credentials.generateSelfSigned(gpa, random, .{
-            .modulus_bits = 2048,
-            .common_name = "zig-libs opcua interop server",
-            .not_before = "200101000000Z",
-            .not_after = "350101000000Z",
-            .application_uri = application_uri,
-        });
+        try security.Credentials.generateSelfSigned(
+            gpa,
+            random,
+            .{
+                .modulus_bits = 2048,
+                .common_name = "zig-libs opcua interop server",
+                .not_before = "200101000000Z",
+                .not_after = "350101000000Z",
+                .application_uri = application_uri,
+            },
+            &f.creds,
+        );
         f.endpoint_storage[0] = server.noneEndpointWithEncryptedUserTokens(live_endpoint_url, app, f.creds.certificate_der);
         f.endpoint_storage[1] = server.secureEndpoint(live_endpoint_url, app, .sign, f.creds.certificate_der, 10);
         f.endpoint_storage[2] = server.secureEndpoint(live_endpoint_url, app, .sign_and_encrypt, f.creds.certificate_der, 20);
