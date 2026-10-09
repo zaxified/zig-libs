@@ -930,10 +930,10 @@ aescbc	ReleaseFast	xmlenc	1	1	5770c1757f710885	c4046968725e140d
 # pin is the whole gate, which is why the guard-stripping fix that gave bolt3
 # its pin back matters here too -- a row with NO-OWN-SRC and an unchanged count
 # would have let the barrier be deleted in silence.
-sealedbox	ReleaseFast	hexenc	1	0	ce35eb9cc7d4f531	677e9993da327f0d
-sealedbox	ReleaseFast	hexdec	1	1	ce35eb9cc7d4f531	1c8749621d19a09b
-sealedbox	ReleaseFast	b64enc	1	0	ce35eb9cc7d4f531	ec1bc04ea2ea3ff7
-sealedbox	ReleaseFast	b64dec	1	1	ce35eb9cc7d4f531	1c8749621d19a09b
+sealedbox	ReleaseFast	hexenc	1	0	facecdf4850308dd	677e9993da327f0d
+sealedbox	ReleaseFast	hexdec	1	1	facecdf4850308dd	1c8749621d19a09b
+sealedbox	ReleaseFast	b64enc	1	0	facecdf4850308dd	ec1bc04ea2ea3ff7
+sealedbox	ReleaseFast	b64dec	1	1	facecdf4850308dd	1c8749621d19a09b
 # ── sealedbox: the XSalsa20-Poly1305 core of seal/open (2026-10-07) ─────────
 # Module code since the multi-block rewrite (`xsalsa20poly1305.zig`,
 # `poly1305.zig`); before it, std's and not a target. 1100-byte message so every
