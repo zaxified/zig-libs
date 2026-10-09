@@ -74,6 +74,7 @@
 //! free functions are pure.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const router = @import("router");
 const http = @import("http");
 
@@ -123,6 +124,10 @@ pub const default_challenge = "Signature";
 /// The raw lowercase-hex HMAC-SHA256 of `body` under `secret` (no prefix).
 /// This is the value that follows `sha256=` in the header.
 pub fn computeHex(secret: []const u8, body: []const u8) [signature_hex_len]u8 {
+    return burn.run(burn.mac_burn, [signature_hex_len]u8, computeHexBody, .{ secret, body });
+}
+
+fn computeHexBody(secret: []const u8, body: []const u8) [signature_hex_len]u8 {
     var mac: [mac_length]u8 = undefined;
     Hmac.create(&mac, body, secret);
     return std.fmt.bytesToHex(mac, .lower);
@@ -293,6 +298,10 @@ fn macEql(a: [max_mac_length]u8, b: [max_mac_length]u8) bool {
 /// Write `<prefix><mac>` for `body` under `secret` in format `f` into
 /// `out_buf` (at least `f.signatureLen()` bytes, else `OutputTooSmall`).
 pub fn signFormat(f: Format, secret: []const u8, body: []const u8, out_buf: []u8) SignError![]const u8 {
+    return burn.run(burn.mac_burn, SignError![]const u8, signFormatBody, .{ f, secret, body, out_buf });
+}
+
+fn signFormatBody(f: Format, secret: []const u8, body: []const u8, out_buf: []u8) SignError![]const u8 {
     const n = f.signatureLen();
     if (out_buf.len < n) return error.OutputTooSmall;
     @memcpy(out_buf[0..f.prefix.len], f.prefix);
@@ -304,6 +313,10 @@ pub fn signFormat(f: Format, secret: []const u8, body: []const u8, out_buf: []u8
 /// Constant-time check of a `<prefix><mac>` value in format `f`. SP/TAB
 /// around the value are tolerated; anything malformed is false.
 pub fn verifyFormat(f: Format, secret: []const u8, body: []const u8, presented: []const u8) bool {
+    return burn.run(burn.mac_burn, bool, verifyFormatBody, .{ f, secret, body, presented });
+}
+
+fn verifyFormatBody(f: Format, secret: []const u8, body: []const u8, presented: []const u8) bool {
     const got = presentedMacFormat(f, presented) orelse return false;
     return macEql(macParts(f.digest, secret, &.{body}), got);
 }
@@ -437,29 +450,42 @@ pub const standard = struct {
     /// fix the layout, so both are accepted: the 32-byte seed, and the
     /// 64-byte seed‖public key (libsodium / `std` `SecretKey`), whose public
     /// half must then match the seed.
-    pub fn decodeSigningKey(text: []const u8) KeyError!Ed25519.KeyPair {
+    ///
+    /// Into `out` (BREAKING 2026-10-09): returned in an error union, the pair —
+    /// secret half included — sat in the caller's temporary. `out` is zeroed
+    /// on error.
+    pub fn decodeSigningKey(out: *Ed25519.KeyPair, text: []const u8) KeyError!void {
+        return burn.run(burn.ed_burn, KeyError!void, decodeSigningKeyBody, .{ out, text });
+    }
+
+    fn decodeSigningKeyBody(out: *Ed25519.KeyPair, text: []const u8) KeyError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
         var buf: [64]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf);
         const n = try decodeB64(&buf, stripPrefix(text, signing_key_prefix));
-        return switch (n) {
-            32 => Ed25519.KeyPair.generateDeterministic(buf[0..32].*) catch error.InvalidKey,
-            64 => blk: {
+        switch (n) {
+            32 => out.* = Ed25519.KeyPair.generateDeterministic(buf[0..32].*) catch return error.InvalidKey,
+            64 => {
                 // NOT `Ed25519.KeyPair.fromSecretKey`: `std` checks the
                 // embedded public half against the seed only under
                 // `std.debug.runtime_safety`, so in ReleaseFast a mismatched
                 // half was taken as is (and signing one message under two
                 // public keys gives away the secret scalar). Derive from the
                 // seed and compare, in every mode.
-                const kp = Ed25519.KeyPair.generateDeterministic(buf[0..32].*) catch break :blk error.InvalidKey;
-                if (!std.crypto.timing_safe.eql([32]u8, kp.public_key.toBytes(), buf[32..64].*)) break :blk error.InvalidKey;
-                break :blk kp;
+                out.* = Ed25519.KeyPair.generateDeterministic(buf[0..32].*) catch return error.InvalidKey;
+                if (!std.crypto.timing_safe.eql([32]u8, out.public_key.toBytes(), buf[32..64].*)) return error.InvalidKey;
             },
-            else => error.InvalidKey,
-        };
+            else => return error.InvalidKey,
+        }
     }
 
     /// `v1,<base64 HMAC-SHA256>` of `id.timestamp.payload` under the raw
     /// `key` (see `decodeSecret`), into `out` (at least `v1_len`).
     pub fn sign(out: []u8, key: []const u8, msg_id: []const u8, timestamp: u64, payload: []const u8) SignError![]const u8 {
+        return burn.run(burn.mac_burn, SignError![]const u8, signBody, .{ out, key, msg_id, timestamp, payload });
+    }
+
+    fn signBody(out: []u8, key: []const u8, msg_id: []const u8, timestamp: u64, payload: []const u8) SignError![]const u8 {
         if (out.len < v1_len) return error.OutputTooSmall;
         var tb: [20]u8 = undefined;
         const mac = macParts(.sha256, key, &.{ msg_id, ".", writeDecimal(&tb, timestamp), ".", payload });
@@ -473,7 +499,14 @@ pub const standard = struct {
     /// hashes the message twice — so the signed content is assembled in
     /// `scratch` (at least `msg_id.len + 22 + payload.len` bytes, else
     /// `OutputTooSmall`); `std`'s streaming signer is randomized.
-    pub fn signEd25519(out: []u8, scratch: []u8, key_pair: Ed25519.KeyPair, msg_id: []const u8, timestamp: u64, payload: []const u8) (SignError || error{SigningFailed})![]const u8 {
+    ///
+    /// `key_pair` by pointer (BREAKING 2026-10-09): by value the caller's frame
+    /// kept a copy of the secret half.
+    pub fn signEd25519(out: []u8, scratch: []u8, key_pair: *const Ed25519.KeyPair, msg_id: []const u8, timestamp: u64, payload: []const u8) (SignError || error{SigningFailed})![]const u8 {
+        return burn.run(burn.ed_burn, (SignError || error{SigningFailed})![]const u8, signEd25519Body, .{ out, scratch, key_pair, msg_id, timestamp, payload });
+    }
+
+    fn signEd25519Body(out: []u8, scratch: []u8, key_pair: *const Ed25519.KeyPair, msg_id: []const u8, timestamp: u64, payload: []const u8) (SignError || error{SigningFailed})![]const u8 {
         if (out.len < v1a_len) return error.OutputTooSmall;
         var tb: [20]u8 = undefined;
         const content = std.fmt.bufPrint(scratch, "{s}.{s}.{s}", .{ msg_id, writeDecimal(&tb, timestamp), payload }) catch return error.OutputTooSmall;
@@ -500,6 +533,10 @@ pub const standard = struct {
     /// Replay inside the window is the caller's to stop (remember
     /// `webhook-id`s for `tolerance_s`).
     pub fn verify(keys: Keys, msg_id: []const u8, timestamp: []const u8, signatures: []const u8, payload: []const u8, now: i64, tolerance_s: u32) VerifyError!void {
+        return burn.run(burn.ed_burn, VerifyError!void, verifyBody, .{ keys, msg_id, timestamp, signatures, payload, now, tolerance_s });
+    }
+
+    fn verifyBody(keys: Keys, msg_id: []const u8, timestamp: []const u8, signatures: []const u8, payload: []const u8, now: i64, tolerance_s: u32) VerifyError!void {
         const ts = try checkTimestamp(timestamp, now, tolerance_s);
         if (msg_id.len == 0) return error.InvalidHeader;
         var tb: [20]u8 = undefined;
@@ -571,6 +608,10 @@ pub const stripe = struct {
     /// `t=<timestamp>,v1=<hex>` into `out` (at least 2 + 20 + 4 + 64 bytes
     /// suffices for any timestamp).
     pub fn sign(out: []u8, secret: []const u8, timestamp: u64, payload: []const u8) SignError![]const u8 {
+        return burn.run(burn.mac_burn, SignError![]const u8, signBody, .{ out, secret, timestamp, payload });
+    }
+
+    fn signBody(out: []u8, secret: []const u8, timestamp: u64, payload: []const u8) SignError![]const u8 {
         var tb: [20]u8 = undefined;
         const ts = writeDecimal(&tb, timestamp);
         const n = 2 + ts.len + 4 + 64;
@@ -588,6 +629,10 @@ pub const stripe = struct {
     /// SDKs check only the past; a future timestamp is no less suspect), and
     /// any `v1=` matching any secret. `v0=` and unknown schemes are ignored.
     pub fn verify(secrets: []const []const u8, header_value: []const u8, payload: []const u8, now: i64, tolerance_s: u32) VerifyError!void {
+        return burn.run(burn.mac_burn, VerifyError!void, verifyBody, .{ secrets, header_value, payload, now, tolerance_s });
+    }
+
+    fn verifyBody(secrets: []const []const u8, header_value: []const u8, payload: []const u8, now: i64, tolerance_s: u32) VerifyError!void {
         var t_text: ?[]const u8 = null;
         var seen: usize = 0;
         var it = std.mem.tokenizeScalar(u8, header_value, ',');
@@ -627,6 +672,10 @@ pub const slack = struct {
     pub const signature_len = 3 + 64;
 
     pub fn sign(out: []u8, secret: []const u8, timestamp: u64, body: []const u8) SignError![]const u8 {
+        return burn.run(burn.mac_burn, SignError![]const u8, signBody, .{ out, secret, timestamp, body });
+    }
+
+    fn signBody(out: []u8, secret: []const u8, timestamp: u64, body: []const u8) SignError![]const u8 {
         if (out.len < signature_len) return error.OutputTooSmall;
         var tb: [20]u8 = undefined;
         const mac = macParts(.sha256, secret, &.{ "v0:", writeDecimal(&tb, timestamp), ":", body });
@@ -638,6 +687,10 @@ pub const slack = struct {
     /// The timestamp within `tolerance_s` of `now`, then the `v0=` value
     /// matching any secret (constant time, every secret tried).
     pub fn verify(secrets: []const []const u8, timestamp: []const u8, signature: []const u8, body: []const u8, now: i64, tolerance_s: u32) VerifyError!void {
+        return burn.run(burn.mac_burn, VerifyError!void, verifyBody, .{ secrets, timestamp, signature, body, now, tolerance_s });
+    }
+
+    fn verifyBody(secrets: []const []const u8, timestamp: []const u8, signature: []const u8, body: []const u8, now: i64, tolerance_s: u32) VerifyError!void {
         const ts = try checkTimestamp(timestamp, now, tolerance_s);
         const got = presentedMacFormat(.{ .prefix = "v0=" }, signature) orelse return error.NoMatchingSignature;
         var tb: [20]u8 = undefined;
@@ -810,6 +863,10 @@ pub const Verifier = struct {
     /// `.prefixed` scheme only (the header value is the whole signature);
     /// the timestamped schemes go through `verifyRequest`.
     pub fn verifyBody(v: *const Verifier, body: []const u8, presented: []const u8) bool {
+        return burn.run(burn.mac_burn, bool, verifyBodyBody, .{ v, body, presented });
+    }
+
+    fn verifyBodyBody(v: *const Verifier, body: []const u8, presented: []const u8) bool {
         const f: Format = .{ .prefix = v.prefix, .digest = v.digest, .encoding = v.encoding };
         const got = presentedMacFormat(f, presented) orelse return false;
         var ok = false;
@@ -1449,13 +1506,14 @@ test "Standard Webhooks: more than max_signatures entries is refused" {
 }
 
 test "Standard Webhooks v1a: Ed25519 against openssl, both whsk_ layouts" {
-    const kp = try standard.decodeSigningKey(sw_whsk);
+    var kp: std.crypto.sign.Ed25519.KeyPair = undefined;
+    try standard.decodeSigningKey(&kp, sw_whsk);
     const pk = try standard.decodePublicKey(sw_whpk);
     try testing.expectEqualSlices(u8, &pk.toBytes(), &kp.public_key.toBytes());
     var out: [standard.v1a_len]u8 = undefined;
     var scratch: [128]u8 = undefined;
-    try testing.expectEqualStrings(sw_v1a, try standard.signEd25519(&out, &scratch, kp, sw_id, sw_ts, sw_payload));
-    try testing.expectError(error.OutputTooSmall, standard.signEd25519(&out, scratch[0..20], kp, sw_id, sw_ts, sw_payload));
+    try testing.expectEqualStrings(sw_v1a, try standard.signEd25519(&out, &scratch, &kp, sw_id, sw_ts, sw_payload));
+    try testing.expectError(error.OutputTooSmall, standard.signEd25519(&out, scratch[0..20], &kp, sw_id, sw_ts, sw_payload));
     const keys: standard.Keys = .{ .public_keys = &.{pk} };
     try standard.verify(keys, sw_id, "1614265330", sw_v1a, sw_payload, @intCast(sw_ts), 300);
     try standard.verify(keys, sw_id, "1614265330", "v1,AAAA " ++ sw_v1a, sw_payload, @intCast(sw_ts), 300);
@@ -1464,9 +1522,10 @@ test "Standard Webhooks v1a: Ed25519 against openssl, both whsk_ layouts" {
     try testing.expectError(error.NoMatchingSignature, standard.verify(keys, sw_id, "1614265330", sw_v1, sw_payload, @intCast(sw_ts), 300));
     // The 64-byte seed‖public layout decodes to the same pair; a public half
     // that does not belong to the seed is refused.
-    const kp64 = try standard.decodeSigningKey("whsk_nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2DXWpgBgrEKt9VL/tPJZAc6DuFy89qmIyWvAhpo9wdRGg==");
+    var kp64: std.crypto.sign.Ed25519.KeyPair = undefined;
+    try standard.decodeSigningKey(&kp64, "whsk_nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2DXWpgBgrEKt9VL/tPJZAc6DuFy89qmIyWvAhpo9wdRGg==");
     try testing.expectEqualSlices(u8, &kp.public_key.toBytes(), &kp64.public_key.toBytes());
-    try testing.expectError(error.InvalidKey, standard.decodeSigningKey("whsk_nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="));
+    try testing.expectError(error.InvalidKey, standard.decodeSigningKey(&kp64, "whsk_nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="));
     try testing.expectError(error.InvalidKey, standard.decodePublicKey("whpk_AAAA"));
     // The v1a cap: max_ed25519_signatures junk entries before the good one
     // are one too many.
@@ -1836,4 +1895,8 @@ test "Standard Webhooks key encodings: sizes outside the spec are refused" {
     try testing.expectEqualStrings("x" ** 25, try standard.decodeSecret(&kb, "whsec_eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA"));
     // A public key is exactly 32 bytes: the 64-byte signing-key value is not one.
     try testing.expectError(error.InvalidKey, standard.decodePublicKey("whpk_nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2DXWpgBgrEKt9VL/tPJZAc6DuFy89qmIyWvAhpo9wdRGg=="));
+}
+
+test {
+    _ = @import("stackprobe_test.zig");
 }

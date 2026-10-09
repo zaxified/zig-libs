@@ -48,6 +48,7 @@ test {
     _ = fuzz;
     _ = fuzz.driver;
     _ = @import("golden.zig");
+    _ = stackprobe;
 }
 
 pub const hex = @import("hex.zig");
@@ -56,6 +57,10 @@ pub const hex = @import("hex.zig");
 /// for the three hazards it carries — the length prefix, the buffer ceiling,
 /// and the fact that a seed is worthless in a harness that discards it.
 pub const fuzz = @import("fuzz.zig");
+
+/// Dead-stack residue probe: needle-free residue below the burn plus needles
+/// for secret inputs/outputs. See its doc comment.
+pub const stackprobe = @import("stackprobe.zig");
 
 pub const expectHex = @import("golden.zig").expectHex;
 pub const expectBytes = @import("golden.zig").expectBytes;

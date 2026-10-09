@@ -1646,6 +1646,15 @@ cmd_changed() {
     # It still FAILS on a malformed or stale exemption.
     (( mt )) && step "check-fuzz-reach" ./scripts/checks/check-fuzz-reach.py --ratchet "--modules=$touched"
 
+    # The static half of the dead-stack rule (secrets by pointer, results via
+    # `out`, a burn on every public entry point that touches a secret). Ten
+    # hand-probed waves found the same three shapes; the source of a public
+    # signature shows all three. `--ratchet` against
+    # `scripts/checks/secret-api-baseline.txt`: a NEW finding fails, and so
+    # does a baseline row that no longer fires (delete it -- the file only
+    # shrinks). Seconds per module, no build.
+    (( mt )) && step "check-secret-api" ./scripts/checks/check-secret-api.py --ratchet "--modules=$touched"
+
     # `run-examples` builds and runs each example in the LANE's optimize mode,
     # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
     # and the example prints its success lines having checked nothing. Three

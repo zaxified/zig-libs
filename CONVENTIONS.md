@@ -148,7 +148,29 @@ dead frame lies below the stack pointer, so any function that reads it must firs
 there — and in Debug/ReleaseSafe Zig initializes that frame's `undefined` locals to `0xaa`,
 scrubbing the very residue the probe wants to see (measured: 2048/2048 bytes overwritten; in
 ReleaseFast the residue is gone for a different reason, register and slot reuse). Z1 stack wipes
-are justified by this rule and by review, not by a regression test.
+are justified by this rule and by review, not by a regression test. (A wipe of one named local
+stays untestable; the dead stack as a WHOLE is not — see §2.1.1.)
+
+### 2.1.1 Dead stack: pointers in, `out` params out, a burn at every entry point
+
+Owner's decision 2026-10-08 ("the higher level"), applied to 60+ modules in ten waves. A secret
+must not survive the call **in any frame** — the library's, std's under it, or the caller's:
+
+- **D1 — secret inputs by `*const T`**, never by value: a by-value parameter is a copy in the
+  CALLER's frame that the callee cannot reach.
+- **D2 — secret results through `out: *T`**, never returned (and never inside an error union): the
+  result slot and the error-union temporary are caller frames too. Zero `out` on the error path.
+- **D3 — every public entry point that touches a secret runs its body under a burn**: the body one
+  frame down (`burn.run(n, R, body, args)`, a `never_inline` call), then `burn.stack(n)` zeroes
+  `n` bytes at that depth. `burn.zig` is copied per module (`hpke/src/burn.zig`; 16-byte vector
+  stores, see its comment). Private helpers keep their shapes — they run under the entry's burn.
+- A std-shaped by-value surface may stay for compatibility when a safe twin `<name>Into` sits
+  beside it; anything else that cannot follow D1–D3 says why in `// secret-api-ok: <reason>`
+  directly above the `pub fn`.
+
+Held by two instruments: `scripts/checks/check-secret-api.py` (static, every gate: finds D1–D3
+violations on the public surface by name and type) and `testkit.stackprobe` (dynamic,
+ReleaseFast: a burn deep enough, no secret input/output left in a frame above it).
 
 ### 2.2 Where secret-bearing randomness comes from
 

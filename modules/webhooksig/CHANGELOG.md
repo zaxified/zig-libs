@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack burns on every secret-touching entry point, and the
+  Ed25519 signing key by pointer / into `out`. `standard.decodeSigningKey(out: *Ed25519.KeyPair,
+  text)` (was: returned the pair — secret half — in an error union), `standard.signEd25519(…,
+  key_pair: *const Ed25519.KeyPair, …)` (was: by value). Every HMAC sign/verify (`computeHex`,
+  `sign*`, `verify*`, `signFormat`/`verifyFormat`, `standard`/`stripe`/`slack`, `Verifier`) now
+  zeroes its stack after the call (`burn.zig`: 8 KiB HMAC, 16 KiB Ed25519). Before: every one of
+  the 13 entry points left its frames — the HMAC `key ⊕ ipad/opad` states, the expected MACs a
+  verify computed, the Ed25519 seed (18–69 windows) — on the dead stack (`stackprobe_test.zig`,
+  `testkit.stackprobe`; the HMAC residue holds no verbatim key bytes, so only the probe's
+  needle-free residue rule sees it).
 - **2026-10-06** — ⛔ **Fixed: a 64-byte `whsk_` key whose public half is not its seed's was accepted in ReleaseFast.** `decodeSigningKey` relied on `std`'s `Ed25519.KeyPair.fromSecretKey`, which checks the embedded public key only under `std.debug.runtime_safety`; signing one message under two public keys gives away the secret scalar. It now derives the pair from the seed and compares in every mode. Found by the tag `2026-10-06` ReleaseFast lane (the existing test asserted the refusal and failed there).
 - **2026-10-04** — **mvp → core.** Standard Webhooks (`standard`: `v1`
   HMAC-SHA256 and `v1a` Ed25519, `whsec_`/`whpk_`/`whsk_` keys, multi-signature

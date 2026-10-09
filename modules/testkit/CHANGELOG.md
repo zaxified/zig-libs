@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **New `stackprobe`: the shared dead-stack probe engine.** `Probe(.{}).run(label,
+  f, args, secrets, .{})` runs `f(args)` in a painted stack region and fails on (a) RESIDUE: a byte
+  that is neither paint nor zero deeper than the top of the longest zero run (the burn), and (b) a
+  NEEDLE: any 16-byte window of the secret inputs and `out` buffers passed in `secrets`, read after
+  the call. No per-algorithm needles. Three controls re-measured in every `run` (negative, positive,
+  short-burn). `skipUnlessOptimized` skips at RUNTIME, so probe bodies are type-checked in Debug.
+  Additive.
+
 - **2026-10-04** — `fuzz.driver.run` skips off 64-bit Linux (`fuzz.driver.supported`) instead of
   failing to compile: its watchdog state is 64-bit atomics (none on mips32) and it calls the
   Linux kernel directly (no `Environ.getPosix` on Windows). The Linux code is not compiled there,

@@ -57,6 +57,7 @@ place to put things a test might one day want.
 | `expectHex` / `expectBytes` | every `goldens.zig` spelled it differently |
 | `loopbackSkip` | the hand-written "loopback bind failed, skipping" give-up in ~25 modules (2026-10-01) |
 | `fuzz.driver.run` / `fuzz.Rng` / `fuzz.driver.hit` | the deterministic fuzz driver, copied by hand into seglog and zstd (2026-09-27) before qap needed it a third time |
+| `stackprobe.Probe` | the dead-stack probe engine, copied into 55 modules' `stackprobe_test.zig` (27.8k lines, 2026-10-09) with hand-derived needles for every intermediate secret; this one needs none — residue below the burn is found without needles, and only secret inputs/`out` buffers are needles |
 
 The golden comparison is the one piece that is *better* than what it replaced,
 not merely shared — see below.
