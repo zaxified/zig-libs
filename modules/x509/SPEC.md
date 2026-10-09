@@ -447,13 +447,17 @@ that name type, i.e. a false reject, never a bypass.
 
 ## Backlog / deferred
 
-- **OPEN (owner decision), 2026-10-10: `parse_slack` in `verifyChain`.** `verifyChain` now runs
-  `safe.validateForStdParse` on every chain entry, but std still sees the caller's buffer, not a
-  copy with `parse_slack` zero padding behind it, so std's boundary probes (see `safe.zig`) are not
-  covered there, unlike `safeCertificate`. A full fix copies each chain entry into padded scratch,
-  which changes who owns the buffer behind `VerifiedChain.leaf` (a `Parsed` that points into it).
-  Options: (a) `VerifiedChain` owns padded copies + `deinit` (BREAKING); (b) the caller passes
-  scratch; (c) leave it as it is, documented. The 50k chain driver run after the fix was clean.
+- **DONE 2026-10-10 (decided by the coordinator, delegated by the owner): `parse_slack` in
+  `verifyChain`.** The open question was whether std, seeing the caller's buffer without padding,
+  could still probe past its end. Reading `Certificate.parse` (0.16) settles it: every probe lands
+  at the end of an element std just read, and with `requireStdDescentPoints` all of those lie
+  inside the buffer except the one after `signatureAlgorithm`, which reads the signatureValue
+  header. A certificate without its signatureValue was well-formed DER and passed the guard, so
+  std read that header at the buffer's end. The guard now requires the trailing BIT STRING
+  (RFC 5280 §4.1; regression test in `safe.zig`), so no probe leaves the buffer, no copy is
+  needed and the API is unchanged; the padding stays in `safeCertificate` as defence in depth.
+  The options weighed were (a) padded copies owned by `VerifiedChain` (BREAKING), (b) scratch
+  passed in by the caller, and (c) documenting the gap.
 
 - **CRL parsing and revocation check** — **DONE 2026-09-30 as `x509.crl`** (see § "CRL"), per
   certificate; **the `verifyChain` wiring (`Options.revocation`: a CRL list, scope, and a policy

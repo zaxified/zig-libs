@@ -59,7 +59,10 @@
 //!    says: std probing for an OPTIONAL sibling at a boundary reads an empty
 //!    `00 00` TLV out of the padding instead of off the end. It is *not* a
 //!    defence against a hostile length, which is an attacker-chosen 32-bit
-//!    number no bounded amount of padding can absorb — layer 2 is.
+//!    number no bounded amount of padding can absorb — layer 2 is. Since
+//!    2026-10-10 layer 2 also requires the trailing signatureValue, which is
+//!    what keeps every boundary probe inside the buffer even without the
+//!    padding (`validateForStdParse`); the padding stays as defence in depth.
 //!
 //! `safeCertificate` runs all three and hands back a `std.crypto.Certificate`
 //! safe to `parse`. `validateCertificate` on its own runs only layer 1 and
@@ -357,7 +360,18 @@ fn requireStdDescentPoints(bytes: []const u8, certificate: Header) Error!void {
     }
 
     // signatureAlgorithm — std descends to read its OID.
-    _ = try constructedAt(b, tbs.content_end, certificate.content_end);
+    const sig_alg = try constructedAt(b, tbs.content_end, certificate.content_end);
+    // signatureValue — std reads its header at `signatureAlgorithm`'s end
+    // without a bound. Required present (RFC 5280 §4.1: the three fields are
+    // not OPTIONAL) and last, this is what keeps every std probe inside the
+    // buffer: the only elements ending at the buffer's end are then the
+    // certificate and this BIT STRING, and std probes after neither. Without
+    // it, a certificate ending at `signatureAlgorithm` made std read the
+    // missing header at the buffer's end, an out-of-bounds read wherever the
+    // buffer was not padded (`verifyChain`, which hands std the caller's DER).
+    if (sig_alg.content_end >= certificate.content_end) return error.NotCertificate;
+    const sig_value = try decodeHeader(b, sig_alg.content_end, certificate.content_end);
+    if (b[sig_alg.content_end] != 0x03 or sig_value.content_end != certificate.content_end) return error.NotCertificate;
 
     // Extensions. std reaches them only for a non-v1 certificate that has a
     // field after subjectPublicKeyInfo, and descends only when that field's
@@ -394,9 +408,10 @@ fn requireStdDescentPoints(bytes: []const u8, certificate: Header) Error!void {
 /// The structural half of `safeCertificate`, without the copy: `der` is a
 /// well-formed DER certificate (`validateCertificate`) and every position
 /// `std.crypto.Certificate.parse` descends into is constructed
-/// (`requireStdDescentPoints`). What it does NOT give is `parse_slack`: std's
-/// boundary probes may still read up to that far past `der`'s end, so a
-/// caller that owns the buffer and needs full safety uses `safeCertificate`.
+/// (`requireStdDescentPoints`), including the trailing signatureValue whose
+/// presence keeps every std boundary probe inside `der`. That makes `der`
+/// itself safe to `parse` without a copy (`verifyChain` relies on it);
+/// `safeCertificate`'s `parse_slack` padding is defence in depth on top.
 pub fn validateForStdParse(der: []const u8) Error!void {
     try validateCertificate(der);
     try requireStdDescentPoints(der, try decodeHeader(der, 0, der.len));
@@ -699,6 +714,26 @@ test "validate: nesting past the depth bound is a typed error" {
         content_len += 2; // this element is now the content of the next one out
     }
     try testing.expectError(error.MaxDepthExceeded, validate(nested[idx..]));
+}
+
+test "validateForStdParse: a certificate without its signatureValue is refused (std would read past the end)" {
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm } with the
+    // BIT STRING dropped and the outer length fixed up. Well-formed DER, every
+    // descent point constructed — and std's `parse` then reads the signature's
+    // header at `signatureAlgorithm`'s end, which is the end of the buffer.
+    const der = &fixtures.leaf_rsa;
+    const outer = try decodeHeader(der, 0, der.len);
+    const tbs = try decodeHeader(der, outer.content_start, outer.content_end);
+    const sig_alg = try decodeHeader(der, tbs.content_end, outer.content_end);
+    const body = der[outer.content_start..sig_alg.content_end];
+    var buf: [4 + fixtures.leaf_rsa.len]u8 = undefined;
+    buf[0..4].* = .{ 0x30, 0x82, @intCast(body.len >> 8), @truncate(body.len) };
+    @memcpy(buf[4..][0..body.len], body);
+    const sigless = buf[0 .. 4 + body.len];
+    try validateCertificate(sigless);
+    try testing.expectError(error.NotCertificate, validateForStdParse(sigless));
+    var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+    try testing.expectError(error.NotCertificate, safeCertificate(sigless, &scratch));
 }
 
 test "safeCertificate: a real certificate round-trips and parses" {
@@ -1270,8 +1305,8 @@ test "differential: guard-accepted mutants reach std's parser and none of them p
     // exact. Roughly 80 % of 1-3 byte mutations still satisfy the guard, which
     // is what makes this a real differential rather than a rejection counter.
     try testing.expectEqual(@as(usize, 16_700), validated);
-    try testing.expectEqual(@as(usize, 15_814), guarded);
-    try testing.expectEqual(@as(usize, 13_822), parsed);
+    try testing.expectEqual(@as(usize, 15_798), guarded); // 15_814 before the signatureValue rule (2026-10-10)
+    try testing.expectEqual(@as(usize, 13_821), parsed); // 13_822 before: std matches the BIT STRING tag NUMBER only, the guard wants 0x03
 }
 
 test "the guard rejects a primitive at every position std descends into" {

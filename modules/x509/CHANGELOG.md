@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Fixed (SECURITY):** `safe.validateForStdParse` (and with it `verifyChain`) let
+  through a certificate that ends at `signatureAlgorithm` without its signatureValue; std's
+  `Certificate.parse` then reads the missing header at the end of the caller's buffer
+  (out of bounds: a panic in safe builds, a read past the buffer in ReleaseFast).
+  `requireStdDescentPoints` now requires the trailing BIT STRING, which keeps every std probe
+  inside the buffer and closes the SPEC's open `parse_slack`-in-`verifyChain` question without an
+  API change.
 - **2026-10-10** — **Fixed (SECURITY):** `verifyChain` / `buildPath` passed the peer's certificates to
   std's `Certificate.parse` and `Parsed.verify` unguarded: a malformed intermediate made std index far
   out of bounds (a safety panic in safe builds, an out-of-bounds read in ReleaseFast), both inside
