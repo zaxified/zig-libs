@@ -1107,43 +1107,56 @@ const presented_seeds = [_][]const u8{
     seed(""), // the ONE input the collapsed harness ever ran
 };
 
+const fz = @import("fuzz_test.zig");
+const VerifyMark = fz.Marker(enum { decoded, anchor_accepted, anchor_refused, genuine_accepted, flipped_refused });
+
 test "fuzz: verify never panics on arbitrary secret/body/presented" {
-    try testing.fuzz({}, fuzzVerify, .{ .corpus = &presented_seeds });
+    try testing.fuzz({}, fuzzVerifySmith, .{ .corpus = &presented_seeds });
 }
 
-fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: WEBHOOKSIG_FUZZ (verify)" {
+    try fz.fuzz_driver.run(fuzzVerify, .{ .prefix = "WEBHOOKSIG_FUZZ", .name = "webhooksig-verify" });
+}
+
+test "fuzz harness: verify, 500 seeds, reaches every outcome" {
+    try VerifyMark.reach(fuzzVerify, "webhooksig-verify", 500);
+}
+
+fn fuzzVerifySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzVerify(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var presented_buf: [128]u8 = undefined;
-    // ⚠ One `smith.slice` call, and it is the FIRST draw. This harness used to
-    // open with `smith.bytes(&secret_buf)` + a ranged length, then the same for
-    // the body, then `smith.value(bool)` to pick between a raw and a structured
-    // `presented`. Every one of those collapses outside `--fuzz`: a ranged
-    // `Smith` draw reads eight octets as a little-endian u64 and returns the
-    // range MINIMUM when fewer remain, `bool` is a 1-bit range, and `Smith`
-    // discards the rest of its input after the first short read. So the target
-    // ran exactly one input for its whole existence — secret `"\x00"`, body
-    // `""`, and a presented value of seven NUL octets followed by sixty-four
-    // `'0'`s, because `smith.index` was 0 for every character. Measured
+    // ⚠ One `slice` call, and it is the FIRST draw (under `Smith`; the driver's
+    // `Rng` takes a damaged corpus entry half of the time instead). This
+    // harness used to open with `smith.bytes(&secret_buf)` + a ranged length,
+    // then the same for the body, then `smith.value(bool)` to pick between a raw
+    // and a structured `presented`. Every one of those collapses outside
+    // `--fuzz`: a ranged `Smith` draw reads eight octets as a little-endian u64
+    // and returns the range MINIMUM when fewer remain, `bool` is a 1-bit range,
+    // and `Smith` discards the rest of its input after the first short read. So
+    // the target ran exactly one input for its whole existence. Measured
     // 2026-09-07 over the corpus above: **0 of 11 seeds non-empty, 0 MACs
     // decoded and 0 signatures accepted before; 10 of 11 non-empty (one seed IS
     // the empty header), 5 decoded and 4 accepted after.**
-    const presented_len: usize = smith.slice(&presented_buf);
+    const presented_len: usize = fz.drawInput(S, src, &presented_buf, &presented_seeds);
     const presented = presented_buf[0..presented_len];
 
     // (a) Against the module's own anchor credential, so the TRUE branch of the
-    // constant-time compare is reachable at all — no random secret can ever
-    // produce a matching MAC, so before this the success path of `verify` was
-    // unreachable from the fuzzer by construction.
-    _ = verify(anchor_secret, anchor_body, presented);
-    // ⚠ …with a DIFFERENT prefix. The second call here used to be
-    // `verifyWithPrefix("sha256=", …)`, which is literally what `verify`
-    // expands to — the same call twice. The empty prefix is the case that
-    // actually differs: a bare 64-character hex value.
-    _ = verifyWithPrefix("", anchor_secret, anchor_body, presented);
+    // constant-time compare is reachable at all -- no random secret can ever
+    // produce a matching MAC.
+    const a1 = verify(anchor_secret, anchor_body, presented);
+    // ⚠ ...with a DIFFERENT prefix: the empty prefix is the case that actually
+    // differs from `verify` (a bare 64-character hex value).
+    const a2 = verifyWithPrefix("", anchor_secret, anchor_body, presented);
+    if (presentedMac("sha256=", presented) != null or presentedMac("", presented) != null) VerifyMark.mark(.decoded);
+    if (a1 or a2) VerifyMark.mark(.anchor_accepted) else VerifyMark.mark(.anchor_refused);
 
     // (b) Against a secret and body derived from the presented bytes.
     // ⚠ With a `Cursor` over the drawn slice, NOT draws after it: a knob drawn
-    // after the byte draw is dead on a corpus replay, which is how the secret
-    // was one NUL octet and the body empty on every run.
+    // after the byte draw is dead on a corpus replay.
     var knobs: tkfuzz.Cursor = .{ .bytes = presented };
     var secret_buf: [32]u8 = undefined;
     const secret_len: usize = knobs.ranged(1, secret_buf.len); // Verifier requires nonempty
@@ -1151,7 +1164,53 @@ fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
     var body_buf: [64]u8 = undefined;
     const body_len: usize = knobs.ranged(0, body_buf.len);
     for (body_buf[0..body_len]) |*b| b.* = knobs.byte();
-    _ = verify(secret_buf[0..secret_len], body_buf[0..body_len], presented);
+    const secret = secret_buf[0..secret_len];
+    const body = body_buf[0..body_len];
+    _ = verify(secret, body, presented);
+
+    // (c) A GENUINE signature in a knob-chosen format is accepted (also with
+    // SP/TAB around it), and a flipped one is refused: a wrong digit, a wrong
+    // prefix octet, a truncated value, a flipped body octet, a flipped secret.
+    const prefixes = [_][]const u8{ "sha256=", "", "v1,", "sha1=", "sha512=" };
+    const f: Format = .{
+        .prefix = prefixes[knobs.ranged(0, prefixes.len - 1)],
+        .digest = @enumFromInt(knobs.ranged(0, 2)),
+        .encoding = @enumFromInt(knobs.ranged(0, 1)),
+    };
+    var sig_buf: [160]u8 = undefined;
+    const sig = signFormat(f, secret, body, &sig_buf) catch return error.SignFailed;
+    if (!verifyFormat(f, secret, body, sig)) return error.GenuineSignatureRefused;
+    var padded_buf: [170]u8 = undefined;
+    const padded = std.fmt.bufPrint(&padded_buf, " \t{s} ", .{sig}) catch unreachable;
+    if (!verifyFormat(f, secret, body, padded)) return error.PaddedSignatureRefused;
+    VerifyMark.mark(.genuine_accepted);
+
+    // Flip one octet of the MAC part. Hex: the next digit (never a case
+    // variant of itself). Base64: the next alphabet character, at a position
+    // whose six bits all count (the last data character carries unused bits).
+    const mac_text = sig[f.prefix.len..];
+    const data_chars = if (f.encoding == .hex) mac_text.len else std.mem.indexOfScalar(u8, mac_text, '=') orelse mac_text.len;
+    const pos = f.prefix.len + knobs.ranged(0, @intCast(data_chars - 2));
+    var flipped: [160]u8 = undefined;
+    @memcpy(flipped[0..sig.len], sig);
+    const alphabet = if (f.encoding == .hex) "0123456789abcdef" else "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    flipped[pos] = alphabet[(std.mem.indexOfScalar(u8, alphabet, sig[pos]).? + 1) % alphabet.len];
+    if (verifyFormat(f, secret, body, flipped[0..sig.len])) return error.FlippedMacAccepted;
+    if (f.prefix.len != 0) {
+        @memcpy(flipped[0..sig.len], sig);
+        flipped[0] ^= 1;
+        if (verifyFormat(f, secret, body, flipped[0..sig.len])) return error.FlippedPrefixAccepted;
+    }
+    if (verifyFormat(f, secret, body, sig[0 .. sig.len - 1])) return error.TruncatedSignatureAccepted;
+    if (body_len != 0) {
+        var body2 = body_buf;
+        body2[knobs.ranged(0, @intCast(body_len - 1))] ^= 1;
+        if (verifyFormat(f, secret, body2[0..body_len], sig)) return error.FlippedBodyAccepted;
+    }
+    var secret2 = secret_buf;
+    secret2[knobs.ranged(0, @intCast(secret_len - 1))] ^= 1;
+    if (verifyFormat(f, secret2[0..secret_len], body, sig)) return error.FlippedSecretAccepted;
+    VerifyMark.mark(.flipped_refused);
 }
 
 test "corpus: every presented value reaches presentedMac, and the counts are pinned" {
@@ -1925,6 +1984,7 @@ test "Standard Webhooks key encodings: sizes outside the spec are refused" {
 }
 
 test {
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
 }

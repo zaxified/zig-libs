@@ -162,6 +162,7 @@ test {
     _ = dhkem;
     _ = schedule;
     _ = @import("kat_rfc9180.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
 }

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `WEBHOOKSIG_FUZZ` over the existing harnesses (`verify`, plus a genuine signature (every digest, encoding and prefix) accepted and a flipped digit, prefix, body, secret or truncation refused).
 - **2026-10-09** — **SECURITY FIX (verifier DoS / stack overflow write):** a `v1a` signature
   of exactly 88 base64 characters without `==` padding decodes to 66 octets and was decoded
   into the 64-octet signature buffer — a panic in safe builds, 2 octets past the buffer in

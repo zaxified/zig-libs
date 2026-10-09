@@ -3899,15 +3899,39 @@ const parse_seeds = [_][]const u8{
     seed("\xf0\x9f\x94\x91.\xf0\x9f\x94\x92.\xf0\x9f\x94\x93"), // 🔑.🔒.🔓
 };
 
+const fz = @import("fuzz_test.zig");
+const ParseMark = fz.Marker(enum { accepted, refused, signature, claims });
+const JwksMark = fz.Marker(enum { local_ok, local_refused, network_ok, network_refused, keys, skipped });
+const TokenResponseMark = fz.Marker(enum { raw_ok, raw_refused, swept_ok, swept_refused });
+const SignVerifyMark = fz.Marker(enum { hmac, asymmetric, genuine_accepted, flipped_refused });
+
 test "fuzz: parse never panics on arbitrary compact-JWT bytes" {
-    try testing.fuzz({}, fuzzParse, .{ .corpus = &parse_seeds });
+    try testing.fuzz({}, fuzzParseSmith, .{ .corpus = &parse_seeds });
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: JWT_FUZZ (parse)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "JWT_FUZZ", .name = "jwt-parse" });
+}
+
+test "fuzz harness: parse, 500 seeds, reaches every outcome" {
+    try ParseMark.reach(fuzzParse, "jwt-parse", 500);
+}
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParse(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    var parsed = parse(testing.allocator, buf[0..len]) catch return;
-    parsed.deinit();
+    const len: usize = fz.drawInput(S, src, &buf, &parse_seeds);
+    var parsed = parse(gpa, buf[0..len]) catch {
+        ParseMark.mark(.refused);
+        return;
+    };
+    defer parsed.deinit();
+    ParseMark.mark(.accepted);
+    if (parsed.signature.len != 0) ParseMark.mark(.signature);
+    if (parsed.claims.iss != null or parsed.claims.exp != null or parsed.claims.sub != null) ParseMark.mark(.claims);
 }
 
 test "corpus: every token seed reaches parse, and what it decoded is pinned" {
@@ -4485,6 +4509,7 @@ test {
     _ = @import("rfc9964_vectors.zig");
     _ = @import("encode.zig");
     _ = @import("cache.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }
 
@@ -5767,12 +5792,24 @@ const jwks_seeds = [_][]const u8{
 };
 
 test "fuzz: parseJwks never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseJwks, .{ .corpus = &jwks_seeds });
+    try testing.fuzz({}, fuzzParseJwksSmith, .{ .corpus = &jwks_seeds });
 }
 
-fn fuzzParseJwks(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: JWT_FUZZ (jwks)" {
+    try fz.fuzz_driver.run(fuzzParseJwks, .{ .prefix = "JWT_FUZZ", .name = "jwt-jwks" });
+}
+
+test "fuzz harness: jwks, 500 seeds, reaches every outcome" {
+    try JwksMark.reach(fuzzParseJwks, "jwt-jwks", 500);
+}
+
+fn fuzzParseJwksSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseJwks(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParseJwks(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [1024]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &jwks_seeds);
     // Individual malformed JWKs are skipped (never a set-wide error), and
     // per parseJwks's own doc comment "Arbitrary bytes never panic" — this
     // is the fuzz harness proving that claim for both `.local` and
@@ -5786,14 +5823,18 @@ fn fuzzParseJwks(_: void, smith: *std.testing.Smith) !void {
     // `fuzzParseTokenResponse` already carries the same warning; the sibling
     // `fuzzParse` gets away with `catch return` only because nothing follows
     // it there.
-    if (parseJwksSource(testing.allocator, buf[0..len], .local)) |ok| {
+    if (parseJwksSource(gpa, buf[0..len], .local)) |ok| {
         var local = ok;
-        local.deinit();
-    } else |_| {}
-    if (parseJwksSource(testing.allocator, buf[0..len], .network)) |ok| {
+        defer local.deinit();
+        JwksMark.mark(.local_ok);
+        if (local.keys.len != 0) JwksMark.mark(.keys);
+        if (local.skipped.len != 0) JwksMark.mark(.skipped);
+    } else |_| JwksMark.mark(.local_refused);
+    if (parseJwksSource(gpa, buf[0..len], .network)) |ok| {
         var network = ok;
         network.deinit();
-    } else |_| {}
+        JwksMark.mark(.network_ok);
+    } else |_| JwksMark.mark(.network_refused);
 }
 
 test "corpus: every JWKS seed reaches the parser, and the keys and skips are pinned" {
@@ -7692,6 +7733,119 @@ test "buildTokenRequest: body round-trips through http.body.urlencoded (compatib
     try testing.expectEqual(@as(?http.body.FormPair, null), it.next());
 }
 
+test "fuzz driver: JWT_FUZZ (sign + verify)" {
+    try fz.fuzz_driver.run(fuzzSignVerify, .{ .prefix = "JWT_FUZZ", .name = "jwt-sign-verify" });
+}
+
+test "fuzz harness: sign + verify, 200 seeds, reaches every outcome" {
+    try SignVerifyMark.reach(fuzzSignVerify, "jwt-sign-verify", 200);
+}
+
+test "fuzz: a genuine token is accepted and a flipped one refused" {
+    try testing.fuzz({}, fuzzSignVerifySmith, .{});
+}
+
+fn fuzzSignVerifySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSignVerify(std.testing.Smith, smith, testing.allocator);
+}
+
+/// The oracle the parsers' harnesses cannot be: a token this module issued is
+/// ACCEPTED by `parseAndVerify` (HS256/384/512, ES256, EdDSA, knob-chosen), and
+/// every damaged copy is REFUSED -- a flipped octet anywhere in the header,
+/// payload or signature, a truncation, a wrong key.
+fn fuzzSignVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [160]u8 = undefined;
+    const raw_len: usize = src.slice(&raw);
+    var knobs: @import("testkit").fuzz.Cursor = .{ .bytes = raw[0..raw_len] };
+    var key_bytes: [64]u8 = undefined;
+    for (&key_bytes) |*b| b.* = knobs.byte();
+    var other_bytes = key_bytes;
+    other_bytes[knobs.ranged(0, 31)] ^= @as(u8, 1) << @intCast(knobs.ranged(0, 7));
+
+    var es256: EcdsaP256Sha256.KeyPair = undefined;
+    var ed: Ed25519.KeyPair = undefined;
+    var signing: SigningKey = undefined;
+    var other_key: Key = undefined;
+    var verify_key: Key = undefined;
+    switch (knobs.ranged(0, 4)) {
+        0 => {
+            signing = .{ .hs256 = key_bytes[0..32] };
+            other_key = .{ .hmac = other_bytes[0..32] };
+        },
+        1 => {
+            signing = .{ .hs384 = key_bytes[0..48] };
+            other_key = .{ .hmac = other_bytes[0..48] };
+        },
+        2 => {
+            signing = .{ .hs512 = &key_bytes };
+            other_key = .{ .hmac = &other_bytes };
+        },
+        3 => {
+            ed = try Ed25519.KeyPair.generateDeterministic(key_bytes[0..32].*);
+            const ed2 = try Ed25519.KeyPair.generateDeterministic(other_bytes[0..32].*);
+            signing = .{ .ed25519 = &ed };
+            other_key = .{ .ed25519 = ed2.public_key };
+        },
+        else => {
+            es256 = try EcdsaP256Sha256.KeyPair.generateDeterministic(key_bytes[0..32].*);
+            const es2 = try EcdsaP256Sha256.KeyPair.generateDeterministic(other_bytes[0..32].*);
+            signing = .{ .es256 = &es256 };
+            other_key = .{ .ecdsa_p256 = es2.public_key };
+        },
+    }
+    verify_key = signing.verificationKey();
+    switch (signing) {
+        .hs256, .hs384, .hs512 => SignVerifyMark.mark(.hmac),
+        else => SignVerifyMark.mark(.asymmetric),
+    }
+
+    const token = try encodeJson(gpa, "{\"iss\":\"i\",\"aud\":\"a\",\"exp\":4102444800}", signing, .{});
+    defer gpa.free(token);
+    const opts: Options = .{ .now_s = 1_700_000_000, .issuer = .{ .required = "i" }, .audience = .{ .required = "a" } };
+    var ok = parseAndVerify(gpa, token, verify_key, opts) catch return error.GenuineTokenRefused;
+    ok.deinit();
+    SignVerifyMark.mark(.genuine_accepted);
+
+    // The wrong key.
+    if (parseAndVerify(gpa, token, other_key, opts)) |p| {
+        var pp = p;
+        pp.deinit();
+        return error.WrongKeyAccepted;
+    } else |_| {}
+
+    // One flipped octet, anywhere (the text of the header and payload is what
+    // the signature covers, so even their last, padding-bit character counts;
+    // in the signature segment the last character is skipped, its low bits
+    // being unused).
+    const last_dot = std.mem.lastIndexOfScalar(u8, token, '.').?;
+    const limit = token.len - 1;
+    const copy = try gpa.dupe(u8, token);
+    defer gpa.free(copy);
+    const at = knobs.ranged(0, @intCast(limit - 1));
+    if (copy[at] != '.') {
+        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        copy[at] = alphabet[(std.mem.indexOfScalar(u8, alphabet, copy[at]).? + 1) % alphabet.len];
+        if (parseAndVerify(gpa, copy, verify_key, opts)) |p| {
+            var pp = p;
+            pp.deinit();
+            return error.FlippedTokenAccepted;
+        } else |_| {}
+    }
+    // A truncation (any shorter prefix), and the signature dropped.
+    const cut = knobs.ranged(0, @intCast(token.len - 1));
+    if (parseAndVerify(gpa, token[0..cut], verify_key, opts)) |p| {
+        var pp = p;
+        pp.deinit();
+        return error.TruncatedTokenAccepted;
+    } else |_| {}
+    if (parseAndVerify(gpa, token[0 .. last_dot + 1], verify_key, opts)) |p| {
+        var pp = p;
+        pp.deinit();
+        return error.UnsignedTokenAccepted;
+    } else |_| {}
+    SignVerifyMark.mark(.flipped_refused);
+}
+
 /// Token-endpoint bodies, in the format the length draw reads. The structured
 /// sweep below covers the member/value matrix; these are the DOCUMENT shapes it
 /// cannot reach — the required-member refusals, the container-level type
@@ -7713,7 +7867,19 @@ const token_response_seeds = [_][]const u8{
 };
 
 test "fuzz: parseTokenResponse never panics on arbitrary or near-valid token bodies" {
-    try testing.fuzz({}, fuzzParseTokenResponse, .{ .corpus = &token_response_seeds });
+    try testing.fuzz({}, fuzzParseTokenResponseSmith, .{ .corpus = &token_response_seeds });
+}
+
+test "fuzz driver: JWT_FUZZ (token response)" {
+    try fz.fuzz_driver.run(fuzzParseTokenResponse, .{ .prefix = "JWT_FUZZ", .name = "jwt-token-response" });
+}
+
+test "fuzz harness: token response, 300 seeds, reaches every outcome" {
+    try TokenResponseMark.reach(fuzzParseTokenResponse, "jwt-token-response", 300);
+}
+
+fn fuzzParseTokenResponseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseTokenResponse(std.testing.Smith, smith, testing.allocator);
 }
 
 /// Adversarial JSON values a hostile or broken OP could put in a
@@ -7754,17 +7920,18 @@ const token_response_members = [_][]const u8{
 ///       essentially never reach that region on its own, and it is where the
 ///       typed extraction actually lives, so the sweep is exhaustive rather
 ///       than smith-sampled — one iteration covers the whole table.
-fn fuzzParseTokenResponse(_: void, smith: *std.testing.Smith) !void {
+fn fuzzParseTokenResponse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [1024]u8 = undefined;
     {
-        const len: usize = smith.slice(&buf);
+        const len: usize = fz.drawInput(S, src, &buf, &token_response_seeds);
         // NB: a typed error here must NOT abandon the iteration — nearly every
         // random byte string is a parse error, and an early `return` would
         // silently skip the structured sweep below (the skip-as-pass shape).
-        if (parseTokenResponse(testing.allocator, buf[0..len])) |ok| {
+        if (parseTokenResponse(gpa, buf[0..len])) |ok| {
             var resp = ok;
             resp.deinit();
-        } else |_| {}
+            TokenResponseMark.mark(.raw_ok);
+        } else |_| TokenResponseMark.mark(.raw_refused);
     }
 
     // Valid filler for the members not under test, so the value under test is
@@ -7772,8 +7939,17 @@ fn fuzzParseTokenResponse(_: void, smith: *std.testing.Smith) !void {
     const filler = [token_response_members.len][]const u8{
         "\"at\"", "\"Bearer\"", "\"x.y.z\"", "3600", "\"rt\"", "\"openid\"", "1",
     };
+    // Under `Smith` the sweep is exhaustive (it never varies, so it runs once
+    // per corpus replay); under the driver each run takes ONE random
+    // (member, value) pair, so a run costs one parse and the budget buys
+    // variety rather than the same 133 parses again.
+    const sampled = S == fz.fuzz_driver.Rng;
+    const only_member: usize = if (sampled) src.index(token_response_members.len) else 0;
+    const only_value: usize = if (sampled) src.index(token_response_values.len) else 0;
     for (token_response_members, 0..) |_, under_test| {
-        for (token_response_values) |value| {
+        if (sampled and under_test != only_member) continue;
+        for (token_response_values, 0..) |value, value_at| {
+            if (sampled and value_at != only_value) continue;
             var w: Writer = .fixed(&buf);
             w.writeByte('{') catch continue;
             for (token_response_members, 0..) |name, i| {
@@ -7784,8 +7960,12 @@ fn fuzzParseTokenResponse(_: void, smith: *std.testing.Smith) !void {
                 w.writeAll(if (i == under_test) value else filler[i]) catch continue;
             }
             w.writeByte('}') catch continue;
-            var resp = parseTokenResponse(testing.allocator, w.buffered()) catch continue;
+            var resp = parseTokenResponse(gpa, w.buffered()) catch {
+                TokenResponseMark.mark(.swept_refused);
+                continue;
+            };
             resp.deinit();
+            TokenResponseMark.mark(.swept_ok);
         }
     }
 }

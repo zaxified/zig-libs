@@ -465,8 +465,23 @@ const header_seeds = [_][]const u8{
     fuzzseed.seed("\x00" ++ "\xff\xfe\x00\x80"), // bytes that are not text at all
 };
 
+const fz = @import("fuzz_test.zig");
+const HeaderMark = fz.Marker(enum { assembled_parsed, blob_parsed, blob_refused, optional_member });
+
 test "fuzz: parse never panics on arbitrary header JSON bytes" {
-    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &header_seeds });
+    try std.testing.fuzz({}, fuzzParseSmith, .{ .corpus = &header_seeds });
+}
+
+test "fuzz driver: JWE_FUZZ (header)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "JWE_FUZZ", .name = "jwe-header" });
+}
+
+test "fuzz harness: header, 400 seeds, reaches every outcome" {
+    try HeaderMark.reach(fuzzParse, "jwe-header", 400);
+}
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParse(std.testing.Smith, smith, std.testing.allocator);
 }
 
 /// Lowercase hex of up to `out.len / 2` payload octets. Hand-rolled because
@@ -511,8 +526,8 @@ fn buildHeaderJson(a: std.mem.Allocator, seed: []const u8) ?[]const u8 {
     return json.items;
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+fn fuzzParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
@@ -520,13 +535,20 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     // See `header_seeds` for what the `smith.value(bool)` knobs after
     // `smith.bytes` were worth on a corpus replay.
     var raw: [header_fuzz_buf_len]u8 = undefined;
-    const n: usize = smith.slice(&raw);
+    // Under the driver's `Rng` half of the draws are a corpus entry (the
+    // flag octet and payload of a seed) with 0-3 octets damaged.
+    const n: usize = fz.drawInput(S, src, &raw, &header_seeds);
     const seed = raw[0..n];
 
-    if (buildHeaderJson(a, seed)) |json| _ = parse(a, json) catch {};
+    if (buildHeaderJson(a, seed)) |json| {
+        if (parse(a, json)) |h| {
+            HeaderMark.mark(.assembled_parsed);
+            if (h.p2c != null or h.p2s != null or h.kid != null or h.epk != null) HeaderMark.mark(.optional_member);
+        } else |_| {}
+    }
     // The raw-bytes case still gets a share of the draws — it is what proves
     // the parser survives non-JSON at all.
-    _ = parse(a, if (n > 1) seed[1..] else seed[0..0]) catch return;
+    if (parse(a, if (n > 1) seed[1..] else seed[0..0])) |_| HeaderMark.mark(.blob_parsed) else |_| HeaderMark.mark(.blob_refused);
 }
 
 test "corpus: every header seed reaches the parser, and the optional members decoded are pinned" {

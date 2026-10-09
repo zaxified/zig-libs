@@ -894,6 +894,7 @@ test {
     _ = aeskw;
     _ = ecdhes;
     _ = @import("kat_rfc7516.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
 }
@@ -1123,12 +1124,27 @@ const token_seeds = [_][]const u8{
     fuzzseed.seedHex("03" ++ "0002" ++ "7b" ++ "0003" ++ "22" ++ "0004" ++ "61"), // '{', '"', 'a' — pushing the header toward JSON-ish
 };
 
+const fz = @import("fuzz_test.zig");
+const DecryptMark = fz.Marker(enum { genuine_accepted, framing_refused, past_framing_refused });
+const RoundtripMark = fz.Marker(enum { dir, key_wrap, gcm_key_wrap, genuine_accepted, flipped_refused });
+
 test "fuzz: decryptCompact never panics on arbitrary compact tokens" {
-    try std.testing.fuzz({}, fuzzDecryptCompact, .{ .corpus = &token_seeds });
+    try std.testing.fuzz({}, fuzzDecryptCompactSmith, .{ .corpus = &token_seeds });
 }
 
-fn fuzzDecryptCompact(_: void, smith: *std.testing.Smith) !void {
-    const gpa = std.testing.allocator;
+test "fuzz driver: JWE_FUZZ (decrypt)" {
+    try fz.fuzz_driver.run(fuzzDecryptCompact, .{ .prefix = "JWE_FUZZ", .name = "jwe-decrypt" });
+}
+
+test "fuzz harness: decrypt, 300 seeds, reaches every outcome" {
+    try DecryptMark.reach(fuzzDecryptCompact, "jwe-decrypt", 300);
+}
+
+fn fuzzDecryptCompactSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecryptCompact(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecryptCompact(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const key = [_]u8{0x2b} ** 16;
 
     // ⚠ This harness used to draw 512 uniform-random bytes and hand them
@@ -1144,21 +1160,121 @@ fn fuzzDecryptCompact(_: void, smith: *std.testing.Smith) !void {
     //
     // Start from a genuine token and corrupt it instead, so the framing is
     // valid by construction and the draws are spent on what happens past it.
-    const token = encryptCompact(gpa, .A128KW, .A128GCM, .{ .symmetric = &key }, "fuzz", "", seededForTest(), .{}) catch return;
+    const token = try encryptCompact(gpa, .A128KW, .A128GCM, .{ .symmetric = &key }, "fuzz", "", seededForTest(), .{});
     defer gpa.free(token);
     var buf: [512]u8 = undefined;
-    if (token.len > buf.len) return;
+    if (token.len > buf.len) return error.TokenOverBuffer;
     @memcpy(buf[0..token.len], token);
 
     // ⚠ ONE byte-first draw, read as a flip script. See `token_seeds` for what
     // the ranged draws were worth on a corpus replay.
     var script_buf: [128]u8 = undefined;
-    const script_len: usize = smith.slice(&script_buf);
+    const script_len: usize = src.slice(&script_buf);
     var script: fuzzseed.Cursor = .{ .bytes = script_buf[0..script_len] };
     applyFlips(&script, buf[0..token.len]);
 
-    const pt = decryptCompact(gpa, .{ .symmetric = &key }, buf[0..token.len], .{}) catch return;
-    gpa.free(pt);
+    // The genuine token opens (the oracle's other half).
+    {
+        const genuine = decryptCompact(gpa, .{ .symmetric = &key }, token, .{}) catch return error.GenuineTokenRefused;
+        defer gpa.free(genuine);
+        if (!std.mem.eql(u8, genuine, "fuzz")) return error.OpenedWrongPlaintext;
+        DecryptMark.mark(.genuine_accepted);
+    }
+    // A token the flips left unchanged is the genuine one and must open; a
+    // changed one may only be accepted if it still carries the SAME plaintext
+    // (a base64url trailing-bits flip is not a forgery) -- never another one.
+    const unchanged = std.mem.eql(u8, buf[0..token.len], token);
+    const pt = decryptCompact(gpa, .{ .symmetric = &key }, buf[0..token.len], .{}) catch |e| {
+        if (unchanged) return error.GenuineTokenRefused;
+        switch (e) {
+            error.MalformedToken, error.InvalidBase64 => DecryptMark.mark(.framing_refused),
+            else => DecryptMark.mark(.past_framing_refused),
+        }
+        return;
+    };
+    defer gpa.free(pt);
+    if (!std.mem.eql(u8, pt, "fuzz")) return error.DamagedTokenOpenedToOtherPlaintext;
+}
+
+test "fuzz driver: JWE_FUZZ (encrypt + decrypt round trip)" {
+    try fz.fuzz_driver.run(fuzzRoundtrip, .{ .prefix = "JWE_FUZZ", .name = "jwe-roundtrip" });
+}
+
+test "fuzz harness: round trip, 200 seeds, reaches every outcome" {
+    try RoundtripMark.reach(fuzzRoundtrip, "jwe-roundtrip", 200);
+}
+
+test "fuzz: a genuine JWE opens and a flipped one is refused" {
+    try std.testing.fuzz({}, fuzzRoundtripSmith, .{});
+}
+
+fn fuzzRoundtripSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRoundtrip(std.testing.Smith, smith, std.testing.allocator);
+}
+
+/// `alg` x `enc` knob-chosen, key and plaintext from the source: what
+/// `encryptCompact` made `decryptCompact` opens to the same plaintext, and the
+/// same token with one octet changed (not a segment's last, whose base64url
+/// unused bits are not authenticated) is REFUSED, as is the wrong key.
+fn fuzzRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const algs = [_]Alg{ .dir, .A128KW, .A256KW, .A128GCMKW, .A256GCMKW };
+    // The 192-bit content encryptions are unsupported by design (std AES-192 gap, see `enc.zig`).
+    const encs = [_]Enc{ .A128GCM, .A256GCM, .@"A128CBC-HS256", .@"A256CBC-HS512" };
+    const key_alg = algs[src.index(algs.len)];
+    const content_enc = encs[src.index(encs.len)];
+    switch (key_alg) {
+        .dir => RoundtripMark.mark(.dir),
+        .A128GCMKW, .A256GCMKW => RoundtripMark.mark(.gcm_key_wrap),
+        else => RoundtripMark.mark(.key_wrap),
+    }
+    var key_buf: [64]u8 = undefined;
+    src.bytes(&key_buf);
+    const key_len: usize = switch (key_alg) {
+        .dir => content_enc.cekLen().?,
+        .A128KW, .A128GCMKW => 16,
+        else => 32,
+    };
+    const key = key_buf[0..key_len];
+    var pt_buf: [40]u8 = undefined;
+    src.bytes(&pt_buf);
+    const pt = pt_buf[0..src.valueRangeAtMost(u8, 0, pt_buf.len)];
+
+    const token = try encryptCompact(gpa, key_alg, content_enc, .{ .symmetric = key }, pt, "", seededForTest(), .{});
+    defer gpa.free(token);
+    const opened = decryptCompact(gpa, .{ .symmetric = key }, token, .{}) catch return error.GenuineTokenRefused;
+    defer gpa.free(opened);
+    if (!std.mem.eql(u8, opened, pt)) return error.OpenedWrongPlaintext;
+    RoundtripMark.mark(.genuine_accepted);
+
+    const copy = try gpa.dupe(u8, token);
+    defer gpa.free(copy);
+    var at = src.index(copy.len - 1);
+    while (copy[at] == '.' or copy[at + 1] == '.') at = (at + 1) % (copy.len - 1);
+    copy[at] = if (copy[at] == 'A') 'B' else 'A';
+    if (decryptCompact(gpa, .{ .symmetric = key }, copy, .{})) |p| {
+        gpa.free(p);
+        return error.FlippedTokenAccepted;
+    } else |_| {}
+
+    var wrong: [64]u8 = key_buf;
+    const wrong_at = src.index(key_len);
+    const wrong_bit = src.index(8);
+    wrong[wrong_at] ^= @as(u8, 1) << @as(u3, @intCast(wrong_bit));
+    // A wrong key is refused -- except that in AES-CBC-HMAC only the MAC half
+    // of the key authenticates: a damaged AES half passes the tag and decrypts
+    // to garbage (valid padding about one time in 256). That is the
+    // construction, not a defect; what must never happen is the right
+    // plaintext from a wrong key.
+    if (decryptCompact(gpa, .{ .symmetric = wrong[0..key_len] }, token, .{})) |p| {
+        defer gpa.free(p);
+        if (std.mem.eql(u8, p, pt)) return error.WrongKeyOpenedToThePlaintext;
+        const aes_half_only = switch (key_alg) {
+            .dir => !content_enc.isGcm() and wrong_at >= key_len / 2,
+            else => false,
+        };
+        if (!aes_half_only) return error.WrongKeyAccepted;
+    } else |_| {}
+    RoundtripMark.mark(.flipped_refused);
 }
 
 /// At least one flip: zero flips is the valid token, which the round-trip

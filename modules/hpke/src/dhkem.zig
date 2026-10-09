@@ -1108,46 +1108,127 @@ fn p384AuthDecapSeeds(c: *P384Corpus) []const []const u8 {
 
 test "fuzz: P256Kem.decap never panics on arbitrary enc bytes" {
     var corpus: P256Corpus = .{};
-    try testing.fuzz({}, fuzzP256Decap, .{ .corpus = p256DecapSeeds(&corpus) });
+    try testing.fuzz({}, fuzzP256DecapSmith, .{ .corpus = p256DecapSeeds(&corpus) });
 }
 
 // Generic over the SEC1-encoded width (comptime N) so P384Kem's fuzz
 // harness below can reuse it verbatim at Npk=97 rather than duplicating
 // the byte-biasing recipe.
-fn fuzzedSec1Bytes(comptime N: usize, smith: *std.testing.Smith, buf: *[N]u8) void {
-    smith.bytes(buf);
-    buf[0] = switch (smith.valueRangeAtMost(u8, 0, 4)) {
+//
+// Under the driver's `Rng` (random bytes are never a point on the curve) half of
+// the draws are instead a GENUINE public key of `Kem` with 0-3 octets damaged,
+// so `fromSec1`'s accept branch and the multiplications behind it run.
+fn fuzzedSec1Bytes(comptime Kem: type, comptime S: type, src: *S, buf: *[Kem.Npk]u8) void {
+    if (S == fz.fuzz_driver.Rng and src.valueRangeAtMost(u8, 0, 3) != 0) {
+        var ikm: [32]u8 = undefined;
+        src.bytes(&ikm);
+        var kp: Kem.KeyPair = undefined;
+        Kem.deriveKeyPair(&kp, &ikm);
+        buf.* = kp.public_key;
+        // Two in three stay undamaged: auth mode needs BOTH points accepted.
+        if (src.valueRangeAtMost(u8, 0, 2) == 0) {
+            for (0..src.valueRangeAtMost(u8, 1, 3)) |_| buf[src.index(buf.len)] = src.value(u8);
+        }
+        return;
+    }
+    src.bytes(buf);
+    buf[0] = switch (src.valueRangeAtMost(u8, 0, 4)) {
         0 => 0,
         1 => 2,
         2 => 3,
         3 => 4,
-        else => smith.value(u8),
+        else => src.value(u8),
     };
 }
 
-fn fuzzP256Decap(_: void, smith: *std.testing.Smith) !void {
-    var skR: P256Kem.KeyPair = undefined;
-    P256Kem.deriveKeyPair(&skR, "hpke fuzz decap receiver");
-    var enc: P256Kem.EncappedKey = undefined;
-    fuzzedSec1Bytes(P256Kem.Npk, smith, &enc);
-    var ss: [P256Kem.Nsecret]u8 = undefined;
-    P256Kem.decap(&ss, enc, &skR) catch {};
+const fz = @import("fuzz_test.zig");
+const KemMark = fz.Marker(enum { accepted, refused, genuine_agrees, tamper_diverges });
+
+/// The receiver's half of the oracle: an `enc` the module's own `encap`
+/// produced decaps to the sender's shared secret, and one damaged octet of it
+/// yields a refusal or a DIFFERENT secret -- never the same one.
+fn genuineDecap(comptime Kem: type, comptime S: type, src: *S, skR: *const Kem.KeyPair, auth: bool) !void {
+    var ikm: [32]u8 = undefined;
+    src.bytes(&ikm);
+    var eph: Kem.KeyPair = undefined;
+    Kem.deriveKeyPair(&eph, &ikm);
+    ikm[0] ^= 0x80;
+    var skS: Kem.KeyPair = undefined;
+    Kem.deriveKeyPair(&skS, &ikm);
+    var sent: Kem.Encapped = undefined;
+    if (auth) try Kem.authEncapDeterministic(&sent, skR.public_key, &skS, &eph) else try Kem.encapDeterministic(&sent, skR.public_key, &eph);
+    var got: [Kem.Nsecret]u8 = undefined;
+    const pk_s = skS.public_key;
+    if (auth) try Kem.authDecap(&got, sent.enc, skR, pk_s) else try Kem.decap(&got, sent.enc, skR);
+    if (!std.mem.eql(u8, &got, &sent.shared_secret)) return error.GenuineEncDecapsDiffers;
+    KemMark.mark(.genuine_agrees);
+
+    var bad = sent.enc;
+    bad[src.index(bad.len)] ^= @as(u8, 1) << @as(u3, @intCast(src.index(8)));
+    var bad_ss: [Kem.Nsecret]u8 = undefined;
+    const r = if (auth) Kem.authDecap(&bad_ss, bad, skR, pk_s) else Kem.decap(&bad_ss, bad, skR);
+    if (r) |_| {
+        if (std.mem.eql(u8, &bad_ss, &sent.shared_secret)) return error.DamagedEncGivesSameSecret;
+    } else |_| {}
+    if (auth) { // the wrong sender key
+        var other_ss: [Kem.Nsecret]u8 = undefined;
+        if (Kem.authDecap(&other_ss, sent.enc, skR, eph.public_key)) |_| {
+            if (std.mem.eql(u8, &other_ss, &sent.shared_secret)) return error.WrongSenderGivesSameSecret;
+        } else |_| {}
+    }
+    KemMark.mark(.tamper_diverges);
+}
+
+fn decapHarness(comptime Kem: type, comptime key_label: []const u8, comptime auth: bool, comptime S: type, src: *S) !void {
+    var skR: Kem.KeyPair = undefined;
+    Kem.deriveKeyPair(&skR, key_label);
+    var enc: Kem.EncappedKey = undefined;
+    fuzzedSec1Bytes(Kem, S, src, &enc);
+    var pkS: Kem.PublicKey = undefined;
+    if (auth) fuzzedSec1Bytes(Kem, S, src, &pkS);
+    var ss: [Kem.Nsecret]u8 = undefined;
+    const r = if (auth) Kem.authDecap(&ss, enc, &skR, pkS) else Kem.decap(&ss, enc, &skR);
+    if (r) |_| KemMark.mark(.accepted) else |_| KemMark.mark(.refused);
+    try genuineDecap(Kem, S, src, &skR, auth);
+}
+
+fn fuzzP256DecapSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzP256Decap(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz driver: HPKE_FUZZ (P-256 decap)" {
+    try fz.fuzz_driver.run(fuzzP256Decap, .{ .prefix = "HPKE_FUZZ", .name = "hpke-p256-decap" });
+}
+
+test "fuzz harness: P-256 decap, 60 seeds, reaches every outcome" {
+    try KemMark.reach(fuzzP256Decap, "hpke-p256-decap", 60);
+}
+
+fn fuzzP256Decap(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    try decapHarness(P256Kem, "hpke fuzz decap receiver", false, S, src);
 }
 
 test "fuzz: P256Kem.authDecap never panics on arbitrary enc/pkS bytes" {
     var corpus: P256Corpus = .{};
-    try testing.fuzz({}, fuzzP256AuthDecap, .{ .corpus = p256AuthDecapSeeds(&corpus) });
+    try testing.fuzz({}, fuzzP256AuthDecapSmith, .{ .corpus = p256AuthDecapSeeds(&corpus) });
 }
 
-fn fuzzP256AuthDecap(_: void, smith: *std.testing.Smith) !void {
-    var skR: P256Kem.KeyPair = undefined;
-    P256Kem.deriveKeyPair(&skR, "hpke fuzz auth-decap receiver");
-    var enc: P256Kem.EncappedKey = undefined;
-    fuzzedSec1Bytes(P256Kem.Npk, smith, &enc);
-    var pkS: P256Kem.PublicKey = undefined;
-    fuzzedSec1Bytes(P256Kem.Npk, smith, &pkS);
-    var ss: [P256Kem.Nsecret]u8 = undefined;
-    P256Kem.authDecap(&ss, enc, &skR, pkS) catch {};
+fn fuzzP256AuthDecapSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzP256AuthDecap(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz driver: HPKE_FUZZ (P-256 authDecap)" {
+    try fz.fuzz_driver.run(fuzzP256AuthDecap, .{ .prefix = "HPKE_FUZZ", .name = "hpke-p256-auth-decap" });
+}
+
+test "fuzz harness: P-256 authDecap, 60 seeds, reaches every outcome" {
+    try KemMark.reach(fuzzP256AuthDecap, "hpke-p256-auth-decap", 60);
+}
+
+fn fuzzP256AuthDecap(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    try decapHarness(P256Kem, "hpke fuzz auth-decap receiver", true, S, src);
 }
 
 // ── fuzz: P384Kem.decap/authDecap never panic on arbitrary enc/pkS bytes ──
@@ -1157,32 +1238,46 @@ fn fuzzP256AuthDecap(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: P384Kem.decap never panics on arbitrary enc bytes" {
     var corpus: P384Corpus = .{};
-    try testing.fuzz({}, fuzzP384Decap, .{ .corpus = p384DecapSeeds(&corpus) });
+    try testing.fuzz({}, fuzzP384DecapSmith, .{ .corpus = p384DecapSeeds(&corpus) });
 }
 
-fn fuzzP384Decap(_: void, smith: *std.testing.Smith) !void {
-    var skR: P384Kem.KeyPair = undefined;
-    P384Kem.deriveKeyPair(&skR, "hpke fuzz p384 decap receiver");
-    var enc: P384Kem.EncappedKey = undefined;
-    fuzzedSec1Bytes(P384Kem.Npk, smith, &enc);
-    var ss: [P384Kem.Nsecret]u8 = undefined;
-    P384Kem.decap(&ss, enc, &skR) catch {};
+fn fuzzP384DecapSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzP384Decap(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz driver: HPKE_FUZZ (P-384 decap)" {
+    try fz.fuzz_driver.run(fuzzP384Decap, .{ .prefix = "HPKE_FUZZ", .name = "hpke-p384-decap", .scale = 20 });
+}
+
+test "fuzz harness: P-384 decap, 40 seeds, reaches every outcome" {
+    try KemMark.reach(fuzzP384Decap, "hpke-p384-decap", 40);
+}
+
+fn fuzzP384Decap(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    try decapHarness(P384Kem, "hpke fuzz p384 decap receiver", false, S, src);
 }
 
 test "fuzz: P384Kem.authDecap never panics on arbitrary enc/pkS bytes" {
     var corpus: P384Corpus = .{};
-    try testing.fuzz({}, fuzzP384AuthDecap, .{ .corpus = p384AuthDecapSeeds(&corpus) });
+    try testing.fuzz({}, fuzzP384AuthDecapSmith, .{ .corpus = p384AuthDecapSeeds(&corpus) });
 }
 
-fn fuzzP384AuthDecap(_: void, smith: *std.testing.Smith) !void {
-    var skR: P384Kem.KeyPair = undefined;
-    P384Kem.deriveKeyPair(&skR, "hpke fuzz p384 auth-decap receiver");
-    var enc: P384Kem.EncappedKey = undefined;
-    fuzzedSec1Bytes(P384Kem.Npk, smith, &enc);
-    var pkS: P384Kem.PublicKey = undefined;
-    fuzzedSec1Bytes(P384Kem.Npk, smith, &pkS);
-    var ss: [P384Kem.Nsecret]u8 = undefined;
-    P384Kem.authDecap(&ss, enc, &skR, pkS) catch {};
+fn fuzzP384AuthDecapSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzP384AuthDecap(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz driver: HPKE_FUZZ (P-384 authDecap)" {
+    try fz.fuzz_driver.run(fuzzP384AuthDecap, .{ .prefix = "HPKE_FUZZ", .name = "hpke-p384-auth-decap", .scale = 20 });
+}
+
+test "fuzz harness: P-384 authDecap, 40 seeds, reaches every outcome" {
+    try KemMark.reach(fuzzP384AuthDecap, "hpke-p384-auth-decap", 40);
+}
+
+fn fuzzP384AuthDecap(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    try decapHarness(P384Kem, "hpke fuzz p384 auth-decap receiver", true, S, src);
 }
 
 /// Counts one corpus's worth of `fuzzedSec1Bytes` draws through the real
@@ -1234,7 +1329,7 @@ test "corpus: the P-256 enc/pkS seeds reach decap, and the counts are pinned" {
     {
         var smith: std.testing.Smith = .{ .in = "" };
         var enc: P256Kem.EncappedKey = undefined;
-        fuzzedSec1Bytes(P256Kem.Npk, &smith, &enc);
+        fuzzedSec1Bytes(P256Kem, std.testing.Smith, &smith, &enc);
         try testing.expectEqual(@as(u8, 0), enc[0]);
         try testing.expectError(error.DeserializeError, blk: {
             var o: [P256Kem.Nsecret]u8 = undefined;
@@ -1245,7 +1340,7 @@ test "corpus: the P-256 enc/pkS seeds reach decap, and the counts are pinned" {
     for (p256DecapSeeds(&decap_corpus)) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var enc: P256Kem.EncappedKey = undefined;
-        fuzzedSec1Bytes(P256Kem.Npk, &smith, &enc);
+        fuzzedSec1Bytes(P256Kem, std.testing.Smith, &smith, &enc);
         d.tags[enc[0]] = true;
         var ss: [P256Kem.Nsecret]u8 = undefined;
         P256Kem.decap(&ss, enc, &skR) catch continue;
@@ -1262,9 +1357,9 @@ test "corpus: the P-256 enc/pkS seeds reach decap, and the counts are pinned" {
     for (p256AuthDecapSeeds(&auth_corpus)) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var enc: P256Kem.EncappedKey = undefined;
-        fuzzedSec1Bytes(P256Kem.Npk, &smith, &enc);
+        fuzzedSec1Bytes(P256Kem, std.testing.Smith, &smith, &enc);
         var pkS: P256Kem.PublicKey = undefined;
-        fuzzedSec1Bytes(P256Kem.Npk, &smith, &pkS);
+        fuzzedSec1Bytes(P256Kem, std.testing.Smith, &smith, &pkS);
         a.tags[enc[0]] = true;
         a.tags[pkS[0]] = true;
         var ss: [P256Kem.Nsecret]u8 = undefined;
@@ -1284,7 +1379,7 @@ test "corpus: the P-384 enc/pkS seeds reach decap, and the counts are pinned" {
     for (p384DecapSeeds(&decap_corpus)) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var enc: P384Kem.EncappedKey = undefined;
-        fuzzedSec1Bytes(P384Kem.Npk, &smith, &enc);
+        fuzzedSec1Bytes(P384Kem, std.testing.Smith, &smith, &enc);
         d.tags[enc[0]] = true;
         var ss: [P384Kem.Nsecret]u8 = undefined;
         P384Kem.decap(&ss, enc, &skR) catch continue;
@@ -1301,9 +1396,9 @@ test "corpus: the P-384 enc/pkS seeds reach decap, and the counts are pinned" {
     for (p384AuthDecapSeeds(&auth_corpus)) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var enc: P384Kem.EncappedKey = undefined;
-        fuzzedSec1Bytes(P384Kem.Npk, &smith, &enc);
+        fuzzedSec1Bytes(P384Kem, std.testing.Smith, &smith, &enc);
         var pkS: P384Kem.PublicKey = undefined;
-        fuzzedSec1Bytes(P384Kem.Npk, &smith, &pkS);
+        fuzzedSec1Bytes(P384Kem, std.testing.Smith, &smith, &pkS);
         a.tags[enc[0]] = true;
         a.tags[pkS[0]] = true;
         var ss: [P384Kem.Nsecret]u8 = undefined;

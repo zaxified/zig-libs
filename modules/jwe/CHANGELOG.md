@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `JWE_FUZZ` over the existing harnesses (`decryptCompact` over flipped tokens, the header parser, plus a compact encrypt/decrypt round trip (`dir`, AES-KW, AES-GCM-KW with the 128/256-bit content encryptions): genuine opens, a flipped octet refused).
 - **2026-10-09** — **BREAKING:** `KeyMaterial.rsa_private` is now `*const rsa.SecretKey` (borrowed, like `ec_private`; was a by-value copy of the whole RSA key per frame): `.{ .rsa_private = &sk }`. `decryptCompact`, `alg.pbes2DeriveKek` and `alg.rsaOaepWrap` now run under a burn (`content_burn`, `kdf_burn`, `rsa_wrap_burn`; `burn.run` added). `enc.gcm` is no longer `pub` (only `enc.encrypt` / `decrypt` used it). `encryptCompact`'s by-value `KeyMaterial` is marked (it holds only borrowed slices and pointers now). Probe: `src/stackprobe2_test.zig`.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** a ReleaseFast stack probe
   (`src/stackprobe_test.zig`, new) found, 5 calls each, after: `ecdhes.generateEphemeral(.p256)`
