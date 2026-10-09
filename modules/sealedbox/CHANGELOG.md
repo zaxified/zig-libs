@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **NO API CHANGE, faster:** X25519 now comes from the sibling `ct25519`
+  (comb base-point multiplication for the ephemeral key and `publicFromSecret`/
+  `keyPairFromSecretKey`, MULX/ADX ladder for the shared secret on x86-64) instead of
+  std's ladder; byte-exact output (PyNaCl KATs, libsodium differential in the bench).
+  seal 64 B ~1.29x → ~0.75x libsodium. New dependency: `ct25519`.
 - **2026-10-09** — **BREAKING:** dead-stack sweep (`CONVENTIONS.md` §2.1.1). `open` and `openAlloc`
   take the keypair by pointer (`kp: *const KeyPair`); `publicFromSecret` takes `sk: *const [32]u8`;
   `keyPairFromSecretKey(out: *KeyPair, sk: *const [32]u8) !void` writes into `out` (zeroed on error)

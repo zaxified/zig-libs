@@ -4,7 +4,8 @@
 //! Encrypt to a recipient's X25519 public key with **no sender key**: a fresh
 //! ephemeral keypair is generated per message, so the recipient cannot identify
 //! the sender. The construction is libsodium's `crypto_box_seal`, byte for
-//! byte: X25519 and BLAKE2b are std's; XSalsa20-Poly1305 is
+//! byte: BLAKE2b is std's, X25519 the sibling `ct25519`'s (comb base-point
+//! multiplication, MULX/ADX ladder; byte-exact with std's); XSalsa20-Poly1305 is
 //! `xsalsa20poly1305.zig`, a multi-block rewrite of std's (same output,
 //! differential-tested against std and pinned by the PyNaCl KATs), because
 //! std's one-block-at-a-time Salsa20 and Poly1305 held 64 KiB messages at
@@ -23,6 +24,10 @@
 
 const std = @import("std");
 const burn = @import("burn.zig");
+/// X25519 from the sibling `ct25519`: comb base-point multiplication for the
+/// ephemeral key and the MULX/ADX ladder for the shared secret (x86-64; std's
+/// ladder elsewhere). Byte-exact with std's `dh.X25519` (ct25519's own KATs).
+const X25519 = @import("ct25519").X25519;
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -37,7 +42,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant,
     .model_after = "libsodium crypto_box_seal / Go nacl/box",
-    .deps = .{},
+    .deps = .{"ct25519"}, // X25519: comb keygen + MULX ladder, byte-exact with std's
 };
 
 pub const SealedBox = std.crypto.nacl.SealedBox;
@@ -92,16 +97,39 @@ pub const OpenError = error{InvalidCiphertext} ||
 /// parsed off the wire) -- not just a pathological caller mistake.
 pub fn seal(io: std.Io, out: []u8, msg: []const u8, recipient_pk: [public_length]u8) SealError!void {
     if (out.len != msg.len + overhead) return error.InvalidBufferSize;
-    var ekp = KeyPair.generate(io);
-    defer std.crypto.secureZero(u8, &ekp.secret_key);
-    var shared = try std.crypto.nacl.Box.createSharedSecret(recipient_pk, ekp.secret_key);
+    var ekp: KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&ekp));
+    generateEphemeral(io, &ekp);
+    var shared: [secretbox.key_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &shared);
+    try sharedKey(&shared, &ekp.secret_key, recipient_pk);
     out[0..public_length].* = ekp.public_key;
     const tag = out[public_length..][0..secretbox.tag_length];
     secretbox.encrypt(out[overhead..], tag, msg, sealNonce(ekp.public_key, recipient_pk), shared);
 }
 
 const secretbox = @import("xsalsa20poly1305.zig");
+
+/// std's `X25519.KeyPair.generate` (the random seed IS the secret scalar), with
+/// the public key from ct25519's comb instead of std's ladder.
+fn generateEphemeral(io: std.Io, out: *KeyPair) void {
+    while (true) {
+        io.random(&out.secret_key);
+        X25519.recoverPublicKeyInto(&out.public_key, &out.secret_key) catch {
+            @branchHint(.unlikely);
+            continue;
+        };
+        return;
+    }
+}
+
+/// `std.crypto.nacl.Box.createSharedSecret`: HSalsa20(0, X25519(sk, pk)).
+fn sharedKey(out: *[secretbox.key_length]u8, sk: *const [secret_length]u8, pk: [public_length]u8) std.crypto.errors.IdentityElementError!void {
+    var dh: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &dh);
+    try X25519.scalarmultInto(&dh, sk, pk);
+    out.* = secretbox.hsalsa20(@splat(0), dh);
+}
 
 /// libsodium's sealed-box nonce: BLAKE2b-192(ephemeral_pk || recipient_pk).
 fn sealNonce(epk: [public_length]u8, pk: [public_length]u8) [secretbox.nonce_length]u8 {
@@ -137,8 +165,9 @@ fn openBody(out: []u8, sealed: []const u8, kp: *const KeyPair) OpenError!void {
     if (sealed.len < overhead or sealed.len != out.len + overhead)
         return error.InvalidCiphertext;
     const epk = sealed[0..public_length].*;
-    var shared = try std.crypto.nacl.Box.createSharedSecret(epk, kp.secret_key);
+    var shared: [secretbox.key_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &shared);
+    try sharedKey(&shared, &kp.secret_key, epk);
     const tag = sealed[public_length..][0..secretbox.tag_length].*;
     try secretbox.decrypt(out, sealed[overhead..], tag, sealNonce(epk, kp.public_key), shared);
 }
@@ -307,14 +336,16 @@ noinline fn burnCodecStack() void {
 }
 
 /// Recompute the public key from a stored secret key (X25519 base-point
-/// multiplication via std). The secret scalar alone fully round-trips a keypair.
+/// multiplication, ct25519's comb). The secret scalar alone fully round-trips a keypair.
 /// `error.IdentityElement` only for pathological all-weak scalars.
 pub fn publicFromSecret(sk: *const [secret_length]u8) error{IdentityElement}![public_length]u8 {
     return burn.run(burn.x25519_burn, error{IdentityElement}![public_length]u8, publicFromSecretBody, .{sk});
 }
 
 fn publicFromSecretBody(sk: *const [secret_length]u8) error{IdentityElement}![public_length]u8 {
-    return std.crypto.dh.X25519.recoverPublicKey(sk.*);
+    var pk: [public_length]u8 = undefined;
+    try X25519.recoverPublicKeyInto(&pk, sk);
+    return pk;
 }
 
 /// Rebuild a usable `KeyPair` from a stored secret key (public key is

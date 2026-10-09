@@ -38,11 +38,14 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   derive the nonce as `blake2b(ephemeral_pk ++ recipient_pk)` (the NaCl seal convention), box the
   plaintext, and prepend the ephemeral public key. `open` recomputes the nonce and unboxes; a
   forged/tampered ciphertext fails the Poly1305 tag (authenticated). Modeled after libsodium
-  `crypto_box_seal` / Go `nacl/box` — the public NaCl sealed-box standard. X25519 and BLAKE2b
-  come from `std.crypto`; XSalsa20-Poly1305 is this module's own (see the next point). Original work of the zig-libs
+  `crypto_box_seal` / Go `nacl/box` — the public NaCl sealed-box standard. BLAKE2b comes from
+  `std.crypto`, X25519 from the sibling `ct25519` (since 2026-10-09: comb base-point
+  multiplication for the ephemeral key, MULX/ADX ladder for the shared secret on x86-64, std's
+  ladder elsewhere; byte-exact with std's, held by ct25519's KATs and this module's PyNaCl and
+  libsodium differentials); HSalsa20 for the shared key is `xsalsa20poly1305.zig`'s; XSalsa20-Poly1305 is this module's own (see the next point). Original work of the zig-libs
   authors (MIT); no NOTICE entry needed (public NaCl standard, no third-party code).
 - **Allocation-free**, reentrant; keys are fixed-size arrays. `publicFromSecret` (by pointer) /
-  `keyPairFromSecretKey` recover a keypair from a stored secret (via std `X25519.recoverPublicKey`)
+  `keyPairFromSecretKey` recover a keypair from a stored secret (via ct25519's `X25519.recoverPublicKeyInto`)
   so a persisted secret round-trips. Serialization is fixed-size base64/hex with typed errors.
 - **One primitive implemented here, on purpose (2026-10-07):** XSalsa20-Poly1305
   (`src/xsalsa20poly1305.zig`, `src/poly1305.zig`). std's computes one Salsa20 block and one
@@ -52,8 +55,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   four interleaved Horner chains over r^4 with 26-bit limbs, the last batch multiplied by
   r^4..r^1. Same algorithms, same output: held by differential tests against std over every
   length/counter edge (in-file), the PyNaCl KATs and the 2000-case libsodium differential, and
-  measured constant-time (`seal` 0 / `open` 1 = accept/reject, below). X25519 and BLAKE2b are
-  still std's.
+  measured constant-time (`seal` 0 / `open` 1 = accept/reject, below). BLAKE2b is still std's;
+  X25519 is ct25519's (its own ctgrind rows).
 - **`openAlloc` allocates before the tag is verified** (audit finding L7): the output buffer is
   allocated first and freed via `errdefer` on a failed `open`. The amplification is bounded (1×:
   one allocation the size of the plaintext, freed immediately on failure, never leaked — see the
@@ -69,7 +72,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   full box with both keys, which this module does not expose, is needed for authenticated sender).
 - **No forward secrecy** beyond the per-message ephemeral key; recipient secret-key compromise
   decrypts all past sealed boxes to that key.
-- **No primitive weakening:** X25519/BLAKE2b are used exactly as `std.crypto` provides them and
+- **No primitive weakening:** BLAKE2b is used exactly as `std.crypto` provides it, X25519 is
+  ct25519's RFC 7748 implementation (byte-exact with std's), and
   XSalsa20-Poly1305 is the full 20-round construction, byte-identical to std's — no custom KDF, no reduced-round variant, no home-rolled AEAD. Nonce derivation is
   deterministic-but-collision-safe by construction (fresh ephemeral key per call ⇒ fresh nonce
   input per call); the module never accepts a caller-supplied nonce that could be reused.
@@ -118,6 +122,8 @@ against every future Zig release).
   those functions used, and a second, uninstrumented raw dead-stack scan that agrees with
   it) — both find the ephemeral secret (raw and clamped), the recipient's clamped long-term
   secret after `open`, and the derived shared key, all still present after the call returns.
+  Since 2026-10-09 X25519 is ct25519's, whose `recoverPublicKeyInto`/`scalarmultInto` burn
+  their own frames, and the shared key is derived in this module (`sharedKey`, zeroed).
 - **M4 — the only barrier against a zero shared secret is a single `std` check, shared by 19
   modules in this repository.** `X25519.scalarmult`'s `if (x2.isZero()) return
   error.IdentityElement;` lives at `lib/std/crypto/25519/curve25519.zig` in the Zig
@@ -141,7 +147,8 @@ closing E4 as "document, don't chase" applies here without modification.
 Review: the 2026-10-07 primitives (`xsalsa20poly1305.zig`, `poly1305.zig`) line by line (§ Backlog
 "Reviewed 2026-10-08", one HIGH fixed) and the new `seal`/`open` glue in `root.zig`: nonce =
 BLAKE2b-192(epk ‖ pk) as libsodium's `crypto_box_seal_nonce`, shared key = std's
-`Box.createSharedSecret` (X25519 + HSalsa20, rejects the identity), ephemeral secret and shared key
+`Box.createSharedSecret` (X25519 + HSalsa20, rejects the identity; since 2026-10-09 the same
+composition inlined as `sharedKey` over ct25519's X25519 and this module's HSalsa20), ephemeral secret and shared key
 zeroed, tag at `out[32..48]`, nothing written to `out` before the tag verifies; both error sets
 still the named ones. Re-checked independently: the final reduction's `|`-assembly of `acc` is
 sound — limb 1 can reach 2^26 only when the carry rippled through limbs 2–4, which leaves it small.
@@ -234,8 +241,9 @@ claimed this module "INHERITS std X25519 ... (NOT a finding)" citing a measureme
 ## Backlog / deferred
 
 - **Speed to parity (P2 needs ≤ 1x on every row)** *(bench 2026-10-07)*: the bulk rows were
-  fixed by the multi-block rewrite (2.3–2.4x → 1.14–1.21x); what is left is (a) X25519, std's,
-  ~1.25x libsodium on every message size — the 64 B rows are nothing else; (b) Salsa20 at
+  fixed by the multi-block rewrite (2.3–2.4x → 1.14–1.21x); (a) X25519 was std's, ~1.25x
+  libsodium on every message size — replaced by ct25519's on 2026-10-09 (seal 64 B ~0.75x,
+  open 64 B ~1.0–1.1x, noisy host; see Performance); (b) Salsa20 at
   2.4 GB/s is near the AVX2 limit of the 32-bit-lane schedule (rotations by 7/9/13/18 are no
   byte shuffle), so further bulk gain would come from fusing the Poly1305 pass into the
   encrypt loop (one read of the ciphertext instead of two). Not measured against the fastest

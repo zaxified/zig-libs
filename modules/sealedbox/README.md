@@ -4,8 +4,8 @@ NaCl `crypto_box_seal` — **anonymous-sender** public-key encryption. Encrypt t
 recipient's X25519 public key with no sender key (a fresh ephemeral keypair per
 message); the recipient cannot identify the sender.
 
-- Byte-compatible with libsodium's `crypto_box_seal`. X25519 and BLAKE2b come
-  from `std.crypto`; XSalsa20-Poly1305 is the module's own multi-block version
+- Byte-compatible with libsodium's `crypto_box_seal`. BLAKE2b comes from
+  `std.crypto`, X25519 from the sibling `ct25519` (byte-exact with std's, faster); XSalsa20-Poly1305 is the module's own multi-block version
   (same output as std's, ~2x faster on large messages; see SPEC.md § Performance).
 - **Model after:** libsodium `crypto_box_seal` / Go `nacl/box`.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant.
