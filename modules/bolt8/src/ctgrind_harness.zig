@@ -88,9 +88,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Deterministic keys: this harness must print the same bytes on every run,
     // because `scripts/checks/ctgrind.sh --check` pins a digest of what it printed.
     var ils: root.Secp256k1DH.KeyPair = undefined;
-    try root.Secp256k1DH.KeyPair.generateDeterministic(&ils, &([_]u8{0x11} ** 32));
+    try root.Secp256k1DH.KeyPair.generateDeterministicInto(&ils, &([_]u8{0x11} ** 32));
     var rls: root.Secp256k1DH.KeyPair = undefined;
-    try root.Secp256k1DH.KeyPair.generateDeterministic(&rls, &([_]u8{0x21} ** 32));
+    try root.Secp256k1DH.KeyPair.generateDeterministicInto(&rls, &([_]u8{0x21} ** 32));
     var prng = std.Random.DefaultPrng.init(0xb01783);
     const e: root.handshake.Ephemeral = .{ .seeded_for_test = prng.random() };
 
@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         taint(t, seed[0..]);
         const sd = reloadVolatile(32, &seed);
         var kp: root.Secp256k1DH.KeyPair = undefined;
-        try root.Secp256k1DH.KeyPair.generateDeterministic(&kp, &sd);
+        try root.Secp256k1DH.KeyPair.generateDeterministicInto(&kp, &sd);
         std.debug.print("pk={x}\n", .{kp.public_key});
     } else if (std.mem.eql(u8, target, "act3")) {
         // Responder Act Three: decrypts the peer's static key under temp_k2 and

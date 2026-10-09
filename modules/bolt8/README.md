@@ -36,7 +36,7 @@ const bolt8 = @import("bolt8");
 
 ```zig
 var kp: bolt8.Secp256k1DH.KeyPair = undefined; // secrets by pointer, results by `out`
-try bolt8.Secp256k1DH.KeyPair.generateDeterministic(&kp, &seed); // or .generate(&kp, random)
+try bolt8.Secp256k1DH.KeyPair.generateDeterministicInto(&kp, &seed); // or .generate(&kp, random)
 const shared = try bolt8.Secp256k1DH.dh(&my_secret, remote_pub_33_bytes); // [32]u8
 ```
 

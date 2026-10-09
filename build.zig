@@ -1273,7 +1273,24 @@ pub fn build(b: *std.Build) void {
             \\    inline for (comptime std.meta.declarations(T)) |d| {{
             \\        const f = @field(T, d.name);
             \\        _ = &f;
-            \\        if (depth > 0 and @TypeOf(f) == type) refAll(f, depth - 1);
+            \\        if (depth > 0 and @TypeOf(f) == type and !isStd(f)) refAll(f, depth - 1);
+            \\    }}
+            \\}}
+            \\
+            \\// A `std` type a module re-exports (`pub const Secp256k1 =
+            \\// std.crypto.ecc.Secp256k1;` in threshold_ecdsa) is not the module's
+            \\// code: walking into it only analyses std, and std's
+            \\// `secp256k1.scalar.Scalar.sqrt` is a deliberate `@compileError`
+            \\// (2026-10-09, red CI once threshold_ecdsa entered the closure).
+            \\// `@typeName` of a std type is its FILE path under std
+            \\// (`crypto.pcurves.secp256k1.Secp256k1`), so: the first segment names
+            \\// a std namespace and NOT one of the published module's own
+            \\// declarations (mls exports its own `crypto`).
+            \\fn isStd(comptime T: type) bool {{
+            \\    comptime {{
+            \\        const name = @typeName(T);
+            \\        const first = name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse return false];
+            \\        return @hasDecl(std, first) and !@hasDecl(published, first);
             \\    }}
             \\}}
             \\

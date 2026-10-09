@@ -83,8 +83,18 @@ pub const KeyPair = struct {
     /// Rejects `0` and out-of-range scalars, mirroring `bip340.SecretKey.
     /// fromBytes`. The key pair goes into `out` (zeroed on error); runs
     /// under a dead-stack burn.
-    pub fn generateDeterministic(out: *KeyPair, seed: *const [32]u8) SecretKeyError!void {
+    pub fn generateDeterministicInto(out: *KeyPair, seed: *const [32]u8) SecretKeyError!void {
         return burn.run(burn.ecc_burn, SecretKeyError!void, generateDeterministicBody, .{ out, seed });
+    }
+
+    /// The `noise.Suite(DH, ...)` shape — `KeyPair.generateDeterministic(seed)
+    /// !KeyPair`, which noise's generic `HandshakeState` and its tests call
+    /// (state.zig). By value, so the caller's result slot holds the pair:
+    /// bolt8's own code uses `generateDeterministicInto`.
+    pub fn generateDeterministic(seed: [32]u8) SecretKeyError!KeyPair {
+        var kp: KeyPair = undefined;
+        try generateDeterministicInto(&kp, &seed);
+        return kp;
     }
 
     fn generateDeterministicBody(out: *KeyPair, seed: *const [32]u8) SecretKeyError!void {
@@ -110,7 +120,7 @@ pub const KeyPair = struct {
         defer std.crypto.secureZero(u8, &seed);
         while (true) {
             random.bytes(&seed);
-            generateDeterministic(out, &seed) catch continue;
+            generateDeterministicInto(out, &seed) catch continue;
             return;
         }
     }
@@ -165,8 +175,9 @@ fn dhBody(secret_key: *const [32]u8, remote_pub: [33]u8) DhError![32]u8 {
 /// API-shape alias for `noise.Suite(DH,...)`'s `DH.scalarmult` — never
 /// actually called by this module (see the adapter-surface doc comment
 /// above); `dh()` is the entry point `handshake.zig` uses.
-pub fn scalarmult(secret_key: *const [32]u8, remote_pub: [33]u8) DhError![32]u8 {
-    return dh(secret_key, remote_pub);
+// secret-api-ok: `noise.Suite(DH, ...)` calls `DH.scalarmult(local.secret_key, remote_pub)` by value (noise state.zig); bolt8 itself calls the burned pointer form `dh()`.
+pub fn scalarmult(secret_key: [32]u8, remote_pub: [33]u8) DhError![32]u8 {
+    return dh(&secret_key, remote_pub);
 }
 
 // ── tests: real KATs from BOLT#8 Appendix A "Transport Test Vectors" ────

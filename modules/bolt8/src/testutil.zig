@@ -12,7 +12,7 @@ const transport = @import("transport.zig");
 
 pub fn tryKeyPair(seed: [32]u8) dh.SecretKeyError!dh.KeyPair {
     var kp: dh.KeyPair = undefined;
-    try dh.KeyPair.generateDeterministic(&kp, &seed);
+    try dh.KeyPair.generateDeterministicInto(&kp, &seed);
     return kp;
 }
 

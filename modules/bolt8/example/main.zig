@@ -29,9 +29,9 @@ pub fn main() !void {
     // module doc comment above for why this is explicitly NOT the
     // production arm of `Ephemeral`.
     var init_ls: bolt8.Secp256k1DH.KeyPair = undefined;
-    try bolt8.Secp256k1DH.KeyPair.generateDeterministic(&init_ls, &([_]u8{0x11} ** 32));
+    try bolt8.Secp256k1DH.KeyPair.generateDeterministicInto(&init_ls, &([_]u8{0x11} ** 32));
     var resp_ls: bolt8.Secp256k1DH.KeyPair = undefined;
-    try bolt8.Secp256k1DH.KeyPair.generateDeterministic(&resp_ls, &([_]u8{0x21} ** 32));
+    try bolt8.Secp256k1DH.KeyPair.generateDeterministicInto(&resp_ls, &([_]u8{0x21} ** 32));
 
     var init_rng = std.Random.DefaultPrng.init(0xC0FFEE);
     var resp_rng = std.Random.DefaultPrng.init(0xDECAFBAD);

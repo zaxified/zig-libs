@@ -312,8 +312,8 @@ fn buildNeedles(n: *Needles) !void {
 test "STACKPROBE (review 2026-10-08): no key or DH residue on the dead stack after any handshake or transport step" {
     if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
 
-    try dh.KeyPair.generateDeterministic(&i_ls, kv.init_ls_priv);
-    try dh.KeyPair.generateDeterministic(&r_ls, kv.resp_ls_priv);
+    try dh.KeyPair.generateDeterministicInto(&i_ls, kv.init_ls_priv);
+    try dh.KeyPair.generateDeterministicInto(&r_ls, kv.resp_ls_priv);
 
     var needles: Needles = .{};
     try buildNeedles(&needles);

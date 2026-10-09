@@ -196,8 +196,8 @@ pub fn main(init: std.process.Init) !u8 {
         .e_i = .{ .key = @splat(0x12) },
         .e_r = .{ .key = @splat(0x22) },
     };
-    try bolt8.Secp256k1DH.KeyPair.generateDeterministic(&keys.ls_i, &@as([32]u8, @splat(0x11)));
-    try bolt8.Secp256k1DH.KeyPair.generateDeterministic(&keys.ls_r, &@as([32]u8, @splat(0x21)));
+    try bolt8.Secp256k1DH.KeyPair.generateDeterministicInto(&keys.ls_i, &@as([32]u8, @splat(0x11)));
+    try bolt8.Secp256k1DH.KeyPair.generateDeterministicInto(&keys.ls_r, &@as([32]u8, @splat(0x21)));
 
     // Interop before timing: the same keys must give the same bytes.
     var acts: [166]u8 = undefined;

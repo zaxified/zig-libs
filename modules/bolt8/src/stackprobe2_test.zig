@@ -29,7 +29,7 @@ var result: root.HandshakeResult = undefined;
 test "STACKPROBE: bolt8 key creation, ECDH and direction init leave no secret in any frame" {
     try sp.skipUnlessOptimized();
 
-    _ = try P.run("KeyPair.generateDeterministic", dh.KeyPair.generateDeterministic, .{ &kp_out, kv.init_ls_priv }, &[_][]const u8{ kv.init_ls_priv, &kp_out.secret_key }, .{});
+    _ = try P.run("KeyPair.generateDeterministicInto", dh.KeyPair.generateDeterministicInto, .{ &kp_out, kv.init_ls_priv }, &[_][]const u8{ kv.init_ls_priv, &kp_out.secret_key }, .{});
 
     prng = std.Random.DefaultPrng.init(0xb018_0003);
     _ = try P.run("KeyPair.generate", dh.KeyPair.generate, .{ &kp_out, prng.random() }, &[_][]const u8{&kp_out.secret_key}, .{});
