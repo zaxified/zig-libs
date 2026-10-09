@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **Added:** passphrase-protected ed25519 and ecdsa-p256 OpenSSH keys load through
+  `HostKey.fromOpenSSH` / `AuthKey.fromOpenSSH` / `parseEd25519OpenSSH` / `parseEcdsaP256OpenSSH`
+  (bcrypt + aes256-ctr/-cbc via rsa's `opensshDecryptSection`, as Go's x/crypto/ssh reads every key
+  type); a wrong or missing passphrase is `error.IncorrectPassphrase` (was `error.UnsupportedCipher`
+  for any encrypted ed25519/ecdsa container). Fixtures from ssh-keygen 10.2p1; stack probe clean.
+  Go-parity plan P1, item 1.
 - **2026-10-09** — **FIX (key integrity):** `HostKey.fromOpenSSH` / `AuthKey.fromOpenSSH` for an RSA key
   cross-checked only the container's public `n` against the secret key, so a damaged public `e`
   loaded as a key whose own signatures do not verify under the advertised public key. `e` is

@@ -69,3 +69,50 @@ pub const ecdsa_p256_key =
 pub const ecdsa_p256_pub_b64 =
     "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCFDhy8iluimUa9wVoExb+NF" ++
     "52Q8aoDvzzHiwfpm5MGvnRwHOk7pL0RzHEllFDUQIb9o8+0BedHq7ZFG/zsIqVY=";
+
+// Passphrase-protected fixtures (2026-10-09), for the encrypted-container
+// loaders. Recipe (OpenSSH 10.2p1; 4 bcrypt rounds so a test run stays fast):
+//   ssh-keygen -t ed25519 -a 4 -N 'zig-libs test passphrase' -C enc-ed25519 -f k_ed_ctr
+//   ssh-keygen -t ecdsa -b 256 -a 4 -N 'zig-libs test passphrase' -C enc-ecdsa -f k_ec_ctr
+//   ssh-keygen -t ed25519 -a 4 -Z aes256-cbc -N 'zig-libs test passphrase' -C enc-ed25519-cbc -f k_ed_cbc
+pub const enc_passphrase = "zig-libs test passphrase";
+
+pub const ed25519_enc_ctr_key =
+    \\-----BEGIN OPENSSH PRIVATE KEY-----
+    \\b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABAACp5Po6
+    \\wevGELav/wD7UAAAAABAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIPtX6m7TBluXaQ/3
+    \\oT9G+7lKQo/fq9Mqlnkjj/KGJ0VVAAAAkOx+aNW8mTM8M9KzpdLxcQdmR9w85Uhs37Zg1i
+    \\xAgr2KFO//4wLPbWK0J3K10ven/2dO3MCO2yL0iRnwFiaYJucukNNpxv3UmSdfQOSEcSRz
+    \\YTvK0xgucBaKoKbS9aDuTPBmuCokpsO0/O1AzLdfsrmCPAU2jVY/pfFOIiXj9rZQ8KjpYm
+    \\OA4vdJYwKlwySnew==
+    \\-----END OPENSSH PRIVATE KEY-----
+    \\
+;
+pub const ed25519_enc_ctr_pub_b64 = "AAAAC3NzaC1lZDI1NTE5AAAAIPtX6m7TBluXaQ/3oT9G+7lKQo/fq9Mqlnkjj/KGJ0VV";
+
+pub const ecdsa_p256_enc_ctr_key =
+    \\-----BEGIN OPENSSH PRIVATE KEY-----
+    \\b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABA1DBK1M7
+    \\EnXY7RRr1mqpyKAAAABAAAAAEAAABoAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlz
+    \\dHAyNTYAAABBBFoWEw5n9h7aJ0kLFCysEaq1IKFIGfRcrFuFpL+qfZ6jI+a0l15pxr6EZF
+    \\peyeMTcDCCQiDMCOdQ/OFYmoh62NcAAACwBSz0fiZ0xEIxZLqpf4NpDosv0eG9vlM9ZIpL
+    \\Op6NdSLjQw3Xz9+s69z1WKZgY/KfwwSCJcxWpa9HtTfOobTTyzlwF1xkvtxXFXH4BubDf7
+    \\r9vqcznfeIGBvVCrUAdprJ3r/ox8/v5OIGScuM1h8NuB0XJGIWayWU0KTIiHOJkSFmfxEC
+    \\YtB92nKowk255cZlVOJNE2pyYYDe8bO4YvdwG1tQ6PBzpO+rx+STEXj/+18=
+    \\-----END OPENSSH PRIVATE KEY-----
+    \\
+;
+pub const ecdsa_p256_enc_ctr_pub_b64 = "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBFoWEw5n9h7aJ0kLFCysEaq1IKFIGfRcrFuFpL+qfZ6jI+a0l15pxr6EZFpeyeMTcDCCQiDMCOdQ/OFYmoh62Nc=";
+
+pub const ed25519_enc_cbc_key =
+    \\-----BEGIN OPENSSH PRIVATE KEY-----
+    \\b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jYmMAAAAGYmNyeXB0AAAAGAAAABBLHD6R+D
+    \\8SdiV15fyIAeE7AAAABAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIEq8T4lwqJnsth2z
+    \\VWfVYPezBwn3eAW27HziuxxfgpFSAAAAoDVXlMl5rpmjHKFpZzwbUMKw8A4ZcF4kICbC4Z
+    \\iJ7UgZj027jGchq3b5VVvF2ZWXWKT9HhLSSo1LRaOv2Efb4vqY3AHhH1FcGyihUR0XARwU
+    \\e91EiUiTliYYKN78YzxMUv6E1hOlp+mmHzX5F2fTwJQoRsl2SE6kKXKfaaS+EybVIhFvOC
+    \\wXgPSCblxoVA6t/fvIytLj6soZp1GfHSiCjk8=
+    \\-----END OPENSSH PRIVATE KEY-----
+    \\
+;
+pub const ed25519_enc_cbc_pub_b64 = "AAAAC3NzaC1lZDI1NTE5AAAAIEq8T4lwqJnsth2zVWfVYPezBwn3eAW27HziuxxfgpFS";

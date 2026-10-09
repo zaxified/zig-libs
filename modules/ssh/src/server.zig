@@ -162,9 +162,9 @@ pub const HostKey = union(enum) {
     /// the rsa-sha2-* variant to negotiation, the container does not encode
     /// it — flip `.hash` after loading for `rsa-sha2-512`). `"ssh-ed25519"`
     /// routes to `parseEd25519OpenSSH`, `"ecdsa-sha2-nistp256"` to
-    /// `parseEcdsaP256OpenSSH` (both unencrypted containers only — real
-    /// deployed host keys are unencrypted; an encrypted container of either
-    /// type is rejected with `error.UnsupportedCipher`).
+    /// `parseEcdsaP256OpenSSH`; all three key types read plain and
+    /// passphrase-protected containers (bcrypt rounds capped at
+    /// `rsa.max_openssh_kdf_rounds`, as in Go's x/crypto/ssh).
     ///
     /// The key is written to `out` (no copy of it is returned through the
     /// stack); on error `out` is zeroed.
@@ -213,11 +213,11 @@ pub const HostKey = union(enum) {
         }
         if (std.mem.eql(u8, key_type, "ssh-ed25519")) {
             out.* = .{ .ed25519 = undefined };
-            return parseEd25519Body(&out.ed25519, bin);
+            return parseEd25519Body(&out.ed25519, bin, passphrase orelse "");
         }
         if (std.mem.eql(u8, key_type, "ecdsa-sha2-nistp256")) {
             out.* = .{ .ecdsa_p256 = undefined };
-            return parseEcdsaP256Body(&out.ecdsa_p256, bin);
+            return parseEcdsaP256Body(&out.ecdsa_p256, bin, passphrase orelse "");
         }
         return error.UnsupportedKeyType;
     }
@@ -387,11 +387,13 @@ fn parseContainerHeader(bin: []const u8) HostKey.FromOpenSSHError!ContainerHeade
     };
 }
 
-/// Parse an ed25519 private key from an **unencrypted** openssh-key-v1
-/// container (cipher/kdf `"none"` — which is what real deployed host keys
-/// like `/etc/ssh/ssh_host_ed25519_key` use). An encrypted container is
-/// rejected with `error.UnsupportedCipher` (`passphrase` is accepted for
-/// signature compatibility but never consumed).
+/// Parse an ed25519 private key from an openssh-key-v1 container, plain
+/// (cipher/kdf `"none"`, what deployed host keys like
+/// `/etc/ssh/ssh_host_ed25519_key` use) or passphrase-protected (bcrypt +
+/// aes256-ctr/-cbc, `ssh-keygen -N`; since 2026-10-09, decrypted by the
+/// sibling `rsa` module's `opensshDecryptSection` as Go's x/crypto/ssh
+/// does for every key type). A wrong or empty passphrase is
+/// `error.IncorrectPassphrase`.
 ///
 /// Private-keys section layout (all RFC 4251 §5 primitives): `uint32`
 /// checkint1 == `uint32` checkint2, `string` keytype `"ssh-ed25519"`,
@@ -401,27 +403,26 @@ fn parseContainerHeader(bin: []const u8) HostKey.FromOpenSSHError!ContainerHeade
 ///
 /// The key pair is written to `out`; on error `out` is zeroed.
 pub fn parseEd25519OpenSSH(out: *Ed25519.KeyPair, bin: []const u8, passphrase: []const u8) HostKey.FromOpenSSHError!void {
-    _ = passphrase; // encrypted containers are rejected below, never decrypted
-    burn.run(burn.load_burn, HostKey.FromOpenSSHError!void, parseEd25519Body, .{ out, bin }) catch |e| {
+    burn.run(burn.load_burn, HostKey.FromOpenSSHError!void, parseEd25519Body, .{ out, bin, passphrase }) catch |e| {
         std.crypto.secureZero(u8, std.mem.asBytes(out));
         return e;
     };
 }
 
-fn parseEd25519Body(out: *Ed25519.KeyPair, bin: []const u8) HostKey.FromOpenSSHError!void {
+fn parseEd25519Body(out: *Ed25519.KeyPair, bin: []const u8, passphrase: []const u8) HostKey.FromOpenSSHError!void {
     const hdr = try parseContainerHeader(bin);
-    if (!std.mem.eql(u8, hdr.ciphername, "none")) return error.UnsupportedCipher;
-    if (!std.mem.eql(u8, hdr.kdfname, "none") or hdr.kdfoptions.len != 0)
-        return error.InvalidOpenSSH;
+    var dec_buf: [16 * 1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, &dec_buf);
+    const sec = try rsa.opensshDecryptSection(&dec_buf, hdr.ciphername, hdr.kdfname, hdr.kdfoptions, hdr.private_section, passphrase);
 
-    var cur = WireCursor{ .b = hdr.private_section };
+    var cur = WireCursor{ .b = sec.plain };
     if (cur.b.len < 8) return error.InvalidOpenSSH;
     const check1 = std.mem.readInt(u32, cur.b[0..4], .big);
     const check2 = std.mem.readInt(u32, cur.b[4..8], .big);
     cur.i = 8;
-    // Unencrypted container: a checkint mismatch is corruption, not a
-    // passphrase problem.
-    if (check1 != check2) return error.InvalidOpenSSH;
+    // Matching checkints are how OpenSSH detects a good passphrase; in a
+    // plain container a mismatch can only be corruption.
+    if (check1 != check2) return if (sec.encrypted) error.IncorrectPassphrase else error.InvalidOpenSSH;
 
     const keytype = cur.string() catch return error.InvalidOpenSSH;
     if (!std.mem.eql(u8, keytype, "ssh-ed25519")) return error.UnsupportedKeyType;
@@ -431,9 +432,9 @@ fn parseEd25519Body(out: *Ed25519.KeyPair, bin: []const u8) HostKey.FromOpenSSHE
     if (pub_bytes.len != 32 or priv_bytes.len != 64) return error.InvalidPrivateKey;
     // priv = 32-byte seed || 32-byte public key; the copies must agree.
     if (!std.mem.eql(u8, priv_bytes[32..64], pub_bytes)) return error.InvalidPrivateKey;
-    // Deterministic padding to the cipher block size (8 for "none").
+    // Deterministic padding to the cipher block size (8 for "none", 16 for AES).
     const pad = cur.b[cur.i..];
-    if (pad.len >= 8) return error.InvalidOpenSSH;
+    if (pad.len >= sec.block_len) return error.InvalidOpenSSH;
     for (pad, 0..) |b, i| {
         if (b != @as(u8, @intCast(i + 1))) return error.InvalidOpenSSH;
     }
@@ -446,10 +447,9 @@ fn parseEd25519Body(out: *Ed25519.KeyPair, bin: []const u8) HostKey.FromOpenSSHE
     if (!std.mem.eql(u8, &out.public_key.toBytes(), pub_bytes)) return error.InvalidPrivateKey;
 }
 
-/// Parse an `ecdsa-sha2-nistp256` private key from an **unencrypted**
-/// openssh-key-v1 container. Same shape and same restriction as
-/// `parseEd25519OpenSSH` right above (`passphrase` accepted but never
-/// consumed; an encrypted container is `error.UnsupportedCipher`).
+/// Parse an `ecdsa-sha2-nistp256` private key from an openssh-key-v1
+/// container, plain or passphrase-protected — same container handling as
+/// `parseEd25519OpenSSH` right above.
 ///
 /// Private-keys section layout (RFC 5656 §3.1 + OpenSSH `PROTOCOL.key`):
 /// `uint32` checkint1 == `uint32` checkint2, `string` keytype
@@ -468,25 +468,24 @@ fn parseEd25519Body(out: *Ed25519.KeyPair, bin: []const u8) HostKey.FromOpenSSHE
 ///
 /// The key pair is written to `out`; on error `out` is zeroed.
 pub fn parseEcdsaP256OpenSSH(out: *EcdsaP256.KeyPair, bin: []const u8, passphrase: []const u8) HostKey.FromOpenSSHError!void {
-    _ = passphrase; // encrypted containers are rejected below, never decrypted
-    burn.run(burn.load_burn, HostKey.FromOpenSSHError!void, parseEcdsaP256Body, .{ out, bin }) catch |e| {
+    burn.run(burn.load_burn, HostKey.FromOpenSSHError!void, parseEcdsaP256Body, .{ out, bin, passphrase }) catch |e| {
         std.crypto.secureZero(u8, std.mem.asBytes(out));
         return e;
     };
 }
 
-fn parseEcdsaP256Body(out: *EcdsaP256.KeyPair, bin: []const u8) HostKey.FromOpenSSHError!void {
+fn parseEcdsaP256Body(out: *EcdsaP256.KeyPair, bin: []const u8, passphrase: []const u8) HostKey.FromOpenSSHError!void {
     const hdr = try parseContainerHeader(bin);
-    if (!std.mem.eql(u8, hdr.ciphername, "none")) return error.UnsupportedCipher;
-    if (!std.mem.eql(u8, hdr.kdfname, "none") or hdr.kdfoptions.len != 0)
-        return error.InvalidOpenSSH;
+    var dec_buf: [16 * 1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, &dec_buf);
+    const sec = try rsa.opensshDecryptSection(&dec_buf, hdr.ciphername, hdr.kdfname, hdr.kdfoptions, hdr.private_section, passphrase);
 
-    var cur = WireCursor{ .b = hdr.private_section };
+    var cur = WireCursor{ .b = sec.plain };
     if (cur.b.len < 8) return error.InvalidOpenSSH;
     const check1 = std.mem.readInt(u32, cur.b[0..4], .big);
     const check2 = std.mem.readInt(u32, cur.b[4..8], .big);
     cur.i = 8;
-    if (check1 != check2) return error.InvalidOpenSSH;
+    if (check1 != check2) return if (sec.encrypted) error.IncorrectPassphrase else error.InvalidOpenSSH;
 
     const keytype = cur.string() catch return error.InvalidOpenSSH;
     if (!std.mem.eql(u8, keytype, "ecdsa-sha2-nistp256")) return error.UnsupportedKeyType;
@@ -497,10 +496,10 @@ fn parseEcdsaP256Body(out: *EcdsaP256.KeyPair, bin: []const u8) HostKey.FromOpen
     _ = cur.string() catch return error.InvalidOpenSSH; // Q — rebuilt from d below, not trusted
     const d_wire = cur.string() catch return error.InvalidOpenSSH;
     _ = cur.string() catch return error.InvalidOpenSSH; // comment
-    // Deterministic padding to the cipher block size (8 for "none") — same
-    // check as parseEd25519OpenSSH above.
+    // Deterministic padding to the cipher block size — same check as
+    // parseEd25519OpenSSH above.
     const pad = cur.b[cur.i..];
-    if (pad.len >= 8) return error.InvalidOpenSSH;
+    if (pad.len >= sec.block_len) return error.InvalidOpenSSH;
     for (pad, 0..) |b, i| {
         if (b != @as(u8, @intCast(i + 1))) return error.InvalidOpenSSH;
     }
@@ -1478,20 +1477,48 @@ test "HostKey.sign/publicBlob: ecdsa-p256 mpint(r)||mpint(s) wire shape verifies
     try EcdsaP256.Signature.fromBytes(rs).verify(&h, pk);
 }
 
-test "parseEd25519OpenSSH rejects an encrypted container with a clear error" {
+test "parseEd25519OpenSSH: a cipher OpenSSH keys do not use is UnsupportedCipher" {
     const t = std.testing;
-    // Synthesize a structurally-valid container header naming aes256-ctr.
+    // aes128-ctr is a transport cipher, never a private-key one (OpenSSH and
+    // Go's x/crypto/ssh read aes256-ctr and aes256-cbc only).
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try w.writeAll("openssh-key-v1\x00");
-    try messages.writeString(&w, "aes256-ctr");
+    try messages.writeString(&w, "aes128-ctr");
     try messages.writeString(&w, "bcrypt");
-    try messages.writeString(&w, "\x00\x00\x00\x04saltsalt"); // opaque here
+    try messages.writeString(&w, "\x00\x00\x00\x04salt\x00\x00\x00\x04");
     try w.writeAll(&[_]u8{ 0, 0, 0, 1 }); // nkeys
-    try messages.writeString(&w, ""); // public blob (unchecked before cipher)
-    try messages.writeString(&w, ""); // private section
+    try messages.writeString(&w, ""); // public blob
+    try messages.writeString(&w, "0123456789abcdef"); // private section
     var kp: Ed25519.KeyPair = undefined;
     try t.expectError(error.UnsupportedCipher, parseEd25519OpenSSH(&kp, w.buffered(), "pw"));
+}
+
+test "HostKey.fromOpenSSH: passphrase-protected ed25519 (ctr, cbc) and ecdsa-p256 load; wrong or no passphrase refused" {
+    const t = std.testing;
+    const v = @import("hostkey_vectors.zig");
+    const Case = struct { text: []const u8, pub_b64: []const u8 };
+    const cases = [_]Case{
+        .{ .text = v.ed25519_enc_ctr_key, .pub_b64 = v.ed25519_enc_ctr_pub_b64 },
+        .{ .text = v.ed25519_enc_cbc_key, .pub_b64 = v.ed25519_enc_cbc_pub_b64 },
+        .{ .text = v.ecdsa_p256_enc_ctr_key, .pub_b64 = v.ecdsa_p256_enc_ctr_pub_b64 },
+    };
+    for (cases) |c| {
+        var hk: HostKey = undefined;
+        try HostKey.fromOpenSSH(&hk, c.text, v.enc_passphrase);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&hk));
+        const blob = try hk.publicBlob(t.allocator);
+        defer t.allocator.free(blob);
+        var want_buf: [256]u8 = undefined;
+        const dec = std.base64.standard.Decoder;
+        const want = want_buf[0..try dec.calcSizeForSlice(c.pub_b64)];
+        try dec.decode(want, c.pub_b64);
+        try t.expectEqualSlices(u8, want, blob);
+
+        var bad: HostKey = undefined;
+        try t.expectError(error.IncorrectPassphrase, HostKey.fromOpenSSH(&bad, c.text, "not the passphrase"));
+        try t.expectError(error.IncorrectPassphrase, HostKey.fromOpenSSH(&bad, c.text, null));
+    }
 }
 
 test "HostKey.fromOpenSSH rejects a key type none of the three loaders handle" {

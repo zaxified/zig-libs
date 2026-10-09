@@ -417,6 +417,13 @@ noinline fn callFromOpenSSH() void {
     std.mem.doNotOptimizeAway(&hk_sink);
 }
 
+/// The passphrase-protected path (2026-10-09): bcrypt_pbkdf, the AES key
+/// schedule and the decrypted private section all pass through the stack.
+noinline fn callFromOpenSSHEncrypted() void {
+    HostKey.fromOpenSSH(&hk_sink, cur_text, vectors.enc_passphrase) catch unreachable;
+    std.mem.doNotOptimizeAway(&hk_sink);
+}
+
 /// A high-entropy seed (a repeated byte would be skipped as low-entropy).
 fn caseSeed(i: u8) [32]u8 {
     var out: [32]u8 = undefined;
@@ -470,6 +477,29 @@ test "STACKPROBE: no key, nonce or CRT residue on the dead stack after host-key 
             cur_text = vectors.ed25519_key;
             bad += try runProbe("HostKey.fromOpenSSH ed25519", callFromOpenSSH, &n);
         }
+    }
+
+    // ── passphrase-protected containers: ed25519 (ctr, cbc), ecdsa-p256 ──
+    // Needles: the loaded key and the passphrase. The decrypted section holds
+    // exactly the key images, so a section left on the stack is caught too.
+    for ([_][]const u8{ vectors.ed25519_enc_ctr_key, vectors.ed25519_enc_cbc_key, vectors.ecdsa_p256_enc_ctr_key }) |text| {
+        try HostKey.fromOpenSSH(&cur_hk, text, vectors.enc_passphrase);
+        var n: Needles = .{};
+        switch (cur_hk) {
+            .ed25519 => |*kp| {
+                ed25519KeyNeedles(&n, kp);
+                leak_src = kp.secret_key.seed();
+            },
+            .ecdsa_p256 => |*kp| {
+                try ecdsaKeyNeedles(&n, kp);
+                leak_src = kp.secret_key.toBytes();
+            },
+            else => unreachable,
+        }
+        n.addBoth("passphrase", vectors.enc_passphrase);
+        n.sort();
+        cur_text = text;
+        bad += try runProbe("HostKey.fromOpenSSH encrypted", callFromOpenSSHEncrypted, &n);
     }
 
     // ── ecdsa-p256: the fixture + one generated key ──

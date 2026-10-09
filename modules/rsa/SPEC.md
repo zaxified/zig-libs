@@ -73,7 +73,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `fromPem`, cleartext PEM only).
 - **P4b** OpenSSH `PROTOCOL.key` private-key parsing (`fromOpenSSH`: unencrypted and
   bcrypt/aes256-ctr/aes256-cbc encrypted, with a from-scratch Blowfish + bcrypt-pbkdf in
-  `openssh.zig`).
+  `openssh.zig`). The cipher/KDF half is public as `opensshDecryptSection` (2026-10-09) so the
+  `ssh` module decrypts ed25519 and ECDSA containers through the same code.
 - **P5** `generate` (keypair generation: probable primes via sieve + Miller-Rabin, FIPS
   186-5-style constraints).
 - **P6** `selfSignedCert` (X.509 v3 self-signed certificate generation, RFC 5280).

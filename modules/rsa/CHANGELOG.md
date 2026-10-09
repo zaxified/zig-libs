@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **Added:** `opensshDecryptSection` (+ `OpensshSection`, `OpensshCipher` now
+  public): the openssh-key-v1 cipher/KDF half of `fromOpenSSH` (bcrypt rounds cap, aes256-ctr/-cbc),
+  shared with the `ssh` module for non-RSA key types. `fromOpenSSH` itself unchanged in behaviour.
 - **2026-10-09** — **BREAKING (error set) / SECURITY:** `fromOpenSSH` refuses a bcrypt round
   count above `max_openssh_kdf_rounds` (2048) with the new `error.KdfRoundsTooLarge`; the count
   comes from the key file and bcrypt_pbkdf is linear in it, so `rounds = 2^32-1` pinned the

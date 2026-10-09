@@ -1956,7 +1956,7 @@ const SshReader = struct {
 /// Ciphers an openssh-key-v1 container may protect the private section
 /// with. OpenSSH's default is aes256-ctr; aes256-cbc is the legacy `-Z`
 /// choice. Both take a 32-byte key + 16-byte IV from bcrypt-pbkdf.
-const OpensshCipher = enum {
+pub const OpensshCipher = enum {
     none,
     aes256_ctr,
     aes256_cbc,
@@ -2025,6 +2025,43 @@ fn fromOpensshBinary(bin: []const u8, passphrase: []const u8) FromOpenSSHError!S
     const private_section = try r.readString();
     if (r.rest().len != 0) return error.InvalidOpenSSH;
 
+    var dec_buf: [max_pem_der_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &dec_buf);
+    const sec = try opensshDecryptSection(&dec_buf, ciphername, kdfname, kdfoptions, private_section, passphrase);
+    return parsePrivateSection(sec.plain, sec.cipher, sec.encrypted);
+}
+
+/// An openssh-key-v1 private-keys section after `opensshDecryptSection`.
+pub const OpensshSection = struct {
+    /// The plaintext section: the container's own bytes when it is not
+    /// encrypted, else the decryption in the caller's `dst`.
+    plain: []const u8,
+    /// Whether a passphrase was involved: a checkint mismatch then means a
+    /// wrong passphrase (`error.IncorrectPassphrase`), not corruption.
+    encrypted: bool,
+    /// The block size the section is padded to (8 for `none`, 16 for AES):
+    /// the `1, 2, 3, ...` padding after the last key is shorter than this.
+    block_len: usize,
+    cipher: OpensshCipher,
+};
+
+/// The cipher/KDF half of OpenSSH `PROTOCOL.key`, shared by every key type
+/// (the `ssh` module uses it for ed25519 and ECDSA containers): validates the
+/// ciphername/kdfname/kdfoptions combination, caps the bcrypt round count
+/// (`max_openssh_kdf_rounds`), derives key || IV with bcrypt_pbkdf and
+/// decrypts `section` (aes256-ctr / aes256-cbc, the two ciphers OpenSSH and
+/// Go's x/crypto/ssh read) into `dst` (`dst.len >= section.len`). For an
+/// unencrypted container (`none`/`none`, empty options) `dst` is untouched
+/// and `plain` is `section`. The caller owns wiping `dst` and burning the
+/// stack (bcrypt and AES key schedules live in this frame's callees).
+pub fn opensshDecryptSection(
+    dst: []u8,
+    ciphername: []const u8,
+    kdfname: []const u8,
+    kdfoptions: []const u8,
+    section: []const u8,
+    passphrase: []const u8,
+) FromOpenSSHError!OpensshSection {
     const cipher = try OpensshCipher.fromName(ciphername);
     const kdf_none = std.mem.eql(u8, kdfname, "none");
     const kdf_bcrypt = std.mem.eql(u8, kdfname, "bcrypt");
@@ -2033,7 +2070,7 @@ fn fromOpensshBinary(bin: []const u8, passphrase: []const u8) FromOpenSSHError!S
     if (cipher == .none) {
         // Unencrypted: kdf must be none with empty options.
         if (!kdf_none or kdfoptions.len != 0) return error.InvalidOpenSSH;
-        return parsePrivateSection(private_section, cipher, false);
+        return .{ .plain = section, .encrypted = false, .block_len = cipher.blockLen(), .cipher = cipher };
     }
 
     // Encrypted: kdf must be bcrypt; kdfoptions = string salt + u32 rounds.
@@ -2043,9 +2080,10 @@ fn fromOpensshBinary(bin: []const u8, passphrase: []const u8) FromOpenSSHError!S
     const rounds = try kr.readU32();
     if (kr.rest().len != 0 or salt.len == 0 or rounds == 0) return error.InvalidOpenSSH;
     if (rounds > max_openssh_kdf_rounds) return error.KdfRoundsTooLarge;
-    if (private_section.len == 0 or private_section.len % cipher.blockLen() != 0) {
+    if (section.len == 0 or section.len % cipher.blockLen() != 0) {
         return error.InvalidOpenSSH;
     }
+    if (dst.len < section.len) return error.InvalidOpenSSH;
 
     // Derive key (32) || IV (16). An empty passphrase is rejected by the
     // KDF itself — report it like any other wrong passphrase.
@@ -2055,9 +2093,7 @@ fn fromOpensshBinary(bin: []const u8, passphrase: []const u8) FromOpenSSHError!S
     const aes_key = key_iv[0..32];
     const iv = key_iv[32..48];
 
-    var dec_buf: [max_pem_der_len]u8 = undefined;
-    const dec = dec_buf[0..private_section.len]; // <= bin.len <= max_pem_der_len
-    defer std.crypto.secureZero(u8, dec);
+    const dec = dst[0..section.len];
     const aes = std.crypto.core.aes;
     switch (cipher) {
         .none => unreachable,
@@ -2067,7 +2103,7 @@ fn fromOpensshBinary(bin: []const u8, passphrase: []const u8) FromOpenSSHError!S
                 aes.AesEncryptCtx(aes.Aes256),
                 ctx,
                 dec,
-                private_section,
+                section,
                 iv.*,
                 .big,
             );
@@ -2076,17 +2112,18 @@ fn fromOpensshBinary(bin: []const u8, passphrase: []const u8) FromOpenSSHError!S
             const ctx = aes.Aes256.initDec(aes_key.*);
             var prev: [16]u8 = iv.*;
             var off: usize = 0;
-            while (off < private_section.len) : (off += 16) {
-                const ct_block = private_section[off..][0..16];
+            while (off < section.len) : (off += 16) {
+                const ct_block = section[off..][0..16];
                 var pt: [16]u8 = undefined;
                 ctx.decrypt(&pt, ct_block);
                 for (&pt, prev) |*b, x| b.* ^= x;
                 @memcpy(dec[off..][0..16], &pt);
                 prev = ct_block.*;
+                std.crypto.secureZero(u8, &pt);
             }
         },
     }
-    return parsePrivateSection(dec, cipher, true);
+    return .{ .plain = dec, .encrypted = true, .block_len = cipher.blockLen(), .cipher = cipher };
 }
 
 /// The (decrypted) private section: checkint pair, key type, the RSA
