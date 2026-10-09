@@ -589,7 +589,7 @@ const HufStream = struct {
         s.pos[0] &= 7;
         std.debug.assert(s.ptr <= s.end);
         std.mem.writeInt(u64, s.buf[s.ptr..][0..8], bits, .little);
-        s.ptr += nb_bits >> 3;
+        s.ptr += @intCast(nb_bits >> 3);
         std.debug.assert(!fast or s.ptr <= s.end);
         if (!fast and s.ptr > s.end) s.ptr = s.end;
     }

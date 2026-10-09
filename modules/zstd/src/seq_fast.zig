@@ -74,15 +74,18 @@ pub const FastSeq = extern struct {
 pub const dec_tables = [16]u8{ 0, 1, 2, 1, 4, 4, 4, 4, 8, 8, 8, 7, 8, 9, 10, 11 };
 
 comptime {
-    const o = [_]struct { []const u8, usize }{
-        .{ "container", 0 }, .{ "bits", 8 },      .{ "ptr", 16 },      .{ "limit", 24 },
-        .{ "ll_state", 32 }, .{ "ml_state", 40 }, .{ "of_state", 48 }, .{ "ll_cells", 56 },
-        .{ "ml_cells", 64 }, .{ "of_cells", 72 }, .{ "prev", 80 },     .{ "lit", 104 },
-        .{ "lit_end", 112 }, .{ "op", 120 },      .{ "oend_w", 128 },  .{ "prefix", 136 },
-        .{ "nb_seq", 144 },  .{ "seq_ll", 152 },  .{ "seq_ml", 160 },  .{ "seq_off", 168 },
-        .{ "status", 176 },  .{ "dec", 184 },
-    };
-    for (o) |f| if (@offsetOf(FastSeq, f[0]) != f[1]) @compileError("FastSeq." ++ f[0] ++ " moved");
+    // Only where the assembly is built: elsewhere `usize` may be 32 bits.
+    if (supported) {
+        const o = [_]struct { []const u8, usize }{
+            .{ "container", 0 }, .{ "bits", 8 },      .{ "ptr", 16 },      .{ "limit", 24 },
+            .{ "ll_state", 32 }, .{ "ml_state", 40 }, .{ "of_state", 48 }, .{ "ll_cells", 56 },
+            .{ "ml_cells", 64 }, .{ "of_cells", 72 }, .{ "prev", 80 },     .{ "lit", 104 },
+            .{ "lit_end", 112 }, .{ "op", 120 },      .{ "oend_w", 128 },  .{ "prefix", 136 },
+            .{ "nb_seq", 144 },  .{ "seq_ll", 152 },  .{ "seq_ml", 160 },  .{ "seq_off", 168 },
+            .{ "status", 176 },  .{ "dec", 184 },
+        };
+        for (o) |f| if (@offsetOf(FastSeq, f[0]) != f[1]) @compileError("FastSeq." ++ f[0] ++ " moved");
+    }
 }
 
 /// Test hook: counts the loop entries, so a test can tell that the

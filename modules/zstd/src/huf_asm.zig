@@ -44,8 +44,11 @@ pub const Args = extern struct {
 };
 
 comptime {
-    for (.{ .{ "ip", 0 }, .{ "op", 32 }, .{ "bits", 64 }, .{ "dt", 96 }, .{ "olimit", 104 } }) |f| {
-        if (@offsetOf(Args, f[0]) != f[1]) @compileError("huf_asm.Args." ++ f[0] ++ " moved");
+    // Only where the assembly is built: elsewhere `usize` may be 32 bits.
+    if (supported) {
+        for (.{ .{ "ip", 0 }, .{ "op", 32 }, .{ "bits", 64 }, .{ "dt", 96 }, .{ "olimit", 104 } }) |f| {
+            if (@offsetOf(Args, f[0]) != f[1]) @compileError("huf_asm.Args." ++ f[0] ++ " moved");
+        }
     }
 }
 
