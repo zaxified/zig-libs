@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (2,000–40,000 runs clean per target, 6 targets, ZSTD_FUZZ; found the stale raw-block underflow, fixed) · ct n/a — compression only (keyword review, 2026-10-07)
 
-**Performance:** ref 0.88–1.07× libzstd 1.5.7 · fastest ref (measured 2026-10-09)
+**Performance:** ref 0.90–1.04× libzstd 1.5.7 · fastest ?× c4milo/stdx (measured 2026-10-09)
 
 **Known defects:** none recorded
 
@@ -3408,7 +3408,7 @@ below is this module's own, beyond that gate:
 
 ## Backlog / deferred
 
-- **Speed: decoding 1.01–1.07× libzstd, a few compression workloads 1.01–1.06×** *(bench 2026-10-09, `zig build bench-zstd`, user-mode cycles, both sides alternating, best of 3 rounds; frames byte-identical)*. Caps the performance axis at 3 (P2 needs every workload ≤ 1.0×). Was 1.43× at level 1 on x-ray (2026-10-07): the byte histogram was counted in one table (libzstd: four, `HIST_count_parallel_wksp`) and Huffman literals were coded one masked code at a time (libzstd: `HUF_CElt` packed, unrolled per table log, two containers) -- both ported 2026-10-09, x-ray c1 now 0.93×, ooffice c1 1.32× → 1.00×. What is left, by `perf` against a symbolised libzstd 1.5.7: (a) **x-ray d3 1.07×** -- the four-stream X2 Huffman loop takes ~18 M cycles where libzstd's `HUF_decompress4X2_usingDTable_internal_fast_asm_loop` takes ~15 M; its assembly keeps 4 bit containers, 4 output and 3 input cursors in registers and reads a cell's bit count with its own byte load, LLVM spills (tried 2026-10-09 and reverted: pointer cursors, no change; three loads per cell, +4 %, more spills). Closing it means that loop in assembly (cf. Z35). (b) **text decoding (dickens d3 1.04×)**: the sequence loop, Z33/Z34's ground. (c) **compression xml c3 1.055×, c1 1.03×, dickens c3 1.03×**: `dfastBlock` equals libzstd's `ZSTD_compressBlock_doubleFast` in cycles; the rest is spread (seq coding, block driver) -- not profiled to the end yet.
+- **Speed: 8 of 20 workloads at 1.006–1.045× libzstd** *(bench 2026-10-09, `ZSTD_BENCH_ROUNDS=5 zig build bench-zstd`, user-mode cycles, the sides alternating, best of 5; frames byte-identical)*: xml c1 1.033, c3 1.040, d3 1.028, d19 1.035; dickens c1 1.015, c19 1.045, d3 1.042; ooffice c1 1.006. Caps the performance axis at 3 (P2: every workload ≤ 1.0×). The run-to-run spread on this shared machine is about ±2–3 % even in cycles (libzstd's own cycles for one workload moved up to 30 % between runs), so a claim of ≤ 1.0 wants a margin. Where it was: 0.92–1.43× (2026-10-07), closed 2026-10-09 by the parallel histogram, the packed Huffman encoder, 16-byte literal copies, a specialised pre-splitter (`b704bed8`, `7a7443c8`) and Z35 (`7f14de43`). What is left, by `perf` against a symbolised libzstd 1.5.7: compression levels 1–3 on xml/dickens -- `fastBlock`/`dfastBlock` a few % over libzstd's match finders, LLVM spilling the table base in the search loop (gcc spills too; no single cause found); decoding of small, many-block frames (xml d3/d19, dickens d3) -- the sequence loop now equals libzstd's, the per-block table building (`readStats`, `readNCount`, `buildFseTable`, the frame driver) is ~0.14 of libzstd's decoding time against its ~0.09. The fastest decoder in the field is c4milo/stdx (0.84–0.92× libzstd, 2026-10-07), not re-measured against this one.
 
 Toward the goal above. "Session" ≈ one working session of the size of the
 level-22/LDM port (≈ 500 lines of Zig with its goldens, diff runs and
