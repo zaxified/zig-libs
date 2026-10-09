@@ -564,6 +564,11 @@ pub const ServerConfig = struct {
     /// claim this server accepts no public key, which is a different and
     /// false statement).
     server_sig_algs: []const []const u8 = &transport.public_key_algorithms,
+    /// KEX methods, ciphers and MACs this server offers, most-preferred first
+    /// (Go `ServerConfig.Config`); `serverHandshake` installs it as
+    /// `Transport.algorithms`. `host_keys` in it is ignored here — the server
+    /// offers the algorithms of the keys in `host_keys` above.
+    algorithms: transport.Algorithms = .{},
 };
 
 // ── server-side (responder-role) key exchange ───────────────────────────────
@@ -989,6 +994,14 @@ fn pickFirst(preferred: []const []const u8, available: []const []const u8) ?[]co
     return null;
 }
 
+/// `pickFirst` from the client's list against ours (`t.algorithms`, a
+/// caller-owned list), returned as the module's own constant so it may be
+/// kept in `Transport.negotiated`.
+fn pickTheirs(client: []const []const u8, ours: []const []const u8, supported: []const []const u8) transport.TransportError![]const u8 {
+    const name = pickFirst(client, ours) orelse return error.UnsupportedAlgorithm;
+    return transport.canonicalName(supported, name) orelse error.UnsupportedAlgorithm;
+}
+
 // ── full server handshake ───────────────────────────────────────────────────
 
 /// Full server (responder) handshake — the mirror of
@@ -1018,6 +1031,8 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     t.role = .server;
     t.gpa = gpa;
     t.server_host_keys = config.host_keys;
+    t.algorithms = config.algorithms;
+    try t.algorithms.validate(); // before the version exchange: nothing sent yet
 
     // 1. Version exchange (role-symmetric; we speak first, which is the
     // conventional server behavior anyway).
@@ -1153,9 +1168,11 @@ fn serverKexRoundBody(
     const client_wants_ext_info = transport.offersExtInfo(client_kex.kex_algorithms, transport.ext_info_c);
     if (round == .initial) t.strict_kex = t.offer_strict_kex and transport.offersExtInfo(client_kex.kex_algorithms, transport.kex_strict_c);
 
-    // 3. Negotiate (client-preference order per RFC 4253 §7.1).
-    const kex_name = pickFirst(client_kex.kex_algorithms, &transport.kex_algorithms) orelse
-        return error.UnsupportedAlgorithm;
+    // 3. Negotiate (client-preference order per RFC 4253 §7.1) against
+    // `t.algorithms` (validated by `buildKexInit` above or by the round that
+    // sent `ours`).
+    const algs = t.algorithms;
+    const kex_name = try pickTheirs(client_kex.kex_algorithms, algs.kex, &transport.supported_kex_algorithms);
     var host_key: ?*const HostKey = null;
     outer: for (client_kex.server_host_key_algorithms) |name| {
         for (t.server_host_keys) |*hk| {
@@ -1166,22 +1183,18 @@ fn serverKexRoundBody(
         }
     }
     const hk = host_key orelse return error.UnsupportedAlgorithm;
-    const cipher_c2s = pickFirst(client_kex.encryption_algorithms_client_to_server, &transport.encryption_algorithms) orelse
-        return error.UnsupportedAlgorithm;
-    const cipher_s2c = pickFirst(client_kex.encryption_algorithms_server_to_client, &transport.encryption_algorithms) orelse
-        return error.UnsupportedAlgorithm;
+    const cipher_c2s = try pickTheirs(client_kex.encryption_algorithms_client_to_server, algs.ciphers, &transport.supported_encryption_algorithms);
+    const cipher_s2c = try pickTheirs(client_kex.encryption_algorithms_server_to_client, algs.ciphers, &transport.supported_encryption_algorithms);
     // MAC only matters for a non-AEAD cipher (mirrors the client's policy),
     // and the name (previously discarded to `_`) is kept for diagnostics.
     const mac_c2s: ?[]const u8 = if (transport.isAeadCipher(cipher_c2s))
         null
     else
-        pickFirst(client_kex.mac_algorithms_client_to_server, &transport.mac_algorithms) orelse
-            return error.UnsupportedAlgorithm;
+        try pickTheirs(client_kex.mac_algorithms_client_to_server, algs.macs, &transport.supported_mac_algorithms);
     const mac_s2c: ?[]const u8 = if (transport.isAeadCipher(cipher_s2c))
         null
     else
-        pickFirst(client_kex.mac_algorithms_server_to_client, &transport.mac_algorithms) orelse
-            return error.UnsupportedAlgorithm;
+        try pickTheirs(client_kex.mac_algorithms_server_to_client, algs.macs, &transport.supported_mac_algorithms);
     // RFC 4253 §7.1 negotiates compression the same as every other
     // name-list and requires a disconnect on no overlap — mirrors the
     // client-side fix in `transport.negotiate`.
@@ -1687,8 +1700,10 @@ fn opensshKnowsKex(io: std.Io, gpa: std.mem.Allocator, kex_name: []const u8) boo
 
 const SelfTestClient = struct {
     port: u16,
+    algs: transport.Algorithms = .{},
     err: ?anyerror = null,
     session_id: ?transport.SessionId = null,
+    negotiated: ?transport.NegotiatedAlgorithms = null,
 
     fn run(self: *SelfTestClient) void {
         self.runInner() catch |e| {
@@ -1718,7 +1733,10 @@ const SelfTestClient = struct {
         var wbuf: [32 * 1024]u8 = undefined;
         var sr = stream.reader(io, &rbuf);
         var sw = stream.writer(io, &wbuf);
-        var t = try transport.connect(&sr.interface, &sw.interface, gpa, accept_any_host_key);
+        var t = transport.Transport.init(&sr.interface, &sw.interface);
+        t.algorithms = self.algs;
+        try t.clientHandshake(gpa, accept_any_host_key);
+        self.negotiated = t.negotiated;
 
         var pbuf: [8192]u8 = undefined;
         try t.requestService("ssh-userauth", &pbuf);
@@ -1743,6 +1761,12 @@ const SelfTestClient = struct {
 };
 
 fn selfConsistency(host_key: *const HostKey) !void {
+    _ = try selfConsistencyWith(host_key, .{}, .{});
+}
+
+/// `selfConsistency` with each side's `Algorithms`; returns what the server
+/// negotiated after checking the client recorded the same names.
+fn selfConsistencyWith(host_key: *const HostKey, client_algs: transport.Algorithms, server_algs: transport.Algorithms) !transport.NegotiatedAlgorithms {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1752,7 +1776,7 @@ fn selfConsistency(host_key: *const HostKey) !void {
     var listener = try listenLoopback(io, &port);
     defer listener.deinit(io);
 
-    var client = SelfTestClient{ .port = port };
+    var client = SelfTestClient{ .port = port, .algs = client_algs };
     const th = try std.Thread.spawn(.{}, SelfTestClient.run, .{&client});
     var joined = false;
     defer if (!joined) th.join(); // runs after stream.close -> client unblocks
@@ -1765,7 +1789,7 @@ fn selfConsistency(host_key: *const HostKey) !void {
     var sw = stream.writer(io, &wbuf);
 
     const keys: []const HostKey = host_key[0..1];
-    var t = try accept(&sr.interface, &sw.interface, gpa, .{ .host_keys = keys });
+    var t = try accept(&sr.interface, &sw.interface, gpa, .{ .host_keys = keys, .algorithms = server_algs });
 
     // The client's encrypted probe must decrypt on our side...
     var pbuf: [8192]u8 = undefined;
@@ -1788,6 +1812,12 @@ fn selfConsistency(host_key: *const HostKey) !void {
     // Both sides must have derived the same session id (= exchange hash H).
     try std.testing.expect(t.session_id != null and client.session_id != null);
     try std.testing.expectEqualSlices(u8, t.session_id.?.slice(), client.session_id.?.slice());
+    const ours = t.negotiated.?;
+    const theirs = client.negotiated.?;
+    try std.testing.expectEqualStrings(ours.kex, theirs.kex);
+    try std.testing.expectEqualStrings(ours.cipher_c2s, theirs.cipher_c2s);
+    try std.testing.expectEqualStrings(ours.cipher_s2c, theirs.cipher_s2c);
+    return ours;
 }
 
 test "self-consistency: our client ↔ our server (ed25519 host key)" {
@@ -1800,6 +1830,76 @@ test "self-consistency: our client ↔ our server (rsa host key)" {
     var hk: HostKey = undefined;
     try HostKey.fromOpenSSH(&hk, fixture_rsa_key, null);
     try selfConsistency(&hk);
+}
+
+test "Algorithms: the client's order decides, the server's list restricts; negotiated names are the module's constants" {
+    const gpa = std.testing.allocator;
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
+
+    // The server's lists live in caller memory freed right after the
+    // handshake: `Transport.negotiated` must not point into them.
+    const kex0 = try gpa.dupe(u8, "curve25519-sha256");
+    defer gpa.free(kex0);
+    const c0 = try gpa.dupe(u8, "chacha20-poly1305@openssh.com");
+    defer gpa.free(c0);
+    const c1 = try gpa.dupe(u8, "aes128-gcm@openssh.com");
+    defer gpa.free(c1);
+    const server_kex = [_][]const u8{kex0};
+    const server_ciphers = [_][]const u8{ c0, c1 };
+    const client_ciphers = [_][]const u8{ "aes128-gcm@openssh.com", "chacha20-poly1305@openssh.com" };
+
+    const neg = try selfConsistencyWith(
+        &hk,
+        .{ .ciphers = &client_ciphers },
+        .{ .kex = &server_kex, .ciphers = &server_ciphers },
+    );
+    // The client prefers mlkem768x25519 by default; the server only allows
+    // curve25519-sha256.
+    try std.testing.expectEqualStrings("curve25519-sha256", neg.kex);
+    // Client order wins over the server's (RFC 4253 §7.1).
+    try std.testing.expectEqualStrings("aes128-gcm@openssh.com", neg.cipher_c2s);
+    try std.testing.expectEqualStrings("aes128-gcm@openssh.com", neg.cipher_s2c);
+    try std.testing.expect(neg.kex.ptr != kex0.ptr);
+    try std.testing.expect(neg.cipher_c2s.ptr == transport.canonicalName(&transport.supported_encryption_algorithms, "aes128-gcm@openssh.com").?.ptr);
+}
+
+test "Algorithms: a client restricted to a non-AEAD cipher negotiates its MAC" {
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
+    const only_ctr = [_][]const u8{"aes256-ctr"};
+    const neg = try selfConsistencyWith(&hk, .{ .ciphers = &only_ctr }, .{});
+    try std.testing.expectEqualStrings("aes256-ctr", neg.cipher_c2s);
+    try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_c2s.?);
+    try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_s2c.?);
+}
+
+test "Algorithms REJECT: disjoint cipher lists end the handshake with UnsupportedAlgorithm" {
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
+    const client_ciphers = [_][]const u8{"chacha20-poly1305@openssh.com"};
+    const server_ciphers = [_][]const u8{"aes256-gcm@openssh.com"};
+    try std.testing.expectError(error.UnsupportedAlgorithm, selfConsistencyWith(
+        &hk,
+        .{ .ciphers = &client_ciphers },
+        .{ .ciphers = &server_ciphers },
+    ));
+}
+
+test "serverHandshake REJECT: an unsupported configured name is refused before anything is sent" {
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
+    var rbuf: [16]u8 = undefined;
+    var r: std.Io.Reader = .fixed(rbuf[0..0]);
+    var wbuf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&wbuf);
+    var t = transport.Transport.init(&r, &w);
+    const bogus = [_][]const u8{"3des-cbc"};
+    try std.testing.expectError(error.UnsupportedAlgorithm, serverHandshake(&t, std.testing.allocator, .{
+        .host_keys = (&hk)[0..1],
+        .algorithms = .{ .ciphers = &bogus },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), w.end);
 }
 
 // The default handshake above negotiates `mlkem768x25519-sha256` (first in

@@ -160,6 +160,72 @@ pub const compression_algorithms = [_][]const u8{
     "none",
 };
 
+// ── runtime-configurable algorithm lists ───────────────────────────────────
+
+/// Every KEX method this module implements — what `Algorithms.kex` may name.
+/// The lists above are the DEFAULT offers; these are the ceiling. They are
+/// equal today; a name that is implemented but not offered by default (e.g.
+/// a legacy algorithm behind an explicit opt-in) goes here only.
+pub const supported_kex_algorithms = kex_algorithms;
+/// Every host-key algorithm a client here can verify (`Algorithms.host_keys`).
+pub const supported_host_key_algorithms = server_host_key_algorithms;
+/// Every cipher implemented by `buildCipher` (`Algorithms.ciphers`).
+pub const supported_encryption_algorithms = encryption_algorithms;
+/// Every MAC implemented for a non-AEAD cipher (`Algorithms.macs`).
+pub const supported_mac_algorithms = mac_algorithms;
+
+/// The caller's algorithm preferences for one connection, most-preferred
+/// first — the counterpart of Go x/crypto/ssh `Config.KeyExchanges` /
+/// `Ciphers` / `MACs` and `ClientConfig.HostKeyAlgorithms`. Set
+/// `Transport.algorithms` before the handshake; every key exchange of the
+/// connection (re-exchanges included) offers and negotiates from it.
+///
+/// Each list must be non-empty, free of duplicates, and name only entries of
+/// the matching `supported_*` list; anything else is refused with
+/// `error.UnsupportedAlgorithm` before our KEXINIT is sent (Go likewise
+/// refuses an unknown name in its config rather than dropping it). The
+/// slices are borrowed for the transport's lifetime; the negotiated names
+/// recorded in `Transport.negotiated` are always this module's own constants,
+/// never slices into them.
+///
+/// `host_keys` is the client's list of host-key algorithms it accepts. A
+/// server offers the algorithms of the host keys it holds
+/// (`server.ServerConfig.host_keys`) and ignores it.
+pub const Algorithms = struct {
+    kex: []const []const u8 = &kex_algorithms,
+    host_keys: []const []const u8 = &server_host_key_algorithms,
+    ciphers: []const []const u8 = &encryption_algorithms,
+    macs: []const []const u8 = &mac_algorithms,
+
+    /// `error.UnsupportedAlgorithm` unless every list is non-empty, has no
+    /// duplicate, and names only supported algorithms.
+    pub fn validate(self: Algorithms) TransportError!void {
+        try validateList(self.kex, &supported_kex_algorithms);
+        try validateList(self.host_keys, &supported_host_key_algorithms);
+        try validateList(self.ciphers, &supported_encryption_algorithms);
+        try validateList(self.macs, &supported_mac_algorithms);
+    }
+};
+
+fn validateList(list: []const []const u8, supported: []const []const u8) TransportError!void {
+    if (list.len == 0) return error.UnsupportedAlgorithm;
+    for (list, 0..) |name, i| {
+        if (canonicalName(supported, name) == null) return error.UnsupportedAlgorithm;
+        for (list[0..i]) |prev| {
+            if (std.mem.eql(u8, prev, name)) return error.UnsupportedAlgorithm;
+        }
+    }
+}
+
+/// `name`'s entry in `supported` — the module's own constant, which outlives
+/// any caller-provided list or decoded KEXINIT — or `null`.
+pub fn canonicalName(supported: []const []const u8, name: []const u8) ?[]const u8 {
+    for (supported) |s| {
+        if (std.mem.eql(u8, s, name)) return s;
+    }
+    return null;
+}
+
 // ── RFC 8308 extension negotiation ─────────────────────────────────────────
 
 /// RFC 8308 §2.1 indicator a CLIENT appends to its KEXINIT `kex_algorithms`
@@ -215,7 +281,7 @@ pub const kex_strict_s = "kex-strict-s-v00@openssh.com";
 
 /// Entries in the `kex_algorithms` name-list we SEND on the first KEXINIT:
 /// the real methods plus the RFC 8308 indicator and the strict-KEX one.
-pub const offered_kex_len = kex_algorithms.len + 2;
+pub const offered_kex_len = supported_kex_algorithms.len + 2;
 
 /// Which key exchange of the connection a KEXINIT belongs to. Only the first
 /// carries the pseudo-algorithms: RFC 8308 §2.1 and OpenSSH `PROTOCOL` both
@@ -231,18 +297,22 @@ pub const KexRound = enum { initial, rekey };
 /// and `server.serverHandshake` must actually handle one after it, which they
 /// do in `Transport.requestService` / `userauth.awaitAuthReply` (client) and
 /// by ignoring an unsolicited one (server).
-pub fn offeredKexAlgorithms(out: *[offered_kex_len][]const u8, role: enum { client, server }, round: KexRound) []const []const u8 {
-    @memcpy(out[0..kex_algorithms.len], &kex_algorithms);
-    if (round == .rekey) return out[0..kex_algorithms.len];
-    out[kex_algorithms.len] = switch (role) {
+///
+/// `methods` is the caller's `Algorithms.kex` (validated: no duplicates, so
+/// it fits `out`); a longer list is cut to what fits.
+pub fn offeredKexAlgorithms(out: *[offered_kex_len][]const u8, methods: []const []const u8, role: enum { client, server }, round: KexRound) []const []const u8 {
+    const n = @min(methods.len, supported_kex_algorithms.len);
+    @memcpy(out[0..n], methods[0..n]);
+    if (round == .rekey) return out[0..n];
+    out[n] = switch (role) {
         .client => ext_info_c,
         .server => ext_info_s,
     };
-    out[kex_algorithms.len + 1] = switch (role) {
+    out[n + 1] = switch (role) {
         .client => kex_strict_c,
         .server => kex_strict_s,
     };
-    return out[0..];
+    return out[0 .. n + 2];
 }
 
 /// Did the peer's KEXINIT `kex_algorithms` carry `indicator` (RFC 8308 §2.1)?
@@ -2156,21 +2226,28 @@ pub fn isAeadCipher(name: []const u8) bool {
         std.mem.eql(u8, name, "aes128-gcm@openssh.com");
 }
 
-fn negotiate(server_kex: KexInit) TransportError!NegotiatedAlgorithms {
-    const kex = pickFirst(&kex_algorithms, server_kex.kex_algorithms) orelse return error.UnsupportedAlgorithm;
-    const host_key = pickFirst(&server_host_key_algorithms, server_kex.server_host_key_algorithms) orelse return error.UnsupportedAlgorithm;
-    const c2s = pickFirst(&encryption_algorithms, server_kex.encryption_algorithms_client_to_server) orelse return error.UnsupportedAlgorithm;
-    const s2c = pickFirst(&encryption_algorithms, server_kex.encryption_algorithms_server_to_client) orelse return error.UnsupportedAlgorithm;
+/// `pickFirst` from the client's (our, validated) list, returned as the
+/// module's own constant for that name (see `NegotiatedAlgorithms`).
+fn pickOurs(ours: []const []const u8, supported: []const []const u8, theirs: []const []const u8) TransportError![]const u8 {
+    const name = pickFirst(ours, theirs) orelse return error.UnsupportedAlgorithm;
+    return canonicalName(supported, name) orelse error.UnsupportedAlgorithm;
+}
+
+fn negotiate(algs: Algorithms, server_kex: KexInit) TransportError!NegotiatedAlgorithms {
+    const kex = try pickOurs(algs.kex, &supported_kex_algorithms, server_kex.kex_algorithms);
+    const host_key = try pickOurs(algs.host_keys, &supported_host_key_algorithms, server_kex.server_host_key_algorithms);
+    const c2s = try pickOurs(algs.ciphers, &supported_encryption_algorithms, server_kex.encryption_algorithms_client_to_server);
+    const s2c = try pickOurs(algs.ciphers, &supported_encryption_algorithms, server_kex.encryption_algorithms_server_to_client);
     // MAC only matters for a non-AEAD cipher; require one is agreeable then,
     // and keep the name (previously discarded to `_`) for diagnostics.
     const mac_c2s: ?[]const u8 = if (isAeadCipher(c2s))
         null
     else
-        pickFirst(&mac_algorithms, server_kex.mac_algorithms_client_to_server) orelse return error.UnsupportedAlgorithm;
+        try pickOurs(algs.macs, &supported_mac_algorithms, server_kex.mac_algorithms_client_to_server);
     const mac_s2c: ?[]const u8 = if (isAeadCipher(s2c))
         null
     else
-        pickFirst(&mac_algorithms, server_kex.mac_algorithms_server_to_client) orelse return error.UnsupportedAlgorithm;
+        try pickOurs(algs.macs, &supported_mac_algorithms, server_kex.mac_algorithms_server_to_client);
     // RFC 4253 §7.1 negotiates compression the same as every other
     // name-list and requires a disconnect on no overlap — this used to be
     // decoded and never negotiated at all (so a peer offering no "none"
@@ -2286,6 +2363,9 @@ pub const Transport = struct {
     /// it engages only when the peer advertises it too. Turning it off is
     /// for interoperating with a peer whose strict-KEX support is broken.
     offer_strict_kex: bool = true,
+    /// Algorithms offered and accepted, most-preferred first (set before the
+    /// handshake; see `Algorithms`). Re-exchanges use it too.
+    algorithms: Algorithms = .{},
 
     /// Set by the handshake.
     role: Role = .client,
@@ -2367,6 +2447,7 @@ pub const Transport = struct {
     pub fn clientHandshake(t: *Transport, gpa: std.mem.Allocator, policy: HostKeyPolicy) TransportError!void {
         t.role = .client;
         t.gpa = gpa;
+        try t.algorithms.validate(); // before the version exchange: nothing sent yet
         const local_id = IdentificationString{ .softwareversion = software_version };
         const v_s = try exchangeVersions(gpa, t.reader, t.writer, local_id);
         defer gpa.free(v_s);
@@ -2554,20 +2635,23 @@ pub const Transport = struct {
     /// Our KEXINIT payload for `round` (caller frees).
     // secret-api-ok: writes algorithm name-lists and a public random cookie; no key material.
     pub fn buildKexInit(t: *Transport, gpa: std.mem.Allocator, round: KexRound) TransportError![]u8 {
+        // Every round of either role builds its KEXINIT here first, so a bad
+        // configuration is refused before anything is sent.
+        try t.algorithms.validate();
         var cookie: [16]u8 = undefined;
         t.entropy.fill(&cookie);
         const empty: []const []const u8 = &.{};
         var offered_kex: [offered_kex_len][]const u8 = undefined;
         var hk_buf: [8][]const u8 = undefined;
         const host_keys: []const []const u8 = switch (t.role) {
-            .client => &server_host_key_algorithms,
+            .client => t.algorithms.host_keys,
             .server => blk: {
                 const n = @min(t.server_host_keys.len, hk_buf.len);
                 for (t.server_host_keys[0..n], hk_buf[0..n]) |*hk, *name| name.* = hk.algorithmName();
                 break :blk hk_buf[0..n];
             },
         };
-        var kex_names = offeredKexAlgorithms(&offered_kex, switch (t.role) {
+        var kex_names = offeredKexAlgorithms(&offered_kex, t.algorithms.kex, switch (t.role) {
             .client => .client,
             .server => .server,
         }, round);
@@ -2576,10 +2660,10 @@ pub const Transport = struct {
             .cookie = cookie,
             .kex_algorithms = kex_names,
             .server_host_key_algorithms = host_keys,
-            .encryption_algorithms_client_to_server = &encryption_algorithms,
-            .encryption_algorithms_server_to_client = &encryption_algorithms,
-            .mac_algorithms_client_to_server = &mac_algorithms,
-            .mac_algorithms_server_to_client = &mac_algorithms,
+            .encryption_algorithms_client_to_server = t.algorithms.ciphers,
+            .encryption_algorithms_server_to_client = t.algorithms.ciphers,
+            .mac_algorithms_client_to_server = t.algorithms.macs,
+            .mac_algorithms_server_to_client = t.algorithms.macs,
             .compression_algorithms_client_to_server = &compression_algorithms,
             .compression_algorithms_server_to_client = &compression_algorithms,
             .languages_client_to_server = empty,
@@ -2771,7 +2855,7 @@ fn clientKexRoundBody(
     var server_kex = try KexInit.decode(gpa, &sreader);
     defer server_kex.deinit(gpa);
 
-    const neg = try negotiate(server_kex);
+    const neg = try negotiate(t.algorithms, server_kex);
     t.negotiated = neg;
     if (round == .initial) t.strict_kex = t.offer_strict_kex and offersExtInfo(server_kex.kex_algorithms, kex_strict_s);
 
@@ -2864,6 +2948,54 @@ pub fn connectInto(
 
 // ── tests ──────────────────────────────────────────────────────────────────
 
+test "Algorithms.validate: defaults pass; empty, unknown, duplicate and pseudo-algorithm names are refused" {
+    const t = std.testing;
+    try (Algorithms{}).validate();
+    const empty: []const []const u8 = &.{};
+    try t.expectError(error.UnsupportedAlgorithm, (Algorithms{ .macs = empty }).validate());
+    const unknown = [_][]const u8{ "chacha20-poly1305@openssh.com", "3des-cbc" };
+    try t.expectError(error.UnsupportedAlgorithm, (Algorithms{ .ciphers = &unknown }).validate());
+    const dup = [_][]const u8{ "curve25519-sha256", "curve25519-sha256" };
+    try t.expectError(error.UnsupportedAlgorithm, (Algorithms{ .kex = &dup }).validate());
+    // The RFC 8308 / strict-KEX indicators are appended by us, never
+    // configured: as methods they would be negotiable.
+    const pseudo = [_][]const u8{ "curve25519-sha256", ext_info_c };
+    try t.expectError(error.UnsupportedAlgorithm, (Algorithms{ .kex = &pseudo }).validate());
+    const strict = [_][]const u8{kex_strict_c};
+    try t.expectError(error.UnsupportedAlgorithm, (Algorithms{ .kex = &strict }).validate());
+    // Case matters on the wire (RFC 4251 §6).
+    const upper = [_][]const u8{"SSH-ED25519"};
+    try t.expectError(error.UnsupportedAlgorithm, (Algorithms{ .host_keys = &upper }).validate());
+}
+
+test "negotiate: our configured order decides; the result is the module's constant" {
+    const t = std.testing;
+    var server_kex = kexInitFor(&compression_algorithms);
+    const ours = [_][]const u8{ "aes256-gcm@openssh.com", "aes256-ctr" };
+    const neg = try negotiate(.{ .ciphers = &ours }, server_kex);
+    try t.expectEqualStrings("aes256-gcm@openssh.com", neg.cipher_c2s);
+    try t.expect(neg.cipher_c2s.ptr == canonicalName(&supported_encryption_algorithms, "aes256-gcm@openssh.com").?.ptr);
+    try t.expect(neg.mac_c2s == null); // AEAD
+    // The server not offering it falls through to our next choice.
+    const server_ciphers = [_][]const u8{ "chacha20-poly1305@openssh.com", "aes256-ctr" };
+    server_kex.encryption_algorithms_client_to_server = &server_ciphers;
+    const neg2 = try negotiate(.{ .ciphers = &ours }, server_kex);
+    try t.expectEqualStrings("aes256-ctr", neg2.cipher_c2s);
+    try t.expectEqualStrings("hmac-sha2-256", neg2.mac_c2s.?);
+}
+
+test "offeredKexAlgorithms: a configured list is offered as given, indicators appended" {
+    const t = std.testing;
+    var offered: [offered_kex_len][]const u8 = undefined;
+    const mine = [_][]const u8{"diffie-hellman-group16-sha512"};
+    const got = offeredKexAlgorithms(&offered, &mine, .client, .initial);
+    try t.expectEqual(@as(usize, 3), got.len);
+    try t.expectEqualStrings("diffie-hellman-group16-sha512", got[0]);
+    try t.expectEqualStrings(ext_info_c, got[1]);
+    try t.expectEqualStrings(kex_strict_c, got[2]);
+    try t.expectEqual(@as(usize, 1), offeredKexAlgorithms(&offered, &mine, .server, .rekey).len);
+}
+
 test "algorithm name-lists are non-empty" {
     const t = std.testing;
     try t.expect(kex_algorithms.len > 0);
@@ -2908,7 +3040,7 @@ fn kexInitFor(compression: []const []const u8) KexInit {
 // exactly like every other name-list already was.
 test "negotiate refuses a server that offers no overlapping compression algorithm" {
     const server_kex = kexInitFor(&[_][]const u8{"zlib@openssh.com"});
-    try std.testing.expectError(error.UnsupportedAlgorithm, negotiate(server_kex));
+    try std.testing.expectError(error.UnsupportedAlgorithm, negotiate(.{}, server_kex));
 }
 
 // Positive control for the same fix, required by the fixer brief: the
@@ -2916,7 +3048,7 @@ test "negotiate refuses a server that offers no overlapping compression algorith
 // negotiate cleanly and record what was picked.
 test "negotiate accepts a server offering \"none\" compression, both directions" {
     const server_kex = kexInitFor(&compression_algorithms);
-    const neg = try negotiate(server_kex);
+    const neg = try negotiate(.{}, server_kex);
     try std.testing.expectEqualStrings("none", neg.compression_c2s);
     try std.testing.expectEqualStrings("none", neg.compression_s2c);
 }
@@ -2960,17 +3092,17 @@ test "the RFC 8308 indicators are never negotiable" {
         try t.expect(!std.mem.eql(u8, name, ext_info_s));
     }
     var offered: [offered_kex_len][]const u8 = undefined;
-    const as_client = offeredKexAlgorithms(&offered, .client, .initial);
+    const as_client = offeredKexAlgorithms(&offered, &kex_algorithms, .client, .initial);
     try t.expectEqual(offered_kex_len, as_client.len);
     try t.expectEqualStrings(ext_info_c, as_client[as_client.len - 2]);
     try t.expectEqualStrings(kex_strict_c, as_client[as_client.len - 1]);
     try t.expectEqualStrings(kex_algorithms[0], as_client[0]);
-    const as_server = offeredKexAlgorithms(&offered, .server, .initial);
+    const as_server = offeredKexAlgorithms(&offered, &kex_algorithms, .server, .initial);
     try t.expectEqualStrings(ext_info_s, as_server[as_server.len - 2]);
     try t.expectEqualStrings(kex_strict_s, as_server[as_server.len - 1]);
     // A re-exchange carries the methods only (no indicator is meaningful
     // after the first KEXINIT).
-    const rekey = offeredKexAlgorithms(&offered, .client, .rekey);
+    const rekey = offeredKexAlgorithms(&offered, &kex_algorithms, .client, .rekey);
     try t.expectEqual(kex_algorithms.len, rekey.len);
     for (kex_algorithms) |name| {
         try t.expect(!std.mem.eql(u8, name, kex_strict_c));

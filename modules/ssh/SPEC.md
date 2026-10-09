@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [cataggar/sshz](https://github.com/cataggar/sshz) | Zig | MIT | 1 | push 2026-09-11 (no releases) | The closest competitor and Zig 0.16: its README lists client and server, keyboard-interactive, publickey/password/none, "multiple channels, sessions, port forwarding, and agent forwarding", rekeying, delayed compression, interop with OpenSSH, Dropbear and libssh. Newer and much broader than this module; source not read. |
 | [ringtailsoftware/misshod](https://github.com/ringtailsoftware/misshod) | Zig | MIT | 32 | push 2025-01-06 | Its README: "not secure, should not be used in real world systems"; exactly one algorithm of each kind. Narrower than this module. |
 
-**Where we are ahead:** against the Zig implementations whose READMEs we read: the ML-KEM-768/X25519 hybrid KEX plus curve25519 and DH group14/16, rsa-sha2 and P-256 host keys, ChaCha20-Poly1305 and AES-GCM ciphers, RFC 8308 `server-sig-algs`, server role included (misshod: one algorithm of each kind; sshz README states no algorithm list, so its algorithm set is unchecked) · **Where we are behind:** no SFTP, no certificates or `ssh-agent`, no X11/agent forwarding, no server-side TCP/IP forwarding (the server owns no sockets by design), no `hostbased`, a fixed algorithm menu without legacy CTR/SHA-1 options, and server handlers that are one-shot callbacks (a "shell" served here is batch, not a pty driving a process) (SPEC "Backlog / deferred"); sshz advertises agent forwarding and Dropbear/libssh interop besides.
+**Where we are ahead:** against the Zig implementations whose READMEs we read: the ML-KEM-768/X25519 hybrid KEX plus curve25519 and DH group14/16, rsa-sha2 and P-256 host keys, ChaCha20-Poly1305 and AES-GCM ciphers, RFC 8308 `server-sig-algs`, server role included (misshod: one algorithm of each kind; sshz README states no algorithm list, so its algorithm set is unchecked) · **Where we are behind:** no SFTP, no certificates or `ssh-agent`, no X11/agent forwarding, no server-side TCP/IP forwarding (the server owns no sockets by design), no `hostbased`, no aes128/192-ctr, hmac-sha2-512, `-etm` MACs, NIST ECDH or legacy SHA-1 options yet (lists configurable, menu narrower than Go's), and server handlers that are one-shot callbacks (a "shell" served here is batch, not a pty driving a process) (SPEC "Backlog / deferred"); sshz advertises agent forwarding and Dropbear/libssh interop besides.
 
 **Re-assessed 2026-10-06** (no new web survey): the survey's "missing and it matters" items for the main uses are in — rekeying both roles (with OpenSSH strict KEX and SSH_MSG_UNIMPLEMENTED), several channels per connection both roles (`connection.Connection` / `serveConnection`), `pty-req`/`shell`/`env`/`window-change`/`signal`/`exit-signal`, client TCP/IP forwarding both directions (`direct-tcpip`, `tcpip-forward`), and `keyboard-interactive` both roles — each live-tested against OpenSSH 10.2p1 (and Go `x/crypto/ssh` for keyboard-interactive). What remains behind is the list above. Scope `mvp` → `core`.
 
@@ -70,12 +70,23 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Transport-agnostic:** `Transport` takes an already-connected `std.Io.Reader`/`std.Io.Writer`
   pair, same shape as the sibling `opcua` module's `Connection` — this module never opens a socket
   itself, and never spawns a process (see the server-side `CommandHandler` seam below).
-- **Algorithm menu is fixed, not negotiable-by-config:** `kex_algorithms` (mlkem768x25519-sha256,
-  curve25519-sha256 + `@libssh.org`, diffie-hellman-group14-sha256/group16-sha512),
-  `server_host_key_algorithms` (ssh-ed25519, rsa-sha2-256/512, ecdsa-sha2-nistp256),
-  `encryption_algorithms` (chacha20-poly1305@openssh.com, aes256-ctr, aes256-gcm@openssh.com,
-  aes128-gcm@openssh.com), `mac_algorithms` (hmac-sha2-256), `compression_algorithms` (none only).
-  One list is caller-narrowable, and only downward: `ServerConfig.server_sig_algs` (below).
+- **Algorithm lists are runtime-configurable (Go `Config.KeyExchanges/Ciphers/MACs`,
+  `ClientConfig.HostKeyAlgorithms`; 2026-10-09).** `transport.Algorithms` (`kex`, `host_keys`,
+  `ciphers`, `macs`, most-preferred first) sits on `Transport.algorithms` (client: set before
+  `clientHandshake`) and `ServerConfig.algorithms` (server); every exchange of the connection,
+  re-exchanges included, offers and negotiates from it. Defaults are `kex_algorithms`
+  (mlkem768x25519-sha256, curve25519-sha256 + `@libssh.org`, diffie-hellman-group14-sha256/
+  group16-sha512), `server_host_key_algorithms` (ssh-ed25519, rsa-sha2-256/512,
+  ecdsa-sha2-nistp256), `encryption_algorithms` (chacha20-poly1305@openssh.com, aes256-ctr,
+  aes256-gcm@openssh.com, aes128-gcm@openssh.com), `mac_algorithms` (hmac-sha2-256); the ceiling is
+  the `supported_*` lists (equal today; a legacy opt-in will live only there). `Algorithms.validate`
+  refuses an empty list, a duplicate, or a name outside `supported_*` with
+  `error.UnsupportedAlgorithm` before anything is sent — the RFC 8308 and strict-KEX indicators are
+  outside `supported_kex_algorithms`, so they cannot be configured as methods either. Negotiated
+  names are canonicalised to the module's constants (`canonicalName`), so `Transport.negotiated`
+  never points into a caller's list. A server's host-key list is the keys it holds, not
+  `Algorithms.host_keys`. `compression_algorithms` stays `none` only. `ServerConfig.server_sig_algs`
+  (below) is narrowable downward.
 - **RFC 8308 extension negotiation, both roles.** The client appends `ext-info-c` and the server
   `ext-info-s` to the `kex_algorithms` they *send* (§2.1); `transport.kex_algorithms`, the list both
   sides negotiate against, never contains either, so §2.2's "if these names become negotiated as key
@@ -361,8 +372,7 @@ for the owner):
   `reserved` `uint32` likewise. Both are per RFC 4253 §7.1: the language name-lists are advisory
   (this module sends them empty) and `reserved` is "for future extension", to be sent as 0. Named
   here only because "decoded and discarded" is otherwise indistinguishable from an oversight.
-- **Fixed algorithm menu; no curve25519 KAT.** The fixed algorithm-menu
-  constants are still not runtime-configurable. RFC 8731 publishes no curve25519-sha256 test
+- **No curve25519 KAT.** (The algorithm lists became runtime-configurable 2026-10-09.) RFC 8731 publishes no curve25519-sha256 test
   vectors anywhere — its §5 is IANA Considerations only, and the RFC as a whole has no
   vectors/examples section — so there is no independent KAT to wire for it; this was a
   misstatement in an earlier revision of this note, not an open task.
@@ -393,13 +403,14 @@ for the owner):
   (CML workspace). This settles the two policy items below: the algorithm menu widens to Go's set and
   becomes configurable, legacy algorithms come as explicit opt-ins (Go's `Insecure*`: DSA, CBC/3DES,
   RC4, DH-sha1, `ssh-rsa` SHA-1; off by default), GSSAPI is in scope. Phases:
-  P1 encrypted ed25519/ecdsa OpenSSH keys, aes-ctr 128/192, hmac-sha2-512 and `-etm` MACs,
-  ecdh-sha2-nistp256/384/521, ecdsa-nistp384/521, DH group-exchange, configurable algorithm lists;
+  P1 ~~encrypted ed25519/ecdsa OpenSSH keys~~ (done 2026-10-09), ~~configurable algorithm lists~~
+  (done 2026-10-09, `transport.Algorithms`), aes-ctr 128/192, hmac-sha2-512 and `-etm` MACs,
+  ecdh-sha2-nistp256/384/521, ecdsa-nistp384/521, DH group-exchange;
   P2 public-key layer (ParsePublicKey / authorized_keys / fingerprints), known_hosts, auth
   orchestration (none probe, multi-key, partial success, multi-round keyboard-interactive);
   P3 server API in Go's shape (channels and requests to the app), streamlocal, Signer + ssh-agent,
   certificates, GSSAPI, legacy opt-ins.
-- **Legacy-compat algorithms (`aes128-ctr`, `hmac-sha2-512`, `ecdsa-sha2-nistp384/521`, `curve25519` variants, `ssh-rsa` opt-in)** *(survey 2026-09-30)*. The fixed algorithm menu (see Design) will fail against older network gear that offers only CTR ciphers/HMAC-SHA1; russh offers "opt-in legacy". Whether to widen the menu is a policy question (fixed menu is a deliberate choice) — question for the owner, not filed as a task.
+- **Legacy-compat algorithms (`aes128-ctr`, `hmac-sha2-512`, `ecdsa-sha2-nistp384/521`, `curve25519` variants, `ssh-rsa` opt-in)** *(survey 2026-09-30)*. Older network gear offers only CTR ciphers/HMAC-SHA1; russh offers "opt-in legacy". **Settled by the owner 2026-10-09** (Go parity item above): widen to Go's set, legacy as explicit opt-ins; the lists are configurable since 2026-10-09.
 - **OpenSSH user certificates (`*-cert-v01@openssh.com`), `ssh-agent` client, `known_hosts` parsing** *(survey 2026-09-30)*. Certificates and agent already listed as not done; `known_hosts` is left to the caller's host-key policy callback by design (README). Effort: small-medium each. Fit §2.
 
 ## Status

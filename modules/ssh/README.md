@@ -238,8 +238,23 @@ Top-level shortcuts: `ssh.authenticate` (client publickey auth),
 (= `ssh.connection.exec`). Namespaces: `ssh.transport`, `ssh.server`,
 `ssh.userauth`, `ssh.connection`, `ssh.messages`.
 
+Algorithm preferences are per connection, like Go's `ssh.Config`:
+
+```zig
+var t = ssh.transport.Transport.init(&sr.interface, &sw.interface);
+t.algorithms = .{
+    .kex = &.{ "curve25519-sha256", "diffie-hellman-group16-sha512" },
+    .ciphers = &.{ "aes256-gcm@openssh.com", "chacha20-poly1305@openssh.com" },
+};
+try t.clientHandshake(gpa, policy);
+// server: ssh.server.ServerConfig{ .host_keys = keys, .algorithms = .{ ... } }
+```
+
+Unset fields keep the defaults; a name outside `transport.supported_*_algorithms`,
+an empty list or a duplicate is `error.UnsupportedAlgorithm` before anything is sent.
+
 See `src/transport.zig` for the full client transport API (algorithm
-name-list constants, `KexInit`, `exchangeVersions`, `Packet`/`CipherState`/
+name-list constants, `Algorithms`, `KexInit`, `exchangeVersions`, `Packet`/`CipherState`/
 `readPacket`/`writePacket`, `HostKeyVerifier`/`HostKeyInfo`/`HostKeyVerdict`/
 `HostKeyPolicy`/`HostKeyFailure`, `NegotiatedAlgorithms`, `Transport`/`connect`),
 `src/server.zig` for the server transport API (`HostKey`, `ServerConfig`,

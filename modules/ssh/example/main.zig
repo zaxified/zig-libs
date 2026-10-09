@@ -28,7 +28,7 @@ pub fn main() !void {
     // §2.1 `ext-info-c` indicator (this side accepts SSH_MSG_EXT_INFO) and
     // OpenSSH's strict-KEX indicator to the module's own `kex_algorithms`.
     var kex_buf: [transport.offered_kex_len][]const u8 = undefined;
-    const offered_kex = transport.offeredKexAlgorithms(&kex_buf, .client, .initial);
+    const offered_kex = transport.offeredKexAlgorithms(&kex_buf, &transport.kex_algorithms, .client, .initial);
 
     const cookie: [16]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     const sent: transport.KexInit = .{

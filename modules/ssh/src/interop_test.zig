@@ -611,6 +611,8 @@ test "live: a real ssh client re-keys every 32 KiB against our server — we fol
     defer fx.deinit();
     const auth = try fx.authenticate();
     connection.serveSession(&fx.t, gpa, .{ .user = auth.user(), .exec = big_output_handler, .stdin_mode = .ignore }) catch |e| {
+        // The test runner reports only "failed"; name the error for the next one.
+        std.debug.print("serveSession: {t} after {d} key exchange(s)\n", .{ e, fx.t.kex_count });
         const out = fx.finish() catch null;
         if (out) |o| gpa.free(o);
         fx.dumpErr();

@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **Added:** runtime-configurable algorithm lists, Go x/crypto/ssh `Config` parity:
+  `transport.Algorithms` (`kex`, `host_keys`, `ciphers`, `macs`) on `Transport.algorithms` (client)
+  and `ServerConfig.algorithms` (server), used by every exchange incl. re-exchanges; ceiling lists
+  `supported_*_algorithms`; `Algorithms.validate` refuses an empty list, a duplicate or an unsupported
+  name (`error.UnsupportedAlgorithm`) before anything is sent; negotiated names are the module's
+  constants (`canonicalName`), never slices into the caller's lists. **Changed (BREAKING, minor):**
+  `offeredKexAlgorithms` takes the method list as a new second argument. Defaults unchanged, so
+  the wire is unchanged. Tests: client order decides / server list restricts / disjoint lists refused
+  over loopback, validation cases, pointer identity of negotiated names. The live 32 KiB client-rekey
+  test now prints the `serveSession` error name on failure (it failed 3 of ~60 runs under load ~6,
+  passed 30/30 quiet; recorded as load-flaky).
+
 - **2026-10-09** — **Added:** passphrase-protected ed25519 and ecdsa-p256 OpenSSH keys load through
   `HostKey.fromOpenSSH` / `AuthKey.fromOpenSSH` / `parseEd25519OpenSSH` / `parseEcdsaP256OpenSSH`
   (bcrypt + aes256-ctr/-cbc via rsa's `opensshDecryptSection`, as Go's x/crypto/ssh reads every key
