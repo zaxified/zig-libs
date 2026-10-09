@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING (error set) / SECURITY:** `fromOpenSSH` refuses a bcrypt round
+  count above `max_openssh_kdf_rounds` (2048) with the new `error.KdfRoundsTooLarge`; the count
+  comes from the key file and bcrypt_pbkdf is linear in it, so `rounds = 2^32-1` pinned the
+  caller's CPU indefinitely. Same cap as Go's x/crypto/ssh. Found by `RSA_FUZZ`.
 - **2026-10-09** — tests: deterministic fuzz driver `RSA_FUZZ` over the existing harnesses (the six key-parser harnesses also run a "mutated" overlay: a genuine fixture damaged in 0-3 octets / truncated; an undamaged one must be accepted as the 2048-bit key).
 - **2026-10-09** — **BREAKING:** `selfSignedCert` takes the secret key by pointer (`sk: *const SecretKey`; call sites in x509, opcua, ocsp, saml, iec62351 migrated). `openssh.bcryptPbkdf` and `openssh.Blowfish.init` now run under a burn (`burn.kdf_burn`); `Blowfish.expandState` / `expand0State` and `eksBlowfishSetup` are no longer `pub` (nothing outside `openssh.zig` used them; `bcryptPbkdf` / `bcryptHash` / `init` are the entry points). Probe: `src/stackprobe2_test.zig`.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the new ReleaseFast stack

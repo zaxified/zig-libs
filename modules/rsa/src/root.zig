@@ -1887,6 +1887,14 @@ fn pemDecodeBody(text: []const u8) PemError!PemBlock {
 // algorithm — the latter implemented from scratch in openssh.zig together
 // with Blowfish (Schneier's spec); see that file's provenance note.
 
+/// The largest bcrypt round count `fromOpenSSH` accepts from a key file:
+/// 2048, 128x ssh-keygen's default of 16 and a few seconds of CPU. OpenSSH
+/// itself sets no bound (ssh-keygen -a takes anything up to INT_MAX); the cap
+/// and its value follow Go's x/crypto/ssh (`maxRounds = 1 << 11`). Found by
+/// RSA_FUZZ (`rsa-openssh` HANG, 2026-10-09): `rounds = 2^32-1` in the
+/// kdfoptions ran for over 120 s before the watchdog.
+pub const max_openssh_kdf_rounds: u32 = 1 << 11;
+
 pub const FromOpenSSHError = error{
     MissingPemBlock,
     InvalidPem,
@@ -1900,6 +1908,10 @@ pub const FromOpenSSHError = error{
     UnsupportedCipher,
     /// A kdfname other than none/bcrypt.
     UnsupportedKdf,
+    /// The bcrypt round count stored in the key file is above
+    /// `max_openssh_kdf_rounds`. bcrypt_pbkdf's cost is linear in it and the
+    /// file sets it, so an uncapped value pins the caller's CPU for months.
+    KdfRoundsTooLarge,
     /// The decrypted check-int pair does not match (wrong passphrase; also
     /// reported for an empty passphrase against an encrypted key).
     IncorrectPassphrase,
@@ -2030,6 +2042,7 @@ fn fromOpensshBinary(bin: []const u8, passphrase: []const u8) FromOpenSSHError!S
     const salt = try kr.readString();
     const rounds = try kr.readU32();
     if (kr.rest().len != 0 or salt.len == 0 or rounds == 0) return error.InvalidOpenSSH;
+    if (rounds > max_openssh_kdf_rounds) return error.KdfRoundsTooLarge;
     if (private_section.len == 0 or private_section.len % cipher.blockLen() != 0) {
         return error.InvalidOpenSSH;
     }
@@ -4604,6 +4617,18 @@ test "fromOpenSSH: rejects unsupported cipher/kdf and foreign PEM labels" {
         var b = OpensshTestBuilder{};
         _ = b.raw("openssh-key-v1\x00").str("chacha20-poly1305@openssh.com").str("bcrypt").str("").int(1).str("").str("");
         try testing.expectError(error.UnsupportedCipher, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), "pw"));
+    }
+    { // bcrypt rounds above the cap (RSA_FUZZ HANG, 2026-10-09): refused
+        // before any KDF work, at the first value over it and at the maximum.
+        for ([_]u32{ max_openssh_kdf_rounds + 1, 0xffff_ffff }) |rounds| {
+            var opts: [4 + 16 + 4]u8 = undefined;
+            std.mem.writeInt(u32, opts[0..4], 16, .big);
+            @memset(opts[4..20], 0x5a);
+            std.mem.writeInt(u32, opts[20..24], rounds, .big);
+            var b = OpensshTestBuilder{};
+            _ = b.raw("openssh-key-v1\x00").str("aes256-ctr").str("bcrypt").str(&opts).int(1).str("").str(&([_]u8{0} ** 16));
+            try testing.expectError(error.KdfRoundsTooLarge, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), "pw"));
+        }
     }
     { // unknown kdf
         var b = OpensshTestBuilder{};
