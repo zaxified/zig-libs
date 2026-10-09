@@ -33,6 +33,7 @@ const router = @import("router");
 const http = @import("http");
 const cookies = @import("cookies");
 const burn = @import("burn.zig");
+const idhex = @import("idhex.zig");
 
 /// The MAC primitive: HMAC-SHA256.
 pub const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -81,7 +82,9 @@ pub const Csrf = struct {
     fn tokenBody(c: *const Csrf, session_id: []const u8, out: *[token_hex_len]u8) []const u8 {
         var mac: [mac_length]u8 = undefined;
         Hmac.create(&mac, session_id, &c.key);
-        out.* = std.fmt.bytesToHex(mac, .lower);
+        // Not `std.fmt.bytesToHex`: it indexes a table by the secret nibble
+        // (8 memcheck contexts here, ctgrind `sessions/csrf`, 2026-10-09).
+        idhex.encode(out, &mac);
         return out;
     }
 
@@ -93,12 +96,17 @@ pub const Csrf = struct {
     }
 
     fn verifyBody(c: *const Csrf, session_id: []const u8, presented_tok: []const u8) bool {
-        if (presented_tok.len != token_hex_len) return false;
+        if (presented_tok.len != token_hex_len) return false; // length is public
+        // Not `std.fmt.hexToBytes`: it branches on each character's class,
+        // and a legitimate presented token IS the secret token (6 memcheck
+        // contexts here, ctgrind `sessions/csrf`, 2026-10-09). The validity
+        // bit is folded in after the compare, not branched on before it.
         var got: [mac_length]u8 = undefined;
-        _ = std.fmt.hexToBytes(&got, presented_tok) catch return false;
+        const hex_ok = idhex.decode(&got, presented_tok);
         var want: [mac_length]u8 = undefined;
         Hmac.create(&want, session_id, &c.key);
-        return std.crypto.timing_safe.eql([mac_length]u8, want, got);
+        const mac_ok = std.crypto.timing_safe.eql([mac_length]u8, want, got);
+        return (@intFromBool(mac_ok) & hex_ok) == 1;
     }
 
     /// The token presented on `req`: the header value first, then the
@@ -579,6 +587,25 @@ test "middleware and Csrf.check agree: a request the middleware 403s also fails 
 }
 
 // ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+test "verify: a non-hex character that decodes to the right nibble is still rejected" {
+    // `idhex.decode` maps an invalid character to 0 and reports it only in
+    // its validity bit, so the MAC compare alone would accept a valid token
+    // whose `0` digit is replaced by any non-hex byte. The bit must count.
+    var key: [32]u8 = @splat(0x30);
+    var buf: [token_hex_len]u8 = undefined;
+    const at = while (true) : (key[0] +%= 1) {
+        const tok = (Csrf{ .key = key }).token("sid", &buf);
+        if (std.mem.indexOfScalar(u8, tok, '0')) |i| break i;
+    };
+    const c = Csrf{ .key = key };
+    try testing.expect(c.verify("sid", &buf)); // control
+    for ("gz G/:@`\x00\xff") |bad| {
+        var forged = buf;
+        forged[at] = bad;
+        try testing.expect(!c.verify("sid", &forged));
+    }
+}
 
 test "verify: a token must be exactly 64 hex digits — a prefix of the right one fails" {
     // `verify` doc: "A wrong length or non-hex token is rejected". The raw MAC

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Constant time: new `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh stun`, targets `mi`, `ltkey`). The MESSAGE-INTEGRITY key through `Builder.addMessageIntegrity` and `Message.verifyMessageIntegrity` (valid and tampered message), and the password through `longTermKey`, show 0 secret-dependent contexts in ReleaseFast. Pinned in `ctgrind-expected.tsv`. No code change.
+
 - **2026-10-09** — tests: deterministic fuzz driver `STUN_FUZZ` over the existing harnesses.
 
 - **2026-10-09** — **BREAKING:** `longTermKey(out: *[16]u8, username, realm, password) void` writes the key into `out` (was: returned `[16]u8` by value, leaving a copy in the caller's frame); migrate with `var key: [16]u8 = undefined; longTermKey(&key, ...)` and wipe `key` after use. `longTermKey` (8 KiB), `Builder.addMessageIntegrity` and `Message.verifyMessageIntegrity` (2 KiB, per packet) now run under dead-stack burns (`burn.zig`); new `stackprobe_test.zig` on `testkit.stackprobe`.

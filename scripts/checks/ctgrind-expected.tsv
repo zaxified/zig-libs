@@ -219,7 +219,7 @@ oscore	ReleaseFast	unprotect	1	1	c7415c327c50437c	ed85db89e3d7e9fd
 # reaches the exchange hash whatever the code does. `ffpow`: POSITIVE CONTROL,
 # the same K through the std.crypto.ff pow dhPowModPrime used until this date
 # — its window select compiles to a jump in ReleaseFast. It must stay >= 1.
-ssh	ReleaseFast	dh	1	4	1b999c6d2dbb6a22	95639ff37028e502
+ssh	ReleaseFast	dh	1	4	e9c9b65abe224f58	95639ff37028e502
 ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # ct25519 — columns below are `total_min in_file`, NOT "in_file total_min".
 # Row 1's `1 0` is `total_min=1, in_file=0`: ct25519's OWN code has zero
@@ -1030,3 +1030,19 @@ groth16	ReleaseFast	zkprove_vt	1	>=10	c5f4a202c843392d	928bc8e1cc116243
 # SHA-256 + ours at 33 and 1000 B. All contexts are the hex witness.
 ripemd160	ReleaseFast	hash	1	0	253ec0e585e73059	247e27e8a7e8ddd7
 ripemd160	ReleaseFast	hash160	1	0	253ec0e585e73059	dc357526ecc9275d
+# stun (2026-10-09) — mi: the MESSAGE-INTEGRITY HMAC-SHA1 key tainted through
+# Builder.addMessageIntegrity + verifyMessageIntegrity (valid and tampered);
+# ltkey: the password through longTermKey (MD5). All contexts are the witness.
+stun	ReleaseFast	mi	1	0	0db158b97faffcd3	9f2207d86c2e2592
+stun	ReleaseFast	ltkey	1	0	0db158b97faffcd3	f48e64fbf4283df1
+# sessions (2026-10-09) — csrf: the CSRF key through Csrf.token + verify
+# (8 in-file before idhex: std.fmt.bytesToHex's table index, then 6 from
+# std.fmt.hexToBytes on the presented = secret token); newid: the session-id
+# bytes through idhex.encode (what Manager.newId runs on its draw).
+sessions	ReleaseFast	csrf	1	0	dbc4af1d88549dad	f2cf7c06791be126
+sessions	ReleaseFast	newid	1	0	8994a7285f5380a6	7a197b81f402a7ea
+# mqtt (2026-10-09) — CONNECT password + 5.0 authentication data tainted
+# through encodePacket (CONNECT 3.1.1/5.0, AUTH) and, as wire bytes only,
+# through decodePacket. The codec copies/slices them and nothing else.
+mqtt	ReleaseFast	encode	1	0	10e691c441a4a4a7	f9bc065c9f983504
+mqtt	ReleaseFast	decode	1	0	10e691c441a4a4a7	c3c3038ba153dcbb

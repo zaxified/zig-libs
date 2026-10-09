@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — docs: ct axis recorded as n/a: no auth token, key or crypto; `looksLikeSecretField` checks schema field names only (code review).
 - **2026-10-09** — tests: deterministic fuzz driver `MCP_FUZZ` over the existing harnesses (`handleMessage` on arbitrary and on damaged corpus lines, client responses).
 
 - **2026-10-06** — **Evidence MIXED → EXTERNAL: the official MCP Python SDK 2.3.0 as a differential

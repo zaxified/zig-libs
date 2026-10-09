@@ -69,6 +69,7 @@ const entropy = @import("entropy");
 const kv = @import("kv");
 
 const csrf = @import("csrf.zig");
+const idhex = @import("idhex.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -829,11 +830,9 @@ pub const Manager = struct {
         // which cannot fail either), so there is no way to report a
         // degraded draw and every id after it would be forgeable.
         entropy.fill(m.io, slice);
-        const hex = "0123456789abcdef";
-        for (slice, 0..) |b, i| {
-            out.id_buf[2 * i] = hex[b >> 4];
-            out.id_buf[2 * i + 1] = hex[b & 0x0f];
-        }
+        // Branch- and table-free: a `"0123456789abcdef"[b >> 4]` lookup
+        // indexes memory by the secret id (ctgrind `sessions/newid`).
+        idhex.encode(out.id_buf[0 .. 2 * slice.len], slice);
         out.id_len = m.id_bytes * 2;
     }
 
@@ -924,6 +923,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 
 test {
     _ = csrf;
+    _ = idhex;
     _ = @import("stackprobe_test.zig");
 }
 

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Constant time: the session id and the CSRF token were hex-encoded through a table indexed by the secret nibble (`newId`'s `"0123456789abcdef"[b >> 4]`, `std.fmt.bytesToHex` in `Csrf.token`). `Csrf.verify` also decoded the presented token, which is the secret token on a legitimate request, with the per-character branching `std.fmt.hexToBytes`. A new private `src/idhex.zig` does branch- and table-free encode/decode, with the hex-validity bit ANDed after the MAC compare instead of branched on first. Accepted inputs are unchanged (either-case hex, exhaustively cross-checked against std). New `src/ctgrind_harness.zig` (targets `csrf`, `newid`): `csrf` went from 8 to 0 in-file contexts in ReleaseFast. New test: a non-hex byte that decodes to the right nibble is rejected. No API change.
+
 - **2026-10-09** — tests: deterministic fuzz driver `SESSIONS_FUZZ` over the existing harnesses (session-record decode, cookie header parse, each also over damaged corpus entries).
 
 - **2026-10-09** — Dead-stack burn: `Csrf.token` and `Csrf.verify` (HMAC-SHA256 under the CSRF key) run their bodies under a 4 KiB per-message `burn.run` (new `src/burn.zig`); new `stackprobe_test.zig` on `testkit.stackprobe`. No signature change.

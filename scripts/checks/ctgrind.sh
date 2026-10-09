@@ -259,6 +259,11 @@ declare -A TARGETS=(
     [aesgcm]="ctx stateless generic"
     # ── 2026-10-09: ripemd160 (unkeyed; the MESSAGE is the secret) ─────────
     [ripemd160]="hash hash160"
+    # ── 2026-10-09: consumed modules (ct-wave): MESSAGE-INTEGRITY key /
+    # long-term password, CSRF key + session id, MQTT password + auth data ──
+    [stun]="mi ltkey"
+    [sessions]="csrf newid"
+    [mqtt]="encode decode"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -309,6 +314,9 @@ declare -A MODES=(
     [bip32]="ReleaseFast"
     [aesgcm]="ReleaseFast"
     [ripemd160]="ReleaseFast"
+    [stun]="ReleaseFast"
+    [sessions]="ReleaseFast"
+    [mqtt]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -561,6 +569,12 @@ declare -A PATTERN=(
     [threshold_ecdsa/betaprime]='signing[.]zig|presign[.]zig|ecproofs[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
     [ripemd160/hash]='root[.]zig'
     [ripemd160/hash160]='root[.]zig|sha2[.]zig'
+    [stun/mi]='root[.]zig|hmac[.]zig|Sha1[.]zig|timing_safe[.]zig'
+    [stun/ltkey]='root[.]zig|md5[.]zig'
+    [sessions/csrf]='root[.]zig|csrf[.]zig|idhex[.]zig|hmac[.]zig|sha2[.]zig|timing_safe[.]zig'
+    [sessions/newid]='root[.]zig|idhex[.]zig'
+    [mqtt/encode]='packet[.]zig'
+    [mqtt/decode]='packet[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 # WITNESS_CHAIN — the files a witness's stack may consist of BETWEEN the
@@ -722,6 +736,12 @@ declare -A LABEL=(
     [aesgcm/generic]='aesgcm Context generic+std (key+pt)'
     [ripemd160/hash]='ripemd160 hash+stream (message tainted)'
     [ripemd160/hash160]='ripemd160 hash160 = std sha256+ours'
+    [stun/mi]='stun MESSAGE-INTEGRITY add+verify (key tainted)'
+    [stun/ltkey]='stun longTermKey MD5 (password tainted)'
+    [sessions/csrf]='sessions Csrf.token+verify (key tainted)'
+    [sessions/newid]='sessions session-id hex (idhex, id tainted)'
+    [mqtt/encode]='mqtt encode CONNECT/AUTH (password+auth data)'
+    [mqtt/decode]='mqtt decode CONNECT/AUTH (credential bytes tainted)'
 )
 
 # ── measurement ────────────────────────────────────────────────────────────

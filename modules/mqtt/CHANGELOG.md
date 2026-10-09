@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Constant time: new `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh mqtt`, targets `encode`, `decode`). The CONNECT password and the 5.0 authentication data go through `encodePacket` (CONNECT 3.1.1/5.0, AUTH) and, as tainted wire bytes, through `decodePacket` with 0 secret-dependent contexts in ReleaseFast. The codec only copies and slices them. Pinned in `ctgrind-expected.tsv`. No code change.
+
 - **2026-10-09** — tests: deterministic fuzz driver `MQTT_FUZZ` over the existing harnesses (v3.1.1 and v5 stream decoders, each also over damaged corpus streams).
 
 - **2026-10-09** — Dead-stack burn: `packet.encodePacket` (and so `encodeConnect`) runs its body under `burn.run` (12 KiB) when the packet is CONNECT (password) or AUTH (authentication data); PUBLISH and the rest are unchanged, no cost on the data path. New `stackprobe_test.zig` on `testkit.stackprobe`. No signature change.
