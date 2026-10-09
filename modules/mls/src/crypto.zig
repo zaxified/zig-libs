@@ -44,6 +44,7 @@ const std = @import("std");
 const hpke = @import("hpke");
 const codec = @import("codec.zig");
 const suite = @import("suite.zig");
+const burn = @import("burn.zig");
 
 /// The `"MLS 1.0 "` prefix RFC 9420 prepends to every `Label` argument of
 /// `ExpandWithLabel`/`SignWithLabel`/`EncryptWithLabel` (NOT `RefHash` —
@@ -153,7 +154,18 @@ pub fn kdfLabelLen(label: []const u8, context: []const u8) Error!usize {
 /// `error.LabelTooLong`.
 pub fn ExpandWithLabelScratch(
     comptime S: type,
-    secret: [S.Nh]u8,
+    secret: *const [S.Nh]u8,
+    label: []const u8,
+    context: []const u8,
+    out: []u8,
+    scratch: []u8,
+) Error!void {
+    return burn.run(burn.kdf_burn, Error!void, expandScratchBody, .{ S, secret, label, context, out, scratch });
+}
+
+fn expandScratchBody(
+    comptime S: type,
+    secret: *const [S.Nh]u8,
     label: []const u8,
     context: []const u8,
     out: []u8,
@@ -161,7 +173,12 @@ pub fn ExpandWithLabelScratch(
 ) Error!void {
     const length = std.math.cast(u16, out.len) orelse return error.LabelTooLong;
     const info = encodeKdfLabel(scratch, length, label, context) catch return error.LabelTooLong;
-    S.Hkdf.expand(out, info, secret);
+    S.Hkdf.expand(out, info, secret.*);
+}
+
+fn expandBody(comptime S: type, secret: *const [S.Nh]u8, label: []const u8, context: []const u8, out: []u8) Error!void {
+    var buf: [label_scratch_len]u8 = undefined;
+    return expandScratchBody(S, secret, label, context, out, &buf);
 }
 
 /// RFC 9420 §8 `ExpandWithLabel(Secret, Label, Context, Length) =
@@ -169,17 +186,15 @@ pub fn ExpandWithLabelScratch(
 /// (`Length = out.len`). Uses this file's fixed `label_scratch_len` stack
 /// buffer — see `ExpandWithLabelScratch` when `context` can be arbitrarily
 /// large.
-pub fn ExpandWithLabel(comptime S: type, secret: [S.Nh]u8, label: []const u8, context: []const u8, out: []u8) Error!void {
-    var buf: [label_scratch_len]u8 = undefined;
-    return ExpandWithLabelScratch(S, secret, label, context, out, &buf);
+pub fn ExpandWithLabel(comptime S: type, secret: *const [S.Nh]u8, label: []const u8, context: []const u8, out: []u8) Error!void {
+    return burn.run(burn.kdf_burn, Error!void, expandBody, .{ S, secret, label, context, out });
 }
 
 /// RFC 9420 §8 `DeriveSecret(Secret, Label) = ExpandWithLabel(Secret,
-/// Label, "", KDF.Nh)`.
-pub fn DeriveSecret(comptime S: type, secret: [S.Nh]u8, label: []const u8) Error![S.Nh]u8 {
-    var out: [S.Nh]u8 = undefined;
-    try ExpandWithLabel(S, secret, label, "", &out);
-    return out;
+/// Label, "", KDF.Nh)`, into `out` (which may alias `secret`: the KDF reads
+/// the whole key before it writes).
+pub fn DeriveSecret(comptime S: type, secret: *const [S.Nh]u8, label: []const u8, out: *[S.Nh]u8) Error!void {
+    return burn.run(burn.kdf_burn, Error!void, expandBody, .{ S, secret, label, "", out });
 }
 
 // ── §9.1: DeriveTreeSecret ────────────────────────────────────────────────
@@ -191,10 +206,10 @@ pub fn DeriveSecret(comptime S: type, secret: [S.Nh]u8, label: []const u8) Error
 /// derive ratchet keys/nonces/next-generation secrets — defined here per
 /// the task brief, ahead of the Secret Tree part itself, since it's pure
 /// composition of `ExpandWithLabel` plus one `uint32` encode.
-pub fn DeriveTreeSecret(comptime S: type, secret: [S.Nh]u8, label: []const u8, generation: u32, out: []u8) Error!void {
+pub fn DeriveTreeSecret(comptime S: type, secret: *const [S.Nh]u8, label: []const u8, generation: u32, out: []u8) Error!void {
     var ctx: [4]u8 = undefined;
     std.mem.writeInt(u32, &ctx, generation, .big);
-    try ExpandWithLabel(S, secret, label, &ctx, out);
+    return burn.run(burn.kdf_burn, Error!void, expandBody, .{ S, secret, label, @as([]const u8, &ctx), out });
 }
 
 // ── §5.1.2: SignWithLabel / VerifyWithLabel ───────────────────────────────
@@ -223,9 +238,20 @@ fn encodeSignContent(buf: []u8, label: []const u8, content: []const u8) codec.Er
 /// `IdentityElementError`/`NonCanonicalError`/`KeyMismatchError`/
 /// `WeakPublicKeyError`) without this file needing to name that set by
 /// hand for every possible `S.Sig`.
-pub fn SignWithLabel(comptime S: type, key_pair: S.Sig.KeyPair, label: []const u8, content: []const u8) !S.Sig.Signature {
+pub fn SignWithLabel(comptime S: type, key_pair: *const S.Sig.KeyPair, label: []const u8, content: []const u8) SignError(S)!S.Sig.Signature {
     var buf: [label_scratch_len]u8 = undefined;
     const sign_content = encodeSignContent(&buf, label, content) catch return error.LabelTooLong;
+    return burn.run(burn.kem_burn, SignError(S)!S.Sig.Signature, signBody, .{ S, key_pair, sign_content });
+}
+
+/// `SignWithLabel`'s error set: this file's `LabelTooLong` plus whatever
+/// `S.Sig.KeyPair.sign` can return.
+pub fn SignError(comptime S: type) type {
+    const R = @typeInfo(@TypeOf(S.Sig.KeyPair.sign)).@"fn".return_type.?;
+    return error{LabelTooLong} || @typeInfo(R).error_union.error_set;
+}
+
+fn signBody(comptime S: type, key_pair: *const S.Sig.KeyPair, sign_content: []const u8) SignError(S)!S.Sig.Signature {
     return key_pair.sign(sign_content, null);
 }
 
@@ -261,14 +287,14 @@ pub fn signContentLen(label: []const u8, content: []const u8) Error!usize {
 pub fn SignWithLabelAlloc(
     comptime S: type,
     allocator: std.mem.Allocator,
-    key_pair: S.Sig.KeyPair,
+    key_pair: *const S.Sig.KeyPair,
     label: []const u8,
     content: []const u8,
 ) !S.Sig.Signature {
     const buf = try allocator.alloc(u8, try signContentLen(label, content));
     defer allocator.free(buf);
     const sign_content = try encodeSignContent(buf, label, content);
-    return key_pair.sign(sign_content, null);
+    return burn.run(burn.kem_burn, SignError(S)!S.Sig.Signature, signBody, .{ S, key_pair, sign_content });
 }
 
 /// The verifying mirror of `SignWithLabelAlloc`.
@@ -344,7 +370,7 @@ pub fn EncryptWithLabelScratch(
 pub fn DecryptWithLabelScratch(
     comptime S: type,
     enc: S.Kem.EncappedKey,
-    skR: S.Kem.KeyPair,
+    skR: *const S.Kem.KeyPair,
     label: []const u8,
     context: []const u8,
     ciphertext: []const u8,
@@ -352,7 +378,7 @@ pub fn DecryptWithLabelScratch(
     scratch: []u8,
 ) !void {
     const info = encodeEncryptContext(scratch, label, context) catch return error.LabelTooLong;
-    try hpke.openBase(S.Kem, S.Aead, S.Nh, enc, &skR, info, "", ciphertext, plaintext_out);
+    try hpke.openBase(S.Kem, S.Aead, S.Nh, enc, skR, info, "", ciphertext, plaintext_out);
 }
 
 /// RFC 9420 §5.1.3 `EncryptWithLabel(PublicKey, Label, Context,
@@ -383,7 +409,7 @@ pub fn EncryptWithLabel(
 pub fn DecryptWithLabel(
     comptime S: type,
     enc: S.Kem.EncappedKey,
-    skR: S.Kem.KeyPair,
+    skR: *const S.Kem.KeyPair,
     label: []const u8,
     context: []const u8,
     ciphertext: []const u8,
@@ -391,7 +417,7 @@ pub fn DecryptWithLabel(
 ) !void {
     var buf: [label_scratch_len]u8 = undefined;
     const info = encodeEncryptContext(&buf, label, context) catch return error.LabelTooLong;
-    try hpke.openBase(S.Kem, S.Aead, S.Nh, enc, &skR, info, "", ciphertext, plaintext_out);
+    try hpke.openBase(S.Kem, S.Aead, S.Nh, enc, skR, info, "", ciphertext, plaintext_out);
 }
 
 // ── tests ─────────────────────────────────────────────────────────────
@@ -417,9 +443,10 @@ test "make_keypackage_ref / make_proposal_ref: distinct labels produce distinct 
 
 test "DeriveSecret: equals ExpandWithLabel(secret, label, \"\", Nh)" {
     const secret = [_]u8{0x11} ** TestSuite.Nh;
-    const got = try DeriveSecret(TestSuite, secret, "test label");
+    var got: [TestSuite.Nh]u8 = undefined;
+    try DeriveSecret(TestSuite, &secret, "test label", &got);
     var want: [TestSuite.Nh]u8 = undefined;
-    try ExpandWithLabel(TestSuite, secret, "test label", "", &want);
+    try ExpandWithLabel(TestSuite, &secret, "test label", "", &want);
     try testing.expectEqualSlices(u8, &want, &got);
 }
 
@@ -437,21 +464,21 @@ test "kdfLabelLen: matches what encodeKdfLabel actually writes, and sizes Expand
 
     // The fixed-buffer entry point must REFUSE rather than truncate.
     var out_fixed: [TestSuite.Nh]u8 = undefined;
-    try testing.expectError(error.LabelTooLong, ExpandWithLabel(TestSuite, secret, label, &big_context, &out_fixed));
+    try testing.expectError(error.LabelTooLong, ExpandWithLabel(TestSuite, &secret, label, &big_context, &out_fixed));
 
     // The scratch entry point succeeds at exactly `need` bytes, and fails
     // one byte short.
     var out: [TestSuite.Nh]u8 = undefined;
-    try ExpandWithLabelScratch(TestSuite, secret, label, &big_context, &out, buf[0..need]);
-    try testing.expectError(error.LabelTooLong, ExpandWithLabelScratch(TestSuite, secret, label, &big_context, &out, buf[0 .. need - 1]));
+    try ExpandWithLabelScratch(TestSuite, &secret, label, &big_context, &out, buf[0..need]);
+    try testing.expectError(error.LabelTooLong, ExpandWithLabelScratch(TestSuite, &secret, label, &big_context, &out, buf[0 .. need - 1]));
 }
 
 test "DeriveTreeSecret: context is the big-endian uint32 generation" {
     const secret = [_]u8{0x22} ** TestSuite.Nh;
     var got: [16]u8 = undefined;
-    try DeriveTreeSecret(TestSuite, secret, "key", 0x01020304, &got);
+    try DeriveTreeSecret(TestSuite, &secret, "key", 0x01020304, &got);
     var want: [16]u8 = undefined;
-    try ExpandWithLabel(TestSuite, secret, "key", &[_]u8{ 0x01, 0x02, 0x03, 0x04 }, &want);
+    try ExpandWithLabel(TestSuite, &secret, "key", &[_]u8{ 0x01, 0x02, 0x03, 0x04 }, &want);
     try testing.expectEqualSlices(u8, &want, &got);
 }
 
@@ -461,7 +488,7 @@ test "SignWithLabel/VerifyWithLabel: round trip, and a tampered content is rejec
     const io = threaded.io();
     const kp = TestSuite.Sig.KeyPair.generate(io);
 
-    const sig = try SignWithLabel(TestSuite, kp, "test", "hello, mls");
+    const sig = try SignWithLabel(TestSuite, &kp, "test", "hello, mls");
     try VerifyWithLabel(TestSuite, kp.public_key, "test", "hello, mls", sig);
     try testing.expectError(error.SignatureVerificationFailed, VerifyWithLabel(TestSuite, kp.public_key, "test", "TAMPERED", sig));
     try testing.expectError(error.SignatureVerificationFailed, VerifyWithLabel(TestSuite, kp.public_key, "different label", "hello, mls", sig));
@@ -479,8 +506,8 @@ test "EncryptWithLabel/DecryptWithLabel: round trip, and a mismatched label fail
     const enc = try EncryptWithLabel(TestSuite, kp.public_key, io, "test", "some context", pt, &ct);
 
     var out: [pt.len]u8 = undefined;
-    try DecryptWithLabel(TestSuite, enc, kp, "test", "some context", &ct, &out);
+    try DecryptWithLabel(TestSuite, enc, &kp, "test", "some context", &ct, &out);
     try testing.expectEqualSlices(u8, pt, &out);
 
-    try testing.expectError(error.DecryptionFailed, DecryptWithLabel(TestSuite, enc, kp, "WRONG label", "some context", &ct, &out));
+    try testing.expectError(error.DecryptionFailed, DecryptWithLabel(TestSuite, enc, &kp, "WRONG label", "some context", &ct, &out));
 }

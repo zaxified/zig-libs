@@ -75,6 +75,7 @@
 
 const std = @import("std");
 const codec = @import("codec.zig");
+const burn = @import("burn.zig");
 const crypto = @import("crypto.zig");
 const suite = @import("suite.zig");
 const tree = @import("tree.zig");
@@ -421,7 +422,7 @@ pub fn framedContentTbsAlloc(allocator: std.mem.Allocator, wf: WireFormat, fc: F
 pub fn signFramedContent(
     comptime S: type,
     allocator: std.mem.Allocator,
-    key_pair: S.Sig.KeyPair,
+    key_pair: *const S.Sig.KeyPair,
     wf: WireFormat,
     fc: FramedContent,
     group_context: ?[]const u8,
@@ -581,7 +582,7 @@ pub fn authenticatedContentTbmAlloc(
 pub fn membershipTag(
     comptime S: type,
     allocator: std.mem.Allocator,
-    membership_key: [S.Nh]u8,
+    membership_key: *const [S.Nh]u8,
     fc: FramedContent,
     auth: FramedContentAuthData,
     group_context: ?[]const u8,
@@ -600,7 +601,7 @@ pub fn membershipTag(
 pub fn verifyMembershipTag(
     comptime S: type,
     allocator: std.mem.Allocator,
-    membership_key: [S.Nh]u8,
+    membership_key: *const [S.Nh]u8,
     pm: PublicMessage,
     group_context: ?[]const u8,
 ) !void {
@@ -617,8 +618,8 @@ pub fn verifyMembershipTag(
 /// types).
 pub fn ProtectPublicParams(comptime S: type) type {
     return struct {
-        signature_key_pair: S.Sig.KeyPair,
-        membership_key: [S.Nh]u8,
+        signature_key_pair: *const S.Sig.KeyPair,
+        membership_key: *const [S.Nh]u8,
         /// The encoded `GroupContext` (§8.1). Required for `member`/
         /// `new_member_commit` senders; ignored otherwise.
         group_context: ?[]const u8 = null,
@@ -641,7 +642,11 @@ pub fn ProtectPublicParams(comptime S: type) type {
 /// official `message-protection.json` vector's procedure checks exactly
 /// this ("For the application message, instead verify that protecting as a
 /// PublicMessage fails").
-pub fn protectPublic(comptime S: type, allocator: std.mem.Allocator, params: ProtectPublicParams(S)) ![]u8 {
+pub fn protectPublic(comptime S: type, allocator: std.mem.Allocator, params: ProtectPublicParams(S)) @TypeOf(protectPublicBody(S, allocator, params)) {
+    return burn.run(burn.kem_burn, @TypeOf(protectPublicBody(S, allocator, params)), protectPublicBody, .{ S, allocator, params });
+}
+
+fn protectPublicBody(comptime S: type, allocator: std.mem.Allocator, params: ProtectPublicParams(S)) ![]u8 {
     if (params.content.contentType() == .application) return error.ApplicationContentMustBeEncrypted;
     if (params.content.contentType() == .commit and params.confirmation_tag == null) {
         return error.MissingConfirmationTag;
@@ -683,7 +688,7 @@ pub fn unprotectPublic(
     allocator: std.mem.Allocator,
     bytes: []const u8,
     signature_public_key: S.Sig.PublicKey,
-    membership_key: [S.Nh]u8,
+    membership_key: *const [S.Nh]u8,
     group_context: ?[]const u8,
 ) !PublicMessage {
     var r = codec.Reader.init(bytes);
@@ -814,13 +819,24 @@ pub fn decryptSenderData(
     comptime S: type,
     allocator: std.mem.Allocator,
     pm: PrivateMessage,
-    sender_data_secret: [S.Nh]u8,
+    sender_data_secret: *const [S.Nh]u8,
+) @TypeOf(decryptSenderDataBody(S, allocator, pm, sender_data_secret)) {
+    return burn.run(burn.kdf_burn, @TypeOf(decryptSenderDataBody(S, allocator, pm, sender_data_secret)), decryptSenderDataBody, .{ S, allocator, pm, sender_data_secret });
+}
+
+fn decryptSenderDataBody(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    pm: PrivateMessage,
+    sender_data_secret: *const [S.Nh]u8,
 ) !SenderData {
     const tag_len = S.Aead.tag_length;
     if (pm.encrypted_sender_data.len < tag_len) return error.CiphertextTooShort;
     const pt_len = pm.encrypted_sender_data.len - tag_len;
 
-    const keys = try secrettree.senderDataKeys(S, sender_data_secret, pm.ciphertext);
+    var keys: secrettree.SenderDataKeys(S) = undefined;
+    defer keys.wipe();
+    try secrettree.senderDataKeys(S, sender_data_secret, pm.ciphertext, &keys);
     const aad = try allocator.alloc(u8, pm.senderDataAadLen());
     defer allocator.free(aad);
     const aad_bytes = try pm.senderDataAad(aad);
@@ -848,7 +864,17 @@ pub fn decryptContent(
     comptime S: type,
     allocator: std.mem.Allocator,
     pm: PrivateMessage,
-    key_nonce: secrettree.KeyNonce(S),
+    key_nonce: *const secrettree.KeyNonce(S),
+    reuse_guard: [4]u8,
+) @TypeOf(decryptContentBody(S, allocator, pm, key_nonce, reuse_guard)) {
+    return burn.run(burn.kdf_burn, @TypeOf(decryptContentBody(S, allocator, pm, key_nonce, reuse_guard)), decryptContentBody, .{ S, allocator, pm, key_nonce, reuse_guard });
+}
+
+fn decryptContentBody(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    pm: PrivateMessage,
+    key_nonce: *const secrettree.KeyNonce(S),
     reuse_guard: [4]u8,
 ) ![]u8 {
     const tag_len = S.Aead.tag_length;
@@ -916,7 +942,7 @@ pub fn parsePrivateContent(
 /// `PrivateMessage`.
 pub fn ProtectPrivateParams(comptime S: type) type {
     return struct {
-        signature_key_pair: S.Sig.KeyPair,
+        signature_key_pair: *const S.Sig.KeyPair,
         /// The encoded `GroupContext` (§8.1) — a `PrivateMessage` always
         /// comes from a `member`, so this is always required.
         group_context: []const u8,
@@ -924,13 +950,13 @@ pub fn ProtectPrivateParams(comptime S: type) type {
         confirmation_tag: ?[]const u8 = null,
         /// The key/nonce for `generation` of the sending leaf's ratchet
         /// (`FramedContentBody.ratchetKind` picks which one).
-        key_nonce: secrettree.KeyNonce(S),
+        key_nonce: *const secrettree.KeyNonce(S),
         generation: u32,
         /// RFC 9420 §6.3.1: MUST be freshly random per message. This
         /// module does not generate it — the application owns randomness
         /// policy, exactly as `keyschedule.PreSharedKeyId.psk_nonce`.
         reuse_guard: [4]u8,
-        sender_data_secret: [S.Nh]u8,
+        sender_data_secret: *const [S.Nh]u8,
         /// Zero octets appended inside the encrypted envelope to blur the
         /// message's true length (§6.3.1: "It is up to the application to
         /// decide ... how much padding to add").
@@ -941,7 +967,11 @@ pub fn ProtectPrivateParams(comptime S: type) type {
 /// RFC 9420 §6.3's encode path: sign, frame, pad, encrypt the content,
 /// then encrypt the sender data under a key sampled from that ciphertext.
 /// Returns freshly allocated `PrivateMessage` wire bytes (caller frees).
-pub fn protectPrivate(comptime S: type, allocator: std.mem.Allocator, params: ProtectPrivateParams(S)) ![]u8 {
+pub fn protectPrivate(comptime S: type, allocator: std.mem.Allocator, params: ProtectPrivateParams(S)) @TypeOf(protectPrivateBody(S, allocator, params)) {
+    return burn.run(burn.kem_burn, @TypeOf(protectPrivateBody(S, allocator, params)), protectPrivateBody, .{ S, allocator, params });
+}
+
+fn protectPrivateBody(comptime S: type, allocator: std.mem.Allocator, params: ProtectPrivateParams(S)) ![]u8 {
     const ct = params.content.contentType();
     if (ct == .commit and params.confirmation_tag == null) return error.MissingConfirmationTag;
     const leaf_index = switch (params.content.sender) {
@@ -1019,7 +1049,9 @@ pub fn protectPrivate(comptime S: type, allocator: std.mem.Allocator, params: Pr
     const sd_ct = try allocator.alloc(u8, sd_pt.len + tag_len);
     defer allocator.free(sd_ct);
     {
-        const keys = try secrettree.senderDataKeys(S, params.sender_data_secret, ciphertext);
+        var keys: secrettree.SenderDataKeys(S) = undefined;
+        defer keys.wipe();
+        try secrettree.senderDataKeys(S, params.sender_data_secret, ciphertext, &keys);
         const aad = try allocator.alloc(u8, header.senderDataAadLen());
         defer allocator.free(aad);
         const aad_bytes = try header.senderDataAad(aad);
@@ -1240,14 +1272,14 @@ test "protectPublic/unprotectPublic: a proposal round-trips and the tags are che
         .body = .{ .proposal = .{ .remove = 2 } },
     };
     const bytes = try protectPublic(TestSuite, testing.allocator, .{
-        .signature_key_pair = kp,
-        .membership_key = membership_key,
+        .signature_key_pair = &kp,
+        .membership_key = &membership_key,
         .group_context = gc,
         .content = fc,
     });
     defer testing.allocator.free(bytes);
 
-    const pm = try unprotectPublic(TestSuite, testing.allocator, bytes, kp.public_key, membership_key, gc);
+    const pm = try unprotectPublic(TestSuite, testing.allocator, bytes, kp.public_key, &membership_key, gc);
     defer pm.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 2), pm.content.body.proposal.remove);
     try testing.expectEqual(@as(u32, 1), pm.content.sender.member);
@@ -1256,7 +1288,7 @@ test "protectPublic/unprotectPublic: a proposal round-trips and the tags are che
     const wrong: [TestSuite.Nh]u8 = @splat(0x5d);
     try testing.expectError(
         error.MacMismatch,
-        unprotectPublic(TestSuite, testing.allocator, bytes, kp.public_key, wrong, gc),
+        unprotectPublic(TestSuite, testing.allocator, bytes, kp.public_key, &wrong, gc),
     );
 }
 
@@ -1266,9 +1298,10 @@ test "protectPublic: application content is refused (RFC 9420 §6's MUST)" {
     var seed: [32]u8 = @splat(4);
     const kp = try TestSuite.Sig.KeyPair.generateDeterministic(seed);
     seed = @splat(0);
+    const zero_key: [TestSuite.Nh]u8 = @splat(0);
     try testing.expectError(error.ApplicationContentMustBeEncrypted, protectPublic(TestSuite, testing.allocator, .{
-        .signature_key_pair = kp,
-        .membership_key = @splat(0),
+        .signature_key_pair = &kp,
+        .membership_key = &zero_key,
         .group_context = gc,
         .content = .{
             .group_id = "group",
@@ -1288,9 +1321,12 @@ test "protectPrivate/unprotect: application data round-trips through both AEADs"
 
     const encryption_secret: [TestSuite.Nh]u8 = @splat(0x77);
     const sender_data_secret: [TestSuite.Nh]u8 = @splat(0x88);
-    const base = try secrettree.ratchetBaseSecret(TestSuite, encryption_secret, 2, 1, .application);
-    var ratchet = secrettree.Ratchet(TestSuite).init(base);
-    const kn = try ratchet.current();
+    var base: [TestSuite.Nh]u8 = undefined;
+    try secrettree.ratchetBaseSecret(TestSuite, &encryption_secret, 2, 1, .application, &base);
+    var ratchet: secrettree.Ratchet(TestSuite) = undefined;
+    secrettree.Ratchet(TestSuite).init(&base, &ratchet);
+    var kn: secrettree.KeyNonce(TestSuite) = undefined;
+    try ratchet.current(&kn);
 
     const fc: FramedContent = .{
         .group_id = "group",
@@ -1300,13 +1336,13 @@ test "protectPrivate/unprotect: application data round-trips through both AEADs"
         .body = .{ .application = "hello, group" },
     };
     const bytes = try protectPrivate(TestSuite, testing.allocator, .{
-        .signature_key_pair = kp,
+        .signature_key_pair = &kp,
         .group_context = gc,
         .content = fc,
-        .key_nonce = kn,
+        .key_nonce = &kn,
         .generation = 0,
         .reuse_guard = .{ 1, 2, 3, 4 },
-        .sender_data_secret = sender_data_secret,
+        .sender_data_secret = &sender_data_secret,
         .padding_len = 5,
     });
     defer testing.allocator.free(bytes);
@@ -1317,12 +1353,12 @@ test "protectPrivate/unprotect: application data round-trips through both AEADs"
     const pmsg = try PrivateMessage.decode(&r);
     try testing.expect(r.atEnd());
 
-    const sd = try decryptSenderData(TestSuite, testing.allocator, pmsg, sender_data_secret);
+    const sd = try decryptSenderData(TestSuite, testing.allocator, pmsg, &sender_data_secret);
     try testing.expectEqual(@as(u32, 1), sd.leaf_index);
     try testing.expectEqual(@as(u32, 0), sd.generation);
     try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, &sd.reuse_guard);
 
-    const pt = try decryptContent(TestSuite, testing.allocator, pmsg, kn, sd.reuse_guard);
+    const pt = try decryptContent(TestSuite, testing.allocator, pmsg, &kn, sd.reuse_guard);
     defer testing.allocator.free(pt);
     const ac = try parsePrivateContent(testing.allocator, pmsg, pt, sd.leaf_index);
     defer ac.deinit(testing.allocator);
@@ -1340,12 +1376,15 @@ test "wrapPrivateMessage: a bare PrivateMessage becomes a decodable MLSMessage" 
 
     const encryption_secret: [TestSuite.Nh]u8 = @splat(0x33);
     const sender_data_secret: [TestSuite.Nh]u8 = @splat(0x44);
-    const base = try secrettree.ratchetBaseSecret(TestSuite, encryption_secret, 2, 0, .application);
-    var ratchet = secrettree.Ratchet(TestSuite).init(base);
-    const kn = try ratchet.current();
+    var base: [TestSuite.Nh]u8 = undefined;
+    try secrettree.ratchetBaseSecret(TestSuite, &encryption_secret, 2, 0, .application, &base);
+    var ratchet: secrettree.Ratchet(TestSuite) = undefined;
+    secrettree.Ratchet(TestSuite).init(&base, &ratchet);
+    var kn: secrettree.KeyNonce(TestSuite) = undefined;
+    try ratchet.current(&kn);
 
     const bare = try protectPrivate(TestSuite, testing.allocator, .{
-        .signature_key_pair = kp,
+        .signature_key_pair = &kp,
         .group_context = gc,
         .content = .{
             .group_id = "group",
@@ -1354,10 +1393,10 @@ test "wrapPrivateMessage: a bare PrivateMessage becomes a decodable MLSMessage" 
             .authenticated_data = &.{},
             .body = .{ .application = "wrapped" },
         },
-        .key_nonce = kn,
+        .key_nonce = &kn,
         .generation = 0,
         .reuse_guard = .{ 9, 9, 9, 9 },
-        .sender_data_secret = sender_data_secret,
+        .sender_data_secret = &sender_data_secret,
     });
     defer testing.allocator.free(bare);
 
@@ -1401,12 +1440,17 @@ test "decryptContent: the reuse guard is load-bearing — a wrong guard fails th
     var seed: [32]u8 = @splat(6);
     const kp = try TestSuite.Sig.KeyPair.generateDeterministic(seed);
     seed = @splat(0);
-    const base = try secrettree.ratchetBaseSecret(TestSuite, @splat(0x77), 2, 1, .handshake);
-    var ratchet = secrettree.Ratchet(TestSuite).init(base);
-    const kn = try ratchet.current();
+    const encryption_secret: [TestSuite.Nh]u8 = @splat(0x77);
+    var base: [TestSuite.Nh]u8 = undefined;
+    try secrettree.ratchetBaseSecret(TestSuite, &encryption_secret, 2, 1, .handshake, &base);
+    var ratchet: secrettree.Ratchet(TestSuite) = undefined;
+    secrettree.Ratchet(TestSuite).init(&base, &ratchet);
+    var kn: secrettree.KeyNonce(TestSuite) = undefined;
+    try ratchet.current(&kn);
 
+    const sender_data_secret: [TestSuite.Nh]u8 = @splat(0x88);
     const bytes = try protectPrivate(TestSuite, testing.allocator, .{
-        .signature_key_pair = kp,
+        .signature_key_pair = &kp,
         .group_context = gc,
         .content = .{
             .group_id = "group",
@@ -1414,10 +1458,10 @@ test "decryptContent: the reuse guard is load-bearing — a wrong guard fails th
             .sender = .{ .member = 1 },
             .body = .{ .proposal = .{ .remove = 2 } },
         },
-        .key_nonce = kn,
+        .key_nonce = &kn,
         .generation = 0,
         .reuse_guard = .{ 0xde, 0xad, 0xbe, 0xef },
-        .sender_data_secret = @splat(0x88),
+        .sender_data_secret = &sender_data_secret,
     });
     defer testing.allocator.free(bytes);
 
@@ -1425,7 +1469,7 @@ test "decryptContent: the reuse guard is load-bearing — a wrong guard fails th
     const pmsg = try PrivateMessage.decode(&r);
     try testing.expectError(
         error.DecryptionFailed,
-        decryptContent(TestSuite, testing.allocator, pmsg, kn, .{ 0xde, 0xad, 0xbe, 0xee }),
+        decryptContent(TestSuite, testing.allocator, pmsg, &kn, .{ 0xde, 0xad, 0xbe, 0xee }),
     );
 }
 

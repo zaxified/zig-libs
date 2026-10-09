@@ -119,10 +119,14 @@ fn ratchetKeyNonce(
     kind: secrettree.RatchetKind,
     generation: u32,
 ) !secrettree.KeyNonce(S) {
-    const base = try secrettree.ratchetBaseSecret(S, encryption_secret, vector_group_size, leaf, kind);
-    var ratchet = secrettree.Ratchet(S).init(base);
+    var base: [S.Nh]u8 = undefined;
+    try secrettree.ratchetBaseSecret(S, &encryption_secret, vector_group_size, leaf, kind, &base);
+    var ratchet: secrettree.Ratchet(S) = undefined;
+    secrettree.Ratchet(S).init(&base, &ratchet);
     while (ratchet.generation < generation) try ratchet.advance();
-    return ratchet.current();
+    var kn: secrettree.KeyNonce(S) = undefined;
+    try ratchet.current(&kn);
+    return kn;
 }
 
 test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for suite 0x0001, byte-exact" {
@@ -186,7 +190,7 @@ test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for s
             const pm = msg.public_message;
 
             // Unprotect: both §6.2 MUSTs, in the order the RFC states them.
-            try expectStageOk(spec[1] ++ " membership_tag (§6.2)", framing.verifyMembershipTag(S, alloc, membership_key, pm, gc_bytes));
+            try expectStageOk(spec[1] ++ " membership_tag (§6.2)", framing.verifyMembershipTag(S, alloc, &membership_key, pm, gc_bytes));
             try expectStageOk(spec[1] ++ " signature (§6.1)", framing.verifyFramedContent(S, alloc, signature_pub, pm.authenticatedContent(), gc_bytes));
             try testing.expectEqual(vector_sender_leaf, pm.content.sender.member);
 
@@ -204,8 +208,8 @@ test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for s
             const header_len = vec.len - bare.len;
 
             const protected = try framing.protectPublic(S, alloc, .{
-                .signature_key_pair = key_pair,
-                .membership_key = membership_key,
+                .signature_key_pair = &key_pair,
+                .membership_key = &membership_key,
                 .group_context = gc_bytes,
                 .content = pm.content,
                 .confirmation_tag = pm.auth.confirmation_tag,
@@ -219,8 +223,8 @@ test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for s
         {
             const app = try hexDecode(arena, obj.get("application").?.string);
             try testing.expectError(error.ApplicationContentMustBeEncrypted, framing.protectPublic(S, alloc, .{
-                .signature_key_pair = key_pair,
-                .membership_key = membership_key,
+                .signature_key_pair = &key_pair,
+                .membership_key = &membership_key,
                 .group_context = gc_bytes,
                 .content = .{
                     .group_id = group_id,
@@ -247,7 +251,7 @@ test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for s
             const pmsg = msg.private_message;
 
             // §6.3.2 first: the sender data is what names the key.
-            const sd = framing.decryptSenderData(S, alloc, pmsg, sender_data_secret) catch |err| {
+            const sd = framing.decryptSenderData(S, alloc, pmsg, &sender_data_secret) catch |err| {
                 std.debug.print("framing KAT: '" ++ spec[1] ++ " sender data (§6.3.2)' failed: {s}\n", .{@errorName(err)});
                 return err;
             };
@@ -256,7 +260,7 @@ test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for s
             const kind: secrettree.RatchetKind = if (pmsg.content_type == .application) .application else .handshake;
             const kn = try ratchetKeyNonce(encryption_secret, sd.leaf_index, kind, sd.generation);
 
-            const plaintext = framing.decryptContent(S, alloc, pmsg, kn, sd.reuse_guard) catch |err| {
+            const plaintext = framing.decryptContent(S, alloc, pmsg, &kn, sd.reuse_guard) catch |err| {
                 std.debug.print("framing KAT: '" ++ spec[1] ++ " content AEAD (§6.3.1)' failed: {s}\n", .{@errorName(err)});
                 return err;
             };
@@ -282,14 +286,14 @@ test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for s
             const header_len = vec.len - bare.len;
 
             const protected = try framing.protectPrivate(S, alloc, .{
-                .signature_key_pair = key_pair,
+                .signature_key_pair = &key_pair,
                 .group_context = gc_bytes,
                 .content = ac.content,
                 .confirmation_tag = ac.auth.confirmation_tag,
-                .key_nonce = kn,
+                .key_nonce = &kn,
                 .generation = sd.generation,
                 .reuse_guard = sd.reuse_guard,
-                .sender_data_secret = sender_data_secret,
+                .sender_data_secret = &sender_data_secret,
                 .padding_len = padding_len,
             });
             defer alloc.free(protected);
@@ -325,7 +329,7 @@ test "message-protection.json: a tampered ciphertext byte fails the content AEAD
         const msg = try framing.MLSMessage.decode(alloc, &r);
         defer msg.deinit(alloc);
         const pmsg = msg.private_message;
-        const sd = try framing.decryptSenderData(S, alloc, pmsg, sender_data_secret);
+        const sd = try framing.decryptSenderData(S, alloc, pmsg, &sender_data_secret);
         const kn = try ratchetKeyNonce(encryption_secret, sd.leaf_index, .application, sd.generation);
 
         // Flip one bit in the middle of the ciphertext.
@@ -337,7 +341,7 @@ test "message-protection.json: a tampered ciphertext byte fails the content AEAD
 
         try testing.expectError(
             error.DecryptionFailed,
-            framing.decryptContent(S, alloc, bad, kn, sd.reuse_guard),
+            framing.decryptContent(S, alloc, bad, &kn, sd.reuse_guard),
         );
         return;
     }
@@ -395,7 +399,7 @@ test "transcript-hashes.json: RFC 9420 §8.2's two hashes for suite 0x0001, byte
         const confirmation_key = try hexSecret(obj.get("confirmation_key").?.string);
         try expectStageOk("confirmation_tag over confirmed_transcript_hash_after", keyschedule.verifyConfirmationTag(
             S,
-            confirmation_key,
+            &confirmation_key,
             &hashes.confirmed,
             ac.auth.confirmation_tag.?,
         ));
@@ -430,13 +434,13 @@ test "transcript-hashes.json: the confirmation_tag does NOT verify against the h
 
         try testing.expectError(error.MacMismatch, keyschedule.verifyConfirmationTag(
             S,
-            confirmation_key,
+            &confirmation_key,
             &hashes.interim,
             ac.auth.confirmation_tag.?,
         ));
         try testing.expectError(error.MacMismatch, keyschedule.verifyConfirmationTag(
             S,
-            confirmation_key,
+            &confirmation_key,
             interim_before,
             ac.auth.confirmation_tag.?,
         ));

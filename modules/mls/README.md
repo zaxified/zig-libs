@@ -165,22 +165,23 @@ S.Nx; // 64 (Ed25519 signature width)
 
 ```zig
 // RFC 9420 §8
-const secret = try mls.DeriveSecret(S, epoch_secret, "encryption");
+var secret: [S.Nh]u8 = undefined;
+try mls.DeriveSecret(S, &epoch_secret, "encryption", &secret);
 var out: [32]u8 = undefined;
-try mls.ExpandWithLabel(S, secret, "derived", context_bytes, &out);
+try mls.ExpandWithLabel(S, &secret, "derived", context_bytes, &out);
 
 // RFC 9420 §5.2
 const kp_ref = try mls.make_keypackage_ref(S, encoded_key_package);
 
 // RFC 9420 §5.1.2 — Ed25519 signing is DETERMINISTIC (RFC 8032)
-const sig = try mls.SignWithLabel(S, signature_key_pair, "FramedContentTBS", content);
+const sig = try mls.SignWithLabel(S, &signature_key_pair, "FramedContentTBS", content);
 try mls.VerifyWithLabel(S, signature_public_key, "FramedContentTBS", content, sig);
 
 // RFC 9420 §5.1.3 — delegates to hpke.sealBase/openBase
 var ct: [pt.len + S.Aead.tag_length]u8 = undefined;
 const enc = try mls.EncryptWithLabel(S, kem_public_key, io, "UpdatePathNode", context_bytes, pt, &ct);
 var out_pt: [pt.len]u8 = undefined;
-try mls.DecryptWithLabel(S, enc, kem_key_pair, "UpdatePathNode", context_bytes, &ct, &out_pt);
+try mls.DecryptWithLabel(S, enc, &kem_key_pair, "UpdatePathNode", context_bytes, &ct, &out_pt);
 ```
 
 **Tree math** (`treemath.zig`):
@@ -285,21 +286,25 @@ const encoded_gc = try gc.encodeAlloc(allocator);
 defer allocator.free(encoded_gc);
 
 // psk_secret from the Commit's PreSharedKey proposals (§8.4), or all-zero
-const psk = try ks.pskSecret(S, allocator, psks); // `&.{}` => ks.zeroSecret(S)
+var psk: [S.Nh]u8 = undefined;
+try ks.pskSecret(S, allocator, psks, &psk); // `&.{}` => ks.zeroSecret(S)
 
-var secrets = try ks.deriveEpoch(S, allocator, init_secret_prev, commit_secret, psk, encoded_gc);
+var secrets: ks.EpochSecrets(S) = undefined;
+try ks.deriveEpoch(S, allocator, &init_secret_prev, &commit_secret, &psk, encoded_gc, &secrets);
 defer secrets.wipe(); // §9.2
 
 secrets.encryption_secret;   // -> the secret tree, below
 secrets.init_secret;         // -> the NEXT epoch's deriveEpoch
 secrets.epoch_authenticator; // §8.7, for out-of-band comparison
 
-const external_pub = ks.externalKeyPair(S, secrets.external_secret).public_key;
-try ks.mlsExporter(S, secrets.exporter_secret, "my-app label", context, out);
+var external_kp: S.Kem.KeyPair = undefined;
+ks.externalKeyPair(S, &secrets.external_secret, &external_kp);
+const external_pub = external_kp.public_key;
+try ks.mlsExporter(S, &secrets.exporter_secret, "my-app label", context, out);
 
 // §6.1, over structures Part 5 assembles (framing.membershipTag)
-const tag = ks.confirmationTag(S, secrets.confirmation_key, confirmed_transcript_hash);
-try ks.verifyConfirmationTag(S, secrets.confirmation_key, confirmed_transcript_hash, received_tag);
+const tag = ks.confirmationTag(S, &secrets.confirmation_key, confirmed_transcript_hash);
+try ks.verifyConfirmationTag(S, &secrets.confirmation_key, confirmed_transcript_hash, received_tag);
 ```
 
 **Secret tree and sender ratchets** (`secrettree.zig`, RFC 9420 §9). A
@@ -311,21 +316,27 @@ unauthenticated generation can make it ratchet:
 const st = mls.secrettree;
 
 // sender: leaf 3's application ratchet
-const base = try st.ratchetBaseSecret(S, secrets.encryption_secret, n_leaves, 3, .application);
-var ratchet = st.Ratchet(S).init(base);
+var base: [S.Nh]u8 = undefined;
+try st.ratchetBaseSecret(S, &secrets.encryption_secret, n_leaves, 3, .application, &base);
+var ratchet: st.Ratchet(S) = undefined;
+st.Ratchet(S).init(&base, &ratchet);
 defer ratchet.wipe();
-const kn = try ratchet.current(); // kn.key, kn.nonce for ratchet.generation
+var kn: st.KeyNonce(S) = undefined;
+try ratchet.current(&kn); // kn.key, kn.nonce for ratchet.generation
 try ratchet.advance();
 
 // receiver: same base, tolerant of out-of-order delivery
-var window = st.Window(S, 32).init(base);
+var window: st.Window(S, 32) = undefined;
+st.Window(S, 32).init(&base, &window);
 defer window.wipe();
 window.max_forward_jump = 256;              // default 1024
-const kn2 = try window.get(generation);     // consumed: a second get() fails
+var kn2: st.KeyNonce(S) = undefined;
+try window.get(generation, &kn2);           // consumed: a second get() fails
 // error.GenerationConsumed / .GenerationTooFarAhead
 
 // §6.3.2 sender-data keys, bound to a sample of the message ciphertext
-const sd = try st.senderDataKeys(S, secrets.sender_data_secret, ciphertext);
+var sd: st.SenderDataKeys(S) = undefined;
+try st.senderDataKeys(S, &secrets.sender_data_secret, ciphertext, &sd);
 ```
 
 ## API surface (Part 5 — message framing)
@@ -348,8 +359,8 @@ const fc: fr.FramedContent = .{
 // §6.2 — signed, MAC'd, not encrypted. Refuses application content
 // (error.ApplicationContentMustBeEncrypted), per §6's MUST.
 const pub_bytes = try fr.protectPublic(S, allocator, .{
-    .signature_key_pair = my_signature_key,
-    .membership_key = secrets.membership_key,
+    .signature_key_pair = &my_signature_key,
+    .membership_key = &secrets.membership_key,
     .group_context = encoded_gc,
     .content = fc,
     .confirmation_tag = null,        // required iff `fc` is a commit
@@ -359,13 +370,13 @@ defer allocator.free(pub_bytes);
 // §6.3 — encrypted. The reuse guard MUST be freshly random per message
 // (§6.3.1); this module never owns a randomness policy.
 const priv_bytes = try fr.protectPrivate(S, allocator, .{
-    .signature_key_pair = my_signature_key,
+    .signature_key_pair = &my_signature_key,
     .group_context = encoded_gc,
     .content = fc,
-    .key_nonce = kn,                 // from secrettree.Ratchet.current()
+    .key_nonce = &kn,                // from secrettree.Ratchet.current()
     .generation = ratchet.generation,
     .reuse_guard = my_fresh_random_4_bytes,
-    .sender_data_secret = secrets.sender_data_secret,
+    .sender_data_secret = &secrets.sender_data_secret,
     .padding_len = 0,
 });
 defer allocator.free(priv_bytes);
@@ -383,16 +394,17 @@ defer msg.deinit(allocator);
 switch (msg) {
     .public_message => {
         // checks BOTH §6.2 MUSTs: membership_tag and the signature
-        const pm = try fr.unprotectPublic(S, allocator, bare_bytes, sender_pub, secrets.membership_key, encoded_gc);
+        const pm = try fr.unprotectPublic(S, allocator, bare_bytes, sender_pub, &secrets.membership_key, encoded_gc);
         defer pm.deinit(allocator);
         _ = pm.content.body;
     },
     .private_message => |pm| {
-        const sd = try fr.decryptSenderData(S, allocator, pm, secrets.sender_data_secret);
+        const sd = try fr.decryptSenderData(S, allocator, pm, &secrets.sender_data_secret);
         // YOUR job: check sd.leaf_index names a non-blank leaf (§6.3.2),
         // then pick that leaf's handshake/application Window.
-        const kn2 = try window.get(sd.generation);
-        const plaintext = try fr.decryptContent(S, allocator, pm, kn2, sd.reuse_guard);
+        var kn2: st.KeyNonce(S) = undefined;
+        try window.get(sd.generation, &kn2);
+        const plaintext = try fr.decryptContent(S, allocator, pm, &kn2, sd.reuse_guard);
         defer allocator.free(plaintext);
         const ac = try fr.parsePrivateContent(allocator, pm, plaintext, sd.leaf_index);
         defer ac.deinit(allocator);
@@ -437,15 +449,16 @@ defer msg.deinit(allocator);
 // §5.2 over YOUR encoded KeyPackage — what names your slot in the Welcome
 const my_ref = try mls.make_keypackage_ref(S, my_encoded_key_package);
 
-var joined = try mls.welcome.join(S, allocator, .{
+var joined: mls.welcome.Joined(S) = undefined;
+try mls.welcome.join(S, allocator, &.{
     .welcome = msg.welcome,
     .key_package_ref = &my_ref,
-    .init_key_pair = my_init_key_pair,      // private half of KeyPackage.init_key
+    .init_key_pair = &my_init_key_pair,    // private half of KeyPackage.init_key
     // §12.4.3: the signature_key of the tree leaf at GroupInfo.signer.
     // Resolving it needs the tree, so it is YOURS to supply.
     .signer_key = signer_leaf_signature_key,
     .psks = &.{},                            // resolved in GroupSecrets order
-});
+}, &joined);
 defer joined.deinit(allocator);
 
 joined.secrets;                    // every §8 secret for the epoch
@@ -471,7 +484,7 @@ const external_pub = try joined.group_info.externalPub();  // §12.4.3.2, wire r
 committer owns the group state that assembles them:
 
 ```zig
-const egi = try mls.welcome.encryptGroupInfo(S, allocator, welcome_secret, encoded_group_info);
+const egi = try mls.welcome.encryptGroupInfo(S, allocator, &welcome_secret, encoded_group_info);
 defer allocator.free(egi);
 // NOTE the context argument: the whole `egi` blob, which is what binds
 // each per-member ciphertext to this one GroupInfo (§12.4.3.1).
@@ -483,7 +496,9 @@ const ct = try mls.welcome.encryptGroupSecrets(S, allocator, io, recipient_init_
 `Group(S)` is the first type in this module that OWNS state. Everything
 else takes bytes and keys and returns bytes and keys; this holds the tree,
 the transcript hashes, the epoch secrets and this member's private path
-secrets, and advances all of them across a Commit.
+secrets, and advances all of them across a Commit. The group (and every value
+holding secrets) is written into caller-owned memory and never returned by
+value, so no copy of a secret is left in the caller's stack frame.
 
 ```zig
 const S = mls.default_suite;
@@ -492,14 +507,15 @@ const G = mls.Group(S);
 // §12.4.3.1: enter the group. Unlike `welcome.join`, this needs no signer
 // key from the caller — it resolves `GroupInfo.signer` out of the ratchet
 // tree itself, and verifies the tree hash and the parent-hash chain first.
-var g = try G.fromWelcome(allocator, .{
+var g: G = undefined;
+try G.fromWelcome(allocator, .{
     .welcome_msg = welcome_bytes,          // whole MLSMessage(Welcome)
     .key_package_msg = my_key_package_msg, // whole MLSMessage(KeyPackage)
-    .init_priv = init_priv,
-    .encryption_priv = encryption_priv,
+    .init_priv = &init_priv,
+    .encryption_priv = &encryption_priv,
     .ratchet_tree = null,                  // or §12.4.3.3's out-of-band tree
     .external_psks = &.{},
-});
+}, &g);
 defer g.deinit();
 
 // §12.4.2: follow the group. `proposal_msgs` are the proposals seen during
@@ -512,7 +528,8 @@ try g.processCommit(.{
 });
 
 // The value every other member of the group also holds for this epoch.
-const auth = g.epochAuthenticator();
+var auth: [S.Nh]u8 = undefined;
+g.epochAuthenticator(&auth);
 ```
 
 Also available: `g.groupContext()` (a no-allocation view for the current
@@ -559,7 +576,7 @@ land in the state its receivers land in.
 // encryption keys are what `fromWelcome` later needs, and the signature
 // key signs everything this client ever sends.
 const kp = try mls.createKeyPackage(S, arena, .{
-    .signature_key_pair = sig_kp,
+    .signature_key_pair = &sig_kp,
     .init_key = init_kp.public_key,
     .encryption_key = enc_kp.public_key,
     .credential = .{ .basic = "alice" },
@@ -571,12 +588,13 @@ const kp_msg = try (mls.MLSMessage{ .key_package = kp }).encodeAlloc(arena);
 // §11: create a one-member group. `io` supplies the single random value
 // §11 calls for; §8.2's epoch-0 confirmed transcript hash is the
 // ZERO-LENGTH string, which this object represents exactly.
-var g = try G.create(allocator, .{
+var g: G = undefined;
+try G.create(allocator, .{
     .io = io,
     .group_id = group_id,
     .key_package_msg = kp_msg,
-    .encryption_priv = enc_kp.secret_key,
-});
+    .encryption_priv = &enc_kp.secret_key,
+}, &g);
 defer g.deinit();
 
 // §12.1: publish a proposal. Nothing is applied — a proposal only takes
@@ -584,7 +602,7 @@ defer g.deinit();
 // committer passes as `.by_reference` and what receivers pass as
 // `proposal_msgs`.
 const prop = try g.createProposal(allocator, .{
-    .signature_key_pair = sig_kp,
+    .signature_key_pair = &sig_kp,
     .proposal = .{ .add = their_key_package },
 });
 
@@ -593,7 +611,7 @@ const prop = try g.createProposal(allocator, .{
 // position-dependent); §12.3's APPLICATION order is fixed and unrelated.
 const c = try g.createCommit(allocator, .{
     .io = io,
-    .signature_key_pair = sig_kp,
+    .signature_key_pair = &sig_kp,
     .proposals = &.{
         .{ .by_value = .{ .add = their_key_package } },
         .{ .by_reference = someone_elses_proposal_msg },
@@ -608,7 +626,7 @@ defer c.deinit(allocator);
 ```
 
 To rotate this member's own leaf key without committing, build the Update's
-`LeafNode` with `g.updateLeaf(.{ .signature_key_pair = ..., .encryption_key_pair = ... })`
+`LeafNode` with `g.updateLeaf(.{ .signature_key_pair = &..., .encryption_key_pair = &... })`
 and send it as a proposal: the group retains the private half and swaps it
 in when whichever Commit applies that Update arrives, which it must, because
 §12.3 applies Updates before the `UpdatePath` is decrypted.
@@ -628,9 +646,11 @@ is a key-schedule entry point rather than group state:
 
 ```zig
 // The joiner's half (§12.4.3.2 would carry `kem_output` in an ExternalInit).
-const ext = try mls.externalInitSender(S, group_external_pub, io);
+var ext: mls.keyschedule.ExternalInit(S) = undefined;
+try mls.externalInitSender(S, group_external_pub, io, &ext);
 // The existing members' half.
-const init_secret = try mls.externalInitReceiver(S, ext.kem_output, group_external_key_pair);
+var init_secret: [S.Nh]u8 = undefined;
+try mls.externalInitReceiver(S, ext.kem_output, &group_external_key_pair, &init_secret);
 ```
 
 Note its anchoring honestly: no upstream MLS vector covers §8.3, so unlike
@@ -648,15 +668,16 @@ nobody issues an Add on its behalf. The `GroupInfo` must carry an
 external join because that join changes the epoch.
 
 ```zig
-var joined = try mls.Group(S).joinByExternalCommit(gpa, allocator, .{
+var joined: mls.Group(S).ExternalJoin = undefined;
+try mls.Group(S).joinByExternalCommit(gpa, allocator, .{
     .io = io,
     .group_info_msg = published_group_info,   // MLSMessage(GroupInfo), public
     .key_package_msg = my_key_package_msg,    // identity half of my new leaf
-    .signature_key_pair = my_sig,
+    .signature_key_pair = &my_sig,
     // §12.2's whitelist also admits a Remove (the "resync" flavor: drop an
     // old appearance of myself) and PreSharedKeys. Nothing else.
     .proposals = &.{},
-});
+}, &joined);
 defer joined.group.deinit();
 defer joined.messages.deinit(allocator);
 // joined.group is already IN the new epoch.
@@ -668,7 +689,7 @@ any other Commit — the `new_member_commit` sender type is handled inside.
 
 ```zig
 try alice.processCommit(.{ .commit_msg = joined.messages.commit });
-// alice.epochAuthenticator() == joined.group.epochAuthenticator()
+// alice.epochAuthenticator(&a) == joined.group.epochAuthenticator(&b)
 ```
 
 **What the joiner can and cannot check.** It verifies the tree against the

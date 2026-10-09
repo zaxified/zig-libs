@@ -83,6 +83,13 @@ const testing = std.testing;
 const S = suite.default;
 const G = group.Group(S);
 
+/// Test-only by-value view of `epochAuthenticator`'s out-pointer form.
+fn tAuth(g: *const G) [S.Nh]u8 {
+    var out: [S.Nh]u8 = undefined;
+    g.epochAuthenticator(&out);
+    return out;
+}
+
 fn hexDecode(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, hex.len / 2);
     _ = try std.fmt.hexToBytes(out, hex);
@@ -257,15 +264,17 @@ test "treekem.json: an UpdatePath GENERATED from the vector's own path_secret[0]
             // this whole test into a round trip.
             const path_secret_0 = seed orelse return error.NoSeedableReceiverInVector;
 
-            const staged = try treekem.stageUpdatePath(S, arena.allocator(), &staging.tree, sender, .{
+            const leaf_kp = try S.Kem.KeyPair.generateDeterministic(@splat(0x5c));
+            var staged: treekem.Staged(S) = undefined;
+            try treekem.stageUpdatePath(S, arena.allocator(), &staging.tree, sender, .{
                 .group_id = group_id,
-                .signature_key_pair = sig_kp,
-                .leaf_key_pair = try S.Kem.KeyPair.generateDeterministic(@splat(0x5c)),
-                .path_secret_0 = path_secret_0,
+                .signature_key_pair = &sig_kp,
+                .leaf_key_pair = &leaf_kp,
+                .path_secret_0 = &path_secret_0,
                 .signature_key = &sig_kp.public_key.toBytes(),
                 .credential = .{ .basic = "kat-committer" },
                 .capabilities = dummy_capabilities,
-            });
+            }, &staged);
 
             // ── ANCHORED. The generated filtered direct path must have the
             // vector's own length, and every derived node_pub[n] must be the
@@ -292,7 +301,7 @@ test "treekem.json: an UpdatePath GENERATED from the vector's own path_secret[0]
                 testing.allocator,
                 io,
                 &staging.tree,
-                staged,
+                &staged,
                 group_context,
                 &.{},
             );
@@ -391,15 +400,17 @@ test "treekem.json: a generated UpdatePath is REJECTED when one derived key is c
     const sig_kp = try S.Sig.KeyPair.generateDeterministic(@splat(0x77));
     var wrong_seed: [S.Nh]u8 = @splat(0xa5);
     wrong_seed[0] ^= 0x01;
-    const staged = try treekem.stageUpdatePath(S, arena.allocator(), &staging.tree, sender, .{
+    const leaf_kp = try S.Kem.KeyPair.generateDeterministic(@splat(0x5c));
+    var staged: treekem.Staged(S) = undefined;
+    try treekem.stageUpdatePath(S, arena.allocator(), &staging.tree, sender, .{
         .group_id = group_id,
-        .signature_key_pair = sig_kp,
-        .leaf_key_pair = try S.Kem.KeyPair.generateDeterministic(@splat(0x5c)),
-        .path_secret_0 = wrong_seed,
+        .signature_key_pair = &sig_kp,
+        .leaf_key_pair = &leaf_kp,
+        .path_secret_0 = &wrong_seed,
         .signature_key = &sig_kp.public_key.toBytes(),
         .credential = .{ .basic = "kat-committer" },
         .capabilities = dummy_capabilities,
-    });
+    }, &staged);
 
     // The FILTER is a property of the tree, so the shape still matches — it
     // is the derived material that must not.
@@ -430,7 +441,7 @@ const Newcomer = struct {
         const init_kp = try S.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
         const enc_kp = try S.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
         const kp = try keypackage.create(S, arena, .{
-            .signature_key_pair = sig,
+            .signature_key_pair = &sig,
             .init_key = init_kp.public_key,
             .encryption_key = enc_kp.public_key,
             .credential = .{ .basic = "newcomer" },
@@ -473,14 +484,15 @@ fn replay(gpa: std.mem.Allocator, sa: std.mem.Allocator, obj: std.json.ObjectMap
         });
     }
 
-    var g = try G.fromWelcome(gpa, .{
+    var g: G = undefined;
+    try G.fromWelcome(gpa, .{
         .welcome_msg = welcome_msg,
         .key_package_msg = key_package_msg,
-        .init_priv = init_priv,
-        .encryption_priv = encryption_priv,
+        .init_priv = &init_priv,
+        .encryption_priv = &encryption_priv,
         .ratchet_tree = ratchet_tree,
         .external_psks = psks.items,
-    });
+    }, &g);
     errdefer g.deinit();
 
     for (obj.get("epochs").?.array.items) |epoch_value| {
@@ -502,7 +514,7 @@ fn replay(gpa: std.mem.Allocator, sa: std.mem.Allocator, obj: std.json.ObjectMap
     const epochs = obj.get("epochs").?.array.items;
     if (epochs.len > 0) {
         const want = try hexDecode(sa, epochs[epochs.len - 1].object.get("epoch_authenticator").?.string);
-        try testing.expectEqualSlices(u8, want, &g.epochAuthenticator());
+        try testing.expectEqualSlices(u8, want, &tAuth(&g));
     }
     return .{ .g = g, .sig = try S.Sig.KeyPair.generateDeterministic(signature_priv), .psks = psks.items };
 }
@@ -530,7 +542,7 @@ fn commitFromReplayedState(gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed
 
     const created = try g.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = replayed.sig,
+        .signature_key_pair = &replayed.sig,
         .proposals = &.{.{ .by_value = .{ .add = newcomer.kp } }},
         .external_psks = replayed.psks,
     });
@@ -540,13 +552,14 @@ fn commitFromReplayedState(gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed
     try testing.expect(g.treeSize() >= before_size);
     try testing.expect(created.welcome != null);
 
-    var joined = try G.fromWelcome(gpa, .{
+    var joined: G = undefined;
+    try G.fromWelcome(gpa, .{
         .welcome_msg = created.welcome.?,
         .key_package_msg = newcomer.kp_msg,
-        .init_priv = newcomer.init_priv,
-        .encryption_priv = newcomer.enc_priv,
+        .init_priv = &newcomer.init_priv,
+        .encryption_priv = &newcomer.enc_priv,
         .external_psks = replayed.psks,
-    });
+    }, &joined);
     defer joined.deinit();
 
     // `fromWelcome` verified the tree hash, the whole §7.9.2 parent-hash
@@ -555,7 +568,7 @@ fn commitFromReplayedState(gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed
     // authenticator is the derived value that ties it all together.
     try testing.expectEqual(g.epoch, joined.epoch);
     try testing.expectEqualSlices(u8, &g.tree_hash, &joined.tree_hash);
-    try testing.expectEqualSlices(u8, &g.epochAuthenticator(), &joined.epochAuthenticator());
+    try testing.expectEqualSlices(u8, &tAuth(&g), &tAuth(&joined));
 
     // Two more epochs, one from each side. This is where the joiner's
     // PRIVATE state gets exercised rather than merely constructed: the
@@ -567,22 +580,23 @@ fn commitFromReplayedState(gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed
     {
         const c2 = try g.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = replayed.sig,
+            .signature_key_pair = &replayed.sig,
             .external_psks = replayed.psks,
         });
         defer c2.deinit(gpa);
         try joined.processCommit(.{ .commit_msg = c2.commit, .external_psks = replayed.psks });
-        try testing.expectEqualSlices(u8, &g.epochAuthenticator(), &joined.epochAuthenticator());
+        try testing.expectEqualSlices(u8, &tAuth(&g), &tAuth(&joined));
     }
     {
+        const c3_sig = try S.Sig.KeyPair.generateDeterministic(@splat(seed));
         const c3 = try joined.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = try S.Sig.KeyPair.generateDeterministic(@splat(seed)),
+            .signature_key_pair = &c3_sig,
             .external_psks = replayed.psks,
         });
         defer c3.deinit(gpa);
         try g.processCommit(.{ .commit_msg = c3.commit, .external_psks = replayed.psks });
-        try testing.expectEqualSlices(u8, &g.epochAuthenticator(), &joined.epochAuthenticator());
+        try testing.expectEqualSlices(u8, &tAuth(&g), &tAuth(&joined));
     }
     return before_size;
 }

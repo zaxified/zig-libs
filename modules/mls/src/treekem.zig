@@ -37,6 +37,7 @@
 
 const std = @import("std");
 const codec = @import("codec.zig");
+const burn = @import("burn.zig");
 const crypto = @import("crypto.zig");
 const suite = @import("suite.zig");
 const treemath = @import("treemath.zig");
@@ -698,6 +699,19 @@ pub fn processUpdatePath(
     /// Commit, or the `treekem.json` vectors, none of which carry an Add).
     added_this_commit: []const u32,
 ) Error!ProcessedUpdatePath {
+    return burn.run(burn.kem_burn, Error!ProcessedUpdatePath, processUpdatePathBody, .{ S, allocator, t, receiver, sender_leaf_index, update_path, group_context, added_this_commit });
+}
+
+fn processUpdatePathBody(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    t: *const tree.RatchetTree,
+    receiver: PrivateLeafState,
+    sender_leaf_index: usize,
+    update_path: UpdatePath,
+    group_context: []const u8,
+    added_this_commit: []const u32,
+) Error!ProcessedUpdatePath {
     const sender_node = 2 * sender_leaf_index;
     const receiver_node = 2 * receiver.leaf_index;
     // A receiver whose own leaf the SAME Commit removed can land past the end
@@ -760,7 +774,8 @@ pub fn processUpdatePath(
             // §7.4: node_secret = DeriveSecret(path_secret, "node");
             // key pair = KEM.DeriveKeyPair(node_secret).
             if (kps.path_secret.len != S.Nh) return error.WrongKeyLength;
-            const node_secret = try crypto.DeriveSecret(S, kps.path_secret[0..S.Nh].*, "node");
+            var node_secret: [S.Nh]u8 = undefined;
+            try crypto.DeriveSecret(S, kps.path_secret[0..S.Nh], "node", &node_secret);
             var derived_kp: S.Kem.KeyPair = undefined;
             S.Kem.deriveKeyPair(&derived_kp, &node_secret);
             key_pair = derived_kp;
@@ -783,7 +798,7 @@ pub fn processUpdatePath(
     // below cannot swallow a buffer-size error as a decryption failure.
     const ctx_scratch = try allocator.alloc(u8, try crypto.encryptContextLen("UpdatePathNode", group_context));
     defer allocator.free(ctx_scratch);
-    crypto.DecryptWithLabelScratch(S, enc, kp, "UpdatePathNode", group_context, ct.ciphertext, &path_secret, ctx_scratch) catch
+    crypto.DecryptWithLabelScratch(S, enc, &kp, "UpdatePathNode", group_context, ct.ciphertext, &path_secret, ctx_scratch) catch
         return error.Malformed; // AEAD/decap failure = reject (Error has no HPKE-specific member)
 
     // §7.4/§7.5 steps 4-6: walk the chain up the filtered direct path,
@@ -796,8 +811,13 @@ pub fn processUpdatePath(
     }
     var i = overlap;
     while (i < fdp.len) : (i += 1) {
-        if (i > overlap) path_secret = try crypto.DeriveSecret(S, path_secret, "path");
-        const node_secret = try crypto.DeriveSecret(S, path_secret, "node");
+        if (i > overlap) {
+            var next: [S.Nh]u8 = undefined;
+            try crypto.DeriveSecret(S, &path_secret, "path", &next);
+            path_secret = next;
+        }
+        var node_secret: [S.Nh]u8 = undefined;
+        try crypto.DeriveSecret(S, &path_secret, "node", &node_secret);
         var node_kp: S.Kem.KeyPair = undefined;
         S.Kem.deriveKeyPair(&node_kp, &node_secret);
         if (!std.mem.eql(u8, &node_kp.public_key, update_path.nodes[i].encryption_key)) return error.Malformed;
@@ -812,7 +832,8 @@ pub fn processUpdatePath(
     // derivation PAST the last (root) path secret of the UpdatePath —
     // pinned byte-exact by treekem.json (each vector's commit_secret is
     // DeriveSecret(root path secret, "path"), not the root secret itself).
-    const commit = try crypto.DeriveSecret(S, path_secret, "path");
+    var commit: [S.Nh]u8 = undefined;
+    try crypto.DeriveSecret(S, &path_secret, "path", &commit);
     const commit_owned = try allocator.dupe(u8, &commit);
     errdefer allocator.free(commit_owned);
     return .{
@@ -1005,11 +1026,14 @@ pub fn Staged(comptime S: type) type {
         /// path secret for anyone to send; the lowest node that does have
         /// one is the next surviving node above it, which is what a joiner
         /// can actually use.
-        pub fn pathSecretFor(self: Self, leaf_index: u32) ?[S.Nh]u8 {
+        pub fn pathSecretFor(self: *const Self, leaf_index: u32, out: *[S.Nh]u8) bool {
             for (self.nodes) |n| {
-                if (inSubtree(2 * @as(usize, leaf_index), n.node)) return n.path_secret;
+                if (inSubtree(2 * @as(usize, leaf_index), n.node)) {
+                    out.* = n.path_secret;
+                    return true;
+                }
             }
-            return null;
+            return false;
         }
     };
 }
@@ -1026,12 +1050,12 @@ pub fn StageParams(comptime S: type) type {
         /// (§7.2), so a leaf signed here cannot be replayed into another
         /// group.
         group_id: []const u8,
-        signature_key_pair: S.Sig.KeyPair,
+        signature_key_pair: *const S.Sig.KeyPair,
         /// §7.5 step 4: "Set the encryption_key to the public key of a
         /// freshly sampled key pair."
-        leaf_key_pair: S.Kem.KeyPair,
+        leaf_key_pair: *const S.Kem.KeyPair,
         /// §7.4: "path_secret[0] is sampled at random."
-        path_secret_0: [S.Nh]u8,
+        path_secret_0: *const [S.Nh]u8,
         /// The rest of the leaf's content. §7.5: "The application MAY
         /// specify other changes to the leaf node, e.g., providing a new
         /// signature key, updated capabilities, or different extensions."
@@ -1072,7 +1096,19 @@ pub fn stageUpdatePath(
     t: *tree.RatchetTree,
     sender_leaf_index: usize,
     params: StageParams(S),
-) !Staged(S) {
+    out: *Staged(S),
+) @TypeOf(stageUpdatePathBody(S, allocator, t, sender_leaf_index, params, out)) {
+    return burn.run(burn.kem_burn, @TypeOf(stageUpdatePathBody(S, allocator, t, sender_leaf_index, params, out)), stageUpdatePathBody, .{ S, allocator, t, sender_leaf_index, params, out });
+}
+
+fn stageUpdatePathBody(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    t: *tree.RatchetTree,
+    sender_leaf_index: usize,
+    params: StageParams(S),
+    out: *Staged(S),
+) !void {
     const sender_node = 2 * sender_leaf_index;
     if (sender_node >= t.nodes.len) return error.InvalidLeafIndex;
 
@@ -1088,10 +1124,15 @@ pub fn stageUpdatePath(
     // §7.4's chain: path_secret[0] is the sampled value; every later one is
     // DeriveSecret(previous, "path"). node_secret = DeriveSecret(path_secret,
     // "node"); (node_priv, node_pub) = KEM.DeriveKeyPair(node_secret).
-    var secret = params.path_secret_0;
+    var secret = params.path_secret_0.*;
     for (fdp, nodes, 0..) |e, *slot, i| {
-        if (i > 0) secret = try crypto.DeriveSecret(S, secret, "path");
-        const node_secret = try crypto.DeriveSecret(S, secret, "node");
+        if (i > 0) {
+            var next: [S.Nh]u8 = undefined;
+            try crypto.DeriveSecret(S, &secret, "path", &next);
+            secret = next;
+        }
+        var node_secret: [S.Nh]u8 = undefined;
+        try crypto.DeriveSecret(S, &secret, "node", &node_secret);
         var kp: S.Kem.KeyPair = undefined;
         S.Kem.deriveKeyPair(&kp, &node_secret);
         slot.* = .{
@@ -1115,7 +1156,7 @@ pub fn stageUpdatePath(
     // sender's is blank or added by this same Commit, so no EXISTING member
     // decrypts this path, and a new member enters the key schedule at
     // `joiner_secret` — below the point `commit_secret` feeds.
-    const commit_secret = try crypto.DeriveSecret(S, secret, "path");
+    try crypto.DeriveSecret(S, &secret, "path", &out.commit_secret);
 
     // §7.5 merge step 1.
     var dp_buf: [treemath.max_path_len]usize = undefined;
@@ -1186,7 +1227,8 @@ pub fn stageUpdatePath(
     // frees what it owns and nothing else.
     t.nodes[sender_node] = .{ .leaf = try dupLeafNodeLists(t.allocator, leaf) };
 
-    return .{ .leaf_node = leaf, .nodes = nodes, .commit_secret = commit_secret };
+    out.leaf_node = leaf;
+    out.nodes = nodes;
 }
 
 /// RFC 9420 §7.5's second block ("The member then encrypts path secrets to
@@ -1215,7 +1257,7 @@ pub fn sealUpdatePath(
     allocator: std.mem.Allocator,
     io: std.Io,
     t: *const tree.RatchetTree,
-    staged: Staged(S),
+    staged: *const Staged(S),
     /// The ENCODED provisional `GroupContext` (§8.1) — see this section's
     /// opening note for why the caller supplies it.
     group_context: []const u8,

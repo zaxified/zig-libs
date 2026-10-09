@@ -142,14 +142,15 @@ fn runEntry(
     }
 
     // ── join.
-    var g = G.fromWelcome(alloc, .{
+    var g: G = undefined;
+    G.fromWelcome(alloc, .{
         .welcome_msg = welcome_msg,
         .key_package_msg = key_package_msg,
-        .init_priv = init_priv,
-        .encryption_priv = encryption_priv,
+        .init_priv = &init_priv,
+        .encryption_priv = &encryption_priv,
         .ratchet_tree = ratchet_tree,
         .external_psks = psks.items,
-    }) catch |err| {
+    }, &g) catch |err| {
         std.debug.print(
             "passive-client KAT [{s}] entry {d}: fromWelcome failed: {s}\n",
             .{ vector, entry_index, @errorName(err) },
@@ -160,7 +161,8 @@ fn runEntry(
 
     {
         const want = try hexDecode(sa, obj.get("initial_epoch_authenticator").?.string);
-        const got = g.epochAuthenticator();
+        var got: [S.Nh]u8 = undefined;
+        g.epochAuthenticator(&got);
         try expectAuthenticator(vector, entry_index, "initial (post-Welcome)", want, &got);
     }
 
@@ -191,7 +193,8 @@ fn runEntry(
         };
 
         const want = try hexDecode(sa, epoch.get("epoch_authenticator").?.string);
-        const got = g.epochAuthenticator();
+        var got: [S.Nh]u8 = undefined;
+        g.epochAuthenticator(&got);
         try expectAuthenticator(vector, entry_index, label, want, &got);
         replayed += 1;
     }

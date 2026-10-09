@@ -444,7 +444,7 @@ pub const LeafNode = struct {
         self: LeafNode,
         comptime S: type,
         allocator: std.mem.Allocator,
-        key_pair: S.Sig.KeyPair,
+        key_pair: *const S.Sig.KeyPair,
         group_id: []const u8,
         leaf_index: u32,
     ) !S.Sig.Signature {
@@ -893,7 +893,7 @@ test "§7.2: LeafNode.sign round-trips through verifySignature, and the group bi
         .signature = &.{},
     };
 
-    const sig = try leaf.sign(S, gpa, kp, "the-group", 3);
+    const sig = try leaf.sign(S, gpa, &kp, "the-group", 3);
     const sig_bytes = sig.toBytes();
     leaf.signature = &sig_bytes;
     try leaf.verifySignature(S, gpa, "the-group", 3);
@@ -910,7 +910,7 @@ test "§7.2: LeafNode.sign round-trips through verifySignature, and the group bi
     kp_leaf.leaf_node_source = .key_package;
     kp_leaf.parent_hash = null;
     kp_leaf.lifetime = .{ .not_before = 0, .not_after = 1 };
-    const kp_sig = try kp_leaf.sign(S, gpa, kp, "", 0);
+    const kp_sig = try kp_leaf.sign(S, gpa, &kp, "", 0);
     const kp_sig_bytes = kp_sig.toBytes();
     kp_leaf.signature = &kp_sig_bytes;
     try kp_leaf.verifySignature(S, gpa, "anything-at-all", 77);

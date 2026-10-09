@@ -103,6 +103,7 @@
 const std = @import("std");
 const codec = @import("codec.zig");
 const content = @import("content.zig");
+const burn = @import("burn.zig");
 const crypto = @import("crypto.zig");
 const framing = @import("framing.zig");
 const keyschedule = @import("keyschedule.zig");
@@ -556,8 +557,8 @@ pub fn Group(comptime S: type) type {
         /// the `passive-client-*.json` vectors compare at every step, and
         /// the one an application shows a user as a "safety number" for the
         /// group as a whole.
-        pub fn epochAuthenticator(self: *const Self) [S.Nh]u8 {
-            return self.secrets.epoch_authenticator;
+        pub fn epochAuthenticator(self: *const Self, out: *[S.Nh]u8) void {
+            out.* = self.secrets.epoch_authenticator;
         }
 
         /// The number of leaves the tree currently spans (blank included).
@@ -688,7 +689,7 @@ pub fn Group(comptime S: type) type {
             /// tinguishable from any other member's.
             key_package_msg: []const u8,
             /// Private half of that KeyPackage's LeafNode `encryption_key`.
-            encryption_priv: [S.Kem.Nsk]u8,
+            encryption_priv: *const [S.Kem.Nsk]u8,
             /// §8.1 GroupContext extensions for epoch 0 (§11: "Extensions:
             /// Any values of the creator's choosing").
             extensions: []const tree.Extension = &.{},
@@ -716,7 +717,15 @@ pub fn Group(comptime S: type) type {
         ///
         /// §8.2's `confirmed_transcript_hash_[0]` is the ZERO-LENGTH string,
         /// not a zero-filled digest; see the `confirmed_len` field.
-        pub fn create(gpa: std.mem.Allocator, params: CreateParams) !Self {
+        ///
+        /// Lands the group in `out` (it holds the epoch secrets and the leaf
+        /// private key, so it is never returned by value); on error `out` is
+        /// undefined and owns nothing.
+        pub fn create(gpa: std.mem.Allocator, params: CreateParams, out: *Self) @TypeOf(createBody(gpa, params, out)) {
+            return burn.run(burn.group_burn, @TypeOf(createBody(gpa, params, out)), createBody, .{ gpa, params, out });
+        }
+
+        fn createBody(gpa: std.mem.Allocator, params: CreateParams, out: *Self) !void {
             const arena_ptr = try WipingArena.create(gpa);
             errdefer arena_ptr.destroy(gpa);
             const arena = arena_ptr.allocator();
@@ -735,7 +744,7 @@ pub fn Group(comptime S: type) type {
             try my_kp.verifySignature(S, gpa);
             try verifyLeafSignature(S, gpa, my_kp.leaf_node, .key_package, null, null);
 
-            const enc_kp = try S.Kem.KeyPair.generateDeterministic(params.encryption_priv);
+            const enc_kp = try S.Kem.KeyPair.generateDeterministic(params.encryption_priv.*);
             if (!std.mem.eql(u8, my_kp.leaf_node.encryption_key, &enc_kp.public_key)) return error.PrivateKeyMismatch;
 
             const nodes = try arena.alloc(?tree.Node, 1);
@@ -759,23 +768,19 @@ pub fn Group(comptime S: type) type {
             // this. `random`'s fallback on `EntropyUnavailable` is silent and
             // low-entropy, so this secret needs the fail-closed call instead.
             try params.io.randomSecure(&init_secret);
-            const secrets = try keyschedule.deriveEpoch(
-                S,
-                gpa,
-                init_secret,
-                keyschedule.zeroSecret(S),
-                keyschedule.zeroSecret(S),
-                gc_bytes,
-            );
+            const zero = keyschedule.zeroSecret(S);
+            var secrets: keyschedule.EpochSecrets(S) = undefined;
+            try keyschedule.deriveEpoch(S, gpa, &init_secret, &zero, &zero, gc_bytes, &secrets);
             init_secret = @splat(0);
 
             // §11: "Compute a confirmation_tag over the empty
             // confirmed_transcript_hash ... Compute the updated
             // interim_transcript_hash".
-            const tag = keyschedule.confirmationTag(S, secrets.confirmation_key, transcript.empty_transcript_hash);
+            const tag = keyschedule.confirmationTag(S, &secrets.confirmation_key, transcript.empty_transcript_hash);
             const interim = try transcript.interimTranscriptHash(S, transcript.empty_transcript_hash, &tag);
 
-            var self: Self = .{
+            const self = out;
+            self.* = .{
                 .gpa = gpa,
                 .arena = arena_ptr,
                 .policy = params.policy,
@@ -789,7 +794,7 @@ pub fn Group(comptime S: type) type {
                 .ratchet_tree = rt,
                 .secrets = secrets,
                 .my_leaf_index = 0,
-                .my_encryption_priv = params.encryption_priv,
+                .my_encryption_priv = params.encryption_priv.*,
                 .my_path_secrets = .empty,
                 .resumption_history = .empty,
                 .pending_updates = .empty,
@@ -808,7 +813,6 @@ pub fn Group(comptime S: type) type {
                 defer gpa.free(re);
                 if (!std.mem.eql(u8, gc_bytes, re)) return error.Malformed;
             }
-            return self;
         }
 
         // ── §12.4.3.1: entering a group from a Welcome ────────────────────
@@ -825,9 +829,9 @@ pub fn Group(comptime S: type) type {
             /// slot and to find our leaf in the tree.
             key_package_msg: []const u8,
             /// Private half of that KeyPackage's `init_key`.
-            init_priv: [S.Kem.Nsk]u8,
+            init_priv: *const [S.Kem.Nsk]u8,
             /// Private half of that KeyPackage's LeafNode `encryption_key`.
-            encryption_priv: [S.Kem.Nsk]u8,
+            encryption_priv: *const [S.Kem.Nsk]u8,
             /// §12.4.3.3's out-of-band tree: the encoded `optional<Node>
             /// ratchet_tree<V>` vector. `null` means the tree must come
             /// from the `GroupInfo`'s `ratchet_tree` extension.
@@ -856,7 +860,13 @@ pub fn Group(comptime S: type) type {
         /// three things §12.4.3.1 lists that Part 6 explicitly left to the
         /// caller: verify the tree hash, verify the parent-hash chain, and
         /// find this client's own leaf.
-        pub fn fromWelcome(gpa: std.mem.Allocator, params: WelcomeParams) !Self {
+        ///
+        /// Lands the group in `out`, as `create` does.
+        pub fn fromWelcome(gpa: std.mem.Allocator, params: WelcomeParams, out: *Self) @TypeOf(fromWelcomeBody(gpa, params, out)) {
+            return burn.run(burn.group_burn, @TypeOf(fromWelcomeBody(gpa, params, out)), fromWelcomeBody, .{ gpa, params, out });
+        }
+
+        fn fromWelcomeBody(gpa: std.mem.Allocator, params: WelcomeParams, out: *Self) !void {
             const arena_ptr = try WipingArena.create(gpa);
             errdefer arena_ptr.destroy(gpa);
             const arena = arena_ptr.allocator();
@@ -891,13 +901,13 @@ pub fn Group(comptime S: type) type {
 
             const slot = w.findSecret(&kp_ref) orelse return error.NoMatchingKeyPackage;
 
-            const init_kp = try S.Kem.KeyPair.generateDeterministic(params.init_priv);
+            const init_kp = try S.Kem.KeyPair.generateDeterministic(params.init_priv.*);
             if (!std.mem.eql(u8, my_kp.init_key, &init_kp.public_key)) return error.PrivateKeyMismatch;
 
             const gs_bytes = try welcome_mod.decryptGroupSecrets(
                 S,
                 arena,
-                init_kp,
+                &init_kp,
                 w.encrypted_group_info,
                 slot.encrypted_group_secrets,
             );
@@ -916,13 +926,14 @@ pub fn Group(comptime S: type) type {
             // flows are the ones that would need it, and neither is built.
             const psks = try resolvePsksFromIds(gpa, group_secrets.psks, params.external_psks, .{});
             defer gpa.free(psks);
-            const psk_secret = try keyschedule.pskSecret(S, gpa, psks);
+            var psk_secret: [S.Nh]u8 = undefined;
+            try keyschedule.pskSecret(S, gpa, psks, &psk_secret);
 
-            var joiner: [S.Nh]u8 = undefined;
-            @memcpy(&joiner, group_secrets.joiner_secret);
-            const welcome_secret = try keyschedule.welcomeSecret(S, joiner, psk_secret);
+            const joiner = group_secrets.joiner_secret[0..S.Nh];
+            var welcome_secret: [S.Nh]u8 = undefined;
+            try keyschedule.welcomeSecret(S, joiner, &psk_secret, &welcome_secret);
 
-            const gi_bytes = try welcome_mod.decryptGroupInfo(S, arena, welcome_secret, w.encrypted_group_info);
+            const gi_bytes = try welcome_mod.decryptGroupInfo(S, arena, &welcome_secret, w.encrypted_group_info);
             var gi_reader = codec.Reader.init(gi_bytes);
             const group_info = try welcome_mod.GroupInfo.decode(arena, &gi_reader);
             if (!gi_reader.atEnd()) return error.Malformed;
@@ -939,10 +950,11 @@ pub fn Group(comptime S: type) type {
 
             // ── §8: the epoch, entered at joiner_secret.
             const gc_bytes = group_info.raw.?.group_context;
-            const secrets = try keyschedule.deriveEpochFromJoiner(S, gpa, joiner, psk_secret, gc_bytes);
+            var secrets: keyschedule.EpochSecrets(S) = undefined;
+            try keyschedule.deriveEpochFromJoiner(S, gpa, joiner, &psk_secret, gc_bytes, &secrets);
             try keyschedule.verifyConfirmationTag(
                 S,
-                secrets.confirmation_key,
+                &secrets.confirmation_key,
                 group_info.group_context.confirmed_transcript_hash,
                 group_info.confirmation_tag,
             );
@@ -954,7 +966,7 @@ pub fn Group(comptime S: type) type {
 
             // ── our own leaf, and the private keys that must match it.
             const my_index = try findOwnLeaf(gpa, &rt, my_leaf_encoded);
-            const enc_kp = try S.Kem.KeyPair.generateDeterministic(params.encryption_priv);
+            const enc_kp = try S.Kem.KeyPair.generateDeterministic(params.encryption_priv.*);
             {
                 const leaf = (rt.nodes[my_index * 2].?).leaf;
                 if (!std.mem.eql(u8, leaf.encryption_key, &enc_kp.public_key)) return error.PrivateKeyMismatch;
@@ -971,7 +983,8 @@ pub fn Group(comptime S: type) type {
                 try derivePathSecretsUp(S, arena, &rt, my_index, start, ps, &path_secrets);
             }
 
-            var self: Self = .{
+            const self = out;
+            self.* = .{
                 .gpa = gpa,
                 .arena = arena_ptr,
                 .policy = params.policy,
@@ -984,7 +997,7 @@ pub fn Group(comptime S: type) type {
                 .ratchet_tree = rt,
                 .secrets = secrets,
                 .my_leaf_index = @intCast(my_index),
-                .my_encryption_priv = params.encryption_priv,
+                .my_encryption_priv = params.encryption_priv.*,
                 .my_path_secrets = path_secrets,
                 .resumption_history = .empty,
                 .pending_updates = .empty,
@@ -1010,7 +1023,6 @@ pub fn Group(comptime S: type) type {
                 defer gpa.free(re);
                 if (!std.mem.eql(u8, gc_bytes, re)) return error.Malformed;
             }
-            return self;
         }
 
         /// §12.4.3.3's "the tree, from the extension or from out of band"
@@ -1108,7 +1120,11 @@ pub fn Group(comptime S: type) type {
         ///     failed `confirmation_tag`;
         ///   * §12.3's last-but-one bullet substitutes §8.3's `init_secret`
         ///     for the previous epoch's.
-        pub fn processCommit(self: *Self, params: CommitParams) !void {
+        pub fn processCommit(self: *Self, params: CommitParams) @TypeOf(processCommitBody(self, params)) {
+            return burn.run(burn.group_burn, @TypeOf(processCommitBody(self, params)), processCommitBody, .{ self, params });
+        }
+
+        fn processCommitBody(self: *Self, params: CommitParams) !void {
             const gpa = self.gpa;
             // Everything this Commit allocates goes here, from the copy of
             // the message on. It joins the group's retained state only if
@@ -1176,7 +1192,7 @@ pub fn Group(comptime S: type) type {
                     else => return error.UnexpectedSenderType,
                 };
                 const committer_key = try leafSignatureKey(&self.ratchet_tree, member_committer);
-                try framing.verifyMembershipTag(S, gpa, self.secrets.membership_key, pm, old_gc);
+                try framing.verifyMembershipTag(S, gpa, &self.secrets.membership_key, pm, old_gc);
                 try framing.verifyFramedContent(S, gpa, committer_key, ac, old_gc);
             }
 
@@ -1358,14 +1374,8 @@ pub fn Group(comptime S: type) type {
                 w.secrets.init_secret;
             defer std.crypto.secureZero(u8, &init_secret);
 
-            var secrets = try keyschedule.deriveEpoch(
-                S,
-                gpa,
-                init_secret,
-                commit_secret,
-                psk_secret,
-                new_gc_bytes,
-            );
+            var secrets: keyschedule.EpochSecrets(S) = undefined;
+            try keyschedule.deriveEpoch(S, gpa, &init_secret, &commit_secret, &psk_secret, new_gc_bytes, &secrets);
             defer secrets.wipe();
 
             // Bullet 12: the confirmation tag proves the committer derived
@@ -1373,7 +1383,7 @@ pub fn Group(comptime S: type) type {
             // arithmetic; this is what makes it binding.
             try keyschedule.verifyConfirmationTag(
                 S,
-                secrets.confirmation_key,
+                &secrets.confirmation_key,
                 &hashes.confirmed,
                 ac.auth.confirmation_tag orelse return error.MissingConfirmationTag,
             );
@@ -1420,8 +1430,12 @@ pub fn Group(comptime S: type) type {
         /// free function.
         fn externalInitSecret(self: *const Self, kem_output: []const u8) ![S.Nh]u8 {
             if (kem_output.len != S.Kem.Npk) return error.WrongKeyLength;
-            const kp = keyschedule.externalKeyPair(S, self.secrets.external_secret);
-            return keyschedule.externalInitReceiver(S, kem_output[0..S.Kem.Npk].*, kp);
+            var kp: S.Kem.KeyPair = undefined;
+            defer std.crypto.secureZero(u8, &kp.secret_key);
+            keyschedule.externalKeyPair(S, &self.secrets.external_secret, &kp);
+            var out: [S.Nh]u8 = undefined;
+            try keyschedule.externalInitReceiver(S, kem_output[0..S.Kem.Npk].*, &kp, &out);
+            return out;
         }
 
         // ── §12.1: creating a proposal ────────────────────────────────────
@@ -1434,7 +1448,7 @@ pub fn Group(comptime S: type) type {
             /// storage and its lifetime are the application's, and this
             /// object borrows it per call rather than keeping a copy alive
             /// for the length of a session.
-            signature_key_pair: S.Sig.KeyPair,
+            signature_key_pair: *const S.Sig.KeyPair,
             proposal: content.Proposal,
             authenticated_data: []const u8 = &.{},
         };
@@ -1450,7 +1464,11 @@ pub fn Group(comptime S: type) type {
         /// returned bytes; they are what a later `createCommit`'s
         /// `.by_reference` arm and a receiver's `CommitParams.proposal_msgs`
         /// both take.
-        pub fn createProposal(self: *const Self, allocator: std.mem.Allocator, params: ProposeParams) ![]u8 {
+        pub fn createProposal(self: *const Self, allocator: std.mem.Allocator, params: ProposeParams) @TypeOf(createProposalBody(self, allocator, params)) {
+            return burn.run(burn.group_burn, @TypeOf(createProposalBody(self, allocator, params)), createProposalBody, .{ self, allocator, params });
+        }
+
+        fn createProposalBody(self: *const Self, allocator: std.mem.Allocator, params: ProposeParams) ![]u8 {
             const gpa = self.gpa;
             const gc = try self.groupContextAlloc(gpa);
             defer gpa.free(gc);
@@ -1465,7 +1483,7 @@ pub fn Group(comptime S: type) type {
             const sig = try framing.signFramedContent(S, gpa, params.signature_key_pair, .mls_public_message, fc, gc);
             const sig_bytes = sig.toBytes();
             const auth: framing.FramedContentAuthData = .{ .signature = &sig_bytes };
-            const mtag = try framing.membershipTag(S, gpa, self.secrets.membership_key, fc, auth, gc);
+            const mtag = try framing.membershipTag(S, gpa, &self.secrets.membership_key, fc, auth, gc);
             const msg: framing.MLSMessage = .{
                 .public_message = .{ .content = fc, .auth = auth, .membership_tag = &mtag },
             };
@@ -1475,7 +1493,7 @@ pub fn Group(comptime S: type) type {
         /// What `updateLeaf` needs to build the `LeafNode` an Update
         /// proposal (§12.1.2) carries.
         pub const UpdateLeafParams = struct {
-            signature_key_pair: S.Sig.KeyPair,
+            signature_key_pair: *const S.Sig.KeyPair,
             /// The FRESH ratchet-tree key pair this member is rotating to.
             /// §7.3: an Update's `encryption_key` MUST differ from the one
             /// it replaces, and that is checked here rather than left to
@@ -1484,7 +1502,7 @@ pub fn Group(comptime S: type) type {
             /// retained (see `pending_updates`), because the member needs
             /// it the moment some Commit applies this Update — which may
             /// be a Commit made by somebody else.
-            encryption_key_pair: S.Kem.KeyPair,
+            encryption_key_pair: *const S.Kem.KeyPair,
         };
 
         /// RFC 9420 §12.1.2 + §7.2: build and sign the `LeafNode` for an
@@ -1498,7 +1516,11 @@ pub fn Group(comptime S: type) type {
         /// what an Update rotates). Every allocation is made in the group's
         /// own arena, so the returned leaf stays valid for as long as the
         /// group does and needs no `deinit`.
-        pub fn updateLeaf(self: *Self, params: UpdateLeafParams) !tree.LeafNode {
+        pub fn updateLeaf(self: *Self, params: UpdateLeafParams) @TypeOf(updateLeafBody(self, params)) {
+            return burn.run(burn.group_burn, @TypeOf(updateLeafBody(self, params)), updateLeafBody, .{ self, params });
+        }
+
+        fn updateLeafBody(self: *Self, params: UpdateLeafParams) !tree.LeafNode {
             const arena = self.arena.allocator();
             const current = try self.ownLeaf();
             const new_pub = params.encryption_key_pair.public_key;
@@ -1551,7 +1573,7 @@ pub fn Group(comptime S: type) type {
             /// Draws §7.4's `path_secret[0]`, the fresh leaf key pair, and
             /// the HPKE ephemerals for every ciphertext.
             io: std.Io,
-            signature_key_pair: S.Sig.KeyPair,
+            signature_key_pair: *const S.Sig.KeyPair,
             /// The proposal list, IN THE ORDER it will appear in the Commit.
             /// The order is the committer's to choose and it is observable:
             /// §12.1.1 places Adds at successive blank leaves "in the order
@@ -1636,8 +1658,8 @@ pub fn Group(comptime S: type) type {
         ///      and the `membership_tag` is computed after BOTH, because
         ///      §6.2's `AuthenticatedContentTBM` covers the whole
         ///      `FramedContentAuthData` including the tag.
-        pub fn createCommit(self: *Self, allocator: std.mem.Allocator, params: CreateCommitParams) !Created {
-            return self.commitInner(allocator, params, .member);
+        pub fn createCommit(self: *Self, allocator: std.mem.Allocator, params: CreateCommitParams) @TypeOf(self.commitInner(allocator, params, .member)) {
+            return burn.run(burn.group_burn, @TypeOf(self.commitInner(allocator, params, .member)), commitInner, .{ self, allocator, params, @as(CommitMode, .member) });
         }
 
         /// Which of §12.4's two Commit flavors `commitInner` is building.
@@ -1792,18 +1814,19 @@ pub fn Group(comptime S: type) type {
                 var leaf_kp: S.Kem.KeyPair = undefined;
                 S.Kem.generateKeyPair(&leaf_kp, params.io);
 
-                const st = try treekem.stageUpdatePath(S, arena, &w.ratchet_tree, w.my_leaf_index, .{
+                staged = @as(treekem.Staged(S), undefined);
+                const st = &staged.?;
+                try treekem.stageUpdatePath(S, arena, &w.ratchet_tree, w.my_leaf_index, .{
                     .group_id = w.group_id,
                     .signature_key_pair = params.signature_key_pair,
-                    .leaf_key_pair = leaf_kp,
-                    .path_secret_0 = path_secret_0,
+                    .leaf_key_pair = &leaf_kp,
+                    .path_secret_0 = &path_secret_0,
                     .signature_key = base_leaf.signature_key,
                     .credential = base_leaf.credential,
                     .capabilities = base_leaf.capabilities,
                     .extensions = base_leaf.extensions,
-                });
+                }, st);
                 path_secret_0 = @splat(0);
-                staged = st;
                 commit_secret = st.commit_secret;
                 new_leaf_priv = leaf_kp.secret_key;
 
@@ -1889,16 +1912,10 @@ pub fn Group(comptime S: type) type {
                 .external => |e| e.init_secret,
             };
             defer std.crypto.secureZero(u8, &init_secret);
-            var secrets = try keyschedule.deriveEpoch(
-                S,
-                gpa,
-                init_secret,
-                commit_secret,
-                applied.psk_secret,
-                new_gc_bytes,
-            );
+            var secrets: keyschedule.EpochSecrets(S) = undefined;
+            try keyschedule.deriveEpoch(S, gpa, &init_secret, &commit_secret, &applied.psk_secret, new_gc_bytes, &secrets);
             defer secrets.wipe();
-            const tag = keyschedule.confirmationTag(S, secrets.confirmation_key, &confirmed);
+            const tag = keyschedule.confirmationTag(S, &secrets.confirmation_key, &confirmed);
             ac.auth.confirmation_tag = &tag;
             const interim = try transcript.interimTranscriptHash(S, &confirmed, &tag);
 
@@ -1919,7 +1936,7 @@ pub fn Group(comptime S: type) type {
             const mtag: ?[S.Nm]u8 = if (external)
                 null
             else
-                try framing.membershipTag(S, gpa, w.secrets.membership_key, fc, ac.auth, old_gc);
+                try framing.membershipTag(S, gpa, &w.secrets.membership_key, fc, ac.auth, old_gc);
             const commit_msg: framing.MLSMessage = .{
                 .public_message = .{
                     .content = fc,
@@ -1947,7 +1964,9 @@ pub fn Group(comptime S: type) type {
                 // §12.4.3.2's `ExternalPub` is a struct with one
                 // `HPKEPublicKey` field, i.e. an `opaque<V>` — so the
                 // extension body is length-prefixed, not a bare key.
-                const ext_kp = keyschedule.externalKeyPair(S, secrets.external_secret);
+                var ext_kp: S.Kem.KeyPair = undefined;
+                defer std.crypto.secureZero(u8, &ext_kp.secret_key);
+                keyschedule.externalKeyPair(S, &secrets.external_secret, &ext_kp);
                 var ext_w = codec.Writer.init(&ext_pub_buf);
                 try ext_w.writeVector(&ext_kp.public_key);
                 try gi_exts.append(gpa, .{
@@ -2037,7 +2056,7 @@ pub fn Group(comptime S: type) type {
             /// symmetry with `create`/`fromWelcome` and because a client
             /// that can join a group has one.
             key_package_msg: []const u8,
-            signature_key_pair: S.Sig.KeyPair,
+            signature_key_pair: *const S.Sig.KeyPair,
             /// Proposals to commit ALONGSIDE the ExternalInit, which this
             /// function contributes itself (the caller cannot: its
             /// `kem_output` is drawn here). §12.2's whitelist admits only a
@@ -2141,11 +2160,23 @@ pub fn Group(comptime S: type) type {
         /// demonstrates presence in a prior epoch identically: only the
         /// client that held that epoch's `resumption_psk` can produce a
         /// Commit the members accept.
+        ///
+        /// Lands the joiner and the messages in `out`, as `create` does.
         pub fn joinByExternalCommit(
             gpa: std.mem.Allocator,
             allocator: std.mem.Allocator,
             params: ExternalJoinParams,
-        ) !ExternalJoin {
+            out: *ExternalJoin,
+        ) @TypeOf(externalJoinBody(gpa, allocator, params, out)) {
+            return burn.run(burn.group_burn, @TypeOf(externalJoinBody(gpa, allocator, params, out)), externalJoinBody, .{ gpa, allocator, params, out });
+        }
+
+        fn externalJoinBody(
+            gpa: std.mem.Allocator,
+            allocator: std.mem.Allocator,
+            params: ExternalJoinParams,
+            out: *ExternalJoin,
+        ) !void {
             const arena_ptr = try WipingArena.create(gpa);
             errdefer arena_ptr.destroy(gpa);
             const arena = arena_ptr.allocator();
@@ -2195,7 +2226,9 @@ pub fn Group(comptime S: type) type {
             // member — can recover it.
             const ext_pub_bytes = (try group_info.externalPub()) orelse return error.ExternalPubUnavailable;
             if (ext_pub_bytes.len != S.Kem.Npk) return error.WrongKeyLength;
-            const ext_init = try keyschedule.externalInitSender(S, ext_pub_bytes[0..S.Kem.Npk].*, params.io);
+            var ext_init: keyschedule.ExternalInit(S) = undefined;
+            defer std.crypto.secureZero(u8, &ext_init.init_secret);
+            try keyschedule.externalInitSender(S, ext_pub_bytes[0..S.Kem.Npk].*, params.io, &ext_init);
 
             // ── the proposal list: §12.2's mandatory ExternalInit first,
             // then whatever the caller added. FIRST rather than last only
@@ -2217,7 +2250,8 @@ pub fn Group(comptime S: type) type {
             // zero-length string. Same rule, same reason as `fromWelcome`.
             if (conf.len != S.Hash.digest_length and conf.len != 0) return error.Malformed;
 
-            var self: Self = .{
+            const self = &out.group;
+            self.* = .{
                 .gpa = gpa,
                 .arena = arena_ptr,
                 .policy = params.policy,
@@ -2276,7 +2310,7 @@ pub fn Group(comptime S: type) type {
                 if (!std.mem.eql(u8, gc_bytes.bytes, re)) return error.Malformed;
             }
 
-            const messages = try self.commitInner(allocator, .{
+            out.messages = try self.commitInner(allocator, .{
                 .io = params.io,
                 .signature_key_pair = params.signature_key_pair,
                 .proposals = sources,
@@ -2290,8 +2324,6 @@ pub fn Group(comptime S: type) type {
                 .leaf = my_kp.leaf_node,
                 .resumption_psks = params.resumption_psks,
             } });
-
-            return .{ .group = self, .messages = messages };
         }
 
         /// RFC 9420 §12.4.3.1's SEND direction: one `Welcome` covering every
@@ -2316,7 +2348,7 @@ pub fn Group(comptime S: type) type {
 
             const gi_bytes = try group_info.encodeAlloc(gpa);
             defer gpa.free(gi_bytes);
-            const egi = try welcome_mod.encryptGroupInfo(S, gpa, secrets.welcome_secret, gi_bytes);
+            const egi = try welcome_mod.encryptGroupInfo(S, gpa, &secrets.welcome_secret, gi_bytes);
             defer gpa.free(egi);
 
             const slots = try gpa.alloc(welcome_mod.EncryptedGroupSecrets, applied.added.len);
@@ -2345,10 +2377,12 @@ pub fn Group(comptime S: type) type {
                 // Commit ... Compute the path secret corresponding to the
                 // common ancestor node." See `Staged.pathSecretFor` for why
                 // it is the lowest node OF THE PATH covering that leaf.
-                const ps: ?[S.Nh]u8 = if (staged) |st| st.pathSecretFor(member.leaf_index) else null;
+                var ps: [S.Nh]u8 = undefined;
+                defer std.crypto.secureZero(u8, &ps);
+                const has_ps = if (staged) |*st| st.pathSecretFor(member.leaf_index, &ps) else false;
                 const gs: welcome_mod.GroupSecrets = .{
                     .joiner_secret = &secrets.joiner_secret,
-                    .path_secret = if (ps) |*p| p else null,
+                    .path_secret = if (has_ps) &ps else null,
                     .psks = applied.psk_ids,
                 };
                 const gs_bytes = try gs.encodeAlloc(gpa);
@@ -2450,7 +2484,7 @@ pub fn Group(comptime S: type) type {
                 else => return error.UnexpectedSenderType,
             };
             const key = try leafSignatureKey(&self.ratchet_tree, sender);
-            try framing.verifyMembershipTag(S, gpa, self.secrets.membership_key, p, old_gc);
+            try framing.verifyMembershipTag(S, gpa, &self.secrets.membership_key, p, old_gc);
             const pac = p.authenticatedContent();
             try framing.verifyFramedContent(S, gpa, key, pac, old_gc);
             return .{
@@ -2679,7 +2713,8 @@ pub fn Group(comptime S: type) type {
             errdefer gpa.free(psk_ids);
             const psks = try self.resolvePsks(gpa, psk_ids, external_psks, resumption_psks);
             defer gpa.free(psks);
-            const psk_secret = try keyschedule.pskSecret(S, gpa, psks);
+            var psk_secret: [S.Nh]u8 = undefined;
+            try keyschedule.pskSecret(S, gpa, psks, &psk_secret);
 
             // §12.4's `pathRequired` pseudocode, verbatim:
             //
@@ -3206,7 +3241,8 @@ pub fn Group(comptime S: type) type {
                 .parent => |p| p.encryption_key,
                 .leaf => |l| l.encryption_key,
             };
-            const node_secret = crypto.DeriveSecret(S, e.path_secret[0..S.Nh].*, "node") catch return false;
+            var node_secret: [S.Nh]u8 = undefined;
+            crypto.DeriveSecret(S, e.path_secret[0..S.Nh], "node", &node_secret) catch return false;
             var kp: S.Kem.KeyPair = undefined;
             S.Kem.deriveKeyPair(&kp, &node_secret);
             return std.mem.eql(u8, pub_key, &kp.public_key);
@@ -3498,7 +3534,11 @@ fn derivePathSecretsUp(
             seen_start = true;
         }
         if (t.nodes[node] == null) continue; // filtered out by the committer
-        if (placed) secret = try crypto.DeriveSecret(S, secret, "path");
+        if (placed) {
+            var next: [S.Nh]u8 = undefined;
+            try crypto.DeriveSecret(S, &secret, "path", &next);
+            secret = next;
+        }
         placed = true;
         try out.append(arena, .{ .node = node, .path_secret = try arena.dupe(u8, &secret) });
     }
@@ -3637,6 +3677,32 @@ test "Policy: the two §7.3 rules this object owns default to ON" {
 
 const keypackage_mod = @import("keypackage.zig");
 
+// Test-only by-value wrappers over the out-pointer constructors, so the
+// scenarios below read as before.
+fn tCreate(gpa: std.mem.Allocator, params: Group(TestSuite).CreateParams) !Group(TestSuite) {
+    var g: Group(TestSuite) = undefined;
+    try Group(TestSuite).create(gpa, params, &g);
+    return g;
+}
+
+fn tFromWelcome(gpa: std.mem.Allocator, params: Group(TestSuite).WelcomeParams) !Group(TestSuite) {
+    var g: Group(TestSuite) = undefined;
+    try Group(TestSuite).fromWelcome(gpa, params, &g);
+    return g;
+}
+
+fn tExternalJoin(gpa: std.mem.Allocator, allocator: std.mem.Allocator, params: Group(TestSuite).ExternalJoinParams) !Group(TestSuite).ExternalJoin {
+    var out: Group(TestSuite).ExternalJoin = undefined;
+    try Group(TestSuite).joinByExternalCommit(gpa, allocator, params, &out);
+    return out;
+}
+
+fn tAuth(g: *const Group(TestSuite)) [TestSuite.Nh]u8 {
+    var out: [TestSuite.Nh]u8 = undefined;
+    g.epochAuthenticator(&out);
+    return out;
+}
+
 /// One test participant: its three key pairs and the `MLSMessage(KeyPackage)`
 /// that publishes their public halves. Deterministic in `seed` so a failure
 /// reproduces exactly.
@@ -3652,7 +3718,7 @@ const TestClient = struct {
         const init_kp = try TestSuite.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
         const enc_kp = try TestSuite.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
         const kp = try keypackage_mod.create(TestSuite, arena, .{
-            .signature_key_pair = sig,
+            .signature_key_pair = &sig,
             .init_key = init_kp.public_key,
             .encryption_key = enc_kp.public_key,
             .credential = .{ .basic = name },
@@ -3676,11 +3742,11 @@ const TestClient = struct {
     }
 
     fn join(self: TestClient, gpa: std.mem.Allocator, welcome_msg: []const u8, psks: []const ExternalPsk) !Group(TestSuite) {
-        return Group(TestSuite).fromWelcome(gpa, .{
+        return tFromWelcome(gpa, .{
             .welcome_msg = welcome_msg,
             .key_package_msg = self.kp_msg,
-            .init_priv = self.init_priv,
-            .encryption_priv = self.enc_priv,
+            .init_priv = &self.init_priv,
+            .encryption_priv = &self.enc_priv,
             .external_psks = psks,
         });
     }
@@ -3690,7 +3756,7 @@ fn expectSameEpoch(a: *const Group(TestSuite), b: *const Group(TestSuite)) !void
     try testing.expectEqual(a.epoch, b.epoch);
     try testing.expectEqualSlices(u8, &a.tree_hash, &b.tree_hash);
     try testing.expectEqualSlices(u8, &a.confirmed_transcript_hash, &b.confirmed_transcript_hash);
-    try testing.expectEqualSlices(u8, &a.epochAuthenticator(), &b.epochAuthenticator());
+    try testing.expectEqualSlices(u8, &tAuth(a), &tAuth(b));
 }
 
 test "§11: create() lands a one-member group at epoch 0 with §8.2's ZERO-LENGTH confirmed transcript hash" {
@@ -3700,11 +3766,11 @@ test "§11: create() lands a one-member group at epoch 0 with §8.2's ZERO-LENGT
     defer arena.deinit();
 
     const alice = try TestClient.init(arena.allocator(), "alice", 1);
-    var g = try Group(TestSuite).create(testing.allocator, .{
+    var g = try tCreate(testing.allocator, .{
         .io = threaded.io(),
         .group_id = "the-group",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer g.deinit();
 
@@ -3719,14 +3785,14 @@ test "§11: create() lands a one-member group at epoch 0 with §8.2's ZERO-LENGT
 
     // §11's "fresh random value": two groups created with the same
     // KeyPackage and the same group_id must NOT share an epoch.
-    var g2 = try Group(TestSuite).create(testing.allocator, .{
+    var g2 = try tCreate(testing.allocator, .{
         .io = threaded.io(),
         .group_id = "the-group",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer g2.deinit();
-    try testing.expect(!std.mem.eql(u8, &g.epochAuthenticator(), &g2.epochAuthenticator()));
+    try testing.expect(!std.mem.eql(u8, &tAuth(&g), &tAuth(&g2)));
     // ... while everything PUBLIC about them is identical, which is what
     // makes the secret the only thing separating them.
     try testing.expectEqualSlices(u8, &g.tree_hash, &g2.tree_hash);
@@ -3743,17 +3809,17 @@ test "§12.4.1: create a group, add a member by value, and the Welcome lands the
     const alice = try TestClient.init(aa, "alice", 1);
     const bob = try TestClient.init(aa, "bob", 2);
 
-    var a = try Group(TestSuite).create(testing.allocator, .{
+    var a = try tCreate(testing.allocator, .{
         .io = io,
         .group_id = "the-group",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
     const created = try a.createCommit(testing.allocator, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
     });
     defer created.deinit(testing.allocator);
@@ -3804,11 +3870,11 @@ test "§12.4.1: a three-member group runs Commits in both directions, with propo
     const carol = try TestClient.init(aa, "carol", 3);
     const dave = try TestClient.init(aa, "dave", 4);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "three",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
@@ -3816,7 +3882,7 @@ test "§12.4.1: a three-member group runs Commits in both directions, with propo
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         defer c.deinit(gpa);
@@ -3829,7 +3895,7 @@ test "§12.4.1: a three-member group runs Commits in both directions, with propo
     // anyone but its creator, and the first with a non-empty UpdatePath.
     // Alice must follow it.
     {
-        const c = try b.createCommit(gpa, .{ .io = io, .signature_key_pair = bob.sig });
+        const c = try b.createCommit(gpa, .{ .io = io, .signature_key_pair = &bob.sig });
         defer c.deinit(gpa);
         try a.processCommit(.{ .commit_msg = c.commit });
         try expectSameEpoch(&a, &b);
@@ -3844,7 +3910,7 @@ test "§12.4.1: a three-member group runs Commits in both directions, with propo
     {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{
                 .{ .by_value = .{ .add = carol.kp } },
                 .{ .by_value = .{ .add = dave.kp } },
@@ -3868,16 +3934,16 @@ test "§12.4.1: a three-member group runs Commits in both directions, with propo
     // to reach `applyProposals`' Update arm from the creation side.
     {
         const new_enc = try TestSuite.Kem.KeyPair.generateDeterministic(@splat(0x33));
-        const leaf = try c_grp.updateLeaf(.{ .signature_key_pair = carol.sig, .encryption_key_pair = new_enc });
+        const leaf = try c_grp.updateLeaf(.{ .signature_key_pair = &carol.sig, .encryption_key_pair = &new_enc });
         const prop = try c_grp.createProposal(gpa, .{
-            .signature_key_pair = carol.sig,
+            .signature_key_pair = &carol.sig,
             .proposal = .{ .update = leaf },
         });
         defer gpa.free(prop);
 
         const c = try d_grp.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = dave.sig,
+            .signature_key_pair = &dave.sig,
             .proposals = &.{.{ .by_reference = prop }},
         });
         defer c.deinit(gpa);
@@ -3903,7 +3969,7 @@ test "§12.4.1: a three-member group runs Commits in both directions, with propo
     {
         const c = try b.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = bob.sig,
+            .signature_key_pair = &bob.sig,
             .proposals = &.{.{ .by_value = .{ .remove = 0 } }},
         });
         defer c.deinit(gpa);
@@ -3949,11 +4015,11 @@ test "§12.4.2's closing note: the member a Commit REMOVES learns exactly that, 
     const carol = try TestClient.init(aa, "carol", 93);
     const dave = try TestClient.init(aa, "dave", 94);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "closing-note",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
@@ -3961,7 +4027,7 @@ test "§12.4.2's closing note: the member a Commit REMOVES learns exactly that, 
     var c_grp: Group(TestSuite) = undefined;
     var d_grp: Group(TestSuite) = undefined;
     {
-        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig, .proposals = &.{
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{
             .{ .by_value = .{ .add = bob.kp } },
             .{ .by_value = .{ .add = carol.kp } },
             .{ .by_value = .{ .add = dave.kp } },
@@ -3980,10 +4046,10 @@ test "§12.4.2's closing note: the member a Commit REMOVES learns exactly that, 
 
     // ── Shape 1: carol's leaf 2 is INTERIOR, dave still holds leaf 3.
     {
-        const carol_before = c_grp.epochAuthenticator();
+        const carol_before = tAuth(&c_grp);
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .remove = 2 } }},
         });
         defer c.deinit(gpa);
@@ -4002,7 +4068,7 @@ test "§12.4.2's closing note: the member a Commit REMOVES learns exactly that, 
         // a short time to decrypt late messages in the previous epoch", and
         // she cannot do that out of a group this library has declared dead.
         try testing.expectEqual(@as(u64, 1), c_grp.epoch);
-        try testing.expectEqualSlices(u8, &carol_before, &c_grp.epochAuthenticator());
+        try testing.expectEqualSlices(u8, &carol_before, &tAuth(&c_grp));
         try testing.expectEqual(@as(usize, 4), c_grp.treeSize());
     }
 
@@ -4010,10 +4076,10 @@ test "§12.4.2's closing note: the member a Commit REMOVES learns exactly that, 
     // beside it is blank — so §7.7 drops the whole right half and the tree
     // shrinks past dave's own position.
     {
-        const dave_before = d_grp.epochAuthenticator();
+        const dave_before = tAuth(&d_grp);
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .remove = 3 } }},
         });
         defer c.deinit(gpa);
@@ -4027,7 +4093,7 @@ test "§12.4.2's closing note: the member a Commit REMOVES learns exactly that, 
 
         try testing.expectError(error.RemovedFromGroup, d_grp.processCommit(.{ .commit_msg = c.commit }));
         try testing.expectEqual(@as(u64, 2), d_grp.epoch);
-        try testing.expectEqualSlices(u8, &dave_before, &d_grp.epochAuthenticator());
+        try testing.expectEqualSlices(u8, &dave_before, &tAuth(&d_grp));
         // Dave's OWN copy of the tree never shrank — the Commit was refused
         // before §12.3 was applied to it.
         try testing.expectEqual(@as(usize, 4), d_grp.treeSize());
@@ -4058,10 +4124,10 @@ fn resignMemberCommit(
     commit.proposals = proposals;
     pm.content.body = .{ .commit = commit };
 
-    const sig = try framing.signFramedContent(TestSuite, gpa, signer, .mls_public_message, pm.content, old_gc);
+    const sig = try framing.signFramedContent(TestSuite, gpa, &signer, .mls_public_message, pm.content, old_gc);
     const sig_bytes = sig.toBytes();
     pm.auth.signature = &sig_bytes;
-    const tag = try framing.membershipTag(TestSuite, gpa, membership_key, pm.content, pm.auth, old_gc);
+    const tag = try framing.membershipTag(TestSuite, gpa, &membership_key, pm.content, pm.auth, old_gc);
     pm.membership_tag = &tag;
     const out: framing.MLSMessage = .{ .public_message = pm };
     return out.encodeAlloc(gpa);
@@ -4090,11 +4156,11 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
     const dave = try TestClient.init(aa, "dave", 74);
     const erin = try TestClient.init(aa, "erin", 75);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "blank-remove",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
@@ -4108,7 +4174,7 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
     {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{
                 .{ .by_value = .{ .add = bob.kp } },
                 .{ .by_value = .{ .add = carol.kp } },
@@ -4127,7 +4193,7 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
     {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .remove = 1 } }},
         });
         defer c.deinit(gpa);
@@ -4143,7 +4209,7 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
     // §12.1.3 was enforced this returned a perfectly good Commit.
     try testing.expectError(error.UnknownMember, a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .remove = 1 } }},
     }));
     // Refused at §12.2, BEFORE any working copy was made — the sender's own
@@ -4155,7 +4221,7 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
     // so that removing the bounds arm cannot pass unnoticed.
     try testing.expectError(error.UnknownMember, a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .remove = 9 } }},
     }));
     // A leaf index whose DOUBLING overflows `u32`. The old test computed
@@ -4163,7 +4229,7 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
     // panic in a safety build, reachable from a decoded message.
     try testing.expectError(error.UnknownMember, a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .remove = 0x8000_0000 } }},
     }));
 
@@ -4173,7 +4239,7 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
     // shadowed by §12.1.3 …
     try testing.expectError(error.InvalidProposalList, a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .remove = 0 } }},
     }));
     // … and the SAME leaf twice in one list is still §12.2's "multiple
@@ -4181,7 +4247,7 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
     // though both name an occupied leaf.
     try testing.expectError(error.InvalidProposalList, a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{
             .{ .by_value = .{ .remove = 2 } },
             .{ .by_value = .{ .remove = 2 } },
@@ -4203,7 +4269,7 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
         // blank), which the legal-multi-Remove step below needs.
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = erin.kp } }},
         });
         defer c.deinit(gpa);
@@ -4234,7 +4300,7 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
     {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{
                 .{ .by_value = .{ .remove = 1 } },
                 .{ .by_value = .{ .remove = 2 } },
@@ -4256,7 +4322,7 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
     {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .remove = 3 } }},
         });
         defer c.deinit(gpa);
@@ -4267,7 +4333,7 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
     // bounds arm, not by the blankness arm — both are live.
     try testing.expectError(error.UnknownMember, a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .remove = 3 } }},
     }));
 }
@@ -4305,18 +4371,18 @@ test "§7.5: adding a member into the committer's OWN sibling leaf keeps that no
     const dave = try TestClient.init(aa, "dave", 44);
     const erin = try TestClient.init(aa, "erin", 45);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "sibling",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         defer c.deinit(gpa);
@@ -4329,7 +4395,7 @@ test "§7.5: adding a member into the committer's OWN sibling leaf keeps that no
     {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{
                 .{ .by_value = .{ .add = carol.kp } },
                 .{ .by_value = .{ .add = dave.kp } },
@@ -4348,7 +4414,7 @@ test "§7.5: adding a member into the committer's OWN sibling leaf keeps that no
     {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .remove = 1 } }},
         });
         defer c.deinit(gpa);
@@ -4361,7 +4427,7 @@ test "§7.5: adding a member into the committer's OWN sibling leaf keeps that no
     // ... and refill it in the same Commit that updates the path.
     const c = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .add = erin.kp } }},
     });
     defer c.deinit(gpa);
@@ -4424,11 +4490,11 @@ test "§12.4.3.1: a joiner's path secrets follow the committer's FILTERED direct
     };
     const frank = try TestClient.init(aa, "frank", 56);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "filtered",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
@@ -4436,7 +4502,7 @@ test "§12.4.3.1: a joiner's path secrets follow the committer's FILTERED direct
     {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{
                 .{ .by_value = .{ .add = members[0].kp } },
                 .{ .by_value = .{ .add = members[1].kp } },
@@ -4457,7 +4523,7 @@ test "§12.4.3.1: a joiner's path secrets follow the committer's FILTERED direct
     {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{
                 .{ .by_value = .{ .remove = 1 } },
                 .{ .by_value = .{ .remove = 2 } },
@@ -4476,7 +4542,7 @@ test "§12.4.3.1: a joiner's path secrets follow the committer's FILTERED direct
     // erin) — node 3 drops out, because everything under node 5 is blank.
     const c = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .add = frank.kp } }},
     });
     defer c.deinit(gpa);
@@ -4521,11 +4587,11 @@ test "§12.4.1: a PreSharedKey proposal reaches the Welcome, and a joiner withou
     const alice = try TestClient.init(aa, "alice", 5);
     const bob = try TestClient.init(aa, "bob", 6);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "psk-group",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
@@ -4537,7 +4603,7 @@ test "§12.4.1: a PreSharedKey proposal reaches the Welcome, and a joiner withou
 
     const c = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{
             .{ .by_value = .{ .add = bob.kp } },
             .{ .by_value = .{ .psk = psk_id } },
@@ -4571,18 +4637,18 @@ test "§12.4: the path is populated by default and omitted only when both §12.4
     const bob = try TestClient.init(aa, "bob", 8);
     const carol = try TestClient.init(aa, "carol", 9);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "path-group",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         defer c.deinit(gpa);
@@ -4595,7 +4661,7 @@ test "§12.4: the path is populated by default and omitted only when both §12.4
     // is absent — and every member must still follow it.
     const c = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .add = carol.kp } }},
         .omit_path_when_allowed = true,
     });
@@ -4615,7 +4681,7 @@ test "§12.4: the path is populated by default and omitted only when both §12.4
     // (§12.4's `len(commit.proposals) == 0 || pathRequired`).
     const empty = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .omit_path_when_allowed = true,
     });
     defer empty.deinit(gpa);
@@ -4636,17 +4702,17 @@ test "§12.4.3.2: include_external_pub publishes an ExternalPub extension the Gr
     const aa = arena.allocator();
 
     const alice = try TestClient.init(aa, "alice", 11);
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "ext-pub",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
     const c = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .include_external_pub = true,
     });
     defer c.deinit(gpa);
@@ -4665,7 +4731,8 @@ test "§12.4.3.2: include_external_pub publishes an ExternalPub extension the Gr
     // §8: `external_pub` is `KEM.DeriveKeyPair(external_secret)`, so a
     // member can recompute it — that is what makes it verifiable at all.
     const published = (try gi.externalPub()).?;
-    const expected = keyschedule.externalKeyPair(TestSuite, a.secrets.external_secret);
+    var expected: TestSuite.Kem.KeyPair = undefined;
+    keyschedule.externalKeyPair(TestSuite, &a.secrets.external_secret, &expected);
     try testing.expectEqualSlices(u8, &expected.public_key, published);
 }
 
@@ -4681,25 +4748,25 @@ test "§12.2: createCommit refuses the proposal lists a receiver would reject" {
     const alice = try TestClient.init(aa, "alice", 13);
     const bob = try TestClient.init(aa, "bob", 14);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "reject",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
     // "It contains a Remove proposal that removes the committer."
     try testing.expectError(error.InvalidProposalList, a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .remove = 0 } }},
     }));
     // "It contains multiple Add proposals that contain KeyPackages that
     // represent the same client" — `Policy`'s signature-key reading.
     try testing.expectError(error.InvalidProposalList, a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{
             .{ .by_value = .{ .add = bob.kp } },
             .{ .by_value = .{ .add = bob.kp } },
@@ -4708,14 +4775,14 @@ test "§12.2: createCommit refuses the proposal lists a receiver would reject" {
     // "It contains an ExternalInit proposal" (a regular Commit's list).
     try testing.expectError(error.InvalidProposalList, a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .external_init = &[_]u8{0xaa} ** 32 } }},
     }));
     // All three refusals happened before the tree was touched, and the
     // group is still usable — as it is after a later refusal too, see the
     // "transactional:" tests.
     try testing.expectEqual(@as(u64, 0), a.epoch);
-    const ok = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+    const ok = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig });
     defer ok.deinit(gpa);
     try testing.expectEqual(@as(u64, 1), a.epoch);
 }
@@ -4732,17 +4799,17 @@ test "§12.4.1: a tampered Commit is rejected by the receiver, so the round trip
     const alice = try TestClient.init(aa, "alice", 21);
     const bob = try TestClient.init(aa, "bob", 22);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "teeth",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         defer c.deinit(gpa);
@@ -4750,7 +4817,7 @@ test "§12.4.1: a tampered Commit is rejected by the receiver, so the round trip
     };
     defer b.deinit();
 
-    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig });
     defer c.deinit(gpa);
 
     // Flip one byte in the MIDDLE of the Commit — inside the UpdatePath's
@@ -4770,7 +4837,7 @@ test "§12.4.1: a tampered Commit is rejected by the receiver, so the round trip
     // member at all.
     const c2 = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .add = (try TestClient.init(aa, "carol", 23)).kp } }},
     });
     defer c2.deinit(gpa);
@@ -4801,17 +4868,17 @@ test "§12.4.2 bullet 1: a Commit from a STALE epoch (a replay of one already pr
     const alice = try TestClient.init(aa, "alice", 24);
     const bob = try TestClient.init(aa, "bob", 25);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "stale-epoch",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         defer c.deinit(gpa);
@@ -4820,7 +4887,7 @@ test "§12.4.2 bullet 1: a Commit from a STALE epoch (a replay of one already pr
     defer b.deinit();
 
     // A real Commit for epoch 1 -> 2.
-    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig });
     defer c.deinit(gpa);
     try b.processCommit(.{ .commit_msg = c.commit });
     try expectSameEpoch(&a, &b);
@@ -4898,7 +4965,7 @@ fn resignExternalCommitOpts(
     if (drop_path) commit.path = null;
     pm.content.body = .{ .commit = commit };
 
-    const sig = try framing.signFramedContent(TestSuite, gpa, signer, .mls_public_message, pm.content, old_gc);
+    const sig = try framing.signFramedContent(TestSuite, gpa, &signer, .mls_public_message, pm.content, old_gc);
     const sig_bytes = sig.toBytes();
     pm.auth.signature = &sig_bytes;
     const out: framing.MLSMessage = .{ .public_message = pm };
@@ -4918,18 +4985,18 @@ test "§12.4.3.2: a stranger turns a published GroupInfo into an external Commit
     const bob = try TestClient.init(aa, "bob", 32);
     const dave = try TestClient.init(aa, "dave", 33);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "external-join",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
             // §12.4.3.2: "to join a group via an external Commit, a new
             // member needs a GroupInfo with an external_pub extension" —
@@ -4949,7 +5016,7 @@ test "§12.4.3.2: a stranger turns a published GroupInfo into an external Commit
     const published_gi = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .include_external_pub = true,
         });
         defer c.deinit(gpa);
@@ -4959,11 +5026,11 @@ test "§12.4.3.2: a stranger turns a published GroupInfo into an external Commit
     defer gpa.free(published_gi);
     try expectSameEpoch(&a, &b);
 
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
     });
     var d = joined.group;
     defer d.deinit();
@@ -5012,7 +5079,7 @@ test "§12.4.3.2: a stranger turns a published GroupInfo into an external Commit
     // produced a state which cannot take another Commit would satisfy every
     // assertion above.
     {
-        const c = try d.createCommit(gpa, .{ .io = io, .signature_key_pair = dave.sig });
+        const c = try d.createCommit(gpa, .{ .io = io, .signature_key_pair = &dave.sig });
         defer c.deinit(gpa);
         try a.processCommit(.{ .commit_msg = c.commit });
         try b.processCommit(.{ .commit_msg = c.commit });
@@ -5035,11 +5102,11 @@ test "§12.4.1/§12.4.2: an external joiner lands in the LEFTMOST blank leaf, no
     const carol = try TestClient.init(aa, "carol", 43);
     const dave = try TestClient.init(aa, "dave", 44);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "leftmost",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
@@ -5047,7 +5114,7 @@ test "§12.4.1/§12.4.2: an external joiner lands in the LEFTMOST blank leaf, no
     var c_group = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{
                 .{ .by_value = .{ .add = bob.kp } },
                 .{ .by_value = .{ .add = carol.kp } },
@@ -5067,7 +5134,7 @@ test "§12.4.1/§12.4.2: an external joiner lands in the LEFTMOST blank leaf, no
     const published_gi = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .remove = 1 } }},
             .include_external_pub = true,
         });
@@ -5080,11 +5147,11 @@ test "§12.4.1/§12.4.2: an external joiner lands in the LEFTMOST blank leaf, no
     try testing.expect(a.ratchet_tree.nodes[1 * 2] == null);
     try testing.expect(a.ratchet_tree.nodes[3 * 2] == null);
 
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
     });
     var d = joined.group;
     defer d.deinit();
@@ -5120,17 +5187,17 @@ test "§12.2: an external Commit's proposal list is a WHITELIST, and a receiver 
     const dave = try TestClient.init(aa, "dave", 52);
     const mallory = try TestClient.init(aa, "mallory", 53);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "whitelist",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     const published_gi = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .include_external_pub = true,
         });
         defer c.deinit(gpa);
@@ -5139,11 +5206,11 @@ test "§12.2: an external Commit's proposal list is a WHITELIST, and a receiver 
     defer gpa.free(published_gi);
 
     // A well-formed external Commit, to be spoiled four ways.
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
     });
     joined.group.deinit();
     defer joined.messages.deinit(gpa);
@@ -5192,7 +5259,7 @@ test "§12.2: an external Commit's proposal list is a WHITELIST, and a receiver 
     // here one alice herself published this epoch.
     {
         const p_msg = try a.createProposal(gpa, .{
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposal = .{ .remove = 0 },
         });
         defer gpa.free(p_msg);
@@ -5232,17 +5299,17 @@ test "§6.2: a new_member_commit PublicMessage has no membership_tag field, and 
     const alice = try TestClient.init(aa, "alice", 61);
     const dave = try TestClient.init(aa, "dave", 62);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "no-tag",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     const published_gi = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .include_external_pub = true,
         });
         defer c.deinit(gpa);
@@ -5250,11 +5317,11 @@ test "§6.2: a new_member_commit PublicMessage has no membership_tag field, and 
     };
     defer gpa.free(published_gi);
 
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
     });
     joined.group.deinit();
     defer joined.messages.deinit(gpa);
@@ -5312,17 +5379,17 @@ test "§12.4.3.2: an external Commit with no path is refused by its OWN rule, no
     const alice = try TestClient.init(aa, "alice", 61);
     const dave = try TestClient.init(aa, "dave", 62);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "external-path-rule",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     const published_gi = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .include_external_pub = true,
         });
         defer c.deinit(gpa);
@@ -5330,11 +5397,11 @@ test "§12.4.3.2: an external Commit with no path is refused by its OWN rule, no
     };
     defer gpa.free(published_gi);
 
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
     });
     joined.group.deinit();
     defer joined.messages.deinit(gpa);
@@ -5372,11 +5439,11 @@ test "§12.4.3.2: joinByExternalCommit refuses what a receiver would, and refuse
     const dave = try TestClient.init(aa, "dave", 72);
     const mallory = try TestClient.init(aa, "mallory", 73);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "sender-refusals",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
@@ -5384,20 +5451,20 @@ test "§12.4.3.2: joinByExternalCommit refuses what a receiver would, and refuse
     // against — §8.3 has nothing to encapsulate to. This is the default
     // shape of a GroupInfo, so the refusal has to be explicit.
     {
-        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig });
         defer c.deinit(gpa);
-        try testing.expectError(error.ExternalPubUnavailable, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        try testing.expectError(error.ExternalPubUnavailable, tExternalJoin(gpa, gpa, .{
             .io = io,
             .group_info_msg = c.group_info,
             .key_package_msg = dave.kp_msg,
-            .signature_key_pair = dave.sig,
+            .signature_key_pair = &dave.sig,
         }));
     }
 
     const published_gi = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .include_external_pub = true,
         });
         defer c.deinit(gpa);
@@ -5411,11 +5478,11 @@ test "§12.4.3.2: joinByExternalCommit refuses what a receiver would, and refuse
     // rather than handed bytes nobody will accept.
     try testing.expectError(
         error.ProposalNotAllowedInExternalCommit,
-        Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        tExternalJoin(gpa, gpa, .{
             .io = io,
             .group_info_msg = published_gi,
             .key_package_msg = dave.kp_msg,
-            .signature_key_pair = dave.sig,
+            .signature_key_pair = &dave.sig,
             .proposals = &.{.{ .add = mallory.kp }},
         }),
     );
@@ -5423,11 +5490,11 @@ test "§12.4.3.2: joinByExternalCommit refuses what a receiver would, and refuse
     // a caller supplying one asks for two.
     try testing.expectError(
         error.MultipleExternalInit,
-        Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        tExternalJoin(gpa, gpa, .{
             .io = io,
             .group_info_msg = published_gi,
             .key_package_msg = dave.kp_msg,
-            .signature_key_pair = dave.sig,
+            .signature_key_pair = &dave.sig,
             .proposals = &.{.{ .external_init = &[_]u8{0xaa} ** 32 }},
         }),
     );
@@ -5439,21 +5506,21 @@ test "§12.4.3.2: joinByExternalCommit refuses what a receiver would, and refuse
         const bad = try gpa.dupe(u8, published_gi);
         defer gpa.free(bad);
         bad[bad.len - 1] ^= 0x01;
-        try testing.expectError(error.SignatureVerificationFailed, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        try testing.expectError(error.SignatureVerificationFailed, tExternalJoin(gpa, gpa, .{
             .io = io,
             .group_info_msg = bad,
             .key_package_msg = dave.kp_msg,
-            .signature_key_pair = dave.sig,
+            .signature_key_pair = &dave.sig,
         }));
     }
 
     // …and the good one still works, so none of the above was a fixture
     // problem.
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
     });
     defer joined.group.deinit();
     defer joined.messages.deinit(gpa);
@@ -5515,18 +5582,18 @@ test "§12.4.3.2/§8.4: a resyncing joiner resolves a resumption PSK the CALLER 
     const alice = try TestClient.init(aa, "alice", 81);
     const bob = try TestClient.init(aa, "bob", 82);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "resync-group",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         defer c.deinit(gpa);
@@ -5549,7 +5616,7 @@ test "§12.4.3.2/§8.4: a resyncing joiner resolves a resumption PSK the CALLER 
     const published_gi = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .include_external_pub = true,
         });
         defer c.deinit(gpa);
@@ -5573,19 +5640,19 @@ test "§12.4.3.2/§8.4: a resyncing joiner resolves a resumption PSK the CALLER 
     // Before the feature this test exists for: the same call with nothing
     // handed in cannot resolve the id, because a group entered by external
     // Commit has an EMPTY `resumption_history`.
-    try testing.expectError(error.PskNotAvailable, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    try testing.expectError(error.PskNotAvailable, tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = bob.kp_msg,
-        .signature_key_pair = bob.sig,
+        .signature_key_pair = &bob.sig,
         .proposals = &proposals,
     }));
 
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = bob.kp_msg,
-        .signature_key_pair = bob.sig,
+        .signature_key_pair = &bob.sig,
         .proposals = &proposals,
         .resumption_psks = &.{.{
             .usage = .application,
@@ -5612,13 +5679,13 @@ test "§12.4.3.2/§8.4: a resyncing joiner resolves a resumption PSK the CALLER 
     // being ruled out is a `psk_secret` that stayed all-zero.)
     try testing.expectEqual(@as(u32, 1), b2.my_leaf_index);
     try testing.expectEqual(@as(usize, 2), a.treeSize());
-    try testing.expect(!std.mem.eql(u8, &a.epochAuthenticator(), &[_]u8{0} ** TestSuite.Nh));
+    try testing.expect(!std.mem.eql(u8, &tAuth(&a), &[_]u8{0} ** TestSuite.Nh));
 
     // The group still works: the resynced member commits, the founder
     // follows. A join that produced state which cannot take another Commit
     // would satisfy everything above.
     {
-        const c = try b2.createCommit(gpa, .{ .io = io, .signature_key_pair = bob.sig });
+        const c = try b2.createCommit(gpa, .{ .io = io, .signature_key_pair = &bob.sig });
         defer c.deinit(gpa);
         try a.processCommit(.{ .commit_msg = c.commit });
         try expectSameEpoch(&a, &b2);
@@ -5645,17 +5712,17 @@ test "§8.4: a resumption PreSharedKeyID naming ANOTHER group does not resolve t
     const alice = try TestClient.init(aa, "alice", 83);
     const dave = try TestClient.init(aa, "dave", 84);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "our-group",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     const published_gi = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .include_external_pub = true,
         });
         defer c.deinit(gpa);
@@ -5670,11 +5737,11 @@ test "§8.4: a resumption PreSharedKeyID naming ANOTHER group does not resolve t
     const alice_epoch1 = try rememberedResumptionPsk(&a, 1);
     const nonce = [_]u8{0x11} ** TestSuite.Nh;
 
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
         .proposals = &.{.{ .psk = resumptionId(.application, "some-other-group", 1, &nonce) }},
         .resumption_psks = &.{.{
             .usage = .application,
@@ -5720,17 +5787,17 @@ test "§8.4: a caller-supplied resumption PSK matches on the WHOLE PreSharedKeyI
     const alice = try TestClient.init(aa, "alice", 85);
     const bob = try TestClient.init(aa, "bob", 86);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "triple",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     const published_gi = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .include_external_pub = true,
         });
         defer c.deinit(gpa);
@@ -5753,11 +5820,11 @@ test "§8.4: a caller-supplied resumption PSK matches on the WHOLE PreSharedKeyI
         .{ .usage = .application, .group_id = "triple", .epoch = 1, .secret = &real },
     };
 
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = bob.kp_msg,
-        .signature_key_pair = bob.sig,
+        .signature_key_pair = &bob.sig,
         .proposals = &.{.{ .psk = resumptionId(.application, "triple", 1, &nonce) }},
         .resumption_psks = &supplied,
     });
@@ -5768,11 +5835,11 @@ test "§8.4: a caller-supplied resumption PSK matches on the WHOLE PreSharedKeyI
 
     // The epoch component of the triple, on its own: an entry for epoch 1
     // does not answer an id naming epoch 0.
-    try testing.expectError(error.PskNotAvailable, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    try testing.expectError(error.PskNotAvailable, tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = bob.kp_msg,
-        .signature_key_pair = bob.sig,
+        .signature_key_pair = &bob.sig,
         .proposals = &.{.{ .psk = resumptionId(.application, "triple", 0, &nonce) }},
         .resumption_psks = &.{.{
             .usage = .application,
@@ -5784,11 +5851,11 @@ test "§8.4: a caller-supplied resumption PSK matches on the WHOLE PreSharedKeyI
 
     // §8.4: a resumption PSK IS a `resumption_psk`, so it is `KDF.Nh` wide.
     // Rejected over the whole list, whether or not this Commit names it.
-    try testing.expectError(error.WrongSecretLength, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    try testing.expectError(error.WrongSecretLength, tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = bob.kp_msg,
-        .signature_key_pair = bob.sig,
+        .signature_key_pair = &bob.sig,
         .resumption_psks = &.{.{
             .usage = .application,
             .group_id = "triple",
@@ -5816,17 +5883,17 @@ test "§12.1.4: a PreSharedKey proposal with usage reinit or branch is invalid, 
     const alice = try TestClient.init(aa, "alice", 87);
     const dave = try TestClient.init(aa, "dave", 88);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "usage-rules",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     const published_gi = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .include_external_pub = true,
         });
         defer c.deinit(gpa);
@@ -5859,11 +5926,11 @@ test "§12.1.4: a PreSharedKey proposal with usage reinit or branch is invalid, 
             .secret = &secret,
         }};
         // The external-join path, through §12.2's whitelist.
-        try testing.expectError(c.want, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        try testing.expectError(c.want, tExternalJoin(gpa, gpa, .{
             .io = io,
             .group_info_msg = published_gi,
             .key_package_msg = dave.kp_msg,
-            .signature_key_pair = dave.sig,
+            .signature_key_pair = &dave.sig,
             .proposals = &.{.{ .psk = c.id }},
             .external_psks = &.{.{ .psk_id = "x", .psk = "k" }},
             .resumption_psks = &supplied,
@@ -5872,7 +5939,7 @@ test "§12.1.4: a PreSharedKey proposal with usage reinit or branch is invalid, 
         // stated about the proposal, so both procedures owe it.
         try testing.expectError(c.want, a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .psk = c.id } }},
             .external_psks = &.{.{ .psk_id = "x", .psk = "k" }},
         }));
@@ -5882,11 +5949,11 @@ test "§12.1.4: a PreSharedKey proposal with usage reinit or branch is invalid, 
     // §12.4.3.2's advice literally produces a Commit alice must refuse. The
     // list is otherwise legal — one ExternalInit, one PreSharedKey — so
     // nothing in the whitelist can be what rejects it.
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
     });
     joined.group.deinit();
     defer joined.messages.deinit(gpa);
@@ -6030,18 +6097,18 @@ test "§12.4.3.1: a joiner refuses a handed ratchet tree whose leaf signatures d
     const bob = try TestClient.init(aa, "bob", 92);
     const dave = try TestClient.init(aa, "dave", 93);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "forged-roster",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
     const published_gi = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
             .include_external_pub = true,
         });
@@ -6053,11 +6120,11 @@ test "§12.4.3.1: a joiner refuses a handed ratchet tree whose leaf signatures d
     // does admit a stranger. Whatever the forged one is rejected for, it is
     // not a broken fixture.
     {
-        var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        var joined = try tExternalJoin(gpa, gpa, .{
             .io = io,
             .group_info_msg = published_gi,
             .key_package_msg = dave.kp_msg,
-            .signature_key_pair = dave.sig,
+            .signature_key_pair = &dave.sig,
         });
         joined.group.deinit();
         joined.messages.deinit(gpa);
@@ -6113,7 +6180,7 @@ test "§12.4.3.1: a joiner refuses a handed ratchet tree whose leaf signatures d
         .signature = &.{},
     };
     // ...and re-sign, as the attacker who owns the signer leaf can.
-    forged.signature = try aa.dupe(u8, &(try forged.sign(TestSuite, aa, alice.sig)).toBytes());
+    forged.signature = try aa.dupe(u8, &(try forged.sign(TestSuite, aa, &alice.sig)).toBytes());
 
     // The forgery really is perfect except for the leaf signature: every
     // check that existed before this regression accepts it. Without this
@@ -6134,11 +6201,11 @@ test "§12.4.3.1: a joiner refuses a handed ratchet tree whose leaf signatures d
     const forged_msg: framing.MLSMessage = .{ .group_info = forged };
     const forged_bytes = try forged_msg.encodeAlloc(aa);
 
-    try testing.expectError(error.SignatureVerificationFailed, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    try testing.expectError(error.SignatureVerificationFailed, tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = forged_bytes,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
     }));
 }
 
@@ -6194,18 +6261,18 @@ test "§12.4.3.1: a joiner refuses a group whose GroupContext declares a version
     const alice = try TestClient.init(aa, "alice", 95);
     const dave = try TestClient.init(aa, "dave", 96);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "wrong-version",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
 
     const published_gi = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .include_external_pub = true,
         });
         defer c.deinit(gpa);
@@ -6214,11 +6281,11 @@ test "§12.4.3.1: a joiner refuses a group whose GroupContext declares a version
 
     // Non-vacuity: the honest GroupInfo admits a stranger.
     {
-        var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        var joined = try tExternalJoin(gpa, gpa, .{
             .io = io,
             .group_info_msg = published_gi,
             .key_package_msg = dave.kp_msg,
-            .signature_key_pair = dave.sig,
+            .signature_key_pair = &dave.sig,
         });
         joined.group.deinit();
         joined.messages.deinit(gpa);
@@ -6239,7 +6306,7 @@ test "§12.4.3.1: a joiner refuses a group whose GroupContext declares a version
         .signer = gi.signer,
         .signature = &.{},
     };
-    forged.signature = try aa.dupe(u8, &(try forged.sign(TestSuite, aa, alice.sig)).toBytes());
+    forged.signature = try aa.dupe(u8, &(try forged.sign(TestSuite, aa, &alice.sig)).toBytes());
 
     // Everything else about it is intact — the GroupInfo signature over the
     // rewritten context verifies, so the rejection below is the version
@@ -6254,11 +6321,11 @@ test "§12.4.3.1: a joiner refuses a group whose GroupContext declares a version
     const forged_msg: framing.MLSMessage = .{ .group_info = forged };
     const forged_bytes = try forged_msg.encodeAlloc(aa);
 
-    try testing.expectError(error.UnsupportedProtocolVersion, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    try testing.expectError(error.UnsupportedProtocolVersion, tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = forged_bytes,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
     }));
 }
 
@@ -6315,7 +6382,7 @@ fn sameEpoch(a: *const Group(TestSuite), b: *const Group(TestSuite)) bool {
     return a.epoch == b.epoch and
         std.mem.eql(u8, &a.tree_hash, &b.tree_hash) and
         std.mem.eql(u8, &a.confirmed_transcript_hash, &b.confirmed_transcript_hash) and
-        std.mem.eql(u8, &a.epochAuthenticator(), &b.epochAuthenticator());
+        std.mem.eql(u8, &tAuth(a), &tAuth(b));
 }
 
 test "transactional: a stranger's external Commit refused at the confirmation tag leaves every member's group as it was" {
@@ -6338,17 +6405,17 @@ test "transactional: a stranger's external Commit refused at the confirmation ta
     const dave = try TestClient.init(aa, "dave", 103);
     const erin = try TestClient.init(aa, "erin", 104);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "txn-external",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         defer c.deinit(gpa);
@@ -6358,29 +6425,29 @@ test "transactional: a stranger's external Commit refused at the confirmation ta
 
     // The GroupInfo alice publishes for external joins — public by design.
     const published_gi = blk: {
-        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig, .include_external_pub = true });
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .include_external_pub = true });
         defer c.deinit(gpa);
         try b.processCommit(.{ .commit_msg = c.commit });
         break :blk try gpa.dupe(u8, c.group_info);
     };
     defer gpa.free(published_gi);
 
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
     });
     defer joined.group.deinit();
     defer joined.messages.deinit(gpa);
 
     // A genuine ExternalInit for this epoch's `external_pub` — but erin's,
     // not the one dave's key schedule consumed.
-    var other = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var other = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = erin.kp_msg,
-        .signature_key_pair = erin.sig,
+        .signature_key_pair = &erin.sig,
     });
     defer other.group.deinit();
     defer other.messages.deinit(gpa);
@@ -6409,7 +6476,7 @@ test "transactional: a stranger's external Commit refused at the confirmation ta
     try expectSameEpoch(&a, &joined.group);
     try expectSameEpoch(&b, &joined.group);
     {
-        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig });
         defer c.deinit(gpa);
         try b.processCommit(.{ .commit_msg = c.commit });
         try joined.group.processCommit(.{ .commit_msg = c.commit });
@@ -6433,17 +6500,17 @@ test "transactional: a createCommit refused after §12.3 touched the tree leaves
     const bob = try TestClient.init(aa, "bob", 112);
     const carol = try TestClient.init(aa, "carol", 113);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "txn-create",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         defer c.deinit(gpa);
@@ -6464,7 +6531,7 @@ test "transactional: a createCommit refused after §12.3 touched the tree leaves
     const before = try stateDigest(&a);
     try testing.expectError(error.PskNotAvailable, a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &list,
     }));
     try testing.expectEqualSlices(u8, &before, &(try stateDigest(&a)));
@@ -6473,7 +6540,7 @@ test "transactional: a createCommit refused after §12.3 touched the tree leaves
     // and both the existing member and the new one land where alice did.
     const c = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &list,
         .external_psks = &psks,
     });
@@ -6503,17 +6570,17 @@ test "transactional: a member's Commit refused after §12.3 leaves the receiver 
     const carol = try TestClient.init(aa, "carol", 123);
     const dave = try TestClient.init(aa, "dave", 124);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "txn-member",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{
                 .{ .by_value = .{ .add = bob.kp } },
                 .{ .by_value = .{ .add = carol.kp } },
@@ -6531,7 +6598,7 @@ test "transactional: a member's Commit refused after §12.3 leaves the receiver 
     };
     const c = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{
             .{ .by_value = .{ .add = dave.kp } },
             .{ .by_value = .{ .psk = psk_id } },
@@ -6618,16 +6685,16 @@ test "transactional: an allocation failure at ANY point of processCommit leaves 
     const carol = try TestClient.init(aa, "carol", 133);
     const dave = try TestClient.init(aa, "dave", 134);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "txn-oom-member",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     const c1 = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{
             .{ .by_value = .{ .add = bob.kp } },
             .{ .by_value = .{ .add = carol.kp } },
@@ -6638,7 +6705,7 @@ test "transactional: an allocation failure at ANY point of processCommit leaves 
     // Add, §7.5's merge and decryption, the key schedule, adoption.
     const c2 = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .add = dave.kp } }},
     });
     defer c2.deinit(gpa);
@@ -6662,27 +6729,27 @@ test "transactional: an allocation failure at ANY point of processCommit on an E
     const bob = try TestClient.init(aa, "bob", 142);
     const dave = try TestClient.init(aa, "dave", 143);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "txn-oom-external",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     const c1 = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
     });
     defer c1.deinit(gpa);
-    const c2 = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig, .include_external_pub = true });
+    const c2 = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .include_external_pub = true });
     defer c2.deinit(gpa);
 
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = c2.group_info,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
     });
     defer joined.group.deinit();
     defer joined.messages.deinit(gpa);
@@ -6714,17 +6781,17 @@ test "transactional: an allocation failure at ANY point of createCommit leaves t
         // three messages it returns; the receiver's never does.
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
         const fa = failing.allocator();
-        var a = try Group(TestSuite).create(fa, .{
+        var a = try tCreate(fa, .{
             .io = io,
             .group_id = "txn-oom-create",
             .key_package_msg = alice.kp_msg,
-            .encryption_priv = alice.enc_priv,
+            .encryption_priv = &alice.enc_priv,
         });
         defer a.deinit();
         var b = blk: {
             const c = try a.createCommit(fa, .{
                 .io = io,
-                .signature_key_pair = alice.sig,
+                .signature_key_pair = &alice.sig,
                 .proposals = &.{
                     .{ .by_value = .{ .add = bob.kp } },
                     .{ .by_value = .{ .add = carol.kp } },
@@ -6737,7 +6804,7 @@ test "transactional: an allocation failure at ANY point of createCommit leaves t
         const before = try stateDigest(&a);
 
         failing.fail_index = failing.alloc_index + n;
-        const outcome = a.createCommit(fa, .{ .io = io, .signature_key_pair = alice.sig, .proposals = &target });
+        const outcome = a.createCommit(fa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &target });
         failing.fail_index = std.math.maxInt(usize);
 
         if (outcome) |c| {
@@ -6753,7 +6820,7 @@ test "transactional: an allocation failure at ANY point of createCommit leaves t
             if (!failing.has_induced_failure) return err;
             s.points += 1;
             if (!std.mem.eql(u8, &before, &(try stateDigest(&a)))) s.changed += 1;
-            const again = a.createCommit(fa, .{ .io = io, .signature_key_pair = alice.sig, .proposals = &target }) catch {
+            const again = a.createCommit(fa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &target }) catch {
                 s.unusable += 1;
                 continue;
             };
@@ -6846,17 +6913,17 @@ test "transactional: a Commit refused at the confirmation tag leaves no copy of 
     const alice = try TestClient.init(aa, "alice", 161);
     const bob = try TestClient.init(aa, "bob", 162);
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "txn-wipe",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         defer c.deinit(gpa);
@@ -6866,7 +6933,7 @@ test "transactional: a Commit refused at the confirmation tag leaves no copy of 
 
     const old_gc = try b.groupContextAlloc(gpa);
     defer gpa.free(old_gc);
-    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig });
     defer c.deinit(gpa);
 
     // Two leaves: alice's filtered direct path is the root, node 1, and that
@@ -6886,7 +6953,7 @@ test "transactional: a Commit refused at the confirmation tag leaves no copy of 
         const tag = try aa.dupe(u8, pm.auth.confirmation_tag.?);
         tag[0] ^= 0x01;
         pm.auth.confirmation_tag = tag;
-        const mtag = try framing.membershipTag(TestSuite, gpa, b.secrets.membership_key, pm.content, pm.auth, old_gc);
+        const mtag = try framing.membershipTag(TestSuite, gpa, &b.secrets.membership_key, pm.content, pm.auth, old_gc);
         pm.membership_tag = &mtag;
         const out: framing.MLSMessage = .{ .public_message = pm };
         break :blk try out.encodeAlloc(aa);
@@ -6971,7 +7038,7 @@ fn reframeMemberMessage(
                 if (edit.leaf_encryption_key) |k| path.leaf_node.encryption_key = k;
                 if (edit.leaf_parent_hash) |h| path.leaf_node.parent_hash = h;
                 if (edit.leaf_encryption_key != null or edit.leaf_parent_hash != null) {
-                    const ls = try path.leaf_node.sign(TestSuite, gpa, signer, receiver.group_id, pm.content.sender.member);
+                    const ls = try path.leaf_node.sign(TestSuite, gpa, &signer, receiver.group_id, pm.content.sender.member);
                     path.leaf_node.signature = try arena.dupe(u8, &ls.toBytes());
                 }
                 if (edit.flip_leaf_signature) {
@@ -6992,11 +7059,11 @@ fn reframeMemberMessage(
     }
     const gc = try receiver.groupContextAlloc(gpa);
     defer gpa.free(gc);
-    const sig = try framing.signFramedContent(TestSuite, gpa, signer, .mls_public_message, pm.content, gc);
+    const sig = try framing.signFramedContent(TestSuite, gpa, &signer, .mls_public_message, pm.content, gc);
     const sig_bytes = try arena.dupe(u8, &sig.toBytes());
     if (edit.flip_signature) sig_bytes[32] ^= 0x01;
     pm.auth.signature = sig_bytes;
-    const tag = try framing.membershipTag(TestSuite, gpa, receiver.secrets.membership_key, pm.content, pm.auth, gc);
+    const tag = try framing.membershipTag(TestSuite, gpa, &receiver.secrets.membership_key, pm.content, pm.auth, gc);
     pm.membership_tag = try arena.dupe(u8, &tag);
     const out: framing.MLSMessage = .{ .public_message = pm };
     return out.encodeAlloc(gpa);
@@ -7013,17 +7080,17 @@ test "§12.4.2: an insider's forged Commit is refused by the rule it breaks, bef
 
     const alice = try TestClient.init(aa, "alice", 101);
     const bob = try TestClient.init(aa, "bob", 102);
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "insider",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         defer c.deinit(gpa);
@@ -7033,7 +7100,7 @@ test "§12.4.2: an insider's forged Commit is refused by the rule it breaks, bef
 
     // An empty Commit: it needs a path (§12.4), and in a two-leaf tree that
     // path has one node.
-    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig });
     defer c.deinit(gpa);
 
     // The helper is faithful: an empty edit reproduces the Commit byte for
@@ -7090,17 +7157,17 @@ test "§12.4.2 bullet 4: every proposal handed to processCommit is authenticated
     const alice = try TestClient.init(aa, "alice", 111);
     const bob = try TestClient.init(aa, "bob", 112);
     const carol = try TestClient.init(aa, "carol", 113);
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "proposal-auth",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         defer c.deinit(gpa);
@@ -7108,9 +7175,9 @@ test "§12.4.2 bullet 4: every proposal handed to processCommit is authenticated
     };
     defer b.deinit();
 
-    const p = try a.createProposal(gpa, .{ .signature_key_pair = alice.sig, .proposal = .{ .add = carol.kp } });
+    const p = try a.createProposal(gpa, .{ .signature_key_pair = &alice.sig, .proposal = .{ .add = carol.kp } });
     defer gpa.free(p);
-    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig });
     defer c.deinit(gpa);
 
     const bad_tag = try gpa.dupe(u8, p);
@@ -7146,24 +7213,24 @@ test "§6.1: an external Commit's signature is checked by the signature, not cau
 
     const alice = try TestClient.init(aa, "alice", 121);
     const dave = try TestClient.init(aa, "dave", 122);
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "ext-sig",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     const published_gi = blk: {
-        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig, .include_external_pub = true });
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .include_external_pub = true });
         defer c.deinit(gpa);
         break :blk try gpa.dupe(u8, c.group_info);
     };
     defer gpa.free(published_gi);
-    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+    var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
         .group_info_msg = published_gi,
         .key_package_msg = dave.kp_msg,
-        .signature_key_pair = dave.sig,
+        .signature_key_pair = &dave.sig,
     });
     joined.group.deinit();
     defer joined.messages.deinit(gpa);
@@ -7192,17 +7259,17 @@ test "§12.2/§7.3: createCommit refuses the remaining list rules, and a duplica
 
     const alice = try TestClient.init(aa, "alice", 131);
     const bob = try TestClient.init(aa, "bob", 132);
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "list-rules",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         c.deinit(gpa);
@@ -7214,14 +7281,14 @@ test "§12.2/§7.3: createCommit refuses the remaining list rules, and a duplica
     // An Update the committer itself proposed, committed by reference.
     const own_update = blk: {
         const new_enc = try TestSuite.Kem.KeyPair.generateDeterministic(@splat(0x77));
-        const leaf = try a.updateLeaf(.{ .signature_key_pair = alice.sig, .encryption_key_pair = new_enc });
-        break :blk try a.createProposal(gpa, .{ .signature_key_pair = alice.sig, .proposal = .{ .update = leaf } });
+        const leaf = try a.updateLeaf(.{ .signature_key_pair = &alice.sig, .encryption_key_pair = &new_enc });
+        break :blk try a.createProposal(gpa, .{ .signature_key_pair = &alice.sig, .proposal = .{ .update = leaf } });
     };
     defer gpa.free(own_update);
     // A member whose LeafNode reuses bob's ENCRYPTION key under a signature
     // key of its own — so only §7.3's encryption-key half can refuse it.
     const twin = try keypackage_mod.create(TestSuite, aa, .{
-        .signature_key_pair = try TestSuite.Sig.KeyPair.generateDeterministic(@splat(133)),
+        .signature_key_pair = &try TestSuite.Sig.KeyPair.generateDeterministic(@splat(133)),
         .init_key = (try TestSuite.Kem.KeyPair.generateDeterministic(@splat(134))).public_key,
         .encryption_key = bob.kp.leaf_node.encryption_key[0..TestSuite.Kem.Npk].*,
         .credential = .{ .basic = "twin" },
@@ -7251,7 +7318,7 @@ test "§12.2/§7.3: createCommit refuses the remaining list rules, and a duplica
         errdefer std.debug.print("case {d}\n", .{i});
         try testing.expectError(cs.want, a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = cs.proposals,
             .external_psks = &.{.{ .psk_id = "x", .psk = "k" }},
         }));
@@ -7261,7 +7328,7 @@ test "§12.2/§7.3: createCommit refuses the remaining list rules, and a duplica
     // about the duplicate.
     const ok = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = psk }},
         .external_psks = &.{.{ .psk_id = "x", .psk = "k" }},
     });
@@ -7288,17 +7355,17 @@ const LeakSweep = struct {
     const psks = [_]ExternalPsk{.{ .psk_id = "sweep", .psk = "sweep-secret" }};
 
     fn run(fa: std.mem.Allocator, io: std.Io, cl: *const Clients, variant: Variant) !void {
-        var a = try Group(TestSuite).create(fa, .{
+        var a = try tCreate(fa, .{
             .io = io,
             .group_id = "leak-sweep",
             .key_package_msg = cl.alice.kp_msg,
-            .encryption_priv = cl.alice.enc_priv,
+            .encryption_priv = &cl.alice.enc_priv,
         });
         defer a.deinit();
         var b = blk: {
             const c1 = try a.createCommit(fa, .{
                 .io = io,
-                .signature_key_pair = cl.alice.sig,
+                .signature_key_pair = &cl.alice.sig,
                 .proposals = if (variant == .psk)
                     &.{ .{ .by_value = .{ .add = cl.bob.kp } }, .{ .by_value = psk } }
                 else
@@ -7311,14 +7378,14 @@ const LeakSweep = struct {
         defer b.deinit();
 
         if (variant == .external) {
-            const c2 = try a.createCommit(fa, .{ .io = io, .signature_key_pair = cl.alice.sig, .include_external_pub = true });
+            const c2 = try a.createCommit(fa, .{ .io = io, .signature_key_pair = &cl.alice.sig, .include_external_pub = true });
             defer c2.deinit(fa);
             try b.processCommit(.{ .commit_msg = c2.commit });
-            var joined = try Group(TestSuite).joinByExternalCommit(fa, fa, .{
+            var joined = try tExternalJoin(fa, fa, .{
                 .io = io,
                 .group_info_msg = c2.group_info,
                 .key_package_msg = cl.carol.kp_msg,
-                .signature_key_pair = cl.carol.sig,
+                .signature_key_pair = &cl.carol.sig,
                 .proposals = &.{psk},
                 .external_psks = &psks,
             });
@@ -7334,13 +7401,13 @@ const LeakSweep = struct {
         defer if (proposal_msg) |m| fa.free(m);
         if (variant == .by_reference) {
             const new_enc = try TestSuite.Kem.KeyPair.generateDeterministic(@splat(0x99));
-            const leaf = try b.updateLeaf(.{ .signature_key_pair = cl.bob.sig, .encryption_key_pair = new_enc });
-            proposal_msg = try b.createProposal(fa, .{ .signature_key_pair = cl.bob.sig, .proposal = .{ .update = leaf } });
+            const leaf = try b.updateLeaf(.{ .signature_key_pair = &cl.bob.sig, .encryption_key_pair = &new_enc });
+            proposal_msg = try b.createProposal(fa, .{ .signature_key_pair = &cl.bob.sig, .proposal = .{ .update = leaf } });
         }
         const add_carol: Group(TestSuite).CommitSource = .{ .by_value = .{ .add = cl.carol.kp } };
         const c2 = try a.createCommit(fa, .{
             .io = io,
-            .signature_key_pair = cl.alice.sig,
+            .signature_key_pair = &cl.alice.sig,
             .proposals = switch (variant) {
                 .plain => &.{},
                 .add, .no_path => &.{add_carol},
@@ -7412,7 +7479,7 @@ fn lowOrderClient(arena: std.mem.Allocator, name: []const u8, seed: u8, which: e
     const good_init = (try TestSuite.Kem.KeyPair.generateDeterministic(@splat(seed +% 64))).public_key;
     const good_enc = (try TestSuite.Kem.KeyPair.generateDeterministic(@splat(seed +% 128))).public_key;
     c.kp = try keypackage_mod.create(TestSuite, arena, .{
-        .signature_key_pair = c.sig,
+        .signature_key_pair = &c.sig,
         .init_key = if (which == .init) zero else good_init,
         .encryption_key = if (which == .encryption) zero else good_enc,
         .credential = .{ .basic = name },
@@ -7453,11 +7520,11 @@ test "leaks: an HPKE failure midway through the Welcome or the UpdatePath leaves
     test_admit_low_order_keys = true;
     defer test_admit_low_order_keys = false;
 
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "leak-hpke",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     const before = try stateDigest(&a);
@@ -7465,7 +7532,7 @@ test "leaks: an HPKE failure midway through the Welcome or the UpdatePath leaves
     // Welcome: the first slot (bob) is sealed, the second (`bad_init`) fails.
     try testing.expectError(error.DhFailed, a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{ .{ .by_value = .{ .add = bob.kp } }, .{ .by_value = .{ .add = bad_init.kp } } },
     }));
     try testing.expectEqualSlices(u8, &before, &(try stateDigest(&a)));
@@ -7474,14 +7541,14 @@ test "leaks: an HPKE failure midway through the Welcome or the UpdatePath leaves
     // leaf first, then to `bad_enc`'s, which fails.
     const c1 = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{ .{ .by_value = .{ .add = bob.kp } }, .{ .by_value = .{ .add = bad_enc.kp } } },
     });
     defer c1.deinit(gpa);
     const mid = try stateDigest(&a);
     try testing.expectError(error.Malformed, a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .add = carol.kp } }},
     }));
     try testing.expectEqualSlices(u8, &mid, &(try stateDigest(&a)));
@@ -7523,11 +7590,11 @@ test "low-order X25519 keys: createCommit refuses an Add whose init_key or encry
     const alice = try TestClient.init(aa, "alice", 221);
     const bad_init = try lowOrderClient(aa, "bad-init", 222, .init);
     const bad_enc = try lowOrderClient(aa, "bad-enc", 223, .encryption);
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "low-order-create",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     const before = try stateDigest(&a);
@@ -7535,7 +7602,7 @@ test "low-order X25519 keys: createCommit refuses an Add whose init_key or encry
         for ([_]bool{ false, true }) |omit| {
             const r = a.createCommit(gpa, .{
                 .io = io,
-                .signature_key_pair = alice.sig,
+                .signature_key_pair = &alice.sig,
                 .proposals = &.{.{ .by_value = .{ .add = kp } }},
                 .omit_path_when_allowed = omit,
             });
@@ -7562,17 +7629,17 @@ test "low-order X25519 keys: processCommit refuses an insider's Commit that adds
     const carol = try TestClient.init(aa, "carol", 233);
     const bad_init = try lowOrderClient(aa, "bad-init", 234, .init);
     const bad_enc = try lowOrderClient(aa, "bad-enc", 235, .encryption);
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "low-order-process",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     var b = blk: {
         const c = try a.createCommit(gpa, .{
             .io = io,
-            .signature_key_pair = alice.sig,
+            .signature_key_pair = &alice.sig,
             .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
         });
         defer c.deinit(gpa);
@@ -7585,7 +7652,7 @@ test "low-order X25519 keys: processCommit refuses an insider's Commit that adds
     // path's leaf key or its first node key swapped for the all-zero point.
     const c = try a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .add = carol.kp } }},
     });
     defer c.deinit(gpa);
@@ -7611,7 +7678,7 @@ test "low-order X25519 keys: processCommit refuses an insider's Commit that adds
     test_admit_low_order_keys = true;
     const c2_or_err = a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .add = bad_enc.kp } }},
     });
     test_admit_low_order_keys = false;
@@ -7633,11 +7700,11 @@ test "low-order X25519 keys: a Welcome whose ratchet tree carries one is refused
     const alice = try TestClient.init(aa, "alice", 241);
     const bob = try TestClient.init(aa, "bob", 242);
     const bad_enc = try lowOrderClient(aa, "bad-enc", 243, .encryption);
-    var a = try Group(TestSuite).create(gpa, .{
+    var a = try tCreate(gpa, .{
         .io = io,
         .group_id = "low-order-welcome",
         .key_package_msg = alice.kp_msg,
-        .encryption_priv = alice.enc_priv,
+        .encryption_priv = &alice.enc_priv,
     });
     defer a.deinit();
     // A committer that does not check seats `bad_enc` beside bob, pathless
@@ -7645,7 +7712,7 @@ test "low-order X25519 keys: a Welcome whose ratchet tree carries one is refused
     test_admit_low_order_keys = true;
     const c0 = a.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{ .{ .by_value = .{ .add = bob.kp } }, .{ .by_value = .{ .add = bad_enc.kp } } },
         .omit_path_when_allowed = true,
     });

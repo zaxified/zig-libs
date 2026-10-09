@@ -121,7 +121,8 @@ test "crypto-basics.json: cipher suite 0x0001 (MLS_128_DHKEMX25519_AES128GCM_SHA
             const want = try hexDecode(arena, ds.get("out").?.string);
             var secret: [S.Nh]u8 = undefined;
             @memcpy(&secret, secret_bytes[0..S.Nh]);
-            const got = try crypto.DeriveSecret(S, secret, label);
+            var got: [S.Nh]u8 = undefined;
+            try crypto.DeriveSecret(S, &secret, label, &got);
             try testing.expectEqualSlices(u8, want, &got);
         }
 
@@ -136,7 +137,7 @@ test "crypto-basics.json: cipher suite 0x0001 (MLS_128_DHKEMX25519_AES128GCM_SHA
             var secret: [S.Nh]u8 = undefined;
             @memcpy(&secret, secret_bytes[0..S.Nh]);
             const got = try arena.alloc(u8, length);
-            try crypto.DeriveTreeSecret(S, secret, label, generation, got);
+            try crypto.DeriveTreeSecret(S, &secret, label, generation, got);
             try testing.expectEqualSlices(u8, want, got);
         }
 
@@ -151,7 +152,7 @@ test "crypto-basics.json: cipher suite 0x0001 (MLS_128_DHKEMX25519_AES128GCM_SHA
             var secret: [S.Nh]u8 = undefined;
             @memcpy(&secret, secret_bytes[0..S.Nh]);
             const got = try arena.alloc(u8, length);
-            try crypto.ExpandWithLabel(S, secret, label, context, got);
+            try crypto.ExpandWithLabel(S, &secret, label, context, got);
             try testing.expectEqualSlices(u8, want, got);
         }
 
@@ -176,7 +177,7 @@ test "crypto-basics.json: cipher suite 0x0001 (MLS_128_DHKEMX25519_AES128GCM_SHA
             // byte-exact, a strictly stronger check than "the published
             // signature merely verifies" (which is all a randomized
             // scheme like ECDSA could offer).
-            const sig = try crypto.SignWithLabel(S, kp, label, content);
+            const sig = try crypto.SignWithLabel(S, &kp, label, content);
             try testing.expectEqualSlices(u8, want_sig, &sig.toBytes());
 
             // And the published signature independently verifies too.
@@ -209,7 +210,7 @@ test "crypto-basics.json: cipher suite 0x0001 (MLS_128_DHKEMX25519_AES128GCM_SHA
             // the plaintext matches byte-exact (the task's required
             // check for a randomized primitive).
             const plaintext_out = try arena.alloc(u8, want_plaintext.len);
-            try crypto.DecryptWithLabel(S, enc, skR, label, context, ciphertext, plaintext_out);
+            try crypto.DecryptWithLabel(S, enc, &skR, label, context, ciphertext, plaintext_out);
             try testing.expectEqualSlices(u8, want_plaintext, plaintext_out);
 
             // Then round-trip OUR OWN EncryptWithLabel/DecryptWithLabel —
@@ -218,7 +219,7 @@ test "crypto-basics.json: cipher suite 0x0001 (MLS_128_DHKEMX25519_AES128GCM_SHA
             const our_ct = try arena.alloc(u8, want_plaintext.len + S.Aead.tag_length);
             const our_enc = try crypto.EncryptWithLabel(S, skR.public_key, io, label, context, want_plaintext, our_ct);
             const roundtrip_out = try arena.alloc(u8, want_plaintext.len);
-            try crypto.DecryptWithLabel(S, our_enc, skR, label, context, our_ct, roundtrip_out);
+            try crypto.DecryptWithLabel(S, our_enc, &skR, label, context, our_ct, roundtrip_out);
             try testing.expectEqualSlices(u8, want_plaintext, roundtrip_out);
         }
     }

@@ -136,7 +136,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !Client {
     defer arena.deinit();
 
     const kp = try mls.createKeyPackage(S, arena.allocator(), .{
-        .signature_key_pair = sig,
+        .signature_key_pair = &sig,
         .init_key = init_pair.public_key,
         .encryption_key = enc_pair.public_key,
         .credential = .{ .basic = opts.name },
@@ -205,12 +205,13 @@ pub fn run(self: *Client) !void {
     try self.sendFrame(.{ .kind = .join, .group = self.opts.group });
 
     if (self.opts.create) {
-        var g = try mls.Group(S).create(gpa, .{
+        var g: mls.Group(S) = undefined;
+        try mls.Group(S).create(gpa, .{
             .io = self.io,
             .group_id = self.opts.group,
             .key_package_msg = self.published,
-            .encryption_priv = self.enc_priv,
-        });
+            .encryption_priv = &self.enc_priv,
+        }, &g);
         errdefer g.deinit();
         var a = try appmsg.AppMessages.init(gpa, &g);
         errdefer a.deinit();
@@ -302,12 +303,13 @@ fn handleInbound(self: *Client, frame: wire.Frame) !void {
             self.state_lock.lock();
             defer self.state_lock.unlock();
             if (self.group != null) return; // already in; a Welcome for someone else
-            var g = mls.Group(S).fromWelcome(gpa, .{
+            var g: mls.Group(S) = undefined;
+            mls.Group(S).fromWelcome(gpa, .{
                 .welcome_msg = frame.msg,
                 .key_package_msg = self.published,
-                .init_priv = self.init_priv,
-                .encryption_priv = self.enc_priv,
-            }) catch |err| switch (err) {
+                .init_priv = &self.init_priv,
+                .encryption_priv = &self.enc_priv,
+            }, &g) catch |err| switch (err) {
                 // The ordinary case: the relay fans one Welcome out to every
                 // subscriber and each tries its own slot.
                 error.NoMatchingKeyPackage => return,
@@ -411,7 +413,7 @@ fn commitAdd(self: *Client, name: []const u8, key_package_msg: []const u8) !void
 
     const created = try g.createCommit(gpa, .{
         .io = self.io,
-        .signature_key_pair = self.sig,
+        .signature_key_pair = &self.sig,
         .proposals = &.{.{ .by_value = .{ .add = kp } }},
     });
     defer created.deinit(gpa);
@@ -481,7 +483,7 @@ fn maybeCommitPending(self: *Client, g: *mls.Group(S)) !void {
 
     const created = g.createCommit(self.gpa, .{
         .io = self.io,
-        .signature_key_pair = self.sig,
+        .signature_key_pair = &self.sig,
         .proposals = &.{.{ .by_reference = self.pending.items[chosen] }},
     }) catch |err| {
         std.debug.print("mls-chat: could not commit the pending proposal: {t}\n", .{err});
@@ -576,7 +578,7 @@ fn removeMember(self: *Client, name: []const u8) !void {
 
     const created = g.createCommit(self.gpa, .{
         .io = self.io,
-        .signature_key_pair = self.sig,
+        .signature_key_pair = &self.sig,
         .proposals = &.{.{ .by_value = .{ .remove = leaf } }},
     }) catch |err| {
         std.debug.print("mls-chat: could not remove '{s}': {t}\n", .{ name, err });
@@ -609,7 +611,7 @@ fn proposeLeave(self: *Client) !void {
         return;
     };
     const bytes = g.createProposal(self.gpa, .{
-        .signature_key_pair = self.sig,
+        .signature_key_pair = &self.sig,
         .proposal = .{ .remove = g.my_leaf_index },
     }) catch |err| {
         std.debug.print("mls-chat: could not propose leaving: {t}\n", .{err});
@@ -722,7 +724,7 @@ fn keyboardLoop(self: *Client) !void {
                 std.debug.print("mls-chat: not in the group yet — nothing to send to\n", .{});
                 continue;
             };
-            break :blk try self.app.?.protect(gpa, self.io, g, self.sig, text);
+            break :blk try self.app.?.protect(gpa, self.io, g, &self.sig, text);
         };
         defer gpa.free(protected);
         try self.sendFrame(.{ .kind = .app, .group = self.opts.group, .msg = protected });

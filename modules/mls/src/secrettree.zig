@@ -55,6 +55,7 @@
 const std = @import("std");
 const suite = @import("suite.zig");
 const crypto = @import("crypto.zig");
+const burn = @import("burn.zig");
 const treemath = @import("treemath.zig");
 
 pub const Error = error{
@@ -103,16 +104,15 @@ pub const RatchetKind = enum {
 // ── §9: deriving down the tree ────────────────────────────────────────────
 
 /// RFC 9420 §9 Figure 25, one step: a child's secret from its parent's.
-pub fn childSecret(comptime S: type, parent_secret: [S.Nh]u8, is_left: bool) Error![S.Nh]u8 {
-    var out: [S.Nh]u8 = undefined;
+/// `out` must not alias `parent_secret`.
+pub fn childSecret(comptime S: type, parent_secret: *const [S.Nh]u8, is_left: bool, out: *[S.Nh]u8) Error!void {
     try crypto.ExpandWithLabel(
         S,
         parent_secret,
         label_tree,
         if (is_left) context_left else context_right,
-        &out,
+        out,
     );
-    return out;
 }
 
 /// The secret at array-based tree index `node_index` in the secret tree
@@ -127,10 +127,21 @@ pub fn childSecret(comptime S: type, parent_secret: [S.Nh]u8, is_left: bool) Err
 /// padded one.
 pub fn nodeSecret(
     comptime S: type,
-    encryption_secret: [S.Nh]u8,
+    encryption_secret: *const [S.Nh]u8,
     n_leaves: usize,
     node_index: usize,
-) Error![S.Nh]u8 {
+    out: *[S.Nh]u8,
+) Error!void {
+    return burn.run(burn.kdf_burn, Error!void, nodeSecretBody, .{ S, encryption_secret, n_leaves, node_index, out });
+}
+
+fn nodeSecretBody(
+    comptime S: type,
+    encryption_secret: *const [S.Nh]u8,
+    n_leaves: usize,
+    node_index: usize,
+    out: *[S.Nh]u8,
+) Error!void {
     if (n_leaves == 0 or node_index >= treemath.node_width(n_leaves)) return error.NodeIndexOutOfRange;
 
     // Path from `node_index` up to (but excluding) the root. `max_path_len`
@@ -145,14 +156,15 @@ pub fn nodeSecret(
         x = treemath.parent(x, n_leaves) orelse return error.NodeIndexOutOfRange;
     }
 
-    var secret = encryption_secret;
+    out.* = encryption_secret.*;
+    var next: [S.Nh]u8 = undefined;
     while (depth > 0) {
         depth -= 1;
         const child = path[depth];
         const p = treemath.parent(child, n_leaves).?;
-        secret = try childSecret(S, secret, treemath.left(p).? == child);
+        try childSecret(S, out, treemath.left(p).? == child, &next);
+        out.* = next;
     }
-    return secret;
 }
 
 /// RFC 9420 §9 Figure 26: the generation-0 secret of one of a leaf's two
@@ -160,16 +172,27 @@ pub fn nodeSecret(
 /// node index `2 * leaf_index` in the array-based tree.
 pub fn ratchetBaseSecret(
     comptime S: type,
-    encryption_secret: [S.Nh]u8,
+    encryption_secret: *const [S.Nh]u8,
     n_leaves: usize,
     leaf_index: usize,
     kind: RatchetKind,
-) Error![S.Nh]u8 {
+    out: *[S.Nh]u8,
+) Error!void {
+    return burn.run(burn.kdf_burn, Error!void, ratchetBaseBody, .{ S, encryption_secret, n_leaves, leaf_index, kind, out });
+}
+
+fn ratchetBaseBody(
+    comptime S: type,
+    encryption_secret: *const [S.Nh]u8,
+    n_leaves: usize,
+    leaf_index: usize,
+    kind: RatchetKind,
+    out: *[S.Nh]u8,
+) Error!void {
     if (leaf_index >= n_leaves) return error.NodeIndexOutOfRange;
-    const leaf_secret = try nodeSecret(S, encryption_secret, n_leaves, leaf_index * 2);
-    var out: [S.Nh]u8 = undefined;
-    try crypto.ExpandWithLabel(S, leaf_secret, kind.label(), "", &out);
-    return out;
+    var leaf_secret: [S.Nh]u8 = undefined;
+    try nodeSecretBody(S, encryption_secret, n_leaves, leaf_index * 2, &leaf_secret);
+    try crypto.ExpandWithLabel(S, &leaf_secret, kind.label(), "", out);
 }
 
 // ── §9.1: the sender ratchet ──────────────────────────────────────────────
@@ -200,26 +223,28 @@ pub fn Ratchet(comptime S: type) type {
         secret: [S.Nh]u8,
         generation: u32,
 
-        pub fn init(base_secret: [S.Nh]u8) Self {
-            return .{ .secret = base_secret, .generation = 0 };
+        pub fn init(base_secret: *const [S.Nh]u8, out: *Self) void {
+            out.* = .{ .secret = base_secret.*, .generation = 0 };
         }
 
         /// The key/nonce for the CURRENT generation. Pure — call `advance`
         /// to move on.
-        pub fn current(self: *const Self) Error!KeyNonce(S) {
-            var out: KeyNonce(S) = undefined;
-            try crypto.DeriveTreeSecret(S, self.secret, label_key, self.generation, &out.key);
-            try crypto.DeriveTreeSecret(S, self.secret, label_nonce, self.generation, &out.nonce);
-            return out;
+        pub fn current(self: *const Self, out: *KeyNonce(S)) Error!void {
+            try crypto.DeriveTreeSecret(S, &self.secret, label_key, self.generation, &out.key);
+            try crypto.DeriveTreeSecret(S, &self.secret, label_nonce, self.generation, &out.nonce);
         }
 
         /// Steps to the next generation, overwriting the consumed secret in
         /// place (RFC 9420 §9.2 — the ratchet must not be rewindable, so
         /// the old secret cannot merely be dropped).
         pub fn advance(self: *Self) Error!void {
+            return burn.run(burn.kdf_burn, Error!void, advanceBody, .{self});
+        }
+
+        fn advanceBody(self: *Self) Error!void {
             if (self.generation == std.math.maxInt(u32)) return error.RatchetExhausted;
             var next: [S.Nh]u8 = undefined;
-            try crypto.DeriveTreeSecret(S, self.secret, label_secret, self.generation, &next);
+            try crypto.DeriveTreeSecret(S, &self.secret, label_secret, self.generation, &next);
             std.crypto.secureZero(u8, &self.secret);
             self.secret = next;
             self.generation += 1;
@@ -260,8 +285,9 @@ pub fn Window(comptime S: type, comptime capacity: usize) type {
         /// consumed the way it marks every other one — this flag does.
         final_spent: bool = false,
 
-        pub fn init(base_secret: [S.Nh]u8) Self {
-            return .{ .ratchet = Ratchet(S).init(base_secret) };
+        pub fn init(base_secret: *const [S.Nh]u8, out: *Self) void {
+            out.* = .{ .ratchet = undefined };
+            Ratchet(S).init(base_secret, &out.ratchet);
         }
 
         /// The key/nonce for `generation`, CONSUMING it: a second call for
@@ -273,15 +299,19 @@ pub fn Window(comptime S: type, comptime capacity: usize) type {
         /// * `generation` at or ahead of the ratchet → ratchets forward,
         ///   retaining each skipped generation, then consumes the target.
         ///   Refuses jumps beyond `max_forward_jump`.
-        pub fn get(self: *Self, generation: u32) Error!KeyNonce(S) {
+        pub fn get(self: *Self, generation: u32, out: *KeyNonce(S)) Error!void {
+            return burn.run(burn.kdf_burn, Error!void, getBody, .{ self, generation, out });
+        }
+
+        fn getBody(self: *Self, generation: u32, out: *KeyNonce(S)) Error!void {
             if (generation < self.ratchet.generation) {
                 for (&self.held) |*slot| {
                     if (slot.*) |*e| {
                         if (e.generation == generation) {
-                            const kn = e.kn;
+                            out.* = e.kn;
                             e.kn.wipe();
                             slot.* = null;
-                            return kn;
+                            return;
                         }
                     }
                 }
@@ -306,11 +336,11 @@ pub fn Window(comptime S: type, comptime capacity: usize) type {
             }
 
             while (self.ratchet.generation < generation) {
-                self.retain(.{ .generation = self.ratchet.generation, .kn = try self.ratchet.current() });
+                try self.retainCurrent();
                 try self.ratchet.advance();
             }
 
-            const kn = try self.ratchet.current();
+            try self.ratchet.current(out);
             // Advancing past the generation we just served is what makes it
             // unrepeatable: it is neither the current generation any more
             // nor retained.
@@ -323,9 +353,11 @@ pub fn Window(comptime S: type, comptime capacity: usize) type {
                     self.final_spent = true;
                     self.ratchet.wipe();
                 },
-                else => return err,
+                else => {
+                    out.wipe();
+                    return err;
+                },
             };
-            return kn;
         }
 
         /// RFC 9420 §9.2: drop everything this window still holds.
@@ -337,10 +369,16 @@ pub fn Window(comptime S: type, comptime capacity: usize) type {
             self.ratchet.wipe();
         }
 
-        fn retain(self: *Self, entry: Entry) void {
+        /// Retain the ratchet's current generation, derived straight into
+        /// its slot (no key/nonce copy on the stack).
+        fn retainCurrent(self: *Self) Error!void {
             if (capacity == 0) return;
             if (self.held[self.next_slot]) |*evicted| evicted.kn.wipe();
-            self.held[self.next_slot] = entry;
+            self.held[self.next_slot] = .{ .generation = self.ratchet.generation, .kn = undefined };
+            self.ratchet.current(&self.held[self.next_slot].?.kn) catch |err| {
+                self.held[self.next_slot] = null;
+                return err;
+            };
             self.next_slot = (self.next_slot + 1) % capacity;
         }
     };
@@ -373,14 +411,13 @@ pub fn SenderDataKeys(comptime S: type) type {
 /// sender-data blob cannot be lifted onto a different ciphertext.
 pub fn senderDataKeys(
     comptime S: type,
-    sender_data_secret: [S.Nh]u8,
+    sender_data_secret: *const [S.Nh]u8,
     ciphertext: []const u8,
-) Error!SenderDataKeys(S) {
+    out: *SenderDataKeys(S),
+) Error!void {
     const sample = ciphertext[0..@min(ciphertext.len, S.Nh)];
-    var out: SenderDataKeys(S) = undefined;
     try crypto.ExpandWithLabel(S, sender_data_secret, label_key, sample, &out.key);
     try crypto.ExpandWithLabel(S, sender_data_secret, label_nonce, sample, &out.nonce);
-    return out;
 }
 
 // ── tests ─────────────────────────────────────────────────────────────
@@ -388,9 +425,59 @@ pub fn senderDataKeys(
 const testing = std.testing;
 const TestSuite = suite.default;
 
+// Test-only by-value wrappers over the out-pointer API, so the assertions
+// below stay readable.
+fn tNode(comptime S: type, es: [S.Nh]u8, n: usize, idx: usize) !([S.Nh]u8) {
+    var out: [S.Nh]u8 = undefined;
+    try nodeSecret(S, &es, n, idx, &out);
+    return out;
+}
+
+fn tBase(comptime S: type, es: [S.Nh]u8, n: usize, leaf: usize, kind: RatchetKind) !([S.Nh]u8) {
+    var out: [S.Nh]u8 = undefined;
+    try ratchetBaseSecret(S, &es, n, leaf, kind, &out);
+    return out;
+}
+
+fn tChild(comptime S: type, parent: [S.Nh]u8, is_left: bool) ![S.Nh]u8 {
+    var out: [S.Nh]u8 = undefined;
+    try childSecret(S, &parent, is_left, &out);
+    return out;
+}
+
+fn tRatchet(base: [TestSuite.Nh]u8) Ratchet(TestSuite) {
+    var r: Ratchet(TestSuite) = undefined;
+    Ratchet(TestSuite).init(&base, &r);
+    return r;
+}
+
+fn tCurrent(r: *const Ratchet(TestSuite)) !KeyNonce(TestSuite) {
+    var out: KeyNonce(TestSuite) = undefined;
+    try r.current(&out);
+    return out;
+}
+
+fn tWindow(comptime c: usize, base: [TestSuite.Nh]u8) Window(TestSuite, c) {
+    var w: Window(TestSuite, c) = undefined;
+    Window(TestSuite, c).init(&base, &w);
+    return w;
+}
+
+fn tGet(w: anytype, generation: u32) !KeyNonce(TestSuite) {
+    var out: KeyNonce(TestSuite) = undefined;
+    try w.get(generation, &out);
+    return out;
+}
+
+fn tSender(comptime S: type, sds: [S.Nh]u8, ct: []const u8) !SenderDataKeys(S) {
+    var out: SenderDataKeys(S) = undefined;
+    try senderDataKeys(S, &sds, ct, &out);
+    return out;
+}
+
 test "nodeSecret: a one-leaf tree's only node IS the root, so its secret is encryption_secret" {
     const es = [_]u8{0x42} ** TestSuite.Nh;
-    const got = try nodeSecret(TestSuite, es, 1, 0);
+    const got = try tNode(TestSuite, es, 1, 0);
     try testing.expectEqualSlices(u8, &es, &got);
 }
 
@@ -398,38 +485,38 @@ test "nodeSecret: children differ from each other and from the parent; out-of-ra
     const es = [_]u8{0x11} ** TestSuite.Nh;
     // n_leaves = 4 -> node_width 7, root 3, children 1 and 5.
     try testing.expectEqual(@as(usize, 7), treemath.node_width(4));
-    const root_secret = try nodeSecret(TestSuite, es, 4, 3);
+    const root_secret = try tNode(TestSuite, es, 4, 3);
     try testing.expectEqualSlices(u8, &es, &root_secret);
 
-    const l = try nodeSecret(TestSuite, es, 4, 1);
-    const r = try nodeSecret(TestSuite, es, 4, 5);
+    const l = try tNode(TestSuite, es, 4, 1);
+    const r = try tNode(TestSuite, es, 4, 5);
     try testing.expect(!std.mem.eql(u8, &l, &r));
     try testing.expect(!std.mem.eql(u8, &l, &es));
 
     // Derived stepwise, the "left" child must match the tree walk.
-    const l_direct = try childSecret(TestSuite, es, true);
+    const l_direct = try tChild(TestSuite, es, true);
     try testing.expectEqualSlices(u8, &l_direct, &l);
 
-    try testing.expectError(error.NodeIndexOutOfRange, nodeSecret(TestSuite, es, 4, 7));
-    try testing.expectError(error.NodeIndexOutOfRange, nodeSecret(TestSuite, es, 0, 0));
+    try testing.expectError(error.NodeIndexOutOfRange, tNode(TestSuite, es, 4, 7));
+    try testing.expectError(error.NodeIndexOutOfRange, tNode(TestSuite, es, 0, 0));
 }
 
 test "ratchetBaseSecret: handshake and application ratchets are independent per leaf" {
     const es = [_]u8{0x21} ** TestSuite.Nh;
-    const h0 = try ratchetBaseSecret(TestSuite, es, 4, 0, .handshake);
-    const a0 = try ratchetBaseSecret(TestSuite, es, 4, 0, .application);
-    const h1 = try ratchetBaseSecret(TestSuite, es, 4, 1, .handshake);
+    const h0 = try tBase(TestSuite, es, 4, 0, .handshake);
+    const a0 = try tBase(TestSuite, es, 4, 0, .application);
+    const h1 = try tBase(TestSuite, es, 4, 1, .handshake);
     try testing.expect(!std.mem.eql(u8, &h0, &a0));
     try testing.expect(!std.mem.eql(u8, &h0, &h1));
-    try testing.expectError(error.NodeIndexOutOfRange, ratchetBaseSecret(TestSuite, es, 4, 4, .handshake));
+    try testing.expectError(error.NodeIndexOutOfRange, tBase(TestSuite, es, 4, 4, .handshake));
 }
 
 test "Ratchet: current() is pure, advance() moves forward and destroys the old secret" {
     const base = [_]u8{0x31} ** TestSuite.Nh;
-    var r = Ratchet(TestSuite).init(base);
+    var r = tRatchet(base);
 
-    const g0a = try r.current();
-    const g0b = try r.current();
+    const g0a = try tCurrent(&r);
+    const g0b = try tCurrent(&r);
     try testing.expectEqualSlices(u8, &g0a.key, &g0b.key);
     try testing.expectEqual(@as(u32, 0), r.generation);
 
@@ -438,7 +525,7 @@ test "Ratchet: current() is pure, advance() moves forward and destroys the old s
     try testing.expectEqual(@as(u32, 1), r.generation);
     try testing.expect(!std.mem.eql(u8, &before, &r.secret));
 
-    const g1 = try r.current();
+    const g1 = try tCurrent(&r);
     try testing.expect(!std.mem.eql(u8, &g0a.key, &g1.key));
     try testing.expect(!std.mem.eql(u8, &g0a.nonce, &g1.nonce));
 
@@ -448,14 +535,14 @@ test "Ratchet: current() is pure, advance() moves forward and destroys the old s
 
 test "Window: in-order delivery matches the bare ratchet generation for generation" {
     const base = [_]u8{0x41} ** TestSuite.Nh;
-    var w = Window(TestSuite, 8).init(base);
-    var r = Ratchet(TestSuite).init(base);
+    var w = tWindow(8, base);
+    var r = tRatchet(base);
 
     var g: u32 = 0;
     while (g < 5) : (g += 1) {
-        const want = try r.current();
+        const want = try tCurrent(&r);
         try r.advance();
-        const got = try w.get(g);
+        const got = try tGet(&w, g);
         try testing.expectEqualSlices(u8, &want.key, &got.key);
         try testing.expectEqualSlices(u8, &want.nonce, &got.nonce);
     }
@@ -463,44 +550,44 @@ test "Window: in-order delivery matches the bare ratchet generation for generati
 
 test "Window: a skipped generation is retained and later served exactly once" {
     const base = [_]u8{0x51} ** TestSuite.Nh;
-    var w = Window(TestSuite, 8).init(base);
-    var r = Ratchet(TestSuite).init(base);
+    var w = tWindow(8, base);
+    var r = tRatchet(base);
 
     // Generation 3 arrives first.
-    const g3 = try w.get(3);
+    const g3 = try tGet(&w, 3);
     var i: u32 = 0;
     while (i < 3) : (i += 1) try r.advance();
-    const want3 = try r.current();
+    const want3 = try tCurrent(&r);
     try testing.expectEqualSlices(u8, &want3.key, &g3.key);
 
     // The three it jumped over are still available, out of order.
-    const g1 = try w.get(1);
-    const g0 = try w.get(0);
+    const g1 = try tGet(&w, 1);
+    const g0 = try tGet(&w, 0);
     try testing.expect(!std.mem.eql(u8, &g0.key, &g1.key));
-    _ = try w.get(2);
+    _ = try tGet(&w, 2);
 
     // ...but each exactly once, and generation 3 itself is not replayable.
-    try testing.expectError(error.GenerationConsumed, w.get(1));
-    try testing.expectError(error.GenerationConsumed, w.get(3));
+    try testing.expectError(error.GenerationConsumed, tGet(&w, 1));
+    try testing.expectError(error.GenerationConsumed, tGet(&w, 3));
 }
 
 test "Window: eviction past capacity, and a huge forward jump is refused not computed" {
     const base = [_]u8{0x61} ** TestSuite.Nh;
-    var w = Window(TestSuite, 2).init(base);
+    var w = tWindow(2, base);
 
-    _ = try w.get(4); // retains generations 0..3 into a 2-slot ring
+    _ = try tGet(&w, 4); // retains generations 0..3 into a 2-slot ring
     // The two oldest fell out; the two newest survive.
-    try testing.expectError(error.GenerationConsumed, w.get(0));
-    try testing.expectError(error.GenerationConsumed, w.get(1));
-    _ = try w.get(2);
-    _ = try w.get(3);
+    try testing.expectError(error.GenerationConsumed, tGet(&w, 0));
+    try testing.expectError(error.GenerationConsumed, tGet(&w, 1));
+    _ = try tGet(&w, 2);
+    _ = try tGet(&w, 3);
 
     // An unauthenticated uint32 generation must not buy 4 billion KDF calls.
-    var w2 = Window(TestSuite, 2).init(base);
-    try testing.expectError(error.GenerationTooFarAhead, w2.get(std.math.maxInt(u32)));
+    var w2 = tWindow(2, base);
+    try testing.expectError(error.GenerationTooFarAhead, tGet(&w2, std.math.maxInt(u32)));
     w2.max_forward_jump = 4;
-    try testing.expectError(error.GenerationTooFarAhead, w2.get(5));
-    _ = try w2.get(4);
+    try testing.expectError(error.GenerationTooFarAhead, tGet(&w2, 5));
+    _ = try tGet(&w2, 4);
 
     w.wipe();
     try testing.expectEqualSlices(u8, &[_]u8{0} ** TestSuite.Nh, &w.ratchet.secret);
@@ -515,13 +602,13 @@ test "Window: the FINAL generation is consumed too — a replay of it is refused
     // replay one captured message without limit, against a module whose doc
     // promises the opposite.
     const base = [_]u8{0x62} ** TestSuite.Nh;
-    var w = Window(TestSuite, 2).init(base);
+    var w = tWindow(2, base);
     // Park the ratchet on the last generation without paying 2^32 KDF calls.
     w.ratchet.generation = std.math.maxInt(u32);
 
-    const first = try w.get(std.math.maxInt(u32));
-    try testing.expectError(error.GenerationConsumed, w.get(std.math.maxInt(u32)));
-    try testing.expectError(error.GenerationConsumed, w.get(std.math.maxInt(u32)));
+    const first = try tGet(&w, std.math.maxInt(u32));
+    try testing.expectError(error.GenerationConsumed, tGet(&w, std.math.maxInt(u32)));
+    try testing.expectError(error.GenerationConsumed, tGet(&w, std.math.maxInt(u32)));
     // The served key is still a real one, and the spent secret is gone.
     try testing.expect(!std.mem.allEqual(u8, &first.key, 0));
     try testing.expectEqualSlices(u8, &[_]u8{0} ** TestSuite.Nh, &w.ratchet.secret);
@@ -533,8 +620,8 @@ test "senderDataKeys: bound to the ciphertext sample, and a short ciphertext use
     var ct_b = ct_a;
     ct_b[0] ^= 0x01; // inside the first KDF.Nh bytes
 
-    const a = try senderDataKeys(TestSuite, sds, &ct_a);
-    const b = try senderDataKeys(TestSuite, sds, &ct_b);
+    const a = try tSender(TestSuite, sds, &ct_a);
+    const b = try tSender(TestSuite, sds, &ct_b);
     try testing.expect(!std.mem.eql(u8, &a.key, &b.key));
     try testing.expect(!std.mem.eql(u8, &a.nonce, &b.nonce));
 
@@ -542,13 +629,13 @@ test "senderDataKeys: bound to the ciphertext sample, and a short ciphertext use
     // behaviour, not an oversight: only the first KDF.Nh bytes are sampled.
     var ct_c = ct_a;
     ct_c[TestSuite.Nh] ^= 0xff;
-    const c = try senderDataKeys(TestSuite, sds, &ct_c);
+    const c = try tSender(TestSuite, sds, &ct_c);
     try testing.expectEqualSlices(u8, &a.key, &c.key);
 
     // A ciphertext shorter than KDF.Nh samples the whole thing.
     const short = [_]u8{0xbb} ** 8;
-    const s1 = try senderDataKeys(TestSuite, sds, &short);
-    const s2 = try senderDataKeys(TestSuite, sds, short[0..8]);
+    const s1 = try tSender(TestSuite, sds, &short);
+    const s2 = try tSender(TestSuite, sds, short[0..8]);
     try testing.expectEqualSlices(u8, &s1.key, &s2.key);
     try testing.expect(!std.mem.eql(u8, &s1.key, &a.key));
 }

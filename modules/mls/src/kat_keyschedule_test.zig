@@ -136,15 +136,19 @@ test "key-schedule.json: RFC 9420 §8's full epoch chain for cipher suite 0x0001
             // divergence names the exact link, then re-checked through the
             // one-call `deriveEpoch` so the convenience path cannot drift
             // from the pieces.
-            const joiner = try keyschedule.joinerSecret(S, arena, init_secret_prev, commit_secret, encoded_gc);
+            var joiner: [S.Nh]u8 = undefined;
+            try keyschedule.joinerSecret(S, arena, &init_secret_prev, &commit_secret, encoded_gc, &joiner);
             try expectStage("joiner_secret", try hexDecode(arena, ep.get("joiner_secret").?.string), &joiner);
 
-            const welcome = try keyschedule.welcomeSecret(S, joiner, psk_secret);
+            var welcome: [S.Nh]u8 = undefined;
+            try keyschedule.welcomeSecret(S, &joiner, &psk_secret, &welcome);
             try expectStage("welcome_secret", try hexDecode(arena, ep.get("welcome_secret").?.string), &welcome);
 
-            const epoch_secret = try keyschedule.epochSecret(S, arena, joiner, psk_secret, encoded_gc);
+            var epoch_secret: [S.Nh]u8 = undefined;
+            try keyschedule.epochSecret(S, arena, &joiner, &psk_secret, encoded_gc, &epoch_secret);
 
-            var secrets = try keyschedule.deriveEpoch(S, arena, init_secret_prev, commit_secret, psk_secret, encoded_gc);
+            var secrets: keyschedule.EpochSecrets(S) = undefined;
+            try keyschedule.deriveEpoch(S, arena, &init_secret_prev, &commit_secret, &psk_secret, encoded_gc, &secrets);
             try expectStage("deriveEpoch/joiner_secret", &joiner, &secrets.joiner_secret);
             try expectStage("deriveEpoch/welcome_secret", &welcome, &secrets.welcome_secret);
             try expectStage("deriveEpoch/epoch_secret", &epoch_secret, &secrets.epoch_secret);
@@ -166,7 +170,8 @@ test "key-schedule.json: RFC 9420 §8's full epoch chain for cipher suite 0x0001
             }
 
             // ── §8: external_pub = KEM.DeriveKeyPair(external_secret) ──
-            const external_kp = keyschedule.externalKeyPair(S, secrets.external_secret);
+            var external_kp: S.Kem.KeyPair = undefined;
+            keyschedule.externalKeyPair(S, &secrets.external_secret, &external_kp);
             try expectStage(
                 "external_pub",
                 try hexDecode(arena, ep.get("external_pub").?.string),
@@ -180,7 +185,7 @@ test "key-schedule.json: RFC 9420 §8's full epoch chain for cipher suite 0x0001
                 const context = try hexDecode(arena, exp.get("context").?.string);
                 const length: usize = @intCast(asI64(exp.get("length").?));
                 const out = try arena.alloc(u8, length);
-                try keyschedule.mlsExporter(S, secrets.exporter_secret, label, context, out);
+                try keyschedule.mlsExporter(S, &secrets.exporter_secret, label, context, out);
                 try expectStage("exporter", try hexDecode(arena, exp.get("secret").?.string), out);
             }
 
@@ -227,7 +232,8 @@ test "psk_secret.json: RFC 9420 §8.4's psk_secret chain for 0..10 PSKs, byte-ex
             };
         }
 
-        const got = try keyschedule.pskSecret(S, arena, psks);
+        var got: [S.Nh]u8 = undefined;
+        try keyschedule.pskSecret(S, arena, psks, &got);
         try expectStage("psk_secret", try hexDecode(arena, entry.object.get("psk_secret").?.string), &got);
 
         if (psks.len == 0) saw_empty = true;

@@ -56,7 +56,7 @@ const Client = struct {
         seed = @splat(0);
 
         const kp = try mls.createKeyPackage(S, arena, .{
-            .signature_key_pair = sig,
+            .signature_key_pair = &sig,
             .init_key = init_pair.public_key,
             .encryption_key = enc_pair.public_key,
             .credential = .{ .basic = name },
@@ -85,7 +85,8 @@ const Client = struct {
 };
 
 fn report(name: []const u8, g: *const mls.Group(S)) void {
-    const auth = g.epochAuthenticator();
+    var auth: [S.Nh]u8 = undefined;
+    g.epochAuthenticator(&auth);
     std.debug.print("{s}: epoch {d}, {d} member(s), authenticator {x}\n", .{
         name,
         g.epoch,
@@ -117,14 +118,17 @@ pub fn main() !void {
     const carol = try Client.create(aa, io, "carol");
 
     // ── epoch 0: alice alone ────────────────────────────────────────────
-    var alice_group = try mls.Group(S).create(gpa, .{
+    // The group lands in caller-owned memory: it holds the epoch secrets,
+    // so the module never returns it by value.
+    var alice_group: mls.Group(S) = undefined;
+    try mls.Group(S).create(gpa, .{
         .io = io,
         // Uniqueness is scoped to the Delivery Service, so naming the group
         // is the application's job, not the protocol's.
         .group_id = "ops-room",
         .key_package_msg = alice.published,
-        .encryption_priv = alice.enc_priv,
-    });
+        .encryption_priv = &alice.enc_priv,
+    }, &alice_group);
     defer alice_group.deinit();
     report("alice", &alice_group);
 
@@ -134,7 +138,7 @@ pub fn main() !void {
     // can cache. The committer has already advanced when this returns.
     const add_bob = try alice_group.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .add = bob.key_package } }},
     });
     defer add_bob.deinit(gpa);
@@ -142,12 +146,13 @@ pub fn main() !void {
     // This Commit adds bob, so a Welcome for him must exist.
     const welcome_for_bob = add_bob.welcome orelse return error.NoWelcomeForAddedMember;
 
-    var bob_group = mls.Group(S).fromWelcome(gpa, .{
+    var bob_group: mls.Group(S) = undefined;
+    mls.Group(S).fromWelcome(gpa, .{
         .welcome_msg = welcome_for_bob,
         .key_package_msg = bob.published,
-        .init_priv = bob.init_priv,
-        .encryption_priv = bob.enc_priv,
-    }) catch |err| switch (err) {
+        .init_priv = &bob.init_priv,
+        .encryption_priv = &bob.enc_priv,
+    }, &bob_group) catch |err| switch (err) {
         // The Welcome was not addressed to this client's KeyPackage — an
         // ordinary outcome when a Delivery Service fans one Welcome out to
         // several clients and each tries its own slot. Here it is addressed
@@ -167,7 +172,7 @@ pub fn main() !void {
     // ── epoch 2: alice adds carol, bob follows the Commit ───────────────
     const add_carol = try alice_group.createCommit(gpa, .{
         .io = io,
-        .signature_key_pair = alice.sig,
+        .signature_key_pair = &alice.sig,
         .proposals = &.{.{ .by_value = .{ .add = carol.key_package } }},
     });
     defer add_carol.deinit(gpa);
@@ -210,8 +215,8 @@ pub fn main() !void {
     // needs — without touching the group's own key schedule.
     var alice_key: [32]u8 = undefined;
     var bob_key: [32]u8 = undefined;
-    try mls.mlsExporter(S, alice_group.secrets.exporter_secret, "example attachment key", "file-1", &alice_key);
-    try mls.mlsExporter(S, bob_group.secrets.exporter_secret, "example attachment key", "file-1", &bob_key);
+    try mls.mlsExporter(S, &alice_group.secrets.exporter_secret, "example attachment key", "file-1", &alice_key);
+    try mls.mlsExporter(S, &bob_group.secrets.exporter_secret, "example attachment key", "file-1", &bob_key);
     if (!std.mem.eql(u8, &alice_key, &bob_key)) return error.ExportedKeysDisagree;
     std.debug.print("exported keys agree\n", .{});
 }

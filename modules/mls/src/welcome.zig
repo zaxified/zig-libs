@@ -93,6 +93,7 @@
 
 const std = @import("std");
 const codec = @import("codec.zig");
+const burn = @import("burn.zig");
 const crypto = @import("crypto.zig");
 const suite = @import("suite.zig");
 const tree = @import("tree.zig");
@@ -341,7 +342,7 @@ pub const GroupInfo = struct {
         self: GroupInfo,
         comptime S: type,
         allocator: std.mem.Allocator,
-        key_pair: S.Sig.KeyPair,
+        key_pair: *const S.Sig.KeyPair,
     ) !S.Sig.Signature {
         const buf = try allocator.alloc(u8, self.tbsEncodedLen());
         defer allocator.free(buf);
@@ -572,11 +573,9 @@ pub const Welcome = struct {
 /// Note there is NO generation and NO reuse guard here, unlike §9.1/§6.3.1:
 /// a `welcome_secret` encrypts exactly one `GroupInfo`, so the nonce is
 /// used once by construction.
-pub fn welcomeKeyNonce(comptime S: type, welcome_secret: [S.Nh]u8) crypto.Error!secrettree.KeyNonce(S) {
-    var out: secrettree.KeyNonce(S) = undefined;
+pub fn welcomeKeyNonce(comptime S: type, welcome_secret: *const [S.Nh]u8, out: *secrettree.KeyNonce(S)) crypto.Error!void {
     try crypto.ExpandWithLabel(S, welcome_secret, label_nonce, "", &out.nonce);
     try crypto.ExpandWithLabel(S, welcome_secret, label_key, "", &out.key);
-    return out;
 }
 
 /// Seals an encoded `GroupInfo` under the welcome key/nonce, producing the
@@ -592,11 +591,21 @@ pub fn welcomeKeyNonce(comptime S: type, welcome_secret: [S.Nh]u8) crypto.Error!
 pub fn encryptGroupInfo(
     comptime S: type,
     allocator: std.mem.Allocator,
-    welcome_secret: [S.Nh]u8,
+    welcome_secret: *const [S.Nh]u8,
+    group_info: []const u8,
+) @TypeOf(encryptGroupInfoBody(S, allocator, welcome_secret, group_info)) {
+    return burn.run(burn.kdf_burn, @TypeOf(encryptGroupInfoBody(S, allocator, welcome_secret, group_info)), encryptGroupInfoBody, .{ S, allocator, welcome_secret, group_info });
+}
+
+fn encryptGroupInfoBody(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    welcome_secret: *const [S.Nh]u8,
     group_info: []const u8,
 ) ![]u8 {
-    var kn = try welcomeKeyNonce(S, welcome_secret);
+    var kn: secrettree.KeyNonce(S) = undefined;
     defer kn.wipe();
+    try welcomeKeyNonce(S, welcome_secret, &kn);
 
     const out = try allocator.alloc(u8, group_info.len + S.Aead.tag_length);
     errdefer allocator.free(out);
@@ -611,15 +620,25 @@ pub fn encryptGroupInfo(
 pub fn decryptGroupInfo(
     comptime S: type,
     allocator: std.mem.Allocator,
-    welcome_secret: [S.Nh]u8,
+    welcome_secret: *const [S.Nh]u8,
+    encrypted_group_info: []const u8,
+) @TypeOf(decryptGroupInfoBody(S, allocator, welcome_secret, encrypted_group_info)) {
+    return burn.run(burn.kdf_burn, @TypeOf(decryptGroupInfoBody(S, allocator, welcome_secret, encrypted_group_info)), decryptGroupInfoBody, .{ S, allocator, welcome_secret, encrypted_group_info });
+}
+
+fn decryptGroupInfoBody(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    welcome_secret: *const [S.Nh]u8,
     encrypted_group_info: []const u8,
 ) ![]u8 {
     const tag_len = S.Aead.tag_length;
     if (encrypted_group_info.len < tag_len) return error.CiphertextTooShort;
     const pt_len = encrypted_group_info.len - tag_len;
 
-    var kn = try welcomeKeyNonce(S, welcome_secret);
+    var kn: secrettree.KeyNonce(S) = undefined;
     defer kn.wipe();
+    try welcomeKeyNonce(S, welcome_secret, &kn);
 
     const pt = try allocator.alloc(u8, pt_len);
     errdefer allocator.free(pt);
@@ -686,7 +705,7 @@ pub fn encryptGroupSecrets(
 pub fn decryptGroupSecrets(
     comptime S: type,
     allocator: std.mem.Allocator,
-    init_key_pair: S.Kem.KeyPair,
+    init_key_pair: *const S.Kem.KeyPair,
     encrypted_group_info: []const u8,
     ct: treekem.HPKECiphertext,
 ) ![]u8 {
@@ -759,7 +778,7 @@ pub fn JoinParams(comptime S: type) type {
         /// `KeyPackage` — what identifies its slot in `welcome.secrets`.
         key_package_ref: []const u8,
         /// The private half of that `KeyPackage`'s `init_key`.
-        init_key_pair: S.Kem.KeyPair,
+        init_key_pair: *const S.Kem.KeyPair,
         /// The signature public key of the leaf named by
         /// `GroupInfo.signer`. Resolving it needs the ratchet tree; see
         /// `GroupInfo.verifySignature` for why that is the caller's step.
@@ -791,7 +810,14 @@ pub fn JoinParams(comptime S: type) type {
 /// leaf validation); finding the leaf whose `LeafNode` equals the caller's
 /// `KeyPackage`'s; installing private keys from `group_secrets.path_secret`;
 /// and §12.4.3.1's closing reinit/branch-resumption-PSK rules.
-pub fn join(comptime S: type, allocator: std.mem.Allocator, params: JoinParams(S)) !Joined(S) {
+///
+/// Writes the result into `out` (it holds the epoch's secrets, so it is never
+/// returned by value); on error `out` is undefined and owns nothing.
+pub fn join(comptime S: type, allocator: std.mem.Allocator, params: *const JoinParams(S), out: *Joined(S)) @TypeOf(joinBody(S, allocator, params, out)) {
+    return burn.run(burn.kem_burn, @TypeOf(joinBody(S, allocator, params, out)), joinBody, .{ S, allocator, params, out });
+}
+
+fn joinBody(comptime S: type, allocator: std.mem.Allocator, params: *const JoinParams(S), out: *Joined(S)) !void {
     if (params.welcome.cipher_suite != S.id) return error.CipherSuiteMismatch;
 
     const slot = params.welcome.findSecret(params.key_package_ref) orelse return error.NoMatchingKeyPackage;
@@ -812,13 +838,16 @@ pub fn join(comptime S: type, allocator: std.mem.Allocator, params: JoinParams(S
     if (group_secrets.joiner_secret.len != S.Nh) return error.WrongSecretLength;
 
     try checkPskList(S, allocator, group_secrets.psks, params.psks);
-    const psk_secret = try keyschedule.pskSecret(S, allocator, params.psks);
+    var psk_secret: [S.Nh]u8 = undefined;
+    defer std.crypto.secureZero(u8, &psk_secret);
+    try keyschedule.pskSecret(S, allocator, params.psks, &psk_secret);
 
-    var joiner: [S.Nh]u8 = undefined;
-    @memcpy(&joiner, group_secrets.joiner_secret);
-    const welcome_secret = try keyschedule.welcomeSecret(S, joiner, psk_secret);
+    const joiner = group_secrets.joiner_secret[0..S.Nh];
+    var welcome_secret: [S.Nh]u8 = undefined;
+    defer std.crypto.secureZero(u8, &welcome_secret);
+    try keyschedule.welcomeSecret(S, joiner, &psk_secret, &welcome_secret);
 
-    const gi_bytes = try decryptGroupInfo(S, allocator, welcome_secret, params.welcome.encrypted_group_info);
+    const gi_bytes = try decryptGroupInfo(S, allocator, &welcome_secret, params.welcome.encrypted_group_info);
     errdefer allocator.free(gi_bytes);
 
     var gi_reader = codec.Reader.init(gi_bytes);
@@ -833,11 +862,12 @@ pub fn join(comptime S: type, allocator: std.mem.Allocator, params: JoinParams(S
     // `decode`. Using it rather than a re-encode is the point — see
     // `GroupInfo.raw`.
     const gc_bytes = group_info.raw.?.group_context;
-    const secrets = try keyschedule.deriveEpochFromJoiner(S, allocator, joiner, psk_secret, gc_bytes);
+    try keyschedule.deriveEpochFromJoiner(S, allocator, joiner, &psk_secret, gc_bytes, &out.secrets);
+    errdefer out.secrets.wipe();
 
     try keyschedule.verifyConfirmationTag(
         S,
-        secrets.confirmation_key,
+        &out.secrets.confirmation_key,
         group_info.group_context.confirmed_transcript_hash,
         group_info.confirmation_tag,
     );
@@ -848,14 +878,11 @@ pub fn join(comptime S: type, allocator: std.mem.Allocator, params: JoinParams(S
         group_info.confirmation_tag,
     );
 
-    return .{
-        .group_info_bytes = gi_bytes,
-        .group_secrets_bytes = gs_bytes,
-        .group_info = group_info,
-        .group_secrets = group_secrets,
-        .secrets = secrets,
-        .interim_transcript_hash = interim,
-    };
+    out.group_info_bytes = gi_bytes;
+    out.group_secrets_bytes = gs_bytes;
+    out.group_info = group_info;
+    out.group_secrets = group_secrets;
+    out.interim_transcript_hash = interim;
 }
 
 /// The `PreSharedKeyID` list in the `GroupSecrets` must be exactly the list
@@ -897,6 +924,13 @@ fn sampleGroupContext() keyschedule.GroupContext {
         .confirmed_transcript_hash = &[_]u8{0x22} ** 32,
         .extensions = &.{},
     };
+}
+
+/// Test-only by-value wrapper over the out-pointer `join`.
+fn tJoin(alloc: std.mem.Allocator, params: JoinParams(TestSuite)) !Joined(TestSuite) {
+    var out: Joined(TestSuite) = undefined;
+    try join(TestSuite, alloc, &params, &out);
+    return out;
 }
 
 test "GroupInfo: encodedLen matches what encode writes, and decode round-trips byte-exact" {
@@ -941,7 +975,7 @@ test "GroupInfo: sign then verify, and a flipped TBS byte is rejected" {
         .signer = 1,
         .signature = &.{},
     };
-    const sig = try gi.sign(TestSuite, testing.allocator, kp);
+    const sig = try gi.sign(TestSuite, testing.allocator, &kp);
     const sig_bytes = sig.toBytes();
     gi.signature = &sig_bytes;
     try gi.verifySignature(TestSuite, testing.allocator, kp.public_key);
@@ -1020,12 +1054,14 @@ test "Welcome: round-trips, and findSecret matches on the KeyPackageRef only" {
 
 test "welcomeKeyNonce: key and nonce are independent derivations of the same secret" {
     const ws: [TestSuite.Nh]u8 = @splat(0x5a);
-    const kn = try welcomeKeyNonce(TestSuite, ws);
+    var kn: secrettree.KeyNonce(TestSuite) = undefined;
+    try welcomeKeyNonce(TestSuite, &ws, &kn);
     // Different labels must give different bytes — a copy-paste of one
     // ExpandWithLabel call into the other would pass a round-trip test.
     try testing.expect(!std.mem.eql(u8, kn.key[0..@min(TestSuite.Nk, TestSuite.Nn)], kn.nonce[0..@min(TestSuite.Nk, TestSuite.Nn)]));
 
-    const again = try welcomeKeyNonce(TestSuite, ws);
+    var again: secrettree.KeyNonce(TestSuite) = undefined;
+    try welcomeKeyNonce(TestSuite, &ws, &again);
     try testing.expectEqualSlices(u8, &kn.key, &again.key);
     try testing.expectEqualSlices(u8, &kn.nonce, &again.nonce);
 }
@@ -1034,18 +1070,18 @@ test "encryptGroupInfo/decryptGroupInfo: round trip, and a wrong welcome_secret 
     const ws: [TestSuite.Nh]u8 = @splat(0x21);
     const pt = "an encoded GroupInfo would go here";
 
-    const ct = try encryptGroupInfo(TestSuite, testing.allocator, ws, pt);
+    const ct = try encryptGroupInfo(TestSuite, testing.allocator, &ws, pt);
     defer testing.allocator.free(ct);
     try testing.expectEqual(pt.len + TestSuite.Aead.tag_length, ct.len);
 
-    const back = try decryptGroupInfo(TestSuite, testing.allocator, ws, ct);
+    const back = try decryptGroupInfo(TestSuite, testing.allocator, &ws, ct);
     defer testing.allocator.free(back);
     try testing.expectEqualSlices(u8, pt, back);
 
     var wrong = ws;
     wrong[0] ^= 1;
-    try testing.expectError(error.DecryptionFailed, decryptGroupInfo(TestSuite, testing.allocator, wrong, ct));
-    try testing.expectError(error.CiphertextTooShort, decryptGroupInfo(TestSuite, testing.allocator, ws, ct[0..4]));
+    try testing.expectError(error.DecryptionFailed, decryptGroupInfo(TestSuite, testing.allocator, &wrong, ct));
+    try testing.expectError(error.CiphertextTooShort, decryptGroupInfo(TestSuite, testing.allocator, &ws, ct[0..4]));
 }
 
 test "encryptGroupSecrets/decryptGroupSecrets: round trip, and the encrypted_group_info context is binding" {
@@ -1066,7 +1102,7 @@ test "encryptGroupSecrets/decryptGroupSecrets: round trip, and the encrypted_gro
     defer testing.allocator.free(ct.kem_output);
     defer testing.allocator.free(ct.ciphertext);
 
-    const back = try decryptGroupSecrets(TestSuite, testing.allocator, kp, &egi, ct);
+    const back = try decryptGroupSecrets(TestSuite, testing.allocator, &kp, &egi, ct);
     defer testing.allocator.free(back);
     try testing.expectEqualSlices(u8, gs_bytes, back);
 
@@ -1074,7 +1110,7 @@ test "encryptGroupSecrets/decryptGroupSecrets: round trip, and the encrypted_gro
     // must make this ciphertext undecryptable, not merely unbound.
     var other = egi;
     other[0] ^= 1;
-    try testing.expectError(error.DecryptionFailed, decryptGroupSecrets(TestSuite, testing.allocator, kp, &other, ct));
+    try testing.expectError(error.DecryptionFailed, decryptGroupSecrets(TestSuite, testing.allocator, &kp, &other, ct));
 }
 
 test "join: end-to-end against a Welcome this file also produced" {
@@ -1095,13 +1131,15 @@ test "join: end-to-end against a Welcome this file also produced" {
 
     const joiner_secret = [_]u8{0x31} ** TestSuite.Nh;
     const psk_secret = keyschedule.zeroSecret(TestSuite);
-    const welcome_secret = try keyschedule.welcomeSecret(TestSuite, joiner_secret, psk_secret);
+    var welcome_secret: [TestSuite.Nh]u8 = undefined;
+    try keyschedule.welcomeSecret(TestSuite, &joiner_secret, &psk_secret, &welcome_secret);
 
     const gc = sampleGroupContext();
     const gc_bytes = try gc.encodeAlloc(alloc);
     defer alloc.free(gc_bytes);
-    const secrets = try keyschedule.deriveEpochFromJoiner(TestSuite, alloc, joiner_secret, psk_secret, gc_bytes);
-    const tag = keyschedule.confirmationTag(TestSuite, secrets.confirmation_key, gc.confirmed_transcript_hash);
+    var secrets: keyschedule.EpochSecrets(TestSuite) = undefined;
+    try keyschedule.deriveEpochFromJoiner(TestSuite, alloc, &joiner_secret, &psk_secret, gc_bytes, &secrets);
+    const tag = keyschedule.confirmationTag(TestSuite, &secrets.confirmation_key, gc.confirmed_transcript_hash);
 
     var gi: GroupInfo = .{
         .group_context = gc,
@@ -1109,13 +1147,13 @@ test "join: end-to-end against a Welcome this file also produced" {
         .signer = 0,
         .signature = &.{},
     };
-    const sig = try gi.sign(TestSuite, alloc, sig_kp);
+    const sig = try gi.sign(TestSuite, alloc, &sig_kp);
     const sig_bytes = sig.toBytes();
     gi.signature = &sig_bytes;
 
     const gi_bytes = try gi.encodeAlloc(alloc);
     defer alloc.free(gi_bytes);
-    const egi = try encryptGroupInfo(TestSuite, alloc, welcome_secret, gi_bytes);
+    const egi = try encryptGroupInfo(TestSuite, alloc, &welcome_secret, gi_bytes);
     defer alloc.free(egi);
 
     const gs: GroupSecrets = .{ .joiner_secret = &joiner_secret };
@@ -1129,10 +1167,10 @@ test "join: end-to-end against a Welcome this file also produced" {
     const slots = [_]EncryptedGroupSecrets{.{ .new_member = &kp_ref, .encrypted_group_secrets = hpke_ct }};
     const w: Welcome = .{ .cipher_suite = TestSuite.id, .secrets = &slots, .encrypted_group_info = egi };
 
-    var joined = try join(TestSuite, alloc, .{
+    var joined = try tJoin(alloc, .{
         .welcome = w,
         .key_package_ref = &kp_ref,
-        .init_key_pair = init_kp,
+        .init_key_pair = &init_kp,
         .signer_key = sig_kp.public_key,
     });
     defer joined.deinit(alloc);
@@ -1143,10 +1181,10 @@ test "join: end-to-end against a Welcome this file also produced" {
     try testing.expect(joined.group_secrets.path_secret == null);
 
     // An unknown KeyPackageRef is a named refusal, not a decrypt attempt.
-    try testing.expectError(error.NoMatchingKeyPackage, join(TestSuite, alloc, .{
+    try testing.expectError(error.NoMatchingKeyPackage, tJoin(alloc, .{
         .welcome = w,
         .key_package_ref = &[_]u8{0x78} ** 32,
-        .init_key_pair = init_kp,
+        .init_key_pair = &init_kp,
         .signer_key = sig_kp.public_key,
     }));
 
@@ -1154,10 +1192,10 @@ test "join: end-to-end against a Welcome this file also produced" {
     // BEFORE any decryption is attempted.
     var wrong_suite = w;
     wrong_suite.cipher_suite = .mls_128_dhkemp256_aes128gcm_sha256_p256;
-    try testing.expectError(error.CipherSuiteMismatch, join(TestSuite, alloc, .{
+    try testing.expectError(error.CipherSuiteMismatch, tJoin(alloc, .{
         .welcome = wrong_suite,
         .key_package_ref = &kp_ref,
-        .init_key_pair = init_kp,
+        .init_key_pair = &init_kp,
         .signer_key = sig_kp.public_key,
     }));
 
@@ -1172,10 +1210,10 @@ test "join: end-to-end against a Welcome this file also produced" {
     defer alloc.free(hpke_ct2.kem_output);
     defer alloc.free(hpke_ct2.ciphertext);
     const slots2 = [_]EncryptedGroupSecrets{.{ .new_member = &kp_ref, .encrypted_group_secrets = hpke_ct2 }};
-    try testing.expectError(error.PskMismatch, join(TestSuite, alloc, .{
+    try testing.expectError(error.PskMismatch, tJoin(alloc, .{
         .welcome = .{ .cipher_suite = TestSuite.id, .secrets = &slots2, .encrypted_group_info = egi },
         .key_package_ref = &kp_ref,
-        .init_key_pair = init_kp,
+        .init_key_pair = &init_kp,
         .signer_key = sig_kp.public_key,
     }));
     // …nor by resolving a DIFFERENT PSK of the same count and encoded width:
@@ -1185,10 +1223,10 @@ test "join: end-to-end against a Welcome this file also produced" {
         .id = .{ .id = .{ .external = "some-PSK" }, .psk_nonce = &[_]u8{0x11} ** 32 },
         .secret = "k",
     }};
-    try testing.expectError(error.PskMismatch, join(TestSuite, alloc, .{
+    try testing.expectError(error.PskMismatch, tJoin(alloc, .{
         .welcome = .{ .cipher_suite = TestSuite.id, .secrets = &slots2, .encrypted_group_info = egi },
         .key_package_ref = &kp_ref,
-        .init_key_pair = init_kp,
+        .init_key_pair = &init_kp,
         .signer_key = sig_kp.public_key,
         .psks = &other_psk,
     }));
@@ -1211,18 +1249,20 @@ test "join: a confirmation_tag that does not match the derived confirmation_key 
     seed = @splat(0);
 
     const joiner_secret = [_]u8{0x31} ** TestSuite.Nh;
-    const welcome_secret = try keyschedule.welcomeSecret(TestSuite, joiner_secret, keyschedule.zeroSecret(TestSuite));
+    const zero_psk = keyschedule.zeroSecret(TestSuite);
+    var welcome_secret: [TestSuite.Nh]u8 = undefined;
+    try keyschedule.welcomeSecret(TestSuite, &joiner_secret, &zero_psk, &welcome_secret);
 
     const gc = sampleGroupContext();
     const bad_tag = [_]u8{0xee} ** TestSuite.Nm;
     var gi: GroupInfo = .{ .group_context = gc, .confirmation_tag = &bad_tag, .signer = 0, .signature = &.{} };
-    const sig = try gi.sign(TestSuite, alloc, sig_kp);
+    const sig = try gi.sign(TestSuite, alloc, &sig_kp);
     const sig_bytes = sig.toBytes();
     gi.signature = &sig_bytes;
 
     const gi_bytes = try gi.encodeAlloc(alloc);
     defer alloc.free(gi_bytes);
-    const egi = try encryptGroupInfo(TestSuite, alloc, welcome_secret, gi_bytes);
+    const egi = try encryptGroupInfo(TestSuite, alloc, &welcome_secret, gi_bytes);
     defer alloc.free(egi);
 
     const gs: GroupSecrets = .{ .joiner_secret = &joiner_secret };
@@ -1235,10 +1275,10 @@ test "join: a confirmation_tag that does not match the derived confirmation_key 
     const kp_ref = [_]u8{0x77} ** 32;
     const slots = [_]EncryptedGroupSecrets{.{ .new_member = &kp_ref, .encrypted_group_secrets = hpke_ct }};
 
-    try testing.expectError(error.MacMismatch, join(TestSuite, alloc, .{
+    try testing.expectError(error.MacMismatch, tJoin(alloc, .{
         .welcome = .{ .cipher_suite = TestSuite.id, .secrets = &slots, .encrypted_group_info = egi },
         .key_package_ref = &kp_ref,
-        .init_key_pair = init_kp,
+        .init_key_pair = &init_kp,
         .signer_key = sig_kp.public_key,
     }));
 }

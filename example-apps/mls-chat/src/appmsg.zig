@@ -94,24 +94,29 @@ pub const AppMessages = struct {
 
     pub fn init(gpa: std.mem.Allocator, group: *const mls.Group(S)) !AppMessages {
         const n_leaves = group.treeSize();
-        const base = try mls.secrettree.ratchetBaseSecret(
+        var base: [S.Nh]u8 = undefined;
+        defer std.crypto.secureZero(u8, &base);
+        try mls.secrettree.ratchetBaseSecret(
             S,
-            group.secrets.encryption_secret,
+            &group.secrets.encryption_secret,
             n_leaves,
             group.my_leaf_index,
             .application,
+            &base,
         );
         const recv = try gpa.alloc(?Window, n_leaves);
         @memset(recv, null);
-        return .{
+        var out: AppMessages = .{
             .gpa = gpa,
             .epoch = group.epoch,
             .n_leaves = n_leaves,
             .my_leaf = group.my_leaf_index,
             .sender_data_secret = group.secrets.sender_data_secret,
-            .send = mls.secrettree.Ratchet(S).init(base),
+            .send = undefined,
             .recv = recv,
         };
+        mls.secrettree.Ratchet(S).init(&base, &out.send);
+        return out;
     }
 
     /// Wipes every ratchet secret this epoch held. Called on re-key as well
@@ -148,7 +153,7 @@ pub const AppMessages = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         group: *const mls.Group(S),
-        signature_key_pair: S.Sig.KeyPair,
+        signature_key_pair: *const S.Sig.KeyPair,
         text: []const u8,
     ) ![]u8 {
         if (self.epoch != group.epoch) return Error.WrongEpoch;
@@ -161,8 +166,9 @@ pub const AppMessages = struct {
         var reuse_guard: [4]u8 = undefined;
         try io.randomSecure(&reuse_guard);
 
-        var key_nonce = try self.send.current();
+        var key_nonce: mls.secrettree.KeyNonce(S) = undefined;
         defer key_nonce.wipe();
+        try self.send.current(&key_nonce);
         const generation = self.send.generation;
 
         const bytes = try mls.protectPrivate(S, gpa, .{
@@ -175,10 +181,10 @@ pub const AppMessages = struct {
                 .authenticated_data = &.{},
                 .body = .{ .application = text },
             },
-            .key_nonce = key_nonce,
+            .key_nonce = &key_nonce,
             .generation = generation,
             .reuse_guard = reuse_guard,
-            .sender_data_secret = self.sender_data_secret,
+            .sender_data_secret = &self.sender_data_secret,
             // §6.3.1 leaves the amount to the application. A chat line's
             // length is a side channel worth blurring, and 64 bytes is cheap
             // next to the AEAD and signature this message already carries.
@@ -221,7 +227,7 @@ pub const AppMessages = struct {
         if (pm.epoch != self.epoch) return Error.WrongEpoch;
         if (pm.content_type != .application) return Error.NotAnApplicationMessage;
 
-        const sd = try mls.decryptSenderData(S, gpa, pm, self.sender_data_secret);
+        const sd = try mls.decryptSenderData(S, gpa, pm, &self.sender_data_secret);
         if (sd.leaf_index >= self.n_leaves) return Error.UnknownSender;
 
         const sender_key = try leafSignatureKey(group, sd.leaf_index);
@@ -229,19 +235,24 @@ pub const AppMessages = struct {
         // The window is per sender and created on first sight of that
         // sender, in this epoch only.
         if (self.recv[sd.leaf_index] == null) {
-            const base = try mls.secrettree.ratchetBaseSecret(
+            var base: [S.Nh]u8 = undefined;
+            defer std.crypto.secureZero(u8, &base);
+            try mls.secrettree.ratchetBaseSecret(
                 S,
-                group.secrets.encryption_secret,
+                &group.secrets.encryption_secret,
                 self.n_leaves,
                 sd.leaf_index,
                 .application,
+                &base,
             );
-            self.recv[sd.leaf_index] = Window.init(base);
+            self.recv[sd.leaf_index] = @as(Window, undefined);
+            Window.init(&base, &self.recv[sd.leaf_index].?);
         }
-        var key_nonce = try self.recv[sd.leaf_index].?.get(sd.generation);
+        var key_nonce: mls.secrettree.KeyNonce(S) = undefined;
         defer key_nonce.wipe();
+        try self.recv[sd.leaf_index].?.get(sd.generation, &key_nonce);
 
-        const plaintext = try mls.decryptContent(S, gpa, pm, key_nonce, sd.reuse_guard);
+        const plaintext = try mls.decryptContent(S, gpa, pm, &key_nonce, sd.reuse_guard);
         defer gpa.free(plaintext);
 
         const ac = try mls.parsePrivateContent(gpa, pm, plaintext, sd.leaf_index);

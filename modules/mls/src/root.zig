@@ -426,6 +426,7 @@ test {
     _ = @import("kat_welcome_test.zig");
     _ = @import("kat_passive_test.zig");
     _ = @import("kat_commit_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.deps is exactly {\"hpke\"}" {

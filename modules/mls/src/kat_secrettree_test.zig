@@ -93,7 +93,8 @@ test "secret-tree.json: RFC 9420 §9's tree, ratchets and §6.3.2 sender data fo
             const sd = entry.object.get("sender_data").?.object;
             const sds = try hexSecret(sd.get("sender_data_secret").?.string);
             const ciphertext = try hexDecode(arena, sd.get("ciphertext").?.string);
-            const got = try secrettree.senderDataKeys(S, sds, ciphertext);
+            var got: secrettree.SenderDataKeys(S) = undefined;
+            try secrettree.senderDataKeys(S, &sds, ciphertext, &got);
             try expectStage("sender_data_key", 0, 0, try hexDecode(arena, sd.get("key").?.string), &got.key);
             try expectStage("sender_data_nonce", 0, 0, try hexDecode(arena, sd.get("nonce").?.string), &got.nonce);
         }
@@ -115,17 +116,20 @@ test "secret-tree.json: RFC 9420 §9's tree, ratchets and §6.3.2 sender data fo
                 const key_field = spec[1];
                 const nonce_field = spec[2];
 
-                const base = try secrettree.ratchetBaseSecret(S, encryption_secret, n_leaves, leaf_index, kind);
+                var base: [S.Nh]u8 = undefined;
+                try secrettree.ratchetBaseSecret(S, &encryption_secret, n_leaves, leaf_index, kind, &base);
 
                 // Pass 1 — the sender's path: advance a bare ratchet
                 // forward through every generation the vector names.
                 {
-                    var ratchet = secrettree.Ratchet(S).init(base);
+                    var ratchet: secrettree.Ratchet(S) = undefined;
+                    secrettree.Ratchet(S).init(&base, &ratchet);
                     for (generations) |g_v| {
                         const g: u32 = @intCast(asI64(g_v.object.get("generation").?));
                         while (ratchet.generation < g) try ratchet.advance();
                         try testing.expectEqual(g, ratchet.generation);
-                        const kn = try ratchet.current();
+                        var kn: secrettree.KeyNonce(S) = undefined;
+                        try ratchet.current(&kn);
                         try expectStage(key_field, leaf_index, g, try hexDecode(arena, g_v.object.get(key_field).?.string), &kn.key);
                         try expectStage(nonce_field, leaf_index, g, try hexDecode(arena, g_v.object.get(nonce_field).?.string), &kn.nonce);
                         checked_generations += 1;
@@ -136,13 +140,15 @@ test "secret-tree.json: RFC 9420 §9's tree, ratchets and §6.3.2 sender data fo
                 // SAME generations newest-first, so every earlier one has
                 // to come back out of the retained window.
                 {
-                    var window = secrettree.Window(S, window_capacity).init(base);
+                    var window: secrettree.Window(S, window_capacity) = undefined;
+                    secrettree.Window(S, window_capacity).init(&base, &window);
                     var i = generations.len;
                     while (i > 0) {
                         i -= 1;
                         const g_v = generations[i];
                         const g: u32 = @intCast(asI64(g_v.object.get("generation").?));
-                        const kn = try window.get(g);
+                        var kn: secrettree.KeyNonce(S) = undefined;
+                        try window.get(g, &kn);
                         try expectStage(key_field, leaf_index, g, try hexDecode(arena, g_v.object.get(key_field).?.string), &kn.key);
                         try expectStage(nonce_field, leaf_index, g, try hexDecode(arena, g_v.object.get(nonce_field).?.string), &kn.nonce);
                     }

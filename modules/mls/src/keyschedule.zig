@@ -85,6 +85,7 @@ const hpke = @import("hpke");
 const codec = @import("codec.zig");
 const suite = @import("suite.zig");
 const crypto = @import("crypto.zig");
+const burn = @import("burn.zig");
 const tree = @import("tree.zig");
 const wire = @import("wire_lists.zig");
 
@@ -244,8 +245,13 @@ pub fn EpochSecrets(comptime S: type) type {
 /// from the left). Named and exposed separately from `joinerSecret` because
 /// this argument order is the single easiest thing in §8 to get backwards
 /// and the hardest to notice.
-pub fn extractInitCommit(comptime S: type, init_secret_prev: [S.Nh]u8, commit_secret: [S.Nh]u8) [S.Nh]u8 {
-    return S.Hkdf.extract(&init_secret_prev, &commit_secret);
+pub fn extractInitCommit(comptime S: type, init_secret_prev: *const [S.Nh]u8, commit_secret: *const [S.Nh]u8, out: *[S.Nh]u8) void {
+    burn.run(burn.kdf_burn, void, extractBody, .{ S, init_secret_prev, commit_secret, out });
+}
+
+/// `out = KDF.Extract(salt, ikm)`; `out` may alias either input.
+fn extractBody(comptime S: type, salt: *const [S.Nh]u8, ikm: *const [S.Nh]u8, out: *[S.Nh]u8) void {
+    out.* = S.Hkdf.extract(salt, ikm);
 }
 
 /// RFC 9420 §8 `joiner_secret = ExpandWithLabel(KDF.Extract(
@@ -257,14 +263,25 @@ pub fn extractInitCommit(comptime S: type, init_secret_prev: [S.Nh]u8, commit_se
 pub fn joinerSecret(
     comptime S: type,
     allocator: std.mem.Allocator,
-    init_secret_prev: [S.Nh]u8,
-    commit_secret: [S.Nh]u8,
+    init_secret_prev: *const [S.Nh]u8,
+    commit_secret: *const [S.Nh]u8,
     group_context: []const u8,
-) Error![S.Nh]u8 {
-    const pre_joiner = extractInitCommit(S, init_secret_prev, commit_secret);
-    var out: [S.Nh]u8 = undefined;
-    try expandWithContext(S, allocator, pre_joiner, label_joiner, group_context, &out);
-    return out;
+    out: *[S.Nh]u8,
+) Error!void {
+    return burn.run(burn.kdf_burn, Error!void, joinerBody, .{ S, allocator, init_secret_prev, commit_secret, group_context, out });
+}
+
+fn joinerBody(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    init_secret_prev: *const [S.Nh]u8,
+    commit_secret: *const [S.Nh]u8,
+    group_context: []const u8,
+    out: *[S.Nh]u8,
+) Error!void {
+    var pre_joiner: [S.Nh]u8 = undefined;
+    extractBody(S, init_secret_prev, commit_secret, &pre_joiner);
+    try expandWithContext(S, allocator, &pre_joiner, label_joiner, group_context, out);
 }
 
 /// Figure 22's SECOND Extract: salt = `joiner_secret` (from the top), IKM =
@@ -273,16 +290,22 @@ pub fn joinerSecret(
 /// derive, which is the structural detail worth naming — deriving
 /// `welcome_secret` from `epoch_secret` instead would type-check, run, and
 /// be wrong.
-pub fn memberSecret(comptime S: type, joiner_secret: [S.Nh]u8, psk_secret: [S.Nh]u8) [S.Nh]u8 {
-    return S.Hkdf.extract(&joiner_secret, &psk_secret);
+pub fn memberSecret(comptime S: type, joiner_secret: *const [S.Nh]u8, psk_secret: *const [S.Nh]u8, out: *[S.Nh]u8) void {
+    burn.run(burn.kdf_burn, void, extractBody, .{ S, joiner_secret, psk_secret, out });
 }
 
 /// RFC 9420 §8 `welcome_secret = DeriveSecret(member_secret, "welcome")`.
 /// Pass `psk_secret = zeroSecret(S)` when the Commit injects no PSKs (§8.4:
 /// "if there are no PreSharedKey proposals ... the resulting psk_secret is
 /// psk_secret_[0], the all-zero vector").
-pub fn welcomeSecret(comptime S: type, joiner_secret: [S.Nh]u8, psk_secret: [S.Nh]u8) Error![S.Nh]u8 {
-    return crypto.DeriveSecret(S, memberSecret(S, joiner_secret, psk_secret), label_welcome);
+pub fn welcomeSecret(comptime S: type, joiner_secret: *const [S.Nh]u8, psk_secret: *const [S.Nh]u8, out: *[S.Nh]u8) Error!void {
+    return burn.run(burn.kdf_burn, Error!void, welcomeBody, .{ S, joiner_secret, psk_secret, out });
+}
+
+fn welcomeBody(comptime S: type, joiner_secret: *const [S.Nh]u8, psk_secret: *const [S.Nh]u8, out: *[S.Nh]u8) Error!void {
+    var member: [S.Nh]u8 = undefined;
+    extractBody(S, joiner_secret, psk_secret, &member);
+    try crypto.DeriveSecret(S, &member, label_welcome, out);
 }
 
 /// RFC 9420 §8 `epoch_secret = ExpandWithLabel(member_secret, "epoch",
@@ -290,13 +313,25 @@ pub fn welcomeSecret(comptime S: type, joiner_secret: [S.Nh]u8, psk_secret: [S.N
 pub fn epochSecret(
     comptime S: type,
     allocator: std.mem.Allocator,
-    joiner_secret: [S.Nh]u8,
-    psk_secret: [S.Nh]u8,
+    joiner_secret: *const [S.Nh]u8,
+    psk_secret: *const [S.Nh]u8,
     group_context: []const u8,
-) Error![S.Nh]u8 {
-    var out: [S.Nh]u8 = undefined;
-    try expandWithContext(S, allocator, memberSecret(S, joiner_secret, psk_secret), label_epoch, group_context, &out);
-    return out;
+    out: *[S.Nh]u8,
+) Error!void {
+    return burn.run(burn.kdf_burn, Error!void, epochBody, .{ S, allocator, joiner_secret, psk_secret, group_context, out });
+}
+
+fn epochBody(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    joiner_secret: *const [S.Nh]u8,
+    psk_secret: *const [S.Nh]u8,
+    group_context: []const u8,
+    out: *[S.Nh]u8,
+) Error!void {
+    var member: [S.Nh]u8 = undefined;
+    extractBody(S, joiner_secret, psk_secret, &member);
+    try expandWithContext(S, allocator, &member, label_epoch, group_context, out);
 }
 
 /// The whole of RFC 9420 §8 Figure 22 in one call: previous epoch's
@@ -305,13 +340,27 @@ pub fn epochSecret(
 pub fn deriveEpoch(
     comptime S: type,
     allocator: std.mem.Allocator,
-    init_secret_prev: [S.Nh]u8,
-    commit_secret: [S.Nh]u8,
-    psk_secret: [S.Nh]u8,
+    init_secret_prev: *const [S.Nh]u8,
+    commit_secret: *const [S.Nh]u8,
+    psk_secret: *const [S.Nh]u8,
     group_context: []const u8,
-) Error!EpochSecrets(S) {
-    const joiner = try joinerSecret(S, allocator, init_secret_prev, commit_secret, group_context);
-    return deriveEpochFromJoiner(S, allocator, joiner, psk_secret, group_context);
+    out: *EpochSecrets(S),
+) Error!void {
+    return burn.run(burn.kdf_burn, Error!void, deriveEpochBody, .{ S, allocator, init_secret_prev, commit_secret, psk_secret, group_context, out });
+}
+
+fn deriveEpochBody(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    init_secret_prev: *const [S.Nh]u8,
+    commit_secret: *const [S.Nh]u8,
+    psk_secret: *const [S.Nh]u8,
+    group_context: []const u8,
+    out: *EpochSecrets(S),
+) Error!void {
+    var joiner: [S.Nh]u8 = undefined;
+    try joinerBody(S, allocator, init_secret_prev, commit_secret, group_context, &joiner);
+    return fromJoinerBody(S, allocator, &joiner, psk_secret, group_context, out);
 }
 
 /// Figure 22 entered ONE STEP LOWER — from `joiner_secret` rather than from
@@ -331,30 +380,39 @@ pub fn deriveEpoch(
 pub fn deriveEpochFromJoiner(
     comptime S: type,
     allocator: std.mem.Allocator,
-    joiner: [S.Nh]u8,
-    psk_secret: [S.Nh]u8,
+    joiner: *const [S.Nh]u8,
+    psk_secret: *const [S.Nh]u8,
     group_context: []const u8,
-) Error!EpochSecrets(S) {
-    const member = memberSecret(S, joiner, psk_secret);
+    out: *EpochSecrets(S),
+) Error!void {
+    return burn.run(burn.kdf_burn, Error!void, fromJoinerBody, .{ S, allocator, joiner, psk_secret, group_context, out });
+}
 
-    var out: [S.Nh]u8 = undefined;
-    try expandWithContext(S, allocator, member, label_epoch, group_context, &out);
-    const epoch = out;
-
-    return .{
-        .joiner_secret = joiner,
-        .welcome_secret = try crypto.DeriveSecret(S, member, label_welcome),
-        .epoch_secret = epoch,
-        .sender_data_secret = try crypto.DeriveSecret(S, epoch, label_sender_data),
-        .encryption_secret = try crypto.DeriveSecret(S, epoch, label_encryption),
-        .exporter_secret = try crypto.DeriveSecret(S, epoch, label_exporter),
-        .external_secret = try crypto.DeriveSecret(S, epoch, label_external),
-        .confirmation_key = try crypto.DeriveSecret(S, epoch, label_confirm),
-        .membership_key = try crypto.DeriveSecret(S, epoch, label_membership),
-        .resumption_psk = try crypto.DeriveSecret(S, epoch, label_resumption),
-        .epoch_authenticator = try crypto.DeriveSecret(S, epoch, label_authentication),
-        .init_secret = try crypto.DeriveSecret(S, epoch, label_init),
-    };
+/// `out` must not alias `joiner`/`psk_secret` other than through
+/// `out.joiner_secret` (copied first).
+fn fromJoinerBody(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    joiner: *const [S.Nh]u8,
+    psk_secret: *const [S.Nh]u8,
+    group_context: []const u8,
+    out: *EpochSecrets(S),
+) Error!void {
+    var member: [S.Nh]u8 = undefined;
+    extractBody(S, joiner, psk_secret, &member);
+    out.joiner_secret = joiner.*;
+    try expandWithContext(S, allocator, &member, label_epoch, group_context, &out.epoch_secret);
+    try crypto.DeriveSecret(S, &member, label_welcome, &out.welcome_secret);
+    const epoch = &out.epoch_secret;
+    try crypto.DeriveSecret(S, epoch, label_sender_data, &out.sender_data_secret);
+    try crypto.DeriveSecret(S, epoch, label_encryption, &out.encryption_secret);
+    try crypto.DeriveSecret(S, epoch, label_exporter, &out.exporter_secret);
+    try crypto.DeriveSecret(S, epoch, label_external, &out.external_secret);
+    try crypto.DeriveSecret(S, epoch, label_confirm, &out.confirmation_key);
+    try crypto.DeriveSecret(S, epoch, label_membership, &out.membership_key);
+    try crypto.DeriveSecret(S, epoch, label_resumption, &out.resumption_psk);
+    try crypto.DeriveSecret(S, epoch, label_authentication, &out.epoch_authenticator);
+    try crypto.DeriveSecret(S, epoch, label_init, &out.init_secret);
 }
 
 /// The all-zero `KDF.Nh`-byte string RFC 9420 §8 writes as `0` — the
@@ -369,7 +427,7 @@ pub fn zeroSecret(comptime S: type) [S.Nh]u8 {
 fn expandWithContext(
     comptime S: type,
     allocator: std.mem.Allocator,
-    secret: [S.Nh]u8,
+    secret: *const [S.Nh]u8,
     label: []const u8,
     context: []const u8,
     out: []u8,
@@ -385,11 +443,12 @@ fn expandWithContext(
 /// KEM.DeriveKeyPair(external_secret)`. The resulting public key is
 /// published in `GroupInfo` so a non-member can join by external Commit;
 /// the private key is held by the whole group.
-pub fn externalKeyPair(comptime S: type, external_secret: [S.Nh]u8) S.Kem.KeyPair {
-    // mls sweep (dead-stack, open): the pair is still returned by value.
-    var kp: S.Kem.KeyPair = undefined;
-    S.Kem.deriveKeyPair(&kp, &external_secret);
-    return kp;
+pub fn externalKeyPair(comptime S: type, external_secret: *const [S.Nh]u8, out: *S.Kem.KeyPair) void {
+    burn.run(burn.kem_burn, void, externalKeyPairBody, .{ S, external_secret, out });
+}
+
+fn externalKeyPairBody(comptime S: type, external_secret: *const [S.Nh]u8, out: *S.Kem.KeyPair) void {
+    S.Kem.deriveKeyPair(out, external_secret);
 }
 
 // ── §8.3: external initialization ─────────────────────────────────────────
@@ -468,13 +527,17 @@ pub fn externalInitSender(
     comptime S: type,
     external_pub: S.Kem.PublicKey,
     io: std.Io,
-) !ExternalInit(S) {
+    out: *ExternalInit(S),
+) @TypeOf(externalInitSenderBody(S, external_pub, io, out)) {
+    return burn.run(burn.kem_burn, @TypeOf(externalInitSenderBody(S, external_pub, io, out)), externalInitSenderBody, .{ S, external_pub, io, out });
+}
+
+fn externalInitSenderBody(comptime S: type, external_pub: S.Kem.PublicKey, io: std.Io, out: *ExternalInit(S)) !void {
     var setup: hpke.Setup(S.Kem, S.Aead, S.Nh) = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&setup.context));
     try hpke.setupBaseS(S.Kem, S.Aead, S.Nh, &setup, external_pub, io, "");
-    var init_secret: [S.Nh]u8 = undefined;
-    try setup.context.exportSecret(&hpkeSuiteId(S), label_external_init, &init_secret);
-    return .{ .kem_output = setup.enc, .init_secret = init_secret };
+    try setup.context.exportSecret(&hpkeSuiteId(S), label_external_init, &out.init_secret);
+    out.kem_output = setup.enc;
 }
 
 /// `externalInitSender` with the ephemeral KEM keypair injected rather than
@@ -484,14 +547,18 @@ pub fn externalInitSender(
 pub fn externalInitSenderDeterministic(
     comptime S: type,
     external_pub: S.Kem.PublicKey,
-    ephemeral: S.Kem.KeyPair,
-) !ExternalInit(S) {
+    ephemeral: *const S.Kem.KeyPair,
+    out: *ExternalInit(S),
+) @TypeOf(externalInitSenderDetBody(S, external_pub, ephemeral, out)) {
+    return burn.run(burn.kem_burn, @TypeOf(externalInitSenderDetBody(S, external_pub, ephemeral, out)), externalInitSenderDetBody, .{ S, external_pub, ephemeral, out });
+}
+
+fn externalInitSenderDetBody(comptime S: type, external_pub: S.Kem.PublicKey, ephemeral: *const S.Kem.KeyPair, out: *ExternalInit(S)) !void {
     var setup: hpke.Setup(S.Kem, S.Aead, S.Nh) = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&setup.context));
-    try hpke.schedule.setupBaseSDeterministic(S.Kem, S.Aead, S.Nh, &setup, external_pub, &ephemeral, "");
-    var init_secret: [S.Nh]u8 = undefined;
-    try setup.context.exportSecret(&hpkeSuiteId(S), label_external_init, &init_secret);
-    return .{ .kem_output = setup.enc, .init_secret = init_secret };
+    try hpke.schedule.setupBaseSDeterministic(S.Kem, S.Aead, S.Nh, &setup, external_pub, ephemeral, "");
+    try setup.context.exportSecret(&hpkeSuiteId(S), label_external_init, &out.init_secret);
+    out.kem_output = setup.enc;
 }
 
 /// RFC 9420 §8.3, the EXISTING MEMBERS' half — what every member runs on
@@ -513,14 +580,17 @@ pub fn externalInitSenderDeterministic(
 pub fn externalInitReceiver(
     comptime S: type,
     kem_output: S.Kem.EncappedKey,
-    external_key_pair: S.Kem.KeyPair,
-) ![S.Nh]u8 {
+    external_key_pair: *const S.Kem.KeyPair,
+    out: *[S.Nh]u8,
+) @TypeOf(externalInitReceiverBody(S, kem_output, external_key_pair, out)) {
+    return burn.run(burn.kem_burn, @TypeOf(externalInitReceiverBody(S, kem_output, external_key_pair, out)), externalInitReceiverBody, .{ S, kem_output, external_key_pair, out });
+}
+
+fn externalInitReceiverBody(comptime S: type, kem_output: S.Kem.EncappedKey, external_key_pair: *const S.Kem.KeyPair, out: *[S.Nh]u8) !void {
     var context: hpke.Context(S.Aead, S.Nh) = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&context));
-    try hpke.setupBaseR(S.Kem, S.Aead, S.Nh, &context, kem_output, &external_key_pair, "");
-    var init_secret: [S.Nh]u8 = undefined;
-    try context.exportSecret(&hpkeSuiteId(S), label_external_init, &init_secret);
-    return init_secret;
+    try hpke.setupBaseR(S.Kem, S.Aead, S.Nh, &context, kem_output, external_key_pair, "");
+    try context.exportSecret(&hpkeSuiteId(S), label_external_init, out);
 }
 
 // ── §8.5: MLS-Exporter ────────────────────────────────────────────────────
@@ -537,14 +607,19 @@ pub fn externalInitReceiver(
 /// surfaces as `error.LabelTooLong` rather than a truncated derivation.
 pub fn mlsExporter(
     comptime S: type,
-    exporter_secret: [S.Nh]u8,
+    exporter_secret: *const [S.Nh]u8,
     label: []const u8,
     context: []const u8,
     out: []u8,
 ) crypto.Error!void {
-    const derived = try crypto.DeriveSecret(S, exporter_secret, label);
+    return burn.run(burn.kdf_burn, crypto.Error!void, exporterBody, .{ S, exporter_secret, label, context, out });
+}
+
+fn exporterBody(comptime S: type, exporter_secret: *const [S.Nh]u8, label: []const u8, context: []const u8, out: []u8) crypto.Error!void {
+    var derived: [S.Nh]u8 = undefined;
+    try crypto.DeriveSecret(S, exporter_secret, label, &derived);
     const context_hash = S.hash(context);
-    try crypto.ExpandWithLabel(S, derived, "exported", &context_hash, out);
+    try crypto.ExpandWithLabel(S, &derived, "exported", &context_hash, out);
 }
 
 // ── §6.1: confirmation_tag / membership_tag ───────────────────────────────
@@ -554,12 +629,17 @@ pub fn mlsExporter(
 /// suite's hash (§17.1's text under Table 7) — see `suite.CipherSuite.Mac`.
 pub fn confirmationTag(
     comptime S: type,
-    confirmation_key: [S.Nh]u8,
+    confirmation_key: *const [S.Nh]u8,
     confirmed_transcript_hash: []const u8,
 ) [S.Nm]u8 {
     var out: [S.Nm]u8 = undefined;
-    S.Mac.create(&out, confirmed_transcript_hash, &confirmation_key);
+    burn.run(burn.kdf_burn, void, macBody, .{ S, confirmation_key, confirmed_transcript_hash, &out });
     return out;
+}
+
+/// `out = MAC(key, msg)` — the tag is public, the key's HMAC pads are not.
+fn macBody(comptime S: type, key: *const [S.Nh]u8, msg: []const u8, out: *[S.Nm]u8) void {
+    S.Mac.create(out, msg, key);
 }
 
 /// Recomputes and CONSTANT-TIME compares a received `confirmation_tag`.
@@ -567,7 +647,7 @@ pub fn confirmationTag(
 /// `std.mem.eql` — a `confirmation_tag` is attacker-supplied.
 pub fn verifyConfirmationTag(
     comptime S: type,
-    confirmation_key: [S.Nh]u8,
+    confirmation_key: *const [S.Nh]u8,
     confirmed_transcript_hash: []const u8,
     tag: []const u8,
 ) Error!void {
@@ -584,11 +664,11 @@ pub fn verifyConfirmationTag(
 /// struct this Part cannot build.
 pub fn membershipTag(
     comptime S: type,
-    membership_key: [S.Nh]u8,
+    membership_key: *const [S.Nh]u8,
     authenticated_content_tbm: []const u8,
 ) [S.Nm]u8 {
     var out: [S.Nm]u8 = undefined;
-    S.Mac.create(&out, authenticated_content_tbm, &membership_key);
+    burn.run(burn.kdf_burn, void, macBody, .{ S, membership_key, authenticated_content_tbm, &out });
     return out;
 }
 
@@ -596,7 +676,7 @@ pub fn membershipTag(
 /// `verifyConfirmationTag`.
 pub fn verifyMembershipTag(
     comptime S: type,
-    membership_key: [S.Nh]u8,
+    membership_key: *const [S.Nh]u8,
     authenticated_content_tbm: []const u8,
     tag: []const u8,
 ) Error!void {
@@ -753,9 +833,14 @@ pub const PskLabel = struct {
 /// but simply `psk_secret_[0]` (§8.4: "if there are no PreSharedKey
 /// proposals in a given Commit, then the resulting psk_secret is
 /// psk_secret_[0], the all-zero vector").
-pub fn pskSecret(comptime S: type, allocator: std.mem.Allocator, psks: []const PreSharedKey(S)) Error![S.Nh]u8 {
+pub fn pskSecret(comptime S: type, allocator: std.mem.Allocator, psks: []const PreSharedKey(S), out: *[S.Nh]u8) Error!void {
+    return burn.run(burn.kdf_burn, Error!void, pskSecretBody, .{ S, allocator, psks, out });
+}
+
+fn pskSecretBody(comptime S: type, allocator: std.mem.Allocator, psks: []const PreSharedKey(S), out: *[S.Nh]u8) Error!void {
     const count = std.math.cast(u16, psks.len) orelse return error.TooManyPsks;
-    var acc = zeroSecret(S);
+    const acc = out;
+    acc.* = zeroSecret(S);
     const zero = zeroSecret(S);
 
     for (psks, 0..) |psk, i| {
@@ -769,12 +854,11 @@ pub fn pskSecret(comptime S: type, allocator: std.mem.Allocator, psks: []const P
         const encoded_label = w.finish();
 
         var psk_input: [S.Nh]u8 = undefined;
-        try expandWithContext(S, allocator, extracted, "derived psk", encoded_label, &psk_input);
+        try expandWithContext(S, allocator, &extracted, "derived psk", encoded_label, &psk_input);
 
-        acc = S.Hkdf.extract(&psk_input, &acc);
+        acc.* = S.Hkdf.extract(&psk_input, acc);
         std.crypto.secureZero(u8, &psk_input);
     }
-    return acc;
 }
 
 // ── tests ─────────────────────────────────────────────────────────────
@@ -833,14 +917,15 @@ test "GroupContext: a multi-kilobyte extension list still derives (the fixed 512
     try testing.expect(enc.len > 3000);
 
     // The point of the allocator on `joinerSecret`: this succeeds.
-    const js = try joinerSecret(TestSuite, testing.allocator, zeroSecret(TestSuite), zeroSecret(TestSuite), enc);
+    const zero = zeroSecret(TestSuite);
+    var js: [TestSuite.Nh]u8 = undefined;
+    try joinerSecret(TestSuite, testing.allocator, &zero, &zero, enc, &js);
     // ...where the fixed-scratch entry point would not.
     var direct: [TestSuite.Nh]u8 = undefined;
     try testing.expectError(
         error.LabelTooLong,
-        crypto.ExpandWithLabel(TestSuite, zeroSecret(TestSuite), label_joiner, enc, &direct),
+        crypto.ExpandWithLabel(TestSuite, &zero, label_joiner, enc, &direct),
     );
-    const zero = zeroSecret(TestSuite);
     try testing.expect(!std.mem.eql(u8, &js, &zero));
 }
 
@@ -859,15 +944,20 @@ test "deriveEpoch: matches the step-by-step derivation, and every secret is dist
     const enc = try gc.encodeAlloc(testing.allocator);
     defer testing.allocator.free(enc);
 
-    var got = try deriveEpoch(TestSuite, testing.allocator, init_prev, commit, psk, enc);
+    var got: EpochSecrets(TestSuite) = undefined;
+    try deriveEpoch(TestSuite, testing.allocator, &init_prev, &commit, &psk, enc, &got);
 
-    const joiner = try joinerSecret(TestSuite, testing.allocator, init_prev, commit, enc);
+    var joiner: [TestSuite.Nh]u8 = undefined;
+    try joinerSecret(TestSuite, testing.allocator, &init_prev, &commit, enc, &joiner);
     try testing.expectEqualSlices(u8, &joiner, &got.joiner_secret);
-    const welcome = try welcomeSecret(TestSuite, joiner, psk);
+    var welcome: [TestSuite.Nh]u8 = undefined;
+    try welcomeSecret(TestSuite, &joiner, &psk, &welcome);
     try testing.expectEqualSlices(u8, &welcome, &got.welcome_secret);
-    const epoch = try epochSecret(TestSuite, testing.allocator, joiner, psk, enc);
+    var epoch: [TestSuite.Nh]u8 = undefined;
+    try epochSecret(TestSuite, testing.allocator, &joiner, &psk, enc, &epoch);
     try testing.expectEqualSlices(u8, &epoch, &got.epoch_secret);
-    const next_init = try crypto.DeriveSecret(TestSuite, got.epoch_secret, label_init);
+    var next_init: [TestSuite.Nh]u8 = undefined;
+    try crypto.DeriveSecret(TestSuite, &got.epoch_secret, label_init, &next_init);
     try testing.expectEqualSlices(u8, &next_init, &got.init_secret);
 
     // Distinct labels must give distinct secrets — catches a copy-paste of
@@ -892,16 +982,21 @@ test "extractInitCommit/memberSecret: salt and IKM are not interchangeable" {
     const b = [_]u8{0x22} ** TestSuite.Nh;
     // If these were equal, Figure 22's salt/IKM convention would be
     // unfalsifiable and the KAT could not catch an inverted Extract.
-    const ab = extractInitCommit(TestSuite, a, b);
-    const ba = extractInitCommit(TestSuite, b, a);
+    var ab: [TestSuite.Nh]u8 = undefined;
+    var ba: [TestSuite.Nh]u8 = undefined;
+    extractInitCommit(TestSuite, &a, &b, &ab);
+    extractInitCommit(TestSuite, &b, &a, &ba);
     try testing.expect(!std.mem.eql(u8, &ab, &ba));
-    const m_ab = memberSecret(TestSuite, a, b);
-    const m_ba = memberSecret(TestSuite, b, a);
+    var m_ab: [TestSuite.Nh]u8 = undefined;
+    var m_ba: [TestSuite.Nh]u8 = undefined;
+    memberSecret(TestSuite, &a, &b, &m_ab);
+    memberSecret(TestSuite, &b, &a, &m_ba);
     try testing.expect(!std.mem.eql(u8, &m_ab, &m_ba));
 }
 
 test "pskSecret: empty list is psk_secret_[0], and order/count/nonce all change the result" {
-    const empty = try pskSecret(TestSuite, testing.allocator, &.{});
+    var empty: [TestSuite.Nh]u8 = undefined;
+    try pskSecret(TestSuite, testing.allocator, &.{}, &empty);
     const zero = zeroSecret(TestSuite);
     try testing.expectEqualSlices(u8, &zero, &empty);
 
@@ -916,19 +1011,23 @@ test "pskSecret: empty list is psk_secret_[0], and order/count/nonce all change 
         .secret = &[_]u8{0x20} ** TestSuite.Nh,
     };
 
-    const forward = try pskSecret(TestSuite, testing.allocator, &.{ k0, k1 });
-    const reversed = try pskSecret(TestSuite, testing.allocator, &.{ k1, k0 });
+    var forward: [TestSuite.Nh]u8 = undefined;
+    var reversed: [TestSuite.Nh]u8 = undefined;
+    try pskSecret(TestSuite, testing.allocator, &.{ k0, k1 }, &forward);
+    try pskSecret(TestSuite, testing.allocator, &.{ k1, k0 }, &reversed);
     // PSKLabel.index binds each PSK to its position (§8.4).
     try testing.expect(!std.mem.eql(u8, &forward, &reversed));
 
     // PSKLabel.count binds the whole list length.
-    const alone = try pskSecret(TestSuite, testing.allocator, &.{k0});
+    var alone: [TestSuite.Nh]u8 = undefined;
+    try pskSecret(TestSuite, testing.allocator, &.{k0}, &alone);
     try testing.expect(!std.mem.eql(u8, &alone, &forward));
 
     // A fresh psk_nonce changes the input even for an identical PSK.
     var k0_renonced = k0;
     k0_renonced.id.psk_nonce = &nonce_b;
-    const renonced = try pskSecret(TestSuite, testing.allocator, &.{k0_renonced});
+    var renonced: [TestSuite.Nh]u8 = undefined;
+    try pskSecret(TestSuite, testing.allocator, &.{k0_renonced}, &renonced);
     try testing.expect(!std.mem.eql(u8, &alone, &renonced));
 }
 
@@ -964,22 +1063,23 @@ test "confirmation/membership tags: verify accepts, one flipped bit and a short 
     const key = [_]u8{0x5c} ** TestSuite.Nh;
     const cth = [_]u8{0x99} ** 32;
 
-    var tag = confirmationTag(TestSuite, key, &cth);
-    try verifyConfirmationTag(TestSuite, key, &cth, &tag);
+    var tag = confirmationTag(TestSuite, &key, &cth);
+    try verifyConfirmationTag(TestSuite, &key, &cth, &tag);
     tag[0] ^= 0x01;
-    try testing.expectError(error.MacMismatch, verifyConfirmationTag(TestSuite, key, &cth, &tag));
+    try testing.expectError(error.MacMismatch, verifyConfirmationTag(TestSuite, &key, &cth, &tag));
     tag[0] ^= 0x01;
-    try testing.expectError(error.MacMismatch, verifyConfirmationTag(TestSuite, key, &cth, tag[0 .. TestSuite.Nm - 1]));
+    try testing.expectError(error.MacMismatch, verifyConfirmationTag(TestSuite, &key, &cth, tag[0 .. TestSuite.Nm - 1]));
 
     // The two MACs use different keys from Table 4, so an
     // AuthenticatedContentTBM tag never collides with a transcript tag.
-    const other_key = try crypto.DeriveSecret(TestSuite, key, label_membership);
-    const mtag = membershipTag(TestSuite, key, &cth);
-    try verifyMembershipTag(TestSuite, key, &cth, &mtag);
+    var other_key: [TestSuite.Nh]u8 = undefined;
+    try crypto.DeriveSecret(TestSuite, &key, label_membership, &other_key);
+    const mtag = membershipTag(TestSuite, &key, &cth);
+    try verifyMembershipTag(TestSuite, &key, &cth, &mtag);
     try testing.expectEqualSlices(u8, &tag, &mtag); // same key+data => same MAC, by construction
     try testing.expectError(
         error.MacMismatch,
-        verifyMembershipTag(TestSuite, other_key, &cth, &mtag),
+        verifyMembershipTag(TestSuite, &other_key, &cth, &mtag),
     );
 }
 
@@ -987,23 +1087,26 @@ test "mlsExporter: label and context are both bound, and the length is honoured"
     const es = [_]u8{0x6e} ** TestSuite.Nh;
     var out_a: [48]u8 = undefined;
     var out_b: [48]u8 = undefined;
-    try mlsExporter(TestSuite, es, "label", "context", &out_a);
-    try mlsExporter(TestSuite, es, "label", "different context", &out_b);
+    try mlsExporter(TestSuite, &es, "label", "context", &out_a);
+    try mlsExporter(TestSuite, &es, "label", "different context", &out_b);
     try testing.expect(!std.mem.eql(u8, &out_a, &out_b));
-    try mlsExporter(TestSuite, es, "other label", "context", &out_b);
+    try mlsExporter(TestSuite, &es, "other label", "context", &out_b);
     try testing.expect(!std.mem.eql(u8, &out_a, &out_b));
 
     var short: [16]u8 = undefined;
-    try mlsExporter(TestSuite, es, "label", "context", &short);
+    try mlsExporter(TestSuite, &es, "label", "context", &short);
     try testing.expect(!std.mem.eql(u8, short[0..16], out_a[0..16])); // Length is in the KDFLabel
 }
 
 test "externalKeyPair: deterministic in external_secret, and a distinct secret gives a distinct key" {
     const a = [_]u8{0x31} ** TestSuite.Nh;
     const b = [_]u8{0x32} ** TestSuite.Nh;
-    const ka1 = externalKeyPair(TestSuite, a);
-    const ka2 = externalKeyPair(TestSuite, a);
-    const kb = externalKeyPair(TestSuite, b);
+    var ka1: TestSuite.Kem.KeyPair = undefined;
+    var ka2: TestSuite.Kem.KeyPair = undefined;
+    var kb: TestSuite.Kem.KeyPair = undefined;
+    externalKeyPair(TestSuite, &a, &ka1);
+    externalKeyPair(TestSuite, &a, &ka2);
+    externalKeyPair(TestSuite, &b, &kb);
     try testing.expectEqualSlices(u8, &ka1.public_key, &ka2.public_key);
     try testing.expect(!std.mem.eql(u8, &ka1.public_key, &kb.public_key));
 }
@@ -1033,25 +1136,32 @@ test "§8.3: hpkeSuiteId reproduces RFC 9180 §7.2.1's suite_id for suite 0x0001
 
 test "§8.3: sender and receiver derive the same init_secret, and it is bound to both inputs" {
     const external_secret = [_]u8{0x5a} ** TestSuite.Nh;
-    const group_key = externalKeyPair(TestSuite, external_secret);
+    var group_key: TestSuite.Kem.KeyPair = undefined;
+    externalKeyPair(TestSuite, &external_secret, &group_key);
 
     var eph_seed: [32]u8 = @splat(0x77);
     const eph = try TestSuite.Kem.KeyPair.generateDeterministic(eph_seed);
     eph_seed = @splat(0);
 
-    const sent = try externalInitSenderDeterministic(TestSuite, group_key.public_key, eph);
-    const received = try externalInitReceiver(TestSuite, sent.kem_output, group_key);
+    var sent: ExternalInit(TestSuite) = undefined;
+    try externalInitSenderDeterministic(TestSuite, group_key.public_key, &eph, &sent);
+    var received: [TestSuite.Nh]u8 = undefined;
+    try externalInitReceiver(TestSuite, sent.kem_output, &group_key, &received);
     try testing.expectEqualSlices(u8, &sent.init_secret, &received);
 
     // An `init_secret` that ignored the group's external key would let any
     // non-member drive the group into an epoch of their choosing.
-    const other_group = externalKeyPair(TestSuite, [_]u8{0x5b} ** TestSuite.Nh);
-    const other_sent = try externalInitSenderDeterministic(TestSuite, other_group.public_key, eph);
+    const other_secret = [_]u8{0x5b} ** TestSuite.Nh;
+    var other_group: TestSuite.Kem.KeyPair = undefined;
+    externalKeyPair(TestSuite, &other_secret, &other_group);
+    var other_sent: ExternalInit(TestSuite) = undefined;
+    try externalInitSenderDeterministic(TestSuite, other_group.public_key, &eph, &other_sent);
     try testing.expect(!std.mem.eql(u8, &sent.init_secret, &other_sent.init_secret));
 
     // …and a receiver handed a kem_output from that other exchange must not
     // land on this one's secret either.
-    const cross = try externalInitReceiver(TestSuite, other_sent.kem_output, other_group);
+    var cross: [TestSuite.Nh]u8 = undefined;
+    try externalInitReceiver(TestSuite, other_sent.kem_output, &other_group, &cross);
     try testing.expect(!std.mem.eql(u8, &sent.init_secret, &cross));
 
     // Decapsulating with the wrong private key yields a DIFFERENT secret
@@ -1059,6 +1169,7 @@ test "§8.3: sender and receiver derive the same init_secret, and it is bound to
     // point, so §8.3 has no built-in authentication of the group — what
     // makes an external Commit safe is the confirmation_tag check the
     // committer's own key schedule ends with, not this exchange.
-    const wrong = try externalInitReceiver(TestSuite, sent.kem_output, other_group);
+    var wrong: [TestSuite.Nh]u8 = undefined;
+    try externalInitReceiver(TestSuite, sent.kem_output, &other_group, &wrong);
     try testing.expect(!std.mem.eql(u8, &sent.init_secret, &wrong));
 }

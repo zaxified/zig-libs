@@ -164,7 +164,7 @@ pub const KeyPackage = struct {
     /// caller stores the returned bytes and sets `signature` to them —
     /// this function does not mutate `self`, because `signature` aliases
     /// caller memory and this file owns no allocation policy for it.
-    pub fn sign(self: KeyPackage, comptime S: type, allocator: std.mem.Allocator, key_pair: S.Sig.KeyPair) !S.Sig.Signature {
+    pub fn sign(self: KeyPackage, comptime S: type, allocator: std.mem.Allocator, key_pair: *const S.Sig.KeyPair) !S.Sig.Signature {
         const buf = try allocator.alloc(u8, self.tbsEncodedLen());
         defer allocator.free(buf);
         var w = codec.Writer.init(buf);
@@ -184,7 +184,7 @@ pub fn CreateParams(comptime S: type) type {
     return struct {
         /// Signs the `KeyPackageTBS` and the `LeafNodeTBS` inside it — RFC
         /// 9420 §10 uses ONE key for both, `leaf_node.signature_key`.
-        signature_key_pair: S.Sig.KeyPair,
+        signature_key_pair: *const S.Sig.KeyPair,
         /// §10: the key a `Welcome` is encrypted to. MUST differ from
         /// `encryption_key` (§10 keeps them distinct so joining and the
         /// ratchet tree never share a key).
@@ -309,7 +309,7 @@ test "KeyPackage: sign then verify, and a flipped TBS byte is rejected" {
         .leaf_node = leaf,
         .signature = &.{},
     };
-    const sig = try kp.sign(TestSuite, testing.allocator, kpair);
+    const sig = try kp.sign(TestSuite, testing.allocator, &kpair);
     const sig_bytes = sig.toBytes();
     kp.signature = &sig_bytes;
     try kp.verifySignature(TestSuite, testing.allocator);

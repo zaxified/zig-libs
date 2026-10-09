@@ -93,6 +93,13 @@ const Entry = struct {
     signer_pub: S.Sig.PublicKey,
 };
 
+/// Test-only by-value wrapper over the out-pointer `welcome.join`.
+fn tJoin(alloc: std.mem.Allocator, params: welcome.JoinParams(S)) !welcome.Joined(S) {
+    var out: welcome.Joined(S) = undefined;
+    try welcome.join(S, alloc, &params, &out);
+    return out;
+}
+
 fn loadEntry(arena: std.mem.Allocator, obj: std.json.ObjectMap) !Entry {
     var init_priv: [S.Kem.Nsk]u8 = undefined;
     const decoded = try std.fmt.hexToBytes(&init_priv, obj.get("init_priv").?.string);
@@ -187,7 +194,7 @@ test "welcome.json: RFC 9420 §12.4.3.1's whole joining path for suite 0x0001, b
 
         // Step 2: HPKE-open the GroupSecrets, with the whole
         // `encrypted_group_info` as the EncryptWithLabel context.
-        const gs_bytes = welcome.decryptGroupSecrets(S, alloc, e.init_key_pair, w.encrypted_group_info, slot.encrypted_group_secrets) catch |err| {
+        const gs_bytes = welcome.decryptGroupSecrets(S, alloc, &e.init_key_pair, w.encrypted_group_info, slot.encrypted_group_secrets) catch |err| {
             std.debug.print("welcome KAT: 'GroupSecrets HPKE open (§12.4.3.1)' failed: {s}\n", .{@errorName(err)});
             return err;
         };
@@ -210,9 +217,11 @@ test "welcome.json: RFC 9420 §12.4.3.1's whole joining path for suite 0x0001, b
         var joiner: [S.Nh]u8 = undefined;
         @memcpy(&joiner, gs.joiner_secret);
         try testing.expectEqual(@as(usize, 0), gs.psks.len);
-        const welcome_secret = try keyschedule.welcomeSecret(S, joiner, keyschedule.zeroSecret(S));
+        const zero_psk = keyschedule.zeroSecret(S);
+        var welcome_secret: [S.Nh]u8 = undefined;
+        try keyschedule.welcomeSecret(S, &joiner, &zero_psk, &welcome_secret);
 
-        const gi_bytes = welcome.decryptGroupInfo(S, alloc, welcome_secret, w.encrypted_group_info) catch |err| {
+        const gi_bytes = welcome.decryptGroupInfo(S, alloc, &welcome_secret, w.encrypted_group_info) catch |err| {
             std.debug.print("welcome KAT: 'GroupInfo AEAD (§12.4.3.1 welcome_key/nonce)' failed: {s}\n", .{@errorName(err)});
             return err;
         };
@@ -221,7 +230,7 @@ test "welcome.json: RFC 9420 §12.4.3.1's whole joining path for suite 0x0001, b
         // ── the SEND direction of this layer, byte-exact (see the module
         // doc comment) ──
         {
-            const resealed = try welcome.encryptGroupInfo(S, alloc, welcome_secret, gi_bytes);
+            const resealed = try welcome.encryptGroupInfo(S, alloc, &welcome_secret, gi_bytes);
             defer alloc.free(resealed);
             try expectStage("encryptGroupInfo -> encrypted_group_info", w.encrypted_group_info, resealed);
         }
@@ -242,21 +251,22 @@ test "welcome.json: RFC 9420 §12.4.3.1's whole joining path for suite 0x0001, b
 
         // Step 5: the epoch, entered at joiner_secret, and the
         // confirmation tag that is what makes taking it on trust sound.
-        const secrets = try keyschedule.deriveEpochFromJoiner(S, alloc, joiner, keyschedule.zeroSecret(S), gi.raw.?.group_context);
+        var secrets: keyschedule.EpochSecrets(S) = undefined;
+        try keyschedule.deriveEpochFromJoiner(S, alloc, &joiner, &zero_psk, gi.raw.?.group_context, &secrets);
         try expectStage("joiner_secret round-trips through EpochSecrets", gs.joiner_secret, &joiner);
         try expectStageOk("confirmation_tag (§6.1/§12.4.3)", keyschedule.verifyConfirmationTag(
             S,
-            secrets.confirmation_key,
+            &secrets.confirmation_key,
             gi.group_context.confirmed_transcript_hash,
             gi.confirmation_tag,
         ));
 
         // ── and the same thing again through the one-call entry point,
         // which must agree with the hand-staged path above in every field ──
-        var joined = welcome.join(S, alloc, .{
+        var joined = tJoin(alloc, .{
             .welcome = w,
             .key_package_ref = &kp_ref,
-            .init_key_pair = e.init_key_pair,
+            .init_key_pair = &e.init_key_pair,
             .signer_key = e.signer_pub,
         }) catch |err| {
             std.debug.print("welcome KAT: 'welcome.join (§12.4.3.1 end to end)' failed: {s}\n", .{@errorName(err)});
@@ -317,10 +327,10 @@ test "welcome.json: each layer's teeth — one flipped byte fails the layer it b
             var bad_ref = kp_ref;
             bad_ref[0] ^= 0x01;
             try testing.expect(w.findSecret(&bad_ref) == null);
-            try testing.expectError(error.NoMatchingKeyPackage, welcome.join(S, alloc, .{
+            try testing.expectError(error.NoMatchingKeyPackage, tJoin(alloc, .{
                 .welcome = w,
                 .key_package_ref = &bad_ref,
-                .init_key_pair = e.init_key_pair,
+                .init_key_pair = &e.init_key_pair,
                 .signer_key = e.signer_pub,
             }));
         }
@@ -333,7 +343,7 @@ test "welcome.json: each layer's teeth — one flipped byte fails the layer it b
             try testing.expectError(error.DecryptionFailed, welcome.decryptGroupSecrets(
                 S,
                 alloc,
-                e.init_key_pair,
+                &e.init_key_pair,
                 w.encrypted_group_info,
                 .{ .kem_output = slot.encrypted_group_secrets.kem_output, .ciphertext = tampered },
             ));
@@ -350,14 +360,14 @@ test "welcome.json: each layer's teeth — one flipped byte fails the layer it b
             try testing.expectError(error.DecryptionFailed, welcome.decryptGroupSecrets(
                 S,
                 alloc,
-                e.init_key_pair,
+                &e.init_key_pair,
                 tampered_ctx,
                 slot.encrypted_group_secrets,
             ));
         }
 
         // Recover the real secrets for the remaining cases.
-        const gs_bytes = try welcome.decryptGroupSecrets(S, alloc, e.init_key_pair, w.encrypted_group_info, slot.encrypted_group_secrets);
+        const gs_bytes = try welcome.decryptGroupSecrets(S, alloc, &e.init_key_pair, w.encrypted_group_info, slot.encrypted_group_secrets);
         defer alloc.free(gs_bytes);
         var gs_reader = codec.Reader.init(gs_bytes);
         const gs = try welcome.GroupSecrets.decode(alloc, &gs_reader);
@@ -365,17 +375,18 @@ test "welcome.json: each layer's teeth — one flipped byte fails the layer it b
         var joiner: [S.Nh]u8 = undefined;
         @memcpy(&joiner, gs.joiner_secret);
         const zero = keyschedule.zeroSecret(S);
-        const welcome_secret = try keyschedule.welcomeSecret(S, joiner, zero);
+        var welcome_secret: [S.Nh]u8 = undefined;
+        try keyschedule.welcomeSecret(S, &joiner, &zero, &welcome_secret);
 
         // (c) The group-info AEAD layer.
         {
             const tampered = try alloc.dupe(u8, w.encrypted_group_info);
             defer alloc.free(tampered);
             tampered[tampered.len / 2] ^= 0x01;
-            try testing.expectError(error.DecryptionFailed, welcome.decryptGroupInfo(S, alloc, welcome_secret, tampered));
+            try testing.expectError(error.DecryptionFailed, welcome.decryptGroupInfo(S, alloc, &welcome_secret, tampered));
         }
 
-        const gi_bytes = try welcome.decryptGroupInfo(S, alloc, welcome_secret, w.encrypted_group_info);
+        const gi_bytes = try welcome.decryptGroupInfo(S, alloc, &welcome_secret, w.encrypted_group_info);
         defer alloc.free(gi_bytes);
         var gi_reader = codec.Reader.init(gi_bytes);
         const gi = try welcome.GroupInfo.decode(alloc, &gi_reader);
@@ -405,19 +416,21 @@ test "welcome.json: each layer's teeth — one flipped byte fails the layer it b
         {
             var bad_joiner = joiner;
             bad_joiner[0] ^= 0x01;
-            const bad_secrets = try keyschedule.deriveEpochFromJoiner(S, alloc, bad_joiner, zero, gi.raw.?.group_context);
+            var bad_secrets: keyschedule.EpochSecrets(S) = undefined;
+            try keyschedule.deriveEpochFromJoiner(S, alloc, &bad_joiner, &zero, gi.raw.?.group_context, &bad_secrets);
             try testing.expectError(error.MacMismatch, keyschedule.verifyConfirmationTag(
                 S,
-                bad_secrets.confirmation_key,
+                &bad_secrets.confirmation_key,
                 gi.group_context.confirmed_transcript_hash,
                 gi.confirmation_tag,
             ));
             // ...and the correct one still passes, so the case above is a
             // real rejection rather than a broken derivation.
-            const good_secrets = try keyschedule.deriveEpochFromJoiner(S, alloc, joiner, zero, gi.raw.?.group_context);
+            var good_secrets: keyschedule.EpochSecrets(S) = undefined;
+            try keyschedule.deriveEpochFromJoiner(S, alloc, &joiner, &zero, gi.raw.?.group_context, &good_secrets);
             try keyschedule.verifyConfirmationTag(
                 S,
-                good_secrets.confirmation_key,
+                &good_secrets.confirmation_key,
                 gi.group_context.confirmed_transcript_hash,
                 gi.confirmation_tag,
             );
@@ -432,10 +445,11 @@ test "welcome.json: each layer's teeth — one flipped byte fails the layer it b
             bad_gc.epoch += 1;
             const bad_bytes = try bad_gc.encodeAlloc(alloc);
             defer alloc.free(bad_bytes);
-            const bad_secrets = try keyschedule.deriveEpochFromJoiner(S, alloc, joiner, zero, bad_bytes);
+            var bad_secrets: keyschedule.EpochSecrets(S) = undefined;
+            try keyschedule.deriveEpochFromJoiner(S, alloc, &joiner, &zero, bad_bytes, &bad_secrets);
             try testing.expectError(error.MacMismatch, keyschedule.verifyConfirmationTag(
                 S,
-                bad_secrets.confirmation_key,
+                &bad_secrets.confirmation_key,
                 gi.group_context.confirmed_transcript_hash,
                 gi.confirmation_tag,
             ));
