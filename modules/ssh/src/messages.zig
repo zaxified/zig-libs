@@ -460,13 +460,43 @@ test "fuzz: readString never panics on arbitrary length-prefixed bytes" {
 }
 
 fn fuzzReadString(_: void, smith: *std.testing.Smith) !void {
+    // The first draw is taken here, byte-first; the harness reads it back.
+    var first: [768]u8 = undefined;
+    const n = smith.slice(&first);
+    var src: fuzz_test.Primed(std.testing.Smith) = .{ .inner = smith, .first = first[0..n] };
+    return readStringHarness(@TypeOf(src), &src, std.testing.allocator);
+}
+
+const fuzz_test = @import("fuzz_test.zig");
+const ReadStringLabel = enum { rejected, too_large, parsed_empty, parsed };
+const read_string_reach = fuzz_test.Reach(ReadStringLabel);
+
+/// The harness body, generic over its source (`testing.fuzz` hands it a
+/// `Smith`, testkit's driver a corpus-replaying PRNG).
+fn readStringHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // 768: the widest seed above is 704 octets, and a seed longer than the
     // buffer reads back as the EMPTY one rather than as a big one.
     var wire: [768]u8 = undefined;
-    const n: usize = smith.slice(&wire);
+    const n: usize = src.slice(&wire);
     var r: std.Io.Reader = .fixed(wire[0..n]);
-    const s = readString(std.testing.allocator, &r) catch return;
-    std.testing.allocator.free(s);
+    const s = readString(gpa, &r) catch |e| {
+        if (e == error.StringTooLarge) read_string_reach.mark(.too_large) else read_string_reach.mark(.rejected);
+        return;
+    };
+    defer gpa.free(s);
+    if (s.len == 0) read_string_reach.mark(.parsed_empty) else read_string_reach.mark(.parsed);
+}
+
+fn driveReadString(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    return fuzz_test.corpusDrive(S, src, gpa, &readstring_seeds, readStringHarness);
+}
+
+test "fuzz driver: SSH_FUZZ (ssh-readstring)" {
+    try fuzz_test.fuzz_driver.run(driveReadString, .{ .prefix = "SSH_FUZZ", .name = "ssh-readstring" });
+}
+
+test "fuzz harness: 500 readString seeds in every test run, and they get everywhere" {
+    try fuzz_test.reachSeeds(read_string_reach, "ssh-readstring", driveReadString, 500);
 }
 
 test "corpus: every readString seed reaches the reader, and the counts are pinned" {
@@ -514,11 +544,43 @@ test "fuzz: readMpint never panics on arbitrary length-prefixed bytes" {
 }
 
 fn fuzzReadMpint(_: void, smith: *std.testing.Smith) !void {
+    // The first draw is taken here, byte-first; the harness reads it back.
+    var first: [128]u8 = undefined;
+    const n = smith.slice(&first);
+    var src: fuzz_test.Primed(std.testing.Smith) = .{ .inner = smith, .first = first[0..n] };
+    return readMpintHarness(@TypeOf(src), &src, std.testing.allocator);
+}
+
+const ReadMpintLabel = enum { rejected, parsed, stripped };
+const read_mpint_reach = fuzz_test.Reach(ReadMpintLabel);
+
+fn readMpintHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var wire: [128]u8 = undefined;
-    const n: usize = smith.slice(&wire);
+    const n: usize = src.slice(&wire);
     var r: std.Io.Reader = .fixed(wire[0..n]);
-    const m = readMpint(std.testing.allocator, &r) catch return;
-    std.testing.allocator.free(m);
+    const m = readMpint(gpa, &r) catch {
+        read_mpint_reach.mark(.rejected);
+        return;
+    };
+    defer gpa.free(m);
+    // A result shorter than the declared length is the RFC 4251 §5 sign pad
+    // removed -- the one thing `readMpint` does beyond `readString`.
+    if (n >= 4 and m.len < std.mem.readInt(u32, wire[0..4], .big))
+        read_mpint_reach.mark(.stripped)
+    else
+        read_mpint_reach.mark(.parsed);
+}
+
+fn driveReadMpint(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    return fuzz_test.corpusDrive(S, src, gpa, &readmpint_seeds, readMpintHarness);
+}
+
+test "fuzz driver: SSH_FUZZ (ssh-readmpint)" {
+    try fuzz_test.fuzz_driver.run(driveReadMpint, .{ .prefix = "SSH_FUZZ", .name = "ssh-readmpint" });
+}
+
+test "fuzz harness: 500 readMpint seeds in every test run, and they get everywhere" {
+    try fuzz_test.reachSeeds(read_mpint_reach, "ssh-readmpint", driveReadMpint, 500);
 }
 
 test "corpus: every readMpint seed reaches the reader, and the counts are pinned" {

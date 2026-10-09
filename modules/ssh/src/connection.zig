@@ -2862,6 +2862,20 @@ test "fuzz: serveSession never panics on an arbitrary channel message stream" {
 }
 
 fn fuzzServeSession(_: void, smith: *std.testing.Smith) !void {
+    // The first draw is taken here, byte-first; the harness reads it back.
+    var first: [192]u8 = undefined;
+    const n = smith.slice(&first);
+    var src: fuzz_test.Primed(std.testing.Smith) = .{ .inner = smith, .first = first[0..n] };
+    return serveSessionHarness(@TypeOf(src), &src, std.testing.allocator);
+}
+
+const fuzz_test = @import("fuzz_test.zig");
+const SessionLabel = enum { failed, served, replied };
+const session_reach = fuzz_test.Reach(SessionLabel);
+
+/// The harness body, generic over its source (`testing.fuzz` hands it a
+/// `Smith`, testkit's driver a corpus-replaying PRNG).
+fn serveSessionHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var payload_store: [6][192]u8 = undefined;
     var payloads: [6][]const u8 = undefined;
     // ⚠ Bytes first, and the message COUNT out of the bytes: a zero-length
@@ -2869,7 +2883,7 @@ fn fuzzServeSession(_: void, smith: *std.testing.Smith) !void {
     // this replaced were actually producing.
     var n: usize = 0;
     while (n < payloads.len) : (n += 1) {
-        const len: usize = smith.slice(&payload_store[n]);
+        const len: usize = src.slice(&payload_store[n]);
         if (len == 0) break;
         payloads[n] = payload_store[n][0..len];
     }
@@ -2884,12 +2898,27 @@ fn fuzzServeSession(_: void, smith: *std.testing.Smith) !void {
 
     // Small window/packet bounds so the flow-control arithmetic is exercised
     // near its edges rather than under a 2 MiB default that never closes.
-    serveSession(&tr, std.testing.allocator, .{
+    const res = serveSession(&tr, gpa, .{
         .exec = fuzz_label.handler(),
         .window_size = 64,
         .max_packet_size = 128,
         .max_input = 4096,
-    }) catch return;
+    });
+    if (res) |_| session_reach.mark(.served) else |_| session_reach.mark(.failed);
+    if (sink.buffered().len > 0) session_reach.mark(.replied);
+}
+
+fn driveSession(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: SessionCorpus = .{};
+    return fuzz_test.corpusDrive(S, src, gpa, corpus.build(), serveSessionHarness);
+}
+
+test "fuzz driver: SSH_FUZZ (ssh-session)" {
+    try fuzz_test.fuzz_driver.run(driveSession, .{ .prefix = "SSH_FUZZ", .name = "ssh-session", .scale = 10 });
+}
+
+test "fuzz harness: 300 serveSession seeds in every test run, and they get everywhere" {
+    try fuzz_test.reachSeeds(session_reach, "ssh-session", driveSession, 300);
 }
 
 test "corpus: the serveSession seeds deliver real channel messages, counts pinned" {

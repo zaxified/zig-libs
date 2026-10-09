@@ -1261,6 +1261,20 @@ test "fuzz: serveUserauth never panics on an arbitrary userauth message stream" 
 }
 
 fn fuzzServeUserauth(_: void, smith: *std.testing.Smith) !void {
+    // The first draw is taken here, byte-first; the harness reads it back.
+    var first: [256]u8 = undefined;
+    const n = smith.slice(&first);
+    var src: fuzz_test.Primed(std.testing.Smith) = .{ .inner = smith, .first = first[0..n] };
+    return serveUserauthHarness(@TypeOf(src), &src, std.testing.allocator);
+}
+
+const fuzz_test = @import("fuzz_test.zig");
+const UserauthLabel = enum { failed, authenticated, replied };
+const userauth_reach = fuzz_test.Reach(UserauthLabel);
+
+/// The harness body, generic over its source (`testing.fuzz` hands it a
+/// `Smith`, testkit's driver a corpus-replaying PRNG).
+fn serveUserauthHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var payload_store: [4][256]u8 = undefined;
     var payloads: [4][]const u8 = undefined;
     // ⚠ Bytes first, and the message COUNT out of the bytes: a zero-length
@@ -1268,7 +1282,7 @@ fn fuzzServeUserauth(_: void, smith: *std.testing.Smith) !void {
     // this replaced were actually producing.
     var n: usize = 0;
     while (n < payloads.len) : (n += 1) {
-        const len: usize = smith.slice(&payload_store[n]);
+        const len: usize = src.slice(&payload_store[n]);
         if (len == 0) break;
         payloads[n] = payload_store[n][0..len];
     }
@@ -1282,7 +1296,7 @@ fn fuzzServeUserauth(_: void, smith: *std.testing.Smith) !void {
     var tr = transport.Transport.init(&r, &sink);
     tr.session_id = transport.SessionId.from("fuzz-session-id");
 
-    const res = serveUserauth(&tr, std.testing.allocator, .{
+    const res = serveUserauth(&tr, gpa, .{
         .authorized_key = .{ .checkFn = struct {
             fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
                 return true;
@@ -1293,9 +1307,28 @@ fn fuzzServeUserauth(_: void, smith: *std.testing.Smith) !void {
                 return true;
             }
         }.f },
-    }) catch return;
+    }) catch {
+        userauth_reach.mark(.failed);
+        if (sink.buffered().len > 0) userauth_reach.mark(.replied);
+        return;
+    };
     // A success must never carry a user name longer than the declared bound.
     std.debug.assert(res.user().len <= max_user_len);
+    userauth_reach.mark(.authenticated);
+    if (sink.buffered().len > 0) userauth_reach.mark(.replied);
+}
+
+fn driveUserauth(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: UserauthCorpus = .{};
+    return fuzz_test.corpusDrive(S, src, gpa, corpus.build(), serveUserauthHarness);
+}
+
+test "fuzz driver: SSH_FUZZ (ssh-userauth)" {
+    try fuzz_test.fuzz_driver.run(driveUserauth, .{ .prefix = "SSH_FUZZ", .name = "ssh-userauth", .scale = 10 });
+}
+
+test "fuzz harness: 300 serveUserauth seeds in every test run, and they get everywhere" {
+    try fuzz_test.reachSeeds(userauth_reach, "ssh-userauth", driveUserauth, 300);
 }
 
 test "corpus: the serveUserauth seeds deliver real requests, and the counts are pinned" {

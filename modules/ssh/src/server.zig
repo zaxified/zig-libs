@@ -194,10 +194,18 @@ pub const HostKey = union(enum) {
             const e_wire = pk_cur.string() catch return error.InvalidOpenSSH;
             const n_wire = pk_cur.string() catch return error.InvalidOpenSSH;
             const pk = rsa.PublicKey.fromBytes(n_wire, e_wire) catch return error.InvalidOpenSSH;
-            // Cross-check: the public blob's n must be the secret key's n.
+            // Cross-check: the public blob's (n, e) must be the secret key's.
+            // n alone was checked until 2026-10-09; SSH_FUZZ `ssh-keyload`
+            // found a container whose public `e` was damaged (65537 ->
+            // 0x018101) load as a host key advertising a public key its own
+            // signatures do not verify under.
             var n_sk: [rsa.max_modulus_len]u8 = undefined;
             sk.n.toBytes(&n_sk, .big) catch return error.InvalidPrivateKey;
             if (!std.mem.eql(u8, stripLeadingZeros(&n_sk), stripLeadingZeros(n_wire)))
+                return error.InvalidPrivateKey;
+            var e_sk: [rsa.max_modulus_len]u8 = undefined;
+            sk.e.toBytes(&e_sk, .big) catch return error.InvalidPrivateKey;
+            if (!std.mem.eql(u8, stripLeadingZeros(&e_sk), stripLeadingZeros(e_wire)))
                 return error.InvalidPrivateKey;
             r.public_key = pk;
             r.hash = .sha2_256;

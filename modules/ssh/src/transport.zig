@@ -3301,11 +3301,43 @@ test "fuzz: KexInit.decode never panics on arbitrary bytes" {
 }
 
 fn fuzzKexInitDecode(_: void, smith: *std.testing.Smith) !void {
+    // The first draw is taken here, byte-first; the harness reads it back.
+    var first: [2048]u8 = undefined;
+    const n = smith.slice(&first);
+    var src: fuzz_test.Primed(std.testing.Smith) = .{ .inner = smith, .first = first[0..n] };
+    return kexInitHarness(@TypeOf(src), &src, std.testing.allocator);
+}
+
+const fuzz_test = @import("fuzz_test.zig");
+const KexInitLabel = enum { rejected, decoded, named };
+const kexinit_reach = fuzz_test.Reach(KexInitLabel);
+
+/// The harness body, generic over its source (`testing.fuzz` hands it a
+/// `Smith`, testkit's driver a corpus-replaying PRNG).
+fn kexInitHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var wire: [2048]u8 = undefined;
-    const n: usize = smith.slice(&wire);
+    const n: usize = src.slice(&wire);
     var r: std.Io.Reader = .fixed(wire[0..n]);
-    var got = KexInit.decode(std.testing.allocator, &r) catch return;
-    got.deinit(std.testing.allocator);
+    var got = KexInit.decode(gpa, &r) catch {
+        kexinit_reach.mark(.rejected);
+        return;
+    };
+    defer got.deinit(gpa);
+    // Eleven empty name-lists decode too; `named` is a real algorithm list.
+    if (got.kex_algorithms.len > 0) kexinit_reach.mark(.named) else kexinit_reach.mark(.decoded);
+}
+
+fn driveKexInit(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: KexInitCorpus = .{};
+    return fuzz_test.corpusDrive(S, src, gpa, corpus.build(), kexInitHarness);
+}
+
+test "fuzz driver: SSH_FUZZ (ssh-kexinit)" {
+    try fuzz_test.fuzz_driver.run(driveKexInit, .{ .prefix = "SSH_FUZZ", .name = "ssh-kexinit" });
+}
+
+test "fuzz harness: 500 KexInit seeds in every test run, and they get everywhere" {
+    try fuzz_test.reachSeeds(kexinit_reach, "ssh-kexinit", driveKexInit, 500);
 }
 
 test "corpus: every KEXINIT seed reaches the decoder, and the counts are pinned" {
@@ -3441,12 +3473,41 @@ test "fuzz: readPacket (cipher .none) never panics on arbitrary bytes" {
 }
 
 fn fuzzReadPacketNone(_: void, smith: *std.testing.Smith) !void {
+    // The first draw is taken here, byte-first; the harness reads it back.
+    var first: [300]u8 = undefined;
+    const n = smith.slice(&first);
+    var src: fuzz_test.Primed(std.testing.Smith) = .{ .inner = smith, .first = first[0..n] };
+    return readPacketHarness(@TypeOf(src), &src, std.testing.allocator);
+}
+
+const ReadPacketLabel = enum { rejected, parsed, payload };
+const readpacket_reach = fuzz_test.Reach(ReadPacketLabel);
+
+fn readPacketHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var wire: [300]u8 = undefined;
-    const n: usize = smith.slice(&wire);
+    const n: usize = src.slice(&wire);
     var r: std.Io.Reader = .fixed(wire[0..n]);
     var cipher: CipherState = .plaintext;
     var buf: [256]u8 = undefined;
-    _ = readPacket(&r, &cipher, &buf) catch return;
+    const pkt = readPacket(&r, &cipher, &buf) catch {
+        readpacket_reach.mark(.rejected);
+        return;
+    };
+    if (pkt.payload.len > 0) readpacket_reach.mark(.payload) else readpacket_reach.mark(.parsed);
+}
+
+fn driveReadPacket(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: PacketCorpus = .{};
+    return fuzz_test.corpusDrive(S, src, gpa, corpus.build(), readPacketHarness);
+}
+
+test "fuzz driver: SSH_FUZZ (ssh-readpacket)" {
+    try fuzz_test.fuzz_driver.run(driveReadPacket, .{ .prefix = "SSH_FUZZ", .name = "ssh-readpacket" });
+}
+
+test "fuzz harness: 500 readPacket seeds in every test run, and they get everywhere" {
+    try fuzz_test.reachSeeds(readpacket_reach, "ssh-readpacket", driveReadPacket, 500);
 }
 
 test "corpus: every readPacket seed reaches the framer, and the counts are pinned" {

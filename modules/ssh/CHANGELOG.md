@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **FIX (key integrity):** `HostKey.fromOpenSSH` / `AuthKey.fromOpenSSH` for an RSA key
+  cross-checked only the container's public `n` against the secret key, so a damaged public `e`
+  loaded as a key whose own signatures do not verify under the advertised public key. `e` is
+  checked too now (`error.InvalidPrivateKey`). Found by the new `SSH_FUZZ` `ssh-keyload` harness;
+  regression test.
+- **2026-10-09** — tests: deterministic fuzz driver `SSH_FUZZ` over the existing harnesses (readString, readMpint, KexInit.decode, readPacket, serveSession, serveUserauth; harness bodies now generic over their source, reach labels, in-suite seed runs), plus a new `ssh-keyload` harness over `HostKey.fromOpenSSH` / `AuthKey.fromOpenSSH` on raw and damaged OpenSSH containers (`src/fuzz_test.zig`). No library change.
 - **2026-10-09** — **BREAKING (error set):** `HostKey.fromOpenSSH` / `AuthKey.fromOpenSSH` inherit
   rsa's new `error.KdfRoundsTooLarge` (an encrypted RSA key whose bcrypt round count is above
   2048, Go's cap) through `rsa.FromOpenSSHError`.
