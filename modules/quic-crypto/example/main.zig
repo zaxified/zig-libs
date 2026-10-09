@@ -52,10 +52,12 @@ pub fn main() !void {
     // therefore differs from every published KAT in this module.
     const client_dcid: [8]u8 = comptime hexN(8, "deadbeefcafebabe");
 
-    const secrets = qc.deriveInitialSecrets(&client_dcid);
+    var secrets: qc.InitialSecrets = undefined;
+    qc.deriveInitialSecrets(&secrets, &client_dcid);
     // Initial-level packets are ALWAYS TLS_AES_128_GCM_SHA256 (RFC 9001
     // §5.2), regardless of whatever suite the handshake later negotiates.
-    const client_keys = qc.derivePacketKeys(HkdfSha256, 16, secrets.client_initial_secret);
+    var client_keys: qc.PacketKeys(16) = undefined;
+    qc.derivePacketKeys(HkdfSha256, 16, &client_keys, &secrets.client_initial_secret);
     std.debug.print("derived client Initial key/iv/hp from a fresh (non-vector) DCID\n", .{});
 
     // ── assemble an unprotected long-header Initial packet ────────────────
@@ -91,7 +93,7 @@ pub fn main() !void {
 
     const P = qc.protection.Protection(Aes128Gcm);
     var ciphertext: [payload.len + P.tag_length]u8 = undefined;
-    const ct_len = try P.seal(client_keys.key, client_keys.iv, packet_number, &header, payload, &ciphertext);
+    const ct_len = try P.seal(&client_keys.key, client_keys.iv, packet_number, &header, payload, &ciphertext);
     must(ct_len == ciphertext.len, @src());
 
     // Print everything the external oracle needs: key, the nonce
@@ -142,7 +144,7 @@ pub fn main() !void {
     const recv_header = recv_packet[0 .. pn_offset + 4];
     const recv_ciphertext = recv_packet[pn_offset + 4 ..];
     var opened: [payload.len]u8 = undefined;
-    const n = try P.open(client_keys.key, client_keys.iv, recovered_pn, recv_header, recv_ciphertext, &opened);
+    const n = try P.open(&client_keys.key, client_keys.iv, recovered_pn, recv_header, recv_ciphertext, &opened);
     try std.testing.expectEqualStrings(payload, opened[0..n]);
     std.debug.print("AEAD open: recovered the original {d}-byte payload\n", .{n});
 
@@ -159,7 +161,7 @@ pub fn main() !void {
     must(t_removed.pn_len == 4, @src());
     const t_pn = std.mem.readInt(u32, tampered_packet[pn_offset..][0..4], .big);
     var discard: [payload.len]u8 = undefined;
-    if (P.open(client_keys.key, client_keys.iv, t_pn, tampered_packet[0 .. pn_offset + 4], tampered_packet[pn_offset + 4 ..], &discard)) |_| {
+    if (P.open(&client_keys.key, client_keys.iv, t_pn, tampered_packet[0 .. pn_offset + 4], tampered_packet[pn_offset + 4 ..], &discard)) |_| {
         unreachable; // a flipped tag byte cannot survive AEAD verification
     } else |err| switch (err) {
         error.DecryptionFailed => std.debug.print("tampered wire packet: open -> DecryptionFailed (expected)\n", .{}),
@@ -167,7 +169,8 @@ pub fn main() !void {
     }
 
     // ── key update (§6): hp is deliberately NOT re-derived ────────────────
-    const ku = qc.advanceKeys(HkdfSha256, 16, secrets.client_initial_secret);
+    var ku: qc.KeyUpdate(HkdfSha256, 16) = undefined;
+    qc.advanceKeys(HkdfSha256, 16, &ku, &secrets.client_initial_secret);
     must(!@hasField(@TypeOf(ku), "hp"), @src());
     must(!std.mem.eql(u8, &ku.key, &client_keys.key), @src()); // key DID change
     std.debug.print("key update: new key/iv derived; hp field absent by type (unchanged per RFC 9001 §6.1)\n", .{});

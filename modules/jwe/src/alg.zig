@@ -22,6 +22,7 @@
 const std = @import("std");
 pub const Entropy = @import("entropy.zig").Entropy;
 const rsa = @import("rsa");
+const burn = @import("burn.zig");
 const aead = std.crypto.aead.aes_gcm;
 
 pub const aeskw = @import("aeskw");
@@ -60,7 +61,14 @@ pub const OaepHash = enum { sha1, sha256 };
 /// `rsa.encryptOaep` with the JOSE-mandated empty label. `random` MUST be
 /// cryptographically secure (OAEP's security proof requires an
 /// unpredictable seed — see `rsa`'s own doc comment).
+///
+/// Burned (`burn.rsa_wrap_burn`): the OAEP padding block (the CEK inside the
+/// masked data block) is built in the body's frames.
 pub fn rsaOaepWrap(pk: rsa.PublicKey, hash: OaepHash, entropy: Entropy, cek: []const u8, out: []u8) Error![]u8 {
+    return burn.run(burn.rsa_wrap_burn, Error![]u8, rsaOaepWrapBody, .{ pk, hash, entropy, cek, out });
+}
+
+fn rsaOaepWrapBody(pk: rsa.PublicKey, hash: OaepHash, entropy: Entropy, cek: []const u8, out: []u8) Error![]u8 {
     // Unwrapped here rather than through an accessor on `Entropy` — see the
     // note at the bottom of `entropy.zig`.
     const random: std.Random = switch (entropy) {
@@ -145,7 +153,20 @@ pub const max_pbes2_salt_value_len: usize = 128;
 /// HMAC-SHA-2 matching `variant`, output length = `variant.kekLen()`. A
 /// direct `std.crypto.pwhash.pbkdf2` call; the resulting KEK then feeds
 /// `aeskw.wrap`/`unwrap` (RFC 3394).
+///
+/// Burned (`burn.kdf_burn`): the HMAC key schedule and PBKDF2 state run one
+/// frame down and are zeroed after.
 pub fn pbes2DeriveKek(
+    variant: Pbes2Variant,
+    password: []const u8,
+    salt_input: []const u8,
+    iterations: u32,
+    out: []u8,
+) Error![]u8 {
+    return burn.run(burn.kdf_burn, Error![]u8, pbes2DeriveKekBody, .{ variant, password, salt_input, iterations, out });
+}
+
+fn pbes2DeriveKekBody(
     variant: Pbes2Variant,
     password: []const u8,
     salt_input: []const u8,

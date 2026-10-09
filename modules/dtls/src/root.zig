@@ -410,6 +410,7 @@ test {
     _ = @import("wolfssl_replay.zig");
     _ = @import("fuzz_corpus.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\"} (certverify.zig's RSASSA-PSS dispatch + certauth.zig's cert parsing + Connection.zig's ChaCha20-Poly1305 suite; the PSK flight engine itself needs no sibling modules)" {
@@ -428,7 +429,8 @@ test "keyschedule.hkdfExpandLabel: uses the DTLS \"dtls13\" prefix (RFC 9147 §5
     // keyschedule.zig's own tests.
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
     const secret = [_]u8{0x42} ** 32;
-    const out = keyschedule.hkdfExpandLabel(Hkdf, secret, "test label", "", 16);
+    var out: [16]u8 = undefined;
+    keyschedule.hkdfExpandLabel(Hkdf, 16, &out, &secret, "test label", "");
     try std.testing.expectEqual(@as(usize, 16), out.len);
     const tls13 = std.crypto.tls.hkdfExpandLabel(Hkdf, secret, "test label", "", 16);
     try std.testing.expect(!std.mem.eql(u8, &tls13, &out));

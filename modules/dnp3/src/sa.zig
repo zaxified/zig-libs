@@ -61,6 +61,7 @@ const std = @import("std");
 /// under this name so the rest of this file (and its tests) reads the same as
 /// before the extraction.
 const aeskw = @import("aeskw");
+const burn = @import("burn.zig");
 
 // ── constant-time byte-slice compare ─────────────────────────────────────────
 
@@ -134,6 +135,10 @@ pub const mac = struct {
     /// Computes the truncated MAC of a single contiguous `msg` into `out`.
     /// `iv` is required only for AES-GMAC. Returns the truncated slice.
     pub fn compute(alg: HmacAlgorithm, key: []const u8, msg: []const u8, iv: ?[12]u8, out: []u8) Error![]u8 {
+        return burn.run(burn.mac_burn, Error![]u8, computeBody, .{ alg, key, msg, iv, out });
+    }
+
+    fn computeBody(alg: HmacAlgorithm, key: []const u8, msg: []const u8, iv: ?[12]u8, out: []u8) Error![]u8 {
         const n = length(alg);
         if (n == 0) return error.UnsupportedAlgorithm;
         if (out.len < n) return error.BufferTooSmall;
@@ -175,6 +180,10 @@ pub const mac = struct {
     /// input. HMAC algorithms only; AES-GMAC returns `UnsupportedAlgorithm`
     /// (its AAD is single-slice — concatenate and use `compute`).
     pub fn computeTwo(alg: HmacAlgorithm, key: []const u8, a: []const u8, b: []const u8, out: []u8) Error![]u8 {
+        return burn.run(burn.mac_burn, Error![]u8, computeTwoBody, .{ alg, key, a, b, out });
+    }
+
+    fn computeTwoBody(alg: HmacAlgorithm, key: []const u8, a: []const u8, b: []const u8, out: []u8) Error![]u8 {
         const n = length(alg);
         if (out.len < n) return error.BufferTooSmall;
         switch (alg) {
@@ -705,6 +714,15 @@ pub fn wrapSessionKeys(
     monitoring_key: []const u8,
     out: []u8,
 ) SessionKeyError![]u8 {
+    return burn.run(burn.key_burn, SessionKeyError![]u8, wrapSessionKeysBody, .{ update_key, control_key, monitoring_key, out });
+}
+
+fn wrapSessionKeysBody(
+    update_key: []const u8,
+    control_key: []const u8,
+    monitoring_key: []const u8,
+    out: []u8,
+) SessionKeyError![]u8 {
     if (control_key.len != monitoring_key.len) return error.KeyLength;
     if (control_key.len != 16 and control_key.len != 32) return error.KeyLength;
     var plain: [64]u8 = undefined;
@@ -737,6 +755,15 @@ pub const UnwrappedSessionKeys = struct {
 /// caller-owned `out`; the caller MUST `secureZero` it once the session keys are
 /// installed (this function cannot, as it hands those bytes back).
 pub fn unwrapSessionKeys(
+    update_key: []const u8,
+    wrapped: []const u8,
+    key_len: usize,
+    out: []u8,
+) SessionKeyError!UnwrappedSessionKeys {
+    return burn.run(burn.key_burn, SessionKeyError!UnwrappedSessionKeys, unwrapSessionKeysBody, .{ update_key, wrapped, key_len, out });
+}
+
+fn unwrapSessionKeysBody(
     update_key: []const u8,
     wrapped: []const u8,
     key_len: usize,

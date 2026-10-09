@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). `deriveKey` and `deriveContext` now
+  run under a shared 8 KiB burn (`src/burn.zig`); `deriveContext`'s private `scrubStackBelow` is
+  gone (same depth, now the module-standard `burn.run`, and probed by `stackprobe_test.zig`). No
+  signature changed. Not covered here: `protect`/`unprotect` (the per-message AEAD path leaves
+  std's AES-128 key schedule behind, as `SPEC.md` § Verification states).
 - **2026-10-05** — **Fix (anti-replay, RFC 8613 §7.4):** `ReplayWindow.update` cleared the mask
   when a new sequence number advanced the window by exactly `window_size`, so the previous
   highest (then at the window's trailing edge, which `check` still treats as in range) was

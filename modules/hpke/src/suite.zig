@@ -14,6 +14,7 @@
 //! definitions threaded through §4/§5.1/§5.2/§7.1.3.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 // ── §1.3 conventions: I2OSP / OS2IP ─────────────────────────────────────
 //
@@ -154,13 +155,18 @@ pub fn labeledExtract(
     label: []const u8,
     ikm: []const u8,
 ) void {
-    var hmac_state = Hkdf.extractInit(salt);
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&hmac_state));
-    hmac_state.update("HPKE-v1");
-    hmac_state.update(suite_id);
-    hmac_state.update(label);
-    hmac_state.update(ikm);
-    hmac_state.final(out);
+    const B = struct {
+        fn body(o: *[Hkdf.prk_length]u8, sid: []const u8, sa: []const u8, lb: []const u8, k: []const u8) void {
+            var hmac_state = Hkdf.extractInit(sa);
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&hmac_state));
+            hmac_state.update("HPKE-v1");
+            hmac_state.update(sid);
+            hmac_state.update(lb);
+            hmac_state.update(k);
+            hmac_state.final(o);
+        }
+    };
+    burn.run(burn.kdf_burn, void, B.body, .{ out, suite_id, salt, label, ikm });
 }
 
 /// Labeled-info assembly overflowed the internal scratch buffer — only
@@ -185,14 +191,19 @@ pub fn labeledExpand(
     info: []const u8,
     out: []u8,
 ) LabeledExpandError!void {
-    var buf: [512]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    w.writeInt(u16, std.math.cast(u16, out.len) orelse return error.LabelTooLong, .big) catch return error.LabelTooLong;
-    w.writeAll("HPKE-v1") catch return error.LabelTooLong;
-    w.writeAll(suite_id) catch return error.LabelTooLong;
-    w.writeAll(label) catch return error.LabelTooLong;
-    w.writeAll(info) catch return error.LabelTooLong;
-    Hkdf.expand(out, w.buffered(), prk.*);
+    const B = struct {
+        fn body(sid: []const u8, p: *const [Hkdf.prk_length]u8, lb: []const u8, inf: []const u8, o: []u8) LabeledExpandError!void {
+            var buf: [512]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            w.writeInt(u16, std.math.cast(u16, o.len) orelse return error.LabelTooLong, .big) catch return error.LabelTooLong;
+            w.writeAll("HPKE-v1") catch return error.LabelTooLong;
+            w.writeAll(sid) catch return error.LabelTooLong;
+            w.writeAll(lb) catch return error.LabelTooLong;
+            w.writeAll(inf) catch return error.LabelTooLong;
+            Hkdf.expand(o, w.buffered(), p.*);
+        }
+    };
+    return burn.run(burn.kdf_burn, LabeledExpandError!void, B.body, .{ suite_id, prk, label, info, out });
 }
 
 // ── tests (real — pure arithmetic / composition, no crypto core needed) ──

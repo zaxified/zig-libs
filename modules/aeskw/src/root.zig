@@ -37,6 +37,7 @@
 
 const std = @import("std");
 const aes = std.crypto.core.aes;
+const burn = @import("burn.zig");
 
 // Had no `pub const meta` block at all before this line (checkCatalog's deps
 // check has a documented exception for it, since it is zero-dep) -- pure
@@ -82,6 +83,10 @@ pub const Error = error{
 ///
 /// KAT: RFC 3394 §4.1, §4.3, §4.5, §4.6 (this file's tests below).
 pub fn wrap(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
+    return burn.run(burn.wrap_burn, Error![]u8, wrapBody, .{ kek, plaintext, out });
+}
+
+fn wrapBody(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
     if (plaintext.len < 16 or plaintext.len % 8 != 0) return error.InvalidLength;
     if (kek.len != 16 and kek.len != 32) return error.UnsupportedKeyLength;
     const n = plaintext.len / 8;
@@ -128,6 +133,10 @@ pub fn wrap(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
 /// caller-owned slices (Z2). There is no Z1 storage here: this module allocates
 /// nothing and keeps nothing between calls.
 pub fn unwrap(kek: []const u8, ciphertext: []const u8, out: []u8) Error![]u8 {
+    return burn.run(burn.wrap_burn, Error![]u8, unwrapBody, .{ kek, ciphertext, out });
+}
+
+fn unwrapBody(kek: []const u8, ciphertext: []const u8, out: []u8) Error![]u8 {
     if (ciphertext.len < 24 or ciphertext.len % 8 != 0) return error.InvalidLength;
     const n = ciphertext.len / 8 - 1;
     if (out.len < n * 8) return error.BufferTooSmall;
@@ -514,4 +523,8 @@ test "wrap refuses key data that is not a whole number of 64-bit blocks" {
         const pt = [_]u8{0x5a} ** 32;
         try std.testing.expectError(error.InvalidLength, wrap(&kek, pt[0..len], &out));
     }
+}
+
+test {
+    _ = @import("stackprobe_test.zig");
 }

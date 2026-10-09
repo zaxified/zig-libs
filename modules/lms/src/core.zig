@@ -11,6 +11,7 @@
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const params = @import("params.zig");
+const burn = @import("burn.zig");
 
 pub const n = params.n;
 pub const id_len = params.id_len;
@@ -42,6 +43,7 @@ pub fn chainHash(id: *const [id_len]u8, q: u32, i: u16, j: u8, x: *const [n]u8) 
 }
 
 /// `H(I || u32str(r) || u16str(D_LEAF) || K)` (§5.3, leaf node `r >= 2^h`).
+// secret-api-ok: `k` is an LM-OTS public key hash (a Merkle leaf, published in signatures), not key material
 pub fn leafHash(id: *const [id_len]u8, r: u32, k: *const [n]u8) [n]u8 {
     var h = Sha256.init(.{});
     h.update(id);
@@ -132,7 +134,15 @@ pub fn otsCandidate(
 
 /// Appendix A: `x_q[i] = H(I || u32str(q) || u16str(i) || u8str(0xff) || SEED)`.
 /// The result is a secret, so it goes to `out` (never returned by value).
+///
+/// Burned (`burn.derive_burn`) on its own because it is a public building
+/// block; inside `Tree` it also runs under the entry point's burn (one
+/// extra 2 KiB zeroing per chain start, noise next to the chain's hashes).
 pub fn deriveX(out: *[n]u8, id: *const [id_len]u8, q: u32, i: u16, seed: *const [n]u8) void {
+    burn.run(burn.derive_burn, void, deriveXBody, .{ out, id, q, i, seed });
+}
+
+fn deriveXBody(out: *[n]u8, id: *const [id_len]u8, q: u32, i: u16, seed: *const [n]u8) void {
     out.* = chainHash(id, q, i, 0xff, seed);
 }
 
@@ -144,7 +154,13 @@ pub fn deriveX(out: *[n]u8, id: *const [id_len]u8, q: u32, i: u16, seed: *const 
 /// It depends on `q` and the secret only, which is safe because each `q`
 /// signs one message; re-signing the same message at the same leaf gives the
 /// identical signature.
+///
+/// Burned (`burn.derive_burn`), like `deriveX`.
 pub fn deriveRandomizer(id: *const [id_len]u8, q: u32, seed: *const [n]u8) [n]u8 {
+    return burn.run(burn.derive_burn, [n]u8, deriveRandomizerBody, .{ id, q, seed });
+}
+
+fn deriveRandomizerBody(id: *const [id_len]u8, q: u32, seed: *const [n]u8) [n]u8 {
     return chainHash(id, q, 0xffff, 0xff, seed);
 }
 

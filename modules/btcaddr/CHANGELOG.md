@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack burn: `wifEncode` (private key, payload, checksum, base58 division) runs its body under `burn.run` (8 KiB, one-shot); new `stackprobe_test.zig` on `testkit.stackprobe`. No signature change.
+
 - **2026-10-03** — **NO CONSUMER-VISIBLE CHANGE:** first audit (review + mutation run, 53
   mutants, 11 survived the first pass, all killed now); three tests added for the template
   bytes, the witness-version opcode range and the 65-byte key prefix. No source change.

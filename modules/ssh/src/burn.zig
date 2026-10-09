@@ -65,3 +65,8 @@ pub const install_burn = 8 * 1024;
 /// `writePacket` / `readPacket`: the plaintext buffer and the per-packet key
 /// material (2026-10-09).
 pub const record_burn = 16 * 1024;
+
+/// `PasswordCheck.check`: the server's password hook runs one frame down, so
+/// its own frames (a hash, a constant-time compare, a lookup) are zeroed too.
+/// Once per password attempt; 16 KiB until measured in ReleaseFast.
+pub const password_burn = 16 * 1024;

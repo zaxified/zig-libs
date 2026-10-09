@@ -465,6 +465,39 @@ def public_surface(src_dir, files):
     return whole, partial
 
 
+def module_deps():
+    """{module: [deps]} from build.zig's module table (`.deps`, not `test_deps`)."""
+    out = {}
+    with open(os.path.join(REPO, "build.zig"), encoding="utf-8") as fh:
+        for line in fh:
+            m = re.search(r'\.\{\s*\.name\s*=\s*"([^"]+)"(.*)\}', line)
+            if not m:
+                continue
+            d = re.search(r'(?<!test_)\.deps\s*=\s*&\.\{([^}]*)\}', m.group(2))
+            out[m.group(1)] = re.findall(r'"([^"]+)"', d.group(1)) if d else []
+    return out
+
+
+DEPS = None
+BURNED_PUB = {}
+
+
+def burned_pub_names(module):
+    """Public functions of `module` that burn (own closure), cached. A call
+    from a dependent module to one of them is a burned call."""
+    if module not in BURNED_PUB:
+        BURNED_PUB[module] = set()  # cycle guard
+        # scan_module fills the per-module globals; the caller's must survive.
+        saved = (set(DERIVED), set(DERIVED_REF), dict(SECRET_FIELDS))
+        try:
+            BURNED_PUB[module] = scan_module(module, want_burned=True)
+        finally:
+            DERIVED.clear(); DERIVED.update(saved[0])
+            DERIVED_REF.clear(); DERIVED_REF.update(saved[1])
+            SECRET_FIELDS.clear(); SECRET_FIELDS.update(saved[2])
+    return BURNED_PUB[module]
+
+
 def crypto_modules():
     """Modules whose build.zig row lists the `crypto` lib."""
     out = set()
@@ -476,14 +509,20 @@ def crypto_modules():
 
 
 CRYPTO = None
+STD_KEYED = re.compile(r"std\.crypto\.(auth|aead|kdf|sign|dh|ecc|core\.aes|stream)\b")
 
 
-def scan_module(module):
-    global CRYPTO
+def scan_module(module, want_burned=False):
+    global CRYPTO, DEPS
     if CRYPTO is None:
         CRYPTO = crypto_modules()
-    crypto = module in CRYPTO
+    if DEPS is None:
+        DEPS = module_deps()
     src_dir, files = module_files(module)
+    # `key` names a secret in a `crypto`-lib module, and in any module whose
+    # own code keys a std MAC/AEAD/KDF/signature/DH with it (stun's
+    # MESSAGE-INTEGRITY HMAC key is a `net` module's `key: []const u8`).
+    crypto = module in CRYPTO or any(STD_KEYED.search(fi.src) for fi in files.values())
     DERIVED.clear()
     DERIVED_REF.clear()
     inl, ref = derive_secret_types(files)
@@ -511,14 +550,55 @@ def scan_module(module):
     # (by name, to a fixpoint). By name, so two `sign`s in two containers
     # share a verdict -- the stack probe is what checks the depth.
     burned = {n for n, bs in bodies.items() if any(BURN.search(b) for b in bs)}
+    # Burns inside a dependency count, but only through a QUALIFIED call:
+    # `k256.sign(` (or `K.sign(` after `const K = k256.Thing;`) from bip32 runs
+    # under k256's own burn. Bare names do not: `encrypt(`/`initEnc(` match
+    # burned functions of half the crypto deps and hid real findings.
+    dep_burned = set()
+    seen, todo = set(), list(DEPS.get(module, []))
+    while todo:
+        d = todo.pop()
+        if d in seen or not os.path.isdir(os.path.join(REPO, "modules", d)):
+            continue
+        seen.add(d)
+        todo.extend(DEPS.get(d, []))
+        dep_burned |= burned_pub_names(d)
+    dep_aliases = set()
+    for fi in files.values():
+        names = {m.group(1) for m in re.finditer(r'\bconst\s+(\w+)\s*=\s*@import\("([^".]+)"\)', fi.src) if m.group(2) in seen}
+        for _ in range(4):
+            more = {m.group(1) for m in re.finditer(r"\bconst\s+(\w+)\s*=\s*(\w+)(?:\.\w+)+\s*;", fi.src) if m.group(2) in names}
+            if more <= names:
+                break
+            names |= more
+        dep_aliases |= names
+    dep_call = None
+    if dep_aliases and dep_burned:
+        dep_call = re.compile(
+            r"\b(?:" + "|".join(map(re.escape, sorted(dep_aliases))) + r")(?:\.\w+)*\.(?:"
+            + "|".join(map(re.escape, sorted(dep_burned))) + r")\s*\("
+        )
+    for n, bs in bodies.items():
+        if dep_call and any(dep_call.search(b) for b in bs):
+            burned.add(n)
     calls = {n: {c for b in bs for c in CALL.findall(b)} - {n} for n, bs in bodies.items()}
+    # A THIN wrapper: every body under this name is short (a line or two of
+    # argument shaping around one call). A long body that reaches a burn on one
+    # path (opcua's `Channel.call`) is not burned on the others.
+    thin = {n: all(len(" ".join(b.split())) <= 600 for b in bs) for n, bs in bodies.items()}
+    # Propagate only through thin PUBLIC wrappers (`sign` -> `signWithPrefix` ->
+    # `signFormat`, each a pub fn): a private helper that reaches a burn on
+    # SOME path (opcua's `Channel.call` decrypts with RSA only for an OPN
+    # message) must not make every caller look burned.
     grew = True
     while grew:
         grew = False
         for n, cs in calls.items():
-            if n not in burned and not cs.isdisjoint(burned):
+            if n in fn_names and n not in burned and thin.get(n) and not cs.isdisjoint(burned):
                 burned.add(n)
                 grew = True
+    if want_burned:
+        return {e[2] for e in entries if e[2] in burned}
     findings = []
     for f, fi, name, params, ret, body, pos, public in entries:
         if not public:
@@ -570,6 +650,8 @@ def scan_module(module):
         if touches == ["self"] and not rs and ACCESSOR.match(name):
             continue
         if not (set(CALL.findall(body)) - {name}).isdisjoint(burned):
+            continue
+        if dep_call and dep_call.search(body):
             continue
         findings.append((module, rel, line, qual, "noburn", ",".join(touches) or rs))
     return findings

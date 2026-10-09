@@ -193,7 +193,8 @@ noinline fn parseHexAndWipe() void {
 }
 
 noinline fn keyPairAndWipe() void {
-    var kp = sb.keyPairFromSecretKey(codec_sk) catch unreachable;
+    var kp: sb.KeyPair = undefined;
+    sb.keyPairFromSecretKey(&kp, &codec_sk) catch unreachable;
     sb.wipe(&kp.secret_key);
 }
 

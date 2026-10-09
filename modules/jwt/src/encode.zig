@@ -46,6 +46,7 @@ pub const SigningKey = union(enum) {
     ml_dsa_65: *const root.MlDsa65.KeyPair,
     ml_dsa_87: *const root.MlDsa87.KeyPair,
 
+    // secret-api-ok: SigningKey is a union of BORROWED slices / pointers (see its doc comment); a by-value copy copies a pointer, never key bytes
     pub fn alg(k: SigningKey) root.Alg {
         return switch (k) {
             .hs256 => .HS256,
@@ -62,6 +63,7 @@ pub const SigningKey = union(enum) {
 
     /// The matching verification key, for a caller that issues and verifies
     /// (or tests a round trip). A borrowed HMAC secret stays borrowed.
+    // secret-api-ok: SigningKey is a union of BORROWED slices / pointers (see its doc comment); a by-value copy copies a pointer, never key bytes
     pub fn verificationKey(k: SigningKey) root.Key {
         return switch (k) {
             .hs256, .hs384, .hs512 => |s| .{ .hmac = s },
@@ -98,6 +100,7 @@ pub const EncodeError = error{
 /// `std.json` — a struct (optional fields left null are omitted), a
 /// `std.json.Value`, anything `std.json.Stringify` takes that is a JSON
 /// object. The caller owns the result.
+// secret-api-ok: SigningKey is a union of BORROWED slices / pointers (a by-value copy copies a pointer); the signature primitive runs in `sign` under its burn
 pub fn encode(gpa: std.mem.Allocator, claims: anytype, key: SigningKey, opts: EncodeOptions) EncodeError![]u8 {
     const json = std.json.Stringify.valueAlloc(gpa, claims, .{ .emit_null_optional_fields = false }) catch
         return error.OutOfMemory;
@@ -108,6 +111,7 @@ pub fn encode(gpa: std.mem.Allocator, claims: anytype, key: SigningKey, opts: En
 /// A signed compact token whose payload is `claims_json` verbatim. It must
 /// be exactly one JSON object (RFC 7519 §7.1 step 2); anything else is
 /// `error.InvalidClaims`. The caller owns the result.
+// secret-api-ok: SigningKey is a union of BORROWED slices / pointers (a by-value copy copies a pointer); the signature primitive runs in `sign` under its burn
 pub fn encodeJson(gpa: std.mem.Allocator, claims_json: []const u8, key: SigningKey, opts: EncodeOptions) EncodeError![]u8 {
     if (!isOneObject(gpa, claims_json)) return error.InvalidClaims;
     try checkKey(key);

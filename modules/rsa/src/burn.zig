@@ -34,3 +34,8 @@ pub noinline fn stack(comptime n: usize) void {
 /// operation's ~1 ms. Nested public calls (`signPkcs1v15` →
 /// `signPkcs1v15Blinded`) burn at each level.
 pub const private_op_burn = 200 * 1024;
+
+/// `bcryptPbkdf` and `Blowfish.init` (4 KiB Blowfish state per frame, one
+/// SHA-512 of the passphrase): one-shot slow KDF, generous size, not yet
+/// measured (`stackprobe2_test.zig`, 2026-10-09).
+pub const kdf_burn = 32 * 1024;

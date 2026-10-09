@@ -451,12 +451,14 @@ pub const Session = struct {
     }
 
     /// §5.3 SSH_MSG_CHANNEL_EOF — "no more data from me".
+    // secret-api-ok: channel layer; it reaches the Transport only through sendPacket/recvPacket, which run under record_burn (writePacket/readPacket), and holds no key material itself.
     pub fn sendEof(self: *Session) ChannelError!void {
         return sendEofMsg(self.t, &self.ch);
     }
 
     /// §5.3 SSH_MSG_CHANNEL_CLOSE. After sending, only the peer's own CLOSE
     /// is still expected.
+    // secret-api-ok: channel layer; it reaches the Transport only through sendPacket/recvPacket, which run under record_burn (writePacket/readPacket), and holds no key material itself.
     pub fn close(self: *Session) ChannelError!void {
         return sendCloseMsg(self.t, &self.ch);
     }
@@ -465,6 +467,7 @@ pub const Session = struct {
     /// the §6.10 exit status. Answers the peer's CLOSE with our own — unless
     /// the peer has hung up by then (Go's x/crypto/ssh server closes the
     /// connection right after its CLOSE): everything was delivered.
+    // secret-api-ok: channel layer; it reaches the Transport only through sendPacket/recvPacket, which run under record_burn (writePacket/readPacket), and holds no key material itself.
     pub fn drain(self: *Session) ChannelError!void {
         while (!self.ch.got_close) {
             switch (try self.pumpOnce()) {
@@ -500,6 +503,7 @@ pub const Session = struct {
     /// up, `exit-status` / `exit-signal` are recorded. On a `Connection`, the
     /// message may belong to another of its channels: it is applied there and
     /// this returns `.other`.
+    // secret-api-ok: channel layer; it reaches the Transport only through sendPacket/recvPacket, which run under record_burn (writePacket/readPacket), and holds no key material itself.
     pub fn pumpOnce(self: *Session) ChannelError!Event {
         if (self.conn) |c| return c.pumpFor(self);
         const pkt = try self.t.recvPacket(self.scratch);
@@ -827,6 +831,7 @@ pub const Connection = struct {
 
     /// The next `forwarded-tcpip` channel the server opened for a remote
     /// forward (pumping until one arrives), with where it came from.
+    // secret-api-ok: channel layer; it reaches the Transport only through sendPacket/recvPacket, which run under record_burn (writePacket/readPacket), and holds no key material itself.
     pub fn acceptForwarded(self: *Connection) ChannelError!struct { session: *Session, origin: ForwardedOrigin } {
         while (self.forwarded.items.len == 0) _ = try self.pumpFor(null);
         const s = self.forwarded.orderedRemove(0);
@@ -977,6 +982,7 @@ pub const ExecOptions = struct {
 ///
 /// `t` must be a transport that has completed userauth
 /// (`userauth.authenticate`).
+// secret-api-ok: channel layer; it reaches the Transport only through sendPacket/recvPacket, which run under record_burn (writePacket/readPacket), and holds no key material itself.
 pub fn exec(
     t: *transport.Transport,
     gpa: std.mem.Allocator,
@@ -1218,6 +1224,7 @@ pub const ServeConfig = struct {
 /// size), then `exit-status`, EOF and CLOSE.
 ///
 /// Returns when the channel is closed both ways, or on SSH_MSG_DISCONNECT.
+// secret-api-ok: channel layer; it reaches the Transport only through sendPacket/recvPacket, which run under record_burn (writePacket/readPacket), and holds no key material itself.
 pub fn serveSession(
     t: *transport.Transport,
     gpa: std.mem.Allocator,
@@ -1238,6 +1245,7 @@ pub fn serveSession(
 ///
 /// Returns on SSH_MSG_DISCONNECT, or when the client hangs up with no
 /// channel left open.
+// secret-api-ok: channel layer; it reaches the Transport only through sendPacket/recvPacket, which run under record_burn (writePacket/readPacket), and holds no key material itself.
 pub fn serveConnection(
     t: *transport.Transport,
     gpa: std.mem.Allocator,

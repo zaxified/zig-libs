@@ -202,8 +202,20 @@ fn expandSecretKey(sk: SecretKey) ExpandedSecretKey {
 /// scalar... Depending on the ciphersuite... derived from SK") — exposed
 /// so callers/tests can pin it against RFC 9381 Appendix B.3's published
 /// `x` values independent of `prove`'s end-to-end output.
-pub fn secretScalar(sk: SecretKey) [32]u8 {
-    return expandSecretKey(sk).x;
+///
+/// `x` goes into `out` (zeroed by the caller's own discipline; never
+/// returned) and `sk` comes by pointer; the body is burned (`burn.zig`,
+/// `stackprobe2_test.zig`).
+pub fn secretScalar(out: *[32]u8, sk: *const SecretKey) void {
+    secretScalarUnburned(out, sk);
+    burn.stack(burn.key_burn);
+}
+
+noinline fn secretScalarUnburned(out: *[32]u8, sk: *const SecretKey) void {
+    var e = expandSecretKey(sk.*);
+    defer std.crypto.secureZero(u8, &e.x);
+    defer std.crypto.secureZero(u8, &e.prefix);
+    out.* = e.x;
 }
 
 /// `Y = x*B` (RFC 9381's parameter list), compressed — RFC 9381 §5.5 /
@@ -262,8 +274,15 @@ pub fn encodeToCurve(pk_string: PublicKey, alpha_string: []const u8) PublicKey {
 /// §5.1.6 step 2's `r`, before "interpret ... as little-endian ... mod
 /// q") — exposed separately from `nonceGeneration` so callers/tests can
 /// pin it against RFC 9381 Appendix B.3's published `k_string` values.
-pub fn nonceGenerationString(sk: SecretKey, h_string: PublicKey) [64]u8 {
-    return nonceStringFrom(&sk, h_string);
+///
+/// `sk` by pointer, `k_string` into `out`; burned (`burn.zig`).
+pub fn nonceGenerationString(out: *[64]u8, sk: *const SecretKey, h_string: PublicKey) void {
+    nonceGenerationStringUnburned(out, sk, h_string);
+    burn.stack(burn.key_burn);
+}
+
+noinline fn nonceGenerationStringUnburned(out: *[64]u8, sk: *const SecretKey, h_string: PublicKey) void {
+    out.* = nonceStringFrom(sk, h_string);
 }
 
 /// `nonceGenerationString` over a borrowed seed, so `prove` does not hand
@@ -292,10 +311,17 @@ fn nonceStringFrom(sk: *const SecretKey, h_string: PublicKey) [64]u8 {
 /// `k = string_to_int(k_string) mod q` — `scalar.reduce64` is exactly
 /// "interpret 64 little-endian bytes as an integer, reduce mod the
 /// group order".
-pub fn nonceGeneration(sk: SecretKey, h_string: PublicKey) [32]u8 {
-    var k_string = nonceGenerationString(sk, h_string);
+///
+/// `sk` by pointer, `k` into `out`; burned (`burn.zig`).
+pub fn nonceGeneration(out: *[32]u8, sk: *const SecretKey, h_string: PublicKey) void {
+    nonceGenerationUnburned(out, sk, h_string);
+    burn.stack(burn.key_burn);
+}
+
+noinline fn nonceGenerationUnburned(out: *[32]u8, sk: *const SecretKey, h_string: PublicKey) void {
+    var k_string = nonceStringFrom(sk, h_string);
     defer std.crypto.secureZero(u8, &k_string);
-    return scalar.reduce64(k_string);
+    out.* = scalar.reduce64(k_string);
 }
 
 /// RFC 9381 §5.4.3 `ECVRF_challenge_generation(P1, P2, P3, P4, P5)`: hash
@@ -413,8 +439,11 @@ pub const KeyPair = struct {
     secret_key: SecretKey,
     public_key: PublicKey,
 
-    pub fn fromSecretKey(sk: *const SecretKey) KeyPair {
-        return .{ .secret_key = sk.*, .public_key = publicKey(sk) };
+    /// Fills `out` (the key pair is never returned: a returned value is a
+    /// copy of the seed in the caller's frame). `publicKey` carries the burn.
+    pub fn fromSecretKey(out: *KeyPair, sk: *const SecretKey) void {
+        out.secret_key = sk.*;
+        out.public_key = publicKey(sk);
     }
 
     /// `ECVRF_prove` under this key pair; the same 80 bytes `prove` returns.

@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). Pointer-keyed twins of the std-shaped
+  by-value surface, so a caller need not leave a key copy in its own frame: `ChaCha20.xorInto`,
+  `ChaCha20.streamInto`, `ChaCha20Poly1305.encryptInto`, `ChaCha20Poly1305.decryptInto`
+  (`key: *const [32]u8`). `xor`/`stream`/`encrypt`/`decrypt` stay (the std shape `aeadframe` and
+  other generic callers instantiate) and keep their existing 2 / 4 KiB per-message burns; the
+  bodies now take the key by pointer, so the twins add no copy above the burn. Additive.
+  `stackprobe2_test.zig` probes the twins (short and wide paths).
 - **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte
   vector stores LLVM realigned the frame of a burn of 2 KiB or less (`and $-32, %rsp`), and the 32..63
   bytes between the zeroed buffer and the saved frame pointer kept whatever a callee had left there

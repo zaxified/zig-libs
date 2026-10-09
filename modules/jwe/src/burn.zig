@@ -23,6 +23,15 @@ pub noinline fn stack(comptime n: usize) void {
     for (0..buf.len) |i| p[i] = @splat(0);
 }
 
+/// `f(args)` in a frame of its own, then `stack(n)` at the same depth.
+/// `inline`, so the argument tuple lives in the entry point's frame -- it holds
+/// only pointers and public values, never a secret by value.
+pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args: anytype) R {
+    const r: R = @call(.never_inline, f, args);
+    stack(n);
+    return r;
+}
+
 /// Ephemeral key generation and `deriveZ`: the body plus `P256.mulInto` (which
 /// burns its own 8 KiB) and `affineCoordinates` dirtied 8.9-9.3 KiB in
 /// ReleaseFast before the fix; the body's own share is the part below
@@ -37,3 +46,7 @@ pub const content_burn = 32 * 1024;
 /// The Concat KDF (SHA-256 rounds over `Z`): 750 B in ReleaseFast
 /// (2026-10-08).
 pub const kdf_burn = 4 * 1024;
+
+/// `alg.rsaOaepWrap`: the OAEP data block and the public-key operation, one
+/// shot (generous, not yet measured; `stackprobe2_test.zig`, 2026-10-09).
+pub const rsa_wrap_burn = 64 * 1024;

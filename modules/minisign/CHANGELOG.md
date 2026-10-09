@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — `RawSecretKey.toBytes` and `RawSecretKey.fromBytes` now run under a burn (`codec_burn`); `formatKeyId` is marked a false positive of the dead-stack lint (a key id is public). No signature changed. Probe: `src/stackprobe2_test.zig`.
 - **2026-10-09** — **BREAKING, HIGH: key generation, signing, sealing and opening left the secret
   key, nonce and password on the dead stack.** New ReleaseFast stack probe (`stackprobe_test.zig`),
   5 calls each, before → after (seed / scalar `a` / nonce prefix / nonce `r` / `seed ‖ pk` image

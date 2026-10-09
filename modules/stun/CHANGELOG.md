@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** `longTermKey(out: *[16]u8, username, realm, password) void` writes the key into `out` (was: returned `[16]u8` by value, leaving a copy in the caller's frame); migrate with `var key: [16]u8 = undefined; longTermKey(&key, ...)` and wipe `key` after use. `longTermKey` (8 KiB), `Builder.addMessageIntegrity` and `Message.verifyMessageIntegrity` (2 KiB, per packet) now run under dead-stack burns (`burn.zig`); new `stackprobe_test.zig` on `testkit.stackprobe`.
+
 - **2026-10-04** — mvp → core (survey 2026-09-30 backlog). ADDED: the server side
   (`bindingResponse`, `ResponderOptions`, `RespondError`) — reproduces RFC 5769 §2.2/§2.3 byte
   for byte; `longTermKey` (RFC 8489 §9.2 MD5 key; verifies RFC 5769 §2.4); `parseUri`

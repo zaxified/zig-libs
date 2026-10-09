@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** `decryptData`, `decryptAssertion` and `decryptDataToDocument` take
+  the RSA key by pointer (`sk: *const rsa.SecretKey`, was by value): a by-value `SecretKey` is a
+  full copy of `d`, `p`, `q`, `dP`, `dQ`, `qInv` in the caller's frame that the module cannot wipe.
+  `decryptData` (and through it the other two) now runs under a 64 KiB dead-stack burn
+  (`src/burn.zig`, one-shot RSA-class); `stackprobe_test.zig` probes all three. The private
+  helpers (`unwrapCek`, the OAEP / PKCS#1 v1.5 arms) pass the key by pointer too. Migrated in-repo:
+  `saml` (two call sites), the example, the tests; also `aescbc.decrypt` now takes its key by
+  pointer (see `aescbc`).
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** RSA-OAEP unwrapping passes the key to rsa by pointer,
   and the test key fixtures and the example build through rsa's out-param constructors
   (rsa 2026-10-08).

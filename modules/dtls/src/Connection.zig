@@ -425,6 +425,7 @@ pub const Config = struct {
     /// mandatory even in certificate mode (see the "certificate mode: what
     /// 'mode' means here" note below) — a `Config` with `cert` set but an
     /// empty `psk` is still rejected.
+    // secret-api-ok: Config holds only slices and pointers (psk, cookie_secret, `SecretKey` is a union of pointers to the key), so the by-value copy copies no secret byte; it reads no secret either.
     pub fn validate(self: Config) ConfigError!void {
         if (self.cipher_suites.len == 0) return error.NoCipherSuites;
         // A suite with no `suiteParams` entry cannot have keys installed, so
@@ -1681,11 +1682,13 @@ pub const Connection = struct {
 
     pub const InitError = ConfigError;
 
+    // secret-api-ok: returns a freshly initialised Connection: no key material exists yet (keys are derived later, in place, under the `handleFlight` / `installApplicationKeys` burns); Config is slices and pointers only.
     pub fn clientInit(config: Config) InitError!Connection {
         try config.validate();
         return .{ .role = .client, .config = config };
     }
 
+    // secret-api-ok: returns a freshly initialised Connection: no key material exists yet (keys are derived later, in place, under the `handleFlight` / `installApplicationKeys` burns); Config is slices and pointers only.
     pub fn serverInit(config: Config) InitError!Connection {
         try config.validate();
         return .{ .role = .server, .config = config };
@@ -1951,8 +1954,8 @@ pub const Connection = struct {
         const my_secret = if (self.role == .client) client_ap_secret else server_ap_secret;
         const peer_secret = if (self.role == .client) server_ap_secret else client_ap_secret;
 
-        self.write_keys = deriveDir(Hkdf, params, my_secret.*);
-        self.read_keys = deriveDir(Hkdf, params, peer_secret.*);
+        self.write_keys = deriveDir(Hkdf, params, my_secret);
+        self.read_keys = deriveDir(Hkdf, params, peer_secret);
         self.suite = suite;
         self.epoch = application_epoch;
         self.send_seq = 0;
@@ -2013,7 +2016,7 @@ pub const Connection = struct {
         const hdr_len = hdr_slice.len;
         if (out.len < hdr_len + ct_len) return error.BufferTooShort;
 
-        const n = protectDispatch(self.suite, self.write_keys, self.epoch, self.send_seq, inner, out[0..hdr_len], out[hdr_len..]) catch
+        const n = protectDispatch(self.suite, &self.write_keys, self.epoch, self.send_seq, inner, out[0..hdr_len], out[hdr_len..]) catch
             return error.BufferTooShort;
         std.debug.assert(n == ct_len);
 
@@ -2021,7 +2024,7 @@ pub const Connection = struct {
         // 16-byte sample of the record ciphertext. The seq bytes follow the
         // 1-byte flags (and CID, if any) — here no CID, so offset 1.
         const seq_off: usize = 1;
-        try snMaskDispatch(self.suite, self.write_keys, out[hdr_len..][0..16], out[seq_off..][0..seq_bytes_n]);
+        try snMaskDispatch(self.suite, &self.write_keys, out[hdr_len..][0..16], out[seq_off..][0..seq_bytes_n]);
 
         self.send_seq +%= 1;
         return out[0 .. hdr_len + ct_len];
@@ -2060,7 +2063,7 @@ pub const Connection = struct {
         var hdr_buf: [16]u8 = undefined;
         if (hdr_len > hdr_buf.len) return error.Malformed;
         @memcpy(hdr_buf[0..hdr_len], datagram[0..hdr_len]);
-        try snMaskDispatch(self.suite, self.read_keys, ct[0..16], hdr_buf[seq_off..][0..seq_bytes_n]);
+        try snMaskDispatch(self.suite, &self.read_keys, ct[0..16], hdr_buf[seq_off..][0..seq_bytes_n]);
 
         const wire_low: u16 = if (seq_len == .short)
             hdr_buf[seq_off]
@@ -2069,7 +2072,7 @@ pub const Connection = struct {
         const largest = if (self.recv_seen_any) self.recv_max_seq else 0;
         const full_seq = record.reconstructSequenceNumber(largest, seq_len, wire_low);
 
-        const body_len = unprotectDispatch(self.suite, self.read_keys, self.epoch, full_seq, ct, hdr_buf[0..hdr_len], out) catch
+        const body_len = unprotectDispatch(self.suite, &self.read_keys, self.epoch, full_seq, ct, hdr_buf[0..hdr_len], out) catch
             return error.DecryptionFailed;
         if (body_len == 0) return error.Malformed; // must hold at least the content type
 
@@ -2261,9 +2264,12 @@ pub const Connection = struct {
         const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
         const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
         const eh = emptySha256Hash();
-        const es = keyschedule.earlySecret(Hkdf, self.config.psk);
-        const bk = keyschedule.binderKey(Hkdf, es, &eh);
-        const binder = keyschedule.pskBinder(Hkdf, Hmac, bk, &binder_th);
+        var es: [32]u8 = undefined;
+        var bk: [32]u8 = undefined;
+        var binder: [32]u8 = undefined;
+        keyschedule.earlySecret(Hkdf, &es, self.config.psk);
+        keyschedule.binderKey(Hkdf, &bk, &es, &eh);
+        keyschedule.pskBinder(Hkdf, Hmac, &binder, &bk, &binder_th);
         @memcpy(ch_full[ch_full.len - 32 ..], &binder);
 
         return ch_full;
@@ -2463,12 +2469,12 @@ pub const Connection = struct {
         const hdr_len = hdr_slice.len;
         if (out.len < hdr_len + ct_len) return error.BufferTooShort;
 
-        const n = protectDispatch(self.suite, self.hs_write_keys, 2, self.hs2.send_seq, inner, out[0..hdr_len], out[hdr_len..]) catch
+        const n = protectDispatch(self.suite, &self.hs_write_keys, 2, self.hs2.send_seq, inner, out[0..hdr_len], out[hdr_len..]) catch
             return error.BufferTooShort;
         std.debug.assert(n == ct_len);
 
         const seq_off: usize = 1;
-        try snMaskDispatch(self.suite, self.hs_write_keys, out[hdr_len..][0..16], out[seq_off..][0..seq_bytes_n]);
+        try snMaskDispatch(self.suite, &self.hs_write_keys, out[hdr_len..][0..16], out[seq_off..][0..seq_bytes_n]);
 
         self.hs2.send_seq +%= 1;
         return out[0 .. hdr_len + ct_len];
@@ -2499,7 +2505,7 @@ pub const Connection = struct {
         var hdr_buf: [16]u8 = undefined;
         if (hdr_len > hdr_buf.len) return error.Malformed;
         @memcpy(hdr_buf[0..hdr_len], record_bytes[0..hdr_len]);
-        try snMaskDispatch(self.suite, self.hs_read_keys, ct[0..16], hdr_buf[seq_off..][0..seq_bytes_n]);
+        try snMaskDispatch(self.suite, &self.hs_read_keys, ct[0..16], hdr_buf[seq_off..][0..seq_bytes_n]);
 
         const wire_low: u16 = if (seq_len == .short)
             hdr_buf[seq_off]
@@ -2508,7 +2514,7 @@ pub const Connection = struct {
         const largest = if (self.hs2.recv_seen_any) self.hs2.recv_max_seq else 0;
         const full_seq = record.reconstructSequenceNumber(largest, seq_len, wire_low);
 
-        const body_len = unprotectDispatch(self.suite, self.hs_read_keys, 2, full_seq, ct, hdr_buf[0..hdr_len], out) catch
+        const body_len = unprotectDispatch(self.suite, &self.hs_read_keys, 2, full_seq, ct, hdr_buf[0..hdr_len], out) catch
             return error.DecryptionFailed;
         if (body_len == 0) return error.Malformed;
 
@@ -3238,10 +3244,12 @@ pub const Connection = struct {
                 if (truncate_at > ch_body.len) return error.Malformed;
                 const truncated = ch_body[0..truncate_at];
 
-                es = keyschedule.earlySecret(Hkdf, self.config.psk);
-                const bk = keyschedule.binderKey(Hkdf, es, &eh);
+                keyschedule.earlySecret(Hkdf, &es, self.config.psk);
+                var bk: [32]u8 = undefined;
+                keyschedule.binderKey(Hkdf, &bk, &es, &eh);
                 const binder_th = self.transcript.wouldBeHash(@intFromEnum(messages.HandshakeType.client_hello), ch_body.len, truncated);
-                const expected_binder = keyschedule.pskBinder(Hkdf, Hmac, bk, &binder_th);
+                var expected_binder: [32]u8 = undefined;
+                keyschedule.pskBinder(Hkdf, Hmac, &expected_binder, &bk, &binder_th);
                 if (!std.crypto.timing_safe.eql([32]u8, expected_binder, binder0[0..32].*)) return error.BinderVerifyFailed;
             },
             .cert_dhe, .cert_dhe_insecure_unauthenticated => {
@@ -3267,7 +3275,7 @@ pub const Connection = struct {
                 dhe_shared = ex.shared;
                 std.crypto.secureZero(u8, &ex.shared.bytes); // the copy in `dhe_shared` is now the only live one
                 const zero_psk = [_]u8{0} ** 32;
-                es = keyschedule.earlySecret(Hkdf, &zero_psk);
+                keyschedule.earlySecret(Hkdf, &es, &zero_psk);
             },
         }
 
@@ -3353,14 +3361,13 @@ pub const Connection = struct {
         // through ServerHello.
         const th_through_sh = self.transcript.currentHash();
         const dhe_ptr: ?[]const u8 = if (dhe_shared) |*s| s.slice() else null;
-        const hs_secret = keyschedule.deriveHandshakeSecret(Hkdf, es, &eh, dhe_ptr);
+        var hs_secret: [32]u8 = undefined;
+        keyschedule.deriveHandshakeSecret(Hkdf, &hs_secret, &es, &eh, dhe_ptr);
         if (dhe_shared) |*s| std.crypto.secureZero(u8, &s.bytes); // forward secrecy: drop the (EC)DHE shared secret
-        const hst = keyschedule.deriveHandshakeTrafficSecrets(Hkdf, hs_secret, &th_through_sh);
-        self.hs_traffic_client = hst.client;
-        self.hs_traffic_server = hst.server;
+        keyschedule.deriveHandshakeTrafficSecrets(Hkdf, &self.hs_traffic_client, &self.hs_traffic_server, &hs_secret, &th_through_sh);
         const params = suiteParams(suite) orelse return error.UnsupportedSuite;
-        self.hs_write_keys = deriveDir(Hkdf, params, hst.server);
-        self.hs_read_keys = deriveDir(Hkdf, params, hst.client);
+        self.hs_write_keys = deriveDir(Hkdf, params, &self.hs_traffic_server);
+        self.hs_read_keys = deriveDir(Hkdf, params, &self.hs_traffic_client);
 
         var ee_body_buf: [8]u8 = undefined;
         const ee_body = messages.encodeEncryptedExtensions(&.{}, &ee_body_buf) catch return error.BufferTooShort;
@@ -3421,9 +3428,11 @@ pub const Connection = struct {
             extra_n += 1;
         }
 
-        const finished_key = keyschedule.deriveFinishedKey(Hkdf, 32, hst.server);
+        var finished_key: [32]u8 = undefined;
+        keyschedule.deriveFinishedKey(Hkdf, 32, &finished_key, &self.hs_traffic_server);
         const th_before_finished = self.transcript.currentHash();
-        const verify_data = keyschedule.computeFinishedVerifyData(Hmac, finished_key, &th_before_finished);
+        var verify_data: [32]u8 = undefined;
+        keyschedule.computeFinishedVerifyData(Hmac, &verify_data, &finished_key, &th_before_finished);
         self.transcript.append(@intFromEnum(messages.HandshakeType.finished), &verify_data);
         var fin_frag_buf: [32 + handshake.header_len]u8 = undefined;
         const fin_fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.finished), self.message_seq, &verify_data, &fin_frag_buf);
@@ -3434,11 +3443,10 @@ pub const Connection = struct {
             cursor += fin_record.len;
         }
 
-        const ms = keyschedule.deriveMasterSecret(Hkdf, hs_secret, &eh);
+        var ms: [32]u8 = undefined;
+        keyschedule.deriveMasterSecret(Hkdf, &ms, &hs_secret, &eh);
         const th_through_server_finished = self.transcript.currentHash();
-        const ap = keyschedule.deriveApplicationTrafficSecrets(Hkdf, ms, &th_through_server_finished);
-        self.pending_ap_client = ap.client;
-        self.pending_ap_server = ap.server;
+        keyschedule.deriveApplicationTrafficSecrets(Hkdf, &self.pending_ap_client, &self.pending_ap_server, &ms, &th_through_server_finished);
 
         var all_records: [6]flight.RecordNumber = undefined;
         var n: usize = 0;
@@ -3485,9 +3493,11 @@ pub const Connection = struct {
 
         const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
         const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
-        const finished_key = keyschedule.deriveFinishedKey(Hkdf, 32, self.hs_traffic_client);
+        var finished_key: [32]u8 = undefined;
+        keyschedule.deriveFinishedKey(Hkdf, 32, &finished_key, &self.hs_traffic_client);
         const th = self.transcript.currentHash(); // through the server's own Finished
-        const expected = keyschedule.computeFinishedVerifyData(Hmac, finished_key, &th);
+        var expected: [32]u8 = undefined;
+        keyschedule.computeFinishedVerifyData(Hmac, &expected, &finished_key, &th);
         if (!std.crypto.timing_safe.eql([32]u8, expected, fin.verify_data[0..32].*)) return error.FinishedVerifyFailed;
         self.transcript.append(@intFromEnum(messages.HandshakeType.finished), fin.verify_data);
 
@@ -3708,8 +3718,9 @@ pub const Connection = struct {
         var hs_secret: [32]u8 = undefined;
         switch (self.config.key_exchange) {
             .psk => {
-                const es = keyschedule.earlySecret(Hkdf, self.config.psk);
-                hs_secret = keyschedule.deriveHandshakeSecret(Hkdf, es, &eh, null);
+                var es: [32]u8 = undefined;
+                keyschedule.earlySecret(Hkdf, &es, self.config.psk);
+                keyschedule.deriveHandshakeSecret(Hkdf, &hs_secret, &es, &eh, null);
             },
             .cert_dhe, .cert_dhe_insecure_unauthenticated => {
                 const server_share = try serverHelloShare(sh_dec.extensions);
@@ -3732,18 +3743,17 @@ pub const Connection = struct {
                 std.crypto.secureZero(u8, &self.ecdhe_secret); // forward secrecy: drop the ephemeral private key
                 self.ecdhe_secret_live = false;
                 const zero_psk = [_]u8{0} ** 32;
-                const es = keyschedule.earlySecret(Hkdf, &zero_psk);
-                hs_secret = keyschedule.deriveHandshakeSecret(Hkdf, es, &eh, shared.slice());
+                var es: [32]u8 = undefined;
+                keyschedule.earlySecret(Hkdf, &es, &zero_psk);
+                keyschedule.deriveHandshakeSecret(Hkdf, &hs_secret, &es, &eh, shared.slice());
                 std.crypto.secureZero(u8, &shared.bytes); // forward secrecy: drop the (EC)DHE shared secret
             },
         }
         const th_through_sh = self.transcript.currentHash();
-        const hst = keyschedule.deriveHandshakeTrafficSecrets(Hkdf, hs_secret, &th_through_sh);
-        self.hs_traffic_client = hst.client;
-        self.hs_traffic_server = hst.server;
+        keyschedule.deriveHandshakeTrafficSecrets(Hkdf, &self.hs_traffic_client, &self.hs_traffic_server, &hs_secret, &th_through_sh);
         const params = suiteParams(suite).?;
-        self.hs_write_keys = deriveDir(Hkdf, params, hst.client);
-        self.hs_read_keys = deriveDir(Hkdf, params, hst.server);
+        self.hs_write_keys = deriveDir(Hkdf, params, &self.hs_traffic_client);
+        self.hs_read_keys = deriveDir(Hkdf, params, &self.hs_traffic_server);
 
         var ee_msg_buf: [64]u8 = undefined;
         var ee_received_buf: [64]bool = undefined;
@@ -3770,9 +3780,11 @@ pub const Connection = struct {
         const server_fin = messages.decodeFinished(cert_result.finishedVerifyData());
         if (server_fin.verify_data.len != 32) return error.Malformed;
 
-        const server_finished_key = keyschedule.deriveFinishedKey(Hkdf, 32, hst.server);
+        var server_finished_key: [32]u8 = undefined;
+        keyschedule.deriveFinishedKey(Hkdf, 32, &server_finished_key, &self.hs_traffic_server);
         const th_before_server_finished = self.transcript.currentHash();
-        const expected_server_vd = keyschedule.computeFinishedVerifyData(Hmac, server_finished_key, &th_before_server_finished);
+        var expected_server_vd: [32]u8 = undefined;
+        keyschedule.computeFinishedVerifyData(Hmac, &expected_server_vd, &server_finished_key, &th_before_server_finished);
         if (!std.crypto.timing_safe.eql([32]u8, expected_server_vd, server_fin.verify_data[0..32].*)) return error.FinishedVerifyFailed;
         self.transcript.append(@intFromEnum(messages.HandshakeType.finished), server_fin.verify_data);
 
@@ -3780,9 +3792,11 @@ pub const Connection = struct {
         // Finished" (RFC 8446 §7.1) regardless of whatever the client sends
         // next below — computed here, BEFORE any client-side certificate
         // messages are appended to the transcript.
-        const ms = keyschedule.deriveMasterSecret(Hkdf, hs_secret, &eh);
+        var ms: [32]u8 = undefined;
+        keyschedule.deriveMasterSecret(Hkdf, &ms, &hs_secret, &eh);
         const th_through_server_finished = self.transcript.currentHash();
-        const ap = keyschedule.deriveApplicationTrafficSecrets(Hkdf, ms, &th_through_server_finished);
+        var ap: struct { client: [32]u8, server: [32]u8 } = undefined;
+        keyschedule.deriveApplicationTrafficSecrets(Hkdf, &ap.client, &ap.server, &ms, &th_through_server_finished);
 
         // ── certificate mode: this client's own Certificate/CertificateVerify,
         // ONLY if the server asked (`cert_result.requested_client_cert`).
@@ -3825,9 +3839,11 @@ pub const Connection = struct {
             }
         }
 
-        const client_finished_key = keyschedule.deriveFinishedKey(Hkdf, 32, hst.client);
+        var client_finished_key: [32]u8 = undefined;
+        keyschedule.deriveFinishedKey(Hkdf, 32, &client_finished_key, &self.hs_traffic_client);
         const th_for_client_finished = self.transcript.currentHash();
-        const client_vd = keyschedule.computeFinishedVerifyData(Hmac, client_finished_key, &th_for_client_finished);
+        var client_vd: [32]u8 = undefined;
+        keyschedule.computeFinishedVerifyData(Hmac, &client_vd, &client_finished_key, &th_for_client_finished);
         self.transcript.append(@intFromEnum(messages.HandshakeType.finished), &client_vd);
 
         var fin_frag_buf: [32 + handshake.header_len]u8 = undefined;
@@ -3892,20 +3908,20 @@ fn secureZeroDirKeys(d: *DirKeys) void {
     std.crypto.secureZero(u8, &d.sn_key);
 }
 
-fn deriveDir(comptime Hkdf: type, params: SuiteParams, secret: [32]u8) DirKeys {
+fn deriveDir(comptime Hkdf: type, params: SuiteParams, secret: *const [32]u8) DirKeys {
     var d = DirKeys{ .key_len = params.key_len, .sn_len = params.sn_len };
     // Derive each of key + sn at the negotiated width (HKDF-Expand-Label's
     // length is part of its input, so a 16-byte "key" is NOT a prefix of a
     // 32-byte one — it must be expanded at the exact suite width).
-    d.iv = keyschedule.deriveTrafficKeyIv(Hkdf, 16, 12, secret).iv; // iv width is suite-independent (12)
+    // iv width is suite-independent (12)
     switch (params.key_len) {
-        16 => @memcpy(d.key[0..16], &keyschedule.deriveTrafficKeyIv(Hkdf, 16, 12, secret).key),
-        32 => @memcpy(d.key[0..32], &keyschedule.deriveTrafficKeyIv(Hkdf, 32, 12, secret).key),
+        16 => keyschedule.deriveTrafficKeyIv(Hkdf, 16, 12, d.key[0..16], &d.iv, secret),
+        32 => keyschedule.deriveTrafficKeyIv(Hkdf, 32, 12, d.key[0..32], &d.iv, secret),
         else => unreachable,
     }
     switch (params.sn_len) {
-        16 => @memcpy(d.sn_key[0..16], &keyschedule.deriveSequenceNumberKey(Hkdf, 16, secret)),
-        32 => @memcpy(d.sn_key[0..32], &keyschedule.deriveSequenceNumberKey(Hkdf, 32, secret)),
+        16 => keyschedule.deriveSequenceNumberKey(Hkdf, 16, d.sn_key[0..16], secret),
+        32 => keyschedule.deriveSequenceNumberKey(Hkdf, 32, d.sn_key[0..32], secret),
         else => unreachable,
     }
     return d;
@@ -3913,7 +3929,7 @@ fn deriveDir(comptime Hkdf: type, params: SuiteParams, secret: [32]u8) DirKeys {
 
 fn protectDispatch(
     suite: CipherSuite,
-    keys: DirKeys,
+    keys: *const DirKeys,
     epoch: u16,
     seq: u48,
     inner: []const u8,
@@ -3921,15 +3937,15 @@ fn protectDispatch(
     out: []u8,
 ) !usize {
     return switch (suite) {
-        .aes_128_gcm_sha256 => aead.Protection(Aes128Gcm).protect(keys.key[0..16].*, keys.iv, epoch, seq, inner, aad, out),
-        .chacha20_poly1305_sha256 => aead.Protection(ChaCha20Poly1305).protect(keys.key[0..32].*, keys.iv, epoch, seq, inner, aad, out),
+        .aes_128_gcm_sha256 => aead.Protection(Aes128Gcm).protect(keys.key[0..16], keys.iv, epoch, seq, inner, aad, out),
+        .chacha20_poly1305_sha256 => aead.Protection(ChaCha20Poly1305).protect(keys.key[0..32], keys.iv, epoch, seq, inner, aad, out),
         else => error.UnsupportedSuite,
     };
 }
 
 fn unprotectDispatch(
     suite: CipherSuite,
-    keys: DirKeys,
+    keys: *const DirKeys,
     epoch: u16,
     seq: u48,
     ct: []const u8,
@@ -3937,13 +3953,13 @@ fn unprotectDispatch(
     out: []u8,
 ) !usize {
     return switch (suite) {
-        .aes_128_gcm_sha256 => aead.Protection(Aes128Gcm).unprotect(keys.key[0..16].*, keys.iv, epoch, seq, ct, aad, out),
-        .chacha20_poly1305_sha256 => aead.Protection(ChaCha20Poly1305).unprotect(keys.key[0..32].*, keys.iv, epoch, seq, ct, aad, out),
+        .aes_128_gcm_sha256 => aead.Protection(Aes128Gcm).unprotect(keys.key[0..16], keys.iv, epoch, seq, ct, aad, out),
+        .chacha20_poly1305_sha256 => aead.Protection(ChaCha20Poly1305).unprotect(keys.key[0..32], keys.iv, epoch, seq, ct, aad, out),
         else => error.UnsupportedSuite,
     };
 }
 
-fn snMaskDispatch(suite: CipherSuite, keys: DirKeys, sample: []const u8, seq_bytes: []u8) !void {
+fn snMaskDispatch(suite: CipherSuite, keys: *const DirKeys, sample: []const u8, seq_bytes: []u8) !void {
     return switch (suite) {
         .aes_128_gcm_sha256 => aead.encryptSequenceNumberAes(keys.sn_key[0..16], sample, seq_bytes),
         .chacha20_poly1305_sha256 => aead.encryptSequenceNumberChaCha20(keys.sn_key[0..32], sample, seq_bytes),
@@ -3978,17 +3994,17 @@ test "protectDispatch(chacha20_poly1305_sha256): byte-identical to Protection(ch
     const aad = "record header bytes";
 
     var via_dispatch: [inner.len + 16]u8 = undefined;
-    const n1 = try protectDispatch(.chacha20_poly1305_sha256, keys, epoch, seq, inner, aad, &via_dispatch);
+    const n1 = try protectDispatch(.chacha20_poly1305_sha256, &keys, epoch, seq, inner, aad, &via_dispatch);
 
     var via_protection: [inner.len + 16]u8 = undefined;
-    const n2 = try aead.Protection(chachapoly.ChaCha20Poly1305).protect(keys.key, keys.iv, epoch, seq, inner, aad, &via_protection);
+    const n2 = try aead.Protection(chachapoly.ChaCha20Poly1305).protect(&keys.key, keys.iv, epoch, seq, inner, aad, &via_protection);
 
     try std.testing.expectEqual(n1, n2);
     try std.testing.expectEqualSlices(u8, via_protection[0..n2], via_dispatch[0..n1]);
 
     // And it opens back through the same two paths.
     var open_dispatch: [inner.len]u8 = undefined;
-    const m1 = try unprotectDispatch(.chacha20_poly1305_sha256, keys, epoch, seq, via_dispatch[0..n1], aad, &open_dispatch);
+    const m1 = try unprotectDispatch(.chacha20_poly1305_sha256, &keys, epoch, seq, via_dispatch[0..n1], aad, &open_dispatch);
     try std.testing.expectEqualSlices(u8, inner, open_dispatch[0..m1]);
 }
 
@@ -4243,7 +4259,9 @@ test "startHandshake: real ClientHello bytes, not a stub — real DTLS 1.3 fligh
 // client.send -> server.recv round-trips, sequence numbers advance and are
 // encrypted on the wire, and any tamper is rejected without a panic.
 
-fn deriveApSecrets(psk: []const u8) struct { c: [32]u8, s: [32]u8 } {
+const ApSecrets = struct { c: [32]u8, s: [32]u8 };
+
+fn deriveApSecrets(psk: []const u8) ApSecrets {
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
     const Sha256 = std.crypto.hash.sha2.Sha256;
     var empty: [32]u8 = undefined;
@@ -4251,11 +4269,15 @@ fn deriveApSecrets(psk: []const u8) struct { c: [32]u8, s: [32]u8 } {
     var th: [32]u8 = undefined;
     Sha256.hash("dtls self-consistency transcript through server Finished", &th, .{});
 
-    const es = keyschedule.earlySecret(Hkdf, psk);
-    const hs = keyschedule.deriveHandshakeSecret(Hkdf, es, &empty, null);
-    const ms = keyschedule.deriveMasterSecret(Hkdf, hs, &empty);
-    const ap = keyschedule.deriveApplicationTrafficSecrets(Hkdf, ms, &th);
-    return .{ .c = ap.client, .s = ap.server };
+    var es: [32]u8 = undefined;
+    var hs: [32]u8 = undefined;
+    var ms: [32]u8 = undefined;
+    var ap: ApSecrets = undefined;
+    keyschedule.earlySecret(Hkdf, &es, psk);
+    keyschedule.deriveHandshakeSecret(Hkdf, &hs, &es, &empty, null);
+    keyschedule.deriveMasterSecret(Hkdf, &ms, &hs, &empty);
+    keyschedule.deriveApplicationTrafficSecrets(Hkdf, &ap.c, &ap.s, &ms, &th);
+    return ap;
 }
 
 fn roundtripSuite(suite: CipherSuite) !void {
@@ -6802,12 +6824,14 @@ test "cert-DHE KAT: X25519 key_share + key schedule reproduce RFC 8448 §3 byte-
     // proven is that the X25519 output is the correct HKDF-Extract IKM.
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
     const zero_psk = [_]u8{0} ** 32;
-    const es = keyschedule.earlySecret(Hkdf, &zero_psk);
+    var es: [32]u8 = undefined;
+    keyschedule.earlySecret(Hkdf, &es, &zero_psk);
     try testing.expectEqualSlices(u8, &hx(32, "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"), &es);
 
     var empty_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("", &empty_hash, .{});
-    const salt = keyschedule.expandLabel(Hkdf, keyschedule.tls13_prefix, es, "derived", &empty_hash, 32);
+    var salt: [32]u8 = undefined;
+    keyschedule.expandLabel(Hkdf, keyschedule.tls13_prefix, 32, &salt, &es, "derived", &empty_hash);
     const hs = Hkdf.extract(&salt, &shared_c);
     try testing.expectEqualSlices(u8, &hx(32, "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), &hs);
 }

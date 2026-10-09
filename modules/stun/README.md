@@ -40,7 +40,7 @@ address. Sits alongside the rest of the `netaddr`-based network family.
   attributes it does not understand (declare ICE's with `known_attributes`),
   400/401 for missing/failing credentials. It reproduces RFC 5769 §2.2/§2.3
   byte for byte from the §2.1 request.
-- **`longTermKey(user, realm, password)`** — the RFC 8489 §9.2 MD5 key for
+- **`longTermKey(out, user, realm, password)`** — the RFC 8489 §9.2 MD5 key (into `out: *[16]u8`) for
   long-term credentials (inputs already OpaqueString-prepared; ASCII needs
   nothing). Verifies RFC 5769 §2.4's sample request.
 - **`parseUri`** — `stun:`/`stuns:` (RFC 7064) and `turn:`/`turns:` with

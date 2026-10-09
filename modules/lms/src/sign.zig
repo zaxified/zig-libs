@@ -226,6 +226,7 @@ pub const LmsSecretKey = struct {
     q: u32,
 
     /// Builds the key into `out` (see `Tree.init`; the seed goes in by pointer).
+    // secret-api-ok: a thin wrapper -- the seed goes by pointer into `Tree.init` (-> `initCached`, burned) and is never copied in this frame
     pub fn init(out: *LmsSecretKey, gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: *const [n]u8) Allocator.Error!void {
         out.q = 0;
         return Tree.init(&out.tree, gpa, lms, ots, id, seed);
@@ -244,6 +245,7 @@ pub const LmsSecretKey = struct {
     }
 
     /// Sign `msg`; returns `out[0..signatureLength()]`.
+    // secret-api-ok: delegates to `Tree.sign` (burned, `burn.sign_burn`); this frame holds only the leaf index, `self` is a pointer
     pub fn sign(self: *LmsSecretKey, msg: []const u8, out: []u8) SignError![]u8 {
         const len = self.signatureLength();
         if (self.q >= self.tree.lms.leaves()) return error.KeyExhausted;
@@ -330,6 +332,7 @@ pub const SecretKey = struct {
     /// supplies them (no RNG in this module) from a CSPRNG. `restore_at`
     /// restores an existing key; null starts at 0. On error `out` holds no
     /// secret.
+    // secret-api-ok: the seed arrives by pointer, is copied only into the caller's `out`, and the tree build runs under `Tree.initCached`'s burn
     pub fn init(out: *SecretKey, gpa: Allocator, levels: []const Level, seed: *const [n]u8, id: [id_len]u8, restore_at: ?Position) InitError!void {
         out.seed = @splat(0); // stays zero on every error return
         if (levels.len < 1 or levels.len > max_levels) return error.InvalidLevels;
@@ -535,6 +538,7 @@ pub const SigningKey = struct {
         return self.sk.pos;
     }
 
+    // secret-api-ok: thin guard around `SecretKey.signPersisting`, whose secret-touching steps (`ensureTrees`, `Tree.sign`) are burned; this frame holds pointers and the guard flag only
     pub fn sign(self: *SigningKey, msg: []const u8, out: []u8) Error![]u8 {
         if (self.home != self) return error.KeyHandleCopied;
         if (self.persist) |p| if (p.io) |io| {

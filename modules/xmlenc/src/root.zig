@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const xml = @import("xml");
+const burn = @import("burn.zig");
 const rsa = @import("rsa");
 const aescbc = @import("aescbc");
 const aeskw = @import("aeskw");
@@ -149,7 +150,7 @@ pub const Error = error{
 // ── public entry points ─────────────────────────────────────────────────────
 
 /// Decrypt an `<xenc:EncryptedData>` element and return the recovered plaintext
-/// octets (owned by `alloc`; caller frees). `sk` is the relying party's RSA
+/// octets (owned by `alloc`; caller frees). `sk` points to the relying party's RSA
 /// private key (used only for rsa-oaep* / rsa-1_5 key transport — for kw-aes*
 /// the CEK comes from `options.kek`, and `sk` is ignored).
 ///
@@ -166,7 +167,16 @@ pub const Error = error{
 pub fn decryptData(
     alloc: std.mem.Allocator,
     encrypted_data: *const xml.Element,
-    sk: rsa.SecretKey,
+    sk: *const rsa.SecretKey,
+    options: Options,
+) Error![]u8 {
+    return burn.run(burn.decrypt_burn, Error![]u8, decryptDataBody, .{ alloc, encrypted_data, sk, options });
+}
+
+fn decryptDataBody(
+    alloc: std.mem.Allocator,
+    encrypted_data: *const xml.Element,
+    sk: *const rsa.SecretKey,
     options: Options,
 ) Error![]u8 {
     if (!isEl(encrypted_data, xenc_ns, "EncryptedData")) return error.MalformedStructure;
@@ -224,7 +234,7 @@ pub fn decryptData(
 pub fn decryptAssertion(
     alloc: std.mem.Allocator,
     encrypted_assertion: *const xml.Element,
-    sk: rsa.SecretKey,
+    sk: *const rsa.SecretKey,
     options: Options,
 ) Error![]u8 {
     if (!isEl(encrypted_assertion, saml_ns, "EncryptedAssertion")) return error.MalformedStructure;
@@ -239,7 +249,7 @@ pub fn decryptAssertion(
 pub fn decryptDataToDocument(
     alloc: std.mem.Allocator,
     encrypted_data: *const xml.Element,
-    sk: rsa.SecretKey,
+    sk: *const rsa.SecretKey,
     options: Options,
 ) (Error || xml.ParseError)!xml.Document {
     const plain = try decryptData(alloc, encrypted_data, sk, options);
@@ -336,7 +346,7 @@ fn decoyCek(secret: []const u8, want: usize, out: *[64]u8) []const u8 {
 fn unwrapCek(
     alloc: std.mem.Allocator,
     enc_key: *const xml.Element,
-    sk: rsa.SecretKey,
+    sk: *const rsa.SecretKey,
     options: Options,
     out: *[64]u8,
     want: usize,
@@ -410,7 +420,7 @@ fn oaepHashFromMethod(method: *const xml.Element) Error!OaepHashes {
 /// caller) always reaches the downstream AES-GCM/CBC pass over the content
 /// ciphertext, exactly as it already does for the RSA-1_5 and AES-KW arms.
 fn rsaOaepUnwrap(
-    sk: rsa.SecretKey,
+    sk: *const rsa.SecretKey,
     hashes: OaepHashes,
     enc_key: *const xml.Element,
     wrapped: []const u8,
@@ -432,12 +442,12 @@ fn rsaOaepUnwrap(
     defer std.crypto.secureZero(u8, &raw_buf);
     const r = switch (hashes.digest) {
         .sha1 => switch (hashes.mgf) {
-            .sha1 => rsa.decryptOaepHNoFail(&sk, Sha1, Sha1, .none, wrapped, label, want, &msg_buf, &raw_buf),
-            .sha256 => rsa.decryptOaepHNoFail(&sk, Sha1, Sha256, .none, wrapped, label, want, &msg_buf, &raw_buf),
+            .sha1 => rsa.decryptOaepHNoFail(sk, Sha1, Sha1, .none, wrapped, label, want, &msg_buf, &raw_buf),
+            .sha256 => rsa.decryptOaepHNoFail(sk, Sha1, Sha256, .none, wrapped, label, want, &msg_buf, &raw_buf),
         },
         .sha256 => switch (hashes.mgf) {
-            .sha1 => rsa.decryptOaepHNoFail(&sk, Sha256, Sha1, .none, wrapped, label, want, &msg_buf, &raw_buf),
-            .sha256 => rsa.decryptOaepHNoFail(&sk, Sha256, Sha256, .none, wrapped, label, want, &msg_buf, &raw_buf),
+            .sha1 => rsa.decryptOaepHNoFail(sk, Sha256, Sha1, .none, wrapped, label, want, &msg_buf, &raw_buf),
+            .sha256 => rsa.decryptOaepHNoFail(sk, Sha256, Sha256, .none, wrapped, label, want, &msg_buf, &raw_buf),
         },
     } catch |e| switch (e) {
         // BufferTooSmall is a structural/public-data precondition (`want` vs
@@ -483,7 +493,7 @@ fn rsaOaepUnwrap(
 /// `em.len`, the loop bounds and `wrapped.len` are all functions of the public
 /// modulus length. (std does not let us hide the RSADP range check, which is on
 /// the public ciphertext anyway.)
-fn rsaPkcs1v15Unwrap(sk: rsa.SecretKey, wrapped: []const u8, out: *[64]u8, want: usize) Error!Unwrapped {
+fn rsaPkcs1v15Unwrap(sk: *const rsa.SecretKey, wrapped: []const u8, out: *[64]u8, want: usize) Error!Unwrapped {
     // `want` is the content algorithm's key length, decided by a public
     // algorithm URI, so refusing an impossible one here leaks nothing — and the
     // decoy is written into `out`, which this bounds.
@@ -556,14 +566,14 @@ fn rsaPkcs1v15Unwrap(sk: rsa.SecretKey, wrapped: []const u8, out: *[64]u8, want:
 /// Raw RSADP over the module's CRT primitive. `rsadpCrt` needs a comptime
 /// modulus length, so dispatch on the (public) modulus byte length across the
 /// realistic RSA key sizes. `wrapped.len` must equal k.
-fn rsaRawPrivate(sk: rsa.SecretKey, wrapped: []const u8, out: *[rsa.max_modulus_len]u8) Error![]const u8 {
+fn rsaRawPrivate(sk: *const rsa.SecretKey, wrapped: []const u8, out: *[rsa.max_modulus_len]u8) Error![]const u8 {
     const k = (sk.n.bits() + 7) / 8;
     if (wrapped.len != k) return error.DecryptionError;
     inline for (.{ 64, 128, 192, 256, 384, 512 }) |L| {
         if (k == L) {
             var c: [L]u8 = undefined;
             @memcpy(&c, wrapped[0..L]);
-            const m = rsa.rsadpCrt(L, c, &sk) catch return error.DecryptionError;
+            const m = rsa.rsadpCrt(L, c, sk) catch return error.DecryptionError;
             @memcpy(out[0..L], &m);
             return out[0..L];
         }
@@ -649,8 +659,8 @@ fn aesCbcDecrypt(alloc: std.mem.Allocator, key: []const u8, data: []const u8) Er
     }
 
     const n = switch (key.len) {
-        16 => aescbc.decrypt(Aes128, key[0..16].*, iv, ct, buf),
-        32 => aescbc.decrypt(Aes256, key[0..32].*, iv, ct, buf),
+        16 => aescbc.decrypt(Aes128, key[0..16], iv, ct, buf),
+        32 => aescbc.decrypt(Aes256, key[0..32], iv, ct, buf),
         else => return error.UnsupportedAlgorithm, // errdefer frees buf
     } catch return error.DecryptionError;
 
@@ -868,6 +878,7 @@ const testing = std.testing;
 test {
     testing.refAllDecls(@This());
     _ = @import("test_roundtrip.zig");
+    _ = @import("stackprobe_test.zig");
     _ = @import("test_external.zig");
 }
 
@@ -952,7 +963,7 @@ fn buildEm(comptime k: usize, b0: u8, b1: u8, ps_len: usize, msg_len: usize, ter
 /// length, so the only thing that can reject a case is the check it names.
 fn unpadEm(comptime k: usize, em: [k]u8, kp: rsa.KeyPair, out: *[64]u8, want: usize) Error![]const u8 {
     const ct = rsa.rsaep(k, em, kp.public_key) catch return error.DecryptionError;
-    const un = try rsaPkcs1v15Unwrap(kp.secret_key, &ct, out, want);
+    const un = try rsaPkcs1v15Unwrap(&kp.secret_key, &ct, out, want);
     if (!un.ok) return error.DecryptionError;
     return un.cek;
 }
@@ -1157,7 +1168,7 @@ test "TEETH (F3): a failed key unwrap still decrypts the content, so both outcom
         // Block type 1 — the classic v1.5 confusion, and non-conforming.
         const bad = buildEm(k, 0x00, 0x01, 29, 32, true);
         const ct = try rsa.rsaep(k, bad, kp.public_key);
-        const un = try rsaPkcs1v15Unwrap(kp.secret_key, &ct, &out, want);
+        const un = try rsaPkcs1v15Unwrap(&kp.secret_key, &ct, &out, want);
         try testing.expect(!un.ok);
         // The decoy is exactly the content algorithm's key length, so the
         // caller's AES pass runs on it.
@@ -1169,14 +1180,14 @@ test "TEETH (F3): a failed key unwrap still decrypts the content, so both outcom
         const other: usize = if (want == 32) 16 else 32;
         const wrong_len = buildEm(k, 0x00, 0x02, k - 3 - other, other, true);
         const ct2 = try rsa.rsaep(k, wrong_len, kp.public_key);
-        const un2 = try rsaPkcs1v15Unwrap(kp.secret_key, &ct2, &out, want);
+        const un2 = try rsaPkcs1v15Unwrap(&kp.secret_key, &ct2, &out, want);
         try testing.expect(!un2.ok);
         try testing.expectEqual(want, un2.cek.len);
 
         // Control: the right length, conforming, still succeeds.
         const good = buildEm(k, 0x00, 0x02, 29, 32, true);
         const ct3 = try rsa.rsaep(k, good, kp.public_key);
-        const un3 = try rsaPkcs1v15Unwrap(kp.secret_key, &ct3, &out, 32);
+        const un3 = try rsaPkcs1v15Unwrap(&kp.secret_key, &ct3, &out, 32);
         try testing.expect(un3.ok);
         try testing.expectEqualSlices(u8, good[k - 32 ..], un3.cek);
     }
@@ -1198,8 +1209,8 @@ test "TEETH (F3): the decoy is unpredictable and input-bound, not a constant" {
     var bad_b = bad_a;
     bad_b[40] ^= 0x01; // one bit of the rejected block
 
-    const un_a = try rsaPkcs1v15Unwrap(kp.secret_key, &(try rsa.rsaep(k, bad_a, kp.public_key)), &out_a, 32);
-    const un_b = try rsaPkcs1v15Unwrap(kp.secret_key, &(try rsa.rsaep(k, bad_b, kp.public_key)), &out_b, 32);
+    const un_a = try rsaPkcs1v15Unwrap(&kp.secret_key, &(try rsa.rsaep(k, bad_a, kp.public_key)), &out_a, 32);
+    const un_b = try rsaPkcs1v15Unwrap(&kp.secret_key, &(try rsa.rsaep(k, bad_b, kp.public_key)), &out_b, 32);
     try testing.expect(!un_a.ok and !un_b.ok);
 
     var zero: [32]u8 = @splat(0);
@@ -1250,7 +1261,7 @@ test "TEETH (F3 OAEP arm): a failed OAEP key unwrap still decrypts the content, 
         const other: usize = if (want == 32) 16 else 32;
         var msg_buf: [32]u8 = @splat(0x5A);
         const ct_wrong_len = try rsa.encryptOaepH(kp.public_key, Sha256, Sha256, random, msg_buf[0..other], "", &ct_buf);
-        const un1 = try rsaOaepUnwrap(kp.secret_key, hashes, enc_key, ct_wrong_len, &out, want);
+        const un1 = try rsaOaepUnwrap(&kp.secret_key, hashes, enc_key, ct_wrong_len, &out, want);
         try testing.expect(!un1.ok);
         try testing.expectEqual(want, un1.cek.len);
 
@@ -1258,13 +1269,13 @@ test "TEETH (F3 OAEP arm): a failed OAEP key unwrap still decrypts the content, 
         // private op recovers garbage, OAEP padding cannot validate).
         var ct_corrupt = try rsa.encryptOaepH(kp.public_key, Sha256, Sha256, random, msg_buf[0..want], "", &ct_buf);
         ct_corrupt[ct_corrupt.len / 2] ^= 0x01;
-        const un2 = try rsaOaepUnwrap(kp.secret_key, hashes, enc_key, ct_corrupt, &out, want);
+        const un2 = try rsaOaepUnwrap(&kp.secret_key, hashes, enc_key, ct_corrupt, &out, want);
         try testing.expect(!un2.ok);
         try testing.expectEqual(want, un2.cek.len);
 
         // Control: a genuinely valid ciphertext of the right length succeeds.
         const ct_good = try rsa.encryptOaepH(kp.public_key, Sha256, Sha256, random, msg_buf[0..want], "", &ct_buf);
-        const un3 = try rsaOaepUnwrap(kp.secret_key, hashes, enc_key, ct_good, &out, want);
+        const un3 = try rsaOaepUnwrap(&kp.secret_key, hashes, enc_key, ct_good, &out, want);
         try testing.expect(un3.ok);
         try testing.expectEqualSlices(u8, msg_buf[0..want], un3.cek);
     }
@@ -1295,8 +1306,8 @@ test "TEETH (F3 OAEP arm): the decoy is unpredictable and input-bound, not a con
     var ct_a_bad_buf: [rsa.max_modulus_len]u8 = undefined;
     @memcpy(ct_a_bad_buf[0..ct_a.len], ct_a);
     ct_a_bad_buf[ct_a.len / 3] ^= 0x01;
-    const un_a = try rsaOaepUnwrap(kp.secret_key, hashes, enc_key, ct_a_bad_buf[0..ct_a.len], &out_a, 32);
-    const un_b = try rsaOaepUnwrap(kp.secret_key, hashes, enc_key, ct_b, &out_b, 32);
+    const un_a = try rsaOaepUnwrap(&kp.secret_key, hashes, enc_key, ct_a_bad_buf[0..ct_a.len], &out_a, 32);
+    const un_b = try rsaOaepUnwrap(&kp.secret_key, hashes, enc_key, ct_b, &out_b, 32);
     try testing.expect(!un_a.ok and !un_b.ok);
 
     var zero: [32]u8 = @splat(0);

@@ -62,13 +62,13 @@ pub fn main() !void {
     // Encrypt the padded buffer in place-sized output; ciphertext length
     // equals the padded plaintext length for CBC (no further expansion).
     var ct: [80]u8 = undefined;
-    _ = try aescbc.encrypt(Aes256, key, iv, &padded, &ct);
+    _ = try aescbc.encrypt(Aes256, &key, iv, &padded, &ct);
     must(std.mem.eql(u8, &expected_ct, &ct), @src());
     std.debug.print("encrypt: byte-exact match against openssl's independent AES-256-CBC ciphertext\n", .{});
 
     // Decrypt + unpad recovers the original message.
     var pt: [80]u8 = undefined;
-    _ = try aescbc.decrypt(Aes256, key, iv, &ct, &pt);
+    _ = try aescbc.decrypt(Aes256, &key, iv, &ct, &pt);
     const unpadded_len = try aescbc.unpadPkcs7(&pt);
     try std.testing.expectEqualStrings(msg, pt[0..unpadded_len]);
     std.debug.print("decrypt+unpad: recovered original {d}-byte message\n", .{unpadded_len});
@@ -86,7 +86,7 @@ pub fn main() !void {
     var tampered = ct;
     tampered[3 * aescbc.block_len + aescbc.block_len - 1] ^= 0x01;
     var tampered_pt: [80]u8 = undefined;
-    _ = try aescbc.decrypt(Aes256, key, iv, &tampered, &tampered_pt);
+    _ = try aescbc.decrypt(Aes256, &key, iv, &tampered, &tampered_pt);
     if (aescbc.unpadPkcs7(&tampered_pt)) |_| {
         unreachable; // the bit-flip analysis above guarantees rejection
     } else |err| switch (err) {

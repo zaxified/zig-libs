@@ -430,6 +430,10 @@ pub const standard = struct {
 
     /// `whsec_<base64>` for a raw key of 24..64 bytes, into `out`.
     pub fn encodeSecret(out: []u8, key: []const u8) (KeyError || SignError)![]const u8 {
+        return burn.run(burn.enc_burn, (KeyError || SignError)![]const u8, encodeSecretBody, .{ out, key });
+    }
+
+    fn encodeSecretBody(out: []u8, key: []const u8) (KeyError || SignError)![]const u8 {
         if (key.len < min_secret_len or key.len > max_secret_len) return error.InvalidKey;
         const n = secret_prefix.len + std.base64.standard.Encoder.calcSize(key.len);
         if (out.len < n) return error.OutputTooSmall;
@@ -1899,4 +1903,5 @@ test "Standard Webhooks key encodings: sizes outside the spec are refused" {
 
 test {
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }

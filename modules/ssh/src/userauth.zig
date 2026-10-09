@@ -58,6 +58,7 @@
 const std = @import("std");
 const transport = @import("transport.zig");
 const messages = @import("messages.zig");
+const burn = @import("burn.zig");
 const server_mod = @import("server.zig");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 /// helpers, in the format `std.testing.Smith` actually reads.
@@ -128,6 +129,7 @@ fn sessionId(t: *const transport.Transport) UserauthError![]const u8 {
 /// (server)** — the whole point being that the two cannot disagree about
 /// what was signed. See the module doc comment for the field list and why
 /// `session_id` leads it.
+// secret-api-ok: encodes public protocol fields (session id, user, algorithm name, PUBLIC key blob).
 pub fn signedBlob(
     w: *std.Io.Writer,
     session_id: []const u8,
@@ -211,6 +213,7 @@ pub const PublickeyOptions = struct {
 /// The signature algorithm is NOT simply `key.algorithmName()`: if the server
 /// sent `server-sig-algs` (RFC 8308 §3.1), the strongest name it accepts for
 /// this key's type is used instead. See `rsaHashFor`.
+// secret-api-ok: thin wrapper of authenticatePublickeyBoundTo; the signature is made by AuthKey.sign (sign_burn) and packets leave through writePacket (record_burn), nothing here holds key material.
 pub fn authenticatePublickey(
     t: *transport.Transport,
     gpa: std.mem.Allocator,
@@ -589,6 +592,7 @@ pub const AuthorizedKeyCheck = struct {
     ctx: *anyopaque = transport.no_context,
     checkFn: *const fn (ctx: *anyopaque, user: []const u8, algorithm: []const u8, key_blob: []const u8) bool,
 
+    // secret-api-ok: the blob is the client's PUBLIC key; the hook compares it with authorized_keys.
     pub fn check(self: AuthorizedKeyCheck, user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
         return self.checkFn(self.ctx, user, algorithm, key_blob);
     }
@@ -607,6 +611,12 @@ pub const PasswordCheck = struct {
     checkFn: *const fn (ctx: *anyopaque, user: []const u8, password: []const u8) bool,
 
     pub fn check(self: PasswordCheck, user: []const u8, password: []const u8) bool {
+        // The burn also covers the caller's hook (`checkFn` runs one frame
+        // down), whose frames hold the peer's plaintext password.
+        return burn.run(burn.password_burn, bool, checkBody, .{ self, user, password });
+    }
+
+    fn checkBody(self: PasswordCheck, user: []const u8, password: []const u8) bool {
         return self.checkFn(self.ctx, user, password);
     }
 };

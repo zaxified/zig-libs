@@ -119,6 +119,7 @@ pub const QueryIterator = struct {
 /// Whether the encoded `raw_key` decodes to exactly `name`. Streams the
 /// decode, so a key of any length compares without a buffer; a key with a
 /// malformed escape never matches.
+// secret-api-ok: `raw_key` is a URL query-parameter name, not a secret
 pub fn keyEquals(raw_key: []const u8, name: []const u8) bool {
     var i: usize = 0;
     var n: usize = 0;

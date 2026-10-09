@@ -13,6 +13,7 @@
 //! `deriveInitialSecrets` byte-exact.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const version = @import("version.zig");
 
 pub const Version = version.Version;
@@ -54,21 +55,23 @@ pub const InitialSecrets = struct {
 /// NOT `dtls.keyschedule`'s forked-label-prefix pattern — RFC 9001 draws no
 /// prefix fork the way RFC 9147/DTLS 1.3 does (see root.zig's module doc,
 /// "the key finding", and SPEC.md).
-pub fn deriveInitialSecrets(client_dcid: []const u8) InitialSecrets {
-    return deriveInitialSecretsFor(.v1, client_dcid);
+pub fn deriveInitialSecrets(out: *InitialSecrets, client_dcid: []const u8) void {
+    deriveInitialSecretsFor(.v1, out, client_dcid);
 }
 
 /// `deriveInitialSecrets` for an explicit QUIC version: the same §5.2 chain
 /// with that version's Initial salt (RFC 9369 §3.3.1 for `.v2`). The
 /// `"client in"` / `"server in"` labels are NOT versioned — RFC 9369 §3.3.2
 /// changes only the key/iv/hp/ku labels.
-pub fn deriveInitialSecretsFor(ver: Version, client_dcid: []const u8) InitialSecrets {
+pub fn deriveInitialSecretsFor(ver: Version, out: *InitialSecrets, client_dcid: []const u8) void {
+    burn.run(burn.kdf_burn, void, deriveInitialSecretsBody, .{ ver, out, client_dcid });
+}
+
+fn deriveInitialSecretsBody(ver: Version, out: *InitialSecrets, client_dcid: []const u8) void {
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
     const initial_secret = Hkdf.extract(ver.initialSalt(), client_dcid);
-    return .{
-        .client_initial_secret = std.crypto.tls.hkdfExpandLabel(Hkdf, initial_secret, "client in", "", 32),
-        .server_initial_secret = std.crypto.tls.hkdfExpandLabel(Hkdf, initial_secret, "server in", "", 32),
-    };
+    out.client_initial_secret = std.crypto.tls.hkdfExpandLabel(Hkdf, initial_secret, "client in", "", 32);
+    out.server_initial_secret = std.crypto.tls.hkdfExpandLabel(Hkdf, initial_secret, "server in", "", 32);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -111,7 +114,8 @@ test "initial_salt_v1 constant is the exact 20-byte RFC 9001 §5.2 value" {
 }
 
 test "deriveInitialSecrets: App. A.1 client + server initial secrets" {
-    const s = deriveInitialSecrets(&client_dst_connection_id);
+    var s: InitialSecrets = undefined;
+    deriveInitialSecrets(&s, &client_dst_connection_id);
     try testing.expectEqualSlices(u8, &rfc_client_initial_secret, &s.client_initial_secret);
     try testing.expectEqualSlices(u8, &rfc_server_initial_secret, &s.server_initial_secret);
 }
@@ -121,16 +125,20 @@ test "deriveInitialSecrets: App. A.1 client + server initial secrets" {
 test "deriveInitialSecretsFor(.v2): RFC 9369 App. A.1 initial secrets" {
     const initial_secret = HkdfSha256.extract(&initial_salt_v2, &client_dst_connection_id);
     try testing.expectEqualSlices(u8, &hexTo(32, "2062e8b3cd8d52092614b8071d0aa1fb7c2e3ac193f78b280e72d8f5751f6aba"), &initial_secret);
-    const s = deriveInitialSecretsFor(.v2, &client_dst_connection_id);
+    var s: InitialSecrets = undefined;
+    deriveInitialSecretsFor(.v2, &s, &client_dst_connection_id);
     try testing.expectEqualSlices(u8, &hexTo(32, "14ec9d6eb9fd7af83bf5a668bc17a7e283766aade7ecd0891f70f9ff7f4bf47b"), &s.client_initial_secret);
     try testing.expectEqualSlices(u8, &hexTo(32, "0263db1782731bf4588e7e4d93b7463907cb8cd8200b5da55a8bd488eafc37c1"), &s.server_initial_secret);
 }
 
 test "deriveInitialSecretsFor(.v1) is deriveInitialSecrets; v1 and v2 differ" {
-    const a = deriveInitialSecrets(&client_dst_connection_id);
-    const b = deriveInitialSecretsFor(.v1, &client_dst_connection_id);
+    var a: InitialSecrets = undefined;
+    var b: InitialSecrets = undefined;
+    deriveInitialSecrets(&a, &client_dst_connection_id);
+    deriveInitialSecretsFor(.v1, &b, &client_dst_connection_id);
     try testing.expectEqualSlices(u8, &a.client_initial_secret, &b.client_initial_secret);
     try testing.expectEqualSlices(u8, &a.server_initial_secret, &b.server_initial_secret);
-    const c = deriveInitialSecretsFor(.v2, &client_dst_connection_id);
+    var c: InitialSecrets = undefined;
+    deriveInitialSecretsFor(.v2, &c, &client_dst_connection_id);
     try testing.expect(!std.mem.eql(u8, &a.client_initial_secret, &c.client_initial_secret));
 }

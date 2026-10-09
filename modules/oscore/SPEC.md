@@ -366,7 +366,7 @@ sub-tag-length payloads, and the Appendix B.1 restart procedures.
   tamper, and a simulated reboot with Appendix B.1 recovery.
 - **Key material on the dead stack** (audit F7): `deriveContext` wipes its
   three derived-value locals and then zeroes the stack region its HKDF/
-  HMAC callees vacated (`scrubStackBelow`, 8 KiB, once per derivation).
+  HMAC callees vacated (the entry point's 8 KiB dead-stack burn, `src/burn.zig`, once per derivation).
   Measured with the audit's probe re-pointed at heap-resident needles so
   the caller's own live copies do not count: in ReleaseSafe/ReleaseFast
   the derived keys were found 1-2 times below the caller before, at most

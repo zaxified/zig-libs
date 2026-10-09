@@ -43,3 +43,8 @@ pub const kem_burn = 32 * 1024;
 /// `Context.seal`/`open`/`exportSecret`: AES-GCM key expansion + GHASH table,
 /// 1.8 KiB at most (2026-10-08).
 pub const aead_burn = 8 * 1024;
+
+/// `suite.labeledExtract` / `labeledExpand`: one HMAC state plus the 512-byte
+/// labeled-info scratch, called a handful of times per KEM / key schedule --
+/// tight, not yet measured (`stackprobe2_test.zig`, 2026-10-09).
+pub const kdf_burn = 4 * 1024;

@@ -24,6 +24,7 @@
 //! padding scheme.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -61,20 +62,31 @@ pub const PaddingError = error{InvalidPadding};
 
 /// Encrypt `plaintext` (must be `block_len`-aligned) into `out` under raw
 /// CBC: `C[0] = E(P[0] XOR IV)`, `C[i] = E(P[i] XOR C[i-1])`. `Aes` is
-/// `std.crypto.core.aes.Aes128` or `Aes256`; `key` is
-/// `[Aes.key_bits / 8]u8`. `out` must be at least `plaintext.len` bytes.
+/// `std.crypto.core.aes.Aes128` or `Aes256`; `key` points to
+/// `[Aes.key_bits / 8]u8` (BREAKING 2026-10-09: by pointer, so no key copy is
+/// left in the caller's frame; the body runs under a dead-stack burn). `out` must be at least `plaintext.len` bytes.
 /// No allocation. Returns the written length (== `plaintext.len`).
 /// Zeroization posture (CONVENTIONS §2.1): nothing here is wiped, deliberately.
 /// The AES round-key schedule (`Aes.initEnc`/`initDec`'s context) and the
 /// per-block staging buffers are Z3 — the internal working state of a
 /// transform, which `std`'s own `core.aes` does not wipe either. `key` and `iv`
-/// arrive by value from caller-owned storage (Z2): the caller wipes those, and
+/// arrive from caller-owned storage (Z2): the caller wipes those, and
 /// the plaintext/ciphertext live in the caller's `out`/input slices, which the
 /// caller likewise owns. This module allocates nothing and holds nothing across
 /// calls, so it has no Z1 storage at all.
 pub fn encrypt(
     comptime Aes: type,
-    key: [Aes.key_bits / 8]u8,
+    key: *const [Aes.key_bits / 8]u8,
+    iv: [block_len]u8,
+    plaintext: []const u8,
+    out: []u8,
+) Error!usize {
+    return burn.run(burn.cbc_burn, Error!usize, encryptBody, .{ Aes, key, iv, plaintext, out });
+}
+
+fn encryptBody(
+    comptime Aes: type,
+    key: *const [Aes.key_bits / 8]u8,
     iv: [block_len]u8,
     plaintext: []const u8,
     out: []u8,
@@ -82,7 +94,7 @@ pub fn encrypt(
     if (plaintext.len % block_len != 0) return error.NotBlockAligned;
     if (out.len < plaintext.len) return error.BufferTooSmall;
 
-    const ctx = Aes.initEnc(key);
+    const ctx = Aes.initEnc(key.*);
     var prev: [block_len]u8 = iv;
     var i: usize = 0;
     while (i < plaintext.len) : (i += block_len) {
@@ -102,7 +114,17 @@ pub fn encrypt(
 /// length (== `ciphertext.len`).
 pub fn decrypt(
     comptime Aes: type,
-    key: [Aes.key_bits / 8]u8,
+    key: *const [Aes.key_bits / 8]u8,
+    iv: [block_len]u8,
+    ciphertext: []const u8,
+    out: []u8,
+) Error!usize {
+    return burn.run(burn.cbc_burn, Error!usize, decryptBody, .{ Aes, key, iv, ciphertext, out });
+}
+
+fn decryptBody(
+    comptime Aes: type,
+    key: *const [Aes.key_bits / 8]u8,
     iv: [block_len]u8,
     ciphertext: []const u8,
     out: []u8,
@@ -110,7 +132,7 @@ pub fn decrypt(
     if (ciphertext.len % block_len != 0) return error.NotBlockAligned;
     if (out.len < ciphertext.len) return error.BufferTooSmall;
 
-    const ctx = Aes.initDec(key);
+    const ctx = Aes.initDec(key.*);
     var prev: [block_len]u8 = iv;
     var i: usize = 0;
     while (i < ciphertext.len) : (i += block_len) {
@@ -260,51 +282,51 @@ const f_2_5_ciphertext = hex("f58c4c04d6e5f1ba779eabfb5f7bfbd6" ++
 
 test "NIST SP800-38A F.2.1 (AES-128-CBC): byte-exact encrypt" {
     var out: [f_2_1_plaintext.len]u8 = undefined;
-    const n = try encrypt(Aes128, f_2_1_key, f_2_1_iv, &f_2_1_plaintext, &out);
+    const n = try encrypt(Aes128, &f_2_1_key, f_2_1_iv, &f_2_1_plaintext, &out);
     try testing.expectEqualSlices(u8, &f_2_1_ciphertext, out[0..n]);
 }
 
 test "NIST SP800-38A F.2.1 (AES-128-CBC): byte-exact decrypt" {
     var out: [f_2_1_ciphertext.len]u8 = undefined;
-    const n = try decrypt(Aes128, f_2_1_key, f_2_1_iv, &f_2_1_ciphertext, &out);
+    const n = try decrypt(Aes128, &f_2_1_key, f_2_1_iv, &f_2_1_ciphertext, &out);
     try testing.expectEqualSlices(u8, &f_2_1_plaintext, out[0..n]);
 }
 
 test "NIST SP800-38A F.2.5 (AES-256-CBC): byte-exact encrypt" {
     var out: [f_2_5_plaintext.len]u8 = undefined;
-    const n = try encrypt(Aes256, f_2_5_key, f_2_5_iv, &f_2_5_plaintext, &out);
+    const n = try encrypt(Aes256, &f_2_5_key, f_2_5_iv, &f_2_5_plaintext, &out);
     try testing.expectEqualSlices(u8, &f_2_5_ciphertext, out[0..n]);
 }
 
 test "NIST SP800-38A F.2.5 (AES-256-CBC): byte-exact decrypt" {
     var out: [f_2_5_ciphertext.len]u8 = undefined;
-    const n = try decrypt(Aes256, f_2_5_key, f_2_5_iv, &f_2_5_ciphertext, &out);
+    const n = try decrypt(Aes256, &f_2_5_key, f_2_5_iv, &f_2_5_ciphertext, &out);
     try testing.expectEqualSlices(u8, &f_2_5_plaintext, out[0..n]);
 }
 
 test "raw CBC rejects non-block-aligned input" {
     var out: [32]u8 = undefined;
-    try testing.expectError(error.NotBlockAligned, encrypt(Aes128, f_2_1_key, f_2_1_iv, "not sixteen", &out));
-    try testing.expectError(error.NotBlockAligned, decrypt(Aes128, f_2_1_key, f_2_1_iv, "not sixteen", &out));
+    try testing.expectError(error.NotBlockAligned, encrypt(Aes128, &f_2_1_key, f_2_1_iv, "not sixteen", &out));
+    try testing.expectError(error.NotBlockAligned, decrypt(Aes128, &f_2_1_key, f_2_1_iv, "not sixteen", &out));
 }
 
 test "raw CBC rejects an undersized out buffer" {
     var out: [16]u8 = undefined; // plaintext is 2 blocks, out is 1
     const pt = [_]u8{0x41} ** 32;
-    try testing.expectError(error.BufferTooSmall, encrypt(Aes128, f_2_1_key, f_2_1_iv, &pt, &out));
+    try testing.expectError(error.BufferTooSmall, encrypt(Aes128, &f_2_1_key, f_2_1_iv, &pt, &out));
 }
 
 test "raw CBC decrypt rejects an undersized out buffer" {
     var out: [16]u8 = undefined; // ciphertext is 2 blocks, out is 1
     const ct = [_]u8{0x41} ** 32;
-    try testing.expectError(error.BufferTooSmall, decrypt(Aes128, f_2_1_key, f_2_1_iv, &ct, &out));
+    try testing.expectError(error.BufferTooSmall, decrypt(Aes128, &f_2_1_key, f_2_1_iv, &ct, &out));
 }
 
 test "raw CBC round-trip: empty message" {
     var out: [0]u8 = undefined;
-    const n = try encrypt(Aes128, f_2_1_key, f_2_1_iv, "", &out);
+    const n = try encrypt(Aes128, &f_2_1_key, f_2_1_iv, "", &out);
     try testing.expectEqual(@as(usize, 0), n);
-    const m = try decrypt(Aes128, f_2_1_key, f_2_1_iv, "", &out);
+    const m = try decrypt(Aes128, &f_2_1_key, f_2_1_iv, "", &out);
     try testing.expectEqual(@as(usize, 0), m);
 }
 
@@ -316,9 +338,9 @@ test "raw CBC round-trip: multi-block message, self-consistency" {
     for (&pt, 0..) |*b, i| b.* = @truncate(i);
 
     var ct: [pt.len]u8 = undefined;
-    _ = try encrypt(Aes256, key, iv, &pt, &ct);
+    _ = try encrypt(Aes256, &key, iv, &pt, &ct);
     var recovered: [pt.len]u8 = undefined;
-    const n = try decrypt(Aes256, key, iv, &ct, &recovered);
+    const n = try decrypt(Aes256, &key, iv, &ct, &recovered);
     try testing.expectEqualSlices(u8, &pt, recovered[0..n]);
 }
 
@@ -357,10 +379,10 @@ test "PKCS#7 pad/unpad round-trip through real CBC encrypt/decrypt" {
     const padded_len = try padPkcs7(msg, &padded);
 
     var ct: [128]u8 = undefined;
-    _ = try encrypt(Aes128, key, iv, padded[0..padded_len], ct[0..padded_len]);
+    _ = try encrypt(Aes128, &key, iv, padded[0..padded_len], ct[0..padded_len]);
 
     var pt: [128]u8 = undefined;
-    _ = try decrypt(Aes128, key, iv, ct[0..padded_len], pt[0..padded_len]);
+    _ = try decrypt(Aes128, &key, iv, ct[0..padded_len], pt[0..padded_len]);
     const n = try unpadPkcs7(pt[0..padded_len]);
     try testing.expectEqualStrings(msg, pt[0..n]);
 }
@@ -452,9 +474,9 @@ test "XML-Enc unpad round-trip through real CBC encrypt/decrypt" {
     const padded_len = try padPkcs7(msg, &padded);
 
     var ct: [64]u8 = undefined;
-    _ = try encrypt(Aes256, key, iv, padded[0..padded_len], ct[0..padded_len]);
+    _ = try encrypt(Aes256, &key, iv, padded[0..padded_len], ct[0..padded_len]);
     var pt: [64]u8 = undefined;
-    _ = try decrypt(Aes256, key, iv, ct[0..padded_len], pt[0..padded_len]);
+    _ = try decrypt(Aes256, &key, iv, ct[0..padded_len], pt[0..padded_len]);
     const n = try unpadXmlEnc(pt[0..padded_len]);
     try testing.expectEqualStrings(msg, pt[0..n]);
 }
@@ -594,6 +616,10 @@ test "raw CBC vs jwe's/xmlenc's hand-rolled shape: same output on the same input
     }
 
     var out: [pt.len]u8 = undefined;
-    _ = try encrypt(Aes128, key, iv, &pt, &out);
+    _ = try encrypt(Aes128, &key, iv, &pt, &out);
     try testing.expectEqualSlices(u8, &expected, &out);
+}
+
+test {
+    _ = @import("stackprobe_test.zig");
 }

@@ -711,7 +711,7 @@ fn makeCert(
         .rsa2048 => try keys.rsa2048PublicKey(),
         .rsa1024 => try keys.rsa1024PublicKey(),
     };
-    return rsa_mod.selfSignedCert(gpa, sk, pk, std.crypto.hash.sha2.Sha256, .{
+    return rsa_mod.selfSignedCert(gpa, &sk, pk, std.crypto.hash.sha2.Sha256, .{
         .common_name = "iec62351-test",
         .serial = 1,
         .not_before = not_before,

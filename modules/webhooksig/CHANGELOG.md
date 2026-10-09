@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack burn: `standard.encodeSecret` (the raw HMAC key) now runs under `burn.run` (2 KiB); probed in the new `stackprobe2_test.zig`. No signature change.
+
 - **2026-10-09** — **BREAKING:** dead-stack burns on every secret-touching entry point, and the
   Ed25519 signing key by pointer / into `out`. `standard.decodeSigningKey(out: *Ed25519.KeyPair,
   text)` (was: returned the pair — secret half — in an error union), `standard.signEd25519(…,

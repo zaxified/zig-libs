@@ -177,6 +177,7 @@ pub const Walker = struct {
 
     pub const Error = Client.Error || error{ OidNotIncreasing, RequestFailed };
 
+    // secret-api-ok: iterator over `Client.getNext`; a v1/v2c community string travels in clear by design (no key derivation or cipher here).
     pub fn next(w: *Walker) Error!?VarBind {
         if (w.finished) return null;
         const resp = try w.client.getNext(w.community, &.{w.current});

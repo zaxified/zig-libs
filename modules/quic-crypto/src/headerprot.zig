@@ -35,6 +35,7 @@
 //! a wrong PN and a downstream AEAD-open failure.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 pub const HeaderProtectionError = error{
     /// The 16-byte sample window would run past the end of the packet.
@@ -63,12 +64,22 @@ pub const Mask = [5]u8;
 /// `std.crypto.core.aes.Aes128/Aes256.initEnc(key).encrypt(...)` — same
 /// AES-ECB primitive; QUIC keeps 5 mask bytes (vs DTLS's 2).
 pub fn computeMaskAes(hp_key: []const u8, sample: [16]u8) Mask {
-    var block: [16]u8 = undefined;
-    switch (hp_key.len) {
-        16 => std.crypto.core.aes.Aes128.initEnc(hp_key[0..16].*).encrypt(&block, &sample),
-        32 => std.crypto.core.aes.Aes256.initEnc(hp_key[0..32].*).encrypt(&block, &sample),
+    return switch (hp_key.len) {
+        16 => burn.run(burn.packet_burn, Mask, maskAes128Body, .{ hp_key[0..16], &sample }),
+        32 => burn.run(burn.packet_burn, Mask, maskAes256Body, .{ hp_key[0..32], &sample }),
         else => unreachable, // hp_key length is fixed by the negotiated suite
-    }
+    };
+}
+
+fn maskAes128Body(key: *const [16]u8, sample: *const [16]u8) Mask {
+    var block: [16]u8 = undefined;
+    std.crypto.core.aes.Aes128.initEnc(key.*).encrypt(&block, sample);
+    return block[0..5].*;
+}
+
+fn maskAes256Body(key: *const [32]u8, sample: *const [16]u8) Mask {
+    var block: [16]u8 = undefined;
+    std.crypto.core.aes.Aes256.initEnc(key.*).encrypt(&block, sample);
     return block[0..5].*;
 }
 
@@ -81,6 +92,10 @@ pub fn computeMaskAes(hp_key: []const u8, sample: [16]u8) Mask {
 /// `sample[0..4]` LE and nonce from `sample[4..16]` — same primitive; QUIC
 /// keeps 5 keystream bytes.
 pub fn computeMaskChaCha20(hp_key: []const u8, sample: [16]u8) Mask {
+    return burn.run(burn.packet_burn, Mask, computeMaskChaCha20Body, .{ hp_key, sample });
+}
+
+fn computeMaskChaCha20Body(hp_key: []const u8, sample: [16]u8) Mask {
     std.debug.assert(hp_key.len == 32);
     const counter = std.mem.readInt(u32, sample[0..4], .little);
     const chacha_nonce: [12]u8 = sample[4..16].*;

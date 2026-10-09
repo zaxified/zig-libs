@@ -226,6 +226,10 @@ pub fn mixKey(ck: *ChainKey, dh_output: []const u8, out: *SymmetricKey) void {
 /// the 16-byte output length lives in the BLAKE2s parameter block (see
 /// `Blake2s128` above), so this is NOT a truncated BLAKE2s-256.
 pub fn keyedMac(key: []const u8, data: []const u8) Mac {
+    return burn.run(burn.mac_burn, Mac, keyedMacBody, .{ key, data });
+}
+
+fn keyedMacBody(key: []const u8, data: []const u8) Mac {
     var out: Mac = undefined;
     Blake2s128.hash(data, &out, .{ .key = key });
     return out;

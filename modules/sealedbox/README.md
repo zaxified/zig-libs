@@ -25,11 +25,11 @@ const kp = sb.KeyPair.generate(io);          // recipient keypair (X25519 / WG-c
 var ct: [sb.sealedLen(msg.len)]u8 = undefined; // == msg.len + sb.overhead
 try sb.seal(io, &ct, msg, kp.public_key);      // io = entropy for the ephemeral key
 var pt: [msg.len]u8 = undefined;
-try sb.open(&pt, &ct, kp);                     // error (no panic) on tamper/short input
+try sb.open(&pt, &ct, &kp);                     // error (no panic) on tamper/short input
 
 // allocating convenience
 const ct2 = try sb.sealAlloc(gpa, io, msg, kp.public_key);  defer gpa.free(ct2);
-const pt2 = try sb.openAlloc(gpa, ct2, kp);                 defer gpa.free(pt2);
+const pt2 = try sb.openAlloc(gpa, ct2, &kp);                 defer gpa.free(pt2);
 
 // key text (base64 / hex). The ENCODED secret is the buffer people forget:
 // it is 44 or 64 bytes of ordinary-looking text sitting in your frame.

@@ -21,12 +21,12 @@ record and the threat model.
 ## What it covers (all RFC 9001)
 
 - **`src/initial.zig` — §5.2 Initial secrets.** `initial_salt_v1` (the fixed
-  20-byte QUIC v1 salt) + `deriveInitialSecrets(client_dcid)` →
+  20-byte QUIC v1 salt) + `deriveInitialSecrets(out, client_dcid)` →
   `client_initial_secret` / `server_initial_secret` from the client's chosen
   Destination Connection ID.
 - **`src/keyschedule.zig` — §5.1 key/iv/hp + §6 key update.**
-  `derivePacketKeys(Hkdf, key_len, secret)` → `{ key, iv, hp }`;
-  `advanceKeys(Hkdf, key_len, secret)` → `{ next_secret, key, iv }` (hp is
+  `derivePacketKeys(Hkdf, key_len, out, secret)` → `{ key, iv, hp }`;
+  `advanceKeys(Hkdf, key_len, out, secret)` → `{ next_secret, key, iv }` (hp is
   NOT re-derived — §6.1). Supports AES-128-GCM (key_len 16) and, structurally,
   AES-256-GCM + ChaCha20-Poly1305 (key_len 32).
 - **`src/protection.zig` — §5.3 packet protection.** `Protection(Aead)` with
@@ -57,17 +57,19 @@ const quic = @import("quic-crypto");
 
 ```zig
 // §5.2 Initial secrets from the client's Destination Connection ID.
-const secrets = quic.deriveInitialSecrets(client_dcid); // => .{ client_initial_secret, server_initial_secret }
+var secrets: quic.InitialSecrets = undefined;
+quic.deriveInitialSecrets(&secrets, client_dcid); // => .{ client_initial_secret, server_initial_secret }
 
 // §5.1 key/iv/hp from any traffic secret (Initial or TLS-derived).
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
-const k = quic.derivePacketKeys(HkdfSha256, 16, secrets.client_initial_secret); // .{ key, iv, hp }
+var k: quic.PacketKeys(16) = undefined;
+quic.derivePacketKeys(HkdfSha256, 16, &k, &secrets.client_initial_secret); // k = .{ key, iv, hp }
 
 // §5.3 AEAD packet protection (AES-128-GCM shown).
 const P = quic.Protection(std.crypto.aead.aes_gcm.Aes128Gcm);
 var out: [2048]u8 = undefined;
-const n = try P.seal(k.key, k.iv, packet_number, header_bytes, payload, &out);
-// receiver: const m = try P.open(k.key, k.iv, pn, header_bytes, ciphertext, &buf);
+const n = try P.seal(&k.key, k.iv, packet_number, header_bytes, payload, &out);
+// receiver: const m = try P.open(&k.key, k.iv, pn, header_bytes, ciphertext, &buf);
 
 // §5.4 header protection.
 const mask = quic.headerprot.computeMaskAes(&k.hp, sample);
@@ -77,8 +79,10 @@ const r = try quic.headerprot.remove(packet, .long, pn_offset, mask);        // 
 
 ```zig
 // QUIC v2 (RFC 9369): the same calls with a Version; v1 is the default.
-const s2 = quic.deriveInitialSecretsFor(.v2, client_dcid);
-const k2 = quic.derivePacketKeysFor(.v2, HkdfSha256, 16, s2.client_initial_secret);
+var s2: quic.InitialSecrets = undefined;
+quic.deriveInitialSecretsFor(.v2, &s2, client_dcid);
+var k2: quic.PacketKeys(16) = undefined;
+quic.derivePacketKeysFor(.v2, HkdfSha256, 16, &k2, &s2.client_initial_secret);
 
 // §5.8 Retry integrity: server appends the tag, client verifies it.
 const tag = try quic.computeRetryTag(.v1, odcid, retry_without_tag);

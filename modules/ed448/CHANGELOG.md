@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **Additive API:** pointer twins beside the std-shaped by-value surface: `KeyPair.createInto(out, seed)`, `KeyPair.generateInto(out, io)` (burned; `create` / `generate` now call them and keep their signatures), `SecretKey.fromBytesInto` / `toBytesInto` (plain codecs, no burn). No signature changed. Probe: `src/stackprobe2_test.zig`.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the new ReleaseFast stack
   probe (`src/stackprobe_test.zig`) found the seed, the clamped `s`, `prefix`, the nonce `r` (digest
   and scalar) and `k·s` in dead frames after every `sign`/`signPh` — the bodies' `secureZero` defers

@@ -70,7 +70,7 @@ const token2 = try jwe.encryptCompact(
     .{ .csprng = csprng.random() }, .{},
 );
 defer gpa.free(token2);
-const plaintext2 = try jwe.decryptCompact(gpa, .{ .rsa_private = sk }, token2, .{});
+const plaintext2 = try jwe.decryptCompact(gpa, .{ .rsa_private = &sk }, token2, .{});
 defer gpa.free(plaintext2);
 ```
 

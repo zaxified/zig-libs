@@ -386,12 +386,19 @@ pub const ChaCha20 = struct {
     /// 64-byte block before writing it, as std's block-buffered `xor` does.
     pub fn xor(out: []u8, in: []const u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
         defer burnFor(in.len <= delegateLimit(delegate_max_bytes));
+        xorBody(out, in, counter, &key, nonce);
+    }
+
+    /// `xor` with the key by pointer: no key copy in the caller's frame (the
+    /// dead-stack-clean form; `xor` takes std's by-value shape).
+    pub fn xorInto(out: []u8, in: []const u8, counter: u32, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+        defer burnFor(in.len <= delegateLimit(delegate_max_bytes));
         xorBody(out, in, counter, key, nonce);
     }
 
     /// `xor`'s body, one frame down so `burnFor` reaches what it left (see
     /// `burnStack`). The AEAD calls this directly and burns once itself.
-    noinline fn xorBody(out: []u8, in: []const u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
+    noinline fn xorBody(out: []u8, in: []const u8, counter: u32, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
         std.debug.assert(out.len == in.len);
         // In EVERY build — see `counterWouldWrap`.
         if (counterWouldWrap(in.len, counter)) @panic(counter_wrap_message);
@@ -408,11 +415,11 @@ pub const ChaCha20 = struct {
         // before a byte is decrypted). Never on key or plaintext.
         if (in.len <= delegateLimit(delegate_max_bytes)) {
             note(&chacha_path, .std_delegated);
-            return StdChaCha.xor(out, in, counter, key, nonce);
+            return StdChaCha.xor(out, in, counter, key.*, nonce);
         }
         note(&chacha_path, .wide);
 
-        const k = keyToWords(key);
+        const k = keyToWords(key.*);
         const n = nonceToWords(nonce);
         var ctr = counter;
         var i: usize = 0;
@@ -454,27 +461,33 @@ pub const ChaCha20 = struct {
             // 32-byte Poly1305-key derivation (paid by EVERY AEAD call, at
             // every length) cost what std costs instead of ~25% more.
             note(&chacha_path, .std_delegated);
-            StdChaCha.xor(out[i..], in[i..], ctr, key, nonce);
+            StdChaCha.xor(out[i..], in[i..], ctr, key.*, nonce);
         }
     }
 
     /// Write the raw ChaCha20 keystream (starting at block `counter`) into `out`.
     pub fn stream(out: []u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
         defer burnFor(out.len <= delegateLimit(delegate_max_bytes));
+        streamBody(out, counter, &key, nonce);
+    }
+
+    /// `stream` with the key by pointer (the dead-stack-clean form).
+    pub fn streamInto(out: []u8, counter: u32, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+        defer burnFor(out.len <= delegateLimit(delegate_max_bytes));
         streamBody(out, counter, key, nonce);
     }
 
-    noinline fn streamBody(out: []u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
+    noinline fn streamBody(out: []u8, counter: u32, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
         // See `counterWouldWrap`: in every build, not just the safe ones.
         if (counterWouldWrap(out.len, counter)) @panic(counter_wrap_message);
         // Short whole call -> std; see the matching note in `xor`.
         if (out.len <= delegateLimit(delegate_max_bytes)) {
             note(&chacha_path, .std_delegated);
-            return StdChaCha.stream(out, counter, key, nonce);
+            return StdChaCha.stream(out, counter, key.*, nonce);
         }
         note(&chacha_path, .wide);
 
-        const k = keyToWords(key);
+        const k = keyToWords(key.*);
         const n = nonceToWords(nonce);
         var ctr = counter;
         var i: usize = 0;
@@ -493,7 +506,7 @@ pub const ChaCha20 = struct {
             @memcpy(out[i..], ks[0..rem]);
         } else if (rem > 0) {
             note(&chacha_path, .std_delegated);
-            StdChaCha.stream(out[i..], ctr, key, nonce);
+            StdChaCha.stream(out[i..], ctr, key.*, nonce);
         }
     }
 };
@@ -592,11 +605,17 @@ pub const ChaCha20Poly1305 = struct {
     /// Encrypt `m` into `c` (`c.len == m.len`) and write the auth tag to `tag`.
     pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
         defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
+        encryptBody(c, tag, m, ad, npub, &k);
+    }
+
+    /// `encrypt` with the key by pointer (the dead-stack-clean form).
+    pub fn encryptInto(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
+        defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
         encryptBody(c, tag, m, ad, npub, k);
     }
 
     /// `encrypt`'s body, one frame down so `burnFor` reaches what it left.
-    noinline fn encryptBody(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
+    noinline fn encryptBody(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
         std.debug.assert(c.len == m.len);
 
         // Short total -> run std's AEAD unchanged. See `aead_delegate_max`.
@@ -607,7 +626,7 @@ pub const ChaCha20Poly1305 = struct {
         // oracle, a branch on a length is not.
         if (m.len + ad.len <= delegateLimit(aead_delegate_max)) {
             note(&aead_path, .std_delegated);
-            return StdAead.encrypt(c, tag, m, ad, npub, k);
+            return StdAead.encrypt(c, tag, m, ad, npub, k.*);
         }
         note(&aead_path, .wide);
 
@@ -632,17 +651,23 @@ pub const ChaCha20Poly1305 = struct {
     /// On failure returns `error.AuthenticationFailed` and `m` is zeroed.
     pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
         defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
+        return decryptBody(m, c, tag, ad, npub, &k);
+    }
+
+    /// `decrypt` with the key by pointer (the dead-stack-clean form).
+    pub fn decryptInto(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
+        defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
         return decryptBody(m, c, tag, ad, npub, k);
     }
 
-    noinline fn decryptBody(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
+    noinline fn decryptBody(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
         std.debug.assert(c.len == m.len);
 
         // Short total -> std's AEAD. Same public-length branch as `encrypt`;
         // see `aead_delegate_max`.
         if (c.len + ad.len <= delegateLimit(aead_delegate_max)) {
             note(&aead_path, .std_delegated);
-            StdAead.decrypt(m, c, tag, ad, npub, k) catch |e| {
+            StdAead.decrypt(m, c, tag, ad, npub, k.*) catch |e| {
                 // The one place the delegation is NOT a straight hand-off.
                 // std documents `m` as *undefined* after a rejection and
                 // implements that as `@memset(m, undefined)`, which is a hint
@@ -704,6 +729,7 @@ test {
     _ = @import("poly1305.zig");
     _ = @import("bench.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
     _ = @import("count.zig");
 }
 

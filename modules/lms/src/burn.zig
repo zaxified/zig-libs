@@ -46,3 +46,8 @@ pub const sign_burn = 2 * 1024;
 /// HSS `ensureTrees` (child seed derivation, child `Tree.init`, the parent's
 /// certificate signature): 3.1 KiB in ReleaseFast (2026-10-09).
 pub const hss_burn = 4 * 1024;
+
+/// `core.deriveX` / `core.deriveRandomizer`: one SHA-256 over `I || q || i ||
+/// 0xff || SEED`, called per chain on the signing path -- tight, not yet
+/// measured (`stackprobe2_test.zig`, 2026-10-09).
+pub const derive_burn = 2 * 1024;

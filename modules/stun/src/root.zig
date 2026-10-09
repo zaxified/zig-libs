@@ -42,6 +42,7 @@
 
 const std = @import("std");
 const netaddr = @import("netaddr");
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -286,6 +287,10 @@ pub const Builder = struct {
     /// so far, with the header length field first set to include this
     /// attribute. `key` is the short-term credential (the SASLprep'd password).
     pub fn addMessageIntegrity(self: *Builder, key: []const u8) BuildError!void {
+        return burn.run(burn.mi_burn, BuildError!void, addMessageIntegrityBody, .{ self, key });
+    }
+
+    fn addMessageIntegrityBody(self: *Builder, key: []const u8) BuildError!void {
         if (self.len + 24 > self.buf.len) return error.BufferTooSmall;
         // Length must point past this attribute before the MAC is taken.
         self.setLengthField(@intCast(self.attrRegionLen() + 24));
@@ -322,23 +327,28 @@ pub const Builder = struct {
 
 /// The long-term credential key (RFC 8489 §9.2.2, the MD5 password
 /// algorithm): MD5(username ":" realm ":" password). Pass it to
-/// `Builder.addMessageIntegrity` / `Message.verifyMessageIntegrity`.
+/// `Builder.addMessageIntegrity` / `Message.verifyMessageIntegrity`. The key
+/// is written to `out` (a result is never returned by value: the caller's
+/// frame would keep a copy); the caller wipes `out` when done. Runs under a
+/// dead-stack burn.
 ///
 /// The three strings must already be processed as RFC 8489 requires —
 /// username and password through the OpaqueString profile (RFC 8265), realm
 /// as received. For printable ASCII that processing changes nothing, so
 /// ASCII credentials can be passed as they are; this module carries no
 /// Unicode tables and does not do it for anything else.
-pub fn longTermKey(username: []const u8, realm: []const u8, password: []const u8) [16]u8 {
+pub fn longTermKey(out: *[16]u8, username: []const u8, realm: []const u8, password: []const u8) void {
+    return burn.run(burn.key_burn, void, longTermKeyBody, .{ out, username, realm, password });
+}
+
+fn longTermKeyBody(out: *[16]u8, username: []const u8, realm: []const u8, password: []const u8) void {
     var h = std.crypto.hash.Md5.init(.{});
     h.update(username);
     h.update(":");
     h.update(realm);
     h.update(":");
     h.update(password);
-    var out: [16]u8 = undefined;
-    h.final(&out);
-    return out;
+    h.final(out);
 }
 
 // ── server side: the Binding responder ──────────────────────────────────────
@@ -629,6 +639,10 @@ pub const Message = struct {
     /// header length field patched to point just past it, and compare in
     /// constant time. False if the attribute is absent or malformed.
     pub fn verifyMessageIntegrity(self: Message, key: []const u8) bool {
+        return burn.run(burn.mi_burn, bool, verifyMessageIntegrityBody, .{ self, key });
+    }
+
+    fn verifyMessageIntegrityBody(self: Message, key: []const u8) bool {
         const mi = self.find(attrCode(.message_integrity)) orelse return false;
         if (mi.value.len != HmacSha1.mac_length) return false;
         var h = HmacSha1.init(key);
@@ -1495,10 +1509,14 @@ test "long-term credentials: RFC 5769 §2.4's request verifies under MD5(user:re
     const realm = m.find(attrCode(.realm)).?.value;
     try testing.expectEqualStrings("example.org", realm);
     try testing.expectEqualStrings("f//499k954d6OL34oL9FSTvy64sA", m.find(attrCode(.nonce)).?.value);
-    const key = longTermKey(user, realm, "TheMatrIX");
+    var key: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &key);
+    longTermKey(&key, user, realm, "TheMatrIX");
     try testing.expect(m.verifyMessageIntegrity(&key));
     // The unprepared password gives another key, which does not verify.
-    const raw = longTermKey(user, realm, "The\u{00AD}M\u{00AA}tr\u{2168}");
+    var raw: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &raw);
+    longTermKey(&raw, user, realm, "The\u{00AD}M\u{00AA}tr\u{2168}");
     try testing.expect(!m.verifyMessageIntegrity(&raw));
     // Builder round trip: the same attributes signed with the key verify.
     var buf: [128]u8 = undefined;
@@ -1728,4 +1746,8 @@ test "corpus: every seed reaches decode, and the walk/accessor counts are pinned
     try testing.expectEqual(@as(usize, 6), accepted);
     try testing.expectEqual(@as(usize, 15), attrs);
     try testing.expectEqual(@as(usize, 3), verified);
+}
+
+test {
+    _ = @import("stackprobe_test.zig");
 }

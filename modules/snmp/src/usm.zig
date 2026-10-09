@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const ber = @import("ber.zig");
+const burn = @import("burn.zig");
 
 pub const DecodeError = ber.DecodeError;
 
@@ -98,6 +99,7 @@ pub fn parse(bytes: []const u8) DecodeError!UsmSecurityParameters {
 /// `v3.EncodeParams.security_parameters`. `auth_params` is written verbatim —
 /// the send path supplies either a zero-filled placeholder (pre-HMAC) or the
 /// final digest.
+// secret-api-ok: `priv_params` is the privacy salt / IV, sent in the clear as msgPrivacyParameters; nothing secret is encoded here.
 pub fn encode(buf: []u8, params: UsmSecurityParameters) ber.EncodeError![]const u8 {
     var e = ber.Encoder.init(buf);
     try e.prependTlv(ber.tag.octet_string, params.priv_params);
@@ -221,6 +223,10 @@ pub const KeyDerivationError = error{
 /// non-empty — `error.EmptyPassword` otherwise (never a division-by-zero
 /// panic).
 pub fn passwordToUserKey(proto: AuthProtocol, password: []const u8, out: []u8) KeyDerivationError![]u8 {
+    return burn.run(burn.key_burn, KeyDerivationError![]u8, passwordToUserKeyBody, .{ proto, password, out });
+}
+
+fn passwordToUserKeyBody(proto: AuthProtocol, password: []const u8, out: []u8) KeyDerivationError![]u8 {
     return switch (proto) {
         .hmac_md5 => pwToUk(hash.Md5, password, out),
         .hmac_sha1 => pwToUk(hash.Sha1, password, out),
@@ -256,6 +262,10 @@ fn pwToUk(comptime Hash: type, password: []const u8, out: []u8) KeyDerivationErr
 /// `Kul = H(Ku ++ engineID ++ Ku)`. `user_key` must be `proto.keyLen()` bytes;
 /// writes `proto.keyLen()` bytes into `out` and returns that prefix.
 pub fn localizeKey(proto: AuthProtocol, user_key: []const u8, engine_id: []const u8, out: []u8) []u8 {
+    return burn.run(burn.key_burn, []u8, localizeKeyBody, .{ proto, user_key, engine_id, out });
+}
+
+fn localizeKeyBody(proto: AuthProtocol, user_key: []const u8, engine_id: []const u8, out: []u8) []u8 {
     return switch (proto) {
         .hmac_md5 => localizeT(hash.Md5, user_key, engine_id, out),
         .hmac_sha1 => localizeT(hash.Sha1, user_key, engine_id, out),
@@ -283,6 +293,12 @@ fn localizeT(comptime Hash: type, user_key: []const u8, engine_id: []const u8, o
 /// `error.EmptyPassword` propagates from `passwordToUserKey` for an empty
 /// password.
 pub fn passwordToKey(proto: AuthProtocol, password: []const u8, engine_id: []const u8, out: []u8) KeyDerivationError![]u8 {
+    // Its own burn: the user key `Ku` lives in this body's frame, above the
+    // callees' burns.
+    return burn.run(burn.key_burn, KeyDerivationError![]u8, passwordToKeyBody, .{ proto, password, engine_id, out });
+}
+
+fn passwordToKeyBody(proto: AuthProtocol, password: []const u8, engine_id: []const u8, out: []u8) KeyDerivationError![]u8 {
     var uk_buf: [max_key_len]u8 = undefined;
     const uk = try passwordToUserKey(proto, password, &uk_buf);
     return localizeKey(proto, uk, engine_id, out);
@@ -299,6 +315,16 @@ pub fn passwordToKey(proto: AuthProtocol, password: []const u8, engine_id: []con
 /// This is the protocol-generic entry point. `computeDigest` is the fixed
 /// 12-byte HMAC-*-96 form kept for the original MD5/SHA-1 API.
 pub fn computeDigestInto(
+    proto: AuthProtocol,
+    localized_key: []const u8,
+    message: []const u8,
+    auth_offset: usize,
+    out: []u8,
+) error{BufferTooSmall}![]u8 {
+    return burn.run(burn.digest_burn, error{BufferTooSmall}![]u8, computeDigestIntoBody, .{ proto, localized_key, message, auth_offset, out });
+}
+
+fn computeDigestIntoBody(
     proto: AuthProtocol,
     localized_key: []const u8,
     message: []const u8,
@@ -397,6 +423,7 @@ pub fn authOffsetFor(proto: AuthProtocol, message: []const u8, params: UsmSecuri
 /// `authOffsetFor` fixed to the 12-byte HMAC-*-96 field length (RFC 3414).
 /// Kept for the original MD5/SHA-1 API; use `authOffsetFor` when the protocol
 /// may be one of the RFC 7860 SHA-2 members.
+// secret-api-ok: `params` is the parsed UsmSecurityParameters; only the address range and length of its `auth_params` field are inspected, no key or digest value is read.
 pub fn authOffset(message: []const u8, params: UsmSecurityParameters) ?usize {
     return authOffsetFor(.hmac_md5, message, params);
 }
@@ -409,6 +436,15 @@ pub fn authOffset(message: []const u8, params: UsmSecurityParameters) ?usize {
 /// digest field is not exactly `proto.digestLen()` bytes or does not lie inside
 /// `message`.
 pub fn verify(
+    proto: AuthProtocol,
+    localized_key: []const u8,
+    message: []const u8,
+    params: UsmSecurityParameters,
+) AuthError!void {
+    return burn.run(burn.digest_burn, AuthError!void, verifyBody, .{ proto, localized_key, message, params });
+}
+
+fn verifyBody(
     proto: AuthProtocol,
     localized_key: []const u8,
     message: []const u8,
@@ -447,6 +483,15 @@ pub fn verify(
 /// The caller must have serialized the message with a `proto.digestLen()`-byte
 /// zero placeholder for `msgAuthenticationParameters` at `auth_offset`.
 pub fn sign(
+    proto: AuthProtocol,
+    localized_key: []const u8,
+    message: []u8,
+    auth_offset: usize,
+) error{KeyTooShort}!void {
+    return burn.run(burn.digest_burn, error{KeyTooShort}!void, signBody, .{ proto, localized_key, message, auth_offset });
+}
+
+fn signBody(
     proto: AuthProtocol,
     localized_key: []const u8,
     message: []u8,

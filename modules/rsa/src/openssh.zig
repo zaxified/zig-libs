@@ -28,6 +28,7 @@
 //! * `std.crypto.pwhash.bcrypt.pbkdf` doubles as an independent oracle.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 // The fractional hexadecimal digits of pi: 1042 32-bit words = 18 P-array
 // subkeys + 4x256 S-box entries, exactly as the Blowfish spec prescribes.
@@ -218,7 +219,15 @@ pub const Blowfish = struct {
     /// into P, then regenerate P and all S-boxes by chain-encrypting the
     /// all-zero block (spec steps 1-7). Key must be 1..72 bytes (the spec
     /// recommends at most 56 = 448 bits; bcrypt feeds 64-byte SHA-512s).
+    ///
+    /// Burned (`burn.zig`): the schedule runs in its own frames.
     pub fn init(key: []const u8) Blowfish {
+        const r = initUnburned(key);
+        burn.stack(burn.kdf_burn);
+        return r;
+    }
+
+    noinline fn initUnburned(key: []const u8) Blowfish {
         var st = initial;
         st.expand0State(key);
         return st;
@@ -312,7 +321,7 @@ pub const Blowfish = struct {
     /// chaining block that is XORed with successive (cyclic) words of
     /// `data` before every encryption. With `data` all-absent this
     /// degenerates to the standard schedule (`expand0State`).
-    pub fn expandState(self: *Blowfish, data: []const u8, key: []const u8) void {
+    fn expandState(self: *Blowfish, data: []const u8, key: []const u8) void {
         var j: usize = 0;
         for (&self.p) |*pe| pe.* ^= stream2word(key, &j);
         var l: u32 = 0;
@@ -342,7 +351,7 @@ pub const Blowfish = struct {
     /// standard Blowfish key schedule (no data-XOR into the chaining
     /// block). `initial` + one `expand0State(key)` == the classic schedule
     /// the ECB test vectors exercise.
-    pub fn expand0State(self: *Blowfish, key: []const u8) void {
+    fn expand0State(self: *Blowfish, key: []const u8) void {
         var j: usize = 0;
         for (&self.p) |*pe| pe.* ^= stream2word(key, &j);
         var l: u32 = 0;
@@ -371,7 +380,7 @@ pub const Blowfish = struct {
 /// password. NOTE: this is the *bcrypt_pbkdf* ordering (salt first, then
 /// password, and the salted expansion takes the salt as chaining data);
 /// the classic bcrypt password hash alternates in the opposite order.
-pub fn eksBlowfishSetup(cost: u6, salt: []const u8, key: []const u8) Blowfish {
+fn eksBlowfishSetup(cost: u6, salt: []const u8, key: []const u8) Blowfish {
     var st = Blowfish.initial;
     st.expandState(salt, key);
     // `n` is an iteration count, not a memory-sized quantity, so it is typed
@@ -423,7 +432,16 @@ pub const PbkdfError = error{InvalidParameters};
 /// of block c lands at out[i*stride + c], stride = ceil(out.len/32) — so
 /// truncating the output never yields a prefix of a longer derivation.
 /// `rounds` >= 1; pass/salt non-empty; out 1..1024 bytes (OpenBSD's bounds).
+///
+/// Burned (`burn.zig`): the Blowfish state (4 KiB) and the SHA-512 of the
+/// passphrase live in the body's frames.
 pub fn bcryptPbkdf(pass: []const u8, salt: []const u8, rounds: u32, out: []u8) PbkdfError!void {
+    const r = bcryptPbkdfUnburned(pass, salt, rounds, out);
+    burn.stack(burn.kdf_burn);
+    return r;
+}
+
+noinline fn bcryptPbkdfUnburned(pass: []const u8, salt: []const u8, rounds: u32, out: []u8) PbkdfError!void {
     const Sha512 = std.crypto.hash.sha2.Sha512;
     if (rounds < 1 or pass.len == 0 or salt.len == 0) return error.InvalidParameters;
     if (out.len == 0 or out.len > 1024) return error.InvalidParameters;

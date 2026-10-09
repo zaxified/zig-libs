@@ -95,6 +95,7 @@
 
 const std = @import("std");
 const rsa = @import("rsa");
+const burn = @import("burn.zig");
 const ber = @import("ber.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -578,6 +579,16 @@ pub const MacError = error{
 /// `acse.zig` hold public protocol bytes on the same reasoning. This module
 /// owns no long-lived secret, so it has no Z1 site.
 pub fn computeMac(
+    algorithm: MacAlgorithm,
+    key: []const u8,
+    domain: []const u8,
+    iv: ?[12]u8,
+    out: []u8,
+) MacError![]u8 {
+    return burn.run(burn.mac_burn, MacError![]u8, computeMacBody, .{ algorithm, key, domain, iv, out });
+}
+
+fn computeMacBody(
     algorithm: MacAlgorithm,
     key: []const u8,
     domain: []const u8,

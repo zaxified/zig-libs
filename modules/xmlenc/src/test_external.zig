@@ -103,7 +103,7 @@ test "EXTERNAL anchor: xmlsec1-encrypted RSA-OAEP-mgf1p + AES-256-GCM decrypts t
     const a = testing.allocator;
     var doc = try xml.parse(a, encrypted_gcm, .{});
     defer doc.deinit();
-    const out = try xmlenc.decryptData(a, doc.root, try spKey(), .{});
+    const out = try xmlenc.decryptData(a, doc.root, &(try spKey()), .{});
     defer a.free(out);
     try testing.expectEqualStrings(expected_plaintext, out);
 }
@@ -140,7 +140,7 @@ test "EXTERNAL anchor: xmlsec1-encrypted xenc11 rsa-oaep(SHA-256) + AES-256-CBC 
     const a = testing.allocator;
     var doc = try xml.parse(a, encrypted_cbc, .{});
     defer doc.deinit();
-    const out = try xmlenc.decryptData(a, doc.root, try spKey(), .{});
+    const out = try xmlenc.decryptData(a, doc.root, &(try spKey()), .{});
     defer a.free(out);
     try testing.expectEqualStrings(expected_plaintext, out);
 }
@@ -182,5 +182,5 @@ test "EXTERNAL anchor: tampered content ciphertext xmlsec1 refuses to decrypt is
     const a = testing.allocator;
     var doc = try xml.parse(a, encrypted_gcm_tampered, .{});
     defer doc.deinit();
-    try testing.expectError(error.DecryptionError, xmlenc.decryptData(a, doc.root, try spKey(), .{}));
+    try testing.expectError(error.DecryptionError, xmlenc.decryptData(a, doc.root, &(try spKey()), .{}));
 }

@@ -57,7 +57,9 @@ test "KAT: SK -> x (secretScalar) matches RFC 9381 Appendix B.3 for every exampl
     for (v.vectors) |vec| {
         const sk = try hex32(vec.sk);
         const want_x = try hex32(vec.x);
-        try std.testing.expectEqualSlices(u8, &want_x, &ecvrf.secretScalar(sk));
+        var got_x: [32]u8 = undefined;
+        ecvrf.secretScalar(&got_x, &sk);
+        try std.testing.expectEqualSlices(u8, &want_x, &got_x);
     }
 }
 
@@ -121,11 +123,13 @@ test "KAT: nonceGenerationString/nonceGeneration -> k_string/k match RFC 9381 Ap
         const sk = try hex32(vec.sk);
         const h = try hex32(vec.h);
         const want_k_string = try hex64(vec.k_string);
-        const got_k_string = ecvrf.nonceGenerationString(sk, h);
+        var got_k_string: [64]u8 = undefined;
+        ecvrf.nonceGenerationString(&got_k_string, &sk, h);
         try std.testing.expectEqualSlices(u8, &want_k_string, &got_k_string);
 
         const want_k = try hex32(vec.k);
-        const got_k = ecvrf.nonceGeneration(sk, h);
+        var got_k: [32]u8 = undefined;
+        ecvrf.nonceGeneration(&got_k, &sk, h);
         try std.testing.expectEqualSlices(u8, &want_k, &got_k);
     }
 }
@@ -411,15 +415,18 @@ test "KeyPair: public key and proofs match publicKey/prove byte for byte on ever
         const sk = try hex32(vec.sk);
         const alpha = try hexAlloc(gpa, vec.alpha);
         defer gpa.free(alpha);
-        const kp = ecvrf.KeyPair.fromSecretKey(&sk);
+        var kp: ecvrf.KeyPair = undefined;
+        ecvrf.KeyPair.fromSecretKey(&kp, &sk);
         try std.testing.expectEqualSlices(u8, &(try hex32(vec.pk)), &kp.public_key);
         try std.testing.expectEqualSlices(u8, &(try hex80(vec.pi)), &kp.prove(alpha));
     }
 }
 
 test "KeyPair: a public_key filled in by hand makes proofs no key verifies (E10)" {
-    const a = ecvrf.KeyPair.fromSecretKey(&(try hex32(v.vectors[0].sk)));
-    const b = ecvrf.KeyPair.fromSecretKey(&(try hex32(v.vectors[1].sk)));
+    var a: ecvrf.KeyPair = undefined;
+    var b: ecvrf.KeyPair = undefined;
+    ecvrf.KeyPair.fromSecretKey(&a, &(try hex32(v.vectors[0].sk)));
+    ecvrf.KeyPair.fromSecretKey(&b, &(try hex32(v.vectors[1].sk)));
     const lying: ecvrf.KeyPair = .{ .secret_key = a.secret_key, .public_key = b.public_key };
     const pi = lying.prove("input");
     try std.testing.expectError(error.InvalidProof, ecvrf.verify(a.public_key, "input", pi));

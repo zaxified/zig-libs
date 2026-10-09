@@ -28,6 +28,7 @@
 const std = @import("std");
 const base32 = @import("base32");
 const root = @import("root.zig");
+const burn = @import("burn.zig");
 
 pub const Algorithm = root.Algorithm;
 
@@ -366,6 +367,10 @@ fn writePercent(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 /// secret is written as unpadded upper-case base32. Validates before writing
 /// anything, so an error leaves `w` untouched.
 pub fn format(w: *std.Io.Writer, k: KeyUri) FormatError!void {
+    return burn.run(burn.otp_burn, FormatError!void, formatBody, .{ w, k });
+}
+
+fn formatBody(w: *std.Io.Writer, k: KeyUri) FormatError!void {
     if (!validText(k.account) or std.mem.indexOfScalar(u8, k.account, ':') != null) return error.InvalidLabel;
     if (k.issuer) |iss| {
         if (!validText(iss) or std.mem.indexOfScalar(u8, iss, ':') != null) return error.InvalidIssuer;

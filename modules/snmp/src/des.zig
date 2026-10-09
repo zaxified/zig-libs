@@ -14,6 +14,7 @@
 //! (CBC use + key/IV derivation, handled in `priv.zig`). No source consulted.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 // ── FIPS 46-3 constant tables (1-indexed bit positions, counted from the MSB) ─
 
@@ -182,8 +183,12 @@ pub const Des = struct {
 
     /// Build the key schedule from an 8-byte key (parity bits are ignored, as in
     /// FIPS 46-3 — only PC-1's chosen 56 bits are used).
-    pub fn init(key: [8]u8) Des {
-        const k64 = std.mem.readInt(u64, &key, .big);
+    pub fn init(key: *const [8]u8) Des {
+        return burn.run(burn.des_burn, Des, initBody, .{key});
+    }
+
+    fn initBody(key: *const [8]u8) Des {
+        const k64 = std.mem.readInt(u64, key, .big);
         const cd = permute(k64, 64, &pc1_table); // 56 bits
         var c: u32 = @intCast(cd >> 28);
         var d: u32 = @intCast(cd & 0x0FFF_FFFF);
@@ -243,7 +248,11 @@ pub const CbcError = error{
 /// DES-CBC encrypt `plaintext` (which must already be a multiple of 8 bytes)
 /// under `key` with the 8-byte `iv`, writing to `out` and returning the written
 /// slice. `out` must be at least `plaintext.len`.
-pub fn cbcEncrypt(key: [8]u8, iv: [8]u8, plaintext: []const u8, out: []u8) CbcError![]u8 {
+pub fn cbcEncrypt(key: *const [8]u8, iv: [8]u8, plaintext: []const u8, out: []u8) CbcError![]u8 {
+    return burn.run(burn.des_burn, CbcError![]u8, cbcEncryptBody, .{ key, iv, plaintext, out });
+}
+
+fn cbcEncryptBody(key: *const [8]u8, iv: [8]u8, plaintext: []const u8, out: []u8) CbcError![]u8 {
     if (plaintext.len % block_len != 0) return error.NotPadded;
     if (out.len < plaintext.len) return error.BufferTooSmall;
     const des = Des.init(key);
@@ -264,7 +273,11 @@ pub fn cbcEncrypt(key: [8]u8, iv: [8]u8, plaintext: []const u8, out: []u8) CbcEr
 /// slice. No un-padding is performed (the caller's BER length delimits the
 /// payload; RFC 3414 leaves the pad value undefined). `out` must be at least
 /// `ciphertext.len`.
-pub fn cbcDecrypt(key: [8]u8, iv: [8]u8, ciphertext: []const u8, out: []u8) CbcError![]u8 {
+pub fn cbcDecrypt(key: *const [8]u8, iv: [8]u8, ciphertext: []const u8, out: []u8) CbcError![]u8 {
+    return burn.run(burn.des_burn, CbcError![]u8, cbcDecryptBody, .{ key, iv, ciphertext, out });
+}
+
+fn cbcDecryptBody(key: *const [8]u8, iv: [8]u8, ciphertext: []const u8, out: []u8) CbcError![]u8 {
     if (ciphertext.len == 0 or ciphertext.len % block_len != 0) return error.InvalidLength;
     if (out.len < ciphertext.len) return error.BufferTooSmall;
     const des = Des.init(key);
@@ -290,7 +303,7 @@ test "FIPS 46-3 single-block KAT" {
     const pt = [8]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
     const expect_ct = [8]u8{ 0x85, 0xE8, 0x13, 0x54, 0x0F, 0x0A, 0xB4, 0x05 };
 
-    const des = Des.init(key);
+    const des = Des.init(&key);
     const ct = des.encryptBlock(pt);
     try testing.expectEqualSlices(u8, &expect_ct, &ct);
 
@@ -301,7 +314,8 @@ test "FIPS 46-3 single-block KAT" {
 
 test "DES all-zero key/plaintext KAT" {
     // Independent vector: key=0, plaintext=0 → 8CA64DE9C1B123A7 (well-known).
-    const des = Des.init(.{0} ** 8);
+    const zero_key = [_]u8{0} ** 8;
+    const des = Des.init(&zero_key);
     const ct = des.encryptBlock(.{0} ** 8);
     try testing.expectEqualSlices(u8, &[_]u8{
         0x8C, 0xA6, 0x4D, 0xE9, 0xC1, 0xB1, 0x23, 0xA7,
@@ -310,7 +324,7 @@ test "DES all-zero key/plaintext KAT" {
 
 test "DES single-block encrypt/decrypt round-trip over many blocks" {
     const key = [8]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
-    const des = Des.init(key);
+    const des = Des.init(&key);
     var blk: [8]u8 = undefined;
     for (0..256) |seed| {
         for (&blk, 0..) |*b, j| b.* = @intCast((seed *% 7 +% j *% 31) & 0xFF);
@@ -327,8 +341,8 @@ test "DES-CBC multi-block round-trip" {
     for (&pt, 0..) |*b, i| b.* = @intCast(i);
     var ct_buf: [64]u8 = undefined;
     var back_buf: [64]u8 = undefined;
-    const ct = try cbcEncrypt(key, iv, &pt, &ct_buf);
-    const back = try cbcDecrypt(key, iv, ct, &back_buf);
+    const ct = try cbcEncrypt(&key, iv, &pt, &ct_buf);
+    const back = try cbcDecrypt(&key, iv, ct, &back_buf);
     try testing.expectEqualSlices(u8, &pt, back);
     // CBC diffuses: identical plaintext blocks must not yield identical
     // ciphertext blocks.
@@ -337,9 +351,10 @@ test "DES-CBC multi-block round-trip" {
 
 test "DES-CBC rejects non-block-aligned lengths" {
     var buf: [16]u8 = undefined;
-    try testing.expectError(error.InvalidLength, cbcDecrypt(.{0} ** 8, .{0} ** 8, &.{}, &buf));
-    try testing.expectError(error.InvalidLength, cbcDecrypt(.{0} ** 8, .{0} ** 8, &[_]u8{0} ** 7, &buf));
-    try testing.expectError(error.NotPadded, cbcEncrypt(.{0} ** 8, .{0} ** 8, &[_]u8{0} ** 7, &buf));
+    const zero_key = [_]u8{0} ** 8;
+    try testing.expectError(error.InvalidLength, cbcDecrypt(&zero_key, .{0} ** 8, &.{}, &buf));
+    try testing.expectError(error.InvalidLength, cbcDecrypt(&zero_key, .{0} ** 8, &[_]u8{0} ** 7, &buf));
+    try testing.expectError(error.NotPadded, cbcEncrypt(&zero_key, .{0} ** 8, &[_]u8{0} ** 7, &buf));
 }
 
 test "DES-CBC one block equals raw block XOR IV" {
@@ -347,11 +362,11 @@ test "DES-CBC one block equals raw block XOR IV" {
     const key = [8]u8{ 0x13, 0x34, 0x57, 0x79, 0x9B, 0xBC, 0xDF, 0xF1 };
     const iv = [8]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11 };
     const pt = [8]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
-    const des = Des.init(key);
+    const des = Des.init(&key);
     var xored = pt;
     for (&xored, iv) |*b, v| b.* ^= v;
     const expect = des.encryptBlock(xored);
     var out: [8]u8 = undefined;
-    const ct = try cbcEncrypt(key, iv, &pt, &out);
+    const ct = try cbcEncrypt(&key, iv, &pt, &out);
     try testing.expectEqualSlices(u8, &expect, ct);
 }

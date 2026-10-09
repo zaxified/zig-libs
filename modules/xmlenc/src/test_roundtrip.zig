@@ -133,7 +133,7 @@ fn roundTrip(
     defer alloc.free(doc_src);
     var doc = try xml.parse(alloc, doc_src, .{});
     defer doc.deinit();
-    return xmlenc.decryptData(alloc, doc.root, sk, options);
+    return xmlenc.decryptData(alloc, doc.root, &sk, options);
 }
 
 test "round-trip: OAEP-mgf1p (SHA1) + AES-256-GCM" {
@@ -225,7 +225,7 @@ test "round-trip: xenc11 rsa-oaep (SHA256) + AES-256-GCM" {
     defer a.free(doc_src);
     var doc = try xml.parse(a, doc_src, .{});
     defer doc.deinit();
-    const out = try xmlenc.decryptData(a, doc.root, kp.secret_key, .{});
+    const out = try xmlenc.decryptData(a, doc.root, &kp.secret_key, .{});
     defer a.free(out);
     try std.testing.expectEqualStrings(plaintext_assertion, out);
 }
@@ -272,7 +272,7 @@ test "round-trip: xenc11 rsa-oaep, digest SHA-256 != MGF1-SHA1 (previously Unsup
     defer a.free(doc_src);
     var doc = try xml.parse(a, doc_src, .{});
     defer doc.deinit();
-    const out = try xmlenc.decryptData(a, doc.root, kp.secret_key, .{});
+    const out = try xmlenc.decryptData(a, doc.root, &kp.secret_key, .{});
     defer a.free(out);
     try std.testing.expectEqualStrings(plaintext_assertion, out);
 }
@@ -315,7 +315,7 @@ test "teeth: xenc11 rsa-oaep with a genuinely unrecognized MGF algorithm -> Unsu
     defer a.free(doc_src);
     var doc = try xml.parse(a, doc_src, .{});
     defer doc.deinit();
-    try std.testing.expectError(error.UnsupportedAlgorithm, xmlenc.decryptData(a, doc.root, kp.secret_key, .{}));
+    try std.testing.expectError(error.UnsupportedAlgorithm, xmlenc.decryptData(a, doc.root, &kp.secret_key, .{}));
 }
 
 test "round-trip via EncryptedAssertion wrapper convenience" {
@@ -336,7 +336,7 @@ test "round-trip via EncryptedAssertion wrapper convenience" {
     defer a.free(wrapper);
     var doc = try xml.parse(a, wrapper, .{});
     defer doc.deinit();
-    const out = try xmlenc.decryptAssertion(a, doc.root, kp.secret_key, .{});
+    const out = try xmlenc.decryptAssertion(a, doc.root, &kp.secret_key, .{});
     defer a.free(out);
     try std.testing.expectEqualStrings(plaintext_assertion, out);
 }
@@ -459,7 +459,7 @@ test "TEETH (F2): the CipherValue caps bound the WORK, not just the decoded size
         // that a cap is a bound on work, whatever its value. (At the 4 MiB
         // default a 2 MiB content CipherValue is legitimately under the cap and
         // is supposed to be decoded.)
-        const r = xmlenc.decryptData(a, doc.root, kp.secret_key, .{
+        const r = xmlenc.decryptData(a, doc.root, &kp.secret_key, .{
             .allow_weak_rsa15 = true,
             .max_ciphertext_len = 4096,
         });
@@ -521,7 +521,7 @@ test "TEETH (F5): a second CipherData or CipherValue is refused, as xmlsec1 refu
         defer doc.deinit();
         try testing.expectError(
             error.MalformedStructure,
-            xmlenc.decryptData(testing.allocator, doc.root, kp.secret_key, .{ .allow_weak_rsa15 = true }),
+            xmlenc.decryptData(testing.allocator, doc.root, &kp.secret_key, .{ .allow_weak_rsa15 = true }),
         );
     }
 }
@@ -629,7 +629,7 @@ test "TEETH (F1): the structural refusals nothing used to reach" {
         const kek = [_]u8{0} ** 32;
         var o = opts;
         o.kek = kek[0..c.kek_len];
-        const r = xmlenc.decryptData(testing.allocator, doc.root, kp.secret_key, o);
+        const r = xmlenc.decryptData(testing.allocator, doc.root, &kp.secret_key, o);
         testing.expectError(c.want, r) catch |e| {
             std.debug.print("xmlenc did not refuse: {s}\n", .{c.name});
             if (r) |p| testing.allocator.free(p) else |_| {}
@@ -754,7 +754,7 @@ test "teeth: CipherReference rejected" {
         "</xenc:EncryptedData>";
     var doc = try xml.parse(a, doc_src, .{});
     defer doc.deinit();
-    try std.testing.expectError(error.CipherReferenceUnsupported, xmlenc.decryptData(a, doc.root, kp.secret_key, .{}));
+    try std.testing.expectError(error.CipherReferenceUnsupported, xmlenc.decryptData(a, doc.root, &kp.secret_key, .{}));
 }
 
 test "teeth: truncated CipherValue (not base64) -> MalformedStructure" {
@@ -771,7 +771,7 @@ test "teeth: truncated CipherValue (not base64) -> MalformedStructure" {
         "</xenc:EncryptedData>";
     var doc = try xml.parse(a, doc_src, .{});
     defer doc.deinit();
-    try std.testing.expectError(error.MalformedStructure, xmlenc.decryptData(a, doc.root, kp.secret_key, .{}));
+    try std.testing.expectError(error.MalformedStructure, xmlenc.decryptData(a, doc.root, &kp.secret_key, .{}));
 }
 
 test "teeth: kw-aes* without kek -> KekNotProvided" {
@@ -962,7 +962,7 @@ fn buildFuzzDoc(alloc: std.mem.Allocator, s: EncShape) ![]u8 {
 fn fuzzDecryptDoc(alloc: std.mem.Allocator, doc_src: []const u8, sk: rsa.SecretKey, options: xmlenc.Options) !void {
     var doc = xml.parse(alloc, doc_src, .{ .id_attr_names = &.{"ID"} }) catch return;
     defer doc.deinit();
-    const plain = xmlenc.decryptData(alloc, doc.root, sk, options) catch return;
+    const plain = xmlenc.decryptData(alloc, doc.root, &sk, options) catch return;
     alloc.free(plain);
 }
 
@@ -1225,7 +1225,7 @@ test "the xmlenc fuzz harness reaches decryptData's crypto path (reachability)" 
         defer a.free(doc_src);
         var doc = try xml.parse(a, doc_src, .{ .id_attr_names = &.{"ID"} });
         defer doc.deinit();
-        const plain = try xmlenc.decryptData(a, doc.root, kp.secret_key, .{});
+        const plain = try xmlenc.decryptData(a, doc.root, &kp.secret_key, .{});
         defer a.free(plain);
         try std.testing.expectEqualStrings(plaintext_assertion, plain);
     }
@@ -1249,7 +1249,7 @@ test "the xmlenc fuzz harness reaches decryptData's crypto path (reachability)" 
         defer doc.deinit();
         try std.testing.expectError(
             error.DecryptionError,
-            xmlenc.decryptData(a, doc.root, kp.secret_key, .{ .allow_weak_rsa15 = true }),
+            xmlenc.decryptData(a, doc.root, &kp.secret_key, .{ .allow_weak_rsa15 = true }),
         );
     }
 
@@ -1376,7 +1376,7 @@ test "Z1: decryptDataToDocument wipes the plaintext IT frees, not just the ones 
 
     var scan = FreeScanner{ .child = a, .needle = "the recovered assertion body" };
     const sa = scan.allocator();
-    var inner = try xmlenc.decryptDataToDocument(sa, outer.root, kp.secret_key, .{});
+    var inner = try xmlenc.decryptDataToDocument(sa, outer.root, &kp.secret_key, .{});
     // Snapshot BEFORE `inner.deinit()`. The returned document legitimately
     // holds the assertion — it is the caller's to destroy (§2.1 Z2) — so
     // letting the scanner see its arena go back would make this test fail for

@@ -132,21 +132,25 @@ const a3_mask = hexToC(5, "4dd92e91ea");
 const a3_protected_header = hexToC(20, "dc6b3343cf0008f067a5502a4262b5004075d92f");
 
 test "RFC 9369 A.1: v2 initial secrets and client/server key/iv/hp (same DCID as RFC 9001 A.1)" {
-    const s = initial.deriveInitialSecretsFor(.v2, &dcid);
+    var s: initial.InitialSecrets = undefined;
+    initial.deriveInitialSecretsFor(.v2, &s, &dcid);
     try testing.expectEqualSlices(u8, &a1_client_secret, &s.client_initial_secret);
     try testing.expectEqualSlices(u8, &a1_server_secret, &s.server_initial_secret);
 
-    const c = keyschedule.derivePacketKeysFor(.v2, HkdfSha256, 16, s.client_initial_secret);
+    var c: keyschedule.PacketKeys(16) = undefined;
+    keyschedule.derivePacketKeysFor(.v2, HkdfSha256, 16, &c, &s.client_initial_secret);
     try testing.expectEqualSlices(u8, &a1_client_key, &c.key);
     try testing.expectEqualSlices(u8, &a1_client_iv, &c.iv);
     try testing.expectEqualSlices(u8, &a1_client_hp, &c.hp);
-    const sv = keyschedule.derivePacketKeysFor(.v2, HkdfSha256, 16, s.server_initial_secret);
+    var sv: keyschedule.PacketKeys(16) = undefined;
+    keyschedule.derivePacketKeysFor(.v2, HkdfSha256, 16, &sv, &s.server_initial_secret);
     try testing.expectEqualSlices(u8, &a1_server_key, &sv.key);
     try testing.expectEqualSlices(u8, &a1_server_iv, &sv.iv);
     try testing.expectEqualSlices(u8, &a1_server_hp, &sv.hp);
 
     // The v1 derivation of the SAME secret must NOT produce the v2 keys.
-    const v1 = keyschedule.derivePacketKeys(HkdfSha256, 16, s.client_initial_secret);
+    var v1: keyschedule.PacketKeys(16) = undefined;
+    keyschedule.derivePacketKeys(HkdfSha256, 16, &v1, &s.client_initial_secret);
     try testing.expect(!std.mem.eql(u8, &v1.key, &a1_client_key));
 }
 
@@ -156,7 +160,7 @@ test "RFC 9369 A.2: client Initial — protect (seal + header protection) is byt
 
     var pkt: [a2_header.len + a2_payload_len + 16]u8 = undefined;
     @memcpy(pkt[0..a2_header.len], &a2_header);
-    const n = try P128.seal(a1_client_key, a1_client_iv, 2, &a2_header, &payload, pkt[a2_header.len..]);
+    const n = try P128.seal(&a1_client_key, a1_client_iv, 2, &a2_header, &payload, pkt[a2_header.len..]);
     try testing.expectEqual(a2_payload_len + 16, n);
     try testing.expectEqual(rfc9369_a2_protected.len, pkt.len);
 
@@ -178,7 +182,7 @@ test "RFC 9369 A.2: client Initial — unprotect (remove header protection + ope
     try testing.expectEqual(@as(usize, 4), r.pn_len);
     try testing.expectEqualSlices(u8, &a2_header, pkt[0..a2_header.len]);
     var out: [a2_payload_len]u8 = undefined;
-    const m = try P128.open(a1_client_key, a1_client_iv, 2, pkt[0..a2_header.len], pkt[a2_header.len..], &out);
+    const m = try P128.open(&a1_client_key, a1_client_iv, 2, pkt[0..a2_header.len], pkt[a2_header.len..], &out);
     try testing.expectEqual(a2_payload_len, m);
     try testing.expectEqualSlices(u8, &rfc9369_a2_crypto_frame, out[0..rfc9369_a2_crypto_frame.len]);
     for (out[rfc9369_a2_crypto_frame.len..m]) |b| try testing.expectEqual(@as(u8, 0), b);
@@ -191,21 +195,24 @@ test "RFC 9369 A.2: v1 keys cannot open the v2 client Initial; a flipped byte fa
     _ = try headerprot.remove(&pkt, .long, 18, mask);
     var out: [a2_payload_len]u8 = undefined;
     // v1 derivation of the v2 client secret (wrong labels) -> wrong key/iv.
-    const wrong = keyschedule.derivePacketKeys(HkdfSha256, 16, a1_client_secret);
-    try testing.expectError(error.DecryptionFailed, P128.open(wrong.key, wrong.iv, 2, pkt[0..a2_header.len], pkt[a2_header.len..], &out));
+    var wrong: keyschedule.PacketKeys(16) = undefined;
+    keyschedule.derivePacketKeys(HkdfSha256, 16, &wrong, &a1_client_secret);
+    try testing.expectError(error.DecryptionFailed, P128.open(&wrong.key, wrong.iv, 2, pkt[0..a2_header.len], pkt[a2_header.len..], &out));
     // v1 SALT (wrong initial salt) -> wrong secrets.
-    const v1s = initial.deriveInitialSecretsFor(.v1, &dcid);
-    const k1 = keyschedule.derivePacketKeysFor(.v2, HkdfSha256, 16, v1s.client_initial_secret);
-    try testing.expectError(error.DecryptionFailed, P128.open(k1.key, k1.iv, 2, pkt[0..a2_header.len], pkt[a2_header.len..], &out));
+    var v1s: initial.InitialSecrets = undefined;
+    initial.deriveInitialSecretsFor(.v1, &v1s, &dcid);
+    var k1: keyschedule.PacketKeys(16) = undefined;
+    keyschedule.derivePacketKeysFor(.v2, HkdfSha256, 16, &k1, &v1s.client_initial_secret);
+    try testing.expectError(error.DecryptionFailed, P128.open(&k1.key, k1.iv, 2, pkt[0..a2_header.len], pkt[a2_header.len..], &out));
     // Flipped ciphertext byte.
     pkt[100] ^= 0x01;
-    try testing.expectError(error.DecryptionFailed, P128.open(a1_client_key, a1_client_iv, 2, pkt[0..a2_header.len], pkt[a2_header.len..], &out));
+    try testing.expectError(error.DecryptionFailed, P128.open(&a1_client_key, a1_client_iv, 2, pkt[0..a2_header.len], pkt[a2_header.len..], &out));
 }
 
 test "RFC 9369 A.3: server Initial — protect is byte-exact and unprotect recovers the payload" {
     var pkt: [a3_header.len + rfc9369_a3_payload.len + 16]u8 = undefined;
     @memcpy(pkt[0..a3_header.len], &a3_header);
-    const n = try P128.seal(a1_server_key, a1_server_iv, 1, &a3_header, &rfc9369_a3_payload, pkt[a3_header.len..]);
+    const n = try P128.seal(&a1_server_key, a1_server_iv, 1, &a3_header, &rfc9369_a3_payload, pkt[a3_header.len..]);
     try testing.expectEqual(rfc9369_a3_payload.len + 16, n);
     try testing.expectEqual(rfc9369_a3_protected.len, pkt.len);
 
@@ -225,7 +232,7 @@ test "RFC 9369 A.3: server Initial — protect is byte-exact and unprotect recov
     try testing.expectEqual(@as(usize, 2), r.pn_len);
     try testing.expectEqualSlices(u8, &a3_header, rx[0..a3_header.len]);
     var out: [rfc9369_a3_payload.len]u8 = undefined;
-    const m = try P128.open(a1_server_key, a1_server_iv, 1, rx[0..a3_header.len], rx[a3_header.len..], &out);
+    const m = try P128.open(&a1_server_key, a1_server_iv, 1, rx[0..a3_header.len], rx[a3_header.len..], &out);
     try testing.expectEqualSlices(u8, &rfc9369_a3_payload, out[0..m]);
 }
 
@@ -237,14 +244,17 @@ const a5_hp = hexToC(32, "d659760d2ba434a226fd37b35c69e2da8211d10c4f12538787d656
 const a5_ku = hexToC(32, "c69374c49e3d2a9466fa689e49d476db5d0dfbc87d32ceeaa6343fd0ae4c7d88");
 
 test "RFC 9369 A.5: v2 ChaCha20-Poly1305 key/iv/hp, key-update secret and the 21-byte short packet" {
-    const k = keyschedule.derivePacketKeysFor(.v2, HkdfSha256, 32, a5_secret);
+    var k: keyschedule.PacketKeys(32) = undefined;
+    keyschedule.derivePacketKeysFor(.v2, HkdfSha256, 32, &k, &a5_secret);
     try testing.expectEqualSlices(u8, &a5_key, &k.key);
     try testing.expectEqualSlices(u8, &a5_iv, &k.iv);
     try testing.expectEqualSlices(u8, &a5_hp, &k.hp);
-    const ku = keyschedule.advanceKeysFor(.v2, HkdfSha256, 32, a5_secret);
+    var ku: keyschedule.KeyUpdate(HkdfSha256, 32) = undefined;
+    keyschedule.advanceKeysFor(.v2, HkdfSha256, 32, &ku, &a5_secret);
     try testing.expectEqualSlices(u8, &a5_ku, &ku.next_secret);
     // Not the v1 "quic ku" result.
-    const ku1 = keyschedule.advanceKeys(HkdfSha256, 32, a5_secret);
+    var ku1: keyschedule.KeyUpdate(HkdfSha256, 32) = undefined;
+    keyschedule.advanceKeys(HkdfSha256, 32, &ku1, &a5_secret);
     try testing.expect(!std.mem.eql(u8, &ku1.next_secret, &a5_ku));
 
     // pn = 654360564, nonce = a6b5bc6ab7dafce328ff4a29.
@@ -253,7 +263,7 @@ test "RFC 9369 A.5: v2 ChaCha20-Poly1305 key/iv/hp, key-update secret and the 21
     const header = hexToC(4, "4200bff4");
     var pkt: [4 + 1 + 16]u8 = undefined;
     @memcpy(pkt[0..4], &header);
-    const n = try PChaCha.seal(a5_key, a5_iv, pn, &header, &[_]u8{0x01}, pkt[4..]);
+    const n = try PChaCha.seal(&a5_key, a5_iv, pn, &header, &[_]u8{0x01}, pkt[4..]);
     try testing.expectEqual(@as(usize, 17), n);
     try testing.expectEqualSlices(u8, &hexToC(17, "0ae7b6b932bc27d786f4bc2bb20f2162ba"), pkt[4..]);
     // "One byte is skipped to produce the sample": sample starts at pn_offset + 4 = 5.

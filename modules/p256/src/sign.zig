@@ -119,13 +119,23 @@ pub const EcdsaP256Sha256 = struct {
             return fromStd(try Std.KeyPair.generateDeterministic(seed.*));
         }
 
-        /// Generate a new, random key pair.
+        /// Generate a new, random key pair. std's shape (the pair comes back
+        /// by value); `generateInto` is the pointer twin.
         pub fn generate(io: std.Io) KeyPair {
+            var kp: KeyPair = undefined;
+            generateInto(&kp, io);
+            return kp;
+        }
+
+        /// `generate` into `out`; the derivation is burned
+        /// (`generateDeterministicInto`) and the seed wiped.
+        pub fn generateInto(out: *KeyPair, io: std.Io) void {
             var seed: [seed_length]u8 = undefined;
             defer std.crypto.secureZero(u8, &seed);
             while (true) {
                 io.random(&seed);
-                return generateDeterministic(seed) catch continue;
+                generateDeterministicInto(out, &seed) catch continue;
+                return;
             }
         }
 
@@ -191,8 +201,32 @@ pub const EcdsaP256Sha256 = struct {
         }
 
         /// An incremental signer over this key pair.
+        ///
+        /// Burned (`burn.zig`): building the signer copies the key through
+        /// std's frames. The result holds the secret key, returned by value —
+        /// `signerInto` is the dead-stack-clean form.
         pub fn signer(key_pair: *const KeyPair, noise: ?[noise_length]u8) !Signer {
-            return .{ .inner = try toStd(key_pair).signer(noise) };
+            const r = signerUnburned(key_pair, if (noise) |*n| n else null);
+            burn.stack(burn.sign_burn);
+            return r;
+        }
+
+        noinline fn signerUnburned(key_pair: *const KeyPair, noise: ?*const [noise_length]u8) !Signer {
+            return .{ .inner = try toStd(key_pair).signer(if (noise) |n| n.* else null) };
+        }
+
+        /// `signer` into `out` (zeroed on error), noise by pointer: the signer
+        /// holds the secret key, so `signer`'s by-value result leaves a copy
+        /// in the caller's frame (`stackprobe2_test.zig`, 2026-10-09).
+        pub fn signerInto(out: *Signer, key_pair: *const KeyPair, noise: ?*const [noise_length]u8) !void {
+            const r = signerIntoUnburned(out, key_pair, noise);
+            burn.stack(burn.sign_burn);
+            return r;
+        }
+
+        noinline fn signerIntoUnburned(out: *Signer, key_pair: *const KeyPair, noise: ?*const [noise_length]u8) !void {
+            errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+            out.* = .{ .inner = try toStd(key_pair).signer(if (noise) |n| n.* else null) };
         }
 
         inline fn toStd(key_pair: *const KeyPair) Std.KeyPair {

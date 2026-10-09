@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const version = @import("version.zig");
+const burn = @import("burn.zig");
 
 pub const Version = version.Version;
 
@@ -57,9 +58,10 @@ pub fn PacketKeys(comptime key_len: usize) type {
 pub fn derivePacketKeys(
     comptime Hkdf: type,
     comptime key_len: usize,
-    traffic_secret: [Hkdf.prk_length]u8,
-) PacketKeys(key_len) {
-    return derivePacketKeysFor(.v1, Hkdf, key_len, traffic_secret);
+    out: *PacketKeys(key_len),
+    traffic_secret: *const [Hkdf.prk_length]u8,
+) void {
+    derivePacketKeysFor(.v1, Hkdf, key_len, out, traffic_secret);
 }
 
 /// `derivePacketKeys` for an explicit QUIC version: `.v1` uses the
@@ -69,14 +71,23 @@ pub fn derivePacketKeysFor(
     ver: Version,
     comptime Hkdf: type,
     comptime key_len: usize,
-    traffic_secret: [Hkdf.prk_length]u8,
-) PacketKeys(key_len) {
+    out: *PacketKeys(key_len),
+    traffic_secret: *const [Hkdf.prk_length]u8,
+) void {
+    burn.run(burn.kdf_burn, void, derivePacketKeysBody, .{ ver, Hkdf, key_len, out, traffic_secret });
+}
+
+fn derivePacketKeysBody(
+    ver: Version,
+    comptime Hkdf: type,
+    comptime key_len: usize,
+    out: *PacketKeys(key_len),
+    traffic_secret: *const [Hkdf.prk_length]u8,
+) void {
     const l = ver.labels();
-    return .{
-        .key = std.crypto.tls.hkdfExpandLabel(Hkdf, traffic_secret, l.key, "", key_len),
-        .iv = std.crypto.tls.hkdfExpandLabel(Hkdf, traffic_secret, l.iv, "", 12),
-        .hp = std.crypto.tls.hkdfExpandLabel(Hkdf, traffic_secret, l.hp, "", key_len),
-    };
+    out.key = std.crypto.tls.hkdfExpandLabel(Hkdf, traffic_secret.*, l.key, "", key_len);
+    out.iv = std.crypto.tls.hkdfExpandLabel(Hkdf, traffic_secret.*, l.iv, "", 12);
+    out.hp = std.crypto.tls.hkdfExpandLabel(Hkdf, traffic_secret.*, l.hp, "", key_len);
 }
 
 /// The result of one RFC 9001 §6 key update: the advanced traffic secret and
@@ -108,9 +119,10 @@ pub fn KeyUpdate(comptime Hkdf: type, comptime key_len: usize) type {
 pub fn advanceKeys(
     comptime Hkdf: type,
     comptime key_len: usize,
-    current_secret: [Hkdf.prk_length]u8,
-) KeyUpdate(Hkdf, key_len) {
-    return advanceKeysFor(.v1, Hkdf, key_len, current_secret);
+    out: *KeyUpdate(Hkdf, key_len),
+    current_secret: *const [Hkdf.prk_length]u8,
+) void {
+    advanceKeysFor(.v1, Hkdf, key_len, out, current_secret);
 }
 
 /// `advanceKeys` for an explicit QUIC version (`.v2`: `"quicv2 ku"`,
@@ -119,16 +131,27 @@ pub fn advanceKeysFor(
     ver: Version,
     comptime Hkdf: type,
     comptime key_len: usize,
-    current_secret: [Hkdf.prk_length]u8,
-) KeyUpdate(Hkdf, key_len) {
+    out: *KeyUpdate(Hkdf, key_len),
+    current_secret: *const [Hkdf.prk_length]u8,
+) void {
+    burn.run(burn.kdf_burn, void, advanceKeysBody, .{ ver, Hkdf, key_len, out, current_secret });
+}
+
+// `out.next_secret` may be the `current_secret` argument (ratchet in place):
+// the input is consumed before any output byte is written.
+fn advanceKeysBody(
+    ver: Version,
+    comptime Hkdf: type,
+    comptime key_len: usize,
+    out: *KeyUpdate(Hkdf, key_len),
+    current_secret: *const [Hkdf.prk_length]u8,
+) void {
     const l = ver.labels();
-    const next_secret = std.crypto.tls.hkdfExpandLabel(Hkdf, current_secret, l.ku, "", Hkdf.prk_length);
-    return .{
-        .next_secret = next_secret,
-        .key = std.crypto.tls.hkdfExpandLabel(Hkdf, next_secret, l.key, "", key_len),
-        .iv = std.crypto.tls.hkdfExpandLabel(Hkdf, next_secret, l.iv, "", 12),
-        // hp is intentionally NOT re-derived — RFC 9001 §6.1.
-    };
+    const next_secret = std.crypto.tls.hkdfExpandLabel(Hkdf, current_secret.*, l.ku, "", Hkdf.prk_length);
+    out.next_secret = next_secret;
+    out.key = std.crypto.tls.hkdfExpandLabel(Hkdf, next_secret, l.key, "", key_len);
+    out.iv = std.crypto.tls.hkdfExpandLabel(Hkdf, next_secret, l.iv, "", 12);
+    // hp is intentionally NOT re-derived — RFC 9001 §6.1.
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -198,24 +221,28 @@ test "sanity: RFC 9001 App. A.5 key-update (\"quic ku\") secret matches std.cryp
 }
 
 test "derivePacketKeys: App. A.1 client + server, App. A.5 chacha" {
-    const c = derivePacketKeys(HkdfSha256, 16, rfc_client_initial_secret);
+    var c: PacketKeys(16) = undefined;
+    derivePacketKeys(HkdfSha256, 16, &c, &rfc_client_initial_secret);
     try testing.expectEqualSlices(u8, &rfc_client_key, &c.key);
     try testing.expectEqualSlices(u8, &rfc_client_iv, &c.iv);
     try testing.expectEqualSlices(u8, &rfc_client_hp, &c.hp);
 
-    const s = derivePacketKeys(HkdfSha256, 16, rfc_server_initial_secret);
+    var s: PacketKeys(16) = undefined;
+    derivePacketKeys(HkdfSha256, 16, &s, &rfc_server_initial_secret);
     try testing.expectEqualSlices(u8, &rfc_server_key, &s.key);
     try testing.expectEqualSlices(u8, &rfc_server_iv, &s.iv);
     try testing.expectEqualSlices(u8, &rfc_server_hp, &s.hp);
 
-    const a5 = derivePacketKeys(HkdfSha256, 32, rfc_a5_secret);
+    var a5: PacketKeys(32) = undefined;
+    derivePacketKeys(HkdfSha256, 32, &a5, &rfc_a5_secret);
     try testing.expectEqualSlices(u8, &rfc_a5_key, &a5.key);
     try testing.expectEqualSlices(u8, &rfc_a5_iv, &a5.iv);
     try testing.expectEqualSlices(u8, &rfc_a5_hp, &a5.hp);
 }
 
 test "advanceKeys: App. A.5 \"quic ku\" secret + its key/iv (hp unchanged)" {
-    const ku = advanceKeys(HkdfSha256, 32, rfc_a5_secret);
+    var ku: KeyUpdate(HkdfSha256, 32) = undefined;
+    advanceKeys(HkdfSha256, 32, &ku, &rfc_a5_secret);
     try testing.expectEqualSlices(u8, &rfc_a5_ku, &ku.next_secret);
     // The RFC does not publish the post-update key/iv, so derive the expected
     // values from rfc_a5_ku via the same sanity path the A.1/A.5 tests use.

@@ -273,7 +273,7 @@ noinline fn callPublicKey() void {
     std.mem.doNotOptimizeAway(&pk);
 }
 noinline fn callFromSecretKey() void {
-    kp_sink = ev.KeyPair.fromSecretKey(&cur_sk);
+    ev.KeyPair.fromSecretKey(&kp_sink, &cur_sk);
 }
 
 fn addScalar(n: *Needles, name: []const u8, s: [32]u8) void {
@@ -288,7 +288,9 @@ fn keyNeedles(n: *Needles) void {
     var h: [64]u8 = undefined;
     Sha512.hash(&cur_sk, &h, .{});
     n.addImage("SHA-512(seed)", &h);
-    addScalar(n, "x", ev.secretScalar(cur_sk));
+    var x: [32]u8 = undefined;
+    ev.secretScalar(&x, &cur_sk);
+    addScalar(n, "x", x);
 }
 
 test "STACKPROBE: no key or nonce residue on the dead stack after prove and key derivation" {
@@ -296,13 +298,15 @@ test "STACKPROBE: no key or nonce residue on the dead stack after prove and key 
     var bad: usize = 0;
     for (0..n_cases) |ci| {
         cur_sk = caseBytes(32, 's', @intCast(ci));
-        cur_kp = ev.KeyPair.fromSecretKey(&cur_sk);
+        ev.KeyPair.fromSecretKey(&cur_kp, &cur_sk);
         leak_src = cur_sk;
 
         const pk = ev.publicKey(&cur_sk);
         const h_string = ev.encodeToCurve(pk, alpha);
-        const k_string = ev.nonceGenerationString(cur_sk, h_string);
-        const k = ev.nonceGeneration(cur_sk, h_string);
+        var k_string: [64]u8 = undefined;
+        ev.nonceGenerationString(&k_string, &cur_sk, h_string);
+        var k: [32]u8 = undefined;
+        ev.nonceGeneration(&k, &cur_sk, h_string);
         const proof = ev.prove(&cur_sk, alpha);
         var c_wide: [32]u8 = @splat(0);
         c_wide[0..ev.c_len].* = proof[ev.pt_len..][0..ev.c_len].*;

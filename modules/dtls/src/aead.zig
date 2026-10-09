@@ -24,6 +24,7 @@
 //! nonce, but the TLS/DTLS profile needs 12.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 pub const RecordProtectionError = error{
     DecryptionFailed,
@@ -71,7 +72,19 @@ pub fn Protection(comptime Aead: type) type {
         /// PRIOR to sequence-number encryption). Writes `plaintext.len +
         /// tag_length` bytes into `out`; returns that count.
         pub fn protect(
-            key: [key_length]u8,
+            key: *const [key_length]u8,
+            static_iv: [nonce_length]u8,
+            epoch: u64,
+            sequence_number: u64,
+            plaintext: []const u8,
+            additional_data: []const u8,
+            out: []u8,
+        ) RecordProtectionError!usize {
+            return burn.run(burn.aead_burn, RecordProtectionError!usize, protectBody, .{ key, static_iv, epoch, sequence_number, plaintext, additional_data, out });
+        }
+
+        fn protectBody(
+            key: *const [key_length]u8,
             static_iv: [nonce_length]u8,
             epoch: u64,
             sequence_number: u64,
@@ -83,7 +96,7 @@ pub fn Protection(comptime Aead: type) type {
             if (out.len < total) return error.BufferTooShort;
             const npub = nonce(static_iv, epoch, sequence_number);
             var tag: [tag_length]u8 = undefined;
-            Aead.encrypt(out[0..plaintext.len], &tag, plaintext, additional_data, npub, key);
+            Aead.encrypt(out[0..plaintext.len], &tag, plaintext, additional_data, npub, key.*);
             @memcpy(out[plaintext.len..][0..tag_length], &tag);
             return total;
         }
@@ -95,7 +108,19 @@ pub fn Protection(comptime Aead: type) type {
         /// `error.DecryptionFailed` — never a panic, never a timing leak
         /// (std AEAD open uses a constant-time tag compare).
         pub fn unprotect(
-            key: [key_length]u8,
+            key: *const [key_length]u8,
+            static_iv: [nonce_length]u8,
+            epoch: u64,
+            sequence_number: u64,
+            ciphertext: []const u8,
+            additional_data: []const u8,
+            out: []u8,
+        ) RecordProtectionError!usize {
+            return burn.run(burn.aead_burn, RecordProtectionError!usize, unprotectBody, .{ key, static_iv, epoch, sequence_number, ciphertext, additional_data, out });
+        }
+
+        fn unprotectBody(
+            key: *const [key_length]u8,
             static_iv: [nonce_length]u8,
             epoch: u64,
             sequence_number: u64,
@@ -109,7 +134,7 @@ pub fn Protection(comptime Aead: type) type {
             const npub = nonce(static_iv, epoch, sequence_number);
             var tag: [tag_length]u8 = undefined;
             @memcpy(&tag, ciphertext[body_len..][0..tag_length]);
-            Aead.decrypt(out[0..body_len], ciphertext[0..body_len], tag, additional_data, npub, key) catch
+            Aead.decrypt(out[0..body_len], ciphertext[0..body_len], tag, additional_data, npub, key.*) catch
                 return error.DecryptionFailed;
             return body_len;
         }
@@ -127,6 +152,14 @@ pub fn Protection(comptime Aead: type) type {
 /// Ciphertext[0..15])`; `seq_bytes[i] ^= Mask[i]`. `sn_key` is 16 (AES-128)
 /// or 32 (AES-256) bytes.
 pub fn encryptSequenceNumberAes(
+    sn_key: []const u8,
+    ciphertext_sample: []const u8,
+    seq_bytes: []u8,
+) RecordProtectionError!void {
+    return burn.run(burn.aead_burn, RecordProtectionError!void, encryptSequenceNumberAesBody, .{ sn_key, ciphertext_sample, seq_bytes });
+}
+
+fn encryptSequenceNumberAesBody(
     sn_key: []const u8,
     ciphertext_sample: []const u8,
     seq_bytes: []u8,
@@ -149,6 +182,14 @@ pub fn encryptSequenceNumberAes(
 /// little-endian (matching the ChaCha20 block layout); the nonce is the next
 /// 12 bytes. `sn_key` is 32 bytes.
 pub fn encryptSequenceNumberChaCha20(
+    sn_key: []const u8,
+    ciphertext_sample: []const u8,
+    seq_bytes: []u8,
+) RecordProtectionError!void {
+    return burn.run(burn.aead_burn, RecordProtectionError!void, encryptSequenceNumberChaCha20Body, .{ sn_key, ciphertext_sample, seq_bytes });
+}
+
+fn encryptSequenceNumberChaCha20Body(
     sn_key: []const u8,
     ciphertext_sample: []const u8,
     seq_bytes: []u8,
@@ -220,11 +261,11 @@ test "AES-GCM record protection: byte-exact vs OpenSSL, then round-trips" {
     const inner = hexTo(10, "48692074686572652117"); // "Hi there!" + type 23
     const aad = hexTo(5, "2e002a0018");
     var out: [64]u8 = undefined;
-    const n = try P.protect(key, iv, 0, 0x2A, &inner, &aad, &out);
+    const n = try P.protect(&key, iv, 0, 0x2A, &inner, &aad, &out);
     try testing.expectEqualSlices(u8, &hexTo(26, "9530a24df8ffa56be28d84fd00b8bad037aa890687853264e508"), out[0..n]);
 
     var back: [64]u8 = undefined;
-    const m = try P.unprotect(key, iv, 0, 0x2A, out[0..n], &aad, &back);
+    const m = try P.unprotect(&key, iv, 0, 0x2A, out[0..n], &aad, &back);
     try testing.expectEqualSlices(u8, &inner, back[0..m]);
 }
 
@@ -236,10 +277,10 @@ test "ChaCha20-Poly1305 record protection: byte-exact vs OpenSSL" {
     const inner = hexTo(10, "48692074686572652117");
     const aad = hexTo(5, "2e002a0018");
     var out: [64]u8 = undefined;
-    const n = try P.protect(key, iv, 0, 0x2A, &inner, &aad, &out);
+    const n = try P.protect(&key, iv, 0, 0x2A, &inner, &aad, &out);
     try testing.expectEqualSlices(u8, &hexTo(26, "fe100fc8a3e503734e8cafbddc40f5e847fcd8be3eb895158ab7"), out[0..n]);
     var back: [64]u8 = undefined;
-    const m = try P.unprotect(key, iv, 0, 0x2A, out[0..n], &aad, &back);
+    const m = try P.unprotect(&key, iv, 0, 0x2A, out[0..n], &aad, &back);
     try testing.expectEqualSlices(u8, &inner, back[0..m]);
 }
 
@@ -255,10 +296,10 @@ test "ChaCha20-Poly1305 record protection: chachapoly sibling is byte-identical 
     const inner = hexTo(10, "48692074686572652117");
     const aad = hexTo(5, "2e002a0018");
     var out: [64]u8 = undefined;
-    const n = try P.protect(key, iv, 0, 0x2A, &inner, &aad, &out);
+    const n = try P.protect(&key, iv, 0, 0x2A, &inner, &aad, &out);
     try testing.expectEqualSlices(u8, &hexTo(26, "fe100fc8a3e503734e8cafbddc40f5e847fcd8be3eb895158ab7"), out[0..n]);
     var back: [64]u8 = undefined;
-    const m = try P.unprotect(key, iv, 0, 0x2A, out[0..n], &aad, &back);
+    const m = try P.unprotect(&key, iv, 0, 0x2A, out[0..n], &aad, &back);
     try testing.expectEqualSlices(u8, &inner, back[0..m]);
 }
 
@@ -269,23 +310,23 @@ test "unprotect: tampered tag/ciphertext/AAD -> DecryptionFailed, never panic" {
     const inner = hexTo(10, "48692074686572652117");
     const aad = hexTo(5, "2e002a0018");
     var out: [64]u8 = undefined;
-    const n = try P.protect(key, iv, 0, 0x2A, &inner, &aad, &out);
+    const n = try P.protect(&key, iv, 0, 0x2A, &inner, &aad, &out);
     var back: [64]u8 = undefined;
 
     var t1 = out;
     t1[0] ^= 1; // flip a ciphertext byte
-    try testing.expectError(error.DecryptionFailed, P.unprotect(key, iv, 0, 0x2A, t1[0..n], &aad, &back));
+    try testing.expectError(error.DecryptionFailed, P.unprotect(&key, iv, 0, 0x2A, t1[0..n], &aad, &back));
 
     var t2 = out;
     t2[n - 1] ^= 1; // flip a tag byte
-    try testing.expectError(error.DecryptionFailed, P.unprotect(key, iv, 0, 0x2A, t2[0..n], &aad, &back));
+    try testing.expectError(error.DecryptionFailed, P.unprotect(&key, iv, 0, 0x2A, t2[0..n], &aad, &back));
 
     var bad_aad = aad;
     bad_aad[0] ^= 1;
-    try testing.expectError(error.DecryptionFailed, P.unprotect(key, iv, 0, 0x2A, out[0..n], &bad_aad, &back));
+    try testing.expectError(error.DecryptionFailed, P.unprotect(&key, iv, 0, 0x2A, out[0..n], &bad_aad, &back));
 
     // Wrong sequence number => wrong nonce => open fails.
-    try testing.expectError(error.DecryptionFailed, P.unprotect(key, iv, 0, 0x2B, out[0..n], &aad, &back));
+    try testing.expectError(error.DecryptionFailed, P.unprotect(&key, iv, 0, 0x2B, out[0..n], &aad, &back));
 }
 
 test "unprotect: ciphertext shorter than the tag is a typed error" {
@@ -294,7 +335,7 @@ test "unprotect: ciphertext shorter than the tag is a typed error" {
     const iv = [_]u8{0} ** 12;
     var back: [4]u8 = undefined;
     const tiny = [_]u8{ 1, 2, 3 };
-    try testing.expectError(error.RecordTooShort, P.unprotect(key, iv, 0, 0, &tiny, "", &back));
+    try testing.expectError(error.RecordTooShort, P.unprotect(&key, iv, 0, 0, &tiny, "", &back));
 }
 
 test "seq-number mask (AES-128 ECB): byte-exact vs OpenSSL, self-inverse" {
@@ -347,5 +388,5 @@ test "protect: output buffer too small is a typed error" {
     const key = [_]u8{0} ** 16;
     const iv = [_]u8{0} ** 12;
     var tiny: [4]u8 = undefined;
-    try testing.expectError(error.BufferTooShort, P.protect(key, iv, 0, 0, "hello", "", &tiny));
+    try testing.expectError(error.BufferTooShort, P.protect(&key, iv, 0, 0, "hello", "", &tiny));
 }

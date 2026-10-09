@@ -32,6 +32,7 @@
 //! See `../NOTICE`.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 /// `otpauth://` provisioning URIs: `parse` (bounded, allocation-free) and
 /// `format`. See `otpauth.zig`.
@@ -95,7 +96,14 @@ const pow10 = [_]u32{
 /// Dynamic truncation (§5.3, extended to longer digests by RFC 6238 the
 /// same way): `offset` = low 4 bits of the *last* digest byte; `P` = the 4
 /// digest bytes at `offset` read big-endian with the top bit masked off.
+///
+/// Dead-stack: the HMAC runs one frame down under a burn (`burn.zig`); every
+/// other code function here reaches the key only through this one.
 pub fn dynamicTruncate(comptime alg: Algorithm, key: []const u8, counter: u64) u32 {
+    return burn.run(burn.otp_burn, u32, dynamicTruncateBody, .{ alg, key, counter });
+}
+
+fn dynamicTruncateBody(comptime alg: Algorithm, key: []const u8, counter: u64) u32 {
     const H = alg.Hmac();
     var msg: [8]u8 = undefined;
     std.mem.writeInt(u64, &msg, counter, .big);
@@ -257,6 +265,7 @@ test "totpVerify accepts the correct code and rejects wrong ones (constant-time 
 
 test {
     _ = @import("otpauth.zig");
+    _ = @import("stackprobe_test.zig");
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
 }

@@ -1244,6 +1244,7 @@ fn serverKexRoundBody(
 
 /// Convenience: `transport.Transport.init` followed by `serverHandshake` —
 /// the responder-side mirror of `transport.connect`.
+// secret-api-ok: thin wrapper of Transport.init + serverHandshake (kex and round burns); ServerConfig holds slices of the host keys, so a by-value copy copies pointers only.
 pub fn accept(
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,

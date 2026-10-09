@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** `encrypt` and `decrypt` take the key by pointer
+  (`key: *const [Aes.key_bits / 8]u8`, was by value): a by-value key is a copy in the caller's frame
+  that the module cannot wipe. Both now run under a 4 KiB dead-stack burn (`src/burn.zig`, per
+  message, tight) and `stackprobe_test.zig` probes them in ReleaseFast. Migrated in-repo: `jwe`,
+  `megolm`, `xmlenc`, the example.
 - **2026-10-05** — Tests: first dated mutation run (17 mutants, all killed after one new test;
   `SPEC.md` § "Mutation run 2026-10-05"): a whole block of 0x11 (pad 17) is refused. No source
   change.

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** `secretScalar`, `nonceGenerationString`, `nonceGeneration` and `KeyPair.fromSecretKey` no longer take the seed by value or return the secret: `secretScalar(out *[32]u8, sk *const SecretKey)`, `nonceGenerationString(out *[64]u8, sk *const, h_string)`, `nonceGeneration(out *[32]u8, sk *const, h_string)`, `KeyPair.fromSecretKey(out *KeyPair, sk *const)` (all `void`). The first three now burn their stack (`burn.zig`). Probe: `src/stackprobe2_test.zig`; README example, KAT test, old probe and ctgrind harness migrated.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the A1 E4 hand probe was not
   kept; its durable form (`src/stackprobe_test.zig`) found the nonce `k` after `prove` and
   `KeyPair.prove` (with the proof's public `c` and `s` it yields `x`) and the seed after `prove` and

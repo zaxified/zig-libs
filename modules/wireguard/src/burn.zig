@@ -56,3 +56,8 @@ pub const seal_burn = 1024;
 /// `DeviceParser`): 1.7 KiB deepest measured (`admit`), the HMAC/BLAKE2s keyed
 /// state and the netlink builder frames.
 pub const cp_burn = 4 * 1024;
+
+/// `noise.keyedMac`: keyed BLAKE2s-128 over the mac1 key (public-derived) or
+/// the cookie secret; per handshake message, so tight (2 KiB until measured in
+/// ReleaseFast).
+pub const mac_burn = 2 * 1024;

@@ -3075,6 +3075,7 @@ pub const TokenRequest = struct {
 /// Build the authorization-code token-exchange request (RFC 6749 §4.1.3,
 /// PKCE §4.5) against `token_endpoint` (from Discovery's
 /// `Metadata.token_endpoint`, or an endpoint configured directly).
+// secret-api-ok: pure string assembly; `params` holds borrowed slices and the code verifier / client secret are percent-encoded straight into the heap request body (the caller's `deinit` frees it) -- no fixed-size secret is ever on the stack
 pub fn buildTokenRequest(
     gpa: std.mem.Allocator,
     token_endpoint: []const u8,

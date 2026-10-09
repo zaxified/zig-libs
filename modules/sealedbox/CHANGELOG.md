@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack sweep (`CONVENTIONS.md` §2.1.1). `open` and `openAlloc`
+  take the keypair by pointer (`kp: *const KeyPair`); `publicFromSecret` takes `sk: *const [32]u8`;
+  `keyPairFromSecretKey(out: *KeyPair, sk: *const [32]u8) !void` writes into `out` (zeroed on error)
+  instead of returning the pair. `open`, `publicFromSecret` and `keyPairFromSecretKey` run under an
+  8 KiB burn (`src/burn.zig`; `open` is per message). `stackprobe2_test.zig` probes them.
+  Migrated in-repo: tests, example, `tools/bench.zig`, `tools/driver.zig`, README.
 - **2026-10-08** — **BREAKING + FIX (secret in the caller's frame):** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
   engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
   through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised

@@ -245,7 +245,7 @@ pub const ClientCredentials = struct {
             break :blk san_buf[0..1];
         } else &.{};
 
-        const certificate_der = try rsa.selfSignedCert(allocator, kp.secret_key, kp.public_key, std.crypto.hash.sha2.Sha256, .{
+        const certificate_der = try rsa.selfSignedCert(allocator, &kp.secret_key, kp.public_key, std.crypto.hash.sha2.Sha256, .{
             .common_name = options.common_name,
             .not_before = options.not_before,
             .not_after = options.not_after,

@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). `Sealer.seal`, `Opener.open` and
+  both `rekey`s now run under an 8 KiB per-message burn (`src/burn.zig`): the AEAD call copied the
+  key by value into a frame nothing cleared. The by-value `init`/`initWindow`/`rekey` stay; new
+  pointer twins build the half in place and take the key by pointer: `Sealer.initInto`,
+  `Opener.initInto`, `Opener.initWindowInto`, `Sealer.rekeyInto`, `Opener.rekeyInto`. Additive, no
+  existing signature changed. `stackprobe_test.zig` probes them for both instantiations.
 - **2026-10-05** — **Fix (anti-replay):** `ReplayWindow.commit` cleared the bitmap when the
   high-water mark advanced by exactly the window size, so the previous high-water mark (then at
   the window's trailing edge, still in range) was accepted a second time — a replay. Fixed;

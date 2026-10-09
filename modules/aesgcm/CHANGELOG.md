@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). `Context.init`/`initWith`,
+  `AesGcm.init`/`initWith` and the stateless `encrypt`/`decrypt` now run under a 4 KiB per-message
+  burn (`src/burn.zig`). Their `key: [N]u8` by-value surface is kept (std shape) with new pointer
+  twins: `initInto(out, *const key)`, `initWithInto(out, b, *const key) bool`,
+  `encryptInto(..., *const key)`, `decryptInto(..., *const key)` -- no key copy and no `Context`
+  in the caller's frame. Additive, no existing signature changed. `stackprobe_test.zig` probes the
+  twins in ReleaseFast.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** Wycheproof `aes_gcm_test.json` anchors the module
   (`tools/wycheproof.py` → `src/testdata/wycheproof.zig`): 79 valid vectors encrypt and decrypt
   exactly on every backend and the stateless path, 54 modified tags are refused with the output

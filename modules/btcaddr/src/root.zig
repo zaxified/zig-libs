@@ -31,6 +31,7 @@
 
 const std = @import("std");
 const bech32 = @import("bech32");
+const burn = @import("burn.zig");
 const ripemd160 = @import("ripemd160");
 
 const base58 = bech32.base58;
@@ -438,6 +439,10 @@ pub const WifEncodeError = base58.Error || error{InvalidKey};
 /// Encodes `key` as WIF for `network` into `out` (>= `max_wif_len` bytes) and
 /// returns the written prefix. The output is secret: the caller wipes `out`.
 pub fn wifEncode(key: *const [32]u8, compressed: bool, network: Network, out: []u8) WifEncodeError![]const u8 {
+    return burn.run(burn.wif_burn, WifEncodeError![]const u8, wifEncodeBody, .{ key, compressed, network, out });
+}
+
+fn wifEncodeBody(key: *const [32]u8, compressed: bool, network: Network, out: []u8) WifEncodeError![]const u8 {
     if (!keyInRange(key)) return error.InvalidKey;
     var payload: [34]u8 = undefined;
     defer std.crypto.secureZero(u8, &payload);
@@ -534,4 +539,5 @@ pub fn p2shP2wshOfWitnessScript(witness_script: []const u8) HelperError![23]u8 {
 test {
     _ = @import("core_test.zig");
     _ = @import("unit_test.zig");
+    _ = @import("stackprobe_test.zig");
 }

@@ -127,6 +127,7 @@ test {
     _ = records;
     _ = outstation;
     _ = goldens;
+    _ = @import("stackprobe_test.zig");
 }
 
 // ── full-stack integration: link + transport together ───────────────────────

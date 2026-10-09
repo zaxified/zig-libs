@@ -123,7 +123,7 @@ pub fn main() !void {
     {
         var doc = try xml.parse(gpa, encrypted_gcm, .{});
         defer doc.deinit();
-        const out = try xmlenc.decryptData(gpa, doc.root, sk, .{});
+        const out = try xmlenc.decryptData(gpa, doc.root, &sk, .{});
         // CONVENTIONS §2.1 Z2: `decryptData`'s doc comment says the returned
         // plaintext is the caller's to destroy, and this example is a caller —
         // the pattern an integrator copies. It used to free it bare.
@@ -142,7 +142,7 @@ pub fn main() !void {
     {
         var doc = try xml.parse(gpa, encrypted_gcm_tampered, .{});
         defer doc.deinit();
-        if (xmlenc.decryptData(gpa, doc.root, sk, .{})) |plaintext| {
+        if (xmlenc.decryptData(gpa, doc.root, &sk, .{})) |plaintext| {
             gpa.free(plaintext);
             return error.UnexpectedAccept;
         } else |err| switch (err) {

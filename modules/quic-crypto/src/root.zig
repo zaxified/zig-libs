@@ -81,6 +81,7 @@ pub const initial_salt_v2 = initial.initial_salt_v2;
 pub const deriveInitialSecrets = initial.deriveInitialSecrets;
 pub const deriveInitialSecretsFor = initial.deriveInitialSecretsFor;
 pub const PacketKeys = keyschedule.PacketKeys;
+pub const KeyUpdate = keyschedule.KeyUpdate;
 pub const derivePacketKeys = keyschedule.derivePacketKeys;
 pub const derivePacketKeysFor = keyschedule.derivePacketKeysFor;
 pub const advanceKeys = keyschedule.advanceKeys;
@@ -143,6 +144,7 @@ test {
     _ = version;
     _ = retry;
     _ = @import("rfc9369_vectors.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.deps is exactly {chachapoly} — quic-crypto still does not import dtls" {

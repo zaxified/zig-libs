@@ -44,7 +44,7 @@ pub fn main() !void {
 
     // ── a valid, currently-in-window self-signed CA cert, pinned as its
     //    own trust anchor (the OPC-UA-style single-application-cert case) ──
-    const good_der = try rsa.selfSignedCert(gpa, keys.secret_key, keys.public_key, std.crypto.hash.sha2.Sha256, .{
+    const good_der = try rsa.selfSignedCert(gpa, &keys.secret_key, keys.public_key, std.crypto.hash.sha2.Sha256, .{
         .common_name = "endpoint.example.org",
         .serial = 1,
         .not_before = "250101000000Z", // 2025-01-01
@@ -67,7 +67,7 @@ pub fn main() !void {
 
     // ── the same call, but the certificate's validity window has already
     //    closed — must fail by name, not silently accept ─────────────────
-    const expired_der = try rsa.selfSignedCert(gpa, keys.secret_key, keys.public_key, std.crypto.hash.sha2.Sha256, .{
+    const expired_der = try rsa.selfSignedCert(gpa, &keys.secret_key, keys.public_key, std.crypto.hash.sha2.Sha256, .{
         .common_name = "stale.example.org",
         .serial = 2,
         .not_before = "200101000000Z", // 2020-01-01

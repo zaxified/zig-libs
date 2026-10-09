@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — the public WOTS+ building blocks `prfKeygen`, `wotsSkGen`, `wotsPkGen`, `wotsSign` and `genLeaf` now run under their own burns (`prf_burn` 2 KiB for the per-chain ones, `burn_size` for the one-shot ones; nested inside `keyGen` / `sign` they only add zeroing). `hashF` / `hashH` / `prf` (KEY is the public SEED), `rootFromSig` (verify path) and `SigningKey.sign` (thin guard) are marked for the dead-stack lint. No signature changed. Probe: `src/stackprobe2_test.zig`.
 - **2026-10-09** — **BREAKING + FIX (HIGH, secrets on the dead stack, dead-stack sweep wave 5):**
   no secret travels by value any more. `keyGen` took `sk_seed` / `sk_prf` BY VALUE and returned
   the whole `KeyPair` (private key included) by value; `prfKeygen`, `wotsSkGen` (the ≈ 2 KiB WOTS+

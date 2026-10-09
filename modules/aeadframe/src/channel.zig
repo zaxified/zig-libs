@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
+const burn = @import("burn.zig");
 const record = @import("record.zig");
 const replay = @import("replay.zig");
 
@@ -123,6 +124,13 @@ pub fn Channel(comptime Aead: type) type {
                 return .{ .key = key, .epoch = epoch };
             }
 
+            /// `init` with the key by pointer and the sealer built in place
+            /// (dead-stack-clean: no key copy in the caller's frame, no
+            /// `Sealer` in its result slot).
+            pub fn initInto(out: *Sealer, key: *const [32]u8, epoch: u32) void {
+                out.* = .{ .key = key.*, .epoch = epoch };
+            }
+
             /// Exact record size for a plaintext of `pt_len` bytes.
             pub fn sealedLen(pt_len: usize) usize {
                 return record.overhead + pt_len;
@@ -133,6 +141,10 @@ pub fn Channel(comptime Aead: type) type {
             /// caller's context binding (tenant / I-SID / channel id): a record
             /// opens only against the identical `aad`. Zero allocation.
             pub fn seal(self: *Sealer, out: []u8, plaintext: []const u8, aad: []const u8) SealError!usize {
+                return burn.run(burn.frame_burn, SealError!usize, sealBody, .{ self, out, plaintext, aad });
+            }
+
+            fn sealBody(self: *Sealer, out: []u8, plaintext: []const u8, aad: []const u8) SealError!usize {
                 const need = record.overhead + plaintext.len;
                 if (out.len < need) return error.BufferTooSmall;
                 if (aad.len > max_caller_aad) return error.AadTooLarge;
@@ -182,12 +194,21 @@ pub fn Channel(comptime Aead: type) type {
             /// undetectable here, exactly as reconstructing a `Sealer` on a spent
             /// `(key, epoch)` is.
             pub fn rekey(self: *Sealer, new_key: [32]u8, new_epoch: u32) RekeyError!void {
+                return burn.run(burn.frame_burn, RekeyError!void, rekeyBody, .{ self, &new_key, new_epoch });
+            }
+
+            /// `rekey` with the new key by pointer (dead-stack-clean).
+            pub fn rekeyInto(self: *Sealer, new_key: *const [32]u8, new_epoch: u32) RekeyError!void {
+                return burn.run(burn.frame_burn, RekeyError!void, rekeyBody, .{ self, new_key, new_epoch });
+            }
+
+            fn rekeyBody(self: *Sealer, new_key: *const [32]u8, new_epoch: u32) RekeyError!void {
                 // Constant-time in the key bytes: both operands are the caller's
                 // own secrets, and the branch outcome (not the content) is what
                 // the caller is told.
-                const same_key = std.crypto.timing_safe.eql([32]u8, new_key, self.key);
+                const same_key = std.crypto.timing_safe.eql([32]u8, new_key.*, self.key);
                 if (same_key and new_epoch <= self.epoch) return error.NonceSpaceReuse;
-                self.key = new_key;
+                self.key = new_key.*;
                 self.epoch = new_epoch;
                 self.seq = 0;
             }
@@ -219,6 +240,17 @@ pub fn Channel(comptime Aead: type) type {
                 return .{ .key = key, .epoch = epoch, .window = .{ .size = window_size } };
             }
 
+            /// `init` with the key by pointer and the opener built in place
+            /// (dead-stack-clean, as `Sealer.initInto`).
+            pub fn initInto(out: *Opener, key: *const [32]u8, epoch: u32) void {
+                out.* = .{ .key = key.*, .epoch = epoch };
+            }
+
+            /// `initWindow` with the key by pointer, built in place.
+            pub fn initWindowInto(out: *Opener, key: *const [32]u8, epoch: u32, window_size: u7) void {
+                out.* = .{ .key = key.*, .epoch = epoch, .window = .{ .size = window_size } };
+            }
+
             /// Open `rec` (bound to `aad`) into `out`, returning the plaintext
             /// length. Order: parse+bounds-check → epoch check → replay
             /// pre-check → AEAD verify+decrypt → commit the sequence number.
@@ -226,6 +258,10 @@ pub fn Channel(comptime Aead: type) type {
             /// record can never burn a legitimate replay slot. On any failure
             /// `out[0..ct_len]` is zeroed — never garbage plaintext.
             pub fn open(self: *Opener, out: []u8, rec: []const u8, aad: []const u8) OpenError!usize {
+                return burn.run(burn.frame_burn, OpenError!usize, openBody, .{ self, out, rec, aad });
+            }
+
+            fn openBody(self: *Opener, out: []u8, rec: []const u8, aad: []const u8) OpenError!usize {
                 const p = try record.parse(rec);
                 if (p.header.epoch != self.epoch) return error.EpochMismatch;
                 if (out.len < p.ct_len) return error.BufferTooSmall;
@@ -263,7 +299,16 @@ pub fn Channel(comptime Aead: type) type {
             /// emits no nonce, so there is no nonce space to spend. It only
             /// changes which records it will accept.
             pub fn rekey(self: *Opener, new_key: [32]u8, new_epoch: u32) void {
-                self.key = new_key;
+                burn.run(burn.frame_burn, void, rekeyBody, .{ self, &new_key, new_epoch });
+            }
+
+            /// `rekey` with the new key by pointer (dead-stack-clean).
+            pub fn rekeyInto(self: *Opener, new_key: *const [32]u8, new_epoch: u32) void {
+                burn.run(burn.frame_burn, void, rekeyBody, .{ self, new_key, new_epoch });
+            }
+
+            fn rekeyBody(self: *Opener, new_key: *const [32]u8, new_epoch: u32) void {
+                self.key = new_key.*;
                 self.epoch = new_epoch;
                 self.window.reset();
             }

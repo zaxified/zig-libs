@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — `core.deriveX` and `core.deriveRandomizer` (public building blocks) now run under their own burn (`derive_burn`, 2 KiB; negligible next to the hash chains they start). `LmsSecretKey.init` / `LmsSecretKey.sign` / `SecretKey.init` are marked thin wrappers of already-burned `Tree` entry points for the dead-stack lint. No signature changed. Probe: `src/stackprobe2_test.zig`.
 - **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte
   vector stores LLVM realigned the frame of a burn of 2 KiB or less (`and $-32, %rsp`), and the 32..63
   bytes between the zeroed buffer and the saved frame pointer kept whatever a callee had left there

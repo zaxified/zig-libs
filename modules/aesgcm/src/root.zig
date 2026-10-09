@@ -25,6 +25,7 @@
 //! arm64 when the target has `aes`), still with the per-key state cached.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const builtin = @import("builtin");
 const crypto = std.crypto;
 const mem = std.mem;
@@ -104,17 +105,49 @@ fn AesGcm(comptime key_bits: u16) type {
             },
 
             /// The context for `key` on the fastest backend this CPU has.
+            /// `initInto` is the dead-stack-clean form: no key copy in the
+            /// caller's frame, no `Context` in its result slot.
             pub fn init(key: [key_length]u8) Context {
-                return Context.initWith(backend(), key).?;
+                return burn.run(burn.msg_burn, Context, initBody, .{&key});
+            }
+
+            /// `out` ← the context for `*key` on the fastest backend (the
+            /// pointer twin of `init`).
+            pub fn initInto(out: *Context, key: *const [key_length]u8) void {
+                burn.run(burn.msg_burn, void, initIntoBody, .{ out, key });
+            }
+
+            fn initBody(key: *const [key_length]u8) Context {
+                return initWithBody(backend(), key).?;
+            }
+
+            fn initIntoBody(out: *Context, key: *const [key_length]u8) void {
+                out.* = initWithBody(backend(), key).?;
             }
 
             /// The context for `key` on backend `b`, or null when this CPU
             /// lacks it — for tests and measurements that compare backends.
             pub fn initWith(b: Backend, key: [key_length]u8) ?Context {
+                return burn.run(burn.msg_burn, ?Context, initWithBody, .{ b, &key });
+            }
+
+            /// `out` ← the context for `*key` on backend `b`; false (and
+            /// `out` untouched) when this CPU lacks it. The pointer twin of
+            /// `initWith`.
+            pub fn initWithInto(out: *Context, b: Backend, key: *const [key_length]u8) bool {
+                return burn.run(burn.msg_burn, bool, initWithIntoBody, .{ out, b, key });
+            }
+
+            fn initWithIntoBody(out: *Context, b: Backend, key: *const [key_length]u8) bool {
+                out.* = initWithBody(b, key) orelse return false;
+                return true;
+            }
+
+            fn initWithBody(b: Backend, key: *const [key_length]u8) ?Context {
                 if (!available(b)) return null;
                 return switch (b) {
-                    .generic => .{ .impl = .{ .generic = .init(key) } },
-                    .aesni => if (x86_asm) .{ .impl = .{ .aesni = .init(key, 8) } } else unreachable,
+                    .generic => .{ .impl = .{ .generic = .init(key.*) } },
+                    .aesni => if (x86_asm) .{ .impl = .{ .aesni = .init(key.*, 8) } } else unreachable,
                 };
             }
 
@@ -156,25 +189,48 @@ fn AesGcm(comptime key_bits: u16) type {
 
         /// `Context.init(key)`.
         pub fn init(key: [key_length]u8) Context {
-            return Context.init(key);
+            return burn.run(burn.msg_burn, Context, Context.initBody, .{&key});
         }
 
         /// `Context.initWith(b, key)`.
         pub fn initWith(b: Backend, key: [key_length]u8) ?Context {
-            return Context.initWith(b, key);
+            return burn.run(burn.msg_burn, ?Context, Context.initWithBody, .{ b, &key });
+        }
+
+        /// `Context.initInto(out, key)`.
+        pub fn initInto(out: *Context, key: *const [key_length]u8) void {
+            burn.run(burn.msg_burn, void, Context.initIntoBody, .{ out, key });
+        }
+
+        /// `Context.initWithInto(out, b, key)`.
+        pub fn initWithInto(out: *Context, b: Backend, key: *const [key_length]u8) bool {
+            return burn.run(burn.msg_burn, bool, Context.initWithIntoBody, .{ out, b, key });
         }
 
         /// std's shape: `c`: ciphertext out, `tag`: tag out, `m`: plaintext,
         /// `ad`: associated data, `npub`: nonce, `key`: key. Same contract
         /// as `Context.encrypt`; derives the per-key state for this one call
         /// (only as many GHASH powers as the lengths need) and wipes it.
+        ///
+        /// Dead-stack: the entry point is burned (per message, tight), but
+        /// `key` by value is still a copy in the caller's frame; `encryptInto`
+        /// takes it by pointer.
         pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, key: [key_length]u8) void {
+            burn.run(burn.msg_burn, void, encryptBody, .{ c, tag, m, ad, npub, &key });
+        }
+
+        /// `encrypt` with the key by pointer (the dead-stack-clean form).
+        pub fn encryptInto(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, key: *const [key_length]u8) void {
+            burn.run(burn.msg_burn, void, encryptBody, .{ c, tag, m, ad, npub, key });
+        }
+
+        fn encryptBody(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, key: *const [key_length]u8) void {
             assert(c.len == m.len);
             assert(m.len <= max_message_len);
             switch (backend()) {
-                .generic => StdGcm.encrypt(c, tag, m, ad, npub, key),
+                .generic => StdGcm.encrypt(c, tag, m, ad, npub, key.*),
                 .aesni => if (x86_asm) {
-                    var k = Ni.init(key, powersFor(ad.len, m.len));
+                    var k = Ni.init(key.*, powersFor(ad.len, m.len));
                     defer wipeBlocks(@ptrCast(&k), @sizeOf(@TypeOf(k)) / 16);
                     k.seal(c, tag, m, ad, npub);
                 } else unreachable,
@@ -184,15 +240,24 @@ fn AesGcm(comptime key_bits: u16) type {
         /// std's shape: `m`: plaintext out, `c`: ciphertext, `tag`, `ad`,
         /// `npub`, `key`. Same contract as `Context.decrypt`.
         pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, key: [key_length]u8) AuthenticationError!void {
+            return burn.run(burn.msg_burn, AuthenticationError!void, decryptBody, .{ m, c, tag, ad, npub, &key });
+        }
+
+        /// `decrypt` with the key by pointer (the dead-stack-clean form).
+        pub fn decryptInto(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, key: *const [key_length]u8) AuthenticationError!void {
+            return burn.run(burn.msg_burn, AuthenticationError!void, decryptBody, .{ m, c, tag, ad, npub, key });
+        }
+
+        fn decryptBody(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, key: *const [key_length]u8) AuthenticationError!void {
             assert(c.len == m.len);
             assert(m.len <= max_message_len);
             switch (backend()) {
-                .generic => StdGcm.decrypt(m, c, tag, ad, npub, key) catch |err| {
+                .generic => StdGcm.decrypt(m, c, tag, ad, npub, key.*) catch |err| {
                     crypto.secureZero(u8, m);
                     return err;
                 },
                 .aesni => if (x86_asm) {
-                    var k = Ni.init(key, powersFor(ad.len, m.len));
+                    var k = Ni.init(key.*, powersFor(ad.len, m.len));
                     defer wipeBlocks(@ptrCast(&k), @sizeOf(@TypeOf(k)) / 16);
                     return k.open(m, c, tag, ad, npub);
                 } else unreachable,
@@ -1344,4 +1409,8 @@ fn fuzzAgree(_: void, smith: *std.testing.Smith) !void {
             try testing.expectEqual(mem.eql(u8, &forged, &want_t), ok);
         }
     }
+}
+
+test {
+    _ = @import("stackprobe_test.zig");
 }

@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING (dead-stack rule, CONVENTIONS §2.1.1):** secrets in by `*const`, secret results
+  out through an `out` pointer (first parameter after the comptime types), every entry point's body under a
+  burn (new `src/burn.zig`). `psk.derivePsk(Hkdf, len, out, rms, nonce)`, `psk.earlySecret(Hkdf, out, psk)`,
+  `psk.binderKey(Hkdf, out, early, hash)`, `psk.computeBinder(Hkdf, Hmac, out, binder_key, hash)`,
+  `psk.verifyBinder(.., binder_key: *const .., ..)`; `earlydata.clientEarlyTrafficSecret` /
+  `earlyExporterMasterSecret` (`out` first), `earlyTrafficKeyIv(Hkdf, key_len, out: *TrafficKeyIv, secret)`,
+  `EarlyDataContext.derive(out: *Ctx, psk, hash)` (was: returned the context); `stek.StekRing.rotate(id, key:
+  *const [32]u8, now_s)`; `select.selectPsk(Hkdf, Hmac, Ring, out: *Selection, ring, ...) SelectError!void`
+  (was: returned the `Selection` with the PSK and session secret; `out` is zeroed on error). Burns: 8 KiB
+  one-shot KDF steps, 4 KiB per-ticket `StekRing.seal/open`, 16 KiB `selectPsk`. Not covered (open):
+  `StekRing.activeKey/findKey` still return the `Stek` (key included) by value. New probe `src/stackprobe_test.zig`
+  (testkit engine) over every entry point; `check-secret-api` is at 0. Example and README migrated.
+
 - **2026-10-04** — Tests: mutation schemata run (37 mutants, all killed). Four new tests:
   NewSessionTicket length prefixes that overrun what follows, `maxEarlyDataSize`'s type/length
   rule, the strike register's inclusive window / re-arm / eviction boundary, and `selectPsk`

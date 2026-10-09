@@ -61,7 +61,7 @@ test "RFC 7516 A.1: RSA-OAEP + A256GCM — decrypt direction, byte-exact plainte
         "SdiwkIr3ajwQzaBtQD_A." ++
         "XFBoMYUZodetZdvTiFvSkQ";
 
-    const plaintext = try root.decryptCompact(std.testing.allocator, .{ .rsa_private = sk }, token, .{
+    const plaintext = try root.decryptCompact(std.testing.allocator, .{ .rsa_private = &sk }, token, .{
         .expect_alg = .@"RSA-OAEP",
         .expect_enc = .A256GCM,
     });

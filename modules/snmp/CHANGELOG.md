@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** `des.Des.init`, `des.cbcEncrypt` and `des.cbcDecrypt` take the DES key as `*const [8]u8` (was `[8]u8` by value: the caller's frame kept a copy of the key); migrate with `&key`. Dead-stack burns (`burn.zig`) on `usm.passwordToUserKey` / `localizeKey` / `passwordToKey` (8 KiB, one-shot), `usm.computeDigestInto` / `verify` / `sign` (4 KiB, per message), `priv.encrypt` / `decrypt` (4 KiB) and the three DES entry points (4 KiB); new `stackprobe_test.zig` on `testkit.stackprobe`. The remaining `check-secret-api` findings (`usm.encode`, `usm.authOffset`, `V3Client.init` / `setEngineTime`, both `Walker.next`) carry `secret-api-ok:` markers: none touches key material.
+
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `UdpTransport` cancel test
   canceled after a fixed 200 ms sleep. On a loaded machine that could land in the send instead,
   and the test then passed by the send's `Canceled` arm. It now cancels once the request has

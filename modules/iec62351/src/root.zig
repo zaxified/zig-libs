@@ -106,4 +106,5 @@ test {
     _ = @import("goose_capture_test.zig");
     _ = @import("iec61850_seam_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }

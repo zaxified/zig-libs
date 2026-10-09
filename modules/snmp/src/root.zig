@@ -175,6 +175,7 @@ test {
     _ = report;
     _ = v3client_mod;
     _ = interop;
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta is well-formed" {

@@ -100,6 +100,7 @@ test {
     _ = earlydata;
     _ = replay;
     _ = select;
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.deps is empty (std only, no sibling-module dependencies)" {

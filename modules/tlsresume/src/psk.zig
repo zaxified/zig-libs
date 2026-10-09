@@ -47,26 +47,46 @@
 //! like `dtls.keyschedule`.
 
 const std = @import("std");
+const burn = @import("burn.zig");
+
+// Dead-stack shape (CONVENTIONS §2.1.1): secrets in by `*const`, secret
+// results out through `out` (first parameter after the comptime types),
+// every entry point's body under `burn.run`.
 
 /// RFC 8446 §7.1 / §4.6.1: `PSK = HKDF-Expand-Label(resumption_master_secret,
 /// "resumption", ticket_nonce, Hash.length)`. `ticket_nonce` is the value
 /// carried in the NewSessionTicket (`ticket.NewSessionTicket.ticket_nonce`).
 pub fn derivePsk(
     comptime Hkdf: type,
-    resumption_master_secret: [Hkdf.prk_length]u8,
-    ticket_nonce: []const u8,
     comptime len: usize,
-) [len]u8 {
-    return std.crypto.tls.hkdfExpandLabel(Hkdf, resumption_master_secret, "resumption", ticket_nonce, len);
+    out: *[len]u8,
+    resumption_master_secret: *const [Hkdf.prk_length]u8,
+    ticket_nonce: []const u8,
+) void {
+    burn.run(burn.kdf_burn, void, derivePskBody, .{ Hkdf, len, out, resumption_master_secret, ticket_nonce });
+}
+
+fn derivePskBody(
+    comptime Hkdf: type,
+    comptime len: usize,
+    out: *[len]u8,
+    resumption_master_secret: *const [Hkdf.prk_length]u8,
+    ticket_nonce: []const u8,
+) void {
+    out.* = std.crypto.tls.hkdfExpandLabel(Hkdf, resumption_master_secret.*, "resumption", ticket_nonce, len);
 }
 
 /// RFC 8446 §7.1: `Early Secret = HKDF-Extract(salt = 0^Hash.length, IKM =
 /// PSK)`. Same primitive as an externally configured PSK's early secret
 /// (RFC 8446 draws no distinction here) — the resumption-vs-external split
 /// happens one step later, in `binderKey`'s label.
-pub fn earlySecret(comptime Hkdf: type, psk: []const u8) [Hkdf.prk_length]u8 {
+pub fn earlySecret(comptime Hkdf: type, out: *[Hkdf.prk_length]u8, psk: []const u8) void {
+    burn.run(burn.kdf_burn, void, earlySecretBody, .{ Hkdf, out, psk });
+}
+
+fn earlySecretBody(comptime Hkdf: type, out: *[Hkdf.prk_length]u8, psk: []const u8) void {
     const zero_salt = [_]u8{0} ** Hkdf.prk_length;
-    return Hkdf.extract(&zero_salt, psk);
+    out.* = Hkdf.extract(&zero_salt, psk);
 }
 
 /// RFC 8446 §7.1: `binder_key = Derive-Secret(early_secret, "res binder",
@@ -77,12 +97,22 @@ pub fn earlySecret(comptime Hkdf: type, psk: []const u8) [Hkdf.prk_length]u8 {
 /// is `Hash("")` — the hash of the empty message list.
 pub fn binderKey(
     comptime Hkdf: type,
-    early_secret: [Hkdf.prk_length]u8,
+    out: *[Hkdf.prk_length]u8,
+    early_secret: *const [Hkdf.prk_length]u8,
     empty_transcript_hash: []const u8,
-) [Hkdf.prk_length]u8 {
+) void {
+    burn.run(burn.kdf_burn, void, binderKeyBody, .{ Hkdf, out, early_secret, empty_transcript_hash });
+}
+
+fn binderKeyBody(
+    comptime Hkdf: type,
+    out: *[Hkdf.prk_length]u8,
+    early_secret: *const [Hkdf.prk_length]u8,
+    empty_transcript_hash: []const u8,
+) void {
     // Derive-Secret(early_secret, "res binder", "") = HKDF-Expand-Label(
     // early_secret, "res binder", Transcript-Hash(""), Hash.length).
-    return std.crypto.tls.hkdfExpandLabel(Hkdf, early_secret, "res binder", empty_transcript_hash, Hkdf.prk_length);
+    out.* = std.crypto.tls.hkdfExpandLabel(Hkdf, early_secret.*, "res binder", empty_transcript_hash, Hkdf.prk_length);
 }
 
 /// RFC 8446 §4.2.11.2: the PSK binder itself — `HMAC(finished_key,
@@ -100,13 +130,22 @@ pub fn binderKey(
 pub fn computeBinder(
     comptime Hkdf: type,
     comptime Hmac: type,
-    binder_key: [Hkdf.prk_length]u8,
+    out: *[Hmac.mac_length]u8,
+    binder_key: *const [Hkdf.prk_length]u8,
     truncated_client_hello_transcript_hash: []const u8,
-) [Hmac.mac_length]u8 {
-    const finished_key = std.crypto.tls.hkdfExpandLabel(Hkdf, binder_key, "finished", "", Hmac.mac_length);
-    var out: [Hmac.mac_length]u8 = undefined;
-    Hmac.create(&out, truncated_client_hello_transcript_hash, &finished_key);
-    return out;
+) void {
+    burn.run(burn.kdf_burn, void, computeBinderBody, .{ Hkdf, Hmac, out, binder_key, truncated_client_hello_transcript_hash });
+}
+
+fn computeBinderBody(
+    comptime Hkdf: type,
+    comptime Hmac: type,
+    out: *[Hmac.mac_length]u8,
+    binder_key: *const [Hkdf.prk_length]u8,
+    truncated_client_hello_transcript_hash: []const u8,
+) void {
+    const finished_key = std.crypto.tls.hkdfExpandLabel(Hkdf, binder_key.*, "finished", "", Hmac.mac_length);
+    Hmac.create(out, truncated_client_hello_transcript_hash, &finished_key);
 }
 
 /// Server-side verify: recompute the binder via `computeBinder` and compare
@@ -118,11 +157,23 @@ pub fn computeBinder(
 pub fn verifyBinder(
     comptime Hkdf: type,
     comptime Hmac: type,
-    binder_key: [Hkdf.prk_length]u8,
+    binder_key: *const [Hkdf.prk_length]u8,
     truncated_client_hello_transcript_hash: []const u8,
     offered_binder: [Hmac.mac_length]u8,
 ) bool {
-    const computed = computeBinder(Hkdf, Hmac, binder_key, truncated_client_hello_transcript_hash);
+    return burn.run(burn.kdf_burn, bool, verifyBinderBody, .{ Hkdf, Hmac, binder_key, truncated_client_hello_transcript_hash, offered_binder });
+}
+
+fn verifyBinderBody(
+    comptime Hkdf: type,
+    comptime Hmac: type,
+    binder_key: *const [Hkdf.prk_length]u8,
+    truncated_client_hello_transcript_hash: []const u8,
+    offered_binder: [Hmac.mac_length]u8,
+) bool {
+    var computed: [Hmac.mac_length]u8 = undefined;
+    const finished_key = std.crypto.tls.hkdfExpandLabel(Hkdf, binder_key.*, "finished", "", Hmac.mac_length);
+    Hmac.create(&computed, truncated_client_hello_transcript_hash, &finished_key);
     return std.crypto.timing_safe.eql([Hmac.mac_length]u8, computed, offered_binder);
 }
 
@@ -194,37 +245,45 @@ test "sanity: RFC 8448 KAT chain is internally consistent (independent of the st
 }
 
 test "derivePsk matches RFC 8448 §4 PSK" {
-    const got = derivePsk(HkdfSha256, rfc8448_resumption_master_secret, &rfc8448_ticket_nonce, 32);
+    var got: [32]u8 = undefined;
+    derivePsk(HkdfSha256, 32, &got, &rfc8448_resumption_master_secret, &rfc8448_ticket_nonce);
     try testing.expectEqualSlices(u8, &rfc8448_psk, &got);
 }
 
 test "earlySecret matches RFC 8448 §4 early_secret" {
-    const got = earlySecret(HkdfSha256, &rfc8448_psk);
+    var got: [32]u8 = undefined;
+    earlySecret(HkdfSha256, &got, &rfc8448_psk);
     try testing.expectEqualSlices(u8, &rfc8448_early_secret, &got);
 }
 
 test "binderKey uses \"res binder\" and matches RFC 8448 §4" {
-    const got = binderKey(HkdfSha256, rfc8448_early_secret, &emptyHash());
+    var got: [32]u8 = undefined;
+    binderKey(HkdfSha256, &got, &rfc8448_early_secret, &emptyHash());
     try testing.expectEqualSlices(u8, &rfc8448_binder_key, &got);
 }
 
 test "computeBinder matches RFC 8448 §4 binder byte-exact" {
-    const got = computeBinder(HkdfSha256, HmacSha256, rfc8448_binder_key, &rfc8448_binder_hash);
+    var got: [32]u8 = undefined;
+    computeBinder(HkdfSha256, HmacSha256, &got, &rfc8448_binder_key, &rfc8448_binder_hash);
     try testing.expectEqualSlices(u8, &rfc8448_binder, &got);
 }
 
 test "verifyBinder accepts the real binder and rejects a flipped byte" {
-    try testing.expect(verifyBinder(HkdfSha256, HmacSha256, rfc8448_binder_key, &rfc8448_binder_hash, rfc8448_binder));
+    try testing.expect(verifyBinder(HkdfSha256, HmacSha256, &rfc8448_binder_key, &rfc8448_binder_hash, rfc8448_binder));
     var bad = rfc8448_binder;
     bad[0] ^= 1;
-    try testing.expect(!verifyBinder(HkdfSha256, HmacSha256, rfc8448_binder_key, &rfc8448_binder_hash, bad));
+    try testing.expect(!verifyBinder(HkdfSha256, HmacSha256, &rfc8448_binder_key, &rfc8448_binder_hash, bad));
 }
 
 test "full chain: rms + nonce -> PSK -> early secret -> binder key -> binder (RFC 8448 §4, end-to-end)" {
-    const psk = derivePsk(HkdfSha256, rfc8448_resumption_master_secret, &rfc8448_ticket_nonce, 32);
-    const es = earlySecret(HkdfSha256, &psk);
-    const bk = binderKey(HkdfSha256, es, &emptyHash());
-    const binder = computeBinder(HkdfSha256, HmacSha256, bk, &rfc8448_binder_hash);
+    var psk: [32]u8 = undefined;
+    var es: [32]u8 = undefined;
+    var bk: [32]u8 = undefined;
+    var binder: [32]u8 = undefined;
+    derivePsk(HkdfSha256, 32, &psk, &rfc8448_resumption_master_secret, &rfc8448_ticket_nonce);
+    earlySecret(HkdfSha256, &es, &psk);
+    binderKey(HkdfSha256, &bk, &es, &emptyHash());
+    computeBinder(HkdfSha256, HmacSha256, &binder, &bk, &rfc8448_binder_hash);
     try testing.expectEqualSlices(u8, &rfc8448_binder, &binder);
 }
 
@@ -240,16 +299,20 @@ test "SHA-384 suite: chain runs at the 48-byte digest length and is internally c
 
     const rms = [_]u8{0x5A} ** 48;
     const nonce = [_]u8{ 0x00, 0x01 };
-    const psk = derivePsk(Hkdf384, rms, &nonce, 48);
-    const es = earlySecret(Hkdf384, &psk);
+    var psk: [48]u8 = undefined;
+    var es: [48]u8 = undefined;
+    derivePsk(Hkdf384, 48, &psk, &rms, &nonce);
+    earlySecret(Hkdf384, &es, &psk);
     var eh: [48]u8 = undefined;
     Sha384.hash("", &eh, .{});
-    const bk = binderKey(Hkdf384, es, &eh);
+    var bk: [48]u8 = undefined;
+    binderKey(Hkdf384, &bk, &es, &eh);
     var th: [48]u8 = undefined;
     Sha384.hash("fake truncated client hello", &th, .{});
-    const binder = computeBinder(Hkdf384, HmacSha384, bk, &th);
-    try testing.expect(verifyBinder(Hkdf384, HmacSha384, bk, &th, binder));
+    var binder: [48]u8 = undefined;
+    computeBinder(Hkdf384, HmacSha384, &binder, &bk, &th);
+    try testing.expect(verifyBinder(Hkdf384, HmacSha384, &bk, &th, binder));
     var bad = binder;
     bad[47] ^= 1;
-    try testing.expect(!verifyBinder(Hkdf384, HmacSha384, bk, &th, bad));
+    try testing.expect(!verifyBinder(Hkdf384, HmacSha384, &bk, &th, bad));
 }

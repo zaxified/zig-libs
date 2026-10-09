@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING (dead-stack rule, CONVENTIONS §2.1.1):** secrets in by `*const`, secret results out
+  through an `out` pointer, every entry point's body under a burn (new `src/burn.zig`).
+  `deriveInitialSecrets(out: *InitialSecrets, dcid)` / `deriveInitialSecretsFor(ver, out, dcid)`;
+  `derivePacketKeys(Hkdf, key_len, out: *PacketKeys, secret: *const ..)` / `derivePacketKeysFor(ver, ...)`;
+  `advanceKeys(Hkdf, key_len, out: *KeyUpdate, secret: *const ..)` / `advanceKeysFor(ver, ...)` (`out.next_secret`
+  may alias `secret`: ratchet in place); `Protection(A).seal/open` take the key as `*const [key_length]u8`.
+  Burned: 8 KiB one-shot key derivations, 4 KiB per packet (`seal`/`open`, `computeMaskAes`,
+  `computeMaskChaCha20`; their signatures are unchanged). New: `KeyUpdate` exported from `root.zig`. New probe
+  `src/stackprobe_test.zig` (testkit engine) over every entry point; `check-secret-api` is at 0. Example and
+  README migrated.
+
 - **2026-10-05** — Tests: first dated mutation run (23 mutants, 22 killed, 1 equivalent; `SPEC.md`
   § "Mutation run 2026-10-05"). No defect; new boundary tests for the Retry pseudo-packet (2049
   octets) and `headerprot.apply` (`pn_offset` past the end, PN one octet past the end). No source

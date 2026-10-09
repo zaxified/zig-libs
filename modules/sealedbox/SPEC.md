@@ -41,7 +41,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `crypto_box_seal` / Go `nacl/box` — the public NaCl sealed-box standard. X25519 and BLAKE2b
   come from `std.crypto`; XSalsa20-Poly1305 is this module's own (see the next point). Original work of the zig-libs
   authors (MIT); no NOTICE entry needed (public NaCl standard, no third-party code).
-- **Allocation-free**, reentrant; keys are fixed-size arrays. `publicFromSecret` /
+- **Allocation-free**, reentrant; keys are fixed-size arrays. `publicFromSecret` (by pointer) /
   `keyPairFromSecretKey` recover a keypair from a stored secret (via std `X25519.recoverPublicKey`)
   so a persisted secret round-trips. Serialization is fixed-size base64/hex with typed errors.
 - **One primitive implemented here, on purpose (2026-10-07):** XSalsa20-Poly1305

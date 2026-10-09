@@ -137,7 +137,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const secret = reloadVolatile(root.SecretKey, &sk);
 
             // Measured: `x` from `sk`, `Y = x*B`.
-            var kp = root.KeyPair.fromSecretKey(&secret);
+            var kp: root.KeyPair = undefined;
+            root.KeyPair.fromSecretKey(&kp, &secret);
             // `Y` is published — declassify it, then force the next read of it
             // to come from the now-defined memory.
             if (taint == .yes) memcheck.makeMemDefined(&kp.public_key);
@@ -151,7 +152,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
         .verify => {
             // Untainted setup: an honest proof over the same alpha.
-            const kp = root.KeyPair.fromSecretKey(&secretKey());
+            var kp: root.KeyPair = undefined;
+            root.KeyPair.fromSecretKey(&kp, &secretKey());
             const pi = kp.prove(alpha_text);
 
             var alpha: [alpha_text.len]u8 = alpha_text.*;

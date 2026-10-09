@@ -22,6 +22,7 @@
 //! construction is the public NaCl standard.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -128,7 +129,11 @@ fn sealNonce(epk: [public_length]u8, pk: [public_length]u8) [secretbox.nonce_len
 /// the 2026-10-07 rewrite a failed tag check leaves `out` untouched -- nothing
 /// is decrypted before the tag verifies -- but that is not a promise: a
 /// caller must not read `out` unless `open` returned successfully.
-pub fn open(out: []u8, sealed: []const u8, kp: KeyPair) OpenError!void {
+pub fn open(out: []u8, sealed: []const u8, kp: *const KeyPair) OpenError!void {
+    return burn.run(burn.x25519_burn, OpenError!void, openBody, .{ out, sealed, kp });
+}
+
+fn openBody(out: []u8, sealed: []const u8, kp: *const KeyPair) OpenError!void {
     if (sealed.len < overhead or sealed.len != out.len + overhead)
         return error.InvalidCiphertext;
     const epk = sealed[0..public_length].*;
@@ -150,7 +155,7 @@ pub fn sealAlloc(gpa: std.mem.Allocator, io: std.Io, msg: []const u8, recipient_
 
 /// Open a sealed message, returning the freshly allocated plaintext.
 /// Errors (never panics) on a too-short/tampered ciphertext.
-pub fn openAlloc(gpa: std.mem.Allocator, sealed: []const u8, kp: KeyPair) ![]u8 {
+pub fn openAlloc(gpa: std.mem.Allocator, sealed: []const u8, kp: *const KeyPair) ![]u8 {
     if (sealed.len < overhead) return error.InvalidCiphertext;
     const out = try gpa.alloc(u8, sealed.len - overhead);
     errdefer gpa.free(out);
@@ -304,14 +309,27 @@ noinline fn burnCodecStack() void {
 /// Recompute the public key from a stored secret key (X25519 base-point
 /// multiplication via std). The secret scalar alone fully round-trips a keypair.
 /// `error.IdentityElement` only for pathological all-weak scalars.
-pub fn publicFromSecret(sk: [secret_length]u8) error{IdentityElement}![public_length]u8 {
-    return std.crypto.dh.X25519.recoverPublicKey(sk);
+pub fn publicFromSecret(sk: *const [secret_length]u8) error{IdentityElement}![public_length]u8 {
+    return burn.run(burn.x25519_burn, error{IdentityElement}![public_length]u8, publicFromSecretBody, .{sk});
+}
+
+fn publicFromSecretBody(sk: *const [secret_length]u8) error{IdentityElement}![public_length]u8 {
+    return std.crypto.dh.X25519.recoverPublicKey(sk.*);
 }
 
 /// Rebuild a usable `KeyPair` from a stored secret key (public key is
 /// recomputed — std's X25519 `KeyPair` treats the secret scalar as the seed).
-pub fn keyPairFromSecretKey(sk: [secret_length]u8) error{IdentityElement}!KeyPair {
-    return .{ .public_key = try publicFromSecret(sk), .secret_key = sk };
+///
+/// Into `out` (BREAKING 2026-10-09): returned in an error union the pair -- secret
+/// scalar included -- sat in the caller's result slot and temporary. `out` is
+/// zeroed on error.
+pub fn keyPairFromSecretKey(out: *KeyPair, sk: *const [secret_length]u8) error{IdentityElement}!void {
+    return burn.run(burn.x25519_burn, error{IdentityElement}!void, keyPairFromSecretKeyBody, .{ out, sk });
+}
+
+fn keyPairFromSecretKeyBody(out: *KeyPair, sk: *const [secret_length]u8) error{IdentityElement}!void {
+    errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+    out.* = .{ .public_key = try publicFromSecretBody(sk), .secret_key = sk.* };
 }
 
 // ── constant-time codecs for SECRET key text ───────────────────────────────
@@ -621,7 +639,7 @@ test "round-trip: buffer API, various sizes including empty" {
         try std.testing.expectEqual(sealedLen(msg.len), boxed.len);
 
         var opened: [msg.len]u8 = undefined;
-        try open(&opened, &boxed, kp);
+        try open(&opened, &boxed, &kp);
         try std.testing.expectEqualSlices(u8, msg, &opened);
     }
 }
@@ -638,7 +656,7 @@ test "round-trip: sealAlloc/openAlloc" {
         try std.testing.expectEqual(sealedLen(msg.len), boxed.len);
         try std.testing.expectEqual(msg.len + overhead, boxed.len);
 
-        const opened = try openAlloc(gpa, boxed, kp);
+        const opened = try openAlloc(gpa, boxed, &kp);
         defer gpa.free(opened);
         try std.testing.expectEqualSlices(u8, msg, opened);
     }
@@ -656,12 +674,12 @@ test "tamper: flipped byte in box or ephemeral pk fails authentication" {
     // flip a byte in the box portion (past the ephemeral pk prefix)
     var t1 = boxed;
     t1[t1.len - 1] ^= 0x01;
-    try std.testing.expectError(error.AuthenticationFailed, open(&opened, &t1, kp));
+    try std.testing.expectError(error.AuthenticationFailed, open(&opened, &t1, &kp));
 
     // flip a byte in the ephemeral pk prefix
     var t2 = boxed;
     t2[0] ^= 0x01;
-    try std.testing.expectError(error.AuthenticationFailed, open(&opened, &t2, kp));
+    try std.testing.expectError(error.AuthenticationFailed, open(&opened, &t2, &kp));
 }
 
 test "wrong recipient keypair fails authentication" {
@@ -673,7 +691,7 @@ test "wrong recipient keypair fails authentication" {
     var boxed: [msg.len + overhead]u8 = undefined;
     try seal(io, &boxed, msg, kp.public_key);
     var opened: [msg.len]u8 = undefined;
-    try std.testing.expectError(error.AuthenticationFailed, open(&opened, &boxed, wrong_kp));
+    try std.testing.expectError(error.AuthenticationFailed, open(&opened, &boxed, &wrong_kp));
 }
 
 test "too-short/garbage ciphertext: clean error, no panic" {
@@ -685,21 +703,21 @@ test "too-short/garbage ciphertext: clean error, no panic" {
 
     // shorter than the overhead
     const short = [_]u8{0xaa} ** (overhead - 1);
-    try std.testing.expectError(error.InvalidCiphertext, open(&opened, &short, kp));
-    try std.testing.expectError(error.InvalidCiphertext, openAlloc(gpa, &short, kp));
+    try std.testing.expectError(error.InvalidCiphertext, open(&opened, &short, &kp));
+    try std.testing.expectError(error.InvalidCiphertext, openAlloc(gpa, &short, &kp));
 
     // empty ciphertext
-    try std.testing.expectError(error.InvalidCiphertext, open(&opened, "", kp));
-    try std.testing.expectError(error.InvalidCiphertext, openAlloc(gpa, "", kp));
+    try std.testing.expectError(error.InvalidCiphertext, open(&opened, "", &kp));
+    try std.testing.expectError(error.InvalidCiphertext, openAlloc(gpa, "", &kp));
 
     // long enough but out-length mismatch
     const mismatched = [_]u8{0xbb} ** (overhead + 10);
-    try std.testing.expectError(error.InvalidCiphertext, open(&opened, &mismatched, kp));
+    try std.testing.expectError(error.InvalidCiphertext, open(&opened, &mismatched, &kp));
 
     // well-sized garbage: must fail authentication, never panic
     var garbage: [4 + overhead]u8 = undefined;
     io.random(&garbage);
-    try std.testing.expectError(error.AuthenticationFailed, open(&opened, &garbage, kp));
+    try std.testing.expectError(error.AuthenticationFailed, open(&opened, &garbage, &kp));
 }
 
 test "KAT: a key whose base64 uses BOTH `+` and `/` — the two alphabet slots nothing else covers" {
@@ -791,9 +809,10 @@ test "KAT: secret key (RFC 7748 Alice) base64 + hex + public recompute" {
     try std.testing.expectEqual(sk, try testParseSecretKeyHex(&hex));
 
     // secret → public rebuild matches the RFC vector
-    const pk = try publicFromSecret(sk);
+    const pk = try publicFromSecret(&sk);
     try std.testing.expectEqualStrings(pk_hex, &encodePublicKeyHex(pk));
-    const kp = try keyPairFromSecretKey(sk);
+    var kp: KeyPair = undefined;
+    try keyPairFromSecretKey(&kp, &sk);
     try std.testing.expectEqual(pk, kp.public_key);
     try std.testing.expectEqual(sk, kp.secret_key);
 }
@@ -818,14 +837,16 @@ test "round-trip: generated keys survive text serialization; rebuilt keypair ope
     var sk_stored: [hex_sk_len]u8 = undefined;
     encodeSecretKeyHex(&sk_stored, &kp.secret_key);
     const pk_back = try parsePublicKeyBase64(&pk_stored);
-    const kp_back = try keyPairFromSecretKey(try testParseSecretKeyHex(&sk_stored));
+    var kp_back_sk = try testParseSecretKeyHex(&sk_stored);
+    var kp_back: KeyPair = undefined;
+    try keyPairFromSecretKey(&kp_back, &kp_back_sk);
     try std.testing.expectEqual(kp.public_key, kp_back.public_key);
 
     const msg = "keys came from a config file";
     var boxed: [msg.len + overhead]u8 = undefined;
     try seal(io, &boxed, msg, pk_back);
     var opened: [msg.len]u8 = undefined;
-    try open(&opened, &boxed, kp_back);
+    try open(&opened, &boxed, &kp_back);
     try std.testing.expectEqualSlices(u8, msg, &opened);
 }
 

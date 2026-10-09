@@ -852,10 +852,13 @@ fn buildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
     var es: [32]u8 = undefined;
     if (set.psk) {
         n.addBig("psk", &psk_store);
-        es = keyschedule.earlySecret(HkdfSha256, &psk_store);
-        const bk = keyschedule.binderKey(HkdfSha256, es, &eh);
+        keyschedule.earlySecret(HkdfSha256, &es, &psk_store);
+        var bk: [32]u8 = undefined;
+        keyschedule.binderKey(HkdfSha256, &bk, &es, &eh);
         n.addBig("binder key", &bk);
-        n.addBig("binder key", &keyschedule.deriveFinishedKey(HkdfSha256, 32, bk));
+        var bk_fin: [32]u8 = undefined;
+        keyschedule.deriveFinishedKey(HkdfSha256, 32, &bk_fin, &bk);
+        n.addBig("binder key", &bk_fin);
     } else {
         const cl = &pre[@intFromEnum(Step.c_flight2)];
         const sv = &pre[@intFromEnum(Step.s_fin)];
@@ -894,16 +897,21 @@ fn buildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
         }
         n.addBig("dh shared", dh[0..dh_len]);
         const zero_psk: [32]u8 = @splat(0);
-        es = keyschedule.earlySecret(HkdfSha256, &zero_psk);
+        keyschedule.earlySecret(HkdfSha256, &es, &zero_psk);
         n.addBig("server sign key", &cert_kat.server_secret_key_bytes);
         if (set.mutual) n.addBig("client sign key", &cert_kat.client_secret_key_bytes);
     }
     n.addBig("early secret", &es);
-    n.addBig("derived", &keyschedule.deriveSecret(HkdfSha256, es, "derived", &eh));
-    const hs = keyschedule.deriveHandshakeSecret(HkdfSha256, es, &eh, if (set.psk) null else dh[0..dh_len]);
-    const ms = keyschedule.deriveMasterSecret(HkdfSha256, hs, &eh);
+    var derived: [32]u8 = undefined;
+    keyschedule.deriveSecret(HkdfSha256, &derived, &es, "derived", &eh);
+    n.addBig("derived", &derived);
+    var hs: [32]u8 = undefined;
+    var ms: [32]u8 = undefined;
+    keyschedule.deriveHandshakeSecret(HkdfSha256, &hs, &es, &eh, if (set.psk) null else dh[0..dh_len]);
+    keyschedule.deriveMasterSecret(HkdfSha256, &ms, &hs, &eh);
     n.addBig("handshake secret", &hs);
-    n.addBig("derived", &keyschedule.deriveSecret(HkdfSha256, hs, "derived", &eh));
+    keyschedule.deriveSecret(HkdfSha256, &derived, &hs, "derived", &eh);
+    n.addBig("derived", &derived);
     n.addBig("master secret", &ms);
 
     // Traffic secrets from the live server, after ServerHello..Finished.
@@ -912,14 +920,19 @@ fn buildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
     n.addBig("hs traffic s", &sv.hs_traffic_server);
     n.addBig("ap traffic c", &sv.pending_ap_client);
     n.addBig("ap traffic s", &sv.pending_ap_server);
-    n.addBig("finished key", &keyschedule.deriveFinishedKey(HkdfSha256, 32, sv.hs_traffic_client));
-    n.addBig("finished key", &keyschedule.deriveFinishedKey(HkdfSha256, 32, sv.hs_traffic_server));
+    var fkey: [32]u8 = undefined;
+    keyschedule.deriveFinishedKey(HkdfSha256, 32, &fkey, &sv.hs_traffic_client);
+    n.addBig("finished key", &fkey);
+    keyschedule.deriveFinishedKey(HkdfSha256, 32, &fkey, &sv.hs_traffic_server);
+    n.addBig("finished key", &fkey);
     // The schedule is only a needle if it is the engine's: it must reproduce the
     // application secrets the server derived from it.
     const th = sv.transcript.currentHash();
-    const ap = keyschedule.deriveApplicationTrafficSecrets(HkdfSha256, ms, &th);
-    try std.testing.expectEqualSlices(u8, &sv.pending_ap_client, &ap.client);
-    try std.testing.expectEqualSlices(u8, &sv.pending_ap_server, &ap.server);
+    var ap_c: [32]u8 = undefined;
+    var ap_s: [32]u8 = undefined;
+    keyschedule.deriveApplicationTrafficSecrets(HkdfSha256, &ap_c, &ap_s, &ms, &th);
+    try std.testing.expectEqualSlices(u8, &sv.pending_ap_client, &ap_c);
+    try std.testing.expectEqualSlices(u8, &sv.pending_ap_server, &ap_s);
 
     addDir(n, sv.hs_write_keys, aes);
     addDir(n, sv.hs_read_keys, aes);

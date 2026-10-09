@@ -27,6 +27,7 @@
 const std = @import("std");
 const stek = @import("stek.zig");
 const psk = @import("psk.zig");
+const burn = @import("burn.zig");
 const replay = @import("replay.zig");
 
 /// The fixed prefix this module expects inside an opened STEK ticket
@@ -165,8 +166,8 @@ pub fn Selection(comptime rms_len: usize) type {
 ///      every later copy is rejected.) Marking only fully-verified tickets
 ///      also keeps the bounded register from being flooded with garbage
 ///      identifiers an attacker can fabricate for free.
-///   6. All checks pass -> return `.{ .selected_index = i, .psk =
-///      derived_psk, .session = session }`.
+///   6. All checks pass -> write `.{ .selected_index = i, .psk =
+///      derived_psk, .session = session }` into `out` (zeroed on error).
 ///
 /// `error.NoAcceptableIdentity` if no offered identity passes all checks
 /// (the engine should fall back to a full handshake, not fail the
@@ -182,6 +183,7 @@ pub fn selectPsk(
     comptime Hkdf: type,
     comptime Hmac: type,
     comptime Ring: type,
+    out: *Selection(Hkdf.prk_length),
     ring: *const Ring,
     identities: []const OfferedIdentity,
     binders: []const [Hmac.mac_length]u8,
@@ -191,7 +193,27 @@ pub fn selectPsk(
     freshness_window_ms: u32,
     strike: ?*replay.StrikeRegister,
     open_scratch: []u8,
-) SelectError!Selection(Hkdf.prk_length) {
+) SelectError!void {
+    const r = burn.run(burn.select_burn, SelectError!void, selectBody, .{ Hkdf, Hmac, Ring, out, ring, identities, binders, empty_transcript_hash, truncated_client_hello_transcript_hash, now_ms, freshness_window_ms, strike, open_scratch });
+    r catch std.crypto.secureZero(u8, std.mem.asBytes(out));
+    return r;
+}
+
+fn selectBody(
+    comptime Hkdf: type,
+    comptime Hmac: type,
+    comptime Ring: type,
+    out: *Selection(Hkdf.prk_length),
+    ring: *const Ring,
+    identities: []const OfferedIdentity,
+    binders: []const [Hmac.mac_length]u8,
+    empty_transcript_hash: []const u8,
+    truncated_client_hello_transcript_hash: []const u8,
+    now_ms: i64,
+    freshness_window_ms: u32,
+    strike: ?*replay.StrikeRegister,
+    open_scratch: []u8,
+) SelectError!void {
     // RFC 8446 §4.2.11.2: binders align 1:1 with identities; a mismatch is
     // an engine-side parsing bug, not attacker-reachable input shape.
     std.debug.assert(identities.len == binders.len);
@@ -212,9 +234,13 @@ pub fn selectPsk(
 
         // 4. Derive the PSK and verify the binder (RFC 8446 §4.2.11.2) —
         // constant-time compare inside psk.verifyBinder.
-        const derived_psk = psk.derivePsk(Hkdf, session.resumption_master_secret, session.ticket_nonce, Hkdf.prk_length);
-        const binder_key = psk.binderKey(Hkdf, psk.earlySecret(Hkdf, &derived_psk), empty_transcript_hash);
-        if (!psk.verifyBinder(Hkdf, Hmac, binder_key, truncated_client_hello_transcript_hash, binder)) continue;
+        var derived_psk: [Hkdf.prk_length]u8 = undefined;
+        var early_secret: [Hkdf.prk_length]u8 = undefined;
+        var binder_key: [Hkdf.prk_length]u8 = undefined;
+        psk.derivePsk(Hkdf, Hkdf.prk_length, &derived_psk, &session.resumption_master_secret, session.ticket_nonce);
+        psk.earlySecret(Hkdf, &early_secret, &derived_psk);
+        psk.binderKey(Hkdf, &binder_key, &early_secret, empty_transcript_hash);
+        if (!psk.verifyBinder(Hkdf, Hmac, &binder_key, truncated_client_hello_transcript_hash, binder)) continue;
 
         // 5. Anti-replay (RFC 8446 §8.1) — only AFTER the binder verified;
         // see the doc comment for the ordering rationale. Allocation
@@ -224,7 +250,8 @@ pub fn selectPsk(
             if (!fresh) continue;
         }
 
-        return .{ .selected_index = i, .psk = derived_psk, .session = session };
+        out.* = .{ .selected_index = i, .psk = derived_psk, .session = session };
+        return;
     }
     return error.NoAcceptableIdentity;
 }
@@ -232,6 +259,37 @@ pub fn selectPsk(
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// By-value test wrapper over the `out`-pointer `selectPsk`.
+fn selectV(
+    ring: *const stek.DefaultRing,
+    identities: []const OfferedIdentity,
+    binders: []const [32]u8,
+    empty_transcript_hash: []const u8,
+    truncated_client_hello_transcript_hash: []const u8,
+    now_ms: i64,
+    freshness_window_ms: u32,
+    strike: ?*replay.StrikeRegister,
+    open_scratch: []u8,
+) SelectError!Selection(32) {
+    var sel: Selection(32) = undefined;
+    try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &sel, ring, identities, binders, empty_transcript_hash, truncated_client_hello_transcript_hash, now_ms, freshness_window_ms, strike, open_scratch);
+    return sel;
+}
+
+/// The binder an RFC 8446 client derives independently of `selectPsk`
+/// (test helper; the secrets are test constants).
+fn clientBinder(rms: *const [32]u8, nonce: []const u8, empty_hash: []const u8, ch_hash: []const u8) [32]u8 {
+    var client_psk: [32]u8 = undefined;
+    var es: [32]u8 = undefined;
+    var bk: [32]u8 = undefined;
+    var binder: [32]u8 = undefined;
+    psk.derivePsk(HkdfSha256, 32, &client_psk, rms, nonce);
+    psk.earlySecret(HkdfSha256, &es, &client_psk);
+    psk.binderKey(HkdfSha256, &bk, &es, empty_hash);
+    psk.computeBinder(HkdfSha256, HmacSha256, &binder, &bk, ch_hash);
+    return binder;
+}
 
 test "SessionState: serialize/parse round-trip (real — pure struct packing, no crypto)" {
     const S = SessionState(32);
@@ -451,7 +509,7 @@ fn sha256Of(s: []const u8) [32]u8 {
 test "selectPsk end-to-end: STEK-issued ticket -> ClientHello2 -> restored PSK; tamper/forge/stale/replay all reject" {
     // ── issue side: SessionState.serialize -> ring.seal -> ticket bytes ──
     var ring = stek.DefaultRing.init();
-    ring.rotate(1, [_]u8{0x42} ** stek.key_length, 0);
+    ring.rotate(1, &([_]u8{0x42} ** stek.key_length), 0);
 
     const rms = [_]u8{0xAB} ** 32;
     const ticket_nonce = [_]u8{ 0x00, 0x00 };
@@ -477,9 +535,7 @@ test "selectPsk end-to-end: STEK-issued ticket -> ClientHello2 -> restored PSK; 
     };
     const empty_hash = sha256Of("");
     const truncated_ch_hash = sha256Of("fake truncated ClientHello2");
-    const client_psk = psk.derivePsk(HkdfSha256, rms, &ticket_nonce, 32);
-    const client_binder_key = psk.binderKey(HkdfSha256, psk.earlySecret(HkdfSha256, &client_psk), &empty_hash);
-    const binder = psk.computeBinder(HkdfSha256, HmacSha256, client_binder_key, &truncated_ch_hash);
+    const binder = clientBinder(&rms, &ticket_nonce, &empty_hash, &truncated_ch_hash);
 
     var strike = replay.StrikeRegister.init(testing.allocator, 8, 60_000);
     defer strike.deinit();
@@ -487,44 +543,46 @@ test "selectPsk end-to-end: STEK-issued ticket -> ClientHello2 -> restored PSK; 
     const window_ms: u32 = 10_000;
 
     // ── happy path: found at index 0, PSK restored byte-exact ──
-    const selection = try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike, &scratch);
+    const selection = try selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike, &scratch);
     try testing.expectEqual(@as(usize, 0), selection.selected_index);
+    var client_psk: [32]u8 = undefined;
+    psk.derivePsk(HkdfSha256, 32, &client_psk, &rms, &ticket_nonce);
     try testing.expectEqualSlices(u8, &client_psk, &selection.psk);
     try testing.expectEqual(ticket_age_add, selection.session.ticket_age_add);
     try testing.expectEqualSlices(u8, &ticket_nonce, selection.session.ticket_nonce);
 
     // ── replay: the exact same offer again is rejected by the register ──
-    try testing.expectError(error.NoAcceptableIdentity, selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike, &scratch));
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike, &scratch));
 
     // ── forged binder: rejected AND does not consume the single-use slot ──
     var strike2 = replay.StrikeRegister.init(testing.allocator, 8, 60_000);
     defer strike2.deinit();
     var bad_binder = binder;
     bad_binder[0] ^= 1;
-    try testing.expectError(error.NoAcceptableIdentity, selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{bad_binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike2, &scratch));
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, &.{identity}, &.{bad_binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike2, &scratch));
     // The legitimate client still resumes: the forgery attempt above never
     // reached (and thus never marked) the strike register.
-    _ = try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike2, &scratch);
+    _ = try selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike2, &scratch);
 
     // ── tampered ticket: falls through, never a panic or false accept ──
     var tampered_buf: [160]u8 = undefined;
     @memcpy(tampered_buf[0..ticket.len], ticket);
     tampered_buf[stek.overhead - 1] ^= 1; // a ciphertext byte
     const tampered = OfferedIdentity{ .ticket = tampered_buf[0..ticket.len], .obfuscated_ticket_age = identity.obfuscated_ticket_age };
-    try testing.expectError(error.NoAcceptableIdentity, selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{tampered}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, null, &scratch));
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, &.{tampered}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, null, &scratch));
 
     // ── stale age: replayed obfuscated age drifts outside the window ──
     const late_ms: i64 = issued_at_ms + age_ms + 100_000; // 100 s later, same claimed age
-    try testing.expectError(error.NoAcceptableIdentity, selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, late_ms, window_ms, null, &scratch));
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, late_ms, window_ms, null, &scratch));
 
     // ── no strike register (strike == null): multiple accepts are allowed ──
-    _ = try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, null, &scratch);
-    _ = try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, null, &scratch);
+    _ = try selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, null, &scratch);
+    _ = try selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, null, &scratch);
 }
 
 test "selectPsk: second offered identity wins when the first is not ours (selected_index echoes position)" {
     var ring = stek.DefaultRing.init();
-    ring.rotate(3, [_]u8{0x77} ** stek.key_length, 0);
+    ring.rotate(3, &([_]u8{0x77} ** stek.key_length), 0);
 
     const rms = [_]u8{0xCD} ** 32;
     const ticket_nonce = [_]u8{0x01};
@@ -545,9 +603,7 @@ test "selectPsk: second offered identity wins when the first is not ours (select
     const now_ms: i64 = issued_at_ms + age_ms;
     const empty_hash = sha256Of("");
     const truncated_ch_hash = sha256Of("another truncated ClientHello");
-    const client_psk = psk.derivePsk(HkdfSha256, rms, &ticket_nonce, 32);
-    const client_binder_key = psk.binderKey(HkdfSha256, psk.earlySecret(HkdfSha256, &client_psk), &empty_hash);
-    const good_binder = psk.computeBinder(HkdfSha256, HmacSha256, client_binder_key, &truncated_ch_hash);
+    const good_binder = clientBinder(&rms, &ticket_nonce, &empty_hash, &truncated_ch_hash);
 
     // Identity 0: some other server's ticket (opaque garbage to our ring).
     const foreign = OfferedIdentity{ .ticket = &([_]u8{0x5C} ** 48), .obfuscated_ticket_age = 0 };
@@ -555,8 +611,10 @@ test "selectPsk: second offered identity wins when the first is not ours (select
     const dummy_binder = [_]u8{0} ** 32;
 
     var scratch: [128]u8 = undefined;
-    const selection = try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{ foreign, ours }, &.{ dummy_binder, good_binder }, &empty_hash, &truncated_ch_hash, now_ms, 10_000, null, &scratch);
+    const selection = try selectV(&ring, &.{ foreign, ours }, &.{ dummy_binder, good_binder }, &empty_hash, &truncated_ch_hash, now_ms, 10_000, null, &scratch);
     try testing.expectEqual(@as(usize, 1), selection.selected_index);
+    var client_psk: [32]u8 = undefined;
+    psk.derivePsk(HkdfSha256, 32, &client_psk, &rms, &ticket_nonce);
     try testing.expectEqualSlices(u8, &client_psk, &selection.psk);
 }
 
@@ -569,7 +627,7 @@ test "selectPsk: a ticket from the future and a strike register that cannot allo
     // allocation failure is fail-closed (doc step 5: "fails to allocate —
     // fail-closed"), never an accept.
     var ring = stek.DefaultRing.init();
-    ring.rotate(1, [_]u8{0x42} ** stek.key_length, 0);
+    ring.rotate(1, &([_]u8{0x42} ** stek.key_length), 0);
     const rms = [_]u8{0xAB} ** 32;
     const nonce = [_]u8{ 0, 0 };
     const issued_at_ms: i64 = 1_000_000;
@@ -579,16 +637,15 @@ test "selectPsk: a ticket from the future and a strike register that cannot allo
     const ticket = try ring.seal(try state.serialize(&pt_buf), [_]u8{0x01} ** stek.nonce_length, &blob_buf);
     const empty_hash = sha256Of("");
     const ch_hash = sha256Of("truncated ClientHello");
-    const client_psk = psk.derivePsk(HkdfSha256, rms, &nonce, 32);
-    const binder = psk.computeBinder(HkdfSha256, HmacSha256, psk.binderKey(HkdfSha256, psk.earlySecret(HkdfSha256, &client_psk), &empty_hash), &ch_hash);
+    const binder = clientBinder(&rms, &nonce, &empty_hash, &ch_hash);
     const identity = OfferedIdentity{ .ticket = ticket, .obfuscated_ticket_age = replay.obfuscateAge(0, 7) };
     var scratch: [128]u8 = undefined;
 
-    _ = try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms, 1_000, null, &scratch); // control
-    try testing.expectError(error.NoAcceptableIdentity, selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms - 1, 1_000, null, &scratch));
+    _ = try selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms, 1_000, null, &scratch); // control
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms - 1, 1_000, null, &scratch));
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var strike = replay.StrikeRegister.init(failing.allocator(), 8, 60_000);
     defer strike.deinit();
-    try testing.expectError(error.NoAcceptableIdentity, selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms, 1_000, &strike, &scratch));
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms, 1_000, &strike, &scratch));
 }

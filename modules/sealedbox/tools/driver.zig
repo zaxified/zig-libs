@@ -110,7 +110,7 @@ fn handle(gpa: std.mem.Allocator, io: std.Io, o: *std.Io.Writer, line: []const u
         const out_len = if (ct.len >= sealedbox.overhead) ct.len - sealedbox.overhead else 0;
         const pt = try gpa.alloc(u8, out_len);
         defer gpa.free(pt);
-        sealedbox.open(pt, ct, kp) catch |e| {
+        sealedbox.open(pt, ct, &kp) catch |e| {
             try o.print("ERR {s}\n", .{@errorName(e)});
             return;
         };

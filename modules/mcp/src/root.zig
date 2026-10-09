@@ -1915,6 +1915,7 @@ pub const InputRound = struct {
     state_out: ?[]const u8 = null,
 
     /// This retry's raw answer under `key`, or null.
+    // secret-api-ok: `key` is a JSON object key (an input-request / argument name), not a secret
     pub fn response(self: *const InputRound, key: []const u8) ?std.json.Value {
         const r = self.responses orelse return null;
         return r.get(key);
@@ -1922,6 +1923,7 @@ pub const InputRound = struct {
 
     /// The `ElicitResult` under `key`; null when absent or not decodable —
     /// ask again. A `decline`/`cancel` decodes: it is the user's answer.
+    // secret-api-ok: `key` is a JSON object key (an input-request / argument name), not a secret
     pub fn elicitation(self: *const InputRound, key: []const u8) ?ElicitationResult {
         const v = self.response(key) orelse return null;
         return ElicitationResult.parse(v) catch null;
@@ -1929,6 +1931,7 @@ pub const InputRound = struct {
 
     /// The `CreateMessageResult` under `key`; null when absent or not
     /// decodable (a tool-use content array included, as on the session path).
+    // secret-api-ok: `key` is a JSON object key (an input-request / argument name), not a secret
     pub fn sampling(self: *const InputRound, key: []const u8) ?SamplingResult {
         const v = self.response(key) orelse return null;
         return SamplingResult.parse(v) catch null;
@@ -1945,6 +1948,7 @@ pub const InputRound = struct {
     /// The same checks as the session path apply, against the capabilities
     /// this request's `_meta` declared (mrtr.mdx: a server "MUST NOT send an
     /// `inputRequests` that the client has not declared support for").
+    // secret-api-ok: `key` is a JSON object key (an input-request / argument name), not a secret
     pub fn ask(self: *InputRound, key: []const u8, req: InputRequest) InputError!void {
         const modern = self.modern orelse return error.SessionRequest;
         if (key.len == 0) return error.EmptyInputKey;
@@ -2278,6 +2282,7 @@ pub const ToolCall = struct {
 
     /// Fetch a required/optional string argument, or null when absent or not
     /// a string.
+    // secret-api-ok: `key` is a JSON object key (an input-request / argument name), not a secret
     pub fn strArg(self: *const ToolCall, key: []const u8) ?[]const u8 {
         if (self.args != .object) return null;
         return switch (self.args.object.get(key) orelse return null) {
@@ -2468,6 +2473,7 @@ pub const PromptRequest = struct {
     };
 
     /// Fetch a string argument, or null when absent or not a string.
+    // secret-api-ok: `key` is a JSON object key (an input-request / argument name), not a secret
     pub fn strArg(self: *const PromptRequest, key: []const u8) ?[]const u8 {
         if (self.args != .object) return null;
         return switch (self.args.object.get(key) orelse return null) {

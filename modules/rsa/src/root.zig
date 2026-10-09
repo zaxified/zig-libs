@@ -2679,7 +2679,7 @@ fn buildExtensions(d: DerBuild, opts: CertOptions) DerCertError![]const u8 {
 /// pre-size a buffer for that.
 pub fn selfSignedCert(
     gpa: std.mem.Allocator,
-    sk: SecretKey,
+    sk: *const SecretKey,
     pk: PublicKey,
     comptime Hash: type,
     opts: CertOptions,
@@ -2718,7 +2718,7 @@ pub fn selfSignedCert(
     // unreachable in practice but stays in `SelfSignedCertError` for type
     // honesty (it is `signPkcs1v15`'s real error set).
     var sig_buf: [max_modulus_len]u8 = undefined;
-    const sig = try signPkcs1v15(&sk, Hash, tbs_certificate, &sig_buf);
+    const sig = try signPkcs1v15(sk, Hash, tbs_certificate, &sig_buf);
 
     const cert = try d.seq(&.{
         tbs_certificate,
@@ -2735,6 +2735,7 @@ pub fn selfSignedCert(
 test {
     _ = openssh;
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 //
@@ -4038,7 +4039,7 @@ test "selfSignedCert: std.crypto.Certificate parses + fully verifies it (self-si
     const sk = try kat2048.secretKey();
     const pk = try kat2048.publicKey();
 
-    const cert_der = try selfSignedCert(testing.allocator, sk, pk, std.crypto.hash.sha2.Sha256, testCertOptions(true));
+    const cert_der = try selfSignedCert(testing.allocator, &sk, pk, std.crypto.hash.sha2.Sha256, testCertOptions(true));
     defer testing.allocator.free(cert_der);
 
     const cert: std.crypto.Certificate = .{ .buffer = cert_der, .index = 0 };
@@ -4094,9 +4095,9 @@ test "selfSignedCert: basicConstraints reflects is_ca (CA vs leaf)" {
     // for a CA cert, `cA`-absent (empty inner SEQUENCE, DEFAULT FALSE) only
     // for a leaf — proving `is_ca` actually reaches the DER, not just that
     // the OID is present in both.
-    const ca_der = try selfSignedCert(testing.allocator, sk, pk, Sha256, testCertOptions(true));
+    const ca_der = try selfSignedCert(testing.allocator, &sk, pk, Sha256, testCertOptions(true));
     defer testing.allocator.free(ca_der);
-    const leaf_der = try selfSignedCert(testing.allocator, sk, pk, Sha256, testCertOptions(false));
+    const leaf_der = try selfSignedCert(testing.allocator, &sk, pk, Sha256, testCertOptions(false));
     defer testing.allocator.free(leaf_der);
 
     const ca_true_seq = [_]u8{ 0x30, 0x03, 0x01, 0x01, 0xff }; // SEQUENCE { BOOLEAN TRUE }
@@ -4131,7 +4132,7 @@ test "selfSignedCert: subjectAltName (dNSName + URI) round-trips through std's v
         .{ .uri = "urn:zig-libs:rsa:test" },
     };
 
-    const cert_der = try selfSignedCert(testing.allocator, sk, pk, std.crypto.hash.sha2.Sha256, opts);
+    const cert_der = try selfSignedCert(testing.allocator, &sk, pk, std.crypto.hash.sha2.Sha256, opts);
     defer testing.allocator.free(cert_der);
     const cert: std.crypto.Certificate = .{ .buffer = cert_der, .index = 0 };
     const parsed = try cert.parse();
@@ -4152,19 +4153,19 @@ test "selfSignedCert: rejects invalid CertOptions (empty CN, malformed UTCTime)"
 
     var opts = testCertOptions(false);
     opts.common_name = "";
-    try testing.expectError(error.InvalidCertOptions, selfSignedCert(testing.allocator, sk, pk, Sha256, opts));
+    try testing.expectError(error.InvalidCertOptions, selfSignedCert(testing.allocator, &sk, pk, Sha256, opts));
 
     opts = testCertOptions(false);
     opts.not_before = "2025-01-01"; // wrong shape entirely
-    try testing.expectError(error.InvalidCertOptions, selfSignedCert(testing.allocator, sk, pk, Sha256, opts));
+    try testing.expectError(error.InvalidCertOptions, selfSignedCert(testing.allocator, &sk, pk, Sha256, opts));
 
     opts = testCertOptions(false);
     opts.not_after = "301231235959"; // missing trailing 'Z'
-    try testing.expectError(error.InvalidCertOptions, selfSignedCert(testing.allocator, sk, pk, Sha256, opts));
+    try testing.expectError(error.InvalidCertOptions, selfSignedCert(testing.allocator, &sk, pk, Sha256, opts));
 
     opts = testCertOptions(false);
     opts.not_before = "25010100000AZ"; // non-digit in the date portion
-    try testing.expectError(error.InvalidCertOptions, selfSignedCert(testing.allocator, sk, pk, Sha256, opts));
+    try testing.expectError(error.InvalidCertOptions, selfSignedCert(testing.allocator, &sk, pk, Sha256, opts));
 }
 
 test "selfSignedCert: allocator exhaustion is reported, not panicked (BufferTooSmall analogue)" {
@@ -4179,7 +4180,7 @@ test "selfSignedCert: allocator exhaustion is reported, not panicked (BufferTooS
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     try testing.expectError(
         error.OutOfMemory,
-        selfSignedCert(failing.allocator(), sk, pk, std.crypto.hash.sha2.Sha256, testCertOptions(false)),
+        selfSignedCert(failing.allocator(), &sk, pk, std.crypto.hash.sha2.Sha256, testCertOptions(false)),
     );
 }
 
@@ -4196,7 +4197,7 @@ test "selfSignedCert: this module's own P4a parser round-trips the embedded SPKI
     const pk = try kat2048.publicKey();
     const Sha256 = std.crypto.hash.sha2.Sha256;
 
-    const cert_der = try selfSignedCert(testing.allocator, sk, pk, Sha256, testCertOptions(false));
+    const cert_der = try selfSignedCert(testing.allocator, &sk, pk, Sha256, testCertOptions(false));
     defer testing.allocator.free(cert_der);
 
     const cert_elem = try Asn1.Element.decode(cert_der, 0);
@@ -4372,7 +4373,7 @@ test "generate: 1024-bit key round-trips P1 sign/verify, P2 OAEP, and P6 selfSig
     // P6: a self-signed certificate for the generated key must fully verify
     // under std.crypto.Certificate (parse + issuer/subject + validity +
     // RSA signature over the TBS bytes).
-    const cert_der = try selfSignedCert(testing.allocator, sk, pk, Sha256, testCertOptions(false));
+    const cert_der = try selfSignedCert(testing.allocator, &sk, pk, Sha256, testCertOptions(false));
     defer testing.allocator.free(cert_der);
     const cert: std.crypto.Certificate = .{ .buffer = cert_der, .index = 0 };
     const parsed = try cert.parse();

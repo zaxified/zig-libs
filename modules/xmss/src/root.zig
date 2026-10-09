@@ -208,16 +208,19 @@ fn keyedHash(comptime pad: *const [n]u8, key: *const [n]u8, m: []const u8) [n]u8
 }
 
 /// F (§5.1): SHA-256(toByte(0, 32) || KEY || M), M of n bytes.
+// secret-api-ok: KEY is derived from the public SEED (RFC 8391 §5.1; every caller passes PRF(SEED, ADRS) or SEED itself), never SK_SEED; the secret chain values travel in M and are the caller's
 pub fn hashF(key: *const [n]u8, m: *const [n]u8) [n]u8 {
     return keyedHash(&pad_f, key, m);
 }
 
 /// H (§5.1): SHA-256(toByte(1, 32) || KEY || M), M of 2n bytes.
+// secret-api-ok: KEY is derived from the public SEED (RFC 8391 §5.1; every caller passes PRF(SEED, ADRS) or SEED itself), never SK_SEED; the secret chain values travel in M and are the caller's
 pub fn hashH(key: *const [n]u8, m: *const [2 * n]u8) [n]u8 {
     return keyedHash(&pad_h, key, m);
 }
 
 /// PRF (§5.1): SHA-256(toByte(3, 32) || KEY || M), M a 32-byte index/ADRS.
+// secret-api-ok: KEY is derived from the public SEED (RFC 8391 §5.1; every caller passes PRF(SEED, ADRS) or SEED itself), never SK_SEED; the secret chain values travel in M and are the caller's
 pub fn prf(key: *const [n]u8, m: *const [32]u8) [n]u8 {
     return keyedHash(&pad_prf, key, m);
 }
@@ -240,6 +243,10 @@ pub fn hashMsg(r: *const [n]u8, root: *const [n]u8, idx: u64, msg: []const u8) [
 /// SK_SEED || SEED || ADRS) — derives one WOTS+ secret chain start. The
 /// result is secret, so it is written through `out`, never returned.
 pub fn prfKeygen(out: *[n]u8, sk_seed: *const [n]u8, pub_seed: *const [n]u8, adrs: *const [32]u8) void {
+    burn.run(burn.prf_burn, void, prfKeygenBody, .{ out, sk_seed, pub_seed, adrs });
+}
+
+fn prfKeygenBody(out: *[n]u8, sk_seed: *const [n]u8, pub_seed: *const [n]u8, adrs: *const [32]u8) void {
     var st = Sha256.init(.{});
     st.update(&pad_prf_keygen);
     st.update(sk_seed);
@@ -298,6 +305,10 @@ pub fn randHash(left: *const [n]u8, right: *const [n]u8, pub_seed: *const [n]u8,
 /// start value = PRF_keygen(sk_seed, SEED || ADRS·chain=i,hash=0,k=0). The
 /// whole private key (≈ 2 KiB) is secret, so it is written through `sk`.
 pub fn wotsSkGen(sk: *[wots_len][n]u8, sk_seed: *const [n]u8, pub_seed: *const [n]u8, adrs: *Adrs) void {
+    burn.run(burn.prf_burn, void, wotsSkGenBody, .{ sk, sk_seed, pub_seed, adrs });
+}
+
+fn wotsSkGenBody(sk: *[wots_len][n]u8, sk_seed: *const [n]u8, pub_seed: *const [n]u8, adrs: *Adrs) void {
     adrs.setHashAddress(0);
     adrs.setKeyAndMask(0);
     for (sk, 0..) |*chain_sk, i| {
@@ -312,6 +323,10 @@ pub fn wotsSkGen(sk: *[wots_len][n]u8, sk_seed: *const [n]u8, pub_seed: *const [
 /// the secrets it passed through are in this call's frames, which the caller
 /// owns (see `chain`).
 pub fn wotsPkGen(sk_seed: *const [n]u8, pub_seed: *const [n]u8, adrs: *Adrs) [wots_len][n]u8 {
+    return burn.run(burn.burn_size, [wots_len][n]u8, wotsPkGenBody, .{ sk_seed, pub_seed, adrs });
+}
+
+fn wotsPkGenBody(sk_seed: *const [n]u8, pub_seed: *const [n]u8, adrs: *Adrs) [wots_len][n]u8 {
     var pk: [wots_len][n]u8 = undefined;
     wotsSkGen(&pk, sk_seed, pub_seed, adrs);
     for (&pk, 0..) |*node, i| {
@@ -348,6 +363,10 @@ pub fn msgToBaseW(msg: *const [n]u8) [wots_len]u8 {
 /// the secrets it passed through are in this call's frames, which the caller
 /// owns (see `chain`).
 pub fn wotsSign(msg: *const [n]u8, sk_seed: *const [n]u8, pub_seed: *const [n]u8, adrs: *Adrs) [wots_len][n]u8 {
+    return burn.run(burn.burn_size, [wots_len][n]u8, wotsSignBody, .{ msg, sk_seed, pub_seed, adrs });
+}
+
+fn wotsSignBody(msg: *const [n]u8, sk_seed: *const [n]u8, pub_seed: *const [n]u8, adrs: *Adrs) [wots_len][n]u8 {
     const digits = msgToBaseW(msg);
     var sig: [wots_len][n]u8 = undefined;
     wotsSkGen(&sig, sk_seed, pub_seed, adrs);
@@ -394,6 +413,10 @@ pub fn ltree(pk: *[wots_len][n]u8, pub_seed: *const [n]u8, adrs: *Adrs) [n]u8 {
 /// steps): fresh OTS + L-tree addresses at `leaf_idx`, single-tree layout
 /// (layer = 0, tree = 0).
 pub fn genLeaf(sk_seed: *const [n]u8, pub_seed: *const [n]u8, leaf_idx: u32) [n]u8 {
+    return burn.run(burn.burn_size, [n]u8, genLeafBody, .{ sk_seed, pub_seed, leaf_idx });
+}
+
+fn genLeafBody(sk_seed: *const [n]u8, pub_seed: *const [n]u8, leaf_idx: u32) [n]u8 {
     var ots_adrs = Adrs{};
     ots_adrs.setType(Adrs.type_ots);
     ots_adrs.setOtsAddress(leaf_idx);
@@ -554,6 +577,7 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
                 self.sk.zeroize();
             }
 
+            // secret-api-ok: thin guard around `Self.sign` (burned, `burn.burn_size`) via `signGuarded`; this frame holds pointers and the guard flag only
             pub fn sign(self: *SigningKey, out: *[signature_length]u8, msg: []const u8) Error!void {
                 if (self.home != self) return error.KeyHandleCopied;
                 if (self.persist) |p| if (p.io) |io| {
@@ -979,6 +1003,7 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
 
         /// XMSS_rootFromSig (§4.1.10, Algorithm 13): the root value implied
         /// by a signature; equals pk.root iff the signature is valid.
+        // secret-api-ok: the verify path; `seed` is the PUBLIC SEED of the key, `sig_ots` / `auth` are parts of a published signature
         pub fn rootFromSig(idx: u32, sig_ots: *const [wots_len][n]u8, auth: *const [h][n]u8, mhash: *const [n]u8, seed: *const [n]u8) [n]u8 {
             var ots_adrs = Adrs{};
             ots_adrs.setType(Adrs.type_ots);
@@ -1466,4 +1491,5 @@ test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }

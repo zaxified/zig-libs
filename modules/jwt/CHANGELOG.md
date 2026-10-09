@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — dead-stack lint: `SigningKey.alg` / `verificationKey` / `encode` / `encodeJson` (the key is a union of borrowed slices and pointers) and `buildTokenRequest` (string assembly into a heap body) are marked as reviewed false positives. No code or signature change; no new probe needed (signing is probed in `stackprobe_test.zig`).
 - **2026-10-09** — **BREAKING (HIGH, secret residue): token signing and HS\* verification left keys,
   nonces and keyed HMAC state on the dead stack; `SigningKey` now borrows its key pairs.**
   Found by a new stack probe (`src/stackprobe_test.zig`, ReleaseFast, 16-byte windows of every secret

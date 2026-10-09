@@ -31,6 +31,7 @@
 //! ```
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 /// The AEAD this ring seals tickets under (RFC 8446 §4.6.1 leaves the ticket
 /// format to the server; AES-256-GCM is this module's fixed choice per the
@@ -123,9 +124,9 @@ pub fn StekRing(comptime depth: usize) type {
         /// silently shadows whichever older slot shared it; callers should
         /// pick ids that don't collide across the live rotation window,
         /// e.g. a monotonic counter mod 256).
-        pub fn rotate(self: *Self, id: u8, key: [key_length]u8, now_s: i64) void {
+        pub fn rotate(self: *Self, id: u8, key: *const [key_length]u8, now_s: i64) void {
             const slot = self.count % depth;
-            self.keys[slot] = .{ .id = id, .key = key, .installed_at_s = now_s };
+            self.keys[slot] = .{ .id = id, .key = key.*, .installed_at_s = now_s };
             self.active = slot;
             self.count += 1;
         }
@@ -168,6 +169,15 @@ pub fn StekRing(comptime depth: usize) type {
             nonce: [nonce_length]u8,
             out: []u8,
         ) SealError![]u8 {
+            return burn.run(burn.ticket_burn, SealError![]u8, sealBody, .{ self, plaintext, nonce, out });
+        }
+
+        fn sealBody(
+            self: *const Self,
+            plaintext: []const u8,
+            nonce: [nonce_length]u8,
+            out: []u8,
+        ) SealError![]u8 {
             const key = self.activeKey() orelse return error.NoActiveKey;
             const total = plaintext.len + overhead;
             if (out.len < total) return error.BufferTooSmall;
@@ -192,6 +202,10 @@ pub fn StekRing(comptime depth: usize) type {
         /// Writes `blob.len - overhead` bytes into `out` and returns that
         /// slice. `out` must not alias `blob`.
         pub fn open(self: *const Self, blob: []const u8, out: []u8) OpenError![]u8 {
+            return burn.run(burn.ticket_burn, OpenError![]u8, openBody, .{ self, blob, out });
+        }
+
+        fn openBody(self: *const Self, blob: []const u8, out: []u8) OpenError![]u8 {
             if (blob.len < overhead) return error.Malformed;
             const key = self.findKey(blob[0]) orelse return error.UnknownKeyId;
 
@@ -223,7 +237,7 @@ test "StekRing: rotate installs the active key; findKey/activeKey agree" {
     var ring = DefaultRing.init();
     try testing.expect(ring.activeKey() == null);
 
-    ring.rotate(1, [_]u8{0xAA} ** key_length, 1_000);
+    ring.rotate(1, &([_]u8{0xAA} ** key_length), 1_000);
     const active = ring.activeKey().?;
     try testing.expectEqual(@as(u8, 1), active.id);
     try testing.expectEqual(@as(i64, 1_000), active.installed_at_s);
@@ -233,13 +247,13 @@ test "StekRing: rotate installs the active key; findKey/activeKey agree" {
 
 test "StekRing: rotating past depth evicts the oldest key (ring-buffer wraparound)" {
     var ring = StekRing(2).init();
-    ring.rotate(1, [_]u8{0x01} ** key_length, 1);
-    ring.rotate(2, [_]u8{0x02} ** key_length, 2);
+    ring.rotate(1, &([_]u8{0x01} ** key_length), 1);
+    ring.rotate(2, &([_]u8{0x02} ** key_length), 2);
     // Both still live (depth = 2, exactly full).
     try testing.expect(ring.findKey(1) != null);
     try testing.expect(ring.findKey(2) != null);
 
-    ring.rotate(3, [_]u8{0x03} ** key_length, 3);
+    ring.rotate(3, &([_]u8{0x03} ** key_length), 3);
     // Key 1 evicted; 2 and 3 live; 3 is now active.
     try testing.expect(ring.findKey(1) == null);
     try testing.expect(ring.findKey(2) != null);
@@ -261,7 +275,7 @@ test "seal/open: round-trip, tamper detection, unknown id, malformed, buffer bou
     // No key ever rotated in -> NoActiveKey.
     try testing.expectError(error.NoActiveKey, ring.seal(plaintext, nonce, &blob_buf));
 
-    ring.rotate(7, [_]u8{0x42} ** key_length, 1_000);
+    ring.rotate(7, &([_]u8{0x42} ** key_length), 1_000);
 
     // 1. Round-trip.
     const blob = try ring.seal(plaintext, nonce, &blob_buf);
@@ -299,8 +313,8 @@ test "seal/open: AAD binds the key id (same key bytes under a different id rejec
     // authenticated as AAD, not merely used for key lookup.
     var ring = DefaultRing.init();
     const key = [_]u8{0x42} ** key_length;
-    ring.rotate(1, key, 1_000);
-    ring.rotate(2, key, 2_000);
+    ring.rotate(1, &key, 1_000);
+    ring.rotate(2, &key, 2_000);
 
     var blob_buf: [128]u8 = undefined;
     var out_buf: [128]u8 = undefined;
@@ -316,13 +330,13 @@ test "seal/open: AAD binds the key id (same key bytes under a different id rejec
 
 test "seal/open: an older still-live STEK still opens its tickets after rotation" {
     var ring = DefaultRing.init();
-    ring.rotate(1, [_]u8{0x01} ** key_length, 1_000);
+    ring.rotate(1, &([_]u8{0x01} ** key_length), 1_000);
 
     var blob_buf: [128]u8 = undefined;
     var out_buf: [128]u8 = undefined;
     const blob = try ring.seal("pre-rotation ticket", [_]u8{0xC3} ** nonce_length, &blob_buf);
 
-    ring.rotate(2, [_]u8{0x02} ** key_length, 2_000); // key 1 now decrypt-only
+    ring.rotate(2, &([_]u8{0x02} ** key_length), 2_000); // key 1 now decrypt-only
     const opened = try ring.open(blob, &out_buf);
     try testing.expectEqualSlices(u8, "pre-rotation ticket", opened);
 

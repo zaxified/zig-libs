@@ -63,6 +63,11 @@
 
 const std = @import("std");
 const pskmod = @import("psk.zig");
+const burn = @import("burn.zig");
+
+// Dead-stack shape (CONVENTIONS §2.1.1): secrets in by `*const`, secret
+// results out through `out` (first parameter after the comptime types),
+// every entry point's body under `burn.run`.
 
 /// RFC 8446 §7.1: `client_early_traffic_secret = Derive-Secret(early_secret,
 /// "c e traffic", ClientHello)` — the secret protecting 0-RTT early-data
@@ -72,12 +77,11 @@ const pskmod = @import("psk.zig");
 /// module doc's pitfall note.
 pub fn clientEarlyTrafficSecret(
     comptime Hkdf: type,
-    early_secret: [Hkdf.prk_length]u8,
+    out: *[Hkdf.prk_length]u8,
+    early_secret: *const [Hkdf.prk_length]u8,
     client_hello_transcript_hash: []const u8,
-) [Hkdf.prk_length]u8 {
-    // Derive-Secret(early_secret, "c e traffic", ClientHello) =
-    // HKDF-Expand-Label(early_secret, "c e traffic", CH_hash, Hash.length).
-    return std.crypto.tls.hkdfExpandLabel(Hkdf, early_secret, "c e traffic", client_hello_transcript_hash, Hkdf.prk_length);
+) void {
+    burn.run(burn.kdf_burn, void, deriveSecretBody, .{ Hkdf, "c e traffic", out, early_secret, client_hello_transcript_hash });
 }
 
 /// RFC 8446 §7.1: `early_exporter_master_secret = Derive-Secret(early_secret,
@@ -86,13 +90,26 @@ pub fn clientEarlyTrafficSecret(
 /// transcript-hash context as `clientEarlyTrafficSecret`.
 pub fn earlyExporterMasterSecret(
     comptime Hkdf: type,
-    early_secret: [Hkdf.prk_length]u8,
+    out: *[Hkdf.prk_length]u8,
+    early_secret: *const [Hkdf.prk_length]u8,
     client_hello_transcript_hash: []const u8,
-) [Hkdf.prk_length]u8 {
-    return std.crypto.tls.hkdfExpandLabel(Hkdf, early_secret, "e exp master", client_hello_transcript_hash, Hkdf.prk_length);
+) void {
+    burn.run(burn.kdf_burn, void, deriveSecretBody, .{ Hkdf, "e exp master", out, early_secret, client_hello_transcript_hash });
 }
 
-/// The record-protection key + IV pair `earlyTrafficKeyIv` returns (RFC 8446
+// Derive-Secret(early_secret, label, ClientHello) =
+// HKDF-Expand-Label(early_secret, label, CH_hash, Hash.length).
+fn deriveSecretBody(
+    comptime Hkdf: type,
+    comptime label: []const u8,
+    out: *[Hkdf.prk_length]u8,
+    early_secret: *const [Hkdf.prk_length]u8,
+    client_hello_transcript_hash: []const u8,
+) void {
+    out.* = std.crypto.tls.hkdfExpandLabel(Hkdf, early_secret.*, label, client_hello_transcript_hash, Hkdf.prk_length);
+}
+
+/// The record-protection key + IV pair `earlyTrafficKeyIv` writes (RFC 8446
 /// §7.3). The per-record nonce is `iv XOR left-padded(seq)` per §5.3 —
 /// sequence numbering for early-data records starts at 0 and is separate
 /// from the handshake/application spaces.
@@ -113,13 +130,21 @@ pub fn TrafficKeyIv(comptime key_len: usize) type {
 pub fn earlyTrafficKeyIv(
     comptime Hkdf: type,
     comptime key_len: usize,
-    client_early_traffic_secret: [Hkdf.prk_length]u8,
-) TrafficKeyIv(key_len) {
+    out: *TrafficKeyIv(key_len),
+    client_early_traffic_secret: *const [Hkdf.prk_length]u8,
+) void {
+    burn.run(burn.kdf_burn, void, earlyTrafficKeyIvBody, .{ Hkdf, key_len, out, client_early_traffic_secret });
+}
+
+fn earlyTrafficKeyIvBody(
+    comptime Hkdf: type,
+    comptime key_len: usize,
+    out: *TrafficKeyIv(key_len),
+    client_early_traffic_secret: *const [Hkdf.prk_length]u8,
+) void {
     comptime std.debug.assert(key_len == 16 or key_len == 32); // RFC 8446 §B.4 suites only
-    return .{
-        .key = std.crypto.tls.hkdfExpandLabel(Hkdf, client_early_traffic_secret, "key", "", key_len),
-        .iv = std.crypto.tls.hkdfExpandLabel(Hkdf, client_early_traffic_secret, "iv", "", 12),
-    };
+    out.key = std.crypto.tls.hkdfExpandLabel(Hkdf, client_early_traffic_secret.*, "key", "", key_len);
+    out.iv = std.crypto.tls.hkdfExpandLabel(Hkdf, client_early_traffic_secret.*, "iv", "", 12);
 }
 
 /// Convenience: the full early-data derivation in one call — PSK ->
@@ -137,19 +162,21 @@ pub fn EarlyDataContext(comptime Hkdf: type, comptime key_len: usize) type {
         key: [key_len]u8,
         iv: [12]u8,
 
-        /// `psk` is the resumption PSK (`psk.derivePsk`'s output);
-        /// `client_hello_transcript_hash` is the COMPLETE-ClientHello digest
-        /// (see the module-doc pitfall note).
-        pub fn derive(psk: []const u8, client_hello_transcript_hash: []const u8) @This() {
-            const early_secret = pskmod.earlySecret(Hkdf, psk);
-            const cets = clientEarlyTrafficSecret(Hkdf, early_secret, client_hello_transcript_hash);
-            const key_iv = earlyTrafficKeyIv(Hkdf, key_len, cets);
-            return .{
-                .early_secret = early_secret,
-                .client_early_traffic_secret = cets,
-                .key = key_iv.key,
-                .iv = key_iv.iv,
-            };
+        /// Writes the whole context into `out`. `psk` is the resumption PSK
+        /// (`psk.derivePsk`'s output); `client_hello_transcript_hash` is the
+        /// COMPLETE-ClientHello digest (see the module-doc pitfall note).
+        pub fn derive(out: *@This(), psk: []const u8, client_hello_transcript_hash: []const u8) void {
+            burn.run(burn.kdf_burn, void, deriveBody, .{ out, psk, client_hello_transcript_hash });
+        }
+
+        fn deriveBody(out: *@This(), psk: []const u8, client_hello_transcript_hash: []const u8) void {
+            pskmod.earlySecret(Hkdf, &out.early_secret, psk);
+            clientEarlyTrafficSecret(Hkdf, &out.client_early_traffic_secret, &out.early_secret, client_hello_transcript_hash);
+            var key_iv: TrafficKeyIv(key_len) = undefined;
+            earlyTrafficKeyIv(Hkdf, key_len, &key_iv, &out.client_early_traffic_secret);
+            out.key = key_iv.key;
+            out.iv = key_iv.iv;
+            std.crypto.secureZero(u8, &key_iv.key);
         }
     };
 }
@@ -206,23 +233,27 @@ const rfc8448_early_record_tag = hexTo(16, "7a7cc5d2844f76d5aee4b4edbf049be0");
 // byte), then the 16-byte GCM tag.
 
 test "clientEarlyTrafficSecret matches RFC 8448 §4 'c e traffic' byte-exact" {
-    const got = clientEarlyTrafficSecret(HkdfSha256, rfc8448_early_secret, &rfc8448_client_hello_hash);
+    var got: [32]u8 = undefined;
+    clientEarlyTrafficSecret(HkdfSha256, &got, &rfc8448_early_secret, &rfc8448_client_hello_hash);
     try testing.expectEqualSlices(u8, &rfc8448_client_early_traffic_secret, &got);
 }
 
 test "earlyExporterMasterSecret matches RFC 8448 §4 'e exp master' byte-exact" {
-    const got = earlyExporterMasterSecret(HkdfSha256, rfc8448_early_secret, &rfc8448_client_hello_hash);
+    var got: [32]u8 = undefined;
+    earlyExporterMasterSecret(HkdfSha256, &got, &rfc8448_early_secret, &rfc8448_client_hello_hash);
     try testing.expectEqualSlices(u8, &rfc8448_early_exporter_master_secret, &got);
 }
 
 test "earlyTrafficKeyIv matches RFC 8448 §4 early write key + iv byte-exact" {
-    const got = earlyTrafficKeyIv(HkdfSha256, 16, rfc8448_client_early_traffic_secret);
+    var got: TrafficKeyIv(16) = undefined;
+    earlyTrafficKeyIv(HkdfSha256, 16, &got, &rfc8448_client_early_traffic_secret);
     try testing.expectEqualSlices(u8, &rfc8448_early_key, &got.key);
     try testing.expectEqualSlices(u8, &rfc8448_early_iv, &got.iv);
 }
 
 test "EarlyDataContext.derive: full chain PSK -> early keys, RFC 8448 §4 end-to-end" {
-    const ctx = EarlyDataContext(HkdfSha256, 16).derive(&rfc8448_psk, &rfc8448_client_hello_hash);
+    var ctx: EarlyDataContext(HkdfSha256, 16) = undefined;
+    EarlyDataContext(HkdfSha256, 16).derive(&ctx, &rfc8448_psk, &rfc8448_client_hello_hash);
     try testing.expectEqualSlices(u8, &rfc8448_early_secret, &ctx.early_secret);
     try testing.expectEqualSlices(u8, &rfc8448_client_early_traffic_secret, &ctx.client_early_traffic_secret);
     try testing.expectEqualSlices(u8, &rfc8448_early_key, &ctx.key);
@@ -235,7 +266,8 @@ test "open RFC 8448 §4's actual early-data record with the derived key/iv" {
     // record header, nonce = iv XOR left-padded seq (seq = 0 for the first
     // early-data record, so nonce == iv), plaintext = TLSInnerPlaintext =
     // content "ABCDEF" || ContentType application_data (0x17).
-    const keys = earlyTrafficKeyIv(HkdfSha256, 16, rfc8448_client_early_traffic_secret);
+    var keys: TrafficKeyIv(16) = undefined;
+    earlyTrafficKeyIv(HkdfSha256, 16, &keys, &rfc8448_client_early_traffic_secret);
     var plaintext: [7]u8 = undefined;
     try Aes128Gcm.decrypt(
         &plaintext,
@@ -252,7 +284,8 @@ test "seal/open round-trip: derived early key/iv protect and recover a record" {
     // Complements the byte-exact open above with the sealing direction
     // (what a resuming CLIENT does with these keys): seal a fresh inner
     // plaintext under the derived key/iv, then open it back.
-    const ctx = EarlyDataContext(HkdfSha256, 16).derive(&rfc8448_psk, &rfc8448_client_hello_hash);
+    var ctx: EarlyDataContext(HkdfSha256, 16) = undefined;
+    EarlyDataContext(HkdfSha256, 16).derive(&ctx, &rfc8448_psk, &rfc8448_client_hello_hash);
     const inner_plaintext = "early GET /" ++ [_]u8{0x17};
     const header = [_]u8{ 0x17, 0x03, 0x03, 0x00, inner_plaintext.len + Aes128Gcm.tag_length };
 
@@ -291,19 +324,24 @@ test "SHA-384 / key_len 32 suite: chain runs at the 48-byte digest length and is
     var ch_hash: [48]u8 = undefined;
     Sha384.hash("fake complete client hello", &ch_hash, .{});
 
-    const ctx = EarlyDataContext(Hkdf384, 32).derive(&psk, &ch_hash);
+    var ctx: EarlyDataContext(Hkdf384, 32) = undefined;
+    EarlyDataContext(Hkdf384, 32).derive(&ctx, &psk, &ch_hash);
 
     // Convenience type must equal the manual step-by-step chain.
-    const es = pskmod.earlySecret(Hkdf384, &psk);
+    var es: [48]u8 = undefined;
+    pskmod.earlySecret(Hkdf384, &es, &psk);
     try testing.expectEqualSlices(u8, &es, &ctx.early_secret);
-    const cets = clientEarlyTrafficSecret(Hkdf384, es, &ch_hash);
+    var cets: [48]u8 = undefined;
+    clientEarlyTrafficSecret(Hkdf384, &cets, &es, &ch_hash);
     try testing.expectEqualSlices(u8, &cets, &ctx.client_early_traffic_secret);
-    const keys = earlyTrafficKeyIv(Hkdf384, 32, cets);
+    var keys: TrafficKeyIv(32) = undefined;
+    earlyTrafficKeyIv(Hkdf384, 32, &keys, &cets);
     try testing.expectEqualSlices(u8, &keys.key, &ctx.key);
     try testing.expectEqualSlices(u8, &keys.iv, &ctx.iv);
 
     // The exporter branch derives and differs from the traffic branch.
-    const exp = earlyExporterMasterSecret(Hkdf384, es, &ch_hash);
+    var exp: [48]u8 = undefined;
+    earlyExporterMasterSecret(Hkdf384, &exp, &es, &ch_hash);
     try testing.expect(!std.mem.eql(u8, &exp, &cets));
 
     // Seal/open round-trip under the derived AES-256-GCM key.
@@ -322,7 +360,9 @@ test "different ClientHello hashes yield different early traffic secrets" {
     // (guards against a copy-paste bug passing "" as context, which would
     // silently produce a fixed secret per PSK).
     const other_hash = [_]u8{0xAB} ** 32;
-    const a = clientEarlyTrafficSecret(HkdfSha256, rfc8448_early_secret, &rfc8448_client_hello_hash);
-    const b = clientEarlyTrafficSecret(HkdfSha256, rfc8448_early_secret, &other_hash);
+    var a: [32]u8 = undefined;
+    var b: [32]u8 = undefined;
+    clientEarlyTrafficSecret(HkdfSha256, &a, &rfc8448_early_secret, &rfc8448_client_hello_hash);
+    clientEarlyTrafficSecret(HkdfSha256, &b, &rfc8448_early_secret, &other_hash);
     try testing.expect(!std.mem.eql(u8, &a, &b));
 }

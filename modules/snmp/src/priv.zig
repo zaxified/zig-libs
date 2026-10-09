@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const ber = @import("ber.zig");
+const burn = @import("burn.zig");
 const des = @import("des.zig");
 const v3 = @import("v3.zig");
 const Aes128 = std.crypto.core.aes.Aes128;
@@ -206,12 +207,24 @@ pub fn encrypt(
     plaintext: []const u8,
     out: []u8,
 ) PrivError!Encrypted {
+    return burn.run(burn.priv_burn, PrivError!Encrypted, encryptBody, .{ proto, localized_priv_key, engine_boots, engine_time, salt_source, plaintext, out });
+}
+
+fn encryptBody(
+    proto: PrivProtocol,
+    localized_priv_key: []const u8,
+    engine_boots: u32,
+    engine_time: u32,
+    salt_source: *SaltSource,
+    plaintext: []const u8,
+    out: []u8,
+) PrivError!Encrypted {
     if (localized_priv_key.len < proto.keyLen()) return error.KeyTooShort;
     const salt = try salt_source.draw(proto, engine_boots);
 
     switch (proto) {
         .des_cbc => {
-            const key: [8]u8 = localized_priv_key[0..8].*;
+            const key = localized_priv_key[0..8];
             const pre_iv = localized_priv_key[8..16];
             var iv: [8]u8 = undefined;
             for (&iv, pre_iv, salt) |*b, p, s| b.* = p ^ s;
@@ -253,6 +266,18 @@ pub fn decrypt(
     ciphertext: []const u8,
     out: []u8,
 ) PrivError![]u8 {
+    return burn.run(burn.priv_burn, PrivError![]u8, decryptBody, .{ proto, localized_priv_key, engine_boots, engine_time, priv_params, ciphertext, out });
+}
+
+fn decryptBody(
+    proto: PrivProtocol,
+    localized_priv_key: []const u8,
+    engine_boots: u32,
+    engine_time: u32,
+    priv_params: []const u8,
+    ciphertext: []const u8,
+    out: []u8,
+) PrivError![]u8 {
     if (localized_priv_key.len < proto.keyLen()) return error.KeyTooShort;
     if (priv_params.len != 8) return error.BadSalt;
     if (out.len < ciphertext.len) return error.BufferTooSmall;
@@ -260,7 +285,7 @@ pub fn decrypt(
 
     switch (proto) {
         .des_cbc => {
-            const key: [8]u8 = localized_priv_key[0..8].*;
+            const key = localized_priv_key[0..8];
             const pre_iv = localized_priv_key[8..16];
             var iv: [8]u8 = undefined;
             for (&iv, pre_iv, salt) |*b, p, s| b.* = p ^ s;

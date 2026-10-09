@@ -210,6 +210,7 @@ pub const SecretKey = union(enum) {
 /// three candidates; ECDSA/Ed25519 keys are each tied to exactly one scheme
 /// (the curve fixes the hash). Never empty — every `SecretKey` union case
 /// maps to at least one scheme.
+// secret-api-ok: `SecretKey` is a tagged union of pointers to the key; this reads only the tag, never the key bytes.
 pub fn candidateSchemes(secret_key: SecretKey) []const SignatureScheme {
     return switch (secret_key) {
         .rsa => &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 },
@@ -356,6 +357,7 @@ pub const SignError = BuildContentError || error{
 /// Non-crypto validation + output-buffer sizing is fully implemented, then
 /// the actual signing operation dispatches to one of four private `signXxx`
 /// primitives (see the "crypto dispatch" section below).
+// secret-api-ok: `SecretKey` is a tagged union of pointers to the key (the by-value copy holds pointers, not key bytes); the signers it dispatches to run under their own burns.
 pub fn sign(
     scheme: SignatureScheme,
     secret_key: SecretKey,

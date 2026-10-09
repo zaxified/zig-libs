@@ -30,3 +30,8 @@ pub const msm_burn = 32 * 1024;
 
 /// `X25519.scalarmult` dirtied 1.3 KiB in ReleaseFast (2026-10-08).
 pub const x25519_burn = 4 * 1024;
+
+/// `X25519.recoverPublicKeyInto` (fixed-base comb) -- generous one-shot size,
+/// not yet measured; the coordinator adjusts after the ReleaseFast probe
+/// (`stackprobe2_test.zig`, 2026-10-09).
+pub const x25519_base_burn = 16 * 1024;

@@ -81,4 +81,5 @@ test {
     _ = channel;
     _ = record;
     _ = replay;
+    _ = @import("stackprobe_test.zig");
 }

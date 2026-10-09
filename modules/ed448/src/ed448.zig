@@ -455,11 +455,21 @@ pub const SecretKey = struct {
     /// is always re-derived from this seed, never stored alongside it.
     bytes: [57]u8,
 
+    // secret-api-ok: pure struct-wrapping codec shaped like `PublicKey.fromBytes`; `fromBytesInto` is the pointer twin
     pub fn fromBytes(bytes: [57]u8) SecretKey {
         return .{ .bytes = bytes };
     }
+    /// `fromBytes` with the seed by pointer and the result into `out`.
+    pub fn fromBytesInto(out: *SecretKey, bytes: *const [57]u8) void {
+        out.bytes = bytes.*;
+    }
+    // secret-api-ok: pure struct-unwrapping codec shaped like `PublicKey.toBytes`; `toBytesInto` is the pointer twin
     pub fn toBytes(sk: SecretKey) [57]u8 {
         return sk.bytes;
+    }
+    /// `toBytes` with the key by pointer and the seed into `out`.
+    pub fn toBytesInto(out: *[57]u8, sk: *const SecretKey) void {
+        out.* = sk.bytes;
     }
 
     /// Zeroize the 57-byte seed in place. Idempotent (re-zeroing an
@@ -539,13 +549,23 @@ pub const KeyPair = struct {
     ///
     /// Burned (`burn.zig`): before, every call left the seed and `h` on the
     /// dead stack (`stackprobe_test.zig`, 2026-10-08).
+    ///
+    /// std's shape (a `KeyPair` returned by value): the result is a copy of
+    /// the seed in the caller's frame. A caller that owns its frame should
+    /// use `createInto`.
     pub fn create(seed: *const [57]u8) KeyPair {
-        const r = createUnburned(seed);
-        burn.stack(burn.sign_burn);
-        return r;
+        var kp: KeyPair = undefined;
+        createInto(&kp, seed);
+        return kp;
     }
 
-    noinline fn createUnburned(seed: *const [57]u8) KeyPair {
+    /// `create` with the key pair into `out`; the body's frames are burned.
+    pub fn createInto(out: *KeyPair, seed: *const [57]u8) void {
+        createUnburned(out, seed);
+        burn.stack(burn.sign_burn);
+    }
+
+    noinline fn createUnburned(out: *KeyPair, seed: *const [57]u8) void {
         var h: [114]u8 = undefined;
         defer std.crypto.secureZero(u8, &h);
         Shake256.hash(seed, &h, .{});
@@ -553,10 +573,8 @@ pub const KeyPair = struct {
         defer std.crypto.secureZero(u8, &s);
         scalar.clamp(&s);
         const a_point = Point.mulBasePoint(s);
-        return .{
-            .public_key = PublicKey.fromBytes(a_point.toBytes()),
-            .secret_key = SecretKey.fromBytes(seed.*),
-        };
+        out.public_key = PublicKey.fromBytes(a_point.toBytes());
+        out.secret_key.bytes = seed.*;
     }
 
     /// Generate a new, random key pair. The seed IS the long-term signing
@@ -564,11 +582,21 @@ pub const KeyPair = struct {
     /// it fails closed (`entropy.fill`) — this signature returns a
     /// `KeyPair` with no error channel, and a guessable seed is a forged
     /// signature under every message.
+    ///
+    /// std's shape (returned by value); `generateInto` is the pointer twin.
     pub fn generate(io: std.Io) KeyPair {
+        var kp: KeyPair = undefined;
+        generateInto(&kp, io);
+        return kp;
+    }
+
+    /// `generate` into `out`; the seed is wiped, the derivation burned
+    /// (`createInto`).
+    pub fn generateInto(out: *KeyPair, io: std.Io) void {
         var seed: [57]u8 = undefined;
         entropy.fill(io, &seed);
         defer std.crypto.secureZero(u8, &seed);
-        return create(&seed);
+        createInto(out, &seed);
     }
 
     /// Zeroize `secret_key` in place; `public_key` is left untouched (it

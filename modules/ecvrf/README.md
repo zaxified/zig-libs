@@ -66,7 +66,8 @@ const beta = try ecvrf.verify(pk, alpha, pi); // error.InvalidProof / error.Inva
 
 // Many proofs under one key: derive the public key once (~23 % faster
 // per proof, same bytes). Build it only with fromSecretKey.
-const kp = ecvrf.KeyPair.fromSecretKey(sk);
+var kp: ecvrf.KeyPair = undefined;
+ecvrf.KeyPair.fromSecretKey(&kp, sk);
 const pi2 = kp.prove(alpha);
 ```
 

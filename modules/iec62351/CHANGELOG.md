@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack burn: `goose.computeMac` (and so `goose.verifyMac`) runs its body under `burn.run` (4 KiB, per frame; the MAC key through the HMAC pads / GCM key schedule); new `stackprobe2_test.zig` on `testkit.stackprobe`. No signature change.
+
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the ECDSA P-256 sealer/signer
   moved off `std.crypto.sign.ecdsa.EcdsaP256Sha256` onto `p256.EcdsaP256Sha256` (burned wrapper). Measured
   BEFORE with the new `src/stackprobe_test.zig` (ReleaseFast, per 5 calls, `goose.build` and

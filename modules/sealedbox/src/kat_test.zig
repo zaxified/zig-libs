@@ -15,6 +15,7 @@ const kat = @import("kat_vectors.zig");
 // test-only import should not move it.
 test {
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 fn hexDecode32(comptime hex: []const u8) [32]u8 {
@@ -65,7 +66,7 @@ test "external anchor: deterministic-ephemeral seal() matches an independently-c
 
     // And it opens correctly with the recipient keypair (module's real API).
     var opened: [kat.message.len]u8 = undefined;
-    try sealedbox.open(&opened, &sealed, .{ .public_key = recipient_pk, .secret_key = recipient_sk });
+    try sealedbox.open(&opened, &sealed, &.{ .public_key = recipient_pk, .secret_key = recipient_sk });
     try testing.expectEqualSlices(u8, kat.message, &opened);
 }
 
@@ -241,7 +242,7 @@ pub fn openHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
 
     var out_buf: [256]u8 = undefined;
     const out_len = if (sealed_len >= sealedbox.overhead) sealed_len - sealedbox.overhead else 0;
-    if (sealedbox.open(out_buf[0..out_len], sealed, kp)) |_| {
+    if (sealedbox.open(out_buf[0..out_len], sealed, &kp)) |_| {
         if (must == .refuse) return error.TamperedBoxOpened;
         fuzz_test.mark(.opened);
     } else |_| {
@@ -284,7 +285,7 @@ pub fn sealHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
 
     var opened_buf: [256]u8 = undefined;
     const opened = opened_buf[0..msg.len];
-    try sealedbox.open(opened, out, kp);
+    try sealedbox.open(opened, out, &kp);
     try testing.expectEqualSlices(u8, msg, opened);
     fuzz_test.mark(.sealed_roundtrip);
 }
@@ -344,7 +345,7 @@ test "H1: a forged tag that agrees with the real one in its first 1/2/4/8 bytes 
         try testing.expect(!std.mem.eql(u8, &real_tag, &tag));
 
         var opened: [msg.len]u8 = undefined;
-        try testing.expectError(error.AuthenticationFailed, sealedbox.open(&opened, &forged, kp));
+        try testing.expectError(error.AuthenticationFailed, sealedbox.open(&opened, &forged, &kp));
     }
 }
 
@@ -389,7 +390,7 @@ test "L5: open rejects a sealed box whose ephemeral-key prefix is a degenerate/s
         var sealed: [32 + 16 + 4]u8 = [_]u8{0xAA} ** (32 + 16 + 4);
         @memcpy(sealed[0..32], &epk);
         var opened: [4]u8 = undefined;
-        try testing.expectError(error.IdentityElement, sealedbox.open(&opened, &sealed, kp));
+        try testing.expectError(error.IdentityElement, sealedbox.open(&opened, &sealed, &kp));
     }
 }
 
@@ -416,7 +417,7 @@ test "corpus: every ciphertext reaches open, and the opened count is pinned" {
         if (sealed_len != 0) nonempty += 1;
         var out_buf: [256]u8 = undefined;
         const out_len = if (sealed_len >= sealedbox.overhead) sealed_len - sealedbox.overhead else 0;
-        if (sealedbox.open(out_buf[0..out_len], sealed_buf[0..sealed_len], kp)) |_| {
+        if (sealedbox.open(out_buf[0..out_len], sealed_buf[0..sealed_len], &kp)) |_| {
             opened += 1;
             recovered += out_len;
         } else |_| {}

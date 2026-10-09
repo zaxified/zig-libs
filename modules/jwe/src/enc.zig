@@ -118,7 +118,8 @@ noinline fn decryptUnburned(
 
 /// `A128GCM`/`A192GCM`/`A256GCM` (RFC 7518 §5.3) — direct
 /// `std.crypto.aead.aes_gcm`. Real, not a stub.
-pub const gcm = struct {
+const gcm = struct {
+    // secret-api-ok: `gcm` is private to this file and reached only through `encrypt` / `decrypt` above, which run it under `burn.content_burn`
     pub fn encrypt(
         enc: Enc,
         key: []const u8,
@@ -146,6 +147,7 @@ pub const gcm = struct {
         return plaintext.len;
     }
 
+    // secret-api-ok: `gcm` is private to this file and reached only through `encrypt` / `decrypt` above, which run it under `burn.content_burn`
     pub fn decrypt(
         enc: Enc,
         key: []const u8,
@@ -268,7 +270,7 @@ pub const cbc_hmac = struct {
         // the same buffer: `aescbc.encrypt` copies each input block into a
         // local register before it overwrites that same span of `out`.
         _ = aescbc.padPkcs7(plaintext, ciphertext_out[0..padded_len]) catch return error.BufferTooSmall;
-        _ = aescbc.encrypt(Aes, enc_key.*, iv[0..block_len].*, ciphertext_out[0..padded_len], ciphertext_out[0..padded_len]) catch |err| switch (err) {
+        _ = aescbc.encrypt(Aes, enc_key, iv[0..block_len].*, ciphertext_out[0..padded_len], ciphertext_out[0..padded_len]) catch |err| switch (err) {
             error.NotBlockAligned => unreachable, // padded_len is always block_len-aligned
             error.BufferTooSmall => return error.BufferTooSmall,
         };
@@ -315,7 +317,7 @@ pub const cbc_hmac = struct {
         // `error.AuthenticationFailed` as a tag mismatch here: a padding
         // error must stay indistinguishable from an authentication error (no
         // padding oracle).
-        _ = aescbc.decrypt(Aes, enc_key.*, iv[0..block_len].*, ciphertext, plaintext_out[0..ciphertext.len]) catch |err| switch (err) {
+        _ = aescbc.decrypt(Aes, enc_key, iv[0..block_len].*, ciphertext, plaintext_out[0..ciphertext.len]) catch |err| switch (err) {
             error.NotBlockAligned => unreachable, // checked above: ciphertext.len % block_len == 0
             error.BufferTooSmall => return error.BufferTooSmall,
         };

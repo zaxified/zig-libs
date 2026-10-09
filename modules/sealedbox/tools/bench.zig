@@ -32,7 +32,7 @@ fn doSeal(c: Ctx) usize {
     return c.msg.len + sealedbox.overhead;
 }
 fn doOpen(c: Ctx) usize {
-    sealedbox.open(c.out[0..c.msg.len], c.sealed, c.kp) catch unreachable;
+    sealedbox.open(c.out[0..c.msg.len], c.sealed, &c.kp) catch unreachable;
     return c.msg.len;
 }
 
@@ -68,7 +68,8 @@ pub fn main(init: std.process.Init) !u8 {
     const r = prng.random();
     var sk: [sealedbox.secret_length]u8 = undefined;
     r.bytes(&sk);
-    const kp = try sealedbox.keyPairFromSecretKey(sk);
+    var kp: sealedbox.KeyPair = undefined;
+    try sealedbox.keyPairFromSecretKey(&kp, &sk);
     const m64 = try arena.alloc(u8, 64);
     const m64k = try arena.alloc(u8, 65536);
     r.bytes(m64);
@@ -104,7 +105,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Interop before timing.
     const theirs = try dir.readFileAlloc(io, "sodium_sealed64.bin", arena, .limited(4096));
     var opened: [64]u8 = undefined;
-    sealedbox.open(&opened, theirs, kp) catch {
+    sealedbox.open(&opened, theirs, &kp) catch {
         std.debug.print("bench-sealedbox: FAILED -- a box libsodium sealed does not open here\n", .{});
         return 1;
     };

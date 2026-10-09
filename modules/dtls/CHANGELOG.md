@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING (dead-stack rule, CONVENTIONS §2.1.1, public building blocks):** `keyschedule.*`
+  now takes every secret by `*const [N]u8` and returns it through `out` pointers (first parameter after the
+  comptime types), no secret by value or return: `expandLabel(Hkdf, prefix, len, out, secret, label, ctx)`,
+  `hkdfExpandLabel(Hkdf, len, out, secret, label, ctx)`, `deriveSecret`/`earlySecret`/`binderKey`/`pskBinder`/
+  `deriveHandshakeSecret`/`deriveMasterSecret`/`deriveFinishedKey`/`computeFinishedVerifyData`/
+  `deriveSequenceNumberKey` (out first), `deriveHandshakeTrafficSecrets` / `deriveApplicationTrafficSecrets`
+  (`out_client, out_server` instead of a struct), `deriveTrafficKeyIv` (`out_key, out_iv`). Burned entry points
+  (8 KiB, one-shot): `expandLabel`, `earlySecret`, `pskBinder`, `deriveHandshakeSecret`, `deriveMasterSecret`,
+  `computeFinishedVerifyData` (the rest only chain these). `aead.Protection(A).protect/unprotect` take the key
+  as `*const [key_length]u8` and run under a 4 KiB per-record burn; `encryptSequenceNumberAes/ChaCha20`
+  (and the `decrypt*` aliases) are burned the same way. `certverify.sign` / `candidateSchemes`,
+  `Config.validate` and `Connection.clientInit/serverInit` carry `secret-api-ok` markers (their by-value
+  arguments hold only slices/pointers; `Connection` is returned before any key exists). No user outside the
+  module (rg modules/ example-apps, 2026-10-09). New probe `src/stackprobe2_test.zig` (testkit engine) over
+  all of the above; `check-secret-api` is at 0 for dtls.
+
 - **2026-10-09** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the key exchange, key schedule and
   record keys of `Connection` left copies on the dead stack. Measured BEFORE with the new full-handshake probe
   in `src/stackprobe_test.zig` (a client<->server handshake in static memory; one probe per public step:

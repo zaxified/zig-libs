@@ -38,3 +38,8 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 /// (`buildAuth`) in ReleaseFast at h = 4 (2026-10-09; the depth grows by only
 /// `n` bytes per tree level). 16 KiB is about twice the deepest.
 pub const burn_size = 16 * 1024;
+
+/// `prfKeygen` / `wotsSkGen`: one SHA-256 per chain start, called 67 times
+/// per WOTS+ key on the signing path -- tight, not yet measured
+/// (`stackprobe2_test.zig`, 2026-10-09).
+pub const prf_burn = 2 * 1024;

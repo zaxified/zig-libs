@@ -284,6 +284,7 @@ pub fn Suite(comptime kind: SuiteKind) type {
         /// `hash_to_curve_g1` is `bls12_381.hash_to_curve.hashToCurveG1` — full
         /// RFC 9380 hash-to-curve (hash-to-field, SSWU map, 11-isogeny,
         /// cofactor clear), already real (`bls12_381` Part 3).
+        // secret-api-ok: `seed_message` is the public generator seed (ciphersuite constant, draft §4.1.1)
         pub fn createGeneratorsWithSeed(allocator: std.mem.Allocator, count: usize, seed_message: []const u8) std.mem.Allocator.Error![]G1.Affine {
             const out = try allocator.alloc(G1.Affine, count);
             errdefer allocator.free(out);
@@ -365,6 +366,7 @@ pub fn Suite(comptime kind: SuiteKind) type {
         ///
         /// Verified byte-exact against draft-12 §8.4.5's ten published scalars
         /// (`kat_test.zig`), whose `SEED`/DST are exactly this pair.
+        // secret-api-ok: `seed` is the PUBLIC fixture seed of the spec's mocked RNG (test vectors only)
         pub fn mockedRandomScalars(comptime count: usize, seed: []const u8) [count]Fr {
             const v = Self.expandMessage(expand_len * count, seed, Self.mocked_scalars_dst);
             var out: [count]Fr = undefined;

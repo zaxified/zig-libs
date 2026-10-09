@@ -114,6 +114,7 @@ test {
     _ = connection;
     _ = @import("interop_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 test "meta.deps names the rsa module (rsa-sha2 host-key verification)" {

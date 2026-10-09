@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack burn: `sa.mac.compute` / `computeTwo` (and so `verify`, `verifyTwo`, `computeReplyMac`, `verifyReplyMac`; 4 KiB, per ASDU) and `sa.wrapSessionKeys` / `unwrapSessionKeys` (8 KiB, session-key change) run their bodies under `burn.run`; new `stackprobe_test.zig` on `testkit.stackprobe`. No signature change.
+
 - **2026-10-05** — Mutation run: 28 of 38 killed, 1 equivalent; 3 tests added
   and 6 existing tests extended (second start octet, continuation after FIN,
   the top bit of a MAC octet, session keys of the wrong unwrapped length, the

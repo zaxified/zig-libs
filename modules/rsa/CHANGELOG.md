@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** `selfSignedCert` takes the secret key by pointer (`sk: *const SecretKey`; call sites in x509, opcua, ocsp, saml, iec62351 migrated). `openssh.bcryptPbkdf` and `openssh.Blowfish.init` now run under a burn (`burn.kdf_burn`); `Blowfish.expandState` / `expand0State` and `eksBlowfishSetup` are no longer `pub` (nothing outside `openssh.zig` used them; `bcryptPbkdf` / `bcryptHash` / `init` are the entry points). Probe: `src/stackprobe2_test.zig`.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the new ReleaseFast stack
   probe (`src/stackprobe_test.zig`) found `p`, `q`, `d`, `dP`, `dQ`, `qInv` and the CRT halves of
   the operation in dead frames after every `signPkcs1v15`, `signPss` and `decryptOaep` — dozens of

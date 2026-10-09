@@ -25,9 +25,9 @@ const Aes256 = std.crypto.core.aes.Aes256;
 
 // Raw CBC (block-aligned input only) — the primitive.
 var ct: [32]u8 = undefined;
-_ = try aescbc.encrypt(Aes256, key, iv, plaintext_32_bytes, &ct);
+_ = try aescbc.encrypt(Aes256, &key, iv, plaintext_32_bytes, &ct);
 var pt: [32]u8 = undefined;
-_ = try aescbc.decrypt(Aes256, key, iv, &ct, &pt);
+_ = try aescbc.decrypt(Aes256, &key, iv, &ct, &pt);
 
 // PKCS#7 (RFC 5652 §6.3) — what jwe's AxxxCBC-HSxxx uses.
 var padded: [64]u8 = undefined;

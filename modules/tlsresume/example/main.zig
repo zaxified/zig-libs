@@ -45,7 +45,7 @@ pub fn main() !void {
     const stek_key = [_]u8{0x42} ** tlsresume.stek.key_length;
 
     var ring: tlsresume.StekRing(3) = .init();
-    ring.rotate(1, stek_key, @divTrunc(now_ms, 1000));
+    ring.rotate(1, &stek_key, @divTrunc(now_ms, 1000));
 
     // ── server: issue a ticket after a full handshake ───────────────────
     const State = tlsresume.select.SessionState(32);
@@ -75,10 +75,14 @@ pub fn main() !void {
     // The client derives the same PSK from the ticket_nonce it was given,
     // then the binder over its own truncated ClientHello — this module
     // never sees ClientHello bytes, only the already-hashed transcript.
-    const client_psk = tlsresume.psk.derivePsk(Hkdf, rfc8448_rms, &rfc8448_ticket_nonce, 32);
-    const client_es = tlsresume.psk.earlySecret(Hkdf, &client_psk);
-    const client_binder_key = tlsresume.psk.binderKey(Hkdf, client_es, &emptyTranscriptHash());
-    const binder = tlsresume.psk.computeBinder(Hkdf, Hmac, client_binder_key, &rfc8448_binder_hash);
+    var client_psk: [32]u8 = undefined;
+    var client_es: [32]u8 = undefined;
+    var client_binder_key: [32]u8 = undefined;
+    var binder: [Hmac.mac_length]u8 = undefined;
+    tlsresume.psk.derivePsk(Hkdf, 32, &client_psk, &rfc8448_rms, &rfc8448_ticket_nonce);
+    tlsresume.psk.earlySecret(Hkdf, &client_es, &client_psk);
+    tlsresume.psk.binderKey(Hkdf, &client_binder_key, &client_es, &emptyTranscriptHash());
+    tlsresume.psk.computeBinder(Hkdf, Hmac, &binder, &client_binder_key, &rfc8448_binder_hash);
 
     const actual_age_ms: u32 = 1_500; // time since issuance, per the client's clock
     const identities = [_]tlsresume.select.OfferedIdentity{.{
@@ -92,10 +96,12 @@ pub fn main() !void {
     defer strike.deinit();
     var open_scratch: [128]u8 = undefined;
 
-    const selection = try tlsresume.select.selectPsk(
+    var selection: tlsresume.select.Selection(32) = undefined;
+    try tlsresume.select.selectPsk(
         Hkdf,
         Hmac,
         tlsresume.StekRing(3),
+        &selection,
         &ring,
         &identities,
         &binders,
@@ -114,10 +120,12 @@ pub fn main() !void {
     // A second presentation of the SAME ticket is a replay — the single-use
     // strike register rejects it, and the engine falls back to a full
     // handshake rather than treating this as a fatal error.
+    var replayed: tlsresume.select.Selection(32) = undefined;
     if (tlsresume.select.selectPsk(
         Hkdf,
         Hmac,
         tlsresume.StekRing(3),
+        &replayed,
         &ring,
         &identities,
         &binders,

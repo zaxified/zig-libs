@@ -54,7 +54,8 @@ pub fn main() !void {
     // long-term keypair is rebuilt from just this stored secret, the way a
     // service loading its key from a config file would.
     const sk = hex32("3a7c910e3a7c910e3a7c910e3a7c910e3a7c910e3a7c910e3a7c910e3a7c910e");
-    const kp = try sealedbox.keyPairFromSecretKey(sk);
+    var kp: sealedbox.KeyPair = undefined;
+    try sealedbox.keyPairFromSecretKey(&kp, &sk);
 
     // PyNaCl's `PrivateKey(sk).public_key` for the exact same `sk` — an
     // independent (libsodium-backed) X25519 base-point multiplication. If
@@ -81,7 +82,7 @@ pub fn main() !void {
     try sealedbox.seal(io, &boxed1, msg1, kp.public_key);
 
     var opened1: [msg1.len]u8 = undefined;
-    try sealedbox.open(&opened1, &boxed1, kp);
+    try sealedbox.open(&opened1, &boxed1, &kp);
     try std.testing.expectEqualStrings(msg1, &opened1);
     std.debug.print("buffer API: round-tripped a {d}-byte message, no allocation\n", .{msg1.len});
 
@@ -96,7 +97,7 @@ pub fn main() !void {
     defer gpa.free(boxed2);
     must(boxed2.len == sealedbox.sealedLen(msg2.len), @src());
 
-    const opened2 = try sealedbox.openAlloc(gpa, boxed2, kp);
+    const opened2 = try sealedbox.openAlloc(gpa, boxed2, &kp);
     defer gpa.free(opened2);
     try std.testing.expectEqualStrings(msg2, opened2);
     std.debug.print("allocating API: round-tripped a {d}-byte message, freed cleanly\n", .{msg2.len});
@@ -111,7 +112,7 @@ pub fn main() !void {
     // Poly1305-tagged body.
     var tampered: [msg2.len + sealedbox.overhead]u8 = boxed2[0 .. msg2.len + sealedbox.overhead].*;
     tampered[tampered.len - 1] ^= 0x01;
-    if (sealedbox.openAlloc(gpa, &tampered, kp)) |_| {
+    if (sealedbox.openAlloc(gpa, &tampered, &kp)) |_| {
         unreachable; // a flipped tag-covered byte cannot survive verification
     } else |err| switch (err) {
         error.AuthenticationFailed => std.debug.print("tampered box: openAlloc -> AuthenticationFailed (expected), no leak\n", .{}),
@@ -120,9 +121,10 @@ pub fn main() !void {
 
     // ── negative path #2: wrong recipient keypair -> AuthenticationFailed ─
     const wrong_sk = [_]u8{0x5b} ** sealedbox.secret_length;
-    const wrong_kp = try sealedbox.keyPairFromSecretKey(wrong_sk);
+    var wrong_kp: sealedbox.KeyPair = undefined;
+    try sealedbox.keyPairFromSecretKey(&wrong_kp, &wrong_sk);
     var opened_wrong: [msg1.len]u8 = undefined;
-    if (sealedbox.open(&opened_wrong, &boxed1, wrong_kp)) |_| {
+    if (sealedbox.open(&opened_wrong, &boxed1, &wrong_kp)) |_| {
         unreachable;
     } else |err| switch (err) {
         error.AuthenticationFailed => std.debug.print("wrong keypair: open -> AuthenticationFailed (expected)\n", .{}),

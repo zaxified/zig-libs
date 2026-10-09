@@ -220,6 +220,10 @@ pub const RawSecretKey = struct {
 
     /// Serialize into `out` (secret: the plaintext key for `kdf_alg_none`).
     pub fn toBytes(self: *const RawSecretKey, out: *[wire_length]u8) void {
+        burn.run(burn.codec_burn, void, toBytesBody, .{ self, out });
+    }
+
+    fn toBytesBody(self: *const RawSecretKey, out: *[wire_length]u8) void {
         var i: usize = 0;
         out[i..][0..2].* = self.sig_alg;
         i += 2;
@@ -244,6 +248,10 @@ pub const RawSecretKey = struct {
 
     /// Parse `bytes` into `out` (every field is written).
     pub fn fromBytes(out: *RawSecretKey, bytes: *const [wire_length]u8) void {
+        burn.run(burn.codec_burn, void, fromBytesBody, .{ out, bytes });
+    }
+
+    fn fromBytesBody(out: *RawSecretKey, bytes: *const [wire_length]u8) void {
         var i: usize = 0;
         out.sig_alg = bytes[i..][0..2].*;
         i += 2;
@@ -538,6 +546,7 @@ pub fn writeSignatureFile(
 
 /// Format a key number as the uppercase 16-hex-digit key id the CLI prints
 /// (`le64_load(key_number)`, i.e. the bytes read as a little-endian u64).
+// secret-api-ok: a key number is a public identifier (printed by the CLI and stored in the public key and signature files), not key material
 pub fn formatKeyId(key_number: [key_number_length]u8) [16]u8 {
     const v = std.mem.readInt(u64, &key_number, .little);
     var out: [16]u8 = undefined;
@@ -1771,6 +1780,7 @@ test {
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 test "KeyPair.wipe destroys the long-term secret key, leaving the public half usable" {

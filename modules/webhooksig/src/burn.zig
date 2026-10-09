@@ -42,3 +42,7 @@ pub const mac_burn = 8 * 1024;
 /// Ed25519 key derivation and signing (3.7 / 4.4 KiB) and `standard.verify`
 /// with its `v1a` verify loop (8.6 KiB), same measurement.
 pub const ed_burn = 16 * 1024;
+
+/// `standard.encodeSecret`: base64 of the raw key into the caller's buffer
+/// (setup path, not per message; the body is a length check and one encode).
+pub const enc_burn = 2 * 1024;

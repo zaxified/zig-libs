@@ -70,3 +70,16 @@ pub const record_burn = 8 * 1024;
 
 /// `installApplicationKeys`: two HKDF expansions per direction (2.1 KiB).
 pub const install_burn = 8 * 1024;
+
+// Public `keyschedule` building blocks: one HKDF-Expand / Extract / HMAC with
+// a handful of 32..48-byte locals, one-shot per handshake step. Generous
+// margin, not a measured depth.
+
+/// `keyschedule.expandLabel` / `earlySecret` / `pskBinder` /
+/// `deriveHandshakeSecret` / `deriveMasterSecret` / `computeFinishedVerifyData`.
+pub const ks_burn = 8 * 1024;
+
+/// Per-record `aead.Protection.protect` / `unprotect` and the sequence-number
+/// masks: on the data path, so tight (AES-GCM / ChaCha20-Poly1305 plus a
+/// 16-byte block). Margin, not a measured depth.
+pub const aead_burn = 4 * 1024;

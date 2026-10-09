@@ -1262,6 +1262,7 @@ fn checkHostKeyAlgorithmAgreement(
 /// below call `checkHostKeyAlgorithmAgreement` first for that reason; the
 /// userauth caller does its own equivalent check (blob-type-vs-`algorithm`,
 /// then `algorithm`-vs-signature-blob) before ever reaching this function.
+// secret-api-ok: verifies with the PUBLIC host key; `key_type` is the algorithm name string, not a key.
 pub fn verifySignature(key_type: []const u8, k_s: []const u8, sig_blob: []const u8, h: []const u8) TransportError!void {
     var sr = SliceReader{ .b = sig_blob };
     const sig_algo = try sr.string();
@@ -2550,6 +2551,7 @@ pub const Transport = struct {
     }
 
     /// Our KEXINIT payload for `round` (caller frees).
+    // secret-api-ok: writes algorithm name-lists and a public random cookie; no key material.
     pub fn buildKexInit(t: *Transport, gpa: std.mem.Allocator, round: KexRound) TransportError![]u8 {
         var cookie: [16]u8 = undefined;
         t.entropy.fill(&cookie);

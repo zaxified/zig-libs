@@ -45,6 +45,7 @@ modules/signal/src/xeddsa.zig	2	0
 modules/snmp/src/usm.zig	5	0
 modules/spake2plus/src/root.zig	2	1
 modules/sphinx/src/core.zig	2	0
+modules/ssh/src/stackprobe2_test.zig	1	0
 modules/ssh/src/transport.zig	3	42
 modules/stun/src/root.zig	1	1
 modules/tenantkex/src/root.zig	1	4

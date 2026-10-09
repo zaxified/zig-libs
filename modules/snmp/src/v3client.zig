@@ -285,6 +285,7 @@ pub const V3Client = struct {
         context_name: []const u8 = &.{},
     };
 
+    // secret-api-ok: builds an empty client; the key buffers in `engine` stay undefined until `seedEngine` fills them in place (through the burned `usm.passwordToKey`), and `user` holds slices of the passwords, so a by-value copy copies pointers only.
     pub fn init(transport: Transport, user: User, options: Options) V3Client {
         return .{
             .transport = transport,
@@ -394,6 +395,7 @@ pub const V3Client = struct {
     }
 
     /// Overwrite the cached engine clock (for callers that keep their own).
+    // secret-api-ok: sets the clock fields of `engine` only; no key or password is read.
     pub fn setEngineTime(c: *V3Client, boots: u32, time: u32) void {
         c.engine.clock = timewin.EngineTimeState.init(boots, time);
     }
@@ -804,6 +806,7 @@ pub const Walker = struct {
 
     pub const WalkError = Error || error{ OidNotIncreasing, RequestFailed };
 
+    // secret-api-ok: iterator over `V3Client.getNext`; the keys are used only inside the burned usm/priv calls that request makes.
     pub fn next(w: *Walker) WalkError!?VarBind {
         if (w.finished) return null;
         const resp = try w.client.getNext(&.{w.current});

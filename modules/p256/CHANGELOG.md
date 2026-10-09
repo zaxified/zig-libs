@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — New `KeyPair.signerInto(out, key_pair, noise)`: the `Signer` holds the secret
+  key, and `signer` returns it by value, so the key sat in the caller's result slot (18 needle windows,
+  `stackprobe2_test.zig`). Additive; `signer` stays (std shape, now documented).
+- **2026-10-09** — **Additive API + burn:** `EcdsaP256Sha256.KeyPair.signer` now runs under a burn; new pointer twin `KeyPair.generateInto(out, io)` beside the std-shaped `generate` (which calls it). No signature changed. Probe: `src/stackprobe2_test.zig`.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the new ReleaseFast stack
   probe (`src/stackprobe_test.zig`; the nonce is solved from the returned signature, so std's own
   nonce is covered) found the secret key, the nonce `k`, `k⁻¹`, `r·d` and `e + r·d` in dead frames

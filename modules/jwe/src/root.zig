@@ -197,8 +197,10 @@ pub const KeyMaterial = union(enum) {
     symmetric: []const u8,
     /// RSA public key — `RSA-OAEP`/`RSA-OAEP-256` encrypt side.
     rsa_public: rsa.PublicKey,
-    /// RSA private key — `RSA-OAEP`/`RSA-OAEP-256` decrypt side.
-    rsa_private: rsa.SecretKey,
+    /// RSA private key — `RSA-OAEP`/`RSA-OAEP-256` decrypt side. Borrowed,
+    /// not copied: a by-value `rsa.SecretKey` would be duplicated into every
+    /// frame this union is passed through.
+    rsa_private: *const rsa.SecretKey,
     /// Password — every `PBES2-*` variant. Borrowed, not copied.
     password: []const u8,
     /// Recipient's static EC/OKP public key (P-256 or X25519) —
@@ -379,6 +381,7 @@ noinline fn ecdhesEncryptKey(
 /// for why a stateless RFC 7516 encoder cannot prevent this outright.
 ///
 /// `aad_extra` must be empty — see the module doc comment.
+// secret-api-ok: KeyMaterial holds only BORROWED slices / pointers (see its doc comment; `rsa_private` and `ec_private` are `*const`); a by-value copy copies a pointer, never key bytes
 pub fn encryptCompact(
     gpa: std.mem.Allocator,
     key_alg: Alg,
@@ -570,7 +573,20 @@ pub fn encryptCompact(
 /// Decrypt a compact-serialization JWE. Returns `gpa`-owned plaintext; free
 /// with `gpa`. Fails closed on anything malformed or unauthenticated —
 /// never partially trusts a token.
+///
+/// Burned (`burn.content_burn`): the unwrap / KDF / content-decryption frames
+/// run one frame down and are zeroed after (`stackprobe2_test.zig`).
+// secret-api-ok: KeyMaterial holds only BORROWED slices / pointers (see its doc comment); a by-value copy copies a pointer, never key bytes
 pub fn decryptCompact(
+    gpa: std.mem.Allocator,
+    key: KeyMaterial,
+    token: []const u8,
+    opts: DecryptOptions,
+) DecryptError![]u8 {
+    return burn.run(burn.content_burn, DecryptError![]u8, decryptCompactBody, .{ gpa, key, token, opts });
+}
+
+fn decryptCompactBody(
     gpa: std.mem.Allocator,
     key: KeyMaterial,
     token: []const u8,
@@ -742,7 +758,7 @@ fn unwrapCek(
             // the fallible unwrap call so a failed/rejected unwrap still
             // wipes whatever the RSA op wrote.
             defer std.crypto.secureZero(u8, &oaep_buf);
-            const got = try alg.rsaOaepUnwrap(&sk, hash, encrypted_key, &oaep_buf);
+            const got = try alg.rsaOaepUnwrap(sk, hash, encrypted_key, &oaep_buf);
             if (got.len != cek_len) return error.InvalidKey;
             @memcpy(cek, got[0..cek_len]);
         },
@@ -879,6 +895,7 @@ test {
     _ = ecdhes;
     _ = @import("kat_rfc7516.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 test "dir + A128GCM real round-trip" {
@@ -1661,7 +1678,7 @@ test "unwrapCek: wrapped CEKs of the wrong length and GCMKW iv/tag of the wrong 
     for ([_]usize{ 15, 17 }) |n| {
         var ek_buf: [max_encrypted_key_len]u8 = undefined;
         const ek = try alg.rsaOaepWrap(kp.public_key, .sha1, seededForTest(), cek17[0..n], &ek_buf);
-        try std.testing.expectError(error.InvalidKey, unwrapCek(rsa_parsed, .{ .rsa_private = kp.secret_key }, ek, &cek, 16, .{}));
+        try std.testing.expectError(error.InvalidKey, unwrapCek(rsa_parsed, .{ .rsa_private = &kp.secret_key }, ek, &cek, 16, .{}));
     }
 
     const kek = [_]u8{0x77} ** 16;

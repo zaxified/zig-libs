@@ -70,6 +70,7 @@ test {
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 test "meta names both RFC 7748 and RFC 8032" {

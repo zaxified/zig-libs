@@ -37,7 +37,7 @@ const tlsresume = @import("tlsresume");
 
 ```zig
 var ring = tlsresume.stek.DefaultRing.init(); // StekRing(3)
-ring.rotate(1, fresh_32_byte_key, now_s); // caller-supplied CSPRNG key
+ring.rotate(1, &fresh_32_byte_key, now_s); // caller-supplied CSPRNG key
 
 // Serialize the session state this ticket should restore (select.zig):
 const State = tlsresume.select.SessionState(32); // SHA-256 suite
@@ -70,8 +70,9 @@ const wire_bytes = try nst.encode(&wire_buf); // real today — send after the h
 const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
 const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 
-const result = try tlsresume.select.selectPsk(
-    Hkdf, Hmac, tlsresume.stek.DefaultRing, &ring,
+var result: tlsresume.select.Selection(32) = undefined;
+try tlsresume.select.selectPsk(
+    Hkdf, Hmac, tlsresume.stek.DefaultRing, &result, &ring,
     offered_identities, offered_binders,
     empty_transcript_hash, truncated_client_hello_transcript_hash,
     now_ms, freshness_window_ms, &open_scratch,
@@ -89,8 +90,9 @@ without it, RFC 8446 §8/§2.3):
 // One call: PSK -> early_secret -> client_early_traffic_secret -> key/iv.
 // The hash is of the COMPLETE ClientHello (binders included) — not the
 // truncated hash the binder uses.
-const ctx = tlsresume.EarlyDataContext(Hkdf, 16) // 16 = AES-128-GCM key len
-    .derive(&result.psk, complete_client_hello_transcript_hash);
+const Ctx = tlsresume.EarlyDataContext(Hkdf, 16); // 16 = AES-128-GCM key len
+var ctx: Ctx = undefined;
+Ctx.derive(&ctx, &result.psk, complete_client_hello_transcript_hash);
 // ctx.key / ctx.iv protect the client's early-data records (RFC 8446 §7.3;
 // per-record nonce = ctx.iv XOR left-padded sequence number, §5.3).
 ```

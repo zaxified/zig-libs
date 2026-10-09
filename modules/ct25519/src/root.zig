@@ -397,37 +397,73 @@ pub const X25519 = struct {
 
         /// Deterministically derive a key pair from a cryptographically
         /// secure secret seed — std's `generateDeterministic`, on the comb.
+        /// std's shape (qap's TLS shim swaps this type in for std's): the
+        /// seed goes in by value and the key pair comes back in an error
+        /// union, so the caller's frame keeps a copy of both. A caller that
+        /// owns its frame should use `generateDeterministicInto`.
+        // secret-api-ok: std.crypto.dh.X25519 shape (qap's TLS shim swaps this type in for std's); `generateDeterministicInto` is the pointer twin and the body runs under its burn
         pub fn generateDeterministic(seed: [seed_length]u8) IdentityElementError!KeyPair {
-            return .{
-                .public_key = try X25519.recoverPublicKey(seed),
-                .secret_key = seed,
-            };
+            var kp: KeyPair = undefined;
+            try generateDeterministicInto(&kp, &seed);
+            return kp;
+        }
+
+        /// `generateDeterministic` with the seed by pointer and the key pair
+        /// into `out` (zeroed on error); the body's frames are burned.
+        pub fn generateDeterministicInto(out: *KeyPair, seed: *const [seed_length]u8) IdentityElementError!void {
+            errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+            try X25519.recoverPublicKeyInto(&out.public_key, seed);
+            out.secret_key = seed.*;
         }
 
         /// Generate a new, random key pair.
+        // secret-api-ok: std.crypto.dh.X25519 shape (qap's TLS shim swaps this type in for std's); `generateInto` is the pointer twin
         pub fn generate(io: std.Io) KeyPair {
+            var kp: KeyPair = undefined;
+            generateInto(&kp, io);
+            return kp;
+        }
+
+        /// `generate` into `out`; the seed is burned with the body.
+        pub fn generateInto(out: *KeyPair, io: std.Io) void {
             var random_seed: [seed_length]u8 = undefined;
             defer std.crypto.secureZero(u8, &random_seed);
             while (true) {
                 io.random(&random_seed);
-                return generateDeterministic(random_seed) catch {
+                generateDeterministicInto(out, &random_seed) catch {
                     @branchHint(.unlikely);
                     continue;
                 };
+                return;
             }
         }
     };
 
     /// Compute the public key for a given private key — `clamp(sk)·B` as the
     /// Montgomery `u`-coordinate, byte-exact with std's `recoverPublicKey`.
+    // secret-api-ok: std.crypto.dh.X25519 shape (qap's TLS shim swaps this type in for std's); `recoverPublicKeyInto` is the pointer twin
     pub fn recoverPublicKey(secret_key: [secret_length]u8) IdentityElementError![public_length]u8 {
-        var sc = secret_key;
+        var out: [public_length]u8 = undefined;
+        try recoverPublicKeyInto(&out, &secret_key);
+        return out;
+    }
+
+    /// `recoverPublicKey` with the key by pointer and the public key into
+    /// `out`; the body's frames are burned (`stackprobe2_test.zig`).
+    pub fn recoverPublicKeyInto(out: *[public_length]u8, secret_key: *const [secret_length]u8) IdentityElementError!void {
+        const r = recoverPublicKeyUnburned(out, secret_key);
+        burn.stack(burn.x25519_base_burn);
+        return r;
+    }
+
+    noinline fn recoverPublicKeyUnburned(out: *[public_length]u8, secret_key: *const [secret_length]u8) IdentityElementError!void {
+        var sc = secret_key.*;
         defer std.crypto.secureZero(u8, &sc);
         Edwards25519.scalar.clamp(&sc);
         const q = combMulBase(&sc);
         // u = (1 + y) / (1 - y) with y = Y / Z, i.e. (Z + Y) / (Z - Y). No
         // identity branch: unreachable for a clamped scalar (see above).
-        return q.z.add(q.y).mul(q.z.sub(q.y).invert()).toBytes();
+        out.* = q.z.add(q.y).mul(q.z.sub(q.y).invert()).toBytes();
     }
 
     /// Compute the X25519 shared secret — byte-exact with std's `scalarmult`,
@@ -1184,6 +1220,7 @@ test {
     // Opt-in micro-benchmark (audit C9); skips unless CT25519_BENCH is set.
     _ = @import("bench.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 /// Deterministic scalars — this module has no RNG and its tests must be

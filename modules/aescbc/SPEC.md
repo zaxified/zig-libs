@@ -50,8 +50,8 @@ pub const block_len = 16;
 pub const Error = error{ NotBlockAligned, BufferTooSmall };
 pub const PaddingError = error{InvalidPadding};
 
-pub fn encrypt(comptime Aes: type, key: [Aes.key_bits / 8]u8, iv: [block_len]u8, plaintext: []const u8, out: []u8) Error!usize;
-pub fn decrypt(comptime Aes: type, key: [Aes.key_bits / 8]u8, iv: [block_len]u8, ciphertext: []const u8, out: []u8) Error!usize;
+pub fn encrypt(comptime Aes: type, key: *const [Aes.key_bits / 8]u8, iv: [block_len]u8, plaintext: []const u8, out: []u8) Error!usize;
+pub fn decrypt(comptime Aes: type, key: *const [Aes.key_bits / 8]u8, iv: [block_len]u8, ciphertext: []const u8, out: []u8) Error!usize;
 
 pub fn paddedLenPkcs7(msg_len: usize) usize;
 pub fn padPkcs7(msg: []const u8, out: []u8) error{BufferTooSmall}!usize;

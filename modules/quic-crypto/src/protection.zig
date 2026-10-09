@@ -24,6 +24,7 @@
 //! QUIC-shaped; see SPEC.md/NOTICE.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const chachapoly = @import("chachapoly");
 
 pub const ProtectionError = error{
@@ -86,7 +87,18 @@ pub fn Protection(comptime Aead: type) type {
         /// output replaces the payload on the wire; header protection (§5.4)
         /// is then applied on top by `headerprot.zig`.
         pub fn seal(
-            key: [key_length]u8,
+            key: *const [key_length]u8,
+            iv: [nonce_length]u8,
+            packet_number: u64,
+            header: []const u8,
+            payload: []const u8,
+            out: []u8,
+        ) ProtectionError!usize {
+            return burn.run(burn.packet_burn, ProtectionError!usize, sealBody, .{ key, iv, packet_number, header, payload, out });
+        }
+
+        fn sealBody(
+            key: *const [key_length]u8,
             iv: [nonce_length]u8,
             packet_number: u64,
             header: []const u8,
@@ -97,7 +109,7 @@ pub fn Protection(comptime Aead: type) type {
             if (out.len < total) return error.BufferTooShort;
             const npub = nonce(iv, packet_number);
             var tag: [tag_length]u8 = undefined;
-            Aead.encrypt(out[0..payload.len], &tag, payload, header, npub, key);
+            Aead.encrypt(out[0..payload.len], &tag, payload, header, npub, key.*);
             @memcpy(out[payload.len..][0..tag_length], &tag);
             return total;
         }
@@ -109,7 +121,18 @@ pub fn Protection(comptime Aead: type) type {
         /// `error.DecryptionFailed` — NEVER a panic, and via std AEAD's
         /// constant-time tag compare (no timing leak between failure modes).
         pub fn open(
-            key: [key_length]u8,
+            key: *const [key_length]u8,
+            iv: [nonce_length]u8,
+            packet_number: u64,
+            header: []const u8,
+            ciphertext: []const u8,
+            out: []u8,
+        ) ProtectionError!usize {
+            return burn.run(burn.packet_burn, ProtectionError!usize, openBody, .{ key, iv, packet_number, header, ciphertext, out });
+        }
+
+        fn openBody(
+            key: *const [key_length]u8,
             iv: [nonce_length]u8,
             packet_number: u64,
             header: []const u8,
@@ -122,7 +145,7 @@ pub fn Protection(comptime Aead: type) type {
             const npub = nonce(iv, packet_number);
             var tag: [tag_length]u8 = undefined;
             @memcpy(&tag, ciphertext[body_len..][0..tag_length]);
-            Aead.decrypt(out[0..body_len], ciphertext[0..body_len], tag, header, npub, key) catch
+            Aead.decrypt(out[0..body_len], ciphertext[0..body_len], tag, header, npub, key.*) catch
                 return error.DecryptionFailed;
             return body_len;
         }
@@ -261,15 +284,15 @@ test "differential: Protection is byte-identical under chachapoly and std, over 
 
     for (lens) |len| {
         for (pns) |pn| {
-            const n1 = try Ours.seal(rfc_a5_key, rfc_a5_iv, pn, &rfc_a5_header, payload[0..len], &ours);
-            const n2 = try Theirs.seal(rfc_a5_key, rfc_a5_iv, pn, &rfc_a5_header, payload[0..len], &theirs);
+            const n1 = try Ours.seal(&rfc_a5_key, rfc_a5_iv, pn, &rfc_a5_header, payload[0..len], &ours);
+            const n2 = try Theirs.seal(&rfc_a5_key, rfc_a5_iv, pn, &rfc_a5_header, payload[0..len], &theirs);
             try testing.expectEqual(n2, n1);
             try testing.expectEqualSlices(u8, theirs[0..n2], ours[0..n1]);
 
             // Cross-open: each implementation must accept the other's packet.
-            const m = try Ours.open(rfc_a5_key, rfc_a5_iv, pn, &rfc_a5_header, theirs[0..n2], &back);
+            const m = try Ours.open(&rfc_a5_key, rfc_a5_iv, pn, &rfc_a5_header, theirs[0..n2], &back);
             try testing.expectEqualSlices(u8, payload[0..len], back[0..m]);
-            const m2 = try Theirs.open(rfc_a5_key, rfc_a5_iv, pn, &rfc_a5_header, ours[0..n1], &back);
+            const m2 = try Theirs.open(&rfc_a5_key, rfc_a5_iv, pn, &rfc_a5_header, ours[0..n1], &back);
             try testing.expectEqualSlices(u8, payload[0..len], back[0..m2]);
         }
     }
@@ -290,39 +313,39 @@ test "Protection.nonce: App. A.2 client + A.5 chacha" {
 
 test "Protection.seal: App. A.3 server Initial byte-exact" {
     var out: [rfc_server_ct.len]u8 = undefined;
-    const n = try Protection(Aes128Gcm).seal(rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &rfc_server_payload, &out);
+    const n = try Protection(Aes128Gcm).seal(&rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &rfc_server_payload, &out);
     try testing.expectEqualSlices(u8, &rfc_server_ct, out[0..n]);
     // A.5 ChaCha20-Poly1305 short-header seal, byte-exact too.
     var out5: [rfc_a5_ct.len]u8 = undefined;
-    const n5 = try Protection(ChaCha20Poly1305).seal(rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &rfc_a5_header, &rfc_a5_plain, &out5);
+    const n5 = try Protection(ChaCha20Poly1305).seal(&rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &rfc_a5_header, &rfc_a5_plain, &out5);
     try testing.expectEqualSlices(u8, &rfc_a5_ct, out5[0..n5]);
 }
 
 test "Protection.open: App. A.3 round-trip + tamper->DecryptionFailed" {
     const P = Protection(Aes128Gcm);
     var back: [rfc_server_payload.len]u8 = undefined;
-    const n = try P.open(rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &rfc_server_ct, &back);
+    const n = try P.open(&rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &rfc_server_ct, &back);
     try testing.expectEqualSlices(u8, &rfc_server_payload, back[0..n]);
 
     // Tampering yields error.DecryptionFailed — never a panic.
     var t1 = rfc_server_ct;
     t1[0] ^= 1; // flip a ciphertext byte
-    try testing.expectError(error.DecryptionFailed, P.open(rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &t1, &back));
+    try testing.expectError(error.DecryptionFailed, P.open(&rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &t1, &back));
 
     var t2 = rfc_server_ct;
     t2[t2.len - 1] ^= 1; // flip a tag byte
-    try testing.expectError(error.DecryptionFailed, P.open(rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &t2, &back));
+    try testing.expectError(error.DecryptionFailed, P.open(&rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &t2, &back));
 
     var bad_header = rfc_server_header;
     bad_header[0] ^= 1;
-    try testing.expectError(error.DecryptionFailed, P.open(rfc_server_key, rfc_server_iv, rfc_server_pn, &bad_header, &rfc_server_ct, &back));
+    try testing.expectError(error.DecryptionFailed, P.open(&rfc_server_key, rfc_server_iv, rfc_server_pn, &bad_header, &rfc_server_ct, &back));
 
     // Wrong packet number => wrong nonce => open fails.
-    try testing.expectError(error.DecryptionFailed, P.open(rfc_server_key, rfc_server_iv, rfc_server_pn + 1, &rfc_server_header, &rfc_server_ct, &back));
+    try testing.expectError(error.DecryptionFailed, P.open(&rfc_server_key, rfc_server_iv, rfc_server_pn + 1, &rfc_server_header, &rfc_server_ct, &back));
 
     // Ciphertext shorter than the tag is a typed error, not a slice panic.
     const tiny = [_]u8{ 1, 2, 3 };
-    try testing.expectError(error.PacketTooShort, P.open(rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &tiny, &back));
+    try testing.expectError(error.PacketTooShort, P.open(&rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &tiny, &back));
 }
 
 test "Protection.open: App. A.5 ChaCha20-Poly1305 round-trip + tamper->DecryptionFailed" {
@@ -335,21 +358,21 @@ test "Protection.open: App. A.5 ChaCha20-Poly1305 round-trip + tamper->Decryptio
     // every test in this file.
     const P = Protection(ChaCha20Poly1305);
     var back: [rfc_a5_plain.len]u8 = undefined;
-    const n = try P.open(rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &rfc_a5_header, &rfc_a5_ct, &back);
+    const n = try P.open(&rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &rfc_a5_header, &rfc_a5_ct, &back);
     try testing.expectEqualSlices(u8, &rfc_a5_plain, back[0..n]);
 
     var t1 = rfc_a5_ct;
     t1[0] ^= 1; // flip a ciphertext byte
-    try testing.expectError(error.DecryptionFailed, P.open(rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &rfc_a5_header, &t1, &back));
+    try testing.expectError(error.DecryptionFailed, P.open(&rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &rfc_a5_header, &t1, &back));
 
     var t2 = rfc_a5_ct;
     t2[t2.len - 1] ^= 1; // flip a tag byte
-    try testing.expectError(error.DecryptionFailed, P.open(rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &rfc_a5_header, &t2, &back));
+    try testing.expectError(error.DecryptionFailed, P.open(&rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &rfc_a5_header, &t2, &back));
 
     var bad_header = rfc_a5_header;
     bad_header[0] ^= 1;
-    try testing.expectError(error.DecryptionFailed, P.open(rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &bad_header, &rfc_a5_ct, &back));
+    try testing.expectError(error.DecryptionFailed, P.open(&rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &bad_header, &rfc_a5_ct, &back));
 
     // Wrong packet number => wrong nonce => open fails.
-    try testing.expectError(error.DecryptionFailed, P.open(rfc_a5_key, rfc_a5_iv, rfc_a5_pn + 1, &rfc_a5_header, &rfc_a5_ct, &back));
+    try testing.expectError(error.DecryptionFailed, P.open(&rfc_a5_key, rfc_a5_iv, rfc_a5_pn + 1, &rfc_a5_header, &rfc_a5_ct, &back));
 }

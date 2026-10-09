@@ -76,6 +76,7 @@
 //! member).
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -899,6 +900,19 @@ pub fn deriveKey(
     label: KeyLabel,
     out: []u8,
 ) DeriveKeyError!void {
+    return burn.run(burn.derive_burn, DeriveKeyError!void, deriveKeyBody, .{ allocator, master_secret, master_salt, id, id_context, algorithm, label, out });
+}
+
+fn deriveKeyBody(
+    allocator: std.mem.Allocator,
+    master_secret: []const u8,
+    master_salt: []const u8,
+    id: []const u8,
+    id_context: ?[]const u8,
+    algorithm: Algorithm,
+    label: KeyLabel,
+    out: []u8,
+) DeriveKeyError!void {
     const info = try encodeInfo(allocator, id, id_context, algorithm, label, @intCast(out.len));
     defer allocator.free(info);
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
@@ -939,28 +953,37 @@ pub fn deriveContext(
     recipient_id: []const u8,
     algorithm: Algorithm,
 ) DeriveContextError!SecurityContext {
+    return burn.run(burn.derive_burn, DeriveContextError!SecurityContext, deriveContextBody, .{ allocator, master_secret, master_salt, id_context, sender_id, recipient_id, algorithm });
+}
+
+fn deriveContextBody(
+    allocator: std.mem.Allocator,
+    master_secret: []const u8,
+    master_salt: []const u8,
+    id_context: ?[]const u8,
+    sender_id: []const u8,
+    recipient_id: []const u8,
+    algorithm: Algorithm,
+) DeriveContextError!SecurityContext {
     var sender_key: [key_length]u8 = undefined;
-    try deriveKey(allocator, master_secret, master_salt, sender_id, id_context, algorithm, .key, &sender_key);
+    try deriveKeyBody(allocator, master_secret, master_salt, sender_id, id_context, algorithm, .key, &sender_key);
 
     var recipient_key: [key_length]u8 = undefined;
-    try deriveKey(allocator, master_secret, master_salt, recipient_id, id_context, algorithm, .key, &recipient_key);
+    try deriveKeyBody(allocator, master_secret, master_salt, recipient_id, id_context, algorithm, .key, &recipient_key);
 
     // Common IV: id is ALWAYS the empty byte string (§3.2.1), regardless
     // of either endpoint's Sender/Recipient ID.
     var common_iv: [nonce_length]u8 = undefined;
-    try deriveKey(allocator, master_secret, master_salt, &.{}, id_context, algorithm, .iv, &common_iv);
+    try deriveKeyBody(allocator, master_secret, master_salt, &.{}, id_context, algorithm, .iv, &common_iv);
 
     // The three derived values are copied into the returned context; the
     // stack locals must not stay behind as a second, unowned copy of key
-    // material, and neither may the frames `deriveKey` -> HKDF -> HMAC
-    // just vacated BELOW this one (audit F7 read the dead stack and found
-    // the Sender Key 2-4x there; wiping only the locals changed nothing,
-    // because every copy sat in std's frames). `scrubStackBelow` reoccupies
-    // that region with a frame of its own and zeroes it.
+    // material. The frames `deriveKeyBody` -> HKDF -> HMAC just vacated BELOW
+    // this one are zeroed by the entry point's burn (audit F7 read the dead
+    // stack and found the Sender Key 2-4x there; every copy sat in std's frames).
     defer std.crypto.secureZero(u8, &sender_key);
     defer std.crypto.secureZero(u8, &recipient_key);
     defer std.crypto.secureZero(u8, &common_iv);
-    defer scrubStackBelow();
 
     return .{
         .common = .{ .algorithm = algorithm, .common_iv = common_iv },
@@ -968,22 +991,6 @@ pub fn deriveContext(
         .recipient = .{ .id = recipient_id, .key = recipient_key },
     };
 }
-
-/// Zeroes a stretch of stack immediately below the caller's frame — the
-/// region the caller's own callees (std's HKDF/HMAC/AES frames) have just
-/// returned from, where they leave key schedules and expanded keys behind
-/// (`secureZero` on this module's locals cannot reach them: the audit's
-/// probe found the derived keys 2-4 times in exactly that region). The
-/// stores are volatile through `secureZero`, so the optimizer cannot drop
-/// them as dead. `noinline` so the frame really sits below the caller's.
-/// One-time cost at context derivation; not on the per-message path.
-noinline fn scrubStackBelow() void {
-    var pad: [scrub_bytes]u8 = undefined;
-    std.crypto.secureZero(u8, &pad);
-}
-/// Sized from the measured depth of `deriveKey`'s HKDF/HMAC-SHA-256 call
-/// chain in Debug (the deepest of the three modes) with headroom.
-const scrub_bytes: usize = 8 * 1024;
 
 pub const ComputeNonceError = error{
     IdTooLong,
@@ -1345,6 +1352,7 @@ pub fn unprotect(
 // tests into the test binary on its own — every submodule must be named
 // here too.
 test {
+    _ = @import("stackprobe_test.zig");
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
 }

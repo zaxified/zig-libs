@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). `dynamicTruncate` (the one HMAC call
+  under `hotp`/`hotpFmt`/`totp`/`totpFmt`/`totpVerify` and the `KeyUri` code methods) and
+  `otpauth.format` now run under a 4 KiB burn (`src/burn.zig`, per code, tight). No signature
+  changed: every secret already came in as a slice. `stackprobe_test.zig` probes them.
 - **2026-10-04** — Tests: first mutation run (57 mutants, 56 killed, 1 equivalent); 5 tests added in
   `otpauth.zig` (truncated `%3` label, `0x1F`/DEL rejection, `u64` multiply overflow, exact-fit
   buffer, `format` of `period = 86400` and `~`). No source change.
