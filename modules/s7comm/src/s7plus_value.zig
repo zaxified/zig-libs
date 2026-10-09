@@ -714,61 +714,77 @@ test "a valid small array round trips through skipValue" {
 /// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
 /// that drive the real `std.testing.Smith` over what it produces.
 const fuzzSeedInto = @import("testkit").fuzz.seedInto;
+const fz = @import("fuzz_test.zig");
+
+const ValueCorpus = struct {
+    raw: [6][256]u8 = undefined,
+    pre: [6][264]u8 = undefined,
+    seeds: [6][]const u8 = undefined,
+
+    fn build(self: *ValueCorpus) ![]const []const u8 {
+        var w: usize = 0;
+
+        // A bare scalar, and a real.
+        self.seeds[0] = fuzzSeedInto(&self.pre[0], try encodeScalar(.usint, i64, 42, &self.raw[0]));
+        self.seeds[1] = fuzzSeedInto(&self.pre[1], try encodeReal(1.5, &self.raw[1]));
+
+        // A struct wrapping a scalar, terminated.
+        w = 0;
+        self.raw[2][w] = 0;
+        w += 1;
+        self.raw[2][w] = @intFromEnum(Datatype.s7struct);
+        w += 1;
+        w += (try putVarUint(1, self.raw[2][w..])).len;
+        w += (try encodeScalar(.uint, i64, 0x0102, self.raw[2][w..])).len;
+        w += (try putVarUint(0, self.raw[2][w..])).len;
+        self.seeds[2] = fuzzSeedInto(&self.pre[2], self.raw[2][0..w]);
+
+        // A small array that is entirely present.
+        self.raw[3][0] = flag_array;
+        self.raw[3][1] = @intFromEnum(Datatype.byte);
+        w = 2;
+        w += (try putVarUint(3, self.raw[3][w..])).len;
+        self.raw[3][w] = 0xAA;
+        self.raw[3][w + 1] = 0xBB;
+        self.raw[3][w + 2] = 0xCC;
+        w += 3;
+        self.seeds[3] = fuzzSeedInto(&self.pre[3], self.raw[3][0..w]);
+
+        // An array count that overruns what follows.
+        self.raw[4][0] = flag_array;
+        self.raw[4][1] = @intFromEnum(Datatype.uint);
+        w = 2 + (try putVarUint(100, self.raw[4][2..])).len + 4;
+        self.seeds[4] = fuzzSeedInto(&self.pre[4], self.raw[4][0..w]);
+
+        // Structs nested past `max_depth`.
+        w = 0;
+        var i: usize = 0;
+        while (i < max_depth + 5) : (i += 1) {
+            self.raw[5][w] = 0;
+            w += 1;
+            self.raw[5][w] = @intFromEnum(Datatype.s7struct);
+            w += 1;
+            w += (try putVarUint(1, self.raw[5][w..])).len;
+        }
+        self.seeds[5] = fuzzSeedInto(&self.pre[5], self.raw[5][0..w]);
+
+        return &self.seeds;
+    }
+};
 
 test "fuzz: value walker never panics or hangs" {
-    var raw: [6][256]u8 = undefined;
-    var pre: [6][264]u8 = undefined;
-    var seeds: [6][]const u8 = undefined;
-    var w: usize = 0;
-
-    // A bare scalar, and a real.
-    seeds[0] = fuzzSeedInto(&pre[0], try encodeScalar(.usint, i64, 42, &raw[0]));
-    seeds[1] = fuzzSeedInto(&pre[1], try encodeReal(1.5, &raw[1]));
-
-    // A struct wrapping a scalar, terminated.
-    w = 0;
-    raw[2][w] = 0;
-    w += 1;
-    raw[2][w] = @intFromEnum(Datatype.s7struct);
-    w += 1;
-    w += (try putVarUint(1, raw[2][w..])).len;
-    w += (try encodeScalar(.uint, i64, 0x0102, raw[2][w..])).len;
-    w += (try putVarUint(0, raw[2][w..])).len;
-    seeds[2] = fuzzSeedInto(&pre[2], raw[2][0..w]);
-
-    // A small array that is entirely present.
-    raw[3][0] = flag_array;
-    raw[3][1] = @intFromEnum(Datatype.byte);
-    w = 2;
-    w += (try putVarUint(3, raw[3][w..])).len;
-    raw[3][w] = 0xAA;
-    raw[3][w + 1] = 0xBB;
-    raw[3][w + 2] = 0xCC;
-    w += 3;
-    seeds[3] = fuzzSeedInto(&pre[3], raw[3][0..w]);
-
-    // An array count that overruns what follows.
-    raw[4][0] = flag_array;
-    raw[4][1] = @intFromEnum(Datatype.uint);
-    w = 2 + (try putVarUint(100, raw[4][2..])).len + 4;
-    seeds[4] = fuzzSeedInto(&pre[4], raw[4][0..w]);
-
-    // Structs nested past `max_depth`.
-    w = 0;
-    var i: usize = 0;
-    while (i < max_depth + 5) : (i += 1) {
-        raw[5][w] = 0;
-        w += 1;
-        raw[5][w] = @intFromEnum(Datatype.s7struct);
-        w += 1;
-        w += (try putVarUint(1, raw[5][w..])).len;
-    }
-    seeds[5] = fuzzSeedInto(&pre[5], raw[5][0..w]);
-
-    try std.testing.fuzz({}, fuzzValue, .{ .corpus = &seeds });
+    var corpus: ValueCorpus = .{};
+    try std.testing.fuzz({}, fuzzValueSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzValue(_: void, smith: *std.testing.Smith) !void {
+const fuzzValueMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzValueSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzValue(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzValue(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length;
     // the ranged length was 0 for every seed and `skipValue` was handed an
@@ -776,12 +792,23 @@ fn fuzzValue(_: void, smith: *std.testing.Smith) !void {
     // **0 of 6 non-empty and 0 that `skipValue` accepted before, 6 of 6
     // non-empty and 4 accepted after** — the other two are the overrunning
     // array count and the over-deep nest, which must be refused.
-    const len: usize = smith.slice(&buf);
+    var corpus: ValueCorpus = .{};
+    const len: usize = fz.drawInput(S, src, &buf, try corpus.build());
+    fuzzValueMark.mark(.ran);
+    if (len != 0) fuzzValueMark.mark(.nonempty);
     var cur = Cursor{ .bytes = buf[0..len] };
     // Either it validates a prefix as a value (consuming no more than present)
     // or it returns a typed error. Never a panic, never past the buffer.
     skipValueDefaultBudget(&cur, max_depth) catch return;
     try testing.expect(cur.pos <= len);
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzValue)" {
+    try fz.fuzz_driver.run(fuzzValue, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-s7plus_value-value" });
+}
+
+test "fuzz harness: fuzzValue, 400 seeds, reaches every outcome" {
+    try fuzzValueMark.reach(fuzzValue, "s7comm-s7plus_value-value", 400);
 }
 
 /// A `Smith` seed for `fuzzVar`, from the hex of the varint octets.
@@ -815,15 +842,24 @@ const varint_seeds = [_][]const u8{
 };
 
 test "fuzz: varint decoders never panic" {
-    try std.testing.fuzz({}, fuzzVar, .{ .corpus = &varint_seeds });
+    try std.testing.fuzz({}, fuzzVarSmith, .{ .corpus = &varint_seeds });
 }
 
-fn fuzzVar(_: void, smith: *std.testing.Smith) !void {
+const fuzzVarMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzVarSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzVar(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzVar(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [16]u8 = undefined;
     // ⚠ See `fuzzValue`. Measured on 2026-09-06 over `varint_seeds`: **0 of 11
     // non-empty and 0 that decoded before, 11 of 11 non-empty and 8 that
     // decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &varint_seeds);
+    fuzzVarMark.mark(.ran);
+    if (len != 0) fuzzVarMark.mark(.nonempty);
     if (getVarUint(u64, buf[0..len], 10)) |r| {
         try testing.expect(r.len <= len);
         // Re-encoding a decoded value and decoding again is a fixed point
@@ -838,4 +874,12 @@ fn fuzzVar(_: void, smith: *std.testing.Smith) !void {
         const again = try putVarInt(r.value, &round);
         try testing.expectEqual(r.value, (try getVarInt(i64, again, 10)).value);
     } else |_| {}
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzVar)" {
+    try fz.fuzz_driver.run(fuzzVar, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-s7plus_value-var" });
+}
+
+test "fuzz harness: fuzzVar, 400 seeds, reaches every outcome" {
+    try fuzzVarMark.reach(fuzzVar, "s7comm-s7plus_value-var", 400);
 }

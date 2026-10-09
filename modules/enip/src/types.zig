@@ -656,6 +656,7 @@ test "a write of a structure carries its handle" {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// Tag payloads: a two-octet type code and its value, which is what `TagData`
 /// and `WriteTagRequest` both read, plus the bare values `decodeValue` takes.
@@ -677,10 +678,17 @@ const type_seeds = [_][]const u8{
 };
 
 test "fuzz: value and tag payload decoding never panics" {
-    try std.testing.fuzz({}, fuzzTypes, .{ .corpus = &type_seeds });
+    try std.testing.fuzz({}, fuzzTypesSmith, .{ .corpus = &type_seeds });
 }
 
-fn fuzzTypes(_: void, smith: *std.testing.Smith) !void {
+const fuzzTypesMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzTypesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzTypes(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzTypes(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -690,12 +698,14 @@ fn fuzzTypes(_: void, smith: *std.testing.Smith) !void {
     // non-empty, one single (payload, type code) pair, and 0 that `TagData`
     // accepted before; 14 of 14 non-empty, 14 distinct pairs and 14 accepted
     // after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &type_seeds);
+    fuzzTypesMark.mark(.ran);
+    if (len != 0) fuzzTypesMark.mark(.nonempty);
     // The type code follows the payload and is drawn with `value(u64)`. A
     // ranged draw over the WHOLE `u16` range does contain the word it reads
     // whenever that word happens to be below 65536, so this one was not
     // hopeless — but `bytes` had already emptied the seed, so it was 0 anyway.
-    const code: u16 = @truncate(smith.value(u64));
+    const code: u16 = @truncate(src.value(u64));
     const t: DataType = @enumFromInt(code);
     _ = decodeValue(t, buf[0..len]) catch {};
 
@@ -717,4 +727,12 @@ fn fuzzTypes(_: void, smith: *std.testing.Smith) !void {
     } else |_| {}
     _ = ReadTagRequest.decode(buf[0..len]) catch {};
     _ = ReadTagFragmentedRequest.decode(buf[0..len]) catch {};
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzTypes)" {
+    try fz.fuzz_driver.run(fuzzTypes, .{ .prefix = "ENIP_FUZZ", .name = "enip-types-types" });
+}
+
+test "fuzz harness: fuzzTypes, 400 seeds, reaches every outcome" {
+    try fuzzTypesMark.reach(fuzzTypes, "enip-types-types", 400);
 }

@@ -669,6 +669,7 @@ test "hostile: truncated integer wider than the target type is rejected" {
 /// sequence of u64 words nobody can read. Under `--fuzz` the fuzzer still
 /// drives every choice, because it drives the slice.
 const Script = @import("testkit").fuzz.Cursor;
+const fz = @import("fuzz_test.zig");
 
 /// The body of `fuzzParseStream`, factored out so the harness and the corpus
 /// guard build the SAME stream from the same octets. A guard measuring a
@@ -746,11 +747,17 @@ const stream_seeds = [_][]const u8{
 };
 
 test "fuzz: parseStream never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseStream, .{ .corpus = &stream_seeds });
+    try testing.fuzz({}, fuzzParseStreamSmith, .{ .corpus = &stream_seeds });
 }
 
-fn fuzzParseStream(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+const fuzzParseStreamMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzParseStreamSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseStream(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzParseStream(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const allocator = gpa;
     // ⚠ One `smith.slice`, then the octets say what happens — see `Script`
     // above for the R1 collapse this replaces. Measured 2026-09-07 over the
     // corpus below: **one two-octet stream (a single empty type-0 record) on
@@ -758,7 +765,9 @@ fn fuzzParseStream(_: void, smith: *std.testing.Smith) !void {
     // 5 records yielded after.** The "before" figure is pinned executably by
     // the corpus guard's last two lines.
     var script: [512]u8 = undefined;
-    const n: usize = smith.slice(&script);
+    const n: usize = fz.drawInput(S, src, &script, &stream_seeds);
+    fuzzParseStreamMark.mark(.ran);
+    if (n != 0) fuzzParseStreamMark.mark(.nonempty);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     _ = buildStream(allocator, script[0..n], &buf) catch return;
@@ -766,6 +775,14 @@ fn fuzzParseStream(_: void, smith: *std.testing.Smith) !void {
     const known_types = [_]u64{ 0, 1, 2, 3, 254 };
     var parsed = parseStream(allocator, buf.items, &known_types) catch return;
     defer parsed.deinit(allocator);
+}
+
+test "fuzz driver: LNWIRE_FUZZ (fuzzParseStream)" {
+    try fz.fuzz_driver.run(fuzzParseStream, .{ .prefix = "LNWIRE_FUZZ", .name = "lnwire-tlv-parseStream" });
+}
+
+test "fuzz harness: fuzzParseStream, 400 seeds, reaches every outcome" {
+    try fuzzParseStreamMark.reach(fuzzParseStream, "lnwire-tlv-parseStream", 400);
 }
 
 test "corpus: every stream script builds a distinct stream, and the records are pinned" {

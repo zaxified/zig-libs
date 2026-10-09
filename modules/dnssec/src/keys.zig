@@ -147,6 +147,7 @@ pub fn verifySignature(algorithm: u8, key: DecodedKey, signed_data: []const u8, 
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 test "decodeRsaKey: short exponent-length form" {
     // e_len=1(0x01), e=0x03, then a tiny (too-small-for-real-use but
@@ -320,14 +321,32 @@ const KeyCorpus = struct {
 
 test "fuzz: decodePublicKey never panics on arbitrary bytes/algorithm" {
     var corpus: KeyCorpus = .{};
-    try testing.fuzz({}, fuzzDecodePublicKey, .{ .corpus = corpus.build() });
+    try testing.fuzz({}, fuzzDecodePublicKeySmith, .{ .corpus = corpus.build() });
 }
 
-fn fuzzDecodePublicKey(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodePublicKeyMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodePublicKeySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecodePublicKey(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecodePublicKey(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: KeyCorpus = .{};
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, corpus.build());
+    fuzzDecodePublicKeyMark.mark(.ran);
+    if (len != 0) fuzzDecodePublicKeyMark.mark(.nonempty);
     if (len == 0) return;
     _ = decodePublicKey(buf[0], buf[1..len]) catch return;
+}
+
+test "fuzz driver: DNSSEC_FUZZ (fuzzDecodePublicKey)" {
+    try fz.fuzz_driver.run(fuzzDecodePublicKey, .{ .prefix = "DNSSEC_FUZZ", .name = "dnssec-keys-decodePublicKey" });
+}
+
+test "fuzz harness: fuzzDecodePublicKey, 400 seeds, reaches every outcome" {
+    try fuzzDecodePublicKeyMark.reach(fuzzDecodePublicKey, "dnssec-keys-DecodePublicKey", 400);
 }
 
 test "corpus: every key seed reaches decodePublicKey, and the families decoded are pinned" {

@@ -339,6 +339,7 @@ const testing = std.testing;
 /// u32 length first, so a raw frame would arrive minus its own first four
 /// octets. See `testkit/src/fuzz.zig` for the two other hazards.
 const seed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 test "U-format round-trip for all six functions" {
     const cases = [_]struct { f: UFunction, hex: []const u8 }{
@@ -508,10 +509,17 @@ const decode_seeds = [_][]const u8{
 };
 
 test "fuzz: apci decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [max_apdu_len + 8]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -520,12 +528,22 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // time, with the frame sitting unread in `buf`. Measured 2026-09-07 over
     // the corpus above: **0 of 19 non-empty and 0 decoded before, 19 of 19
     // non-empty and 6 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &decode_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     const apdu = decode(buf[0..len]) catch return;
     // Anything that decodes must re-encode to the very same octets.
     var round: [max_apdu_len]u8 = undefined;
     const again = encode(apdu.control, apdu.asdu, &round) catch return;
     try testing.expectEqualSlices(u8, buf[0..apdu.len], again);
+}
+
+test "fuzz driver: IEC104_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "IEC104_FUZZ", .name = "iec104-apci-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "iec104-apci-decode", 400);
 }
 
 test "corpus: every APDU seed reaches the decoder, and the accepted count is pinned" {
@@ -567,10 +585,17 @@ const framer_seeds = [_][]const u8{
 };
 
 test "fuzz: framer never panics or hangs on arbitrary stream bytes" {
-    try std.testing.fuzz({}, fuzzFramer, .{ .corpus = &framer_seeds });
+    try std.testing.fuzz({}, fuzzFramerSmith, .{ .corpus = &framer_seeds });
 }
 
-fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
+const fuzzFramerMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzFramerSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFramer(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzFramer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var input: [512]u8 = undefined;
     // ⚠ Same defect as `fuzzDecode` above, and worse: `len` never touched the
     // buffer at all — it was the bound of the loop that feeds it. `len` was 0,
@@ -579,7 +604,9 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
     // `check-fuzz-reach` only learned to see that shape on 2026-09-07.
     // Measured over the corpus above: **0 of 8 seeds reached `feed` and 0
     // frames were yielded before, 8 of 8 and 13 frames after.**
-    const len: usize = smith.slice(&input);
+    const len: usize = fz.drawInput(S, src, &input, &framer_seeds);
+    fuzzFramerMark.mark(.ran);
+    if (len != 0) fuzzFramerMark.mark(.nonempty);
     var storage: [max_apdu_len * 2]u8 = undefined;
     var f = Framer.init(&storage);
     var off: usize = 0;
@@ -597,6 +624,14 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
             if (got == null) break;
         }
     }
+}
+
+test "fuzz driver: IEC104_FUZZ (fuzzFramer)" {
+    try fz.fuzz_driver.run(fuzzFramer, .{ .prefix = "IEC104_FUZZ", .name = "iec104-apci-framer" });
+}
+
+test "fuzz harness: fuzzFramer, 400 seeds, reaches every outcome" {
+    try fuzzFramerMark.reach(fuzzFramer, "iec104-apci-framer", 400);
 }
 
 test "corpus: every stream seed reaches feed, and the frames yielded are pinned" {

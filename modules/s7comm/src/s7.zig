@@ -405,6 +405,7 @@ test "encode derives the length fields from the slices" {
 /// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
 /// that drive the real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// One PDU per ROSCTR `decode` accepts, and every rejection the tests pin.
 const s7_seeds = [_][]const u8{
@@ -424,10 +425,17 @@ const s7_seeds = [_][]const u8{
 };
 
 test "fuzz: s7 decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &s7_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &s7_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -435,9 +443,19 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever saw the empty
     // input. Measured on 2026-09-06 over the corpus above: **0 of 13
     // non-empty and 0 decoded before, 13 of 13 non-empty and 4 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &s7_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     const pdu = decode(buf[0..len]) catch return;
     var round: [512]u8 = undefined;
     const again = try encode(pdu.header, pdu.parameters, pdu.data, &round);
     try testing.expectEqualSlices(u8, buf[0..len], again);
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-s7-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "s7comm-s7-decode", 400);
 }

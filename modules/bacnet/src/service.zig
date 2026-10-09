@@ -1419,6 +1419,7 @@ fn fuzzRawSeed(comptime h: []const u8) []const u8 {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// One real body per decoder this harness calls, in the same hex spelling the
 /// tests above use, plus the two RPM iterator shapes and a truncation.
@@ -1445,10 +1446,17 @@ const service_seeds = [_][]const u8{
 };
 
 test "fuzz: service decoders never crash on arbitrary bodies" {
-    try std.testing.fuzz({}, fuzzServices, .{ .corpus = &service_seeds });
+    try std.testing.fuzz({}, fuzzServicesSmith, .{ .corpus = &service_seeds });
 }
 
-fn fuzzServices(_: void, smith: *std.testing.Smith) !void {
+const fuzzServicesMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzServicesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzServices(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzServices(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [192]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and a ranged draw then
@@ -1462,7 +1470,9 @@ fn fuzzServices(_: void, smith: *std.testing.Smith) !void {
     // `WhoIs.decode("")` is legal — it is the unrestricted Who-Is — so the
     // collapsed harness scored 19 of 19 "accepted" while carrying exactly one
     // distinct input. An acceptance rate can be 100 % with no reach at all.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &service_seeds);
+    fuzzServicesMark.mark(.ran);
+    if (len != 0) fuzzServicesMark.mark(.nonempty);
     const data = buf[0..len];
 
     _ = WhoIs.decode(data) catch {};
@@ -1497,6 +1507,14 @@ fn fuzzServices(_: void, smith: *std.testing.Smith) !void {
             _ = (els.next() catch break) orelse break;
         }
     }
+}
+
+test "fuzz driver: BACNET_FUZZ (fuzzServices)" {
+    try fz.fuzz_driver.run(fuzzServices, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-service-services" });
+}
+
+test "fuzz harness: fuzzServices, 400 seeds, reaches every outcome" {
+    try fuzzServicesMark.reach(fuzzServices, "bacnet-service-services", 400);
 }
 
 // ── a structure-aware harness for the wire-integer sites ───────────────────
@@ -1576,10 +1594,17 @@ const integer_seeds = [_][]const u8{
 };
 
 test "fuzz: a wire integer of any width never truncates into a service field" {
-    try std.testing.fuzz({}, fuzzServiceIntegers, .{ .corpus = &integer_seeds });
+    try std.testing.fuzz({}, fuzzServiceIntegersSmith, .{ .corpus = &integer_seeds });
 }
 
-fn fuzzServiceIntegers(_: void, smith: *std.testing.Smith) !void {
+const fuzzServiceIntegersMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzServiceIntegersSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzServiceIntegers(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzServiceIntegers(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var digits: [8]u8 = undefined;
     // ⚠ `bytes` followed by `valueRangeAtMost(u8, 1, 8)` drew nothing: `bytes`
     // ate the seed and the ranged draw returned its MINIMUM, so `width` was 1
@@ -1592,9 +1617,11 @@ fn fuzzServiceIntegers(_: void, smith: *std.testing.Smith) !void {
     // `digits`: `bytes` stops at 8 octets and the ranged draw then finds a full
     // word left and occasionally lands inside its range. With no corpus at all
     // — which is what this harness had — it is exactly one pair.
-    const width: usize = @max(1, smith.slice(&digits));
+    const width: usize = @max(1, fz.drawInput(S, src, &digits, &integer_seeds));
+    fuzzServiceIntegersMark.mark(.ran);
+    if (width != 0) fuzzServiceIntegersMark.mark(.nonempty);
     const int = digits[0..width];
-    const which: u8 = @intCast(smith.value(u64) % 19);
+    const which: u8 = @intCast(src.value(u64) % 19);
 
     const oid = [_]u8{ 0x00, 0x00, 0x00, 0x05 };
     const present_value = [_]u8{0x55};
@@ -1730,4 +1757,12 @@ fn fuzzServiceIntegers(_: void, smith: *std.testing.Smith) !void {
             }
         },
     }
+}
+
+test "fuzz driver: BACNET_FUZZ (fuzzServiceIntegers)" {
+    try fz.fuzz_driver.run(fuzzServiceIntegers, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-service-serviceIntegers" });
+}
+
+test "fuzz harness: fuzzServiceIntegers, 400 seeds, reaches every outcome" {
+    try fuzzServiceIntegersMark.reach(fuzzServiceIntegers, "bacnet-service-serviceIntegers", 400);
 }

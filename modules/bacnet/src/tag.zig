@@ -1743,6 +1743,7 @@ test "decoder: hostile primitive payloads" {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seed;
+const fz = @import("fuzz_test.zig");
 
 /// Tag streams: one per application class the reader decodes, the bracket
 /// shapes `openedBlock` walks, and the two overlong forms the tests pin.
@@ -1781,16 +1782,25 @@ const header_seeds = [_][]const u8{
 };
 
 test "fuzz: tag skipping never crashes, hangs or stalls" {
-    try std.testing.fuzz({}, fuzzSkip, .{ .corpus = &tag_seeds });
+    try std.testing.fuzz({}, fuzzSkipSmith, .{ .corpus = &tag_seeds });
 }
 
-fn fuzzSkip(_: void, smith: *std.testing.Smith) !void {
+const fuzzSkipMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzSkipSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSkip(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzSkip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length; the
     // ranged length was 0 for every seed. Measured on 2026-09-06 over
     // `tag_seeds`: **0 of 13 non-empty and 0 whose first tag `skip` accepted
     // before; 13 of 13 non-empty and 11 accepted after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &tag_seeds);
+    fuzzSkipMark.mark(.ran);
+    if (len != 0) fuzzSkipMark.mark(.nonempty);
     var r = Reader.init(buf[0..len]);
     var guard: usize = 0;
     while (!r.atEnd() and guard < 4096) : (guard += 1) {
@@ -1802,14 +1812,31 @@ fn fuzzSkip(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
-test "fuzz: application values never crash the decoder" {
-    try std.testing.fuzz({}, fuzzAppValue, .{ .corpus = &tag_seeds });
+test "fuzz driver: BACNET_FUZZ (fuzzSkip)" {
+    try fz.fuzz_driver.run(fuzzSkip, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-tag-skip" });
 }
 
-fn fuzzAppValue(_: void, smith: *std.testing.Smith) !void {
+test "fuzz harness: fuzzSkip, 400 seeds, reaches every outcome" {
+    try fuzzSkipMark.reach(fuzzSkip, "bacnet-tag-skip", 400);
+}
+
+test "fuzz: application values never crash the decoder" {
+    try std.testing.fuzz({}, fuzzAppValueSmith, .{ .corpus = &tag_seeds });
+}
+
+const fuzzAppValueMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzAppValueSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzAppValue(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzAppValue(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ See `fuzzSkip`: `bytes` then a ranged length always yielded 0.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &tag_seeds);
+    fuzzAppValueMark.mark(.ran);
+    if (len != 0) fuzzAppValueMark.mark(.nonempty);
     var r = Reader.init(buf[0..len]);
     var guard: usize = 0;
     while (!r.atEnd() and guard < 4096) : (guard += 1) {
@@ -1819,8 +1846,16 @@ fn fuzzAppValue(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+test "fuzz driver: BACNET_FUZZ (fuzzAppValue)" {
+    try fz.fuzz_driver.run(fuzzAppValue, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-tag-appValue" });
+}
+
+test "fuzz harness: fuzzAppValue, 400 seeds, reaches every outcome" {
+    try fuzzAppValueMark.reach(fuzzAppValue, "bacnet-tag-appValue", 400);
+}
+
 test "fuzz: openedBlock returns a sub-slice of its input or nothing" {
-    try std.testing.fuzz({}, fuzzOpenedBlock, .{ .corpus = &tag_seeds });
+    try std.testing.fuzz({}, fuzzOpenedBlockSmith, .{ .corpus = &tag_seeds });
 }
 
 /// W2-05 lived through a clean coverage-guided sweep because `openedBlock` was
@@ -1829,10 +1864,19 @@ test "fuzz: openedBlock returns a sub-slice of its input or nothing" {
 /// The property that would have caught it is the one `sc.zig`'s harness
 /// already asserts for its own decode — a borrowed slice must lie inside the
 /// buffer it was borrowed from.
-fn fuzzOpenedBlock(_: void, smith: *std.testing.Smith) !void {
+const fuzzOpenedBlockMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzOpenedBlockSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzOpenedBlock(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzOpenedBlock(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ See `fuzzSkip`: `bytes` then a ranged length always yielded 0.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &tag_seeds);
+    fuzzOpenedBlockMark.mark(.ran);
+    if (len != 0) fuzzOpenedBlockMark.mark(.nonempty);
     const input = buf[0..len];
     // Every bracket number a service decoder in this module actually opens,
     // plus one extended-form number, so a closing bracket of a *different*
@@ -1852,11 +1896,26 @@ fn fuzzOpenedBlock(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
-test "fuzz: every canonically decoded header re-encodes to the same octets" {
-    try std.testing.fuzz({}, fuzzHeaderRoundTrip, .{ .corpus = &header_seeds });
+test "fuzz driver: BACNET_FUZZ (fuzzOpenedBlock)" {
+    try fz.fuzz_driver.run(fuzzOpenedBlock, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-tag-openedBlock" });
 }
 
-fn fuzzHeaderRoundTrip(_: void, smith: *std.testing.Smith) !void {
+test "fuzz harness: fuzzOpenedBlock, 400 seeds, reaches every outcome" {
+    try fuzzOpenedBlockMark.reach(fuzzOpenedBlock, "bacnet-tag-openedBlock", 400);
+}
+
+test "fuzz: every canonically decoded header re-encodes to the same octets" {
+    try std.testing.fuzz({}, fuzzHeaderRoundTripSmith, .{ .corpus = &header_seeds });
+}
+
+const fuzzHeaderRoundTripMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzHeaderRoundTripSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzHeaderRoundTrip(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzHeaderRoundTrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [max_header_len]u8 = undefined;
     // ⚠ See `fuzzSkip`. This one takes `header_seeds`, not `tag_seeds`:
     // `Smith.slice` returns 0 when the seed's declared length exceeds the
@@ -1865,7 +1924,9 @@ fn fuzzHeaderRoundTrip(_: void, smith: *std.testing.Smith) !void {
     // non-empty and 10 decoded after** — and `tag_seeds`' 11-octet entry fed
     // into this 7-octet buffer arrives empty, which is why the corpus is
     // separate rather than shared.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &header_seeds);
+    fuzzHeaderRoundTripMark.mark(.ran);
+    if (len != 0) fuzzHeaderRoundTripMark.mark(.nonempty);
     const input = buf[0..len];
     const t = decodeHeader(input) catch return;
     // A peer may take an escape where the short form would have fitted — for
@@ -1878,4 +1939,12 @@ fn fuzzHeaderRoundTrip(_: void, smith: *std.testing.Smith) !void {
     const n = encodeHeader(t, &out) catch return;
     if (n != t.header_len) return error.HeaderLenMismatch;
     if (!std.mem.eql(u8, input[0..n], out[0..n])) return error.NotCanonical;
+}
+
+test "fuzz driver: BACNET_FUZZ (fuzzHeaderRoundTrip)" {
+    try fz.fuzz_driver.run(fuzzHeaderRoundTrip, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-tag-headerRoundTrip" });
+}
+
+test "fuzz harness: fuzzHeaderRoundTrip, 400 seeds, reaches every outcome" {
+    try fuzzHeaderRoundTripMark.reach(fuzzHeaderRoundTrip, "bacnet-tag-headerRoundTrip", 400);
 }

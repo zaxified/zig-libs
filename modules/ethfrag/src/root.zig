@@ -1516,11 +1516,12 @@ test "fuzz: reassembler never panics and stays bounded on hostile fragment strea
     // this drives arbitrary (including deliberately malformed and
     // overlapping) fragment streams at it and asserts only: it never panics,
     // and `inflightCount()` never exceeds `max_inflight`.
-    try testing.fuzz({}, fuzzReassembler, .{ .corpus = &reassembler_seeds });
+    try testing.fuzz({}, fuzzReassemblerSmith, .{ .corpus = &reassembler_seeds });
 }
 
 /// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
 const tkfuzz = @import("testkit").fuzz;
+const fz = @import("fuzz_test.zig");
 const seed = tkfuzz.seedHex;
 
 /// Fragment-stream scripts in the format `Smith.slice` reads.
@@ -1684,9 +1685,15 @@ fn fuzzReassemblerStep(r: *Reassembler, cur: *tkfuzz.Cursor, now: *u64, tally: ?
     };
 }
 
-fn fuzzReassembler(_: void, smith: *std.testing.Smith) !void {
+const fuzzReassemblerMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzReassemblerSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzReassembler(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzReassembler(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const max_inflight: usize = 4;
-    var r = Reassembler.init(testing.allocator, .{
+    var r = Reassembler.init(gpa, .{
         .max_inflight = max_inflight,
         .max_frame_len = 512,
         .max_fragments_per_datagram = 16,
@@ -1705,16 +1712,26 @@ fn fuzzReassembler(_: void, smith: *std.testing.Smith) !void {
     // named for never ran either. Measured 2026-09-07 over the corpus above:
     // **0 steps run, 0 datagrams completed and a peak in-flight count
     // of 0 before; 81 steps run, 3 datagrams completed and a peak of 4 after.**
-    const n: usize = smith.slice(&script);
+    const n: usize = fz.drawInput(S, src, &script, &reassembler_seeds);
+    fuzzReassemblerMark.mark(.ran);
+    if (n != 0) fuzzReassemblerMark.mark(.nonempty);
     var cur: tkfuzz.Cursor = .{ .bytes = script[0..n] };
 
     var now: u64 = 0;
     const steps = cur.ranged(0, 64);
     var step: u32 = 0;
     while (step < steps) : (step += 1) {
-        if (try fuzzReassemblerStep(&r, &cur, &now, null)) |bytes| testing.allocator.free(bytes);
+        if (try fuzzReassemblerStep(&r, &cur, &now, null)) |bytes| gpa.free(bytes);
         try testing.expect(r.inflightCount() <= max_inflight);
     }
+}
+
+test "fuzz driver: ETHFRAG_FUZZ (fuzzReassembler)" {
+    try fz.fuzz_driver.run(fuzzReassembler, .{ .prefix = "ETHFRAG_FUZZ", .name = "ethfrag-root-reassembler" });
+}
+
+test "fuzz harness: fuzzReassembler, 400 seeds, reaches every outcome" {
+    try fuzzReassemblerMark.reach(fuzzReassembler, "ethfrag-root-reassembler", 400);
 }
 
 test "corpus: every script drives the reassembler, and the counts are pinned" {

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-11 · mutation 2026-10-05 (43/43) · src ?
 
-**Hardening:** fuzz ? · ct n/a — building automation, no auth (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BACNET_FUZZ) · ct n/a — building automation, no auth (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

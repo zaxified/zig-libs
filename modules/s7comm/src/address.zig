@@ -351,6 +351,7 @@ test "parseItem is the one-call form" {
 /// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
 /// that drive the real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seed;
+const fz = @import("fuzz_test.zig");
 
 /// Real STEP 7 address literals, one per area and transport size the parser
 /// knows, in both notations, plus the malformed shapes its tests pin.
@@ -383,10 +384,17 @@ const address_seeds = [_][]const u8{
 };
 
 test "fuzz: address parser never panics" {
-    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &address_seeds });
+    try std.testing.fuzz({}, fuzzParseSmith, .{ .corpus = &address_seeds });
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+const fuzzParseMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParse(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [40]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -395,10 +403,20 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     // input. Measured on 2026-09-06 over the corpus above: **0 of 25
     // non-empty and 0 that parsed before, 25 of 25 non-empty and 19 that parsed
     // after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &address_seeds);
+    fuzzParseMark.mark(.ran);
+    if (len != 0) fuzzParseMark.mark(.nonempty);
     const a = parse(buf[0..len]) catch return;
     // Anything that parses must build an item or fail cleanly.
     const it = a.item(1) catch return;
     var out: [items.item_len]u8 = undefined;
     _ = try it.encode(&out);
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzParse)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-address-parse" });
+}
+
+test "fuzz harness: fuzzParse, 400 seeds, reaches every outcome" {
+    try fuzzParseMark.reach(fuzzParse, "s7comm-address-parse", 400);
 }

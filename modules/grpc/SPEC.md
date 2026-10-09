@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-09-06 (22/22) · src ?
 
-**Hardening:** fuzz ? · ct n/a — RPC framing (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, GRPC_FUZZ) · ct n/a — RPC framing (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

@@ -639,6 +639,7 @@ test "encode refuses an odd path and an oversized additional status" {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// CIP messages. `Request` and `Reply` read the same octets two ways, so the
 /// corpus carries both shapes: service, path size, path, data — and service
@@ -659,10 +660,17 @@ const message_seeds = [_][]const u8{
 };
 
 test "fuzz: request and reply decoders never panic and re-encode exactly" {
-    try std.testing.fuzz({}, fuzzMessages, .{ .corpus = &message_seeds });
+    try std.testing.fuzz({}, fuzzMessagesSmith, .{ .corpus = &message_seeds });
 }
 
-fn fuzzMessages(_: void, smith: *std.testing.Smith) !void {
+const fuzzMessagesMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzMessagesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzMessages(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzMessages(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -671,7 +679,9 @@ fn fuzzMessages(_: void, smith: *std.testing.Smith) !void {
     // input. Measured on 2026-09-06 over the corpus above: **0 of 12
     // non-empty and 0 accepted by either decoder before, 12 of 12 non-empty and
     // 10 accepted after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &message_seeds);
+    fuzzMessagesMark.mark(.ran);
+    if (len != 0) fuzzMessagesMark.mark(.nonempty);
     var round: [512]u8 = undefined;
     if (Request.decode(buf[0..len])) |req| {
         try testing.expectEqualSlices(u8, buf[0..len], try req.encode(&round));
@@ -681,6 +691,14 @@ fn fuzzMessages(_: void, smith: *std.testing.Smith) !void {
         try testing.expectEqualSlices(u8, buf[0..len], try rep.encode(&round));
         _ = rep.extendedStatus();
     } else |_| {}
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzMessages)" {
+    try fz.fuzz_driver.run(fuzzMessages, .{ .prefix = "ENIP_FUZZ", .name = "enip-cip-messages" });
+}
+
+test "fuzz harness: fuzzMessages, 400 seeds, reaches every outcome" {
+    try fuzzMessagesMark.reach(fuzzMessages, "enip-cip-messages", 400);
 }
 
 /// Multiple Service Packet payloads: a count, that many little-endian offsets,
@@ -698,10 +716,17 @@ const multiple_seeds = [_][]const u8{
 };
 
 test "fuzz: multiple service packet walking never panics" {
-    try std.testing.fuzz({}, fuzzMultiple, .{ .corpus = &multiple_seeds });
+    try std.testing.fuzz({}, fuzzMultipleSmith, .{ .corpus = &multiple_seeds });
 }
 
-fn fuzzMultiple(_: void, smith: *std.testing.Smith) !void {
+const fuzzMultipleMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzMultipleSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzMultiple(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzMultiple(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -709,7 +734,9 @@ fn fuzzMultiple(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever saw the empty
     // input. Measured on 2026-09-06 over the corpus above: **0 of 8
     // non-empty and 0 decoded before, 8 of 8 non-empty and 5 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &multiple_seeds);
+    fuzzMultipleMark.mark(.ran);
+    if (len != 0) fuzzMultipleMark.mark(.nonempty);
     const ms = MultipleService.decode(buf[0..len]) catch return;
     var i: usize = 0;
     while (i < ms.count) : (i += 1) {
@@ -719,6 +746,14 @@ fn fuzzMultiple(_: void, smith: *std.testing.Smith) !void {
         _ = Request.decode(msg) catch {};
         _ = Reply.decode(msg) catch {};
     }
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzMultiple)" {
+    try fz.fuzz_driver.run(fuzzMultiple, .{ .prefix = "ENIP_FUZZ", .name = "enip-cip-multiple" });
+}
+
+test "fuzz harness: fuzzMultiple, 400 seeds, reaches every outcome" {
+    try fuzzMultipleMark.reach(fuzzMultiple, "enip-cip-multiple", 400);
 }
 
 /// Attribute lists: a count and that many (id, status, value) entries, at the
@@ -735,10 +770,17 @@ const attr_seeds = [_][]const u8{
 };
 
 test "fuzz: attribute list iteration never panics or hangs" {
-    try std.testing.fuzz({}, fuzzAttrList, .{ .corpus = &attr_seeds });
+    try std.testing.fuzz({}, fuzzAttrListSmith, .{ .corpus = &attr_seeds });
 }
 
-fn fuzzAttrList(_: void, smith: *std.testing.Smith) !void {
+const fuzzAttrListMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzAttrListSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzAttrList(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzAttrList(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -747,10 +789,12 @@ fn fuzzAttrList(_: void, smith: *std.testing.Smith) !void {
     // input. Measured on 2026-09-06 over the corpus above: **0 of 8
     // non-empty and one single (list, width) pair before, 8 of 8 non-empty and
     // 8 distinct pairs after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &attr_seeds);
+    fuzzAttrListMark.mark(.ran);
+    if (len != 0) fuzzAttrListMark.mark(.nonempty);
     // `width` follows the list and is drawn with `value(u64)` rather than a
     // ranged draw, so the seed chooses it too.
-    const width: usize = @intCast(smith.value(u64) % 9);
+    const width: usize = @intCast(src.value(u64) % 9);
     var it = AttributeListIterator.init(buf[0..len]) catch return;
     var guard: usize = 0;
     while (true) {
@@ -759,4 +803,12 @@ fn fuzzAttrList(_: void, smith: *std.testing.Smith) !void {
         const e = it.next(width) catch break;
         if (e == null) break;
     }
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzAttrList)" {
+    try fz.fuzz_driver.run(fuzzAttrList, .{ .prefix = "ENIP_FUZZ", .name = "enip-cip-attrList" });
+}
+
+test "fuzz harness: fuzzAttrList, 400 seeds, reaches every outcome" {
+    try fuzzAttrListMark.reach(fuzzAttrList, "enip-cip-attrList", 400);
 }

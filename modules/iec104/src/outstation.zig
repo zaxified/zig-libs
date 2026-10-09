@@ -663,6 +663,7 @@ const testing = std.testing;
 /// is. A corpus entry is not the frame: `Smith.slice` reads a little-endian
 /// u32 length first (see `testkit/src/fuzz.zig`).
 const seed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// Collects reply ASDUs so a test can inspect them.
 pub const CollectSink = struct {
@@ -1283,10 +1284,17 @@ const handle_seeds = [_][]const u8{
 };
 
 test "fuzz: the outstation never panics on arbitrary ASDU bytes" {
-    try std.testing.fuzz({}, fuzzHandle, .{ .corpus = &handle_seeds });
+    try std.testing.fuzz({}, fuzzHandleSmith, .{ .corpus = &handle_seeds });
 }
 
-fn fuzzHandle(_: void, smith: *std.testing.Smith) !void {
+const fuzzHandleMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzHandleSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzHandle(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzHandle(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [apci.max_asdu_len]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -1297,7 +1305,9 @@ fn fuzzHandle(_: void, smith: *std.testing.Smith) !void {
     // this harness. Measured 2026-09-07 over the corpus above: **0 of 15 seeds
     // non-empty, 0 handled and 0 replies emitted before; 15 of 15 non-empty,
     // 11 handled and 19 replies after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &handle_seeds);
+    fuzzHandleMark.mark(.ran);
+    if (len != 0) fuzzHandleMark.mark(.nonempty);
     var points = demoPoints();
     var o = try Outstation.init(.{ .common_address = 47 }, &points);
     var s = CollectSink{};
@@ -1330,6 +1340,14 @@ fn fuzzHandle(_: void, smith: *std.testing.Smith) !void {
         if (request_is_well_formed and err != error.SinkFull) return err;
         return;
     };
+}
+
+test "fuzz driver: IEC104_FUZZ (fuzzHandle)" {
+    try fz.fuzz_driver.run(fuzzHandle, .{ .prefix = "IEC104_FUZZ", .name = "iec104-outstation-handle" });
+}
+
+test "fuzz harness: fuzzHandle, 400 seeds, reaches every outcome" {
+    try fuzzHandleMark.reach(fuzzHandle, "iec104-outstation-handle", 400);
 }
 
 test "corpus: every outstation seed reaches handle, and the replies are pinned" {

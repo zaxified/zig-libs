@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `S7COMM_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Fifteen harnesses (address, cotp, items item/dataItems, s7 decode, s7plus frame/object/path/value/var, server handle, tpkt decode/framer, userdata, vars). Verdict: 200,000 runs each, ReleaseSafe, clean.
 - **2026-10-05** — Mutation run: 25 of 43 killed, 1 equivalent; 3 tests added
   and 8 existing tests extended, nearly all at a one-past boundary (TPKT total
   65536 and one octet short, framer overflow and partial packet, a COTP

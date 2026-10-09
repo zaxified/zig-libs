@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `ETHFRAG_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harness: `reassembler`. Verdict: 200,000 runs, ReleaseSafe, clean.
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** the fuzz harness gained a
   burst step kind so coverage-guided fuzzing reaches the
   `max_fragments_per_datagram` guard (A1 F6; `TooManyFragments` was 0 in

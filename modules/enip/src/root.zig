@@ -172,6 +172,7 @@ test {
 // ── tests: the whole stack, client against adapter ─────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 test "meta names exactly the one sibling dependency" {
     try testing.expectEqual(@as(usize, 1), meta.deps.len);
@@ -1149,7 +1150,7 @@ const adapter_seeds = [_][]const u8{
 };
 
 test "fuzz: the adapter never panics on arbitrary messages" {
-    try std.testing.fuzz({}, fuzzAdapter, .{ .corpus = &adapter_seeds });
+    try std.testing.fuzz({}, fuzzAdapterSmith, .{ .corpus = &adapter_seeds });
 }
 
 // F6 (2026-08-11 re-audit): `Config.max_reply`'s default (4000) used to be
@@ -1167,7 +1168,14 @@ test "fuzz: the adapter never panics on arbitrary messages" {
 const fuzz_scada_len = 4200;
 const fuzz_out_len = 8192;
 
-fn fuzzAdapter(_: void, smith: *std.testing.Smith) !void {
+const fuzzAdapterMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzAdapterSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzAdapter(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzAdapter(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var scada: [fuzz_scada_len]u8 = @splat(0);
     var dint: [16]u8 = @splat(0);
     var real: [16]u8 = @splat(0);
@@ -1186,15 +1194,25 @@ fn fuzzAdapter(_: void, smith: *std.testing.Smith) !void {
     // 2026-09-06 over the corpus above: **0 of 12 non-empty, 0 replies, and the
     // session never open before; 12 of 12 non-empty, 9 replies, and the session
     // open on 6 of the 12 after.**
-    const len: usize = smith.slice(&input);
+    const len: usize = fz.drawInput(S, src, &input, &adapter_seeds);
+    fuzzAdapterMark.mark(.ran);
+    if (len != 0) fuzzAdapterMark.mark(.nonempty);
     // The session flag follows the message, drawn with a full-width `value`.
-    if (smith.value(u64) & 1 == 1) target.session_handle = 0xA5A5_0001;
+    if (src.value(u64) & 1 == 1) target.session_handle = 0xA5A5_0001;
     var out: [fuzz_out_len]u8 = undefined;
     const reply = target.handle(input[0..len], &out) catch return;
     const r = reply orelse return;
     // Anything the adapter emits must itself be a legal message.
     const msg = try encap.decode(r);
     try testing.expectEqual(r.len, msg.total_len);
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzAdapter)" {
+    try fz.fuzz_driver.run(fuzzAdapter, .{ .prefix = "ENIP_FUZZ", .name = "enip-root-adapter" });
+}
+
+test "fuzz harness: fuzzAdapter, 400 seeds, reaches every outcome" {
+    try fuzzAdapterMark.reach(fuzzAdapter, "enip-root-adapter", 400);
 }
 
 /// Builds the CIP `Read Tag Fragmented` request bytes `Client.readTagFragmented`
@@ -1258,10 +1276,17 @@ const client_reply_seeds = [_][]const u8{
 };
 
 test "fuzz: a client survives an arbitrary reply without panicking" {
-    try std.testing.fuzz({}, fuzzClientReply, .{ .corpus = &client_reply_seeds });
+    try std.testing.fuzz({}, fuzzClientReplySmith, .{ .corpus = &client_reply_seeds });
 }
 
-fn fuzzClientReply(_: void, smith: *std.testing.Smith) !void {
+const fuzzClientReplyMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzClientReplySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzClientReply(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzClientReply(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var lt: transport.LoopTransport = .{};
     var reply: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length. The
@@ -1271,7 +1296,9 @@ fn fuzzClientReply(_: void, smith: *std.testing.Smith) !void {
     // corpus above: **`len` was 24 on every one of the six
     // seeds before — a header and nothing else; after, it is 28, 42, 42, 50, 56
     // and 82, so the CPF body reaches the reply decoder for the first time.**
-    const len: usize = @max(24, smith.slice(&reply));
+    const len: usize = @max(24, fz.drawInput(S, src, &reply, &client_reply_seeds));
+    fuzzClientReplyMark.mark(.ran);
+    if (len != 0) fuzzClientReplyMark.mark(.nonempty);
     // Make it a plausible frame so the decoder gets past the header.
     reply[0] = 0x6F;
     reply[1] = 0x00;
@@ -1284,6 +1311,14 @@ fn fuzzClientReply(_: void, smith: *std.testing.Smith) !void {
     c.registered = true;
     c.session_handle = std.mem.readInt(u32, reply[4..8], .little);
     _ = c.readTag("SCADA", 1) catch {};
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzClientReply)" {
+    try fz.fuzz_driver.run(fuzzClientReply, .{ .prefix = "ENIP_FUZZ", .name = "enip-root-clientReply" });
+}
+
+test "fuzz harness: fuzzClientReply, 400 seeds, reaches every outcome" {
+    try fuzzClientReplyMark.reach(fuzzClientReply, "enip-root-clientReply", 400);
 }
 
 // ── live interop ────────────────────────────────────────────────────────────

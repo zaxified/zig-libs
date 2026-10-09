@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `MODBUS_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harnesses: `decodeAdu`, `server`. Verdict: 200,000 runs each, ReleaseSafe, clean.
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The two `TcpTransport` cancel tests
   canceled after a fixed sleep. On a loaded machine that could land in the request write instead,
   and the test then passed by that arm. Both now cancel once the exchange is inside its reply read

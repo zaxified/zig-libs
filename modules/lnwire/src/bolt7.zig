@@ -1641,7 +1641,7 @@ test "hostile: reply_channel_range with an encoded_short_ids length prefix excee
 // harness stands in for that whole sub-family.
 test "fuzz: decodeQueryShortChannelIds never panics on arbitrary bytes" {
     var corpus: QueryCorpus = .{};
-    try testing.fuzz({}, fuzzDecodeQueryShortChannelIds, .{ .corpus = try corpus.build(testing.allocator) });
+    try testing.fuzz({}, fuzzDecodeQueryShortChannelIdsSmith, .{ .corpus = try corpus.build(testing.allocator) });
 }
 
 /// `query_short_channel_ids` messages, in the format `Smith.slice` reads.
@@ -1727,8 +1727,15 @@ const QueryCorpus = struct {
     }
 };
 
-fn fuzzDecodeQueryShortChannelIds(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+const fuzzDecodeQueryShortChannelIdsMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeQueryShortChannelIdsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecodeQueryShortChannelIds(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecodeQueryShortChannelIds(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: QueryCorpus = .{};
+    const allocator = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call. What was here before was a partial fix, and
     // it is worth naming because it looked complete: the length was written as
@@ -1745,10 +1752,20 @@ fn fuzzDecodeQueryShortChannelIds(_: void, smith: *std.testing.Smith) !void {
     // Measured 2026-09-07 over the corpus above: **1 of 9 seeds non-empty
     // (the all-zero buffer) and 0 decoded before; 9 of 9 non-empty and 4
     // decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, (try corpus.build(gpa)));
+    fuzzDecodeQueryShortChannelIdsMark.mark(.ran);
+    if (len != 0) fuzzDecodeQueryShortChannelIdsMark.mark(.nonempty);
 
     var m = decodeQueryShortChannelIds(allocator, buf[0..len]) catch return;
     defer m.deinit(allocator);
+}
+
+test "fuzz driver: LNWIRE_FUZZ (fuzzDecodeQueryShortChannelIds)" {
+    try fz.fuzz_driver.run(fuzzDecodeQueryShortChannelIds, .{ .prefix = "LNWIRE_FUZZ", .name = "lnwire-bolt7-decodeQueryShortChannelIds" });
+}
+
+test "fuzz harness: fuzzDecodeQueryShortChannelIds, 400 seeds, reaches every outcome" {
+    try fuzzDecodeQueryShortChannelIdsMark.reach(fuzzDecodeQueryShortChannelIds, "lnwire-bolt7-decodeQueryShortChannelIds", 400);
 }
 
 test "corpus: every query seed reaches the decoder, and the id octets are pinned" {
@@ -1824,6 +1841,7 @@ test "TEETH: a channel_announcement with unordered node ids is refused (BOLT#7 M
 // (added 2026-10-06)
 
 const sf_kat = @import("bolt7_sigs_filter_kat_vectors.zig");
+const fz = @import("fuzz_test.zig");
 
 test "official vector (rust-lightning msgs.rs encoding_announcement_signatures): both directions" {
     const allocator = testing.allocator;
@@ -2094,14 +2112,31 @@ fn runGossipExtra(bytes: []const u8) GossipExtraOutcome {
 
 test "fuzz: announcement_signatures / gossip_timestamp_filter / address descriptors never panic" {
     var corpus: GossipExtraCorpus = .{};
-    try testing.fuzz({}, fuzzGossipExtra, .{ .corpus = try corpus.build(testing.allocator) });
+    try testing.fuzz({}, fuzzGossipExtraSmith, .{ .corpus = try corpus.build(testing.allocator) });
 }
 
-fn fuzzGossipExtra(_: void, smith: *std.testing.Smith) !void {
+const fuzzGossipExtraMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzGossipExtraSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzGossipExtra(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzGossipExtra(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: GossipExtraCorpus = .{};
     var buf: [256]u8 = undefined;
     // One faithful `smith.slice` draw (see `fuzzDecodeQueryShortChannelIds`).
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, (try corpus.build(gpa)));
+    fuzzGossipExtraMark.mark(.ran);
+    if (len != 0) fuzzGossipExtraMark.mark(.nonempty);
     _ = runGossipExtra(buf[0..len]);
+}
+
+test "fuzz driver: LNWIRE_FUZZ (fuzzGossipExtra)" {
+    try fz.fuzz_driver.run(fuzzGossipExtra, .{ .prefix = "LNWIRE_FUZZ", .name = "lnwire-bolt7-gossipExtra" });
+}
+
+test "fuzz harness: fuzzGossipExtra, 400 seeds, reaches every outcome" {
+    try fuzzGossipExtraMark.reach(fuzzGossipExtra, "lnwire-bolt7-gossipExtra", 400);
 }
 
 test "corpus: every gossip-extra seed reaches the decoders, and the counts are pinned" {

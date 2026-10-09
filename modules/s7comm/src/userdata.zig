@@ -481,6 +481,7 @@ test "cpu status is read from the 0x0424 record" {
 /// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
 /// that drive the real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// The three decoders this harness calls read three different framings out of
 /// the same octets, so the corpus carries all three: userdata parameter heads,
@@ -501,10 +502,17 @@ const userdata_seeds = [_][]const u8{
 };
 
 test "fuzz: userdata decoders never panic" {
-    try std.testing.fuzz({}, fuzzUserdata, .{ .corpus = &userdata_seeds });
+    try std.testing.fuzz({}, fuzzUserdataSmith, .{ .corpus = &userdata_seeds });
 }
 
-fn fuzzUserdata(_: void, smith: *std.testing.Smith) !void {
+const fuzzUserdataMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzUserdataSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzUserdata(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzUserdata(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -513,7 +521,9 @@ fn fuzzUserdata(_: void, smith: *std.testing.Smith) !void {
     // input. Measured on 2026-09-06 over the corpus above: **0 of 12
     // non-empty and 0 accepted by any of the three decoders before, 12 of 12
     // non-empty and 5 accepted after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &userdata_seeds);
+    fuzzUserdataMark.mark(.ran);
+    if (len != 0) fuzzUserdataMark.mark(.nonempty);
     _ = Param.decode(buf[0..len]) catch {};
     if (DataBlock.decode(buf[0..len])) |db| {
         try testing.expect(db.payload.len + 4 <= len);
@@ -525,4 +535,12 @@ fn fuzzUserdata(_: void, smith: *std.testing.Smith) !void {
             try testing.expect(rec.len == r.header.record_length);
         }
     } else |_| {}
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzUserdata)" {
+    try fz.fuzz_driver.run(fuzzUserdata, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-userdata-userdata" });
+}
+
+test "fuzz harness: fuzzUserdata, 400 seeds, reaches every outcome" {
+    try fuzzUserdataMark.reach(fuzzUserdata, "s7comm-userdata-userdata", 400);
 }

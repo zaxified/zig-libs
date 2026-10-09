@@ -899,6 +899,7 @@ test "path size is words and an odd path is refused" {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// EPATHs: one per segment type this module encodes and decodes, plus the
 /// declared lengths that overrun.
@@ -919,10 +920,17 @@ const epath_seeds = [_][]const u8{
 };
 
 test "fuzz: epath iteration never panics and re-encodes exactly" {
-    try std.testing.fuzz({}, fuzzPath, .{ .corpus = &epath_seeds });
+    try std.testing.fuzz({}, fuzzPathSmith, .{ .corpus = &epath_seeds });
 }
 
-fn fuzzPath(_: void, smith: *std.testing.Smith) !void {
+const fuzzPathMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzPathSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPath(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzPath(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -935,7 +943,9 @@ fn fuzzPath(_: void, smith: *std.testing.Smith) !void {
     // EMPTY path re-encodes to an empty path and `reencode("")` succeeds. A
     // pass rate of 100 % with one distinct input, and every accessor below
     // walking nothing: acceptance is not reach.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &epath_seeds);
+    fuzzPathMark.mark(.ran);
+    if (len != 0) fuzzPathMark.mark(.nonempty);
     var round: [512]u8 = undefined;
     if (reencode(buf[0..len], &round)) |again| {
         try testing.expectEqualSlices(u8, buf[0..len], again);
@@ -952,4 +962,12 @@ fn fuzzPath(_: void, smith: *std.testing.Smith) !void {
         const seg = it.next() catch break;
         if (seg == null) break;
     }
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzPath)" {
+    try fz.fuzz_driver.run(fuzzPath, .{ .prefix = "ENIP_FUZZ", .name = "enip-epath-path" });
+}
+
+test "fuzz harness: fuzzPath, 400 seeds, reaches every outcome" {
+    try fuzzPathMark.reach(fuzzPath, "enip-epath-path", 400);
 }

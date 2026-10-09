@@ -616,6 +616,7 @@ test "encode refuses a datagram whose length the u16 field cannot hold" {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seed;
+const fz = @import("fuzz_test.zig");
 
 /// Real BACnet/IP datagrams, lifted from the tests above: one per function this
 /// decoder dispatches on, plus the three rejections that bound it.
@@ -635,10 +636,17 @@ const bvlc_seeds = [_][]const u8{
 };
 
 test "fuzz: BVLC decode never panics and re-encodes identically" {
-    try std.testing.fuzz({}, fuzzBvlc, .{ .corpus = &bvlc_seeds });
+    try std.testing.fuzz({}, fuzzBvlcSmith, .{ .corpus = &bvlc_seeds });
 }
 
-fn fuzzBvlc(_: void, smith: *std.testing.Smith) !void {
+const fuzzBvlcMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzBvlcSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzBvlc(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzBvlc(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed and a ranged draw then
@@ -646,10 +654,20 @@ fn fuzzBvlc(_: void, smith: *std.testing.Smith) !void {
     // was 0 for every seed and this harness decoded the empty datagram, once.
     // Measured on 2026-09-06 over the corpus above: **0 of 12 non-empty and 0
     // decoded before, 12 of 12 non-empty and 9 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &bvlc_seeds);
+    fuzzBvlcMark.mark(.ran);
+    if (len != 0) fuzzBvlcMark.mark(.nonempty);
     const dgram = buf[0..len];
     const msg = decode(dgram) catch return;
     var out: [512]u8 = undefined;
     const again = try encode(msg, &out);
     try testing.expectEqualSlices(u8, dgram, again);
+}
+
+test "fuzz driver: BACNET_FUZZ (fuzzBvlc)" {
+    try fz.fuzz_driver.run(fuzzBvlc, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-bvll-bvlc" });
+}
+
+test "fuzz harness: fuzzBvlc, 400 seeds, reaches every outcome" {
+    try fuzzBvlcMark.reach(fuzzBvlc, "bacnet-bvll-bvlc", 400);
 }

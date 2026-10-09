@@ -893,7 +893,7 @@ fn fieldValue(hl: hpack.HeaderList, name: []const u8) ?[]const u8 {
 // The first is what stops an error response from hanging a client that waits
 // for trailers that will never come.
 test "fuzz: the Trailers-Only decision over scripted response shapes" {
-    try std.testing.fuzz({}, fuzzResponseShape, .{ .corpus = &shape_seeds });
+    try std.testing.fuzz({}, fuzzResponseShapeSmith, .{ .corpus = &shape_seeds });
 }
 
 const status_values = [_][]const u8{ "0", "1", "7", "16", "99", "", "not-a-number", "0 " };
@@ -914,6 +914,7 @@ const status_values = [_][]const u8{ "0", "1", "7", "16", "99", "", "not-a-numbe
 /// script you can read. Under `--fuzz` the fuzzer still drives every choice,
 /// because it drives the slice.
 const Script = @import("testkit").fuzz.Cursor;
+const fz = @import("fuzz_test.zig");
 
 /// The shape a script scripted, plus what the client made of it — so the guard
 /// below can measure the corpus rather than assert it merely ran.
@@ -1050,10 +1051,27 @@ fn runShapeScript(bytes: []const u8) !ShapeOutcome {
     return out;
 }
 
-fn fuzzResponseShape(_: void, smith: *std.testing.Smith) !void {
+const fuzzResponseShapeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzResponseShapeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzResponseShape(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzResponseShape(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var script: [256]u8 = undefined;
-    const n: usize = smith.slice(&script);
+    const n: usize = fz.drawInput(S, src, &script, &shape_seeds);
+    fuzzResponseShapeMark.mark(.ran);
+    if (n != 0) fuzzResponseShapeMark.mark(.nonempty);
     _ = try runShapeScript(script[0..n]);
+}
+
+test "fuzz driver: GRPC_FUZZ (fuzzResponseShape)" {
+    try fz.fuzz_driver.run(fuzzResponseShape, .{ .prefix = "GRPC_FUZZ", .name = "grpc-call_test-responseShape" });
+}
+
+test "fuzz harness: fuzzResponseShape, 400 seeds, reaches every outcome" {
+    try fuzzResponseShapeMark.reach(fuzzResponseShape, "grpc-call_test-responseShape", 400);
 }
 
 /// Response scripts. The layout the cursor reads is, one octet each:

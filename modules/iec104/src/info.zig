@@ -593,6 +593,7 @@ pub fn writeU16(out: []u8, v: u16) void {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 test "quality descriptor bit positions and round-trip" {
     try testing.expectEqual(@as(u8, 0x00), (Quality{}).toByte());
@@ -793,13 +794,30 @@ test "scalar helpers are little-endian" {
 }
 
 test "fuzz: CP56Time2a decode never panics and always round-trips" {
-    try std.testing.fuzz({}, fuzzTime, .{});
+    try std.testing.fuzz({}, fuzzTimeSmith, .{});
 }
 
-fn fuzzTime(_: void, smith: *std.testing.Smith) !void {
+const fuzzTimeMark = fz.Marker(enum { ran, decoded, refused });
+
+fn fuzzTimeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzTime(std.testing.Smith, smith, std.testing.allocator);
+}
+
+test "fuzz driver: IEC104_FUZZ (fuzzTime)" {
+    try fz.fuzz_driver.run(fuzzTime, .{ .prefix = "IEC104_FUZZ", .name = "iec104-info-time" });
+}
+
+test "fuzz harness: fuzzTime, 400 seeds, reaches every outcome" {
+    try fuzzTimeMark.reach(fuzzTime, "iec104-info-time", 400);
+}
+
+fn fuzzTime(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [7]u8 = undefined;
-    smith.bytes(&buf);
-    const t = CP56Time2a.decode(&buf) catch return;
+    src.bytes(&buf);
+    fuzzTimeMark.mark(.ran);
+    const t = CP56Time2a.decode(&buf) catch return fuzzTimeMark.mark(.refused);
+    fuzzTimeMark.mark(.decoded);
     var again: [7]u8 = undefined;
     _ = try t.encode(&again);
     try testing.expectEqual(t, try CP56Time2a.decode(&again));

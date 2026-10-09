@@ -665,7 +665,7 @@ test "fuzz: decode never panics/OOBs on hostile bytes and stays within input bou
     // tunnel, so this drives arbitrary bytes — truncated, wrong-version,
     // reserved-bit-dirty, bit-flipped — and asserts only: never panics, and any
     // successful decode's payload is a subslice strictly within the input.
-    try testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
 /// The largest frame this decoder can be handed on a real tunnel: a 9000-octet
@@ -688,6 +688,7 @@ const fuzz_drawn: usize = header_len + 64;
 /// a little-endian u32 length first, so a raw frame would arrive minus its own
 /// version, flags and the top two octets of the I-SID.
 const testkit = @import("testkit");
+const fz = @import("fuzz_test.zig");
 const seed = testkit.fuzz.seedHex;
 
 /// Header regions, in the format `Smith.slice` reads. Only the first
@@ -708,7 +709,14 @@ const decode_seeds = [_][]const u8{
     seed(""), // the empty frame
 };
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [fuzz_max_frame]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(out.len, in.len)` octets and every ranged
@@ -719,7 +727,9 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // the same reason, so even a full-length draw would have died at the
     // version check. Measured 2026-09-07 over the corpus below: 0 of 8 seeds
     // decoded before, 3 of 8 after.
-    const drawn: usize = smith.slice(buf[0..fuzz_drawn]);
+    const drawn: usize = fz.drawInput(S, src, buf[0..fuzz_drawn], &decode_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (drawn != 0) fuzzDecodeMark.mark(.nonempty);
     var cur: testkit.fuzz.Cursor = .{ .bytes = buf[0..drawn] };
 
     // A size class rather than a uniform draw: a uniform length over the whole
@@ -746,6 +756,14 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // The decision helpers must also never panic on decoded-from-hostile fields.
     _ = decrementTtl(dec.fields) catch {};
     _ = droppedBySplitHorizon(dec.fields, cur.word());
+}
+
+test "fuzz driver: L2ENCAP_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "L2ENCAP_FUZZ", .name = "l2encap-root-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "l2encap-root-decode", 400);
 }
 
 test "corpus: every seed reaches the decoder, and the counts are pinned" {

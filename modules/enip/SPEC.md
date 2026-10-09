@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-06 · mutation 2026-09-10 · src ?
 
-**Hardening:** fuzz ? · ct n/a — industrial protocol, no auth (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ENIP_FUZZ) · ct n/a — industrial protocol, no auth (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

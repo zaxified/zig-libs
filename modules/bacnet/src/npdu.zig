@@ -840,6 +840,7 @@ test "mac_len cannot name an octet outside the MAC storage" {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seed;
+const fz = @import("fuzz_test.zig");
 
 /// Every NPCI shape the tests above pin: no specifier, source only, global
 /// broadcast, a network-layer message with and without a payload, plus the
@@ -859,10 +860,17 @@ const npdu_seeds = [_][]const u8{
 };
 
 test "fuzz: NPDU decode never panics and canonical headers re-encode" {
-    try std.testing.fuzz({}, fuzzNpdu, .{ .corpus = &npdu_seeds });
+    try std.testing.fuzz({}, fuzzNpduSmith, .{ .corpus = &npdu_seeds });
 }
 
-fn fuzzNpdu(_: void, smith: *std.testing.Smith) !void {
+const fuzzNpduMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzNpduSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzNpdu(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzNpdu(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and a ranged draw then
@@ -870,7 +878,9 @@ fn fuzzNpdu(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever decoded the empty
     // NPDU. Measured on 2026-09-06 over the corpus above: **0 of 11 non-empty
     // and 0 decoded before, 11 of 11 non-empty and 6 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &npdu_seeds);
+    fuzzNpduMark.mark(.ran);
+    if (len != 0) fuzzNpduMark.mark(.nonempty);
     const input = buf[0..len];
     const n = decode(input) catch return;
     switch (n.payload) {
@@ -881,4 +891,12 @@ fn fuzzNpdu(_: void, smith: *std.testing.Smith) !void {
         },
         .network => {},
     }
+}
+
+test "fuzz driver: BACNET_FUZZ (fuzzNpdu)" {
+    try fz.fuzz_driver.run(fuzzNpdu, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-npdu-npdu" });
+}
+
+test "fuzz harness: fuzzNpdu, 400 seeds, reaches every outcome" {
+    try fuzzNpduMark.reach(fuzzNpdu, "bacnet-npdu-npdu", 400);
 }

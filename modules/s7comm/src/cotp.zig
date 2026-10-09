@@ -649,6 +649,7 @@ test "TpduSize.bytes maps only the defined codes" {
 /// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
 /// that drive the real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// One TPDU per code `decode` dispatches on, plus every rejection the tests
 /// above pin.
@@ -671,10 +672,17 @@ const cotp_seeds = [_][]const u8{
 };
 
 test "fuzz: cotp decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &cotp_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &cotp_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [300]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -682,7 +690,9 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever saw the empty
     // input. Measured on 2026-09-06 over the corpus above: **0 of 15
     // non-empty and 0 decoded before, 15 of 15 non-empty and 6 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &cotp_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     const t = decode(buf[0..len]) catch return;
     // Anything that decoded as one of the four codes with no CDT field must
     // have come from a full-octet code (RFC 905 Table 8). DR/DC/ER have no
@@ -705,4 +715,12 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         },
         else => {},
     }
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-cotp-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "s7comm-cotp-decode", 400);
 }

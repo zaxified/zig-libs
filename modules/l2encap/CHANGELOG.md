@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `L2ENCAP_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harness: `decode`. Verdict: 200,000 runs, ReleaseSafe, clean.
 - **2026-10-04** — Tests: first mutation run (34 mutants, 34 killed); added a test that rejects each reserved `flags` bit 1..7 individually.
 
 - **2026-09-30** — Anchor grade corrected from class A · oracle SELF to **class D · oracle n/a**: the

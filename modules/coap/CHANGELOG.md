@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `COAP_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harness: `parse` (round-trips every accepted datagram byte-for-byte). Verdict: 200,000 runs, ReleaseSafe, clean.
 - **2026-10-06** — Review: adversarial re-review of the code after the 2026-09-03 audit (the
   RFC 7641 §7 notification budget and the `fuzzParse` rewrite). No code change, no behaviour
   change. 4 findings, 2 fixed in docs: `server.Server.init` now states that `seed_mid` must come

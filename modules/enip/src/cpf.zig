@@ -501,6 +501,7 @@ test "connection id reads only from a connected address item" {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// Common Packet Format item lists: the item count, then typed items. One list
 /// per shape `decode` and its typed views understand, plus the truncations.
@@ -518,10 +519,17 @@ const cpf_seeds = [_][]const u8{
 };
 
 test "fuzz: cpf decode never panics and re-encodes exactly" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &cpf_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &cpf_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -529,7 +537,9 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever saw the empty
     // input. Measured on 2026-09-06 over the corpus above: **0 of 10
     // non-empty and 0 decoded before, 10 of 10 non-empty and 4 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &cpf_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     var storage: [16]Item = undefined;
     const list = decode(buf[0..len], &storage) catch return;
     try testing.expectEqual(len, list.encoded_len);
@@ -546,6 +556,14 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+test "fuzz driver: ENIP_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "ENIP_FUZZ", .name = "enip-cpf-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "enip-cpf-decode", 400);
+}
+
 /// The same lists behind the interface handle and timeout an encapsulated
 /// SendRRData body carries.
 const envelope_seeds = [_][]const u8{
@@ -557,10 +575,17 @@ const envelope_seeds = [_][]const u8{
 };
 
 test "fuzz: envelope decode never panics" {
-    try std.testing.fuzz({}, fuzzEnvelope, .{ .corpus = &envelope_seeds });
+    try std.testing.fuzz({}, fuzzEnvelopeSmith, .{ .corpus = &envelope_seeds });
 }
 
-fn fuzzEnvelope(_: void, smith: *std.testing.Smith) !void {
+const fuzzEnvelopeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzEnvelopeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzEnvelope(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzEnvelope(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -568,10 +593,20 @@ fn fuzzEnvelope(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever saw the empty
     // input. Measured on 2026-09-06 over the corpus above: **0 of 5
     // non-empty and 0 decoded before, 5 of 5 non-empty and 3 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &envelope_seeds);
+    fuzzEnvelopeMark.mark(.ran);
+    if (len != 0) fuzzEnvelopeMark.mark(.nonempty);
     var storage: [16]Item = undefined;
     const env = decodeEnvelope(buf[0..len], &storage) catch return;
     var round: [512]u8 = undefined;
     const again = try encodeEnvelope(env.interface_handle, env.timeout, env.list.items, &round);
     try testing.expectEqualSlices(u8, buf[0..len], again);
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzEnvelope)" {
+    try fz.fuzz_driver.run(fuzzEnvelope, .{ .prefix = "ENIP_FUZZ", .name = "enip-cpf-envelope" });
+}
+
+test "fuzz harness: fuzzEnvelope, 400 seeds, reaches every outcome" {
+    try fuzzEnvelopeMark.reach(fuzzEnvelope, "enip-cpf-envelope", 400);
 }

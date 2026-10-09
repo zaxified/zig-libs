@@ -232,6 +232,7 @@ pub fn encodeExtension(w: *Writer, allocator: Allocator, ext: Extension) Allocat
 
 const testing = std.testing;
 const testkit = @import("testkit");
+const fz = @import("fuzz_test.zig");
 
 test "Reader: fixed-width big-endian reads" {
     const bytes = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09 };
@@ -417,11 +418,18 @@ const FrameCorpus = struct {
 
 test "fuzz: openFrame + decodeExtension never panic on arbitrary bytes" {
     var corpus: FrameCorpus = .{};
-    try testing.fuzz({}, fuzzFrameAndExtension, .{ .corpus = try corpus.build(testing.allocator) });
+    try testing.fuzz({}, fuzzFrameAndExtensionSmith, .{ .corpus = try corpus.build(testing.allocator) });
 }
 
-fn fuzzFrameAndExtension(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+const fuzzFrameAndExtensionMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzFrameAndExtensionSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFrameAndExtension(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzFrameAndExtension(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: FrameCorpus = .{};
+    const allocator = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call. What was here before was a partial fix, and it
     // is worth naming because it looked complete: the length was written as
@@ -433,13 +441,15 @@ fn fuzzFrameAndExtension(_: void, smith: *std.testing.Smith) !void {
     // above: **1 of 12 seeds non-empty (that all-zero buffer), 1 framed and 0
     // TLV records read before; 11 of 12 non-empty (the empty message is a
     // deliberate seed), 9 framed and 4 records after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, (try corpus.build(gpa)));
+    fuzzFrameAndExtensionMark.mark(.ran);
+    if (len != 0) fuzzFrameAndExtensionMark.mark(.nonempty);
     const bytes = buf[0..len];
 
     // ⚠ `value(u64)` and a bit test, not `value(bool)`: a bool drawn after the
     // bytes is `false` on every replay, so `want` was always the second
     // branch. The choice travels in the seed now — see `FrameCorpus`.
-    const w = smith.value(u64);
+    const w = src.value(u64);
     const want: u16 = if (bytes.len >= 2 and w & 1 != 0)
         std.mem.readInt(u16, bytes[0..2], .big)
     else
@@ -448,6 +458,14 @@ fn fuzzFrameAndExtension(_: void, smith: *std.testing.Smith) !void {
     var r = openFrame(bytes, want) catch return;
     var ext = decodeExtension(allocator, r.rest(), &.{ 0, 1, 3, 254 }) catch return;
     defer ext.deinit(allocator);
+}
+
+test "fuzz driver: LNWIRE_FUZZ (fuzzFrameAndExtension)" {
+    try fz.fuzz_driver.run(fuzzFrameAndExtension, .{ .prefix = "LNWIRE_FUZZ", .name = "lnwire-message-frameAndExtension" });
+}
+
+test "fuzz harness: fuzzFrameAndExtension, 400 seeds, reaches every outcome" {
+    try fuzzFrameAndExtensionMark.reach(fuzzFrameAndExtension, "lnwire-message-frameAndExtension", 400);
 }
 
 test "corpus: every frame seed reaches openFrame, and the records read are pinned" {

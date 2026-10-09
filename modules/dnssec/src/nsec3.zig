@@ -328,6 +328,7 @@ fn coverDecoded(decoded: []const DecodedRecord, name: []const u8, salt: []const 
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 test "owner-hash labels: the options this module reads and writes them with" {
     // The alphabet itself is `base32`'s (and tested there against RFC 4648
@@ -688,12 +689,22 @@ fn labelRecord(label: []const u8) Nsec3Record {
 
 test "fuzz: proveDenial never panics on a hostile owner-hash label" {
     var corpus: LabelCorpus = .{};
-    try testing.fuzz({}, fuzzProveDenial, .{ .corpus = corpus.build() });
+    try testing.fuzz({}, fuzzProveDenialSmith, .{ .corpus = corpus.build() });
 }
 
-fn fuzzProveDenial(_: void, smith: *std.testing.Smith) !void {
+const fuzzProveDenialMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzProveDenialSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzProveDenial(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzProveDenial(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: LabelCorpus = .{};
     var label_buf: [256]u8 = undefined;
-    const label_len: usize = smith.slice(&label_buf);
+    const label_len: usize = fz.drawInput(S, src, &label_buf, corpus.build());
+    fuzzProveDenialMark.mark(.ran);
+    if (label_len != 0) fuzzProveDenialMark.mark(.nonempty);
 
     // Verbatim first, then folded into the alphabet — both, every seed, rather
     // than a coin that reads an exhausted input.
@@ -712,6 +723,14 @@ fn fuzzProveDenial(_: void, smith: *std.testing.Smith) !void {
         var out: [sha1_digest_len]u8 = undefined;
         _ = decodeOwnerHash(folded[0..label_len], &out);
     }
+}
+
+test "fuzz driver: DNSSEC_FUZZ (fuzzProveDenial)" {
+    try fz.fuzz_driver.run(fuzzProveDenial, .{ .prefix = "DNSSEC_FUZZ", .name = "dnssec-nsec3-proveDenial" });
+}
+
+test "fuzz harness: fuzzProveDenial, 400 seeds, reaches every outcome" {
+    try fuzzProveDenialMark.reach(fuzzProveDenial, "dnssec-nsec3-ProveDenial", 400);
 }
 
 test "corpus: every label seed reaches decodeOwnerHash, and the hashes decoded are pinned" {

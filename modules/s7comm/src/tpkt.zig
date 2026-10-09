@@ -307,6 +307,7 @@ test "framer surfaces a bad version rather than resynchronising" {
 /// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
 /// that drive the real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// Real TPKT packets: a COTP-DT carrying an S7 header, a full Read Var job, and
 /// every rejection `decode` has an error for.
@@ -325,10 +326,17 @@ const tpkt_seeds = [_][]const u8{
 };
 
 test "fuzz: tpkt decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &tpkt_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &tpkt_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -336,13 +344,23 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever saw the empty
     // input. Measured on 2026-09-06 over the corpus above: **0 of 11
     // non-empty and 0 decoded before, 11 of 11 non-empty and 4 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &tpkt_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     const pkt = decode(buf[0..len]) catch return;
     try testing.expect(pkt.total_len <= len);
     try testing.expectEqual(pkt.total_len, pkt.payload.len + header_len);
     var round: [512]u8 = undefined;
     const again = try encode(pkt.payload, &round);
     try testing.expectEqualSlices(u8, buf[0..pkt.total_len], again);
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-tpkt-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "s7comm-tpkt-decode", 400);
 }
 
 /// Streams for the framer: two whole packets back to back, a packet split so
@@ -357,10 +375,17 @@ const framer_seeds = [_][]const u8{
 };
 
 test "fuzz: framer never panics or hangs" {
-    try std.testing.fuzz({}, fuzzFramer, .{ .corpus = &framer_seeds });
+    try std.testing.fuzz({}, fuzzFramerSmith, .{ .corpus = &framer_seeds });
 }
 
-fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
+const fuzzFramerMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzFramerSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFramer(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzFramer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var input: [512]u8 = undefined;
     // ⚠ Same defect as `fuzzDecode` above, and NOT flagged by
     // `check-fuzz-reach`: the gate's R2 rule looks for the drawn buffer being
@@ -370,7 +395,9 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
     // harness fed the framer nothing at all. Measured on 2026-09-06 over the
     // corpus above: **0 of 5 seeds fed the framer a single octet, and 0 packets
     // came out, before; 5 of 5 fed, 4 packets out, after.**
-    const len: usize = smith.slice(&input);
+    const len: usize = fz.drawInput(S, src, &input, &framer_seeds);
+    fuzzFramerMark.mark(.ran);
+    if (len != 0) fuzzFramerMark.mark(.nonempty);
     var storage: [1024]u8 = undefined;
     var f = Framer.init(&storage);
     var off: usize = 0;
@@ -387,4 +414,12 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
             if (got == null) break;
         }
     }
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzFramer)" {
+    try fz.fuzz_driver.run(fuzzFramer, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-tpkt-framer" });
+}
+
+test "fuzz harness: fuzzFramer, 400 seeds, reaches every outcome" {
+    try fuzzFramerMark.reach(fuzzFramer, "s7comm-tpkt-framer", 400);
 }

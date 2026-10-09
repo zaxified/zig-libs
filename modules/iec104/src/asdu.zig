@@ -902,6 +902,7 @@ pub fn buildSingle(
 
 const testing = std.testing;
 const testkit = @import("testkit");
+const fz = @import("fuzz_test.zig");
 
 test "params validate and derive header length" {
     try default_params.validate();
@@ -1412,10 +1413,18 @@ const AsduCorpus = struct {
 
 test "fuzz: ASDU decode and object iteration never panic" {
     var corpus: AsduCorpus = .{};
-    try std.testing.fuzz({}, fuzzAsdu, .{ .corpus = try corpus.build() });
+    try std.testing.fuzz({}, fuzzAsduSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzAsdu(_: void, smith: *std.testing.Smith) !void {
+const fuzzAsduMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzAsduSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzAsdu(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzAsdu(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: AsduCorpus = .{};
+    _ = gpa;
     var buf: [253]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -1424,9 +1433,11 @@ fn fuzzAsdu(_: void, smith: *std.testing.Smith) !void {
     // the frame sitting unread in `buf`. Measured 2026-09-07 over the corpus
     // above: **0 of 12 seeds non-empty, 0 decoded and 0 objects walked before;
     // 12 of 12 non-empty, 7 decoded and 134 objects walked after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, (try corpus.build()));
+    fuzzAsduMark.mark(.ran);
+    if (len != 0) fuzzAsduMark.mark(.nonempty);
     // ⚠ `value(u64)` and a `%`, not three ranged draws: see `paramsFromWord`.
-    const p = paramsFromWord(smith.value(u64));
+    const p = paramsFromWord(src.value(u64));
     const a = decode(buf[0..len], p) catch return;
     var it = a.objects();
     var seen: usize = 0;
@@ -1434,6 +1445,14 @@ fn fuzzAsdu(_: void, smith: *std.testing.Smith) !void {
         seen += 1;
         try testing.expect(seen <= std.math.maxInt(u7));
     }
+}
+
+test "fuzz driver: IEC104_FUZZ (fuzzAsdu)" {
+    try fz.fuzz_driver.run(fuzzAsdu, .{ .prefix = "IEC104_FUZZ", .name = "iec104-asdu-asdu" });
+}
+
+test "fuzz harness: fuzzAsdu, 400 seeds, reaches every outcome" {
+    try fuzzAsduMark.reach(fuzzAsdu, "iec104-asdu-asdu", 400);
 }
 
 test "corpus: every ASDU seed reaches the decoder with the widths it was encoded under" {

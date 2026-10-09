@@ -278,3 +278,75 @@ test "oracle: NSEC3 Opt-Out — NXDOMAIN over an opt-out span downgrades to Inse
     const r = nsec3.proveDenial("sub.www.example", ty_a, .{ .records = set }, vectors.nsec3opt_salt, vectors.nsec3opt_iterations);
     try testing.expectEqual(nsec3.DenialResult.insecure, r);
 }
+
+// ── fuzz: genuine accepted, damaged refused (DNSSEC_FUZZ) ────────────────────
+
+const fz = @import("fuzz_test.zig");
+const ValidateMark = fz.Marker(enum { secure, flipped_bogus, truncated_bogus, damaged_parsed, damaged_refused });
+
+fn fuzzValidateSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzValidate(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: a genuine RRset is Secure, a damaged signature Bogus, damaged wire never panics" {
+    try testing.fuzz({}, fuzzValidateSmith, .{});
+}
+
+test "fuzz driver: DNSSEC_FUZZ (validate)" {
+    try fz.fuzz_driver.run(fuzzValidate, .{ .prefix = "DNSSEC_FUZZ", .name = "dnssec-oracle-validate", .scale = 5 });
+}
+
+test "fuzz harness: validate, 300 seeds, reaches every outcome" {
+    try ValidateMark.reach(fuzzValidate, "dnssec-oracle-validate", 300);
+}
+
+/// The oracle the parsers' harnesses cannot be. A real signed RRset (any of the
+/// ldns-signed vectors) validates `.secure`; one flipped signature bit and any
+/// truncation of the signature are `.bogus`; RRSIG and DNSKEY wire bytes with 0-3
+/// octets damaged either fail to parse or validate to something -- never a panic
+/// (a damaged octet can be a legal change, a case-fold of the signer name, so
+/// the verdict is not asserted there).
+fn fuzzValidate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [24]u8 = undefined;
+    const n: usize = src.slice(&raw);
+    var knobs: @import("testkit").fuzz.Cursor = .{ .bytes = raw[0..n] };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const v = vectors.verify_vecs[knobs.ranged(0, vectors.verify_vecs.len - 1)];
+    const rrsig = try rdata.parseRrsig(a, v.rrsig_rdata);
+    const dnskey = try rdata.parseDnskey(v.key_rdata);
+    const recs = try recordsFrom(a, v);
+    const anchor: chain.TrustAnchor = .{ .dnskey_rdata = v.key_rdata };
+    const opts: root.ValidateOptions = .{ .now = rrsig.inception };
+
+    const ok = try root.validate(gpa, recs, rrsig, v.name, dnskey, anchor, opts);
+    if (ok != .secure) return error.GenuineRefused;
+    ValidateMark.mark(.secure);
+
+    var bad = rrsig;
+    const sig = try a.dupe(u8, rrsig.signature);
+    sig[knobs.ranged(0, @intCast(sig.len - 1))] ^= @as(u8, 1) << @intCast(knobs.ranged(0, 7));
+    bad.signature = sig;
+    if ((try root.validate(gpa, recs, bad, v.name, dnskey, anchor, opts)) != .bogus) return error.FlippedSignatureAccepted;
+    ValidateMark.mark(.flipped_bogus);
+
+    bad.signature = rrsig.signature[0..knobs.ranged(0, @intCast(rrsig.signature.len - 1))];
+    if ((try root.validate(gpa, recs, bad, v.name, dnskey, anchor, opts)) != .bogus) return error.TruncatedSignatureAccepted;
+    ValidateMark.mark(.truncated_bogus);
+
+    // Damaged wire: 0-3 octets of the RRSIG and of the DNSKEY RDATA.
+    var sbuf: [512]u8 = undefined;
+    var kbuf: [512]u8 = undefined;
+    const sn = @min(v.rrsig_rdata.len, sbuf.len);
+    const kn = @min(v.key_rdata.len, kbuf.len);
+    @memcpy(sbuf[0..sn], v.rrsig_rdata[0..sn]);
+    @memcpy(kbuf[0..kn], v.key_rdata[0..kn]);
+    for (0..knobs.ranged(0, 3)) |_| sbuf[knobs.word() % sn] = knobs.byte();
+    for (0..knobs.ranged(0, 3)) |_| kbuf[knobs.word() % kn] = knobs.byte();
+    const dr = rdata.parseRrsig(a, sbuf[0..sn]) catch return ValidateMark.mark(.damaged_refused);
+    const dk = rdata.parseDnskey(kbuf[0..kn]) catch return ValidateMark.mark(.damaged_refused);
+    _ = try root.validate(gpa, recs, dr, v.name, dk, .{ .dnskey_rdata = kbuf[0..kn] }, opts);
+    ValidateMark.mark(.damaged_parsed);
+}

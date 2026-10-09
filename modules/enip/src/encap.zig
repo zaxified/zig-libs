@@ -681,6 +681,7 @@ test "service name is whatever is left in the item, not a fixed 16 octets" {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// Whole EtherNet/IP encapsulation messages — the 24-octet header and its body
 /// — one per command this decoder dispatches on, plus the framing rejections.
@@ -701,10 +702,17 @@ const encap_seeds = [_][]const u8{
 };
 
 test "fuzz: encapsulation decode never panics and re-encodes exactly" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &encap_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &encap_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -712,12 +720,22 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever saw the empty
     // input. Measured on 2026-09-06 over the corpus above: **0 of 13
     // non-empty and 0 decoded before, 13 of 13 non-empty and 11 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &encap_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     const msg = decode(buf[0..len]) catch return;
     try testing.expectEqual(len, msg.total_len);
     var round: [512]u8 = undefined;
     const again = try encode(msg, &round);
     try testing.expectEqualSlices(u8, buf[0..len], again);
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "ENIP_FUZZ", .name = "enip-encap-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "enip-encap-decode", 400);
 }
 
 /// Streams for the framer: two messages back to back, a body split across the
@@ -731,10 +749,17 @@ const framer_seeds = [_][]const u8{
 };
 
 test "fuzz: framer never panics or hangs" {
-    try std.testing.fuzz({}, fuzzFramer, .{ .corpus = &framer_seeds });
+    try std.testing.fuzz({}, fuzzFramerSmith, .{ .corpus = &framer_seeds });
 }
 
-fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
+const fuzzFramerMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzFramerSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFramer(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzFramer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var input: [512]u8 = undefined;
     // ⚠ Same defect as `fuzzDecode` above, and NOT flagged by
     // `check-fuzz-reach`: its R2 rule looks for the drawn buffer being sliced
@@ -744,7 +769,9 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
     // framer nothing at all. Measured on 2026-09-06 over the corpus above:
     // **0 of 5 seeds fed a single octet and 0 messages came out before; 5 of 5
     // fed and 6 messages out after.**
-    const len: usize = smith.slice(&input);
+    const len: usize = fz.drawInput(S, src, &input, &framer_seeds);
+    fuzzFramerMark.mark(.ran);
+    if (len != 0) fuzzFramerMark.mark(.nonempty);
     var storage: [1024]u8 = undefined;
     var f = Framer.init(&storage);
     var off: usize = 0;
@@ -764,6 +791,14 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+test "fuzz driver: ENIP_FUZZ (fuzzFramer)" {
+    try fz.fuzz_driver.run(fuzzFramer, .{ .prefix = "ENIP_FUZZ", .name = "enip-encap-framer" });
+}
+
+test "fuzz harness: fuzzFramer, 400 seeds, reaches every outcome" {
+    try fuzzFramerMark.reach(fuzzFramer, "enip-encap-framer", 400);
+}
+
 /// The three decoders this harness calls read three different bodies out of
 /// the same octets, so the corpus carries all three: a CIP Identity object, a
 /// ListServices entry, and a 16-octet sockaddr_in.
@@ -778,10 +813,17 @@ const item_seeds = [_][]const u8{
 };
 
 test "fuzz: identity and service decoders never panic" {
-    try std.testing.fuzz({}, fuzzItems, .{ .corpus = &item_seeds });
+    try std.testing.fuzz({}, fuzzItemsSmith, .{ .corpus = &item_seeds });
 }
 
-fn fuzzItems(_: void, smith: *std.testing.Smith) !void {
+const fuzzItemsMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzItemsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzItems(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzItems(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -790,7 +832,9 @@ fn fuzzItems(_: void, smith: *std.testing.Smith) !void {
     // input. Measured on 2026-09-06 over the corpus above: **0 of 7
     // non-empty and 0 accepted by any of the three before, 7 of 7 non-empty and
     // 6 accepted after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &item_seeds);
+    fuzzItemsMark.mark(.ran);
+    if (len != 0) fuzzItemsMark.mark(.nonempty);
     if (Identity.decode(buf[0..len])) |ident| {
         var round: [256]u8 = undefined;
         const again = try ident.encode(&round);
@@ -806,4 +850,12 @@ fn fuzzItems(_: void, smith: *std.testing.Smith) !void {
         const again = try sa.encode(&round);
         try testing.expectEqualSlices(u8, buf[0..16], again);
     } else |_| {}
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzItems)" {
+    try fz.fuzz_driver.run(fuzzItems, .{ .prefix = "ENIP_FUZZ", .name = "enip-encap-items" });
+}
+
+test "fuzz harness: fuzzItems, 400 seeds, reaches every outcome" {
+    try fuzzItemsMark.reach(fuzzItems, "enip-encap-items", 400);
 }

@@ -1592,6 +1592,7 @@ test "garbage frames never panic" {
 /// is — hex, because that is how a Modbus capture is quoted. A corpus entry
 /// is not the frame: `Smith.slice` reads a little-endian `u32` length first.
 const seedHex = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// Real Modbus frames, in the format the length draw reads. Random bytes
 /// essentially never satisfy the MBAP length field (`len_field + 6 ==
@@ -1625,7 +1626,7 @@ const adu_seeds = [_][]const u8{
 };
 
 test "fuzz: tcp/rtu decodeAdu and PDU response parsers never panic" {
-    try testing.fuzz({}, fuzzDecodeAdu, .{ .corpus = &adu_seeds });
+    try testing.fuzz({}, fuzzDecodeAduSmith, .{ .corpus = &adu_seeds });
 }
 
 test "corpus: every frame seed reaches both decoders, and what decodes is pinned" {
@@ -1670,10 +1671,19 @@ test "corpus: every frame seed reaches both decoders, and what decodes is pinned
     try testing.expectEqual(@as(usize, 4), responses); // the two correctly-sized read responses plus the two write echoes
 }
 
-fn fuzzDecodeAdu(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeAduMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeAduSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecodeAdu(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecodeAdu(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⚠ One byte-first draw. Never `bytes` then a ranged length.
     var buf: [300]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &adu_seeds);
+    fuzzDecodeAduMark.mark(.ran);
+    if (len != 0) fuzzDecodeAduMark.mark(.nonempty);
     const bytes = buf[0..len];
 
     _ = tcp.decodeAdu(bytes) catch {};
@@ -1685,6 +1695,14 @@ fn fuzzDecodeAdu(_: void, smith: *std.testing.Smith) !void {
     pdu.parseReadBitsResponse(bytes, .read_coils, &bits) catch {};
     pdu.parseWriteSingleResponse(bytes, .write_single_register, 1, 2) catch {};
     pdu.parseWriteMultipleResponse(bytes, .write_multiple_registers, 1, 2) catch {};
+}
+
+test "fuzz driver: MODBUS_FUZZ (fuzzDecodeAdu)" {
+    try fz.fuzz_driver.run(fuzzDecodeAdu, .{ .prefix = "MODBUS_FUZZ", .name = "modbus-root-decodeAdu" });
+}
+
+test "fuzz harness: fuzzDecodeAdu, 400 seeds, reaches every outcome" {
+    try fuzzDecodeAduMark.reach(fuzzDecodeAdu, "modbus-root-decodeAdu", 400);
 }
 
 test "meta is well-formed" {

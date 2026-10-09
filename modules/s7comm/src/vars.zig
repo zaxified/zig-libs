@@ -218,6 +218,7 @@ test "encodeRequest refuses more items than the count octet holds" {
 /// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
 /// that drive the real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// Read/Write Var request parameter blocks: the function octet, the item count,
 /// and that many twelve-octet S7ANY descriptors — with the count agreeing with
@@ -235,10 +236,17 @@ const request_seeds = [_][]const u8{
 };
 
 test "fuzz: request parameter decode never panics" {
-    try std.testing.fuzz({}, fuzzRequest, .{ .corpus = &request_seeds });
+    try std.testing.fuzz({}, fuzzRequestSmith, .{ .corpus = &request_seeds });
 }
 
-fn fuzzRequest(_: void, smith: *std.testing.Smith) !void {
+const fuzzRequestMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzRequestSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRequest(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzRequest(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -246,7 +254,9 @@ fn fuzzRequest(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever saw the empty
     // input. Measured on 2026-09-06 over the corpus above: **0 of 9
     // non-empty and 0 decoded before, 9 of 9 non-empty and 4 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &request_seeds);
+    fuzzRequestMark.mark(.ran);
+    if (len != 0) fuzzRequestMark.mark(.nonempty);
     const req = decodeRequest(buf[0..len]) catch return;
     var it = req.iterator();
     var seen: usize = 0;
@@ -257,4 +267,12 @@ fn fuzzRequest(_: void, smith: *std.testing.Smith) !void {
         try testing.expect(seen <= max_items);
     }
     try testing.expectEqual(@as(usize, req.count), seen);
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzRequest)" {
+    try fz.fuzz_driver.run(fuzzRequest, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-vars-request" });
+}
+
+test "fuzz harness: fuzzRequest, 400 seeds, reaches every outcome" {
+    try fuzzRequestMark.reach(fuzzRequest, "s7comm-vars-request", 400);
 }

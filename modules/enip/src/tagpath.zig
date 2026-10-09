@@ -336,6 +336,7 @@ test "path size in words matches what the builder produced" {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seed;
+const fz = @import("fuzz_test.zig");
 
 /// Real Logix tag paths, one per component shape the parser builds, plus the
 /// malformed ones its tests pin.
@@ -360,10 +361,17 @@ const tagpath_seeds = [_][]const u8{
 };
 
 test "fuzz: tag path parsing never panics and always encodes" {
-    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &tagpath_seeds });
+    try std.testing.fuzz({}, fuzzParseSmith, .{ .corpus = &tagpath_seeds });
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+const fuzzParseMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParse(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [128]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -373,7 +381,9 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     // non-empty and 0 that parsed before, 16 of 17 non-empty and 9 that parsed
     // after** — 16, because one seed is the empty path, which is a real input
     // for this parser and indistinguishable from the smoke round.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &tagpath_seeds);
+    fuzzParseMark.mark(.ran);
+    if (len != 0) fuzzParseMark.mark(.nonempty);
     var storage: [8]Component = undefined;
     const p = parse(buf[0..len], &storage) catch return;
     // Anything that parses must encode to a legal, even-length EPATH.
@@ -382,4 +392,12 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     try testing.expect(wire.len % 2 == 0);
     var round: [512]u8 = undefined;
     try testing.expectEqualSlices(u8, wire, try epath.reencode(wire, &round));
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzParse)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "ENIP_FUZZ", .name = "enip-tagpath-parse" });
+}
+
+test "fuzz harness: fuzzParse, 400 seeds, reaches every outcome" {
+    try fuzzParseMark.reach(fuzzParse, "enip-tagpath-parse", 400);
 }

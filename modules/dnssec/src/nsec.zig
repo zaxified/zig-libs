@@ -300,6 +300,7 @@ fn coverNsec(set: []const NsecRecord, name: []const u8) ?NsecRecord {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 /// Build a single-window (window 0) Type Bit Maps over `types` (all < 256) into
 /// caller-owned `buf` (>= 34 bytes). Constructs `.raw` directly, exactly as the
@@ -603,13 +604,23 @@ const FuzzCorpus = struct {
     }
 };
 
-fn fuzzNsecProveDenial(_: void, smith: *std.testing.Smith) !void {
+const fuzzNsecProveDenialMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzNsecProveDenialSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzNsecProveDenial(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzNsecProveDenial(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: FuzzCorpus = .{};
     var owner_buf: [512]u8 = undefined;
     var next_buf: [512]u8 = undefined;
     var qname_buf: [512]u8 = undefined;
-    const owner_len: usize = smith.slice(&owner_buf);
-    const next_len: usize = smith.slice(&next_buf);
-    const qname_len: usize = smith.slice(&qname_buf);
+    const owner_len: usize = fz.drawInput(S, src, &owner_buf, corpus.build());
+    fuzzNsecProveDenialMark.mark(.ran);
+    if (owner_len != 0) fuzzNsecProveDenialMark.mark(.nonempty);
+    const next_len: usize = src.slice(&next_buf);
+    const qname_len: usize = src.slice(&qname_buf);
 
     const rec: NsecRecord = .{
         .owner = owner_buf[0..owner_len],
@@ -622,9 +633,17 @@ fn fuzzNsecProveDenial(_: void, smith: *std.testing.Smith) !void {
     _ = proveDenial(qname_buf[0..qname_len], 1, set);
 }
 
+test "fuzz driver: DNSSEC_FUZZ (fuzzNsecProveDenial)" {
+    try fz.fuzz_driver.run(fuzzNsecProveDenial, .{ .prefix = "DNSSEC_FUZZ", .name = "dnssec-nsec-nsecProveDenial" });
+}
+
+test "fuzz harness: fuzzNsecProveDenial, 400 seeds, reaches every outcome" {
+    try fuzzNsecProveDenialMark.reach(fuzzNsecProveDenial, "dnssec-nsec-NsecProveDenial", 400);
+}
+
 test "fuzz: proveDenial never panics on hostile owner/next-domain-name/qname text (audit F8)" {
     var corpus: FuzzCorpus = .{};
-    try testing.fuzz({}, fuzzNsecProveDenial, .{ .corpus = corpus.build() });
+    try testing.fuzz({}, fuzzNsecProveDenialSmith, .{ .corpus = corpus.build() });
 }
 
 test "corpus: every fuzz seed actually reaches splitLabels with non-empty text" {

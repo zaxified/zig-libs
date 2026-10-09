@@ -1436,6 +1436,7 @@ test "a full subscription table is refused with a resources error" {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// Whole BACnet/IP datagrams as they arrive on the wire — BVLC header, NPDU,
 /// APDU — because that is what `inject` takes. Addressed at instance 599, which
@@ -1456,10 +1457,17 @@ const device_seeds = [_][]const u8{
 };
 
 test "fuzz: the device never crashes on an arbitrary datagram" {
-    try std.testing.fuzz({}, fuzzDevice, .{ .corpus = &device_seeds });
+    try std.testing.fuzz({}, fuzzDeviceSmith, .{ .corpus = &device_seeds });
 }
 
-fn fuzzDevice(_: void, smith: *std.testing.Smith) !void {
+const fuzzDeviceMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDeviceSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDevice(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDevice(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var rig: Rig = .{};
     rig.wire();
     var db = Db.init();
@@ -1473,7 +1481,17 @@ fn fuzzDevice(_: void, smith: *std.testing.Smith) !void {
     // datagram, once. Measured on 2026-09-06 over the corpus above: **0 of 12
     // non-empty and 0 that got past the BVLC header before, 12 of 12 non-empty
     // and 8 past it after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &device_seeds);
+    fuzzDeviceMark.mark(.ran);
+    if (len != 0) fuzzDeviceMark.mark(.nonempty);
     rig.device_ep.inject(rig.client_ep.address, buf[0..len]);
     _ = dev.poll(0) catch {};
+}
+
+test "fuzz driver: BACNET_FUZZ (fuzzDevice)" {
+    try fz.fuzz_driver.run(fuzzDevice, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-device-device" });
+}
+
+test "fuzz harness: fuzzDevice, 400 seeds, reaches every outcome" {
+    try fuzzDeviceMark.reach(fuzzDevice, "bacnet-device-device", 400);
 }

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `GRPC_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harnesses: `deframerNeverPanics`, `fieldValuesNeverPanic`, `responseShape`. Verdict: 200,000 runs each, ReleaseSafe, clean.
 - **2026-09-15** — **BEHAVIOURAL (new memory cap on receive, on by default):** audit `protobuf`
   F1, round-2 decision Q4 (cross-module, fixed together with `protobuf` in one commit). Both
   `Stream(Req, Rep).receive` (client) and `Methods(Req, Rep).Stream.receive` (server) used to

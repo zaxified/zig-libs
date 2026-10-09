@@ -307,6 +307,7 @@ test "encode refuses an integrity part on a type that has none" {
 /// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
 /// that drive the real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// S7CommPlus frames: the 0x72 protocol octet, a PDU type, a big-endian data
 /// length and that many octets — single, chained, and every truncation.
@@ -325,10 +326,17 @@ const frame_seeds = [_][]const u8{
 };
 
 test "fuzz: frame decode never panics" {
-    try std.testing.fuzz({}, fuzzFrame, .{ .corpus = &frame_seeds });
+    try std.testing.fuzz({}, fuzzFrameSmith, .{ .corpus = &frame_seeds });
 }
 
-fn fuzzFrame(_: void, smith: *std.testing.Smith) !void {
+const fuzzFrameMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzFrameSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFrame(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzFrame(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -336,8 +344,18 @@ fn fuzzFrame(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever saw the empty
     // input. Measured on 2026-09-06 over the corpus above: **0 of 11
     // non-empty and 0 decoded before, 11 of 11 non-empty and 3 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &frame_seeds);
+    fuzzFrameMark.mark(.ran);
+    if (len != 0) fuzzFrameMark.mark(.nonempty);
     const f = decode(buf[0..len]) catch return;
     try testing.expect(f.total_len <= len);
     try testing.expect(f.data.len <= len);
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzFrame)" {
+    try fz.fuzz_driver.run(fuzzFrame, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-s7plus-frame" });
+}
+
+test "fuzz harness: fuzzFrame, 400 seeds, reaches every outcome" {
+    try fuzzFrameMark.reach(fuzzFrame, "s7comm-s7plus-frame", 400);
 }

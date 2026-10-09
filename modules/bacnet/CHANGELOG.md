@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `BACNET_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Fourteen harnesses (apdu, bvll, device, npdu, sc decode/options, sc hub, sc node, service, service integers, tag skip/appValue/openedBlock/headerRoundTrip). Verdict: 200,000 runs each, ReleaseSafe, clean.
 - **2026-10-05** — Mutation run: 26 of 43 killed, 0 equivalent; 7 tests added
   and 8 existing tests extended (fixed-size BVLC bodies one octet long, ragged
   Write-BDT and `bdtIterator` bodies, the u16 length on encode, DLEN one past

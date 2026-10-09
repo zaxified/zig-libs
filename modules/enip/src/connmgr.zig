@@ -1008,6 +1008,7 @@ test "backplane route builds port 1 link slot" {
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
 const fuzzSeedInto = @import("testkit").fuzz.seedInto;
+const fz = @import("fuzz_test.zig");
 
 /// Connection Manager service bodies. The five decoders this harness calls
 /// read the same octets five ways, so the corpus carries one body of each
@@ -1022,7 +1023,11 @@ const connmgr_seeds = [_][]const u8{
     fuzzSeed("0103"), // a tick count with no body
 };
 
-test "fuzz: connection manager decoders never panic" {
+/// Backing storage for the encoder-built seeds below.
+const ConnMgrStore = struct { us_odd: [4 + 64]u8, us_even: [4 + 64]u8, fo: [4 + 128]u8, fc: [4 + 64]u8 };
+const connmgr_corpus_len = connmgr_seeds.len + 4;
+
+fn buildConnMgrCorpus(corpus: *[connmgr_corpus_len][]const u8, store: *ConnMgrStore) void {
     // The Unconnected_Send/Forward_Open/Forward_Close-shaped entries this
     // corpus used to carry were typed by hand as a plausible-looking shape.
     // Measured 2026-09-10: the two hand-typed Unconnected_Send bodies no
@@ -1043,16 +1048,14 @@ test "fuzz: connection manager decoders never panic" {
         .embedded = &[_]u8{ 0x4C, 0x03, 0x91, 0x05, 'S', 'C', 'A', 'D', 'A', 0x00, 0x28 }, // odd length: exercises the pad-octet branch
         .route_path = &backplane_slot_0,
     }).encode(&us_odd_buf) catch unreachable;
-    var us_odd_seed_buf: [4 + us_odd_buf.len]u8 = undefined;
-    const us_odd_seed = fuzzSeedInto(&us_odd_seed_buf, us_odd);
+    const us_odd_seed = fuzzSeedInto(&store.us_odd, us_odd);
 
     var us_even_buf: [64]u8 = undefined;
     const us_even = (UnconnectedSend{
         .embedded = &[_]u8{ 0x4C, 0x03, 0x91, 0x05, 'S', 'C', 'A', 'D', 'A', 0x00, 0x28, 0x00 }, // even length: no pad octet
         .route_path = &backplane_slot_0,
     }).encode(&us_even_buf) catch unreachable;
-    var us_even_seed_buf: [4 + us_even_buf.len]u8 = undefined;
-    const us_even_seed = fuzzSeedInto(&us_even_seed_buf, us_even);
+    const us_even_seed = fuzzSeedInto(&store.us_even, us_even);
 
     var fo_body_buf: [128]u8 = undefined;
     const fo_body = (ForwardOpen{
@@ -1067,8 +1070,7 @@ test "fuzz: connection manager decoders never panic" {
         .t_to_o_params = .{ .size = 500, .variable = true, .priority = .low, .connection_type = .point_to_point },
         .connection_path = &[_]u8{ 0x20, 0x02, 0x24, 0x01 },
     }).encode(&fo_body_buf) catch unreachable;
-    var fo_seed_buf: [4 + fo_body_buf.len]u8 = undefined;
-    const fo_seed = fuzzSeedInto(&fo_seed_buf, fo_body);
+    const fo_seed = fuzzSeedInto(&store.fo, fo_body);
 
     var fc_body_buf: [64]u8 = undefined;
     const fc_body = (ForwardClose{
@@ -1077,16 +1079,20 @@ test "fuzz: connection manager decoders never panic" {
         .originator_serial = 0x89AB_CDEF,
         .connection_path = &[_]u8{ 0x20, 0x02, 0x24, 0x01 },
     }).encode(&fc_body_buf) catch unreachable;
-    var fc_seed_buf: [4 + fc_body_buf.len]u8 = undefined;
-    const fc_seed = fuzzSeedInto(&fc_seed_buf, fc_body);
+    const fc_seed = fuzzSeedInto(&store.fc, fc_body);
 
-    var corpus: [connmgr_seeds.len + 4][]const u8 = undefined;
     @memcpy(corpus[0..connmgr_seeds.len], &connmgr_seeds);
     corpus[connmgr_seeds.len] = us_odd_seed;
     corpus[connmgr_seeds.len + 1] = us_even_seed;
     corpus[connmgr_seeds.len + 2] = fo_seed;
     corpus[connmgr_seeds.len + 3] = fc_seed;
-    try std.testing.fuzz({}, fuzzConnMgr, .{ .corpus = &corpus });
+}
+
+test "fuzz: connection manager decoders never panic" {
+    var store: ConnMgrStore = undefined;
+    var corpus: [connmgr_corpus_len][]const u8 = undefined;
+    buildConnMgrCorpus(&corpus, &store);
+    try std.testing.fuzz({}, fuzzConnMgrSmith, .{ .corpus = &corpus });
 }
 
 test "corpus: the encoder-built Unconnected_Send/Forward_Open/Forward_Close seeds are actually accepted" {
@@ -1144,7 +1150,14 @@ test "corpus: the encoder-built Unconnected_Send/Forward_Open/Forward_Close seed
     try testing.expectEqualSlices(u8, fc_body, try fc.encode(&fc_round));
 }
 
-fn fuzzConnMgr(_: void, smith: *std.testing.Smith) !void {
+const fuzzConnMgrMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzConnMgrSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzConnMgr(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzConnMgr(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -1176,7 +1189,12 @@ fn fuzzConnMgr(_: void, smith: *std.testing.Smith) !void {
     // (`ForwardOpenReply`/`ForwardCloseReply`, which parse a TARGET's
     // answer, not a request) have no seed shaped for them yet — a corpus
     // gap this note now records rather than hides.
-    const len: usize = smith.slice(&buf);
+    var store: ConnMgrStore = undefined;
+    var corpus: [connmgr_corpus_len][]const u8 = undefined;
+    buildConnMgrCorpus(&corpus, &store);
+    const len: usize = fz.drawInput(S, src, &buf, &corpus);
+    fuzzConnMgrMark.mark(.ran);
+    if (len != 0) fuzzConnMgrMark.mark(.nonempty);
     var round: [1024]u8 = undefined;
     if (UnconnectedSend.decode(buf[0..len])) |us| {
         const again = try us.encode(&round);
@@ -1195,4 +1213,12 @@ fn fuzzConnMgr(_: void, smith: *std.testing.Smith) !void {
     } else |_| {}
     _ = ForwardOpenReply.decode(buf[0..len]) catch {};
     _ = ForwardCloseReply.decode(buf[0..len]) catch {};
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzConnMgr)" {
+    try fz.fuzz_driver.run(fuzzConnMgr, .{ .prefix = "ENIP_FUZZ", .name = "enip-connmgr-connMgr" });
+}
+
+test "fuzz harness: fuzzConnMgr, 400 seeds, reaches every outcome" {
+    try fuzzConnMgrMark.reach(fuzzConnMgr, "enip-connmgr-connMgr", 400);
 }

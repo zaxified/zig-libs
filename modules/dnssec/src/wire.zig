@@ -104,6 +104,7 @@ pub fn encodeCanonicalName(name: []const u8, out: []u8) NameError![]u8 {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 test "decodeUncompressedName: simple name" {
     const wire = "\x03www\x07example\x03com\x00";
@@ -207,18 +208,35 @@ const name_seeds = [_][]const u8{
 };
 
 test "fuzz: decodeUncompressedName never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeUncompressedName, .{ .corpus = &name_seeds });
+    try testing.fuzz({}, fuzzDecodeUncompressedNameSmith, .{ .corpus = &name_seeds });
 }
 
-fn fuzzDecodeUncompressedName(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeUncompressedNameMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeUncompressedNameSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecodeUncompressedName(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecodeUncompressedName(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [300]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &name_seeds);
+    fuzzDecodeUncompressedNameMark.mark(.ran);
+    if (len != 0) fuzzDecodeUncompressedNameMark.mark(.nonempty);
 
     var out: [max_name_text_len]u8 = undefined;
     var start: usize = 0;
     while (start <= len) : (start += 1) {
         _ = decodeUncompressedName(buf[0..len], start, &out) catch continue;
     }
+}
+
+test "fuzz driver: DNSSEC_FUZZ (fuzzDecodeUncompressedName)" {
+    try fz.fuzz_driver.run(fuzzDecodeUncompressedName, .{ .prefix = "DNSSEC_FUZZ", .name = "dnssec-wire-decodeUncompressedName" });
+}
+
+test "fuzz harness: fuzzDecodeUncompressedName, 400 seeds, reaches every outcome" {
+    try fuzzDecodeUncompressedNameMark.reach(fuzzDecodeUncompressedName, "dnssec-wire-DecodeUncompressedName", 400);
 }
 
 test "corpus: every name seed reaches the decoder, and the offsets that decode are pinned" {

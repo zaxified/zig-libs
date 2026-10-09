@@ -694,6 +694,7 @@ pub const Node = NodeWith(4, sc.min_bvlc_length);
 // ── tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 const test_uuid = sc.Uuid{ .octets = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 } };
 const hub_uuid = sc.Uuid{ .octets = @splat(0xA5) };
@@ -1374,13 +1375,33 @@ const NodeRun = struct {
 
 fn fuzzNode(run: *NodeRun, smith: *std.testing.Smith) !void {
     run.* = .{};
-    try driveNode(smith, run);
+    try driveNode(std.testing.Smith, smith, run);
+}
+
+const fuzzNodeMark = fz.Marker(enum { ran, decodable, emitted });
+
+/// The driver's half: the same body over the PRNG source.
+fn fuzzNodeRng(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var run: NodeRun = .{};
+    try driveNode(S, src, &run);
+    fuzzNodeMark.mark(.ran);
+    if (run.decodable != 0) fuzzNodeMark.mark(.decodable);
+    if (run.emitted != 0) fuzzNodeMark.mark(.emitted);
+}
+
+test "fuzz driver: BACNET_FUZZ (fuzzNode)" {
+    try fz.fuzz_driver.run(fuzzNodeRng, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-sc_node-node" });
+}
+
+test "fuzz harness: fuzzNode, 400 seeds, reaches every outcome" {
+    try fuzzNodeMark.reach(fuzzNodeRng, "bacnet-sc_node-node", 400);
 }
 
 /// ⭐ The harness body, factored out so the corpus guard below drives the SAME
 /// draw sequence rather than a paraphrase of it. A guard that measures a
 /// different sequence from the one the fuzzer runs is not a guard.
-fn driveNode(smith: *std.testing.Smith, run: *NodeRun) !void {
+fn driveNode(comptime S: type, smith: *S, run: *NodeRun) !void {
     var prng = std.Random.DefaultPrng.init(smith.value(u64));
     var node = testNode(&prng);
     var accept_buf: [64]u8 = undefined;
@@ -1454,7 +1475,7 @@ test "corpus: the node seeds drive every knob, and the counts are pinned" {
     for (node_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var run: NodeRun = .{};
-        try driveNode(&smith, &run);
+        try driveNode(std.testing.Smith, &smith, &run);
         states_seen[run.state] = true;
         totals.frames += run.frames;
         totals.nonempty += run.nonempty;

@@ -705,7 +705,7 @@ test "fuzz: the responder never panics on hostile requests inside a well-formed 
         prng.random().bytes(b);
         s.* = b;
     }
-    try std.testing.fuzz({}, fuzzHandle, .{ .corpus = &seeds });
+    try std.testing.fuzz({}, fuzzHandleSmith, .{ .corpus = &seeds });
 }
 
 // ── the structure-aware responder harness ───────────────────────────────────
@@ -786,12 +786,12 @@ const fuzz_data_sizes = [_]u8{ 0x00, 0x03, 0x04, 0x05, 0x06, 0x07, 0x09 };
 /// knob with `value(u64)` and reduce it yourself", and that is a three-function
 /// change here. An exemption would have recorded the collapse as acceptable and
 /// left the responder untested.
-fn drawBelow(smith: *std.testing.Smith, bound: u64) u64 {
+fn drawBelow(smith: anytype, bound: u64) u64 {
     return smith.value(u64) % bound;
 }
 
 /// `boolWeighted(num, den - num)` with a draw the seed can steer.
-fn drawOdds(smith: *std.testing.Smith, num: u64, den: u64) bool {
+fn drawOdds(smith: anytype, num: u64, den: u64) bool {
     return drawBelow(smith, den) < num;
 }
 
@@ -799,7 +799,7 @@ fn drawOdds(smith: *std.testing.Smith, num: u64, den: u64) bool {
 /// ranged draw: its weights are `0..maxInt(T)`, and `weightsContain` is false
 /// for all but a vanishing fraction of the 64-bit words it reads, so it too
 /// returned 0. Truncating a full-width `value(u64)` keeps every input word.
-fn drawWide(smith: *std.testing.Smith, comptime T: type) T {
+fn drawWide(smith: anytype, comptime T: type) T {
     return @truncate(smith.value(u64));
 }
 
@@ -807,7 +807,7 @@ fn drawWide(smith: *std.testing.Smith, comptime T: type) T {
 /// because a wrong one is rejected by `items.Item.decode` before the responder
 /// ever sees the item — that refusal is `items.zig`'s harness's job, not this
 /// one's.
-fn fuzzItemBytes(smith: *std.testing.Smith, out: *[12]u8) void {
+fn fuzzItemBytes(smith: anytype, out: *[12]u8) void {
     out[0] = 0x12;
     out[1] = 0x0A;
     out[2] = 0x10;
@@ -854,7 +854,7 @@ fn fuzzItemBytes(smith: *std.testing.Smith, out: *[12]u8) void {
 /// data-block iterator rejects the frame before `applyWrite` runs and the
 /// whole request is wasted — but sometimes a lie, which is the case
 /// `applyWrite`'s own `value.payload.len < want` guard exists for.
-fn fuzzWriteValue(smith: *std.testing.Smith, data: []u8, pos: usize, last: bool) ?usize {
+fn fuzzWriteValue(smith: anytype, data: []u8, pos: usize, last: bool) ?usize {
     const ts: items.DataTransportSize = @enumFromInt(fuzz_data_sizes[@intCast(drawBelow(smith, fuzz_data_sizes.len))]);
     const n: usize = @intCast(drawBelow(smith, 33));
     const honest = items.encodeLength(ts, n) catch return null;
@@ -904,7 +904,7 @@ fn fuzzEnvelope(rosctr: u8, params: []const u8, data: []const u8, out: []u8) ?[]
 
 /// Builds one request. Returns null when this draw could not be assembled, in
 /// which case the caller simply moves on.
-fn fuzzRequest(smith: *std.testing.Smith, out: []u8) ?[]const u8 {
+fn fuzzRequest(smith: anytype, out: []u8) ?[]const u8 {
     var params: [320]u8 = undefined;
     var data: [640]u8 = undefined;
     var plen: usize = 0;
@@ -992,7 +992,24 @@ fn fuzzRequest(smith: *std.testing.Smith, out: []u8) ?[]const u8 {
     return fuzzEnvelope(rosctr, params[0..plen], data[0..dlen], out);
 }
 
-fn fuzzHandle(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const fuzzHandleMark = fz.Marker(enum { ran, request_built, replied });
+
+fn fuzzHandleSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzHandle(std.testing.Smith, smith, std.testing.allocator);
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzHandle)" {
+    try fz.fuzz_driver.run(fuzzHandle, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-server-handle" });
+}
+
+test "fuzz harness: fuzzHandle, 400 seeds, reaches every outcome" {
+    try fuzzHandleMark.reach(fuzzHandle, "s7comm-server-handle", 400);
+}
+
+fn fuzzHandle(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    fuzzHandleMark.mark(.ran);
     var storage: [128]u8 = @splat(0);
     var areas = [_]AreaBinding{
         .{ .area = .db, .db_number = 1, .bytes = storage[0..64] },
@@ -1010,6 +1027,8 @@ fn fuzzHandle(_: void, smith: *std.testing.Smith) !void {
     var n: usize = 0;
     while (n < 4) : (n += 1) {
         const frame = fuzzRequest(smith, &frame_buf) orelse continue;
-        _ = r.handle(frame, &out) catch continue;
+        fuzzHandleMark.mark(.request_built);
+        const reply = r.handle(frame, &out) catch continue;
+        if (reply != null) fuzzHandleMark.mark(.replied);
     }
 }

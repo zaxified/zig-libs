@@ -375,6 +375,7 @@ pub const algorithm = struct {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 test "parseDnskey: flags/protocol/algorithm/public_key split" {
     const rdata = "\x01\x01" ++ "\x03" ++ "\x08" ++ "\xde\xad\xbe\xef";
@@ -631,26 +632,35 @@ const RdataCorpus = struct {
 
 test "fuzz: RDATA parsers never panic on arbitrary bytes" {
     var corpus: RdataCorpus = .{};
-    try testing.fuzz({}, fuzzRdata, .{ .corpus = corpus.build() });
+    try testing.fuzz({}, fuzzRdataSmith, .{ .corpus = corpus.build() });
 }
 
-fn fuzzRdata(_: void, smith: *std.testing.Smith) !void {
+const fuzzRdataMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzRdataSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRdata(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzRdata(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: RdataCorpus = .{};
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, corpus.build());
+    fuzzRdataMark.mark(.ran);
+    if (len != 0) fuzzRdataMark.mark(.nonempty);
     const rdata = buf[0..len];
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const gpa = arena.allocator();
+    const aa = arena.allocator();
 
     _ = parseDnskey(rdata) catch {};
-    _ = parseRrsig(gpa, rdata) catch {};
+    _ = parseRrsig(aa, rdata) catch {};
     _ = parseDs(rdata) catch {};
     _ = parseTypeBitMap(rdata) catch {};
-    _ = parseNsec(gpa, rdata) catch {};
+    _ = parseNsec(aa, rdata) catch {};
     _ = parseNsec3(rdata) catch {};
     _ = parseNsec3Param(rdata) catch {};
-    // ⛔ Not `smith.value(u8)`: a knob drawn AFTER the byte draw reads an
+    // ⛔ Not `src.value(u8)`: a knob drawn AFTER the byte draw reads an
     // exhausted input and returns the weight minimum, which is 0 -- and
     // algorithm 0 is the one `keyTag` special-cases nowhere. Sweeping the
     // registered numbers instead costs seven cheap calls and does not depend on
@@ -658,6 +668,14 @@ fn fuzzRdata(_: void, smith: *std.testing.Smith) !void {
     for ([_]u8{ 0, algorithm.rsasha1, algorithm.rsasha256, algorithm.ecdsap256sha256, algorithm.ed25519, 200, 255 }) |alg| {
         _ = keyTag(rdata, alg);
     }
+}
+
+test "fuzz driver: DNSSEC_FUZZ (fuzzRdata)" {
+    try fz.fuzz_driver.run(fuzzRdata, .{ .prefix = "DNSSEC_FUZZ", .name = "dnssec-rdata-rdata" });
+}
+
+test "fuzz harness: fuzzRdata, 400 seeds, reaches every outcome" {
+    try fuzzRdataMark.reach(fuzzRdata, "dnssec-rdata-Rdata", 400);
 }
 
 test "corpus: every RDATA seed reaches the parsers, and what each accepted is pinned" {

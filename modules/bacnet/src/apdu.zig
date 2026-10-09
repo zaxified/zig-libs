@@ -759,6 +759,7 @@ test "unknown PDU types and empty buffers" {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seed;
+const fz = @import("fuzz_test.zig");
 
 /// One APDU per PDU type this decoder dispatches on, lifted from the tests
 /// above, plus the two rejections that bound the type octet.
@@ -779,10 +780,17 @@ const apdu_seeds = [_][]const u8{
 };
 
 test "fuzz: APDU decode never panics and round-trips what it accepts" {
-    try std.testing.fuzz({}, fuzzApdu, .{ .corpus = &apdu_seeds });
+    try std.testing.fuzz({}, fuzzApduSmith, .{ .corpus = &apdu_seeds });
 }
 
-fn fuzzApdu(_: void, smith: *std.testing.Smith) !void {
+const fuzzApduMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzApduSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzApdu(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzApdu(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and a ranged draw then
@@ -790,10 +798,20 @@ fn fuzzApdu(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever decoded the empty
     // APDU. Measured on 2026-09-06 over the corpus above: **0 of 13 non-empty
     // and 0 decoded before, 13 of 13 non-empty and 11 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &apdu_seeds);
+    fuzzApduMark.mark(.ran);
+    if (len != 0) fuzzApduMark.mark(.nonempty);
     const input = buf[0..len];
     const a = decode(input) catch return;
     var out: [256]u8 = undefined;
     const again = encode(a, &out) catch return;
     try testing.expectEqualSlices(u8, input, again);
+}
+
+test "fuzz driver: BACNET_FUZZ (fuzzApdu)" {
+    try fz.fuzz_driver.run(fuzzApdu, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-apdu-apdu" });
+}
+
+test "fuzz harness: fuzzApdu, 400 seeds, reaches every outcome" {
+    try fuzzApduMark.reach(fuzzApdu, "bacnet-apdu-apdu", 400);
 }

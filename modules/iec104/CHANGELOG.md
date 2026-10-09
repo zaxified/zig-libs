@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `IEC104_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harnesses: `apci-decode`, `apci-framer`, `asdu`, `info-time`, `outstation-handle`. Verdict: 200,000 runs each, ReleaseSafe, clean.
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The write→read→write regression
   test bound the fixed port 15683; its peer now binds port 0 and publishes the port it got. Its
   1 s listen wait became a 30 s watchdog.

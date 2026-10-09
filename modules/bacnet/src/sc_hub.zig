@@ -555,6 +555,7 @@ pub const Hub = HubWith(8, 16, sc.min_bvlc_length);
 // ── tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 const hub_vmac = sc.Vmac{ .octets = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF } };
 const hub_uuid = sc.Uuid{ .octets = @splat(0xA5) };
@@ -998,13 +999,33 @@ const HubRun = struct {
 
 fn fuzzHub(run: *HubRun, smith: *std.testing.Smith) !void {
     run.* = .{};
-    try driveHub(smith, run);
+    try driveHub(std.testing.Smith, smith, run);
+}
+
+const fuzzHubMark = fz.Marker(enum { ran, decodable, emitted });
+
+/// The driver's half: the same body over the PRNG source.
+fn fuzzHubRng(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var run: HubRun = .{};
+    try driveHub(S, src, &run);
+    fuzzHubMark.mark(.ran);
+    if (run.decodable != 0) fuzzHubMark.mark(.decodable);
+    if (run.emitted != 0) fuzzHubMark.mark(.emitted);
+}
+
+test "fuzz driver: BACNET_FUZZ (fuzzHub)" {
+    try fz.fuzz_driver.run(fuzzHubRng, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-sc_hub-hub" });
+}
+
+test "fuzz harness: fuzzHub, 400 seeds, reaches every outcome" {
+    try fuzzHubMark.reach(fuzzHubRng, "bacnet-sc_hub-hub", 400);
 }
 
 /// ⭐ The harness body, factored out so the corpus guard below drives the SAME
 /// draw sequence rather than a paraphrase of it. A guard that measures a
 /// different sequence from the one the fuzzer runs is not a guard.
-fn driveHub(smith: *std.testing.Smith, run: *HubRun) !void {
+fn driveHub(comptime S: type, smith: *S, run: *HubRun) !void {
     var prng = std.Random.DefaultPrng.init(smith.value(u64));
     var hub = testHub(&prng);
     var cbuf: [64]u8 = undefined;
@@ -1077,7 +1098,7 @@ test "corpus: the hub seeds drive every knob, and the counts are pinned" {
     for (hub_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var run: HubRun = .{};
-        try driveHub(&smith, &run);
+        try driveHub(std.testing.Smith, &smith, &run);
         totals.frames += run.frames;
         totals.nonempty += run.nonempty;
         totals.decodable += run.decodable;

@@ -188,6 +188,7 @@ test "hostile: a grpc-timeout value outside the grammar is rejected" {
 /// little-endian u32 length first (see `testkit/src/fuzz.zig`).
 const seed = @import("testkit").fuzz.seedHex;
 const testkit = @import("testkit");
+const fz = @import("fuzz_test.zig");
 
 /// What a stream did to the deframer, so the guard below can measure the
 /// corpus rather than assert it merely ran.
@@ -285,10 +286,18 @@ const DeframeCorpus = struct {
 
 test "fuzz: the deframer never panics on arbitrary bytes, however they are chopped" {
     var corpus: DeframeCorpus = .{};
-    try std.testing.fuzz({}, fuzzDeframerNeverPanics, .{ .corpus = corpus.build() });
+    try std.testing.fuzz({}, fuzzDeframerNeverPanicsSmith, .{ .corpus = corpus.build() });
 }
 
-fn fuzzDeframerNeverPanics(_: void, smith: *std.testing.Smith) !void {
+const fuzzDeframerNeverPanicsMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDeframerNeverPanicsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDeframerNeverPanics(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDeframerNeverPanics(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: DeframeCorpus = .{};
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -299,12 +308,22 @@ fn fuzzDeframerNeverPanics(_: void, smith: *std.testing.Smith) !void {
     // all. `check-fuzz-reach` only learned to see that shape on 2026-09-07.
     // Measured over the corpus above: **0 of 11 seeds reached `push` and 0
     // messages were deframed before, 11 of 11 and 109 messages after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, corpus.build());
+    fuzzDeframerNeverPanicsMark.mark(.ran);
+    if (len != 0) fuzzDeframerNeverPanicsMark.mark(.nonempty);
     // ⚠ `value(u64)` and a `%`, not `valueRangeAtMost(u16, 1, 64)`: a ranged
     // draw taken after the bytes is its minimum, so every stream was chopped
     // one octet at a time. See `DeframeCorpus`.
-    const chunk: usize = @intCast(smith.value(u64) % 64 + 1);
+    const chunk: usize = @intCast(src.value(u64) % 64 + 1);
     _ = try runDeframeStream(buf[0..len], chunk);
+}
+
+test "fuzz driver: GRPC_FUZZ (fuzzDeframerNeverPanics)" {
+    try fz.fuzz_driver.run(fuzzDeframerNeverPanics, .{ .prefix = "GRPC_FUZZ", .name = "grpc-adversarial-deframerNeverPanics" });
+}
+
+test "fuzz harness: fuzzDeframerNeverPanics, 400 seeds, reaches every outcome" {
+    try fuzzDeframerNeverPanicsMark.reach(fuzzDeframerNeverPanics, "grpc-adversarial-deframerNeverPanics", 400);
 }
 
 test "corpus: every deframer seed reaches push with the chunk size it was written for" {
@@ -368,10 +387,16 @@ const field_seeds = [_][]const u8{
 };
 
 test "fuzz: status, timeout and metadata field parsing never panic" {
-    try std.testing.fuzz({}, fuzzFieldValuesNeverPanic, .{ .corpus = &field_seeds });
+    try std.testing.fuzz({}, fuzzFieldValuesNeverPanicSmith, .{ .corpus = &field_seeds });
 }
 
-fn fuzzFieldValuesNeverPanic(_: void, smith: *std.testing.Smith) !void {
+const fuzzFieldValuesNeverPanicMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzFieldValuesNeverPanicSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFieldValuesNeverPanic(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzFieldValuesNeverPanic(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length — see `fuzzDeframerNeverPanics` above. `len` was 0 for every
@@ -379,7 +404,9 @@ fn fuzzFieldValuesNeverPanic(_: void, smith: *std.testing.Smith) !void {
     // Measured over the corpus above: **0 of 20 seeds non-empty, 0 statuses,
     // 0 timeouts and 0 binary values resolved before; 20 of 20 non-empty, 3
     // statuses, 2 timeouts and 6 binary values after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &field_seeds);
+    fuzzFieldValuesNeverPanicMark.mark(.ran);
+    if (len != 0) fuzzFieldValuesNeverPanicMark.mark(.nonempty);
     const value = buf[0..len];
 
     _ = status.parse(value);
@@ -393,8 +420,16 @@ fn fuzzFieldValuesNeverPanic(_: void, smith: *std.testing.Smith) !void {
         _ = status.encodeMessage(decoded, &enc);
     }
 
-    const r = metadata.decodeValue(std.testing.allocator, "x-bin", value) catch return;
-    r.deinit(std.testing.allocator);
+    const r = metadata.decodeValue(gpa, "x-bin", value) catch return;
+    r.deinit(gpa);
+}
+
+test "fuzz driver: GRPC_FUZZ (fuzzFieldValuesNeverPanic)" {
+    try fz.fuzz_driver.run(fuzzFieldValuesNeverPanic, .{ .prefix = "GRPC_FUZZ", .name = "grpc-adversarial-fieldValuesNeverPanic" });
+}
+
+test "fuzz harness: fuzzFieldValuesNeverPanic, 400 seeds, reaches every outcome" {
+    try fuzzFieldValuesNeverPanicMark.reach(fuzzFieldValuesNeverPanic, "grpc-adversarial-fieldValuesNeverPanic", 400);
 }
 
 test "corpus: every field seed reaches the parsers, and what they resolved is pinned" {

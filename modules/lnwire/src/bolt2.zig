@@ -1276,11 +1276,18 @@ const OpenChannelCorpus = struct {
 
 test "fuzz: decodeOpenChannel never panics on arbitrary bytes" {
     var corpus: OpenChannelCorpus = .{};
-    try testing.fuzz({}, fuzzDecodeOpenChannel, .{ .corpus = try corpus.build(testing.allocator) });
+    try testing.fuzz({}, fuzzDecodeOpenChannelSmith, .{ .corpus = try corpus.build(testing.allocator) });
 }
 
-fn fuzzDecodeOpenChannel(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+const fuzzDecodeOpenChannelMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeOpenChannelSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecodeOpenChannel(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecodeOpenChannel(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: OpenChannelCorpus = .{};
+    const allocator = gpa;
     var buf: [400]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -1295,10 +1302,20 @@ fn fuzzDecodeOpenChannel(_: void, smith: *std.testing.Smith) !void {
     // does not is the `WrongType` case, which is worth having.
     // Measured 2026-09-07 over the corpus above: **0 of 9 seeds non-empty and
     // 0 decoded before, 9 of 9 non-empty and 3 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, (try corpus.build(gpa)));
+    fuzzDecodeOpenChannelMark.mark(.ran);
+    if (len != 0) fuzzDecodeOpenChannelMark.mark(.nonempty);
 
     var m = decodeOpenChannel(allocator, buf[0..len]) catch return;
     defer m.deinit(allocator);
+}
+
+test "fuzz driver: LNWIRE_FUZZ (fuzzDecodeOpenChannel)" {
+    try fz.fuzz_driver.run(fuzzDecodeOpenChannel, .{ .prefix = "LNWIRE_FUZZ", .name = "lnwire-bolt2-decodeOpenChannel" });
+}
+
+test "fuzz harness: fuzzDecodeOpenChannel, 400 seeds, reaches every outcome" {
+    try fuzzDecodeOpenChannelMark.reach(fuzzDecodeOpenChannel, "lnwire-bolt2-decodeOpenChannel", 400);
 }
 
 test "corpus: every open_channel seed reaches the decoder, and the counts are pinned" {
@@ -1334,6 +1351,7 @@ test "corpus: every open_channel seed reaches the decoder, and the counts are pi
 // ── channel_reestablish / update_fail_malformed_htlc (added 2026-10-06) ──
 
 const rm_kat = @import("bolt2_reestablish_malformed_kat_vectors.zig");
+const fz = @import("fuzz_test.zig");
 
 fn hexArray(comptime n: usize, hex: []const u8) [n]u8 {
     var out: [n]u8 = undefined;
@@ -1610,14 +1628,31 @@ fn runReestablishMalformed(allocator: Allocator, bytes: []const u8) ReestablishF
 
 test "fuzz: decodeChannelReestablish / decodeUpdateFailMalformedHtlc never panic on arbitrary bytes" {
     var corpus: ReestablishCorpus = .{};
-    try testing.fuzz({}, fuzzReestablishMalformed, .{ .corpus = try corpus.build(testing.allocator) });
+    try testing.fuzz({}, fuzzReestablishMalformedSmith, .{ .corpus = try corpus.build(testing.allocator) });
 }
 
-fn fuzzReestablishMalformed(_: void, smith: *std.testing.Smith) !void {
+const fuzzReestablishMalformedMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzReestablishMalformedSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzReestablishMalformed(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzReestablishMalformed(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: ReestablishCorpus = .{};
     var buf: [256]u8 = undefined;
     // One faithful `smith.slice` draw (see `fuzzDecodeOpenChannel`).
-    const len: usize = smith.slice(&buf);
-    _ = runReestablishMalformed(testing.allocator, buf[0..len]);
+    const len: usize = fz.drawInput(S, src, &buf, (try corpus.build(gpa)));
+    fuzzReestablishMalformedMark.mark(.ran);
+    if (len != 0) fuzzReestablishMalformedMark.mark(.nonempty);
+    _ = runReestablishMalformed(gpa, buf[0..len]);
+}
+
+test "fuzz driver: LNWIRE_FUZZ (fuzzReestablishMalformed)" {
+    try fz.fuzz_driver.run(fuzzReestablishMalformed, .{ .prefix = "LNWIRE_FUZZ", .name = "lnwire-bolt2-reestablishMalformed" });
+}
+
+test "fuzz harness: fuzzReestablishMalformed, 400 seeds, reaches every outcome" {
+    try fuzzReestablishMalformedMark.reach(fuzzReestablishMalformed, "lnwire-bolt2-reestablishMalformed", 400);
 }
 
 test "corpus: every reestablish/malformed seed reaches a decoder, and the counts are pinned" {

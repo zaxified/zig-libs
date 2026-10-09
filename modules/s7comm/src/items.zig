@@ -699,6 +699,7 @@ test "payloadBytes covers the element widths" {
 /// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
 /// that drive the real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// Twelve-octet S7ANY item descriptors: one per transport size a client really
 /// asks for, the two areas whose address counts elements rather than bits, and
@@ -722,10 +723,17 @@ const item_seeds = [_][]const u8{
 };
 
 test "fuzz: item decode never panics" {
-    try std.testing.fuzz({}, fuzzItem, .{ .corpus = &item_seeds });
+    try std.testing.fuzz({}, fuzzItemSmith, .{ .corpus = &item_seeds });
 }
 
-fn fuzzItem(_: void, smith: *std.testing.Smith) !void {
+const fuzzItemMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzItemSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzItem(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzItem(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [32]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -733,10 +741,20 @@ fn fuzzItem(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever saw the empty
     // input. Measured on 2026-09-06 over the corpus above: **0 of 15
     // non-empty and 0 decoded before, 15 of 15 non-empty and 12 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &item_seeds);
+    fuzzItemMark.mark(.ran);
+    if (len != 0) fuzzItemMark.mark(.nonempty);
     const it = Item.decode(buf[0..len]) catch return;
     var round: [item_len]u8 = undefined;
     try testing.expectEqualSlices(u8, buf[0..item_len], try it.encode(&round));
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzItem)" {
+    try fz.fuzz_driver.run(fuzzItem, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-items-item" });
+}
+
+test "fuzz harness: fuzzItem, 400 seeds, reaches every outcome" {
+    try fuzzItemMark.reach(fuzzItem, "s7comm-items-item", 400);
 }
 
 /// Data-item blocks as a Read/Write Var reply carries them: a return code, a
@@ -756,10 +774,17 @@ const data_item_seeds = [_][]const u8{
 };
 
 test "fuzz: data item iterator never panics or runs past its block" {
-    try std.testing.fuzz({}, fuzzDataItems, .{ .corpus = &data_item_seeds });
+    try std.testing.fuzz({}, fuzzDataItemsSmith, .{ .corpus = &data_item_seeds });
 }
 
-fn fuzzDataItems(_: void, smith: *std.testing.Smith) !void {
+const fuzzDataItemsMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDataItemsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDataItems(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDataItems(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ See `fuzzItem`. `count` is drawn AFTER the block now and with
     // `value(u64)`, not `valueRangeAtMost`: a ranged draw returns its minimum
@@ -768,8 +793,10 @@ fn fuzzDataItems(_: void, smith: *std.testing.Smith) !void {
     // step. Measured on 2026-09-06 over the corpus above: **0 of 10 non-empty
     // and one single (block, count) pair before; 10 of 10 non-empty
     // and 6 distinct pairs after.**
-    const len: usize = smith.slice(&buf);
-    const count: u16 = @intCast(smith.value(u64) % 41);
+    const len: usize = fz.drawInput(S, src, &buf, &data_item_seeds);
+    fuzzDataItemsMark.mark(.ran);
+    if (len != 0) fuzzDataItemsMark.mark(.nonempty);
+    const count: u16 = @intCast(src.value(u64) % 41);
     var it = DataItemIterator.init(buf[0..len], count);
     var guard: usize = 0;
     while (true) {
@@ -779,4 +806,12 @@ fn fuzzDataItems(_: void, smith: *std.testing.Smith) !void {
         if (got == null) break;
         try testing.expect(it.consumed() <= len);
     }
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzDataItems)" {
+    try fz.fuzz_driver.run(fuzzDataItems, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-items-dataItems" });
+}
+
+test "fuzz harness: fuzzDataItems, 400 seeds, reaches every outcome" {
+    try fuzzDataItemsMark.reach(fuzzDataItems, "s7comm-items-dataItems", 400);
 }

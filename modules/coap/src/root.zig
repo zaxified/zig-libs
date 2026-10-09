@@ -623,6 +623,7 @@ test "Code helpers" {
 /// reads a little-endian u32 length first, so a raw frame would arrive minus
 /// its own first four octets — which for CoAP is exactly the header.
 const seed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// CoAP datagrams, in the format `Smith.slice` reads.
 ///
@@ -661,10 +662,17 @@ const parse_seeds = [_][]const u8{
 };
 
 test "fuzz: parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParse, .{ .corpus = &parse_seeds });
+    try testing.fuzz({}, fuzzParseSmith, .{ .corpus = &parse_seeds });
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+const fuzzParseMark = fz.Marker(enum { ran, nonempty, parsed, refused, with_options });
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParse(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets, and the ranged draw
@@ -673,10 +681,14 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     // time, with the datagram sitting unread in `buf`. Measured 2026-09-07 over
     // the corpus above: 0 of 18 seeds non-empty and 0 parsed before, 18 of 18
     // non-empty and 6 parsed after (9 options walked, against 0).
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &parse_seeds);
+    fuzzParseMark.mark(.ran);
+    if (len != 0) fuzzParseMark.mark(.nonempty);
 
     var options_buf: [32]Option = undefined;
-    const msg = parse(buf[0..len], &options_buf) catch return;
+    const msg = parse(buf[0..len], &options_buf) catch return fuzzParseMark.mark(.refused);
+    fuzzParseMark.mark(.parsed);
+    if (msg.options.len != 0) fuzzParseMark.mark(.with_options);
 
     // What parse promises, asserted rather than assumed: the option numbers do
     // not go backwards (that is what makes the delta encoding invertible), and
@@ -690,6 +702,14 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     const n = try serialize(msg, &round);
     try testing.expectEqual(encodedLen(msg), n);
     try testing.expectEqualSlices(u8, buf[0..n], round[0..n]);
+}
+
+test "fuzz driver: COAP_FUZZ (fuzzParse)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "COAP_FUZZ", .name = "coap-root-parse" });
+}
+
+test "fuzz harness: fuzzParse, 400 seeds, reaches every outcome" {
+    try fuzzParseMark.reach(fuzzParse, "coap-root-parse", 400);
 }
 
 test "corpus: every parse seed reaches the decoder, and the counts are pinned" {

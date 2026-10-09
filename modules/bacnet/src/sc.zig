@@ -1264,6 +1264,7 @@ test "a message with no destination is a broadcast, and so is the all-ones VMAC"
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// One frame per function this decoder dispatches on, lifted from the tests
 /// above, plus the rejections that bound the control octet and the body length.
@@ -1304,10 +1305,17 @@ const option_seeds = [_][]const u8{
 };
 
 test "fuzz: decode never panics, hangs or hands back a slice outside the input" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &sc_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &sc_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and a ranged draw then
@@ -1315,7 +1323,9 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // length was 0 for every seed and this harness only ever decoded the empty
     // frame. Measured on 2026-09-06 over the corpus above: **0 of 17 non-empty
     // and 0 decoded before, 17 of 17 non-empty and 12 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &sc_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     const input = buf[0..len];
     const m = decode(input) catch return;
 
@@ -1348,16 +1358,33 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     try testing.expectEqualSlices(u8, input, again);
 }
 
-test "fuzz: option walking always makes forward progress" {
-    try std.testing.fuzz({}, fuzzOptions, .{ .corpus = &option_seeds });
+test "fuzz driver: BACNET_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-sc-decode" });
 }
 
-fn fuzzOptions(_: void, smith: *std.testing.Smith) !void {
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "bacnet-sc-decode", 400);
+}
+
+test "fuzz: option walking always makes forward progress" {
+    try std.testing.fuzz({}, fuzzOptionsSmith, .{ .corpus = &option_seeds });
+}
+
+const fuzzOptionsMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzOptionsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzOptions(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzOptions(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [128]u8 = undefined;
     // ⚠ See `fuzzDecode`: `bytes` then a ranged length always yielded 0.
     // Measured on 2026-09-06 over `option_seeds`: **0 of 11 non-empty and 0
     // lists walked before, 11 of 11 non-empty and 9 walked after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &option_seeds);
+    fuzzOptionsMark.mark(.ran);
+    if (len != 0) fuzzOptionsMark.mark(.nonempty);
     const input = buf[0..len];
 
     var it: OptionIter = .{ .rest = input };
@@ -1375,4 +1402,12 @@ fn fuzzOptions(_: void, smith: *std.testing.Smith) !void {
     // scanOptions agrees with the walk, or refuses.
     const n = scanOptions(input) catch return;
     try testing.expect(n <= input.len);
+}
+
+test "fuzz driver: BACNET_FUZZ (fuzzOptions)" {
+    try fz.fuzz_driver.run(fuzzOptions, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-sc-options" });
+}
+
+test "fuzz harness: fuzzOptions, 400 seeds, reaches every outcome" {
+    try fuzzOptionsMark.reach(fuzzOptions, "bacnet-sc-options", 400);
 }

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `DNSSEC_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harnesses: `wire-decodeUncompressedName`, `keys-decodePublicKey`, `nsec-nsecProveDenial`, `nsec3-proveDenial`, `rdata`, plus a new `oracle-validate` (a real ldns-signed RRset validates Secure; a flipped signature bit and any signature truncation validate Bogus; damaged RRSIG/DNSKEY wire never panics). Verdict: 200,000 runs each, ReleaseSafe, clean; `oracle-validate` at its scale (40,000 runs, RSA/ECDSA verification at ~340/s).
 - **2026-10-02** — **BREAKING (no known consumer): the private base32hex is gone;
   owner-hash labels go through the `base32` module (new dependency).** Removed
   `nsec3.encode`, `nsec3.decode`, `nsec3.encodedLen`, `nsec3.decodedLen` and

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `ENIP_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Fourteen harnesses (encap decode/framer/items, epath, tagpath, types, cpf decode/envelope, cip messages/multiple/attrList, connmgr, adapter, clientReply). Verdict: 200,000 runs each, ReleaseSafe, clean.
 - **2026-10-06** — **BEHAVIOURAL, not breaking:** `TcpTransport.setReadTimeout`
   now bounds the **whole** encapsulation message a `read` returns, not just the
   wait for its first octet — the open MED finding of today's review (SPEC.md,

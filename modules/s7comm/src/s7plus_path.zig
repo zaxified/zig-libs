@@ -252,6 +252,7 @@ test "resolve maps the root and passes steps through" {
 /// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
 /// that drive the real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seed;
+const fz = @import("fuzz_test.zig");
 
 /// Real symbolic paths, plus one per error the parser can return.
 const path_seeds = [_][]const u8{
@@ -271,10 +272,17 @@ const path_seeds = [_][]const u8{
 };
 
 test "fuzz: path parse never panics" {
-    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &path_seeds });
+    try std.testing.fuzz({}, fuzzParseSmith, .{ .corpus = &path_seeds });
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+const fuzzParseMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParse(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [128]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
@@ -283,9 +291,19 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     // input. Measured on 2026-09-06 over the corpus above: **0 of 13
     // non-empty and 0 that parsed before, 13 of 13 non-empty and 5 that parsed
     // after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &path_seeds);
+    fuzzParseMark.mark(.ran);
+    if (len != 0) fuzzParseMark.mark(.nonempty);
     var comps: [16]Component = undefined;
     const p = parse(buf[0..len], &comps) catch return;
     // Anything that parses has a root that points inside the input.
     try testing.expect(p.components.len <= comps.len);
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzParse)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-s7plus_path-parse" });
+}
+
+test "fuzz harness: fuzzParse, 400 seeds, reaches every outcome" {
+    try fuzzParseMark.reach(fuzzParse, "s7comm-s7plus_path-parse", 400);
 }

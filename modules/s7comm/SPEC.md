@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-17 · mutation 2026-10-05 (42/43, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — PLC protocol, no auth in scope (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, S7COMM_FUZZ) · ct n/a — PLC protocol, no auth in scope (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

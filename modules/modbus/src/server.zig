@@ -1545,6 +1545,7 @@ test "fuzz: structurally valid requests with wire-controlled fields never panic"
 /// is. A corpus entry is not the PDU: `Smith.slice` reads a little-endian
 /// `u32` length first.
 const seedHexServer = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// Request PDUs, in the format the length draw reads — one per function code
 /// the dispatch table knows, aimed at the address ranges this server is
@@ -1573,7 +1574,7 @@ const server_seeds = [_][]const u8{
 };
 
 test "fuzz: the server never panics and always answers or stays silent" {
-    try testing.fuzz({}, fuzzServer, .{ .corpus = &server_seeds });
+    try testing.fuzz({}, fuzzServerSmith, .{ .corpus = &server_seeds });
 }
 
 test "corpus: every request seed reaches the dispatch table, and the replies are pinned" {
@@ -1618,16 +1619,33 @@ test "corpus: every request seed reaches the dispatch table, and the replies are
     try testing.expectEqual(@as(usize, 12), exceptions);
 }
 
-fn fuzzServer(_: void, smith: *std.testing.Smith) !void {
+const fuzzServerMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzServerSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzServer(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⚠ ONE byte-first draw, and no knobs at all: see the block comment above
     // for what the two that were here cost this target.
     var frame: [300]u8 = undefined;
-    const len: usize = smith.slice(&frame);
+    const len: usize = fz.drawInput(S, src, &frame, &server_seeds);
+    fuzzServerMark.mark(.ran);
+    if (len != 0) fuzzServerMark.mark(.nonempty);
     const bytes = frame[0..len];
 
     // Both framings on every input, rather than a coin flip the ordinary lane
     // always lost.
     for ([_]mb.Framing{ .tcp, .rtu }) |framing| try fuzzServerOnce(framing, bytes);
+}
+
+test "fuzz driver: MODBUS_FUZZ (fuzzServer)" {
+    try fz.fuzz_driver.run(fuzzServer, .{ .prefix = "MODBUS_FUZZ", .name = "modbus-server-server" });
+}
+
+test "fuzz harness: fuzzServer, 400 seeds, reaches every outcome" {
+    try fuzzServerMark.reach(fuzzServer, "modbus-server-server", 400);
 }
 
 fn fuzzServerOnce(framing: mb.Framing, bytes: []const u8) !void {
