@@ -275,12 +275,29 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const IfaceMark = fz.Marker(enum { rejected, parsed, typed });
+
 test "fuzz: interface parse never crashes" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzParse, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzParseSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: NL80211_FUZZ (interface parse)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "NL80211_FUZZ", .name = "nl80211-iface" });
+}
+
+test "fuzz harness: interface parse, 300 seeds, reaches every outcome" {
+    try IfaceMark.reach(fuzzParse, "nl80211-iface", 300);
+}
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzParse, smith, script[0..n]);
+}
+
+fn fuzzParse(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var raw: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
@@ -293,8 +310,15 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     // `parse("")` succeeds. Measured 2026-09-07 over the corpus above: **0 of
     // 6 seeds non-empty and 6 of 6 "parsed" before; 6 of 6 non-empty, 3 parsed
     // and 3 of them carrying an iftype after.**
-    const len: usize = smith.slice(&raw);
-    if (parse(raw[0..len])) |i| std.mem.doNotOptimizeAway(&i) else |_| {}
+    var cstore: Corpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) (cstore.build() catch &.{}) else &.{};
+    _ = gpa;
+    const len: usize = fz.drawInput(S, smith, &raw, entries);
+    if (parse(raw[0..len])) |i| {
+        std.mem.doNotOptimizeAway(&i);
+        IfaceMark.mark(.parsed);
+        if (i.iftype != .unspecified) IfaceMark.mark(.typed);
+    } else |_| IfaceMark.mark(.rejected);
 }
 
 test "corpus: every interface seed reaches the parser, and the counts are pinned" {

@@ -1068,6 +1068,7 @@ pub fn trace(gpa: std.mem.Allocator, dest: netaddr.Ip, opts: Options) LiveTraceE
 // ── tests: canned-bytes fake transport ──────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 
 fn ip4(a: u8, b: u8, c: u8, d: u8) netaddr.Ip {
     return .{ .v4 = .{ a, b, c, d } };
@@ -2600,6 +2601,11 @@ fn fuzzOneRun(input: []const u8) anyerror!void {
                 error.InvalidOptions => unreachable,
             };
             defer tr.deinit(gpa);
+            var any_reply = false;
+            for (tr.hops) |h| for (h.probes) |pr| {
+                if (pr.kind != .timeout) any_reply = true;
+            };
+            if (any_reply) fuzz_mark(.resolved) else fuzz_mark(.silent);
             // Touch every derived value: stats() and distinctAddresses() both
             // index fixed stack scratch off attacker-influenced probe counts.
             var buf: [max_probes_per_hop]netaddr.Ip = undefined;
@@ -2620,16 +2626,17 @@ fn fuzzOneRun(input: []const u8) anyerror!void {
 /// lower bound outside `--fuzz` (the repository-wide `Smith` trap recorded
 /// in `feedback_my_own_lint_measured_a_smaller_world` / accesslog's notes),
 /// which would leave this harness half-dead.
-fn fuzzTraceroute(_: void, smith: *testing.Smith) anyerror!void {
+fn fuzzTraceroute(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var pool: [1024]u8 = undefined;
     var n: usize = 0;
     inline for (0..4) |_| {
         var lb: [1]u8 = undefined;
-        smith.bytes(&lb);
+        src.bytes(&lb);
         const want = @min(@as(usize, lb[0]), pool.len - n - 1);
         pool[n] = @intCast(want);
         n += 1;
-        smith.bytes(pool[n..][0..want]);
+        src.bytes(pool[n..][0..want]);
         n += want;
     }
     try fuzzOneRun(pool[0..n]);
@@ -2686,8 +2693,17 @@ const fuzz_corpus = [_][]const u8{
     &(.{ 200, 0x4f } ++ .{0xaa} ** 199),
 };
 
+/// `fuzz_corpus` as `Smith.slice` frames: `FuzzScript` reads its bytes from
+/// the first `slice` draw, so each entry is the packet stream `fuzzTraceroute`
+/// then reads verbatim.
+const fuzz_corpus_framed = blk: {
+    var a: [fuzz_corpus.len][]const u8 = undefined;
+    for (fuzz_corpus, 0..) |c, i| a[i] = testkit.fuzz.seed(c);
+    break :blk a;
+};
+
 test "fuzz: arbitrary ICMP bytes through the full hop state machine never panic" {
-    try testing.fuzz({}, fuzzTraceroute, .{ .corpus = &fuzz_corpus });
+    try testing.fuzz({}, fuzzScript(fuzzTraceroute), .{ .corpus = &fuzz_corpus_framed });
 }
 
 test "fuzz corpus really reaches the classifier (a green fuzz run is not vacuous)" {
@@ -2709,6 +2725,107 @@ test "fuzz corpus really reaches the classifier (a green fuzz run is not vacuous
         };
     }
     try testing.expect(resolved > 0);
+}
+
+// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+//
+// `fuzzTraceroute` is generic over its source of choices
+// (`fn(comptime S, *S, gpa)`); `testing.fuzz` feeds it through `FuzzScript`,
+// `TRACEROUTE_FUZZ=<runs>[,<first seed>]` through testkit's driver (`_MS`,
+// `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there). It stays in this file
+// because `FuzzTransport` and the corpus are private. Random bytes never form
+// an ICMP error with a valid checksum and the probe's ident, so
+// `fuzzTracerouteMutated` damages the corpus' packet streams instead (a
+// quarter of its draws damage nothing).
+
+const fuzz_driver = testkit.fuzz.driver;
+
+const FuzzLabel = enum { silent, resolved };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn fuzz_mark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+const FuzzScript = struct {
+    cur: testkit.fuzz.Cursor,
+
+    pub fn valueRangeAtMost(self: *FuzzScript, comptime T: type, at_least: T, at_most: T) T {
+        return @intCast(self.cur.ranged(at_least, at_most));
+    }
+    pub fn value(self: *FuzzScript, comptime T: type) T {
+        return switch (T) {
+            bool => self.cur.byte() & 1 == 1,
+            u8 => self.cur.byte(),
+            u16 => self.cur.word(),
+            else => @compileError("FuzzScript.value: unsupported type"),
+        };
+    }
+    pub fn bytes(self: *FuzzScript, buf: []u8) void {
+        for (buf) |*b| b.* = self.cur.byte();
+    }
+    pub fn index(self: *FuzzScript, len: usize) usize {
+        return self.cur.ranged(0, @intCast(len - 1));
+    }
+    pub fn slice(self: *FuzzScript, buf: []u8) u32 {
+        const left = self.cur.bytes.len -| self.cur.at;
+        const n = @min(buf.len, left);
+        @memcpy(buf[0..n], self.cur.bytes[self.cur.at..][0..n]);
+        self.cur.at += n;
+        return @intCast(n);
+    }
+};
+
+fn fuzzScript(comptime harness: anytype) fn (void, *testing.Smith) anyerror!void {
+    return struct {
+        fn f(_: void, smith: *testing.Smith) anyerror!void {
+            var script: [1024]u8 = undefined;
+            const n = smith.slice(&script);
+            var src: FuzzScript = .{ .cur = .{ .bytes = script[0..n] } };
+            return harness(FuzzScript, &src, testing.allocator);
+        }
+    }.f;
+}
+
+fn fuzzTracerouteMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var pool: [256]u8 = undefined;
+    const c = fuzz_corpus[src.index(fuzz_corpus.len)];
+    @memcpy(pool[0..c.len], c);
+    var len: usize = c.len;
+    if (len != 0) {
+        for (0..src.valueRangeAtMost(u8, 0, 3)) |_| pool[src.index(len)] = src.value(u8);
+        if (src.valueRangeAtMost(u8, 0, 3) == 0) len = src.index(len) + 1;
+    }
+    try fuzzOneRun(pool[0..len]);
+}
+
+test "fuzz: hop state machine, damaged corpus packet streams" {
+    try testing.fuzz({}, fuzzScript(fuzzTracerouteMutated), .{});
+}
+
+test "fuzz driver: TRACEROUTE_FUZZ" {
+    try fuzz_driver.run(fuzzTraceroute, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute", .scale = 4 });
+    try fuzz_driver.run(fuzzTracerouteMutated, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute-mutated", .scale = 4 });
+}
+
+test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
+    fuzz_reach = @splat(0);
+    inline for (.{ fuzzTraceroute, fuzzTracerouteMutated }, 0..) |h, which| {
+        for (0..400) |sd| {
+            var prng = std.Random.DefaultPrng.init(sd);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print("traceroute harness {d} seed {d}: {t}\n", .{ which, sd, err });
+                return err;
+            };
+        }
+    }
+    for (fuzz_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 // See kernel_oracle_test.zig / tools/interop.zig / tools/kernel_oracle.py.

@@ -800,6 +800,7 @@ pub fn buildNewRequest(
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
+const fz = @import("fuzz_test.zig");
 const testing = std.testing;
 const goldens = @import("goldens.zig");
 
@@ -1706,10 +1707,11 @@ fn walkDecode(buf: []const u8) !DecodeTally {
 
 test "fuzz: decodeFlow never crashes, hangs or reads out of bounds" {
     var corpus: DecodeCorpus = .{};
-    try testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fz.fuzzScript(fuzzDecode, 2048), .{ .corpus = try corpus.build() });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // 2048, not 512: `dump_reply_three_flows` is a whole captured datagram and
     // a seed longer than the buffer is not a big seed — `Smith.slice` reads it
     // back as the EMPTY one, so the module's own largest capture would have
@@ -1728,8 +1730,14 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // is refused at `payload.len < nfgenmsg_len`, and `MessageIterator` yields
     // nothing from it, so neither the attribute walk nor the nested tuple
     // decode had ever run.
-    const len: usize = smith.slice(&raw);
-    std.mem.doNotOptimizeAway(try walkDecode(raw[0..len]));
+    const len: usize = src.slice(&raw);
+    try tallyDecode(raw[0..len]);
+}
+
+fn tallyDecode(bytes: []const u8) !void {
+    const t = try walkDecode(bytes);
+    std.mem.doNotOptimizeAway(t);
+    if (t.flat != 0) fz.mark(.parsed) else fz.mark(.rejected);
 }
 
 test "corpus: every decode seed reaches the walkers, and the counts are pinned" {
@@ -1766,4 +1774,27 @@ test "corpus: every decode seed reaches the walkers, and the counts are pinned" 
     try testing.expectEqual(@as(usize, 16), total.addresses);
     try testing.expectEqual(@as(usize, 6), total.messages);
     try testing.expectEqual(@as(usize, 6), total.flows);
+}
+
+// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+// Shared plumbing and the notes on `CONNTRACK_FUZZ` are in `fuzz_test.zig`.
+
+fn fuzzDecodeMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: DecodeCorpus = .{};
+    var raw: [2048]u8 = undefined;
+    try tallyDecode(fz.damaged(S, src, try corpus.build(), &raw));
+}
+
+test "fuzz: decodeFlow, damaged corpus entries" {
+    try testing.fuzz({}, fz.fuzzScript(fuzzDecodeMutated, 64), .{});
+}
+
+test "fuzz driver: CONNTRACK_FUZZ (decode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "CONNTRACK_FUZZ", .name = "conntrack-decode" });
+    try fz.fuzz_driver.run(fuzzDecodeMutated, .{ .prefix = "CONNTRACK_FUZZ", .name = "conntrack-decode-mutated" });
+}
+
+test "fuzz harness: 400 seeds in every test run, and they get everywhere (decode)" {
+    try fz.checkReach("conntrack decode", .{ fuzzDecode, fuzzDecodeMutated }, 400);
 }

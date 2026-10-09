@@ -710,6 +710,7 @@ fn roundsAwayWhenBelowHalf(result_neg: bool, mode: RoundingMode) bool {
 
 test {
     _ = @import("big.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,26 +1296,22 @@ test "parse hardening: mantissa width cap prevents i256 accumulator overflow" {
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     const alphabet = "0123456789+-.eE";
     var buf: [128]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
-    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
-    // then finds fewer than the eight it needs and returns the range MINIMUM —
-    // so `len` was 0 for every input and `Decimal.parse` was handed "",
-    // refused with `error.InvalidCharacter` at the first byte it did not find,
-    // and the literal sat unread in `buf`. Measured 2026-09-07 over the corpus
-    // above: **0 of 24 seeds non-empty and 0 parsed before, 23 of 24 non-empty
-    // (one seed IS the empty literal) and 9 parsed after.**
+    // One `smith.slice` call first, never `smith.bytes` followed by a ranged
+    // length (a ranged draw after `bytes` returns the range minimum, so every
+    // seed would reach `parse` empty).
     const len: usize = smith.slice(&buf);
-    // ⚠ This substitution is a `--fuzz`-only aid, and deliberately so: on a
-    // corpus replay `Smith` has already been drained by the draw above, so
-    // `boolWeighted` is false throughout and every seed reaches `parse`
-    // verbatim, which is exactly what a corpus of real literals wants. Under
-    // `--fuzz` the fuzzer still drives it and biases raw bytes toward the
-    // mantissa/exponent alphabet.
+    // ⚠ This substitution is a `--fuzz`-only aid: on a corpus replay `Smith`
+    // has already been drained by the draw above, so `boolWeighted` is false
+    // throughout and every seed reaches `parse` verbatim. (The driver's PRNG
+    // source does its own biasing in `fuzz_test.zig`.)
     for (buf[0..len]) |*c| {
         if (smith.boolWeighted(1, 4)) c.* = alphabet[c.* % alphabet.len];
     }
-    _ = Decimal.parse(buf[0..len]) catch return;
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try fz.parseHarness(fz.ScriptSource, &src, testing.allocator);
 }
+
+const fz = @import("fuzz_test.zig");
 
 test "corpus: every literal reaches Decimal.parse, and the counts are pinned" {
     // ⭐ The measurement, executable rather than written in a comment. It is

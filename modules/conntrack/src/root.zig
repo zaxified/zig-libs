@@ -674,6 +674,7 @@ pub fn eventKind(m: codec.Message) ?EventKind {
 
 // ── offline tests ───────────────────────────────────────────────────────────
 
+const fz = @import("fuzz_test.zig");
 const testing = std.testing;
 const goldens = @import("goldens.zig");
 
@@ -1217,7 +1218,7 @@ const dump_scripts = [_][]const u8{
 };
 
 test "fuzz: the dump engine survives any interleaving of dump replies" {
-    try testing.fuzz({}, fuzzDumpEngine, .{ .corpus = &dump_scripts });
+    try testing.fuzz({}, fz.fuzzScript(fuzzDumpEngine, 512), .{ .corpus = &dump_scripts });
 }
 
 test "corpus: every dump script drives the engine, and the collected count is pinned" {
@@ -1263,13 +1264,16 @@ test "corpus: every dump script drives the engine, and the collected count is pi
 /// finding rather than a silent survivor. (The W2-07 double free needed four
 /// consecutive `NLM_F_DUMP_INTR`, which is exactly the kind of sequence a
 /// scripted unit test only reaches if somebody already suspects it.)
-fn fuzzDumpEngine(_: void, smith: *std.testing.Smith) !void {
+fn fuzzDumpEngine(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var script_bytes: [512]u8 = undefined;
     // ⚠ The draw is here rather than inside `runDumpEngine` on purpose:
     // `check-fuzz-reach` reads the target's own body, so a harness that draws
     // through a helper is reported as making no `Smith` draw at all.
-    const script_len: usize = smith.slice(&script_bytes);
-    std.mem.doNotOptimizeAway(try runDumpEngine(script_bytes[0..script_len]));
+    const script_len: usize = src.slice(&script_bytes);
+    const r = try runDumpEngine(script_bytes[0..script_len]);
+    std.mem.doNotOptimizeAway(r);
+    if (r.completed) fz.mark(.parsed) else fz.mark(.rejected);
 }
 
 /// One run of the dump engine over a scripted interleaving, returning what it
@@ -1535,4 +1539,16 @@ test "live: an event socket sees the flow another socket creates" {
     // stderr from a passing step as a failure — a rule that only holds if
     // passing tests stay silent.
     if (verboseSkip()) std.debug.print("\nLIVE conntrack events: NEW event observed for the inserted flow.\n", .{});
+}
+
+// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+// Shared plumbing and the notes on `CONNTRACK_FUZZ` are in `fuzz_test.zig`.
+// `parsed` here is "the dump completed", `rejected` "it ended in an error".
+
+test "fuzz driver: CONNTRACK_FUZZ (dump engine)" {
+    try fz.fuzz_driver.run(fuzzDumpEngine, .{ .prefix = "CONNTRACK_FUZZ", .name = "conntrack-dump-engine" });
+}
+
+test "fuzz harness: 400 seeds in every test run, and they get everywhere (dump engine)" {
+    try fz.checkReach("conntrack dump engine", .{fuzzDumpEngine}, 400);
 }

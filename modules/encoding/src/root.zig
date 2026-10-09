@@ -819,6 +819,7 @@ test "encode: a valid multi-byte lead truncated at buffer end passes through, no
 }
 
 test {
+    _ = @import("fuzz_test.zig");
     // Exhaustive cross-check of all five high-tables against vendored
     // normative sources (WHATWG index-*.txt / Unicode.org 8859-1.TXT) — see
     // normative_test.zig and ../NOTICE.
@@ -893,16 +894,11 @@ test "fuzz: decodeToUtf8 / encodeFromUtf8 never panic, OOB or leak on arbitrary 
 fn fuzzCodecNeverLeaks(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
     const len = smith.slice(&buf);
-    const input = buf[0..len];
-
-    const a = std.testing.allocator;
-    for (fuzz_encodings) |enc| {
-        const decoded = try decodeToUtf8(a, input, enc);
-        defer a.free(decoded);
-        const encoded = try encodeFromUtf8(a, input, enc);
-        defer a.free(encoded);
-    }
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try fz.codecHarness(fz.ScriptSource, &src, std.testing.allocator);
 }
+
+const fz = @import("fuzz_test.zig");
 
 test "corpus: every seed reaches both codecs, and the octets produced are pinned" {
     // ⭐ Octets produced is the second number, and it has to be: neither codec

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `SNTP_FUZZ` over the existing harnesses.
+
 - **2026-10-05** — **Anchoring: a real chronyd, beevik/ntp and ntplib judge `query` and the codec**
   (`tools/ntp_oracle.py`, `tools/interop.zig`, `tools/go_oracle`, `src/ntp_oracle_test.zig`): chronyd 4.8 per scenario
   (unprivileged, `-x`, `unshare -rn`) -- stratum 3 to request versions 1-4 and over IPv6, stratum 10, unsynchronized,

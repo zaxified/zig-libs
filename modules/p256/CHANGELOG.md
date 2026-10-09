@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `P256_FUZZ` over the existing harnesses (`fromSec1` gains a pristine/flipped overlay: genuine encodings of `k*G` must decode to it, a flipped `y` bit must be refused).
 - **2026-10-09** — New `KeyPair.signerInto(out, key_pair, noise)`: the `Signer` holds the secret
   key, and `signer` returns it by value, so the key sat in the caller's result slot (18 needle windows,
   `stackprobe2_test.zig`). Additive; `signer` stays (std shape, now documented).

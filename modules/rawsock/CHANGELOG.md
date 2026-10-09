@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `RAWSOCK_FUZZ` over the existing harnesses (Ethernet header,
+  hardware address, ARP reply).
+
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig` (`unshare -rn zig build interop-rawsock`)
   asks the Linux kernel "who-has" over a veth pair through this module's own socket and ARP builder, and
   the kernel answers; the request and reply are frozen (`src/testdata/kernel_arp.zig`) and replayed without

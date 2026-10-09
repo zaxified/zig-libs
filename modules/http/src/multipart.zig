@@ -812,16 +812,37 @@ const multipart_seeds = [_][]const u8{
     seed(db ++ "--"), // the closing delimiter with no trailing CRLF
 };
 
+const fz = @import("fuzz_test.zig");
+const MpMark = fz.Marker(enum { refused, parts });
+const MpStreamMark = fz.Marker(enum { compared, agreed_parts });
+
 test "fuzz: multipart parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzMultipartParse, .{ .corpus = &multipart_seeds });
+    try testing.fuzz({}, fuzzMultipartParseSmith, .{ .corpus = &multipart_seeds });
 }
 
-fn fuzzMultipartParse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: HTTP_FUZZ (multipart-parse)" {
+    try fz.fuzz_driver.run(fuzzMultipartParse, .{ .prefix = "HTTP_FUZZ", .name = "http-multipart-parse" });
+}
+
+test "fuzz harness: multipart parse, 300 seeds, reaches every outcome" {
+    try MpMark.reach(fuzzMultipartParse, "http-multipart-parse", 300);
+}
+
+fn fuzzMultipartParseSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzMultipartParse, smith, script[0..n]);
+}
+
+fn fuzzMultipartParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &multipart_seeds);
 
     var it = parse(buf[0..len], test_boundary, .{});
-    while (it.next() catch return) |_| {}
+    var parts: usize = 0;
+    while (it.next() catch return MpMark.mark(.refused)) |_| parts += 1;
+    if (parts != 0) MpMark.mark(.parts);
 }
 
 test "corpus: every multipart seed reaches the parser, and the parts walked are pinned" {
@@ -1016,15 +1037,34 @@ test "Reader: a megabyte of near-delimiters streams byte-identical to parse" {
 }
 
 test "Reader: fuzz — same parts and the same end as parse, over any read size" {
-    try testing.fuzz({}, fuzzStreamMatchesParse, .{ .corpus = &multipart_seeds });
+    try testing.fuzz({}, fuzzStreamMatchesParseSmith, .{ .corpus = &multipart_seeds });
 }
 
-fn fuzzStreamMatchesParse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: HTTP_FUZZ (multipart-stream)" {
+    try fz.fuzz_driver.run(fuzzStreamMatchesParse, .{ .prefix = "HTTP_FUZZ", .name = "http-multipart-stream" });
+}
+
+test "fuzz harness: multipart stream, 300 seeds, reaches every outcome" {
+    try MpStreamMark.reach(fuzzStreamMatchesParse, "http-multipart-stream", 300);
+}
+
+fn fuzzStreamMatchesParseSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzStreamMatchesParse, smith, script[0..n]);
+}
+
+fn fuzzStreamMatchesParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    const step = smith.valueRangeAtMost(u8, 1, 64);
-    const extra = smith.valueRangeAtMost(u8, 0, 64);
+    const len: usize = fz.drawInput(S, src, &buf, &multipart_seeds);
+    const step = src.valueRangeAtMost(u8, 1, 64);
+    const extra = src.valueRangeAtMost(u8, 0, 64);
     try expectSameAsParse(buf[0..len], test_boundary, .{}, step, test_boundary.len + 4 + extra);
+    MpStreamMark.mark(.compared);
+    // Did the two agree on a body that actually has parts, not only on a refusal?
+    var it = parse(buf[0..len], test_boundary, .{});
+    if (it.next() catch null) |_| MpStreamMark.mark(.agreed_parts);
 }
 
 test "Reader: nextPart skips an unread body, and a half-read one" {

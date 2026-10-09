@@ -1404,6 +1404,53 @@ test "fuzz: fromSec1 never panics on arbitrary bytes" {
 }
 
 fn fuzzFromSec1(_: void, smith: *std.testing.Smith) !void {
+    return sec1Harness(std.testing.Smith, smith, std.testing.allocator);
+}
+
+const fuzz_driver = @import("testkit").fuzz.driver;
+const FuzzLabel = enum { raw_rejected, raw_accepted, roundtrip, flip_rejected };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn mark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+test "fuzz driver: P256_FUZZ (p256-sec1)" {
+    try fuzz_driver.run(sec1Harness, .{ .prefix = "P256_FUZZ", .name = "p256-sec1" });
+}
+
+test "fuzz harness: 300 seeds in every test run, and they get everywhere" {
+    fuzz_reach = @splat(0);
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        sec1Harness(fuzz_driver.Rng, &rng, std.testing.allocator) catch |err| {
+            std.debug.print("p256-sec1 seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+    }
+    for (fuzz_reach, 0..) |n, i| {
+        const l: FuzzLabel = @enumFromInt(i);
+        // A random SEC1 string is accepted only as the lone tag 0x00 (the
+        // identity), which is 1 in ~2^8 per input; the roundtrip overlay below
+        // covers the accepting paths, so `raw_accepted` is not demanded.
+        if (l == .raw_accepted) continue;
+        if (n == 0) {
+            std.debug.print("reach: label {t} never hit in 300 seeds\n", .{l});
+            return error.HarnessDoesNotReach;
+        }
+    }
+}
+
+/// Generic over its source (`Smith` under `--fuzz`, `fuzz_driver.Rng` under the
+/// driver). Raw bytes go to `fromSec1` (any outcome, no panic). Then a genuine
+/// point `k*G` (k from the same drawn octets) must survive both encodings, the
+/// opposite compressed tag must decode to its negation, and an uncompressed
+/// encoding with one `y` bit flipped must be refused (a single flipped bit can
+/// never turn `y` into `-y`, so it is off the curve).
+fn sec1Harness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [65]u8 = undefined;
     // ⚠ `smith.slice` in ONE call, never `bytes` and then a ranged length.
     // What stood here did both, and also chose the tag from a ranged draw
@@ -1414,7 +1461,40 @@ fn fuzzFromSec1(_: void, smith: *std.testing.Smith) !void {
     // returned on the `s.len < 1` line. The whole SEC1 decoder, three paths
     // and four typed refusals, was reached by nothing.
     const len: usize = smith.slice(&buf);
-    _ = P256.fromSec1(buf[0..len]) catch {};
+    if (P256.fromSec1(buf[0..len])) |_| {
+        mark(.raw_accepted);
+    } else |_| {
+        mark(.raw_rejected);
+    }
+
+    // Pristine overlay: k = the drawn octets (zero-padded) as a scalar.
+    var k: [32]u8 = @splat(0);
+    @memcpy(k[0..@min(len, 32)], buf[0..@min(len, 32)]);
+    k[0] &= 0x7f; // below the group order's leading octet 0xff: any k < n
+    k[31] |= 1; // nonzero
+    const pt = P256.basePoint.mulPublic(k, .big) catch return;
+    pt.rejectIdentity() catch return;
+
+    const comp = pt.toCompressedSec1();
+    const back_c = P256.fromSec1(&comp) catch return error.GenuineEncodingRejected;
+    if (!back_c.equivalent(pt)) return error.RoundTripMismatch;
+    const unc = pt.toUncompressedSec1();
+    const back_u = P256.fromSec1(&unc) catch return error.GenuineEncodingRejected;
+    if (!back_u.equivalent(pt)) return error.RoundTripMismatch;
+    mark(.roundtrip);
+
+    var other = comp;
+    other[0] ^= 1; // 02 <-> 03: the point with the other y parity
+    const neg_pt = P256.fromSec1(&other) catch return error.GenuineEncodingRejected;
+    if (!neg_pt.equivalent(pt.neg())) return error.NegationMismatch;
+    if (neg_pt.equivalent(pt)) return error.NegationMismatch;
+
+    var bad = unc;
+    bad[33 + buf[1] % 32] ^= @as(u8, 1) << @intCast(buf[2] % 8);
+    if (P256.fromSec1(&bad)) |_| {
+        return error.ForgedPointAccepted;
+    } else |_| {}
+    mark(.flip_rejected);
 }
 
 test "corpus: every SEC1 seed reaches fromSec1, and the points decoded are pinned" {

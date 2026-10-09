@@ -232,6 +232,16 @@ as a measurement rather than a rediscovery.
 
 ## Backlog / deferred
 
+- **OPEN, owner decision — `fromOpenSSH` takes the bcrypt `rounds` from the key file
+  uncapped (RSA_FUZZ `rsa-openssh` HANG, seed 26887, 2026-10-09).** An encrypted
+  `openssh-key-v1` blob whose kdfoptions carry `rounds = 2^32-1` keeps `bcryptPbkdf` busy for
+  what is in practice for ever (> 120 s measured, and linear in `rounds`); a consumer that
+  loads a key file someone else supplied (upload, shared config) can be pinned. OpenSSH and
+  Go x/crypto/ssh do not cap it either (parity), so a cap is policy: e.g. a documented
+  maximum (ssh-keygen's default is 16, `-a 100` is a common hardening) returning a new error
+  — an addition to `FromOpenSSHError`, i.e. BREAKING for exhaustive switches. Until decided,
+  the fuzz verdict is NOT recorded on the card: the other five harnesses (pubder, secder,
+  pkcs8, pubpem, secpem) ran 8 x 25 000 seeds each clean; openssh 7 of 8 ranges clean.
 - **Review 2026-10-03 (L6):** `fromPrimes` trusts `q` to be prime (documented) and a Carmichael
   `p` passes the `qInv` Fermat self-check; the sign-time fault check then refuses such a key, so it
   fails late rather than at import. Paillier's checked path tests primality; rsa could offer the same

@@ -498,5 +498,6 @@ test {
     _ = reg;
     _ = config;
     _ = client;
+    _ = @import("fuzz_test.zig");
     _ = @import("goldens.zig");
 }

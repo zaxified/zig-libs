@@ -913,6 +913,7 @@ test "reclaimGate: equal-txn reader is safe, strictly-older reader blocks" {
 // return a valid `Meta` or a typed `RecoverError`.
 
 const kv = @import("kv");
+const testkit = @import("testkit");
 
 /// How many pages `fuzzRecover` lays down. Hoisted out of the harness because
 /// a corpus entry's SIZE is a function of it — see `RecoverSeed`.
@@ -1055,15 +1056,104 @@ test "fuzz: recover never panics on arbitrary on-disk page bytes" {
 
 fn fuzzRecover(run: *RecoverRun, smith: *std.testing.Smith) !void {
     run.* = .{};
-    try driveRecover(smith, run);
+    try driveRecover(std.testing.Smith, smith, run, testing.allocator);
+}
+
+// ── the deterministic driver (KVTREE_FUZZ=<runs>[,<first seed>]) ───────────
+//
+// The harness body is generic over its source of choices, so testkit's driver
+// runs it from a PRNG (`Rng`). Its first draw is `bytes`, which is faithful, so
+// no cursor adapter is needed: `fuzzRecover` hands it the `Smith` directly and
+// the corpus above is unchanged. Harness name: `recover`.
+
+const fuzz_driver = testkit.fuzz.driver;
+const fz_labels = [_][]const u8{ "meta_stamped", "branch_page", "freelist_page", "adopted", "unrecoverable" };
+var fz_reach: [fz_labels.len]usize = @splat(0);
+
+fn recoverHarness(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
+    var run: RecoverRun = .{};
+    try driveRecover(S, src, &run, gpa);
+    if (run.metas_stamped != 0) fzMark(0);
+    if (run.shapes[2] != 0) fzMark(1);
+    if (run.shapes[3] != 0) fzMark(2);
+    if (run.adopted != null) fzMark(3) else fzMark(4);
+}
+
+fn fzMark(comptime i: usize) void {
+    fz_reach[i] += 1;
+    fuzz_driver.hit(fz_labels[i]);
+}
+
+/// The corpus above, lightly damaged: one of `recover_seeds` serialised, then
+/// 0-2 knob words nudged (+-1 or a small value) and 0-3 page octets
+/// overwritten, replayed through `Smith`'s own input format. Random pages
+/// almost never make `recover` adopt a meta (0 in 200 000 runs, 2026-10-09);
+/// the corpus's adopted seeds do, and their neighbours are where a
+/// `candidateValid` or tree-walk check that is one off would show.
+/// (`Smith{ .in = ... }` over a STRUCTURED corpus entry, not random bytes --
+/// the latter collapses every draw to its minimum, see testkit's driver.)
+fn recoverMutatedHarness(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
+    const sd = recover_seeds[src.index(recover_seeds.len)];
+    const image_len = @as(usize, recover_pages) * page_size;
+    const buf = try gpa.alloc(u8, image_len + sd.words.len * 8);
+    defer gpa.free(buf);
+    @memset(buf[0..image_len], sd.fill);
+    for (sd.words, 0..) |w, i| std.mem.writeInt(u64, buf[image_len + i * 8 ..][0..8], w, .little);
+    if (sd.words.len != 0) {
+        for (0..src.valueRangeAtMost(u8, 0, 2)) |_| {
+            const at = image_len + src.index(sd.words.len) * 8;
+            const w = std.mem.readInt(u64, buf[at..][0..8], .little);
+            const nw: u64 = switch (src.valueRangeAtMost(u8, 0, 2)) {
+                0 => w +% 1,
+                1 => w -% 1,
+                else => src.valueRangeAtMost(u64, 0, 16),
+            };
+            std.mem.writeInt(u64, buf[at..][0..8], nw, .little);
+        }
+    }
+    for (0..src.valueRangeAtMost(u8, 0, 3)) |_| buf[src.index(image_len)] = src.value(u8);
+    var sm: std.testing.Smith = .{ .in = buf };
+    var run: RecoverRun = .{};
+    try driveRecover(std.testing.Smith, &sm, &run, gpa);
+    if (run.adopted != null) fzMark(3) else fzMark(4);
+    if (run.root_kind) |k| if (k == @intFromEnum(format.NodeKind.branch)) fzMark(1);
+}
+
+test "fuzz driver: KVTREE_FUZZ (recover, recover-mutated)" {
+    try fuzz_driver.run(recoverHarness, .{ .prefix = "KVTREE_FUZZ", .name = "recover" });
+    try fuzz_driver.run(recoverMutatedHarness, .{ .prefix = "KVTREE_FUZZ", .name = "recover-mutated" });
+}
+
+test "fuzz harness: 150 seeds in every test run, and they get everywhere" {
+    fz_reach = @splat(0);
+    for (0..150) |sd| {
+        var prng = std.Random.DefaultPrng.init(sd);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        recoverHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("kvtree recover seed {d}: {t}\n", .{ sd, err });
+            return err;
+        };
+    }
+    // `adopted` comes from the mutated corpus harness: random pages almost
+    // never pass `candidateValid` (0 in 200 000 driver runs, 2026-10-09).
+    for (0..150) |sd| {
+        var prng = std.Random.DefaultPrng.init(sd);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        recoverMutatedHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("kvtree recover-mutated seed {d}: {t}\n", .{ sd, err });
+            return err;
+        };
+    }
+    for (fz_reach, fz_labels) |n, l| if (n == 0) {
+        std.debug.print("reach: label {s} never hit in 150 seeds\n", .{l});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 /// ⭐ The harness body, factored out so the corpus guard below drives the SAME
 /// draw sequence rather than a paraphrase of it. A guard that measures a
 /// different sequence from the one the fuzzer runs is not a guard.
-fn driveRecover(smith: *std.testing.Smith, run: *RecoverRun) !void {
-    const gpa = testing.allocator;
-
+fn driveRecover(comptime S: type, smith: *S, run: *RecoverRun, gpa: Allocator) !void {
     var sim = kv.SimStorage.init(gpa);
     defer sim.deinit();
     const handle = try sim.storage().open("fuzz.kvt", .create_truncate);
@@ -1245,7 +1335,7 @@ test "corpus: the recover seeds drive every knob, and the counts are pinned" {
     for (corpus) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var run: RecoverRun = .{};
-        try driveRecover(&smith, &run);
+        try driveRecover(std.testing.Smith, &smith, &run, testing.allocator);
         metas_stamped += run.metas_stamped;
         for (&shapes, run.shapes) |*acc, n| acc.* += n;
         const m = run.adopted orelse continue;

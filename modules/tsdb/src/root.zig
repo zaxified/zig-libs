@@ -1407,6 +1407,7 @@ pub const Range = struct {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("codec.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

@@ -7336,16 +7336,34 @@ const message_seeds = [_][]const u8{
 };
 
 test "fuzz: handleMessage never panics on an arbitrary JSON-RPC line" {
-    try testing.fuzz({}, fuzzHandleMessage, .{ .corpus = &message_seeds });
+    try testing.fuzz({}, fuzzScript(fuzzHandleMessage), .{ .corpus = &message_seeds });
 }
 
-fn fuzzHandleMessage(_: void, smith: *std.testing.Smith) !void {
+fn fuzzHandleMessage(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    return handleOne(S, src, gpa, false);
+}
+
+fn fuzzHandleMessageMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    return handleOne(S, src, gpa, true);
+}
+
+fn handleOne(comptime S: type, src: *S, gpa: std.mem.Allocator, mutated: bool) anyerror!void {
     // ⚠ One byte-first draw, and no knob after it: the peer id is no longer
     // drawn at all, because a draw after the bytes is dead on a corpus replay.
     // Both peers run on every input instead, which is more than the single
     // drawn value could give.
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    var len: usize = undefined;
+    if (mutated) {
+        // One of `message_seeds`, a few octets damaged, maybe cut short:
+        // random bytes never form a request line.
+        var smith: std.testing.Smith = .{ .in = message_seeds[src.index(message_seeds.len)] };
+        len = smith.slice(&buf);
+        if (len != 0) {
+            for (0..src.valueRangeAtMost(u8, 0, 3)) |_| buf[src.index(len)] = src.value(u8);
+            if (src.valueRangeAtMost(u8, 0, 3) == 0) len = src.index(len) + 1;
+        }
+    } else len = src.slice(&buf);
 
     // ⭐ A LIVE `TestApp`, not `null`. `testServer(null)` leaves the registered
     // `echo` tool's `ctx` null and `echoHandler` opens with `ctx.?`, so the
@@ -7359,9 +7377,10 @@ fn fuzzHandleMessage(_: void, smith: *std.testing.Smith) !void {
     var app: TestApp = .{};
     var s = testServer(&app);
     defer s.deinit();
-    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     s.handleMessage(buf[0..len], &aw.writer) catch return;
+    if (std.mem.indexOf(u8, aw.written(), "\"error\":") != null) fuzz_mark(.error_reply) else fuzz_mark(.ok_reply);
     // The peer arm of the same entry point: `handleMessageFrom` with a
     // non-zero peer, which `handleMessage` does not reach.
     s.handleMessageFrom(buf[0..len], &aw.writer, 7) catch return;
@@ -7668,10 +7687,11 @@ test "corpus: every response script builds a distinct line, and the octets are p
 }
 
 test "fuzz: an arbitrary client RESPONSE never panics and always reaches the parsers" {
-    try testing.fuzz({}, fuzzClientResponse, .{ .corpus = &response_scripts });
+    try testing.fuzz({}, fuzzScript(fuzzClientResponse), .{ .corpus = &response_scripts });
 }
 
-fn fuzzClientResponse(_: void, smith: *std.testing.Smith) !void {
+fn fuzzClientResponse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⚠ ONE byte-first draw, then a `Cursor` over it. What stood here drew
     // every choice from `smith` directly, opening with `smith.index(2)`. A
     // `Smith` ranged draw returns the range MINIMUM when fewer than eight
@@ -7685,7 +7705,7 @@ fn fuzzClientResponse(_: void, smith: *std.testing.Smith) !void {
     // do not depend on the fuzzer at all. Measured 2026-09-07: 1 round,
     // 4 identical fuzzed answers, 1 distinct JSON shape.
     var script: [64]u8 = undefined;
-    const script_len: usize = smith.slice(&script);
+    const script_len: usize = src.slice(&script);
     var c = kit.Cursor{ .bytes = script[0..script_len] };
     var s = try serverWithCaps("{\"sampling\":{},\"elicitation\":{\"form\":{},\"url\":{}}}");
     defer s.deinit();
@@ -7744,8 +7764,10 @@ fn fuzzClientResponse(_: void, smith: *std.testing.Smith) !void {
         line.clearRetainingCapacity();
         try buildFuzzResponse(&c, &line.writer, id);
         const before = probe.calls;
+        const err_before = probe.err_payloads;
         try deliverFuzzLine(&s, line.written(), peer);
         try testing.expectEqual(before + 1, probe.calls);
+        if (probe.err_payloads != err_before) fuzz_mark(.error_payload) else fuzz_mark(.result_unparsed);
         try testing.expectEqual(@as(usize, 0), s.pendingCount());
     }
 
@@ -9169,4 +9191,94 @@ test "subscriptions/listen: integer ids echo as integers; a non-object filter is
     defer testing.allocator.free(legacy);
     try testing.expect(std.mem.indexOf(u8, legacy, "\"code\":-32602") != null);
     try testing.expect(std.mem.indexOf(u8, legacy, "acknowledged") == null);
+}
+
+// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+//
+// The harnesses above are generic over their source of choices
+// (`fn(comptime S, *S, gpa)`); `testing.fuzz` feeds them through `FuzzScript`,
+// `MCP_FUZZ=<runs>[,<first seed>]` through testkit's driver (`_MS`,
+// `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there). They stay in this file
+// because the test server, probe and corpora they use are private. Random
+// bytes never form a JSON-RPC request, so `handleMessage` also has a "mutated"
+// twin: a corpus line, a few octets damaged, maybe cut short.
+
+const fuzz_driver = @import("testkit").fuzz.driver;
+
+const FuzzLabel = enum { error_reply, ok_reply, error_payload, result_unparsed };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn fuzz_mark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+const FuzzScript = struct {
+    cur: kit.Cursor,
+
+    pub fn valueRangeAtMost(self: *FuzzScript, comptime T: type, at_least: T, at_most: T) T {
+        return @intCast(self.cur.ranged(at_least, at_most));
+    }
+    pub fn value(self: *FuzzScript, comptime T: type) T {
+        return switch (T) {
+            bool => self.cur.byte() & 1 == 1,
+            u8 => self.cur.byte(),
+            u16 => self.cur.word(),
+            else => @compileError("FuzzScript.value: unsupported type"),
+        };
+    }
+    pub fn bytes(self: *FuzzScript, buf: []u8) void {
+        for (buf) |*b| b.* = self.cur.byte();
+    }
+    pub fn index(self: *FuzzScript, len: usize) usize {
+        return self.cur.ranged(0, @intCast(len - 1));
+    }
+    /// What `Smith.slice` returns for this script: up to `buf.len` of the
+    /// remaining script bytes, and their count.
+    pub fn slice(self: *FuzzScript, buf: []u8) u32 {
+        const left = self.cur.bytes.len -| self.cur.at;
+        const n = @min(buf.len, left);
+        @memcpy(buf[0..n], self.cur.bytes[self.cur.at..][0..n]);
+        self.cur.at += n;
+        return @intCast(n);
+    }
+};
+
+fn fuzzScript(comptime harness: anytype) fn (void, *std.testing.Smith) anyerror!void {
+    return struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            var script: [1024]u8 = undefined;
+            const n = smith.slice(&script);
+            var src: FuzzScript = .{ .cur = .{ .bytes = script[0..n] } };
+            return harness(FuzzScript, &src, testing.allocator);
+        }
+    }.f;
+}
+
+test "fuzz: handleMessage, damaged corpus lines" {
+    try testing.fuzz({}, fuzzScript(fuzzHandleMessageMutated), .{});
+}
+
+test "fuzz driver: MCP_FUZZ" {
+    try fuzz_driver.run(fuzzHandleMessage, .{ .prefix = "MCP_FUZZ", .name = "mcp-handle-message" });
+    try fuzz_driver.run(fuzzHandleMessageMutated, .{ .prefix = "MCP_FUZZ", .name = "mcp-handle-message-mutated" });
+    try fuzz_driver.run(fuzzClientResponse, .{ .prefix = "MCP_FUZZ", .name = "mcp-client-response", .scale = 4 });
+}
+
+test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
+    fuzz_reach = @splat(0);
+    inline for (.{ fuzzHandleMessage, fuzzHandleMessageMutated, fuzzClientResponse }, 0..) |h, which| {
+        for (0..400) |sd| {
+            var prng = std.Random.DefaultPrng.init(sd);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print("mcp harness {d} seed {d}: {t}\n", .{ which, sd, err });
+                return err;
+            };
+        }
+    }
+    for (fuzz_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }

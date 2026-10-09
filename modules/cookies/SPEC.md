@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-19 · mutation 2026-10-04 (32/32) · src ?
 
-**Hardening:** fuzz ? · ct none
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, COOKIES_FUZZ) · ct none
 
 **Performance:** not measured
 

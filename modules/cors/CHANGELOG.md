@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `CORS_FUZZ` over the existing harnesses (`gates`).
 - **2026-10-05** — **Anchoring: headless Chrome** (`tools/interop.zig`, `tools/browser_oracle.js`,
   `src/browser_oracle_test.zig`): 504 `fetch()` calls from two origins under 16 gated and 2 static
   configurations; Chrome's verdict must equal the configured policy, and the middleware must still

@@ -2034,6 +2034,9 @@ test "Archive/EntryReader: zip64 with Deflate-compressed data" {
 
 var f8_entry_reader_reached: usize = 0;
 
+const fz = @import("fuzz_test.zig");
+const fuzz_driver = @import("testkit").fuzz.driver;
+
 /// The corpus, built at run time from this module's own `ArchiveWriter`:
 /// random bytes essentially never assemble a byte-exact, walkable central
 /// directory (which is why finding F1 needed a crafted case), so the only
@@ -2168,8 +2171,9 @@ fn tryEntries(archive: *Archive) void {
         // than attempting a large allocation from a small fuzz input.
         er.initMax(archive, entry, &window, 64 * 1024) catch continue;
         f8_entry_reader_reached += 1;
+        fz.mark(.entry_opened);
         var sink_buf: [256]u8 = undefined;
-        _ = er.reader().readSliceShort(&sink_buf) catch {};
+        if ((er.reader().readSliceShort(&sink_buf) catch 0) != 0) fz.mark(.entry_read);
         _ = er.reader().discardRemaining() catch {};
     }
 }
@@ -2179,7 +2183,7 @@ fn tryEntries(archive: *Archive) void {
 // walk only and cannot skip the caller's remaining work (that was the shape
 // of an earlier draft's bug: `return` inside a bare `{ }` block still returns
 // the whole enclosing function in Zig).
-fn tryArchiveBytes(bytes: []const u8) void {
+fn tryArchiveBytes(gpa: std.mem.Allocator, bytes: []const u8) void {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     tmp.dir.writeFile(testing.io, .{ .sub_path = "f.zip", .data = bytes }) catch return;
@@ -2187,8 +2191,12 @@ fn tryArchiveBytes(bytes: []const u8) void {
     defer f.close(testing.io);
 
     var archive: Archive = undefined;
-    archive.init(testing.io, testing.allocator, f) catch return;
+    archive.init(testing.io, gpa, f) catch {
+        fz.mark(.init_refused);
+        return;
+    };
     defer archive.deinit();
+    fz.mark(.init_ok);
     tryEntries(&archive);
 }
 
@@ -2200,7 +2208,64 @@ fn fuzzArchiveInit(_: void, smith: *std.testing.Smith) !void {
     // longer than the buffer reads back EMPTY.
     var buf: [ZipCorpus.cap]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    tryArchiveBytes(buf[0..len]);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try archiveHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
+fn archiveHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var buf: [ZipCorpus.cap]u8 = undefined;
+    const len: usize = src.slice(&buf);
+    tryArchiveBytes(gpa, buf[0..len]);
+}
+
+const mut_names = [_][]const u8{ "a.txt", "dir/b.bin", "x/y/z", "long" ** 20 };
+
+/// A valid archive from this module's own `ArchiveWriter`, then damaged: a few
+/// octets flipped, maybe cut short. Random octets never assemble a walkable
+/// central directory, so `archiveHarness` alone stops at `Archive.init`.
+fn mutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var out: [ZipCorpus.cap]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    var zw = ArchiveWriter.init(gpa, &w);
+    defer zw.deinit();
+    var content: [600]u8 = undefined;
+    const count = src.valueRangeAtMost(u8, 1, 3);
+    for (0..count) |_| {
+        const clen: usize = src.valueRangeAtMost(u16, 0, content.len);
+        // Compressible half the time, noise the rest: both Deflate shapes.
+        if (src.value(bool)) {
+            @memset(content[0..clen], src.value(u8));
+        } else src.bytes(content[0..clen]);
+        const deflate = src.value(bool);
+        zw.addEntry(mut_names[src.index(mut_names.len)], content[0..clen], .{ .method = if (deflate) .deflate else .store }) catch break;
+    }
+    zw.finish() catch {};
+    var n = w.buffered().len;
+    if (n == 0) return;
+    const flips = src.valueRangeAtMost(u8, 0, 4);
+    for (0..flips) |_| out[src.index(n)] ^= src.value(u8);
+    if (src.valueRangeAtMost(u8, 0, 3) == 0) n -= src.index(n);
+    tryArchiveBytes(gpa, out[0..n]);
+}
+
+test "fuzz driver: ZIPSTREAM_FUZZ (archive, mutated)" {
+    try fuzz_driver.run(archiveHarness, .{ .prefix = "ZIPSTREAM_FUZZ", .name = "archive" });
+    try fuzz_driver.run(mutatedHarness, .{ .prefix = "ZIPSTREAM_FUZZ", .name = "mutated" });
+}
+
+test "fuzz harnesses: 300 seeds each in every test run, and they get everywhere" {
+    fz.resetReach();
+    inline for (.{ archiveHarness, mutatedHarness }, .{ "archive", "mutated" }) |h, name| {
+        for (0..300) |seed| {
+            var prng = std.Random.DefaultPrng.init(seed);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print("zipstream {s} seed {d}: {t}\n", .{ name, seed, err });
+                return err;
+            };
+        }
+    }
+    try fz.expectAllReached();
 }
 
 // ── offline write-path anchor (real unzip/zipinfo capture, no subprocess) ─

@@ -2415,6 +2415,9 @@ fn systemTar(gpa: Allocator, io: std.Io, cwd: std.Io.Dir, argv: []const []const 
 // back EMPTY. The buffer is now `8 * block_size`, set by the largest archive
 // the module's own `Writer` produces below, not by taste.
 
+const fz = @import("fuzz_test.zig");
+const fuzz_driver = @import("testkit").fuzz.driver;
+
 /// The corpus, built at run time from this module's own `Writer`: `tar` owns
 /// no captured archive, so freezing a paste of one would only track the
 /// encoder until someone edited it.
@@ -2588,21 +2591,99 @@ fn fuzzReader(_: void, smith: *std.testing.Smith) !void {
     // ⚠ One byte-first draw. Never `bytes` then a ranged length.
     var buf: [ArchiveCorpus.cap]u8 = undefined;
     const len: usize = smith.slice(&buf);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try readerHarness(fz.ScriptSource, &src, testing.allocator);
+}
 
-    var src: std.Io.Reader = .fixed(buf[0..len]);
-    var tr = Reader.init(testing.allocator, &src);
+fn readerHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var buf: [ArchiveCorpus.cap]u8 = undefined;
+    const len: usize = src.slice(&buf);
+    walkArchive(gpa, buf[0..len]);
+}
+
+/// The entry-by-entry walk a real extractor does; any error ends it (that is
+/// the reader refusing, which is the right answer for a hostile archive).
+fn walkArchive(gpa: std.mem.Allocator, bytes: []const u8) void {
+    var src: std.Io.Reader = .fixed(bytes);
+    var tr = Reader.init(gpa, &src);
     defer tr.deinit();
 
     var content_buf: [256]u8 = undefined;
     var entries: usize = 0;
     while (entries < 16) : (entries += 1) {
-        const entry = (tr.next() catch return) orelse return;
+        const entry = (tr.next() catch {
+            fz.mark(.refused);
+            return;
+        }) orelse {
+            fz.mark(.ended_clean);
+            return;
+        };
         _ = entry;
+        fz.mark(.entry_walked);
         while (true) {
-            const n = tr.read(&content_buf) catch return;
+            const n = tr.read(&content_buf) catch {
+                fz.mark(.refused);
+                return;
+            };
             if (n == 0) break;
+            fz.mark(.content_read);
         }
     }
+}
+
+const mut_names = [_][]const u8{ "a", "etc/hostname", "tree/", "x/y/z.txt", "long/" ++ ("n" ** 130) ++ "/f" };
+
+/// A valid archive from this module's own `Writer`, then damaged: a few
+/// octets flipped, the first header's checksum maybe re-stamped (so the
+/// edited field is parsed rather than refused at `verifyChecksum`), maybe
+/// cut short. Random octets almost never form a header whose checksum
+/// verifies, so the `readerHarness` alone cannot get past the first block.
+fn mutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var scratch: [ArchiveCorpus.cap]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&scratch);
+    const tw = Writer.init(&w);
+    var content: [700]u8 = undefined;
+    const count = src.valueRangeAtMost(u8, 1, 3);
+    for (0..count) |_| {
+        const name = mut_names[src.index(mut_names.len)];
+        const clen: usize = src.valueRangeAtMost(u16, 0, content.len);
+        src.bytes(content[0..clen]);
+        const kind: Kind = switch (src.valueRangeAtMost(u8, 0, 3)) {
+            0 => .dir,
+            1 => .symlink,
+            else => .file,
+        };
+        const body: []const u8 = if (kind == .file) content[0..clen] else "";
+        tw.writeEntry(.{ .path = name, .kind = kind, .mode = 0o644, .link_target = if (kind == .symlink) "target" else "" }, body) catch break;
+    }
+    if (src.value(bool)) tw.finish() catch {};
+    var arch_len = w.buffered().len;
+    if (arch_len == 0) return;
+    const flips = src.valueRangeAtMost(u8, 0, 4);
+    for (0..flips) |_| scratch[src.index(arch_len)] ^= src.value(u8);
+    if (arch_len >= block_size and src.value(bool)) recomputeChecksum(scratch[0..block_size]);
+    if (src.value(bool)) arch_len -= src.index(arch_len);
+    walkArchive(gpa, scratch[0..arch_len]);
+}
+
+test "fuzz driver: TAR_FUZZ (reader, mutated)" {
+    try fuzz_driver.run(readerHarness, .{ .prefix = "TAR_FUZZ", .name = "reader" });
+    try fuzz_driver.run(mutatedHarness, .{ .prefix = "TAR_FUZZ", .name = "mutated" });
+}
+
+test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere" {
+    fz.resetReach();
+    inline for (.{ readerHarness, mutatedHarness }, .{ "reader", "mutated" }) |h, name| {
+        for (0..500) |seed| {
+            var prng = std.Random.DefaultPrng.init(seed);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print("tar {s} seed {d}: {t}\n", .{ name, seed, err });
+                return err;
+            };
+        }
+    }
+    try fz.expectAllReached();
 }
 
 test "GNU tar --format=pax: a long name arrives through the pax 'x' header (external anchor)" {

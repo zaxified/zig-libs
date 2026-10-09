@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `DECIMAL_FUZZ` over the existing harnesses.
 - **2026-10-04** — **BEHAVIOURAL** fixes found by the mutation run: `Decimal.round(n)` with a rounding
   place beyond 10^36 now returns 0 (it returned the value unchanged; `rescale` already gave 0);
   `Decimal.parse` of a magnitude below 1e-60 now rounds half-away to the 12th place (0 below half an

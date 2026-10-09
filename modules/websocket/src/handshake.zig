@@ -123,6 +123,12 @@ pub fn computeAcceptKey(key: []const u8) [28]u8 {
 /// base64-alphabet characters without actually being valid.
 fn validateKey(key: []const u8) HandshakeError!void {
     if (key.len != 24) return error.InvalidKey;
+    // 24 base64 characters WITHOUT `==` padding decode to 18 octets, not 16:
+    // check the decoded size before decoding into the fixed buffer (found by
+    // WEBSOCKET_FUZZ 2026-10-09: a client's key panicked the server in safe
+    // builds and wrote 2 octets past `decoded` in ReleaseFast).
+    const n = std.base64.standard.Decoder.calcSizeForSlice(key) catch return error.InvalidKey;
+    if (n != 16) return error.InvalidKey;
     var decoded: [16]u8 = undefined;
     std.base64.standard.Decoder.decode(&decoded, key) catch return error.InvalidKey;
 }
@@ -575,6 +581,15 @@ test "acceptHandshake: rejects malformed key (wrong decoded length)" {
     try testing.expectError(error.InvalidKey, acceptHandshake(head, .{}));
 }
 
+test "acceptHandshake: rejects a 24-character key without padding (decodes to 18 octets)" {
+    // Regression (WEBSOCKET_FUZZ, 2026-10-09): the length check alone let this
+    // through to a decode into a 16-octet buffer -- a panic in safe builds,
+    // two octets written past the buffer in ReleaseFast.
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAAAA\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    try testing.expectError(error.InvalidKey, acceptHandshake(head, .{}));
+}
+
 test "acceptHandshake: rejects key with invalid base64 characters" {
     const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: !!!!not-b64!!!!!!!!!!!!!\r\nSec-WebSocket-Version: 13\r\n";
     const head = try h1.RequestHead.parse(req);
@@ -890,6 +905,8 @@ test "writeRequest: positive control, ordinary fields still write correctly" {
 // so they stay fixed.
 
 const fuzz = @import("testkit").fuzz;
+const fz = @import("fuzz_test.zig");
+const fuzz_driver = fuzz.driver;
 
 /// Response blocks a **client** receives from its server, in the format
 /// `Smith.slice` reads (one call, never `smith.bytes` + a ranged length —
@@ -922,8 +939,42 @@ test "fuzz: verifyResponse never panics, client role (h1.ResponseHead.parse + ve
 fn fuzzVerifyResponseClient(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    const head = h1.ResponseHead.parse(buf[0..len]) catch return;
-    _ = verifyResponse(head, fixed_key, &fixed_offered) catch return;
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try responseHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
+fn responseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [512]u8 = undefined;
+    const len: usize = src.slice(&buf);
+    responseCase(buf[0..len]);
+}
+
+fn responseCase(bytes: []const u8) void {
+    const head = h1.ResponseHead.parse(bytes) catch {
+        fz.mark(.response_unparsed);
+        return;
+    };
+    _ = verifyResponse(head, fixed_key, &fixed_offered) catch {
+        fz.mark(.response_refused);
+        return;
+    };
+    fz.mark(.response_verified);
+}
+
+/// One corpus response with a few octets flipped: random octets never parse
+/// as an HTTP response head, so `responseHarness` alone stops at the parser.
+fn responseMutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const text = response_seeds[src.index(response_seeds.len)][4..];
+    var buf: [512]u8 = undefined;
+    @memcpy(buf[0..text.len], text);
+    const flips = src.valueRangeAtMost(u8, 0, 3);
+    for (0..flips) |_| {
+        if (text.len == 0) break;
+        buf[src.index(text.len)] ^= src.value(u8);
+    }
+    responseCase(buf[0..text.len]);
 }
 
 // ── fuzz: acceptHandshake off the wire, server role, never panics ──────────
@@ -959,8 +1010,63 @@ test "fuzz: acceptHandshake never panics, server role (h1.RequestHead.parse + ac
 fn fuzzAcceptHandshakeServer(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    const head = h1.RequestHead.parse(buf[0..len]) catch return;
-    _ = acceptHandshake(head, .{ .protocols = &fixed_offered }) catch return;
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try requestHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
+fn requestHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [512]u8 = undefined;
+    const len: usize = src.slice(&buf);
+    requestCase(buf[0..len]);
+}
+
+fn requestCase(bytes: []const u8) void {
+    const head = h1.RequestHead.parse(bytes) catch {
+        fz.mark(.request_unparsed);
+        return;
+    };
+    _ = acceptHandshake(head, .{ .protocols = &fixed_offered }) catch {
+        fz.mark(.request_refused);
+        return;
+    };
+    fz.mark(.request_accepted);
+}
+
+/// One corpus request with a few octets flipped (see `responseMutatedHarness`).
+fn requestMutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const text = request_seeds[src.index(request_seeds.len)][4..];
+    var buf: [512]u8 = undefined;
+    @memcpy(buf[0..text.len], text);
+    const flips = src.valueRangeAtMost(u8, 0, 3);
+    for (0..flips) |_| {
+        if (text.len == 0) break;
+        buf[src.index(text.len)] ^= src.value(u8);
+    }
+    requestCase(buf[0..text.len]);
+}
+
+test "fuzz driver: WEBSOCKET_FUZZ (response, response-mutated, request, request-mutated)" {
+    try fuzz_driver.run(responseHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "response" });
+    try fuzz_driver.run(responseMutatedHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "response-mutated" });
+    try fuzz_driver.run(requestHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "request" });
+    try fuzz_driver.run(requestMutatedHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "request-mutated" });
+}
+
+test "fuzz harnesses: 500 seeds each in every test run, and the handshakes get everywhere" {
+    fz.resetReach();
+    inline for (.{ responseHarness, responseMutatedHarness, requestHarness, requestMutatedHarness }, .{ "response", "response-mutated", "request", "request-mutated" }) |h, name| {
+        for (0..500) |sd| {
+            var prng = std.Random.DefaultPrng.init(sd);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print("websocket {s} seed {d}: {t}\n", .{ name, sd, err });
+                return err;
+            };
+        }
+    }
+    try fz.expectReached(&.{ .response_unparsed, .response_refused, .response_verified, .request_unparsed, .request_refused, .request_accepted });
 }
 
 test "corpus: every request seed reaches h1.RequestHead.parse, and acceptHandshake's own checks all fire" {

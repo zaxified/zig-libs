@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `AESGCM_FUZZ` over the existing harnesses (the harness also checks that the genuine tag is accepted and decrypts to the message).
 - **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** documented why `Context.encrypt`/`decrypt` carry
   no dead-stack burn (keyed-transform state, §2.1 Z3; the owning protocol entry point burns).
 - **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). `Context.init`/`initWith`,

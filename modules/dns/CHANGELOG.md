@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `DNS_FUZZ` over the existing harnesses (decoder on arbitrary bytes, decoder on damaged captures).
+
 - **2026-10-07** — **Fix (behaviour change), `Resolver.query` asks the next server when one fails.**
   A reply with SERVFAIL, NOTIMP or REFUSED used to be returned as the answer, so one broken or
   refusing first nameserver failed every lookup that getaddrinfo still resolved. Now such a reply

@@ -3695,7 +3695,7 @@ test "writeErrorFromCode maps the write-path errnos" {
     try testing.expectEqual(error.Unexpected, writeErrorFromCode(std.math.minInt(i32)));
 }
 
-/// Address bytes plus the six knobs `fuzzBuilders` draws after them, in the
+/// Address bytes plus the six knobs `builderHarness` draws after them, in the
 /// exact order it draws them. The layout is the draw sequence: a
 /// `testkit.fuzz` slice seed (u32 length + bytes), then one little-endian u64
 /// per knob.
@@ -3751,15 +3751,37 @@ const BuilderCorpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const BuildMark = fz.Marker(enum { address, route, neighbor, link_set, refused });
+const ParseMark = fz.Marker(enum { rejected, link, address, route, neighbor });
+
 test "fuzz: request builders never crash on arbitrary spec bytes" {
     var corpus: BuilderCorpus = .{};
-    var run: BuilderRun = .{};
-    try testing.fuzz(&run, fuzzBuilders, .{ .corpus = corpus.build() });
+    try testing.fuzz({}, builderHarnessSmith, .{ .corpus = corpus.build() });
 }
 
-fn fuzzBuilders(run: *BuilderRun, smith: *std.testing.Smith) !void {
-    run.* = .{};
-    try driveBuilders(smith, run);
+fn builderHarnessSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(builderHarness, smith, script[0..n]);
+}
+
+fn builderHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var run: BuilderRun = .{};
+    try driveBuilders(S, src, &run, gpa);
+    if (run.built[0]) BuildMark.mark(.address);
+    if (run.built[1]) BuildMark.mark(.route);
+    if (run.built[2]) BuildMark.mark(.neighbor);
+    if (run.built[3]) BuildMark.mark(.link_set);
+    if (run.accepted < 4) BuildMark.mark(.refused);
+}
+
+test "fuzz driver: NETLINK_FUZZ (rtnetlink builders)" {
+    try fz.fuzz_driver.run(builderHarness, .{ .prefix = "NETLINK_FUZZ", .name = "netlink-builders" });
+}
+
+test "fuzz harness: rtnetlink builders, 300 seeds, reaches every outcome" {
+    try BuildMark.reach(builderHarness, "netlink-builders", 300);
 }
 
 /// What one pass of `driveBuilders` drew and what came of it. The harness
@@ -3789,7 +3811,7 @@ const BuilderRun = struct {
 /// ⭐ The harness body, factored out so the corpus guard below drives the SAME
 /// draw sequence rather than a paraphrase of it. A guard that measures a
 /// different sequence from the one the fuzzer runs is not a guard.
-fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
+fn driveBuilders(comptime S: type, smith: *S, run: *BuilderRun, gpa: std.mem.Allocator) !void {
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(addr.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
@@ -3807,7 +3829,6 @@ fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
     run.ifindex = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32));
     const prefix = run.prefix;
     const ifindex = run.ifindex;
-    const gpa = testing.allocator;
 
     if (buildAddressRequest(gpa, 1, RTM_NEWADDR, 0, .{
         .ifindex = ifindex,
@@ -3880,7 +3901,7 @@ test "corpus: every builder seed reaches the builders, and the counts are pinned
     for (entries, builder_seeds) |sd, spec| {
         var smith: std.testing.Smith = .{ .in = sd };
         var run: BuilderRun = .{};
-        try driveBuilders(&smith, &run);
+        try driveBuilders(std.testing.Smith, &smith, &run, testing.allocator);
         if (run.addr_len != 0) nonempty += 1;
         try testing.expectEqualSlices(u8, spec.addr, run.addr[0..run.addr_len]);
         if (run.prefix == spec.prefix and run.ifindex == spec.ifindex and
@@ -4041,10 +4062,25 @@ const ParserCorpus = struct {
 
 test "fuzz: typed parsers never crash on arbitrary payloads" {
     var corpus: ParserCorpus = .{};
-    try testing.fuzz({}, fuzzParsers, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzParsersSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzParsers(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: NETLINK_FUZZ (rtnetlink parsers)" {
+    try fz.fuzz_driver.run(fuzzParsers, .{ .prefix = "NETLINK_FUZZ", .name = "netlink-parsers" });
+}
+
+test "fuzz harness: rtnetlink parsers, 300 seeds, reaches every outcome" {
+    try ParseMark.reach(fuzzParsers, "netlink-parsers", 300);
+}
+
+fn fuzzParsersSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzParsers, smith, script[0..n]);
+}
+
+fn fuzzParsers(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var raw: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
@@ -4053,12 +4089,36 @@ fn fuzzParsers(_: void, smith: *std.testing.Smith) !void {
     // payload with the message sitting unread in `raw`. Measured 2026-09-07
     // over the corpus above: **0 of 9 seeds non-empty and 0 of 36 (seed,
     // parser) pairs parsed before, 9 of 9 non-empty and 10 of 36 after.**
-    const len: usize = smith.slice(&raw);
+    var cstore: ParserCorpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) (cstore.build() catch &.{}) else &.{};
+    const len: usize = fz.drawInput(S, smith, &raw, entries);
     const payload = raw[0..len];
-    if (parseLink(payload)) |_| {} else |_| {}
-    if (parseAddress(payload)) |_| {} else |_| {}
-    if (parseRoute(payload)) |_| {} else |_| {}
-    if (parseNeighbor(payload)) |_| {} else |_| {}
+    var any = false;
+    if (parseLink(payload)) |v| {
+        if (v != null) {
+            any = true;
+            ParseMark.mark(.link);
+        }
+    } else |_| {}
+    if (parseAddress(payload)) |v| {
+        if (v != null) {
+            any = true;
+            ParseMark.mark(.address);
+        }
+    } else |_| {}
+    if (parseRoute(payload)) |v| {
+        if (v != null) {
+            any = true;
+            ParseMark.mark(.route);
+        }
+    } else |_| {}
+    if (parseNeighbor(payload)) |v| {
+        if (v != null) {
+            any = true;
+            ParseMark.mark(.neighbor);
+        }
+    } else |_| {}
+    if (!any) ParseMark.mark(.rejected);
 }
 
 test "corpus: every parser seed reaches the parsers, and the accepted count is pinned" {
@@ -5789,4 +5849,5 @@ fn netnsCoreOn(nl: *Socket) !void {
 test {
     _ = codec;
     _ = bridge;
+    _ = fz;
 }

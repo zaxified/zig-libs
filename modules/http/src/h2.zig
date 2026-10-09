@@ -3283,14 +3283,34 @@ const parse_frame_seeds = [_][]const u8{
     frameSeed(@enumFromInt(0xff), 0, 1, "unknown"), // an unregistered type must be ignored, not refused
 };
 
+const fz = @import("fuzz_test.zig");
+const FrameMark = fz.Marker(enum { short, rejected, parsed });
+const ColdMark = fz.Marker(enum { refused, accepted, with_events });
+const WarmMark = fz.Marker(enum { refused, accepted, with_events });
+
 test "fuzz: parseFrame never panics on arbitrary header+payload" {
-    try testing.fuzz({}, fuzzParseFrame, .{ .corpus = &parse_frame_seeds });
+    try testing.fuzz({}, fuzzParseFrameSmith, .{ .corpus = &parse_frame_seeds });
 }
 
-fn fuzzParseFrame(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: HTTP_FUZZ (h2-parse-frame)" {
+    try fz.fuzz_driver.run(fuzzParseFrame, .{ .prefix = "HTTP_FUZZ", .name = "http-h2-parse-frame" });
+}
+
+test "fuzz harness: h2 parseFrame, 300 seeds, reaches every outcome" {
+    try FrameMark.reach(fuzzParseFrame, "http-h2-parse-frame", 300);
+}
+
+fn fuzzParseFrameSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzParseFrame, smith, script[0..n]);
+}
+
+fn fuzzParseFrame(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    if (len < frame_header_len) return;
+    const len: usize = fz.drawInput(S, src, &buf, &parse_frame_seeds);
+    if (len < frame_header_len) return FrameMark.mark(.short);
 
     var h = FrameHeader.decode(buf[0..frame_header_len]);
     const payload = buf[frame_header_len..len];
@@ -3303,7 +3323,8 @@ fn fuzzParseFrame(_: void, smith: *std.testing.Smith) !void {
     // what lets a mutated or truncated one still be parsed rather than trip an
     // assert the production caller makes impossible.
     h.length = @intCast(payload.len);
-    _ = parseFrame(h, payload) catch {};
+    _ = parseFrame(h, payload) catch return FrameMark.mark(.rejected);
+    FrameMark.mark(.parsed);
 }
 
 test "corpus: every frame seed reaches parseFrame, and the frames decoded are pinned" {
@@ -3369,21 +3390,37 @@ const cold_start_seeds = [_][]const u8{
 };
 
 test "fuzz: Connection.recv never panics on arbitrary bytes (pre-handshake)" {
-    try testing.fuzz({}, fuzzConnRecvColdStart, .{ .corpus = &cold_start_seeds });
+    try testing.fuzz({}, fuzzConnRecvColdStartSmith, .{ .corpus = &cold_start_seeds });
 }
 
-fn fuzzConnRecvColdStart(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+test "fuzz driver: HTTP_FUZZ (h2-recv-cold)" {
+    try fz.fuzz_driver.run(fuzzConnRecvColdStart, .{ .prefix = "HTTP_FUZZ", .name = "http-h2-recv-cold" });
+}
 
-    const gpa = testing.allocator;
+test "fuzz harness: h2 recv cold start, 300 seeds, reaches every outcome" {
+    try ColdMark.reach(fuzzConnRecvColdStart, "http-h2-recv-cold", 300);
+}
+
+fn fuzzConnRecvColdStartSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzConnRecvColdStart, smith, script[0..n]);
+}
+
+fn fuzzConnRecvColdStart(comptime S: type, src: *S, driver_gpa: std.mem.Allocator) anyerror!void {
+    _ = driver_gpa;
+    const gpa = testing.allocator; // `freeEvents` and `testServer` free with it
+    var buf: [512]u8 = undefined;
+    const len: usize = fz.drawInput(S, src, &buf, &cold_start_seeds);
+
     var conn: Connection = .init(gpa, .server, .{});
     defer conn.deinit();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     var events: std.ArrayList(Event) = .empty;
     defer freeEvents(&events);
-    _ = conn.recv(buf[0..len], &out, &events) catch {};
+    if (conn.recv(buf[0..len], &out, &events)) |_| ColdMark.mark(.accepted) else |_| ColdMark.mark(.refused);
+    if (events.items.len != 0) ColdMark.mark(.with_events);
 }
 
 /// Frame streams a server sees after a completed handshake, in the format the
@@ -3416,21 +3453,37 @@ const warm_seeds = [_][]const u8{
 };
 
 test "fuzz: Connection.recv never panics on arbitrary bytes (post-handshake)" {
-    try testing.fuzz({}, fuzzConnRecvWarm, .{ .corpus = &warm_seeds });
+    try testing.fuzz({}, fuzzConnRecvWarmSmith, .{ .corpus = &warm_seeds });
 }
 
-fn fuzzConnRecvWarm(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: HTTP_FUZZ (h2-recv-warm)" {
+    try fz.fuzz_driver.run(fuzzConnRecvWarm, .{ .prefix = "HTTP_FUZZ", .name = "http-h2-recv-warm" });
+}
+
+test "fuzz harness: h2 recv warm, 300 seeds, reaches every outcome" {
+    try WarmMark.reach(fuzzConnRecvWarm, "http-h2-recv-warm", 300);
+}
+
+fn fuzzConnRecvWarmSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzConnRecvWarm, smith, script[0..n]);
+}
+
+fn fuzzConnRecvWarm(comptime S: type, src: *S, driver_gpa: std.mem.Allocator) anyerror!void {
+    _ = driver_gpa;
+    const gpa = testing.allocator; // `freeEvents` and `testServer` free with it
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &warm_seeds);
 
     var conn = testServer() catch return;
     defer conn.deinit();
-    const gpa = testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     var events: std.ArrayList(Event) = .empty;
     defer freeEvents(&events);
-    _ = conn.recv(buf[0..len], &out, &events) catch {};
+    if (conn.recv(buf[0..len], &out, &events)) |_| WarmMark.mark(.accepted) else |_| WarmMark.mark(.refused);
+    if (events.items.len != 0) WarmMark.mark(.with_events);
 }
 
 test "corpus: every recv seed reaches the connection, and the events raised are pinned" {

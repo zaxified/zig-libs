@@ -217,6 +217,7 @@ pub const EthIpv4 = struct {
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
+const fz = @import("fuzz_test.zig");
 const testing = std.testing;
 
 // Golden Ethernet/IPv4 ARP request, transcribed field-by-field from the
@@ -401,10 +402,11 @@ const arp_seeds = [_][]const u8{
 };
 
 test "fuzz: ARP parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzArpParse, .{ .corpus = &arp_seeds });
+    try testing.fuzz({}, fz.fuzzScript(fuzzArpParse, 128), .{ .corpus = &arp_seeds });
 }
 
-fn fuzzArpParse(_: void, smith: *std.testing.Smith) !void {
+fn fuzzArpParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // 128, not 64: the hlen 14 / plen 8 seed is 52 octets and a generic ARP
     // packet may legally be far larger. A seed longer than the buffer is not
     // a big seed — `Smith.slice` reads it back as the EMPTY one.
@@ -419,9 +421,13 @@ fn fuzzArpParse(_: void, smith: *std.testing.Smith) !void {
     // 0 packets parsed and 0 address octets sliced before; 11 of 12 non-empty
     // (one seed IS the empty frame), 8 packets, 5 of them Ethernet+IPv4, and
     // 184 address octets sliced, after.**
-    const len: usize = smith.slice(&buf);
-    _ = Packet.parse(buf[0..len]) catch {};
-    _ = EthIpv4.parse(buf[0..len]) catch {};
+    const len: usize = src.slice(&buf);
+    parseArp(buf[0..len]);
+}
+
+fn parseArp(bytes: []const u8) void {
+    if (Packet.parse(bytes)) |_| fz.mark(.parsed) else |_| fz.mark(.rejected);
+    _ = EthIpv4.parse(bytes) catch {};
 }
 
 test "corpus: every ARP seed reaches the parsers, and the sliced counts are pinned" {
@@ -454,4 +460,27 @@ test "corpus: every ARP seed reaches the parsers, and the sliced counts are pinn
     try testing.expectEqual(@as(usize, 8), packets);
     try testing.expectEqual(@as(usize, 5), eth);
     try testing.expectEqual(@as(usize, 184), octets);
+}
+
+// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+// Shared plumbing and the notes on `L2DISCO_FUZZ` are in `fuzz_test.zig`.
+
+fn fuzzArpMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+
+    var buf: [128]u8 = undefined;
+    parseArp(fz.damaged(S, src, &arp_seeds, &buf));
+}
+
+test "fuzz: arp parse, damaged corpus entries" {
+    try testing.fuzz({}, fz.fuzzScript(fuzzArpMutated, 64), .{});
+}
+
+test "fuzz driver: L2DISCO_FUZZ (arp)" {
+    try fz.fuzz_driver.run(fuzzArpParse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-arp" });
+    try fz.fuzz_driver.run(fuzzArpMutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-arp-mutated" });
+}
+
+test "fuzz harness: 400 seeds in every test run, and they get everywhere (arp)" {
+    try fz.checkReach("l2disco arp", .{ fuzzArpParse, fuzzArpMutated }, 400);
 }

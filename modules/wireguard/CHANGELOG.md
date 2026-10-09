@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `WIREGUARD_FUZZ` over the existing harnesses, plus a new `keyFromBase64` harness (corpus incl. 44 characters without `=`). Overlays: a generated GET_DEVICE reply must decode to its peers/addresses; a sealed transport packet must open, replay/flip/truncation must be refused.
 - **2026-10-09** — **SECURITY FIX (panic / stack overflow write on a malformed key):**
   `keyFromBase64`/`keyFromBase64Into` checked only the text length (44); 44 base64
   characters without the trailing `=` decode to 33 octets and were decoded into the

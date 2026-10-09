@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `TZ_FUZZ` over the existing harnesses.
 - **2026-10-05** — **Tests:** POSIX-footer evaluation anchored externally (`src/posix_test.zig`,
   vectors `posix_kat.zig` from `tools/gen_posix_kat.py` + `tools/go_posix/`): every zone 2037..2050
   against Python zoneinfo over tzdata 2026a, and 28 POSIX strings no release ships (Jn/n day forms,

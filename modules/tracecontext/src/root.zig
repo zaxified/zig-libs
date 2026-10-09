@@ -844,6 +844,7 @@ test "TraceContext echo: traceparent header survives the caller's dead frame" {
 
 // See w3c_conformance_test.zig / w3c_vectors.zig / NOTICE.
 test {
+    _ = @import("fuzz_test.zig");
     _ = @import("w3c_vectors.zig");
     _ = @import("w3c_conformance_test.zig");
     _ = @import("otel_oracle_test.zig");
@@ -888,11 +889,14 @@ const traceparent_corpus = [_][]const u8{
     fuzzseed.seed("\x00" ++ "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-011"), // one octet over
     fuzzseed.seed("\x00"), // the empty header
     fuzzseed.seed("\x00" ++ "\xff\x00\x7f-\r\n"), // bytes no header could contain
-    fuzzseed.seed("\x01" ++ "\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02"), // script: every field its nominal length, all delimiters `-`
-    fuzzseed.seed("\x01" ++ "\x00\x02\x02\x02\x02"), // script: the version field one octet SHORT
-    fuzzseed.seed("\x01" ++ "\x02\x02\x01\x02\x02"), // script: the trace-id one octet LONG
-    fuzzseed.seed("\x01" ++ "\x02\x00\x02\x02\x02\x02"), // script: an `_` delimiter
-    fuzzseed.seed("\x01" ++ "\x02\x02\x02\x02\x02\x02\x02\x09\x08\x07"), // script: arbitrary and uppercase field bytes
+    // Script seeds (fuzz_test.zig `buildTraceparent`; a short script CYCLES):
+    // per field one fault octet (mod 16: 0 short, 1 long, 2 uppercase, 3
+    // arbitrary octet, else clean), a position octet, then one octet per digit.
+    fuzzseed.seed("\x01" ++ "\x04"), // script: every field clean, `-` delimiters, version "44" (accepted)
+    fuzzseed.seed("\x01" ++ "\x00"), // script: every field one octet SHORT, `_` delimiters
+    fuzzseed.seed("\x01" ++ "\x01"), // script: every field one octet LONG, plus an extension
+    fuzzseed.seed("\x01" ++ "\x02\x00\x0b"), // script: an uppercase digit in a field
+    fuzzseed.seed("\x01" ++ "\x03\x00\xff"), // script: an arbitrary octet in a field
 };
 
 test "fuzz: TraceParent.parse never panics, arbitrary or traceparent-shaped bytes" {
@@ -908,68 +912,13 @@ fn fuzzParseNeverPanics(_: void, smith: *std.testing.Smith) !void {
     // ⚠ ONE byte-first draw. See `traceparent_corpus` for what the ranged
     // draws did to a corpus of real headers.
     const n: usize = smith.slice(&raw);
-    var buf: [traceparent_buf_len]u8 = undefined;
-    const input = buildTraceparent(raw[0..n], &buf);
-    _ = TraceParent.parse(input) catch return;
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = raw[0..n] } };
+    try fz.parseHarness(fz.ScriptSource, &src, testing.allocator);
 }
 
-/// Octet 0 selects: `0x00` means the remaining octets are the header
-/// verbatim; anything else means they are a script assembling
-/// `version-traceid-parentid-flags` field by field, each field independently
-/// its nominal length or off by one, and each delimiter usually `-` but
-/// sometimes not.
-fn buildTraceparent(seed: []const u8, buf: []u8) []const u8 {
-    if (seed.len == 0) return buf[0..0];
-    if (seed[0] == 0) {
-        const body = seed[1..];
-        const n = @min(body.len, buf.len);
-        @memcpy(buf[0..n], body[0..n]);
-        return buf[0..n];
-    }
-    var script: fuzzseed.Cursor = .{ .bytes = seed[1..] };
-    var w: std.Io.Writer = .fixed(buf);
-    writeField(&script, &w, 2); // version
-    writeDelim(&script, &w);
-    writeField(&script, &w, 32); // trace-id
-    writeDelim(&script, &w);
-    writeField(&script, &w, 16); // parent-id
-    writeDelim(&script, &w);
-    writeField(&script, &w, 2); // flags
-    // Occasionally a trailing extension, as a future version may carry.
-    if (script.byte() & 1 == 1) {
-        w.writeByte('-') catch return w.buffered();
-        writeField(&script, &w, @intCast(script.ranged(0, 12)));
-    }
-    return w.buffered();
-}
+const fz = @import("fuzz_test.zig");
 
-fn writeDelim(script: *fuzzseed.Cursor, w: *std.Io.Writer) void {
-    const c: u8 = if (script.ranged(0, 9) == 0) '_' else '-';
-    w.writeByte(c) catch {};
-}
-
-fn writeField(script: *fuzzseed.Cursor, w: *std.Io.Writer, nominal_len: u8) void {
-    const delta: i16 = switch (script.ranged(0, 9)) {
-        0 => -1,
-        1 => 1,
-        else => 0,
-    };
-    const len: u8 = @intCast(std.math.clamp(@as(i16, nominal_len) + delta, 0, 48));
-    var i: u8 = 0;
-    while (i < len) : (i += 1) {
-        w.writeByte(fieldByte(script)) catch return;
-    }
-}
-
-/// Mostly a valid lowercase hex digit; sometimes uppercase hex (invalid per
-/// spec — lowercase is mandated) or a fully arbitrary byte.
-fn fieldByte(script: *fuzzseed.Cursor) u8 {
-    return switch (script.ranged(0, 9)) {
-        0...6 => hex_digits[script.ranged(0, hex_digits.len - 1)],
-        7 => std.ascii.toUpper(hex_digits[script.ranged(0, hex_digits.len - 1)]),
-        else => script.byte(),
-    };
-}
+const buildTraceparent = fz.buildTraceparent;
 
 test "corpus: every traceparent seed reaches the parser, and what it accepts is pinned" {
     // ⭐ Pinning the accepted count alone would be a weak guard on a decoder
@@ -997,7 +946,7 @@ test "corpus: every traceparent seed reaches the parser, and what it accepts is 
     try testing.expectEqual(traceparent_corpus.len - 1, nonempty);
     // Measured 2026-09-07. The corpus this replaces handed the parser 0
     // octets and got 0 headers parsed, from five real W3C header strings.
-    try testing.expectEqual(@as(usize, 788), octets);
-    try testing.expectEqual(@as(usize, 4), accepted);
+    try testing.expectEqual(@as(usize, 791), octets);
+    try testing.expectEqual(@as(usize, 3), accepted);
     try testing.expectEqual(@as(usize, 2), sampled);
 }

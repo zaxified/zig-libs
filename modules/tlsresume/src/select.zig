@@ -456,11 +456,83 @@ test "fuzz: SessionState(32).parse never panics on arbitrary bytes" {
 }
 
 fn fuzzSessionStateParse(_: void, smith: *std.testing.Smith) !void {
-    // ⚠ One byte-first draw, and no branch: see the block comment above.
-    const S = SessionState(32);
+    return stateHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+const fuzz_driver = @import("testkit").fuzz.driver;
+const StateLabel = enum { raw_rejected, raw_accepted, roundtrip, truncated_rejected, flipped_parsed };
+var state_reach: [@typeInfo(StateLabel).@"enum".fields.len]usize = @splat(0);
+
+fn markState(comptime l: StateLabel) void {
+    state_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// Generic over its source (`Smith` under `--fuzz`, `fuzz_driver.Rng` under the
+/// driver). The drawn octets are parsed raw (any outcome, no panic); then they
+/// also seed a PRNG that builds a genuine record: `serialize` then `parse` must
+/// give the same fields back, every truncation must be refused, and a flipped
+/// octet (anywhere but the nonce-length byte) must still parse.
+fn stateHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const St = SessionState(32);
     var buf: [StateCorpus.cap]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    _ = S.parse(buf[0..len]) catch {};
+    if (St.parse(buf[0..len])) |_| markState(.raw_accepted) else |_| markState(.raw_rejected);
+
+    var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, buf[0..len]));
+    const rnd = prng.random();
+    var nonce: [16]u8 = undefined;
+    rnd.bytes(&nonce);
+    const nonce_len = rnd.uintAtMost(usize, nonce.len);
+    var rms: [32]u8 = undefined;
+    rnd.bytes(&rms);
+    const state = St{
+        .resumption_master_secret = rms,
+        .ticket_nonce = nonce[0..nonce_len],
+        .issued_at_ms = rnd.int(i64),
+        .ticket_age_add = rnd.int(u32),
+    };
+    var wire: [StateCorpus.cap]u8 = undefined;
+    const enc = state.serialize(&wire) catch return error.SerializeFailed;
+    const back = St.parse(enc) catch return error.GenuineRecordRejected;
+    if (!std.mem.eql(u8, &back.resumption_master_secret, &rms) or
+        !std.mem.eql(u8, back.ticket_nonce, state.ticket_nonce) or
+        back.issued_at_ms != state.issued_at_ms or back.ticket_age_add != state.ticket_age_add)
+        return error.RoundTripMismatch;
+    markState(.roundtrip);
+
+    const cut = rnd.uintLessThan(usize, enc.len);
+    if (St.parse(enc[0..cut])) |_| return error.TruncatedRecordAccepted else |_| {}
+    markState(.truncated_rejected);
+
+    var flipped: [StateCorpus.cap]u8 = undefined;
+    @memcpy(flipped[0..enc.len], enc);
+    var at = rnd.uintLessThan(usize, enc.len);
+    if (at == 32) at = 0; // the nonce-length octet decides the layout; leave it
+    flipped[at] ^= @as(u8, 1) << rnd.int(u3);
+    _ = St.parse(flipped[0..enc.len]) catch return error.FlippedRecordRejected;
+    markState(.flipped_parsed);
+}
+
+test "fuzz driver: TLSRESUME_FUZZ (tlsresume-state)" {
+    try fuzz_driver.run(stateHarness, .{ .prefix = "TLSRESUME_FUZZ", .name = "tlsresume-state" });
+}
+
+test "fuzz harness: 300 state seeds in every test run, and they get everywhere" {
+    state_reach = @splat(0);
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        stateHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("tlsresume-state seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+    }
+    for (state_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(StateLabel, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 test "corpus: every record seed reaches parse, and the nonce octets recovered are pinned" {

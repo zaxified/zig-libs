@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-04 (37/37) · src ?
 
-**Hardening:** fuzz ? · ct none
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, TLSRESUME_FUZZ) · ct none
 
 **Performance:** not measured
 

@@ -836,6 +836,8 @@ test "decodeCloseBody: accepts every RFC 6455 §7.4.1 legal close code" {
 /// they are. A corpus entry is not the frame: `Smith.slice` reads a
 /// little-endian u32 length first (see `testkit/src/fuzz.zig`).
 const seed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
+const fuzz_driver = @import("testkit").fuzz.driver;
 
 /// Frames for the **server** role, in the format `Smith.slice` reads.
 ///
@@ -883,14 +885,31 @@ fn fuzzParseFrameServer(_: void, smith: *std.testing.Smith) !void {
     // above: **0 of 18 seeds reached `parseFrame` and 0 frames were parsed
     // before, 18 of 18 and 7 frames after.**
     const len: usize = smith.slice(&buf);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try frameHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
+fn frameHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [256]u8 = undefined;
+    const len: usize = src.slice(&buf);
 
     var off: usize = 0;
     var iterations: usize = 0;
     while (off < len and iterations < 64) : (iterations += 1) {
-        const result = parseFrame(buf[off..len], .server, 1 << 16) catch return;
+        const result = parseFrame(buf[off..len], .server, 1 << 16) catch {
+            fz.mark(.frame_refused);
+            return;
+        };
         switch (result) {
-            .need_more => return,
-            .frame => |f| off += f.consumed,
+            .need_more => {
+                fz.mark(.frame_need_more);
+                return;
+            },
+            .frame => |f| {
+                fz.mark(.frame_parsed);
+                off += f.consumed;
+            },
         }
     }
 }
@@ -971,7 +990,39 @@ fn fuzzDecodeCloseBody(_: void, smith: *std.testing.Smith) !void {
     // 19 non-empty (the empty body is a deliberate seed), 10 accepted and 9
     // codes read after.**
     const len: usize = smith.slice(&buf);
-    _ = decodeCloseBody(buf[0..len]) catch return;
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try closeHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
+fn closeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [128]u8 = undefined;
+    const len: usize = src.slice(&buf);
+    _ = decodeCloseBody(buf[0..len]) catch {
+        fz.mark(.close_refused);
+        return;
+    };
+    fz.mark(.close_decoded);
+}
+
+test "fuzz driver: WEBSOCKET_FUZZ (frame, close)" {
+    try fuzz_driver.run(frameHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "frame" });
+    try fuzz_driver.run(closeHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "close" });
+}
+
+test "fuzz harnesses: 500 seeds each in every test run, and the frame harnesses get everywhere" {
+    fz.resetReach();
+    inline for (.{ frameHarness, closeHarness }, .{ "frame", "close" }) |h, name| {
+        for (0..500) |sd| {
+            var prng = std.Random.DefaultPrng.init(sd);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print("websocket {s} seed {d}: {t}\n", .{ name, sd, err });
+                return err;
+            };
+        }
+    }
+    try fz.expectReached(&.{ .frame_refused, .frame_need_more, .frame_parsed, .close_refused, .close_decoded });
 }
 
 test "corpus: every close-body seed reaches the decoder, and the codes read are pinned" {

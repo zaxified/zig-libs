@@ -160,6 +160,7 @@ test {
     _ = writer;
     _ = header;
     _ = coerce;
+    _ = @import("fuzz_test.zig");
 }
 
 // ── external anchor: maxogden/csv-spectrum corpus ───────────────────────────

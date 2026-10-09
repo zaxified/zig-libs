@@ -5207,6 +5207,83 @@ const ModuliSeen = struct {
     }
 };
 
+// ── deterministic driver: harness bodies generic over the source ───────────
+
+const fuzz_driver = testkit.fuzz.driver;
+const FuzzLabel = enum { raw_rejected, raw_accepted, pristine_accepted, damaged_rejected, damaged_accepted };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn mark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+fn parsePubDer(in: []const u8) ?usize {
+    const pk = PublicKey.fromDer(in) catch return null;
+    return pk.n.bits();
+}
+fn parsePubPem(in: []const u8) ?usize {
+    const pk = PublicKey.fromPem(in) catch return null;
+    return pk.n.bits();
+}
+fn parseSecDer(in: []const u8) ?usize {
+    var sk: SecretKey = undefined;
+    SecretKey.fromDer(&sk, in) catch return null;
+    defer sk.deinit();
+    return sk.n.bits();
+}
+fn parsePkcs8(in: []const u8) ?usize {
+    var sk: SecretKey = undefined;
+    fromPkcs8(&sk, in) catch return null;
+    defer sk.deinit();
+    return sk.n.bits();
+}
+fn parseSecPem(in: []const u8) ?usize {
+    var sk: SecretKey = undefined;
+    SecretKey.fromPem(&sk, in) catch return null;
+    defer sk.deinit();
+    return sk.n.bits();
+}
+fn parseSsh(in: []const u8) ?usize {
+    var sk: SecretKey = undefined;
+    fromOpenSSH(&sk, in, "hunter2") catch return null;
+    defer sk.deinit();
+    return sk.n.bits();
+}
+
+fn scriptByte(script: []const u8, i: usize) u8 {
+    return if (i < script.len) script[i] else 0;
+}
+
+/// The "mutated" overlay: a genuine fixture (chosen by the script), damaged in
+/// 0..3 octets and maybe truncated, all read from the drawn octets `script`
+/// (missing octets read as zero). An undamaged fixture is a genuine input and
+/// MUST be accepted as the 2048-bit key; a damaged one may go either way but
+/// must not panic.
+fn overlay(comptime parse: fn ([]const u8) ?usize, fixtures: []const []const u8, script: []const u8) !void {
+    const fx = fixtures[scriptByte(script, 13) % fixtures.len];
+    var out: [2560]u8 = undefined;
+    @memcpy(out[0..fx.len], fx);
+    var len = fx.len;
+    const nd = scriptByte(script, 0) % 4;
+    for (0..nd) |i| {
+        const pos = ((@as(usize, scriptByte(script, 1 + 3 * i)) << 8) | scriptByte(script, 2 + 3 * i)) % len;
+        out[pos] ^= scriptByte(script, 3 + 3 * i);
+    }
+    if (scriptByte(script, 10) & 0x80 != 0)
+        len = ((@as(usize, scriptByte(script, 11)) << 8) | scriptByte(script, 12)) % (len + 1);
+    const pristine = std.mem.eql(u8, out[0..len], fx);
+    if (parse(out[0..len])) |bits| {
+        if (pristine) {
+            if (bits != 2048) return error.GenuineKeyMismatch;
+            mark(.pristine_accepted);
+        } else mark(.damaged_accepted);
+    } else {
+        if (pristine) return error.GenuineKeyRejected;
+        mark(.damaged_rejected);
+    }
+}
+
 // ── PublicKey.fromDer ────────────────────────────────────────────────────────
 
 // `pub_pkcs1` is `30 82 01 0a | 02 82 01 01 | 00 <256 octets of n> |
@@ -5234,12 +5311,20 @@ const pubder_seeds = [_][]const u8{
 };
 
 fn fuzzPublicKeyFromDer(_: void, smith: *std.testing.Smith) !void {
+    return pubDerHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+fn pubDerHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // 1024 against a 294-octet SPKI, the largest public encoding a 2048-bit
     // key makes; a 4096-bit SPKI is still only ~550.
     var buf: [1024]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    const pk = PublicKey.fromDer(buf[0..len]) catch return;
-    std.mem.doNotOptimizeAway(pk.n.bits());
+    if (parsePubDer(buf[0..len])) |bits| {
+        std.mem.doNotOptimizeAway(bits);
+        mark(.raw_accepted);
+    } else mark(.raw_rejected);
+    try overlay(parsePubDer, &.{ &kat2048_der.pub_spki, &kat2048_der.pub_pkcs1 }, buf[0..len]);
 }
 
 test "fuzz: PublicKey.fromDer never panics" {
@@ -5302,6 +5387,11 @@ const secder_seeds = [_][]const u8{
 };
 
 fn fuzzSecretKeyFromDer(_: void, smith: *std.testing.Smith) !void {
+    return secDerHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+fn secDerHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⛔ 2048 because the module's own 2048-bit PKCS#1 private key is 1191
     // octets. With the old 1024-octet buffer no real private key could ever
     // have passed through this harness: `Smith.slice` checks the declared
@@ -5309,10 +5399,11 @@ fn fuzzSecretKeyFromDer(_: void, smith: *std.testing.Smith) !void {
     // minimum, so an over-long seed reads back as the EMPTY one.
     var buf: [2048]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    var sk: SecretKey = undefined;
-    SecretKey.fromDer(&sk, buf[0..len]) catch return;
-    defer sk.deinit();
-    std.mem.doNotOptimizeAway(sk.n.bits());
+    if (parseSecDer(buf[0..len])) |bits| {
+        std.mem.doNotOptimizeAway(bits);
+        mark(.raw_accepted);
+    } else mark(.raw_rejected);
+    try overlay(parseSecDer, &.{&kat2048_der.priv_pkcs1}, buf[0..len]);
 }
 
 test "fuzz: SecretKey.fromDer never panics" {
@@ -5366,14 +5457,20 @@ const pkcs8_seeds = [_][]const u8{
 };
 
 fn fuzzFromPkcs8(_: void, smith: *std.testing.Smith) !void {
+    return pkcs8Harness(std.testing.Smith, smith, testing.allocator);
+}
+
+fn pkcs8Harness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⛔ 2048: the PKCS#8 form of the module's own 2048-bit key is 1217
     // octets, so 1024 could not carry it (see `fuzzSecretKeyFromDer`).
     var buf: [2048]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    var sk: SecretKey = undefined;
-    fromPkcs8(&sk, buf[0..len]) catch return;
-    defer sk.deinit();
-    std.mem.doNotOptimizeAway(sk.n.bits());
+    if (parsePkcs8(buf[0..len])) |bits| {
+        std.mem.doNotOptimizeAway(bits);
+        mark(.raw_accepted);
+    } else mark(.raw_rejected);
+    try overlay(parsePkcs8, &.{&kat2048_der.priv_pkcs8}, buf[0..len]);
 }
 
 test "fuzz: fromPkcs8 never panics" {
@@ -5424,12 +5521,20 @@ const pubpem_seeds = [_][]const u8{
 };
 
 fn fuzzPublicKeyFromPem(_: void, smith: *std.testing.Smith) !void {
+    return pubPemHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+fn pubPemHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // 1024 against a 452-octet PEM public key; the PRIVATE forms are ~1700 and
     // belong to `fuzzSecretKeyFromPem`, which sizes its buffer for them.
     var buf: [1024]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    const pk = PublicKey.fromPem(buf[0..len]) catch return;
-    std.mem.doNotOptimizeAway(pk.n.bits());
+    if (parsePubPem(buf[0..len])) |bits| {
+        std.mem.doNotOptimizeAway(bits);
+        mark(.raw_accepted);
+    } else mark(.raw_rejected);
+    try overlay(parsePubPem, &.{ kat2048_pem.pub_spki, kat2048_pem.pub_pkcs1 }, buf[0..len]);
 }
 
 test "fuzz: PublicKey.fromPem never panics" {
@@ -5478,15 +5583,21 @@ const secpem_seeds = [_][]const u8{
 };
 
 fn fuzzSecretKeyFromPem(_: void, smith: *std.testing.Smith) !void {
+    return secPemHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+fn secPemHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⛔ 2048: the module's own PKCS#8 PEM private key is 1705 octets and the
     // PKCS#1 one 1676. With the old 1024-octet buffer neither could pass — a
     // seed longer than the buffer reads back EMPTY, silently.
     var buf: [2048]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    var sk: SecretKey = undefined;
-    SecretKey.fromPem(&sk, buf[0..len]) catch return;
-    defer sk.deinit();
-    std.mem.doNotOptimizeAway(sk.n.bits());
+    if (parseSecPem(buf[0..len])) |bits| {
+        std.mem.doNotOptimizeAway(bits);
+        mark(.raw_accepted);
+    } else mark(.raw_rejected);
+    try overlay(parseSecPem, &.{ kat2048_pem.priv_pkcs1, kat2048_pem.priv_pkcs8 }, buf[0..len]);
 }
 
 test "fuzz: SecretKey.fromPem never panics" {
@@ -5577,6 +5688,11 @@ const OpensshCorpus = struct {
 };
 
 fn fuzzFromOpenSSH(_: void, smith: *std.testing.Smith) !void {
+    return sshHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+fn sshHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⛔ 2560: the module's own OpenSSH fixtures are 1824–1877 octets, so the
     // old 1024-octet buffer could not carry one — an over-long seed reads back
     // as the EMPTY one and says nothing about it.
@@ -5585,9 +5701,12 @@ fn fuzzFromOpenSSH(_: void, smith: *std.testing.Smith) !void {
     var pass: [64]u8 = undefined;
     const plen: usize = smith.slice(&pass);
     var sk: SecretKey = undefined;
-    fromOpenSSH(&sk, buf[0..len], pass[0..plen]) catch return;
-    defer sk.deinit();
-    std.mem.doNotOptimizeAway(sk.n.bits());
+    if (fromOpenSSH(&sk, buf[0..len], pass[0..plen])) {
+        defer sk.deinit();
+        std.mem.doNotOptimizeAway(sk.n.bits());
+        mark(.raw_accepted);
+    } else |_| mark(.raw_rejected);
+    try overlay(parseSsh, &.{ openssh_fixture_plain, openssh_fixture_ctr, openssh_fixture_cbc }, buf[0..len]);
 }
 
 test "fuzz: fromOpenSSH never panics" {
@@ -5633,4 +5752,60 @@ test "corpus: fromOpenSSH seeds reach the parser, counts pinned" {
     try testing.expectEqual(@as(usize, 3), with_pass);
     try testing.expectEqual(@as(usize, 5), accepted);
     try testing.expectEqual(@as(usize, 1), moduli.n);
+}
+
+// ── deterministic driver tests ───────────────────────────────────────────────
+
+test "fuzz driver: RSA_FUZZ (rsa-pubder)" {
+    try fuzz_driver.run(pubDerHarness, .{ .prefix = "RSA_FUZZ", .name = "rsa-pubder" });
+}
+test "fuzz driver: RSA_FUZZ (rsa-secder)" {
+    try fuzz_driver.run(secDerHarness, .{ .prefix = "RSA_FUZZ", .name = "rsa-secder" });
+}
+test "fuzz driver: RSA_FUZZ (rsa-pkcs8)" {
+    try fuzz_driver.run(pkcs8Harness, .{ .prefix = "RSA_FUZZ", .name = "rsa-pkcs8" });
+}
+test "fuzz driver: RSA_FUZZ (rsa-pubpem)" {
+    try fuzz_driver.run(pubPemHarness, .{ .prefix = "RSA_FUZZ", .name = "rsa-pubpem" });
+}
+test "fuzz driver: RSA_FUZZ (rsa-secpem)" {
+    try fuzz_driver.run(secPemHarness, .{ .prefix = "RSA_FUZZ", .name = "rsa-secpem" });
+}
+test "fuzz driver: RSA_FUZZ (rsa-openssh)" {
+    try fuzz_driver.run(sshHarness, .{ .prefix = "RSA_FUZZ", .name = "rsa-openssh", .scale = 10 });
+}
+
+fn reachCheck(comptime harness: anytype, name: []const u8, seeds: usize, optional: ?FuzzLabel) !void {
+    fuzz_reach = @splat(0);
+    for (0..seeds) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        harness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("{s} seed {d}: {t}\n", .{ name, seed, err });
+            return err;
+        };
+    }
+    for (fuzz_reach, 0..) |n, i| {
+        const l: FuzzLabel = @enumFromInt(i);
+        // Random octets are never a valid key encoding: `raw_accepted` is
+        // reached only through the corpus, not by the driver.
+        if (l == .raw_accepted) continue;
+        if (optional) |o| if (l == o) continue;
+        if (n == 0) {
+            std.debug.print("reach: {s}: label {t} never hit in {d} seeds\n", .{ name, l, seeds });
+            return error.HarnessDoesNotReach;
+        }
+    }
+}
+
+test "fuzz harness: seeds in every test run, and they get everywhere" {
+    try reachCheck(pubDerHarness, "rsa-pubder", 300, null);
+    try reachCheck(pubPemHarness, "rsa-pubpem", 300, null);
+    try reachCheck(secDerHarness, "rsa-secder", 100, null);
+    try reachCheck(pkcs8Harness, "rsa-pkcs8", 100, null);
+    // A damaged base64/armoured body is accepted only by luck (a XOR that lands
+    // in padding or whitespace); not demanded for the private PEM and OpenSSH
+    // forms, whose seeds are too expensive to run by the thousand.
+    try reachCheck(secPemHarness, "rsa-secpem", 100, .damaged_accepted);
+    try reachCheck(sshHarness, "rsa-openssh", 30, .damaged_accepted);
 }

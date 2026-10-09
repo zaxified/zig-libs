@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `SESSIONS_FUZZ` over the existing harnesses (session-record decode, cookie header parse, each also over damaged corpus entries).
+
 - **2026-10-09** — Dead-stack burn: `Csrf.token` and `Csrf.verify` (HMAC-SHA256 under the CSRF key) run their bodies under a 4 KiB per-message `burn.run` (new `src/burn.zig`); new `stackprobe_test.zig` on `testkit.stackprobe`. No signature change.
 - **2026-10-04** — Tests: mutation schemata run (48 mutants, 45 killed, 2 equivalent, 1
   alive by design — see SPEC § Verification). Ten new tests: timeouts at their exact

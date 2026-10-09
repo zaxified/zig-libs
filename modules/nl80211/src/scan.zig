@@ -486,12 +486,29 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const ScanMark = fz.Marker(enum { rejected, bss, nest });
+
 test "fuzz: BSS parsing never crashes or leaks" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzParse, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzParseSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: NL80211_FUZZ (BSS parse)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "NL80211_FUZZ", .name = "nl80211-scan" });
+}
+
+test "fuzz harness: BSS parse, 300 seeds, reaches every outcome" {
+    try ScanMark.reach(fuzzParse, "nl80211-scan", 300);
+}
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzParse, smith, script[0..n]);
+}
+
+fn fuzzParse(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var raw: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
@@ -505,17 +522,25 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     // non-empty, 6 of 6 nests "parsed" and 0 BSSes found through the ATTR.BSS
     // wrapper before; 6 of 6 non-empty, 3 nests parsed and 1 BSS found
     // after.**
-    const len: usize = smith.slice(&raw);
-    if (parseBss(testing.allocator, raw[0..len])) |maybe| {
+    var cstore: Corpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) (cstore.build() catch &.{}) else &.{};
+    const len: usize = fz.drawInput(S, smith, &raw, entries);
+    var any = false;
+    if (parseBss(gpa, raw[0..len])) |maybe| {
         if (maybe) |bss| {
             var b = bss;
-            b.deinit(testing.allocator);
+            any = true;
+            ScanMark.mark(.bss);
+            b.deinit(gpa);
         }
     } else |_| {}
-    if (parseBssNest(testing.allocator, raw[0..len])) |bss| {
+    if (parseBssNest(gpa, raw[0..len])) |bss| {
         var b = bss;
-        b.deinit(testing.allocator);
+        any = true;
+        ScanMark.mark(.nest);
+        b.deinit(gpa);
     } else |_| {}
+    if (!any) ScanMark.mark(.rejected);
 }
 
 test "corpus: every scan seed reaches both parsers, and the counts are pinned" {

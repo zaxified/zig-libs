@@ -5468,6 +5468,8 @@ const fuzz_schema = [_]Rule{
 };
 
 const fuzzseed = @import("testkit").fuzz;
+const fz = @import("fuzz_test.zig");
+const fuzz_driver = fuzzseed.driver;
 
 // ⛔ Neither of these two targets had a corpus, so outside `--fuzz` the runner
 // gave each ONE input: `in = ""`. Every draw then returned its minimum.
@@ -5604,11 +5606,24 @@ fn fuzzValidateJson(_: void, smith: *std.testing.Smith) !void {
     // `smith.value(bool)` chain did with no corpus at all.
     var raw: [1 + json_buf_len]u8 = undefined;
     const n: usize = smith.slice(&raw);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = raw[0..n] } };
+    try jsonHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
+fn jsonHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [1 + json_buf_len]u8 = undefined;
+    const n: usize = src.slice(&raw);
     var buf: [json_buf_len]u8 = undefined;
     const body = buildJsonBody(raw[0..n], &buf);
 
-    var r = validateJson(testing.allocator, body, &fuzz_schema) catch return;
+    // Malformed JSON is a report (`json_invalid`), not an error: only OOM is.
+    var r = validateJson(gpa, body, &fuzz_schema) catch return;
     defer r.deinit();
+    // A body satisfying every rule (required `name` and `meta.id`, all else
+    // well-typed) is not reachable from random scripts; only the corpus has it.
+    if (!r.ok() and r.errors.len == 1 and std.mem.eql(u8, r.errors[0].code, "json_invalid")) {
+        fz.mark(.json_invalid);
+    } else if (!r.ok()) fz.mark(.json_violations);
 }
 
 /// The fuzz schema as a typed struct, carrying the schema itself as
@@ -5631,10 +5646,19 @@ test "fuzz: the streaming path agrees with the tree path" {
 fn fuzzStreamingAgrees(_: void, smith: *std.testing.Smith) !void {
     var raw: [1 + json_buf_len]u8 = undefined;
     const n: usize = smith.slice(&raw);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = raw[0..n] } };
+    try streamingHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
+fn streamingHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa; // the agreement helpers use `testing.allocator` themselves
+    var raw: [1 + json_buf_len]u8 = undefined;
+    const n: usize = src.slice(&raw);
     var buf: [json_buf_len]u8 = undefined;
     const body = buildJsonBody(raw[0..n], &buf);
     try expectSchemaAgrees(body, &fuzz_schema);
     try expectTypedAgrees(FuzzTyped, body);
+    fz.mark(.streaming_agreed);
 }
 
 test "corpus: every body reaches validateJson, and the violations reported are pinned" {
@@ -5702,9 +5726,38 @@ fn fuzzValidateFormat(_: void, smith: *std.testing.Smith) !void {
     // the twelve formats were never called.
     var raw: [2 + format_buf_len]u8 = undefined;
     const n: usize = smith.slice(&raw);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = raw[0..n] } };
+    try formatHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
+fn formatHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var raw: [2 + format_buf_len]u8 = undefined;
+    const n: usize = src.slice(&raw);
     var buf: [format_buf_len]u8 = undefined;
     const case = buildFormatCase(raw[0..n], &buf);
-    _ = validateFormat(case[0], case[1]);
+    fz.mark(if (validateFormat(case[0], case[1])) .format_accepted else .format_rejected);
+}
+
+test "fuzz driver: VALIDATE_FUZZ (json, streaming, format)" {
+    try fuzz_driver.run(jsonHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "json" });
+    try fuzz_driver.run(streamingHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "streaming" });
+    try fuzz_driver.run(formatHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "format" });
+}
+
+test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere" {
+    fz.resetReach();
+    inline for (.{ jsonHarness, streamingHarness, formatHarness }, .{ "json", "streaming", "format" }) |h, name| {
+        for (0..500) |seed| {
+            var prng = std.Random.DefaultPrng.init(seed);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print("validate {s} seed {d}: {t}\n", .{ name, seed, err });
+                return err;
+            };
+        }
+    }
+    try fz.expectAllReached();
 }
 
 test "corpus: every Format is exercised, and the strings each accepts are pinned" {

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `PATHMTU_FUZZ` over the existing harness (`classify` on arbitrary bytes and on damaged real captures).
+
 - **2026-10-05** — **Anchoring: real kernels judge `probe` and `query`, and `searchWith` replays their answers**
   (`tools/kernel_oracle.py`, `tools/interop.zig`, `src/kernel_oracle_test.zig`): 22 scenarios, v4 and v6, each a
   fresh client -> router -> server topology of network namespaces (`unshare -rmn`): a lowered router->server link

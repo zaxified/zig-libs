@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `DISKFREE_FUZZ` over the existing harnesses.
+
 - **2026-10-04** — EXTERNAL ORACLE (GNU coreutils `df`), and a unit fix it prompted.
   - `tools/df-diff.sh` + `tools/df_dump.zig`: a live differential against `df -B1 --output=…`,
     mount by mount (2026-10-04, df 9.7: 61 SAME, 2 DRIFT on live filesystems, 0 DIFF, 0 SKIP over

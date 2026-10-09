@@ -1826,23 +1826,21 @@ const Corpus = struct {
     }
 };
 
+test {
+    _ = @import("fuzz_test.zig");
+}
+
 test "fuzz: deserialize never panics on arbitrary bytes" {
     var corpus: Corpus = .{};
     try testing.fuzz({}, fuzzDeserialize, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzDeserialize(_: void, smith: *std.testing.Smith) !void {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    var buf: [256]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    const d = deserialize(arena.allocator(), buf[0..len]) catch return;
-    // Walk what came back: an image that decodes must also be traversable, and
-    // the old harness discarded the result without touching a single cell.
-    for (d.rows) |row| for (row) |v| {
-        _ = v.asFloat();
-    };
+    const ft = @import("fuzz_test.zig");
+    var script: [300]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    var src: ft.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    try ft.deserializeHarness(ft.ScriptSource, &src, testing.allocator);
 }
 
 test "corpus: every seed reaches deserialize, and the cells decoded are pinned" {

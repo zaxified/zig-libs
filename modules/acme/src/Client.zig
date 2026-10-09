@@ -1233,13 +1233,109 @@ test "fuzz: parseOrder never panics on arbitrary bytes" {
 }
 
 fn fuzzParseOrder(_: void, smith: *std.testing.Smith) !void {
+    return orderHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+const fuzz_driver = @import("testkit").fuzz.driver;
+const JsonLabel = enum { raw_rejected, raw_accepted, genuine_parsed, truncated_rejected, flipped };
+var json_reach: [@typeInfo(JsonLabel).@"enum".fields.len]usize = @splat(0);
+
+fn markJson(comptime l: JsonLabel) void {
+    json_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+const alnum = "abcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn word(rnd: std.Random, out: []u8) []const u8 {
+    const n = 1 + rnd.uintAtMost(usize, out.len - 1);
+    for (out[0..n]) |*c| c.* = alnum[rnd.uintLessThan(usize, alnum.len)];
+    return out[0..n];
+}
+
+/// Generic over its source (`Smith` under `--fuzz`, `fuzz_driver.Rng` under the
+/// driver). The drawn octets are parsed raw (any outcome, no panic); then they
+/// seed a PRNG that writes a genuine order response, which must parse to the
+/// very fields it was written from. Every truncation must be refused.
+fn orderHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [512]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    // The CA's order-response JSON decoder: arbitrary bytes must only ever
-    // yield a typed error, never a panic/OOB.
-    _ = parseOrder(arena.allocator(), buf[0..len]) catch return;
+    if (parseOrder(arena.allocator(), buf[0..len])) |_| markJson(.raw_accepted) else |_| markJson(.raw_rejected);
+
+    var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, buf[0..len]));
+    const rnd = prng.random();
+    const statuses = [_][]const u8{ "pending", "processing", "ready", "valid", "invalid", "deactivated", "expired", "revoked", "brand-new" };
+    const st = statuses[rnd.uintLessThan(usize, statuses.len)];
+    var json_buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&json_buf);
+    var fin_store: [24]u8 = undefined;
+    const fin = word(rnd, &fin_store);
+    try w.print("{{\"status\":\"{s}\",\"authorizations\":[", .{st});
+    var urls: [4][24]u8 = undefined;
+    var url_lens: [4]usize = undefined;
+    const n_auth = rnd.uintAtMost(usize, 4);
+    for (0..n_auth) |i| {
+        const u = word(rnd, &urls[i]);
+        url_lens[i] = u.len;
+        try w.print("{s}\"https://ca/authz/{s}\"", .{ if (i == 0) "" else ",", u });
+    }
+    var cert_store: [24]u8 = undefined;
+    const cert: ?[]const u8 = if (rnd.boolean()) word(rnd, &cert_store) else null;
+    try w.print("],\"finalize\":\"{s}\"", .{fin});
+    if (cert) |c| try w.print(",\"certificate\":\"{s}\"", .{c});
+    try w.writeAll("}");
+    const json = w.buffered();
+
+    const order = parseOrder(arena.allocator(), json) catch return error.GenuineResponseRejected;
+    if (order.status != statusFromString(st) or !std.mem.eql(u8, order.finalize, fin) or
+        order.authorizations.len != n_auth or (order.certificate == null) != (cert == null))
+        return error.RoundTripMismatch;
+    if (cert) |c| if (!std.mem.eql(u8, order.certificate.?, c)) return error.RoundTripMismatch;
+    for (order.authorizations, 0..) |u, i| {
+        if (!std.mem.endsWith(u8, u, urls[i][0..url_lens[i]])) return error.RoundTripMismatch;
+    }
+    markJson(.genuine_parsed);
+
+    const cut = rnd.uintLessThan(usize, json.len);
+    if (parseOrder(arena.allocator(), json[0..cut])) |_| return error.TruncatedResponseAccepted else |_| {}
+    markJson(.truncated_rejected);
+
+    json_buf[rnd.uintLessThan(usize, json.len)] ^= @as(u8, 1) << rnd.int(u3);
+    _ = parseOrder(arena.allocator(), json) catch {};
+    markJson(.flipped);
+}
+
+test "fuzz driver: ACME_FUZZ (acme-order)" {
+    try fuzz_driver.run(orderHarness, .{ .prefix = "ACME_FUZZ", .name = "acme-order" });
+}
+
+fn jsonReachCheck(comptime harness: anytype, name: []const u8, seeds: usize) !void {
+    json_reach = @splat(0);
+    for (0..seeds) |sd| {
+        var prng = std.Random.DefaultPrng.init(sd);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        harness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("{s} seed {d}: {t}\n", .{ name, sd, err });
+            return err;
+        };
+    }
+    for (json_reach, 0..) |n, i| {
+        const l: JsonLabel = @enumFromInt(i);
+        // Random octets are not JSON of the right shape: `raw_accepted` is
+        // reached through the corpus only.
+        if (l == .raw_accepted) continue;
+        if (n == 0) {
+            std.debug.print("reach: {s}: label {t} never hit in {d} seeds\n", .{ name, l, seeds });
+            return error.HarnessDoesNotReach;
+        }
+    }
+}
+
+test "fuzz harness: 300 seeds per CA-response harness in every test run, and they get everywhere" {
+    try jsonReachCheck(orderHarness, "acme-order", 300);
+    try jsonReachCheck(authzHarness, "acme-authz", 300);
 }
 
 test "corpus: every order seed reaches parseOrder, and what it extracted is pinned" {
@@ -1301,13 +1397,61 @@ test "fuzz: parseAuthz never panics on arbitrary bytes" {
 }
 
 fn fuzzParseAuthz(_: void, smith: *std.testing.Smith) !void {
+    return authzHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz driver: ACME_FUZZ (acme-authz)" {
+    try fuzz_driver.run(authzHarness, .{ .prefix = "ACME_FUZZ", .name = "acme-authz" });
+}
+
+/// Same contract as `orderHarness`, for the authorization response: the genuine
+/// one must yield the FIRST challenge of each recognised type.
+fn authzHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [512]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    // The CA's authorization-response JSON decoder: same contract as
-    // parseOrder above.
-    _ = parseAuthz(arena.allocator(), buf[0..len]) catch return;
+    if (parseAuthz(arena.allocator(), buf[0..len])) |_| markJson(.raw_accepted) else |_| markJson(.raw_rejected);
+
+    var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, buf[0..len]));
+    const rnd = prng.random();
+    const types = [_][]const u8{ "http-01", "dns-01", "tls-alpn-01", "other-01" };
+    var json_buf: [1536]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&json_buf);
+    var dom_store: [24]u8 = undefined;
+    const dom = word(rnd, &dom_store);
+    const wildcard = rnd.boolean();
+    try w.print("{{\"status\":\"pending\",\"identifier\":{{\"type\":\"dns\",\"value\":\"{s}\"}},\"wildcard\":{},\"challenges\":[", .{ dom, wildcard });
+    // First (url, token) seen per type, to compare with what the parser picked.
+    var first_tok: [4]?[8]u8 = @splat(null);
+    const n_ch = rnd.uintAtMost(usize, 6);
+    for (0..n_ch) |i| {
+        const ti = rnd.uintLessThan(usize, types.len);
+        var tok: [8]u8 = undefined;
+        for (&tok) |*c| c.* = alnum[rnd.uintLessThan(usize, alnum.len)];
+        if (first_tok[ti] == null) first_tok[ti] = tok;
+        try w.print("{s}{{\"type\":\"{s}\",\"url\":\"https://ca/chall/{d}\",\"token\":\"{s}\"}}", .{ if (i == 0) "" else ",", types[ti], i, tok });
+    }
+    try w.writeAll("]}");
+    const json = w.buffered();
+
+    const az = parseAuthz(arena.allocator(), json) catch return error.GenuineResponseRejected;
+    if (!std.mem.eql(u8, az.identifier, dom) or az.wildcard != wildcard) return error.RoundTripMismatch;
+    const got = [_]?ChallengeInfo{ az.http01, az.dns01, az.tls_alpn01 };
+    const want_idx = [_]usize{ 0, 1, 2 };
+    for (got, want_idx) |g, ti| {
+        if ((g == null) != (first_tok[ti] == null)) return error.RoundTripMismatch;
+        if (g) |c| if (!std.mem.eql(u8, c.token, &first_tok[ti].?)) return error.RoundTripMismatch;
+    }
+    markJson(.genuine_parsed);
+
+    const cut = rnd.uintLessThan(usize, json.len);
+    if (parseAuthz(arena.allocator(), json[0..cut])) |_| return error.TruncatedResponseAccepted else |_| {}
+    markJson(.truncated_rejected);
+
+    json_buf[rnd.uintLessThan(usize, json.len)] ^= @as(u8, 1) << rnd.int(u3);
+    _ = parseAuthz(arena.allocator(), json) catch {};
+    markJson(.flipped);
 }
 
 test "corpus: every authz seed reaches parseAuthz, and the challenges matched are pinned" {

@@ -1880,18 +1880,38 @@ const decode_block_seeds = [_][]const u8{
     seedHex("8220"), // a size update after the first field is malformed
 };
 
+const fz = @import("fuzz_test.zig");
+const BlockMark = fz.Marker(enum { rejected, decoded, with_fields });
+const HuffMark = fz.Marker(enum { refused, decoded });
+
 test "fuzz: Decoder.decodeBlock never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeBlock, .{ .corpus = &decode_block_seeds });
+    try testing.fuzz({}, fuzzDecodeBlockSmith, .{ .corpus = &decode_block_seeds });
 }
 
-fn fuzzDecodeBlock(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+test "fuzz driver: HTTP_FUZZ (hpack-block)" {
+    try fz.fuzz_driver.run(fuzzDecodeBlock, .{ .prefix = "HTTP_FUZZ", .name = "http-hpack-block" });
+}
 
-    var dec: Decoder = .init(testing.allocator, .{});
+test "fuzz harness: hpack block, 300 seeds, reaches every outcome" {
+    try BlockMark.reach(fuzzDecodeBlock, "http-hpack-block", 300);
+}
+
+fn fuzzDecodeBlockSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzDecodeBlock, smith, script[0..n]);
+}
+
+fn fuzzDecodeBlock(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var buf: [512]u8 = undefined;
+    const len: usize = fz.drawInput(S, src, &buf, &decode_block_seeds);
+
+    var dec: Decoder = .init(gpa, .{});
     defer dec.deinit();
-    var hl = dec.decodeBlock(buf[0..len]) catch return;
-    hl.deinit(testing.allocator);
+    var hl = dec.decodeBlock(buf[0..len]) catch return BlockMark.mark(.rejected);
+    BlockMark.mark(.decoded);
+    if (hl.fields.len != 0) BlockMark.mark(.with_fields);
+    hl.deinit(gpa);
 }
 
 test "corpus: every header-block seed reaches the decoder, and the fields decoded are pinned" {
@@ -2005,13 +2025,33 @@ const huffman_seeds = [_][]const u8{
 };
 
 test "fuzz: huffman table decoder always agrees with the bit-walk" {
-    try testing.fuzz({}, fuzzHuffmanDifferential, .{ .corpus = &huffman_seeds });
+    try testing.fuzz({}, fuzzHuffmanDifferentialSmith, .{ .corpus = &huffman_seeds });
 }
 
-fn fuzzHuffmanDifferential(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: HTTP_FUZZ (hpack-huffman)" {
+    try fz.fuzz_driver.run(fuzzHuffmanDifferential, .{ .prefix = "HTTP_FUZZ", .name = "http-hpack-huffman" });
+}
+
+test "fuzz harness: huffman differential, 300 seeds, reaches every outcome" {
+    try HuffMark.reach(fuzzHuffmanDifferential, "http-hpack-huffman", 300);
+}
+
+fn fuzzHuffmanDifferentialSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzHuffmanDifferential, smith, script[0..n]);
+}
+
+fn fuzzHuffmanDifferential(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [256]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &huffman_seeds);
     try expectHuffmanDecodersAgree(buf[0..len]);
+    // The agreed outcome, for the reach report.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    if (huffmanDecodeAppend(gpa, &out, buf[0..len], 4096)) |_| {
+        if (out.items.len != 0) HuffMark.mark(.decoded);
+    } else |_| HuffMark.mark(.refused);
 }
 
 test "corpus: every huffman seed reaches both decoders, and the octets decoded are pinned" {

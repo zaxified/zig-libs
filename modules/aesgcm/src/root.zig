@@ -1386,9 +1386,46 @@ test "fuzz: every backend agrees with std on arbitrary key, nonce, AD and messag
     try testing.fuzz({}, fuzzAgree, .{});
 }
 
+const fuzz_driver = @import("testkit").fuzz.driver;
+const FuzzLabel = enum { genuine_accepted, forged_rejected, nonempty_message };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn mark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+test "fuzz driver: AESGCM_FUZZ (aesgcm-agree)" {
+    try fuzz_driver.run(agreeHarness, .{ .prefix = "AESGCM_FUZZ", .name = "aesgcm-agree" });
+}
+
+test "fuzz harness: 300 seeds in every test run, and they get everywhere" {
+    fuzz_reach = @splat(0);
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        agreeHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("aesgcm-agree seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+    }
+    for (fuzz_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
+}
+
 var fuzz_buf: [3 * 1100]u8 = undefined;
 
 fn fuzzAgree(_: void, smith: *std.testing.Smith) !void {
+    return agreeHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+/// Generic over its source (`Smith` under `--fuzz`, `fuzz_driver.Rng` under the driver).
+/// Besides the differential against std, the genuine tag must be ACCEPTED (and
+/// decrypt to the message) and an arbitrary one refused.
+fn agreeHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var key: [32]u8 = undefined;
     var iv: [12]u8 = undefined;
     var ad: [80]u8 = undefined;
@@ -1399,6 +1436,7 @@ fn fuzzAgree(_: void, smith: *std.testing.Smith) !void {
     const m = fuzz_buf[0..m_len];
     const c = fuzz_buf[1100..][0..m_len];
     const d = fuzz_buf[2200..][0..m_len];
+    if (m_len > 0) mark(.nonempty_message);
     inline for (.{ Aes128Gcm, Aes256Gcm }) |Gcm| {
         const Std = if (Gcm.key_length == 16) crypto.aead.aes_gcm.Aes128Gcm else crypto.aead.aes_gcm.Aes256Gcm;
         const k = key[0..Gcm.key_length].*;
@@ -1410,11 +1448,16 @@ fn fuzzAgree(_: void, smith: *std.testing.Smith) !void {
             ctx.encrypt(c, &t, m, ad[0..ad_len], iv);
             try testing.expectEqualSlices(u8, d, c);
             try testing.expectEqualSlices(u8, &want_t, &t);
+            // Pristine: the genuine tag opens, to the message.
+            ctx.decrypt(c, d, want_t, ad[0..ad_len], iv) catch return error.GenuineMessageRejected;
+            try testing.expectEqualSlices(u8, m, c);
+            mark(.genuine_accepted);
             // Arbitrary bytes as a tag: accepted exactly when std accepts.
             var forged: [16]u8 = undefined;
             smith.bytes(&forged);
             const ok = if (ctx.decrypt(c, d, forged, ad[0..ad_len], iv)) true else |_| false;
             try testing.expectEqual(mem.eql(u8, &forged, &want_t), ok);
+            if (!ok) mark(.forged_rejected);
         }
     }
 }

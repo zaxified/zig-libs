@@ -503,11 +503,94 @@ test "corpus: every ticket seed reaches decode, and the extensions parsed are pi
 }
 
 fn fuzzTicketDecode(_: void, smith: *std.testing.Smith) !void {
-    // ⚠ One byte-first draw, and no branch: see the block comment above.
+    return ticketHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+const fuzz_driver = @import("testkit").fuzz.driver;
+const TicketLabel = enum { raw_rejected, raw_accepted, roundtrip, truncated_rejected, trailing_rejected, flipped };
+var ticket_reach: [@typeInfo(TicketLabel).@"enum".fields.len]usize = @splat(0);
+
+fn markTicket(comptime l: TicketLabel) void {
+    ticket_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// Generic over its source (`Smith` under `--fuzz`, `fuzz_driver.Rng` under the
+/// driver). The drawn octets are decoded raw (any outcome, no panic); then they
+/// seed a PRNG that builds a genuine ticket: `encode` then `decode` must give
+/// it back, every truncation and one trailing octet must be refused, and a
+/// flipped octet must not panic.
+fn ticketHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var ext_buf: [8]Extension = undefined;
     var buf: [TicketCorpus.cap]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    _ = NewSessionTicket.decode(buf[0..len], &ext_buf) catch {};
+    if (NewSessionTicket.decode(buf[0..len], &ext_buf)) |_| markTicket(.raw_accepted) else |_| markTicket(.raw_rejected);
+
+    var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, buf[0..len]));
+    const rnd = prng.random();
+    var pool: [64]u8 = undefined;
+    rnd.bytes(&pool);
+    const nonce_len = rnd.uintAtMost(usize, 20);
+    const ticket_len = 1 + rnd.uintAtMost(usize, 39);
+    var exts: [8]Extension = undefined;
+    const n_ext = rnd.uintAtMost(usize, exts.len);
+    for (exts[0..n_ext]) |*e| e.* = .{ .ext_type = rnd.int(u16), .data = pool[0..rnd.uintAtMost(usize, 6)] };
+    const nst = NewSessionTicket{
+        .ticket_lifetime = rnd.int(u32),
+        .ticket_age_add = rnd.int(u32),
+        .ticket_nonce = pool[0..nonce_len],
+        .ticket = pool[nonce_len..][0..ticket_len],
+        .extensions = exts[0..n_ext],
+    };
+    var wire: [TicketCorpus.cap + 1]u8 = undefined;
+    const enc = nst.encode(wire[0..TicketCorpus.cap]) catch return error.EncodeFailed;
+    const back = NewSessionTicket.decode(enc, &ext_buf) catch return error.GenuineTicketRejected;
+    if (back.ticket_lifetime != nst.ticket_lifetime or back.ticket_age_add != nst.ticket_age_add or
+        !std.mem.eql(u8, back.ticket_nonce, nst.ticket_nonce) or !std.mem.eql(u8, back.ticket, nst.ticket) or
+        back.extensions.len != n_ext) return error.RoundTripMismatch;
+    for (back.extensions, exts[0..n_ext]) |g, w| {
+        if (g.ext_type != w.ext_type or !std.mem.eql(u8, g.data, w.data)) return error.RoundTripMismatch;
+    }
+    markTicket(.roundtrip);
+
+    const cut = rnd.uintLessThan(usize, enc.len);
+    if (NewSessionTicket.decode(enc[0..cut], &ext_buf)) |_| return error.TruncatedTicketAccepted else |_| {}
+    markTicket(.truncated_rejected);
+
+    wire[enc.len] = rnd.int(u8);
+    if (NewSessionTicket.decode(wire[0 .. enc.len + 1], &ext_buf)) |_| return error.TrailingOctetAccepted else |_| {}
+    markTicket(.trailing_rejected);
+
+    wire[rnd.uintLessThan(usize, enc.len)] ^= @as(u8, 1) << rnd.int(u3);
+    _ = NewSessionTicket.decode(wire[0..enc.len], &ext_buf) catch {};
+    markTicket(.flipped);
+}
+
+test "fuzz driver: TLSRESUME_FUZZ (tlsresume-ticket)" {
+    try fuzz_driver.run(ticketHarness, .{ .prefix = "TLSRESUME_FUZZ", .name = "tlsresume-ticket" });
+}
+
+test "fuzz harness: 300 ticket seeds in every test run, and they get everywhere" {
+    ticket_reach = @splat(0);
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        ticketHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("tlsresume-ticket seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+    }
+    for (ticket_reach, 0..) |n, i| {
+        const l: TicketLabel = @enumFromInt(i);
+        // Random octets are not a well-formed ticket (the lengths must add up
+        // exactly): `raw_accepted` is reached through the corpus only.
+        if (l == .raw_accepted) continue;
+        if (n == 0) {
+            std.debug.print("reach: label {t} never hit in 300 seeds\n", .{l});
+            return error.HarnessDoesNotReach;
+        }
+    }
 }
 
 test "maxEarlyDataSize: null when no early_data extension is present" {

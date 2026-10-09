@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `NL80211_FUZZ` over the existing harnesses (regulatory, station,
+  scan/BSS, interface, wiphy, information elements, event parsing).
+
 - **2026-10-04** — mvp → core (survey 2026-09-30 backlog, items 1, 2 and 4). ADDED `config.zig`:
   `Nl80211.survey` (`GET_SURVEY` → `Survey`: frequency, noise dBm, in-use, active/busy/ext-busy/
   rx/tx/scan/bss-rx ms), `setTxPower` (auto/limit/fixed mBm), `setChannel` (full chandef —

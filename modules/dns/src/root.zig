@@ -137,6 +137,7 @@ test {
     // External anchor for config.zig: glibc's behaviour on the same files
     // (tools/config_oracle.py), replayed without glibc or a namespace.
     _ = @import("config_oracle_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "reverseName: IPv4" {

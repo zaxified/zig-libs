@@ -443,6 +443,7 @@ pub const Builder = struct {
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
+const fz = @import("fuzz_test.zig");
 const testing = std.testing;
 
 // Golden CDPv2 frame, transcribed TLV-by-TLV from the documented format;
@@ -717,7 +718,7 @@ const cdp_seeds = [_][]const u8{
 };
 
 test "fuzz: CDP Frame.parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzCdpParse, .{ .corpus = &cdp_seeds });
+    try testing.fuzz({}, fz.fuzzScript(fuzzCdpParse, 256), .{ .corpus = &cdp_seeds });
 }
 
 /// What one frame yielded. Shared by the fuzz target and its corpus guard so
@@ -756,7 +757,8 @@ fn walkCdp(bytes: []const u8) CdpTally {
     return t;
 }
 
-fn fuzzCdpParse(_: void, smith: *std.testing.Smith) !void {
+fn fuzzCdpParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -770,8 +772,14 @@ fn fuzzCdpParse(_: void, smith: *std.testing.Smith) !void {
     // addresses decoded, after.** The empty slice is refused at `bytes.len < header_len`,
     // so neither the TLV walker nor the address walker — the whole reason this
     // target exists — had ever run once.
-    const len: usize = smith.slice(&buf);
-    std.mem.doNotOptimizeAway(walkCdp(buf[0..len]));
+    const len: usize = src.slice(&buf);
+    tallyCdp(buf[0..len]);
+}
+
+fn tallyCdp(bytes: []const u8) void {
+    const t = walkCdp(bytes);
+    std.mem.doNotOptimizeAway(t);
+    if (t.parsed != 0) fz.mark(.parsed) else fz.mark(.rejected);
 }
 
 test "corpus: every CDP seed reaches the walkers, and the decoded counts are pinned" {
@@ -807,4 +815,27 @@ test "corpus: every CDP seed reaches the walkers, and the decoded counts are pin
     try testing.expectEqual(@as(usize, 23), total.tlvs);
     try testing.expectEqual(@as(usize, 5), total.addresses);
     try testing.expectEqual(@as(usize, 1), total.checksum_ok);
+}
+
+// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+// Shared plumbing and the notes on `L2DISCO_FUZZ` are in `fuzz_test.zig`.
+
+fn fuzzCdpMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+
+    var buf: [256]u8 = undefined;
+    tallyCdp(fz.damaged(S, src, &cdp_seeds, &buf));
+}
+
+test "fuzz: cdp parse, damaged corpus entries" {
+    try testing.fuzz({}, fz.fuzzScript(fuzzCdpMutated, 64), .{});
+}
+
+test "fuzz driver: L2DISCO_FUZZ (cdp)" {
+    try fz.fuzz_driver.run(fuzzCdpParse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-cdp" });
+    try fz.fuzz_driver.run(fuzzCdpMutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-cdp-mutated" });
+}
+
+test "fuzz harness: 400 seeds in every test run, and they get everywhere (cdp)" {
+    try fz.checkReach("l2disco cdp", .{ fuzzCdpParse, fuzzCdpMutated }, 400);
 }

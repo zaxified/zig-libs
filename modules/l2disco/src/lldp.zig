@@ -839,6 +839,7 @@ pub const Builder = struct {
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
+const fz = @import("fuzz_test.zig");
 const testing = std.testing;
 
 const kat_mac = Mac{ .octets = .{ 0x00, 0x1b, 0x21, 0x3c, 0x9d, 0xf8 } };
@@ -1308,10 +1309,11 @@ fn walkLldp(bytes: []const u8, tolerant: bool) LldpTally {
 }
 
 test "fuzz: LLDPDU parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzLldpParse, .{ .corpus = &lldp_seeds });
+    try testing.fuzz({}, fz.fuzzScript(fuzzLldpParse, 256), .{ .corpus = &lldp_seeds });
 }
 
-fn fuzzLldpParse(_: void, smith: *std.testing.Smith) !void {
+fn fuzzLldpParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -1327,14 +1329,20 @@ fn fuzzLldpParse(_: void, smith: *std.testing.Smith) !void {
     // frame), 5 parsed strictly, 9 tolerantly (the four that differ are the
     // malformed-optional seeds), 51 TLVs walked, 4 org TLVs of which 3
     // decode, and 3 management addresses, after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = src.slice(&buf);
     // ⚠ `tolerant_optionals` travels in the seed's tail. Drawn here it would
     // be `false` forever, and one whole documented branch of this parser —
     // "skip the malformed optional and keep the neighbour record" — would
     // never run. `walkLldp` drives both settings on every seed anyway, so the
     // draw picks which of the two the deeper walk uses.
-    const tolerant = smith.value(u64) & 1 != 0;
-    std.mem.doNotOptimizeAway(walkLldp(buf[0..len], tolerant));
+    const tolerant = src.value(bool);
+    tallyLldp(buf[0..len], tolerant);
+}
+
+fn tallyLldp(bytes: []const u8, tolerant: bool) void {
+    const t = walkLldp(bytes, tolerant);
+    std.mem.doNotOptimizeAway(t);
+    if (t.strict != 0) fz.mark(.parsed) else fz.mark(.rejected);
 }
 
 test "corpus: every LLDP seed reaches the iterators, and the walked counts are pinned" {
@@ -1519,4 +1527,28 @@ test "Builder: LLDP-MED capabilities and network policy reproduce the tcpdump-ch
     try b2.addMedNetworkPolicy(p);
     const o = try OrgSpecific.parse(buf[2..b2.pos]);
     try testing.expectEqualDeep(OrgValue{ .med_network_policy = p }, o.decode().?);
+}
+
+// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+// Shared plumbing and the notes on `L2DISCO_FUZZ` are in `fuzz_test.zig`.
+
+fn fuzzLldpMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+
+    var buf: [256]u8 = undefined;
+    const tolerant = src.value(bool);
+    tallyLldp(fz.damaged(S, src, &lldp_seeds, &buf), tolerant);
+}
+
+test "fuzz: lldp parse, damaged corpus entries" {
+    try testing.fuzz({}, fz.fuzzScript(fuzzLldpMutated, 64), .{});
+}
+
+test "fuzz driver: L2DISCO_FUZZ (lldp)" {
+    try fz.fuzz_driver.run(fuzzLldpParse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-lldp" });
+    try fz.fuzz_driver.run(fuzzLldpMutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-lldp-mutated" });
+}
+
+test "fuzz harness: 400 seeds in every test run, and they get everywhere (lldp)" {
+    try fz.checkReach("l2disco lldp", .{ fuzzLldpParse, fuzzLldpMutated }, 400);
 }

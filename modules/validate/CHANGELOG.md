@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `VALIDATE_FUZZ` over the existing harnesses (`json`, `streaming`, `format`).
 - **2026-10-06** — **Anchoring: query decoding + coercion oracle** (`tools/query_oracle.py`,
   `src/query_oracle_test.zig`): Python `parse_qsl`, Go `net/url` and WHATWG `URLSearchParams` judge the
   decoding; pydantic 2.13.5 (lax, fed the decoded bytes) judges the coercion and the error code, with

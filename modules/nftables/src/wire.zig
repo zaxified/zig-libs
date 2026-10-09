@@ -1744,12 +1744,30 @@ fn walkDecoders(buf: []const u8) !WireTally {
     return t;
 }
 
+const fz = @import("fuzz_test.zig");
+const WireMark = fz.Marker(enum { nothing, named, handles, exprs, elements });
+
 test "fuzz: object decoders never crash, loop or over-read" {
     var corpus: WireCorpus = .{};
-    try testing.fuzz({}, fuzzDecoders, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzDecodersSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzDecoders(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: NFTABLES_FUZZ (wire decoders)" {
+    try fz.fuzz_driver.run(fuzzDecoders, .{ .prefix = "NFTABLES_FUZZ", .name = "nftables-wire" });
+}
+
+test "fuzz harness: wire decoders, 300 seeds, reaches every outcome" {
+    try WireMark.reach(fuzzDecoders, "nftables-wire", 300);
+}
+
+fn fuzzDecodersSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzDecoders, smith, script[0..n]);
+}
+
+fn fuzzDecoders(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // 2048, not 512: a rule reply carrying real expressions and a set-element
     // reply carrying several elements both run past 512, and a seed longer
     // than the buffer is not a big seed — `Smith.slice` reads it back as the
@@ -1768,8 +1786,16 @@ fn fuzzDecoders(_: void, smith: *std.testing.Smith) !void {
     // slice is refused at `payload.len < nfgenmsg_len`, so neither the
     // expression iterator nor the set-element iterator — the two loops this
     // target bounds with a `try testing.expect` — had ever executed.
-    const len: usize = smith.slice(&raw);
-    std.mem.doNotOptimizeAway(try walkDecoders(raw[0..len]));
+    var cstore: WireCorpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) (cstore.build() catch &.{}) else &.{};
+    const len: usize = fz.drawInput(S, smith, &raw, entries);
+    const t = try walkDecoders(raw[0..len]);
+    std.mem.doNotOptimizeAway(t);
+    if (t.named != 0) WireMark.mark(.named);
+    if (t.handles != 0) WireMark.mark(.handles);
+    if (t.exprs != 0) WireMark.mark(.exprs);
+    if (t.elements != 0) WireMark.mark(.elements);
+    if (t.named == 0 and t.handles == 0 and t.exprs == 0 and t.elements == 0) WireMark.mark(.nothing);
 }
 
 test "corpus: every wire seed reaches the decoders, and the walked counts are pinned" {

@@ -2238,25 +2238,20 @@ test "fuzz: parse never panics on arbitrary text" {
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     const alphabet = "0123456789+-.eE";
     var buf: [256]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
-    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
-    // then finds fewer than the eight it needs and returns the range MINIMUM —
-    // so `len` was 0 for every input and `BigDecimal.parse` was handed "",
-    // refusing at once, with the literal sitting unread in `buf`. Measured
-    // 2026-09-07 over the corpus above: **0 of 17 seeds non-empty and 0 parsed
-    // before, 16 of 17 non-empty (one seed IS the empty literal) and 10 parsed
-    // after.**
+    // One `smith.slice` call first, never `smith.bytes` followed by a ranged
+    // length (see the sibling in `root.zig`).
     const len: usize = smith.slice(&buf);
     // ⚠ A `--fuzz`-only aid: on a corpus replay `Smith` is already drained, so
     // `boolWeighted` is false throughout and every seed reaches `parse`
-    // verbatim — which is what a corpus of real literals wants.
+    // verbatim.
     for (buf[0..len]) |*c| {
         if (smith.boolWeighted(1, 4)) c.* = alphabet[c.* % alphabet.len];
     }
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    _ = BigDecimal.parse(arena.allocator(), buf[0..len]) catch return;
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try fz.bigParseHarness(fz.ScriptSource, &src, testing.allocator);
 }
+
+const fz = @import("fuzz_test.zig");
 
 test "corpus: every literal reaches BigDecimal.parse, and the counts are pinned" {
     // ⭐ The measurement, executable rather than written in a comment. It is

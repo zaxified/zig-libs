@@ -1208,6 +1208,8 @@ test "encode limits: oversized name and attr are rejected" {
 // nothing.
 
 const testkit = @import("testkit");
+const fz = @import("fuzz_test.zig");
+const fuzz_driver = testkit.fuzz.driver;
 
 /// The walker harness's buffer.
 ///
@@ -1342,22 +1344,38 @@ test "corpus: every seed reaches the walkers, and the attrs walked are pinned" {
 fn fuzzCodec(_: void, smith: *std.testing.Smith) !void {
     var raw: [fuzz_buf_len]u8 = undefined;
     const len = smith.slice(&raw);
-    const buf = raw[0..len];
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = raw[0..len] } };
+    try codecHarness(fz.ScriptSource, &src, testing.allocator);
+}
 
+fn codecHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [fuzz_buf_len]u8 = undefined;
+    const len = src.slice(&raw);
+    try walkAll(gpa, raw[0..len]);
+}
+
+fn walkAll(gpa: std.mem.Allocator, buf: []const u8) !void {
     // Raw walk: each step consumes >= 4 bytes, so bound the step count.
     var steps: usize = 0;
     var it: AttrIterator = .{ .buf = buf };
-    while (it.next() catch null) |_| {
+    while (true) {
+        const a = it.next() catch {
+            fz.mark(.attr_refused);
+            break;
+        };
+        if (a == null) break;
+        fz.mark(.attr_walked);
         steps += 1;
-        try testing.expect(steps <= buf.len / 4 + 1);
+        if (steps > buf.len / 4 + 1) return error.WalkerDidNotAdvance;
     }
 
     // Typed blobmsg walk, one nesting level deep.
     var fsteps: usize = 0;
     var fit = FieldIterator.init(buf);
     while (fit.next() catch null) |f| {
+        fz.mark(.field_walked);
         fsteps += 1;
-        try testing.expect(fsteps <= buf.len / 4 + 1);
+        if (fsteps > buf.len / 4 + 1) return error.WalkerDidNotAdvance;
         switch (f.value) {
             .table, .array => |b| {
                 var sub = FieldIterator.init(b);
@@ -1368,9 +1386,28 @@ fn fuzzCodec(_: void, smith: *std.testing.Smith) !void {
     }
 
     // Full recursive JSON decode (exercises the depth cap too).
-    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    var aw = std.Io.Writer.Allocating.init(gpa);
     defer aw.deinit();
-    decodeToJson(buf, &aw.writer) catch {};
+    decodeToJson(buf, &aw.writer) catch return;
+    fz.mark(.json_decoded);
+}
+
+/// A valid attr stream from this module's own `encodeArgs` (a corpus JSON
+/// text), then damaged: a few octets flipped, maybe cut short. Random octets
+/// almost never carry a length field the walker accepts, so `codecHarness`
+/// alone stays at the first attr header.
+fn codecMutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const text = encode_seeds[src.index(encode_seeds.len)][4..];
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, text, .{}) catch return;
+    defer parsed.deinit();
+    const enc = encodeArgs(gpa, parsed.value) catch return;
+    defer gpa.free(enc);
+    if (enc.len == 0) return;
+    var n = enc.len;
+    const flips = src.valueRangeAtMost(u8, 0, 4);
+    for (0..flips) |_| enc[src.index(n)] ^= src.value(u8);
+    if (src.valueRangeAtMost(u8, 0, 3) == 0) n -= src.index(n);
+    try walkAll(gpa, enc[0..n]);
 }
 
 // ── fuzz: the JSON -> blobmsg encode path (`encodeArgs`) is the other
@@ -1405,15 +1442,67 @@ test "fuzz: encodeArgs never crashes on arbitrary JSON-shaped text" {
 }
 
 fn fuzzEncodeArgs(_: void, smith: *std.testing.Smith) !void {
-    const gpa = testing.allocator;
     var raw: [512]u8 = undefined;
     const len = smith.slice(&raw);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = raw[0..len] } };
+    try encodeHarness(fz.ScriptSource, &src, testing.allocator);
+}
 
-    var parsed = std.json.parseFromSlice(std.json.Value, gpa, raw[0..len], .{}) catch return;
+fn encodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [512]u8 = undefined;
+    const len = src.slice(&raw);
+    try encodeText(gpa, raw[0..len]);
+}
+
+fn encodeText(gpa: std.mem.Allocator, text: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, text, .{}) catch {
+        fz.mark(.text_unparsed);
+        return;
+    };
     defer parsed.deinit();
 
-    const buf = encodeArgs(gpa, parsed.value) catch return;
+    const buf = encodeArgs(gpa, parsed.value) catch {
+        fz.mark(.encode_refused);
+        return;
+    };
     defer gpa.free(buf);
+    fz.mark(.encoded);
+}
+
+/// A corpus JSON text with a few octets flipped: random text is almost never
+/// a JSON object, so `encodeHarness` alone rarely gets past `std.json`.
+fn encodeMutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const text = encode_seeds[src.index(encode_seeds.len)][4..];
+    var buf: [512]u8 = undefined;
+    @memcpy(buf[0..text.len], text);
+    const flips = src.valueRangeAtMost(u8, 0, 3);
+    for (0..flips) |_| {
+        if (text.len == 0) break;
+        buf[src.index(text.len)] ^= src.value(u8);
+    }
+    try encodeText(gpa, buf[0..text.len]);
+}
+
+test "fuzz driver: BLOBMSG_FUZZ (codec, codec-mutated, encode, encode-mutated)" {
+    try fuzz_driver.run(codecHarness, .{ .prefix = "BLOBMSG_FUZZ", .name = "codec" });
+    try fuzz_driver.run(codecMutatedHarness, .{ .prefix = "BLOBMSG_FUZZ", .name = "codec-mutated" });
+    try fuzz_driver.run(encodeHarness, .{ .prefix = "BLOBMSG_FUZZ", .name = "encode" });
+    try fuzz_driver.run(encodeMutatedHarness, .{ .prefix = "BLOBMSG_FUZZ", .name = "encode-mutated" });
+}
+
+test "fuzz harnesses: 400 seeds each in every test run, and they get everywhere" {
+    fz.resetReach();
+    inline for (.{ codecHarness, codecMutatedHarness, encodeHarness, encodeMutatedHarness }, .{ "codec", "codec-mutated", "encode", "encode-mutated" }) |h, name| {
+        for (0..400) |sd| {
+            var prng = std.Random.DefaultPrng.init(sd);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print("blobmsg {s} seed {d}: {t}\n", .{ name, sd, err });
+                return err;
+            };
+        }
+    }
+    try fz.expectAllReached();
 }
 
 test "corpus: every JSON seed reaches encodeArgs, and the octets encoded are pinned" {

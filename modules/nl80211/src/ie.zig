@@ -963,12 +963,29 @@ const IeCorpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const IeMark = fz.Marker(enum { nothing, elements, rsn, wpa1 });
+
 test "fuzz: the IE walk never crashes on arbitrary bytes" {
     var corpus: IeCorpus = .{};
-    try testing.fuzz({}, fuzzIes, .{ .corpus = corpus.build() });
+    try testing.fuzz({}, fuzzIesSmith, .{ .corpus = corpus.build() });
 }
 
-fn fuzzIes(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: NL80211_FUZZ (IE walk)" {
+    try fz.fuzz_driver.run(fuzzIes, .{ .prefix = "NL80211_FUZZ", .name = "nl80211-ies" });
+}
+
+test "fuzz harness: IE walk, 300 seeds, reaches every outcome" {
+    try IeMark.reach(fuzzIes, "nl80211-ies", 300);
+}
+
+fn fuzzIesSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzIes, smith, script[0..n]);
+}
+
+fn fuzzIes(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var raw: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
@@ -982,13 +999,19 @@ fn fuzzIes(_: void, smith: *std.testing.Smith) !void {
     // above: **0 of 10 seeds non-empty, 0 elements walked and 0 RSN or WPA1
     // elements found before; 10 of 10 non-empty, 40 elements walked and 3
     // found after.**
-    const len: usize = smith.slice(&raw);
+    _ = gpa;
+    var cstore: IeCorpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) cstore.build() else &.{};
+    const len: usize = fz.drawInput(S, smith, &raw, entries);
     const buf = raw[0..len];
 
     var it: Iterator = .{ .buf = buf };
+    var walked: usize = 0;
     while (it.next() catch null) |e| {
         _ = e;
+        walked += 1;
     }
+    if (walked != 0) IeMark.mark(.elements) else IeMark.mark(.nothing);
     const s = summarize(buf);
     std.mem.doNotOptimizeAway(&s);
     // The accessor, not just the parse — F1's fuzz gap was exactly a harness
@@ -999,8 +1022,14 @@ fn fuzzIes(_: void, smith: *std.testing.Smith) !void {
     std.mem.doNotOptimizeAway(&s.security(@as(u16, @truncate(smith.value(u64)))));
     // A truncated walk must never be classified as "no protection".
     if (s.truncated and s.rsn == null) std.debug.assert(s.security(0) == .unknown);
-    if (parseRsn(buf)) |r| std.mem.doNotOptimizeAway(&r) else |_| {}
-    if (parseWpa1(buf)) |r| std.mem.doNotOptimizeAway(&r) else |_| {}
+    if (parseRsn(buf)) |r| {
+        std.mem.doNotOptimizeAway(&r);
+        IeMark.mark(.rsn);
+    } else |_| {}
+    if (parseWpa1(buf)) |r| {
+        std.mem.doNotOptimizeAway(&r);
+        IeMark.mark(.wpa1);
+    } else |_| {}
     _ = find(buf, EID.SSID);
     _ = findExtension(buf, EXT_EID.HE_CAPABILITY);
     _ = findVendor(buf, oui_microsoft, vendor_type_wpa);

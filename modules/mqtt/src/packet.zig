@@ -2289,10 +2289,11 @@ const StreamCorpus = struct {
 
 test "fuzz: decode never panics on arbitrary bytes" {
     var corpus: StreamCorpus = .{};
-    try testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzScript(fuzzDecode), .{ .corpus = try corpus.build() });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -2304,13 +2305,23 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // that shape on 2026-09-07. Measured over the corpus above: **0 of 18
     // seeds reached `decode` and 0 packets were walked before, 18 of 18 and 18
     // packets after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = src.slice(&buf);
+    walkV3(buf[0..len]);
+}
 
+fn walkV3(buf: []const u8) void {
     var off: usize = 0;
     var iterations: usize = 0;
-    while (off < len and iterations < 64) : (iterations += 1) {
-        const decoded = decode(buf[off..len]) catch return;
-        const d = decoded orelse return; // need more data
+    while (off < buf.len and iterations < 64) : (iterations += 1) {
+        const decoded = decode(buf[off..]) catch {
+            fuzz_mark(.rejected);
+            return;
+        };
+        const d = decoded orelse { // need more data
+            fuzz_mark(.need_more);
+            return;
+        };
+        fuzz_mark(.decoded);
         off += d.consumed;
     }
 }
@@ -2931,17 +2942,29 @@ const StreamCorpusV5 = struct {
 
 test "fuzz: v5 decode never panics on arbitrary bytes" {
     var corpus: StreamCorpusV5 = .{};
-    try testing.fuzz({}, fuzzDecodeV5, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzScript(fuzzDecodeV5), .{ .corpus = try corpus.build() });
 }
 
-fn fuzzDecodeV5(_: void, smith: *std.testing.Smith) !void {
+fn fuzzDecodeV5(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
-    // One `smith.slice` call — see `fuzzDecode` for why never `bytes` + a length.
-    const len: usize = smith.slice(&buf);
+    // One `slice` call — see `fuzzDecode` for why never `bytes` + a length.
+    const len: usize = src.slice(&buf);
+    walkV5(buf[0..len]);
+}
+
+fn walkV5(buf: []const u8) void {
     var off: usize = 0;
     var iterations: usize = 0;
-    while (off < len and iterations < 64) : (iterations += 1) {
-        const d = (decodePacket(buf[off..len], .v5) catch return) orelse return;
+    while (off < buf.len and iterations < 64) : (iterations += 1) {
+        const d = (decodePacket(buf[off..], .v5) catch {
+            fuzz_mark(.rejected);
+            return;
+        }) orelse {
+            fuzz_mark(.need_more);
+            return;
+        };
+        fuzz_mark(.decoded);
         switch (d.packet) {
             .publish => |p| {
                 _ = p.properties.user_properties.count();
@@ -2978,4 +3001,123 @@ test "corpus v5: every seed reaches decodePacket, and the packets walked are pin
     // 4 + 3 (the cut copy loses its last packet) + 5 + 1 + 4.
     try testing.expectEqual(@as(usize, 17), walked);
     try testing.expectEqual(@as(usize, 4), refused);
+}
+
+// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+//
+// The harnesses above are generic over their source of choices
+// (`fn(comptime S, *S, gpa)`); `testing.fuzz` feeds them through
+// `ScriptSource`, `MQTT_FUZZ=<runs>[,<first seed>]` through testkit's driver
+// (`_MS`, `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there). They stay in
+// this file because the stream corpora they damage are private. Random bytes
+// almost never form a packet, so each harness has a "mutated" twin: one corpus
+// stream, a few octets damaged, maybe cut short.
+
+const fuzz_driver = testkit.fuzz.driver;
+
+const FuzzLabel = enum { rejected, need_more, decoded };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn fuzz_mark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+const FuzzScript = struct {
+    cur: testkit.fuzz.Cursor,
+
+    pub fn valueRangeAtMost(self: *FuzzScript, comptime T: type, at_least: T, at_most: T) T {
+        return @intCast(self.cur.ranged(at_least, at_most));
+    }
+    pub fn value(self: *FuzzScript, comptime T: type) T {
+        return switch (T) {
+            bool => self.cur.byte() & 1 == 1,
+            u8 => self.cur.byte(),
+            u16 => self.cur.word(),
+            else => @compileError("FuzzScript.value: unsupported type"),
+        };
+    }
+    pub fn bytes(self: *FuzzScript, buf: []u8) void {
+        for (buf) |*b| b.* = self.cur.byte();
+    }
+    pub fn index(self: *FuzzScript, len: usize) usize {
+        return self.cur.ranged(0, @intCast(len - 1));
+    }
+    /// What `Smith.slice` returns for this script: up to `buf.len` of the
+    /// remaining script bytes, and their count.
+    pub fn slice(self: *FuzzScript, buf: []u8) u32 {
+        const left = self.cur.bytes.len -| self.cur.at;
+        const n = @min(buf.len, left);
+        @memcpy(buf[0..n], self.cur.bytes[self.cur.at..][0..n]);
+        self.cur.at += n;
+        return @intCast(n);
+    }
+};
+
+fn fuzzScript(comptime harness: anytype) fn (void, *std.testing.Smith) anyerror!void {
+    return struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            var script: [1024]u8 = undefined;
+            const n = smith.slice(&script);
+            var src: FuzzScript = .{ .cur = .{ .bytes = script[0..n] } };
+            return harness(FuzzScript, &src, testing.allocator);
+        }
+    }.f;
+}
+
+/// A corpus stream with a few octets damaged and maybe cut short.
+fn damagedStream(comptime S: type, src: *S, entries: []const []const u8, buf: *[256]u8) []const u8 {
+    var smith: std.testing.Smith = .{ .in = entries[src.index(entries.len)] };
+    var len: usize = smith.slice(buf);
+    if (len == 0) return buf[0..0];
+    for (0..src.valueRangeAtMost(u8, 0, 3)) |_| buf[src.index(len)] = src.value(u8);
+    if (src.valueRangeAtMost(u8, 0, 3) == 0) len = src.index(len) + 1;
+    return buf[0..len];
+}
+
+fn fuzzDecodeMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: StreamCorpus = .{};
+    var buf: [256]u8 = undefined;
+    walkV3(damagedStream(S, src, try corpus.build(), &buf));
+}
+
+fn fuzzDecodeV5Mutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: StreamCorpusV5 = .{};
+    var buf: [256]u8 = undefined;
+    walkV5(damagedStream(S, src, try corpus.build(), &buf));
+}
+
+test "fuzz: decode, damaged corpus streams" {
+    try testing.fuzz({}, fuzzScript(fuzzDecodeMutated), .{});
+}
+
+test "fuzz: v5 decode, damaged corpus streams" {
+    try testing.fuzz({}, fuzzScript(fuzzDecodeV5Mutated), .{});
+}
+
+test "fuzz driver: MQTT_FUZZ" {
+    try fuzz_driver.run(fuzzDecode, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-decode" });
+    try fuzz_driver.run(fuzzDecodeMutated, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-decode-mutated" });
+    try fuzz_driver.run(fuzzDecodeV5, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-v5-decode" });
+    try fuzz_driver.run(fuzzDecodeV5Mutated, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-v5-decode-mutated" });
+}
+
+test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
+    fuzz_reach = @splat(0);
+    inline for (.{ fuzzDecode, fuzzDecodeMutated, fuzzDecodeV5, fuzzDecodeV5Mutated }, 0..) |h, which| {
+        for (0..400) |seed| {
+            var prng = std.Random.DefaultPrng.init(seed);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print("mqtt harness {d} seed {d}: {t}\n", .{ which, seed, err });
+                return err;
+            };
+        }
+    }
+    for (fuzz_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }

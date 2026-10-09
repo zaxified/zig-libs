@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `HTTP_FUZZ` over the existing harnesses (range, content-type,
+  urlencoded, h1 request/response head and chunked, multipart parse/stream, hpack block/huffman, h2 parseFrame/recv).
+
 - **2026-10-09** — **Fix, https dial: no copy of the TLS session keys on the dead stack.** The dial
   now uses `tlsclient.Client.initInto`, which writes the established session (application traffic
   keys) straight into the connection; `init`'s by-value return left a copy in dead frames

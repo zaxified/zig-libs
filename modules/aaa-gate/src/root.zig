@@ -2547,16 +2547,38 @@ const bearer_seeds = [_][]const u8{
     seed("\r\n"), // an empty header block
 };
 
+const fz = @import("fuzz_test.zig");
+const BearerMark = fz.Marker(enum { absent, found });
+const ApiKeyMark = fz.Marker(enum { absent, found });
+const QueryMark = fz.Marker(enum { absent, found });
+const BearerValueMark = fz.Marker(enum { absent, found });
+const ClientKeyMark = fz.Marker(enum { fallback, forwarded, clamped });
+
 test "fuzz bearerToken never panics" {
-    try testing.fuzz({}, fuzzBearerToken, .{ .corpus = &bearer_seeds });
+    try testing.fuzz({}, fuzzBearerTokenSmith, .{ .corpus = &bearer_seeds });
 }
 
-fn fuzzBearerToken(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: AAA_GATE_FUZZ (bearer header block)" {
+    try fz.fuzz_driver.run(fuzzBearerToken, .{ .prefix = "AAA_GATE_FUZZ", .name = "aaa-gate-bearer" });
+}
+
+test "fuzz harness: bearer header block, 300 seeds, reaches every outcome" {
+    try BearerMark.reach(fuzzBearerToken, "aaa-gate-bearer", 300);
+}
+
+fn fuzzBearerTokenSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzBearerToken, smith, script[0..n]);
+}
+
+fn fuzzBearerToken(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, smith, &buf, &bearer_seeds);
     var body: http.Server.RequestBody = .{ .none = .fixed("") };
     const req = fuzzRequest(buf[0..len], "", &body);
-    _ = bearerToken(&req);
+    if (bearerToken(&req)) |_| BearerMark.mark(.found) else BearerMark.mark(.absent);
 }
 
 test "corpus: every bearer seed reaches the extractor, and the tokens found are pinned" {
@@ -2616,12 +2638,26 @@ const api_key_seeds = [_][]const u8{
 };
 
 test "fuzz apiKeyPresented never panics" {
-    try testing.fuzz({}, fuzzApiKeyPresented, .{ .corpus = &api_key_seeds });
+    try testing.fuzz({}, fuzzApiKeyPresentedSmith, .{ .corpus = &api_key_seeds });
 }
 
-fn fuzzApiKeyPresented(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: AAA_GATE_FUZZ (api key presented)" {
+    try fz.fuzz_driver.run(fuzzApiKeyPresented, .{ .prefix = "AAA_GATE_FUZZ", .name = "aaa-gate-api-key" });
+}
+
+test "fuzz harness: api key presented, 300 seeds, reaches every outcome" {
+    try ApiKeyMark.reach(fuzzApiKeyPresented, "aaa-gate-api-key", 300);
+}
+
+fn fuzzApiKeyPresentedSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzApiKeyPresented, smith, script[0..n]);
+}
+
+fn fuzzApiKeyPresented(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [256]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, smith, &buf, &api_key_seeds);
     // ⛔ Not a second ranged draw: after `slice` the input is exhausted, so
     // any further draw is its range minimum for ever. The divide is a US octet
     // in the bytes themselves, which the fuzzer drives along with everything
@@ -2630,12 +2666,12 @@ fn fuzzApiKeyPresented(_: void, smith: *std.testing.Smith) !void {
     var body: http.Server.RequestBody = .{ .none = .fixed("") };
     const req = fuzzRequest(buf[0..split], buf[@min(split + 1, len)..len], &body);
 
-    var g = try Gate.init(testing.allocator, .{
+    var g = try Gate.init(gpa, .{
         .auth_mode = .api_key,
         .api_key_query_param = "api_key",
     });
     defer g.deinit();
-    _ = apiKeyPresented(&g, &req);
+    if (apiKeyPresented(&g, &req)) |_| ApiKeyMark.mark(.found) else ApiKeyMark.mark(.absent);
 }
 
 test "corpus: every api-key seed reaches both extraction paths, and the split is real" {
@@ -2716,13 +2752,28 @@ const query_seeds = [_][]const u8{
 };
 
 test "fuzz queryValue never panics" {
-    try testing.fuzz({}, fuzzQueryValue, .{ .corpus = &query_seeds });
+    try testing.fuzz({}, fuzzQueryValueSmith, .{ .corpus = &query_seeds });
 }
 
-fn fuzzQueryValue(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: AAA_GATE_FUZZ (query value)" {
+    try fz.fuzz_driver.run(fuzzQueryValue, .{ .prefix = "AAA_GATE_FUZZ", .name = "aaa-gate-query" });
+}
+
+test "fuzz harness: query value, 300 seeds, reaches every outcome" {
+    try QueryMark.reach(fuzzQueryValue, "aaa-gate-query", 300);
+}
+
+fn fuzzQueryValueSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzQueryValue, smith, script[0..n]);
+}
+
+fn fuzzQueryValue(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    _ = queryValue(buf[0..len], "api_key");
+    const len: usize = fz.drawInput(S, smith, &buf, &query_seeds);
+    if (queryValue(buf[0..len], "api_key")) |_| QueryMark.mark(.found) else QueryMark.mark(.absent);
 }
 
 test "corpus: every query seed reaches queryValue, and what it returned is pinned" {
@@ -2767,13 +2818,28 @@ const bearer_value_seeds = [_][]const u8{
 };
 
 test "fuzz bearerTokenOf never panics" {
-    try testing.fuzz({}, fuzzBearerTokenOf, .{ .corpus = &bearer_value_seeds });
+    try testing.fuzz({}, fuzzBearerTokenOfSmith, .{ .corpus = &bearer_value_seeds });
 }
 
-fn fuzzBearerTokenOf(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: AAA_GATE_FUZZ (bearer value)" {
+    try fz.fuzz_driver.run(fuzzBearerTokenOf, .{ .prefix = "AAA_GATE_FUZZ", .name = "aaa-gate-bearer-value" });
+}
+
+test "fuzz harness: bearer value, 300 seeds, reaches every outcome" {
+    try BearerValueMark.reach(fuzzBearerTokenOf, "aaa-gate-bearer-value", 300);
+}
+
+fn fuzzBearerTokenOfSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzBearerTokenOf, smith, script[0..n]);
+}
+
+fn fuzzBearerTokenOf(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    _ = bearerTokenOf(buf[0..len]);
+    const len: usize = fz.drawInput(S, smith, &buf, &bearer_value_seeds);
+    if (bearerTokenOf(buf[0..len])) |_| BearerValueMark.mark(.found) else BearerValueMark.mark(.absent);
 }
 
 test "corpus: every bearer-value seed reaches bearerTokenOf, and what it returned is pinned" {
@@ -2815,12 +2881,27 @@ const client_key_seeds = [_][]const u8{
 };
 
 test "fuzz clientKeyFrom never panics" {
-    try testing.fuzz({}, fuzzClientKeyFrom, .{ .corpus = &client_key_seeds });
+    try testing.fuzz({}, fuzzClientKeyFromSmith, .{ .corpus = &client_key_seeds });
 }
 
-fn fuzzClientKeyFrom(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: AAA_GATE_FUZZ (client key)" {
+    try fz.fuzz_driver.run(fuzzClientKeyFrom, .{ .prefix = "AAA_GATE_FUZZ", .name = "aaa-gate-client-key" });
+}
+
+test "fuzz harness: client key, 300 seeds, reaches every outcome" {
+    try ClientKeyMark.reach(fuzzClientKeyFrom, "aaa-gate-client-key", 300);
+}
+
+fn fuzzClientKeyFromSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzClientKeyFrom, smith, script[0..n]);
+}
+
+fn fuzzClientKeyFrom(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, smith, &buf, &client_key_seeds);
     const split: usize = fuzzSplitAt(buf[0..len]);
     const xff = buf[0..split];
     const real_ip = buf[@min(split + 1, len)..len];
@@ -2833,6 +2914,8 @@ fn fuzzClientKeyFrom(_: void, smith: *std.testing.Smith) !void {
     );
     // Never panics AND never exceeds the bound the throttle store relies on.
     try testing.expect(key.len <= client_key_len_max);
+    if (std.mem.eql(u8, key, fallback_key)) ClientKeyMark.mark(.fallback) else ClientKeyMark.mark(.forwarded);
+    if (key.len == client_key_len_max) ClientKeyMark.mark(.clamped);
 }
 
 test "corpus: every client-key seed reaches clientKeyFrom, and the split is real" {

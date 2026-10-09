@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `L2DISCO_FUZZ` over the existing harnesses (DHCP, LLDP, ARP, CDP parsers, each also over damaged corpus entries).
+
 - **2026-10-06** — **FIX:** `lldp.PortId.text()` returned null for the `port_component` subtype and
   `ChassisId.text()` for its `port_component`, though both are an entPhysicalAlias string (IEEE 802.1AB):
   a neighbour naming its port that way showed no port at all. Both now return the text. Found by the

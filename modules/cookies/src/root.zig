@@ -810,6 +810,7 @@ test {
 // `SetCookie.write` builds (see setcookie_oracle_test.zig).
 test {
     _ = @import("setcookie_oracle_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 // ── fuzz: parse never panics on arbitrary or cookie-shaped bytes ───────────
@@ -870,14 +871,12 @@ test "fuzz: parse never panics, arbitrary or cookie-shaped bytes" {
 }
 
 fn fuzzParseNeverPanics(_: void, smith: *std.testing.Smith) !void {
-    // ⚠ ONE byte-first draw. Never a ranged draw before the bytes.
+    // ⚠ ONE byte-first draw (inside the harness). Never a ranged draw before the bytes.
+    const ft = @import("fuzz_test.zig");
     var buf: [512]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    var it = parse(buf[0..len]);
-    while (it.next()) |c| {
-        std.mem.doNotOptimizeAway(c.name);
-        std.mem.doNotOptimizeAway(c.value);
-    }
+    var src: ft.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try ft.parseHarness(ft.ScriptSource, &src, std.testing.allocator);
 }
 
 test "corpus: every cookie seed reaches the scanner, and the segments yielded are pinned" {

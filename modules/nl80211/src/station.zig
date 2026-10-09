@@ -445,12 +445,29 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const StationMark = fz.Marker(enum { rejected, parsed, bitrate, rate_info });
+
 test "fuzz: station parse never crashes" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzParse, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzParseSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: NL80211_FUZZ (station parse)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "NL80211_FUZZ", .name = "nl80211-station" });
+}
+
+test "fuzz harness: station parse, 300 seeds, reaches every outcome" {
+    try StationMark.reach(fuzzParse, "nl80211-station", 300);
+}
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzParse, smith, script[0..n]);
+}
+
+fn fuzzParse(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var raw: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
@@ -466,17 +483,23 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     // and 3 bitrates after.** The bitrate count is the one that matters:
     // `kilobitsPerSecond` is where the P-18 overflow panic lived, and the
     // collapsed harness could not reach it at all.
-    const len: usize = smith.slice(&raw);
+    var cstore: Corpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) (cstore.build() catch &.{}) else &.{};
+    const len: usize = fz.drawInput(S, smith, &raw, entries);
+    _ = gpa;
     // Also exercise the accessors, not just the parse — `kilobitsPerSecond`
     // (P-18) is where the previous integer-overflow panic lived, and a
     // fuzz harness that only calls `parse`/`parseRateInfo` walks right past
     // it, per the finding.
     if (parse(raw[0..len])) |s| {
+        StationMark.mark(.parsed);
         std.mem.doNotOptimizeAway(&s);
         if (s.tx_bitrate) |r| std.mem.doNotOptimizeAway(r.kilobitsPerSecond());
         if (s.rx_bitrate) |r| std.mem.doNotOptimizeAway(r.kilobitsPerSecond());
-    } else |_| {}
+        if (s.tx_bitrate != null or s.rx_bitrate != null) StationMark.mark(.bitrate);
+    } else |_| StationMark.mark(.rejected);
     if (parseRateInfo(raw[0..len])) |r| {
+        StationMark.mark(.rate_info);
         std.mem.doNotOptimizeAway(&r);
         std.mem.doNotOptimizeAway(r.kilobitsPerSecond());
     } else |_| {}

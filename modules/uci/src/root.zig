@@ -2117,8 +2117,96 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     // ⚠ One byte-first draw. Never `bytes` then a ranged length.
     var buf: [1024]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    var pkg = parse(testing.allocator, buf[0..len]) catch return;
-    pkg.deinit(testing.allocator);
+    var src: ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try parseHarness(ScriptSource, &src, testing.allocator);
+}
+
+// ── deterministic fuzz driver (UCI_FUZZ, 2026-10-09) ────────────────────────
+//
+// The harness bodies are generic over their source of choices
+// (`fn(comptime S, *S, gpa)`): `testing.fuzz` feeds them through
+// `ScriptSource`, testkit's driver through a PRNG. They live here rather than
+// in a `fuzz_test.zig` because they reach private items (`Option`, `Section`,
+// `isEscapelessControl`, the round-trip generator). Driver:
+// `UCI_FUZZ=<runs>[,<first seed>]` (`_MS`, `_SEEDFILE`, `_INPUT`, `_ONLY` as
+// documented in testkit's fuzz driver).
+
+const fuzz_driver = @import("testkit").fuzz.driver;
+
+const FuzzLabel = enum { parse_rejected, parse_accepted, rt_compared, rt_refused_value };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn fuzzMark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// `testing.fuzz`'s source: the bytes come FIRST, in one `slice` draw, and
+/// every choice is read from them by a cursor -- so each seed is its own input.
+const ScriptSource = struct {
+    cur: testkitFuzz.Cursor,
+
+    /// What `Smith.slice` would have returned for this script: up to
+    /// `buf.len` of the remaining script bytes, and their count.
+    pub fn slice(self: *ScriptSource, buf: []u8) u32 {
+        const left = self.cur.bytes.len -| self.cur.at;
+        const n = @min(buf.len, left);
+        @memcpy(buf[0..n], self.cur.bytes[self.cur.at..][0..n]);
+        self.cur.at += n;
+        return @intCast(n);
+    }
+};
+
+/// `parse` never panics or leaks on arbitrary bytes.
+fn parseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var buf: [1024]u8 = undefined;
+    const len: usize = src.slice(&buf);
+    var pkg = parse(gpa, buf[0..len]) catch {
+        fuzzMark(.parse_rejected);
+        return;
+    };
+    pkg.deinit(gpa);
+    fuzzMark(.parse_accepted);
+}
+
+/// `parse(serialize(pkg))` round-trips to an equal package, built from the
+/// script bytes.
+fn roundTripHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa; // `roundTripOne` runs under `testing.allocator`, as the driver test does
+    var script: [64]u8 = undefined;
+    const n: usize = src.slice(&script);
+    var c = testkitFuzz.Cursor{ .bytes = script[0..n] };
+    var b: RoundTripBuild = undefined;
+    switch (try roundTripOne(b.make(&c))) {
+        .compared => fuzzMark(.rt_compared),
+        .refused_value => fuzzMark(.rt_refused_value),
+        .refused_duplicate, .refused_name => {},
+    }
+}
+
+test "fuzz driver: UCI_FUZZ" {
+    try fuzz_driver.run(parseHarness, .{ .prefix = "UCI_FUZZ", .name = "uci-parse" });
+    try fuzz_driver.run(roundTripHarness, .{ .prefix = "UCI_FUZZ", .name = "uci-roundtrip" });
+}
+
+test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
+    fuzz_reach = @splat(0);
+    for (0..500) |seed_n| {
+        var prng = std.Random.DefaultPrng.init(seed_n);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        parseHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("uci parse seed {d}: {t}\n", .{ seed_n, err });
+            return err;
+        };
+        roundTripHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("uci roundtrip seed {d}: {t}\n", .{ seed_n, err });
+            return err;
+        };
+    }
+    for (fuzz_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 test "corpus: every config seed reaches parse, and the model built is pinned" {
@@ -2329,15 +2417,13 @@ const RoundTripBuild = struct {
 };
 
 fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
-    // ⚠ ONE byte-first draw, then a `Cursor` over it. What stood here opened
-    // `smith.value(bool)` and drew every subsequent choice from `smith`
-    // directly, so on the single empty input this target ever ran, every
-    // choice was a minimum and the "package" was empty.
+    // ⚠ ONE byte-first draw, then a `Cursor` over it (the harness opened
+    // `smith.value(bool)` and drew every choice from `smith` directly, so on
+    // the single empty input this target ever ran every choice was a minimum).
     var script: [64]u8 = undefined;
     const n: usize = smith.slice(&script);
-    var c = testkitFuzz.Cursor{ .bytes = script[0..n] };
-    var b: RoundTripBuild = undefined;
-    _ = try roundTripOne(b.make(&c));
+    var src: ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    try roundTripHarness(ScriptSource, &src, testing.allocator);
 }
 
 const RoundTrip = enum { compared, refused_value, refused_duplicate, refused_name };

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `CSVSTREAM_FUZZ` over the existing harnesses.
 - **2026-10-05** — **BEHAVIOURAL: `SplitOptions.trailing_empty_field` is now ON by default.** `a,b,`
   splits into three fields (the last empty), as RFC 4180, Python's `csv` and Go's `encoding/csv` read
   it; before, the final empty field was dropped, so a row whose LAST value is empty (`1,2,` under

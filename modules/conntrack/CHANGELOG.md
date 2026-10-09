@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `CONNTRACK_FUZZ` over the existing harnesses (`decodeFlow` on arbitrary and on damaged corpus entries, the dump engine).
+
 - **2026-10-04** — **Tests:** mutation run (34 schemata mutants, all killed after 5 new tests:
   `nfgenmsg` byte order, PROTOINFO/TCP-flags/family decoding guards, ICMPv6 attribute numbers and
   the PROTOINFO gate in the builders, and `awaitFlowOver`/`dumpOver` message filtering through the

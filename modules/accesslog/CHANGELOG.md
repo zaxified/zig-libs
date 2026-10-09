@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `ACCESSLOG_FUZZ` over the existing harnesses.
+
 - **2026-10-06** — ADDED: `Sink` — the thread-safe access-log writer over one shared `std.Io.Writer`
   (`init(writer, .{ .format, .synchronized, .io })`, `log(entry)`): a group commit, never a lock held
   across the write, never a torn or interleaved line. Moved from `metrics.AccessLog` (removed there)

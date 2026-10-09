@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `NETLINK_FUZZ` over the existing harnesses (codec walkers,
+  rtnetlink builders and parsers, bridge builders and parsers).
+
 - **2026-10-04** — mvp → core (survey 2026-09-30 backlog). ADDED: multicast **event monitoring**
   (`RTNLGRP`, `rtnlGroupMask`, `Socket.openMonitor`, `Socket.recvEvents` → `EventIterator` of
   typed `Event`s — link/addr/route/neigh/rule new/del — decoded by the dump parsers; `Overrun`

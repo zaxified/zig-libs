@@ -647,6 +647,7 @@ pub const Builder = struct {
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
+const fz = @import("fuzz_test.zig");
 const testing = std.testing;
 
 const kat_mac = Mac{ .octets = .{ 0x00, 0x0b, 0x82, 0x01, 0xfc, 0x42 } };
@@ -1024,10 +1025,11 @@ fn walkDhcp(bytes: []const u8) DhcpTally {
 
 test "fuzz: DHCP Message.parse never panics on arbitrary bytes" {
     var corpus: DhcpCorpus = .{};
-    try testing.fuzz({}, fuzzDhcpParse, .{ .corpus = corpus.build() });
+    try testing.fuzz({}, fz.fuzzScript(fuzzDhcpParse, 1024), .{ .corpus = corpus.build() });
 }
 
-fn fuzzDhcpParse(_: void, smith: *std.testing.Smith) !void {
+fn fuzzDhcpParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // 1024, not 512: `bootp_min_len` is 300 and a DHCP datagram carrying a
     // full parameter list runs well past that. A seed longer than the buffer
     // is not a big seed — `Smith.slice` reads it back as the EMPTY one.
@@ -1044,8 +1046,14 @@ fn fuzzDhcpParse(_: void, smith: *std.testing.Smith) !void {
     // fields decoded, 6 addresses listed and 2 overloaded options read,
     // after.** The empty slice is refused at `bytes.len < 240`, so the option
     // walker this target exists for had never run.
-    const len: usize = smith.slice(&buf);
-    std.mem.doNotOptimizeAway(walkDhcp(buf[0..len]));
+    const len: usize = src.slice(&buf);
+    tallyDhcp(buf[0..len]);
+}
+
+fn tallyDhcp(bytes: []const u8) void {
+    const t = walkDhcp(bytes);
+    std.mem.doNotOptimizeAway(t);
+    if (t.parsed != 0) fz.mark(.parsed) else fz.mark(.rejected);
 }
 
 test "corpus: every DHCP seed reaches the option walker, and the counts are pinned" {
@@ -1254,4 +1262,27 @@ test "Builder: the new options reproduce the tcpdump-checked bytes" {
     try testing.expectEqualStrings("eng.example.com", (try di.next(&name)).?);
     try testing.expectEqualStrings("corp.example.com", (try di.next(&name)).?);
     try testing.expectError(error.OptionTooLong, b2.addDomainSearch(&.{"a..b"}));
+}
+
+// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+// Shared plumbing and the notes on `L2DISCO_FUZZ` are in `fuzz_test.zig`.
+
+fn fuzzDhcpMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: DhcpCorpus = .{};
+    var buf: [1024]u8 = undefined;
+    tallyDhcp(fz.damaged(S, src, corpus.build(), &buf));
+}
+
+test "fuzz: dhcp parse, damaged corpus entries" {
+    try testing.fuzz({}, fz.fuzzScript(fuzzDhcpMutated, 64), .{});
+}
+
+test "fuzz driver: L2DISCO_FUZZ (dhcp)" {
+    try fz.fuzz_driver.run(fuzzDhcpParse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-dhcp" });
+    try fz.fuzz_driver.run(fuzzDhcpMutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-dhcp-mutated" });
+}
+
+test "fuzz harness: 400 seeds in every test run, and they get everywhere (dhcp)" {
+    try fz.checkReach("l2disco dhcp", .{ fuzzDhcpParse, fuzzDhcpMutated }, 400);
 }

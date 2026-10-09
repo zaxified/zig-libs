@@ -1930,6 +1930,17 @@ test "borrow: a parked value outliving two out-of-order releases is freed exactl
 // random corpus needs luck to reach the interesting interleavings at all, the
 // shapes that matter are also driven as fixed scripts below, so they run in
 // the ordinary suite.
+const testkit = @import("testkit");
+const fuzz_driver = testkit.fuzz.driver;
+
+const SeamLabel = enum { pinned, committed, released, parked };
+var seam_reach: [@typeInfo(SeamLabel).@"enum".fields.len]usize = @splat(0);
+
+fn mark(comptime l: SeamLabel) void {
+    seam_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
 const SeamHarness = struct {
     const key_pool = [_][]const u8{ "k0", "k1", "k2", "k3" };
     const payload = "abcdefgh";
@@ -2004,12 +2015,16 @@ const SeamHarness = struct {
         switch (op % op_count) {
             op_put => self.c.put(k, payload[0..len], self.now, ttl, 0),
             op_get => _ = self.c.get(k, self.now, 0),
-            op_pin => if (self.c.pin(k, self.now, 0)) |b| self.store(b),
+            op_pin => if (self.c.pin(k, self.now, 0)) |b| {
+                mark(.pinned);
+                self.store(b);
+            },
             op_reserve => if (self.fill == null) {
                 if (self.c.reserve(k, len, self.now, ttl, 0)) |f| self.fill = f;
             },
             op_commit => if (self.fill) |f| {
                 @memset(f.bytes, 'z');
+                mark(.committed);
                 self.store(self.c.commit(f));
                 self.fill = null;
             },
@@ -2017,11 +2032,15 @@ const SeamHarness = struct {
                 self.c.discard(f);
                 self.fill = null;
             },
-            op_release => if (self.takeBorrow(arg)) |b| self.c.release(b),
+            op_release => if (self.takeBorrow(arg)) |b| {
+                mark(.released);
+                self.c.release(b);
+            },
             op_remove => _ = self.c.remove(k),
             op_clear => self.c.clear(),
             else => unreachable,
         }
+        if (self.c.doomed.items.len > 0) mark(.parked);
         try self.check();
     }
 
@@ -2127,7 +2146,45 @@ fn fuzzSeam(_: void, smith: *std.testing.Smith) !void {
     // matters is that no weighted draw decides which operation runs.
     var script: [64]u8 = undefined;
     smith.bytes(&script);
-    try SeamHarness.run(testing.allocator, &script);
+    var src: ScriptSource = .{ .cur = .{ .bytes = &script } };
+    try seamHarness(ScriptSource, &src, testing.allocator);
+}
+
+/// `testing.fuzz`'s source: the script `smith.bytes` produced, read by a cursor.
+const ScriptSource = struct {
+    cur: testkit.fuzz.Cursor,
+
+    pub fn bytes(self: *ScriptSource, buf: []u8) void {
+        for (buf) |*b| b.* = self.cur.byte();
+    }
+};
+
+/// The harness body, generic over its source of choices (`ScriptSource` for
+/// `testing.fuzz`, `fuzz_driver.Rng` for the deterministic driver).
+fn seamHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var script: [64]u8 = undefined;
+    src.bytes(&script);
+    try SeamHarness.run(gpa, &script);
+}
+
+test "fuzz driver: RAMCACHE_FUZZ (seam)" {
+    try fuzz_driver.run(seamHarness, .{ .prefix = "RAMCACHE_FUZZ", .name = "ramcache-seam" });
+}
+
+test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
+    seam_reach = @splat(0);
+    for (0..400) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        seamHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("ramcache seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+    }
+    for (seam_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(SeamLabel, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 test "fuzz: arbitrary borrow-seam operation sequences keep every structural invariant" {

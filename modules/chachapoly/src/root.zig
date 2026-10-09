@@ -1461,6 +1461,7 @@ test "counter space boundary: the last non-wrapping block is accepted (audit F1)
 
 /// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
 const tkfuzz = @import("testkit").fuzz;
+const fuzz_driver = tkfuzz.driver;
 
 /// The AEAD open call takes five separate byte strings, and `Smith.slice`
 /// draws one — so the harness packs them, and the corpus is written in the
@@ -1567,6 +1568,25 @@ test "fuzz: decrypt never panics on arbitrary ciphertext/tag/AAD/nonce/key" {
 }
 
 fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
+    return decryptHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+/// Reach labels of `decryptHarness`.
+const FuzzLabel = enum { raw_rejected, raw_opened, sealed_opened, flip_rejected };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn mark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// Generic over its source (`Smith` under `--fuzz`, `fuzz_driver.Rng` under the
+/// deterministic driver). Two checks per input: the raw tuple goes to `decrypt`
+/// (any outcome, no panic); then the same key/nonce/AAD seal the drawn
+/// ciphertext octets as a plaintext, which MUST open to the same octets, and
+/// one flipped octet anywhere in (ciphertext, tag, AAD, nonce) MUST be refused.
+fn decryptHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [aead_buf_len]u8 = @splat(0);
     // ⚠ ONE `smith.slice` call, and it is the FIRST draw; the five arguments
     // are carved out of it (see `unpackAeadInput`). It used to be five
@@ -1587,7 +1607,72 @@ fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
     const in = unpackAeadInput(&buf, n);
 
     var m: [aead_max_ct]u8 = undefined;
-    ChaCha20Poly1305.decrypt(m[0..in.ct.len], in.ct, in.tag, in.ad, in.nonce, in.key) catch {};
+    if (ChaCha20Poly1305.decrypt(m[0..in.ct.len], in.ct, in.tag, in.ad, in.nonce, in.key)) |_| {
+        mark(.raw_opened);
+    } else |_| {
+        mark(.raw_rejected);
+    }
+
+    // Pristine: a genuine sealed message must open, and to the same octets.
+    var sealed: [aead_max_ct]u8 = undefined;
+    var stag: [ChaCha20Poly1305.tag_length]u8 = undefined;
+    ChaCha20Poly1305.encrypt(sealed[0..in.ct.len], &stag, in.ct, in.ad, in.nonce, in.key);
+    ChaCha20Poly1305.decrypt(m[0..in.ct.len], sealed[0..in.ct.len], stag, in.ad, in.nonce, in.key) catch
+        return error.GenuineMessageRejected;
+    if (!std.mem.eql(u8, m[0..in.ct.len], in.ct)) return error.RoundTripMismatch;
+    mark(.sealed_opened);
+
+    // Flipped: one octet of (ciphertext | tag | AAD | nonce), chosen by the
+    // drawn tag octets, must be refused and must not leak the plaintext.
+    var ad_copy: [aead_max_ad]u8 = undefined;
+    @memcpy(ad_copy[0..in.ad.len], in.ad);
+    var nonce = in.nonce;
+    const region = in.tag[0] % 4;
+    const bit: u8 = @as(u8, 1) << @intCast(in.tag[1] % 8);
+    switch (region) {
+        0 => if (in.ct.len > 0) {
+            sealed[in.tag[2] % in.ct.len] ^= bit;
+        } else {
+            stag[0] ^= bit;
+        },
+        1 => stag[in.tag[2] % stag.len] ^= bit,
+        2 => if (in.ad.len > 0) {
+            ad_copy[in.tag[2] % in.ad.len] ^= bit;
+        } else {
+            nonce[0] ^= bit;
+        },
+        else => nonce[in.tag[2] % nonce.len] ^= bit,
+    }
+    if (ChaCha20Poly1305.decrypt(m[0..in.ct.len], sealed[0..in.ct.len], stag, ad_copy[0..in.ad.len], nonce, in.key)) |_| {
+        return error.ForgeryAccepted;
+    } else |_| {}
+    mark(.flip_rejected);
+}
+
+test "fuzz driver: CHACHAPOLY_FUZZ (chachapoly-decrypt)" {
+    try fuzz_driver.run(decryptHarness, .{ .prefix = "CHACHAPOLY_FUZZ", .name = "chachapoly-decrypt" });
+}
+
+test "fuzz harness: 300 seeds in every test run, and they get everywhere" {
+    fuzz_reach = @splat(0);
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        decryptHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("chachapoly-decrypt seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+    }
+    // raw_opened is unreachable from random bytes (no random tuple
+    // authenticates); the corpus test below pins the one genuine open.
+    for (fuzz_reach, 0..) |n, i| {
+        const l: FuzzLabel = @enumFromInt(i);
+        if (l == .raw_opened) continue;
+        if (n == 0) {
+            std.debug.print("reach: label {t} never hit in 300 seeds\n", .{l});
+            return error.HarnessDoesNotReach;
+        }
+    }
 }
 
 test "corpus: every AEAD tuple reaches decrypt, and the opened count is pinned" {

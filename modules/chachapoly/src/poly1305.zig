@@ -1041,6 +1041,21 @@ test "fuzz: MAC agrees with std on arbitrary key/message" {
 }
 
 fn fuzzAgainstStd(_: void, smith: *std.testing.Smith) !void {
+    return macHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+const fuzz_driver = @import("testkit").fuzz.driver;
+const FuzzLabel = enum { empty_message, short_message, wide_message };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn mark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// Generic over its source (`Smith` under `--fuzz`, `fuzz_driver.Rng` under the driver).
+fn macHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [poly_key_len + 640]u8 = @splat(0);
     // ⚠ ONE `smith.slice` call, and it is the FIRST draw — the key and the
     // message are both carved out of it. It used to be `smith.bytes(&key)`,
@@ -1058,11 +1073,33 @@ fn fuzzAgainstStd(_: void, smith: *std.testing.Smith) !void {
     const msg: [640]u8 = buf[poly_key_len..].*;
     const len: usize = if (n > poly_key_len) n - poly_key_len else 0;
 
+    if (len == 0) mark(.empty_message) else if (len < 16 * 3 * lanes) mark(.short_message) else mark(.wide_message);
     var ours: [16]u8 = undefined;
     var theirs: [16]u8 = undefined;
     Poly1305.create(&ours, msg[0..len], &key);
     StdPoly.create(&theirs, msg[0..len], &key);
     try testing.expectEqualSlices(u8, &theirs, &ours);
+}
+
+test "fuzz driver: CHACHAPOLY_FUZZ (chachapoly-poly1305)" {
+    try fuzz_driver.run(macHarness, .{ .prefix = "CHACHAPOLY_FUZZ", .name = "chachapoly-poly1305" });
+}
+
+test "fuzz harness: 300 seeds in every test run, and they get everywhere" {
+    fuzz_reach = @splat(0);
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        macHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("chachapoly-poly1305 seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+    }
+    for (fuzz_reach, 0..) |n, i| if (n == 0) {
+        // The wide label needs a message of 48 * lanes octets; Rng.slice reaches it.
+        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 test "corpus: every seed reaches the MAC, and the message coverage is pinned" {

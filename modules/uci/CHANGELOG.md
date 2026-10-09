@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `UCI_FUZZ` over the existing harnesses.
 - **2026-10-06** — **FIX (behaviour change): `serialize` refuses an empty section type, section name or
   option key with `error.InvalidName`.** It used to write `config ''` / `option '' 'v'`, which the real
   libuci refuses as a whole file ("insufficient arguments") — one empty word made the config unloadable on

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `ACME_FUZZ` over the existing harnesses (parseOrder, parseAuthz, parseCsr also build a genuine response / signed CSR from the drawn octets: it must parse back to its fields; truncations, a trailing octet and any flipped CSR bit must be refused).
 - **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** dead-stack pass (`check-secret-api`). `jws.sign`, `x509.csrDer` and `x509.tlsAlpnCertDer` (all already took the key pair by pointer) now run under a 32 KiB burn (`burn.sign_burn`); `Client.init` carries a `secret-api-ok` marker (the `Client` holds the account key by design and is built in place). New `src/stackprobe2_test.zig` (testkit.stackprobe, ReleaseFast) probes the three signing entry points.
 
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** ES256 moved off

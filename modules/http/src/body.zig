@@ -322,17 +322,39 @@ const content_type_seeds = [_][]const u8{
     seed("application/json\t; charset=\tUTF-8\t"), // tabs are the other OWS byte
 };
 
+const fz = @import("fuzz_test.zig");
+const CtMark = fz.Marker(enum { rejected, parsed, with_params });
+const UrlMark = fz.Marker(enum { empty, pairs });
+
 test "fuzz: ContentType.parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzContentType, .{ .corpus = &content_type_seeds });
+    try testing.fuzz({}, fuzzContentTypeSmith, .{ .corpus = &content_type_seeds });
 }
 
-fn fuzzContentType(_: void, smith: *std.testing.Smith) !void {
-    var buf: [256]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+test "fuzz driver: HTTP_FUZZ (content-type)" {
+    try fz.fuzz_driver.run(fuzzContentType, .{ .prefix = "HTTP_FUZZ", .name = "http-content-type" });
+}
 
-    const ct = ContentType.parse(buf[0..len]) orelse return;
+test "fuzz harness: content-type, 300 seeds, reaches every outcome" {
+    try CtMark.reach(fuzzContentType, "http-content-type", 300);
+}
+
+fn fuzzContentTypeSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzContentType, smith, script[0..n]);
+}
+
+fn fuzzContentType(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [256]u8 = undefined;
+    const len: usize = fz.drawInput(S, src, &buf, &content_type_seeds);
+
+    const ct = ContentType.parse(buf[0..len]) orelse return CtMark.mark(.rejected);
+    CtMark.mark(.parsed);
     var it = ct.params();
-    while (it.next()) |_| {}
+    var any = false;
+    while (it.next()) |_| any = true;
+    if (any) CtMark.mark(.with_params);
 }
 
 test "corpus: every media-type seed reaches the parser, and the parameters walked are pinned" {
@@ -385,15 +407,32 @@ const urlencoded_seeds = [_][]const u8{
 };
 
 test "fuzz: urlencoded never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzUrlencoded, .{ .corpus = &urlencoded_seeds });
+    try testing.fuzz({}, fuzzUrlencodedSmith, .{ .corpus = &urlencoded_seeds });
 }
 
-fn fuzzUrlencoded(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: HTTP_FUZZ (urlencoded)" {
+    try fz.fuzz_driver.run(fuzzUrlencoded, .{ .prefix = "HTTP_FUZZ", .name = "http-urlencoded" });
+}
+
+test "fuzz harness: urlencoded, 300 seeds, reaches every outcome" {
+    try UrlMark.reach(fuzzUrlencoded, "http-urlencoded", 300);
+}
+
+fn fuzzUrlencodedSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzUrlencoded, smith, script[0..n]);
+}
+
+fn fuzzUrlencoded(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &urlencoded_seeds);
 
     var it = urlencoded(buf[0..len]);
-    while (it.next()) |_| {}
+    var pairs = false;
+    while (it.next()) |_| pairs = true;
+    if (pairs) UrlMark.mark(.pairs) else UrlMark.mark(.empty);
 }
 
 test "corpus: every urlencoded seed reaches the decoder, and the pairs yielded are pinned" {

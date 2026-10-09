@@ -961,26 +961,15 @@ test "fuzz: LineIterator never panics or loops on arbitrary bytes" {
 }
 
 fn fuzzLineIterator(_: void, smith: *std.testing.Smith) !void {
-    // ⚠ This used to be `smith.bytes(&buf)` followed by
-    // `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` consumes
-    // `min(buf.len, in.len)` octets and the ranged draw then reads eight MORE
-    // as a little-endian u64, returning the range minimum when fewer remain —
-    // so `len` was 0 on every input a seed can carry, `it.next()` returned null
-    // at once, and the `steps <= len + 1` assertion below had never executed.
+    // Bytes first, in one `slice` draw (see `fuzz_test.zig`): a ranged draw
+    // before them would collapse every seed to the empty record.
     var buf: [512]u8 = undefined;
     const len: usize = smith.slice(&buf);
-
-    for (fuzz_quotes) |quote| {
-        var it = LineIterator.init(buf[0..len], quote, 0);
-        // Every record consumes at least one byte plus its terminator, so the
-        // number of records is bounded by the input length.
-        var steps: usize = 0;
-        while (it.next()) |_| {
-            steps += 1;
-            try t.expect(steps <= len + 1);
-        }
-    }
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try fz.lineHarness(fz.ScriptSource, &src, t.allocator);
 }
+
+const fz = @import("fuzz_test.zig");
 
 test "corpus: every line seed reaches the iterator, and the records yielded are pinned" {
     // Records yielded is the second number: `LineIterator.init("")` is legal
@@ -1047,21 +1036,10 @@ test "fuzz: splitFields never panics on arbitrary bytes" {
 }
 
 fn fuzzSplitFields(_: void, smith: *std.testing.Smith) !void {
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-
-    // ⚠ Same collapse as the sibling: the length was 0 and both `delimiter`
-    // and `quote` were drawn after the bytes, so every seed reached
-    // `splitFields` as an empty record with delimiter 0 and quoting disabled.
     var line_buf: [256]u8 = undefined;
     const len: usize = smith.slice(&line_buf);
-
-    var fields_buf: [64][]const u8 = undefined;
-    for (fuzz_delims) |delimiter| {
-        for (fuzz_quotes) |quote| {
-            _ = splitFields(line_buf[0..len], &fields_buf, delimiter, quote, arena.allocator()) catch continue;
-        }
-    }
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = line_buf[0..len] } };
+    try fz.splitHarness(fz.ScriptSource, &src, t.allocator);
 }
 
 test "corpus: every field seed reaches splitFields, and the fields split are pinned" {

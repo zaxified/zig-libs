@@ -2027,15 +2027,20 @@ const RecordCorpus = struct {
     }
 };
 
-fn fuzzSessionRecordDecode(_: void, smith: *std.testing.Smith) !void {
+fn fuzzSessionRecordDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var record: [RecordCorpus.cap]u8 = undefined;
+    // ⚠ One byte-first draw. Never `bytes` then a ranged length.
+    const len: usize = src.slice(&record);
+    lookupRecord(record[0..len]);
+}
+
+fn lookupRecord(record: []const u8) void {
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var m = env.manager(.{ .idle = 10_000, .absolute = 100_000 }) catch @panic("fuzz: Manager.init");
 
-    // ⚠ One byte-first draw. Never `bytes` then a ranged length.
-    var record: [RecordCorpus.cap]u8 = undefined;
-    const len: usize = smith.slice(&record);
     // Bypass `seed`'s structured layout: put a fully arbitrary byte string
     // straight into the store under a fixed id, then decode it exactly like
     // a corrupted/attacker-controlled record would be decoded on `load`.
@@ -2043,14 +2048,18 @@ fn fuzzSessionRecordDecode(_: void, smith: *std.testing.Smith) !void {
     // length checks) — arbitrary bytes must only ever yield `.absent`/
     // `.expired`, never a panic or OOB write into `out`'s fixed buffers.
     const id = "fuzz-session-id";
-    _ = env.store.store().put(id, record[0..len], 0);
+    _ = env.store.store().put(id, record, 0);
     var out: Session = .{};
-    _ = m.lookup(id, &out);
+    switch (m.lookup(id, &out)) {
+        .loaded => fuzz_mark(.loaded),
+        .expired => fuzz_mark(.expired),
+        .absent => fuzz_mark(.absent),
+    }
 }
 
 test "fuzz: Manager.lookup's session-record decode never panics on arbitrary bytes" {
     var corpus: RecordCorpus = .{};
-    try testing.fuzz({}, fuzzSessionRecordDecode, .{ .corpus = corpus.build() });
+    try testing.fuzz({}, fuzzScript(fuzzSessionRecordDecode, RecordCorpus.cap), .{ .corpus = corpus.build() });
 }
 
 test "corpus: every record seed reaches lookup, and the payload octets copied are pinned" {
@@ -2123,20 +2132,24 @@ const cookie_header_seeds = [_][]const u8{
     fuzzSeed(""), // zero length: the ONLY input this target ever ran
 };
 
-fn fuzzCookieParse(_: void, smith: *std.testing.Smith) !void {
+fn fuzzCookieParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⚠ One byte-first draw. Never `bytes` then a ranged length.
     var header: [128]u8 = undefined;
-    const len: usize = smith.slice(&header);
+    const len: usize = src.slice(&header);
+    findCookie(header[0..len]);
+}
+
+fn findCookie(header: []const u8) void {
     // The Cookie request-header decoder this module relies on to find the
     // session id (`Manager.load` → `cookies.get` → `cookies.find`/`parse`):
     // arbitrary bytes must only ever yield null/a borrowed slice, never a
     // panic or OOB.
-    const v = cookies.find(header[0..len], default_cookie_name);
-    _ = v;
+    if (cookies.find(header, default_cookie_name) != null) fuzz_mark(.cookie_found) else fuzz_mark(.cookie_missing);
 }
 
 test "fuzz: cookie header parse (as used by Manager.load) never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzCookieParse, .{ .corpus = &cookie_header_seeds });
+    try testing.fuzz({}, fuzzScript(fuzzCookieParse, 128), .{ .corpus = &cookie_header_seeds });
 }
 
 test "corpus: every cookie seed reaches find, and the ids recovered are pinned" {
@@ -2362,4 +2375,125 @@ test "KvStore: once closed by a failed write, a readable record is still not ser
     try testing.expect((try env.db.getBuf(&vbuf, env.storeKey(&kbuf, s.id()))) != null); // non-vacuous
     var l: Session = .{};
     try testing.expectEqual(Manager.LoadResult.absent, m.lookup(s.id(), &l));
+}
+
+// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+//
+// The two harnesses above are generic over their source of choices
+// (`fn(comptime S, *S, gpa)`); `testing.fuzz` feeds them through `FuzzScript`,
+// `SESSIONS_FUZZ=<runs>[,<first seed>]` through testkit's driver (`_MS`,
+// `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there). They stay in this file
+// because `Env` and the corpora are private. Random bytes never form a valid
+// record or carry the cookie name, so each harness has a "mutated" twin: a
+// corpus entry, a few octets damaged, maybe cut short.
+
+const fuzz_driver = @import("testkit").fuzz.driver;
+
+const FuzzLabel = enum { absent, loaded, expired, cookie_found, cookie_missing };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn fuzz_mark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+const FuzzScript = struct {
+    cur: @import("testkit").fuzz.Cursor,
+
+    pub fn valueRangeAtMost(self: *FuzzScript, comptime T: type, at_least: T, at_most: T) T {
+        return @intCast(self.cur.ranged(at_least, at_most));
+    }
+    pub fn value(self: *FuzzScript, comptime T: type) T {
+        return switch (T) {
+            bool => self.cur.byte() & 1 == 1,
+            u8 => self.cur.byte(),
+            u16 => self.cur.word(),
+            else => @compileError("FuzzScript.value: unsupported type"),
+        };
+    }
+    pub fn bytes(self: *FuzzScript, buf: []u8) void {
+        for (buf) |*b| b.* = self.cur.byte();
+    }
+    pub fn index(self: *FuzzScript, len: usize) usize {
+        return self.cur.ranged(0, @intCast(len - 1));
+    }
+    /// What `Smith.slice` returns for this script: up to `buf.len` of the
+    /// remaining script bytes, and their count.
+    pub fn slice(self: *FuzzScript, buf: []u8) u32 {
+        const left = self.cur.bytes.len -| self.cur.at;
+        const n = @min(buf.len, left);
+        @memcpy(buf[0..n], self.cur.bytes[self.cur.at..][0..n]);
+        self.cur.at += n;
+        return @intCast(n);
+    }
+};
+
+/// `testing.fuzz`'s callback for a harness; `max` bounds the script (the
+/// first `slice` draw), which for the record decoder must hold a whole
+/// 4096-octet record.
+fn fuzzScript(comptime harness: anytype, comptime max: usize) fn (void, *std.testing.Smith) anyerror!void {
+    return struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            var script: [max]u8 = undefined;
+            const n = smith.slice(&script);
+            var src: FuzzScript = .{ .cur = .{ .bytes = script[0..n] } };
+            return harness(FuzzScript, &src, testing.allocator);
+        }
+    }.f;
+}
+
+/// A corpus entry with a few of its first octets damaged, maybe cut short.
+fn damaged(comptime S: type, src: *S, entries: []const []const u8, buf: []u8) []const u8 {
+    var smith: std.testing.Smith = .{ .in = entries[src.index(entries.len)] };
+    var len: usize = smith.slice(buf);
+    if (len == 0) return buf[0..0];
+    for (0..src.valueRangeAtMost(u8, 0, 3)) |_| buf[src.index(@min(len, 24))] = src.value(u8);
+    if (src.valueRangeAtMost(u8, 0, 3) == 0) len = src.index(len) + 1;
+    return buf[0..len];
+}
+
+fn fuzzSessionRecordMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: RecordCorpus = .{};
+    var record: [RecordCorpus.cap]u8 = undefined;
+    lookupRecord(damaged(S, src, corpus.build(), &record));
+}
+
+fn fuzzCookieMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var header: [128]u8 = undefined;
+    findCookie(damaged(S, src, &cookie_header_seeds, &header));
+}
+
+test "fuzz: session-record decode, damaged corpus records" {
+    try testing.fuzz({}, fuzzScript(fuzzSessionRecordMutated, 64), .{});
+}
+
+test "fuzz: cookie header parse, damaged corpus headers" {
+    try testing.fuzz({}, fuzzScript(fuzzCookieMutated, 64), .{});
+}
+
+test "fuzz driver: SESSIONS_FUZZ" {
+    try fuzz_driver.run(fuzzSessionRecordDecode, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-record" });
+    try fuzz_driver.run(fuzzSessionRecordMutated, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-record-mutated" });
+    try fuzz_driver.run(fuzzCookieParse, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-cookie" });
+    try fuzz_driver.run(fuzzCookieMutated, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-cookie-mutated" });
+}
+
+test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
+    fuzz_reach = @splat(0);
+    inline for (.{ fuzzSessionRecordDecode, fuzzSessionRecordMutated, fuzzCookieParse, fuzzCookieMutated }, 0..) |h, which| {
+        for (0..400) |sd| {
+            var prng = std.Random.DefaultPrng.init(sd);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print("sessions harness {d} seed {d}: {t}\n", .{ which, sd, err });
+                return err;
+            };
+        }
+    }
+    for (fuzz_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }

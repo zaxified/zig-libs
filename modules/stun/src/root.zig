@@ -1689,30 +1689,15 @@ test "fuzz: decode + every accessor never crash on arbitrary bytes" {
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
-    var packet: [1024]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
-    // length. `bytes` takes `@min(packet.len, in.len)` octets and the ranged
-    // draw then finds fewer than the eight it needs and returns the range
-    // MINIMUM — so `len` was 0 on every input, `decode` was handed `packet[0..0]`
-    // and returned `error.Truncated` immediately, with the message sitting
-    // unread in `packet`. Every accessor, both verifiers and the attribute walk
-    // below this line had never executed. Measured 2026-09-07 over the corpus
-    // above: **0 of 10 seeds non-empty and 0 decoded before, 10 of 10 non-empty
-    // and 6 decoded after, walking 15 attributes where the collapsed harness
-    // walked none.**
-    const len: usize = smith.slice(&packet);
-    const msg = decode(packet[0..len]) catch return;
-    // A successfully-decoded (but otherwise arbitrary) message must survive every
-    // accessor + the full attribute walk + both verifiers with no panic/OOB —
-    // decode borrows the input (no allocation), so there is nothing to free.
-    _ = msg.xorMappedAddress() catch {};
-    _ = msg.plainMappedAddress() catch {};
-    _ = msg.mappedAddress() catch {};
-    _ = msg.errorCode() catch {};
-    _ = msg.verifyFingerprint();
-    _ = msg.verifyMessageIntegrity("key");
-    var it = msg.attributes();
-    while (it.next()) |_| {}
+    // length (the ranged draw would find fewer than eight octets and return the
+    // range MINIMUM, so the message was never read; measured 2026-09-07).
+    // The harness body lives in `fuzz_test.zig`, generic over its source.
+    const ft = @import("fuzz_test.zig");
+    var script: [1024]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    var src: ft.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    try ft.decodeHarness(ft.ScriptSource, &src, testing.allocator);
 }
 
 test "corpus: every seed reaches decode, and the walk/accessor counts are pinned" {
@@ -1749,5 +1734,6 @@ test "corpus: every seed reaches decode, and the walk/accessor counts are pinned
 }
 
 test {
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }

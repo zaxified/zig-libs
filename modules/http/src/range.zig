@@ -778,16 +778,36 @@ const range_seeds = [_][]const u8{
     seed("bytes=-99999999999999999999999"), // a suffix length that overflows u64
 };
 
+const fz = @import("fuzz_test.zig");
+const RangeMark = fz.Marker(enum { rejected, parsed, several });
+
 test "fuzz: Range header parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzRangeParse, .{ .corpus = &range_seeds });
+    try testing.fuzz({}, fuzzRangeParseSmith, .{ .corpus = &range_seeds });
 }
 
-fn fuzzRangeParse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: HTTP_FUZZ (range)" {
+    try fz.fuzz_driver.run(fuzzRangeParse, .{ .prefix = "HTTP_FUZZ", .name = "http-range" });
+}
+
+test "fuzz harness: range parse, 300 seeds, reaches every outcome" {
+    try RangeMark.reach(fuzzRangeParse, "http-range", 300);
+}
+
+fn fuzzRangeParseSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzRangeParse, smith, script[0..n]);
+}
+
+fn fuzzRangeParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &range_seeds);
 
     var out: [default_max_ranges]ByteRangeSpec = undefined;
-    _ = parse(buf[0..len], &out) catch return;
+    const specs = parse(buf[0..len], &out) catch return RangeMark.mark(.rejected);
+    RangeMark.mark(.parsed);
+    if (specs.len > 1) RangeMark.mark(.several);
 }
 
 test "corpus: every Range seed reaches the parser, and the specs decoded are pinned" {

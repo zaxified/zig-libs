@@ -899,7 +899,7 @@ fn findKeyColon(input: []const u8, from: usize) usize {
 /// a wall-clock ratio in the Debug lane is drowned by allocator noise, and a
 /// timing test that cannot tell the fixed code from the broken code is not a
 /// test (W2 re-audit 2026-09-02, `json5` F3).
-pub var line_scan_bytes: usize = 0;
+var line_scan_bytes: usize = 0;
 
 fn lineOf(input: []const u8, pos: usize) usize {
     const end = @min(pos, input.len);
@@ -2004,11 +2004,10 @@ test "fuzz: preprocess never panics on arbitrary bytes" {
 }
 
 fn fuzzPreprocess(_: void, smith: *std.testing.Smith) !void {
-    const alloc = std.testing.allocator;
     var buf: [512]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    const out = preprocess(alloc, buf[0..len]) catch return;
-    alloc.free(out);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try fz.preprocessHarness(fz.ScriptSource, &src, std.testing.allocator);
 }
 
 test "corpus: every seed reaches both entry points, and the rewriting they do is pinned" {
@@ -2066,51 +2065,21 @@ test "fuzz: preprocessAnnotated never panics on arbitrary bytes" {
 }
 
 fn fuzzPreprocessAnnotated(_: void, smith: *std.testing.Smith) !void {
-    const alloc = std.testing.allocator;
     var buf: [512]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    const input = buf[0..len];
-    const r = preprocessAnnotated(alloc, input) catch return;
-    defer alloc.free(r.out);
-
-    // The ORACLE, which this target did not have: "does not panic" is
-    // `preprocess`'s contract, not this one's. What a caller relies on here
-    // is that turning diagnostics on does not change whether the document
-    // parses — the two entry points must agree. Asserting "the output is
-    // always valid JSON" instead would be asserting something untrue and
-    // untrueable: empty input, and every JSON5 construct this module defers,
-    // are passed through for `std.json` to reject on purpose
-    // (W2 re-audit 2026-09-02, `json5` F2).
-    const plain = preprocess(alloc, input) catch return;
-    defer alloc.free(plain);
-    const ann_ok = jsonParses(alloc, r.out);
-    const plain_ok = jsonParses(alloc, plain);
-    if (ann_ok != plain_ok) {
-        std.debug.print(
-            "\nentry points disagree on {f}\n  preprocess ({}): {f}\n  annotated  ({}): {f}\n",
-            .{
-                std.ascii.hexEscape(input, .lower),
-                plain_ok,
-                std.ascii.hexEscape(plain, .lower),
-                ann_ok,
-                std.ascii.hexEscape(r.out, .lower),
-            },
-        );
-        return error.EntryPointsDisagree;
-    }
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try fz.annotatedHarness(fz.ScriptSource, &src, std.testing.allocator);
 }
 
-fn jsonParses(alloc: std.mem.Allocator, text: []const u8) bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{
-        .duplicate_field_behavior = .use_last,
-    }) catch return false;
-    parsed.deinit();
-    return true;
-}
+// The harness bodies (generic over their source) and the driver tests live in
+// `fuzz_test.zig`.
+const fz = @import("fuzz_test.zig");
+const jsonParses = fz.jsonParses;
 
 // ── external anchor: json5/json5-tests corpus ───────────────────────────────
 // See json5_tests_test.zig / json5_tests_vectors.zig / NOTICE.
 test {
+    _ = @import("fuzz_test.zig");
     _ = @import("json5_tests_vectors.zig");
     _ = @import("json5_tests_test.zig");
     _ = @import("ref_oracle_test.zig");

@@ -561,16 +561,17 @@ test "value codec round trip incl. non-finite samples" {
 // CLASS C ("no wire interop") notwithstanding.
 
 fn fuzzParseCanonical(_: void, smith: *std.testing.Smith) !void {
-    const gpa = std.testing.allocator;
-    var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
     // latter drew `len == 0` on every input this target ever ran outside
     // `--fuzz` (a ranged draw needs eight octets and `bytes` had eaten them),
     // so `parseCanonical` was handed a zero-length slice every round and
     // failed at `takeLenPrefixed` with the descriptor unread in `buf`.
-    const len: usize = smith.slice(&buf);
-    var d = parseCanonical(gpa, buf[0..len]) catch return;
-    d.deinit(gpa);
+    // The harness body lives in `fuzz_test.zig`, generic over its source.
+    const ft = @import("fuzz_test.zig");
+    var script: [256]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    var src: ft.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    try ft.parseCanonicalHarness(ft.ScriptSource, &src, std.testing.allocator);
 }
 
 /// ⛔ Built from `canonicalize`, the module's own encoder: a canonical
@@ -672,11 +673,13 @@ const point_key_seeds = [_][]const u8{
 };
 
 fn fuzzDecodePointKey(_: void, smith: *std.testing.Smith) !void {
-    var buf: [64]u8 = undefined;
     // ⚠ Same as above: this target's length draw was 0 on every input, so
     // `decodePointKey` never saw a key of the one length it accepts.
-    const len: usize = smith.slice(&buf);
-    _ = decodePointKey(buf[0..len]);
+    const ft = @import("fuzz_test.zig");
+    var script: [64]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    var src: ft.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    try ft.decodePointKeyHarness(ft.ScriptSource, &src, std.testing.allocator);
 }
 
 test "fuzz: decodePointKey never panics on arbitrary bytes" {

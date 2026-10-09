@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `TSDB_FUZZ` over the existing harnesses.
+
 - **2026-10-04** — ADDED, no format break: sample compression and series deletion (survey
   2026-09-30 gaps). `Db.compact(before, opts)` packs raw samples below a horizon into
   Gorilla blocks (`chunk.zig`: delta-of-delta timestamps, XOR'd values, ≤ 1024 samples / 1 KiB)

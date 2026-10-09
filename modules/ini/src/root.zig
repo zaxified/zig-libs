@@ -451,6 +451,7 @@ const testing = std.testing;
 
 test {
     _ = @import("oracle_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "an mc skin: sections, later lines win, `;` inside values" {
@@ -726,48 +727,13 @@ test "fuzz: parse never panics; a lenient parse never fails; strict agrees with 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [1024]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    _ = try checkAllPresets(buf[0..len]);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try fz.parseHarness(fz.ScriptSource, &src, testing.allocator);
 }
 
-/// Parse `text` with every preset, strict and lenient, and check what must
-/// hold whatever the input: lenient never fails (short of memory); when
-/// strict succeeds, lenient produced the same document and skipped nothing;
-/// every line number is inside the text. Returns how many strict parses
-/// succeeded.
+const fz = @import("fuzz_test.zig");
 fn checkAllPresets(text: []const u8) !usize {
-    const line_count = std.mem.count(u8, text, "\n") + 1;
-    var ok: usize = 0;
-    for ([_]Options{ .{}, .python, .desktop, .{ .inline_comments = true } }) |base| {
-        var lax_opts = base;
-        lax_opts.strict = false;
-        var lax = try parse(testing.allocator, text, lax_opts);
-        defer lax.deinit();
-        for (lax.skipped) |l| try testing.expect(l >= 1 and l <= line_count);
-        for (lax.sections) |s| {
-            try testing.expect(s.line <= line_count);
-            for (s.entries) |e| {
-                try testing.expect(e.line >= 1 and e.line <= line_count);
-                try testing.expect(e.key.len > 0);
-            }
-        }
-        var strict = parse(testing.allocator, text, base) catch |e| switch (e) {
-            error.OutOfMemory => return e,
-            else => continue,
-        };
-        defer strict.deinit();
-        ok += 1;
-        try testing.expectEqual(@as(usize, 0), lax.skipped.len);
-        try testing.expectEqual(lax.sections.len, strict.sections.len);
-        for (lax.sections, strict.sections) |x, y| {
-            try testing.expectEqualStrings(x.name, y.name);
-            try testing.expectEqual(x.entries.len, y.entries.len);
-            for (x.entries, y.entries) |ex, ey| {
-                try testing.expectEqualStrings(ex.key, ey.key);
-                try testing.expectEqualStrings(ex.value, ey.value);
-            }
-        }
-    }
-    return ok;
+    return fz.checkAllPresets(testing.allocator, text);
 }
 
 test "corpus: every seed reaches parse, and how many strict parses succeed is pinned" {

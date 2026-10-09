@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `TRACEROUTE_FUZZ` over the existing harness (the hop state machine on arbitrary and on damaged ICMP packet streams); `testkit` added to its test deps.
+
 - **2026-10-05** — **Anchoring: real routers judge `trace`, and `traceWith` replays their packets**
   (`tools/kernel_oracle.py`, `tools/interop.zig`, `src/kernel_oracle_test.zig`): 16 live traces through a client ->
   r1 -> r2 -> r3 -> server chain of network namespaces (`unshare -rmn`) -- clean, a router dropping its Time

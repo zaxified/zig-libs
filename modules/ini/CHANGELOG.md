@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `INI_FUZZ` over the existing harnesses.
 - **2026-10-03** — Audit: review and a 77-mutant run (all killed; 17 survived the first pass).
   Seven tests added for the gaps (locale-key rule, inline comments after a tab and without
   `trim_values`, `unquote` and `unescapeDesktop` escapes, `getBool` words, `case_insensitive_keys`,

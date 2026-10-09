@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `BLOBMSG_FUZZ` over the existing harnesses (`codec`, `encode`), each with a `-mutated` twin (a valid image or JSON text from the corpus, damaged), because random octets never pass the walker's length checks nor parse as a JSON object.
 - **2026-10-06** — **FIX (behaviour change), the JSON codec now agrees with libubox's own** (found by the
   new libubox oracle, `tools/libubox_oracle.py` → `src/libubox_oracle_test.zig`):
   - `encodeArgs`/`encodeJson` encode a JSON `null` as a value-less `BM.UNSPEC` (id 0) field, as

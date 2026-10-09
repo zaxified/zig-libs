@@ -1740,6 +1740,7 @@ pub const Live = struct {
 const testing = std.testing;
 
 test {
+    _ = @import("fuzz_test.zig");
     _ = @import("go_oracle_test.zig");
 }
 
@@ -1897,27 +1898,15 @@ test "fuzz: sanitizePath's traversal-safety contract holds for arbitrary bytes" 
 fn fuzzSanitizePath(_: void, smith: *testing.Smith) !void {
     // ⚠ One `smith.slice` call: bytes and length in a single draw, so every
     // mutated byte really does land inside the slice `sanitizePath` sees.
-    var raw_buf: [4096]u8 = undefined;
-    const raw_len: usize = smith.slice(&raw_buf);
-    const raw = raw_buf[0..raw_len];
-    const allow_dotfiles = smith.value(bool);
-
-    var out: [max_path_bytes]u8 = undefined;
-    const clean = sanitizePath(raw, &out, .{ .allow_dotfiles = allow_dotfiles }) catch return;
-
-    // An empty result is a valid outcome (the doc comment: "means the
-    // request targets the root directory itself") -- not a segment to check.
-    if (clean.len == 0) return;
-    try testing.expect(clean[0] != '/');
-    try testing.expect(clean[clean.len - 1] != '/');
-    var it = mem.splitScalar(u8, clean, '/');
-    while (it.next()) |seg| {
-        try testing.expect(seg.len != 0);
-        try testing.expect(!mem.eql(u8, seg, "."));
-        try testing.expect(!mem.eql(u8, seg, ".."));
-        if (!allow_dotfiles) try testing.expect(seg[0] != '.');
-        for (seg) |c| try testing.expect(c != 0 and c != '\\');
-    }
+    // The harness body lives in `fuzz_test.zig`, generic over its source; the
+    // wrapper draws the bytes first, then what the body reads from the source.
+    const ft = @import("fuzz_test.zig");
+    var script: [4096]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    const dotfiles = smith.value(bool);
+    const shape = smith.valueRangeAtMost(u8, 0, 1);
+    var src: ft.ScriptSource = .{ .cur = .{ .bytes = script[0..n] }, .dotfiles = dotfiles, .shape = shape };
+    try ft.sanitizePathHarness(ft.ScriptSource, &src, testing.allocator);
 }
 
 test "corpus: every path seed reaches sanitizePath, and the counts are pinned" {

@@ -758,20 +758,11 @@ test "fuzz: find never panics, arbitrary or real zone-name bytes" {
 
 fn fuzzFindNeverPanics(_: void, smith: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
-    // ⚠ One `smith.slice` call, and it is the FIRST draw. It used to go
-    // through `buildZoneName`, which opened with
-    // `smith.valueRangeAtMost(u8, 0, 2)` — a ranged draw, which reads eight
-    // octets as a little-endian u64 and returns the range MINIMUM unless that
-    // whole word lands inside the range. Outside `--fuzz` it was therefore
-    // always 0, i.e. the "copy a real zone name" branch, and `smith.index`
-    // right after it was 0 too, so `find` was called with
-    // `"Africa/Abidjan"` — the FIRST table entry — and nothing else, ever.
-    // The comment promising "one draw in three copies a real zone name"
-    // described a distribution that never existed. Measured 2026-09-07 over
-    // the corpus above: **1 distinct name and 1 table hit before; 11 of 12
-    // seeds non-empty, 12 distinct names and 6 hits after.**
+    // ⚠ One `smith.slice` call, and it is the FIRST draw (a ranged draw first
+    // collapsed every seed to the table's first entry).
     const len: usize = smith.slice(&buf);
-    _ = find(buf[0..len]);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try fz.findHarness(fz.ScriptSource, &src, std.testing.allocator);
 }
 
 test "corpus: every zone name reaches find, and the hit count is pinned" {
@@ -838,110 +829,22 @@ test "fuzz: offsetAt's POSIX-TZ footer parser never panics, arbitrary or footer-
     try std.testing.fuzz({}, fuzzPosixFooterNeverPanics, .{ .corpus = &posix_footer_corpus });
 }
 
-fn zoneWithFooter(posix: []const u8) Zone {
-    return .{
-        .name = "Fuzz/Zone",
-        .init_off = 0,
-        .init_dst = false,
-        .trans = &[_]Transition{},
-        .posix = posix,
-    };
-}
-
-/// A wide but bounded instant, in whole years, derived from the drawn bytes.
-/// Far enough past/before epoch to reach every rule form's year math without
-/// courting unrelated `i64*86400` overflow in datefmt, which is not this
-/// module's decode surface.
-fn footerInstant(cur: *tkfuzz.Cursor) i64 {
-    // ⚠ Two components, not one. A whole-year step alone lands every instant
-    // within a few days of January, which is never DST in the northern
-    // hemisphere — the day-of-year term is what makes the summer branch of a
-    // `M3.5.0,M10.5.0` rule reachable at all.
-    const years = @as(i64, cur.ranged(0, 200)) - 100;
-    const days = @as(i64, cur.ranged(0, 364));
-    return years * (365 * 86400) + days * 86400;
-}
-
 fn fuzzPosixFooterNeverPanics(_: void, smith: *std.testing.Smith) !void {
     var buf: [128]u8 = undefined;
     // ⚠ One `smith.slice` call, and it is the FIRST draw — see the corpus
     // comment above for what the old first draw did to the six real footers
     // that were already sitting there.
     const len: usize = smith.slice(&buf);
-    const drawn = buf[0..len];
-    var cur: tkfuzz.Cursor = .{ .bytes = drawn };
-
-    // (a) The drawn bytes AS a footer, verbatim. This is what the corpus of
-    // real POSIX-TZ strings is for, and it is the pass that never ran.
-    const z = zoneWithFooter(drawn);
-    _ = offsetAt(&z, footerInstant(&cur));
-
-    // (b) The same bytes as a SCRIPT for the grammar generator, so the
-    // structured shapes arbitrary bytes never spell still get built. ⚠ The
-    // generator's choices come from the `Cursor`, not from draws after the
-    // byte draw — every one of those was its range minimum on a replay, so
-    // the generator emitted one fixed string when it ran at all.
-    var gen_buf: [128]u8 = undefined;
-    const gen = buildPosixFooter(&cur, &gen_buf);
-    const gz = zoneWithFooter(gen);
-    _ = offsetAt(&gz, footerInstant(&cur));
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try fz.footerHarness(fz.ScriptSource, &src, std.testing.allocator);
 }
 
-/// Assembles `stdoffset[dst[offset][,start[/time],end[/time]]]` — the grammar
-/// `posixOffset` walks — with each optional piece independently present or
-/// absent, so both the "no DST" short-circuit and the full two-rule path get
-/// exercised, not just whichever one arbitrary bytes happen to stumble into.
-fn buildPosixFooter(cur: *tkfuzz.Cursor, buf: []u8) []const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    writeAbbrev(cur, &w);
-    writeFooterOffset(cur, &w);
-    if (cur.byte() & 1 == 0) return w.buffered();
-    writeAbbrev(cur, &w);
-    if (cur.byte() & 1 == 1) writeFooterOffset(cur, &w);
-    if (cur.byte() & 1 == 0) return w.buffered();
-    w.writeByte(',') catch return w.buffered();
-    writeRuleText(cur, &w);
-    writeRuleTimeText(cur, &w);
-    w.writeByte(',') catch return w.buffered();
-    writeRuleText(cur, &w);
-    writeRuleTimeText(cur, &w);
-    return w.buffered();
-}
-
-fn writeAbbrev(cur: *tkfuzz.Cursor, w: *std.Io.Writer) void {
-    const letters = "ABCXYZ";
-    const len = cur.ranged(1, 4);
-    var i: u32 = 0;
-    while (i < len) : (i += 1) {
-        w.writeByte(letters[cur.ranged(0, letters.len - 1)]) catch return;
-    }
-}
-
-fn writeFooterOffset(cur: *tkfuzz.Cursor, w: *std.Io.Writer) void {
-    if (cur.byte() & 1 == 1) w.writeByte(if (cur.byte() & 1 == 1) '+' else '-') catch return;
-    w.print("{d}", .{cur.ranged(0, 23)}) catch return;
-    if (cur.byte() & 1 == 0) return;
-    w.print(":{d:0>2}", .{cur.ranged(0, 59)}) catch return;
-    if (cur.byte() & 1 == 1) w.print(":{d:0>2}", .{cur.ranged(0, 59)}) catch return;
-}
-
-fn writeRuleText(cur: *tkfuzz.Cursor, w: *std.Io.Writer) void {
-    switch (cur.ranged(0, 2)) {
-        0 => w.print("M{d}.{d}.{d}", .{
-            cur.ranged(1, 12),
-            cur.ranged(1, 5),
-            cur.ranged(0, 6),
-        }) catch {},
-        1 => w.print("J{d}", .{cur.ranged(1, 365)}) catch {},
-        else => w.print("{d}", .{cur.ranged(0, 365)}) catch {},
-    }
-}
-
-fn writeRuleTimeText(cur: *tkfuzz.Cursor, w: *std.Io.Writer) void {
-    if (cur.byte() & 1 == 0) return;
-    w.writeByte('/') catch return;
-    writeFooterOffset(cur, w);
-}
+// The harness bodies (generic over their source) and the driver tests live in
+// `fuzz_test.zig`.
+const fz = @import("fuzz_test.zig");
+const zoneWithFooter = fz.zoneWithFooter;
+const footerInstant = fz.footerInstant;
+const buildPosixFooter = fz.buildPosixFooter;
 
 test "corpus: every footer reaches offsetAt, and the generator actually varies" {
     // ⭐ The measurement, executable rather than written in a comment.
@@ -996,5 +899,6 @@ test "corpus: every footer reaches offsetAt, and the generator actually varies" 
 }
 
 test {
+    _ = @import("fuzz_test.zig");
     _ = @import("posix_test.zig");
 }

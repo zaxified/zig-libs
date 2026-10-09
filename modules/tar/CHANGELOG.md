@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `TAR_FUZZ` over the existing harnesses (`reader`, plus `mutated`: a `Writer`-built archive, damaged, because random octets never pass `verifyChecksum`).
 - **2026-10-05** — **Fixes** found by a Go archive/tar differential oracle (`tools/go_oracle/`,
   replayed by `src/go_oracle.zig`, re-taken by `zig build interop-tar`): GNU/star base-256 is now read in
   every numeric field, not only `size` — a uid over 2 097 151 from `tar --format=gnu` was read as 0

@@ -1686,9 +1686,20 @@ fn walkExprs(buf: []const u8) !ExprTally {
     return t;
 }
 
+const fz = @import("fuzz_test.zig");
+const ExprMark = fz.Marker(enum { nothing, exprs, inner, verdicts });
+
 test "fuzz: the expression walker never crashes, loops or over-reads" {
     var corpus: ExprCorpus = .{};
-    try testing.fuzz({}, fuzzExprWalk, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzExprWalkSmith, .{ .corpus = try corpus.build() });
+}
+
+test "fuzz driver: NFTABLES_FUZZ (expression walker)" {
+    try fz.fuzz_driver.run(fuzzExprWalk, .{ .prefix = "NFTABLES_FUZZ", .name = "nftables-expr" });
+}
+
+test "fuzz harness: expression walker, 300 seeds, reaches every outcome" {
+    try ExprMark.reach(fuzzExprWalk, "nftables-expr", 300);
 }
 
 test "corpus: every expression seed reaches the walker, and the counts are pinned" {
@@ -1722,7 +1733,14 @@ test "corpus: every expression seed reaches the walker, and the counts are pinne
     try testing.expectEqual(@as(usize, 4), total.verdicts);
 }
 
-fn fuzzExprWalk(_: void, smith: *std.testing.Smith) !void {
+fn fuzzExprWalkSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzExprWalk, smith, script[0..n]);
+}
+
+fn fuzzExprWalk(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // 2048, not 512: a `Program` with a set lookup and a masked compare in it
     // already runs past 512, and a seed longer than the buffer is not a big
     // seed — `Smith.slice` reads it back as the EMPTY one.
@@ -1739,24 +1757,29 @@ fn fuzzExprWalk(_: void, smith: *std.testing.Smith) !void {
     // and 0 verdicts decoded before; 9 of 10 non-empty (one seed IS the empty
     // nest), 22 expressions walked, 56 inner attributes read and 4 verdicts
     // decoded, after.**
-    const len: usize = smith.slice(&raw);
+    var cstore: ExprCorpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) (cstore.build() catch &.{}) else &.{};
+    const len: usize = fz.drawInput(S, smith, &raw, entries);
     const buf = raw[0..len];
 
     var steps: usize = 0;
     var it: ExprIterator = .{ .attrs = .{ .buf = buf } };
     while (it.next() catch null) |v| {
         steps += 1;
+        ExprMark.mark(.exprs);
         try testing.expect(steps <= buf.len / 4 + 1);
-        _ = decodeVerdict(v.data) catch {};
+        if (decodeVerdict(v.data)) |_| ExprMark.mark(.verdicts) else |_| {}
         var inner = v.attrs();
         var isteps: usize = 0;
         while (inner.next() catch null) |a| {
             isteps += 1;
+            ExprMark.mark(.inner);
             try testing.expect(isteps <= v.data.len / 4 + 1);
             _ = a.asBe32() catch {};
             _ = a.asString();
         }
     }
+    if (steps == 0) ExprMark.mark(.nothing);
 }
 
 test "a payload set lookup is bounded like its two cmp siblings" {

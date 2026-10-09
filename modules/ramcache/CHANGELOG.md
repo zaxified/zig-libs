@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `RAMCACHE_FUZZ` over the existing harnesses.
+
 - **2026-10-04** — Fix (**BEHAVIOURAL**): `Sharded.stats()` now reports `rehashes` (it was
   silently always 0 because the aggregator never added the field).
 - **2026-10-04** — Tests: mutation run (60 mutants, 58 killed, 2 unpinned heuristic boundaries)

@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `AAA_GATE_FUZZ` over the existing harnesses (bearer token,
+  bearer value, API key, query value, client key).
+
 - **2026-10-04** — Tests: mutation schemata run (43 mutants, 42 killed, 1 equivalent).
   Four new tests: an `api_key_verify` callback alone keeps the api-key plane closed, the
   denied-audit fold count resets after each admitted entry, `Bearer` followed only by

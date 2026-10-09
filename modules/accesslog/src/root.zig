@@ -1446,7 +1446,7 @@ const fuzz_field_max = 32;
 /// `fuzzCase` writes that encoding and the "corpus really reaches the fields"
 /// test below pins the decode, so a change to this order goes red instead of
 /// silently degenerating the corpus back to nothing.
-fn fuzzEntry(smith: *std.testing.Smith, pool: *[10 * fuzz_field_max]u8) Entry {
+fn fuzzEntry(comptime S: type, smith: *S, pool: *[10 * fuzz_field_max]u8) Entry {
     var flags: [1]u8 = undefined;
     smith.bytes(&flags);
 
@@ -1593,7 +1593,7 @@ test "fuzz corpus: the written inputs really reach the fields that matter" {
 
     // The first entry decodes to precisely what `fuzzCase` was handed.
     var smith: std.testing.Smith = .{ .in = fuzz_corpus[0] };
-    const first = fuzzEntry(&smith, &pool);
+    const first = fuzzEntry(std.testing.Smith, &smith, &pool);
     try testing.expectEqualStrings("\xff", first.time_formatted.?);
     try testing.expectEqualStrings("\x80", first.remote_addr.?);
     try testing.expectEqualStrings("GET", first.method);
@@ -1605,7 +1605,7 @@ test "fuzz corpus: the written inputs really reach the fields that matter" {
 
     // …and the absent-optionals entry really leaves them absent.
     var smith2: std.testing.Smith = .{ .in = fuzz_corpus[5] };
-    const bare = fuzzEntry(&smith2, &pool);
+    const bare = fuzzEntry(std.testing.Smith, &smith2, &pool);
     try testing.expectEqual(@as(?[]const u8, null), bare.user_agent);
     try testing.expectEqual(@as(?[]const u8, null), bare.remote_addr);
     try testing.expectEqual(@as(?u64, null), bare.latency_ns);
@@ -1617,7 +1617,7 @@ test "fuzz corpus: the written inputs really reach the fields that matter" {
     var any_all_valid = false;
     for (fuzz_corpus) |input| {
         var s: std.testing.Smith = .{ .in = input };
-        const e = fuzzEntry(&s, &pool);
+        const e = fuzzEntry(std.testing.Smith, &s, &pool);
         const slots = [9]?[]const u8{
             e.method,     e.target,  e.protocol,   e.remote_addr,
             e.user_agent, e.referer, e.request_id, e.trace_id,
@@ -1649,7 +1649,7 @@ test "corpus: the numeric tail is alive, and the drawn values are pinned" {
     var widest_json: usize = 0;
     for (fuzz_corpus) |input| {
         var s: std.testing.Smith = .{ .in = input };
-        const e = fuzzEntry(&s, &pool);
+        const e = fuzzEntry(std.testing.Smith, &s, &pool);
         if (e.status != 0) nonzero_status += 1;
         if (e.timestamp_ns < 0) negative_ts += 1;
         if (e.latency_ns) |l| {
@@ -1679,8 +1679,25 @@ test "fuzz: JSON Lines always parses, whatever bytes the fields carry" {
 }
 
 fn fuzzJsonLines(_: void, smith: *std.testing.Smith) !void {
+    try jsonLinesHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+const testkit = @import("testkit");
+const fuzz_driver = testkit.fuzz.driver;
+
+const FuzzLabel = enum { exact_roundtrip, replacement, optional_null, optional_present };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn mark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// The harness bodies are generic over their source of choices: `testing.fuzz`
+/// hands them a `*Smith`, the deterministic driver a `*fuzz_driver.Rng`.
+fn jsonLinesHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var pool: [10 * fuzz_field_max]u8 = undefined;
-    const entry = fuzzEntry(smith, &pool);
+    const entry = fuzzEntry(S, smith, &pool);
 
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -1696,7 +1713,7 @@ fn fuzzJsonLines(_: void, smith: *std.testing.Smith) !void {
     // on unparseable output as long as it could explain why.
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
-        testing.allocator,
+        gpa,
         out[0 .. out.len - 1],
         .{},
     );
@@ -1713,8 +1730,14 @@ fn fuzzJsonLines(_: void, smith: *std.testing.Smith) !void {
         .{ .k = "request_id", .v = entry.request_id },
     };
     for (opts) |o| switch (obj.get(o.k).?) {
-        .null => try testing.expectEqual(@as(?[]const u8, null), o.v),
-        .string => |s| try expectFieldPolicy(o.v.?, s),
+        .null => {
+            try testing.expectEqual(@as(?[]const u8, null), o.v);
+            mark(.optional_null);
+        },
+        .string => |s| {
+            try expectFieldPolicy(o.v.?, s);
+            mark(.optional_present);
+        },
         else => return error.TestUnexpectedResult,
     };
 }
@@ -1729,7 +1752,9 @@ fn expectFieldPolicy(in: []const u8, got: []const u8) !void {
     try testing.expect(std.unicode.utf8ValidateSlice(got));
     if (std.unicode.utf8ValidateSlice(in)) {
         try testing.expectEqualStrings(in, got);
+        mark(.exact_roundtrip);
     } else {
+        mark(.replacement);
         try testing.expect(std.mem.indexOf(u8, got, replacement) != null);
         try testing.expect(got.len <= in.len * replacement.len);
     }
@@ -1740,8 +1765,13 @@ test "fuzz: logfmt stays one line with no raw control byte" {
 }
 
 fn fuzzLogfmt(_: void, smith: *std.testing.Smith) !void {
+    try logfmtHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+fn logfmtHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var pool: [10 * fuzz_field_max]u8 = undefined;
-    const entry = fuzzEntry(smith, &pool);
+    const entry = fuzzEntry(S, smith, &pool);
 
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -1756,8 +1786,13 @@ test "fuzz: Combined stays one line with no raw control byte" {
 }
 
 fn fuzzCombined(_: void, smith: *std.testing.Smith) !void {
+    try combinedHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+fn combinedHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var pool: [10 * fuzz_field_max]u8 = undefined;
-    const entry = fuzzEntry(smith, &pool);
+    const entry = fuzzEntry(S, smith, &pool);
 
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -1765,6 +1800,36 @@ fn fuzzCombined(_: void, smith: *std.testing.Smith) !void {
     const out = w.buffered();
     try expectOneLine(out);
     for (out[0 .. out.len - 1]) |c| try testing.expect(c >= 0x20 and c != 0x7F);
+}
+
+test "fuzz driver: ACCESSLOG_FUZZ (jsonlines)" {
+    try fuzz_driver.run(jsonLinesHarness, .{ .prefix = "ACCESSLOG_FUZZ", .name = "accesslog-jsonlines" });
+}
+
+test "fuzz driver: ACCESSLOG_FUZZ (logfmt)" {
+    try fuzz_driver.run(logfmtHarness, .{ .prefix = "ACCESSLOG_FUZZ", .name = "accesslog-logfmt" });
+}
+
+test "fuzz driver: ACCESSLOG_FUZZ (combined)" {
+    try fuzz_driver.run(combinedHarness, .{ .prefix = "ACCESSLOG_FUZZ", .name = "accesslog-combined" });
+}
+
+test "fuzz harnesses: 300 seeds each in every test run, and they get everywhere" {
+    fuzz_reach = @splat(0);
+    inline for (.{ jsonLinesHarness, logfmtHarness, combinedHarness }, 0..) |h, which| {
+        for (0..300) |seed| {
+            var prng = std.Random.DefaultPrng.init(seed);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print("accesslog harness {d} seed {d}: {t}\n", .{ which, seed, err });
+                return err;
+            };
+        }
+    }
+    for (fuzz_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 // ── UTF-8 sanitization: the "always readable" requirement ────────────────

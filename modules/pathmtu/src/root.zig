@@ -1465,12 +1465,13 @@ test "golden: real-capture fixture size canary" {
 // -- fuzz: classify never panics on arbitrary bytes --------------------------
 
 test "fuzz: classify never panics on arbitrary packets" {
-    try testing.fuzz({}, fuzzClassify, .{});
+    try testing.fuzz({}, fuzzScript(fuzzClassify), .{});
 }
 
-fn fuzzClassify(_: void, smith: *std.testing.Smith) !void {
+fn fuzzClassify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
+    src.bytes(&buf);
 
     // ⚠ Length, ident and seq are read OUT OF THE BYTES, never drawn from a
     // range, and that is not a style choice. A `Smith` ranged draw consumes 8
@@ -1488,9 +1489,124 @@ fn fuzzClassify(_: void, smith: *std.testing.Smith) !void {
     const ident = std.mem.readInt(u16, control[2..4], .little);
     const seq = std.mem.readInt(u16, control[4..6], .little);
 
-    _ = classify(.v4, false, body[0..len], ident, seq);
-    _ = classify(.v4, true, body[0..len], ident, seq);
-    _ = classify(.v6, false, body[0..len], ident, seq);
+    classifyAll(body[0..len], ident, seq);
+}
+
+fn classifyAll(packet: []const u8, ident: u16, seq: u16) void {
+    for ([_]?Classified{
+        classify(.v4, false, packet, ident, seq),
+        classify(.v4, true, packet, ident, seq),
+        classify(.v6, false, packet, ident, seq),
+    }) |c| if (c != null) fuzz_mark(.matched) else fuzz_mark(.rejected);
+}
+
+// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+//
+// `fuzzClassify` is generic over its source of choices
+// (`fn(comptime S, *S, gpa)`); `testing.fuzz` feeds it through `FuzzScript`,
+// `PATHMTU_FUZZ=<runs>[,<first seed>]` through testkit's driver (`_MS`,
+// `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there). It stays in this file
+// because `classify` and the captures are private. Random bytes never carry
+// the probe's ident and seq inside a quoted ICMP error, so `fuzzClassifyMutated`
+// damages the two real captures above instead (the right ident/seq two times
+// in three).
+
+const fuzz_driver = testkit.fuzz.driver;
+
+const FuzzLabel = enum { rejected, matched };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn fuzz_mark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+const FuzzScript = struct {
+    cur: testkit.fuzz.Cursor,
+
+    pub fn valueRangeAtMost(self: *FuzzScript, comptime T: type, at_least: T, at_most: T) T {
+        return @intCast(self.cur.ranged(at_least, at_most));
+    }
+    pub fn value(self: *FuzzScript, comptime T: type) T {
+        return switch (T) {
+            bool => self.cur.byte() & 1 == 1,
+            u8 => self.cur.byte(),
+            u16 => self.cur.word(),
+            else => @compileError("FuzzScript.value: unsupported type"),
+        };
+    }
+    pub fn bytes(self: *FuzzScript, buf: []u8) void {
+        for (buf) |*b| b.* = self.cur.byte();
+    }
+    pub fn index(self: *FuzzScript, len: usize) usize {
+        return self.cur.ranged(0, @intCast(len - 1));
+    }
+    pub fn slice(self: *FuzzScript, buf: []u8) u32 {
+        const left = self.cur.bytes.len -| self.cur.at;
+        const n = @min(buf.len, left);
+        @memcpy(buf[0..n], self.cur.bytes[self.cur.at..][0..n]);
+        self.cur.at += n;
+        return @intCast(n);
+    }
+};
+
+fn fuzzScript(comptime harness: anytype) fn (void, *std.testing.Smith) anyerror!void {
+    return struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            var script: [1024]u8 = undefined;
+            const n = smith.slice(&script);
+            var src: FuzzScript = .{ .cur = .{ .bytes = script[0..n] } };
+            return harness(FuzzScript, &src, testing.allocator);
+        }
+    }.f;
+}
+
+fn fuzzClassifyMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const v6 = src.value(bool);
+    const g: []const u8 = if (v6) &real_v6_packet_too_big else &real_v4_frag_needed;
+    var buf: [64]u8 = undefined;
+    @memcpy(buf[0..g.len], g);
+    var len: usize = g.len;
+    for (0..src.valueRangeAtMost(u8, 0, 3)) |_| buf[src.index(len)] = src.value(u8);
+    if (src.valueRangeAtMost(u8, 0, 3) == 0) len = src.index(len) + 1;
+    var ident: u16 = if (v6) 15772 else 0x3d92;
+    var seq: u16 = 1;
+    if (src.valueRangeAtMost(u8, 0, 2) == 0) {
+        ident = src.value(u16);
+        seq = src.value(u16);
+    }
+    // The family/strip pair the capture was taken with, then all three.
+    const c = classify(if (v6) .v6 else .v4, !v6, buf[0..len], ident, seq);
+    if (c != null) fuzz_mark(.matched) else fuzz_mark(.rejected);
+    classifyAll(buf[0..len], ident, seq);
+}
+
+test "fuzz: classify, damaged real captures" {
+    try testing.fuzz({}, fuzzScript(fuzzClassifyMutated), .{});
+}
+
+test "fuzz driver: PATHMTU_FUZZ" {
+    try fuzz_driver.run(fuzzClassify, .{ .prefix = "PATHMTU_FUZZ", .name = "pathmtu-classify" });
+    try fuzz_driver.run(fuzzClassifyMutated, .{ .prefix = "PATHMTU_FUZZ", .name = "pathmtu-classify-mutated" });
+}
+
+test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
+    fuzz_reach = @splat(0);
+    inline for (.{ fuzzClassify, fuzzClassifyMutated }, 0..) |h, which| {
+        for (0..400) |sd| {
+            var prng = std.Random.DefaultPrng.init(sd);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print("pathmtu harness {d} seed {d}: {t}\n", .{ which, sd, err });
+                return err;
+            };
+        }
+    }
+    for (fuzz_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 // -- live (gated where privilege is genuinely required) ----------------------

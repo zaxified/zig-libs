@@ -1298,23 +1298,15 @@ test "fuzz: decodeResponse never panics on arbitrary bytes" {
 }
 
 fn fuzzDecodeResponse(_: void, smith: *std.testing.Smith) !void {
-    var buf: [64]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
-    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
-    // then finds fewer than the eight it needs and returns the range MINIMUM —
-    // so `len` was 0 for every input and `decodeResponse` was called with
-    // `buf[0..0]`, dying at `error.InvalidLength` before it ever read a field,
-    // with the datagram sitting unread in `buf`. Measured 2026-09-07 over the
-    // corpus above: **0 of 11 seeds non-empty and 0 decoded before, 11 of 11
-    // non-empty and 3 decoded after.**
-    const len: usize = smith.slice(&buf);
-
-    // Always pass a live kiss_out so the KissOfDeath write path (new in this
-    // sweep) is exercised by the same never-panics fuzz target, not just the
-    // main decode path.
-    var kod: KissOfDeath = undefined;
-    const reply = decodeResponse(buf[0..len], &kod) catch return;
-    verifyOriginate(reply, reply.originate) catch return;
+    // length (the ranged draw would find fewer than eight octets and return the
+    // range MINIMUM, so the datagram was never read; measured 2026-09-07).
+    // The harness body lives in `fuzz_test.zig`, generic over its source.
+    const ft = @import("fuzz_test.zig");
+    var script: [64]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    var src: ft.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    try ft.decodeResponseHarness(ft.ScriptSource, &src, testing.allocator);
 }
 
 test "corpus: every seed reaches decodeResponse, and the accepted count is pinned" {
@@ -1353,5 +1345,6 @@ test "corpus: every seed reaches decodeResponse, and the accepted count is pinne
 
 // See ntp_oracle_test.zig / tools/interop.zig / tools/ntp_oracle.py.
 test {
+    _ = @import("fuzz_test.zig");
     _ = @import("ntp_oracle_test.zig");
 }

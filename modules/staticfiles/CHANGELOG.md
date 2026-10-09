@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `STATICFILES_FUZZ` over the existing harnesses.
+
 - **2026-10-05** — **BEHAVIOURAL, not breaking:** a regular file asked for as a directory
   (`/a.txt/`, `/a.txt%2f`, `/a.txt/.`) answers **404** in `Handler.serve`, `Snapshot`/`Live`
   (`error.NotFound` from `resolveFile`); it was served as `/a.txt`, so an exact-path rule in a proxy

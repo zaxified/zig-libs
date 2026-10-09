@@ -1004,6 +1004,7 @@ test {
     _ = nl;
     _ = wire;
     _ = expr;
+    _ = @import("fuzz_test.zig");
     _ = @import("goldens.zig");
     if (builtin.os.tag == .linux) {
         _ = native;

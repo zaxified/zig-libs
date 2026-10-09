@@ -1883,14 +1883,37 @@ const request_head_seeds = [_][]const u8{
     seed("GET / HTTP/1.1\r\nHost: h\nAccept: */*\r\n"), // a bare-LF header line
 };
 
+const fz = @import("fuzz_test.zig");
+const HeadMark = fz.Marker(enum { rejected, parsed, with_headers });
+const RespMark = fz.Marker(enum { rejected, parsed, with_headers });
+const ChunkMark = fz.Marker(enum { refused, decoded });
+
 test "fuzz: RequestHead.parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzRequestHeadParse, .{ .corpus = &request_head_seeds });
+    try testing.fuzz({}, fuzzRequestHeadParseSmith, .{ .corpus = &request_head_seeds });
 }
 
-fn fuzzRequestHeadParse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: HTTP_FUZZ (h1-request-head)" {
+    try fz.fuzz_driver.run(fuzzRequestHeadParse, .{ .prefix = "HTTP_FUZZ", .name = "http-h1-request-head" });
+}
+
+test "fuzz harness: request head, 300 seeds, reaches every outcome" {
+    try HeadMark.reach(fuzzRequestHeadParse, "http-h1-request-head", 300);
+}
+
+fn fuzzRequestHeadParseSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzRequestHeadParse, smith, script[0..n]);
+}
+
+fn fuzzRequestHeadParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    _ = RequestHead.parse(buf[0..len]) catch return;
+    const len: usize = fz.drawInput(S, src, &buf, &request_head_seeds);
+    const head = RequestHead.parse(buf[0..len]) catch return HeadMark.mark(.rejected);
+    HeadMark.mark(.parsed);
+    var it = head.iterate();
+    if (it.next() != null) HeadMark.mark(.with_headers);
 }
 
 test "corpus: every request-head seed reaches the parser, and what it walked is pinned" {
@@ -1952,13 +1975,31 @@ const response_head_seeds = [_][]const u8{
 };
 
 test "fuzz: ResponseHead.parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzResponseHeadParse, .{ .corpus = &response_head_seeds });
+    try testing.fuzz({}, fuzzResponseHeadParseSmith, .{ .corpus = &response_head_seeds });
 }
 
-fn fuzzResponseHeadParse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: HTTP_FUZZ (h1-response-head)" {
+    try fz.fuzz_driver.run(fuzzResponseHeadParse, .{ .prefix = "HTTP_FUZZ", .name = "http-h1-response-head" });
+}
+
+test "fuzz harness: response head, 300 seeds, reaches every outcome" {
+    try RespMark.reach(fuzzResponseHeadParse, "http-h1-response-head", 300);
+}
+
+fn fuzzResponseHeadParseSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzResponseHeadParse, smith, script[0..n]);
+}
+
+fn fuzzResponseHeadParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    _ = ResponseHead.parse(buf[0..len]) catch return;
+    const len: usize = fz.drawInput(S, src, &buf, &response_head_seeds);
+    const head = ResponseHead.parse(buf[0..len]) catch return RespMark.mark(.rejected);
+    RespMark.mark(.parsed);
+    var it = head.iterate();
+    if (it.next() != null) RespMark.mark(.with_headers);
 }
 
 test "corpus: every response-head seed reaches the parser, and what it walked is pinned" {
@@ -2005,12 +2046,27 @@ const chunked_seeds = [_][]const u8{
 };
 
 test "fuzz: ChunkedReader never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzChunkedReader, .{ .corpus = &chunked_seeds });
+    try testing.fuzz({}, fuzzChunkedReaderSmith, .{ .corpus = &chunked_seeds });
 }
 
-fn fuzzChunkedReader(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: HTTP_FUZZ (h1-chunked)" {
+    try fz.fuzz_driver.run(fuzzChunkedReader, .{ .prefix = "HTTP_FUZZ", .name = "http-h1-chunked" });
+}
+
+test "fuzz harness: chunked reader, 300 seeds, reaches every outcome" {
+    try ChunkMark.reach(fuzzChunkedReader, "http-h1-chunked", 300);
+}
+
+fn fuzzChunkedReaderSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzChunkedReader, smith, script[0..n]);
+}
+
+fn fuzzChunkedReader(comptime S: type, fsrc: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, fsrc, &buf, &chunked_seeds);
 
     var src: Reader = .fixed(buf[0..len]);
     var cbuf: [64]u8 = undefined;
@@ -2022,7 +2078,9 @@ fn fuzzChunkedReader(_: void, smith: *std.testing.Smith) !void {
     // (see `ChunkedReader.fail_reason`), never a panic or an infinite loop
     // (the fixed output buffer bounds `streamRemaining`'s work even if it
     // did loop).
-    _ = cr.reader.streamRemaining(&w) catch {};
+    if (cr.reader.streamRemaining(&w)) |_| {
+        if (w.buffered().len != 0) ChunkMark.mark(.decoded);
+    } else |_| ChunkMark.mark(.refused);
 }
 
 test "corpus: every chunked seed reaches the decoder, and the octets decoded are pinned" {

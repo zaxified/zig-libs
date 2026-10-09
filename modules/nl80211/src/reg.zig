@@ -410,12 +410,29 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const RegMark = fz.Marker(enum { rejected, parsed, rules });
+
 test "fuzz: regulatory parse never crashes or leaks" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzParse, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzParseSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: NL80211_FUZZ (regulatory parse)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "NL80211_FUZZ", .name = "nl80211-reg" });
+}
+
+test "fuzz harness: regulatory parse, 300 seeds, reaches every outcome" {
+    try RegMark.reach(fuzzParse, "nl80211-reg", 300);
+}
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzParse, smith, script[0..n]);
+}
+
+fn fuzzParse(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var raw: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
@@ -429,11 +446,15 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     // non-empty, 6 of 6 "parsed" and 0 rules decoded before; 6 of 6 non-empty,
     // 3 parsed and 1 rule after.** The rule count is the number that says the
     // REG_RULES nest walk — everything this file is about — ran at all.
-    const len: usize = smith.slice(&raw);
-    if (parse(testing.allocator, raw[0..len])) |d| {
+    var cstore: Corpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) (cstore.build() catch &.{}) else &.{};
+    const len: usize = fz.drawInput(S, smith, &raw, entries);
+    if (parse(gpa, raw[0..len])) |d| {
         var dd = d;
-        dd.deinit(testing.allocator);
-    } else |_| {}
+        RegMark.mark(.parsed);
+        if (dd.rules.len != 0) RegMark.mark(.rules);
+        dd.deinit(gpa);
+    } else |_| RegMark.mark(.rejected);
 }
 
 test "corpus: every regulatory seed reaches the parser, and the counts are pinned" {

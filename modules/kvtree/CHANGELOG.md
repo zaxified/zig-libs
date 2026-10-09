@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `KVTREE_FUZZ` over the existing harness (`recover`; its body is now generic over its source) plus `recover-mutated`, the corpus with 0-2 knob words nudged and 0-3 page octets overwritten (random pages never reach an adopted meta).
 - **2026-10-04** — **The cursor walks both ways**: `Cursor.last`, `Cursor.prev` and
   `Cursor.seekAfter` (after the last key <= k). The cursor sits between two keys; `next` at the
   end now leaves it there instead of emptying its stack, so `prev` can walk back. No change for

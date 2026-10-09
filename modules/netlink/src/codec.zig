@@ -1254,12 +1254,30 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const WalkMark = fz.Marker(enum { empty, messages, attrs, raw_attrs });
+
 test "fuzz: message + attribute walkers never crash, loop, or read OOB" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzWalkers, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzWalkersSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzWalkers(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: NETLINK_FUZZ (codec walkers)" {
+    try fz.fuzz_driver.run(fuzzWalkers, .{ .prefix = "NETLINK_FUZZ", .name = "netlink-walkers" });
+}
+
+test "fuzz harness: codec walkers, 300 seeds, reaches every outcome" {
+    try WalkMark.reach(fuzzWalkers, "netlink-walkers", 300);
+}
+
+fn fuzzWalkersSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzWalkers, smith, script[0..n]);
+}
+
+fn fuzzWalkers(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var raw: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
@@ -1268,8 +1286,11 @@ fn fuzzWalkers(_: void, smith: *std.testing.Smith) !void {
     // buffer with the datagram sitting unread in `raw`. Measured 2026-09-07
     // over the corpus above: **0 of 12 seeds non-empty and 0 messages walked
     // before, 12 of 12 non-empty and 9 messages / 12 attributes after.**
-    const len: usize = smith.slice(&raw);
+    var cstore: Corpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) (cstore.build() catch &.{}) else &.{};
+    const len: usize = fz.drawInput(S, smith, &raw, entries);
     const buf = raw[0..len];
+    if (len == 0) WalkMark.mark(.empty);
     // The fixed family-header length to walk past before the TLVs start.
     // ⚠ `value(u64)` and a `%`, not `valueRangeAtMost(u16, 0, 32)`: a ranged
     // draw is the range minimum, so this was 0 for every seed and every
@@ -1283,6 +1304,7 @@ fn fuzzWalkers(_: void, smith: *std.testing.Smith) !void {
     var mit: MessageIterator = .{ .buf = buf };
     while (mit.next() catch null) |m| {
         steps += 1;
+        WalkMark.mark(.messages);
         try testing.expect(steps <= buf.len / 4 + 1);
         _ = m.errorCode() catch {};
         _ = m.errorMessage() catch {};
@@ -1299,6 +1321,7 @@ fn fuzzWalkers(_: void, smith: *std.testing.Smith) !void {
         var asteps: usize = 0;
         while (ait.next() catch null) |a| {
             asteps += 1;
+            WalkMark.mark(.attrs);
             try testing.expect(asteps <= m.payload.len / 4 + 1);
             _ = a.asU8() catch {};
             _ = a.asU16() catch {};
@@ -1314,6 +1337,7 @@ fn fuzzWalkers(_: void, smith: *std.testing.Smith) !void {
     var asteps: usize = 0;
     while (ait.next() catch null) |a| {
         asteps += 1;
+        WalkMark.mark(.raw_attrs);
         try testing.expect(asteps <= buf.len / 4 + 1);
         var nit = a.nested();
         while (nit.next() catch null) |_| {}

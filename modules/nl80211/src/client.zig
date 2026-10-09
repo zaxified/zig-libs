@@ -1080,8 +1080,19 @@ test "parseEvent: malformed attributes are typed errors" {
     try testing.expectError(error.BadLength, parseEvent(1, &.{ 0x08, 0x00, 0x99, 0x00, 1, 0, 0, 0 }));
 }
 
+const fz = @import("fuzz_test.zig");
+const EventMark = fz.Marker(enum { rejected, parsed, ends_scan, group_id });
+
 test "fuzz: event parsing never crashes" {
-    try testing.fuzz({}, fuzzEvent, .{});
+    try testing.fuzz({}, fuzzEventSmith, .{});
+}
+
+test "fuzz driver: NL80211_FUZZ (event parse)" {
+    try fz.fuzz_driver.run(fuzzEvent, .{ .prefix = "NL80211_FUZZ", .name = "nl80211-event" });
+}
+
+test "fuzz harness: event parse, 300 seeds, reaches every outcome" {
+    try EventMark.reach(fuzzEvent, "nl80211-event", 300);
 }
 
 // ── C-06 regression: the dump/ACK loops must not spin forever ──────────────
@@ -1339,7 +1350,14 @@ const Corpus = struct {
     }
 };
 
-fn fuzzEvent(_: void, smith: *std.testing.Smith) !void {
+fn fuzzEventSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzEvent, smith, script[0..n]);
+}
+
+fn fuzzEvent(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var raw: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
@@ -1354,10 +1372,19 @@ fn fuzzEvent(_: void, smith: *std.testing.Smith) !void {
     // over the corpus above: **0 of 7 seeds non-empty, 7 of 7 events "parsed",
     // 0 of them ending a scan and 0 group ids found before; 7 of 7 non-empty,
     // 4 parsed, 2 ending a scan and 1 group id after.**
-    const len: usize = smith.slice(&raw);
+    var cstore: Corpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) (cstore.build() catch &.{}) else &.{};
+    const len: usize = fz.drawInput(S, smith, &raw, entries);
     const cmd: u8 = @truncate(smith.value(u64));
-    if (parseEvent(cmd, raw[0..len])) |e| std.mem.doNotOptimizeAway(&e) else |_| {}
-    if (findMcastGroupId(raw[0..len], "scan")) |g| std.mem.doNotOptimizeAway(&g) else |_| {}
+    if (parseEvent(cmd, raw[0..len])) |e| {
+        std.mem.doNotOptimizeAway(&e);
+        EventMark.mark(.parsed);
+        if (e.endsScan()) EventMark.mark(.ends_scan);
+    } else |_| EventMark.mark(.rejected);
+    if (findMcastGroupId(raw[0..len], "scan")) |g| {
+        std.mem.doNotOptimizeAway(&g);
+        if (g != null) EventMark.mark(.group_id);
+    } else |_| {}
 }
 
 test "corpus: every event seed reaches both parsers, and the counts are pinned" {

@@ -1915,61 +1915,13 @@ test "applyPreflight: a direct caller breaking the ACRM contract gets a failed p
 // ── fuzz: the pure gates never panic on hostile header bytes ────────────────
 
 fn fuzzGates(_: void, smith: *std.testing.Smith) !void {
+    // The harness body lives in fuzz_test.zig (generic over its source, so the
+    // deterministic driver runs it too). ⚠ ONE byte-first `slice` draw here.
+    const ft = @import("fuzz_test.zig");
     var buf: [gate_buf_len]u8 = undefined;
-    // ⚠ One `smith.slice`, never `bytes` then a ranged draw. `bytes` consumes
-    // `@min(buf.len, in.len)` octets, so the ranged length that followed it
-    // read fewer than the eight it needs as a little-endian `u64` and returned
-    // the range MINIMUM — `len` was 0 for every input this lane can carry, and
-    // all three gates were only ever handed the empty string. That is the one
-    // input the gates agree on trivially: `requestedHeadersAllowed("")` is
-    // `true` by the "no header named, nothing to refuse" path and never
-    // reaches the comma split at all. Measured 2026-09-07: 0 of 14 seeds
-    // arrived non-empty before, 14 of 14 after.
     const len: usize = smith.slice(&buf);
-    const bytes = buf[0..len];
-
-    // Policies live on the stack — the gates allocate nothing.
-    const listed: Cors = .{
-        .gpa = testing.failing_allocator,
-        .options = .{
-            .allowed_origins = .{ .list = &.{ "https://app.example", "null" } },
-            .allowed_headers = .{ .list = &.{ "Content-Type", "Authorization" } },
-        },
-        .allow_methods_value = "",
-        .allow_headers_value = "",
-        .expose_headers_value = "",
-    };
-    _ = listed.allowOriginValue(bytes);
-    _ = listed.methodTokenAllowed(bytes);
-    _ = listed.requestedHeadersAllowed(bytes);
-
-    // The other side of every union the gates read. Driving only the `.list`
-    // policy above left this test asserting "never panic" over a config space
-    // it could not enter: `requestedHeadersAllowed` used to read `.list`
-    // unconditionally, so a `.reflect` policy — the DEFAULT — was precisely
-    // the input that broke the claim, and precisely the one not generated.
-    const reflecting: Cors = .{
-        .gpa = testing.failing_allocator,
-        .options = .{
-            .allowed_origins = .any,
-            .allowed_headers = .reflect,
-        },
-        .allow_methods_value = "",
-        .allow_headers_value = "",
-        .expose_headers_value = "",
-    };
-    _ = reflecting.allowOriginValue(bytes);
-    _ = reflecting.methodTokenAllowed(bytes);
-    _ = reflecting.requestedHeadersAllowed(bytes);
-
-    const none_policy: Cors = .{
-        .gpa = testing.failing_allocator,
-        .options = .{ .allowed_origins = .none, .allowed_headers = .reflect },
-        .allow_methods_value = "",
-        .allow_headers_value = "",
-        .expose_headers_value = "",
-    };
-    _ = none_policy.allowOriginValue(bytes);
+    var src: ft.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try ft.gatesHarness(ft.ScriptSource, &src, testing.allocator);
 }
 
 test "the pure gates are total: .reflect answers instead of reading a dead union field" {
@@ -2319,4 +2271,5 @@ test "allow_unconditional_wildcard: a bare OPTIONS gets only the wildcard, no pr
 // See browser_oracle_test.zig / tools/interop.zig / tools/browser_oracle.js.
 test {
     _ = @import("browser_oracle_test.zig");
+    _ = @import("fuzz_test.zig");
 }

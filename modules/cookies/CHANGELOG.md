@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `COOKIES_FUZZ` over the existing harnesses (`jar`, `parse`).
 - **2026-10-06** — **Anchoring: Set-Cookie BUILD direction against headless Chrome + Go**
   (`tools/setcookie_oracle.js`, `tools/go_setcookie`, `src/setcookie_oracle_test.zig`): 65 cases,
   each line served to Chrome 154 and read by Go 1.26's `ParseSetCookie`; `write` must produce the

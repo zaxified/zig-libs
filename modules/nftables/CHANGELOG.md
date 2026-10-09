@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `NFTABLES_FUZZ` over the existing harnesses (object decoders,
+  expression walker).
+
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** the JSON builder is anchored to a real `nft`.
   `tools/interop.zig` (`unshare -rn zig build interop-nftables -- --capture`) applies eight builder
   scenarios with `nft -j -f -` and freezes `nft -j list ruleset`; `src/json_oracle_test.zig` replays

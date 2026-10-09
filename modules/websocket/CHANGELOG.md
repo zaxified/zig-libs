@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **SECURITY FIX (server DoS / stack overflow write):** `acceptHandshake`
+  accepted any 24-character `Sec-WebSocket-Key` and decoded it into a 16-octet buffer; 24
+  base64 characters without `==` padding decode to 18 octets, so a client could panic the
+  server in Debug/ReleaseSafe and write 2 octets past the buffer in ReleaseFast. The
+  decoded size is now checked first (`error.InvalidKey`). Found by the new `WEBSOCKET_FUZZ`
+  driver (`request-mutated`); regression test.
+- **2026-10-09** — tests: deterministic fuzz driver `WEBSOCKET_FUZZ` over the existing harnesses (`response`, `request`, `frame`, `close`, `connection`; the two handshake ones with a `-mutated` twin, because random octets never parse as an HTTP head).
 - **2026-10-04** — Fix (behaviour change, not breaking API): `Sec-WebSocket-Protocol` is now
   matched **exactly** (byte for byte) on both sides. The server (`acceptHandshake`) used to select
   case-insensitively and answer with its own spelling, so a client that offered `chat` to a

@@ -1251,13 +1251,108 @@ test "fuzz: parseCsr never panics on arbitrary bytes" {
 }
 
 fn fuzzParseCsr(_: void, smith: *std.testing.Smith) !void {
+    return csrHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+const fuzz_driver = testkit.fuzz.driver;
+const CsrLabel = enum { raw_rejected, raw_accepted, genuine_parsed, truncated_rejected, trailing_rejected, flipped_rejected };
+var csr_reach: [@typeInfo(CsrLabel).@"enum".fields.len]usize = @splat(0);
+
+fn markCsr(comptime l: CsrLabel) void {
+    csr_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// Generic over its source (`Smith` under `--fuzz`, `fuzz_driver.Rng` under the
+/// driver). The drawn octets are parsed raw (any outcome, no panic, success
+/// freed); then they seed a PRNG that names 1..3 domains and has `csrDer` sign
+/// a genuine CSR, which must parse back to those names. Every truncation, one
+/// trailing octet and any single flipped bit must be REFUSED: the CSR is
+/// self-signed over every octet of its body, so an accepted flip is a forgery.
+fn csrHarness(comptime S: type, smith: *S, gpa: Allocator) anyerror!void {
     var buf: [1024]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    // The CSR DER decoder (parse-back oracle side of csrDer/the mock CA's
-    // finalize path): arbitrary bytes must only ever yield a typed error,
-    // never a panic/OOB — and any success must be freed.
-    var parsed = parseCsr(testing.allocator, buf[0..len]) catch return;
-    parsed.deinit();
+    if (parseCsr(gpa, buf[0..len])) |parsed| {
+        var p = parsed;
+        p.deinit();
+        markCsr(.raw_accepted);
+    } else |_| markCsr(.raw_rejected);
+
+    var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, buf[0..len]));
+    const rnd = prng.random();
+    var names_store: [3][24]u8 = undefined;
+    var names: [3][]const u8 = undefined;
+    const n_names = 1 + rnd.uintLessThan(usize, 3);
+    for (names[0..n_names], names_store[0..n_names]) |*nm, *st| {
+        const label_len = 1 + rnd.uintLessThan(usize, 8);
+        for (st[0..label_len]) |*c| c.* = 'a' + rnd.uintLessThan(u8, 26);
+        const suffix = ".example.com";
+        @memcpy(st[label_len..][0..suffix.len], suffix);
+        nm.* = st[0 .. label_len + suffix.len];
+    }
+    const der = csrDer(gpa, testKeyPair(42), names[0..n_names]) catch return error.CsrDerFailed;
+    defer gpa.free(der);
+    {
+        var parsed = parseCsr(gpa, der) catch return error.GenuineCsrRejected;
+        defer parsed.deinit();
+        if (parsed.sans.len != n_names) return error.RoundTripMismatch;
+        for (parsed.sans, names[0..n_names]) |g, want| {
+            if (!std.mem.eql(u8, g, want)) return error.RoundTripMismatch;
+        }
+    }
+    markCsr(.genuine_parsed);
+
+    const cut = rnd.uintLessThan(usize, der.len);
+    if (parseCsr(gpa, der[0..cut])) |p| {
+        var pp = p;
+        pp.deinit();
+        return error.TruncatedCsrAccepted;
+    } else |_| {}
+    markCsr(.truncated_rejected);
+
+    var ext: [1024]u8 = undefined;
+    @memcpy(ext[0..der.len], der);
+    ext[der.len] = rnd.int(u8);
+    if (parseCsr(gpa, ext[0 .. der.len + 1])) |p| {
+        var pp = p;
+        pp.deinit();
+        return error.TrailingOctetAccepted;
+    } else |_| {}
+    markCsr(.trailing_rejected);
+
+    ext[rnd.uintLessThan(usize, der.len)] ^= @as(u8, 1) << rnd.int(u3);
+    if (parseCsr(gpa, ext[0..der.len])) |p| {
+        var pp = p;
+        pp.deinit();
+        return error.ForgedCsrAccepted;
+    } else |_| {}
+    markCsr(.flipped_rejected);
+}
+
+test "fuzz driver: ACME_FUZZ (acme-csr)" {
+    try fuzz_driver.run(csrHarness, .{ .prefix = "ACME_FUZZ", .name = "acme-csr" });
+}
+
+test "fuzz harness: 200 CSR seeds in every test run, and they get everywhere" {
+    csr_reach = @splat(0);
+    for (0..200) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        csrHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("acme-csr seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+    }
+    for (csr_reach, 0..) |n, i| {
+        const l: CsrLabel = @enumFromInt(i);
+        // Random octets are never a self-signed CSR: `raw_accepted` is reached
+        // through the corpus only.
+        if (l == .raw_accepted) continue;
+        if (n == 0) {
+            std.debug.print("reach: label {t} never hit in 200 seeds\n", .{l});
+            return error.HarnessDoesNotReach;
+        }
+    }
 }
 
 test "corpus: every CSR seed reaches parseCsr, and the SANs recovered are pinned" {

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `CHACHAPOLY_FUZZ` over the existing harnesses (decrypt gains a pristine/flipped overlay: a genuine seal must open, one flipped octet must be refused).
 - **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). Pointer-keyed twins of the std-shaped
   by-value surface, so a caller need not leave a key copy in its own frame: `ChaCha20.xorInto`,
   `ChaCha20.streamInto`, `ChaCha20Poly1305.encryptInto`, `ChaCha20Poly1305.decryptInto`

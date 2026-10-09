@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `DATASET_FUZZ` over the existing harnesses.
+
 - **2026-10-04** — ADDED: `ColumnType.timestamp` (survey 2026-09-30 gap). Cells are `Value.int`
   microseconds since the Unix epoch (UTC), the PostgreSQL/DuckDB/Arrow `[us]` unit; the column
   tag is appended (wire byte 6), no new `Value` variant, so no `switch` over `Value` breaks.

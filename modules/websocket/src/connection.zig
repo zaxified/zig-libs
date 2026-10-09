@@ -1502,6 +1502,8 @@ test "positive control: a later unrelated message still reassembles after an ear
 
 const fuzz = @import("testkit").fuzz;
 const seed = fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
+const fuzz_driver = fuzz.driver;
 
 /// Frames a **client** receives from its server, in the format `Smith.slice`
 /// reads (see `frame.zig`'s fuzz harnesses / `testkit.fuzz` for why: one
@@ -1532,6 +1534,14 @@ test "fuzz: Connection.receive never panics, client role" {
 fn fuzzConnectionReceiveClient(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
     const len: usize = smith.slice(&buf);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try connectionHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
+fn connectionHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [256]u8 = undefined;
+    const len: usize = src.slice(&buf);
 
     var scratch: [64]u8 = undefined;
     var conn: Connection = .init(.client, &scratch, 1 << 16);
@@ -1543,12 +1553,38 @@ fn fuzzConnectionReceiveClient(_: void, smith: *std.testing.Smith) !void {
     var off: usize = 0;
     var iterations: usize = 0;
     while (off < len and iterations < 64) : (iterations += 1) {
-        const result = conn.receive(buf[off..len]) catch return;
+        const result = conn.receive(buf[off..len]) catch {
+            fz.mark(.conn_refused);
+            return;
+        };
         switch (result.event) {
-            .need_more => return,
-            else => off += result.consumed,
+            .need_more => {
+                fz.mark(.conn_need_more);
+                return;
+            },
+            else => {
+                fz.mark(.conn_event);
+                off += result.consumed;
+            },
         }
     }
+}
+
+test "fuzz driver: WEBSOCKET_FUZZ (connection)" {
+    try fuzz_driver.run(connectionHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "connection" });
+}
+
+test "fuzz harness: 500 seeds in every test run, and the connection gets everywhere" {
+    fz.resetReach();
+    for (0..500) |sd| {
+        var prng = std.Random.DefaultPrng.init(sd);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        connectionHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("websocket connection seed {d}: {t}\n", .{ sd, err });
+            return err;
+        };
+    }
+    try fz.expectReached(&.{ .conn_refused, .conn_need_more, .conn_event });
 }
 
 test "corpus: every client seed reaches Connection.receive, and reassembly/close/masking/limits all fire" {

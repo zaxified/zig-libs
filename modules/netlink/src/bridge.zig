@@ -1937,7 +1937,7 @@ test "wire constants agree with the kernel UAPI" {
     try testing.expectEqual(@as(u16, 4094), info.vid);
 }
 
-/// One corpus entry for `fuzzBuilders`, spelled as the VALUES its draws read
+/// One corpus entry for `builderHarness`, spelled as the VALUES its draws read
 /// rather than as octets.
 ///
 /// The interface name and the link-layer address are the two `smith.slice`
@@ -2243,15 +2243,38 @@ const BuilderCorpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const BuildMark = fz.Marker(enum { bridge_add, fdb, vlan, brport, fdb_dump, refused });
+const ParseMark = fz.Marker(enum { rejected, fdb, brport, vlans });
+
 test "fuzz: bridge builders never crash on arbitrary spec bytes" {
     var corpus: BuilderCorpus = .{};
-    var run: BuilderRun = .{};
-    try std.testing.fuzz(&run, fuzzBuilders, .{ .corpus = corpus.build() });
+    try std.testing.fuzz({}, builderHarnessSmith, .{ .corpus = corpus.build() });
 }
 
-fn fuzzBuilders(run: *BuilderRun, smith: *std.testing.Smith) !void {
-    run.* = .{};
-    try driveBuilders(smith, run);
+fn builderHarnessSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(builderHarness, smith, script[0..n]);
+}
+
+fn builderHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var run: BuilderRun = .{};
+    try driveBuilders(S, src, &run, gpa);
+    if (run.built[0]) BuildMark.mark(.bridge_add);
+    if (run.built[1]) BuildMark.mark(.fdb);
+    if (run.built[2]) BuildMark.mark(.vlan);
+    if (run.built[3]) BuildMark.mark(.brport);
+    if (run.built[4]) BuildMark.mark(.fdb_dump);
+    if (run.accepted < 5) BuildMark.mark(.refused);
+}
+
+test "fuzz driver: NETLINK_FUZZ (bridge builders)" {
+    try fz.fuzz_driver.run(builderHarness, .{ .prefix = "NETLINK_FUZZ", .name = "netlink-bridge-builders" });
+}
+
+test "fuzz harness: bridge builders, 300 seeds, reaches every outcome" {
+    try BuildMark.reach(builderHarness, "netlink-bridge-builders", 300);
 }
 
 /// What one pass of `driveBuilders` drew and what came of it. The harness
@@ -2280,8 +2303,7 @@ const BuilderRun = struct {
 /// ⭐ The harness body, factored out so the corpus guard below drives the
 /// SAME draw sequence rather than a paraphrase of it. A guard that measures a
 /// different sequence from the one the fuzzer runs is not a guard.
-fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
-    const gpa = testing.allocator;
+fn driveBuilders(comptime S: type, smith: *S, run: *BuilderRun, gpa: std.mem.Allocator) !void {
     // ⚠ One `smith.slice` call per buffer, never `smith.bytes` followed by a
     // ranged length. `bytes` takes `@min(buf.len, in.len)` octets and the
     // ranged draw then finds fewer than the eight it needs and returns the
@@ -2319,13 +2341,13 @@ fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
     // the seed that produced it.
     run.drawn.br_seq = smith.value(u32);
     run.drawn.br_flags = smith.value(u16);
-    run.drawn.forward_delay = if (smith.eos()) smith.value(u32) else null;
-    run.drawn.ageing_time = if (smith.eos()) smith.value(u32) else null;
-    run.drawn.stp_state = if (smith.eos()) smith.value(u32) else null;
-    run.drawn.br_priority = if (smith.eos()) smith.value(u16) else null;
-    run.drawn.vlan_filtering = if (smith.eos()) smith.eos() else null;
-    run.drawn.vlan_protocol = if (smith.eos()) smith.value(u16) else null;
-    run.drawn.br_mac = smith.eos();
+    run.drawn.forward_delay = if (fz.eos(smith)) smith.value(u32) else null;
+    run.drawn.ageing_time = if (fz.eos(smith)) smith.value(u32) else null;
+    run.drawn.stp_state = if (fz.eos(smith)) smith.value(u32) else null;
+    run.drawn.br_priority = if (fz.eos(smith)) smith.value(u16) else null;
+    run.drawn.vlan_filtering = if (fz.eos(smith)) fz.eos(smith) else null;
+    run.drawn.vlan_protocol = if (fz.eos(smith)) smith.value(u16) else null;
+    run.drawn.br_mac = fz.eos(smith);
     if (buildBridgeAddRequest(gpa, run.drawn.br_seq, run.drawn.br_flags, .{
         .name = name,
         .forward_delay = run.drawn.forward_delay,
@@ -2345,11 +2367,11 @@ fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
     run.drawn.fdb_type = smith.value(u16);
     run.drawn.fdb_flags = smith.value(u16);
     run.drawn.fdb_ifindex = smith.value(u32);
-    run.drawn.fdb_dst = smith.eos();
-    run.drawn.fdb_vlan = if (smith.eos()) smith.value(u16) else null;
-    run.drawn.fdb_port = if (smith.eos()) smith.value(u16) else null;
-    run.drawn.fdb_vni = if (smith.eos()) smith.value(u32) else null;
-    run.drawn.fdb_master = if (smith.eos()) smith.value(u32) else null;
+    run.drawn.fdb_dst = fz.eos(smith);
+    run.drawn.fdb_vlan = if (fz.eos(smith)) smith.value(u16) else null;
+    run.drawn.fdb_port = if (fz.eos(smith)) smith.value(u16) else null;
+    run.drawn.fdb_vni = if (fz.eos(smith)) smith.value(u32) else null;
+    run.drawn.fdb_master = if (fz.eos(smith)) smith.value(u32) else null;
     run.drawn.fdb_state = smith.value(u16);
     run.drawn.fdb_nflags = smith.value(u8);
     run.drawn.fdb_ntype = smith.value(u8);
@@ -2374,11 +2396,11 @@ fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
     run.drawn.vlan_type = smith.value(u16);
     run.drawn.vlan_ifindex = smith.value(u32);
     run.drawn.vid = smith.value(u16);
-    run.drawn.vid_end = if (smith.eos()) smith.value(u16) else null;
-    run.drawn.pvid = smith.eos();
-    run.drawn.untagged = smith.eos();
-    run.drawn.vlan_self = smith.eos();
-    run.drawn.vlan_master = smith.eos();
+    run.drawn.vid_end = if (fz.eos(smith)) smith.value(u16) else null;
+    run.drawn.pvid = fz.eos(smith);
+    run.drawn.untagged = fz.eos(smith);
+    run.drawn.vlan_self = fz.eos(smith);
+    run.drawn.vlan_master = fz.eos(smith);
     if (buildVlanRequest(gpa, run.drawn.vlan_seq, run.drawn.vlan_type, run.drawn.vlan_ifindex, .{
         .vid = run.drawn.vid,
         .vid_end = run.drawn.vid_end,
@@ -2394,12 +2416,12 @@ fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
 
     run.drawn.bp_seq = smith.value(u32);
     run.drawn.bp_ifindex = smith.value(u32);
-    run.drawn.bp_state = if (smith.eos()) smith.value(u8) else null;
-    run.drawn.bp_learning = if (smith.eos()) smith.eos() else null;
-    run.drawn.bp_unicast_flood = if (smith.eos()) smith.eos() else null;
-    run.drawn.bp_isolated = if (smith.eos()) smith.eos() else null;
-    run.drawn.bp_priority = if (smith.eos()) smith.value(u16) else null;
-    run.drawn.bp_cost = if (smith.eos()) smith.value(u32) else null;
+    run.drawn.bp_state = if (fz.eos(smith)) smith.value(u8) else null;
+    run.drawn.bp_learning = if (fz.eos(smith)) fz.eos(smith) else null;
+    run.drawn.bp_unicast_flood = if (fz.eos(smith)) fz.eos(smith) else null;
+    run.drawn.bp_isolated = if (fz.eos(smith)) fz.eos(smith) else null;
+    run.drawn.bp_priority = if (fz.eos(smith)) smith.value(u16) else null;
+    run.drawn.bp_cost = if (fz.eos(smith)) smith.value(u32) else null;
     if (buildBrportRequest(gpa, run.drawn.bp_seq, run.drawn.bp_ifindex, .{
         .state = run.drawn.bp_state,
         .learning = run.drawn.bp_learning,
@@ -2414,8 +2436,8 @@ fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
     } else |_| {}
 
     run.drawn.dump_seq = smith.value(u32);
-    run.drawn.dump_ifindex = if (smith.eos()) smith.value(u32) else null;
-    run.drawn.dump_master = if (smith.eos()) smith.value(u32) else null;
+    run.drawn.dump_ifindex = if (fz.eos(smith)) smith.value(u32) else null;
+    run.drawn.dump_master = if (fz.eos(smith)) smith.value(u32) else null;
     if (buildFdbDumpRequest(gpa, run.drawn.dump_seq, .{
         .ifindex = run.drawn.dump_ifindex,
         .master = run.drawn.dump_master,
@@ -2449,7 +2471,7 @@ test "corpus: every builder seed reaches the builders, and the counts are pinned
     for (entries, builder_seeds) |sd, spec| {
         var smith: std.testing.Smith = .{ .in = sd };
         var run: BuilderRun = .{};
-        try driveBuilders(&smith, &run);
+        try driveBuilders(std.testing.Smith, &smith, &run, testing.allocator);
         if (run.name_len != 0 and run.mac_len != 0) nonempty += 1;
         try testing.expectEqualDeep(spec, run.drawn);
         for (&built, run.built) |*acc, b| acc.* += @intFromBool(b);
@@ -2515,10 +2537,24 @@ const parser_seeds = [_][]const u8{
 };
 
 test "fuzz: bridge parsers never crash on arbitrary payloads" {
-    try std.testing.fuzz({}, fuzzParsers, .{ .corpus = &parser_seeds });
+    try std.testing.fuzz({}, fuzzParsersSmith, .{ .corpus = &parser_seeds });
 }
 
-fn fuzzParsers(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: NETLINK_FUZZ (bridge parsers)" {
+    try fz.fuzz_driver.run(fuzzParsers, .{ .prefix = "NETLINK_FUZZ", .name = "netlink-bridge-parsers" });
+}
+
+test "fuzz harness: bridge parsers, 300 seeds, reaches every outcome" {
+    try ParseMark.reach(fuzzParsers, "netlink-bridge-parsers", 300);
+}
+
+fn fuzzParsersSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzParsers, smith, script[0..n]);
+}
+
+fn fuzzParsers(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var raw: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
@@ -2527,13 +2563,30 @@ fn fuzzParsers(_: void, smith: *std.testing.Smith) !void {
     // payload with the capture sitting unread in `raw`. Measured 2026-09-07
     // over the corpus above: **0 of 14 seeds non-empty and 0 records parsed
     // before, 14 of 14 non-empty and 11 records after.**
-    const len: usize = smith.slice(&raw);
+    const len: usize = fz.drawInput(S, smith, &raw, &parser_seeds);
     const payload = raw[0..len];
-    if (parseFdb(payload)) |_| {} else |_| {}
-    if (parseBrport(payload)) |_| {} else |_| {}
+    var any = false;
+    if (parseFdb(payload)) |v| {
+        if (v != null) {
+            any = true;
+            ParseMark.mark(.fdb);
+        }
+    } else |_| {}
+    if (parseBrport(payload)) |v| {
+        if (v != null) {
+            any = true;
+            ParseMark.mark(.brport);
+        }
+    } else |_| {}
     var out: std.ArrayList(VlanEntry) = .empty;
-    defer out.deinit(testing.allocator);
-    if (parseVlans(testing.allocator, &out, payload)) |_| {} else |_| {}
+    defer out.deinit(gpa);
+    if (parseVlans(gpa, &out, payload)) |_| {
+        if (out.items.len != 0) {
+            any = true;
+            ParseMark.mark(.vlans);
+        }
+    } else |_| {}
+    if (!any) ParseMark.mark(.rejected);
 }
 
 test "corpus: every parser seed reaches the parsers, and the record count is pinned" {

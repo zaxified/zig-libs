@@ -1551,6 +1551,26 @@ fn walkOpen(msg: []const u8) !OpenTally {
 }
 
 fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
+    return openHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+const fuzz_driver = testkit.fuzz.driver;
+const OpenLabel = enum { raw_opened, raw_refused, sealed_opened, replay_rejected, flipped_rejected, truncated_rejected };
+var open_reach: [@typeInfo(OpenLabel).@"enum".fields.len]usize = @splat(0);
+
+fn markOpen(comptime l: OpenLabel) void {
+    open_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// Generic over its source (`Smith` under `--fuzz`, `fuzz_driver.Rng` under the
+/// driver). The drawn octets go to `open` raw (any typed error, no panic); then
+/// they seed a PRNG that has a sender seal a packet under the harness key: it
+/// must open, to the sealed octets plus padding; the same message again must
+/// be a replay; and one flipped octet anywhere, or any truncation, must be
+/// refused (a forgery accepted is a failure).
+fn openHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [160]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -1566,7 +1586,62 @@ fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
     // 2026-09-07 over the corpus above: **0 of 9 seeds non-empty and 0 opened
     // before; 9 of 9 non-empty, 3 opened and 64 octets of plaintext, after.**
     const len: usize = smith.slice(&buf);
-    std.mem.doNotOptimizeAway(try walkOpen(buf[0..len]));
+    const raw = try walkOpen(buf[0..len]);
+    if (raw.opened != 0) markOpen(.raw_opened) else markOpen(.raw_refused);
+
+    var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, buf[0..len]));
+    const rnd = prng.random();
+    var pt: [80]u8 = undefined;
+    rnd.bytes(&pt);
+    const pt_len = rnd.uintAtMost(usize, pt.len);
+    var s = tSend(fuzz_key, fuzz_index, t0);
+    var sealed: [160]u8 = undefined;
+    const sl = (s.seal(&sealed, pt[0..pt_len], t0) catch return error.SealFailed).len;
+
+    var out: [160]u8 = undefined;
+    var r = tRecv(fuzz_key, fuzz_index, t0);
+    const o = r.open(&out, sealed[0..sl], t0) catch return error.GenuineMessageRejected;
+    if (o.len + overhead != sl or o.len < pt_len or !std.mem.eql(u8, out[0..pt_len], pt[0..pt_len]))
+        return error.RoundTripMismatch;
+    markOpen(.sealed_opened);
+    if (r.open(&out, sealed[0..sl], t0)) |_| return error.ReplayAccepted else |_| {}
+    markOpen(.replay_rejected);
+
+    var bad: [160]u8 = undefined;
+    @memcpy(bad[0..sl], sealed[0..sl]);
+    bad[rnd.uintLessThan(usize, sl)] ^= @as(u8, 1) << rnd.int(u3);
+    var r2 = tRecv(fuzz_key, fuzz_index, t0);
+    if (r2.open(&out, bad[0..sl], t0)) |_| return error.ForgedMessageAccepted else |_| {}
+    markOpen(.flipped_rejected);
+
+    var r3 = tRecv(fuzz_key, fuzz_index, t0);
+    if (r3.open(&out, sealed[0..rnd.uintLessThan(usize, sl)], t0)) |_| return error.TruncatedMessageAccepted else |_| {}
+    markOpen(.truncated_rejected);
+}
+
+test "fuzz driver: WIREGUARD_FUZZ (wireguard-transport)" {
+    try fuzz_driver.run(openHarness, .{ .prefix = "WIREGUARD_FUZZ", .name = "wireguard-transport" });
+}
+
+test "fuzz harness: 300 seeds in every test run, and they get everywhere" {
+    open_reach = @splat(0);
+    for (0..300) |sd| {
+        var prng = std.Random.DefaultPrng.init(sd);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        openHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("wireguard-transport seed {d}: {t}\n", .{ sd, err });
+            return err;
+        };
+    }
+    for (open_reach, 0..) |n, i| {
+        const l: OpenLabel = @enumFromInt(i);
+        // A random message never authenticates: `raw_opened` is the corpus's.
+        if (l == .raw_opened) continue;
+        if (n == 0) {
+            std.debug.print("reach: label {t} never hit in 300 seeds\n", .{l});
+            return error.HarnessDoesNotReach;
+        }
+    }
 }
 
 test "fuzz: RecvSession.open never panics on arbitrary bytes" {

@@ -692,12 +692,29 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const WiphyMark = fz.Marker(enum { rejected, wiphys });
+
 test "fuzz: the wiphy parser never crashes and never leaks" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzFeed, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzFeedSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzFeed(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: NL80211_FUZZ (wiphy parser)" {
+    try fz.fuzz_driver.run(fuzzFeed, .{ .prefix = "NL80211_FUZZ", .name = "nl80211-wiphy" });
+}
+
+test "fuzz harness: wiphy parser, 300 seeds, reaches every outcome" {
+    try WiphyMark.reach(fuzzFeed, "nl80211-wiphy", 300);
+}
+
+fn fuzzFeedSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzFeed, smith, script[0..n]);
+}
+
+fn fuzzFeed(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var raw: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
@@ -711,12 +728,15 @@ fn fuzzFeed(_: void, smith: *std.testing.Smith) !void {
     // corpus above: **0 of 7 seeds non-empty and 0 wiphys produced before; 7
     // of 7 non-empty and 4 wiphys after.** The wiphy count is the number that
     // says a message was ever attributed to a radio.
-    const len: usize = smith.slice(&raw);
-    var p: Parser = .init(testing.allocator);
+    var cstore: Corpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) (cstore.build() catch &.{}) else &.{};
+    const len: usize = fz.drawInput(S, smith, &raw, entries);
+    var p: Parser = .init(gpa);
     defer p.deinit();
-    p.feed(raw[0..len]) catch return;
-    const list = p.finish() catch return;
-    freeAll(testing.allocator, list);
+    p.feed(raw[0..len]) catch return WiphyMark.mark(.rejected);
+    const list = p.finish() catch return WiphyMark.mark(.rejected);
+    if (list.len != 0) WiphyMark.mark(.wiphys);
+    freeAll(gpa, list);
 }
 
 test "corpus: every wiphy seed reaches the parser, and the counts are pinned" {

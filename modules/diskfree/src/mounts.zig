@@ -499,6 +499,8 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
 // in a container, and this module's pure `parseMounts` also accepts a
 // caller-supplied snapshot file. Allocates, so this runs under
 // `std.testing.allocator` with every result freed.
+const testkit = @import("testkit");
+const fuzz_driver = testkit.fuzz.driver;
 const fuzz_fixture = @embedFile("testdata/mounts_sample.txt");
 const fuzz_fixture_escaped = @embedFile("testdata/mounts_escaped.txt");
 
@@ -517,11 +519,60 @@ test "fuzz: parseMounts never panics, OOB or leaks, arbitrary or mutated-real by
 }
 
 fn fuzzParseMountsNeverLeaks(_: void, smith: *std.testing.Smith) !void {
+    // The blob first, in one draw; the harness reads it back through a cursor.
     var raw: [fuzz_input_len]u8 = undefined;
     smith.bytes(&raw);
+    var src: ScriptSource = .{ .cur = .{ .bytes = &raw } };
+    try mountsHarness(ScriptSource, &src, testing.allocator);
+}
+
+/// `testing.fuzz`'s source: the blob `smith.bytes` produced, read by a cursor.
+const ScriptSource = struct {
+    cur: testkit.fuzz.Cursor,
+
+    pub fn bytes(self: *ScriptSource, buf: []u8) void {
+        for (buf) |*b| b.* = self.cur.byte();
+    }
+};
+
+const FuzzLabel = enum { no_entries, entries, from_sample };
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+
+fn mark(comptime l: FuzzLabel) void {
+    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// The harness body, generic over its source of choices (`testing.fuzz`'s
+/// `ScriptSource`, the driver's `fuzz_driver.Rng`).
+fn mountsHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [fuzz_input_len]u8 = undefined;
+    src.bytes(&raw);
     var buf: [fuzz_input_len]u8 = undefined;
-    const entries = try parseMounts(testing.allocator, shapeInput(&raw, &buf));
-    freeAll(testing.allocator, entries);
+    if (raw[0] & 3 != 0) mark(.from_sample);
+    const entries = try parseMounts(gpa, shapeInput(&raw, &buf));
+    if (entries.len == 0) mark(.no_entries) else mark(.entries);
+    freeAll(gpa, entries);
+}
+
+test "fuzz driver: DISKFREE_FUZZ (mounts)" {
+    try fuzz_driver.run(mountsHarness, .{ .prefix = "DISKFREE_FUZZ", .name = "diskfree-mounts" });
+}
+
+test "fuzz harness (mounts): 300 seeds in every test run, and they get everywhere" {
+    fuzz_reach = @splat(0);
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        mountsHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("diskfree mounts seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+    }
+    for (fuzz_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 /// Turns one blob of fuzzer/corpus bytes into a parser input: either the

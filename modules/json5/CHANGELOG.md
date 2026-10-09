@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `JSON5_FUZZ` over the existing harnesses.
 - **2026-10-06** — **BEHAVIOURAL:** `preprocessAnnotated` no longer recovers a bad bare word (`nul`,
   `tru`) or a single-quoted string broken by a newline OUTSIDE an object (top level, or inside an
   array) — there is no sibling key to put the `$err` in, so it used to fix them silently: `nul` came

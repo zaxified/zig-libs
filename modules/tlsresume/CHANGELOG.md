@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `TLSRESUME_FUZZ` over the existing harnesses (plus a generated-record overlay: serialize/encode then parse/decode must round-trip, every truncation and a trailing octet must be refused).
 - **2026-10-09** — **BREAKING:** `StekRing.activeKey()` and `findKey(id)` return `?*const Stek` (a
   pointer into the ring, valid until the next `rotate`) instead of a copy: every call copied the STEK —
   the ticket-encryption key — into the caller's frame. `ring.activeKey().?.key` and `== null` read as

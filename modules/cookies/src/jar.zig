@@ -715,6 +715,7 @@ test "domainMatch, pathMatch, defaultPath" {
 // ── fuzz: arbitrary Set-Cookie fields from several origins, then requests ──
 
 const fuzz_driver = @import("testkit").fuzz.driver;
+const fz = @import("fuzz_test.zig");
 
 const fz_urls = [_][]const u8{
     "http://www.example.test/",
@@ -771,11 +772,11 @@ fn jarHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         for (e.domain) |c| if (std.ascii.isUpper(c)) return error.DomainNotLowercase;
         if (!e.host_only) {
             if (list.isPublicSuffix(e.domain)) return error.PublicSuffixDomain;
-            fuzz_driver.hit("domain_cookie");
+            fz.mark(.domain_cookie);
         }
-        if (e.secure) fuzz_driver.hit("secure_cookie");
+        if (e.secure) fz.mark(.secure_cookie);
     }
-    if (j.entries.items.len != 0) fuzz_driver.hit("stored");
+    if (j.entries.items.len != 0) fz.mark(.stored);
 
     // What a request carries: only cookies the jar holds for that URL, and
     // never a Secure one over http.
@@ -784,7 +785,7 @@ fn jarHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         var out: [4096]u8 = undefined;
         var w: std.Io.Writer = .fixed(&out);
         if (!try j.writeCookiesAt(url, t0, &w, "")) continue;
-        fuzz_driver.hit("sent");
+        fz.mark(.sent);
         var pairs = std.mem.splitSequence(u8, w.buffered(), "; ");
         while (pairs.next()) |pair| {
             const held = for (j.entries.items) |e| {
@@ -806,7 +807,24 @@ test "fuzz driver: the jar keeps only what its rules allow (COOKIES_FUZZ)" {
 test "fuzz: the jar keeps only what its rules allow (coverage-guided exploration)" {
     try testing.fuzz({}, struct {
         fn one(_: void, smith: *std.testing.Smith) !void {
-            try jarHarness(std.testing.Smith, smith, testing.allocator);
+            // Bytes first, one `slice` draw; the harness's choices read from them.
+            var buf: [2048]u8 = undefined;
+            const n = smith.slice(&buf);
+            var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..n] } };
+            try jarHarness(fz.ScriptSource, &src, testing.allocator);
         }
     }.one, .{});
+}
+
+test "fuzz harness: 400 seeds of the jar in every test run, and they get everywhere" {
+    fz.resetReach();
+    for (0..400) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        jarHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("cookies jar seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+    }
+    try fz.expectReached(&.{ .domain_cookie, .secure_cookie, .stored, .sent });
 }

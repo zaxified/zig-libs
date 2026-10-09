@@ -1467,21 +1467,42 @@ const eth_seeds = [_][]const u8{
     testkit.fuzz.seed(""), // the input this target used to run for ever
 };
 
+const fz = @import("fuzz_test.zig");
+const EthMark = fz.Marker(enum { rejected, parsed });
+const HwMark = fz.Marker(enum { rejected, parsed });
+const ArpMark = fz.Marker(enum { rejected, parsed });
+
 test "fuzz: EthHeader.parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzEthHeaderParse, .{ .corpus = &eth_seeds });
+    try testing.fuzz({}, fuzzEthHeaderParseSmith, .{ .corpus = &eth_seeds });
 }
 
-fn fuzzEthHeaderParse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: RAWSOCK_FUZZ (ethernet header)" {
+    try fz.fuzz_driver.run(fuzzEthHeaderParse, .{ .prefix = "RAWSOCK_FUZZ", .name = "rawsock-eth" });
+}
+
+test "fuzz harness: ethernet header, 300 seeds, reaches every outcome" {
+    try EthMark.reach(fuzzEthHeaderParse, "rawsock-eth", 300);
+}
+
+fn fuzzEthHeaderParseSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzEthHeaderParse, smith, script[0..n]);
+}
+
+fn fuzzEthHeaderParse(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
     // latter drew `len == 0` on every input this target ever ran outside
     // `--fuzz` (a ranged draw needs eight octets and `bytes` had eaten them),
     // so `parse` returned null off its `frame.len < 14` check every round.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, smith, &buf, &eth_seeds);
     if (EthHeader.parse(buf[0..len])) |h| {
         var out: [eth_hdr_len]u8 = undefined;
         h.write(&out);
-    }
+        EthMark.mark(.parsed);
+    } else EthMark.mark(.rejected);
 }
 
 test "corpus: the Ethernet seeds reach the parser, and the counts are pinned" {
@@ -1548,20 +1569,35 @@ fn hwSeed(comptime script: []const u8, comptime mode: u64) []const u8 {
 const hw_hex_digits = "0123456789abcdefABCDEFxyz "; // last four: deliberately invalid
 
 test "fuzz: parseHwaddr never panics on arbitrary text" {
-    try testing.fuzz({}, fuzzParseHwaddr, .{ .corpus = &hwaddr_seeds });
+    try testing.fuzz({}, fuzzParseHwaddrSmith, .{ .corpus = &hwaddr_seeds });
 }
 
-fn fuzzParseHwaddr(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: RAWSOCK_FUZZ (hwaddr)" {
+    try fz.fuzz_driver.run(fuzzParseHwaddr, .{ .prefix = "RAWSOCK_FUZZ", .name = "rawsock-hwaddr" });
+}
+
+test "fuzz harness: hwaddr, 300 seeds, reaches every outcome" {
+    try HwMark.reach(fuzzParseHwaddr, "rawsock-hwaddr", 300);
+}
+
+fn fuzzParseHwaddrSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzParseHwaddr, smith, script[0..n]);
+}
+
+fn fuzzParseHwaddr(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⚠ The byte draw is FIRST. See `hwaddr_seeds`.
     var buf: [64]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, smith, &buf, &hwaddr_seeds);
     // Two shapes: the drawn octets verbatim (exercises the length/separator
     // gate), and a structurally-correct "xx:xx:xx:xx:xx:xx" skeleton whose hex
     // digits, separator and case come from the same octets — the only way to
     // reach the per-octet `charToDigit` calls instead of bailing out at the
     // length or separator check on the first try.
     if (smith.value(bool)) {
-        _ = parseHwaddr(buf[0..len]);
+        if (parseHwaddr(buf[0..len]) != null) HwMark.mark(.parsed) else HwMark.mark(.rejected);
     } else {
         var cur: testkit.fuzz.Cursor = .{ .bytes = buf[0..len] };
         const sep: u8 = if (cur.byte() & 1 == 0) ':' else '-';
@@ -1571,7 +1607,7 @@ fn fuzzParseHwaddr(_: void, smith: *std.testing.Smith) !void {
             text[i * 3 + 1] = hw_hex_digits[cur.byte() % hw_hex_digits.len];
             if (i != hwaddr_len - 1) text[i * 3 + 2] = sep;
         }
-        _ = parseHwaddr(&text);
+        if (parseHwaddr(&text) != null) HwMark.mark(.parsed) else HwMark.mark(.rejected);
     }
 }
 
@@ -1649,20 +1685,35 @@ fn arpSeed(comptime script: []const u8, comptime mode: u64) []const u8 {
 }
 
 test "fuzz: arp.parseReply never panics on arbitrary or structurally ARP-shaped frames" {
-    try testing.fuzz({}, fuzzArpParseReply, .{ .corpus = &arp_seeds });
+    try testing.fuzz({}, fuzzArpParseReplySmith, .{ .corpus = &arp_seeds });
 }
 
-fn fuzzArpParseReply(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: RAWSOCK_FUZZ (arp reply)" {
+    try fz.fuzz_driver.run(fuzzArpParseReply, .{ .prefix = "RAWSOCK_FUZZ", .name = "rawsock-arp" });
+}
+
+test "fuzz harness: arp reply, 300 seeds, reaches every outcome" {
+    try ArpMark.reach(fuzzArpParseReply, "rawsock-arp", 300);
+}
+
+fn fuzzArpParseReplySmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzArpParseReply, smith, script[0..n]);
+}
+
+fn fuzzArpParseReply(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⚠ The byte draw is FIRST. See `arp_seeds`.
     var buf: [128]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, smith, &buf, &arp_seeds);
 
     // Two shapes: the drawn octets verbatim (the length/ethertype gate), and a
     // real ARP reply frame with octets from the same draw written over it —
     // gets past the ethertype/oper checks so the sender IP/MAC extraction
     // actually runs on hostile data.
     if (smith.value(bool)) {
-        _ = arp.parseReply(buf[0..len]);
+        if (arp.parseReply(buf[0..len]) != null) ArpMark.mark(.parsed) else ArpMark.mark(.rejected);
     } else {
         var reply = arp.buildRequest(
             .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff },
@@ -1677,7 +1728,7 @@ fn fuzzArpParseReply(_: void, smith: *std.testing.Smith) !void {
             const pos = cur.ranged(0, @intCast(reply.len - 1));
             reply[pos] = cur.byte();
         }
-        _ = arp.parseReply(&reply);
+        if (arp.parseReply(&reply) != null) ArpMark.mark(.parsed) else ArpMark.mark(.rejected);
     }
 }
 

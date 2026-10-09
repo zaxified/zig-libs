@@ -1854,11 +1854,30 @@ test "fuzz: device parser never crashes on arbitrary payloads" {
 }
 
 fn fuzzParser(_: void, smith: *std.testing.Smith) !void {
+    return parserHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+const fuzz_driver = testkit.fuzz.driver;
+const WgLabel = enum { raw_fed, raw_refused, device_roundtrip, damaged, key_roundtrip, key_unpadded33_rejected, key_flipped };
+var wg_reach: [@typeInfo(WgLabel).@"enum".fields.len]usize = @splat(0);
+
+fn markWg(comptime l: WgLabel) void {
+    wg_reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// Generic over its source (`Smith` under `--fuzz`, `fuzz_driver.Rng` under the
+/// driver). The drawn octets go to the device parser raw (any outcome, no
+/// panic); then they seed a PRNG that assembles a genuine GET_DEVICE reply
+/// (keys, 0..3 peers each with 0..3 allowed IPs and maybe an endpoint), which
+/// must decode to exactly those peers and addresses, and whose damaged copy
+/// (0..3 octets flipped, maybe truncated) must not panic.
+fn parserHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var raw: [1024]u8 = undefined;
     var ep: [64]u8 = undefined;
-    // ⚠ One `smith.slice` call per value, never `smith.bytes` followed by a
-    // ranged length. `bytes` takes `@min(raw.len, in.len)` octets and the
-    // ranged draw then finds fewer than the eight it needs and returns the
+    // ⚠ One `slice` call per value, never `bytes` followed by a ranged
+    // length. Under `Smith`, `bytes` takes `@min(raw.len, in.len)` octets and
+    // the ranged draw then finds fewer than the eight it needs and returns the
     // range MINIMUM, so `len` was 0 for every seed and `feed` was handed an
     // EMPTY payload with the reply sitting unread in `raw`.
     //
@@ -1866,11 +1885,180 @@ fn fuzzParser(_: void, smith: *std.testing.Smith) !void {
     // 0 payloads fed, 0 peers and 0 allowed IPs decoded before; 10 of 11
     // non-empty (one seed IS the empty payload), 10 feeds accepted, 2 peers
     // (each payload fed twice and MERGED, not duplicated), 4 allowed IPs, 4
-    // endpoints and 2 device keys, after.** `feed("")` fails at `splitPayload`, so the TLV walk, the
-    // peer nest and the merge path had never run.
+    // endpoints and 2 device keys, after.** `feed("")` fails at `splitPayload`,
+    // so the TLV walk, the peer nest and the merge path had never run.
     const len: usize = smith.slice(&raw);
     const ep_len: usize = smith.slice(&ep);
-    std.mem.doNotOptimizeAway(walkParser(raw[0..len], ep[0..ep_len]));
+    {
+        var parser: DeviceParser = .init(gpa);
+        defer parser.deinit();
+        if (parser.feed(raw[0..len])) |_| markWg(.raw_fed) else |_| markWg(.raw_refused);
+        // Fed twice: the merge path (the same peer arriving again extends it).
+        parser.feed(raw[0..len]) catch {};
+        if (parser.finish()) |d| {
+            var dev = d;
+            dev.deinit(gpa);
+        } else |_| {}
+        _ = parseEndpoint(ep[0..ep_len]) catch {};
+    }
+
+    var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, raw[0..len]));
+    const rnd = prng.random();
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    try GetFixture.deviceHeader(gpa, &msg, rnd.intRangeAtMost(u16, 1, 0xffff));
+    var dev_pub: Key = undefined;
+    var dev_priv: Key = undefined;
+    rnd.bytes(&dev_pub);
+    rnd.bytes(&dev_priv);
+    try attrRaw(gpa, &msg, WGDEVICE_A.PUBLIC_KEY, &dev_pub);
+    try attrRaw(gpa, &msg, WGDEVICE_A.PRIVATE_KEY, &dev_priv);
+    try attrU16(gpa, &msg, WGDEVICE_A.LISTEN_PORT, rnd.int(u16));
+    const n_peers = rnd.uintAtMost(usize, 3);
+    var peer_keys: [3]Key = undefined;
+    var peer_ips: [3]usize = undefined;
+    var peer_ep: [3]bool = undefined;
+    if (n_peers > 0) {
+        const peers = try nestBegin(gpa, &msg, WGDEVICE_A.PEERS);
+        for (0..n_peers) |i| {
+            const entry = try nestBegin(gpa, &msg, 0);
+            rnd.bytes(&peer_keys[i]);
+            try attrRaw(gpa, &msg, WGPEER_A.PUBLIC_KEY, &peer_keys[i]);
+            peer_ep[i] = rnd.boolean();
+            if (peer_ep[i]) {
+                var addr: [4]u8 = undefined;
+                rnd.bytes(&addr);
+                try appendEndpoint(gpa, &msg, .{ .v4 = .{ .addr = addr, .port = rnd.int(u16) } });
+            }
+            peer_ips[i] = rnd.uintAtMost(usize, 3);
+            if (peer_ips[i] > 0) {
+                const ips = try nestBegin(gpa, &msg, WGPEER_A.ALLOWEDIPS);
+                for (0..peer_ips[i]) |_| {
+                    var a4: [4]u8 = undefined;
+                    rnd.bytes(&a4);
+                    try appendAllowedIp(gpa, &msg, AllowedIp.v4(a4, rnd.uintAtMost(u8, 32)));
+                }
+                try nestEnd(&msg, ips);
+            }
+            try nestEnd(&msg, entry);
+        }
+        try nestEnd(&msg, peers);
+    }
+    {
+        var parser: DeviceParser = .init(gpa);
+        defer parser.deinit();
+        parser.feed(msg.items) catch return error.GenuineReplyRejected;
+        var dev = parser.finish() catch return error.GenuineReplyRejected;
+        defer dev.deinit(gpa);
+        if (dev.peers.len != n_peers) return error.RoundTripMismatch;
+        if (dev.public_key == null or !std.mem.eql(u8, &dev.public_key.?, &dev_pub)) return error.RoundTripMismatch;
+        if (dev.private_key == null or !std.mem.eql(u8, &dev.private_key.?, &dev_priv)) return error.RoundTripMismatch;
+        for (dev.peers, 0..) |pe, i| {
+            if (!std.mem.eql(u8, &pe.public_key, &peer_keys[i])) return error.RoundTripMismatch;
+            if (pe.allowed_ips.len != peer_ips[i]) return error.RoundTripMismatch;
+            if ((pe.endpoint != null) != peer_ep[i]) return error.RoundTripMismatch;
+        }
+    }
+    markWg(.device_roundtrip);
+
+    // Damaged copy: 0..3 flipped octets, maybe truncated. Any outcome but a panic.
+    const bad = try gpa.dupe(u8, msg.items);
+    defer gpa.free(bad);
+    for (0..rnd.uintAtMost(usize, 3)) |_| bad[rnd.uintLessThan(usize, bad.len)] ^= rnd.int(u8);
+    const bad_len = if (rnd.boolean()) rnd.uintAtMost(usize, bad.len) else bad.len;
+    {
+        var parser: DeviceParser = .init(gpa);
+        defer parser.deinit();
+        parser.feed(bad[0..bad_len]) catch {};
+        if (parser.finish()) |d| {
+            var dev = d;
+            dev.deinit(gpa);
+        } else |_| {}
+    }
+    markWg(.damaged);
+}
+
+/// `keyFromBase64` over arbitrary text and over keys of our own making. Besides
+/// the round trip: 44 base64 characters WITHOUT the `=` decode to 33 octets and
+/// must be refused (the 2026-10-09 defect), and a key with one character
+/// changed must never come back as the original.
+fn keyHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [64]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    if (keyFromBase64(buf[0..len])) |_| markWg(.raw_fed) else |_| markWg(.raw_refused);
+
+    var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, buf[0..len]));
+    const rnd = prng.random();
+    var key: Key = undefined;
+    rnd.bytes(&key);
+    const text = keyToBase64(key);
+    const back = keyFromBase64(&text) catch return error.GenuineKeyRejected;
+    if (!std.mem.eql(u8, &back, &key)) return error.RoundTripMismatch;
+    markWg(.key_roundtrip);
+
+    var thirty3: [33]u8 = undefined;
+    rnd.bytes(&thirty3);
+    var t44: [44]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&t44, &thirty3);
+    if (keyFromBase64(&t44)) |_| return error.UnpaddedKeyAccepted else |_| {}
+    if (keyFromBase64(text[0 .. text.len - 1])) |_| return error.ShortKeyAccepted else |_| {}
+    markWg(.key_unpadded33_rejected);
+
+    var flipped = text;
+    const at = rnd.uintLessThan(usize, flipped.len);
+    const abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    flipped[at] = abc[(std.mem.indexOfScalar(u8, abc, flipped[at]) orelse 0) +% 1 + rnd.uintLessThan(usize, 62) & 63];
+    if (keyFromBase64(&flipped)) |k| {
+        if (std.mem.eql(u8, &k, &key) and !std.mem.eql(u8, &flipped, &text)) return error.ForgedKeyAccepted;
+    } else |_| {}
+    markWg(.key_flipped);
+}
+
+const key_seeds = [_][]const u8{
+    testkit.fuzz.seed("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="), // the all-zero key, canonical
+    testkit.fuzz.seed("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), // 44 characters, no '=': 33 octets
+    testkit.fuzz.seed("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB="), // non-canonical trailing bits
+    testkit.fuzz.seed(""),
+};
+
+test "fuzz: keyFromBase64 never panics, and never decodes a wrong-sized string" {
+    try testing.fuzz({}, fuzzKey, .{ .corpus = &key_seeds });
+}
+
+fn fuzzKey(_: void, smith: *std.testing.Smith) !void {
+    return keyHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz driver: WIREGUARD_FUZZ (wireguard-parser)" {
+    try fuzz_driver.run(parserHarness, .{ .prefix = "WIREGUARD_FUZZ", .name = "wireguard-parser" });
+}
+
+test "fuzz driver: WIREGUARD_FUZZ (wireguard-key)" {
+    try fuzz_driver.run(keyHarness, .{ .prefix = "WIREGUARD_FUZZ", .name = "wireguard-key" });
+}
+
+fn wgReachCheck(comptime harness: anytype, name: []const u8, seeds: usize, comptime required: []const WgLabel) !void {
+    wg_reach = @splat(0);
+    for (0..seeds) |sd| {
+        var prng = std.Random.DefaultPrng.init(sd);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        harness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("{s} seed {d}: {t}\n", .{ name, sd, err });
+            return err;
+        };
+    }
+    inline for (required) |l| if (wg_reach[@intFromEnum(l)] == 0) {
+        std.debug.print("reach: {s}: label {t} never hit in {d} seeds\n", .{ name, l, seeds });
+        return error.HarnessDoesNotReach;
+    };
+}
+
+test "fuzz harness: 300 seeds per harness in every test run, and they get everywhere" {
+    // `raw_fed` (a random payload that a parser accepts) and a random
+    // 44-character canonical key are reached through the corpus only.
+    try wgReachCheck(parserHarness, "wireguard-parser", 300, &.{ .raw_refused, .device_roundtrip, .damaged });
+    try wgReachCheck(keyHarness, "wireguard-key", 300, &.{ .raw_refused, .key_roundtrip, .key_unpadded33_rejected, .key_flipped });
 }
 
 test "corpus: every parser seed reaches feed, and the decoded counts are pinned" {
