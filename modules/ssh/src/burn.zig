@@ -51,6 +51,11 @@ pub const load_burn = 64 * 1024;
 /// DH group14 43 / 46 KiB, group16 53 / 56 KiB, mlkem768x25519 87 / 98 KiB
 /// (std's ML-KEM keeps its matrices on the stack).
 pub const kex_x25519_burn = 64 * 1024;
+/// `ecdhNistKex` / `ecdhNistKexServer` (P-256, P-384): sized above curve25519
+/// for std's P-384 tables; `stackprobe_test.zig`'s key-exchange test finds no
+/// scalar or `K` residue under it in ReleaseFast (2026-10-10), the depth
+/// itself not yet measured.
+pub const kex_ecdh_burn = 96 * 1024;
 pub const kex_dh_burn = 128 * 1024;
 pub const kex_mlkem_burn = 192 * 1024;
 

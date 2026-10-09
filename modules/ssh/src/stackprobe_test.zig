@@ -626,7 +626,7 @@ fn recEntropy(r: *Recorder) transport.Entropy {
     return .{ .io = .{ .userdata = r, .vtable = &rec_vtable } };
 }
 
-const Kex = enum { curve25519, mlkem, dh14, dh16 };
+const Kex = enum { curve25519, mlkem, dh14, dh16, ecdh256, ecdh384 };
 const Role = enum { client, server };
 
 const kx_v_c = "SSH-2.0-zig_probe_client";
@@ -646,6 +646,8 @@ fn kexName(k: Kex) []const u8 {
         .mlkem => "mlkem768x25519-sha256",
         .dh14 => "diffie-hellman-group14-sha256",
         .dh16 => "diffie-hellman-group16-sha512",
+        .ecdh256 => "ecdh-sha2-nistp256",
+        .ecdh384 => "ecdh-sha2-nistp384",
     };
 }
 
@@ -661,11 +663,13 @@ fn apiKex(k: Kex, role: Role, r: *std.Io.Reader, w: *std.Io.Writer, ent: transpo
             .curve25519 => try transport.curve25519Kex(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, accept_any, "ssh-ed25519"),
             .mlkem => try transport.mlkem768x25519Kex(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, accept_any, "ssh-ed25519"),
             .dh14, .dh16 => try transport.dhGroupKex(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, accept_any, kexName(k), "ssh-ed25519"),
+            .ecdh256, .ecdh384 => try transport.ecdhNistKex(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, accept_any, kexName(k), "ssh-ed25519"),
         },
         .server => switch (k) {
             .curve25519 => try server.curve25519KexServer(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, &kex_hk, gpa),
             .mlkem => try server.mlkem768x25519KexServer(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, &kex_hk, gpa),
             .dh14, .dh16 => try server.dhGroupKexServer(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, &kex_hk, gpa, kexName(k)),
+            .ecdh256, .ecdh384 => try server.ecdhNistKexServer(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, &kex_hk, gpa, kexName(k)),
         },
     }
 }
@@ -838,6 +842,19 @@ fn kexNeedles(n: *Needles, k: Kex, role: Role, me: *const Recorder, peer: *const
             n.addBoth("dh K", kk);
             leak_src = mine[0..32].*;
         },
+        inline .ecdh256, .ecdh384 => |kk| {
+            // One draw per side: the first candidate scalar (a rejection has
+            // probability < 2^-32), from which `fromScalar` builds the pair.
+            const c_ = comptime transport.EcdhNist.forName(kexName(kk)).?;
+            const Kp = transport.EcdhNistKeyPair(c_);
+            const L = comptime c_.len();
+            const mine = Kp.fromScalar(me.draw(0)[0..L].*) orelse return error.ProbeScalarRejected;
+            const theirs = Kp.fromScalar(peer.draw(0)[0..L].*) orelse return error.ProbeScalarRejected;
+            n.addBoth("ecdh scalar", &mine.secret);
+            const shared = try transport.ecdhNistShared(c_, &mine.secret, &theirs.public);
+            n.addBoth("ecdh K", &shared);
+            leak_src = mine.secret[0..32].*;
+        },
     }
 }
 
@@ -872,7 +889,7 @@ test "STACKPROBE: no ephemeral secret, shared secret or traffic key on the dead 
     defer threaded.deinit();
     var bad: usize = 0;
 
-    inline for (.{ Kex.curve25519, Kex.mlkem, Kex.dh14, Kex.dh16 }) |k| {
+    inline for (.{ Kex.curve25519, Kex.mlkem, Kex.dh14, Kex.dh16, Kex.ecdh256, Kex.ecdh384 }) |k| {
         inline for (.{ Role.client, Role.server }) |role| {
             cur_kex = k;
             cur_role = role;

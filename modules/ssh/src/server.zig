@@ -706,6 +706,95 @@ fn isCurve25519Kex(name: []const u8) bool {
         std.mem.eql(u8, name, "curve25519-sha256@libssh.org");
 }
 
+/// ecdh-sha2-nistp256 / -nistp384 server side (see the body below).
+///
+/// The result goes to `out` (never returned by value: it holds `K`); the body
+/// runs one frame down and the stack it dirtied is zeroed after it.
+pub fn ecdhNistKexServer(
+    out: *transport.KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: transport.CipherPair,
+    entropy: transport.Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    host_key: *const HostKey,
+    gpa: std.mem.Allocator,
+    kex_name: []const u8,
+) transport.TransportError!void {
+    return burn.run(burn.kex_ecdh_burn, transport.TransportError!void, ecdhNistKexServerInto, .{ out, r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, host_key, gpa, kex_name });
+}
+
+fn ecdhNistKexServerInto(
+    out: *transport.KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: transport.CipherPair,
+    entropy: transport.Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    host_key: *const HostKey,
+    gpa: std.mem.Allocator,
+    kex_name: []const u8,
+) transport.TransportError!void {
+    switch (transport.EcdhNist.forName(kex_name) orelse return error.UnsupportedAlgorithm) {
+        inline else => |c| try ecdhNistKexServerBody(c, out, r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, host_key, gpa),
+    }
+}
+
+/// Run the server side of RFC 5656 §4 ECDH: receive SSH_MSG_KEX_ECDH_INIT
+/// (`Q_C`), validate it, generate our ephemeral pair (`Q_S`), compute `K` and
+/// `H` (`transport.ecdhNistFinish`, the client's formula), sign `H` with
+/// `host_key`, send SSH_MSG_KEX_ECDH_REPLY (`K_S`, `Q_S`, signature).
+fn ecdhNistKexServerBody(
+    comptime c: transport.EcdhNist,
+    out: *transport.KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: transport.CipherPair,
+    entropy: transport.Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    host_key: *const HostKey,
+    gpa: std.mem.Allocator,
+) transport.TransportError!void {
+    // SSH_MSG_KEX_ECDH_INIT: byte || string Q_C.
+    var buf: [16384]u8 = undefined;
+    const pkt = try transport.readKexPacket(r, ciphers, &buf);
+    if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
+    var cur = WireCursor{ .b = pkt.payload[1..] };
+    const q_c = try cur.string();
+
+    var kp = try transport.EcdhNistKeyPair(c).generate(entropy);
+    defer kp.zeroize();
+    var shared = try transport.ecdhNistShared(c, &kp.secret, q_c);
+    defer std.crypto.secureZero(u8, &shared);
+
+    const k_s = try host_key.publicBlob(gpa);
+    defer gpa.free(k_s);
+
+    out.* = .{};
+    try transport.ecdhNistFinish(c, out, &shared, client_id, server_id, client_kexinit_payload, server_kexinit_payload, k_s, q_c, &kp.public);
+
+    const sig = try host_key.sign(gpa, out.hash());
+    defer gpa.free(sig);
+
+    // SSH_MSG_KEX_ECDH_REPLY: byte || string K_S || string Q_S || string sig.
+    var obuf: [2048]u8 = undefined;
+    var ow: std.Io.Writer = .fixed(&obuf);
+    try ow.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_REPLY));
+    try messages.writeString(&ow, k_s);
+    try messages.writeString(&ow, &kp.public);
+    try messages.writeString(&ow, sig);
+    try transport.writePacket(w, ciphers.w, entropy, ow.buffered());
+}
+
 /// diffie-hellman-group14/16 server side (see the body below).
 ///
 /// The result goes to `out` (never returned by value: it holds `K`); the body
@@ -1245,6 +1334,8 @@ fn serverKexRoundBody(
         try mlkem768x25519KexServer(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
     else if (isCurve25519Kex(kex_name))
         try curve25519KexServer(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
+    else if (transport.isEcdhNistKex(kex_name))
+        try ecdhNistKexServer(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa, kex_name)
     else
         try dhGroupKexServer(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa, kex_name);
 
@@ -1961,7 +2052,10 @@ const DirectKexClient = struct {
         var sw = stream.writer(io, &wbuf);
         var none: transport.CipherState = .plaintext;
         var res: transport.KexResult = .{};
-        try transport.dhGroupKex(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.kex_name, self.negotiated_host_key_algorithm);
+        if (transport.isEcdhNistKex(self.kex_name))
+            try transport.ecdhNistKex(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.kex_name, self.negotiated_host_key_algorithm)
+        else
+            try transport.dhGroupKex(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.kex_name, self.negotiated_host_key_algorithm);
         defer res.zeroize();
         self.hash_len = res.hash_len;
         @memcpy(self.hash[0..res.hash_len], res.hash());
@@ -1997,7 +2091,10 @@ fn directDhConsistency(kex_name: []const u8) !void {
     try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
     var none: transport.CipherState = .plaintext;
     var res: transport.KexResult = .{};
-    try dhGroupKexServer(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, &hk, gpa, kex_name);
+    if (transport.isEcdhNistKex(kex_name))
+        try ecdhNistKexServer(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, &hk, gpa, kex_name)
+    else
+        try dhGroupKexServer(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, &hk, gpa, kex_name);
     defer res.zeroize();
 
     th.join();
@@ -2016,6 +2113,14 @@ test "self-consistency (direct KEX): diffie-hellman-group14-sha256" {
 
 test "self-consistency (direct KEX): diffie-hellman-group16-sha512" {
     try directDhConsistency("diffie-hellman-group16-sha512");
+}
+
+test "self-consistency (direct KEX): ecdh-sha2-nistp256" {
+    try directDhConsistency("ecdh-sha2-nistp256");
+}
+
+test "self-consistency (direct KEX): ecdh-sha2-nistp384" {
+    try directDhConsistency("ecdh-sha2-nistp384");
 }
 
 test "dhGroupKex (client): rejects a genuine rsa-sha2-256 host-key signature when rsa-sha2-512 was negotiated (RFC 8332 three-way check)" {
@@ -2490,6 +2595,14 @@ test "live interop: OpenSSH ssh client → our server — diffie-hellman-group14
 
 test "live interop: OpenSSH ssh client → our server — diffie-hellman-group16-sha512" {
     try liveOpensshClient("ed25519", "ssh-ed25519", "diffie-hellman-group16-sha512", "aes256-ctr");
+}
+
+test "live interop: OpenSSH ssh client → our server — ecdh-sha2-nistp256" {
+    try liveOpensshClient("ed25519", "ssh-ed25519", "ecdh-sha2-nistp256", "aes256-ctr");
+}
+
+test "live interop: OpenSSH ssh client → our server — ecdh-sha2-nistp384" {
+    try liveOpensshClient("ed25519", "ssh-ed25519", "ecdh-sha2-nistp384", "chacha20-poly1305@openssh.com");
 }
 
 test "live interop: OpenSSH ssh client → our server — mlkem768x25519-sha256" {

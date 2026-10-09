@@ -4,7 +4,7 @@
 //! `group16-sha512`).
 //!
 //! Usage: ctgrind-ssh <target> <yes|no>
-//!   targets: dh | ffpow
+//!   targets: dh | ffpow | ecdh
 //!
 //! * `dh` — taints the DH secret `x` and computes `e = g^x` and `K = f^x` in
 //!   both groups through `dhPowModPrime` (montint `powMont`). Until
@@ -15,6 +15,10 @@
 //!   code `dh` replaced. Its row must stay non-zero in `ff.zig`; if it ever
 //!   reads zero, either std fixed its pow or this instrument stopped seeing
 //!   the leak, and the `dh` zero means nothing until it is understood.
+//! * `ecdh` — `ecdh-sha2-nistp256` / `-nistp384` (2026-10-10): taints the
+//!   ephemeral scalar and runs our key-pair construction (`fromScalar`), the
+//!   shared secret against a peer point (`ecdhNistShared`, std's `mul`) and
+//!   `K`'s encoding plus the exchange hash (`ecdhNistFinish`).
 //!
 //! `K` is printed as `ctgrind_result=` (the witness and the output pin). The
 //! one in-file context `dh` keeps is `stripLeadingZeros` on `K`: an SSH mpint
@@ -50,6 +54,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var prng = std.Random.DefaultPrng.init(0x7373_685f_6468); // "ssh_dh"
     const random = prng.random();
 
+    if (std.mem.eql(u8, target, "ecdh")) {
+        inline for (.{ transport.EcdhNist.p256, transport.EcdhNist.p384 }) |c| try ecdh(c, random, t);
+        return;
+    }
+
     for (groups) |name| {
         const prime = (transport.DhGroup.forName(name) orelse return error.UnknownGroup).prime;
         // The peer's public value f = g^y for a public y, computed untainted.
@@ -81,4 +90,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("ctgrind_result={x}\n", .{full[512 - prime.len ..]});
         } else return error.UnknownTarget;
     }
+}
+
+fn ecdh(comptime c: transport.EcdhNist, random: std.Random, t: Taint) !void {
+    const Kp = transport.EcdhNistKeyPair(c);
+    // The peer's point, from a public scalar, untainted.
+    const peer = while (true) {
+        var y: [c.len()]u8 = undefined;
+        random.bytes(&y);
+        if (Kp.fromScalar(y)) |kp| break kp.public;
+    };
+    var x: [c.len()]u8 = undefined;
+    while (true) {
+        random.bytes(&x);
+        if (Kp.fromScalar(x) != null) break;
+    }
+    if (t == .yes) std.valgrind.memcheck.makeMemUndefined(&x);
+    const kp = Kp.fromScalar(x) orelse return error.Rejected;
+    const shared = try transport.ecdhNistShared(c, &kp.secret, &peer);
+    var res: transport.KexResult = .{};
+    try transport.ecdhNistFinish(c, &res, &shared, "SSH-2.0-a", "SSH-2.0-b", "ic", "is", "ks", &kp.public, &peer);
+    std.debug.print("ctgrind_result={x}\n", .{res.hash()});
 }

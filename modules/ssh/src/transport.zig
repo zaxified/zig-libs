@@ -34,6 +34,9 @@ const Sha512 = std.crypto.hash.sha2.Sha512;
 const X25519 = std.crypto.dh.X25519;
 const Ed25519 = std.crypto.sign.Ed25519;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const Sha384 = std.crypto.hash.sha2.Sha384;
+const P256 = std.crypto.ecc.P256;
+const P384 = std.crypto.ecc.P384;
 const Aes128 = std.crypto.core.aes.Aes128;
 const Aes256 = std.crypto.core.aes.Aes256;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
@@ -121,13 +124,17 @@ pub const software_version = "zig_ssh_0.1";
 /// OpenSSH 10.x; `curve25519-sha256` (RFC 8731) stays present right after as
 /// the classical fallback. `diffie-hellman-group14-sha256` (RFC 4253 §8.1 +
 /// RFC 3526 §3, SHA-256) / `diffie-hellman-group16-sha512` (RFC 3526 §5,
-/// SHA-512) are the classic MODP Diffie-Hellman groups. `pickFirst`/
-/// `negotiate` walk this list in order; every entry has a working KEX
-/// implementation (`mlkem768x25519Kex` / `curve25519Kex` / `dhGroupKex`).
+/// SHA-512) are the classic MODP Diffie-Hellman groups; `ecdh-sha2-nistp256` /
+/// `-nistp384` (RFC 5656 §4) sit between the two, OpenSSH's and Go's default
+/// order. `pickFirst`/`negotiate` walk this list in order; every entry has a
+/// working KEX implementation (`mlkem768x25519Kex` / `curve25519Kex` /
+/// `ecdhNistKex` / `dhGroupKex`).
 pub const kex_algorithms = [_][]const u8{
     "mlkem768x25519-sha256",
     "curve25519-sha256",
     "curve25519-sha256@libssh.org",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
     "diffie-hellman-group14-sha256",
     "diffie-hellman-group16-sha512",
 };
@@ -313,7 +320,10 @@ pub const KexRound = enum { initial, rekey };
 /// `methods` is the caller's `Algorithms.kex` (validated: no duplicates, so
 /// it fits `out`); a longer list is cut to what fits.
 pub fn offeredKexAlgorithms(out: *[offered_kex_len][]const u8, methods: []const []const u8, role: enum { client, server }, round: KexRound) []const []const u8 {
-    const n = @min(methods.len, supported_kex_algorithms.len);
+    // `usize`, not inferred: `@min` with a comptime-known bound narrows its
+    // result to the smallest type holding it (`u3` for 7 methods), and the
+    // `n + 1` below then overflowed the day the list reached 7 (2026-10-10).
+    const n: usize = @min(methods.len, supported_kex_algorithms.len);
     @memcpy(out[0..n], methods[0..n]);
     if (round == .rekey) return out[0..n];
     out[n] = switch (role) {
@@ -1648,6 +1658,224 @@ fn isCurve25519Kex(name: []const u8) bool {
         std.mem.eql(u8, name, "curve25519-sha256@libssh.org");
 }
 
+// ── NIST ECDH (RFC 5656 §4: ecdh-sha2-nistp256 / -nistp384) ─────────────────
+
+/// One `ecdh-sha2-nist*` method: the curve (std's, constant-time `mul`) and
+/// the exchange-hash function RFC 5656 §6.2.1 pairs with it. `pub` so the
+/// server role (`server.ecdhNistKexServer`) uses the same table.
+pub const EcdhNist = enum {
+    p256,
+    p384,
+
+    pub fn forName(name: []const u8) ?EcdhNist {
+        if (std.mem.eql(u8, name, "ecdh-sha2-nistp256")) return .p256;
+        if (std.mem.eql(u8, name, "ecdh-sha2-nistp384")) return .p384;
+        return null;
+    }
+
+    pub fn Curve(comptime c: EcdhNist) type {
+        return switch (c) {
+            .p256 => P256,
+            .p384 => P384,
+        };
+    }
+
+    pub fn Hash(comptime c: EcdhNist) type {
+        return switch (c) {
+            .p256 => Sha256,
+            .p384 => Sha384,
+        };
+    }
+
+    /// Scalar and field-element byte length.
+    pub fn len(comptime c: EcdhNist) usize {
+        return switch (c) {
+            .p256 => 32,
+            .p384 => 48,
+        };
+    }
+
+    /// The SEC1 uncompressed point both sides send (`04 || x || y`). Only
+    /// this form is accepted from the peer, as Go does (`elliptic.Unmarshal`)
+    /// and as every OpenSSH sends it.
+    pub fn pointLen(comptime c: EcdhNist) usize {
+        return 1 + 2 * c.len();
+    }
+};
+
+pub fn isEcdhNistKex(name: []const u8) bool {
+    return EcdhNist.forName(name) != null;
+}
+
+/// An ephemeral key pair on `c`: a uniformly drawn canonical nonzero scalar
+/// (rejection sampling, as dtls's secp256r1 share does) and its public point.
+pub fn EcdhNistKeyPair(comptime c: EcdhNist) type {
+    return struct {
+        secret: [c.len()]u8,
+        public: [c.pointLen()]u8,
+
+        pub fn generate(entropy: Entropy) TransportError!@This() {
+            for (0..64) |_| {
+                var candidate: [c.len()]u8 = undefined;
+                defer std.crypto.secureZero(u8, &candidate);
+                entropy.fill(&candidate);
+                if (fromScalar(candidate)) |kp| return kp;
+            }
+            return error.KexFailed;
+        }
+
+        /// The pair for `candidate`, or null when it is not a canonical
+        /// nonzero scalar (the caller draws again). Only that one bit of the
+        /// candidate is branched on: the zero test ORs every byte rather than
+        /// stopping at the first nonzero one (`ctgrind_harness.zig`'s `ecdh`).
+        pub fn fromScalar(candidate: [c.len()]u8) ?@This() {
+            const C = c.Curve();
+            C.scalar.rejectNonCanonical(candidate, .big) catch return null;
+            var acc: u8 = 0;
+            for (candidate) |b| acc |= b;
+            if (acc == 0) return null;
+            const point = C.basePoint.mul(candidate, .big) catch return null;
+            return .{ .secret = candidate, .public = point.toUncompressedSec1() };
+        }
+
+        pub fn zeroize(self: *@This()) void {
+            std.crypto.secureZero(u8, &self.secret);
+        }
+    };
+}
+
+/// The RFC 5656 §4 shared secret: the x-coordinate of `secret * peer`, with
+/// `peer` required to be an uncompressed SEC1 point ON the curve (std's
+/// `fromSec1` checks the equation; the identity has no uncompressed encoding)
+/// and the product required not to be the identity. Returned as a big-endian
+/// field element of the curve's full length.
+pub fn ecdhNistShared(comptime c: EcdhNist, secret: *const [c.len()]u8, peer: []const u8) TransportError![c.len()]u8 {
+    const C = c.Curve();
+    if (peer.len != c.pointLen() or peer[0] != 0x04) return error.KexFailed;
+    const q = C.fromSec1(peer) catch return error.KexFailed;
+    const p = q.mul(secret.*, .big) catch return error.KexFailed;
+    return p.affineCoordinates().x.toBytes(.big);
+}
+
+/// `H = HASH(V_C || V_S || I_C || I_S || K_S || Q_C || Q_S || K)` (RFC 5656
+/// §4: `Q_C`/`Q_S` are `string`s, `K` an mpint) into `res`, with `K`'s mpint
+/// encoding kept in `res.k_enc` for the KDF. Shared by both roles.
+pub fn ecdhNistFinish(
+    comptime c: EcdhNist,
+    res: *KexResult,
+    shared_x: *const [c.len()]u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    k_s: []const u8,
+    q_c: []const u8,
+    q_s: []const u8,
+) TransportError!void {
+    const H = c.Hash();
+    {
+        var kw: std.Io.Writer = .fixed(&res.k_enc);
+        messages.writeMpint(&kw, stripLeadingZeros(shared_x)) catch return error.KexFailed;
+        res.k_enc_len = @intCast(kw.buffered().len);
+    }
+    res.hash_len = H.digest_length;
+    var sh = H.init(.{});
+    hashStringH(H, &sh, client_id);
+    hashStringH(H, &sh, server_id);
+    hashStringH(H, &sh, client_kexinit_payload);
+    hashStringH(H, &sh, server_kexinit_payload);
+    hashStringH(H, &sh, k_s);
+    hashStringH(H, &sh, q_c);
+    hashStringH(H, &sh, q_s);
+    sh.update(res.k_enc[0..res.k_enc_len]);
+    sh.final(res.exchange_hash[0..H.digest_length]);
+}
+
+/// ecdh-sha2-nistp256 / -nistp384 client side (see the body below).
+///
+/// The result goes to `out` (never returned by value: it holds `K`); the body
+/// runs one frame down and the stack it dirtied is zeroed after it.
+pub fn ecdhNistKex(
+    out: *KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: CipherPair,
+    entropy: Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    policy: HostKeyPolicy,
+    kex_name: []const u8,
+    negotiated_host_key_algorithm: []const u8,
+) TransportError!void {
+    return burn.run(burn.kex_ecdh_burn, TransportError!void, ecdhNistKexInto, .{ out, r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, policy, kex_name, negotiated_host_key_algorithm });
+}
+
+fn ecdhNistKexInto(
+    out: *KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: CipherPair,
+    entropy: Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    policy: HostKeyPolicy,
+    kex_name: []const u8,
+    negotiated_host_key_algorithm: []const u8,
+) TransportError!void {
+    switch (EcdhNist.forName(kex_name) orelse return error.UnsupportedAlgorithm) {
+        inline else => |c| try ecdhNistKexBody(c, out, r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, policy, negotiated_host_key_algorithm),
+    }
+}
+
+/// Run the client side of RFC 5656 §4 ECDH: SSH_MSG_KEX_ECDH_INIT (`Q_C`) →
+/// SSH_MSG_KEX_ECDH_REPLY (`K_S`, `Q_S`, signature), validate `Q_S`, compute
+/// `K` and `H`, then the same host-key gate as every other method.
+fn ecdhNistKexBody(
+    comptime c: EcdhNist,
+    out: *KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: CipherPair,
+    entropy: Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    policy: HostKeyPolicy,
+    negotiated_host_key_algorithm: []const u8,
+) TransportError!void {
+    var kp = try EcdhNistKeyPair(c).generate(entropy);
+    defer kp.zeroize();
+
+    // SSH_MSG_KEX_ECDH_INIT: byte || string Q_C.
+    var ibuf: [8 + c.pointLen()]u8 = undefined;
+    var iw: std.Io.Writer = .fixed(&ibuf);
+    iw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) catch return error.KexFailed;
+    messages.writeString(&iw, &kp.public) catch return error.KexFailed;
+    try writePacket(w, ciphers.w, entropy, iw.buffered());
+
+    // SSH_MSG_KEX_ECDH_REPLY: byte || string K_S || string Q_S || string sig.
+    var buf: [16384]u8 = undefined;
+    const pkt = try readKexPacket(r, ciphers, &buf);
+    if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXDH_REPLY)) return error.KexFailed;
+    var cur = SliceReader{ .b = pkt.payload[1..] };
+    const k_s = try cur.string();
+    const q_s = try cur.string();
+    const sig = try cur.string();
+
+    var shared = try ecdhNistShared(c, &kp.secret, q_s);
+    defer std.crypto.secureZero(u8, &shared);
+
+    out.* = .{};
+    try ecdhNistFinish(c, out, &shared, client_id, server_id, client_kexinit_payload, server_kexinit_payload, k_s, &kp.public, q_s);
+    try gateHostKey(policy, k_s, sig, out.hash(), negotiated_host_key_algorithm);
+    Sha256.hash(k_s, &out.host_key_digest, .{});
+}
+
 // ── classic MODP Diffie-Hellman (RFC 4253 §8 + RFC 3526) ────────────────────
 
 /// RFC 3526 §3 2048-bit MODP group prime (`diffie-hellman-group14-sha256`),
@@ -2208,10 +2436,12 @@ fn deriveKeyBytesH(comptime H: type, out: []u8, letter: u8, k_enc: []const u8, h
 }
 
 /// Derive `out` for one key letter, dispatching on the KEX method's hash width
-/// (`hash_len` 32 → SHA-256, 64 → SHA-512).
+/// (`hash_len` 32 → SHA-256, 48 → SHA-384, 64 → SHA-512).
 fn deriveKey(out: []u8, letter: u8, k_enc: []const u8, h: []const u8, session_id: []const u8, hash_len: u8) void {
     if (hash_len == 64) {
         deriveKeyBytesH(Sha512, out, letter, k_enc, h, session_id);
+    } else if (hash_len == 48) {
+        deriveKeyBytesH(Sha384, out, letter, k_enc, h, session_id);
     } else {
         deriveKeyBytesH(Sha256, out, letter, k_enc, h, session_id);
     }
@@ -2997,6 +3227,8 @@ fn clientKexRoundBody(
         try mlkem768x25519Kex(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.host_key)
     else if (isCurve25519Kex(neg.kex))
         try curve25519Kex(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.host_key)
+    else if (isEcdhNistKex(neg.kex))
+        try ecdhNistKex(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.kex, neg.host_key)
     else
         try dhGroupKex(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.kex, neg.host_key);
 
@@ -4849,6 +5081,46 @@ test "live interop against OpenSSH sshd — diffie-hellman-group14-sha256" {
 
 test "live interop against OpenSSH sshd — diffie-hellman-group16-sha512" {
     try liveInterop("diffie-hellman-group16-sha512", "aes256-ctr");
+}
+
+test "live interop against OpenSSH sshd — ecdh-sha2-nistp256" {
+    try liveInterop("ecdh-sha2-nistp256", "aes256-ctr");
+}
+
+test "live interop against OpenSSH sshd — ecdh-sha2-nistp384" {
+    try liveInterop("ecdh-sha2-nistp384", "chacha20-poly1305@openssh.com");
+}
+
+test "ecdhNistShared: refuses a point off the curve, a compressed point, a wrong length and the identity encoding" {
+    const Kp256 = EcdhNistKeyPair(.p256);
+    const Kp384 = EcdhNistKeyPair(.p384);
+    var a = try Kp256.generate(.os);
+    defer a.zeroize();
+    var b = try Kp256.generate(.os);
+    defer b.zeroize();
+    // The genuine exchange agrees both ways.
+    try std.testing.expectEqualSlices(u8, &(try ecdhNistShared(.p256, &a.secret, &b.public)), &(try ecdhNistShared(.p256, &b.secret, &a.public)));
+    // y + 1: off the curve.
+    var off = b.public;
+    off[off.len - 1] +%= 1;
+    try std.testing.expectError(error.KexFailed, ecdhNistShared(.p256, &a.secret, &off));
+    // The compressed form of a genuine point (Go accepts only uncompressed).
+    var comp: [33]u8 = undefined;
+    comp[0] = 0x02 | (b.public[64] & 1);
+    @memcpy(comp[1..], b.public[1..33]);
+    try std.testing.expectError(error.KexFailed, ecdhNistShared(.p256, &a.secret, &comp));
+    // Wrong length, empty, and SEC1's identity encoding.
+    try std.testing.expectError(error.KexFailed, ecdhNistShared(.p256, &a.secret, b.public[0..64]));
+    try std.testing.expectError(error.KexFailed, ecdhNistShared(.p256, &a.secret, ""));
+    try std.testing.expectError(error.KexFailed, ecdhNistShared(.p256, &a.secret, &[_]u8{0}));
+    // A P-384 point is not a P-256 one, and the other way round.
+    var c = try Kp384.generate(.os);
+    defer c.zeroize();
+    try std.testing.expectError(error.KexFailed, ecdhNistShared(.p256, &a.secret, &c.public));
+    try std.testing.expectError(error.KexFailed, ecdhNistShared(.p384, &c.secret, &a.public));
+    var d = try Kp384.generate(.os);
+    defer d.zeroize();
+    try std.testing.expectEqualSlices(u8, &(try ecdhNistShared(.p384, &c.secret, &d.public)), &(try ecdhNistShared(.p384, &d.secret, &c.public)));
 }
 
 test "live interop against OpenSSH sshd — mlkem768x25519-sha256" {

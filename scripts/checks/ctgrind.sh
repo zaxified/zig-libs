@@ -164,7 +164,7 @@ declare -A TARGETS=(
     [oscore]="derive protect unprotect"
     # 2026-10-02: the MODP DH exponent (dhPowModPrime, montint) + `ffpow`, the
     # positive control that runs the replaced std.crypto.ff pow on the same x.
-    [ssh]="dh ffpow"
+    [ssh]="dh ffpow ecdh"
     # `comb` (C3's fixed-base comb via `mulBase`), `ladderbase` (the pre-C3
     # window ladder over the comptime table, still reachable as
     # `mul(basePoint, s)`) and `ladder` (C4: runtime-decoded point, runtime
@@ -364,6 +364,7 @@ declare -A PATTERN=(
     # bn254's own hand-written Montgomery field (commit 1892c814 replaced the
     # `std.crypto.ff` backend with it). `fp.zig` carries montMul/montSqr,
     # condSubP, subLimbs, ctSelect and the `blackBox` barrier; `g1.zig` the
+    [ssh/ecdh]='transport[.]zig'
     # ladder the tainted scalar drives. `scalar.zig` is listed for the
     # scalarmul target because `Fr` IS the secret there.
     [bn254/field]='fp[.]zig'
@@ -668,6 +669,7 @@ declare -A LABEL=(
     [montint/asmcore]='montint src'
     [montint/field]='montint Field(r) (Fr backend)'
     [montint/ffcontrol]='montint ffcontrol (std.crypto.ff, positive control)'
+    [ssh/ecdh]='ssh NIST ECDH scalar (P-256, P-384)'
     [montint/dyn]='montint DynModint (secret modulus)'
     # ── rounds 5-7, 2026-09-09 ─────────────────────────────────────────────
     [spake2plus/w0w1]='spake2plus computeW0W1+std wide-reduce'

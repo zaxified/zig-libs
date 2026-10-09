@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Added:** `ecdh-sha2-nistp256` and `ecdh-sha2-nistp384` key exchange (RFC 5656 §4),
+  client and server, offered by default after curve25519 (OpenSSH's and Go's order). std's P-256/P-384
+  (constant-time `mul`); the peer's point must be uncompressed SEC1 on the curve (as Go). Exchange hash
+  SHA-256 / SHA-384, so the KDF gained SHA-384. Live interop against OpenSSH 10.2 in both roles,
+  ctgrind target `ecdh`. **Fixed:** `offeredKexAlgorithms` overflowed (`@min` against a comptime
+  bound narrowed `n` to `u3`) once the method list reached seven entries.
 - **2026-10-10** — **Fixed:** a peer's SSH_MSG_DISCONNECT in the middle of a key exchange (RFC 4253 §7.1
   allows it; OpenSSH sends "disconnected by user" when its session ends while a re-exchange it
   started is pending) was read as the next KEX message: the server failed with `KexFailed` (DISCONNECT
