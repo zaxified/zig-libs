@@ -23,6 +23,7 @@
 const std = @import("std");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const ChaCha20IETF = std.crypto.stream.chacha.ChaCha20IETF;
+const burn = @import("burn.zig");
 
 /// BOLT#4 "Key Generation"'s four named key types, with their exact
 /// (unterminated) ASCII HMAC-key labels.
@@ -46,11 +47,13 @@ pub const KeyType = enum {
 /// shared_secret)`. Note the HMAC-key/message roles: the fixed short label
 /// is the HMAC KEY, the 32-byte per-hop shared secret is the MESSAGE —
 /// swapping them would silently derive a different (wrong, non-interop)
-/// key.
-pub fn generateKey(key_type: KeyType, shared_secret: [32]u8) [32]u8 {
-    var out: [32]u8 = undefined;
-    HmacSha256.create(&out, &shared_secret, key_type.label());
-    return out;
+/// key. The derived key goes into `out`; runs under a dead-stack burn.
+pub fn generateKey(out: *[32]u8, key_type: KeyType, shared_secret: *const [32]u8) void {
+    return burn.run(burn.kdf_burn, void, generateKeyBody, .{ out, key_type, shared_secret });
+}
+
+fn generateKeyBody(out: *[32]u8, key_type: KeyType, shared_secret: *const [32]u8) void {
+    HmacSha256.create(out, shared_secret, key_type.label());
 }
 
 /// BOLT#4 "Pseudo Random Byte Stream": fills all of `out` with
@@ -64,19 +67,31 @@ pub fn generateKey(key_type: KeyType, shared_secret: [32]u8) [32]u8 {
 /// stream ... initialized with a key derived from the shared secret and a
 /// 96-bit zero-nonce" verbatim (there is no separate "encrypt zeros" step
 /// to perform; `.stream` IS that operation).
-pub fn generateCipherStream(key: [32]u8, out: []u8) void {
+/// Runs under a dead-stack burn.
+pub fn generateCipherStream(key: *const [32]u8, out: []u8) void {
+    return burn.run(burn.kdf_burn, void, generateCipherStreamBody, .{ key, out });
+}
+
+fn generateCipherStreamBody(key: *const [32]u8, out: []u8) void {
     const zero_nonce = [_]u8{0} ** ChaCha20IETF.nonce_length;
-    ChaCha20IETF.stream(out, 0, key, zero_nonce);
+    ChaCha20IETF.stream(out, 0, key.*, zero_nonce);
+}
+
+/// Test helper: value-shaped `generateKey`.
+fn tKey(key_type: KeyType, ss: [32]u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    generateKey(&out, key_type, &ss);
+    return out;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
 
 test "generateKey: distinct key types yield distinct keys for the same secret" {
     const ss = [_]u8{0x42} ** 32;
-    const rho = generateKey(.rho, ss);
-    const mu = generateKey(.mu, ss);
-    const um = generateKey(.um, ss);
-    const pad = generateKey(.pad, ss);
+    const rho = tKey(.rho, ss);
+    const mu = tKey(.mu, ss);
+    const um = tKey(.um, ss);
+    const pad = tKey(.pad, ss);
     try std.testing.expect(!std.mem.eql(u8, &rho, &mu));
     try std.testing.expect(!std.mem.eql(u8, &rho, &um));
     try std.testing.expect(!std.mem.eql(u8, &rho, &pad));
@@ -87,8 +102,8 @@ test "generateKey: distinct key types yield distinct keys for the same secret" {
 
 test "generateKey: deterministic, and matches a std-only recomputation (HMAC-key/message roles)" {
     const ss = [_]u8{0x7a} ** 32;
-    const a = generateKey(.rho, ss);
-    const b = generateKey(.rho, ss);
+    const a = tKey(.rho, ss);
+    const b = tKey(.rho, ss);
     try std.testing.expectEqualSlices(u8, &a, &b);
 
     // Independent recomputation directly against std.crypto, spelling out
@@ -111,8 +126,8 @@ test "generateCipherStream: deterministic, full-length, and matches raw ChaCha20
     const key = [_]u8{0x11} ** 32;
     var a: [1300]u8 = undefined;
     var b: [1300]u8 = undefined;
-    generateCipherStream(key, &a);
-    generateCipherStream(key, &b);
+    generateCipherStream(&key, &a);
+    generateCipherStream(&key, &b);
     try std.testing.expectEqualSlices(u8, &a, &b);
 
     var expected: [1300]u8 = undefined;
@@ -126,7 +141,7 @@ test "generateCipherStream: deterministic, full-length, and matches raw ChaCha20
 test "generateCipherStream: different keys produce different streams" {
     var a: [64]u8 = undefined;
     var b: [64]u8 = undefined;
-    generateCipherStream([_]u8{1} ** 32, &a);
-    generateCipherStream([_]u8{2} ** 32, &b);
+    generateCipherStream(&([_]u8{1} ** 32), &a);
+    generateCipherStream(&([_]u8{2} ** 32), &b);
     try std.testing.expect(!std.mem.eql(u8, &a, &b));
 }

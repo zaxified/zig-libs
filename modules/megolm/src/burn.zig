@@ -67,3 +67,8 @@ pub const key_decode_burn = 16 * 1024;
 /// `ExportedSessionKey.decode` / `fromBase64`: 63 / 219 B measured, no residue
 /// (the ratchet is copied once, wire bytes to `out`); a token burn only.
 pub const export_decode_burn = 1024;
+
+/// `cipher.fullMac` / `verifyTruncatedMac`: one HMAC-SHA-256 over the message
+/// (per-message path, so small). Sized generously until the ReleaseFast probe
+/// (`stackprobe2_test.zig`) reports the real depth.
+pub const mac_burn = 4 * 1024;

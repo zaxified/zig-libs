@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack pass (`check-secret-api`). `pickle.decodeOutbound` and `pickle.openOutbound` no longer return the `OutboundSession` (it sat in the caller's result slot); they write it through a new trailing `out: *OutboundSession` parameter, only on success. `cipher.fullMac`, `verifyTruncatedMac` and `pickle.encodeOutbound`/`decodeOutbound`/`openOutbound` now run under a burn (`burn.mac_burn` 4 KiB, `session_burn`, `decrypt_burn`). `OutboundSession.fromPickle`/`fromSealedPickle` follow. `sessionId` carries a `secret-api-ok` marker (public key only). New `src/stackprobe2_test.zig` on `testkit.stackprobe` probes those five entry points (ReleaseFast).
+
 - **2026-10-09** — **BREAKING + FIX (secrets on the dead stack, second wave):** the remaining by-value secrets (before: `deriveKeys` left AES key, HMAC key, IV and round-key
   residue, `Ratchet.generate` R0 and `SessionKey.decode` / `fromBase64` R left residue, 0
   after): `cipher.deriveKeys(&ratchet, &out)` (was `deriveKeys(&ratchet) Keys`),

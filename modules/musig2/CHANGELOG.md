@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** `nonceGen(out: *NonceGenResult, sk: ?*const [32]u8, …, rand_prime: *const [32]u8, io) NonceGenError!void` — the result goes through `out` (zeroed secnonce on error), `sk` and `rand_prime` by pointer (were by value: the caller frame kept copies); migrate with `var r: NonceGenResult = undefined; try nonceGen(&r, &sk, …, &rand_prime, io)`. `nonceGen` now runs under a 32 KiB dead-stack burn (`burn.zig`); new `stackprobe2_test.zig` on `testkit.stackprobe`. `sign` unchanged.
+
 - **2026-10-08** — **BREAKING + FIX (secrets in the caller's frame):** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
   engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
   through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised

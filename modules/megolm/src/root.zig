@@ -98,6 +98,7 @@ test {
     _ = pickle;
     _ = @import("kat_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 test "meta.deps names aescbc (the AES-CBC/PKCS7 primitive), entropy (R0) and chachapoly (sealed pickles)" {

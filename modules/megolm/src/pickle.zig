@@ -98,6 +98,7 @@ const entropy = @import("entropy");
 const chachapoly = @import("chachapoly");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
 const testkit = @import("testkit");
+const burn = @import("burn.zig");
 const ratchet_mod = @import("ratchet.zig");
 const session_mod = @import("session.zig");
 
@@ -173,6 +174,10 @@ fn checkFrame(bytes: []const u8, kind: Kind, exact_len: usize) PickleError!void 
 // ── outbound ─────────────────────────────────────────────────────────────
 
 pub fn encodeOutbound(s: *const OutboundSession, out: *[outbound_len]u8) void {
+    burn.run(burn.session_burn, void, encodeOutboundBody, .{ s, out });
+}
+
+fn encodeOutboundBody(s: *const OutboundSession, out: *[outbound_len]u8) void {
     writeHeader(out[0..header_len], .outbound);
     var at: usize = header_len;
     std.mem.writeInt(u32, out[at..][0..counter_len], s.ratchet.counter, .big);
@@ -184,7 +189,12 @@ pub fn encodeOutbound(s: *const OutboundSession, out: *[outbound_len]u8) void {
     out[at..][0..pk_len].* = s.signing_key.public_key.toBytes();
 }
 
-pub fn decodeOutbound(bytes: []const u8) PickleError!OutboundSession {
+/// The session goes through `out`, written only on success.
+pub fn decodeOutbound(bytes: []const u8, out: *OutboundSession) PickleError!void {
+    return burn.run(burn.session_burn, PickleError!void, decodeOutboundBody, .{ bytes, out });
+}
+
+fn decodeOutboundBody(bytes: []const u8, out: *OutboundSession) PickleError!void {
     try checkFrame(bytes, .outbound, outbound_len);
     var at: usize = header_len;
     const counter = std.mem.readInt(u32, bytes[at..][0..counter_len], .big);
@@ -202,10 +212,9 @@ pub fn decodeOutbound(bytes: []const u8) PickleError!OutboundSession {
         std.crypto.secureZero(u8, &kp.secret_key.bytes);
         return error.InconsistentState;
     }
-    var s: OutboundSession = undefined;
-    Ratchet.init(data, counter, &s.ratchet);
-    s.signing_key = kp;
-    return s;
+    Ratchet.init(data, counter, &out.ratchet);
+    out.signing_key = kp;
+    std.crypto.secureZero(u8, &kp.secret_key.bytes);
 }
 
 // ── inbound ──────────────────────────────────────────────────────────────
@@ -285,11 +294,16 @@ pub fn sealOutbound(io: std.Io, s: *const OutboundSession, key: *const PickleKey
     sealInto(io, key, .sealed_outbound, &plain, out);
 }
 
-pub fn openOutbound(bytes: []const u8, key: *const PickleKey) PickleError!OutboundSession {
+/// The session goes through `out`, written only on success.
+pub fn openOutbound(bytes: []const u8, key: *const PickleKey, out: *OutboundSession) PickleError!void {
+    return burn.run(burn.decrypt_burn, PickleError!void, openOutboundBody, .{ bytes, key, out });
+}
+
+fn openOutboundBody(bytes: []const u8, key: *const PickleKey, out: *OutboundSession) PickleError!void {
     var plain: [outbound_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &plain);
     try openInto(bytes, key, .sealed_outbound, &plain);
-    return decodeOutbound(&plain);
+    return decodeOutbound(&plain, out);
 }
 
 pub fn sealInbound(io: std.Io, s: *const InboundGroupSession, key: *const PickleKey, out: *[sealed_inbound_len]u8) void {
@@ -718,9 +732,9 @@ fn pickleRound(smith: *std.testing.Smith) FuzzOutcome {
     }
     const bytes = buf[0..len];
     var decoded: usize = 0;
-    if (decodeOutbound(bytes)) |s| {
-        var ss = s;
-        ss.deinit();
+    var os: OutboundSession = undefined;
+    if (decodeOutbound(bytes, &os)) {
+        os.deinit();
         decoded += 1;
     } else |_| {}
     if (decodeInbound(bytes)) |s| {
@@ -728,9 +742,8 @@ fn pickleRound(smith: *std.testing.Smith) FuzzOutcome {
         ss.deinit();
         decoded += 1;
     } else |_| {}
-    if (openOutbound(bytes, &fuzz_key)) |s| {
-        var ss = s;
-        ss.deinit();
+    if (openOutbound(bytes, &fuzz_key, &os)) {
+        os.deinit();
         decoded += 1;
     } else |_| {}
     if (openInbound(bytes, &fuzz_key)) |s| {

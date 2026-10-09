@@ -247,19 +247,21 @@ pub const Initiator = struct {
     /// 3. The initiator mixes in the RESPONDER's known static public key:
     ///    `h = SHA256(h || rs.pub.serializeCompressed())`
     ///    (`.mixHash(&rs_pub)`).
-    pub fn init(ls: *const dh.KeyPair, rs_pub: [33]u8) Initiator {
+    ///
+    /// The handshake object goes into `out` (it holds the static private key
+    /// by value, so it is never returned).
+    pub fn init(out: *Initiator, ls: *const dh.KeyPair, rs_pub: [33]u8) void {
         defer burnStack();
-        return initBody(ls, rs_pub);
+        initBody(out, ls, rs_pub);
     }
 
     /// `var self` is a named copy of the static key: it stays in this frame
     /// after the return, hence one frame down and burned like the acts.
-    noinline fn initBody(ls: *const dh.KeyPair, rs_pub: [33]u8) Initiator {
-        var self = Initiator{ .ls = ls.*, .rs_pub = rs_pub };
-        self.ss.initializeSymmetric(protocol_name);
-        self.ss.mixHash(prologue);
-        self.ss.mixHash(&rs_pub);
-        return self;
+    noinline fn initBody(out: *Initiator, ls: *const dh.KeyPair, rs_pub: [33]u8) void {
+        out.* = Initiator{ .ls = ls.*, .rs_pub = rs_pub };
+        out.ss.initializeSymmetric(protocol_name);
+        out.ss.mixHash(prologue);
+        out.ss.mixHash(&rs_pub);
     }
 
     /// BOLT#8 Act One, **Sender Actions** (`-> e, es`):
@@ -268,7 +270,7 @@ pub const Initiator = struct {
     ///    generator (`Ephemeral.csprng` in production). The KAT hook is the
     ///    separate, test-build-only `genAct1WithEphemeral`.
     /// 2. `h = SHA256(h || e.pub)` (`ss.mixHash(&e.public_key)`).
-    /// 3. `es = ECDH(e.priv, rs)` (`dh.dh(e.secret_key, self.rs_pub)`).
+    /// 3. `es = ECDH(e.priv, rs)` (`dh.dh(&e.secret_key, self.rs_pub)`).
     /// 4. `ck, temp_k1 = HKDF(ck, es)` (`ss.mixKey(&es)` — re-seeds the
     ///    embedded `CipherState` with `temp_k1` and resets its nonce to 0).
     /// 5. `c = encryptWithAD(temp_k1, 0, h, <empty>)`
@@ -284,7 +286,9 @@ pub const Initiator = struct {
     }
 
     noinline fn genAct1Body(self: *Initiator, ephemeral: Ephemeral) HandshakeError!act.Act1 {
-        return self.act1(dh.KeyPair.generate(ephemeral.source()));
+        var e: dh.KeyPair = undefined;
+        dh.KeyPair.generate(&e, ephemeral.source());
+        return self.act1(e);
     }
 
     /// **TEST ONLY** (`void` outside a test build — see `testOnly`): run Act
@@ -301,7 +305,7 @@ pub const Initiator = struct {
         errdefer self.state = .failed;
         self.ephemeral = e;
         self.ss.mixHash(&e.public_key);
-        const es = try dh.dh(e.secret_key, self.rs_pub);
+        const es = try dh.dh(&e.secret_key, self.rs_pub);
         self.ss.mixKey(&es);
         var tag: [16]u8 = undefined;
         try self.ss.encryptAndHash("", &tag);
@@ -315,7 +319,7 @@ pub const Initiator = struct {
     ///    — version/length checks live there, not here).
     /// 2. `h = SHA256(h || re)` (`ss.mixHash(&msg.e_pub)`); store
     ///    `self.re_pub = msg.e_pub`.
-    /// 3. `ee = ECDH(e.priv, re)` (`dh.dh(self.e.?.secret_key,
+    /// 3. `ee = ECDH(e.priv, re)` (`dh.dh(&self.e.?.secret_key,
     ///    msg.e_pub)`, using the ephemeral `genAct1` generated).
     /// 4. `ck, temp_k2 = HKDF(ck, ee)` (`ss.mixKey(&ee)`).
     /// 5. `p = decryptWithAD(temp_k2, 0, h, c)`
@@ -333,7 +337,7 @@ pub const Initiator = struct {
         if (self.state != .awaiting_act2) return error.WrongState;
         errdefer self.state = .failed;
         self.ss.mixHash(&msg.e_pub);
-        const ee = try dh.dh(self.ephemeral.?.secret_key, msg.e_pub);
+        const ee = try dh.dh(&self.ephemeral.?.secret_key, msg.e_pub);
         self.ss.mixKey(&ee);
         var empty: [0]u8 = undefined;
         try self.ss.decryptAndHash(&msg.tag, &empty);
@@ -356,7 +360,7 @@ pub const Initiator = struct {
     ///    nonce silently resets to 0 and every downstream ciphertext byte
     ///    changes).
     /// 2. `h = SHA256(h || c)` — automatic.
-    /// 3. `se = ECDH(ls.priv, re)` (`dh.dh(self.ls.secret_key,
+    /// 3. `se = ECDH(ls.priv, re)` (`dh.dh(&self.ls.secret_key,
     ///    self.re_pub.?)`).
     /// 4. `ck, temp_k3 = HKDF(ck, se)` (`ss.mixKey(&se)` — resets the
     ///    nonce to 0 again, ready for step 5).
@@ -390,7 +394,7 @@ pub const Initiator = struct {
         // see the doc comment's nonce-continuity warning).
         var c: [49]u8 = undefined;
         try self.ss.encryptAndHash(&self.ls.public_key, &c);
-        const se = try dh.dh(self.ls.secret_key, self.re_pub.?);
+        const se = try dh.dh(&self.ls.secret_key, self.re_pub.?);
         self.ss.mixKey(&se);
         var t: [16]u8 = undefined;
         try self.ss.encryptAndHash("", &t);
@@ -450,18 +454,19 @@ pub const Responder = struct {
     /// ls.pub.serializeCompressed())`") rather than a remote one — both
     /// sides end up mixing in the SAME bytes (the responder's static
     /// key), just from their own local/remote perspective.
-    pub fn init(ls: *const dh.KeyPair) Responder {
+    ///
+    /// The handshake object goes into `out` (see `Initiator.init`).
+    pub fn init(out: *Responder, ls: *const dh.KeyPair) void {
         defer burnStack();
-        return initBody(ls);
+        initBody(out, ls);
     }
 
     /// See `Initiator.initBody`.
-    noinline fn initBody(ls: *const dh.KeyPair) Responder {
-        var self = Responder{ .ls = ls.* };
-        self.ss.initializeSymmetric(protocol_name);
-        self.ss.mixHash(prologue);
-        self.ss.mixHash(&ls.public_key);
-        return self;
+    noinline fn initBody(out: *Responder, ls: *const dh.KeyPair) void {
+        out.* = Responder{ .ls = ls.* };
+        out.ss.initializeSymmetric(protocol_name);
+        out.ss.mixHash(prologue);
+        out.ss.mixHash(&ls.public_key);
     }
 
     /// BOLT#8 Act One, **Receiver Actions**:
@@ -469,7 +474,7 @@ pub const Responder = struct {
     /// 1-2. Parse `msg` (done by the caller via `act.Act1.fromBytes`).
     /// 3. `h = SHA256(h || re)` (`ss.mixHash(&msg.e_pub)`); store
     ///    `self.re_pub = msg.e_pub`.
-    /// 4. `es = ECDH(s.priv, re)` (`dh.dh(self.ls.secret_key,
+    /// 4. `es = ECDH(s.priv, re)` (`dh.dh(&self.ls.secret_key,
     ///    msg.e_pub)` — the RESPONDER's static key this time, not an
     ///    ephemeral; this is the asymmetry `es` always denotes in Noise
     ///    notation, "ephemeral times static", with the ephemeral supplied
@@ -489,7 +494,7 @@ pub const Responder = struct {
         if (self.state != .start) return error.WrongState;
         errdefer self.state = .failed;
         self.ss.mixHash(&msg.e_pub);
-        const es = try dh.dh(self.ls.secret_key, msg.e_pub);
+        const es = try dh.dh(&self.ls.secret_key, msg.e_pub);
         self.ss.mixKey(&es);
         var empty: [0]u8 = undefined;
         try self.ss.decryptAndHash(&msg.tag, &empty);
@@ -504,7 +509,7 @@ pub const Responder = struct {
     ///    needs it for `se`). The KAT hook is the separate, test-build-only
     ///    `genAct2WithEphemeral`.
     /// 2. `h = SHA256(h || e.pub)` (`ss.mixHash(&e.public_key)`).
-    /// 3. `ee = ECDH(e.priv, re)` (`dh.dh(e.secret_key,
+    /// 3. `ee = ECDH(e.priv, re)` (`dh.dh(&e.secret_key,
     ///    self.re_pub.?)` — `re` here is the INITIATOR's ephemeral from
     ///    Act One).
     /// 4. `ck, temp_k2 = HKDF(ck, ee)` (`ss.mixKey(&ee)`).
@@ -517,7 +522,9 @@ pub const Responder = struct {
     }
 
     noinline fn genAct2Body(self: *Responder, ephemeral: Ephemeral) HandshakeError!act.Act2 {
-        return self.act2(dh.KeyPair.generate(ephemeral.source()));
+        var e: dh.KeyPair = undefined;
+        dh.KeyPair.generate(&e, ephemeral.source());
+        return self.act2(e);
     }
 
     /// **TEST ONLY** (`void` outside a test build — see `testOnly`): the
@@ -534,7 +541,7 @@ pub const Responder = struct {
         errdefer self.state = .failed;
         self.ephemeral = e;
         self.ss.mixHash(&e.public_key);
-        const ee = try dh.dh(e.secret_key, self.re_pub.?);
+        const ee = try dh.dh(&e.secret_key, self.re_pub.?);
         self.ss.mixKey(&ee);
         var tag: [16]u8 = undefined;
         try self.ss.encryptAndHash("", &tag);
@@ -559,7 +566,7 @@ pub const Responder = struct {
     ///    from a later `dh.dh` call, or an explicit `Secp256k1.fromSec1`
     ///    check here) — that failure must also abort the connection.
     /// 4. `h = SHA256(h || c)` — automatic.
-    /// 5. `se = ECDH(e.priv, rs)` (`dh.dh(self.e.?.secret_key,
+    /// 5. `se = ECDH(e.priv, rs)` (`dh.dh(&self.e.?.secret_key,
     ///    self.rs_pub.?)` — the RESPONDER's ephemeral this time, mirroring
     ///    the initiator's `se = ECDH(s.priv, re)`: same DH pair, computed
     ///    from the other side).
@@ -600,7 +607,7 @@ pub const Responder = struct {
         // SEC1 point — `dh.dh`'s `Secp256k1.fromSec1` rejects it with
         // `error.InvalidPublicKey` before any scalar multiply runs (BOLT#8
         // "act3 bad rs test"); only a VALIDATED key is stored.
-        const se = try dh.dh(self.ephemeral.?.secret_key, rs);
+        const se = try dh.dh(&self.ephemeral.?.secret_key, rs);
         self.rs_pub = rs;
         // Audit finding F5: `rs_pub` above is set from a VALIDATED key, but
         // the handshake can still fail below (the final `decryptAndHash` —
@@ -679,6 +686,7 @@ test "Suite(dh, ChaChaPoly, SHA256) type-checks and its SymmetricState is DH-agn
 }
 
 const kv = @import("kat_vectors.zig");
+const tu = @import("testutil.zig");
 // The pre-Act-One transcript hash is not itself a `kat_vectors.zig` entry
 // (it's an independently-computed cross-check specific to this test, not
 // a value BOLT#8 publishes) — kept as its own top-level const (rather than
@@ -690,11 +698,11 @@ test "Initiator.init / Responder.init: BOLT#8 'Handshake State Initialization' m
     // Fixed identities from BOLT#8 Appendix A (see dh.zig's KAT constants
     // for provenance); re-derived here via public API so this test does
     // not reach into dh.zig's private test-only decls.
-    const init_ls = try dh.KeyPair.generateDeterministic([_]u8{0x11} ** 32);
-    const resp_ls = try dh.KeyPair.generateDeterministic([_]u8{0x21} ** 32);
+    const init_ls = tu.keyPair([_]u8{0x11} ** 32);
+    const resp_ls = tu.keyPair([_]u8{0x21} ** 32);
 
-    const initiator = Initiator.init(&init_ls, resp_ls.public_key);
-    const responder = Responder.init(&resp_ls);
+    const initiator = tu.initiator(&init_ls, resp_ls.public_key);
+    const responder = tu.responder(&resp_ls);
 
     // Both sides mix in the SAME bytes (the responder's static key) as
     // their final pre-message step, so their running `h`/`ck` must match
@@ -750,15 +758,15 @@ test "Ephemeral: exactly two arms, production and test are distinct, and nothing
 }
 
 test "genAct1/genAct2 ALWAYS draw: the stored ephemeral is an output, and pre-setting it cannot steer Act One (B6 R1)" {
-    const ls = try dh.KeyPair.generateDeterministic([_]u8{0x11} ** 32);
-    const rs = try dh.KeyPair.generateDeterministic([_]u8{0x21} ** 32);
+    const ls = tu.keyPair([_]u8{0x11} ** 32);
+    const rs = tu.keyPair([_]u8{0x21} ** 32);
 
     // The exact attack the audit described: a consumer pins a constant
     // ephemeral of their own choosing and expects it to be used.
-    const attacker_fixed = try dh.KeyPair.generateDeterministic([_]u8{0x42} ** 32);
+    const attacker_fixed = tu.keyPair([_]u8{0x42} ** 32);
 
     var prng = std.Random.DefaultPrng.init(0xb01783);
-    var initiator = Initiator.init(&ls, rs.public_key);
+    var initiator = tu.initiator(&ls, rs.public_key);
     initiator.ephemeral = attacker_fixed; // inert since B6: never read as input
     const a1 = try initiator.genAct1(.{ .seeded_for_test = prng.random() });
 
@@ -772,17 +780,17 @@ test "genAct1/genAct2 ALWAYS draw: the stored ephemeral is an output, and pre-se
     // seed reproduces it, a different seed does not. (Without this half the
     // test would also pass against a hardcoded key.)
     var same = std.Random.DefaultPrng.init(0xb01783);
-    var i_same = Initiator.init(&ls, rs.public_key);
+    var i_same = tu.initiator(&ls, rs.public_key);
     const a1_same = try i_same.genAct1(.{ .seeded_for_test = same.random() });
     try testing.expectEqual(a1.e_pub, a1_same.e_pub);
 
     var other = std.Random.DefaultPrng.init(0xb01784);
-    var i_other = Initiator.init(&ls, rs.public_key);
+    var i_other = tu.initiator(&ls, rs.public_key);
     const a1_other = try i_other.genAct1(.{ .seeded_for_test = other.random() });
     try testing.expect(!std.mem.eql(u8, &a1.e_pub, &a1_other.e_pub));
 
     // Same three properties on the responder side.
-    var responder = Responder.init(&rs);
+    var responder = tu.responder(&rs);
     try responder.readAct1(a1);
     responder.ephemeral = attacker_fixed;
     var rprng = std.Random.DefaultPrng.init(0xdeadbeef);
@@ -792,12 +800,12 @@ test "genAct1/genAct2 ALWAYS draw: the stored ephemeral is an output, and pre-se
 }
 
 test "act ordering is enforced: no second genAct1/genAct2 can silently reuse the ephemeral (B6 R2)" {
-    const ls = try dh.KeyPair.generateDeterministic([_]u8{0x11} ** 32);
-    const rs = try dh.KeyPair.generateDeterministic([_]u8{0x21} ** 32);
+    const ls = tu.keyPair([_]u8{0x11} ** 32);
+    const rs = tu.keyPair([_]u8{0x21} ** 32);
     var prng = std.Random.DefaultPrng.init(0x60177);
     const rnd: Ephemeral = .{ .seeded_for_test = prng.random() };
 
-    var initiator = Initiator.init(&ls, rs.public_key);
+    var initiator = tu.initiator(&ls, rs.public_key);
     // Out of order the other way: Act Two / Act Three before Act One.
     try testing.expectError(error.WrongState, initiator.readAct2(.{ .e_pub = rs.public_key, .tag = @splat(0) }));
     try testing.expectError(error.WrongState, initiator.genAct3(&scratch_result));
@@ -808,7 +816,7 @@ test "act ordering is enforced: no second genAct1/genAct2 can silently reuse the
     try testing.expectError(error.WrongState, initiator.genAct1(rnd));
     try testing.expectError(error.WrongState, initiator.genAct1WithEphemeral(ls));
 
-    var responder = Responder.init(&rs);
+    var responder = tu.responder(&rs);
     try testing.expectError(error.WrongState, responder.genAct2(rnd));
     try responder.readAct1(a1);
     try testing.expectError(error.WrongState, responder.readAct1(a1));

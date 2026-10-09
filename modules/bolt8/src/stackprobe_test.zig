@@ -207,18 +207,20 @@ var got: [plaintext.len]u8 = undefined;
 fn reset() void {
     prng_i = .init(0xb018_0001);
     prng_r = .init(0xb018_0002);
-    ini = bolt8.Initiator.init(&i_ls, r_ls.public_key);
-    rsp = bolt8.Responder.init(&r_ls);
+    bolt8.Initiator.init(&ini, &i_ls, r_ls.public_key);
+    bolt8.Responder.init(&rsp, &r_ls);
 }
 
 /// `var x = init(...); defer x.deinit();` — what a caller is told to write.
 noinline fn stepInitiatorInit() void {
-    var x = bolt8.Initiator.init(&i_ls, r_ls.public_key);
+    var x: bolt8.Initiator = undefined;
+    bolt8.Initiator.init(&x, &i_ls, r_ls.public_key);
     defer x.deinit();
     std.mem.doNotOptimizeAway(&x);
 }
 noinline fn stepResponderInit() void {
-    var x = bolt8.Responder.init(&r_ls);
+    var x: bolt8.Responder = undefined;
+    bolt8.Responder.init(&x, &r_ls);
     defer x.deinit();
     std.mem.doNotOptimizeAway(&x);
 }
@@ -241,8 +243,8 @@ noinline fn stepReadAct3() void {
     rsp.readAct3(m3, &res_r) catch unreachable;
 }
 noinline fn stepTransportInit() void {
-    t_i = bolt8.Transport.init(res_i);
-    t_r = bolt8.Transport.init(res_r);
+    bolt8.Transport.init(&t_i, &res_i);
+    bolt8.Transport.init(&t_r, &res_r);
 }
 noinline fn stepSend() void {
     t_i.sendMessage(plaintext, &wire) catch unreachable;
@@ -283,7 +285,7 @@ fn buildNeedles(n: *Needles) !void {
     stepGenAct1();
     const ie = ini.ephemeral.?;
     n.addKey("initiator ephemeral key", ie.secret_key);
-    n.add("es", try dh.dh(ie.secret_key, r_ls.public_key));
+    n.add("es", try dh.dh(&ie.secret_key, r_ls.public_key));
     n.add("es shared point x", try sharedX(ie.secret_key, r_ls.public_key));
     n.add("ck after act 1", ini.ss.ck);
     n.add("temp_k1", ini.ss.cipher_state.k);
@@ -292,14 +294,14 @@ fn buildNeedles(n: *Needles) !void {
     stepGenAct2();
     const re = rsp.ephemeral.?;
     n.addKey("responder ephemeral key", re.secret_key);
-    n.add("ee", try dh.dh(re.secret_key, ie.public_key));
+    n.add("ee", try dh.dh(&re.secret_key, ie.public_key));
     n.add("ee shared point x", try sharedX(re.secret_key, ie.public_key));
     n.add("ck after act 2", rsp.ss.ck);
     n.add("temp_k2", rsp.ss.cipher_state.k);
 
     stepReadAct2();
     stepGenAct3();
-    n.add("se", try dh.dh(i_ls.secret_key, re.public_key));
+    n.add("se", try dh.dh(&i_ls.secret_key, re.public_key));
     n.add("se shared point x", try sharedX(i_ls.secret_key, re.public_key));
     n.add("ck after act 3", res_i.ck);
     n.add("temp_k3", ini.ss.cipher_state.k);
@@ -310,8 +312,8 @@ fn buildNeedles(n: *Needles) !void {
 test "STACKPROBE (review 2026-10-08): no key or DH residue on the dead stack after any handshake or transport step" {
     if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
 
-    i_ls = try dh.KeyPair.generateDeterministic(kv.init_ls_priv.*);
-    r_ls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
+    try dh.KeyPair.generateDeterministic(&i_ls, kv.init_ls_priv);
+    try dh.KeyPair.generateDeterministic(&r_ls, kv.resp_ls_priv);
 
     var needles: Needles = .{};
     try buildNeedles(&needles);

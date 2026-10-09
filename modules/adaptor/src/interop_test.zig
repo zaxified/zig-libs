@@ -94,7 +94,7 @@ test "interop: adapt reproduces schnorr_fun's decrypt_signature BYTE-EXACTLY" {
             .s_prime = hexN(32, vec.s_prime),
             .needs_negation = vec.needs_negation,
         };
-        const sig = try adaptor.adapt(presig, hexN(32, vec.t));
+        const sig = try adaptor.adapt(presig, &(hexN(32, vec.t)));
         try std.testing.expectEqualSlices(u8, &hexN(64, vec.sig), &sig);
     }
 }
@@ -182,7 +182,7 @@ test "interop: adapt/extract on the SELF-AUTHORED vectors match schnorr_fun's ow
         };
         const t_point = try adaptor.AdaptorPoint.fromBytes(hexN(33, vec.adaptor_point));
 
-        const sig = try adaptor.adapt(presig, hexN(32, vec.t));
+        const sig = try adaptor.adapt(presig, &(hexN(32, vec.t)));
         try std.testing.expectEqualSlices(u8, &hexN(64, cross.foreign_sig), &sig);
 
         const full_sig = try bip340.Signature.fromBytes(sig);

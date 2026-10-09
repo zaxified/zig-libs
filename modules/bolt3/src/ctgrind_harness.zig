@@ -225,7 +225,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const basepoint_secret = reloadVolatile(32, &bs);
             const per_commitment_secret = reloadVolatile(32, &pcs);
 
-            const out = try bolt3.derivePrivateKey(basepoint_secret, per_commitment_secret);
+            var out: [32]u8 = undefined;
+            try bolt3.derivePrivateKey(&out, &basepoint_secret, &per_commitment_secret);
             std.debug.print("privkey={x}\n", .{out});
         },
         .revocation => {
@@ -236,7 +237,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const revocation_basepoint_secret = reloadVolatile(32, &rbs);
             const per_commitment_secret = reloadVolatile(32, &pcs);
 
-            const out = try bolt3.deriveRevocationPrivateKey(revocation_basepoint_secret, per_commitment_secret);
+            var out: [32]u8 = undefined;
+            try bolt3.deriveRevocationPrivateKey(&out, &revocation_basepoint_secret, &per_commitment_secret);
             std.debug.print("revprivkey={x}\n", .{out});
         },
         .shachain => {
@@ -248,7 +250,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintIf(tainted, &sd);
             const seed = reloadVolatile(32, &sd);
 
-            const out = bolt3.perCommitmentSecret(seed, bolt3.max_index);
+            var out: [32]u8 = undefined;
+            bolt3.perCommitmentSecret(&out, &seed, bolt3.max_index);
             std.debug.print("secret={x}\n", .{out});
         },
         .shachain_index => {
@@ -264,7 +267,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const idxr = reloadVolatile(6, &idx_bytes);
             const index = std.mem.readInt(u48, &idxr, .big);
 
-            const out = bolt3.perCommitmentSecret(seed, index);
+            var out: [32]u8 = undefined;
+            bolt3.perCommitmentSecret(&out, &seed, index);
             std.debug.print("secret={x}\n", .{out});
         },
     }

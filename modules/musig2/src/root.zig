@@ -58,6 +58,7 @@
 //! encodings, the MuSig2 aggregation/signing equations) on top.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const bip340 = @import("bip340");
 const Secp256k1 = @import("k256").Secp256k1;
 const Fe = Secp256k1.Fe;
@@ -356,20 +357,36 @@ pub const NonceGenResult = struct {
 /// given). `io` is threaded through for API symmetry with `bip340.sign`
 /// (unused: deterministic once `rand_prime` is in hand).
 pub fn nonceGen(
-    sk: ?[32]u8,
+    out: *NonceGenResult,
+    sk: ?*const [32]u8,
     pk: [33]u8,
     aggpk: ?[32]u8,
     msg: ?[]const u8,
     extra_in: ?[]const u8,
-    rand_prime: [32]u8,
+    rand_prime: *const [32]u8,
     io: std.Io,
-) NonceGenError!NonceGenResult {
+) NonceGenError!void {
+    return burn.run(burn.nonce_burn, NonceGenError!void, nonceGenBody, .{ out, sk, pk, aggpk, msg, extra_in, rand_prime, io });
+}
+
+fn nonceGenBody(
+    out: *NonceGenResult,
+    sk: ?*const [32]u8,
+    pk: [33]u8,
+    aggpk: ?[32]u8,
+    msg: ?[]const u8,
+    extra_in: ?[]const u8,
+    rand_prime: *const [32]u8,
+    io: std.Io,
+) NonceGenError!void {
     _ = io;
+    // Zeroed on every error path: `out` carries a secret nonce only on success.
+    out.* = .{ .secnonce = SecNonce.fromBytes(@splat(0)), .pubnonce = undefined };
 
     // rand = rand' xor taggedHash(MuSig/aux, rand') if sk given, else rand'.
-    var rand: [32]u8 = rand_prime;
+    var rand: [32]u8 = rand_prime.*;
     if (sk) |sk_bytes| {
-        const aux_hash = bip340.taggedHash(aux_tag, &rand_prime);
+        const aux_hash = bip340.taggedHash(aux_tag, rand_prime);
         for (&rand, sk_bytes, aux_hash) |*r, s, a| r.* = s ^ a;
     }
 
@@ -414,7 +431,7 @@ pub fn nonceGen(
     secnonce_bytes[32..64].* = k[1].toBytes(.big);
     secnonce_bytes[64..97].* = pk;
 
-    return .{
+    out.* = .{
         .secnonce = SecNonce.fromBytes(secnonce_bytes),
         .pubnonce = PubNonce.fromBytes(pubnonce_bytes) catch unreachable, // k*G is never infinity for k != 0
     };
@@ -1087,6 +1104,7 @@ test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 test "meta.model_after names BIP327 and the sibling bip340 dep" {

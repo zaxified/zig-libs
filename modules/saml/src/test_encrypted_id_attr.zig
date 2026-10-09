@@ -79,7 +79,7 @@ test "EncryptedID: decrypts to the same NameID as the cleartext equivalent" {
     var enc_signed = try mintResponse(alloc, enc_id, "");
     defer enc_signed.deinit(alloc);
     var cfg = baseConfig(fx.t_valid, enc_signed.key);
-    cfg.sp_decrypt_key = sp.secret_key;
+    cfg.sp_decrypt_key = &sp.secret_key;
     var res = try saml.consumeResponseXml(alloc, enc_signed.xml, cfg);
     defer res.deinit();
 
@@ -119,7 +119,7 @@ test "M19 teeth: decrypted EncryptedID plaintext that is not a NameID -> IdDecry
     var signed = try mintResponse(alloc, enc_id, "");
     defer signed.deinit(alloc);
     var cfg = baseConfig(fx.t_valid, signed.key);
-    cfg.sp_decrypt_key = sp.secret_key;
+    cfg.sp_decrypt_key = &sp.secret_key;
     try testing.expectError(error.IdDecryptionFailed, saml.consumeResponseXml(alloc, signed.xml, cfg));
 }
 
@@ -132,7 +132,7 @@ test "EncryptedID: wrong SP key -> IdDecryptionFailed (generic)" {
     var signed = try mintResponse(alloc, enc_id, "");
     defer signed.deinit(alloc);
     var cfg = baseConfig(fx.t_valid, signed.key);
-    cfg.sp_decrypt_key = other.secret_key;
+    cfg.sp_decrypt_key = &other.secret_key;
     try testing.expectError(error.IdDecryptionFailed, saml.consumeResponseXml(alloc, signed.xml, cfg));
 }
 
@@ -156,7 +156,7 @@ test "EncryptedAttribute: mixed cleartext + encrypted attributes all present" {
     var signed = try mintResponse(alloc, cleartext_nameid, stmt);
     defer signed.deinit(alloc);
     var cfg = baseConfig(fx.t_valid, signed.key);
-    cfg.sp_decrypt_key = sp.secret_key;
+    cfg.sp_decrypt_key = &sp.secret_key;
     var res = try saml.consumeResponseXml(alloc, signed.xml, cfg);
     defer res.deinit();
 
@@ -195,7 +195,7 @@ test "EncryptedAttribute: wrong SP key -> AttributeDecryptionFailed (generic)" {
     var signed = try mintResponse(alloc, cleartext_nameid, stmt);
     defer signed.deinit(alloc);
     var cfg = baseConfig(fx.t_valid, signed.key);
-    cfg.sp_decrypt_key = other.secret_key;
+    cfg.sp_decrypt_key = &other.secret_key;
     try testing.expectError(error.AttributeDecryptionFailed, saml.consumeResponseXml(alloc, signed.xml, cfg));
 }
 
@@ -216,6 +216,6 @@ test "EncryptedID enclosure is authenticated: tampering the ciphertext breaks th
     signed.xml[last] = if (signed.xml[last] == 'A') 'B' else 'A';
 
     var cfg = baseConfig(fx.t_valid, signed.key);
-    cfg.sp_decrypt_key = sp.secret_key;
+    cfg.sp_decrypt_key = &sp.secret_key;
     try testing.expectError(error.SignatureInvalid, saml.consumeResponseXml(alloc, signed.xml, cfg));
 }

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). Secrets go in by pointer, key-holding results come out through `out`: `KeyPair.generateDeterministic(out: *KeyPair, seed: *const [32]u8) SecretKeyError!void`, `KeyPair.generate(out: *KeyPair, random) void`, `dh.dh(secret_key: *const [32]u8, remote_pub)` (and `scalarmult`), `Initiator.init(out: *Initiator, ls, rs_pub) void`, `Responder.init(out: *Responder, ls) void`, `Transport.init(out: *Transport, result: *const HandshakeResult) void`, `Direction.init(out, key: *const [32]u8, chain: *const [32]u8) void`. `generateDeterministic`, `generate`, `dh` and `Transport`/`Direction.init` run under a stack burn (new `src/burn.zig`: 32 KiB ECC, 4 KiB init); the handshake acts keep their own `burnStack`. New `src/stackprobe2_test.zig` (testkit engine) probes the key/ECDH/direction entry points; the old probe was migrated to the new signatures. Tests use the value-shaped helpers in `src/testutil.zig`. `tools/peer.zig` (already out of date with `genAct3`) was not migrated.
+
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
   engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
   through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised

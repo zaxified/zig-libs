@@ -284,9 +284,10 @@ noinline fn constructBody(
         for (hop_payloads[0 .. n - 1], hop_secrets[0 .. n - 1]) |payload, hop_secret| {
             const shift = hopframe.shiftSize(payload.len);
             @memset(filler[filler_len..][0..shift], 0);
-            var rho = keyderive.generateKey(.rho, hop_secret.shared_secret);
+            var rho: [32]u8 = undefined;
+            keyderive.generateKey(&rho, .rho, &hop_secret.shared_secret);
             defer std.crypto.secureZero(u8, &rho);
-            keyderive.generateCipherStream(rho, stream[0 .. hopframe.hop_payloads_len + shift]);
+            keyderive.generateCipherStream(&rho, stream[0 .. hopframe.hop_payloads_len + shift]);
             const forced = stream[hopframe.hop_payloads_len - filler_len ..][0 .. filler_len + shift];
             for (filler[0 .. filler_len + shift], forced) |*f, s| f.* ^= s;
             filler_len += shift;
@@ -296,7 +297,12 @@ noinline fn constructBody(
     // Step 3: seed the working buffer with deterministic-from-session_key
     // padding (looks like CSPRNG output to every observer).
     var buf: [hopframe.hop_payloads_len]u8 = undefined;
-    keyderive.generateCipherStream(keyderive.generateKey(.pad, session_key.*), &buf);
+    {
+        var pad_key: [32]u8 = undefined;
+        keyderive.generateKey(&pad_key, .pad, session_key);
+        defer std.crypto.secureZero(u8, &pad_key);
+        keyderive.generateCipherStream(&pad_key, &buf);
+    }
 
     // Step 5: the REVERSE-order wrap loop (last hop's layer first).
     var next_hmac = [_]u8{0} ** hmac_len; // all-zero marks "final hop" for hop n-1
@@ -307,11 +313,12 @@ noinline fn constructBody(
         hopframe.rightShift(&buf, shift);
         _ = try hopframe.writeHopFrame(&buf, hop_payloads[i], next_hmac);
 
-        var rho = keyderive.generateKey(.rho, hop_secrets[i].shared_secret);
+        var rho: [32]u8 = undefined;
+        keyderive.generateKey(&rho, .rho, &hop_secrets[i].shared_secret);
         defer std.crypto.secureZero(u8, &rho);
         var stream: [hopframe.hop_payloads_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &stream);
-        keyderive.generateCipherStream(rho, &stream);
+        keyderive.generateCipherStream(&rho, &stream);
         for (&buf, stream) |*b, s| b.* ^= s;
 
         // Step 5e: on the first iteration only, splice the filler over the
@@ -320,7 +327,8 @@ noinline fn constructBody(
         // deobfuscation streams will force there.
         if (i == n - 1) @memcpy(buf[hopframe.hop_payloads_len - filler_len ..], filler[0..filler_len]);
 
-        var mu = keyderive.generateKey(.mu, hop_secrets[i].shared_secret);
+        var mu: [32]u8 = undefined;
+        keyderive.generateKey(&mu, .mu, &hop_secrets[i].shared_secret);
         defer std.crypto.secureZero(u8, &mu);
         var mac = HmacSha256.init(&mu);
         mac.update(&buf);
@@ -447,7 +455,8 @@ noinline fn processBody(node_privkey: *const [32]u8, pkt: OnionPacket, associate
 
     // Steps 2-4: verify the packet HMAC in constant time, BEFORE touching
     // hop_payloads' content in any data-dependent way.
-    var mu = keyderive.generateKey(.mu, shared_secret);
+    var mu: [32]u8 = undefined;
+    keyderive.generateKey(&mu, .mu, &shared_secret);
     defer std.crypto.secureZero(u8, &mu);
     var expected_hmac: [hmac_len]u8 = undefined;
     var mac = HmacSha256.init(&mu);
@@ -460,11 +469,12 @@ noinline fn processBody(node_privkey: *const [32]u8, pkt: OnionPacket, associate
     // Steps 5-6: deobfuscate `hop_payloads ‖ 0^1300` with a full 2600-byte
     // rho stream — the zero-padded second half becomes raw keystream, i.e.
     // exactly the "revealed tail" the sender's filler generation predicted.
-    var rho = keyderive.generateKey(.rho, shared_secret);
+    var rho: [32]u8 = undefined;
+    keyderive.generateKey(&rho, .rho, &shared_secret);
     defer std.crypto.secureZero(u8, &rho);
     var stream: [2 * hop_payloads_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &stream);
-    keyderive.generateCipherStream(rho, &stream);
+    keyderive.generateCipherStream(&rho, &stream);
     var unwrapped: [2 * hop_payloads_len]u8 = undefined;
     for (unwrapped[0..hop_payloads_len], pkt.hop_payloads, stream[0..hop_payloads_len]) |*u, p, s|
         u.* = p ^ s;
@@ -638,10 +648,14 @@ fn sealForTest(node_privkey: [32]u8, plaintext: []const u8, associated_data: []c
     var buf = [_]u8{0} ** hop_payloads_len;
     @memcpy(buf[0..plaintext.len], plaintext);
     var stream: [hop_payloads_len]u8 = undefined;
-    keyderive.generateCipherStream(keyderive.generateKey(.rho, hs[0].shared_secret), &stream);
+    var rho_k: [32]u8 = undefined;
+    keyderive.generateKey(&rho_k, .rho, &hs[0].shared_secret);
+    keyderive.generateCipherStream(&rho_k, &stream);
     for (&buf, stream) |*b, s| b.* ^= s;
     var hmac: [hmac_len]u8 = undefined;
-    var mac = HmacSha256.init(&keyderive.generateKey(.mu, hs[0].shared_secret));
+    var mu_k: [32]u8 = undefined;
+    keyderive.generateKey(&mu_k, .mu, &hs[0].shared_secret);
+    var mac = HmacSha256.init(&mu_k);
     mac.update(&buf);
     mac.update(associated_data);
     mac.final(&hmac);

@@ -1636,19 +1636,19 @@ test "decodeMessageKey refuses small-order keys (review F10) and takes a real on
     var identity: [32]u8 = @splat(0);
     identity[0] = 1;
     for ([_][32]u8{ order8, order4, identity }) |k| try std.testing.expectError(error.InvalidEncoding, decodeMessageKey(k));
-    const real = try messagePublicKey(@splat(7));
+    const real = try messagePublicKey(&@as([32]u8, @splat(7)));
     _ = try decodeMessageKey(real);
 }
 
 /// The Ed25519 public key of a message-signing seed (`KeyShare.message_seed`).
-pub fn messagePublicKey(seed: [32]u8) error{InvalidParameters}![32]u8 {
+pub fn messagePublicKey(seed: *const [32]u8) error{InvalidParameters}![32]u8 {
     const result = messagePublicKeyUnburned(seed);
     burn.stack(message_public_key_stack_burn);
     return result;
 }
 
-noinline fn messagePublicKeyUnburned(seed: [32]u8) error{InvalidParameters}![32]u8 {
-    const kp = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch return error.InvalidParameters;
+noinline fn messagePublicKeyUnburned(seed: *const [32]u8) error{InvalidParameters}![32]u8 {
+    const kp = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed.*) catch return error.InvalidParameters;
     return kp.public_key.toBytes();
 }
 
@@ -1921,7 +1921,7 @@ pub const KeyShare = struct {
         // The broadcast copy of this party's own `X_i` must be the one it holds.
         if (!std.mem.eql(u8, &own.verifying_share.toBytes(), &verifying_share.toBytes())) return error.InvalidEncoding;
         // …and so must its message key.
-        const own_mk = messagePublicKey(message_seed) catch return error.InvalidEncoding;
+        const own_mk = messagePublicKey(&message_seed) catch return error.InvalidEncoding;
         if (!std.mem.eql(u8, &own_mk, &own.message_key)) return error.InvalidEncoding;
 
         return .{
@@ -2013,7 +2013,7 @@ fn keygenTrustedDealerByValue(
             .paillier_pk = paillier_keys[i - 1].public,
             .aux = aux_params[i - 1],
             .verifying_share = try derivePublicKeyShare(split.commitments, i),
-            .message_key = try messagePublicKey(message_seeds[i - 1]),
+            .message_key = try messagePublicKey(&message_seeds[i - 1]),
         };
     }
     const public_keys: PublicKeys = .{ .entries = party_pubs };

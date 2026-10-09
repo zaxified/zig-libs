@@ -179,7 +179,7 @@ through the **same** signature-verify + XSW + conditions/subject/audience path a
 cleartext assertion does.
 
 - **Key config** (`Config`, all optional; null ⇒ old refuse-behavior):
-  - `sp_decrypt_key: ?rsa.SecretKey` — the SP's private key. **Null (default) ⇒
+  - `sp_decrypt_key: ?*const rsa.SecretKey` — the SP's private key (held by pointer; the key must outlive the call). **Null (default) ⇒
     an EncryptedAssertion is refused with `error.EncryptedAssertionUnsupported`**
     (unchanged for callers who did not opt in).
   - `allow_weak_rsa15: bool = false` — pass-through gate for RSA-1_5 key

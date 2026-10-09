@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** `check-secret-api` closed at 0 findings: `x3dh`/`pqxdh` `PreKeyBundle`/`InitialMessage` (public wire structs whose field name `identity_key` the lint reads as secret) and the entry points taking them by value carry `secret-api-ok` markers with that reason; the secret keys of those entry points were already by pointer and burned. No burn or signature changed.
+
 - **2026-10-09** — **Breaking:** dead-stack burn for every secret-handling entry point
   (`stackprobe_test.zig`: 12 of 13 probed calls left key / DH / chain-key / message-key /
   ML-KEM residue before — `generateKemPreKey` and the PQXDH calls dirtied 90-136 KiB; 0

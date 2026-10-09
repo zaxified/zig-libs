@@ -25,6 +25,13 @@
 
 const std = @import("std");
 const sphinx = @import("root.zig");
+
+/// Value-shaped test wrapper over the `out`-pointer `generateKey`.
+fn tKey(key_type: sphinx.KeyType, ss: [32]u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    sphinx.generateKey(&out, key_type, &ss);
+    return out;
+}
 const Secp256k1 = std.crypto.ecc.Secp256k1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const v = @import("kat_vectors.zig");
@@ -118,8 +125,8 @@ test "KAT: hopframe.shiftSize on the 5 official hop payload lengths (51, 115, 51
 
 test "KAT: generateKey('rho'/'mu', ss_0) are well-formed and distinct" {
     const ss0 = hexN(32, v.shared_secrets[0]);
-    const rho = sphinx.generateKey(.rho, ss0);
-    const mu = sphinx.generateKey(.mu, ss0);
+    const rho = tKey(.rho, ss0);
+    const mu = tKey(.mu, ss0);
     try testing.expect(!std.mem.eql(u8, &rho, &mu));
 
     // std-only recomputation, proving generateKey's HMAC-key/message
@@ -249,9 +256,9 @@ test "KAT: a hop_payloads tamper that would decode to a RESERVED bigsize length 
     // — a live parse-error oracle over the tampered ciphertext, reached
     // before the integrity check ever ran.
     const ss0 = hexN(32, v.shared_secrets[0]);
-    const rho = sphinx.generateKey(.rho, ss0);
+    const rho = tKey(.rho, ss0);
     var stream_byte: [1]u8 = undefined;
-    sphinx.generateCipherStream(rho, &stream_byte);
+    sphinx.generateCipherStream(&rho, &stream_byte);
 
     var pkt = try sphinx.OnionPacket.fromBytes(hexN(sphinx.packet_len, v.onion));
     pkt.hop_payloads[0] = stream_byte[0] ^ 1; // deobfuscates to exactly 1

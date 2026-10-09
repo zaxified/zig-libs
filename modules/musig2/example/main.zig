@@ -109,13 +109,15 @@ pub fn main() !void {
         const is_alice = std.mem.eql(u8, &pk.bytes, &alice_pk.bytes);
         const sk = if (is_alice) alice_sk else bob_sk;
         const rand = if (is_alice) alice_rand else bob_rand;
-        const generated = musig2.nonceGen(
-            sk.bytes,
+        var generated: musig2.NonceGenResult = undefined;
+        musig2.nonceGen(
+            &generated,
+            &sk.bytes,
             pk.toBytes(),
             channel_key,
             sighash,
             null,
-            rand,
+            &rand,
             io,
         ) catch |err| switch (err) {
             // Negligible but not impossible; a signer redraws rather than
@@ -209,13 +211,15 @@ pub fn main() !void {
     //    lets the caller distinguish "not your session" from "bad signature".
     const outsider_sk = try bip340.SecretKey.fromBytes(@splat(0x11));
     const outsider_pk = try plainPubkey(outsider_sk);
-    const outsider_nonce = try musig2.nonceGen(
-        outsider_sk.bytes,
+    var outsider_nonce: musig2.NonceGenResult = undefined;
+    try musig2.nonceGen(
+        &outsider_nonce,
+        &outsider_sk.bytes,
         outsider_pk.toBytes(),
         channel_key,
         sighash,
         null,
-        @splat(0x99),
+        &@as([32]u8, @splat(0x99)),
         io,
     );
     var outsider_secnonce = outsider_nonce.secnonce;

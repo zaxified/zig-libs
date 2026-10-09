@@ -432,6 +432,7 @@ pub const GroupSecrets = struct {
     path_secret: ?[]const u8 = null,
     psks: []const keyschedule.PreSharedKeyId = &.{},
 
+    // secret-api-ok: GroupSecrets holds only slices (heap/caller memory); a by-value copy copies pointers, not secret bytes.
     pub fn encodedLen(self: GroupSecrets) usize {
         const path: usize = if (self.path_secret) |ps| 1 + varintLen(ps.len) + ps.len else 1;
         return varintLen(self.joiner_secret.len) + self.joiner_secret.len +
@@ -439,6 +440,7 @@ pub const GroupSecrets = struct {
             wire.varVecLen(keyschedule.PreSharedKeyId, self.psks);
     }
 
+    // secret-api-ok: GroupSecrets holds only slices; encode only copies them into the caller-owned writer.
     pub fn encode(self: GroupSecrets, w: *codec.Writer) Error!void {
         try w.writeVector(self.joiner_secret);
         try w.writePresence(self.path_secret != null);
@@ -446,6 +448,7 @@ pub const GroupSecrets = struct {
         try wire.encodeVarVec(keyschedule.PreSharedKeyId, w, self.psks);
     }
 
+    // secret-api-ok: returns slices aliasing the input reader (plus the heap psks list); no secret bytes live in the result slot.
     pub fn decode(allocator: std.mem.Allocator, r: *codec.Reader) !GroupSecrets {
         const joiner_secret = try r.readVector();
         const path_secret: ?[]const u8 = if (try r.readPresence()) try r.readVector() else null;
@@ -548,6 +551,7 @@ pub const Welcome = struct {
     /// client's KeyPackages". A plain byte comparison is right here — a
     /// `KeyPackageRef` is a public hash of a public `KeyPackage`, not a
     /// secret, so there is nothing for a timing side channel to leak.
+    // secret-api-ok: false positive: key_package_ref is a public hash of a public KeyPackage (see the doc comment).
     pub fn findSecret(self: Welcome, key_package_ref: []const u8) ?EncryptedGroupSecrets {
         for (self.secrets) |s| {
             if (std.mem.eql(u8, s.new_member, key_package_ref)) return s;

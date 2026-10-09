@@ -984,7 +984,7 @@ pub fn Staged(comptime S: type) type {
 
         /// One node of the sender's filtered direct path, leaf-to-root —
         /// the same order and the same length as `UpdatePath.nodes` (§7.6).
-        pub const Node = struct {
+        pub const PathNode = struct {
             /// Array index of the direct-path node.
             node: usize,
             /// The copath child whose resolution this node's ciphertexts
@@ -1000,7 +1000,7 @@ pub fn Staged(comptime S: type) type {
         /// the freshly sampled `encryption_key`, §7.5's `parent_hash`, and
         /// a signature over all of it. Already installed in the tree.
         leaf_node: tree.LeafNode,
-        nodes: []Node,
+        nodes: []PathNode,
         /// §12.4.1's `commit_secret`: `path_secret[n+1]`, one
         /// `DeriveSecret(., "path")` past the last path secret — the same
         /// value `processUpdatePath` hands a receiver.
@@ -1118,7 +1118,7 @@ fn stageUpdatePathBody(
     const fdp = try filteredDirectPath(allocator, t, sender_node);
     defer allocator.free(fdp);
 
-    const nodes = try allocator.alloc(Staged(S).Node, fdp.len);
+    const nodes = try allocator.alloc(Staged(S).PathNode, fdp.len);
     errdefer allocator.free(nodes);
 
     // §7.4's chain: path_secret[0] is the sampled value; every later one is

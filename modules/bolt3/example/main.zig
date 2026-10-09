@@ -98,7 +98,8 @@ pub fn main() !void {
         // superseded) — a real peer would send 32 bytes on the wire; here
         // both halves live in one process, so derive the secret once and
         // only touch `.point_only` until "revocation time" below.
-        const pcs_this_round = bolt3.perCommitmentSecret(peer_seed, index);
+        var pcs_this_round: [32]u8 = undefined;
+        bolt3.perCommitmentSecret(&pcs_this_round, &peer_seed, index);
         const pcp_this_round = pointOf(pcs_this_round);
 
         // Local derives this round's simple + revocation keys from the
@@ -126,10 +127,12 @@ pub fn main() !void {
         // local holds and a per-commitment secret only the counterparty
         // reveals after the fact.
         if (prev_pcp != null) {
-            const revoked_secret = bolt3.perCommitmentSecret(peer_seed, prev_index);
+            var revoked_secret: [32]u8 = undefined;
+            bolt3.perCommitmentSecret(&revoked_secret, &peer_seed, prev_index);
             must(std.mem.eql(u8, &pointOf(revoked_secret), &prev_pcp.?), @src());
 
-            const revocationprivkey = try bolt3.deriveRevocationPrivateKey(local_revocation_basepoint_secret, revoked_secret);
+            var revocationprivkey: [32]u8 = undefined;
+            try bolt3.deriveRevocationPrivateKey(&revocationprivkey, &local_revocation_basepoint_secret, &revoked_secret);
             const revocationpubkey_from_priv = pointOf(revocationprivkey);
             must(std.mem.eql(u8, &revocationpubkey_from_priv, &prev_revocation_pubkey.?), @src());
             std.debug.print("round {d}: revoked round {d}'s commitment — justice key recovered, matches blind derivation\n", .{ round, round - 1 });
@@ -155,7 +158,10 @@ pub fn main() !void {
     // Likewise a corrupted secret (all-zero is non-canonical: not a valid
     // scalar) on the revocation-privkey path.
     const bad_secret = [_]u8{0} ** 32;
-    if (bolt3.deriveRevocationPrivateKey(bad_secret, bolt3.perCommitmentSecret(peer_seed, bolt3.max_index))) |_| {
+    var last_pcs: [32]u8 = undefined;
+    bolt3.perCommitmentSecret(&last_pcs, &peer_seed, bolt3.max_index);
+    var unused_key: [32]u8 = undefined;
+    if (bolt3.deriveRevocationPrivateKey(&unused_key, &bad_secret, &last_pcs)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.InvalidSecret => std.debug.print("corrupted revocation basepoint secret: InvalidSecret (expected)\n", .{}),
@@ -176,8 +182,10 @@ pub fn main() !void {
 
     // `perCommitmentSecret` is a pure function of (seed, index) — a node
     // never needs to STORE a once-derived secret, only recompute it.
-    const recomputed = bolt3.perCommitmentSecret(peer_seed, bolt3.max_index);
-    const first = bolt3.perCommitmentSecret(peer_seed, bolt3.max_index);
+    var recomputed: [32]u8 = undefined;
+    var first: [32]u8 = undefined;
+    bolt3.perCommitmentSecret(&recomputed, &peer_seed, bolt3.max_index);
+    bolt3.perCommitmentSecret(&first, &peer_seed, bolt3.max_index);
     must(std.mem.eql(u8, &recomputed, &first), @src());
 
     std.debug.print("bolt3 example: OK\n", .{});

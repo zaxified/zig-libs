@@ -129,6 +129,8 @@ pub const SetupError = std.mem.Allocator.Error || error{ DegenerateToxicWaste, D
 pub const ProveError = error{DomainTooSmall} || poly.DivError;
 
 /// Frees the heap-allocated key slices in a `KeyPair` returned by `setup`.
+// secret-api-ok: `KeyPair` here is (ProvingKey, VerifyingKey), the public CRS (curve points), not
+// key material; the only secret input of this module's setup (`ToxicWaste`) goes in by pointer.
 pub fn freeKeyPair(allocator: std.mem.Allocator, kp: KeyPair) void {
     allocator.free(kp.pk.a_query);
     allocator.free(kp.pk.b_g1_query);
@@ -198,6 +200,8 @@ fn columnEvalAtTau(comptime n: usize, sys: r1cs.System, which: Matrix, wire: usi
 ///
 /// Key slices are heap-allocated with `allocator`; free with `freeKeyPair`.
 ///
+// secret-api-ok: the returned `KeyPair` is the public CRS (ProvingKey/VerifyingKey: curve points),
+// not a secret; the toxic waste `tw` goes in by pointer and the body runs under `burn.setup_burn`.
 /// `tw` is read through the pointer and never copied: the caller owns the five
 /// scalars and wipes them (`ToxicWaste.deinit`) once `setup` has returned. The
 /// body runs one frame down and the stack it dirtied (the inverses of γ and δ,

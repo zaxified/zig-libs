@@ -224,14 +224,16 @@ test "STACKPROBE (audit 2026-10-08): no key or nonce residue on the dead stack a
     const io = std.testing.io;
     const partner_sk = [_]u8{0x6B} ** 32;
     const partner_pk = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase(partner_sk, .big)).toCompressedSec1() };
-    const partner = try musig2.nonceGen(partner_sk, partner_pk.bytes, null, msg, null, [_]u8{0x77} ** 32, io);
+    var partner: musig2.NonceGenResult = undefined;
+    try musig2.nonceGen(&partner, &partner_sk, partner_pk.bytes, null, msg, null, &@as([32]u8, [_]u8{0x77} ** 32), io);
 
     for (cases) |case| {
         probe_sk = try bip340.SecretKey.fromBytes(case.sk);
         const pk = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase(case.sk, .big)).toCompressedSec1() };
         probe_pks = .{ pk, partner_pk };
         musig2.keySort(&probe_pks);
-        const ng = try musig2.nonceGen(case.sk, pk.bytes, null, msg, null, case.rand, io);
+        var ng: musig2.NonceGenResult = undefined;
+        try musig2.nonceGen(&ng, &case.sk, pk.bytes, null, msg, null, &@as([32]u8, case.rand), io);
         probe_fresh = ng.secnonce;
         probe_ctx = .{ .aggnonce = try musig2.nonceAgg(&.{ ng.pubnonce, partner.pubnonce }), .pubkeys = &probe_pks, .msg = msg };
         const needles = try needlesFor(case.sk, probe_fresh);

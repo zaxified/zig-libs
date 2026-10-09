@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** `check-secret-api` closed at 0 findings: `One`/`Two` `encrypt`/`decrypt` (key already by pointer) delegate to `Aes256Cbc.encrypt`/`decrypt`, which burn the key schedule; they carry `secret-api-ok` markers saying so. No burn or signature changed.
+
 - **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte
   vector stores LLVM realigned the frame of a burn of 2 KiB or less (`and $-32, %rsp`), and the 32..63
   bytes between the zeroed buffer and the saved frame pointer kept whatever a callee had left there

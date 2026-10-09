@@ -193,6 +193,7 @@ pub const PreKeyBundle = struct {
 
     pub const DecodeError = error{InvalidPreKeyBundle};
 
+    // secret-api-ok: PreKeyBundle is Bob's PUBLISHED bundle (public keys, id, public signature); the lint reads the field name identity_key as secret.
     pub fn toBytes(b: PreKeyBundle) [encoded_length]u8 {
         var out: [encoded_length]u8 = undefined;
         var off: usize = 0;
@@ -215,6 +216,7 @@ pub const PreKeyBundle = struct {
         return out;
     }
 
+    // secret-api-ok: PreKeyBundle is Bob's PUBLISHED bundle (public keys, id, public signature); the lint reads the field name identity_key as secret.
     pub fn fromBytes(bytes: [encoded_length]u8) DecodeError!PreKeyBundle {
         var off: usize = 0;
         const identity_key = bytes[off..][0..key_length].*;
@@ -267,6 +269,7 @@ pub const InitialMessage = struct {
     pub const header_length: usize = key_length + key_length + 4 + 1 + 4 + 4; // 77
 
     /// Caller owns the returned slice (`allocator.free`).
+    // secret-api-ok: InitialMessage is Alice's wire message (public keys, ids, ciphertext); the lint reads the field name identity_key as secret.
     pub fn toBytes(m: InitialMessage, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         const out = try allocator.alloc(u8, header_length + m.ciphertext.len);
         var off: usize = 0;
@@ -289,6 +292,7 @@ pub const InitialMessage = struct {
     }
 
     /// Caller owns the returned `ciphertext` slice (`allocator.free`).
+    // secret-api-ok: InitialMessage is Alice's wire message (public keys, ids, ciphertext); the lint reads the field name identity_key as secret.
     pub fn fromBytes(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!InitialMessage {
         if (bytes.len < header_length) return error.InvalidInitialMessage;
         var off: usize = 0;
@@ -415,6 +419,7 @@ pub const InitiateOutput = struct {
 /// `alice_ik` by pointer; the output (whose `agreement.shared_secret` is the
 /// session secret) through `out`, written only on success. The stack the
 /// handshake used is burned before the call returns.
+// secret-api-ok: PreKeyBundle is Bob's PUBLISHED bundle (public keys, id, public signature); the lint reads the field name identity_key as secret.
 pub fn initiateUnverified(
     allocator: std.mem.Allocator,
     alice_ik: *const IdentityKey,
@@ -468,6 +473,7 @@ fn initiateUnverifiedBody(
 /// should use): verifies `bob_bundle`'s XEdDSA signature under
 /// `xeddsa.verify` first (spec § "X3DH key agreement" step 2) and only
 /// then defers to `initiateUnverified`.
+// secret-api-ok: PreKeyBundle is Bob's PUBLISHED bundle (public keys, id, public signature); the lint reads the field name identity_key as secret.
 pub fn initiate(
     allocator: std.mem.Allocator,
     alice_ik: *const IdentityKey,
@@ -512,6 +518,7 @@ pub const RespondOutput = struct {
 ///
 /// Bob's keys by pointer; the output (the session secret) through `out`,
 /// written only on success. Stack burned before the call returns.
+// secret-api-ok: alice_initial is the received wire message (public keys, ids, ciphertext); Bob's secret keys are passed by pointer.
 pub fn respond(
     allocator: std.mem.Allocator,
     bob_ik: *const IdentityKey,

@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const params = @import("params.zig");
+const burn = @import("burn.zig");
 const Shake256 = std.crypto.hash.sha3.Shake256;
 
 /// HQC's internal PRNG (domain 0) — a plain SHAKE256(entropy ||
@@ -64,7 +65,12 @@ pub const Prng = struct {
 pub const Xof = struct {
     st: Shake256,
 
+    /// Runs under a dead-stack burn (the seed is secret for `dk`-side draws).
     pub fn init(seed: []const u8) Xof {
+        return burn.run(burn.prng_burn, Xof, initBody, .{seed});
+    }
+
+    fn initBody(seed: []const u8) Xof {
         var st = Shake256.init(.{});
         st.update(seed);
         st.update(&.{params.domain.xof});
@@ -104,7 +110,12 @@ pub const Xof = struct {
 /// seedPKE.ek) from seedPKE (64-byte output, split by the caller into two
 /// 32-byte halves). KAT-verified: kat_vectors.zig's `hqc128_keygen`
 /// fixture reproduces `I(seed_pke) == seed_dk || seed_ek` exactly.
+/// Runs under a dead-stack burn.
 pub fn hashI(out: *[64]u8, seed: []const u8) void {
+    return burn.run(burn.prng_burn, void, hashIBody, .{ out, seed });
+}
+
+fn hashIBody(out: *[64]u8, seed: []const u8) void {
     var st = std.crypto.hash.sha3.Sha3_512.init(.{});
     st.update(seed);
     st.update(&.{params.domain.i});

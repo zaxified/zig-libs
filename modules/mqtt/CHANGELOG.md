@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack burn: `packet.encodePacket` (and so `encodeConnect`) runs its body under `burn.run` (12 KiB) when the packet is CONNECT (password) or AUTH (authentication data); PUBLISH and the rest are unchanged, no cost on the data path. New `stackprobe_test.zig` on `testkit.stackprobe`. No signature change.
+
 - **2026-10-06** — **Broker answers a refused CONNECT before closing (fix).** An MQTT 3.1.1 CONNECT
   with an empty client identifier and CleanSession 0 now gets CONNACK 0x02 (3.1.3-8), and a CONNECT
   at a protocol level this broker does not speak gets CONNACK "unacceptable protocol version" (3.1.2-2:

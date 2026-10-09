@@ -462,11 +462,15 @@ pub const SecretKey = struct {
 
     pub const ByteError = std.crypto.ff.OverflowError || std.crypto.ff.RepresentationError;
 
-    pub fn nByteLen(self: SecretKey) usize {
+    /// By pointer: `SecretKey` holds `lambda`/`mu`/the CRT block inline, so a
+    /// by-value receiver would copy them into the caller's frame.
+    pub fn nByteLen(self: *const SecretKey) usize {
         return byteLen(self.n.bits());
     }
 
-    pub fn nToBytes(self: SecretKey, out: []u8) ByteError!void {
+    // secret-api-ok: reads only the PUBLIC modulus `n` of the key (no `lambda`/`mu`/CRT field is
+    // touched), so there is nothing to burn; the receiver is a pointer so no secret is copied.
+    pub fn nToBytes(self: *const SecretKey, out: []u8) ByteError!void {
         return self.n.toBytes(out, .big);
     }
 

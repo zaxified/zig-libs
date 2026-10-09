@@ -20,17 +20,18 @@ const dh = @import("dh.zig");
 const act = @import("act.zig");
 const handshake = @import("handshake.zig");
 const transport = @import("transport.zig");
+const tu = @import("testutil.zig");
 
 /// An initiator that has emitted Act One with the KAT-injected ephemeral —
 /// the state every "initiator receives Act Two" test starts from.
 fn initiatorAfterAct1() !handshake.Initiator {
-    const ls = try dh.KeyPair.generateDeterministic(kv.init_ls_priv.*);
-    var initiator = handshake.Initiator.init(&ls, kv.resp_ls_pub.*);
+    const ls = tu.keyPair(kv.init_ls_priv.*);
+    var initiator = tu.initiator(&ls, kv.resp_ls_pub.*);
     // Appendix A fixes `e.priv`, so this goes through the test-build-only
     // `genAct1WithEphemeral` hook — the ONLY way to pin the ephemeral since
     // the B6 seam audit; `genAct1` itself always draws from its `Ephemeral`.
     const a1 = try initiator.genAct1WithEphemeral(
-        try dh.KeyPair.generateDeterministic(kv.init_e_priv.*),
+        tu.keyPair(kv.init_e_priv.*),
     );
     try testing.expectEqualSlices(u8, kv.act1_bytes, &a1.toBytes());
     return initiator;
@@ -40,11 +41,11 @@ fn initiatorAfterAct1() !handshake.Initiator {
 /// with the KAT-injected ephemeral — the state every "responder receives
 /// Act Three" test starts from.
 fn responderAfterAct2() !handshake.Responder {
-    const ls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
-    var responder = handshake.Responder.init(&ls);
+    const ls = tu.keyPair(kv.resp_ls_priv.*);
+    var responder = tu.responder(&ls);
     try responder.readAct1(try act.Act1.fromBytes(kv.act1_bytes));
     const a2 = try responder.genAct2WithEphemeral(
-        try dh.KeyPair.generateDeterministic(kv.resp_e_priv.*),
+        tu.keyPair(kv.resp_e_priv.*),
     );
     try testing.expectEqualSlices(u8, kv.act2_bytes, &a2.toBytes());
     return responder;
@@ -104,8 +105,8 @@ test "KAT: full 'transport-initiator successful handshake' — act1/act2/act3 + 
     // Transport round-trip over the freshly-derived keys: the initiator's
     // first message must be the published message-0 vector, and the
     // responder must decrypt it back.
-    var itx = transport.Transport.init(a3.result);
-    var rtx = transport.Transport.init(r);
+    var itx = tu.transportOf(a3.result);
+    var rtx = tu.transportOf(r);
     var wire: [transport.length_frame_len + 5 + 16]u8 = undefined;
     try itx.sendMessage("hello", &wire);
     try testing.expectEqualSlices(u8, kv.msg_outputs[0].bytes, &wire);
@@ -122,8 +123,8 @@ test "KAT: 'transport-initiator act2 bad MAC test' — readAct2 must fail closed
 }
 
 test "KAT: 'transport-responder act1 bad MAC test' — readAct1 must fail closed with DecryptionFailed" {
-    const ls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
-    var responder = handshake.Responder.init(&ls);
+    const ls = tu.keyPair(kv.resp_ls_priv.*);
+    var responder = tu.responder(&ls);
     try testing.expectError(error.DecryptionFailed, responder.readAct1(try act.Act1.fromBytes(kv.act1_bad_mac)));
 }
 
@@ -182,15 +183,15 @@ test "F5: Act One failing on a malformed rs, and readAct1 failing on a bad MAC, 
     // the 2026-10-08 mutation run, leaving the initiator in `.start` with
     // `h` already holding the first ephemeral -- a retry would run Act One
     // again over a transcript the responder can never match.
-    const ls = try dh.KeyPair.generateDeterministic(kv.init_ls_priv.*);
-    var initiator = handshake.Initiator.init(&ls, kv.bad_pubkey_serialization.*);
-    const e = try dh.KeyPair.generateDeterministic(kv.init_e_priv.*);
+    const ls = tu.keyPair(kv.init_ls_priv.*);
+    var initiator = tu.initiator(&ls, kv.bad_pubkey_serialization.*);
+    const e = tu.keyPair(kv.init_e_priv.*);
     try testing.expectError(error.InvalidPublicKey, initiator.genAct1WithEphemeral(e));
     try testing.expectEqual(handshake.Initiator.State.failed, initiator.state);
     try testing.expectError(error.WrongState, initiator.genAct1WithEphemeral(e));
 
-    const rls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
-    var responder = handshake.Responder.init(&rls);
+    const rls = tu.keyPair(kv.resp_ls_priv.*);
+    var responder = tu.responder(&rls);
     try testing.expectError(error.DecryptionFailed, responder.readAct1(try act.Act1.fromBytes(kv.act1_bad_mac)));
     try testing.expectEqual(handshake.Responder.State.failed, responder.state);
     try testing.expectError(error.WrongState, responder.readAct1(try act.Act1.fromBytes(kv.act1_bytes)));
@@ -200,8 +201,8 @@ test "KAT: 'transport-responder act1 bad key serialization test' — readAct1 mu
     // Audit finding F4 (2026-09-05): of BOLT#8's 16 named test vectors, this
     // was the one embedded nowhere and exercised nowhere. The module
     // rejects it correctly today -- this pins that against regression.
-    const ls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
-    var responder = handshake.Responder.init(&ls);
+    const ls = tu.keyPair(kv.resp_ls_priv.*);
+    var responder = tu.responder(&ls);
     try testing.expectError(error.InvalidPublicKey, responder.readAct1(try act.Act1.fromBytes(kv.act1_bad_key_serialization)));
     // Sanity check on the vector itself: exactly one byte different from
     // the accepted `act1_bytes` (the e.pub SEC1 prefix, index 1), so this
@@ -232,7 +233,7 @@ test "KAT: 'transport-responder act3 bad rs test' — a decryptable-but-unparsea
 // ── what IS real, cross-checked here as end-to-end wiring sanity ───────
 
 test "wiring sanity: Transport built from the published sk/rk/ck reproduces the message-test outputs (delegates to transport.zig's own KAT)" {
-    var t = transport.Transport.init(.{
+    var t = tu.transportOf(.{
         .sk = kv.init_sk.*,
         .rk = kv.init_rk.*,
         .ck = kv.ck_temp_k3[0].*,
@@ -249,14 +250,14 @@ test "README 'post-handshake transport' snippet, verbatim, with real types (F9 2
     // `l` is `Transport.recvLength`'s runtime `u16` result -- "unable to
     // resolve comptime value". This is the corrected form, kept in the real
     // suite (not just the doc) so it cannot silently rot again.
-    var sender = transport.Transport.init(.{
+    var sender = tu.transportOf(.{
         .sk = kv.init_sk.*,
         .rk = kv.init_rk.*,
         .ck = kv.ck_temp_k3[0].*,
         .handshake_hash = [_]u8{0} ** 32,
         .remote_static = [_]u8{0} ** 33,
     });
-    var receiver = transport.Transport.init(.{
+    var receiver = tu.transportOf(.{
         .sk = kv.init_rk.*,
         .rk = kv.init_sk.*,
         .ck = kv.ck_temp_k3[0].*,
@@ -337,10 +338,10 @@ test "differential: BOLT#8 message-test frames are byte-identical under chachapo
 }
 
 test "wiring sanity: Initiator.init/Responder.init from the published identities agree (delegates to handshake.zig's own KAT)" {
-    const init_ls = try dh.KeyPair.generateDeterministic(kv.init_ls_priv.*);
-    const resp_ls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
-    const initiator = handshake.Initiator.init(&init_ls, kv.resp_ls_pub.*);
-    const responder = handshake.Responder.init(&resp_ls);
+    const init_ls = tu.keyPair(kv.init_ls_priv.*);
+    const resp_ls = tu.keyPair(kv.resp_ls_priv.*);
+    const initiator = tu.initiator(&init_ls, kv.resp_ls_pub.*);
+    const responder = tu.responder(&resp_ls);
     try testing.expectEqual(initiator.ss.h, responder.ss.h);
     try testing.expectEqualSlices(u8, kv.ck_after_init, &initiator.ss.ck);
 }
@@ -364,7 +365,7 @@ test "F2: deinit zeroes the key material each object directly owns" {
     try testing.expect(std.mem.allEqual(u8, &responder.ls.secret_key, 0));
     try testing.expect(std.mem.allEqual(u8, &responder.ss.ck, 0));
 
-    var t = transport.Transport.init(.{ .sk = kv.init_sk.*, .rk = kv.init_rk.*, .ck = kv.ck_temp_k3[0].*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var t = tu.transportOf(.{ .sk = kv.init_sk.*, .rk = kv.init_rk.*, .ck = kv.ck_temp_k3[0].*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
     try testing.expect(!std.mem.allEqual(u8, &t.tx.cipher.k, 0));
     t.deinit();
     try testing.expect(std.mem.allEqual(u8, &t.tx.cipher.k, 0));

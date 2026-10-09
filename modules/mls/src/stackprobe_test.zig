@@ -353,7 +353,7 @@ fn rewind() void {
 
 // ── world: clients, replicas, pristine results ──────────────────────────────
 
-const gpa = std.heap.page_allocator;
+const gpa = std.heap.page_allocator; // global-alloc-ok: the probe's fixture world (clients, replicas, pristine results) outlives every test block and must not come from testing.allocator, whose per-test leak check would fire on it
 const POOL = 8;
 const n_cases = 2;
 

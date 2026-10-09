@@ -3188,7 +3188,7 @@ test "presign: the session id binds the signer set, the threshold and the public
     // Peer 2 holds another message key in this party's table (a split refresh).
     const entries = try allocator.dupe(root.PartyPublicKeys, share.public_keys.entries);
     defer allocator.free(entries);
-    entries[1].message_key = try root.messagePublicKey(@splat(9));
+    entries[1].message_key = try root.messagePublicKey(&@as([32]u8, @splat(9)));
     var other_table_share = share;
     other_table_share.public_keys = .{ .entries = entries };
     var other_table: Party = undefined;

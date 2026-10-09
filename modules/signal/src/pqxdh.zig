@@ -264,6 +264,7 @@ pub const InitiateOutput = struct {
 ///
 /// `alice_ik` by pointer; the output (the session secret) through `out`,
 /// written only on success. Stack burned before the call returns.
+// secret-api-ok: bob_bundle is Bob's published bundle (public keys and signatures); Alice's secret key is passed by pointer.
 pub fn initiateUnverified(
     allocator: std.mem.Allocator,
     alice_ik: *const IdentityKey,
@@ -324,6 +325,7 @@ fn initiateUnverifiedBody(
 
 /// Alice's side, fail-closed: both of Bob's signatures are verified before
 /// any key material is derived.
+// secret-api-ok: bob_bundle is Bob's published bundle (public keys and signatures); Alice's secret key is passed by pointer.
 pub fn initiate(
     allocator: std.mem.Allocator,
     alice_ik: *const IdentityKey,
@@ -376,6 +378,7 @@ pub const RespondError = AgreementError || initial_message.OpenError || error{
 ///
 /// Bob's keys by pointer; the output (the session secret) through `out`,
 /// written only on success. Stack burned before the call returns.
+// secret-api-ok: alice_initial is the received wire message (public keys, ids, KEM ciphertext); Bob's secret keys are passed by pointer.
 pub fn respond(
     allocator: std.mem.Allocator,
     bob_ik: *const IdentityKey,

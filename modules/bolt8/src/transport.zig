@@ -18,6 +18,7 @@ const std = @import("std");
 const handshake = @import("handshake.zig");
 const Suite = handshake.Suite;
 const CipherState = Suite.CipherState;
+const burn = @import("burn.zig");
 
 /// BOLT#8 "Lightning Message Specification": "The *maximum* size of _any_
 /// Lightning message MUST NOT exceed 65535 bytes."
@@ -45,10 +46,16 @@ pub const Direction = struct {
     /// `split()`.
     chain: [32]u8,
 
-    pub fn init(key: [32]u8, chain: [32]u8) Direction {
-        var cipher: CipherState = .{};
-        cipher.initializeKey(&key);
-        return .{ .cipher = cipher, .chain = chain };
+    /// The direction goes into `out` (it holds the key, so it is not returned);
+    /// runs under a dead-stack burn.
+    pub fn init(out: *Direction, key: *const [32]u8, chain: *const [32]u8) void {
+        return burn.run(burn.init_burn, void, initBody, .{ out, key, chain });
+    }
+
+    fn initBody(out: *Direction, key: *const [32]u8, chain: *const [32]u8) void {
+        out.cipher = .{};
+        out.cipher.initializeKey(key);
+        out.chain = chain.*;
     }
 
     /// BOLT#8 "Lightning Message Key Rotation", steps 1-5 for a single key
@@ -111,11 +118,16 @@ pub const Transport = struct {
     /// (`handshake.HandshakeResult`) per BOLT#8 Act Three steps 6-8 (or
     /// the receiver's mirrored 9-11): `rn = sn = 0` (`Direction.init` via
     /// `CipherState.initializeKey`), `rck = sck = ck`.
-    pub fn init(result: handshake.HandshakeResult) Transport {
-        return .{
-            .tx = Direction.init(result.sk, result.ck),
-            .rx = Direction.init(result.rk, result.ck),
-        };
+    ///
+    /// The transport goes into `out` (it holds both keys); `result` is read
+    /// through a pointer. Runs under a dead-stack burn.
+    pub fn init(out: *Transport, result: *const handshake.HandshakeResult) void {
+        return burn.run(burn.init_burn, void, initBody, .{ out, result });
+    }
+
+    fn initBody(out: *Transport, result: *const handshake.HandshakeResult) void {
+        Direction.init(&out.tx, &result.sk, &result.ck);
+        Direction.init(&out.rx, &result.rk, &result.ck);
     }
 
     /// Zero both directions' live cipher key and rotation chaining key.
@@ -198,13 +210,15 @@ pub const Transport = struct {
 // `kat_vectors.zig` (single source of truth).
 
 const testing = std.testing;
+const tu = @import("testutil.zig");
 const kv = @import("kat_vectors.zig");
 const msg_test_ck = kv.msg_test_ck;
 const msg_test_sk = kv.msg_test_sk;
 const msg_test_rk = kv.msg_test_rk;
 
 test "Direction.rotate: matches the published rotation intermediates byte-exact (twice)" {
-    var d = Direction.init(msg_test_sk.*, msg_test_ck.*);
+    var d: Direction = undefined;
+    Direction.init(&d, msg_test_sk, msg_test_ck);
     d.rotate();
     try testing.expectEqualSlices(u8, kv.rotation_1.chain, &d.chain);
     try testing.expectEqualSlices(u8, kv.rotation_1.key, &d.cipher.k);
@@ -216,7 +230,7 @@ test "Direction.rotate: matches the published rotation intermediates byte-exact 
 }
 
 test "Transport.sendMessage: 1001x 'hello' reproduces all 6 published outputs, auto-rotating at message 500/1000" {
-    var t = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var t = tu.transportOf(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
 
     var want_i: usize = 0;
     var out: [length_frame_len + 5 + 16]u8 = undefined;
@@ -236,8 +250,8 @@ test "Transport: round-trip send/recv across a rotation boundary (real decrypt o
     // used only to send, one only to receive — decrypting the SAME
     // messages the sender produced (both directions rotate identically
     // since both start from the same (ck, sk) as "their own" tx key).
-    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
-    var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var sender = tu.transportOf(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var receiver = tu.transportOf(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
 
     var i: usize = 0;
     while (i < 1002) : (i += 1) {
@@ -253,7 +267,7 @@ test "Transport: round-trip send/recv across a rotation boundary (real decrypt o
 }
 
 test "Transport.sendMessage: rejects an oversized message and a wrong-size buffer" {
-    var t = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var t = tu.transportOf(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
     var out: [length_frame_len + 5 + 16]u8 = undefined;
     try testing.expectError(error.BufferWrongSize, t.sendMessage("hello", out[0 .. out.len - 1]));
     // Too LARGE is wrong too: the caller sends `out` as-is, so a spare tail
@@ -275,8 +289,8 @@ test "Transport: a message of exactly 65535 bytes, BOLT#8's maximum, is sent and
     // big-endian integer and a message MUST NOT exceed 65535 bytes — so
     // 65535 itself is legal and has to get through.
     const result: handshake.HandshakeResult = .{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 };
-    var a = Transport.init(result);
-    var b = Transport.init(.{ .sk = result.rk, .rk = result.sk, .ck = result.ck, .handshake_hash = result.handshake_hash, .remote_static = result.remote_static });
+    var a = tu.transportOf(result);
+    var b = tu.transportOf(.{ .sk = result.rk, .rk = result.sk, .ck = result.ck, .handshake_hash = result.handshake_hash, .remote_static = result.remote_static });
     const m = try testing.allocator.alloc(u8, max_message_len);
     defer testing.allocator.free(m);
     for (m, 0..) |*x, i| x.* = @truncate(i *% 31);
@@ -299,8 +313,8 @@ test "Transport.recvMessage: rejects a mismatched-size out buffer BEFORE decrypt
     // `out`, leaving the rest of the caller's buffer untouched (stale/
     // uninitialized) while looking like a normal successful call — this
     // guard is what turns that into an explicit, loud rejection instead.
-    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
-    var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var sender = tu.transportOf(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var receiver = tu.transportOf(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
 
     var out: [length_frame_len + 5 + 16]u8 = undefined;
     try sender.sendMessage("hello", &out);
@@ -314,8 +328,8 @@ test "Transport.recvMessage: rejects a mismatched-size out buffer BEFORE decrypt
 }
 
 test "Transport.recvMessage: a tampered ciphertext fails closed with DecryptionFailed" {
-    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
-    var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var sender = tu.transportOf(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var receiver = tu.transportOf(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
 
     var out: [length_frame_len + 5 + 16]u8 = undefined;
     try sender.sendMessage("hello", &out);
@@ -332,8 +346,8 @@ test "F13: NonceExhausted is structurally unreachable through this module's own 
     // `sendMessage`/`recvLength`/`recvMessage` can never approach
     // `CipherState`'s real exhaustion point (2^64-1). 4000 messages spans
     // four rotation boundaries; `n` must never exceed `rotation_interval`.
-    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
-    var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var sender = tu.transportOf(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var receiver = tu.transportOf(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
     var max_tx_n: u64 = 0;
     var max_rx_n: u64 = 0;
     var i: usize = 0;
@@ -359,7 +373,7 @@ test "F13: NonceExhausted is structurally unreachable through this module's own 
 // real AEAD decrypt rather than failing on an uninitialised cipher.
 
 fn freshReceiver() Transport {
-    return Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    return tu.transportOf(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
 }
 
 const fuzz_test = @import("fuzz_test.zig");
@@ -368,7 +382,7 @@ const fuzz_test = @import("fuzz_test.zig");
 /// length frame, then the 5 + 16 octet body.
 fn genuineFrame() [length_frame_len + 5 + 16]u8 {
     var out: [length_frame_len + 5 + 16]u8 = undefined;
-    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var sender = tu.transportOf(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
     sender.sendMessage("hello", &out) catch unreachable;
     return out;
 }
@@ -487,7 +501,7 @@ test "fuzz Transport.recvMessage never panics" {
 
 test "corpus: the transport seeds reach a real AEAD decrypt, not just the length gate" {
     var seed_out: [length_frame_len + 5 + 16]u8 = undefined;
-    var seed_sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var seed_sender = tu.transportOf(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
     try seed_sender.sendMessage("hello", &seed_out);
 
     var recv_len: Transport = freshReceiver();

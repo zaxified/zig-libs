@@ -61,7 +61,7 @@ pub const sp_priv_pem =
     \\-----END PRIVATE KEY-----
 ;
 
-fn spKey() !rsa.SecretKey {
+pub fn spKey() !rsa.SecretKey {
     var sk: rsa.SecretKey = undefined;
     try rsa.SecretKey.fromPem(&sk, sp_priv_pem);
     return sk;
@@ -74,7 +74,7 @@ fn spKey() !rsa.SecretKey {
 // from the Response, exactly as `test_encrypted.zig`'s own helper does —
 // Exclusive-C14N is position-independent, so the existing IdP signature over
 // it is unaffected by that declaration).
-const response_with_encrypted_assertion =
+pub const response_with_encrypted_assertion =
     "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"_resp0011223344556677889900aabbcc\" Version=\"2.0\" IssueInstant=\"2024-06-01T12:00:00Z\" Destination=\"https://sp.example.org/acs\" InResponseTo=\"req-9988776655\"><saml:Issuer>https://idp.example.org/saml</saml:Issuer><samlp:Status><samlp:StatusCode Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/></samlp:Status><saml:EncryptedAssertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\"><xenc:EncryptedData xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\" Type=\"http://www.w3.org/2001/04/xmlenc#Element\">\n" ++
     "<xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/>\n" ++
     "<ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\n" ++
@@ -164,7 +164,8 @@ test "EXTERNAL anchor: fixture count canary — 1 genuinely xmlsec1-encrypted En
 
 test "EXTERNAL anchor: xmlsec1-encrypted EncryptedAssertion decrypts -> verifies -> extracts identically to the cleartext fixture" {
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = try spKey();
+    const sp_key = try spKey();
+    cfg.sp_decrypt_key = &sp_key;
     var res = try saml.consumeResponseXml(testing.allocator, response_with_encrypted_assertion, cfg);
     defer res.deinit();
 
@@ -194,7 +195,8 @@ test "EXTERNAL anchor: tampered ciphertext xmlsec1 itself refuses to decrypt is 
     );
     defer alloc.free(tampered);
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = try spKey();
+    const sp_key = try spKey();
+    cfg.sp_decrypt_key = &sp_key;
     try testing.expectError(error.AssertionDecryptionFailed, saml.consumeResponseXml(alloc, tampered, cfg));
 }
 
@@ -206,7 +208,8 @@ test "EXTERNAL anchor: rollover — the decrypted assertion verifies under an AD
     var old: rsa.KeyPair = undefined;
     try rsa.generate(&old, prng.random(), 1024, 65537);
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = try spKey();
+    const sp_key = try spKey();
+    cfg.sp_decrypt_key = &sp_key;
     cfg.idp_key = .{ .rsa = old.public_key };
     const extra = [_]saml.VerifyKey{fx.idpKey()};
     cfg.additional_idp_keys = &extra;

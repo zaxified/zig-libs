@@ -40,6 +40,7 @@
 //! specifications.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 
 /// Protocol name carried in the CONNECT variable header (spec 3.1.2.1).
 pub const protocol_name = "MQTT";
@@ -1167,6 +1168,16 @@ fn fixedFlags(p: Packet) u4 {
 /// with reason success and no properties takes the short form the spec
 /// allows (no reason code, no property length).
 pub fn encodePacket(buf: []u8, version: Version, p: Packet) EncodeError![]const u8 {
+    // Only the packets that carry a credential (CONNECT's password, AUTH's
+    // authentication data) run under a dead-stack burn; PUBLISH and the rest
+    // are the data path and hold nothing secret.
+    return switch (p) {
+        .connect, .auth => burn.run(burn.cred_burn, EncodeError![]const u8, encodePacketBody, .{ buf, version, p }),
+        else => encodePacketBody(buf, version, p),
+    };
+}
+
+fn encodePacketBody(buf: []u8, version: Version, p: Packet) EncodeError![]const u8 {
     var counter = Cursor{ .buf = &.{}, .counting = true };
     try writeBody(&counter, version, p);
     const remaining = try checkedRemaining(counter.pos);
@@ -1179,6 +1190,7 @@ pub fn encodePacket(buf: []u8, version: Version, p: Packet) EncodeError![]const 
 /// Wire size of the packet `encodePacket` would produce for `p`, without a
 /// buffer — so a sender can hold a message to a receiver's limit (5.0's
 /// Maximum Packet Size, a broker's `max_packet_size`) before encoding it.
+// secret-api-ok: counting pass only (`Cursor.counting` writes and copies nothing, it adds lengths), so a CONNECT password is never copied into a frame here.
 pub fn packetWireLen(version: Version, p: Packet) EncodeError!usize {
     var counter = Cursor{ .buf = &.{}, .counting = true };
     try writeBody(&counter, version, p);

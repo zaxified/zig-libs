@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). `Pke.keygen(out: *KeyPair, seed)` returns its pair through `out` (was `keygen(seed) KeyPair`; `kem.keypair` is the only in-tree caller and zeroes its copy); it runs under the KEM-keypair-sized burn. `prng.Xof.init` and `prng.hashI` now run under a 4 KiB burn (`burn.prng_burn`). New `src/stackprobe2_test.zig` probes the three.
+
 - **2026-10-09** — **BREAKING, HIGH: HQC-KEM left its secrets on the dead stack.** New
   ReleaseFast stack probe (`stackprobe_test.zig`, all three sets), 5 calls each, before → after
   (HQC-128 / HQC-256): `keypair` the seed, the PKE seed 30, sigma 25 and the secret half of dk

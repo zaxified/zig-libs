@@ -32,6 +32,7 @@ const Secp256k1 = @import("k256").Secp256k1;
 const scalar = Secp256k1.scalar;
 const Scalar = scalar.Scalar;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -90,16 +91,22 @@ pub fn derivePublicKey(basepoint: [33]u8, per_commitment_point: [33]u8) Error![3
 
 /// privkey = basepoint_secret + SHA256(per_commitment_point ‖ basepoint)   (mod n),
 /// where basepoint / per_commitment_point are the secrets' own public points.
-pub fn derivePrivateKey(basepoint_secret: [32]u8, per_commitment_secret: [32]u8) Error![32]u8 {
-    var b = Scalar.fromBytes(basepoint_secret, .big) catch return error.InvalidSecret;
+/// The result goes into `out` (zeroed on error); runs under a dead-stack burn.
+pub fn derivePrivateKey(out: *[32]u8, basepoint_secret: *const [32]u8, per_commitment_secret: *const [32]u8) Error!void {
+    return burn.run(burn.ecc_burn, Error!void, derivePrivateKeyBody, .{ out, basepoint_secret, per_commitment_secret });
+}
+
+fn derivePrivateKeyBody(out: *[32]u8, basepoint_secret: *const [32]u8, per_commitment_secret: *const [32]u8) Error!void {
+    out.* = @splat(0);
+    var b = Scalar.fromBytes(basepoint_secret.*, .big) catch return error.InvalidSecret;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&b));
     // `pointOf` (k256 `combMulBase`) reduces a scalar >= n instead of
     // refusing it, so canonicality is checked here, as for every other secret.
-    _ = Scalar.fromBytes(per_commitment_secret, .big) catch return error.InvalidSecret;
+    _ = Scalar.fromBytes(per_commitment_secret.*, .big) catch return error.InvalidSecret;
     const basepoint = pointOf(basepoint_secret) catch return error.InvalidSecret;
     const per_commitment_point = pointOf(per_commitment_secret) catch return error.InvalidSecret;
     const t = hashToScalar(sha2(per_commitment_point, basepoint));
-    return b.add(t).toBytes(.big);
+    out.* = b.add(t).toBytes(.big);
 }
 
 /// revocationpubkey = revocation_basepoint·h1 + per_commitment_point·h2, with
@@ -117,20 +124,26 @@ pub fn deriveRevocationPublicKey(revocation_basepoint: [33]u8, per_commitment_po
 
 /// revocationprivkey = revocation_basepoint_secret·h1 + per_commitment_secret·h2  (mod n),
 /// with the same h1/h2 as above computed from the secrets' public points.
-pub fn deriveRevocationPrivateKey(revocation_basepoint_secret: [32]u8, per_commitment_secret: [32]u8) Error![32]u8 {
-    var rbs = Scalar.fromBytes(revocation_basepoint_secret, .big) catch return error.InvalidSecret;
+/// The result goes into `out` (zeroed on error); runs under a dead-stack burn.
+pub fn deriveRevocationPrivateKey(out: *[32]u8, revocation_basepoint_secret: *const [32]u8, per_commitment_secret: *const [32]u8) Error!void {
+    return burn.run(burn.ecc_burn, Error!void, deriveRevocationPrivateKeyBody, .{ out, revocation_basepoint_secret, per_commitment_secret });
+}
+
+fn deriveRevocationPrivateKeyBody(out: *[32]u8, revocation_basepoint_secret: *const [32]u8, per_commitment_secret: *const [32]u8) Error!void {
+    out.* = @splat(0);
+    var rbs = Scalar.fromBytes(revocation_basepoint_secret.*, .big) catch return error.InvalidSecret;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&rbs));
-    var pcs = Scalar.fromBytes(per_commitment_secret, .big) catch return error.InvalidSecret;
+    var pcs = Scalar.fromBytes(per_commitment_secret.*, .big) catch return error.InvalidSecret;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&pcs));
     const revocation_basepoint = pointOf(revocation_basepoint_secret) catch return error.InvalidSecret;
     const per_commitment_point = pointOf(per_commitment_secret) catch return error.InvalidSecret;
     const h1 = hashToScalar(sha2(revocation_basepoint, per_commitment_point));
     const h2 = hashToScalar(sha2(per_commitment_point, revocation_basepoint));
-    return rbs.mul(h1).add(pcs.mul(h2)).toBytes(.big);
+    out.* = rbs.mul(h1).add(pcs.mul(h2)).toBytes(.big);
 }
 
-fn pointOf(secret: [32]u8) ![33]u8 {
-    const p = try Secp256k1.combMulBase(secret, .big);
+fn pointOf(secret: *const [32]u8) ![33]u8 {
+    const p = try Secp256k1.combMulBase(secret.*, .big);
     return p.toCompressedSec1();
 }
 
@@ -145,8 +158,14 @@ pub const max_index: u48 = (1 << 48) - 1;
 /// store any prefix of already-revealed secrets in O(48) space (see the
 /// storage half — a follow-up `RevocationStore`) while making each secret
 /// derivable only forward, never backward.
-pub fn perCommitmentSecret(seed: [32]u8, index: u48) [32]u8 {
-    var p = seed;
+/// The result goes into `out`; runs under a dead-stack burn.
+pub fn perCommitmentSecret(out: *[32]u8, seed: *const [32]u8, index: u48) void {
+    return burn.run(burn.shachain_burn, void, perCommitmentSecretBody, .{ out, seed, index });
+}
+
+fn perCommitmentSecretBody(out: *[32]u8, seed: *const [32]u8, index: u48) void {
+    var p = seed.*;
+    defer std.crypto.secureZero(u8, &p);
     var b: usize = 48;
     while (b > 0) {
         b -= 1;
@@ -157,7 +176,26 @@ pub fn perCommitmentSecret(seed: [32]u8, index: u48) [32]u8 {
             p = h.finalResult();
         }
     }
-    return p;
+    out.* = p;
+}
+
+// Value-shaped test wrappers over the `out`-pointer API.
+fn tPriv(b: [32]u8, p: [32]u8) Error![32]u8 {
+    var o: [32]u8 = undefined;
+    try derivePrivateKey(&o, &b, &p);
+    return o;
+}
+
+fn tRevPriv(b: [32]u8, p: [32]u8) Error![32]u8 {
+    var o: [32]u8 = undefined;
+    try deriveRevocationPrivateKey(&o, &b, &p);
+    return o;
+}
+
+fn tShachain(seed: [32]u8, index: u48) [32]u8 {
+    var o: [32]u8 = undefined;
+    perCommitmentSecret(&o, &seed, index);
+    return o;
 }
 
 // ── BOLT#3 Appendix E: Key Derivation — official test vectors ──────────────
@@ -172,7 +210,7 @@ test "BOLT#3 App E — derivation of key from basepoint and per_commitment_point
 }
 
 test "BOLT#3 App E — derivation of secret key from basepoint secret and per_commitment_secret" {
-    const out = try derivePrivateKey(tv_base_secret, tv_pcs);
+    const out = try tPriv(tv_base_secret, tv_pcs);
     try std.testing.expectEqualSlices(u8, &hex32("cbced912d3b21bf196a766651e436aff192362621ce317704ea2f75d87e7be0f"), &out);
 }
 
@@ -182,14 +220,14 @@ test "BOLT#3 App E — derivation of revocation key from basepoint and per_commi
 }
 
 test "BOLT#3 App E — derivation of revocation secret key from basepoint secret and per_commitment_secret" {
-    const out = try deriveRevocationPrivateKey(tv_base_secret, tv_pcs);
+    const out = try tRevPriv(tv_base_secret, tv_pcs);
     try std.testing.expectEqualSlices(u8, &hex32("d09ffff62ddb2297ab000cc85bcb4283fdeb6aa052affbc9dddcf33b61078110"), &out);
 }
 
 test "revocation pub derived from secrets matches pub-from-points" {
     // Cross-check: the revocation pubkey must be the public point of the
     // revocation privkey (the whole point of the split-secret construction).
-    const revpriv = try deriveRevocationPrivateKey(tv_base_secret, tv_pcs);
+    const revpriv = try tRevPriv(tv_base_secret, tv_pcs);
     const revpub_from_priv = (try Secp256k1.combMulBase(revpriv, .big)).toCompressedSec1();
     const base_pub = (try Secp256k1.combMulBase(tv_base_secret, .big)).toCompressedSec1();
     const pcp = (try Secp256k1.combMulBase(tv_pcs, .big)).toCompressedSec1();
@@ -198,7 +236,7 @@ test "revocation pub derived from secrets matches pub-from-points" {
 }
 
 test "simple priv derived matches pub-from-points" {
-    const priv = try derivePrivateKey(tv_base_secret, tv_pcs);
+    const priv = try tPriv(tv_base_secret, tv_pcs);
     const pub_from_priv = (try Secp256k1.combMulBase(priv, .big)).toCompressedSec1();
     const base_pub = (try Secp256k1.combMulBase(tv_base_secret, .big)).toCompressedSec1();
     const pcp = (try Secp256k1.combMulBase(tv_pcs, .big)).toCompressedSec1();
@@ -208,27 +246,27 @@ test "simple priv derived matches pub-from-points" {
 
 // ── BOLT#3 Appendix D: Per-commitment Secret — generation test vectors ──────
 test "BOLT#3 App D — generate_from_seed 0 final node" {
-    const s = perCommitmentSecret(hex32("0000000000000000000000000000000000000000000000000000000000000000"), max_index);
+    const s = tShachain(hex32("0000000000000000000000000000000000000000000000000000000000000000"), max_index);
     try std.testing.expectEqualSlices(u8, &hex32("02a40c85b6f28da08dfdbe0926c53fab2de6d28c10301f8f7c4073d5e42e3148"), &s);
 }
 
 test "BOLT#3 App D — generate_from_seed FF final node" {
-    const s = perCommitmentSecret(hex32("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"), max_index);
+    const s = tShachain(hex32("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"), max_index);
     try std.testing.expectEqualSlices(u8, &hex32("7cc854b54e3e0dcdb010d7a3fee464a9687be6e8db3be6854c475621e007a5dc"), &s);
 }
 
 test "BOLT#3 App D — generate_from_seed FF alternate bits 1" {
-    const s = perCommitmentSecret(hex32("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"), 0xaaaaaaaaaaa);
+    const s = tShachain(hex32("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"), 0xaaaaaaaaaaa);
     try std.testing.expectEqualSlices(u8, &hex32("56f4008fb007ca9acf0e15b054d5c9fd12ee06cea347914ddbaed70d1c13a528"), &s);
 }
 
 test "BOLT#3 App D — generate_from_seed FF alternate bits 2" {
-    const s = perCommitmentSecret(hex32("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"), 0x555555555555);
+    const s = tShachain(hex32("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"), 0x555555555555);
     try std.testing.expectEqualSlices(u8, &hex32("9015daaeb06dba4ccc05b91b2f73bd54405f2be9f217fbacd3c5ac2e62327d31"), &s);
 }
 
 test "BOLT#3 App D — generate_from_seed 01 last nontrivial node" {
-    const s = perCommitmentSecret(hex32("0101010101010101010101010101010101010101010101010101010101010101"), 1);
+    const s = tShachain(hex32("0101010101010101010101010101010101010101010101010101010101010101"), 1);
     try std.testing.expectEqualSlices(u8, &hex32("915c75942a26bb3a433a8ce2cb0427c29ec6c1775cfc78328b57f6ba7bfeaa9c"), &s);
 }
 
@@ -236,9 +274,9 @@ test "per-commitment secret feeds the revocation derivation end-to-end" {
     // A commitment's per_commitment_secret (App D) is exactly the input the
     // revocation derivation (App E) consumes — chain the two halves together.
     const seed = hex32("0101010101010101010101010101010101010101010101010101010101010101");
-    const pcs = perCommitmentSecret(seed, max_index);
+    const pcs = tShachain(seed, max_index);
     const revpub = try deriveRevocationPublicKey(tv_base_point, (try Secp256k1.combMulBase(pcs, .big)).toCompressedSec1());
-    const revpriv = try deriveRevocationPrivateKey(tv_base_secret, pcs);
+    const revpriv = try tRevPriv(tv_base_secret, pcs);
     // revpub must be revpriv·G (mirrors the App-E cross-check, but sourced from a real shachain secret).
     const revpub_from_priv = (try Secp256k1.combMulBase(revpriv, .big)).toCompressedSec1();
     try std.testing.expectEqualSlices(u8, &revpub, &revpub_from_priv);
@@ -248,7 +286,7 @@ test "invalid point / secret surface as typed errors" {
     const bad33 = [_]u8{0} ** 33;
     try std.testing.expectError(error.InvalidPoint, derivePublicKey(bad33, tv_pcp));
     const bad32 = [_]u8{0} ** 32; // zero is a non-canonical secret
-    try std.testing.expectError(error.InvalidSecret, derivePrivateKey(bad32, tv_pcs));
+    try std.testing.expectError(error.InvalidSecret, tPriv(bad32, tv_pcs));
 }
 
 test "revocation derivation: invalid point / secret surface as typed errors" {
@@ -256,8 +294,8 @@ test "revocation derivation: invalid point / secret surface as typed errors" {
     const bad32 = [_]u8{0} ** 32; // zero is a non-canonical secret
     try std.testing.expectError(error.InvalidPoint, deriveRevocationPublicKey(bad33, tv_pcp));
     try std.testing.expectError(error.InvalidPoint, deriveRevocationPublicKey(tv_base_point, bad33));
-    try std.testing.expectError(error.InvalidSecret, deriveRevocationPrivateKey(bad32, tv_pcs));
-    try std.testing.expectError(error.InvalidSecret, deriveRevocationPrivateKey(tv_base_secret, bad32));
+    try std.testing.expectError(error.InvalidSecret, tRevPriv(bad32, tv_pcs));
+    try std.testing.expectError(error.InvalidSecret, tRevPriv(tv_base_secret, bad32));
 }
 
 test "every input is validated: bad per_commitment_point, zero or >= n secrets" {
@@ -267,10 +305,10 @@ test "every input is validated: bad per_commitment_point, zero or >= n secrets" 
     const zero = [_]u8{0} ** 32;
     const over_n = [_]u8{0xff} ** 32; // > n: not a canonical scalar
     try std.testing.expectError(error.InvalidPoint, derivePublicKey(tv_base_point, bad33));
-    try std.testing.expectError(error.InvalidSecret, derivePrivateKey(tv_base_secret, zero));
-    try std.testing.expectError(error.InvalidSecret, derivePrivateKey(over_n, tv_pcs));
-    try std.testing.expectError(error.InvalidSecret, deriveRevocationPrivateKey(over_n, tv_pcs));
-    try std.testing.expectError(error.InvalidSecret, deriveRevocationPrivateKey(tv_base_secret, over_n));
+    try std.testing.expectError(error.InvalidSecret, tPriv(tv_base_secret, zero));
+    try std.testing.expectError(error.InvalidSecret, tPriv(over_n, tv_pcs));
+    try std.testing.expectError(error.InvalidSecret, tRevPriv(over_n, tv_pcs));
+    try std.testing.expectError(error.InvalidSecret, tRevPriv(tv_base_secret, over_n));
 }
 
 test "regression: derivePrivateKey refuses a per_commitment_secret >= n" {
@@ -279,7 +317,7 @@ test "regression: derivePrivateKey refuses a per_commitment_secret >= n" {
     // silently reduced, while `deriveRevocationPrivateKey` refused the same
     // bytes and `Error.InvalidSecret` promises a canonical (< n) scalar.
     const over_n = [_]u8{0xff} ** 32;
-    try std.testing.expectError(error.InvalidSecret, derivePrivateKey(tv_base_secret, over_n));
+    try std.testing.expectError(error.InvalidSecret, tPriv(tv_base_secret, over_n));
 }
 
 fn hex32(comptime s: *const [64]u8) [32]u8 {
@@ -292,4 +330,8 @@ fn hex33(comptime s: *const [66]u8) [33]u8 {
     var out: [33]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, s) catch unreachable;
     return out;
+}
+
+test {
+    _ = @import("stackprobe_test.zig");
 }

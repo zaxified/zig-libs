@@ -626,7 +626,7 @@ noinline fn callGenerateAuxWithTrapdoor() void {
     root.generateAuxParamsWithTrapdoor(arena(), recorder.random(), root.min_aux_generate_bits, &io.aux_gen) catch @panic("generateAuxParamsWithTrapdoor");
 }
 noinline fn callMessagePublicKey() void {
-    const pk = root.messagePublicKey(io.seed) catch @panic("messagePublicKey");
+    const pk = root.messagePublicKey(&io.seed) catch @panic("messagePublicKey");
     io.sink +%= pk[0];
 }
 noinline fn callAnnounce() void {

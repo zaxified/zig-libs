@@ -43,3 +43,8 @@ pub fn sizes(comptime security_bytes: usize) struct { keypair: usize, encaps: us
         else => .{ .keypair = 192 * 1024, .encaps = 288 * 1024, .decaps = 384 * 1024 },
     };
 }
+
+/// `prng.Xof.init` / `prng.hashI`: one SHAKE256 / SHA3-512 absorb and a final
+/// permutation (Keccak state + block), called a handful of times per KEM
+/// operation, so a tight 4 KiB.
+pub const prng_burn = 4 * 1024;

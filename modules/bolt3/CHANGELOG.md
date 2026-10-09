@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). `derivePrivateKey`, `deriveRevocationPrivateKey` and `perCommitmentSecret` take their secrets by `*const [32]u8` and return the result through a leading `out: *[32]u8` (`derivePrivateKey(out, basepoint_secret, per_commitment_secret) Error!void`, `deriveRevocationPrivateKey(out, revocation_basepoint_secret, per_commitment_secret) Error!void`, `perCommitmentSecret(out, seed, index) void`; `out` is zeroed on error). All three run their body under a stack burn (`src/burn.zig`, 32 KiB / 4 KiB); `src/stackprobe_test.zig` probes them in ReleaseFast.
+
 - **2026-10-05** — Fixed: `derivePrivateKey` accepted a `per_commitment_secret` >= n and
   silently reduced it (k256 `combMulBase` reduces instead of refusing), although
   `Error.InvalidSecret` promises a canonical scalar and `deriveRevocationPrivateKey`

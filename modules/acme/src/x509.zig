@@ -129,6 +129,10 @@ pub const CsrError = error{ OutOfMemory, ValueTooLarge, InvalidDomain, SigningFa
 /// A wildcard (`*.example.org`) is a valid dNSName here; whether it can be
 /// validated is the order flow's business. Caller owns the returned bytes.
 pub fn csrDer(gpa: Allocator, key_pair: *const Es256.KeyPair, domains: []const []const u8) CsrError![]u8 {
+    return burn.run(burn.sign_burn, CsrError![]u8, csrDerBody, .{ gpa, key_pair, domains });
+}
+
+fn csrDerBody(gpa: Allocator, key_pair: *const Es256.KeyPair, domains: []const []const u8) CsrError![]u8 {
     if (domains.len == 0) return error.InvalidDomain;
     for (domains) |name| {
         if (!isValidDomain(name) and !isValidWildcardDomain(name)) return error.InvalidDomain;
@@ -231,6 +235,18 @@ pub const TlsAlpnCert = struct {
 /// `serial` is the (positive, minimal, ≤20-byte) INTEGER content. `not_before`
 /// / `not_after` are ASN.1 UTCTime strings. Caller owns the returned bytes.
 pub fn tlsAlpnCertDer(
+    gpa: Allocator,
+    key_pair: *const Es256.KeyPair,
+    domain: []const u8,
+    acme_identifier: [32]u8,
+    serial: []const u8,
+    not_before: []const u8,
+    not_after: []const u8,
+) TlsAlpnError![]u8 {
+    return burn.run(burn.sign_burn, TlsAlpnError![]u8, tlsAlpnCertDerBody, .{ gpa, key_pair, domain, acme_identifier, serial, not_before, not_after });
+}
+
+fn tlsAlpnCertDerBody(
     gpa: Allocator,
     key_pair: *const Es256.KeyPair,
     domain: []const u8,

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack rule (CONVENTIONS §2.1.1), no signature change: `decodeRevokeAndAck`, `serializeRevokeAndAck`, `decodeChannelReestablish` and `serializeChannelReestablish` now run their bodies under a 2 KiB stack burn (new `src/burn.zig`; probe `src/stackprobe_test.zig`, residue only). They keep the by-value message API that every codec in the family shares (`secret-api-ok` markers): the message is the caller-owned secret holder (zero `per_commitment_secret` / `your_last_per_commitment_secret` yourself, as documented).
+
 - **2026-10-06** — FIXED (review of PR #5): an `AddressIterator.next` error is final — the
   iterator stops (later calls return `null`) and `unparsed()` returns the failing descriptor
   and its tail. Before, `pos` stayed put and every later call met the same error, so

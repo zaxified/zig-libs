@@ -239,6 +239,15 @@ pub fn sign(
     payload: []const u8,
     header: Header,
 ) SignError![]u8 {
+    return burn.run(burn.sign_burn, SignError![]u8, signBody, .{ gpa, key_pair, payload, header });
+}
+
+fn signBody(
+    gpa: std.mem.Allocator,
+    key_pair: *const KeyPair,
+    payload: []const u8,
+    header: Header,
+) SignError![]u8 {
     // Protected header JSON. Field order mirrors x/crypto/acme (alg,
     // jwk|kid, nonce, url) — servers must not care, but goldens do.
     var hw: std.Io.Writer.Allocating = .init(gpa);

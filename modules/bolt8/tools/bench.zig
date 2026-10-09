@@ -63,8 +63,10 @@ const Keys = struct {
 const Both = struct { ini: bolt8.HandshakeResult, rsp: bolt8.HandshakeResult };
 
 fn handshake(k: *Keys, acts: *[166]u8) !Both {
-    var ini = bolt8.Initiator.init(&k.ls_i, k.ls_r.public_key);
-    var rsp = bolt8.Responder.init(&k.ls_r);
+    var ini: bolt8.Initiator = undefined;
+    bolt8.Initiator.init(&ini, &k.ls_i, k.ls_r.public_key);
+    var rsp: bolt8.Responder = undefined;
+    bolt8.Responder.init(&rsp, &k.ls_r);
     const a1 = (try ini.genAct1(.{ .seeded_for_test = k.e_i.random() })).toBytes();
     try rsp.readAct1(try bolt8.act.Act1.fromBytes(&a1));
     const a2 = (try rsp.genAct2(.{ .seeded_for_test = k.e_r.random() })).toBytes();
@@ -189,11 +191,13 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     var keys: Keys = .{
-        .ls_i = try bolt8.Secp256k1DH.KeyPair.generateDeterministic(@splat(0x11)),
-        .ls_r = try bolt8.Secp256k1DH.KeyPair.generateDeterministic(@splat(0x21)),
+        .ls_i = undefined,
+        .ls_r = undefined,
         .e_i = .{ .key = @splat(0x12) },
         .e_r = .{ .key = @splat(0x22) },
     };
+    try bolt8.Secp256k1DH.KeyPair.generateDeterministic(&keys.ls_i, &@as([32]u8, @splat(0x11)));
+    try bolt8.Secp256k1DH.KeyPair.generateDeterministic(&keys.ls_r, &@as([32]u8, @splat(0x21)));
 
     // Interop before timing: the same keys must give the same bytes.
     var acts: [166]u8 = undefined;
@@ -214,8 +218,10 @@ pub fn main(init: std.process.Init) !u8 {
         const theirs = try dir.readFileAlloc(io, x.frame_file, arena, .limited(1 << 20));
         var a: [166]u8 = undefined;
         const p = try handshake(&keys, &a);
-        var ti = bolt8.Transport.init(p.ini);
-        var tr = bolt8.Transport.init(p.rsp);
+        var ti: bolt8.Transport = undefined;
+        bolt8.Transport.init(&ti, &p.ini);
+        var tr: bolt8.Transport = undefined;
+        bolt8.Transport.init(&tr, &p.rsp);
         const mine = wire[0..theirs.len];
         try ti.sendMessage(x.msg, mine);
         if (!std.mem.eql(u8, mine, theirs)) {
@@ -253,7 +259,9 @@ pub fn main(init: std.process.Init) !u8 {
     for (ws) |x| {
         var a: [166]u8 = undefined;
         const p = try handshake(&keys, &a);
-        var c: XferCtx = .{ .ini = bolt8.Transport.init(p.ini), .rsp = bolt8.Transport.init(p.rsp), .msg = x.msg, .wire = wire, .out = out };
+        var c: XferCtx = .{ .ini = undefined, .rsp = undefined, .msg = x.msg, .wire = wire, .out = out };
+        bolt8.Transport.init(&c.ini, &p.ini);
+        bolt8.Transport.init(&c.rsp, &p.rsp);
         const ours = timeIt(io, &c, XferCtx.op);
         const t = rows.get(x.name) orelse return error.MissingRow;
         const ratio = ours.ns / t.ns;

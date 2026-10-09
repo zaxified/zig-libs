@@ -35,6 +35,7 @@ const k256 = @import("k256");
 const bech32raw = @import("bech32_raw.zig");
 const bitpack = @import("bitpack.zig");
 const ecdsa = @import("ecdsa_recover.zig");
+const burn = @import("burn.zig");
 const amount_vectors = @import("bolt11_amount_kat_vectors.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -256,6 +257,8 @@ pub const DecodeError = bech32raw.DecodeError || bitpack.PaddingError || bitpack
 /// — see the module doc comment for the signature-verification core.
 /// The returned `Invoice` owns `description`/`metadata`/`features`/
 /// `fallbacks[].program`/`route_hints[].hops` — call `.deinit(allocator)`.
+// secret-api-ok: `Invoice.payment_secret` is a field of the invoice string itself, handed to the
+// payer by design (BOLT#11 `s`); it is not key material, and decoding is public-data parsing.
 pub fn decode(allocator: Allocator, invoice_str: []const u8) DecodeError!Invoice {
     var raw = try bech32raw.decode(allocator, invoice_str);
     defer raw.deinit(allocator);
@@ -604,6 +607,10 @@ fn appendTaggedField(allocator: Allocator, data: *std.ArrayList(u5), f: TaggedFi
 /// nonce — see `ecdsa_recover.zig`). Returns an owned, freshly bech32
 /// (no length cap) - encoded invoice string.
 pub fn encode(allocator: Allocator, params: EncodeParams, sign_input: SignInput) ![]u8 {
+    return burn.run(burn.encode_burn, @typeInfo(@TypeOf(encodeBody)).@"fn".return_type.?, encodeBody, .{ allocator, params, sign_input });
+}
+
+fn encodeBody(allocator: Allocator, params: EncodeParams, sign_input: SignInput) ![]u8 {
     var amt_buf: [32]u8 = undefined;
     const amt_str: []const u8 = if (params.amount_msat) |m| formatAmount(m, &amt_buf) else "";
     const hrp = try std.fmt.allocPrint(allocator, "ln{s}{s}", .{ networkPrefix(params.network), amt_str });

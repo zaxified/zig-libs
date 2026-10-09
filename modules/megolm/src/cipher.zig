@@ -82,8 +82,12 @@ fn deriveKeysBody(ratchet_bytes: *const [ratchet_mod.ratchet_len]u8, out: *Keys)
 /// it (the outbound path, before truncating) don't recompute.
 pub fn fullMac(hmac_key: *const [hmac_key_len]u8, data: []const u8) [full_mac_len]u8 {
     var out: [full_mac_len]u8 = undefined;
-    HmacSha256.create(&out, data, hmac_key);
+    burn.run(burn.mac_burn, void, fullMacBody, .{ hmac_key, data, &out });
     return out;
+}
+
+fn fullMacBody(hmac_key: *const [hmac_key_len]u8, data: []const u8, out: *[full_mac_len]u8) void {
+    HmacSha256.create(out, data, hmac_key);
 }
 
 /// Constant-time verification of a truncated (8-byte) wire MAC.
@@ -107,7 +111,7 @@ pub fn encryptCbc(allocator: std.mem.Allocator, keys: *const Keys, plaintext: []
     // already-overwritten bytes. `NotBlockAligned`/`BufferTooSmall` are
     // both unreachable: `padded_len` is block_len-aligned by construction
     // and `buf` is sized to exactly that.
-    _ = aescbc.encrypt(Aes256, keys.aes_key, keys.iv, buf, buf) catch unreachable;
+    _ = aescbc.encrypt(Aes256, &keys.aes_key, keys.iv, buf, buf) catch unreachable;
     return buf;
 }
 
@@ -128,7 +132,7 @@ pub fn decryptCbc(allocator: std.mem.Allocator, keys: *const Keys, ciphertext: [
     defer allocator.free(buf);
     // Alignment already checked above and `buf.len == ciphertext.len`, so
     // `NotBlockAligned`/`BufferTooSmall` are both unreachable.
-    _ = aescbc.decrypt(Aes256, keys.aes_key, keys.iv, ciphertext, buf) catch unreachable;
+    _ = aescbc.decrypt(Aes256, &keys.aes_key, keys.iv, ciphertext, buf) catch unreachable;
 
     const plain_len = aescbc.unpadPkcs7(buf) catch return error.InvalidPadding;
     return try allocator.dupe(u8, buf[0..plain_len]);

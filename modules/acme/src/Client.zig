@@ -181,6 +181,7 @@ const Directory = struct {
 /// `jws.generateKeyPair`). `account_key` is taken by pointer (no by-value copy
 /// of the private key in the caller's frame) and copied into the client, which
 /// wipes its copy in `deinit`; wipe the caller's own pair after this call.
+// secret-api-ok: Client holds the account key by design (zeroed in deinit); init is a field-wise construction into the caller's result slot, which IS the caller's Client variable, and takes the key by pointer; an out-form would only move the same bytes.
 pub fn init(
     io: std.Io,
     gpa: Allocator,

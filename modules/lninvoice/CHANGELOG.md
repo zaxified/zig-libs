@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack rule (CONVENTIONS §2.1.1), no signature change: `bolt11.encode` now runs its body under a 16 KiB stack burn (new `src/burn.zig`; the ECDSA/BIP340 signing underneath was already burned in `k256`/`bip340`), probed by the new `src/stackprobe2_test.zig`. `bolt11.decode` and `bolt12.decodeInvoice` carry `secret-api-ok` markers (the invoice's `payment_secret` is public wire data shared with the payer; the bolt12 `Invoice` holds no secret).
+
 - **2026-10-09** — **TEST ONLY, NO API CHANGE:** dead-stack stack probe (`src/stackprobe_test.zig`, ReleaseFast) over BOLT#11 `encode` with `.private_key`, `signMerkle`, `encodeSignedInvoiceRequest`, `encodeSignedInvoice`: the private key and the ECDSA / BIP340 nonce material in every representation, needles self-checked against the published `R`. 0 residue as shipped (the signers are burned in `k256`/`bip340`; this module's frames hold only pointers).
 
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** BOLT11 signing follows k256's pointer `ecdsa_recover.sign`; BOLT12 signing and tests follow bip340's pointer

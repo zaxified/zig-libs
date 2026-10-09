@@ -355,6 +355,7 @@ pub const One = struct {
     ///
     /// `key` is taken by pointer (the M3 by-value copy above is gone with the
     /// by-value parameter) — the only copies are `Aes256Cbc`'s, which burns.
+    // secret-api-ok: delegates to Aes256Cbc.encrypt/decrypt, which burn their own key schedule; the key is only passed by pointer (the lint cannot see a same-name delegate).
     pub fn encrypt(key: *const SharedSecret, dst: []u8, plaintext: []const u8) CbcError!void {
         try Aes256Cbc.encrypt(dst, plaintext, key, @splat(0));
     }
@@ -362,6 +363,7 @@ pub const One = struct {
     /// §6.5.7 `decrypt(key, demCiphertext)`: inverse of `encrypt`
     /// (`dst.len == ciphertext.len`, a multiple of 16). See `encrypt`'s doc
     /// comment (M3) for why `key` is re-bound to a `var` and zeroed here.
+    // secret-api-ok: delegates to Aes256Cbc.encrypt/decrypt, which burn their own key schedule; the key is only passed by pointer (the lint cannot see a same-name delegate).
     pub fn decrypt(key: *const SharedSecret, dst: []u8, ciphertext: []const u8) CbcError!void {
         try Aes256Cbc.decrypt(dst, ciphertext, key, @splat(0));
     }
@@ -475,6 +477,7 @@ pub const Two = struct {
     /// same by-value-parameter copy, same fix, and this half (the AES key)
     /// is exactly `n.aes_key` in the dead-stack probe.
     /// `key` by pointer: see `One.encrypt`.
+    // secret-api-ok: delegates to Aes256Cbc.encrypt/decrypt, which burn their own key schedule; the key is only passed by pointer (the lint cannot see a same-name delegate).
     pub fn encrypt(key: *const SharedSecret, iv: [iv_length]u8, dst: []u8, plaintext: []const u8) CbcError!void {
         if (dst.len != encryptedLength(plaintext.len)) return error.InvalidLength;
         try Aes256Cbc.encrypt(dst[iv_length..], plaintext, key[32..64], iv);
@@ -484,6 +487,7 @@ pub const Two = struct {
     /// §6.5.8 `decrypt(key, demCiphertext)`: split off the leading 16-byte
     /// IV, AES-256-CBC-decrypt the rest with the AES-key half. `dst.len`
     /// must equal `decryptedLength(ciphertext.len)`. M3: see `encrypt` above.
+    // secret-api-ok: delegates to Aes256Cbc.encrypt/decrypt, which burn their own key schedule; the key is only passed by pointer (the lint cannot see a same-name delegate).
     pub fn decrypt(key: *const SharedSecret, dst: []u8, ciphertext: []const u8) CbcError!void {
         const plaintext_len = try decryptedLength(ciphertext.len);
         if (dst.len != plaintext_len) return error.InvalidLength;

@@ -99,7 +99,7 @@ fn load(allocator: std.mem.Allocator, set: vectors.KeySet) !Loaded {
             .aux = .{ .n_tilde = nt, .h1 = try auxFe(allocator, nt, p.h1), .h2 = try auxFe(allocator, nt, p.h2) },
             .verifying_share = big_x,
             // tss-lib has no message keys; a fresh one per party (a test seed).
-            .message_key = try root.messagePublicKey(@splat(@intCast(p.index))),
+            .message_key = try root.messagePublicKey(&@as([32]u8, @splat(@intCast(p.index)))),
         };
         const tp = try unhex(allocator, p.aux_p_safe);
         errdefer allocator.free(tp);

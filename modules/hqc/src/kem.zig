@@ -121,7 +121,9 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
             var sigma: [security_bytes]u8 = undefined;
             xof.getBytes(&sigma);
 
-            const pke_kp = Pke.keygen(&seed_pke);
+            var pke_kp: Pke.KeyPair = undefined;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&pke_kp));
+            Pke.keygen(&pke_kp, &seed_pke);
 
             const dk = &out.dk;
             var off: usize = 0;

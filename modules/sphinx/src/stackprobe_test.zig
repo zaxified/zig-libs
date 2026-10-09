@@ -25,6 +25,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const sphinx = @import("root.zig");
+
+/// Value-shaped test wrapper over the `out`-pointer `generateKey`.
+fn tKey(key_type: sphinx.KeyType, ss: [32]u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    sphinx.generateKey(&out, key_type, &ss);
+    return out;
+}
 const v = @import("kat_vectors.zig");
 const Secp256k1 = @import("k256").Secp256k1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -182,14 +189,14 @@ fn buildNeedles(n: *Needles) !void {
     n.add("session key", session_key);
     n.add("node 1 private key", node_priv[1]);
     n.add("node 1 private key, little-endian", le(node_priv[1]));
-    n.add("pad key", sphinx.generateKey(.pad, session_key));
+    n.add("pad key", tKey(.pad, session_key));
     var hs: [hops]sphinx.HopSecret = undefined;
     try sphinx.deriveHopSecrets(&session_key, &pubkeys, &hs);
     var e = session_key;
     for (hs, 0..) |h, i| {
         n.add("shared secret ss_i", h.shared_secret);
-        n.add("rho_i", sphinx.generateKey(.rho, h.shared_secret));
-        n.add("mu_i", sphinx.generateKey(.mu, h.shared_secret));
+        n.add("rho_i", tKey(.rho, h.shared_secret));
+        n.add("mu_i", tKey(.mu, h.shared_secret));
         if (i + 1 == hops) break;
         var bf: [32]u8 = undefined;
         var hasher = Sha256.init(.{});

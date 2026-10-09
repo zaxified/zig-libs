@@ -43,6 +43,7 @@ pub const noise_name = "secp256k1";
 const std = @import("std");
 const Secp256k1 = @import("k256").Secp256k1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const burn = @import("burn.zig");
 
 // ── noise.Suite(DH, ...) adapter surface ─────────────────────────────────
 //
@@ -80,24 +81,37 @@ pub const KeyPair = struct {
     /// values rather than fresh randomness; the spec's own "note: this is
     /// a violation of the spec, which requires randomness" KAT hook).
     /// Rejects `0` and out-of-range scalars, mirroring `bip340.SecretKey.
-    /// fromBytes`.
-    pub fn generateDeterministic(seed: [32]u8) SecretKeyError!KeyPair {
-        const d = Secp256k1.scalar.Scalar.fromBytes(seed, .big) catch
+    /// fromBytes`. The key pair goes into `out` (zeroed on error); runs
+    /// under a dead-stack burn.
+    pub fn generateDeterministic(out: *KeyPair, seed: *const [32]u8) SecretKeyError!void {
+        return burn.run(burn.ecc_burn, SecretKeyError!void, generateDeterministicBody, .{ out, seed });
+    }
+
+    fn generateDeterministicBody(out: *KeyPair, seed: *const [32]u8) SecretKeyError!void {
+        out.* = std.mem.zeroes(KeyPair);
+        const d = Secp256k1.scalar.Scalar.fromBytes(seed.*, .big) catch
             return error.InvalidSecretKey;
         if (d.isZero()) return error.InvalidSecretKey;
-        const p = Secp256k1.combMulBase(seed, .big) catch return error.InvalidSecretKey;
-        return .{ .secret_key = seed, .public_key = p.toCompressedSec1() };
+        const p = Secp256k1.combMulBase(seed.*, .big) catch return error.InvalidSecretKey;
+        out.* = .{ .secret_key = seed.*, .public_key = p.toCompressedSec1() };
     }
 
     /// Draw a fresh keypair from a CSPRNG (the production path — KATs use
     /// `generateDeterministic` with the spec's fixed scalars instead).
     /// Rejection-samples on the (probability ~2^-128) chance the drawn
     /// scalar is `0` or `>= n`.
-    pub fn generate(random: std.Random) KeyPair {
+    /// The key pair goes into `out`; runs under a dead-stack burn.
+    pub fn generate(out: *KeyPair, random: std.Random) void {
+        return burn.run(burn.ecc_burn, void, generateBody, .{ out, random });
+    }
+
+    fn generateBody(out: *KeyPair, random: std.Random) void {
+        var seed: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
         while (true) {
-            var seed: [32]u8 = undefined;
             random.bytes(&seed);
-            return generateDeterministic(seed) catch continue;
+            generateDeterministic(out, &seed) catch continue;
+            return;
         }
     }
 
@@ -134,9 +148,14 @@ pub const DhError = error{
 /// DH tokens in the spec's Noise_XK notation) — this is the one place
 /// BOLT#8's public keys (33 bytes) and its DH output (32 bytes) part ways;
 /// see the module doc comment.
-pub fn dh(secret_key: [32]u8, remote_pub: [33]u8) DhError![32]u8 {
+/// Runs under a dead-stack burn.
+pub fn dh(secret_key: *const [32]u8, remote_pub: [33]u8) DhError![32]u8 {
+    return burn.run(burn.ecc_burn, DhError![32]u8, dhBody, .{ secret_key, remote_pub });
+}
+
+fn dhBody(secret_key: *const [32]u8, remote_pub: [33]u8) DhError![32]u8 {
     const point = Secp256k1.fromSec1(&remote_pub) catch return error.InvalidPublicKey;
-    const shared = point.mul(secret_key, .big) catch return error.IdentityElement;
+    const shared = point.mul(secret_key.*, .big) catch return error.IdentityElement;
     const compressed = shared.toCompressedSec1();
     var out: [32]u8 = undefined;
     Sha256.hash(&compressed, &out, .{});
@@ -146,7 +165,7 @@ pub fn dh(secret_key: [32]u8, remote_pub: [33]u8) DhError![32]u8 {
 /// API-shape alias for `noise.Suite(DH,...)`'s `DH.scalarmult` — never
 /// actually called by this module (see the adapter-surface doc comment
 /// above); `dh()` is the entry point `handshake.zig` uses.
-pub fn scalarmult(secret_key: [32]u8, remote_pub: [33]u8) DhError![32]u8 {
+pub fn scalarmult(secret_key: *const [32]u8, remote_pub: [33]u8) DhError![32]u8 {
     return dh(secret_key, remote_pub);
 }
 
@@ -161,27 +180,28 @@ pub fn scalarmult(secret_key: [32]u8, remote_pub: [33]u8) DhError![32]u8 {
 
 const testing = std.testing;
 const kv = @import("kat_vectors.zig");
+const tu = @import("testutil.zig");
 
 test "KeyPair.generateDeterministic: BOLT#8 Appendix A fixed scalars derive their published pubkeys" {
-    try testing.expectEqual((try KeyPair.generateDeterministic(kv.init_ls_priv.*)).public_key, kv.init_ls_pub.*);
-    try testing.expectEqual((try KeyPair.generateDeterministic(kv.init_e_priv.*)).public_key, kv.init_e_pub.*);
-    try testing.expectEqual((try KeyPair.generateDeterministic(kv.resp_ls_priv.*)).public_key, kv.resp_ls_pub.*);
-    try testing.expectEqual((try KeyPair.generateDeterministic(kv.resp_e_priv.*)).public_key, kv.resp_e_pub.*);
+    try testing.expectEqual(tu.keyPair(kv.init_ls_priv.*).public_key, kv.init_ls_pub.*);
+    try testing.expectEqual(tu.keyPair(kv.init_e_priv.*).public_key, kv.init_e_pub.*);
+    try testing.expectEqual(tu.keyPair(kv.resp_ls_priv.*).public_key, kv.resp_ls_pub.*);
+    try testing.expectEqual(tu.keyPair(kv.resp_e_priv.*).public_key, kv.resp_e_pub.*);
 }
 
 test "dh: Act One es = ECDH(init.e, resp.ls) == ECDH(resp.ls, init.e) (published ss)" {
-    try testing.expectEqual(kv.ss_act1_es.*, try dh(kv.init_e_priv.*, kv.resp_ls_pub.*));
-    try testing.expectEqual(kv.ss_act1_es.*, try dh(kv.resp_ls_priv.*, kv.init_e_pub.*));
+    try testing.expectEqual(kv.ss_act1_es.*, try dh(kv.init_e_priv, kv.resp_ls_pub.*));
+    try testing.expectEqual(kv.ss_act1_es.*, try dh(kv.resp_ls_priv, kv.init_e_pub.*));
 }
 
 test "dh: Act Two ee = ECDH(resp.e, init.e) == ECDH(init.e, resp.e) (published ss)" {
-    try testing.expectEqual(kv.ss_act2_ee.*, try dh(kv.resp_e_priv.*, kv.init_e_pub.*));
-    try testing.expectEqual(kv.ss_act2_ee.*, try dh(kv.init_e_priv.*, kv.resp_e_pub.*));
+    try testing.expectEqual(kv.ss_act2_ee.*, try dh(kv.resp_e_priv, kv.init_e_pub.*));
+    try testing.expectEqual(kv.ss_act2_ee.*, try dh(kv.init_e_priv, kv.resp_e_pub.*));
 }
 
 test "dh: Act Three se = ECDH(init.ls, resp.e) == ECDH(resp.e, init.ls) (published ss)" {
-    try testing.expectEqual(kv.ss_act3_se.*, try dh(kv.init_ls_priv.*, kv.resp_e_pub.*));
-    try testing.expectEqual(kv.ss_act3_se.*, try dh(kv.resp_e_priv.*, kv.init_ls_pub.*));
+    try testing.expectEqual(kv.ss_act3_se.*, try dh(kv.init_ls_priv, kv.resp_e_pub.*));
+    try testing.expectEqual(kv.ss_act3_se.*, try dh(kv.resp_e_priv, kv.init_ls_pub.*));
 }
 
 test "dh: rejects a malformed (uncompressed-prefix-in-33-byte-slot) public key" {
@@ -189,7 +209,7 @@ test "dh: rejects a malformed (uncompressed-prefix-in-33-byte-slot) public key" 
     // act2 e.pub byte is patched from 0x02 to 0x04 without adding the 32
     // extra bytes an uncompressed point would need — `fromSec1` must
     // reject this before any scalar multiply.
-    try testing.expectError(error.InvalidPublicKey, dh(kv.init_e_priv.*, kv.bad_pubkey_serialization.*));
+    try testing.expectError(error.InvalidPublicKey, dh(kv.init_e_priv, kv.bad_pubkey_serialization.*));
 }
 
 test "dh: rejects the act3-bad-rs-test's malformed recovered static key" {
@@ -197,7 +217,7 @@ test "dh: rejects the act3-bad-rs-test's malformed recovered static key" {
     // `rs` comes back with a 0x04 prefix (should be 0x02/0x03) — same
     // parse-level rejection as above, independent of the AEAD step that
     // (in the full handshake) would have recovered these bytes.
-    try testing.expectError(error.InvalidPublicKey, dh(kv.resp_e_priv.*, kv.bad_recovered_static_key.*));
+    try testing.expectError(error.InvalidPublicKey, dh(kv.resp_e_priv, kv.bad_recovered_static_key.*));
 }
 
 test "meta-shape: public_length/seed_length match BOLT#8's 33/32-byte split" {
@@ -208,20 +228,21 @@ test "meta-shape: public_length/seed_length match BOLT#8's 33/32-byte split" {
 test "KeyPair.generateDeterministic rejects 0 and the group order n" {
     // A secp256k1 private key is an integer in [1, n - 1] (SEC 1 v2 §3.2.1);
     // 0 has no public key and n reduces to 0.
-    try testing.expectError(error.InvalidSecretKey, KeyPair.generateDeterministic([_]u8{0} ** 32));
+    try testing.expectError(error.InvalidSecretKey, tu.tryKeyPair([_]u8{0} ** 32));
     var n: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&n, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
-    try testing.expectError(error.InvalidSecretKey, KeyPair.generateDeterministic(n));
+    try testing.expectError(error.InvalidSecretKey, tu.tryKeyPair(n));
     n[31] -= 1; // n - 1 is the largest valid key
-    _ = try KeyPair.generateDeterministic(n);
+    _ = try tu.tryKeyPair(n);
 }
 
 test "KeyPair.generate: rejects nothing observable, always yields a valid public key" {
     var prng = std.Random.DefaultPrng.init(0xb01783);
     const random = prng.random();
-    const kp = KeyPair.generate(random);
+    var kp: KeyPair = undefined;
+    KeyPair.generate(&kp, random);
     // Round-trips through the curve: re-deriving from the same secret
     // scalar must reproduce the exact same public key.
-    const again = try KeyPair.generateDeterministic(kp.secret_key);
+    const again = tu.keyPair(kp.secret_key);
     try testing.expectEqual(kp.public_key, again.public_key);
 }

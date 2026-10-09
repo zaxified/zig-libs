@@ -211,12 +211,12 @@ const Fixture = struct {
 fn buildFixture(io: std.Io) !Fixture {
     const sk = try bip340.SecretKey.fromBytes(secretScalar("ctgrind-adaptor-harness-fixture-signer-key-v1"));
     const t_bytes = secretScalar("ctgrind-adaptor-harness-fixture-adaptor-secret-v1");
-    const adaptor_point = try adaptor.AdaptorPoint.fromSecret(t_bytes);
+    const adaptor_point = try adaptor.AdaptorPoint.fromSecret(&t_bytes);
     const aux_rand = secretBytes(32, "ctgrind-adaptor-harness-fixture-aux-rand-v1");
     const msg = "ctgrind harness message";
 
     const presig = try adaptor.preSign(&sk, msg, aux_rand, adaptor_point, io);
-    const sig_bytes = try adaptor.adapt(presig, t_bytes);
+    const sig_bytes = try adaptor.adapt(presig, &t_bytes);
     const full_sig = try bip340.Signature.fromBytes(sig_bytes);
 
     return .{ .presig = presig, .adaptor_point = adaptor_point, .t_bytes = t_bytes, .full_sig = full_sig };
@@ -254,7 +254,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // is not this target's secret (the presigner never learns it
             // either, in the real protocol).
             const t_pub_bytes = secretScalar("ctgrind-adaptor-harness-presign-adaptor-point-v1");
-            const adaptor_point = try adaptor.AdaptorPoint.fromSecret(t_pub_bytes);
+            const adaptor_point = try adaptor.AdaptorPoint.fromSecret(&t_pub_bytes);
             const msg = "ctgrind harness message";
             const aux_rand = secretBytes(32, "ctgrind-adaptor-harness-presign-aux-rand-v1");
 
@@ -270,7 +270,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintIf(tainted, &t_bytes);
             const t_raw = reloadVolatile(32, &t_bytes);
 
-            const sig = try adaptor.adapt(fx.presig, t_raw);
+            const sig = try adaptor.adapt(fx.presig, &t_raw);
             std.debug.print("sig={x}\n", .{sig});
         },
         .extract => {

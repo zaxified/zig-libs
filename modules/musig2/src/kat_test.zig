@@ -160,7 +160,8 @@ test "KAT nonceGen: byte-exact secnonce/pubnonce against all 4 official vectors"
 
         const rand_prime = hexN(32, case.rand_);
 
-        const result = try musig2.nonceGen(sk, pk, aggpk, msg, extra_in, rand_prime, io);
+        var result: musig2.NonceGenResult = undefined;
+        try musig2.nonceGen(&result, if (sk) |*s| s else null, pk, aggpk, msg, extra_in, &@as([32]u8, rand_prime), io);
 
         try std.testing.expectEqualSlices(u8, &hexN(97, case.expected_secnonce), &result.secnonce.bytes);
         try std.testing.expectEqualSlices(u8, &hexN(66, case.expected_pubnonce), &result.pubnonce.bytes);
@@ -285,7 +286,8 @@ test "sign consumes the caller's secnonce: zeroed after a success AND after a fa
     const pks = [_]musig2.PlainPublicKey{pk};
     const zero = [_]u8{0} ** 64;
 
-    var ng = try musig2.nonceGen(sk_bytes, pk.bytes, null, "msg", null, [_]u8{0x31} ** 32, io);
+    var ng: musig2.NonceGenResult = undefined;
+    try musig2.nonceGen(&ng, &sk_bytes, pk.bytes, null, "msg", null, &@as([32]u8, [_]u8{0x31} ** 32), io);
     const ctx = musig2.SessionContext{ .aggnonce = try musig2.nonceAgg(&.{ng.pubnonce}), .pubkeys = &pks, .msg = "msg" };
     _ = try musig2.sign(&ng.secnonce, &sk, ctx);
     try std.testing.expectEqualSlices(u8, &zero, ng.secnonce.bytes[0..64]);
@@ -293,7 +295,8 @@ test "sign consumes the caller's secnonce: zeroed after a success AND after a fa
     try std.testing.expectError(error.InvalidSecNonce, musig2.sign(&ng.secnonce, &sk, other));
 
     // A FAILED attempt consumes it too: the signer is not in this session.
-    var ng2 = try musig2.nonceGen(sk_bytes, pk.bytes, null, "msg", null, [_]u8{0x32} ** 32, io);
+    var ng2: musig2.NonceGenResult = undefined;
+    try musig2.nonceGen(&ng2, &sk_bytes, pk.bytes, null, "msg", null, &@as([32]u8, [_]u8{0x32} ** 32), io);
     const stranger = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase([_]u8{0x6B} ** 32, .big)).toCompressedSec1() };
     const wrong = musig2.SessionContext{ .aggnonce = ctx.aggnonce, .pubkeys = &.{stranger}, .msg = "msg" };
     try std.testing.expectError(error.PubkeyNotInSession, musig2.sign(&ng2.secnonce, &sk, wrong));
@@ -303,7 +306,8 @@ test "sign consumes the caller's secnonce: zeroed after a success AND after a fa
 
 test "partialSigVerify: a signer index outside either list is an error, not a panic" {
     const pk = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase([_]u8{0x5A} ** 32, .big)).toCompressedSec1() };
-    const ng = try musig2.nonceGen(null, pk.bytes, null, "m", null, [_]u8{0x33} ** 32, std.testing.io);
+    var ng: musig2.NonceGenResult = undefined;
+    try musig2.nonceGen(&ng, null, pk.bytes, null, "m", null, &@as([32]u8, [_]u8{0x33} ** 32), std.testing.io);
     const psig = try musig2.PartialSignature.fromBytes([_]u8{1} ** 32);
     try std.testing.expectError(error.InvalidPublicKey, musig2.partialSigVerify(psig, &.{ng.pubnonce}, &.{pk}, &.{}, "m", 1));
     // Two keys, one nonce: index 1 is inside `pubkeys` and outside `pubnonces`.
@@ -336,7 +340,8 @@ test "sign REJECTS a secnonce bound to a DIFFERENT signer's pubkey (SecretKeyMis
 
     // secnonce is bound to pk_a (via nonceGen's `pk` argument)...
     const rand_prime = [_]u8{0xCC} ** 32;
-    var ng = try musig2.nonceGen(sk_a_bytes, pk_a.bytes, null, "msg", null, rand_prime, io);
+    var ng: musig2.NonceGenResult = undefined;
+    try musig2.nonceGen(&ng, &sk_a_bytes, pk_a.bytes, null, "msg", null, &@as([32]u8, rand_prime), io);
 
     // ...but sign is called with sk_b — a genuine mismatch.
     const pks = [_]musig2.PlainPublicKey{ pk_a, pk_b };
@@ -363,7 +368,8 @@ test "sign refuses when the session lists the signer's x with the other parity" 
     flipped[0] ^= 1; // 02 <-> 03: the same x, the negated point
     const other = (try std_ecc.basePoint.mul([_]u8{0x22} ** 32, .big)).toCompressedSec1();
 
-    var ng = try musig2.nonceGen(sk_bytes, own, null, "msg", null, [_]u8{0xCC} ** 32, io);
+    var ng: musig2.NonceGenResult = undefined;
+    try musig2.nonceGen(&ng, &sk_bytes, own, null, "msg", null, &@as([32]u8, [_]u8{0xCC} ** 32), io);
     const aggnonce = try musig2.nonceAgg(&.{ng.pubnonce});
     const pks = [_]musig2.PlainPublicKey{ try .fromBytes(flipped), try .fromBytes(other) };
     const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = &pks, .msg = "msg" };
@@ -689,7 +695,8 @@ test "end-to-end: 3 signers, nonceGen→nonceAgg→sign→partialSigVerify→par
 
         var rand_prime = [_]u8{0xA7} ** 32; // per-signer distinct nonce randomness
         rand_prime[0] = @intCast(i);
-        const ng = try musig2.nonceGen(sk_bytes, pks[i].bytes, null, msg, null, rand_prime, io);
+        var ng: musig2.NonceGenResult = undefined;
+        try musig2.nonceGen(&ng, &sk_bytes, pks[i].bytes, null, msg, null, &@as([32]u8, rand_prime), io);
         secnonces[i] = ng.secnonce;
         pubnonces[i] = ng.pubnonce;
     }
@@ -734,7 +741,8 @@ test "end-to-end: 3 signers with an x-only (Taproot-style) tweak — aggregate v
 
         var rand_prime = [_]u8{0xC3} ** 32; // per-signer distinct nonce randomness
         rand_prime[0] = @intCast(i);
-        const ng = try musig2.nonceGen(sk_bytes, pks[i].bytes, null, msg, null, rand_prime, io);
+        var ng: musig2.NonceGenResult = undefined;
+        try musig2.nonceGen(&ng, &sk_bytes, pks[i].bytes, null, msg, null, &@as([32]u8, rand_prime), io);
         secnonces[i] = ng.secnonce;
         pubnonces[i] = ng.pubnonce;
     }

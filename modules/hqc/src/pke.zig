@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const params = @import("params.zig");
+const burn = @import("burn.zig");
 const gf2x = @import("gf2x.zig");
 const prng = @import("prng.zig");
 const code = @import("code.zig");
@@ -70,7 +71,15 @@ pub fn Pke(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
         ///   s = y*h + x
         ///   ek_pke = seed_ek || s
         ///   dk_pke = seed_dk
-        pub fn keygen(seed: *const [params.seed_bytes]u8) KeyPair {
+        ///
+        /// The pair goes into `out` (`dk` is the secret half; zeroed on
+        /// entry), and the body runs under a dead-stack burn.
+        pub fn keygen(out: *KeyPair, seed: *const [params.seed_bytes]u8) void {
+            out.* = std.mem.zeroes(KeyPair);
+            burn.run(burn.sizes(p.securityBytes()).keypair, void, keygenBody, .{ out, seed });
+        }
+
+        fn keygenBody(out: *KeyPair, seed: *const [params.seed_bytes]u8) void {
             var keypair_seed: [64]u8 = undefined;
             defer std.crypto.secureZero(u8, &keypair_seed);
             prng.hashI(&keypair_seed, seed);
@@ -100,14 +109,9 @@ pub fn Pke(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
 
             const s = Ring.add(Ring.mul(y, h), x);
 
-            var ek: EncKey = undefined;
-            @memcpy(ek[0..params.seed_bytes], seed_ek);
-            Ring.toBytes(s, ek[params.seed_bytes..]);
-
-            var dk: DecKey = undefined;
-            @memcpy(&dk, seed_dk);
-
-            return .{ .ek = ek, .dk = dk };
+            @memcpy(out.ek[0..params.seed_bytes], seed_ek);
+            Ring.toBytes(s, out.ek[params.seed_bytes..]);
+            @memcpy(&out.dk, seed_dk);
         }
 
         /// hqc_ek_pke_from_string: re-derive (h, s) from a serialized

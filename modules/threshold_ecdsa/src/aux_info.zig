@@ -101,7 +101,7 @@ pub const LocalAux = struct {
         return .{
             .paillier_pk = self.paillier.key.public,
             // A clamped Ed25519 scalar is never zero: no seed fails here.
-            .message_key = root.messagePublicKey(self.message_seed) catch unreachable,
+            .message_key = root.messagePublicKey(&self.message_seed) catch unreachable,
             .aux = self.aux,
             .aux_proof = try aux_proofs.proveWellFormedBound(allocator, self.aux, &self.trapdoor, context, random),
             .paillier_proof = try aux_proofs.Pimod.provePaillier(allocator, self.paillier.modulus(), self.paillier.p(), self.paillier.q(), context, random),
@@ -416,7 +416,7 @@ fn assembleKeyShareByValue(
     if (!std.mem.eql(u8, &modulusBytes(own_ann.paillier_pk), &modulusBytes(own.paillier.key.public)) or
         !std.mem.eql(u8, &auxModulusBytes(own_ann.aux.n_tilde), &auxModulusBytes(own.aux.n_tilde)) or
         !feBytesEql(own_ann.aux.h1, own.aux.h1) or !feBytesEql(own_ann.aux.h2, own.aux.h2) or
-        !std.mem.eql(u8, &own_ann.message_key, &(root.messagePublicKey(own.message_seed) catch return error.NotOwnAnnouncement)))
+        !std.mem.eql(u8, &own_ann.message_key, &(root.messagePublicKey(&own.message_seed) catch return error.NotOwnAnnouncement)))
         return error.NotOwnAnnouncement;
 
     const own_x = try root.derivePublicKeyShare(vvec, index);
@@ -694,7 +694,7 @@ test "aux_info: verifyAnnouncement refuses a Paillier key below the floor" {
     const ctx = ctxFor(1);
     const ann: Announcement = .{
         .paillier_pk = small.key.public,
-        .message_key = try root.messagePublicKey(full.message_seed),
+        .message_key = try root.messagePublicKey(&full.message_seed),
         .aux = full.aux,
         .aux_proof = try aux_proofs.proveWellFormedBound(allocator, full.aux, &full.trapdoor, &ctx, random),
         .paillier_proof = try aux_proofs.Pimod.provePaillier(allocator, small.modulus(), small.p(), small.q(), &ctx, random),
@@ -790,7 +790,7 @@ test "aux_info: verifyAnnouncement refuses a ring-Pedersen modulus that is not 2
 
     const ann: Announcement = .{
         .paillier_pk = full.paillier.key.public,
-        .message_key = try root.messagePublicKey(full.message_seed),
+        .message_key = try root.messagePublicKey(&full.message_seed),
         .aux = aux,
         .aux_proof = aux_proof,
         .paillier_proof = try aux_proofs.Pimod.provePaillier(allocator, full.paillier.modulus(), full.paillier.p(), full.paillier.q(), &ctx, random),

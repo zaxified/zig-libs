@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack rule (CONVENTIONS §2.1.1). New safe twin `SecretKey.fromBytesInto(out: *SecretKey, bytes: *const [32]u8) SecretKeyError!void` (zeroes `out` on error); the by-value `SecretKey.fromBytes` keeps its signature (it has ~70 call sites in `musig2`, `taproot`, `bitcoinscript`, `adaptor`, …) but now runs under a burn like the twin. `PublicKey.fromSecretKey` now runs under a 16 KiB burn too (new `src/burn.zig`). New `src/stackprobe2_test.zig` probes all three.
+
 - **2026-10-08** — **BREAKING + FIX (secrets in the caller's frame):** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
   engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
   through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised

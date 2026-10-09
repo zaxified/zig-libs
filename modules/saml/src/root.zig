@@ -125,6 +125,7 @@ const xmlenc = @import("xmlenc");
 const rsa = @import("rsa");
 const x509 = @import("x509");
 const datefmt = @import("datefmt");
+const burn = @import("burn.zig");
 
 /// P-256 public keys, the one EC form `xmldsig.VerifyKey` (and therefore this
 /// module's Holder-of-Key matching) supports.
@@ -400,7 +401,7 @@ pub const Config = struct {
     /// `<saml:EncryptedAssertion>` (RSA-OAEP / — gated — RSA-1_5 key transport)
     /// via the `xmlenc` module. Null (the default) ⇒ encrypted assertions are
     /// refused (`error.EncryptedAssertionUnsupported`), i.e. opt-in.
-    sp_decrypt_key: ?rsa.SecretKey = null,
+    sp_decrypt_key: ?*const rsa.SecretKey = null,
     /// Permit RSAES-PKCS#1 v1.5 key transport when decrypting (Bleichenbacher /
     /// Jager–Somorovsky). OFF by default; only enable for an IdP that offers
     /// nothing else. Passed straight through to `xmlenc`.
@@ -651,16 +652,24 @@ pub fn decodeRedirectField(alloc: std.mem.Allocator, field: []const u8) DecodeEr
 /// Consume a POST-binding SAMLResponse form field (base64). Decodes, parses and
 /// fully validates it, returning the trusted `AuthnResult` or a typed error.
 pub fn consumeResponse(alloc: std.mem.Allocator, saml_response_field: []const u8, config: Config) ConsumeError!AuthnResult {
+    return burn.run(burn.consume_burn, ConsumeError!AuthnResult, consumeResponseBody, .{ alloc, saml_response_field, config });
+}
+
+fn consumeResponseBody(alloc: std.mem.Allocator, saml_response_field: []const u8, config: Config) ConsumeError!AuthnResult {
     const xml_bytes = decodePostField(alloc, saml_response_field) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidEncoding,
     };
     defer alloc.free(xml_bytes);
-    return consumeResponseXml(alloc, xml_bytes, config);
+    return consumeResponseXmlBody(alloc, xml_bytes, config);
 }
 
 /// Consume an already-base64-decoded `<samlp:Response>` XML document.
 pub fn consumeResponseXml(alloc: std.mem.Allocator, xml_bytes: []const u8, config: Config) ConsumeError!AuthnResult {
+    return burn.run(burn.consume_burn, ConsumeError!AuthnResult, consumeResponseXmlBody, .{ alloc, xml_bytes, config });
+}
+
+fn consumeResponseXmlBody(alloc: std.mem.Allocator, xml_bytes: []const u8, config: Config) ConsumeError!AuthnResult {
     var doc = xml.parse(alloc, xml_bytes, untrustedXmlOptions()) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedResponse,
@@ -1045,7 +1054,7 @@ fn decryptWrappedElement(
     comptime E: type,
     alloc: std.mem.Allocator,
     wrapper: *const xml.Element,
-    sp_decrypt_key: ?rsa.SecretKey,
+    sp_decrypt_key: ?*const rsa.SecretKey,
     allow_weak_rsa15: bool,
     decrypt_kek: ?[]const u8,
     fail_err: E,
@@ -3048,7 +3057,7 @@ pub const LogoutRequestConfig = struct {
     /// This SP's RSA private key, for decrypting a `<saml:EncryptedID>` NameID.
     /// Null (default) ⇒ refused with `error.EncryptedIdUnsupported`, mirroring
     /// the Response/Assertion path's opt-in discipline.
-    sp_decrypt_key: ?rsa.SecretKey = null,
+    sp_decrypt_key: ?*const rsa.SecretKey = null,
     allow_weak_rsa15: bool = false,
     decrypt_kek: ?[]const u8 = null,
 };
@@ -3102,12 +3111,16 @@ pub const LogoutRequestResult = struct {
 /// (base64 of the XML, which itself carries the embedded signature — POST
 /// always uses `.embedded`).
 pub fn consumeLogoutRequest(alloc: std.mem.Allocator, saml_request_field: []const u8, config: LogoutRequestConfig) LogoutRequestError!LogoutRequestResult {
+    return burn.run(burn.consume_burn, LogoutRequestError!LogoutRequestResult, consumeLogoutRequestBody, .{ alloc, saml_request_field, config });
+}
+
+fn consumeLogoutRequestBody(alloc: std.mem.Allocator, saml_request_field: []const u8, config: LogoutRequestConfig) LogoutRequestError!LogoutRequestResult {
     const xml_bytes = decodePostField(alloc, saml_request_field) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidEncoding,
     };
     defer alloc.free(xml_bytes);
-    return consumeLogoutRequestXml(alloc, xml_bytes, .embedded, config);
+    return consumeLogoutRequestXmlBody(alloc, xml_bytes, .embedded, config);
 }
 
 /// Parse + verify an already-decoded `<samlp:LogoutRequest>`. `source` states
@@ -3116,6 +3129,15 @@ pub fn consumeLogoutRequest(alloc: std.mem.Allocator, saml_request_field: []cons
 /// `verifyRedirectSignature` on the (URL-decoded) query parameters yourself,
 /// and only on `true` call this with `.redirect_verified`.
 pub fn consumeLogoutRequestXml(
+    alloc: std.mem.Allocator,
+    xml_bytes: []const u8,
+    source: SignatureSource,
+    config: LogoutRequestConfig,
+) LogoutRequestError!LogoutRequestResult {
+    return burn.run(burn.consume_burn, LogoutRequestError!LogoutRequestResult, consumeLogoutRequestXmlBody, .{ alloc, xml_bytes, source, config });
+}
+
+fn consumeLogoutRequestXmlBody(
     alloc: std.mem.Allocator,
     xml_bytes: []const u8,
     source: SignatureSource,
@@ -3786,6 +3808,7 @@ test {
     _ = @import("test_multikey.zig");
     _ = @import("test_metadata.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 const testing = std.testing;

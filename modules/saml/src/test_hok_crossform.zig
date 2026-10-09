@@ -198,7 +198,7 @@ fn mintRsaCert(alloc: std.mem.Allocator, seed: u64) !RsaCert {
     var prng = std.Random.DefaultPrng.init(seed);
     var kp: rsa.KeyPair = undefined;
     try rsa.generate(&kp, prng.random(), 1024, 65537);
-    const der = try rsa.selfSignedCert(alloc, kp.secret_key, kp.public_key, std.crypto.hash.sha2.Sha256, .{
+    const der = try rsa.selfSignedCert(alloc, &kp.secret_key, kp.public_key, std.crypto.hash.sha2.Sha256, .{
         .common_name = "hok-rsa-test",
         .not_before = "240101000000Z",
         .not_after = "340101000000Z",

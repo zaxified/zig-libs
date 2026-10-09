@@ -579,6 +579,7 @@ pub fn authenticatedContentTbmAlloc(
 /// AuthenticatedContentTBM)`. The MAC itself is
 /// `keyschedule.membershipTag`; this function is the missing half it
 /// documented as "a Part 5 framing structure".
+// secret-api-ok: delegates to keyschedule.membershipTag, which burns (the lint cannot see a same-name delegate); the key is only passed by pointer and the result is a public MAC tag.
 pub fn membershipTag(
     comptime S: type,
     allocator: std.mem.Allocator,
@@ -598,6 +599,7 @@ pub fn membershipTag(
 /// types an empty struct, and their authenticity rests on the signature
 /// alone (§12.1.8: an external proposal's signer is named by the
 /// `external_senders` extension).
+// secret-api-ok: delegates to keyschedule.verifyMembershipTag, which burns (the lint cannot see a same-name delegate); only a pointer to the key is passed.
 pub fn verifyMembershipTag(
     comptime S: type,
     allocator: std.mem.Allocator,

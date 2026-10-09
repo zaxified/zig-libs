@@ -48,7 +48,7 @@ const ok = adaptor.preVerify(xonly_pubkey, msg, t_point, presig);
 // Adapt: whoever knows t completes the pre-signature into an ORDINARY
 // 64-byte BIP340 signature — verifiable by plain bip340.verify with no
 // idea an adaptor scheme was involved.
-const sig_bytes = try adaptor.adapt(presig, t_secret);
+const sig_bytes = try adaptor.adapt(presig, &t_secret);
 const sig = try bip340.Signature.fromBytes(sig_bytes);
 const verified = bip340.verify(xonly_pubkey, msg, sig); // true
 

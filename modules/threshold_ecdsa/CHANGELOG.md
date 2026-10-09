@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). `messagePublicKey(seed: *const [32]u8)` takes the Ed25519 message-signing seed by pointer (was by value; it was already burned). `aux_proofs.deriveModChallenge` / `derivePrmChallengeBits` carry `secret-api-ok` markers: their `seed` is the public Fiat-Shamir digest, not a secret. Call sites in `aux_info`, `presign`, `tsslib_interop`, the old stack probe and `dkg` migrated.
+
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
   engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
   through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised

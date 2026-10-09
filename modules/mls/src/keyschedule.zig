@@ -418,6 +418,7 @@ fn fromJoinerBody(
 /// The all-zero `KDF.Nh`-byte string RFC 9420 §8 writes as `0` — the
 /// `psk_secret` for an epoch with no PSKs, and `psk_secret_[0]` in §8.4's
 /// chain.
+// secret-api-ok: returns the all-zero constant of RFC 9420 section 8, not a secret.
 pub fn zeroSecret(comptime S: type) [S.Nh]u8 {
     return [_]u8{0} ** S.Nh;
 }

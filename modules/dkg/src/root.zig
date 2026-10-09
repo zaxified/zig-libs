@@ -185,7 +185,7 @@ noinline fn assembleKeySharesUnburned(
             .paillier_pk = paillier_keys[i].public,
             .aux = aux_params[i],
             .verifying_share = outputs[i].verifying_share,
-            .message_key = tecdsa.messagePublicKey(message_seeds[i]) catch unreachable, // a clamped Ed25519 scalar is never zero
+            .message_key = tecdsa.messagePublicKey(&message_seeds[i]) catch unreachable, // a clamped Ed25519 scalar is never zero
         };
     }
     const public_keys: tecdsa.PublicKeys = .{ .entries = entries };

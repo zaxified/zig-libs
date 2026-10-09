@@ -126,6 +126,7 @@ test {
     _ = broker;
     _ = external_goldens;
     _ = v5_replay;
+    _ = @import("stackprobe_test.zig");
     _ = @import("topic_oracle_test.zig");
     _ = @import("session_replay.zig");
 }

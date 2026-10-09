@@ -245,7 +245,7 @@ test "STACKPROBE (audit 2026-10-08): no key or nonce residue on the dead stack a
     var th = std.Io.Threaded.init(std.testing.allocator, .{});
     defer th.deinit();
     presign_io = th.io();
-    probe_t = try adaptor.AdaptorPoint.fromSecret(@splat(0x37));
+    probe_t = try adaptor.AdaptorPoint.fromSecret(&@as([32]u8, @splat(0x37)));
 
     for (cases) |case| {
         cur_sk = try bip340.SecretKey.fromBytes(case.sk);

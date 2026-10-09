@@ -70,7 +70,7 @@ pub fn main() !void {
 
     // T = t*G — the public adaptor point the presigner binds to, without
     // ever learning t itself.
-    const adaptor_point = try adaptor.AdaptorPoint.fromSecret(t_bytes);
+    const adaptor_point = try adaptor.AdaptorPoint.fromSecret(&t_bytes);
 
     // ── PreSign: produce a pre-signature bound to T, no knowledge of t ────
     const presig = try adaptor.preSign(&secret_key, &msg, aux_rand, adaptor_point, io);
@@ -81,7 +81,7 @@ pub fn main() !void {
     std.debug.print("preVerify: accepted\n", .{});
 
     // ── Adapt: whoever learns t completes it into a PLAIN BIP340 sig ─────
-    const full_sig_bytes = try adaptor.adapt(presig, t_bytes);
+    const full_sig_bytes = try adaptor.adapt(presig, &t_bytes);
     const full_sig = try bip340.Signature.fromBytes(full_sig_bytes);
 
     // External oracle: a completely ordinary bip340.verify call — the
@@ -97,7 +97,7 @@ pub fn main() !void {
 
     // ── Negative case: extracting against the WRONG adaptor point must
     //    fail by NAME, not silently return a bogus scalar ────────────────
-    const wrong_point = try adaptor.AdaptorPoint.fromSecret(wrong_t_bytes);
+    const wrong_point = try adaptor.AdaptorPoint.fromSecret(&wrong_t_bytes);
     if (adaptor.extract(presig, full_sig, wrong_point)) |_| {
         return error.UnexpectedExtractSuccess;
     } else |err| switch (err) {

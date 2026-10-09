@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). `generateKey(out: *[32]u8, key_type, shared_secret: *const [32]u8) void` (was `generateKey(key_type, shared_secret: [32]u8) [32]u8`) and `generateCipherStream(key: *const [32]u8, out: []u8)` (was `key: [32]u8`); both run under a 2 KiB stack burn (new `src/burn.zig`) and are probed by the new `src/stackprobe2_test.zig`. `construct`/`process` keep their own burn; the derived `rho`/`mu`/pad keys now live in zeroed locals instead of by-value temporaries.
+
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
   engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
   through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised

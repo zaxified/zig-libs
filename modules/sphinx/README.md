@@ -45,9 +45,10 @@ const bytes_out = pkt.toBytes();
 Stream"):
 
 ```zig
-const rho = sphinx.generateKey(.rho, shared_secret); // .rho | .mu | .um | .pad
+var rho: [32]u8 = undefined;
+sphinx.generateKey(&rho, .rho, &shared_secret); // .rho | .mu | .um | .pad
 var stream: [1300]u8 = undefined;
-sphinx.generateCipherStream(rho, &stream); // ChaCha20(rho, nonce=0) keystream
+sphinx.generateCipherStream(&rho, &stream); // ChaCha20(rho, nonce=0) keystream
 ```
 
 **BOLT#1 `bigsize`** (the per-hop payload length prefix):

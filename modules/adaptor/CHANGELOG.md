@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). `AdaptorPoint.fromSecret(adaptor_secret: *const [32]u8)` and `adapt(presig, adaptor_secret: *const [32]u8)` take the adaptor secret by pointer (were by value). Both now run under a stack burn (new `src/burn.zig`: 32 KiB / 4 KiB); `preSign` keeps its own. New `src/stackprobe2_test.zig` probes them. README snippet migrated.
+
 - **2026-10-08** — **BREAKING + FIX (secrets in the caller's frame):** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
   engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
   through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised

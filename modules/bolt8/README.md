@@ -35,8 +35,9 @@ const bolt8 = @import("bolt8");
 **The secp256k1 DH adapter**:
 
 ```zig
-const kp = try bolt8.Secp256k1DH.KeyPair.generateDeterministic(seed); // or .generate(random)
-const shared = try bolt8.Secp256k1DH.dh(my_secret, remote_pub_33_bytes); // [32]u8
+var kp: bolt8.Secp256k1DH.KeyPair = undefined; // secrets by pointer, results by `out`
+try bolt8.Secp256k1DH.KeyPair.generateDeterministic(&kp, &seed); // or .generate(&kp, random)
+const shared = try bolt8.Secp256k1DH.dh(&my_secret, remote_pub_33_bytes); // [32]u8
 ```
 
 **The handshake driver**:
@@ -51,14 +52,16 @@ const shared = try bolt8.Secp256k1DH.dh(my_secret, remote_pub_33_bytes); // [32]
 var csprng = std.Random.DefaultCsprng.init(seed_from_getrandom);
 const entropy: bolt8.handshake.Ephemeral = .{ .csprng = csprng.random() };
 
-var initiator = bolt8.Initiator.init(&my_static_keypair, responder_static_pubkey);
+var initiator: bolt8.Initiator = undefined;
+bolt8.Initiator.init(&initiator, &my_static_keypair, responder_static_pubkey);
 const act1 = try initiator.genAct1(entropy);
 try initiator.readAct2(act2_from_wire);
 var done: bolt8.HandshakeResult = undefined; // transport keys: an out-parameter, see SPEC
 const act3 = try initiator.genAct3(&done);
-// act3 -> send over the wire; done -> bolt8.Transport.init(done)
+// act3 -> send over the wire; done -> bolt8.Transport.init(&t, &done)
 
-var responder = bolt8.Responder.init(&my_static_keypair);
+var responder: bolt8.Responder = undefined;
+bolt8.Responder.init(&responder, &my_static_keypair);
 try responder.readAct1(act1_from_wire);
 const act2 = try responder.genAct2(entropy);
 var result: bolt8.HandshakeResult = undefined;
@@ -81,7 +84,8 @@ outside a test build).
 **The post-handshake transport** (once a `HandshakeResult` is in hand):
 
 ```zig
-var t = bolt8.Transport.init(handshake_result);
+var t: bolt8.Transport = undefined;
+bolt8.Transport.init(&t, &handshake_result);
 
 var out: [bolt8.transport.length_frame_len + msg.len + 16]u8 = undefined;
 try t.sendMessage(msg, &out); // frames + encrypts + auto-rotates every 500 messages

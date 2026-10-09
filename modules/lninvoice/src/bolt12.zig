@@ -638,6 +638,8 @@ pub const InvoiceDecodeError = bech32raw.SplitError || error{InvalidDataChar} ||
 
 /// Decode (and TLV-validate) a BOLT#12 `invoice` string (`lni1...`). Does
 /// NOT verify the signature — call `Invoice.verify` for that.
+// secret-api-ok: this `Invoice` holds only public wire data (hash, amount, node id, signature);
+// the lint sees it as secret only because `bolt11.Invoice` (same name) carries a payment_secret.
 pub fn decodeInvoice(allocator: Allocator, str: []const u8) InvoiceDecodeError!Invoice {
     const stripped = try bech32raw.stripContinuation(allocator, str);
     defer allocator.free(stripped);

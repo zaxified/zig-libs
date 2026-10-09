@@ -31,6 +31,7 @@ const Secp256k1 = @import("k256").Secp256k1;
 const Fe = Secp256k1.Fe;
 const scalar = Secp256k1.scalar;
 const Scalar = scalar.Scalar;
+const burn = @import("burn.zig");
 
 pub const hash = @import("hash.zig");
 pub const taggedHash = hash.taggedHash;
@@ -134,10 +135,30 @@ pub const SecretKey = struct {
 
     pub const encoded_length = 32;
 
+    /// By-value convenience form, kept for the many callers that build a
+    /// `SecretKey` inline; it runs under a dead-stack burn but cannot reach the
+    /// caller's copies of `bytes` and of the result. Prefer `fromBytesInto`.
     pub fn fromBytes(bytes: [32]u8) SecretKeyError!SecretKey {
+        return burn.run(burn.key_burn, SecretKeyError!SecretKey, fromBytesBody, .{bytes});
+    }
+
+    fn fromBytesBody(bytes: [32]u8) SecretKeyError!SecretKey {
         const d = Scalar.fromBytes(bytes, .big) catch return error.InvalidSecretKey;
         if (d.isZero()) return error.InvalidSecretKey;
         return .{ .bytes = bytes };
+    }
+
+    /// Safe twin of `fromBytes`: the bytes by pointer, the key into `out`
+    /// (zeroed on error); runs under a dead-stack burn.
+    pub fn fromBytesInto(out: *SecretKey, bytes: *const [32]u8) SecretKeyError!void {
+        return burn.run(burn.key_burn, SecretKeyError!void, fromBytesIntoBody, .{ out, bytes });
+    }
+
+    fn fromBytesIntoBody(out: *SecretKey, bytes: *const [32]u8) SecretKeyError!void {
+        out.bytes = @splat(0);
+        const d = Scalar.fromBytes(bytes.*, .big) catch return error.InvalidSecretKey;
+        if (d.isZero()) return error.InvalidSecretKey;
+        out.bytes = bytes.*;
     }
 };
 
@@ -150,6 +171,10 @@ pub const PublicKey = struct {
     /// `d * G`, serialized x-only (BIP340 §"Public Key Conversion":
     /// `pk = bytes(x(d'*G))`).
     pub fn fromSecretKey(sk: *const SecretKey) SecretKeyError!PublicKey {
+        return burn.run(burn.pub_burn, SecretKeyError!PublicKey, publicFromSecretKeyBody, .{sk});
+    }
+
+    fn publicFromSecretKeyBody(sk: *const SecretKey) SecretKeyError!PublicKey {
         var kp: KeyPair = undefined;
         defer kp.deinit();
         try KeyPair.fromSecretKey(&kp, sk);
@@ -743,6 +768,7 @@ test {
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 test "meta.model_after names BIP340 and std's Secp256k1" {

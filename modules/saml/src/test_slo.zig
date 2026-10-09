@@ -283,7 +283,7 @@ test "LogoutRequest: EncryptedID decrypts to the expected NameID" {
 
     const kp = try makeIdpKey(0x510_0008);
     var cfg = baseRequestConfig(.{ .rsa = kp.public_key });
-    cfg.sp_decrypt_key = sp.secret_key;
+    cfg.sp_decrypt_key = &sp.secret_key;
     var res = try saml.consumeLogoutRequestXml(alloc, req, .redirect_verified, cfg);
     defer res.deinit();
     try testing.expectEqualStrings("alice@example.org", res.name_id);
@@ -315,7 +315,7 @@ test "LogoutRequest: EncryptedID wrong SP key -> IdDecryptionFailed (generic)" {
 
     const kp = try makeIdpKey(0x510_000A);
     var cfg = baseRequestConfig(.{ .rsa = kp.public_key });
-    cfg.sp_decrypt_key = other.secret_key;
+    cfg.sp_decrypt_key = &other.secret_key;
     try testing.expectError(error.IdDecryptionFailed, saml.consumeLogoutRequestXml(alloc, req, .redirect_verified, cfg));
 }
 
@@ -467,7 +467,7 @@ test "Z1: Decrypted.deinit wipes the recovered NameID before its buffer is freed
 
     const kp = try makeIdpKey(0x510_0008);
     var cfg = baseRequestConfig(.{ .rsa = kp.public_key });
-    cfg.sp_decrypt_key = sp.secret_key;
+    cfg.sp_decrypt_key = &sp.secret_key;
     var res = try saml.consumeLogoutRequestXml(sa, req, .redirect_verified, cfg);
     defer res.deinit();
 

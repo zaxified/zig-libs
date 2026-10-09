@@ -436,6 +436,8 @@ const ModBinding = union(enum) {
 /// shape but over a DETERMINISTIC (not random) byte stream, so prover and
 /// verifier derive the IDENTICAL `y_i` from the same public `(aux, w)`.
 /// `index` is 1-based (`1..=pi_mod_iterations`) to match the paper's `i`.
+// secret-api-ok: `seed` is the public Fiat-Shamir digest of the (public) transcript, recomputed by
+// the verifier; not secret material.
 pub fn deriveModChallenge(n_tilde: root.AuxModulus, seed: [32]u8, index: u32) root.AuxFe {
     var n_buf: [root.aux_modulus_bytes]u8 = undefined;
     n_tilde.toBytes(&n_buf, .big) catch unreachable; // fixed-width buffer always sufficient
@@ -473,6 +475,8 @@ fn derivePrmSeed(aux: root.AuxParams, context: ?[]const u8, commitments: []const
 /// bits (`m = 128 <= 256` fits inside a single `expandChallenge` call's
 /// first block; the loop still handles `m > 256` correctly if the
 /// soundness constant is ever widened).
+// secret-api-ok: `seed` is the public Fiat-Shamir digest of the (public) transcript, recomputed by
+// the verifier; not secret material.
 pub fn derivePrmChallengeBits(seed: [32]u8, out_bits: *[pi_prm_iterations]bool) void {
     var bit_bytes: [(pi_prm_iterations + 7) / 8]u8 = undefined;
     expandChallenge(seed, 0, 0, &bit_bytes);

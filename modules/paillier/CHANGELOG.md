@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING (source-compatible for method calls):** `SecretKey.nByteLen` and `SecretKey.nToBytes` take `self: *const SecretKey` (was by value, which copied `lambda`/`mu`/the CRT block into the caller's frame). `key.nToBytes(&buf)` call syntax is unchanged; only explicit `SecretKey.nToBytes(copy, …)` callers must pass a pointer. `nToBytes` reads only the public modulus (`secret-api-ok` marker). No new burn, no new probe.
+
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
   engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
   through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised

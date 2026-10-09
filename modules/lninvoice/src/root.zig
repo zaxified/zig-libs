@@ -93,4 +93,5 @@ test {
     _ = bolt11;
     _ = bolt12;
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }

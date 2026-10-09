@@ -1604,6 +1604,7 @@ pub const Broker = struct {
 
     /// `restoreSession` for a 5.0 session: the same, plus its Session Expiry
     /// Interval. The subscriptions' 5.0 options travel in `SessionSub`.
+    // secret-api-ok: `Broker.config` holds hooks and limits (the auth hook is a function pointer); the client's password is a borrowed slice that only `process` hands to that hook, and nothing here sees it.
     pub fn restoreSessionWith(b: *Broker, client_id: []const u8, username: ?[]const u8, subs: []const SessionSub, offline_since_ms: i64, opts: RestoreOptions) RestoreError!void {
         if (client_id.len == 0 or client_id.len > max_client_id) return error.InvalidClientId;
         if (username) |u| if (u.len > max_username) return error.InvalidUsername;
@@ -1724,6 +1725,7 @@ pub const Broker = struct {
     /// least `Config.session_expiry_ms` before `now` (the caller's clock, the
     /// one `process` is given). Returns how many went. A no-op while
     /// `session_expiry_ms` is 0.
+    // secret-api-ok: `Broker.config` holds hooks and limits, no credential; this only ages offline sessions.
     pub fn expireSessions(b: *Broker, now: i64) usize {
         // A session that ends takes its delayed Will with it — published now
         // (3.1.2-8: "or the Session ends"), after the lock.
@@ -1762,6 +1764,7 @@ pub const Broker = struct {
 
     /// Register a new connection over `transport`; returns an owned pointer
     /// (freed by `remove`). Allocates the connection's rx/tx buffers.
+    // secret-api-ok: `Broker.config` holds hooks and limits, no credential; this only allocates the connection's buffers.
     pub fn accept(b: *Broker, transport: Transport) Error!*Connection {
         b.mutex.lock();
         defer b.mutex.unlock();
@@ -2077,6 +2080,7 @@ pub const Broker = struct {
     /// `publish` with 5.0 properties and a Message Expiry. Held to
     /// `max_packet_size` in its largest form, the 5.0 PUBLISH a subscriber
     /// would get.
+    // secret-api-ok: `Broker.config` holds hooks and limits, no credential; this fans a topic and payload out.
     pub fn publishWith(b: *Broker, topic_name: []const u8, payload: []const u8, o: PublishOptions) Error!void {
         if (@intFromEnum(o.qos) > @intFromEnum(b.config.maximum_qos)) return error.ProtocolViolation;
         topic.validateName(topic_name) catch return error.ProtocolViolation;

@@ -24,6 +24,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const message = @import("message.zig");
+const burn = @import("burn.zig");
 const Reader = message.Reader;
 const Writer = message.Writer;
 const Extension = message.Extension;
@@ -481,7 +482,14 @@ pub const RevokeAndAck = struct {
     pub fn deinit(_: *RevokeAndAck, _: Allocator) void {}
 };
 
+// secret-api-ok: uniform message-codec API (every `decode*` returns its message by value); the
+// result IS the caller-owned message whose `per_commitment_secret` the caller must zero (see the
+// struct doc). The codec's own frames run under a burn.
 pub fn decodeRevokeAndAck(bytes: []const u8) message.FrameError!RevokeAndAck {
+    return burn.run(burn.codec_burn, message.FrameError!RevokeAndAck, decodeRevokeAndAckBody, .{bytes});
+}
+
+fn decodeRevokeAndAckBody(bytes: []const u8) message.FrameError!RevokeAndAck {
     var r = try message.openFrame(bytes, REVOKE_AND_ACK_TYPE);
     return .{
         .channel_id = try r.takeArray(32),
@@ -490,7 +498,14 @@ pub fn decodeRevokeAndAck(bytes: []const u8) message.FrameError!RevokeAndAck {
     };
 }
 
+// secret-api-ok: uniform message-codec API (every `serialize*` takes its message by value, which
+// is what the generic KAT round-trip relies on); `msg` is the caller's own message and is
+// zeroed by the caller (struct doc). The codec's own frames run under a burn.
 pub fn serializeRevokeAndAck(allocator: Allocator, msg: RevokeAndAck) Allocator.Error![]u8 {
+    return burn.run(burn.codec_burn, Allocator.Error![]u8, serializeRevokeAndAckBody, .{ allocator, msg });
+}
+
+fn serializeRevokeAndAckBody(allocator: Allocator, msg: RevokeAndAck) Allocator.Error![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, REVOKE_AND_ACK_TYPE);
@@ -738,7 +753,13 @@ fn checkReestablishTlvLengths(ext: Extension) TlvLengthError!void {
     }
 }
 
+// secret-api-ok: uniform message-codec API (see `decodeRevokeAndAck`); the result is the
+// caller-owned message whose `your_last_per_commitment_secret` the caller must zero.
 pub fn decodeChannelReestablish(allocator: Allocator, bytes: []const u8) (DecodeError || TlvLengthError || Allocator.Error)!ChannelReestablish {
+    return burn.run(burn.codec_burn, (DecodeError || TlvLengthError || Allocator.Error)!ChannelReestablish, decodeChannelReestablishBody, .{ allocator, bytes });
+}
+
+fn decodeChannelReestablishBody(allocator: Allocator, bytes: []const u8) (DecodeError || TlvLengthError || Allocator.Error)!ChannelReestablish {
     var r = try message.openFrame(bytes, CHANNEL_REESTABLISH_TYPE);
     var m: ChannelReestablish = undefined;
     m.channel_id = try r.takeArray(32);
@@ -757,7 +778,12 @@ pub fn decodeChannelReestablish(allocator: Allocator, bytes: []const u8) (Decode
 /// Refuses (`error.InvalidTlvLength`) to emit a known TLV record of the
 /// wrong length — the peer would be required to fail the stream. Records
 /// are written in the order given; build them in increasing type order.
+// secret-api-ok: uniform message-codec API (see `serializeRevokeAndAck`).
 pub fn serializeChannelReestablish(allocator: Allocator, msg: ChannelReestablish) (Allocator.Error || TlvLengthError)![]u8 {
+    return burn.run(burn.codec_burn, (Allocator.Error || TlvLengthError)![]u8, serializeChannelReestablishBody, .{ allocator, msg });
+}
+
+fn serializeChannelReestablishBody(allocator: Allocator, msg: ChannelReestablish) (Allocator.Error || TlvLengthError)![]u8 {
     for (msg.extension.records) |rec| {
         const known = rec.type == REESTABLISH_TLV_NEXT_FUNDING or rec.type == REESTABLISH_TLV_MY_CURRENT_FUNDING_LOCKED;
         if (known and rec.value.len != FundingTxidFlags.wire_len) return error.InvalidTlvLength;

@@ -153,7 +153,7 @@ test "encrypted flow: decrypt -> verify -> extract yields the SAME AuthnResult a
     const enc_resp = try encryptedResponse(alloc, kp.public_key);
     defer alloc.free(enc_resp);
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = kp.secret_key;
+    cfg.sp_decrypt_key = &kp.secret_key;
     var enc = try saml.consumeResponseXml(alloc, enc_resp, cfg);
     defer enc.deinit();
 
@@ -198,7 +198,7 @@ test "Z1: the decrypted assertion body does not survive in any block consumeResp
     const sa = scan.allocator();
 
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = kp.secret_key;
+    cfg.sp_decrypt_key = &kp.secret_key;
     var res = try saml.consumeResponseXml(sa, enc_resp, cfg);
 
     // The decryption + signature verification really happened, and the scanner
@@ -224,7 +224,7 @@ test "encrypted flow: POST binding (base64) decodes then decrypts + verifies" {
     _ = enc.encode(field, enc_resp);
 
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = kp.secret_key;
+    cfg.sp_decrypt_key = &kp.secret_key;
     var res = try saml.consumeResponse(alloc, field, cfg);
     defer res.deinit();
     try testing.expectEqualStrings("alice@example.org", res.name_id);
@@ -251,7 +251,7 @@ test "teeth: wrong SP decryption key -> AssertionDecryptionFailed" {
     const enc_resp = try encryptedResponse(alloc, kp.public_key);
     defer alloc.free(enc_resp);
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = other.secret_key;
+    cfg.sp_decrypt_key = &other.secret_key;
     try testing.expectError(error.AssertionDecryptionFailed, saml.consumeResponseXml(alloc, enc_resp, cfg));
 }
 
@@ -272,7 +272,7 @@ test "teeth: tamper the assertion BEFORE encrypting -> caught by signature verif
     defer alloc.free(enc_resp);
 
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = kp.secret_key;
+    cfg.sp_decrypt_key = &kp.secret_key;
     try testing.expectError(error.SignatureInvalid, saml.consumeResponseXml(alloc, enc_resp, cfg));
 }
 
@@ -290,7 +290,7 @@ test "teeth: a cleartext AND an encrypted assertion together -> MultipleAssertio
     defer alloc.free(resp);
 
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = kp.secret_key;
+    cfg.sp_decrypt_key = &kp.secret_key;
     try testing.expectError(error.MultipleAssertions, saml.consumeResponseXml(alloc, resp, cfg));
 }
 
@@ -310,7 +310,7 @@ test "teeth: two encrypted assertions -> MultipleAssertions" {
     defer alloc.free(two);
 
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = kp.secret_key;
+    cfg.sp_decrypt_key = &kp.secret_key;
     try testing.expectError(error.MultipleAssertions, saml.consumeResponseXml(alloc, two, cfg));
 }
 
@@ -347,7 +347,7 @@ test "teeth: classic wrap INSIDE the decrypted assertion -> SignatureWrappingDet
     defer alloc.free(enc_resp);
 
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = kp.secret_key;
+    cfg.sp_decrypt_key = &kp.secret_key;
     try testing.expectError(error.SignatureWrappingDetected, saml.consumeResponseXml(alloc, enc_resp, cfg));
 }
 
@@ -365,7 +365,7 @@ test "teeth: decrypted assertion with signature Reference repointed to a decoy -
     defer alloc.free(enc_resp);
 
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = kp.secret_key;
+    cfg.sp_decrypt_key = &kp.secret_key;
     try testing.expectError(error.SignatureInvalid, saml.consumeResponseXml(alloc, enc_resp, cfg));
 }
 
@@ -386,6 +386,6 @@ test "M20 teeth: decrypted EncryptedAssertion plaintext that is not an Assertion
     defer alloc.free(enc_resp);
 
     var cfg = baseConfig(fx.t_valid);
-    cfg.sp_decrypt_key = kp.secret_key;
+    cfg.sp_decrypt_key = &kp.secret_key;
     try testing.expectError(error.NoAssertion, saml.consumeResponseXml(alloc, enc_resp, cfg));
 }

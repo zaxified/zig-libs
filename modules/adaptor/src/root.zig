@@ -51,6 +51,7 @@ const Secp256k1 = @import("k256").Secp256k1;
 const Fe = Secp256k1.Fe;
 const scalar_mod = Secp256k1.scalar;
 const Scalar = scalar_mod.Scalar;
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -138,9 +139,15 @@ pub const AdaptorPoint = struct {
     /// documented to) would refuse to complete. An honest counterparty who
     /// derived `T` this way from those bytes could never get its own
     /// pre-signature adapted.
-    pub fn fromSecret(adaptor_secret: [32]u8) AdaptorPointError!AdaptorPoint {
-        _ = Scalar.fromBytes(adaptor_secret, .big) catch return error.InvalidAdaptorPoint;
-        const p = Secp256k1.combMulBase(adaptor_secret, .big) catch return error.InvalidAdaptorPoint;
+    ///
+    /// The secret comes in by pointer and the body runs under a dead-stack burn.
+    pub fn fromSecret(adaptor_secret: *const [32]u8) AdaptorPointError!AdaptorPoint {
+        return burn.run(burn.point_burn, AdaptorPointError!AdaptorPoint, fromSecretBody, .{adaptor_secret});
+    }
+
+    fn fromSecretBody(adaptor_secret: *const [32]u8) AdaptorPointError!AdaptorPoint {
+        _ = Scalar.fromBytes(adaptor_secret.*, .big) catch return error.InvalidAdaptorPoint;
+        const p = Secp256k1.combMulBase(adaptor_secret.*, .big) catch return error.InvalidAdaptorPoint;
         return .{ .bytes = p.toCompressedSec1() };
     }
 
@@ -603,13 +610,17 @@ pub const AdaptError = error{
 /// (working through both parity branches — see `SPEC.md`), which is
 /// exactly BIP340's verification equation for `R = R_even` (`presig.r`)
 /// and challenge `e`.
-pub fn adapt(presig: PreSignature, adaptor_secret: [32]u8) AdaptError![64]u8 {
+pub fn adapt(presig: PreSignature, adaptor_secret: *const [32]u8) AdaptError![64]u8 {
+    return burn.run(burn.adapt_burn, AdaptError![64]u8, adaptBody, .{ presig, adaptor_secret });
+}
+
+fn adaptBody(presig: PreSignature, adaptor_secret: *const [32]u8) AdaptError![64]u8 {
     // Defensive re-check of s_prime < n (fromBytes already enforces it,
     // but adapt stays safe on hand-constructed values).
     const s_prime = Scalar.fromBytes(presig.s_prime, .big) catch return error.InvalidPreSignature;
 
     // Step 1: t as a canonical non-zero scalar.
-    const t = Scalar.fromBytes(adaptor_secret, .big) catch return error.InvalidAdaptorSecret;
+    const t = Scalar.fromBytes(adaptor_secret.*, .big) catch return error.InvalidAdaptorSecret;
     if (t.isZero()) return error.InvalidAdaptorSecret;
 
     // Step 2: t_used = t, negated iff needs_negation — the SAME flag
@@ -716,6 +727,7 @@ test {
     _ = @import("interop_vectors.zig");
     _ = @import("interop_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 test "meta.model_after names the scriptless-scripts construction and the sibling bip340 dep" {
@@ -761,7 +773,7 @@ test "audit F7: AdaptorPoint.fromBytes rejects all four malformed SEC1 shapes" {
 
     // An otherwise-valid compressed point with the uncompressed-form prefix
     // byte (0x04) instead of 0x02/0x03.
-    var uncompressed_prefix = (try AdaptorPoint.fromSecret([_]u8{0x01} ** 31 ++ [_]u8{0x01})).toBytes();
+    var uncompressed_prefix = (try AdaptorPoint.fromSecret(&([_]u8{0x01} ** 31 ++ [_]u8{0x01}))).toBytes();
     uncompressed_prefix[0] = 0x04;
     try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromBytes(uncompressed_prefix));
 
@@ -781,7 +793,7 @@ test "PreSignature.fromBytes rejects a flag byte other than 0/1" {
 
 test "AdaptorPoint.fromSecret round-trips through .point() to the same secp256k1 point basePoint.mul gives directly" {
     const t_bytes = [_]u8{0x01} ** 31 ++ [_]u8{0x02}; // arbitrary small nonzero scalar
-    const ap = try AdaptorPoint.fromSecret(t_bytes);
+    const ap = try AdaptorPoint.fromSecret(&t_bytes);
     const got = try ap.point();
     const want = try Secp256k1.combMulBase(t_bytes, .big);
     try std.testing.expect(got.equivalent(want));
@@ -802,27 +814,27 @@ test "audit F1: AdaptorPoint.fromSecret rejects adaptor_secret >= n (matches ada
     };
     var n_plus_1 = n_bytes;
     n_plus_1[31] += 1; // n + 1, still fits in 32 bytes (n is not near 2^256)
-    try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromSecret(n_plus_1));
+    try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromSecret(&n_plus_1));
 
     // Control: `n + 1` and `1` used to alias to the SAME point (mod-n
     // reduction) — confirm that pre-fix aliasing is what's being refused,
     // not something unrelated.
     const one = [_]u8{0x00} ** 31 ++ [_]u8{0x01};
-    const t_one = try AdaptorPoint.fromSecret(one);
+    const t_one = try AdaptorPoint.fromSecret(&one);
     _ = t_one;
 
     // Control: the genuinely canonical values on both sides of the boundary
     // still work exactly as before.
     var n_minus_1 = n_bytes;
     n_minus_1[31] -= 1;
-    _ = try AdaptorPoint.fromSecret(n_minus_1); // canonical (< n), still accepted
-    try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromSecret(n_bytes)); // == n, identity, unchanged behaviour
+    _ = try AdaptorPoint.fromSecret(&n_minus_1); // canonical (< n), still accepted
+    try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromSecret(&n_bytes)); // == n, identity, unchanged behaviour
 }
 
 test "A1 F5 (round-2 follow-up): preSignImpl enforces step 9 on the REAL production path, not just in a standalone check function" {
     const sk = try bip340.SecretKey.fromBytes([_]u8{0x42} ** 32);
     const t_bytes = [_]u8{0x01} ** 31 ++ [_]u8{0x07};
-    const adaptor_point = try AdaptorPoint.fromSecret(t_bytes);
+    const adaptor_point = try AdaptorPoint.fromSecret(&t_bytes);
     const msg = "A1 F5 adaptor regression";
     const aux_rand = [_]u8{0xCD} ** 32;
 

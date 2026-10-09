@@ -72,7 +72,8 @@ const tweaks = [_]musig2.Tweak{.{ .tweak = tweak32, .is_xonly = true }};
 **Nonce generation** (`NonceGen`):
 
 ```zig
-const result = try musig2.nonceGen(sk, pk_bytes, aggpk_xonly, msg, extra_in, rand_prime, io);
+var result: musig2.NonceGenResult = undefined;
+try musig2.nonceGen(&result, &sk, pk_bytes, aggpk_xonly, msg, extra_in, &rand_prime, io);
 // result.secnonce: musig2.SecNonce  (LOCAL — never send over the wire; single-use, see SPEC.md)
 // result.pubnonce: musig2.PubNonce  (send to co-signers)
 ```

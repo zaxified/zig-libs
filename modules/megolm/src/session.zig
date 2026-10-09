@@ -116,6 +116,7 @@ pub const OutboundSession = struct {
     /// Base64(Ed25519 public key) — a session's globally-unique identifier
     /// (the spec: "The public part of K is used as an identifier to
     /// discriminate between sessions").
+    // secret-api-ok: sessionId reads only the Ed25519 PUBLIC key; the lint sees a method of a secret-holding session.
     pub fn sessionId(self: *const OutboundSession, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return base64EncodeBytes(allocator, &self.signing_key.public_key.toBytes());
     }
@@ -203,7 +204,7 @@ pub const OutboundSession = struct {
     }
 
     fn fromPickleBody(bytes: []const u8, out: *OutboundSession) pickle_mod.PickleError!void {
-        out.* = try pickle_mod.decodeOutbound(bytes);
+        try pickle_mod.decodeOutbound(bytes, out);
     }
 
     /// Restore a session from `pickleSealed`'s output; a wrong key or any
@@ -213,7 +214,7 @@ pub const OutboundSession = struct {
     }
 
     fn fromSealedPickleBody(bytes: []const u8, key: *const pickle_mod.PickleKey, out: *OutboundSession) pickle_mod.PickleError!void {
-        out.* = try pickle_mod.openOutbound(bytes, key);
+        try pickle_mod.openOutbound(bytes, key, out);
     }
 };
 

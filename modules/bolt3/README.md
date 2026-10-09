@@ -18,9 +18,11 @@ zig-libs' MIT license.
 |---|---|
 | `derivePublicKey` / `derivePrivateKey` | Per-commitment blinding: `basepoint + SHA256(per_commitment_point ‖ basepoint)·G` (and the secret mod n) |
 | `deriveRevocationPublicKey` / `deriveRevocationPrivateKey` | Revocation split-secret: `rb·SHA256(rb‖pcp) + pcp·SHA256(pcp‖rb)` — the justice-transaction primitive that neither party alone can complete |
-| `perCommitmentSecret(seed, index)` | Appendix D shachain generation: the O(48) hash tree the secrets are drawn from |
+| `perCommitmentSecret(out, seed, index)` | Appendix D shachain generation: the O(48) hash tree the secrets are drawn from |
 
-Points are 33-byte SEC1-compressed; secrets are 32-byte big-endian scalars.
+Points are 33-byte SEC1-compressed; secrets are 32-byte big-endian scalars. Secret inputs
+are passed by `*const` pointer and secret results land in an `out: *[32]u8`; every secret
+entry point runs under a dead-stack burn (`src/burn.zig`).
 
 ## Scope
 

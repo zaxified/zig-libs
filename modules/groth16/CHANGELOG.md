@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** `prover.setup` / `prover.freeKeyPair` carry `secret-api-ok` markers for the dead-stack lint: the `KeyPair` they return/take is the public CRS (`ProvingKey` + `VerifyingKey`, curve points), not key material. The secret input (`ToxicWaste`) was already by pointer and `setup` already burned.
+
 - **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte
   vector stores LLVM realigned the frame of a burn of 2 KiB or less (`and $-32, %rsp`), and the 32..63
   bytes between the zeroed buffer and the saved frame pointer kept whatever a callee had left there

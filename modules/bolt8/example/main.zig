@@ -28,16 +28,20 @@ pub fn main() !void {
     // entropy syscall and reproduces the same run every time — see the
     // module doc comment above for why this is explicitly NOT the
     // production arm of `Ephemeral`.
-    const init_ls = try bolt8.Secp256k1DH.KeyPair.generateDeterministic([_]u8{0x11} ** 32);
-    const resp_ls = try bolt8.Secp256k1DH.KeyPair.generateDeterministic([_]u8{0x21} ** 32);
+    var init_ls: bolt8.Secp256k1DH.KeyPair = undefined;
+    try bolt8.Secp256k1DH.KeyPair.generateDeterministic(&init_ls, &([_]u8{0x11} ** 32));
+    var resp_ls: bolt8.Secp256k1DH.KeyPair = undefined;
+    try bolt8.Secp256k1DH.KeyPair.generateDeterministic(&resp_ls, &([_]u8{0x21} ** 32));
 
     var init_rng = std.Random.DefaultPrng.init(0xC0FFEE);
     var resp_rng = std.Random.DefaultPrng.init(0xDECAFBAD);
 
     // The initiator must know the responder's static public key in
     // advance — BOLT#8 is `Noise_XK`, so it is never sent on the wire.
-    var initiator = bolt8.Initiator.init(&init_ls, resp_ls.public_key);
-    var responder = bolt8.Responder.init(&resp_ls);
+    var initiator: bolt8.Initiator = undefined;
+    bolt8.Initiator.init(&initiator, &init_ls, resp_ls.public_key);
+    var responder: bolt8.Responder = undefined;
+    bolt8.Responder.init(&responder, &resp_ls);
 
     // Act One: initiator -> responder.
     const a1 = try initiator.genAct1(.{ .seeded_for_test = init_rng.random() });
@@ -59,8 +63,10 @@ pub fn main() !void {
     std.debug.print("handshake hash matches on both sides: {}\n", .{std.mem.eql(u8, &iresult.handshake_hash, &rresult.handshake_hash)});
 
     // ── post-handshake transport ────────────────────────────────────────
-    var itx = bolt8.Transport.init(iresult);
-    var rtx = bolt8.Transport.init(rresult);
+    var itx: bolt8.Transport = undefined;
+    bolt8.Transport.init(&itx, &iresult);
+    var rtx: bolt8.Transport = undefined;
+    bolt8.Transport.init(&rtx, &rresult);
 
     const plaintext = "0100"; // a stand-in for a real Lightning message's 2-byte type + body
     var wire: [bolt8.transport.length_frame_len + plaintext.len + 16]u8 = undefined;
@@ -76,7 +82,8 @@ pub fn main() !void {
     // any AEAD tag failure, never a best-effort decode.
     var tampered = wire;
     tampered[tampered.len - 1] ^= 0xff;
-    var rtx2 = bolt8.Transport.init(rresult);
+    var rtx2: bolt8.Transport = undefined;
+    bolt8.Transport.init(&rtx2, &rresult);
     const length2 = try rtx2.recvLength(tampered[0..bolt8.transport.length_frame_len]);
     var out2: [plaintext.len]u8 = undefined;
     rtx2.recvMessage(tampered[bolt8.transport.length_frame_len..], out2[0..length2]) catch |err| switch (err) {
