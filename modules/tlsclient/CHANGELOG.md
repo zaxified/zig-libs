@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Security hardening:** `checkWellFormed` (every server certificate, before std's
+  parser sees it) now runs `x509.safe.validateForStdParse` instead of `validateCertificate` alone: it
+  also requires a constructed element at every position std's `Certificate.parse` descends into, and
+  a well-formed RSAPublicKey inside an RSA key's BIT STRING, which std's verify reads unchecked. Both
+  are documented out-of-bounds paths in std (x509 2026-10-10, found by x509's chain fuzz driver).
+
 - **2026-10-09** — **HIGH: the established session's application secrets
   were left on the dead stack by `Client.init`'s by-value return.** New
   `Client.initInto(out: *Client, input, output, options)` writes the session to

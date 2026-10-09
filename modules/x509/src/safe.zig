@@ -391,6 +391,38 @@ fn requireStdDescentPoints(bytes: []const u8, certificate: Header) Error!void {
     }
 }
 
+/// The structural half of `safeCertificate`, without the copy: `der` is a
+/// well-formed DER certificate (`validateCertificate`) and every position
+/// `std.crypto.Certificate.parse` descends into is constructed
+/// (`requireStdDescentPoints`). What it does NOT give is `parse_slack`: std's
+/// boundary probes may still read up to that far past `der`'s end, so a
+/// caller that owns the buffer and needs full safety uses `safeCertificate`.
+pub fn validateForStdParse(der: []const u8) Error!void {
+    try validateCertificate(der);
+    try requireStdDescentPoints(der, try decodeHeader(der, 0, der.len));
+    // `Parsed.verify` on an RSA issuer hands the subjectPublicKey BIT STRING's
+    // content to `rsa.PublicKey.parseDer`, which reads a SEQUENCE and two
+    // INTEGERs out of it unchecked. A BIT STRING is primitive, so nothing
+    // above looked inside (fuzz driver, 2026-10-10: index 278 of a 270-octet
+    // key). Require exactly that shape, tiling the content.
+    const spki = spkiOf(der) catch return error.NotCertificate;
+    if (spki.algorithmIs(&oid_rsa_encryption) or spki.algorithmIs(&oid_rsassa_pss)) {
+        try requireRsaPublicKey(spki.key_bits);
+    }
+}
+
+/// `RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }`
+/// (RFC 8017 §A.1.1), exactly filling `kb`.
+fn requireRsaPublicKey(kb: []const u8) Error!void {
+    const seq = try decodeHeader(kb, 0, kb.len);
+    if (kb[0] != 0x30 or seq.content_end != kb.len) return error.NotCertificate;
+    const modulus = try decodeHeader(kb, seq.content_start, seq.content_end);
+    if (kb[seq.content_start] != 0x02) return error.NotCertificate;
+    if (modulus.content_end >= seq.content_end) return error.Truncated;
+    const exponent = try decodeHeader(kb, modulus.content_end, seq.content_end);
+    if (kb[modulus.content_end] != 0x02 or exponent.content_end != seq.content_end) return error.NotCertificate;
+}
+
 pub const SafeCertificateError = Error || error{
     /// The certificate is larger than the bound: `max_certificate_len`, or
     /// `SafeCertificateOptions.max_len` for `safeCertificateOpts`.
@@ -447,6 +479,7 @@ pub fn safeCertificateOpts(certificate_der: []const u8, scratch: []u8, opts: Saf
 /// tag/length octets) — directly comparable with `Spki.algorithm_oid` /
 /// `Spki.namedCurveOid`.
 pub const oid_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 }; // 1.2.840.113549.1.1.1
+pub const oid_rsassa_pss = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a }; // 1.2.840.113549.1.1.10
 pub const oid_ec_public_key = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 }; // 1.2.840.10045.2.1
 pub const oid_prime256v1 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 }; // 1.2.840.10045.3.1.7
 pub const oid_secp384r1 = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 }; // 1.3.132.0.34
@@ -1059,21 +1092,50 @@ const CertCorpus = struct {
     }
 };
 
-fn fuzzSpkiOf(_: void, smith: *std.testing.Smith) anyerror!void {
+const fz = @import("fuzz_test.zig");
+const SpkiMark = fz.Marker(enum { accepted, refused, key });
+const ValidateMark = fz.Marker(enum { validated, refused, parsed, over_length });
+
+/// The corpus, built once for the driver's harnesses (a harness run must not
+/// pay for copying ~40 KiB of certificates).
+var shared_corpus: CertCorpus = .{};
+var shared_entries: ?[]const []const u8 = null;
+fn corpusEntries() []const []const u8 {
+    if (shared_entries == null) shared_entries = shared_corpus.build();
+    return shared_entries.?;
+}
+
+fn fuzzSpkiOfSmith(_: void, smith: *std.testing.Smith) anyerror!void {
+    try fuzzSpkiOf(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzSpkiOf(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [fuzz_buf_bytes]u8 = undefined;
-    // ⚠ One `smith.slice`, never `bytes` followed by a ranged length.
-    const n: usize = smith.slice(&buf);
+    // ⚠ One `slice` (under `Smith`), never `bytes` followed by a ranged length.
+    const n: usize = fz.drawInput(S, src, &buf, corpusEntries());
     if (spkiOf(buf[0..n])) |spki| {
+        SpkiMark.mark(.accepted);
         _ = spki.namedCurveOid();
         _ = spki.algorithmIs(&oid_rsa_encryption);
-        _ = rsa.PublicKey.fromDer(spki.der) catch {};
-        _ = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(spki.key_bits) catch {};
-    } else |_| {}
+        var key = false;
+        if (rsa.PublicKey.fromDer(spki.der)) |_| key = true else |_| {}
+        if (std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(spki.key_bits)) |_| key = true else |_| {}
+        if (key) SpkiMark.mark(.key);
+    } else |_| SpkiMark.mark(.refused);
 }
 
 test "fuzz: arbitrary bytes through spkiOf never panic" {
     var corpus: CertCorpus = .{};
-    try testing.fuzz({}, fuzzSpkiOf, .{ .corpus = corpus.build() });
+    try testing.fuzz({}, fuzzSpkiOfSmith, .{ .corpus = corpus.build() });
+}
+
+test "fuzz driver: X509_FUZZ (spkiOf)" {
+    try fz.fuzz_driver.run(fuzzSpkiOf, .{ .prefix = "X509_FUZZ", .name = "x509-spki" });
+}
+
+test "fuzz harness: spkiOf, 300 seeds, reaches every outcome" {
+    try SpkiMark.reach(fuzzSpkiOf, "x509-spki", 300);
 }
 
 test "corpus: the spkiOf seeds reach the parser, and the counts are pinned" {
@@ -1104,27 +1166,41 @@ test "corpus: the spkiOf seeds reach the parser, and the counts are pinned" {
     try testing.expectEqual(@as(usize, 6), keys);
 }
 
-fn fuzzValidateAndSafeParse(_: void, smith: *std.testing.Smith) anyerror!void {
+fn fuzzValidateAndSafeParseSmith(_: void, smith: *std.testing.Smith) anyerror!void {
+    try fuzzValidateAndSafeParse(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz driver: X509_FUZZ (validator + safe parser)" {
+    try fz.fuzz_driver.run(fuzzValidateAndSafeParse, .{ .prefix = "X509_FUZZ", .name = "x509-validate" });
+}
+
+test "fuzz harness: validator + safe parser, 300 seeds, reaches every outcome" {
+    try ValidateMark.reach(fuzzValidateAndSafeParse, "x509-validate", 300);
+}
+
+fn fuzzValidateAndSafeParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [fuzz_buf_bytes]u8 = undefined;
-    const n: usize = smith.slice(&buf);
+    const n: usize = fz.drawInput(S, src, &buf, corpusEntries());
     const input = buf[0..n];
     // The validator must be total on arbitrary bytes.
     validate(input) catch {};
-    validateCertificate(input) catch {};
+    if (validateCertificate(input)) |_| ValidateMark.mark(.validated) else |_| ValidateMark.mark(.refused);
+    if (n > max_certificate_len) ValidateMark.mark(.over_length);
     // And the safe parser: validate → pad → parse, never a crash. The buffer
     // is `max_certificate_len + parse_slack`, so this branch is a real test
     // rather than the constant-true it was against a 1024-octet buffer.
     var scratch: [max_certificate_len + parse_slack]u8 = undefined;
     if (n <= max_certificate_len) {
         if (safeCertificate(input, &scratch)) |cert| {
-            if (cert.parse()) |_| {} else |_| {}
+            if (cert.parse()) |_| ValidateMark.mark(.parsed) else |_| {}
         } else |_| {}
     }
 }
 
 test "fuzz: arbitrary bytes through the validator and the safe parser never panic" {
     var corpus: CertCorpus = .{};
-    try testing.fuzz({}, fuzzValidateAndSafeParse, .{ .corpus = corpus.build() });
+    try testing.fuzz({}, fuzzValidateAndSafeParseSmith, .{ .corpus = corpus.build() });
 }
 
 test "corpus: the validator seeds reach safeCertificate, and the counts are pinned" {

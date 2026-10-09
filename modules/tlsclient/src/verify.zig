@@ -42,7 +42,11 @@ pub const Error = error{
 /// Refuse a certificate std's parser must not see (see the file header).
 pub fn checkWellFormed(der: []const u8) Error!void {
     if (der.len > x509.safe.max_certificate_len) return error.TlsCertificateNotVerified;
-    x509.safe.validateCertificate(der) catch return error.TlsCertificateNotVerified;
+    // Not `validateCertificate` alone: std's parser also descends into
+    // fixed field positions whatever their constructed bit, and std's RSA
+    // verify reads the key inside the subjectPublicKey BIT STRING unchecked
+    // (x509 2026-10-10). `validateForStdParse` covers both.
+    x509.safe.validateForStdParse(der) catch return error.TlsCertificateNotVerified;
 }
 
 /// Verify `chain` (leaf first, as the server sent it, each one already

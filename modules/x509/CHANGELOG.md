@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Fixed (SECURITY):** `verifyChain` / `buildPath` passed the peer's certificates to
+  std's `Certificate.parse` and `Parsed.verify` unguarded: a malformed intermediate made std index far
+  out of bounds (a safety panic in safe builds, an out-of-bounds read in ReleaseFast), both inside
+  `parse` and inside std's RSA key parser, which reads the RSAPublicKey in the subjectPublicKey BIT
+  STRING unchecked. Every chain entry now goes through the new `safe.validateForStdParse`
+  (`validateCertificate` + the std descent points + an exact `SEQUENCE { INTEGER, INTEGER }` RSA key)
+  before anything else; trust anchors are the caller's configuration and are not re-checked.
+  **Fixed (malleability):** `parseShape` read every RFC 5280 field by position without checking its
+  tag, and bounded elements by the buffer rather than by their parent, so the UNSIGNED outer encoding
+  could be altered and the same signature still verified under another fingerprint: the outer
+  SEQUENCE tag, the signature BIT STRING tag, the outer length, the outer signatureAlgorithm (now
+  required byte-equal to the signed tbsCertificate.signature, RFC 5280 §4.1.1.2), and the tags of the
+  TBS fields. Found by the chain fuzz driver once its damage range covered the whole certificate;
+  regression tests red without the fixes (one accepted, one std panic).
+
+- **2026-10-10** — tests: deterministic fuzz driver `X509_FUZZ` over the existing harnesses (`spkiOf`, the validator and safe parser, the extension walk, `parsePssParams`, plus chain verification: the OpenSSL-signed fixture chains are accepted, a damaged leaf or intermediate and an out-of-validity time refused).
 - **2026-10-10** — **Fixed (SECURITY, DoS):** `extensions.parseElement` checked that a long-form length's
   octets were in the buffer but not that `start + length` fits: std's `der.Element.parse` computes that
   end in u32, so a 4-octet length near 2^32 overflowed — a safety panic (process abort) in safe builds,

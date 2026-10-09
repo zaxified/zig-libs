@@ -54,6 +54,7 @@ const extensions = @import("extensions.zig");
 const algorithm = @import("algorithm.zig");
 const rsa = @import("rsa");
 const crl = @import("crl.zig");
+const safe = @import("safe.zig");
 
 /// One certificate's DER bytes. A bare `[]const u8` alias rather than a
 /// wrapper struct: every std/rsa API in this collection that touches a
@@ -354,6 +355,19 @@ pub fn buildPath(
     opts: Options,
 ) VerifyChainError![]PathEntry {
     if (chain.len == 0) return error.EmptyChain;
+    // The chain is the peer's: nothing in it reaches std's parser (which
+    // `verifyLink` and `verifyChain` call) or this module's walks before
+    // x509's own guard has seen it. Without this a malformed intermediate
+    // made std index far out of bounds (fuzz driver, 2026-10-10: a safety
+    // panic in `Certificate.parse` via `verifyLink`; an out-of-bounds read in
+    // ReleaseFast). Trust anchors are the caller's own configuration.
+    for (chain) |cert_der| {
+        if (cert_der.len > safe.max_pq_certificate_len) return error.CertificateFieldHasInvalidLength;
+        safe.validateForStdParse(cert_der) catch |err| return switch (err) {
+            error.EmptyBitString => error.CertificateHasInvalidBitString,
+            else => error.CertificateFieldHasInvalidLength,
+        };
+    }
 
     var path: std.ArrayList(PathEntry) = .empty;
     errdefer path.deinit(gpa);
@@ -919,10 +933,26 @@ fn parseBitStringSafe(cert: Certificate, elem: der.Element) Certificate.ParseErr
     return Certificate.parseBitString(cert, elem);
 }
 
+/// `e`'s identifier octet must be exactly `byte`. The positions below are
+/// fixed by RFC 5280 §4.1; std's reader descends by position and never looks.
+/// Checking matters even where the bytes are outside the signed
+/// tbsCertificate: an unchecked tag there (the outer SEQUENCE, the signature
+/// BIT STRING) lets one signature verify under several encodings, i.e. under
+/// several certificate fingerprints (found by the x509 fuzz driver,
+/// 2026-10-10: octet 0 `30` -> `0e`, the signature's `03` -> `c3`).
+fn expectTag(e: der.Element, byte: u8) Certificate.ParseError!void {
+    if (@as(u8, @bitCast(e.identifier)) != byte) return error.CertificateFieldHasWrongDataType;
+}
+
+const tag_sequence: u8 = 0x30;
+const tag_bit_string: u8 = 0x03;
+
 fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
     const bytes = cert.buffer;
     const certificate = try extensions.parseElement(bytes, cert.index);
+    try expectTag(certificate, tag_sequence);
     const tbs_certificate = try extensions.parseElement(bytes, certificate.slice.start);
+    try expectTag(tbs_certificate, tag_sequence);
     const version_elem = try extensions.parseElement(bytes, tbs_certificate.slice.start);
     _ = try Certificate.parseVersion(bytes, version_elem);
     const serial_number = if (@as(u8, @bitCast(version_elem.identifier)) == 0xa0)
@@ -930,16 +960,22 @@ fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
     else
         version_elem;
     const tbs_signature = try extensions.parseElement(bytes, serial_number.slice.end);
+    try expectTag(tbs_signature, tag_sequence);
     const issuer = try extensions.parseElement(bytes, tbs_signature.slice.end);
+    try expectTag(issuer, tag_sequence);
     const validity = try extensions.parseElement(bytes, issuer.slice.end);
+    try expectTag(validity, tag_sequence);
     const not_before_elem = try extensions.parseElement(bytes, validity.slice.start);
     const not_before = try Certificate.parseTime(cert, not_before_elem);
     const not_after_elem = try extensions.parseElement(bytes, not_before_elem.slice.end);
     const not_after = try Certificate.parseTime(cert, not_after_elem);
     const subject = try extensions.parseElement(bytes, validity.slice.end);
+    try expectTag(subject, tag_sequence);
     const pub_key_info = try extensions.parseElement(bytes, subject.slice.end);
+    try expectTag(pub_key_info, tag_sequence);
 
     const pub_key_alg_seq = try extensions.parseElement(bytes, pub_key_info.slice.start);
+    try expectTag(pub_key_alg_seq, tag_sequence);
     const pub_key_alg_oid = try extensions.parseElement(bytes, pub_key_alg_seq.slice.start);
     if (pub_key_alg_oid.identifier.tag != .object_identifier) return error.CertificateFieldHasWrongDataType;
     const pub_key_alg_oid_bytes = bytes[pub_key_alg_oid.slice.start..pub_key_alg_oid.slice.end];
@@ -959,9 +995,11 @@ fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
         },
     };
     const pub_key_elem = try extensions.parseElement(bytes, pub_key_alg_seq.slice.end);
+    try expectTag(pub_key_elem, tag_bit_string);
     const pub_key_slice = try parseBitStringSafe(cert, pub_key_elem);
 
     const sig_algo = try extensions.parseElement(bytes, tbs_certificate.slice.end);
+    try expectTag(sig_algo, tag_sequence);
     const algo_oid_elem = try extensions.parseElement(bytes, sig_algo.slice.start);
     if (algo_oid_elem.identifier.tag != .object_identifier) return error.CertificateFieldHasWrongDataType;
     const sig_alg_params: ?[]const u8 = if (algo_oid_elem.slice.end < sig_algo.slice.end) params: {
@@ -969,6 +1007,18 @@ fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
         break :params bytes[algo_oid_elem.slice.end..params_elem.slice.end];
     } else null;
     const sig_elem = try extensions.parseElement(bytes, sig_algo.slice.end);
+    try expectTag(sig_elem, tag_bit_string);
+    // tbsCertificate, signatureAlgorithm and signatureValue tile the outer
+    // SEQUENCE exactly. `parseElement` bounds each element by the buffer only,
+    // so without this a damaged outer length (unsigned) still verified
+    // (fuzz driver, 2026-10-10: octet 3 `68` -> `1a`).
+    if (sig_elem.slice.end != certificate.slice.end) return error.CertificateFieldHasInvalidLength;
+    // RFC 5280 §4.1.1.2: signatureAlgorithm "MUST contain the same algorithm
+    // identifier as the signature field in the sequence tbsCertificate". The
+    // inner copy is signed, so byte equality pins the outer one (fuzz driver,
+    // 2026-10-10: its NULL parameters `05` -> `4b` still verified).
+    if (!std.mem.eql(u8, bytes[tbs_certificate.slice.end..sig_algo.slice.end], bytes[serial_number.slice.end..tbs_signature.slice.end]))
+        return error.CertificateFieldHasWrongDataType;
     const signature_slice = try parseBitStringSafe(cert, sig_elem);
 
     if (serial_number.identifier.tag != .integer) return error.CertificateFieldHasWrongDataType;
@@ -1585,16 +1635,35 @@ const pss_seeds = [_][]const u8{
     testkit.fuzz.seed(""),
 };
 
+const fz = @import("fuzz_test.zig");
+const PssMark = fz.Marker(enum { accepted, refused, explicit_salt });
+
 test "fuzz: parsePssParams never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzPssParams, .{ .corpus = &pss_seeds });
+    try testing.fuzz({}, fuzzPssParamsSmith, .{ .corpus = &pss_seeds });
 }
 
-fn fuzzPssParams(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: X509_FUZZ (parsePssParams)" {
+    try fz.fuzz_driver.run(fuzzPssParams, .{ .prefix = "X509_FUZZ", .name = "x509-pss" });
+}
+
+test "fuzz harness: parsePssParams, 500 seeds, reaches every outcome" {
+    try PssMark.reach(fuzzPssParams, "x509-pss", 500);
+}
+
+fn fuzzPssParamsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPssParams(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzPssParams(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // 256 against a 60-octet longest real encoding.
     var buf: [256]u8 = undefined;
-    // ⚠ One `smith.slice`, never `bytes` followed by a ranged length.
-    const len: usize = smith.slice(&buf);
-    _ = parsePssParams(buf[0..len]) catch {};
+    // ⚠ One `slice` (under `Smith`), never `bytes` followed by a ranged length.
+    const len: usize = fz.drawInput(S, src, &buf, &pss_seeds);
+    if (parsePssParams(buf[0..len])) |p| {
+        PssMark.mark(.accepted);
+        if (p.salt_len != 20) PssMark.mark(.explicit_salt);
+    } else |_| PssMark.mark(.refused);
 }
 
 test "corpus: the parsePssParams seeds reach the parser, counts pinned" {
@@ -1627,4 +1696,5 @@ test "corpus: the parsePssParams seeds reach the parser, counts pinned" {
 
 test {
     _ = @import("chain_test.zig");
+    _ = @import("fuzz_test.zig");
 }

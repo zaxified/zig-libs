@@ -762,15 +762,39 @@ const CertCorpus = struct {
     }
 };
 
-test "fuzz: findExtensions + all extension-value parsers never panic on arbitrary bytes" {
-    var corpus: CertCorpus = .{};
-    try testing.fuzz({}, fuzzExtensions, .{ .corpus = corpus.build() });
+const fz = @import("fuzz_test.zig");
+const ExtMark = fz.Marker(enum { found, walked, value_parsed, refused });
+
+/// The corpus, built once for the driver's harness.
+var shared_corpus: CertCorpus = .{};
+var shared_entries: ?[]const []const u8 = null;
+fn corpusEntries() []const []const u8 {
+    if (shared_entries == null) shared_entries = shared_corpus.build();
+    return shared_entries.?;
 }
 
-fn fuzzExtensions(_: void, smith: *std.testing.Smith) !void {
+test "fuzz: findExtensions + all extension-value parsers never panic on arbitrary bytes" {
+    var corpus: CertCorpus = .{};
+    try testing.fuzz({}, fuzzExtensionsSmith, .{ .corpus = corpus.build() });
+}
+
+test "fuzz driver: X509_FUZZ (extensions)" {
+    try fz.fuzz_driver.run(fuzzExtensions, .{ .prefix = "X509_FUZZ", .name = "x509-extensions" });
+}
+
+test "fuzz harness: extensions, 400 seeds, reaches every outcome" {
+    try ExtMark.reach(fuzzExtensions, "x509-extensions", 400);
+}
+
+fn fuzzExtensionsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzExtensions(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzExtensions(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [fuzz_buf_bytes]u8 = undefined;
-    // ⚠ One `smith.slice`, never `bytes` followed by a ranged length.
-    const len: usize = smith.slice(&buf);
+    // ⚠ One `slice` (under `Smith`), never `bytes` followed by a ranged length.
+    const len: usize = fz.drawInput(S, src, &buf, corpusEntries());
     const bytes = buf[0..len];
 
     // Shape 1: the whole buffer as a "certificate" — exercises
@@ -781,8 +805,10 @@ fn fuzzExtensions(_: void, smith: *std.testing.Smith) !void {
     // avoid panicking, only to be meaningful — see its doc comment).
     const cert: Certificate = .{ .buffer = bytes, .index = 0 };
     if (findExtensions(cert) catch null) |ext_slice| {
+        ExtMark.mark(.found);
         var it = iterate(ext_slice, cert);
         while (it.next() catch null) |entry| {
+            ExtMark.mark(.walked);
             _ = parseBasicConstraints(entry.value) catch {};
             _ = parseKeyUsage(entry.value) catch {};
             _ = hasPurpose(entry.value, .server_auth) catch {};
@@ -805,7 +831,7 @@ fn fuzzExtensions(_: void, smith: *std.testing.Smith) !void {
     // actual shape each of these functions receives in production (an
     // already-unwrapped `ExtensionEntry.value`), independent of whether
     // `findExtensions`/`iterate` above happened to walk that far.
-    _ = parseBasicConstraints(bytes) catch {};
+    if (parseBasicConstraints(bytes)) |_| ExtMark.mark(.value_parsed) else |_| ExtMark.mark(.refused);
     _ = parseKeyUsage(bytes) catch {};
     _ = hasPurpose(bytes, .client_auth) catch {};
     _ = parseSubjectKeyIdentifier(bytes) catch {};

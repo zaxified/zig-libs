@@ -231,6 +231,12 @@ differs from the MAC tail, which it did not here). The check stays; it is what m
 
 ## Backlog / deferred
 
+- **ct, not measured (2026-10-09 ct review):** a session is looked up by its secret id through the
+  store (`m.store.get`, `root.zig` ~703 → ramcache `getImpl` / kv `KvStore.key`): hashing and
+  comparing the id there is secret-dependent and lives in those modules, outside this card's
+  ctgrind rows. Same as every hash-keyed session store (Go's, Rails'); worth a look if ramcache/kv
+  get a ct axis.
+
 - **Reviewed 2026-07-10** (adversarial security pass, alongside `aaa-gate`/`jwt`/`acme`/
   `snmp.usm`/`kv`/`http`/`sealedbox`/`hashdigest`) — `sessions` is server-side auth-adjacent state
   (session identity + CSRF): session-fixation and logout-resurrection issues (HIGH) plus an
