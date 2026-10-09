@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — docs: Performance re-measured after the ct25519 switch (worst of 3 runs: seal 0.86/0.93x, open 1.11/1.13x libsodium).
 - **2026-10-09** — **NO API CHANGE, faster:** X25519 now comes from the sibling `ct25519`
   (comb base-point multiplication for the ephemeral key and `publicFromSecret`/
   `keyPairFromSecretKey`, MULX/ADX ladder for the shared secret on x86-64) instead of

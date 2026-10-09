@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, SEALEDBOX_FUZZ) · ct 2026-10-07 (ctgrind)
 
-**Performance:** ref 1.14–1.29× libsodium 1.0.18 crypto_box_seal · fastest ? (measured 2026-10-07)
+**Performance:** ref 0.86–1.13× libsodium 1.0.18 crypto_box_seal · fastest ? (measured 2026-10-09, worst of 3 runs per workload)
 
 **Known defects:** none recorded
 
@@ -230,6 +230,12 @@ libsodium sealed must open here first), 2026-10-07, same host, libsodium 1.0.18:
 | open 64 B | 1.23x | 1.25x |
 | seal 64 KiB | 2.31x | **1.21x** |
 | open 64 KiB | 2.39x | **1.14x** |
+
+2026-10-09, X25519 from ct25519 (worst of three `bench-sealedbox` runs on a quiet host, ours
+stable within 1 %, libsodium's own time moving up to 7 % between runs): seal 64 B **0.86x**,
+seal 64 KiB **0.93x**, open 64 B 1.11x, open 64 KiB 1.13x. What keeps P at 3 is `open`: the
+64 KiB row is the bulk path (Poly1305 over the ciphertext, then Salsa20 — two passes), the
+64 B row is one X25519 ladder against libsodium's.
 
 Components on 64 KiB (scratch microbench, same host): Salsa20 0.51 → 2.38 GB/s, Poly1305
 1.41 → 2.92 GB/s. Small messages are X25519 (std's, ~1.25x libsodium's) and did not move.
