@@ -41,7 +41,7 @@ const verbose = false;
 
 // ── needle set ──────────────────────────────────────────────────────────────
 
-const max_windows = 4096;
+const max_windows = 8192;
 
 const Needles = struct {
     win: [max_windows]u128 = undefined,
@@ -372,6 +372,308 @@ test "STACKPROBE: no key or nonce residue on the dead stack after the client Cer
             ed25519Needles(&n, cur_key.ed25519, signed_msg);
             n.sort();
             bad += try runProbe("signCertificateVerify Ed25519", callSign, &n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+// ── the ECDHE key exchange and the handshake key schedule ───────────────────
+//
+// `Client.init` is driven with a canned server flight: one TLS record holding
+// a ServerHello that selects one group, with a server key share built from a
+// fixed server secret. `init` derives the shared secret and the handshake
+// secrets on reading it, then fails reading the next record
+// (`TlsConnectionTruncated`) — after the key exchange, which is the point.
+// Application traffic secrets need a full server flight: out of scope.
+//
+// ⛔ A probe that never reaches the code finds 0 for the wrong reason: the
+// reach check runs `init` once with `ssl_key_log` and requires the server
+// handshake traffic secret the probe recomputed to be in the log.
+
+const tls = std.crypto.tls;
+const Reader = std.Io.Reader;
+const Writer = std.Io.Writer;
+const X25519 = std.crypto.dh.X25519;
+const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
+const Sha3_512 = std.crypto.hash.sha3.Sha3_512;
+const Hkdf = std.crypto.kdf.hkdf.Hkdf;
+const Hmac = std.crypto.auth.hmac.sha2;
+const Es256Pair = Es256.KeyPair;
+const Es384Pair = Es384.KeyPair;
+
+// ── API adapter: the only part that changes when the fix lands ──────────────
+
+var kex_entropy: [Client.Options.entropy_len]u8 = undefined;
+var in_buf: [Client.min_buffer_len]u8 = undefined;
+var in_len: usize = 0;
+var out_buf: [8192]u8 = undefined;
+var read_buf: [Client.min_buffer_len]u8 = undefined;
+var write_buf: [Client.min_buffer_len]u8 = undefined;
+var in_reader: Reader = undefined;
+var out_writer: Writer = undefined;
+var init_err: ?anyerror = null;
+var log_buf: [4096]u8 = undefined;
+var log_writer: Writer = undefined;
+var key_log: Client.SslKeyLog = undefined;
+var use_key_log = false;
+
+noinline fn callInit() void {
+    in_reader = Reader.fixed(&in_buf);
+    in_reader.end = in_len;
+    out_writer = Writer.fixed(&out_buf);
+    const opts: Client.Options = .{
+        .host = .no_verification,
+        .ca = .no_verification,
+        .write_buffer = &write_buf,
+        .read_buffer = &read_buf,
+        .entropy = &kex_entropy,
+        .realtime_now = .{ .nanoseconds = 0 },
+        .ssl_key_log = if (use_key_log) &key_log else null,
+    };
+    if (Client.init(&in_reader, &out_writer, opts)) |_| init_err = error.Unexpected else |e| init_err = e;
+}
+
+// ── the client's ephemeral keys, recomputed from the entropy ────────────────
+
+const Keys = struct {
+    mlkem: MLKem768.KeyPair,
+    p256: Es256Pair,
+    p384: Es384Pair,
+    x25519: X25519.KeyPair,
+};
+var keys: Keys = undefined;
+
+/// `len` bytes derived from (`tag`, `ci`) by hash — never `@splat`, which the
+/// distinct-bytes filter would skip.
+fn derive(comptime tag: []const u8, ci: u8, comptime len: usize) [len]u8 {
+    var out: [(len + 63) / 64 * 64]u8 = undefined;
+    var i: usize = 0;
+    while (i * 64 < out.len) : (i += 1) {
+        Sha512.hash(tag ++ &[_]u8{ ci, @intCast(i) }, out[i * 64 ..][0..64], .{});
+    }
+    return out[0..len].*;
+}
+
+fn putBytes(p: *usize, bytes: []const u8) void {
+    @memcpy(in_buf[p.*..][0..bytes.len], bytes);
+    p.* += bytes.len;
+}
+
+fn putInt(comptime T: type, p: *usize, v: T) void {
+    std.mem.writeInt(T, in_buf[p.*..][0..@sizeOf(T)], v, .big);
+    p.* += @sizeOf(T);
+}
+
+/// One record: a TLS 1.3 ServerHello selecting `suite`, `group` and `share`.
+fn buildFlight(ci: u8, group: tls.NamedGroup, suite: tls.CipherSuite, share: []const u8) void {
+    var p: usize = 5;
+    in_buf[0] = 0x16;
+    in_buf[1] = 3;
+    in_buf[2] = 3;
+    in_buf[p] = 2; // server_hello
+    p += 4; // type + u24 length, patched below
+    putInt(u16, &p, 0x0303);
+    putBytes(&p, &derive("tls-server-random", ci, 32));
+    in_buf[p] = 32;
+    p += 1;
+    putBytes(&p, kex_entropy[32..64]); // legacy_session_id echo
+    putInt(u16, &p, @intFromEnum(suite));
+    in_buf[p] = 0; // legacy_compression_method
+    p += 1;
+    putInt(u16, &p, @intCast(6 + 4 + 4 + share.len)); // extensions
+    putInt(u16, &p, @intFromEnum(tls.ExtensionType.supported_versions));
+    putInt(u16, &p, 2);
+    putInt(u16, &p, 0x0304);
+    putInt(u16, &p, @intFromEnum(tls.ExtensionType.key_share));
+    putInt(u16, &p, @intCast(4 + share.len));
+    putInt(u16, &p, @intFromEnum(group));
+    putInt(u16, &p, @intCast(share.len));
+    putBytes(&p, share);
+    std.mem.writeInt(u24, in_buf[6..9], @intCast(p - 9), .big);
+    std.mem.writeInt(u16, in_buf[3..5], @intCast(p - 5), .big);
+    in_len = p;
+}
+
+// ── needles ─────────────────────────────────────────────────────────────────
+
+/// HMAC's `key ⊕ ipad` and `key ⊕ opad` blocks.
+fn addPads(n: *Needles, name: []const u8, key: []const u8) void {
+    var a: [48]u8 = undefined;
+    var b: [48]u8 = undefined;
+    for (key, 0..) |k, i| {
+        a[i] = k ^ 0x36;
+        b[i] = k ^ 0x5c;
+    }
+    n.addImage(name, a[0..key.len]);
+    n.addImage(name, b[0..key.len]);
+}
+
+/// The handshake key schedule (RFC 8446 §7.1) for `shared`; returns the
+/// server handshake traffic secret (the reach check looks for it in the key log).
+fn scheduleNeedles(comptime Hash: type, comptime aead_key_len: usize, n: *Needles, shared: []const u8, hello_hash: *const [Hash.digest_length]u8) [Hash.digest_length]u8 {
+    const K = Hkdf(if (Hash == Sha256) Hmac.HmacSha256 else Hmac.HmacSha384);
+    const dl = Hash.digest_length;
+    const zeroes = [1]u8{0} ** dl;
+    const early = K.extract(&[1]u8{0}, &zeroes);
+    const empty = tls.emptyHash(Hash);
+    const hs_derived = tls.hkdfExpandLabel(K, early, "derived", &empty, dl);
+    const hs = K.extract(&hs_derived, shared);
+    const ap_derived = tls.hkdfExpandLabel(K, hs, "derived", &empty, dl);
+    const master = K.extract(&ap_derived, &zeroes);
+    const c_ts = tls.hkdfExpandLabel(K, hs, "c hs traffic", hello_hash, dl);
+    const s_ts = tls.hkdfExpandLabel(K, hs, "s hs traffic", hello_hash, dl);
+    n.addBoth("shared", shared[0..@min(shared.len, 64)]);
+    n.addBoth("hs secret", &hs);
+    n.addBoth("ap derived", &ap_derived);
+    n.addBoth("master", &master);
+    n.addBoth("c hs ts", &c_ts);
+    n.addBoth("s hs ts", &s_ts);
+    n.addBoth("c fin key", &tls.hkdfExpandLabel(K, c_ts, "finished", "", dl));
+    n.addBoth("s fin key", &tls.hkdfExpandLabel(K, s_ts, "finished", "", dl));
+    n.addBoth("c hs key", &tls.hkdfExpandLabel(K, c_ts, "key", "", aead_key_len));
+    n.addBoth("s hs key", &tls.hkdfExpandLabel(K, s_ts, "key", "", aead_key_len));
+    addPads(n, "hmac pad", &hs);
+    addPads(n, "hmac pad", &ap_derived);
+    addPads(n, "hmac pad", &c_ts);
+    addPads(n, "hmac pad", &s_ts);
+    return s_ts;
+}
+
+/// Every ephemeral secret the client holds, whatever group the server picks.
+fn keyNeedles(n: *Needles) void {
+    const mlkem_seed = kex_entropy[64..128];
+    n.addBoth("mlkem seed", mlkem_seed);
+    var g: [64]u8 = undefined;
+    var h = Sha3_512.init(.{});
+    h.update(mlkem_seed[0..32]);
+    h.update(&[1]u8{3}); // ML-KEM-768: k = 3
+    h.final(&g);
+    n.addBoth("mlkem sigma", g[32..64]);
+    const sk_bytes = keys.mlkem.secret_key.toBytes();
+    n.addImage("mlkem sk", sk_bytes[0..1152]); // the encoded secret vector s
+    n.addImage("mlkem sk", std.mem.asBytes(&keys.mlkem.secret_key.sk));
+
+    n.addBoth("p256 seed", kex_entropy[128..160]);
+    n.addScalar("p256 d", std.crypto.ecc.P256.scalar.Scalar.fromBytes(keys.p256.secret_key.bytes, .big) catch unreachable);
+    n.addBoth("p384 seed", kex_entropy[160..208]);
+    n.addScalar("p384 d", std.crypto.ecc.P384.scalar.Scalar.fromBytes(keys.p384.secret_key.bytes, .big) catch unreachable);
+
+    n.addBoth("x25519 sk", &keys.x25519.secret_key);
+    var clamped = keys.x25519.secret_key;
+    Ed.scalar.clamp(&clamped);
+    n.addBoth("x25519 sk", &clamped);
+}
+
+fn hex(comptime N: usize, b: *const [N]u8) [N * 2]u8 {
+    return std.fmt.bytesToHex(b.*, .lower);
+}
+
+fn kexCase(comptime group: tls.NamedGroup, comptime suite: tls.CipherSuite, ci: u8) !usize {
+    const Hash = switch (suite) {
+        .AES_128_GCM_SHA256 => Sha256,
+        .AES_256_GCM_SHA384 => Sha384,
+        else => @compileError("suite"),
+    };
+    const key_len = if (Hash == Sha256) 16 else 32;
+
+    kex_entropy = derive("tls-kex-entropy", ci, Client.Options.entropy_len);
+    keys = .{
+        .mlkem = try MLKem768.KeyPair.generateDeterministic(kex_entropy[64..128].*),
+        .p256 = try Es256Pair.generateDeterministic(kex_entropy[128..160].*),
+        .p384 = try Es384Pair.generateDeterministic(kex_entropy[160..208].*),
+        .x25519 = try X25519.KeyPair.generateDeterministic(kex_entropy[208..240].*),
+    };
+
+    var n: Needles = .{};
+    keyNeedles(&n);
+
+    // The server's side, from fixed server secrets.
+    var shared_buf: [64]u8 = undefined;
+    var shared: []const u8 = undefined;
+    var share_buf: [1200]u8 = undefined;
+    var share: []const u8 = undefined;
+    switch (group) {
+        .x25519_ml_kem768, .x25519 => {
+            const srv_sk = derive("tls-server-x25519", ci, 32);
+            const srv_pub = try X25519.recoverPublicKey(srv_sk);
+            const xs = try X25519.scalarmult(srv_sk, keys.x25519.public_key);
+            n.addBoth("x25519 shared", &xs);
+            if (group == .x25519) {
+                share = &srv_pub;
+                shared = &xs;
+            } else {
+                const m = derive("tls-server-mlkem-m", ci, 32);
+                const enc = keys.mlkem.public_key.encapsDeterministic(&m);
+                var kr: [64]u8 = undefined;
+                var gh = Sha3_512.init(.{});
+                gh.update(&m);
+                gh.update(&keys.mlkem.public_key.hpk);
+                gh.final(&kr);
+                n.addBoth("mlkem m/K/r", &m);
+                n.addBoth("mlkem m/K/r", &kr);
+                n.addBoth("mlkem ss", &enc.shared_secret);
+                @memcpy(share_buf[0..enc.ciphertext.len], &enc.ciphertext);
+                @memcpy(share_buf[enc.ciphertext.len..][0..32], &srv_pub);
+                share = share_buf[0 .. enc.ciphertext.len + 32];
+                @memcpy(shared_buf[0..32], &enc.shared_secret);
+                @memcpy(shared_buf[32..64], &xs);
+                shared = &shared_buf;
+            }
+        },
+        .secp256r1 => {
+            const srv = try Es256Pair.generateDeterministic(derive("tls-server-p256", ci, 32));
+            const sec1 = srv.public_key.toUncompressedSec1();
+            @memcpy(share_buf[0..sec1.len], &sec1);
+            share = share_buf[0..sec1.len];
+            const x = (try keys.p256.public_key.p.mul(srv.secret_key.bytes, .big)).affineCoordinates().x;
+            shared_buf[0..32].* = x.toBytes(.big);
+            shared = shared_buf[0..32];
+            n.addBoth("ecdh x", shared);
+            n.addImage("ecdh x", std.mem.asBytes(&x));
+        },
+        .secp384r1 => {
+            const srv = try Es384Pair.generateDeterministic(derive("tls-server-p384", ci, 48));
+            const sec1 = srv.public_key.toUncompressedSec1();
+            @memcpy(share_buf[0..sec1.len], &sec1);
+            share = share_buf[0..sec1.len];
+            const x = (try keys.p384.public_key.p.mul(srv.secret_key.bytes, .big)).affineCoordinates().x;
+            shared_buf[0..48].* = x.toBytes(.big);
+            shared = shared_buf[0..48];
+            n.addBoth("ecdh x", shared);
+            n.addImage("ecdh x", std.mem.asBytes(&x));
+        },
+        else => @compileError("group"),
+    }
+    buildFlight(ci, group, suite, share);
+
+    // Reach: one logged run captures the ClientHello (the transcript) and must
+    // show the handshake secret we recomputed.
+    log_writer = Writer.fixed(&log_buf);
+    key_log = .{ .client_key_seq = 0, .server_key_seq = 0, .client_random = undefined, .writer = &log_writer };
+    use_key_log = true;
+    callInit();
+    use_key_log = false;
+    try std.testing.expectEqual(@as(?anyerror, error.TlsConnectionTruncated), init_err);
+    var th = Hash.init(.{});
+    th.update(out_writer.buffered()[tls.record_header_len..]); // ClientHello
+    th.update(in_buf[tls.record_header_len..in_len]); // ServerHello
+    const hello_hash = th.peek();
+    const s_ts = scheduleNeedles(Hash, key_len, &n, shared, &hello_hash);
+    try std.testing.expect(std.mem.indexOf(u8, log_writer.buffered(), &hex(Hash.digest_length, &s_ts)) != null);
+
+    n.sort();
+    leak_src = keys.x25519.secret_key;
+    return runProbe("Client.init " ++ @tagName(group) ++ " / " ++ @tagName(suite), callInit, &n);
+}
+
+test "STACKPROBE: no ECDHE or handshake key-schedule residue on the dead stack after Client.init" {
+    try skipUnlessOptimized();
+    var bad: usize = 0;
+    var ci: u8 = 0;
+    inline for (.{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1 }) |g| {
+        inline for (.{ .AES_128_GCM_SHA256, .AES_256_GCM_SHA384 }) |s| {
+            bad += try kexCase(g, s, ci);
+            ci += 1;
         }
     }
     try std.testing.expectEqual(@as(usize, 0), bad);

@@ -47,6 +47,7 @@ const messages = @import("messages.zig");
 const keyschedule = @import("keyschedule.zig");
 const aead = @import("aead.zig");
 const record = @import("record.zig");
+const burn = @import("burn.zig");
 const handshake = @import("handshake.zig");
 const flight = @import("flight.zig");
 const engine = @import("engine.zig");
@@ -1740,6 +1741,12 @@ pub const Connection = struct {
     /// `getrandom(2)` look the same to the code. What the type buys is that
     /// the weak path can no longer be entered by accident.
     pub fn startHandshake(self: *Connection, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError![]const u8 {
+        // Dead-stack hygiene: the body draws the ephemeral (EC)DHE / ML-KEM
+        // secrets; whatever it leaves on the stack below this frame is zeroed.
+        return burn.run(burn.start_burn, HandshakeError![]const u8, startHandshakeBody, .{ self, entropy, now_ms, out });
+    }
+
+    fn startHandshakeBody(self: *Connection, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError![]const u8 {
         if (self.role != .client) return error.WrongState;
         if (self.state != .start) return error.WrongState;
 
@@ -1833,6 +1840,12 @@ pub const Connection = struct {
     /// answered a retransmitted flight with `error.WrongState`), but it is
     /// not the full RFC 9147 §5.7 receiver either.
     pub fn handleFlight(self: *Connection, datagram: []const u8, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
+        // Dead-stack hygiene: the body runs the whole key exchange and key
+        // schedule; whatever it leaves on the stack below this frame is zeroed.
+        return burn.run(burn.flight_burn, HandshakeError!HandshakeResult, handleFlightBody, .{ self, datagram, entropy, now_ms, out });
+    }
+
+    fn handleFlightBody(self: *Connection, datagram: []const u8, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         if (datagram.len > self.rx_flight.len - self.rx_flight_len) {
             self.rx_flight_len = 0;
             return error.FlightTooLarge;
@@ -1920,8 +1933,17 @@ pub const Connection = struct {
     pub fn installApplicationKeys(
         self: *Connection,
         suite: CipherSuite,
-        client_ap_secret: [32]u8,
-        server_ap_secret: [32]u8,
+        client_ap_secret: *const [32]u8,
+        server_ap_secret: *const [32]u8,
+    ) SendError!void {
+        return burn.run(burn.install_burn, SendError!void, installApplicationKeysBody, .{ self, suite, client_ap_secret, server_ap_secret });
+    }
+
+    fn installApplicationKeysBody(
+        self: *Connection,
+        suite: CipherSuite,
+        client_ap_secret: *const [32]u8,
+        server_ap_secret: *const [32]u8,
     ) SendError!void {
         const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
         const params = suiteParams(suite) orelse return error.UnsupportedSuite;
@@ -1929,8 +1951,8 @@ pub const Connection = struct {
         const my_secret = if (self.role == .client) client_ap_secret else server_ap_secret;
         const peer_secret = if (self.role == .client) server_ap_secret else client_ap_secret;
 
-        self.write_keys = deriveDir(Hkdf, params, my_secret);
-        self.read_keys = deriveDir(Hkdf, params, peer_secret);
+        self.write_keys = deriveDir(Hkdf, params, my_secret.*);
+        self.read_keys = deriveDir(Hkdf, params, peer_secret.*);
         self.suite = suite;
         self.epoch = application_epoch;
         self.send_seq = 0;
@@ -1947,7 +1969,7 @@ pub const Connection = struct {
     /// (RFC 9147 §4.2.3). Returns `header || protected_record` written into
     /// `out`. Advances the send sequence number.
     pub fn send(self: *Connection, plaintext: []const u8, out: []u8) SendError![]const u8 {
-        return self.protectRecord(content_type_application_data, plaintext, out);
+        return burn.run(burn.record_burn, SendError![]const u8, protectRecord, .{ self, content_type_application_data, plaintext, out });
     }
 
     /// The record-protection half of `send`, parameterised by the inner
@@ -2012,6 +2034,10 @@ pub const Connection = struct {
     /// application bytes written into `out`. A tag mismatch or malformed
     /// record is a typed error — never a panic.
     pub fn recv(self: *Connection, datagram: []const u8, out: []u8) SendError![]const u8 {
+        return burn.run(burn.record_burn, SendError![]const u8, recvBody, .{ self, datagram, out });
+    }
+
+    fn recvBody(self: *Connection, datagram: []const u8, out: []u8) SendError![]const u8 {
         if (self.state != .connected) return error.NotConnected;
 
         const dec = record.decodeUnified(datagram, 0) catch return error.Malformed;
@@ -3465,7 +3491,7 @@ pub const Connection = struct {
         if (!std.crypto.timing_safe.eql([32]u8, expected, fin.verify_data[0..32].*)) return error.FinishedVerifyFailed;
         self.transcript.append(@intFromEnum(messages.HandshakeType.finished), fin.verify_data);
 
-        try self.installApplicationKeys(self.suite, self.pending_ap_client, self.pending_ap_server);
+        try self.installApplicationKeys(self.suite, &self.pending_ap_client, &self.pending_ap_server);
         self.clearFlightTracker();
         self.retransmit_timer.reset();
         self.last_flight_len = 0;
@@ -3821,7 +3847,7 @@ pub const Connection = struct {
         n += 1;
         self.markFlightSent(all_records[0..n]);
 
-        try self.installApplicationKeys(suite, ap.client, ap.server);
+        try self.installApplicationKeys(suite, &ap.client, &ap.server);
         // `now_ms` is used only on the HelloRetryRequest path above (arming
         // the retry flight's timer); once connected the client retransmits
         // nothing.
@@ -4238,8 +4264,8 @@ fn roundtripSuite(suite: CipherSuite) !void {
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = cfg.psk_identity, .psk = cfg.psk });
 
     const ap = deriveApSecrets(cfg.psk);
-    try client.installApplicationKeys(suite, ap.c, ap.s);
-    try server.installApplicationKeys(suite, ap.c, ap.s);
+    try client.installApplicationKeys(suite, &ap.c, &ap.s);
+    try server.installApplicationKeys(suite, &ap.c, &ap.s);
     try testing.expectEqual(State.connected, client.state);
 
     // Both endpoints must have derived identical directional keys
@@ -4282,7 +4308,7 @@ fn roundtripSuite(suite: CipherSuite) !void {
     tampered[rec1.len - 1] ^= 0x80; // flip the last tag byte of the record
     // recv advances state, so use a fresh server for a clean seq window.
     var server2 = try Connection.serverInit(.{ .role = .server, .psk_identity = cfg.psk_identity, .psk = cfg.psk });
-    try server2.installApplicationKeys(suite, ap.c, ap.s);
+    try server2.installApplicationKeys(suite, &ap.c, &ap.s);
     try testing.expectError(error.DecryptionFailed, server2.recv(tampered[0..rec1.len], &plain));
 }
 
@@ -4298,7 +4324,7 @@ test "installApplicationKeys: CCM suites are honestly rejected (std nonce gap)" 
     const cfg = Config{ .role = .client, .psk_identity = "id", .psk = "secret" };
     var conn = try Connection.clientInit(cfg);
     const ap = deriveApSecrets(cfg.psk);
-    try testing.expectError(error.UnsupportedSuite, conn.installApplicationKeys(.aes_128_ccm_8_sha256, ap.c, ap.s));
+    try testing.expectError(error.UnsupportedSuite, conn.installApplicationKeys(.aes_128_ccm_8_sha256, &ap.c, &ap.s));
 }
 
 // ── handshake flight engine: the mandatory oracle ────────────────────────

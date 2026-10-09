@@ -5,6 +5,35 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING, HIGH: the key exchange left its secrets on the dead stack.**
+  Second ReleaseFast probe in `stackprobe_test.zig`: every KEX method in both roles against a
+  peer thread over a socketpair, plus a full handshake per role; the measured side draws from a
+  recording entropy source, so the needles are its own ephemeral secrets (X25519 seed, ML-KEM
+  seed and secret key, ML-KEM `m`, DH exponent), every shared secret (`K_X25519`, `K_MLKEM`,
+  combined `K`, DH `K`) and the installed cipher states. Before → after (16-byte windows, 5
+  calls): curve25519 client/server 55/50, mlkem768x25519 1225/65 (the client's ML-KEM secret key:
+  1160), DH group14 255/240, group16 500/500, full handshake client/server 875/105 (incl. the
+  read cipher's key, 30) → **0** everywhere, NEG=0, POS=2.
+  - **API (BREAKING):** `transport.curve25519Kex`, `dhGroupKex`, `mlkem768x25519Kex` and
+    `server.curve25519KexServer`, `dhGroupKexServer`, `mlkem768x25519KexServer` take
+    `out: *KexResult` first and return `!void` (the result holds `K`; returned by value it was
+    copied through the caller's frame). `Transport.installCipher(…, kr: *const KexResult)`.
+    `deriveKeys(out, &shared_secret, &exchange_hash, &session_id)`.
+  - **Burns** (`src/burn.zig`, body one frame down + zeroing): per method, because ML-KEM is
+    three times as deep as X25519 — curve25519 64 KiB (dirtied 30 / 38 KiB client / server),
+    DH 128 KiB (43–56 KiB), mlkem768x25519 192 KiB (87 / 98 KiB; std's ML-KEM keeps its
+    matrices on the stack); `clientKexRound`/`serverKexRound` 32 KiB (derivation + install);
+    `installCipher`/`deriveKeys` 8 KiB; `writePacket`/`readPacket` 16 KiB — the write body's
+    8 KiB buffer held the PLAINTEXT packet (a userauth password) and both left per-packet key
+    material. The KEX `scratch` buffer is wiped before it is freed (a re-exchange may queue
+    channel data through it).
+  - Instrument note: a `std.Random.ChaCha` used as the recording source left its by-value init
+    temporary (keystream = the very draws) in the probe's own frame and read as residue; the
+    source is SHAKE256(seed ‖ counter) squeezed into the caller's buffer instead. The "before"
+    numbers above were re-measured with the fixed source on the unfixed tree.
+  - Not covered: AES-GCM / aes256-ctr record paths (the cipher menu is fixed and the handshake
+    negotiates chacha20-poly1305 first; their key schedules run under the same record burn),
+    a probe-driven rekey (same `clientKexRound`/`serverKexRound` as the initial exchange).
 - **2026-10-09** — **BREAKING, HIGH: host and user keys left the dead stack full of key material.**
   New ReleaseFast stack probe (`stackprobe_test.zig`), 5 calls each, before → after:
   `HostKey.sign` ed25519 left the scalar `a`, the nonce prefix and the nonce `r` (≤ 40 hits),

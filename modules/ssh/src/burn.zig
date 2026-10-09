@@ -41,3 +41,26 @@ pub const sign_burn = 16 * 1024;
 /// and 52.6 KiB (ecdsa-p256) in ReleaseFast (2026-10-09). `rsa.fromOpenSSH`
 /// burns its own frames.
 pub const load_burn = 64 * 1024;
+
+/// The six per-method KEX entry points (`transport.curve25519Kex`, …,
+/// `server.dhGroupKexServer`), one size per method: one size for all would
+/// make every curve25519 exchange zero ML-KEM's depth. Dirtied in ReleaseFast
+/// (client / server, 64 B burns, `stackprobe_test.zig`'s key-exchange test,
+/// 2026-10-09; the probe's own frames included): curve25519 30 / 38 KiB,
+/// DH group14 43 / 46 KiB, group16 53 / 56 KiB, mlkem768x25519 87 / 98 KiB
+/// (std's ML-KEM keeps its matrices on the stack).
+pub const kex_x25519_burn = 64 * 1024;
+pub const kex_dh_burn = 128 * 1024;
+pub const kex_mlkem_burn = 192 * 1024;
+
+/// `clientKexRound` / `serverKexRound`: the round's own frame, key derivation
+/// and cipher install — the KEX below them burns its own, deeper (2026-10-09).
+pub const round_burn = 32 * 1024;
+
+/// `Transport.installCipher` (the state is built by value) and `deriveKeys`
+/// (2026-10-09).
+pub const install_burn = 8 * 1024;
+
+/// `writePacket` / `readPacket`: the plaintext buffer and the per-packet key
+/// material (2026-10-09).
+pub const record_burn = 16 * 1024;

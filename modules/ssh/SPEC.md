@@ -327,11 +327,13 @@ environment with OpenSSH installed.
 
 ## Backlog / deferred
 
-- **Dead stack of the key exchange (found 2026-10-09, not fixed):** the ephemeral X25519 / ML-KEM /
-  DH secrets and the shared secret `K` are wiped in the KEX frames, but std's `X25519.scalarmult`,
-  ML-KEM `decaps`/`encaps` and `dhPowModPrime` frames below them are not burned, and the exchange
-  hash → key derivation leaves traffic keys in dead frames. Needs a probe driving one KEX per
-  method (the host-key paths have one, `stackprobe_test.zig`).
+- ~~**Dead stack of the key exchange**~~ — **fixed 2026-10-09**: per-method KEX entry points take
+  `out: *KexResult` and burn their bodies (std's X25519 / ML-KEM / modexp frames included), the
+  KEX rounds, `installCipher`, `deriveKeys` and `writePacket`/`readPacket` burn theirs; probed per
+  method and role plus a full handshake per role (`stackprobe_test.zig`, 0 residue; CHANGELOG has
+  the numbers). Remaining: the AES-GCM / aes256-ctr record paths and a rekey are covered by the
+  same burns but not driven by the probe (the cipher and KEX menus are fixed constants, so a
+  handshake cannot select them).
 - ~~DH exponent through `std.crypto.ff`'s pow~~ — **fixed 2026-10-02**: `dhPowModPrime` is montint's `powMont` with a branchless exponent loader (ff's window select compiles to a jump in ReleaseFast — measured). ctgrind target `dh` (0 contexts in montint; 4 on the mpint length of `e`/`K`, inherent to RFC 4251) with the old ff path kept as the `ffpow` positive control.
 Parts 1-3 are implemented. What is *not* here yet (not now ≠ never: the dated survey items
 after this list file most of these as tasks; the fixed algorithm menu stays a policy question

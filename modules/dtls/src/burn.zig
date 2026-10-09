@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack burn for the CertificateVerify signers (`certverify.sign`: ECDSA
-//! P-256/P-384 and Ed25519 through std, RSA-PSS through `rsa`). Each signing
-//! body runs one frame down (`run`, a `never_inline` call), then the bytes that
-//! body dirtied at that depth are zeroed. The body is a separate frame on
-//! purpose: inlined into `sign`, the burn would land above the body's locals.
-//! `stackprobe_test.zig` goes red when a body outgrows its burn.
-//!
-//! Out of scope here (see SPEC.md "Backlog / deferred"): the ECDHE scalars,
-//! the key schedule and the record keys of `Connection.zig`.
+//! P-256/P-384 and Ed25519 through std, RSA-PSS through `rsa`) and for every
+//! secret-touching public entry point of `Connection.zig` (`startHandshake`,
+//! `handleFlight`, `installApplicationKeys`, `send`, `recv`: the ECDHE scalars
+//! and ML-KEM seeds, the shared secrets, the key schedule, the record keys).
+//! Each body runs one frame down (`run`, a `never_inline` call), then the bytes
+//! that body dirtied at that depth are zeroed. The body is a separate frame on
+//! purpose: inlined into the entry point, the burn would land above the body's
+//! locals. `stackprobe_test.zig` goes red when a body outgrows its burn.
 
 /// Zero `n` bytes of stack below the caller.
 pub noinline fn stack(comptime n: usize) void {
@@ -48,3 +48,24 @@ pub const ed25519_burn = 40 * 1024;
 /// pointer API the by-value key copies reached 26.9 KiB deep (2026-10-08).
 /// 8 KiB is a margin, not a measured depth.
 pub const rsa_burn = 8 * 1024;
+
+// `Connection` entry points. Depths are the dirty stack of the unburned body in
+// ReleaseFast, from the full-handshake probe (2026-10-09); each burn is ~2x
+// that, rounded.
+
+/// `startHandshake`: ClientHello build, the ECDHE / ML-KEM keygen. Deepest case
+/// the hybrid group (70.2 KiB; PSK 7.2, X25519 26.9, P-256 33.4).
+pub const start_burn = 128 * 1024;
+
+/// `handleFlight`: both roles, the whole key exchange, key schedule, record
+/// protection and certificate verification/signing. Deepest case the hybrid
+/// client reading the server flight (107.0 KiB); the hybrid server 81.6 KiB,
+/// the P-256 server 85.3 KiB.
+pub const flight_burn = 224 * 1024;
+
+/// `send` / `recv`: AEAD, the sequence-number mask and the 1500-byte inner
+/// plaintext buffer (4.3 KiB at most, ChaCha20-Poly1305).
+pub const record_burn = 8 * 1024;
+
+/// `installApplicationKeys`: two HKDF expansions per direction (2.1 KiB).
+pub const install_burn = 8 * 1024;

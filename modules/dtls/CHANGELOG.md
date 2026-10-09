@@ -5,6 +5,37 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the key exchange, key schedule and
+  record keys of `Connection` left copies on the dead stack. Measured BEFORE with the new full-handshake probe
+  in `src/stackprobe_test.zig` (a client<->server handshake in static memory; one probe per public step:
+  `startHandshake`, `handleFlight` ×3, `send`, `recv` ×2 directions, `installApplicationKeys`; ReleaseFast,
+  per 5 calls; needles derived from the live connections and a recording entropy source): every one of the
+  40 probes measured before the fix (5 sets × 8 steps) found residue, 5 015 hits per 5 calls over the four classical sets
+  (PSK AES-128-GCM 1 620, PSK ChaCha20 860, cert X25519 1 750, cert P-256 + client auth 785) and 26 305 for the
+  X25519MLKEM768 set (24 540 of it the re-expanded ML-KEM decapsulation key). By kind, summed over the
+  sets: the ephemeral entropy draws 65× and the clamped X25519 scalar 10×, the client's `ecdhe_secret` 50×,
+  the shared secret 80×, the early / handshake / master secrets 120× / 100× / 100×, the PSK binder key 60×,
+  the handshake traffic secrets 100× + 100×, the application traffic secrets 200× + 200×, the finished keys
+  200×, the record keys 1 070×, the sequence-number keys 625× and AES-128 round keys / GHASH key 3 700×; the
+  ML-KEM decapsulation key (expanded from the seed) 24 540×. Dirty depth of the unburned bodies:
+  `startHandshake` 7.2 KiB (PSK) … 70.2 KiB (hybrid), `handleFlight` 34.6 … 107.0 KiB, `send`/`recv`
+  1.9 … 4.3 KiB, `installApplicationKeys` 2.1 KiB. After: 0 residues in all 45 probes (the 40 plus `installApplicationKeys`), negative control 0,
+  positive control found.
+  - **API:** `Connection.installApplicationKeys` takes the two application traffic secrets by pointer
+    (`client_ap_secret: *const [32]u8`, `server_ap_secret: *const [32]u8`, were `[32]u8` by value): a by-value
+    secret argument is copied into the caller's frame, where no burn inside the callee can reach it.
+    Callers write `&client_ap_secret, &server_ap_secret`. Nothing else in the public API changed.
+  - Each of `startHandshake`, `handleFlight`, `installApplicationKeys`, `send` and `recv` now runs its body one
+    frame down and zeroes the stack it dirtied (`src/burn.zig`: 128 KiB, 224 KiB, 8 KiB, 8 KiB, 8 KiB; each
+    ~2× the measured depth). Because the burn sits at the public entry, it also covers std's X25519 / P-256 /
+    ML-KEM / HKDF / AES frames, the entropy source's own frames and the snapshot `handleFlight` takes for its
+    rollback. 224 KiB of vector stores is about 2 µs next to a handshake's scalar multiplications.
+  - `ecdheGenerate`/`ecdheSharedSecret`/`ecdheServerExchange` (file-private) are unchanged: the secrets never
+    cross the public API, so burning around the call replaces moving them to out-parameters.
+  - Not covered (SPEC "Backlog / deferred"): the standalone helpers in `keyschedule`/`aead`/`record` when a
+    consumer calls them directly, secrets that stay in the live `Connection` by design, HelloRetryRequest and
+    `poll` paths.
+
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** CertificateVerify signing
   (`certverify.sign`, all four key families) left the private key and the signing nonce on the dead stack,
   and `certverify.SecretKey` carried the keys BY VALUE (an `rsa.SecretKey` alone is 11.8 KiB), copied with

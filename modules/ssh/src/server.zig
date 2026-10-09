@@ -561,6 +561,43 @@ pub const ServerConfig = struct {
 
 // ── server-side (responder-role) key exchange ───────────────────────────────
 
+/// curve25519-sha256 server side (see the body below).
+///
+/// The result goes to `out` (never returned by value: it holds `K`); the body
+/// runs one frame down and the stack it dirtied is zeroed after it, std's
+/// X25519 / ML-KEM / modexp frames included.
+pub fn curve25519KexServer(
+    out: *transport.KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: transport.CipherPair,
+    entropy: transport.Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    host_key: *const HostKey,
+    gpa: std.mem.Allocator,
+) transport.TransportError!void {
+    return burn.run(burn.kex_x25519_burn, transport.TransportError!void, curve25519KexServerInto, .{ out, r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, host_key, gpa });
+}
+
+fn curve25519KexServerInto(
+    out: *transport.KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: transport.CipherPair,
+    entropy: transport.Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    host_key: *const HostKey,
+    gpa: std.mem.Allocator,
+) transport.TransportError!void {
+    out.* = try curve25519KexServerBody(r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, host_key, gpa);
+}
+
 /// Run the server side of curve25519-sha256 key exchange (RFC 8731): receive
 /// SSH_MSG_KEX_ECDH_INIT (`Q_C`, the client's ephemeral public value),
 /// generate our own ephemeral keypair (`Q_S`, seeded from `entropy`),
@@ -577,7 +614,7 @@ pub const ServerConfig = struct {
 /// then produces the signature. Everything downstream of having `K`/`H`
 /// (key derivation, cipher construction, the Binary Packet Protocol) is
 /// reused from `transport.zig`, not reimplemented.
-pub fn curve25519KexServer(
+fn curve25519KexServerBody(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     ciphers: transport.CipherPair,
@@ -657,6 +694,45 @@ fn isCurve25519Kex(name: []const u8) bool {
         std.mem.eql(u8, name, "curve25519-sha256@libssh.org");
 }
 
+/// diffie-hellman-group14/16 server side (see the body below).
+///
+/// The result goes to `out` (never returned by value: it holds `K`); the body
+/// runs one frame down and the stack it dirtied is zeroed after it, std's
+/// X25519 / ML-KEM / modexp frames included.
+pub fn dhGroupKexServer(
+    out: *transport.KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: transport.CipherPair,
+    entropy: transport.Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    host_key: *const HostKey,
+    gpa: std.mem.Allocator,
+    kex_name: []const u8,
+) transport.TransportError!void {
+    return burn.run(burn.kex_dh_burn, transport.TransportError!void, dhGroupKexServerInto, .{ out, r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, host_key, gpa, kex_name });
+}
+
+fn dhGroupKexServerInto(
+    out: *transport.KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: transport.CipherPair,
+    entropy: transport.Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    host_key: *const HostKey,
+    gpa: std.mem.Allocator,
+    kex_name: []const u8,
+) transport.TransportError!void {
+    out.* = try dhGroupKexServerBody(r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, host_key, gpa, kex_name);
+}
+
 /// Responder side of classic MODP Diffie-Hellman key exchange (RFC 4253 §8.1,
 /// RFC 3526 groups `diffie-hellman-group14-sha256` /
 /// `diffie-hellman-group16-sha512`), the server-role mirror of
@@ -666,7 +742,7 @@ fn isCurve25519Kex(name: []const u8) bool {
 /// sign `H`, and send SSH_MSG_KEXDH_REPLY (`K_S`, `f`, signature). The RFC 3526
 /// primes + digest choice + modexp are reused from `transport.zig` (`DhGroup`,
 /// `dhPowModPrime`) — not re-embedded here.
-pub fn dhGroupKexServer(
+fn dhGroupKexServerBody(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     ciphers: transport.CipherPair,
@@ -755,6 +831,43 @@ pub fn dhGroupKexServer(
     return res;
 }
 
+/// mlkem768x25519-sha256 server side (see the body below).
+///
+/// The result goes to `out` (never returned by value: it holds `K`); the body
+/// runs one frame down and the stack it dirtied is zeroed after it, std's
+/// X25519 / ML-KEM / modexp frames included.
+pub fn mlkem768x25519KexServer(
+    out: *transport.KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: transport.CipherPair,
+    entropy: transport.Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    host_key: *const HostKey,
+    gpa: std.mem.Allocator,
+) transport.TransportError!void {
+    return burn.run(burn.kex_mlkem_burn, transport.TransportError!void, mlkem768x25519KexServerInto, .{ out, r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, host_key, gpa });
+}
+
+fn mlkem768x25519KexServerInto(
+    out: *transport.KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: transport.CipherPair,
+    entropy: transport.Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    host_key: *const HostKey,
+    gpa: std.mem.Allocator,
+) transport.TransportError!void {
+    out.* = try mlkem768x25519KexServerBody(r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, host_key, gpa);
+}
+
 /// Responder side of `mlkem768x25519-sha256` (OpenSSH's post-quantum hybrid),
 /// the server-role mirror of `transport.mlkem768x25519Kex`: receive
 /// SSH_MSG_KEX_ECDH_INIT with blob `C = ML-KEM_encaps_key(1184) ‖ X25519_pub`,
@@ -762,7 +875,7 @@ pub fn dhGroupKexServer(
 /// compute `K = SHA256(K_MLKEM ‖ K_X25519)` (string-encoded), hash
 /// `H = SHA256(V_C‖V_S‖I_C‖I_S‖K_S‖C‖S‖string(K))`, sign it, and send the
 /// reply with blob `S = ML-KEM_ciphertext(1088) ‖ X25519_server_pub`.
-pub fn mlkem768x25519KexServer(
+fn mlkem768x25519KexServerBody(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     ciphers: transport.CipherPair,
@@ -979,9 +1092,25 @@ pub fn serverKexRound(
     peer_kexinit: ?[]const u8,
     ours: ?[]const u8,
 ) transport.TransportError!ServerKexOutcome {
+    // Body one frame down, its stack (`K`, derived keys, std's frames) zeroed
+    // after it.
+    return burn.run(burn.round_burn, transport.TransportError!ServerKexOutcome, serverKexRoundBody, .{ t, gpa, round, peer_kexinit, ours });
+}
+
+fn serverKexRoundBody(
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    round: transport.KexRound,
+    peer_kexinit: ?[]const u8,
+    ours: ?[]const u8,
+) transport.TransportError!ServerKexOutcome {
     if (t.server_host_keys.len == 0) return error.UnsupportedAlgorithm;
     const scratch = try gpa.alloc(u8, 64 * 1024);
-    defer gpa.free(scratch);
+    defer {
+        // A re-exchange may queue channel data through it.
+        std.crypto.secureZero(u8, scratch);
+        gpa.free(scratch);
+    }
     const ciphers = transport.CipherPair{ .r = &t.read_cipher, .w = &t.write_cipher, .skip_generic = round == .rekey };
 
     // 2. Our KEXINIT (I_S): host-key algorithms restricted to keys we hold.
@@ -1090,13 +1219,14 @@ pub fn serverKexRound(
     var v_s_copy = t.v_s;
     const v_c = v_c_copy.slice();
     const v_s = v_s_copy.slice();
-    var kex_result = if (transport.isMlkemKex(kex_name))
-        try mlkem768x25519KexServer(t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
-    else if (isCurve25519Kex(kex_name))
-        try curve25519KexServer(t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
-    else
-        try dhGroupKexServer(t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa, kex_name);
+    var kex_result: transport.KexResult = .{};
     defer kex_result.zeroize();
+    if (transport.isMlkemKex(kex_name))
+        try mlkem768x25519KexServer(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
+    else if (isCurve25519Kex(kex_name))
+        try curve25519KexServer(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
+    else
+        try dhGroupKexServer(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa, kex_name);
 
     if (t.session_id == null) t.session_id = transport.SessionId.from(kex_result.hash());
 
@@ -1104,10 +1234,10 @@ pub fn serverKexRound(
     // server-to-client keys ('B'/'D'/'F') and DECRYPT with the
     // client-to-server keys ('A'/'C'/'E'), the exact swap of the client's.
     try transport.writePacket(t.writer, ciphers.w, t.entropy, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
-    try t.installCipher(.write, cipher_s2c, .s2c, kex_result);
+    try t.installCipher(.write, cipher_s2c, .s2c, &kex_result);
     const nk = try transport.readKexPacket(t.reader, ciphers, scratch);
     if (msgType(nk) != @intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)) return error.ProtocolError;
-    try t.installCipher(.read, cipher_c2s, .c2s, kex_result);
+    try t.installCipher(.read, cipher_c2s, .c2s, &kex_result);
 
     return .{ .client_wants_ext_info = client_wants_ext_info };
 }
@@ -1694,7 +1824,8 @@ const DirectKexClient = struct {
         var sr = stream.reader(io, &rbuf);
         var sw = stream.writer(io, &wbuf);
         var none: transport.CipherState = .plaintext;
-        var res = try transport.dhGroupKex(&sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.kex_name, self.negotiated_host_key_algorithm);
+        var res: transport.KexResult = .{};
+        try transport.dhGroupKex(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.kex_name, self.negotiated_host_key_algorithm);
         defer res.zeroize();
         self.hash_len = res.hash_len;
         @memcpy(self.hash[0..res.hash_len], res.hash());
@@ -1729,7 +1860,8 @@ fn directDhConsistency(kex_name: []const u8) !void {
 
     try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
     var none: transport.CipherState = .plaintext;
-    var res = try dhGroupKexServer(&sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, &hk, gpa, kex_name);
+    var res: transport.KexResult = .{};
+    try dhGroupKexServer(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, &hk, gpa, kex_name);
     defer res.zeroize();
 
     th.join();
@@ -1791,7 +1923,8 @@ test "dhGroupKex (client): rejects a genuine rsa-sha2-256 host-key signature whe
     try HostKey.fromOpenSSH(&hk, fixture_rsa_key, null);
     try std.testing.expectEqualStrings("rsa-sha2-256", hk.algorithmName());
     var none: transport.CipherState = .plaintext;
-    var res = try dhGroupKexServer(&sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, &hk, gpa, kex_name);
+    var res: transport.KexResult = .{};
+    try dhGroupKexServer(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, &hk, gpa, kex_name);
     defer res.zeroize();
 
     th.join();
@@ -1829,10 +1962,11 @@ test "dhGroupKexServer: rejects a KEXDH_INIT carrying e == p or e == p-1 (F1 reg
         var out_scratch: [8192]u8 = undefined;
         var w: std.Io.Writer = .fixed(&out_scratch);
         var none: transport.CipherState = .plaintext;
+        var kr: transport.KexResult = .{};
 
         try std.testing.expectError(
             error.KexFailed,
-            dhGroupKexServer(&r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", &hk, gpa, kex_name),
+            dhGroupKexServer(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", &hk, gpa, kex_name),
         );
     }
 }
@@ -1985,7 +2119,8 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
     // zero and not two.
     var hk: HostKey = undefined;
     try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
-    var res = try dhGroupKexServer(&sr.interface, &sw.interface, .{ .r = &none_r, .w = &none_w }, .os, i_c, i_s, v_c, v_s, &hk, gpa, "diffie-hellman-group14-sha256");
+    var res: transport.KexResult = .{};
+    try dhGroupKexServer(&res, &sr.interface, &sw.interface, .{ .r = &none_r, .w = &none_w }, .os, i_c, i_s, v_c, v_s, &hk, gpa, "diffie-hellman-group14-sha256");
     defer res.zeroize();
 
     // 6. NEWKEYS both ways.
@@ -2003,7 +2138,7 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
     st.write_cipher = none_w;
     try std.testing.expectEqual(@as(u32, 4), st.write_cipher.sequenceNumber());
     st.session_id = transport.SessionId.from(res.hash());
-    try st.installCipher(.write, "chacha20-poly1305@openssh.com", .s2c, res);
+    try st.installCipher(.write, "chacha20-poly1305@openssh.com", .s2c, &res);
     var probe: [32]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&probe);
     try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));

@@ -166,12 +166,32 @@ the handshake, and their tests at the end of the file. The offline test
 
 ## Backlog / deferred
 
-**2026-10-09:** the ECDHE key shares (`KeyShare`: ML-KEM-768, X25519, P-256,
-P-384 generated per handshake) and the key schedule leave their secrets in
-std's dead frames — inherited from std's file, not burned; needs a probe
-driving one handshake per group. (The P-256/P-384 shared-secret multiply
-itself was variable-time in std — `mulPublic` on our ephemeral scalar — and
-is `mul` here since 2026-10-09.)
+**2026-10-09 (resolved, ECDHE + handshake key schedule):** the ECDHE key
+shares (`KeyShare`: ML-KEM-768, X25519, P-256, P-384) and the handshake key
+schedule left their secrets in `Client.init`'s frame and in std's dead frames.
+`Client.init` now runs its body (`initBody`) one frame down and zeroes
+`burn.init_burn` (320 KiB; the body's frame is 181 KiB, the deepest measured
+callee path -- ML-KEM decaps + X25519 -- reaches 237 KiB). Probe
+(`stackprobe_test.zig`, ReleaseFast): a canned ServerHello per group
+(`x25519_ml_kem768`, `x25519`, `secp256r1`, `secp384r1`) x suite
+(`AES_128_GCM_SHA256`, `AES_256_GCM_SHA384`), reach checked through
+`ssl_key_log`; 2380-2965 needle windows per group in 5 calls before, 0 after,
+NEG = 0, POS >= 1. Needles: the four seeds, the ML-KEM secret vector and sigma,
+the P-256/P-384 scalars, the X25519 scalar (raw and clamped), every shared
+secret (ML-KEM K and r, X25519, ECDH x), the handshake and master secrets, the
+client/server handshake traffic secrets, finished keys, handshake keys, and the
+HMAC pads of the HKDF keys. Still open: the application traffic secrets and
+keys, the Finished MACs and the certificate path of a full handshake (the probe
+feeds only a ServerHello; the burn covers them by depth, unmeasured), and TLS
+1.2 (ECDHE_RSA key schedule). The 12-byte IVs are shorter than a needle window
+and are not probed. (The P-256/P-384 shared-secret multiply was variable-time in
+std -- `mulPublic` on our ephemeral scalar -- and is `mul` here since 2026-10-09.)
+Also open (coordinator review, 2026-10-09): `init` returns `Client` BY VALUE (std's
+shape), so the finished `Client` -- application record keys included -- is
+copied through `burn.run`'s result slot in `init`'s frame, above the burn, and
+through the caller's temporaries. The fix is an `initInto(out: *Client, …)`
+beside the std-compatible `init` (the pattern of the other secret APIs); the
+probe needs a full server flight to see it.
 
 **2026-10-04:** ALPN and TLS 1.3 client certificates are **done**. Still
 deferred: session-ticket resumption (a PSK/ticket state machine and a session

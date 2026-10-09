@@ -224,7 +224,7 @@ const client_hello = try conn.startHandshake(.{ .csprng = csprng.random() }, now
 
 // The application-data record path IS real. Given the traffic secrets a
 // completed handshake produces (dtls.keyschedule.deriveApplicationTrafficSecrets):
-try conn.installApplicationKeys(.aes_128_gcm_sha256, client_ap_secret, server_ap_secret);
+try conn.installApplicationKeys(.aes_128_gcm_sha256, &client_ap_secret, &server_ap_secret);
 const record = try conn.send("hello", &out);   // AEAD + seq-number encryption
 // peer:  const msg = try peer.recv(record, &buf);
 ```

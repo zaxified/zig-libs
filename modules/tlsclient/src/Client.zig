@@ -266,6 +266,15 @@ pub const InitError = error{
 ///
 /// `input` is asserted to have buffer capacity at least `min_buffer_len`.
 pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client {
+    // zig-libs tlsclient: dead-stack burn. The ECDHE secrets and the key
+    // schedule live in `initBody`'s frame and in std's callee frames (X25519,
+    // ML-KEM, P-256/P-384, HKDF); the body runs one frame down and the burn
+    // zeroes everything it dirtied (see `burn.init_burn`). `options` is copied
+    // into the argument tuple: pointers and public values only.
+    return burn.run(burn.init_burn, InitError!Client, initBody, .{ input, output, options });
+}
+
+fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client {
     assert(input.buffer.len >= min_buffer_len);
     const host = switch (options.host) {
         .no_verification => "",

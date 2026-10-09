@@ -399,7 +399,7 @@ var cur_hk: HostKey = undefined;
 var cur_text: []const u8 = "";
 var hk_sink: HostKey = undefined;
 
-var heap_buf: [64 * 1024]u8 = undefined;
+var heap_buf: [1024 * 1024]u8 = undefined;
 var heap_fba: std.heap.FixedBufferAllocator = undefined;
 var out_sink: []u8 = &.{};
 
@@ -524,6 +524,360 @@ test "STACKPROBE: no key, nonce or CRT residue on the dead stack after host-key 
         cur_text = vectors.rsa_key;
         bad += try runProbe("HostKey.fromOpenSSH rsa", callFromOpenSSH, &n);
         hk_sink.rsa.secret_key.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Key exchange (added 2026-10-09). One KEX per method and role, each against
+// a peer thread over a socketpair, plus a full handshake per role (KEX + key
+// derivation + cipher install). The measured side draws its entropy from a
+// recording `Io`, so the needles are exactly its ephemeral secrets: the
+// X25519 seed, the ML-KEM seed and secret key, the DH exponent, the
+// component and combined shared secrets `K`, and — for the full handshake —
+// the installed cipher states (the traffic keys). The peer records too, so
+// `K` can be recomputed. Both sides restart from fixed seeds on every call:
+// all seven runs of `runProbe` are the same exchange.
+// ════════════════════════════════════════════════════════════════════════════
+
+const transport = @import("transport.zig");
+const X25519 = std.crypto.dh.X25519;
+const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
+const KexResult = transport.KexResult;
+
+/// Entropy that is a fixed stream and remembers every draw of 32 bytes or more
+/// (the KEX secrets; packet padding and the KEXINIT cookie are shorter and
+/// public anyway). Each draw is SHAKE256(seed ‖ counter) squeezed straight
+/// into the caller's buffer: the generator's state lives only in this frame,
+/// deep inside the measured call. (A `std.Random.ChaCha` reset per call left
+/// its by-value init temporary — keystream included, i.e. the very draws —
+/// in the instrument's own frame above the burn: 2026-10-09, read as residue
+/// until the stack dump showed whose frame it was.)
+const Recorder = struct {
+    seed: u8,
+    counter: u64 = 0,
+    draws: [4][1024]u8 = undefined,
+    lens: [4]usize = undefined,
+    n: usize = 0,
+
+    fn reset(self: *Recorder) void {
+        self.counter = 0;
+        self.n = 0;
+    }
+
+    fn draw(self: *const Recorder, i: usize) []const u8 {
+        return self.draws[i][0..self.lens[i]];
+    }
+
+    fn randomSecure(ud: ?*anyopaque, buf: []u8) std.Io.RandomSecureError!void {
+        const self: *Recorder = @ptrCast(@alignCast(ud.?));
+        var x = std.crypto.hash.sha3.Shake256.init(.{});
+        x.update(&[_]u8{ 'k', 'e', 'x', self.seed });
+        x.update(std.mem.asBytes(&self.counter));
+        x.squeeze(buf);
+        self.counter += 1;
+        if (buf.len >= 32 and self.n < self.draws.len) {
+            @memcpy(self.draws[self.n][0..buf.len], buf);
+            self.lens[self.n] = buf.len;
+            self.n += 1;
+        }
+    }
+    fn random(ud: ?*anyopaque, buf: []u8) void {
+        randomSecure(ud, buf) catch unreachable;
+    }
+};
+
+var threaded: std.Io.Threaded = undefined;
+var rec_vtable: std.Io.VTable = undefined;
+var rec_me: Recorder = .{ .seed = 1 };
+var rec_peer: Recorder = .{ .seed = 2 };
+
+fn recEntropy(r: *Recorder) transport.Entropy {
+    return .{ .io = .{ .userdata = r, .vtable = &rec_vtable } };
+}
+
+const Kex = enum { curve25519, mlkem, dh14, dh16 };
+const Role = enum { client, server };
+
+const kx_v_c = "SSH-2.0-zig_probe_client";
+const kx_v_s = "SSH-2.0-zig_probe_server";
+const kx_i_c = "I_C probe client kexinit payload";
+const kx_i_s = "I_S probe server kexinit payload";
+
+const accept_any: transport.HostKeyPolicy = .{ .verifier = .{ .verifyFn = struct {
+    fn f(_: *anyopaque, _: transport.HostKeyInfo) transport.HostKeyVerdict {
+        return .accept;
+    }
+}.f }, .host = "127.0.0.1" };
+
+fn kexName(k: Kex) []const u8 {
+    return switch (k) {
+        .curve25519 => "curve25519-sha256",
+        .mlkem => "mlkem768x25519-sha256",
+        .dh14 => "diffie-hellman-group14-sha256",
+        .dh16 => "diffie-hellman-group16-sha512",
+    };
+}
+
+// ── API adapter: the only place that names the shapes under test ────────────
+// (BEFORE the 2026-10-09 fix the methods returned `KexResult` by value:
+// `out.* = try transport.curve25519Kex(r, w, …)`.)
+
+fn apiKex(k: Kex, role: Role, r: *std.Io.Reader, w: *std.Io.Writer, ent: transport.Entropy, gpa: std.mem.Allocator, out: *KexResult) !void {
+    var none: transport.CipherState = .plaintext;
+    const cp: transport.CipherPair = .single(&none);
+    switch (role) {
+        .client => switch (k) {
+            .curve25519 => try transport.curve25519Kex(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, accept_any, "ssh-ed25519"),
+            .mlkem => try transport.mlkem768x25519Kex(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, accept_any, "ssh-ed25519"),
+            .dh14, .dh16 => try transport.dhGroupKex(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, accept_any, kexName(k), "ssh-ed25519"),
+        },
+        .server => switch (k) {
+            .curve25519 => try server.curve25519KexServer(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, &kex_hk, gpa),
+            .mlkem => try server.mlkem768x25519KexServer(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, &kex_hk, gpa),
+            .dh14, .dh16 => try server.dhGroupKexServer(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, &kex_hk, gpa, kexName(k)),
+        },
+    }
+}
+
+fn apiHandshake(role: Role, t: *transport.Transport, gpa: std.mem.Allocator) !void {
+    switch (role) {
+        .client => {
+            try t.clientHandshake(gpa, accept_any);
+            try t.requestService("ssh-userauth", &svc_buf);
+        },
+        .server => try server.serverHandshake(t, gpa, .{ .host_keys = (&kex_hk)[0..1] }),
+    }
+}
+
+// ── one exchange over a socketpair ──────────────────────────────────────────
+
+var kex_hk: HostKey = undefined;
+var svc_buf: [64 * 1024]u8 = undefined;
+var cur_kex: Kex = .curve25519;
+var cur_role: Role = .client;
+var kex_sink: KexResult = .{};
+var hs_t: transport.Transport = undefined;
+var peer_t: transport.Transport = undefined;
+var peer_err: ?anyerror = null;
+var me_rbuf: [64 * 1024]u8 = undefined;
+var me_wbuf: [64 * 1024]u8 = undefined;
+var peer_rbuf: [64 * 1024]u8 = undefined;
+var peer_wbuf: [64 * 1024]u8 = undefined;
+var me_r: std.Io.File.Reader = undefined;
+var me_w: std.Io.File.Writer = undefined;
+var peer_r: std.Io.File.Reader = undefined;
+var peer_w: std.Io.File.Writer = undefined;
+var peer_heap: [256 * 1024]u8 = undefined;
+
+fn other(r: Role) Role {
+    return if (r == .client) .server else .client;
+}
+
+fn peerMain(fd: i32, full: bool) void {
+    const io = threaded.io();
+    const f: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    peer_r = f.readerStreaming(io, &peer_rbuf);
+    peer_w = f.writerStreaming(io, &peer_wbuf);
+    var fba: std.heap.FixedBufferAllocator = .init(&peer_heap);
+    rec_peer.reset();
+    const role = other(cur_role);
+    if (full) {
+        peer_t = .init(&peer_r.interface, &peer_w.interface);
+        peer_t.entropy = recEntropy(&rec_peer);
+        apiHandshake(role, &peer_t, fba.allocator()) catch |e| {
+            peer_err = e;
+        };
+    } else {
+        var res: KexResult = .{};
+        apiKex(cur_kex, role, &peer_r.interface, &peer_w.interface, recEntropy(&rec_peer), fba.allocator(), &res) catch |e| {
+            peer_err = e;
+        };
+    }
+}
+
+/// Socketpair + peer thread around `body`, which runs on this thread.
+inline fn withPeer(full: bool, body: anytype) void {
+    var fds: [2]i32 = undefined;
+    if (std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0, &fds) != 0) unreachable;
+    const th = std.Thread.spawn(.{}, peerMain, .{ fds[1], full }) catch unreachable;
+    const io = threaded.io();
+    const f: std.Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    me_r = f.readerStreaming(io, &me_rbuf);
+    me_w = f.writerStreaming(io, &me_wbuf);
+    heap_fba.reset();
+    rec_me.reset();
+    body();
+    // Let the peer finish writing (a server sends EXT_INFO after NEWKEYS,
+    // when the client may already have returned): half-close only, so a peer
+    // still reading sees EOF instead of hanging; a failed call cuts both ways.
+    _ = std.os.linux.shutdown(fds[0], if (call_err != null) std.os.linux.SHUT.RDWR else std.os.linux.SHUT.WR);
+    th.join();
+    _ = std.os.linux.close(fds[0]);
+    _ = std.os.linux.close(fds[1]);
+}
+
+var call_err: ?anyerror = null;
+
+noinline fn callKex() void {
+    withPeer(false, struct {
+        fn b() void {
+            apiKex(cur_kex, cur_role, &me_r.interface, &me_w.interface, recEntropy(&rec_me), heap_fba.allocator(), &kex_sink) catch |e| {
+                call_err = e;
+            };
+        }
+    }.b);
+}
+
+noinline fn callHandshake() void {
+    withPeer(true, struct {
+        fn b() void {
+            hs_t = .init(&me_r.interface, &me_w.interface);
+            hs_t.entropy = recEntropy(&rec_me);
+            apiHandshake(cur_role, &hs_t, heap_fba.allocator()) catch |e| {
+                call_err = e;
+            };
+        }
+    }.b);
+}
+
+// ── needles, recomputed from both sides' recorded draws ─────────────────────
+
+fn clientOf(role: Role, me: *const Recorder, peer: *const Recorder) *const Recorder {
+    return if (role == .client) me else peer;
+}
+
+fn x25519Needles(n: *Needles, mine: [32]u8, theirs: [32]u8) !void {
+    n.addBoth("x25519 sk", &mine);
+    const k = try X25519.scalarmult(mine, try X25519.recoverPublicKey(theirs));
+    n.addBoth("x25519 K", &k);
+}
+
+/// Needles of one exchange of `k` with `role` measured; `me`/`peer` hold the
+/// draws of that exchange.
+fn kexNeedles(n: *Needles, k: Kex, role: Role, me: *const Recorder, peer: *const Recorder) !void {
+    const c = clientOf(role, me, peer);
+    const s = clientOf(other(role), me, peer);
+    switch (k) {
+        .curve25519 => {
+            const cs = c.draw(0)[0..32].*;
+            const ss = s.draw(0)[0..32].*;
+            if (role == .client) try x25519Needles(n, cs, ss) else try x25519Needles(n, ss, cs);
+            leak_src = me.draw(0)[0..32].*;
+        },
+        .mlkem => {
+            // client: x_seed, kem_seed(64); server: kem encaps seed, x_seed.
+            const cx = c.draw(0)[0..32].*;
+            const kem_seed = c.draw(1)[0..MLKem768.seed_length].*;
+            const enc_seed = s.draw(0)[0..MLKem768.encaps_seed_length].*;
+            const sx = s.draw(1)[0..32].*;
+            const kp = try MLKem768.KeyPair.generateDeterministic(kem_seed);
+            const enc = kp.public_key.encapsDeterministic(&enc_seed);
+            const xk = try X25519.scalarmult(cx, try X25519.recoverPublicKey(sx));
+            if (role == .client) {
+                n.addBoth("x25519 sk", &cx);
+                n.addImage("mlkem seed", &kem_seed);
+                n.addImage("mlkem sk", &kp.secret_key.toBytes());
+            } else {
+                n.addBoth("x25519 sk", &sx);
+                n.addImage("mlkem m", &enc_seed);
+            }
+            n.addBoth("x25519 K", &xk);
+            n.addImage("mlkem K", &enc.shared_secret);
+            var res: KexResult = .{};
+            const kk = transport.mlkemSharedK(&res, enc.shared_secret, xk);
+            n.addImage("K", &kk);
+            leak_src = me.draw(0)[0..32].*;
+        },
+        .dh14, .dh16 => {
+            const group = transport.DhGroup.forName(kexName(k)).?;
+            var xs: [2][1024]u8 = undefined;
+            for ([_]*const Recorder{ me, peer }, 0..) |r, i| {
+                const b = xs[i][0..group.prime.len];
+                @memcpy(b, r.draw(0)[0..group.prime.len]);
+                b[0] &= 0x7f;
+                b[b.len - 1] |= 1;
+            }
+            const mine = xs[0][0..group.prime.len];
+            const theirs = xs[1][0..group.prime.len];
+            n.addBoth("dh exponent", mine);
+            var pub_buf: [1024]u8 = undefined;
+            const peer_pub = try transport.dhPowModPrime(group.prime, &[_]u8{2}, theirs, &pub_buf);
+            var k_buf: [1024]u8 = undefined;
+            const kk = try transport.dhPowModPrime(group.prime, peer_pub, mine, &k_buf);
+            n.addBoth("dh K", kk);
+            leak_src = mine[0..32].*;
+        },
+    }
+}
+
+fn controlNeedle(n: *Needles) void {
+    // A value the call never sees: must stay at zero hits (the scan's
+    // false-positive floor inside every set).
+    var c: [32]u8 = undefined;
+    Sha256.hash("ssh-kex-probe-control", &c, .{});
+    n.addBoth("control", &c);
+}
+
+fn kexLabel(comptime k: Kex, comptime role: Role) []const u8 {
+    return "kex " ++ @tagName(k) ++ " " ++ @tagName(role);
+}
+
+fn hsLabel(comptime role: Role) []const u8 {
+    return "handshake " ++ @tagName(role);
+}
+
+fn setupKexProbe() !void {
+    threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    rec_vtable = threaded.io().vtable.*;
+    rec_vtable.randomSecure = Recorder.randomSecure;
+    rec_vtable.random = Recorder.random;
+    heap_fba = .init(&heap_buf);
+    try HostKey.fromOpenSSH(&kex_hk, vectors.ed25519_key, null);
+}
+
+test "STACKPROBE: no ephemeral secret, shared secret or traffic key on the dead stack after a key exchange" {
+    try skipUnlessOptimized();
+    try setupKexProbe();
+    defer threaded.deinit();
+    var bad: usize = 0;
+
+    inline for (.{ Kex.curve25519, Kex.mlkem, Kex.dh14, Kex.dh16 }) |k| {
+        inline for (.{ Role.client, Role.server }) |role| {
+            cur_kex = k;
+            cur_role = role;
+            call_err = null;
+            peer_err = null;
+            callKex(); // priming run: the draws the needles come from
+            if (call_err) |e| return e;
+            if (peer_err) |e| return e;
+            var n: Needles = .{};
+            try kexNeedles(&n, k, role, &rec_me, &rec_peer);
+            controlNeedle(&n);
+            n.sort();
+            bad += try runProbe(kexLabel(k, role), callKex, &n);
+            if (call_err) |e| return e;
+        }
+    }
+
+    // Full handshake (the first method on both lists: mlkem768x25519): the
+    // same KEX secrets plus the traffic keys the transport installed.
+    inline for (.{ Role.client, Role.server }) |role| {
+        cur_role = role;
+        call_err = null;
+        peer_err = null;
+        callHandshake();
+        if (call_err != null or peer_err != null) std.debug.print("handshake {t}: me={?} peer={?}\n", .{ role, call_err, peer_err });
+        if (call_err) |e| return e;
+        if (peer_err) |e| return e;
+        var n: Needles = .{};
+        try kexNeedles(&n, .mlkem, role, &rec_me, &rec_peer);
+        n.addImage("read cipher", std.mem.asBytes(&hs_t.read_cipher));
+        n.addImage("write cipher", std.mem.asBytes(&hs_t.write_cipher));
+        controlNeedle(&n);
+        n.sort();
+        bad += try runProbe(hsLabel(role), callHandshake, &n);
+        if (call_err) |e| return e;
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }

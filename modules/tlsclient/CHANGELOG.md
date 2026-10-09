@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **HIGH: the ECDHE key shares and the handshake key schedule
+  left their secrets on the dead stack after `Client.init`.** ReleaseFast stack
+  probe (`stackprobe_test.zig`) drives `init` with a canned ServerHello per group
+  and suite (reach checked via `ssl_key_log`); 16-byte needle windows found in 5
+  calls, before → after: `x25519_ml_kem768` 2380 / 2460 (SHA-256 / SHA-384
+  suite) → 0, `x25519` 2860 / 2965 → 0, `secp256r1` 2830 / 2930 → 0,
+  `secp384r1` 2535 / 2630 → 0 (all four key pairs' seeds and scalars, the
+  ML-KEM secret vector, the shared secrets, handshake/master secrets, handshake
+  traffic secrets and keys, HMAC pads). `init` runs its body one frame down and
+  zeroes 320 KiB afterwards (`burn.zig`; the body's frame is 181 KiB, dirty depth
+  up to 237 KiB). No API or wire change. Not covered yet: the application
+  traffic secrets and the rest of a full handshake (SPEC "Backlog / deferred").
+
 - **2026-10-09** — **BREAKING, HIGH: the client-certificate signature left the
   key and the nonce on the dead stack; the P-256/P-384 ECDHE secret was
   multiplied in variable time.** New ReleaseFast stack probe

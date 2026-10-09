@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack burn for the client-certificate signature
-//! (`Client.signCertificateVerify`). It runs its body one frame down (`run`, a `never_inline` call), then zeroes the bytes that body
+//! (`Client.signCertificateVerify`) and for the handshake (`Client.init`:
+//! the ECDHE key shares and the key schedule). It runs its body one frame down (`run`, a `never_inline` call), then zeroes the bytes that body
 //! dirtied at that depth. The body is a separate frame on purpose: inlined
 //! into the entry point, the burn would land above the body's locals.
 //! `stackprobe_test.zig` goes red when a body outgrows its burn.
@@ -33,3 +34,12 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 /// `signCertificateVerify`: std ECDSA P-256 dirtied 7.3 KiB, P-384 7.1 KiB,
 /// Ed25519 6.1 KiB in ReleaseFast (2026-10-09).
 pub const sign_burn = 16 * 1024;
+
+/// `Client.init`: the body's own frame is 181 KiB (`sub $0x2d580,%rsp`: two
+/// 16 KiB cleartext buffers, the certificate chain state, the cipher unions)
+/// and the ECDHE + key-schedule callees (ML-KEM decaps + X25519 for the hybrid
+/// group, the deepest) reach 237 KiB below the body's entry in ReleaseFast
+/// (stack probe, 2026-10-09; P-256/P-384/X25519 alone 227 KiB). 320 KiB leaves a
+/// third over the measured depth for the certificate-verification callees,
+/// which the probe does not reach; ~3 µs of vector stores next to a handshake.
+pub const init_burn = 320 * 1024;

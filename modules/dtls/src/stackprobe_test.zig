@@ -2,7 +2,9 @@
 
 //! Dead-stack residue probe for CertificateVerify signing
 //! (`certverify.sign`, all four key families: RSA-PSS, ECDSA P-256, ECDSA
-//! P-384, Ed25519). Kept in the module per `CONVENTIONS.md` §9.
+//! P-384, Ed25519) and, in the second test (bottom of the file), for the key
+//! exchange, key schedule and record keys of a full in-memory handshake.
+//! Kept in the module per `CONVENTIONS.md` §9.
 //!
 //! Method as `acme`'s probe: paint a stack window below the probe, run the
 //! call `PAD` bytes deeper, snapshot the window and look for secrets. The key
@@ -56,13 +58,14 @@ const Needles = struct {
     win: [max_windows]u128 = undefined,
     owner: [max_windows]u8 = undefined,
     len: usize = 0,
-    names: [32][]const u8 = undefined,
+    names: [48][]const u8 = undefined,
     n_names: usize = 0,
 
     fn addImage(self: *Needles, name: []const u8, image: []const u8) void {
         const id: u8 = @intCast(self.lookupName(name));
         var i: usize = 0;
         while (i + W <= image.len) : (i += 1) {
+            if (self.len >= max_windows) @panic("needle set overflow");
             // Skip low-entropy windows (limb padding, short values' zero
             // high limbs): a dead stack holds runs like that anyway.
             if (distinct(image[i..][0..W]) < 8) continue;
@@ -130,7 +133,7 @@ const Needles = struct {
     }
 };
 
-const Hits = [32]usize;
+const Hits = [48]usize;
 
 // ── the measured region ─────────────────────────────────────────────────────
 //
@@ -174,6 +177,11 @@ noinline fn snapshot() void {
     const p: [*]const volatile u8 = @ptrFromInt(region_lo);
     for (&snap, 0..) |*d, i| d.* = p[i];
 }
+
+/// Runs before every measured call, outside the painted window (default: none).
+/// The handshake probe restores the `Connection` the call starts from.
+fn noPrep() void {}
+var prep_fn: *const fn () void = &noPrep;
 
 /// Count needle windows in the last snapshot, one per run of overlapping
 /// windows. `hit_min_depth`/`hit_max_depth`: bytes below the region's top.
@@ -241,6 +249,7 @@ inline fn scrubCalleeSaved() void {
 /// `inline`: as its own frame it ran the call deeper than the region top
 /// `runProbe` computed (2026-10-08).
 inline fn measure(call: *const fn () void, n: *const Needles) Hits {
+    prep_fn(); // restore the state the call starts from (before the paint)
     scrubCalleeSaved();
     paint();
     shim(call);
@@ -263,6 +272,7 @@ fn runProbe(label: []const u8, call: *const fn () void, n: *const Needles) !usiz
         if (hit_min_depth != 0 and (shallowest == 0 or hit_min_depth < shallowest)) shallowest = hit_min_depth;
         if (hit_max_depth > deepest) deepest = hit_max_depth;
     }
+    prep_fn();
     scrubCalleeSaved();
     paint();
     shim(call);
@@ -531,4 +541,415 @@ fn setKeyEd() void {
 }
 fn setKeyRsa() void {
     cur_key = .{ .rsa = &key_rsa };
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Key exchange and key schedule: a full in-memory client <-> server handshake
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The measured call is ONE public step of the handshake (`startHandshake`,
+// `handleFlight` on either side, `send`, `recv`) on a `Connection` that lives in
+// static memory. A reference run walks the whole handshake once and keeps, for
+// every step, the connection as it was BEFORE the step (`pre`), the datagram
+// fed to it and every byte the (recording) entropy source handed out. Each
+// measured call restores `pre` and re-seeds the entropy first (`prepStep`, run
+// before the window is painted), so the five repetitions of a probe see the
+// same secrets. Needles are derived from that reference run:
+//   - every entropy draw that is not on the wire (the ECDHE scalars and ML-KEM
+//     seeds, the encapsulation seed, the signing noise) and its clamped /
+//     expanded images (X25519 scalar, ML-KEM decapsulation key);
+//   - the client's ECDHE secret as it sits in the live connection, the shared
+//     secret recomputed from it and the server's share;
+//   - early / derived / handshake / master secrets recomputed from that
+//     shared secret; the traffic secrets, the finished keys and every record
+//     key, IV, sequence-number key (and AES round keys / GHASH key) read from the
+//     live connections;
+//   - the PSK (PSK sets) and the certificate signing keys.
+
+const dtls = @import("root.zig");
+const Connection = dtls.Connection;
+const cert_kat = @import("certauth_kat_vectors.zig");
+const keyschedule = @import("keyschedule.zig");
+const MlKem768 = std.crypto.kem.ml_kem.MLKem768;
+const X25519 = std.crypto.dh.X25519;
+const P256c = std.crypto.ecc.P256;
+const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+const Aes128 = std.crypto.core.aes.Aes128;
+const NamedGroup = dtls.messages.NamedGroup;
+
+const Step = enum(u8) { c_start, s_hello, c_flight2, s_fin, c_send, s_recv, s_send, c_recv, c_install };
+const n_steps = 9;
+
+fn isClient(st: Step) bool {
+    return switch (st) {
+        .c_start, .c_flight2, .c_send, .c_recv, .c_install => true,
+        .s_hello, .s_fin, .s_recv, .s_send => false,
+    };
+}
+
+/// Entropy source that records every `fill` it serves (one entry per call).
+const Rec = struct {
+    prng: std.Random.DefaultPrng = undefined,
+    log: [4096]u8 = undefined,
+    n: usize = 0,
+    ent_off: [64]u16 = undefined,
+    ent_len: [64]u16 = undefined,
+    n_ent: usize = 0,
+
+    fn reset(self: *Rec, seed: u64) void {
+        self.prng = .init(seed);
+        self.n = 0;
+        self.n_ent = 0;
+    }
+
+    fn fill(self: *Rec, buf: []u8) void {
+        self.prng.random().bytes(buf);
+        if (self.n_ent < 64 and self.n + buf.len <= self.log.len) {
+            self.ent_off[self.n_ent] = @intCast(self.n);
+            self.ent_len[self.n_ent] = @intCast(buf.len);
+            self.n_ent += 1;
+            @memcpy(self.log[self.n..][0..buf.len], buf);
+            self.n += buf.len;
+        }
+    }
+
+    fn random(self: *Rec) std.Random {
+        return std.Random.init(self, fill);
+    }
+};
+
+// The connections, their pre-step snapshots and every buffer live in static
+// memory, so none of them is part of the probed stack window.
+var live_client: Connection = undefined;
+var live_server: Connection = undefined;
+var pre: [n_steps]Connection = undefined;
+var in_store: [n_steps][6144]u8 = undefined;
+var in_len: [n_steps]usize = @splat(0);
+var out_buf: [6144]u8 = undefined;
+var plain_buf: [256]u8 = undefined;
+var out_len: usize = 0;
+var step_failed = false;
+var cur_step: Step = .c_start;
+var cur_seed: u64 = 0;
+var rec: Rec = .{};
+var step_rec: [n_steps]Rec = undefined;
+var needles_store: Needles = .{};
+
+/// Secrets for the `installApplicationKeys` step (the server's pending ones).
+var inst_c: [32]u8 = undefined;
+var inst_s: [32]u8 = undefined;
+
+const app_msg = "dtls kex probe application record";
+
+fn connOf(st: Step) *Connection {
+    return if (isClient(st)) &live_client else &live_server;
+}
+
+fn stepIn(st: Step) []const u8 {
+    return in_store[@intFromEnum(st)][0..in_len[@intFromEnum(st)]];
+}
+
+fn setIn(st: Step) void {
+    @memcpy(in_store[@intFromEnum(st)][0..out_len], out_buf[0..out_len]);
+    in_len[@intFromEnum(st)] = out_len;
+}
+
+/// API adapter: the one place that names how a step calls the module.
+fn doStep(st: Step) void {
+    const ent: dtls.Entropy = .{ .seeded_for_test = rec.random() };
+    switch (st) {
+        .c_start => {
+            const o = live_client.startHandshake(ent, 0, &out_buf) catch return failStep();
+            out_len = o.len;
+        },
+        .s_hello, .s_fin => {
+            const r = live_server.handleFlight(stepIn(st), ent, 0, &out_buf) catch return failStep();
+            out_len = r.out.len;
+        },
+        .c_flight2 => {
+            const r = live_client.handleFlight(stepIn(st), ent, 0, &out_buf) catch return failStep();
+            out_len = r.out.len;
+        },
+        .c_send => {
+            const o = live_client.send(app_msg, &out_buf) catch return failStep();
+            out_len = o.len;
+        },
+        .s_recv => {
+            const o = live_server.recv(stepIn(st), &plain_buf) catch return failStep();
+            out_len = o.len;
+        },
+        .s_send => {
+            const o = live_server.send(app_msg, &out_buf) catch return failStep();
+            out_len = o.len;
+        },
+        .c_recv => {
+            const o = live_client.recv(stepIn(st), &plain_buf) catch return failStep();
+            out_len = o.len;
+        },
+        .c_install => {
+            live_client.installApplicationKeys(live_client.suite, &inst_c, &inst_s) catch return failStep();
+            out_len = 0;
+        },
+    }
+}
+
+fn failStep() void {
+    step_failed = true;
+}
+
+noinline fn callStep() void {
+    doStep(cur_step);
+}
+
+fn prepStep() void {
+    @memcpy(std.mem.asBytes(connOf(cur_step)), std.mem.asBytes(&pre[@intFromEnum(cur_step)]));
+    rec.reset(cur_seed +% @intFromEnum(cur_step));
+}
+
+/// Walk the handshake once; fill `pre`, the inputs and `step_rec`.
+fn reference(cfg_c: dtls.Config, cfg_s: dtls.Config) !void {
+    live_client = try Connection.clientInit(cfg_c);
+    live_server = try Connection.serverInit(cfg_s);
+    in_len = @splat(0);
+    for (0..n_steps) |i| {
+        const st: Step = @enumFromInt(i);
+        cur_step = st;
+        @memcpy(std.mem.asBytes(&pre[i]), std.mem.asBytes(connOf(st)));
+        prepStep();
+        step_failed = false;
+        if (st == .c_install) {
+            inst_c = pre[@intFromEnum(Step.s_fin)].pending_ap_client;
+            inst_s = pre[@intFromEnum(Step.s_fin)].pending_ap_server;
+        }
+        doStep(st);
+        try std.testing.expect(!step_failed);
+        step_rec[i] = rec;
+        switch (st) {
+            .c_start => setIn(.s_hello),
+            .s_hello => setIn(.c_flight2),
+            .c_flight2 => setIn(.s_fin),
+            .c_send => setIn(.s_recv),
+            .s_send => setIn(.c_recv),
+            .s_fin, .s_recv, .c_recv, .c_install => {},
+        }
+    }
+    try std.testing.expectEqual(dtls.connection.State.connected, live_client.state);
+    try std.testing.expectEqual(dtls.connection.State.connected, live_server.state);
+}
+
+fn onWire(chunk: []const u8) bool {
+    for ([_]Step{ .s_hello, .c_flight2, .s_fin }) |st| {
+        if (std.mem.indexOf(u8, stepIn(st), chunk) != null) return true;
+    }
+    return false;
+}
+
+fn addDir(n: *Needles, d: anytype, aes: bool) void {
+    n.addBig("record key", d.key[0..d.key_len]);
+    n.addBig("sn key", d.sn_key[0..d.sn_len]);
+    if (aes) {
+        addAes(n, d.key[0..16].*);
+        addAes(n, d.sn_key[0..16].*);
+    }
+}
+
+fn addAes(n: *Needles, key: [16]u8) void {
+    const aes = Aes128.initEnc(key);
+    n.addImage("aes round keys", std.mem.asBytes(&aes));
+    var h: [16]u8 = undefined;
+    aes.encrypt(&h, &@as([16]u8, @splat(0)));
+    n.addBig("ghash H", &h);
+}
+
+const Set = struct {
+    name: []const u8,
+    psk: bool,
+    group: NamedGroup,
+    suite: dtls.CipherSuite,
+    mutual: bool = false,
+};
+
+const sets = [_]Set{
+    .{ .name = "psk aes128gcm", .psk = true, .group = .x25519, .suite = .aes_128_gcm_sha256 },
+    .{ .name = "psk chacha20", .psk = true, .group = .x25519, .suite = .chacha20_poly1305_sha256 },
+    .{ .name = "cert x25519 aes128gcm", .psk = false, .group = .x25519, .suite = .aes_128_gcm_sha256 },
+    .{ .name = "cert p256 chacha20 mutual", .psk = false, .group = .secp256r1, .suite = .chacha20_poly1305_sha256, .mutual = true },
+    .{ .name = "cert x25519mlkem768 aes128gcm", .psk = false, .group = .x25519_ml_kem768, .suite = .aes_128_gcm_sha256 },
+};
+
+var psk_store: [32]u8 = undefined;
+var sk_server: Ecdsa.EcdsaP256Sha256.SecretKey = undefined;
+var sk_client: Ecdsa.EcdsaP256Sha256.SecretKey = undefined;
+
+fn configs(comptime set: Set) !struct { c: dtls.Config, s: dtls.Config } {
+    const suites = [_]dtls.CipherSuite{set.suite};
+    if (set.psk) {
+        return .{
+            .c = .{ .role = .client, .psk_identity = "device-042", .psk = &psk_store, .cipher_suites = &suites },
+            .s = .{ .role = .server, .psk_identity = "device-042", .psk = &psk_store, .cipher_suites = &suites },
+        };
+    }
+    sk_server = try Ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.server_secret_key_bytes);
+    sk_client = try Ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.client_secret_key_bytes);
+    var c: dtls.Config = .{
+        .role = .client,
+        .key_exchange = .cert_dhe,
+        .key_share_group = set.group,
+        .cipher_suites = &suites,
+        .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
+        .now_sec = cert_kat.valid_now_sec,
+        .require_peer_cert = true,
+    };
+    var s: dtls.Config = .{
+        .role = .server,
+        .key_exchange = .cert_dhe,
+        .cipher_suites = &suites,
+        .cert = .{ .chain = &.{&cert_kat.server_cert_der}, .private_key = .{ .ecdsa_p256 = &sk_server } },
+    };
+    if (set.mutual) {
+        c.cert = .{ .chain = &.{&cert_kat.client_cert_der}, .private_key = .{ .ecdsa_p256 = &sk_client } };
+        s.request_client_cert = true;
+        s.require_peer_cert = true;
+        s.peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der };
+        s.now_sec = cert_kat.valid_now_sec;
+    }
+    return .{ .c = c, .s = s };
+}
+
+/// Needles from the reference run (see the section header). Returns the
+/// 32-byte control secret.
+fn buildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
+    n.len = 0;
+    n.n_names = 0;
+    const aes = set.suite == .aes_128_gcm_sha256;
+
+    // Entropy that is not on the wire.
+    for (0..n_steps) |i| {
+        const r = &step_rec[i];
+        for (0..r.n_ent) |e| {
+            const chunk = r.log[r.ent_off[e]..][0..r.ent_len[e]];
+            if (onWire(chunk)) continue;
+            n.addBig("entropy", chunk);
+            if (chunk.len == 32) {
+                var cl: [32]u8 = chunk[0..32].*;
+                cl[0] &= 248;
+                cl[31] &= 127;
+                cl[31] |= 64;
+                n.addBig("x25519 scalar", &cl);
+            }
+            if (chunk.len == MlKem768.seed_length) {
+                const kp = try MlKem768.KeyPair.generateDeterministic(chunk[0..MlKem768.seed_length].*);
+                n.addImage("ml-kem dk", std.mem.asBytes(&kp.secret_key));
+                n.addImage("ml-kem dk", &kp.secret_key.toBytes());
+            }
+        }
+    }
+
+    var eh: [32]u8 = undefined;
+    Sha256.hash("", &eh, .{});
+    var dh: [64]u8 = undefined;
+    var dh_len: usize = 0;
+    var es: [32]u8 = undefined;
+    if (set.psk) {
+        n.addBig("psk", &psk_store);
+        es = keyschedule.earlySecret(HkdfSha256, &psk_store);
+        const bk = keyschedule.binderKey(HkdfSha256, es, &eh);
+        n.addBig("binder key", &bk);
+        n.addBig("binder key", &keyschedule.deriveFinishedKey(HkdfSha256, 32, bk));
+    } else {
+        const cl = &pre[@intFromEnum(Step.c_flight2)];
+        const sv = &pre[@intFromEnum(Step.s_fin)];
+        const grp = cl.ecdhe_group;
+        try std.testing.expectEqual(@intFromEnum(set.group), grp);
+        const sec_len: usize = if (set.group == .x25519_ml_kem768) 96 else 32;
+        n.addBig("ecdhe secret", cl.ecdhe_secret[0..sec_len]);
+        const sp = sv.ecdhe_public[0..sv.ecdhe_public_len];
+        switch (set.group) {
+            .x25519 => {
+                const ss = try X25519.scalarmult(cl.ecdhe_secret[0..32].*, sp[0..32].*);
+                dh[0..32].* = ss;
+                dh_len = 32;
+            },
+            .secp256r1 => {
+                const point = try P256c.fromSec1(sp);
+                const shared = try point.mul(cl.ecdhe_secret[0..32].*, .big);
+                const a = shared.affineCoordinates();
+                dh[0..32].* = a.x.toBytes(.big);
+                dh_len = 32;
+                n.addBig("dh y", &a.y.toBytes(.big));
+                n.addImage("dh fe", std.mem.asBytes(&a.x));
+                n.addImage("dh fe", std.mem.asBytes(&a.y));
+            },
+            .x25519_ml_kem768 => {
+                const kp = try MlKem768.KeyPair.generateDeterministic(cl.ecdhe_secret[0..MlKem768.seed_length].*);
+                const ss_pq = try kp.secret_key.decaps(sp[0..MlKem768.ciphertext_length]);
+                const ss_x = try X25519.scalarmult(cl.ecdhe_secret[MlKem768.seed_length..][0..32].*, sp[MlKem768.ciphertext_length..][0..32].*);
+                dh[0..32].* = ss_pq;
+                dh[32..64].* = ss_x;
+                dh_len = 64;
+                n.addBig("ss_pq", &ss_pq);
+                n.addBig("ss_x", &ss_x);
+            },
+            else => unreachable,
+        }
+        n.addBig("dh shared", dh[0..dh_len]);
+        const zero_psk: [32]u8 = @splat(0);
+        es = keyschedule.earlySecret(HkdfSha256, &zero_psk);
+        n.addBig("server sign key", &cert_kat.server_secret_key_bytes);
+        if (set.mutual) n.addBig("client sign key", &cert_kat.client_secret_key_bytes);
+    }
+    n.addBig("early secret", &es);
+    n.addBig("derived", &keyschedule.deriveSecret(HkdfSha256, es, "derived", &eh));
+    const hs = keyschedule.deriveHandshakeSecret(HkdfSha256, es, &eh, if (set.psk) null else dh[0..dh_len]);
+    const ms = keyschedule.deriveMasterSecret(HkdfSha256, hs, &eh);
+    n.addBig("handshake secret", &hs);
+    n.addBig("derived", &keyschedule.deriveSecret(HkdfSha256, hs, "derived", &eh));
+    n.addBig("master secret", &ms);
+
+    // Traffic secrets from the live server, after ServerHello..Finished.
+    const sv = &pre[@intFromEnum(Step.s_fin)];
+    n.addBig("hs traffic c", &sv.hs_traffic_client);
+    n.addBig("hs traffic s", &sv.hs_traffic_server);
+    n.addBig("ap traffic c", &sv.pending_ap_client);
+    n.addBig("ap traffic s", &sv.pending_ap_server);
+    n.addBig("finished key", &keyschedule.deriveFinishedKey(HkdfSha256, 32, sv.hs_traffic_client));
+    n.addBig("finished key", &keyschedule.deriveFinishedKey(HkdfSha256, 32, sv.hs_traffic_server));
+    // The schedule is only a needle if it is the engine's: it must reproduce the
+    // application secrets the server derived from it.
+    const th = sv.transcript.currentHash();
+    const ap = keyschedule.deriveApplicationTrafficSecrets(HkdfSha256, ms, &th);
+    try std.testing.expectEqualSlices(u8, &sv.pending_ap_client, &ap.client);
+    try std.testing.expectEqualSlices(u8, &sv.pending_ap_server, &ap.server);
+
+    addDir(n, sv.hs_write_keys, aes);
+    addDir(n, sv.hs_read_keys, aes);
+    addDir(n, live_client.write_keys, aes);
+    addDir(n, live_client.read_keys, aes);
+    addDir(n, live_server.write_keys, aes);
+    addDir(n, live_server.read_keys, aes);
+
+    var ctl: [LEAK]u8 = undefined;
+    Sha256.hash(set.name, &ctl, .{});
+    n.addBig("control", &ctl);
+    n.sort();
+    return ctl;
+}
+
+test "STACKPROBE: no ECDHE, key-schedule or record-key residue on the dead stack after a full handshake" {
+    try skipUnlessOptimized();
+    var bad: usize = 0;
+    inline for (sets, 0..) |set, si| {
+        Sha256.hash(set.name, &psk_store, .{});
+        cur_seed = 0xD715_0000 + si * 64;
+        const cfg = try configs(set);
+        try reference(cfg.c, cfg.s);
+        leak_src = try buildNeedles(&needles_store, set);
+        prep_fn = prepStep;
+        inline for (comptime std.meta.tags(Step)) |st| {
+            cur_step = st;
+            bad += try runProbe("kex " ++ set.name ++ " " ++ @tagName(st), callStep, &needles_store);
+        }
+        prep_fn = noPrep;
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
 }

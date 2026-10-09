@@ -19,6 +19,7 @@
 //! itself.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const builtin = @import("builtin");
 const messages = @import("messages.zig");
 const rsa = @import("rsa");
@@ -704,6 +705,12 @@ fn aesCtrXor(ctx: std.crypto.core.aes.AesEncryptCtx(Aes256), counter: *[16]u8, d
 /// decrypting and MAC-verifying as needed, into `buf`. Advances the sequence
 /// number. Returned slices point into `buf`.
 pub fn readPacket(r: *std.Io.Reader, cipher: *CipherState, buf: []u8) TransportError!Packet {
+    // Decryption's per-packet key material (the cipher's key schedule, the
+    // Poly1305 key): one frame down, its stack zeroed after it.
+    return burn.run(burn.record_burn, TransportError!Packet, readPacketBody, .{ r, cipher, buf });
+}
+
+fn readPacketBody(r: *std.Io.Reader, cipher: *CipherState, buf: []u8) TransportError!Packet {
     switch (cipher.*) {
         .none => |*st| {
             const lenb = try r.takeArray(4);
@@ -843,6 +850,13 @@ pub fn readPacket(r: *std.Io.Reader, cipher: *CipherState, buf: []u8) TransportE
 /// `cipher`'s state (computing padding, encrypting, appending the MAC as
 /// needed), then flush. Advances the sequence number.
 pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, entropy: Entropy, payload: []const u8) TransportError!void {
+    // The body's 8 KiB buffer holds the plaintext packet (a password in
+    // userauth) and the cipher's per-packet key material: one frame down,
+    // its stack zeroed after it.
+    return burn.run(burn.record_burn, TransportError!void, writePacketBody, .{ w, cipher, entropy, payload });
+}
+
+fn writePacketBody(w: *std.Io.Writer, cipher: *CipherState, entropy: Entropy, payload: []const u8) TransportError!void {
     var buf: [8192]u8 = undefined;
     switch (cipher.*) {
         .none => |*st| {
@@ -1344,12 +1358,49 @@ fn gateHostKey(
     };
 }
 
+/// curve25519-sha256 client side (see the body below).
+///
+/// The result goes to `out` (never returned by value: it holds `K`); the body
+/// runs one frame down and the stack it dirtied is zeroed after it, std's
+/// X25519 / ML-KEM / modexp frames included.
+pub fn curve25519Kex(
+    out: *KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: CipherPair,
+    entropy: Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    policy: HostKeyPolicy,
+    negotiated_host_key_algorithm: []const u8,
+) TransportError!void {
+    return burn.run(burn.kex_x25519_burn, TransportError!void, curve25519KexInto, .{ out, r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, policy, negotiated_host_key_algorithm });
+}
+
+fn curve25519KexInto(
+    out: *KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: CipherPair,
+    entropy: Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    policy: HostKeyPolicy,
+    negotiated_host_key_algorithm: []const u8,
+) TransportError!void {
+    out.* = try curve25519KexBody(r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, policy, negotiated_host_key_algorithm);
+}
+
 /// Run the client side of curve25519-sha256 key exchange (RFC 8731):
 /// SSH_MSG_KEX_ECDH_INIT (`Q_C`) → SSH_MSG_KEX_ECDH_REPLY (`K_S`, `Q_S`,
 /// signature), compute `K` and `H`, verify the host key via
 /// `policy.verifier`, cross-check `negotiated_host_key_algorithm` against
 /// `K_S`/the signature blob, then verify the signature over `H`.
-pub fn curve25519Kex(
+fn curve25519KexBody(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     ciphers: CipherPair,
@@ -1595,6 +1646,45 @@ fn beToLimbsCt(comptime L: usize, be: []const u8) [L]u64 {
     return v;
 }
 
+/// diffie-hellman-group14/16 client side (see the body below).
+///
+/// The result goes to `out` (never returned by value: it holds `K`); the body
+/// runs one frame down and the stack it dirtied is zeroed after it, std's
+/// X25519 / ML-KEM / modexp frames included.
+pub fn dhGroupKex(
+    out: *KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: CipherPair,
+    entropy: Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    policy: HostKeyPolicy,
+    kex_name: []const u8,
+    negotiated_host_key_algorithm: []const u8,
+) TransportError!void {
+    return burn.run(burn.kex_dh_burn, TransportError!void, dhGroupKexInto, .{ out, r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, policy, kex_name, negotiated_host_key_algorithm });
+}
+
+fn dhGroupKexInto(
+    out: *KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: CipherPair,
+    entropy: Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    policy: HostKeyPolicy,
+    kex_name: []const u8,
+    negotiated_host_key_algorithm: []const u8,
+) TransportError!void {
+    out.* = try dhGroupKexBody(r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, policy, kex_name, negotiated_host_key_algorithm);
+}
+
 /// Run the client side of classic MODP Diffie-Hellman key exchange (RFC 4253
 /// §8.1, RFC 3526 groups): send SSH_MSG_KEXDH_INIT (`e = g^x mod p`), receive
 /// SSH_MSG_KEXDH_REPLY (`K_S`, `f = g^y mod p`, signature), compute
@@ -1602,7 +1692,7 @@ fn beToLimbsCt(comptime L: usize, be: []const u8) [L]u64 {
 /// `K` are mpints and HASH is SHA-256 (group14) or SHA-512 (group16). Then
 /// verify the host key, cross-check `negotiated_host_key_algorithm` against
 /// `K_S`/the signature blob, and verify the signature over `H`.
-pub fn dhGroupKex(
+fn dhGroupKexBody(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     ciphers: CipherPair,
@@ -1729,6 +1819,43 @@ pub fn mlkemSharedK(res: *KexResult, kem_shared: [32]u8, x25519_shared: [32]u8) 
     return k_raw;
 }
 
+/// mlkem768x25519-sha256 client side (see the body below).
+///
+/// The result goes to `out` (never returned by value: it holds `K`); the body
+/// runs one frame down and the stack it dirtied is zeroed after it, std's
+/// X25519 / ML-KEM / modexp frames included.
+pub fn mlkem768x25519Kex(
+    out: *KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: CipherPair,
+    entropy: Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    policy: HostKeyPolicy,
+    negotiated_host_key_algorithm: []const u8,
+) TransportError!void {
+    return burn.run(burn.kex_mlkem_burn, TransportError!void, mlkem768x25519KexInto, .{ out, r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, policy, negotiated_host_key_algorithm });
+}
+
+fn mlkem768x25519KexInto(
+    out: *KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: CipherPair,
+    entropy: Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    policy: HostKeyPolicy,
+    negotiated_host_key_algorithm: []const u8,
+) TransportError!void {
+    out.* = try mlkem768x25519KexBody(r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, policy, negotiated_host_key_algorithm);
+}
+
 /// Run the client side of `mlkem768x25519-sha256` (OpenSSH's post-quantum
 /// hybrid, its current default): generate an X25519 ephemeral keypair AND an
 /// ML-KEM-768 keypair, send `KEX_ECDH_INIT` with blob
@@ -1738,7 +1865,7 @@ pub fn mlkemSharedK(res: *KexResult, kem_shared: [32]u8, x25519_shared: [32]u8) 
 /// `K = SHA256(K_MLKEM ‖ K_X25519)` (encoded as a `string`) and
 /// `H = SHA256(V_C‖V_S‖I_C‖I_S‖K_S‖C‖S‖string(K))`. Verify the host key,
 /// cross-check `negotiated_host_key_algorithm`, then verify the signature.
-pub fn mlkem768x25519Kex(
+fn mlkem768x25519KexBody(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     ciphers: CipherPair,
@@ -1834,21 +1961,21 @@ pub const DerivedKeys = struct {
 /// RFC 4253 §7.2 KDF for one key letter: `HASH(K || H || X || session_id)`,
 /// extended via `HASH(K || H || <all so far>)` to fill `out`. `k_mpint` must
 /// be `K` already in mpint wire form.
-fn deriveKeyBytes(out: []u8, letter: u8, k_mpint: []const u8, h: [32]u8, session_id: [32]u8) void {
+fn deriveKeyBytes(out: []u8, letter: u8, k_mpint: []const u8, h: *const [32]u8, session_id: *const [32]u8) void {
     var first: [32]u8 = undefined;
     defer std.crypto.secureZero(u8, &first);
     var s = Sha256.init(.{});
     s.update(k_mpint);
-    s.update(&h);
+    s.update(h);
     s.update(&[_]u8{letter});
-    s.update(&session_id);
+    s.update(session_id);
     s.final(&first);
     var written: usize = @min(out.len, 32);
     @memcpy(out[0..written], first[0..written]);
     while (written < out.len) {
         var s2 = Sha256.init(.{});
         s2.update(k_mpint);
-        s2.update(&h);
+        s2.update(h);
         s2.update(out[0..written]);
         var block: [32]u8 = undefined;
         defer std.crypto.secureZero(u8, &block);
@@ -1861,18 +1988,22 @@ fn deriveKeyBytes(out: []u8, letter: u8, k_mpint: []const u8, h: [32]u8, session
 
 /// RFC 4253 §7.2 key-derivation for the `aes256-ctr`/`hmac-sha2-256` key sizes
 /// (letters `A`..`F`). `shared_secret` is the raw 32-byte X25519 output.
-pub fn deriveKeys(shared_secret: [32]u8, exchange_hash: [32]u8, session_id: [32]u8) DerivedKeys {
+/// Secrets in by pointer, keys out through `out`; the body runs one frame
+/// down and its stack is zeroed after it.
+pub fn deriveKeys(out: *DerivedKeys, shared_secret: *const [32]u8, exchange_hash: *const [32]u8, session_id: *const [32]u8) void {
+    burn.run(burn.install_burn, void, deriveKeysBody, .{ out, shared_secret, exchange_hash, session_id });
+}
+
+fn deriveKeysBody(out: *DerivedKeys, shared_secret: *const [32]u8, exchange_hash: *const [32]u8, session_id: *const [32]u8) void {
     var kmbuf: [4 + 33]u8 = undefined;
     defer std.crypto.secureZero(u8, &kmbuf);
-    const k_mpint = encodeMpint(&kmbuf, &shared_secret);
-    var out: DerivedKeys = undefined;
+    const k_mpint = encodeMpint(&kmbuf, shared_secret);
     deriveKeyBytes(&out.iv_client_to_server, 'A', k_mpint, exchange_hash, session_id);
     deriveKeyBytes(&out.iv_server_to_client, 'B', k_mpint, exchange_hash, session_id);
     deriveKeyBytes(&out.enc_key_client_to_server, 'C', k_mpint, exchange_hash, session_id);
     deriveKeyBytes(&out.enc_key_server_to_client, 'D', k_mpint, exchange_hash, session_id);
     deriveKeyBytes(&out.mac_key_client_to_server, 'E', k_mpint, exchange_hash, session_id);
     deriveKeyBytes(&out.mac_key_server_to_client, 'F', k_mpint, exchange_hash, session_id);
-    return out;
 }
 
 pub const Direction = enum { c2s, s2c };
@@ -1918,7 +2049,7 @@ fn deriveKey(out: []u8, letter: u8, k_enc: []const u8, h: []const u8, session_id
 
 /// Build the installed `CipherState` for one direction from a negotiated
 /// cipher name and the KEX result, deriving exactly the needed key material.
-fn buildCipher(name: []const u8, dir: Direction, kr: KexResult, sid: []const u8, seq: u32) TransportError!CipherState {
+fn buildCipher(name: []const u8, dir: Direction, kr: *const KexResult, sid: []const u8, seq: u32) TransportError!CipherState {
     var kmbuf: [4 + 33]u8 = undefined;
     defer std.crypto.secureZero(u8, &kmbuf);
     // K as fed to the KDF: the KEX's explicit encoding, or (legacy curve25519)
@@ -2461,7 +2592,15 @@ pub const Transport = struct {
 
     /// Install the keys of a finished exchange for one direction: wipe the
     /// old state and continue (or, under strict KEX, restart) its sequence.
-    pub fn installCipher(t: *Transport, which: enum { read, write }, name: []const u8, dir: Direction, kr: KexResult) TransportError!void {
+    pub fn installCipher(t: *Transport, which: CipherSlot, name: []const u8, dir: Direction, kr: *const KexResult) TransportError!void {
+        // The new state is built by value (`buildCipher`): body one frame
+        // down, its stack zeroed after it.
+        return burn.run(burn.install_burn, TransportError!void, installCipherBody, .{ t, which, name, dir, kr });
+    }
+
+    pub const CipherSlot = enum { read, write };
+
+    fn installCipherBody(t: *Transport, which: CipherSlot, name: []const u8, dir: Direction, kr: *const KexResult) TransportError!void {
         const state = switch (which) {
             .read => &t.read_cipher,
             .write => &t.write_cipher,
@@ -2574,6 +2713,9 @@ fn sameHostKey(ctx: *anyopaque, key: HostKeyInfo) HostKeyVerdict {
 /// One complete client key exchange: the initial one (with `policy`) or a
 /// re-exchange (`peer_kexinit` already received; `ours` set when we sent our
 /// KEXINIT first, i.e. `Transport.rekey`).
+/// One complete initiator key exchange: KEX, key derivation, NEWKEYS, cipher
+/// install. The body runs one frame down and the stack it dirtied — `K`, the
+/// derived keys, the `KexResult` and std's frames — is zeroed after it.
 fn clientKexRound(
     t: *Transport,
     gpa: std.mem.Allocator,
@@ -2582,8 +2724,23 @@ fn clientKexRound(
     peer_kexinit: ?[]const u8,
     ours: ?[]const u8,
 ) TransportError!void {
+    return burn.run(burn.round_burn, TransportError!void, clientKexRoundBody, .{ t, gpa, round, initial_policy, peer_kexinit, ours });
+}
+
+fn clientKexRoundBody(
+    t: *Transport,
+    gpa: std.mem.Allocator,
+    round: KexRound,
+    initial_policy: ?HostKeyPolicy,
+    peer_kexinit: ?[]const u8,
+    ours: ?[]const u8,
+) TransportError!void {
     const scratch = try gpa.alloc(u8, 64 * 1024);
-    defer gpa.free(scratch);
+    defer {
+        // A re-exchange may queue channel data through it.
+        std.crypto.secureZero(u8, scratch);
+        gpa.free(scratch);
+    }
     const ciphers = CipherPair{ .r = &t.read_cipher, .w = &t.write_cipher, .skip_generic = round == .rekey };
 
     // I_C: our KEXINIT.
@@ -2642,13 +2799,14 @@ fn clientKexRound(
     var v_s_copy = t.v_s;
     const v_c = v_c_copy.slice();
     const v_s = v_s_copy.slice();
-    var kex_result = if (isMlkemKex(neg.kex))
-        try mlkem768x25519Kex(t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.host_key)
-    else if (isCurve25519Kex(neg.kex))
-        try curve25519Kex(t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.host_key)
-    else
-        try dhGroupKex(t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.kex, neg.host_key);
+    var kex_result: KexResult = .{};
     defer kex_result.zeroize();
+    if (isMlkemKex(neg.kex))
+        try mlkem768x25519Kex(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.host_key)
+    else if (isCurve25519Kex(neg.kex))
+        try curve25519Kex(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.host_key)
+    else
+        try dhGroupKex(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.kex, neg.host_key);
 
     if (t.session_id == null) t.session_id = SessionId.from(kex_result.hash());
     if (round == .initial) t.host_key_digest = kex_result.host_key_digest;
@@ -2656,10 +2814,10 @@ fn clientKexRound(
     // NEWKEYS: ours under the old write keys, then switch writing; theirs
     // under the old read keys, then switch reading.
     try writePacket(t.writer, ciphers.w, t.entropy, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
-    try t.installCipher(.write, neg.cipher_c2s, .c2s, kex_result);
+    try t.installCipher(.write, neg.cipher_c2s, .c2s, &kex_result);
     const nk = try readKexPacket(t.reader, ciphers, scratch);
     if (msgType(nk) != @intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)) return error.ProtocolError;
-    try t.installCipher(.read, neg.cipher_s2c, .s2c, kex_result);
+    try t.installCipher(.read, neg.cipher_s2c, .s2c, &kex_result);
 }
 
 /// Convenience: `Transport.init` followed by `.clientHandshake`.
@@ -3501,10 +3659,11 @@ test "curve25519Kex (client): rejects a KEX_ECDH_REPLY carrying the identity poi
     var out_scratch: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&out_scratch);
     var none: CipherState = .plaintext;
+    var kr: KexResult = .{};
 
     try std.testing.expectError(
         error.KexFailed,
-        curve25519Kex(&r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
+        curve25519Kex(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
     );
 }
 
@@ -3546,7 +3705,8 @@ test "Entropy.io: the KEXINIT cookie, the padding and the ephemeral key come fro
     var empty: std.Io.Reader = .fixed("");
     w = .fixed(&out);
     var none: CipherState = .plaintext;
-    if (curve25519Kex(&empty, &w, .single(&none), entropy, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519")) |_|
+    var kr: KexResult = .{};
+    if (curve25519Kex(&kr, &empty, &w, .single(&none), entropy, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519")) |_|
         return error.TestUnexpectedResult
     else |_| {}
     const kp = try X25519.KeyPair.generateDeterministic(@splat(0x5a));
@@ -3559,6 +3719,10 @@ const RecordingReject = struct {
     seen_host: []const u8 = "",
     seen_port: u16 = 0,
     seen_key_type: []const u8 = "",
+    /// `HostKeyInfo` slices are borrowed for the call only (`key_type` points
+    /// into the KEX body's packet buffer, which the dead-stack burn zeroes on
+    /// return) — kept by copy, as its doc comment tells every verifier to.
+    key_type_buf: [64]u8 = undefined,
     calls: usize = 0,
     reason: HostKeyRejection = .key_mismatch,
 
@@ -3567,7 +3731,9 @@ const RecordingReject = struct {
         self.calls += 1;
         self.seen_host = key.host;
         self.seen_port = key.port;
-        self.seen_key_type = key.key_type;
+        const n = @min(key.key_type.len, self.key_type_buf.len);
+        @memcpy(self.key_type_buf[0..n], key.key_type[0..n]);
+        self.seen_key_type = self.key_type_buf[0..n];
         return .{ .reject = self.reason };
     }
 
@@ -3627,7 +3793,9 @@ fn kexWith(key_type: []const u8, sig_algo: []const u8, negotiated: []const u8, p
     var out_scratch: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&out_scratch);
     var none: CipherState = .plaintext;
-    _ = try curve25519Kex(&r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", policy, negotiated);
+    var kr: KexResult = .{};
+    defer kr.zeroize();
+    try curve25519Kex(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", policy, negotiated);
 }
 
 /// The reply/negotiation pair used by the rejection tests. Both name an
@@ -3796,10 +3964,11 @@ test "dhGroupKex (client): rejects a KEXDH_REPLY carrying f == p or f == p-1" {
         var out_scratch: [8192]u8 = undefined;
         var w: std.Io.Writer = .fixed(&out_scratch);
         var none: CipherState = .plaintext;
+        var kr: KexResult = .{};
 
         try std.testing.expectError(
             error.KexFailed,
-            dhGroupKex(&r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, kex_name, "ssh-ed25519"),
+            dhGroupKex(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, kex_name, "ssh-ed25519"),
         );
     }
 }
@@ -3881,8 +4050,10 @@ test "KDF is deterministic and matches the RFC 4253 §7.2 formula for one block"
     const h = [_]u8{0x11} ** 32;
     const sid = [_]u8{0x22} ** 32;
 
-    const a = deriveKeys(ss, h, sid);
-    const b = deriveKeys(ss, h, sid);
+    var a: DerivedKeys = undefined;
+    var b: DerivedKeys = undefined;
+    deriveKeys(&a, &ss, &h, &sid);
+    deriveKeys(&b, &ss, &h, &sid);
     try t.expectEqualSlices(u8, &a.enc_key_client_to_server, &b.enc_key_client_to_server);
     // Different letters must produce different key material.
     try t.expect(!std.mem.eql(u8, &a.enc_key_client_to_server, &a.enc_key_server_to_client));
