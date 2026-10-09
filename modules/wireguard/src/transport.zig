@@ -654,6 +654,7 @@ pub const Session = struct {
     /// becomes both halves' `born_s` and is what `reject_after_time_s` /
     /// `rekey_after_time_s` are measured from.
     /// In place, keys by pointer (see `SendSession.init`).
+    // secret-api-ok: only forwards the key pointers to SendSession.init / RecvSession.init, which memcpy into self; no computation, no frame of its own holds a key copy
     pub fn init(self: *Session, keys: *const TransportKeys, local_index: u32, remote_index: u32, now_s: u64) void {
         self.send.init(&keys.send, remote_index, now_s);
         self.recv.init(&keys.recv, local_index, now_s);
@@ -661,6 +662,7 @@ pub const Session = struct {
 
     /// Whether the session has passed `reject_after_time_s` (both halves share
     /// one `born_s`, so this is one question, not two).
+    // secret-api-ok: reads born_s only (a public timestamp); the key is never touched
     pub fn expired(self: *const Session, now_s: u64) bool {
         return self.send.expired(now_s);
     }

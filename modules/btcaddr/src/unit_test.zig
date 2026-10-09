@@ -160,13 +160,15 @@ test "toScriptPubKey: typed rejection reasons" {
 test "WIF: typed rejection reasons and well-known key 1" {
     var one = [_]u8{0} ** 32;
     one[31] = 1;
+    var wscratch: btcaddr.Wif = undefined;
     var out: [btcaddr.max_wif_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &out);
     try testing.expectEqualStrings("5HpHagT65TZzG1PH3CSu63k8DbpvD8s5ip4nEB3kEsreAnchuDf", try btcaddr.wifEncode(&one, false, .mainnet, &out));
     try testing.expectEqualStrings("KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn", try btcaddr.wifEncode(&one, true, .mainnet, &out));
     try testing.expectEqualStrings("cMahea7zqjxrtgAbB7LSGbcQUr1uX1ojuat9jZodMN87JcbXMTcA", try btcaddr.wifEncode(&one, true, .signet, &out));
 
-    var w = try btcaddr.wifDecode("KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn");
+    var w: btcaddr.Wif = undefined;
+    try btcaddr.wifDecode(&w, "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn");
     try testing.expect(w.compressed and w.chains.unique() == .mainnet);
     try testing.expectEqualSlices(u8, &one, &w.key);
     w.wipe();
@@ -178,33 +180,34 @@ test "WIF: typed rejection reasons and well-known key 1" {
     payload[0] = 0x80;
     payload[1..33].* = one;
     payload[33] = 0x02;
-    try testing.expectError(error.InvalidCompressionFlag, btcaddr.wifDecode(try bech32.base58.checkEncode(payload[0..34], &buf)));
+    try testing.expectError(error.InvalidCompressionFlag, btcaddr.wifDecode(&wscratch, try bech32.base58.checkEncode(payload[0..34], &buf)));
     // lengths
-    try testing.expectError(error.InvalidPayloadLength, btcaddr.wifDecode(try bech32.base58.checkEncode(payload[0..32], &buf)));
+    try testing.expectError(error.InvalidPayloadLength, btcaddr.wifDecode(&wscratch, try bech32.base58.checkEncode(payload[0..32], &buf)));
     payload[33] = 0x01;
     payload[34] = 0x01;
-    try testing.expectError(error.InvalidPayloadLength, btcaddr.wifDecode(try bech32.base58.checkEncode(payload[0..35], &buf)));
+    try testing.expectError(error.InvalidPayloadLength, btcaddr.wifDecode(&wscratch, try bech32.base58.checkEncode(payload[0..35], &buf)));
     // version byte
     payload[0] = 0x81;
-    try testing.expectError(error.UnknownVersionByte, btcaddr.wifDecode(try bech32.base58.checkEncode(payload[0..33], &buf)));
+    try testing.expectError(error.UnknownVersionByte, btcaddr.wifDecode(&wscratch, try bech32.base58.checkEncode(payload[0..33], &buf)));
     // scalar out of range: zero, n, n-1 is fine
     payload[0] = 0x80;
     @memset(payload[1..33], 0);
-    try testing.expectError(error.InvalidKey, btcaddr.wifDecode(try bech32.base58.checkEncode(payload[0..33], &buf)));
+    try testing.expectError(error.InvalidKey, btcaddr.wifDecode(&wscratch, try bech32.base58.checkEncode(payload[0..33], &buf)));
     const n = hex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
     payload[1..33].* = n.*;
-    try testing.expectError(error.InvalidKey, btcaddr.wifDecode(try bech32.base58.checkEncode(payload[0..33], &buf)));
+    try testing.expectError(error.InvalidKey, btcaddr.wifDecode(&wscratch, try bech32.base58.checkEncode(payload[0..33], &buf)));
     var nm1 = n.*;
     nm1[31] -= 1;
     payload[1..33].* = nm1;
-    var ok = try btcaddr.wifDecode(try bech32.base58.checkEncode(payload[0..33], &buf));
+    var ok: btcaddr.Wif = undefined;
+    try btcaddr.wifDecode(&ok, try bech32.base58.checkEncode(payload[0..33], &buf));
     ok.wipe();
     try testing.expectError(error.InvalidKey, btcaddr.wifEncode(n, true, .mainnet, &out));
     try testing.expectError(error.InvalidKey, btcaddr.wifEncode(&([_]u8{0} ** 32), true, .mainnet, &out));
     // checksum
-    try testing.expectError(error.ChecksumMismatch, btcaddr.wifDecode("KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWm"));
+    try testing.expectError(error.ChecksumMismatch, btcaddr.wifDecode(&wscratch, "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWm"));
     // an address is not a WIF key
-    try testing.expectError(error.InvalidPayloadLength, btcaddr.wifDecode("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"));
+    try testing.expectError(error.InvalidPayloadLength, btcaddr.wifDecode(&wscratch, "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"));
     // buffer too small is reported, not truncated
     var tiny: [10]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, btcaddr.wifEncode(&one, true, .mainnet, &tiny));
@@ -302,8 +305,8 @@ fn fuzzDecode(_: void, smith: *testing.Smith) !void {
         try testing.expect(std.ascii.eqlIgnoreCase(back.slice(), s));
     } else |_| {}
 
-    if (btcaddr.wifDecode(s)) |w_const| {
-        var w = w_const;
+    var w: btcaddr.Wif = undefined;
+    if (btcaddr.wifDecode(&w, s)) |_| {
         defer w.wipe();
         const net: btcaddr.Network = if (w.chains.contains(.mainnet)) .mainnet else .testnet;
         var out: [btcaddr.max_wif_len]u8 = undefined;

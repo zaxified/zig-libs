@@ -209,9 +209,9 @@ chachapoly	ReleaseSafe	aead	1	>=1	dac354fbbc6ad8a9	870a36cbebbc4588
 # `crypto.timing_safe.eql` two lines above it. Branching on the answer is the
 # API; the comparison that produced it is the constant-time one. It is here and
 # not in the other two because only `unprotect` verifies a tag.
-oscore	ReleaseFast	derive	1	0	1beaf7473a4e8c9e	2f7c17dad79da56d
-oscore	ReleaseFast	protect	1	0	1beaf7473a4e8c9e	6eac6a90e3479ab8
-oscore	ReleaseFast	unprotect	1	1	1beaf7473a4e8c9e	ed85db89e3d7e9fd
+oscore	ReleaseFast	derive	1	0	c7415c327c50437c	2f7c17dad79da56d
+oscore	ReleaseFast	protect	1	0	c7415c327c50437c	6eac6a90e3479ab8
+oscore	ReleaseFast	unprotect	1	1	c7415c327c50437c	ed85db89e3d7e9fd
 # ssh dh / ffpow (2026-10-02). `dh`: the MODP DH secret x through
 # dhPowModPrime (montint powMont) in group14 and group16 — 0 contexts in
 # montint; the 4 in-file are stripLeadingZeros on e (public) and on K, twice:
@@ -219,7 +219,7 @@ oscore	ReleaseFast	unprotect	1	1	1beaf7473a4e8c9e	ed85db89e3d7e9fd
 # reaches the exchange hash whatever the code does. `ffpow`: POSITIVE CONTROL,
 # the same K through the std.crypto.ff pow dhPowModPrime used until this date
 # — its window select compiles to a jump in ReleaseFast. It must stay >= 1.
-ssh	ReleaseFast	dh	1	4	b9edbd11e3c203fb	95639ff37028e502
+ssh	ReleaseFast	dh	1	4	67ed6f4b48d28a55	95639ff37028e502
 ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # ct25519 — columns below are `total_min in_file`, NOT "in_file total_min".
 # Row 1's `1 0` is `total_min=1, in_file=0`: ct25519's OWN code has zero
@@ -1010,9 +1010,9 @@ bip32	ReleaseFast	mnemonic	1	3	a5dbfbf5eee08b66	d42db8cf9cdc2200
 # Source pin moved 2026-10-02 (d30dce13: `x86_asm` also off for the self-hosted
 # backend on a baseline CPU; the ReleaseFast/LLVM build is unchanged): --stacks
 # reads the same one line, root.zig:793 (NiKey.open) and :266 (Generic.open).
-aesgcm	ReleaseFast	ctx	1	4	66b62fa834f10d71	beb9b7dd29864dad
-aesgcm	ReleaseFast	stateless	1	4	66b62fa834f10d71	beb9b7dd29864dad
-aesgcm	ReleaseFast	generic	1	4	66b62fa834f10d71	beb9b7dd29864dad
+aesgcm	ReleaseFast	ctx	1	4	5b4932c6229ec5ef	beb9b7dd29864dad
+aesgcm	ReleaseFast	stateless	1	4	5b4932c6229ec5ef	beb9b7dd29864dad
+aesgcm	ReleaseFast	generic	1	4	5b4932c6229ec5ef	beb9b7dd29864dad
 # groth16 (2026-10-09): the zkey prover's `.constant_time` MSM choice
 # (`zkprove.proveWith`). zkprove_ct pins 6 in-file, all at the public end:
 # `toAffine` on the three proof points (zkprove.zig, the return) -- the identity

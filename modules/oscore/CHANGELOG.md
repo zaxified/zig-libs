@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack sweep, part 2. `protect` and `unprotect` now run under a 4 KiB
+  per-message burn (`burn.msg_burn`); new `deriveContextInto(out, …)` writes the context into
+  the caller's slot (zeroed on error) so the keys never pass through a result temporary
+  (`deriveContext` stays as the by-value constructor, marked `secret-api-ok`). No signature
+  changed. Probed by `stackprobe2_test.zig`.
 - **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). `deriveKey` and `deriveContext` now
   run under a shared 8 KiB burn (`src/burn.zig`); `deriveContext`'s private `scrubStackBelow` is
   gone (same depth, now the module-standard `burn.run`, and probed by `stackprobe_test.zig`). No

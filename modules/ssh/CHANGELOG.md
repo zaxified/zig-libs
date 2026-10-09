@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — New `transport.connectInto(out, reader, writer, gpa, policy)`: `connect` building the `Transport` in the caller's slot instead of returning it by value, so the session keys never pass through a result temporary (`out` is `deinit`-ed on error). `connect` stays as the by-value convenience; `Transport.init` and `connect` carry `secret-api-ok:` markers (no key exists at `init`; `connect` has the `Into` twin). Probed in `stackprobe2_test.zig` (client handshake against a peer-thread server over a socketpair). No signature change.
 - **2026-10-09** — Dead-stack burn: `userauth.PasswordCheck.check` (the server's password hook, with the peer's plaintext password) runs under `burn.run` (16 KiB, per attempt), so the hook's own frames are zeroed too; new `stackprobe2_test.zig` on `testkit.stackprobe`. The other `check-secret-api` findings (channel layer, `accept`, `verifySignature`, `buildKexInit`, `signedBlob`, `authenticatePublickey`, `AuthorizedKeyCheck.check`) carry `secret-api-ok:` markers: none touches key material itself. No signature change.
 
 - **2026-10-09** — **BREAKING, HIGH: the key exchange left its secrets on the dead stack.**

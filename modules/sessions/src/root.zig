@@ -924,6 +924,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 
 test {
     _ = csrf;
+    _ = @import("stackprobe_test.zig");
 }
 
 const testing = std.testing;

@@ -60,7 +60,8 @@ test "Core key_io_valid: address rows, both directions, right chain" {
         }
 
         // a WIF decoder must not accept an address
-        if (btcaddr.wifDecode(row.string)) |_| return error.TestUnexpectedResult else |_| {}
+        var wd: btcaddr.Wif = undefined;
+        if (btcaddr.wifDecode(&wd, row.string)) |_| return error.TestUnexpectedResult else |_| {}
     }
     try testing.expect(n_addr > 40);
 }
@@ -74,7 +75,8 @@ test "Core key_io_valid: WIF rows, both directions, compressed flag" {
         var key: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(&key, row.hex);
 
-        var w = try btcaddr.wifDecode(row.string);
+        var w: btcaddr.Wif = undefined;
+        try btcaddr.wifDecode(&w, row.string);
         defer w.wipe();
         try testing.expectEqualSlices(u8, &key, &w.key);
         try testing.expectEqual(row.is_compressed, w.compressed);
@@ -99,7 +101,8 @@ test "Core key_io_invalid: rejected as address and as WIF" {
             std.debug.print("accepted as address: {s}\n", .{s});
             return error.TestUnexpectedResult;
         } else |_| {}
-        if (btcaddr.wifDecode(s)) |_| {
+        var wd: btcaddr.Wif = undefined;
+        if (btcaddr.wifDecode(&wd, s)) |_| {
             std.debug.print("accepted as WIF: {s}\n", .{s});
             return error.TestUnexpectedResult;
         } else |_| {}

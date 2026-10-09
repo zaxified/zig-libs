@@ -32,6 +32,7 @@ const std = @import("std");
 const router = @import("router");
 const http = @import("http");
 const cookies = @import("cookies");
+const burn = @import("burn.zig");
 
 /// The MAC primitive: HMAC-SHA256.
 pub const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -74,6 +75,10 @@ pub const Csrf = struct {
 
     /// Write the hex token for `session_id` into `out`, returning the slice.
     pub fn token(c: *const Csrf, session_id: []const u8, out: *[token_hex_len]u8) []const u8 {
+        return burn.run(burn.csrf_burn, []const u8, tokenBody, .{ c, session_id, out });
+    }
+
+    fn tokenBody(c: *const Csrf, session_id: []const u8, out: *[token_hex_len]u8) []const u8 {
         var mac: [mac_length]u8 = undefined;
         Hmac.create(&mac, session_id, &c.key);
         out.* = std.fmt.bytesToHex(mac, .lower);
@@ -84,6 +89,10 @@ pub const Csrf = struct {
     /// to raw MACs and compares with `std.crypto.timing_safe.eql` — never
     /// `std.mem.eql`. A wrong length or non-hex token is rejected (false).
     pub fn verify(c: *const Csrf, session_id: []const u8, presented_tok: []const u8) bool {
+        return burn.run(burn.csrf_burn, bool, verifyBody, .{ c, session_id, presented_tok });
+    }
+
+    fn verifyBody(c: *const Csrf, session_id: []const u8, presented_tok: []const u8) bool {
         if (presented_tok.len != token_hex_len) return false;
         var got: [mac_length]u8 = undefined;
         _ = std.fmt.hexToBytes(&got, presented_tok) catch return false;

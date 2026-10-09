@@ -97,6 +97,7 @@ Base58Check's 32-bit checksum detects typos only; nothing here authenticates an 
 buffers (`bech32.base58` wipes them), the WIF payload scratch in `wifEncode` and the decode
 scratch in `wifDecode` are wiped with `std.crypto.secureZero` on every exit (CONVENTIONS §2.1;
 the compiler may still keep copies in registers or spill slots — the caveat of §2.1 applies).
+`wifDecode(out, s)` writes the key only into the caller's `*Wif` (never returned by value; `out.key` zeroed on error) and runs under a dead-stack burn, like `wifEncode`.
 What is left to the caller: `Wif.key` (`Wif.wipe()`) and the `out` buffer given to `wifEncode`.
 `base58` is **not constant-time** in the secret (it inherits `bech32.base58`'s documented limit,
 `alphabet[d]` indexed by payload digits); this module makes no constant-time claim. The address

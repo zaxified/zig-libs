@@ -546,6 +546,7 @@ PRG was kept.
 
 ## Backlog / deferred
 
+- **Dead stack: `alpha`/`beta` by value** *(2026-10-09, dead-stack sweep)*: the secret point and value enter `genWithSeeds` as plain integers, so `burn.run`'s argument tuple keeps a copy in the entry frame above the burn (8 + up to 8·L bytes). Seeds/keys are already by pointer and burned. A `*const` form is cheap but changes every call; deferred until a consumer cares.
 - **Distributed comparison function (DCF) and interval functions** *(survey 2026-09-30)*: the module doc names `dcf.zig` as the reason it is called `fss` and not `dpf`. Google's tree has `dcf/`, libfss offers comparison; private analytics (thresholds, histograms), secure ReLU/comparison in MPC ML, and range queries need it. Medium (BCGIKRS21, one bit of extra state per level, reuses `prg` and `group`); fits §2.
 - **Incremental / hierarchical DPF (IDPF)** *(survey 2026-09-30)*: the headline feature of the reference library; private heavy hitters (Poplar, the VDAF `Poplar1` in DAP) is the main deployed use of DPFs. `evalFull` already walks prefixes internally but there is no per-level output/CW. Medium; fits §2.
 - **Non-`Z_{2^{8L}}` output groups** (`XOR`, `Z_N`, tuples/vectors of elements) *(survey 2026-09-30, inferred from Google's API)*: only the additive `Z_{2^{8L}}` group exists (`group.zig`); PIR-by-XOR and VDAF-style field elements need others. Small-medium; fits §2.

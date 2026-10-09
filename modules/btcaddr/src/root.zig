@@ -415,8 +415,15 @@ pub const WifDecodeError = base58.CheckError || error{
     InvalidKey,
 };
 
-/// Decodes a WIF string. Fail-closed; scratch is wiped on every exit.
-pub fn wifDecode(s: []const u8) WifDecodeError!Wif {
+/// Decodes a WIF string into `out`. Fail-closed (`out.key` is zeroed on error);
+/// scratch is wiped on every exit. The key is written only to `out`, never
+/// returned by value.
+pub fn wifDecode(out: *Wif, s: []const u8) WifDecodeError!void {
+    return burn.run(burn.wif_decode_burn, WifDecodeError!void, wifDecodeBody, .{ out, s });
+}
+
+fn wifDecodeBody(out: *Wif, s: []const u8) WifDecodeError!void {
+    errdefer std.crypto.secureZero(u8, &out.key);
     var buf: [34]u8 = undefined;
     defer std.crypto.secureZero(u8, &buf);
     const payload = base58.checkDecode(s, &buf) catch |e| return switch (e) {
@@ -431,7 +438,9 @@ pub fn wifDecode(s: []const u8) WifDecodeError!Wif {
     };
     if (payload.len == 34 and payload[33] != 0x01) return error.InvalidCompressionFlag;
     if (!keyInRange(payload[1..33])) return error.InvalidKey;
-    return .{ .chains = chains, .key = payload[1..33].*, .compressed = payload.len == 34 };
+    out.chains = chains;
+    out.key = payload[1..33].*;
+    out.compressed = payload.len == 34;
 }
 
 pub const WifEncodeError = base58.Error || error{InvalidKey};

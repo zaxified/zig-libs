@@ -132,19 +132,21 @@ pub fn StekRing(comptime depth: usize) type {
         }
 
         /// The current encrypt-with key, or `null` if `rotate` was never
-        /// called.
-        pub fn activeKey(self: *const Self) ?Stek {
-            return self.keys[self.active];
+        /// called. A pointer into the ring (BREAKING 2026-10-09): by value the
+        /// key was copied into the caller's frame on every seal; valid until
+        /// the next `rotate`.
+        pub fn activeKey(self: *const Self) ?*const Stek {
+            return if (self.keys[self.active]) |*k| k else null;
         }
 
         /// Look up a still-live key by the id stamped in a ticket blob.
         /// `null` means the key has rotated out (or never existed) — the
         /// caller should treat the ticket as unusable and fall back to a
         /// full (non-resumed) handshake, not an error condition.
-        pub fn findKey(self: *const Self, id: u8) ?Stek {
-            for (self.keys) |maybe| {
-                const k = maybe orelse continue;
-                if (k.id == id) return k;
+        /// A pointer into the ring, like `activeKey` (BREAKING 2026-10-09).
+        pub fn findKey(self: *const Self, id: u8) ?*const Stek {
+            for (&self.keys) |*maybe| {
+                if (maybe.*) |*k| if (k.id == id) return k;
             }
             return null;
         }

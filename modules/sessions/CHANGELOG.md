@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — Dead-stack burn: `Csrf.token` and `Csrf.verify` (HMAC-SHA256 under the CSRF key) run their bodies under a 4 KiB per-message `burn.run` (new `src/burn.zig`); new `stackprobe_test.zig` on `testkit.stackprobe`. No signature change.
 - **2026-10-04** — Tests: mutation schemata run (48 mutants, 45 killed, 2 equivalent, 1
   alive by design — see SPEC § Verification). Ten new tests: timeouts at their exact
   limits and the rolling `last_seen` refresh, `setData` at `max_session_bytes`, an

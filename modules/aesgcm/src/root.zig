@@ -98,6 +98,14 @@ fn AesGcm(comptime key_bits: u16) type {
         /// It holds secrets. Call `wipe` when the key is retired — nothing
         /// else clears it (`CONVENTIONS.md` §2.1: the module cannot know when
         /// the caller is done with it).
+        ///
+        /// Dead stack (`CONVENTIONS.md` §2.1.1): `init*` burn (key expansion),
+        /// the per-message `Context.encrypt`/`decrypt` deliberately do NOT — a
+        /// keyed transform's working state is §2.1's Z3, and the burn belongs
+        /// to the protocol entry point that owns the key and the message
+        /// (dtls/quic-crypto `protect`, oscore, hpke, aeadframe), which runs
+        /// this call inside its own burn. Burning here too would pay twice per
+        /// record (decision 2026-10-09).
         pub const Context = struct {
             impl: union(Backend) {
                 generic: Generic,

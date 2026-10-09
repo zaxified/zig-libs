@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** documented why `Context.encrypt`/`decrypt` carry
+  no dead-stack burn (keyed-transform state, §2.1 Z3; the owning protocol entry point burns).
 - **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). `Context.init`/`initWith`,
   `AesGcm.init`/`initWith` and the stateless `encrypt`/`decrypt` now run under a 4 KiB per-message
   burn (`src/burn.zig`). Their `key: [N]u8` by-value surface is kept (std shape) with new pointer

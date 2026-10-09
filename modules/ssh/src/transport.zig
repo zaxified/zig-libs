@@ -2330,6 +2330,7 @@ pub const Transport = struct {
     /// (`std.Io.net.Stream.Reader.err` / `std.Io.File.Reader.err`); a caller
     /// that needs to tell a cancel from a dead connection inspects the reader
     /// it built and passed in here, not anything `TransportError` returns.
+    // secret-api-ok: returns a fresh Transport with plaintext ciphers; no key or session secret exists before a handshake installs them
     pub fn init(reader: *std.Io.Reader, writer: *std.Io.Writer) Transport {
         return .{ .reader = reader, .writer = writer };
     }
@@ -2834,6 +2835,7 @@ fn clientKexRoundBody(
 ///         error.HostKeyVerificationFailed => return report(failure),
 ///         else => return err,
 ///     };
+// secret-api-ok: documented by-value convenience; `connectInto` is the out-param twin (the session keys then never pass through a result temporary)
 pub fn connect(
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
@@ -2843,6 +2845,21 @@ pub fn connect(
     var t = Transport.init(reader, writer);
     try t.clientHandshake(gpa, policy);
     return t;
+}
+
+/// `connect`, building the transport in `out` instead of returning it by value:
+/// the session keys then exist only in the caller's slot. On error `out` is
+/// cleaned up (`deinit`: ciphers zeroed, buffered packets freed).
+pub fn connectInto(
+    out: *Transport,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    gpa: std.mem.Allocator,
+    policy: HostKeyPolicy,
+) TransportError!void {
+    out.* = Transport.init(reader, writer);
+    errdefer out.deinit();
+    try out.clientHandshake(gpa, policy);
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────

@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** `StekRing.activeKey()` and `findKey(id)` return `?*const Stek` (a
+  pointer into the ring, valid until the next `rotate`) instead of a copy: every call copied the STEK —
+  the ticket-encryption key — into the caller's frame. `ring.activeKey().?.key` and `== null` read as
+  before.
 - **2026-10-09** — **BREAKING (dead-stack rule, CONVENTIONS §2.1.1):** secrets in by `*const`, secret results
   out through an `out` pointer (first parameter after the comptime types), every entry point's body under a
   burn (new `src/burn.zig`). `psk.derivePsk(Hkdf, len, out, rms, nonce)`, `psk.earlySecret(Hkdf, out, psk)`,

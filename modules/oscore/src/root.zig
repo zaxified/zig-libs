@@ -944,6 +944,7 @@ pub const DeriveContextError = std.mem.Allocator.Error;
 ///
 /// Byte-exact target: the SAME Appendix C.1-C.3 vectors as `deriveKey`,
 /// but exercised through this composed entry point.
+// secret-api-ok: the documented by-value constructor (the caller owns the result); `deriveContextInto` is the out-param twin
 pub fn deriveContext(
     allocator: std.mem.Allocator,
     master_secret: []const u8,
@@ -954,6 +955,43 @@ pub fn deriveContext(
     algorithm: Algorithm,
 ) DeriveContextError!SecurityContext {
     return burn.run(burn.derive_burn, DeriveContextError!SecurityContext, deriveContextBody, .{ allocator, master_secret, master_salt, id_context, sender_id, recipient_id, algorithm });
+}
+
+/// `deriveContext`, writing the context into `out` instead of returning it by
+/// value: the keys then exist only in the caller's slot, never in a result
+/// temporary. `out` is zeroed on error.
+pub fn deriveContextInto(
+    out: *SecurityContext,
+    allocator: std.mem.Allocator,
+    master_secret: []const u8,
+    master_salt: []const u8,
+    id_context: ?[]const u8,
+    sender_id: []const u8,
+    recipient_id: []const u8,
+    algorithm: Algorithm,
+) DeriveContextError!void {
+    return burn.run(burn.derive_burn, DeriveContextError!void, deriveContextIntoBody, .{ out, allocator, master_secret, master_salt, id_context, sender_id, recipient_id, algorithm });
+}
+
+fn deriveContextIntoBody(
+    out: *SecurityContext,
+    allocator: std.mem.Allocator,
+    master_secret: []const u8,
+    master_salt: []const u8,
+    id_context: ?[]const u8,
+    sender_id: []const u8,
+    recipient_id: []const u8,
+    algorithm: Algorithm,
+) DeriveContextError!void {
+    errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+    out.* = .{
+        .common = .{ .algorithm = algorithm, .common_iv = undefined },
+        .sender = .{ .id = sender_id, .key = undefined },
+        .recipient = .{ .id = recipient_id, .key = undefined },
+    };
+    try deriveKeyBody(allocator, master_secret, master_salt, sender_id, id_context, algorithm, .key, &out.sender.key);
+    try deriveKeyBody(allocator, master_secret, master_salt, recipient_id, id_context, algorithm, .key, &out.recipient.key);
+    try deriveKeyBody(allocator, master_secret, master_salt, &.{}, id_context, algorithm, .iv, &out.common.common_iv);
 }
 
 fn deriveContextBody(
@@ -1165,6 +1203,17 @@ pub fn protect(
     include_kid: bool,
     kid_context: ?[]const u8,
 ) ProtectError!Protected {
+    return burn.run(burn.msg_burn, ProtectError!Protected, protectBody, .{ allocator, ctx, plaintext, aad, include_kid, kid_context });
+}
+
+fn protectBody(
+    allocator: std.mem.Allocator,
+    ctx: *SecurityContext,
+    plaintext: []const u8,
+    aad: AadParams,
+    include_kid: bool,
+    kid_context: ?[]const u8,
+) ProtectError!Protected {
     if (plaintext.len > max_plaintext_len) return error.MessageTooLong;
 
     const piv = ctx.sender.sequence_number;
@@ -1291,6 +1340,18 @@ pub fn unprotect(
     request_nonce_source: ?NonceSource,
     is_request: bool,
 ) UnprotectError![]u8 {
+    return burn.run(burn.msg_burn, UnprotectError![]u8, unprotectBody, .{ allocator, ctx, option, ciphertext, aad, request_nonce_source, is_request });
+}
+
+fn unprotectBody(
+    allocator: std.mem.Allocator,
+    ctx: *SecurityContext,
+    option: OscoreOption,
+    ciphertext: []const u8,
+    aad: AadParams,
+    request_nonce_source: ?NonceSource,
+    is_request: bool,
+) UnprotectError![]u8 {
     // Step 0: the AEAD's own length ceiling, before anything else is
     // touched — a rejected message must not even reach the replay check.
     if (ciphertext.len > max_ciphertext_len) return error.MessageTooLong;
@@ -1353,6 +1414,7 @@ pub fn unprotect(
 // here too.
 test {
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
 }

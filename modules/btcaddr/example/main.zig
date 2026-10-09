@@ -54,7 +54,8 @@ pub fn main() !void {
 
     // ── key import: WIF -> 32-byte key, compressed flag, and back ──
     const wif = "L5nJeqKmpHp4P7F8ZYyjwc5a7P4d8EabuGAzfGJk7yC1BJyzNaEd";
-    var key = try btcaddr.wifDecode(wif);
+    var key: btcaddr.Wif = undefined;
+    try btcaddr.wifDecode(&key, wif);
     defer key.wipe();
     var want_key: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&want_key, "ff778740f88ddcf102aeb81daee289c044c4a4571c4b6f287400f4b8e0b843f8");

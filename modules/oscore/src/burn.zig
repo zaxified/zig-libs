@@ -37,3 +37,8 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 /// context (not per message). Replaces the former 8 KiB `scrubStackBelow`
 /// (measured in Debug); the coordinator measures the real ReleaseFast depth.
 pub const derive_burn = 8 * 1024;
+
+/// `protect` / `unprotect`: per-message AEAD (AES-CCM) under the context's key,
+/// so a TIGHT burn on the data path (like dtls `Protection.protect`, 4 KiB per
+/// record); the coordinator measures the real ReleaseFast depth.
+pub const msg_burn = 4 * 1024;

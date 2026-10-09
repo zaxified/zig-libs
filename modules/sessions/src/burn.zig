@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT
 
-//! Dead-stack burn for `wifEncode` (the private key goes through the payload
-//! buffer, the double SHA-256 checksum and the base58 big-number division). The
-//! public entry point runs its body one frame down (`run`, a `never_inline`
-//! call), then zeroes the bytes that body dirtied at that depth. The body is a
-//! separate frame on purpose: inlined into the entry point, the burn would land
-//! above the body's locals. `stackprobe_test.zig` goes red when the body
-//! outgrows its burn. Copied from `webhooksig/src/burn.zig` (`stack` and `run`
-//! identical in every module).
+//! Dead-stack burn for the CSRF entry points (`Csrf.token`, `Csrf.verify`: an
+//! HMAC-SHA256 under the CSRF key, on every guarded request). Each runs its
+//! body one frame down (`run`, a `never_inline` call), then zeroes the bytes
+//! that body dirtied at that depth. The body is a separate frame on purpose:
+//! inlined into the entry point, the burn would land above the body's locals.
+//! `stackprobe_test.zig` goes red when a body outgrows its burn. Copied from
+//! `webhooksig/src/burn.zig` (`stack` and `run` identical in every module).
 
 /// Zero `n` bytes of stack below the caller.
 pub noinline fn stack(comptime n: usize) void {
@@ -34,10 +33,6 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
     return r;
 }
 
-/// `wifEncode`: one-shot key export, so generous (8 KiB until measured in
-/// ReleaseFast).
-pub const wif_burn = 8 * 1024;
-
-/// `wifDecode`: one-shot key import (base58 division of the secret string, scratch
-/// payload), so generous (8 KiB until measured in ReleaseFast).
-pub const wif_decode_burn = 8 * 1024;
+/// `Csrf.token` / `Csrf.verify`: one HMAC-SHA256 per call, on the request path
+/// (per-message), so TIGHT -- 4 KiB until measured in ReleaseFast.
+pub const csrf_burn = 4 * 1024;

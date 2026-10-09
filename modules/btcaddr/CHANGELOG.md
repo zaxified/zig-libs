@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **BREAKING:** `wifDecode(s)` returning `Wif` by value is now `wifDecode(out: *Wif, s) WifDecodeError!void`: the private key is written only into the caller's slot (`out.key` zeroed on error), never returned, and the body runs under an 8 KiB `burn.run`. Migrate `var w = try wifDecode(s)` to `var w: Wif = undefined; try wifDecode(&w, s)`. No caller outside this module's tests and `example/main.zig`. Probed in `stackprobe_test.zig`.
 - **2026-10-09** — Dead-stack burn: `wifEncode` (private key, payload, checksum, base58 division) runs its body under `burn.run` (8 KiB, one-shot); new `stackprobe_test.zig` on `testkit.stackprobe`. No signature change.
 
 - **2026-10-03** — **NO CONSUMER-VISIBLE CHANGE:** first audit (review + mutation run, 53

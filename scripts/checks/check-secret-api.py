@@ -327,11 +327,12 @@ def secret_name(pname, crypto):
 
 
 SECRET_FIELDS = {}  # derived type -> the fields that make it secret
+ALL_INDIRECT = set()  # module containers whose every field is a slice/pointer
 DERIVED = set()  # secret held inline
 DERIVED_REF = set()  # secret referenced (slice/pointer/list)
 
 
-def derive_secret_types(files):
+def derive_secret_types(files, crypto=False):
     """Containers holding a secret field are secret types themselves (fixpoint).
 
     Fields count by their TYPE or by an explicit secret NAME (`secret*`,
@@ -345,6 +346,13 @@ def derive_secret_types(files):
     for fi in files.values():
         for st, en, name in fi.containers:
             conts.append((name, fi.fields(st, en)))
+    # A type NAMED like a secret whose fields are all slices/pointers
+    # (mls `GroupSecrets`: three slices into caller memory) copies only
+    # pointers when passed by value: it touches a secret, it is not one.
+    ALL_INDIRECT.clear()
+    for name, flds in conts:
+        if flds and all(re.match(r"^\?*\s*(\*|\[\]|\[\*)", t) for _, t in flds):
+            ALL_INDIRECT.add(name)
     inline, ref = set(), set()
     SECRET_FIELDS.clear()
     grew = True
@@ -358,7 +366,7 @@ def derive_secret_types(files):
                 tns = set(re.findall(r"\b([A-Z]\w*)\b", ftype))
                 by_type_inline = any((SECRET_TYPE.match(t) and not NOT_SECRET_TYPE.match(t)) or t in inline for t in tns)
                 by_type_ref = any(t in ref for t in tns)
-                by_name = bool(SECRET_NAME.match(fname)) and not NOT_SECRET_NAME.search(fname) and "u8" in ftype
+                by_name = (bool(SECRET_NAME.match(fname)) or (crypto and fname in ("key", "keys"))) and not NOT_SECRET_NAME.search(fname) and "u8" in ftype
                 if by_type_inline or by_type_ref or by_name:
                     SECRET_FIELDS.setdefault(name, set()).add(fname)
                 if (by_type_inline or by_name) and not indirect and name not in inline:
@@ -368,6 +376,28 @@ def derive_secret_types(files):
                 elif (by_type_inline or by_type_ref or by_name) and name not in ref:
                     ref.add(name)
                     grew = True
+    # Aliases (`const Share = Dpf.Key;`, `pub const Seed = [16]u8;` excluded —
+    # only a NAMED type on the right): an alias of a secret type is one.
+    # Found by the C4 sweep: pir's `Share` slipped past by name (2026-10-09).
+    alias_re = re.compile(r"\bconst\s+([A-Z]\w*)\s*=\s*(?:[\w]+\.)*([A-Z]\w*)\s*;")
+    aliases = [(m.group(1), m.group(2)) for fi in files.values() for m in alias_re.finditer(fi.src)]
+    grew = True
+    while grew:
+        grew = False
+        for a, t in aliases:
+            if a == t:  # a re-export under the same name: same type
+                continue
+            secret_t = (SECRET_TYPE.match(t) and not NOT_SECRET_TYPE.match(t) and t not in ALL_INDIRECT) or t in inline
+            if secret_t and a not in inline and not NOT_SECRET_TYPE.match(a):
+                inline.add(a)
+                ref.add(a)
+                SECRET_FIELDS.pop(a, None)
+                grew = True
+            elif t in ref and a not in ref:
+                ref.add(a)
+                if t in SECRET_FIELDS:
+                    SECRET_FIELDS[a] = SECRET_FIELDS[t]
+                grew = True
     return inline, ref
 
 
@@ -380,6 +410,8 @@ def secret_param(pname, ptype, fi, pos, crypto=False):
         tn = resolve_self(None, fi, pos)
     else:
         tn = resolve_self(type_name(t), fi, pos) if type_name(t) in ("Self",) else type_name(t)
+    if tn and tn in ALL_INDIRECT and tn not in DERIVED and SECRET_TYPE.match(tn):
+        return "&" + tn
     if tn and ((SECRET_TYPE.match(tn) and not NOT_SECRET_TYPE.match(tn)) or tn in DERIVED):
         return tn
     if tn and tn in DERIVED_REF:
@@ -488,13 +520,14 @@ def burned_pub_names(module):
     if module not in BURNED_PUB:
         BURNED_PUB[module] = set()  # cycle guard
         # scan_module fills the per-module globals; the caller's must survive.
-        saved = (set(DERIVED), set(DERIVED_REF), dict(SECRET_FIELDS))
+        saved = (set(DERIVED), set(DERIVED_REF), dict(SECRET_FIELDS), set(ALL_INDIRECT))
         try:
             BURNED_PUB[module] = scan_module(module, want_burned=True)
         finally:
             DERIVED.clear(); DERIVED.update(saved[0])
             DERIVED_REF.clear(); DERIVED_REF.update(saved[1])
             SECRET_FIELDS.clear(); SECRET_FIELDS.update(saved[2])
+            ALL_INDIRECT.clear(); ALL_INDIRECT.update(saved[3])
     return BURNED_PUB[module]
 
 
@@ -525,7 +558,7 @@ def scan_module(module, want_burned=False):
     crypto = module in CRYPTO or any(STD_KEYED.search(fi.src) for fi in files.values())
     DERIVED.clear()
     DERIVED_REF.clear()
-    inl, ref = derive_secret_types(files)
+    inl, ref = derive_secret_types(files, crypto)
     DERIVED.update(inl)
     DERIVED_REF.update(ref - inl)
     whole, partial = public_surface(src_dir, files)

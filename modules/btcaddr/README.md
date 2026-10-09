@@ -36,7 +36,7 @@ and `0x00/0x05/0x80` -> mainnet; `bcrt` -> regtest; `tb` -> testnet+signet; othe
 all three), never a guess. Encoding takes a concrete `Network`.
 
 **WIF** (`wifEncode`/`wifDecode`): version `0x80` / `0xef`, optional `0x01` compression flag,
-key checked to be in `[1, n-1]`. The decoded `Wif` is secret: call `wipe()`; scratch buffers
+key checked to be in `[1, n-1]`. `wifDecode(&out_wif, s)` fills the caller's `Wif` (secret: call `wipe()`); scratch buffers
 inside the module are wiped on every exit.
 
 **Helpers:** `p2pkhOfPublicKey`, `p2wpkhOfPublicKey`, `p2shP2wpkhOfPublicKey`,
