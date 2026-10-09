@@ -243,6 +243,12 @@ test "zkprove: our proof is the one snarkjs accepted" {
     const js = try @import("snarkjs_export.zig").proofJson(testing.allocator, proof);
     defer testing.allocator.free(js);
     try testing.expectEqualStrings(std.mem.trimEnd(u8, @embedFile("testdata/snarkjs/ours_proof.json"), "\n"), js);
+
+    // The constant-time MSM gives the same proof, byte for byte.
+    const ct_proof = try zkprove.proveWith(testing.allocator, z, w, &.{ .r = field.frFromU64(11), .s = field.frFromU64(13) }, .{ .msm = .constant_time });
+    const ct_js = try @import("snarkjs_export.zig").proofJson(testing.allocator, ct_proof);
+    defer testing.allocator.free(ct_js);
+    try testing.expectEqualStrings(js, ct_js);
 }
 
 // ── phase 2 ─────────────────────────────────────────────────────────────────

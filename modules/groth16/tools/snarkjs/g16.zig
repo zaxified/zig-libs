@@ -3,6 +3,7 @@
 //! snarkjs oracle in `gen.sh` can drive them on circuits too big to commit:
 //!
 //!     g16 prove      <circuit.zkey> <witness.wtns> <proof.json> <public.json>
+//!     g16 prove-ct   (same arguments; the constant-time MSM)
 //!     g16 newzkey    <circuit.r1cs> <ceremony.ptau> <out.zkey>
 //!     g16 contribute <in.zkey> <out.zkey> <name>
 //!     g16 verify     <circuit.r1cs> <ceremony.ptau> <circuit.zkey>
@@ -22,7 +23,7 @@ const Fr = groth16.Fr;
 
 fn usage() noreturn {
     std.debug.print(
-        \\usage: g16 prove <zkey> <wtns> <proof.json> <public.json>
+        \\usage: g16 prove|prove-ct <zkey> <wtns> <proof.json> <public.json>
         \\       g16 newzkey <r1cs> <ptau> <out.zkey>
         \\       g16 contribute <in.zkey> <out.zkey> <name>
         \\       g16 verify <r1cs> <ptau> <zkey>
@@ -56,7 +57,8 @@ pub fn main(init: std.process.Init) !void {
     }
     const cwd = std.Io.Dir.cwd();
 
-    if (std.mem.eql(u8, cmd, "prove")) {
+    const ct = std.mem.eql(u8, cmd, "prove-ct");
+    if (ct or std.mem.eql(u8, cmd, "prove")) {
         if (n != 4) usage();
         var t = std.Io.Timestamp.now(io, .awake);
         const zbytes = try cwd.readFileAlloc(io, a[0], gpa, .limited(max_file));
@@ -72,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
         t = std.Io.Timestamp.now(io, .awake);
         var rand: groth16.Randomizers = .{ .r = Fr.random(io), .s = Fr.random(io) };
         defer std.crypto.secureZero(u8, std.mem.asBytes(&rand));
-        const proof = try groth16.zkprove.prove(gpa, z, w, &rand);
+        const proof = try groth16.zkprove.proveWith(gpa, z, w, &rand, .{ .msm = if (ct) .constant_time else .pippenger });
         std.debug.print("prove {d} ms\n", .{t.untilNow(io, .awake).toMilliseconds()});
         const pj = try groth16.snarkjs_export.proofJson(gpa, proof);
         defer gpa.free(pj);

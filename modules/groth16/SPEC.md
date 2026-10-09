@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-02 · mutation 2026-10-02 · src ?
 
-**Hardening:** fuzz ? · ct none
+**Hardening:** fuzz ? · ct 2026-10-09 (ctgrind)
 
 **Performance:** not measured
 
@@ -267,12 +267,21 @@ ReleaseFast the circuit was silently TRUNCATED to fit — the CRS then being bui
 from the truncated circuit, so the dropped constraints were absent from the
 statement the verifier checks, with nothing at any layer reporting it.
 
-**4. The zkey prover's MSM is variable-time in the witness.** `msm.pippengerG1`/
-`pippengerG2` pick buckets by scalar digits and branch on empty buckets — the
-trade snarkjs, rapidsnark, arkworks and gnark all make. A co-resident attacker
-who can time or cache-probe the prover learns about the witness. The toy
-`prove` still uses the constant-time naive MSM. `contribute`'s secret goes
-through `bn254`'s constant-time `scalarMul` only.
+**4. The zkey prover's default MSM is variable-time in the witness.**
+`msm.pippengerG1`/`pippengerG2` pick buckets by scalar digits and branch on
+empty buckets — the trade snarkjs, rapidsnark, arkworks and gnark all make. A
+co-resident attacker who can time or cache-probe the prover learns about the
+witness. Since 2026-10-09 `zkprove.proveWith(…, .{ .msm = .constant_time })`
+is the alternative: one constant-time `scalarMul` per term, same proof byte
+for byte (`snarkjs_files_test.zig`), measured by `src/ctgrind_harness.zig`
+with the private witness and `r`/`s` tainted — 6 in-file contexts, all
+`toAffine` on the three published proof points, none in the MSM, the NTTs or
+the A·w/B·w accumulation; the Pippenger row of the same harness (the positive
+control) reads 26. It costs ~21× the default: 34 s against 1.6 s at 10 000
+constraints, one core, ReleaseFast (`tools/snarkjs/g16 prove-ct`; snarkjs
+verified that proof). `zkprove.prove` stays Pippenger, the default every
+other prover has. The toy `prove` uses the constant-time naive MSM.
+`contribute`'s secret goes through `bn254`'s constant-time `scalarMul` only.
 
 **5. A `.zkey` is trusted by the prover; `phase2.verify` is how it earns that.**
 `zkey.parse` checks that every point is on its curve and every index is in

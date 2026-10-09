@@ -1013,3 +1013,14 @@ bip32	ReleaseFast	mnemonic	1	3	093d572ac3425d32	d42db8cf9cdc2200
 aesgcm	ReleaseFast	ctx	1	4	6ec74fb0c56bb12b	beb9b7dd29864dad
 aesgcm	ReleaseFast	stateless	1	4	6ec74fb0c56bb12b	beb9b7dd29864dad
 aesgcm	ReleaseFast	generic	1	4	6ec74fb0c56bb12b	beb9b7dd29864dad
+# groth16 (2026-10-09): the zkey prover's `.constant_time` MSM choice
+# (`zkprove.proveWith`). zkprove_ct pins 6 in-file, all at the public end:
+# `toAffine` on the three proof points (zkprove.zig, the return) -- the identity
+# test g1.zig/g2.zig and the zero check in `Fp.inv` (fp.zig, via fp2.zig for
+# pi_B) -- after every secret has been blinded by r/s. None in the MSM, the NTTs
+# or the A.w/B.w accumulation (--stacks). zkprove_vt is the positive control:
+# the default Pippenger MSM, variable-time in the witness by design (SPEC.md
+# § 5b item 4); 26 in-file when pinned, bound >=10 so a compiler change in
+# the bucket loop does not turn the control red for nothing.
+groth16	ReleaseFast	zkprove_ct	1	6	87979a224ece173b	928bc8e1cc116243
+groth16	ReleaseFast	zkprove_vt	1	>=10	87979a224ece173b	928bc8e1cc116243

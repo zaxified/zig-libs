@@ -226,6 +226,9 @@ declare -A TARGETS=(
     # ── rounds 5-7, 2026-09-09: the queue completes at 28 ──────────────────
     [spake2plus]="w0w1 computel proverstart verifierstart proverfinish verifierfinish"
     [bbs]="sign proofgen"
+    # `zkprove_vt` is the positive control: the default Pippenger MSM, variable-time
+    # in the witness by design (groth16 SPEC.md § 5b item 4).
+    [groth16]="zkprove_ct zkprove_vt"
     [coconut]="authority_sign user_issue user_show"
     [hpke]="x25519_decap x25519_authdecap p256_decap p256_authdecap p384_decap p384_authdecap open"
     [signal]="sign ratchet"
@@ -287,6 +290,7 @@ declare -A MODES=(
     [adaptor]="ReleaseFast"
     [spake2plus]="ReleaseFast"
     [bbs]="ReleaseFast"
+    [groth16]="ReleaseFast"
     [coconut]="ReleaseFast"
     [hpke]="ReleaseFast"
     [signal]="ReleaseFast"
@@ -464,6 +468,8 @@ declare -A PATTERN=(
     [spake2plus/verifierfinish]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|sha2[.]zig|hmac[.]zig|hkdf[.]zig|timing_safe[.]zig'
     [bbs/sign]='bbs[.]zig|ciphersuite[.]zig|keys[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [bbs/proofgen]='bbs[.]zig|ciphersuite[.]zig|keys[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
+    [groth16/zkprove_ct]='zkprove[.]zig|msm[.]zig|fft[.]zig|domain[.]zig|field[.]zig|burn[.]zig|fp[.]zig|fp2[.]zig|g1[.]zig|g2[.]zig|scalar[.]zig|montint[.]zig|limbs[.]zig'
+    [groth16/zkprove_vt]='zkprove[.]zig|msm[.]zig|fft[.]zig|domain[.]zig|field[.]zig|burn[.]zig|fp[.]zig|fp2[.]zig|g1[.]zig|g2[.]zig|scalar[.]zig|montint[.]zig|limbs[.]zig'
     [coconut/authority_sign]='credential[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [coconut/user_issue]='params[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [coconut/user_show]='credential[.]zig|g1[.]zig|g2[.]zig|fp[.]zig|fp2[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
@@ -653,6 +659,8 @@ declare -A LABEL=(
     [spake2plus/verifierfinish]='spake2plus verifierFinish+confirm MAC'
     [bbs/sign]='bbs sign SK+bls12_381'
     [bbs/proofgen]='bbs proofGen undisclosed msgs+bls12_381'
+    [groth16/zkprove_ct]='groth16 zkprove constant_time witness+r,s'
+    [groth16/zkprove_vt]='groth16 zkprove Pippenger (pos. control)'
     [coconut/authority_sign]='coconut authority key share+bls12_381'
     [coconut/user_issue]='coconut user attributes (local commit)'
     [coconut/user_show]='coconut proveCredential (attrs+blinding)'

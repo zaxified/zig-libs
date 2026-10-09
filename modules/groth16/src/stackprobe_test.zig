@@ -547,6 +547,9 @@ fn apiProve(pk: prover.ProvingKey, sys: r1cs.System, w: []const Fr, rand: *const
 fn apiZkProve(gpa: std.mem.Allocator, z: zkey.ZKey, w: []const Fr, rand: *const prover.Randomizers) zkprove.ProveError!zkprove.Proof {
     return zkprove.prove(gpa, z, w, rand);
 }
+fn apiZkProveCt(gpa: std.mem.Allocator, z: zkey.ZKey, w: []const Fr, rand: *const prover.Randomizers) zkprove.ProveError!zkprove.Proof {
+    return zkprove.proveWith(gpa, z, w, rand, .{ .msm = .constant_time });
+}
 fn apiContribute(gpa: std.mem.Allocator, z: *zkey.ZKey, x: *const Fr, s: *const Fr) !void {
     return phase2.contribute(gpa, z, x, s, "probe");
 }
@@ -589,6 +592,10 @@ noinline fn callProve() void {
 }
 noinline fn callZkProve() void {
     const proof = apiZkProve(freshHeap(), cur_z, &cur_zw, &cur_rand) catch unreachable;
+    std.mem.doNotOptimizeAway(&proof);
+}
+noinline fn callZkProveCt() void {
+    const proof = apiZkProveCt(freshHeap(), cur_z, &cur_zw, &cur_rand) catch unreachable;
     std.mem.doNotOptimizeAway(&proof);
 }
 noinline fn callContribute() void {
@@ -643,6 +650,9 @@ test "STACKPROBE: no prover-secret residue on the dead stack after setup, prove,
         leak_src = cur_zw[1].toBytes();
         heap_view = &heap_buf;
         bad += try runProbe("zkprove.prove", callZkProve, &nd);
+        // The constant-time MSM: per-term `scalarMul` frames instead of buckets.
+        heap_view = &heap_buf;
+        bad += try runProbe("zkprove.proveWith constant_time", callZkProveCt, &nd);
 
         // phase2.contribute: x, s, x^-1, s*x.
         nd.reset();

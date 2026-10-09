@@ -32,7 +32,7 @@ longer `@panic`. The core was an **Opus** task, not a Fable one, because the
 | `zkey.zig` | snarkjs `.zkey` (Groth16 proving key) reader and writer — round-trips snarkjs's files byte for byte |
 | `circom.zig` | circom `.r1cs` reader, `.wtns` reader and writer |
 | `ptau.zig` | snarkjs powers-of-tau (`.ptau`) reader, points decoded on demand |
-| `zkprove.zig` | **the real prover**: `.zkey` + witness → proof, Pippenger MSM, quotient on a coset |
+| `zkprove.zig` | **the real prover**: `.zkey` + witness → proof, quotient on a coset; Pippenger MSM (variable-time in the witness, the default) or `proveWith(…, .{ .msm = .constant_time })` (~21× slower) |
 | `phase2.zig` | phase-2 ceremony: `newZkey(r1cs, ptau)`, `contribute`, `verifyContribution`, `verify` |
 
 ## The anchor

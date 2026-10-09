@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **Constant-time prover option + first ctgrind record.** New
+  `zkprove.proveWith(gpa, z, witness, rand, .{ .msm = .constant_time })` runs the
+  naive MSM (one constant-time `scalarMul` per term) instead of Pippenger, which is
+  variable-time in the witness (SPEC.md § 5b item 4). Same proof byte for byte
+  (test on the snarkjs fixture). `zkprove.prove` is unchanged (Pippenger, the
+  default every other prover has) and its doc comment now says it is
+  variable-time. New `src/ctgrind_harness.zig` (private witness + `r`/`s`
+  tainted): `zkprove_ct` 6 in-file contexts, all `toAffine` on the published
+  proof points; `zkprove_vt` (Pippenger, positive control) 26. Cost ~21×: 34 s
+  against 1.6 s at 10 000 constraints, one core, ReleaseFast — via the new
+  `tools/snarkjs/g16 prove-ct`; snarkjs `groth16 verify` accepted that proof and
+  rejected it with `pi_a.x + 1`. The stack probe covers the new path (0).
+  `tools/snarkjs/gen.sh` built `g16` without `montint` (bn254's dependency since
+  `Fr` became `montint.Field`) — fixed.
 - **2026-10-09** — **BREAKING, HIGH: dead-stack sweep of the prover's secret entry
   points.** A new ReleaseFast stack probe (`stackprobe_test.zig`, engine of
   `bls12_381`'s) found every one of them leaving its secrets in dead frames. Before

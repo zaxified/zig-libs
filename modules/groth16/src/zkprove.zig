@@ -52,20 +52,62 @@ pub const ProveError = error{
     DomainTooLarge,
 } || Allocator.Error;
 
-/// Proves `witness` against `z`. `rand` are the zero-knowledge randomizers:
-/// draw both uniformly at random for every proof (`Fr.random(io)`); reusing
-/// them across two proofs of different witnesses leaks the witness
-/// difference.
+/// The multi-scalar multiplication the prover runs over the witness and the
+/// quotient.
+pub const Msm = enum {
+    /// Pippenger's bucket method. ⚠ VARIABLE-TIME in the witness: which bucket
+    /// a base lands in, and whether a bucket is still empty, depend on the
+    /// witness digits, so a co-resident attacker who can time or cache-probe
+    /// the prover learns about the witness (SPEC.md § 5b item 4). The trade
+    /// snarkjs, rapidsnark, arkworks and gnark make; the default.
+    pippenger,
+    /// One constant-time `scalarMul` per term (`msm.msmG1`/`msmG2`), the
+    /// group additions through `ctSelect`. For a prover sharing a machine
+    /// with someone it does not trust. ~21× slower: 34 s against 1.6 s at
+    /// 10 000 constraints, one core, ReleaseFast (2026-10-09).
+    constant_time,
+};
+
+pub const Options = struct {
+    msm: Msm = .pippenger,
+};
+
+/// Proves `witness` against `z` with the default options — Pippenger MSM,
+/// VARIABLE-TIME in the witness (see `Msm`); `proveWith(…, .{ .msm =
+/// .constant_time })` when the prover's timing is observable. `rand` are the
+/// zero-knowledge randomizers: draw both uniformly at random for every proof
+/// (`Fr.random(io)`); reusing them across two proofs of different witnesses
+/// leaks the witness difference.
 ///
 /// `rand` is taken by pointer and never copied; the caller wipes it (and the
 /// witness). The body runs one frame down and the stack it dirtied is zeroed
 /// after it; the heap scratch (evaluations, the Pippenger limbs and buckets) is
 /// wiped before it goes back to `allocator`.
 pub fn prove(allocator: Allocator, z: ZKey, witness: []const Fr, rand: *const prover.Randomizers) ProveError!Proof {
-    return burn.run(burn.zkprove_burn, ProveError!Proof, proveBody, .{ allocator, z, witness, rand });
+    return proveWith(allocator, z, witness, rand, .{});
 }
 
-fn proveBody(allocator: Allocator, z: ZKey, witness: []const Fr, rand: *const prover.Randomizers) ProveError!Proof {
+/// `prove` with a choice of MSM. Both choices give the same proof for the same
+/// inputs.
+pub fn proveWith(allocator: Allocator, z: ZKey, witness: []const Fr, rand: *const prover.Randomizers, opts: Options) ProveError!Proof {
+    return burn.run(burn.zkprove_burn, ProveError!Proof, proveBody, .{ allocator, z, witness, rand, opts.msm });
+}
+
+fn msmG1(allocator: Allocator, kind: Msm, bases: []const G1.Affine, scalars: []const Fr) Allocator.Error!G1.Jacobian {
+    return switch (kind) {
+        .pippenger => msm.pippengerG1(allocator, bases, scalars),
+        .constant_time => msm.msmG1(bases, scalars),
+    };
+}
+
+fn msmG2(allocator: Allocator, kind: Msm, bases: []const G2.Affine, scalars: []const Fr) Allocator.Error!G2.Jacobian {
+    return switch (kind) {
+        .pippenger => msm.pippengerG2(allocator, bases, scalars),
+        .constant_time => msm.msmG2(bases, scalars),
+    };
+}
+
+fn proveBody(allocator: Allocator, z: ZKey, witness: []const Fr, rand: *const prover.Randomizers, kind: Msm) ProveError!Proof {
     if (witness.len != z.n_vars) return error.WitnessMismatch;
     const log_n = z.power();
     if (log_n + 1 > domain.max_log_size) return error.DomainTooLarge;
@@ -111,19 +153,19 @@ fn proveBody(allocator: Allocator, z: ZKey, witness: []const Fr, rand: *const pr
     const delta1 = G1.Jacobian.fromAffine(z.delta_g1);
 
     var pi_a = G1.Jacobian.fromAffine(z.alpha_g1);
-    pi_a = pi_a.add(try msm.pippengerG1(allocator, z.a, witness));
+    pi_a = pi_a.add(try msmG1(allocator, kind, z.a, witness));
     pi_a = pi_a.add(delta1.scalarMul(r));
 
     var pi_b = G2.Jacobian.fromAffine(z.beta_g2);
-    pi_b = pi_b.add(try msm.pippengerG2(allocator, z.b_g2, witness));
+    pi_b = pi_b.add(try msmG2(allocator, kind, z.b_g2, witness));
     pi_b = pi_b.add(G2.Jacobian.fromAffine(z.delta_g2).scalarMul(s));
 
     var b_in_g1 = G1.Jacobian.fromAffine(z.beta_g1);
-    b_in_g1 = b_in_g1.add(try msm.pippengerG1(allocator, z.b_g1, witness));
+    b_in_g1 = b_in_g1.add(try msmG1(allocator, kind, z.b_g1, witness));
     b_in_g1 = b_in_g1.add(delta1.scalarMul(s));
 
-    var pi_c = try msm.pippengerG1(allocator, z.c, witness[z.n_public + 1 ..]);
-    pi_c = pi_c.add(try msm.pippengerG1(allocator, z.h, h));
+    var pi_c = try msmG1(allocator, kind, z.c, witness[z.n_public + 1 ..]);
+    pi_c = pi_c.add(try msmG1(allocator, kind, z.h, h));
     pi_c = pi_c.add(pi_a.scalarMul(s));
     pi_c = pi_c.add(b_in_g1.scalarMul(r));
     pi_c = pi_c.add(delta1.scalarMul(r.mul(s)).negate());
