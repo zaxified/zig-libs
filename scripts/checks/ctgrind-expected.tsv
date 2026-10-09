@@ -813,13 +813,13 @@ coconut	ReleaseFast	user_issue	1	21	a6281f1d04b2a243	af24664cb307a403
 # proveBody < run@burn.zig) except the Fr.fromBytes rejection-sampler context
 # reached from Entropy.scalar, 5 -> 4 distinct chains. No new site.
 coconut	ReleaseFast	user_show	1	26	28f8c53e98befca5	286e5ea12d924b29
-hpke	ReleaseFast	x25519_decap	1	1	d826d58763828e11	c0cee0a8c6bf72c3
-hpke	ReleaseFast	x25519_authdecap	1	2	d826d58763828e11	05af25d1d0e3943d
-hpke	ReleaseFast	p256_decap	1	1	d826d58763828e11	851ee3406999dacc
-hpke	ReleaseFast	p256_authdecap	1	2	d826d58763828e11	4b0f0c964acb8411
-hpke	ReleaseFast	p384_decap	1	2	d826d58763828e11	6b70bba9cc229a39
-hpke	ReleaseFast	p384_authdecap	1	4	d826d58763828e11	2741ac2ff5069767
-hpke	ReleaseFast	open	1	1	b6ef9cece144d2d5	59883c70dcd08ee6
+hpke	ReleaseFast	x25519_decap	1	1	0b29e6574a3e7267	c0cee0a8c6bf72c3
+hpke	ReleaseFast	x25519_authdecap	1	2	0b29e6574a3e7267	05af25d1d0e3943d
+hpke	ReleaseFast	p256_decap	1	1	0b29e6574a3e7267	851ee3406999dacc
+hpke	ReleaseFast	p256_authdecap	1	2	0b29e6574a3e7267	4b0f0c964acb8411
+hpke	ReleaseFast	p384_decap	1	2	0b29e6574a3e7267	6b70bba9cc229a39
+hpke	ReleaseFast	p384_authdecap	1	4	0b29e6574a3e7267	2741ac2ff5069767
+hpke	ReleaseFast	open	1	1	a3051d9bb2f0429f	59883c70dcd08ee6
 signal	ReleaseFast	sign	1	1	51e4774f1e219e5c	b2a0053066d93a75
 signal	ReleaseFast	ratchet	1	2	42f801e2bd3aaa81	92ab00fad0ce5c41
 # sphinx construct 10 -> 8 (re-pin 2026-09-15): its two ECDH `k256.mul` calls
