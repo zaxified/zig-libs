@@ -1254,10 +1254,10 @@ fn serverKexRoundBody(
     // server-to-client keys ('B'/'D'/'F') and DECRYPT with the
     // client-to-server keys ('A'/'C'/'E'), the exact swap of the client's.
     try transport.writePacket(t.writer, ciphers.w, t.entropy, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
-    try t.installCipher(.write, cipher_s2c, .s2c, &kex_result);
+    try t.installCipher(.write, cipher_s2c, mac_s2c, .s2c, &kex_result);
     const nk = try transport.readKexPacket(t.reader, ciphers, scratch);
     if (msgType(nk) != @intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)) return error.ProtocolError;
-    try t.installCipher(.read, cipher_c2s, .c2s, &kex_result);
+    try t.installCipher(.read, cipher_c2s, mac_c2s, .c2s, &kex_result);
 
     return .{ .client_wants_ext_info = client_wants_ext_info };
 }
@@ -1870,8 +1870,8 @@ test "Algorithms: a client restricted to a non-AEAD cipher negotiates its MAC" {
     const only_ctr = [_][]const u8{"aes256-ctr"};
     const neg = try selfConsistencyWith(&hk, .{ .ciphers = &only_ctr }, .{});
     try std.testing.expectEqualStrings("aes256-ctr", neg.cipher_c2s);
-    try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_c2s.?);
-    try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_s2c.?);
+    try std.testing.expectEqualStrings(transport.mac_algorithms[0], neg.mac_c2s.?);
+    try std.testing.expectEqualStrings(transport.mac_algorithms[0], neg.mac_s2c.?);
 }
 
 test "Algorithms REJECT: disjoint cipher lists end the handshake with UnsupportedAlgorithm" {
@@ -2274,7 +2274,7 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
     st.write_cipher = none_w;
     try std.testing.expectEqual(@as(u32, 4), st.write_cipher.sequenceNumber());
     st.session_id = transport.SessionId.from(res.hash());
-    try st.installCipher(.write, "chacha20-poly1305@openssh.com", .s2c, &res);
+    try st.installCipher(.write, "chacha20-poly1305@openssh.com", null, .s2c, &res);
     var probe: [32]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&probe);
     try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
@@ -2303,6 +2303,12 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
 /// SSH_MSG_USERAUTH_REQUEST decrypts too. The client then fails auth (we
 /// never implement userauth in part 1) — that is expected and not asserted.
 fn liveOpensshClient(keygen_type: []const u8, hostkey_algo: []const u8, kex_name: []const u8, cipher_name: []const u8) !void {
+    return liveOpensshClientMac(keygen_type, hostkey_algo, kex_name, cipher_name, "hmac-sha2-256");
+}
+
+/// `liveOpensshClient` with the client forced to `MACs=<mac_name>` (only
+/// meaningful for a non-AEAD cipher).
+fn liveOpensshClientMac(keygen_type: []const u8, hostkey_algo: []const u8, kex_name: []const u8, cipher_name: []const u8, mac_name: []const u8) !void {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -2375,13 +2381,15 @@ fn liveOpensshClient(keygen_type: []const u8, hostkey_algo: []const u8, kex_name
     defer gpa.free(hka_opt);
     const kex_opt = try std.fmt.allocPrint(gpa, "KexAlgorithms={s}", .{kex_name});
     defer gpa.free(kex_opt);
+    const macs_opt = try std.fmt.allocPrint(gpa, "MACs={s}", .{mac_name});
+    defer gpa.free(macs_opt);
     var ssh_child = std.process.spawn(io, .{
         .argv = &.{
             "/usr/bin/ssh",                  "-p",             port_str,                         "-F",
             "/dev/null",                     "-o",             "StrictHostKeyChecking=no",       "-o",
             "UserKnownHostsFile=/dev/null",  "-o",             "GlobalKnownHostsFile=/dev/null", "-o",
             "PreferredAuthentications=none", "-o",             "BatchMode=yes",                  "-o",
-            "MACs=hmac-sha2-256",            "-o",             "ConnectTimeout=10",              "-o",
+            macs_opt,                        "-o",             "ConnectTimeout=10",              "-o",
             ciphers_opt,                     "-o",             hka_opt,                          "-o",
             kex_opt,                         "test@127.0.0.1", "true",
         },
@@ -2407,7 +2415,7 @@ fn liveOpensshClient(keygen_type: []const u8, hostkey_algo: []const u8, kex_name
     inline for (.{ t.read_cipher, t.write_cipher }) |c| {
         switch (c) {
             .chacha20_poly1305 => try std.testing.expectEqualStrings("chacha20-poly1305@openssh.com", cipher_name),
-            .aes256_ctr_hmac_sha256 => try std.testing.expectEqualStrings("aes256-ctr", cipher_name),
+            .aes_ctr_hmac => try std.testing.expect(std.mem.endsWith(u8, cipher_name, "-ctr")),
             .aes_gcm => |st| switch (st.key_bits) {
                 .aes256 => try std.testing.expectEqualStrings("aes256-gcm@openssh.com", cipher_name),
                 .aes128 => try std.testing.expectEqualStrings("aes128-gcm@openssh.com", cipher_name),
@@ -2430,8 +2438,8 @@ fn liveOpensshClient(keygen_type: []const u8, hostkey_algo: []const u8, kex_name
         try std.testing.expect(neg.mac_c2s == null);
         try std.testing.expect(neg.mac_s2c == null);
     } else {
-        try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_c2s.?);
-        try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_s2c.?);
+        try std.testing.expectEqualStrings(mac_name, neg.mac_c2s.?);
+        try std.testing.expectEqualStrings(mac_name, neg.mac_s2c.?);
     }
 
     // The client's next encrypted packet must decrypt to its userauth
@@ -2456,6 +2464,16 @@ test "live interop: OpenSSH ssh client → our server — curve25519 + ed25519 +
 
 test "live interop: OpenSSH ssh client → our server — curve25519 + ed25519 + aes256-ctr" {
     try liveOpensshClient("ed25519", "ssh-ed25519", "curve25519-sha256", "aes256-ctr");
+}
+
+test "live interop: OpenSSH ssh client → our server — aes128-ctr × every MAC (EtM and not)" {
+    for (transport.mac_algorithms) |mac| {
+        try liveOpensshClientMac("ed25519", "ssh-ed25519", "curve25519-sha256", "aes128-ctr", mac);
+    }
+}
+
+test "live interop: OpenSSH ssh client → our server — aes256-ctr + hmac-sha2-512-etm@openssh.com" {
+    try liveOpensshClientMac("ed25519", "ssh-ed25519", "curve25519-sha256", "aes256-ctr", "hmac-sha2-512-etm@openssh.com");
 }
 
 test "live interop: OpenSSH ssh client → our server — curve25519 + rsa-sha2-256 + chacha20-poly1305" {

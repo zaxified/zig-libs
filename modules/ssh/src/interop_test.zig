@@ -760,7 +760,12 @@ test "live: signal TERM reaches the remote command, which reports exit-signal" {
     const s = try conn.openSession(.{});
     defer s.deinit();
     // `exec` so the signal hits sleep itself, not a shell waiting on it.
-    try s.exec("exec sleep 30");
+    // Signal only once the command is running: OpenSSH refuses a `signal`
+    // request for a session with no child yet, and under load the request
+    // overtook the fork (failed once, 2026-10-10, sleep then ran its 30 s).
+    // Before the `exec`, TERM ends the shell, which reports TERM just the same.
+    try s.exec("echo ready; exec sleep 30");
+    while (std.mem.indexOf(u8, s.stdout.items, "ready") == null) _ = try s.pumpOnce();
     try s.signal("TERM");
     try s.drain();
     try std.testing.expect(s.exit_signal != null);

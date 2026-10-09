@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Fixed:** a peer's SSH_MSG_DISCONNECT in the middle of a key exchange (RFC 4253 §7.1
+  allows it; OpenSSH sends "disconnected by user" when its session ends while a re-exchange it
+  started is pending) was read as the next KEX message: the server failed with `KexFailed` (DISCONNECT
+  where KEX init was due) or `ProtocolError` (where NEWKEYS was due). `readKexPacket` now ends the
+  exchange with the new `error.PeerDisconnected` (**BREAKING**, error set grows), and
+  `serveSession` treats it as the client hanging up after our CLOSE, like EndOfStream. This was the
+  "load-flaky" live 32 KiB client-rekey test: 4–10 of 48 parallel runs failed, now 48/48; the cause
+  was found by naming the error in that test (previous entry). Regression test red without the fix.
+- **2026-10-10** — **Added:** `aes128-ctr` (RFC 4344) and the MACs `hmac-sha2-512` (RFC 6668),
+  `hmac-sha2-256-etm@openssh.com` and `hmac-sha2-512-etm@openssh.com` (OpenSSH `PROTOCOL` §1.5:
+  length in clear, MAC over seq || length || ciphertext, checked before decrypting) — Go x/crypto/ssh
+  parity P1. Default MAC order is now Go's: `-256-etm`, `-512-etm`, `-256`, `-512` (so a CTR
+  session with OpenSSH now negotiates EtM). **Changed (BREAKING):** `CipherState.aes256_ctr_hmac_sha256`
+  → `CipherState.aes_ctr_hmac` (`AesCtrHmacState`: key size, MAC, EtM flag); `Transport.installCipher`
+  takes the negotiated MAC name. `aes192-ctr` is not offered: std has no AES-192 (a repo-wide gap,
+  SPEC backlog). Tests: all 8 AES × HMAC × EtM combinations round-trip and refuse a flipped
+  MAC/ciphertext/length octet with the reader state untouched; live OpenSSH 10.2 interop both roles
+  for aes128-ctr × each MAC and aes256-ctr + hmac-sha2-512-etm. The live `signal TERM` test now
+  waits for the command to run before signalling (OpenSSH refuses a signal for a session with no
+  child yet; it failed once under load).
+
 - **2026-10-09** — **Added:** runtime-configurable algorithm lists, Go x/crypto/ssh `Config` parity:
   `transport.Algorithms` (`kex`, `host_keys`, `ciphers`, `macs`) on `Transport.algorithms` (client)
   and `ServerConfig.algorithms` (server), used by every exchange incl. re-exchanges; ceiling lists

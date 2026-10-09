@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [cataggar/sshz](https://github.com/cataggar/sshz) | Zig | MIT | 1 | push 2026-09-11 (no releases) | The closest competitor and Zig 0.16: its README lists client and server, keyboard-interactive, publickey/password/none, "multiple channels, sessions, port forwarding, and agent forwarding", rekeying, delayed compression, interop with OpenSSH, Dropbear and libssh. Newer and much broader than this module; source not read. |
 | [ringtailsoftware/misshod](https://github.com/ringtailsoftware/misshod) | Zig | MIT | 32 | push 2025-01-06 | Its README: "not secure, should not be used in real world systems"; exactly one algorithm of each kind. Narrower than this module. |
 
-**Where we are ahead:** against the Zig implementations whose READMEs we read: the ML-KEM-768/X25519 hybrid KEX plus curve25519 and DH group14/16, rsa-sha2 and P-256 host keys, ChaCha20-Poly1305 and AES-GCM ciphers, RFC 8308 `server-sig-algs`, server role included (misshod: one algorithm of each kind; sshz README states no algorithm list, so its algorithm set is unchecked) · **Where we are behind:** no SFTP, no certificates or `ssh-agent`, no X11/agent forwarding, no server-side TCP/IP forwarding (the server owns no sockets by design), no `hostbased`, no aes128/192-ctr, hmac-sha2-512, `-etm` MACs, NIST ECDH or legacy SHA-1 options yet (lists configurable, menu narrower than Go's), and server handlers that are one-shot callbacks (a "shell" served here is batch, not a pty driving a process) (SPEC "Backlog / deferred"); sshz advertises agent forwarding and Dropbear/libssh interop besides.
+**Where we are ahead:** against the Zig implementations whose READMEs we read: the ML-KEM-768/X25519 hybrid KEX plus curve25519 and DH group14/16, rsa-sha2 and P-256 host keys, ChaCha20-Poly1305 and AES-GCM ciphers, RFC 8308 `server-sig-algs`, server role included (misshod: one algorithm of each kind; sshz README states no algorithm list, so its algorithm set is unchecked) · **Where we are behind:** no SFTP, no certificates or `ssh-agent`, no X11/agent forwarding, no server-side TCP/IP forwarding (the server owns no sockets by design), no `hostbased`, no aes192-ctr, NIST ECDH, DH group-exchange or legacy SHA-1 options yet (lists configurable, menu narrower than Go's), and server handlers that are one-shot callbacks (a "shell" served here is batch, not a pty driving a process) (SPEC "Backlog / deferred"); sshz advertises agent forwarding and Dropbear/libssh interop besides.
 
 **Re-assessed 2026-10-06** (no new web survey): the survey's "missing and it matters" items for the main uses are in — rekeying both roles (with OpenSSH strict KEX and SSH_MSG_UNIMPLEMENTED), several channels per connection both roles (`connection.Connection` / `serveConnection`), `pty-req`/`shell`/`env`/`window-change`/`signal`/`exit-signal`, client TCP/IP forwarding both directions (`direct-tcpip`, `tcpip-forward`), and `keyboard-interactive` both roles — each live-tested against OpenSSH 10.2p1 (and Go `x/crypto/ssh` for keyboard-interactive). What remains behind is the list above. Scope `mvp` → `core`.
 
@@ -78,7 +78,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   (mlkem768x25519-sha256, curve25519-sha256 + `@libssh.org`, diffie-hellman-group14-sha256/
   group16-sha512), `server_host_key_algorithms` (ssh-ed25519, rsa-sha2-256/512,
   ecdsa-sha2-nistp256), `encryption_algorithms` (chacha20-poly1305@openssh.com, aes256-ctr,
-  aes256-gcm@openssh.com, aes128-gcm@openssh.com), `mac_algorithms` (hmac-sha2-256); the ceiling is
+  aes256-gcm@openssh.com, aes128-gcm@openssh.com, aes128-ctr), `mac_algorithms`
+  (hmac-sha2-256-etm@openssh.com, hmac-sha2-512-etm@openssh.com, hmac-sha2-256, hmac-sha2-512 —
+  Go's order); the ceiling is
   the `supported_*` lists (equal today; a legacy opt-in will live only there). `Algorithms.validate`
   refuses an empty list, a duplicate, or a name outside `supported_*` with
   `error.UnsupportedAlgorithm` before anything is sent — the RFC 8308 and strict-KEX indicators are
@@ -404,8 +406,10 @@ for the owner):
   becomes configurable, legacy algorithms come as explicit opt-ins (Go's `Insecure*`: DSA, CBC/3DES,
   RC4, DH-sha1, `ssh-rsa` SHA-1; off by default), GSSAPI is in scope. Phases:
   P1 ~~encrypted ed25519/ecdsa OpenSSH keys~~ (done 2026-10-09), ~~configurable algorithm lists~~
-  (done 2026-10-09, `transport.Algorithms`), aes-ctr 128/192, hmac-sha2-512 and `-etm` MACs,
-  ecdh-sha2-nistp256/384/521, ecdsa-nistp384/521, DH group-exchange;
+  (done 2026-10-09, `transport.Algorithms`), ~~aes128-ctr, hmac-sha2-512 and `-etm` MACs~~ (done
+  2026-10-10), ecdh-sha2-nistp256/384/521, ecdsa-nistp384/521, DH group-exchange; `aes192-ctr`
+  waits on an AES-192 block cipher (std 0.16 has none; aescbc, aeskw, aesgcm, jwe and xmlenc refuse
+  192-bit keys for the same reason — one shared AES-192 would close all of them);
   P2 public-key layer (ParsePublicKey / authorized_keys / fingerprints), known_hosts, auth
   orchestration (none probe, multi-key, partial success, multi-round keyboard-interactive);
   P3 server API in Go's shape (channels and requests to the app), streamlocal, Signer + ssh-agent,

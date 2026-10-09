@@ -1682,7 +1682,8 @@ fn envAccepted(patterns: []const []const u8, name: []const u8) bool {
 /// The peer went away (end of stream, reset, or a write into a closed
 /// socket).
 fn hungUp(e: ChannelError) bool {
-    return e == error.EndOfStream or e == error.ReadFailed or e == error.WriteFailed;
+    return e == error.EndOfStream or e == error.ReadFailed or e == error.WriteFailed or
+        e == error.PeerDisconnected;
 }
 
 /// `ServeConfig.subsystem_names` membership test — linear scan, since the

@@ -34,13 +34,15 @@ const Sha512 = std.crypto.hash.sha2.Sha512;
 const X25519 = std.crypto.dh.X25519;
 const Ed25519 = std.crypto.sign.Ed25519;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const Aes128 = std.crypto.core.aes.Aes128;
 const Aes256 = std.crypto.core.aes.Aes256;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
 const ChaCha = std.crypto.stream.chacha.ChaCha20With64BitNonce;
 const Poly1305 = std.crypto.onetimeauth.Poly1305;
-const Hmac = std.crypto.auth.hmac.Hmac(Sha256);
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const HmacSha512 = std.crypto.auth.hmac.sha2.HmacSha512;
 
 /// The sibling `rsa` module's public-key type — referenced here so a
 /// `HostKeyVerifier` implementation can parse an `rsa-sha2-*` host key with
@@ -64,6 +66,12 @@ pub const TransportError = std.Io.Reader.Error || std.Io.Writer.Error ||
     /// not re-key, so the connection is refused rather than continued into
     /// nonce reuse. See `max_packets_per_direction`.
     SequenceNumberExhausted,
+    /// The peer sent SSH_MSG_DISCONNECT in the middle of a key exchange.
+    /// RFC 4253 §7.1 allows it there (it is a transport-generic message);
+    /// OpenSSH does it when its session ends while a re-exchange it started
+    /// is still pending. Outside an exchange the DISCONNECT packet is
+    /// returned to the caller by `Transport.recvPacket` instead.
+    PeerDisconnected,
 };
 
 /// Hard ceiling on packets per direction under one set of keys.
@@ -144,6 +152,7 @@ pub const encryption_algorithms = [_][]const u8{
     "aes256-ctr",
     "aes256-gcm@openssh.com",
     "aes128-gcm@openssh.com",
+    "aes128-ctr",
 };
 
 /// MAC algorithms this client offers. Not used with
@@ -151,7 +160,10 @@ pub const encryption_algorithms = [_][]const u8{
 /// Poly1305) — only relevant when `aes256-ctr` (or another non-AEAD cipher)
 /// is negotiated.
 pub const mac_algorithms = [_][]const u8{
+    "hmac-sha2-256-etm@openssh.com",
+    "hmac-sha2-512-etm@openssh.com",
     "hmac-sha2-256",
+    "hmac-sha2-512",
 };
 
 /// Compression methods this client offers. Only `none` — this module never
@@ -658,17 +670,82 @@ pub const NoneState = struct {
     under_key: u32 = 0,
 };
 
-/// `aes256-ctr` + `hmac-sha2-256` (RFC 4253 §6.3 cipher, RFC 6668 MAC)
-/// per-direction state. `enc_iv` is the running 128-bit CTR counter, advanced
-/// one block per 16 encrypted bytes and carried across packets (never reset).
-pub const Aes256CtrHmacSha256State = struct {
+/// `aes128-ctr` / `aes256-ctr` (RFC 4344 §4) with `hmac-sha2-256` /
+/// `hmac-sha2-512` (RFC 6668), either encrypt-and-MAC (RFC 4253 §6.4: the
+/// MAC covers `seq || plaintext packet`) or the OpenSSH encrypt-then-MAC
+/// variants `hmac-sha2-*-etm@openssh.com` (`PROTOCOL` §1.5: the length field
+/// travels in clear and the MAC covers `seq || length || ciphertext`, checked
+/// before anything is decrypted). Per-direction state. `enc_iv` is the
+/// running 128-bit CTR counter, advanced one block per 16 encrypted bytes and
+/// carried across packets (never reset).
+pub const AesCtrHmacState = struct {
+    /// The first 16 (`aes128`) or all 32 (`aes256`) bytes are the key.
     enc_key: [32]u8,
+    key_bits: enum { aes128, aes256 },
     enc_iv: [16]u8,
-    mac_key: [32]u8,
+    /// The first `macLen()` bytes are the HMAC key (RFC 6668: key = output size).
+    mac_key: [64]u8,
+    mac: MacAlgorithm,
+    etm: bool,
     /// See `Chacha20Poly1305State.sequence_number`.
     sequence_number: u32,
     under_key: u32 = 0,
+
+    pub fn macLen(self: *const AesCtrHmacState) usize {
+        return self.mac.len();
+    }
 };
+
+/// The HMACs a non-AEAD cipher pairs with.
+pub const MacAlgorithm = enum {
+    hmac_sha2_256,
+    hmac_sha2_512,
+
+    pub fn len(self: MacAlgorithm) usize {
+        return switch (self) {
+            .hmac_sha2_256 => HmacSha256.mac_length,
+            .hmac_sha2_512 => HmacSha512.mac_length,
+        };
+    }
+
+    /// `mac_algorithms` name → algorithm and whether it is the `-etm` form.
+    pub fn fromName(name: []const u8) ?struct { MacAlgorithm, bool } {
+        const table = .{
+            .{ "hmac-sha2-256", MacAlgorithm.hmac_sha2_256, false },
+            .{ "hmac-sha2-512", MacAlgorithm.hmac_sha2_512, false },
+            .{ "hmac-sha2-256-etm@openssh.com", MacAlgorithm.hmac_sha2_256, true },
+            .{ "hmac-sha2-512-etm@openssh.com", MacAlgorithm.hmac_sha2_512, true },
+        };
+        inline for (table) |e| {
+            if (std.mem.eql(u8, name, e[0])) return .{ e[1], e[2] };
+        }
+        return null;
+    }
+};
+
+/// HMAC of `seq || parts...` under `st`'s MAC into `out[0..st.macLen()]`.
+fn packetMac(st: *const AesCtrHmacState, seq: u32, parts: []const []const u8, out: *[64]u8) void {
+    var seqb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &seqb, seq, .big);
+    switch (st.mac) {
+        inline else => |m| {
+            const H = if (m == .hmac_sha2_256) HmacSha256 else HmacSha512;
+            var hm = H.init(st.mac_key[0..H.mac_length]);
+            hm.update(&seqb);
+            for (parts) |p| hm.update(p);
+            hm.final(out[0..H.mac_length]);
+        },
+    }
+}
+
+/// `st`'s AES-CTR keystream XORed over `data`, advancing `counter` (the
+/// reader passes a copy of `st.enc_iv` and commits it once the MAC checks).
+fn ctrXor(st: *const AesCtrHmacState, counter: *[16]u8, data: []u8) void {
+    switch (st.key_bits) {
+        .aes128 => aesCtrXor(Aes128.initEnc(st.enc_key[0..16].*), counter, data),
+        .aes256 => aesCtrXor(Aes256.initEnc(st.enc_key), counter, data),
+    }
+}
 
 /// `aes256-gcm@openssh.com` / `aes128-gcm@openssh.com` (RFC 5647) per-
 /// direction state.
@@ -678,7 +755,7 @@ pub const Aes256CtrHmacSha256State = struct {
 /// aes256-gcm key). `fixed_iv` is the 4-byte fixed part of the RFC 5647 §7.1
 /// 12-byte GCM nonce (`fixed_iv || 8-byte invocation_counter`); the
 /// `invocation_counter` increments once per packet, and unlike
-/// `chacha20_poly1305`/`aes256_ctr_hmac_sha256` it is NOT the SSH sequence
+/// `chacha20_poly1305`/`aes_ctr_hmac` it is NOT the SSH sequence
 /// number (RFC 5647 keeps them as two separate 64-bit/32-bit counters that
 /// happen to increment in lockstep).
 pub const AesGcmState = struct {
@@ -697,7 +774,8 @@ pub const AesGcmState = struct {
 pub const CipherState = union(enum) {
     none: NoneState,
     chacha20_poly1305: Chacha20Poly1305State,
-    aes256_ctr_hmac_sha256: Aes256CtrHmacSha256State,
+    /// `aes128-ctr` / `aes256-ctr` with an HMAC — see `AesCtrHmacState`.
+    aes_ctr_hmac: AesCtrHmacState,
     /// `aes256-gcm@openssh.com` / `aes128-gcm@openssh.com` — see `AesGcmState`.
     aes_gcm: AesGcmState,
 
@@ -731,9 +809,12 @@ pub const CipherPair = struct {
 };
 
 /// Read the next packet of a key exchange (see `CipherPair.skip_generic`).
+/// A peer's SSH_MSG_DISCONNECT ends the exchange with
+/// `error.PeerDisconnected`, in either kind of exchange.
 pub fn readKexPacket(r: *std.Io.Reader, ciphers: CipherPair, buf: []u8) TransportError!Packet {
     while (true) {
         const pkt = try readPacket(r, ciphers.r, buf);
+        if (msgType(pkt) == @intFromEnum(messages.MessageType.SSH_MSG_DISCONNECT)) return error.PeerDisconnected;
         if (ciphers.skip_generic) switch (msgType(pkt)) {
             @intFromEnum(messages.MessageType.SSH_MSG_IGNORE),
             @intFromEnum(messages.MessageType.SSH_MSG_DEBUG),
@@ -753,9 +834,10 @@ fn seqNonce(seq: u32) [8]u8 {
     return n;
 }
 
-/// AES-256-CTR keystream XOR over `data`, advancing `counter` (big-endian,
-/// full 128-bit block) one step per 16-byte block consumed.
-fn aesCtrXor(ctx: std.crypto.core.aes.AesEncryptCtx(Aes256), counter: *[16]u8, data: []u8) void {
+/// AES-CTR keystream XOR over `data` (`ctx` an AES-128 or AES-256 encryption
+/// context), advancing `counter` (big-endian, full 128-bit block) one step per
+/// 16-byte block consumed.
+fn aesCtrXor(ctx: anytype, counter: *[16]u8, data: []u8) void {
     var i: usize = 0;
     while (i < data.len) : (i += 16) {
         var ks: [16]u8 = undefined;
@@ -832,42 +914,56 @@ fn readPacketBody(r: *std.Io.Reader, cipher: *CipherState, buf: []u8) TransportE
                 .mac = buf[4 + pkt_len .. 4 + pkt_len + 16],
             };
         },
-        .aes256_ctr_hmac_sha256 => |*st| {
-            const ctx = Aes256.initEnc(st.enc_key);
+        .aes_ctr_hmac => |*st| {
+            const mlen = st.macLen();
             var counter = st.enc_iv;
-            const b0 = try r.takeArray(16);
-            @memcpy(buf[0..16], b0);
-            aesCtrXor(ctx, &counter, buf[0..16]);
-            const pkt_len = std.mem.readInt(u32, buf[0..4], .big);
-            const total_pt = 4 + @as(usize, pkt_len);
-            if (pkt_len < 12 or total_pt % 16 != 0 or pkt_len > messages.max_wire_string_len) return error.ProtocolError;
-            if (total_pt + 32 > buf.len) return error.PacketTooLarge;
-            if (total_pt > 16) {
-                try r.readSliceAll(buf[16..total_pt]);
-                aesCtrXor(ctx, &counter, buf[16..total_pt]);
+            var pkt_len: u32 = undefined;
+            var total_pt: usize = undefined;
+            var mac_recv: [64]u8 = @splat(0);
+            var mac: [64]u8 = @splat(0);
+            if (st.etm) {
+                // PROTOCOL §1.5: length in clear; MAC over seq || length ||
+                // ciphertext, verified before decrypting anything. The
+                // encrypted part (excluding the length) is block-aligned.
+                const lenb = try r.takeArray(4);
+                @memcpy(buf[0..4], lenb);
+                pkt_len = std.mem.readInt(u32, buf[0..4], .big);
+                if (pkt_len < 16 or pkt_len % 16 != 0 or pkt_len > messages.max_wire_string_len) return error.ProtocolError;
+                total_pt = 4 + @as(usize, pkt_len);
+                if (total_pt + mlen > buf.len) return error.PacketTooLarge;
+                try r.readSliceAll(buf[4..total_pt]);
+                try r.readSliceAll(mac_recv[0..mlen]);
+                packetMac(st, st.sequence_number, &.{buf[0..total_pt]}, &mac);
+                if (!std.crypto.timing_safe.eql([64]u8, mac, mac_recv)) return error.MacVerificationFailed;
+                ctrXor(st, &counter, buf[4..total_pt]);
+            } else {
+                const b0 = try r.takeArray(16);
+                @memcpy(buf[0..16], b0);
+                ctrXor(st, &counter, buf[0..16]);
+                pkt_len = std.mem.readInt(u32, buf[0..4], .big);
+                total_pt = 4 + @as(usize, pkt_len);
+                if (pkt_len < 12 or total_pt % 16 != 0 or pkt_len > messages.max_wire_string_len) return error.ProtocolError;
+                if (total_pt + mlen > buf.len) return error.PacketTooLarge;
+                if (total_pt > 16) {
+                    try r.readSliceAll(buf[16..total_pt]);
+                    ctrXor(st, &counter, buf[16..total_pt]);
+                }
+                try r.readSliceAll(mac_recv[0..mlen]);
+                packetMac(st, st.sequence_number, &.{buf[0..total_pt]}, &mac);
+                if (!std.crypto.timing_safe.eql([64]u8, mac, mac_recv)) return error.MacVerificationFailed;
             }
-            var mac_recv: [32]u8 = undefined;
-            try r.readSliceAll(&mac_recv);
-            var mac: [32]u8 = undefined;
-            var hm = Hmac.init(&st.mac_key);
-            var seqb: [4]u8 = undefined;
-            std.mem.writeInt(u32, &seqb, st.sequence_number, .big);
-            hm.update(&seqb);
-            hm.update(buf[0..total_pt]);
-            hm.final(&mac);
-            if (!std.crypto.timing_safe.eql([32]u8, mac, mac_recv)) return error.MacVerificationFailed;
             st.enc_iv = counter;
             try bumpSequence(&st.sequence_number, &st.under_key);
             const padlen = buf[4];
             if (padlen < 4 or @as(usize, padlen) + 1 > pkt_len) return error.ProtocolError;
             const payload_len = pkt_len - 1 - padlen;
-            @memcpy(buf[total_pt .. total_pt + 32], &mac_recv);
+            @memcpy(buf[total_pt .. total_pt + mlen], mac_recv[0..mlen]);
             return .{
                 .packet_length = pkt_len,
                 .padding_length = padlen,
                 .payload = buf[5 .. 5 + payload_len],
                 .padding = buf[5 + payload_len .. total_pt],
-                .mac = buf[total_pt .. total_pt + 32],
+                .mac = buf[total_pt .. total_pt + mlen],
             };
         },
         .aes_gcm => |*st| {
@@ -968,28 +1064,31 @@ fn writePacketBody(w: *std.Io.Writer, cipher: *CipherState, entropy: Entropy, pa
             try w.flush();
             try bumpSequence(&st.sequence_number, &st.under_key);
         },
-        .aes256_ctr_hmac_sha256 => |*st| {
+        .aes_ctr_hmac => |*st| {
             const block: usize = 16;
-            var padlen: usize = block - ((4 + 1 + payload.len) % block);
+            const mlen = st.macLen();
+            // Encrypt-then-MAC aligns what is encrypted; encrypt-and-MAC
+            // aligns the whole packet, length field included.
+            const aligned = if (st.etm) 1 + payload.len else 4 + 1 + payload.len;
+            var padlen: usize = block - (aligned % block);
             if (padlen < 4) padlen += block;
             const pkt_len: u32 = @intCast(1 + payload.len + padlen);
             const total_pt = 4 + @as(usize, pkt_len);
-            if (total_pt + 32 > buf.len) return error.PacketTooLarge;
+            if (total_pt + mlen > buf.len) return error.PacketTooLarge;
             std.mem.writeInt(u32, buf[0..4], pkt_len, .big);
             buf[4] = @intCast(padlen);
             @memcpy(buf[5 .. 5 + payload.len], payload);
             entropy.fill(buf[5 + payload.len .. total_pt]);
-            var mac: [32]u8 = undefined;
-            var hm = Hmac.init(&st.mac_key);
-            var seqb: [4]u8 = undefined;
-            std.mem.writeInt(u32, &seqb, st.sequence_number, .big);
-            hm.update(&seqb);
-            hm.update(buf[0..total_pt]);
-            hm.final(&mac);
-            const ctx = Aes256.initEnc(st.enc_key);
-            aesCtrXor(ctx, &st.enc_iv, buf[0..total_pt]);
-            @memcpy(buf[total_pt .. total_pt + 32], &mac);
-            try w.writeAll(buf[0 .. total_pt + 32]);
+            var mac: [64]u8 = undefined;
+            if (st.etm) {
+                ctrXor(st, &st.enc_iv, buf[4..total_pt]);
+                packetMac(st, st.sequence_number, &.{buf[0..total_pt]}, &mac);
+            } else {
+                packetMac(st, st.sequence_number, &.{buf[0..total_pt]}, &mac);
+                ctrXor(st, &st.enc_iv, buf[0..total_pt]);
+            }
+            @memcpy(buf[total_pt .. total_pt + mlen], mac[0..mlen]);
+            try w.writeAll(buf[0 .. total_pt + mlen]);
             try w.flush();
             try bumpSequence(&st.sequence_number, &st.under_key);
         },
@@ -2119,8 +2218,9 @@ fn deriveKey(out: []u8, letter: u8, k_enc: []const u8, h: []const u8, session_id
 }
 
 /// Build the installed `CipherState` for one direction from a negotiated
-/// cipher name and the KEX result, deriving exactly the needed key material.
-fn buildCipher(name: []const u8, dir: Direction, kr: *const KexResult, sid: []const u8, seq: u32) TransportError!CipherState {
+/// cipher name (and, for a non-AEAD cipher, MAC name) and the KEX result,
+/// deriving exactly the needed key material.
+fn buildCipher(name: []const u8, mac_name: ?[]const u8, dir: Direction, kr: *const KexResult, sid: []const u8, seq: u32) TransportError!CipherState {
     var kmbuf: [4 + 33]u8 = undefined;
     defer std.crypto.secureZero(u8, &kmbuf);
     // K as fed to the KDF: the KEX's explicit encoding, or (legacy curve25519)
@@ -2137,19 +2237,24 @@ fn buildCipher(name: []const u8, dir: Direction, kr: *const KexResult, sid: []co
             .key_header = km[32..64].*,
             .sequence_number = seq,
         } };
-    } else if (std.mem.eql(u8, name, "aes256-ctr")) {
-        var iv: [16]u8 = undefined;
-        var ek: [32]u8 = undefined;
-        var mk: [32]u8 = undefined;
-        deriveKey(&iv, if (dir == .c2s) 'A' else 'B', k_enc, h, sid, hl);
-        deriveKey(&ek, if (dir == .c2s) 'C' else 'D', k_enc, h, sid, hl);
-        deriveKey(&mk, if (dir == .c2s) 'E' else 'F', k_enc, h, sid, hl);
-        return .{ .aes256_ctr_hmac_sha256 = .{
-            .enc_key = ek,
-            .enc_iv = iv,
-            .mac_key = mk,
+    } else if (std.mem.eql(u8, name, "aes256-ctr") or std.mem.eql(u8, name, "aes128-ctr")) {
+        const m = MacAlgorithm.fromName(mac_name orelse return error.UnsupportedAlgorithm) orelse
+            return error.UnsupportedAlgorithm;
+        const is256 = std.mem.eql(u8, name, "aes256-ctr");
+        var st: AesCtrHmacState = .{
+            .enc_key = @splat(0),
+            .key_bits = if (is256) .aes256 else .aes128,
+            .enc_iv = undefined,
+            .mac_key = @splat(0),
+            .mac = m[0],
+            .etm = m[1],
             .sequence_number = seq,
-        } };
+        };
+        deriveKey(&st.enc_iv, if (dir == .c2s) 'A' else 'B', k_enc, h, sid, hl);
+        deriveKey(st.enc_key[0..if (is256) @as(usize, 32) else 16], if (dir == .c2s) 'C' else 'D', k_enc, h, sid, hl);
+        // RFC 6668 §2: the HMAC key is as long as its output.
+        deriveKey(st.mac_key[0..m[0].len()], if (dir == .c2s) 'E' else 'F', k_enc, h, sid, hl);
+        return .{ .aes_ctr_hmac = st };
     } else if (std.mem.eql(u8, name, "aes256-gcm@openssh.com") or
         std.mem.eql(u8, name, "aes128-gcm@openssh.com"))
     {
@@ -2679,21 +2784,21 @@ pub const Transport = struct {
 
     /// Install the keys of a finished exchange for one direction: wipe the
     /// old state and continue (or, under strict KEX, restart) its sequence.
-    pub fn installCipher(t: *Transport, which: CipherSlot, name: []const u8, dir: Direction, kr: *const KexResult) TransportError!void {
+    pub fn installCipher(t: *Transport, which: CipherSlot, name: []const u8, mac_name: ?[]const u8, dir: Direction, kr: *const KexResult) TransportError!void {
         // The new state is built by value (`buildCipher`): body one frame
         // down, its stack zeroed after it.
-        return burn.run(burn.install_burn, TransportError!void, installCipherBody, .{ t, which, name, dir, kr });
+        return burn.run(burn.install_burn, TransportError!void, installCipherBody, .{ t, which, name, mac_name, dir, kr });
     }
 
     pub const CipherSlot = enum { read, write };
 
-    fn installCipherBody(t: *Transport, which: CipherSlot, name: []const u8, dir: Direction, kr: *const KexResult) TransportError!void {
+    fn installCipherBody(t: *Transport, which: CipherSlot, name: []const u8, mac_name: ?[]const u8, dir: Direction, kr: *const KexResult) TransportError!void {
         const state = switch (which) {
             .read => &t.read_cipher,
             .write => &t.write_cipher,
         };
         const seq: u32 = if (t.strict_kex) 0 else state.sequenceNumber();
-        const next = try buildCipher(name, dir, kr, t.session_id.?.slice(), seq);
+        const next = try buildCipher(name, mac_name, dir, kr, t.session_id.?.slice(), seq);
         std.crypto.secureZero(u8, std.mem.asBytes(state));
         state.* = next;
     }
@@ -2901,10 +3006,10 @@ fn clientKexRoundBody(
     // NEWKEYS: ours under the old write keys, then switch writing; theirs
     // under the old read keys, then switch reading.
     try writePacket(t.writer, ciphers.w, t.entropy, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
-    try t.installCipher(.write, neg.cipher_c2s, .c2s, &kex_result);
+    try t.installCipher(.write, neg.cipher_c2s, neg.mac_c2s, .c2s, &kex_result);
     const nk = try readKexPacket(t.reader, ciphers, scratch);
     if (msgType(nk) != @intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)) return error.ProtocolError;
-    try t.installCipher(.read, neg.cipher_s2c, .s2c, &kex_result);
+    try t.installCipher(.read, neg.cipher_s2c, neg.mac_s2c, .s2c, &kex_result);
 }
 
 /// Convenience: `Transport.init` followed by `.clientHandshake`.
@@ -2948,6 +3053,27 @@ pub fn connectInto(
 
 // ── tests ──────────────────────────────────────────────────────────────────
 
+test "readKexPacket: a peer DISCONNECT inside an exchange is PeerDisconnected, not a malformed exchange" {
+    // OpenSSH sends DISCONNECT ("disconnected by user") when its session ends
+    // while a re-exchange it started is pending; RFC 4253 §7.1 allows it
+    // there. Before this, the server read it as the client's KEX init
+    // (`KexFailed`) or NEWKEYS (`ProtocolError`) and the live 32 KiB rekey
+    // test failed whenever the client got there first.
+    const t = std.testing;
+    for ([_]bool{ false, true }) |skip_generic| {
+        var out: [128]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        var wc: CipherState = .plaintext;
+        if (skip_generic) try writePacket(&w, &wc, .os, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_IGNORE)});
+        const disconnect = [_]u8{ @intFromEnum(messages.MessageType.SSH_MSG_DISCONNECT), 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0 };
+        try writePacket(&w, &wc, .os, &disconnect);
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var rc: CipherState = .plaintext;
+        var buf: [128]u8 = undefined;
+        try t.expectError(error.PeerDisconnected, readKexPacket(&r, .{ .r = &rc, .w = &wc, .skip_generic = skip_generic }, &buf));
+    }
+}
+
 test "Algorithms.validate: defaults pass; empty, unknown, duplicate and pseudo-algorithm names are refused" {
     const t = std.testing;
     try (Algorithms{}).validate();
@@ -2981,7 +3107,7 @@ test "negotiate: our configured order decides; the result is the module's consta
     server_kex.encryption_algorithms_client_to_server = &server_ciphers;
     const neg2 = try negotiate(.{ .ciphers = &ours }, server_kex);
     try t.expectEqualStrings("aes256-ctr", neg2.cipher_c2s);
-    try t.expectEqualStrings("hmac-sha2-256", neg2.mac_c2s.?);
+    try t.expectEqualStrings(mac_algorithms[0], neg2.mac_c2s.?);
 }
 
 test "offeredKexAlgorithms: a configured list is offered as given, indicators appended" {
@@ -3713,48 +3839,114 @@ test "chacha20-poly1305@openssh detects tampering" {
     try t.expectError(error.MacVerificationFailed, readPacket(&r, &rc, &rbuf));
 }
 
-test "packet codec round-trip: aes256-ctr + hmac-sha2-256 (fixed keys, multi-packet)" {
+/// Every AES-CTR + HMAC combination `buildCipher` can install.
+const ctr_combos = blk: {
+    var out: [8]AesCtrHmacState = undefined;
+    var i: usize = 0;
+    for ([_]@FieldType(AesCtrHmacState, "key_bits"){ .aes128, .aes256 }) |kb| {
+        for ([_]MacAlgorithm{ .hmac_sha2_256, .hmac_sha2_512 }) |m| {
+            for ([_]bool{ false, true }) |etm| {
+                out[i] = .{
+                    .enc_key = [_]u8{5} ** 32,
+                    .key_bits = kb,
+                    .enc_iv = [_]u8{1} ** 16,
+                    .mac_key = [_]u8{7} ** 64,
+                    .mac = m,
+                    .etm = etm,
+                    .sequence_number = 3,
+                };
+                i += 1;
+            }
+        }
+    }
+    break :blk out;
+};
+
+test "packet codec round-trip: aes128/256-ctr × hmac-sha2-256/512 × EtM or not (multi-packet)" {
     const t = std.testing;
-    const ek = [_]u8{5} ** 32;
-    const iv = [_]u8{1} ** 16;
-    const mk = [_]u8{7} ** 32;
-    var wc: CipherState = .{ .aes256_ctr_hmac_sha256 = .{ .enc_key = ek, .enc_iv = iv, .mac_key = mk, .sequence_number = 3 } };
-    var rc: CipherState = .{ .aes256_ctr_hmac_sha256 = .{ .enc_key = ek, .enc_iv = iv, .mac_key = mk, .sequence_number = 3 } };
+    for (ctr_combos) |combo| {
+        var wc: CipherState = .{ .aes_ctr_hmac = combo };
+        var rc: CipherState = .{ .aes_ctr_hmac = combo };
+        var out: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        // Two packets exercise the running CTR counter across packet boundaries.
+        try writePacket(&w, &wc, .os, "first aes packet payload");
+        const first_len = w.end;
+        try writePacket(&w, &wc, .os, "second aes packet, different length!!");
+        const wire = w.buffered();
+        // EtM sends the length in clear and block-aligns what follows it;
+        // encrypt-and-MAC encrypts the length and aligns the whole packet.
+        const len_field = std.mem.readInt(u32, wire[0..4], .big);
+        const mlen = combo.mac.len();
+        if (combo.etm) {
+            try t.expectEqual(@as(usize, 4 + len_field + mlen), first_len);
+            try t.expectEqual(@as(u32, 0), len_field % 16);
+        } else {
+            try t.expect(4 + @as(usize, len_field) + mlen != first_len);
+            try t.expectEqual(@as(usize, 0), (first_len - mlen) % 16);
+        }
 
-    var out: [1024]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&out);
-    // Two packets exercise the running CTR counter across packet boundaries.
-    try writePacket(&w, &wc, .os, "first aes packet payload");
-    try writePacket(&w, &wc, .os, "second aes packet, different length!!");
-
-    var r: std.Io.Reader = .fixed(w.buffered());
-    var rbuf: [512]u8 = undefined;
-    const p1 = try readPacket(&r, &rc, &rbuf);
-    try t.expectEqualStrings("first aes packet payload", p1.payload);
-    var rbuf2: [512]u8 = undefined;
-    const p2 = try readPacket(&r, &rc, &rbuf2);
-    try t.expectEqualStrings("second aes packet, different length!!", p2.payload);
-    try t.expectEqual(wc.aes256_ctr_hmac_sha256.enc_iv, rc.aes256_ctr_hmac_sha256.enc_iv);
+        var r: std.Io.Reader = .fixed(wire);
+        var rbuf: [512]u8 = undefined;
+        const p1 = try readPacket(&r, &rc, &rbuf);
+        try t.expectEqualStrings("first aes packet payload", p1.payload);
+        try t.expectEqual(mlen, p1.mac.len);
+        var rbuf2: [512]u8 = undefined;
+        const p2 = try readPacket(&r, &rc, &rbuf2);
+        try t.expectEqualStrings("second aes packet, different length!!", p2.payload);
+        try t.expectEqual(wc.aes_ctr_hmac.enc_iv, rc.aes_ctr_hmac.enc_iv);
+        try t.expectEqual(@as(u32, 5), rc.aes_ctr_hmac.sequence_number);
+    }
 }
 
-test "aes256-ctr detects MAC tampering" {
+test "aes-ctr + hmac REJECT: a flipped MAC, ciphertext or length octet fails, in every combination" {
     const t = std.testing;
-    const ek = [_]u8{5} ** 32;
-    const iv = [_]u8{2} ** 16;
-    const mk = [_]u8{7} ** 32;
-    var wc: CipherState = .{ .aes256_ctr_hmac_sha256 = .{ .enc_key = ek, .enc_iv = iv, .mac_key = mk, .sequence_number = 0 } };
-    var out: [256]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&out);
-    try writePacket(&w, &wc, .os, "aes integrity");
-    const wire = w.buffered();
-    var tampered: [256]u8 = undefined;
-    @memcpy(tampered[0..wire.len], wire);
-    tampered[wire.len - 1] ^= 0x80; // flip a MAC byte
+    for (ctr_combos) |combo| {
+        var wc: CipherState = .{ .aes_ctr_hmac = combo };
+        var out: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        try writePacket(&w, &wc, .os, "aes integrity");
+        const wire = w.buffered();
+        // Last octet (MAC), a payload octet (ciphertext), and the first
+        // octet (the length: clear under EtM, encrypted otherwise).
+        for ([_]usize{ wire.len - 1, 9, 0 }) |at| {
+            var tampered: [256]u8 = undefined;
+            @memcpy(tampered[0..wire.len], wire);
+            tampered[at] ^= 0x80;
+            var rc: CipherState = .{ .aes_ctr_hmac = combo };
+            var r: std.Io.Reader = .fixed(tampered[0..wire.len]);
+            var rbuf: [256]u8 = undefined;
+            if (readPacket(&r, &rc, &rbuf)) |_| {
+                return error.TestUnexpectedResult;
+            } else |e| switch (e) {
+                // A flipped length is refused by framing or runs out of input.
+                error.MacVerificationFailed, error.ProtocolError, error.PacketTooLarge, error.EndOfStream => {},
+                else => return e,
+            }
+            // The reader's state is untouched by a refused packet.
+            try t.expectEqual(combo.enc_iv, rc.aes_ctr_hmac.enc_iv);
+            try t.expectEqual(combo.sequence_number, rc.aes_ctr_hmac.sequence_number);
+        }
+    }
+}
 
-    var rc: CipherState = .{ .aes256_ctr_hmac_sha256 = .{ .enc_key = ek, .enc_iv = iv, .mac_key = mk, .sequence_number = 0 } };
-    var r: std.Io.Reader = .fixed(tampered[0..wire.len]);
-    var rbuf: [256]u8 = undefined;
-    try t.expectError(error.MacVerificationFailed, readPacket(&r, &rc, &rbuf));
+test "buildCipher: the negotiated MAC name selects the HMAC and the EtM framing" {
+    const t = std.testing;
+    var kr: KexResult = .{};
+    kr.hash_len = 32;
+    const sid = [_]u8{0x11} ** 32;
+    for ([_][]const u8{ "aes128-ctr", "aes256-ctr" }) |cipher| {
+        for (mac_algorithms) |mac| {
+            const cs = try buildCipher(cipher, mac, .c2s, &kr, &sid, 0);
+            const m = MacAlgorithm.fromName(mac).?;
+            try t.expectEqual(m[0], cs.aes_ctr_hmac.mac);
+            try t.expectEqual(m[1], cs.aes_ctr_hmac.etm);
+            // RFC 6668: the HMAC key is as long as its output; the rest stays zero.
+            try t.expect(std.mem.allEqual(u8, cs.aes_ctr_hmac.mac_key[m[0].len()..], 0));
+        }
+        try t.expectError(error.UnsupportedAlgorithm, buildCipher(cipher, null, .c2s, &kr, &sid, 0));
+        try t.expectError(error.UnsupportedAlgorithm, buildCipher(cipher, "hmac-sha1", .c2s, &kr, &sid, 0));
+    }
 }
 
 test "RFC 3526 primes: exact bit lengths + canonical RFC bytes" {
@@ -4453,6 +4645,11 @@ fn readEd25519PubFromKeyFile(gpa: std.mem.Allocator, io: std.Io, path: []const u
 }
 
 fn liveInterop(kex_name: []const u8, cipher_name: []const u8) !void {
+    return liveInteropMac(kex_name, cipher_name, "hmac-sha2-256");
+}
+
+/// `liveInterop` with `sshd` forced to `MACs=<mac_name>`.
+fn liveInteropMac(kex_name: []const u8, cipher_name: []const u8, mac_name: []const u8) !void {
     const gpa = std.testing.allocator;
 
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -4509,17 +4706,19 @@ fn liveInterop(kex_name: []const u8, cipher_name: []const u8) !void {
     defer gpa.free(ciphers_opt);
     const kex_opt = try std.fmt.allocPrint(gpa, "KexAlgorithms={s}", .{kex_name});
     defer gpa.free(kex_opt);
+    const macs_opt = try std.fmt.allocPrint(gpa, "MACs={s}", .{mac_name});
+    defer gpa.free(macs_opt);
 
     // Start sshd (foreground master; all config via -o, no config file).
     var sshd = std.process.spawn(io, .{
         .argv = &.{
-            sshd_path,            "-D", "-e",                      "-f",
-            "/dev/null",          "-h", hk_path,                   "-o",
-            port_opt,             "-o", "ListenAddress=127.0.0.1", "-o",
-            "UsePAM=no",          "-o", "StrictModes=no",          "-o",
-            "PidFile=none",       "-o", "LogLevel=QUIET",          "-o",
-            kex_opt,              "-o", ciphers_opt,               "-o",
-            "MACs=hmac-sha2-256",
+            sshd_path,      "-D", "-e",                      "-f",
+            "/dev/null",    "-h", hk_path,                   "-o",
+            port_opt,       "-o", "ListenAddress=127.0.0.1", "-o",
+            "UsePAM=no",    "-o", "StrictModes=no",          "-o",
+            "PidFile=none", "-o", "LogLevel=QUIET",          "-o",
+            kex_opt,        "-o", ciphers_opt,               "-o",
+            macs_opt,
         },
         .stdout = .ignore,
         .stderr = .ignore,
@@ -4572,7 +4771,7 @@ fn liveInterop(kex_name: []const u8, cipher_name: []const u8) !void {
     // Confirm the cipher we forced is what got installed.
     switch (transport.read_cipher) {
         .chacha20_poly1305 => try std.testing.expect(std.mem.eql(u8, cipher_name, "chacha20-poly1305@openssh.com")),
-        .aes256_ctr_hmac_sha256 => try std.testing.expect(std.mem.eql(u8, cipher_name, "aes256-ctr")),
+        .aes_ctr_hmac => try std.testing.expect(std.mem.endsWith(u8, cipher_name, "-ctr")),
         .aes_gcm => |st| switch (st.key_bits) {
             .aes256 => try std.testing.expectEqualStrings("aes256-gcm@openssh.com", cipher_name),
             .aes128 => try std.testing.expectEqualStrings("aes128-gcm@openssh.com", cipher_name),
@@ -4593,8 +4792,8 @@ fn liveInterop(kex_name: []const u8, cipher_name: []const u8) !void {
         try std.testing.expect(neg.mac_c2s == null);
         try std.testing.expect(neg.mac_s2c == null);
     } else {
-        try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_c2s.?);
-        try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_s2c.?);
+        try std.testing.expectEqualStrings(mac_name, neg.mac_c2s.?);
+        try std.testing.expectEqualStrings(mac_name, neg.mac_s2c.?);
     }
 
     // ── the refusal path, against the same real server ────────────────────
@@ -4626,6 +4825,14 @@ fn liveInterop(kex_name: []const u8, cipher_name: []const u8) !void {
         try std.testing.expectEqualStrings("127.0.0.1", wrong_pin.seen_host);
         try std.testing.expectEqual(port, wrong_pin.seen_port);
     }
+}
+
+test "live interop against OpenSSH sshd — aes128-ctr × every MAC (EtM and not)" {
+    for (mac_algorithms) |mac| try liveInteropMac("curve25519-sha256", "aes128-ctr", mac);
+}
+
+test "live interop against OpenSSH sshd — aes256-ctr + hmac-sha2-512-etm@openssh.com" {
+    try liveInteropMac("curve25519-sha256", "aes256-ctr", "hmac-sha2-512-etm@openssh.com");
 }
 
 test "live interop against OpenSSH sshd — curve25519 + chacha20-poly1305@openssh.com" {
