@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte
+  vector stores LLVM realigned the frame of a burn of 2 KiB or less (`and $-32, %rsp`), and the 32..63
+  bytes between the zeroed buffer and the saved frame pointer kept whatever a callee had left there
+  (a 32-byte scalar survived in `voprf`'s probe). Here that was `rng_burn` (2 KiB). Every burn now uses 16-byte
+  stores, which need no realignment. No API change.
+
 - **2026-10-09** — **BREAKING, HIGH: every BBS entry point left its secrets on the dead stack
   or in freed heap.** New ReleaseFast stack probe (`stackprobe_test.zig`: stack window plus a
   scanned heap arena), 5 calls each, before → after: `keyGen` SK 40, the key material 5 and the

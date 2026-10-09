@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte
+  vector stores LLVM realigned the frame of a burn of 2 KiB or less (`and $-32, %rsp`), and the 32..63
+  bytes between the zeroed buffer and the saved frame pointer kept whatever a callee had left there
+  (a 32-byte scalar survived in `voprf`'s probe). Here that was `short_path_burn` (2 KiB). Every burn now uses 16-byte
+  stores, which need no realignment. No API change.
+
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
   engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
   through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised

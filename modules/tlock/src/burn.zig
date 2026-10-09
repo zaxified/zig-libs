@@ -9,14 +9,15 @@
 
 /// Zero `n` bytes of stack below the caller.
 pub noinline fn stack(comptime n: usize) void {
-    // Volatile 32-byte vector stores: `secureZero` is a volatile byte memset
-    // (~3 B/ns without libc, 2.5 µs per 8 KiB); this is ~100 B/ns (2026-10-08).
-    const V = @Vector(4, u64);
-    // align(16), not `V`'s natural 32: a 32-aligned buffer makes the frame
-    // realign, and the up to 56 bytes between the saved frame pointer and
-    // the buffer stayed unzeroed — a callee's secret survived there
-    // (threshold_ecdsa stack probe, 2026-10-08). At 16 the buffer ends at
-    // the saved frame pointer.
+    // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
+    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
+    // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
+    // between the buffer top and the saved frame pointer unzeroed -- a callee's
+    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // the buffer alone did not stop it). At 16 the frame needs no realignment and
+    // the buffer ends at the saved frame pointer.
+    const V = @Vector(2, u64);
     var buf: [n / @sizeOf(V)]V align(16) = undefined;
     const p: [*]align(16) volatile V = &buf;
     for (0..buf.len) |i| p[i] = @splat(0);
