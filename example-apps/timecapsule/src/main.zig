@@ -129,7 +129,8 @@ fn keygen(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) 
 
     var seed: [hqc.params.seed_bytes]u8 = undefined;
     try io.randomSecure(&seed);
-    var kp = Kem.keypair(&seed);
+    var kp: Kem.KeyPair = undefined;
+    Kem.keypair(&kp, &seed);
     defer std.crypto.secureZero(u8, &kp.dk);
     std.crypto.secureZero(u8, &seed);
 
@@ -227,13 +228,14 @@ fn seal(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
 
     // `rnd` is half the raw material of the derived content key; zero it after
     // sealing, the same hygiene keygen/open apply to every other secret here.
-    var rnd = Env.SealRandomness.generate(io);
+    var rnd: Env.SealRandomness = undefined;
+    Env.SealRandomness.generate(&rnd, io);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&rnd));
     sealed: {
         out_w.interface.writeAll(capsule_magic) catch break :sealed;
         out_w.interface.writeByte(capsule_version) catch break :sealed;
         out_w.interface.writeAll(&info.chain_hash) catch break :sealed;
-        Env.sealStream(gpa, &out_w.interface, &in_r.interface, ek, p_pub, round, rnd) catch |err| {
+        Env.sealStream(gpa, &out_w.interface, &in_r.interface, &ek, p_pub, round, &rnd) catch |err| {
             if (err == error.ReadFailed) {
                 std.debug.print("timecapsule: reading {s} failed: {t}\n", .{ in_file, in_r.err.? });
                 out.abort(io);
@@ -395,7 +397,7 @@ fn open(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
     };
     const sig = round.signatureG1() catch unreachable; // verifyRound already required G1
 
-    if (cap.version == tle.envelope.version) return openV1(gpa, io, in_file, out_file, dk, sig);
+    if (cap.version == tle.envelope.version) return openV1(gpa, io, in_file, out_file, &dk, sig);
 
     var in_f = std.Io.Dir.cwd().openFile(io, in_file, .{}) catch |err| {
         std.debug.print("timecapsule: cannot read {s}: {t}\n", .{ in_file, err });
@@ -417,7 +419,7 @@ fn open(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
 
     opened: {
         in_r.interface.discardAll(capsule_header_bytes) catch break :opened;
-        Env.openStream(gpa, &out_w.interface, &in_r.interface, dk, sig) catch |err| switch (err) {
+        Env.openStream(gpa, &out_w.interface, &in_r.interface, &dk, sig) catch |err| switch (err) {
             error.ReadFailed, error.WriteFailed => break :opened,
             else => {
                 std.debug.print("timecapsule: open REFUSED: {t}\n", .{err});
@@ -446,7 +448,7 @@ fn openV1(
     io: std.Io,
     in_file: []const u8,
     out_file: []const u8,
-    dk: Kem.DecapsKey,
+    dk: *const Kem.DecapsKey,
     sig: drand.bls12_381.g1.Affine,
 ) !u8 {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, in_file, gpa, .limited(capsule_header_bytes + Env.overhead + max_v1_plaintext_bytes)) catch |err| {
