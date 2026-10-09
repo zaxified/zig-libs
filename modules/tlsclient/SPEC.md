@@ -180,18 +180,28 @@ NEG = 0, POS >= 1. Needles: the four seeds, the ML-KEM secret vector and sigma,
 the P-256/P-384 scalars, the X25519 scalar (raw and clamped), every shared
 secret (ML-KEM K and r, X25519, ECDH x), the handshake and master secrets, the
 client/server handshake traffic secrets, finished keys, handshake keys, and the
-HMAC pads of the HKDF keys. Still open: the application traffic secrets and
-keys, the Finished MACs and the certificate path of a full handshake (the probe
-feeds only a ServerHello; the burn covers them by depth, unmeasured), and TLS
-1.2 (ECDHE_RSA key schedule). The 12-byte IVs are shorter than a needle window
-and are not probed. (The P-256/P-384 shared-secret multiply was variable-time in
-std -- `mulPublic` on our ephemeral scalar -- and is `mul` here since 2026-10-09.)
-Also open (coordinator review, 2026-10-09): `init` returns `Client` BY VALUE (std's
-shape), so the finished `Client` -- application record keys included -- is
-copied through `burn.run`'s result slot in `init`'s frame, above the burn, and
-through the caller's temporaries. The fix is an `initInto(out: *Client, …)`
-beside the std-compatible `init` (the pattern of the other secret APIs); the
-probe needs a full server flight to see it.
+HMAC pads of the HKDF keys. TLS 1.2 (ECDHE_RSA key schedule) is not probed.
+The 12-byte IVs are shorter than a needle window and are not probed. (The
+P-256/P-384 shared-secret multiply was variable-time in std -- `mulPublic` on
+our ephemeral scalar -- and is `mul` here since 2026-10-09.)
+
+**2026-10-09 (resolved, the established session):** `init` returns `Client`
+BY VALUE (std's shape), so the finished `Client` -- application traffic
+secrets and keys -- was copied through `burn.run`'s result slot in `init`'s
+frame, above the burn, and through the caller's temporaries. New
+`Client.initInto(out: *Client, …)` beside the std-compatible `init` writes the
+session to `out` inside the burned call tree; `http.Client` dials with it. The
+probe now also feeds a full server flight (ChangeCipherSpec, EncryptedExtensions,
+a P-256 Certificate, CertificateVerify, Finished; `.ca = .no_verification`, the
+signature and MAC still checked) and checks reach through the logged client
+application secret: through `init` 640 windows over the 8 sets (client/server
+application traffic secrets and keys, 437-989 B below the region top: the
+wrapper's and the caller's frames) → 0 through `initInto`. The full flight
+reaches 296 KiB below the body's entry for every group and suite (certificate
+parse + ECDSA verify, deeper than the ECDHE path), so `init_burn` went 320 →
+384 KiB. Still open: an RSA server key and `.ca = .bundle` verification are
+covered by depth only (unmeasured), and `init` itself keeps std's by-value shape
+(documented on the function).
 
 **2026-10-04:** ALPN and TLS 1.3 client certificates are **done**. Still
 deferred: session-ticket resumption (a PSK/ticket state machine and a session

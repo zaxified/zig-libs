@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **HIGH: the established session's application secrets
+  were left on the dead stack by `Client.init`'s by-value return.** New
+  `Client.initInto(out: *Client, input, output, options)` writes the session to
+  `out` inside the burned call tree; `init` keeps std's shape (doc comment points
+  to `initInto`). The stack probe now drives a full server flight
+  (EncryptedExtensions, Certificate, CertificateVerify, Finished) per group and
+  suite: through `init` 640 needle windows over the 8 sets (client/server
+  application traffic secrets and keys, in the wrapper's and the caller's
+  frames) → 0 through `initInto`. The full flight reaches 296 KiB below the body,
+  so `burn.init_burn` 320 → 384 KiB. Additive API, no wire change.
+
 - **2026-10-09** — **HIGH: the ECDHE key shares and the handshake key schedule
   left their secrets on the dead stack after `Client.init`.** ReleaseFast stack
   probe (`stackprobe_test.zig`) drives `init` with a canned ServerHello per group

@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **Fix, https dial: no copy of the TLS session keys on the dead stack.** The dial
+  now uses `tlsclient.Client.initInto`, which writes the established session (application traffic
+  keys) straight into the connection; `init`'s by-value return left a copy in dead frames
+  (tlsclient stack probe). No API or behaviour change.
+
 - **2026-10-07** — **Fix (behaviour change), `h1.ChunkedReader` reads chunk extensions.** Everything
   after the first `;` on a chunk-size line used to pass unread, so a bare CR, a control byte or an
   unterminated quoted-string inside an extension decoded clean -- room for a parser in front to read

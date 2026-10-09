@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack residue probe for the client-certificate signature
-//! (`Client.signCertificateVerify`, all three key types). Kept in the module
-//! per `CONVENTIONS.md` §9.
+//! (`Client.signCertificateVerify`, all three key types) and for the handshake
+//! (`Client.initInto`: a ServerHello alone, and a full server flight that
+//! returns an established session — its application secrets must stay in the
+//! `Client` only). Kept in the module per `CONVENTIONS.md` §9.
 //!
 //! Method as `acme`'s probe: paint a stack window below the probe, run the
 //! call `PAD` bytes deeper, snapshot the window and look for secrets.
@@ -32,7 +34,7 @@ const Sha512 = std.crypto.hash.sha2.Sha512;
 const Es256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const Es384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 
-const WINDOW = 256 * 1024;
+const WINDOW = 512 * 1024; // deeper than `burn.init_burn`
 const LEAK = 32;
 const W = 16; // needle window
 
@@ -416,6 +418,8 @@ var log_buf: [4096]u8 = undefined;
 var log_writer: Writer = undefined;
 var key_log: Client.SslKeyLog = undefined;
 var use_key_log = false;
+/// The established session lives here, off the stack (a full flight only).
+var client_sink: Client = undefined;
 
 noinline fn callInit() void {
     in_reader = Reader.fixed(&in_buf);
@@ -430,7 +434,10 @@ noinline fn callInit() void {
         .realtime_now = .{ .nanoseconds = 0 },
         .ssl_key_log = if (use_key_log) &key_log else null,
     };
-    if (Client.init(&in_reader, &out_writer, opts)) |_| init_err = error.Unexpected else |e| init_err = e;
+    init_err = null;
+    Client.initInto(&client_sink, &in_reader, &out_writer, opts) catch |e| {
+        init_err = e;
+    };
 }
 
 // ── the client's ephemeral keys, recomputed from the entropy ────────────────
@@ -508,9 +515,14 @@ fn addPads(n: *Needles, name: []const u8, key: []const u8) void {
     n.addImage(name, b[0..key.len]);
 }
 
+fn Schedule(comptime Hash: type) type {
+    return struct { s_ts: [Hash.digest_length]u8, master: [Hash.digest_length]u8 };
+}
+
 /// The handshake key schedule (RFC 8446 §7.1) for `shared`; returns the
-/// server handshake traffic secret (the reach check looks for it in the key log).
-fn scheduleNeedles(comptime Hash: type, comptime aead_key_len: usize, n: *Needles, shared: []const u8, hello_hash: *const [Hash.digest_length]u8) [Hash.digest_length]u8 {
+/// server handshake traffic secret (the reach check looks for it in the key
+/// log) and the master secret (a full flight derives the application secrets).
+fn scheduleNeedles(comptime Hash: type, comptime aead_key_len: usize, n: *Needles, shared: []const u8, hello_hash: *const [Hash.digest_length]u8) Schedule(Hash) {
     const K = Hkdf(if (Hash == Sha256) Hmac.HmacSha256 else Hmac.HmacSha384);
     const dl = Hash.digest_length;
     const zeroes = [1]u8{0} ** dl;
@@ -536,7 +548,130 @@ fn scheduleNeedles(comptime Hash: type, comptime aead_key_len: usize, n: *Needle
     addPads(n, "hmac pad", &ap_derived);
     addPads(n, "hmac pad", &c_ts);
     addPads(n, "hmac pad", &s_ts);
-    return s_ts;
+    return .{ .s_ts = s_ts, .master = master };
+}
+
+// ── the server's encrypted flight (a full TLS 1.3 handshake) ────────────────
+//
+// ChangeCipherSpec, then EncryptedExtensions, Certificate, CertificateVerify
+// and Finished, each in a record of its own under the server handshake key, appended to the
+// ServerHello so `Client.init` returns an established session. The server
+// certificate is the throwaway `client-p256` leaf (its key is in testdata);
+// `.ca = .no_verification` skips the chain, but the CertificateVerify
+// signature and the Finished MAC are checked as in any handshake.
+
+const server_cert_der = derFromPem(@embedFile("testdata/client-p256.pem"));
+const server_key_der = @embedFile("testdata/client-p256.key.der");
+
+fn derFromPem(comptime pem: []const u8) []const u8 {
+    const S = struct {
+        const der = blk: {
+            @setEvalBranchQuota(1_000_000);
+            const begin = std.mem.indexOf(u8, pem, "-----\n").? + 6;
+            const end = std.mem.indexOf(u8, pem, "\n-----END").?;
+            var clean: [end - begin]u8 = undefined;
+            var len: usize = 0;
+            for (pem[begin..end]) |ch| if (ch != '\n') {
+                clean[len] = ch;
+                len += 1;
+            };
+            const b64 = clean[0..len];
+            var out: [std.base64.standard.Decoder.calcSizeForSlice(b64) catch unreachable]u8 = undefined;
+            std.base64.standard.Decoder.decode(&out, b64) catch unreachable;
+            break :blk out;
+        };
+    };
+    return &S.der;
+}
+
+/// One handshake message (`typ`, u24 length, `body`) into `buf`.
+fn hsMsg(buf: []u8, typ: tls.HandshakeType, body: []const u8) []const u8 {
+    buf[0] = @intFromEnum(typ);
+    std.mem.writeInt(u24, buf[1..4], @intCast(body.len), .big);
+    @memcpy(buf[4..][0..body.len], body);
+    return buf[0 .. 4 + body.len];
+}
+
+/// `msg` as one TLS 1.3 record (inner type handshake) appended to `in_buf`.
+fn appendRecord(comptime Aead: type, key: [Aead.key_length]u8, iv: [Aead.nonce_length]u8, seq: u64, msg: []const u8) void {
+    var pt: [2048]u8 = undefined;
+    @memcpy(pt[0..msg.len], msg);
+    pt[msg.len] = @intFromEnum(tls.ContentType.handshake);
+    const inner = pt[0 .. msg.len + 1];
+    const rec = in_buf[in_len..];
+    rec[0..3].* = .{ @intFromEnum(tls.ContentType.application_data), 3, 3 };
+    std.mem.writeInt(u16, rec[3..5], @intCast(inner.len + Aead.tag_length), .big);
+    var nonce = iv;
+    var seq_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seq_be, seq, .big);
+    for (nonce[nonce.len - 8 ..], seq_be) |*b, s| b.* ^= s;
+    Aead.encrypt(rec[5..][0..inner.len], rec[5 + inner.len ..][0..Aead.tag_length], inner, rec[0..5], nonce, key);
+    in_len += 5 + inner.len + Aead.tag_length;
+}
+
+/// Appends the server's encrypted flight after the ServerHello in `in_buf`
+/// and returns the client application traffic secret (the reach check looks
+/// for it in the key log); adds the application secrets and keys as needles.
+fn appendServerFlight(comptime Hash: type, comptime Aead: type, n: *Needles, sched: Schedule(Hash), transcript: *Hash) ![Hash.digest_length]u8 {
+    const HmacT = if (Hash == Sha256) Hmac.HmacSha256 else Hmac.HmacSha384;
+    const K = Hkdf(HmacT);
+    const dl = Hash.digest_length;
+    const key = tls.hkdfExpandLabel(K, sched.s_ts, "key", "", Aead.key_length);
+    const iv = tls.hkdfExpandLabel(K, sched.s_ts, "iv", "", Aead.nonce_length);
+    var buf: [2048]u8 = undefined;
+    var body: [2048]u8 = undefined;
+
+    // The middlebox-compatibility ChangeCipherSpec: std's client switches to
+    // the handshake keys on it, not on the ServerHello.
+    putBytes(&in_len, &.{ @intFromEnum(tls.ContentType.change_cipher_spec), 3, 3, 0, 1, 1 });
+
+    const ee = hsMsg(&buf, .encrypted_extensions, &.{ 0, 0 });
+    transcript.update(ee);
+    appendRecord(Aead, key, iv, 0, ee);
+
+    const der = server_cert_der;
+    body[0] = 0; // certificate_request_context
+    std.mem.writeInt(u24, body[1..4], @intCast(3 + der.len + 2), .big);
+    std.mem.writeInt(u24, body[4..7], @intCast(der.len), .big);
+    @memcpy(body[7..][0..der.len], der);
+    std.mem.writeInt(u16, body[7 + der.len ..][0..2], 0, .big); // no extensions
+    const cert = hsMsg(&buf, .certificate, body[0 .. 7 + der.len + 2]);
+    transcript.update(cert);
+    appendRecord(Aead, key, iv, 1, cert);
+
+    // SEC1 ECPrivateKey: 30 77 02 01 01 04 20 <32-byte scalar> …
+    try std.testing.expectEqualSlices(u8, "\x30\x77\x02\x01\x01\x04\x20", server_key_der[0..7]);
+    const kp = try Es256.KeyPair.fromSecretKey(try Es256.SecretKey.fromBytes(server_key_der[7..39].*));
+    const signed = " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00";
+    var cv_msg: [signed.len + dl]u8 = undefined;
+    cv_msg[0..signed.len].* = signed.*;
+    cv_msg[signed.len..].* = transcript.peek();
+    var sig_der: [Es256.Signature.der_encoded_length_max]u8 = undefined;
+    const sig = (try kp.sign(&cv_msg, null)).toDer(&sig_der);
+    std.mem.writeInt(u16, body[0..2], @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256), .big);
+    std.mem.writeInt(u16, body[2..4], @intCast(sig.len), .big);
+    @memcpy(body[4..][0..sig.len], sig);
+    const cv = hsMsg(&buf, .certificate_verify, body[0 .. 4 + sig.len]);
+    transcript.update(cv);
+    appendRecord(Aead, key, iv, 2, cv);
+
+    const fin_key = tls.hkdfExpandLabel(K, sched.s_ts, "finished", "", HmacT.key_length);
+    const verify_data = tls.hmac(HmacT, &transcript.peek(), fin_key);
+    const fin = hsMsg(&buf, .finished, &verify_data);
+    transcript.update(fin);
+    appendRecord(Aead, key, iv, 3, fin);
+
+    const h = transcript.peek();
+    const c_ap = tls.hkdfExpandLabel(K, sched.master, "c ap traffic", &h, dl);
+    const s_ap = tls.hkdfExpandLabel(K, sched.master, "s ap traffic", &h, dl);
+    n.addBoth("c ap ts", &c_ap);
+    n.addBoth("s ap ts", &s_ap);
+    n.addBoth("c ap key", &tls.hkdfExpandLabel(K, c_ap, "key", "", Aead.key_length));
+    n.addBoth("s ap key", &tls.hkdfExpandLabel(K, s_ap, "key", "", Aead.key_length));
+    addPads(n, "hmac pad", &sched.master);
+    addPads(n, "hmac pad", &c_ap);
+    addPads(n, "hmac pad", &s_ap);
+    return c_ap;
 }
 
 /// Every ephemeral secret the client holds, whatever group the server picks.
@@ -568,13 +703,17 @@ fn hex(comptime N: usize, b: *const [N]u8) [N * 2]u8 {
     return std.fmt.bytesToHex(b.*, .lower);
 }
 
-fn kexCase(comptime group: tls.NamedGroup, comptime suite: tls.CipherSuite, ci: u8) !usize {
+/// `full`: the server's whole first flight follows, and `Client.init` returns
+/// an established session (application secrets); otherwise the input ends
+/// after the ServerHello and the call fails on the truncation.
+fn kexCase(comptime group: tls.NamedGroup, comptime suite: tls.CipherSuite, comptime full: bool, ci: u8) !usize {
     const Hash = switch (suite) {
         .AES_128_GCM_SHA256 => Sha256,
         .AES_256_GCM_SHA384 => Sha384,
         else => @compileError("suite"),
     };
     const key_len = if (Hash == Sha256) 16 else 32;
+    const Aead = if (Hash == Sha256) std.crypto.aead.aes_gcm.Aes128Gcm else std.crypto.aead.aes_gcm.Aes256Gcm;
 
     kex_entropy = derive("tls-kex-entropy", ci, Client.Options.entropy_len);
     keys = .{
@@ -658,12 +797,26 @@ fn kexCase(comptime group: tls.NamedGroup, comptime suite: tls.CipherSuite, ci: 
     th.update(out_writer.buffered()[tls.record_header_len..]); // ClientHello
     th.update(in_buf[tls.record_header_len..in_len]); // ServerHello
     const hello_hash = th.peek();
-    const s_ts = scheduleNeedles(Hash, key_len, &n, shared, &hello_hash);
-    try std.testing.expect(std.mem.indexOf(u8, log_writer.buffered(), &hex(Hash.digest_length, &s_ts)) != null);
+    const sched = scheduleNeedles(Hash, key_len, &n, shared, &hello_hash);
+    try std.testing.expect(std.mem.indexOf(u8, log_writer.buffered(), &hex(Hash.digest_length, &sched.s_ts)) != null);
+
+    if (full) {
+        // Reach: the whole flight is accepted and the client logs the
+        // application secret we derived.
+        const c_ap = try appendServerFlight(Hash, Aead, &n, sched, &th);
+        log_writer = Writer.fixed(&log_buf);
+        key_log = .{ .client_key_seq = 0, .server_key_seq = 0, .client_random = undefined, .writer = &log_writer };
+        use_key_log = true;
+        callInit();
+        use_key_log = false;
+        try std.testing.expectEqual(@as(?anyerror, null), init_err);
+        try std.testing.expect(std.mem.indexOf(u8, log_writer.buffered(), &hex(Hash.digest_length, &c_ap)) != null);
+    }
 
     n.sort();
     leak_src = keys.x25519.secret_key;
-    return runProbe("Client.init " ++ @tagName(group) ++ " / " ++ @tagName(suite), callInit, &n);
+    const what = if (full) " full flight" else " ServerHello";
+    return runProbe("Client.init " ++ @tagName(group) ++ " / " ++ @tagName(suite) ++ what, callInit, &n);
 }
 
 test "STACKPROBE: no ECDHE or handshake key-schedule residue on the dead stack after Client.init" {
@@ -672,7 +825,20 @@ test "STACKPROBE: no ECDHE or handshake key-schedule residue on the dead stack a
     var ci: u8 = 0;
     inline for (.{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1 }) |g| {
         inline for (.{ .AES_128_GCM_SHA256, .AES_256_GCM_SHA384 }) |s| {
-            bad += try kexCase(g, s, ci);
+            bad += try kexCase(g, s, false, ci);
+            ci += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "STACKPROBE: no application secret residue on the dead stack after a full Client.init handshake" {
+    try skipUnlessOptimized();
+    var bad: usize = 0;
+    var ci: u8 = 32;
+    inline for (.{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1 }) |g| {
+        inline for (.{ .AES_128_GCM_SHA256, .AES_256_GCM_SHA384 }) |s| {
+            bad += try kexCase(g, s, true, ci);
             ci += 1;
         }
     }

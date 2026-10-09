@@ -35,6 +35,10 @@ var client = try tls.Client.init(&net_reader.interface, &net_writer.interface, .
 });
 ```
 
+`Client.initInto(&client, reader, writer, options)` is the same handshake
+writing the session to `client` in place: `init`'s by-value return leaves a
+copy of the application traffic keys on the dead stack, `initInto` does not.
+
 What changes for a caller: a chain std would have accepted is refused with
 `error.TlsCertificateNotVerified` when an issuer in it is not a CA, a
 pathLen/keyUsage/nameConstraints rule is broken, or the leaf's extKeyUsage

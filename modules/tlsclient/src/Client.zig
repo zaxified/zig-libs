@@ -265,6 +265,11 @@ pub const InitError = error{
 /// `host` is only borrowed during this function call.
 ///
 /// `input` is asserted to have buffer capacity at least `min_buffer_len`.
+///
+/// std's shape, kept for drop-in use. The returned `Client` holds the
+/// application traffic secrets and keys, and returning it by value leaves a
+/// copy in this function's dead frame and in the caller's temporaries; use
+/// `initInto` to have the handshake write it straight to its final place.
 pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client {
     // zig-libs tlsclient: dead-stack burn. The ECDHE secrets and the key
     // schedule live in `initBody`'s frame and in std's callee frames (X25519,
@@ -272,6 +277,18 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     // zeroes everything it dirtied (see `burn.init_burn`). `options` is copied
     // into the argument tuple: pointers and public values only.
     return burn.run(burn.init_burn, InitError!Client, initBody, .{ input, output, options });
+}
+
+/// `init`, with the established session written to `out` (zig-libs
+/// tlsclient). The application traffic secrets and keys are copied only
+/// inside the burned call tree, so no copy is left on the dead stack, in this
+/// frame or the caller's. `out` is left untouched on error.
+pub fn initInto(out: *Client, input: *Reader, output: *Writer, options: Options) InitError!void {
+    return burn.run(burn.init_burn, InitError!void, initIntoBody, .{ out, input, output, options });
+}
+
+fn initIntoBody(out: *Client, input: *Reader, output: *Writer, options: Options) InitError!void {
+    out.* = try initBody(input, output, options);
 }
 
 fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client {

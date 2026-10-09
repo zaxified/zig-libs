@@ -1876,7 +1876,10 @@ fn dialTls(c: *Client, url: http.Url) Error!*Conn {
     // material too — this seeds the ClientHello random and key share for
     // every HTTPS request, so fail closed instead.
     try io.randomSecure(&entropy);
-    conn.tls_client = tls.Client.init(&conn.sr.interface, &conn.sw.interface, .{
+    // `initInto`, not `init`: the session (application traffic keys) is
+    // written in place, with no by-value copy left on the dead stack.
+    conn.tls_client = @as(tls.Client, undefined);
+    tls.Client.initInto(&conn.tls_client.?, &conn.sr.interface, &conn.sw.interface, .{
         .host = switch (o.tls.verify) {
             .strict => .{ .explicit = url.host },
             .insecure_no_verify => .no_verification,
@@ -1902,10 +1905,13 @@ fn dialTls(c: *Client, url: http.Url) Error!*Conn {
         // Fine for HTTP: framing (Content-Length/chunked) detects
         // truncation at the layer above.
         .allow_truncation_attacks = true,
-    }) catch |err| switch (err) {
-        error.ReadFailed, error.WriteFailed => return error.ConnectFailed,
-        error.Canceled => return error.Canceled,
-        else => return error.TlsFailed,
+    }) catch |err| {
+        conn.tls_client = null;
+        return switch (err) {
+            error.ReadFailed, error.WriteFailed => error.ConnectFailed,
+            error.Canceled => error.Canceled,
+            else => error.TlsFailed,
+        };
     };
     return conn;
 }
