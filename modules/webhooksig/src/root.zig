@@ -268,6 +268,12 @@ fn decodeMac(d: Digest, e: Encoding, text: []const u8) ?[max_mac_length]u8 {
     var out: [max_mac_length]u8 = @splat(0);
     const n = d.macLength();
     if (text.len != e.encodedLen(n)) return null;
+    // The right LENGTH can still be the wrong SHAPE: a padded length filled
+    // with base64 characters and no `=` decodes past `n` (2026-10-09).
+    if (e == .base64) {
+        const sz = std.base64.standard.Decoder.calcSizeForSlice(text) catch return null;
+        if (sz != n) return null;
+    }
     switch (e) {
         .hex => _ = std.fmt.hexToBytes(out[0..n], text) catch return null,
         .base64 => std.base64.standard.Decoder.decode(out[0..n], text) catch return null,
@@ -566,6 +572,11 @@ pub const standard = struct {
                 seen_v1a += 1;
                 if (seen_v1a > max_ed25519_signatures) return error.InvalidHeader;
                 if (value.len != 88) continue;
+                // 88 characters WITHOUT `==` padding decode to 66 octets: size
+                // first, then decode into the fixed buffer (the websocket key
+                // defect of 2026-10-09, same shape).
+                const sz = std.base64.standard.Decoder.calcSizeForSlice(value) catch continue;
+                if (sz != 64) continue;
                 var sb: [64]u8 = undefined;
                 std.base64.standard.Decoder.decode(&sb, value) catch continue;
                 const sig = Ed25519.Signature.fromBytes(sb);
@@ -1196,6 +1207,14 @@ test "corpus: every presented value reaches presentedMac, and the counts are pin
     try testing.expectEqual(@as(usize, 8), distinct_secrets);
 }
 
+test "decodeMac: a padded-length base64 value with no `=` is refused, not decoded past the MAC" {
+    // Regression 2026-10-09: 44 base64 characters decode to 33 octets, one more
+    // than SHA-256's 32; only the length was checked before the decode.
+    try testing.expect(decodeMac(.sha256, .base64, "A" ** 44) == null);
+    try testing.expect(decodeMac(.sha512, .base64, "A" ** 88) == null);
+    try testing.expect(decodeMac(.sha256, .base64, "A" ** 43 ++ "=") != null);
+}
+
 test "computeHex is lowercase hex and matches a well-known HMAC-SHA256 demo vector" {
     // NOT an RFC 4231 vector (RFC 4231's HMAC-SHA256 keys/data are the
     // 0x0b*20/"Jefe"/0xaa*20/... test cases) — this key="key" /
@@ -1535,6 +1554,10 @@ test "Standard Webhooks v1a: Ed25519 against openssl, both whsk_ layouts" {
     // are one too many.
     const junk = "v1a,x " ** max_ed25519_signatures;
     try testing.expectError(error.InvalidHeader, standard.verify(keys, sw_id, "1614265330", junk ++ sw_v1a, sw_payload, @intCast(sw_ts), 300));
+    // An 88-character v1a value WITHOUT `==` padding decodes to 66 octets: it
+    // must be skipped, not decoded into the 64-octet signature buffer (same
+    // shape as the websocket key defect of 2026-10-09).
+    try standard.verify(keys, sw_id, "1614265330", "v1a," ++ "A" ** 88 ++ " " ++ sw_v1a, sw_payload, @intCast(sw_ts), 300);
     const fits = "v1a,x " ** (max_ed25519_signatures - 1);
     try standard.verify(keys, sw_id, "1614265330", fits ++ sw_v1a, sw_payload, @intCast(sw_ts), 300);
 }

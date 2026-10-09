@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **SECURITY FIX (verifier DoS / stack overflow write):** a `v1a` signature
+  of exactly 88 base64 characters without `==` padding decodes to 66 octets and was decoded
+  into the 64-octet signature buffer — a panic in safe builds, 2 octets past the buffer in
+  ReleaseFast, from an attacker-supplied header. Such a value is now skipped like any other
+  undecodable entry. The same defect in `decodeMac` (every `v1`/base64 HMAC signature:
+  44 characters without `=` decode to 33 octets for SHA-256's 32) is fixed the same way.
+  Same shape as the websocket key defect found by fuzzing that day; regression tests.
 - **2026-10-09** — Dead-stack burn: `standard.encodeSecret` (the raw HMAC key) now runs under `burn.run` (2 KiB); probed in the new `stackprobe2_test.zig`. No signature change.
 
 - **2026-10-09** — **BREAKING:** dead-stack burns on every secret-touching entry point, and the

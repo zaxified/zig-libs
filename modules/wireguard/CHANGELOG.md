@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — **SECURITY FIX (panic / stack overflow write on a malformed key):**
+  `keyFromBase64`/`keyFromBase64Into` checked only the text length (44); 44 base64
+  characters without the trailing `=` decode to 33 octets and were decoded into the
+  32-octet key — a panic in safe builds, one octet past the key in ReleaseFast. The
+  decoded size is checked first now (`error.InvalidKey`). Same shape as the websocket
+  key defect found by fuzzing that day; regression test.
 - **2026-10-09** — `check-secret-api` refinement (struct fields named `key`/`keys`): `Session.init` and `Session.expired` carry `secret-api-ok:` markers (the first only forwards key pointers to the memcpy-only `SendSession.init`/`RecvSession.init`, the second reads the public `born_s`). No code or signature change.
 - **2026-10-09** — Dead-stack burn: `noise.keyedMac` (mac1/mac2 key, cookie secret) now runs under `burn.run` (2 KiB, per handshake message); probed in the new `stackprobe2_test.zig` on `testkit.stackprobe`. No signature change.
 

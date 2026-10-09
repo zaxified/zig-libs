@@ -217,6 +217,11 @@ pub fn keyFromBase64Into(s: []const u8, out: *Key) KeyParseError!void {
 fn keyFromBase64Body(s: []const u8, out: *Key) KeyParseError!void {
     errdefer std.crypto.secureZero(u8, out);
     if (s.len != key_b64_len) return error.InvalidKey;
+    // 44 base64 characters WITHOUT the trailing `=` decode to 33 octets:
+    // size first, then decode into the 32-octet key (2026-10-09; the
+    // websocket/webhooksig defect shape).
+    const sz = std.base64.standard.Decoder.calcSizeForSlice(s) catch return error.InvalidKey;
+    if (sz != key_len) return error.InvalidKey;
     std.base64.standard.Decoder.decode(out, s) catch return error.InvalidKey;
     // Reject non-canonical trailing bits (e.g. "…B=" where "…A=" is meant).
     var back = keyToBase64(out.*);
@@ -1138,6 +1143,9 @@ test "key base64: zero-key vector, round-trip, malformed inputs" {
     try testing.expectError(error.InvalidKey, keyFromBase64(""));
     try testing.expectError(error.InvalidKey, keyFromBase64("short"));
     try testing.expectError(error.InvalidKey, keyFromBase64(zero_b64[0..43]));
+    // Regression 2026-10-09: the right length without the `=` decodes to 33
+    // octets and used to be decoded into the 32-octet key.
+    try testing.expectError(error.InvalidKey, keyFromBase64("A" ** 44));
     var bad_char = text;
     bad_char[10] = '!';
     try testing.expectError(error.InvalidKey, keyFromBase64(&bad_char));
