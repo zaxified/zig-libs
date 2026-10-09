@@ -22,9 +22,10 @@
 //! size must equal libzstd's to the byte (the module emits libzstd's frames), a
 //! decompressed size the input's; otherwise the run fails.
 //!
-//! Arguments, if any, keep only the workloads whose name (`x-ray.c1`) contains
-//! one of them: `zig build bench-zstd -- x-ray.c1 d3`. The card's line needs
-//! the full run.
+//! Arguments, if any, keep only the workloads they name: a whole name
+//! (`x-ray.c1`, not `x-ray.c19`) or, without a dot, any part of one (`d3`,
+//! `xml`): `zig build bench-zstd -- x-ray.c1 d3`. The card's line needs the
+//! full run.
 
 const std = @import("std");
 const zstd = @import("zstd");
@@ -45,7 +46,10 @@ fn selected(filters: []const [:0]const u8, file: []const u8, op: Op) bool {
     if (filters.len == 0) return true;
     var buf: [64]u8 = undefined;
     const name = std.fmt.bufPrint(&buf, "{s}.{s}", .{ file, op.tag }) catch return true;
-    for (filters) |f| if (std.mem.indexOf(u8, name, f) != null) return true;
+    for (filters) |f| {
+        const hit = if (std.mem.indexOfScalar(u8, f, '.') != null) std.mem.eql(u8, name, f) else std.mem.indexOf(u8, name, f) != null;
+        if (hit) return true;
+    }
     return false;
 }
 

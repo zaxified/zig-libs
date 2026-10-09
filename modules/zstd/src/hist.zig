@@ -2,13 +2,13 @@
 //! Byte histograms (port of libzstd lib/compress/hist.c, v1.5.7).
 //!
 //! libzstd has a "simple" and a 4-way "parallel" counter and picks one by input
-//! size and alphabet (`HIST_count_wksp`); both return the same counts, the same
-//! trimmed `max_symbol` and the same largest count, so the choice is speed only.
+//! size; both return the same counts, the same trimmed `max_symbol` and the
+//! same largest count, so the choice is speed only.
 
 const std = @import("std");
 const fill = @import("fill.zig");
 
-/// `HIST_FAST_THRESHOLD`: below it a full byte alphabet is counted simply.
+/// `HIST_FAST_THRESHOLD`: below it the bytes are counted simply.
 const parallel_threshold = 1500;
 
 /// Count the bytes of `src` into `count[0..max_symbol.*+1]`, trim `max_symbol`
@@ -22,7 +22,10 @@ pub fn count(counts: []u32, max_symbol: *u32, src: []const u8) u32 {
         max_symbol.* = 0;
         return 0;
     }
-    if (max_in < 255 or src.len >= parallel_threshold) return countParallel(counts, max_symbol, src);
+    // libzstd's `HIST_countFast_wksp` rule. (`HIST_count_wksp` also counts
+    // a small alphabet in parallel at any length; the sequence codes, the
+    // only small alphabets here, go through `HIST_countFast_wksp`.)
+    if (src.len >= parallel_threshold) return countParallel(counts, max_symbol, src);
     fill.zero(u32, counts[0 .. max_in + 1]);
     for (src) |b| {
         std.debug.assert(b <= max_in);
@@ -86,7 +89,7 @@ test "the parallel counter agrees with a plain count at every length and alphabe
     var src: [4100]u8 = undefined;
     // Lengths around the 16-byte stripes and the 1500-byte threshold; skewed
     // and run-heavy inputs (the case the four tables exist for) as well as
-    // uniform ones, and alphabets below 255 (always parallel in libzstd).
+    // uniform ones, and alphabets below 255 (the sequence codes).
     const lens = [_]usize{ 1, 15, 16, 17, 31, 1499, 1500, 1501, 4096, 4100 };
     for (lens) |len| for ([_]u32{ 255, 52, 35, 1 }) |alpha| for (0..3) |shape| {
         for (src[0..len], 0..) |*b, i| b.* = switch (shape) {

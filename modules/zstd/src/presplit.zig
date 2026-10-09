@@ -28,7 +28,7 @@ const Fingerprint = struct {
     nb_events: usize = 0,
 };
 
-fn hash2(p: []const u8, hash_log: u32) u32 {
+inline fn hash2(p: []const u8, comptime hash_log: u32) u32 {
     std.debug.assert(hash_log >= 8);
     if (hash_log == 8) return p[0];
     std.debug.assert(hash_log <= hashlog_max);
@@ -38,7 +38,9 @@ fn hash2(p: []const u8, hash_log: u32) u32 {
     return (v *% knuth) >> @intCast(32 - hash_log);
 }
 
-fn recordFingerprint(fp: *Fingerprint, src: []const u8, sampling_rate: usize, hash_log: u32) void {
+/// Specialised on the rate and the table size, as libzstd's
+/// `ZSTD_recordFingerprint_<rate>` (one per splitter level).
+fn recordFingerprint(fp: *Fingerprint, src: []const u8, comptime sampling_rate: usize, comptime hash_log: u32) void {
     fill.zero(u32, fp.events[0 .. @as(usize, 1) << @intCast(hash_log)]);
     fp.nb_events = 0;
     const limit = src.len - hash_length + 1;
@@ -51,7 +53,7 @@ fn abs64(v: i64) u64 {
     return @intCast(if (v < 0) -v else v);
 }
 
-fn fpDistance(fp1: *const Fingerprint, fp2: *const Fingerprint, hash_log: u32) u64 {
+fn fpDistance(fp1: *const Fingerprint, fp2: *const Fingerprint, comptime hash_log: u32) u64 {
     var distance: u64 = 0;
     const n1: i64 = @intCast(fp1.nb_events);
     const n2: i64 = @intCast(fp2.nb_events);
@@ -62,7 +64,7 @@ fn fpDistance(fp1: *const Fingerprint, fp2: *const Fingerprint, hash_log: u32) u
 }
 
 /// True when `newfp` is too far from `ref` to belong to the same block.
-fn compareFingerprints(ref: *const Fingerprint, newfp: *const Fingerprint, penalty: u32, hash_log: u32) bool {
+fn compareFingerprints(ref: *const Fingerprint, newfp: *const Fingerprint, penalty: u32, comptime hash_log: u32) bool {
     const p50: u64 = @as(u64, ref.nb_events) * @as(u64, newfp.nb_events);
     const deviation = fpDistance(ref, newfp, hash_log);
     const threshold = p50 * (threshold_base + penalty) / threshold_penalty_rate;
@@ -88,6 +90,13 @@ const Stats = struct {
 };
 
 fn splitByChunks(block: []const u8, level: u32, stats: *Stats) usize {
+    return switch (level) {
+        inline 0...3 => |l| splitByChunksAt(block, l, stats),
+        else => unreachable,
+    };
+}
+
+fn splitByChunksAt(block: []const u8, comptime level: u32, stats: *Stats) usize {
     const rates = [_]usize{ 43, 11, 5, 1 };
     const hash_params = [_]u32{ 8, 9, 10, 10 };
     std.debug.assert(block.len == full_block);
