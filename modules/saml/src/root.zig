@@ -3789,6 +3789,7 @@ fn appendTextEscaped(alloc: std.mem.Allocator, w: *std.ArrayList(u8), s: []const
 // ── tests ────────────────────────────────────────────────────────────────────
 
 test {
+    _ = @import("fuzz_test.zig");
     _ = @import("test_xsw.zig");
     _ = @import("test_fixture.zig");
     _ = @import("test_encrypted.zig");
@@ -3917,21 +3918,47 @@ const field_seeds = [_][]const u8{
     testkit.fuzz.seed(""), // the input these targets used to run for ever
 };
 
+const fz = @import("fuzz_test.zig");
+const FieldMark = fz.Marker(enum { post_ok, redirect_ok, rejected });
+const IdpMark = fz.Marker(enum { rejected, parsed, with_endpoint, with_cert, mangled });
+
 test "fuzz: decodePostField/decodeRedirectField never panic on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeFields, .{ .corpus = &field_seeds });
+    try testing.fuzz({}, fuzzDecodeFieldsSmith, .{ .corpus = &field_seeds });
 }
 
-fn fuzzDecodeFields(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: SAML_FUZZ (fields)" {
+    try fz.fuzz_driver.run(fuzzDecodeFields, .{ .prefix = "SAML_FUZZ", .name = "fields" });
+}
+
+test "fuzz harness: 400 seeds of the binding-field decoders in every test run, and they get everywhere" {
+    try FieldMark.reach(fuzzDecodeFields, "saml-fields", 400);
+}
+
+fn fuzzDecodeFieldsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecodeFields(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDecodeFields(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
     // latter drew `len == 0` on every input this target ever ran outside
     // `--fuzz` (a ranged draw needs eight octets and `bytes` had eaten them),
     // so both decoders were handed `""` every round.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, smith, &buf, &field_seeds);
     const field = buf[0..len];
 
-    if (decodePostField(testing.allocator, field)) |d| testing.allocator.free(d) else |_| {}
-    if (decodeRedirectField(testing.allocator, field)) |d| testing.allocator.free(d) else |_| {}
+    var ok = false;
+    if (decodePostField(gpa, field)) |d| {
+        gpa.free(d);
+        FieldMark.mark(.post_ok);
+        ok = true;
+    } else |_| {}
+    if (decodeRedirectField(gpa, field)) |d| {
+        gpa.free(d);
+        FieldMark.mark(.redirect_ok);
+        ok = true;
+    } else |_| {}
+    if (!ok) FieldMark.mark(.rejected);
 }
 
 test "corpus: the binding-field seeds reach both decoders, and the counts are pinned" {
@@ -4021,22 +4048,46 @@ const idp_seeds = [_][]const u8{
 };
 
 test "fuzz: parseIdpMetadata never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseIdpMetadata, .{ .corpus = &idp_seeds });
+    try testing.fuzz({}, fuzzParseIdpMetadataSmith, .{ .corpus = &idp_seeds });
+}
+
+test "fuzz driver: SAML_FUZZ (idp metadata)" {
+    try fz.fuzz_driver.run(fuzzParseIdpMetadata, .{ .prefix = "SAML_FUZZ", .name = "idp" });
+}
+
+test "fuzz harness: 400 seeds of parseIdpMetadata in every test run, and they get everywhere" {
+    try IdpMark.reach(fuzzParseIdpMetadata, "saml-idp", 400);
 }
 
 const idp_alphabet = "<>/=\"'&;! ?abcmdsEntityDescriptorIDPSSOKeyInfoX509CertificateSingleSignOnServiceBinding0123\n\t";
 
-fn fuzzParseIdpMetadata(_: void, smith: *std.testing.Smith) !void {
+fn fuzzParseIdpMetadataSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseIdpMetadata(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParseIdpMetadata(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [idp_metadata_buf_len]u8 = undefined;
     // ⚠ One `smith.slice` call. See `idp_metadata_buf_len` for the other half
     // of what was wrong here.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, smith, &buf, &idp_seeds);
+    // Smith substitutes octet by octet (weight 1 in 4); the driver decides ONCE
+    // per input whether to mangle at all, so most inputs stay a damaged
+    // document and the parser gets past its first check.
+    const mangle = if (comptime @hasDecl(S, "boolWeighted")) true else smith.valueRangeAtMost(u8, 0, 3) == 0;
+    if (mangle) IdpMark.mark(.mangled);
     for (buf[0..len]) |*c| {
-        if (smith.boolWeighted(1, 3)) c.* = idp_alphabet[c.* % idp_alphabet.len];
+        const sub = if (comptime @hasDecl(S, "boolWeighted")) smith.boolWeighted(1, 3) else smith.valueRangeAtMost(u8, 0, 3) == 0;
+        if (mangle and sub) c.* = idp_alphabet[c.* % idp_alphabet.len];
     }
 
-    var m = parseIdpMetadata(testing.allocator, buf[0..len]) catch return;
-    m.deinit();
+    var m = parseIdpMetadata(gpa, buf[0..len]) catch {
+        IdpMark.mark(.rejected);
+        return;
+    };
+    defer m.deinit();
+    IdpMark.mark(.parsed);
+    if (m.sso_endpoints.len != 0) IdpMark.mark(.with_endpoint);
+    if (m.signing_certs_der.len != 0) IdpMark.mark(.with_cert);
 }
 
 test "corpus: the IdP metadata seeds reach the parser, and the counts are pinned" {

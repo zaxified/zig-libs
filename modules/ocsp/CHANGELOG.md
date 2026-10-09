@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `OCSP_FUZZ` over the existing harnesses (`parse`, `verify`); `verify` checks the genuine delegated response is accepted and a flipped one refused.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** `ocsp_test.zig` follows p256's `ecdsaSign`, which now takes
   the key and nonce by pointer, and rsa's 2026-10-08 API (keys by pointer, out-param
   constructors).

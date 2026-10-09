@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-09** — tests: deterministic fuzz driver `XMLDSIG_FUZZ` over the existing `verify` harness, which now also checks that the genuine signed document is accepted and one with 1-3 octets flipped refused. The mode-4 oracle (genuine accepted, any flipped octet refused) exempts only changes inside the SignatureValue text and whitespace-for-whitespace inside a tag, which C14N normalizes (the 200k verdict met one at seed 33152: a space before an attribute became a tab, and the signature rightly held).
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** a test in `root.zig` follows p256's `ecdsaSign`, which now takes
   the key and nonce by pointer, and rsa's 2026-10-08 API (keys by pointer, out-param
   constructors).

@@ -960,10 +960,86 @@ fn buildFuzzDoc(alloc: std.mem.Allocator, s: EncShape) ![]u8 {
 /// Parse + decrypt one built document. Split out so the reachability test
 /// drives exactly what the fuzzer drives.
 fn fuzzDecryptDoc(alloc: std.mem.Allocator, doc_src: []const u8, sk: rsa.SecretKey, options: xmlenc.Options) !void {
-    var doc = xml.parse(alloc, doc_src, .{ .id_attr_names = &.{"ID"} }) catch return;
+    var doc = xml.parse(alloc, doc_src, .{ .id_attr_names = &.{"ID"} }) catch {
+        FzMark.mark(.unparsed);
+        return;
+    };
     defer doc.deinit();
-    const plain = xmlenc.decryptData(alloc, doc.root, &sk, options) catch return;
+    const plain = xmlenc.decryptData(alloc, doc.root, &sk, options) catch {
+        FzMark.mark(.refused);
+        return;
+    };
     alloc.free(plain);
+}
+
+const fz = @import("fuzz_test.zig");
+const FzMark = fz.Marker(enum { unparsed, refused, genuine_accepted, flipped_refused });
+
+/// The genuine encrypted documents the oracle damages, built once per process
+/// (an RSA-OAEP wrap and an AES encryption each) and held in the page
+/// allocator: they outlive every test's allocator.
+const GenuineDocs = struct {
+    gcm: []u8,
+    cbc: []u8,
+};
+var fuzz_genuine: ?GenuineDocs = null;
+
+fn fuzzGenuine() !GenuineDocs {
+    if (fuzz_genuine) |g| return g;
+    const a = std.heap.page_allocator; // global-alloc-ok: process-lifetime fuzz fixture, outlives testing.allocator's per-test teardown
+    const kp = try fuzzKeyPair();
+    const cek = [_]u8{0x5A} ** 32;
+    const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+    const wrapped_b64 = try b64(a, wrapped);
+    const gcm_ct = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
+    const cbc_ct = try cbcEncrypt(a, aes.Aes256, cek, plaintext_assertion);
+    fuzz_genuine = .{
+        .gcm = try buildFuzzDoc(a, .{
+            .content_alg = xenc11_ns ++ "aes256-gcm",
+            .key_alg = xenc_ns ++ "rsa-oaep-mgf1p",
+            .key_cipher_text = wrapped_b64,
+            .content_cipher_text = try b64(a, gcm_ct),
+        }),
+        .cbc = try buildFuzzDoc(a, .{
+            .content_alg = xenc_ns ++ "aes256-cbc",
+            .key_alg = xenc_ns ++ "rsa-oaep-mgf1p",
+            .key_cipher_text = wrapped_b64,
+            .content_cipher_text = try b64(a, cbc_ct),
+        }),
+    };
+    return fuzz_genuine.?;
+}
+
+/// The oracle: a genuine document, untouched, decrypts to exactly the
+/// plaintext; the AES-GCM one with 1-3 octets flipped anywhere either fails
+/// or (the damage fell on markup nothing reads, or on base64 whitespace and
+/// padding) decrypts to exactly the SAME plaintext -- never to another. The
+/// CBC document is only run untouched: CBC carries no integrity of its own.
+fn fuzzGenuineOracle(a: std.mem.Allocator, sk: rsa.SecretKey, script_bytes: []const u8) !void {
+    const g = try fuzzGenuine();
+    var c: fuzzseed.Cursor = .{ .bytes = script_bytes };
+    const use_gcm = c.byte() & 1 == 0;
+    const base = if (use_gcm) g.gcm else g.cbc;
+    const doc_src = try a.dupe(u8, base);
+    if (use_gcm) {
+        for (0..c.ranged(0, 3)) |_| doc_src[@as(usize, c.word()) % doc_src.len] ^= @intCast(c.ranged(1, 255));
+    }
+    const changed = !std.mem.eql(u8, doc_src, base);
+
+    var doc = xml.parse(a, doc_src, .{ .id_attr_names = &.{"ID"} }) catch {
+        if (!changed) return error.GenuineDocumentUnparsed;
+        FzMark.mark(.flipped_refused);
+        return;
+    };
+    defer doc.deinit();
+    const plain = xmlenc.decryptData(a, doc.root, &sk, .{}) catch {
+        if (!changed) return error.GenuineDocumentRefused;
+        FzMark.mark(.flipped_refused);
+        return;
+    };
+    defer a.free(plain);
+    if (!std.mem.eql(u8, plain, plaintext_assertion)) return error.AlteredCiphertextDecryptedToOtherPlaintext;
+    if (changed) fz.fuzz_driver.hit("flipped_benign") else FzMark.mark(.genuine_accepted);
 }
 
 /// XML-text-safe alphabet: base64's own characters plus whitespace and a few
@@ -1049,7 +1125,7 @@ const xmlenc_seeds = [_][]const u8{
 };
 
 test "fuzz: decryptData never panics on a hostile EncryptedData" {
-    try std.testing.fuzz({}, fuzzDecryptData, .{ .corpus = &xmlenc_seeds });
+    try std.testing.fuzz({}, fuzzDecryptDataSmith, .{ .corpus = &xmlenc_seeds });
 }
 
 /// Assemble the document and the options one seed describes. Shared with the
@@ -1118,8 +1194,24 @@ fn buildFuzzCase(
     return .{ doc_src, unstructured, options };
 }
 
-fn fuzzDecryptData(_: void, smith: *std.testing.Smith) !void {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+fn fuzzDecryptDataSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecryptData(std.testing.Smith, smith, std.testing.allocator);
+}
+
+test "fuzz driver: XMLENC_FUZZ (decrypt: genuine decrypts, flipped fails)" {
+    if (fz.driverRequested("XMLENC_FUZZ")) {
+        _ = try fuzzKeyPair();
+        _ = try fuzzGenuine();
+    }
+    try fz.fuzz_driver.run(fuzzDecryptData, .{ .prefix = "XMLENC_FUZZ", .name = "decrypt" });
+}
+
+test "fuzz harness: 300 seeds of decryptData in every test run, genuine decrypts and flipped fails" {
+    try FzMark.reach(fuzzDecryptData, "xmlenc-decrypt", 300);
+}
+
+fn fuzzDecryptData(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
@@ -1138,6 +1230,10 @@ fn fuzzDecryptData(_: void, smith: *std.testing.Smith) !void {
     // Also the unstructured direction, so the XML framing itself is fuzzed and
     // not only the fields inside a fixed template.
     try fuzzDecryptDoc(a, case[1], kp.secret_key, case[2]);
+
+    // And the oracle, on a script read from the same draw (after the fields
+    // above, so the seeds' meaning is unchanged).
+    try fuzzGenuineOracle(a, kp.secret_key, seed_buf[0..n]);
 }
 
 test "corpus: every seed builds a distinct document, and the algorithm spread is pinned" {
@@ -1255,7 +1351,7 @@ test "the xmlenc fuzz harness reaches decryptData's crypto path (reachability)" 
 
     // 3. And the harness body itself runs to completion on fixed input.
     var smith: std.testing.Smith = .{ .in = &([_]u8{0x02} ** 32 ++ [_]u8{0x00} ** 2048) };
-    try fuzzDecryptData({}, &smith);
+    try fuzzDecryptData(std.testing.Smith, &smith, a);
 }
 
 // ── CONVENTIONS §2.1 Z1: nothing this module frees may still hold plaintext ──

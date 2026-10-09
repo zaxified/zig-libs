@@ -1355,6 +1355,7 @@ test "ECDSA DER: encodings that DER forbids are rejected (Wycheproof rows)" {
 
 test {
     _ = @import("ocsp_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("goldens.zig");
     _ = @import("p384_test.zig");
 }

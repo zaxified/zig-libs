@@ -878,6 +878,7 @@ const testing = std.testing;
 test {
     testing.refAllDecls(@This());
     _ = @import("test_roundtrip.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("test_external.zig");
 }

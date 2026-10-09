@@ -1235,14 +1235,86 @@ test "fuzz: parseResponse never panics on arbitrary bytes" {
 }
 
 fn fuzzParseResponse(_: void, smith: *std.testing.Smith) !void {
+    try parseHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+const fz = @import("fuzz_test.zig");
+const ParseMark = fz.Marker(enum { empty, rejected, parsed, with_basic });
+const VerifyMark = fz.Marker(enum { genuine_accepted, flipped_refused, cert_damaged });
+
+/// The corpus the driver draws its damaged inputs from, and the fixture the
+/// verify harness runs on, built once per process (a key generation each).
+/// They outlive every test's allocator, hence the page allocator.
+var driver_parse_corpus: ?ParseCorpus = null;
+var driver_verify_ctx: ?VerifyFuzzCtx = null;
+
+fn driverParseCorpus() ![]const []const u8 {
+    if (driver_parse_corpus == null) {
+        driver_parse_corpus = .{};
+        // global-alloc-ok: process-lifetime fuzz fixture, outlives testing.allocator's per-test teardown
+        return driver_parse_corpus.?.build(std.heap.page_allocator);
+    }
+    return &driver_parse_corpus.?.seeds;
+}
+
+fn driverVerifyCtx() !*const VerifyFuzzCtx {
+    if (driver_verify_ctx == null) {
+        const gpa = std.heap.page_allocator; // global-alloc-ok: process-lifetime fuzz fixture, as above
+        const fx = try makeRsaFixture(gpa);
+        const issuer = try extractBits(fx.issuer_der);
+        const subject = try extractBits(fx.subject_der);
+        var prng = std.Random.DefaultPrng.init(0xf0e1d2c3);
+        var dkp: rsa.KeyPair = undefined;
+        try rsa.generate(&dkp, prng.random(), 1024, 65537);
+        const delegate_self = try rsa.selfSignedCert(gpa, &dkp.secret_key, dkp.public_key, Sha256, .{
+            .common_name = "fuzz delegated responder",
+            .serial = 9,
+            .not_before = "200101000000Z",
+            .not_after = "400101000000Z",
+            .is_ca = false,
+        });
+        const dbits = try extractBits(delegate_self);
+        const delegate_cert = try buildDelegateCert(gpa, fx.kp.secret_key, issuer.subject_name, try spkiOf(delegate_self), dbits.subject_name, .ocsp_signing);
+        const resp_der = try buildResponse(gpa, .{
+            .issuer = issuer,
+            .subject_serial = subject.serial,
+            .responder_by_name = dbits.subject_name,
+            .certs = delegate_cert,
+            .sign_rsa = dkp.secret_key,
+        });
+        driver_verify_ctx = .{ .response = resp_der, .issuer = fx.issuer_der, .subject = fx.subject_der };
+    }
+    return &driver_verify_ctx.?;
+}
+
+/// `parseResponse` over arbitrary bytes, or (driver) a corpus entry -- the
+/// genuine plain and delegated responses among them -- with 0-3 octets
+/// damaged: random DER never spells an OCSPResponse.
+fn parseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [parse_buf_len]u8 = undefined;
-    // One `smith.slice`, never `bytes` then a ranged draw. `bytes` consumes
-    // `@min(buf.len, in.len)` octets, so the ranged length that followed found
-    // fewer than the eight it reads as a little-endian `u64` and returned the
-    // range MINIMUM: `len` was 0 for every input this lane can carry, and
-    // `parseResponse` was handed the empty slice for ever.
-    const len: usize = smith.slice(&buf);
-    _ = ocsp.parseResponse(buf[0..len]) catch return;
+    const corpus: []const []const u8 = if (S == fz.fuzz_driver.Rng) try driverParseCorpus() else &.{};
+    const len = fz.drawInput(S, src, &buf, corpus);
+    if (len == 0) ParseMark.mark(.empty);
+    const parsed = ocsp.parseResponse(buf[0..len]) catch {
+        ParseMark.mark(.rejected);
+        return;
+    };
+    ParseMark.mark(.parsed);
+    if (parsed.basic != null) ParseMark.mark(.with_basic);
+}
+
+fn parseHarnessDriver(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    return parseHarness(S, src, gpa);
+}
+
+test "fuzz driver: OCSP_FUZZ (parseResponse)" {
+    if (fz.driverRequested("OCSP_FUZZ")) _ = try driverParseCorpus();
+    try fz.fuzz_driver.run(parseHarnessDriver, .{ .prefix = "OCSP_FUZZ", .name = "parse" });
+}
+
+test "fuzz harness: 400 seeds of parseResponse in every test run, and they get everywhere" {
+    try ParseMark.reach(parseHarnessDriver, "ocsp-parse", 400);
 }
 
 /// The static seeds plus a genuine response and that response with one octet
@@ -1473,6 +1545,24 @@ fn damage(script: *fuzzseed.Cursor, buf: []u8, original: []const u8) bool {
 const verify_script_len = 2560;
 
 fn fuzzVerify(ctx: *const VerifyFuzzCtx, smith: *std.testing.Smith) !void {
+    try verifyHarness(std.testing.Smith, smith, ctx);
+}
+
+fn verifyHarnessDriver(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    return verifyHarness(S, src, try driverVerifyCtx());
+}
+
+test "fuzz driver: OCSP_FUZZ (verify: genuine accepted, flipped refused)" {
+    if (fz.driverRequested("OCSP_FUZZ")) _ = try driverVerifyCtx();
+    try fz.fuzz_driver.run(verifyHarnessDriver, .{ .prefix = "OCSP_FUZZ", .name = "verify" });
+}
+
+test "fuzz harness: 300 seeds of verify in every test run, genuine accepted and flipped refused" {
+    try VerifyMark.reach(verifyHarnessDriver, "ocsp-verify", 300);
+}
+
+fn verifyHarness(comptime S: type, smith: *S, ctx: *const VerifyFuzzCtx) !void {
     // One byte-first draw, read as a SCRIPT. It used to be a chain of ranged
     // `Smith` draws opening with `smith.valueRangeAtMost(u8, 0, 4)` for the
     // mode, with a `verifySeed(mode, bits, n)` helper writing each choice as
@@ -1537,15 +1627,19 @@ fn fuzzVerify(ctx: *const VerifyFuzzCtx, smith: *std.testing.Smith) !void {
 
     const parsed = ocsp.parseResponse(resp) catch {
         if (mode != 1) return error.UndamagedFixtureNoLongerParses;
+        if (response_damaged) VerifyMark.mark(.flipped_refused);
         return;
     };
     const verdict = ocsp.verify(parsed, iss, subj, opts) catch {
         if (mode == 0) return error.UndamagedFixtureRejected;
+        if (response_damaged) VerifyMark.mark(.flipped_refused);
+        if (mode >= 2) VerifyMark.mark(.cert_damaged);
         return;
     };
     if (mode == 0) {
         if (verdict.status != .good) return error.UndamagedFixtureNotGood;
         if (!verdict.delegated) return error.UndamagedFixtureNotDelegated;
+        VerifyMark.mark(.genuine_accepted);
     }
     // Every octet of this response is inside the signed `tbsResponseData`,
     // inside the signature over it, inside a certificate the issuer signed, or

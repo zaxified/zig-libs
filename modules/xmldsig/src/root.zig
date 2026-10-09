@@ -777,6 +777,7 @@ fn decodeBase64(arena: std.mem.Allocator, text: []const u8) VerifyError![]u8 {
 test {
     _ = c14n;
     _ = @import("test_external.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 const testing = std.testing;
@@ -1948,13 +1949,31 @@ fn buildFuzzSignature(alloc: std.mem.Allocator, s: SigShape) ![]u8 {
 /// Parse a candidate document and run `verify()` on the `ds:Signature` it
 /// contains (the element itself when it is the root — the enveloping shape).
 /// Split out so the reachability test drives exactly what the fuzzer drives.
-fn fuzzVerifyDoc(alloc: std.mem.Allocator, src: []const u8, options: Options) !void {
-    var doc = xml.parse(alloc, src, .{ .id_attr_names = &.{"ID"} }) catch return;
+fn fuzzVerifyDoc(alloc: std.mem.Allocator, src: []const u8, options: Options) !bool {
+    var doc = xml.parse(alloc, src, .{ .id_attr_names = &.{"ID"} }) catch {
+        FzMark.mark(.unparsed);
+        return false;
+    };
     defer doc.deinit();
-    const sig = if (isDs(doc.root, "Signature")) doc.root else childByName(doc.root, "Signature") orelse return;
-    var res = verify(alloc, &doc, sig, options) catch return;
-    res.deinit(alloc);
+    const sig = if (isDs(doc.root, "Signature")) doc.root else childByName(doc.root, "Signature") orelse {
+        FzMark.mark(.unparsed);
+        return false;
+    };
+    var res = verify(alloc, &doc, sig, options) catch {
+        FzMark.mark(.verify_error);
+        return false;
+    };
+    defer res.deinit(alloc);
+    if (!res.valid) {
+        FzMark.mark(.verdict_invalid);
+        return false;
+    }
+    for (res.references) |r| if (!r.digest_valid) return false;
+    return true;
 }
+
+const fz = @import("fuzz_test.zig");
+const FzMark = fz.Marker(enum { unparsed, verify_error, verdict_invalid, genuine_accepted, flipped_refused });
 
 /// XML-text-safe alphabet (no `<`/`&`), biased to base64 so a fuzzed
 /// DigestValue/SignatureValue frequently decodes instead of dying at the
@@ -2005,7 +2024,11 @@ const verify_scripts = [_][]const u8{
     kit.seed("\x01\x01\x10\xab\xcd\xef\x01\x02\x02\x00\x01\x02\x00\x01\x02\x00\x10\x10"), // a mid-document mutation
 };
 
-fn fuzzVerifySignature(_: void, smith: *std.testing.Smith) !void {
+fn fuzzVerifySignatureSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzVerifySignature(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzVerifySignature(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     // ⚠ ONE byte-first draw, then a `Cursor` over it. What stood here
     // opened `smith.value(bool)` and drew every one of its ~20 choices
     // from `smith` directly. A `Smith` scalar or ranged draw reads eight
@@ -2029,7 +2052,7 @@ fn fuzzVerifySignature(_: void, smith: *std.testing.Smith) !void {
     const script_len: usize = smith.slice(&script);
     var c = kit.Cursor{ .bytes = script[0..script_len] };
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
@@ -2086,7 +2109,7 @@ fn fuzzVerifySignature(_: void, smith: *std.testing.Smith) !void {
             .key_info_cert = if (c.byte() & 1 == 1) digest_value else null,
             .second_reference = c.byte() & 1 == 1,
         });
-        try fuzzVerifyDoc(a, src, options);
+        _ = try fuzzVerifyDoc(a, src, options);
     }
 
     // Mode 2 — a genuinely VALID signed document with a fuzzer-chosen byte
@@ -2098,11 +2121,75 @@ fn fuzzVerifySignature(_: void, smith: *std.testing.Smith) !void {
         const mutant = try a.dupe(u8, base);
         const n = mutateDoc(&c, mutant);
         _ = n;
-        try fuzzVerifyDoc(a, mutant, options);
+        _ = try fuzzVerifyDoc(a, mutant, options);
     }
 
     // Mode 3 — unstructured, so the XML framing itself is fuzzed.
-    try fuzzVerifyDoc(a, raw[0..raw_len], options);
+    _ = try fuzzVerifyDoc(a, raw[0..raw_len], options);
+
+    // Mode 4 — the oracle. The genuine signed document, with 0-3 octets
+    // flipped ANYWHERE (a 16-bit offset: `mutateDoc`'s one-octet offset only
+    // reaches the first 256 octets). Untouched it MUST verify; with any octet
+    // changed it must be refused -- unless every changed octet lies inside the
+    // SignatureValue text, where base64 padding and whitespace are lenient, or
+    // every change is whitespace for whitespace inside a tag, which C14N
+    // normalizes away (seed 33152: a space before an attribute became a tab).
+    // Whitespace in text content is NOT exempt: C14N keeps it, so the digest
+    // must refuse it.
+    // Read last, so the script bytes modes 1-3 consume are unchanged.
+    {
+        const base = try fuzzSignedDoc();
+        const mutant = try a.dupe(u8, base);
+        var diff_lo: usize = mutant.len;
+        var diff_hi: usize = 0;
+        for (0..c.ranged(0, 3)) |_| {
+            mutant[@as(usize, c.word()) % mutant.len] ^= @intCast(c.ranged(1, 255));
+        }
+        for (mutant, base, 0..) |m, b, i| if (m != b) {
+            diff_lo = @min(diff_lo, i);
+            diff_hi = i;
+        };
+        const accepted = try fuzzVerifyDoc(a, mutant, .{ .key = .{ .rsa = pk } });
+        if (diff_lo > diff_hi) {
+            if (!accepted) return error.GenuineSignatureRefused;
+            FzMark.mark(.genuine_accepted);
+        } else if (accepted) {
+            const sv_open = std.mem.indexOf(u8, base, "<ds:SignatureValue>").? + "<ds:SignatureValue>".len;
+            const sv_close = std.mem.indexOf(u8, base, "</ds:SignatureValue>").?;
+            const in_sig_value = diff_lo >= sv_open and diff_hi < sv_close;
+            if (!in_sig_value and !onlyWhitespaceInsideTags(base, mutant)) return error.AlteredDocumentVerified;
+            fz.fuzz_driver.hit("flipped_benign");
+        } else FzMark.mark(.flipped_refused);
+    }
+}
+
+/// Every octet where `mutant` differs from `base` is XML whitespace in both,
+/// and sits inside markup (after a `<` with no `>` since): the attribute
+/// separators C14N rewrites to a single space.
+fn onlyWhitespaceInsideTags(base: []const u8, mutant: []const u8) bool {
+    const ws = " \t\r\n";
+    for (base, mutant, 0..) |b, m, i| {
+        if (b == m) continue;
+        if (std.mem.indexOfScalar(u8, ws, b) == null or std.mem.indexOfScalar(u8, ws, m) == null) return false;
+        const lt = std.mem.lastIndexOfScalar(u8, base[0..i], '<') orelse return false;
+        if (std.mem.indexOfScalar(u8, base[lt..i], '>') != null) return false;
+    }
+    return true;
+}
+
+test "onlyWhitespaceInsideTags: tag-internal whitespace swaps only" {
+    try std.testing.expect(onlyWhitespaceInsideTags("<a b=\"1\">x y</a>", "<a\tb=\"1\">x y</a>"));
+    try std.testing.expect(!onlyWhitespaceInsideTags("<a b=\"1\">x y</a>", "<a b=\"1\">x\ty</a>")); // text content
+    try std.testing.expect(!onlyWhitespaceInsideTags("<a b=\"1\">x y</a>", "<a c=\"1\">x y</a>")); // not whitespace
+}
+
+test "fuzz driver: XMLDSIG_FUZZ (verify: genuine accepted, flipped refused)" {
+    if (fz.driverRequested("XMLDSIG_FUZZ")) _ = try fuzzSignedDoc();
+    try fz.fuzz_driver.run(fuzzVerifySignature, .{ .prefix = "XMLDSIG_FUZZ", .name = "verify" });
+}
+
+test "fuzz harness: 300 seeds of verify in every test run, genuine accepted and flipped refused" {
+    try FzMark.reach(fuzzVerifySignature, "xmldsig-verify", 300);
 }
 
 fn b64Encode(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
@@ -2113,7 +2200,7 @@ fn b64Encode(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
 }
 
 test "fuzz: verify never panics on a hostile ds:Signature" {
-    try std.testing.fuzz({}, fuzzVerifySignature, .{ .corpus = &verify_scripts });
+    try std.testing.fuzz({}, fuzzVerifySignatureSmith, .{ .corpus = &verify_scripts });
 }
 
 test "corpus: every verify script drives a distinct shape, and the octets it writes are pinned" {
@@ -2230,7 +2317,7 @@ test "the xmldsig fuzz harness reaches verify's digest and signature checks (rea
 
     // 3. And the harness body itself runs to completion on fixed input.
     var smith: std.testing.Smith = .{ .in = &([_]u8{0x01} ** 64 ++ [_]u8{0x00} ** 2048) };
-    try fuzzVerifySignature({}, &smith);
+    try fuzzVerifySignature(std.testing.Smith, &smith, a);
 }
 
 // ── mutation run 2026-10-05 ─────────────────────────────────────────────────

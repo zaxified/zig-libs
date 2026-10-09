@@ -1513,22 +1513,30 @@ test "corpus: the AIA seeds drive every knob, and the counts are pinned" {
     for (tags_seen) |t| try testing.expect(t);
 }
 
-fn fuzzAia(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const AiaMark = fz.Marker(enum { structured_url, structured_refused, discovered, discover_refused });
+const RefreshMark = fz.Marker(enum { genuine_accepted, flipped_refused, refused, stapled });
+
+fn fuzzAiaSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzAia(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzAia(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     const goldens = @import("goldens.zig");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
     var raw: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
-    const raw_len: usize = smith.slice(&raw);
+    const raw_len: usize = fz.drawInput(S, smith, &raw, &aia_seeds);
 
     // 1. Structured: a real AccessDescription around fuzzed bytes. The OID is
     //    either the genuine id-ad-ocsp (so the URI branch is taken) or fuzzed.
     const oid: []const u8 = if (smith.value(bool)) &oid_ad_ocsp else raw[0..@min(raw_len, 16)];
     const loc_tag = fuzz_loc_tags[smith.index(fuzz_loc_tags.len)];
     const value = try buildAia(a, oid, loc_tag, raw[0..raw_len]);
-    _ = parseAiaOcspUrl(value) catch {};
+    if (parseAiaOcspUrl(value) catch null) |_| AiaMark.mark(.structured_url) else AiaMark.mark(.structured_refused);
 
     // 2. Unstructured, straight at the extension parser.
     _ = parseAiaOcspUrl(raw[0..raw_len]) catch {};
@@ -1538,7 +1546,7 @@ fn fuzzAia(_: void, smith: *std.testing.Smith) !void {
     const mutant = try a.dupe(u8, &goldens.godaddy_leaf_der);
     const n = @min(smith.valueRangeAtMost(u8, 0, 8), raw_len);
     for (0..n) |i| mutant[smith.index(mutant.len)] = raw[i];
-    _ = discoverResponderUrl(mutant) catch {};
+    if (discoverResponderUrl(mutant) catch null) |_| AiaMark.mark(.discovered) else AiaMark.mark(.discover_refused);
 
     // 4. And every truncation is a typed error, never a walk off the end.
     const cut = smith.valueRangeAtMost(u16, 0, @intCast(goldens.godaddy_leaf_der.len));
@@ -1546,12 +1554,24 @@ fn fuzzAia(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the AIA responder-URL walk never panics" {
-    try std.testing.fuzz({}, fuzzAia, .{ .corpus = &aia_seeds });
+    try std.testing.fuzz({}, fuzzAiaSmith, .{ .corpus = &aia_seeds });
 }
 
-fn fuzzRefresh(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: OCSPCACHE_FUZZ (aia)" {
+    try fz.fuzz_driver.run(fuzzAia, .{ .prefix = "OCSPCACHE_FUZZ", .name = "aia" });
+}
+
+test "fuzz harness: 400 seeds of the AIA walk in every test run, and they get everywhere" {
+    try AiaMark.reach(fuzzAia, "ocspcache-aia", 400);
+}
+
+fn fuzzRefreshSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRefresh(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzRefresh(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     const goldens = @import("goldens.zig");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
@@ -1562,7 +1582,8 @@ fn fuzzRefresh(_: void, smith: *std.testing.Smith) !void {
     // The responder's answer: the real captured response, mutated or truncated
     // (so `ocsp.parseResponse` and `ocsp.verify` are actually reached), or
     // arbitrary bytes.
-    const body: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+    const body_mode = smith.valueRangeAtMost(u8, 0, 3);
+    const body: []const u8 = switch (body_mode) {
         0 => &goldens.godaddy_response_der,
         1 => blk: {
             const mutant = try a.dupe(u8, &goldens.godaddy_response_der);
@@ -1578,24 +1599,53 @@ fn fuzzRefresh(_: void, smith: *std.testing.Smith) !void {
         .status = if (smith.value(bool)) 200 else smith.valueRangeAtMost(u16, 0, 599),
         .body = body,
     };
-    var cache = Cache.init(std.testing.allocator, mock.transport(), .{
+    var cache = Cache.init(gpa, mock.transport(), .{
         .fetch_method = if (smith.value(bool)) .post else .get,
         .max_response_bytes = 64 * 1024,
     });
     defer cache.deinit();
 
-    const now: i64 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+    const now_mode = smith.valueRangeAtMost(u8, 0, 2);
+    const now: i64 = switch (now_mode) {
         0 => goldens.now_unix,
         1 => goldens.next_update_unix + 1,
         else => @as(i64, smith.value(i32)),
     };
 
-    cache.refresh(&goldens.godaddy_leaf_der, &goldens.godaddy_issuer_der, now) catch {};
-    if (cache.getStapled(a, &goldens.godaddy_leaf_der, now) catch null) |s| a.free(s);
+    var accepted = true;
+    cache.refresh(&goldens.godaddy_leaf_der, &goldens.godaddy_issuer_der, now) catch {
+        accepted = false;
+    };
+    // The oracle, on the rounds where the transport status and the clock are
+    // the captured ones: the genuine signed response is ACCEPTED and stapled,
+    // and any response that differs from it by even one octet is REFUSED.
+    if (mock.status == 200 and now_mode == 0) {
+        const genuine = std.mem.eql(u8, body, &goldens.godaddy_response_der);
+        if (genuine) {
+            if (!accepted) return error.GenuineResponseRefused;
+            RefreshMark.mark(.genuine_accepted);
+        } else if (body_mode != 3 or raw_len != 0) {
+            if (accepted) return error.AlteredResponseAccepted;
+            RefreshMark.mark(.flipped_refused);
+        }
+    }
+    if (!accepted) RefreshMark.mark(.refused);
+    if (cache.getStapled(a, &goldens.godaddy_leaf_der, now) catch null) |s| {
+        RefreshMark.mark(.stapled);
+        a.free(s);
+    }
     _ = cache.needsRefresh(&goldens.godaddy_leaf_der, now);
 
     // A fuzzed subject/issuer pair too — the request-building side.
     cache.refresh(raw[0..raw_len], &goldens.godaddy_issuer_der, now) catch {};
+}
+
+test "fuzz driver: OCSPCACHE_FUZZ (refresh: genuine accepted, altered refused)" {
+    try fz.fuzz_driver.run(fuzzRefresh, .{ .prefix = "OCSPCACHE_FUZZ", .name = "refresh" });
+}
+
+test "fuzz harness: 400 seeds of Cache.refresh in every test run, genuine accepted and altered refused" {
+    try RefreshMark.reach(fuzzRefresh, "ocspcache-refresh", 400);
 }
 
 /// Words: `[body_mode, (mode 1: mutation_count, positions…) | (mode 2: cut),
@@ -1663,7 +1713,7 @@ test "corpus: the refresh seeds drive every knob, and the counts are pinned" {
 }
 
 test "fuzz: Cache.refresh never panics on a hostile responder body" {
-    try std.testing.fuzz({}, fuzzRefresh, .{ .corpus = &refresh_seeds });
+    try std.testing.fuzz({}, fuzzRefreshSmith, .{ .corpus = &refresh_seeds });
 }
 
 test "the ocspcache fuzz harnesses reach the AIA walk and ocsp.verify (reachability)" {
@@ -1703,12 +1753,13 @@ test "the ocspcache fuzz harnesses reach the AIA walk and ocsp.verify (reachabil
 
     // 4. And both harness bodies run to completion on fixed input.
     var s1: std.testing.Smith = .{ .in = &([_]u8{0x01} ** 32 ++ [_]u8{0x00} ** 1024) };
-    try fuzzAia({}, &s1);
+    try fuzzAia(std.testing.Smith, &s1, a);
     var s2: std.testing.Smith = .{ .in = &([_]u8{0x00} ** 1024) };
-    try fuzzRefresh({}, &s2);
+    try fuzzRefresh(std.testing.Smith, &s2, a);
 }
 
 test {
     _ = @import("ocspcache_test.zig");
     _ = @import("goldens.zig");
+    _ = @import("fuzz_test.zig");
 }
