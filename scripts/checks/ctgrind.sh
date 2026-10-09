@@ -257,6 +257,8 @@ declare -A TARGETS=(
     # ── 2026-09-28: aesgcm (stitched AES-NI kernel + std-primitive backend) ─
     # Key AND plaintext tainted; see modules/aesgcm/src/ctgrind_harness.zig.
     [aesgcm]="ctx stateless generic"
+    # ── 2026-10-09: ripemd160 (unkeyed; the MESSAGE is the secret) ─────────
+    [ripemd160]="hash hash160"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -306,6 +308,7 @@ declare -A MODES=(
     [opaque]="ReleaseFast"
     [bip32]="ReleaseFast"
     [aesgcm]="ReleaseFast"
+    [ripemd160]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -556,6 +559,8 @@ declare -A PATTERN=(
     [threshold_ecdsa/auxgen]='root[.]zig|zkproofs[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig'
     [threshold_ecdsa/open7]='mta[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig'
     [threshold_ecdsa/betaprime]='signing[.]zig|presign[.]zig|ecproofs[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [ripemd160/hash]='root[.]zig'
+    [ripemd160/hash160]='root[.]zig|sha2[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 # WITNESS_CHAIN — the files a witness's stack may consist of BETWEEN the
@@ -715,6 +720,8 @@ declare -A LABEL=(
     [aesgcm/ctx]='aesgcm Context aesni (key+pt)'
     [aesgcm/stateless]='aesgcm stateless aesni (key+pt)'
     [aesgcm/generic]='aesgcm Context generic+std (key+pt)'
+    [ripemd160/hash]='ripemd160 hash+stream (message tainted)'
+    [ripemd160/hash160]='ripemd160 hash160 = std sha256+ours'
 )
 
 # ── measurement ────────────────────────────────────────────────────────────

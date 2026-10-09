@@ -1024,3 +1024,9 @@ aesgcm	ReleaseFast	generic	1	4	5b4932c6229ec5ef	beb9b7dd29864dad
 # the bucket loop does not turn the control red for nothing.
 groth16	ReleaseFast	zkprove_ct	1	6	c5f4a202c843392d	928bc8e1cc116243
 groth16	ReleaseFast	zkprove_vt	1	>=10	c5f4a202c843392d	928bc8e1cc116243
+# ripemd160 (2026-10-09) — unkeyed, so the MESSAGE is tainted: a hashed preimage
+# or key fed through hash160 is the case a branch in `compress` would leak.
+# hash: one-shot at 0/1/55/56/64/1000 B + a 3-chunk stream; hash160: std
+# SHA-256 + ours at 33 and 1000 B. All contexts are the hex witness.
+ripemd160	ReleaseFast	hash	1	0	253ec0e585e73059	247e27e8a7e8ddd7
+ripemd160	ReleaseFast	hash160	1	0	253ec0e585e73059	dc357526ecc9275d
