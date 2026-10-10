@@ -159,12 +159,22 @@ pub const SimStorage = struct {
         /// The bytes that were at `[off, off + old.len)` immediately before
         /// this write, i.e. the overlap with the then-current file. Empty when
         /// undo is not being recorded, or when the write only appended.
+        /// Always the whole allocation (it is freed as such); a truncation
+        /// that cuts this range shortens `len` only, and undo restores
+        /// `undoBytes()` — never re-slice `old` itself.
         old: []u8 = &.{},
         /// The file's length immediately before this write. Undoing in reverse
         /// order restores both the bytes and the length exactly.
         old_file_len: usize = 0,
         /// An `allocate` (zeros added past the end), not a write.
         alloc: bool = false,
+
+        /// The recorded old bytes that still lie inside the range: `old`
+        /// up to `len` (`old.len <= len` when recorded; a later truncation
+        /// may have shortened `len` below it).
+        fn undoBytes(r: Range) []const u8 {
+            return r.old[0..@min(r.old.len, r.len)];
+        }
     };
 
     /// Sentinel lock holder standing for "a different process holds it" —
@@ -409,9 +419,10 @@ pub const SimStorage = struct {
                 // leaves the OLD bytes on media, not zeros — modelling it as
                 // zeros both invents a state the disk never had and destroys
                 // the pre-write value a reader might legitimately recover.
-                if (r.old.len != 0) {
-                    const oend = @min(r.off + r.old.len, new_len);
-                    @memcpy(f.content.items[r.off..oend], r.old[0 .. oend - r.off]);
+                const old = r.undoBytes();
+                if (old.len != 0) {
+                    const oend = @min(r.off + old.len, new_len);
+                    @memcpy(f.content.items[r.off..oend], old[0 .. oend - r.off]);
                     if (oend < end) @memset(f.content.items[oend..end], 0);
                 } else {
                     @memset(f.content.items[r.off..end], 0);
@@ -719,7 +730,8 @@ pub const SimStorage = struct {
         while (i > 0) {
             i -= 1;
             const r = f.unsynced_writes.items[i];
-            if (r.old.len != 0) @memcpy(f.content.items[r.off..][0..r.old.len], r.old);
+            const old = r.undoBytes();
+            if (old.len != 0) @memcpy(f.content.items[r.off..][0..old.len], old);
             // Length restore is unconditional — it is what reverts a pure
             // APPEND, which has no `old` bytes to put back and is the only
             // thing an append-only store ever does.
@@ -741,8 +753,12 @@ pub const SimStorage = struct {
                 continue;
             }
             var rr = r;
-            if (rr.off + rr.len > len) rr.len = len - rr.off; // clamp straddler
-            if (rr.old.len > rr.len) rr.old = rr.old[0..rr.len];
+            // Clamp a straddler by its length alone: `old` stays the whole
+            // allocation, which `clearUnsynced` frees as such. Re-slicing it
+            // here (until 2026-10-11) handed the allocator a shorter slice
+            // than it allocated — an invalid free that `testing.allocator`
+            // reports on the next sync or crash after a straddling truncate.
+            if (rr.off + rr.len > len) rr.len = len - rr.off;
             f.unsynced_writes.items[w] = rr;
             w += 1;
         }
@@ -1320,6 +1336,39 @@ test "sim: an un-synced in-place OVERWRITE is rolled back by a crash, not kept" 
     // What was never fsynced is not on media. Under the old model this read
     // back "N2W-committed-bytes".
     try testing.expectEqualStrings("OLD-committed-bytes", &after);
+}
+
+test "sim: a truncate through an un-synced overwrite frees its undo buffer whole" {
+    // `dropUnsyncedAbove` used to re-slice the straddling range's undo buffer
+    // to the cut, and `clearUnsynced` then freed the shorter slice — an
+    // invalid free `testing.allocator` reports (found 2026-10-11 by
+    // pagecache's model test). Both the sync and the crash path free it.
+    for ([_]bool{ false, true }) |crash| {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.allow_overwrite = true;
+        const st = sim.storage();
+        const h = try st.open("f", .open_or_create);
+        try st.writeAll(h, "0123456789abcdefghij", 0);
+        try st.sync(h);
+        try st.syncDir();
+        try st.writeAll(h, "XXXXXXXXXXXX", 4); // un-synced, 12 old bytes recorded
+        try st.truncate(h, 8); // cuts that range to 4 bytes
+        if (crash) {
+            sim.ops_until_crash = 0;
+            try testing.expectError(error.Crashed, st.sync(h));
+            sim.reboot();
+            const h2 = try st.open("f", .open_or_create);
+            var head: [4]u8 = undefined;
+            try st.preadFull(h2, &head, 0);
+            try testing.expectEqualStrings("0123", &head); // the durable prefix
+        } else {
+            try st.sync(h);
+            var all: [8]u8 = undefined;
+            try st.preadFull(h, &all, 0);
+            try testing.expectEqualStrings("0123XXXX", &all);
+        }
+    }
 }
 
 test "sim: reorder mode restores the pre-write bytes of a dropped overwrite, not zeros" {
