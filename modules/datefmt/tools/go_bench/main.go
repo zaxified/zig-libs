@@ -11,8 +11,11 @@
 //	parse_imf    time.Parse(http.TimeFormat, s).Unix()
 //	parse_rfc    time.Parse(time.RFC3339, s).Unix()      (Z, whole seconds)
 //	parse_rfcns  time.Parse(time.RFC3339, s)             (fraction + offset)
-//	*_layout     the same as the name without the suffix (the Zig side
-//	             formats/parses through a precompiled layout there)
+//	fmt_rfc3339_tokens  ... .Format("2006-01-02T15:04:05Z")  (same text as
+//	             fmt_rfc3339, a layout Go does not special-case)
+//	*_layout, *_canned, parse_rfc3339_parts  the Go side of the row they
+//	             extend (fmt_rfc3339_layout: of fmt_rfc3339_tokens); the Zig
+//	             side uses a precompiled layout or a canned function there
 //
 // Timing matches the Zig side: double the batch until it takes over 100 ms,
 // then keep the best of five.
@@ -90,7 +93,7 @@ func main() {
 
 	var f func() int
 	switch name {
-	case "fmt_imf", "fmt_imf_layout":
+	case "fmt_imf", "fmt_imf_layout", "fmt_imf_canned":
 		f = func() int {
 			t := 0
 			for _, u := range unix {
@@ -98,7 +101,15 @@ func main() {
 			}
 			return t
 		}
-	case "fmt_rfc3339", "fmt_rfc3339_layout":
+	case "fmt_rfc3339_tokens", "fmt_rfc3339_layout":
+		f = func() int {
+			t := 0
+			for _, u := range unix {
+				t += sum(time.Unix(u, 0).UTC().Format("2006-01-02T15:04:05Z"))
+			}
+			return t
+		}
+	case "fmt_rfc3339":
 		f = func() int {
 			t := 0
 			for _, u := range unix {
@@ -106,7 +117,7 @@ func main() {
 			}
 			return t
 		}
-	case "parse_imf", "parse_imf_layout":
+	case "parse_imf", "parse_imf_layout", "parse_imf_canned":
 		f = func() int {
 			t := 0
 			for _, s := range imf {
@@ -130,7 +141,7 @@ func main() {
 			}
 			return t
 		}
-	case "parse_rfc3339_frac":
+	case "parse_rfc3339_frac", "parse_rfc3339_parts":
 		f = func() int {
 			t := 0
 			for _, s := range rfcns {

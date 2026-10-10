@@ -90,6 +90,14 @@ fn Layout.compile(fmt) ParseError!Layout;        // TooManyTokens past 64 tokens
 fn Layout.format(*const Layout, alloc, parts) ![]u8;
 fn Layout.parse(*const Layout, input) ParseError!DateParts;
 
+// Canned formats, validated (year 0..9999); buf* never allocate
+fn bufRfc3339(buf: *[rfc3339_max_len]u8, parts, frac_digits: u8) ![]u8;  // Z or ±hh:mm from off_min
+fn formatRfc3339(alloc, parts, frac_digits) ![]u8;
+fn parseRfc3339(s) ParseError!DateParts;         // offset required, kept in off_min
+fn bufImfFixdate(buf: *[imf_fixdate_len]u8, parts) !void;  // "Sun, 06 Nov 1994 08:49:37 GMT"
+fn formatImfFixdate(alloc, parts) ![]u8;
+fn parseImfFixdate(s) ParseError!DateParts;      // fixdate only, weekday checked
+
 // Arithmetic (pre-1970 safe)
 fn addDays(parts, n: i64) DateParts;
 fn addMonths(parts, n: i32) DateParts;           // clamps day (Jan 31 +1mo → Feb 28/29)

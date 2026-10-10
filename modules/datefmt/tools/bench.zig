@@ -12,16 +12,26 @@
 //! timestamps (1990..2060); one op = all 64:
 //!   fmt_imf             Unix seconds -> `Date:` header text (IMF-fixdate);
 //!                       ours `unixToParts` + `format`, Go `Format(http.TimeFormat)`
-//!   fmt_rfc3339         Unix seconds -> `YYYY-MM-DDThh:mm:ssZ`, same pairing
+//!   fmt_rfc3339         Unix seconds -> `YYYY-MM-DDThh:mm:ssZ`: ours
+//!                       `formatRfc3339`, Go `Format(time.RFC3339)` -- both
+//!                       sides' canned path (Go special-cases that layout)
 //!   parse_imf           `If-Modified-Since` text -> Unix seconds;
 //!                       ours `parse` + `partsToUnix`, Go `time.Parse(http.TimeFormat)`
 //!   parse_rfc3339       RFC 3339 `...Z` -> Unix seconds, ours `parseXsdDateTime`
 //!   parse_rfc3339_frac  RFC 3339 with 9 fraction digits and a +02:00 offset,
 //!                       ours `parseXsdDateTimeNs`, Go `time.Parse(time.RFC3339)`
-//!   *_layout            fmt_imf, fmt_rfc3339, parse_imf through a
+//!   fmt_rfc3339_tokens  the same text through the token engine, ours
+//!                       `format("YYYY-MM-DD[T]hh:mm:ss[Z]")`, Go
+//!                       `Format("2006-01-02T15:04:05Z")` -- a layout Go does
+//!                       NOT special-case, so generic path against generic path
+//!   *_layout            fmt_imf, fmt_rfc3339_tokens, parse_imf through a
 //!                       `datefmt.Layout` compiled once (comptime); Go runs the
 //!                       same code as the row without the suffix (it has no
 //!                       compiled layout -- its layout string is the constant)
+//!   fmt_imf_canned      `formatImfFixdate`, Go as fmt_imf
+//!   parse_imf_canned    `parseImfFixdate` + `partsToUnix`, Go as parse_imf
+//!   parse_rfc3339_parts `parseRfc3339` (offset kept, applied after), on the
+//!                       parse_rfc3339_frac inputs, Go as that row
 //! Each side times the same way (double the batch until it takes over 100 ms,
 //! best of five); per workload the sides alternate for BENCH_ROUNDS (default 3)
 //! rounds, each keeping its best. The result count (sum of output bytes, or of
@@ -43,7 +53,7 @@ const rfc_fmt = "YYYY-MM-DD[T]hh:mm:ss[Z]";
 
 const net_base: ?[]const u8 = null;
 const info_only = [_][]const u8{};
-const names = [_][]const u8{ "fmt_imf", "fmt_rfc3339", "parse_imf", "parse_rfc3339", "parse_rfc3339_frac", "fmt_imf_layout", "fmt_rfc3339_layout", "parse_imf_layout" };
+const names = [_][]const u8{ "fmt_imf", "fmt_rfc3339", "parse_imf", "parse_rfc3339", "parse_rfc3339_frac", "fmt_imf_layout", "fmt_rfc3339_layout", "parse_imf_layout", "fmt_rfc3339_tokens", "fmt_imf_canned", "parse_imf_canned", "parse_rfc3339_parts" };
 const imf_layout = datefmt.Layout.compile(imf_fmt) catch unreachable;
 const rfc_layout = datefmt.Layout.compile(rfc_fmt) catch unreachable;
 
@@ -64,7 +74,7 @@ fn once(d: *const Data, w: usize) u64 {
     const a = std.heap.smp_allocator;
     var t: u64 = 0;
     switch (w) {
-        0, 1 => for (d.unix) |u| {
+        0, 8 => for (d.unix) |u| {
             const s = datefmt.format(a, datefmt.unixToParts(u), if (w == 0) imf_fmt else rfc_fmt) catch unreachable;
             t += sumBytes(s);
             a.free(s);
@@ -82,6 +92,21 @@ fn once(d: *const Data, w: usize) u64 {
         7 => for (d.imf) |s| {
             const p = imf_layout.parse(s) catch unreachable;
             t +%= @bitCast(datefmt.partsToUnix(p));
+        },
+        1, 9 => for (d.unix) |u| {
+            const p = datefmt.unixToParts(u);
+            const s = (if (w == 1) datefmt.formatRfc3339(a, p, 0) else datefmt.formatImfFixdate(a, p)) catch unreachable;
+            t += sumBytes(s);
+            a.free(s);
+        },
+        10 => for (d.imf) |s| {
+            const p = datefmt.parseImfFixdate(s) catch unreachable;
+            t +%= @bitCast(datefmt.partsToUnix(p));
+        },
+        11 => for (d.rfcns) |s| {
+            const p = datefmt.parseRfc3339(s) catch unreachable;
+            t +%= @bitCast(datefmt.partsToUnix(p) - @as(i64, p.off_min.?) * 60);
+            t += p.nanosecond;
         },
         3 => for (d.rfc) |s| {
             t +%= @bitCast(datefmt.parseXsdDateTime(s) catch unreachable);

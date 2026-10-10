@@ -1152,6 +1152,192 @@ pub fn formatIsoDate(alloc: std.mem.Allocator, parts: DateParts) ![]const u8 {
     return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}", .{ y_u, parts.month, parts.day });
 }
 
+// ---------------------------------------------------------------------------
+// Canned formats: RFC 3339 and the HTTP date (IMF-fixdate)
+// ---------------------------------------------------------------------------
+//
+// Fixed-shape writers with no format string to read and, in the `buf*` form,
+// no allocator: what an HTTP server or a log line needs on every request (qap
+// `access.zig` and `http` `Server.zig` hand-rolled both before these existed).
+// Unlike `format`, they validate: a field out of range or a year outside
+// 0000..9999 (four digits is all either grammar can say) is an error, never
+// garbage in a header.
+
+/// Longest `bufRfc3339` output: `YYYY-MM-DDThh:mm:ss.nnnnnnnnn+hh:mm`.
+pub const rfc3339_max_len = 35;
+
+/// `parts` as RFC 3339 (`YYYY-MM-DDThh:mm:ss[.f…](Z|±hh:mm)`) into `buf`;
+/// returns the written prefix. `frac_digits` (0..9) fraction digits are
+/// written, truncated (0 = none: Go's `time.RFC3339`; 9 = always nine, unlike
+/// Go's `RFC3339Nano`, which trims trailing zeros). The offset is
+/// `parts.off_min`: null or 0 is `Z`, anything else `±hh:mm`, as in Go.
+/// `InvalidDate`: a date out of range or a year outside 0..9999.
+/// `InvalidTime`: a time out of range, an offset of a day or more, or
+/// `frac_digits` > 9.
+pub fn bufRfc3339(buf: *[rfc3339_max_len]u8, parts: DateParts, frac_digits: u8) error{ InvalidDate, InvalidTime }![]u8 {
+    try checkCanned(parts);
+    if (frac_digits > 9) return error.InvalidTime;
+    const om: i32 = parts.off_min orelse 0;
+    if (om <= -24 * 60 or om >= 24 * 60) return error.InvalidTime;
+
+    var n = putDec(buf, 0, @intCast(parts.year), 4);
+    buf[n] = '-';
+    n = putDec(buf, n + 1, parts.month, 2);
+    buf[n] = '-';
+    n = putDec(buf, n + 1, parts.day, 2);
+    buf[n] = 'T';
+    n = putDec(buf, n + 1, parts.hour, 2);
+    buf[n] = ':';
+    n = putDec(buf, n + 1, parts.minute, 2);
+    buf[n] = ':';
+    n = putDec(buf, n + 1, parts.second, 2);
+    if (frac_digits > 0) {
+        var digits: [9]u8 = undefined;
+        _ = putDec(&digits, 0, parts.nanosecond, 9);
+        buf[n] = '.';
+        @memcpy(buf[n + 1 ..][0..frac_digits], digits[0..frac_digits]);
+        n += 1 + frac_digits;
+    }
+    if (om == 0) {
+        buf[n] = 'Z';
+        return buf[0 .. n + 1];
+    }
+    const mag: u32 = @intCast(@abs(om));
+    buf[n] = if (om < 0) '-' else '+';
+    n = putDec(buf, n + 1, mag / 60, 2);
+    buf[n] = ':';
+    n = putDec(buf, n + 1, mag % 60, 2);
+    return buf[0..n];
+}
+
+/// `bufRfc3339` into a new allocation (caller frees).
+pub fn formatRfc3339(alloc: std.mem.Allocator, parts: DateParts, frac_digits: u8) ![]u8 {
+    var buf: [rfc3339_max_len]u8 = undefined;
+    return alloc.dupe(u8, try bufRfc3339(&buf, parts, frac_digits));
+}
+
+/// Parse RFC 3339 `YYYY-MM-DD(T|t)hh:mm:ss[.f…](Z|z|±hh:mm)` into wall-clock
+/// `DateParts` with `off_min` set (0 for `Z`) -- the parse→format reshuffle
+/// keeps the offset, where `parseXsdDateTimeNs` folds it into a Unix instant.
+/// Stricter than `parseXsdDateTimeNs`, as RFC 3339 is: the offset is
+/// required. Any number (≥ 1) of fraction digits; the first 9 are kept, the
+/// rest truncated. A leap second (`:60`) is `InvalidTime`, as in Go's
+/// `time.Parse` -- `DateParts` cannot hold it. The whole input must match.
+pub fn parseRfc3339(s: []const u8) ParseError!DateParts {
+    if (s.len < 20) return ParseError.InvalidFormat; // "YYYY-MM-DDThh:mm:ssZ"
+    if (s[4] != '-' or s[7] != '-' or (s[10] != 'T' and s[10] != 't') or s[13] != ':' or s[16] != ':')
+        return ParseError.InvalidFormat;
+    var p = DateParts{
+        .year = try parseUint(i32, s[0..4], ParseError.InvalidDate),
+        .month = try parseUint(u32, s[5..7], ParseError.InvalidDate),
+        .day = try parseUint(u32, s[8..10], ParseError.InvalidDate),
+        .hour = try parseUint(u32, s[11..13], ParseError.InvalidTime),
+        .minute = try parseUint(u32, s[14..16], ParseError.InvalidTime),
+        .second = try parseUint(u32, s[17..19], ParseError.InvalidTime),
+    };
+    var i: usize = 19;
+    if (s[i] == '.') {
+        i += 1;
+        const start = i;
+        var scale: u32 = 100_000_000; // weight of the next digit
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+            p.nanosecond += @as(u32, s[i] - '0') * scale;
+            scale /= 10;
+        }
+        if (i == start) return ParseError.InvalidFormat;
+    }
+    if (i >= s.len) return ParseError.InvalidFormat; // the offset is required
+    switch (s[i]) {
+        'Z', 'z' => {
+            p.off_min = 0;
+            i += 1;
+        },
+        '+', '-' => {
+            if (i + 6 > s.len or s[i + 3] != ':') return ParseError.InvalidFormat;
+            const oh = try parseUint(i32, s[i + 1 .. i + 3], ParseError.InvalidTime);
+            const om = try parseUint(i32, s[i + 4 .. i + 6], ParseError.InvalidTime);
+            if (oh > 23 or om > 59) return ParseError.InvalidTime;
+            p.off_min = if (s[i] == '-') -(oh * 60 + om) else oh * 60 + om;
+            i += 6;
+        },
+        else => return ParseError.InvalidFormat,
+    }
+    if (i != s.len) return ParseError.InvalidFormat;
+    try checkParsed(p);
+    return p;
+}
+
+/// Length of an IMF-fixdate (RFC 9110 §5.6.7): `Sun, 06 Nov 1994 08:49:37 GMT`.
+pub const imf_fixdate_len = 29;
+
+/// `parts` (UTC; `off_min` is ignored -- the format is always GMT) as the
+/// HTTP date `EEE, DD MMM YYYY hh:mm:ss GMT` into `buf`. Errors as `bufRfc3339`.
+pub fn bufImfFixdate(buf: *[imf_fixdate_len]u8, parts: DateParts) error{ InvalidDate, InvalidTime }!void {
+    try checkCanned(parts);
+    const dow = isoWeekday(ymdToEpochDay(parts.year, parts.month, parts.day));
+    buf[0..3].* = short_day_names[dow - 1][0..3].*;
+    buf[3..5].* = ", ".*;
+    _ = putDec(buf, 5, parts.day, 2);
+    buf[7] = ' ';
+    buf[8..11].* = short_month_names[parts.month - 1][0..3].*;
+    buf[11] = ' ';
+    _ = putDec(buf, 12, @intCast(parts.year), 4);
+    buf[16] = ' ';
+    _ = putDec(buf, 17, parts.hour, 2);
+    buf[19] = ':';
+    _ = putDec(buf, 20, parts.minute, 2);
+    buf[22] = ':';
+    _ = putDec(buf, 23, parts.second, 2);
+    buf[25..29].* = " GMT".*;
+}
+
+/// `bufImfFixdate` into a new allocation (caller frees).
+pub fn formatImfFixdate(alloc: std.mem.Allocator, parts: DateParts) ![]u8 {
+    var buf: [imf_fixdate_len]u8 = undefined;
+    try bufImfFixdate(&buf, parts);
+    return alloc.dupe(u8, &buf);
+}
+
+/// Parse an IMF-fixdate exactly (`Sun, 06 Nov 1994 08:49:37 GMT`, names in
+/// that case, `GMT` literal) into UTC `DateParts` (`off_min` 0). The day name
+/// must be the date's real weekday. RFC 9110's obsolete forms (RFC 850,
+/// asctime) are not accepted; a recipient that must take them parses with
+/// `parse` and their format strings.
+pub fn parseImfFixdate(s: []const u8) ParseError!DateParts {
+    if (s.len != imf_fixdate_len) return ParseError.InvalidFormat;
+    if (!std.mem.eql(u8, s[3..5], ", ") or s[7] != ' ' or s[11] != ' ' or s[16] != ' ' or
+        s[19] != ':' or s[22] != ':' or !std.mem.eql(u8, s[25..29], " GMT")) return ParseError.InvalidFormat;
+    const month: u32 = for (short_month_names, 1..) |name, m| {
+        if (std.mem.eql(u8, s[8..11], name)) break @intCast(m);
+    } else return ParseError.InvalidDate;
+    const p = DateParts{
+        .year = try parseUint(i32, s[12..16], ParseError.InvalidDate),
+        .month = month,
+        .day = try parseUint(u32, s[5..7], ParseError.InvalidDate),
+        .hour = try parseUint(u32, s[17..19], ParseError.InvalidTime),
+        .minute = try parseUint(u32, s[20..22], ParseError.InvalidTime),
+        .second = try parseUint(u32, s[23..25], ParseError.InvalidTime),
+        .off_min = 0,
+    };
+    try checkParsed(p);
+    const dow = isoWeekday(ymdToEpochDay(p.year, p.month, p.day));
+    if (!std.mem.eql(u8, s[0..3], short_day_names[dow - 1])) return ParseError.InvalidDate;
+    return p;
+}
+
+/// The range check the canned writers share: a valid date and time, year
+/// 0000..9999 (four digits).
+fn checkCanned(p: DateParts) error{ InvalidDate, InvalidTime }!void {
+    if (p.hour > 23 or p.minute > 59 or p.second > 59 or p.nanosecond > 999_999_999) return error.InvalidTime;
+    if (p.year < 0 or p.year > 9999 or !validate(p)) return error.InvalidDate;
+}
+
+/// `validate` with `parse`'s error split.
+fn checkParsed(p: DateParts) ParseError!void {
+    if (p.hour > 23 or p.minute > 59 or p.second > 59) return ParseError.InvalidTime;
+    if (!validate(p)) return ParseError.InvalidDate;
+}
+
 /// Parse an `xsd:dateTime` (SAML/XML-Schema) timestamp to Unix seconds:
 /// `YYYY-MM-DDThh:mm:ss(.frac)?(Z|±hh:mm)?`. Fractional seconds (any number
 /// of digits, ≥ 1) are accepted and dropped — this returns whole seconds; use
@@ -1584,6 +1770,148 @@ test "Layout: same result as format/parse with the format string, also compiled 
         try expectLayoutMatches(&imf, "EEE, DD MMM YYYY hh:mm:ss [GMT]", p);
     }
     try testing.expectError(ParseError.TooManyTokens, Layout.compile("YYYY-" ** 40));
+}
+
+test "canned: RFC 9110 and RFC 3339 examples" {
+    // RFC 9110 §5.6.7.
+    const imf = try parseImfFixdate("Sun, 06 Nov 1994 08:49:37 GMT");
+    try testing.expectEqual(@as(i64, 784111777), partsToUnix(imf));
+    var ib: [imf_fixdate_len]u8 = undefined;
+    try bufImfFixdate(&ib, unixToParts(784111777));
+    try testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", &ib);
+
+    // RFC 3339 §5.8.
+    const a = try parseRfc3339("1985-04-12T23:20:50.52Z");
+    try testing.expectEqual(DateParts{ .year = 1985, .month = 4, .day = 12, .hour = 23, .minute = 20, .second = 50, .nanosecond = 520_000_000, .off_min = 0 }, a);
+    const b = try parseRfc3339("1996-12-19T16:39:57-08:00");
+    try testing.expectEqual(@as(?i32, -480), b.off_min);
+    const c = try parseRfc3339("1937-01-01T12:00:27.87+00:20");
+    try testing.expectEqual(@as(?i32, 20), c.off_min);
+    try testing.expectEqual(@as(u32, 870_000_000), c.nanosecond);
+    var rb: [rfc3339_max_len]u8 = undefined;
+    try testing.expectEqualStrings("1985-04-12T23:20:50.52Z", try bufRfc3339(&rb, a, 2));
+    try testing.expectEqualStrings("1996-12-19T16:39:57-08:00", try bufRfc3339(&rb, b, 0));
+    try testing.expectEqualStrings("1937-01-01T12:00:27.870000000+00:20", try bufRfc3339(&rb, c, 9));
+    try testing.expectEqualStrings("1985-04-12T23:20:50Z", try bufRfc3339(&rb, .{ .year = 1985, .month = 4, .day = 12, .hour = 23, .minute = 20, .second = 50 }, 0));
+    // The leap second of the RFC's own example: DateParts cannot hold it.
+    try testing.expectError(ParseError.InvalidTime, parseRfc3339("1990-12-31T23:59:60Z"));
+}
+
+test "canned: agree with the token engine and parseXsdDateTimeNs over random instants" {
+    var prng = std.Random.DefaultPrng.init(0xca_77ed);
+    const r = prng.random();
+    var rb: [rfc3339_max_len]u8 = undefined;
+    var ib: [imf_fixdate_len]u8 = undefined;
+    for (0..2000) |_| {
+        var p = unixToParts(r.intRangeAtMost(i64, -62_167_219_200, 253_402_300_799)); // 0000..9999
+        p.nanosecond = r.uintLessThan(u32, 1_000_000_000);
+        const utc = p;
+        p.off_min = r.intRangeAtMost(i32, -1439, 1439);
+
+        try bufImfFixdate(&ib, utc);
+        const want_imf = try format(testing.allocator, utc, "EEE, DD MMM YYYY hh:mm:ss [GMT]");
+        defer testing.allocator.free(want_imf);
+        try testing.expectEqualStrings(want_imf, &ib);
+        var back = try parseImfFixdate(&ib);
+        back.nanosecond = utc.nanosecond;
+        back.off_min = null;
+        try testing.expectEqual(utc, back);
+
+        const fd: u8 = r.uintAtMost(u8, 9);
+        const s = try bufRfc3339(&rb, p, fd);
+        const want = try format(testing.allocator, p, if (p.off_min.? == 0) "YYYY-MM-DD[T]hh:mm:ss.SSSSSSSSS[Z]" else "YYYY-MM-DD[T]hh:mm:ss.SSSSSSSSSZZ");
+        defer testing.allocator.free(want);
+        // The token engine always writes nine digits; cut to fd (and the dot).
+        const head = if (fd == 0) want[0..19] else want[0 .. 20 + fd];
+        try testing.expectEqualStrings(head, s[0..head.len]);
+        try testing.expectEqualStrings(want[29..], s[head.len..]);
+        const q = try parseRfc3339(s);
+        const ns_kept = p.nanosecond - p.nanosecond % std.math.pow(u32, 10, 9 - fd);
+        try testing.expectEqual(ns_kept, q.nanosecond);
+        try testing.expectEqual(p.off_min, q.off_min);
+        const inst = try parseXsdDateTimeNs(s);
+        try testing.expectEqual(partsToUnix(q) - @as(i64, q.off_min.?) * 60, inst.unix);
+        try testing.expectEqual(q.nanosecond, inst.nanosecond);
+    }
+}
+
+test "canned: out-of-range values are errors, malformed input is refused" {
+    var rb: [rfc3339_max_len]u8 = undefined;
+    var ib: [imf_fixdate_len]u8 = undefined;
+    const ok = DateParts{ .year = 2024, .month = 2, .day = 29, .hour = 23, .minute = 59, .second = 59 };
+    _ = try bufRfc3339(&rb, ok, 9);
+    try bufImfFixdate(&ib, ok);
+    for ([_]DateParts{
+        .{ .year = -1 },                          .{ .year = 10000 },
+        .{ .year = 2023, .month = 2, .day = 29 }, .{ .month = 13 },
+        .{ .day = 0 },
+    }) |bad| {
+        try testing.expectError(error.InvalidDate, bufRfc3339(&rb, bad, 0));
+        try testing.expectError(error.InvalidDate, bufImfFixdate(&ib, bad));
+    }
+    for ([_]DateParts{ .{ .hour = 24 }, .{ .minute = 60 }, .{ .second = 60 }, .{ .nanosecond = 1_000_000_000 } }) |bad| {
+        try testing.expectError(error.InvalidTime, bufRfc3339(&rb, bad, 0));
+        try testing.expectError(error.InvalidTime, bufImfFixdate(&ib, bad));
+    }
+    try testing.expectError(error.InvalidTime, bufRfc3339(&rb, .{ .off_min = 1440 }, 0));
+    try testing.expectError(error.InvalidTime, bufRfc3339(&rb, .{ .off_min = -1440 }, 0));
+    try testing.expectError(error.InvalidTime, bufRfc3339(&rb, .{}, 10));
+    try testing.expectEqualStrings("1970-01-01T00:00:00+23:59", try bufRfc3339(&rb, .{ .off_min = 1439 }, 0));
+    try testing.expectEqualStrings("0000-01-01T00:00:00Z", try bufRfc3339(&rb, .{ .year = 0 }, 0));
+    try testing.expectEqualStrings("9999-12-31T23:59:59Z", try bufRfc3339(&rb, .{ .year = 9999, .month = 12, .day = 31, .hour = 23, .minute = 59, .second = 59 }, 0));
+
+    for ([_][]const u8{
+        "2024-01-01T00:00:00", // no offset
+        "2024-01-01T00:00:00.Z", // empty fraction
+        "2024-01-01 00:00:00Z", // space separator
+        "2024-01-01T00:00:00+0100", // offset without colon
+        "2024-01-01T00:00:00Zx", // trailing
+        "2024-01-01T00:00:00+01:0", // short offset
+    }) |bad| try testing.expectError(ParseError.InvalidFormat, parseRfc3339(bad));
+    try testing.expectError(ParseError.InvalidTime, parseRfc3339("2024-01-01T00:00:00+24:00"));
+    try testing.expectError(ParseError.InvalidTime, parseRfc3339("2024-01-01T24:00:00Z"));
+    try testing.expectError(ParseError.InvalidDate, parseRfc3339("2023-02-29T00:00:00Z"));
+    try testing.expectError(ParseError.InvalidDate, parseRfc3339("2024-1a-01T00:00:00Z"));
+    try testing.expectError(ParseError.InvalidDate, parseRfc3339("+024-01-01T00:00:00Z")); // sign in a field
+    _ = try parseRfc3339("2024-01-01t00:00:00z");
+
+    for ([_][]const u8{
+        "Sun, 06 Nov 1994 08:49:37 UTC", // not GMT
+        "Sun, 6 Nov 1994 08:49:37 GMT", // one-digit day
+        "Sunday, 06-Nov-94 08:49:37 GMT", // RFC 850 (obsolete)
+        "Sun Nov  6 08:49:37 1994", // asctime (obsolete)
+        "Sun, 06 Nov 1994 08:49:37 GMT ", // trailing
+    }) |bad| try testing.expectError(ParseError.InvalidFormat, parseImfFixdate(bad));
+    try testing.expectError(ParseError.InvalidDate, parseImfFixdate("Mon, 06 Nov 1994 08:49:37 GMT")); // wrong weekday
+    try testing.expectError(ParseError.InvalidDate, parseImfFixdate("Sun, 06 nov 1994 08:49:37 GMT")); // case
+    try testing.expectError(ParseError.InvalidDate, parseImfFixdate("Fri, 31 Feb 1994 08:49:37 GMT"));
+    try testing.expectError(ParseError.InvalidTime, parseImfFixdate("Sun, 06 Nov 1994 08:60:37 GMT"));
+}
+
+test "canned parsers: mutated and random input is an error or a valid date, never a panic" {
+    // Header input is untrusted (`If-Modified-Since`): byte flips, cuts and
+    // random bytes, in a safety-checked build.
+    var prng = std.Random.DefaultPrng.init(0xbad_da7e);
+    const r = prng.random();
+    const seeds = [_][]const u8{ "Sun, 06 Nov 1994 08:49:37 GMT", "1937-01-01T12:00:27.87+00:20", "2024-02-29T23:59:59.123456789Z" };
+    var buf: [40]u8 = undefined;
+    for (0..20_000) |i| {
+        const seed = seeds[i % seeds.len];
+        var len = seed.len;
+        @memcpy(buf[0..len], seed);
+        switch (r.uintLessThan(u8, 3)) {
+            0 => for (0..r.uintAtMost(u8, 3)) |_| {
+                buf[r.uintLessThan(usize, len)] = r.int(u8);
+            },
+            1 => len = r.uintAtMost(usize, len),
+            else => {
+                len = r.uintAtMost(usize, buf.len);
+                r.bytes(buf[0..len]);
+            },
+        }
+        if (parseRfc3339(buf[0..len])) |p| try testing.expect(validate(p)) else |_| {}
+        if (parseImfFixdate(buf[0..len])) |p| try testing.expect(validate(p)) else |_| {}
+    }
 }
 
 test "tokenize: more than MAX_TOKENS tokens is TooManyTokens, not an overrun" {

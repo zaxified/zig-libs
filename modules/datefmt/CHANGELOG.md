@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Canned formats: `bufRfc3339`/`formatRfc3339`/`parseRfc3339` (RFC 3339; 0..9
+  fraction digits; offset from/into `off_min`) and `bufImfFixdate`/`formatImfFixdate`/`parseImfFixdate`
+  (the RFC 9110 HTTP date). The `buf*` forms write into a fixed-size array without allocating. Unlike
+  `format`, all of them validate their fields (year 0..9999). Bench vs Go `time`: 0.06–0.91× (P2).
+  Canned rows are paired with Go's canned RFC 3339 path; the token engine is now paired with a layout
+  Go does not special-case (`fmt_rfc3339_tokens`).
+
 - **2026-10-10** — Speed: `format` and `parse` 7–18× faster on short formats (bench vs Go `time`:
   0.23–18.95× → 0.29–1.83×; P3). The tokenizer looks tokens up by first character instead of scanning
   the token table at every position, and the token array is no longer memset on every call. `format`
