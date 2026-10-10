@@ -625,6 +625,7 @@ const verify_seeds = [_][]const u8{
 };
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 const VerifyMark = fz.Marker(enum { pristine_verified, refused_at_parse, parsed_rejected });
 const WireMark = fz.Marker(enum { element_ok, element_refused, signature_ok, signature_refused, scalar_ok, scalar_refused, identifier_ok, identifier_refused });
 const ProtoMark = fz.Marker(enum { genuine_accepted, flipped_sig_rejected, bad_share_detected, bad_share_aggregate_rejected, good_share_verified, other_message_rejected, other_quorum });
@@ -692,7 +693,9 @@ test "fuzz: wire decoders reject what is not canonical and re-encode what they a
 }
 
 fn fuzzWireSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzWire(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzWire(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 
 /// The byte-level decoders a participant's message passes through:
@@ -754,7 +757,9 @@ test "fuzz: a (t,n) signing round trip is accepted; damaged signatures and share
 }
 
 fn fuzzProtocolSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzProtocol(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzProtocol(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 
 fn drawScalar(comptime S: type, src: *S) frost.Scalar {

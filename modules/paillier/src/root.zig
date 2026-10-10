@@ -2472,7 +2472,7 @@ const fz = @import("fuzz_test.zig");
 var corpus_cache: ?*Corpus = null;
 fn cachedCorpus() *const Corpus {
     if (corpus_cache == null) {
-        const c = std.heap.page_allocator.create(Corpus) catch @panic("out of memory");
+        const c = std.heap.page_allocator.create(Corpus) catch @panic("out of memory"); // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
         c.* = .{};
         c.build() catch @panic("corpus build failed");
         corpus_cache = c;

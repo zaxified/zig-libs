@@ -2875,6 +2875,7 @@ test "the session era is untouched: an initialize-era POST under a session-revis
 // ── deterministic fuzz driver (MCP_HTTP_FUZZ, added 2026-10-10) ─────────────
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 
 const PreMark = fz.Marker(enum { initialize, not_initialize, correlatable, not_correlatable, damaged });
 
@@ -3059,7 +3060,9 @@ pub fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
 }
 
 fn fuzzWireSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzWire(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzWire(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 
 test "fuzz: HTTP requests, damaged, against two live sessions" {

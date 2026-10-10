@@ -594,7 +594,7 @@ var corpus_cache: ?StringCorpus = null;
 fn corpusEntries() []const []const u8 {
     if (corpus_cache == null) {
         corpus_cache = .{};
-        _ = corpus_cache.?.build(std.heap.page_allocator) catch unreachable;
+        _ = corpus_cache.?.build(std.heap.page_allocator) catch unreachable; // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
     }
     return corpus_cache.?.entries[0..corpus_cache.?.n];
 }
@@ -625,11 +625,15 @@ test "fuzz harness: bech32 roundtrip, 300 seeds, reaches every outcome" {
 }
 
 fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzDecode(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzDecode(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 fn fuzzRoundtripSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzRoundtrip(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzRoundtrip(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 fn fuzzDecode(comptime S: type, src: *S, allocator: Allocator) anyerror!void {

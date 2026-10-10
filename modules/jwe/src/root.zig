@@ -1161,6 +1161,7 @@ const token_seeds = [_][]const u8{
 };
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 const DecryptMark = fz.Marker(enum { genuine_accepted, framing_refused, past_framing_refused });
 const RoundtripMark = fz.Marker(enum { dir, key_wrap, gcm_key_wrap, genuine_accepted, flipped_refused });
 
@@ -1245,7 +1246,9 @@ test "fuzz: a genuine JWE opens and a flipped one is refused" {
 }
 
 fn fuzzRoundtripSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzRoundtrip(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzRoundtrip(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 
 /// `alg` x `enc` knob-chosen, key and plaintext from the source: what

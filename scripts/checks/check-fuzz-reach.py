@@ -336,6 +336,14 @@ class File:
                 (brace + 1, end - 1, self.src[m.end():paren_end - 1]))
         # `const Name = struct { … }`, so a method can be resolved on the type
         # the receiver was built from rather than by name alone.
+        # `const fz = @import("fuzz_test.zig");` — a sibling file of the same
+        # module. The deterministic-driver waves (2026-10-09/10) put one shared
+        # `drawInput` into each module's `fuzz_test.zig` and call it as
+        # `fz.drawInput(S, src, …)` from every harness; without following it the
+        # gate read ~200 harnesses as "makes no `Smith` draw at all".
+        self.imports = {}
+        for m in re.finditer(r'\bconst\s+(\w+)\s*=\s*@import\("([\w./-]+\.zig)"\)', self.src):
+            self.imports[m.group(1)] = (path.parent / m.group(2)).resolve()
         self.structs = {}
         for m in re.finditer(r"\bconst\s+(\w+)\s*=\s*(?:packed\s+|extern\s+)?struct\b[^{]*\{",
                              self.src):
@@ -372,6 +380,14 @@ class File:
         out = {n: None for n in SMITH_FIELD_RE.findall(d[2])}
         for m in re.finditer(r"(\w+)\s*:\s*anytype", d[2]):
             out[m.group(1)] = None
+        # A harness generic over its source of choices (`fn h(comptime S:
+        # type, src: *S, …)`, the shape every deterministic fuzz driver
+        # needs): the `testing.fuzz` callback calls it as `h(Smith, smith, …)`,
+        # so `src` IS the Smith there. Without this every such target read as
+        # "makes no `Smith` draw at all" (2026-10-10: ~350 targets, red CI).
+        for g in re.findall(r"comptime\s+(\w+)\s*:\s*type", d[2]):
+            for m in re.finditer(r"(\w+)\s*:\s*\*\s*" + re.escape(g) + r"\b", d[2]):
+                out[m.group(1)] = None
         for m in re.finditer(r"(\w+)\s*:\s*\*?(\w+)", d[2]):
             ty = m.group(2)
             if ty in self.structs and SMITH_FIELD_RE.search(
@@ -421,8 +437,50 @@ def smith_names(body: str, base: dict) -> dict:
     return names
 
 
+_FILES = {}
+
+
+def load(path: Path):
+    """A sibling file, parsed once per run (None when it does not exist)."""
+    if path not in _FILES:
+        _FILES[path] = File(path) if path.is_file() else None
+    return _FILES[path]
+
+
+RNG_NE_RE = re.compile(r"\bif\s*\(\s*\w+\s*!=\s*[\w.]*\bRng\s*\)\s*return\s+([^;]*);")
+RNG_EQ_RE = re.compile(r"\bif\s*\(\s*\w+\s*==\s*[\w.]*\bRng\b")
+
+
+def as_smith(body: str) -> str:
+    """`body` as the `testing.fuzz` callback runs it: with the source type
+    being `Smith`, so every `S == …Rng` branch is dead and `if (S != …Rng)
+    return e;` is where the function ends. Those two guards are how a harness
+    generic over its source keeps driver-only draws (corpus picks, damage
+    counts) away from the Smith; reading them as live code reported ranged
+    draws the Smith never makes. Offsets are preserved (blanking, not
+    deleting) so line numbers still point at the source."""
+    m = RNG_NE_RE.search(body)
+    if m:
+        body = body[:m.start()] + " " * (m.start(1) - m.start()) + m.group(1) + ";" + " " * (len(body) - m.end())
+    while True:
+        m = RNG_EQ_RE.search(body)
+        if not m:
+            return body
+        open_paren = body.index("(", m.start())
+        end = match_paren(body, open_paren)
+        rest = body[end:]
+        lead = len(rest) - len(rest.lstrip())
+        if rest.lstrip().startswith("{"):
+            end = match_paren(body, end + lead)
+        else:
+            semi = body.find(";", end)
+            end = len(body) if semi < 0 else semi + 1
+        body = body[:m.start()] + re.sub(r"[^\n]", " ", body[m.start():end]) + body[end:]
+
+
 def walk(f: File, body: str, carriers: set, depth: int, seen: frozenset, via: str):
     """Yield `Draw`s in source order, inlining helper calls at their call site."""
+    body = as_smith(body)
     carriers = smith_names(body, carriers)
     events = []
     for m in DRAW_RE.finditer(body):
@@ -479,17 +537,23 @@ def walk(f: File, body: str, carriers: set, depth: int, seen: frozenset, via: st
             name, owner = payload
             if depth >= MAX_DEPTH or name in seen:
                 continue
-            sub = f.body(name, owner)
+            g = f
+            if owner in f.imports:
+                g = load(f.imports[owner])
+                owner = None
+                if g is None:
+                    continue
+            sub = g.body(name, owner)
             if sub is None:
                 continue
             sub_carriers = dict(carriers)
             # A callee's `anytype` parameter is typeless here; give it the type
             # of the carrier the caller passed in, or `d.below()` inside it
             # resolves by name alone — and `dnp3` has two `fn below`.
-            for k, v in f.carrier_params(name, owner).items():
+            for k, v in g.carrier_params(name, owner).items():
                 if sub_carriers.get(k) is None:
                     sub_carriers[k] = v if v is not None else owner
-            yield from walk(f, sub, sub_carriers, depth + 1,
+            yield from walk(g, sub, sub_carriers, depth + 1,
                             seen | {name}, via if via else name)
 
 

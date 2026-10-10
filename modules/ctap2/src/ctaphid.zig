@@ -732,6 +732,7 @@ test "Channel.open: another client's INIT response on the broadcast channel is s
 // ── fuzz: a hostile authenticator on the HID side ───────────────────────────
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 const HidMark = fz.Marker(enum {
     roundtrip,
     roundtrip_noise,
@@ -760,7 +761,9 @@ test "fuzz: ctaphid assembler and channel survive a damaged report stream" {
 }
 
 fn fuzzHidSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzHid(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzHid(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 /// A scripted report device: serves `reads` in order (then a transport

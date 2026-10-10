@@ -192,7 +192,9 @@ pub fn fuzzGoose(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
 }
 
 fn fuzzGooseSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzGoose(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzGoose(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: sealed GOOSE frames verify, tampered ones do not" {
@@ -280,7 +282,9 @@ pub fn fuzzReplay(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
 }
 
 fn fuzzReplaySmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzReplay(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzReplay(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: the GOOSE guard against a publisher and an attacker" {
@@ -398,7 +402,9 @@ pub fn fuzzAcse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
 }
 
 fn fuzzAcseSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzAcse(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzAcse(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: a signed token in an AARQ, genuine and damaged" {

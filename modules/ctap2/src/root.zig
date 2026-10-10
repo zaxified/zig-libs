@@ -213,7 +213,9 @@ test "fuzz harness: pin token, 200 seeds, reaches every outcome" {
 }
 
 fn fuzzPinTokenSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzPinToken(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzPinToken(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 
 /// The crypto oracle for the token path: a token encrypted under a drawn

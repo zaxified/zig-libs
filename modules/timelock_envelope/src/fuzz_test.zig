@@ -87,7 +87,7 @@ const fx = @import("security_test.zig");
 
 const Env = envelope.Envelope128;
 const Kem = hqc.Hqc128;
-const pa = std.heap.page_allocator;
+const pa = std.heap.page_allocator; // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
 
 const plaintext = "the launch codes expire at dawn";
 

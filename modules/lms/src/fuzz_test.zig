@@ -180,7 +180,7 @@ fn fuzzLmsSignVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!v
     if (trees[which] == null) {
         var seed: [params.n]u8 = @splat(@intCast(which + 1));
         trees[which] = @as(sign.Tree, undefined);
-        try sign.Tree.init(&trees[which].?, std.heap.page_allocator, .sha256_m32_h5, ots_sets[which], @splat(@intCast(0x40 + which)), &seed);
+        try sign.Tree.init(&trees[which].?, std.heap.page_allocator, .sha256_m32_h5, ots_sets[which], @splat(@intCast(0x40 + which)), &seed); // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
     }
     const tree = &trees[which].?;
     switch (which) {
@@ -233,7 +233,7 @@ fn fuzzHssSignVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!v
     const seed: [params.n]u8 = @splat(0x5a);
     if (hss_key == null) {
         hss_key = @as(sign.SecretKey, undefined);
-        try sign.SecretKey.init(&hss_key.?, std.heap.page_allocator, &hss_levels, &seed, @splat(0x77), null);
+        try sign.SecretKey.init(&hss_key.?, std.heap.page_allocator, &hss_levels, &seed, @splat(0x77), null); // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
     }
     var mbuf: [40]u8 = undefined;
     const ml = src.index(mbuf.len + 1);

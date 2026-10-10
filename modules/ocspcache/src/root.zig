@@ -1566,7 +1566,9 @@ test "fuzz harness: 400 seeds of the AIA walk in every test run, and they get ev
 }
 
 fn fuzzRefreshSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzRefresh(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzRefresh(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 
 fn fuzzRefresh(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {

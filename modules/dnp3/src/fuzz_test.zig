@@ -182,7 +182,9 @@ pub fn fuzzSa(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
 }
 
 fn fuzzSaSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzSa(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzSa(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: Secure Authentication wrap, MAC and objects as an oracle" {

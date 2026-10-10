@@ -1737,7 +1737,9 @@ fn fuzzProofVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
 }
 
 fn fuzzProofVerifySmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzProofVerify(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzProofVerify(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: a proof this module issued verifies and a damaged one does not" {

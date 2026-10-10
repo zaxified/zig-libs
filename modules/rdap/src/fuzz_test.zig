@@ -298,10 +298,14 @@ test "fuzz harness: roundtrip and destination, 500 seeds, reach every outcome" {
 }
 
 fn roundtripSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzRoundtrip(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzRoundtrip(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 fn destinationSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzDestination(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzDestination(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 test "fuzz: roundtrip, exploration" {
     try testing.fuzz({}, roundtripSmith, .{});

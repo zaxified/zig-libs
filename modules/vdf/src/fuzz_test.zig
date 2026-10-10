@@ -242,7 +242,9 @@ test "fuzz harness: eval, 300 seeds, reaches every outcome" {
 }
 
 fn smithVerify(_: void, smith: *std.testing.Smith) !void {
-    try fuzzVerify(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzVerify(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 test "fuzz: a genuine proof is accepted and a damaged one refused" {
     try testing.fuzz({}, smithVerify, .{});

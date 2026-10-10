@@ -1251,8 +1251,7 @@ var driver_verify_ctx: ?VerifyFuzzCtx = null;
 fn driverParseCorpus() ![]const []const u8 {
     if (driver_parse_corpus == null) {
         driver_parse_corpus = .{};
-        // global-alloc-ok: process-lifetime fuzz fixture, outlives testing.allocator's per-test teardown
-        return driver_parse_corpus.?.build(std.heap.page_allocator);
+        return driver_parse_corpus.?.build(std.heap.page_allocator); // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
     }
     return &driver_parse_corpus.?.seeds;
 }

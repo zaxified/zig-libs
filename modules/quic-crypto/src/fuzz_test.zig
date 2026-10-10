@@ -181,7 +181,9 @@ pub fn fuzzHpRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerr
 }
 
 fn fuzzHpRoundtripSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzHpRoundtrip(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzHpRoundtrip(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: header protection apply/remove round trip over all three mask primitives" {
@@ -301,7 +303,9 @@ pub fn fuzzProtection(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
 }
 
 fn fuzzProtectionSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzProtection(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzProtection(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: a sealed packet opens, a damaged one is refused" {
@@ -408,7 +412,9 @@ pub fn fuzzInitialRetry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
 }
 
 fn fuzzInitialRetrySmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzInitialRetry(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzInitialRetry(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: initial secrets, key chain and the Retry Integrity Tag" {

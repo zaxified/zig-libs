@@ -89,7 +89,7 @@ fn Fixture(comptime big: bool) type {
         fn get() @TypeOf(cached.?) {
             if (cached) |c| return c;
             const vec = if (big) v.falcon1024[0] else v.falcon512[0];
-            const a = std.heap.page_allocator;
+            const a = std.heap.page_allocator; // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
             const hex = struct {
                 fn f(h: []const u8) []u8 {
                     const out = a.alloc(u8, h.len / 2) catch unreachable;

@@ -1292,7 +1292,7 @@ var captured_reshare: ?[]const CapturedReshare = null;
 
 fn capturedReshareFrames() []const CapturedReshare {
     if (captured_reshare == null) {
-        const pa = std.heap.page_allocator;
+        const pa = std.heap.page_allocator; // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
         var list: std.ArrayList(CapturedReshare) = .empty;
         for (0..4) |steps| {
             var w = FuzzWorld.build(pa, steps) catch unreachable;

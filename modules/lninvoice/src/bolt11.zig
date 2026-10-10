@@ -1388,7 +1388,7 @@ var corpus_cache: ?InvoiceCorpus = null;
 fn corpusEntries() []const []const u8 {
     if (corpus_cache == null) {
         corpus_cache = .{};
-        _ = corpus_cache.?.build(std.heap.page_allocator) catch unreachable;
+        _ = corpus_cache.?.build(std.heap.page_allocator) catch unreachable; // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
     }
     return corpus_cache.?.entries[0..corpus_cache.?.n];
 }
@@ -1416,11 +1416,15 @@ test "fuzz harness: bolt11 sign, 40 seeds, reaches every outcome" {
 }
 
 fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzDecode(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzDecode(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 fn fuzzSignSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzSign(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzSign(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 fn fuzzDecode(comptime S: type, src: *S, allocator: Allocator) anyerror!void {

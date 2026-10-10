@@ -1025,11 +1025,14 @@ const fuzz_seeds = [_][]const u8{
 };
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 const DecodersMark = fz.Marker(enum { header_ok, header_refused, dearmor_ok, dearmor_refused, payload_refused, payload_genuine, payload_flip_refused });
 const FileMark = fz.Marker(enum { genuine_accepted, flipped_refused, truncated_refused, appended_refused });
 
 fn fuzzDecodersSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzDecoders(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzDecoders(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 fn fuzzDecoders(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
@@ -1119,7 +1122,9 @@ fn fuzzFile(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
 }
 
 fn fuzzFileSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzFile(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzFile(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: a genuine age file opens and a damaged one does not" {

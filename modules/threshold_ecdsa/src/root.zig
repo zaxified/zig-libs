@@ -2926,8 +2926,7 @@ var fuzz_corpus: Corpus = .{};
 var fuzz_corpus_built = false;
 fn fuzzCorpus() *Corpus {
     if (!fuzz_corpus_built) {
-        // global-alloc-ok: process-lifetime fixture of a test-only harness
-        fuzz_corpus.build(std.heap.page_allocator) catch @panic("fuzz corpus");
+        fuzz_corpus.build(std.heap.page_allocator) catch @panic("fuzz corpus"); // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
         fuzz_corpus_built = true;
     }
     return &fuzz_corpus;

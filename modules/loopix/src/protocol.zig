@@ -1313,6 +1313,7 @@ test "a client takes a packet once, and only one addressed to it; a provider sto
 // an id that was sent; the counters stay consistent.
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 const InjectMark = fz.Marker(enum { fifo, poisson, direct, providers, malformed_counted, stashed_at_mix, mailbox_filled, fetch_answered, delivered });
 
 fn hostilePayload(comptime S: type, src: *S, cfg: LoopixConfig, node_ptr: *NodeId, from_ptr: *NodeId, buf: []u8) []const u8 {
@@ -1446,7 +1447,9 @@ fn fuzzInject(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
 }
 
 fn fuzzInjectSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzInject(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzInject(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: hostile packets into the relay handlers never panic or mis-deliver" {

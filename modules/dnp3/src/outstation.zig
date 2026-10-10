@@ -4972,11 +4972,15 @@ pub fn fuzzSessionFrames(comptime S: type, src: *S, gpa: std.mem.Allocator) anye
 }
 
 fn fuzzFragmentSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzFragment(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzFragment(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 fn fuzzSessionFramesSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzSessionFrames(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzSessionFrames(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: structured fragments through the driver harness" {

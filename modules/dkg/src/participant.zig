@@ -1614,7 +1614,7 @@ var captured_frames: ?[]const CapturedFrame = null;
 
 fn capturedFrames() []const CapturedFrame {
     if (captured_frames == null) {
-        const pa = std.heap.page_allocator;
+        const pa = std.heap.page_allocator; // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
         var list: std.ArrayList(CapturedFrame) = .empty;
         for (0..7) |steps| {
             var net = buildFuzzNet(pa, steps) catch unreachable;

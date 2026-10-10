@@ -148,6 +148,103 @@ pub const Cursor = struct {
     }
 };
 
+/// A `Cursor` with the driver `Rng`'s method set, so a harness generic over
+/// its source (`fn h(comptime S: type, src: *S, gpa)`) runs from a script
+/// under `testing.fuzz` exactly as it runs from a PRNG under the driver:
+///
+///     fn hSmith(_: void, smith: *std.testing.Smith) !void {
+///         var script: [1024]u8 = undefined;
+///         var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+///         try h(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
+///     }
+///
+/// Handing `h` the `Smith` itself instead makes every ranged draw the range
+/// minimum (see `Cursor`), which is what `check-fuzz-reach` flags. The slice
+/// stays in the callback, as its first statement, because that is the draw
+/// the gate reads.
+///
+/// A ranged draw reads as few octets as cover the span (one for a span below
+/// 256), big-endian, then reduces modulo the span; `slice` hands out what is
+/// left of the script, not cycling, so a frame drawn last is the seed's tail.
+pub const ScriptSource = struct {
+    cur: Cursor,
+
+    pub fn init(script: []const u8) ScriptSource {
+        return .{ .cur = .{ .bytes = script } };
+    }
+
+    pub fn valueRangeAtMost(self: *ScriptSource, comptime T: type, at_least: T, at_most: T) T {
+        comptime std.debug.assert(@bitSizeOf(T) <= 64);
+        std.debug.assert(at_least <= at_most);
+        const span: u64 = @intCast(@as(i128, at_most) - @as(i128, at_least));
+        var x: u64 = 0;
+        var cover: u64 = 0;
+        while (cover < span) {
+            x = (x << 8) | self.cur.byte();
+            cover = (cover << 8) | 0xff;
+        }
+        const off: u64 = if (span == std.math.maxInt(u64)) x else x % (span + 1);
+        return @intCast(@as(i128, at_least) + off);
+    }
+
+    pub fn value(self: *ScriptSource, comptime T: type) T {
+        switch (@typeInfo(T)) {
+            .bool => return self.cur.byte() & 1 == 1,
+            .@"enum" => {
+                const all = comptime std.enums.values(T);
+                return all[self.valueRangeAtMost(usize, 0, all.len - 1)];
+            },
+            .int => |info| {
+                const U = std.meta.Int(.unsigned, info.bits);
+                if (info.bits <= 8) return @bitCast(@as(U, @truncate(self.cur.byte())));
+                var x: U = 0;
+                for (0..(info.bits + 7) / 8) |_| x = (x << 8) | self.cur.byte();
+                return @bitCast(x);
+            },
+            else => @compileError("ScriptSource.value: unsupported type " ++ @typeName(T)),
+        }
+    }
+
+    pub fn bytes(self: *ScriptSource, buf: []u8) void {
+        for (buf) |*b| b.* = self.cur.byte();
+    }
+
+    /// `Smith.boolWeighted`: true with odds `true_weight : false_weight`.
+    pub fn boolWeighted(self: *ScriptSource, true_weight: u64, false_weight: u64) bool {
+        return self.valueRangeAtMost(u64, 0, true_weight + false_weight - 1) < true_weight;
+    }
+
+    pub fn index(self: *ScriptSource, len: usize) usize {
+        return self.valueRangeAtMost(usize, 0, len - 1);
+    }
+
+    pub fn slice(self: *ScriptSource, buf: []u8) u32 {
+        const left = self.cur.bytes.len -| self.cur.at;
+        const n = @min(buf.len, left);
+        // `Cursor.byte` cycles, so `at` may already be past the end.
+        if (n == 0) return 0;
+        @memcpy(buf[0..n], self.cur.bytes[self.cur.at..][0..n]);
+        self.cur.at += n;
+        return @intCast(n);
+    }
+};
+
+test "ScriptSource: ranged draws come from the script, not the range minimum" {
+    var src: ScriptSource = .init(&.{ 7, 0x01, 0x2c, 1, 0xab, 0xcd });
+    try std.testing.expectEqual(@as(u8, 3), src.valueRangeAtMost(u8, 1, 5)); // 1 + 7 % 5
+    try std.testing.expectEqual(@as(u16, 300), src.valueRangeAtMost(u16, 0, 1000)); // 0x012c
+    try std.testing.expect(src.value(bool));
+    try std.testing.expectEqual(@as(u16, 0xabcd), src.value(u16));
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 0), src.slice(&buf)); // script used up
+    // A script the ranged draws already cycled past: `slice` is empty, not a panic.
+    var short: ScriptSource = .init(&.{ 1, 2 });
+    _ = short.value(u32);
+    try std.testing.expectEqual(@as(u32, 0), short.slice(&buf));
+    var neg: ScriptSource = .init(&.{200});
+    try std.testing.expectEqual(@as(i8, -3), neg.valueRangeAtMost(i8, -5, 5)); // -5 + 200 % 11
+}
+
 // ── the anchor: what Smith reads back ────────────────────────────────────────
 //
 // These are not round-trips of this file against itself. Each drives the real

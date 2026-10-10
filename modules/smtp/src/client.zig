@@ -1004,7 +1004,9 @@ pub fn fuzzClient(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
 }
 
 fn fuzzClientSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzClient(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzClient(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: a damaged server reply never makes the client send secrets in the clear" {

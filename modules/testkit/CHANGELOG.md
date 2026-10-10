@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Added:** `fuzz.ScriptSource` — the driver `Rng`'s method set (plus `boolWeighted`) over
+  one `smith.slice` script, so a harness generic over its source runs from a reviewable script under
+  `testing.fuzz` instead of collapsing every ranged Smith draw to its minimum (`check-fuzz-reach`).
 - **2026-10-09** — **New `stackprobe`: the shared dead-stack probe engine.** `Probe(.{}).run(label,
   f, args, secrets, .{})` runs `f(args)` in a painted stack region and fails on (a) RESIDUE: a byte
   that is neither paint nor zero deeper than the top of the longest zero run (the burn), and (b) a

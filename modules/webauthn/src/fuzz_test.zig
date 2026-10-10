@@ -217,7 +217,9 @@ pub fn fuzzAssertion(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
 }
 
 fn fuzzAssertionSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzAssertion(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzAssertion(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: a genuine assertion is accepted, a damaged one refused" {
@@ -316,7 +318,9 @@ pub fn fuzzRegistration(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
 }
 
 fn fuzzRegistrationSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzRegistration(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzRegistration(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: a genuine registration is accepted, a damaged one refused" {

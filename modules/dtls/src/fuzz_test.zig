@@ -346,7 +346,9 @@ pub fn fuzzRecord(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
 }
 
 fn fuzzRecordSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzRecord(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzRecord(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: damaged, replayed and reordered application records" {

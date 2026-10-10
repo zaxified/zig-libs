@@ -2328,6 +2328,7 @@ const scan_scripts = [_][]const u8{
 };
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 
 test {
     _ = fz;
@@ -2363,7 +2364,9 @@ fn fuzzDamagedSmith(_: void, smith: *std.testing.Smith) !void {
     try fuzzDamaged(std.testing.Smith, smith, std.testing.allocator);
 }
 fn fuzzScanRoundtripSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzScanRoundtrip(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzScanRoundtrip(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 test "fuzz: roundtrip, exploration" {
     try std.testing.fuzz({}, fuzzScanRoundtripSmith, .{});

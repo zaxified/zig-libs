@@ -342,6 +342,7 @@ const rx_seeds = [_][]const u8{
 };
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 const RxMark = fz.Marker(enum { refused, accepted, rejected, to_initializing, to_up, to_down, inert_on_refusal, ticked_hold });
 const HandshakeMark = fz.Marker(enum { genuine_up, damaged_refused, damaged_accepted, damaged_rejected, hold_expired, restarted });
 
@@ -370,11 +371,15 @@ test "fuzz harness: handshake, 300 seeds, reaches every outcome" {
 }
 
 fn fuzzRxSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzRx(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzRx(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 
 fn fuzzHandshakeSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzHandshake(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzHandshake(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 
 fn markEffect(eff: Effect) void {

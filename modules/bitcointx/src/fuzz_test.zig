@@ -126,7 +126,9 @@ test "fuzz harness: roundtrip, 600 seeds, reaches every outcome" {
 }
 
 fn roundtripSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzRoundtrip(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzRoundtrip(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: roundtrip, exploration" {

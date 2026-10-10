@@ -206,7 +206,9 @@ pub fn fuzzHandshake(comptime S2: type, src: *S2, gpa: std.mem.Allocator) anyerr
 }
 
 fn fuzzHandshakeSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzHandshake(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzHandshake(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: a handshake with one message damaged never completes" {
@@ -301,7 +303,9 @@ pub fn fuzzTransport(comptime S2: type, src: *S2, gpa: std.mem.Allocator) anyerr
 }
 
 fn fuzzTransportSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzTransport(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzTransport(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: transport cipher states: damage, replay, reorder and rekey" {

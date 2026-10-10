@@ -517,9 +517,13 @@ pub fn Ecdsa(comptime Hash: type) type {
         }
 
         /// Sign a digest with a caller-chosen nonce (CAVP SigGen vectors).
-        /// Test-only: a reused or biased nonce reveals the key.
-        pub fn signPrehashedWithNonceForTesting(out: *Signature, d_bytes: *const [66]u8, h: *const [Hash.digest_length]u8, k_bytes: *const [66]u8) SignError!void {
-            if (!@import("builtin").is_test) @compileError("test-only");
+        /// Test-only: a reused or biased nonce reveals the key, so outside a
+        /// test build the declaration is `void` and cannot be called. (A
+        /// `@compileError` in the body instead fails `check-testonly`, whose
+        /// probe references every public function of the published module.)
+        pub const signPrehashedWithNonceForTesting = if (@import("builtin").is_test) signWithNonceForTesting else {};
+
+        fn signWithNonceForTesting(out: *Signature, d_bytes: *const [66]u8, h: *const [Hash.digest_length]u8, k_bytes: *const [66]u8) SignError!void {
             try checkSecret(d_bytes);
             const d = Scalar.fromBytesReduce(d_bytes.*, .big);
             const k = try Scalar.fromBytes(k_bytes.*, .big);

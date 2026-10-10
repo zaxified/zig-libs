@@ -233,7 +233,9 @@ fn fuzzSnpSmith(_: void, smith: *std.testing.Smith) !void {
 }
 
 fn fuzzSequenceSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzSequence(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzSequence(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 /// The update process against a model, over LSPs this module's own builder

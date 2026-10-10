@@ -1117,6 +1117,7 @@ fn g1Eql(a: g1.Affine, b: g1.Affine) bool {
 // ── fuzz: untrusted-wire decoders never panic/OOB on arbitrary bytes ──────
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 const CredMark = fz.Marker(enum { accepted, refused, canonical_roundtrip });
 const PartMark = fz.Marker(enum { accepted, refused, canonical_roundtrip });
 const ProofMark = fz.Marker(enum { accepted, refused, canonical_roundtrip, disclosure_refused, hidden_responses });
@@ -1278,7 +1279,7 @@ var proof_corpus_cache: ?ShowProofCorpus = null;
 fn proofCorpusEntries() []const []const u8 {
     if (proof_corpus_cache == null) {
         proof_corpus_cache = .{};
-        _ = proof_corpus_cache.?.build(std.heap.page_allocator) catch unreachable;
+        _ = proof_corpus_cache.?.build(std.heap.page_allocator) catch unreachable; // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
     }
     return &proof_corpus_cache.?.slots;
 }
@@ -1390,7 +1391,7 @@ var proto_fixture: ?ProtoFixture = null;
 
 fn protoFixture() *const ProtoFixture {
     if (proto_fixture == null) {
-        const gpa = std.heap.page_allocator;
+        const gpa = std.heap.page_allocator; // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
         var prng = std.Random.DefaultPrng.init(0xC0C0);
         var f: ProtoFixture = undefined;
         f.params = Parameters.generate(gpa, 3) catch unreachable;
@@ -1416,7 +1417,9 @@ test "fuzz harness: protocol, 6 seeds, reaches every outcome" {
 }
 
 fn fuzzProtocolSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzProtocol(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzProtocol(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 
 fn fuzzProtocol(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {

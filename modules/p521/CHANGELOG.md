@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **BEHAVIOURAL, not breaking:** `signPrehashedWithNonceForTesting` is `void` outside a test
+  build (was a function whose body was a `@compileError`), so `check-testonly`'s probe of the published module
+  compiles. Tests call it exactly as before.
 - **2026-10-10** — Scope survey (OpenSSL reference, Go `crypto/ecdh`/`ecdsa` measured with Go's
   own benchmarks, RustCrypto `p521`, aws-lc, Zig std): `parity`; `## Compared with` table added;
   Performance `fastest ?` (aws-lc unmeasured); grade 4 (no longer provisional). Docs only.

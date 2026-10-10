@@ -753,7 +753,9 @@ fn fuzzFrames(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
 const FramesMark = fz.Marker(enum { replied, silent, all_submitted });
 
 fn fuzzFramesSmith(_: void, smith: *std.testing.Smith) anyerror!void {
-    return fuzzFrames(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    return fuzzFrames(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: valid frames aimed at their own adapters, damaged (Smith replay)" {

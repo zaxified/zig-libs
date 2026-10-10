@@ -410,6 +410,7 @@ test "smoke: parseTcpTimestamps and matchEcho are reachable as re-exports (no st
 // ── fuzz: a hostile observation stream into one estimator ───────────────────
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 const StreamMark = fz.Marker(enum {
     sample,
     no_match,
@@ -435,7 +436,9 @@ test "fuzz harness: estimator, 300 seeds, reaches every outcome" {
 }
 
 fn fuzzStreamSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzStream(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzStream(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 /// One estimator on a small TSval space (so echoes collide with sends), a tiny

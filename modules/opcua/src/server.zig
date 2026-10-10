@@ -7327,6 +7327,7 @@ test "secure: encrypted UserNameIdentityToken over a SecurityPolicy#None channel
 // never get a tampered Write into the address space.
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 
 const Tape = struct {
     bytes: [96 * 1024]u8 = undefined,
@@ -7449,7 +7450,7 @@ fn scenarioSecure(rig: *TestRig, pki: TestPki) !void {
 fn secureConfigGlobal() !struct { cfg: Config, pki: TestPki } {
     if (pki_global == null) {
         pki_prng = std.Random.DefaultCsprng.init([_]u8{0x3D} ** 32);
-        pki_global = try TestPki.init(std.heap.page_allocator, &pki_prng, .{});
+        pki_global = try TestPki.init(std.heap.page_allocator, &pki_prng, .{}); // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
     }
     const pki = pki_global.?;
     const endpoints = secureTestEndpoints(&sec_endpoints, pki.server.certificate_der);
@@ -7630,11 +7631,15 @@ pub fn fuzzSessionSecure(comptime S: type, src: *S, gpa: std.mem.Allocator) anye
 }
 
 fn fuzzSessionNoneSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzSessionNone(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzSessionNone(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 fn fuzzSessionSecureSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzSessionSecure(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzSessionSecure(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: a recorded session with one damaged chunk (SecurityPolicy None)" {

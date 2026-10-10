@@ -2210,6 +2210,7 @@ fn toyNTilde() root.AuxModulus {
 }
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 const ModMark = fz.Marker(enum { accepted, refused, fixed_point });
 const PrmMark = fz.Marker(enum { accepted, refused, fixed_point });
 
@@ -2235,10 +2236,14 @@ test "fuzz harness: prm proof, 400 seeds, reaches every outcome" {
 }
 
 fn fuzzModProofSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzModProof(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzModProof(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 fn fuzzPrmProofSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzPrmProof(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzPrmProof(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 var frame_buf: [70_000]u8 = undefined;

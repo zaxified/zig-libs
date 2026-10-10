@@ -634,6 +634,7 @@ test "DleqProof: honest accepts; S or Σ from another σ, wrong R, wrong context
 }
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 const EcMark = fz.Marker(enum { raw, genuine_accepted, damaged_refused });
 
 test "fuzz: PedersenProof/StProof/SchnorrProof.fromBytes never panic" {
@@ -649,7 +650,9 @@ test "fuzz harness: ec proofs, 300 seeds, reaches every outcome" {
 }
 
 fn fuzzDecodersSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzDecoders(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzDecoders(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 /// Mode 0: arbitrary octets into the four decoders (never a panic). Modes 1-4:

@@ -542,12 +542,15 @@ test {
 // ── fuzz: untrusted-wire decoders never panic/OOB on arbitrary bytes ──────
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 const ToPointMark = fz.Marker(enum { accepted, refused, canonical, flipped_refused });
 const DecryptMark = fz.Marker(enum { bad_length, decrypted, genuine_roundtrip });
 const ProtocolMark = fz.Marker(enum { secrets_agree, roundtrip, mac_ok, tampered_refused, wrong_key_refused });
 
 fn fuzzPublicKeyToPointSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzPublicKeyToPoint(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzPublicKeyToPoint(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 
 /// 64 octets for a coordinate pair. Under `Smith` exactly `smith.bytes`; under
@@ -673,7 +676,9 @@ fn twoSeed(comptime cipher_len: usize) []const u8 {
 }
 
 fn fuzzTwoDecryptSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzTwoDecrypt(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzTwoDecrypt(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 
 fn fuzzTwoDecrypt(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {

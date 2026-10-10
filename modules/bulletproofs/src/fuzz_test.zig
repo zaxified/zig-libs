@@ -98,7 +98,7 @@ const Genuine = struct {
 
     fn get() !void {
         if (ready) return;
-        const a = std.heap.page_allocator;
+        const a = std.heap.page_allocator; // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
         gens = try bp.Generators.init(a, n_bits);
         const v: u64 = 200;
         const gamma = [_]u8{5} ++ [_]u8{0} ** 31;

@@ -259,7 +259,9 @@ fn berWalk(bytes: []const u8, depth: usize) void {
 }
 
 fn fuzzWireSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzWire(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzWire(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: the SNMP decoders never panic on damaged messages" {
@@ -400,7 +402,9 @@ pub fn fuzzAuthPriv(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
 }
 
 fn fuzzAuthPrivSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzAuthPriv(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzAuthPriv(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: USM authentication and privacy as an oracle" {
@@ -526,7 +530,9 @@ pub fn fuzzV3Reply(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
 }
 
 fn fuzzV3ReplySmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzV3Reply(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzV3Reply(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz: a damaged v3 reply is never data over an authenticated level" {

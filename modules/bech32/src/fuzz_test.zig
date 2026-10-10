@@ -230,13 +230,19 @@ test "fuzz harness: roundtrips, 400 seeds, reach every outcome" {
 }
 
 fn bech32RoundtripSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzBech32Roundtrip(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzBech32Roundtrip(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 fn base58RoundtripSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzBase58Roundtrip(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzBase58Roundtrip(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 fn segwitRoundtripSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzSegwitRoundtrip(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzSegwitRoundtrip(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 test "fuzz: bech32 roundtrip, exploration" {
     try testing.fuzz({}, bech32RoundtripSmith, .{});

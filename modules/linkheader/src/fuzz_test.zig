@@ -219,7 +219,9 @@ test "fuzz harness: roundtrip + helpers, 500 seeds, reach every outcome" {
 }
 
 fn roundtripSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzRoundtrip(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzRoundtrip(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 fn helpersSmith(_: void, smith: *std.testing.Smith) !void {
     try fuzzHelpers(std.testing.Smith, smith, testing.allocator);

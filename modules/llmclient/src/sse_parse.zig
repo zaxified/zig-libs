@@ -394,6 +394,7 @@ test "Parser: a leading UTF-8 BOM on the stream's first line is skipped (A1 F24)
 // ── fuzz: untrusted SSE bytes never panic ───────────────────────────────────
 
 const fz = @import("fuzz_test.zig");
+const testkit = @import("testkit");
 const SseMark = fz.Marker(enum { dispatched, multi_line, with_event, with_id, with_retry, ended_clean, mid_group_eof });
 const StreamMark = fz.Marker(enum { genuine_stream, crlf, bom, multi_line });
 
@@ -455,7 +456,9 @@ test "fuzz harness: sse stream, 300 seeds, reaches every outcome" {
 }
 
 fn fuzzSseStreamSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzSseStream(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzSseStream(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 /// The oracle the byte-feeding harness cannot be: 1-5 events written the way a

@@ -742,7 +742,9 @@ test "fuzz harness: decode proof, 300 seeds, reaches every outcome" {
 }
 
 fn fuzzDecodeProofSmith(_: void, smith: *std.testing.Smith) !void {
-    try fuzzDecodeProof(std.testing.Smith, smith, std.testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzDecodeProof(testkit.fuzz.ScriptSource, &src, std.testing.allocator);
 }
 
 fn fuzzDecodeProof(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {

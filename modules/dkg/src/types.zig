@@ -401,7 +401,7 @@ fn bcastCorpusEntries() []const []const u8 {
     if (bcast_corpus_cache == null) {
         bcast_corpus_cache = .{};
         // Page allocator, never freed: the corpus entries outlive any test.
-        _ = bcast_corpus_cache.?.build(std.heap.page_allocator);
+        _ = bcast_corpus_cache.?.build(std.heap.page_allocator); // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
     }
     return bcast_corpus_cache.?.entries[0..bcast_corpus_cache.?.n];
 }
