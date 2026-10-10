@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWT_FUZZ) · ct none
 
-**Performance:** not measured
+**Performance:** ref 0.40–1.63× golang-jwt v5.3.1 (Go 1.26.0) · fastest ? (measured 2026-10-10)
 
 **Known defects:** none recorded
 
@@ -350,8 +350,53 @@ the range check after it); `lookup`'s and `insert`'s `set.id == 0` guards (each 
 redundant: an id-0 entry is never stored or never probed); `require_exp` not folded into the cache
 key (a hit re-runs `checkTimes`, which applies it).
 
+## Performance — `bench-jwt` (2026-10-10)
+
+The comparative benchmark behind the card's Performance line. Reference: golang-jwt/jwt v5.3.1
+(the scope's reference) on Go 1.26.0's standard-library crypto, built offline from the Go
+module cache (`tools/go_bench/`, `go.sum` pinned). Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
+
+Method: `zig build bench-jwt` (`tools/bench.zig` driving `tools/go_bench/main.go`): each side
+doubles its batch until it takes over 100 ms and keeps the best of five; per workload the
+sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; **ratios by wall time** (the
+Go side has no cycle counter, and runs under its GC); spread = (worst round − best round) /
+best round per side. Before timing, golang-jwt must accept our token for every algorithm and
+we must accept its.
+
+Workloads, same keys on both sides, a typical access token (iss, sub, aud, exp, nbf, iat,
+scope; ~290–330 bytes): `<alg>_sign` = `encodeJson` (+ free; `std.heap.smp_allocator`) vs
+`NewWithClaims(...).SignedString`; `<alg>_verify` = `parseAndVerify` with issuer, audience and
+expiry required (+ deinit) vs `jwt.Parse` with the method pinned and `WithIssuer`,
+`WithAudience`, `WithExpirationRequired`. `BENCH_ROUNDS=7` (the card's run):
+
+| workload | ours ns/op | ref ns/op | ours/ref | spread ours | spread ref |
+|---|---:|---:|---:|---:|---:|
+| `hs256_sign` | 2570 | 6437 | 0.399 | 3.9% | 23.3% |
+| `hs256_verify` | 4406 | 9909 | 0.445 | 4.7% | 19.5% |
+| `es256_sign` | 38836 | 43251 | 0.898 | 4.4% | 27.5% |
+| `es256_verify` | 132982 | 94353 | 1.409 | 10.0% | 28.8% |
+| `eddsa_sign` | 58527 | 35984 | 1.626 | 81.3% | 42.6% |
+| `eddsa_verify` | 73438 | 74369 | 0.987 | 9.5% | 17.0% |
+
+Cross-check, a 5-round run (spreads up to 220 %, Go's GC plus the load): `hs256_sign` 0.634,
+`hs256_verify` 0.324, `es256_sign` 0.628, `es256_verify` 1.412, `eddsa_sign` 1.692,
+`eddsa_verify` 0.987; a 3-round run: 0.319 / 0.521 / 0.785 / 1.363 / 1.554 / 0.860.
+
+**Reading.** Parsing, JSON and HMAC are 2–3× faster than golang-jwt; ES256 signing is level or
+ahead (p256); the two rows behind are **EdDSA signing, 1.6–1.7×** (`std.crypto.sign.Ed25519`,
+whose `r·B` runs on std's base-point code) and **ES256 verification, 1.4×** (p256's
+`ecdsaVerify`, itself 1.9× OpenSSL -- see p256's SPEC; Go's P-256 is the fiat/nistec assembly).
+Worst row 1.63× → P3.
+
 ## Backlog / deferred
 
+- **Performance levers** *(bench 2026-10-10, `zig build bench-jwt`; P3 → P2 needs every row
+  ≤ 1.1× golang-jwt)*: (a) **EdDSA sign 1.6–1.7×** -- `Ed25519` is `std.crypto.sign.Ed25519`;
+  its `r·B` could run on the sibling `ct25519`'s comb `mulBase` (~3× std's ladder per
+  ct25519's SPEC, 1.05× libsodium's table) through a thin signer here, keeping std's verify
+  (proposal, not measured; the signer must keep std's byte-exact output and burn discipline);
+  (b) **ES256 verify 1.4×** -- the gap is p256's `ecdsaVerify` (1.9× OpenSSL), fixed there
+  (p256 Backlog "Performance levers"), not here.
 - **Dead-stack residue not yet probed or burned (found 2026-10-09 while sweeping signing):** the
   `kty:"oct"` secret in `parseJwks` (`jwkMaterial` decodes `k` through arena/stack buffers before
   it becomes `Key.hmac`); `VerifiedCache`'s SipHash `mac_key` (zeroed by `defer`, but the SipHash

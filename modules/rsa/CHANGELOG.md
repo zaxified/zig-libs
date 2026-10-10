@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tools: comparative benchmark `tools/bench.zig` + `tools/c_bench/foreign_bench.c` (`zig build bench-rsa`) against OpenSSL 3.5.5 at 2048/3072/4096 bits (PKCS#1 v1.5 sign/verify, OAEP decrypt, blinded and not); card Performance filled (1.44–2.84×), SPEC "Performance — bench-rsa" section and the levers in Backlog.
 - **2026-10-09** — **Added:** `opensshDecryptSection` (+ `OpensshSection`, `OpensshCipher` now
   public): the openssh-key-v1 cipher/KDF half of `fromOpenSSH` (bcrypt rounds cap, aes256-ctr/-cbc),
   shared with the `ssh` module for non-RSA key types. `fromOpenSSH` itself unchanged in behaviour.

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tools: comparative benchmark `tools/bench.zig` + `tools/c_bench/foreign_bench.c` (`zig build bench-p256`) against OpenSSL 3.5.5 (nistz256) for sign/verify/ECDH/keygen; card Performance filled (1.53–3.31×, worst `ecdh`), SPEC "Performance — bench-p256" section and the levers in Backlog.
 - **2026-10-09** — tests: deterministic fuzz driver `P256_FUZZ` over the existing harnesses (`fromSec1` gains a pristine/flipped overlay: genuine encodings of `k*G` must decode to it, a flipped `y` bit must be refused).
 - **2026-10-09** — New `KeyPair.signerInto(out, key_pair, noise)`: the `Signer` holds the secret
   key, and `signer` returns it by value, so the key sat in the caller's result slot (18 needle windows,

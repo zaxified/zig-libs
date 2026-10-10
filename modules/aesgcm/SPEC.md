@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-10 (100,000 runs clean, AESGCM_FUZZ, with AES-192) · ct 2026-10-10 (ctgrind ctx/stateless/generic over AES-128/192/256: 6 in-file each = the tag-check verdict)
 
-**Performance:** not measured
+**Performance:** ref 0.23–1.00× OpenSSL 3.5.5 EVP AES-GCM · fastest ? (measured 2026-10-10)
 
 **Known defects:** none recorded
 
@@ -298,8 +298,48 @@ review, as §2.1 says they must be.
   clarity): the construction is from the published papers above; the code is
   original.
 
+## Performance
+
+Measured 2026-10-10 against OpenSSL 3.5.5 (system `libcrypto.so.3`, EVP AES-GCM: the
+AES-NI/PCLMULQDQ stitched `aesni_gcm` assembly). Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
+
+Method: `zig build bench-aesgcm` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`): each side doubles its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst round − best round) / best round per side. Before timing, an interop check (OpenSSL's AES-256-GCM ciphertext and tag of the 16 KiB message must equal ours byte for byte).
+
+Workloads: AES-128/256-GCM encrypt and decrypt of 64 B, 1420 B and 16 KiB with 13 bytes of
+AD, key set up once on both sides (`Context` vs an `EVP_CIPHER_CTX` keyed once, nonce set per
+op). `BENCH_ROUNDS=5`:
+
+| workload | ours ns/op | ref ns/op | ours/ref | spread ours | spread ref |
+|---|---:|---:|---:|---:|---:|
+| `aes128_enc_64` | 57 | 252 | 0.230 | 19.7% | 30.4% |
+| `aes128_enc_1420` | 348 | 568 | 0.621 | 31.0% | 53.1% |
+| `aes128_enc_16384` | 3499 | 3481 | 1.000 | 40.3% | 29.6% |
+| `aes128_dec_64` | 56 | 236 | 0.239 | 47.1% | 73.5% |
+| `aes128_dec_1420` | 327 | 509 | 0.634 | 40.5% | 84.4% |
+| `aes128_dec_16384` | 3090 | 3225 | 0.992 | 49.4% | 24.9% |
+| `aes256_enc_64` | 60 | 219 | 0.275 | 1.4% | 9.2% |
+| `aes256_enc_1420` | 412 | 563 | 0.728 | 1.9% | 26.6% |
+| `aes256_enc_16384` | 4052 | 4171 | 0.972 | 1.7% | 2.6% |
+| `aes256_dec_64` | 60 | 197 | 0.303 | 1.2% | 90.9% |
+| `aes256_dec_1420` | 394 | 555 | 0.710 | 15.1% | 64.7% |
+| `aes256_dec_16384` | 4202 | 4140 | 0.990 | 35.7% | 49.4% |
+
+A first run (3 rounds, heavier load) agreed: worst 0.997–1.000 on the 16 KiB rows, 0.23–0.30
+on 64 B, 0.64–0.72 on 1420 B.
+
+**Reading.** At 16 KiB both sides run the same class of stitched AES-NI/PCLMULQDQ kernel and
+meet at 0.97–1.00×; below that OpenSSL's per-call EVP overhead (nonce re-init, AD update, tag
+ctrl: ~150 ns) dominates and this module's context path is 1.4–4× faster. Grade: worst row
+1.00× ≤ 1.0, but the fastest implementation in the field (BoringSSL/aws-lc's AES-GCM, Go's
+`crypto/cipher`) is not measured, so P2.
+
 ## Backlog / deferred
 
+- **Performance P2 → P1: measure the fastest in the field** *(bench 2026-10-10)*: ours is
+  0.97–1.00× OpenSSL 3.5.5 at 16 KiB and faster below; P1 needs `fastest ≤ 1.25×`, and no
+  other implementation is measured. Candidates: aws-lc / BoringSSL (same CRYPTOGAMS kernel
+  family as OpenSSL, plus VAES paths), Go `crypto/cipher`. Add them as an `alt` side in
+  `tools/bench.zig` when one is installable on the host.
 - ~~**Wycheproof AES-GCM vectors**~~ — DONE 2026-10-06 (see Anchoring). Its IV-size and counter-edge groups need IVs other than 96 bits, which this API does not take; the 96-bit counter wrap stays anchored on `std` (Re-derived).
 - **arm64 stitched AESE/PMULL kernel and run-time HWCAP dispatch** *(survey 2026-09-30)*: on arm64 servers a consumer gets `std`'s two-pass speed, not the 1.6–2.2× the README advertises. Already listed above under "What is deliberately not done" for want of arm64 hardware to measure on; recorded here as the gap a user of OpenSSL/Go on ARM will notice. Effort: large. Fits §2.
 

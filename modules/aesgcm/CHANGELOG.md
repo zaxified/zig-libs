@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tools: comparative benchmark `tools/bench.zig` + `tools/c_bench/foreign_bench.c` (`zig build bench-aesgcm`) against OpenSSL 3.5.5 EVP AES-GCM; card Performance filled (0.23–1.00×, fastest not measured) and a SPEC "Performance" section with the raw table.
 - **2026-10-10** — AES-192: new `Aes192Gcm` (same API). Generic backend and stateless generic path over the new `aes192` module (dep added; std 0.16 has no AES-192); the x86-64 stitched kernel runs it with Nr = 12 and its own `aesenclast` Nk = 6 key expansion (checked against `aes192`). Anchors: McGrew–Viega 7–10, 17 OpenSSL long-message rows, Wycheproof's 64 AES-192 tests (37 valid, 27 forged); differential, bit-flip, inc32 and fuzz harnesses cover all three sizes. ctgrind rows 4 → 6 in-file (the tag-check verdict for the third key size).
 - **2026-10-09** — tests: deterministic fuzz driver `AESGCM_FUZZ` over the existing harnesses (the harness also checks that the genuine tag is accepted and decrypts to the message).
 - **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** documented why `Context.encrypt`/`decrypt` carry

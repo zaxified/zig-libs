@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, WIREGUARD_FUZZ) · ct none
 
-**Performance:** not measured
+**Performance:** ref 0.90–1.37× OpenSSL 3.5.5 ChaCha20-Poly1305 + libsodium 1.0.18 X25519 composition · fastest ? (measured 2026-10-10)
 
 **Known defects:** none recorded
 
@@ -102,7 +102,51 @@ than asserting a byte-identity that was never true between two conformant encode
 direction is cross-checked by decoding both this module's own request and `wg`'s real one to an
 equal semantic `Device`.
 
+## Performance — `bench-wireguard` (2026-10-10)
+
+The comparative benchmark behind the card's Performance line. Neither the in-kernel WireGuard
+(root and a tunnel) nor wireguard-go (not installed) can be timed op for op here, and the
+scope's reference (wgctrl-go, the configuration plane) has no speed to compare, so **the
+reference is a per-primitive composition of the same work in C**: transport messages built
+with OpenSSL 3.5.5's EVP ChaCha20-Poly1305 (the kernel's ChaCha/Poly1305 x86 code comes from
+the same CRYPTOGAMS family) plus the same header and padding, and the handshake's X25519 work
+in libsodium 1.0.18. Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
+
+Method: `zig build bench-wireguard` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`): each side doubles its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst round − best round) / best round per side. Before timing, an interop check (the composition's transport message for counter 0 of the 1420-byte packet must equal ours byte for byte, and one full handshake must complete).
+
+Workloads: `seal_<n>` = `transport.SendSession.seal` (header, pad to 16, AEAD, counter) vs
+the composition; `open_<n>` = `RecvSession.open` of the next of 64 messages sealed with
+counters 0..63 (replay window reset once per 64, in our time) vs header parse + AEAD open;
+`handshake` = one full handshake, both roles (`createInitiation`, `consumeInitiation`,
+`createResponse`, `consumeResponse`, fresh ephemerals) vs **only** its X25519 work in libsodium
+(2 base + 8 variable-base multiplications) -- a lower bound on the reference, so that ratio is
+pessimistic for us. n = 64 and 1420. `BENCH_ROUNDS=7` (the card's run):
+
+| workload | ours ns/op | ref ns/op | ours/ref | spread ours | spread ref |
+|---|---:|---:|---:|---:|---:|
+| `seal_64` | 383 | 430 | 0.899 | 1.3% | 8.6% |
+| `seal_1420` | 1368 | 1216 | 1.121 | 1.6% | 3.7% |
+| `open_64` | 388 | 419 | 0.948 | 0.6% | 6.8% |
+| `open_1420` | 1366 | 1215 | 1.124 | 1.2% | 11.6% |
+| `handshake` | 532482 | 388894 | 1.373 | 1.7% | 2.0% |
+
+Cross-checks: a 5-round run gave `seal_64` 0.825, `seal_1420` 1.099, `open_64` 0.861,
+`open_1420` 1.411 (ref spread 36 %, ours 9.9 % -- an outlier against 1.091 and 1.124 in the
+other two runs), `handshake` 1.377. A first version of `open` reset the replay window
+(1 KiB) before every op and read 1.4–1.55× on that artefact; the ring replaced it.
+
+**Reading.** The packet path is level with OpenSSL's AEAD at 64 B and 1.1× at 1420 B (that
+is `chachapoly`'s own gap to OpenSSL's 8-block AVX2 kernel). The handshake is 1.37× a
+composition that leaves out every hash, MAC and AEAD of the handshake, i.e. its X25519 work
+is slower than libsodium's: `noise.X25519` is `std`'s ladder. Worst row 1.37× → P3.
+
 ## Backlog / deferred
+- **Performance levers** *(bench 2026-10-10, `zig build bench-wireguard`; P3 → P2 needs every
+  row ≤ 1.1×)*: (a) **handshake 1.37×** a libsodium X25519-only lower bound: `noise.X25519` is
+  `std.crypto.dh.X25519`; the sibling `ct25519` has a MULX/ADX ladder (1.09× libsodium) and a
+  comb for the ephemerals (0.58×) -- switching (`ct25519` as a dep) is the expected fix
+  (proposal, not measured); (b) **transport 1420 B 1.12×** OpenSSL's AEAD: that is
+  `chachapoly`'s bulk gap (1.3× OpenSSL at 16 KiB), fixed there, not here.
 - **`setDeviceFrom(*const Config)` (2026-10-09)** — the copy-free twin of `setDevice`, beside it as `buildSetRequestsFrom` sits beside `buildSetRequests`: `setDevice(cfg: Config)` leaves the by-value argument (with the private key) in the caller's dead frame. Additive; then axp-core can switch. Effort: small.
 The root-gated live test's `runIp()` helper shells out to the `ip` binary — the one external-process
 use in the whole repo (zig-libs is otherwise 100% pure-Zig/no-exec). Flagged as a known item

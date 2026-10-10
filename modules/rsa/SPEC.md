@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (8 x 25,000 seeds per harness clean, RSA_FUZZ) · ct 2026-10-03 (ctgrind)
 
-**Performance:** not measured
+**Performance:** ref 1.44–2.84× OpenSSL 3.5.5 · fastest ? (measured 2026-10-10)
 
 **Known defects:** none recorded
 
@@ -158,6 +158,48 @@ byte-exact vector (the shipped OpenSSL OAEP KATs are all equal-hash) — it is c
 constructed round-trip test, which proves internal consistency but not agreement with an external
 implementation for that specific configuration.
 
+## Performance — `bench-rsa` against OpenSSL (2026-10-10)
+
+The comparative benchmark behind the card's Performance line; it supersedes the single
+`openssl speed` comparison of the next section for the ratios (that section's key-construction
+analysis still stands: the bench times warm keys only). Reference: OpenSSL 3.5.5, system
+`libcrypto.so.3`, EVP RSA (CRT, base blinding ON by default, `bn_mul_mont` MULX/ADX assembly).
+Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
+
+Method: `zig build bench-rsa` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`): each side doubles its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst round − best round) / best round per side. Before timing, an interop check (OpenSSL generates the 2048/3072/4096-bit keys both sides load; its PKCS#1 v1.5 signature must equal ours byte for byte and it must decrypt our OAEP ciphertext to the message).
+
+Workloads per key size, warm key, 32-byte message: `sign` = `signPkcs1v15(Sha256)` (this
+module's default: blinding OFF) and `signbl` = `signPkcs1v15Blinded(.csprng)`, both vs
+`SHA256` + `EVP_PKEY_sign` (blinding ON); `verify` = `verifyPkcs1v15` vs `EVP_PKEY_verify`
+(e = 65537); `dec`/`decbl` = `decryptOaep`/`decryptOaepBlinded` (SHA-256, MGF1-SHA-256) vs
+`EVP_PKEY_decrypt`. `BENCH_ROUNDS=5`:
+
+| workload | ours ns/op | ref ns/op | ours/ref | spread ours | spread ref |
+|---|---:|---:|---:|---:|---:|
+| `sign_2048` | 1210320 | 600158 | 2.015 | 5.8% | 4.5% |
+| `signbl_2048` | 1639761 | 598494 | 2.727 | 2.1% | 1.1% |
+| `verify_2048` | 28091 | 18931 | 1.489 | 1.7% | 5.0% |
+| `dec_2048` | 1206932 | 610870 | 1.990 | 1.3% | 5.0% |
+| `decbl_2048` | 1678805 | 605775 | 2.775 | 0.9% | 6.6% |
+| `sign_3072` | 4307409 | 1829374 | 2.362 | 2.5% | 3.7% |
+| `signbl_3072` | 5125088 | 1820599 | 2.840 | 1.2% | 5.8% |
+| `verify_3072` | 56847 | 37619 | 1.522 | 0.8% | 1.6% |
+| `dec_3072` | 4322490 | 1809155 | 2.352 | 0.8% | 1.4% |
+| `decbl_3072` | 5178647 | 1851241 | 2.819 | 7.2% | 3.3% |
+| `sign_4096` | 7417197 | 4087564 | 1.864 | 6.0% | 1.5% |
+| `signbl_4096` | 8883821 | 4043996 | 2.223 | 9.5% | 6.2% |
+| `verify_4096` | 90867 | 62503 | 1.444 | 1.2% | 1.0% |
+| `dec_4096` | 7470756 | 4045343 | 1.859 | 5.1% | 1.0% |
+| `decbl_4096` | 8841510 | 4016381 | 2.207 | 2.6% | 6.1% |
+
+A first run (3 rounds, heavier load, spreads up to 84 %) gave 1.41–3.29×, worst `decbl_3072`;
+the quieter run above is the card's.
+
+**Reading.** The private operation is ~1.9–2.4× OpenSSL with blinding off and ~2.2–2.8× with
+it on (OpenSSL always blinds), so the card's worst, 2.84× (`signbl_3072`), gives P4.
+Verification is ~1.5× (the 2026-09-08 figure below, 2.1×, was against `openssl speed`'s
+number on another day). Levers in Backlog.
+
 ## Performance posture — measured 2026-09-08, and deliberately not chased further
 
 Numbers are ReleaseFast on one desktop; treat them as ratios. OpenSSL 3.5.5 on the
@@ -233,6 +275,15 @@ as a measurement rather than a rediscovery.
 
 ## Backlog / deferred
 
+- **Performance levers (bench 2026-10-10: private op 1.9–2.4×, blinded 2.2–2.8×, verify
+  1.4–1.5× OpenSSL 3.5.5; P4 → P3 needs every row ≤ 2×; proposals, none measured):**
+  (a) a MULX/ADX Montgomery multiply/square for `montint` (what `bn_mul_mont`/`rsaz` give
+  OpenSSL; p256's `fast_core` is the in-tree precedent) -- moves every row, verify included;
+  (b) a CT fixed-window exponentiation with a wider window (w = 5–6) and gathered table if
+  the current one is narrower; (c) for the blinded paths, a cached blinding pair updated by
+  squaring per operation (OpenSSL's `BN_BLINDING_update`: two modular multiplications) instead
+  of a fresh `r`, `r^e` and `r^-1` each time -- the +0.35–0.5× the blinded rows carry over the
+  unblinded ones.
 - **Fixed 2026-10-09 — bcrypt `rounds` from the key file capped at 2048** (`max_openssh_kdf_rounds`,
   `error.KdfRoundsTooLarge`), as Go's x/crypto/ssh does (`maxRounds = 1 << 11`; OpenSSH sets no
   bound). Found by RSA_FUZZ `rsa-openssh` (HANG, seed 26887: `rounds = 2^32-1` pinned

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, P256_FUZZ) · ct 2026-09-28 (ctgrind)
 
-**Performance:** not measured
+**Performance:** ref 1.53–3.31× OpenSSL 3.5.5 · fastest ? (measured 2026-10-10)
 
 **Known defects:** none recorded
 
@@ -265,6 +265,41 @@ there are no GLV constants to own here.
   slot, with a second representation of `G` (misses the redirect on purpose),
   and the Jacobian join's `P = ±Q` cases.
 
+## Performance — `bench-p256` against OpenSSL (2026-10-10)
+
+The comparative benchmark behind the card's Performance line (the section below,
+"Performance status", is the older in-module `P256_BENCH` history against `std`). Reference:
+OpenSSL 3.5.5, system `libcrypto.so.3`, EVP over the x86-64 `ecp_nistz256` assembly (MULX/ADX,
+w=7 precomputed base-point table). Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
+
+Method: `zig build bench-p256` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`): each side doubles its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst round − best round) / best round per side. Before timing, an interop check (OpenSSL must verify our signature, imported as SubjectPublicKeyInfo, and we must verify OpenSSL's DER signature).
+
+Workloads, one operation on a 32-byte message: `sign` = `EcdsaP256Sha256.KeyPair.sign`
+(RFC 6979 nonce) vs `SHA256` + `EVP_PKEY_sign` (random nonce); `sign_raw` =
+`ecdsaSignDeterministic` vs the same; `verify` = `ecdsaVerify` (the fast verifier jwt's ES256
+uses) vs `SHA256` + `EVP_PKEY_verify`; `verify_std` = the std-shaped
+`EcdsaP256Sha256.Signature.verify` vs the same; `ecdh` = `P256.mul(peer, d)` + affine `x` vs
+`EVP_PKEY_derive` (peer set once); `keygen` = `KeyPair.generate` vs `EVP_PKEY_keygen` (+ free).
+`BENCH_ROUNDS=5`:
+
+| workload | ours ns/op | ref ns/op | ours/ref | spread ours | spread ref |
+|---|---:|---:|---:|---:|---:|
+| `sign` | 36979 | 24481 | 1.537 | 4.3% | 13.4% |
+| `sign_raw` | 36419 | 24389 | 1.529 | 2.8% | 3.3% |
+| `verify` | 130068 | 68395 | 1.898 | 1.2% | 2.1% |
+| `verify_std` | 130628 | 69149 | 1.890 | 0.8% | 3.6% |
+| `ecdh` | 169730 | 50802 | 3.313 | 0.4% | 3.3% |
+| `keygen` | 30376 | 14228 | 2.198 | 0.9% | 20.6% |
+
+A first run (3 rounds, heavier load, spreads up to 72 %) gave the same picture: 1.47–3.19×,
+`ecdh` worst.
+
+**Reading.** Every row is behind; the card's worst is `ecdh` at 3.3× — the constant-time
+variable-base `mul` (~170 µs against nistz256's ~51 µs) — so P4. Signing (1.5×) and keygen
+(2.2×) pay for the base-point multiply through the CT windowed core rather than a large
+precomputed table; verification (1.9×) is the interleaved wNAF double-base plus a Fermat
+inversion. Levers in Backlog.
+
 ## Performance status
 
 **Scaffold baseline** (both gates off — the portable oracle, the "before"),
@@ -344,6 +379,21 @@ grew ~40 s → ~50 s (the comptime table build + one comptime batch inversion).
 
 ## Backlog
 
+**Performance levers (bench 2026-10-10, P4 → P3 needs every row ≤ 2×, → P2 ≤ 1.1×; none
+measured yet, proposals):**
+- **`ecdh` 3.3× — the CT variable-base `mul`.** nistz256 does a signed 5-bit Booth window (16
+  precomputed multiples, CT gather), ~51 doublings-and-adds, entirely in the MULX/ADX field.
+  Check that `mul`'s gated windowed core runs on `fast_core`'s asm field throughout (not the
+  portable `Fe`), switch to Booth w=5 with a CT table select, and replace the final Fermat
+  inversion (`affineCoordinates` → `z.invert()`) with a CT safegcd/addition-chain inverse
+  (`modinv.zig` has the vartime one for verify).
+- **`keygen` 2.2× / `sign` 1.5× — the base-point multiply.** OpenSSL uses a w=7 precomputed
+  table (37 × 64 affine points, ~150 KB) and no doublings online. Route `KeyPair` generation
+  and the signer's `k·G` through the comb (`combMulBaseFast`) or a larger static table; for
+  `sign`, also the Fermat inverse of `k` (CT addition chain) and RFC 6979's HMAC-DRBG cost
+  (~2–3 µs of the 37 µs).
+- **`verify` 1.9×** — a precomputed static table for `G` in the double-base (w=7, as OpenSSL),
+  leaving the wNAF only for the public key; z-inversion via `modinv`.
 1. ~~`fast_core.fieldMul`/`fieldSq`~~ — **DONE (Fable core phase)**: `MULX/ADX`
    product + the signed NIST word-shuffle reduction (HMV Alg. 2.29), validated
    against a bignum `% p` oracle on 2M random products before the asm, then

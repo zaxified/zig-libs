@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct 2026-09-29 (ctgrind)
 
-**Performance:** not measured
+**Performance:** ref 0.58–1.09× libsodium 1.0.18 · fastest 1.21× OpenSSL 3.5.5 (measured 2026-10-10)
 
 **Known defects:** none recorded
 
@@ -738,8 +738,51 @@ for the property the module is named after.** Re-run it after any change to
 original targets; the `comb`, `ladderbase` and `ladder` targets and their
 positive controls are in § "C3 — the base point uses a fixed-base comb".
 
+## Performance — `bench-ct25519` (2026-10-10)
+
+The comparative benchmark behind the card's Performance line. **Reference: libsodium 1.0.18**
+(system `libsodium.so.23`) as a stand-in: the scope's reference, curve25519-dalek 5.0, is a Rust
+crate that is not installed on this host. The X25519 rows also run OpenSSL 3.5.5
+(`libcrypto.so.3`, the `x25519-x86_64` MULX/ADX assembly), the faster of the two there and the
+card's `fastest`. Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
+
+Method: `zig build bench-ct25519` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`): each side doubles its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst round − best round) / best round per side. Before timing, an interop check (every foreign output -- both X25519s from both libraries, the Edwards and Ristretto base multiples -- must equal ours byte for byte).
+
+Workloads, encoded output included on both sides: `x25519` = `X25519.scalarmultInto` vs
+`crypto_scalarmult` / OpenSSL `EVP_PKEY_derive` (peer set once); `x25519_pub` =
+`X25519.recoverPublicKeyInto` vs `crypto_scalarmult_base` / OpenSSL raw-key import +
+`get_raw_public_key`; `ed_base` = `mulBase(s).toBytes()` vs
+`crypto_scalarmult_ed25519_base_noclamp`; `rist_base` = `mulRistrettoBase(s).toBytes()` vs
+`crypto_scalarmult_ristretto255_base`. Not compared: the variable-base Edwards/Ristretto `mul`
+-- libsodium's `crypto_scalarmult_ed25519_noclamp` adds a prime-order-subgroup check (a second
+scalar multiplication) that `mul` does not do. `BENCH_ROUNDS=7` (the card's run):
+
+| workload | ours ns/op | ref ns/op | alt ns/op | ours/ref | ours/fastest | spread ours | spread ref | spread alt |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `x25519` | 43268 | 39738 | 35842 | 1.089 | 1.214 | 1.0% | 1.9% | 2.4% |
+| `x25519_pub` | 21463 | 37176 | 44922 | 0.579 | 0.579 | 2.4% | 2.5% | 12.0% |
+| `ed_base` | 20742 | 19739 | 0 | 1.047 | 1.047 | 4.8% | 7.4% | 0.0% |
+| `rist_base` | 21300 | 20632 | 0 | 1.024 | 1.024 | 2.4% | 7.5% | 0.0% |
+
+(`alt` = OpenSSL on the X25519 rows.) Cross-checks: a 5-round run gave `x25519` 1.095 / 1.221,
+`x25519_pub` 0.575, `ed_base` 1.061, `rist_base` 1.031; a 3-round run under heavier load gave
+`x25519` 1.161 / 1.283 (ref spread 4.9 %, ours 22.9 %).
+
+**Reading.** The comb makes key generation ~1.7× faster than both libraries; the shared
+secret on the MULX/ADX ladder sits at 1.09–1.10× libsodium (2 runs; a noisy third 1.16×) and
+1.21–1.22× OpenSSL; the Edwards/Ristretto comb is within 2–6 % of libsodium's table. Worst
+row 1.09× → P2, with a thin margin under the 1.1× tolerance -- a noisy run can read P3.
+
 ## Backlog / deferred
 
+- **Performance: the X25519 shared secret, 1.09× libsodium / 1.21× OpenSSL** *(bench
+  2026-10-10, `zig build bench-ct25519`)*: the only row above 1.0 by more than noise, and the
+  one between P2 and P1. OpenSSL's `x25519-x86_64` runs the same 4×64 MULX/ADX radix, so the
+  gap is in the ladder body or the final inversion, not the representation. Lever (proposal,
+  unmeasured): `perf` both on the ladder, compare instructions per ladder step, and replace the
+  Fermat inversion at the end (~10 % of a ladder) with a constant-time safegcd
+  (Bernstein–Yang) inverse. Also: the scope's reference, curve25519-dalek, is not measured
+  (not installed) -- the card names libsodium as a stand-in.
 - **aarch64 field core for the X25519 shared secret and the comb** *(survey 2026-09-30)*: P6 is x86-64 MULX/ADX inline assembly and other targets run `std`'s ladder unchanged, so an ARM server gets none of the 1.16–1.23× win. Effort: medium (a 4×64 core with `umulh`, reusing P6's field differential). Fits §2 (inline asm is native Zig).
 - **Constant-time multiscalar on Edwards25519** *(survey 2026-09-30)*: `mulMultiRistretto` exists, `curve25519-dalek`'s constant-time multiscalar covers Edwards too; a protocol with secret scalars on the raw curve (FROST-style, adaptor signatures) has to loop `mul` and sum. Only worth doing when a consumer asks. Effort: small (the Ristretto Straus code over Edwards points). Fits §2.
 

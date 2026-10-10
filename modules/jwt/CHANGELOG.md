@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tools: comparative benchmark `tools/bench.zig` + `tools/go_bench/` (`zig build bench-jwt`) against golang-jwt v5.3.1 on Go 1.26.0 (HS256/ES256/EdDSA sign + verify, cross-verified tokens); card Performance filled (0.40–1.63×), SPEC "Performance — bench-jwt" section and the levers in Backlog.
 - **2026-10-10** — ES512 (ECDSA P-521 + SHA-512): verify (`Key.ecdsa_p521`, `Key.ecdsaP521FromCoords`), sign (`SigningKey.es512`), and JWK `kty:"EC"`, `crv:"P-521"` with exact 66-byte coordinates, through the new `p521` module (new dep). `ES512` tokens no longer return `UnsupportedAlg`. Anchored to RFC 7515 A.4 (known-answer signature; the A.4 JWK through JWKS; `d` derives `x`/`y`).
 - **2026-10-09** — tests: deterministic fuzz driver `JWT_FUZZ` over the existing harnesses (`parse`, `parseJwks`, `parseTokenResponse`, plus a new sign/verify oracle: a token this module issued is accepted, a flipped one, a truncation and a wrong key are refused).
 - **2026-10-09** — dead-stack lint: `SigningKey.alg` / `verificationKey` / `encode` / `encodeJson` (the key is a union of borrowed slices and pointers) and `buildTokenRequest` (string assembly into a heap body) are marked as reviewed false positives. No code or signature change; no new probe needed (signing is probed in `stackprobe_test.zig`).

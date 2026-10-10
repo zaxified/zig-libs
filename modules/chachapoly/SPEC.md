@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, _A_APOLY_FUZZ) · ct 2026-09-08 (ctgrind)
 
-**Performance:** not measured
+**Performance:** ref 0.80–1.33× OpenSSL 3.5.5 EVP ChaCha20-Poly1305 · fastest 1.33× OpenSSL 3.5.5 (measured 2026-10-10)
 
 **Known defects:** none recorded
 
@@ -388,8 +388,45 @@ lane-parallel MAC off entirely: measured cost, MAC 4048 → 1698 MB/s at 8 KiB,
 different property — every comparison replayed against every implementation of
 it, which is how two real routing holes in `decrypt` and `stream` were found.
 
+## Performance — `bench-chachapoly` (2026-10-10)
+
+The comparative benchmark behind the card's Performance line. Reference: OpenSSL 3.5.5 (the
+scope's reference; system `libcrypto.so.3`, EVP `chacha20-poly1305`, AVX2 assembly); also
+measured: libsodium 1.0.18 (`crypto_aead_chacha20poly1305_ietf_*_detached`). `fastest` is per
+row the faster of the two -- OpenSSL from 1420 B up, libsodium at 64 B. Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
+
+Method: `zig build bench-chachapoly` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`): each side doubles its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst round − best round) / best round per side. Before timing, an interop check (both libraries' ciphertext and tag of the 1420-byte message must equal ours byte for byte).
+
+Workloads: encrypt and decrypt (`ChaCha20Poly1305.encryptInto`/`decryptInto`) of 64 B, 1420 B
+and 16 KiB with 13 bytes of AD. `BENCH_ROUNDS=5` (`alt` = libsodium):
+
+| workload | ours ns/op | ref ns/op | alt ns/op | ours/ref | ours/fastest | spread ours | spread ref | spread alt |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `enc_64` | 378 | 448 | 369 | 0.841 | 1.010 | 1.5% | 6.0% | 2.1% |
+| `enc_1420` | 1356 | 1257 | 1662 | 1.081 | 1.081 | 1.9% | 3.4% | 8.8% |
+| `enc_16384` | 11043 | 8354 | 12017 | 1.325 | 1.325 | 6.0% | 4.9% | 10.8% |
+| `dec_64` | 373 | 464 | 375 | 0.804 | 0.995 | 1.7% | 5.3% | 2.6% |
+| `dec_1420` | 1337 | 1278 | 1675 | 1.054 | 1.054 | 6.0% | 3.6% | 14.0% |
+| `dec_16384` | 11047 | 8495 | 12062 | 1.314 | 1.314 | 1.6% | 4.5% | 33.5% |
+
+Cross-check, two earlier runs with the roles swapped (libsodium as `ref`): ours/libsodium
+0.80–1.02 and 0.80–1.04 (64 B rows 1.01–1.04, 1420 B 0.80–0.82, 16 KiB 0.92–0.93), ours/fastest
+1.32 both times.
+
+**Reading.** At 64 B we are level with libsodium and ahead of OpenSSL (its EVP per-call
+overhead); at 1420 B 1.05–1.08× OpenSSL; at 16 KiB 1.31–1.33× OpenSSL's AVX2 code, which is
+the card's worst → P3. Against libsodium alone (not the scope's reference) the worst would be
+1.04× (P2).
+
 ## Non-goals / backlog
 
+- **Performance: 16 KiB at 1.31–1.33× OpenSSL 3.5.5** *(bench 2026-10-10, `zig build
+  bench-chachapoly`; P3 → P2 needs ≤ 1.1× on every row, 1420 B is at 1.05–1.08×)*. OpenSSL's
+  x86-64 ChaCha20-Poly1305 interleaves the Poly1305 blocks into the 8-block AVX2 ChaCha20 loop
+  (one pass over the data); this module runs keystream-xor and the lane-parallel Poly1305 as two
+  passes. Lever (proposal, not measured): a stitched one-pass seal/open for the AVX2 width
+  (MAC each 512-byte keystream chunk while it is in registers), then re-measure; the 1420 B row
+  would follow, and wireguard's transport rows with it.
 - **AVX-512 (L = 8) is correctness-tested but perf-unmeasured** — no AVX-512
   hardware here. The selection is comptime, so a host that has it takes the
   8-lane path untested for *speed*; it is not untested for *correctness*.

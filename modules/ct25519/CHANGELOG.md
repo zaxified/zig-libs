@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tools: comparative benchmark `tools/bench.zig` + `tools/c_bench/foreign_bench.c` (`zig build bench-ct25519`) against libsodium 1.0.18 (stand-in reference; dalek not installed) and OpenSSL 3.5.5 for X25519; card Performance filled (0.58–1.09×, fastest 1.21× OpenSSL), SPEC "Performance — bench-ct25519" section.
 - **2026-10-09** — **Additive API + burn:** `X25519.recoverPublicKey` now runs under a burn (new `recoverPublicKeyInto(out, secret_key *const)`); new pointer twins `KeyPair.generateDeterministicInto` and `KeyPair.generateInto`. The std-shaped by-value `recoverPublicKey` / `generateDeterministic` / `generate` stay (qap's TLS shim swaps the type in for std's) and call the twins. Probe: `src/stackprobe2_test.zig`.
 - **2026-10-08** — **FIX (secrets on the dead stack, MEDIUM) + additive API:** the new ReleaseFast
   stack probe (`src/stackprobe_test.zig`, all secret-scalar entry points) found every scalar in dead

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tools: comparative benchmark `tools/bench.zig` + `tools/c_bench/foreign_bench.c` (`zig build bench-chachapoly`) against OpenSSL 3.5.5 (reference) and libsodium 1.0.18; card Performance filled (0.80–1.33×, worst 16 KiB), SPEC "Performance — bench-chachapoly" section and the lever in the backlog.
 - **2026-10-09** — tests: deterministic fuzz driver `CHACHAPOLY_FUZZ` over the existing harnesses (decrypt gains a pristine/flipped overlay: a genuine seal must open, one flipped octet must be refused).
 - **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). Pointer-keyed twins of the std-shaped
   by-value surface, so a caller need not leave a key copy in its own frame: `ChaCha20.xorInto`,

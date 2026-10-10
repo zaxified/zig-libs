@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — file digests, no keys (keyword review, 2026-10-07)
 
-**Performance:** not measured
+**Performance:** ref 0.84–1.40× Go 1.26.0 crypto + encoding/hex · fastest 1.60× OpenSSL 3.5.5 (measured 2026-10-10)
 
 **Evidence:** kat — thin std.crypto wrapper; official RFC/BLAKE vectors only
 
@@ -66,7 +66,61 @@ loop, the up-front buffer check) and the `ShortBuffer` checks of `hex` and
 different lengths is already false. One test added for the two real gaps: a buffer one byte
 short of `hexLength` is `ShortBuffer` in both `hex` and `finalHex`.
 
+## Performance
+
+Measured 2026-10-10 by `zig build bench-hashdigest` (`tools/bench.zig` driving
+`tools/go_bench/main.go` and `tools/c_bench/foreign_bench.c`). Reference: Go 1.26.0's one-shot
+`Sum*` + `hex.Encode` (the scope's reference; `crypto/sha256`, `crypto/sha512`, `crypto/sha3`,
+`golang.org/x/crypto/blake2b` v0.57.0). Also measured (`alt`, the card's `fastest`): OpenSSL
+3.5.5 EVP digests (digest fetched and `EVP_MD_CTX` allocated once) + the same hex loop, and
+libsodium 1.0.18 `crypto_generichash` for BLAKE2b-256 (OpenSSL has only BLAKE2b-512). BLAKE3
+is not compared: no reference library on this host. Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
+
+Method: each side doubles its batch until it takes over 100 ms and keeps the best of five; per
+workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; **ratios by
+wall time** (the Go side has no cycle counter); spread = (worst round − best round) / best
+round per side. Before timing, every foreign hex digest of the 64 KiB message (Go's and the C
+side's) must equal ours.
+
+Workloads: `hashdigest.hex(algo, msg, out)` -- one-shot digest + lowercase hex -- of 64 B and
+64 KiB for the eight non-BLAKE3 algorithms. `BENCH_ROUNDS=5`:
+
+| workload | ours ns/op | ref ns/op | alt ns/op | ours/ref | ours/fastest | spread ours | spread ref | spread alt |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `sha256_64` | 517 | 448 | 447 | 1.156 | 1.157 | 3.5% | 1.9% | 6.4% |
+| `sha256_65536` | 234462 | 167183 | 146531 | 1.402 | 1.600 | 2.9% | 2.8% | 3.2% |
+| `sha224_64` | 516 | 440 | 422 | 1.172 | 1.223 | 1.9% | 5.6% | 2.3% |
+| `sha224_65536` | 233304 | 166527 | 147584 | 1.401 | 1.581 | 0.8% | 2.0% | 1.2% |
+| `sha384_64` | 361 | 347 | 372 | 1.041 | 1.041 | 3.7% | 3.2% | 3.5% |
+| `sha384_65536` | 148862 | 112897 | 98275 | 1.319 | 1.515 | 2.0% | 2.7% | 2.9% |
+| `sha512_64` | 376 | 372 | 401 | 1.011 | 1.011 | 2.5% | 2.2% | 5.0% |
+| `sha512_65536` | 149979 | 112222 | 98159 | 1.336 | 1.528 | 1.4% | 1.7% | 2.1% |
+| `sha512_256_64` | 350 | 333 | 359 | 1.049 | 1.049 | 1.6% | 8.8% | 2.5% |
+| `sha512_256_65536` | 148728 | 113103 | 97435 | 1.315 | 1.526 | 3.1% | 1.6% | 5.0% |
+| `sha3_256_64` | 428 | 506 | 512 | 0.847 | 0.847 | 2.7% | 21.0% | 4.0% |
+| `sha3_256_65536` | 187410 | 198108 | 182429 | 0.946 | 1.027 | 2.2% | 6.7% | 1.9% |
+| `sha3_512_64` | 457 | 542 | 545 | 0.843 | 0.843 | 2.8% | 1.7% | 4.3% |
+| `sha3_512_65536` | 358654 | 381550 | 337527 | 0.940 | 1.063 | 0.9% | 1.9% | 0.8% |
+| `blake2b256_64` | 214 | 202 | 201 | 1.059 | 1.062 | 3.2% | 5.6% | 4.9% |
+| `blake2b256_65536` | 79321 | 65739 | 59662 | 1.207 | 1.330 | 1.9% | 0.9% | 1.7% |
+
+Cross-check, two earlier runs against OpenSSL/libsodium alone (by cycles): ours/OpenSSL 1.52–1.59
+on every SHA-2 64 KiB row, 0.94–1.22 on 64 B, SHA-3 0.79–1.08, BLAKE2b-256 64 KiB 1.32–1.58.
+
+**Reading.** This module is a thin wrapper: the time is `std.crypto.hash`'s. SHA-3 is level or
+ahead; small messages are within 1.0–1.17× Go; bulk SHA-2 is 1.32–1.40× Go and 1.52–1.60×
+OpenSSL, BLAKE2b-256 1.21× Go / 1.33× libsodium. This CPU has no SHA-NI, so both foreign sides
+run their AVX2/BMI2 SHA-2 assembly against std's portable code. Worst row 1.40× → P3.
+
 ## Backlog / deferred
+- **Performance: bulk SHA-2 1.32–1.40× Go, 1.52–1.60× OpenSSL; BLAKE2b-256 1.21× Go**
+  *(bench 2026-10-10, `zig build bench-hashdigest`; P3 → P2 needs every row ≤ 1.1×)*. The time
+  is `std.crypto.hash`'s, which has no AVX2 message-schedule path for SHA-256/512 on x86-64
+  without SHA-NI. Levers (proposals, not measured): route `.sha256`/`.sha224`/`.sha512`/...
+  through the sibling `sha2` module if it is faster on this path (its card is `not measured`
+  -- measure first); otherwise an AVX2 multi-block message schedule (what Go's
+  `sha256block_amd64` and OpenSSL's `sha256_block_data_order_avx2` do) belongs in `sha2`, not
+  here.
 - (survey 2026-09-30) **`sha256sum`-style checksum-file parse/verify** (`<hex>  <name>` lines, BSD `SHA256 (f) = hex`): every release-verification tool needs it; ~150 lines, pure Zig, fits CONVENTIONS section 2.
 - ~~(survey 2026-09-30) **`std.Io.Writer` adapter**~~ — not needed: Zig 0.16's `std.Io.Writer.Hashed` (pass-through) and `Hashing` (sink) already give the `io.Copy(h, r)` idiom over any `std.crypto` hasher (checked in `lib/std/Io/Writer.zig`).
 - (survey 2026-09-30) **XOF/keyed modes** (SHAKE, BLAKE3 keyed/derive): only if a consumer asks; `std` has the engines; small, fits.
