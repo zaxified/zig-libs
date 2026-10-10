@@ -102,10 +102,13 @@ pub const BitReader = struct {
 
     /// Read `n` (0..32) bits. Errors if fewer than `n` bits remain.
     pub inline fn takeBits(self: *BitReader, n: u32) BrotliError!u32 {
-        if (n == 0) return 0;
-        self.refill();
-        if (self.cnt < n) return error.TruncatedInput;
-        const v: u32 = @truncate(self.acc & mask(n));
+        // Refill only when short: most reads after a refill find the bits
+        // there (57..64 of them).
+        if (self.cnt < n) {
+            self.refill();
+            if (self.cnt < n) return error.TruncatedInput;
+        }
+        const v: u32 = @truncate(self.acc & ((@as(u64, 1) << @intCast(n)) - 1)); // n ≤ 32
         self.acc >>= @intCast(n);
         self.cnt -= n;
         return v;
@@ -124,7 +127,7 @@ pub const BitReader = struct {
 
     /// Decode one symbol from a prefix-code table.
     pub inline fn readSymbol(self: *BitReader, table: *const huffman.Table) BrotliError!u16 {
-        self.refill();
+        if (self.cnt < 15) self.refill(); // 15: the longest code (RFC 7932 §3.5)
         const idx: usize = @truncate(self.acc & mask(table.bits));
         var e = table.entries[idx];
         if (e.len & huffman.link_flag != 0) {

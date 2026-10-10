@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Decompression faster again (vs google/brotli: 1.49–1.78× → 1.12–1.28×): short
+  back-references are 16/32-byte moves into slack the output keeps instead of `memcpy` calls, the
+  bit reader refills only when short of bits, and code tables are built with `@bitReverse`. No API
+  change.
+
 - **2026-10-11** — Speed (bench vs google/brotli 1.2.0: 1.41–3.38× → 1.04–1.88×, P3). Decoder:
   two-level prefix tables (8-bit root), an 8-byte bit-reader refill, `memcpy` back-references, one
   output reserve per insert and one growth per meta-block. Encoder: the single-literal-code

@@ -34,15 +34,10 @@ pub const Table = struct {
     }
 };
 
+/// The low `len` bits of `code`, reversed (`len` ≤ 16; 0 gives 0).
 fn reverseBits(code: u32, len: u5) u32 {
-    var r: u32 = 0;
-    var c = code;
-    var i: u5 = 0;
-    while (i < len) : (i += 1) {
-        r = (r << 1) | (c & 1);
-        c >>= 1;
-    }
-    return r;
+    if (len == 0) return 0;
+    return @as(u32, @bitReverse(@as(u16, @truncate(code)))) >> @intCast(16 - @as(u6, len));
 }
 
 /// Number of bits to represent `x` (bit length): 0 for x==0, else floor(log2(x))+1.
