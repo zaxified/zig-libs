@@ -1273,3 +1273,13 @@ snmp	ReleaseFast	kdf	1	0	89a9cf04a32dadad	b7a78ad081fdb5eb
 snmp	ReleaseFast	auth	1	0	89a9cf04a32dadad	42cc3493cbe134d7
 snmp	ReleaseFast	aes	1	0	69eb3b1a572eceba	aeff07ae5b6a7083
 snmp	ReleaseFast	des	1	256	c58a69cb557ea3a6	f7e7b8e6152d7073
+# aes192 (2026-10-10) — enc / dec: key + plaintext (enc) or ciphertext (dec)
+# tainted through initEnc/initEncInto/initDec/initDecInto/initFromEnc, the
+# one-block, wide and xor paths and std's modes.ctr. Pinned on the AES-NI
+# backend (CTGRIND_CPU=skylake): 0 in-file. std's software backend
+# (CTGRIND_CPU=x86_64, not a pinned row) reads 356 / 349 in-file, every one a
+# secret-indexed LOAD in std's cache-line-masked sbox/table lookups
+# (soft.zig:127-134, 838-840, 878-880), no branch — std's own Aes128/Aes256
+# posture there; see modules/aes192/SPEC.md.
+aes192	ReleaseFast	enc	1	0	62fecebc952f315c	2b73cb024e51118c
+aes192	ReleaseFast	dec	1	0	62fecebc952f315c	68602ef849690825

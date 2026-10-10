@@ -269,6 +269,7 @@ const module_list = [_]Module{
     .{ .name = "xmlenc", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "aescbc", "aeskw" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "aescbc", .libs = &.{ "web", "crypto" }, .test_deps = &.{"testkit"} },
     .{ .name = "aeskw", .libs = &.{"web"}, .test_deps = &.{"testkit"} },
+    .{ .name = "aes192", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "jwe", .libs = &.{"web"}, .deps = &.{ "rsa", "p256", "aescbc", "aeskw" }, .test_deps = &.{"testkit"} },
     .{ .name = "rdap", .libs = &.{"net"}, .deps = &.{ "http", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "blobstore", .libs = &.{"storage"}, .deps = &.{"hashdigest"} },

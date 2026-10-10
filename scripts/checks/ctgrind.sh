@@ -310,6 +310,7 @@ declare -A TARGETS=(
     [dnp3]="mac keys"
     # ── 2026-10-10: ct-wave: SNMPv3 USM password, auth + priv keys ──
     [snmp]="kdf auth aes des"
+    [aes192]="enc dec"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -386,6 +387,7 @@ declare -A MODES=(
     [mcp-http]="ReleaseFast"
     [dnp3]="ReleaseFast"
     [snmp]="ReleaseFast"
+    [aes192]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -691,6 +693,11 @@ declare -A PATTERN=(
     [snmp/auth]='usm[.]zig|burn[.]zig'
     [snmp/aes]='priv[.]zig|burn[.]zig'
     [snmp/des]='priv[.]zig|des[.]zig|burn[.]zig'
+    # aes192 (2026-10-10): own key expansion + std's round primitive. std's AES
+    # files are named on purpose -- the rounds ARE this module's rounds, on
+    # whichever backend the build's CPU selects (skylake here: aesni.zig).
+    [aes192/enc]='root[.]zig|burn[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig|armcrypto[.]zig|modes[.]zig'
+    [aes192/dec]='root[.]zig|burn[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig|armcrypto[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 # WITNESS_CHAIN — the files a witness's stack may consist of BETWEEN the
@@ -905,6 +912,8 @@ declare -A LABEL=(
     [snmp/auth]='snmp HMAC digests all protocols (auth key tainted)'
     [snmp/aes]='snmp AES-128-CFB priv round trip (key+PDU tainted)'
     [snmp/des]='snmp DES-CBC priv round trip (key+PDU tainted)'
+    [aes192/enc]='aes192 init/encrypt/wide/xor/modes.ctr (key+plaintext tainted)'
+    [aes192/dec]='aes192 initDec/initFromEnc/decrypt/wide (key+ciphertext tainted)'
 )
 
 # ── measurement ────────────────────────────────────────────────────────────
