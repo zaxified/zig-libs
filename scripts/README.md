@@ -60,7 +60,8 @@ debug it, not how the gate is run.
 | `check-example-assert.py` | Refuses `std.debug.assert` under `modules/*/example/`. `build.zig` builds each example with the run's own `.optimize` and `run-examples` RUNS it in the lane's mode, so in `-Doptimize=ReleaseFast` every assertion is compiled out, the example prints its success lines and exits 0 having checked nothing. Measured 2026-09-05: **593 sites in 63 of the 230 examples**. Not merely lost coverage — `sealedbox`, `ripemd160` and `bip340` compared against an EXTERNAL oracle this way and PRINTED that the oracle agreed when no comparison ran; verified by breaking `sealedbox`'s PyNaCl constant, after which the old example still exited 0 and still claimed a byte-exact match, while the converted one names the failing line. Replacement is `must(<cond>, @src())` over `std.debug.panic`, which is live in every optimize mode, or `if (!cond) return error.X;`. ⛔ Blind to `unreachable`, to `std.debug.assert` inside `src/`, to a check that cannot fail, and to whether the example is run at all. Runs on every gate. |
 | `check-changelog-entry.py` | Refuses a change-set that moves a module substantially without moving its `CHANGELOG.md`. `zig build check-changelog` is a PRESENCE gate — it reads the tree, never a diff, so a module can have its parser rewritten while its changelog last moved six weeks ago and stay green. **The rule, in one sentence:** a module owes a new dated bullet when, under `modules/<name>/src/`, the change-set touches a line beginning with `pub` **or** moves more than 25 lines of code — excluding blank lines, comments, whitespace-only differences, and everything inside a `test` block (tests live in `src/` here, so counting them would make a batch of regression tests look like a rewrite). Two triggers and not one, because a line threshold gets both ends backwards: widening a return type is one line every consumer must recompile against, and re-flowing a match is 200 lines nobody can observe. Base ref against the tree is authoritative and is what CI passes; `--staged` is what `hooks/pre-commit` asks of one commit; `--commit REV`/`A..B` replays history. **The escape is a real entry** — `- **YYYY-MM-DD** — **NO CONSUMER-VISIBLE CHANGE:** …` — deliberately not special-cased in code, for the same reason `FUZZ-EXEMPT.tsv` was retired, and the gate names every module that used it on every run. Replayed over the last 120 commits: 7 of 12 ten-commit windows red, 16 flags, all real. ⛔ Blind to a multi-line `pub fn` signature and to a field added inside a `pub const T = struct`; both need a Zig-side parse. Runs on every gate. |
 | `portable-known-failures.tsv` | The `(module, target)` pairs a module DECLARES in `meta.targets` but that do not currently compile, each with the real compiler error. A declared-but-broken target is a tracked debt, not a silently dropped claim. |
-| `check-ci-cache-keys.sh` | Refuses a CI config where one lane's cache restore-key prefix can match another lane's entry. `restore-keys` matches by prefix, so distinct names are not enough — they must not be prefixes of each other. An amd64 lane restored an aarch64 tree this way and recompiled everything, green throughout. Also refuses a scoped-job shard list (`-Dgroup=`) that misses a primary lib from `module-graph`: its modules would never be tested on a push. |
+| `fingerprint-exempt.py` | Keeps build.zig's `fingerprint_exempt` list equal to the top-level declarations reachable only from a check's `.makeFn` and never from the code that compiles or tests a module (2026-10-10). `module-fingerprints` leaves those out of the machinery hash, so editing a repo check no longer re-keys all ~240 modules — before, it turned every such push into a cold run of the collection. A name listed but reachable from module wiring would HIDE a re-key: that fails. `--write` regenerates the list. |
+| `check-ci-cache-keys.sh` | Refuses a CI config where one lane's cache restore-key prefix can match another lane's entry. `restore-keys` matches by prefix, so distinct names are not enough — they must not be prefixes of each other. An amd64 lane restored an aarch64 tree this way and recompiled everything, green throughout. Also refuses a scoped-job shard list (`-Dgroup=`) that misses a primary lib from `module-graph`: its modules would never be tested on a push — and a `split: k/n` group missing one of its parts. |
 | `check-uapi-consts.py` | Diffs the kernel UAPI constants modules hardcode against the headers they came from. Driven by `zig build check-uapi`, which the gate runs; it SKIPS (never fails) on a host without python3 or kernel headers. Currently 689 matched / 0 mismatched across five modules, with 263 constants unresolved — it says so rather than counting them as passes. |
 
 **`gen/` — generators and oracles, run by hand and rarely.** They re-create
@@ -173,9 +174,12 @@ from a diff against `BASE_REF` if you pass one (`scripts/test.sh changed main`).
   fingerprint, so the stamps already say what they re-keyed (see *Stamps*)
 - `.github/**` and any script the gate itself executes — `test.sh`,
   `test-lib.sh`, `capped`, `dark-tests.sh`, `ci-environment.sh`, `test-tag.sh`,
-  `ci-stamps.sh`, `check-ci-cache-keys.sh`, `hooks/**` → **every check plus a smoke
-  set** — one plain and one netns module, end to end — to prove the driver itself
-  works, locally and on CI alike, and then the modules with no green stamp as always.
+  `ci-stamps.sh`, `check-ci-cache-keys.sh`, `hooks/**` → **a smoke set** — one
+  plain and one netns module, end to end — to prove the driver itself works, the
+  usual scoped checks, and then the modules with no green stamp as always. Every
+  check over the whole tree only with `ZIGLIBS_WIDE_CHECKS=1` (since 2026-10-10;
+  before, always, and in each CI shard). `scripts/checks/*.tsv` and
+  `*-baseline.txt` are check DATA and do not count as a harness change.
   The driver is not in any fingerprint (it decides which modules run, not what they
   compile to), so a driver edit re-tests nothing that was already proven. Until
   2026-09-18 CI escalated to the full gate here: on 2026-08-15 a push that changed the
@@ -495,15 +499,26 @@ self-hosted backend is for the edit loop only and no lane uses it. CI runs the
 push lane (`changed`, default mode) on every push and the `ReleaseSafe` and
 `ReleaseFast` full lanes on a tag or `workflow_dispatch`.
 
-**ReleaseFast-only tests run on every push too (2026-10-08).** A dead-stack
-probe skips in Debug and ReleaseSafe (both fill `undefined`), so before this
-nothing between two tags ran it — a regression of bip340's A1 F2 sat red at HEAD
-for a day with every lane green. `changed` now runs, after the module step, the
-whole suite of every module in its set whose `src/` holds such a skip
-(`RF_ONLY_RE` in `test.sh`: `mode != .ReleaseFast` or `mode == .Debug or
-… mode == .ReleaseSafe` before `return error.SkipZigTest`) again with
-`-Doptimize=ReleaseFast`. Locally, after touching such a module:
-`scripts/modtest <m> -Doptimize=ReleaseFast`.
+**ReleaseFast-only tests: on request only in `changed` (2026-10-08, cut back
+2026-10-10).** A dead-stack probe skips in Debug and ReleaseSafe (both fill
+`undefined`). From 2026-10-08 `changed` re-ran, after the module step, the whole
+suite of every module in its set holding such a skip (`RF_ONLY_RE` in `test.sh`)
+with `-Doptimize=ReleaseFast`. The dead-stack sweep put probes in ~50 modules and
+that second build became 19 minutes of a 51-minute push run, so it is off unless
+`ZIGLIBS_RF_ONLY=1` (owner: the push lane is a ≤ 5-minute loop). The ReleaseFast
+full lane runs every probe on a tag or dispatch. After touching a module with a
+probe, run `scripts/modtest <m> -Doptimize=ReleaseFast` yourself.
+
+**The push lane's budget (owner, 2026-10-10): ≤ 5 minutes.** Push runs had grown
+to 37–105 minutes. What keeps `changed` inside it:
+`fingerprint_exempt` (a repo check's code is not machinery, so editing one
+re-keys nothing — `fingerprint-exempt.py`); whole-tree checks only with
+`ZIGLIBS_WIDE_CHECKS=1`; `scripts/checks/*.tsv` and `*-baseline.txt` are data,
+not harness; `PUSH_DEFERRED` modules (dkg, threshold_ecdsa: 9–10 and 5–7
+minutes) run on the full lanes, or with `ZIGLIBS_RUN_DEFERRED=1`; and
+`ZIGLIBS_SPLIT=k/n` lets CI spread one primary lib over several jobs
+(crypto and rest run as two each). A job over the 15-minute cap is a design
+regression to fix, not a cap to raise.
 
 ## Privileged tests
 

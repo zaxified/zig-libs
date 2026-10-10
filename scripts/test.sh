@@ -257,6 +257,45 @@ lane_modules() {
     printf '%s' "${out[*]}"
 }
 
+# ⛔ THE PUSH LANE IS A ≤ 5-MINUTE LOOP (owner, 2026-10-10). Two knobs keep it
+# there; both apply to `changed` only, never to `all`/the tag lanes.
+#
+# PUSH_DEFERRED: modules whose suite alone outlasts the budget (measured in
+# push run 37975285984: dkg 9-10 min, threshold_ecdsa 5-7 min, the crypto
+# shard's critical path). `changed` leaves them unproven -- no stamp -- and
+# says so; the full lanes (tag / workflow_dispatch) run them, and so does
+# `scripts/modtest <m>` when they are what you changed. ZIGLIBS_RUN_DEFERRED=1
+# puts them back.
+PUSH_DEFERRED="dkg threshold_ecdsa"
+
+defer_slow() {
+    local m out="" deferred=""
+    if [[ "${ZIGLIBS_RUN_DEFERRED:-0}" == 1 ]]; then echo "$1"; return; fi
+    for m in $1; do
+        case " $PUSH_DEFERRED " in
+            *" $m "*) deferred="$deferred $m" ;;
+            *) out="$out $m" ;;
+        esac
+    done
+    [[ -n "$deferred" ]] && echo "changed: deferred to the full lanes (push-lane budget):$deferred" >&2
+    echo "${out# }"
+}
+
+# ZIGLIBS_SPLIT=k/n: this job takes the modules whose name hashes to k mod n
+# (1-based), so one primary lib can spread over several CI jobs. By the NAME,
+# not by position: a module must land in the same job on every push, since
+# each job keeps its own stamps.
+split_modules() {
+    local spec="${ZIGLIBS_SPLIT:-}"
+    if [[ -z "$spec" ]]; then echo "$1"; return; fi
+    local k="${spec%/*}" n="${spec#*/}" m h out=""
+    for m in $1; do
+        h=$(printf '%s' "$m" | cksum | cut -d' ' -f1)
+        (( h % n == k - 1 )) && out="$out $m"
+    done
+    echo "${out# }"
+}
+
 # ── stamps ──────────────────────────────────────────────────────────────────
 # A stamp says: this module, at this fingerprint, passed this lane. A module
 # whose current fingerprint (`zig build module-fingerprints`, see build.zig for
@@ -425,11 +464,20 @@ harness_smoke() {
         [[ -n "$plain" && -n "$netns" && -n "$loop" ]] && break
     done
 
-    echo "changed: the harness or a CI lane definition changed -- running every check and"
     local smoke="$plain${netns:+, $netns}${loop:+, $loop}"
+    # ⛔ Every check over the WHOLE tree only on request (2026-10-10, owner:
+    # the push lane is a ≤ 5-minute loop). It cost 8-11 minutes and ran in
+    # each of the three CI shards. The scoped checks below still run every
+    # changed checker over this push's modules; the tag / dispatch lanes run
+    # them all wide.
+    if [[ "${ZIGLIBS_WIDE_CHECKS:-0}" == 1 ]]; then
+        echo "changed: the harness or a CI lane definition changed -- running every check and"
+        phase_all_checks
+    else
+        echo "changed: the harness or a CI lane definition changed -- running"
+    fi
     echo "  a smoke set ($smoke) that exercises the driver end to end; the modules"
     echo "  with no green stamp follow."
-    phase_all_checks
     run_modules "$plain $netns $loop"
 }
 
@@ -538,6 +586,15 @@ rf_only_modules() {
 }
 
 run_rf_only() {
+    # ⛔ OFF in `changed` by default since 2026-10-10 (owner: the push lane is
+    # a ≤ 5-minute loop). The dead-stack sweep put a ReleaseFast-only probe in
+    # ~50 modules, so this second build of the closure grew from 12 modules to
+    # 47 in one shard -- 19 of a 51-minute push run (37975285984). The
+    # ReleaseFast full lane (tag / workflow_dispatch) runs every module in
+    # ReleaseFast anyway, probes included; between tags, run the touched
+    # modules' probes with `scripts/modtest <m> -Doptimize=ReleaseFast`, or set
+    # ZIGLIBS_RF_ONLY=1 to get this step back in `changed`.
+    [[ "${ZIGLIBS_RF_ONLY:-0}" == 1 ]] || return 0
     local mods a
     local -a rf_args=()
     for a in ${EXTRA_ZIG_ARGS[@]+"${EXTRA_ZIG_ARGS[@]}"}; do
@@ -1363,6 +1420,12 @@ cmd_changed() {
                 # a module between libs breaks check-catalog / check-libs-table.
                 trigger_catalog=1
                 ;;
+            scripts/checks/*.tsv|scripts/checks/*-baseline.txt)
+                # DATA the checks read (ctgrind's expected table, the ratchet
+                # baselines), not a check: re-pinning a ctgrind digest changes
+                # nothing a push lane runs, and counting it as a harness edit
+                # sent nearly every crypto push down the smoke path (2026-10-10).
+                ;;
             .github/*|scripts/test.sh|scripts/tag.sh|scripts/check-apps.sh|scripts/lib/*|scripts/checks/*|scripts/hooks/*)
                 # The harness or the CI lane definition itself: no narrower set
                 # can be trusted, because what narrows it is the thing that
@@ -1454,7 +1517,7 @@ cmd_changed() {
     local smoke_done=0
     if [[ $trigger_all -eq 1 ]]; then
         harness_smoke
-        smoke_done=1
+        [[ "${ZIGLIBS_WIDE_CHECKS:-0}" == 1 ]] && smoke_done=1
     fi
 
     # ⭐ WHICH MODULES RUN IS DECIDED BY STAMPS (2026-09-18), not by the diff.
@@ -1465,9 +1528,10 @@ cmd_changed() {
     # does not forget a module that went red two commits ago.
     local lane closure lane_mods
     lane="$(stamps_lane_key changed)"
-    lane_mods="$(lane_modules)"
+    lane_mods="$(split_modules "$(lane_modules)")"
     fp_load   # here, in THIS shell: see stamps_record
     closure="$(stamps_pending "$lane_mods" "$lane")"
+    closure="$(defer_slow "$closure")"
     local total_n
     total_n=$(wc -w <<< "$closure")
     echo "changed: $total_n of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' ($(lane_cpu_note))"
@@ -1557,7 +1621,14 @@ cmd_changed() {
     # Same reasoning as `check-testonly` above: ~0.1s warm, and the change
     # signal that would gate it (editing a harness, or editing the module it
     # measures) is exactly what a developer is doing when it matters.
-    (( mc )) && step "check-ctgrind" zig build check-ctgrind
+    # Narrowed to this push's modules that HAVE a harness (2026-10-10): the
+    # whole set cost 75-127 s in every shard of every push.
+    local -a ctg_args=()
+    local cm
+    for cm in $closure; do
+        [[ -f "modules/$cm/src/ctgrind_harness.zig" ]] && ctg_args+=("-Dctgrind-module=$cm")
+    done
+    (( mc )) && [[ ${#ctg_args[@]} -gt 0 ]] && step "check-ctgrind" zig build check-ctgrind "${ctg_args[@]}"
 
     # Gated on `mc` like the two above. It was absent from this driver until
     # 2026-08-14, which is why nobody noticed it had
@@ -1584,6 +1655,9 @@ cmd_changed() {
     [[ -n "$files" ]] && step "check-portable-table" zig build check-portable-table
     [[ -n "$files" ]] && step "check-libs-table" zig build check-libs-table
     [[ -n "$files" ]] && step "check-catalog-table" zig build check-catalog-table
+    # build.zig's `fingerprint_exempt` must still be exactly the declarations
+    # no module wiring reaches: a stale name would hide a re-key. ~0.1 s.
+    (( trigger_catalog )) && step "check-fingerprint-exempt" ./scripts/checks/fingerprint-exempt.py
     # The class no other gate can see: Zig analyses a function body only when
     # something references it, so a `pub fn` no test reaches can be outright
     # non-compiling and still ship green. Measured 2026-08-21: 403 of 9626
@@ -1742,6 +1816,7 @@ phase_checks_fast_tail() {
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
     step "tag.sh self-test" ./scripts/lib/test-tag.sh
     step "check-ci-cache-keys" ./scripts/checks/check-ci-cache-keys.sh
+    step "check-fingerprint-exempt" ./scripts/checks/fingerprint-exempt.py
     step "check-scripts-doc" zig build check-scripts-doc
     step "check-package" zig build check-package
     step "check-catalog" zig build check-catalog

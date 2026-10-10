@@ -102,4 +102,20 @@ elif [[ "$have" != "$want" ]]; then
     echo "  A lib missing here is a set of modules no push ever tests." >&2
     rc=1
 fi
+# ⭐ AND A SPLIT GROUP NEEDS EVERY PART (2026-10-10). `split: k/n` hands a job
+# the modules whose name hashes to k (test.sh `split_modules`); a missing part
+# is 1/n of the group that no push ever tests, green.
+split_bad=$(awk '
+    /^[[:space:]]*-[[:space:]]*shard:/ { g = ""; sp = "" }
+    /^[[:space:]]*groups:/ { sub(/^[[:space:]]*groups:[[:space:]]*/, ""); g = $0 }
+    /^[[:space:]]*split:/ {
+        sub(/^[[:space:]]*split:[[:space:]]*/, ""); gsub(/"/, ""); sp = $0
+        if (sp != "") { split(sp, kn, "/"); n[g] = kn[2]; seen[g, kn[1]] = 1 }
+    }
+    END { for (gr in n) for (k = 1; k <= n[gr]; k++) if (!((gr, k) in seen)) print gr " lacks part " k "/" n[gr] }
+' <<< "$scoped")
+if [[ -n "$split_bad" ]]; then
+    echo "check-ci-cache-keys: a split shard is missing a part: $split_bad" >&2
+    rc=1
+fi
 exit "$rc"

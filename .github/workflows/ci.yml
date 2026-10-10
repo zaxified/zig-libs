@@ -270,7 +270,12 @@ jobs:
     # 90, not 75, since 2026-09-29: the default mode compiles with LLVM now (not
     # the self-hosted backend), 2-6x more compile time per module, and a
     # re-keying push is ~75 modules cold per shard.
-    timeout-minutes: 90
+    # 15 since 2026-10-10: the push lane is a ≤ 5-minute loop (owner). A job
+    # that needs more is a design regression to fix, not a cap to raise --
+    # measured causes of the 37-105-minute runs before: every module re-keyed
+    # by any build.zig edit, every repo check over the whole tree in each
+    # shard, a second ReleaseFast build of the closure, dkg/threshold_ecdsa.
+    timeout-minutes: 15
     # ⭐ THREE SHARDS, like the full lanes (2026-09-18). On an ordinary push each
     # shard finds most of its modules stamped and is minutes, so the split
     # costs two runner start-ups. It is there for the push that re-keys
@@ -282,13 +287,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # crypto and rest are split in two by module-name hash (ZIGLIBS_SPLIT,
+        # see split_modules in test.sh) so that a push re-keying a primary lib
+        # spreads over two runners; each half keeps its own stamps.
         include:
-          - shard: crypto
+          - shard: crypto-1
             groups: -Dgroup=crypto
+            split: 1/2
+          - shard: crypto-2
+            groups: -Dgroup=crypto
+            split: 2/2
           - shard: net
             groups: -Dgroup=net
-          - shard: rest
+            split: ""
+          - shard: rest-1
             groups: -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os
+            split: 1/2
+          - shard: rest-2
+            groups: -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os
+            split: 2/2
     name: changed modules [${{ matrix.shard }}]
     steps:
       # Full history: `test.sh changed <base>` diffs against the base branch,
@@ -413,6 +430,7 @@ jobs:
       - name: Test changed modules
         env:
           ZIGLIBS_LANE: changed modules [${{ matrix.shard }}]
+          ZIGLIBS_SPLIT: ${{ matrix.split }}
           ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
           GH_TOKEN: ${{ github.token }}
         run: |

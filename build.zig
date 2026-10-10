@@ -1634,6 +1634,9 @@ pub fn build(b: *std.Build) void {
             });
             ctgrind.dependOn(&inst.step);
         }
+        // `-Dctgrind-module` narrows the rot guard too (2026-10-10): the push
+        // lane compiles only the harnesses of the modules it is testing.
+        if (!selected) continue;
 
         // The rot guard compiles at Debug (fastest) with `-fvalgrind` forced
         // on. The switch matches what the real run uses -- a harness that
@@ -1789,7 +1792,7 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
     machinery.update("\x00");
     {
         const src = try b.build_root.handle.readFileAlloc(io, "build.zig", b.allocator, .limited(64 * 1024 * 1024));
-        hashZigTokens(&machinery, try b.allocator.dupeZ(u8, src), "module_list");
+        hashZigTokens(&machinery, try b.allocator.dupeZ(u8, src), &([_][]const u8{"module_list"} ++ fingerprint_exempt));
     }
     // ⚠ NOT the driver scripts (2026-09-18). test.sh, test-lib.sh and friends
     // decide WHICH modules run and how the result is reported; they do not
@@ -1807,7 +1810,7 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
         machinery.update(path);
         machinery.update("\x00");
         if (std.mem.endsWith(u8, path, ".zig")) {
-            hashZigTokens(&machinery, try b.allocator.dupeZ(u8, src), null);
+            hashZigTokens(&machinery, try b.allocator.dupeZ(u8, src), &.{});
         } else {
             machinery.update(src);
         }
@@ -2036,7 +2039,7 @@ fn fileDigest(
         var envs: []const u8 = "";
         if (kind == .tok and std.mem.endsWith(u8, path, ".zig")) {
             const z = try b.allocator.dupeZ(u8, src);
-            hashZigTokens(&fh, z, null);
+            hashZigTokens(&fh, z, &.{});
             embeds = try collectEmbeds(b, z);
             envs = try collectEnvNames(b, z);
         } else {
@@ -2106,37 +2109,63 @@ fn hasComponent(path: []const u8, name: []const u8) bool {
 }
 
 /// Every token except comments, each as tag + bytes. `//` comments are never
-/// tokens; `///` and `//!` are, and are dropped here. With `skip_decl`, the
-/// initializer of the top-level `const <skip_decl> = ...;` is dropped too
-/// (build.zig's `module_list`, whose entries are hashed per module instead).
-fn hashZigTokens(h: *std.crypto.hash.sha2.Sha256, src: [:0]const u8, skip_decl: ?[]const u8) void {
+/// tokens; `///` and `//!` are, and are dropped here. Every top-level
+/// declaration named in `skip` is dropped too: a `const`/`var`'s initializer up
+/// to its `;`, a `fn`'s signature and body up to the `}` that closes it
+/// (build.zig's `module_list`, hashed per module instead, and the
+/// `fingerprint_exempt` check implementations). A `fn` whose signature holds a
+/// brace (`struct { ... }` as a type) stops skipping at that brace and hashes
+/// the rest -- too much, never too little.
+fn hashZigTokens(h: *std.crypto.hash.sha2.Sha256, src: [:0]const u8, skip: []const []const u8) void {
     var tok = std.zig.Tokenizer.init(src);
-    var skipping = false;
-    var depth: usize = 0;
+    const Skip = enum { none, to_semicolon, to_brace };
+    var skipping: Skip = .none;
+    var depth: usize = 0; // nesting while skipping
+    var top: usize = 0; // brace depth of the file, to see top-level declarations
+    var prev: std.zig.Token.Tag = .invalid;
     var prev_ident: []const u8 = "";
     while (true) {
         const t = tok.next();
         if (t.tag == .eof) break;
         if (t.tag == .doc_comment or t.tag == .container_doc_comment) continue;
         const text = src[t.loc.start..t.loc.end];
-        if (skipping) {
+        if (skipping != .none) {
             switch (t.tag) {
                 .l_brace, .l_paren, .l_bracket => depth += 1,
-                .r_brace, .r_paren, .r_bracket => depth -|= 1,
-                .semicolon => if (depth == 0) {
-                    skipping = false;
+                .r_brace, .r_paren, .r_bracket => {
+                    depth -|= 1;
+                    if (skipping == .to_brace and t.tag == .r_brace and depth == 0) skipping = .none;
+                },
+                .semicolon => if (skipping == .to_semicolon and depth == 0) {
+                    skipping = .none;
                 },
                 else => {},
             }
             continue;
         }
-        if (skip_decl) |name| {
-            if (t.tag == .equal and std.mem.eql(u8, prev_ident, name)) {
-                skipping = true;
+        switch (t.tag) {
+            .l_brace => top += 1,
+            .r_brace => top -|= 1,
+            else => {},
+        }
+        if (top == 0) {
+            const named = for (skip) |name| {
+                if (std.mem.eql(u8, text, name)) break true;
+            } else false;
+            if (t.tag == .identifier and prev == .keyword_fn and named) {
+                skipping = .to_brace;
+                depth = 0;
+                continue;
+            }
+            if (t.tag == .equal and for (skip) |name| {
+                if (std.mem.eql(u8, prev_ident, name)) break true;
+            } else false) {
+                skipping = .to_semicolon;
                 depth = 0;
                 continue;
             }
         }
+        prev = t.tag;
         prev_ident = if (t.tag == .identifier) text else "";
         h.update(@tagName(t.tag));
         h.update("\x00");
@@ -2144,6 +2173,152 @@ fn hashZigTokens(h: *std.crypto.hash.sha2.Sha256, src: [:0]const u8, skip_decl: 
         h.update("\x00");
     }
 }
+
+/// The top-level declarations `module-fingerprints` leaves out of the
+/// machinery hash (2026-10-10): the implementations of repo checks and
+/// generators, reachable only from a `.makeFn` and never from the code that
+/// compiles or tests a module. Editing one used to re-key all ~240 modules and
+/// turn the push lane into a cold run of the collection. Computed, not chosen:
+/// `scripts/checks/fingerprint-exempt.py --write` regenerates it and the
+/// default (`--check`, in every gate) fails when a listed name has become
+/// reachable from module wiring.
+const fingerprint_exempt = [_][]const u8{
+    "AnchorGrade",
+    "AuditMark",
+    "CatalogStep",
+    "DarkTestsStep",
+    "DigestKind",
+    "EvidenceCD",
+    "FileMemo",
+    "FuzzExemption",
+    "FuzzScan",
+    "Hardening",
+    "LibsTableStep",
+    "Maturity",
+    "MaturityGrade",
+    "MutationScore",
+    "Perf",
+    "PortableBaselineEntry",
+    "PortableBaselineStep",
+    "PortableTableStep",
+    "PurityDebt",
+    "PurityFinding",
+    "StringLiteralIterator",
+    "ahead_max_age_days",
+    "appCoversModule",
+    "catalogRowNeedle",
+    "checkAnchors",
+    "checkCatalog",
+    "checkChangelog",
+    "checkChangelogShape",
+    "checkCopyleft",
+    "checkCopyleftDeclaration",
+    "checkDepsMatch",
+    "checkEntryDates",
+    "checkExampleRule",
+    "checkFuzz",
+    "checkFuzzExempt",
+    "checkGlobalAlloc",
+    "checkLibs",
+    "checkModuleCitations",
+    "checkModulePurity",
+    "checkNonGoals",
+    "checkNoticeLinksIn",
+    "checkNoticeLinksResolve",
+    "checkPackagePaths",
+    "checkProvenance",
+    "checkScriptsDoc",
+    "checkSpdxHeaders",
+    "checkUapi",
+    "collapseWhitespace",
+    "collectEmbeds",
+    "collectEnvNames",
+    "containsAnyIgnoreCase",
+    "containsName",
+    "copyleftSelfDeclaration",
+    "copyleft_grants",
+    "copyleft_ids",
+    "countFuzzCalls",
+    "dayAfter",
+    "declaresItselfGenerated",
+    "entryDate",
+    "exampleTriggers",
+    "example_apps",
+    "example_pub_fn_threshold",
+    "example_self_method_threshold",
+    "fileDigest",
+    "fileExists",
+    "fileHasByteAcceptingPubFn",
+    "findModuleErrorBlock",
+    "fingerprint_exempt",
+    "firstDataFile",
+    "firstDataZigFile",
+    "foreign_source_exts",
+    "foreign_toolchains",
+    "genMetaDeps",
+    "globalAllocMarkerReason",
+    "global_alloc_marker",
+    "global_alloc_needles",
+    "hasComponent",
+    "hashZigTokens",
+    "isBuildScratchDir",
+    "isInsideLineComment",
+    "isTopLevelDecl",
+    "isTopLevelTestDecl",
+    "lib_sections",
+    "libs_table_begin_marker",
+    "libs_table_end_marker",
+    "lineWithoutMarker",
+    "maturityGrade",
+    "maturityLine",
+    "maturityLineAt",
+    "maturityLineOpt",
+    "maturity_grade_prefix",
+    "maturity_heading",
+    "mentionsName",
+    "metaDepsFromRoot",
+    "metaStringField",
+    "moduleAnchorGrade",
+    "moduleFuzzExemption",
+    "moduleMaturity",
+    "modulePurityDebt",
+    "moduleSrcHash",
+    "namesItsPayload",
+    "nonGoalExempt",
+    "nonGoalExemptions",
+    "p2_ref_tolerance",
+    "parseAuditMark",
+    "parseDay",
+    "parseHardening",
+    "parsePerf",
+    "parsePortableBaseline",
+    "parsePortableStepTail",
+    "parseRatio",
+    "portablePairKey",
+    "portable_baseline_path",
+    "portable_table_begin_marker",
+    "portable_table_end_marker",
+    "printAppList",
+    "printMaturityReport",
+    "printModuleFingerprints",
+    "printModuleGraph",
+    "process_spawn_markers",
+    "provenanceStatement",
+    "purityFinding",
+    "readmeDepsCell",
+    "readmeLibOf",
+    "renderLibsTable",
+    "renderPortableTable",
+    "scanModuleForFuzz",
+    "scanNoticeLinks",
+    "scanShippedForCopyleft",
+    "scanSpdx",
+    "scanSrcForPurity",
+    "survey_max_age_days",
+    "todayDay",
+    "unreleasedSection",
+    "withGradeLine",
+};
 
 /// `-Dmodule` as given, for the source-scanning steps whose make functions
 /// cannot see `build()`'s locals. Empty = every module.
