@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — tests: model-fuzz against a naive ordered-array reference model (300 seeded random sequences over admit/close/record/ban/greylist/prefix bans/reconcile with an injected clock; per-step verdict and state checks incl. LRU eviction and sweep, snapshot multiset, text and restore round trips; reach classes enforced). No API or behaviour change.
+
 - **2026-10-10** — Card Performance `n/a` with the reason (no timeable reference implementation). Docs only.
 
 - **2026-10-04** — Added (survey 2026-09-30 backlog): `Options.allow` (fail2ban

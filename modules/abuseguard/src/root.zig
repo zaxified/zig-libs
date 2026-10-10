@@ -2557,3 +2557,651 @@ test "middleware: a 500 response is the server's fault and never strikes" {
     try expectStatus(runWirePeer(&r, wire("/boom", ""), &buf, mkPeer4("203.0.113.70", 1)), "500");
     try testing.expectEqual(@as(usize, 0), g.trackedCount());
 }
+
+// ── model-fuzz: seeded random operation sequences vs a naive reference ───────
+//
+// The reference model below is a re-statement of the documented semantics
+// (SPEC.md "Design & invariants", README) in the plainest possible form: an
+// ordered array of per-key records (front = most recently touched), integer
+// strike counters, absolute-nanosecond deadlines, a linear list of range bans
+// and a linear allowlist test. It never calls the guard and shares no code
+// with it: addresses are re-implemented as (family, 16 bytes) with a bit-loop
+// mask, so keying, v4-mapped unification and prefix canonicalisation are
+// checked, not borrowed. The clock is the injected TestClock, so every
+// deadline, decay boundary and TTL expiry is driven to the exact nanosecond.
+
+const AgAddr = struct {
+    fam: u8, // 4 or 6
+    b: [16]u8 = .{0} ** 16,
+
+    fn eql(x: AgAddr, y: AgAddr) bool {
+        return x.fam == y.fam and std.mem.eql(u8, &x.b, &y.b);
+    }
+};
+
+const AgPrefix = struct {
+    a: AgAddr,
+    bits: u8,
+
+    fn eql(x: AgPrefix, y: AgPrefix) bool {
+        return x.bits == y.bits and x.a.eql(y.a);
+    }
+};
+
+fn agRaw(ip: netaddr.Ip) AgAddr {
+    switch (ip) {
+        .v4 => |b| {
+            var r = AgAddr{ .fam = 4 };
+            @memcpy(r.b[0..4], &b);
+            return r;
+        },
+        .v6 => |b| return .{ .fam = 6, .b = b },
+    }
+}
+
+fn agIsMapped(a: AgAddr) bool {
+    if (a.fam != 6) return false;
+    for (a.b[0..10]) |c| if (c != 0) return false;
+    return a.b[10] == 0xff and a.b[11] == 0xff;
+}
+
+fn agUnmap(a: AgAddr) AgAddr {
+    if (!agIsMapped(a)) return a;
+    var r = AgAddr{ .fam = 4 };
+    @memcpy(r.b[0..4], a.b[12..16]);
+    return r;
+}
+
+fn agMask(a: AgAddr, bits: u8) AgAddr {
+    var r = a;
+    var i: usize = bits;
+    while (i < 128) : (i += 1) r.b[i / 8] &= ~(@as(u8, 0x80) >> @intCast(i % 8));
+    return r;
+}
+
+/// A ban / allow prefix as the docs define it: host bits zeroed; a v4-mapped
+/// v6 prefix of /96 or longer is the v4 prefix it denotes.
+fn agPrefixOf(p: netaddr.Prefix) AgPrefix {
+    const raw = agRaw(p.addr);
+    if (agIsMapped(raw) and p.bits >= 96) return .{ .a = agMask(agUnmap(raw), p.bits - 96), .bits = p.bits - 96 };
+    return .{ .a = agMask(raw, p.bits), .bits = p.bits };
+}
+
+fn agHas(p: AgPrefix, a: AgAddr) bool {
+    return p.a.fam == a.fam and p.a.eql(agMask(a, p.bits));
+}
+
+const AgCfg = struct {
+    max_per: ?u32,
+    max_total: ?u32,
+    ttl_ms: u64,
+    threshold: u32,
+    decay_ms: u64,
+    after: u32,
+    max_tracked: usize,
+    store_full: StoreFull,
+    allow: []const netaddr.Prefix,
+    v6bits: u8,
+    v4bits: u8,
+    max_pfx: usize,
+};
+
+const AgReach = struct {
+    admitted: u64 = 0,
+    banned_entry: u64 = 0,
+    banned_range: u64 = 0,
+    greylisted: u64 = 0,
+    per_ip_cap: u64 = 0,
+    total_cap: u64 = 0,
+    store_full: u64 = 0,
+    admitted_untracked: u64 = 0,
+    allow_overrides_verdict: u64 = 0,
+    grey_expired_at_boundary: u64 = 0,
+    strikes_decayed: u64 = 0,
+    offense_greylist: u64 = 0,
+    offense_ban: u64 = 0,
+    evicted: u64 = 0,
+    evicted_banned_last_resort: u64 = 0,
+    swept_empty: u64 = 0,
+    unban_removed_entry: u64 = 0,
+    too_many_prefix_bans: u64 = 0,
+    unban_prefix_true: u64 = 0,
+    unban_prefix_false: u64 = 0,
+    close_untracked_fallback: u64 = 0,
+    close_unmatched: u64 = 0,
+    reconcile_applied: u64 = 0,
+    snapshot_checked: u64 = 0,
+    restore_roundtrip: u64 = 0,
+};
+
+const AgEntry = struct {
+    key: AgAddr,
+    live: u32 = 0,
+    strikes: u64 = 0,
+    mark: u64, // instant up to which strikes have been drained
+    grey_until: u64 = 0,
+    offenses: u32 = 0,
+    banned: bool = false,
+};
+
+const AgModel = struct {
+    cfg: AgCfg,
+    reach: *AgReach,
+    ents: [16]AgEntry = undefined, // [0] = most recently touched
+    n: usize = 0,
+    pfx: [8]AgPrefix = undefined,
+    np: usize = 0,
+    untracked: usize = 0,
+
+    const ms = std.time.ns_per_ms;
+
+    fn keyOf(m: *const AgModel, ip: netaddr.Ip) AgAddr {
+        const a = agUnmap(agRaw(ip));
+        return agMask(a, if (a.fam == 4) m.cfg.v4bits else m.cfg.v6bits);
+    }
+
+    fn find(m: *const AgModel, key: AgAddr) ?usize {
+        for (m.ents[0..m.n], 0..) |e, i| if (e.key.eql(key)) return i;
+        return null;
+    }
+
+    fn remove(m: *AgModel, i: usize) void {
+        var j = i;
+        while (j + 1 < m.n) : (j += 1) m.ents[j] = m.ents[j + 1];
+        m.n -= 1;
+    }
+
+    fn insertFront(m: *AgModel, e: AgEntry) void {
+        var j = m.n;
+        while (j > 0) : (j -= 1) m.ents[j] = m.ents[j - 1];
+        m.ents[0] = e;
+        m.n += 1;
+    }
+
+    fn allowed(m: *const AgModel, ip: netaddr.Ip) bool {
+        const a = agUnmap(agRaw(ip));
+        for (m.cfg.allow) |p| if (agHas(agPrefixOf(p), a)) return true;
+        return false;
+    }
+
+    fn inPfx(m: *const AgModel, ip: netaddr.Ip) bool {
+        const a = agUnmap(agRaw(ip));
+        for (m.pfx[0..m.np]) |p| if (agHas(p, a)) return true;
+        return false;
+    }
+
+    fn drained(m: *const AgModel, e: *const AgEntry, now: u64) u64 {
+        if (m.cfg.decay_ms == 0) return 0;
+        return (now -| e.mark) / (m.cfg.decay_ms * ms);
+    }
+
+    fn isEmpty(m: *const AgModel, e: *const AgEntry, now: u64) bool {
+        return e.live == 0 and !e.banned and e.offenses == 0 and now >= e.grey_until and
+            (e.strikes -| m.drained(e, now)) == 0;
+    }
+
+    fn total(m: *const AgModel) usize {
+        var t: usize = m.untracked;
+        for (m.ents[0..m.n]) |e| t += e.live;
+        return t;
+    }
+
+    /// Touch-or-insert; index 0 afterwards, null when nothing can make room.
+    fn touch(m: *AgModel, key: AgAddr, now: u64) ?usize {
+        if (m.find(key)) |i| {
+            const e = m.ents[i];
+            m.remove(i);
+            m.insertFront(e);
+            return 0;
+        }
+        while (m.n > 0 and m.isEmpty(&m.ents[m.n - 1], now)) {
+            m.n -= 1;
+            m.reach.swept_empty += 1;
+        }
+        if (m.n >= m.cfg.max_tracked) {
+            var victim: ?usize = null;
+            var i = m.n;
+            while (i > 0) { // oldest first: no live connection, not banned
+                i -= 1;
+                if (m.ents[i].live == 0 and !m.ents[i].banned) {
+                    victim = i;
+                    break;
+                }
+            }
+            if (victim == null) {
+                i = m.n;
+                while (i > 0) { // last resort: a banned entry without live connections
+                    i -= 1;
+                    if (m.ents[i].live == 0) {
+                        victim = i;
+                        m.reach.evicted_banned_last_resort += 1;
+                        break;
+                    }
+                }
+            }
+            const v = victim orelse return null;
+            m.remove(v);
+            m.reach.evicted += 1;
+        }
+        m.insertFront(.{ .key = key, .mark = now });
+        return 0;
+    }
+
+    fn admit(m: *AgModel, ip: netaddr.Ip, now: u64) AdmitVerdict {
+        if (m.cfg.max_total) |mx| if (m.total() >= mx) return .total_cap;
+        const al = m.allowed(ip);
+        if (!al and m.inPfx(ip)) return .banned;
+        const i = m.touch(m.keyOf(ip), now) orelse switch (m.cfg.store_full) {
+            .reject => return .store_full,
+            .admit_untracked => {
+                m.untracked += 1;
+                return .admitted_untracked;
+            },
+        };
+        const e = &m.ents[i];
+        if (!al) {
+            if (e.banned) return .banned;
+            if (now < e.grey_until) return .greylisted;
+            e.grey_until = 0;
+        } else if (e.banned or now < e.grey_until or m.inPfx(ip)) {
+            m.reach.allow_overrides_verdict += 1;
+        }
+        if (m.cfg.max_per) |mx| if (e.live >= mx) return .per_ip_cap;
+        e.live += 1;
+        return .admitted;
+    }
+
+    fn closed(m: *AgModel, ip: netaddr.Ip) void {
+        if (m.find(m.keyOf(ip))) |i| if (m.ents[i].live != 0) {
+            m.ents[i].live -= 1;
+            return;
+        };
+        if (m.untracked > 0) {
+            m.untracked -= 1;
+            m.reach.close_untracked_fallback += 1;
+        } else m.reach.close_unmatched += 1;
+    }
+
+    fn closedUntracked(m: *AgModel) void {
+        if (m.untracked > 0) m.untracked -= 1;
+    }
+
+    fn reconcile(m: *AgModel, ip: netaddr.Ip, live: u32) void {
+        const i = m.find(m.keyOf(ip)) orelse return;
+        m.ents[i].live = live;
+        m.reach.reconcile_applied += 1;
+    }
+
+    fn record(m: *AgModel, ip: netaddr.Ip, w: u32, now: u64) void {
+        if (w == 0 or m.allowed(ip)) return;
+        const i = m.touch(m.keyOf(ip), now) orelse return;
+        const e = &m.ents[i];
+        const dr = m.drained(e, now);
+        if (dr > 0 and e.strikes > 0) m.reach.strikes_decayed += 1;
+        e.strikes = (e.strikes -| dr) + w;
+        // Whole strikes drain; the undrained remainder of the interval is kept.
+        e.mark = if (m.cfg.decay_ms == 0) now else e.mark + dr * m.cfg.decay_ms * ms;
+        if (e.strikes < m.cfg.threshold) return;
+        e.strikes = 0;
+        e.offenses += 1;
+        if (m.cfg.after != 0 and e.offenses >= m.cfg.after) {
+            e.banned = true;
+            e.grey_until = 0;
+            m.reach.offense_ban += 1;
+        } else {
+            e.grey_until = now + m.cfg.ttl_ms * ms;
+            m.reach.offense_greylist += 1;
+        }
+    }
+
+    fn ban(m: *AgModel, ip: netaddr.Ip, now: u64) void {
+        const i = m.touch(m.keyOf(ip), now) orelse return;
+        m.ents[i].banned = true;
+    }
+
+    fn unban(m: *AgModel, ip: netaddr.Ip) void {
+        const i = m.find(m.keyOf(ip)) orelse return;
+        const e = &m.ents[i];
+        e.banned = false;
+        e.grey_until = 0;
+        e.strikes = 0;
+        e.offenses = 0;
+        if (e.live == 0) {
+            m.remove(i);
+            m.reach.unban_removed_entry += 1;
+        }
+    }
+
+    fn greylist(m: *AgModel, ip: netaddr.Ip, ttl_ms: ?u64, now: u64) void {
+        const i = m.touch(m.keyOf(ip), now) orelse return;
+        m.ents[i].grey_until = now + (ttl_ms orelse m.cfg.ttl_ms) * ms;
+    }
+
+    fn banPrefix(m: *AgModel, p: netaddr.Prefix) error{TooManyPrefixBans}!void {
+        const c = agPrefixOf(p);
+        for (m.pfx[0..m.np]) |q| if (q.eql(c)) return;
+        if (m.np >= m.cfg.max_pfx) return error.TooManyPrefixBans;
+        m.pfx[m.np] = c;
+        m.np += 1;
+    }
+
+    fn unbanPrefix(m: *AgModel, p: netaddr.Prefix) bool {
+        const c = agPrefixOf(p);
+        for (m.pfx[0..m.np], 0..) |q, i| if (q.eql(c)) {
+            var j = i;
+            while (j + 1 < m.np) : (j += 1) m.pfx[j] = m.pfx[j + 1];
+            m.np -= 1;
+            return true;
+        };
+        return false;
+    }
+};
+
+const AgRec = struct {
+    kind: u8, // 0 range, 1 ban, 2 greylist
+    p: AgPrefix,
+    ms: u64 = 0,
+
+    fn less(_: void, x: AgRec, y: AgRec) bool {
+        if (x.kind != y.kind) return x.kind < y.kind;
+        if (x.p.a.fam != y.p.a.fam) return x.p.a.fam < y.p.a.fam;
+        const c = std.mem.order(u8, &x.p.a.b, &y.p.a.b);
+        if (c != .eq) return c == .lt;
+        if (x.p.bits != y.p.bits) return x.p.bits < y.p.bits;
+        return x.ms < y.ms;
+    }
+
+    fn eql(x: AgRec, y: AgRec) bool {
+        return x.kind == y.kind and x.p.eql(y.p) and x.ms == y.ms;
+    }
+};
+
+fn agRecOf(r: BanRecord) AgRec {
+    return .{
+        .kind = if (r.greylist_remaining_ms != null) 2 else if (r.range) 0 else 1,
+        .p = .{ .a = agRaw(r.prefix.addr), .bits = r.prefix.bits },
+        .ms = r.greylist_remaining_ms orelse 0,
+    };
+}
+
+const ag_ips = [_][]const u8{
+    "10.0.0.1",        "10.0.0.2",        "10.0.1.1",    "10.0.1.2",
+    "::ffff:10.0.0.1", "::ffff:10.0.1.1", "2001:db8::1", "2001:db8::2",
+    "2001:db8:0:1::1", "2001:db8:0:1::2",
+};
+const ag_pfx = [_][]const u8{
+    "10.0.0.0/24",         "10.0.0.1/32",   "::ffff:10.0.1.0/120", "2001:db8::/32",
+    "2001:db8:0:1::2/128", "2001:db8::/64", "10.0.1.0/24",
+};
+const ag_allow_sets = [_][]const []const u8{
+    &.{},
+    &.{"10.0.1.0/24"},
+    &.{"2001:db8:0:1::/64"},
+    &.{ "::ffff:10.0.0.0/120", "2001:db8::2/128" },
+};
+
+fn agAudit(g: *Guard, m: *const AgModel, univ: []const netaddr.Ip, now: u64) !void {
+    for (univ) |ip| {
+        const key = m.keyOf(ip);
+        const ei = m.find(key);
+        try testing.expectEqual(if (ei) |i| m.ents[i].live else 0, g.connCount(ip));
+        try testing.expectEqual(m.inPfx(ip) or (if (ei) |i| m.ents[i].banned else false), g.isBanned(ip));
+        try testing.expectEqual(if (ei) |i| now < m.ents[i].grey_until else false, g.isGreylisted(ip));
+    }
+    try testing.expectEqual(m.total(), g.totalConns());
+    try testing.expectEqual(m.untracked, g.untrackedConns());
+    try testing.expectEqual(m.n, g.trackedCount());
+}
+
+fn agSnapshotCheck(gpa: Allocator, g: *Guard, m: *const AgModel, univ: []const netaddr.Ip, clk: *TestClock, opts: Options, now: u64) !bool {
+    var want: std.ArrayList(AgRec) = .empty;
+    defer want.deinit(gpa);
+    for (m.pfx[0..m.np]) |p| try want.append(gpa, .{ .kind = 0, .p = p });
+    for (m.ents[0..m.n]) |e| {
+        const bits = if (e.key.fam == 4) m.cfg.v4bits else m.cfg.v6bits;
+        if (e.banned) try want.append(gpa, .{ .kind = 1, .p = .{ .a = e.key, .bits = bits } });
+        if (now < e.grey_until) {
+            const rem = e.grey_until - now;
+            try want.append(gpa, .{ .kind = 2, .p = .{ .a = e.key, .bits = bits }, .ms = rem / AgModel.ms + @intFromBool(rem % AgModel.ms != 0) });
+        }
+    }
+    const recs = try g.snapshot(gpa);
+    defer gpa.free(recs);
+    const got = try gpa.alloc(AgRec, recs.len);
+    defer gpa.free(got);
+    for (recs, got) |r, *o| o.* = agRecOf(r);
+    std.mem.sort(AgRec, got, {}, AgRec.less);
+    std.mem.sort(AgRec, want.items, {}, AgRec.less);
+    try testing.expectEqual(want.items.len, got.len);
+    for (want.items, got) |w, x| try testing.expect(w.eql(x));
+
+    // text -> parse is the identity on the records
+    var aw: Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try writeSnapshot(recs, &aw.writer);
+    var parsed: std.ArrayList(BanRecord) = .empty;
+    defer parsed.deinit(gpa);
+    var lines = std.mem.splitScalar(u8, aw.written(), '\n');
+    while (lines.next()) |line| if (try parseSnapshotLine(line)) |r| try parsed.append(gpa, r);
+    try testing.expectEqual(recs.len, parsed.items.len);
+    for (recs, parsed.items) |a, b| {
+        try testing.expect(a.prefix.eql(b.prefix));
+        try testing.expectEqual(a.range, b.range);
+        try testing.expectEqual(a.greylist_remaining_ms, b.greylist_remaining_ms);
+    }
+
+    // restore into a fresh guard (same options, same instant, roomy store)
+    // reproduces every ban and every live greylist
+    if (m.cfg.max_tracked < 16) return false;
+    var g2 = Guard.init(gpa, opts);
+    defer g2.deinit();
+    _ = clk;
+    try g2.restore(parsed.items);
+    for (univ) |ip| {
+        try testing.expectEqual(g.isBanned(ip), g2.isBanned(ip));
+        try testing.expectEqual(g.isGreylisted(ip), g2.isGreylisted(ip));
+    }
+    return true;
+}
+
+fn agCase(gpa: Allocator, seed: u64, reach: *AgReach) !void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+
+    var univ: [ag_ips.len]netaddr.Ip = undefined;
+    for (ag_ips, &univ) |t, *o| o.* = mkIp(t);
+    var pfx_univ: [ag_pfx.len]netaddr.Prefix = undefined;
+    for (ag_pfx, &pfx_univ) |t, *o| o.* = mkPrefix(t);
+    var allow_buf: [2]netaddr.Prefix = undefined;
+    const allow_text = ag_allow_sets[rnd.uintLessThan(usize, ag_allow_sets.len)];
+    for (allow_text, 0..) |t, i| allow_buf[i] = mkPrefix(t);
+
+    const per_c = [_]?u32{ null, 1, 2, 3, 100 };
+    const tot_c = [_]?u32{ null, null, 2, 5 };
+    const mt_c = [_]usize{ 1, 2, 3, 4, 4096 };
+    const ttl_c = [_]u64{ 3, 10, 30 };
+    const thr_c = [_]u32{ 1, 2, 3, 5 };
+    const dec_c = [_]u64{ 0, 4, 7 };
+    const after_c = [_]u32{ 0, 1, 2, 3 };
+    const cfg = AgCfg{
+        .max_per = per_c[rnd.uintLessThan(usize, per_c.len)],
+        .max_total = tot_c[rnd.uintLessThan(usize, tot_c.len)],
+        .ttl_ms = ttl_c[rnd.uintLessThan(usize, ttl_c.len)],
+        .threshold = thr_c[rnd.uintLessThan(usize, thr_c.len)],
+        .decay_ms = dec_c[rnd.uintLessThan(usize, dec_c.len)],
+        .after = after_c[rnd.uintLessThan(usize, after_c.len)],
+        .max_tracked = mt_c[rnd.uintLessThan(usize, mt_c.len)],
+        .store_full = if (rnd.boolean()) .reject else .admit_untracked,
+        .allow = allow_buf[0..allow_text.len],
+        .v6bits = if (rnd.boolean()) 64 else 128,
+        .v4bits = if (rnd.boolean()) 32 else 24,
+        .max_pfx = if (rnd.boolean()) 2 else 8,
+    };
+
+    var clk: TestClock = .{ .ns = .init(1_000_000_000 + rnd.uintLessThan(u64, 999_983)) };
+    const opts = Options{
+        .max_conns_per_ip = cfg.max_per,
+        .max_conns_total = cfg.max_total,
+        .greylist_ttl_ms = cfg.ttl_ms,
+        .ban_threshold = cfg.threshold,
+        .strike_decay_ms = cfg.decay_ms,
+        .ban_after_offenses = cfg.after,
+        .max_tracked_ips = cfg.max_tracked,
+        .on_store_full = cfg.store_full,
+        .allow = cfg.allow,
+        .ipv6_key_bits = cfg.v6bits,
+        .ipv4_key_bits = cfg.v4bits,
+        .max_prefix_bans = cfg.max_pfx,
+        .clock = clk.clock(),
+    };
+    var g = Guard.init(gpa, opts);
+    defer g.deinit();
+    var m = AgModel{ .cfg = cfg, .reach = reach };
+    var owed: [ag_ips.len]u32 = .{0} ** ag_ips.len;
+    var owed_untracked: u32 = 0;
+
+    const steps = 100 + rnd.uintLessThan(usize, 250);
+    var step: usize = 0;
+    var op: []const u8 = "";
+    errdefer std.debug.print("abuseguard model-fuzz FAILED: seed={d} step={d} op={s}\n", .{ seed, step, op });
+    while (step < steps) : (step += 1) {
+        const now = clk.ns.load(.monotonic);
+        const k = rnd.uintLessThan(usize, ag_ips.len);
+        const ip = univ[k];
+        const roll = rnd.uintLessThan(u32, 100);
+        if (roll < 34) {
+            op = "admit";
+            const want = m.admit(ip, now);
+            const got = g.admit(ip);
+            try testing.expectEqual(want, got);
+            switch (got) {
+                .admitted => {
+                    owed[k] += 1;
+                    reach.admitted += 1;
+                },
+                .admitted_untracked => {
+                    owed_untracked += 1;
+                    reach.admitted_untracked += 1;
+                },
+                .banned => if (m.inPfx(ip)) {
+                    reach.banned_range += 1;
+                } else {
+                    reach.banned_entry += 1;
+                },
+                .greylisted => reach.greylisted += 1,
+                .per_ip_cap => reach.per_ip_cap += 1,
+                .total_cap => reach.total_cap += 1,
+                .store_full => reach.store_full += 1,
+            }
+        } else if (roll < 52) {
+            op = "connClosed";
+            // mostly pair a held slot, sometimes close something nobody holds
+            var kk = k;
+            if (rnd.uintLessThan(u32, 10) != 0) for (owed, 0..) |o, i| if (o > 0) {
+                kk = i;
+                break;
+            };
+            if (owed[kk] > 0) owed[kk] -= 1;
+            m.closed(univ[kk]);
+            g.connClosed(univ[kk]);
+        } else if (roll < 56) {
+            op = "connClosedUntracked";
+            if (owed_untracked > 0) owed_untracked -= 1;
+            m.closedUntracked();
+            g.connClosedUntracked();
+        } else if (roll < 68) {
+            op = "record";
+            const wts = [_]u32{ 0, 1, 1, 2, 3 };
+            const w = wts[rnd.uintLessThan(usize, wts.len)];
+            m.record(ip, w, now);
+            g.record(ip, w);
+        } else if (roll < 72) {
+            op = "ban";
+            m.ban(ip, now);
+            g.ban(ip);
+        } else if (roll < 75) {
+            op = "unban";
+            m.unban(ip);
+            g.unban(ip);
+        } else if (roll < 79) {
+            op = "greylist";
+            const ttl: ?u64 = switch (rnd.uintLessThan(u32, 4)) {
+                0 => null,
+                1 => 0,
+                2 => 1 + rnd.uintLessThan(u64, 4),
+                else => cfg.ttl_ms,
+            };
+            m.greylist(ip, ttl, now);
+            g.greylist(ip, ttl);
+        } else if (roll < 82) {
+            op = "banPrefix";
+            const p = pfx_univ[rnd.uintLessThan(usize, pfx_univ.len)];
+            const want = m.banPrefix(p);
+            if (g.banPrefix(p)) |_| {
+                try want;
+            } else |err| {
+                try testing.expectError(error.TooManyPrefixBans, want);
+                try testing.expectEqual(error.TooManyPrefixBans, err);
+                reach.too_many_prefix_bans += 1;
+            }
+        } else if (roll < 85) {
+            op = "unbanPrefix";
+            const p = pfx_univ[rnd.uintLessThan(usize, pfx_univ.len)];
+            const want = m.unbanPrefix(p);
+            try testing.expectEqual(want, g.unbanPrefix(p));
+            if (want) reach.unban_prefix_true += 1 else reach.unban_prefix_false += 1;
+        } else if (roll < 87) {
+            op = "reconcile";
+            const live = rnd.uintLessThan(u32, 4);
+            m.reconcile(ip, live);
+            g.reconcile(ip, live);
+        } else if (roll < 96) {
+            op = "advance";
+            const dn = cfg.decay_ms * AgModel.ms;
+            const tn = cfg.ttl_ms * AgModel.ms;
+            var adv: u64 = switch (rnd.uintLessThan(u32, 8)) {
+                0 => 0,
+                1 => 1,
+                2 => AgModel.ms,
+                3 => if (dn > 0) dn - 1 + rnd.uintLessThan(u64, 3) else tn,
+                4 => tn - 1 + rnd.uintLessThan(u64, 3),
+                5 => rnd.uintLessThan(u64, 3 * tn),
+                else => 0,
+            };
+            // aim exactly at (or one ns around) a live deadline or a drain boundary
+            if (adv == 0 and m.n > 0) {
+                const e = m.ents[rnd.uintLessThan(usize, m.n)];
+                const edge: u64 = if (now < e.grey_until and rnd.boolean())
+                    e.grey_until
+                else if (dn > 0 and e.strikes > 0)
+                    e.mark + dn * (1 + rnd.uintLessThan(u64, 3))
+                else
+                    0;
+                if (edge > now) {
+                    adv = edge - now - rnd.uintLessThan(u64, 2);
+                    if (edge == e.grey_until) reach.grey_expired_at_boundary += 1;
+                }
+            }
+            _ = clk.ns.fetchAdd(adv, .monotonic);
+        } else {
+            op = "snapshot";
+            reach.snapshot_checked += 1;
+            if (try agSnapshotCheck(gpa, &g, &m, &univ, &clk, opts, now)) reach.restore_roundtrip += 1;
+        }
+        try agAudit(&g, &m, &univ, clk.ns.load(.monotonic));
+    }
+}
+
+test "model-fuzz: Guard == naive per-key reference model (300 seeds, injected clock)" {
+    const gpa = testing.allocator;
+    var reach = AgReach{};
+    var seed: u64 = 0;
+    while (seed < 300) : (seed += 1) try agCase(gpa, 0xAB05_E6A2_D000 + seed, &reach);
+    errdefer std.debug.print("abuseguard model-fuzz reach: {any}\n", .{reach});
+    inline for (std.meta.fields(AgReach)) |f| {
+        if (@field(reach, f.name) == 0) {
+            std.debug.print("abuseguard model-fuzz: reach class never hit: {s}\n", .{f.name});
+            return error.ReachClassMissed;
+        }
+    }
+}
