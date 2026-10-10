@@ -105,7 +105,9 @@ fn reloadVolatile(s: *const [32]u8) [32]u8 {
 ///   `opaque` and `bulletproofs` take, which no target measured).
 /// `msm` — `mulMultiRistretto` over 9 terms (one full chunk of 8 plus one),
 ///   every scalar derived from the tainted secret, public runtime points
-///   (audit `bulletproofs` B9: the prove-side MSM).
+///   (audit `bulletproofs` B9: the prove-side MSM); then `mulMulti` over the
+///   same scalars and the points' Edwards representatives (2026-10-10), its
+///   result printed as `edwards=` so the witness covers both.
 /// `x25519` — `X25519.recoverPublicKey`: the comb plus the Edwards→Montgomery
 ///   map (one `Fe.invert`), the tainted seed as the secret key; THEN
 ///   `X25519.scalarmult` of the same tainted key against a public peer key
@@ -220,6 +222,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
             const q = ct25519.mulMultiRistretto(&scalars, &points);
             out_bytes = q.toBytes();
+            var epoints: [9]ct25519.Edwards25519 = undefined;
+            for (&epoints, points) |*e, r| e.* = r.p;
+            const qe = ct25519.mulMulti(&scalars, &epoints);
+            std.debug.print("edwards={x}\n", .{qe.toBytes()});
         },
         .std_mul => {
             if (Ristretto255.basePoint.mul(sec)) |q| {

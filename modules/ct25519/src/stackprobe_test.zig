@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack residue probe for the secret-scalar paths: `mul`, `mulBase`,
-//! `mulRistretto`, `mulRistrettoBase`, `mulMultiRistretto` and X25519
+//! `mulRistretto`, `mulRistrettoBase`, `mulMultiRistretto`, `mulMulti` and X25519
 //! (`scalarmult`, `recoverPublicKey`). Kept in the module per
 //! `CONVENTIONS.md` §9. Engine and method as `ed448`'s `stackprobe_test.zig`:
 //! paint, call, scan every 16-byte window of every secret image (the scalar
@@ -257,6 +257,7 @@ var cur_peer: [32]u8 = undefined;
 var x_shared: [32]u8 = undefined;
 var msm_scalars: [2][32]u8 = undefined;
 var msm_points: [2]ct.Ristretto255 = undefined;
+var msm_epoints: [2]ct.Edwards25519 = undefined;
 
 noinline fn callMul() void {
     const q = ct.mul(cur_p, cur_s);
@@ -279,6 +280,12 @@ noinline fn callMulMulti() void {
     msm_scalars = .{ cur_s, cur_s2 };
     msm_points = .{ cur_r, ct.Ristretto255.basePoint };
     const q = ct.mulMultiRistretto(&msm_scalars, &msm_points);
+    std.mem.doNotOptimizeAway(&q);
+}
+noinline fn callMulMultiEdwards() void {
+    msm_scalars = .{ cur_s, cur_s2 };
+    msm_epoints = .{ cur_p, ct.Edwards25519.basePoint };
+    const q = ct.mulMulti(&msm_scalars, &msm_epoints);
     std.mem.doNotOptimizeAway(&q);
 }
 noinline fn callX25519() void {
@@ -317,6 +324,7 @@ test "STACKPROBE: no scalar or shared-secret residue on the dead stack after the
             .{ .name = "mulRistretto", .f = callMulRistretto },
             .{ .name = "mulRistrettoBase", .f = callMulRistrettoBase },
             .{ .name = "mulMultiRistretto", .f = callMulMulti },
+            .{ .name = "mulMulti", .f = callMulMultiEdwards },
             .{ .name = "X25519.recoverPublicKey", .f = callX25519Public },
         };
         for (calls) |c| bad += try runProbe(c.name, c.f, &n);

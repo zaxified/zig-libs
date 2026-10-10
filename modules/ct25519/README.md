@@ -31,7 +31,9 @@ union std's rejection would force on the caller, not raw speed.
 points)` — `Σ s_i·P_i` for secret scalars by Straus's interleaving: one shared
 chain of doublings instead of one ladder per term, constant-time in every
 scalar, the same group element as summing `mulRistretto` (since 2026-09-16,
-audit `bulletproofs` B9; SPEC.md § B9).
+audit `bulletproofs` B9; SPEC.md § B9). `mulMulti(scalars, points)` is the same
+on raw `Edwards25519` points (since 2026-10-10), equal to summing `mul`,
+torsion components included — std's `Edwards25519.mulMulti` is variable-time.
 
 **`X25519`** — `std.crypto.dh.X25519`'s shape (`KeyPair.generateDeterministic`/`generate`, `recoverPublicKey`, `scalarmult`, the lengths) with key generation on the comb plus the Edwards→Montgomery map, 2.36× std's ladder (21.8 vs 51.6 µs). Bit-exact with std (RFC 7748 §6.1 vectors, 512-seed differential); ctgrind target `x25519`. SPEC.md § "X25519 key generation on the comb".
 Since 2026-09-29 `scalarmult` (the shared secret) runs the RFC 7748 ladder on a 4×64-bit field in x86-64 `mulx` (BMI2) / `adcx`+`adox` (ADX) inline assembly when the build target has those features and the backend is LLVM — chosen at compile time, std's ladder otherwise — 1.16–1.23× std's ladder in ReleaseFast (≈ 44–47 vs 54–57 µs, both asm paths). Same signature and bytes as std's, `error.IdentityElement` included; held to std over RFC 7748 §5.2/§6.1, thousands of random and edge inputs per backend, and a field-level `u512` differential; the ctgrind `x25519` target now covers it (0 contexts in the module, positive controls fire). SPEC.md § P6.

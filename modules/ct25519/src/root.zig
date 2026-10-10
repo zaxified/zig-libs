@@ -1175,28 +1175,49 @@ const msm_chunk = 8;
 /// Burned (`burn.zig`): the Straus pass left every scalar on the dead stack
 /// (`stackprobe_test.zig`, 2026-10-08).
 pub fn mulMultiRistretto(scalars: []const [32]u8, points: []const Ristretto255) Ristretto255 {
-    const r = mulMultiRistrettoUnburned(scalars, points);
+    const r = mulMultiUnburned(Ristretto255, scalars, points);
+    burn.stack(burn.msm_burn);
+    return .{ .p = r };
+}
+
+/// `Σ scalars[i]·points[i]` over Edwards25519, **constant-time in every
+/// scalar** and total: `mulMultiRistretto` on raw curve points, for protocols
+/// with secret scalars on Edwards25519 itself (FROST-style signing shares,
+/// adaptor signatures) that would otherwise loop `mul` and sum. Each scalar is
+/// used as-is, all 256 bits, and the result is the same point as the sum of
+/// the `mul` products — torsion components included, since nothing reduces
+/// or clears the cofactor. Points are not validated; `scalars.len` must equal
+/// `points.len` (a mismatch panics, as in `mulMultiRistretto`). Burned, as
+/// `mulMultiRistretto` is. (std's `Edwards25519.mulMulti` is variable-time,
+/// "for public data".)
+pub fn mulMulti(scalars: []const [32]u8, points: []const Edwards25519) Edwards25519 {
+    const r = mulMultiUnburned(Edwards25519, scalars, points);
     burn.stack(burn.msm_burn);
     return r;
 }
 
-noinline fn mulMultiRistrettoUnburned(scalars: []const [32]u8, points: []const Ristretto255) Ristretto255 {
-    if (scalars.len != points.len) @panic("ct25519.mulMultiRistretto: scalars.len != points.len");
+noinline fn mulMultiUnburned(comptime P: type, scalars: []const [32]u8, points: []const P) Edwards25519 {
+    if (scalars.len != points.len) @panic(if (P == Ristretto255)
+        "ct25519.mulMultiRistretto: scalars.len != points.len"
+    else
+        "ct25519.mulMulti: scalars.len != points.len");
     var total = Edwards25519.identityElement;
     var start: usize = 0;
     while (start < scalars.len) {
         const k = @min(msm_chunk, scalars.len - start);
-        total = total.add(strausChunk(scalars[start..][0..k], points[start..][0..k]));
+        total = total.add(strausChunk(P, scalars[start..][0..k], points[start..][0..k]));
         start += k;
     }
-    return .{ .p = total };
+    return total;
 }
 
-/// One Straus pass over at most `msm_chunk` terms.
-fn strausChunk(scalars: []const [32]u8, points: []const Ristretto255) Edwards25519 {
+/// One Straus pass over at most `msm_chunk` terms; `P` is `Edwards25519` or
+/// `Ristretto255` (whose `.p` is the Edwards representative).
+fn strausChunk(comptime P: type, scalars: []const [32]u8, points: []const P) Edwards25519 {
     var tabs: [msm_chunk][16]Edwards25519 = undefined;
-    for (tabs[0..points.len], points) |*t, p| {
-        t.* = if (p.p.is_base) base_pc else precompute(p.p); // branch on a PUBLIC flag
+    for (tabs[0..points.len], points) |*t, pt| {
+        const p: Edwards25519 = if (P == Ristretto255) pt.p else pt;
+        t.* = if (p.is_base) base_pc else precompute(p); // branch on a PUBLIC flag
     }
     var q = Edwards25519.identityElement;
     var pos: usize = 252;
@@ -1615,6 +1636,87 @@ test "B9 mulMultiRistretto: one term equals mulRistretto; zero terms are the ide
         try testing.expectEqualSlices(u8, &mulRistretto(p, s).toBytes(), &mulMultiRistretto(&.{s}, &.{p}).toBytes());
     }
     const ret = @typeInfo(@TypeOf(mulMultiRistretto)).@"fn".return_type.?;
+    try testing.expect(@typeInfo(ret) != .error_union);
+}
+
+test "mulMulti (Edwards): bit-exact vs the per-term mul sum, torsion points included, across every chunk boundary" {
+    const debug = @import("builtin").mode == .Debug;
+    const sizes = [_]usize{ 0, 1, 2, 7, 8, 9, 16, 17, 33 };
+    const trials: usize = if (debug) 2 else 30;
+    var prng = std.Random.DefaultPrng.init(0xED_5_7A_05);
+    const random = prng.random();
+    // Low-order points: (0, -1) of order 2 and (√−1, 0) of order 4. Ristretto
+    // hides them; on the raw curve they are a valid input, and the product
+    // must carry their component exactly as `mul` does.
+    var y_minus_one: [32]u8 = @splat(0xff);
+    y_minus_one[0] = 0xec;
+    y_minus_one[31] = 0x7f;
+    const t2 = try Edwards25519.fromBytes(y_minus_one);
+    const t4 = try Edwards25519.fromBytes(@splat(0));
+    var scalars: [33][32]u8 = undefined;
+    var points: [33]Edwards25519 = undefined;
+    var compared: usize = 0;
+    for (sizes) |n| {
+        if (debug and n > 17) continue;
+        for (0..trials) |trial| {
+            for (0..n) |i| {
+                random.bytes(&scalars[i]);
+                if ((i + trial) % 3 == 1) scalars[i] = scalar.reduce(scalars[i]);
+                if ((i + trial) % 5 == 2) scalars[i] = edgeScalar(i + trial);
+                var k: [64]u8 = undefined;
+                random.bytes(&k);
+                const r = mulBase(scalar.reduce64(k));
+                points[i] = switch ((i + 2 * trial) % 7) {
+                    0 => Edwards25519.basePoint,
+                    1 => Edwards25519.identityElement,
+                    2 => try Edwards25519.fromBytes(Edwards25519.basePoint.toBytes()),
+                    3 => r.add(t2),
+                    4 => r.add(t4),
+                    else => r,
+                };
+            }
+            var want = Edwards25519.identityElement;
+            for (scalars[0..n], points[0..n]) |sc, pt| want = want.add(mul(pt, sc));
+            const got = mulMulti(scalars[0..n], points[0..n]);
+            try testing.expectEqualSlices(u8, &want.toBytes(), &got.toBytes());
+            compared += 1;
+        }
+    }
+    try testing.expect(compared >= if (debug) 14 else 270);
+}
+
+test "mulMulti (Edwards): bit-exact vs std's variable-time Edwards25519.mulMulti on public data" {
+    // std's MSM is an independent implementation (its own tables and
+    // windowing, variable-time); on prime-order points and reduced scalars,
+    // where it raises no error, the two must give the same point.
+    var prng = std.Random.DefaultPrng.init(0x57D_3D);
+    const random = prng.random();
+    inline for (.{ 1, 2, 3, 5, 9 }) |n| {
+        for (0..8) |_| {
+            var ss: [n][32]u8 = undefined;
+            var ps: [n]Edwards25519 = undefined;
+            for (&ss, &ps) |*sc, *pt| {
+                var k: [64]u8 = undefined;
+                random.bytes(&k);
+                sc.* = scalar.reduce64(k);
+                random.bytes(&k);
+                pt.* = mulBase(scalar.reduce64(k));
+            }
+            const want = try Edwards25519.mulMulti(n, ps, ss);
+            try testing.expectEqualSlices(u8, &want.toBytes(), &mulMulti(&ss, &ps).toBytes());
+        }
+    }
+}
+
+test "mulMulti (Edwards): one term equals mul; zero terms are the identity; no error set" {
+    const id_bytes = Edwards25519.identityElement.toBytes();
+    try testing.expectEqualSlices(u8, &id_bytes, &mulMulti(&.{}, &.{}).toBytes());
+    const p = try Edwards25519.fromBytes(Edwards25519.basePoint.toBytes());
+    for (0..6) |i| {
+        const s = edgeScalar(i);
+        try testing.expectEqualSlices(u8, &mul(p, s).toBytes(), &mulMulti(&.{s}, &.{p}).toBytes());
+    }
+    const ret = @typeInfo(@TypeOf(mulMulti)).@"fn".return_type.?;
     try testing.expect(@typeInfo(ret) != .error_union);
 }
 
