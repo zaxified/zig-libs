@@ -1581,7 +1581,7 @@ cmd_changed() {
     [[ -n "${closure// /}" ]] && mc=1
     [[ $mc -eq 1 || -n "${seeds// /}" || -n "${docs_only// /}" ]] && mt=1
     closure_has() { case " $closure " in *" $1 "*) return 0 ;; esac; return 1; }
-    stamps_narrow "$closure" "$lane_mods"
+    stamps_narrow "$closure" "$(lane_modules)"  # the WHOLE lane: a split half must still narrow
     # The modules a comment- or prose-reading scan must look at: the unproven
     # ones plus every module the diff touched, docs included (a comment edit
     # re-keys nothing, and fuzz-reach exemptions and NOTICE files are prose).
@@ -2191,7 +2191,7 @@ cmd_modules() {
         summary
         return 0
     fi
-    stamps_narrow "$todo" "$lane_mods"
+    stamps_narrow "$todo" "$(lane_modules)"  # the WHOLE lane: a split half must still narrow
     CAP_MODS="$todo" capability_check
     step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
     step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
@@ -2218,7 +2218,7 @@ cmd_examples() {
         summary
         return 0
     fi
-    stamps_narrow "$todo" "$lane_mods"
+    stamps_narrow "$todo" "$(lane_modules)"  # the WHOLE lane: a split half must still narrow
     CAP_MODS="$todo" capability_check
     step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
     run_examples_for "$todo"
@@ -2252,7 +2252,7 @@ cmd_build() {
     set_extra_args "$@"
     graph_load
     local lane_mods todo lane
-    lane_mods="$(lane_modules)"
+    lane_mods="$(split_modules "$(lane_modules)")"
     lane="$(stamps_lane_key build)"
     fp_load   # here, in THIS shell: see stamps_record
     todo="$(stamps_pending "$lane_mods" "$lane")"
@@ -2264,7 +2264,7 @@ cmd_build() {
         summary
         return 0
     fi
-    stamps_narrow "$todo" "$lane_mods"
+    stamps_narrow "$todo" "$(lane_modules)"  # the WHOLE lane: a split half must still narrow
     step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
     step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
     # This lane runs no test, so there is no `--summary all` to digest and

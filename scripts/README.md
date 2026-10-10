@@ -509,7 +509,16 @@ that second build became 19 minutes of a 51-minute push run, so it is off unless
 full lane runs every probe on a tag or dispatch. After touching a module with a
 probe, run `scripts/modtest <m> -Doptimize=ReleaseFast` yourself.
 
-**The push lane's budget (owner, 2026-10-10): ≤ 5 minutes.** Push runs had grown
+**What a push is for (owner, 2026-10-10): a consistency check in ≤ 5 minutes —
+everything else belongs to the tag.** CI's push lane runs `test.sh checks-fast`
+(fmt, catalog and its tables incl. the grade gate, changelog, package, licences,
+~16 s) and `test.sh build` (every module of its shard with no green `build` stamp
+compiled with its test binary and example, running nothing), and compiles the
+example apps without running them. Module tests, running examples and apps, the
+optimized modes, arm64, interop, ctgrind and the wide checks run on a tag or
+`workflow_dispatch`. Locally: `scripts/modtest <m>` for what you touched.
+
+**`changed`, when you run it yourself, keeps its own budget knobs.** Push runs had grown
 to 37–105 minutes. What keeps `changed` inside it:
 `fingerprint_exempt` (a repo check's code is not machinery, so editing one
 re-keys nothing — `fingerprint-exempt.py`); whole-tree checks only with

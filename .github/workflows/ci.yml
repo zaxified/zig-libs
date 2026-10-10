@@ -378,16 +378,8 @@ jobs:
       # missing skips its live tests. Since 2026-09-18 such a module is never
       # stamped (capability_check records the gap), so a failed install here
       # costs a re-run next time rather than a green that lasts.
-      - name: Close the environment gaps the gate reports
-        if: env.ZIGLIBS_DRY_RUN != '1'
-        continue-on-error: true
-        # `tests`, not `all`: this job runs `test.sh changed`, which runs tests
-        # and examples and never `interop-*`. Since 2026-09-06 the wolfSSL and
-        # five-Python-oracle half of that script serves ONLY `zig build
-        # interop-<m>` -- the six migrated modules replay committed transcripts
-        # and pass on a host with no compiler and no Python -- so installing it
-        # here bought the lane that gates every push nothing at all.
-        run: bash scripts/lib/ci-environment.sh tests
+      # No peer install (2026-10-10): the push lane runs nothing that talks to
+      # a peer -- it checks consistency and compiles (see the step below).
       # The base differs by event, and a base that does not resolve is NOT
       # allowed to read as "nothing changed": `changed_files` fails and the
       # driver runs `all` rather than passing having tested nothing.
@@ -427,50 +419,27 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/stamps"
           bash scripts/lib/ci-stamps.sh fetch ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-scoped-${{ matrix.shard }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
-      - name: Test changed modules
+      # ⭐ WHAT A PUSH IS FOR (owner, 2026-10-10): within 5 minutes, say whether
+      # this commit is consistent and builds -- nothing else. Everything beyond
+      # a quick consistency check belongs to the tag: module tests, examples
+      # and apps RUN, ReleaseSafe/Fast, arm64, interop, ctgrind, the wide
+      # checks. So: the sub-second consistency gates (catalog, changelog,
+      # package, licences, the grade gate), then `test.sh build` -- every
+      # module of this shard with no green `build` stamp, compiled with its
+      # test binary (so every function body is analysed) and its example,
+      # running NOTHING. Before this the step was `test.sh changed` (tests of
+      # the whole dependency closure), and pushes took 37-105 minutes.
+      - name: Check consistency and compile
         env:
           ZIGLIBS_LANE: changed modules [${{ matrix.shard }}]
           ZIGLIBS_SPLIT: ${{ matrix.split }}
           ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
-          GH_TOKEN: ${{ github.token }}
         run: |
-          # Same as the `full` job: the imap peer is found at its default path,
-          # the opcua one is named by an environment variable.
-          export OPCUA_PYTHON="$HOME/.cache/zig-libs-opcua/bin/python3"
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="origin/${{ github.base_ref }}"
-          else
-            # ⭐ FROM THE LAST GREEN PUSH, NOT FROM THE PREVIOUS ONE (2026-09-18).
-            # `github.event.before` is the previous push, green or not: push A
-            # breaks X and goes red, push B touches only Y, B tests only Y and
-            # goes green with X still broken. Diffing from the last commit whose
-            # run PASSED covers every commit since, A's included. Same idea as
-            # `nrwl/nx-set-shas`. If the lookup fails, or names a commit this
-            # clone does not have, the base is the root commit (see below).
-            base=$(gh run list --repo "${{ github.repository }}" --workflow ci.yml \
-              --branch main --event push --status success --limit 1 \
-              --json headSha --jq '.[0].headSha' 2>/dev/null || true)
-            if [ -z "$base" ] || ! git rev-parse -q --verify "$base^{commit}" >/dev/null; then
-              # Fail CLOSED (audit 2026-09-18): falling back to the previous
-              # push reopened the very hole this lookup closes -- a README
-              # broken by a red push A, out of push B's diff, never re-checked.
-              # The root commit puts every file in the diff, so every check
-              # runs; module selection is still by stamps, so this costs the
-              # checks, not the matrix.
-              base="$(git rev-list --max-parents=0 HEAD | tail -1)"
-              echo "::warning::no usable green push run on main -- diffing from the root commit, every check runs"
-            fi
-            echo "base: $base (last green push on main)"
-          fi
-          # A pinned CPU level: GitHub's amd64 pool mixes at least four CPU
-          # models (znver3, znver4, emeraldrapids, ...), and with `native`
-          # every change would have to go green once per model before its
-          # stamp holds. x86_64_v3 (AVX2, BMI2) is on all of them; the full
-          # lanes pin the same level plus `adx`, which is what turns on the
-          # k256/p256/montint asm cores (see the lane table).
-          # +aes+pclmul because no psABI level carries them: plain v3 would
-          # test only the software AES/GHASH that no deployed build runs.
-          bash scripts/test.sh changed "$base" -Dcpu=x86_64_v3+aes+pclmul ${{ matrix.groups }}
+          bash scripts/test.sh checks-fast
+          # A pinned CPU level: GitHub's amd64 pool mixes CPU models, and with
+          # `native` every change would have to go green once per model before
+          # its stamp holds. +aes+pclmul because no psABI level carries them.
+          bash scripts/test.sh build -Dcpu=x86_64_v3+aes+pclmul ${{ matrix.groups }}
       - name: Decide whether the build tree grew
         id: zsave
         if: success() && env.ZIGLIBS_DRY_RUN != '1' && steps.zcache.outputs.cache-hit != 'true'
@@ -1236,7 +1205,9 @@ jobs:
           if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
             bash scripts/check-apps.sh --run
           else
-            bash scripts/check-apps.sh --run --stamps -Dcpu=x86_64_v3+aes+pclmul
+            # A push only compiles the apps (owner 2026-10-10: a push checks
+            # consistency; running belongs to the tag, which runs every app).
+            bash scripts/check-apps.sh --stamps -Dcpu=x86_64_v3+aes+pclmul
           fi
       - name: Keep the apps' stamps
         if: success() && env.ZIGLIBS_DRY_RUN != '1' && github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
