@@ -122,6 +122,7 @@ test {
     _ = pairing;
     _ = precompiles;
     _ = groth16;
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta.model_after names BN254/alt-bn128" {

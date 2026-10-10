@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `AESCBC_FUZZ` (testkit) over CBC (AES-128/256 round trip, the exact effect of a flipped ciphertext bit, misaligned/short-output refused) and PKCS#7 / XML-Enc unpadding against a branching reference. No change to the library code.
 - **2026-10-09** — **BREAKING:** `encrypt` and `decrypt` take the key by pointer
   (`key: *const [Aes.key_bits / 8]u8`, was by value): a by-value key is a copy in the caller's frame
   that the module cannot wipe. Both now run under a 4 KiB dead-stack burn (`src/burn.zig`, per

@@ -1241,6 +1241,7 @@ test {
     _ = @import("bssl_w0w1_vectors.zig");
     _ = @import("bssl_w0w1_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta.model_after names RFC 9383 / SPAKE2+ (not RFC 9382 / plain SPAKE2)" {
@@ -1343,12 +1344,20 @@ const share_seeds = [_][]const u8{
     seedHex("04"), // a bare uncompressed tag
 };
 
-fn fuzzShareDecode(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const ShareMark = fz.Marker(enum { parsed, refused, finish_invalid_share, finish_mismatch });
+const ExchangeMark = fz.Marker(enum { genuine_accepted, tampered_refused, wrong_password_refused });
+
+fn fuzzShareDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzShareDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzShareDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // ⚠ ONE byte-first draw. Never `value`/`valueRangeAtMost` before the
-    // bytes, and never `bytes` followed by a ranged length — see the block
+    // bytes, and never `bytes` followed by a ranged length -- see the block
     // comment above for what that cost this target.
     var buf: [share_length]u8 = undefined;
-    const n: usize = smith.slice(&buf);
+    const n: usize = fz.drawInput(S, src, &buf, &share_seeds);
     // The entry points take `[share_length]u8`, so a short draw is padded
     // exactly the way a short wire read would have to be handled.
     var share: [share_length]u8 = [_]u8{0} ** share_length;
@@ -1357,7 +1366,8 @@ fn fuzzShareDecode(_: void, smith: *std.testing.Smith) !void {
     // The bare decode boundary.
     if (P256.fromSec1(&share)) |point| {
         point.rejectIdentity() catch {};
-    } else |_| {}
+        ShareMark.mark(.parsed);
+    } else |_| ShareMark.mark(.refused);
 
     // And the real entry point behind it: parse, RFC 9383 §6 group check,
     // then the secret-touching arithmetic and the transcript allocation.
@@ -1365,7 +1375,7 @@ fn fuzzShareDecode(_: void, smith: *std.testing.Smith) !void {
     var res: ProverFinishResult = undefined;
     if (proverFinish(
         &res,
-        std.testing.allocator,
+        gpa,
         "fuzz",
         "p",
         "v",
@@ -1376,11 +1386,128 @@ fn fuzzShareDecode(_: void, smith: *std.testing.Smith) !void {
         share,
         [_]u8{0} ** hash_length,
     )) {
-        freeTranscript(std.testing.allocator, res.tt);
-    } else |_| {}
+        // Unreachable in practice (a zero confirmation): the MAC would have
+        // to be all zero. Free anyway, and say so.
+        freeTranscript(gpa, res.tt);
+        return error.ZeroConfirmationAccepted;
+    } else |e| switch (e) {
+        error.InvalidShareV => ShareMark.mark(.finish_invalid_share),
+        error.ConfirmationMismatch => ShareMark.mark(.finish_mismatch),
+        else => {},
+    }
 }
+
 test "fuzz the share-decode boundary and the entry point behind it" {
-    try std.testing.fuzz({}, fuzzShareDecode, .{ .corpus = &share_seeds });
+    try std.testing.fuzz({}, fuzzShareDecodeSmith, .{ .corpus = &share_seeds });
+}
+
+test "fuzz driver: SPAKE2PLUS_FUZZ (share)" {
+    try fz.fuzz_driver.run(fuzzShareDecode, .{ .prefix = "SPAKE2PLUS_FUZZ", .name = "spake2plus-share" });
+}
+
+test "fuzz harness: share, 300 seeds, reaches every outcome" {
+    try ShareMark.reach(fuzzShareDecode, "spake2plus-share", 300);
+}
+
+test "fuzz: a genuine SPAKE2+ exchange completes and every tampered one is refused" {
+    try std.testing.fuzz({}, fuzzExchangeSmith, .{});
+}
+
+test "fuzz driver: SPAKE2PLUS_FUZZ (exchange)" {
+    try fz.fuzz_driver.run(fuzzExchange, .{ .prefix = "SPAKE2PLUS_FUZZ", .name = "spake2plus-exchange", .scale = 20 });
+}
+
+test "fuzz harness: exchange, 40 seeds, reaches every outcome" {
+    try ExchangeMark.reach(fuzzExchange, "spake2plus-exchange", 40);
+}
+
+fn fuzzExchangeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzExchange(std.testing.Smith, smith, std.testing.allocator);
+}
+
+/// The oracle the decoder's harness cannot be: with the same password both
+/// sides finish with equal `K_shared` and each accepts the other's
+/// confirmation; with one flipped bit in either confirmation MAC, either
+/// share, or the password, neither side accepts.
+fn fuzzExchange(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [112]u8 = undefined;
+    const n: usize = src.slice(&raw);
+    var k: @import("testkit").fuzz.Cursor = .{ .bytes = raw[0..n] };
+    var pbkdf: [80]u8 = undefined;
+    for (&pbkdf) |*b| b.* = k.byte();
+    var x: [scalar_length]u8 = undefined;
+    var y: [scalar_length]u8 = undefined;
+    for (&x) |*b| b.* = k.byte();
+    for (&y) |*b| b.* = k.byte();
+    // Keep the scalars inside the group order's top byte so almost all draws are in range.
+    x[0] &= 0x7f;
+    y[0] &= 0x7f;
+    var w: W0W1 = undefined;
+    computeW0W1(&w, &pbkdf) catch return;
+    const l = computeL(&w.w1) catch return;
+    const share_p = proverStart(&x, &w.w0) catch return error.InRangeScalarRefused;
+    const share_v = verifierStart(&y, &w.w0) catch return error.InRangeScalarRefused;
+
+    const ctx = "fuzz";
+    const confirm_v = (try verifierConfirm(gpa, ctx, "p", "v", &w.w0, l, &y, share_p, share_v)).confirm_v;
+    var pr: ProverFinishResult = undefined;
+    proverFinish(&pr, gpa, ctx, "p", "v", &w.w0, &w.w1, &x, share_p, share_v, confirm_v) catch return error.GenuineConfirmationRefused;
+    defer freeTranscript(gpa, pr.tt);
+    var vr: VerifierFinishResult = undefined;
+    verifierFinish(&vr, gpa, ctx, "p", "v", &w.w0, l, &y, share_p, share_v, pr.confirm_p) catch return error.GenuineConfirmationRefused;
+    defer freeTranscript(gpa, vr.tt);
+    if (!std.mem.eql(u8, &pr.k_shared, &vr.k_shared)) return error.SharedSecretsDiffer;
+    if (!std.mem.eql(u8, &confirm_v, &vr.confirm_v)) return error.ConfirmVDiffers;
+    ExchangeMark.mark(.genuine_accepted);
+
+    // One flipped bit in a confirmation MAC.
+    const bit = @as(u8, 1) << @intCast(k.ranged(0, 7));
+    const at = k.ranged(0, hash_length - 1);
+    var pr2: ProverFinishResult = undefined;
+    var bad_v = confirm_v;
+    bad_v[at] ^= bit;
+    if (proverFinish(&pr2, gpa, ctx, "p", "v", &w.w0, &w.w1, &x, share_p, share_v, bad_v)) {
+        freeTranscript(gpa, pr2.tt);
+        return error.TamperedConfirmVAccepted;
+    } else |_| {}
+    var bad_p = pr.confirm_p;
+    bad_p[at] ^= bit;
+    var vr2: VerifierFinishResult = undefined;
+    if (verifierFinish(&vr2, gpa, ctx, "p", "v", &w.w0, l, &y, share_p, share_v, bad_p)) {
+        freeTranscript(gpa, vr2.tt);
+        return error.TamperedConfirmPAccepted;
+    } else |_| {}
+
+    // One flipped bit in a share: it either stops being a point or changes the transcript.
+    var bad_share = share_v;
+    bad_share[k.ranged(1, share_length - 1)] ^= bit;
+    if (proverFinish(&pr2, gpa, ctx, "p", "v", &w.w0, &w.w1, &x, share_p, bad_share, confirm_v)) {
+        freeTranscript(gpa, pr2.tt);
+        return error.TamperedShareVAccepted;
+    } else |_| {}
+    bad_share = share_p;
+    bad_share[k.ranged(1, share_length - 1)] ^= bit;
+    if (verifierFinish(&vr2, gpa, ctx, "p", "v", &w.w0, l, &y, bad_share, share_v, vr.confirm_v)) {
+        freeTranscript(gpa, vr2.tt);
+        return error.TamperedSharePAccepted;
+    } else |_| {}
+    // Another context string / identity binds into the transcript too.
+    if (proverFinish(&pr2, gpa, "fuzZ", "p", "v", &w.w0, &w.w1, &x, share_p, share_v, confirm_v)) {
+        freeTranscript(gpa, pr2.tt);
+        return error.OtherContextAccepted;
+    } else |_| {}
+    ExchangeMark.mark(.tampered_refused);
+
+    // A wrong password on the Prover's side.
+    var other_pbkdf = pbkdf;
+    other_pbkdf[k.ranged(0, 79)] ^= bit;
+    var w2: W0W1 = undefined;
+    computeW0W1(&w2, &other_pbkdf) catch return;
+    if (proverFinish(&pr2, gpa, ctx, "p", "v", &w2.w0, &w2.w1, &x, share_p, share_v, confirm_v)) {
+        freeTranscript(gpa, pr2.tt);
+        return error.WrongPasswordAccepted;
+    } else |_| {}
+    ExchangeMark.mark(.wrong_password_refused);
 }
 
 test "corpus: every share seed reaches fromSec1, and the points parsed are pinned" {

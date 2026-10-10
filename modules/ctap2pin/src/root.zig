@@ -541,11 +541,56 @@ test {
 
 // ── fuzz: untrusted-wire decoders never panic/OOB on arbitrary bytes ──────
 
-fn fuzzPublicKeyToPoint(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const ToPointMark = fz.Marker(enum { accepted, refused, canonical, flipped_refused });
+const DecryptMark = fz.Marker(enum { bad_length, decrypted, genuine_roundtrip });
+const ProtocolMark = fz.Marker(enum { secrets_agree, roundtrip, mac_ok, tampered_refused, wrong_key_refused });
+
+fn fuzzPublicKeyToPointSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPublicKeyToPoint(std.testing.Smith, smith, std.testing.allocator);
+}
+
+/// 64 octets for a coordinate pair. Under `Smith` exactly `smith.bytes`; under
+/// the driver half the draws are a genuine public key (random scalar) or the
+/// base point, with 0-3 octets damaged.
+fn drawPoint(comptime S: type, src: *S, buf: *[64]u8) void {
+    if (S != fz.fuzz_driver.Rng or !src.value(bool)) {
+        src.bytes(buf);
+        return;
+    }
+    var scalar: [32]u8 = undefined;
+    src.bytes(&scalar);
+    scalar[0] &= 0x7f;
+    const pk = publicKeyFromScalar(&scalar) catch {
+        buf.* = to_point_seeds[0][0..64].*;
+        return;
+    };
+    var full: [64]u8 = undefined;
+    full[0..32].* = pk.x;
+    full[32..64].* = pk.y;
+    @memset(buf, 0); // a truncation leaves zeroes behind
+    _ = fz.damage(src, buf, &full);
+}
+
+fn fuzzPublicKeyToPoint(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var buf: [64]u8 = undefined;
-    smith.bytes(&buf);
+    drawPoint(S, src, &buf);
     const pk = PublicKey{ .x = buf[0..32].*, .y = buf[32..64].* };
-    _ = pk.toPoint() catch return;
+    const p = pk.toPoint() catch {
+        ToPointMark.mark(.refused);
+        return;
+    };
+    ToPointMark.mark(.accepted);
+    // Canonical: an accepted point re-encodes to the very coordinates it came from.
+    const aff = p.affineCoordinates();
+    if (!std.mem.eql(u8, &aff.x.toBytes(.big), &pk.x) or !std.mem.eql(u8, &aff.y.toBytes(.big), &pk.y)) return error.AcceptedPointNotCanonical;
+    ToPointMark.mark(.canonical);
+    // One flipped bit of an accepted point leaves the curve.
+    var flipped = buf;
+    flipped[(buf[0] +% buf[63]) % 64] ^= @as(u8, 1) << @intCast(buf[31] % 8);
+    const pk2 = PublicKey{ .x = flipped[0..32].*, .y = flipped[32..64].* };
+    if (pk2.toPoint()) |_| return error.FlippedPointAccepted else |_| {}
+    ToPointMark.mark(.flipped_refused);
 }
 
 /// ⛔ Audit finding I1 (2026-09-05): `smith.bytes(&buf)` draws 64 UNIFORM
@@ -570,7 +615,15 @@ const to_point_seeds = [_][]const u8{
 };
 
 test "fuzz PublicKey.toPoint never panics" {
-    try std.testing.fuzz({}, fuzzPublicKeyToPoint, .{ .corpus = &to_point_seeds });
+    try std.testing.fuzz({}, fuzzPublicKeyToPointSmith, .{ .corpus = &to_point_seeds });
+}
+
+test "fuzz driver: CTAP2PIN_FUZZ (toPoint)" {
+    try fz.fuzz_driver.run(fuzzPublicKeyToPoint, .{ .prefix = "CTAP2PIN_FUZZ", .name = "ctap2pin-topoint" });
+}
+
+test "fuzz harness: toPoint, 300 seeds, reaches every outcome" {
+    try ToPointMark.reach(fuzzPublicKeyToPoint, "ctap2pin-topoint", 300);
 }
 
 test "corpus: the toPoint seeds reach both the accept and the identity-reject path" {
@@ -619,22 +672,68 @@ fn twoSeed(comptime cipher_len: usize) []const u8 {
     }.bytes;
 }
 
-fn fuzzTwoDecrypt(_: void, smith: *std.testing.Smith) !void {
+fn fuzzTwoDecryptSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzTwoDecrypt(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzTwoDecrypt(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var key_buf: [Two.shared_secret_length]u8 = undefined;
-    smith.bytes(&key_buf);
+    src.bytes(&key_buf);
     var cipher_buf: [256]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
-    const cipher_len: usize = smith.slice(&cipher_buf);
+    // ⚠ One `slice` call, never `bytes` followed by a ranged length.
+    var cipher_len: usize = undefined;
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        // A genuine ciphertext with 0-3 octets damaged, maybe truncated; the
+        // damage-free draw (3/4 of the 0-3 damage count is >0) also round-trips.
+        var pt: [64]u8 = undefined;
+        src.bytes(&pt);
+        const pt_len = src.index(pt.len / 16 + 1) * 16;
+        var iv: [Two.iv_length]u8 = undefined;
+        src.bytes(&iv);
+        var genuine: [16 + 64]u8 = undefined;
+        const ct = genuine[0..Two.encryptedLength(pt_len)];
+        try Two.encrypt(&key_buf, iv, ct, pt[0..pt_len]);
+        if (src.value(bool)) {
+            var out: [64]u8 = undefined;
+            try Two.decrypt(&key_buf, out[0..pt_len], ct);
+            if (!std.mem.eql(u8, out[0..pt_len], pt[0..pt_len])) return error.GenuineCiphertextAltered;
+            // A flipped bit anywhere changes the plaintext (CBC is malleable, not authenticated).
+            if (pt_len > 0) {
+                var bad: [16 + 64]u8 = genuine;
+                bad[src.index(ct.len)] ^= @as(u8, 1) << @intCast(src.index(8));
+                var out2: [64]u8 = undefined;
+                try Two.decrypt(&key_buf, out2[0..pt_len], bad[0..ct.len]);
+                if (std.mem.eql(u8, out2[0..pt_len], pt[0..pt_len])) return error.FlippedCiphertextDecryptedUnchanged;
+            }
+            DecryptMark.mark(.genuine_roundtrip);
+        }
+        cipher_len = fz.damage(src, &cipher_buf, ct);
+    } else {
+        cipher_len = src.slice(&cipher_buf);
+    }
     const ciphertext = cipher_buf[0..cipher_len];
     // Two.decrypt takes ciphertext.len from the wire; a malformed length
     // (< iv_length, or not a whole number of blocks past the IV) must
     // return a typed error, never panic/OOB, before any AES runs.
-    const plaintext_len = Two.decryptedLength(ciphertext.len) catch return;
+    const plaintext_len = Two.decryptedLength(ciphertext.len) catch {
+        DecryptMark.mark(.bad_length);
+        return;
+    };
     var dst: [256]u8 = undefined;
     Two.decrypt(&key_buf, dst[0..plaintext_len], ciphertext) catch return;
+    DecryptMark.mark(.decrypted);
 }
+
 test "fuzz Two.decrypt never panics" {
-    try std.testing.fuzz({}, fuzzTwoDecrypt, .{ .corpus = &decrypt_seeds });
+    try std.testing.fuzz({}, fuzzTwoDecryptSmith, .{ .corpus = &decrypt_seeds });
+}
+
+test "fuzz driver: CTAP2PIN_FUZZ (Two.decrypt)" {
+    try fz.fuzz_driver.run(fuzzTwoDecrypt, .{ .prefix = "CTAP2PIN_FUZZ", .name = "ctap2pin-two-decrypt" });
+}
+
+test "fuzz harness: Two.decrypt, 300 seeds, reaches every outcome" {
+    try DecryptMark.reach(fuzzTwoDecrypt, "ctap2pin-two-decrypt", 300);
 }
 
 test "corpus: the decrypt seeds reach the cipher, and the counts are pinned" {
@@ -660,4 +759,101 @@ test "corpus: the decrypt seeds reach the cipher, and the counts are pinned" {
     try std.testing.expectEqual(decrypt_seeds.len - 1, nonempty); // all but the empty seed
     try std.testing.expectEqual(@as(usize, 4), accepted_length);
     try std.testing.expectEqual(@as(usize, 288), plaintext_octets);
+}
+
+test "fuzz: both protocols agree on a secret, round-trip, and refuse every tampered message" {
+    try std.testing.fuzz({}, fuzzProtocolSmith, .{});
+}
+
+test "fuzz driver: CTAP2PIN_FUZZ (protocol)" {
+    try fz.fuzz_driver.run(fuzzProtocol, .{ .prefix = "CTAP2PIN_FUZZ", .name = "ctap2pin-protocol", .scale = 4 });
+}
+
+test "fuzz harness: protocol, 60 seeds, reaches every outcome" {
+    try ProtocolMark.reach(fuzzProtocol, "ctap2pin-protocol", 60);
+}
+
+fn fuzzProtocolSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzProtocol(std.testing.Smith, smith, std.testing.allocator);
+}
+
+/// The oracle for the protocol layer: platform and authenticator derive the
+/// SAME shared secret (ECDH + kdf, protocols One and Two); `decrypt(encrypt(m))
+/// == m`; `verify(authenticate(m))`; and a flipped bit in the signature, the
+/// message or the key is REFUSED; a flipped ciphertext bit never decrypts back
+/// to the original plaintext (CBC carries no authentication; the MAC does).
+fn fuzzProtocol(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    var raw: [160]u8 = undefined;
+    const n: usize = src.slice(&raw);
+    var k: @import("testkit").fuzz.Cursor = .{ .bytes = raw[0..n] };
+    var plat: [32]u8 = undefined;
+    var auth: [32]u8 = undefined;
+    for (&plat) |*b| b.* = k.byte();
+    for (&auth) |*b| b.* = k.byte();
+    plat[0] &= 0x7f;
+    auth[0] &= 0x7f;
+    // The all-zero scalar (an empty `--fuzz` input) is no key.
+    const auth_pk = publicKeyFromScalar(&auth) catch return;
+    _ = publicKeyFromScalar(&plat) catch return;
+    var msg_buf: [48]u8 = undefined;
+    for (&msg_buf) |*b| b.* = k.byte();
+    const msg = msg_buf[0..k.ranged(0, 48)];
+    var pt: [48]u8 = undefined;
+    for (&pt) |*b| b.* = k.byte();
+    const pt_len = k.ranged(0, 3) * 16;
+    var iv: [16]u8 = undefined;
+    for (&iv) |*b| b.* = k.byte();
+    const bit = @as(u8, 1) << @intCast(k.ranged(0, 7));
+
+    inline for (.{ Protocol.one, Protocol.two }) |proto| {
+        const P = Impl(proto);
+        var enc: P.Encaps = undefined;
+        try P.encapsulate(&enc, &plat, auth_pk);
+        // The authenticator's side: ECDH with the platform's public key, then kdf.
+        var z: [32]u8 = undefined;
+        try ecdhZ(&z, &auth, enc.platform_key_agreement);
+        var other: P.SharedSecret = undefined;
+        P.kdf(&other, &z);
+        if (!std.mem.eql(u8, &enc.shared_secret, &other)) return error.SharedSecretsDiffer;
+        ProtocolMark.mark(.secrets_agree);
+
+        // Encrypt / decrypt.
+        var ct_buf: [16 + 48]u8 = undefined;
+        var back: [48]u8 = undefined;
+        const ct: []u8 = if (proto == .one) ct_buf[0..pt_len] else ct_buf[0 .. 16 + pt_len];
+        if (proto == .one) try P.encrypt(&enc.shared_secret, ct, pt[0..pt_len]) else try P.encrypt(&enc.shared_secret, iv, ct, pt[0..pt_len]);
+        try P.decrypt(&other, back[0..pt_len], ct);
+        if (!std.mem.eql(u8, back[0..pt_len], pt[0..pt_len])) return error.RoundTripAltered;
+        ProtocolMark.mark(.roundtrip);
+        if (ct.len > 0) {
+            ct[k.ranged(0, @intCast(ct.len - 1))] ^= bit;
+            try P.decrypt(&other, back[0..pt_len], ct);
+            // A flip inside the IV or any ciphertext block changes some plaintext block.
+            if (pt_len > 0 and std.mem.eql(u8, back[0..pt_len], pt[0..pt_len])) return error.FlippedCiphertextUnchanged;
+        }
+
+        // Authenticate / verify.
+        const key = if (proto == .one) @as([]const u8, &enc.shared_secret) else enc.shared_secret[0..32];
+        const sig = if (proto == .one) try P.authenticate(key, msg) else P.authenticate(key, msg);
+        if (!P.verify(key, msg, &sig)) return error.GenuineMacRefused;
+        ProtocolMark.mark(.mac_ok);
+        var bad_sig = sig;
+        bad_sig[k.ranged(0, sig.len - 1)] ^= bit;
+        if (P.verify(key, msg, &bad_sig)) return error.FlippedMacAccepted;
+        if (P.verify(key, msg, sig[0 .. sig.len - 1])) return error.ShortMacAccepted;
+        var bad_msg: [49]u8 = undefined;
+        @memcpy(bad_msg[0..msg.len], msg);
+        bad_msg[msg.len] = k.byte();
+        if (P.verify(key, bad_msg[0 .. msg.len + 1], &sig)) return error.ExtendedMessageAccepted;
+        if (msg.len > 0) {
+            bad_msg[k.ranged(0, @intCast(msg.len - 1))] ^= bit;
+            if (P.verify(key, bad_msg[0..msg.len], &sig)) return error.FlippedMessageAccepted;
+        }
+        ProtocolMark.mark(.tampered_refused);
+        var bad_key: P.SharedSecret = enc.shared_secret;
+        bad_key[k.ranged(0, 31)] ^= bit;
+        const bk = if (proto == .one) @as([]const u8, &bad_key) else bad_key[0..32];
+        if (P.verify(bk, msg, &sig)) return error.WrongKeyAccepted;
+        ProtocolMark.mark(.wrong_key_refused);
+    }
 }

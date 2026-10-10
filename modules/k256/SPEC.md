@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-08 · mutation 2026-10-08 (48/48) · src 170831e3a2bff684
 
-**Hardening:** fuzz ? · ct 2026-09-15 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, K256_FUZZ; mul at 1/4, sign at 1/4 of it) · ct 2026-09-15 (ctgrind)
 
 **Performance:** not measured
 

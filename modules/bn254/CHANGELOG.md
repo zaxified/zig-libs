@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `BN254_FUZZ` (testkit) over ecAdd/ecMul/ecPairing on damaged genuine calldata (results canonical) and the group laws (distributivity, order wrap, inverse, bilinearity of the pairing check). No change to the library code.
 - **2026-10-09** — Dead-stack sweep (wave 6): **no secret-holding entry point** — no
   key generation, signing, ECDH or prover here (the Groth16 prover is `groth16`'s, and
   is swept there); `ecMul` takes a public scalar. The curve layer keeps its value API.

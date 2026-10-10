@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `SPAKE2PLUS_FUZZ` (testkit) over the share-decode boundary and a full SPAKE2+ exchange (both sides finish with equal K_shared; tampered confirmations, shares, context or password refused). No change to the library code.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** every secret path left
   the password-derived scalars, the ephemerals, `Z`/`V` and the whole key schedule on the dead stack,
   in the module's frames and in the caller's (by-value scalar params, by-value results, a result

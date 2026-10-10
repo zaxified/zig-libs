@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-15 · mutation 2026-09-11 · src ?
 
-**Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, CTAP2PIN_FUZZ; protocol at 1/4 of it) · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 

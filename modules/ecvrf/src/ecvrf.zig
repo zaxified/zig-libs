@@ -708,25 +708,155 @@ test "verify: no longer re-decodes pi to reach proofToHash's tail (audit E10 poi
 
 // ── fuzz harnesses (untrusted-wire decoders) ────────────────────────────
 
-test "fuzz: decodeProof never crashes on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzDecodeProof, .{});
+const fz = @import("fuzz_test.zig");
+const DecodeMark = fz.Marker(enum { accepted, refused, canonical });
+const VerifyMark = fz.Marker(enum { accepted, bad_key, bad_proof, bad_challenge });
+const ProveVerifyMark = fz.Marker(enum { genuine_accepted, flipped_refused, wrong_alpha_refused, wrong_key_refused });
+
+const testkit = @import("testkit");
+
+fn drawProof(comptime S: type, src: *S, pi: *Proof) void {
+    // Under the driver half the proofs are a real one with 0-3 octets damaged.
+    if (S != fz.fuzz_driver.Rng or !src.value(bool)) {
+        src.bytes(pi);
+        return;
+    }
+    const sk: SecretKey = @splat(src.value(u8));
+    const pi0 = prove(&sk, "fuzz");
+    var tmp: [proof_len]u8 = undefined;
+    const n = fz.damage(src, &tmp, &pi0);
+    @memset(pi, 0);
+    @memcpy(pi[0..n], tmp[0..n]);
 }
 
-fn fuzzDecodeProof(_: void, smith: *std.testing.Smith) !void {
+test "fuzz: decodeProof never crashes on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzDecodeProofSmith, .{});
+}
+
+test "fuzz driver: ECVRF_FUZZ (decode proof)" {
+    try fz.fuzz_driver.run(fuzzDecodeProof, .{ .prefix = "ECVRF_FUZZ", .name = "ecvrf-decode-proof" });
+}
+
+test "fuzz harness: decode proof, 300 seeds, reaches every outcome" {
+    try DecodeMark.reach(fuzzDecodeProof, "ecvrf-decode-proof", 300);
+}
+
+fn fuzzDecodeProofSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecodeProof(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecodeProof(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var pi: Proof = undefined;
-    smith.bytes(&pi);
-    _ = decodeProof(pi) catch return;
+    drawProof(S, src, &pi);
+    const d = decodeProof(pi) catch {
+        DecodeMark.mark(.refused);
+        return;
+    };
+    DecodeMark.mark(.accepted);
+    // Canonical: what decodes re-encodes to the very bytes it came from
+    // (no proof has a second spelling), and the split is lossless.
+    const g = try stringToPoint(d.gamma);
+    if (!std.mem.eql(u8, &g.toBytes(), pi[0..pt_len])) return error.GammaNotCanonical;
+    if (!std.mem.eql(u8, &d.c, pi[pt_len..][0..c_len]) or !std.mem.eql(u8, &d.s, pi[pt_len + c_len ..])) return error.SplitLossy;
+    DecodeMark.mark(.canonical);
 }
 
 test "fuzz: verify never crashes on arbitrary pk/proof bytes" {
-    try std.testing.fuzz({}, fuzzVerify, .{});
+    try std.testing.fuzz({}, fuzzVerifySmith, .{});
 }
 
-fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: ECVRF_FUZZ (verify)" {
+    try fz.fuzz_driver.run(fuzzVerify, .{ .prefix = "ECVRF_FUZZ", .name = "ecvrf-verify", .scale = 2 });
+}
+
+test "fuzz harness: verify, 300 seeds, reaches every outcome" {
+    try VerifyMark.reach(fuzzVerify, "ecvrf-verify", 300);
+}
+
+fn fuzzVerifySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzVerify(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var pk: PublicKey = undefined;
-    smith.bytes(&pk);
     var pi: Proof = undefined;
-    smith.bytes(&pi);
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        // A real (pk, alpha, proof) with 0-3 octets of the pair damaged.
+        const sk: SecretKey = @splat(src.value(u8));
+        pk = publicKey(&sk);
+        pi = prove(&sk, "fuzz");
+        var both: [pt_len + proof_len]u8 = undefined;
+        @memcpy(both[0..pt_len], &pk);
+        @memcpy(both[pt_len..], &pi);
+        var tmp: [pt_len + proof_len]u8 = undefined;
+        _ = fz.damage(src, &tmp, &both);
+        pk = tmp[0..pt_len].*;
+        pi = tmp[pt_len..][0..proof_len].*;
+    } else {
+        src.bytes(&pk);
+        src.bytes(&pi);
+    }
     const alpha = "fuzz";
-    _ = verify(pk, alpha, pi) catch return;
+    const out = verify(pk, alpha, pi) catch |e| {
+        if (e == error.InvalidPublicKey) {
+            VerifyMark.mark(.bad_key);
+        } else if (decodeProof(pi)) |_| {
+            VerifyMark.mark(.bad_challenge);
+        } else |_| VerifyMark.mark(.bad_proof);
+        return;
+    };
+    VerifyMark.mark(.accepted);
+    // What verifies yields exactly the hash of its Gamma.
+    const again = try proofToHash(pi);
+    if (!std.mem.eql(u8, &out, &again)) return error.HashMismatch;
+}
+
+test "fuzz: a genuine proof verifies and every damaged copy is refused" {
+    try std.testing.fuzz({}, fuzzProveVerifySmith, .{});
+}
+
+test "fuzz driver: ECVRF_FUZZ (prove + verify)" {
+    try fz.fuzz_driver.run(fuzzProveVerify, .{ .prefix = "ECVRF_FUZZ", .name = "ecvrf-prove-verify", .scale = 4 });
+}
+
+test "fuzz harness: prove + verify, 100 seeds, reaches every outcome" {
+    try ProveVerifyMark.reach(fuzzProveVerify, "ecvrf-prove-verify", 100);
+}
+
+fn fuzzProveVerifySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzProveVerify(std.testing.Smith, smith, std.testing.allocator);
+}
+
+/// `prove` output is ACCEPTED by `verify` (and `proofToHash` agrees); a proof
+/// with any one bit flipped, another alpha, or another key is REFUSED.
+fn fuzzProveVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    var raw: [96]u8 = undefined;
+    const n: usize = src.slice(&raw);
+    var k: testkit.fuzz.Cursor = .{ .bytes = raw[0..n] };
+    var sk: SecretKey = undefined;
+    for (&sk) |*b| b.* = k.byte();
+    var alpha_buf: [40]u8 = undefined;
+    for (&alpha_buf) |*b| b.* = k.byte();
+    const alpha = alpha_buf[0..k.ranged(0, 40)];
+    const pk = publicKey(&sk);
+    const pi = prove(&sk, alpha);
+    const out = verify(pk, alpha, pi) catch return error.GenuineProofRefused;
+    if (!std.mem.eql(u8, &out, &(try proofToHash(pi)))) return error.HashMismatch;
+    ProveVerifyMark.mark(.genuine_accepted);
+
+    var bad = pi;
+    bad[k.ranged(0, proof_len - 1)] ^= @as(u8, 1) << @intCast(k.ranged(0, 7));
+    if (verify(pk, alpha, bad)) |_| return error.FlippedProofAccepted else |_| {}
+    ProveVerifyMark.mark(.flipped_refused);
+
+    var other_alpha: [41]u8 = undefined;
+    @memcpy(other_alpha[0..alpha.len], alpha);
+    other_alpha[alpha.len] = k.byte();
+    if (verify(pk, other_alpha[0 .. alpha.len + 1], pi)) |_| return error.WrongAlphaAccepted else |_| {}
+    ProveVerifyMark.mark(.wrong_alpha_refused);
+
+    var other_sk = sk;
+    other_sk[k.ranged(0, 31)] ^= @as(u8, 1) << @intCast(k.ranged(0, 7));
+    if (verify(publicKey(&other_sk), alpha, pi)) |_| return error.WrongKeyAccepted else |_| {}
+    ProveVerifyMark.mark(.wrong_key_refused);
 }

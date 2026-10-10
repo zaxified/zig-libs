@@ -1417,6 +1417,7 @@ test {
     _ = @import("stackprobe2_test.zig");
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta.deps is empty (coap-agnostic — see module doc comment)" {
@@ -1596,36 +1597,220 @@ const option_seeds = [_][]const u8{
     fuzzSeed(&.{ 0x12, 0x05, 0xaa }), // kid context length past the end
 };
 
-fn fuzzOscoreOptionDecode(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const OptionMark = fz.Marker(enum { accepted, refused, roundtrip, kid, kid_context });
+const ExchangeMark = fz.Marker(enum { request_accepted, response_accepted, piv_less_response_accepted, damaged_refused, replay_refused, wrong_key_refused });
+
+fn fuzzOscoreOptionDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzOscoreOptionDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzOscoreOptionDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [64]u8 = undefined;
-    // One `smith.slice` draw — never `bytes` followed by a ranged length:
+    // One `slice` draw -- never `bytes` followed by a ranged length:
     // `bytes` consumes the whole seed and the ranged draw then returns its
     // minimum, so the harness decoded the EMPTY option once per run
     // (audit F9 instrumented it: `call=1 len=0`).
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &option_seeds);
     // §6.1's wire-facing decoder: arbitrary bytes must only ever produce a
     // typed error (reserved bits/length, truncation) or a borrowed-slice
-    // struct — never a panic or OOB read. Whatever it accepts must
+    // struct -- never a panic or OOB read. Whatever it accepts must
     // re-encode to bytes that decode to the same fields (the encoder's
     // shortest-form rule means the bytes themselves may differ, e.g. a
     // non-minimal Partial IV).
-    const opt = OscoreOption.decode(buf[0..len]) catch return;
-    const again = opt.encode(std.testing.allocator) catch |err| switch (err) {
+    const opt = OscoreOption.decode(buf[0..len]) catch {
+        OptionMark.mark(.refused);
+        return;
+    };
+    OptionMark.mark(.accepted);
+    if (opt.kid != null) OptionMark.mark(.kid);
+    if (opt.kid_context != null) OptionMark.mark(.kid_context);
+    const again = opt.encode(gpa) catch |err| switch (err) {
         error.OutOfMemory => return err,
         // A decoded option always fits: n <= 5 bytes and s <= 255.
         error.PartialIvTooLarge, error.KidContextTooLong => return error.TestUnexpectedResult,
     };
-    defer std.testing.allocator.free(again);
+    defer gpa.free(again);
     const opt2 = try OscoreOption.decode(again);
     try std.testing.expectEqual(opt.partial_iv, opt2.partial_iv);
     try std.testing.expectEqual(opt.kid == null, opt2.kid == null);
     try std.testing.expectEqual(opt.kid_context == null, opt2.kid_context == null);
     if (opt.kid) |k| try std.testing.expectEqualSlices(u8, k, opt2.kid.?);
     if (opt.kid_context) |kc| try std.testing.expectEqualSlices(u8, kc, opt2.kid_context.?);
+    OptionMark.mark(.roundtrip);
 }
 
 test "fuzz: OscoreOption.decode never panics on arbitrary bytes, and what it accepts round-trips" {
-    try std.testing.fuzz({}, fuzzOscoreOptionDecode, .{ .corpus = &option_seeds });
+    try std.testing.fuzz({}, fuzzOscoreOptionDecodeSmith, .{ .corpus = &option_seeds });
+}
+
+test "fuzz driver: OSCORE_FUZZ (option)" {
+    try fz.fuzz_driver.run(fuzzOscoreOptionDecode, .{ .prefix = "OSCORE_FUZZ", .name = "oscore-option" });
+}
+
+test "fuzz harness: option, 500 seeds, reaches every outcome" {
+    try OptionMark.reach(fuzzOscoreOptionDecode, "oscore-option", 500);
+}
+
+test "fuzz: a genuine OSCORE exchange is accepted and every damaged copy refused" {
+    try std.testing.fuzz({}, fuzzOscoreExchangeSmith, .{});
+}
+
+test "fuzz driver: OSCORE_FUZZ (exchange)" {
+    try fz.fuzz_driver.run(fuzzOscoreExchange, .{ .prefix = "OSCORE_FUZZ", .name = "oscore-exchange", .scale = 2 });
+}
+
+test "fuzz harness: exchange, 300 seeds, reaches every outcome" {
+    try ExchangeMark.reach(fuzzOscoreExchange, "oscore-exchange", 300);
+}
+
+fn fuzzOscoreExchangeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzOscoreExchange(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn expectAuthRefused(gpa: std.mem.Allocator, result: UnprotectError![]u8) !void {
+    if (result) |pt| {
+        gpa.free(pt);
+        return error.DamagedMessageAccepted;
+    } else |e| if (e != error.AuthenticationFailed) return error.UnexpectedRefusal;
+    ExchangeMark.mark(.damaged_refused);
+}
+
+/// The oracle the option decoder's harness cannot be: a message `protect`
+/// issued is ACCEPTED by `unprotect` on the peer (request and both response
+/// shapes), and every damaged copy -- a flipped bit anywhere in the
+/// ciphertext or tag, a truncation, an extra octet, a changed AAD field or
+/// Partial IV, the wrong key -- is REFUSED with `AuthenticationFailed`; the
+/// refusals leave the replay window alone (the genuine message still passes
+/// afterwards) and a second delivery is `Replayed`.
+fn fuzzOscoreExchange(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [160]u8 = undefined;
+    const raw_len: usize = src.slice(&raw);
+    var k: @import("testkit").fuzz.Cursor = .{ .bytes = raw[0..raw_len] };
+
+    var secret: [16]u8 = undefined;
+    for (&secret) |*b| b.* = k.byte();
+    var cid_buf: [7]u8 = undefined;
+    var sid_buf: [7]u8 = undefined;
+    var salt_buf: [8]u8 = undefined;
+    for (&cid_buf) |*b| b.* = k.byte();
+    for (&sid_buf) |*b| b.* = k.byte();
+    for (&salt_buf) |*b| b.* = k.byte();
+    const cid = cid_buf[0..k.ranged(0, 7)];
+    const sid = sid_buf[0..k.ranged(0, 7)];
+    const salt = salt_buf[0..k.ranged(0, 8)];
+
+    var client = try deriveContext(gpa, &secret, salt, null, cid, sid, .aes_ccm_16_64_128);
+    var server = try deriveContext(gpa, &secret, salt, null, sid, cid, .aes_ccm_16_64_128);
+    var other_secret = secret;
+    other_secret[k.ranged(0, 15)] ^= @as(u8, 1) << @intCast(k.ranged(0, 7));
+    var stranger = try deriveContext(gpa, &other_secret, salt, null, sid, cid, .aes_ccm_16_64_128);
+
+    var pt_buf: [48]u8 = undefined;
+    for (&pt_buf) |*b| b.* = k.byte();
+    const pt = pt_buf[0..k.ranged(0, 48)];
+    var opts_buf: [8]u8 = undefined;
+    for (&opts_buf) |*b| b.* = k.byte();
+    const class_i = opts_buf[0..if (k.ranged(0, 3) == 0) k.ranged(0, 8) else 0];
+
+    // The Sender Sequence Number: small, or anywhere in the 40-bit range.
+    var seq: u64 = k.byte();
+    if (k.ranged(0, 1) == 1) {
+        seq = 0;
+        for (0..5) |_| seq = (seq << 8) | k.byte();
+    }
+    client.sender.sequence_number = seq;
+
+    var piv_buf: [OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const request_piv = OscoreOption.encodePartialIv(seq, &piv_buf);
+    const aad: AadParams = .{ .request_kid = cid, .request_piv = request_piv, .options = class_i };
+
+    const prot = try protect(gpa, &client, pt, aad, true, null);
+    defer gpa.free(prot.ciphertext);
+    // Through the wire form: encode, decode, then unprotect.
+    const wire = try prot.option.encode(gpa);
+    defer gpa.free(wire);
+    const opt = try OscoreOption.decode(wire);
+
+    // Damage first: a refusal must not touch the replay window.
+    const copy = try gpa.dupe(u8, prot.ciphertext);
+    defer gpa.free(copy);
+    copy[k.ranged(0, @intCast(copy.len - 1))] ^= @as(u8, 1) << @intCast(k.ranged(0, 7));
+    try expectAuthRefused(gpa, unprotect(gpa, &server, opt, copy, aad, null, true));
+    const cut = k.ranged(0, @intCast(prot.ciphertext.len - 1));
+    try expectAuthRefused(gpa, unprotect(gpa, &server, opt, prot.ciphertext[0..cut], aad, null, true));
+    const longer = try gpa.alloc(u8, prot.ciphertext.len + 1);
+    defer gpa.free(longer);
+    @memcpy(longer[0..prot.ciphertext.len], prot.ciphertext);
+    longer[prot.ciphertext.len] = k.byte();
+    try expectAuthRefused(gpa, unprotect(gpa, &server, opt, longer, aad, null, true));
+    // A changed AAD field.
+    var bad_kid: [7]u8 = undefined;
+    @memcpy(bad_kid[0..cid.len], cid);
+    if (cid.len == 0) {
+        var wrong = aad;
+        wrong.request_kid = "x";
+        try expectAuthRefused(gpa, unprotect(gpa, &server, opt, prot.ciphertext, wrong, null, true));
+    } else {
+        bad_kid[k.ranged(0, @intCast(cid.len - 1))] ^= @as(u8, 1) << @intCast(k.ranged(0, 7));
+        var wrong = aad;
+        wrong.request_kid = bad_kid[0..cid.len];
+        try expectAuthRefused(gpa, unprotect(gpa, &server, opt, prot.ciphertext, wrong, null, true));
+    }
+    var wrong_opts = aad;
+    wrong_opts.options = if (class_i.len == 0) "\x01" else class_i[0 .. class_i.len - 1];
+    try expectAuthRefused(gpa, unprotect(gpa, &server, opt, prot.ciphertext, wrong_opts, null, true));
+    // A different Partial IV in the option (the nonce changes).
+    if (seq < max_partial_iv) {
+        var shifted = opt;
+        shifted.partial_iv = seq + 1;
+        try expectAuthRefused(gpa, unprotect(gpa, &server, shifted, prot.ciphertext, aad, null, true));
+    }
+    // The wrong key.
+    try expectAuthRefused(gpa, unprotect(gpa, &stranger, opt, prot.ciphertext, aad, null, true));
+    ExchangeMark.mark(.wrong_key_refused);
+
+    // The genuine request is accepted, once.
+    const got = unprotect(gpa, &server, opt, prot.ciphertext, aad, null, true) catch return error.GenuineRequestRefused;
+    defer gpa.free(got);
+    if (!std.mem.eql(u8, got, pt)) return error.GenuineRequestAltered;
+    ExchangeMark.mark(.request_accepted);
+    if (unprotect(gpa, &server, opt, prot.ciphertext, aad, null, true)) |again| {
+        gpa.free(again);
+        return error.ReplayAccepted;
+    } else |e| if (e != error.Replayed) return error.UnexpectedRefusal;
+    ExchangeMark.mark(.replay_refused);
+
+    // A response carrying its own Partial IV: protected by the server, checked by the client.
+    var reply_buf: [32]u8 = undefined;
+    for (&reply_buf) |*b| b.* = k.byte();
+    const reply = reply_buf[0..k.ranged(0, 32)];
+    server.sender.sequence_number = k.byte();
+    const rprot = try protect(gpa, &server, reply, aad, false, null);
+    defer gpa.free(rprot.ciphertext);
+    const rcopy = try gpa.dupe(u8, rprot.ciphertext);
+    defer gpa.free(rcopy);
+    rcopy[k.ranged(0, @intCast(rcopy.len - 1))] ^= @as(u8, 1) << @intCast(k.ranged(0, 7));
+    try expectAuthRefused(gpa, unprotect(gpa, &client, rprot.option, rcopy, aad, null, false));
+    const rgot = unprotect(gpa, &client, rprot.option, rprot.ciphertext, aad, null, false) catch return error.GenuineResponseRefused;
+    defer gpa.free(rgot);
+    if (!std.mem.eql(u8, rgot, reply)) return error.GenuineResponseAltered;
+    ExchangeMark.mark(.response_accepted);
+
+    // A response without a Partial IV: the request's nonce is reused (§5.2).
+    const nonce = try computeNonce(server.common.common_iv, cid, seq);
+    var sealed: [33 + tag_length]u8 = undefined;
+    var aad_buf: [max_aad_len]u8 = undefined;
+    std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt(sealed[0..reply.len], sealed[reply.len..][0..tag_length], reply, try buildAad(&aad_buf, aad), nonce, server.sender.key);
+    const bare: OscoreOption = .{ .partial_iv = null, .kid = null, .kid_context = null };
+    const src_nonce: NonceSource = .{ .id = cid, .partial_iv = seq };
+    var sealed_bad = sealed;
+    sealed_bad[k.ranged(0, @intCast(reply.len + tag_length - 1))] ^= @as(u8, 1) << @intCast(k.ranged(0, 7));
+    try expectAuthRefused(gpa, unprotect(gpa, &client, bare, sealed_bad[0 .. reply.len + tag_length], aad, src_nonce, false));
+    const bgot = unprotect(gpa, &client, bare, sealed[0 .. reply.len + tag_length], aad, src_nonce, false) catch return error.GenuineBareResponseRefused;
+    defer gpa.free(bgot);
+    if (!std.mem.eql(u8, bgot, reply)) return error.GenuineBareResponseAltered;
+    ExchangeMark.mark(.piv_less_response_accepted);
 }
 
 test "ReplayWindow: oversized window_size (>64) + hostile diff/shift does not panic (audit F1)" {

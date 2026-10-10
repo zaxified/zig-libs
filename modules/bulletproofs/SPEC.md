@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-15 · mutation 2026-10-02 (14/15, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct 2026-09-15 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BULLETPROOFS_FUZZ; rp-decode at 1/4, prove-verify at 1/40 of it) · ct 2026-09-15 (ctgrind)
 
 **Performance:** not measured
 

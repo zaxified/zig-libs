@@ -112,6 +112,7 @@ test {
     _ = eip2333;
     _ = @import("blst_interop_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta.model_after names the pairing-friendly-curves draft" {

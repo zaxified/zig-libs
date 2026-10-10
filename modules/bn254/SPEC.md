@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-03 · mutation 2026-09-03 · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-02 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BN254_FUZZ; ecadd and ecmul at 1/4, ecpairing at 1/10, algebra at 1/100 of it) · ct 2026-10-02 (ctgrind)
 
 **Performance:** not measured
 

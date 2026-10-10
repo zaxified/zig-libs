@@ -359,6 +359,7 @@ test {
     _ = @import("tree_vectors.zig");
     _ = @import("tree_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta.model_after names BIP341" {

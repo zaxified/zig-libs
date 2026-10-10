@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `CTAP2PIN_FUZZ` (testkit) over `PublicKey.toPoint` (canonical, flipped bit leaves the curve), `Two.decrypt` (genuine round trip, CBC malleability) and both pinUvAuth protocols (shared secrets agree, round trip, MAC accepted, tampered/wrong-key MAC refused). No change to the library code.
 - **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** `check-secret-api` closed at 0 findings: `One`/`Two` `encrypt`/`decrypt` (key already by pointer) delegate to `Aes256Cbc.encrypt`/`decrypt`, which burn the key schedule; they carry `secret-api-ok` markers saying so. No burn or signature changed.
 
 - **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte

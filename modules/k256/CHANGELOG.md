@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `K256_FUZZ` (testkit) over `fromSec1` (canonical re-encode), `Fe.fromBytes` (accepted exactly below p), a differential between mulPublic/mulPublicDoubleAdd/mulPublicGlv/combMulBase, and ECDSA (with pubkey recovery) and BIP-340 sign/verify (flipped signature, digest/message, wrong key refused). No change to the library code.
 - **2026-10-08** — **BREAKING + FIX (secrets in the caller's frame):** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
   engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
   through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised

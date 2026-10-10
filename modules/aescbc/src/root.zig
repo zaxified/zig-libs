@@ -622,4 +622,5 @@ test "raw CBC vs jwe's/xmlenc's hand-rolled shape: same output on the same input
 
 test {
     _ = @import("stackprobe_test.zig");
+    _ = @import("fuzz_test.zig");
 }

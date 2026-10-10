@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-05 (24/24) · src ?
 
-**Hardening:** fuzz ? · ct 2026-08-11 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DECAF448_FUZZ; decode at 1/2, group at 1/8, hash at 1/4 of it) · ct 2026-08-11 (ctgrind)
 
 **Performance:** not measured
 

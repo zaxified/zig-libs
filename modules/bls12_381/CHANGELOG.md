@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `BLS12_381_FUZZ` (testkit) over secret/public-key/signature decoders (canonical re-encode, damaged genuine encodings refused) and sign/verify, fast and distinct-message aggregation and proof of possession (flipped, wrong message/key, swapped messages refused). No change to the library code.
 - **2026-10-09** — **BREAKING, HIGH: every entry point that holds a BLS secret left it on the dead
   stack.** New ReleaseFast stack probe (`stackprobe_test.zig`), 5 calls each, before → after:
   `keyGen` the IKM 10, PRK 20, OKM 30 and the key 40; the `SecretKey`/`SecretKeyShare` codecs the

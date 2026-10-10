@@ -184,6 +184,7 @@ test {
     _ = interop_test;
     _ = stackprobe_test;
     _ = verify_b8_diff_test;
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta.model_after names Bulletproofs + Ristretto255" {

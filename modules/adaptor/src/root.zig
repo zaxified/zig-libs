@@ -728,6 +728,7 @@ test {
     _ = @import("interop_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta.model_after names the scriptless-scripts construction and the sibling bip340 dep" {

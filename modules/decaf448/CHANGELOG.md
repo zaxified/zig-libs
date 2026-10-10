@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `DECAF448_FUZZ` (testkit) over `Element.decode` (accepted encodings re-encode canonically, a damaged one names another element), the group law on random scalars, and hashToElement/hashToScalar DST bounds. No change to the library code.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, MEDIUM):** the new ReleaseFast stack
   probe (`src/stackprobe_test.zig`) found the scalar and its inverse in dead frames after
   `scalar.invert`, and the result after `scalar.random`; both now burn their stack (`burn.zig`).
