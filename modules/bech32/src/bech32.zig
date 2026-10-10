@@ -457,19 +457,40 @@ const decode_seeds = [_][]const u8{
     bendSeed("", &.{}), // and the input a corpus-less target runs for ever
 };
 
+const fz = @import("fuzz_test.zig");
+const DecodeMark = fz.Marker(enum { accepted, refused });
+
 test "fuzz: decode never panics on arbitrary text" {
-    try testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
+}
+
+test "fuzz driver: BECH32_FUZZ (bech32 decode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "BECH32_FUZZ", .name = "bech32-decode" });
+}
+
+test "fuzz harness: bech32 decode, 600 seeds, reaches every outcome" {
+    try DecodeMark.reach(fuzzDecode, "bech32-decode", 600);
+}
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, testing.allocator);
 }
 
 const fuzz_alphabet = "qpzry9x8gf2tvdw0s3jn54khce6mua7l1"; // charset + separator
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [128]u8 = undefined;
-    const len = smith.slice(&buf); // not `bytes` + a ranged length: that always yields 0
+    const len = fz.drawInput(S, src, &buf, &decode_seeds); // not `bytes` + a ranged length: that always yields 0
+    const bend = fz.bendInput(S, src);
     for (buf[0..len]) |*c| {
-        if (smith.boolWeighted(1, 3)) c.* = fuzz_alphabet[c.* % fuzz_alphabet.len];
+        if (bend and fz.weighted(src, 1, 3)) c.* = fuzz_alphabet[c.* % fuzz_alphabet.len];
     }
-    _ = decode(buf[0..len]) catch return;
+    _ = decode(buf[0..len]) catch {
+        DecodeMark.mark(.refused);
+        return;
+    };
+    DecodeMark.mark(.accepted);
 }
 
 test "corpus: every bech32 seed reaches decode, and the counts are pinned" {

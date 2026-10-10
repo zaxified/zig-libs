@@ -121,6 +121,7 @@ test {
     _ = @import("bip143_kat_test.zig");
     _ = @import("bip341_kat_vectors.zig");
     _ = @import("bip341_kat_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta.deps names bip340" {
@@ -146,9 +147,24 @@ test "root re-exports resolve to the same types/values as tx.zig" {
 // seam) must be byte-identical to the one-off `sighash` for the same inputs;
 // that is the invariant a validator's whole O(n) vs O(n²) choice rests on, and
 // it is checked on every input that decodes.
+const fz = @import("fuzz_test.zig");
+const SighashMark = fz.Marker(enum { decoded, refused, bip143, bip341, mismatch_refused });
+
 test "fuzz: every decoded transaction through legacy/BIP143/BIP341 sighash" {
     var corpus: SighashCorpus = .{};
-    try std.testing.fuzz({}, fuzzSighash, .{ .corpus = corpus.build() });
+    try std.testing.fuzz({}, fuzzSighashSmith, .{ .corpus = corpus.build() });
+}
+
+test "fuzz driver: BITCOINTX_FUZZ (sighash)" {
+    try fz.fuzz_driver.run(fuzzSighash, .{ .prefix = "BITCOINTX_FUZZ", .name = "bitcointx-sighash" });
+}
+
+test "fuzz harness: sighash, 500 seeds, reaches every outcome" {
+    try SighashMark.reach(fuzzSighash, "bitcointx-sighash", 500);
+}
+
+fn fuzzSighashSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSighash(std.testing.Smith, smith, std.testing.allocator);
 }
 
 /// F11 (2026-08-11 re-audit): a same-shape clone of `t` with an
@@ -179,8 +195,7 @@ fn cloneVinVout(allocator: std.mem.Allocator, t: Transaction) !ClonedVinVout {
     } };
 }
 
-fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
-    const a = std.testing.allocator;
+fn fuzzSighash(comptime S: type, smith: *S, a: std.mem.Allocator) anyerror!void {
     // ⚠ Two `smith.slice` calls, never `bytes` followed by a ranged length.
     // Measured on the four 512-octet seeds this target used to carry: `len`
     // came out of `valueRangeAtMost(u16, 0, 256)` reading the tail words
@@ -194,7 +209,7 @@ fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
     // own smallest reference transaction is 275 octets, so not one of them
     // could have passed through here even with a working length draw.
     var buf: [tx.fuzz_tx_buf_len]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawTx(S, smith, &buf);
     // The same bias `tx.zig`'s harness uses on the octet after the version
     // field, so ARBITRARY bytes decode instead of the fuzzer spending its
     // budget on the CompactSize bail-out. `else` leaves a seeded frame alone.
@@ -207,9 +222,13 @@ fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
         };
     }
 
-    var r = deserializePartial(a, buf[0..len]) catch return;
+    var r = deserializePartial(a, buf[0..len]) catch {
+        SighashMark.mark(.refused);
+        return;
+    };
     defer r.tx.deinit(a);
     const t = r.tx;
+    SighashMark.mark(.decoded);
 
     var script_buf: [96]u8 = undefined;
     const script_len: usize = smith.slice(&script_buf);
@@ -238,6 +257,7 @@ fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
     _ = legacy.sighash(a, t, idx, script, ht32) catch {};
 
     if (bip143.sighash(a, t, idx, script, amount, ht32)) |h| {
+        SighashMark.mark(.bip143);
         const pre = try bip143.precompute(a, t);
         const h2 = bip143.sighashWith(a, pre, t, idx, script, amount, ht32) catch
             return error.PrecomputedSeamRefusedAnAcceptedInput;
@@ -256,6 +276,7 @@ fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
                 error.PrecomputedMismatch,
                 bip143.sighashWith(a, pre, clone.tx, idx, script, amount, ht32),
             );
+            SighashMark.mark(.mismatch_refused);
         }
     } else |_| {}
 
@@ -273,6 +294,7 @@ fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
         else
             smith.value(u8);
         if (bip341.sighash(a, t, idx, ht8, outs)) |h| {
+            SighashMark.mark(.bip341);
             const pre = bip341.precompute(a, t, outs) catch
                 return error.PrecomputeRefusedAnAcceptedTransaction;
             const h2 = bip341.sighashWith(a, pre, t, idx, ht8, outs) catch

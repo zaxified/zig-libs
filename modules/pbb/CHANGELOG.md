@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `PBB_FUZZ` over the decode harness (generic over its choice source) plus an encode/decode roundtrip oracle (an issued frame decodes to its fields and customer data; a prefix holding the header decodes to the matching customer prefix; a cut inside the header is refused). No code change.
 - **2026-10-04** — Tests: first mutation run (44 mutants, 44 killed); added a test for the error class at the exact boundary lengths of the tag-region EtherType and the B-Tag + next-EtherType checks.
 
 - **2026-09-07** — **`fuzzDecode` handed `decode` an EMPTY frame on every input, and

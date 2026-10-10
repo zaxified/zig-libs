@@ -869,7 +869,26 @@ test "fuzz: decode never panics/OOBs on hostile bytes and stays within input bou
     // absurd lengths — and asserts only: never panics, and any successful
     // decode's customer slice is strictly within the input. Under a plain `zig
     // build test` this runs once as a smoke test (same convention as l2encap).
-    try testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
+}
+
+const fz = @import("fuzz_test.zig");
+const DecodeMark = fz.Marker(enum { accepted, refused, b_tagged });
+
+test {
+    _ = fz;
+}
+
+test "fuzz driver: PBB_FUZZ (decode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "PBB_FUZZ", .name = "pbb-decode" });
+}
+
+test "fuzz harness: decode, 500 seeds, reaches every outcome" {
+    try DecodeMark.reach(fuzzDecode, "pbb-decode", 500);
+}
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, testing.allocator);
 }
 
 // ── External anchor: Wireshark 4.6.4 (sharkd, via scripts/gen/dissect.py) ───────────
@@ -1088,7 +1107,8 @@ const decode_seeds = [_][]const u8{
     seed(""), // the empty frame
 };
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+fn fuzzDecode(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [fuzz_max_frame]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(out.len, in.len)` octets and every ranged
@@ -1098,7 +1118,7 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // The bias block below hung on a `smith.value(bool)` drawn in the same
     // exhausted state, so it never ran either: nothing ever planted an
     // EtherType, and random octets spell one at ~2^-16.
-    const drawn: usize = smith.slice(buf[0..fuzz_drawn]);
+    const drawn: usize = fz.drawInput(S, smith, buf[0..fuzz_drawn], &decode_seeds);
     var cur: testkit.fuzz.Cursor = .{ .bytes = buf[0..drawn] };
 
     // A size class rather than one uniform draw: uniform over the whole range
@@ -1124,7 +1144,12 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
             std.mem.writeInt(u16, buf[b_mac_len + b_tag_len ..][0..2], itag_ethertype, .big);
     }
 
-    const dec = decode(buf[0..len]) catch return; // any typed error is fine
+    const dec = decode(buf[0..len]) catch { // any typed error is fine
+        DecodeMark.mark(.refused);
+        return;
+    };
+    DecodeMark.mark(.accepted);
+    if (dec.fields.b_tag != null) DecodeMark.mark(.b_tagged);
     // If it decoded, the customer slice is exactly the tail and never escapes.
     try testing.expect(len >= min_frame_len);
     const consumed = len - dec.customer_data.len;

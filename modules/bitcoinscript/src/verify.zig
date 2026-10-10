@@ -494,8 +494,23 @@ const verify_seeds = [_][]const u8{
     fuzzseed.seedHex("08" ++ "01a9" ++ "0114" ++ "0100" ** 6 ++ "00" ++ "00" ++ "00" ++ "00" ++ "00"), // a P2SH-ish redeem prefix
 };
 
+const fz = @import("fuzz_test.zig");
+const VerifyMark = fz.Marker(enum { accepted, refused, witness, long_script });
+
 test "fuzz: verifyScript never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzVerifyScript, .{ .corpus = &verify_seeds });
+    try testing.fuzz({}, fuzzVerifyScriptSmith, .{ .corpus = &verify_seeds });
+}
+
+test "fuzz driver: BITCOINSCRIPT_FUZZ (verifyScript)" {
+    try fz.fuzz_driver.run(fuzzVerifyScript, .{ .prefix = "BITCOINSCRIPT_FUZZ", .name = "bitcoinscript-verify" });
+}
+
+test "fuzz harness: verifyScript, 400 seeds, reaches every outcome" {
+    try VerifyMark.reach(fuzzVerifyScript, "bitcoinscript-verify", 400);
+}
+
+fn fuzzVerifyScriptSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzVerifyScript(std.testing.Smith, smith, testing.allocator);
 }
 
 fn fuzzScriptBytes(script: *fuzzseed.Cursor, buf: []u8) []u8 {
@@ -596,15 +611,15 @@ fn buildVerifyCase(
     };
 }
 
-fn fuzzVerifyScript(_: void, smith: *std.testing.Smith) !void {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+fn fuzzVerifyScript(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
     // ⚠ ONE byte-first draw. See `verify_seeds` for what the chain of ranged
     // draws was worth with no corpus at all.
     var seed_buf: [verify_script_len]u8 = undefined;
-    const n: usize = smith.slice(&seed_buf);
+    const n: usize = fz.drawInput(S, src, &seed_buf, &verify_seeds);
 
     var sig_buf: [10_001]u8 = undefined;
     var pubkey_buf: [10_001]u8 = undefined;
@@ -612,7 +627,13 @@ fn fuzzVerifyScript(_: void, smith: *std.testing.Smith) !void {
     var witness_items: [4][]const u8 = undefined;
     const c = buildVerifyCase(seed_buf[0..n], &sig_buf, &pubkey_buf, &witness_bufs, &witness_items);
 
-    verifyScript(a, c.script_sig, c.script_pubkey, c.witness, c.flags, dummyCtx()) catch return;
+    if (c.witness.len != 0) VerifyMark.mark(.witness);
+    if (c.script_sig.len > 200 or c.script_pubkey.len > 200) VerifyMark.mark(.long_script);
+    verifyScript(a, c.script_sig, c.script_pubkey, c.witness, c.flags, dummyCtx()) catch {
+        VerifyMark.mark(.refused);
+        return;
+    };
+    VerifyMark.mark(.accepted);
 }
 
 test "corpus: every seed builds a case, and the limits the corpus crosses are pinned" {

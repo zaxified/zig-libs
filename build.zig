@@ -400,7 +400,7 @@ const module_list = [_]Module{
     .{ .name = "p256", .libs = &.{ "crypto", "web" }, .test_deps = &.{"testkit"} },
     .{ .name = "ripemd160", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "sha2", .libs = &.{"crypto"} },
-    .{ .name = "bech32", .libs = &.{"crypto"}, .deps = &.{"ripemd160"} },
+    .{ .name = "bech32", .libs = &.{"crypto"}, .deps = &.{"ripemd160"}, .test_deps = &.{"testkit"} },
     .{ .name = "bip32", .libs = &.{"crypto"}, .deps = &.{ "k256", "ripemd160", "bech32" }, .test_deps = &.{"testkit"} },
     .{ .name = "btcaddr", .libs = &.{"crypto"}, .deps = &.{ "bech32", "ripemd160" }, .test_deps = &.{"testkit"} },
     .{ .name = "lms", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },

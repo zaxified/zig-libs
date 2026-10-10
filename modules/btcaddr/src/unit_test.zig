@@ -286,16 +286,33 @@ const fuzz_seeds = [_][]const u8{
     testkit.fuzz.seed(""),
 };
 
+const fz = @import("fuzz_test.zig");
+const DecodeMark = fz.Marker(enum { address, address_refused, wif, wif_refused });
+
 test "fuzz: toScriptPubKey and wifDecode never panic; what they accept round-trips" {
-    try testing.fuzz({}, fuzzDecode, .{ .corpus = &fuzz_seeds });
+    try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &fuzz_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *testing.Smith) !void {
+test "fuzz driver: BTCADDR_FUZZ (decode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "BTCADDR_FUZZ", .name = "btcaddr-decode" });
+}
+
+test "fuzz harness: decode, 500 seeds, reaches every outcome" {
+    try DecodeMark.reach(fuzzDecode, "btcaddr-decode", 500);
+}
+
+fn fuzzDecodeSmith(_: void, smith: *testing.Smith) !void {
+    try fuzzDecode(testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var text: [128]u8 = undefined;
-    const len: usize = smith.slice(&text);
+    const len: usize = fz.drawInput(S, src, &text, &fuzz_seeds);
     const s = text[0..len];
 
     if (btcaddr.toScriptPubKey(s)) |d| {
+        DecodeMark.mark(.address);
         // An accepted address is the canonical encoding of its script on
         // one of the chains it claims (bech32: modulo case).
         const net: btcaddr.Network = inline for (.{ .mainnet, .testnet, .signet, .regtest }) |n| {
@@ -303,14 +320,129 @@ fn fuzzDecode(_: void, smith: *testing.Smith) !void {
         } else return error.NoChain;
         const back = try btcaddr.fromScriptPubKey(d.script(), net);
         try testing.expect(std.ascii.eqlIgnoreCase(back.slice(), s));
-    } else |_| {}
+    } else |_| DecodeMark.mark(.address_refused);
 
     var w: btcaddr.Wif = undefined;
     if (btcaddr.wifDecode(&w, s)) |_| {
         defer w.wipe();
+        DecodeMark.mark(.wif);
         const net: btcaddr.Network = if (w.chains.contains(.mainnet)) .mainnet else .testnet;
         var out: [btcaddr.max_wif_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &out);
         try testing.expectEqualStrings(s, try btcaddr.wifEncode(&w.key, w.compressed, net, &out));
+    } else |_| DecodeMark.mark(.wif_refused);
+}
+
+const RoundMark = fz.Marker(enum { p2pkh, p2sh, segwit, taproot, wif, genuine_accepted, flipped_refused });
+
+/// An address this module issued for a random script is accepted and decodes
+/// to that script; one substituted character is refused (a base58check or
+/// bech32/bech32m checksum collision is the only way through, 2^-32); a WIF
+/// issued for a random key decodes to it.
+fn fuzzRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var h: [32]u8 = undefined;
+    src.bytes(&h);
+    const net: btcaddr.Network = switch (src.valueRangeAtMost(u8, 0, 3)) {
+        0 => .mainnet,
+        1 => .testnet,
+        2 => .signet,
+        else => .regtest,
+    };
+    var script_buf: [btcaddr.max_script_len]u8 = undefined;
+    const script: []const u8 = switch (src.valueRangeAtMost(u8, 0, 4)) {
+        0 => blk: {
+            RoundMark.mark(.p2pkh);
+            const x = btcaddr.scriptP2pkh(h[0..20]);
+            @memcpy(script_buf[0..x.len], &x);
+            break :blk script_buf[0..x.len];
+        },
+        1 => blk: {
+            RoundMark.mark(.p2sh);
+            const x = btcaddr.scriptP2sh(h[0..20]);
+            @memcpy(script_buf[0..x.len], &x);
+            break :blk script_buf[0..x.len];
+        },
+        2 => blk: {
+            RoundMark.mark(.segwit);
+            const x = btcaddr.scriptP2wpkh(h[0..20]);
+            @memcpy(script_buf[0..x.len], &x);
+            break :blk script_buf[0..x.len];
+        },
+        3 => blk: {
+            RoundMark.mark(.segwit);
+            const x = btcaddr.scriptP2wsh(&h);
+            @memcpy(script_buf[0..x.len], &x);
+            break :blk script_buf[0..x.len];
+        },
+        else => blk: {
+            RoundMark.mark(.taproot);
+            const x = btcaddr.scriptP2tr(&h);
+            @memcpy(script_buf[0..x.len], &x);
+            break :blk script_buf[0..x.len];
+        },
+    };
+    const addr = try btcaddr.fromScriptPubKey(script, net);
+    const d = btcaddr.toScriptPubKeyFor(addr.slice(), net) catch return error.GenuineRefused;
+    if (!std.mem.eql(u8, d.script(), script)) return error.RoundtripMismatch;
+    RoundMark.mark(.genuine_accepted);
+
+    // One substituted character (a different one from the address's own
+    // alphabet: the base58 or bech32 character set).
+    const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    var copy: [btcaddr.max_address_len]u8 = undefined;
+    @memcpy(copy[0..addr.len], addr.slice());
+    const at = src.index(addr.len);
+    const bech = std.mem.indexOfScalar(u8, addr.slice(), '1') != null and
+        (std.ascii.startsWithIgnoreCase(addr.slice(), "bc1") or std.ascii.startsWithIgnoreCase(addr.slice(), "tb1") or std.ascii.startsWithIgnoreCase(addr.slice(), "bcrt1"));
+    if (bech) {
+        // Past the separator only (an hrp edit is a different, refused address
+        // anyway, but the invariant checked here is the checksum's).
+        const sep = std.mem.lastIndexOfScalar(u8, addr.slice(), '1').?;
+        const j = sep + 1 + src.index(addr.len - sep - 1);
+        const cs = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        copy[j] = cs[(std.mem.indexOfScalar(u8, cs, copy[j]).? + 1) % cs.len];
+    } else {
+        copy[at] = alphabet[(std.mem.indexOfScalar(u8, alphabet, copy[at]).? + 1) % alphabet.len];
+    }
+    if (btcaddr.toScriptPubKeyFor(copy[0..addr.len], net)) |_| return error.FlippedAddressAccepted else |_| {}
+    RoundMark.mark(.flipped_refused);
+
+    // WIF.
+    var key: [32]u8 = h;
+    key[0] = 1 + (key[0] % 0x7f);
+    const compressed = src.value(bool);
+    var out: [btcaddr.max_wif_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &out);
+    const wif = try btcaddr.wifEncode(&key, compressed, net, &out);
+    var w: btcaddr.Wif = undefined;
+    btcaddr.wifDecode(&w, wif) catch return error.GenuineWifRefused;
+    defer w.wipe();
+    if (!std.mem.eql(u8, &w.key, &key) or w.compressed != compressed) return error.WifRoundtripMismatch;
+    var wcopy: [btcaddr.max_wif_len]u8 = undefined;
+    @memcpy(wcopy[0..wif.len], wif);
+    const wj = src.index(wif.len);
+    wcopy[wj] = alphabet[(std.mem.indexOfScalar(u8, alphabet, wcopy[wj]).? + 1) % alphabet.len];
+    var w2: btcaddr.Wif = undefined;
+    if (btcaddr.wifDecode(&w2, wcopy[0..wif.len])) |_| {
+        w2.wipe();
+        return error.FlippedWifAccepted;
     } else |_| {}
+    RoundMark.mark(.wif);
+}
+
+test "fuzz driver: BTCADDR_FUZZ (roundtrip)" {
+    try fz.fuzz_driver.run(fuzzRoundtrip, .{ .prefix = "BTCADDR_FUZZ", .name = "btcaddr-roundtrip" });
+}
+
+test "fuzz harness: roundtrip, 400 seeds, reaches every outcome" {
+    try RoundMark.reach(fuzzRoundtrip, "btcaddr-roundtrip", 400);
+}
+
+fn fuzzRoundtripSmith(_: void, smith: *testing.Smith) !void {
+    try fuzzRoundtrip(testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: roundtrip, exploration" {
+    try testing.fuzz({}, fuzzRoundtripSmith, .{});
 }

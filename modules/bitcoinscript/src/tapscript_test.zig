@@ -343,19 +343,34 @@ const tapscript_seeds = [_][]const u8{
     fuzzseed.seedHex("0002" ++ "01ba" ++ "0151" ++ "00" ++ "00" ++ "00" ++ "ff" ** 8), // every `discourage_*` policy on
 };
 
+const fz = @import("fuzz_test.zig");
+const LeafMark = fz.Marker(enum { genuine_commitment, damaged_refused, leaf_accepted, leaf_refused });
+
 test "fuzz: tapscript leaf evaluation, with the commitment built for the leaf" {
-    try std.testing.fuzz({}, fuzzTapscriptLeaf, .{ .corpus = &tapscript_seeds });
+    try std.testing.fuzz({}, fuzzTapscriptLeafSmith, .{ .corpus = &tapscript_seeds });
 }
 
-fn fuzzTapscriptLeaf(_: void, smith: *std.testing.Smith) !void {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+test "fuzz driver: BITCOINSCRIPT_FUZZ (tapscript leaf)" {
+    try fz.fuzz_driver.run(fuzzTapscriptLeaf, .{ .prefix = "BITCOINSCRIPT_FUZZ", .name = "bitcoinscript-tapscript" });
+}
+
+test "fuzz harness: tapscript leaf, 400 seeds, reaches every outcome" {
+    try LeafMark.reach(fuzzTapscriptLeaf, "bitcoinscript-tapscript", 400);
+}
+
+fn fuzzTapscriptLeafSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzTapscriptLeaf(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzTapscriptLeaf(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
     // ⚠ ONE byte-first draw. See `tapscript_seeds` for the cap the old
     // `u64`-word seeds put on every choice here.
     var seed_buf: [tapscript_script_len]u8 = undefined;
-    const seed_len: usize = smith.slice(&seed_buf);
+    const seed_len: usize = fz.drawInput(S, src, &seed_buf, &tapscript_seeds);
     var script_cursor: fuzzseed.Cursor = .{ .bytes = seed_buf[0..seed_len] };
 
     // A leaf script the fuzzer chooses, biased toward real opcodes so the
@@ -402,7 +417,9 @@ fn fuzzTapscriptLeaf(_: void, smith: *std.testing.Smith) !void {
     }
 
     const r = verify.verifyScript(a, &.{}, &s.script_pubkey, witness[0 .. n_stack + 2], f, s.ctx);
+    if (r) |_| LeafMark.mark(.leaf_accepted) else |_| LeafMark.mark(.leaf_refused);
     if (!cb_damaged) {
+        LeafMark.mark(.genuine_commitment);
         // The commitment was built for this exact leaf, so the one verdict
         // that must never come back is "the commitment does not match" — that
         // is the wall this harness exists to get past, and if it ever returns
@@ -412,7 +429,7 @@ fn fuzzTapscriptLeaf(_: void, smith: *std.testing.Smith) !void {
             else => {},
         }
     } else {
-        _ = r catch {};
+        if (r) |_| return error.DamagedControlBlockAccepted else |_| LeafMark.mark(.damaged_refused);
     }
 }
 

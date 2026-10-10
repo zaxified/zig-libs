@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-11 · mutation 2026-09-11 · src ?
 
-**Hardening:** fuzz ? · ct n/a — QR encoding (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, QR_FUZZ) · ct n/a — QR encoding (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

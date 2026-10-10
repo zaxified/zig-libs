@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `BECH32_FUZZ` over the bech32, base58 and segwit decode harnesses (generic over their choice source) plus roundtrip oracles (genuine accepted, one substituted character refused, wrong hrp refused). No code change.
 - **2026-09-15** — **API addition, no consumer-visible behaviour change:** `polymod`,
   `charValue`, `toLower` and `hrpExpandInto` (the BCH-checksum/charset primitives underneath
   `encode`/`decode`, already length-generic — plain slices, no internal cap) are now `pub` and

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `QR_FUZZ` over the encode, decode, damage and sequence harnesses (generic over their choice source; verdicts at a `.scale` share for the slow ones). The damage harness now also requires that net damage of at most two modules is always recovered. No code change.
 - **2026-09-11** — **DOC FIX (SPEC.md only, no code change):** A1/qr.md's open "post-Forney"
   item resolved by explanation + measurement rather than by finding an adversarial RS input.
   The post-Forney syndrome re-check cannot catch a genuine Berlekamp-Massey miscorrection to a

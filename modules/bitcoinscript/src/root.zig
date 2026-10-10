@@ -105,6 +105,7 @@ test {
     _ = tapscript;
     _ = interpreter;
     _ = verify;
+    _ = @import("fuzz_test.zig");
     _ = @import("asmparser.zig");
     _ = @import("script_tests_vectors.zig");
     _ = @import("script_tests_test.zig");

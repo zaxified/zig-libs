@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `LINKHEADER_FUZZ` over the parse harness (generic over its choice source) plus a write-to-parse roundtrip oracle and a helpers harness (`decodeExtValue`/`unquote`/`resolve` never panic, `encodeExtValue` roundtrips). No code change.
 - **2026-10-04** — **mvp → core.** Every param of a parsed link: `Link.params()`
   (`ParamIterator`, borrowed, header order, repeats and unknown ones included),
   `Link.param(name)`, `Link.raw_params`; `anchor`, `media` and `title*`

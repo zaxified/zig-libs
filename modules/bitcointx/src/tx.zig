@@ -982,13 +982,27 @@ fn buildDeserCorpus(self: *DeserCorpus) []const []const u8 {
     return self.entries[0..self.n];
 }
 
+const fz = @import("fuzz_test.zig");
+const DeserMark = fz.Marker(enum { accepted, refused, witness, multi_input });
+
 test "fuzz: deserializePartial never panics on arbitrary bytes" {
     var corpus: DeserCorpus = .{};
-    try testing.fuzz({}, fuzzDeserializePartial, .{ .corpus = buildDeserCorpus(&corpus) });
+    try testing.fuzz({}, fuzzDeserializePartialSmith, .{ .corpus = buildDeserCorpus(&corpus) });
 }
 
-fn fuzzDeserializePartial(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+test "fuzz driver: BITCOINTX_FUZZ (deserializePartial)" {
+    try fz.fuzz_driver.run(fuzzDeserializePartial, .{ .prefix = "BITCOINTX_FUZZ", .name = "bitcointx-deserialize" });
+}
+
+test "fuzz harness: deserializePartial, 500 seeds, reaches every outcome" {
+    try DeserMark.reach(fuzzDeserializePartial, "bitcointx-deserialize", 500);
+}
+
+fn fuzzDeserializePartialSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDeserializePartial(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDeserializePartial(comptime S: type, smith: *S, allocator: Allocator) anyerror!void {
     var buf: [fuzz_tx_buf_len]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length. The
     // latter drew `len == 0` on every input this target ever ran outside
@@ -996,7 +1010,7 @@ fn fuzzDeserializePartial(_: void, smith: *std.testing.Smith) !void {
     // returns the range MINIMUM when fewer than eight remain, and `bytes` had
     // already eaten them. With no corpus either, the one input was `""` -- so
     // `deserializePartial` had never decoded a transaction here.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawTx(S, smith, &buf);
 
     // Bias the byte right after the 4-byte version field (where a
     // CompactSize vin-count, or the 0x00 segwit marker, is read) toward
@@ -1014,8 +1028,14 @@ fn fuzzDeserializePartial(_: void, smith: *std.testing.Smith) !void {
         };
     }
 
-    var r = deserializePartial(allocator, buf[0..len]) catch return;
+    var r = deserializePartial(allocator, buf[0..len]) catch {
+        DeserMark.mark(.refused);
+        return;
+    };
     defer r.tx.deinit(allocator);
+    DeserMark.mark(.accepted);
+    if (r.tx.has_witness) DeserMark.mark(.witness);
+    if (r.tx.vin.len > 1) DeserMark.mark(.multi_input);
 }
 
 test "corpus: deserializePartial seeds reach the decoder, and the counts are pinned" {

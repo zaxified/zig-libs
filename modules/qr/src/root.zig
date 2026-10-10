@@ -1419,6 +1419,7 @@ fn parseSegments(data: []const u8, version: u6, out: []u8, seq_out: *?Sequence) 
 test {
     _ = render;
     _ = @import("golden_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "GF(2^8) is the field the standard names" {
@@ -1629,14 +1630,35 @@ const encode_seeds = [_][]const u8{
     seed(""), // the empty script: exactly what the collapsed harness ran
 };
 
+const fz = @import("fuzz_test.zig");
+const EncodeMark = fz.Marker(enum { encoded, refused, round_tripped });
+const DecodeMark = fz.Marker(enum { grid });
+const DamageMark = fz.Marker(enum { undamaged, damaged, recovered, refused });
+const SequenceMark = fz.Marker(enum { encoded, multi_symbol });
+
 test "fuzz: encode never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzEncode, .{ .corpus = &encode_seeds });
+    try std.testing.fuzz({}, fuzzEncodeSmith, .{ .corpus = &encode_seeds });
 }
 
-fn fuzzEncode(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: QR_FUZZ (encode)" {
+    try fz.fuzz_driver.run(fuzzEncode, .{ .prefix = "QR_FUZZ", .name = "qr-encode", .scale = 4 });
+}
+
+test "fuzz harness: encode, 300 seeds, reaches every outcome" {
+    try EncodeMark.reach(fuzzEncode, "qr-encode", 300);
+}
+
+fn fuzzEncodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzEncode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzEncode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    _ = try runEncodeScript(buf[0..len]);
+    const len: usize = fz.drawInput(S, src, &buf, &encode_seeds);
+    const out = try runEncodeScript(buf[0..len]);
+    if (out.encoded) EncodeMark.mark(.encoded) else EncodeMark.mark(.refused);
+    if (out.round_tripped) EncodeMark.mark(.round_tripped);
 }
 
 test "corpus: every encode seed reaches the encoder, and the symbols built are pinned" {
@@ -1931,13 +1953,27 @@ const decode_seeds = [_][]const u8{
 };
 
 test "fuzz: decode never panics on an arbitrary grid" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: QR_FUZZ (decode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "QR_FUZZ", .name = "qr-decode" });
+}
+
+test "fuzz harness: decode, 200 seeds, reaches every outcome" {
+    try DecodeMark.reach(fuzzDecode, "qr-decode", 200);
+}
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var script: [512]u8 = undefined;
-    const n: usize = smith.slice(&script);
+    const n: usize = fz.drawInput(S, src, &script, &decode_seeds);
     _ = runDecodeScript(script[0..n]);
+    DecodeMark.mark(.grid);
 }
 
 /// What one damage script did to a real symbol.
@@ -1971,6 +2007,7 @@ fn runDamageScript(bytes: []const u8) !DamageOutcome {
     var m: Matrix = undefined;
     encode(&m, "FUZZ TARGET 12345", .{ .ecc = out.ecc }) catch return out;
 
+    const orig = m;
     const flips = s.word() % 201;
     out.flips = flips;
     for (0..flips) |_| {
@@ -1980,7 +2017,17 @@ fn runDamageScript(bytes: []const u8) !DamageOutcome {
     }
 
     var buf: [4096]u8 = undefined;
-    const got = decode(&m, &buf) catch return out;
+    // Net damage of at most two modules lies within what every ECC level
+    // repairs (two modules touch at most two codewords, and the format and
+    // version information carry their own BCH): it must be recovered.
+    var net: usize = 0;
+    for (0..m.size) |y| for (0..m.size) |x| {
+        if (m.isDark(@intCast(x), @intCast(y)) != orig.isDark(@intCast(x), @intCast(y))) net += 1;
+    };
+    const got = decode(&m, &buf) catch {
+        if (net <= 2) return error.RecoverableDamageNotRecovered;
+        return out;
+    };
     // If it claims success, the message must be the one that was encoded —
     // a decoder that returns confident nonsense is worse than one that refuses.
     try std.testing.expectEqualStrings("FUZZ TARGET 12345", got);
@@ -2018,13 +2065,28 @@ const damage_seeds = [_][]const u8{
 };
 
 test "fuzz: decode survives damage to a real symbol" {
-    try std.testing.fuzz({}, fuzzDamage, .{ .corpus = &damage_seeds });
+    try std.testing.fuzz({}, fuzzDamageSmith, .{ .corpus = &damage_seeds });
 }
 
-fn fuzzDamage(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: QR_FUZZ (damage)" {
+    try fz.fuzz_driver.run(fuzzDamage, .{ .prefix = "QR_FUZZ", .name = "qr-damage", .scale = 2 });
+}
+
+test "fuzz harness: damage, 300 seeds, reaches every outcome" {
+    try DamageMark.reach(fuzzDamage, "qr-damage", 300);
+}
+
+fn fuzzDamageSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDamage(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDamage(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var script: [512]u8 = undefined;
-    const n: usize = smith.slice(&script);
-    _ = try runDamageScript(script[0..n]);
+    const n: usize = fz.drawInput(S, src, &script, &damage_seeds);
+    const out = try runDamageScript(script[0..n]);
+    if (out.flips == 0) DamageMark.mark(.undamaged) else DamageMark.mark(.damaged);
+    if (out.recovered) DamageMark.mark(.recovered) else DamageMark.mark(.refused);
 }
 
 test "corpus: the grid and damage scripts reach the decoder, and what they did is pinned" {
@@ -2278,13 +2340,28 @@ const sequence_seeds = [_][]const u8{
 };
 
 test "fuzz: a sequence survives the round trip whatever the message" {
-    try std.testing.fuzz({}, fuzzSequence, .{ .corpus = &sequence_seeds });
+    try std.testing.fuzz({}, fuzzSequenceSmith, .{ .corpus = &sequence_seeds });
 }
 
-fn fuzzSequence(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: QR_FUZZ (sequence)" {
+    try fz.fuzz_driver.run(fuzzSequence, .{ .prefix = "QR_FUZZ", .name = "qr-sequence", .scale = 8 });
+}
+
+test "fuzz harness: sequence, 300 seeds, reaches every outcome" {
+    try SequenceMark.reach(fuzzSequence, "qr-sequence", 300);
+}
+
+fn fuzzSequenceSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSequence(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzSequence(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var script: [601]u8 = undefined;
-    const n: usize = smith.slice(&script);
-    _ = try runSequenceScript(script[0..n]);
+    const n: usize = fz.drawInput(S, src, &script, &sequence_seeds);
+    const out = try runSequenceScript(script[0..n]);
+    if (out.symbols != 0) SequenceMark.mark(.encoded);
+    if (out.symbols > 1) SequenceMark.mark(.multi_symbol);
 }
 
 test "corpus: the sequence scripts really split, and the symbol counts are pinned" {

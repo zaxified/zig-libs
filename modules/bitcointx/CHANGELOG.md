@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `BITCOINTX_FUZZ` over the `deserializePartial` and decode-to-sighash harnesses (generic over their choice source; reference transactions with 0-3 damaged octets) plus a serialize roundtrip oracle (reference transactions come back byte-identical, accepted ones re-serialize idempotently). No code change.
 - **2026-10-05** — Tests: first dated mutation run (34 mutants, 32 killed, 2 equivalent; `SPEC.md`
   § "Mutation run 2026-10-05"). No defect; new tests for a version-only transaction and a trailing
   `OP_PUSHDATA1` in a scriptCode. No source change.

@@ -1019,14 +1019,42 @@ const parse_seeds = [_][]const u8{
     seed("</terms>; rel=\"copyright\"; anchor=\"#foo\""), // RFC 8288 §3.5, an unmodeled param
 };
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
-    var buf: [256]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    var it = parse(buf[0..len]);
-    while (it.next()) |_| {}
+const fz = @import("fuzz_test.zig");
+
+test {
+    _ = fz;
 }
+const ParseMark = fz.Marker(enum { empty, links, title, params });
+
+fn fuzzParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [256]u8 = undefined;
+    const len: usize = fz.drawInput(S, src, &buf, &parse_seeds);
+    var it = parse(buf[0..len]);
+    var n: usize = 0;
+    while (it.next()) |l| {
+        n += 1;
+        if (l.title != null) ParseMark.mark(.title);
+        var ps = l.params();
+        while (ps.next()) |_| ParseMark.mark(.params);
+    }
+    if (n == 0) ParseMark.mark(.empty) else ParseMark.mark(.links);
+}
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParse(std.testing.Smith, smith, testing.allocator);
+}
+
 test "fuzz parse never panics" {
-    try testing.fuzz({}, fuzzParse, .{ .corpus = &parse_seeds });
+    try testing.fuzz({}, fuzzParseSmith, .{ .corpus = &parse_seeds });
+}
+
+test "fuzz driver: LINKHEADER_FUZZ (parse)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "LINKHEADER_FUZZ", .name = "linkheader-parse" });
+}
+
+test "fuzz harness: parse, 500 seeds, reaches every outcome" {
+    try ParseMark.reach(fuzzParse, "linkheader-parse", 500);
 }
 
 test "corpus: every seed reaches the parser, and the links yielded are pinned" {

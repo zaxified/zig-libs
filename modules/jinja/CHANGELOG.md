@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `JINJA_FUZZ` over the compile, whitespace, numeric-argument, autoescape and xmlattr harnesses (generic over their choice source) plus an integer-arithmetic oracle against Zig closed forms. No code change.
 - **2026-10-06** — Mutation run: 36 of 38 killed, 2 equivalent; 5 tests added (every
   render cap at its bound and one past it, the memory guards and zero steps under a small
   budget, `checkName`'s name-length/component-count bounds and a lone NUL, index ==

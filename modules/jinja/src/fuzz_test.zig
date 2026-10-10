@@ -13,10 +13,90 @@
 //! ```sh
 //! zig build test-jinja --fuzz --release=safe
 //! ```
+//!
+//! Deterministic driver (added 2026-10-10): every harness body is generic over
+//! its source of choices, `fn(comptime S, *S, gpa)`; `testing.fuzz` hands it a
+//! `std.testing.Smith` (corpus seeds replay as before), the driver a
+//! `testkit.fuzz.driver.Rng`. `JINJA_FUZZ=<runs>[,<first seed>]` (`_ONLY`
+//! selects a harness). Harness names: `jinja-compile`, `jinja-whitespace`,
+//! `jinja-numeric`, `jinja-autoescape`, `jinja-xmlattr`, `jinja-arith`.
+//! The driver's `Rng` half draws a corpus entry's first frame with 0-3 octets
+//! damaged and maybe truncated, or fresh octets.
 
 const std = @import("std");
 const jinja = @import("root.zig");
 const testkit_fuzz = @import("testkit").fuzz;
+const testing = std.testing;
+pub const fuzz_driver = testkit_fuzz.driver;
+
+/// One harness input into `buf`; returns its length. Under `Smith` (`--fuzz`,
+/// `_INPUT` replay) it is exactly `src.slice`. Under the driver's `Rng` half
+/// the draws are instead a corpus entry (frames carry a little-endian u32
+/// length header; the bend words after the frame are dropped) with 0-3 octets
+/// damaged and maybe truncated: random text almost never passes the checksum.
+pub fn drawInput(comptime S: type, src: *S, buf: []u8, corpus: []const []const u8) usize {
+    if (S != fuzz_driver.Rng) return src.slice(buf);
+    if (corpus.len == 0 or !src.value(bool)) return src.slice(buf);
+    const entry = corpus[src.index(corpus.len)];
+    const flen = std.mem.readInt(u32, entry[0..4], .little);
+    const frame = entry[4..][0..@min(flen, entry.len - 4)];
+    return damage(src, buf, frame);
+}
+
+/// `frame` into `buf` with 0-3 octets damaged and maybe truncated (the
+/// driver's `Rng` only; the damage is drawn from `src`).
+pub fn damage(src: anytype, buf: []u8, frame: []const u8) usize {
+    var n = @min(frame.len, buf.len);
+    @memcpy(buf[0..n], frame[0..n]);
+    for (0..src.valueRangeAtMost(u8, 0, 3)) |_| {
+        if (n == 0) break;
+        buf[src.index(n)] = src.value(u8);
+    }
+    if (src.valueRangeAtMost(u8, 0, 3) == 0) n = src.index(n + 1);
+    return n;
+}
+
+/// Reach counters for one harness file's labels. `mark` also feeds the
+/// driver's `REACH` report; `reach` runs `seeds` seeds in the ordinary test
+/// binary and fails with `error.HarnessDoesNotReach` if a label never fired.
+pub fn Marker(comptime Label: type) type {
+    return struct {
+        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+
+        pub fn mark(comptime l: Label) void {
+            counts[@intFromEnum(l)] += 1;
+            fuzz_driver.hit(@tagName(l));
+        }
+
+        pub fn reach(comptime harness: anytype, comptime name: []const u8, seeds: usize) !void {
+            counts = @splat(0);
+            for (0..seeds) |seed_n| {
+                var prng = std.Random.DefaultPrng.init(seed_n);
+                var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+                harness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                    std.debug.print(name ++ " seed {d}: {t}\n", .{ seed_n, err });
+                    return err;
+                };
+            }
+            for (counts, 0..) |n, i| if (n == 0) {
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                return error.HarnessDoesNotReach;
+            };
+        }
+    };
+}
+
+fn drawFrom(comptime S: type, src: *S, buf: []u8, corpus: []const []const u8) []const u8 {
+    return buf[0..drawInput(S, src, buf, corpus)];
+}
+
+fn smithOf(comptime harness: anytype) fn (void, *std.testing.Smith) anyerror!void {
+    return struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            return harness(std.testing.Smith, smith, std.testing.allocator);
+        }
+    }.f;
+}
 
 /// `testkit.fuzz.seed`, aliased so the corpora below read as the template text
 /// they are. A corpus entry is not the template: the draw reads a little-endian
@@ -68,17 +148,22 @@ fn drawSource(smith: *std.testing.Smith, buf: []u8) []const u8 {
 /// cliff) and `s` is now fuzzer-drawn bytes instead of the literal `"text"`,
 /// so a defect reachable only via hostile context data (F2/F3/F5's shape)
 /// is now in the sweep's reach, not just template-*syntax* defects.
-fn fuzzCompileAndRender(_: void, smith: *std.testing.Smith) !void {
-    const gpa = std.testing.allocator;
+const CompileMark = Marker(enum { compiled, compile_refused, rendered, render_refused });
+
+fn fuzzCompileAndRender(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [fuzz_template_buf_len]u8 = undefined;
-    const src = drawSource(smith, &buf);
+    const src = drawFrom(S, smith, &buf, &template_seeds);
 
     var env = try jinja.Environment.init(gpa, .{ .undefined_policy = .lenient });
     defer env.deinit();
 
     var diag: jinja.Diagnostic = .{};
-    var tmpl = env.compile(src, &diag) catch return;
+    var tmpl = env.compile(src, &diag) catch {
+        CompileMark.mark(.compile_refused);
+        return;
+    };
     defer tmpl.deinit();
+    CompileMark.mark(.compiled);
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -96,18 +181,23 @@ fn fuzzCompileAndRender(_: void, smith: *std.testing.Smith) !void {
         .d = .{ .k = "v" },
     });
 
-    const out = tmpl.render(gpa, ctx, &diag) catch return;
+    const out = tmpl.render(gpa, ctx, &diag) catch {
+        CompileMark.mark(.render_refused);
+        return;
+    };
     gpa.free(out);
+    CompileMark.mark(.rendered);
 }
 
 /// The same, with the syntax options that rewrite whitespace turned on — the
 /// slice edits in `applyWhitespace` are the part most likely to walk off the
 /// end of a text chunk. F12: buffer raised from 512 to 4096 bytes, matching
 /// the order-of-magnitude increase given to the harness above.
-fn fuzzWhitespaceOptions(_: void, smith: *std.testing.Smith) !void {
-    const gpa = std.testing.allocator;
+const WsMark = Marker(enum { compiled, compile_refused, rendered, render_refused });
+
+fn fuzzWhitespaceOptions(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [fuzz_whitespace_buf_len]u8 = undefined;
-    const src = drawSource(smith, &buf);
+    const src = drawFrom(S, smith, &buf, &whitespace_seeds);
 
     var env = try jinja.Environment.init(gpa, .{
         .trim_blocks = true,
@@ -117,10 +207,18 @@ fn fuzzWhitespaceOptions(_: void, smith: *std.testing.Smith) !void {
     });
     defer env.deinit();
 
-    var tmpl = env.compile(src, null) catch return;
+    var tmpl = env.compile(src, null) catch {
+        WsMark.mark(.compile_refused);
+        return;
+    };
     defer tmpl.deinit();
-    const out = tmpl.render(gpa, .{ .map = .{ .pairs = &.{} } }, null) catch return;
+    WsMark.mark(.compiled);
+    const out = tmpl.render(gpa, .{ .map = .{ .pairs = &.{} } }, null) catch {
+        WsMark.mark(.render_refused);
+        return;
+    };
     gpa.free(out);
+    WsMark.mark(.rendered);
 }
 
 /// One place a template puts a number, split around the number itself.
@@ -206,7 +304,11 @@ const NumericScript = struct { n: i64, exp: i32 };
 fn readNumericScript(smith: *std.testing.Smith) NumericScript {
     var buf: [64]u8 = undefined;
     const len = smith.slice(&buf);
-    var cur: testkit_fuzz.Cursor = .{ .bytes = buf[0..len] };
+    return numericScriptFrom(buf[0..len]);
+}
+
+fn numericScriptFrom(bytes: []const u8) NumericScript {
+    var cur: testkit_fuzz.Cursor = .{ .bytes = bytes };
     var raw: u64 = 0;
     for (0..8) |_| raw = (raw << 8) | cur.byte();
     // `Cursor.word` is two octets big-endian, so a script reads in the order it
@@ -250,9 +352,11 @@ const numeric_seeds = [_][]const u8{
     numericSeed(9007199254740993, 0), // 2^53+1: not representable as an f64
 };
 
-fn fuzzNumericArgs(_: void, smith: *std.testing.Smith) !void {
-    const gpa = std.testing.allocator;
-    const script = readNumericScript(smith);
+const NumMark = Marker(enum { rendered, refused });
+
+fn fuzzNumericArgs(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    var nbuf: [64]u8 = undefined;
+    const script = numericScriptFrom(drawFrom(S, smith, &nbuf, &numeric_seeds));
 
     for (num_sites) |site| {
         for ([_]Spelling{ .literal_int, .literal_float, .via_ctx }) |spelling| {
@@ -302,8 +406,12 @@ fn renderNumericSite(
     @memcpy(pairs[0..ctx.map.pairs.len], ctx.map.pairs);
     pairs[ctx.map.pairs.len] = .{ .key = .{ .string = .{ .bytes = "nn" } }, .value = nn };
 
-    const out = tmpl.render(gpa, .{ .map = .{ .pairs = pairs } }, null) catch return;
+    const out = tmpl.render(gpa, .{ .map = .{ .pairs = pairs } }, null) catch {
+        NumMark.mark(.refused);
+        return;
+    };
     gpa.free(out);
+    NumMark.mark(.rendered);
 }
 
 /// Template shapes that put **context data** through a filter, a method or an
@@ -390,9 +498,9 @@ const escape_seeds = [_][]const u8{
     seed("<" ** 64), // enough markup to walk any escaper's buffer growth
 };
 
-fn fuzzAutoescapeInvariant(_: void, smith: *std.testing.Smith) !void {
-    const gpa = std.testing.allocator;
+const EscMark = Marker(enum { rendered, refused, markup_in_datum });
 
+fn fuzzAutoescapeInvariant(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     // ⚠ The data draw comes FIRST and is one `slice` call. It used to be
     // `escape_sites[smith.index(escape_sites.len)]` followed by a ranged length
     // and `bytes`, which disarmed the harness twice over: a ranged first draw
@@ -402,7 +510,8 @@ fn fuzzAutoescapeInvariant(_: void, smith: *std.testing.Smith) !void {
     // the oracle to find. The site is no longer drawn — EVERY site runs on
     // every input, which is the point of having a table of them.
     var buf: [256]u8 = undefined;
-    const evil = buf[0..smith.slice(&buf)];
+    const evil = drawFrom(S, smith, &buf, &escape_seeds);
+    if (std.mem.indexOfAny(u8, evil, "<>") != null) EscMark.mark(.markup_in_datum);
 
     var env = try jinja.Environment.init(gpa, .{ .autoescape = true, .undefined_policy = .lenient });
     defer env.deinit();
@@ -420,8 +529,12 @@ fn fuzzAutoescapeInvariant(_: void, smith: *std.testing.Smith) !void {
         defer arena.deinit();
         const ctx = try jinja.valueFrom(arena.allocator(), .{ .s = "q x q", .e = evil });
 
-        const out = tmpl.render(gpa, ctx, null) catch continue;
+        const out = tmpl.render(gpa, ctx, null) catch {
+            EscMark.mark(.refused);
+            continue;
+        };
         defer gpa.free(out);
+        EscMark.mark(.rendered);
 
         if (std.mem.indexOfAny(u8, out, "<>")) |at| {
             std.debug.print(
@@ -475,9 +588,9 @@ const xmlattr_seeds = [_][]const u8{
     seedPair("onmouseover", "alert(1)"), // a legal name that happens to be an event handler
 };
 
-fn fuzzXmlattrInvariant(_: void, smith: *std.testing.Smith) !void {
-    const gpa = std.testing.allocator;
+const XmlMark = Marker(enum { rendered, refused, key_with_space });
 
+fn fuzzXmlattrInvariant(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     // ⚠ Two `slice` draws, key then value. Both used to be
     // `indexWithHash` + `bytes`, so both lengths were 0 for every input a
     // corpus can carry — the harness rendered `{{ d|xmlattr }}` over a single
@@ -485,7 +598,8 @@ fn fuzzXmlattrInvariant(_: void, smith: *std.testing.Smith) !void {
     // every run. The key is the half the audit's CRITICAL lived in, and it had
     // never once held a byte.
     var kbuf: [128]u8 = undefined;
-    const kn = smith.slice(&kbuf);
+    const kn = drawInput(S, smith, &kbuf, &xmlattr_seeds);
+    if (std.mem.indexOfAny(u8, kbuf[0..kn], " \t\n/>=\"") != null) XmlMark.mark(.key_with_space);
     var vbuf: [128]u8 = undefined;
     const vn = smith.slice(&vbuf);
 
@@ -508,8 +622,12 @@ fn fuzzXmlattrInvariant(_: void, smith: *std.testing.Smith) !void {
 
     // A refusal is the correct answer for a key that cannot be spelled; only a
     // rendered result makes a claim that can be wrong.
-    const out = tmpl.render(gpa, ctx, null) catch return;
+    const out = tmpl.render(gpa, ctx, null) catch {
+        XmlMark.mark(.refused);
+        return;
+    };
     defer gpa.free(out);
+    XmlMark.mark(.rendered);
 
     if (!attrsWellFormed(out)) {
         std.debug.print(
@@ -548,7 +666,7 @@ fn attrsWellFormed(out: []const u8) bool {
 }
 
 test "fuzz: arbitrary context data never breaks out of an attribute name" {
-    try std.testing.fuzz({}, fuzzXmlattrInvariant, .{ .corpus = &xmlattr_seeds });
+    try std.testing.fuzz({}, smithOf(fuzzXmlattrInvariant), .{ .corpus = &xmlattr_seeds });
 }
 
 test "the attribute oracle rejects the injection the audit found" {
@@ -636,7 +754,7 @@ const template_seeds = [_][]const u8{
 };
 
 test "fuzz: arbitrary bytes as a template never panic" {
-    try std.testing.fuzz({}, fuzzCompileAndRender, .{ .corpus = &template_seeds });
+    try std.testing.fuzz({}, smithOf(fuzzCompileAndRender), .{ .corpus = &template_seeds });
 }
 
 /// The same templates, minus the context datum the whitespace harness does not
@@ -664,15 +782,15 @@ const whitespace_seeds = [_][]const u8{
 };
 
 test "fuzz: arbitrary bytes with whitespace options never panic" {
-    try std.testing.fuzz({}, fuzzWhitespaceOptions, .{ .corpus = &whitespace_seeds });
+    try std.testing.fuzz({}, smithOf(fuzzWhitespaceOptions), .{ .corpus = &whitespace_seeds });
 }
 
 test "fuzz: arbitrary numeric arguments to filters, globals and slices never panic" {
-    try std.testing.fuzz({}, fuzzNumericArgs, .{ .corpus = &numeric_seeds });
+    try std.testing.fuzz({}, smithOf(fuzzNumericArgs), .{ .corpus = &numeric_seeds });
 }
 
 test "fuzz: arbitrary context data never reaches the output as live markup" {
-    try std.testing.fuzz({}, fuzzAutoescapeInvariant, .{ .corpus = &escape_seeds });
+    try std.testing.fuzz({}, smithOf(fuzzAutoescapeInvariant), .{ .corpus = &escape_seeds });
 }
 
 test "every autoescape fuzz site is a template that compiles" {
@@ -917,4 +1035,98 @@ test "corpus: every xmlattr seed carries a key and a value, and what rendered is
     // every run — and 0 attribute octets. 19 / 19 / 11 / 179 after.
     try std.testing.expectEqual(@as(usize, 11), renders);
     try std.testing.expectEqual(@as(usize, 179), attr_octets);
+}
+
+// ── the arithmetic oracle ────────────────────────────────────────────────────
+
+const ArithMark = Marker(enum { genuine_accepted, floor_division, negative_operand, comparison });
+
+/// Integer expressions the engine and Zig must agree on: `+ - *` (wrapping is
+/// refused, not wrapped), floor `//` and `%` (Python semantics, the sign of
+/// the divisor), and comparisons. A rendered answer that differs from the
+/// closed form is a defect; a refused one (overflow, division by zero) is
+/// allowed only where Zig's own arithmetic overflows or divides by zero.
+fn fuzzArith(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const a: i64 = if (src.value(bool)) src.valueRangeAtMost(i16, -50, 50) else src.value(i32);
+    const b: i64 = if (src.value(bool)) src.valueRangeAtMost(i16, -50, 50) else src.value(i32);
+    const op = src.valueRangeAtMost(u8, 0, 6);
+    if (a < 0 or b < 0) ArithMark.mark(.negative_operand);
+
+    var tbuf: [96]u8 = undefined;
+    const syms = [_][]const u8{ "+", "-", "*", "//", "%", "<", "==" };
+    const sym = syms[op];
+    const text = try std.fmt.bufPrint(&tbuf, "{{{{ ({d}) {s} ({d}) }}}}", .{ a, sym, b });
+
+    var env = try jinja.Environment.init(gpa, .{ .undefined_policy = .strict });
+    defer env.deinit();
+    var tmpl = try env.compile(text, null);
+    defer tmpl.deinit();
+
+    var want_buf: [32]u8 = undefined;
+    const want: ?[]const u8 = switch (op) {
+        0 => try std.fmt.bufPrint(&want_buf, "{d}", .{a + b}),
+        1 => try std.fmt.bufPrint(&want_buf, "{d}", .{a - b}),
+        2 => try std.fmt.bufPrint(&want_buf, "{d}", .{a * b}),
+        3 => if (b == 0) null else blk: {
+            ArithMark.mark(.floor_division);
+            break :blk try std.fmt.bufPrint(&want_buf, "{d}", .{@divFloor(a, b)});
+        },
+        4 => if (b == 0) null else try std.fmt.bufPrint(&want_buf, "{d}", .{@mod(a, b)}),
+        5 => blk: {
+            ArithMark.mark(.comparison);
+            break :blk try std.fmt.bufPrint(&want_buf, "{s}", .{if (a < b) "True" else "False"});
+        },
+        else => try std.fmt.bufPrint(&want_buf, "{s}", .{if (a == b) "True" else "False"}),
+    };
+
+    const out = tmpl.render(gpa, .{ .map = .{ .pairs = &.{} } }, null) catch {
+        if (want == null) return; // division by zero: refused
+        return error.GenuineExpressionRefused;
+    };
+    defer gpa.free(out);
+    const w = want orelse return error.DivisionByZeroRendered;
+    if (!std.mem.eql(u8, out, w)) {
+        std.debug.print("\narith: '{s}' rendered '{s}', want '{s}'\n", .{ text, out, w });
+        return error.ArithmeticMismatch;
+    }
+    ArithMark.mark(.genuine_accepted);
+}
+
+// ── driver, reach ────────────────────────────────────────────────────────────
+
+test "fuzz driver: JINJA_FUZZ (compile and render)" {
+    try fuzz_driver.run(fuzzCompileAndRender, .{ .prefix = "JINJA_FUZZ", .name = "jinja-compile", .scale = 1 });
+}
+test "fuzz driver: JINJA_FUZZ (whitespace)" {
+    try fuzz_driver.run(fuzzWhitespaceOptions, .{ .prefix = "JINJA_FUZZ", .name = "jinja-whitespace", .scale = 1 });
+}
+// One numeric input is 96 compile-and-renders (32 sites x 3 spellings); a count
+// near the engine's ceiling (`slice`/`batch` build up to ~1.8M groups before
+// `OutOfRange`, ~250 ms each) puts a single input past the driver's 2 s default,
+// so this harness gets a larger per-input limit rather than a smaller number
+// range: the cost per render stays bounded by the ceiling.
+test "fuzz driver: JINJA_FUZZ (numeric)" {
+    try fuzz_driver.run(fuzzNumericArgs, .{ .prefix = "JINJA_FUZZ", .name = "jinja-numeric", .scale = 100, .default_limit_ms = 20_000 });
+}
+test "fuzz driver: JINJA_FUZZ (autoescape)" {
+    try fuzz_driver.run(fuzzAutoescapeInvariant, .{ .prefix = "JINJA_FUZZ", .name = "jinja-autoescape", .scale = 8 });
+}
+test "fuzz driver: JINJA_FUZZ (xmlattr)" {
+    try fuzz_driver.run(fuzzXmlattrInvariant, .{ .prefix = "JINJA_FUZZ", .name = "jinja-xmlattr", .scale = 1 });
+}
+test "fuzz driver: JINJA_FUZZ (arith)" {
+    try fuzz_driver.run(fuzzArith, .{ .prefix = "JINJA_FUZZ", .name = "jinja-arith", .scale = 1 });
+}
+
+test "fuzz harness: every harness, a few hundred seeds, reaches every outcome" {
+    try CompileMark.reach(fuzzCompileAndRender, "jinja-compile", 400);
+    try WsMark.reach(fuzzWhitespaceOptions, "jinja-whitespace", 400);
+    try NumMark.reach(fuzzNumericArgs, "jinja-numeric", 20);
+    try EscMark.reach(fuzzAutoescapeInvariant, "jinja-autoescape", 100);
+    try XmlMark.reach(fuzzXmlattrInvariant, "jinja-xmlattr", 400);
+    try ArithMark.reach(fuzzArith, "jinja-arith", 400);
+}
+
+test "fuzz: arithmetic agrees with the closed form" {
+    try std.testing.fuzz({}, smithOf(fuzzArith), .{});
 }

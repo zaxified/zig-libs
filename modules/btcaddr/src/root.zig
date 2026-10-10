@@ -548,5 +548,6 @@ pub fn p2shP2wshOfWitnessScript(witness_script: []const u8) HelperError![23]u8 {
 test {
     _ = @import("core_test.zig");
     _ = @import("unit_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-04 (44/44) · src ?
 
-**Hardening:** fuzz ? · ct n/a — PBB codec (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, PBB_FUZZ) · ct n/a — PBB codec (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

@@ -2327,8 +2327,76 @@ const scan_scripts = [_][]const u8{
     kit.seed("\x40\x40\x40" ++ "\x00\x00\x00\x00\xff\xff\xff\xff"), // eight-pixel bars, which is what a finder pattern's run lengths look like
 };
 
+const fz = @import("fuzz_test.zig");
+
+test {
+    _ = fz;
+}
+const ScanMark = fz.Marker(enum { found, refused, light_pixels });
+const DamagedMark = fz.Marker(enum { pristine, damaged, found, refused, decoded });
+const RoundtripMark = fz.Marker(enum { scanned_and_decoded, scale_small, scale_large, long_text });
+
 test "fuzz: scan never panics on an arbitrary image" {
-    try std.testing.fuzz({}, fuzzScan, .{ .corpus = &scan_scripts });
+    try std.testing.fuzz({}, fuzzScanSmith, .{ .corpus = &scan_scripts });
+}
+
+test "fuzz driver: QRSCAN_FUZZ (scan)" {
+    try fz.fuzz_driver.run(fuzzScan, .{ .prefix = "QRSCAN_FUZZ", .name = "qrscan-scan", .scale = 8 });
+}
+test "fuzz driver: QRSCAN_FUZZ (damaged)" {
+    try fz.fuzz_driver.run(fuzzDamaged, .{ .prefix = "QRSCAN_FUZZ", .name = "qrscan-damaged", .scale = 8 });
+}
+test "fuzz driver: QRSCAN_FUZZ (roundtrip)" {
+    try fz.fuzz_driver.run(fuzzScanRoundtrip, .{ .prefix = "QRSCAN_FUZZ", .name = "qrscan-roundtrip", .scale = 8 });
+}
+
+test "fuzz harness: scan, damaged and roundtrip, 100 seeds, reach every outcome" {
+    try ScanMark.reach(fuzzScan, "qrscan-scan", 100);
+    try DamagedMark.reach(fuzzDamaged, "qrscan-damaged", 100);
+    try RoundtripMark.reach(fuzzScanRoundtrip, "qrscan-roundtrip", 100);
+}
+
+fn fuzzScanSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzScan(std.testing.Smith, smith, std.testing.allocator);
+}
+fn fuzzDamagedSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDamaged(std.testing.Smith, smith, std.testing.allocator);
+}
+fn fuzzScanRoundtripSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzScanRoundtrip(std.testing.Smith, smith, std.testing.allocator);
+}
+test "fuzz: roundtrip, exploration" {
+    try std.testing.fuzz({}, fuzzScanRoundtripSmith, .{});
+}
+
+/// The oracle the scan harnesses cannot be: a pristine rendering of a symbol
+/// this repo's encoder issued, at any module scale and error-correction level,
+/// is FOUND, sampled module for module, and decoded to the text that went in.
+fn fuzzScanRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var text: [48]u8 = undefined;
+    const n = 1 + src.index(text.len);
+    for (text[0..n]) |*c| c.* = "ABCXYZ 0189$%*+-./:abcxyz~"[src.index(26)];
+    if (n > 24) RoundtripMark.mark(.long_text);
+    const ecc: qr.Ecc = @enumFromInt(src.valueRangeAtMost(u8, 0, 3));
+    const scale: u32 = src.valueRangeAtMost(u8, 3, 8);
+    if (scale <= 4) RoundtripMark.mark(.scale_small) else RoundtripMark.mark(.scale_large);
+
+    var m: qr.Matrix = undefined;
+    try qr.encode(&m, text[0..n], .{ .ecc = ecc });
+    var pixels: [512 * 512]u8 = undefined;
+    const img = render(&m, scale, &pixels);
+    var scratch: [scratchSize(512, 512)]u8 = undefined;
+    const found = scan(img, &scratch) catch return error.GenuineSymbolNotFound;
+    if (found.matrix.size != m.size) return error.SizeMismatch;
+    for (0..m.size) |y| for (0..m.size) |x| {
+        if (m.isDark(@intCast(x), @intCast(y)) != found.matrix.isDark(@intCast(x), @intCast(y))) return error.SampledModuleMismatch;
+    };
+    var fm = found.matrix;
+    var out: [128]u8 = undefined;
+    const got = qr.decode(&fm, &out) catch return error.GenuineSymbolNotDecoded;
+    if (!std.mem.eql(u8, got, text[0..n])) return error.DecodedTextMismatch;
+    RoundtripMark.mark(.scanned_and_decoded);
 }
 
 test "corpus: every scan script produces a distinct image, and the light pixels are pinned" {
@@ -2369,7 +2437,8 @@ test "corpus: every scan script produces a distinct image, and the light pixels 
     try std.testing.expectEqual(@as(usize, 9967), light); // 0 before: the collapsed image was entirely black
 }
 
-fn fuzzScan(_: void, smith: *std.testing.Smith) !void {
+fn fuzzScan(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // Dimensions, stride and every pixel come from outside. The interesting
     // failures are not crashes in binarisation but in sampling: a finder triple
     // can be geometrically valid and still project sampling points outside the
@@ -2403,7 +2472,7 @@ fn fuzzScan(_: void, smith: *std.testing.Smith) !void {
     // so a four-octet seed is a repeating pixel pattern rather than 20 480
     // zeroes, and the corpus above is a set of readable geometry scripts.
     var script: [64]u8 = undefined;
-    const script_len: usize = smith.slice(&script);
+    const script_len: usize = fz.drawInput(S, smith, &script, &scan_scripts);
     var c = kit.Cursor{ .bytes = script[0..script_len] };
 
     const w = c.ranged(fuzz_min_dim, 128);
@@ -2416,14 +2485,26 @@ fn fuzzScan(_: void, smith: *std.testing.Smith) !void {
     var pixels: [128 * 160]u8 = undefined;
     for (&pixels) |*p| p.* = c.byte();
     if (@as(usize, stride) * h > pixels.len) return;
+    scanLightMark(pixels[0 .. @as(usize, stride) * h]);
 
     var scratch: [scratchSize(128, 128)]u8 = undefined;
     const img: Image = .{ .luma = pixels[0 .. @as(usize, stride) * h], .width = w, .height = h, .stride = stride };
-    const found = scan(img, &scratch) catch return;
+    const found = scan(img, &scratch) catch {
+        ScanMark.mark(.refused);
+        return;
+    };
+    ScanMark.mark(.found);
     // A returned grid must be a legal symbol size, or the caller is handed
     // something `qr.decode` will index against the wrong geometry.
     try std.testing.expect(found.matrix.size >= 21 and found.matrix.size <= qr.max_size);
     try std.testing.expectEqual(@as(u16, 0), (found.matrix.size - 17) % 4);
+}
+
+fn scanLightMark(pixels: []const u8) void {
+    for (pixels) |p| if (p >= 128) {
+        ScanMark.mark(.light_pixels);
+        return;
+    };
 }
 
 /// Scripts for `fuzzDamaged`: a blob count, then (x, y, value) triples. The
@@ -2443,10 +2524,11 @@ const damage_scripts = [_][]const u8{
 };
 
 test "fuzz: a real symbol with the image damaged around it" {
-    try std.testing.fuzz({}, fuzzDamaged, .{ .corpus = &damage_scripts });
+    try std.testing.fuzz({}, fuzzDamagedSmith, .{ .corpus = &damage_scripts });
 }
 
-fn fuzzDamaged(_: void, smith: *std.testing.Smith) !void {
+fn fuzzDamaged(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // Noise on top of a genuine symbol reaches the parts random pixels never do:
     // candidate merging, the triple search, and sampling with slightly wrong
     // finder centres.
@@ -2465,12 +2547,29 @@ fn fuzzDamaged(_: void, smith: *std.testing.Smith) !void {
     const img = render(&m, 4, &pixels);
 
     var script: [64]u8 = undefined;
-    const script_len: usize = smith.slice(&script);
+    const script_len: usize = fz.drawInput(S, smith, &script, &damage_scripts);
     var c = kit.Cursor{ .bytes = script[0..script_len] };
-    _ = damage(&c, pixels[0 .. @as(usize, img.width) * img.height], img.width);
+    const written = damage(&c, pixels[0 .. @as(usize, img.width) * img.height], img.width);
+    if (written == 0) DamagedMark.mark(.pristine) else DamagedMark.mark(.damaged);
 
     var scratch: [scratchSize(400, 400)]u8 = undefined;
-    _ = scan(img, &scratch) catch return;
+    const found = scan(img, &scratch) catch {
+        // The pristine symbol has nothing to hide behind.
+        if (written == 0) return error.PristineSymbolNotFound;
+        DamagedMark.mark(.refused);
+        return;
+    };
+    DamagedMark.mark(.found);
+    // Whatever the damage, a decode that CLAIMS success must return the text
+    // that was encoded: confident nonsense is worse than a refusal.
+    var fm = found.matrix;
+    var out: [64]u8 = undefined;
+    if (qr.decode(&fm, &out)) |got| {
+        if (!std.mem.eql(u8, got, "FUZZ")) return error.DamagedSymbolDecodedToOtherText;
+        DamagedMark.mark(.decoded);
+    } else |_| {
+        if (written == 0) return error.PristineSymbolNotDecoded;
+    }
 }
 
 /// Apply the script's damage to `pixels` and return how many octets it wrote.

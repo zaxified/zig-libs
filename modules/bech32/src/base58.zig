@@ -492,21 +492,43 @@ const decode_seeds = [_][]const u8{
     bendSeed("", &.{}), // and the input a corpus-less target runs for ever
 };
 
+const fz = @import("fuzz_test.zig");
+const DecodeMark = fz.Marker(enum { decoded, refused, check_decoded });
+
 test "fuzz: decode/checkDecode never panic on arbitrary text" {
-    try testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: BECH32_FUZZ (base58 decode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "BECH32_FUZZ", .name = "base58-decode" });
+}
+
+test "fuzz harness: base58 decode, 600 seeds, reaches every outcome" {
+    try DecodeMark.reach(fuzzDecode, "base58-decode", 600);
+}
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [max_encoded_len + 8]u8 = undefined;
-    // `smith.slice`, not `bytes` + a ranged length: `bytes` consumes the
+    // `slice`, not `bytes` + a ranged length: `bytes` consumes the
     // whole seed and the length draw is then always 0.
-    const len = smith.slice(&buf);
+    const len = fz.drawInput(S, src, &buf, &decode_seeds);
+    const bend = fz.bendInput(S, src);
     for (buf[0..len]) |*c| {
-        if (smith.boolWeighted(1, 3)) c.* = alphabet[c.* % alphabet.len];
+        if (bend and fz.weighted(src, 1, 3)) c.* = alphabet[c.* % alphabet.len];
     }
     var out: [max_payload_len]u8 = undefined;
-    _ = decode(buf[0..len], &out) catch return;
+    _ = decode(buf[0..len], &out) catch {
+        DecodeMark.mark(.refused);
+        return;
+    };
+    DecodeMark.mark(.decoded);
     _ = checkDecode(buf[0..len], &out) catch return;
+    DecodeMark.mark(.check_decoded);
 }
 
 test "corpus: every base58 seed reaches the decoder, and the counts are pinned" {

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-15 · mutation 2026-10-05 (32/34, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — public transaction data (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BITCOINTX_FUZZ) · ct n/a — public transaction data (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

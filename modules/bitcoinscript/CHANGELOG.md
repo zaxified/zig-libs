@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `BITCOINSCRIPT_FUZZ` over the `verifyScript` and tapscript-leaf harnesses (generic over their choice source; the driver draws fresh or damaged-corpus octet scripts). The tapscript harness now also requires that a damaged control block is always refused. No code change.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** tests follow bip340's out-param
   `KeyPair.fromSecretKey` (bip340 2026-10-08).
 - **2026-09-30** — **NO CONSUMER-VISIBLE CHANGE:** a new test file cross-checks `taproot`'s script-tree
