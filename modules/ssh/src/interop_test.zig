@@ -49,12 +49,16 @@ fn writeFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     try fw.interface.flush();
 }
 
-/// `key_type` is an `ssh-keygen -t` name, or `ecdsa384` for `-t ecdsa -b 384`.
+/// `key_type` is an `ssh-keygen -t` name, or `ecdsa384` / `ecdsa521` for
+/// `-t ecdsa -b 384` / `-b 521`.
 fn keygen(io: std.Io, key_type: []const u8, path: []const u8) !void {
     const p384 = std.mem.eql(u8, key_type, "ecdsa384");
+    const p521 = std.mem.eql(u8, key_type, "ecdsa521");
     var child = std.process.spawn(io, .{
         .argv = if (p384)
             &.{ "ssh-keygen", "-q", "-t", "ecdsa", "-b", "384", "-N", "", "-C", "zig-ssh-interop", "-f", path }
+        else if (p521)
+            &.{ "ssh-keygen", "-q", "-t", "ecdsa", "-b", "521", "-N", "", "-C", "zig-ssh-interop", "-f", path }
         else
             &.{ "ssh-keygen", "-q", "-t", key_type, "-N", "", "-C", "zig-ssh-interop", "-f", path },
         .stdout = .ignore,
@@ -646,6 +650,30 @@ test "live: our client — sshd with an ecdsa-sha2-nistp384 host key, publickey 
     };
     defer res.deinit(gpa);
     try std.testing.expectEqualStrings("ok", res.stdout);
+}
+
+test "live: our client — sshd with an ecdsa-sha2-nistp521 host key, publickey auth with an nistp521 user key" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try Sshd.start(gpa, threaded.io(), .{ .host_key_type = "ecdsa521", .client_key_type = "ecdsa521" });
+    defer fx.deinit();
+    try std.testing.expectEqualStrings("ecdsa-sha2-nistp521", fx.t.negotiated.?.host_key);
+    var res = connection.exec(&fx.t, gpa, "printf ok", .{}) catch |e| {
+        fx.dumpLog();
+        return e;
+    };
+    defer res.deinit(gpa);
+    try std.testing.expectEqualStrings("ok", res.stdout);
+}
+
+test "live: a real ssh client authenticates to our server with an ecdsa-sha2-nistp521 user key" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try SshClient.start(gpa, threaded.io(), .{ .user_key_type = "ecdsa521" });
+    defer fx.deinit();
+    _ = try fx.authenticate();
 }
 
 test "live: a real ssh client authenticates to our server with an ecdsa-sha2-nistp384 user key" {

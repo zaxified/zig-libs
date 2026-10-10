@@ -38,6 +38,8 @@ const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Sha384 = std.crypto.hash.sha2.Sha384;
 const P256 = std.crypto.ecc.P256;
 const P384 = std.crypto.ecc.P384;
+const p521 = @import("p521");
+const EcdsaP521 = p521.EcdsaP521Sha512;
 const Aes128 = std.crypto.core.aes.Aes128;
 const Aes192 = @import("aes192").Aes192;
 const Aes256 = std.crypto.core.aes.Aes256;
@@ -137,6 +139,7 @@ pub const kex_algorithms = [_][]const u8{
     "curve25519-sha256@libssh.org",
     "ecdh-sha2-nistp256",
     "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
     "diffie-hellman-group-exchange-sha256",
     "diffie-hellman-group14-sha256",
     "diffie-hellman-group16-sha512",
@@ -149,6 +152,7 @@ pub const server_host_key_algorithms = [_][]const u8{
     "rsa-sha2-512",
     "ecdsa-sha2-nistp256",
     "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
 };
 
 /// Symmetric ciphers this client offers (same list both directions).
@@ -289,6 +293,7 @@ pub const public_key_algorithms = [_][]const u8{
     "rsa-sha2-256",
     "ecdsa-sha2-nistp256",
     "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
 };
 
 /// OpenSSH strict key exchange (`PROTOCOL` §1.9, the Terrapin
@@ -1400,6 +1405,7 @@ pub fn keyBlobTypeFor(algorithm: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, algorithm, "rsa-sha2-512")) return "ssh-rsa";
     if (std.mem.eql(u8, algorithm, "ecdsa-sha2-nistp256")) return "ecdsa-sha2-nistp256";
     if (std.mem.eql(u8, algorithm, "ecdsa-sha2-nistp384")) return "ecdsa-sha2-nistp384";
+    if (std.mem.eql(u8, algorithm, "ecdsa-sha2-nistp521")) return "ecdsa-sha2-nistp521";
     return null;
 }
 
@@ -1482,6 +1488,8 @@ pub fn verifySignature(key_type: []const u8, k_s: []const u8, sig_blob: []const 
         try verifyEcdsa(EcdsaP256, "nistp256", k_s, sig_bytes, h);
     } else if (std.mem.eql(u8, key_type, "ecdsa-sha2-nistp384")) {
         try verifyEcdsa(EcdsaP384, "nistp384", k_s, sig_bytes, h);
+    } else if (std.mem.eql(u8, key_type, "ecdsa-sha2-nistp521")) {
+        try verifyEcdsa(EcdsaP521, "nistp521", k_s, sig_bytes, h);
     } else return error.UnsupportedAlgorithm;
 }
 
@@ -1686,10 +1694,12 @@ fn isCurve25519Kex(name: []const u8) bool {
 pub const EcdhNist = enum {
     p256,
     p384,
+    p521,
 
     pub fn forName(name: []const u8) ?EcdhNist {
         if (std.mem.eql(u8, name, "ecdh-sha2-nistp256")) return .p256;
         if (std.mem.eql(u8, name, "ecdh-sha2-nistp384")) return .p384;
+        if (std.mem.eql(u8, name, "ecdh-sha2-nistp521")) return .p521;
         return null;
     }
 
@@ -1697,6 +1707,7 @@ pub const EcdhNist = enum {
         return switch (c) {
             .p256 => P256,
             .p384 => P384,
+            .p521 => p521.P521,
         };
     }
 
@@ -1704,6 +1715,7 @@ pub const EcdhNist = enum {
         return switch (c) {
             .p256 => Sha256,
             .p384 => Sha384,
+            .p521 => Sha512,
         };
     }
 
@@ -1712,6 +1724,17 @@ pub const EcdhNist = enum {
         return switch (c) {
             .p256 => 32,
             .p384 => 48,
+            .p521 => 66,
+        };
+    }
+
+    /// Mask for a candidate scalar's top byte, so a draw has the order's bit
+    /// length: P-521's n has 521 bits, one in its top byte; without it 127
+    /// of 128 draws would be rejected and 64 tries would fail most of the time.
+    pub fn topMask(comptime c: EcdhNist) u8 {
+        return switch (c) {
+            .p256, .p384 => 0xff,
+            .p521 => 0x01,
         };
     }
 
@@ -1739,6 +1762,7 @@ pub fn EcdhNistKeyPair(comptime c: EcdhNist) type {
                 var candidate: [c.len()]u8 = undefined;
                 defer std.crypto.secureZero(u8, &candidate);
                 entropy.fill(&candidate);
+                candidate[0] &= c.topMask();
                 if (fromScalar(candidate)) |kp| return kp;
             }
             return error.KexFailed;
@@ -3667,7 +3691,7 @@ test "server-sig-algs names exactly what the verifier accepts" {
     // extension exists to prevent, one algorithm further along. The list is
     // spelled out rather than derived from `keyBlobTypeFor` so that adding a
     // branch there without adding the name here fails HERE.
-    const verifiable = [_][]const u8{ "ssh-ed25519", "rsa-sha2-256", "rsa-sha2-512", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384" };
+    const verifiable = [_][]const u8{ "ssh-ed25519", "rsa-sha2-256", "rsa-sha2-512", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521" };
     try t.expectEqual(verifiable.len, public_key_algorithms.len);
     for (verifiable) |name| {
         try t.expect(pickFirst(&public_key_algorithms, &.{name}) != null);
@@ -5357,6 +5381,10 @@ test "dhGexKex (client) group checks: bit length, parity, generator range" {
 
 test "live interop against OpenSSH sshd — aes192-ctr" {
     try liveInterop("curve25519-sha256", "aes192-ctr");
+}
+
+test "live interop against OpenSSH sshd — ecdh-sha2-nistp521" {
+    try liveInterop("ecdh-sha2-nistp521", "aes256-ctr");
 }
 
 test "live interop against OpenSSH sshd — ecdh-sha2-nistp256" {

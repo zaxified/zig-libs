@@ -72,7 +72,7 @@ pub const meta = .{
     // sequence-number/cipher state; nothing shared/global.
     .concurrency = .single_owner,
     .model_after = "RFC 4253/4251/4252/4254 + RFC 8731 (curve25519-sha256) + RFC 8332/8709/5656 (host+user key algorithms) + RFC 8308 (ext-info / server-sig-algs); design ref ringtailsoftware/misshod (MIT) shape only, no source copied",
-    .deps = .{ "rsa", "montint", "aes192" },
+    .deps = .{ "rsa", "montint", "aes192", "p521" },
 };
 
 // ── top-level entry points (the three names parts 2 and 3 grew into) ───────

@@ -44,6 +44,7 @@ const burn = @import("burn.zig");
 const Ed25519 = std.crypto.sign.Ed25519;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+const EcdsaP521 = @import("p521").EcdsaP521Sha512;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
 const X25519 = std.crypto.dh.X25519;
@@ -119,6 +120,9 @@ pub const HostKey = union(enum) {
     ecdsa_p256: EcdsaP256.KeyPair,
     /// `ecdsa-sha2-nistp384` (RFC 5656), the same shape on P-384 / SHA-384.
     ecdsa_p384: EcdsaP384.KeyPair,
+    /// `ecdsa-sha2-nistp521` (RFC 5656), on this collection's `p521` module
+    /// (std 0.16 has no P-521) with SHA-512.
+    ecdsa_p521: EcdsaP521.KeyPair,
 
     pub const RsaHash = enum { sha2_256, sha2_512 };
 
@@ -143,6 +147,7 @@ pub const HostKey = union(enum) {
             },
             .ecdsa_p256 => "ecdsa-sha2-nistp256",
             .ecdsa_p384 => "ecdsa-sha2-nistp384",
+            .ecdsa_p521 => "ecdsa-sha2-nistp521",
         };
     }
 
@@ -227,6 +232,10 @@ pub const HostKey = union(enum) {
             out.* = .{ .ecdsa_p384 = undefined };
             return parseEcdsaP384Body(&out.ecdsa_p384, bin, passphrase orelse "");
         }
+        if (std.mem.eql(u8, key_type, "ecdsa-sha2-nistp521")) {
+            out.* = .{ .ecdsa_p521 = undefined };
+            return parseEcdsaBody(EcdsaP521, "ecdsa-sha2-nistp521", "nistp521", &out.ecdsa_p521, bin, passphrase orelse "");
+        }
         return error.UnsupportedKeyType;
     }
 
@@ -268,6 +277,12 @@ pub const HostKey = union(enum) {
                 const q = kp.public_key.toUncompressedSec1();
                 messages.writeString(&w, "ecdsa-sha2-nistp384") catch unreachable;
                 messages.writeString(&w, "nistp384") catch unreachable;
+                messages.writeString(&w, &q) catch unreachable;
+            },
+            .ecdsa_p521 => |*kp| {
+                const q = kp.public_key.toUncompressedSec1();
+                messages.writeString(&w, "ecdsa-sha2-nistp521") catch unreachable;
+                messages.writeString(&w, "nistp521") catch unreachable;
                 messages.writeString(&w, &q) catch unreachable;
             },
         }
@@ -325,6 +340,7 @@ pub const HostKey = union(enum) {
             },
             .ecdsa_p256 => |*kp| signEcdsa(kp, "ecdsa-sha2-nistp256", data, &w),
             .ecdsa_p384 => |*kp| signEcdsa(kp, "ecdsa-sha2-nistp384", data, &w),
+            .ecdsa_p521 => |*kp| signEcdsa(kp, "ecdsa-sha2-nistp521", data, &w),
         }
         return w.buffered();
     }
@@ -335,7 +351,7 @@ pub const HostKey = union(enum) {
 fn signEcdsa(kp: anytype, comptime name: []const u8, data: []const u8, w: *std.Io.Writer) void {
     const sig = kp.sign(data, null) catch
         @panic("ecdsa host-key signing failed on a validated key");
-    var inner_buf: [128]u8 = undefined;
+    var inner_buf: [160]u8 = undefined; // P-521: 2 x (4 + 1 + 66)
     var iw: std.Io.Writer = .fixed(&inner_buf);
     messages.writeMpint(&iw, &sig.r) catch unreachable;
     messages.writeMpint(&iw, &sig.s) catch unreachable;
@@ -1573,6 +1589,8 @@ const fixture_ecdsa_p256_key = vectors.ecdsa_p256_key;
 const fixture_ecdsa_p256_pub_b64 = vectors.ecdsa_p256_pub_b64;
 const fixture_ecdsa_p384_key = vectors.ecdsa_p384_key;
 const fixture_ecdsa_p384_pub_b64 = vectors.ecdsa_p384_pub_b64;
+const fixture_ecdsa_p521_key = vectors.ecdsa_p521_key;
+const fixture_ecdsa_p521_pub_b64 = vectors.ecdsa_p521_pub_b64;
 
 fn decodeFixturePub(b64: []const u8, buf: []u8) ![]u8 {
     const dec = std.base64.standard.Decoder;
@@ -1697,6 +1715,26 @@ test "HostKey.fromOpenSSH: ecdsa-p384 fixture parses; K_S matches ssh-keygen's .
     h2[0] ^= 1;
     try t.expectError(error.HostKeyVerificationFailed, transport.verifySignature("ecdsa-sha2-nistp384", blob, sig_blob, &h2));
     try t.expectError(error.HostKeyVerificationFailed, transport.verifySignature("ecdsa-sha2-nistp256", blob, sig_blob, &h));
+}
+
+test "HostKey.fromOpenSSH: ecdsa-p521 fixture parses; K_S matches ssh-keygen's .pub blob; signature verifies via transport" {
+    const t = std.testing;
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_ecdsa_p521_key, null);
+    try t.expectEqualStrings("ecdsa-sha2-nistp521", hk.algorithmName());
+    const blob = try hk.publicBlob(t.allocator);
+    defer t.allocator.free(blob);
+    var pubbuf: [256]u8 = undefined;
+    const expected = try decodeFixturePub(fixture_ecdsa_p521_pub_b64, &pubbuf);
+    try t.expectEqualSlices(u8, expected, blob);
+    const h = [_]u8{0x3C} ** 64;
+    const sig_blob = try hk.sign(t.allocator, &h);
+    defer t.allocator.free(sig_blob);
+    try transport.verifySignature("ecdsa-sha2-nistp521", blob, sig_blob, &h);
+    var h2 = h;
+    h2[63] ^= 1;
+    try t.expectError(error.HostKeyVerificationFailed, transport.verifySignature("ecdsa-sha2-nistp521", blob, sig_blob, &h2));
+    try t.expectError(error.HostKeyVerificationFailed, transport.verifySignature("ecdsa-sha2-nistp384", blob, sig_blob, &h));
 }
 
 test "parseEcdsaP256OpenSSH: a curve other than nistp256 is UnsupportedKeyType, not accepted" {
@@ -2655,6 +2693,8 @@ fn liveOpensshClientMac(keygen_type: []const u8, hostkey_algo: []const u8, kex_n
         var child = std.process.spawn(io, .{
             .argv = if (std.mem.eql(u8, keygen_type, "ecdsa384"))
                 &.{ "ssh-keygen", "-q", "-t", "ecdsa", "-b", "384", "-N", "", "-C", "zig-ssh-live-test", "-f", hk_path }
+            else if (std.mem.eql(u8, keygen_type, "ecdsa521"))
+                &.{ "ssh-keygen", "-q", "-t", "ecdsa", "-b", "521", "-N", "", "-C", "zig-ssh-live-test", "-f", hk_path }
             else
                 &.{ "ssh-keygen", "-q", "-t", keygen_type, "-N", "", "-C", "zig-ssh-live-test", "-f", hk_path },
             .stdout = .ignore,
@@ -2809,6 +2849,14 @@ test "live interop: OpenSSH ssh client → our server — diffie-hellman-group-e
 
 test "live interop: OpenSSH ssh client → our server — aes192-ctr" {
     try liveOpensshClient("ed25519", "ssh-ed25519", "curve25519-sha256", "aes192-ctr");
+}
+
+test "live interop: OpenSSH ssh client → our server — ecdh-sha2-nistp521 + ecdsa-sha2-nistp521 host key" {
+    try liveOpensshClient("ecdsa521", "ecdsa-sha2-nistp521", "ecdh-sha2-nistp521", "chacha20-poly1305@openssh.com");
+}
+
+test "self-consistency (direct KEX): ecdh-sha2-nistp521" {
+    try directDhConsistency("ecdh-sha2-nistp521");
 }
 
 test "live interop: OpenSSH ssh client → our server — ecdh-sha2-nistp256" {

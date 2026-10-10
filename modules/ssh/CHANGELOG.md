@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Added:** `ecdh-sha2-nistp521` key exchange and `ecdsa-sha2-nistp521` host and user keys,
+  over the new `p521` module (std 0.16 has no P-521); `meta.deps` gains `p521`. Ephemeral P-521 scalars
+  are drawn with the top byte masked to the order's bit length (521 bits). Live interop against OpenSSH
+  10.2 in both roles (ECDH, P-521 host key, P-521 user key); ssh-keygen fixture test; STACKPROBE covers
+  the P-521 exchange, signing and loading (`load_burn` raised to 128 KiB: loading a P-521 key dirtied
+  90 KiB); ctgrind `ecdh` now also covers P-521 (22 in-file, the same verdict/mpint-length categories).
+  This completes Go parity phase P1.
 - **2026-10-10** — **Added:** `aes192-ctr` (RFC 4344), offered after `aes128-ctr`, over the new `aes192`
   module (std 0.16 has no AES-192); `meta.deps` gains `aes192`. Packet codec round-trips for every MAC,
   live interop against OpenSSH 10.2 in both roles.

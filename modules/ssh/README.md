@@ -9,14 +9,14 @@ as the server. No `@panic` stubs remain in this module.
 
 - **Part 1 — transport** (`transport.zig` client, `server.zig` server): version
   exchange, KEXINIT negotiation, `mlkem768x25519-sha256` / `curve25519-sha256`
-  (RFC 8731) / `ecdh-sha2-nistp256` / `-nistp384` (RFC 5656) /
+  (RFC 8731) / `ecdh-sha2-nistp256` / `-nistp384` / `-nistp521` (RFC 5656) /
   `diffie-hellman-group-exchange-sha256` (RFC 4419) /
   `diffie-hellman-group14-sha256` / `-group16-sha512` key
   exchange, the RFC 4253 §6 Binary Packet Protocol,
   `chacha20-poly1305@openssh.com` / `aes256-ctr`+`hmac-sha2-256` /
   `aes{128,256}-gcm@openssh.com` ciphers, and host-key *verification* (client)
   / *signing* (server) for ssh-ed25519, rsa-sha2-256/512 (via the `rsa` module)
-  and ecdsa-sha2-nistp256 / -nistp384. Once a handshake completes, `Transport.negotiated`
+  and ecdsa-sha2-nistp256 / -nistp384 / -nistp521. Once a handshake completes, `Transport.negotiated`
   reports the negotiated KEX/host-key/cipher/MAC wire names (both roles) —
   diagnostics parity with `ssh -v`'s negotiation banner. **Key re-exchange**
   (RFC 4253 §9) runs inside `Transport.recvPacket`/`sendPacket` in either role

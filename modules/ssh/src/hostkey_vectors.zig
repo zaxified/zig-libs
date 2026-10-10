@@ -134,3 +134,24 @@ pub const ecdsa_p384_pub_b64 =
     "AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBLGP564oCzJCNHptV1eRSIlv" ++
     "g7k5q/zGaavByVdmKMsVKF1Cem7SCALTbrT+RXxfaEWLEIePxLzYvsUdC/n9qOtNtEzd2vhFrDY3" ++
     "KfVcD6P1lsPwD2MBx2Cq4jfca2kH/A==";
+
+pub const ecdsa_p521_key =
+    \\-----BEGIN OPENSSH PRIVATE KEY-----
+    \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAArAAAABNlY2RzYS
+    \\1zaGEyLW5pc3RwNTIxAAAACG5pc3RwNTIxAAAAhQQBDt7L6tnuRt3frOAZ6Z8X3u2W1vLL
+    \\uKZI5kc+/xnYn7qsXneC+sDy3YNLuzsZsfyoZS3JKD7VihQk1wtFxRkqjeEBJq646zKzte
+    \\0XosxIUCzPSfUr6ZIm1abn88mFbWPMB2hhfHPCT28baddNhOJeNV+RXRFngySHdaNyqYYI
+    \\3VIKn2AAAAEYtlKHj7ZSh48AAAATZWNkc2Etc2hhMi1uaXN0cDUyMQAAAAhuaXN0cDUyMQ
+    \\AAAIUEAQ7ey+rZ7kbd36zgGemfF97tltbyy7imSOZHPv8Z2J+6rF53gvrA8t2DS7s7GbH8
+    \\qGUtySg+1YoUJNcLRcUZKo3hASauuOsys7XtF6LMSFAsz0n1K+mSJtWm5/PJhW1jzAdoYX
+    \\xzwk9vG2nXTYTiXjVfkV0RZ4Mkh3WjcqmGCN1SCp9gAAAAQgCgkg/wLvtTi5rcTT74RZF3
+    \\u7CScLr1aWTAYQY76+bF1HPodQFnLMgE3gVgrW8S8a21I2ptvUEXqk7NXnNfvc1LAQAAAB
+    \\l6aWctbGlicy1zc2gtdGVzdC1maXh0dXJlAQ==
+    \\-----END OPENSSH PRIVATE KEY-----
+    \\
+;
+pub const ecdsa_p521_pub_b64 =
+    "AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAEO3svq2e5G3d+s4Bnpnxfe" ++
+    "7ZbW8su4pkjmRz7/Gdifuqxed4L6wPLdg0u7Oxmx/KhlLckoPtWKFCTXC0XFGSqN4QEmrrjrMrO1" ++
+    "7ReizEhQLM9J9SvpkibVpufzyYVtY8wHaGF8c8JPbxtp102E4l41X5FdEWeDJId1o3KphgjdUgqf" ++
+    "YA==";

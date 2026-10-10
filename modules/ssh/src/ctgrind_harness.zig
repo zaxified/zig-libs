@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const random = prng.random();
 
     if (std.mem.eql(u8, target, "ecdh")) {
-        inline for (.{ transport.EcdhNist.p256, transport.EcdhNist.p384 }) |c| try ecdh(c, random, t);
+        inline for (.{ transport.EcdhNist.p256, transport.EcdhNist.p384, transport.EcdhNist.p521 }) |c| try ecdh(c, random, t);
         return;
     }
 
@@ -106,11 +106,13 @@ fn ecdh(comptime c: transport.EcdhNist, random: std.Random, t: Taint) !void {
     const peer = while (true) {
         var y: [c.len()]u8 = undefined;
         random.bytes(&y);
+        y[0] &= c.topMask();
         if (Kp.fromScalar(y)) |kp| break kp.public;
     };
     var x: [c.len()]u8 = undefined;
     while (true) {
         random.bytes(&x);
+        x[0] &= c.topMask();
         if (Kp.fromScalar(x) != null) break;
     }
     if (t == .yes) std.valgrind.memcheck.makeMemUndefined(&x);

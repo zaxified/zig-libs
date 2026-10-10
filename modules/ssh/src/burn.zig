@@ -39,9 +39,10 @@ pub const sign_burn = 16 * 1024;
 
 /// `HostKey.fromOpenSSH` and the container parsers: the 16 KiB container and
 /// 24 KiB base64 buffers plus the key derivation dirtied 48.8 KiB (ed25519)
-/// and 52.6 KiB (ecdsa-p256) in ReleaseFast (2026-10-09). `rsa.fromOpenSSH`
-/// burns its own frames.
-pub const load_burn = 64 * 1024;
+/// and 52.6 KiB (ecdsa-p256) in ReleaseFast (2026-10-09); ecdsa-p521 (the
+/// `p521` module's key derivation) 90 KiB (2026-10-10, found by the probe at
+/// 64 KiB). `rsa.fromOpenSSH` burns its own frames.
+pub const load_burn = 128 * 1024;
 
 /// The six per-method KEX entry points (`transport.curve25519Kex`, …,
 /// `server.dhGroupKexServer`), one size per method: one size for all would

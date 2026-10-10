@@ -219,11 +219,12 @@ oscore	ReleaseFast	unprotect	1	1	27958d87aa1dac88	ed85db89e3d7e9fd
 # reaches the exchange hash whatever the code does. `ffpow`: POSITIVE CONTROL,
 # the same K through the std.crypto.ff pow dhPowModPrime used until this date
 # — its window select compiles to a jump in ReleaseFast. It must stay >= 1.
-ssh	ReleaseFast	dh	1	4	4d4621ac9caed250	95639ff37028e502
+ssh	ReleaseFast	dh	1	4	e295dd202f569dc4	95639ff37028e502
 ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
-# ssh ecdh (2026-10-10): ecdh-sha2-nistp256/384, the ephemeral scalar tainted
-# through fromScalar, ecdhNistShared and ecdhNistFinish, P-256 then P-384. All
-# 17 are one-bit verdicts or K's length, none a scalar-dependent branch inside
+# ssh ecdh (2026-10-10): ecdh-sha2-nistp256/384/521, the ephemeral scalar tainted
+# through fromScalar, ecdhNistShared and ecdhNistFinish, P-256, P-384, then P-521
+# (the p521 module, whose own API verdicts are declassified there). All
+# 22 (17 before P-521) are one-bit verdicts or K's length, none a scalar-dependent branch inside
 # the multiply: fromScalar's accept/reject (rejectNonCanonical, the OR-ed zero
 # test, mul's identity error — the rejection-sampling outcome, public since a
 # rejected candidate is discarded); std's pcMul16 ending in `rejectIdentity`
@@ -235,8 +236,8 @@ ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # montint's DynModint (the server-chosen prime; group14 and group16 primes
 # here) — 0 contexts in dyn/montint/limbs; the 2 in-file are stripLeadingZeros
 # on e and K (RFC 4251 §5 mpint length, as `dh`).
-ssh	ReleaseFast	gex	1	2	4d4621ac9caed250	2d8d321e6c103efe
-ssh	ReleaseFast	ecdh	1	17	4d4621ac9caed250	75272e76fb52617b
+ssh	ReleaseFast	gex	1	2	e295dd202f569dc4	2d8d321e6c103efe
+ssh	ReleaseFast	ecdh	1	22	e295dd202f569dc4	8683e4aaf784b64c
 # ct25519 — columns below are `total_min in_file`, NOT "in_file total_min".
 # Row 1's `1 0` is `total_min=1, in_file=0`: ct25519's OWN code has zero
 # expected contexts (the `total_min=1` is only the harness's print, a
