@@ -2497,3 +2497,206 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
         return error.HarnessDoesNotReach;
     };
 }
+
+// ── model-based differential: Manager + both stores vs a naive model ───────
+//
+// The tests above are hand-picked scenarios. This one drives `Manager`
+// (create / lookup / persist / regenerate) and `Store.delete` with seeded
+// random operation sequences, over `RamcacheStore` AND `KvStore`, and checks
+// every result against `SessionModel`: a plain map from id to
+// { generation, record } that re-states the documented semantics on its own —
+// expiry is `now − created > absolute` or `now − last_seen > idle` (strict,
+// 0 disables), and expiry deletes; `persist` is a compare-and-swap that lands
+// iff the store's generation for the id equals the session's; `delete` bumps
+// the generation and leaves a tombstone (`RamcacheStore`) or removes the key so
+// the generation reads 0 again (`KvStore`, documented: "no tombstone"); a
+// `regenerate`d session is a fresh id at generation 0 carrying the old
+// `created` and data, with the old id deleted. Several handles may hold the
+// same id at different generations: two requests racing on one session.
+
+const SessionModel = struct {
+    const Rec = struct { created: i64, last_seen: i64, data: []const u8 };
+    const Entry = struct { gen: Generation = 0, rec: ?Rec = null };
+
+    arena: Allocator,
+    map: std.StringHashMapUnmanaged(Entry) = .empty,
+    tombstones: bool,
+    idle: i64,
+    absolute: i64,
+
+    fn entry(md: *SessionModel, id: []const u8) !*Entry {
+        const gop = try md.map.getOrPut(md.arena, id);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try md.arena.dupe(u8, id);
+            gop.value_ptr.* = .{};
+        }
+        return gop.value_ptr;
+    }
+
+    fn delete(md: *SessionModel, id: []const u8) !void {
+        const e = try md.entry(id);
+        e.rec = null;
+        e.gen = if (md.tombstones) e.gen + 1 else 0;
+    }
+
+    const Lookup = union(enum) { absent, expired_absolute, expired_idle, loaded: struct { rec: Rec, gen: Generation } };
+
+    fn lookup(md: *SessionModel, id: []const u8, now: i64) !Lookup {
+        const e = try md.entry(id);
+        const rec = e.rec orelse return .absent;
+        if (md.absolute > 0 and now - rec.created > md.absolute) {
+            try md.delete(id);
+            return .expired_absolute;
+        }
+        if (md.idle > 0 and now - rec.last_seen > md.idle) {
+            try md.delete(id);
+            return .expired_idle;
+        }
+        return .{ .loaded = .{ .rec = rec, .gen = e.gen } };
+    }
+
+    /// The CAS: lands iff the generations match; returns the new one.
+    fn persist(md: *SessionModel, id: []const u8, expected: Generation, created: i64, now: i64, data: []const u8) !?Generation {
+        const e = try md.entry(id);
+        if (e.gen != expected) return null;
+        e.gen = expected + 1;
+        e.rec = .{ .created = created, .last_seen = now, .data = try md.arena.dupe(u8, data) };
+        return e.gen;
+    }
+};
+
+const ModelReach = enum { loaded, absent, expired_idle, expired_absolute, persist_won, persist_stale, regenerated, deleted, restarted };
+
+fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(ModelReach).@"enum".fields.len]usize) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(case_seed);
+    const rnd = prng.random();
+
+    const idle: i64 = if (rnd.boolean()) 1_000 else 0;
+    const absolute: i64 = if (rnd.uintLessThan(u8, 4) != 0) 3_000 else 0;
+    var env: if (kv_backed) KvEnv else Env = undefined;
+    if (kv_backed) {
+        try env.init();
+    } else {
+        env = Env.init();
+        env.wire();
+    }
+    defer env.deinit();
+    const clock_ptr = &env.clk; // the manager's clock (and RamcacheStore's)
+    var m = try Manager.init(testing.allocator, env.store.store(), .{
+        .io = testing.io,
+        .clock = clock_ptr.clock(),
+        .idle_timeout_ns = idle,
+        .absolute_timeout_ns = absolute,
+    });
+
+    var md: SessionModel = .{ .arena = arena, .tombstones = !kv_backed, .idle = idle, .absolute = absolute };
+    const handles = try testing.allocator.alloc(Session, 6);
+    defer testing.allocator.free(handles);
+    var live = [_]bool{false} ** 6;
+    var data_buf: [max_session_bytes]u8 = undefined;
+
+    const steps = 60 + rnd.uintLessThan(usize, 120);
+    for (0..steps) |step| {
+        errdefer std.debug.print("sessions model: kv={} seed={d} step={d} now={d}\n", .{ kv_backed, case_seed, step, clock_ptr.now_ns });
+        const h = rnd.uintLessThan(usize, handles.len);
+        switch (rnd.uintLessThan(u8, 10)) {
+            // A new session, persisted with random data (the create CAS).
+            0, 1 => {
+                m.create(&handles[h]);
+                const n = if (rnd.uintLessThan(u8, 16) == 0) max_session_bytes else rnd.uintLessThan(usize, 64);
+                rnd.bytes(data_buf[0..n]);
+                try handles[h].setData(data_buf[0..n]);
+                const want = try md.persist(handles[h].id(), 0, handles[h].created_ns, clock_ptr.now_ns, handles[h].data());
+                try testing.expect(want != null); // a fresh CSPRNG id
+                try testing.expect(m.persist(&handles[h]));
+                try testing.expectEqual(want.?, handles[h].generation);
+                live[h] = true;
+            },
+            // Time passes: often exactly onto, or one past, a timeout edge.
+            2, 3 => clock_ptr.now_ns += switch (rnd.uintLessThan(u8, 6)) {
+                0 => 0,
+                1 => idle,
+                2 => idle + 1,
+                3 => @max(idle - 1, 0),
+                else => @as(i64, rnd.uintLessThan(u32, 1_500)),
+            },
+            // A request comes back with the handle's id.
+            4, 5 => if (live[h]) {
+                const id = try arena.dupe(u8, handles[h].id());
+                const want = try md.lookup(id, clock_ptr.now_ns);
+                var got: Session = undefined;
+                const r = m.lookup(id, &got);
+                switch (want) {
+                    .absent => {
+                        try testing.expectEqual(Manager.LoadResult.absent, r);
+                        reach[@intFromEnum(ModelReach.absent)] += 1;
+                    },
+                    .expired_absolute, .expired_idle => {
+                        try testing.expectEqual(Manager.LoadResult.expired, r);
+                        reach[@intFromEnum(if (want == .expired_idle) ModelReach.expired_idle else ModelReach.expired_absolute)] += 1;
+                    },
+                    .loaded => |l| {
+                        try testing.expectEqual(Manager.LoadResult.loaded, r);
+                        try testing.expectEqualSlices(u8, l.rec.data, got.data());
+                        try testing.expectEqual(l.rec.created, got.created_ns);
+                        try testing.expectEqual(l.gen, got.generation);
+                        try testing.expectEqual(clock_ptr.now_ns, got.last_seen_ns);
+                        handles[h] = got;
+                        reach[@intFromEnum(ModelReach.loaded)] += 1;
+                    },
+                }
+            },
+            // The handle saves (maybe with new data): wins or is stale.
+            6 => if (live[h]) {
+                if (rnd.boolean()) {
+                    const n = rnd.uintLessThan(usize, 64);
+                    rnd.bytes(data_buf[0..n]);
+                    try handles[h].setData(data_buf[0..n]);
+                }
+                const want = try md.persist(handles[h].id(), handles[h].generation, handles[h].created_ns, clock_ptr.now_ns, handles[h].data());
+                const ok = m.persist(&handles[h]);
+                try testing.expectEqual(want != null, ok);
+                if (want) |g| try testing.expectEqual(g, handles[h].generation);
+                reach[@intFromEnum(if (ok) ModelReach.persist_won else ModelReach.persist_stale)] += 1;
+            },
+            // A second request holds the same session.
+            7 => if (live[h]) {
+                const j = rnd.uintLessThan(usize, handles.len);
+                handles[j] = handles[h];
+                live[j] = true;
+            },
+            // Login: rotate the id (the old one is deleted in the store).
+            8 => if (live[h]) {
+                try md.delete(handles[h].id());
+                m.regenerate(&handles[h]);
+                try testing.expectEqual(@as(Generation, 0), handles[h].generation);
+                reach[@intFromEnum(ModelReach.regenerated)] += 1;
+            },
+            // Logout / admin delete of the handle's id; or a restart (kv).
+            else => if (kv_backed and rnd.uintLessThan(u8, 3) == 0) {
+                try env.restart();
+                reach[@intFromEnum(ModelReach.restarted)] += 1;
+            } else if (live[h]) {
+                try md.delete(handles[h].id());
+                m.store.delete(handles[h].id());
+                reach[@intFromEnum(ModelReach.deleted)] += 1;
+            },
+        }
+    }
+}
+
+test "model: Manager over RamcacheStore and KvStore agrees with a naive session model on random operation sequences" {
+    var reach = [_]usize{0} ** @typeInfo(ModelReach).@"enum".fields.len;
+    const seeds = if (@import("builtin").mode == .Debug) 60 else 200;
+    for (0..seeds) |case_seed| {
+        try sessionModelRun(false, case_seed, &reach);
+        try sessionModelRun(true, case_seed, &reach);
+    }
+    for (reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("model reach: {t} never hit\n", .{@as(ModelReach, @enumFromInt(i))});
+        return error.ModelDoesNotReach;
+    };
+}
