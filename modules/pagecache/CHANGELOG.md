@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — tests: model-fuzz against a naive per-file byte-array model (300 seeded random `Storage`-op sequences incl. borrows, torn writes, rename/delete; per-step media, size, read, borrow-snapshot and counter checks; reach classes enforced). No API or behaviour change.
+
 - **2026-10-10** — Card Performance `n/a` with the reason (no timeable reference implementation). Docs only.
 
 - **2026-09-29** — Fix: a plain `pread` miss could put OLDER bytes over a write that landed while

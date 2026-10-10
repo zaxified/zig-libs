@@ -2385,3 +2385,334 @@ test "read-ahead: transparency, kvtree over PageCache(Sim) with read-ahead == ra
     try testing.expect(raw_dump.len > 0);
     try testing.expect(pc.cache.stats.entries <= 8);
 }
+
+// ── model-fuzz: seeded random operation sequences vs a naive reference ───────
+//
+// The reference model is a flat byte array per path ("the disk"), written from
+// the Storage contract alone: a write overlays bytes (zero-filling any gap), a
+// truncate shrinks, a read returns the bytes that are there (short at EOF, 0
+// past it). It knows nothing of pages, residency, eviction or pinning. The
+// cache must be invisible: every pread / size equals the model, the inner
+// media equals the model after every step (write-through, also after a failed
+// or torn write), and a borrow keeps the snapshot it was handed. Eviction
+// order is an implementation choice and is not modelled -- only the budget
+// invariant (`resident <= max_pages + borrowed`) and the counter identities
+// (`hits + misses` == full-page preads issued) are.
+
+const MfModel = struct {
+    const ps = 16; // page size under test (tiny, so edges are reached fast)
+    const n_paths = 3;
+    const cap = 24 * ps;
+    const paths = [n_paths][]const u8{ "p0", "p1", "p2" };
+
+    exists: [n_paths]bool = .{false} ** n_paths,
+    len: [n_paths]usize = .{0} ** n_paths,
+    data: [n_paths][cap]u8 = undefined,
+
+    fn write(m: *MfModel, i: usize, off: usize, bytes: []const u8) void {
+        const end = off + bytes.len;
+        if (end > m.len[i]) {
+            @memset(m.data[i][m.len[i]..end], 0);
+            m.len[i] = end;
+        }
+        @memcpy(m.data[i][off..end], bytes);
+    }
+
+    fn read(m: *const MfModel, i: usize, off: usize, out: []u8) usize {
+        if (off >= m.len[i]) return 0;
+        const n = @min(out.len, m.len[i] - off);
+        @memcpy(out[0..n], m.data[i][off..][0..n]);
+        return n;
+    }
+};
+
+const MfReach = struct {
+    hit: u64 = 0,
+    miss: u64 = 0,
+    evict: u64 = 0,
+    ref_hit: u64 = 0,
+    ref_miss: u64 = 0,
+    ref_null: u64 = 0,
+    readahead: u64 = 0,
+    over_cap_by_borrow: u64 = 0,
+    borrow_kept_snapshot: u64 = 0,
+    short_read: u64 = 0,
+    eof_read: u64 = 0,
+    unaligned_write: u64 = 0,
+    failed_write: u64 = 0,
+    torn_write: u64 = 0,
+    ro_denied: u64 = 0,
+    truncate: u64 = 0,
+    close_reopen: u64 = 0,
+    create_truncate: u64 = 0,
+    rename: u64 = 0,
+    delete: u64 = 0,
+    open_errors: u64 = 0,
+};
+
+const MfBorrow = struct { page: Page, path: usize, off: usize, snap: [MfModel.ps]u8 };
+
+fn mfCase(gpa: std.mem.Allocator, seed: u64, reach: *MfReach) !void {
+    const ps = MfModel.ps;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+
+    const max_pages_choices = [_]usize{ 1, 1, 2, 3, 5, 8 };
+    const ra_choices = [_]u32{ 0, 0, 2, 4 };
+    const max_pages = max_pages_choices[rnd.uintLessThan(usize, max_pages_choices.len)];
+    const ra = ra_choices[rnd.uintLessThan(usize, ra_choices.len)];
+
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var fault = FaultStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, fault.storage(), .{ .page_size = ps, .max_pages = max_pages, .read_ahead_pages = ra });
+    defer pc.deinit();
+    const st = pc.storage();
+
+    var model = MfModel{};
+    var handles: [MfModel.n_paths]?Storage.Handle = .{null} ** MfModel.n_paths;
+    var ro: [MfModel.n_paths]bool = .{false} ** MfModel.n_paths;
+    var borrows: [6]?MfBorrow = .{null} ** 6;
+    var full_reads: u64 = 0;
+    var ref_ok: u64 = 0;
+    defer for (&borrows) |*slot| {
+        if (slot.*) |b| pc.releasePage(b.page);
+    };
+
+    const steps = 80 + rnd.uintLessThan(usize, 220);
+    var step: usize = 0;
+    errdefer std.debug.print("pagecache model-fuzz FAILED: seed={d} step={d} max_pages={d} read_ahead={d}\n", .{ seed, step, max_pages, ra });
+    while (step < steps) : (step += 1) {
+        const i = rnd.uintLessThan(usize, MfModel.n_paths);
+        var roll = rnd.uintLessThan(u32, 100);
+        if (handles[i] == null and roll >= 12 and roll < 96) roll = 0; // a closed path: open it first
+        const live_pages = model.len[i] / ps;
+
+        if (roll < 12) { // ---- open
+            if (handles[i] != null) continue; // precondition: one handle per path
+            const modes = [_]Storage.OpenMode{ .open_or_create, .open_or_create, .create_truncate, .read_only, .create_new };
+            const mode = modes[rnd.uintLessThan(usize, modes.len)];
+            if (st.open(MfModel.paths[i], mode)) |h| {
+                try testing.expect(!(mode == .read_only and !model.exists[i]));
+                try testing.expect(!(mode == .create_new and model.exists[i]));
+                if (mode == .create_truncate) {
+                    model.len[i] = 0;
+                    reach.create_truncate += 1;
+                }
+                if (mode != .read_only) model.exists[i] = true;
+                handles[i] = h;
+                ro[i] = mode == .read_only;
+            } else |err| {
+                reach.open_errors += 1;
+                if (mode == .read_only and !model.exists[i]) {
+                    try testing.expectEqual(error.FileNotFound, err);
+                } else if (mode == .create_new and model.exists[i]) {
+                    try testing.expectEqual(error.PathAlreadyExists, err);
+                } else return err;
+            }
+        } else if (roll < 18) { // ---- close (and usually reopen later)
+            const h = handles[i].?;
+            st.close(h);
+            handles[i] = null;
+            reach.close_reopen += 1;
+        } else if (roll < 42) { // ---- full aligned page write
+            const h = handles[i].?;
+            const idx = rnd.uintLessThan(usize, live_pages + 3);
+            if ((idx + 1) * ps > MfModel.cap) continue;
+            var page: [ps]u8 = undefined;
+            if (rnd.boolean()) rnd.bytes(&page) else @memset(&page, rnd.int(u8));
+            if (ro[i]) {
+                try testing.expectError(error.AccessDenied, st.writeAll(h, &page, idx * ps));
+                reach.ro_denied += 1;
+            } else {
+                try st.writeAll(h, &page, idx * ps);
+                model.write(i, idx * ps, &page);
+            }
+        } else if (roll < 48) { // ---- unaligned / short / long write
+            const h = handles[i].?;
+            if (ro[i]) continue;
+            const off = rnd.uintLessThan(usize, model.len[i] + 2 * ps + 1);
+            const n = 1 + rnd.uintLessThan(usize, 2 * ps + 3);
+            if (off + n > MfModel.cap) continue;
+            var buf: [2 * ps + 3]u8 = undefined;
+            rnd.bytes(buf[0..n]);
+            try st.writeAll(h, buf[0..n], off);
+            model.write(i, off, buf[0..n]);
+            if (!(n == ps and off % ps == 0)) reach.unaligned_write += 1;
+        } else if (roll < 72) { // ---- full aligned page read
+            const h = handles[i].?;
+            const idx = rnd.uintLessThan(usize, live_pages + 3);
+            var got: [ps]u8 = undefined;
+            var want: [ps]u8 = undefined;
+            const n = try st.pread(h, &got, idx * ps);
+            const wn = model.read(i, idx * ps, &want);
+            full_reads += 1;
+            try testing.expectEqual(wn, n);
+            try testing.expectEqualSlices(u8, want[0..wn], got[0..n]);
+            if (n == 0) reach.eof_read += 1 else if (n < ps) reach.short_read += 1;
+        } else if (roll < 78) { // ---- arbitrary read
+            const h = handles[i].?;
+            const off = rnd.uintLessThan(usize, model.len[i] + ps + 1);
+            const len = 1 + rnd.uintLessThan(usize, 3 * ps);
+            var got: [3 * ps]u8 = undefined;
+            var want: [3 * ps]u8 = undefined;
+            const n = try st.pread(h, got[0..len], off);
+            const wn = model.read(i, off, want[0..len]);
+            if (len == ps and off % ps == 0) full_reads += 1;
+            try testing.expectEqual(wn, n);
+            try testing.expectEqualSlices(u8, want[0..wn], got[0..n]);
+        } else if (roll < 86) { // ---- borrow
+            const h = handles[i].?;
+            const aligned = rnd.uintLessThan(u32, 8) != 0;
+            const idx = rnd.uintLessThan(usize, live_pages + 2);
+            const off = idx * ps + (if (aligned) 0 else 1 + rnd.uintLessThan(usize, ps - 1));
+            const slot = for (&borrows) |*s| {
+                if (s.* == null) break s;
+            } else continue;
+            const full_present = off % ps == 0 and off + ps <= model.len[i];
+            const r = try pc.preadRef(h, ps, off);
+            if (r) |page| {
+                try testing.expect(full_present);
+                var want: [ps]u8 = undefined;
+                _ = model.read(i, off, &want);
+                try testing.expectEqualSlices(u8, &want, page.bytes);
+                ref_ok += 1;
+                slot.* = .{ .page = page, .path = i, .off = off, .snap = want };
+            } else {
+                try testing.expect(!full_present);
+                reach.ref_null += 1;
+            }
+        } else if (roll < 91) { // ---- release a borrow
+            const k = rnd.uintLessThan(usize, borrows.len);
+            if (borrows[k]) |b| {
+                try testing.expectEqualSlices(u8, &b.snap, b.page.bytes);
+                pc.releasePage(b.page);
+                borrows[k] = null;
+            }
+        } else if (roll < 94) { // ---- truncate (shrink only: the seam's contract)
+            const h = handles[i].?;
+            const nl = rnd.uintLessThan(usize, model.len[i] + 1);
+            if (ro[i]) {
+                try testing.expectError(error.AccessDenied, st.truncate(h, nl));
+                reach.ro_denied += 1;
+            } else {
+                // No sync first: a cut through an un-synced overwrite is the
+                // case that found kv SimStorage's undo-buffer invalid free
+                // (fixed 2026-10-11, kv/src/sim.zig `undoBytes`).
+                try st.truncate(h, nl);
+                model.len[i] = nl;
+                reach.truncate += 1;
+            }
+        } else if (roll < 96) { // ---- failed write, optionally torn
+            const h = handles[i].?;
+            if (ro[i]) continue;
+            const idx = rnd.uintLessThan(usize, live_pages + 2);
+            var page: [ps]u8 = undefined;
+            rnd.bytes(&page);
+            const torn = if (rnd.boolean()) rnd.uintLessThan(usize, ps) else 0;
+            fault.fail_write_index = fault.writes;
+            fault.torn_prefix = torn;
+            try testing.expectError(error.NoSpaceLeft, st.writeAll(h, &page, idx * ps));
+            fault.fail_write_index = null;
+            fault.torn_prefix = 0;
+            if (torn > 0) {
+                model.write(i, idx * ps, page[0..torn]); // the prefix really landed on media
+                reach.torn_write += 1;
+            }
+            reach.failed_write += 1;
+        } else if (roll < 98) { // ---- rename (both paths closed)
+            const j = rnd.uintLessThan(usize, MfModel.n_paths);
+            if (handles[i] != null or handles[j] != null) continue;
+            if (!model.exists[i]) {
+                try testing.expectError(error.FileNotFound, st.rename(MfModel.paths[i], MfModel.paths[j]));
+            } else {
+                try st.rename(MfModel.paths[i], MfModel.paths[j]);
+                if (i != j) {
+                    model.exists[j] = true;
+                    model.len[j] = model.len[i];
+                    model.data[j] = model.data[i];
+                    model.exists[i] = false;
+                    model.len[i] = 0;
+                }
+                reach.rename += 1;
+            }
+        } else { // ---- delete (closed path)
+            if (handles[i] != null) continue;
+            if (!model.exists[i]) {
+                try testing.expectError(error.FileNotFound, st.delete(MfModel.paths[i]));
+            } else {
+                try st.delete(MfModel.paths[i]);
+                model.exists[i] = false;
+                model.len[i] = 0;
+                reach.delete += 1;
+            }
+        }
+
+        // ---- invariants after EVERY step
+        for (0..MfModel.n_paths) |p| {
+            // Write-through: media equals the model, always.
+            if (model.exists[p]) {
+                try testing.expectEqualSlices(u8, model.data[p][0..model.len[p]], sim.fileContent(MfModel.paths[p]).?);
+            } else {
+                try testing.expect(sim.fileContent(MfModel.paths[p]) == null);
+            }
+            if (handles[p]) |h| try testing.expectEqual(@as(u64, model.len[p]), try st.size(h));
+        }
+        var live_borrows: usize = 0;
+        for (borrows) |slot| {
+            const b = slot orelse continue;
+            live_borrows += 1;
+            // A borrow keeps the snapshot it was handed, whatever happened since.
+            try testing.expectEqualSlices(u8, &b.snap, b.page.bytes);
+            var cur: [ps]u8 = undefined;
+            const cn = model.read(b.path, b.off, &cur);
+            // (reach) the live page moved on while the borrow still holds the old bytes
+            if (!model.exists[b.path] or cn != ps or !std.mem.eql(u8, &cur, &b.snap)) reach.borrow_kept_snapshot += 1;
+        }
+        const s = pc.stats();
+        try testing.expect(s.resident_pages <= max_pages + s.borrowed_pages);
+        try testing.expect(s.resident_bytes <= s.resident_pages * ps);
+        try testing.expect(s.borrowed_pages <= live_borrows);
+        try testing.expectEqual(full_reads, s.hits + s.misses);
+        try testing.expectEqual(ref_ok, s.ref_hits + s.ref_misses);
+        if (s.resident_pages > max_pages) reach.over_cap_by_borrow += 1;
+    }
+
+    // A last full audit through the cache, page by page, against the model.
+    for (0..MfModel.n_paths) |p| {
+        const h = handles[p] orelse continue;
+        var off: usize = 0;
+        while (off < model.len[p]) : (off += ps) {
+            var got: [ps]u8 = undefined;
+            var want: [ps]u8 = undefined;
+            const n = try st.pread(h, &got, off);
+            const wn = model.read(p, off, &want);
+            full_reads += 1;
+            try testing.expectEqual(wn, n);
+            try testing.expectEqualSlices(u8, want[0..wn], got[0..n]);
+        }
+    }
+    const fin = pc.stats();
+    if (fin.hits > 0) reach.hit += 1;
+    if (fin.misses > 0) reach.miss += 1;
+    if (fin.evictions > 0) reach.evict += 1;
+    if (fin.ref_hits > 0) reach.ref_hit += 1;
+    if (fin.ref_misses > 0) reach.ref_miss += 1;
+    if (fin.readahead_pages > 0) reach.readahead += 1;
+}
+
+test "model-fuzz: PageCache over SimStorage == naive per-file byte model (300 seeds)" {
+    const gpa = testing.allocator;
+    var reach = MfReach{};
+    var seed: u64 = 0;
+    while (seed < 300) : (seed += 1) try mfCase(gpa, 0x9A6E_CAC0_0000 + seed, &reach);
+    errdefer std.debug.print("pagecache model-fuzz reach: {any}\n", .{reach});
+    // Every outcome class must have happened, or the run proved less than it claims.
+    inline for (std.meta.fields(MfReach)) |f| {
+        if (@field(reach, f.name) == 0) {
+            std.debug.print("pagecache model-fuzz: reach class never hit: {s}\n", .{f.name});
+            return error.ReachClassMissed;
+        }
+    }
+}
