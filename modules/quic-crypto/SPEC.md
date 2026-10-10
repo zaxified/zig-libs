@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-05 (22/23, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: 1-RTT traffic secret through key derivation, key update, seal/open and header protection; `aes` / `chacha` 4 in-file each — the RFC-mandated packet-number-length read in `remove` and the AEAD verdict, none a branch on a key)
 **Performance:** not measured
 
 **Known defects:** none recorded

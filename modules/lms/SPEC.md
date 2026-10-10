@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-10-03 · mutation 2026-10-03 (60/67, 7 eq) · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: seed through LMS H5/W4 and 2-level HSS keygen + sign; `lms` 4 / `hss` 6 in-file = chain lengths from the message digest over the PUBLISHED randomizer C, an artefact)
 **Performance:** not measured
 
 **Known defects:** none recorded

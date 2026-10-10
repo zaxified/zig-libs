@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (targets `aes`, `chacha`, ReleaseFast). A 1-RTT traffic secret is tainted through `derivePacketKeys`, `advanceKeys`, `Protection.seal`/`open` and header protection (`computeMaskAes`/`computeMaskChaCha20`, `apply`, `remove`). 4 in-file contexts per target, none a branch on a key: `headerprot.remove` reading the packet-number length it has just unmasked (RFC 9001 §5.4.1; public to the endpoint) and the AEAD tag-verify outcome. Initial secrets and the Retry key are public by construction and not measured. No code change.
 - **2026-10-09** — **BREAKING (dead-stack rule, CONVENTIONS §2.1.1):** secrets in by `*const`, secret results out
   through an `out` pointer, every entry point's body under a burn (new `src/burn.zig`).
   `deriveInitialSecrets(out: *InitialSecrets, dcid)` / `deriveInitialSecretsFor(ver, out, dcid)`;

@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-08-23 · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: password KDF, all auth digests, AES-CFB privacy 0 in-file; DES-CBC privacy 256 = open finding, table-driven des.zig)
 **Performance:** not measured
 
 **Known defects:** none recorded

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — docs: ct axis recorded as n/a. The only secret is the node signing key. `bolt11.encode` (`.private_key`) and `bolt12.signMerkle` hand it by pointer straight to `k256`'s recoverable ECDSA and `bip340.sign`, both measured by their own ctgrind rows; no lninvoice code reads the key. Everything else (invoice fields, the payment secret carried in the invoice, signatures, node ids) is public (code review).
 - **2026-10-09** — Dead-stack rule (CONVENTIONS §2.1.1), no signature change: `bolt11.encode` now runs its body under a 16 KiB stack burn (new `src/burn.zig`; the ECDSA/BIP340 signing underneath was already burned in `k256`/`bip340`), probed by the new `src/stackprobe2_test.zig`. `bolt11.decode` and `bolt12.decodeInvoice` carry `secret-api-ok` markers (the invoice's `payment_secret` is public wire data shared with the payer; the bolt12 `Invoice` holds no secret).
 
 - **2026-10-09** — **TEST ONLY, NO API CHANGE:** dead-stack stack probe (`src/stackprobe_test.zig`, ReleaseFast) over BOLT#11 `encode` with `.private_key`, `signMerkle`, `encodeSignedInvoiceRequest`, `encodeSignedInvoice`: the private key and the ECDSA / BIP340 nonce material in every representation, needles self-checked against the published `R`. 0 residue as shipped (the signers are burned in `k256`/`bip340`; this module's frames hold only pointers).

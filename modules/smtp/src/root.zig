@@ -150,6 +150,7 @@ test {
     _ = command;
     _ = data;
     _ = auth;
+    _ = @import("b64ct.zig");
     _ = mime;
     _ = message;
     _ = session;

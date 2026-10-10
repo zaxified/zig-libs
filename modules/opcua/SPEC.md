@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-10-06 · mutation 2026-09-07 · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: channel nonces through deriveKeys 0; keys + body through sign/encrypt and decrypt/verify 14 in-file = the HMAC verdict and post-MAC padding/length handling)
 **Performance:** not measured
 
 **Known defects:** none recorded

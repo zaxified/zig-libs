@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: GOOSE/SV MAC key through computeMac/verifyMac, all HMAC and GMAC algorithms; 0 in-file; signature profiles via rsa/p256)
 **Performance:** not measured
 
 **Known defects:** none recorded

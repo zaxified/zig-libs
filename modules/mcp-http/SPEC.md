@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation ? · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: Mcp-Session-Id bytes through the id encoding; 0 in-file after replacing std.fmt `{x}`)
 **Performance:** not measured
 
 **Known defects:** none recorded

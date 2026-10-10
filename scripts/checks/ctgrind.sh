@@ -264,6 +264,52 @@ declare -A TARGETS=(
     [stun]="mi ltkey"
     [sessions]="csrf newid"
     [mqtt]="encode decode"
+    # ── 2026-10-10: ct-wave: Noise statics, ephemerals, PSK, transport keys ──
+    [noise]="hs transport"
+    # ── 2026-10-10: ct-wave: TLS 1.3 client ephemerals/key schedule, client-auth key ──
+    [tlsclient]="kex cv"
+    # ── 2026-10-10: ct-wave: DTLS 1.3 PSK, key schedule, record keys ──
+    [dtls]="hs app"
+    # ── 2026-10-10: ct-wave: QUIC 1-RTT traffic secret, packet + header protection ──
+    [quic-crypto]="aes chacha"
+    # ── 2026-10-10: ct-wave: Megolm ratchet + signing key, session export, sealed pickle ──
+    [megolm]="msg skey pickle"
+    # ── 2026-10-10: ct-wave: MLS key schedule, secret tree, PrivateMessage ──
+    [mls]="ks tree priv"
+    # ── 2026-10-10: ct-wave: OTP shared secret, codes, otpauth URI ──
+    [otp]="code uri"
+    # ── 2026-10-10: ct-wave: AES Key Wrap KEK + wrapped key ──
+    [aeskw]="wrap"
+    # ── 2026-10-10: ct-wave: AEAD framing channel keys + plaintext ──
+    [aeadframe]="chacha aes"
+    # ── 2026-10-10: ct-wave: per-tenant Noise_IK PE statics + ephemerals ──
+    [tenantkex]="ik"
+    # ── 2026-10-10: ct-wave: CTAP2 client PIN, shared secret, pinUvAuthToken ──
+    [ctap2]="pin token"
+    # ── 2026-10-10: ct-wave: VOPRF server key, client input/blinds, keygen seed ──
+    [voprf]="server client keygen"
+    # ── 2026-10-10: ct-wave: base32 encode/decode of a secret ──
+    [base32]="encode decode"
+    # ── 2026-10-10: ct-wave: timelock envelope lock secrets, HQC dk ──
+    [timelock_envelope]="kdf env"
+    # ── 2026-10-10: ct-wave: SHA-2 message as the secret, HMAC over sha2 ──
+    [sha2]="hash hmac"
+    # ── 2026-10-10: ct-wave: LMS/HSS seed ──
+    [lms]="lms hss"
+    # ── 2026-10-10: ct-wave: XMSS SK_SEED/SK_PRF ──
+    [xmss]="sign"
+    # ── 2026-10-10: ct-wave: GOOSE/SV MAC keys ──
+    [iec62351]="mac"
+    # ── 2026-10-10: ct-wave: OPC UA channel nonces + symmetric keys ──
+    [opcua]="kdf chunk"
+    # ── 2026-10-10: ct-wave: SMTP AUTH password ──
+    [smtp]="auth"
+    # ── 2026-10-10: ct-wave: MCP session id ──
+    [mcp-http]="sid"
+    # ── 2026-10-10: ct-wave: DNP3 SA session/update keys ──
+    [dnp3]="mac keys"
+    # ── 2026-10-10: ct-wave: SNMPv3 USM password, auth + priv keys ──
+    [snmp]="kdf auth aes des"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -317,6 +363,29 @@ declare -A MODES=(
     [stun]="ReleaseFast"
     [sessions]="ReleaseFast"
     [mqtt]="ReleaseFast"
+    [noise]="ReleaseFast"
+    [tlsclient]="ReleaseFast"
+    [dtls]="ReleaseFast"
+    [quic-crypto]="ReleaseFast"
+    [megolm]="ReleaseFast"
+    [mls]="ReleaseFast"
+    [otp]="ReleaseFast"
+    [aeskw]="ReleaseFast"
+    [aeadframe]="ReleaseFast"
+    [tenantkex]="ReleaseFast"
+    [ctap2]="ReleaseFast"
+    [voprf]="ReleaseFast"
+    [base32]="ReleaseFast"
+    [timelock_envelope]="ReleaseFast"
+    [sha2]="ReleaseFast"
+    [lms]="ReleaseFast"
+    [xmss]="ReleaseFast"
+    [iec62351]="ReleaseFast"
+    [opcua]="ReleaseFast"
+    [smtp]="ReleaseFast"
+    [mcp-http]="ReleaseFast"
+    [dnp3]="ReleaseFast"
+    [snmp]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -577,6 +646,51 @@ declare -A PATTERN=(
     [sessions/newid]='root[.]zig|idhex[.]zig'
     [mqtt/encode]='packet[.]zig'
     [mqtt/decode]='packet[.]zig'
+    [noise/hs]='state[.]zig|root[.]zig|patterns[.]zig|token[.]zig|burn[.]zig'
+    [noise/transport]='state[.]zig|root[.]zig|burn[.]zig'
+    [tlsclient/kex]='Client[.]zig|verify[.]zig|burn[.]zig'
+    [tlsclient/cv]='Client[.]zig|burn[.]zig'
+    [dtls/hs]='Connection[.]zig|aead[.]zig|keyschedule[.]zig|record[.]zig|engine[.]zig|handshake[.]zig|flight[.]zig|messages[.]zig|burn[.]zig|root[.]zig'
+    [dtls/app]='Connection[.]zig|aead[.]zig|keyschedule[.]zig|record[.]zig|engine[.]zig|handshake[.]zig|flight[.]zig|messages[.]zig|burn[.]zig|root[.]zig'
+    [quic-crypto/aes]='keyschedule[.]zig|protection[.]zig|headerprot[.]zig|burn[.]zig|root[.]zig|version[.]zig'
+    [quic-crypto/chacha]='keyschedule[.]zig|protection[.]zig|headerprot[.]zig|burn[.]zig|root[.]zig|version[.]zig'
+    [megolm/msg]='session[.]zig|session_key[.]zig|ratchet[.]zig|cipher[.]zig|message[.]zig|pickle[.]zig|burn[.]zig|root[.]zig'
+    [megolm/skey]='session[.]zig|session_key[.]zig|ratchet[.]zig|cipher[.]zig|message[.]zig|pickle[.]zig|burn[.]zig|root[.]zig'
+    [megolm/pickle]='session[.]zig|session_key[.]zig|ratchet[.]zig|cipher[.]zig|message[.]zig|pickle[.]zig|burn[.]zig|root[.]zig'
+    [mls/ks]='keyschedule[.]zig|secrettree[.]zig|framing[.]zig|crypto[.]zig|codec[.]zig|content[.]zig|suite[.]zig|burn[.]zig|root[.]zig'
+    [mls/tree]='keyschedule[.]zig|secrettree[.]zig|framing[.]zig|crypto[.]zig|codec[.]zig|content[.]zig|suite[.]zig|burn[.]zig|root[.]zig'
+    [mls/priv]='keyschedule[.]zig|secrettree[.]zig|framing[.]zig|crypto[.]zig|codec[.]zig|content[.]zig|suite[.]zig|burn[.]zig|root[.]zig'
+    [otp/code]='root[.]zig|burn[.]zig'
+    [otp/uri]='root[.]zig|otpauth[.]zig|burn[.]zig'
+    [aeskw/wrap]='root[.]zig|burn[.]zig'
+    [aeadframe/chacha]='channel[.]zig|record[.]zig|replay[.]zig|burn[.]zig|root[.]zig'
+    [aeadframe/aes]='channel[.]zig|record[.]zig|replay[.]zig|burn[.]zig|root[.]zig'
+    [tenantkex/ik]='root[.]zig|burn[.]zig'
+    [ctap2/pin]='clientpin[.]zig|root[.]zig'
+    [ctap2/token]='clientpin[.]zig|root[.]zig'
+    [voprf/server]='root[.]zig|burn[.]zig'
+    [voprf/client]='root[.]zig|burn[.]zig'
+    [voprf/keygen]='root[.]zig|burn[.]zig'
+    [base32/encode]='root[.]zig'
+    [base32/decode]='root[.]zig'
+    [timelock_envelope/kdf]='envelope[.]zig|stream[.]zig|root[.]zig|burn[.]zig'
+    [timelock_envelope/env]='envelope[.]zig|stream[.]zig|root[.]zig|burn[.]zig'
+    [sha2/hash]='root[.]zig'
+    [sha2/hmac]='root[.]zig'
+    [lms/lms]='core[.]zig|sign[.]zig|params[.]zig|root[.]zig|burn[.]zig'
+    [lms/hss]='core[.]zig|sign[.]zig|params[.]zig|root[.]zig|burn[.]zig'
+    [xmss/sign]='root[.]zig|burn[.]zig'
+    [iec62351/mac]='goose[.]zig|root[.]zig|burn[.]zig'
+    [opcua/kdf]='security[.]zig|burn[.]zig'
+    [opcua/chunk]='security[.]zig|burn[.]zig'
+    [smtp/auth]='auth[.]zig|b64ct[.]zig'
+    [mcp-http/sid]='sidhex[.]zig|root[.]zig'
+    [dnp3/mac]='sa[.]zig|burn[.]zig'
+    [dnp3/keys]='sa[.]zig|burn[.]zig'
+    [snmp/kdf]='usm[.]zig|burn[.]zig'
+    [snmp/auth]='usm[.]zig|burn[.]zig'
+    [snmp/aes]='priv[.]zig|burn[.]zig'
+    [snmp/des]='priv[.]zig|des[.]zig|burn[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 # WITNESS_CHAIN — the files a witness's stack may consist of BETWEEN the
@@ -746,6 +860,51 @@ declare -A LABEL=(
     [sessions/newid]='sessions session-id hex (idhex, id tainted)'
     [mqtt/encode]='mqtt encode CONNECT/AUTH (password+auth data)'
     [mqtt/decode]='mqtt decode CONNECT/AUTH (credential bytes tainted)'
+    [noise/hs]='noise XXpsk3 handshake (statics+ephemerals+psk tainted)'
+    [noise/transport]='noise transport encrypt/decrypt+rekey (keys tainted)'
+    [tlsclient/kex]='tlsclient ECDHE+key schedule on a ServerHello (ephemeral secrets tainted)'
+    [tlsclient/cv]='tlsclient signCertificateVerify P-256/P-384/Ed25519 (key tainted)'
+    [dtls/hs]='dtls PSK handshake (psk tainted)'
+    [dtls/app]='dtls send/recv AES-GCM+ChaCha (record keys tainted)'
+    [quic-crypto/aes]='quic-crypto keys+seal/open+HP AES (traffic secret tainted)'
+    [quic-crypto/chacha]='quic-crypto keys+seal/open+HP ChaCha (traffic secret tainted)'
+    [megolm/msg]='megolm encrypt/decrypt (ratchet+signing key tainted)'
+    [megolm/skey]='megolm SessionKey/Exported base64 round trip (ratchet tainted)'
+    [megolm/pickle]='megolm sealed pickle round trip (session+pickle key tainted)'
+    [mls/ks]='mls deriveEpoch (init/commit/psk secrets tainted)'
+    [mls/tree]='mls secret tree + ratchets (encryption secret tainted)'
+    [mls/priv]='mls protectPrivate + decrypt (keys, sd secret, sig key tainted)'
+    [otp/code]='otp hotp/totp/fmt/verify SHA-1/256/512 (secret tainted)'
+    [otp/uri]='otp otpauth.format + totpCode (secret tainted)'
+    [aeskw/wrap]='aeskw wrap/unwrap/tampered AES-128/256 (KEK+key tainted)'
+    [aeadframe/chacha]='aeadframe ChaCha seal/rekey/open (key+plaintext tainted)'
+    [aeadframe/aes]='aeadframe AES-GCM seal/rekey/open (key+plaintext tainted)'
+    [tenantkex/ik]='tenantkex Noise_IK both sides (PE statics + ephemerals tainted)'
+    [ctap2/pin]='ctap2 PIN rules/pad/hash + encrypt/MAC (PIN + shared secret tainted)'
+    [ctap2/token]='ctap2 decryptToken + Token.authenticate (shared secret tainted)'
+    [voprf/server]='voprf blindEvaluate/Verifiable/Poprf + evaluate (skS + proof nonce tainted)'
+    [voprf/client]='voprf blind/finalize/Verifiable/Poprf (input + blinds tainted)'
+    [voprf/keygen]='voprf deriveKeyPair x3 modes (seed tainted)'
+    [base32/encode]='base32 encode std/hex, pad/case (secret tainted)'
+    [base32/decode]='base32 decode std/hex, pad/case + reject (text tainted)'
+    [timelock_envelope/kdf]='timelock_envelope deriveKeys+deriveStreamKey (lock secrets tainted)'
+    [timelock_envelope/env]='timelock_envelope seal/open (randomness, plaintext, HQC dk tainted)'
+    [sha2/hash]='sha2 224/256/384/512 hash+update+peek (message tainted)'
+    [sha2/hmac]='sha2 HMAC-SHA256/512 over sha2 (key+message tainted)'
+    [lms/lms]='lms H5/W4 keygen+sign (seed tainted)'
+    [lms/hss]='lms HSS 2-level keygen+sign (seed tainted)'
+    [xmss/sign]='xmss h4 keyGen+5 signs (SK_SEED+SK_PRF tainted)'
+    [iec62351/mac]='iec62351 GOOSE computeMac/verifyMac all algs (key tainted)'
+    [opcua/kdf]='opcua deriveKeys P_SHA256 (nonces tainted)'
+    [opcua/chunk]='opcua sign/encrypt + decrypt/verify (keys+body tainted)'
+    [smtp/auth]='smtp AUTH PLAIN/LOGIN responses (password tainted)'
+    [mcp-http/sid]='mcp-http session-id hex (id tainted)'
+    [dnp3/mac]='dnp3 SA MAC compute/verify + reply MAC (session key tainted)'
+    [dnp3/keys]='dnp3 SA session key wrap/unwrap (update+session keys tainted)'
+    [snmp/kdf]='snmp passwordToUserKey+localizeKey (password tainted)'
+    [snmp/auth]='snmp HMAC digests all protocols (auth key tainted)'
+    [snmp/aes]='snmp AES-128-CFB priv round trip (key+PDU tainted)'
+    [snmp/des]='snmp DES-CBC priv round trip (key+PDU tainted)'
 )
 
 # ── measurement ────────────────────────────────────────────────────────────

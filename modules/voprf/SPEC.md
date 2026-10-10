@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-05 (21/25, 4 eq) · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: skS + proof nonce, client input + blinds, keygen seed; `server` 5 / `client` 8 / `keygen` 3 in-file, all single verdicts after the allEqual fix)
 **Performance:** not measured
 
 **Known defects:** none recorded

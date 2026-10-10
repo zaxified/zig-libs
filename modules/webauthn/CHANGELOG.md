@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — docs: ct axis recorded as n/a: the module is a WebAuthn relying-party verifier. Signatures, credential public keys, authenticator data, client data and the challenge (sent to the client in clear) are all public, and no private or MAC key is held. The signature checks are the `p256`/`rsa`/std primitives' (code review).
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** a test signs through rsa's pointer API and builds its
   key through the out-param `generate` (rsa 2026-10-08).
 - **2026-10-05** — Tests: first dated mutation run (54 mutants, all killed after 7 new tests;

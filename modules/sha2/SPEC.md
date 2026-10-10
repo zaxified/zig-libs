@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-10-03 · mutation 2026-10-03 (52/54, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: message through SHA-224/256/384/512 hash/update/peek and HMAC over sha2 with key + message tainted; 0 in-file)
 **Performance:** not measured
 
 **Known defects:** none recorded

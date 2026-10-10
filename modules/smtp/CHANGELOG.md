@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Constant time: AUTH PLAIN and AUTH LOGIN base64-encoded the password through `std.base64`, which indexes its alphabet by the secret. `checkCredential` also branched on every password byte (NUL/CR/LF). New private `src/b64ct.zig` encodes branch- and table-free, byte-identical to std (tested over every length 0..300 and every byte value). `checkCredential` now ORs a borrow-derived match bit per byte and branches once. New `src/ctgrind_harness.zig` (target `auth`, ReleaseFast): 312 -> 6 in-file contexts, the one validity verdict per call. No API change.
 - **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only (audit F13, F14). The amortized
   `reply.Parser.compact` is pinned by a byte count instead of the opt-in wall-clock bench, and
   `Session.wipeOut` zeroing the command buffer by a scan of its spare capacity after AUTH

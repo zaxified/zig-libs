@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (target `mac`, ReleaseFast): the GOOSE/SV MAC key is tainted through `goose.computeMac` and `goose.verifyMac` (valid and tampered) for HMAC-SHA256-80/128/256 and AES-GMAC-64/128. 0 in-file contexts. The RSASSA-PSS/ECDSA profiles are the `rsa`/`p256` modules' rows. No code change.
 - **2026-10-09** — Dead-stack burn: `goose.computeMac` (and so `goose.verifyMac`) runs its body under `burn.run` (4 KiB, per frame; the MAC key through the HMAC pads / GCM key schedule); new `stackprobe2_test.zig` on `testkit.stackprobe`. No signature change.
 
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the ECDSA P-256 sealer/signer

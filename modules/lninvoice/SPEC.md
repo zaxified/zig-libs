@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-09-03 · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct n/a — the node key is only forwarded by pointer to `k256` (BOLT#11 ECDSA) and `bip340` (BOLT#12 Schnorr), which carry their own ctgrind rows; invoice fields, signatures and node ids are public (review, 2026-10-10)
 **Performance:** not measured
 
 **Known defects:** none recorded

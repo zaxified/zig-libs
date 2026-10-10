@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (targets `lms`, `hss`, ReleaseFast): the seed is tainted through LMS (H5/W4) and two-level HSS key generation and signing. The 4 / 6 in-file contexts are the LM-OTS chain loop, whose count is a digit of the message hash over the randomizer C. C is derived from the seed but published in the signature, so this is a tainting artefact, not a leak. No code change.
 - **2026-10-09** — `core.deriveX` and `core.deriveRandomizer` (public building blocks) now run under their own burn (`derive_burn`, 2 KiB; negligible next to the hash chains they start). `LmsSecretKey.init` / `LmsSecretKey.sign` / `SecretKey.init` are marked thin wrappers of already-burned `Tree` entry points for the dead-stack lint. No signature changed. Probe: `src/stackprobe2_test.zig`.
 - **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte
   vector stores LLVM realigned the frame of a burn of 2 KiB or less (`and $-32, %rsp`), and the 32..63

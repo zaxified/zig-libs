@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-09-17 · mutation none · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: AUTH PLAIN/LOGIN password; 312 -> 6 in-file after the b64ct + masked credential-check fix, the 6 = one validity verdict per call)
 **Performance:** not measured
 
 **Known defects:** none recorded

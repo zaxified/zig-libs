@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (targets `kdf`, `env`, ReleaseFast). `kdf` taints both lock secrets through `deriveKeys` and `stream.deriveStreamKey` and has 0 in-file contexts. `env` runs `Envelope128.seal`/`open` with the seal randomness, plaintext and HQC decapsulation key tainted. Its 8 in-file contexts are in the dependencies reached through envelope frames: `tlock.encrypt` arithmetic and the compressed encoding of the public ciphertext point, HQC's fixed-weight rejection sampling in `dkParse`, and the AEAD verdict. None is in this module's own code. No code change.
 - **2026-10-09** — **BREAKING, HIGH: the envelope left its secrets in its callers' frames.**
   New ReleaseFast stack probe (`stackprobe_test.zig`), 5 calls each, before → after: `seal`
   the KEM message / s_time 15 and the AEAD key 10; `open` the AEAD key 10; `sealStream` s_time

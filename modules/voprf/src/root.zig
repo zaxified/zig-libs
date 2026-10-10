@@ -599,7 +599,10 @@ fn finalizeHash(input: []const u8, info: ?[]const u8, unblinded: [Ne]u8) [Nh]u8 
 /// shared by every Finalize. Rejects a non-canonical or zero blind.
 fn unblind(blind_scalar: [Ns]u8, evaluated_element: Element) FinalizeError![Ne]u8 {
     _ = deserializeScalar(blind_scalar) catch return error.InvalidBlind;
-    if (std.mem.allEqual(u8, &blind_scalar, 0)) return error.InvalidBlind;
+    // Not `std.mem.allEqual`: it exits at the first non-zero byte of the
+    // secret blind (ctgrind `voprf/client`, 2026-10-10). One verdict, taken
+    // on a constant-time compare.
+    if (std.crypto.timing_safe.eql([Ns]u8, blind_scalar, [_]u8{0} ** Ns)) return error.InvalidBlind;
     const inv = scalar.Scalar.fromBytes(blind_scalar).invert().toBytes();
     // `inv` is derived from the SECRET blind: constant-time multiply.
     return ct25519.mulRistretto(evaluated_element.p, inv).toBytes();
@@ -880,7 +883,9 @@ fn blindEvaluatePoprfBatchBody(
     if (evaluated_out.len != blinded.len) return error.MismatchedLengths;
     const m = poprfInfoScalar(info);
     const t = scalar.add(sk.*, m);
-    if (std.mem.allEqual(u8, &t, 0)) return error.InverseError;
+    // `t = skS + m` is secret: constant-time zero check, not the early-exit
+    // `std.mem.allEqual` (ctgrind `voprf/server`, 2026-10-10).
+    if (std.crypto.timing_safe.eql([Ns]u8, t, [_]u8{0} ** Ns)) return error.InverseError;
     const t_inv = scalar.Scalar.fromBytes(t).invert().toBytes();
     for (blinded, evaluated_out) |blinded_element, *out| {
         // `t_inv`/`t` are derived from the SECRET key: constant-time.
@@ -974,7 +979,9 @@ fn evaluatePoprfBody(sk: *const [Ns]u8, input: []const u8, info: []const u8, out
     const input_element = try hashToGroup(.poprf, input);
     const m = poprfInfoScalar(info);
     const t = scalar.add(sk.*, m);
-    if (std.mem.allEqual(u8, &t, 0)) return error.InverseError;
+    // `t = skS + m` is secret: constant-time zero check, not the early-exit
+    // `std.mem.allEqual` (ctgrind `voprf/server`, 2026-10-10).
+    if (std.crypto.timing_safe.eql([Ns]u8, t, [_]u8{0} ** Ns)) return error.InverseError;
     const t_inv = scalar.Scalar.fromBytes(t).invert().toBytes();
     const evaluated = ct25519.mulRistretto(input_element.p, t_inv); // SECRET t_inv
     out.* = finalizeHash(input, info, evaluated.toBytes());

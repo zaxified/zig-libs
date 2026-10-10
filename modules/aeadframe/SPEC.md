@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-05 (35/35) · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: channel keys + plaintext through seal/rekey/open, ChaCha20-Poly1305 and AES-256-GCM; 5 in-file each = AEAD verdicts + the rekey same-key verdict)
 **Performance:** not measured
 
 **Evidence:** model-fuzz — replay window compared to a reference set over a randomised trace; plus golden wire and never-panic fuzz

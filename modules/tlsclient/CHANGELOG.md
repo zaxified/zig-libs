@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (targets `kex`, `cv`, ReleaseFast). `kex` drives `Client.initInto` over a canned ServerHello with the key-share secrets in `Options.entropy` tainted (key generation, X25519 exchange, handshake key schedule); `cv` taints the client private key through `signCertificateVerify` for P-256, P-384 and Ed25519. No context is a branch of `Client.zig`'s own on a secret: the 21 / 32 in-file contexts are std's ML-KEM matrix rejection sampling (public rho, an artefact of tainting the seed), identity/range verdicts in key generation and ECDSA internals (itemised in `scripts/checks/ctgrind-expected.tsv`). The encrypted server flight is not measured: decrypted public server messages are parsed as by any TLS client. No code change.
 - **2026-10-10** — **Security hardening:** `checkWellFormed` (every server certificate, before std's
   parser sees it) now runs `x509.safe.validateForStdParse` instead of `validateCertificate` alone: it
   also requires a constructed element at every position std's `Certificate.parse` descends into, and

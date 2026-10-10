@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — docs: ct axis recorded as n/a: NETCONF framing, RPC building and reply parsing hold no secret; the only credential is passed through to `ssh.userauth.authenticatePassword`, whose constant-time story is `ssh`'s (code review).
 - **2026-09-15** — **BEHAVIOURAL, not breaking (default on, switch to opt out):**
   `Client.send` now checks, before writing anything to the wire, that the peer's `<hello>`
   actually advertised the capability an operation requires — `lock`/`unlock`/`getConfig`/

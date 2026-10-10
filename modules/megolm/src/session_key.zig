@@ -31,6 +31,7 @@ const std = @import("std");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
 const testkit = @import("testkit");
 const ratchet_mod = @import("ratchet.zig");
+const b64ct = @import("b64ct.zig");
 const burn = @import("burn.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -192,22 +193,24 @@ fn decodeSignedPartUnchecked(bytes: *const [signed_part_len]u8, out: *ExportedSe
     out.signing_key = bytes[1 + index_len + ratchet_mod.ratchet_len ..][0..pubkey_len].*;
 }
 
+// Not `std.base64`: these encode/decode the ratchet, and std's codec indexes
+// a table by each secret sextet/character and branches on validity (40
+// memcheck contexts, ctgrind `megolm/skey`, 2026-10-10). `b64ct` is the
+// same alphabet and accept set, computed without branches or indexes.
 fn base64Encode(allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error![]u8 {
-    const codec = std.base64.standard_no_pad;
-    const out = try allocator.alloc(u8, codec.Encoder.calcSize(bytes.len));
-    _ = codec.Encoder.encode(out, bytes);
+    const out = try allocator.alloc(u8, b64ct.encodedLen(bytes.len));
+    b64ct.encode(out, bytes);
     return out;
 }
 
 fn base64Decode(allocator: std.mem.Allocator, s: []const u8) (std.mem.Allocator.Error || std.base64.Error)![]u8 {
-    const codec = std.base64.standard_no_pad;
-    const size = try codec.Decoder.calcSizeForSlice(s);
+    const size = try b64ct.decodedLen(s.len);
     const out = try allocator.alloc(u8, size);
     errdefer {
         std.crypto.secureZero(u8, out);
         allocator.free(out);
     }
-    try codec.Decoder.decode(out, s);
+    try b64ct.decode(out, s);
     return out;
 }
 

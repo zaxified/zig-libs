@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — docs: ct axis recorded as n/a: the only secret, the API key, is validated for header-safe bytes and copied into the `x-api-key` header; no MAC, key derivation or secret compare happens here (code review; TLS is `http`'s).
 - **2026-10-06** — FIXED (review of PR #5): citations could be requested but not received. A
   streamed `citations_delta` was `error.MalformedResponse`, ending the stream at the first
   citation, and a non-streaming text block's `citations` array was dropped. Now

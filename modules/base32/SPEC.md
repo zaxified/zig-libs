@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-10-03 · mutation 2026-10-03 (38/40, 2 eq) · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BASE32_FUZZ) · ct none
-
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BASE32_FUZZ) · ct 2026-10-10 (ctgrind: secret through encode, both alphabets/pad/case, 0 in-file; encoded secret through decode 5 = the per-char `=` test, whose outcome the public length fixes, + the final validity verdict)
 **Performance:** not measured
 
 **Known defects:** none recorded

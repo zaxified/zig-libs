@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation ? · src ?
 
-**Hardening:** fuzz ? · ct none
+**Hardening:** fuzz ? · ct n/a — the SSH password is handed straight to `ssh.userauth`; framing/RPC carry no key, MAC or compare (review, 2026-10-10)
 
 **Performance:** not measured
 

@@ -101,6 +101,7 @@
 //! response framing happen outside the lock.
 
 const std = @import("std");
+const sidhex = @import("sidhex.zig");
 const router = @import("router");
 const http = @import("http");
 const mcp = @import("mcp");
@@ -307,7 +308,10 @@ pub const Sessions = struct {
         var raw: [16]u8 = undefined;
         fillRandom(&raw);
         var idbuf: [32]u8 = undefined;
-        const id_txt = std.fmt.bufPrint(&idbuf, "{x}", .{&raw}) catch unreachable;
+        // Not `std.fmt` `{x}`: it indexes a digit table by each secret nibble
+        // (ctgrind `mcp-http/sid`, 2026-10-10). Same lowercase text.
+        sidhex.encode(&idbuf, &raw);
+        const id_txt: []const u8 = &idbuf;
         // A collision would silently merge two peers, which is the very thing
         // the id exists to prevent. At 128 bits it never happens; refusing is
         // still the only honest answer if it does.
@@ -2609,6 +2613,7 @@ test "close() actually ends the session it marks" {
 
 test {
     _ = modern;
+    _ = sidhex;
 }
 
 /// A POST with arbitrary extra header lines (each ending `\r\n`).

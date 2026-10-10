@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Constant time: `Sessions.create` hex-formatted the 128-bit CSPRNG session id, the only gate on a session's GET/POST/DELETE, with `std.fmt` `{x}`, a digit table indexed by the secret nibble. A new private `src/sidhex.zig` encodes branch- and table-free, with the same lowercase text (tested against std). New `src/ctgrind_harness.zig` (target `sid`, ReleaseFast): 0 in-file contexts. The registry lookup of a presented id (a hash map) is unchanged, as in `sessions`. No API change.
 - **2026-10-02** — `x-mcp-header` annotations are read to `mcp`'s
   `header_annotations.max_chain` (32 `properties` levels; was an off-by-one 33),
   the depth `mcp.Server.addTool` now enforces, so a registered tool can carry

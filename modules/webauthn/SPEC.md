@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-10-05 (54/54) · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct n/a — relying-party verifier: every input (signatures, credential public keys, challenges, client data) is public or sent in clear; holds no key, MAC key or secret (review, 2026-10-10)
 **Performance:** not measured
 
 **Known defects:** none recorded

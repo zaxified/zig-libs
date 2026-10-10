@@ -45,15 +45,27 @@ pub const AuthError = error{
 };
 
 const b64 = std.base64.standard;
+// Not std's encoder for the credential: it indexes its alphabet by the secret
+// (with the old per-byte `checkCredential`: 312 memcheck contexts, ctgrind
+// `smtp/auth`, 2026-10-10; 6 after, the single validity verdict per call).
+const b64ct = @import("b64ct.zig");
 
 /// The two challenges LOGIN uses, base64 as they appear on the wire.
 pub const login_username_challenge = "VXNlcm5hbWU6"; // "Username:"
 pub const login_password_challenge = "UGFzc3dvcmQ6"; // "Password:"
 
+/// A credential must not hold NUL, CR or LF. Scanned without a branch per
+/// byte (the password is secret; ctgrind `smtp/auth`, 2026-10-10): each
+/// byte's match is a borrow-derived bit, ORed together and branched on once.
 fn checkCredential(s: []const u8) AuthError!void {
-    for (s) |c| {
-        if (c == 0 or c == '\r' or c == '\n') return error.InvalidCredential;
-    }
+    var bad: u8 = 0;
+    for (s) |c| bad |= isZero(c) | isZero(c ^ '\r') | isZero(c ^ '\n');
+    if (bad != 0) return error.InvalidCredential;
+}
+
+/// 1 when `x == 0`, else 0, without a branch.
+inline fn isZero(x: u8) u8 {
+    return @truncate((@as(u16, x) -% 1) >> 8 & 1);
 }
 
 /// Encoded length of `n` raw octets (base64 with padding).
@@ -87,14 +99,14 @@ pub fn plainResponse(buf: []u8, authzid: []const u8, authcid: []const u8, passwd
     i += 1;
     @memcpy(raw[i..][0..passwd.len], passwd);
     i += passwd.len;
-    return b64.Encoder.encode(buf, raw[0..i]);
+    return b64ct.encode(buf, raw[0..i]);
 }
 
 /// One LOGIN step: base64 of the credential the server just asked for.
 pub fn loginResponse(buf: []u8, credential: []const u8) AuthError![]const u8 {
     try checkCredential(credential);
     if (encodedLen(credential.len) > buf.len) return error.NoSpaceLeft;
-    return b64.Encoder.encode(buf, credential);
+    return b64ct.encode(buf, credential);
 }
 
 /// Decode a server challenge (the text of a `334` reply). An empty challenge is

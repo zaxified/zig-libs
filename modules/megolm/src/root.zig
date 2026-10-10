@@ -96,6 +96,7 @@ test {
     _ = session_key;
     _ = session;
     _ = pickle;
+    _ = @import("b64ct.zig");
     _ = @import("kat_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");

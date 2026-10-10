@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (target `wrap`, ReleaseFast): the KEK and the wrapped key are tainted through `wrap`, `unwrap` and a tampered `unwrap`, with AES-128 and AES-256 KEKs. 4 in-file contexts, all the integrity verdict taken after the constant-time IV compare. No code change.
 - **2026-10-09** — Dead-stack burn: `wrap` and `unwrap` (KEK, key data) run their bodies under `burn.run` (4 KiB, per-message path); new `stackprobe_test.zig` on `testkit.stackprobe`. No signature change.
 
 - **2026-10-05** — Tests: first dated mutation run (13 mutants, 12 killed, 1 equivalent; `SPEC.md`

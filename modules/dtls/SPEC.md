@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-09-07 · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: PSK through a full handshake, record keys through send/recv; `hs` 119 / `app` 14 in-file, none a branch on a key — constant-time-check verdicts and processing of decrypted content)
 **Performance:** not measured
 
 **Known defects:** none recorded

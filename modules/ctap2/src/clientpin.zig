@@ -78,9 +78,146 @@ pub const default_min_pin_code_points = 4;
 /// The caller supplies the PIN in Normalization Form C, as the spec requires;
 /// this module does not normalize (see SPEC.md, Backlog).
 pub fn validateNewPin(pin: []const u8, min_code_points: u32) PinError!void {
-    const count = std.unicode.utf8CountCodepoints(pin) catch return error.PinNotUtf8;
+    const r = utf8CountCt(pin);
+    if (!r.valid) return error.PinNotUtf8;
     if (pin.len > max_pin_bytes) return error.PinTooLong;
-    if (count < @max(min_code_points, default_min_pin_code_points)) return error.PinTooShort;
+    if (r.count < @max(min_code_points, default_min_pin_code_points)) return error.PinTooShort;
+}
+
+// ── constant-time UTF-8 validation + code-point count ───────────────────────
+//
+// Not `std.unicode.utf8CountCodepoints`: it branches on the PIN bytes (its
+// ASCII fast path, then one decode per sequence), which tells a timing
+// observer whether the PIN is ASCII and, if not, its code-point structure
+// (ctgrind `ctap2/pin`, 2026-10-10: 1 context). Here every decision is a
+// mask built from a borrow — no branch and no table indexed by a PIN byte —
+// and validity is accumulated and returned for ONE verdict after the loop.
+// Accepts exactly what std accepts (well-formed UTF-8: no overlongs, no
+// surrogates, nothing above U+10FFFF, no truncated sequence), cross-checked
+// exhaustively below.
+
+const Utf8Count = struct { valid: bool, count: usize };
+
+/// 0xff when lo <= c <= hi, else 0.
+inline fn inRangeMask(c: u8, lo: u8, hi: u8) u8 {
+    const v = (@as(u16, c) -% lo) | (@as(u16, hi) -% c);
+    return ~@as(u8, @truncate(v >> 8));
+}
+
+/// 0xff when x == 0, else 0.
+inline fn zeroMask(x: u8) u8 {
+    return @truncate((@as(u16, x) -% 1) >> 8);
+}
+
+fn utf8CountCt(s: []const u8) Utf8Count {
+    var valid: u8 = 0xff;
+    var count: usize = 0;
+    // Continuation bytes still expected, and the allowed range of the NEXT
+    // one (narrowed after E0, ED, F0, F4 per RFC 3629 §4).
+    var need: u8 = 0;
+    var lo: u8 = 0x80;
+    var hi: u8 = 0xbf;
+    for (s) |b| {
+        const in_seq = ~zeroMask(need); // 0xff while continuations are due
+        const at_lead = ~in_seq;
+
+        // Continuation position: must be inside [lo, hi].
+        valid &= at_lead | inRangeMask(b, lo, hi);
+
+        // Lead position: classify by ranges.
+        const ascii = inRangeMask(b, 0x00, 0x7f);
+        const two = inRangeMask(b, 0xc2, 0xdf);
+        const three = inRangeMask(b, 0xe0, 0xef);
+        const four = inRangeMask(b, 0xf0, 0xf4);
+        valid &= in_seq | ascii | two | three | four;
+
+        const lead_need = (two & 1) | (three & 2) | (four & 3);
+        need = (in_seq & (need -% 1)) | (at_lead & lead_need);
+
+        const e0 = inRangeMask(b, 0xe0, 0xe0);
+        const ed = inRangeMask(b, 0xed, 0xed);
+        const f0 = inRangeMask(b, 0xf0, 0xf0);
+        const f4 = inRangeMask(b, 0xf4, 0xf4);
+        const lead_lo: u8 = 0x80 ^ (e0 & (0x80 ^ 0xa0)) ^ (f0 & (0x80 ^ 0x90));
+        const lead_hi: u8 = 0xbf ^ (ed & (0xbf ^ 0x9f)) ^ (f4 & (0xbf ^ 0x8f));
+        lo = (in_seq & 0x80) | (at_lead & lead_lo);
+        hi = (in_seq & 0xbf) | (at_lead & lead_hi);
+
+        // A code point starts at every byte that is not 10xxxxxx.
+        count += 1 & ~inRangeMask(b, 0x80, 0xbf);
+    }
+    valid &= zeroMask(need); // no truncated sequence at the end
+    return .{ .valid = valid == 0xff, .count = count };
+}
+
+fn expectSameAsStd(s: []const u8) !void {
+    const ours = utf8CountCt(s);
+    if (std.unicode.utf8CountCodepoints(s)) |n| {
+        if (!ours.valid or ours.count != n) {
+            std.debug.print("mismatch on {x}: std valid count={d}, ours valid={} count={d}\n", .{ s, n, ours.valid, ours.count });
+            return error.TestUnexpectedResult;
+        }
+    } else |_| {
+        if (ours.valid) {
+            std.debug.print("mismatch on {x}: std invalid, ours valid\n", .{s});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "utf8CountCt agrees with std on every 1-, 2- and 3-byte string" {
+    var buf: [3]u8 = undefined;
+    for (0..256) |a| {
+        buf[0] = @intCast(a);
+        try expectSameAsStd(buf[0..1]);
+        for (0..256) |b| {
+            buf[1] = @intCast(b);
+            try expectSameAsStd(buf[0..2]);
+            for (0..256) |c| {
+                buf[2] = @intCast(c);
+                try expectSameAsStd(buf[0..3]);
+            }
+        }
+    }
+}
+
+const edge_cps = [_]u21{ 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff, 0xe000, 0xffff, 0x10000, 0x10ffff };
+
+test "utf8CountCt agrees with std on 200k random strings up to 63 bytes" {
+    var prng = std.Random.DefaultPrng.init(0xc7a2_0f10);
+    const rnd = prng.random();
+    var buf: [63 + 4]u8 = undefined;
+    for (0..200_000) |_| {
+        const target = rnd.uintAtMost(usize, 63);
+        var len: usize = 0;
+        if (rnd.boolean()) {
+            // Mostly well-formed: encode random scalar values (biased to the
+            // edges), then sometimes damage one byte or cut the tail.
+            while (len < target) {
+                const cp: u21 = switch (rnd.uintLessThan(u8, 6)) {
+                    0 => rnd.uintLessThan(u21, 0x80),
+                    1 => rnd.intRangeAtMost(u21, 0x80, 0x7ff),
+                    2 => rnd.intRangeAtMost(u21, 0x800, 0xd7ff),
+                    3 => rnd.intRangeAtMost(u21, 0xe000, 0xffff),
+                    4 => rnd.intRangeAtMost(u21, 0x10000, 0x10ffff),
+                    else => edge_cps[rnd.uintLessThan(usize, edge_cps.len)],
+                };
+                len += std.unicode.utf8Encode(cp, buf[len..]) catch unreachable;
+            }
+            if (len > 63) len = 63;
+            switch (rnd.uintLessThan(u8, 4)) {
+                0 => if (len > 0) {
+                    buf[rnd.uintLessThan(usize, len)] = rnd.int(u8);
+                },
+                1 => len = rnd.uintAtMost(usize, len),
+                else => {},
+            }
+        } else {
+            len = target;
+            rnd.bytes(buf[0..len]);
+        }
+        try expectSameAsStd(buf[0..len]);
+    }
 }
 
 /// Check the CURRENT PIN the user typed: at most 63 bytes (an older PIN may

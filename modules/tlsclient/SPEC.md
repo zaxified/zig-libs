@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (22/23) · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: key-share secrets through ECDHE + key schedule, client-auth key through signCertificateVerify; `kex` 21 / `cv` 32 in-file, all std keygen/ECDSA verdicts, none a Client.zig branch; encrypted flight not measured)
 **Performance:** not measured
 
 **Known defects:** none recorded

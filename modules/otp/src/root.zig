@@ -109,8 +109,34 @@ fn dynamicTruncateBody(comptime alg: Algorithm, key: []const u8, counter: u64) u
     std.mem.writeInt(u64, &msg, counter, .big);
     var mac: [H.mac_length]u8 = undefined;
     H.create(&mac, &msg, key);
-    const offset: usize = mac[H.mac_length - 1] & 0x0f;
-    return std.mem.readInt(u32, mac[offset..][0..4], .big) & 0x7fff_ffff;
+    return truncateCt(H.mac_length, &mac);
+}
+
+/// RFC 4226 §5.3 dynamic truncation, constant time. Not
+/// `mac[offset..][0..4]`: the offset is the low nibble of a MAC under the
+/// secret key, so indexing by it is a secret-dependent load address (memcheck
+/// reports it: 18 contexts, ctgrind `otp/code`, 2026-10-10; 0 after). All
+/// 16 candidate windows are read and the one at `offset` is selected with a
+/// mask built from a borrow.
+fn truncateCt(comptime n: usize, mac: *const [n]u8) u32 {
+    const offset: u32 = mac[n - 1] & 0x0f;
+    var p: u32 = 0;
+    inline for (0..16) |o| {
+        const d: u32 = @as(u32, o) ^ offset; // 0 iff o == offset (both < 16)
+        const sel: u32 = 0 -% ((d -% 1) >> 31); // all-ones iff d == 0
+        p |= sel & std.mem.readInt(u32, mac[o..][0..4], .big);
+    }
+    return p & 0x7fff_ffff;
+}
+
+test "truncateCt equals the RFC 4226 indexed truncation for every offset" {
+    var mac: [20]u8 = undefined;
+    for (&mac, 0..) |*b, i| b.* = @truncate(0x91 +% i *% 37);
+    for (0..16) |o| {
+        mac[19] = (mac[19] & 0xf0) | @as(u8, @intCast(o));
+        const want = std.mem.readInt(u32, mac[o..][0..4], .big) & 0x7fff_ffff;
+        try std.testing.expectEqual(want, truncateCt(20, &mac));
+    }
 }
 
 /// RFC 4226 HOTP: `Truncate(HMAC-alg(key, counter)) mod 10^digits`,

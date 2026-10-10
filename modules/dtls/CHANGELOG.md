@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (targets `hs`, `app`, ReleaseFast). `hs` runs an in-memory PSK handshake with the PSK tainted on both sides; `app` taints both directions' record keys (AEAD key, IV, sequence-number mask key) through `send`/`recv` under AES-128-GCM and ChaCha20-Poly1305. No context is a branch on a key: the in-file ones are verdicts of checks that already run in constant time (PSK binder, both Finished MACs, the AEAD tag) and the receiver processing what it just decrypted (sequence-number reconstruction, padding scan and content-type dispatch, handshake-message parsing, transcript hashing), itemised in `scripts/checks/ctgrind-expected.tsv`. No code change.
 - **2026-10-09** — **BREAKING (dead-stack rule, CONVENTIONS §2.1.1, public building blocks):** `keyschedule.*`
   now takes every secret by `*const [N]u8` and returns it through `out` pointers (first parameter after the
   comptime types), no secret by value or return: `expandLabel(Hkdf, prefix, len, out, secret, label, ctx)`,

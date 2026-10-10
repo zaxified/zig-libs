@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (targets `kdf`, `chunk`, ReleaseFast, Basic256Sha256). `kdf` taints both channel nonces through `deriveKeys` and has 0 in-file contexts. `chunk` taints the channel keys and body through `symmetricSignAndEncrypt`/`symmetricDecryptAndVerify`: 14 contexts, made up of the HMAC verdict and, after it, the padding checks and copy of the authenticated plaintext (its length). Padding is checked only after the MAC, so it is no padding oracle. No code change.
 - **2026-10-09** — **BREAKING:** dead-stack burns (`CONVENTIONS.md` §2.1.1).
   `SecureChannel.open(conn, allocator, options, out: *SecureChannel)` and
   `ClientCredentials.generateSelfSigned(allocator, random, options, out:

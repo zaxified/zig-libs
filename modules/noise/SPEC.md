@@ -8,8 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (25/25) · src ?
 
-**Hardening:** fuzz ? · ct none
-
+**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: XXpsk3 statics/ephemerals/PSK + transport keys tainted, `hs` 8 / `transport` 6 in-file, all std verdicts — X25519 identity check, AEAD tag outcome — none a noise branch)
 **Performance:** not measured
 
 **Known defects:** none recorded

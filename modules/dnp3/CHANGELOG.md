@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (targets `mac`, `keys`, ReleaseFast). `mac` taints the Secure Authentication session key through `sa.mac.compute`/`verify` (every HMAC truncation and AES-GMAC) and `computeReplyMac`/`verifyReplyMac`: 0 in-file contexts. `keys` taints the update and session keys through `wrapSessionKeys`/`unwrapSessionKeys`: 2, `aeskw`'s integrity verdict. No code change.
 - **2026-10-09** — Dead-stack burn: `sa.mac.compute` / `computeTwo` (and so `verify`, `verifyTwo`, `computeReplyMac`, `verifyReplyMac`; 4 KiB, per ASDU) and `sa.wrapSessionKeys` / `unwrapSessionKeys` (8 KiB, session-key change) run their bodies under `burn.run`; new `stackprobe_test.zig` on `testkit.stackprobe`. No signature change.
 
 - **2026-10-05** — Mutation run: 28 of 38 killed, 1 equivalent; 3 tests added

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
 
-**Hardening:** fuzz ? · ct none
+**Hardening:** fuzz ? · ct n/a — the API key is an opaque header value copied verbatim into `x-api-key`; no key derivation, MAC or compare in the module (review, 2026-10-10)
 
 **Performance:** not measured
 
