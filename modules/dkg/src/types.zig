@@ -391,33 +391,81 @@ const BroadcastCorpus = struct {
     }
 };
 
-fn fuzzPedersenBroadcastDecode(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const BcastMark = fz.Marker(enum { accepted, refused, with_commitments, canonical_roundtrip, claimed_count_lie });
+const ShareMark = fz.Marker(enum { accepted, refused, canonical_roundtrip });
+
+var bcast_corpus_cache: ?BroadcastCorpus = null;
+
+fn bcastCorpusEntries() []const []const u8 {
+    if (bcast_corpus_cache == null) {
+        bcast_corpus_cache = .{};
+        // Page allocator, never freed: the corpus entries outlive any test.
+        _ = bcast_corpus_cache.?.build(std.heap.page_allocator);
+    }
+    return bcast_corpus_cache.?.entries[0..bcast_corpus_cache.?.n];
+}
+
+fn fuzzPedersenSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPedersenBroadcastDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzFeldmanSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFeldmanBroadcastDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzShareMsgSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzShareMsgDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzPedersenBroadcastDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [broadcast_buf_len]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
-    // latter drew `len == 0` on every input the ordinary lane ever ran (a
-    // ranged draw needs eight octets and `bytes` had eaten them), so this
-    // target returned `InvalidEncoding` off the `bytes.len < 8` check every
-    // round, with the broadcast sitting unread in `buf`.
-    const len: usize = smith.slice(&buf);
+    // ⚠ One `slice` call, never `bytes` followed by a ranged length: the
+    // latter drew `len == 0` on every input the ordinary lane ever ran. Under
+    // the driver's `Rng`, half the draws are a corpus frame with 0-3 octets
+    // damaged (a point on the curve is unreachable from uniform bytes).
+    const len: usize = fz.drawInput(S, src, &buf, bcastCorpusEntries());
     // The `t` count (bytes[4..8]) is attacker-controlled; the decoder must
     // reject any length mismatch (`bytes.len != 8 + t*Ne`) BEFORE
-    // allocating — never panic/OOB regardless of the claimed `t`.
-    const pb = PedersenBroadcast.fromBytesAlloc(std.testing.allocator, buf[0..len]) catch return;
-    defer pb.deinit(std.testing.allocator);
+    // allocating -- never panic/OOB regardless of the claimed `t`.
+    const pb = PedersenBroadcast.fromBytesAlloc(gpa, buf[0..len]) catch {
+        BcastMark.mark(.refused);
+        if (len >= 8 and std.mem.readInt(u32, buf[4..8], .big) > 4) BcastMark.mark(.claimed_count_lie);
+        return;
+    };
+    defer pb.deinit(gpa);
+    BcastMark.mark(.accepted);
+    if (pb.commitments.len != 0) BcastMark.mark(.with_commitments);
+    const again = try pb.toBytesAlloc(gpa);
+    defer gpa.free(again);
+    if (!std.mem.eql(u8, again, buf[0..len])) return error.NonCanonicalBroadcastAccepted;
+    BcastMark.mark(.canonical_roundtrip);
 }
 test "fuzz PedersenBroadcast.fromBytesAlloc never panics" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var corpus: BroadcastCorpus = .{};
-    try std.testing.fuzz({}, fuzzPedersenBroadcastDecode, .{ .corpus = corpus.build(arena.allocator()) });
+    try std.testing.fuzz({}, fuzzPedersenSmith, .{ .corpus = corpus.build(arena.allocator()) });
+}
+test "fuzz driver: DKG_FUZZ (pedersen decode)" {
+    try fz.fuzz_driver.run(fuzzPedersenBroadcastDecode, .{ .prefix = "DKG_FUZZ", .name = "dkg-pedersen-decode" });
+}
+test "fuzz harness: pedersen decode, 300 seeds, reaches every outcome" {
+    try BcastMark.reach(fuzzPedersenBroadcastDecode, "dkg-pedersen-decode", 300);
 }
 
-fn fuzzFeldmanBroadcastDecode(_: void, smith: *std.testing.Smith) !void {
+fn fuzzFeldmanBroadcastDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [broadcast_buf_len]u8 = undefined;
-    // ⚠ Same as above: this target's length draw was 0 on every input.
-    const len: usize = smith.slice(&buf);
-    const fb = FeldmanBroadcast.fromBytesAlloc(std.testing.allocator, buf[0..len]) catch return;
-    defer fb.deinit(std.testing.allocator);
+    const len: usize = fz.drawInput(S, src, &buf, bcastCorpusEntries());
+    const fb = FeldmanBroadcast.fromBytesAlloc(gpa, buf[0..len]) catch {
+        BcastMark.mark(.refused);
+        return;
+    };
+    defer fb.deinit(gpa);
+    BcastMark.mark(.accepted);
+    const again = try fb.toBytesAlloc(gpa);
+    defer gpa.free(again);
+    if (!std.mem.eql(u8, again, buf[0..len])) return error.NonCanonicalFeldmanAccepted;
 }
 test "fuzz FeldmanBroadcast.fromBytesAlloc never panics" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -425,7 +473,10 @@ test "fuzz FeldmanBroadcast.fromBytesAlloc never panics" {
     var corpus: BroadcastCorpus = .{};
     // The two frames are byte-identical on the wire (`FeldmanBroadcast`
     // delegates to `PedersenBroadcast`), so the same corpus is the right one.
-    try std.testing.fuzz({}, fuzzFeldmanBroadcastDecode, .{ .corpus = corpus.build(arena.allocator()) });
+    try std.testing.fuzz({}, fuzzFeldmanSmith, .{ .corpus = corpus.build(arena.allocator()) });
+}
+test "fuzz driver: DKG_FUZZ (feldman decode)" {
+    try fz.fuzz_driver.run(fuzzFeldmanBroadcastDecode, .{ .prefix = "DKG_FUZZ", .name = "dkg-feldman-decode" });
 }
 
 test "corpus: every broadcast seed reaches the decoder, and the counts are pinned" {
@@ -454,14 +505,35 @@ test "corpus: every broadcast seed reaches the decoder, and the counts are pinne
     try std.testing.expectEqual(@as(usize, 11), commitments);
 }
 
-fn fuzzShareMsgDecode(_: void, smith: *std.testing.Smith) !void {
+fn fuzzShareMsgDecode(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var buf: [ShareMsg.encoded_length]u8 = undefined;
-    smith.bytes(&buf);
-    const msg = ShareMsg.fromBytes(buf) catch return;
-    _ = msg.toBytes();
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        // A genuine message with 0-3 octets damaged (scalars at or above the
+        // group order are the refusals worth reaching).
+        var g: [ShareMsg.encoded_length]u8 = undefined;
+        src.bytes(&g);
+        std.mem.writeInt(u64, g[0..8], src.value(u64), .big);
+        @memset(g[8..][0..16], 0);
+        @memset(g[8 + Ns ..][0..16], 0);
+        _ = fz.damage(src, &buf, &g);
+        if (src.value(bool)) @memset(buf[8..][0..16], 0xff);
+    } else src.bytes(&buf);
+    const msg = ShareMsg.fromBytes(buf) catch {
+        ShareMark.mark(.refused);
+        return;
+    };
+    ShareMark.mark(.accepted);
+    if (!std.mem.eql(u8, &msg.toBytes(), &buf)) return error.NonCanonicalShareMsgAccepted;
+    ShareMark.mark(.canonical_roundtrip);
 }
 test "fuzz ShareMsg.fromBytes never panics" {
-    try std.testing.fuzz({}, fuzzShareMsgDecode, .{});
+    try std.testing.fuzz({}, fuzzShareMsgSmith, .{});
+}
+test "fuzz driver: DKG_FUZZ (sharemsg decode)" {
+    try fz.fuzz_driver.run(fuzzShareMsgDecode, .{ .prefix = "DKG_FUZZ", .name = "dkg-sharemsg-decode" });
+}
+test "fuzz harness: sharemsg decode, 300 seeds, reaches every outcome" {
+    try ShareMark.reach(fuzzShareMsgDecode, "dkg-sharemsg-decode", 300);
 }
 
 /// ⛔ A LOCAL COPY of `testkit.fuzz.seedInto`, and it has to be one. Enrolling this

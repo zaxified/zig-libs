@@ -393,20 +393,156 @@ test "Parser: a leading UTF-8 BOM on the stream's first line is skipped (A1 F24)
 
 // ── fuzz: untrusted SSE bytes never panic ───────────────────────────────────
 
-fn fuzzParserNext(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const SseMark = fz.Marker(enum { dispatched, multi_line, with_event, with_id, with_retry, ended_clean, mid_group_eof });
+const StreamMark = fz.Marker(enum { genuine_stream, crlf, bom, multi_line });
+
+const sse_corpus = [_][]const u8{
+    "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+    "data: a\ndata: b\r\nid: x\x00y\nretry: 12\n\n: comment\n\ndata: partial",
+    "\xEF\xBB\xBFevent: e\nid: 7\nretry: 5\ndata: d\n\n",
+};
+
+fn fuzzParserNextSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParserNext(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParserNext(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [512]u8 = undefined;
-    const len = smith.slice(&buf); // not `bytes` + a ranged length: that always yields 0
+    const len = fz.drawRaw(S, src, &buf, &sse_corpus); // not `bytes` + a ranged length: that always yields 0
     var reader: std.Io.Reader = .fixed(buf[0..len]);
-    var p = Parser.init(&reader, testing.allocator);
+    var p = Parser.init(&reader, gpa);
     defer p.deinit();
     while (true) {
-        const ev = p.next() catch break;
-        if (ev == null) break;
+        const ev = p.next() catch |e| {
+            if (e == error.EndOfStream) SseMark.mark(.mid_group_eof);
+            break;
+        };
+        const got = ev orelse {
+            SseMark.mark(.ended_clean);
+            break;
+        };
+        SseMark.mark(.dispatched);
+        if (std.mem.indexOfScalar(u8, got.data, '\n') != null) SseMark.mark(.multi_line);
+        if (got.event != null) SseMark.mark(.with_event);
+        if (got.id != null) SseMark.mark(.with_id);
+        if (got.retry != null) SseMark.mark(.with_retry);
     }
 }
+
 test "fuzz Parser.next never panics" {
-    try testing.fuzz({}, fuzzParserNext, .{ .corpus = &.{
-        "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
-        "data: a\ndata: b\r\nid: x\x00y\nretry: 12\n\n: comment\n\ndata: partial",
-    } });
+    try testing.fuzz({}, fuzzParserNextSmith, .{ .corpus = &sse_corpus });
+}
+
+test "fuzz driver: LLMCLIENT_FUZZ (sse)" {
+    try fz.fuzz_driver.run(fuzzParserNext, .{ .prefix = "LLMCLIENT_FUZZ", .name = "llmclient-sse-parse" });
+}
+
+test "fuzz harness: sse, 500 seeds, reaches every outcome" {
+    try SseMark.reach(fuzzParserNext, "llmclient-sse-parse", 500);
+}
+
+test "fuzz: a stream written by the spec's grammar parses back to the events written" {
+    try testing.fuzz({}, fuzzSseStreamSmith, .{});
+}
+
+test "fuzz driver: LLMCLIENT_FUZZ (sse stream)" {
+    try fz.fuzz_driver.run(fuzzSseStream, .{ .prefix = "LLMCLIENT_FUZZ", .name = "llmclient-sse-stream" });
+}
+
+test "fuzz harness: sse stream, 300 seeds, reaches every outcome" {
+    try StreamMark.reach(fuzzSseStream, "llmclient-sse-stream", 300);
+}
+
+fn fuzzSseStreamSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSseStream(std.testing.Smith, smith, testing.allocator);
+}
+
+/// The oracle the byte-feeding harness cannot be: 1-5 events written the way a
+/// server writes them (optional BOM first, comment lines, `event:`/`id:`/`retry:`
+/// fields, 1-3 non-empty `data:` lines, LF or CRLF terminators, a blank line to
+/// dispatch) must come back as exactly those events, in order, then a clean end.
+fn fuzzSseStream(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    const Ev = struct { event: ?[]const u8, id: ?[]const u8, data: []const u8, retry: ?u32 };
+    var want: [5]Ev = undefined;
+    var store: [5][96]u8 = undefined;
+    var used: [5]usize = @splat(0);
+    const crlf = src.value(bool);
+    const eol: []const u8 = if (crlf) "\r\n" else "\n";
+    if (src.valueRangeAtMost(u8, 0, 3) == 0) try wire.appendSlice(gpa, "\xEF\xBB\xBF");
+    const n = src.valueRangeAtMost(u8, 1, 5);
+    const tokens = "abcdefghijklmnopqrstuvwxyz0123456789{}\":,._-";
+    for (0..n) |k| {
+        var at: usize = 0;
+        const base = &store[k];
+        if (src.valueRangeAtMost(u8, 0, 3) == 0) {
+            try wire.appendSlice(gpa, ": a comment");
+            try wire.appendSlice(gpa, eol);
+        }
+        var ev: Ev = .{ .event = null, .id = null, .data = "", .retry = null };
+        if (src.value(bool)) {
+            const l = src.valueRangeAtMost(u8, 1, 8);
+            for (0..l) |i| base[at + i] = tokens[src.index(tokens.len)];
+            ev.event = base[at .. at + l];
+            at += l;
+            try wire.appendSlice(gpa, "event: ");
+            try wire.appendSlice(gpa, ev.event.?);
+            try wire.appendSlice(gpa, eol);
+        }
+        if (src.value(bool)) {
+            const l = src.valueRangeAtMost(u8, 1, 8);
+            for (0..l) |i| base[at + i] = tokens[src.index(tokens.len)];
+            ev.id = base[at .. at + l];
+            at += l;
+            try wire.appendSlice(gpa, "id:");
+            try wire.appendSlice(gpa, ev.id.?);
+            try wire.appendSlice(gpa, eol);
+        }
+        if (src.value(bool)) {
+            const r = src.value(u16);
+            ev.retry = r;
+            try wire.print(gpa, "retry: {d}{s}", .{ r, eol });
+        }
+        const lines = src.valueRangeAtMost(u8, 1, 3);
+        const data_start = at;
+        for (0..lines) |j| {
+            if (j > 0) {
+                base[at] = '\n';
+                at += 1;
+            }
+            const l = src.valueRangeAtMost(u8, 1, 10);
+            const line_start = at;
+            for (0..l) |i| base[at + i] = tokens[src.index(tokens.len)];
+            at += l;
+            try wire.appendSlice(gpa, "data: ");
+            try wire.appendSlice(gpa, base[line_start..at]);
+            try wire.appendSlice(gpa, eol);
+        }
+        ev.data = base[data_start..at];
+        used[k] = at;
+        want[k] = ev;
+        try wire.appendSlice(gpa, eol);
+    }
+    var reader: std.Io.Reader = .fixed(wire.items);
+    var p = Parser.init(&reader, gpa);
+    defer p.deinit();
+    for (want[0..n]) |w| {
+        const got = (try p.next()) orelse return error.EventLost;
+        if (!std.mem.eql(u8, got.data, w.data)) return error.DataChanged;
+        if ((got.event == null) != (w.event == null)) return error.EventNameChanged;
+        if (w.event) |e| if (!std.mem.eql(u8, got.event.?, e)) return error.EventNameChanged;
+        if ((got.id == null) != (w.id == null)) return error.IdChanged;
+        if (w.id) |e| if (!std.mem.eql(u8, got.id.?, e)) return error.IdChanged;
+        if (got.retry != w.retry) return error.RetryChanged;
+    }
+    if ((try p.next()) != null) return error.PhantomEvent;
+    StreamMark.mark(.genuine_stream);
+    if (crlf) StreamMark.mark(.crlf);
+    if (std.mem.startsWith(u8, wire.items, "\xEF\xBB\xBF")) StreamMark.mark(.bom);
+    for (want[0..n]) |w| if (std.mem.indexOfScalar(u8, w.data, '\n') != null) {
+        StreamMark.mark(.multi_line);
+        break;
+    };
 }

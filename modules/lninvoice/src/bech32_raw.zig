@@ -583,23 +583,130 @@ const StringCorpus = struct {
     }
 };
 
-test "fuzz: decode never panics on arbitrary bytes" {
-    var corpus: StringCorpus = .{};
-    try testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build(testing.allocator) });
+const fz = @import("fuzz_test.zig");
+const RawMark = fz.Marker(enum { accepted, mixed_case, no_separator, bad_checksum, bad_charset, other_refused });
+const RoundtripMark = fz.Marker(enum { roundtrip, upper_roundtrip, flipped_refused, no_checksum_roundtrip });
+
+/// The corpus is built once per process (its strings come out of this module's
+/// own encoder), on the page allocator so it outlives any test allocator.
+var corpus_cache: ?StringCorpus = null;
+
+fn corpusEntries() []const []const u8 {
+    if (corpus_cache == null) {
+        corpus_cache = .{};
+        _ = corpus_cache.?.build(std.heap.page_allocator) catch unreachable;
+    }
+    return corpus_cache.?.entries[0..corpus_cache.?.n];
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
-    // ⚠ One `smith.slice`, then the octets say what happens — see `Script`.
-    // Measured 2026-09-07 over the corpus below: **one input, the EMPTY
-    // string, before; 10 scripts, 206 characters and 3 strings decoded after.**
+test "fuzz: decode never panics on arbitrary bytes" {
+    var corpus: StringCorpus = .{};
+    try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = try corpus.build(testing.allocator) });
+}
+
+test "fuzz driver: LNINVOICE_FUZZ (bech32)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "LNINVOICE_FUZZ", .name = "lninvoice-bech32-decode" });
+}
+
+test "fuzz harness: bech32, 500 seeds, reaches every outcome" {
+    try RawMark.reach(fuzzDecode, "lninvoice-bech32-decode", 500);
+}
+
+test "fuzz: encode -> decode returns the input; one flipped symbol is refused" {
+    try testing.fuzz({}, fuzzRoundtripSmith, .{});
+}
+
+test "fuzz driver: LNINVOICE_FUZZ (bech32 roundtrip)" {
+    try fz.fuzz_driver.run(fuzzRoundtrip, .{ .prefix = "LNINVOICE_FUZZ", .name = "lninvoice-bech32-roundtrip" });
+}
+
+test "fuzz harness: bech32 roundtrip, 300 seeds, reaches every outcome" {
+    try RoundtripMark.reach(fuzzRoundtrip, "lninvoice-bech32-roundtrip", 300);
+}
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzRoundtripSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRoundtrip(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, allocator: Allocator) anyerror!void {
+    // ⚠ One `slice`, then the octets say what happens -- see `Script`. Under
+    // the driver's `Rng`, half the scripts are a corpus entry with 0-3 octets
+    // damaged (the corpus holds real checksummed strings).
     var script: [512]u8 = undefined;
-    const n: usize = smith.slice(&script);
+    const n: usize = if (S == fz.fuzz_driver.Rng) fz.drawInput(S, src, &script, corpusEntries()) else src.slice(&script);
     var buf: [128]u8 = undefined;
     const text = buildString(script[0..n], &buf);
 
-    var dec = decode(allocator, text) catch return;
+    var dec = decode(allocator, text) catch |e| {
+        switch (e) {
+            error.MixedCase => RawMark.mark(.mixed_case),
+            error.NoSeparator => RawMark.mark(.no_separator),
+            error.InvalidChecksum => RawMark.mark(.bad_checksum),
+            error.InvalidDataChar => RawMark.mark(.bad_charset),
+            else => RawMark.mark(.other_refused),
+        }
+        return;
+    };
     defer dec.deinit(allocator);
+    RawMark.mark(.accepted);
+}
+
+/// The oracle the byte-feeding harness cannot be: `encode` of a drawn HRP and
+/// data decodes to the lower-cased HRP and exactly that data (also upper-cased,
+/// and through the no-checksum pair), and the string with ONE data/checksum
+/// symbol replaced is refused (a BCH code of this length detects every
+/// single-symbol error).
+fn fuzzRoundtrip(comptime S: type, src: *S, allocator: Allocator) anyerror!void {
+    var hrp_buf: [8]u8 = undefined;
+    const hrp_len = src.valueRangeAtMost(u8, 1, hrp_buf.len);
+    for (hrp_buf[0..hrp_len]) |*c| c.* = src.valueRangeAtMost(u8, 'a', 'z');
+    const hrp = hrp_buf[0..hrp_len];
+    var data: [160]u5 = undefined;
+    const dlen = src.valueRangeAtMost(u8, 0, data.len);
+    for (data[0..dlen]) |*q| q.* = src.value(u5);
+
+    const text = try encode(allocator, hrp, data[0..dlen]);
+    defer allocator.free(text);
+    var dec = try decode(allocator, text);
+    defer dec.deinit(allocator);
+    if (!std.mem.eql(u8, dec.hrp, hrp) or dec.data.len != dlen) return error.RoundtripChanged;
+    for (dec.data, data[0..dlen]) |x, y| if (x != y) return error.RoundtripChanged;
+    RoundtripMark.mark(.roundtrip);
+
+    // Upper-cased whole string: still the same content.
+    var upper: [256]u8 = undefined;
+    for (text, 0..) |c, i| upper[i] = std.ascii.toUpper(c);
+    var dup = try decode(allocator, upper[0..text.len]);
+    defer dup.deinit(allocator);
+    if (!std.mem.eql(u8, dup.hrp, hrp) or dup.data.len != dlen) return error.UppercaseChanged;
+    RoundtripMark.mark(.upper_roundtrip);
+
+    // One replaced symbol after the separator.
+    const sep = std.mem.lastIndexOfScalar(u8, text, '1').?;
+    var bent: [256]u8 = undefined;
+    @memcpy(bent[0..text.len], text);
+    const at = sep + 1 + src.index(text.len - sep - 1);
+    const alphabet = charset;
+    const cur = std.mem.indexOfScalar(u8, alphabet, bent[at]).?;
+    bent[at] = alphabet[(cur + 1 + src.index(alphabet.len - 1)) % alphabet.len];
+    if (decode(allocator, bent[0..text.len])) |d| {
+        var dd = d;
+        dd.deinit(allocator);
+        return error.FlippedSymbolAccepted;
+    } else |_| {}
+    RoundtripMark.mark(.flipped_refused);
+
+    // The checksum-less pair (BOLT#12) is a plain round trip.
+    const raw = try encodeNoChecksum(allocator, hrp, data[0..dlen]);
+    defer allocator.free(raw);
+    var nd = try decodeNoChecksum(allocator, raw);
+    defer nd.deinit(allocator);
+    if (!std.mem.eql(u8, nd.hrp, hrp) or nd.data.len != dlen) return error.NoChecksumRoundtripChanged;
+    RoundtripMark.mark(.no_checksum_roundtrip);
 }
 
 test "corpus: every string script builds a string, and what decode made of it is pinned" {

@@ -2091,15 +2091,39 @@ const bolt12_seeds = [_][]const u8{
     seed("01"),
 };
 
+const fz = @import("fuzz_test.zig");
+const B12Mark = fz.Marker(enum { empty_stream, records, merkle_ok, merkle_refused, offer, invoice_request, invoice, all_refused });
+
 test "fuzz: BOLT#12 decoders and merkleRoot never panic on arbitrary input" {
-    try testing.fuzz({}, fuzzBolt12, .{ .corpus = &bolt12_seeds });
+    try testing.fuzz({}, fuzzBolt12Smith, .{ .corpus = &bolt12_seeds });
 }
 
-fn fuzzBolt12(_: void, smith: *std.testing.Smith) !void {
-    // ⚠ One `smith.slice`, then the octets say what happens — see `Script`.
+test "fuzz driver: LNINVOICE_FUZZ (bolt12)" {
+    try fz.fuzz_driver.run(fuzzBolt12, .{ .prefix = "LNINVOICE_FUZZ", .name = "lninvoice-bolt12" });
+}
+
+test "fuzz harness: bolt12, 500 seeds, reaches every outcome" {
+    try B12Mark.reach(fuzzBolt12, "lninvoice-bolt12", 500);
+}
+
+fn fuzzBolt12Smith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzBolt12(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzBolt12(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
+    // ⚠ One `slice`, then the octets say what happens -- see `Script`. Under
+    // the driver's `Rng`, half the scripts are a corpus entry with 0-3 octets
+    // damaged.
     var script: [1024]u8 = undefined;
-    const n: usize = smith.slice(&script);
-    _ = try runBolt12Script(testing.allocator, script[0..n]);
+    const n: usize = fz.drawInput(S, src, &script, &bolt12_seeds);
+    const out = try runBolt12Script(gpa, script[0..n]);
+    if (out.stream_len == 0) B12Mark.mark(.empty_stream);
+    if (out.records != 0) B12Mark.mark(.records);
+    if (out.merkle_ok) B12Mark.mark(.merkle_ok) else B12Mark.mark(.merkle_refused);
+    if (out.offers != 0) B12Mark.mark(.offer);
+    if (out.ireqs != 0) B12Mark.mark(.invoice_request);
+    if (out.invoices != 0) B12Mark.mark(.invoice);
+    if (out.offers + out.ireqs + out.invoices == 0) B12Mark.mark(.all_refused);
 }
 
 test "corpus: every BOLT#12 script builds a stream, and what the parsers made of it is pinned" {

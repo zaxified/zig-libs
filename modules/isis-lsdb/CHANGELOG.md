@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `ISIS_LSDB_FUZZ`: `isis-lsdb-insert` (hostile LSP bytes, six arrival arms), `isis-lsdb-snp` (hostile CSNP/PSNP into a bounded store) and a new `isis-lsdb-sequence` update-process model (strictly higher sequence stored, equal/lower ignored, a received LSP naming us never stored, one flipped bit in the checksummed region refused and the store unchanged). No source change.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Anchoring no longer calls the checksum check out of scope — `Lsdb.insert`'s §7.3.14.2 discard (§8) is stated as done.
 - **2026-10-05** — Mutation run: 47 of 52 killed, 5 equivalent; 9 tests added and one
   KAT extended (purge vs purge; same/older arrival acks; own-LSP echo, challenge SSN

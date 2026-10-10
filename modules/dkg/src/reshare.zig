@@ -1284,18 +1284,84 @@ const FuzzWorld = struct {
     }
 };
 
-fn fuzzReceiverHandle(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const RecvMark = fz.Marker(enum { frame_accepted, frame_refused, refusal_inert, corpus_frame, advance_ok, advance_err });
+
+const CapturedReshare = struct { bytes: []const u8, from: Sender, steps: usize };
+var captured_reshare: ?[]const CapturedReshare = null;
+
+fn capturedReshareFrames() []const CapturedReshare {
+    if (captured_reshare == null) {
+        const pa = std.heap.page_allocator;
+        var list: std.ArrayList(CapturedReshare) = .empty;
+        for (0..4) |steps| {
+            var w = FuzzWorld.build(pa, steps) catch unreachable;
+            defer w.rig.deinit();
+            if (steps == 0 or steps == 2) {
+                for (w.rig.dealers) |*d| for (d.outbox.items) |m| {
+                    switch (m.to) {
+                        .party => |j| if (j != 1) continue,
+                        .broadcast => {},
+                    }
+                    list.append(pa, .{ .bytes = pa.dupe(u8, m.bytes) catch unreachable, .from = .{ .dealer = d.id() }, .steps = steps }) catch unreachable;
+                };
+            } else {
+                for (w.rig.receivers) |*r| {
+                    if (r.id() == 1) continue;
+                    for (r.outbox.items) |m| {
+                        list.append(pa, .{ .bytes = pa.dupe(u8, m.bytes) catch unreachable, .from = .{ .receiver = r.id() }, .steps = steps }) catch unreachable;
+                    }
+                }
+            }
+        }
+        captured_reshare = list.toOwnedSlice(pa) catch unreachable;
+    }
+    return captured_reshare.?;
+}
+
+fn fuzzReceiverSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzReceiverHandle(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzReceiverHandle(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    // 0..4 = a dealer id (what every seed before F7 meant), 5..9 = the same
-    // ids in the receiver role.
-    const raw: u32 = @intCast(smith.value(u64) % 10);
-    const from: Sender = if (raw < 5) .{ .dealer = raw } else .{ .receiver = raw - 5 };
-    const steps: usize = @intCast(smith.value(u64) % 4);
-    var w = try FuzzWorld.build(testing.allocator, steps);
+    var from: Sender = undefined;
+    var steps: usize = undefined;
+    var len: usize = undefined;
+    if (S == fz.fuzz_driver.Rng and src.valueRangeAtMost(u8, 0, 3) != 0) {
+        const cf = capturedReshareFrames();
+        const c = cf[src.index(cf.len)];
+        len = fz.damage(src, &buf, c.bytes);
+        from = c.from;
+        steps = c.steps;
+        RecvMark.mark(.corpus_frame);
+    } else {
+        len = src.slice(&buf);
+        // 0..4 = a dealer id (what every seed before F7 meant), 5..9 = the same
+        // ids in the receiver role.
+        const raw: u32 = @intCast(src.value(u64) % 10);
+        from = if (raw < 5) .{ .dealer = raw } else .{ .receiver = raw - 5 };
+        steps = @intCast(src.value(u64) % 4);
+    }
+    var w = try FuzzWorld.build(gpa, steps);
     defer w.rig.deinit();
-    w.rig.receivers[0].handle(from, buf[0..len]) catch {};
-    w.rig.receivers[0].advance() catch {};
+    const before = w.rig.receivers[0].phase();
+    if (w.rig.receivers[0].handle(from, buf[0..len])) |_| {
+        RecvMark.mark(.frame_accepted);
+    } else |_| {
+        RecvMark.mark(.frame_refused);
+        if (w.rig.receivers[0].phase() != before) return error.RefusalMovedThePhase;
+        RecvMark.mark(.refusal_inert);
+    }
+    if (w.rig.receivers[0].advance()) |_| RecvMark.mark(.advance_ok) else |_| RecvMark.mark(.advance_err);
+}
+
+test "fuzz driver: DKG_FUZZ (reshare receiver handle)" {
+    try fz.fuzz_driver.run(fuzzReceiverHandle, .{ .prefix = "DKG_FUZZ", .name = "dkg-reshare-receiver-handle", .scale = 40 });
+}
+
+test "fuzz harness: reshare receiver handle, 120 seeds, reaches every outcome" {
+    try RecvMark.reach(fuzzReceiverHandle, "dkg-reshare-receiver-handle", 120);
 }
 
 fn seedFrame(out: []u8, frame: []const u8, from: u64, steps: u64) []const u8 {
@@ -1335,7 +1401,7 @@ test "fuzz: ReshareReceiver.handle never panics, in any round" {
             }
         }
     }
-    try std.testing.fuzz({}, fuzzReceiverHandle, .{ .corpus = seeds.items });
+    try std.testing.fuzz({}, fuzzReceiverSmith, .{ .corpus = seeds.items });
 }
 
 fn badShare1toBoth(from: u32, to: u32, bytes: []u8) Action {

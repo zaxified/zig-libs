@@ -321,19 +321,93 @@ const fuzz_corpus = [_][]const u8{
     fuzzseed.seed("\x01" ++ "\x04" ++ "\x03\xff\xff\x03\x08\x08"), // script: opaque options with hostile kind/length octets
 };
 
+const fz = @import("fuzz_test.zig");
+const OptMark = fz.Marker(enum { empty, found, not_found, verbatim, script, end_stops_walk, agrees_with_reference, genuine_found });
+
 test "fuzz: parseTcpTimestamps never panics or reads OOB, arbitrary or TLV-shaped bytes" {
-    try std.testing.fuzz({}, fuzzParseNeverPanics, .{ .corpus = &fuzz_corpus });
+    try std.testing.fuzz({}, fuzzParseSmith, .{ .corpus = &fuzz_corpus });
+}
+
+test "fuzz driver: PPING_FUZZ (tcp options)" {
+    try fz.fuzz_driver.run(fuzzParseNeverPanics, .{ .prefix = "PPING_FUZZ", .name = "pping-tcp-options" });
+}
+
+test "fuzz harness: tcp options, 500 seeds, reaches every outcome" {
+    try OptMark.reach(fuzzParseNeverPanics, "pping-tcp-options", 500);
 }
 
 const fuzz_buf_len = 64;
 
-fn fuzzParseNeverPanics(_: void, smith: *std.testing.Smith) !void {
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseNeverPanics(std.testing.Smith, smith, std.testing.allocator);
+}
+
+/// A second, independent reading of the same grammar (RFC 9293 s.3.1 / RFC 7323
+/// s.3.2): the module's walk must agree with it on every option list.
+fn referenceTimestamps(o: []const u8) ?Timestamps {
+    var i: usize = 0;
+    while (i < o.len) {
+        if (o[i] == 0) return null;
+        if (o[i] == 1) {
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= o.len) return null;
+        const l: usize = o[i + 1];
+        if (l < 2 or i + l > o.len) return null;
+        if (o[i] == 8 and l == 10) return .{
+            .tsval = @as(u32, o[i + 2]) << 24 | @as(u32, o[i + 3]) << 16 | @as(u32, o[i + 4]) << 8 | o[i + 5],
+            .tsecr = @as(u32, o[i + 6]) << 24 | @as(u32, o[i + 7]) << 16 | @as(u32, o[i + 8]) << 8 | o[i + 9],
+        };
+        i += l;
+    }
+    return null;
+}
+
+fn fuzzParseNeverPanics(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var raw: [1 + fuzz_buf_len]u8 = undefined;
     // ⚠ ONE byte-first draw. See `fuzz_corpus` for what the ranged draws did.
-    const n: usize = smith.slice(&raw);
+    // Under the driver's `Rng`, half the draws are a corpus entry with 0-3
+    // octets damaged.
+    const n: usize = fz.drawInput(S, src, &raw, &fuzz_corpus);
+    if (n == 0) OptMark.mark(.empty) else if (raw[0] == 0) OptMark.mark(.verbatim) else OptMark.mark(.script);
     var buf: [fuzz_buf_len]u8 = undefined;
     const opts = buildTcpOptions(raw[0..n], &buf);
-    _ = parseTcpTimestamps(opts);
+    const got = parseTcpTimestamps(opts);
+    if (got != null) OptMark.mark(.found) else OptMark.mark(.not_found);
+    const want = referenceTimestamps(opts);
+    if ((got == null) != (want == null)) return error.DisagreesWithReference;
+    if (got) |g| if (g.tsval != want.?.tsval or g.tsecr != want.?.tsecr) return error.DisagreesWithReference;
+    OptMark.mark(.agrees_with_reference);
+    if (opts.len != 0 and opts[0] == 0) OptMark.mark(.end_stops_walk);
+
+    // A genuine Timestamps option behind a prefix of NOPs and a well-formed
+    // opaque option is found with exactly its values; behind an END it is not.
+    var g: [32]u8 = undefined;
+    var at: usize = 0;
+    const nops = src.valueRangeAtMost(u8, 0, 6);
+    for (0..nops) |_| {
+        g[at] = 1;
+        at += 1;
+    }
+    if (src.value(bool)) {
+        g[at] = 2; // MSS
+        g[at + 1] = 4;
+        g[at + 2] = 5;
+        g[at + 3] = 0xb4;
+        at += 4;
+    }
+    const tsval = src.value(u32);
+    const tsecr = src.value(u32);
+    g[at] = 8;
+    g[at + 1] = 10;
+    std.mem.writeInt(u32, g[at + 2 ..][0..4], tsval, .big);
+    std.mem.writeInt(u32, g[at + 6 ..][0..4], tsecr, .big);
+    const ts = parseTcpTimestamps(g[0 .. at + 10]) orelse return error.GenuineTimestampsNotFound;
+    if (ts.tsval != tsval or ts.tsecr != tsecr) return error.GenuineTimestampsWrongValues;
+    OptMark.mark(.genuine_found);
+    g[0] = 0; // END ahead of everything
+    if (parseTcpTimestamps(g[0 .. at + 10]) != null) return error.TimestampsFoundBehindEnd;
 }
 
 /// Turn one drawn seed into an option list. Octet 0 selects: 0 means the

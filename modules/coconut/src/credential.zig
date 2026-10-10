@@ -1116,24 +1116,85 @@ fn g1Eql(a: g1.Affine, b: g1.Affine) bool {
 
 // ── fuzz: untrusted-wire decoders never panic/OOB on arbitrary bytes ──────
 
-fn fuzzCredentialDecode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [Credential.encoded_bytes]u8 = undefined;
-    smith.bytes(&buf);
-    const cred = Credential.fromBytes(buf) catch return;
-    _ = cred.toBytes();
-}
-test "fuzz Credential.fromBytes never panics" {
-    try std.testing.fuzz({}, fuzzCredentialDecode, .{});
+const fz = @import("fuzz_test.zig");
+const CredMark = fz.Marker(enum { accepted, refused, canonical_roundtrip });
+const PartMark = fz.Marker(enum { accepted, refused, canonical_roundtrip });
+const ProofMark = fz.Marker(enum { accepted, refused, canonical_roundtrip, disclosure_refused, hidden_responses });
+const ProtoMark = fz.Marker(enum { genuine_accepted, plain_verified, wrong_value_refused, wrong_context_refused, wrong_mask_refused, flipped_proof_refused, other_key_refused });
+
+/// A genuine encoded credential: `[k1]G1`, `[k2]G1` (compressed).
+fn genuineCredentialBytes(src: anytype) [Credential.encoded_bytes]u8 {
+    const c: Credential = .{
+        .h = g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(frOf(1 + src.valueRangeAtMost(u16, 0, 1000))).toAffine(),
+        .s = g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(frOf(1 + src.valueRangeAtMost(u16, 0, 1000))).toAffine(),
+    };
+    return c.toBytes();
 }
 
-fn fuzzPartialCredentialDecode(_: void, smith: *std.testing.Smith) !void {
+fn fuzzCredentialDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzCredentialDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzCredentialDecode(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    var buf: [Credential.encoded_bytes]u8 = undefined;
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        // Real encodings with 0-3 octets damaged; uniform bytes almost never
+        // are a point on the curve.
+        const g = genuineCredentialBytes(src);
+        _ = fz.damage(src, &buf, &g);
+        if (src.value(bool)) @memcpy(&buf, &g);
+        if (src.value(bool)) buf[src.index(buf.len)] = src.value(u8);
+    } else src.bytes(&buf);
+    const cred = Credential.fromBytes(buf) catch {
+        CredMark.mark(.refused);
+        return;
+    };
+    CredMark.mark(.accepted);
+    // What decodes re-encodes to the very octets it came from (no second
+    // spelling of the same credential).
+    if (!std.mem.eql(u8, &cred.toBytes(), &buf)) return error.NonCanonicalCredentialAccepted;
+    CredMark.mark(.canonical_roundtrip);
+}
+test "fuzz Credential.fromBytes never panics" {
+    try std.testing.fuzz({}, fuzzCredentialDecodeSmith, .{});
+}
+test "fuzz driver: COCONUT_FUZZ (credential decode)" {
+    try fz.fuzz_driver.run(fuzzCredentialDecode, .{ .prefix = "COCONUT_FUZZ", .name = "coconut-credential-decode" });
+}
+test "fuzz harness: credential decode, 300 seeds, reaches every outcome" {
+    try CredMark.reach(fuzzCredentialDecode, "coconut-credential-decode", 300);
+}
+
+fn fuzzPartialCredentialDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPartialCredentialDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzPartialCredentialDecode(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var buf: [PartialCredential.encoded_bytes]u8 = undefined;
-    smith.bytes(&buf);
-    const part = PartialCredential.fromBytes(buf) catch return;
-    _ = part.toBytes();
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        const c = genuineCredentialBytes(src);
+        var g: [PartialCredential.encoded_bytes]u8 = undefined;
+        std.mem.writeInt(u64, g[0..8], src.value(u64), .big);
+        @memcpy(g[8..], &c);
+        _ = fz.damage(src, &buf, &g);
+        if (src.value(bool)) @memcpy(&buf, &g);
+    } else src.bytes(&buf);
+    const part = PartialCredential.fromBytes(buf) catch {
+        PartMark.mark(.refused);
+        return;
+    };
+    PartMark.mark(.accepted);
+    if (!std.mem.eql(u8, &part.toBytes(), &buf)) return error.NonCanonicalPartialAccepted;
+    PartMark.mark(.canonical_roundtrip);
 }
 test "fuzz PartialCredential.fromBytes never panics" {
-    try std.testing.fuzz({}, fuzzPartialCredentialDecode, .{});
+    try std.testing.fuzz({}, fuzzPartialCredentialDecodeSmith, .{});
+}
+test "fuzz driver: COCONUT_FUZZ (partial decode)" {
+    try fz.fuzz_driver.run(fuzzPartialCredentialDecode, .{ .prefix = "COCONUT_FUZZ", .name = "coconut-partial-decode" });
+}
+test "fuzz harness: partial decode, 300 seeds, reaches every outcome" {
+    try PartMark.reach(fuzzPartialCredentialDecode, "coconut-partial-decode", 300);
 }
 
 /// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
@@ -1209,10 +1270,31 @@ const ShowProofCorpus = struct {
 test "fuzz ShowProof.fromBytes never panics" {
     var corpus: ShowProofCorpus = .{};
     const seeds = try corpus.build(std.testing.allocator);
-    try std.testing.fuzz({}, fuzzShowProofDecode, .{ .corpus = seeds });
+    try std.testing.fuzz({}, fuzzShowProofDecodeSmith, .{ .corpus = seeds });
 }
 
-fn fuzzShowProofDecode(_: void, smith: *std.testing.Smith) !void {
+var proof_corpus_cache: ?ShowProofCorpus = null;
+
+fn proofCorpusEntries() []const []const u8 {
+    if (proof_corpus_cache == null) {
+        proof_corpus_cache = .{};
+        _ = proof_corpus_cache.?.build(std.heap.page_allocator) catch unreachable;
+    }
+    return &proof_corpus_cache.?.slots;
+}
+
+test "fuzz driver: COCONUT_FUZZ (showproof decode)" {
+    try fz.fuzz_driver.run(fuzzShowProofDecode, .{ .prefix = "COCONUT_FUZZ", .name = "coconut-showproof-decode" });
+}
+test "fuzz harness: showproof decode, 300 seeds, reaches every outcome" {
+    try ProofMark.reach(fuzzShowProofDecode, "coconut-showproof-decode", 300);
+}
+
+fn fuzzShowProofDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzShowProofDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzShowProofDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [show_proof_buf_len]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -1223,13 +1305,23 @@ fn fuzzShowProofDecode(_: void, smith: *std.testing.Smith) !void {
     // below describes was never entered once. Measured 2026-09-07 over the
     // corpus above: **0 of 8 seeds non-empty and 0 proofs decoded before, 8 of
     // 8 non-empty and 1 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, proofCorpusEntries());
     // Self-describing (length-prefixed `q`, then a `disclosed` mask, then a
     // count of remaining 32-byte scalars derived from the REST of the
     // buffer) — the classic "attacker-controlled count vs. actual buffer
     // length" surface. Must never panic/OOB, only return a typed error.
-    const proof = ShowProof.fromBytes(std.testing.allocator, buf[0..len]) catch return;
-    defer proof.deinit(std.testing.allocator);
+    const proof = ShowProof.fromBytes(gpa, buf[0..len]) catch |e| {
+        ProofMark.mark(.refused);
+        if (e == error.InvalidDisclosure) ProofMark.mark(.disclosure_refused);
+        return;
+    };
+    defer proof.deinit(gpa);
+    ProofMark.mark(.accepted);
+    if (proof.responses_m.len != 0) ProofMark.mark(.hidden_responses);
+    const again = try proof.toBytes(gpa);
+    defer gpa.free(again);
+    if (!std.mem.eql(u8, again, buf[0..len])) return error.NonCanonicalProofAccepted;
+    ProofMark.mark(.canonical_roundtrip);
 }
 
 test "corpus: every ShowProof seed reaches fromBytes, and the counts are pinned" {
@@ -1282,4 +1374,128 @@ test "proveCredential takes std.Io; the seeded form exists only under a name tha
     try std.testing.expectEqual(std.Io, gen_params[1].type.?);
     const test_params = @typeInfo(@TypeOf(proveCredentialSeededForTest)).@"fn".params;
     try std.testing.expectEqual(std.Random, test_params[1].type.?);
+}
+
+// ── fuzz: the whole issue -> show -> verify protocol, with damage ───────────
+
+/// One key set for every run (key generation and parameter derivation are the
+/// expensive, not the interesting, part): q = 3 attributes, a 2-of-3 authority
+/// set, plus a second, unrelated key set for the wrong-key control.
+const ProtoFixture = struct {
+    params: Parameters,
+    keys_a: keys.ThresholdKeys,
+    keys_b: keys.ThresholdKeys,
+};
+var proto_fixture: ?ProtoFixture = null;
+
+fn protoFixture() *const ProtoFixture {
+    if (proto_fixture == null) {
+        const gpa = std.heap.page_allocator;
+        var prng = std.Random.DefaultPrng.init(0xC0C0);
+        var f: ProtoFixture = undefined;
+        f.params = Parameters.generate(gpa, 3) catch unreachable;
+        keys.keygenSeededForTest(&f.keys_a, gpa, prng.random(), 3, 2, 3) catch unreachable;
+        keys.keygenSeededForTest(&f.keys_b, gpa, prng.random(), 3, 2, 3) catch unreachable;
+        proto_fixture = f;
+    }
+    return &proto_fixture.?;
+}
+
+test "fuzz: threshold issuance, show and verify; wrong value, mask, context, key and flipped proof octets are refused" {
+    try std.testing.fuzz({}, fuzzProtocolSmith, .{});
+}
+
+test "fuzz driver: COCONUT_FUZZ (protocol)" {
+    // A run is two partial signatures, an aggregation, a show and up to seven
+    // pairing-based verifications: one run is worth many parser runs.
+    try fz.fuzz_driver.run(fuzzProtocol, .{ .prefix = "COCONUT_FUZZ", .name = "coconut-protocol", .scale = 1000 });
+}
+
+test "fuzz harness: protocol, 6 seeds, reaches every outcome" {
+    try ProtoMark.reach(fuzzProtocol, "coconut-protocol", 6);
+}
+
+fn fuzzProtocolSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzProtocol(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzProtocol(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const f = protoFixture();
+    var prng_seed: [8]u8 = undefined;
+    src.bytes(&prng_seed);
+    var prng = std.Random.DefaultPrng.init(std.mem.readInt(u64, &prng_seed, .little));
+
+    const attrs = [_]Fr{ frOf(src.value(u32)), frOf(src.value(u32)), frOf(src.value(u32)) };
+    const h = f.params.commonBase(&attrs);
+    const first = src.valueRangeAtMost(u8, 0, 2);
+    const second = (first + 1 + src.valueRangeAtMost(u8, 0, 1)) % 3;
+    const partials = [_]PartialCredential{
+        try signPartial(&f.keys_a.sk_shares[first], h, &attrs),
+        try signPartial(&f.keys_a.sk_shares[second], h, &attrs),
+    };
+    const credential = try aggregateCredential(gpa, &partials, 2);
+    if (!psVerifyPlain(f.keys_a.master_vk, credential, &attrs)) return error.GenuineCredentialRefused;
+    ProtoMark.mark(.plain_verified);
+
+    var disclosed: [3]bool = undefined;
+    var values: [3]Fr = undefined;
+    var nv: usize = 0;
+    for (&disclosed, 0..) |*d, i| {
+        d.* = src.value(bool);
+        if (d.*) {
+            values[nv] = attrs[i];
+            nv += 1;
+        }
+    }
+    const ctx = "fuzz-gate/nonce-0001";
+    const proof = try proveCredentialSeededForTest(gpa, prng.random(), f.params, f.keys_a.master_vk, credential, &attrs, &disclosed, ctx);
+    defer proof.deinit(gpa);
+    if (!try verifyCredential(gpa, f.params, f.keys_a.master_vk, proof, &disclosed, values[0..nv], ctx)) return error.GenuineShowRefused;
+    ProtoMark.mark(.genuine_accepted);
+
+    // The wire form carries it, byte for byte.
+    const wire = try proof.toBytes(gpa);
+    defer gpa.free(wire);
+    {
+        const back = try ShowProof.fromBytes(gpa, wire);
+        defer back.deinit(gpa);
+        if (!try verifyCredential(gpa, f.params, f.keys_a.master_vk, back, &disclosed, values[0..nv], ctx)) return error.RoundTrippedShowRefused;
+    }
+
+    // Another context / another gate's mask / another key: refused.
+    if (try verifyCredential(gpa, f.params, f.keys_a.master_vk, proof, &disclosed, values[0..nv], "fuzz-gate/nonce-0002")) return error.ReplayAcceptedAtOtherContext;
+    ProtoMark.mark(.wrong_context_refused);
+    if (try verifyCredential(gpa, f.params, f.keys_b.master_vk, proof, &disclosed, values[0..nv], ctx)) return error.AcceptedUnderOtherKey;
+    ProtoMark.mark(.other_key_refused);
+
+    // A different value for the first disclosed attribute (when there is one).
+    if (nv > 0) {
+        var wrong = values;
+        wrong[0] = wrong[0].add(Fr.one);
+        if (try verifyCredential(gpa, f.params, f.keys_a.master_vk, proof, &disclosed, wrong[0..nv], ctx)) return error.WrongDisclosedValueAccepted;
+        ProtoMark.mark(.wrong_value_refused);
+    }
+    // A different mask of the same size: refused (not an error).
+    {
+        var other = disclosed;
+        const i = src.index(3);
+        const j = (i + 1 + src.index(2)) % 3;
+        if (other[i] != other[j]) {
+            std.mem.swap(bool, &other[i], &other[j]);
+            if (try verifyCredential(gpa, f.params, f.keys_a.master_vk, proof, &other, values[0..nv], ctx)) return error.OtherMaskAccepted;
+            ProtoMark.mark(.wrong_mask_refused);
+        }
+    }
+
+    // One flipped octet anywhere in the encoded proof: refused at decode or
+    // at verification.
+    const copy = try gpa.dupe(u8, wire);
+    defer gpa.free(copy);
+    copy[src.index(copy.len)] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
+    if (ShowProof.fromBytes(gpa, copy)) |bent| {
+        defer bent.deinit(gpa);
+        const ok = verifyCredential(gpa, f.params, f.keys_a.master_vk, bent, &disclosed, values[0..nv], ctx) catch false;
+        if (ok) return error.FlippedProofAccepted;
+    } else |_| {}
+    ProtoMark.mark(.flipped_proof_refused);
 }

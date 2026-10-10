@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-03 · mutation 2026-10-03 (84/87, 3 eq) · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: PIN + shared secret through PIN rules, padding, hashing, encrypt/MAC; token decrypt + MAC; `pin` 0 / `token` 0 after replacing std's UTF-8 code-point count (was 1))
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, CTAP2_FUZZ) · ct 2026-10-10 (ctgrind: PIN + shared secret through PIN rules, padding, hashing, encrypt/MAC; token decrypt + MAC; `pin` 0 / `token` 0 after replacing std's UTF-8 code-point count (was 1))
 **Performance:** not measured
 
 **Known defects:** none recorded

@@ -1605,17 +1605,82 @@ fn buildFuzzNet(allocator: std.mem.Allocator, steps: usize) !TestNet {
     return net;
 }
 
-fn fuzzParticipantHandle(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const HandleMark = fz.Marker(enum { frame_accepted, frame_refused, refusal_inert, corpus_frame, advance_ok, advance_err, reached_reveals, reached_done });
+
+/// One captured frame with the sender and the round it was captured in.
+const CapturedFrame = struct { bytes: []const u8, from: u32, steps: usize };
+var captured_frames: ?[]const CapturedFrame = null;
+
+fn capturedFrames() []const CapturedFrame {
+    if (captured_frames == null) {
+        const pa = std.heap.page_allocator;
+        var list: std.ArrayList(CapturedFrame) = .empty;
+        for (0..7) |steps| {
+            var net = buildFuzzNet(pa, steps) catch unreachable;
+            defer net.deinit();
+            for (net.parties[1..]) |*p| for (p.outbox.items) |m| {
+                switch (m.to) {
+                    .party => |j| if (j != 1) continue,
+                    .broadcast => {},
+                }
+                list.append(pa, .{ .bytes = pa.dupe(u8, m.bytes) catch unreachable, .from = @intCast(p.id()), .steps = steps }) catch unreachable;
+            };
+        }
+        captured_frames = list.toOwnedSlice(pa) catch unreachable;
+    }
+    return captured_frames.?;
+}
+
+fn fuzzParticipantSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParticipantHandle(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParticipantHandle(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [512]u8 = undefined;
-    // ⚠ `slice` first, ranged draws after: see modules/testkit/src/fuzz.zig.
-    const len: usize = smith.slice(&buf);
-    const from: u32 = @intCast(smith.value(u64) % 5);
-    const steps: usize = @intCast(smith.value(u64) % 7);
-    var net = try buildFuzzNet(testing.allocator, steps);
+    var from: u32 = undefined;
+    var steps: usize = undefined;
+    var len: usize = undefined;
+    if (S == fz.fuzz_driver.Rng and src.valueRangeAtMost(u8, 0, 3) != 0) {
+        // A real frame, captured per round from the same deterministic run,
+        // with 0-3 octets damaged: uniform bytes never get past the frame kind.
+        const cf = capturedFrames();
+        const c = cf[src.index(cf.len)];
+        len = fz.damage(src, &buf, c.bytes);
+        from = c.from;
+        steps = c.steps;
+        HandleMark.mark(.corpus_frame);
+    } else {
+        // ⚠ `slice` first, ranged draws after: see modules/testkit/src/fuzz.zig.
+        len = src.slice(&buf);
+        from = @intCast(src.value(u64) % 5);
+        steps = @intCast(src.value(u64) % 7);
+    }
+    var net = try buildFuzzNet(gpa, steps);
     defer net.deinit();
-    net.parties[0].handle(from, buf[0..len]) catch {};
+    const before = net.parties[0].phase();
+    if (before == .reveals) HandleMark.mark(.reached_reveals);
+    if (before == .done) HandleMark.mark(.reached_done);
+    if (net.parties[0].handle(from, buf[0..len])) |_| {
+        HandleMark.mark(.frame_accepted);
+    } else |_| {
+        HandleMark.mark(.frame_refused);
+        // A refused frame leaves the round where it was.
+        if (net.parties[0].phase() != before and net.parties[0].phase() != .aborted) return error.RefusalMovedThePhase;
+        HandleMark.mark(.refusal_inert);
+    }
     // Whatever was refused or accepted, the party must still be drivable.
-    net.parties[0].advance() catch {};
+    if (net.parties[0].advance()) |_| HandleMark.mark(.advance_ok) else |_| HandleMark.mark(.advance_err);
+}
+
+test "fuzz driver: DKG_FUZZ (participant handle)" {
+    // A run builds a three-party DKG world up to a drawn round (curve
+    // arithmetic for every frame): share the budget with the parsers.
+    try fz.fuzz_driver.run(fuzzParticipantHandle, .{ .prefix = "DKG_FUZZ", .name = "dkg-participant-handle", .scale = 40 });
+}
+
+test "fuzz harness: participant handle, 120 seeds, reaches every outcome" {
+    try HandleMark.reach(fuzzParticipantHandle, "dkg-participant-handle", 120);
 }
 
 fn fuzzSeed(out: []u8, frame: []const u8, from: u64, steps: u64) []const u8 {
@@ -1647,5 +1712,5 @@ test "fuzz: Participant.handle never panics, in any round" {
             try seeds.append(aa, fuzzSeed(buf, m.bytes, p.id(), steps));
         };
     }
-    try std.testing.fuzz({}, fuzzParticipantHandle, .{ .corpus = seeds.items });
+    try std.testing.fuzz({}, fuzzParticipantSmith, .{ .corpus = seeds.items });
 }

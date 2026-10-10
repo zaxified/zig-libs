@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-14 · mutation 2026-09-03 · src ?
 
-**Hardening:** fuzz ? · ct n/a — IS-IS codec, no auth (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ISIS_FUZZ) · ct n/a — IS-IS codec, no auth (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

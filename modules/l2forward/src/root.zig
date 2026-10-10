@@ -1732,22 +1732,70 @@ const op_seeds = [_][]const u8{
     seed(""),
 };
 
+const fz = @import("fuzz_test.zig");
+const OpsMark = fz.Marker(enum {
+    learned,
+    refreshed,
+    moved,
+    duplicate_detected,
+    denied_duplicate,
+    static_pinned,
+    learn_refused,
+    unicast,
+    flood,
+    local_only,
+    cap_refused,
+});
+
 test "fuzz: a random op stream never breaks a cap, never leaks, and a core frame never relays" {
-    try std.testing.fuzz({}, fuzzOps, .{ .corpus = &op_seeds });
+    try std.testing.fuzz({}, fuzzOpsSmith, .{ .corpus = &op_seeds });
 }
 
-fn fuzzOps(_: void, smith: *std.testing.Smith) !void {
-    var script: [256]u8 = undefined;
-    const n: usize = smith.slice(&script);
-    var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..n] };
-    _ = try driveOps(&cur);
+test "fuzz driver: L2FORWARD_FUZZ (ops)" {
+    try fz.fuzz_driver.run(fuzzOps, .{ .prefix = "L2FORWARD_FUZZ", .name = "l2forward-ops" });
+}
+
+test "fuzz harness: ops, 300 seeds, reaches every outcome" {
+    try OpsMark.reach(fuzzOps, "l2forward-ops", 300);
+}
+
+fn fuzzOpsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzOps(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzOps(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    // Every choice is a Cursor read, so under the driver's `Rng` a script of
+    // random octets is as good as any.
+    var script: [512 + 64]u8 = undefined;
+    var at: usize = 0;
+    // Structure-aware prelude (driver only): configure I-SID 1 and one member,
+    // then relearn MAC 2 (the first unicast one in the pool) from alternating PEs a tick apart, which is how the
+    // duplicate-MAC quarantine (RFC 7432 s.15) is reached; a random op stream
+    // almost never relearns one (I-SID, MAC) pair often enough inside the
+    // window. The rest of the script is random as before.
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        const add_isid = [_]u8{ 5, 0, 0, 0, 0 };
+        @memcpy(script[0..5], &add_isid);
+        at = 5;
+        for (0..src.valueRangeAtMost(u8, 4, 9)) |k| {
+            const learn = [_]u8{ 0, 0, @intCast(k % 3), 1, 1 };
+            @memcpy(script[at..][0..5], &learn);
+            at += 5;
+        }
+    }
+    const n: usize = src.slice(script[at .. at + 512][0..512]);
+    var cur: testkit.fuzz.Cursor = .{ .bytes = script[0 .. at + n] };
+    _ = try driveOpsWith(gpa, &cur);
 }
 
 /// The op stream itself, returned as the number of ops actually executed so a
 /// guard can pin it. Shared with the corpus guard below, so the guard drives the
 /// same code the harness does.
 fn driveOps(cur: *testkit.fuzz.Cursor) !usize {
-    const gpa = testing.allocator;
+    return driveOpsWith(testing.allocator, cur);
+}
+
+fn driveOpsWith(gpa: std.mem.Allocator, cur: *testkit.fuzz.Cursor) !usize {
     // Small caps and a small pool of IDs so a bounded op stream actually
     // presses on `TooManyIsids`/`TooManyMembers`/`FdbFull`/quarantine, not
     // just the happy path.
@@ -1788,15 +1836,61 @@ fn driveOps(cur: *testkit.fuzz.Cursor) !usize {
         executed += 1;
 
         switch (op) {
-            .learn => _ = t.learn(isid, mac, pe, now) catch {},
-            .learn_static => t.learnStatic(isid, mac, pe, now) catch {},
+            .learn => {
+                const before_lookup = t.lookup(isid, mac, now);
+                if (t.learn(isid, mac, pe, now)) |outcome| {
+                    // What each outcome promises about the binding afterwards.
+                    switch (outcome) {
+                        .learned, .refreshed, .moved => {
+                            if (t.lookup(isid, mac, now) != pe) return error.LearnedBindingNotVisible;
+                        },
+                        .duplicate_detected, .denied_duplicate => {
+                            if (t.lookup(isid, mac, now) != null) return error.QuarantinedMacStillResolves;
+                        },
+                        .static_pinned => {
+                            if (t.lookup(isid, mac, now) != before_lookup) return error.PinnedBindingChanged;
+                        },
+                    }
+                    switch (outcome) {
+                        .learned => OpsMark.mark(.learned),
+                        .refreshed => OpsMark.mark(.refreshed),
+                        .moved => OpsMark.mark(.moved),
+                        .duplicate_detected => OpsMark.mark(.duplicate_detected),
+                        .denied_duplicate => OpsMark.mark(.denied_duplicate),
+                        .static_pinned => OpsMark.mark(.static_pinned),
+                    }
+                } else |_| OpsMark.mark(.learn_refused);
+            },
+            .learn_static => t.learnStatic(isid, mac, pe, now) catch OpsMark.mark(.cap_refused),
             .forget => _ = t.forget(isid, mac),
-            .add_member => t.addMember(isid, pe) catch {},
+            .add_member => t.addMember(isid, pe) catch OpsMark.mark(.cap_refused),
             .remove_member => t.removeMember(isid, pe),
-            .add_isid => t.addIsid(isid) catch {},
+            .add_isid => t.addIsid(isid) catch OpsMark.mark(.cap_refused),
             .remove_isid => _ = t.removeIsid(isid),
             .tick => t.tick(now),
-            .forward_access => _ = t.forward(isid, mac, .access, now, &out) catch {},
+            .forward_access => {
+                const d = t.forward(isid, mac, .access, now, &out) catch continue;
+                switch (d) {
+                    .unicast => |dst| {
+                        OpsMark.mark(.unicast);
+                        if (t.lookup(isid, mac, now) != dst or !t.isMember(isid, dst) or isBumAddress(mac))
+                            return error.UnicastNotTheLearnedMember;
+                    },
+                    .flood => |set| {
+                        OpsMark.mark(.flood);
+                        if (set.len != t.memberCount(isid)) return error.FloodSetNotAllMembers;
+                        for (set, 0..) |m, k| {
+                            if (!t.isMember(isid, m)) return error.FloodedToNonMember;
+                            if (k > 0 and set[k - 1] >= m) return error.FloodSetNotAscending;
+                        }
+                        // A known, in-member unicast never floods.
+                        if (!isBumAddress(mac)) if (t.lookup(isid, mac, now)) |dst| {
+                            if (t.isMember(isid, dst)) return error.KnownUnicastFlooded;
+                        };
+                    },
+                    .local_only => return error.AccessFrameLocalOnly,
+                }
+            },
             .forward_core => {
                 // The invariant: a frame that arrived from the core is NEVER
                 // relayed back into the fabric, on ANY table state this
@@ -1806,6 +1900,7 @@ fn driveOps(cur: *testkit.fuzz.Cursor) !usize {
                 // so this also structurally cannot contain `pe`.
                 const decision = t.forward(isid, mac, .{ .core = pe }, now, &out) catch continue;
                 if (decision != .local_only) return error.CoreIngressWasRelayed;
+                OpsMark.mark(.local_only);
             },
         }
 

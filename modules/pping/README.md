@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-19 · mutation 2026-08-13 · src ?
 
-**Hardening:** fuzz ? · ct n/a — passive ping (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, PPING_FUZZ) · ct n/a — passive ping (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

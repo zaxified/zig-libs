@@ -341,26 +341,150 @@ const rx_seeds = [_][]const u8{
     fuzzSeed(&.{ 0x83, 0x14, 0x01, 0x06, 0x11, 0x01, 0x00, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x1e, 0x00, 0x25, 0x01, 0xf0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0xb1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0xa1 }),
 };
 
+const fz = @import("fuzz_test.zig");
+const RxMark = fz.Marker(enum { refused, accepted, rejected, to_initializing, to_up, to_down, inert_on_refusal, ticked_hold });
+const HandshakeMark = fz.Marker(enum { genuine_up, damaged_refused, damaged_accepted, damaged_rejected, hold_expired, restarted });
+
 test "fuzz: rxHelloBytes on hostile bytes never panics; a rejected PDU is inert" {
-    try std.testing.fuzz({}, fuzzRx, .{ .corpus = &rx_seeds });
+    try std.testing.fuzz({}, fuzzRxSmith, .{ .corpus = &rx_seeds });
 }
 
-fn fuzzRx(_: void, smith: *std.testing.Smith) !void {
-    var buf: [128]u8 = undefined;
-    // One `smith.slice` draw — never `bytes` followed by a ranged length,
-    // which handed this harness the EMPTY input once per unseeded run.
-    const len: usize = smith.slice(&buf);
-    const input = buf[0..len];
+test "fuzz driver: ISIS_ADJ_FUZZ (rx)" {
+    try fz.fuzz_driver.run(fuzzRx, .{ .prefix = "ISIS_ADJ_FUZZ", .name = "isis-adj-rx" });
+}
 
+test "fuzz harness: rx, 500 seeds, reaches every outcome" {
+    try RxMark.reach(fuzzRx, "isis-adj-rx", 500);
+}
+
+test "fuzz: two adjacencies handshake to Up; damaged frames never corrupt the FSM" {
+    try std.testing.fuzz({}, fuzzHandshakeSmith, .{});
+}
+
+test "fuzz driver: ISIS_ADJ_FUZZ (handshake)" {
+    try fz.fuzz_driver.run(fuzzHandshake, .{ .prefix = "ISIS_ADJ_FUZZ", .name = "isis-adj-handshake" });
+}
+
+test "fuzz harness: handshake, 300 seeds, reaches every outcome" {
+    try HandshakeMark.reach(fuzzHandshake, "isis-adj-handshake", 300);
+}
+
+fn fuzzRxSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRx(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzHandshakeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzHandshake(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn markEffect(eff: Effect) void {
+    if (eff.rejected != null) RxMark.mark(.rejected);
+    if (eff.transition) |t| switch (t.to) {
+        .initializing => RxMark.mark(.to_initializing),
+        .up => RxMark.mark(.to_up),
+        .down => RxMark.mark(.to_down),
+    };
+}
+
+/// Several hostile hellos (and timer ticks) into one adjacency. Invariants: a
+/// refused PDU mutates nothing, a soft-rejected one mutates nothing, a reported
+/// transition is the state the FSM is in, `adjacency_up` means Up.
+fn fuzzRx(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var adj = Adjacency.init(.{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 });
     _ = adj.start(0);
-    const before = adj.currentState();
-    if (adj.rxHelloBytes(input, 1)) |_| {
-        // Accepted or rejected — either way the state is one of the three legal
-        // values (guaranteed by the enum) and the FSM did not panic.
-    } else |_| {
-        // A decode error must be inert: it mutates nothing.
-        try std.testing.expectEqual(before, adj.currentState());
+    var now: Time = 0;
+    const steps = src.valueRangeAtMost(u8, 1, 6);
+    for (0..steps) |_| {
+        var buf: [128]u8 = undefined;
+        // One `slice` draw (never `bytes` then a ranged length, which handed
+        // the harness the EMPTY input once per unseeded run); under the
+        // driver's `Rng` a corpus entry with 0-3 octets damaged.
+        const len: usize = fz.drawInput(S, src, &buf, &rx_seeds);
+        const input = buf[0..len];
+        now += src.valueRangeAtMost(u8, 0, 40);
+        if (src.valueRangeAtMost(u8, 0, 3) == 0) {
+            const prev = adj.currentState();
+            const eff = adj.tick(now);
+            if (eff.transition) |t| {
+                try std.testing.expectEqual(prev, t.from);
+                try std.testing.expectEqual(adj.currentState(), t.to);
+                RxMark.mark(.ticked_hold);
+            }
+            continue;
+        }
+        const before = adj;
+        if (adj.rxHelloBytes(input, now)) |eff| {
+            RxMark.mark(.accepted);
+            markEffect(eff);
+            if (eff.rejected != null) try std.testing.expect(std.meta.eql(before, adj));
+            if (eff.transition) |t| {
+                try std.testing.expectEqual(before.currentState(), t.from);
+                try std.testing.expectEqual(adj.currentState(), t.to);
+            }
+            if (eff.adjacency_up) try std.testing.expectEqual(State.up, adj.currentState());
+            if (adj.currentState() == .up) try std.testing.expect(adj.neighbor_system_id != null);
+        } else |_| {
+            RxMark.mark(.refused);
+            // A decode error must be inert: it mutates nothing.
+            try std.testing.expect(std.meta.eql(before, adj));
+            RxMark.mark(.inert_on_refusal);
+        }
+    }
+}
+
+/// Two adjacencies exchanging the hellos the module itself builds. With the
+/// wire left alone they reach Up on both sides; with one frame damaged (octets
+/// flipped, maybe truncated, or the hello dropped) neither side panics or
+/// reports a transition that is not the state it is in; and a refused frame
+/// leaves the receiver unchanged.
+fn fuzzHandshake(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    var a = Adjacency.init(cfg(sys_a, 0xA1));
+    var b = Adjacency.init(cfg(sys_b, 0xB1));
+    _ = a.start(0);
+    _ = b.start(0);
+    const damage_round: ?u8 = if (src.value(bool)) src.valueRangeAtMost(u8, 0, 3) else null;
+    var now: Time = 0;
+    var round: u8 = 0;
+    var damaged = false;
+    while (round < 6) : (round += 1) {
+        now += 10;
+        for ([2]u1{ 0, 1 }) |dir| {
+            const tx = if (dir == 0) &a else &b;
+            const rx = if (dir == 0) &b else &a;
+            const eff = tx.tick(now);
+            const hf = eff.send_hello orelse continue;
+            var buf: [96]u8 = undefined;
+            var frame = try buildHello(&buf, hf);
+            if (damage_round != null and damage_round.? == round) {
+                var dbuf: [96]u8 = undefined;
+                const n = fz.damage(src, &dbuf, frame);
+                frame = dbuf[0..n];
+                damaged = true;
+            }
+            const before = rx.*;
+            if (rx.rxHelloBytes(frame, now)) |e| {
+                if (damaged) {
+                    if (e.rejected != null) HandshakeMark.mark(.damaged_rejected) else HandshakeMark.mark(.damaged_accepted);
+                }
+                if (e.transition) |t| try std.testing.expectEqual(rx.currentState(), t.to);
+            } else |_| {
+                try std.testing.expect(std.meta.eql(before, rx.*));
+                if (damaged) HandshakeMark.mark(.damaged_refused);
+            }
+        }
+    }
+    if (damage_round == null) {
+        try std.testing.expectEqual(State.up, a.currentState());
+        try std.testing.expectEqual(State.up, b.currentState());
+        HandshakeMark.mark(.genuine_up);
+        // Silence: past the hold both fall back to Down with `hold_expired`.
+        const ea = a.tick(now + 1000);
+        const eb = b.tick(now + 1000);
+        if (ea.adjacency_down == .hold_expired and eb.adjacency_down == .hold_expired) HandshakeMark.mark(.hold_expired);
+        if (a.currentState() != .down or b.currentState() != .down) return error.HoldDidNotExpire;
+        // A restart of one side while the other still thinks it is Up.
+        _ = a.start(now + 1000);
+        HandshakeMark.mark(.restarted);
     }
 }
 
@@ -368,4 +492,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("three_way.zig");
     _ = @import("fsm.zig");
+    _ = @import("fuzz_test.zig");
 }

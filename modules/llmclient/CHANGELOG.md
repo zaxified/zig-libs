@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `LLMCLIENT_FUZZ`: `llmclient-sse-parse`, `llmclient-message`, `llmclient-stream-event`, `llmclient-token-count` over the existing harnesses (driver draws a corpus string with 0-3 octets damaged), each now also parsing a well-formed document whose fields must come back; and `llmclient-sse-stream` (events written the way a server writes them -- BOM, comments, LF/CRLF, event/id/retry/data fields -- parse back to exactly those events). A count above i64 max arriving as a `number_string` is refused by design and kept out of the genuine range. No source change.
 - **2026-10-10** — docs: ct axis recorded as n/a: the only secret, the API key, is validated for header-safe bytes and copied into the `x-api-key` header; no MAC, key derivation or secret compare happens here (code review; TLS is `http`'s).
 - **2026-10-06** — FIXED (review of PR #5): citations could be requested but not received. A
   streamed `citations_delta` was `error.MalformedResponse`, ending the stream at the first

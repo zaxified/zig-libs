@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `L2FORWARD_FUZZ` over the op-stream harness (generic over its choice source; driver prelude relearns one MAC from alternating PEs to reach the RFC 7432 duplicate-MAC quarantine), with new per-step oracles: each `learn` outcome fixes what `lookup` answers afterwards (learned/refreshed/moved bind the PE, quarantine resolves to nothing, a pin is unchanged), a unicast decision is the learned member, a flood is exactly the ascending member set and never replaces a known member unicast. No source change.
 - **2026-09-10** — A1 F-C/F-F re-audited, not fixed: both were already
   addressed in `f83009e6` (SPEC.md "The quarantine's cost is the operator's
   to weigh" / "a live quarantine also survives ageing/tick", and the "MAC

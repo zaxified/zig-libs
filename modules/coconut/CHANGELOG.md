@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `COCONUT_FUZZ`: `coconut-credential-decode`, `coconut-partial-decode` (genuine encodings with 0-3 octets damaged; what decodes re-encodes to the same octets), `coconut-showproof-decode` (corpus entry damaged; same canonical round trip) and `coconut-protocol` (2-of-3 issuance, aggregation, show, verify; the wire form verifies; another context, key, mask or disclosed value and one flipped octet of the encoded proof are refused). No source change.
 - **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte
   vector stores LLVM realigned the frame of a burn of 2 KiB or less (`and $-32, %rsp`), and the 32..63
   bytes between the zeroed buffer and the saved frame pointer kept whatever a callee had left there

@@ -364,7 +364,7 @@ test "trustedDealerKeygen at t = 3: every share passes the Feldman check against
             want = want.add(term);
             x_pow = x_pow.mul(x);
         }
-        const got = try frost.Secp256k1.combMulBase(share.signing_share.toBytes(), .big);
+        const got = try @import("k256").Secp256k1.combMulBase(share.signing_share.toBytes(), .big);
         try std.testing.expect(got.equivalent(want));
     }
     // And any 3 shares still reconstruct the secret.
@@ -624,16 +624,27 @@ const verify_seeds = [_][]const u8{
     fuzzSeedLocal(""),
 };
 
-fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
-    // ⚠ The FIRST draw is a byte draw. See `verify_seeds`.
+const fz = @import("fuzz_test.zig");
+const VerifyMark = fz.Marker(enum { pristine_verified, refused_at_parse, parsed_rejected });
+const WireMark = fz.Marker(enum { element_ok, element_refused, signature_ok, signature_refused, scalar_ok, scalar_refused, identifier_ok, identifier_refused });
+const ProtoMark = fz.Marker(enum { genuine_accepted, flipped_sig_rejected, bad_share_detected, bad_share_aggregate_rejected, good_share_verified, other_message_rejected, other_quorum });
+
+fn fuzzVerifySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzVerify(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    // ⚠ The FIRST draw is a byte draw. See `verify_seeds`. Under the driver's
+    // `Rng`, half the scripts are a seed with 0-3 octets damaged.
     var script: [128]u8 = undefined;
-    const script_len: usize = smith.slice(&script);
+    const script_len: usize = fz.drawInput(S, src, &script, &verify_seeds);
     var cur: FuzzCursor = .{ .bytes = script[0..script_len] };
 
     const group_public_key = elementFromHex(v.group.public_key);
     const msg = hexN(4, v.group.message);
 
-    var bytes = hexN(65, v.final_signature);
+    const pristine = hexN(65, v.final_signature);
+    var bytes = pristine;
     const n_flips = cur.ranged(0, 40);
     var i: u32 = 0;
     while (i < n_flips) : (i += 1) {
@@ -641,12 +652,212 @@ fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
         bytes[pos] = cur.byte();
     }
 
-    const sig = frost.Signature.fromBytes(bytes) catch return;
-    _ = frost.verify(&msg, sig, group_public_key);
+    const sig = frost.Signature.fromBytes(bytes) catch {
+        VerifyMark.mark(.refused_at_parse);
+        return;
+    };
+    const ok = frost.verify(&msg, sig, group_public_key);
+    // The oracle: the published signature verifies, and no other 65 octets do.
+    if (std.mem.eql(u8, &bytes, &pristine)) {
+        if (!ok) return error.PublishedSignatureRefused;
+        VerifyMark.mark(.pristine_verified);
+    } else {
+        if (ok) return error.DamagedSignatureAccepted;
+        VerifyMark.mark(.parsed_rejected);
+    }
 }
 
 test "fuzz: verify never panics on corrupted signature bytes" {
-    try std.testing.fuzz({}, fuzzVerify, .{ .corpus = &verify_seeds });
+    try std.testing.fuzz({}, fuzzVerifySmith, .{ .corpus = &verify_seeds });
+}
+
+test "fuzz driver: FROST_FUZZ (verify)" {
+    try fz.fuzz_driver.run(fuzzVerify, .{ .prefix = "FROST_FUZZ", .name = "frost-verify" });
+}
+
+test "fuzz harness: verify, 400 seeds, reaches every outcome" {
+    try VerifyMark.reach(fuzzVerify, "frost-verify", 400);
+}
+
+test "fuzz driver: FROST_FUZZ (wire)" {
+    try fz.fuzz_driver.run(fuzzWire, .{ .prefix = "FROST_FUZZ", .name = "frost-wire" });
+}
+
+test "fuzz harness: wire, 300 seeds, reaches every outcome" {
+    try WireMark.reach(fuzzWire, "frost-wire", 300);
+}
+
+test "fuzz: wire decoders reject what is not canonical and re-encode what they accept" {
+    try std.testing.fuzz({}, fuzzWireSmith, .{});
+}
+
+fn fuzzWireSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzWire(std.testing.Smith, smith, std.testing.allocator);
+}
+
+/// The byte-level decoders a participant's message passes through:
+/// `Element.fromBytes`, `Signature.fromBytes`, the scalar wire types and
+/// `Identifier.fromBytes`. Inputs are a published element/scalar with 0-3
+/// octets damaged (uniform bytes are rarely on the curve), and plain random
+/// bytes. What a decoder accepts re-encodes to the same octets.
+fn fuzzWire(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    var e: [33]u8 = hexN(33, v.group.public_key);
+    var sg: [65]u8 = hexN(65, v.final_signature);
+    var sc: [32]u8 = hexN(32, v.group.secret_key);
+    if (src.value(bool)) {
+        var tmp: [65]u8 = undefined;
+        const n1 = fz.damage(src, &tmp, &e);
+        @memcpy(e[0..n1], tmp[0..n1]);
+        const n2 = fz.damage(src, &tmp, &sg);
+        @memcpy(sg[0..n2], tmp[0..n2]);
+        const n3 = fz.damage(src, &tmp, &sc);
+        @memcpy(sc[0..n3], tmp[0..n3]);
+    } else {
+        src.bytes(&e);
+        src.bytes(&sg);
+        src.bytes(&sc);
+        // At or above the group order n (its top fifteen octets are 0xFF): not a scalar.
+        if (src.value(bool)) @memset(sc[0..16], 0xff);
+    }
+    if (frost.Element.fromBytes(e)) |el| {
+        if (!std.mem.eql(u8, &el.toBytes(), &e)) return error.NonCanonicalElementAccepted;
+        WireMark.mark(.element_ok);
+    } else |_| WireMark.mark(.element_refused);
+    if (frost.Signature.fromBytes(sg)) |sig| {
+        if (!std.mem.eql(u8, &sig.toBytes(), &sg)) return error.NonCanonicalSignatureAccepted;
+        WireMark.mark(.signature_ok);
+    } else |_| WireMark.mark(.signature_refused);
+    if (frost.SigningShare.fromBytes(sc)) |sh| {
+        var share = sh;
+        defer share.deinit();
+        if (!std.mem.eql(u8, &share.toBytes(), &sc)) return error.NonCanonicalScalarAccepted;
+        WireMark.mark(.scalar_ok);
+    } else |_| WireMark.mark(.scalar_refused);
+    if (frost.Identifier.fromBytes(sc)) |id| {
+        if (!std.mem.eql(u8, &id.toBytes(), &sc)) return error.NonCanonicalIdentifierAccepted;
+        WireMark.mark(.identifier_ok);
+    } else |_| WireMark.mark(.identifier_refused);
+}
+
+test "fuzz driver: FROST_FUZZ (protocol)" {
+    // A run is key generation, two to four signers' two rounds, an aggregation
+    // and up to nine verifications (scalar multiplications each).
+    try fz.fuzz_driver.run(fuzzProtocol, .{ .prefix = "FROST_FUZZ", .name = "frost-protocol", .scale = 200 });
+}
+
+test "fuzz harness: protocol, 60 seeds, reaches every outcome" {
+    try ProtoMark.reach(fuzzProtocol, "frost-protocol", 60);
+}
+
+test "fuzz: a (t,n) signing round trip is accepted; damaged signatures and shares are not" {
+    try std.testing.fuzz({}, fuzzProtocolSmith, .{});
+}
+
+fn fuzzProtocolSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzProtocol(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn drawScalar(comptime S: type, src: *S) frost.Scalar {
+    var wide = [_]u8{0} ** 48;
+    src.bytes(wide[16..48]);
+    return frost.Scalar.fromBytes48(wide, .big);
+}
+
+/// The genuine round trip over fresh key material and a drawn quorum, then the
+/// damage a hostile participant or network can do: a signature with one flipped
+/// bit, a signature share with one flipped bit (`verifySignatureShare` names the
+/// cheater; an `aggregate` over it yields a signature `verify` refuses), a
+/// different message.
+fn fuzzProtocol(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const max: u16 = src.valueRangeAtMost(u8, 2, 5);
+    const min: u16 = src.valueRangeAtMost(u8, 2, @intCast(max));
+    const secret = drawScalar(S, src);
+    var coeffs: [4]frost.Scalar = undefined;
+    for (coeffs[0 .. min - 1]) |*c| c.* = drawScalar(S, src);
+    const kg = frost.trustedDealerKeygen(gpa, secret, coeffs[0 .. min - 1], max, min) catch return;
+    defer {
+        for (kg.shares) |*s| s.deinit();
+        gpa.free(kg.shares);
+        gpa.free(kg.vss_commitment);
+    }
+
+    // A quorum of `min` distinct participants.
+    var picked: [5]usize = undefined;
+    var used = [_]bool{false} ** 5;
+    for (picked[0..min]) |*p| {
+        var idx = src.index(max);
+        while (used[idx]) idx = (idx + 1) % max;
+        used[idx] = true;
+        p.* = idx;
+    }
+    var nonces: [5]frost.SigningNonces = undefined;
+    var comms: [5]frost.SigningCommitments = undefined;
+    var pairs: [5]frost.NonceCommitmentPair = undefined;
+    for (picked[0..min], 0..) |idx, k| {
+        var hr: [32]u8 = undefined;
+        var br: [32]u8 = undefined;
+        src.bytes(&hr);
+        src.bytes(&br);
+        frost.generateNonces(&nonces[k], &kg.shares[idx].signing_share, hr, br);
+        pairs[k] = try frost.round1Commit(&nonces[k]);
+        comms[k] = .{ .identifier = kg.shares[idx].identifier, .hiding = pairs[k].hiding, .binding = pairs[k].binding };
+    }
+    // Sort the commitments, keeping each signer's nonces and pair beside them.
+    var order: [5]usize = .{ 0, 1, 2, 3, 4 };
+    std.mem.sort(usize, order[0..min], &comms, struct {
+        fn lt(c: *[5]frost.SigningCommitments, a: usize, b: usize) bool {
+            return std.mem.order(u8, &c[a].identifier.toBytes(), &c[b].identifier.toBytes()) == .lt;
+        }
+    }.lt);
+    var sorted: [5]frost.SigningCommitments = undefined;
+    for (order[0..min], 0..) |o, k| sorted[k] = comms[o];
+
+    var msg_buf: [24]u8 = undefined;
+    const msg_len = src.valueRangeAtMost(u8, 0, msg_buf.len);
+    src.bytes(&msg_buf);
+    const msg = msg_buf[0..msg_len];
+
+    var shares: [5]frost.SignatureShare = undefined;
+    for (order[0..min], 0..) |o, k| {
+        const idx = picked[o];
+        shares[k] = try frost.round2Sign(gpa, kg.shares[idx].identifier, &kg.shares[idx].signing_share, kg.group_public_key, &nonces[o], msg, sorted[0..min]);
+    }
+    const sig = try frost.aggregate(gpa, sorted[0..min], msg, kg.group_public_key, shares[0..min]);
+    if (!frost.verify(msg, sig, kg.group_public_key)) return error.GenuineSignatureRefused;
+    ProtoMark.mark(.genuine_accepted);
+    if (min != max) ProtoMark.mark(.other_quorum);
+
+    // One flipped bit of the signature.
+    var sb = sig.toBytes();
+    sb[src.index(sb.len)] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
+    if (frost.Signature.fromBytes(sb)) |bent| {
+        if (frost.verify(msg, bent, kg.group_public_key)) return error.FlippedSignatureAccepted;
+    } else |_| {}
+    ProtoMark.mark(.flipped_sig_rejected);
+
+    // Another message.
+    if (frost.verify("a different message", sig, kg.group_public_key)) return error.SignatureAcceptedForOtherMessage;
+    ProtoMark.mark(.other_message_rejected);
+
+    // A share with one flipped bit: named by verifySignatureShare, and an
+    // aggregate over it is no valid signature. The honest share verifies.
+    const who = src.index(min);
+    const o = order[who];
+    const vs = frost.VerifyingShare.fromPoint(try @import("k256").Secp256k1.combMulBase(kg.shares[picked[o]].signing_share.toBytes(), .big)) catch return;
+    if (!(try frost.verifySignatureShare(gpa, kg.shares[picked[o]].identifier, vs, pairs[o], shares[who], sorted[0..min], kg.group_public_key, msg))) return error.HonestShareRefused;
+    ProtoMark.mark(.good_share_verified);
+    var shb = shares[who].toBytes();
+    shb[src.index(32)] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
+    if (frost.SignatureShare.fromBytes(shb)) |bad| {
+        if (try frost.verifySignatureShare(gpa, kg.shares[picked[o]].identifier, vs, pairs[o], bad, sorted[0..min], kg.group_public_key, msg)) return error.BadShareAccepted;
+        ProtoMark.mark(.bad_share_detected);
+        var tampered = shares;
+        tampered[who] = bad;
+        if (frost.aggregate(gpa, sorted[0..min], msg, kg.group_public_key, tampered[0..min])) |agg| {
+            if (frost.verify(msg, agg, kg.group_public_key)) return error.AggregateOverBadShareAccepted;
+        } else |_| {}
+        ProtoMark.mark(.bad_share_aggregate_rejected);
+    } else |_| {}
 }
 
 test "corpus: the verify seeds actually corrupt the signature, and the counts are pinned" {

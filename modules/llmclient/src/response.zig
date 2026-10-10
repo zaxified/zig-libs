@@ -865,49 +865,156 @@ test "parseMessage: a non-string JSON value on a string field is treated as empt
 // `smith.slice`, not `bytes` + a ranged length (that pair always yields the
 // empty input), and seeds that reach the typed walk — without them the
 // harnesses saw one empty string each (A1 F9).
-fn fuzzParseMessage(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const MsgMark = fz.Marker(enum { accepted, refused, text_block, tool_block, genuine });
+const EvMark = fz.Marker(enum { accepted, refused, delta, start, stop, message_delta, error_event, genuine });
+const TokMark = fz.Marker(enum { accepted, refused, genuine });
+
+const message_corpus = [_][]const u8{
+    "{\"id\":\"msg_1\",\"model\":\"m\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}",
+    "{\"content\":[{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"n\",\"input\":{}}],\"usage\":{\"input_tokens\":1e300}}",
+    "{\"content\":[1,2,3],\"stop_details\":{\"category\":5}}",
+};
+const event_corpus = [_][]const u8{
+    "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}",
+    "{\"type\":\"content_block_stop\",\"index\":4294967296}",
+    "{\"type\":\"content_block_stop\",\"index\":3}",
+    "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":-1}}}",
+    "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12}}",
+    "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"x\"}}",
+    "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+};
+const token_corpus = [_][]const u8{
+    "{ \"input_tokens\": 14 }",
+    "{\"input_tokens\":1e300}",
+    "{\"input_tokens\":-1,\"x\":[1,{\"y\":null}]}",
+    "{\"input_tokens\":18446744073709551615}",
+};
+
+fn fuzzParseMessageSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseMessage(std.testing.Smith, smith, testing.allocator);
+}
+fn fuzzParseStreamEventSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseStreamEvent(std.testing.Smith, smith, testing.allocator);
+}
+fn fuzzParseTokenCountSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseTokenCount(std.testing.Smith, smith, testing.allocator);
+}
+
+const word_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_ ";
+
+fn drawWord(comptime S: type, src: *S, out: []u8) []u8 {
+    const l = src.valueRangeAtMost(u8, 0, @intCast(out.len));
+    for (out[0..l]) |*c| c.* = word_chars[src.index(word_chars.len)];
+    return out[0..l];
+}
+
+// `smith.slice`, not `bytes` + a ranged length (that pair always yields the
+// empty input), and seeds that reach the typed walk — without them the
+// harnesses saw one empty string each (A1 F9). Each harness is also run with a
+// well-formed document the module's grammar admits, whose fields must come back.
+fn fuzzParseMessage(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [512]u8 = undefined;
-    const len = smith.slice(&buf);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const len = fz.drawRaw(S, src, &buf, &message_corpus);
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    _ = parseMessage(arena.allocator(), buf[0..len]) catch return;
+    if (parseMessage(arena.allocator(), buf[0..len])) |m| {
+        MsgMark.mark(.accepted);
+        for (m.content) |b| switch (b) {
+            .text => MsgMark.mark(.text_block),
+            .tool_use => MsgMark.mark(.tool_block),
+            else => {},
+        };
+    } else |_| MsgMark.mark(.refused);
+
+    // A well-formed message must round-trip its fields.
+    var idb: [16]u8 = undefined;
+    var tb: [24]u8 = undefined;
+    const id = drawWord(S, src, &idb);
+    const text = drawWord(S, src, &tb);
+    const tin = src.value(u32);
+    const tout = src.value(u32);
+    var jb: [512]u8 = undefined;
+    const doc = try std.fmt.bufPrint(&jb, "{{\"id\":\"{s}\",\"model\":\"m\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"stop_reason\":\"end_turn\",\"usage\":{{\"input_tokens\":{d},\"output_tokens\":{d}}}}}", .{ id, text, tin, tout });
+    const m = parseMessage(arena.allocator(), doc) catch return error.GenuineMessageRefused;
+    if (!std.mem.eql(u8, m.id, id) or m.usage.input_tokens != tin or m.usage.output_tokens != tout) return error.GenuineMessageChanged;
+    if (m.content.len != 1 or m.content[0] != .text or !std.mem.eql(u8, m.content[0].text.text, text)) return error.GenuineMessageChanged;
+    if (m.stop_reason != .end_turn) return error.GenuineMessageChanged;
+    MsgMark.mark(.genuine);
+}
+
+test "fuzz driver: LLMCLIENT_FUZZ (message)" {
+    try fz.fuzz_driver.run(fuzzParseMessage, .{ .prefix = "LLMCLIENT_FUZZ", .name = "llmclient-message" });
+}
+test "fuzz harness: message, 300 seeds, reaches every outcome" {
+    try MsgMark.reach(fuzzParseMessage, "llmclient-message", 300);
 }
 test "fuzz parseMessage never panics" {
-    try testing.fuzz({}, fuzzParseMessage, .{ .corpus = &.{
-        "{\"id\":\"msg_1\",\"model\":\"m\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}",
-        "{\"content\":[{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"n\",\"input\":{}}],\"usage\":{\"input_tokens\":1e300}}",
-        "{\"content\":[1,2,3],\"stop_details\":{\"category\":5}}",
-    } });
+    try testing.fuzz({}, fuzzParseMessageSmith, .{ .corpus = &message_corpus });
 }
 
-fn fuzzParseStreamEvent(_: void, smith: *std.testing.Smith) !void {
+fn fuzzParseStreamEvent(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [512]u8 = undefined;
-    const len = smith.slice(&buf);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const len = fz.drawRaw(S, src, &buf, &event_corpus);
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    _ = parseStreamEvent(arena.allocator(), buf[0..len]) catch return;
+    if (parseStreamEvent(arena.allocator(), buf[0..len])) |ev| {
+        EvMark.mark(.accepted);
+        switch (ev) {
+            .content_block_delta => EvMark.mark(.delta),
+            .content_block_start, .message_start => EvMark.mark(.start),
+            .content_block_stop => EvMark.mark(.stop),
+            .message_delta => EvMark.mark(.message_delta),
+            .@"error" => EvMark.mark(.error_event),
+            else => {},
+        }
+    } else |_| EvMark.mark(.refused);
+
+    // A well-formed text delta returns its index and text.
+    var tb: [24]u8 = undefined;
+    const text = drawWord(S, src, &tb);
+    const index = src.value(u32);
+    var jb: [256]u8 = undefined;
+    const doc = try std.fmt.bufPrint(&jb, "{{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{{\"type\":\"text_delta\",\"text\":\"{s}\"}}}}", .{ index, text });
+    const ev = parseStreamEvent(arena.allocator(), doc) catch return error.GenuineEventRefused;
+    if (ev != .content_block_delta or ev.content_block_delta.index != index or ev.content_block_delta.delta != .text_delta or
+        !std.mem.eql(u8, ev.content_block_delta.delta.text_delta.text, text)) return error.GenuineEventChanged;
+    EvMark.mark(.genuine);
+}
+
+test "fuzz driver: LLMCLIENT_FUZZ (stream event)" {
+    try fz.fuzz_driver.run(fuzzParseStreamEvent, .{ .prefix = "LLMCLIENT_FUZZ", .name = "llmclient-stream-event" });
+}
+test "fuzz harness: stream event, 300 seeds, reaches every outcome" {
+    try EvMark.reach(fuzzParseStreamEvent, "llmclient-stream-event", 300);
 }
 test "fuzz parseStreamEvent never panics" {
-    try testing.fuzz({}, fuzzParseStreamEvent, .{ .corpus = &.{
-        "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}",
-        "{\"type\":\"content_block_stop\",\"index\":4294967296}",
-        "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":-1}}}",
-        "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12}}",
-    } });
+    try testing.fuzz({}, fuzzParseStreamEventSmith, .{ .corpus = &event_corpus });
 }
 
-fn fuzzParseTokenCount(_: void, smith: *std.testing.Smith) !void {
+fn fuzzParseTokenCount(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [256]u8 = undefined;
-    const len = smith.slice(&buf);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const len = fz.drawRaw(S, src, &buf, &token_corpus);
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    _ = parseTokenCount(arena.allocator(), buf[0..len]) catch return;
+    if (parseTokenCount(arena.allocator(), buf[0..len])) |_| TokMark.mark(.accepted) else |_| TokMark.mark(.refused);
+
+    // `std.json` hands a count above i64 max over as a `number_string`, which
+    // `u64Field` refuses by design ("not a count this client can use").
+    const n: u64 = src.value(u64) & std.math.maxInt(i64);
+    var jb: [64]u8 = undefined;
+    const doc = try std.fmt.bufPrint(&jb, "{{ \"input_tokens\": {d} }}", .{n});
+    const tc = parseTokenCount(arena.allocator(), doc) catch return error.GenuineCountRefused;
+    if (tc.input_tokens != n) return error.GenuineCountChanged;
+    TokMark.mark(.genuine);
+}
+
+test "fuzz driver: LLMCLIENT_FUZZ (token count)" {
+    try fz.fuzz_driver.run(fuzzParseTokenCount, .{ .prefix = "LLMCLIENT_FUZZ", .name = "llmclient-token-count" });
+}
+test "fuzz harness: token count, 300 seeds, reaches every outcome" {
+    try TokMark.reach(fuzzParseTokenCount, "llmclient-token-count", 300);
 }
 test "fuzz parseTokenCount never panics" {
-    try testing.fuzz({}, fuzzParseTokenCount, .{ .corpus = &.{
-        "{ \"input_tokens\": 14 }",
-        "{\"input_tokens\":1e300}",
-        "{\"input_tokens\":-1,\"x\":[1,{\"y\":null}]}",
-        "{\"input_tokens\":18446744073709551615}",
-    } });
+    try testing.fuzz({}, fuzzParseTokenCountSmith, .{ .corpus = &token_corpus });
 }

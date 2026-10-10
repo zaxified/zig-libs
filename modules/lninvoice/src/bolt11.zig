@@ -1169,7 +1169,7 @@ test "BOLT#11 KAT: donation invoice ENCODE byte-exact against the spec's own lnb
 // instead of bouncing off `InvalidChecksum` every time.
 test "fuzz: decode never panics on arbitrary attacker-supplied invoice strings" {
     var corpus: InvoiceCorpus = .{};
-    try testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build(testing.allocator) });
+    try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = try corpus.build(testing.allocator) });
 }
 
 test "hostile: an out-of-range recovery id (4) is a typed error, not an @intCast panic" {
@@ -1379,19 +1379,172 @@ const InvoiceCorpus = struct {
     }
 };
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
-    // ⚠ One `smith.slice`, then the octets say what happens — see `Script`.
-    // Measured 2026-09-07 over the corpus above: **one invoice with an EMPTY
-    // data part on every input before; 9 scripts, 1842 quintets, all 4 HRP
-    // shapes and 1 real invoice decoded after.**
+const fz = @import("fuzz_test.zig");
+const InvMark = fz.Marker(enum { accepted, recovered, refused_structure, refused_signature });
+const SignMark = fz.Marker(enum { genuine_accepted, declared_node, flipped_refused, tampered_refused, tampered_other_key, truncated_refused });
+
+var corpus_cache: ?InvoiceCorpus = null;
+
+fn corpusEntries() []const []const u8 {
+    if (corpus_cache == null) {
+        corpus_cache = .{};
+        _ = corpus_cache.?.build(std.heap.page_allocator) catch unreachable;
+    }
+    return corpus_cache.?.entries[0..corpus_cache.?.n];
+}
+
+test "fuzz driver: LNINVOICE_FUZZ (bolt11)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "LNINVOICE_FUZZ", .name = "lninvoice-bolt11-decode" });
+}
+
+test "fuzz harness: bolt11, 500 seeds, reaches every outcome" {
+    try InvMark.reach(fuzzDecode, "lninvoice-bolt11-decode", 500);
+}
+
+test "fuzz: a signed invoice decodes to its signer; damaged copies are refused" {
+    try testing.fuzz({}, fuzzSignSmith, .{});
+}
+
+test "fuzz driver: LNINVOICE_FUZZ (bolt11 sign)" {
+    // A run is a key derivation, a signature and several decodes (each a
+    // public-key recovery): share the budget with the parser harnesses.
+    try fz.fuzz_driver.run(fuzzSign, .{ .prefix = "LNINVOICE_FUZZ", .name = "lninvoice-bolt11-sign", .scale = 20 });
+}
+
+test "fuzz harness: bolt11 sign, 40 seeds, reaches every outcome" {
+    try SignMark.reach(fuzzSign, "lninvoice-bolt11-sign", 40);
+}
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzSignSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSign(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, allocator: Allocator) anyerror!void {
+    // ⚠ One `slice`, then the octets say what happens -- see `Script`. Under
+    // the driver's `Rng`, half the scripts are a corpus entry (the spelled-out
+    // BOLT#11 donation invoice among them) with 0-3 octets damaged.
     var script: [1024]u8 = undefined;
-    const n: usize = smith.slice(&script);
+    const n: usize = if (S == fz.fuzz_driver.Rng) fz.drawInput(S, src, &script, corpusEntries()) else src.slice(&script);
     const invoice = buildInvoice(allocator, script[0..n]) catch return;
     defer allocator.free(invoice);
 
-    var inv = decode(allocator, invoice) catch return;
+    var inv = decode(allocator, invoice) catch |e| {
+        switch (e) {
+            error.InvalidSignature, error.InvalidRecoveryId, error.HighSNotAllowed => InvMark.mark(.refused_signature),
+            else => InvMark.mark(.refused_structure),
+        }
+        return;
+    };
     defer inv.deinit(allocator);
+    InvMark.mark(.accepted);
+    switch (inv.verification) {
+        .recovered => InvMark.mark(.recovered),
+        .declared_node_id => {},
+    }
+}
+
+/// The oracle the parser harness cannot be. A random key signs a random
+/// invoice through this module's own `encode`; `decode` must accept it and
+/// return the signer's key, the amount and the fields. Then three damaged
+/// copies: one replaced character after the separator (bech32 detects every
+/// single-symbol error) and a truncation are refused; and a quintet of the
+/// SIGNED region replaced, with the checksum recomputed so the string stays
+/// well formed, is refused or -- when no node id is declared and it is
+/// accepted -- recovers a DIFFERENT key (the signature no longer vouches for
+/// the signer).
+fn fuzzSign(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
+    var privkey: [32]u8 = undefined;
+    src.bytes(&privkey);
+    const pub_point = k256.Secp256k1.combMulBase(privkey, .big) catch return;
+    const signer = pub_point.toCompressedSec1();
+
+    var payment_hash: [32]u8 = undefined;
+    var payment_secret: [32]u8 = undefined;
+    src.bytes(&payment_hash);
+    src.bytes(&payment_secret);
+    var desc: [40]u8 = undefined;
+    const desc_len = src.valueRangeAtMost(u8, 1, desc.len);
+    for (desc[0..desc_len]) |*c| c.* = src.valueRangeAtMost(u8, 'a', 'z');
+    var fields: [6]TaggedFieldOut = undefined;
+    var nf: usize = 0;
+    fields[nf] = .{ .payment_hash = payment_hash };
+    nf += 1;
+    fields[nf] = .{ .payment_secret = payment_secret };
+    nf += 1;
+    fields[nf] = .{ .description = desc[0..desc_len] };
+    nf += 1;
+    const declare = src.valueRangeAtMost(u8, 0, 3) == 0;
+    if (declare) {
+        fields[nf] = .{ .node_id = signer };
+        nf += 1;
+    }
+    const expiry = src.valueRangeAtMost(u16, 1, 60000);
+    if (src.value(bool)) {
+        fields[nf] = .{ .expiry_seconds = expiry };
+        nf += 1;
+    }
+    const amount: ?u64 = if (src.value(bool)) @as(u64, src.value(u32)) * 1000 else null;
+    const params: EncodeParams = .{
+        .network = src.value(Network),
+        .amount_msat = amount,
+        .timestamp = src.value(u32),
+        .fields = fields[0..nf],
+    };
+    const str = encode(gpa, params, .{ .private_key = &privkey }) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return,
+    };
+    defer gpa.free(str);
+
+    var inv = decode(gpa, str) catch return error.GenuineInvoiceRefused;
+    defer inv.deinit(gpa);
+    if (!std.mem.eql(u8, &inv.verified_pubkey, &signer)) return error.SignerNotRecovered;
+    if (inv.amount_msat != amount or !std.mem.eql(u8, &inv.payment_hash, &payment_hash)) return error.FieldsChanged;
+    if (!std.mem.eql(u8, inv.description.?, desc[0..desc_len])) return error.DescriptionChanged;
+    if (declare and inv.verification != .declared_node_id) return error.DeclaredNodeNotUsed;
+    SignMark.mark(.genuine_accepted);
+    if (declare) SignMark.mark(.declared_node);
+
+    // One replaced character after the separator.
+    const sep = std.mem.lastIndexOfScalar(u8, str, '1').?;
+    const copy = try gpa.dupe(u8, str);
+    defer gpa.free(copy);
+    const at = sep + 1 + src.index(str.len - sep - 1);
+    const cur = std.mem.indexOfScalar(u8, bech32raw.charset, copy[at]).?;
+    copy[at] = bech32raw.charset[(cur + 1 + src.index(bech32raw.charset.len - 1)) % bech32raw.charset.len];
+    if (decode(gpa, copy)) |d| {
+        var dd = d;
+        dd.deinit(gpa);
+        return error.FlippedInvoiceAccepted;
+    } else |_| {}
+    SignMark.mark(.flipped_refused);
+
+    // A truncation.
+    if (decode(gpa, str[0..src.index(str.len)])) |d| {
+        var dd = d;
+        dd.deinit(gpa);
+        return error.TruncatedInvoiceAccepted;
+    } else |_| {}
+    SignMark.mark(.truncated_refused);
+
+    // A quintet of the signed region replaced, checksum recomputed.
+    var raw = try bech32raw.decode(gpa, str);
+    defer raw.deinit(gpa);
+    const signed_len = raw.data.len - 104;
+    const q = src.index(signed_len);
+    raw.data[q] = @intCast((@as(u8, raw.data[q]) + 1 + src.index(31)) % 32);
+    const forged = try bech32raw.encode(gpa, raw.hrp, raw.data);
+    defer gpa.free(forged);
+    if (decode(gpa, forged)) |d| {
+        var dd = d;
+        defer dd.deinit(gpa);
+        if (std.mem.eql(u8, &dd.verified_pubkey, &signer)) return error.TamperedInvoiceStillVouchedBySigner;
+        SignMark.mark(.tampered_other_key);
+    } else |_| SignMark.mark(.tampered_refused);
 }
 
 test "corpus: every invoice script builds an invoice, and the data parts are pinned" {

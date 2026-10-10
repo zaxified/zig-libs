@@ -80,6 +80,7 @@ test {
     _ = @import("fido2_vectors.zig");
     _ = @import("oracle_test.zig");
     _ = @import("client_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 // ── fuzz: every parser of authenticator bytes, and the client on top ────────
@@ -98,38 +99,50 @@ const fuzz_platform_scalar: [32]u8 = .{ 0x47, 0xbb, 0xb5, 0x64, 0x78, 0xbe, 0x49
 ///   4 token response + decrypt under a fixed secret (both protocols)
 ///   5 framing.splitResponse   6 Client.getPinToken against a valid key
 ///     agreement followed by these bytes as the token response
-fn fuzzResponses(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const RespMark = fz.Marker(enum { getinfo_ok, key_agreement_ok, pin_retries_ok, uv_retries_ok, token_ok, token_decrypted, split_ok, client_token_ok, refused });
+const PinMark = fz.Marker(enum { token_roundtrip_p1, token_roundtrip_p2, short_ciphertext_refused, mac_differs_on_flip, wrong_secret_differs });
+
+fn fuzzResponsesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzResponses(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzResponses(comptime S: type, src: *S, a: std.mem.Allocator) anyerror!void {
     var script: [2048]u8 = undefined;
-    const n: usize = smith.slice(&script);
+    const n: usize = fz.drawInput(S, src, &script, &fuzz_seeds);
     if (n == 0) return;
     const sel = (script[0] & 0x7f) % 7;
     const body = script[1..n];
-    const a = std.testing.allocator;
 
     switch (sel) {
-        0 => _ = getinfo.parse(a, body) catch {},
+        0 => if (getinfo.parse(a, body)) |_| RespMark.mark(.getinfo_ok) else |_| RespMark.mark(.refused),
         1, 2, 3, 4 => {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const al = arena.allocator();
             switch (sel) {
-                1 => _ = clientpin.parseKeyAgreementResponse(al, body) catch {},
-                2 => _ = clientpin.parsePinRetriesResponse(al, body) catch {},
-                3 => _ = clientpin.parseUvRetriesResponse(al, body) catch {},
+                1 => if (clientpin.parseKeyAgreementResponse(al, body)) |_| RespMark.mark(.key_agreement_ok) else |_| RespMark.mark(.refused),
+                2 => if (clientpin.parsePinRetriesResponse(al, body)) |_| RespMark.mark(.pin_retries_ok) else |_| RespMark.mark(.refused),
+                3 => if (clientpin.parseUvRetriesResponse(al, body)) |_| RespMark.mark(.uv_retries_ok) else |_| RespMark.mark(.refused),
                 else => {
-                    const ct = clientpin.parseTokenResponse(al, body) catch return;
+                    const ct = clientpin.parseTokenResponse(al, body) catch {
+                        RespMark.mark(.refused);
+                        return;
+                    };
+                    RespMark.mark(.token_ok);
                     for ([_]ctap2pin.Protocol{ .one, .two }) |p| {
                         var s: clientpin.SharedSecret = .{ .protocol = p, .platform_key = undefined };
                         @memset(&s.bytes, 0x42);
                         if (s.decryptToken(ct)) |tok| {
                             var t = tok;
                             t.deinit();
+                            RespMark.mark(.token_decrypted);
                         } else |_| {}
                     }
                 },
             }
         },
-        5 => _ = framing.splitResponse(body) catch {},
+        5 => if (framing.splitResponse(body)) |_| RespMark.mark(.split_ok) else |_| RespMark.mark(.refused),
         else => {
             const auth_pub = try ctap2pin.publicKeyFromScalar(&[32]u8{ 0x4f, 0x4d, 0x86, 0xa2, 0xe5, 0x42, 0x3b, 0x2f, 0x3f, 0xf5, 0x75, 0x29, 0x16, 0x5e, 0xc6, 0xb6, 0xce, 0x75, 0x44, 0x58, 0x5b, 0xe1, 0x6e, 0x32, 0x42, 0xa6, 0x75, 0xbf, 0xb1, 0xeb, 0x68, 0x55 });
             const cose = [_]cbor.MapEntry{
@@ -151,8 +164,12 @@ fn fuzzResponses(_: void, smith: *std.testing.Smith) !void {
             var rnd: testutil.ScriptRandom = .{ .bytes = &scalars };
             const protocol: ctap2pin.Protocol = if (script[0] & 0x80 != 0) .two else .one;
             const c = clientpin.Client.init(a, tr.transport(), rnd.random(), protocol);
-            var t = c.getPinToken("1234") catch return;
+            var t = c.getPinToken("1234") catch {
+                RespMark.mark(.refused);
+                return;
+            };
             t.deinit();
+            RespMark.mark(.client_token_ok);
         },
     }
 }
@@ -164,12 +181,89 @@ const fuzz_seeds = [_][]const u8{
     testkit.fuzz.seed(&[_]u8{3} ++ fido2_vectors.cases[1].responses[0][1..]), // UV retries
     testkit.fuzz.seed(&[_]u8{4} ++ fido2_vectors.cases[5].responses[1][1..]), // token response
     testkit.fuzz.seed(&[_]u8{5} ++ fido2_vectors.cases[5].responses[1]), // whole message
-    testkit.fuzz.seed(&[_]u8{6} ++ fido2_vectors.cases[5].responses[1][1..]), // client, protocol One
-    testkit.fuzz.seed(&[_]u8{0x86} ++ fido2_vectors.cases[15].responses[1][1..]), // client, protocol Two
+    // Selector 6 hands the bytes over as a whole response MESSAGE (status byte first),
+    // like selector 5; with the status byte dropped these two seeds were refused at
+    // the status check, so the client path never reached its token decrypt.
+    testkit.fuzz.seed(&[_]u8{6} ++ fido2_vectors.cases[5].responses[1]), // client, protocol One
+    testkit.fuzz.seed(&[_]u8{0x86} ++ fido2_vectors.cases[15].responses[1]), // client, protocol Two
 };
 
 test "fuzz: authenticator responses never panic or leak" {
-    try std.testing.fuzz({}, fuzzResponses, .{ .corpus = &fuzz_seeds });
+    try std.testing.fuzz({}, fuzzResponsesSmith, .{ .corpus = &fuzz_seeds });
+}
+
+test "fuzz driver: CTAP2_FUZZ (responses)" {
+    try fz.fuzz_driver.run(fuzzResponses, .{ .prefix = "CTAP2_FUZZ", .name = "ctap2-responses" });
+}
+
+test "fuzz harness: responses, 500 seeds, reaches every outcome" {
+    try RespMark.reach(fuzzResponses, "ctap2-responses", 500);
+}
+
+test "fuzz: PIN token round trip and the MAC it authenticates with" {
+    try std.testing.fuzz({}, fuzzPinTokenSmith, .{});
+}
+
+test "fuzz driver: CTAP2_FUZZ (pin token)" {
+    try fz.fuzz_driver.run(fuzzPinToken, .{ .prefix = "CTAP2_FUZZ", .name = "ctap2-pintoken" });
+}
+
+test "fuzz harness: pin token, 200 seeds, reaches every outcome" {
+    try PinMark.reach(fuzzPinToken, "ctap2-pintoken", 200);
+}
+
+fn fuzzPinTokenSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPinToken(std.testing.Smith, smith, std.testing.allocator);
+}
+
+/// The crypto oracle for the token path: a token encrypted under a drawn
+/// shared secret (both protocols) decrypts to exactly itself; a ciphertext of
+/// the wrong length is refused; the token's `authenticate` MAC is
+/// deterministic, differs after one flipped bit of the message, and differs
+/// under another token. (AES-CBC carries no integrity of its own -- the
+/// authenticator's MAC does -- so a damaged ciphertext is not required to be
+/// refused, only never to decrypt to the original.)
+fn fuzzPinToken(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    for ([_]ctap2pin.Protocol{ .one, .two }) |p| {
+        var sec: clientpin.SharedSecret = .{ .protocol = p, .platform_key = undefined };
+        src.bytes(&sec.bytes);
+        var plain: [32]u8 = undefined;
+        src.bytes(&plain);
+        const tok_len: usize = if (p == .one and src.value(bool)) 16 else 32;
+        var iv_seed: [64]u8 = undefined;
+        src.bytes(&iv_seed);
+        var rnd: testutil.ScriptRandom = .{ .bytes = &iv_seed };
+        var ct: [48]u8 = undefined;
+        const ct_len = sec.encryptedLen(tok_len);
+        try sec.encrypt(rnd.random(), ct[0..ct_len], plain[0..tok_len]);
+        var tok = try sec.decryptToken(ct[0..ct_len]);
+        defer tok.deinit();
+        if (!std.mem.eql(u8, tok.slice(), plain[0..tok_len])) return error.TokenRoundtripChanged;
+        if (p == .one) PinMark.mark(.token_roundtrip_p1) else PinMark.mark(.token_roundtrip_p2);
+
+        if (ct_len > 1) if (sec.decryptToken(ct[0 .. ct_len - 1])) |t2| {
+            var t = t2;
+            t.deinit();
+            return error.ShortCiphertextAccepted;
+        } else |_| PinMark.mark(.short_ciphertext_refused);
+
+        var msg: [40]u8 = undefined;
+        const mlen = src.valueRangeAtMost(u8, 1, msg.len);
+        src.bytes(&msg);
+        const m1 = tok.authenticate(msg[0..mlen]);
+        const m1b = tok.authenticate(msg[0..mlen]);
+        if (!std.mem.eql(u8, m1.slice(), m1b.slice())) return error.MacNotDeterministic;
+        var flipped = msg;
+        flipped[src.index(mlen)] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
+        const m2 = tok.authenticate(flipped[0..mlen]);
+        if (std.mem.eql(u8, m1.slice(), m2.slice())) return error.FlippedMessageSameMac;
+        PinMark.mark(.mac_differs_on_flip);
+        var other = tok;
+        other.bytes[src.index(tok_len)] ^= 1;
+        const m3 = other.authenticate(msg[0..mlen]);
+        if (std.mem.eql(u8, m1.slice(), m3.slice())) return error.OtherTokenSameMac;
+        PinMark.mark(.wrong_secret_differs);
+    }
 }
 
 test "corpus: each fuzz seed reaches its selector's accept path" {

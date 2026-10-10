@@ -728,3 +728,193 @@ test "Channel.open: another client's INIT response on the broadcast channel is s
     const ch = try Channel.open(hid.dev(), .{ 1, 2, 3, 4, 5, 6, 7, 8 });
     try testing.expectEqual(hid.cid, ch.cid);
 }
+
+// ── fuzz: a hostile authenticator on the HID side ───────────────────────────
+
+const fz = @import("fuzz_test.zig");
+const HidMark = fz.Marker(enum {
+    roundtrip,
+    roundtrip_noise,
+    damaged_error,
+    damaged_complete,
+    damaged_incomplete,
+    unknown_command,
+    init_ok,
+    init_refused,
+    channel_ok,
+    channel_keepalive,
+    channel_hid_error,
+    channel_refused,
+});
+
+test "fuzz driver: CTAP2_FUZZ (ctaphid)" {
+    try fz.fuzz_driver.run(fuzzHid, .{ .prefix = "CTAP2_FUZZ", .name = "ctap2-ctaphid" });
+}
+
+test "fuzz harness: ctaphid, 300 seeds, reaches every outcome" {
+    try HidMark.reach(fuzzHid, "ctap2-ctaphid", 300);
+}
+
+test "fuzz: ctaphid assembler and channel survive a damaged report stream" {
+    try testing.fuzz({}, fuzzHidSmith, .{});
+}
+
+fn fuzzHidSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzHid(std.testing.Smith, smith, testing.allocator);
+}
+
+/// A scripted report device: serves `reads` in order (then a transport
+/// failure), records what the channel wrote.
+const FakeDevice = struct {
+    reads: []const Packet,
+    ri: usize = 0,
+    written: [16]Packet = undefined,
+    nw: usize = 0,
+
+    fn dev(self: *FakeDevice) ReportDevice {
+        return .{ .ctx = self, .writeFn = write, .readFn = read };
+    }
+    fn write(ctx: *anyopaque, report: *const Packet) framing.TransportError!void {
+        const self: *FakeDevice = @ptrCast(@alignCast(ctx));
+        if (self.nw == self.written.len) return error.TransportFailed;
+        self.written[self.nw] = report.*;
+        self.nw += 1;
+    }
+    fn read(ctx: *anyopaque, report: *Packet) framing.TransportError!void {
+        const self: *FakeDevice = @ptrCast(@alignCast(ctx));
+        if (self.ri >= self.reads.len) return error.TransportFailed;
+        report.* = self.reads[self.ri];
+        self.ri += 1;
+    }
+};
+
+/// Encode `payload` as `cmd` on `cid` and append the reports.
+fn pushMessage(list: *std.ArrayList(Packet), gpa: std.mem.Allocator, cid: u32, cmd: Command, payload: []const u8) !void {
+    var enc = try Encoder.init(cid, cmd, payload);
+    var pkt: Packet = undefined;
+    while (enc.next(&pkt)) try list.append(gpa, pkt);
+}
+
+fn fuzzHid(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const our_cid: u32 = src.value(u32) | 1;
+    var payload: [400]u8 = undefined;
+    const plen = src.valueRangeAtMost(u16, 0, payload.len);
+    src.bytes(&payload);
+    const body = payload[0..plen];
+    const raw_cmd = src.valueRangeAtMost(u8, 0, 0x7f);
+    const cmd: Command = @enumFromInt(raw_cmd);
+    switch (cmd) {
+        .ping, .msg, .lock, .init, .wink, .cbor, .cancel, .keepalive, .@"error" => {},
+        _ => HidMark.mark(.unknown_command),
+    }
+
+    // (1) Assembler: the genuine report stream comes back as the message, with
+    // reports of other channels interleaved; then one damaged copy.
+    var pkts: std.ArrayList(Packet) = .empty;
+    defer pkts.deinit(gpa);
+    try pushMessage(&pkts, gpa, our_cid, cmd, body);
+    var buf: [max_payload]u8 = undefined;
+    {
+        var a = Assembler.init(our_cid, &buf);
+        var got: ?Message = null;
+        var noise = false;
+        for (pkts.items) |*pk| {
+            if (src.valueRangeAtMost(u8, 0, 3) == 0) {
+                var other: Packet = pk.*;
+                std.mem.writeInt(u32, other[0..4], our_cid ^ 0x8000_0000, .big);
+                if ((try a.feed(&other)) != .other_channel) return error.OtherChannelNotIgnored;
+                noise = true;
+            }
+            switch (try a.feed(pk)) {
+                .complete => |m| got = m,
+                .incomplete => {},
+                .other_channel => return error.OwnChannelIgnored,
+            }
+        }
+        const m = got orelse return error.GenuineMessageNotAssembled;
+        if (m.cmd != cmd or m.cid != our_cid or !std.mem.eql(u8, m.payload, body)) return error.GenuineMessageChanged;
+        if (noise) HidMark.mark(.roundtrip_noise) else HidMark.mark(.roundtrip);
+    }
+    {
+        var a = Assembler.init(our_cid, &buf);
+        const victim = src.index(pkts.items.len);
+        for (pkts.items, 0..) |*pk, i| {
+            var use: Packet = pk.*;
+            if (i == victim) {
+                var dmg: Packet = undefined;
+                const n = fz.damage(src, &dmg, pk);
+                @memcpy(use[0..n], dmg[0..n]);
+                if (n < use.len and src.value(bool)) @memset(use[n..], 0);
+            }
+            if (a.feed(&use)) |f| switch (f) {
+                .complete => HidMark.mark(.damaged_complete),
+                .incomplete => HidMark.mark(.damaged_incomplete),
+                .other_channel => {},
+            } else |_| {
+                HidMark.mark(.damaged_error);
+                // `active` is what gates the next report; the counters of a
+                // finished message stay behind until the next init report
+                // overwrites them (an error with nothing in progress resets nothing).
+                if (a.active) return error.AssemblerStillActiveAfterError;
+                break;
+            }
+            if (a.have > a.want or a.want > buf.len) return error.AssemblerCountsOutOfRange;
+        }
+    }
+
+    // (2) CTAPHID_INIT response parse: genuine accepted, wrong nonce / short refused.
+    var nonce: [8]u8 = undefined;
+    src.bytes(&nonce);
+    var init_payload: [17]u8 = undefined;
+    @memcpy(init_payload[0..8], &nonce);
+    src.bytes(init_payload[8..]);
+    if (parseInitResponse(&init_payload, nonce)) |_| HidMark.mark(.init_ok) else |_| return error.GenuineInitRefused;
+    var bad = init_payload;
+    bad[src.index(8)] ^= 1;
+    if (parseInitResponse(&bad, nonce)) |_| return error.WrongNonceAccepted else |_| {}
+    if (parseInitResponse(init_payload[0..src.index(17)], nonce)) |_| return error.ShortInitAccepted else |_| HidMark.mark(.init_refused);
+
+    // (3) Channel: INIT on the broadcast channel then one CBOR exchange, the
+    // device's reports woven from keepalives, other-channel noise and the
+    // answer; optionally one report damaged.
+    var reads: std.ArrayList(Packet) = .empty;
+    defer reads.deinit(gpa);
+    var init_resp: [17]u8 = undefined;
+    @memcpy(init_resp[0..8], &nonce);
+    std.mem.writeInt(u32, init_resp[8..12], our_cid, .big);
+    init_resp[12] = 2;
+    init_resp[13] = 1;
+    init_resp[14] = 0;
+    init_resp[15] = 0;
+    init_resp[16] = InitResponse.cap_cbor;
+    try pushMessage(&reads, gpa, broadcast_cid, .init, &init_resp);
+    const keepalives = src.valueRangeAtMost(u8, 0, 3);
+    for (0..keepalives) |_| try pushMessage(&reads, gpa, our_cid, .keepalive, &.{1});
+    if (src.value(bool)) try pushMessage(&reads, gpa, our_cid ^ 0x100, .cbor, "someone else");
+    const hid_err = src.valueRangeAtMost(u8, 0, 9) == 0;
+    if (hid_err) try pushMessage(&reads, gpa, our_cid, .@"error", &.{0x06}) else try pushMessage(&reads, gpa, our_cid, .cbor, body);
+    const damage_at: ?usize = if (src.valueRangeAtMost(u8, 0, 2) == 0) src.index(reads.items.len) else null;
+    if (damage_at) |at| {
+        var dmg: Packet = undefined;
+        const n = fz.damage(src, &dmg, &reads.items[at]);
+        @memcpy(reads.items[at][0..n], dmg[0..n]);
+    }
+    var fd: FakeDevice = .{ .reads = reads.items };
+    var ch = Channel.open(fd.dev(), nonce) catch {
+        HidMark.mark(.channel_refused);
+        if (damage_at == null) return error.GenuineChannelOpenRefused;
+        return;
+    };
+    var resp: [max_payload]u8 = undefined;
+    if (ch.transact(&.{ 0x06, 0xa0 }, &resp)) |n| {
+        if (damage_at == null) {
+            if (hid_err) return error.HidErrorNotReported;
+            if (!std.mem.eql(u8, resp[0..n], body)) return error.GenuineResponseChanged;
+            HidMark.mark(.channel_ok);
+            if (keepalives != 0) HidMark.mark(.channel_keepalive);
+        }
+    } else |_| {
+        if (ch.last_hid_error != null) HidMark.mark(.channel_hid_error) else if (damage_at != null) HidMark.mark(.channel_refused);
+        if (damage_at == null and !hid_err) return error.GenuineExchangeFailed;
+    }
+}

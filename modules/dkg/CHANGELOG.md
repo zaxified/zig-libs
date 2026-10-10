@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `DKG_FUZZ` (dkg now has `testkit` in `test_deps`; the local seed copies in `types.zig` are kept): `dkg-pedersen-decode`, `dkg-feldman-decode`, `dkg-sharemsg-decode` (corpus frame / genuine message with 0-3 octets damaged; what decodes re-encodes to the same octets), `dkg-participant-handle` and `dkg-reshare-receiver-handle` (captured real frames of every round, damaged, into a party brought to that round; a refused frame leaves the phase where it was; the party stays drivable). The two handlers run at their scale (5,000 of the 200,000 budget). No source change.
 - **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** follows `threshold_ecdsa.messagePublicKey` taking its seed by pointer (internal call site in `assembleKeyShares`).
 
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region

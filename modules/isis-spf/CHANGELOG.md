@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `ISIS_SPF_FUZZ`: `isis-spf-compute` (hostile TLV regions spliced into stamped LSPs, then both `compute` entry points) and a new `isis-spf-model` oracle (random two-way graphs of up to 6 systems through the real LSDB; the table equals a Floyd-Warshall matrix over mutually advertised arcs below the max link metric, each direction at its own metric, and every next hop lies on a shortest path). No source change.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: §6 no longer says `spf-ect` must not be modified; the overload-bit item waits on `spf-ect`'s transit-exclusion hook (Backlog).
 - **2026-09-30** — **Added: LAN transit through pseudonodes.** A pseudonode LSP
   (LSP-ID octet 6 ≠ 0) and member advertisements toward a pseudonode used to be

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-08 · mutation 2026-10-08 (38/39, 1 eq) · src 03a554e37047d716
 
-**Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean (`frost-protocol` at its scale, 1,000), FROST_FUZZ) · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 

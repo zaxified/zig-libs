@@ -187,8 +187,104 @@ const insert_seeds = [_][]const u8{
     seed(""), // the empty buffer
 };
 
+const fz = @import("fuzz_test.zig");
+const InsertMark = fz.Marker(enum { stored, ignored, refused, corrupted, local, received });
+const SnpMark = fz.Marker(enum { csnp, psnp, seeded, entries, placeholders, summarised });
+const SeqMark = fz.Marker(enum { stored, older_ignored, damaged_refused, self_challenge });
+
 test "fuzz: insert on hostile bytes never panics; a rejected LSP leaves the store unchanged" {
-    try std.testing.fuzz({}, fuzzInsert, .{ .corpus = &insert_seeds });
+    try std.testing.fuzz({}, fuzzInsertSmith, .{ .corpus = &insert_seeds });
+}
+
+test "fuzz driver: ISIS_LSDB_FUZZ (insert)" {
+    try fz.fuzz_driver.run(fuzzInsert, .{ .prefix = "ISIS_LSDB_FUZZ", .name = "isis-lsdb-insert" });
+}
+
+test "fuzz harness: insert, 500 seeds, reaches every outcome" {
+    try InsertMark.reach(fuzzInsert, "isis-lsdb-insert", 500);
+}
+
+test "fuzz driver: ISIS_LSDB_FUZZ (snp)" {
+    try fz.fuzz_driver.run(fuzzSnp, .{ .prefix = "ISIS_LSDB_FUZZ", .name = "isis-lsdb-snp" });
+}
+
+test "fuzz harness: snp, 500 seeds, reaches every outcome" {
+    try SnpMark.reach(fuzzSnp, "isis-lsdb-snp", 500);
+}
+
+test "fuzz: a model of the update process, with genuine and damaged LSPs" {
+    try std.testing.fuzz({}, fuzzSequenceSmith, .{});
+}
+
+test "fuzz driver: ISIS_LSDB_FUZZ (sequence)" {
+    try fz.fuzz_driver.run(fuzzSequence, .{ .prefix = "ISIS_LSDB_FUZZ", .name = "isis-lsdb-sequence" });
+}
+
+test "fuzz harness: sequence, 300 seeds, reaches every outcome" {
+    try SeqMark.reach(fuzzSequence, "isis-lsdb-sequence", 300);
+}
+
+fn fuzzInsertSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzInsert(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzSnpSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSnp(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzSequenceSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSequence(std.testing.Smith, smith, testing.allocator);
+}
+
+/// The update process against a model, over LSPs this module's own builder
+/// stamped (so the §7.3.14.2 checksum gate is passed): a strictly higher
+/// sequence number is stored, an equal or lower one is not; a copy with one
+/// bit flipped in the checksummed region is refused and changes nothing; a
+/// received LSP naming us is never stored (it is a challenge).
+fn fuzzSequence(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var db = Lsdb.init(gpa, .{ .local_system_id = sys_a, .interface_count = 2, .capacity = 32 });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    const rounds = src.valueRangeAtMost(u8, 1, 24);
+    for (0..rounds) |_| {
+        const which = src.valueRangeAtMost(u8, 0, 4);
+        const lsp_num = src.valueRangeAtMost(u8, 0, 3);
+        const seq: u32 = src.valueRangeAtMost(u8, 1, 12);
+        const sys: [6]u8 = if (which == 4) sys_a else .{ 0, 0, 0, 0, 0, 0xC0 + which };
+        const wire = buildLsp(&buf, sys, lsp_num, seq, 1000);
+        if (src.valueRangeAtMost(u8, 0, 5) == 0) {
+            // One flipped bit inside the checksummed region.
+            const at = isis.pdu.lsp_checksum_base + src.index(wire.len - isis.pdu.lsp_checksum_base);
+            buf[at] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
+            const before = db.count();
+            if (db.insert(wire, 0, 1)) |r| {
+                if (r.stored) return error.DamagedLspStored;
+            } else |_| {}
+            try testing.expectEqual(before, db.count());
+            SeqMark.mark(.damaged_refused);
+            continue;
+        }
+        const id: LspId = .{ sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], 0, lsp_num };
+        const prior: u32 = if (db.get(id, 1)) |v| v.sequence_number else 0;
+        const r = db.insert(wire, 0, 1) catch |e| switch (e) {
+            error.DatabaseFull => continue,
+            else => return e,
+        };
+        if (which == 4) {
+            if (r.stored) return error.OwnLspStoredFromPeer;
+            if (r.self_challenge != null) SeqMark.mark(.self_challenge);
+            continue;
+        }
+        const held = db.get(id, 1) orelse return error.StoredLspMissing;
+        if (r.stored != (seq > prior)) return error.UpdateProcessDisagreesWithModel;
+        if (r.stored) {
+            SeqMark.mark(.stored);
+            if (held.sequence_number != seq) return error.StoredWrongSequence;
+        } else {
+            SeqMark.mark(.older_ignored);
+            if (held.sequence_number != prior) return error.IgnoredLspChangedStore;
+        }
+    }
 }
 
 /// Stamps a modeled L1 LSP header over the front of `buf`, so a buffer of
@@ -233,12 +329,18 @@ fn driveInsert(db: *Lsdb, input: []const u8) !InsertTally {
 
         for ([_]?u8{ null, 0 }) |arrival| {
             const before = db.count();
-            if (db.insert(bytes, arrival, 1)) |_| {
+            if (db.insert(bytes, arrival, 1)) |r| {
                 // Accepted, ignored, or refused — all leave a coherent store.
                 if (arrival == null) tally.local += 1 else tally.received += 1;
-            } else |_| {
+                if (arrival == null) InsertMark.mark(.local) else InsertMark.mark(.received);
+                if (r.stored) InsertMark.mark(.stored) else InsertMark.mark(.ignored);
+            } else |e| {
                 // A decode error (or DatabaseFull) must be inert w.r.t. membership.
                 try testing.expectEqual(before, db.count());
+                switch (e) {
+                    error.CorruptedLsp => InsertMark.mark(.corrupted),
+                    else => InsertMark.mark(.refused),
+                }
             }
         }
     }
@@ -249,8 +351,8 @@ fn driveInsert(db: *Lsdb, input: []const u8) !InsertTally {
 /// side of the §7.3.14.2 checksum gate they were on.
 const InsertTally = struct { local: usize = 0, received: usize = 0 };
 
-fn fuzzInsert(_: void, smith: *std.testing.Smith) !void {
-    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_a, .interface_count = 2, .capacity = 32 });
+fn fuzzInsert(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var db = Lsdb.init(gpa, .{ .local_system_id = sys_a, .interface_count = 2, .capacity = 32 });
     defer db.deinit();
 
     var buf: [128]u8 = undefined;
@@ -259,7 +361,7 @@ fn fuzzInsert(_: void, smith: *std.testing.Smith) !void {
     // then finds fewer than the eight it needs and returns the range MINIMUM —
     // so `len` was 0 on every input a seed can carry and `insert` was handed an
     // empty slice, which `header.decode` refuses on its first line.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &insert_seeds);
     _ = try driveInsert(&db, buf[0..len]);
 }
 
@@ -304,7 +406,7 @@ test "corpus: every insert seed reaches the store, and the counts are pinned" {
 // range, the LSP-Entry records, and a tail of arbitrary octets in the TLV
 // region — and puts them through the wire codec before the store sees them.
 test "fuzz: hostile CSNP/PSNP bytes never panic, and never grow the store past capacity" {
-    try std.testing.fuzz({}, fuzzSnp, .{ .corpus = &snp_seeds });
+    try std.testing.fuzz({}, fuzzSnpSmith, .{ .corpus = &snp_seeds });
 }
 
 const fuzz_capacity: usize = 16;
@@ -454,8 +556,8 @@ fn driveSnp(db: *Lsdb, cur: *testkit.fuzz.Cursor) !SnpTally {
     return tally;
 }
 
-fn fuzzSnp(_: void, smith: *std.testing.Smith) !void {
-    var db = Lsdb.init(testing.allocator, .{
+fn fuzzSnp(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var db = Lsdb.init(gpa, .{
         .local_system_id = sys_a,
         .interface_count = 2,
         .capacity = fuzz_capacity,
@@ -463,9 +565,16 @@ fn fuzzSnp(_: void, smith: *std.testing.Smith) !void {
     defer db.deinit();
 
     var script: [256]u8 = undefined;
-    const n: usize = smith.slice(&script);
+    // Under the driver's `Rng` the script is random octets: every choice is a
+    // Cursor read, so any byte string is a valid script.
+    const n: usize = src.slice(&script);
     var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..n] };
-    _ = try driveSnp(&db, &cur);
+    const t = try driveSnp(&db, &cur);
+    if (t.csnp == 1) SnpMark.mark(.csnp) else SnpMark.mark(.psnp);
+    if (t.seeded != 0) SnpMark.mark(.seeded);
+    if (t.entries != 0) SnpMark.mark(.entries);
+    if (t.placeholders != 0) SnpMark.mark(.placeholders);
+    if (t.summarised != 0) SnpMark.mark(.summarised);
 }
 
 /// Scripts for `driveSnp`, read octet by octet (a short one cycles). The first
@@ -549,4 +658,5 @@ test {
     _ = @import("store.zig");
     _ = @import("goldens.zig");
     _ = @import("bench.zig");
+    _ = @import("fuzz_test.zig");
 }

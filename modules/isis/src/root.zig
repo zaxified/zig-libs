@@ -108,6 +108,7 @@ test {
     _ = @import("spb.zig");
     _ = @import("checksum.zig");
     _ = @import("goldens.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta is well-formed" {
@@ -142,7 +143,7 @@ test "fuzz: PDU/TLV decode never panics/OOBs/over-allocates on hostile bytes" {
     // l2encap / icmp). The decoder reads straight off an untrusted link, so this
     // drives arbitrary bytes and asserts only: never panics, every walk
     // terminates, and any value slice lies strictly within the input.
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
 /// `sub` must lie entirely inside `input`. Checked as an offset and a length,
@@ -359,18 +360,28 @@ const decode_seeds = [_][]const u8{
     seed(""), // the empty buffer
 };
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const DecodeMark = fz.Marker(enum { refused, lan_hello, p2p_hello, lsp, csnp, psnp, other, tlv_region, biased, carried_bad, carried_not_present, stamped_good, flipped_not_good });
+
+test "fuzz driver: ISIS_FUZZ (decode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "ISIS_FUZZ", .name = "isis-decode" });
+}
+
+test "fuzz harness: decode, 500 seeds, reaches every outcome" {
+    try DecodeMark.reach(fuzzDecode, "isis-decode", 500);
+}
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var buf: [512]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
-    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
-    // then finds fewer than the eight it needs and returns the range MINIMUM —
-    // so `len` was 0 on every input a seed can carry, and `walkTlvs` and
-    // `decode` were both handed an empty slice. Everything the TEETH test below
-    // proves about `biasToModeledPdu` was true and unreachable at the same time:
-    // the `smith.value(bool)` guarding it was drawn AFTER the exhausted input,
-    // so it was false and the bias never ran once outside `--fuzz`.
-    const len: usize = smith.slice(&buf);
-    driveInput(buf[0..len]);
+    // ⚠ One `slice` call, never `bytes` followed by a ranged length (see the
+    // history above: the ranged draw then answers its minimum). Under the
+    // driver's `Rng` half the draws are a corpus entry with 0-3 octets damaged.
+    const len: usize = fz.drawInput(S, src, &buf, &decode_seeds);
+    try driveInput(buf[0..len]);
 
     // The bias, as a second arm rather than a coin flip: a copy of the same
     // bytes with a modeled header stamped over the front, so the corpus
@@ -378,18 +389,29 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var biased: [512]u8 = undefined;
     @memcpy(biased[0..len], buf[0..len]);
     var cur: testkit.fuzz.Cursor = .{ .bytes = buf[0..len] };
-    if (len >= 8) _ = biasToModeledPdu(biased[0..len], len, &cur);
-    driveInput(biased[0..len]);
+    if (len >= 8 and biasToModeledPdu(biased[0..len], len, &cur)) DecodeMark.mark(.biased);
+    try driveInput(biased[0..len]);
 }
 
 /// Everything the harness asserts about one buffer of untrusted octets.
-fn driveInput(input: []const u8) void {
+fn driveInput(input: []const u8) !void {
     // The raw TLV walk over the whole buffer must always be safe.
     walkTlvs(input, input);
 
     // The dispatch decoder must never panic; on success, the body's TLV region
     // is walked (already bounded) and its sub-TLVs, all within the input.
-    const p = decode(input) catch return;
+    const p = decode(input) catch {
+        DecodeMark.mark(.refused);
+        return;
+    };
+    switch (p) {
+        .lan_hello => DecodeMark.mark(.lan_hello),
+        .p2p_hello => DecodeMark.mark(.p2p_hello),
+        .lsp => DecodeMark.mark(.lsp),
+        .csnp => DecodeMark.mark(.csnp),
+        .psnp => DecodeMark.mark(.psnp),
+        .other => DecodeMark.mark(.other),
+    }
     const region: []const u8 = switch (p) {
         .lan_hello => |x| x.tlv_bytes,
         .p2p_hello => |x| x.tlv_bytes,
@@ -398,13 +420,31 @@ fn driveInput(input: []const u8) void {
         .psnp => |x| x.tlv_bytes,
         .other => return,
     };
+    if (region.len != 0) DecodeMark.mark(.tlv_region);
     // The LSP checksum surface reads the SAME untrusted bytes, and
     // `isis-lsdb` calls `checkLspChecksum` on them straight off the wire.
-    // It was never driven from here: 210 lines added on the untrusted path
-    // with no fuzz coverage at all.
     if (p == .lsp) {
         _ = pdu.computeLspChecksum(input) catch {};
-        _ = pdu.checkLspChecksum(input) catch {};
+        const carried = pdu.checkLspChecksum(input) catch pdu.ChecksumStatus.bad;
+        if (carried == .bad) DecodeMark.mark(.carried_bad);
+        if (carried == .not_present) DecodeMark.mark(.carried_not_present);
+
+        // Oracle: a stamped LSP grades good, and one flipped bit anywhere in
+        // the checksummed region (lifetime is outside it) grades not-good.
+        var copy: [512]u8 = undefined;
+        const total = p.lsp.pdu_length;
+        @memcpy(copy[0..total], input[0..total]);
+        _ = try pdu.stampLspChecksum(copy[0..total]);
+        if ((try pdu.checkLspChecksum(copy[0..total])) != .good) return error.StampedLspNotGood;
+        DecodeMark.mark(.stamped_good);
+        var h = std.hash.Wyhash.init(0);
+        h.update(input);
+        const r = h.final();
+        const at = pdu.lsp_checksum_base + r % (total - pdu.lsp_checksum_base);
+        copy[at] ^= @as(u8, 1) << @intCast((r >> 32) & 7);
+        const st = try pdu.checkLspChecksum(copy[0..total]);
+        if (st == .good) return error.FlippedLspGood;
+        DecodeMark.mark(.flipped_not_good);
     }
     walkTlvs(region, input);
 }

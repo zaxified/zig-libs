@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `PPING_FUZZ`: `pping-tcp-options` (checked against an independent reading of the option grammar; a genuine Timestamps option behind NOPs/MSS is found with its exact values, behind END it is not), `pping-ip-echo` (a genuine IPv4/IPv6 Echo packet decodes to its identifier, sequence, kind and addresses) and a new `pping-estimator` stream harness (bounded tables, first echo consumed once, sample fields and RTT bounds against a send-time model, genuine round trip yields exactly its RTT, a clock stepping backwards never panics, echo/TCP mixing refused). No source change.
 - **2026-10-06** — ADDED: ICMP / ICMPv6 Echo RTT. `parseIpEcho` (IPv4 or IPv6
   packet, extension-header walk capped at 8, typed `EchoParseError`) and
   `parseIcmpEcho` decode Echo Request/Reply (types 8/0, 128/129);

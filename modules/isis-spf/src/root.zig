@@ -1939,22 +1939,131 @@ fn driveSpf(gpa: std.mem.Allocator, input: []const u8) !usize {
     return routes;
 }
 
-fn fuzzComputeOverLsdb(_: void, smith: *testing.Smith) anyerror!void {
-    var input_buf: [512]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
-    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
-    // then finds fewer than the eight it needs and returns the range MINIMUM —
-    // so the region was ZERO octets long on every input a seed can carry. Both
-    // LSPs were built with an empty TLV region, the graph had no edges, and the
-    // SPF this harness exists to fuzz ran over nothing. The buffer is also
-    // raised 256 → 512, to match the region size the module's own
-    // `insertReachLsp` fixtures build into.
-    const len: usize = smith.slice(&input_buf);
-    _ = try driveSpf(testing.allocator, input_buf[0..len]);
+const fz = @import("fuzz_test.zig");
+const ComputeMark = fz.Marker(enum { empty, edges, self_only, front_door_stored });
+const ModelMark = fz.Marker(enum { reachable_agrees, unreachable_agrees, one_way_dropped, max_metric_dropped, multi_hop });
+
+fn fuzzComputeOverLsdbSmith(_: void, smith: *testing.Smith) anyerror!void {
+    try fuzzComputeOverLsdb(testing.Smith, smith, testing.allocator);
 }
 
-test "fuzz: SPF over an LSDB fed arbitrary bytes never panics" {
-    try testing.fuzz({}, fuzzComputeOverLsdb, .{ .corpus = &spf_seeds });
+fn fuzzModelSmith(_: void, smith: *testing.Smith) anyerror!void {
+    try fuzzModel(testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzComputeOverLsdb(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var input_buf: [512]u8 = undefined;
+    // ⚠ One `slice` call, never `bytes` followed by a ranged length. `bytes`
+    // takes `@min(buf.len, in.len)` octets and the ranged draw then finds fewer
+    // than the eight it needs and returns the range MINIMUM -- so the region
+    // was ZERO octets long on every input a seed can carry. The buffer is also
+    // raised 256 -> 512, to match the region size the module's own
+    // `insertReachLsp` fixtures build into. Under the driver's `Rng`, half the
+    // draws are a corpus entry with 0-3 octets damaged.
+    const len: usize = fz.drawInput(S, src, &input_buf, &spf_seeds);
+    if (len == 0) ComputeMark.mark(.empty);
+    const n = try driveSpf(gpa, input_buf[0..len]);
+    if (n > 1) ComputeMark.mark(.edges) else ComputeMark.mark(.self_only);
+    if (n == 0) return;
+    ComputeMark.mark(.front_door_stored);
+}
+
+test "fuzz driver: ISIS_SPF_FUZZ (compute)" {
+    try fz.fuzz_driver.run(fuzzComputeOverLsdb, .{ .prefix = "ISIS_SPF_FUZZ", .name = "isis-spf-compute" });
+}
+
+test "fuzz harness: compute, 500 seeds, reaches every outcome" {
+    try ComputeMark.reach(fuzzComputeOverLsdb, "isis-spf-compute", 500);
+}
+
+test "fuzz: SPF against a Floyd-Warshall model on random two-way graphs" {
+    try testing.fuzz({}, fuzzModelSmith, .{});
+}
+
+test "fuzz driver: ISIS_SPF_FUZZ (model)" {
+    try fz.fuzz_driver.run(fuzzModel, .{ .prefix = "ISIS_SPF_FUZZ", .name = "isis-spf-model" });
+}
+
+test "fuzz harness: model, 300 seeds, reaches every outcome" {
+    try ModelMark.reach(fuzzModel, "isis-spf-model", 300);
+}
+
+/// The oracle the byte-feeding harness cannot be: a random topology of up to 6
+/// systems, each directed adjacency advertised (or not) at its own metric,
+/// goes through the real LSDB and `compute`; the table must equal a
+/// Floyd-Warshall shortest-path matrix over the arcs both ends advertise
+/// (the two-way check) below the RFC 5305 max-link-metric, each direction at
+/// its own metric, and every next hop must lie on a shortest path.
+fn fuzzModel(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [96]u8 = undefined;
+    const raw_len: usize = src.slice(&raw);
+    var cur: @import("testkit").fuzz.Cursor = .{ .bytes = raw[0..raw_len] };
+    const n: usize = cur.ranged(2, 6);
+    const inf: u64 = std.math.maxInt(u64) / 4;
+    var adv: [6][6]u32 = undefined; // advertised metric u->v, 0 = not advertised
+    for (0..n) |u| for (0..n) |v| {
+        adv[u][v] = 0;
+        if (u == v) continue;
+        const m = cur.byte();
+        if (m < 80) continue;
+        adv[u][v] = if (m == 255) 0xFFFFFF else 1 + @as(u32, (m - 80) % 20);
+    };
+
+    var db = lsdb.Lsdb.init(gpa, cfgFor(sysId(1)));
+    defer db.deinit();
+    for (0..n) |u| {
+        var buf: [512]u8 = undefined;
+        const origin = sysId(@intCast(u + 1));
+        var lb = try isis.pdu.LspBuilder.init(&buf, .{
+            .remaining_lifetime = 1000,
+            .lsp_id = .{ origin[0], origin[1], origin[2], origin[3], origin[4], origin[5], 0, 0 },
+            .sequence_number = 1,
+            .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+        });
+        for (0..n) |v| if (adv[u][v] != 0) {
+            const nbr7: [7]u8 = .{ 0, 0, 0, 0, 0, @intCast(v + 1), 0 };
+            try isis.tlvs.addExtendedIsReach(&lb.tlvs, nbr7, @intCast(adv[u][v]), &.{});
+        };
+        _ = try db.insert(lb.finish(), null, 0);
+    }
+
+    // The model: an arc u->v exists iff both ends advertise and neither is at
+    // the max link metric; it costs u's advertised metric.
+    var d: [6][6]u64 = undefined;
+    for (0..n) |u| for (0..n) |v| {
+        d[u][v] = if (u == v) 0 else inf;
+        if (u == v or adv[u][v] == 0 or adv[v][u] == 0) {
+            if (u != v and (adv[u][v] != 0) != (adv[v][u] != 0)) ModelMark.mark(.one_way_dropped);
+            continue;
+        }
+        if (adv[u][v] == 0xFFFFFF or adv[v][u] == 0xFFFFFF) {
+            ModelMark.mark(.max_metric_dropped);
+            continue;
+        }
+        d[u][v] = adv[u][v];
+    };
+    for (0..n) |k| for (0..n) |i| for (0..n) |j| {
+        if (d[i][k] + d[k][j] < d[i][j]) d[i][j] = d[i][k] + d[k][j];
+    };
+
+    var rt = try compute(gpa, &db, sysId(1), 0);
+    defer rt.deinit();
+    var seen = [_]bool{false} ** 6;
+    for (rt.routes) |r| {
+        const v: usize = r.dest[5] - 1;
+        seen[v] = true;
+        if (d[0][v] >= inf) return error.RouteToUnreachableSystem;
+        if (r.metric != d[0][v]) return error.RouteMetricDiffersFromModel;
+        if (v != 0) {
+            // The next hop is a neighbour of local on a shortest path.
+            const h: usize = r.next_hop[5] - 1;
+            if (d[0][h] >= inf or adv[0][h] == 0 or d[0][h] + d[h][v] != d[0][v]) return error.NextHopNotOnShortestPath;
+            if (d[0][v] > d[0][h]) ModelMark.mark(.multi_hop);
+        }
+        ModelMark.mark(.reachable_agrees);
+    }
+    for (0..n) |v| if (d[0][v] < inf and !seen[v]) return error.ReachableSystemMissing;
+    for (0..n) |v| if (d[0][v] >= inf and !seen[v]) ModelMark.mark(.unreachable_agrees);
 }
 
 test "corpus: every SPF seed reaches the graph builder, and the route count is pinned" {

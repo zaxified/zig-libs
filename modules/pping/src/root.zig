@@ -407,6 +407,145 @@ test "smoke: parseTcpTimestamps and matchEcho are reachable as re-exports (no st
     _ = matchEcho; // resolved as a value (function pointer), never called here
 }
 
+// ── fuzz: a hostile observation stream into one estimator ───────────────────
+
+const fz = @import("fuzz_test.zig");
+const StreamMark = fz.Marker(enum {
+    sample,
+    no_match,
+    duplicate_echo_silent,
+    capacity_pressed,
+    aged_out,
+    backwards_clock,
+    genuine_roundtrip,
+    echo_sample,
+    mixed_refused,
+});
+
+test "fuzz: an observation stream keeps the tables bounded, consumes the first echo only" {
+    try std.testing.fuzz({}, fuzzStreamSmith, .{});
+}
+
+test "fuzz driver: PPING_FUZZ (estimator)" {
+    try fz.fuzz_driver.run(fuzzStream, .{ .prefix = "PPING_FUZZ", .name = "pping-estimator" });
+}
+
+test "fuzz harness: estimator, 300 seeds, reaches every outcome" {
+    try StreamMark.reach(fuzzStream, "pping-estimator", 300);
+}
+
+fn fuzzStreamSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzStream(std.testing.Smith, smith, testing.allocator);
+}
+
+/// One estimator on a small TSval space (so echoes collide with sends), a tiny
+/// capacity and max_age (so capacity eviction and aging both fire), and a clock
+/// that mostly advances and sometimes steps backwards (which must degrade to
+/// "nothing evicted", never a panic). Checked after every step: occupancy stays
+/// within capacity; a sample's `at` is the observation's clock, its `tsval` was
+/// sent in the opposite direction, and its `rtt` lies between "now minus the
+/// last time that value was sent" and "now minus the first"; an echo is
+/// consumed once -- a second sample for the same send is an error. At the start
+/// a genuine round trip (send, echo within max_age) must yield exactly its RTT.
+fn fuzzStream(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const cfg: Config = .{ .capacity = src.valueRangeAtMost(u8, 1, 8), .max_age = src.valueRangeAtMost(u8, 1, 30) };
+    var est = try Estimator.init(gpa, cfg);
+    defer est.deinit(gpa);
+    var echo_est = try Estimator.init(gpa, cfg);
+    defer echo_est.deinit(gpa);
+
+    var now: u64 = src.valueRangeAtMost(u8, 0, 50);
+    // Model: per direction and TSval, the earliest and latest time it was sent
+    // since it went live, and whether a send is still unconsumed.
+    const Slot = struct { first: u64 = 0, last: u64 = 0, sent: bool = false, live: bool = false };
+    var model: [2][16]Slot = @splat(@splat(.{}));
+
+    if (src.value(bool)) {
+        // Genuine round trip on a fresh estimator.
+        const x = src.value(u32);
+        const delay: u64 = src.valueRangeAtMost(u8, 0, @intCast(cfg.max_age));
+        _ = est.observe(.{ .dir = .a_to_b, .tsval = x, .tsecr = 0, .now = now });
+        const got = est.observe(.{ .dir = .b_to_a, .tsval = x +% 1, .tsecr = x, .now = now + delay }) orelse
+            return error.GenuineRoundTripNoSample;
+        if (got.rtt != delay or got.tsval != x or got.at != now + delay) return error.GenuineRoundTripWrongSample;
+        // The echo is consumed: its duplicate yields nothing.
+        if (est.observe(.{ .dir = .b_to_a, .tsval = x +% 2, .tsecr = x, .now = now + delay }) != null) return error.DuplicateEchoSampled;
+        StreamMark.mark(.genuine_roundtrip);
+        est.reset();
+    }
+
+    const steps = src.valueRangeAtMost(u8, 1, 60);
+    for (0..steps) |_| {
+        const adv = src.valueRangeAtMost(u8, 0, 12);
+        if (src.valueRangeAtMost(u8, 0, 19) == 0) {
+            now -|= adv;
+            StreamMark.mark(.backwards_clock);
+        } else now += adv;
+        const dir: Direction = if (src.value(bool)) .a_to_b else .b_to_a;
+        const di = @intFromEnum(dir);
+        const oi = @intFromEnum(dir.opposite());
+        const tsval = src.valueRangeAtMost(u8, 0, 15);
+        const tsecr = src.valueRangeAtMost(u8, 0, 15);
+        if (src.valueRangeAtMost(u8, 0, 9) == 0) {
+            // Echo traffic on its own estimator, plus a mixed call that must be refused.
+            const e: IcmpEcho = .{
+                .family = if (src.value(bool)) .v4 else .v6,
+                .kind = if (src.value(bool)) .request else .reply,
+                .identifier = src.valueRangeAtMost(u8, 0, 3),
+                .sequence = src.valueRangeAtMost(u8, 0, 3),
+            };
+            if (echo_est.observeEcho(.{ .dir = dir, .echo = e, .now = now })) |smp| {
+                StreamMark.mark(.echo_sample);
+                if (smp.at != now or smp.proto == .tcp_timestamps) return error.EchoSampleWrong;
+            }
+            const before = echo_est.observations_refused;
+            if (echo_est.traffic == .icmp_echo) {
+                if (echo_est.observe(.{ .dir = dir, .tsval = tsval, .tsecr = tsecr, .now = now }) != null) return error.MixedCallSampled;
+                if (echo_est.observations_refused != before + 1) return error.MixedCallNotCounted;
+                StreamMark.mark(.mixed_refused);
+            }
+            for ([2]Direction{ .a_to_b, .b_to_a }) |d| if (echo_est.tableCount(d) > cfg.capacity) return error.EchoTableOverCapacity;
+            continue;
+        }
+        const was_full = est.tableCount(dir) == cfg.capacity;
+        const got = est.observe(.{ .dir = dir, .tsval = tsval, .tsecr = tsecr, .now = now });
+        if (got) |smp| {
+            StreamMark.mark(.sample);
+            const m = &model[oi][tsecr];
+            if (!m.sent or !m.live) return error.SampleForUnsentOrConsumedEcho;
+            if (smp.at != now or smp.tsval != tsecr or smp.proto != .tcp_timestamps) return error.SampleFieldsWrong;
+            // rtt = now - first_seen of the entry, and first_seen is one of the sends.
+            if (now >= m.first) {
+                if (smp.rtt > now - m.first) return error.RttAboveFirstSend;
+            }
+            if (now >= m.last) {
+                if (smp.rtt < now - m.last) return error.RttBelowLastSend;
+            }
+            m.live = false;
+        } else {
+            StreamMark.mark(.no_match);
+            if (model[oi][tsecr].live == false and model[oi][tsecr].sent) StreamMark.mark(.duplicate_echo_silent);
+        }
+        // This observation's own send (a duplicate TSval keeps its first-seen).
+        const mine = &model[di][tsval];
+        if (!mine.sent or !mine.live) {
+            mine.first = now;
+            mine.last = now;
+        }
+        // The stored entry's first-seen is one of the sends since this one
+        // went live; with a clock that steps backwards that is neither the
+        // earliest nor the latest in call order, so keep the range.
+        mine.first = @min(mine.first, now);
+        mine.last = @max(mine.last, now);
+        mine.sent = true;
+        mine.live = true;
+        if (was_full) StreamMark.mark(.capacity_pressed);
+        for ([2]Direction{ .a_to_b, .b_to_a }) |d| if (est.tableCount(d) > cfg.capacity) return error.TableOverCapacity;
+        if (est.samples_emitted > est.observations_total) return error.MoreSamplesThanObservations;
+    }
+    if (now > cfg.max_age) StreamMark.mark(.aged_out);
+}
+
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────────
 //
 // refAllDecls walks every pub declaration reachable from this file (including

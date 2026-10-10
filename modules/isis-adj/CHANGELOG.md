@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `ISIS_ADJ_FUZZ`: `isis-adj-rx` (sequences of hostile hellos and ticks into one adjacency; a refused or soft-rejected PDU mutates nothing, a reported transition is the state reached) and `isis-adj-handshake` (two adjacencies exchanging the module's own hellos: genuine wire reaches Up on both sides and expires to Down on silence; a damaged frame never corrupts the FSM). No source change.
 - **2026-10-05** — Mutation run: 40 of 44 killed, 4 equivalent; 4 tests added (`encode`
   buffer one octet short; `tick` before `start`/after `stop` and while hunting; shared
   area in the third Area Addresses TLV; area check only on L1 circuits). No code change.

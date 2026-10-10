@@ -403,14 +403,87 @@ const fuzz_corpus = [_][]const u8{
     fuzzseed.seedHex("7000"), // version 7
 };
 
+const fz = @import("fuzz_test.zig");
+const EchoMark = fz.Marker(enum { echo_v4, echo_v6, not_echo, refused, genuine_v4, genuine_v6 });
+
 test "fuzz: parseIpEcho never panics or reads OOB on arbitrary packets" {
-    try std.testing.fuzz({}, fuzzParseIpEcho, .{ .corpus = &fuzz_corpus });
+    try std.testing.fuzz({}, fuzzParseIpEchoSmith, .{ .corpus = &fuzz_corpus });
 }
 
-fn fuzzParseIpEcho(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: PPING_FUZZ (ip echo)" {
+    try fz.fuzz_driver.run(fuzzParseIpEcho, .{ .prefix = "PPING_FUZZ", .name = "pping-ip-echo" });
+}
+
+test "fuzz harness: ip echo, 500 seeds, reaches every outcome" {
+    try EchoMark.reach(fuzzParseIpEcho, "pping-ip-echo", 500);
+}
+
+fn fuzzParseIpEchoSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseIpEcho(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzParseIpEcho(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var raw: [128]u8 = undefined;
-    const n: usize = smith.slice(&raw);
-    _ = parseIpEcho(raw[0..n]) catch {};
+    const n: usize = fz.drawInput(S, src, &raw, &fuzz_corpus);
+    if (parseIpEcho(raw[0..n])) |r| {
+        if (r) |e| {
+            switch (e.echo.family) {
+                .v4 => EchoMark.mark(.echo_v4),
+                .v6 => EchoMark.mark(.echo_v6),
+            }
+        } else EchoMark.mark(.not_echo);
+    } else |_| EchoMark.mark(.refused);
+
+    // Genuine: an IPv4 / IPv6 packet this harness assembles from the RFCs
+    // (IPv4 header with IHL 5-8 or the IPv6 fixed header with 0-3 extension
+    // headers, then the Echo header) decodes to exactly the drawn
+    // identifier, sequence, kind and addresses.
+    var pkt: [160]u8 = @splat(0);
+    const id = src.value(u16);
+    const seq = src.value(u16);
+    const reply = src.value(bool);
+    if (src.value(bool)) {
+        const ihl: usize = src.valueRangeAtMost(u8, 5, 8);
+        pkt[0] = 0x40 | @as(u8, @intCast(ihl));
+        const total: u16 = @intCast(ihl * 4 + 8);
+        std.mem.writeInt(u16, pkt[2..4], total, .big);
+        pkt[9] = 1;
+        for (pkt[12..20]) |*b| b.* = src.value(u8);
+        const m = ihl * 4;
+        pkt[m] = if (reply) 0 else 8;
+        std.mem.writeInt(u16, pkt[m + 4 ..][0..2], id, .big);
+        std.mem.writeInt(u16, pkt[m + 6 ..][0..2], seq, .big);
+        const e = (try parseIpEcho(pkt[0..total])) orelse return error.GenuineV4NotEcho;
+        if (e.echo.identifier != id or e.echo.sequence != seq or (e.echo.kind == .reply) != reply or e.echo.family != .v4)
+            return error.GenuineV4Wrong;
+        if (!std.mem.eql(u8, e.src.v4[0..], pkt[12..16]) or !std.mem.eql(u8, e.dst.v4[0..], pkt[16..20])) return error.GenuineV4Addresses;
+        EchoMark.mark(.genuine_v4);
+    } else {
+        pkt[0] = 0x60;
+        var off: usize = 40;
+        var next: u8 = 58;
+        // Extension headers: hop-by-hop (0), routing (43), destination options (60), each 8 octets.
+        const exts = [_]u8{ 0, 43, 60 };
+        const k = src.valueRangeAtMost(u8, 0, 3);
+        if (k > 0) next = exts[0];
+        pkt[6] = next;
+        for (0..k) |j| {
+            const this = exts[j];
+            _ = this;
+            pkt[off] = if (j + 1 < k) exts[j + 1] else 58;
+            pkt[off + 1] = 0; // length 0 = 8 octets
+            off += 8;
+        }
+        pkt[off] = if (reply) 129 else 128;
+        std.mem.writeInt(u16, pkt[off + 4 ..][0..2], id, .big);
+        std.mem.writeInt(u16, pkt[off + 6 ..][0..2], seq, .big);
+        std.mem.writeInt(u16, pkt[4..6], @intCast(off - 40 + 8), .big);
+        for (pkt[8..40]) |*b| b.* = src.value(u8);
+        const e = (try parseIpEcho(pkt[0 .. off + 8])) orelse return error.GenuineV6NotEcho;
+        if (e.echo.identifier != id or e.echo.sequence != seq or (e.echo.kind == .reply) != reply or e.echo.family != .v6)
+            return error.GenuineV6Wrong;
+        EchoMark.mark(.genuine_v6);
+    }
 }
 
 test "corpus: every seed reaches the walk, and the outcomes are pinned" {
