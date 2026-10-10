@@ -698,18 +698,44 @@ fn freeShares(allocator: std.mem.Allocator, shares: []tecdsa.KeyShare) void {
     }
 }
 
+/// The protocol keygen (2-of-3) the refresh tests start from, with the aux
+/// material it was run under — made once per test binary. A keygen and a
+/// refresh are ~48 s of ReleaseSafe each; one test doing both took ~110 s and
+/// exceeded `--test-timeout` (3 min) on a loaded CI runner, so the keygen is
+/// shared and each test runs one refresh.
+const KeygenFixture = struct { locals: [3]aux_info.LocalAux, old: [3]tecdsa.KeyShare };
+var keygen_fixture: ?KeygenFixture = null;
+
+fn keygenFixture() !*KeygenFixture {
+    if (keygen_fixture) |*f| return f;
+    const pa = std.heap.page_allocator; // global-alloc-ok: process-lifetime test fixture shared by several tests, outlives testing.allocator's per-test teardown
+    var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0000);
+    const random = prng.random();
+    // Built in place: the parties take pointers to `locals`.
+    keygen_fixture = @as(KeygenFixture, undefined);
+    errdefer keygen_fixture = null;
+    const f = &keygen_fixture.?;
+    for (&f.locals) |*l| l.* = try quickLocal(pa, random);
+    f.old = try keygen(pa, random, &f.locals, "refresh-test-keygen");
+    return f;
+}
+
+test "refresh fixture: the protocol keygen every refresh test starts from" {
+    const f = try keygenFixture();
+    for (f.old[1..]) |s| try testing.expectEqualSlices(u8, &f.old[0].group_public_key.toBytes(), &s.group_public_key.toBytes());
+}
+
 test "refresh 2-of-3: new shares and Paillier keys, the same key; new shares sign, old and new do not mix" {
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0001);
     const random = prng.random();
-    var locals: [6]aux_info.LocalAux = undefined;
+    const old = (try keygenFixture()).old;
+    var locals: [3]aux_info.LocalAux = undefined;
     var made: usize = 0;
     defer for (locals[0..made]) |*l| l.deinit(allocator);
-    while (made < 6) : (made += 1) locals[made] = try quickLocal(allocator, random);
+    while (made < 3) : (made += 1) locals[made] = try quickLocal(allocator, random);
 
-    var old = try keygen(allocator, random, locals[0..3], "refresh-test-keygen");
-    defer freeShares(allocator, &old);
-    var new = try refresh(allocator, random, &old, locals[3..6], "refresh-test-epoch-1", null);
+    var new = try refresh(allocator, random, &old, &locals, "refresh-test-epoch-1", null);
     // A refresh does not need the old Paillier keys any more.
     defer freeShares(allocator, &new);
 
@@ -742,19 +768,18 @@ test "refresh 2-of-3: a dealer dealing a share that is not its published one is 
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0002);
     const random = prng.random();
-    var locals: [6]aux_info.LocalAux = undefined;
+    const old = (try keygenFixture()).old;
+    var locals: [3]aux_info.LocalAux = undefined;
     var made: usize = 0;
     defer for (locals[0..made]) |*l| l.deinit(allocator);
-    while (made < 6) : (made += 1) locals[made] = try quickLocal(allocator, random);
+    while (made < 3) : (made += 1) locals[made] = try quickLocal(allocator, random);
 
-    var old = try keygen(allocator, random, locals[0..3], "refresh-test-keygen-2");
-    defer freeShares(allocator, &old);
     // Dealer 2 deals x_2 + 1 (consistent with itself, not with the X_2 the
     // group published): every receiver, its own included, sees B_0 ≠ X_2.
     var input = old;
     input[1].secret_share = old[1].secret_share.add(tecdsa.Scalar.one);
     input[1].verifying_share = try tecdsa.Element.fromPoint(try tecdsa.Secp256k1.basePoint.mul(input[1].secret_share.toBytes(.big), .big));
-    var new = try refresh(allocator, random, &input, locals[3..6], "refresh-test-epoch-2", 2);
+    var new = try refresh(allocator, random, &input, &locals, "refresh-test-epoch-2", 2);
     defer freeShares(allocator, &new);
     for (new) |n| try testing.expectEqualSlices(u8, &old[0].group_public_key.toBytes(), &n.group_public_key.toBytes());
     const ecdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
@@ -784,16 +809,37 @@ fn deliverAll(allocator: std.mem.Allocator, parties: []EcdsaRefresh, filter: ?*c
     }
 }
 
-test "refresh: a missing, replayed or tampered frame and a shared modulus abort the round, naming the culprit (mutation audit)" {
+/// A trusted-dealer 2-of-3 key and fresh aux material for three parties —
+/// what each fault test below starts from. The three faults were one test
+/// (~85 s ReleaseSafe); split so each stays well inside `--test-timeout`.
+const FaultRig = struct {
+    kg: tecdsa.signing.TestKeygen,
+    locals: [3]aux_info.LocalAux,
+
+    fn init(allocator: std.mem.Allocator, random: std.Random) !FaultRig {
+        var rig: FaultRig = undefined;
+        rig.kg = try tecdsa.signing.testKeygen(allocator, random, 2, 3);
+        errdefer rig.kg.deinit(allocator);
+        var made: usize = 0;
+        errdefer for (rig.locals[0..made]) |*l| l.deinit(allocator);
+        while (made < 3) : (made += 1) rig.locals[made] = try quickLocal(allocator, random);
+        return rig;
+    }
+
+    fn deinit(self: *FaultRig, allocator: std.mem.Allocator) void {
+        for (&self.locals) |*l| l.deinit(allocator);
+        self.kg.deinit(allocator);
+    }
+};
+
+test "refresh: a missing or replayed announcement aborts the round, naming the culprit (mutation audit)" {
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0003);
     const random = prng.random();
-    const kg = try tecdsa.signing.testKeygen(allocator, random, 2, 3);
-    defer kg.deinit(allocator);
-    var locals: [3]aux_info.LocalAux = undefined;
-    var made: usize = 0;
-    defer for (locals[0..made]) |*l| l.deinit(allocator);
-    while (made < 3) : (made += 1) locals[made] = try quickLocal(allocator, random);
+    var rig = try FaultRig.init(allocator, random);
+    defer rig.deinit(allocator);
+    const kg = &rig.kg;
+    const locals = &rig.locals;
 
     // Announcement round: party 1 never hears from party 2; party 3 is
     // handed party 1's own (valid, party-1-bound) frame as if party 2 sent it.
@@ -815,6 +861,16 @@ test "refresh: a missing, replayed or tampered frame and a shared modulus abort 
         try testing.expectError(error.MissingMessage, parties[0].advance());
         try testing.expectEqual(@as(?u32, 2), parties[0].culprit());
     }
+}
+
+test "refresh: a lost or tampered Πfac proof aborts the round, naming the culprit (mutation audit)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0007);
+    const random = prng.random();
+    var rig = try FaultRig.init(allocator, random);
+    defer rig.deinit(allocator);
+    const kg = &rig.kg;
+    const locals = &rig.locals;
 
     // Πfac round: party 2's proof to party 1 is lost, its proof to party 3 tampered.
     {
@@ -838,6 +894,16 @@ test "refresh: a missing, replayed or tampered frame and a shared modulus abort 
         try testing.expectError(error.InvalidFactorProof, parties[2].advance());
         try testing.expectEqual(@as(?u32, 2), parties[2].culprit());
     }
+}
+
+test "refresh: two parties announcing one modulus abort the round (mutation audit)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0008);
+    const random = prng.random();
+    var rig = try FaultRig.init(allocator, random);
+    defer rig.deinit(allocator);
+    const kg = &rig.kg;
+    const locals = &rig.locals;
 
     // Two parties announcing one Paillier and ring-Pedersen modulus (each
     // proof is valid under its own context; only the distinctness check sees it).
@@ -951,12 +1017,15 @@ test "refresh: aux material of the old table is refused, from this party and fro
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0006);
     const random = prng.random();
+    // locals[0..3]: the aux material the fixture's keygen ran under (the
+    // stale table); locals[3..5]: fresh material for parties 1 and 3.
+    const f = try keygenFixture();
+    const old = f.old;
     var locals: [5]aux_info.LocalAux = undefined;
-    var made: usize = 0;
-    defer for (locals[0..made]) |*l| l.deinit(allocator);
+    locals[0..3].* = f.locals;
+    var made: usize = 3;
+    defer for (locals[3..made]) |*l| l.deinit(allocator);
     while (made < 5) : (made += 1) locals[made] = try quickLocal(allocator, random);
-    var old = try keygen(allocator, random, locals[0..3], "stale-keygen");
-    defer freeShares(allocator, &old);
 
     // This party starts with its old LocalAux: refused before anything is sent.
     {

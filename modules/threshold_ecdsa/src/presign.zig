@@ -2712,8 +2712,53 @@ test "presign: per-signer state machines, 2-of-3 and 3-of-3, sign bytes and a pr
     }
 }
 
-test "presign: every deviation aborts every honest signer, naming the cheater where GG20 §4.2 can" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+const DeviationExpect = struct { case: Case, fault: Fault, attributed: bool };
+const deviation_cases = [_]DeviationExpect{
+    .{ .case = .range_proof, .fault = .range_proof, .attributed = true },
+    .{ .case = .mta_swap, .fault = .mta_proof, .attributed = true },
+    .{ .case = .mtawc_swap, .fault = .mtawc_proof, .attributed = true },
+    .{ .case = .pedersen_proof, .fault = .pedersen_proof, .attributed = true },
+    .{ .case = .gamma_swap, .fault = .gamma_decommitment, .attributed = true },
+    .{ .case = .gamma_blind, .fault = .gamma_decommitment, .attributed = true },
+    .{ .case = .gamma_proof, .fault = .gamma_proof, .attributed = true },
+    .{ .case = .pdl_proof, .fault = .pdl_proof, .attributed = true },
+    .{ .case = .r_bar_swap, .fault = .pdl_proof, .attributed = true },
+    .{ .case = .st_proof, .fault = .st_proof, .attributed = true },
+    .{ .case = .missing, .fault = .missing_message, .attributed = true },
+    .{ .case = .duplicate, .fault = .duplicate_message, .attributed = true },
+    // A message for another session, round or recipient, a truncated
+    // one and one whose signature fails are dropped as noise — they
+    // prove nothing about their claimed sender (review F3) — so the
+    // cheater's message for the slot is missing.
+    .{ .case = .wrong_sid, .fault = .missing_message, .attributed = true },
+    .{ .case = .wrong_round, .fault = .missing_message, .attributed = true },
+    .{ .case = .misaddressed, .fault = .missing_message, .attributed = true },
+    .{ .case = .truncated, .fault = .missing_message, .attributed = true },
+    .{ .case = .bad_signature, .fault = .missing_message, .attributed = true },
+    // A signed message of the wrong kind for the round (mutation audit):
+    // a broadcast where only p2p messages are due, and the reverse.
+    .{ .case = .bc_in_p2p_round, .fault = .unexpected_message, .attributed = true },
+    .{ .case = .p2p_in_bc_round, .fault = .unexpected_message, .attributed = true },
+    // Signed, but too short to hold the attestation block (a signed lie).
+    .{ .case = .short_body, .fault = .malformed_message, .attributed = true },
+    // Different broadcasts to different signers: caught by the signed
+    // attestations before anyone acts on the split view (review F1) —
+    // and since the cheater signed both versions, it is named.
+    .{ .case = .equivocate, .fault = .equivocation, .attributed = true },
+    // An attestation of a broadcast its sender never signed: the
+    // attester is named, not the signer it misquotes.
+    .{ .case = .false_echo, .fault = .equivocation, .attributed = true },
+    // Types 5 and 7: consistent lies every proof accepts; caught by the
+    // sums, then named by the §4.3 opening (`openAbort`, `identify`).
+    .{ .case = .delta_shift, .fault = .r_bar_sum, .attributed = true },
+    .{ .case = .sigma_shift, .fault = .s_sum, .attributed = true },
+};
+
+/// Runs `cases` (deviations by party 2 of a 2-of-3 key) and checks every
+/// honest signer aborts with the expected verdict. Split over three tests so
+/// none comes near `--test-timeout` (each case is a full presign run, ~5 s in
+/// ReleaseSafe; all 24 in one test exceeded 3 minutes on a loaded CI runner).
+fn expectDeviationsAbort(cases: []const DeviationExpect) !void {
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6368_6561_7465_7273);
     const random = prng.random();
@@ -2722,47 +2767,6 @@ test "presign: every deviation aborts every honest signer, naming the cheater wh
     const shares = [_]root.KeyShare{ kg.key_shares[0], kg.key_shares[1], kg.key_shares[2] };
     const cheat = shares[1].index;
 
-    const Expect = struct { case: Case, fault: Fault, attributed: bool };
-    const cases = [_]Expect{
-        .{ .case = .range_proof, .fault = .range_proof, .attributed = true },
-        .{ .case = .mta_swap, .fault = .mta_proof, .attributed = true },
-        .{ .case = .mtawc_swap, .fault = .mtawc_proof, .attributed = true },
-        .{ .case = .pedersen_proof, .fault = .pedersen_proof, .attributed = true },
-        .{ .case = .gamma_swap, .fault = .gamma_decommitment, .attributed = true },
-        .{ .case = .gamma_blind, .fault = .gamma_decommitment, .attributed = true },
-        .{ .case = .gamma_proof, .fault = .gamma_proof, .attributed = true },
-        .{ .case = .pdl_proof, .fault = .pdl_proof, .attributed = true },
-        .{ .case = .r_bar_swap, .fault = .pdl_proof, .attributed = true },
-        .{ .case = .st_proof, .fault = .st_proof, .attributed = true },
-        .{ .case = .missing, .fault = .missing_message, .attributed = true },
-        .{ .case = .duplicate, .fault = .duplicate_message, .attributed = true },
-        // A message for another session, round or recipient, a truncated
-        // one and one whose signature fails are dropped as noise — they
-        // prove nothing about their claimed sender (review F3) — so the
-        // cheater's message for the slot is missing.
-        .{ .case = .wrong_sid, .fault = .missing_message, .attributed = true },
-        .{ .case = .wrong_round, .fault = .missing_message, .attributed = true },
-        .{ .case = .misaddressed, .fault = .missing_message, .attributed = true },
-        .{ .case = .truncated, .fault = .missing_message, .attributed = true },
-        .{ .case = .bad_signature, .fault = .missing_message, .attributed = true },
-        // A signed message of the wrong kind for the round (mutation audit):
-        // a broadcast where only p2p messages are due, and the reverse.
-        .{ .case = .bc_in_p2p_round, .fault = .unexpected_message, .attributed = true },
-        .{ .case = .p2p_in_bc_round, .fault = .unexpected_message, .attributed = true },
-        // Signed, but too short to hold the attestation block (a signed lie).
-        .{ .case = .short_body, .fault = .malformed_message, .attributed = true },
-        // Different broadcasts to different signers: caught by the signed
-        // attestations before anyone acts on the split view (review F1) —
-        // and since the cheater signed both versions, it is named.
-        .{ .case = .equivocate, .fault = .equivocation, .attributed = true },
-        // An attestation of a broadcast its sender never signed: the
-        // attester is named, not the signer it misquotes.
-        .{ .case = .false_echo, .fault = .equivocation, .attributed = true },
-        // Types 5 and 7: consistent lies every proof accepts; caught by the
-        // sums, then named by the §4.3 opening (`openAbort`, `identify`).
-        .{ .case = .delta_shift, .fault = .r_bar_sum, .attributed = true },
-        .{ .case = .sigma_shift, .fault = .s_sum, .attributed = true },
-    };
     for (cases) |c| {
         var res = try runSession(allocator, &shares, random, c.case);
         defer res.deinit(allocator);
@@ -2792,6 +2796,21 @@ test "presign: every deviation aborts every honest signer, naming the cheater wh
     }
 }
 
+test "presign: every deviation aborts every honest signer, naming the cheater where GG20 §4.2 can (proofs)" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    try expectDeviationsAbort(deviation_cases[0..8]);
+}
+
+test "presign: every deviation aborts every honest signer, naming the cheater where GG20 §4.2 can (transport)" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    try expectDeviationsAbort(deviation_cases[8..16]);
+}
+
+test "presign: every deviation aborts every honest signer, naming the cheater where GG20 §4.2 can (attestations, sums)" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    try expectDeviationsAbort(deviation_cases[16..]);
+}
+
 test "presign: §4.3 opening — a signer lying in its opening is named by everyone who received the lie" {
     if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
@@ -2809,27 +2828,33 @@ test "presign: §4.3 opening — a signer lying in its opening is named by every
     }
 }
 
-test "presign: §4.3 opening — a forged round-2 message or a decryption lifted by N names the opener" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+const OpeningCase = struct { Case, Fault };
+
+/// The §4.3 opening cases: each is a full presign run plus the openings
+/// (~6 s ReleaseSafe), so they are split over two tests to stay well inside
+/// `--test-timeout`.
+const opening_cases = [_]OpeningCase{
+    .{ .open_lie_round2, .r_bar_sum },
+    .{ .open_plain_n, .s_sum },
+    .{ .open_lie_k, .s_sum },
+    .{ .open_trailing7, .s_sum },
+    .{ .open_short7, .s_sum },
+    .{ .open_trailing5, .r_bar_sum },
+    .{ .open_short5, .r_bar_sum },
+    .{ .open7_late_mu, .s_sum },
+    .{ .open7_late_strip, .s_sum },
+    .{ .open7_late_round2, .s_sum },
+    .{ .open5_late_mask, .r_bar_sum },
+};
+
+fn expectOpeningNamesLiar(cases: []const OpeningCase) !void {
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6f70_656e_6c69_6532);
     const random = prng.random();
     const kg = try signing.testKeygen(allocator, random, 2, 3);
     defer kg.deinit(allocator);
     const shares = [_]root.KeyShare{ kg.key_shares[0], kg.key_shares[1], kg.key_shares[2] };
-    for ([_]struct { Case, Fault }{
-        .{ .open_lie_round2, .r_bar_sum },
-        .{ .open_plain_n, .s_sum },
-        .{ .open_lie_k, .s_sum },
-        .{ .open_trailing7, .s_sum },
-        .{ .open_short7, .s_sum },
-        .{ .open_trailing5, .r_bar_sum },
-        .{ .open_short5, .r_bar_sum },
-        .{ .open7_late_mu, .s_sum },
-        .{ .open7_late_strip, .s_sum },
-        .{ .open7_late_round2, .s_sum },
-        .{ .open5_late_mask, .r_bar_sum },
-    }) |c| {
+    for (cases) |c| {
         var res = try runSession(allocator, &shares, random, c[0]);
         defer res.deinit(allocator);
         errdefer std.debug.print("case {s}: {any}\n", .{ @tagName(c[0]), res.aborts });
@@ -2840,6 +2865,16 @@ test "presign: §4.3 opening — a forged round-2 message or a decryption lifted
             try testing.expectEqual(Abort{ .culprit = liar, .fault = c[1] }, a.abort);
         }
     }
+}
+
+test "presign: §4.3 opening — a forged round-2 message or a decryption lifted by N names the opener (lies, malformed)" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    try expectOpeningNamesLiar(opening_cases[0..7]);
+}
+
+test "presign: §4.3 opening — a forged round-2 message or a decryption lifted by N names the opener (late messages)" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    try expectOpeningNamesLiar(opening_cases[7..]);
 }
 
 test "presign: an opening shown two ways is caught by the echo round, its signer named by everyone (review F5)" {

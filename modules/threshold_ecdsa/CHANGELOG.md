@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** the presign deviation and §4.3-opening tests and the
+  aux_info end-to-end test are split into tests of at most ~45 s ReleaseSafe (aux_info over a shared
+  announcement fixture); together they exceeded CI's 3-minute `--test-timeout` under a full crypto lane.
 - **2026-10-10** — **Fixed:** `MtaProofWc.fromBytesAlloc` accepted trailing octets after the final point
   (`bytes.len < offset + Ne`), so one proof had many encodings; it now requires the exact length, as
   `PdlProof` does. Regression test in the round-trip test.

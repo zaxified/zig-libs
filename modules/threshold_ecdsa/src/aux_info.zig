@@ -531,21 +531,39 @@ fn ctxFor(i: u32) [12]u8 {
     return out;
 }
 
-test "aux_info: three parties announce, check each other, prove factors pairwise, assemble shares" {
-    const allocator = testing.allocator;
-    var prng = std.Random.DefaultPrng.init(0x6175_7831);
-    const random = prng.random();
+/// Three parties' aux material and their announcements, made once per test
+/// binary and shared by the `aux_info:` tests below. Announcing is ~28 s of
+/// ReleaseSafe (Πmod and the ring-Pedersen proofs over 2048-bit moduli); the
+/// one test that used to do it together with every check took ~100 s and
+/// exceeded `--test-timeout` (3 min) on a loaded CI runner.
+const AnnFixture = struct { locals: [3]LocalAux, anns: [3]Announcement };
+var ann_fixture: ?AnnFixture = null;
 
-    var locals: [3]LocalAux = undefined;
-    var made: usize = 0;
-    defer for (locals[0..made]) |*l| l.deinit(allocator);
-    while (made < 3) : (made += 1) locals[made] = try tssLocal(allocator, made);
+fn annFixture() !*AnnFixture {
+    if (ann_fixture) |*f| return f;
+    const pa = std.heap.page_allocator; // global-alloc-ok: process-lifetime test fixture shared by several tests, outlives testing.allocator's per-test teardown
+    var prng = std.Random.DefaultPrng.init(0x6175_7831);
+    ann_fixture = @as(AnnFixture, undefined);
+    errdefer ann_fixture = null;
+    const f = &ann_fixture.?;
+    for (&f.locals, 0..) |*l, i| l.* = try tssLocal(pa, i);
+    for (&f.anns, &f.locals, 1..) |*a, *l, i| {
+        const ctx = ctxFor(@intCast(i));
+        a.* = try l.announce(pa, &ctx, prng.random());
+    }
+    return f;
+}
+
+test "aux_info: announcements survive the codec, verify, and are bound to their sender" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6175_7832);
+    const random = prng.random();
+    const f = try annFixture();
 
     // Broadcast, through the codec, as a receiver would see it.
     var anns: [3]Announcement = undefined;
-    for (&anns, &locals, 1..) |*a, *l, i| {
+    for (&anns, f.anns, 1..) |*a, sent, i| {
         const ctx = ctxFor(@intCast(i));
-        const sent = try l.announce(allocator, &ctx, random);
         const bytes = try sent.toBytesAlloc(allocator);
         defer allocator.free(bytes);
         a.* = try Announcement.fromBytes(bytes);
@@ -574,6 +592,15 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
     var wrong_mod = anns[1];
     wrong_mod.paillier_proof = anns[0].paillier_proof;
     try testing.expectError(error.InvalidPaillierProof, verifyAnnouncement(wrong_mod, &ctxFor(2), random));
+}
+
+test "aux_info: each party checks its peers, Πfac pairwise, then assembles its share" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6175_7833);
+    const random = prng.random();
+    const f = try annFixture();
+    const locals = &f.locals;
+    const anns = f.anns;
 
     // Each party's view: announcements, distinct moduli, then Πfac from
     // every peer made for it (every ordered pair).
@@ -585,8 +612,8 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
         try testing.expectEqual(@as(?struct { usize, usize }, null), set.checkDistinct());
     }
     defer for (&sets) |*set| set.deinit(allocator);
-    for (&locals, anns, 1..) |*prover, prover_ann, i| {
-        for (&locals, anns, 1..) |*verifier, verifier_ann, j| {
+    for (locals, anns, 1..) |*prover, prover_ann, i| {
+        for (locals, anns, 1..) |*verifier, verifier_ann, j| {
             if (i == j) continue;
             const ctx = ctxFor(@intCast(i));
             const proof = try prover.proveFactors(verifier_ann.aux, &ctx, random);
@@ -595,30 +622,6 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
             try testing.expect(!sets[j - 1].verifyPeerFactors(@intCast(i), &ctxFor(@intCast(j)), proof));
             try testing.expect(sets[j - 1].verifyPeerFactors(@intCast(i), &ctx, proof));
         }
-    }
-
-    // Mutation audit: a set counts only what was checked. A valid Πfac from a
-    // peer whose announcement was not verified is refused (94); with every
-    // announcement and Πfac in, the set is still not verified before the
-    // distinctness check has run (95), and not before every Πfac is in (96).
-    {
-        var fresh = try AnnouncementSet.init(allocator, &anns, 1);
-        defer fresh.deinit(allocator);
-        var proofs: [2]fac_proof.FacProof = undefined;
-        for (&proofs, 2..) |*pr, j| pr.* = try locals[j - 1].proveFactors(anns[0].aux, &ctxFor(@intCast(j)), random);
-        try testing.expect(!fresh.verifyPeerFactors(2, &ctxFor(2), proofs[0]));
-        for (2..4) |j| try fresh.verifyPeer(@intCast(j), &ctxFor(@intCast(j)), random);
-        try testing.expect(fresh.verifyPeerFactors(2, &ctxFor(2), proofs[0]));
-        try testing.expect(fresh.checkDistinct() == null);
-        try testing.expect(fresh.verified() == null); // Πfac of party 3 missing
-        try testing.expect(fresh.verifyPeerFactors(3, &ctxFor(3), proofs[1]));
-        try testing.expect(fresh.verified() != null);
-
-        var fresh2 = try AnnouncementSet.init(allocator, &anns, 1);
-        defer fresh2.deinit(allocator);
-        for (2..4) |j| try fresh2.verifyPeer(@intCast(j), &ctxFor(@intCast(j)), random);
-        for ([_]usize{ 0, 1 }, 2..) |pi, j| try testing.expect(fresh2.verifyPeerFactors(@intCast(j), &ctxFor(@intCast(j)), proofs[pi]));
-        try testing.expect(fresh2.verified() == null); // everything in, but never checked for distinctness
     }
 
     // A 2-of-3 sharing stands in for the DKG's output here (the `dkg`
@@ -655,6 +658,39 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
     var not_the_token: u8 = 0;
     const forged: Verified = .{ .all = sets[0].verified().?.all, .me = 1, .seal = &not_the_token };
     try testing.expectError(error.InvalidParameters, assembleKeyShare(allocator, forged, &split.shares[0].scalar, commits, &locals[0], &scratch_ks));
+}
+
+test "aux_info: a set counts only what was checked (mutation audit)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6175_7834);
+    const random = prng.random();
+    const f = try annFixture();
+    const locals = &f.locals;
+    const anns = f.anns;
+
+    // A valid Πfac from a
+    // peer whose announcement was not verified is refused (94); with every
+    // announcement and Πfac in, the set is still not verified before the
+    // distinctness check has run (95), and not before every Πfac is in (96).
+    {
+        var fresh = try AnnouncementSet.init(allocator, &anns, 1);
+        defer fresh.deinit(allocator);
+        var proofs: [2]fac_proof.FacProof = undefined;
+        for (&proofs, 2..) |*pr, j| pr.* = try locals[j - 1].proveFactors(anns[0].aux, &ctxFor(@intCast(j)), random);
+        try testing.expect(!fresh.verifyPeerFactors(2, &ctxFor(2), proofs[0]));
+        for (2..4) |j| try fresh.verifyPeer(@intCast(j), &ctxFor(@intCast(j)), random);
+        try testing.expect(fresh.verifyPeerFactors(2, &ctxFor(2), proofs[0]));
+        try testing.expect(fresh.checkDistinct() == null);
+        try testing.expect(fresh.verified() == null); // Πfac of party 3 missing
+        try testing.expect(fresh.verifyPeerFactors(3, &ctxFor(3), proofs[1]));
+        try testing.expect(fresh.verified() != null);
+
+        var fresh2 = try AnnouncementSet.init(allocator, &anns, 1);
+        defer fresh2.deinit(allocator);
+        for (2..4) |j| try fresh2.verifyPeer(@intCast(j), &ctxFor(@intCast(j)), random);
+        for ([_]usize{ 0, 1 }, 2..) |pi, j| try testing.expect(fresh2.verifyPeerFactors(@intCast(j), &ctxFor(@intCast(j)), proofs[pi]));
+        try testing.expect(fresh2.verified() == null); // everything in, but never checked for distinctness
+    }
 }
 
 test "aux_info: a copied Ñ with its proofs fails under the copier's context; findDuplicate is the second line" {
