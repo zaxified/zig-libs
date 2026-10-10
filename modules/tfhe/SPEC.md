@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-02 · mutation 2026-10-02 · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-02 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget clean, TFHE_FUZZ) · ct 2026-10-02 (ctgrind)
 
 **Performance:** not measured
 

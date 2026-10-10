@@ -2604,6 +2604,10 @@ test {
 }
 
 test {
+    _ = @import("fuzz_test.zig");
+}
+
+test {
     _ = fac_proof;
 }
 
@@ -2910,20 +2914,71 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const FeldmanMark = fz.Marker(enum { accepted, refused, genuine_accepted, fixed_point });
+const PkMark = fz.Marker(enum { accepted, refused, genuine_accepted, fixed_point });
+const AuxMark = fz.Marker(enum { accepted, refused, genuine_accepted, fixed_point });
+const KsMark = fz.Marker(enum { accepted, refused, genuine_accepted, fixed_point });
+const ElementMark = fz.Marker(enum { accepted, refused, roundtrip });
+
+/// The corpus, built once for the driver (its inputs are copied out of it).
+var fuzz_corpus: Corpus = .{};
+var fuzz_corpus_built = false;
+fn fuzzCorpus() *Corpus {
+    if (!fuzz_corpus_built) {
+        // global-alloc-ok: process-lifetime fixture of a test-only harness
+        fuzz_corpus.build(std.heap.page_allocator) catch @panic("fuzz corpus");
+        fuzz_corpus_built = true;
+    }
+    return &fuzz_corpus;
+}
+
 test "fuzz: FeldmanCommitments.fromBytesAlloc never panics or over-allocates" {
     var corpus: Corpus = .{};
     try corpus.build(testing.allocator);
-    try testing.fuzz({}, fuzzFeldmanCommitmentsFromBytesAlloc, .{ .corpus = &corpus.feld_entries });
+    try testing.fuzz({}, fuzzFeldmanSmith, .{ .corpus = &corpus.feld_entries });
 }
 
-fn fuzzFeldmanCommitmentsFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
-    // ⚠ One `smith.slice`: the message IS the input, so the hostile counts are
+test "fuzz driver: TECDSA_FUZZ (feldman)" {
+    try fz.fuzz_driver.run(fuzzFeldman, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-feldman" });
+}
+
+test "fuzz harness: feldman, 400 seeds, reaches every outcome" {
+    try FeldmanMark.reach(fuzzFeldman, "tecdsa-feldman", 400);
+}
+
+fn fuzzFeldmanSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFeldman(std.testing.Smith, smith, testing.allocator);
+}
+
+/// Oracles: a genuine frame (corpus entries 0 and 1) is accepted; whatever is
+/// accepted re-encodes to something that decodes and re-encodes identically
+/// (a fixed point), and no count a frame declares makes the decoder allocate
+/// more than the frame holds.
+fn fuzzFeldman(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const corpus = fuzzCorpus();
+    // ⚠ One `slice`: the message IS the input, so the hostile counts are
     // seeds rather than draws the replay lane cannot make.
     var buf: [Corpus.feld_buf_bytes]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    const result = FeldmanCommitments.fromBytesAlloc(allocator, buf[0..len]) catch return;
-    defer allocator.free(result.commitments);
+    const d = fz.drawInput(S, src, &buf, &corpus.feld_entries);
+    const genuine = d.entry != null and d.entry.? < 2 and !d.damaged;
+    const result = FeldmanCommitments.fromBytesAlloc(gpa, buf[0..d.len]) catch {
+        if (genuine) return error.GenuineRefused;
+        FeldmanMark.mark(.refused);
+        return;
+    };
+    defer gpa.free(result.commitments);
+    FeldmanMark.mark(.accepted);
+    if (genuine) FeldmanMark.mark(.genuine_accepted);
+    const once = try result.toBytesAlloc(gpa);
+    defer gpa.free(once);
+    const back = try FeldmanCommitments.fromBytesAlloc(gpa, once);
+    defer gpa.free(back.commitments);
+    const twice = try back.toBytesAlloc(gpa);
+    defer gpa.free(twice);
+    if (!std.mem.eql(u8, once, twice)) return error.EncodingNotFixedPoint;
+    if (genuine and !std.mem.eql(u8, once, buf[0..d.len])) return error.GenuineNotReproduced;
+    FeldmanMark.mark(.fixed_point);
 }
 
 test "corpus: the FeldmanCommitments seeds reach the decoder, counts pinned" {
@@ -2954,18 +3009,46 @@ test "corpus: the FeldmanCommitments seeds reach the decoder, counts pinned" {
 test "fuzz: PublicKeys.fromBytesAlloc never panics or over-allocates" {
     var corpus: Corpus = .{};
     try corpus.build(testing.allocator);
-    try testing.fuzz({}, fuzzPublicKeysFromBytesAlloc, .{ .corpus = &corpus.pk_entries });
+    try testing.fuzz({}, fuzzPublicKeysSmith, .{ .corpus = &corpus.pk_entries });
 }
 
-fn fuzzPublicKeysFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+test "fuzz driver: TECDSA_FUZZ (public keys)" {
+    try fz.fuzz_driver.run(fuzzPublicKeys, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-public-keys" });
+}
+
+test "fuzz harness: public keys, 400 seeds, reaches every outcome" {
+    try PkMark.reach(fuzzPublicKeys, "tecdsa-public-keys", 400);
+}
+
+fn fuzzPublicKeysSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPublicKeys(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzPublicKeys(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const corpus = fuzzCorpus();
     // 4096 against a ~1150-octet real two-party frame; the old assembly buffer
     // was 260, so no real frame could have gone through even had the draw
     // worked.
     var buf: [Corpus.pk_buf_bytes]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    const result = PublicKeys.fromBytesAlloc(allocator, buf[0..len]) catch return;
-    defer allocator.free(result.entries);
+    const d = fz.drawInput(S, src, &buf, &corpus.pk_entries);
+    const genuine = d.entry != null and d.entry.? == 0 and !d.damaged;
+    const result = PublicKeys.fromBytesAlloc(gpa, buf[0..d.len]) catch {
+        if (genuine) return error.GenuineRefused;
+        PkMark.mark(.refused);
+        return;
+    };
+    defer gpa.free(result.entries);
+    PkMark.mark(.accepted);
+    if (genuine) PkMark.mark(.genuine_accepted);
+    const once = try result.toBytesAlloc(gpa);
+    defer gpa.free(once);
+    const back = try PublicKeys.fromBytesAlloc(gpa, once);
+    defer gpa.free(back.entries);
+    const twice = try back.toBytesAlloc(gpa);
+    defer gpa.free(twice);
+    if (!std.mem.eql(u8, once, twice)) return error.EncodingNotFixedPoint;
+    if (genuine and !std.mem.eql(u8, once, buf[0..d.len])) return error.GenuineNotReproduced;
+    PkMark.mark(.fixed_point);
 }
 
 test "corpus: the PublicKeys seeds reach the decoder, counts pinned" {
@@ -2994,15 +3077,43 @@ test "corpus: the PublicKeys seeds reach the decoder, counts pinned" {
 test "fuzz: AuxParams.fromBytesAlloc never panics on arbitrary bytes" {
     var corpus: Corpus = .{};
     try corpus.build(testing.allocator);
-    try testing.fuzz({}, fuzzAuxParamsFromBytesAlloc, .{ .corpus = &corpus.aux_entries });
+    try testing.fuzz({}, fuzzAuxParamsSmith, .{ .corpus = &corpus.aux_entries });
 }
 
-fn fuzzAuxParamsFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: TECDSA_FUZZ (aux params)" {
+    try fz.fuzz_driver.run(fuzzAuxParams, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-aux-params" });
+}
+
+test "fuzz harness: aux params, 400 seeds, reaches every outcome" {
+    try AuxMark.reach(fuzzAuxParams, "tecdsa-aux-params", 400);
+}
+
+fn fuzzAuxParamsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzAuxParams(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzAuxParams(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const corpus = fuzzCorpus();
     // 1024 against the 780 octets a full `aux_modulus_bits` triple encodes to;
     // the old assembly buffer was three fields of 64.
     var buf: [Corpus.aux_buf_bytes]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    _ = AuxParams.fromBytesAlloc(buf[0..len]) catch return;
+    const d = fz.drawInput(S, src, &buf, &corpus.aux_entries);
+    const genuine = d.entry != null and d.entry.? < 2 and !d.damaged;
+    const params = AuxParams.fromBytesAlloc(buf[0..d.len]) catch {
+        if (genuine) return error.GenuineRefused;
+        AuxMark.mark(.refused);
+        return;
+    };
+    AuxMark.mark(.accepted);
+    if (genuine) AuxMark.mark(.genuine_accepted);
+    const once = try params.toBytesAlloc(gpa);
+    defer gpa.free(once);
+    const back = try AuxParams.fromBytesAlloc(once);
+    const twice = try back.toBytesAlloc(gpa);
+    defer gpa.free(twice);
+    if (!std.mem.eql(u8, once, twice)) return error.EncodingNotFixedPoint;
+    if (genuine and !std.mem.eql(u8, once, buf[0..d.len])) return error.GenuineNotReproduced;
+    AuxMark.mark(.fixed_point);
 }
 
 test "corpus: the AuxParams seeds reach the decoder, counts pinned" {
@@ -3038,16 +3149,45 @@ test "corpus: the AuxParams seeds reach the decoder, counts pinned" {
 test "fuzz: KeyShare.fromBytesAlloc never panics on arbitrary bytes (audit F8)" {
     var corpus: Corpus = .{};
     try corpus.build(testing.allocator);
-    try testing.fuzz({}, fuzzKeyShareFromBytesAlloc, .{ .corpus = &corpus.ks_entries });
+    try testing.fuzz({}, fuzzKeyShareSmith, .{ .corpus = &corpus.ks_entries });
 }
 
-fn fuzzKeyShareFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+test "fuzz driver: TECDSA_FUZZ (key share)" {
+    try fz.fuzz_driver.run(fuzzKeyShare, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-key-share" });
+}
+
+test "fuzz harness: key share, 400 seeds, reaches every outcome" {
+    try KsMark.reach(fuzzKeyShare, "tecdsa-key-share", 400);
+}
+
+fn fuzzKeyShareSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzKeyShare(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzKeyShare(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const corpus = fuzzCorpus();
     var buf: [Corpus.ks_buf_bytes]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const d = fz.drawInput(S, src, &buf, &corpus.ks_entries);
+    const genuine = d.entry != null and d.entry.? == 0 and !d.damaged;
     var result: KeyShare = undefined;
-    KeyShare.fromBytesAlloc(allocator, buf[0..len], &result) catch return;
-    defer allocator.free(result.public_keys.entries);
+    KeyShare.fromBytesAlloc(gpa, buf[0..d.len], &result) catch {
+        if (genuine) return error.GenuineRefused;
+        KsMark.mark(.refused);
+        return;
+    };
+    defer gpa.free(result.public_keys.entries);
+    KsMark.mark(.accepted);
+    if (genuine) KsMark.mark(.genuine_accepted);
+    const once = try result.toBytesAlloc(gpa);
+    defer gpa.free(once);
+    var back: KeyShare = undefined;
+    try KeyShare.fromBytesAlloc(gpa, once, &back);
+    defer gpa.free(back.public_keys.entries);
+    const twice = try back.toBytesAlloc(gpa);
+    defer gpa.free(twice);
+    if (!std.mem.eql(u8, once, twice)) return error.EncodingNotFixedPoint;
+    if (genuine and !std.mem.eql(u8, once, buf[0..d.len])) return error.GenuineNotReproduced;
+    KsMark.mark(.fixed_point);
 }
 
 test "corpus: the KeyShare seeds reach the decoder, only the well-formed one is accepted" {
@@ -3082,12 +3222,40 @@ test "corpus: the KeyShare seeds reach the decoder, only the well-formed one is 
 // exact-width buffer is the whole harness, no corpus needed. This closes
 // the audit's twelfth and last decoder.
 test "fuzz: Element.fromBytes never panics (audit F8)" {
-    try testing.fuzz({}, fuzzElementFromBytes, .{});
+    try testing.fuzz({}, fuzzElementSmith, .{});
 }
-fn fuzzElementFromBytes(_: void, smith: *std.testing.Smith) !void {
+
+test "fuzz driver: TECDSA_FUZZ (element)" {
+    try fz.fuzz_driver.run(fuzzElement, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-element" });
+}
+
+test "fuzz harness: element, 400 seeds, reaches every outcome" {
+    try ElementMark.reach(fuzzElement, "tecdsa-element", 400);
+}
+
+fn fuzzElementSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzElement(std.testing.Smith, smith, testing.allocator);
+}
+
+/// Half the draws are a genuine point (the base point times a small scalar)
+/// with one octet damaged, since a random 33 octets are a curve point half
+/// of the time only after the right prefix. An accepted element encodes back
+/// to the input bytes.
+fn fuzzElement(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var buf: [Element.encoded_length]u8 = undefined;
-    smith.bytes(&buf);
-    _ = Element.fromBytes(buf) catch return;
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        const k = testScalar(@intCast(1 + src.index(200)));
+        const p = Element.fromPoint(Secp256k1.basePoint.mul(k.toBytes(.big), .big) catch unreachable) catch unreachable;
+        buf = p.toBytes();
+        if (src.valueRangeAtMost(u8, 0, 2) != 0) buf[src.index(buf.len)] = src.value(u8);
+    } else src.bytes(&buf);
+    const e = Element.fromBytes(buf) catch {
+        ElementMark.mark(.refused);
+        return;
+    };
+    ElementMark.mark(.accepted);
+    if (!std.mem.eql(u8, &e.toBytes(), &buf)) return error.ElementNotCanonical;
+    ElementMark.mark(.roundtrip);
 }
 
 /// ⛔ A LOCAL COPY of `testkit.fuzz.seedInto`, and it has to be one — see the

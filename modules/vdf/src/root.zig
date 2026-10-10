@@ -195,6 +195,7 @@ const kat_test = @import("kat_test.zig");
 test {
     std.testing.refAllDecls(@This());
     _ = kat_test;
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta.model_after names Wesolowski" {

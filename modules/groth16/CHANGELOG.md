@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** fuzz verdict recorded for the file readers (`zkey`, `wtns`, `r1cs`, `ptau` on damaged real snarkjs/circom files): 200,000 runs of `GROTH16_FUZZ` clean in ReleaseSafe, every accepted-kind and error label reached; new in-suite reach test (300 seeds, `HarnessDoesNotReach`). Proof/verifying-key verification lives in `bn254` (its own harness).
+
 - **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** `prover.setup` / `prover.freeKeyPair` carry `secret-api-ok` markers for the dead-stack lint: the `KeyPair` they return/take is the public CRS (`ProvingKey` + `VerifyingKey`, curve points), not key material. The secret input (`ToxicWaste`) was already by pointer and `setup` already burned.
 
 - **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte

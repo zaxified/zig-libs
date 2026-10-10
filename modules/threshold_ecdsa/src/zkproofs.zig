@@ -3603,40 +3603,108 @@ test "audit R2 (LOW): fixed-length mulAddBytes is bit-exact against the old earl
     }
 }
 
-test "fuzz: RangeProof.fromBytesAlloc never panics or over-allocates (audit F8)" {
-    try testing.fuzz(buildDecoderFixture(), fuzzRangeProofFromBytesAlloc, .{});
+const fz = @import("fuzz_test.zig");
+const DecodeMark = fz.Marker(enum { accepted, refused, fixed_point });
+const RangeMark = DecodeMark;
+const MtaMark = fz.Marker(enum { accepted, refused, fixed_point });
+const MtaWcMark = fz.Marker(enum { accepted, refused, fixed_point });
+const PdlMark = fz.Marker(enum { accepted, refused, fixed_point });
+
+var decoder_fixture: ?DecoderFixture = null;
+fn fixture() DecoderFixture {
+    if (decoder_fixture == null) decoder_fixture = buildDecoderFixture();
+    return decoder_fixture.?;
 }
 
-fn fuzzRangeProofFromBytesAlloc(fx: DecoderFixture, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+/// Shared body of the four proof-decoder harnesses. Oracles: no panic, no
+/// leak, no allocation beyond what the frame holds; whatever is accepted
+/// re-encodes to bytes that decode and re-encode identically.
+fn decodeHarness(comptime T: type, comptime Mark: type, comptime shape_kind: u8, comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const fx = fixture();
     var buf: [4096]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    const result = RangeProof.fromBytesAlloc(allocator, fx.n_tilde, fx.alice_pk, buf[0..len]) catch return;
-    defer result.deinit(allocator);
+    const g = (root.Element.fromPoint(root.Secp256k1.basePoint) catch unreachable).toBytes();
+    const shape: fz.Shape = switch (shape_kind) {
+        0 => .{ .want = 6 }, // RangeProof
+        1 => .{ .want = 10 }, // MtaProof
+        2 => .{ .want = 10, .wrap = true, .tail = g }, // MtaProofWc
+        else => .{ .want = 6, .wrap = true, .tail = g }, // PdlProof
+    };
+    const len = fz.drawFields(S, src, &buf, shape);
+    const result = T.fromBytesAlloc(gpa, fx.n_tilde, fx.alice_pk, buf[0..len]) catch {
+        Mark.mark(.refused);
+        return;
+    };
+    defer result.deinit(gpa);
+    Mark.mark(.accepted);
+    const once = try result.toBytesAlloc(gpa);
+    defer gpa.free(once);
+    const back = try T.fromBytesAlloc(gpa, fx.n_tilde, fx.alice_pk, once);
+    defer back.deinit(gpa);
+    const twice = try back.toBytesAlloc(gpa);
+    defer gpa.free(twice);
+    if (!std.mem.eql(u8, once, twice)) return error.EncodingNotFixedPoint;
+    Mark.mark(.fixed_point);
+}
+
+fn fuzzRangeProof(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    return decodeHarness(RangeProof, RangeMark, 0, S, src, gpa);
+}
+fn fuzzMtaProof(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    return decodeHarness(MtaProof, MtaMark, 1, S, src, gpa);
+}
+fn fuzzMtaProofWc(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    return decodeHarness(MtaProofWc, MtaWcMark, 2, S, src, gpa);
+}
+fn fuzzPdlProof(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    return decodeHarness(PdlProof, PdlMark, 3, S, src, gpa);
+}
+
+fn fuzzRangeProofSmith(_: DecoderFixture, smith: *std.testing.Smith) !void {
+    try fuzzRangeProof(std.testing.Smith, smith, testing.allocator);
+}
+fn fuzzMtaProofSmith(_: DecoderFixture, smith: *std.testing.Smith) !void {
+    try fuzzMtaProof(std.testing.Smith, smith, testing.allocator);
+}
+fn fuzzMtaProofWcSmith(_: DecoderFixture, smith: *std.testing.Smith) !void {
+    try fuzzMtaProofWc(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: RangeProof.fromBytesAlloc never panics or over-allocates (audit F8)" {
+    try testing.fuzz(buildDecoderFixture(), fuzzRangeProofSmith, .{});
 }
 
 test "fuzz: MtaProof.fromBytesAlloc never panics or over-allocates (audit F8)" {
-    try testing.fuzz(buildDecoderFixture(), fuzzMtaProofFromBytesAlloc, .{});
-}
-
-fn fuzzMtaProofFromBytesAlloc(fx: DecoderFixture, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
-    var buf: [4096]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    const result = MtaProof.fromBytesAlloc(allocator, fx.n_tilde, fx.alice_pk, buf[0..len]) catch return;
-    defer result.deinit(allocator);
+    try testing.fuzz(buildDecoderFixture(), fuzzMtaProofSmith, .{});
 }
 
 test "fuzz: MtaProofWc.fromBytesAlloc never panics or over-allocates (audit F8)" {
-    try testing.fuzz(buildDecoderFixture(), fuzzMtaProofWcFromBytesAlloc, .{});
+    try testing.fuzz(buildDecoderFixture(), fuzzMtaProofWcSmith, .{});
 }
 
-fn fuzzMtaProofWcFromBytesAlloc(fx: DecoderFixture, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
-    var buf: [4096]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    const result = MtaProofWc.fromBytesAlloc(allocator, fx.n_tilde, fx.alice_pk, buf[0..len]) catch return;
-    defer result.deinit(allocator);
+test "fuzz driver: TECDSA_FUZZ (range proof)" {
+    try fz.fuzz_driver.run(fuzzRangeProof, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-range-proof" });
+}
+test "fuzz driver: TECDSA_FUZZ (mta proof)" {
+    try fz.fuzz_driver.run(fuzzMtaProof, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-mta-proof" });
+}
+test "fuzz driver: TECDSA_FUZZ (mta proof wc)" {
+    try fz.fuzz_driver.run(fuzzMtaProofWc, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-mta-proof-wc" });
+}
+test "fuzz driver: TECDSA_FUZZ (pdl proof)" {
+    try fz.fuzz_driver.run(fuzzPdlProof, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-pdl-proof" });
+}
+
+test "fuzz harness: range proof, 500 seeds, reaches every outcome" {
+    try RangeMark.reach(fuzzRangeProof, "tecdsa-range-proof", 500);
+}
+test "fuzz harness: mta proof, 500 seeds, reaches every outcome" {
+    try MtaMark.reach(fuzzMtaProof, "tecdsa-mta-proof", 500);
+}
+test "fuzz harness: mta proof wc, 500 seeds, reaches every outcome" {
+    try MtaWcMark.reach(fuzzMtaProofWc, "tecdsa-mta-proof-wc", 500);
+}
+test "fuzz harness: pdl proof, 500 seeds, reaches every outcome" {
+    try PdlMark.reach(fuzzPdlProof, "tecdsa-pdl-proof", 500);
 }
 
 // -- PdlProof (GG20 Phase 5) --

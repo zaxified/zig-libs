@@ -741,3 +741,43 @@ test "subBytes: borrow and value at the edges" {
     try testing.expectEqual(@as(u8, 0), subBytes(&[_]u8{5}, &[_]u8{5}, &out));
     try testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0 }, &out);
 }
+
+const fz = @import("fuzz_test.zig");
+const FacMark = fz.Marker(enum { accepted, refused, fixed_point });
+
+test "fuzz: FacProof.fromBytes never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzFacProofSmith, .{});
+}
+
+test "fuzz driver: TECDSA_FUZZ (fac proof)" {
+    try fz.fuzz_driver.run(fuzzFacProof, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-fac-proof" });
+}
+
+test "fuzz harness: fac proof, 500 seeds, reaches every outcome" {
+    try FacMark.reach(fuzzFacProof, "tecdsa-fac-proof", 500);
+}
+
+fn fuzzFacProofSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFacProof(std.testing.Smith, smith, testing.allocator);
+}
+
+/// Eleven length-prefixed fields over the toy N̂ = 187 (lengths sometimes
+/// lying). Oracles: no panic; what is accepted re-encodes to bytes that decode
+/// and re-encode identically.
+fn fuzzFacProof(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const n_hat = root.AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable;
+    var buf: [4096]u8 = undefined;
+    const len = fz.drawFields(S, src, &buf, .{ .want = 11 });
+    const p = FacProof.fromBytes(n_hat, buf[0..len]) catch {
+        FacMark.mark(.refused);
+        return;
+    };
+    FacMark.mark(.accepted);
+    const once = try p.toBytesAlloc(gpa);
+    defer gpa.free(once);
+    const back = try FacProof.fromBytes(n_hat, once);
+    const twice = try back.toBytesAlloc(gpa);
+    defer gpa.free(twice);
+    if (!std.mem.eql(u8, once, twice)) return error.EncodingNotFixedPoint;
+    FacMark.mark(.fixed_point);
+}

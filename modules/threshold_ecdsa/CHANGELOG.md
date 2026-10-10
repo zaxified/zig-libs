@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** deterministic fuzz driver (`TECDSA_FUZZ`, `src/fuzz_test.zig`) over every wire decoder: Feldman commitments, public keys, aux params, key share, `Element`, the four EC proofs (honest proof accepted, damaged one refused), range / MtA / MtAwc / PDL / Πmod / Πprm / Πfac proofs, `Presignature`, and `combine` (shares nobody signed never combine). Harness bodies are generic over their choice source, so existing `--fuzz` corpora replay unchanged. 200,000 runs per harness clean in ReleaseSafe; the Πmod/Πprm harnesses now hold a full 67 KB frame (the old 4096-octet buffer could never reach `accepted`). Note: `MtaProofWc.fromBytesAlloc` ignores octets after the final point (only a lower bound is checked), unlike `PdlProof`.
+
 - **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). `messagePublicKey(seed: *const [32]u8)` takes the Ed25519 message-signing seed by pointer (was by value; it was already burned). `aux_proofs.deriveModChallenge` / `derivePrmChallengeBits` carry `secret-api-ok` markers: their `seed` is the public Fiat-Shamir digest, not a secret. Call sites in `aux_info`, `presign`, `tsslib_interop`, the old stack probe and `dkg` migrated.
 
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** fuzz verdict recorded for the codec readers (`TFHE_FUZZ`, all six kinds on damaged encodings: whatever is accepted re-encodes to the bytes read, an intact encoding is accepted): 200,000 runs clean in ReleaseSafe, every outcome reached; new in-suite reach test (400 seeds, every kind both accepted and refused).
+
 - **2026-10-05** — **NO CONSUMER-VISIBLE CHANGE:** scope re-survey (`SURVEY-PLAYBOOK.md`); `SPEC.md` only. Scope **mvp → core**, judged against tfhe-rs 1.8.1's `boolean` API and TFHE-lib — the gate-level libraries this module claims to be — not against tfhe-rs's `integer` layer, which is filed as a scope extension. The 2026-10-02 work (real parameter sets, gates, codec, two-way interop) covers the `boolean` user flow its docs describe end to end; the remaining gaps — ~20× slower per gate, no public-key encryption, no bincode/versioned serialisation, no compressed keys, no `KS_PBS` order — are ranked under Backlog. `## Compared with` re-verified (stars, releases, LICENSE files) and given an ahead/even/behind paragraph; two rows added: Lattigo (blind-rotation primitives) and **thedonutfactory/zig-tfhe** (MIT, Zig, needs a C compiler), which the 2026-09-30 survey missed when it said no Zig TFHE existed.
 
 - **2026-10-02** — **BREAKING.** Real parameter sets, binary gates, byte encodings, and tfhe-rs 1.8.1 interop in both directions (maturity task A13; grade 4 → 3, oracle SELF → EXTERNAL).

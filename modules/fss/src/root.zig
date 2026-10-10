@@ -103,6 +103,7 @@ test {
     _ = kat_vectors;
     _ = @import("kat_test.zig");
     _ = @import("mpf_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("bench.zig");
     _ = @import("stackprobe_test.zig");
 }

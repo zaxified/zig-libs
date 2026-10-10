@@ -2976,14 +2976,79 @@ test "presign: a pooled presignature survives encoding, is taken at most once, a
     try testing.expectError(error.PresignatureUsed, res.presigs[1].toBytesAlloc(allocator));
 }
 
+const fz = @import("fuzz_test.zig");
+const PresigMark = fz.Marker(enum { refused, length_matches, accepted });
+const CombineMark = fz.Marker(enum { header_ok, header_refused, combine_refused });
+
 test "fuzz: Presignature.fromBytesAlloc never panics" {
-    try testing.fuzz({}, fuzzPresigDecode, .{});
+    try testing.fuzz({}, fuzzPresigDecodeSmith, .{});
 }
-fn fuzzPresigDecode(_: void, smith: *std.testing.Smith) !void {
+
+test "fuzz driver: TECDSA_FUZZ (presignature)" {
+    try fz.fuzz_driver.run(fuzzPresigDecode, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-presig" });
+}
+
+test "fuzz harness: presignature, 400 seeds, reaches every refusing outcome" {
+    // `accepted` is not required: a presignature that decodes needs the
+    // relations of a finished session (R = Σ R̄, k·R = R̄_i, ...), which only
+    // a real run produces (`presign: ... round-trips` tests below).
+    PresigMark.reset();
+    for (0..400) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fz.fuzz_driver.Rng = .{ .r = prng.random() };
+        try fuzzPresigDecode(fz.fuzz_driver.Rng, &rng, testing.allocator);
+    }
+    try testing.expect(PresigMark.count(.refused) != 0 and PresigMark.count(.length_matches) != 0);
+}
+
+fn fuzzPresigDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPresigDecode(std.testing.Smith, smith, testing.allocator);
+}
+
+/// Under the driver, 3/4 of the inputs are frames with a valid version, a
+/// signer count of 2-3 (sometimes a lie) and exactly the length that count
+/// implies, curve points and keys in their slots, so the decoder gets past
+/// its length gate into the field checks. The oracle is no panic and no leak.
+fn fuzzPresigDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [1200]u8 = undefined;
-    const bytes = buf[0..smith.slice(&buf)];
+    var len: usize = 0;
+    if (S == fz.fuzz_driver.Rng and src.valueRangeAtMost(u8, 0, 3) != 0) {
+        const g = (Element.fromPoint(Secp256k1.basePoint) catch unreachable).toBytes();
+        const kp = Ed25519.KeyPair.generateDeterministic(@splat(1)) catch unreachable;
+        const n: u32 = if (src.valueRangeAtMost(u8, 0, 15) == 0) src.value(u32) else src.valueRangeAtMost(u32, 2, 3);
+        const nn: usize = if (n >= 2 and n <= 3) n else 2;
+        const per = 4 + Ne + Ne + attestation_entry_length + 32;
+        len = 1 + 32 + 4 + Ne + 4 + nn * per + Ne + Ns + 3 * 32;
+        src.bytes(buf[0..len]);
+        buf[0] = if (src.valueRangeAtMost(u8, 0, 15) == 0) src.value(u8) else Presignature.codec_version;
+        std.mem.writeInt(u32, buf[33..37], src.valueRangeAtMost(u32, 0, 4), .big);
+        buf[37..][0..Ne].* = g;
+        std.mem.writeInt(u32, buf[37 + Ne ..][0..4], n, .big);
+        var off: usize = 1 + 32 + 4 + Ne + 4;
+        for (0..nn) |i| {
+            std.mem.writeInt(u32, buf[off..][0..4], @intCast(i + 1), .big);
+            off += 4;
+        }
+        buf[off..][0..Ne].* = g;
+        off += Ne + Ns;
+        for (0..2 * nn) |_| {
+            buf[off..][0..Ne].* = g;
+            off += Ne;
+        }
+        off += nn * attestation_entry_length;
+        for (0..nn) |_| {
+            buf[off..][0..32].* = kp.public_key.toBytes();
+            off += 32;
+        }
+        for (0..src.valueRangeAtMost(u8, 0, 2)) |_| buf[src.index(len)] = src.value(u8);
+        PresigMark.mark(.length_matches);
+    } else len = src.slice(&buf);
     var p: Presignature = undefined;
-    Presignature.fromBytesAlloc(testing.allocator, bytes, &p) catch return;
+    Presignature.fromBytesAlloc(gpa, buf[0..len], &p) catch {
+        PresigMark.mark(.refused);
+        return;
+    };
+    PresigMark.mark(.accepted);
     p.deinit();
 }
 
@@ -3209,13 +3274,42 @@ test "presign: the session id binds the signer set, the threshold and the public
 }
 
 test "fuzz: peekHeader and PresignaturePublic.combine never panic on arbitrary shares" {
-    try testing.fuzz({}, fuzzCombine, .{});
+    try testing.fuzz({}, fuzzCombineSmith, .{});
 }
-fn fuzzCombine(_: void, smith: *std.testing.Smith) !void {
-    var buf: [2][header_length + 2 * attestation_entry_length + Ns + signature_length + 8]u8 = undefined;
+
+test "fuzz driver: TECDSA_FUZZ (combine)" {
+    try fz.fuzz_driver.run(fuzzCombine, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-combine" });
+}
+
+test "fuzz harness: combine, 300 seeds, reaches every outcome" {
+    try CombineMark.reach(fuzzCombine, "tecdsa-combine", 300);
+}
+
+fn fuzzCombineSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzCombine(std.testing.Smith, smith, testing.allocator);
+}
+
+/// Oracle beyond "never panics": shares nobody signed must never combine into
+/// a signature. Under the driver 3/4 of the shares carry a valid header and
+/// the exact length, so `combine` reaches its signature checks.
+fn fuzzCombine(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const share_len = header_length + 2 * attestation_entry_length + Ns + signature_length;
+    var buf: [2][share_len + 8]u8 = undefined;
     var shares: [2][]const u8 = undefined;
-    for (&buf, &shares) |*b, *s| s.* = b[0..smith.slice(b)];
-    for (shares) |s| _ = peekHeader(s) catch {};
+    for (&buf, &shares, 0..) |*b, *s, i| {
+        if (S == fz.fuzz_driver.Rng and src.valueRangeAtMost(u8, 0, 3) != 0) {
+            src.bytes(b);
+            b[0] = if (src.valueRangeAtMost(u8, 0, 15) == 0) src.value(u8) else wire_version;
+            b[1] = sign_round;
+            @memset(b[2..34], 0);
+            std.mem.writeInt(u32, b[34..38], @intCast(i + 1), .big);
+            std.mem.writeInt(u32, b[38..42], 0, .big);
+            s.* = b[0..if (src.valueRangeAtMost(u8, 0, 7) == 0) src.index(share_len + 9) else share_len];
+        } else s.* = b[0..src.slice(b)];
+    }
+    for (shares) |s| {
+        if (peekHeader(s)) |_| CombineMark.mark(.header_ok) else |_| CombineMark.mark(.header_refused);
+    }
     const g = Element.fromPoint(Secp256k1.basePoint) catch unreachable;
     var signers = [_]u32{ 1, 2 };
     var r_bar = [_]Element{ g, g };
@@ -3224,7 +3318,7 @@ fn fuzzCombine(_: void, smith: *std.testing.Smith) !void {
     const kp = Ed25519.KeyPair.generateDeterministic(@splat(1)) catch unreachable;
     var keys = [_]Ed25519.PublicKey{ kp.public_key, kp.public_key };
     const public: PresignaturePublic = .{
-        .allocator = testing.allocator,
+        .allocator = gpa,
         .sid = [_]u8{0} ** 32,
         .group_public_key = g,
         .signers = &signers,
@@ -3236,7 +3330,9 @@ fn fuzzCombine(_: void, smith: *std.testing.Smith) !void {
         .message_keys = &keys,
     };
     var abort: ?Abort = null;
-    _ = public.combine(.{ .bytes = "fuzz" }, &shares, &abort) catch {};
+    if (public.combine(.{ .bytes = "fuzz" }, &shares, &abort)) |_| {
+        return error.UnsignedSharesCombined;
+    } else |_| CombineMark.mark(.combine_refused);
 }
 
 test "presign: round 1 refuses a party whose own aux tuple or Paillier key fails the peer checks" {

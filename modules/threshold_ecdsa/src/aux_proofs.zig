@@ -2209,24 +2209,110 @@ fn toyNTilde() root.AuxModulus {
     return root.AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable;
 }
 
-test "fuzz: ModProof.fromBytesAlloc never panics on arbitrary bytes (audit F8)" {
-    try testing.fuzz({}, fuzzModProofFromBytesAlloc, .{});
-}
+const fz = @import("fuzz_test.zig");
+const ModMark = fz.Marker(enum { accepted, refused, fixed_point });
+const PrmMark = fz.Marker(enum { accepted, refused, fixed_point });
 
-fn fuzzModProofFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
-    var buf: [4096]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    _ = ModProof.fromBytesAlloc(toyNTilde(), buf[0..len]) catch return;
+test "fuzz: ModProof.fromBytesAlloc never panics on arbitrary bytes (audit F8)" {
+    try testing.fuzz({}, fuzzModProofSmith, .{});
 }
 
 test "fuzz: PrmProof.fromBytesAlloc never panics on arbitrary bytes (audit F8)" {
-    try testing.fuzz({}, fuzzPrmProofFromBytesAlloc, .{});
+    try testing.fuzz({}, fuzzPrmProofSmith, .{});
 }
 
-fn fuzzPrmProofFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
-    var buf: [4096]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    _ = PrmProof.fromBytesAlloc(toyNTilde(), buf[0..len]) catch return;
+test "fuzz driver: TECDSA_FUZZ (mod proof)" {
+    try fz.fuzz_driver.run(fuzzModProof, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-mod-proof" });
+}
+test "fuzz driver: TECDSA_FUZZ (prm proof)" {
+    try fz.fuzz_driver.run(fuzzPrmProof, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-prm-proof" });
+}
+test "fuzz harness: mod proof, 400 seeds, reaches every outcome" {
+    try ModMark.reach(fuzzModProof, "tecdsa-mod-proof", 400);
+}
+test "fuzz harness: prm proof, 400 seeds, reaches every outcome" {
+    try PrmMark.reach(fuzzPrmProof, "tecdsa-prm-proof", 400);
+}
+
+fn fuzzModProofSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzModProof(std.testing.Smith, smith, testing.allocator);
+}
+fn fuzzPrmProofSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPrmProof(std.testing.Smith, smith, testing.allocator);
+}
+
+var frame_buf: [70_000]u8 = undefined;
+
+/// A frame of the Πmod/Πprm layout over the toy Ñ = 187: fixed-width 256-octet
+/// length-prefixed field elements (mostly in range), flag octets for Πmod.
+/// Under the driver, 3/4 of the draws are such a frame (then 0-3 octets
+/// damaged, maybe truncated, maybe a trailing octet); the rest are plain
+/// slices. (The old 4096-octet buffer could never hold one: a Πmod frame is
+/// ~67 KB, so the harness before this one never reached `accepted`.)
+fn drawProofFrame(comptime S: type, src: *S, buf: []u8, comptime flags: bool) usize {
+    if (S != fz.fuzz_driver.Rng or src.valueRangeAtMost(u8, 0, 3) == 0) return src.slice(buf);
+    var n: usize = 0;
+    const fields: usize = if (flags) 1 + 2 * pi_mod_iterations else 2 * pi_prm_iterations;
+    for (0..fields) |i| {
+        std.mem.writeInt(u32, buf[n..][0..4], root.aux_modulus_bytes, .big);
+        n += 4;
+        @memset(buf[n..][0..root.aux_modulus_bytes], 0);
+        buf[n + root.aux_modulus_bytes - 1] = @intCast(src.index(187));
+        if (src.valueRangeAtMost(u8, 0, 63) == 0) buf[n + root.aux_modulus_bytes - 1] = src.value(u8);
+        n += root.aux_modulus_bytes;
+        if (flags and i != 0 and i % 2 == 0) {
+            buf[n] = @intFromBool(src.value(bool));
+            buf[n + 1] = @intFromBool(src.value(bool));
+            if (src.valueRangeAtMost(u8, 0, 63) == 0) buf[n + src.index(2)] = src.value(u8);
+            n += 2;
+        }
+    }
+    for (0..src.valueRangeAtMost(u8, 0, 3)) |_| buf[src.index(n)] = src.value(u8);
+    switch (src.valueRangeAtMost(u8, 0, 7)) {
+        0 => n = src.index(n + 1),
+        1 => {
+            buf[n] = src.value(u8);
+            n += 1;
+        },
+        else => {},
+    }
+    return n;
+}
+
+/// Oracles: no panic or leak; whatever is accepted re-encodes to bytes that
+/// decode and re-encode identically.
+fn fuzzModProof(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const buf = &frame_buf;
+    const len = drawProofFrame(S, src, buf, true);
+    const p = ModProof.fromBytesAlloc(toyNTilde(), buf[0..len]) catch {
+        ModMark.mark(.refused);
+        return;
+    };
+    ModMark.mark(.accepted);
+    const once = try p.toBytesAlloc(gpa);
+    defer gpa.free(once);
+    const back = try ModProof.fromBytesAlloc(toyNTilde(), once);
+    const twice = try back.toBytesAlloc(gpa);
+    defer gpa.free(twice);
+    if (!std.mem.eql(u8, once, twice)) return error.EncodingNotFixedPoint;
+    ModMark.mark(.fixed_point);
+}
+
+fn fuzzPrmProof(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const buf = &frame_buf;
+    const len = drawProofFrame(S, src, buf, false);
+    const p = PrmProof.fromBytesAlloc(toyNTilde(), buf[0..len]) catch {
+        PrmMark.mark(.refused);
+        return;
+    };
+    PrmMark.mark(.accepted);
+    const once = try p.toBytesAlloc(gpa);
+    defer gpa.free(once);
+    const back = try PrmProof.fromBytesAlloc(toyNTilde(), once);
+    const twice = try back.toBytesAlloc(gpa);
+    defer gpa.free(twice);
+    if (!std.mem.eql(u8, once, twice)) return error.EncodingNotFixedPoint;
+    PrmMark.mark(.fixed_point);
 }
 
 // ── Πmod over a Paillier modulus (dealer-free keygen) ───────────────────

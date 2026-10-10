@@ -130,6 +130,7 @@ fn note(e: anyerror) void {
 }
 
 /// The fixed-witness inputs that go with the fixtures.
+var accepted: struct { zkey: usize = 0, wtns: usize = 0, r1cs: usize = 0, ptau: usize = 0 } = .{};
 var witness: ?[]Fr = null;
 var r1cs_fixture: ?circom.R1cs = null;
 
@@ -155,6 +156,7 @@ fn readersHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
                 return;
             };
             defer z.deinit(gpa);
+            accepted.zkey += 1;
             fuzz_driver.hit("zkey_accepted");
             const once = try zkey.toBytes(gpa, z);
             defer gpa.free(once);
@@ -183,6 +185,7 @@ fn readersHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
                 return;
             };
             defer gpa.free(w);
+            accepted.wtns += 1;
             fuzz_driver.hit("wtns_accepted");
             var aw: std.Io.Writer.Allocating = .init(gpa);
             defer aw.deinit();
@@ -198,6 +201,7 @@ fn readersHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
                 return;
             };
             defer r.deinit(gpa);
+            accepted.r1cs += 1;
             fuzz_driver.hit("r1cs_accepted");
             // Every index the parser handed out must be usable as one.
             const zw = try gpa.alloc(Fr, r.n_wires);
@@ -211,6 +215,7 @@ fn readersHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
                 if (intact) return error.IntactRefused;
                 return;
             };
+            accepted.ptau += 1;
             fuzz_driver.hit("ptau_accepted");
             var level: u5 = 0;
             while (level <= p.power + 1) : (level += 1) {
@@ -236,6 +241,17 @@ fn readersHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
 
 test "fuzz driver: file readers on damaged snarkjs/circom files (GROTH16_FUZZ)" {
     try fuzz_driver.run(readersHarness, .{ .prefix = "GROTH16_FUZZ", .name = "readers" });
+}
+
+test "fuzz driver reach: every reader accepts some damaged input and refuses others" {
+    accepted = .{};
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        try readersHarness(fuzz_driver.Rng, &rng, testing.allocator);
+    }
+    if (accepted.zkey == 0 or accepted.wtns == 0 or accepted.r1cs == 0 or accepted.ptau == 0)
+        return error.HarnessDoesNotReach;
 }
 
 test "fuzz: file readers (coverage-guided exploration)" {

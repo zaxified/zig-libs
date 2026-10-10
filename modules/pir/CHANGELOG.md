@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** deterministic fuzz driver (`PIR_FUZZ`, `src/fuzz_test.zig`): whole protocol runs over random databases through the byte codecs. Plain and multi-index PIR reconstruct the record, refuse wrong share and answer lengths, and a flipped answer octet inside the record changes it; verified PIR rejects any flipped octet of either server's value or tag answer (`AnswerRejected`) and a damaged share leads to rejection or the correct record, never a wrong one; `Database.init` / `domainBitsFor` totality. 200,000 runs per harness clean in ReleaseSafe.
+
 - **2026-10-09** — **BREAKING:** dead-stack burns (`CONVENTIONS.md` §2.1.1),
   following `fss`. Secrets go in by pointer and results come out through
   `out` parameters: `Pir.query(index, *const Seed, *const Seed, out: *[2]Share)`,

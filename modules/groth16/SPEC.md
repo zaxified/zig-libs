@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-02 · mutation 2026-10-02 · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-09 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, GROTH16_FUZZ) · ct 2026-10-09 (ctgrind)
 
 **Performance:** not measured
 

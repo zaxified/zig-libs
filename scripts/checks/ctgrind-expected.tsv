@@ -1250,8 +1250,8 @@ opcua	ReleaseFast	chunk	1	14	1eca3e15a3507385	17e08703a66ffe0f
 # sha2 (2026-10-10) — hash: the message tainted through hash/update/peek for
 # SHA-224/256/384/512 at 0..1000 bytes; hmac: std Hmac over sha2.Sha256/512
 # with key + message tainted. Both 0.
-sha2	ReleaseFast	hash	1	0	dccd11716fb67030	5159f9e4e7e6085d
-sha2	ReleaseFast	hmac	1	0	dccd11716fb67030	f0186875cfa058e3
+sha2	ReleaseFast	hash	1	0	50d415f0e224c0fa	5159f9e4e7e6085d
+sha2	ReleaseFast	hmac	1	0	50d415f0e224c0fa	f0186875cfa058e3
 # xmss (2026-10-10) — sign: keyGen + 5 signs at h=4 with SK_SEED/SK_PRF
 # tainted. 2 = the WOTS chain length loop (root.zig:284): its count is a
 # base-w digit of H_msg(r, root, idx, M), and r = PRF(SK_PRF, idx) is

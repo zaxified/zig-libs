@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** deterministic fuzz driver (`SHA2_FUZZ`): every backend, up to six `update` cuts, `peek` after each cut and the one-shot `hash` agree with std on arbitrary bytes and on lengths at the padding boundaries; HMAC-SHA-256/384/512 (keys short, at and past the block size) and HKDF extract/expand agree with std's. 200,000 runs per harness clean in ReleaseSafe.
+
 - **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (targets `hash`, `hmac`, ReleaseFast): the message (the secret, when a key or password is hashed) is tainted through `hash`, `update` and `peek` for all four digests at 0..1000 bytes, and through std's `Hmac` over this module's `Sha256`/`Sha512` with the key tainted too. 0 in-file contexts. No code change.
 - **2026-10-07** — Tests only (pilot): instruction-count cases in `src/count.zig`, skipped unless
   `ZIGLIBS_COUNT` names one, held by `scripts/count-insns sha2` to `tools/count.tsv` (instructions per

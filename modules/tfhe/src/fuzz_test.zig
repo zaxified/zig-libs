@@ -135,6 +135,8 @@ fn classify(e: anyerror) bool {
     return false;
 }
 
+var reached: struct { accepted: [kinds.len]usize = @splat(0), refused: [kinds.len]usize = @splat(0) } = .{};
+
 fn codecHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     if (bases == null) bases = try makeBases();
     const ki = src.index(kinds.len);
@@ -160,12 +162,28 @@ fn codecHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
         },
     }
     const ok = try decodeRoundTrip(kind, scratch[0..len], gpa);
+    if (ok) reached.accepted[ki] += 1 else reached.refused[ki] += 1;
     if (mode == 0 and !ok) return error.IntactRefused;
     if (mode == 1 and !ok and kind != .client_key) return error.ValidHeaderRefused;
 }
 
 test "fuzz driver: codec readers on damaged encodings (TFHE_FUZZ)" {
     try fuzz_driver.run(codecHarness, .{ .prefix = "TFHE_FUZZ", .name = "codec" });
+}
+
+test "fuzz driver reach: every kind is both accepted and refused within 400 seeds" {
+    reached = .{};
+    for (0..400) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        try codecHarness(fuzz_driver.Rng, &rng, testing.allocator);
+    }
+    for (kinds, 0..) |kind, i| {
+        if (reached.accepted[i] == 0 or reached.refused[i] == 0) {
+            std.debug.print("reach: kind {t} accepted={d} refused={d}\n", .{ kind, reached.accepted[i], reached.refused[i] });
+            return error.HarnessDoesNotReach;
+        }
+    }
 }
 
 test "fuzz: codec readers on damaged encodings (coverage-guided exploration)" {

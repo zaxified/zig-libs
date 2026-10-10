@@ -633,22 +633,107 @@ test "DleqProof: honest accepts; S or Σ from another σ, wrong R, wrong context
     try testing.expect(verifyDleq(back, r_point, s_point, sigma_point, "ctx"));
 }
 
+const fz = @import("fuzz_test.zig");
+const EcMark = fz.Marker(enum { raw, genuine_accepted, damaged_refused });
+
 test "fuzz: PedersenProof/StProof/SchnorrProof.fromBytes never panic" {
-    try testing.fuzz({}, fuzzDecoders, .{});
+    try testing.fuzz({}, fuzzDecodersSmith, .{});
 }
-fn fuzzDecoders(_: void, smith: *std.testing.Smith) !void {
-    var a: [PedersenProof.encoded_length]u8 = undefined;
-    smith.bytes(&a);
-    _ = PedersenProof.fromBytes(a) catch {};
-    var b: [StProof.encoded_length]u8 = undefined;
-    smith.bytes(&b);
-    _ = StProof.fromBytes(b) catch {};
-    var c: [SchnorrProof.encoded_length]u8 = undefined;
-    smith.bytes(&c);
-    _ = SchnorrProof.fromBytes(c) catch {};
-    var d: [DleqProof.encoded_length]u8 = undefined;
-    smith.bytes(&d);
-    _ = DleqProof.fromBytes(d) catch {};
+
+test "fuzz driver: TECDSA_FUZZ (ec proofs)" {
+    try fz.fuzz_driver.run(fuzzDecoders, .{ .prefix = "TECDSA_FUZZ", .name = "tecdsa-ec-proofs" });
+}
+
+test "fuzz harness: ec proofs, 300 seeds, reaches every outcome" {
+    try EcMark.reach(fuzzDecoders, "tecdsa-ec-proofs", 300);
+}
+
+fn fuzzDecodersSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecoders(std.testing.Smith, smith, testing.allocator);
+}
+
+/// Mode 0: arbitrary octets into the four decoders (never a panic). Modes 1-4:
+/// an honest proof of one kind, encoded, with 0-3 octets damaged: undamaged is
+/// decoded AND verifies; damaged either fails to decode or fails to verify.
+fn fuzzDecoders(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    const mode: u8 = if (S == fz.fuzz_driver.Rng) src.valueRangeAtMost(u8, 0, 4) else 0;
+    if (mode == 0) {
+        var a: [PedersenProof.encoded_length]u8 = undefined;
+        src.bytes(&a);
+        EcMark.mark(.raw);
+        _ = PedersenProof.fromBytes(a) catch {};
+        var b: [StProof.encoded_length]u8 = undefined;
+        src.bytes(&b);
+        _ = StProof.fromBytes(b) catch {};
+        var c: [SchnorrProof.encoded_length]u8 = undefined;
+        src.bytes(&c);
+        _ = SchnorrProof.fromBytes(c) catch {};
+        var d: [DleqProof.encoded_length]u8 = undefined;
+        src.bytes(&d);
+        _ = DleqProof.fromBytes(d) catch {};
+        return;
+    }
+    var prng = std.Random.DefaultPrng.init(src.value(u64));
+    const random = prng.random();
+    const sigma = randomScalar(random);
+    const ell = randomScalar(random);
+    const x_point = pointOf(sigma);
+    const r_point = pointOf(randomScalar(random));
+    const s_point = try Element.fromPoint(try (try r_point.point()).mul(sigma.toBytes(.big), .big));
+    const t_point = try pedersenCommit(&sigma, &ell);
+    const ctx = "fuzz";
+
+    var buf: [@max(@max(PedersenProof.encoded_length, StProof.encoded_length), @max(SchnorrProof.encoded_length, DleqProof.encoded_length))]u8 = undefined;
+    var n: usize = 0;
+    switch (mode) {
+        1 => {
+            n = PedersenProof.encoded_length;
+            buf[0..PedersenProof.encoded_length].* = provePedersen(&sigma, &ell, t_point, ctx, random).toBytes();
+        },
+        2 => {
+            n = StProof.encoded_length;
+            buf[0..StProof.encoded_length].* = (try proveSt(&sigma, &ell, r_point, s_point, t_point, ctx, random)).toBytes();
+        },
+        3 => {
+            n = SchnorrProof.encoded_length;
+            buf[0..SchnorrProof.encoded_length].* = proveSchnorr(&sigma, x_point, ctx, random).toBytes();
+        },
+        else => {
+            n = DleqProof.encoded_length;
+            buf[0..DleqProof.encoded_length].* = (try proveDleq(&sigma, r_point, s_point, x_point, ctx, random)).toBytes();
+        },
+    }
+    var orig: [buf.len]u8 = undefined;
+    @memcpy(orig[0..n], buf[0..n]);
+    const flips = src.valueRangeAtMost(u8, 0, 3);
+    for (0..flips) |_| buf[src.index(n)] ^= src.valueRangeAtMost(u8, 1, 255);
+    const changed = !std.mem.eql(u8, orig[0..n], buf[0..n]);
+
+    const ok: bool = switch (mode) {
+        1 => blk: {
+            const p = PedersenProof.fromBytes(buf[0..PedersenProof.encoded_length].*) catch break :blk false;
+            break :blk verifyPedersen(p, t_point, ctx);
+        },
+        2 => blk: {
+            const p = StProof.fromBytes(buf[0..StProof.encoded_length].*) catch break :blk false;
+            break :blk verifySt(p, r_point, s_point, t_point, ctx);
+        },
+        3 => blk: {
+            const p = SchnorrProof.fromBytes(buf[0..SchnorrProof.encoded_length].*) catch break :blk false;
+            break :blk verifySchnorr(p, x_point, ctx);
+        },
+        else => blk: {
+            const p = DleqProof.fromBytes(buf[0..DleqProof.encoded_length].*) catch break :blk false;
+            break :blk verifyDleq(p, r_point, s_point, x_point, ctx);
+        },
+    };
+    if (!changed) {
+        if (!ok) return error.GenuineProofRefused;
+        EcMark.mark(.genuine_accepted);
+    } else {
+        if (ok) return error.DamagedProofAccepted;
+        EcMark.mark(.damaged_refused);
+    }
 }
 
 test "DleqProof: each equation is load-bearing, and the challenge binds Σ" {

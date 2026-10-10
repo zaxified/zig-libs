@@ -811,29 +811,169 @@ test "comptime evaluation" {
     try testing.expectEqualSlices(u8, &unhex(32, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"), &got);
 }
 
+const fuzz_driver = @import("testkit").fuzz.driver;
+
+const AgreeMark = enum { stdlib, simd, scalar, boundary, multi_cut, peek_checked, oneshot_checked, empty };
+var agree_counts: [@typeInfo(AgreeMark).@"enum".fields.len]usize = @splat(0);
+fn markAgree(comptime l: AgreeMark) void {
+    agree_counts[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
 test "fuzz: every backend and any split agree with std on arbitrary bytes" {
-    try testing.fuzz({}, fuzzAgree, .{});
+    try testing.fuzz({}, fuzzAgreeSmith, .{});
+}
+
+test "fuzz driver: SHA2_FUZZ (agree)" {
+    try fuzz_driver.run(fuzzAgree, .{ .prefix = "SHA2_FUZZ", .name = "sha2-agree" });
+}
+
+test "fuzz driver: SHA2_FUZZ (hmac)" {
+    try fuzz_driver.run(fuzzHmac, .{ .prefix = "SHA2_FUZZ", .name = "sha2-hmac" });
+}
+
+test "fuzz harness: sha2-agree, 300 seeds, reaches every outcome" {
+    agree_counts = @splat(0);
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        try fuzzAgree(fuzz_driver.Rng, &rng, testing.allocator);
+    }
+    for (agree_counts, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: sha2-agree label {t} never hit\n", .{@as(AgreeMark, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
+}
+
+test "fuzz harness: sha2-hmac, 300 seeds" {
+    hmac_counts = @splat(0);
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        try fuzzHmac(fuzz_driver.Rng, &rng, testing.allocator);
+    }
+    for (hmac_counts, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: sha2-hmac label {t} never hit\n", .{@as(HmacMark, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 /// Past the largest SIMD batch of either word size (8 × 64 = 4 × 128 bytes)
 /// several times over, so a fuzzer reaches full and partial batches.
 var fuzz_buf: [3 * 1024]u8 = undefined;
 
-fn fuzzAgree(_: void, smith: *std.testing.Smith) !void {
-    const len = smith.slice(&fuzz_buf);
+fn fuzzAgreeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzAgree(std.testing.Smith, smith, testing.allocator);
+}
+
+/// A message length: under the driver a third of the draws sit within two
+/// octets of a padding boundary (55/56/63/64, 111/112/127/128 and their
+/// multiples), where the one-block / two-block finalisation switches.
+fn fuzzLen(comptime S: type, src: *S, cap: usize) usize {
+    if (S != fuzz_driver.Rng) return src.slice(fuzz_buf[0..cap]);
+    if (src.valueRangeAtMost(u8, 0, 2) == 0) {
+        const unit: usize = if (src.value(bool)) 64 else 128;
+        const k = 1 + src.index(cap / unit);
+        const off = src.valueRangeAtMost(u8, 0, 4);
+        const len = @min(cap, k * unit + off -| 2);
+        src.bytes(fuzz_buf[0..len]);
+        markAgree(.boundary);
+        return len;
+    }
+    return src.slice(fuzz_buf[0..cap]);
+}
+
+fn fuzzAgree(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    const len = fuzzLen(S, src, fuzz_buf.len);
+    if (len == 0) markAgree(.empty);
     const data = fuzz_buf[0..len];
-    const cut = smith.valueRangeAtMost(u32, 0, len);
+    // up to 6 cut points, sorted: the pieces go to `update` one by one
+    var cuts: [6]usize = undefined;
+    const ncuts: usize = if (S == fuzz_driver.Rng) src.valueRangeAtMost(u8, 0, 6) else 1;
+    for (cuts[0..ncuts]) |*c| c.* = src.valueRangeAtMost(u32, 0, @intCast(len));
+    std.mem.sort(usize, cuts[0..ncuts], {}, std.sort.asc(usize));
+    if (ncuts > 1) markAgree(.multi_cut);
     defer test_hooks.forced = null;
     inline for (all_hashes) |H| {
         var want: [H.digest_length]u8 = undefined;
         StdOf(H).hash(data, &want, .{});
         for (backendsFor(WordOf(H))) |b| {
             test_hooks.forced = b;
+            switch (b) {
+                .stdlib => markAgree(.stdlib),
+                .simd => markAgree(.simd),
+                .scalar => markAgree(.scalar),
+            }
             var d = H.init(.{});
-            d.update(data[0..cut]);
-            d.update(data[cut..]);
+            var sd = StdOf(H).init(.{});
+            var at: usize = 0;
+            for (cuts[0..ncuts]) |c| {
+                d.update(data[at..c]);
+                sd.update(data[at..c]);
+                at = c;
+                if (!std.mem.eql(u8, &sd.peek(), &d.peek())) return error.PeekDiffers;
+                markAgree(.peek_checked);
+            }
+            d.update(data[at..]);
             try testing.expectEqualSlices(u8, &want, &d.finalResult());
+            var one: [H.digest_length]u8 = undefined;
+            H.hash(data, &one, .{});
+            try testing.expectEqualSlices(u8, &want, &one);
+            markAgree(.oneshot_checked);
         }
+    }
+}
+
+const HmacMark = enum { long_key, block_key, short_key, empty_message, hkdf };
+var hmac_counts: [@typeInfo(HmacMark).@"enum".fields.len]usize = @splat(0);
+fn markHmac(comptime l: HmacMark) void {
+    hmac_counts[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+fn fuzzHmac(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    var key_buf: [300]u8 = undefined;
+    var msg_buf: [700]u8 = undefined;
+    const klen = if (S == fuzz_driver.Rng and src.value(bool))
+        @min(key_buf.len, @as(usize, if (src.value(bool)) 64 else 128) + src.valueRangeAtMost(u8, 0, 4) -| 2)
+    else
+        src.slice(&key_buf);
+    if (S == fuzz_driver.Rng) src.bytes(key_buf[0..klen]);
+    const mlen = src.slice(&msg_buf);
+    const key = key_buf[0..klen];
+    const msg = msg_buf[0..mlen];
+    const cut = src.valueRangeAtMost(u32, 0, @intCast(mlen));
+    if (klen > 128) markHmac(.long_key) else if (klen >= 64) markHmac(.block_key) else markHmac(.short_key);
+    if (mlen == 0) markHmac(.empty_message);
+    defer test_hooks.forced = null;
+    inline for (.{ Sha256, Sha384, Sha512 }) |H| {
+        const Ours = std.crypto.auth.hmac.Hmac(H);
+        const Std = std.crypto.auth.hmac.Hmac(StdOf(H));
+        var want: [Ours.mac_length]u8 = undefined;
+        Std.create(&want, msg, key);
+        for (backendsFor(WordOf(H))) |b| {
+            test_hooks.forced = b;
+            var got: [Ours.mac_length]u8 = undefined;
+            Ours.create(&got, msg, key);
+            try testing.expectEqualSlices(u8, &want, &got);
+            var m = Ours.init(key);
+            m.update(msg[0..cut]);
+            m.update(msg[cut..]);
+            m.final(&got);
+            try testing.expectEqualSlices(u8, &want, &got);
+        }
+        // HKDF extract / expand over the same bytes
+        const OH = std.crypto.kdf.hkdf.Hkdf(Ours);
+        const SH = std.crypto.kdf.hkdf.Hkdf(Std);
+        const prk = OH.extract(key, msg);
+        try testing.expectEqualSlices(u8, &SH.extract(key, msg), &prk);
+        var okm_a: [97]u8 = undefined;
+        var okm_b: [97]u8 = undefined;
+        const olen = 1 + (mlen % 97);
+        OH.expand(okm_a[0..olen], key, prk);
+        SH.expand(okm_b[0..olen], key, prk);
+        try testing.expectEqualSlices(u8, okm_b[0..olen], okm_a[0..olen]);
+        markHmac(.hkdf);
     }
 }
 
