@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 3.5.5 (surveyed 2026-10-10)
 
-**Audit:** review none · mutation none · src ?
+**Audit:** review 2026-10-10 · mutation 2026-10-10 (21/22, 1 eq) · src 510d8447160244b9
 
 **Hardening:** fuzz 2026-10-10 (200,000 runs clean, AES192_FUZZ, every reach label hit) · ct 2026-10-10 (ctgrind enc/dec: key + plaintext/ciphertext tainted, 0 in-file on AES-NI; software backend measured unpinned, see *Constant-time contract*)
 

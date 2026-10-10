@@ -29,8 +29,27 @@
 //! all.
 //!
 //! This module is that missing binding, and nothing else. It implements no
-//! generator, holds no state, and adds no algorithm: every byte it returns
-//! came out of `std.Io.randomSecure` on this call.
+//! generator and adds no algorithm: every byte it returns came out of the
+//! kernel's CRNG on this call — through `std.Io.randomSecure`, or, on Linux
+//! without libc when `io` is std's own `Threaded`, through the kernel's vDSO
+//! `getrandom` (see *The vDSO fast path* below).
+//!
+//! ## The vDSO fast path
+//!
+//! `getrandom(2)` costs a syscall per draw: 760 ns for 32 bytes against Go's
+//! 113 ns (`zig build bench-entropy`, 2026-10-07), because Go 1.24+ draws from
+//! the kernel's vDSO `getrandom` (Linux 6.11+). That is still the kernel's
+//! generator — a ChaCha20 state in user memory that the kernel keys, reseeds
+//! and wipes across fork — not a user-space generator of ours. `fill` takes
+//! it (`vgetrandom.zig`) only when all of these hold: Linux, no libc (with
+//! libc std already calls `arc4random_buf`, which glibc 2.41+ routes there),
+//! x86_64 or aarch64, and `io.vtable` is `std.Io.Threaded`'s own table — so an
+//! `Io` that interposes on any slot (a deterministic simulator, a counting
+//! test double) still sees every draw. Anything the vDSO does not
+//! complete — no symbol, the state pool busy or not set up yet, a negative
+//! return — falls through to `io.randomSecure` below, unchanged, so the
+//! fail-closed abort is the same. The module now keeps state: one mapping of
+//! kernel-sized states and a busy flag each, taken without locks.
 //!
 //! ## The trade-off, stated plainly
 //!
@@ -123,23 +142,31 @@
 //! in std. Nothing here improves on it.
 
 const std = @import("std");
+const vgetrandom = @import("vgetrandom.zig");
+
+/// `std.Io.Threaded`'s vtable. `Threaded.io` returns the address of one
+/// comptime constant table, so a `Threaded` that is never used (only its
+/// address enters the Io) yields the same pointer every instance carries.
+const threaded_vtable = blk: {
+    var probe: std.Io.Threaded = undefined;
+    break :blk probe.io().vtable;
+};
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Fail-closed entropy source — `fill` draws from `std.Io.randomSecure` or aborts the process; no generator, no silent degrade. **Panics on failure.**",
+    .doc = "Fail-closed entropy source — `fill` draws from the kernel CRNG (vDSO `getrandom` under std's Threaded Io on Linux, else `std.Io.randomSecure`) or aborts the process; no generator, no silent degrade. **Panics on failure.**",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "any",
     .targets = .{.linux64},
-    .platform = .any, // no syscall of its own; `std.Io` carries the OS-specific half
+    .platform = .any, // Linux vDSO path is optional; everything else goes through `std.Io`
     .role = .util,
-    // No state whatsoever — `fill` is a pure function of its arguments, and
-    // `std.Io.randomSecure` is documented Threadsafe, so concurrent calls
-    // against one `std.Io` are fine. Nothing here needs synchronizing, which
-    // is why this is `.reentrant` and not `.threadsafe`.
-    .concurrency = .reentrant,
+    // The vDSO path keeps a pool of kernel states, each taken by an atomic
+    // busy flag (`vgetrandom.zig`); `std.Io.randomSecure` is documented
+    // Threadsafe. Concurrent `fill` calls are safe.
+    .concurrency = .threadsafe,
     // Nothing is modelled after anything: this module is a binding over
     // `std.Io.randomSecure`, not an implementation of anything. The
     // abort-rather-than-return-weak-entropy posture it takes is the one
@@ -241,6 +268,14 @@ pub fn fill(io: std.Io, buf: []u8) void {
     // backend implements its own.
     if (io.vtable.swapCancelProtection == &std.Io.unreachableSwapCancelProtection)
         @panic(unsupported_io_message);
+
+    // The vDSO fast path (module doc): only when `io` IS std's Threaded --
+    // its whole vtable, not one slot, so an Io that copies Threaded's table
+    // and swaps any entry (a simulator, a test double, F1's case above) keeps
+    // the path below. Nothing here can be canceled, so it runs before the
+    // protection swap.
+    if (vgetrandom.supported and buf.len != 0 and io.vtable == threaded_vtable and vgetrandom.draw(buf)) return;
+
     const prev = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(prev);
 
@@ -938,4 +973,19 @@ test "the abort messages each name their own cause, and only their own" {
     try testing.expect(std.mem.indexOf(u8, canceled_contract_violation_message, "Canceled") != null);
     try testing.expect(std.mem.indexOf(u8, canceled_contract_violation_message, "swapCancelProtection") != null);
     try testing.expect(std.mem.indexOf(u8, canceled_contract_violation_message, "EntropyUnavailable") == null);
+}
+
+test {
+    _ = vgetrandom;
+}
+
+test "fill under std's Threaded Io takes the vDSO path where the kernel offers it" {
+    if (!vgetrandom.supported) return error.SkipZigTest;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try std.testing.expect(io.vtable == threaded_vtable);
+    var buf: [64]u8 = @splat(0);
+    fill(io, &buf);
+    try std.testing.expect(!std.mem.allEqual(u8, &buf, 0));
 }

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — no computation on the secret bytes: it copies std.Io.randomSecure output to the caller, so there is nothing to time
 
-**Performance:** ref 1.86–6.74× Go crypto/rand.Read · fastest ? (measured 2026-10-07)
+**Performance:** ref 0.98–1.01× Go crypto/rand.Read · fastest ? (measured 2026-10-10)
 
 **Evidence:** kat — tests pin which std entry point is called; no output value to check
 
@@ -364,8 +364,8 @@ filled the whole buffer.
 - **Class D** — our own design — no third party exists to agree with, by construction.
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
-**What the tests actually contain.** own policy binding over std.Io.randomSecure; no algorithm and no wire, so no third party to agree with — tests pin WHICH std entry point is called, not any output value
+**What the tests actually contain.** own policy binding over the kernel CRNG (std.Io.randomSecure, or the vDSO `getrandom` under std's Threaded Io); no algorithm and no wire, so no third party to agree with — tests pin WHICH std entry point is called, not any output value
 
 ## Backlog / deferred
 
-- **Speed: 1.86–6.74× Go `crypto/rand.Read`'s time** *(bench 2026-10-07, `zig build bench-entropy`, Linux 7.0)*: 32 B 760 ns against 113 ns, 4 KiB and 1 MiB about 1.9×. Caps the grade at 4 (performance axis). Go 1.24+ calls the kernel's vDSO `getrandom` (Linux 6.11+: a per-thread ChaCha state the kernel reseeds, no syscall per call); `fill` goes through `std.Io.randomSecure`, one `getrandom` syscall per call. Closing it means a vDSO `vgetrandom` path with its per-thread opaque state (`mmap` with the parameters the kernel reports), falling back to the syscall where the vDSO lacks the symbol — still fail-closed. Effort: medium.
+- ~~**Speed: 1.86–6.74× Go `crypto/rand.Read`'s time**~~ **closed 2026-10-10**: `fill` takes the kernel's vDSO `getrandom` under std's Threaded Io on Linux without libc (`src/vgetrandom.zig`) → 0.98–1.01× Go (32 B 99 ns, 4 KiB, 1 MiB). Fallback to `std.Io.randomSecure` on anything the vDSO does not complete, so fail-closed is unchanged. Not done: "fastest in the field" (Rust `getrandom` takes the syscall, so Go's vDSO path is likely the fastest; unmeasured).

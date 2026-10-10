@@ -2611,6 +2611,10 @@ const CatalogStep = struct {
         // reported by check-catalog-table.
         var stale_cards: std.ArrayList(struct { path: []const u8, data: []const u8 }) = .empty;
         var card_failed = false;
+        // Grade number per module and the modules a project outside this repo
+        // imports, for the closure rule after the loop.
+        var grade_of = std.StringHashMap(u8).init(b.allocator);
+        var consumed: std.ArrayList([]const u8) = .empty;
         const today = todayDay(io);
         for (module_list) |m| {
             const src = b.build_root.handle.readFileAlloc(io, b.fmt("modules/{s}/src/root.zig", .{m.name}), b.allocator, .limited(2 * 1024 * 1024)) catch |err| {
@@ -2658,8 +2662,41 @@ const CatalogStep = struct {
             const fixed = withGradeLine(b, mat.src, grade.line(b));
             if (!std.mem.eql(u8, fixed, mat.src)) stale_cards.append(b.allocator, .{ .path = mat.path, .data = fixed }) catch @panic("OOM");
             docs.put(m.name, .{ .doc = doc, .note = note, .grade = grade.cell(b) }) catch @panic("OOM");
+            grade_of.put(m.name, grade.n) catch @panic("OOM");
+            if (mat.consumer) consumed.append(b.allocator, m.name) catch @panic("OOM");
         }
+        // The same rule over the dependency closure (owner, 2026-10-10): a
+        // consumer builds every module its import pulls in, so a grade-4 `deps`
+        // entry under a grade-3 module ships the main-path-only code anyway.
+        // `test_deps` are not followed -- they never reach the consumer's binary.
         if (card_failed) return step.fail("{s}: a module's maturity card is missing or malformed (logged above)", .{verb});
+        var closure_failed = false;
+        {
+            var seen = std.StringHashMap(void).init(b.allocator);
+            for (consumed.items) |root| {
+                seen.clearRetainingCapacity();
+                var stack: std.ArrayList([]const u8) = .empty;
+                stack.append(b.allocator, root) catch @panic("OOM");
+                while (stack.pop()) |name| {
+                    const deps = for (module_list) |mm| {
+                        if (std.mem.eql(u8, mm.name, name)) break mm.deps;
+                    } else &.{};
+                    for (deps) |dep| {
+                        if ((seen.getOrPut(dep) catch @panic("OOM")).found_existing) continue;
+                        stack.append(b.allocator, dep) catch @panic("OOM");
+                        const n = grade_of.get(dep) orelse continue;
+                        if (n >= 4) {
+                            std.log.err(
+                                "{s}: module '{s}' is grade {d} but consumed module '{s}' depends on it (through `deps`) -- a consumed module's dependencies must be 3 or better too",
+                                .{ verb, dep, n, root },
+                            );
+                            closure_failed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (closure_failed) return step.fail("{s}: a consumed module depends on a module graded 4 or worse (logged above)", .{verb});
 
         const readme = b.build_root.handle.readFileAlloc(io, "README.md", b.allocator, .limited(4 * 1024 * 1024)) catch |err| {
             std.log.err("{s}: cannot read README.md: {t}", .{ verb, err });

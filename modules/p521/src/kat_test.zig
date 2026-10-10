@@ -237,3 +237,37 @@ test "Wycheproof ECDH secp521r1: 669 rows" {
     }
     try testing.expectEqual(@as(usize, 669), t.valid + t.invalid + t.acc_ok + t.acc_bad);
 }
+
+// Audit 2026-10-10 (mutation survivors 29, 35, 36, 37): each refusal below
+// was unpinned — the verdict a caller sees could change without a test failing.
+test "refusals: zero secret key, zero r or s, non-strict DER signatures" {
+    const E = root.EcdsaP521Sha512;
+    const zero: [66]u8 = @splat(0);
+
+    // A zero secret has no public key: fromSecretKey and signing refuse it
+    // (without the check, the pair came back with the identity as its key).
+    try testing.expectError(error.IdentityElement, E.KeyPair.fromSecretKey(.{ .bytes = zero }));
+
+    const kp = try E.KeyPair.generateDeterministic(@splat(7));
+    var bad_kp = kp;
+    bad_kp.secret_key.bytes = zero;
+    try testing.expectError(error.IdentityElement, bad_kp.sign("m", null));
+
+    // r = 0 or s = 0 is refused at Verifier.init with its own error (std's
+    // Ecdsa does the same), not left to fail later as a mismatch.
+    const sig = try kp.sign("m", null);
+    var bad = sig;
+    bad.r = zero;
+    try testing.expectError(error.IdentityElement, bad.verify("m", kp.public_key));
+    bad = sig;
+    bad.s = zero;
+    try testing.expectError(error.IdentityElement, bad.verify("m", kp.public_key));
+
+    // Strict DER: a negative INTEGER and a SEQUENCE length that disagrees
+    // with the content are refused; the well-formed twin parses.
+    try testing.expectError(error.InvalidEncoding, E.Signature.fromDer(&.{ 0x30, 0x06, 0x02, 0x01, 0x80, 0x02, 0x01, 0x01 }));
+    try testing.expectError(error.InvalidEncoding, E.Signature.fromDer(&.{ 0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01 }));
+    try testing.expectError(error.InvalidEncoding, E.Signature.fromDer(&.{ 0x30, 0x05, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01 }));
+    const ok = try E.Signature.fromDer(&.{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01 });
+    try testing.expectEqual(@as(u8, 1), ok.r[65]);
+}

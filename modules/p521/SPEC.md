@@ -6,11 +6,11 @@
 
 **Scope:** parity — OpenSSL 3.5.5 (surveyed 2026-10-10)
 
-**Audit:** review none · mutation none · src ?
+**Audit:** review 2026-10-10 · mutation 2026-10-10 (34/38, 4 eq) · src e7543f2635547189
 
 **Hardening:** fuzz 2026-10-10 (200,000 runs clean, P521_FUZZ, every reach label hit) · ct 2026-10-10 (ctgrind mul/keygen/sign/ecdh: secret tainted, 0 in-file; positive control `vartime` flags)
 
-**Performance:** ref 2.17× OpenSSL 3.5.5 ecp_nistp521 · fastest ? (measured 2026-10-10)
+**Performance:** ref 0.68–1.70× OpenSSL 3.5.5 ecp_nistp521 · fastest ? (measured 2026-10-10)
 
 **Known defects:** none recorded
 
@@ -192,27 +192,34 @@ same host, 2026-10-10:
 
 | op | p521 | OpenSSL 3.5.5 | ratio |
 |---|--:|--:|--:|
-| keygen | 615 µs | — | — |
-| ECDH | 637 µs | 404 µs | 1.58× |
-| sign | 741 µs | 342 µs | 2.17× |
-| verify | 849 µs | 646 µs | 1.31× |
+| keygen | 122 µs | — | — |
+| ECDH | 702 µs | 412 µs | 1.70× |
+| sign | 237 µs | 350 µs | 0.68× |
+| verify | 836 µs | 677 µs | 1.23× |
 
-Under the owner's 2.5× bar for phase 1 (2026-10-10), so the base-point table
-stays in the backlog.
+Second measurement of the day, after the fixed-base comb (`combMulBaseCt`,
+`src/base_table.zig`): keygen 615 → 122 µs, sign 741 → 237 µs (2.17× → 0.68×).
+Taken while other benchmarks shared the host, so ±10 %; the verdict (worst
+ratio 1.70×, ECDH's variable-base ladder) is not close to a boundary.
 
 ## What is deliberately not done
 
 - **No vendored fiat-crypto** (owner, 2026-10-10): hand-written Mersenne
   arithmetic, held by the differential and the bound test.
-- **No precomputed base table in phase 1** (owner, 2026-10-10): one
-  constant-time variable-base path for every secret. Not never — *Backlog*.
+- ~~**No precomputed base table in phase 1**~~ — taken out of the backlog
+  the same day (2026-10-10) for the owner's goal that a consumed module's
+  dependencies grade 3 or better (sign was 2.17×, P4). The table is generated
+  (`tools/gen_base_table.py`, independent Python affine arithmetic), not built
+  at comptime: that cost every compile ~1 minute and ~2 GB.
 - **No ECDH object**: a function `ecdh`/`ecdhInto` next to `P521.mul`, as std
   has no ECDH type for its NIST curves either (owner, 2026-10-10).
 
 ## Backlog / deferred
 
-- **Fixed-base comb for k·G / d·G** — sign is 2.17× OpenSSL, keygen ~615 µs;
-  a comptime affine comb (as `p256`) would roughly halve both. Fits §2.
+- ~~**Fixed-base comb for k·G / d·G**~~ — done 2026-10-10 (see *Performance*).
+- **ECDH 1.70× OpenSSL** — the variable-base ladder (4-bit fixed windows,
+  projective complete formulas) is now the slowest path; MULX/ADX field
+  multiply (below) is the lever.
 - **Faster scalar inversion** — Fermat costs ~650 Montgomery products per
   signature; a constant-time safegcd (`p256/src/modinv.zig`'s shape) or
   blinding would remove most of it.

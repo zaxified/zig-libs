@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Speed, behaviour unchanged for callers:** `fill` draws through the kernel's vDSO
+  `getrandom` (Linux 6.11+, x86_64/aarch64, no libc) when `io` is std's `Threaded` — its whole
+  vtable, so an `Io` that interposes on any slot still sees every draw. New `src/vgetrandom.zig`:
+  states mapped with the parameters the kernel reports, a lock-free pool of 64 slots with busy flags
+  outside the droppable mapping, own vDSO symbol lookup (std 0.16's `os.linux.vdso` is not `pub`).
+  Anything the vDSO does not complete falls back to `io.randomSecure`, so the fail-closed abort is the
+  same (the seccomp test still aborts). `bench-entropy`: 1.86–6.74× → 0.98–1.01× Go `crypto/rand.Read`
+  (32 B: 760 → 99 ns), grade 4 → 3. `meta.concurrency` `.reentrant` → `.threadsafe` (the module keeps
+  state now).
+
 - **2026-09-14** — **BEHAVIOURAL (aborts earlier, with its own message):** audit F1, round-2
   decision Q8. `fill` called `swapCancelProtection` unconditionally; on `std.Io.failing`, whose
   slot is std's `unreachableSwapCancelProtection`, that is undefined behaviour. Measured on the
