@@ -442,15 +442,41 @@ const message_seeds = [_][]const u8{
     seed(""),
 };
 
+const fz = @import("fuzz_test.zig");
+const MessageMark = fz.Marker(enum { vote_req, vote_resp, append_resp, append_req, refused });
+
 test "fuzz: Message.decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecode, .{ .corpus = &message_seeds });
+    try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &message_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: RAFT_FUZZ (message)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "RAFT_FUZZ", .name = "raft-message" });
+}
+
+test "fuzz harness: message, 500 seeds, reaches every outcome" {
+    try MessageMark.reach(fuzzDecode, "raft-message", 500);
+}
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &message_seeds;
     var buf: [160]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
     var scratch: [4]Entry = undefined;
-    const m = Message.decode(buf[0..len], 0, 1, &scratch) catch return;
+    const m = Message.decode(buf[0..len], 0, 1, &scratch) catch {
+        MessageMark.mark(.refused);
+        return;
+    };
+    switch (m.body) {
+        .vote_req => MessageMark.mark(.vote_req),
+        .vote_resp => MessageMark.mark(.vote_resp),
+        .append_resp => MessageMark.mark(.append_resp),
+        .append_req => MessageMark.mark(.append_req),
+    }
     // Accepted ⇒ re-encodes to the same bytes (the codec has one encoding).
     var out: [160]u8 = undefined;
     std.debug.assert(m.encodedLen() == len);

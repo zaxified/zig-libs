@@ -185,17 +185,41 @@ const relay_seeds = [_][]const u8{
     seedHex("ff"),
 };
 
+const fz = @import("fuzz_test.zig");
+const RelayMark = fz.Marker(enum { feefilter, sendcmpct, empty, refused });
+
 test "fuzz: feefilter / sendcmpct / expectEmpty never panic on arbitrary bytes" {
-    try testing.fuzz({}, fuzzRelay, .{ .corpus = &relay_seeds });
+    try testing.fuzz({}, fuzzRelaySmith, .{ .corpus = &relay_seeds });
 }
 
-fn fuzzRelay(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: BTCP2P_FUZZ (relay)" {
+    try fz.fuzz_driver.run(fuzzRelay, .{ .prefix = "BTCP2P_FUZZ", .name = "btcp-relay" });
+}
+
+test "fuzz harness: relay, 500 seeds, reaches every outcome" {
+    try RelayMark.reach(fuzzRelay, "btcp-relay", 500);
+}
+
+fn fuzzRelaySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRelay(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzRelay(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &relay_seeds;
     var buf: [32]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
     const b = buf[0..len];
     if (decodeFeeFilter(b)) |f| {
         try testing.expect(len == 8 and f.feerate >= 0 and f.feerate <= MAX_MONEY);
+        RelayMark.mark(.feefilter);
+    } else |_| RelayMark.mark(.refused);
+    if (decodeSendCmpct(b)) |_| {
+        try testing.expect(len == 9);
+        RelayMark.mark(.sendcmpct);
     } else |_| {}
-    if (decodeSendCmpct(b)) |_| try testing.expect(len == 9) else |_| {}
-    if (expectEmpty(b)) |_| try testing.expect(len == 0) else |_| {}
+    if (expectEmpty(b)) |_| {
+        try testing.expect(len == 0);
+        RelayMark.mark(.empty);
+    } else |_| {}
 }

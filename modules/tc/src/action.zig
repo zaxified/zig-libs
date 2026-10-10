@@ -307,6 +307,11 @@ pub const EncodeError = std.mem.Allocator.Error || error{
 // ── gact ────────────────────────────────────────────────────────────────────
 
 /// `tc_gact_p.ptype` — how the probabilistic variant picks its packets.
+///
+/// Non-exhaustive, like `Verdict`: the value is read off the wire, and a
+/// newer kernel (or a hostile peer) may send one this module predates.
+/// `@enumFromInt` on an exhaustive enum panicked there (found by the
+/// 2026-10-10 fuzz driver, seed 202).
 pub const ProbType = enum(u16) {
     /// `PGACT_NONE`.
     none = 0,
@@ -314,6 +319,7 @@ pub const ProbType = enum(u16) {
     netrand = 1,
     /// `PGACT_DETERM` — every `pval`-th packet.
     determ = 2,
+    _,
 };
 
 /// `struct tc_gact_p` — the `random RANDTYPE ACTION VAL` modifier.
@@ -1802,18 +1808,58 @@ const ActionCorpus = struct {
     }
 };
 
-test "fuzz: action parsers never crash on arbitrary payloads" {
-    var corpus: ActionCorpus = .{};
-    try testing.fuzz({}, fuzzParseAction, .{ .corpus = try corpus.build() });
+test "an unknown gact probability type from the wire is carried, not a panic" {
+    // Regression (fuzz driver TC_FUZZ seed 202): `GactProb.decode` did
+    // `@enumFromInt` on an exhaustive enum.
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    const acts = [_]ActionSpec{.{ .gact = .{
+        .random = .{ .ptype = .netrand, .pval = 4, .paction = .ok },
+    } }};
+    try appendActionList(gpa, &list, 7, &acts, ratespec.golden_psched);
+    const probe = (GactProb{ .ptype = .netrand, .pval = 4, .paction = .ok }).encode();
+    const at = std.mem.indexOf(u8, list.items, &probe).?;
+    std.mem.writeInt(u16, list.items[at..][0..2], 0x7777, native_endian);
+
+    var outer: codec.AttrIterator = .{ .buf = list.items };
+    const nest = (try outer.next()).?;
+    var it: ActionIterator = .init(nest.data);
+    const g = (try it.next()).?;
+    try testing.expectEqual(@as(u16, 0x7777), @intFromEnum(g.gact.?.random.?.ptype));
+    try testing.expectEqual(@as(u16, 4), g.gact.?.random.?.pval);
 }
 
-fn fuzzParseAction(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const ActionMark = fz.Marker(enum { action, action_refused, list, stats, iterated, refused });
+
+test "fuzz: action parsers never crash on arbitrary payloads" {
+    var corpus: ActionCorpus = .{};
+    try testing.fuzz({}, fuzzParseActionSmith, .{ .corpus = try corpus.build() });
+}
+
+test "fuzz driver: TC_FUZZ (action)" {
+    try fz.fuzz_driver.run(fuzzParseAction, .{ .prefix = "TC_FUZZ", .name = "tc-action" });
+}
+
+test "fuzz harness: action, 500 seeds, reaches every outcome" {
+    try ActionMark.reach(fuzzParseAction, "tc-action", 500);
+}
+
+fn fuzzParseActionSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseAction(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParseAction(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: ActionCorpus = .{};
+    const entries = corpus.build() catch return;
     // 4096, not 256: a police action carries two 1 KiB rate tables, and a seed
     // longer than the buffer is not a big seed — `Smith.slice` reads it back
     // as the EMPTY one. The one action kind with a loop worth fuzzing could
     // not have passed through this module's own harness at 256.
     var raw: [4096]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and all four parsers were handed an EMPTY
@@ -1827,20 +1873,29 @@ fn fuzzParseAction(_: void, smith: *std.testing.Smith) !void {
     // empty slice — an action with no attributes is a legal (if useless)
     // entry — so an acceptance count called this harness healthy while it
     // walked nothing.
-    const len: usize = smith.slice(&raw);
+    const len: usize = fz.drawInput(S, src, &raw, entries);
     const buf = raw[0..len];
     // ⚠ `value(u64)` truncated, not `value(u16)`: a `u16` draw reads eight
     // input octets as a little-endian u64 and only survives if the whole word
     // fits in 16 bits, so the ordinal was 0 — `TCA_ACT_UNSPEC` — for every
     // seed. The ordinal travels in the seed's tail now.
-    const order: u16 = @truncate(smith.value(u64));
-    if (parseAction(order, buf)) |a| std.mem.doNotOptimizeAway(a.kind().len) else |_| {}
-    if (parseActionList(buf)) |l| std.mem.doNotOptimizeAway(l.total) else |_| {}
-    if (parseStats(buf)) |s| std.mem.doNotOptimizeAway(s.packets) else |_| {}
+    const order: u16 = @truncate(src.value(u64));
+    if (parseAction(order, buf)) |a| {
+        std.mem.doNotOptimizeAway(a.kind().len);
+        ActionMark.mark(.action);
+    } else |_| ActionMark.mark(.action_refused);
+    if (parseActionList(buf)) |l| {
+        std.mem.doNotOptimizeAway(l.total);
+        if (l.total != 0) ActionMark.mark(.list);
+    } else |_| ActionMark.mark(.refused);
+    if (parseStats(buf)) |s| {
+        std.mem.doNotOptimizeAway(s.packets);
+        if (s.packets != 0 or s.bytes != 0) ActionMark.mark(.stats);
+    } else |_| {}
     if (actionsOf(buf)) |maybe| {
         if (maybe) |it_const| {
             var it = it_const;
-            while (it.next() catch null) |_| {}
+            while (it.next() catch null) |_| ActionMark.mark(.iterated);
         }
     } else |_| {}
 }

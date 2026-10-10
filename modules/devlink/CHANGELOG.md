@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `DEVLINK_FUZZ` over the existing harnesses (region + chunk assembler, param, resource, dev + info, port, health, notification); reach labels count real outcomes. No code or API change.
 - **2026-10-05** — Mutation run: 29 of 40 killed, 2 equivalent; 5 tests added
   and 1 extended (top-level snapshot ids past `max_snapshots`, an empty chunk
   outside the window, a 9-octet u64, and `walkStep` over the mock socket: a

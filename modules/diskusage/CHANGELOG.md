@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `DISKUSAGE_FUZZ` over the existing harnesses (lstatPath on corpus-damaged path bytes: embedded NUL refused, never truncated); reach labels count real outcomes. No code or API change.
 - **2026-09-30** — **Added: parallel traversal (`Options.threads`) and a
   prune predicate (`Options.should_descend`).** `threads = 0` (one worker per
   CPU) or `n` walks directories concurrently over `std.Io.Group`, with one

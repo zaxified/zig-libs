@@ -759,14 +759,31 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const ParamMark = fz.Marker(enum { decoded, refused, valued });
+
 test "fuzz: parameter decoding never crashes" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzParam, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzParamSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzParam(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: DEVLINK_FUZZ (param)" {
+    try fz.fuzz_driver.run(fuzzParam, .{ .prefix = "DEVLINK_FUZZ", .name = "devlink-param" });
+}
+
+test "fuzz harness: param, 500 seeds, reaches every outcome" {
+    try ParamMark.reach(fuzzParam, "devlink-param", 500);
+}
+
+fn fuzzParamSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParam(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParam(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: Corpus = .{};
+    const entries = corpus.build() catch return;
     var buf: [512]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `parse` was handed an empty attribute
@@ -778,12 +795,14 @@ fn fuzzParam(_: void, smith: *std.testing.Smith) !void {
     // attribute list is a legal devlink reply — every field is optional — so
     // `parse("")` succeeds, and the collapsed harness scored a perfect 7 of 7
     // while never entering the PARAM nest or its value list.
-    const len: usize = smith.slice(&buf);
-    if (parse(testing.allocator, buf[0..len])) |p| {
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    if (parse(gpa, buf[0..len])) |p| {
         var v = p;
         _ = v.reloadWouldChange();
-        v.deinit(testing.allocator);
-    } else |_| {}
+        ParamMark.mark(.decoded);
+        if (v.values.len != 0) ParamMark.mark(.valued);
+        v.deinit(gpa);
+    } else |_| ParamMark.mark(.refused);
 }
 
 test "corpus: every param seed reaches the parser, and the decoded count is pinned" {

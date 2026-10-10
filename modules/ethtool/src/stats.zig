@@ -752,14 +752,31 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const StatsMark = fz.Marker(enum { stats_ok, stats_refused, sets_ok, sets_refused, groups, strings });
+
 test "fuzz: statistics and string-set decoding never crash or leak" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzStats, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzStatsSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzStats(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: ETHTOOL_FUZZ (stats)" {
+    try fz.fuzz_driver.run(fuzzStats, .{ .prefix = "ETHTOOL_FUZZ", .name = "ethtool-stats" });
+}
+
+test "fuzz harness: stats, 500 seeds, reaches every outcome" {
+    try StatsMark.reach(fuzzStats, "ethtool-stats", 500);
+}
+
+fn fuzzStatsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzStats(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzStats(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: Corpus = .{};
+    const entries = corpus.build() catch return;
     var raw: [512]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and both decoders were handed an empty
@@ -772,16 +789,22 @@ fn fuzzStats(_: void, smith: *std.testing.Smith) !void {
     // of 8 stats replies and 8 of 8 string-set replies "decoded", 0 groups and
     // 0 strings recovered before; 8 of 8 non-empty, 3 and 5 decoded, 3 groups
     // and 2 strings after.**
-    const len: usize = smith.slice(&raw);
+    const len: usize = fz.drawInput(S, src, &raw, entries);
     const buf = raw[0..len];
-    if (parse(testing.allocator, buf)) |s| {
+    if (parse(gpa, buf)) |s| {
         var v = s;
-        v.deinit(testing.allocator);
-    } else |_| {}
-    if (parseStringSets(testing.allocator, buf)) |s| {
+        StatsMark.mark(.stats_ok);
+        if (v.groups.len != 0) StatsMark.mark(.groups);
+        v.deinit(gpa);
+    } else |_| StatsMark.mark(.stats_refused);
+    if (parseStringSets(gpa, buf)) |s| {
         var v = s;
-        v.deinit(testing.allocator);
-    } else |_| {}
+        StatsMark.mark(.sets_ok);
+        for (v.sets) |one| {
+            if (one.entries.len != 0) StatsMark.mark(.strings);
+        }
+        v.deinit(gpa);
+    } else |_| StatsMark.mark(.sets_refused);
 }
 
 test "corpus: every stats seed reaches both decoders, and the counts are pinned" {

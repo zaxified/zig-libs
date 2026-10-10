@@ -689,14 +689,35 @@ const tag_seeds = [_][]const u8{
     seed(""), // the empty payload: Truncated, and what the collapsed harness ran
 };
 
+const fz = @import("fuzz_test.zig");
+const TagMark = fz.Marker(enum { ok, refused });
+
 test "fuzz: tagOf never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzTagOf, .{ .corpus = &tag_seeds });
+    try testing.fuzz({}, fuzzTagOfSmith, .{ .corpus = &tag_seeds });
 }
 
-fn fuzzTagOf(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: RAFT_FUZZ (tag)" {
+    try fz.fuzz_driver.run(fuzzTagOf, .{ .prefix = "RAFT_FUZZ", .name = "raft-tag" });
+}
+
+test "fuzz harness: tag, 500 seeds, reaches every outcome" {
+    try TagMark.reach(fuzzTagOf, "raft-tag", 500);
+}
+
+fn fuzzTagOfSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzTagOf(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzTagOf(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &tag_seeds;
     var buf: [8]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    _ = tagOf(buf[0..len]) catch return;
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    _ = tagOf(buf[0..len]) catch {
+        TagMark.mark(.refused);
+        return;
+    };
+    TagMark.mark(.ok);
 }
 
 /// Log entries, in the format the length draw reads: `term(8) kind(1)
@@ -714,14 +735,34 @@ const log_entry_seeds = [_][]const u8{
     seed(""), // empty: what the collapsed harness ran
 };
 
+const LogEntryMark = fz.Marker(enum { ok, refused });
+
 test "fuzz: LogEntry.decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzLogEntry, .{ .corpus = &log_entry_seeds });
+    try testing.fuzz({}, fuzzLogEntrySmith, .{ .corpus = &log_entry_seeds });
 }
 
-fn fuzzLogEntry(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: RAFT_FUZZ (log-entry)" {
+    try fz.fuzz_driver.run(fuzzLogEntry, .{ .prefix = "RAFT_FUZZ", .name = "raft-log-entry" });
+}
+
+test "fuzz harness: log-entry, 500 seeds, reaches every outcome" {
+    try LogEntryMark.reach(fuzzLogEntry, "raft-log-entry", 500);
+}
+
+fn fuzzLogEntrySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzLogEntry(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzLogEntry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &log_entry_seeds;
     var buf: [LogEntry.wire_len * 2]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    _ = LogEntry.decode(buf[0..len]) catch return;
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    _ = LogEntry.decode(buf[0..len]) catch {
+        LogEntryMark.mark(.refused);
+        return;
+    };
+    LogEntryMark.mark(.ok);
 }
 
 /// RequestVote frames, in the format the length draw reads. Both decoders see
@@ -740,15 +781,31 @@ const request_vote_seeds = [_][]const u8{
     seed(""), // empty: what the collapsed harness ran
 };
 
+const VoteMark = fz.Marker(enum { req, resp, refused });
+
 test "fuzz: RequestVote req/resp decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzRequestVote, .{ .corpus = &request_vote_seeds });
+    try testing.fuzz({}, fuzzRequestVoteSmith, .{ .corpus = &request_vote_seeds });
 }
 
-fn fuzzRequestVote(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: RAFT_FUZZ (request-vote)" {
+    try fz.fuzz_driver.run(fuzzRequestVote, .{ .prefix = "RAFT_FUZZ", .name = "raft-request-vote" });
+}
+
+test "fuzz harness: request-vote, 500 seeds, reaches every outcome" {
+    try VoteMark.reach(fuzzRequestVote, "raft-request-vote", 500);
+}
+
+fn fuzzRequestVoteSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRequestVote(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzRequestVote(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &request_vote_seeds;
     var buf: [RequestVoteReq.wire_len * 2]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    _ = RequestVoteReq.decode(buf[0..len]) catch {};
-    _ = RequestVoteResp.decode(buf[0..len]) catch {};
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    if (RequestVoteReq.decode(buf[0..len])) |_| VoteMark.mark(.req) else |_| VoteMark.mark(.refused);
+    if (RequestVoteResp.decode(buf[0..len])) |_| VoteMark.mark(.resp) else |_| VoteMark.mark(.refused);
 }
 
 /// AppendEntries frames. The header is `tag(1) term(8) leader(4) prevIdx(8)
@@ -782,15 +839,31 @@ const append_entries_seeds = [_][]const u8{
     seed(""), // empty: what the collapsed harness ran
 };
 
+const AppendMark = fz.Marker(enum { req, with_entries, resp, refused });
+
 test "fuzz: AppendEntries req/resp decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzAppendEntries, .{ .corpus = &append_entries_seeds });
+    try testing.fuzz({}, fuzzAppendEntriesSmith, .{ .corpus = &append_entries_seeds });
 }
 
-fn fuzzAppendEntries(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: RAFT_FUZZ (append-entries)" {
+    try fz.fuzz_driver.run(fuzzAppendEntries, .{ .prefix = "RAFT_FUZZ", .name = "raft-append-entries" });
+}
+
+test "fuzz harness: append-entries, 500 seeds, reaches every outcome" {
+    try AppendMark.reach(fuzzAppendEntries, "raft-append-entries", 500);
+}
+
+fn fuzzAppendEntriesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzAppendEntries(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzAppendEntries(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &append_entries_seeds;
     // Wider than `max_wire` so a full header plus a lying entry count — the
     // out-of-bounds-write case — is inside the drawn range.
     var buf: [AppendEntriesReq.max_wire + 16]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
 
     var scratch: [max_entries_per_msg]LogEntry = undefined;
     if (AppendEntriesReq.decode(buf[0..len], &scratch)) |req| {
@@ -798,8 +871,10 @@ fn fuzzAppendEntries(_: void, smith: *std.testing.Smith) !void {
         // by `scratch` — the property the old assert was standing in for.
         std.debug.assert(req.entries.len <= max_entries_per_msg);
         for (req.entries) |e| std.mem.doNotOptimizeAway(e.term);
-    } else |_| {}
-    _ = AppendEntriesResp.decode(buf[0..len]) catch {};
+        AppendMark.mark(.req);
+        if (req.entries.len != 0) AppendMark.mark(.with_entries);
+    } else |_| AppendMark.mark(.refused);
+    if (AppendEntriesResp.decode(buf[0..len])) |_| AppendMark.mark(.resp) else |_| AppendMark.mark(.refused);
 }
 
 /// Persistent-state images: `currentTerm(8) votedFor(4) logLen(4)` then
@@ -826,20 +901,40 @@ const persistent_state_seeds = [_][]const u8{
     seed(""), // empty: what the collapsed harness ran
 };
 
+const PersistMark = fz.Marker(enum { ok, log_nonempty, refused });
+
 test "fuzz: PersistentState.deserialize never panics or over-allocates" {
-    try testing.fuzz({}, fuzzPersistentState, .{ .corpus = &persistent_state_seeds });
+    try testing.fuzz({}, fuzzPersistentStateSmith, .{ .corpus = &persistent_state_seeds });
 }
 
-fn fuzzPersistentState(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: RAFT_FUZZ (persistent)" {
+    try fz.fuzz_driver.run(fuzzPersistentState, .{ .prefix = "RAFT_FUZZ", .name = "raft-persistent" });
+}
+
+test "fuzz harness: persistent, 500 seeds, reaches every outcome" {
+    try PersistMark.reach(fuzzPersistentState, "raft-persistent", 500);
+}
+
+fn fuzzPersistentStateSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPersistentState(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzPersistentState(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const entries: []const []const u8 = &persistent_state_seeds;
     var buf: [PersistentState.header_len + 4 * LogEntry.wire_len]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
 
     // The testing allocator is the guard against the unbounded-count bug: a
     // count the buffer cannot back must be rejected BEFORE `alloc`, so this
     // never asks for more than `buf` could possibly describe.
-    const st = PersistentState.deserialize(testing.allocator, buf[0..len]) catch return;
-    defer testing.allocator.free(st.log);
+    const st = PersistentState.deserialize(gpa, buf[0..len]) catch {
+        PersistMark.mark(.refused);
+        return;
+    };
+    defer gpa.free(st.log);
     std.debug.assert(st.log.len * LogEntry.wire_len <= buf.len);
+    PersistMark.mark(.ok);
+    if (st.log.len != 0) PersistMark.mark(.log_nonempty);
 }
 
 test "corpus: every raft seed reaches its decoder, and what each accepted is pinned" {

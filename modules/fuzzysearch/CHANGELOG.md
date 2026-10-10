@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `FUZZYSEARCH_FUZZ` over the existing harnesses (frozen-buffer loader + search on corpus-damaged bytes, and re-sealed mutations of a valid index); reach labels count real outcomes. No code or API change.
 - **2026-10-04** — Tests: first mutation run (43 mutants, 41 killed, 2 equivalent); added tests for the inclusive limits (`max_query_len`, `max_k`), a key exactly filling its `key_buf` share, the `max_visited` budget boundary, k=0 pruning work, and `osaDistance` at `max_ref_len`.
 
 - **2026-10-04** — **Reads `trie` format version 2** (path-compressed, now

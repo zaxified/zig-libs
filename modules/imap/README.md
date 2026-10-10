@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-10-05 (38/40, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct none
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, IMAP_FUZZ) · ct none
 
 **Performance:** not measured
 

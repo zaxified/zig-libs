@@ -1048,9 +1048,24 @@ fn walkExt(blob: []const u8) ?ExtTally {
     return t;
 }
 
+const fz = @import("fuzz_test.zig");
+const ExtMark = fz.Marker(enum { walked, refused, groups, records });
+
 test "fuzz: parseExt never panics on a truncated/mutated synthetic .BTF.ext blob" {
     var corpus: ExtCorpus = .{};
-    try testing.fuzz({}, fuzzParseExt, .{ .corpus = try corpus.build(testing.allocator) });
+    try testing.fuzz({}, fuzzParseExtSmith, .{ .corpus = try corpus.build(testing.allocator) });
+}
+
+test "fuzz driver: EBPF_FUZZ (btfext)" {
+    try fz.fuzz_driver.run(fuzzParseExt, .{ .prefix = "EBPF_FUZZ", .name = "ebpf-btfext" });
+}
+
+test "fuzz harness: btfext, 500 seeds, reaches every outcome" {
+    try ExtMark.reach(fuzzParseExt, "ebpf-btfext", 500);
+}
+
+fn fuzzParseExtSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseExt(std.testing.Smith, smith, testing.allocator);
 }
 
 test "corpus: every .BTF.ext seed reaches the parser, and the walked counts are pinned" {
@@ -1086,9 +1101,11 @@ test "corpus: every .BTF.ext seed reaches the parser, and the walked counts are 
     try testing.expectEqual(@as(u32, 8), records);
 }
 
-fn fuzzParseExt(_: void, smith: *std.testing.Smith) !void {
+fn fuzzParseExt(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: ExtCorpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) corpus.build(gpa) catch return else &.{};
     var buf: [8192]u8 = undefined;
-    // ⚠ The blob is drawn as BYTES now, in one `smith.slice` call. It used to
+    // ⚠ The blob is drawn as BYTES now, in one `src.slice` call. It used to
     // be built here: `SynthExt.build(...)` truncated to
     // `valueRangeAtMost(u32, 0, seed.len)` and then byte-flipped
     // `valueRangeAtMost(u8, 0, 16)` times. A ranged draw reads eight input
@@ -1101,8 +1118,12 @@ fn fuzzParseExt(_: void, smith: *std.testing.Smith) !void {
     // ⛔ Measured 2026-09-07 over the corpus above: **0 of 9 seeds non-empty,
     // 0 parsed, 0 groups walked and 0 records decoded before; 9 of 9
     // non-empty, 3 parsed, 5 groups and 8 records after.**
-    const len: usize = smith.slice(&buf);
-    std.mem.doNotOptimizeAway(walkExt(buf[0..len]));
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    if (walkExt(buf[0..len])) |t| {
+        ExtMark.mark(.walked);
+        if (t.groups != 0) ExtMark.mark(.groups);
+        if (t.records != 0) ExtMark.mark(.records);
+    } else ExtMark.mark(.refused);
 }
 
 test "synthetic .BTF.ext: sections, groups and forward-compatible records" {

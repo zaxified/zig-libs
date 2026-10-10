@@ -994,17 +994,35 @@ const FilterCorpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const FilterMark = fz.Marker(enum { u32, flower, filter, refused });
+
 test "fuzz: filter parsers never crash on arbitrary payloads" {
     var corpus: FilterCorpus = .{};
-    try testing.fuzz({}, fuzzParseFilter, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzParseFilterSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzParseFilter(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: TC_FUZZ (filter)" {
+    try fz.fuzz_driver.run(fuzzParseFilter, .{ .prefix = "TC_FUZZ", .name = "tc-filter" });
+}
+
+test "fuzz harness: filter, 500 seeds, reaches every outcome" {
+    try FilterMark.reach(fuzzParseFilter, "tc-filter", 500);
+}
+
+fn fuzzParseFilterSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseFilter(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParseFilter(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: FilterCorpus = .{};
+    const entries = corpus.build() catch return;
     // 1024, not 256: a u32 selector carrying the kernel's maximum key count is
     // 16 + 128*16 octets, and a seed longer than the buffer is not a big seed
     // — `Smith.slice` reads it back as the EMPTY one.
     var raw: [1024]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and all three parsers were handed an EMPTY
@@ -1016,16 +1034,23 @@ fn fuzzParseFilter(_: void, smith: *std.testing.Smith) !void {
     // `parseU32Options` and `parseFlowerOptions` both SUCCEED on the empty
     // slice — an empty options body is a legal classifier reply — so an
     // acceptance count called this harness healthy while it walked nothing.
-    const len: usize = smith.slice(&raw);
+    const len: usize = fz.drawInput(S, src, &raw, entries);
     const buf = raw[0..len];
-    if (parseU32Options(buf)) |_| {} else |_| {}
-    if (parseFlowerOptions(buf)) |_| {} else |_| {}
-    if (parseFilter(buf)) |f| std.mem.doNotOptimizeAway(f.kind().len) else |_| {}
+    if (parseU32Options(buf)) |w| {
+        if (w.keys_len != 0) FilterMark.mark(.u32);
+    } else |_| FilterMark.mark(.refused);
+    if (parseFlowerOptions(buf)) |w| {
+        if (qdisc.optionalsSet(w) != 0) FilterMark.mark(.flower);
+    } else |_| {}
+    if (parseFilter(buf)) |f| {
+        std.mem.doNotOptimizeAway(f.kind().len);
+        if (f.kind().len != 0) FilterMark.mark(.filter);
+    } else |_| {}
     // ⚠ `value(u64)` truncated, not `value(u32)`: a `u32` draw reads eight
     // input octets as a little-endian u64 and only survives if the whole word
     // fits in 32 bits, so it was 0 for every seed. The word travels in the
     // seed's tail now.
-    _ = parseInfo(@truncate(smith.value(u64)));
+    _ = parseInfo(@truncate(src.value(u64)));
 }
 
 test "corpus: every filter seed reaches the parsers, and the decoded counts are pinned" {

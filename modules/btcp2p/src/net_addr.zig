@@ -180,20 +180,41 @@ const decode_seeds = [_][]const u8{
     seedHex("000000"), // Truncated: the 3-octet buffer from the hostile test
 };
 
+const fz = @import("fuzz_test.zig");
+const NetAddrMark = fz.Marker(enum { ok, refused });
+
 test "fuzz: NetAddr.decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzNetAddrDecode, .{ .corpus = &decode_seeds });
+    try testing.fuzz({}, fuzzNetAddrDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzNetAddrDecode(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: BTCP2P_FUZZ (netaddr)" {
+    try fz.fuzz_driver.run(fuzzNetAddrDecode, .{ .prefix = "BTCP2P_FUZZ", .name = "btcp-netaddr" });
+}
+
+test "fuzz harness: netaddr, 500 seeds, reaches every outcome" {
+    try NetAddrMark.reach(fuzzNetAddrDecode, "btcp-netaddr", 500);
+}
+
+fn fuzzNetAddrDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzNetAddrDecode(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzNetAddrDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &decode_seeds;
     var buf: [64]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `NetAddr.decode` saw `buf[0..0]` every
     // single time, with the seed sitting unread in `buf`.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
     var r: Reader = .{ .bytes = buf[0..len] };
-    _ = NetAddr.decode(&r) catch return;
+    _ = NetAddr.decode(&r) catch {
+        NetAddrMark.mark(.refused);
+        return;
+    };
+    NetAddrMark.mark(.ok);
 }
 
 test "corpus: every net_addr seed reaches the decoder, and the accepted count is pinned" {

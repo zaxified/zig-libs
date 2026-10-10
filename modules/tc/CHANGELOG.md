@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `TC_FUZZ` over the existing harnesses (action, options, filter, dump); reach labels count real outcomes. No code or API change.
+- **2026-10-10** — Fixed: `parseAction` panicked (invalid enum value) on an unknown gact probability type from the kernel/peer (`GactProb.decode` did `@enumFromInt` on the exhaustive `ProbType`; found by the new `TC_FUZZ` driver, seed 202). `ProbType` is now non-exhaustive (`_`), like `Verdict`; the raw value is carried through. Also: deterministic fuzz driver `TC_FUZZ` over the existing harnesses (action, options, filter, dump); reach labels count real outcomes.
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** A1 F10 (performance pass). `htb`'s
   `rate`/`ceil` and `tbf`'s `rate`/`peakrate`, plus `police`'s `rate`/`peakrate`, each built
   two 256-entry rate tables even when both would come out byte-identical (the common

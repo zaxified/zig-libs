@@ -812,14 +812,41 @@ const BitsetCorpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const BitsetMark = fz.Marker(enum { parsed, refused, bits_set, named });
+
 test "fuzz: bitset decoding never crashes or over-reads" {
     var corpus: BitsetCorpus = .{};
-    try testing.fuzz({}, fuzzBitset, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzBitsetSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzBitset(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: ETHTOOL_FUZZ (bitset)" {
+    try fz.fuzz_driver.run(fuzzBitset, .{ .prefix = "ETHTOOL_FUZZ", .name = "ethtool-bitset" });
+}
+
+test "fuzz harness: bitset, 500 seeds, reaches every outcome" {
+    try BitsetMark.reach(fuzzBitset, "ethtool-bitset", 500);
+}
+
+fn fuzzBitsetSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzBitset(std.testing.Smith, smith, testing.allocator);
+}
+
+/// A probe index: one the set names when it names any, else a small one.
+fn namedProbe(comptime S: type, bs: *const Bitset, src: *S) u32 {
+    if (bs.bits) |list| {
+        if (list.len != 0) {
+            if (list[src.index(list.len)].index) |i| return i;
+        }
+    }
+    return @intCast(src.index(128));
+}
+
+fn fuzzBitset(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: BitsetCorpus = .{};
+    const entries = corpus.build() catch return;
     var raw: [512]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `parse` was handed an empty nest with
@@ -831,16 +858,34 @@ fn fuzzBitset(_: void, smith: *std.testing.Smith) !void {
     // on an empty `Bitset`. Measured 2026-09-07 over the corpus above: **0 of
     // 10 seeds non-empty, 10 of 10 "parsed" and 0 bits set before; 10 of 10
     // non-empty, 5 parsed and 11 bits set after.**
-    const len: usize = smith.slice(&raw);
-    var bs = parse(testing.allocator, raw[0..len]) catch return;
-    defer bs.deinit(testing.allocator);
+    const len: usize = fz.drawInput(S, src, &raw, entries);
+    var bs = parse(gpa, raw[0..len]) catch {
+        BitsetMark.mark(.refused);
+        return;
+    };
+    defer bs.deinit(gpa);
     // ⚠ `value(u64)` and a `%`, not `valueRangeAtMost(u32, 0, 100_000)`: a
     // ranged draw is the range minimum, so this probed bit 0 for every seed —
     // the one index that reaches no bounds arithmetic in `isSet`, `inMask` or
     // `nameOf`. The probe now travels in the seed. (Five of the ten seeds here
     // probe bit 0 legitimately, which is why the guard pins the probe against
     // what was written rather than merely against zero.)
-    const probe: u32 = @intCast(smith.value(u64) % 100_001);
+    // Under the driver half the probes go to an index the parsed set names
+    // (so `nameOf` has something to find), the rest to a small index.
+    const probe: u32 = if (S == fz.fuzz_driver.Rng and src.value(bool))
+        namedProbe(S, &bs, src)
+    else
+        @intCast(src.value(u64) % 100_001);
+    BitsetMark.mark(.parsed);
+    if (bs.count() != 0) BitsetMark.mark(.bits_set);
+    if (bs.bits) |list| {
+        for (list) |b| {
+            if (b.name != null) {
+                BitsetMark.mark(.named);
+                break;
+            }
+        }
+    }
     std.mem.doNotOptimizeAway(bs.isSet(probe));
     std.mem.doNotOptimizeAway(bs.inMask(probe));
     std.mem.doNotOptimizeAway(bs.count());

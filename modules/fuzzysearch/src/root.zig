@@ -365,14 +365,21 @@ test "permanent malformed control: a back-pointing child offset is rejected, not
     try testing.expectError(error.Corrupt, f.search("a", 1, &results, &kb, .{})); // cycle rejected, no loop
 }
 
-fn runQueries(f: Frozen) void {
+/// True when at least one of the queries succeeded.
+fn queriesOk(f: Frozen) bool {
+    var ok = false;
     var results: [4]Match = undefined;
     var kb: [4 * 32]u8 = undefined;
     // Always a bounded budget on untrusted buffers — a crafted DAG could
     // otherwise fan out; the budget caps total work.
-    _ = f.search("a", 1, &results, &kb, .{ .max_visited = 2000 }) catch {};
-    _ = f.search("", 2, &results, &kb, .{ .max_visited = 2000 }) catch {};
-    _ = f.search("abc", 3, &results, &kb, .{ .max_visited = 2000 }) catch {};
+    if (f.search("a", 1, &results, &kb, .{ .max_visited = 2000 })) |_| ok = true else |_| {}
+    if (f.search("", 2, &results, &kb, .{ .max_visited = 2000 })) |_| ok = true else |_| {}
+    if (f.search("abc", 3, &results, &kb, .{ .max_visited = 2000 })) |_| ok = true else |_| {}
+    return ok;
+}
+
+fn runQueries(f: Frozen) void {
+    _ = queriesOk(f);
 }
 
 test "truncated buffers of every length load-fail or search safely, no panic" {
@@ -422,15 +429,36 @@ const random_seeds = [_][]const u8{
     fuzzSeed(""), // the empty buffer: what the collapsed harness ran, every time
 };
 
-fn fuzzRandom(_: void, smith: *std.testing.Smith) !void {
+fn fuzzRandom(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &random_seeds;
     var buf: [512]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    const f = Frozen.load(buf[0..len]) catch return;
-    runQueries(f);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    const f = Frozen.load(buf[0..len]) catch {
+        RandomMark.mark(.refused);
+        return;
+    };
+    RandomMark.mark(.loaded);
+    if (queriesOk(f)) RandomMark.mark(.queries_ok);
 }
 
+const fz = @import("fuzz_test.zig");
+const RandomMark = fz.Marker(enum { loaded, refused, queries_ok });
+
 test "fuzz: loader + search path never panic on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzRandom, .{ .corpus = &random_seeds });
+    try std.testing.fuzz({}, fuzzRandomSmith, .{ .corpus = &random_seeds });
+}
+
+test "fuzz driver: FUZZYSEARCH_FUZZ (random)" {
+    try fz.fuzz_driver.run(fuzzRandom, .{ .prefix = "FUZZYSEARCH_FUZZ", .name = "fuzzysearch-random" });
+}
+
+test "fuzz harness: random, 500 seeds, reaches every outcome" {
+    try RandomMark.reach(fuzzRandom, "fuzzysearch-random", 500);
+}
+
+fn fuzzRandomSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRandom(std.testing.Smith, smith, testing.allocator);
 }
 
 /// What one mutation script asked for, so the corpus guard can measure the
@@ -498,29 +526,47 @@ const mutated_seeds = [_][]const u8{
     fuzzSeed(""), // the empty script: zero flips, no re-seal
 };
 
-fn fuzzMutated(base: []const u8, smith: *std.testing.Smith) !void {
-    var script: [64]u8 = undefined;
-    const n: usize = smith.slice(&script);
-    var copy: [1024]u8 = undefined;
-    if (base.len > copy.len) return;
-    @memcpy(copy[0..base.len], base);
-    var d: Damage = .{};
-    damage(script[0..n], copy[0..base.len], &d);
-    _ = Frozen.loadVerified(copy[0..base.len]) catch {};
-    const f = Frozen.load(copy[0..base.len]) catch return;
-    runQueries(f);
-}
-
-test "fuzz: mutated-valid-buffer loader + search path never panic" {
-    // Version 1: the seed scripts name v1 header offsets.
-    const base = try trie.freezeFromPairsWith(testing.allocator, testing.allocator, &.{
+fn fuzzMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const base = try trie.freezeFromPairsWith(gpa, gpa, &.{
         .{ .key = "praha", .value = 1 },
         .{ .key = "prahasever", .value = 2 },
         .{ .key = "plzen", .value = 3 },
         .{ .key = "brno", .value = 4 },
     }, .v1);
-    defer testing.allocator.free(base);
-    try std.testing.fuzz(base, fuzzMutated, .{ .corpus = &mutated_seeds });
+    defer gpa.free(base);
+    var script: [64]u8 = undefined;
+    const n: usize = fz.drawInput(S, src, &script, &mutated_seeds);
+    var copy: [1024]u8 = undefined;
+    if (base.len > copy.len) return;
+    @memcpy(copy[0..base.len], base);
+    var d: Damage = .{};
+    damage(script[0..n], copy[0..base.len], &d);
+    if (d.changed == 0) MutatedMark.mark(.pristine);
+    if (Frozen.loadVerified(copy[0..base.len])) |_| MutatedMark.mark(.verified) else |_| {}
+    const f = Frozen.load(copy[0..base.len]) catch {
+        MutatedMark.mark(.rejected);
+        return;
+    };
+    if (d.changed != 0) MutatedMark.mark(.damaged_loaded);
+    if (queriesOk(f)) MutatedMark.mark(.queries_ok);
+}
+
+test "fuzz: mutated-valid-buffer loader + search path never panic" {
+    try std.testing.fuzz({}, fuzzMutatedSmith, .{ .corpus = &mutated_seeds });
+}
+
+const MutatedMark = fz.Marker(enum { pristine, verified, rejected, damaged_loaded, queries_ok });
+
+test "fuzz driver: FUZZYSEARCH_FUZZ (mutated)" {
+    try fz.fuzz_driver.run(fuzzMutated, .{ .prefix = "FUZZYSEARCH_FUZZ", .name = "fuzzysearch-mutated" });
+}
+
+test "fuzz harness: mutated, 500 seeds, reaches every outcome" {
+    try MutatedMark.reach(fuzzMutated, "fuzzysearch-mutated", 500);
+}
+
+fn fuzzMutatedSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzMutated(std.testing.Smith, smith, testing.allocator);
 }
 
 test "corpus: the random buffers reach the loader, and what they get past is pinned" {

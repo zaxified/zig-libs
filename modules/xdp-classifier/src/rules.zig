@@ -657,6 +657,64 @@ test "hostile: LpmKey.toBytes never panics across the full prefix_len range" {
     }
 }
 
+// ── deterministic fuzz driver (XDP_FUZZ) ────────────────────────────────────
+
+const fz = @import("fuzz_test.zig");
+
+/// One label set per harness (`Marker` is memoised per label type).
+fn VerdictLabels(comptime tag: u8) type {
+    _ = tag;
+    return enum { ok, invalid_prefix_len, noncanonical, duplicate, too_many };
+}
+const ValidateMark = fz.Marker(VerdictLabels(0));
+const SortedMark = fz.Marker(VerdictLabels(1));
+const Sorted6Mark = fz.Marker(VerdictLabels(2));
+const LookupMark = fz.Marker(enum { defaulted, matched });
+
+fn markVerdict(comptime M: type, r: RuleSetError!void) void {
+    if (r) |_| M.mark(.ok) else |e| switch (e) {
+        error.InvalidPrefixLen => M.mark(.invalid_prefix_len),
+        error.NonCanonicalPrefix => M.mark(.noncanonical),
+        error.DuplicatePrefix => M.mark(.duplicate),
+        error.TooManyRules => M.mark(.too_many),
+        error.ScratchTooSmall => {}, // only `validateSorted` with a short scratch; the harnesses pass a full one
+    }
+}
+
+/// How the driver's `Rng` shapes a rule table; all-false under `Smith`
+/// (which draws no mode, so `--fuzz` corpora replay as before). Uniform
+/// addresses never collide and are never canonical, so without this the
+/// duplicate and accepted branches are unreachable.
+const Shape = struct { narrow: bool = false, canon: bool = false };
+
+fn drawShape(comptime S: type, src: *S) Shape {
+    if (S != fz.fuzz_driver.Rng) return .{};
+    return .{ .narrow = src.value(bool), .canon = src.value(bool) };
+}
+
+/// Zero the host bits of `addr` below a `plen`-bit prefix.
+fn canonicalise(addr: []u8, plen: usize) void {
+    for (addr, 0..) |*b, i| {
+        const lo = i * 8;
+        if (plen >= lo + 8) continue;
+        if (plen <= lo) {
+            b.* = 0;
+        } else {
+            const keep: u3 = @intCast(plen - lo);
+            b.* &= ~(@as(u8, 0xff) >> keep);
+        }
+    }
+}
+
+fn drawRule4(comptime S: type, src: *S, sh: Shape) ClassifierRule {
+    const m: u8 = if (sh.narrow) 0x03 else 0xff;
+    var addr: [4]u8 = .{ src.value(u8) & m, src.value(u8) & m, src.value(u8) & m, src.value(u8) & m };
+    var plen: u6 = src.value(u6); // full 0..63, including out-of-spec 33..63
+    if (sh.narrow) plen %= 36;
+    if (sh.canon and plen <= 32) canonicalise(&addr, plen);
+    return .{ .prefix = .{ .addr = addr, .prefix_len = plen }, .class = src.value(u32) };
+}
+
 // ── F8: fuzz harnesses ──────────────────────────────────────────────────────
 //
 // F8 measured 0 `testing.fuzz` harnesses in a module that is a parser (the
@@ -669,49 +727,58 @@ test "hostile: LpmKey.toBytes never panics across the full prefix_len range" {
 // exploration on top, same role `testing.fuzz` plays in the other 168
 // modules that already have it.
 
-fn fuzzValidateNeverPanics(_: void, smith: *std.testing.Smith) !void {
+fn fuzzValidateNeverPanics(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const shape = drawShape(S, src);
     var buf: [8]ClassifierRule = undefined;
     // check-fuzz-reach R1: `index` is a ranged draw and this is the harness's
     // FIRST draw, so it reads the range minimum for all but 1 in 2^64 seeds
     // -- collapsing every corpus entry to `n == 0`. `value(u64)` has
     // full-range weights (faithful to any seed byte), reduced by hand.
-    const n: usize = @intCast(smith.value(u64) % (buf.len + 1)); // 0..8 rules
+    const n: usize = @intCast(src.value(u64) % (buf.len + 1)); // 0..8 rules
     for (buf[0..n]) |*r| {
-        r.* = .{
-            .prefix = .{
-                .addr = .{ smith.value(u8), smith.value(u8), smith.value(u8), smith.value(u8) },
-                .prefix_len = smith.value(u6), // full 0..63, including out-of-spec 33..63
-            },
-            .class = smith.value(u32),
-        };
+        r.* = drawRule4(S, src, shape);
     }
     const rs: RuleSet = .{ .rules = buf[0..n] };
     // `usize` has no fixed bitsize (comptime error from Smith's weighting
     // machinery) -- draw a fixed-width value and widen it instead.
-    const max_entries: usize = smith.valueRangeAtMost(u16, 0, 16);
-    _ = rs.validate(max_entries) catch {}; // any declared error or success; a panic is not
+    const max_entries: usize = src.valueRangeAtMost(u16, 0, 16);
+    markVerdict(ValidateMark, rs.validate(max_entries)); // any declared error or success; a panic is not
 }
 
 test "fuzz: RuleSet.validate never panics on any (rules, max_entries)" {
-    try std.testing.fuzz({}, fuzzValidateNeverPanics, .{});
+    try std.testing.fuzz({}, fuzzValidateNeverPanicsSmith, .{});
 }
 
-fn fuzzLookupNeverPanics(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: XDP_FUZZ (validate)" {
+    try fz.fuzz_driver.run(fuzzValidateNeverPanics, .{ .prefix = "XDP_FUZZ", .name = "xdp-validate" });
+}
+
+test "fuzz harness: validate, 500 seeds, reaches every outcome" {
+    try ValidateMark.reach(fuzzValidateNeverPanics, "xdp-validate", 500);
+}
+
+fn fuzzValidateNeverPanicsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzValidateNeverPanics(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzLookupNeverPanics(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const shape = drawShape(S, src);
     var buf: [8]ClassifierRule = undefined;
     // check-fuzz-reach R1: same fix as fuzzValidateNeverPanics above -- a
     // ranged draw as the FIRST draw collapses every seed to `n == 0`.
-    const n: usize = @intCast(smith.value(u64) % (buf.len + 1));
+    const n: usize = @intCast(src.value(u64) % (buf.len + 1));
     for (buf[0..n]) |*r| {
-        r.* = .{
-            .prefix = .{
-                .addr = .{ smith.value(u8), smith.value(u8), smith.value(u8), smith.value(u8) },
-                .prefix_len = smith.value(u6),
-            },
-            .class = smith.value(u32),
-        };
+        r.* = drawRule4(S, src, shape);
     }
-    const query: [4]u8 = .{ smith.value(u8), smith.value(u8), smith.value(u8), smith.value(u8) };
-    const default_class = smith.value(u32);
+    var query: [4]u8 = .{ src.value(u8), src.value(u8), src.value(u8), src.value(u8) };
+    // Half the driver's queries are a loaded rule's own address.
+    if (S == fz.fuzz_driver.Rng and n > 0 and src.value(bool)) query = buf[src.index(n)].prefix.addr;
+    if (shape.narrow) for (&query) |*q| {
+        q.* &= 0x03;
+    };
+    const default_class = src.value(u32);
 
     const got = lookupReference(buf[0..n], query, default_class);
     // Invariant that must hold for EVERY input, not just the hand-picked
@@ -726,10 +793,23 @@ fn fuzzLookupNeverPanics(_: void, smith: *std.testing.Smith) !void {
         }
     }
     try testing.expect(got == default_class or found_among_rules);
+    if (got == default_class) LookupMark.mark(.defaulted) else LookupMark.mark(.matched);
 }
 
 test "fuzz: lookupReference never panics, and always returns default_class or a loaded rule's class" {
-    try std.testing.fuzz({}, fuzzLookupNeverPanics, .{});
+    try std.testing.fuzz({}, fuzzLookupNeverPanicsSmith, .{});
+}
+
+test "fuzz driver: XDP_FUZZ (lookup)" {
+    try fz.fuzz_driver.run(fuzzLookupNeverPanics, .{ .prefix = "XDP_FUZZ", .name = "xdp-lookup" });
+}
+
+test "fuzz harness: lookup, 500 seeds, reaches every outcome" {
+    try LookupMark.reach(fuzzLookupNeverPanics, "xdp-lookup", 500);
+}
+
+fn fuzzLookupNeverPanicsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzLookupNeverPanics(std.testing.Smith, smith, std.testing.allocator);
 }
 
 // ── F3: validateSorted (O(n log n) alternative to validate's O(n²)) ────────
@@ -798,7 +878,9 @@ test "validateSorted: too-small scratch is rejected, not a silent out-of-bounds 
     try testing.expectError(RuleSetError.ScratchTooSmall, rs.validateSorted(64, &scratch));
 }
 
-fn fuzzValidateSortedAgreesWithValidate(_: void, smith: *std.testing.Smith) !void {
+fn fuzzValidateSortedAgreesWithValidate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const shape = drawShape(S, src);
     // Differential test, not a reimplementation: both functions are called
     // on the SAME input and their verdicts compared. A bug that made
     // `validateSorted` agree with itself (e.g. a comparator that treats
@@ -809,27 +891,34 @@ fn fuzzValidateSortedAgreesWithValidate(_: void, smith: *std.testing.Smith) !voi
     var buf: [40]ClassifierRule = undefined;
     // check-fuzz-reach R1: same fix as fuzzValidateNeverPanics above -- a
     // ranged draw as the FIRST draw collapses every seed to `n == 0`.
-    const n: usize = @intCast(smith.value(u64) % (buf.len + 1));
+    const n: usize = @intCast(src.value(u64) % (buf.len + 1));
     for (buf[0..n]) |*r| {
-        r.* = .{
-            .prefix = .{
-                .addr = .{ smith.value(u8), smith.value(u8), smith.value(u8), smith.value(u8) },
-                .prefix_len = smith.value(u6), // full 0..63, including out-of-spec 33..63
-            },
-            .class = smith.value(u32),
-        };
+        r.* = drawRule4(S, src, shape);
     }
     const rs: RuleSet = .{ .rules = buf[0..n] };
-    const max_entries: usize = smith.valueRangeAtMost(u16, 0, 48);
+    const max_entries: usize = src.valueRangeAtMost(u16, 0, 48);
 
     var scratch: [buf.len]usize = undefined;
     const want = rs.validate(max_entries);
     const got = rs.validateSorted(max_entries, scratch[0..n]);
     try testing.expectEqual(want, got);
+    markVerdict(SortedMark, want);
 }
 
 test "fuzz: validateSorted agrees with validate on every (rules, max_entries)" {
-    try std.testing.fuzz({}, fuzzValidateSortedAgreesWithValidate, .{});
+    try std.testing.fuzz({}, fuzzValidateSortedAgreesWithValidateSmith, .{});
+}
+
+test "fuzz driver: XDP_FUZZ (validate-sorted)" {
+    try fz.fuzz_driver.run(fuzzValidateSortedAgreesWithValidate, .{ .prefix = "XDP_FUZZ", .name = "xdp-validate-sorted" });
+}
+
+test "fuzz harness: validate-sorted, 500 seeds, reaches every outcome" {
+    try SortedMark.reach(fuzzValidateSortedAgreesWithValidate, "xdp-validate-sorted", 500);
+}
+
+fn fuzzValidateSortedAgreesWithValidateSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzValidateSortedAgreesWithValidate(std.testing.Smith, smith, std.testing.allocator);
 }
 
 test "F3: validateSorted agrees with validate across a deterministic sweep, including duplicate-heavy tables" {
@@ -978,21 +1067,27 @@ test "IPv6 helpers agree with the independent IPv4 code on IPv4-mapped addresses
     }
 }
 
-fn fuzzValidate6SortedAgrees(_: void, smith: *std.testing.Smith) !void {
+fn fuzzValidate6SortedAgrees(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const shape = drawShape(S, src);
     var buf: [24]ClassifierRule6 = undefined;
     // check-fuzz-reach R1: a full-range u64 first, reduced by hand.
-    const n: usize = @intCast(smith.value(u64) % (buf.len + 1));
+    const n: usize = @intCast(src.value(u64) % (buf.len + 1));
     for (buf[0..n]) |*r| {
         var addr: [16]u8 = @splat(0);
         // Few distinct addresses so duplicates and near-duplicates occur.
-        addr[0] = smith.value(u8) & 0x03;
-        addr[15] = smith.value(u8) & 0x01;
-        r.* = .{ .prefix = .{ .addr = addr, .prefix_len = smith.value(u8) }, .class = smith.value(u32) };
+        addr[0] = src.value(u8) & 0x03;
+        addr[15] = src.value(u8) & 0x01;
+        var plen: u8 = src.value(u8);
+        if (shape.narrow) plen %= 132;
+        if (shape.canon and plen <= 128) canonicalise(&addr, plen);
+        r.* = .{ .prefix = .{ .addr = addr, .prefix_len = plen }, .class = src.value(u32) };
     }
     const rs: RuleSet6 = .{ .rules = buf[0..n] };
-    const max_entries: usize = smith.valueRangeAtMost(u16, 0, 32);
+    const max_entries: usize = src.valueRangeAtMost(u16, 0, 32);
     var scratch: [buf.len]usize = undefined;
     try testing.expectEqual(rs.validate(max_entries), rs.validateSorted(max_entries, scratch[0..n]));
+    markVerdict(Sorted6Mark, rs.validate(max_entries));
     const q: [16]u8 = if (n > 0) buf[0].prefix.addr else @splat(0);
     const got = lookupReference6(buf[0..n], q, 0xFFFF_FFFF);
     var ok = got == 0xFFFF_FFFF;
@@ -1001,7 +1096,19 @@ fn fuzzValidate6SortedAgrees(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: RuleSet6.validateSorted agrees with validate; lookupReference6 returns default or a loaded class" {
-    try std.testing.fuzz({}, fuzzValidate6SortedAgrees, .{});
+    try std.testing.fuzz({}, fuzzValidate6SortedAgreesSmith, .{});
+}
+
+test "fuzz driver: XDP_FUZZ (validate6)" {
+    try fz.fuzz_driver.run(fuzzValidate6SortedAgrees, .{ .prefix = "XDP_FUZZ", .name = "xdp-validate6" });
+}
+
+test "fuzz harness: validate6, 500 seeds, reaches every outcome" {
+    try Sorted6Mark.reach(fuzzValidate6SortedAgrees, "xdp-validate6", 500);
+}
+
+fn fuzzValidate6SortedAgreesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzValidate6SortedAgrees(std.testing.Smith, smith, std.testing.allocator);
 }
 
 test "RuleSet6.validateSorted agrees with validate across a deterministic duplicate-heavy sweep" {

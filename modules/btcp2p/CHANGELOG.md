@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `BTCP2P_FUZZ` over the existing harnesses (header, block, relay, varbytes, addr, reject, netaddr, version, inventory, locator, headers, envelope); reach labels count real outcomes. No code or API change.
 - **2026-10-05** — Mutation run: 41 of 41 killed, 0 equivalent; 6 tests added (command
   printable-range edges and a 12-byte command, `MAX_PAYLOAD_LENGTH` edge on decode and refusal
   on encode, `consumed` across two frames, `MAX_INV_ENTRIES` isolated and its edge,

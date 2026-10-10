@@ -2521,8 +2521,23 @@ const config_shift_seeds = [_][]const u8{
     testkit.fuzz.seed("config:" ++ "9" ** 40),
 };
 
+const fz = @import("fuzz_test.zig");
+const ConfigShiftMark = fz.Marker(enum { parsed, defaulted });
+
 test "fuzz: parseConfigShift never panics on arbitrary sysfs-file bytes" {
-    try testing.fuzz({}, fuzzParseConfigShift, .{ .corpus = &config_shift_seeds });
+    try testing.fuzz({}, fuzzParseConfigShiftSmith, .{ .corpus = &config_shift_seeds });
+}
+
+test "fuzz driver: EBPF_FUZZ (config-shift)" {
+    try fz.fuzz_driver.run(fuzzParseConfigShift, .{ .prefix = "EBPF_FUZZ", .name = "ebpf-config-shift" });
+}
+
+test "fuzz harness: config-shift, 500 seeds, reaches every outcome" {
+    try ConfigShiftMark.reach(fuzzParseConfigShift, "ebpf-config-shift", 500);
+}
+
+fn fuzzParseConfigShiftSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseConfigShift(std.testing.Smith, smith, testing.allocator);
 }
 
 test "corpus: every config-shift seed reaches the parser, and the accepted count is pinned" {
@@ -2554,9 +2569,11 @@ test "corpus: every config-shift seed reaches the parser, and the accepted count
     try testing.expectEqual(@as(u6, 63), parseConfigShift("config:63", 0));
 }
 
-fn fuzzParseConfigShift(_: void, smith: *std.testing.Smith) !void {
+fn fuzzParseConfigShift(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &config_shift_seeds;
     var buf: [64]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and the parser was handed an EMPTY slice
@@ -2568,17 +2585,19 @@ fn fuzzParseConfigShift(_: void, smith: *std.testing.Smith) !void {
     // any of the grammar ran. Measured 2026-09-07 over the corpus above:
     // **0 of 17 seeds non-empty and 0 parsed before; 16 of 17 non-empty (one
     // seed IS the empty file) and 6 parsed after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
     // ⚠ `value(u64)` reduced, not `value(u6)`: a narrow draw reads eight input
     // octets as a little-endian u64 and only survives if the whole word fits
     // the type, so the fallback value was 0 on every seed — and 0 is the one
     // value that cannot tell "fell back" apart from "parsed config:0", which
     // is the first line of the very file this parser exists to read.
-    const default: u6 = @truncate(smith.value(u64));
+    const default: u6 = @truncate(src.value(u64));
     // The u6 return type already makes "out of range" unrepresentable; the
     // property under test is that arbitrary bytes (short reads, embedded
     // NULs, non-ASCII, digit strings far longer than any real shift value,
     // a bare "config:" with nothing after it, multiple '-' separators, …)
     // never trip an unreachable/overflow/index-out-of-bounds path.
-    _ = parseConfigShift(buf[0..len], default);
+    const got = parseConfigShift(buf[0..len], default);
+    const other = parseConfigShift(buf[0..len], default +% 1);
+    if (got != default or other != default +% 1) ConfigShiftMark.mark(.parsed) else ConfigShiftMark.mark(.defaulted);
 }

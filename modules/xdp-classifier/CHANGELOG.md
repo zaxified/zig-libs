@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `XDP_FUZZ` over the existing harnesses (validate, lookup, validateSorted-vs-validate differential, IPv6 table, emitted packet path vs reference over generated frames); reach labels count real outcomes. No code or API change.
 - **2026-10-06** — ADDED, **BEHAVIOURAL, not breaking:** VLAN tag skip and IPv6 classification; scope mvp -> core.
   `ClassifierOptions`/`CpumapSteerOptions` gain `vlan_depth: VlanDepth = .double` (skip 0..2
   802.1Q `0x8100` / 802.1ad `0x88A8` tags, either TPID at either depth) and `lpm6_map_fd: ?fd_t =

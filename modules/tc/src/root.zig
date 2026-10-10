@@ -1097,18 +1097,36 @@ fn walkDump(dgram: []const u8) DumpTally {
     return t;
 }
 
+const fz = @import("fuzz_test.zig");
+const DumpMark = fz.Marker(enum { messages, records, kinds, controls });
+
 test "fuzz: a dump datagram never crashes the framer, the triage or the parsers" {
     var corpus: DumpCorpus = .{};
-    try testing.fuzz({}, fuzzDumpParse, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzDumpParseSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzDumpParse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: TC_FUZZ (dump)" {
+    try fz.fuzz_driver.run(fuzzDumpParse, .{ .prefix = "TC_FUZZ", .name = "tc-dump" });
+}
+
+test "fuzz harness: dump, 500 seeds, reaches every outcome" {
+    try DumpMark.reach(fuzzDumpParse, "tc-dump", 500);
+}
+
+fn fuzzDumpParseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDumpParse(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDumpParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: DumpCorpus = .{};
+    const entries = corpus.build() catch return;
     // 8192, not 256: an htb class reply carries two 1 KiB rate tables, so the
     // largest datagram this module can produce is over 2 KiB — and a seed
     // longer than the buffer is not a big seed, `Smith.slice` reads it back as
     // the EMPTY one.
     var raw: [8192]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and the target parsed an EMPTY slice with
@@ -1118,8 +1136,13 @@ fn fuzzDumpParse(_: void, smith: *std.testing.Smith) !void {
     // 0 messages framed, 0 records classified and 0 kinds read before; 10 of
     // 10 non-empty, 15 messages framed, 6 records, 5 kinds and 7 control
     // verdicts (done / failed / malformed / overrun / restart) after.**
-    const len: usize = smith.slice(&raw);
-    std.mem.doNotOptimizeAway(walkDump(raw[0..len]));
+    const len: usize = fz.drawInput(S, src, &raw, entries);
+    const t = walkDump(raw[0..len]);
+    std.mem.doNotOptimizeAway(t);
+    if (t.messages != 0) DumpMark.mark(.messages);
+    if (t.records != 0) DumpMark.mark(.records);
+    if (t.kinds != 0) DumpMark.mark(.kinds);
+    if (t.controls != 0) DumpMark.mark(.controls);
 }
 
 test "corpus: every dump seed reaches the framer, and the walked counts are pinned" {

@@ -472,14 +472,32 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const PortMark = fz.Marker(enum { decoded, refused });
+
 test "fuzz: port decoding never crashes" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzPort, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzPortSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzPort(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: DEVLINK_FUZZ (port)" {
+    try fz.fuzz_driver.run(fuzzPort, .{ .prefix = "DEVLINK_FUZZ", .name = "devlink-port" });
+}
+
+test "fuzz harness: port, 500 seeds, reaches every outcome" {
+    try PortMark.reach(fuzzPort, "devlink-port", 500);
+}
+
+fn fuzzPortSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPort(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzPort(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: Corpus = .{};
+    const entries = corpus.build() catch return;
     var buf: [256]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `parse` was handed an empty attribute
@@ -491,8 +509,11 @@ fn fuzzPort(_: void, smith: *std.testing.Smith) !void {
     // devlink reply — every field of a port is optional — so `parse("")`
     // succeeds, and the collapsed harness scored a perfect 7 of 7 while never
     // once entering the TLV walk.
-    const len: usize = smith.slice(&buf);
-    if (parse(buf[0..len])) |p| std.mem.doNotOptimizeAway(&p) else |_| {}
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    if (parse(buf[0..len])) |p| {
+        std.mem.doNotOptimizeAway(&p);
+        PortMark.mark(.decoded);
+    } else |_| PortMark.mark(.refused);
 }
 
 test "corpus: every port seed reaches the parser, and the decoded count is pinned" {

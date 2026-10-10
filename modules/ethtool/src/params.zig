@@ -721,14 +721,32 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const ParamsMark = fz.Marker(enum { rings, channels, coalesce, pause, refused, field });
+
 test "fuzz: parameter decoders never crash" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzParams, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzParamsSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzParams(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: ETHTOOL_FUZZ (params)" {
+    try fz.fuzz_driver.run(fuzzParams, .{ .prefix = "ETHTOOL_FUZZ", .name = "ethtool-params" });
+}
+
+test "fuzz harness: params, 500 seeds, reaches every outcome" {
+    try ParamsMark.reach(fuzzParams, "ethtool-params", 500);
+}
+
+fn fuzzParamsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParams(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParams(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: Corpus = .{};
+    const entries = corpus.build() catch return;
     var raw: [256]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and all four decoders were handed an empty
@@ -742,12 +760,24 @@ fn fuzzParams(_: void, smith: *std.testing.Smith) !void {
     // of 9 non-empty, 15 pairs decoded and 22 fields after.** The pair count
     // went DOWN, which is the point: the empty reply is accepted by all four
     // decoders and a real one is not.
-    const len: usize = smith.slice(&raw);
+    const len: usize = fz.drawInput(S, src, &raw, entries);
     const buf = raw[0..len];
-    if (parseRings(buf)) |v| std.mem.doNotOptimizeAway(&v) else |_| {}
-    if (parseChannels(buf)) |v| std.mem.doNotOptimizeAway(&v) else |_| {}
-    if (parseCoalesce(buf)) |v| std.mem.doNotOptimizeAway(&v) else |_| {}
-    if (parsePause(buf)) |v| std.mem.doNotOptimizeAway(&v) else |_| {}
+    if (parseRings(buf)) |v| {
+        ParamsMark.mark(.rings);
+        if (v.rx != null or v.rx_max != null or v.tx_push != null) ParamsMark.mark(.field);
+    } else |_| ParamsMark.mark(.refused);
+    if (parseChannels(buf)) |v| {
+        ParamsMark.mark(.channels);
+        if (v.combined_count != null or v.rx_count != null) ParamsMark.mark(.field);
+    } else |_| ParamsMark.mark(.refused);
+    if (parseCoalesce(buf)) |v| {
+        ParamsMark.mark(.coalesce);
+        if (v.rx_usecs != null or v.tx_max_frames != null or v.use_adaptive_rx != null) ParamsMark.mark(.field);
+    } else |_| ParamsMark.mark(.refused);
+    if (parsePause(buf)) |v| {
+        ParamsMark.mark(.pause);
+        if (v.autoneg != null or v.rx != null or v.stats != null) ParamsMark.mark(.field);
+    } else |_| ParamsMark.mark(.refused);
 }
 
 test "corpus: every parameter seed reaches all four decoders, and the counts are pinned" {

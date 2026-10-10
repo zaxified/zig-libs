@@ -1150,9 +1150,24 @@ const ElfCorpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const ElfMark = fz.Marker(enum { opened, refused, walked, symbols });
+
 test "fuzz: openImage never panics on a truncated/mutated synthetic ELF image" {
     var corpus: ElfCorpus = .{};
-    try testing.fuzz({}, fuzzOpenImage, .{ .corpus = try corpus.build(testing.allocator) });
+    try testing.fuzz({}, fuzzOpenImageSmith, .{ .corpus = try corpus.build(testing.allocator) });
+}
+
+test "fuzz driver: EBPF_FUZZ (elf)" {
+    try fz.fuzz_driver.run(fuzzOpenImage, .{ .prefix = "EBPF_FUZZ", .name = "ebpf-elf" });
+}
+
+test "fuzz harness: elf, 500 seeds, reaches every outcome" {
+    try ElfMark.reach(fuzzOpenImage, "ebpf-elf", 500);
+}
+
+fn fuzzOpenImageSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzOpenImage(std.testing.Smith, smith, testing.allocator);
 }
 
 test "corpus: every ELF seed reaches openImage, and the walked counts are pinned" {
@@ -1205,13 +1220,14 @@ test "corpus: every ELF seed reaches openImage, and the walked counts are pinned
     try testing.expectEqual(@as(usize, 5), unbounded);
 }
 
-fn fuzzOpenImage(_: void, smith: *std.testing.Smith) !void {
-    const gpa = testing.allocator;
+fn fuzzOpenImage(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: ElfCorpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) corpus.build(gpa) catch return else &.{};
     // 16384, not a synthetic 1 KiB: the corpus carries a real 4 KiB clang
     // object, and a seed longer than the buffer is not a big seed —
     // `Smith.slice` reads it back as the EMPTY one.
     var buf: [16384]u8 = undefined;
-    // ⚠ The image is drawn as BYTES now, in one `smith.slice` call. It used to
+    // ⚠ The image is drawn as BYTES now, in one `src.slice` call. It used to
     // be built here: `SynthElf.build()` truncated to
     // `valueRangeAtMost(u32, 0, seed.len)` and then byte-flipped
     // `valueRangeAtMost(u8, 0, 12)` times. A ranged draw reads eight input
@@ -1224,20 +1240,28 @@ fn fuzzOpenImage(_: void, smith: *std.testing.Smith) !void {
     // 0 images opened and 0 accessor walks before; 10 of 10 non-empty, 7
     // opened, 7 accessor walks and 5 of them in the unbounded-index domain
     // this harness exists for, after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
     // ⚠ Both index words travel in the seed's tail. They used to be
-    // `smith.index(image.sections.len)` and `smith.value(u32)`, drawn after
+    // `src.index(image.sections.len)` and `src.value(u32)`, drawn after
     // the input was spent — so the section was 0 (the null section) and the
     // entry index was 0, which is the one value whose product with any
     // `sh_entsize` cannot overflow. See `fuzzWalkAccessors`, whose whole doc
     // comment is about that index needing to be unbounded.
-    const sec: u32 = @truncate(smith.value(u64));
-    const idx: u32 = @truncate(smith.value(u64));
+    const sec: u32 = @truncate(src.value(u64));
+    const idx: u32 = @truncate(src.value(u64));
 
-    var image = openImage(gpa, buf[0..len], false) catch return;
+    var image = openImage(gpa, buf[0..len], false) catch {
+        ElfMark.mark(.refused);
+        return;
+    };
     defer image.deinit();
 
+    ElfMark.mark(.opened);
     if (image.sections.len > 0) {
+        ElfMark.mark(.walked);
+        if (image.symbolCount(sec % image.sections.len) catch null) |cnt| {
+            if (cnt > 0) ElfMark.mark(.symbols);
+        }
         fuzzWalkAccessors(&image, sec % image.sections.len, idx);
     }
     _ = image.symtabIndex();

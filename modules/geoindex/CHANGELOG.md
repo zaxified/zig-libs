@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `GEOINDEX_FUZZ` over the existing harnesses (frozen-buffer loader + queries on corpus-damaged bytes, and header/body re-sealed mutations of a valid index); reach labels count real outcomes. No code or API change.
 - **2026-10-05** — Mutation run: 30 of 34 killed, 4 equivalent; 8 tests added
   (header region/root/empty-index edges, `Nodes.at` at `count` and one byte
   short, reserved flag bits, exact bbox budget, `StackOverflow`, empty `out`,

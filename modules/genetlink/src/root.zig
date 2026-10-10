@@ -746,22 +746,55 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const SplitMark = fz.Marker(enum { accepted, refused, with_attrs, attr_walk_refused });
+const McastMark = fz.Marker(enum { found, not_found, refused, structured });
+
 test "fuzz: splitPayload never panics on arbitrary bytes" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzSplitPayload, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzSplitPayloadSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzSplitPayload(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: GENETLINK_FUZZ (split)" {
+    try fz.fuzz_driver.run(fuzzSplitPayload, .{ .prefix = "GENETLINK_FUZZ", .name = "genetlink-split" });
+}
+
+test "fuzz harness: split, 500 seeds, reaches every outcome" {
+    try SplitMark.reach(fuzzSplitPayload, "genetlink-split", 500);
+}
+
+fn fuzzSplitPayloadSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSplitPayload(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzSplitPayload(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: Corpus = .{};
+    const entries = corpus.build() catch return;
     var buf: [64]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
-    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
-    // then finds fewer than the eight it needs and returns the range MINIMUM,
-    // so `len` was 0 for every seed and `splitPayload` was handed an empty
-    // slice with the payload sitting unread in `buf`. Measured 2026-09-07 over
-    // the corpus above: **0 of 6 seeds non-empty and 0 accepted before, 6 of 6
-    // non-empty and 4 accepted after.**
-    const len: usize = smith.slice(&buf);
-    _ = splitPayload(buf[0..len]) catch {};
+    // ⚠ One `slice` call, never `bytes` followed by a ranged length. `bytes`
+    // takes `@min(buf.len, in.len)` octets and the ranged draw then finds
+    // fewer than the eight it needs and returns the range MINIMUM, so `len`
+    // was 0 for every seed. Measured 2026-09-07 over the corpus above: **0 of
+    // 6 seeds non-empty and 0 accepted before, 6 of 6 non-empty and 4
+    // accepted after.**
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    const split = splitPayload(buf[0..len]) catch {
+        SplitMark.mark(.refused);
+        return;
+    };
+    SplitMark.mark(.accepted);
+    var it: codec.AttrIterator = .{ .buf = split.attrs };
+    var n: usize = 0;
+    while (true) {
+        const a = it.next() catch {
+            SplitMark.mark(.attr_walk_refused);
+            break;
+        };
+        if (a == null) break;
+        n += 1;
+    }
+    if (n != 0) SplitMark.mark(.with_attrs);
 }
 
 test "corpus: every splitPayload seed reaches it, and the accepted count is pinned" {
@@ -866,54 +899,72 @@ const FindCorpus = struct {
 
 test "fuzz: findMcastGroupId never panics on arbitrary or structurally-nested attribute bytes" {
     var corpus: FindCorpus = .{};
-    try testing.fuzz({}, fuzzFindMcastGroupId, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzFindMcastGroupIdSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzFindMcastGroupId(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: GENETLINK_FUZZ (mcast)" {
+    try fz.fuzz_driver.run(fuzzFindMcastGroupId, .{ .prefix = "GENETLINK_FUZZ", .name = "genetlink-mcast" });
+}
+
+test "fuzz harness: mcast, 500 seeds, reaches every outcome" {
+    try McastMark.reach(fuzzFindMcastGroupId, "genetlink-mcast", 500);
+}
+
+fn fuzzFindMcastGroupIdSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFindMcastGroupId(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzFindMcastGroupId(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [512]u8 = undefined;
     var want_buf: [16]u8 = undefined;
-    // ⚠ The bytes come FIRST, in one `slice` call each. This harness used to
-    // open with `smith.value(bool)` to pick between a raw walk and a
-    // structured one — a 1-bit draw, which outside `--fuzz` is the range
-    // MINIMUM for all but 1 in 2^63 seeds, so the raw branch was dead and the
-    // seed was discarded before a single octet of it had been read. Inside the
-    // surviving branch `n_groups` was `valueRangeAtMost(u8, 0, 4)`, also the
-    // minimum, so the nest it built had ZERO groups: the inner nest walk and
-    // the name comparison that branch exists for were never reached either.
-    // Both halves now run on every seed, from the same drawn octets. Measured
-    // 2026-09-07 over the corpus above: **not one of the 7 seeds contributed a
-    // single octet before — the harness built the identical 4-octet empty nest
-    // for every one of them, 0 group ids found and 0 refusals — against 7 of 7
-    // seeds non-empty, 1 id found and 2 refused after.**
-    const attrs_len: usize = smith.slice(&buf);
-    const want_len: usize = smith.slice(&want_buf);
+    // ⚠ The bytes come FIRST, in one `slice` call each (see the 2026-09-07
+    // measurement: a 1-bit draw up front made the raw branch dead and the
+    // nest built identical for every seed). Both halves run on every seed,
+    // from the same drawn octets.
+    var attrs_len: usize = undefined;
+    var want_len: usize = undefined;
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        // The driver: one of the corpus entries (attribute blob + the name
+        // asked for), the blob damaged, the name kept or damaged.
+        var corpus: FindCorpus = .{};
+        const entries = corpus.build() catch return;
+        const i = src.index(entries.len);
+        const alen = std.mem.readInt(u32, entries[i][0..4], .little);
+        attrs_len = fz.damage(src, &buf, entries[i][4..][0..alen]);
+        want_len = fz.damage(src, &want_buf, corpus.wants[i]);
+    } else {
+        attrs_len = src.slice(&buf);
+        want_len = src.slice(&want_buf);
+    }
     const want = want_buf[0..want_len];
 
     // (a) The raw walk: the drawn octets straight into the outer iterator.
-    _ = findMcastGroupId(buf[0..attrs_len], want) catch {};
+    if (findMcastGroupId(buf[0..attrs_len], want)) |id| {
+        if (id != null) McastMark.mark(.found) else McastMark.mark(.not_found);
+    } else |_| McastMark.mark(.refused);
 
     // (b) The structured walk: the same octets carved into group NAME
     //     attributes inside a well-formed CTRL_ATTR_MCAST_GROUPS nest, so the
     //     inner walk and the name comparison are reached even when the drawn
     //     bytes are not a valid nest.
     var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(testing.allocator);
-    const outer = codec.nestBegin(testing.allocator, &list, CTRL_ATTR_MCAST_GROUPS) catch return;
-    const n_groups: usize = @intCast(smith.value(u64) % 5);
+    defer list.deinit(gpa);
+    const outer = codec.nestBegin(gpa, &list, CTRL_ATTR_MCAST_GROUPS) catch return;
+    const n_groups: usize = @intCast(src.value(u64) % 5);
     var off: usize = 0;
     for (0..n_groups) |i| {
-        const inner = codec.nestBegin(testing.allocator, &list, @intCast(i + 1)) catch return;
-        if (smith.eos()) {
+        const inner = codec.nestBegin(gpa, &list, @intCast(i + 1)) catch return;
+        if (fz.flag(S, src)) {
             codec.appendAttrU32(
-                testing.allocator,
+                gpa,
                 &list,
                 CTRL_ATTR_MCAST_GRP_ID,
-                @truncate(smith.value(u64)),
+                @truncate(src.value(u64)),
             ) catch return;
         }
         const take = @min(attrs_len - off, @as(usize, 16));
         codec.appendAttrString(
-            testing.allocator,
+            gpa,
             &list,
             CTRL_ATTR_MCAST_GRP_NAME,
             buf[off..][0..take],
@@ -922,6 +973,7 @@ fn fuzzFindMcastGroupId(_: void, smith: *std.testing.Smith) !void {
         codec.nestEnd(&list, inner) catch return;
     }
     codec.nestEnd(&list, outer) catch return;
+    if (n_groups != 0) McastMark.mark(.structured);
     _ = findMcastGroupId(list.items, want) catch {};
 }
 

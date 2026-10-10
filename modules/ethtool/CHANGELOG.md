@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `ETHTOOL_FUZZ` over the existing harnesses (notification + nlctrl groups, the RINGS/CHANNELS/COALESCE/PAUSE decoders, stats + string sets, bitset); reach labels count real outcomes. No code or API change.
 - **2026-09-30** — **`ioctl.drvinfo()` and `ioctl.driverStats()`: `ethtool -i` and plain `ethtool -S`.**
   New `src/ioctl.zig`, exactly two `SIOCETHTOOL` entry points (`ETHTOOL_GDRVINFO`;
   `GSSET_INFO` + `GSTRINGS` + `GSTATS`) over `std.os.linux`, no libc. They have no netlink

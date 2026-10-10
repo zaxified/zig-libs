@@ -448,21 +448,47 @@ const decode_seeds = [_][]const u8{
     seed("\xff"), // InvalidUtf8: not valid UTF-8 to begin with
 };
 
+const fz = @import("fuzz_test.zig");
+const Utf7Mark = fz.Marker(enum { decoded, refused, non_ascii });
+
 test "fuzz: modified UTF-7 decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: IMAP_FUZZ (utf7)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "IMAP_FUZZ", .name = "imap-utf7" });
+}
+
+test "fuzz harness: utf7, 500 seeds, reaches every outcome" {
+    try Utf7Mark.reach(fuzzDecode, "imap-utf7", 500);
+}
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const entries: []const []const u8 = &decode_seeds;
     var buf: [256]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `decodeAlloc` was handed an empty slice
     // with the seed sitting unread in `buf`.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
 
-    const out = decodeAlloc(testing.allocator, buf[0..len]) catch return;
-    defer testing.allocator.free(out);
+    const out = decodeAlloc(gpa, buf[0..len]) catch {
+        Utf7Mark.mark(.refused);
+        return;
+    };
+    defer gpa.free(out);
+    Utf7Mark.mark(.decoded);
+    for (out) |c| {
+        if (c >= 0x80) {
+            Utf7Mark.mark(.non_ascii);
+            break;
+        }
+    }
 
     // Whatever came back must be valid UTF-8 -- the decoder's contract, and a
     // stronger check than "it did not crash". A surrogate mishandled as a

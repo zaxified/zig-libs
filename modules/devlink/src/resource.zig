@@ -570,14 +570,31 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const ResourceMark = fz.Marker(enum { decoded, refused, resources });
+
 test "fuzz: resource decoding never crashes or runs away" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzResource, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzResourceSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzResource(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: DEVLINK_FUZZ (resource)" {
+    try fz.fuzz_driver.run(fuzzResource, .{ .prefix = "DEVLINK_FUZZ", .name = "devlink-resource" });
+}
+
+test "fuzz harness: resource, 500 seeds, reaches every outcome" {
+    try ResourceMark.reach(fuzzResource, "devlink-resource", 500);
+}
+
+fn fuzzResourceSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzResource(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzResource(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: Corpus = .{};
+    const entries = corpus.build() catch return;
     var buf: [1024]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `parse` was handed an empty attribute
@@ -590,13 +607,14 @@ fn fuzzResource(_: void, smith: *std.testing.Smith) !void {
     // `parse("")` succeeds, and the collapsed harness scored a perfect 7 of 7
     // while never entering the recursive RESOURCE_LIST walk that this
     // function's whole depth bound exists for.
-    const len: usize = smith.slice(&buf);
-    if (parse(testing.allocator, buf[0..len])) |rs| {
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    if (parse(gpa, buf[0..len])) |rs| {
         var v = rs;
-        _ = v.count();
+        ResourceMark.mark(.decoded);
+        if (v.count() != 0) ResourceMark.mark(.resources);
         _ = v.find("x");
-        v.deinit(testing.allocator);
-    } else |_| {}
+        v.deinit(gpa);
+    } else |_| ResourceMark.mark(.refused);
 }
 
 test "corpus: every resource seed reaches the parser, and the counts are pinned" {

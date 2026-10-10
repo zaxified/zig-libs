@@ -926,8 +926,23 @@ const fuzz_seeds = [_][]const u8{
     fuzzseed.seed(".."), // relative, and above the working directory
 };
 
+const fz = @import("fuzz_test.zig");
+const LstatMark = fz.Marker(enum { nul_refused, resolved, stat_error });
+
 test "fuzz: lstatPath never panics or truncates silently on arbitrary path bytes" {
-    try testing.fuzz({}, fuzzLstatPath, .{ .corpus = &fuzz_seeds });
+    try testing.fuzz({}, fuzzLstatPathSmith, .{ .corpus = &fuzz_seeds });
+}
+
+test "fuzz driver: DISKUSAGE_FUZZ (lstat)" {
+    try fz.fuzz_driver.run(fuzzLstatPath, .{ .prefix = "DISKUSAGE_FUZZ", .name = "diskusage-lstat" });
+}
+
+test "fuzz harness: lstat, 500 seeds, reaches every outcome" {
+    try LstatMark.reach(fuzzLstatPath, "diskusage-lstat", 500);
+}
+
+fn fuzzLstatPathSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzLstatPath(std.testing.Smith, smith, testing.allocator);
 }
 
 test "corpus: every seed reaches lstatPath, and what it resolves is pinned" {
@@ -965,14 +980,16 @@ test "corpus: every seed reaches lstatPath, and what it resolves is pinned" {
     try testing.expectEqual(@as(usize, 4), resolved);
 }
 
-fn fuzzLstatPath(_: void, smith: *std.testing.Smith) !void {
+fn fuzzLstatPath(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &fuzz_seeds;
     var buf: [fuzz_path_buf_len]u8 = undefined;
-    // One `smith.slice`, never a ranged length followed by `bytes`. The ranged
+    // One `src.slice`, never a ranged length followed by `bytes`. The ranged
     // draw reads eight octets as a little-endian `u64` and returns the range
     // MINIMUM unless that whole word already falls inside the range, so the
     // length was hostage to `fuzz_path_buf_len` - see the corpus comment above
     // for the measurement.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
     const path = buf[0..len];
 
     const backend = detect();
@@ -984,6 +1001,7 @@ fn fuzzLstatPath(_: void, smith: *std.testing.Smith) !void {
     // than the one it was actually given).
     if (std.mem.findScalar(u8, path, 0) != null) {
         try testing.expectError(error.InvalidPath, result);
+        LstatMark.mark(.nul_refused);
         return;
     }
     // Everything else: any `StatError`, or a real `FileStat` (a fuzzed
@@ -991,5 +1009,5 @@ fn fuzzLstatPath(_: void, smith: *std.testing.Smith) !void {
     // handled outcome. Only a panic — caught by the harness process
     // crashing, the same way every other `testing.fuzz` target in this
     // collection is checked — is a failure.
-    _ = result catch {};
+    if (result) |_| LstatMark.mark(.resolved) else |_| LstatMark.mark(.stat_error);
 }

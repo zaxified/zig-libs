@@ -1398,6 +1398,11 @@ pub fn fixupDatasecs(obj: *Object) ParseError!void {
                 const sym = obj.image.symbol(obj.symtab_idx, s) catch return error.MalformedElf;
                 if (sym.st_shndx != sec_idx) continue;
                 if (!std.mem.eql(u8, obj.image.symbolName(obj.symtab_idx, sym), vname)) continue;
+                // `st_value` / `st_size` are u64 straight off the ELF; the
+                // BTF slots are u32 (found by the 2026-10-10 fuzz driver,
+                // EBPF_FUZZ ebpf-object seed 1867: `@intCast` panic).
+                if (sym.st_value > std.math.maxInt(u32) or sym.st_size > std.math.maxInt(u32))
+                    return error.MalformedElf;
                 std.mem.writeInt(u32, bytes[at + 4 ..][0..4], @intCast(sym.st_value), .little);
                 if (sym.st_size != 0)
                     std.mem.writeInt(u32, bytes[at + 8 ..][0..4], @intCast(sym.st_size), .little);
@@ -1925,6 +1930,32 @@ test "hostile: a map_value relocation landing exactly on the value-size boundary
     defer gpa.free(img);
     std.mem.writeInt(u64, img[at..][0..8], 16, .little); // was 8 (valid), now == value_size
     try testing.expectError(error.RelocationOutOfRange, open(gpa, img, .{}));
+}
+
+test "hostile: a datasec variable symbol with a >32-bit st_size is refused, not an @intCast panic" {
+    // Regression (fuzz driver EBPF_FUZZ ebpf-object seed 1867): `fixupDatasecs`
+    // narrowed the u64 `st_value` / `st_size` into BTF's u32 slots unchecked.
+    const gpa = testing.allocator;
+    var probe = try open(gpa, fx_rodata_const, .{});
+    const symtab_idx = probe.symtab_idx;
+    const sh_offset = probe.image.sections[symtab_idx].sh_offset;
+    const n = try probe.image.symbolCount(symtab_idx);
+    var target_off: ?usize = null;
+    var si: u32 = 0;
+    while (si < n) : (si += 1) {
+        const sym = try probe.image.symbol(symtab_idx, si);
+        if (std.mem.eql(u8, probe.image.symbolName(symtab_idx, sym), "tag")) {
+            target_off = @intCast(sh_offset + @as(u64, si) * 24 + 16); // Elf64_Sym.st_size
+            break;
+        }
+    }
+    probe.deinit();
+    const img = try gpa.dupe(u8, fx_rodata_const);
+    defer gpa.free(img);
+    std.mem.writeInt(u64, img[target_off.?..][0..8], 0x1_0000_0000, .little);
+    var obj = try open(gpa, img, .{});
+    defer obj.deinit();
+    try testing.expectError(error.MalformedElf, fixupDatasecs(&obj));
 }
 
 test "hostile: a .BTF.ext record whose insn_off is not 8-aligned is refused, not silently rounded (D8)" {
@@ -2934,25 +2965,47 @@ fn walkObject(gpa: std.mem.Allocator, bytes: []const u8, opts: OpenOptions) ?Obj
     return t;
 }
 
+const fz = @import("fuzz_test.zig");
+const ObjectMark = fz.Marker(enum { opened, refused, programs, maps, relos });
+
 test "fuzz: open never panics on a hostile BPF object" {
     var corpus: ObjectCorpus = .{};
-    try testing.fuzz({}, fuzzOpenObject, .{ .corpus = try corpus.build(testing.allocator) });
+    try testing.fuzz({}, fuzzOpenObjectSmith, .{ .corpus = try corpus.build(testing.allocator) });
 }
 
-fn fuzzOpenObject(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: EBPF_FUZZ (object)" {
+    try fz.fuzz_driver.run(fuzzOpenObject, .{ .prefix = "EBPF_FUZZ", .name = "ebpf-object" });
+}
+
+test "fuzz harness: object, 500 seeds, reaches every outcome" {
+    try ObjectMark.reach(fuzzOpenObject, "ebpf-object", 500);
+}
+
+fn fuzzOpenObjectSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzOpenObject(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzOpenObject(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: ObjectCorpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) corpus.build(gpa) catch return else &.{};
     // 32768: the largest fixture here is 5.8 KiB and a fuzzer may grow it. A
     // seed longer than the buffer is not a big seed — `Smith.slice` reads it
     // back as the EMPTY one, silently, which is how a corpus of real objects
     // would have turned into a corpus of nothing.
     var buf: [32768]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
     // `require_bpf_machine` travels in the seed's tail rather than being a
     // draw made after the input is spent, which would pin it to `false`
     // forever — it is the one option `open` has and it gates a refusal.
-    const strict = smith.value(u64) & 1 != 0;
-    std.mem.doNotOptimizeAway(walkObject(testing.allocator, buf[0..len], .{
+    const strict = src.value(u64) & 1 != 0;
+    if (walkObject(gpa, buf[0..len], .{
         .require_bpf_machine = strict,
-    }));
+    })) |t| {
+        ObjectMark.mark(.opened);
+        if (t.programs != 0) ObjectMark.mark(.programs);
+        if (t.maps != 0) ObjectMark.mark(.maps);
+        if (t.relos != 0) ObjectMark.mark(.relos);
+    } else ObjectMark.mark(.refused);
 }
 
 test "corpus: every object seed reaches open, and the parsed counts are pinned" {

@@ -375,7 +375,7 @@ const module_list = [_]Module{
     .{ .name = "mls", .libs = &.{"crypto"}, .deps = &.{"hpke"}, .test_deps = &.{"testkit"} },
     .{ .name = "megolm", .libs = &.{"crypto"}, .deps = &.{ "aescbc", "entropy", "chachapoly" }, .test_deps = &.{"testkit"} },
     .{ .name = "ebpf", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
-    .{ .name = "xdp-classifier", .libs = &.{"net"}, .deps = &.{"ebpf"} },
+    .{ .name = "xdp-classifier", .libs = &.{"net"}, .deps = &.{"ebpf"}, .test_deps = &.{"testkit"} },
     .{ .name = "ecvrf", .libs = &.{"crypto"}, .deps = &.{"ct25519"}, .test_deps = &.{"testkit"} },
     .{ .name = "fss", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "pir", .libs = &.{"crypto"}, .deps = &.{"fss"}, .test_deps = &.{"testkit"} },

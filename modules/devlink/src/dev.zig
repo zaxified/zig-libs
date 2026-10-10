@@ -473,14 +473,31 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const DevMark = fz.Marker(enum { device, device_refused, info, info_refused, versions });
+
 test "fuzz: device and info decoding never crash" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzDev, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzDevSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzDev(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: DEVLINK_FUZZ (dev)" {
+    try fz.fuzz_driver.run(fuzzDev, .{ .prefix = "DEVLINK_FUZZ", .name = "devlink-dev" });
+}
+
+test "fuzz harness: dev, 500 seeds, reaches every outcome" {
+    try DevMark.reach(fuzzDev, "devlink-dev", 500);
+}
+
+fn fuzzDevSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDev(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDev(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: Corpus = .{};
+    const entries = corpus.build() catch return;
     var buf: [512]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and both parsers were handed an empty
@@ -493,13 +510,18 @@ fn fuzzDev(_: void, smith: *std.testing.Smith) !void {
     // every field is optional — so both parsers succeed on it, and the
     // collapsed harness scored 6 of 6 twice over while never entering the TLV
     // walk. `versions` is the number that can tell the two apart.
-    const len: usize = smith.slice(&buf);
-    if (parseDevice(buf[0..len])) |d| std.mem.doNotOptimizeAway(&d) else |_| {}
-    if (parseInfo(testing.allocator, buf[0..len])) |info| {
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    if (parseDevice(buf[0..len])) |d| {
+        std.mem.doNotOptimizeAway(&d);
+        DevMark.mark(.device);
+    } else |_| DevMark.mark(.device_refused);
+    if (parseInfo(gpa, buf[0..len])) |info| {
         var v = info;
         _ = v.hasPendingUpdate();
-        v.deinit(testing.allocator);
-    } else |_| {}
+        DevMark.mark(.info);
+        if (v.versions.len != 0) DevMark.mark(.versions);
+        v.deinit(gpa);
+    } else |_| DevMark.mark(.info_refused);
 }
 
 test "corpus: every dev seed reaches both parsers, and the decoded counts are pinned" {

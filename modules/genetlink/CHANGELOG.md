@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `GENETLINK_FUZZ` over the existing harnesses (`splitPayload` plus its attribute walk, `findMcastGroupId` raw and structured); reach labels count real outcomes. No code or API change.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** real `CTRL_CMD_GETFAMILY` exchanges for families
   with several multicast groups (netdev, nl80211, thermal, mptcp_pm) and for an unknown family are
   frozen by `tools/families_capture.py` (Python's own socket and decoder) and replayed through the

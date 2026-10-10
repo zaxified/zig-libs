@@ -451,14 +451,32 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const HealthMark = fz.Marker(enum { decoded, refused, named });
+
 test "fuzz: reporter decoding never crashes" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzHealth, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzHealthSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzHealth(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: DEVLINK_FUZZ (health)" {
+    try fz.fuzz_driver.run(fuzzHealth, .{ .prefix = "DEVLINK_FUZZ", .name = "devlink-health" });
+}
+
+test "fuzz harness: health, 500 seeds, reaches every outcome" {
+    try HealthMark.reach(fuzzHealth, "devlink-health", 500);
+}
+
+fn fuzzHealthSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzHealth(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzHealth(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: Corpus = .{};
+    const entries = corpus.build() catch return;
     var buf: [256]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `parse` was handed an empty attribute
@@ -470,11 +488,13 @@ fn fuzzHealth(_: void, smith: *std.testing.Smith) !void {
     // An empty attribute list is a legal devlink reply — every field is
     // optional — so `parse("")` succeeds, and the collapsed harness scored a
     // perfect 6 of 6 while never entering the reporter nest.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
     if (parse(buf[0..len])) |r| {
         _ = r.unrecoveredCount();
         _ = r.hasDump();
-    } else |_| {}
+        HealthMark.mark(.decoded);
+        if (r.name().len != 0) HealthMark.mark(.named);
+    } else |_| HealthMark.mark(.refused);
 }
 
 test "corpus: every reporter seed reaches the parser, and the decoded count is pinned" {

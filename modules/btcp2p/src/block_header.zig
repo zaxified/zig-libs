@@ -165,20 +165,41 @@ const decode_seeds = [_][]const u8{
     seedHex("01000000"), // Truncated: a version field and nothing else
 };
 
+const fz = @import("fuzz_test.zig");
+const HeaderMark = fz.Marker(enum { ok, refused });
+
 test "fuzz: BlockHeader.decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzBlockHeaderDecode, .{ .corpus = &decode_seeds });
+    try testing.fuzz({}, fuzzBlockHeaderDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzBlockHeaderDecode(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: BTCP2P_FUZZ (header)" {
+    try fz.fuzz_driver.run(fuzzBlockHeaderDecode, .{ .prefix = "BTCP2P_FUZZ", .name = "btcp-header" });
+}
+
+test "fuzz harness: header, 500 seeds, reaches every outcome" {
+    try HeaderMark.reach(fuzzBlockHeaderDecode, "btcp-header", 500);
+}
+
+fn fuzzBlockHeaderDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzBlockHeaderDecode(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzBlockHeaderDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &decode_seeds;
     var buf: [96]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `decode` saw `buf[0..0]` every single
     // time, with the seed sitting unread in `buf`.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
     var r: Reader = .{ .bytes = buf[0..len] };
-    const header = BlockHeader.decode(&r) catch return;
+    const header = BlockHeader.decode(&r) catch {
+        HeaderMark.mark(.refused);
+        return;
+    };
+    HeaderMark.mark(.ok);
     _ = header.blockHash();
 }
 

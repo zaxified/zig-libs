@@ -473,20 +473,40 @@ const inventory_seeds = [_][]const u8{
     seedHex("fd"), // a CompactSize prefix with no octets behind it
 };
 
+const fz = @import("fuzz_test.zig");
+const InvMark = fz.Marker(enum { ok, refused });
+
 test "fuzz: decodeInventoryList never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzInventoryList, .{ .corpus = &inventory_seeds });
+    try testing.fuzz({}, fuzzInventoryListSmith, .{ .corpus = &inventory_seeds });
 }
 
-fn fuzzInventoryList(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+test "fuzz driver: BTCP2P_FUZZ (inv)" {
+    try fz.fuzz_driver.run(fuzzInventoryList, .{ .prefix = "BTCP2P_FUZZ", .name = "btcp-inv" });
+}
+
+test "fuzz harness: inv, 500 seeds, reaches every outcome" {
+    try InvMark.reach(fuzzInventoryList, "btcp-inv", 500);
+}
+
+fn fuzzInventoryListSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzInventoryList(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzInventoryList(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const entries: []const []const u8 = &inventory_seeds;
+    const allocator = gpa;
     var buf: [512]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and the decoder saw `buf[0..0]` every
     // single time, with the seed sitting unread in `buf`.
-    const len: usize = smith.slice(&buf);
-    var list = decodeInventoryList(allocator, buf[0..len]) catch return;
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    var list = decodeInventoryList(allocator, buf[0..len]) catch {
+        InvMark.mark(.refused);
+        return;
+    };
+    InvMark.mark(.ok);
     defer list.deinit(allocator);
 }
 
@@ -530,16 +550,35 @@ const locator_seeds = [_][]const u8{
     seedHex("7f1101"), // Truncated: not even the version field
 };
 
+const LocatorMark = fz.Marker(enum { ok, refused });
+
 test "fuzz: decodeBlockLocator never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzBlockLocator, .{ .corpus = &locator_seeds });
+    try testing.fuzz({}, fuzzBlockLocatorSmith, .{ .corpus = &locator_seeds });
 }
 
-fn fuzzBlockLocator(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+test "fuzz driver: BTCP2P_FUZZ (locator)" {
+    try fz.fuzz_driver.run(fuzzBlockLocator, .{ .prefix = "BTCP2P_FUZZ", .name = "btcp-locator" });
+}
+
+test "fuzz harness: locator, 500 seeds, reaches every outcome" {
+    try LocatorMark.reach(fuzzBlockLocator, "btcp-locator", 500);
+}
+
+fn fuzzBlockLocatorSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzBlockLocator(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzBlockLocator(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const entries: []const []const u8 = &locator_seeds;
+    const allocator = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ Same defect as `fuzzInventoryList` above: `len` was 0 for every seed.
-    const len: usize = smith.slice(&buf);
-    var loc = decodeBlockLocator(allocator, buf[0..len]) catch return;
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    var loc = decodeBlockLocator(allocator, buf[0..len]) catch {
+        LocatorMark.mark(.refused);
+        return;
+    };
+    LocatorMark.mark(.ok);
     defer loc.deinit(allocator);
 }
 
@@ -578,16 +617,35 @@ const headers_seeds = [_][]const u8{
     seedHex("01" ++ "00" ** 79), // TooManyItems: one octet short of a single entry
 };
 
+const HeadersMark = fz.Marker(enum { ok, refused });
+
 test "fuzz: decodeHeaders never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzHeaders, .{ .corpus = &headers_seeds });
+    try testing.fuzz({}, fuzzHeadersSmith, .{ .corpus = &headers_seeds });
 }
 
-fn fuzzHeaders(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+test "fuzz driver: BTCP2P_FUZZ (headers)" {
+    try fz.fuzz_driver.run(fuzzHeaders, .{ .prefix = "BTCP2P_FUZZ", .name = "btcp-headers" });
+}
+
+test "fuzz harness: headers, 500 seeds, reaches every outcome" {
+    try HeadersMark.reach(fuzzHeaders, "btcp-headers", 500);
+}
+
+fn fuzzHeadersSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzHeaders(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzHeaders(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const entries: []const []const u8 = &headers_seeds;
+    const allocator = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ Same defect as `fuzzInventoryList` above: `len` was 0 for every seed.
-    const len: usize = smith.slice(&buf);
-    var h = decodeHeaders(allocator, buf[0..len]) catch return;
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    var h = decodeHeaders(allocator, buf[0..len]) catch {
+        HeadersMark.mark(.refused);
+        return;
+    };
+    HeadersMark.mark(.ok);
     defer h.deinit(allocator);
 }
 

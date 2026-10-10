@@ -262,19 +262,35 @@ fn biasedSeed(comptime frame: []const u8, comptime words: []const u64) []const u
     }.bytes;
 }
 
+const fz = @import("fuzz_test.zig");
+const BlockMark = fz.Marker(enum { ok, refused });
+
 test "fuzz: decodeBlock never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeBlock, .{ .corpus = &decode_seeds });
+    try testing.fuzz({}, fuzzDecodeBlockSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzDecodeBlock(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+test "fuzz driver: BTCP2P_FUZZ (block)" {
+    try fz.fuzz_driver.run(fuzzDecodeBlock, .{ .prefix = "BTCP2P_FUZZ", .name = "btcp-block" });
+}
+
+test "fuzz harness: block, 500 seeds, reaches every outcome" {
+    try BlockMark.reach(fuzzDecodeBlock, "btcp-block", 500);
+}
+
+fn fuzzDecodeBlockSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecodeBlock(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDecodeBlock(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const entries: []const []const u8 = &decode_seeds;
+    const allocator = gpa;
     var buf: [512]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `decodeBlock` saw `buf[0..0]` every
     // single time, with the seed sitting unread in `buf`.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
 
     // Bias the octet right after the 80-octet header (the txn_count
     // CompactSize) toward small counts -- otherwise a uniformly random octet
@@ -288,11 +304,15 @@ fn fuzzDecodeBlock(_: void, smith: *std.testing.Smith) !void {
     // input, so it was the weight minimum -- false -- on every execution. The
     // bias had never once been applied. It is now bounded by `len`, so it can
     // only ever rewrite an octet the decoder will actually read.
-    if (len > block_header.HEADER_LEN and smith.value(bool)) {
-        buf[block_header.HEADER_LEN] = smith.valueRangeAtMost(u8, 0, 3);
+    if (len > block_header.HEADER_LEN and src.value(bool)) {
+        buf[block_header.HEADER_LEN] = src.valueRangeAtMost(u8, 0, 3);
     }
 
-    var blk = decodeBlock(allocator, buf[0..len]) catch return;
+    var blk = decodeBlock(allocator, buf[0..len]) catch {
+        BlockMark.mark(.refused);
+        return;
+    };
+    BlockMark.mark(.ok);
     defer blk.deinit(allocator);
 }
 

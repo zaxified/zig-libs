@@ -1771,16 +1771,34 @@ pub fn optionalsSet(v: anytype) usize {
     return n;
 }
 
+const fz = @import("fuzz_test.zig");
+const OptionsMark = fz.Marker(enum { netem, shaper, optionals, qdisc, class, refused });
+
 test "fuzz: option parsers never crash on arbitrary payloads" {
     var corpus: OptionsCorpus = .{};
-    try testing.fuzz({}, fuzzParseOptions, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzParseOptionsSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzParseOptions(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: TC_FUZZ (options)" {
+    try fz.fuzz_driver.run(fuzzParseOptions, .{ .prefix = "TC_FUZZ", .name = "tc-options" });
+}
+
+test "fuzz harness: options, 500 seeds, reaches every outcome" {
+    try OptionsMark.reach(fuzzParseOptions, "tc-options", 500);
+}
+
+fn fuzzParseOptionsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseOptions(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParseOptions(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: OptionsCorpus = .{};
+    const entries = corpus.build() catch return;
     // ⛔ 4096, not 256. See `OptionsCorpus`: an htb class options nest is over
     // 2 KiB of rate tables, and a seed longer than the buffer reads back EMPTY.
     var raw: [4096]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and all eight parsers were handed an EMPTY
@@ -1792,16 +1810,32 @@ fn fuzzParseOptions(_: void, smith: *std.testing.Smith) !void {
     // 65 optionals after.** And **5 of the 8 parsers *succeeded* on that empty
     // slice** — an empty attribute list is a legal options body — so an
     // acceptance count said the harness was healthy while it walked nothing.
-    const len: usize = smith.slice(&raw);
+    const len: usize = fz.drawInput(S, src, &raw, entries);
     const buf = raw[0..len];
-    if (parseNetemOptions(buf)) |_| {} else |_| {}
-    if (parseHtbOptions(buf)) |_| {} else |_| {}
+    if (parseNetemOptions(buf)) |_| OptionsMark.mark(.netem) else |_| OptionsMark.mark(.refused);
+    if (parseHtbOptions(buf)) |w| {
+        OptionsMark.mark(.shaper);
+        if (optionalsSet(w) != 0) OptionsMark.mark(.optionals);
+    } else |_| {}
     if (parseHtbClassOptions(buf)) |_| {} else |_| {}
-    if (parseTbfOptions(buf)) |_| {} else |_| {}
-    if (parseFqCodelOptions(buf)) |_| {} else |_| {}
-    if (parseCakeOptions(buf)) |_| {} else |_| {}
-    if (parseQdisc(buf)) |q| std.mem.doNotOptimizeAway(q.kind().len) else |_| {}
-    if (parseClass(buf)) |c| std.mem.doNotOptimizeAway(c.kind().len) else |_| {}
+    if (parseTbfOptions(buf)) |w| {
+        OptionsMark.mark(.shaper);
+        if (optionalsSet(w) != 0) OptionsMark.mark(.optionals);
+    } else |_| {}
+    if (parseFqCodelOptions(buf)) |w| {
+        if (optionalsSet(w) != 0) OptionsMark.mark(.optionals);
+    } else |_| {}
+    if (parseCakeOptions(buf)) |w| {
+        if (optionalsSet(w) != 0) OptionsMark.mark(.optionals);
+    } else |_| {}
+    if (parseQdisc(buf)) |q| {
+        std.mem.doNotOptimizeAway(q.kind().len);
+        if (q.kind().len != 0) OptionsMark.mark(.qdisc);
+    } else |_| {}
+    if (parseClass(buf)) |c| {
+        std.mem.doNotOptimizeAway(c.kind().len);
+        if (c.kind().len != 0) OptionsMark.mark(.class);
+    } else |_| {}
 }
 
 test "corpus: every option seed reaches the parsers, and the decoded counts are pinned" {

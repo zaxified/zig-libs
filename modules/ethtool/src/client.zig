@@ -1288,14 +1288,31 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const NotificationMark = fz.Marker(enum { notification, other_cmd, refused, group_found, group_none, group_refused });
+
 test "fuzz: notification parsing never crashes" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzNotification, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzNotificationSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzNotification(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: ETHTOOL_FUZZ (notification)" {
+    try fz.fuzz_driver.run(fuzzNotification, .{ .prefix = "ETHTOOL_FUZZ", .name = "ethtool-notification" });
+}
+
+test "fuzz harness: notification, 500 seeds, reaches every outcome" {
+    try NotificationMark.reach(fuzzNotification, "ethtool-notification", 500);
+}
+
+fn fuzzNotificationSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzNotification(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzNotification(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: Corpus = .{};
+    const entries = corpus.build() catch return;
     var raw_buf: [256]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(raw_buf.len, in.len)` octets and the ranged
     // draw then finds fewer than the eight it needs and returns the range
     // MINIMUM, so `len` was 0 for every seed and both `parseNotification` and
@@ -1308,13 +1325,16 @@ fn fuzzNotification(_: void, smith: *std.testing.Smith) !void {
     // 2026-09-07 over the corpus above: **0 of 5 seeds non-empty, 5 of 5
     // "parsed", 0 recognised as notifications and 0 group ids found before; 5
     // of 5 non-empty, 4 parsed, 2 recognised and 1 group id after.**
-    const len: usize = smith.slice(&raw_buf);
-    const cmd: u8 = @truncate(smith.value(u64));
-    if (parseNotification(testing.allocator, cmd, raw_buf[0..len])) |n| {
+    const len: usize = fz.drawInput(S, src, &raw_buf, entries);
+    const cmd: u8 = if (S == fz.fuzz_driver.Rng and src.value(bool)) uapi.REPLY.RINGS_NTF else @truncate(src.value(u64));
+    if (parseNotification(gpa, cmd, raw_buf[0..len])) |n| {
         var v = n;
-        v.deinit(testing.allocator);
-    } else |_| {}
-    if (findMcastGroupId(raw_buf[0..len], "monitor")) |g| std.mem.doNotOptimizeAway(&g) else |_| {}
+        if (v.isNotification()) NotificationMark.mark(.notification) else NotificationMark.mark(.other_cmd);
+        v.deinit(gpa);
+    } else |_| NotificationMark.mark(.refused);
+    if (findMcastGroupId(raw_buf[0..len], "monitor")) |g| {
+        if (g != null) NotificationMark.mark(.group_found) else NotificationMark.mark(.group_none);
+    } else |_| NotificationMark.mark(.group_refused);
 }
 
 test "corpus: every notification seed reaches both parsers, and the counts are pinned" {

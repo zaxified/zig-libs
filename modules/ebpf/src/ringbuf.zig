@@ -1098,9 +1098,24 @@ test "MapInfo mirrors the kernel's bpf_map_info prefix layout" {
     try testing.expectEqual(@as(usize, 88), @sizeOf(MapInfo));
 }
 
+const fz = @import("fuzz_test.zig");
+const RingMark = fz.Marker(enum { records, empty });
+
 test "fuzz: record walk over hostile mmap-region bytes never panics or reads out of bounds" {
     var corpus: RingCorpus = .{};
-    try testing.fuzz({}, fuzzRingbufWalk, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzRingbufWalkSmith, .{ .corpus = try corpus.build() });
+}
+
+test "fuzz driver: EBPF_FUZZ (ringbuf)" {
+    try fz.fuzz_driver.run(fuzzRingbufWalk, .{ .prefix = "EBPF_FUZZ", .name = "ebpf-ringbuf" });
+}
+
+test "fuzz harness: ringbuf, 500 seeds, reaches every outcome" {
+    try RingMark.reach(fuzzRingbufWalk, "ebpf-ringbuf", 500);
+}
+
+fn fuzzRingbufWalkSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRingbufWalk(std.testing.Smith, smith, testing.allocator);
 }
 
 /// Drives the real `Reader.next()`/`advance()` over a hand-built region whose
@@ -1116,8 +1131,9 @@ test "fuzz: record walk over hostile mmap-region bytes never panics or reads out
 /// this is what keeps a single `next()` call's internal discard-skipping
 /// loop bounded, rather than fuzzing toward an unrelated "huge backlog"
 /// hang that a real mmap'd ring could never actually present.
-fn fuzzRingbufWalk(_: void, smith: *std.testing.Smith) !void {
-    std.mem.doNotOptimizeAway(try walkRing(smith));
+fn fuzzRingbufWalk(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const n = try walkRing(S, src, gpa);
+    if (n != 0) RingMark.mark(.records) else RingMark.mark(.empty);
 }
 
 /// One round of the ring walk, returning how many records came back. Shared by
@@ -1134,9 +1150,11 @@ fn fuzzRingbufWalk(_: void, smith: *std.testing.Smith) !void {
 /// `next()` returns null on the first line of the loop when `prod == cons`,
 /// so **the one input this target ever ran walked zero records**, and the
 /// bounds assertion the whole harness is built around was never evaluated.
-fn walkRing(smith: *std.testing.Smith) !usize {
+fn walkRing(comptime S: type, src: *S, gpa: std.mem.Allocator) !usize {
     var script: [4096]u8 = undefined;
-    const script_len: usize = smith.slice(&script);
+    var corpus: RingCorpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) corpus.build() catch return 0 else &.{};
+    const script_len: usize = fz.drawInput(S, src, &script, entries);
     var c: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
 
     const ring_size: usize = switch (c.ranged(0, 3)) {
@@ -1147,7 +1165,6 @@ fn walkRing(smith: *std.testing.Smith) !usize {
     };
     const page = std.heap.page_size_min;
     const alignment: std.mem.Alignment = comptime .fromByteUnits(std.heap.page_size_min);
-    const gpa = testing.allocator;
 
     const cons = try gpa.alignedAlloc(u8, alignment, page);
     defer gpa.free(cons);
@@ -1381,7 +1398,7 @@ test "corpus: every ring script drives the walk, and the record count is pinned"
     var records: usize = 0;
     for (entries) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
-        records += try walkRing(&smith);
+        records += try walkRing(std.testing.Smith, &smith, testing.allocator);
         var probe: std.testing.Smith = .{ .in = sd };
         var buf: [4096]u8 = undefined;
         if (probe.slice(&buf) != 0) nonempty += 1;
@@ -1393,7 +1410,7 @@ test "corpus: every ring script drives the walk, and the record count is pinned"
     // collapsed harness — every `Cursor` read is 0, which is every `Smith`
     // ranged draw's minimum — and it walks nothing.
     var empty: std.testing.Smith = .{ .in = testkit.fuzz.seed("") };
-    try testing.expectEqual(@as(usize, 0), try walkRing(&empty));
+    try testing.expectEqual(@as(usize, 0), try walkRing(std.testing.Smith, &empty, testing.allocator));
 }
 
 test "LIVE: mmap a real ringbuf map and consume a record end-to-end" {

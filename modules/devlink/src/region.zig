@@ -814,14 +814,31 @@ const Corpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const RegionMark = fz.Marker(enum { decoded, refused, chunk_fed, chunk_refused, covered });
+
 test "fuzz: region decoding and chunk reassembly never crash" {
     var corpus: Corpus = .{};
-    try testing.fuzz({}, fuzzRegion, .{ .corpus = try corpus.build() });
+    try testing.fuzz({}, fuzzRegionSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzRegion(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: DEVLINK_FUZZ (region)" {
+    try fz.fuzz_driver.run(fuzzRegion, .{ .prefix = "DEVLINK_FUZZ", .name = "devlink-region" });
+}
+
+test "fuzz harness: region, 500 seeds, reaches every outcome" {
+    try RegionMark.reach(fuzzRegion, "devlink-region", 500);
+}
+
+fn fuzzRegionSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRegion(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzRegion(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: Corpus = .{};
+    const entries = corpus.build() catch return;
     var buf: [512]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed, and both `parseRegion` and the assembler
@@ -834,12 +851,18 @@ fn fuzzRegion(_: void, smith: *std.testing.Smith) !void {
     // empty attribute list is a legal devlink reply — every field is optional,
     // and `Assembler.feed` explicitly tolerates a message with no chunks — so
     // the collapsed harness scored a perfect 7 of 7 while placing nothing.
-    const len: usize = smith.slice(&buf);
-    if (parseRegion(buf[0..len])) |r| std.mem.doNotOptimizeAway(&r) else |_| {}
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    if (parseRegion(buf[0..len])) |r| {
+        std.mem.doNotOptimizeAway(&r);
+        RegionMark.mark(.decoded);
+    } else |_| RegionMark.mark(.refused);
 
-    var a = Assembler.init(testing.allocator, 0, 256) catch return;
-    defer a.deinit(testing.allocator);
-    a.feed(buf[0..len]) catch {};
+    var a = Assembler.init(gpa, 0, 256) catch return;
+    defer a.deinit(gpa);
+    if (a.feed(buf[0..len])) |_| {
+        RegionMark.mark(.chunk_fed);
+        if (a.covered != 0) RegionMark.mark(.covered);
+    } else |_| RegionMark.mark(.chunk_refused);
 }
 
 test "corpus: every region seed reaches both paths, and the counts are pinned" {

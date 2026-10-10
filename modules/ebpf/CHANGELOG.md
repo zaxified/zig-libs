@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Fixed: `fixupDatasecs` panicked (`@intCast` integer does not fit) on an object whose variable symbol has `st_value` or `st_size` above 32 bits; it now returns `error.MalformedElf` (found by the new `EBPF_FUZZ` driver, ebpf-object seed 1867; regression test added).
+- **2026-10-10** — tests: deterministic fuzz driver `EBPF_FUZZ` over the existing harnesses (config shift, ELF image, .BTF.ext, ringbuf walk, BTF, BPF object (open + relocate + CO-RE + datasec fixup)); reach labels count real outcomes. No code or API change.
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `object.open()` now
   rejects three more classes of malformed `.BTF`/`.BTF.ext`/ELF input it
   previously accepted or crashed on: a KFLAG struct's non-bitfield member at

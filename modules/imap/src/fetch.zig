@@ -1103,43 +1103,62 @@ const fetch_seeds = [_][]const u8{
     shapedSeed("1 2\x00HEADER", 0x33), // refused: a space in the sequence set
 };
 
+const fz = @import("fuzz_test.zig");
+const FetchMark = fz.Marker(enum { ok, refused, hostile });
+
 test "fuzz: no FETCH argument can put a second command line on the wire" {
-    try testing.fuzz({}, fuzzEncode, .{ .corpus = &fetch_seeds });
+    try testing.fuzz({}, fuzzEncodeSmith, .{ .corpus = &fetch_seeds });
+}
+
+test "fuzz driver: IMAP_FUZZ (fetch)" {
+    try fz.fuzz_driver.run(fuzzEncode, .{ .prefix = "IMAP_FUZZ", .name = "imap-fetch" });
+}
+
+test "fuzz harness: fetch, 500 seeds, reaches every outcome" {
+    try FetchMark.reach(fuzzEncode, "imap-fetch", 500);
+}
+
+fn fuzzEncodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzEncode(std.testing.Smith, smith, testing.allocator);
 }
 
 /// `fetch.encode` never calls `string`, so it never emits a literal: every byte
 /// it writes is either a constant or a caller argument written unframed. That
 /// makes the invariant exact — one CRLF, at the very end, and no stray CR or LF
 /// anywhere before it. The shape is `smtp/src/command.zig`'s `fuzzCommands`.
-fn fuzzEncode(_: void, smith: *std.testing.Smith) !void {
+fn fuzzEncode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const entries: []const []const u8 = &fetch_seeds;
     var raw: [96]u8 = undefined;
-    // ⚠ One `smith.slice` call, and the fields are cut from what it returned.
-    // This used to be `smith.bytes(&raw)` followed by two ranged length draws;
+    // ⚠ One `src.slice` call, and the fields are cut from what it returned.
+    // This used to be `src.bytes(&raw)` followed by two ranged length draws;
     // `bytes` takes `@min(raw.len, in.len)` octets and each ranged draw then
     // finds fewer than the eight it needs and returns the range MINIMUM, so
     // `seq` and `sec` were BOTH empty for every seed while the drawn octets sat
     // unread in `raw`. The old comment beside those draws said "the empty
     // seq_set and the empty section are both interesting" — they were the only
     // thing this harness had ever produced.
-    const n = smith.slice(&raw);
+    const n = fz.drawInput(S, src, &raw, entries);
+    fz.sprinkle(S, src, raw[0..n]);
     const in = raw[0..n];
+    if (fz.hostile(in)) FetchMark.mark(.hostile);
     const f = fields(2, in);
     const seq = f[0];
     const sec = f[1];
-    const tag = if (smith.value(bool)) "T1" else seq;
+    const tag = if (src.value(bool)) "T1" else seq;
 
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    var e = command.Encoder.init(std.testing.allocator, &w, .{});
+    var e = command.Encoder.init(gpa, &w, .{});
 
     const req: Request = .{
-        .uid = smith.value(bool),
-        .flags = smith.value(bool),
-        .body_structure = smith.value(bool),
+        .uid = src.value(bool),
+        .flags = src.value(bool),
+        .body_structure = src.value(bool),
         .sections = &.{sec},
-        .peek = smith.value(bool),
+        .peek = src.value(bool),
     };
-    if (encode(&e, tag, seq, smith.value(bool), req)) |_| {
+    if (encode(&e, tag, seq, src.value(bool), req)) |_| {
+        FetchMark.mark(.ok);
         const line = w.buffered();
         std.debug.assert(std.mem.endsWith(u8, line, "\r\n"));
         const body = line[0 .. line.len - 2];
@@ -1147,6 +1166,7 @@ fn fuzzEncode(_: void, smith: *std.testing.Smith) !void {
         std.debug.assert(std.mem.indexOfScalar(u8, body, '\n') == null);
         std.debug.assert(std.mem.indexOfScalar(u8, body, 0) == null);
     } else |_| {
+        FetchMark.mark(.refused);
         // A refusal must also be a clean refusal: nothing half-written.
         std.debug.assert(w.buffered().len == 0);
     }

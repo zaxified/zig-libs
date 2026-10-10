@@ -318,20 +318,40 @@ const addr_seeds = [_][]const u8{
     seedHex("fd"), // a CompactSize prefix with no octets behind it
 };
 
+const fz = @import("fuzz_test.zig");
+const AddrMark = fz.Marker(enum { ok, refused });
+
 test "fuzz: decodeAddr never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzAddr, .{ .corpus = &addr_seeds });
+    try testing.fuzz({}, fuzzAddrSmith, .{ .corpus = &addr_seeds });
 }
 
-fn fuzzAddr(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+test "fuzz driver: BTCP2P_FUZZ (addr)" {
+    try fz.fuzz_driver.run(fuzzAddr, .{ .prefix = "BTCP2P_FUZZ", .name = "btcp-addr" });
+}
+
+test "fuzz harness: addr, 500 seeds, reaches every outcome" {
+    try AddrMark.reach(fuzzAddr, "btcp-addr", 500);
+}
+
+fn fuzzAddrSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzAddr(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzAddr(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const entries: []const []const u8 = &addr_seeds;
+    const allocator = gpa;
     var buf: [512]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `decodeAddr` saw `buf[0..0]` every
     // single time, with the seed sitting unread in `buf`.
-    const len: usize = smith.slice(&buf);
-    var a = decodeAddr(allocator, buf[0..len]) catch return;
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    var a = decodeAddr(allocator, buf[0..len]) catch {
+        AddrMark.mark(.refused);
+        return;
+    };
+    AddrMark.mark(.ok);
     defer a.deinit(allocator);
 }
 
@@ -378,15 +398,35 @@ const reject_seeds = [_][]const u8{
     seedHex("fd0001"), // Truncated: a message claiming 256 octets
 };
 
+const RejectMark = fz.Marker(enum { ok, refused });
+
 test "fuzz: decodeReject never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzReject, .{ .corpus = &reject_seeds });
+    try testing.fuzz({}, fuzzRejectSmith, .{ .corpus = &reject_seeds });
 }
 
-fn fuzzReject(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: BTCP2P_FUZZ (reject)" {
+    try fz.fuzz_driver.run(fuzzReject, .{ .prefix = "BTCP2P_FUZZ", .name = "btcp-reject" });
+}
+
+test "fuzz harness: reject, 500 seeds, reaches every outcome" {
+    try RejectMark.reach(fuzzReject, "btcp-reject", 500);
+}
+
+fn fuzzRejectSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzReject(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzReject(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &reject_seeds;
     var buf: [256]u8 = undefined;
     // ⚠ Same defect as `fuzzAddr` above: `len` was 0 for every seed.
-    const len: usize = smith.slice(&buf);
-    _ = decodeReject(buf[0..len]) catch return;
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    _ = decodeReject(buf[0..len]) catch {
+        RejectMark.mark(.refused);
+        return;
+    };
+    RejectMark.mark(.ok);
 }
 
 test "corpus: every reject seed reaches the decoder, and the accepted count is pinned" {

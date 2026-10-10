@@ -765,20 +765,38 @@ const cmd_seeds: []const []const u8 = &.{
     &cmdSeed("\xC3\xA9&INBOX\x00\r\n", 0x5A5A_5A5A_5A5A_5A0A, 512),
 };
 
+const fz = @import("fuzz_test.zig");
+const CommandMark = fz.Marker(enum { ok, refused, hostile });
+
 test "fuzz: no command builder can put a second command line on the wire" {
-    try testing.fuzz({}, fuzzBuilders, .{ .corpus = cmd_seeds });
+    try testing.fuzz({}, fuzzBuildersSmith, .{ .corpus = cmd_seeds });
 }
 
-fn fuzzBuilders(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: IMAP_FUZZ (command)" {
+    try fz.fuzz_driver.run(fuzzBuilders, .{ .prefix = "IMAP_FUZZ", .name = "imap-command" });
+}
+
+test "fuzz harness: command, 500 seeds, reaches every outcome" {
+    try CommandMark.reach(fuzzBuilders, "imap-command", 500);
+}
+
+fn fuzzBuildersSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzBuilders(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzBuilders(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const entries: []const []const u8 = cmd_seeds;
     var raw: [arg_bytes]u8 = undefined;
-    // ⚠ One `smith.slice` call, and the fields are cut from what it returned.
-    // This used to be `smith.bytes(&raw)` followed by five ranged length draws;
+    // ⚠ One `src.slice` call, and the fields are cut from what it returned.
+    // This used to be `src.bytes(&raw)` followed by five ranged length draws;
     // `bytes` takes `@min(raw.len, in.len)` octets and each ranged draw then
     // reads eight more as a little-endian u64, falling back to the range
     // MINIMUM. Every field was empty on an unshaped seed and one octet long on
     // the shaped corpus above.
-    const n = smith.slice(&raw);
+    const n = fz.drawInput(S, src, &raw, entries);
+    fz.sprinkle(S, src, raw[0..n]);
     const in = raw[0..n];
+    if (fz.hostile(in)) CommandMark.mark(.hostile);
     const tag = field(in, 0, 16);
     const user = field(in, 16, 24);
     const pass = field(in, 40, 24);
@@ -786,15 +804,13 @@ fn fuzzBuilders(_: void, smith: *std.testing.Smith) !void {
     const fl = field(in, 80, 16);
 
     const opts = Options{
-        .quoted_utf8 = smith.value(bool),
-        .literal_minus = smith.value(bool),
-        .literal_plus = smith.value(bool),
+        .quoted_utf8 = src.value(bool),
+        .literal_minus = src.value(bool),
+        .literal_plus = src.value(bool),
         // Without a callback a synchronising literal is refused outright, which
         // is a legal outcome but reaches none of the literal-writing code.
-        .on_sync = if (smith.value(bool)) null else noWait,
+        .on_sync = if (src.value(bool)) null else noWait,
     };
-
-    const gpa = testing.allocator;
 
     // The commands whose only unframed argument is the tag.
     inline for (.{ "capability", "noop", "logout", "startTls" }) |which| {
@@ -802,13 +818,14 @@ fn fuzzBuilders(_: void, smith: *std.testing.Smith) !void {
         s.init();
         var e = s.enc(gpa, opts);
         if (@field(Encoder, which)(&e, tag)) |_| {
+            CommandMark.mark(.ok);
             if (!framedAsOneCommand(s.written())) return error.NotOneCommand;
             // No literal is possible here, so the stronger form must hold too.
             const body = s.written()[0 .. s.written().len - 2];
             if (std.mem.indexOfScalar(u8, body, '\r') != null) return error.CarriageReturnInCommand;
             if (std.mem.indexOfScalar(u8, body, '\n') != null) return error.LineFeedInCommand;
             if (std.mem.indexOfScalar(u8, body, 0) != null) return error.NulInCommand;
-        } else |_| {}
+        } else |_| CommandMark.mark(.refused);
     }
 
     {
@@ -816,16 +833,18 @@ fn fuzzBuilders(_: void, smith: *std.testing.Smith) !void {
         s.init();
         var e = s.enc(gpa, opts);
         if (e.login(tag, user, pass)) |_| {
+            CommandMark.mark(.ok);
             if (!framedAsOneCommand(s.written())) return error.NotOneCommand;
-        } else |_| {}
+        } else |_| CommandMark.mark(.refused);
     }
     {
         var s: Sink = undefined;
         s.init();
         var e = s.enc(gpa, opts);
-        if (e.select(tag, name, smith.value(bool))) |_| {
+        if (e.select(tag, name, src.value(bool))) |_| {
+            CommandMark.mark(.ok);
             if (!framedAsOneCommand(s.written())) return error.NotOneCommand;
-        } else |_| {}
+        } else |_| CommandMark.mark(.refused);
     }
 
     // The primitives, each on its own writer so one refusal does not mask the
@@ -836,11 +855,12 @@ fn fuzzBuilders(_: void, smith: *std.testing.Smith) !void {
         s.init();
         var e = s.enc(gpa, opts);
         if (@field(Encoder, which)(&e, fl)) |_| {
+            CommandMark.mark(.ok);
             const out = s.written();
             if (std.mem.indexOfScalar(u8, out, '\r') != null) return error.CarriageReturnInArgument;
             if (std.mem.indexOfScalar(u8, out, '\n') != null) return error.LineFeedInArgument;
             if (std.mem.indexOfScalar(u8, out, 0) != null) return error.NulInArgument;
-        } else |_| {}
+        } else |_| CommandMark.mark(.refused);
     }
     {
         // `quoted` frames with `"`, so what it writes must stay inside them:
@@ -850,6 +870,7 @@ fn fuzzBuilders(_: void, smith: *std.testing.Smith) !void {
         s.init();
         var e = s.enc(gpa, opts);
         if (e.quoted(user)) |_| {
+            CommandMark.mark(.ok);
             const out = s.written();
             if (out.len < 2 or out[0] != '"' or out[out.len - 1] != '"') return error.NotQuoted;
             if (std.mem.indexOfScalar(u8, out, '\r') != null) return error.CarriageReturnInQuoted;
@@ -862,7 +883,7 @@ fn fuzzBuilders(_: void, smith: *std.testing.Smith) !void {
                     if (k >= out.len - 1) return error.DanglingEscape;
                 } else if (out[k] == '"') return error.UnescapedQuote;
             }
-        } else |_| {}
+        } else |_| CommandMark.mark(.refused);
     }
     {
         // A mailbox name must survive the encoding it was given: `mailbox`
@@ -871,18 +892,20 @@ fn fuzzBuilders(_: void, smith: *std.testing.Smith) !void {
         s.init();
         var e = s.enc(gpa, opts);
         if (e.mailbox(name)) |_| {
+            CommandMark.mark(.ok);
             try e.crlf();
             if (!framedAsOneCommand(s.written())) return error.NotOneCommand;
-        } else |_| {}
+        } else |_| CommandMark.mark(.refused);
     }
     {
         var s: Sink = undefined;
         s.init();
         var e = s.enc(gpa, opts);
         if (e.string(pass)) |_| {
+            CommandMark.mark(.ok);
             try e.crlf();
             if (!framedAsOneCommand(s.written())) return error.NotOneCommand;
-        } else |_| {}
+        } else |_| CommandMark.mark(.refused);
     }
 }
 

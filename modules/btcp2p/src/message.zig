@@ -283,21 +283,42 @@ const varbytes_seeds = [_][]const u8{
     seedHex("0568656c"), // Truncated: declares 5, delivers 3
 };
 
+const fz = @import("fuzz_test.zig");
+const VarBytesMark = fz.Marker(enum { ok, refused });
+
 test "fuzz: compactSize + varBytes never panic on arbitrary bytes" {
-    try testing.fuzz({}, fuzzCompactSizeAndVarBytes, .{ .corpus = &varbytes_seeds });
+    try testing.fuzz({}, fuzzCompactSizeAndVarBytesSmith, .{ .corpus = &varbytes_seeds });
 }
 
-fn fuzzCompactSizeAndVarBytes(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: BTCP2P_FUZZ (varbytes)" {
+    try fz.fuzz_driver.run(fuzzCompactSizeAndVarBytes, .{ .prefix = "BTCP2P_FUZZ", .name = "btcp-varbytes" });
+}
+
+test "fuzz harness: varbytes, 500 seeds, reaches every outcome" {
+    try VarBytesMark.reach(fuzzCompactSizeAndVarBytes, "btcp-varbytes", 500);
+}
+
+fn fuzzCompactSizeAndVarBytesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzCompactSizeAndVarBytes(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzCompactSizeAndVarBytes(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &varbytes_seeds;
     var buf: [256]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and the reader was handed an empty slice
     // with the seed sitting unread in `buf`.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
 
     var r: Reader = .{ .bytes = buf[0..len] };
-    _ = r.varBytes() catch return;
+    _ = r.varBytes() catch {
+        VarBytesMark.mark(.refused);
+        return;
+    };
+    VarBytesMark.mark(.ok);
 }
 
 test "corpus: every var_str seed reaches the reader, and the accepted count is pinned" {

@@ -247,11 +247,27 @@ const version_seeds = [_][]const u8{
     seedHex("62ea0000" ++ "0100000000000000"), // Truncated: cut mid addr_recv, the hostile test's payload
 };
 
+const fz = @import("fuzz_test.zig");
+const VersionMark = fz.Marker(enum { ok, refused });
+
 test "fuzz: decodeVersion never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeVersion, .{ .corpus = &version_seeds });
+    try testing.fuzz({}, fuzzDecodeVersionSmith, .{ .corpus = &version_seeds });
 }
 
-fn fuzzDecodeVersion(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: BTCP2P_FUZZ (version)" {
+    try fz.fuzz_driver.run(fuzzDecodeVersion, .{ .prefix = "BTCP2P_FUZZ", .name = "btcp-version" });
+}
+
+test "fuzz harness: version, 500 seeds, reaches every outcome" {
+    try VersionMark.reach(fuzzDecodeVersion, "btcp-version", 500);
+}
+
+fn fuzzDecodeVersionSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecodeVersion(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDecodeVersion(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const entries: []const []const u8 = &version_seeds;
     // ⚠ 512, not the 256 this harness carried before. `max_subversion_length`
     // is 256, so the shortest `version` message that can reach
     // `error.SubversionTooLong` is 80 + 3 + 257 + 4 = 344 octets -- and a seed
@@ -260,14 +276,18 @@ fn fuzzDecodeVersion(_: void, smith: *std.testing.Smith) !void {
     // this harness could not have reached that refusal, nor even a legal
     // maximum-length user_agent, no matter what it was fed.
     var buf: [512]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `decodeVersion` saw `buf[0..0]` every
     // single time, with the seed sitting unread in `buf`.
-    const len: usize = smith.slice(&buf);
-    var v = decodeVersion(buf[0..len]) catch return;
-    v.deinit(testing.allocator);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
+    var v = decodeVersion(buf[0..len]) catch {
+        VersionMark.mark(.refused);
+        return;
+    };
+    VersionMark.mark(.ok);
+    v.deinit(gpa);
 }
 
 test "corpus: every version seed reaches the decoder, and the accepted count is pinned" {

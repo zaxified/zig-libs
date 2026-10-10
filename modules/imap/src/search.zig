@@ -686,8 +686,23 @@ const search_seeds = [_][]const u8{
     shapedSeed("1\x001\x00\\*", 0x33), // `\*` -- legal in PERMANENTFLAGS, not as a search key
 };
 
+const fz = @import("fuzz_test.zig");
+const SearchMark = fz.Marker(enum { ok, refused, hostile });
+
 test "fuzz: no SEARCH set or flag can put a second command line on the wire" {
-    try testing.fuzz({}, fuzzEncode, .{ .corpus = &search_seeds });
+    try testing.fuzz({}, fuzzEncodeSmith, .{ .corpus = &search_seeds });
+}
+
+test "fuzz driver: IMAP_FUZZ (search)" {
+    try fz.fuzz_driver.run(fuzzEncode, .{ .prefix = "IMAP_FUZZ", .name = "imap-search" });
+}
+
+test "fuzz harness: search, 500 seeds, reaches every outcome" {
+    try SearchMark.reach(fuzzEncode, "imap-search", 500);
+}
+
+fn fuzzEncodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzEncode(std.testing.Smith, smith, testing.allocator);
 }
 
 /// Only the unframed criteria are driven here — `seq_set`, `uid_set` and the
@@ -695,16 +710,19 @@ test "fuzz: no SEARCH set or flag can put a second command line on the wire" {
 /// through `string`, which may emit a literal whose payload legitimately holds
 /// a CR, and mixing them in would make the invariant untestable rather than
 /// stronger.
-fn fuzzEncode(_: void, smith: *std.testing.Smith) !void {
+fn fuzzEncode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const entries: []const []const u8 = &search_seeds;
     var raw: [96]u8 = undefined;
-    // ⚠ One `smith.slice` call, and the fields are cut from what it returned.
-    // This used to be `smith.bytes(&raw)` followed by three ranged length
+    // ⚠ One `src.slice` call, and the fields are cut from what it returned.
+    // This used to be `src.bytes(&raw)` followed by three ranged length
     // draws; `bytes` takes `@min(raw.len, in.len)` octets and each ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `seq`, `uid` and `flag_key` were ALL empty for every seed while the
     // drawn octets sat unread in `raw`.
-    const n = smith.slice(&raw);
+    const n = fz.drawInput(S, src, &raw, entries);
+    fz.sprinkle(S, src, raw[0..n]);
     const in = raw[0..n];
+    if (fz.hostile(in)) SearchMark.mark(.hostile);
     const f = fields(3, in);
     const seq = f[0];
     const uid = f[1];
@@ -712,18 +730,19 @@ fn fuzzEncode(_: void, smith: *std.testing.Smith) !void {
 
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    var e = command.Encoder.init(std.testing.allocator, &w, .{});
+    var e = command.Encoder.init(gpa, &w, .{});
 
     const inner = Criteria{
-        .seq_set = if (smith.value(bool)) seq else null,
+        .seq_set = if (src.value(bool)) seq else null,
         .flag = &.{flag_key},
     };
     const crit = Criteria{
-        .uid_set = if (smith.value(bool)) uid else null,
-        .larger = smith.value(u32),
+        .uid_set = if (src.value(bool)) uid else null,
+        .larger = src.value(u32),
         .not = &.{&inner},
     };
-    if (encode(&e, "T1", smith.value(bool), .{ .count = smith.value(bool) }, &crit)) |_| {
+    if (encode(&e, "T1", src.value(bool), .{ .count = src.value(bool) }, &crit)) |_| {
+        SearchMark.mark(.ok);
         const line = w.buffered();
         std.debug.assert(std.mem.endsWith(u8, line, "\r\n"));
         const body = line[0 .. line.len - 2];
@@ -731,6 +750,7 @@ fn fuzzEncode(_: void, smith: *std.testing.Smith) !void {
         std.debug.assert(std.mem.indexOfScalar(u8, body, '\n') == null);
         std.debug.assert(std.mem.indexOfScalar(u8, body, 0) == null);
     } else |_| {
+        SearchMark.mark(.refused);
         std.debug.assert(w.buffered().len == 0);
     }
 }

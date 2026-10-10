@@ -564,18 +564,35 @@ fn stampedSeed(comptime h: []const u8, comptime words: []const u64) []const u8 {
     }.bytes;
 }
 
+const fz = @import("fuzz_test.zig");
+const EnvelopeMark = fz.Marker(enum { decoded, refused });
+
 test "fuzz: decodeMessage never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeMessage, .{ .corpus = &decode_seeds });
+    try testing.fuzz({}, fuzzDecodeMessageSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzDecodeMessage(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: BTCP2P_FUZZ (envelope)" {
+    try fz.fuzz_driver.run(fuzzDecodeMessage, .{ .prefix = "BTCP2P_FUZZ", .name = "btcp-envelope" });
+}
+
+test "fuzz harness: envelope, 500 seeds, reaches every outcome" {
+    try EnvelopeMark.reach(fuzzDecodeMessage, "btcp-envelope", 500);
+}
+
+fn fuzzDecodeMessageSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecodeMessage(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDecodeMessage(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const entries: []const []const u8 = &decode_seeds;
     var buf: [512]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // ⚠ One `src.slice` call, never `src.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `decodeMessage` saw `buf[0..0]` every
     // single time, with the seed sitting unread in `buf`.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
     const bytes = buf[0..len];
 
     const nets = [_]Network{ .mainnet, .testnet3, .regtest, .signet };
@@ -588,13 +605,13 @@ fn fuzzDecodeMessage(_: void, smith: *std.testing.Smith) !void {
     // exhausted, and `value(bool)` on an exhausted input is the weight minimum,
     // i.e. `false`) — which is what we want, since every seed carries the magic
     // it means to test.
-    if (bytes.len >= 4 and smith.value(bool)) {
-        const idx = smith.valueRangeAtMost(u8, 0, nets.len - 1);
+    if (bytes.len >= 4 and src.value(bool)) {
+        const idx = src.valueRangeAtMost(u8, 0, nets.len - 1);
         @memcpy(bytes[0..4], &magic(nets[idx]));
     }
 
     for (nets) |n| {
-        _ = decodeMessage(bytes, n) catch {};
+        if (decodeMessage(bytes, n)) |_| EnvelopeMark.mark(.decoded) else |_| EnvelopeMark.mark(.refused);
     }
 }
 

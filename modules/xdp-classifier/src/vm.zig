@@ -810,10 +810,11 @@ test "packet path: the emitted program agrees with the independent reference on 
     }
 }
 
-fn fuzzPacketPathAgrees(_: void, smith: *std.testing.Smith) !void {
+fn fuzzPacketPathAgrees(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // check-fuzz-reach R1: the FIRST draw is a full-range u64 and every knob
     // (key field, VLAN depth, IPv6 on/off) is reduced from it by hand.
-    const knobs = smith.value(u64);
+    const knobs = src.value(u64);
     const cfg: Config = .{
         .key_field = if (knobs % 2 == 0) .dst else .src,
         .vlan_depth = @enumFromInt((knobs / 2) % 3),
@@ -822,13 +823,39 @@ fn fuzzPacketPathAgrees(_: void, smith: *std.testing.Smith) !void {
     };
     const prog = classifierFor(cfg);
     var pkt: [128]u8 = undefined;
-    const len: usize = smith.slice(&pkt);
+    // Under the driver, most packets come from `randomFrame` (valid Ethernet /
+    // VLAN / IPv4 / IPv6 shapes with matching prefixes and boundary lengths);
+    // uniform noise only ever reaches the "not IP" exit.
+    var len: usize = undefined;
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        len = randomFrame(src.r, &pkt).len;
+        PacketMark.mark(.frame);
+    } else {
+        len = src.slice(&pkt);
+        PacketMark.mark(.noise);
+    }
     const got = try runClassifier(prog, pkt[0..len]);
+    if (got == cfg.default_class) PacketMark.mark(.defaulted) else PacketMark.mark(.matched);
     try testing.expectEqual(packetDecideReference(pkt[0..len], cfg.refConfig(), cfg.default_class), got);
 }
 
+const fz = @import("fuzz_test.zig");
+const PacketMark = fz.Marker(enum { frame, noise, defaulted, matched });
+
 test "fuzz: the emitted classifier program agrees with the independent reference" {
-    try std.testing.fuzz({}, fuzzPacketPathAgrees, .{});
+    try std.testing.fuzz({}, fuzzPacketPathAgreesSmith, .{});
+}
+
+test "fuzz driver: XDP_FUZZ (packet)" {
+    try fz.fuzz_driver.run(fuzzPacketPathAgrees, .{ .prefix = "XDP_FUZZ", .name = "xdp-packet" });
+}
+
+test "fuzz harness: packet, 500 seeds, reaches every outcome" {
+    try PacketMark.reach(fuzzPacketPathAgrees, "xdp-packet", 500);
+}
+
+fn fuzzPacketPathAgreesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPacketPathAgrees(std.testing.Smith, smith, std.testing.allocator);
 }
 
 test "positive control: the interpreter's bounds-proof model rejects a weakened VLAN or IPv6 bounds check" {

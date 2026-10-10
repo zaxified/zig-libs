@@ -1590,9 +1590,24 @@ const BtfCorpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const BtfMark = fz.Marker(enum { parsed, refused, type_found, members });
+
 test "fuzz: parse never panics on a truncated/mutated synthetic BTF blob" {
     var corpus: BtfCorpus = .{};
-    try testing.fuzz({}, fuzzParse, .{ .corpus = try corpus.build(testing.allocator) });
+    try testing.fuzz({}, fuzzParseSmith, .{ .corpus = try corpus.build(testing.allocator) });
+}
+
+test "fuzz driver: EBPF_FUZZ (btf)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "EBPF_FUZZ", .name = "ebpf-btf" });
+}
+
+test "fuzz harness: btf, 500 seeds, reaches every outcome" {
+    try BtfMark.reach(fuzzParse, "ebpf-btf", 500);
+}
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParse(std.testing.Smith, smith, testing.allocator);
 }
 
 test "corpus: every BTF seed reaches the parser, and the accessor counts are pinned" {
@@ -1643,10 +1658,11 @@ test "corpus: every BTF seed reaches the parser, and the accessor counts are pin
     try testing.expectEqual(@as(usize, 21), accessors);
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
-    const gpa = testing.allocator;
+fn fuzzParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: BtfCorpus = .{};
+    const entries: []const []const u8 = if (S == fz.fuzz_driver.Rng) corpus.build(gpa) catch return else &.{};
     var buf: [8192]u8 = undefined;
-    // ⚠ The blob is drawn as BYTES now, in one `smith.slice` call. It used to
+    // ⚠ The blob is drawn as BYTES now, in one `src.slice` call. It used to
     // be built here: `Synth.good()` truncated to
     // `valueRangeAtMost(u32, 0, seed.len)` and then byte-flipped
     // `valueRangeAtMost(u8, 0, 16)` times. A ranged draw reads eight input
@@ -1659,20 +1675,28 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     // ⛔ Measured 2026-09-07 over the corpus above: **0 of 10 seeds non-empty,
     // 0 parsed and 0 accessor calls before; 10 of 10 non-empty, 4 parsed and
     // 21 accessor calls after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, entries);
     // ⚠ `value(u64)` truncated, not `value(u32)` — see `BtfCorpus`: a `u32`
     // draw survives only if the whole eight-octet word fits in 32 bits, so the
     // id was 0, the void pseudo-type, on every seed.
-    const id: u32 = @truncate(smith.value(u64));
+    // Under the driver half the ids are small, where the types live; a
+    // uniform u32 almost never names one.
+    const id: u32 = if (S == fz.fuzz_driver.Rng and src.value(bool)) @intCast(src.index(40)) else @truncate(src.value(u64));
 
-    var b = parse(gpa, buf[0..len], .{}) catch return;
+    var b = parse(gpa, buf[0..len], .{}) catch {
+        BtfMark.mark(.refused);
+        return;
+    };
     defer b.deinit();
 
     // Walk the deferred-validation surface the module doc calls out: `byId`
     // on a fuzzer-chosen id (very possibly out of range after mutation), and
     // every per-kind accessor the doc says must reject a bad `vlen`/
     // `name_off` cleanly rather than read out of bounds.
+    BtfMark.mark(.parsed);
     if (b.byId(id) catch null) |t| {
+        BtfMark.mark(.type_found);
+        if (t.vlen != 0) BtfMark.mark(.members);
         var i: u16 = 0;
         while (i < t.vlen and i < 64) : (i += 1) {
             _ = b.member(t, i) catch {};

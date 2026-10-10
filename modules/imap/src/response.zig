@@ -815,14 +815,30 @@ const response_seeds = [_][]const u8{
     seed("* 172 EXISTS\r\n* 173 EXISTS\r\n* AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), // a final line with no CRLF
 };
 
+const fz = @import("fuzz_test.zig");
+const ResponseMark = fz.Marker(enum { messages, multi, refused });
+
 test "fuzz: response parsing never panics on arbitrary server bytes" {
-    try testing.fuzz({}, fuzzResponse, .{ .corpus = &response_seeds });
+    try testing.fuzz({}, fuzzResponseSmith, .{ .corpus = &response_seeds });
 }
 
-fn fuzzResponse(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: IMAP_FUZZ (response)" {
+    try fz.fuzz_driver.run(fuzzResponse, .{ .prefix = "IMAP_FUZZ", .name = "imap-response" });
+}
+
+test "fuzz harness: response, 500 seeds, reaches every outcome" {
+    try ResponseMark.reach(fuzzResponse, "imap-response", 500);
+}
+
+fn fuzzResponseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzResponse(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzResponse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const entries: []const []const u8 = &response_seeds;
     var buf: [80 * 1024]u8 = undefined;
     // ⚠ ONE draw, and it is the bytes. This used to be a `valueWeighted` length
-    // followed by `smith.bytes(buf[0..len])`, which fixed the ordering problem
+    // followed by `src.bytes(buf[0..len])`, which fixed the ordering problem
     // the F8 note below describes but created a worse one: a weighted draw
     // reads EIGHT octets as a little-endian u64 and falls back to
     // `weights[0].min` — zero — unless that u64 happens to land inside a
@@ -836,9 +852,9 @@ fn fuzzResponse(_: void, smith: *std.testing.Smith) !void {
     // drained `in` completely and every subsequent draw degenerated to its
     // default. That is why the FIRST version of this harness never reached
     // `LineTooLong` despite the raised window — audit `imap` F8.)
-    const len: usize = smith.sliceWeighted(&buf, len_weights, byte_weights);
+    const len: usize = fz.drawWeighted(S, src, &buf, entries, len_weights, byte_weights);
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
     var r = std.Io.Reader.fixed(buf[0..len]);
@@ -852,8 +868,11 @@ fn fuzzResponse(_: void, smith: *std.testing.Smith) !void {
     while (guard < 64) : (guard += 1) {
         _ = rd.next() catch |e| {
             if (e == error.LineTooLong) f8_line_too_long_reached += 1;
+            ResponseMark.mark(.refused);
+            if (guard >= 2) ResponseMark.mark(.multi);
             return;
         };
+        ResponseMark.mark(.messages);
     }
 }
 
@@ -900,7 +919,7 @@ test "fuzz harness (F8 regression): LineTooLong is actually reachable from fuzzR
 
     f8_line_too_long_reached = 0;
     var smith = std.testing.Smith{ .in = scratch };
-    fuzzResponse({}, &smith) catch {};
+    fuzzResponse(std.testing.Smith, &smith, testing.allocator) catch {};
     try testing.expect(f8_line_too_long_reached > 0);
 }
 
