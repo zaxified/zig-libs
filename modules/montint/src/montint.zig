@@ -66,6 +66,20 @@ pub const asm_min_limbs: usize = 32;
 /// squaring differential proves it against `montMulCios(a,a)`).
 pub const sqr_min_limbs: usize = 8;
 
+/// Cutoff for the FIXED-`L` asm kernel (`asm_core.montMulFixed`: rows fully
+/// unrolled at comptime, outer loop in asm), which since 2026-10-10 serves
+/// BOTH `montMul` and `montSqr` (as `a·a`) at `L >= fixed_min_limbs` on an
+/// asm-capable target. Measured on the bench host (TSC cycles per op, best
+/// previous path → fixed kernel): L=8 mul 485 → 335 but square 346 → 340
+/// (a tie, so L=8 keeps the portable square; it keeps the portable multiply
+/// too, so nothing below 1024 bits changes), L=16 1273 → 989, L=24 3032 →
+/// 1930, L=32 4064 → 3154, L=48 8266 → 7071, L=64 13494 → 12173. The fixed
+/// kernel's general multiply beats even the dedicated SOS squares at these
+/// sizes, which is why the square routes through it. Supersedes
+/// `asm_min_limbs` on the dispatch (that runtime-`n` core is still compiled,
+/// benched and differentially tested, but no `Modint` reaches it).
+pub const fixed_min_limbs: usize = 16;
+
 /// A modulus + its Montgomery constants, parameterized by an upper bound on the
 /// modulus bit-width. `L = ceil(max_bits/64)` full 2^64 limbs; the modulus
 /// occupies exactly `L` limbs (leading zero limbs are allowed as long as the
@@ -300,7 +314,9 @@ pub fn Modint(comptime max_bits: comptime_int) type {
             var z: Elem = undefined;
             // Small-L cutoff: asm only pays off for large moduli (see
             // `asm_min_limbs`); pairing fields (L=4/6) stay portable.
-            if (comptime asm_active and L >= asm_min_limbs) {
+            if (comptime asm_active and L >= fixed_min_limbs) {
+                asm_core.montMulFixed(L, &z, a, b, &self.m, self.n0inv);
+            } else if (comptime asm_active and L >= asm_min_limbs) {
                 asm_core.montMul(&z, a, b, &self.m, self.n0inv);
             } else {
                 z = self.montMulCios(a, b);
@@ -312,7 +328,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         /// (asm available+on AND the modulus is large enough to clear the
         /// `asm_min_limbs` small-L cutoff). Used by the bench harness.
         pub fn dispatchesToAsm() bool {
-            return asm_active and L >= asm_min_limbs;
+            return asm_active and L >= @min(asm_min_limbs, fixed_min_limbs);
         }
 
         /// Montgomery squaring `z = a²·R⁻¹ mod m`. A dedicated square is ~1.5×
@@ -333,6 +349,15 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         ///   * else (tiny L, incl. the pairing-field sizes) → `montMulCios(a,a)`,
         ///     where the general multiply is as fast or faster.
         pub fn montSqr(self: *const Self, a: *const Elem) Elem {
+            if (comptime asm_active and L >= fixed_min_limbs) {
+                var z: Elem = undefined;
+                if (comptime L <= asm_core.sqr_fixed_max_limbs) {
+                    asm_core.montSqrFixed(L, &z, a, &self.m, self.n0inv);
+                } else {
+                    asm_core.montMulFixed(L, &z, a, a, &self.m, self.n0inv);
+                }
+                return z;
+            }
             if (comptime asm_active and L >= asm_min_limbs) {
                 var z: Elem = undefined;
                 var scratch: [2 * L]u64 = undefined;
@@ -760,8 +785,12 @@ test "asm_min_limbs: the dispatch cutoff is pinned by value, and by what it sele
         try std.testing.expect(Modint(2048).dispatchesToAsm());
         try std.testing.expect(Modint(4096).dispatchesToAsm());
         // The RSA-2048 CRT half — the secret `dP`/`dQ` path, and the width the
-        // 2026-08-13 timing fix was about. Portable, by this cutoff.
-        try std.testing.expect(!Modint(1024).dispatchesToAsm());
+        // 2026-08-13 timing fix was about. Portable by `asm_min_limbs`, asm by
+        // `fixed_min_limbs` (2026-10-10) — and the 512-bit size below it stays
+        // portable.
+        try std.testing.expectEqual(@as(usize, 16), fixed_min_limbs);
+        try std.testing.expect(Modint(1024).dispatchesToAsm());
+        try std.testing.expect(!Modint(512).dispatchesToAsm());
         // The pairing fields the cutoff exists to protect from a 2.4×
         // slowdown: `bls12_381` Fp (L=6) and `bn254` Fp (L=4).
         try std.testing.expect(!Modint(381).dispatchesToAsm());

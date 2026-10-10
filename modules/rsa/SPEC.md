@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (8 x 25,000 seeds per harness clean, RSA_FUZZ) · ct 2026-10-03 (ctgrind)
 
-**Performance:** ref 1.44–2.84× OpenSSL 3.5.5 · fastest ? (measured 2026-10-10)
+**Performance:** ref 1.15–1.61× OpenSSL 3.5.5 · fastest ? (measured 2026-10-10)
 
 **Known defects:** none recorded
 
@@ -195,10 +195,48 @@ module's default: blinding OFF) and `signbl` = `signPkcs1v15Blinded(.csprng)`, b
 A first run (3 rounds, heavier load, spreads up to 84 %) gave 1.41–3.29×, worst `decbl_3072`;
 the quieter run above is the card's.
 
-**Reading.** The private operation is ~1.9–2.4× OpenSSL with blinding off and ~2.2–2.8× with
-it on (OpenSSL always blinds), so the card's worst, 2.84× (`signbl_3072`), gives P4.
-Verification is ~1.5× (the 2026-09-08 figure below, 2.1×, was against `openssl speed`'s
-number on another day). Levers in Backlog.
+**Reading (first measurement).** The private operation was ~1.9–2.4× OpenSSL with blinding off
+and ~2.2–2.8× with it on (OpenSSL always blinds); worst 2.84× (`signbl_3072`), P4.
+
+### After the 2026-10-10 performance pass (the card's numbers)
+
+Profile first (`perf` on the bench binary): the CRT halves (L = 16/24/32 limbs) ran the PORTABLE
+CIOS at 2048/3072 bits (montint's runtime-`n` asm lost below 2048 bits) and the asm core at 4096
+— `montSqr` + `montMul` ~95 % of an unblinded op; with blinding on, `invModN` (a `std.math.big`
+extended Euclid) was ~25 % of `signbl_2048` on top. Three levers, all measured:
+
+1. **montint fixed-`L` asm kernels** (`asm_core.montMulFixed`/`montSqrFixed`, see montint SPEC):
+   unblinded rows 1.9–2.4× → 1.49–1.55× (2048), 1.50 (3072), 1.49 (4096) in one 3-round run;
+   the dedicated square added ~8–11 % per squaring on top.
+2. **Blinding inverse on a constant-time batched safegcd** (`src/safegcd.zig`, Bernstein–Yang
+   in 59-divstep batches over runtime-length signed-62 vectors) instead of `std.math.big`, and
+   `r` drawn/range-checked as a montint element (no `ff` round trip): blinded rows 2.28/1.96/1.82
+   → 1.68/1.63/1.56× (2048/3072/4096) on top of lever 1. The inverse is verified (`r·r⁻¹ ≡ 1`)
+   before use; any failure redraws `r`.
+3. (none for verify; it rode lever 1: 1.49/1.52/1.44 → 1.15/1.29/1.28×).
+
+Same method, `BENCH_ROUNDS=7`, two full runs (spreads ≤ 3.4 % ours, ≤ 8 % ref):
+
+| workload | ours ns/op (run 2) | ref ns/op | ours/ref run 1 | run 2 |
+|---|---:|---:|---:|---:|
+| `sign_2048` | 867233 | 580726 | 1.522 | 1.496 |
+| `signbl_2048` | 918658 | 577034 | 1.604 | 1.594 |
+| `verify_2048` | 20531 | 17760 | 1.163 | 1.147 |
+| `dec_2048` | 851000 | 577819 | 1.489 | 1.484 |
+| `decbl_2048` | 937240 | 582769 | 1.609 | 1.606 |
+| `sign_3072` | 2468809 | 1736202 | 1.446 | 1.424 |
+| `signbl_3072` | 2623759 | 1735909 | 1.506 | 1.506 |
+| `verify_3072` | 46459 | 35698 | 1.275 | 1.305 |
+| `dec_3072` | 2454902 | 1742957 | 1.426 | 1.420 |
+| `decbl_3072` | 2608336 | 1722903 | 1.521 | 1.505 |
+| `sign_4096` | 5392183 | 3879048 | 1.396 | 1.386 |
+| `signbl_4096` | 5582356 | 3856660 | 1.438 | 1.441 |
+| `verify_4096` | 77094 | 60406 | 1.284 | 1.279 |
+| `dec_4096` | 5374537 | 3889644 | 1.388 | 1.382 |
+| `decbl_4096` | 5643644 | 3908478 | 1.446 | 1.442 |
+
+Worst row 1.61× (`decbl_2048`). At 2048 OpenSSL runs its AVX2 `rsaz_1024` code for the CRT
+halves, which is why that size stays furthest behind.
 
 ## Performance posture — measured 2026-09-08, and deliberately not chased further
 
@@ -275,7 +313,13 @@ as a measurement rather than a rediscovery.
 
 ## Backlog / deferred
 
-- **Performance levers (bench 2026-10-10: private op 1.9–2.4×, blinded 2.2–2.8×, verify
+- **Performance levers** — ✅ 2026-10-10: (a) done as montint's fixed-`L` kernels, (c) done
+  differently (a constant-time safegcd inverse per op instead of a cached pair, which would
+  need mutable state in a `*const SecretKey`); (b) not needed (montint's window is already
+  w = 5). Now 1.15–1.61× (SPEC "After the 2026-10-10 performance pass"). Next, by payoff: an
+  AVX2 radix-2^29 kernel for L = 16 (what OpenSSL's `rsaz_1024` does at 2048), and a cached
+  blinding pair if a mutable key context ever exists. Original text:
+  **(bench 2026-10-10: private op 1.9–2.4×, blinded 2.2–2.8×, verify
   1.4–1.5× OpenSSL 3.5.5; P4 → P3 needs every row ≤ 2×; proposals, none measured):**
   (a) a MULX/ADX Montgomery multiply/square for `montint` (what `bn_mul_mont`/`rsaz` give
   OpenSSL; p256's `fast_core` is the in-tree precedent) -- moves every row, verify included;

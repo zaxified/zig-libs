@@ -521,6 +521,277 @@ fn condSub(z: []u64, top: u64, m: []const u64) void {
     }
 }
 
+// ── fixed-L unrolled CIOS (comptime-generated rows) — the hot path since 2026-10-10 ──
+//
+// `montMul` above runs RUNTIME-`n` rows (4-way unrolled loops, remainder loops,
+// OF/CF folds at every group boundary, one asm block per outer limb). At the
+// sizes RSA actually runs — the CRT halves at L = 16/24/32 — that bookkeeping
+// cost more than the products: the portable comptime-unrolled CIOS beat it at
+// L = 16 and the rsa bench sat at 1.9–2.4× OpenSSL (2026-10-10). `Modint` knows
+// `L` at comptime, so this kernel spells each row out completely — `L` copies
+// of `mulx / adcx mem / adox / mov` for the multiply row and the same for the
+// reduction row — and keeps only the OUTER loop (trip count `L`, public) in the
+// asm. Measured on the bench host (TSC cycles per multiply, ReleaseFast):
+//   L = 16: 1273 → 989 · L = 24: 3032 → 1930 · L = 32: 4064 → 3154
+// against the best of the previous `montMul`/`montSqr` at each size.
+//
+// One CIOS iteration (`t` = z, L words in memory; t[L] in r13, t[L+1] in r14):
+//   mul row     (t[0..L], t[L], t[L+1]) += a·b[i]
+//   u           t[0]·n0inv (imul — flags dead there)
+//   reduce row  t = (t + u·m) >> 64, the store shifted down one limb
+// Each row runs the two independent carry chains of the module doc: CF carries
+// `t[j]` (`adcx` with a memory source), OF carries the previous product's high
+// half (`adox`); the alternating hi register is r11/r12. The row tails fold
+// both flags into t[L] / t[L+1] with a zero register (rax) — the same
+// arithmetic, in the same order, as the portable `montMulCios`, which is the
+// oracle the differential pins it to.
+//
+// Constant-time: the instruction stream is a comptime constant of `L`; the
+// only branch is the outer loop's `jnz` on a public counter; every address is
+// a fixed offset off a pinned base pointer; the final reduction is the masked
+// `condSubFixed` (laundered mask, see `condSub`'s note on why that matters at
+// a comptime `L`). Code size: ~8·L instructions per row pair, ~1.6 KB at L = 32.
+
+/// Decimal text of a comptime integer (the row generator's byte offsets),
+/// without `std.fmt` — whose comptime cost, at ~4·L formatted lines per
+/// kernel and up to eight kernel sizes per build, ran into the eval quota.
+fn decStr(comptime n: usize) []const u8 {
+    comptime {
+        if (n == 0) return "0";
+        var buf: [20]u8 = undefined;
+        var i: usize = buf.len;
+        var x = n;
+        while (x > 0) : (x /= 10) {
+            i -= 1;
+            buf[i] = '0' + @as(u8, @intCast(x % 10));
+        }
+        const out = buf[i..].*;
+        return &out;
+    }
+}
+
+/// A comptime text builder appending into a fixed buffer: linear in the
+/// output size, where repeated `++` re-copies the whole prefix per piece
+/// (quadratic — it doubled montint's test compile time with the square
+/// kernel's ~2·L² lines).
+fn AsmText(comptime cap: usize) type {
+    return struct {
+        buf: [cap]u8 = undefined,
+        len: usize = 0,
+        fn put(self: *@This(), comptime piece: []const u8) void {
+            @memcpy(self.buf[self.len..][0..piece.len], piece);
+            self.len += piece.len;
+        }
+    };
+}
+
+fn hiReg(comptime j: usize) []const u8 {
+    return if (j % 2 == 0) "%%r11" else "%%r12";
+}
+
+/// The asm text of ONE outer CIOS iteration for a fixed `L` (see above).
+/// Register plan: rdi = t (= z), rsi = a, rbx = &b[i] (advanced by the loop),
+/// rcx = m, r8 = n0inv, r9 = outer counter, rdx = MULX multiplier, rax = 0,
+/// r10 = current lo, r11/r12 = alternating hi, r13 = t[L], r14 = t[L+1].
+fn ciosFixedBody(comptime L: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        var s: AsmText(400 * L + 512) = .{};
+        // mul row: t[j] += a[j]·b_i (+ hi of j−1), j = 0..L−1
+        s.put(" movq (%%rbx), %%rdx\n xorl %%eax, %%eax\n");
+        s.put(" mulxq (%%rsi), %%r10, %%r11\n adcxq (%%rdi), %%r10\n movq %%r10, (%%rdi)\n");
+        for (1..L) |j| {
+            const o = decStr(8 * j);
+            s.put(" mulxq " ++ o ++ "(%%rsi), %%r10, " ++ hiReg(j) ++ "\n" ++
+                " adcxq " ++ o ++ "(%%rdi), %%r10\n" ++
+                " adoxq " ++ hiReg(j - 1) ++ ", %%r10\n" ++
+                " movq %%r10, " ++ o ++ "(%%rdi)\n");
+        }
+        // (t[L+1]:t[L]) = t[L] + hi_{L−1} + CF + OF
+        s.put(" adcxq %%rax, %%r13\n adoxq " ++ hiReg(L - 1) ++ ", %%r13\n" ++
+            " movl $0, %%r14d\n adcxq %%rax, %%r14\n adoxq %%rax, %%r14\n");
+        // reduce row: u = t[0]·n0inv; t = (t + u·m) >> 64
+        s.put(" movq (%%rdi), %%rdx\n imulq %%r8, %%rdx\n xorl %%eax, %%eax\n");
+        s.put(" mulxq (%%rcx), %%r10, %%r11\n adcxq (%%rdi), %%r10\n");
+        for (1..L) |j| {
+            const o = decStr(8 * j);
+            s.put(" mulxq " ++ o ++ "(%%rcx), %%r10, " ++ hiReg(j) ++ "\n" ++
+                " adcxq " ++ o ++ "(%%rdi), %%r10\n" ++
+                " adoxq " ++ hiReg(j - 1) ++ ", %%r10\n" ++
+                " movq %%r10, " ++ decStr(8 * (j - 1)) ++ "(%%rdi)\n");
+        }
+        // t[L−1] = t[L] + hi_{L−1} + CF + OF; t[L] = t[L+1] + the two carries
+        s.put(" adcxq %%rax, %%r13\n adoxq " ++ hiReg(L - 1) ++ ", %%r13\n" ++
+            " movq %%r13, " ++ decStr(8 * (L - 1)) ++ "(%%rdi)\n" ++
+            " movq %%r14, %%r13\n adcxq %%rax, %%r13\n adoxq %%rax, %%r13\n");
+        const out = s.buf[0..s.len].*;
+        return &out;
+    }
+}
+
+/// `z = a·b·R⁻¹ mod m` for a COMPTIME limb count `L` (same contract as
+/// `montMul`: full 2^64 limbs, `a, b < m`, `z` aliases none of `a`, `b`, `m`;
+/// `a == b` is fine). Dispatched by `Modint.montMul`/`montSqr` iff
+/// `supported and gate.asm_core_implemented` and `L >= montint.fixed_min_limbs`.
+pub fn montMulFixed(comptime L: usize, z: *[L]u64, a: *const [L]u64, b: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
+    if (comptime supported) {
+        montMulFixedAmd64(L, z, a, b, m, n0inv);
+    } else {
+        unreachable; // guarded by every caller; see `mulRow` for why `pub` needs this
+    }
+}
+
+fn montMulFixedAmd64(comptime L: usize, z: *[L]u64, a: *const [L]u64, b: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
+    comptime std.debug.assert(L >= 2);
+    @memset(z, 0);
+    const body = comptime ciosFixedBody(L);
+    var top: u64 = undefined;
+    var d_b: usize = undefined;
+    var d_cnt: usize = undefined;
+    asm volatile (" xorl %%r13d, %%r13d\n" ++ "1:\n" ++ body ++ " addq $8, %%rbx\n decq %%r9\n jnz 1b\n"
+        : [top] "={r13}" (top),
+          [db] "={rbx}" (d_b),
+          [dc] "={r9}" (d_cnt),
+        : [zp] "{rdi}" (z),
+          [ap] "{rsi}" (a),
+          [bp] "{rbx}" (b),
+          [mp] "{rcx}" (m),
+          [n0] "{r8}" (n0inv),
+          [cnt] "{r9}" (@as(usize, L)),
+        : .{ .rax = true, .rdx = true, .r10 = true, .r11 = true, .r12 = true, .r14 = true, .cc = true, .memory = true });
+    // t < 2m: top ∈ {0, 1}; constant-time final reduce.
+    condSubFixed(L, z, top, m);
+}
+
+/// The asm text of the fixed-`L` SOS Montgomery SQUARE (see `montSqrFixed`).
+/// Register plan: rsi = a, rdi = A (2L-word scratch; advanced only in the
+/// final reduction loop), rcx = m, r8 = n0inv, r9 = reduction counter,
+/// rdx = MULX multiplier, rax = 0, r10 = lo, r11/r12 = alternating hi,
+/// r13 = the pending column carry `cc`, r14 = scratch.
+fn sqrFixedText(comptime L: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(2_000_000);
+        var s: AsmText(100 * L * L + 400 * L + 512) = .{};
+        // 1. cross products: row i adds a[i]·a[i+1..L−1] into A[2i+1 .. i+L−1]
+        //    (CF: the A words, OF: the previous high half); the row carry
+        //    lands in the still-untouched A[i+L].
+        for (0..L - 1) |i| {
+            s.put(" movq " ++ decStr(8 * i) ++ "(%%rsi), %%rdx\n xorl %%eax, %%eax\n");
+            for (i + 1..L) |j| {
+                const k = decStr(8 * (i + j));
+                s.put(" mulxq " ++ decStr(8 * j) ++ "(%%rsi), %%r10, " ++ hiReg(j) ++ "\n" ++
+                    " adcxq " ++ k ++ "(%%rdi), %%r10\n");
+                if (j > i + 1) s.put(" adoxq " ++ hiReg(j - 1) ++ ", %%r10\n");
+                s.put(" movq %%r10, " ++ k ++ "(%%rdi)\n");
+            }
+            s.put(" adcxq %%rax, " ++ hiReg(L - 1) ++ "\n adoxq %%rax, " ++ hiReg(L - 1) ++ "\n" ++
+                " movq " ++ hiReg(L - 1) ++ ", " ++ decStr(8 * (i + L)) ++ "(%%rdi)\n");
+        }
+        // 2. A ← 2·A + Σ a[i]²·B^(2i): CF doubles each word in place (adcx r,r),
+        //    OF adds the diagonal halves; a² < B^(2L), so both chains end at 0.
+        s.put(" xorl %%eax, %%eax\n");
+        for (0..L) |i| {
+            const lo = decStr(16 * i);
+            const hi = decStr(16 * i + 8);
+            s.put(" movq " ++ decStr(8 * i) ++ "(%%rsi), %%rdx\n mulxq %%rdx, %%r11, %%r12\n" ++
+                " movq " ++ lo ++ "(%%rdi), %%r10\n adcxq %%r10, %%r10\n adoxq %%r11, %%r10\n movq %%r10, " ++ lo ++ "(%%rdi)\n" ++
+                " movq " ++ hi ++ "(%%rdi), %%r10\n adcxq %%r10, %%r10\n adoxq %%r12, %%r10\n movq %%r10, " ++ hi ++ "(%%rdi)\n");
+        }
+        // 3. word-serial REDC: L rows of A[i..i+L−1] += u·m (u = A[i]·n0inv),
+        //    the row carry plus the pending cc folded into A[i+L] — the
+        //    portable `montSqrCios` phase 4, one asm loop iteration per row.
+        s.put(" xorl %%r13d, %%r13d\n movl $" ++ decStr(L) ++ ", %%r9d\n2:\n");
+        s.put(" movq (%%rdi), %%rdx\n imulq %%r8, %%rdx\n xorl %%eax, %%eax\n");
+        s.put(" mulxq (%%rcx), %%r10, %%r11\n adcxq (%%rdi), %%r10\n movq %%r10, (%%rdi)\n");
+        for (1..L) |j| {
+            const o = decStr(8 * j);
+            s.put(" mulxq " ++ o ++ "(%%rcx), %%r10, " ++ hiReg(j) ++ "\n" ++
+                " adcxq " ++ o ++ "(%%rdi), %%r10\n" ++
+                " adoxq " ++ hiReg(j - 1) ++ ", %%r10\n" ++
+                " movq %%r10, " ++ o ++ "(%%rdi)\n");
+        }
+        const top = decStr(8 * L);
+        s.put(" adcxq %%rax, " ++ hiReg(L - 1) ++ "\n adoxq %%rax, " ++ hiReg(L - 1) ++ "\n" ++
+            " movq " ++ top ++ "(%%rdi), %%r10\n xorl %%r14d, %%r14d\n" ++
+            " addq %%r13, %%r10\n adcq $0, %%r14\n addq " ++ hiReg(L - 1) ++ ", %%r10\n adcq $0, %%r14\n" ++
+            " movq %%r10, " ++ top ++ "(%%rdi)\n movq %%r14, %%r13\n" ++
+            " addq $8, %%rdi\n decq %%r9\n jnz 2b\n");
+        const out = s.buf[0..s.len].*;
+        return &out;
+    }
+}
+
+/// Upper limb count served by the dedicated fixed square: its cross-product
+/// phase is fully unrolled (~2·L² instructions — ~12 KB at L = 32), so wider
+/// moduli keep squaring through `montMulFixed(a, a)`.
+pub const sqr_fixed_max_limbs: usize = 32;
+
+/// `z = a²·R⁻¹ mod m` for a comptime `L` in `[2, sqr_fixed_max_limbs]` —
+/// the SOS square with every row unrolled: `L(L−1)/2` cross products (each
+/// computed once, doubled in one pass with the diagonal), then `L` REDC rows.
+/// `L² + L(L−1)/2` products against `montMulFixed`'s `2·L²`. Same contract as
+/// `montMulFixed` with `b == a`; `z` must not alias `a` or `m`. The REDC
+/// threading is exactly the portable `montSqrCios`'s (and the runtime-`n`
+/// `montSqr`'s), so both are its oracles. Constant-time on the same terms as
+/// `montMulFixed`: a comptime instruction stream, one public loop counter,
+/// fixed offsets, the laundered `condSubFixed`.
+pub fn montSqrFixed(comptime L: usize, z: *[L]u64, a: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
+    if (comptime supported) {
+        montSqrFixedAmd64(L, z, a, m, n0inv);
+    } else {
+        unreachable; // guarded by every caller; see `mulRow`
+    }
+}
+
+fn montSqrFixedAmd64(comptime L: usize, z: *[L]u64, a: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
+    comptime std.debug.assert(L >= 2 and L <= sqr_fixed_max_limbs);
+    var A: [2 * L]u64 = [_]u64{0} ** (2 * L);
+    defer std.crypto.secureZero(u64, &A);
+    const text = comptime sqrFixedText(L);
+    var cc: u64 = undefined;
+    var d_a: usize = undefined;
+    var d_cnt: usize = undefined;
+    asm volatile (text
+        : [cc] "={r13}" (cc),
+          [da] "={rdi}" (d_a),
+          [dc] "={r9}" (d_cnt),
+        : [ap] "{rsi}" (a),
+          [Ap] "{rdi}" (&A),
+          [mp] "{rcx}" (m),
+          [n0] "{r8}" (n0inv),
+        : .{ .rax = true, .rdx = true, .r10 = true, .r11 = true, .r12 = true, .r14 = true, .cc = true, .memory = true });
+    z.* = A[L..].*;
+    condSubFixed(L, z, cc, m);
+}
+
+inline fn blackBox(x: u64) u64 {
+    return asm volatile (""
+        : [ret] "=r" (-> u64),
+        : [x] "0" (x),
+    );
+}
+
+/// `condSub` at a comptime `L`: the loops fully unroll, which is exactly when
+/// LLVM recovers `smask ∈ {0, ~0}` and hoists pass 2 behind a branch on the
+/// secret borrow (measured on `montint.condSubTop`), so the mask is laundered.
+fn condSubFixed(comptime L: usize, z: *[L]u64, top: u64, m: *const [L]u64) void {
+    var borrow: u1 = 0;
+    for (z, m) |zi, mi| {
+        const s = @subWithOverflow(zi, mi);
+        const s2 = @subWithOverflow(s[0], borrow);
+        borrow = s[1] | s2[1];
+    }
+    const under = @subWithOverflow(top, @as(u64, borrow))[1]; // 1 ⇒ value < m
+    const smask: u64 = blackBox(0 -% (1 -% @as(u64, under)));
+    var b2: u1 = 0;
+    for (z, m) |*zi, mi| {
+        const s = @subWithOverflow(zi.*, mi & smask);
+        const s2 = @subWithOverflow(s[0], b2);
+        zi.* = s2[0];
+        b2 = s[1] | s2[1];
+    }
+}
+
 // ── condSub borrow-chain coverage ───────────────────────────────────────────
 
 test "condSub pass 2: the borrow must survive a limb where z[i] == m[i]" {

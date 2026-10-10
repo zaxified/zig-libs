@@ -217,6 +217,111 @@ fn reduceWide(wide: u512) [4]u64 {
     return reduceWideShuffle(wide);
 }
 
+// ── Montgomery domain (R = 2^256) — what `Fe` stores since 2026-10-10 ──────
+//
+// `Fe` holds `a·R mod p`, canonical (`< p`). The multiply is a 256×256→512
+// product followed by a Montgomery REDC, which for this prime is the cheap
+// reduction: `p ≡ −1 (mod 2^64)`, so `n0' = −p⁻¹ mod 2^64 = 1` and each of the
+// four rounds' quotient digit is just the current low limb, and `m·p` is two
+// shifts plus ONE 64×64 multiply (by `p₃ = 2^64 − 2^32 + 1`). Measured on the
+// bench host (i7-7920HQ, ReleaseFast, chained): the MULX/ADX Montgomery
+// multiply 68 TSC cycles against 131 for the word-shuffle Solinas multiply
+// (`fast_core.fieldMul`, kept with its differential as a second normal-domain
+// reduction). Constants, codecs and `isOdd`/`toInt` convert at the edges.
+
+/// `R mod p` (`R = 2^256`) — the Montgomery form of 1.
+const r_mod_p: u256 = @truncate((@as(u512, 1) << 256) % field_order);
+/// `R² mod p` — `toMont(x) = REDC(x·R²)`.
+const r2_mod_p: u256 = @truncate((@as(u512, r_mod_p) * r_mod_p) % field_order);
+/// `R³ mod p` — turns safegcd's `(aR)⁻¹ = a⁻¹R⁻¹` into `a⁻¹R` in one REDC.
+const r3_mod_p: u256 = @truncate((@as(u512, r2_mod_p) * r_mod_p) % field_order);
+/// `(p + 1) / 2^64`: the REDC round `(t + m·p)/2^64` with `m = t mod 2^64` is
+/// exactly `⌊t/2^64⌋ + m·((p+1)/2^64)` because `p + 1 ≡ 0 (mod 2^96)`.
+const p1_shr64: u256 = (field_order + 1) >> 64;
+
+/// The portable Montgomery reduction `REDC(t) = t·R⁻¹ mod p` for `t < p·R`
+/// (any product of two canonical elements). Four rounds of the identity above,
+/// then one masked conditional subtract: after the rounds `t < 2p`. Comptime-
+/// evaluable (the comb table is built through it). The asm core
+/// (`fast_core.montMul`/`montSq`) must reproduce it bit for bit.
+fn montReducePortable(wide: u512) [4]u64 {
+    var t = wide;
+    inline for (0..4) |_| {
+        const m: u64 = @truncate(t);
+        t = (t >> 64) + @as(u512, m) * p1_shr64;
+    }
+    std.debug.assert((t >> 257) == 0);
+    const lo: u256 = @truncate(t);
+    const hi: u64 = @truncate(t >> 256); // 0 or 1
+    const d = @subWithOverflow(lo, field_order);
+    // keep `lo` iff the true value `hi·2^256 + lo` is < p: no high bit AND a borrow.
+    const keep_bit: u64 = @as(u64, d[1]) & ~hi;
+    const keep: u256 = @as(u256, 0) -% @as(u256, blackBox(keep_bit));
+    return fromU256((lo & keep) | (d[0] & ~keep));
+}
+
+/// `z = a·b·R⁻¹ mod p`, portable (the oracle the Montgomery asm mirrors).
+pub fn montMulPortable(a: [4]u64, b: [4]u64) [4]u64 {
+    return montReducePortable(@as(u512, toU256(a)) * @as(u512, toU256(b)));
+}
+
+/// `z = a²·R⁻¹ mod p`, portable.
+pub fn montSqPortable(a: [4]u64) [4]u64 {
+    const av: u512 = toU256(a);
+    return montReducePortable(av * av);
+}
+
+inline fn montMulLimbs(a: [4]u64, b: [4]u64) [4]u64 {
+    if (field_asm_active and !@inComptime()) {
+        var z: [4]u64 = undefined;
+        fast_core.montMul(&z, &a, &b);
+        return z;
+    }
+    return montMulPortable(a, b);
+}
+
+/// Normal → Montgomery form of a canonical value (`x·R mod p`).
+inline fn toMont(x: u256) [4]u64 {
+    if (@inComptime()) return fromU256(@truncate((@as(u512, x) << 256) % field_order));
+    return montMulLimbs(fromU256(x), fromU256(r2_mod_p));
+}
+
+/// Montgomery → normal form (`REDC(x)`; canonical in, canonical out).
+///
+/// Written on scalars rather than through `montMulLimbs(l, 1)`: the asm core
+/// takes its operands and result by pointer, so every `toBytes` of a secret
+/// (an ECDH shared `x`) parked both forms in the CALLER's frame, outside any
+/// burn — the ECDH stack probe found them (2026-10-10). Four REDC rounds of
+/// `t ← ⌊t/2^64⌋ + m·((p+1)/2^64)`, `m = t mod 2^64`, with `(p+1)/2^64 =
+/// p₃·2^128 + 2^32`. No final subtract: for an input `x < p` the result
+/// `(x + M·p)/2^256 < p + 1`, and `= p` would need `x ≡ 0`, i.e. `x = M = 0`;
+/// so it is already canonical (the differential against the portable REDC in
+/// `oracle_test.zig` pins it). Constant-time; comptime-evaluable.
+inline fn fromMontLimbs(l: [4]u64) [4]u64 {
+    const p3: u64 = 0xFFFF_FFFF_0000_0001;
+    var a0 = l[0];
+    var a1 = l[1];
+    var a2 = l[2];
+    var a3 = l[3];
+    inline for (0..4) |_| {
+        const m = a0;
+        const x = @as(u128, m) * p3;
+        const s0 = @as(u128, a1) + (m << 32);
+        const s1 = @as(u128, a2) + (m >> 32) + (s0 >> 64);
+        const s2 = @as(u128, a3) + @as(u64, @truncate(x)) + (s1 >> 64);
+        const s3 = (x >> 64) + (s2 >> 64);
+        a0 = @truncate(s0);
+        a1 = @truncate(s1);
+        a2 = @truncate(s2);
+        a3 = @truncate(s3);
+    }
+    return .{ a0, a1, a2, a3 };
+}
+
+inline fn fromMont(l: [4]u64) u256 {
+    return toU256(fromMontLimbs(l));
+}
+
 /// `z = a·b mod p`, portable Solinas path (the oracle the asm core mirrors).
 pub fn mulPortable(a: [4]u64, b: [4]u64) [4]u64 {
     const wide: u512 = @as(u512, toU256(a)) * @as(u512, toU256(b));
@@ -239,11 +344,15 @@ pub const Fe = struct {
     pub const encoded_length = 32;
 
     pub const zero = Fe{ .limbs = .{ 0, 0, 0, 0 } };
-    pub const one = Fe{ .limbs = .{ 1, 0, 0, 0 } };
+    /// 1 in Montgomery form (`R mod p`).
+    pub const one = Fe{ .limbs = fromU256(r_mod_p) };
 
     /// The field prime as an integer type, for parity with std's `Fe.IntRepr`.
     pub const IntRepr = u256;
 
+    /// The raw Montgomery-form limbs as an integer (`a·R mod p`) — what the
+    /// domain-agnostic `add`/`sub` operate on. NOT the element's value: that
+    /// is `toInt`.
     inline fn value(fe: Fe) u256 {
         return toU256(fe.limbs);
     }
@@ -265,25 +374,31 @@ pub const Fe = struct {
     pub fn fromBytes(s: [encoded_length]u8, endian: std.builtin.Endian) NonCanonicalError!Fe {
         const v = std.mem.readInt(u256, &s, endian);
         if (v >= field_order) return error.NonCanonical;
-        return .{ .limbs = fromU256(v) };
+        return .{ .limbs = toMont(v) };
     }
 
     /// Pack a field element.
     pub fn toBytes(fe: Fe, endian: std.builtin.Endian) [encoded_length]u8 {
+        // Limb by limb from registers (see `fromMontLimbs` for why).
+        const l = fromMontLimbs(fe.limbs);
         var s: [encoded_length]u8 = undefined;
-        std.mem.writeInt(u256, &s, fe.value(), endian);
+        inline for (0..4) |i| switch (endian) {
+            .little => std.mem.writeInt(u64, s[8 * i ..][0..8], l[i], .little),
+            .big => std.mem.writeInt(u64, s[24 - 8 * i ..][0..8], l[i], .big),
+        };
         return s;
     }
 
     /// Create a field element from a comptime integer `< p`.
     pub fn fromInt(comptime x: u256) NonCanonicalError!Fe {
         if (x >= field_order) return error.NonCanonical;
-        return .{ .limbs = fromU256(x) };
+        const l = comptime toMont(x);
+        return .{ .limbs = l };
     }
 
     /// Return the element as an integer.
     pub fn toInt(fe: Fe) u256 {
-        return fe.value();
+        return fromMont(fe.limbs);
     }
 
     pub fn isZero(fe: Fe) bool {
@@ -291,7 +406,7 @@ pub const Fe = struct {
     }
 
     pub fn isOdd(fe: Fe) bool {
-        return (fe.limbs[0] & 1) != 0;
+        return (fromMont(fe.limbs) & 1) != 0;
     }
 
     pub fn equivalent(a: Fe, b: Fe) bool {
@@ -362,27 +477,23 @@ pub const Fe = struct {
         return Fe.zero.sub(a);
     }
 
-    /// `a·b mod p`. Dispatches to the gated amd64 core when active, else the
-    /// portable Solinas reduction. The `@inComptime()` guard routes comptime
-    /// evaluation to the portable path (the asm core cannot execute in the
-    /// comptime interpreter); at runtime that branch is comptime-dead.
+    /// `a·b mod p` (Montgomery: `aR·bR·R⁻¹ = abR`). Dispatches to the gated
+    /// amd64 Montgomery core when active, else the portable REDC. The
+    /// `@inComptime()` guard routes comptime evaluation to the portable path
+    /// (the asm core cannot execute in the comptime interpreter); at runtime
+    /// that branch is comptime-dead.
     pub fn mul(a: Fe, b: Fe) Fe {
-        if (field_asm_active and !@inComptime()) {
-            var z: [4]u64 = undefined;
-            fast_core.fieldMul(&z, &a.limbs, &b.limbs);
-            return .{ .limbs = z };
-        }
-        return .{ .limbs = mulPortable(a.limbs, b.limbs) };
+        return .{ .limbs = montMulLimbs(a.limbs, b.limbs) };
     }
 
     /// `a² mod p`. Dispatches like `mul` (same comptime/asm split).
     pub fn sq(a: Fe) Fe {
         if (field_asm_active and !@inComptime()) {
             var z: [4]u64 = undefined;
-            fast_core.fieldSq(&z, &a.limbs);
+            fast_core.montSq(&z, &a.limbs);
             return .{ .limbs = z };
         }
-        return .{ .limbs = sqPortable(a.limbs) };
+        return .{ .limbs = montSqPortable(a.limbs) };
     }
 
     /// `a` squared `n` times.
@@ -416,7 +527,10 @@ pub const Fe = struct {
     /// → ~3 µs (590 divsteps in ten 62-bit batches).
     pub fn invert(a: Fe) Fe {
         if (comptime gate.fast_invert_implemented) {
-            return .{ .limbs = modinv.invert(a.limbs, field_modinfo) };
+            // safegcd inverts the stored limbs: (aR)⁻¹ = a⁻¹R⁻¹; one REDC
+            // against R³ lands on a⁻¹R, the Montgomery form of a⁻¹.
+            const inv = Fe{ .limbs = modinv.invert(a.limbs, field_modinfo) };
+            return inv.mul(.{ .limbs = fromU256(r3_mod_p) });
         }
         return a.invertFermat();
     }

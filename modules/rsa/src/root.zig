@@ -93,6 +93,7 @@ const std = @import("std");
 /// Fast constant-time Montgomery modexp backend for the RSA hot path
 /// (private CRT op, non-CRT private op, public op). See `montint`'s SPEC.md.
 const montint = @import("montint");
+const safegcd = @import("safegcd.zig");
 const burn = @import("burn.zig");
 
 /// Blowfish + OpenBSD bcrypt_pbkdf (P4b support primitives), re-exported
@@ -448,8 +449,8 @@ pub const SecretKey = struct {
 // ── big.int helpers (the public-operand inverse only) ───────────────────────
 //
 // `fromPrimes` stopped using these on 2026-10-03 (montint limb arithmetic,
-// constant-time); what remains is `bigModInverse` for the per-op blinding
-// inverse of a fresh public random `r` and for `blindrsa`.
+// constant-time) and the per-op blinding inverse on 2026-10-10 (`safegcd.zig`);
+// what remains is `bigModInverse` for `blindrsa`.
 
 const BigInt = std.math.big.int.Managed;
 
@@ -480,18 +481,17 @@ fn bigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) !BigInt {
 /// composite) `m`; fails with `error.InvalidPrivateKey` unless gcd(e, m) = 1.
 /// VARIABLE-TIME in both operands (division-based Euclid — `std.crypto.ff`
 /// has no `invert`, and Fermat inversion needs a *prime* modulus, which a
-/// composite-modulus caller may not even know the factorization of). Used
-/// internally for per-op CRT base-blinding only (`invModN`, called on a
-/// fresh public random `r`, never on secret key material); key derivation
-/// uses montint's constant-time `inverseOfModulus` since 2026-10-03.
+/// composite-modulus caller may not even know the factorization of). No
+/// longer used inside this module: per-op CRT base-blinding moved to the
+/// constant-time `safegcd.zig` on 2026-10-10, key derivation to montint's
+/// `inverseOfModulus` on 2026-10-03.
 ///
 /// `pub` so sibling modules needing a generic composite-modulus inverse
 /// (currently `blindrsa`, for its RFC 9474 blinding-factor inversion) can
 /// reuse this instead of carrying their own copy. It is a bare arithmetic
 /// primitive with NO masking of its own — a caller with a secret operand
 /// MUST mask it (multiply by a fresh independent random unit) before
-/// calling, the same way `invModN` above and `blindrsa`'s `maskedInvert`
-/// do; passing a secret directly leaks it through the run's data-dependent
+/// calling, the same way `blindrsa`'s `maskedInvert` does; passing a secret directly leaks it through the run's data-dependent
 /// branch count. The returned `BigInt` is a fresh, caller-owned value (the
 /// caller's allocator is used for it, same as every other scratch value
 /// here); this module always draws `gpa` from a `FixedBufferAllocator`
@@ -769,55 +769,47 @@ pub const Blinding = union(enum) {
 /// (`m·r_inv = (c·r^e)^d·r⁻¹ = c^d·r·r⁻¹ = c^d mod n`).
 const BlindingFactors = struct { c_blinded: MontElem, r_inv: MontElem };
 
-/// Draw a fresh blinding pair. All arithmetic here is on the PUBLIC modulus n
-/// and on `r` (a secret-independent random value), so the variable-time inverse
-/// and the `r^e` public modexp leak nothing about the private exponent. `rng`
-/// MUST be cryptographically secure — a predictable `r` voids the masking.
+/// Draw a fresh blinding pair. All arithmetic is on the PUBLIC modulus `n`
+/// and on `r`, a fresh secret-independent random unit; `rng` MUST be
+/// cryptographically secure — a predictable `r` voids the masking.
+///
+/// Since 2026-10-10 the whole pair is built on montint and `safegcd.zig`:
+/// `r` is drawn and range-checked as a montint element (no `std.crypto.ff`
+/// round trip), and `r⁻¹ mod n` is the constant-time batched safegcd instead
+/// of the `std.math.big` extended Euclid — that inverse was most of the
+/// blinded rows' cost in `bench-rsa` (SPEC "Performance"). The inverse is
+/// checked (`r·r⁻¹ ≡ 1`) before use, so neither a non-unit `r` (shares `p` or
+/// `q`: probability ~2^-1023) nor a divstep-bound shortfall can produce a
+/// wrong unblinding; both just redraw.
 fn makeBlinding(sk: *const SecretKey, c: *const MontElem, rng: std.Random) BlindingFactors {
-    const n_len = byteLen(sk.n.bits());
-    var n_be: [max_modulus_len]u8 = undefined;
-    sk.n.toBytes(n_be[0..n_len], .big) catch unreachable;
+    const n_len = sk.n_mont.byteLen();
     var e_be: [max_modulus_len]u8 = undefined;
     sk.e.toBytes(&e_be, .big) catch unreachable;
+    var one: MontElem = MontParams.zero;
+    one[0] = 1;
 
     while (true) {
-        // Uniform r in [1, n-1] by rejection sampling (>= n redraws).
+        // Uniform r in [1, n−1] by rejection sampling (>= n and 0 redraw).
         var r_raw: [max_modulus_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &r_raw);
         rng.bytes(r_raw[0..n_len]);
-        const r = Fe.fromBytes(sk.n, r_raw[0..n_len], .big) catch continue;
-        if (r.isZero()) continue;
-        var r_be: [max_modulus_len]u8 = undefined;
-        r.toBytes(r_be[0..n_len], .big) catch unreachable; // canonical, < n
+        var r_el = sk.n_mont.elemFromBytesBE(r_raw[0..n_len]) catch continue;
+        defer std.crypto.secureZero(u64, &r_el);
+        if (MontParams.isZero(&r_el)) continue;
 
-        // r_inv = r⁻¹ mod n (fails only if gcd(r, n) != 1 — r shares p or q,
-        // astronomically unlikely; redraw if so).
-        var rinv_be: [max_modulus_len]u8 = undefined;
-        const rinv = invModN(n_be[0..n_len], r_be[0..n_len], &rinv_be) orelse continue;
-        const r_inv = sk.n_mont.elemFromBytesBE(rinv) catch continue;
+        var r_inv: MontElem = MontParams.zero;
+        if (!BlindInverter.invert(&r_el, &sk.n_mont.m, sk.n_mont.nbits, &r_inv)) continue;
+        const chk = sk.n_mont.mul(&r_el, &r_inv);
+        if (!MontParams.eql(&chk, &one)) continue;
 
-        // re = r^e mod n (public exponent), then c_blinded = c·re mod n —
-        // on montint, so the blinded base never meets `ff`'s branching mul.
-        const r_el = sk.n_mont.elemFromBytesBE(r_be[0..n_len]) catch unreachable; // < n
+        // re = r^e mod n (public exponent), then c_blinded = c·re mod n.
         const re = sk.n_mont.powPublic(&r_el, stripLeadingZeros(&e_be));
         return .{ .c_blinded = sk.n_mont.mul(c, &re), .r_inv = r_inv };
     }
 }
 
-/// `r⁻¹ mod n` as big-endian bytes into `out` (returns the written slice), or
-/// `null` if `r` is not a unit mod n. Extended-Euclid via `std.math.big.int` on
-/// a stack arena — variable-time, but only ever on the public modulus and a
-/// random `r`, never on secret key material.
-fn invModN(n_be: []const u8, r_be: []const u8, out: *[max_modulus_len]u8) ?[]const u8 {
-    var scratch: [96 * 1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    const gpa = fba.allocator();
-    var r_big = bigFromBytes(gpa, r_be) catch return null;
-    var n_big = bigFromBytes(gpa, n_be) catch return null;
-    var inv = bigModInverse(gpa, &r_big, &n_big) catch return null; // gcd != 1 -> null
-    if (inv.bitCountAbs() > max_modulus_bits) return null;
-    inv.toConst().writeTwosComplement(out, .big); // left-zero-padded to out.len
-    return out[0..];
-}
+/// The blinding inverse's limb width matches montint's element exactly.
+const BlindInverter = safegcd.Inverter(@typeInfo(MontElem).array.len * 64);
 
 fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Blinding) PrimitiveError!void {
     // OS2IP + range check on the PUBLIC input; from here on every value is
@@ -2784,6 +2776,7 @@ pub fn selfSignedCert(
 // is referenced from a `test { _ = ...; }` block here.
 test {
     _ = openssh;
+    _ = safegcd;
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
 }

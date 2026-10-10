@@ -82,6 +82,7 @@ test {
     _ = @import("dyn.zig");
     _ = @import("nt.zig");
     _ = @import("kat_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("bench.zig");
 }
 

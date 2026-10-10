@@ -33,21 +33,23 @@
 //!   every one of those ends in. This is also the size the pairing fields use
 //!   (`bn254` L=4, `bls12_381` L=6), which the dispatch comment calls out as
 //!   the ones that MUST stay portable.
-//! * `portable` — `Modint(1024)`, `L = 16`. At/above `sqr_min_limbs`, below
-//!   `asm_min_limbs`: the dedicated portable square `montSqrCios`
-//!   (`montint.zig:281`) is live, and the asm core is not. Drives `powMont`
-//!   with a tainted EXPONENT and a tainted base — the flagship claim
-//!   (`montint.zig:417`): fixed 5-bit window, a multiply per window, a
-//!   branchless 32-entry gather, all `L·64` exponent bits processed. This is
-//!   also the RSA-2048 CRT width (secret `dP`/`dQ`), so it additionally drives
-//!   one `sub` — see `runPow`.
-//! * `asm` — `Modint(2048)`, `L = 32`. At `asm_min_limbs`, so `montMul` and
-//!   `montSqr` route into `asm_core.montMul`/`montSqr`
-//!   (`asm_core.zig:47`: "no secret-dependent branch, load address, or
-//!   store address"). Same tainted `powMont`, so the same window/gather logic
-//!   runs on top of the asm core. Memcheck reads real machine code, so the
-//!   inline-asm block is measured exactly like compiled Zig: a `Jcc` on a
-//!   tainted flag or a tainted address would both be reported.
+//! * `portable` — `Modint(512)`, `L = 8`. At/above `sqr_min_limbs`, below
+//!   `fixed_min_limbs`: the dedicated portable square `montSqrCios` is live,
+//!   and no asm core is. Drives `powMont` with a tainted EXPONENT and a
+//!   tainted base — the flagship claim: fixed 5-bit window, a multiply per
+//!   window, a branchless 32-entry gather, all `L·64` exponent bits
+//!   processed — plus one `sub` (see `runPow`). Until 2026-10-10 this target
+//!   was `Modint(1024)`, the RSA-2048 CRT width; that width now runs the
+//!   fixed-`L` asm kernel (`fixed_min_limbs = 16`) and is measured by the
+//!   `dyn` target's L = 16 run, so this one moved down to keep the portable
+//!   bodies measured.
+//! * `asm` — `Modint(2048)`, `L = 32`. At `fixed_min_limbs`, so `montMul` and
+//!   `montSqr` route into `asm_core.montMulFixed` (the comptime-unrolled
+//!   rows: "the only branch is the outer loop's `jnz` on a public counter").
+//!   Same tainted `powMont`, so the same window/gather logic runs on top of
+//!   the asm core. Memcheck reads real machine code, so the inline-asm block
+//!   is measured exactly like compiled Zig: a `Jcc` on a tainted flag or a
+//!   tainted address would both be reported.
 //!
 //! ## What the counts mean
 //!
@@ -204,8 +206,9 @@ fn runPow(comptime bits: comptime_int, comptime tag: []const u8, tainted: bool) 
     // leak class here is LLVM re-deriving `mask ∈ {0, ~0}` at a fully unrolled
     // width: each `L` is separate codegen with its own verdict, and L=16 is
     // exactly the RSA-2048 CRT width the 2026-08-13 fix was about. One call
-    // here covers both remaining widths (L=16 via `portable`, L=32 via
-    // `asmcore`) without a fourth target, and `add`/`mul`/`montSqr` need no
+    // here covers both remaining widths (L=8 via `portable` — L=16 until
+    // 2026-10-10, now reached through `dyn` — and L=32 via `asmcore`) without
+    // a fourth target, and `add`/`mul`/`montSqr` need no
     // equivalent because `condSubTop` — the thing they all end in — is already
     // driven at both widths through `powMont`'s multiplies and squarings.
     const dif = m.sub(&base, &exp);
@@ -433,7 +436,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             printElem(M, "mul", &m, &prod);
             printElem(M, "sqr", &m, &sq);
         },
-        .portable => try runPow(1024, "portable", tainted),
+        .portable => try runPow(512, "portable", tainted),
         .asmcore => try runPow(2048, "asm", tainted),
         .field => try runField(tainted),
         .ffcontrol => try runFfControl(tainted),

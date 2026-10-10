@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — perf (no API change): `Fe` is now Montgomery-domain (`fast_core.montMul`/`montSq`: MULX/ADX product + 4-round REDC, 131 → 68 cycles per multiply; portable `montMulPortable` for comptime/non-amd64; codecs convert at the edges with a register-only REDC) and `mulCtWindowed` runs w = 5 Booth digits with Jacobian doublings around the complete RCB addition. `bench-p256` vs OpenSSL 3.5.5: sign 1.54 → 1.23×, verify 1.86 → 1.21×, ecdh 3.28 → 1.59×, keygen 2.19 → 1.64–1.92× (bimodal). `burn.mul_burn` 8 → 12 KiB (the w = 5 core dirties 8.4 KiB). New differentials: Montgomery asm/portable vs a naive REDC, `mulCtWindowed` edge scalars vs the CT ladder. ctgrind `comb` 2 / `sign` 12 in-file, unchanged (digests re-pinned); STACKPROBE green.
 - **2026-10-10** — tools: comparative benchmark `tools/bench.zig` + `tools/c_bench/foreign_bench.c` (`zig build bench-p256`) against OpenSSL 3.5.5 (nistz256) for sign/verify/ECDH/keygen; card Performance filled (1.53–3.31×, worst `ecdh`), SPEC "Performance — bench-p256" section and the levers in Backlog.
 - **2026-10-09** — tests: deterministic fuzz driver `P256_FUZZ` over the existing harnesses (`fromSec1` gains a pristine/flipped overlay: genuine encodings of `k*G` must decode to it, a flipped `y` bit must be refused).
 - **2026-10-09** — New `KeyPair.signerInto(out, key_pair, noise)`: the `Signer` holds the secret

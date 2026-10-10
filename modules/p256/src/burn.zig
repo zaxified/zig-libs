@@ -24,8 +24,10 @@ pub noinline fn stack(comptime n: usize) void {
 }
 
 /// A scalar multiply (variable- or fixed-base) dirtied 4.8 KiB in ReleaseFast
-/// (2026-10-08).
-pub const mul_burn = 8 * 1024;
+/// (2026-10-08); the w = 5 Jacobian-doubling `mulCtWindowed` (16-entry table,
+/// 52-digit recoding) took the ECDH probe to 8.4 KiB dirty (2026-10-10), past
+/// the old 8 KiB, so the burn grew with it.
+pub const mul_burn = 12 * 1024;
 
 /// `affineCoordinates` (one field inversion): the ECDH probe in
 /// `stackprobe_test.zig` reads clean with this (2026-10-08).

@@ -107,6 +107,72 @@ test "differential: amd64 asm core == portable oracle on random (a,b,odd-N)" {
     }
 }
 
+// The fixed-`L` kernel (`asm_core.montMulFixed`, what `Modint.montMul`/
+// `montSqr` dispatch to at `L >= fixed_min_limbs` since 2026-10-10) against
+// the portable CIOS, at every size the dispatch can select plus the
+// smallest the generator accepts. Moduli with the top bit set AND with a
+// short top limb (`m < 2^(64L−63)`: `t` then never reaches the top word, a
+// different carry pattern), and operands at the edges `0`, `1`, `m − 1` —
+// the values where a dropped CF/OF tail shows first.
+fn fixedDiff(comptime L: usize, rand: std.Random, trials: usize) !void {
+    const M = Modint(L * 64);
+    var t: usize = 0;
+    while (t < trials) : (t += 1) {
+        var mv: M.Elem = undefined;
+        for (&mv) |*w| w.* = rand.int(u64);
+        mv[0] |= 1;
+        if (t % 4 == 3) mv[L - 1] = 1 + (mv[L - 1] >> 63) else mv[L - 1] |= 1 << 63;
+        const m = try M.fromElem(mv);
+        var a: M.Elem = undefined;
+        var b: M.Elem = undefined;
+        for (&a, &b) |*x, *y| {
+            x.* = rand.int(u64);
+            y.* = rand.int(u64);
+        }
+        a[L - 1] %= mv[L - 1];
+        b[L - 1] %= mv[L - 1];
+        switch (t % 16) {
+            0 => a = .{0} ** L,
+            1 => {
+                b = .{0} ** L;
+                b[0] = 1;
+            },
+            2, 3 => {
+                a = mv;
+                a[0] -= 1;
+                if (t % 16 == 3) b = a;
+            },
+            else => {},
+        }
+        const want = m.montMulCios(&a, &b);
+        var got: M.Elem = undefined;
+        asm_core.montMulFixed(L, &got, &a, &b, &m.m, m.n0inv);
+        try std.testing.expectEqualSlices(u64, &want, &got);
+        asm_core.montMulFixed(L, &got, &a, &a, &m.m, m.n0inv);
+        try std.testing.expectEqualSlices(u64, &m.montMulCios(&a, &a), &got);
+        if (comptime L <= asm_core.sqr_fixed_max_limbs) {
+            asm_core.montSqrFixed(L, &got, &a, &m.m, m.n0inv);
+            try std.testing.expectEqualSlices(u64, &m.montMulCios(&a, &a), &got);
+            asm_core.montSqrFixed(L, &got, &b, &m.m, m.n0inv);
+            try std.testing.expectEqualSlices(u64, &m.montMulCios(&b, &b), &got);
+        }
+    }
+}
+
+test "differential: fixed-L asm kernels (mul, sqr) == portable CIOS (L = 2, 8, 16, 24, 32, 48, 64)" {
+    if (!gate.asm_core_implemented) return error.SkipZigTest;
+    if (!asm_core.supported) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0xF1_7ED_C105);
+    const rand = prng.random();
+    try fixedDiff(2, rand, 4000);
+    try fixedDiff(8, rand, 2000);
+    try fixedDiff(16, rand, 2000);
+    try fixedDiff(24, rand, 1000);
+    try fixedDiff(32, rand, 1000);
+    try fixedDiff(48, rand, 300);
+    try fixedDiff(64, rand, 300);
+}
+
 fn randBelow(comptime M: type, rand: std.Random, m: *const M.Elem) M.Elem {
     var v: M.Elem = undefined;
     for (&v) |*w| w.* = rand.int(u64);

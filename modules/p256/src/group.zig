@@ -443,63 +443,75 @@ pub const P256 = struct {
     }
 
     /// GATED Fable core #2a — CONSTANT-TIME windowed variable-base multiply
-    /// (secret scalars). A fixed-window (w = 4) signed-digit form: the scalar is
-    /// recoded branch-free into 65 signed digits d_i ∈ [−8, 7], a runtime table
-    /// of the magnitudes {1..8}·p is built with a PUBLIC schedule, and the
-    /// online phase does 4 doublings + one table add per digit, top-down. The
-    /// per-digit gather is a `blackBox`-guarded masked linear scan over ALL
-    /// eight entries at fixed offsets (never secret-indexed — the k256/powMont
-    /// lesson), and the digit sign is applied by a masked point negation.
-    /// Stays on the complete projective formulas (full `add`, projective
-    /// runtime table): its table is built per call from a secret-derived
-    /// point, so there is no comptime affine table to gather from.
-    /// Pinned bit-for-bit to `mulDoubleAddCt` by the gated differential.
+    /// (secret scalars: ECDH). A fixed-window (w = 5) signed-digit form: the
+    /// scalar is recoded branch-free into 52 signed digits d_i ∈ [−16, 15], a
+    /// runtime table of the magnitudes {1..16}·p is built with a PUBLIC
+    /// schedule, and the online phase does 5 doublings + one table add per
+    /// digit, top-down. The per-digit gather is a `blackBox`-guarded masked
+    /// linear scan over ALL sixteen entries at fixed offsets (never secret-
+    /// indexed — the k256/powMont lesson), and the digit sign is applied by a
+    /// masked point negation.
+    ///
+    /// The DOUBLINGS run in Jacobian coordinates (`Jac.dbl`, 3M+5S against the
+    /// complete projective 8M+3S+2m_b), the ADDITION stays the complete RCB
+    /// Algorithm 4 on projective points: each window converts the accumulator
+    /// projective→Jacobian (`(XZ : YZ² : Z)`), doubles five times, converts
+    /// back (`(XZ : Y : Z³)`) and adds — 6 conversion multiplies buy 25 saved
+    /// per window. `Jac.dbl` is exception-free on a prime-order curve (no
+    /// 2-torsion; `Z = 0` stays `Z = 0`), and the only identity the
+    /// accumulator can be in is the leading run of zero digits, which the
+    /// conversion maps to `(1 : 1 : 0)` by a masked select (a fixed point of
+    /// `Jac.dbl` that converts back to std's `(0 : 1 : 0)`), so the addition
+    /// stays complete and nothing branches. Measured 2026-10-10 (ECDH bench):
+    /// 104 µs → see SPEC "Performance". Pinned bit-for-bit (as a point) to
+    /// `mulDoubleAddCt` by the gated differential.
     pub fn mulCtWindowed(p: P256, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
         const k = scalarValue(s_, endian);
-        const half: u64 = 1 << (comb_w - 1); // 8
-        const twow: u64 = 1 << comb_w; // 16
+        const half: u64 = 1 << (vb_w - 1); // 16
+        const twow: u64 = 1 << vb_w; // 32
         const wmask: u64 = twow - 1;
 
-        // Magnitude table {1..8}·p — the schedule is public (fixed loop), only
+        // Magnitude table {1..16}·p — the schedule is public (fixed loop), only
         // the VALUES are secret-derived, so this is constant-time.
-        var tab: [comb_teeth]P256 = undefined;
+        var tab: [vb_teeth]P256 = undefined;
         tab[0] = p;
         tab[1] = p.dbl();
         var j: usize = 2;
-        while (j < comb_teeth) : (j += 1) tab[j] = tab[j - 1].add(p);
+        while (j < vb_teeth) : (j += 1) tab[j] = tab[j - 1].add(p);
 
         // Branch-free signed-digit (Booth-style) recoding, bottom-up (the
         // carry propagates upward), stored for the top-down consumption below.
         // Secret VALUES in the arrays, but every access is at a PUBLIC index.
-        var mags: [comb_t]u64 = undefined;
-        var negs: [comb_t]u64 = undefined;
+        var mags: [vb_t]u64 = undefined;
+        var negs: [vb_t]u64 = undefined;
         var carry: u64 = 0;
         var i: usize = 0;
-        while (i < comb_t) : (i += 1) {
-            const shift: usize = i * comb_w; // PUBLIC (loop-derived) shift
+        while (i < vb_t) : (i += 1) {
+            const shift: usize = i * vb_w; // PUBLIC (loop-derived) shift
             const wv: u64 = if (shift < 256) (@as(u64, @truncate(k >> @intCast(shift))) & wmask) else 0;
             const x = wv + carry; // 0 .. 2^w
             const is_neg: u64 = @intFromBool(x >= half); // setcc, not a branch
             carry = is_neg;
             // The select mask is laundered through `blackBox`: without it LLVM
-            // recovers `is_neg = (x >= 8)` and lowers the select to a CMOV (or
+            // recovers `is_neg = (x >= 16)` and lowers the select to a CMOV (or
             // worse, a branch) on the secret digit — observed in ReleaseFast
             // disasm before the barrier was added.
             const negmask: u64 = blackBox(0 -% is_neg);
-            mags[i] = ((twow - x) & negmask) | (x & ~negmask); // |d| ∈ [0, 8]
+            mags[i] = ((twow - x) & negmask) | (x & ~negmask); // |d| ∈ [0, 16]
             negs[i] = is_neg;
         }
 
-        // Top-down: acc = 2^w·acc + d_i·p. Fixed trip count; the complete
-        // formulas make identity doublings/additions exception-free.
+        // Top-down: acc = 2^w·acc + d_i·p. Fixed trip count, no branch.
         var acc = P256.identityElement;
-        i = comb_t;
+        i = vb_t;
         while (i > 0) {
             i -= 1;
-            acc = acc.dbl().dbl().dbl().dbl();
+            var jac = jacFromProjectiveCt(acc);
+            jac = jac.dbl().dbl().dbl().dbl().dbl();
+            acc = jacToProjectiveCt(jac);
             var g = P256.identityElement;
             j = 0;
-            while (j < comb_teeth) : (j += 1) {
+            while (j < vb_teeth) : (j += 1) {
                 const match: u64 = @intFromBool(@as(u64, j + 1) == mags[i]);
                 const mask = blackBox(0 -% match);
                 blendLimbs(&g.x, tab[j].x, mask);
@@ -982,11 +994,44 @@ comptime {
 }
 
 /// Window width of the CT variable-base core `mulCtWindowed` (its runtime
-/// magnitude table is {1..8}·p, built per call — a wider window would cost
-/// more in table construction than it saves).
-const comb_w: usize = 4;
-const comb_teeth: usize = 1 << (comb_w - 1); // 8
-const comb_t: usize = (256 / comb_w) + 1; // 65
+/// magnitude table is {1..16}·p, built per call: 15 complete operations buy
+/// 13 fewer window additions than w = 4 — the same w = 5 Booth window as
+/// OpenSSL nistz256's variable-base multiply; measured 2026-10-10).
+const vb_w: usize = 5;
+const vb_teeth: usize = 1 << (vb_w - 1); // 16
+/// 52 windows = 260 bits: the top window holds bit 255 plus the carry, so its
+/// value is at most 2 < 16 and no carry escapes (asserted below).
+const vb_t: usize = (256 + vb_w - 1) / vb_w; // 52
+
+comptime {
+    std.debug.assert(vb_t * vb_w >= 256 + 1);
+    // top window: (256 - (vb_t-1)·w) scalar bits + carry < half
+    std.debug.assert((@as(u64, 1) << @intCast(256 - (vb_t - 1) * vb_w)) < (1 << (vb_w - 1)));
+}
+
+/// Projective → Jacobian for the CONSTANT-TIME windowed core: `(XZ : YZ² : Z)`,
+/// except that the identity (`Z = 0`, which this map would send to the
+/// all-zero triple) becomes `(1 : 1 : 0)` by a masked select — a fixed point
+/// of `Jac.dbl` that `jacToProjectiveCt` maps back to `(0 : 1 : 0)`. The
+/// select mask is laundered through `blackBox`; no branch on the point.
+fn jacFromProjectiveCt(p: P256) Jac {
+    var j = Jac.fromProjective(p);
+    const zl = p.z.limbs;
+    const nz: u64 = zl[0] | zl[1] | zl[2] | zl[3];
+    // is_zero = 1 iff nz == 0, without a compare the optimizer can branch on.
+    const is_zero: u64 = ((nz | (0 -% nz)) >> 63) ^ 1;
+    const mask = blackBox(0 -% is_zero);
+    blendLimbs(&j.x, field.Fe.one, mask);
+    blendLimbs(&j.y, field.Fe.one, mask);
+    return j;
+}
+
+/// Jacobian → projective, branch-free: `(XZ : Y : Z³)`. For the `(1 : 1 : 0)`
+/// identity this is `(0 : 1 : 0)` with no special case.
+fn jacToProjectiveCt(p: Jac) P256 {
+    const z2 = p.z.sq();
+    return .{ .x = p.x.mul(p.z), .y = p.y, .z = z2.mul(p.z) };
+}
 
 /// The precomputed fixed-base table type: `[window][magnitude−1]` affine points.
 pub const BaseTable = [fb_t][fb_teeth]AffineCoordinates;

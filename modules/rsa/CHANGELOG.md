@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — perf (no API change): the blinded private ops build `r⁻¹ mod n` with a new constant-time batched safegcd (`src/safegcd.zig`, verified `r·r⁻¹ ≡ 1` before use) instead of the variable-time `std.math.big` Euclid, and draw `r` as a montint element (no `std.crypto.ff` round trip); together with montint's new fixed-`L` kernels, `bench-rsa` vs OpenSSL 3.5.5 went from 1.44–2.84× to 1.15–1.61× (worst `decbl_2048`). The private-op `invModN` helper is gone; `bigModInverse` stays for `blindrsa`. ctgrind `crt` 2 / `noncrt` 0 / `keygen` 173 in-file, unchanged (digests re-pinned); STACKPROBE green.
 - **2026-10-10** — tools: comparative benchmark `tools/bench.zig` + `tools/c_bench/foreign_bench.c` (`zig build bench-rsa`) against OpenSSL 3.5.5 at 2048/3072/4096 bits (PKCS#1 v1.5 sign/verify, OAEP decrypt, blinded and not); card Performance filled (1.44–2.84×), SPEC "Performance — bench-rsa" section and the levers in Backlog.
 - **2026-10-09** — **Added:** `opensshDecryptSection` (+ `OpensshSection`, `OpensshCipher` now
   public): the openssh-key-v1 cipher/KDF half of `fromOpenSSH` (bcrypt rounds cap, aes256-ctr/-cbc),

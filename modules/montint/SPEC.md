@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-03 · mutation 2026-10-03 · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-06 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MONTINT_FUZZ) · ct 2026-10-06 (ctgrind)
 
 **Performance:** not measured
 
@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; **re-surveyed 2026-10-05** after `
 | [FiloSottile/bigmod](https://github.com/FiloSottile/bigmod) (`filippo.io/bigmod`, the exported Go `crypto/internal/bigmod`) | Go | BSD-3-Clause (LICENSE text verified) | 16 | v0.1.0 (2025-05-08, pkg.go.dev, verified) | The Go standard library's RSA/ECDSA backend, exported; README warns the API is not stable. `Nat`/`Modulus` with `Add`/`Sub`/`Mul`/`Mod`, constant-time `Exp`, `ExpShortVarTime`, `Equal`/`IsZero`/`IsOne`/`IsMinusOne`/`IsOdd`, `NewModulusProduct` — but `InverseVarTime` and `GCDVarTime` are **variable-time** (pkg.go.dev function list, verified). No square root, no primality (Go's `crypto/rsa` key generation does that around it *(inferred)*). |
 | [rust-num/num-bigint](https://github.com/rust-num/num-bigint) | Rust | MIT OR Apache-2.0 (`LICENSE-MIT` verified) | 613 | 0.5.1 (crates.io, verified) | What a Rust user reaches for first: general heap bignums with `modpow`, `modinv`, `sqrt`, gcd (`num-integer`). The README says nothing about constant time (verified), so not a secret-key backend — listed because it is the general-purpose alternative a user compares against, not as competition on this module's contract. |
 
-**Where we are ahead:** of `std.crypto.ff`, ~17× at 2048-bit modmul and 5–7× at modexp on amd64 (module's own bench) with full 2^64 limbs and a `MULX/ADCX/ADOX` core, and constant-time where ff is not; ctgrind-measured constant-time on every type (`scripts/checks/ctgrind.sh montint`: `small`/`portable`/`asmcore`/`field`/`dyn`). Of `filippo.io/bigmod`: **constant-time** inversion, gcd and lcm (bigmod's are `VarTime`), and constant-time Miller-Rabin along a prime's path. **Where we are even:** with crypto-bigint and bigmod on the main use case — CT modmul/modexp over a run-time odd modulus (`DynModint`), a variable-time public-exponent power (`powPublic`), a comptime prime field (`Field`), `eql`/`isZero`, exact division, CT inversion (also of the modulus mod an even `n`), gcd/lcm, and Miller-Rabin key-generation primitives; four in-repo consumers (`rsa`, `paillier`, `threshold_ecdsa`, `vdf`) run every secret operation on it. **Where we are behind (→ Backlog; none on the modmul/modexp/keygen path):** square roots mod a prime (crypto-bigint, OpenSSL), a Baillie-PSW/Lucas test (Miller-Rabin only), element `compare`/`isOdd` on `DynModint`/`Modint` (bigmod has `IsOdd`, ff has `compare`), inversion speed for a per-message path (one step at a time, ~one modexp; crypto-bigint batches 62 steps; `rsa`'s per-op blinding inverse still runs on a variable-time `std.math.big` routine, a CT one at this speed would make a 2048-bit CRT sign several times slower *(inferred from the module's own timings)*), and aarch64 runs only the portable path. (Closed since the 2026-09-30 survey: `powPublic`, wide `reduce`, `eql`/`isZero`, run-time-sized moduli — `DynModint`, 2026-10-02; CT inversion, `nt` gcd/lcm/`divExact`, Miller-Rabin — 2026-10-03; the 2026-10-03 review's five LOW hardening items — 2026-10-06.)
+**Where we are ahead:** of `std.crypto.ff`, ~17× at 2048-bit modmul and 5–7× at modexp on amd64 (module's own bench) with full 2^64 limbs and a `MULX/ADCX/ADOX` core, and constant-time where ff is not; ctgrind-measured constant-time on every type (`scripts/checks/ctgrind.sh montint`: `small`/`portable`/`asmcore`/`field`/`dyn`). Of `filippo.io/bigmod`: **constant-time** inversion, gcd and lcm (bigmod's are `VarTime`), and constant-time Miller-Rabin along a prime's path. **Where we are even:** with crypto-bigint and bigmod on the main use case — CT modmul/modexp over a run-time odd modulus (`DynModint`), a variable-time public-exponent power (`powPublic`), a comptime prime field (`Field`), `eql`/`isZero`, exact division, CT inversion (also of the modulus mod an even `n`), gcd/lcm, and Miller-Rabin key-generation primitives; four in-repo consumers (`rsa`, `paillier`, `threshold_ecdsa`, `vdf`) run every secret operation on it. **Where we are behind (→ Backlog; none on the modmul/modexp/keygen path):** square roots mod a prime (crypto-bigint, OpenSSL), a Baillie-PSW/Lucas test (Miller-Rabin only), element `compare`/`isOdd` on `DynModint`/`Modint` (bigmod has `IsOdd`, ff has `compare`), inversion speed for a per-message path (one step at a time, ~one modexp; crypto-bigint batches 62 steps; `rsa`'s per-op blinding inverse moved to its own batched CT safegcd on 2026-10-10), and aarch64 runs only the portable path. (Closed since the 2026-09-30 survey: `powPublic`, wide `reduce`, `eql`/`isZero`, run-time-sized moduli — `DynModint`, 2026-10-02; CT inversion, `nt` gcd/lcm/`divExact`, Miller-Rabin — 2026-10-03; the 2026-10-03 review's five LOW hardening items — 2026-10-06.)
 
 **Verdict (2026-10-05): core.** The main use cases of a constant-time Montgomery library over arbitrary odd moduli — RSA/Paillier/DH-style modexp with secret exponents, public-exponent verify, key setup (inverses of `e` mod `λ`, `lcm`, prime search) and VDF squaring — are all covered, tested against `std.math.big.int`/CPython oracles and measured under ctgrind, and in production use by four sibling modules. The remaining gaps are off that path (square roots matter for point decompression and Rabin-style schemes, BPSW strengthens a Miller-Rabin test FIPS 186-5 already accepts *(inferred)*), cosmetic (`compare`/`isOdd`), or speed (per-message inversion, aarch64). Not `parity`: crypto-bigint and OpenSSL still have square roots, faster inversion and a stronger primality test that a user of either would notice missing.
 
@@ -289,10 +289,10 @@ names `montint.zig`, `limbs.zig` or `asm_core.zig`):
 | `small` | `Modint(256)`, L=4 | portable CIOS (both cutoffs missed) | yes | **yes** | 8 | **0** ✅ *(was 7)* | 99 |
 | `small` | | | yes | no | 0 | 0 | 0 *(control)* |
 | `small` | | | **no** | yes | 0 | 0 | 0 *(trap)* |
-| `portable` | `Modint(1024)`, L=16 | portable CIOS + `montSqrCios` | yes | **yes** | 4 | **0** ✅ *(was 5)* | 99 |
+| `portable` | `Modint(512)`, L=8 *(L=16 until 2026-10-10)* | portable CIOS + `montSqrCios` | yes | **yes** | 4 | **0** ✅ *(was 5)* | 99 |
 | `portable` | | | yes | no | 0 | 0 | 0 *(control)* |
 | `portable` | | | **no** | yes | 0 | 0 | 0 *(trap)* |
-| `asmcore` | `Modint(2048)`, L=32 | `asm_core.montMul`/`montSqr` | yes | **yes** | 4 | **0** ✅ *(was 0)* | 99 |
+| `asmcore` | `Modint(2048)`, L=32 | `asm_core.montMulFixed`/`montSqrFixed` *(runtime-`n` `montMul`/`montSqr` until 2026-10-10)* | yes | **yes** | 4 | **0** ✅ *(was 0)* | 99 |
 | `asmcore` | | | yes | no | 0 | 0 | 0 *(control)* |
 | `asmcore` | | | **no** | yes | 0 | 0 | 0 *(trap)* |
 
@@ -583,6 +583,32 @@ the large RSA/Paillier/VDF moduli where it robustly wins. The asm core remains
 correct at every `L` (the differential exercises `n ∈ {1,2,3,4,5,8,16,17,32,33,64}`
 incl. leading-zero-limb moduli and squaring aliasing) — the cutoff is purely a
 speed dispatch, not a correctness bound.
+
+### Fixed-`L` kernels (2026-10-10) — what `L >= 16` dispatches to now
+
+`Modint` knows `L` at comptime, so `asm_core.montMulFixed(L, …)` and
+`asm_core.montSqrFixed(L, …)` spell every row out at comptime (one
+`mulx / adcx mem / adox / mov` per limb product, CF for the accumulator words,
+OF for the previous high half) and keep only the public outer loop in asm. The
+runtime-`n` core above (`montMul`/`montSqr`/`mulRow`) carried loop and
+OF/CF-fold bookkeeping that lost to the portable CIOS below 2048 bits; the
+fixed kernels do not. Dispatch (`montint.fixed_min_limbs = 16`):
+`montMul` → `montMulFixed` at `L >= 16`; `montSqr` → `montSqrFixed` (SOS:
+`L(L−1)/2` unrolled cross products, one doubling+diagonal pass, `L` REDC rows
+in an asm loop) at `16 <= L <= asm_core.sqr_fixed_max_limbs` (32, a code-size
+bound: the cross phase is ~2·L² instructions), `montMulFixed(a, a)` above it.
+Below 16 limbs nothing changed (bn254/bls12_381 Fp, 512-bit). Measured, TSC
+cycles per op on the bench host (previous best path → fixed): mul L=16 1273 →
+~930, L=24 3032 → ~1900, L=32 4064 → ~3200; square L=16 → ~850, L=24 → ~1750,
+L=32 → ~2900. Effect on `rsa` (`bench-rsa`): private op 1.9–2.4× → ~1.3–1.5×
+OpenSSL 3.5.5. Differential: `kat_test.zig` "fixed-L asm kernels (mul, sqr) ==
+portable CIOS" at L = 2, 8, 16, 24, 32, 48, 64 with short-top-limb moduli and
+the `0`/`1`/`m−1` operands. ctgrind: `asmcore` (L=32) measures them (0
+in-file); the `portable` target moved to `Modint(512)` to keep measuring the
+portable bodies; L=16 is reached through `dyn`. The asm text is generated with a
+linear comptime buffer (`AsmText`), not `++` (quadratic: it doubled the test
+build with the square kernel). The runtime-`n` core stays compiled, benched and
+differentially tested, but no `Modint` reaches it any more.
 
 ## Threats / caveats
 

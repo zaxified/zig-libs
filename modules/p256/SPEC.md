@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, P256_FUZZ) · ct 2026-09-28 (ctgrind)
 
-**Performance:** ref 1.53–3.31× OpenSSL 3.5.5 · fastest ? (measured 2026-10-10)
+**Performance:** ref 1.20–1.92× OpenSSL 3.5.5 · fastest ? (measured 2026-10-10)
 
 **Known defects:** none recorded
 
@@ -63,6 +63,24 @@ gated-core split, the portable-oracle/asm-differential harness, the
 called out below.
 
 ## Field representation — four full 2^64 limbs
+
+> **Since 2026-10-10 `Fe` is MONTGOMERY-domain** (`limbs = a·2^256 mod p`,
+> canonical). `mul`/`sq` are a MULX/ADX product followed by a Montgomery REDC
+> (`fast_core.montMul`/`montSq`, ~68 TSC cycles against 131 for the word-shuffle
+> Solinas multiply below): for this prime `−p⁻¹ ≡ 1 (mod 2^64)`, so each of
+> the four rounds' quotient digit is the low limb itself and `m·p` is two shifts
+> plus one 64×64 multiply. The portable path is `field.montMulPortable`
+> (`montReducePortable`, the `(p+1)/2^64` shortcut, comptime-evaluable — the
+> comb table is built through it); `oracle_test.zig` pins asm and portable to a
+> naive textbook REDC. `fromBytes`/`fromInt` convert in (`·R²`, or `(x≪256) mod p`
+> at comptime), `toBytes`/`toInt`/`isOdd` convert out with a scalar four-round
+> REDC (`fromMontLimbs`, register-only: the pointer-based asm call left an ECDH
+> shared `x` on the caller's dead stack — stack probe, 2026-10-10), `invert`
+> multiplies safegcd's `(aR)⁻¹` by `R³`. `add`/`sub`/`neg`/`cMov`/`isZero`/
+> `equivalent` are domain-agnostic and unchanged. `Fe.limbs` is still a public
+> field; no consumer reads it. Everything below about the NORMAL-domain Solinas
+> reduction still describes `field.mulPortable`/`fast_core.fieldMul`, which are
+> kept with their differentials but no longer reached by `Fe`.
 
 `Fe` stores the base-field value as **four full 2^64 little-endian limbs**
 (`[4]u64`), always canonical (`< p`) between operations, **NORMAL domain** (not
@@ -294,11 +312,33 @@ uses) vs `SHA256` + `EVP_PKEY_verify`; `verify_std` = the std-shaped
 A first run (3 rounds, heavier load, spreads up to 72 %) gave the same picture: 1.47–3.19×,
 `ecdh` worst.
 
-**Reading.** Every row is behind; the card's worst is `ecdh` at 3.3× — the constant-time
-variable-base `mul` (~170 µs against nistz256's ~51 µs) — so P4. Signing (1.5×) and keygen
-(2.2×) pay for the base-point multiply through the CT windowed core rather than a large
-precomputed table; verification (1.9×) is the interleaved wNAF double-base plus a Fermat
-inversion. Levers in Backlog.
+**Reading (first measurement).** Every row was behind; the worst was `ecdh` at 3.3× — the
+constant-time variable-base `mul` (~170 µs against nistz256's ~51 µs) — so P4.
+
+### After the 2026-10-10 performance pass (the card's numbers)
+
+Two levers, both measured: (1) **Montgomery-domain field** (`Fe` stores `a·2^256 mod p`; the
+MULX/ADX multiply with a 4-round REDC — this prime's `−p⁻¹ ≡ 1 (mod 2^64)` — is 68 TSC cycles
+against the word-shuffle Solinas's 131, chained), which moved every row: ecdh 3.28 → 2.05,
+keygen 2.19 → 1.63, verify 1.86 → 1.18, sign 1.54 → 1.23 (one 3-round run); (2) **`mulCtWindowed`
+at w = 5 with Jacobian doublings** around the complete RCB addition (per window: projective →
+Jacobian, five `Jac.dbl` at 3M+5S instead of 8M+3S+2m_b, back, one complete add; the identity
+mapped to the doubling fixed point `(1:1:0)` by a masked select): ecdh 2.05 → 1.59. Same method,
+`BENCH_ROUNDS=7`, two full runs (spreads ≤ 9.5 % ref, ≤ 2.6 % ours) plus two `keygen ecdh` runs:
+
+| workload | ours ns/op (run 2) | ref ns/op | ours/ref run 1 | run 2 | extra runs |
+|---|---:|---:|---:|---:|---|
+| `sign` | 27624 | 23457 | 1.228 | 1.235 | |
+| `sign_raw` | 27340 | 23214 | 1.206 | 1.202 | |
+| `verify` | 79824 | 65583 | 1.208 | 1.203 | |
+| `verify_std` | 79642 | 65795 | 1.223 | 1.208 | |
+| `ecdh` | 77656 | 48745 | 1.593 | 1.589 | 1.588, 1.628 |
+| `keygen` | 21497 | 13548 | 1.919 | 1.639 | 1.656, 1.892 |
+
+`keygen` is **bimodal** (≈ 21.3 µs or ≈ 24.7 µs per run, each run internally tight) and is the
+row closest to 2×; its profile is the comb `d·G` (~70 %) and std's HMAC-DRBG seed→scalar
+derivation in `generateDeterministic` (~25 %, SHA-256 without SHA-NI on this host), which
+OpenSSL does not pay. Not chased further here — see Backlog.
 
 ## Performance status
 
@@ -379,8 +419,19 @@ grew ~40 s → ~50 s (the comptime table build + one comptime batch inversion).
 
 ## Backlog
 
-**Performance levers (bench 2026-10-10, P4 → P3 needs every row ≤ 2×, → P2 ≤ 1.1×; none
-measured yet, proposals):**
+**Performance levers (bench 2026-10-10).** ✅ Done the same day: Montgomery-domain field
+(item 8 below) and `mulCtWindowed` w = 5 with Jacobian doublings — every row now 1.2–1.9×
+(SPEC "After the 2026-10-10 performance pass"). Still open, by expected payoff:
+- **`keygen` (1.64–1.92×, bimodal):** (a) a CT Jacobian mixed addition in the comb for
+  windows 0..41 (madd 7M+4S vs RCB-mixed 11M+2m_b; `acc = ±Q` is impossible there because
+  `|Σ_{j<i} d_j·2^{6j}| < 2^{6i} ≤ |d_i·2^{6i}| < n/2`, the identity is a masked select, the
+  top window stays complete) — est. −3 µs on keygen and sign; (b) `generate` drawing the scalar
+  directly instead of std's HMAC-DRBG over a random seed (−5 µs) — needs a constant-time
+  canonicality check of the candidate, which is why it was not done in passing.
+- **`ecdh` (1.59×):** what is left is field add/sub overhead (~10 per Jacobian doubling,
+  u256 + `blackBox`) and the per-window conversions; an asm add/sub would help every row.
+
+Original proposals (2026-10-10, before the pass):
 - **`ecdh` 3.3× — the CT variable-base `mul`.** nistz256 does a signed 5-bit Booth window (16
   precomputed multiples, CT gather), ~51 doublings-and-adds, entirely in the MULX/ADX field.
   Check that `mul`'s gated windowed core runs on `fast_core`'s asm field throughout (not the
@@ -401,7 +452,8 @@ measured yet, proposals):**
 2. ~~`group.combMulBaseFast`~~ — **DONE (Fable core phase)**: fixed-base comb
    (comptime projective table, signed-digit, `blackBox`-guarded CT gather).
 3. ~~`group.mulCtWindowed`~~ — **DONE (Fable core phase)**: CT windowed
-   variable-base (w = 4 signed digits, runtime magnitude table, same CT gather).
+   variable-base (w = 4 signed digits, runtime magnitude table, same CT gather);
+   w = 5 with Jacobian doublings since 2026-10-10.
 4. ~~wNAF `slide` acceleration for `mulPublic` / `mulDoubleBasePublic`~~ —
    **DONE (owner-verify phase)**: interleaved width-5 wNAF (Straus–Shamir),
    one shared doubling chain + an odd-multiple table per base. Vartime/public
@@ -426,7 +478,8 @@ measured yet, proposals):**
    comb + std's five scalar canonicality compares + one more of the same class
    in `Scalar.invert`'s re-encoding + `isZero` on `r`/`s`), controls/traps 0,
    `--check` OK.
-8. **Montgomery-domain field core** — measured headroom, not done: `Fe.mul`
+8. ✅ **DONE 2026-10-10** (`fast_core.montMul`/`montSq`, measured 131 → 68 TSC cycles per
+   multiply; every bench row moved 1.25–1.6×). Original note: **Montgomery-domain field core** — measured headroom, not done: `Fe.mul`
    33 ns / `Fe.sq` 30 ns are bounded by the ~130-instruction word-shuffle
    reduce (the MULX product is ~50). nistz256's interleaved Montgomery reduce
    exploits `p₀⁻¹ ≡ 1 (mod 2^64)` and `p`'s shape at ~8 instructions per round;

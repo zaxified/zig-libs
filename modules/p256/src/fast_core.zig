@@ -533,3 +533,163 @@ fn fieldSqAmd64(z: *[4]u64, a: *const [4]u64) void {
           [ap] "{rsi}" (a),
         : .{ .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .cc = true, .memory = true });
 }
+
+// ── Montgomery reduce tail (R = 2^256) — what `field.Fe` runs on since 2026-10-10 ──
+//
+// Consumes the same state as `shuffle_reduce`: the 512-bit product t0..t7 in
+// r8..r15, rdi = z. Computes `REDC(t) = t·2^−256 mod p`, canonical, bit-exact
+// with `field.montReducePortable` (pinned by the gated differential in
+// `oracle_test.zig`).
+//
+// REDC of the LOW half only, then the high half added once: `t = H·2^256 + L`
+// gives `t·R⁻¹ ≡ H + REDC(L)`, `H < p` (because `t < p²`) and `REDC(L) ≤ p`,
+// so the sum is `< 2p` and one masked conditional subtract canonicalises it.
+// `REDC(L)` is four rounds on a rotating 4-limb window (a0..a3): `p ≡ −1 (mod
+// 2^64)` makes the quotient digit `m = a0` itself and kills limb 0 exactly
+// (`a0 + m·p0 = m·2^64`, the carry of which is folded below as the `+m` term).
+// What remains of `m·p + m` is `m·2^96` (two shifts: `m<<32` into a1, `m>>32`
+// into a2) and `m·p3·2^192` (`p3 = 2^64 − 2^32 + 1`: ONE `MULX`, lo into a3,
+// hi = the new top limb). One add/adc chain per round; the hi limb absorbs
+// the final carry without wrapping (`hi(m·p3) ≤ 2^64 − 2^32`), and the window
+// value stays `< 2^192 + p < 2^256`, so nothing is ever dropped.
+//
+// Constant-time: straight-line, no branch, no secret-indexed address, only
+// DIT-set instructions; the final select is the same `sbb` mask + XOR-blend as
+// the Solinas tail. Clobbers rax, rbx, rcx, rdx, rsi, r8..r15, flags.
+const mont_reduce =
+    \\ movabsq $0xFFFFFFFF00000001, %%rsi
+    // round 0: m = r8; (r8,r9,r10,r11) -> (r9,r10,r11,r8)
+    \\ movq %%r8, %%rdx
+    \\ mulxq %%rsi, %%rbx, %%rcx
+    \\ movq %%r8, %%rax
+    \\ shlq $32, %%rax
+    \\ shrq $32, %%r8
+    \\ addq %%rax, %%r9
+    \\ adcq %%r8, %%r10
+    \\ adcq %%rbx, %%r11
+    \\ adcq $0, %%rcx
+    \\ movq %%rcx, %%r8
+    // round 1: m = r9; (r9,r10,r11,r8) -> (r10,r11,r8,r9)
+    \\ movq %%r9, %%rdx
+    \\ mulxq %%rsi, %%rbx, %%rcx
+    \\ movq %%r9, %%rax
+    \\ shlq $32, %%rax
+    \\ shrq $32, %%r9
+    \\ addq %%rax, %%r10
+    \\ adcq %%r9, %%r11
+    \\ adcq %%rbx, %%r8
+    \\ adcq $0, %%rcx
+    \\ movq %%rcx, %%r9
+    // round 2: m = r10; (r10,r11,r8,r9) -> (r11,r8,r9,r10)
+    \\ movq %%r10, %%rdx
+    \\ mulxq %%rsi, %%rbx, %%rcx
+    \\ movq %%r10, %%rax
+    \\ shlq $32, %%rax
+    \\ shrq $32, %%r10
+    \\ addq %%rax, %%r11
+    \\ adcq %%r10, %%r8
+    \\ adcq %%rbx, %%r9
+    \\ adcq $0, %%rcx
+    \\ movq %%rcx, %%r10
+    // round 3: m = r11; (r11,r8,r9,r10) -> (r8,r9,r10,r11)
+    \\ movq %%r11, %%rdx
+    \\ mulxq %%rsi, %%rbx, %%rcx
+    \\ movq %%r11, %%rax
+    \\ shlq $32, %%rax
+    \\ shrq $32, %%r11
+    \\ addq %%rax, %%r8
+    \\ adcq %%r11, %%r9
+    \\ adcq %%rbx, %%r10
+    \\ adcq $0, %%rcx
+    \\ movq %%rcx, %%r11
+    // + high half
+    \\ xorl %%eax, %%eax
+    \\ addq %%r12, %%r8
+    \\ adcq %%r13, %%r9
+    \\ adcq %%r14, %%r10
+    \\ adcq %%r15, %%r11
+    \\ adcq $0, %%rax
+    // diff = acc - p
+    \\ movl $4294967295, %%ecx
+    \\ movq %%r8, %%r12
+    \\ subq $-1, %%r12
+    \\ movq %%r9, %%r13
+    \\ sbbq %%rcx, %%r13
+    \\ movq %%r10, %%r14
+    \\ sbbq $0, %%r14
+    \\ movq %%r11, %%r15
+    \\ sbbq %%rsi, %%r15
+    \\ sbbq $0, %%rax
+    \\ xorq %%r12, %%r8
+    \\ andq %%rax, %%r8
+    \\ xorq %%r12, %%r8
+    \\ xorq %%r13, %%r9
+    \\ andq %%rax, %%r9
+    \\ xorq %%r13, %%r9
+    \\ xorq %%r14, %%r10
+    \\ andq %%rax, %%r10
+    \\ xorq %%r14, %%r10
+    \\ xorq %%r15, %%r11
+    \\ andq %%rax, %%r11
+    \\ xorq %%r15, %%r11
+    \\ movq %%r8, (%%rdi)
+    \\ movq %%r9, 8(%%rdi)
+    \\ movq %%r10, 16(%%rdi)
+    \\ movq %%r11, 24(%%rdi)
+;
+
+/// `z = a·b·2^−256 mod p` (Montgomery multiply) over four full 2^64 limbs, all
+/// canonical (`< p`). Same calling contract as `fieldMul`. Dispatched by
+/// `field.Fe.mul` iff `supported and gate.field_asm_implemented`.
+pub fn montMul(z: *[4]u64, a: *const [4]u64, b: *const [4]u64) void {
+    if (comptime supported) {
+        montMulAmd64(z, a, b);
+    } else {
+        unreachable;
+    }
+}
+
+/// `z = a²·2^−256 mod p` (Montgomery square): the dedicated square product +
+/// the Montgomery tail. Dispatched by `field.Fe.sq` like `montMul`.
+pub fn montSq(z: *[4]u64, a: *const [4]u64) void {
+    if (comptime supported) {
+        montSqAmd64(z, a);
+    } else {
+        unreachable;
+    }
+}
+
+fn montMulAmd64(z: *[4]u64, a: *const [4]u64, b: *const [4]u64) void {
+    var d0: u64 = undefined;
+    var d1: u64 = undefined;
+    var d2: u64 = undefined;
+    var d3: u64 = undefined;
+    var d4: u64 = undefined;
+    asm volatile (mul_product ++ "\n" ++ mont_reduce
+        : [d0] "={rax}" (d0),
+          [d1] "={rcx}" (d1),
+          [d2] "={rdx}" (d2),
+          [d3] "={rsi}" (d3),
+          [d4] "={rbx}" (d4),
+        : [zp] "{rdi}" (z),
+          [ap] "{rsi}" (a),
+          [bp] "{rbx}" (b),
+        : .{ .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .cc = true, .memory = true });
+}
+
+fn montSqAmd64(z: *[4]u64, a: *const [4]u64) void {
+    var d0: u64 = undefined;
+    var d1: u64 = undefined;
+    var d2: u64 = undefined;
+    var d3: u64 = undefined;
+    var d4: u64 = undefined;
+    asm volatile (sq_product ++ "\n" ++ mont_reduce
+        : [d0] "={rax}" (d0),
+          [d1] "={rcx}" (d1),
+          [d2] "={rdx}" (d2),
+          [d3] "={rsi}" (d3),
+          [d4] "={rbx}" (d4),
+        : [zp] "{rdi}" (z),
+          [ap] "{rsi}" (a),
+        : .{ .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .cc = true, .memory = true });
+}

@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** deterministic fuzz driver (`MONTINT_FUZZ`, `src/fuzz_test.zig`) with `std.math.big` as a differential oracle: the byte loaders (`fromBytesBE`, `elementFromBytesBE`, `elemFromBytesBE`, `loadBE`) give the exact accept / `EvenModulus` / `ModulusTooSmall` / `NonCanonical` / `Overflow` verdict big integers predict, and `Modint(256)` / `DynModint(2048)` add, sub, neg, mul, sq, pow, powPublic, inverse and `reduceBytesBE` match big-integer results (the dispatching Montgomery multiply and square also match the portable CIOS ones). 200,000 runs per harness clean in ReleaseSafe.
+
+- **2026-10-10** — perf: fixed-`L` MULX/ADX kernels `asm_core.montMulFixed`/`montSqrFixed` (rows unrolled at comptime, outer loop in asm, laundered `condSubFixed`), dispatched by `Modint.montMul`/`montSqr` at `L >= fixed_min_limbs` (16; the square up to `sqr_fixed_max_limbs` = 32). 1.2–1.7× faster per op at L = 16..64; nothing below 1024 bits changes. Differential vs the portable CIOS at L = 2..64; ctgrind `asmcore` 0 in-file, `portable` target moved to `Modint(512)` (output re-pinned). No API change (new `pub` consts `fixed_min_limbs`, `asm_core.sqr_fixed_max_limbs`).
 - **2026-10-06** — **BREAKING: `nt.divExact` returns
   `error{NotDivisible}![n]u64`** (was `[n]u64`, garbage for a zero or
   non-dividing divisor): the quotient is checked as `q·b = a` over the full

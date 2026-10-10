@@ -144,6 +144,86 @@ test "GATED differential: fast_core.fieldMul/fieldSq == portable Solinas" {
     }
 }
 
+// The Montgomery field (what `Fe.mul`/`Fe.sq` run since 2026-10-10): the asm
+// core vs the portable REDC, and BOTH vs a third, naive REDC written here from
+// the textbook definition (`m = t mod 2^64`, `t = (t + m·p)/2^64`, four times,
+// one subtract) — the portable REDC uses the `(p+1)/2^64` shortcut, so the two
+// oracles do not share a derivation. Random draws plus the operand edges a
+// carry-chain bug hits first.
+fn redcNaive(t0: u512) [4]u64 {
+    const p: u512 = field.field_order;
+    var t = t0;
+    inline for (0..4) |_| {
+        const m: u512 = t & 0xFFFF_FFFF_FFFF_FFFF;
+        t = (t + m * p) >> 64;
+    }
+    if (t >= p) t -= p;
+    const v: u256 = @intCast(t);
+    return .{ @truncate(v), @truncate(v >> 64), @truncate(v >> 128), @truncate(v >> 192) };
+}
+
+fn limbsOf(v: u256) [4]u64 {
+    return .{ @truncate(v), @truncate(v >> 64), @truncate(v >> 128), @truncate(v >> 192) };
+}
+
+fn u256Of(l: [4]u64) u256 {
+    return @as(u256, l[0]) | (@as(u256, l[1]) << 64) | (@as(u256, l[2]) << 128) | (@as(u256, l[3]) << 192);
+}
+
+test "GATED differential: fast_core.montMul/montSq == portable REDC == naive REDC" {
+    const p = field.field_order;
+    const edges = [_]u256{
+        0,             1,              2,             p - 1,          p - 2,
+        p >> 1,        (p >> 1) + 1,   (1 << 64) - 1, 1 << 64,        (1 << 96) - 1,
+        1 << 192,      (1 << 224) - 1, (1 << 255),    (1 << 255) - 1, 0xFFFFFFFF00000000FFFFFFFF00000000FFFFFFFF00000000FFFFFFFF00000000 % p,
+        p - (1 << 64),
+    };
+    const asm_on = gate.field_asm_implemented and fast_core.supported;
+    var prng = std.Random.DefaultPrng.init(0x3A0E_7256);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 20_000 + edges.len * edges.len) : (i += 1) {
+        const av: u256, const bv: u256 = if (i < edges.len * edges.len)
+            .{ edges[i % edges.len], edges[i / edges.len] }
+        else
+            .{ rand.int(u256) % p, rand.int(u256) % p };
+        const a = limbsOf(av);
+        const b = limbsOf(bv);
+        const want_mul = redcNaive(@as(u512, av) * bv);
+        const want_sq = redcNaive(@as(u512, av) * av);
+        try std.testing.expectEqualSlices(u64, &want_mul, &field.montMulPortable(a, b));
+        try std.testing.expectEqualSlices(u64, &want_sq, &field.montSqPortable(a));
+        if (asm_on) {
+            var got: [4]u64 = undefined;
+            fast_core.montMul(&got, &a, &b);
+            try std.testing.expectEqualSlices(u64, &want_mul, &got);
+            fast_core.montSq(&got, &a);
+            try std.testing.expectEqualSlices(u64, &want_sq, &got);
+        }
+    }
+    // The representation itself: `Fe` stores `x·2^256 mod p`.
+    const x: u256 = 0x1234_5678_9ABC_DEF0_0FED_CBA9_8765_4321_1122_3344_5566_7788_99AA_BBCC_DDEE_FF00 % p;
+    var xb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &xb, x, .big);
+    const fe = try field.Fe.fromBytes(xb, .big);
+    try std.testing.expectEqual(@as(u256, @truncate((@as(u512, x) << 256) % p)), u256Of(fe.limbs));
+    try std.testing.expectEqual(x, fe.toInt());
+    // `toInt`/`toBytes` use a scalar REDC (`fromMontLimbs`), not the asm core:
+    // pin it to the naive REDC on the edges and random limbs.
+    for (edges) |ev| {
+        const e = field.Fe{ .limbs = limbsOf(ev) };
+        try std.testing.expectEqual(u256Of(redcNaive(ev)), e.toInt());
+        var eb: [32]u8 = undefined;
+        std.mem.writeInt(u256, &eb, u256Of(redcNaive(ev)), .little);
+        try std.testing.expectEqualSlices(u8, &eb, &e.toBytes(.little));
+    }
+    for (0..2000) |_| {
+        const v = rand.int(u256) % p;
+        try std.testing.expectEqual(u256Of(redcNaive(v)), (field.Fe{ .limbs = limbsOf(v) }).toInt());
+    }
+    try std.testing.expectEqual(@as(u256, @truncate((@as(u512, 1) << 256) % p)), u256Of(field.Fe.one.limbs));
+}
+
 // Debug: this is the single heaviest test in the module -- each draw calls
 // std's unoptimized Debug `basePoint.mul` (plain double-and-add, no comb
 // table there) on top of the module's own comb + portable-ladder paths.
@@ -228,6 +308,38 @@ test "GATED differential: group.mulCtWindowed == portable CT ladder" {
         const want = p.mulDoubleAddCt(sb, .big) catch continue;
         const got = P256.mulCtWindowed(p, sb, .big) catch continue;
         try std.testing.expect(want.equivalent(got));
+    }
+}
+
+// The recoding/identity edges of the w = 5 Jacobian-doubling core (2026-10-10):
+// leading zero windows (the accumulator sits in the identity across several
+// projective↔Jacobian conversions), every-digit-negative patterns (the carry
+// ripples through all 52 windows), the top window's carry-in, and the scalars
+// that reduce to the identity. Outcome (point or `IdentityElement`) must match
+// the ladder exactly.
+test "GATED differential: mulCtWindowed edge scalars == portable CT ladder" {
+    if (!gate.fast_scalarmul_implemented) return error.SkipZigTest;
+    const n: u256 = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551;
+    const edges = [_]u256{
+        0,                     1,                          2,                                                                  3,                                                                  15,
+        16,                    17,                         31,                                                                 32,                                                                 33,
+        1 << 5,                (1 << 10) - 1,              1 << 250,                                                           (1 << 255),                                                         (1 << 255) - 1,
+        (1 << 255) + 16,       n - 1,                      n - 2,                                                              n,                                                                  n + 1,
+        std.math.maxInt(u256), std.math.maxInt(u256) - 16, 0x8421084210842108421084210842108421084210842108421084210842108421, 0xF7BDEF7BDEF7BDEF7BDEF7BDEF7BDEF7BDEF7BDEF7BDEF7BDEF7BDEF7BDEF7BD, 0x1084210842108421084210842108421084210842108421084210842108421084,
+    };
+    const bases = [_]P256{ P256.basePoint.dbl(), P256.basePoint.dbl().add(P256.basePoint) };
+    for (bases) |p| {
+        for (edges) |e| {
+            var sb: [32]u8 = undefined;
+            std.mem.writeInt(u256, &sb, e, .big);
+            const want = p.mulDoubleAddCt(sb, .big);
+            const got = P256.mulCtWindowed(p, sb, .big);
+            if (want) |w| {
+                try std.testing.expect(w.equivalent(try got));
+            } else |err| {
+                try std.testing.expectError(err, got);
+            }
+        }
     }
 }
 
