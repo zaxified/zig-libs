@@ -116,8 +116,9 @@ pub const KeyScheduleError = error{
     /// `mode` is `.base`/`.auth` but a non-empty `psk`/`psk_id` was
     /// supplied (RFC 9180 §5.1 "VerifyPSKInputs").
     InconsistentPsk,
-    /// A psk-bearing mode was given a PSK shorter than `Nh` (32 bytes for
-    /// HKDF-SHA256, the only KDF this module instantiates). RFC 9180
+    /// A psk-bearing mode was given a PSK shorter than 32 bytes
+    /// (`psk_min_len`, for every KDF; until 2026-10-10 it was `Nh`, which
+    /// refused RFC 9180 A.6's own vectors at HKDF-SHA512). RFC 9180
     /// §5.1.2: "The PSK MUST have at least 32 bytes of entropy and SHOULD
     /// be of length Nh bytes or longer." A PSK shorter than 32 BYTES
     /// cannot carry 32 bytes of entropy, so a short PSK is a provable
@@ -130,6 +131,9 @@ pub const KeyScheduleError = error{
     /// only; see SPEC.md's threat model for the deviation rationale.
     PskTooShort,
 };
+
+/// RFC 9180 §5.1.2's floor: "at least 32 bytes of entropy", for every KDF.
+pub const psk_min_len: usize = 32;
 
 /// RFC 9180 §5.2: the AEAD nonce for sequence number `seq` — `base_nonce
 /// XOR I2OSP(seq, Nn)` (the sequence number is right-aligned/big-endian
@@ -280,7 +284,7 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
 /// aead_id)` — the OUTER suite id, not the KEM's):
 /// ```text
 /// VerifyPSKInputs(mode, psk, psk_id)   // KeyScheduleError.InconsistentPsk on a mismatch, see that error's doc comment
-/// // plus §5.1.2's PSK floor: a psk shorter than Nh -> KeyScheduleError.PskTooShort (NOT in the RFC's VerifyPSKInputs pseudocode; see that error's doc comment)
+/// // plus §5.1.2's PSK floor: a psk shorter than 32 bytes -> KeyScheduleError.PskTooShort (NOT in the RFC's VerifyPSKInputs pseudocode; see that error's doc comment)
 /// psk_id_hash = LabeledExtract(suite_id, "", "psk_id_hash", psk_id)
 /// info_hash   = LabeledExtract(suite_id, "", "info_hash", info)
 /// key_schedule_context = concat(I2OSP(mode, 1), psk_id_hash, info_hash)
@@ -342,7 +346,9 @@ fn keyScheduleBody(
     // caller who got the mode/PSK combination wrong still sees
     // `InconsistentPsk` (the RFC's own diagnosis) rather than a length
     // complaint about a PSK that shouldn't have been supplied at all.
-    if (got_psk and psk.len < Nh) return error.PskTooShort;
+    // 32 bytes for every KDF: the RFC's MUST. Nh is only its SHOULD, and an
+    // Nh floor refused RFC 9180's own A.6.2/A.6.4 (32-byte PSK, Nh = 64).
+    if (got_psk and psk.len < psk_min_len) return error.PskTooShort;
 
     var psk_id_hash: [Kdf.prk_length]u8 = undefined;
 
@@ -1071,7 +1077,7 @@ test "keySchedule: VerifyPSKInputs rejects every inconsistent mode/psk combinati
     try keySchedule(Aes128Gcm, 32, &ctx, .auth_psk, &suite_id, &ss, "", &test_psk, "some id");
 }
 
-test "keySchedule: RFC 9180 §5.1.2 PSK floor — a psk shorter than Nh fails closed with error.PskTooShort" {
+test "keySchedule: RFC 9180 §5.1.2 PSK floor — a psk shorter than 32 bytes fails closed with error.PskTooShort, for every Nh" {
     // "The PSK MUST have at least 32 bytes of entropy" (§5.1.2): a PSK
     // shorter than 32 BYTES cannot satisfy that, whatever its content, so
     // this module rejects it rather than deriving a key schedule from it.
@@ -1090,6 +1096,17 @@ test "keySchedule: RFC 9180 §5.1.2 PSK floor — a psk shorter than Nh fails cl
     // own Appendix A PSK vectors are exactly 32 bytes, so a stricter floor
     // would reject the spec's own test vectors.
     try keySchedule(Aes128Gcm, 32, &ctx, .psk, &suite_id, &ss, "", ([_]u8{0xcd} ** 32)[0..32], "some id");
+    // The floor is 32 bytes at Nh = 48 and 64 too (the RFC's MUST; Nh is
+    // only its SHOULD): 31 refused, 32 accepted. Before 2026-10-10 the floor
+    // was Nh, which refused RFC 9180 A.6.2/A.6.4's own 32-byte PSK.
+    const psk31 = ([_]u8{0xcd} ** 32)[0..31];
+    const psk32 = ([_]u8{0xcd} ** 32)[0..32];
+    var ctx48: Context(Aes128Gcm, 48) = undefined;
+    try testing.expectError(error.PskTooShort, keySchedule(Aes128Gcm, 48, &ctx48, .psk, &suite_id, &ss, "", psk31, "some id"));
+    try keySchedule(Aes128Gcm, 48, &ctx48, .psk, &suite_id, &ss, "", psk32, "some id");
+    var ctx64: Context(Aes128Gcm, 64) = undefined;
+    try testing.expectError(error.PskTooShort, keySchedule(Aes128Gcm, 64, &ctx64, .auth_psk, &suite_id, &ss, "", psk31, "some id"));
+    try keySchedule(Aes128Gcm, 64, &ctx64, .auth_psk, &suite_id, &ss, "", psk32, "some id");
 }
 
 test "Context.seal/.open: round trip, seq advances, tampered ct rejected WITHOUT advancing seq" {

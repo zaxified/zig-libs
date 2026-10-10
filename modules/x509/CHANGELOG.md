@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — New: ECDSA P-521 certificates and CRLs. Links (and CRLs) whose issuer key is EC secp521r1 — which std's `Parsed.verify` refuses with `CertificateSignatureNamedCurveUnsupported` — are verified through the new `p521` module (new dep): ecdsa-with-SHA224/256/384/512, std's issuer/validity/signature order and error mapping, strict-DER signatures. `safe.oid_secp521r1` added. Tests: `src/p521_test.zig` over OpenSSL-checked fixtures (`src/data/p521/`, recipe `tools/gen_p521_fixtures.py`).
 - **2026-10-10** — **Fixed (SECURITY):** `safe.validateForStdParse` (and with it `verifyChain`) let
   through a certificate that ends at `signatureAlgorithm` without its signatureValue; std's
   `Certificate.parse` then reads the missing header at the end of the caller's buffer

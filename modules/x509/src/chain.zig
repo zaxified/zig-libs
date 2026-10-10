@@ -53,6 +53,7 @@ const der = Certificate.der;
 const extensions = @import("extensions.zig");
 const algorithm = @import("algorithm.zig");
 const rsa = @import("rsa");
+const p521 = @import("p521");
 const crl = @import("crl.zig");
 const safe = @import("safe.zig");
 
@@ -540,6 +541,7 @@ fn checkIsCaSigner(cand_der: CertDer) VerifyChainError!void {
 /// (`+` time validity — RFC 5280 §6.1.3 (a)(1)/(2)/(3)). Dispatches on
 /// `subject_der`'s own `signatureAlgorithm`: RSASSA-PSS (which
 /// `std.crypto.Certificate` cannot even parse) routes to `verifyPssLink`;
+/// a P-521 issuer key routes to `verifyP521Link` (std refuses the curve);
 /// everything std supports (RSA PKCS1v15, ECDSA P-256/P-384, Ed25519)
 /// routes to `std.crypto.Certificate.Parsed.verify`. For that std path, the
 /// issuer only needs to supply its public key and subject DN — fields that
@@ -577,6 +579,14 @@ fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64) VerifyCha
         return verifyPssLink(subject_der, issuer_pub_key, now_sec);
     }
 
+    // ECDSA under a P-521 issuer key: std names the curve but its
+    // `Parsed.verify` refuses it (`CertificateSignatureNamedCurveUnsupported`),
+    // so this link is checked here, through the `p521` module.
+    {
+        const issuer_shape = try parseShape(.{ .buffer = issuer_der, .index = 0 });
+        if (isP521(issuer_shape.pub_key_algo)) return verifyP521Link(subject_shape, issuer_der, issuer_shape, now_sec);
+    }
+
     const subject_cert: Certificate = .{ .buffer = subject_der, .index = 0 };
     const subject_parsed = try subject_cert.parse();
 
@@ -587,6 +597,42 @@ fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64) VerifyCha
     };
 
     try subject_parsed.verify(issuer_parsed, now_sec);
+}
+
+fn isP521(algo: algorithm.PubKeyAlgo) bool {
+    return switch (algo) {
+        .X9_62_id_ecPublicKey => |curve| curve == .secp521r1,
+        else => false,
+    };
+}
+
+/// A link whose issuer key is ECDSA P-521, in std's `Parsed.verify` order:
+/// issuer DN, validity window, then the signature.
+fn verifyP521Link(subject_shape: Shape, issuer_der: CertDer, issuer_shape: Shape, now_sec: i64) VerifyChainError!void {
+    if (!std.mem.eql(u8, subject_shape.issuer, issuer_shape.subject)) return error.CertificateIssuerMismatch;
+    if (now_sec < @as(i64, @intCast(subject_shape.not_before))) return error.CertificateNotYetValid;
+    if (now_sec > @as(i64, @intCast(subject_shape.not_after))) return error.CertificateExpired;
+    const key = issuer_der[issuer_shape.pub_key_slice.start..issuer_shape.pub_key_slice.end];
+    return verifyP521Signature(subject_shape.sig_alg_oid, subject_shape.message, subject_shape.signature, key);
+}
+
+/// ECDSA-with-SHA224/256/384/512 under a P-521 SEC1 key, with std's error
+/// mapping (`verify_ecdsa`): a non-ECDSA signature algorithm is an algorithm
+/// mismatch, a bad key / signature encoding or a failed check is
+/// `CertificateSignatureInvalid`. The DER signature is parsed strictly
+/// (`p521.Ecdsa.Signature.fromDer`).
+fn verifyP521Signature(sig_alg_oid: []const u8, message: []const u8, signature: []const u8, sec1_key: []const u8) VerifyChainError!void {
+    const alg = Certificate.Algorithm.map.get(sig_alg_oid) orelse
+        return error.CertificateSignatureAlgorithmUnsupported;
+    switch (alg) {
+        inline .ecdsa_with_SHA224, .ecdsa_with_SHA256, .ecdsa_with_SHA384, .ecdsa_with_SHA512 => |a| {
+            const E = p521.Ecdsa(a.Hash());
+            const pk = E.PublicKey.fromSec1(sec1_key) catch return error.CertificateSignatureInvalid;
+            const sig = E.Signature.fromDer(signature) catch return error.CertificateSignatureInvalid;
+            sig.verify(message, pk) catch return error.CertificateSignatureInvalid;
+        },
+        else => return error.CertificateSignatureAlgorithmMismatch,
+    }
 }
 
 /// Verifies an ML-DSA link (RFC 9881) — the second algorithm this module
@@ -814,6 +860,12 @@ pub fn verifySignedBy(data: SignedData, issuer_der: CertDer) VerifyChainError!vo
             },
         }
         return;
+    }
+
+    if (isP521(issuer_shape.pub_key_algo)) {
+        if (!std.mem.eql(u8, data_issuer, issuer_shape.subject)) return error.CertificateIssuerMismatch;
+        const key = issuer_der[issuer_shape.pub_key_slice.start..issuer_shape.pub_key_slice.end];
+        return verifyP521Signature(data.sig_alg_oid, message, signature, key);
     }
 
     // Everything std names: a `Parsed` view of the signed object carrying

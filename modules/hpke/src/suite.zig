@@ -59,12 +59,13 @@ pub fn os2ip(bytes: []const u8) u64 {
 
 /// RFC 9180 §7.1 Table 2 — DHKEM identifiers this module names (the
 /// three std can build without a C dependency: X25519, P-256 and P-384
-/// raw ECDH; see `dhkem.zig`). Other spec-registered KEMs (P-521, X448)
-/// are simply not instantiated here — nothing in this file is
+/// raw ECDH, plus P-521 on the in-repo `p521` module; see `dhkem.zig`).
+/// X448 is simply not instantiated here — nothing in this file is
 /// X25519/P-256/P-384 specific.
 pub const KemId = enum(u16) {
     dhkem_p256_hkdf_sha256 = 0x0010,
     dhkem_p384_hkdf_sha384 = 0x0011,
+    dhkem_p521_hkdf_sha512 = 0x0012,
     dhkem_x25519_hkdf_sha256 = 0x0020,
     _,
 };

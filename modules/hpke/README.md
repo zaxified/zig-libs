@@ -29,7 +29,7 @@ internally, P-384 HKDF-SHA384, regardless of the outer `Nh`). KAT: RFC 9180
 Appendix A.4 (`DHKEM(P-256, HKDF-SHA256), HKDF-SHA512, AES-128-GCM`), see
 SPEC.md's done-record.
 
-**Three DHKEMs: X25519, P-256 and (since 2026-08-06) P-384**
+**Four DHKEMs: X25519, P-256, (since 2026-08-06) P-384 and (since 2026-10-10) P-521** — P-521 (`P521Kem`, kem_id 0x0012) on the in-repo `p521` module, anchored byte-exact to RFC 9180 A.6 in all four modes. P-384:
 (`dhkem_p384_hkdf_sha384`, kem_id 0x0011) — structurally identical to
 `P256Kem`, built directly on `std.crypto.ecc.P384` (no local
 perf-specialized sibling the way `p256` is for P-256). **RFC 9180 Appendix

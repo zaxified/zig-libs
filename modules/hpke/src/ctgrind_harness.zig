@@ -49,9 +49,11 @@
 //!   perf-specialized sibling exists for P-384 — see `dhkem.zig`'s module
 //!   doc comment).
 //!
-//! RFC 9180 also registers P-521 and X448 DHKEMs; this module implements
-//! neither (`suite.zig`'s `KemId` doc comment), so there is nothing to
-//! target for them.
+//! * `p521_decap` / `p521_authdecap` — DHKEM(P-521, HKDF-SHA512)
+//!   (2026-10-10), whose group arithmetic is this repo's `p521` module
+//!   (`ecdhInto`; its own harness pins the multiply at 0 in-file).
+//!
+//! RFC 9180 also registers an X448 DHKEM; this module does not implement it.
 //!
 //! ## Own code vs. delegate, per target — read before trusting a pattern
 //!
@@ -71,6 +73,7 @@
 //! | `x25519_*` | `dhkem.zig`, `suite.zig` | std `x25519.zig`, `curve25519.zig`, 25519's `field.zig`; std `hkdf.zig`, `hmac.zig`, `sha2.zig` (HKDF-SHA256) |
 //! | `p256_*` | `dhkem.zig`, `suite.zig` | **this repo's own** `p256` module: `group.zig`, `field.zig`, `fast_core.zig`; std `hkdf.zig`, `hmac.zig`, `sha2.zig` (HKDF-SHA256) |
 //! | `p384_*` | `dhkem.zig`, `suite.zig` | std `pcurves/p384.zig`, pcurves p384's `field.zig`, pcurves' `common.zig`; std `hkdf.zig`, `hmac.zig`, `sha2.zig` (HKDF-SHA384) |
+//! | `p521_*` | `dhkem.zig`, `suite.zig` | **this repo's own** `p521` module: `group.zig`, `field.zig`, `scalar.zig`, `ct.zig`, `burn.zig`; std `hkdf.zig`, `hmac.zig`, `sha2.zig` (HKDF-SHA512) |
 //! | `open` | `schedule.zig` | `chachapoly`'s own `root.zig`/`chacha20.zig`/`poly1305.zig` (this module's RECOMMENDED AEAD binding, re-exported as `hpke.ChaCha20Poly1305`) |
 //!
 //! `p256`'s own arithmetic is a DELEGATE here in the same sense std's is for
@@ -324,6 +327,8 @@ const Target = enum {
     p256_authdecap,
     p384_decap,
     p384_authdecap,
+    p521_decap,
+    p521_authdecap,
     open,
 };
 const Taint = enum { yes, no };
@@ -335,6 +340,8 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "p256_authdecap")) return .p256_authdecap;
     if (std.mem.eql(u8, s, "p384_decap")) return .p384_decap;
     if (std.mem.eql(u8, s, "p384_authdecap")) return .p384_authdecap;
+    if (std.mem.eql(u8, s, "p521_decap")) return .p521_decap;
+    if (std.mem.eql(u8, s, "p521_authdecap")) return .p521_authdecap;
     if (std.mem.eql(u8, s, "open")) return .open;
     return error.UnknownTarget;
 }
@@ -392,6 +399,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
             "ctgrind-hpke-p384-authdecap-recipient-ikm",
             "ctgrind-hpke-p384-authdecap-sender-ikm",
             "ctgrind-hpke-p384-authdecap-ephemeral-ikm",
+        ),
+        .p521_decap => try kemDecap(
+            dhkem.P521Kem,
+            taint,
+            "ctgrind-hpke-p521-decap-recipient-ikm",
+            "ctgrind-hpke-p521-decap-ephemeral-ikm",
+        ),
+        .p521_authdecap => try kemAuthDecap(
+            dhkem.P521Kem,
+            taint,
+            "ctgrind-hpke-p521-authdecap-recipient-ikm",
+            "ctgrind-hpke-p521-authdecap-sender-ikm",
+            "ctgrind-hpke-p521-authdecap-ephemeral-ikm",
         ),
         .open => try openTarget(taint),
     }

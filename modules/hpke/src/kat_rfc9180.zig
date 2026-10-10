@@ -25,7 +25,7 @@
 //!   OUTSIDE this module — a round-trip test cannot, because a sender and a
 //!   recipient built from the same misreading of §5.1 round-trip perfectly.
 //!
-//! Not embedded: A.4/A.6 (HKDF-SHA512, P-521 — KDF/KEM this module does not
+//! A.6 (P-521) lives in `kat_rfc9180_a6.zig` (generated). Not embedded here: A.4/A.6 (HKDF-SHA512, P-521 — KDF/KEM this module did not
 //! instantiate), A.7+ (export-only AEAD), and the mode vectors of A.2/A.5
 //! (`ChaCha20Poly1305`), whose only difference from the embedded A.1/A.3
 //! mode vectors is the `aead_id` byte inside `suite_id`, already covered by
@@ -46,7 +46,7 @@ const schedule = @import("schedule.zig");
 const testing = std.testing;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 
-fn hexTo(comptime n: usize, s: *const [n * 2]u8) [n]u8 {
+pub fn hexTo(comptime n: usize, s: *const [n * 2]u8) [n]u8 {
     @setEvalBranchQuota(10_000);
     var out: [n]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, s) catch unreachable;

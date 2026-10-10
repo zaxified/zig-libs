@@ -830,13 +830,18 @@ coconut	ReleaseFast	user_issue	1	21	a6281f1d04b2a243	af24664cb307a403
 # proveBody < run@burn.zig) except the Fr.fromBytes rejection-sampler context
 # reached from Entropy.scalar, 5 -> 4 distinct chains. No new site.
 coconut	ReleaseFast	user_show	1	26	28f8c53e98befca5	286e5ea12d924b29
-hpke	ReleaseFast	x25519_decap	1	1	0b29e6574a3e7267	c0cee0a8c6bf72c3
-hpke	ReleaseFast	x25519_authdecap	1	2	0b29e6574a3e7267	05af25d1d0e3943d
-hpke	ReleaseFast	p256_decap	1	1	0b29e6574a3e7267	851ee3406999dacc
-hpke	ReleaseFast	p256_authdecap	1	2	0b29e6574a3e7267	4b0f0c964acb8411
-hpke	ReleaseFast	p384_decap	1	2	0b29e6574a3e7267	6b70bba9cc229a39
-hpke	ReleaseFast	p384_authdecap	1	4	0b29e6574a3e7267	2741ac2ff5069767
-hpke	ReleaseFast	open	1	1	a3051d9bb2f0429f	59883c70dcd08ee6
+hpke	ReleaseFast	x25519_decap	1	1	0284b00feeb2e2fb	c0cee0a8c6bf72c3
+hpke	ReleaseFast	x25519_authdecap	1	2	0284b00feeb2e2fb	05af25d1d0e3943d
+hpke	ReleaseFast	p256_decap	1	1	0284b00feeb2e2fb	851ee3406999dacc
+hpke	ReleaseFast	p256_authdecap	1	2	0284b00feeb2e2fb	4b0f0c964acb8411
+hpke	ReleaseFast	p384_decap	1	2	0284b00feeb2e2fb	6b70bba9cc229a39
+hpke	ReleaseFast	p384_authdecap	1	4	0284b00feeb2e2fb	2741ac2ff5069767
+hpke	ReleaseFast	open	1	1	42d3ebff03e12947	59883c70dcd08ee6
+# hpke p521 (2026-10-10): DHKEM(P-521, HKDF-SHA512) decap / authDecap, skR tainted,
+# group through the `p521` module's ecdhInto: 0 in-file (p521's range/identity verdicts
+# are declassified there, see modules/p521/SPEC.md).
+hpke	ReleaseFast	p521_decap	1	0	a61e96c24833076e	f9c48b1e130f8af6
+hpke	ReleaseFast	p521_authdecap	1	0	a61e96c24833076e	f00506c9b354a23b
 signal	ReleaseFast	sign	1	1	51e4774f1e219e5c	b2a0053066d93a75
 signal	ReleaseFast	ratchet	1	2	42f801e2bd3aaa81	92ab00fad0ce5c41
 # sphinx construct 10 -> 8 (re-pin 2026-09-15): its two ECDH `k256.mul` calls

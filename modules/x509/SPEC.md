@@ -31,7 +31,28 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.crypto.Certificate` | Zig | MIT | — | Zig 0.16.0 | Parse, hostname check, one signature link at a time, `Bundle` root store; no basicConstraints/keyUsage/pathLen/nameConstraints enforcement (ziglang/zig #35877), no RSA-PSS certificates, no ML-DSA/SLH-DSA, unchecked DER reader (this module's `safe.zig` documents the out-of-bounds). |
 | [RustCrypto/formats](https://github.com/RustCrypto/formats) (`x509-cert`) | Rust | Apache-2.0 OR MIT (API field empty; source not read) | 339 | push 2026-09-28 | Certificate/CRL/CSR parse and build types; no path validation *(inferred)*. |
 
-**Where we are ahead:** of Zig `std`, a complete RFC 5280 §6 path validator (backtracking path building, pathLen with the self-issued exception, name constraints, EKU chaining), RSA-PSS certificates, and post-quantum ML-DSA (RFC 9881) and SLH-DSA chains; `safe.zig` closes the std DER out-of-bounds; chains checked against OpenSSL 3.5 for each algorithm. Post-quantum certificate chains are not something Go `crypto/x509` or rustls-webpki verify as far as the survey could tell *(inferred)*. **Where we are behind:** revocation is CRL-only (delta and indirect CRLs are refused; OCSP is the sibling `ocsp` module and not wired into the path), certificate-policy processing, rfc822Name/URI name constraints (fail closed), no certificate/CSR/CRL construction API beyond the test helper `rsa.selfSignedCert`, no own hostname matching (std's).
+**Where we are ahead:** of Zig `std`, a complete RFC 5280 §6 path validator (backtracking path building, pathLen with the self-issued exception, name constraints, EKU chaining), RSA-PSS certificates, ECDSA P-521 links and CRLs (std names the curve but refuses to verify it; since 2026-10-10 through the in-repo `p521` module), and post-quantum ML-DSA (RFC 9881) and SLH-DSA chains; `safe.zig` closes the std DER out-of-bounds; chains checked against OpenSSL 3.5 for each algorithm. Post-quantum certificate chains are not something Go `crypto/x509` or rustls-webpki verify as far as the survey could tell *(inferred)*. **Where we are behind:** revocation is CRL-only (delta and indirect CRLs are refused; OCSP is the sibling `ocsp` module and not wired into the path), certificate-policy processing, rfc822Name/URI name constraints (fail closed), no certificate/CSR/CRL construction API beyond the test helper `rsa.selfSignedCert`, no own hostname matching (std's).
+
+## ECDSA P-521 (2026-10-10)
+
+std's `Certificate` names `secp521r1` but `Parsed.verify` returns
+`CertificateSignatureNamedCurveUnsupported` for it. Every link whose ISSUER
+key is EC P-521 — in `verifyChain` (`verifyLink`) and for CRLs
+(`verifySignedBy`) — is therefore checked here, in std's order (issuer DN,
+validity, signature): the subject's `signatureAlgorithm` must be
+ecdsa-with-SHA224/256/384/512 (else `CertificateSignatureAlgorithmMismatch`),
+the key decodes with `p521.EcdsaP521Sha512.PublicKey.fromSec1` and the
+signature with the `p521` module's strict-DER `fromDer`; any failure is
+`CertificateSignatureInvalid`, as std maps its own ECDSA errors. A P-521
+*subject* under a P-256/P-384 issuer needs nothing new (std verifies with the
+issuer's key, and parses a P-521 leaf, so `VerifiedChain.leaf` is set).
+The DER guards are unchanged: every certificate still passes
+`safe.validateForStdParse` in `buildPath` before any of this runs, and the new
+path reads only `parseShape`'s bounded walk. `safe.oid_secp521r1` is added
+next to the other named-curve OIDs. Anchors: `p521_test.zig` — a P-521
+hierarchy (root SHA-512, intermediate SHA-384, leaf SHA-256), a P-256 leaf
+under the P-521 CA, a P-521 intermediate under a P-384 root, a P-521 CRL
+(revoked/good/tampered), tamper/expiry/wrong-anchor refusals.
 
 ## Design & invariants
 
@@ -368,6 +389,8 @@ sub-algorithms (`buildPath`, `checkNameConstraints`, `checkPathLength`,
 `chain_test.zig` (`zig build test-x509`, green in Debug and
 ReleaseFast), including an openssl-3.5-generated oracle chain per supported
 signature algorithm (RSA PKCS1v15, RSASSA-PSS, ECDSA P-256, ECDSA P-384,
+ECDSA P-521 (ecdsa-with-SHA256/384/512, `p521_test.zig`, fixtures from
+`tools/gen_p521_fixtures.py` with `openssl verify` agreeing on every verdict),
 Ed25519, ML-DSA-44/65/87, SLH-DSA in both hash families) and dedicated rejection-case hierarchies (expired/not-yet-valid,
 name-constraint violation, non-CA issuer, pathLenConstraint exceeded,
 self-issued not counted, tampered signature, EKU mismatch, unknown anchor).

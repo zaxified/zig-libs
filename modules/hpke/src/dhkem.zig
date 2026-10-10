@@ -45,6 +45,10 @@ const burn = @import("burn.zig");
 // random`/`scalar.rejectNonCanonical`), just not asm-accelerated.
 const P256 = @import("p256").P256;
 const P384 = std.crypto.ecc.P384;
+// P-521 (std has none): the `p521` module — constant-time `ecdhInto` for
+// every DH with a secret scalar, `mulInto` for the key derivation.
+const p521 = @import("p521");
+const HkdfSha512 = std.crypto.kdf.hkdf.HkdfSha512;
 
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 // std names no `HkdfSha384` alias (unlike `HkdfSha256`/`HkdfSha512`) — same
@@ -101,9 +105,11 @@ fn extractAndExpand(
     const kem_suite_id = comptime suite.kemSuiteId(kem_id);
     var eae_prk: [Hkdf.prk_length]u8 = undefined;
     suite.labeledExtract(Hkdf, &eae_prk, &kem_suite_id, "", "eae_prk", dh);
-    // kem_context tops out at 291 bytes (P-384 auth mode: 3 × 97-byte SEC1
-    // points) — far inside labeledExpand's 512-byte scratch, so
-    // error.LabelTooLong is structurally unreachable here.
+    // kem_context tops out at 399 bytes (P-521 auth mode: 3 × 133-byte SEC1
+    // points); with the 7-byte "HPKE-v1", the 5-byte suite id, the
+    // 13-byte label and the 2-byte length that is 426 bytes, inside
+    // labeledExpand's 512-byte scratch, so error.LabelTooLong is
+    // structurally unreachable here.
     suite.labeledExpand(Hkdf, &kem_suite_id, &eae_prk, "shared_secret", kem_context, out) catch unreachable;
 }
 
@@ -661,6 +667,157 @@ pub const P384Kem = struct {
         kem_context[Npk .. 2 * Npk].* = skR.public_key;
         kem_context[2 * Npk ..].* = pkS.*;
         extractAndExpand(HkdfSha384, kem_id, Nsecret, out, &dh, &kem_context);
+    }
+};
+
+// ── DHKEM(P-521, HKDF-SHA512) — RFC 9180 §7.1, kem_id 0x0012 ────────────
+
+/// `dhkem_p521_hkdf_sha512` (RFC 9180 §7.1 Table 2): Nsecret = 64
+/// (HKDF-SHA512's `Nh`), Nsk = 66, Npk = 133 (SEC1 uncompressed,
+/// `0x04 || X(66) || Y(66)`). The group is the in-repo `p521` module (std
+/// has no P-521): every DH runs through `p521.ecdhInto` — constant time in
+/// the scalar, peer point validated (canonical, on the curve, not the
+/// identity), result's identity refused. `DeriveKeyPair` uses the 0x01
+/// bitmask §7.1.3 gives P-521 (Nsk = 66 bytes = 528 bits, the order has
+/// 521). Anchored byte-exact to RFC 9180 A.6 (all four modes,
+/// `kat_rfc9180_a6.zig`).
+pub const P521Kem = struct {
+    pub const kem_id: u16 = @intFromEnum(suite.KemId.dhkem_p521_hkdf_sha512);
+    pub const Nsecret: usize = 64;
+    pub const Npk: usize = 133; // SEC1 uncompressed: 0x04 || X(66) || Y(66)
+    pub const Nsk: usize = 66;
+
+    pub const PublicKey = [Npk]u8;
+    pub const EncappedKey = [Npk]u8;
+
+    pub const KeyPair = struct {
+        secret_key: [Nsk]u8,
+        public_key: PublicKey,
+    };
+
+    pub const Encapped = struct {
+        shared_secret: [Nsecret]u8,
+        enc: EncappedKey,
+    };
+
+    /// RFC 9180 §4 `DeriveKeyPair(random(Nsk))` over `entropy.fill`, as the
+    /// other two NIST KEMs.
+    pub fn generateKeyPair(out: *KeyPair, io: std.Io) void {
+        var ikm: [Nsk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &ikm);
+        entropy.fill(io, &ikm);
+        deriveKeyPair(out, &ikm);
+    }
+
+    /// RFC 9180 §7.1.3 `DeriveKeyPair(ikm)` for P-521: candidates from
+    /// `LabeledExpand(dkp_prk, "candidate", I2OSP(counter, 1), 66)` with
+    /// `bitmask = 0x01` on the first byte, the first one in [1, n − 1].
+    /// KAT: A.6.1–A.6.4's ikmE/ikmR/ikmS → skXm/pkXm.
+    pub fn deriveKeyPair(out: *KeyPair, ikm: []const u8) void {
+        burn.run(burn.kem_burn, void, deriveKeyPairBody, .{ out, ikm });
+    }
+
+    fn deriveKeyPairBody(out: *KeyPair, ikm: []const u8) void {
+        const kem_suite_id = comptime suite.kemSuiteId(kem_id);
+        var dkp_prk: [HkdfSha512.prk_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &dkp_prk);
+        suite.labeledExtract(HkdfSha512, &dkp_prk, &kem_suite_id, "", "dkp_prk", ikm);
+        var counter: u16 = 0;
+        while (counter <= 255) : (counter += 1) {
+            const ctr = suite.i2osp(1, counter);
+            var candidate: [Nsk]u8 = undefined;
+            suite.labeledExpand(HkdfSha512, &kem_suite_id, &dkp_prk, "candidate", &ctr, &candidate) catch unreachable;
+            candidate[0] &= 0x01; // RFC 9180 §7.1.3 bitmask for P-521
+            // `rejectNonCanonical`'s verdict is declassified inside p521
+            // (the rejection is the spec's, and its probability is ~2^-260).
+            p521.scalar.rejectNonCanonical(candidate, .big) catch continue; // sk >= n
+            if (std.mem.allEqual(u8, &candidate, 0)) continue; // sk == 0
+            var pk_point: p521.P521 = undefined;
+            // A non-zero scalar below n times G is never the identity.
+            p521.P521.mulInto(&pk_point, p521.P521.basePoint, &candidate, .big) catch unreachable;
+            out.* = .{ .secret_key = candidate, .public_key = pk_point.toUncompressedSec1() };
+            return;
+        }
+        @panic("hpke: P-521 DeriveKeyPair exhausted 256 candidates (probability ~2^-66000; RFC 9180 7.1.3 DeriveKeyPairError)");
+    }
+
+    /// One DH: x(sk · pk) through `p521.ecdhInto`. A peer that does not
+    /// decode is `DeserializeError`; an identity result (impossible for a
+    /// valid point and sk in [1, n − 1]) is `DhFailed`.
+    fn dh(out: *[Nsk]u8, sk: *const [Nsk]u8, pk: *const PublicKey) error{ DeserializeError, DhFailed }!void {
+        p521.ecdhInto(out, sk, pk) catch |err| return switch (err) {
+            error.IdentityElement => error.DhFailed,
+            error.InvalidEncoding, error.NonCanonical, error.NotSquare => error.DeserializeError,
+        };
+    }
+
+    pub fn encapDeterministic(out: *Encapped, pkR: PublicKey, eph: *const KeyPair) EncapError!void {
+        return burn.run(burn.kem_burn, EncapError!void, encapBody, .{ out, &pkR, eph });
+    }
+
+    fn encapBody(out: *Encapped, pkR: *const PublicKey, eph: *const KeyPair) EncapError!void {
+        var z: [Nsk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &z);
+        try dh(&z, &eph.secret_key, pkR);
+        var kem_context: [2 * Npk]u8 = undefined;
+        kem_context[0..Npk].* = eph.public_key;
+        kem_context[Npk..].* = pkR.*;
+        extractAndExpand(HkdfSha512, kem_id, Nsecret, &out.shared_secret, &z, &kem_context);
+        out.enc = eph.public_key;
+    }
+
+    pub fn encap(out: *Encapped, pkR: PublicKey, io: std.Io) EncapError!void {
+        var eph: KeyPair = undefined;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+        generateKeyPair(&eph, io);
+        return encapDeterministic(out, pkR, &eph);
+    }
+
+    pub fn decap(out: *[Nsecret]u8, enc: EncappedKey, skR: *const KeyPair) DecapError!void {
+        return burn.run(burn.kem_burn, DecapError!void, decapBody, .{ out, &enc, skR });
+    }
+
+    fn decapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair) DecapError!void {
+        var z: [Nsk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &z);
+        try dh(&z, &skR.secret_key, enc);
+        var kem_context: [2 * Npk]u8 = undefined;
+        kem_context[0..Npk].* = enc.*;
+        kem_context[Npk..].* = skR.public_key;
+        extractAndExpand(HkdfSha512, kem_id, Nsecret, out, &z, &kem_context);
+    }
+
+    pub fn authEncapDeterministic(out: *Encapped, pkR: PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        return burn.run(burn.kem_burn, EncapError!void, authEncapBody, .{ out, &pkR, skS, eph });
+    }
+
+    fn authEncapBody(out: *Encapped, pkR: *const PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        var z: [2 * Nsk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &z);
+        try dh(z[0..Nsk], &eph.secret_key, pkR);
+        try dh(z[Nsk..], &skS.secret_key, pkR);
+        var kem_context: [3 * Npk]u8 = undefined;
+        kem_context[0..Npk].* = eph.public_key;
+        kem_context[Npk .. 2 * Npk].* = pkR.*;
+        kem_context[2 * Npk ..].* = skS.public_key;
+        extractAndExpand(HkdfSha512, kem_id, Nsecret, &out.shared_secret, &z, &kem_context);
+        out.enc = eph.public_key;
+    }
+
+    pub fn authDecap(out: *[Nsecret]u8, enc: EncappedKey, skR: *const KeyPair, pkS: PublicKey) DecapError!void {
+        return burn.run(burn.kem_burn, DecapError!void, authDecapBody, .{ out, &enc, skR, &pkS });
+    }
+
+    fn authDecapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair, pkS: *const PublicKey) DecapError!void {
+        var z: [2 * Nsk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &z);
+        try dh(z[0..Nsk], &skR.secret_key, enc);
+        try dh(z[Nsk..], &skR.secret_key, pkS);
+        var kem_context: [3 * Npk]u8 = undefined;
+        kem_context[0..Npk].* = enc.*;
+        kem_context[Npk .. 2 * Npk].* = skR.public_key;
+        kem_context[2 * Npk ..].* = pkS.*;
+        extractAndExpand(HkdfSha512, kem_id, Nsecret, out, &z, &kem_context);
     }
 };
 

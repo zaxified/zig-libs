@@ -10,7 +10,8 @@
 //! without ever sealing a message through it (e.g. MLS/RFC 9420's
 //! external-init and external-commit, §8.3/§12.4).
 //!
-//! Three DHKEMs: `X25519Kem`, `P256Kem` (curve group from the local
+//! Four DHKEMs: `P521Kem` (the in-repo `p521` module, RFC 9180 A.6
+//! byte-exact), `X25519Kem`, `P256Kem` (curve group from the local
 //! asm-accelerated `p256` module) and `P384Kem` (curve group from
 //! `std.crypto.ecc.P384` directly — no local perf-specialized sibling
 //! exists for P-384, see `dhkem.zig`'s module doc comment). RFC 9180
@@ -71,6 +72,8 @@ pub const Mode = suite.Mode;
 pub const X25519Kem = dhkem.X25519Kem;
 pub const P256Kem = dhkem.P256Kem;
 pub const P384Kem = dhkem.P384Kem;
+/// DHKEM(P-521, HKDF-SHA512), kem_id 0x0012 — group from the `p521` module.
+pub const P521Kem = dhkem.P521Kem;
 
 pub const Context = schedule.Context;
 pub const keySchedule = schedule.keySchedule;
@@ -149,7 +152,7 @@ pub const meta = .{
     // wire byte depends on either.
     // entropy: the `random(Nsk)` in each KEM's `generateKeyPair`, i.e. the
     // ephemeral key behind every `sealBase`/`sealPsk`/`sealAuth`/`encap`.
-    .deps = .{ "p256", "chachapoly", "entropy" },
+    .deps = .{ "p256", "chachapoly", "entropy", "p521" },
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -162,13 +165,15 @@ test {
     _ = dhkem;
     _ = schedule;
     _ = @import("kat_rfc9180.zig");
+    _ = @import("kat_rfc9180_a6.zig");
+    _ = @import("kat_rfc9180_a6_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
 }
 
-test "meta.deps is exactly {p256, chachapoly, entropy} (the P-256 group + the ChaCha AEAD + the fail-closed key draw; else std only)" {
-    try std.testing.expectEqual(@as(usize, 3), meta.deps.len);
+test "meta.deps is exactly {p256, chachapoly, entropy, p521} (the P-256 group + the ChaCha AEAD + the fail-closed key draw + the P-521 group; else std only)" {
+    try std.testing.expectEqual(@as(usize, 4), meta.deps.len);
     try std.testing.expectEqualStrings("p256", meta.deps[0]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[1]);
     // `entropy` is the `random(Nsk)` in RFC 9180 §4's `GenerateKeyPair() =
@@ -176,6 +181,8 @@ test "meta.deps is exactly {p256, chachapoly, entropy} (the P-256 group + the Ch
     // mode. Unlike the two above it is NOT an inert swap: dropping it puts
     // that key back on `io.random`'s silent-degrade path.
     try std.testing.expectEqualStrings("entropy", meta.deps[2]);
+    // std has no P-521: DHKEM(P-521, HKDF-SHA512) runs on the `p521` module.
+    try std.testing.expectEqualStrings("p521", meta.deps[3]);
 }
 
 test "the ChaCha AEAD swap is inert: chachapoly and std agree on every RFC 9180 Nk/Nn/Nt" {
@@ -193,6 +200,7 @@ test "KemId/KdfId/AeadId ordinals match RFC 9180 Tables 2/3/5" {
     try std.testing.expectEqual(@as(u16, 0x0020), @intFromEnum(KemId.dhkem_x25519_hkdf_sha256));
     try std.testing.expectEqual(@as(u16, 0x0010), @intFromEnum(KemId.dhkem_p256_hkdf_sha256));
     try std.testing.expectEqual(@as(u16, 0x0011), @intFromEnum(KemId.dhkem_p384_hkdf_sha384));
+    try std.testing.expectEqual(@as(u16, 0x0012), @intFromEnum(KemId.dhkem_p521_hkdf_sha512));
     try std.testing.expectEqual(@as(u16, 0x0001), @intFromEnum(KdfId.hkdf_sha256));
     try std.testing.expectEqual(@as(u16, 0x0001), @intFromEnum(AeadId.aes128gcm));
     try std.testing.expectEqual(@as(u16, 0x0002), @intFromEnum(AeadId.aes256gcm));

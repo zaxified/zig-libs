@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-09 · mutation ? · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, HPKE_FUZZ) · ct 2026-09-09 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, HPKE_FUZZ; P-521 not yet in the harnesses) · ct 2026-10-10 (ctgrind, P-521 decap/authDecap added)
 
 **Performance:** not measured
 
@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jedisct1/zig-hpke](https://github.com/jedisct1/zig-hpke) | Zig | MIT | 18 | pushed 2026-05-19 | The Zig peer. Its README: X25519, P-256, P-384, ML-KEM-512/768/1024, MLKEM768-X25519, -P256, MLKEM1024-P384, HKDF and SHAKE/TurboSHAKE KDFs, AES-GCM/ChaCha. No P-521 or X448. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No HPKE, but ships the parts for the PQ suites: `kem.ml_kem` and `kem.hybrid` (`MlKem768X25519`, `MlKem768P256`, `MlKem1024P384`; checked in `lib/std/crypto/`). No P-521. |
 
-**Where we are ahead:** all four modes (base, psk, auth, auth_psk) anchored to RFC 9180 Appendix A byte for byte including `AuthEncap`/`AuthDecap`, three DHKEMs, the §5.1 setup layer and exporter that `mls` uses, HKDF-SHA256/384/512 key-schedule dispatch, and a PSK-length floor stricter than the RFC. **Where we are behind:** no post-quantum or hybrid KEM (Go stdlib, rust-hpke and zig-hpke all have them), no SHAKE KDFs, no P-521 or X448 DHKEM, no `export_only` (0xFFFF) suite (→ Backlog).
+**Where we are ahead:** all four modes (base, psk, auth, auth_psk) anchored to RFC 9180 Appendix A byte for byte including `AuthEncap`/`AuthDecap`, four DHKEMs (P-521 since 2026-10-10, RFC 9180 A.6 in all four modes), the §5.1 setup layer and exporter that `mls` uses, HKDF-SHA256/384/512 key-schedule dispatch, and the RFC's §5.1.2 PSK-length floor (32 bytes) enforced, which its pseudocode omits. **Where we are behind:** no post-quantum or hybrid KEM (Go stdlib, rust-hpke and zig-hpke all have them), no SHAKE KDFs, no X448 DHKEM, no `export_only` (0xFFFF) suite (→ Backlog).
 
 ## What this is, in one paragraph
 
@@ -43,7 +43,9 @@ multi-message `Context` for streaming use and a secret-export function
 MLS). This module targets the three DHKEM instantiations `std.crypto` can
 drive without a C dependency — `dhkem_x25519_hkdf_sha256` (kem_id
 0x0020), `dhkem_p256_hkdf_sha256` (kem_id 0x0010) and, since 2026-08-06,
-`dhkem_p384_hkdf_sha384` (kem_id 0x0011) — each fixed to ITS OWN internal
+`dhkem_p384_hkdf_sha384` (kem_id 0x0011), plus since 2026-10-10
+`dhkem_p521_hkdf_sha512` (kem_id 0x0012, the in-repo `p521` module, since std
+has no P-521; DeriveKeyPair with §7.1.3's 0x01 bitmask) — each fixed to ITS OWN internal
 KDF (HKDF-SHA256 for X25519/P-256, HKDF-SHA384 for P-384, RFC 9180 §7.1
 Table 2), all three spec-named AEADs (AES-128-GCM, AES-256-GCM,
 ChaCha20Poly1305), and all three spec-named OUTER key-schedule KDFs
@@ -133,9 +135,12 @@ spec's own `VerifyPSKInputs()` pseudocode does not encode. A PSK shorter
 than 32 bytes cannot carry 32 bytes of entropy, so its LENGTH is the one
 checkable projection of that MUST (entropy of a long-enough PSK is not
 observable from the bytes), and `keySchedule` rejects it with
-`KeyScheduleError.PskTooShort`. The floor is `Nh` (32 for HKDF-SHA256),
-inclusive — the RFC's own Appendix A PSK vectors are exactly 32 bytes, so a
-stricter floor would reject the spec's test vectors. Consistency
+`KeyScheduleError.PskTooShort`. The floor is 32 bytes for every KDF
+(`schedule.psk_min_len`), inclusive — the RFC's own Appendix A PSK vectors
+are exactly 32 bytes, so a stricter floor would reject the spec's test
+vectors. Until 2026-10-10 the floor was `Nh`, which did exactly that at
+HKDF-SHA512 (A.6.2/A.6.4, 32-byte PSK, Nh = 64); `Nh` is only the RFC's
+SHOULD. Consistency
 (`VerifyPSKInputs`) is checked FIRST, so a caller with the mode/PSK
 combination wrong still gets the RFC's own diagnosis (`InconsistentPsk`)
 rather than a length complaint about a PSK that should not have been
@@ -642,8 +647,9 @@ implemented and KAT-verified (order preserved):
    item 16); it is anchored by type widths, self-consistency round trips
    and malformed-input rejection instead. Otherwise, every RFC 9180
    surface this module implements has an embedded official vector. The
-   Appendix A sections still NOT embedded are A.6 (P-521 — a KEM this
-   module does not instantiate), A.7+ (export-only AEAD) and the
+   Appendix A sections still NOT embedded are A.7+ (export-only AEAD) —
+   A.6 (P-521) is embedded in full since 2026-10-10
+   (`kat_rfc9180_a6.zig`, `tools/gen_rfc9180_a6.py`) — and the
    `ChaCha20Poly1305` mode vectors of A.2/A.5, which differ from the
    embedded A.1/A.3/A.4 mode vectors only in the `aead_id`/`kdf_id` bytes
    of `suite_id` — already covered by their respective base headers.
@@ -653,7 +659,7 @@ implemented and KAT-verified (order preserved):
 - **Post-quantum and hybrid KEMs** (ML-KEM-768/1024, MLKEM768-X25519 aka X-Wing, MLKEM768-P256, MLKEM1024-P384; draft-ietf-hpke-pq) *(survey 2026-09-30)*: three of the four other implementations have them and PQ-hybrid HPKE is where deployments are moving (ECH, MLS). Searched `rg -i 'ml_kem|mlkem|xwing|hybrid' modules/hpke/src` — nothing. Effort: medium; std 0.16.0 provides `kem.ml_kem` and `kem.hybrid`. Fits §2. Needs the one-stage KDF below for the draft's suites.
 - **SHAKE128/SHAKE256 (and TurboSHAKE) one-stage KDFs** (draft-ietf-hpke-pq) *(survey 2026-09-30)*: required by the PQ suites, offered by Go and rust-hpke. Effort: small-medium (`std.crypto.hash.sha3` has SHAKE). Fits §2.
 - **`export_only` AEAD id 0xFFFF as a suite** (RFC 9180 §7.3) *(survey 2026-09-30)*: `AeadId.export_only` exists only as an enum tag and in a comment (`rg export_only modules/hpke/src`); `Context` needs a real `Aead` type, so a caller cannot derive secrets under the 0xFFFF suite id. Go has `ExportOnly()`. Effort: small. Fits §2.
-- **DHKEM(X448, HKDF-SHA512)** (0x0021) and **DHKEM(P-521, HKDF-SHA512)** (0x0012) *(survey 2026-09-30)*: RFC 9180 registers both (MLS suites 0x0004-0x0006 need them); Go/rust-hpke offer P-521, none of the peers offer X448. X448 is small on top of sibling `ed448` (`x448.scalarmult`); P-521 is large because std has no P-521 (pure Zig field + curve needed). Fits §2.
+- **DHKEM(X448, HKDF-SHA512)** (0x0021) *(survey 2026-09-30)*: RFC 9180 registers it (MLS suites 0x0004/0x0006 need it); none of the peers offer X448. Small on top of sibling `ed448` (`x448.scalarmult`). Fits §2. (DHKEM(P-521, HKDF-SHA512) 0x0012: done 2026-10-10 on the `p521` module, RFC 9180 A.6 byte-exact.)
 
 ## Anchoring
 

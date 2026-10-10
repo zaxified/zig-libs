@@ -24,14 +24,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [golang-jwt/jwt](https://github.com/golang-jwt/jwt) — **reference** | Go | MIT | 9.2k | v5.3.1 (2026-01-28) | Sign and verify for HS/RS/PS/ES(256/384/512)/EdDSA, custom claims, validation options. This module verifies HS, RS, ES256/384, EdDSA and ML-DSA but refuses PS256/384/512 and ES512 (`error.UnsupportedAlg`), and signs everything except RS/PS/ES512. |
+| [golang-jwt/jwt](https://github.com/golang-jwt/jwt) — **reference** | Go | MIT | 9.2k | v5.3.1 (2026-01-28) | Sign and verify for HS/RS/PS/ES(256/384/512)/EdDSA, custom claims, validation options. This module verifies HS, RS, ES256/384/512, EdDSA and ML-DSA but refuses PS256/384/512 (`error.UnsupportedAlg`), and signs everything except RS/PS. |
 | [panva/jose](https://github.com/panva/jose) | TypeScript | MIT | 7.8k | v6.2.12 (2026-09-05) | Full JOSE (JWS, JWE, JWK, JWKS with remote fetch and cache, JWT); every RFC 7518 alg. JWE is a separate sibling module here (`jwe`). *(inferred from README; not exercised)* |
 | [Keats/jsonwebtoken](https://github.com/Keats/jsonwebtoken) | Rust | MIT | 2.1k | push 2026-09-24 (no releases via GH API) | Top Rust crate: encode/decode, RS/PS/ES/EdDSA, JWK sets. No OIDC discovery or resource-server middleware. *(inferred)* |
 | [lestrrat-go/jwx](https://github.com/lestrrat-go/jwx) | Go | MIT | 2.4k | v4.5.0 (2026-09-08) | Whole JOSE family plus a JWKS auto-refresh cache. *(inferred)* |
 | [go-jose/go-jose](https://github.com/go-jose/go-jose) | Go | Apache-2.0 | 536 | v4.1.5 (2026-09-03) | JWS/JWE/JWK toolkit (source not read: not MIT). |
 | [leroycep/zig-jwt](https://github.com/leroycep/zig-jwt) / [deatil/zig-jwt](https://github.com/deatil/zig-jwt) / [NikoMalik/jwt-zig](https://github.com/NikoMalik/jwt-zig) | Zig | MIT / Apache-2.0 / MIT | 42 / 21 / 5 | push 2025-08 / 2026-09-29 / 2026-07 | Zig ecosystem: small sign/verify libraries; none found with JWKS by `kid`, OIDC discovery, a resource-server guard or the OAuth2 PKCE helpers. *(inferred from repo descriptions; sources not read)* |
 
-**Where we are ahead:** the only pure-Zig JWT with JWKS-by-`kid`, OIDC discovery + cached `Provider`, a `router` Bearer middleware and framework-agnostic `Guard`, the OAuth2/OIDC relying-party helpers (PKCE, state, nonce, id-token checks), a verified-token cache and RFC 9964 ML-DSA (published RFC vectors in tests); safe defaults (mandatory audience/issuer, plain-HTTP key source refused, `alg` fixed by the key type when signing). · **Where we are behind:** RSASSA-PSS and ES512 (P-521) verification, RS/PS signing, OAuth2 error-response parsing and DPoP (→ Backlog items)
+**Where we are ahead:** the only pure-Zig JWT with JWKS-by-`kid`, OIDC discovery + cached `Provider`, a `router` Bearer middleware and framework-agnostic `Guard`, the OAuth2/OIDC relying-party helpers (PKCE, state, nonce, id-token checks), a verified-token cache and RFC 9964 ML-DSA (published RFC vectors in tests); safe defaults (mandatory audience/issuer, plain-HTTP key source refused, `alg` fixed by the key type when signing). · **Where we are behind:** RSASSA-PSS verification, RS/PS signing, OAuth2 error-response parsing and DPoP (→ Backlog items)
 
 ## Design & invariants
 
@@ -46,7 +46,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `std.crypto.Certificate.rsa` PKCS1-v1_5 over `std.crypto.ff`; HMAC, Ed25519 and ES384 from
   `std.crypto` too) — plus the **in-repo `p256` module for ES256** since `3403d47`, which is
   byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256` and carries that module's own KAT /
-  differential evidence. Nothing is hand-rolled here. Modeled after
+  differential evidence, and the **in-repo `p521` module for ES512** since 2026-10-10 (std has
+  no P-521; CAVP/Wycheproof/OpenSSL-anchored there). Nothing is hand-rolled here. Modeled after
   the JOSE/OAuth2 RFCs (7515/7519/7517/7518/8037/8017/8725, OIDC Discovery/RFC 8414, RFC 6750, RFC
   6749, RFC 7636); see NOTICE for full citation list.
 - **Concurrency:** reentrant except `Provider` (one mutable key cache) — the caller injects a lock
@@ -142,7 +143,7 @@ This is the security core; the defenses are the point:
   JWKS (`fetchJwks`/`Provider`) **refuses** `kty:"oct"` keys (`JwkSkipReason.oct_from_network`) — a
   published JWKS is attacker-readable, so a symmetric key there would let anyone forge HS\* tokens.
   Symmetric keys are trusted only from a locally-configured `parseJwks` set.
-- **Out of scope:** RS*/PS*/ES512 *signing* (issuance covers HS*, ES256/384, EdDSA, ML-DSA); encryption (JWE); `x5c` chain validation; revocation
+- **Out of scope:** RS*/PS* *signing* (issuance covers HS*, ES256/384/512, EdDSA, ML-DSA); encryption (JWE); `x5c` chain validation; revocation
   lists / token introspection (RFC 7662); `c_hash`/`at_hash` (implicit/hybrid-flow-only checks —
   P7 covers the authorization *code* flow, where they do not apply). Provider trust rests on TLS to
   the issuer (via the `http` client / `Fetcher`); P7's `TokenRequest`/`buildAuthorizationUrl` carry
@@ -315,7 +316,7 @@ alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp
 Mutant schemata over a copy of `root.zig` + `cache.zig` (one ReleaseSafe build with the whole
 dependency closure, 134 tests in the binary, `setsid -w timeout -s KILL 20` per mutant):
 **111 mutants, 105 killed, 6 equivalent**. Points: segment split, every `crit` rule, `aud`/`iss`
-matching, `exp`/`nbf`/`iat` edges and leeway, `require_exp`, the `none`/unknown/PS*/ES512 arms,
+matching, `exp`/`nbf`/`iat` edges and leeway, `require_exp`, the `none`/unknown/PS* arms, ES512 (RFC 7515 A.4 known answer, A.4 JWK through JWKS),
 every signature-length check, the HMAC secret and compare, RSA modulus sizes, `parseAndVerify`'s
 stages, JWKS key selection (kid, pinned `alg`, ambiguity, `use`), private-key and `oct` refusal on
 the network path, key-material lengths, the `https://` rule, discovery issuer and `jwks_uri`
@@ -406,13 +407,13 @@ key (a hit re-runs `checkTimes`, which applies it).
   `discoverWith`/`fetchJwksWith`; the three-argument calls keep their signatures.
 
 - **PS256/384/512 verification** (survey 2026-09-30) — `verify` returns `error.UnsupportedAlg`. Providers that mandate PSS (FAPI profiles, some HSM-backed issuers) issue these tokens; golang-jwt/jose accept them. Effort: medium (RSASSA-PSS over `std.crypto.ff`, or through the in-repo `rsa` module — check dependency cost per the RS\* entry). Fits CONVENTIONS §2: yes.
-- **ES512 (P-521) verification** (survey 2026-09-30) — refused because std has no P-521. Rare in practice, but part of every reference's alg table. Effort: medium-large (a P-521 module or extending `p256`'s pattern). Fits §2: yes.
+- ~~**ES512 (P-521) verification**~~ — done 2026-10-10: ES512 verify and sign through the in-repo `p521` module (raw 132-byte `R‖S`), JWK `crv:"P-521"` with 66-byte coordinates; anchored to RFC 7515 A.4.
 - **RS/PS signing** — already listed above under "RS\* signing"; the survey confirms it as a gap against golang-jwt (survey 2026-09-30). The `rsa` module's `signPkcs1v15` exists.
 - **OAuth2 error-response parsing (RFC 6749 §5.2)** — already deferred above; the survey confirms a relying-party user of any full OIDC client hits it on the first failed token request (survey 2026-09-30). Effort: small. Fits §2: yes.
 
 ## Status
 
-`gap · any · both · reentrant (Provider: externally synced)` + deps `http`, `router`, `p256` —
+`gap · any · both · reentrant (Provider: externally synced)` + deps `http`, `router`, `p256`, `p521` —
 canonical source is `pub const meta` in src/root.zig.
 
 ## Anchoring

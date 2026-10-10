@@ -13,7 +13,7 @@ DER parsing for the extension fields `std.crypto.Certificate` omits
 `authorityKeyIdentifier`, `nameConstraints` — see `extensions.zig`), plus the
 path-building/policy decision layer (`chain.zig`): RFC 4158-style path
 building with backtracking over multiple same-subject-DN candidates,
-per-link signature verification (RSA PKCS1v15, RSASSA-PSS, ECDSA P-256/P-384,
+per-link signature verification (RSA PKCS1v15, RSASSA-PSS, ECDSA P-256/P-384/P-521,
 Ed25519, ML-DSA-44/65/87, all twelve SLH-DSA parameter sets),
 basicConstraints/keyUsage CA-signer enforcement,
 pathLenConstraint bookkeeping (self-issued-certificate exception included),
@@ -95,7 +95,8 @@ See `src/root.zig`'s module doc comment for the full recon; summary:
   authorityKeyIdentifier/nameConstraints values at all (the OIDs are
   *recognized* but never extracted).
 - Real single-link verify (`Parsed.verify`): issuer/subject name match +
-  validity window + signature, for RSA PKCS1v15, ECDSA P-256/P-384, and
+  validity window + signature, for RSA PKCS1v15, ECDSA P-256/P-384 (P-521 links
+  are this module's own, through `p521` — std refuses the curve), and
   Ed25519. **No RSA-PSS, no ML-DSA and no SLH-DSA support** — `Certificate.parse` itself
   rejects such a certificate (unrecognized signature-algorithm OID), and the
   table naming those OIDs is closed to extension.
@@ -183,7 +184,7 @@ switch (status) {
 
 Before answering it checks: well-formed v2 CRL, inner = outer signature
 algorithm, CRL issuer = the certificate's issuer = the issuer certificate's
-subject, the issuer's key signed it (RSA, RSASSA-PSS, ECDSA P-256/P-384,
+subject, the issuer's key signed it (RSA, RSASSA-PSS, ECDSA P-256/P-384/P-521,
 Ed25519, ML-DSA, SLH-DSA), `keyUsage.cRLSign`, AKI = SKI when both exist,
 `thisUpdate <= now < nextUpdate` (no nextUpdate: only with `max_age_sec`), and
 scope: a partitioned CRL (issuing distribution point) must be named by the

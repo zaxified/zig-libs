@@ -11,6 +11,7 @@
 //! RFC 4158-style path building with backtracking over multiple
 //! same-subject-DN candidates, per-link signature verification (RSA
 //! PKCS1v15/ECDSA P-256+P-384/Ed25519 via `std.crypto.Certificate.Parsed.verify`,
+//! ECDSA P-521 via `chain.zig`'s `verifyP521Link` + the `p521` module,
 //! RSASSA-PSS via this module's own `verifyPssLink` + the `rsa` module,
 //! ML-DSA-44/65/87 via `verifyMlDsaLink` + std's `std.crypto.sign.mldsa`,
 //! all twelve SLH-DSA parameter sets via `verifySlhDsaLink` + the `slhdsa`
@@ -48,7 +49,8 @@
 //! - **Single-link verify** (`Parsed.verify(issuer, now_sec)`): checks
 //!   issuer==subject DN match, validity window, AND the signature — for RSA
 //!   PKCS1v15 (SHA-1/224/256/384/512), ECDSA (P-256/P-384 — **not** P-521,
-//!   `error.CertificateSignatureNamedCurveUnsupported`), and Ed25519.
+//!   `error.CertificateSignatureNamedCurveUnsupported`; this module verifies
+//!   P-521 links itself since 2026-10-10), and Ed25519.
 //!   **RSA-PSS is not supported at all**: `Certificate.Algorithm` (the
 //!   certificate's `signatureAlgorithm`) has no `rsassa_pss` variant, so
 //!   `Certificate.parse` itself fails
@@ -198,7 +200,7 @@ pub const meta = .{
     .role = .util, // pure verification logic; no I/O, no wire framing of its own
     .concurrency = .reentrant, // no shared/global state; every function is a pure value-in/value-out check
     .model_after = "RFC 5280 (X.509 v3 / PKIX) + RFC 9881 (ML-DSA in X.509); built on std.crypto.Certificate (MIT) for DER + single-link verify",
-    .deps = .{ "rsa", "slhdsa" }, // rsa.verifyPss for the RSASSA-PSS gap; slhdsa for RFC 9882 certificates (std has no SLH-DSA)
+    .deps = .{ "rsa", "slhdsa", "p521" }, // p521: ECDSA under P-521 issuer keys (std refuses the curve); rsa.verifyPss for the RSASSA-PSS gap; slhdsa for RFC 9882 certificates (std has no SLH-DSA)
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────────
@@ -214,4 +216,5 @@ test {
     _ = crl;
     _ = @import("crl_test.zig");
     _ = @import("chain_crl_test.zig");
+    _ = @import("p521_test.zig");
 }

@@ -206,7 +206,7 @@ pub const meta = .{
     .role = .both, // P6 = a `router` middleware guarding routes (server); P7 = an OAuth2/OIDC client building auth/token requests and accepting ID Tokens (relying party).
     .concurrency = .reentrant, // except Provider — one mutable cache, external sync (inject ResourceServer.lock under a threaded server); VerifiedCache is internally synchronized
     .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (issuer metadata -> jwks_uri/authorization_endpoint/token_endpoint) with cached, rotation-aware Provider; RFC 6750 Bearer resource-server middleware; RFC 7636 PKCE + OIDC Core 1.0 §3.1 authorization code flow + §3.1.3.7 ID Token validation; OAuth2/OIDC resource server AND relying party",
-    .deps = .{ "http", "router", "p256" }, // p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256)
+    .deps = .{ "http", "router", "p256", "p521" }, // p521: ES512 (std has no P-521); p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256)
 };
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -643,6 +643,7 @@ pub fn validateClaims(claims: Claims, opts: Options) ValidateError!void {
 /// The asm-accelerated P-256 module — supplies the ES256 key/signature types
 /// and the fast vartime verify on the P2 HTTPS per-request hot path.
 const p256_mod = @import("p256");
+const p521_mod = @import("p521");
 
 /// std signature schemes re-exported so callers (and P4's JWKS) can name the
 /// key types without spelling out the std.crypto paths. ES256 (the P2 HTTPS
@@ -653,6 +654,9 @@ const p256_mod = @import("p256");
 /// std (p256 covers only the P-256 curve).
 pub const EcdsaP256Sha256 = p256_mod.EcdsaP256Sha256;
 pub const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+/// ES512 (ECDSA P-521 + SHA-512): std has no P-521; the `p521` module's
+/// type has std's `Ecdsa` surface (raw 132-byte `R‖S` via `toBytes`/`fromBytes`).
+pub const EcdsaP521Sha512 = p521_mod.EcdsaP521Sha512;
 pub const Ed25519 = std.crypto.sign.Ed25519;
 /// ML-DSA (FIPS 204) parameter sets, as RFC 9964 names them for JOSE. Pure
 /// std: measured on the audit host (2026-08-22, ReleaseFast) std's ML-DSA-65
@@ -697,6 +701,8 @@ pub const Key = union(enum) {
     ecdsa_p256: EcdsaP256Sha256.PublicKey,
     /// P-384 public key for ES384.
     ecdsa_p384: EcdsaP384Sha384.PublicKey,
+    /// P-521 public key for ES512.
+    ecdsa_p521: EcdsaP521Sha512.PublicKey,
     /// Ed25519 public key for EdDSA (RFC 8037).
     ed25519: Ed25519.PublicKey,
     /// RSA public key for RS256/RS384/RS512 (RSASSA-PKCS1-v1_5).
@@ -729,6 +735,15 @@ pub const Key = union(enum) {
         @memcpy(sec1[49..97], &y);
         const pk = EcdsaP384Sha384.PublicKey.fromSec1(&sec1) catch return error.InvalidKey;
         return .{ .ecdsa_p384 = pk };
+    }
+
+    /// P-521 key from raw big-endian affine coordinates (JWK `x`/`y`, 66
+    /// bytes each — RFC 7518 §6.2.1.2: the full coordinate length, leading
+    /// zeros kept).
+    pub fn ecdsaP521FromCoords(x: [66]u8, y: [66]u8) KeyError!Key {
+        const sec1 = [_]u8{0x04} ++ x ++ y;
+        const pk = EcdsaP521Sha512.PublicKey.fromSec1(&sec1) catch return error.InvalidKey;
+        return .{ .ecdsa_p521 = pk };
     }
 
     /// Ed25519 key from its 32-byte encoding — a JWK's decoded `x`
@@ -789,7 +804,7 @@ pub const VerifyError = error{
     /// HS256 token offered an EC/Ed public key, or ES256 vs a P-384 key).
     AlgKeyMismatch,
     /// `alg` is unrecognized, or recognized but not implemented here
-    /// (PS* — RSA-PSS; ES512 — std.crypto has no P-521).
+    /// (PS* — RSA-PSS).
     UnsupportedAlg,
     /// The signature has the wrong length for the alg, or does not verify
     /// over `signing_input`.
@@ -814,8 +829,8 @@ pub fn verify(parsed: *const ParsedToken, key: Key) VerifyError!void {
     switch (parsed.alg) {
         .none => return error.UnsecuredToken,
         .unknown => return error.UnsupportedAlg,
-        // PS* needs RSA-PSS; ES512 needs P-521 (not in std).
-        .PS256, .PS384, .PS512, .ES512 => return error.UnsupportedAlg,
+        // PS* needs RSA-PSS.
+        .PS256, .PS384, .PS512 => return error.UnsupportedAlg,
         .HS256 => try verifyHmac(hmac_sha2.HmacSha256, parsed, key),
         .HS384 => try verifyHmac(hmac_sha2.HmacSha384, parsed, key),
         .HS512 => try verifyHmac(hmac_sha2.HmacSha512, parsed, key),
@@ -828,6 +843,10 @@ pub fn verify(parsed: *const ParsedToken, key: Key) VerifyError!void {
         },
         .ES384 => switch (key) {
             .ecdsa_p384 => |pk| try verifyEcdsa(EcdsaP384Sha384, pk, parsed),
+            else => return error.AlgKeyMismatch,
+        },
+        .ES512 => switch (key) {
+            .ecdsa_p521 => |pk| try verifyEcdsa(EcdsaP521Sha512, pk, parsed),
             else => return error.AlgKeyMismatch,
         },
         .EdDSA => switch (key) {
@@ -943,8 +962,8 @@ fn HmacCheck(comptime Mac: type) type {
     };
 }
 
-/// ES256/ES384: the JWS signature is the raw fixed-width big-endian `R‖S`
-/// (32+32 for P-256, 48+48 for P-384; RFC 7518 §3.4) — `Signature.fromBytes`
+/// ES256/ES384/ES512: the JWS signature is the raw fixed-width big-endian `R‖S`
+/// (32+32 for P-256, 48+48 for P-384, 66+66 for P-521; RFC 7518 §3.4) — `Signature.fromBytes`
 /// takes exactly that layout. Any crypto-level rejection (non-canonical
 /// scalar, identity element, mismatch) is `BadSignature`.
 fn verifyEcdsa(comptime Scheme: type, public_key: Scheme.PublicKey, parsed: *const ParsedToken) VerifyError!void {
@@ -1354,7 +1373,14 @@ fn jwkFromValue(
                 break :blk Key.ecdsaP384FromCoords(x[0..48].*, y[0..48].*) catch
                     return error.InvalidKeyMaterial;
             }
-            return error.UnsupportedCrv; // P-521: no std P-521 support
+            if (std.mem.eql(u8, crv, "P-521")) {
+                const x = try jwkMaterial(arena, obj, "x");
+                const y = try jwkMaterial(arena, obj, "y");
+                if (x.len != 66 or y.len != 66) return error.InvalidKeyMaterial;
+                break :blk Key.ecdsaP521FromCoords(x[0..66].*, y[0..66].*) catch
+                    return error.InvalidKeyMaterial;
+            }
+            return error.UnsupportedCrv;
         }
         if (std.mem.eql(u8, kty, "OKP")) {
             // RFC 8037 §2: crv + x (the raw public key bytes).
@@ -4778,7 +4804,7 @@ test "verify: alg confusion — token alg must match the key type" {
 
 test "verify: unknown and not-yet-supported algs → UnsupportedAlg" {
     var buf: [512]u8 = undefined;
-    inline for (.{ "XS999", "PS256", "PS512", "ES512" }) |alg_name| {
+    inline for (.{ "XS999", "PS256", "PS512" }) |alg_name| {
         const si = signingInputInto(&buf, "{\"alg\":\"" ++ alg_name ++ "\"}",
             \\{"exp":1000}
         );
@@ -5585,8 +5611,8 @@ test "JWKS: RFC 7515 A.2 (RSA) and A.3 (EC) keys as JWKs verify the RFC tokens" 
 test "JWKS: unsupported and enc keys don't break the set; good key resolves" {
     const mixed =
         "{\"keys\":[" ++
-        // P-521: recognized kty, unsupported curve → skipped.
-        "{\"kty\":\"EC\",\"crv\":\"P-521\",\"x\":\"AAAA\",\"y\":\"AAAA\",\"kid\":\"p521\"}," ++
+        // P-192: recognized kty, unsupported curve → skipped.
+        "{\"kty\":\"EC\",\"crv\":\"P-192\",\"x\":\"AAAA\",\"y\":\"AAAA\",\"kid\":\"p192\"}," ++
         // Unknown kty → skipped.
         "{\"kty\":\"quantum\",\"kid\":\"q\"}," ++
         // X25519 is key agreement, not signing → skipped.
@@ -8945,4 +8971,83 @@ test "NumericDate: a float of exactly 2^63 is InvalidClaim, and -2^63 is the las
     var parsed = try parse(testing.allocator, bottom);
     defer parsed.deinit();
     try testing.expectEqual(@as(?i64, std.math.minInt(i64)), parsed.claims.exp);
+}
+
+// ── ES512 (ECDSA P-521 + SHA-512, via the `p521` module) ───────────────────
+
+/// RFC 7515 §A.4.1 P-521 JWK (`x`, `y`, `d`) and the A.4 JWS signature.
+const rfc7515_a4_x_b64 = "AekpBQ8ST8a8VcfVOTNl353vSrDCLLJXmPk06wTjxrrjcBpXp5EOnYG_NjFZ6OvLFV1jSfS9tsz4qUxcWceqwQGk";
+const rfc7515_a4_y_b64 = "ADSmRA43Z1DSNx_RvcLI87cdL07l6jQyyBXMoxVg_l2Th-x3S1WDhjDly79ajL4Kkd0AZMaZmh9ubmf63e3kyMj2";
+const rfc7515_a4_d_b64 = "AY5pb7A0UFiB3RELSD64fTLOSV_jazdF7fLYyuTw8lOfRhWg6Y6rUrPAxerEzgdRhajnu0ferB0d53vM9mE15j2C";
+const rfc7515_a4_sig_b64 = "AdwMgeerwtHoh-l192l60hp9wAHZFVJbLfD_UxMi70cwnZOYaRI1bKPWROc-mZZq" ++
+    "wqT2SI-KGDKB34XO0aw_7XdtAG8GaSwFKdCAPZgoXD2YBJZCPEX3xKpRwcdOO8Kp" ++
+    "EHwJjyqOgzDO7iKvU8vcnwNrmxYbSW9ERBXukOXolLzeO_Jn";
+
+test "verify: RFC 7515 A.4 ES512 known-answer signature (and d derives x, y)" {
+    var x: [66]u8 = undefined;
+    var y: [66]u8 = undefined;
+    var d: [66]u8 = undefined;
+    _ = b64uDecode(&x, rfc7515_a4_x_b64);
+    _ = b64uDecode(&y, rfc7515_a4_y_b64);
+    _ = b64uDecode(&d, rfc7515_a4_d_b64);
+    const key = try Key.ecdsaP521FromCoords(x, y);
+
+    var kp: EcdsaP521Sha512.KeyPair = undefined;
+    try EcdsaP521Sha512.KeyPair.fromSecretKeyInto(&kp, &.{ .bytes = d });
+    const sec1 = kp.public_key.toUncompressedSec1();
+    try testing.expectEqualSlices(u8, &x, sec1[1..67]);
+    try testing.expectEqualSlices(u8, &y, sec1[67..133]);
+
+    // The A.4 payload is the plain string "Payload", not a claims object, so
+    // `verify` runs on a hand-built ParsedToken (as the RFC 8037 test does).
+    var sig_buf: [132]u8 = undefined;
+    const sig = b64uDecode(&sig_buf, rfc7515_a4_sig_b64);
+    try testing.expectEqual(@as(usize, 132), sig.len);
+    var kat: ParsedToken = .{
+        .header = .{ .alg = "ES512" },
+        .claims = .{ .raw = .null },
+        .signing_input = "eyJhbGciOiJFUzUxMiJ9.UGF5bG9hZA",
+        .signature = sig,
+        .alg = .ES512,
+        .arena = undefined, // never deinit'd; verify does not touch it
+    };
+    try verify(&kat, key);
+    sig_buf[131] ^= 0x01;
+    try testing.expectError(error.BadSignature, verify(&kat, key));
+    sig_buf[131] ^= 0x01;
+    kat.signing_input = "eyJhbGciOiJFUzUxMiJ9.UGF5bG9hZB";
+    try testing.expectError(error.BadSignature, verify(&kat, key));
+    kat.signing_input = "eyJhbGciOiJFUzUxMiJ9.UGF5bG9hZA";
+    // A DER signature, or any length but 132, is not a JWS ES512 signature.
+    kat.signature = sig[0..131];
+    try testing.expectError(error.BadSignature, verify(&kat, key));
+    kat.signature = sig;
+    // alg/key confusion both ways.
+    const p384 = try EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{3} ** EcdsaP384Sha384.KeyPair.seed_length);
+    try testing.expectError(error.AlgKeyMismatch, verify(&kat, .{ .ecdsa_p384 = p384.public_key }));
+    try testing.expectError(error.AlgKeyMismatch, verify(&kat, .{ .hmac = "secret" }));
+    kat.alg = .ES384;
+    try testing.expectError(error.AlgKeyMismatch, verify(&kat, key));
+}
+
+test "JWKS: an RFC 7515 A.4 P-521 JWK resolves to an ES512 key; wrong coordinate lengths refused" {
+    const set = "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-521\",\"kid\":\"a4\",\"x\":\"" ++
+        rfc7515_a4_x_b64 ++ "\",\"y\":\"" ++ rfc7515_a4_y_b64 ++ "\"}]}";
+    var jwks = try parseJwks(testing.allocator, set);
+    defer jwks.deinit();
+    const k = jwks.keyForKid("a4").?.key;
+    try testing.expect(k == .ecdsa_p521);
+
+    // A coordinate one octet short (leading zero dropped) is not the full
+    // coordinate size RFC 7518 §6.2.1.2 requires.
+    var x: [66]u8 = undefined;
+    _ = b64uDecode(&x, rfc7515_a4_x_b64);
+    var short_b64: [88]u8 = undefined;
+    const short_s = std.base64.url_safe_no_pad.Encoder.encode(&short_b64, x[1..]);
+    var head: [256]u8 = undefined;
+    const bad = try std.fmt.bufPrint(&head, "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-521\",\"kid\":\"s\",\"x\":\"{s}\",\"y\":\"" ++ rfc7515_a4_y_b64 ++ "\"}}]}}", .{short_s});
+    var bad_jwks = try parseJwks(testing.allocator, bad);
+    defer bad_jwks.deinit();
+    try testing.expectEqual(@as(usize, 0), bad_jwks.keys.len);
+    try testing.expectEqual(JwkSkipReason.invalid_key, bad_jwks.skipped[0].reason);
 }

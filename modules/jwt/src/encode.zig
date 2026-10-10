@@ -13,8 +13,8 @@
 //! what a test wants and costs a production issuer nothing it relies on.
 //!
 //! Not offered: RS*/PS* (std has no RSA signing; the `rsa` module does, but
-//! pulling it in as a dependency is a separate change), ES512 (no P-521 in
-//! std) — the same gaps `verify` has.
+//! pulling it in as a dependency is a separate change) — the same gap
+//! `verify` has. ES512 signs through the `p521` module.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -39,6 +39,7 @@ pub const SigningKey = union(enum) {
     hs512: []const u8,
     es256: *const root.EcdsaP256Sha256.KeyPair,
     es384: *const root.EcdsaP384Sha384.KeyPair,
+    es512: *const root.EcdsaP521Sha512.KeyPair,
     /// EdDSA (RFC 8037) over Ed25519.
     ed25519: *const root.Ed25519.KeyPair,
     /// RFC 9964, empty context string (as the RFC requires).
@@ -54,6 +55,7 @@ pub const SigningKey = union(enum) {
             .hs512 => .HS512,
             .es256 => .ES256,
             .es384 => .ES384,
+            .es512 => .ES512,
             .ed25519 => .EdDSA,
             .ml_dsa_44 => .@"ML-DSA-44",
             .ml_dsa_65 => .@"ML-DSA-65",
@@ -69,6 +71,7 @@ pub const SigningKey = union(enum) {
             .hs256, .hs384, .hs512 => |s| .{ .hmac = s },
             .es256 => |kp| .{ .ecdsa_p256 = kp.public_key },
             .es384 => |kp| .{ .ecdsa_p384 = kp.public_key },
+            .es512 => |kp| .{ .ecdsa_p521 = kp.public_key },
             .ed25519 => |kp| .{ .ed25519 = kp.public_key },
             .ml_dsa_44 => |kp| .{ .ml_dsa_44 = kp.public_key },
             .ml_dsa_65 => |kp| .{ .ml_dsa_65 = kp.public_key },
@@ -177,6 +180,9 @@ fn sign(key: SigningKey, input: []const u8, buf: []u8) EncodeError![]const u8 {
         .hs512 => |s| return burn.run(burn.hmac_burn, R, mac, .{ hmac_sha2.HmacSha512, s, input, buf }),
         .es256 => |kp| return burn.run(burn.ec_burn, R, signEc, .{ kp, input, buf }),
         .es384 => |kp| return burn.run(burn.ec_burn, R, signEc, .{ kp, input, buf }),
+        // p521's `sign` burns its own body (24 KiB); this burn covers the
+        // frame above it.
+        .es512 => |kp| return burn.run(burn.ec_burn, R, signEc, .{ kp, input, buf }),
         .ed25519 => |kp| return burn.run(burn.ec_burn, R, signEc, .{ kp, input, buf }),
         .ml_dsa_44 => |kp| return burn.run(burn.mldsa44_burn, R, signMlDsa, .{ kp, input, buf }),
         .ml_dsa_65 => |kp| return burn.run(burn.mldsa65_burn, R, signMlDsa, .{ kp, input, buf }),
@@ -184,7 +190,7 @@ fn sign(key: SigningKey, input: []const u8, buf: []u8) EncodeError![]const u8 {
     }
 }
 
-/// ES256 / ES384 / Ed25519. JWS ECDSA signatures are the raw fixed-width R‖S
+/// ES256 / ES384 / ES512 / Ed25519. JWS ECDSA signatures are the raw fixed-width R‖S
 /// (RFC 7518 §3.4), which is what `Signature.toBytes` yields — not DER.
 fn signEc(kp: anytype, input: []const u8, buf: []u8) EncodeError![]const u8 {
     return put(buf, &((kp.sign(input, null) catch return error.SigningFailed).toBytes()));
@@ -249,6 +255,9 @@ test "encode: every algorithm round-trips through parseAndVerify, alg from the k
     try roundTrip(.{ .es256 = &es256 }, .{ .kid = "ec" });
     const es384 = try root.EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{7} ** root.EcdsaP384Sha384.KeyPair.seed_length);
     try roundTrip(.{ .es384 = &es384 }, .{});
+    var es512: root.EcdsaP521Sha512.KeyPair = undefined;
+    try root.EcdsaP521Sha512.KeyPair.generateDeterministicInto(&es512, &([_]u8{7} ** root.EcdsaP521Sha512.KeyPair.seed_length));
+    try roundTrip(.{ .es512 = &es512 }, .{ .kid = "p521" });
     const ed = try root.Ed25519.KeyPair.generateDeterministic(seed32);
     try roundTrip(.{ .ed25519 = &ed }, .{});
     const ml44 = try root.MlDsa44.KeyPair.generateDeterministic(seed32);

@@ -4,7 +4,7 @@ A JWT/JWS toolkit for OAuth2/OIDC — both a resource-server token *validator*
 and an OIDC *relying party* (RP). The validator side: compact-serialization
 parsing (RFC 7515 §3.1) into typed models, registered-claims validation
 (RFC 7519 §4.1), JWS signature verification (RFC 7515 §5.2 + RFC 7518)
-for **HS256/384/512** (HMAC-SHA-2), **ES256/ES384** (ECDSA P-256/P-384),
+for **HS256/384/512** (HMAC-SHA-2), **ES256/ES384/ES512** (ECDSA P-256/P-384/P-521),
 **EdDSA** (Ed25519, RFC 8037), **RS256/384/512** (RSASSA-PKCS1-v1_5,
 RFC 8017 — the OIDC default) and **ML-DSA-44/65/87** (RFC 9964 — the
 post-quantum FIPS-204 signatures, keys as `kty:"AKP"` JWKs), and **JWKS key
@@ -14,9 +14,10 @@ header's `kid`, verify via `verifyWithJwks`/`parseVerifyJwks`. The signature
 core hand-rolls no crypto — `std.base64.url_safe_no_pad` for the segments,
 `std.json` for header/payload/JWKS, and `std.crypto` for the signatures (RSA
 via `std.crypto.Certificate.rsa`'s PKCS1-v1_5 verify over `std.crypto.ff`
-modexp), with the single exception of **ES256**, which runs on the in-repo
+modexp), with two exceptions: **ES256**, which runs on the in-repo
 `p256` module (byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256`, ~2.7×
-faster verify) — see the Deps bullet below.
+faster verify), and **ES512**, which runs on the in-repo `p521` module (std
+has no P-521) — see the Deps bullet below.
 
 On top of the offline core sit two turnkey layers: the **networked
 `Provider`** (P5) — OpenID Connect Discovery 1.0 (`<issuer>/.well-known/
@@ -70,7 +71,8 @@ copied.
   sync under a threaded server — inject `ResourceServer.lock` (see its docs).
 - **Deps:** `http` (the `HttpFetcher` + the middleware's request/response
   types, and P7's `TokenRequest.method`), `router` (the middleware), `p256`
-  (the fast ES256 curve — byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256`).
+  (the fast ES256 curve — byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256`),
+  `p521` (ES512: P-521, which std lacks).
   The signature core and P7's request/response builders need neither `http`
   nor `router`.
 
@@ -105,8 +107,7 @@ that. Never authorize from a `ParsedToken` alone.
   checked, including the SHA-2 OID — wrong length, `s ≥ n`, bad padding or
   a wrong-hash DigestInfo are all `BadSignature`. Keys are validated at
   construction (2048/3072/4096-bit modulus; odd exponent in `[3, 2^32)`).
-- Unknown or not-yet-implemented algs (`PS*` — RSA-PSS; ES512 — no P-521
-  in std) → `UnsupportedAlg`; wrong-length or garbage signatures →
+- Unknown or not-yet-implemented algs (`PS*` — RSA-PSS) → `UnsupportedAlg`; wrong-length or garbage signatures →
   `BadSignature`, never a panic.
 - **JWKS selection cannot smuggle a mismatched key**: whatever
   `JwkSet.selectKey` resolves still goes through `verify`'s key-type check
@@ -137,7 +138,7 @@ ID-token acceptance).
 | `AudiencePolicy` / `IssuerPolicy` | mandatory-choice unions for `Options`: `.{ .required = "…" }` (must match) \| `.any` (conscious opt-out). No default — see "Mandatory audience/issuer" |
 | `validateClaims(claims, Options) ValidateError!void` | RFC 7519 §4.1 checks; pure, allocation-free |
 | `Alg` | RFC 7518 names (`HS256`…`EdDSA`) plus RFC 9964's `ML-DSA-44`/`ML-DSA-65`/`ML-DSA-87`, `none`, `unknown` — the verify dispatch |
-| `Key` | tagged union: `.hmac` (secret bytes) \| `.ecdsa_p256` \| `.ecdsa_p384` \| `.ed25519` (std public keys) \| `.rsa` (`RsaPublicKey`) \| `.ml_dsa_44` / `.ml_dsa_65` / `.ml_dsa_87` (FIPS-204 public keys); constructors `ecdsaP256FromCoords(x, y)` / `ecdsaP384FromCoords(x, y)` / `ed25519FromBytes(x)` / `rsaFromModExp(n, e)` / `mlDsa44FromBytes(pub)` / `mlDsa65FromBytes(pub)` / `mlDsa87FromBytes(pub)` take exactly a JWK's decoded parameters (`KeyError.InvalidKey` on bad points/moduli/exponents/encodings). The tag binds the key TYPE to the token's `alg`, which is what closes algorithm confusion — including across the three ML-DSA parameter sets, where the tags are distinct types |
+| `Key` | tagged union: `.hmac` (secret bytes) \| `.ecdsa_p256` \| `.ecdsa_p384` \| `.ecdsa_p521` \| `.ed25519` (std public keys) \| `.rsa` (`RsaPublicKey`) \| `.ml_dsa_44` / `.ml_dsa_65` / `.ml_dsa_87` (FIPS-204 public keys); constructors `ecdsaP256FromCoords(x, y)` / `ecdsaP384FromCoords(x, y)` / `ecdsaP521FromCoords(x, y)` (66-byte coordinates) / `ed25519FromBytes(x)` / `rsaFromModExp(n, e)` / `mlDsa44FromBytes(pub)` / `mlDsa65FromBytes(pub)` / `mlDsa87FromBytes(pub)` take exactly a JWK's decoded parameters (`KeyError.InvalidKey` on bad points/moduli/exponents/encodings). The tag binds the key TYPE to the token's `alg`, which is what closes algorithm confusion — including across the three ML-DSA parameter sets, where the tags are distinct types |
 | `verify(&parsed, key) VerifyError!void` | recompute/check the signature over `signing_input`; RFC 8725 defenses baked in |
 | `parseAndVerify(gpa, token, key, Options) !ParsedToken` | the one-call API: parse → verify → validateClaims; frees on any failure |
 | `parseJwks(gpa, json) JwksError!JwkSet` | parse an RFC 7517 `{"keys":[…]}` document — `kty` `RSA`/`EC`/`OKP`/`oct` and RFC 9964's `AKP` (ML-DSA, whose REQUIRED `alg` carries the parameter set and is never inferred from the key length); per-JWK problems skip that key (recorded in `skipped`), only a non-JWKS document errors |
@@ -381,7 +382,7 @@ goes into `Config.context`. Nothing in the module uses the cache on its own;
   arena-owned by its `JwkSet`, so this holds automatically there.)
 - **JWKS is skip-tolerant per key, strict per document** (RFC 7517 §5): a
   set routinely publishes keys a verifier does not use, so an individual
-  JWK that is unsupported (`P-521`, `X25519`, unknown `kty`) or malformed
+  JWK that is unsupported (`P-192`, `X25519`, unknown `kty`) or malformed
   (bad base64url, wrong-length coordinates, off-curve point, bad
   modulus/exponent, wrong-typed members) is *skipped* and recorded in
   `JwkSet.skipped` with a `JwkSkipReason` — only a document that is not a
@@ -465,7 +466,7 @@ token → parse → verify OK; tampered payload, corrupted signature and
 wrong-keypair key each → `BadSignature`); the RFC 8725 alg-confusion
 matrix (`alg:none` with any key → `UnsecuredToken`; HS token vs EC/Ed keys
 and ES/EdDSA tokens vs HMAC keys and cross-curve keys → `AlgKeyMismatch`;
-unknown/`PS*`/`ES512` → `UnsupportedAlg`); wrong-length and
+unknown/`PS*` → `UnsupportedAlg`); ES512 against RFC 7515 A.4 (known-answer signature, its JWK through JWKS, `d` deriving `x`/`y`); wrong-length and
 garbage-but-right-length signatures → `BadSignature`, never a panic;
 invalid key bytes (off-curve points, non-canonical Ed25519) →
 `KeyError.InvalidKey`; and `parseAndVerify` end-to-end (good → claims
@@ -515,7 +516,7 @@ P4 (JWKS, RFC 7517):
   `NoMatchingKey`; a JWK pinned `alg:"RS384"` refuses an RS256 token *with
   a valid RS256 signature* (`NoMatchingKey`) yet verifies the RS384 one —
   on both the `kid` and the no-`kid` path.
-- **Skip tolerance**: a set mixing P-521 / unknown-`kty` / X25519 /
+- **Skip tolerance**: a set mixing P-192 / unknown-`kty` / X25519 /
   `use:"enc"` with one good RSA key — three skipped with the right
   reasons, the good key still verifies by `kid`; an 11-way malformed-JWK
   matrix (non-object, missing/wrong-typed `kty`, bad base64url, missing
