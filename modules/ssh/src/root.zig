@@ -51,6 +51,13 @@ pub const messages = @import("messages.zig");
 pub const server = @import("server.zig");
 pub const userauth = @import("userauth.zig");
 pub const connection = @import("connection.zig");
+/// Public keys as values: parse/verify/fingerprint a wire blob, read and
+/// write `authorized_keys` lines (Go's `ParsePublicKey`, `ParseAuthorizedKey`,
+/// `MarshalAuthorizedKey`, `FingerprintSHA256`).
+pub const keys = @import("keys.zig");
+/// OpenSSH `known_hosts` lookup, hashing and writing, plus ready-made
+/// `HostKeyVerifier`s (`KnownHosts`, `FixedHostKey`) — Go's `knownhosts`.
+pub const knownhosts = @import("knownhosts.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -112,6 +119,8 @@ test {
     _ = server;
     _ = userauth;
     _ = connection;
+    _ = keys;
+    _ = knownhosts;
     _ = @import("interop_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");

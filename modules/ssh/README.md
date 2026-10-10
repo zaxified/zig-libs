@@ -95,25 +95,14 @@ shipped.
 const ssh = @import("ssh");
 
 // ── client: connect → authenticate → run a command ────────────────────────
-// The host-key policy is yours: a struct of your own reached through `ctx`.
-// `key.key_blob` does NOT outlive the call — copy it if you keep it.
-const KnownHosts = struct {
-    path: []const u8,
-
-    fn verify(ctx: *anyopaque, key: ssh.transport.HostKeyInfo) ssh.transport.HostKeyVerdict {
-        const self: *KnownHosts = @ptrCast(@alignCast(ctx));
-        return switch (lookUp(self.path, key.host, key.port, key.key_type, key.key_blob)) {
-            .match => .accept,
-            .absent => .{ .reject = .unknown_host }, // or prompt, then .accept
-            .different => .{ .reject = .key_mismatch },
-        };
-    }
-};
-
-var policy: KnownHosts = .{ .path = "~/.ssh/known_hosts" };
+// The host-key policy is yours. `knownhosts.KnownHosts` answers from
+// known_hosts text you read (hashed entries, wildcards, `[host]:port`,
+// `@revoked`); `knownhosts.FixedHostKey` pins one key; or write your own
+// `{ ctx, verifyFn }` (`HostKeyInfo.key_blob` does NOT outlive the call).
+var policy: ssh.knownhosts.KnownHosts = .{ .text = known_hosts_text };
 var failure: ssh.transport.HostKeyFailure = undefined;
 var t = ssh.transport.connect(&reader, &writer, gpa, .{
-    .verifier = .{ .ctx = &policy, .verifyFn = KnownHosts.verify },
+    .verifier = policy.verifier(),
     .host = "router.example.net", // what the verifier looks up
     .port = 22,
     .failure = &failure, // optional: WHY it was refused

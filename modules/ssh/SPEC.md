@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-06 · mutation 2026-08-22 · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, SSH_FUZZ) · ct 2026-10-10 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SSH_FUZZ; ssh-pubkey added 2026-10-10) · ct 2026-10-10 (ctgrind)
 
 **Performance:** not measured
 
@@ -117,7 +117,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   caller-supplied policy — no known_hosts file, TOFU policy or pinning lives in this module.
   Symmetrically, **user-key trust is the caller's concern on the server side**:
   `userauth.AuthorizedKeyCheck` is the one-line-of-`authorized_keys` seam, and this module never
-  reads the filesystem for it.
+  reads the filesystem for it. What it does give both sides is the **text formats**: `keys.zig`
+  parses and writes `authorized_keys` lines and fingerprints keys (`findAuthorizedKey` is the body of
+  a typical `AuthorizedKeyCheck`), over text the caller read.
 - **Every caller-supplied policy carries a `ctx: *anyopaque` and is called through it.**
   `transport.HostKeyVerifier`, `userauth.AuthorizedKeyCheck`, `userauth.PasswordCheck` and
   `connection.CommandHandler` are `{ ctx, fn(ctx, …) }` structs, not bare `*const fn`. A process
@@ -414,12 +416,20 @@ for the owner):
   ~~DH group-exchange~~ (done 2026-10-10: client takes any server prime of 2048..8192 bits on
   montint's `DynModint`, server answers from the fixed group14/group16 primes as Go's does); ~~`aes192-ctr`~~
   (done 2026-10-10 over the new `aes192` module; live OpenSSH interop both roles);
-  P2 public-key layer (ParsePublicKey / authorized_keys / fingerprints), known_hosts, auth
+  ~~P2 public-key layer~~ (done 2026-10-10: `keys.zig` — `PublicKey.parse`/`verify`/`eql`,
+  `fingerprintSha256`/`fingerprintMd5` byte-equal to `ssh-keygen -lf`, `authorized_keys` line parser
+  with quoted options + `AuthorizedKeysIterator` + `findAuthorizedKey`, `writeAuthorizedKey`,
+  `HostKeyInfo.publicKey`; fuzz `ssh-pubkey` 200k clean; RSA keys above the `rsa` module's 4096-bit cap
+  are skipped as unusable, OpenSSH goes to 16384), ~~known_hosts~~ (done 2026-10-10: `knownhosts.zig` — `check`
+  in OpenSSH's order revoked → accept → same-type mismatch → unknown, wildcards/negation/`[host]:port`,
+  hashed `|1|` entries byte-equal to `ssh-keygen -H`, `writeLine` plain or hashed, `KnownHosts` and
+  `FixedHostKey` verifiers; not done: `@cert-authority` (needs certificates, P3), Go's `KeyError.Want`
+  host-key-algorithm preference, the CheckHostIP second lookup by address), auth
   orchestration (none probe, multi-key, partial success, multi-round keyboard-interactive);
   P3 server API in Go's shape (channels and requests to the app), streamlocal, Signer + ssh-agent,
   certificates, GSSAPI, legacy opt-ins.
 - **Legacy-compat algorithms (`aes128-ctr`, `hmac-sha2-512`, `ecdsa-sha2-nistp384/521`, `curve25519` variants, `ssh-rsa` opt-in)** *(survey 2026-09-30)*. Older network gear offers only CTR ciphers/HMAC-SHA1; russh offers "opt-in legacy". **Settled by the owner 2026-10-09** (Go parity item above): widen to Go's set, legacy as explicit opt-ins; the lists are configurable since 2026-10-09.
-- **OpenSSH user certificates (`*-cert-v01@openssh.com`), `ssh-agent` client, `known_hosts` parsing** *(survey 2026-09-30)*. Certificates and agent already listed as not done; `known_hosts` is left to the caller's host-key policy callback by design (README). Effort: small-medium each. Fit §2.
+- **OpenSSH user certificates (`*-cert-v01@openssh.com`), `ssh-agent` client** *(survey 2026-09-30)*. Certificates and agent already listed as not done (Go parity P3). `known_hosts` parsing is done (2026-10-10, `knownhosts.zig`); the file itself stays the caller's to read and write. Effort: small-medium each. Fit §2.
 
 ## Status
 

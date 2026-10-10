@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Added:** `knownhosts` — OpenSSH `known_hosts` as a host-key policy (Go's `knownhosts`):
+  `check(text, host, port, blob)` gives `accept` / `revoked` / `key_mismatch` / `unknown_host` in OpenSSH's
+  order (a host known only under other key types is unknown, not mismatched); wildcards, `!` negation,
+  `[host]:port`, hashed `|1|salt|hash` names (lowercased like `ssh-keygen -H`, checked byte-equal against it);
+  `writeLine`/`writeHashedName`; `KnownHosts` and `FixedHostKey` `HostKeyVerifier`s. `@cert-authority`
+  lines are parsed and skipped (certificates not supported yet).
+- **2026-10-10** — **Added:** `keys` — public keys as values (Go's `ParsePublicKey`, `ParseAuthorizedKey`,
+  `MarshalAuthorizedKey`, `FingerprintSHA256`, `FingerprintLegacyMD5`): `keys.PublicKey.parse` validates a
+  wire blob (no trailing bytes, curve name = type, point on curve, RSA bounds), `verify` refuses a
+  signature algorithm of another key type, fingerprints match `ssh-keygen -lf` for all five types;
+  `parseAuthorizedKeyLine` (quoted options with `\"`, type field cross-checked against the blob),
+  `AuthorizedKeysIterator` (skips what sshd skips, counts it), `findAuthorizedKey`, `writeAuthorizedKey`;
+  `transport.HostKeyInfo.publicKey`. Fuzz harness `ssh-pubkey` (peer blobs and damaged lines), 200k clean.
 - **2026-10-10** — **Added:** `ecdh-sha2-nistp521` key exchange and `ecdsa-sha2-nistp521` host and user keys,
   over the new `p521` module (std 0.16 has no P-521); `meta.deps` gains `p521`. Ephemeral P-521 scalars
   are drawn with the top byte masked to the order's bit length (521 bits). Live interop against OpenSSH

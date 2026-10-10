@@ -23,6 +23,7 @@ const burn = @import("burn.zig");
 const builtin = @import("builtin");
 const messages = @import("messages.zig");
 const rsa = @import("rsa");
+const keys = @import("keys.zig");
 const montint = @import("montint");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 /// helpers, in the format `std.testing.Smith` actually reads.
@@ -1184,6 +1185,13 @@ pub const HostKeyInfo = struct {
     /// the base64 field of a `known_hosts` line decodes to, and what
     /// `ssh-keygen -lf` fingerprints.
     key_blob: []const u8,
+
+    /// `key_blob` as a typed key, for its fingerprint, comparison with a
+    /// stored key, or a `known_hosts` line. Borrows `key_blob`, so it lives
+    /// only as long as the call does.
+    pub fn publicKey(self: HostKeyInfo) keys.ParseError!keys.PublicKey {
+        return keys.PublicKey.parse(self.key_blob);
+    }
 };
 
 /// Why a caller's host-key policy refused a key.
@@ -1793,6 +1801,7 @@ pub fn EcdhNistKeyPair(comptime c: EcdhNist) type {
 /// `fromSec1` checks the equation; the identity has no uncompressed encoding)
 /// and the product required not to be the identity. Returned as a big-endian
 /// field element of the curve's full length.
+// secret-api-ok: a KEX step, called only from the ECDH KEX bodies (client and server), which run under the KEX burn; `pub` for stackprobe_test and the ctgrind harness.
 pub fn ecdhNistShared(comptime c: EcdhNist, secret: *const [c.len()]u8, peer: []const u8) TransportError![c.len()]u8 {
     const C = c.Curve();
     if (peer.len != c.pointLen() or peer[0] != 0x04) return error.KexFailed;

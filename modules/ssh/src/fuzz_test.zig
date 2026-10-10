@@ -13,7 +13,7 @@
 //! Drivers: `SSH_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there); harness names `ssh-
 //! readstring`, `ssh-readmpint`, `ssh-kexinit`, `ssh-readpacket`,
-//! `ssh-session`, `ssh-userauth`, `ssh-keyload`.
+//! `ssh-session`, `ssh-userauth`, `ssh-keyload`, `ssh-pubkey`.
 
 const std = @import("std");
 const testing = std.testing;
@@ -188,6 +188,8 @@ pub const ScriptSource = struct {
     pub fn slice(self: *ScriptSource, buf: []u8) u32 {
         const left = self.cur.bytes.len -| self.cur.at;
         const n = @min(buf.len, left);
+        // `Cursor.byte` cycles, so `at` may already be past the end.
+        if (n == 0) return 0;
         @memcpy(buf[0..n], self.cur.bytes[self.cur.at..][0..n]);
         self.cur.at += n;
         return @intCast(n);
@@ -375,4 +377,129 @@ test "HostKey.fromOpenSSH: an RSA container whose public e disagrees with the se
     try testing.expectError(error.InvalidPrivateKey, server.HostKey.fromOpenSSH(&hk, text, null));
     var ak: userauth.AuthKey = undefined;
     try testing.expectError(error.InvalidPrivateKey, userauth.AuthKey.fromOpenSSH(&ak, text, null));
+}
+
+// ── public keys and authorized_keys lines ───────────────────────────────────
+//
+// `keys.PublicKey.parse` sees the PEER's bytes (the server's `K_S` through
+// `HostKeyInfo.publicKey`, a client's `publickey` blob); the `authorized_keys`
+// parser sees a local file. Shapes:
+//
+//   0   raw drawn bytes as a blob;
+//   1-3 a fixture blob (five key types), 0-3 octets damaged or cut short;
+//   4-5 a fixture written as an `authorized_keys` line with drawn options
+//       and comment octets, then 0-3 octets of the LINE damaged.
+//
+// Oracle: an intact fixture parses as its own type; anything that parses
+// survives `writeAuthorizedKey` → `parseAuthorizedKeyLine` with the same blob
+// and both fingerprints compute; nothing panics.
+
+const keys = @import("keys.zig");
+
+pub const PubLabel = enum { raw_rejected, intact_parsed, damaged_rejected, damaged_parsed, line_parsed, line_rejected };
+pub const pub_reach = Reach(PubLabel);
+
+const pub_fixtures = [_][]const u8{
+    vectors.ed25519_pub_b64,    vectors.rsa_pub_b64,        vectors.ecdsa_p256_pub_b64,
+    vectors.ecdsa_p384_pub_b64, vectors.ecdsa_p521_pub_b64,
+};
+
+fn roundTrip(key: keys.PublicKey) anyerror!void {
+    var fs: [keys.fingerprint_sha256_len]u8 = undefined;
+    _ = key.fingerprintSha256(&fs);
+    var fm: [keys.fingerprint_md5_len]u8 = undefined;
+    _ = key.fingerprintMd5(&fm);
+    var line: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&line);
+    try keys.writeAuthorizedKey(&w, key, "c");
+    var buf: [keys.max_blob_len]u8 = undefined;
+    const again = try keys.parseAuthorizedKeyLine(w.buffered(), &buf);
+    if (!again.key.eql(key)) return error.RoundTripChangedKey;
+}
+
+pub fn pubKeyHarness(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    const shape = src.valueRangeAtMost(u8, 0, 5);
+    if (shape == 0) {
+        var raw: [keys.max_blob_len + 16]u8 = undefined;
+        const n = src.slice(&raw);
+        if (keys.PublicKey.parse(raw[0..n])) |k| return roundTrip(k) else |_| {}
+        pub_reach.mark(.raw_rejected);
+        return;
+    }
+    const fx = pub_fixtures[src.valueRangeAtMost(u8, 0, pub_fixtures.len - 1)];
+    var orig_buf: [keys.max_blob_len]u8 = undefined;
+    const dec = std.base64.standard.Decoder;
+    const orig = orig_buf[0..try dec.calcSizeForSlice(fx)];
+    try dec.decode(orig, fx);
+
+    if (shape <= 3) {
+        var bin_buf: [keys.max_blob_len]u8 = undefined;
+        var bin: []u8 = bin_buf[0..orig.len];
+        @memcpy(bin, orig);
+        if (src.value(bool)) {
+            bin = bin[0 .. @as(usize, src.value(u16)) % (bin.len + 1)];
+        } else {
+            var k = src.valueRangeAtMost(u8, 0, 3);
+            while (k > 0) : (k -= 1) bin[@as(usize, src.value(u16)) % bin.len] ^= src.valueRangeAtMost(u8, 1, 255);
+        }
+        const intact = std.mem.eql(u8, bin, orig);
+        if (keys.PublicKey.parse(bin)) |key| {
+            try roundTrip(key);
+            if (intact) pub_reach.mark(.intact_parsed) else pub_reach.mark(.damaged_parsed);
+        } else |_| {
+            if (intact) return error.IntactKeyRejected;
+            pub_reach.mark(.damaged_rejected);
+        }
+        return;
+    }
+
+    var opts: [48]u8 = undefined;
+    const on = src.slice(&opts);
+    var comment: [24]u8 = undefined;
+    const cn = src.slice(&comment);
+    var line_buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&line_buf);
+    if (on != 0) {
+        try w.writeAll(opts[0..on]);
+        try w.writeByte(' ');
+    }
+    try keys.writeAuthorizedKey(&w, try keys.PublicKey.parse(orig), comment[0..cn]);
+    const line = line_buf[0..w.end];
+    var k = src.valueRangeAtMost(u8, 0, 3);
+    while (k > 0) : (k -= 1) line[@as(usize, src.value(u16)) % line.len] ^= src.valueRangeAtMost(u8, 1, 255);
+    var buf: [keys.max_blob_len]u8 = undefined;
+    if (keys.parseAuthorizedKeyLine(line, &buf)) |entry| {
+        var it = entry.optionIterator();
+        while (it.next()) |_| {}
+        try roundTrip(entry.key);
+        pub_reach.mark(.line_parsed);
+    } else |_| pub_reach.mark(.line_rejected);
+    var lines = keys.AuthorizedKeysIterator.init(line);
+    while (lines.next(&buf)) |entry| try roundTrip(entry.key);
+}
+
+fn fuzzPubKey(_: void, smith: *testing.Smith) !void {
+    var script: [512]u8 = undefined;
+    const n = smith.slice(&script);
+    var src: ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    return pubKeyHarness(ScriptSource, &src, testing.allocator);
+}
+
+const pubkey_seeds = [_][]const u8{
+    testkit.fuzz.seedHex("010000"), // fixture 0 intact
+    testkit.fuzz.seedHex("0104000200100ff0"), // p521 blob, two octets damaged
+    testkit.fuzz.seedHex("04020000"), // ecdsa-p256 as a bare line
+    testkit.fuzz.seed(""),
+};
+
+test "fuzz: public-key blobs and authorized_keys lines never panic" {
+    try testing.fuzz({}, fuzzPubKey, .{ .corpus = &pubkey_seeds });
+}
+
+test "fuzz driver: SSH_FUZZ (ssh-pubkey)" {
+    try fuzz_driver.run(pubKeyHarness, .{ .prefix = "SSH_FUZZ", .name = "ssh-pubkey" });
+}
+
+test "fuzz harness: 300 public-key seeds in every test run, and they get everywhere" {
+    try reachSeeds(pub_reach, "ssh-pubkey", pubKeyHarness, 300);
 }
