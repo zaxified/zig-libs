@@ -284,8 +284,8 @@ decaf448	ReleaseFast	scalarmul	1	0	dd1af0024c4e1323	77a1bd1038ca1053
 # `alpha` only to list its input-dependent branches, and a bound is all it
 # pins. It does NOT catch E15's `timing_safe.eql` -> `mem.eql` mutation
 # (measured, same count). Read no constant-time claim into this row.
-ecvrf	ReleaseFast	prove	1	0	52e76e04bef2cffc	f676793e0800a787
-ecvrf	ReleaseFast	verify	1	>=1	52e76e04bef2cffc	087c8ff4d336d9b1
+ecvrf	ReleaseFast	prove	1	0	8b01b2b0210de673	f676793e0800a787
+ecvrf	ReleaseFast	verify	1	>=1	8b01b2b0210de673	087c8ff4d336d9b1
 ed448	ReleaseFast	full	1	3	838a6c0b078b46f2	5853bb35135afb85
 ed448	ReleaseFast	ladder	1	0	a56ef8197ddaa7a3	43db8426e0d6c6e7
 # k256 — the field layer is clean; every group/sign/ecdsa context is a
