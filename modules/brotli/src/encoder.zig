@@ -86,18 +86,28 @@ const BitWriter = struct {
     cnt: u6 = 0,
     gpa: std.mem.Allocator,
 
-    fn writeBits(self: *BitWriter, val: u32, n: u6) std.mem.Allocator.Error!void {
+    /// Up to 32 bits. The accumulator holds up to 31 pending bits between
+    /// calls and goes out four bytes at a time (a byte per `append` was most
+    /// of `writeCompressedBlock`'s time, bench 2026-10-11).
+    inline fn writeBits(self: *BitWriter, val: u32, n: u6) std.mem.Allocator.Error!void {
         const m: u64 = (@as(u64, 1) << n) - 1;
         self.acc |= (@as(u64, val) & m) << self.cnt;
         self.cnt += n;
-        while (self.cnt >= 8) {
-            try self.buf.append(self.gpa, @truncate(self.acc & 0xff));
-            self.acc >>= 8;
-            self.cnt -= 8;
+        if (self.cnt >= 32) {
+            try self.buf.ensureUnusedCapacity(self.gpa, 4);
+            self.buf.appendSliceAssumeCapacity(&std.mem.toBytes(std.mem.nativeToLittle(u32, @truncate(self.acc))));
+            self.acc >>= 32;
+            self.cnt -= 32;
         }
     }
 
+    /// Write out every pending bit, the last byte zero-padded.
     fn alignToByte(self: *BitWriter) std.mem.Allocator.Error!void {
+        while (self.cnt >= 8) {
+            try self.buf.append(self.gpa, @truncate(self.acc));
+            self.acc >>= 8;
+            self.cnt -= 8;
+        }
         if (self.cnt != 0) {
             try self.buf.append(self.gpa, @truncate(self.acc & 0xff));
             self.acc = 0;
@@ -105,8 +115,26 @@ const BitWriter = struct {
         }
     }
 
+    /// Precondition: byte aligned (`alignToByte`).
     fn writeBytes(self: *BitWriter, bytes: []const u8) std.mem.Allocator.Error!void {
         try self.buf.appendSlice(self.gpa, bytes);
+    }
+
+    /// A writer that continues from `m` of another (same pending bits), for
+    /// writing an alternative into a scratch buffer.
+    fn resumeAt(self: *BitWriter, m: Mark) void {
+        self.buf.clearRetainingCapacity();
+        self.acc = m.acc;
+        self.cnt = m.cnt;
+    }
+
+    /// Replace everything written since `m` with what `alt` (resumed at the
+    /// same `m`) holds.
+    fn takeFrom(self: *BitWriter, m: Mark, alt: *const BitWriter) std.mem.Allocator.Error!void {
+        self.rollback(m);
+        try self.buf.appendSlice(self.gpa, alt.buf.items);
+        self.acc = alt.acc;
+        self.cnt = alt.cnt;
     }
 
     /// Absolute bit position, used to price a block against its alternative.
@@ -326,12 +354,15 @@ const Code = struct {
 
 /// Invert a decoder-side `huffman.Table` into writable bit patterns.
 ///
-/// A symbol with code length L occupies table indices `rev + k * 2^L`; the
-/// smallest of those, `rev`, is exactly the L bits to write (the reader peeks
-/// `table.bits` bits and indexes with them, so the first bit written is the
-/// index's bit 0). Deriving the patterns from the table the *decoder* would
-/// build removes any chance of the two disagreeing about canonical code
-/// assignment — the format-level risk is anchored externally instead.
+/// A symbol with code length L ≤ `table.bits` occupies root indices
+/// `rev + k * 2^L`; the smallest of those, `rev`, is exactly the L bits to
+/// write (the reader peeks `table.bits` bits and indexes with them, so the
+/// first bit written is the index's bit 0). A longer code sits in the subtable
+/// a root link at index `i` points to, at `j + k * 2^(L - table.bits)`: its
+/// bits are `i` then the smallest `j`. Deriving the patterns from the table the
+/// *decoder* would build removes any chance of the two disagreeing about
+/// canonical code assignment — the format-level risk is anchored externally
+/// instead.
 fn codeFromTable(gpa: std.mem.Allocator, table: *const huffman.Table, alphabet_size: u32) !Code {
     const bits = try gpa.alloc(u16, alphabet_size);
     errdefer gpa.free(bits);
@@ -342,6 +373,17 @@ fn codeFromTable(gpa: std.mem.Allocator, table: *const huffman.Table, alphabet_s
 
     const size = @as(usize, 1) << table.bits;
     for (table.entries[0..size], 0..) |e, i| {
+        if (e.len & huffman.link_flag != 0) {
+            const sub_size = @as(usize, 1) << @as(u5, @intCast(e.len & ~huffman.link_flag));
+            for (table.entries[e.sym..][0..sub_size], 0..) |se, j| {
+                if (se.sym >= alphabet_size) return error.InvalidHuffman;
+                if (j < @as(usize, 1) << @as(u5, @intCast(se.len - table.bits))) {
+                    bits[se.sym] = @intCast(i | (j << table.bits));
+                    len[se.sym] = se.len;
+                }
+            }
+            continue;
+        }
         if (e.sym >= alphabet_size) return error.InvalidHuffman;
         if (e.len == 0) continue; // single-symbol code: nothing to write
         if (i < @as(usize, 1) << @as(u5, @intCast(e.len))) {
@@ -708,9 +750,12 @@ const Matcher = struct {
         const size = @as(usize, 1) << chain_log;
         const head = try gpa.alloc(u32, @as(usize, 1) << hash_log);
         errdefer gpa.free(head);
+        // `prev` is left as allocated: `find` reads `prev[c & mask]` only for
+        // a candidate `c` that came out of `head` or `prev`, and `insert(c)`
+        // wrote that slot first. Clearing it cost a byte-wise memset of up to
+        // 4 MiB per call (below).
         const prev = try gpa.alloc(u32, size);
-        @memset(head, empty);
-        @memset(prev, empty);
+        fillEmpty(head);
         return .{
             .chain_depth = chain_depth,
             .head = head,
@@ -719,6 +764,38 @@ const Matcher = struct {
             .hash_shift = @intCast(32 - @as(u6, hash_log)),
             .data = data,
         };
+    }
+
+    /// `@memset(head, empty)` in 32-byte stores. Zig 0.16 without libc
+    /// lowers `@memset` to `compiler_rt.memset`, which stores one byte at a
+    /// time: 20 % of `fast` compression of 128 KiB (bench 2026-10-11). The
+    /// stores are volatile so LLVM does not turn the loop back into that
+    /// call. Same workaround as `zstd/src/fill.zig`; `fastmem` exports a
+    /// replacement for whole executables. Delete when Zig's memset is
+    /// vectorised (after 0.16) and go back to `@memset`.
+    fn fillEmpty(buf: []u32) void {
+        const V = @Vector(8, u32);
+        const v: V = @splat(empty);
+        const p: [*]volatile u32 = buf.ptr;
+        var i: usize = 0;
+        while (i + 8 <= buf.len) : (i += 8) {
+            const w: *align(4) volatile V = @ptrCast(p + i);
+            w.* = v;
+        }
+        while (i < buf.len) : (i += 1) p[i] = empty;
+    }
+
+    /// Length of the common prefix of `data[c..]` and `data[p..]`, at most
+    /// `max_len` (`p + max_len <= data.len`, `c < p`): eight bytes per step,
+    /// the first differing byte from the XOR's trailing zeros.
+    fn matchLen(data: []const u8, c: usize, p: usize, max_len: usize) usize {
+        var l: usize = 0;
+        while (l + 8 <= max_len) : (l += 8) {
+            const x = std.mem.readInt(u64, data[c + l ..][0..8], .little) ^ std.mem.readInt(u64, data[p + l ..][0..8], .little);
+            if (x != 0) return l + @ctz(x) / 8;
+        }
+        while (l < max_len and data[c + l] == data[p + l]) l += 1;
+        return l;
     }
 
     fn deinit(self: *Matcher, gpa: std.mem.Allocator) void {
@@ -770,8 +847,7 @@ const Matcher = struct {
             // Cheap reject: a candidate that cannot beat `best_len` is skipped
             // before the byte-by-byte compare.
             if (best_len == 0 or self.data[c + best_len] == self.data[p + best_len]) {
-                var l: usize = 0;
-                while (l < max_len and self.data[c + l] == self.data[p + l]) l += 1;
+                const l = matchLen(self.data, c, p, max_len);
                 if (l >= min_match) {
                     const g = self.gain(l, d);
                     if (g > best_gain) {
@@ -1424,6 +1500,10 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOpt
     var cmds: std.ArrayListUnmanaged(Cmd) = .empty;
     defer cmds.deinit(gpa);
 
+    // The single-literal-code alternative of a block is written here.
+    var alt = BitWriter{ .gpa = gpa };
+    defer alt.buf.deinit(gpa);
+
     var emitted_last = false;
     var ring: DistRing = .{};
     var off: usize = 0;
@@ -1441,22 +1521,21 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOpt
         var kept = false;
         var trial = ring;
         const first = try tryBlock(gpa, &w, input, off, end, cmds.items, is_last, &trial, opts.effort, false);
-        var ok = first != null;
+        const ok = first != null;
         // The context model was chosen on estimated bits. When it split the
         // literals, write the block once more with a single literal code and
         // keep whichever is really shorter (a flat, small alphabet is where
         // the estimate overfits: `alpha5_flat` came out 1.4 % larger with
         // contexts than without).
+        // The alternative goes to `alt`, resumed at the same bit, so the
+        // winner is spliced in instead of written a third time.
         if (first != null and first.? > 1) {
             const ctx_end = w.bitPos();
-            w.rollback(m);
+            alt.resumeAt(m);
             var single_ring = ring;
-            const single = try tryBlock(gpa, &w, input, off, end, cmds.items, is_last, &single_ring, opts.effort, true);
-            if (single == null or ctx_end < w.bitPos()) {
-                w.rollback(m);
-                trial = ring;
-                ok = (try tryBlock(gpa, &w, input, off, end, cmds.items, is_last, &trial, opts.effort, false)) != null;
-            } else {
+            const single = try tryBlock(gpa, &alt, input, off, end, cmds.items, is_last, &single_ring, opts.effort, true);
+            if (single != null and ctx_end >= m.len * 8 + alt.bitPos()) {
+                try w.takeFrom(m, &alt);
                 trial = single_ring;
             }
         }

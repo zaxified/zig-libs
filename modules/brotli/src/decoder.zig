@@ -119,11 +119,6 @@ fn DecoderOf(comptime Sink: type) type {
         dist_htree_index: u32 = 0,
         last_distance_context: u32 = 0,
 
-        fn appendByte(self: *Self, b: u8) Error!void {
-            try self.out.reserve(1, self.br);
-            try self.out.put(b);
-        }
-
         fn ensureRoom(self: *Self, n: usize) Error!void {
             try self.out.reserve(n, self.br);
         }
@@ -497,6 +492,7 @@ fn DecoderOf(comptime Sink: type) type {
             self.htree_command = &self.command_group[0];
             try self.calculateDistanceLut(dist_alphabet_size);
 
+            self.out.hint(@intCast(mlen));
             try self.runCommands(mlen);
         }
 
@@ -535,7 +531,8 @@ fn DecoderOf(comptime Sink: type) type {
                         const hc = &self.literal_group[self.context_map_slice[context]];
                         lit = try self.br.readSymbol(hc);
                     }
-                    try self.appendByte(@intCast(lit));
+                    // Room for the whole insert was reserved above.
+                    try self.out.put(@intCast(lit));
                     self.block_length[0] -= 1;
                 }
                 mlen -= insert_len;
@@ -604,10 +601,7 @@ fn DecoderOf(comptime Sink: type) type {
                     self.dist_rb[self.dist_rb_idx & 3] = distance;
                     self.dist_rb_idx +%= 1;
                     try self.ensureRoom(copy);
-                    // `back(d)` moves with every byte put, so an overlapping copy
-                    // (d < copy) repeats the pattern, as LZ77 requires.
-                    var k: usize = 0;
-                    while (k < copy) : (k += 1) try self.out.put(self.out.back(d));
+                    try self.out.copyBack(d, copy);
                     mlen -= @intCast(copy);
                     if (mlen < 0) return error.InvalidLength;
                 }
@@ -703,6 +697,7 @@ const ListSink = struct {
     }
     fn reserve(s: *ListSink, n: usize, _: *const BitReader) BrotliError!void {
         if (s.list.items.len + n > s.cap) return error.OutputTooLarge;
+        if (s.list.capacity - s.list.items.len >= n) return; // usually: `hint` grew it
         try s.list.ensureUnusedCapacity(s.gpa, n);
     }
     fn reserveStored(s: *ListSink, n: usize, br: *const BitReader) BrotliError!void {
@@ -713,6 +708,34 @@ const ListSink = struct {
     }
     fn putSlice(s: *ListSink, bytes: []const u8) BrotliError!void {
         s.list.appendSliceAssumeCapacity(bytes);
+    }
+    /// Append `n` bytes copied from `d` back (after `reserve(n)`). An
+    /// overlapping copy (d < n) repeats the last `d` bytes, as LZ77 requires:
+    /// it goes in chunks of `d`, each a non-overlapping copy of bytes already
+    /// written; a short period goes byte by byte.
+    fn copyBack(s: *ListSink, d: usize, n: usize) BrotliError!void {
+        const start = s.list.items.len;
+        s.list.items.len += n;
+        const buf = s.list.items;
+        if (d >= n) {
+            @memcpy(buf[start..][0..n], buf[start - d ..][0..n]);
+        } else if (d < 8) {
+            for (start..start + n) |i| buf[i] = buf[i - d];
+        } else {
+            var k: usize = 0;
+            while (k < n) {
+                const c = @min(d, n - k);
+                @memcpy(buf[start + k ..][0..c], buf[start + k - d ..][0..c]);
+                k += c;
+            }
+        }
+    }
+    /// The next `n` bytes are coming (a meta-block's length): grow once, up
+    /// to the cap, instead of doubling through it. A failure here is left to
+    /// `reserve`, which reports it at the byte that needs the room.
+    fn hint(s: *ListSink, n: usize) void {
+        const room = @min(n, s.cap -| s.list.items.len);
+        s.list.ensureUnusedCapacity(s.gpa, room) catch {};
     }
     fn readAligned(s: *ListSink, br: *BitReader, n: usize) BrotliError!void {
         const start = s.list.items.len;
@@ -811,6 +834,12 @@ const RingSink = struct {
     fn putSlice(s: *RingSink, bytes: []const u8) Error!void {
         for (bytes) |b| try s.put(b);
     }
+    /// `back(d)` moves with every byte put, so an overlapping copy (d < n)
+    /// repeats the pattern, as LZ77 requires.
+    fn copyBack(s: *RingSink, d: usize, n: usize) Error!void {
+        for (0..n) |_| try s.put(s.back(d));
+    }
+    fn hint(_: *RingSink, _: usize) void {}
     fn readAligned(s: *RingSink, br: *BitReader, n: usize) Error!void {
         var rem = n;
         while (rem > 0) {

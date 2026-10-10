@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Speed (bench vs google/brotli 1.2.0: 1.41–3.38× → 1.04–1.88×, P3). Decoder:
+  two-level prefix tables (8-bit root), an 8-byte bit-reader refill, `memcpy` back-references, one
+  output reserve per insert and one growth per meta-block. Encoder: the single-literal-code
+  alternative of a block is written to a scratch writer instead of re-writing the winner (output
+  byte-identical), the bit writer flushes 32 bits at a time, the match finder no longer clears its
+  `prev` chain and fills `head` in vector stores (Zig 0.16's `memset` is byte-wise without libc), and
+  match lengths are compared 8 bytes at a time. No API change.
+
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-brotli`): **1.41–3.38× google/brotli** — over 2×, P4. Card stays `not measured` with the numbers in *Backlog* until the module is sped up (owner 2026-10-10: a consumed module must grade 3 or better). Tooling only, no code change.
 
 - **2026-10-04** — Builds for 32-bit and Windows: `meta.targets` is now linux64, linux32 (mips32,

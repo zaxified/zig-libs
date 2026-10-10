@@ -3,17 +3,30 @@
 //!
 //! Codes are read least-significant-bit first, so the canonical (MSB-first)
 //! code assigned to each symbol is bit-reversed before being placed into a
-//! flat lookup table of size `1 << bits`. Decoding peeks `bits` bits, indexes
-//! the table, and drops the entry's actual code length.
+//! lookup table. Two levels, as in zlib and google/brotli: a root table of
+//! `1 << bits` entries (`bits` ≤ `root_bits`) holds every code up to that
+//! length; a longer code's root entry links to a subtable indexed by the bits
+//! after the root. A flat table of `1 << 15` entries (128 KiB) per literal
+//! tree missed the cache on most lookups (bench 2026-10-11). Decoding peeks
+//! `bits` bits, indexes the root, follows a link once, and drops the entry's
+//! actual code length.
 
 const std = @import("std");
 const BrotliError = @import("errors.zig").BrotliError;
 
+/// A symbol and its code length, or -- `len & link_flag` -- a link from the
+/// root: the subtable starts at `entries[sym]` and is indexed by
+/// `len & ~link_flag` bits.
 pub const Entry = struct { sym: u16, len: u8 };
+pub const link_flag: u8 = 0x80;
+
+/// Root table index width for codes longer than this (google/brotli's
+/// `HUFFMAN_TABLE_BITS`).
+pub const root_bits = 8;
 
 pub const Table = struct {
     entries: []Entry,
-    bits: u5, // index width == max code length (0 for a single-symbol code)
+    bits: u5, // root index width: min(max code length, root_bits); 0 for a single-symbol code
 
     pub fn deinit(self: *Table, gpa: std.mem.Allocator) void {
         gpa.free(self.entries);
@@ -79,21 +92,58 @@ pub fn buildComplex(gpa: std.mem.Allocator, code_lengths: []const u8) BrotliErro
         next_code[len] = code;
     }
 
-    const size = @as(usize, 1) << max_len;
+    const root: u5 = @min(max_len, root_bits);
+    const root_size = @as(usize, 1) << root;
+
+    // Subtables: a code longer than `root` belongs to the one of its first
+    // `root` bits (MSB-first: `key`). In canonical order the codes under one
+    // key are contiguous and, the code being complete, fill its subtree; the
+    // subtable is as deep as the longest of them.
+    var sub_max = [_]u5{0} ** (1 << root_bits);
+    if (max_len > root) {
+        var nc = next_code;
+        for (code_lengths) |l| {
+            if (l == 0) continue;
+            const L: u5 = @intCast(l);
+            const c = nc[L];
+            nc[L] += 1;
+            if (L <= root) continue;
+            const key = c >> @intCast(L - root);
+            sub_max[key] = @max(sub_max[key], L);
+        }
+    }
+    var sub_off = [_]u16{0} ** (1 << root_bits);
+    var size = root_size;
+    for (sub_max[0..root_size], sub_off[0..root_size]) |m, *off| {
+        if (m == 0) continue;
+        off.* = @intCast(size);
+        size += @as(usize, 1) << (m - root);
+    }
+
     const entries = try gpa.alloc(Entry, size);
+    for (sub_max[0..root_size], sub_off[0..root_size], 0..) |m, off, key| {
+        if (m == 0) continue;
+        entries[reverseBits(@intCast(key), root)] = .{ .sym = off, .len = link_flag | (m - root) };
+    }
     for (code_lengths, 0..) |l, sym| {
         if (l == 0) continue;
         const L: u5 = @intCast(l);
         const c = next_code[L];
         next_code[L] += 1;
         const rev = reverseBits(c, L);
-        const step = @as(usize, 1) << L;
-        var idx: usize = rev;
-        while (idx < size) : (idx += step) {
-            entries[idx] = .{ .sym = @intCast(sym), .len = l };
+        if (L <= root) {
+            const step = @as(usize, 1) << L;
+            var idx: usize = rev;
+            while (idx < root_size) : (idx += step) entries[idx] = .{ .sym = @intCast(sym), .len = l };
+        } else {
+            const key = c >> @intCast(L - root);
+            const sub_size = @as(usize, 1) << (sub_max[key] - root);
+            const step = @as(usize, 1) << (L - root);
+            var idx: usize = rev >> root;
+            while (idx < sub_size) : (idx += step) entries[sub_off[key] + idx] = .{ .sym = @intCast(sym), .len = l };
         }
     }
-    return .{ .entries = entries, .bits = max_len };
+    return .{ .entries = entries, .bits = root };
 }
 
 /// Build a simple prefix code (3.4). `num_symbols` is the decoded selector

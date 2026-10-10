@@ -68,7 +68,25 @@ pub const BitReader = struct {
         }
     }
 
-    fn refill(self: *BitReader) void {
+    inline fn refill(self: *BitReader) void {
+        if (self.cnt > 56) return;
+        // Fast path, eight bytes at hand: one load fills the accumulator to
+        // 57..64 bits. Only the whole bytes counted are kept: the bits above
+        // `cnt` must stay zero, because the aligned-byte readers move
+        // `byte_pos` past the accumulator.
+        if (self.data.len - self.byte_pos >= 8) {
+            const nbytes = (64 - self.cnt) >> 3;
+            const v = std.mem.readInt(u64, self.data[self.byte_pos..][0..8], .little) & mask(nbytes * 8);
+            self.acc |= v << @intCast(self.cnt);
+            self.byte_pos += nbytes;
+            self.cnt += nbytes * 8;
+            return;
+        }
+        self.refillSlow();
+    }
+
+    /// The last bytes of a slice, or a stream chunk boundary: byte by byte.
+    fn refillSlow(self: *BitReader) void {
         while (self.cnt <= 56) {
             if (self.byte_pos == self.data.len and !self.nextChunk()) return;
             self.acc |= @as(u64, self.data[self.byte_pos]) << @intCast(self.cnt);
@@ -83,7 +101,7 @@ pub const BitReader = struct {
     }
 
     /// Read `n` (0..32) bits. Errors if fewer than `n` bits remain.
-    pub fn takeBits(self: *BitReader, n: u32) BrotliError!u32 {
+    pub inline fn takeBits(self: *BitReader, n: u32) BrotliError!u32 {
         if (n == 0) return 0;
         self.refill();
         if (self.cnt < n) return error.TruncatedInput;
@@ -105,10 +123,14 @@ pub const BitReader = struct {
     }
 
     /// Decode one symbol from a prefix-code table.
-    pub fn readSymbol(self: *BitReader, table: *const huffman.Table) BrotliError!u16 {
+    pub inline fn readSymbol(self: *BitReader, table: *const huffman.Table) BrotliError!u16 {
         self.refill();
         const idx: usize = @truncate(self.acc & mask(table.bits));
-        const e = table.entries[idx];
+        var e = table.entries[idx];
+        if (e.len & huffman.link_flag != 0) {
+            const sub: usize = @truncate((self.acc >> table.bits) & mask(e.len & ~huffman.link_flag));
+            e = table.entries[@as(usize, e.sym) + sub];
+        }
         if (e.len > self.cnt) return error.TruncatedInput;
         self.dropBits(e.len);
         return e.sym;
