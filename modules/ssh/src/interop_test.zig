@@ -49,9 +49,14 @@ fn writeFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     try fw.interface.flush();
 }
 
+/// `key_type` is an `ssh-keygen -t` name, or `ecdsa384` for `-t ecdsa -b 384`.
 fn keygen(io: std.Io, key_type: []const u8, path: []const u8) !void {
+    const p384 = std.mem.eql(u8, key_type, "ecdsa384");
     var child = std.process.spawn(io, .{
-        .argv = &.{ "ssh-keygen", "-q", "-t", key_type, "-N", "", "-C", "zig-ssh-interop", "-f", path },
+        .argv = if (p384)
+            &.{ "ssh-keygen", "-q", "-t", "ecdsa", "-b", "384", "-N", "", "-C", "zig-ssh-interop", "-f", path }
+        else
+            &.{ "ssh-keygen", "-q", "-t", key_type, "-N", "", "-C", "zig-ssh-interop", "-f", path },
         .stdout = .ignore,
         .stderr = .ignore,
     }) catch return error.SkipZigTest;
@@ -84,6 +89,8 @@ pub const SshdOptions = struct {
     /// Extra `-o` settings for `sshd`, e.g. `"RekeyLimit=32K"`.
     extra: []const []const u8 = &.{},
     client_key_type: []const u8 = "ed25519",
+    /// sshd's host key, in `keygen`'s naming.
+    host_key_type: []const u8 = "ed25519",
     /// Authenticate before returning (publickey, the fixture's own key).
     authenticate: bool = true,
     /// `Transport.offer_strict_kex` for our client.
@@ -121,7 +128,7 @@ pub const Sshd = struct {
         defer gpa.free(hk_path);
         const ck_path = try std.fmt.allocPrint(gpa, "{s}/ck", .{dir_path});
         defer gpa.free(ck_path);
-        try keygen(io, "ed25519", hk_path);
+        try keygen(io, opts.host_key_type, hk_path);
         try keygen(io, opts.client_key_type, ck_path);
 
         const ck_pub_path = try std.fmt.allocPrint(gpa, "{s}.pub", .{ck_path});
@@ -624,6 +631,30 @@ test "live: a real ssh client re-keys every 32 KiB against our server — we fol
     try expectPattern(out[0..out.len -| 2], big_output_len);
     try std.testing.expectEqualStrings("0\n", out[out.len -| 2..]);
     try std.testing.expect(kex_count >= 2);
+}
+
+test "live: our client — sshd with an ecdsa-sha2-nistp384 host key, publickey auth with an nistp384 user key" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try Sshd.start(gpa, threaded.io(), .{ .host_key_type = "ecdsa384", .client_key_type = "ecdsa384" });
+    defer fx.deinit();
+    try std.testing.expectEqualStrings("ecdsa-sha2-nistp384", fx.t.negotiated.?.host_key);
+    var res = connection.exec(&fx.t, gpa, "printf ok", .{}) catch |e| {
+        fx.dumpLog();
+        return e;
+    };
+    defer res.deinit(gpa);
+    try std.testing.expectEqualStrings("ok", res.stdout);
+}
+
+test "live: a real ssh client authenticates to our server with an ecdsa-sha2-nistp384 user key" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try SshClient.start(gpa, threaded.io(), .{ .user_key_type = "ecdsa384" });
+    defer fx.deinit();
+    _ = try fx.authenticate();
 }
 
 test "live: our server re-keys every 16 KiB against a real ssh client — it follows" {

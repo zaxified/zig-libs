@@ -116,3 +116,21 @@ pub const ed25519_enc_cbc_key =
     \\
 ;
 pub const ed25519_enc_cbc_pub_b64 = "AAAAC3NzaC1lZDI1NTE5AAAAIEq8T4lwqJnsth2zVWfVYPezBwn3eAW27HziuxxfgpFS";
+
+pub const ecdsa_p384_key =
+    \\-----BEGIN OPENSSH PRIVATE KEY-----
+    \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAiAAAABNlY2RzYS
+    \\1zaGEyLW5pc3RwMzg0AAAACG5pc3RwMzg0AAAAYQSxj+euKAsyQjR6bVdXkUiJb4O5Oav8
+    \\xmmrwclXZijLFShdQnpu0ggC0260/kV8X2hFixCHj8S82L7FHQv5/ajrTbRM3dr4Raw2Ny
+    \\n1XA+j9ZbD8A9jAcdgquI33GtpB/wAAADoiRzE0okcxNIAAAATZWNkc2Etc2hhMi1uaXN0
+    \\cDM4NAAAAAhuaXN0cDM4NAAAAGEEsY/nrigLMkI0em1XV5FIiW+DuTmr/MZpq8HJV2Yoyx
+    \\UoXUJ6btIIAtNutP5FfF9oRYsQh4/EvNi+xR0L+f2o6020TN3a+EWsNjcp9VwPo/WWw/AP
+    \\YwHHYKriN9xraQf8AAAAMQCMj3GmquDQTSNyJ6FMKYpSBIv2NELSZAcIVh5bk9ClWvfgPq
+    \\MoljAfP2kBqnYw8zIAAAAZemlnLWxpYnMtc3NoLXRlc3QtZml4dHVyZQECAwQFBg==
+    \\-----END OPENSSH PRIVATE KEY-----
+    \\
+;
+pub const ecdsa_p384_pub_b64 =
+    "AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBLGP564oCzJCNHptV1eRSIlv" ++
+    "g7k5q/zGaavByVdmKMsVKF1Cem7SCALTbrT+RXxfaEWLEIePxLzYvsUdC/n9qOtNtEzd2vhFrDY3" ++
+    "KfVcD6P1lsPwD2MBx2Cq4jfca2kH/A==";

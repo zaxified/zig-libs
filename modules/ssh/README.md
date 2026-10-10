@@ -15,7 +15,7 @@ as the server. No `@panic` stubs remain in this module.
   `chacha20-poly1305@openssh.com` / `aes256-ctr`+`hmac-sha2-256` /
   `aes{128,256}-gcm@openssh.com` ciphers, and host-key *verification* (client)
   / *signing* (server) for ssh-ed25519, rsa-sha2-256/512 (via the `rsa` module)
-  and ecdsa-sha2-nistp256. Once a handshake completes, `Transport.negotiated`
+  and ecdsa-sha2-nistp256 / -nistp384. Once a handshake completes, `Transport.negotiated`
   reports the negotiated KEX/host-key/cipher/MAC wire names (both roles) —
   diagnostics parity with `ssh -v`'s negotiation banner. **Key re-exchange**
   (RFC 4253 §9) runs inside `Transport.recvPacket`/`sendPacket` in either role

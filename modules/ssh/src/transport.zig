@@ -34,6 +34,7 @@ const Sha512 = std.crypto.hash.sha2.Sha512;
 const X25519 = std.crypto.dh.X25519;
 const Ed25519 = std.crypto.sign.Ed25519;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Sha384 = std.crypto.hash.sha2.Sha384;
 const P256 = std.crypto.ecc.P256;
 const P384 = std.crypto.ecc.P384;
@@ -145,6 +146,7 @@ pub const server_host_key_algorithms = [_][]const u8{
     "rsa-sha2-256",
     "rsa-sha2-512",
     "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
 };
 
 /// Symmetric ciphers this client offers (same list both directions).
@@ -283,6 +285,7 @@ pub const public_key_algorithms = [_][]const u8{
     "rsa-sha2-512",
     "rsa-sha2-256",
     "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
 };
 
 /// OpenSSH strict key exchange (`PROTOCOL` §1.9, the Terrapin
@@ -1392,6 +1395,7 @@ pub fn keyBlobTypeFor(algorithm: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, algorithm, "rsa-sha2-256")) return "ssh-rsa";
     if (std.mem.eql(u8, algorithm, "rsa-sha2-512")) return "ssh-rsa";
     if (std.mem.eql(u8, algorithm, "ecdsa-sha2-nistp256")) return "ecdsa-sha2-nistp256";
+    if (std.mem.eql(u8, algorithm, "ecdsa-sha2-nistp384")) return "ecdsa-sha2-nistp384";
     return null;
 }
 
@@ -1471,21 +1475,33 @@ pub fn verifySignature(key_type: []const u8, k_s: []const u8, sig_blob: []const 
             rsa.verifyPkcs1v15(pk, Sha512, h, sig_bytes) catch return error.HostKeyVerificationFailed;
         } else return error.UnsupportedAlgorithm;
     } else if (std.mem.eql(u8, key_type, "ecdsa-sha2-nistp256")) {
-        var ksr = SliceReader{ .b = k_s };
-        _ = try ksr.string(); // type
-        _ = try ksr.string(); // curve name "nistp256"
-        const q = try ksr.string(); // SEC1 point
-        var ssr = SliceReader{ .b = sig_bytes };
-        const r_m = stripLeadingZeros(try ssr.string());
-        const s_m = stripLeadingZeros(try ssr.string());
-        if (r_m.len > 32 or s_m.len > 32) return error.HostKeyVerificationFailed;
-        var rs = [_]u8{0} ** 64;
-        @memcpy(rs[32 - r_m.len .. 32], r_m);
-        @memcpy(rs[64 - s_m.len .. 64], s_m);
-        const pk = EcdsaP256.PublicKey.fromSec1(q) catch return error.HostKeyVerificationFailed;
-        const signature = EcdsaP256.Signature.fromBytes(rs);
-        signature.verify(h, pk) catch return error.HostKeyVerificationFailed;
+        try verifyEcdsa(EcdsaP256, "nistp256", k_s, sig_bytes, h);
+    } else if (std.mem.eql(u8, key_type, "ecdsa-sha2-nistp384")) {
+        try verifyEcdsa(EcdsaP384, "nistp384", k_s, sig_bytes, h);
     } else return error.UnsupportedAlgorithm;
+}
+
+/// RFC 5656 §3.1 / §3.1.2: `k_s` is `string type || string curve || string Q`
+/// and `sig_bytes` is `mpint r || mpint s`; `E` hashes `h` with the curve's
+/// own digest (SHA-256 for nistp256, SHA-384 for nistp384, §6.2.1). The
+/// curve name inside the blob must be the one its type names (Go's
+/// `parseECDSA` checks the same).
+fn verifyEcdsa(comptime E: type, comptime curve: []const u8, k_s: []const u8, sig_bytes: []const u8, h: []const u8) TransportError!void {
+    const n = E.Signature.encoded_length / 2;
+    var ksr = SliceReader{ .b = k_s };
+    _ = try ksr.string(); // type
+    if (!std.mem.eql(u8, try ksr.string(), curve)) return error.HostKeyVerificationFailed;
+    const q = try ksr.string(); // SEC1 point
+    var ssr = SliceReader{ .b = sig_bytes };
+    const r_m = stripLeadingZeros(try ssr.string());
+    const s_m = stripLeadingZeros(try ssr.string());
+    if (r_m.len > n or s_m.len > n) return error.HostKeyVerificationFailed;
+    var rs = [_]u8{0} ** (2 * n);
+    @memcpy(rs[n - r_m.len .. n], r_m);
+    @memcpy(rs[2 * n - s_m.len .. 2 * n], s_m);
+    const pk = E.PublicKey.fromSec1(q) catch return error.HostKeyVerificationFailed;
+    const signature = E.Signature.fromBytes(rs);
+    signature.verify(h, pk) catch return error.HostKeyVerificationFailed;
 }
 
 /// The client-side host-key gate, shared verbatim by all three KEX methods:
@@ -3428,7 +3444,7 @@ test "server-sig-algs names exactly what the verifier accepts" {
     // extension exists to prevent, one algorithm further along. The list is
     // spelled out rather than derived from `keyBlobTypeFor` so that adding a
     // branch there without adding the name here fails HERE.
-    const verifiable = [_][]const u8{ "ssh-ed25519", "rsa-sha2-256", "rsa-sha2-512", "ecdsa-sha2-nistp256" };
+    const verifiable = [_][]const u8{ "ssh-ed25519", "rsa-sha2-256", "rsa-sha2-512", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384" };
     try t.expectEqual(verifiable.len, public_key_algorithms.len);
     for (verifiable) |name| {
         try t.expect(pickFirst(&public_key_algorithms, &.{name}) != null);

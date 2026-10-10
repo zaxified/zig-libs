@@ -43,6 +43,7 @@ const burn = @import("burn.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
 const X25519 = std.crypto.dh.X25519;
@@ -116,6 +117,8 @@ pub const HostKey = union(enum) {
     /// `std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair` already exists and the
     /// shape mirrors `ed25519` exactly — no extra parsing machinery needed.
     ecdsa_p256: EcdsaP256.KeyPair,
+    /// `ecdsa-sha2-nistp384` (RFC 5656), the same shape on P-384 / SHA-384.
+    ecdsa_p384: EcdsaP384.KeyPair,
 
     pub const RsaHash = enum { sha2_256, sha2_512 };
 
@@ -139,14 +142,15 @@ pub const HostKey = union(enum) {
                 .sha2_512 => "rsa-sha2-512",
             },
             .ecdsa_p256 => "ecdsa-sha2-nistp256",
+            .ecdsa_p384 => "ecdsa-sha2-nistp384",
         };
     }
 
     pub const FromOpenSSHError = rsa.FromOpenSSHError || error{
         /// The container parsed structurally but names a key type this
-        /// module does not load (only `ssh-rsa`, `ssh-ed25519`, and
-        /// `ecdsa-sha2-nistp256` — also covers an ecdsa container naming a
-        /// curve other than nistp256, since `HostKey` has no other variant).
+        /// module does not load (only `ssh-rsa`, `ssh-ed25519`,
+        /// `ecdsa-sha2-nistp256` and `-nistp384` — also covers an ecdsa
+        /// container whose curve is not the one its type names).
         UnsupportedKeyType,
     };
 
@@ -219,6 +223,10 @@ pub const HostKey = union(enum) {
             out.* = .{ .ecdsa_p256 = undefined };
             return parseEcdsaP256Body(&out.ecdsa_p256, bin, passphrase orelse "");
         }
+        if (std.mem.eql(u8, key_type, "ecdsa-sha2-nistp384")) {
+            out.* = .{ .ecdsa_p384 = undefined };
+            return parseEcdsaP384Body(&out.ecdsa_p384, bin, passphrase orelse "");
+        }
         return error.UnsupportedKeyType;
     }
 
@@ -254,6 +262,12 @@ pub const HostKey = union(enum) {
                 const q = kp.public_key.toUncompressedSec1();
                 messages.writeString(&w, "ecdsa-sha2-nistp256") catch unreachable;
                 messages.writeString(&w, "nistp256") catch unreachable;
+                messages.writeString(&w, &q) catch unreachable;
+            },
+            .ecdsa_p384 => |*kp| {
+                const q = kp.public_key.toUncompressedSec1();
+                messages.writeString(&w, "ecdsa-sha2-nistp384") catch unreachable;
+                messages.writeString(&w, "nistp384") catch unreachable;
                 messages.writeString(&w, &q) catch unreachable;
             },
         }
@@ -309,20 +323,25 @@ pub const HostKey = union(enum) {
                 messages.writeString(&w, self.algorithmNameFor(rsa_hash)) catch unreachable;
                 messages.writeString(&w, raw) catch unreachable;
             },
-            .ecdsa_p256 => |*kp| {
-                const sig = kp.sign(data, null) catch
-                    @panic("ecdsa host-key signing failed on a validated key");
-                var inner_buf: [80]u8 = undefined;
-                var iw: std.Io.Writer = .fixed(&inner_buf);
-                messages.writeMpint(&iw, &sig.r) catch unreachable;
-                messages.writeMpint(&iw, &sig.s) catch unreachable;
-                messages.writeString(&w, "ecdsa-sha2-nistp256") catch unreachable;
-                messages.writeString(&w, iw.buffered()) catch unreachable;
-            },
+            .ecdsa_p256 => |*kp| signEcdsa(kp, "ecdsa-sha2-nistp256", data, &w),
+            .ecdsa_p384 => |*kp| signEcdsa(kp, "ecdsa-sha2-nistp384", data, &w),
         }
         return w.buffered();
     }
 };
+
+/// RFC 5656 §3.1.2 signature blob: `string name || string(mpint r || mpint s)`
+/// (NOT the fixed-width form; `transport.verifyEcdsa` reads it back).
+fn signEcdsa(kp: anytype, comptime name: []const u8, data: []const u8, w: *std.Io.Writer) void {
+    const sig = kp.sign(data, null) catch
+        @panic("ecdsa host-key signing failed on a validated key");
+    var inner_buf: [128]u8 = undefined;
+    var iw: std.Io.Writer = .fixed(&inner_buf);
+    messages.writeMpint(&iw, &sig.r) catch unreachable;
+    messages.writeMpint(&iw, &sig.s) catch unreachable;
+    messages.writeString(w, name) catch unreachable;
+    messages.writeString(w, iw.buffered()) catch unreachable;
+}
 
 // ── openssh-key-v1 container parsing (ed25519 + type dispatch) ──────────────
 
@@ -474,7 +493,30 @@ pub fn parseEcdsaP256OpenSSH(out: *EcdsaP256.KeyPair, bin: []const u8, passphras
     };
 }
 
+/// `parseEcdsaP256OpenSSH` for `ecdsa-sha2-nistp384`.
+pub fn parseEcdsaP384OpenSSH(out: *EcdsaP384.KeyPair, bin: []const u8, passphrase: []const u8) HostKey.FromOpenSSHError!void {
+    burn.run(burn.load_burn, HostKey.FromOpenSSHError!void, parseEcdsaP384Body, .{ out, bin, passphrase }) catch |e| {
+        std.crypto.secureZero(u8, std.mem.asBytes(out));
+        return e;
+    };
+}
+
 fn parseEcdsaP256Body(out: *EcdsaP256.KeyPair, bin: []const u8, passphrase: []const u8) HostKey.FromOpenSSHError!void {
+    return parseEcdsaBody(EcdsaP256, "ecdsa-sha2-nistp256", "nistp256", out, bin, passphrase);
+}
+
+fn parseEcdsaP384Body(out: *EcdsaP384.KeyPair, bin: []const u8, passphrase: []const u8) HostKey.FromOpenSSHError!void {
+    return parseEcdsaBody(EcdsaP384, "ecdsa-sha2-nistp384", "nistp384", out, bin, passphrase);
+}
+
+fn parseEcdsaBody(
+    comptime E: type,
+    comptime key_name: []const u8,
+    comptime curve_name: []const u8,
+    out: *E.KeyPair,
+    bin: []const u8,
+    passphrase: []const u8,
+) HostKey.FromOpenSSHError!void {
     const hdr = try parseContainerHeader(bin);
     var dec_buf: [16 * 1024]u8 = undefined;
     defer std.crypto.secureZero(u8, &dec_buf);
@@ -488,11 +530,11 @@ fn parseEcdsaP256Body(out: *EcdsaP256.KeyPair, bin: []const u8, passphrase: []co
     if (check1 != check2) return if (sec.encrypted) error.IncorrectPassphrase else error.InvalidOpenSSH;
 
     const keytype = cur.string() catch return error.InvalidOpenSSH;
-    if (!std.mem.eql(u8, keytype, "ecdsa-sha2-nistp256")) return error.UnsupportedKeyType;
+    if (!std.mem.eql(u8, keytype, key_name)) return error.UnsupportedKeyType;
     const curve = cur.string() catch return error.InvalidOpenSSH;
-    // Only nistp256 is wired up (`HostKey` has no nistp384/521 variant) —
-    // same "unsupported, not malformed" verdict the type dispatch above uses.
-    if (!std.mem.eql(u8, curve, "nistp256")) return error.UnsupportedKeyType;
+    // The curve must be the one the type names — same "unsupported, not
+    // malformed" verdict the type dispatch above uses.
+    if (!std.mem.eql(u8, curve, curve_name)) return error.UnsupportedKeyType;
     _ = cur.string() catch return error.InvalidOpenSSH; // Q — rebuilt from d below, not trusted
     const d_wire = cur.string() catch return error.InvalidOpenSSH;
     _ = cur.string() catch return error.InvalidOpenSSH; // comment
@@ -507,14 +549,14 @@ fn parseEcdsaP256Body(out: *EcdsaP256.KeyPair, bin: []const u8, passphrase: []co
     // `d` is mpint-encoded: big-endian magnitude, with a leading zero byte
     // only when the top bit would otherwise read as a sign bit. Strip it and
     // right-align into the fixed-width scalar `SecretKey.fromBytes` wants.
-    var scalar: [32]u8 = @splat(0);
+    var scalar: [E.SecretKey.encoded_length]u8 = @splat(0);
     const trimmed = std.mem.trimStart(u8, d_wire, &.{0});
     if (trimmed.len > scalar.len or trimmed.len == 0) return error.InvalidPrivateKey;
     @memcpy(scalar[scalar.len - trimmed.len ..], trimmed);
     defer std.crypto.secureZero(u8, &scalar);
 
-    const sk = EcdsaP256.SecretKey.fromBytes(scalar) catch return error.InvalidPrivateKey;
-    out.* = EcdsaP256.KeyPair.fromSecretKey(sk) catch return error.InvalidPrivateKey;
+    const sk = E.SecretKey.fromBytes(scalar) catch return error.InvalidPrivateKey;
+    out.* = E.KeyPair.fromSecretKey(sk) catch return error.InvalidPrivateKey;
     // Do not trust the parsed `d` (or the container's own `Q`, which is never
     // even read into a value above): rebuild K_S through publicBlob and
     // require it to equal the container's plaintext public blob byte for
@@ -522,8 +564,8 @@ fn parseEcdsaP256Body(out: *EcdsaP256.KeyPair, bin: []const u8, passphrase: []co
     // (e, n) and this file's own `parseEd25519OpenSSH` does for the seed.
     var pb_buf: [1024]u8 = undefined;
     var pb_w: std.Io.Writer = .fixed(&pb_buf);
-    messages.writeString(&pb_w, "ecdsa-sha2-nistp256") catch unreachable;
-    messages.writeString(&pb_w, "nistp256") catch unreachable;
+    messages.writeString(&pb_w, key_name) catch unreachable;
+    messages.writeString(&pb_w, curve_name) catch unreachable;
     messages.writeString(&pb_w, &out.public_key.toUncompressedSec1()) catch unreachable;
     if (!std.mem.eql(u8, pb_w.buffered(), hdr.public_blob)) return error.InvalidPrivateKey;
 }
@@ -1416,6 +1458,8 @@ const fixture_rsa_key = vectors.rsa_key;
 const fixture_rsa_pub_b64 = vectors.rsa_pub_b64;
 const fixture_ecdsa_p256_key = vectors.ecdsa_p256_key;
 const fixture_ecdsa_p256_pub_b64 = vectors.ecdsa_p256_pub_b64;
+const fixture_ecdsa_p384_key = vectors.ecdsa_p384_key;
+const fixture_ecdsa_p384_pub_b64 = vectors.ecdsa_p384_pub_b64;
 
 fn decodeFixturePub(b64: []const u8, buf: []u8) ![]u8 {
     const dec = std.base64.standard.Decoder;
@@ -1516,6 +1560,30 @@ test "HostKey.fromOpenSSH: ecdsa-p256 fixture parses; K_S matches ssh-keygen's .
     @memcpy(rs[32 - r_m.len .. 32], r_m);
     @memcpy(rs[64 - s_m.len .. 64], s_m);
     try EcdsaP256.Signature.fromBytes(rs).verify(&h, pk);
+}
+
+test "HostKey.fromOpenSSH: ecdsa-p384 fixture parses; K_S matches ssh-keygen's .pub blob; signature verifies via transport" {
+    const t = std.testing;
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_ecdsa_p384_key, null);
+    try t.expectEqualStrings("ecdsa-sha2-nistp384", hk.algorithmName());
+
+    const blob = try hk.publicBlob(t.allocator);
+    defer t.allocator.free(blob);
+    var pubbuf: [256]u8 = undefined;
+    const expected = try decodeFixturePub(fixture_ecdsa_p384_pub_b64, &pubbuf);
+    try t.expectEqualSlices(u8, expected, blob);
+
+    // The client's verifier accepts it, and refuses it under the wrong curve
+    // name, a flipped octet of H, and as a P-256 key.
+    const h = [_]u8{0x3C} ** 48;
+    const sig_blob = try hk.sign(t.allocator, &h);
+    defer t.allocator.free(sig_blob);
+    try transport.verifySignature("ecdsa-sha2-nistp384", blob, sig_blob, &h);
+    var h2 = h;
+    h2[0] ^= 1;
+    try t.expectError(error.HostKeyVerificationFailed, transport.verifySignature("ecdsa-sha2-nistp384", blob, sig_blob, &h2));
+    try t.expectError(error.HostKeyVerificationFailed, transport.verifySignature("ecdsa-sha2-nistp256", blob, sig_blob, &h));
 }
 
 test "parseEcdsaP256OpenSSH: a curve other than nistp256 is UnsupportedKeyType, not accepted" {
@@ -2454,7 +2522,10 @@ fn liveOpensshClientMac(keygen_type: []const u8, hostkey_algo: []const u8, kex_n
     defer gpa.free(hk_path);
     {
         var child = std.process.spawn(io, .{
-            .argv = &.{ "ssh-keygen", "-q", "-t", keygen_type, "-N", "", "-C", "zig-ssh-live-test", "-f", hk_path },
+            .argv = if (std.mem.eql(u8, keygen_type, "ecdsa384"))
+                &.{ "ssh-keygen", "-q", "-t", "ecdsa", "-b", "384", "-N", "", "-C", "zig-ssh-live-test", "-f", hk_path }
+            else
+                &.{ "ssh-keygen", "-q", "-t", keygen_type, "-N", "", "-C", "zig-ssh-live-test", "-f", hk_path },
             .stdout = .ignore,
             .stderr = .ignore,
         }) catch return error.SkipZigTest;
@@ -2595,6 +2666,10 @@ test "live interop: OpenSSH ssh client → our server — diffie-hellman-group14
 
 test "live interop: OpenSSH ssh client → our server — diffie-hellman-group16-sha512" {
     try liveOpensshClient("ed25519", "ssh-ed25519", "diffie-hellman-group16-sha512", "aes256-ctr");
+}
+
+test "live interop: OpenSSH ssh client → our server — ecdsa-sha2-nistp384 host key" {
+    try liveOpensshClient("ecdsa384", "ecdsa-sha2-nistp384", "ecdh-sha2-nistp384", "aes256-gcm@openssh.com");
 }
 
 test "live interop: OpenSSH ssh client → our server — ecdh-sha2-nistp256" {

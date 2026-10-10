@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Added:** `ecdsa-sha2-nistp384` host and user keys (RFC 5656): `HostKey.ecdsa_p384`
+  (= `userauth.AuthKey`), OpenSSH key loading (`parseEcdsaP384OpenSSH`, plain and passphrase-protected via
+  the shared container path), signing, and verification in `transport.verifySignature`; offered in
+  `server_host_key_algorithms` and `public_key_algorithms`. The ECDSA verifier now also requires the
+  curve name inside the key blob to match its type (Go's `parseECDSA` does). Live interop against
+  OpenSSH 10.2: our client against an sshd with a P-384 host key and a P-384 user key, OpenSSH's client
+  against our server with a P-384 host key and with a P-384 user key.
 - **2026-10-10** — **Added:** `ecdh-sha2-nistp256` and `ecdh-sha2-nistp384` key exchange (RFC 5656 §4),
   client and server, offered by default after curve25519 (OpenSSH's and Go's order). std's P-256/P-384
   (constant-time `mul`); the peer's point must be uncompressed SEC1 on the curve (as Go). Exchange hash

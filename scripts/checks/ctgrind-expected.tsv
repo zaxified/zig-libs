@@ -219,7 +219,7 @@ oscore	ReleaseFast	unprotect	1	1	c7415c327c50437c	ed85db89e3d7e9fd
 # reaches the exchange hash whatever the code does. `ffpow`: POSITIVE CONTROL,
 # the same K through the std.crypto.ff pow dhPowModPrime used until this date
 # — its window select compiles to a jump in ReleaseFast. It must stay >= 1.
-ssh	ReleaseFast	dh	1	4	bee9fa5e5e5196af	95639ff37028e502
+ssh	ReleaseFast	dh	1	4	7f381760bf6d980a	95639ff37028e502
 ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # ssh ecdh (2026-10-10): ecdh-sha2-nistp256/384, the ephemeral scalar tainted
 # through fromScalar, ecdhNistShared and ecdhNistFinish, P-256 then P-384. All
@@ -231,7 +231,7 @@ ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # above it uses pcSelect and is clean); ecdhNistShared's identity catch; and
 # stripLeadingZeros + writeMpint on K (RFC 4251 §5, as `dh`). Witness 4 =
 # the printed exchange hash.
-ssh	ReleaseFast	ecdh	1	17	bee9fa5e5e5196af	75272e76fb52617b
+ssh	ReleaseFast	ecdh	1	17	7f381760bf6d980a	75272e76fb52617b
 # ct25519 — columns below are `total_min in_file`, NOT "in_file total_min".
 # Row 1's `1 0` is `total_min=1, in_file=0`: ct25519's OWN code has zero
 # expected contexts (the `total_min=1` is only the harness's print, a

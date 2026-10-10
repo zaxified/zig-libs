@@ -36,6 +36,9 @@ const HostKey = server.HostKey;
 const Ed25519 = std.crypto.sign.Ed25519;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const Scalar = std.crypto.ecc.P256.scalar.Scalar;
+const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+const Scalar384 = std.crypto.ecc.P384.scalar.Scalar;
+const Sha384 = std.crypto.hash.sha2.Sha384;
 const Ed = std.crypto.ecc.Edwards25519;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
@@ -439,6 +442,36 @@ fn rawSig(blob: []const u8) ![]const u8 {
 }
 
 /// ecdsa raw = mpint(r) ‖ mpint(s) → fixed-width r‖s.
+/// P-384: `d`, and the nonce `k` solved from the signature as for P-256
+/// (`e` = SHA-384 of the message, reduced the way std's ECDSA reduces it).
+fn ecdsa384Needles(n: *Needles, kp: *const EcdsaP384.KeyPair, msg: ?[]const u8, sig: ?[96]u8) !void {
+    const d = try Scalar384.fromBytes(kp.secret_key.toBytes(), .big);
+    n.addBoth("d", &d.toBytes(.big));
+    n.addImage("d", std.mem.asBytes(&d));
+    const m = msg orelse return;
+    var h: [48]u8 = undefined;
+    Sha384.hash(m, &h, .{});
+    var wide: [64]u8 = @splat(0);
+    wide[16..64].* = h;
+    const e = Scalar384.fromBytes64(wide, .big);
+    const r = try Scalar384.fromBytes(sig.?[0..48].*, .big);
+    const sv = try Scalar384.fromBytes(sig.?[48..96].*, .big);
+    const k = sv.invert().mul(e.add(r.mul(d)));
+    n.addBoth("k", &k.toBytes(.big));
+    n.addImage("k", std.mem.asBytes(&k));
+    n.addBoth("k^-1", &k.invert().toBytes(.big));
+}
+
+fn ecdsaRs384(raw: []const u8) ![96]u8 {
+    var cur = messages.Cursor{ .b = raw };
+    var out: [96]u8 = @splat(0);
+    for (0..2) |i| {
+        const m = std.mem.trimStart(u8, try cur.string(), &.{0});
+        @memcpy(out[i * 48 + 48 - m.len ..][0..m.len], m);
+    }
+    return out;
+}
+
 fn ecdsaRs(raw: []const u8) ![64]u8 {
     var cur = messages.Cursor{ .b = raw };
     var out: [64]u8 = @splat(0);
@@ -525,6 +558,28 @@ test "STACKPROBE: no key, nonce or CRT residue on the dead stack after host-key 
             n.sort();
             cur_text = vectors.ecdsa_p256_key;
             bad += try runProbe("HostKey.fromOpenSSH ecdsa-p256", callFromOpenSSH, &n);
+        }
+    }
+
+    // ── ecdsa-p384: the fixture (sign + load) ──
+    {
+        try HostKey.fromOpenSSH(&cur_hk, vectors.ecdsa_p384_key, null);
+        const kp = &cur_hk.ecdsa_p384;
+        leak_src = kp.secret_key.toBytes()[0..32].*;
+        {
+            callSign();
+            var n: Needles = .{};
+            try ecdsa384Needles(&n, kp, &exchange_hash, try ecdsaRs384(try rawSig(out_sink)));
+            n.sort();
+            bad += try runProbe("HostKey.sign ecdsa-p384", callSign, &n);
+        }
+        {
+            var n: Needles = .{};
+            try ecdsa384Needles(&n, kp, null, null);
+            try containerNeedles(&n, vectors.ecdsa_p384_key);
+            n.sort();
+            cur_text = vectors.ecdsa_p384_key;
+            bad += try runProbe("HostKey.fromOpenSSH ecdsa-p384", callFromOpenSSH, &n);
         }
     }
 
