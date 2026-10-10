@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `NETCONF_FUZZ` (`src/fuzz_test.zig`, `client.zig`). `netconf-wire`: genuine `<hello>`, `<rpc-reply>` (ok / data / several rpc-errors) and `<notification>` documents and their RFC 6242 framing (end-of-message; chunked with a drawn chunk size) in random-sized pieces; undamaged they parse to what was written and the framer returns the payload, damaged (0-3 octets, truncation) never panic. `netconf-client`: a whole session (hello, get-config, a refused lock with its rpc-error, discard-changes, close-session) against the `FakePeer` whose bytes are damaged / truncated / garbled / doubled at one read; every call ends in a typed error or a reply for the message-id that was sent. Verdicts clean (client at `.scale` 2). No code change.
 - **2026-10-10** — docs: ct axis recorded as n/a: NETCONF framing, RPC building and reply parsing hold no secret; the only credential is passed through to `ssh.userauth.authenticatePassword`, whose constant-time story is `ssh`'s (code review).
 - **2026-09-15** — **BEHAVIOURAL, not breaking (default on, switch to opt out):**
   `Client.send` now checks, before writing anything to the wire, that the peer's `<hello>`

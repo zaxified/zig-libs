@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `IEC62351_FUZZ` (`src/fuzz_test.zig`). `iec62351-goose`: GOOSE / SV frames sealed with HMAC-SHA-256 (80/128/256), AES-GMAC (64/128) or ECDSA P-256, both header profiles, verify; damaged they are refused, or accepted only with the covered domain, tag and IV unchanged (the key metadata is unauthenticated by design). `iec62351-replay`: a publisher's genuine GOOSE identities interleaved with replays and forged old state: the guard accepts the genuine stream, never accepts a pair twice or an older one, and a rejection leaves its state untouched. `iec62351-acse`: a signed IEC 62351-4 token spliced into an AARQ is found and verified; another key, an expired or a future token never; a token with changed octets never verifies. Verdicts clean (acse at `.scale` 4). No code change.
 - **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (target `mac`, ReleaseFast): the GOOSE/SV MAC key is tainted through `goose.computeMac` and `goose.verifyMac` (valid and tampered) for HMAC-SHA256-80/128/256 and AES-GMAC-64/128. 0 in-file contexts. The RSASSA-PSS/ECDSA profiles are the `rsa`/`p256` modules' rows. No code change.
 - **2026-10-09** — Dead-stack burn: `goose.computeMac` (and so `goose.verifyMac`) runs its body under `burn.run` (4 KiB, per frame; the MAC key through the HMAC pads / GCM key schedule); new `stackprobe2_test.zig` on `testkit.stackprobe`. No signature change.
 

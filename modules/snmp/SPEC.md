@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-08-23 · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: password KDF, all auth digests, AES-CFB privacy 0 in-file; DES-CBC privacy 256 = open finding, table-driven des.zig)
+**Hardening:** fuzz 2026-10-10 (SNMP_FUZZ: `snmp-wire` and `snmp-auth-priv` 200,000-run budget clean; `snmp-v3-reply` at `.scale` 64 = 3,125 runs — every run derives USM keys from passwords, ~65/s; the existing decode harnesses are unchanged) · ct 2026-10-10 (ctgrind: password KDF, all auth digests, AES-CFB privacy 0 in-file; DES-CBC privacy 256 = open finding, table-driven des.zig)
 **Performance:** not measured
 
 **Known defects:** none recorded

@@ -200,13 +200,91 @@ fn splitChain(input: []const u8, out: *[max_chain_len][]const u8) usize {
     return n;
 }
 
-fn fuzzChain(bundle: *Certificate.Bundle, smith: *std.testing.Smith) anyerror!void {
+const fz = @import("fuzz_test.zig");
+const ChainMark = fz.Marker(enum { honest_verified, forged_refused, malformed, damaged_refused, raw });
+
+fn fuzzChainSmith(bundle: *Certificate.Bundle, smith: *std.testing.Smith) anyerror!void {
+    try fuzzChainDrawn(std.testing.Smith, smith, bundle);
+}
+
+fn fuzzChainRng(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var bundle = try rootBundle(gpa);
+    defer bundle.deinit(gpa);
+    try fuzzChainDrawn(S, src, &bundle);
+}
+
+/// A server's chain: under `Smith` the raw frame; under the driver's `Rng` one
+/// of four genuine chains with 0-3 octets damaged and maybe truncated. An
+/// undamaged honest chain verifies, an undamaged forged one is refused, and a
+/// damaged chain is never accepted.
+fn fuzzChainDrawn(comptime S: type, src: *S, bundle: *Certificate.Bundle) anyerror!void {
     var buf: [4 * 4096]u8 = undefined;
-    const input = buf[0..smith.slice(&buf)];
+    var n: usize = 0;
+    var which: u8 = 255;
+    var frame: [4 * 4096]u8 = undefined;
+    var fl: usize = 0;
+    var gen: [4][]const u8 = undefined;
+    var gen_n: usize = 0;
+    var changed = true;
+    var exact = false; // not a single octet differs from the genuine frame
+    if (S != fz.fuzz_driver.Rng) {
+        n = src.slice(&buf);
+    } else if (src.valueRangeAtMost(u8, 0, 9) == 0) {
+        n = src.slice(&buf);
+        ChainMark.mark(.raw);
+    } else {
+        const sets = [_][]const []const u8{
+            &.{ @embedFile("testdata/leaf.pem"), @embedFile("testdata/inter.pem") },
+            &.{ @embedFile("testdata/forged.pem"), @embedFile("testdata/leaf.pem"), @embedFile("testdata/inter.pem") },
+            &.{ @embedFile("testdata/leaf-client.pem"), @embedFile("testdata/inter.pem") },
+            &.{ @embedFile("testdata/leaf.pem"), @embedFile("testdata/inter.pem"), @embedFile("testdata/root.pem") },
+        };
+        which = src.valueRangeAtMost(u8, 0, sets.len - 1);
+        var der_buf: [4096]u8 = undefined;
+        for (sets[which], 0..) |p, i| {
+            const der = try pemToDer(p, &der_buf);
+            std.mem.writeInt(u16, frame[fl..][0..2], @intCast(der.len), .big);
+            @memcpy(frame[fl + 2 ..][0..der.len], der);
+            gen[i] = frame[fl + 2 ..][0..der.len];
+            fl += 2 + der.len;
+        }
+        gen_n = sets[which].len;
+        n = fz.damage(src, &buf, frame[0..fl]);
+        exact = n == fl and std.mem.eql(u8, buf[0..n], frame[0..fl]);
+    }
     var chain: [max_chain_len][]const u8 = undefined;
-    const n = splitChain(input, &chain);
-    for (chain[0..n]) |der| checkWellFormed(der) catch return;
-    verifyAgainstBundle(chain[0..n], bundle, now) catch {};
+    const cn = splitChain(buf[0..n], &chain);
+    if (which != 255) {
+        // "Damaged" = the certificates the server would be sending differ. A
+        // length prefix that over-claims is cut at the end of the input, so
+        // it can change octets and not the chain. Set 3 carries a stray copy
+        // of the root: the anchor comes from the bundle, so damage confined
+        // to that copy changes nothing.
+        const need = if (which == 3) 2 else gen_n;
+        changed = cn < need or (which != 3 and cn != gen_n);
+        for (0..@min(cn, need)) |i| {
+            if (!std.mem.eql(u8, chain[i], gen[i])) changed = true;
+        }
+    }
+    for (chain[0..cn]) |der| checkWellFormed(der) catch {
+        if (which != 255) ChainMark.mark(.malformed);
+        return;
+    };
+    const verdict = verifyAgainstBundle(chain[0..cn], bundle, now);
+    if (which == 255) return;
+    if (verdict) |_| {
+        if (changed) return error.DamagedChainAccepted;
+        // Undamaged: set 0 and 3 are honest (3 carries the root too), 1 and 2 are not.
+        if (which == 1 or which == 2) return error.ForgedChainAccepted;
+        ChainMark.mark(.honest_verified);
+    } else |_| {
+        if (changed) {
+            ChainMark.mark(.damaged_refused);
+        } else {
+            if ((which == 0 or which == 3) and exact) return error.HonestChainRefused;
+            ChainMark.mark(.forged_refused);
+        }
+    }
 }
 
 /// A corpus seed for `fuzzChain`: the chain frame (2-byte length + DER per
@@ -236,7 +314,7 @@ test "fuzz: arbitrary chains through the guard and the verifier never panic" {
     defer gpa.free(honest);
     const forged = try seed(gpa, &.{ @embedFile("testdata/forged.pem"), @embedFile("testdata/leaf.pem"), @embedFile("testdata/inter.pem") });
     defer gpa.free(forged);
-    try testing.fuzz(&bundle, fuzzChain, .{ .corpus = &.{ honest, forged } });
+    try testing.fuzz(&bundle, fuzzChainSmith, .{ .corpus = &.{ honest, forged } });
 }
 
 /// Reads a corpus seed back exactly as `fuzzChain` does, through `Smith`.
@@ -265,4 +343,12 @@ test "corpus: the seeds reach the verifier through Smith -- honest verifies, for
     try testing.expectEqual(@as(usize, 3), m);
     for (chain[0..m]) |der| try checkWellFormed(der);
     try testing.expectError(error.TlsCertificateNotVerified, verifyAgainstBundle(chain[0..m], &bundle, now));
+}
+
+test "fuzz driver: TLSCLIENT_FUZZ (chain)" {
+    try fz.fuzz_driver.run(fuzzChainRng, .{ .prefix = "TLSCLIENT_FUZZ", .name = "tlsclient-chain" });
+}
+
+test "fuzz harness: chain, 400 seeds, reaches every outcome" {
+    try ChainMark.reach(fuzzChainRng, "tlsclient-chain", 400);
 }

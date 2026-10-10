@@ -162,6 +162,7 @@ pub const EngineState = v3client_mod.EngineState;
 pub const SaltSeed = v3client_mod.SaltSeed;
 
 test {
+    _ = @import("fuzz_test.zig");
     _ = ber;
     _ = oid;
     _ = message;

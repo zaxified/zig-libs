@@ -53,6 +53,7 @@ pub const meta = .{
 test {
     _ = verify;
     _ = @import("interop_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     // The handshake path: analysed in full, so a patch that does not
     // compile cannot hide behind laziness.

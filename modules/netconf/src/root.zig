@@ -130,6 +130,7 @@ test {
     _ = rpc;
     _ = reply;
     _ = client;
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta.deps names the modules this one is built on" {

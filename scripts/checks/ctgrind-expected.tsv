@@ -1079,8 +1079,8 @@ mqtt	ReleaseFast	decode	1	0	10e691c441a4a4a7	c3c3038ba153dcbb
 # (curve25519.zig:77; 2 ephemeral keygens + 4 DH) + 2 x the AEAD tag-verify
 # outcome (std chacha20.zig:713 via chachapoly); transport 6 = the tag-verify
 # outcome of the 6 decryptions.
-noise	ReleaseFast	hs	1	8	b3d4a87244443041	95912b58e70d0846
-noise	ReleaseFast	transport	1	6	e114c59e06c5d1ea	b4443cf65f6c3849
+noise	ReleaseFast	hs	1	8	7f2a256be9da1778	95912b58e70d0846
+noise	ReleaseFast	transport	1	6	dde901de8c90da98	b4443cf65f6c3849
 # tlsclient (2026-10-10) — kex: Client.initInto on a canned ServerHello with
 # the key-share secrets (entropy[64..240]) tainted; cv: signCertificateVerify
 # with the client key tainted (P-256, P-384, Ed25519). No context is a branch
@@ -1095,7 +1095,7 @@ noise	ReleaseFast	transport	1	6	e114c59e06c5d1ea	b4443cf65f6c3849
 # encoding of the public signature, trimStart of its leading zeros). The
 # encrypted flight is not measured (see the harness: 696 parse contexts on
 # decrypted public server messages).
-tlsclient	ReleaseFast	kex	1	21	76ef77da02472416	73e6ffdaf71d18ad
+tlsclient	ReleaseFast	kex	1	21	a4921619bbfcc67c	73e6ffdaf71d18ad
 tlsclient	ReleaseFast	cv	1	32	286c48373bfa674d	8b11266441b54869
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
@@ -1113,8 +1113,8 @@ tlsclient	ReleaseFast	cv	1	32	286c48373bfa674d	8b11266441b54869
 # engine.zig). hs 119 is almost all (b) — the encrypted handshake flight is
 # public to the peer that sent it; app 14 = 4 AEAD verdicts + seq-number
 # reconstruction + padding scan + content-type dispatch per record.
-dtls	ReleaseFast	hs	1	119	57c994ee557808a8	ca9a2595f120b466
-dtls	ReleaseFast	app	1	14	57c994ee557808a8	ac0eb91f2511d729
+dtls	ReleaseFast	hs	1	119	fa8e494e972566e9	ca9a2595f120b466
+dtls	ReleaseFast	app	1	14	fa8e494e972566e9	ac0eb91f2511d729
 # quic-crypto (2026-10-10) — aes / chacha: a 1-RTT traffic secret tainted
 # through derivePacketKeys, advanceKeys, Protection.seal/open and header
 # protection (computeMask*, apply, remove). In-file 4 each, none a branch on a
@@ -1124,8 +1124,8 @@ dtls	ReleaseFast	app	1	14	57c994ee557808a8	ac0eb91f2511d729
 # AEAD tag-verify outcome in open. The harness marks the unmasked header
 # defined before open; without that the AEAD's length handling on it adds ~50
 # artefacts.
-quic-crypto	ReleaseFast	aes	1	4	f9e7b39fb1e319a6	4d96b4e7d3af1ed7
-quic-crypto	ReleaseFast	chacha	1	4	f9e7b39fb1e319a6	d1cf9a5cadb2a284
+quic-crypto	ReleaseFast	aes	1	4	807dcd889a53e75b	4d96b4e7d3af1ed7
+quic-crypto	ReleaseFast	chacha	1	4	807dcd889a53e75b	d1cf9a5cadb2a284
 # megolm (2026-10-10) — msg: ratchet + Ed25519 signing key tainted through
 # encrypt/decrypt (the harness marks the wire message, the decrypted length
 # and its own allocator index defined: all public); skey: SessionKey and
@@ -1228,7 +1228,7 @@ smtp	ReleaseFast	auth	1	6	228962068d53d10f	58737f369d111669
 # mcp-http (2026-10-10) — sid: the 16 CSPRNG bytes of an Mcp-Session-Id
 # through sidhex.encode (what Sessions.create runs). FIX: it used std.fmt
 # "{x}", a digit table indexed by the secret nibble. 0.
-mcp-http	ReleaseFast	sid	1	0	ef36770357dfdb1b	693d310c7437c6ed
+mcp-http	ReleaseFast	sid	1	0	4f52f981749bdedf	693d310c7437c6ed
 # dnp3 (2026-10-10) — mac: SA session key through mac.compute/verify (all
 # HMAC truncations + AES-GMAC) and computeReplyMac/verifyReplyMac: 0.
 # keys: update + session keys through wrapSessionKeys/unwrapSessionKeys
@@ -1237,7 +1237,7 @@ dnp3	ReleaseFast	mac	1	0	3e76f94ec5a2e0cb	0dcd2c9e71d8d02f
 dnp3	ReleaseFast	keys	1	2	3e76f94ec5a2e0cb	d2337903af778cbe
 # iec62351 (2026-10-10) — mac: GOOSE/SV MAC key through computeMac/verifyMac
 # for HMAC-SHA256-80/128/256 and AES-GMAC-64/128 (AES-128/256): 0.
-iec62351	ReleaseFast	mac	1	0	fdd47c666b8e8c12	760ede68c6c5b472
+iec62351	ReleaseFast	mac	1	0	baa343dce2c14435	760ede68c6c5b472
 # opcua (2026-10-10, Basic256Sha256) — kdf: both channel nonces through
 # deriveKeys: 0. chunk: channel keys + body through symmetricSignAndEncrypt/
 # symmetricDecryptAndVerify (Sign, SignAndEncrypt, wrong-direction reject).

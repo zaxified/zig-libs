@@ -96,6 +96,7 @@ test {
     _ = server;
     _ = @import("server_interop.zig");
     _ = @import("asyncua_replay.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }
 

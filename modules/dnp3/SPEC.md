@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-10-05 (37/38, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: SA session key through every MAC + reply MAC 0; update/session keys through key wrap 2 = aeskw integrity verdict)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DNP3_FUZZ: `dnp3-fragment` and `dnp3-session` over the structured hostile-field generator, plus damaged genuine reads and damaged link frames; `dnp3-sa` Secure Authentication wrap / MAC / g120 objects as an oracle) · ct 2026-10-10 (ctgrind: SA session key through every MAC + reply MAC 0; update/session keys through key wrap 2 = aeskw integrity verdict)
 **Performance:** not measured
 
 **Known defects:** none recorded

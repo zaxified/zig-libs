@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-09-07 · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: PSK through a full handshake, record keys through send/recv; `hs` 119 / `app` 14 in-file, none a branch on a key — constant-time-check verdicts and processing of decrypted content)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DTLS_FUZZ: `dtls-handshake` PSK / HelloRetryRequest cookie / (EC)DHE with one flight damaged, `dtls-record`, `dtls-wire`; certificate-authenticated flights not driven) · ct 2026-10-10 (ctgrind: PSK through a full handshake, record keys through send/recv; `hs` 119 / `app` 14 in-file, none a branch on a key — constant-time-check verdicts and processing of decrypted content)
 **Performance:** not measured
 
 **Known defects:** none recorded

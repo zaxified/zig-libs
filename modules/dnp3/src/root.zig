@@ -127,6 +127,7 @@ test {
     _ = records;
     _ = outstation;
     _ = goldens;
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }
 

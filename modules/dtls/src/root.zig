@@ -409,6 +409,7 @@ test {
     _ = certauth;
     _ = @import("wolfssl_replay.zig");
     _ = @import("fuzz_corpus.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
 }

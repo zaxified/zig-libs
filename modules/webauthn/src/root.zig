@@ -1025,6 +1025,7 @@ test {
     _ = @import("clientdata_test.zig");
     _ = @import("assertion_test.zig");
     _ = @import("attestation_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "smoke: module compiles and CoseKey.alg dispatch works" {

@@ -1441,3 +1441,192 @@ test "live interop: end-of-message framing (:base:1.0 only) against a real NETCO
     // framing — the dialect decision proven against a third-party peer.
     try liveRoundTrip(&.{capabilities.cap_base_1_0}, .end_of_message);
 }
+
+// ── deterministic fuzz driver (NETCONF_FUZZ, added 2026-10-10) ──────────────
+//
+// A whole session against the scripted `FakePeer`, its bytes on the way to the
+// client damaged at ONE read: the 0-3 octets of that read altered, the read
+// truncated (the rest of it lost), replaced by garbage, or delivered twice. The
+// client's every call ends in a typed error or a reply, and a reply it hands
+// back is for the message-id it sent.
+
+const fz = @import("fuzz_test.zig");
+
+fn FuzzTap(comptime S: type) type {
+    return struct {
+        peer: *FakePeer,
+        src: *S,
+        /// The read (counted from 0) that is tampered with; `maxInt` = none.
+        at: usize,
+        mode: enum { damage, truncate, garbage, duplicate } = .damage,
+        reads: usize = 0,
+        changed: bool = false,
+        dup: [4096]u8 = undefined,
+        dup_len: usize = 0,
+
+        const Self = @This();
+        const vtable: Transport.VTable = .{ .read = readFn, .write = writeFn };
+
+        fn transport(self: *Self) Transport {
+            return .{ .ctx = self, .vtable = &vtable };
+        }
+
+        fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return self.peer.transport().write(bytes);
+        }
+
+        fn readFn(ctx: *anyopaque, buf: []u8) TransportError!usize {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (self.dup_len != 0) {
+                const n = @min(buf.len, self.dup_len);
+                @memcpy(buf[0..n], self.dup[0..n]);
+                std.mem.copyForwards(u8, self.dup[0 .. self.dup_len - n], self.dup[n..self.dup_len]);
+                self.dup_len -= n;
+                return n;
+            }
+            const n = try self.peer.transport().read(buf);
+            const call = self.reads;
+            self.reads += 1;
+            if (call != self.at or n == 0) return n;
+            switch (self.mode) {
+                .damage => {
+                    var tmp: [4096]u8 = undefined;
+                    const m = if (S == fz.fuzz_driver.Rng) fz.damage(self.src, &tmp, buf[0..n]) else self.src.slice(&tmp);
+                    self.changed = m != n or !std.mem.eql(u8, tmp[0..m], buf[0..n]);
+                    @memcpy(buf[0..m], tmp[0..m]);
+                    return m;
+                },
+                .truncate => {
+                    const m = self.src.index(n);
+                    self.changed = m != n;
+                    return m;
+                },
+                .garbage => {
+                    var tmp: [256]u8 = undefined;
+                    const m = self.src.slice(&tmp);
+                    const k = @min(m, buf.len);
+                    @memcpy(buf[0..k], tmp[0..k]);
+                    self.changed = true;
+                    return k;
+                },
+                .duplicate => {
+                    const k = @min(n, self.dup.len);
+                    @memcpy(self.dup[0..k], buf[0..k]);
+                    self.dup_len = k;
+                    self.changed = true;
+                    return n;
+                },
+            }
+        }
+    };
+}
+
+const ClientMark = fz.Marker(enum {
+    genuine_session,
+    tampered_error,
+    tampered_reply,
+    chunked,
+    eom,
+    rpc_error_surfaced,
+    id_checked,
+});
+
+pub fn fuzzClient(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const chunked = if (S == fz.fuzz_driver.Rng) src.value(bool) else true;
+    const peer_caps: []const []const u8 = if (chunked)
+        &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }
+    else
+        &.{capabilities.cap_base_1_0};
+    var peer = FakePeer.init(gpa, peer_caps);
+    defer peer.deinit();
+    peer.drip = if (S == fz.fuzz_driver.Rng) src.index(5) else 0;
+
+    var at: usize = std.math.maxInt(usize);
+    var mode: @FieldType(FuzzTap(S), "mode") = .damage;
+    if (S == fz.fuzz_driver.Rng) {
+        if (src.valueRangeAtMost(u8, 0, 9) >= 2) {
+            at = src.index(14);
+            mode = switch (src.index(4)) {
+                0 => .damage,
+                1 => .truncate,
+                2 => .garbage,
+                else => .duplicate,
+            };
+        }
+    } else {
+        at = src.index(14);
+        mode = .garbage;
+    }
+    var tap: FuzzTap(S) = .{ .peer = &peer, .src = src, .at = at, .mode = mode };
+    var c = try Client.init(gpa, tap.transport(), .{});
+    defer c.deinit();
+
+    var ok = true;
+    c.hello() catch {
+        ok = false;
+    };
+    var id_checked = false;
+    var surfaced = false;
+    const Op = enum { get_config, lock, discard, close };
+    const ops = [_]Op{ .get_config, .lock, .discard, .close };
+    if (ok) for (ops) |op| {
+        const sent_id = c.next_id;
+        const rpc: rpc_mod.Rpc = switch (op) {
+            .get_config => .{ .get_config = .{ .source = .running } },
+            .lock => .{ .lock = .running },
+            .discard => .discard_changes,
+            .close => .close_session,
+        };
+        const id = c.send(rpc) catch {
+            ok = false;
+            break;
+        };
+        var r = c.receiveReply(id) catch {
+            ok = false;
+            break;
+        };
+        defer r.deinit();
+        r.expectMessageId(sent_id) catch return error.ReplyForAnotherMessageId;
+        id_checked = true;
+        switch (op) {
+            .get_config => if (!tap.changed) {
+                const data = r.expectData() catch return error.GenuineGetConfigFailed;
+                if (std.mem.indexOf(u8, data, "<name>root</name>") == null) return error.GenuineDataWrong;
+            },
+            .lock => if (!tap.changed) {
+                if (!r.hasErrors()) return error.GenuineLockWasNotRefused;
+                surfaced = true;
+            },
+            .discard, .close => if (!tap.changed) {
+                r.expectOk() catch return error.GenuineOkFailed;
+            },
+        }
+    };
+    if (!tap.changed) {
+        if (!ok) {
+            std.debug.print("netconf-client: the untampered session failed\n", .{});
+            return error.GenuineSessionFailed;
+        }
+        ClientMark.mark(.genuine_session);
+        if (chunked) ClientMark.mark(.chunked) else ClientMark.mark(.eom);
+        if (surfaced) ClientMark.mark(.rpc_error_surfaced);
+    } else if (ok) ClientMark.mark(.tampered_reply) else ClientMark.mark(.tampered_error);
+    if (id_checked) ClientMark.mark(.id_checked);
+}
+
+fn fuzzClientSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzClient(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: a session whose peer bytes are tampered with ends in a typed error or a correlated reply" {
+    try testing.fuzz({}, fuzzClientSmith, .{});
+}
+
+test "fuzz driver: NETCONF_FUZZ (client)" {
+    try fz.fuzz_driver.run(fuzzClient, .{ .prefix = "NETCONF_FUZZ", .name = "netconf-client", .scale = 2 });
+}
+
+test "fuzz harness: client, 500 seeds, reaches every outcome" {
+    try ClientMark.reach(fuzzClient, "netconf-client", 500);
+}

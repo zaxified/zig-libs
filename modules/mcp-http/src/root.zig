@@ -598,7 +598,7 @@ fn isInitialize(gpa: std.mem.Allocator, body: []const u8) bool {
             defer if (val_tok == .allocated_string) gpa.free(val);
             result = std.mem.eql(u8, val, "initialize");
         } else {
-            scanner.skipValue() catch return false;
+            if (!skipOneValue(&scanner)) return false;
         }
     }
 }
@@ -637,7 +637,7 @@ fn correlatableResponse(gpa: std.mem.Allocator, body: []const u8) bool {
             // consuming only an `object_begin` here would desync the scan and
             // let a nested key masquerade as a top-level one.
             if ((scanner.peekNextTokenType() catch return false) != .number) {
-                scanner.skipValue() catch return false;
+                if (!skipOneValue(&scanner)) return false;
                 continue;
             }
             const val_tok = scanner.nextAllocMax(gpa, .alloc_if_needed, max_field_len) catch return false;
@@ -651,8 +651,25 @@ fn correlatableResponse(gpa: std.mem.Allocator, body: []const u8) bool {
         }
         if (std.mem.eql(u8, key, "method")) has_method = true;
         if (std.mem.eql(u8, key, "result") or std.mem.eql(u8, key, "error")) has_payload = true;
-        scanner.skipValue() catch return false;
+        if (!skipOneValue(&scanner)) return false;
     }
+}
+
+/// `Scanner.skipValue` after the checks it leaves to the caller. Its
+/// `peekNextTokenType` reads the next octet without consulting the grammar, so
+/// the value of `{"a":}` is "an object end", and `skipValue` meets that with
+/// `unreachable` ("attempt to skip a non-value token") -- a panic in Debug and
+/// ReleaseSafe, undefined behaviour in ReleaseFast, from a POST body nobody has
+/// authenticated. Found by the 2026-10-10 fuzz driver (`{"a":}`, `[1,]`-shaped
+/// members). A false return means "not a well-formed value here": neither
+/// scanner's caller wants anything from such a body.
+fn skipOneValue(scanner: *std.json.Scanner) bool {
+    switch (scanner.peekNextTokenType() catch return false) {
+        .object_end, .array_end, .end_of_document => return false,
+        else => {},
+    }
+    scanner.skipValue() catch return false;
+    return true;
 }
 
 /// The `Last-Event-ID` request header as a u64 (0 when absent/invalid ⇒ replay
@@ -2318,6 +2335,27 @@ test "oracle: tools/call \"work\" (real client bytes) reproduces the real progre
     );
 }
 
+test "regression: a member with no value is not a body, and does not trip skipValue's unreachable" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "{\"a\":}", "{\"id\":}", "{\"x\":1,\"a\":}", "{\"jsonrpc\":\"2.0\",\"y\":]", "{\"a\":" }) |body| {
+        try std.testing.expect(!isInitialize(gpa, body));
+        try std.testing.expect(!correlatableResponse(gpa, body));
+    }
+}
+
+test "regression: a POST whose body has a member with no value is answered, not a panic" {
+    const gpa = std.testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var out: [4096]u8 = undefined;
+    const got = runWire(&r, post("/mcp", "{\"a\":}"), &out);
+    try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 "));
+}
+
 // ── fuzz: the pre-parse scanners never panic, OOB, or leak ─────────────────
 //
 // `isInitialize` and `correlatableResponse` are the decode entry point that
@@ -2832,4 +2870,206 @@ test "the session era is untouched: an initialize-era POST under a session-revis
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
     try testing.expect(std.mem.indexOf(u8, bodyOf(got), "resultType") == null);
     try testing.expect(std.mem.indexOf(u8, bodyOf(got), "\"name\":\"echo\"") != null);
+}
+
+// ── deterministic fuzz driver (MCP_HTTP_FUZZ, added 2026-10-10) ─────────────
+
+const fz = @import("fuzz_test.zig");
+
+const PreMark = fz.Marker(enum { initialize, not_initialize, correlatable, not_correlatable, damaged });
+
+pub fn fuzzPreParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [1 + jsonrpc_buf_len]u8 = undefined;
+    var n: usize = 0;
+    var damaged = false;
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        // A corpus entry (frames carry a little-endian u32 length header) with
+        // 0-3 octets damaged and maybe truncated.
+        const entry = jsonrpc_corpus[src.index(jsonrpc_corpus.len)];
+        const flen = std.mem.readInt(u32, entry[0..4], .little);
+        const frame = entry[4..][0..@min(flen, entry.len - 4)];
+        n = fz.damage(src, &raw, frame);
+        damaged = true;
+    } else n = src.slice(&raw);
+    var buf: [jsonrpc_buf_len]u8 = undefined;
+    const body = buildJsonRpcish(raw[0..n], &buf);
+    if (damaged) PreMark.mark(.damaged);
+    if (isInitialize(gpa, body)) PreMark.mark(.initialize) else PreMark.mark(.not_initialize);
+    if (correlatableResponse(gpa, body)) PreMark.mark(.correlatable) else PreMark.mark(.not_correlatable);
+}
+
+fn fuzzPreParseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPreParse(std.testing.Smith, smith, std.testing.allocator);
+}
+
+test "fuzz: the pre-parse scanners, driver harness" {
+    try std.testing.fuzz({}, fuzzPreParseSmith, .{});
+}
+
+test "fuzz driver: MCP_HTTP_FUZZ (pre-parse)" {
+    try fz.fuzz_driver.run(fuzzPreParse, .{ .prefix = "MCP_HTTP_FUZZ", .name = "mcp-http-pre-parse" });
+}
+
+test "fuzz harness: pre-parse, 500 seeds, reaches every outcome" {
+    try PreMark.reach(fuzzPreParse, "mcp-http-pre-parse", 500);
+}
+
+const WireMark = fz.Marker(enum {
+    list_ok,
+    call_ok,
+    notification_accepted,
+    get_stream,
+    delete_then_gone,
+    origin_refused,
+    forged_session_refused,
+    damaged_request_answered,
+    damaged_request_dropped,
+    garbage,
+});
+
+fn statusOf(got: []const u8) ?u16 {
+    if (got.len < 12 or !std.mem.startsWith(u8, got, "HTTP/1.1 ")) return null;
+    return std.fmt.parseInt(u16, got[9..12], 10) catch null;
+}
+
+const call_body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"hi\"}}}";
+const note_body = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+
+pub fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    const origins = [_][]const u8{"https://ok.example"};
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions, .allowed_origins = &origins };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var out: [8192]u8 = undefined;
+    var rbuf: [1536]u8 = undefined;
+    // Two live sessions.
+    var sids: [2][32]u8 = undefined;
+    for (&sids) |*sid| {
+        const init = runWire(&r, postWithSession(&rbuf, "", init_body), &out);
+        const hdr = headerValue(init, "Mcp-Session-Id") orelse return error.NoSession;
+        if (hdr.len != 32) return error.UnexpectedSessionIdLength;
+        @memcpy(sid, hdr);
+    }
+    if (!(try sessions.push(&sids[0], "{\"n\":1}"))) return error.PushFailed;
+
+    const Kind = enum { list, call, note, get, delete, origin, forged, damaged, garbage };
+    var kind: Kind = .garbage;
+    if (S == fz.fuzz_driver.Rng) {
+        kind = @enumFromInt(src.index(9));
+    }
+    var req_buf: [2048]u8 = undefined;
+    const sid_a: []const u8 = &sids[0];
+    const sid_b: []const u8 = &sids[1];
+    switch (kind) {
+        .list => {
+            const got = runWire(&r, postWithSession(&req_buf, sid_a, list_body), &out);
+            if (statusOf(got) != 200 or std.mem.indexOf(u8, bodyOf(got), "echo") == null) return error.ListFailed;
+            WireMark.mark(.list_ok);
+        },
+        .call => {
+            const got = runWire(&r, postWithSession(&req_buf, sid_b, call_body), &out);
+            if (statusOf(got) != 200 or std.mem.indexOf(u8, got, "\"ok\":true") == null) return error.CallFailed;
+            WireMark.mark(.call_ok);
+        },
+        .note => {
+            const got = runWire(&r, postWithSession(&req_buf, sid_a, note_body), &out);
+            if (statusOf(got) != 202) return error.NotificationNotAccepted;
+            WireMark.mark(.notification_accepted);
+        },
+        .get => {
+            const got = runWire(&r, getWithSession(&req_buf, sid_a, null), &out);
+            if (statusOf(got) != 200 or std.mem.indexOf(u8, got, "data: {\"n\":1}") == null) return error.StreamFailed;
+            // The other session does not see session A's event.
+            const other = runWire(&r, getWithSession(&req_buf, sid_b, null), &out);
+            if (std.mem.indexOf(u8, other, "{\"n\":1}") != null) return error.EventLeakedAcrossSessions;
+            WireMark.mark(.get_stream);
+        },
+        .delete => {
+            const got = runWire(&r, deleteWithSession(&req_buf, sid_b), &out);
+            if (statusOf(got) != 204) return error.DeleteFailed;
+            const gone = runWire(&r, postWithSession(&req_buf, sid_b, list_body), &out);
+            if (statusOf(gone) != 404) return error.DeletedSessionStillLive;
+            const alive = runWire(&r, postWithSession(&req_buf, sid_a, list_body), &out);
+            if (statusOf(alive) != 200) return error.DeleteTookTheOtherSession;
+            WireMark.mark(.delete_then_gone);
+        },
+        .origin => {
+            const bad = [_][]const u8{ "https://evil.example", "https://ok.example.evil", "null", "" };
+            const o = bad[src.index(bad.len)];
+            const got = runWire(&r, std.fmt.bufPrint(&req_buf, "POST /mcp HTTP/1.1\r\nHost: t\r\nOrigin: {s}\r\nMcp-Session-Id: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ o, sid_a, list_body.len, list_body }) catch unreachable, &out);
+            if (statusOf(got) != 403) return error.ForeignOriginAccepted;
+            WireMark.mark(.origin_refused);
+        },
+        .forged => {
+            // A session id that is neither: one octet of a live id changed.
+            var forged: [32]u8 = sids[src.index(2)];
+            const at = src.index(forged.len);
+            const old = forged[at];
+            forged[at] = "0123456789abcdefABCDEFxyz-_ "[src.index(28)];
+            if (forged[at] == old) forged[at] = if (old == 'z') 'y' else 'z';
+            const verb = src.index(3);
+            const got = switch (verb) {
+                0 => runWire(&r, postWithSession(&req_buf, &forged, list_body), &out),
+                1 => runWire(&r, getWithSession(&req_buf, &forged, null), &out),
+                else => runWire(&r, deleteWithSession(&req_buf, &forged), &out),
+            };
+            if (statusOf(got) != 404) {
+                std.debug.print("mcp-http-wire: a session id differing from a live one in one octet got status {?d}\n", .{statusOf(got)});
+                return error.ForgedSessionAccepted;
+            }
+            // ...and both real sessions are still there.
+            for (sids) |s| {
+                const alive = runWire(&r, postWithSession(&req_buf, &s, list_body), &out);
+                if (statusOf(alive) != 200) return error.RealSessionLost;
+            }
+            WireMark.mark(.forged_session_refused);
+        },
+        .damaged => {
+            var genuine_buf: [1536]u8 = undefined;
+            const base = switch (src.index(5)) {
+                0 => postWithSession(&genuine_buf, sid_a, list_body),
+                1 => postWithSession(&genuine_buf, sid_b, call_body),
+                2 => postWithSession(&genuine_buf, "", init_body),
+                3 => getWithSession(&genuine_buf, sid_a, "1"),
+                else => deleteWithSession(&genuine_buf, sid_b),
+            };
+            const n = fz.damage(src, &req_buf, base);
+            const got = runWire(&r, req_buf[0..n], &out);
+            if (got.len == 0) {
+                WireMark.mark(.damaged_request_dropped);
+            } else {
+                // Whatever it answered, it is an HTTP response.
+                if (statusOf(got) == null) return error.NotAnHttpResponse;
+                WireMark.mark(.damaged_request_answered);
+            }
+        },
+        .garbage => {
+            const n = src.slice(&req_buf);
+            const got = runWire(&r, req_buf[0..n], &out);
+            if (got.len != 0 and statusOf(got) == null) return error.NotAnHttpResponse;
+            WireMark.mark(.garbage);
+        },
+    }
+}
+
+fn fuzzWireSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzWire(std.testing.Smith, smith, std.testing.allocator);
+}
+
+test "fuzz: HTTP requests, damaged, against two live sessions" {
+    try std.testing.fuzz({}, fuzzWireSmith, .{});
+}
+
+test "fuzz driver: MCP_HTTP_FUZZ (wire)" {
+    try fz.fuzz_driver.run(fuzzWire, .{ .prefix = "MCP_HTTP_FUZZ", .name = "mcp-http-wire", .scale = 2 });
+}
+
+test "fuzz harness: wire, 400 seeds, reaches every outcome" {
+    try WireMark.reach(fuzzWire, "mcp-http-wire", 400);
 }

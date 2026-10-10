@@ -295,6 +295,8 @@ const FakeServer = struct {
     /// survives one-byte-at-a-time delivery).
     drip: usize = 0,
     tls_upgrades: usize = 0,
+    /// `received.len` at the moment of the (simulated) TLS handshake.
+    upgrade_at: ?usize = null,
 
     fn init(gpa: std.mem.Allocator, replies: []const []const u8) FakeServer {
         return .{ .gpa = gpa, .replies = replies };
@@ -762,4 +764,257 @@ test "live interop: a full session against a real SMTP server" {
         try testing.expectEqualStrings(doc, got);
         std.debug.print("live SMTP: server received {d} octets, byte-identical to what we sent\n", .{got.len});
     }
+}
+
+// ── deterministic fuzz driver (SMTP_FUZZ, added 2026-10-10) ─────────────────
+//
+// A whole SMTP conversation against a scripted server, ONE reply of which is
+// damaged, dropped, re-coded, replaced by garbage or doubled, with the bytes
+// handed to the client in random-sized pieces. Whatever the server says the
+// client ends in a typed error or a finished transaction; and it never puts
+// the credentials, an AUTH command or (with `tls = .required`) a transaction
+// command on the wire before TLS, nor at all if TLS never came.
+
+const fz = @import("fuzz_test.zig");
+
+const fuzz_user = "alice";
+const fuzz_pass = "s3cret-pass";
+const fuzz_body = "Subject: fuzz\r\n\r\nbefore\r\n.\r\nafter\r\n";
+
+const FuzzConf = enum { plain, tls_auth, stripped, opportunistic_no_tls };
+
+const fuzz_replies = struct {
+    const plain = [_][]const u8{
+        "250-mail.example.com Hello\r\n250-PIPELINING\r\n250-SIZE 1000000\r\n250 8BITMIME\r\n",
+        "250 2.1.0 Ok\r\n",
+        "250 2.1.5 Ok\r\n",
+        "354 End data\r\n",
+        "250 2.0.0 Ok: queued\r\n",
+        "221 2.0.0 Bye\r\n",
+    };
+    const tls_auth = [_][]const u8{
+        "250-mail.example.com Hello\r\n250-STARTTLS\r\n250 PIPELINING\r\n",
+        "220 2.0.0 Ready to start TLS\r\n",
+        "250-mail.example.com Hello\r\n250-AUTH PLAIN LOGIN\r\n250-PIPELINING\r\n250 8BITMIME\r\n",
+        "235 2.7.0 Authentication successful\r\n",
+        "250 2.1.0 Ok\r\n",
+        "250 2.1.5 Ok\r\n",
+        "354 End data\r\n",
+        "250 2.0.0 Ok: queued\r\n",
+        "221 2.0.0 Bye\r\n",
+    };
+    const stripped = [_][]const u8{
+        "250-mail.example.com Hello\r\n250-AUTH PLAIN LOGIN\r\n250 PIPELINING\r\n",
+        "250 2.1.0 Ok\r\n",
+        "250 2.1.5 Ok\r\n",
+        "354 End data\r\n",
+        "250 2.0.0 Ok: queued\r\n",
+        "221 2.0.0 Bye\r\n",
+    };
+};
+
+fn fuzzUpgrade(ctx: *anyopaque) TransportError!Transport {
+    const self: *FakeServer = @ptrCast(@alignCast(ctx));
+    self.tls_upgrades += 1;
+    self.upgrade_at = self.received.items.len;
+    return self.transport();
+}
+
+/// First index of `needle` in `hay`, or null.
+fn fuzzFind(hay: []const u8, needle: []const u8) ?usize {
+    return std.mem.indexOf(u8, hay, needle);
+}
+
+const ClientMark = fz.Marker(enum {
+    plain_done,
+    tls_auth_done,
+    stripped_refused,
+    opportunistic_refused,
+    damaged_done,
+    damaged_error,
+    no_secret_before_tls,
+    secret_after_tls,
+});
+
+pub fn fuzzClient(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const conf: FuzzConf = if (S == fz.fuzz_driver.Rng) @enumFromInt(src.valueRangeAtMost(u8, 0, 3)) else .plain;
+    const script: []const []const u8 = switch (conf) {
+        .plain => &fuzz_replies.plain,
+        .tls_auth => &fuzz_replies.tls_auth,
+        .stripped, .opportunistic_no_tls => &fuzz_replies.stripped,
+    };
+    var mutated: [16][]const u8 = undefined;
+    @memcpy(mutated[0..script.len], script);
+    var greeting: []const u8 = "220 mail.example.com ESMTP\r\n";
+    var scratch: [512]u8 = undefined;
+    var scratch2: [512]u8 = undefined;
+    var n_replies: usize = script.len;
+
+    const Mut = enum { none, damage, drop, recode, garbage, duplicate };
+    var mut: Mut = .none;
+    var at: usize = 0;
+    if (S == fz.fuzz_driver.Rng) {
+        mut = switch (src.valueRangeAtMost(u8, 0, 9)) {
+            0, 1 => .none,
+            2, 3, 4 => .damage,
+            5 => .drop,
+            6 => .recode,
+            7 => .garbage,
+            else => .duplicate,
+        };
+        at = src.index(script.len + 1); // 0 = the greeting
+    } else {
+        mut = .garbage;
+        at = src.index(script.len + 1);
+    }
+    var changed = false;
+    if (mut != .none) {
+        const orig: []const u8 = if (at == 0) greeting else script[at - 1];
+        var repl: []const u8 = orig;
+        switch (mut) {
+            .none => unreachable,
+            .damage => {
+                const n = fz.damage(src, &scratch, orig);
+                repl = scratch[0..n];
+            },
+            .drop => repl = "",
+            .recode => {
+                @memcpy(scratch[0..orig.len], orig);
+                if (orig.len >= 3) {
+                    scratch[0] = '0' + @as(u8, @intCast(2 + src.index(4)));
+                    scratch[1] = '0' + @as(u8, @intCast(src.index(10)));
+                    scratch[2] = '0' + @as(u8, @intCast(src.index(10)));
+                }
+                repl = scratch[0..orig.len];
+            },
+            .garbage => {
+                const n = src.slice(&scratch);
+                repl = scratch[0..n];
+            },
+            .duplicate => {
+                @memcpy(scratch[0..orig.len], orig);
+                @memcpy(scratch[orig.len..][0..orig.len], orig);
+                repl = scratch[0 .. 2 * orig.len];
+            },
+        }
+        changed = !std.mem.eql(u8, repl, orig);
+        if (at == 0) {
+            @memcpy(scratch2[0..repl.len], repl);
+            greeting = scratch2[0..repl.len];
+        } else mutated[at - 1] = repl;
+    }
+    n_replies = script.len;
+
+    var srv = FakeServer.init(gpa, mutated[0..n_replies]);
+    defer srv.deinit();
+    srv.drip = if (S == fz.fuzz_driver.Rng) src.index(4) else 0;
+    try srv.outbox.appendSlice(gpa, greeting);
+
+    var opts: Options = .{ .session = .{ .tls = .disabled, .ehlo_domain = "client.example.org" } };
+    switch (conf) {
+        .plain => {},
+        .tls_auth => {
+            opts.session.tls = .required;
+            opts.session.credentials = .{ .username = fuzz_user, .password = fuzz_pass };
+            opts.tls = .{ .ctx = &srv, .upgrade = fuzzUpgrade };
+        },
+        .stripped => {
+            opts.session.tls = .required;
+            opts.session.credentials = .{ .username = fuzz_user, .password = fuzz_pass };
+        },
+        .opportunistic_no_tls => {
+            opts.session.tls = .opportunistic;
+            opts.session.credentials = .{ .username = fuzz_user, .password = fuzz_pass };
+        },
+    }
+    var c = try Client.init(gpa, srv.transport(), opts);
+    defer c.deinit();
+
+    var failed: ?anyerror = null;
+    c.connect() catch |e| {
+        failed = e;
+    };
+    if (failed == null) c.sendEnvelope(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = fuzz_body }) catch |e| {
+        failed = e;
+    };
+    if (failed == null) c.quit() catch |e| {
+        failed = e;
+    };
+
+    // The security invariants, whatever the server said.
+    if (conf != .plain) {
+        const b64 = std.base64.standard.Encoder;
+        var plain_blob: [64]u8 = undefined;
+        const blob = std.fmt.bufPrint(&plain_blob, "\x00{s}\x00{s}", .{ fuzz_user, fuzz_pass }) catch unreachable;
+        var e1: [128]u8 = undefined;
+        var e2: [128]u8 = undefined;
+        var e3: [128]u8 = undefined;
+        const secrets = [_][]const u8{ "AUTH ", b64.encode(&e1, blob), b64.encode(&e2, fuzz_user), b64.encode(&e3, fuzz_pass) };
+        const floor = srv.upgrade_at orelse srv.received.items.len + 1;
+        for (secrets) |needle| {
+            if (fuzzFind(srv.received.items, needle)) |i| {
+                if (i < floor) {
+                    std.debug.print("smtp-client: {s} reached the wire before TLS (conf {t}, mutation {t} at {d})\n", .{ needle, conf, mut, at });
+                    return error.SecretBeforeTls;
+                }
+                ClientMark.mark(.secret_after_tls);
+            }
+        }
+        if (conf == .tls_auth or conf == .stripped) {
+            if (fuzzFind(srv.received.items, "MAIL FROM")) |i| {
+                if (i < floor) {
+                    std.debug.print("smtp-client: MAIL FROM reached the wire before TLS with tls=required (conf {t}, mutation {t} at {d})\n", .{ conf, mut, at });
+                    return error.TransactionBeforeTls;
+                }
+            }
+        }
+        ClientMark.mark(.no_secret_before_tls);
+    }
+
+    if (mut == .none or !changed) {
+        switch (conf) {
+            .plain => {
+                if (failed) |e| {
+                    std.debug.print("smtp-client: the genuine conversation failed: {t}\n", .{e});
+                    return error.GenuineConversationFailed;
+                }
+                if (srv.messages.items.len != 1 or !std.mem.eql(u8, srv.messages.items[0], fuzz_body)) return error.MessageNotDelivered;
+                ClientMark.mark(.plain_done);
+            },
+            .tls_auth => {
+                if (failed) |e| {
+                    std.debug.print("smtp-client: the genuine STARTTLS + AUTH conversation failed: {t}\n", .{e});
+                    return error.GenuineConversationFailed;
+                }
+                if (srv.tls_upgrades != 1 or srv.messages.items.len != 1) return error.MessageNotDelivered;
+                ClientMark.mark(.tls_auth_done);
+            },
+            .stripped => {
+                if (failed == null) return error.StrippedStarttlsAccepted;
+                if (fuzzFind(srv.received.items, "MAIL FROM") != null or fuzzFind(srv.received.items, "AUTH ") != null) return error.StrippedStarttlsLeaked;
+                ClientMark.mark(.stripped_refused);
+            },
+            .opportunistic_no_tls => {
+                if (failed == null) return error.PlaintextAuthSent;
+                if (fuzzFind(srv.received.items, "AUTH ") != null) return error.PlaintextAuthSent;
+                ClientMark.mark(.opportunistic_refused);
+            },
+        }
+    } else if (failed == null) ClientMark.mark(.damaged_done) else ClientMark.mark(.damaged_error);
+}
+
+fn fuzzClientSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzClient(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: a damaged server reply never makes the client send secrets in the clear" {
+    try testing.fuzz({}, fuzzClientSmith, .{});
+}
+
+test "fuzz driver: SMTP_FUZZ (client)" {
+    try fz.fuzz_driver.run(fuzzClient, .{ .prefix = "SMTP_FUZZ", .name = "smtp-client" });
+}
+
+test "fuzz harness: client, 500 seeds, reaches every outcome" {
+    try ClientMark.reach(fuzzClient, "smtp-client", 500);
 }

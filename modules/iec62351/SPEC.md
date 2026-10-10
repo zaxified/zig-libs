@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: GOOSE/SV MAC key through computeMac/verifyMac, all HMAC and GMAC algorithms; 0 in-file; signature profiles via rsa/p256)
+**Hardening:** fuzz 2026-10-10 (IEC62351_FUZZ: `iec62351-goose` and `iec62351-replay` 200,000-run budget clean; `iec62351-acse` at `.scale` 4 = 50,000 runs — a signed token in an AARQ; RSA-PSS sealers are not driven; the existing parser harnesses are unchanged) · ct 2026-10-10 (ctgrind: GOOSE/SV MAC key through computeMac/verifyMac, all HMAC and GMAC algorithms; 0 in-file; signature profiles via rsa/p256)
 **Performance:** not measured
 
 **Known defects:** none recorded

@@ -144,6 +144,7 @@ test {
     _ = version;
     _ = retry;
     _ = @import("rfc9369_vectors.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }
 

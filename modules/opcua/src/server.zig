@@ -3664,6 +3664,8 @@ const TestRig = struct {
     client_conn: transport.Connection = undefined,
     channel: services.Channel = undefined,
     now_ms: i64 = 0,
+    /// The fuzz driver records everything the client sends (`pump`).
+    tape: ?*Tape = null,
     auth_token: [32]u8 = @splat(0),
     /// The most recent `ServerNonce` (CreateSession, then every
     /// ActivateSession) — what the next `ClientSignature` has to cover.
@@ -3740,6 +3742,7 @@ const TestRig = struct {
     /// Hand everything the client wrote to the server.
     fn pump(rig: *TestRig) !void {
         const bytes = rig.client_out.written();
+        if (rig.tape) |t| t.record(bytes);
         try rig.conn.feed(bytes, &rig.server_out.writer, rig.now_ms);
         rig.client_out.clearRetainingCapacity();
     }
@@ -7310,5 +7313,358 @@ test "secure: encrypted UserNameIdentityToken over a SecurityPolicy#None channel
             .body = out.writer.buffered(),
         }));
         try testing.expectEqual(status.bad_identity_token_invalid, rig.channel.last_service_result);
+    }
+}
+
+// ── deterministic fuzz driver (OPCUA_FUZZ, added 2026-10-10) ────────────────
+//
+// A genuine client conversation is RECORDED once (every `pump` appends what the
+// client sent) and replayed against a fresh rig: the rig's PRNG is seeded, so
+// the server answers a replay with the same auth token, nonces and channel id
+// the recording saw, and the recorded requests stay valid. A replay with one
+// chunk damaged, dropped, duplicated, swapped with its neighbour or replaced by
+// random bytes must never crash, hang or leak -- and, over SignAndEncrypt, must
+// never get a tampered Write into the address space.
+
+const fz = @import("fuzz_test.zig");
+
+const Tape = struct {
+    bytes: [96 * 1024]u8 = undefined,
+    len: usize = 0,
+    cuts: [64]usize = undefined,
+    n: usize = 0,
+    ready: bool = false,
+    /// Server octets of the undamaged replay.
+    baseline_out: usize = 0,
+    /// The chunk that carries the Write (the secure tape only).
+    write_chunk: usize = 0,
+
+    fn record(t: *Tape, b: []const u8) void {
+        if (b.len == 0 or t.n == t.cuts.len or t.len + b.len > t.bytes.len) return;
+        @memcpy(t.bytes[t.len..][0..b.len], b);
+        t.len += b.len;
+        t.cuts[t.n] = t.len;
+        t.n += 1;
+    }
+
+    fn chunk(t: *const Tape, i: usize) []const u8 {
+        const from = if (i == 0) 0 else t.cuts[i - 1];
+        return t.bytes[from..t.cuts[i]];
+    }
+};
+
+var tape_none: Tape = .{};
+var tape_secure: Tape = .{};
+var pki_global: ?TestPki = null;
+var pki_prng: std.Random.DefaultCsprng = undefined;
+var sec_endpoints: [3]services.EndpointDescription = undefined;
+
+fn writeAnswer(rig: *TestRig, value: i32) !void {
+    const writes = [_]services.WriteValue{
+        .{ .node_id = rig.answer_id, .attribute_id = services.attribute_id.value, .index_range = null, .value = .{ .value = .{ .scalar = .{ .int32 = value } } } },
+    };
+    const r = try rig.call(
+        .message,
+        services.type_id.write_request,
+        services.WriteRequest,
+        .{ .request_header = rig.header(rig.authToken()), .nodes_to_write = &writes },
+        services.encodeWriteRequest,
+        services.WriteResponse,
+        services.type_id.write_response,
+        services.decodeWriteResponse,
+        services.result_fns.write,
+    );
+    services.freeWriteResponse(rig.gpa, r);
+}
+
+fn readAnswer(rig: *TestRig) !void {
+    const reads = [_]services.ReadValueId{
+        .{ .node_id = rig.answer_id, .attribute_id = services.attribute_id.value, .index_range = null, .data_encoding = .{ .namespace_index = 0, .name = null } },
+    };
+    const r = try rig.call(
+        .message,
+        services.type_id.read_request,
+        services.ReadRequest,
+        .{ .request_header = rig.header(rig.authToken()), .max_age = 0, .timestamps_to_return = .both, .nodes_to_read = &reads },
+        services.encodeReadRequest,
+        services.ReadResponse,
+        services.type_id.read_response,
+        services.decodeReadResponse,
+        services.result_fns.read,
+    );
+    services.freeReadResponse(rig.gpa, r);
+}
+
+fn closeSession(rig: *TestRig) !void {
+    const r = try rig.call(
+        .message,
+        services.type_id.close_session_request,
+        services.CloseSessionRequest,
+        .{ .request_header = rig.header(rig.authToken()), .delete_subscriptions = true },
+        services.encodeCloseSessionRequest,
+        services.CloseSessionResponse,
+        services.type_id.close_session_response,
+        services.decodeCloseSessionResponse,
+        services.result_fns.close_session,
+    );
+    services.freeCloseSessionResponse(rig.gpa, r);
+}
+
+fn scenarioNone(rig: *TestRig) !void {
+    try rig.connect();
+    try readAnswer(rig);
+    try writeAnswer(rig, 43);
+    const sub = try createSubscription(rig, 100, 10);
+    const sub_id = sub.subscription_id;
+    services.freeCreateSubscriptionResponse(rig.gpa, sub);
+    const items = try rigCreateMonitoredItemSampling(rig, sub_id, rig.answer_id, 1, 100);
+    services.freeCreateMonitoredItemsResponse(rig.gpa, items);
+    _ = try parkPublish(rig, &.{});
+    try readAnswer(rig);
+    try closeSession(rig);
+}
+
+fn scenarioSecure(rig: *TestRig, pki: TestPki) !void {
+    // `connectSecure`, except that the client draws from its OWN generator:
+    // the rig's one is the server's too, and a replay (no client) would then
+    // hand the server a different random sequence than the recording saw.
+    var client_prng = std.Random.DefaultPrng.init(0xC11E);
+    try rig.handshake();
+    rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+    rig.channel.security.?.random = client_prng.random();
+    _ = try rig.openChannelSecure(.sign_and_encrypt, .issue, 600_000);
+    try rig.createSessionSecure(pki.client, pki.server.certificate_der);
+    var sig_buf: []u8 = &.{};
+    const sig = try rig.clientSignature(pki.client, pki.server.certificate_der, &rig.server_nonce, &sig_buf);
+    defer rig.gpa.free(sig_buf);
+    var token_buf: [128]u8 = undefined;
+    try rig.activateSessionSecure(sig, try rig.anonymousToken(&token_buf));
+    try readAnswer(rig);
+    rig.tape.?.write_chunk = rig.tape.?.n;
+    try writeAnswer(rig, 43);
+    try readAnswer(rig);
+    try closeSession(rig);
+}
+
+fn secureConfigGlobal() !struct { cfg: Config, pki: TestPki } {
+    if (pki_global == null) {
+        pki_prng = std.Random.DefaultCsprng.init([_]u8{0x3D} ** 32);
+        pki_global = try TestPki.init(std.heap.page_allocator, &pki_prng, .{});
+    }
+    const pki = pki_global.?;
+    const endpoints = secureTestEndpoints(&sec_endpoints, pki.server.certificate_der);
+    return .{ .cfg = secureTestConfig(endpoints, pki), .pki = pki };
+}
+
+const Mutation = enum { none, damage, drop, duplicate, swap, random };
+
+const ReplayResult = struct { out_octets: usize, answer: ?i32, closed: bool, changed: bool };
+
+fn answerOf(rig: *TestRig) ?i32 {
+    const nd = rig.store.getNode(rig.answer_id) orelse return null;
+    switch (nd.attributes) {
+        .variable => |v| {
+            const val = v.value.value orelse return null;
+            return switch (val) {
+                .scalar => |sc| switch (sc) {
+                    .int32 => |x| x,
+                    else => null,
+                },
+                else => null,
+            };
+        },
+        else => return null,
+    }
+}
+
+fn feedTick(rig: *TestRig, bytes: []const u8, out_octets: *usize) void {
+    rig.conn.feed(bytes, &rig.server_out.writer, 0) catch |err| switch (err) {
+        error.OutOfMemory, error.WriteFailed, error.ValueTooLarge, error.ResponseTooLarge => {},
+    };
+    rig.conn.tick(&rig.server_out.writer, 0) catch |err| switch (err) {
+        error.OutOfMemory, error.WriteFailed, error.ValueTooLarge, error.ResponseTooLarge => {},
+    };
+    out_octets.* += rig.server_out.written().len;
+    rig.server_out.clearRetainingCapacity();
+}
+
+fn replay(rig: *TestRig, tape: *const Tape, comptime S: type, src: *S, mutation: Mutation, at: usize, scratch: []u8) ReplayResult {
+    var out: usize = 0;
+    var changed = false;
+    var i: usize = 0;
+    while (i < tape.n) : (i += 1) {
+        const piece = tape.chunk(i);
+        if (i != at or mutation == .none) {
+            feedTick(rig, piece, &out);
+            continue;
+        }
+        switch (mutation) {
+            .none => unreachable,
+            .damage => {
+                const n = if (S == fz.fuzz_driver.Rng) fz.damage(src, scratch, piece) else src.slice(scratch);
+                changed = n != piece.len or !std.mem.eql(u8, scratch[0..n], piece);
+                feedTick(rig, scratch[0..n], &out);
+            },
+            .drop => changed = true,
+            .duplicate => {
+                feedTick(rig, piece, &out);
+                feedTick(rig, piece, &out);
+            },
+            .swap => if (i + 1 < tape.n) {
+                feedTick(rig, tape.chunk(i + 1), &out);
+                feedTick(rig, piece, &out);
+                i += 1;
+            } else feedTick(rig, piece, &out),
+            .random => {
+                const n = src.slice(scratch);
+                changed = n != piece.len or !std.mem.eql(u8, scratch[0..n], piece);
+                feedTick(rig, scratch[0..n], &out);
+            },
+        }
+    }
+    return .{ .out_octets = out, .answer = answerOf(rig), .closed = rig.conn.isClosed(), .changed = changed };
+}
+
+fn ensureTape(comptime secure: bool) !*Tape {
+    const tape = if (secure) &tape_secure else &tape_none;
+    if (tape.ready) return tape;
+    const gpa = testing.allocator;
+    const sc = try secureConfigGlobal();
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, if (secure) sc.cfg else TestRig.defaultConfig());
+        defer rig.deinit();
+        rig.tape = tape;
+        if (secure) try scenarioSecure(&rig, sc.pki) else try scenarioNone(&rig);
+        rig.tape = null;
+    }
+    // Baseline: the undamaged replay on a fresh rig.
+    var rig: TestRig = undefined;
+    try rig.init(gpa, if (secure) sc.cfg else TestRig.defaultConfig());
+    defer rig.deinit();
+    var scratch: [4096]u8 = undefined;
+    var unused: fz.fuzz_driver.Rng = undefined;
+    const r = replay(&rig, tape, fz.fuzz_driver.Rng, &unused, .none, 0, &scratch);
+    tape.baseline_out = r.out_octets;
+    if (r.answer != 43) return error.GenuineReplayDidNotWrite;
+    tape.ready = true;
+    return tape;
+}
+
+const SessMark = fz.Marker(enum {
+    genuine_replay,
+    damaged,
+    dropped,
+    duplicated,
+    swapped,
+    random_chunk,
+    survived,
+    closed,
+    write_landed,
+    write_refused,
+});
+
+fn sessionHarness(comptime secure: bool, comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const tape = try ensureTape(secure);
+    const sc = try secureConfigGlobal();
+    var mutation: Mutation = .damage;
+    var at: usize = 0;
+    if (S == fz.fuzz_driver.Rng) {
+        mutation = switch (src.valueRangeAtMost(u8, 0, 19)) {
+            0...3 => .none,
+            4...12 => .damage,
+            13, 14 => .drop,
+            15, 16 => .duplicate,
+            17, 18 => .swap,
+            else => .random,
+        };
+        at = src.index(tape.n);
+    } else at = src.index(tape.n);
+
+    var rig: TestRig = undefined;
+    try rig.init(gpa, if (secure) sc.cfg else TestRig.defaultConfig());
+    defer rig.deinit();
+    var scratch: [8192]u8 = undefined;
+    const r = replay(&rig, tape, S, src, mutation, at, &scratch);
+
+    switch (mutation) {
+        .none => {
+            if (r.out_octets != tape.baseline_out or r.answer != 43) {
+                std.debug.print("opcua: the undamaged replay changed: {d} octets (baseline {d}), answer {?d}\n", .{ r.out_octets, tape.baseline_out, r.answer });
+                return error.GenuineReplayChanged;
+            }
+            SessMark.mark(.genuine_replay);
+        },
+        .damage => SessMark.mark(.damaged),
+        .drop => SessMark.mark(.dropped),
+        .duplicate => SessMark.mark(.duplicated),
+        .swap => SessMark.mark(.swapped),
+        .random => SessMark.mark(.random_chunk),
+    }
+    if (mutation != .none) {
+        if (r.closed) SessMark.mark(.closed) else SessMark.mark(.survived);
+        if (r.answer == 43) SessMark.mark(.write_landed) else SessMark.mark(.write_refused);
+    }
+    if (secure and mutation != .none) {
+        // Over SignAndEncrypt the only value the address space may ever hold
+        // is what the client wrote (43) or what was there (42): a tampered
+        // Write that landed would hold anything else.
+        const write_tampered = at == tape.write_chunk and r.changed and (mutation == .damage or mutation == .random or mutation == .drop);
+        if (write_tampered and r.answer != 42) {
+            std.debug.print("opcua-secure: the Write chunk was tampered with ({t}) and the answer is {?d}\n", .{ mutation, r.answer });
+            return error.TamperedWriteLanded;
+        }
+        if (r.answer != 42 and r.answer != 43) {
+            std.debug.print("opcua-secure: a tampered chunk (mutation {t}, chunk {d}) left the answer at {?d}\n", .{ mutation, at, r.answer });
+            return error.TamperedWriteLanded;
+        }
+    }
+}
+
+pub fn fuzzSessionNone(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    return sessionHarness(false, S, src, gpa);
+}
+
+pub fn fuzzSessionSecure(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    return sessionHarness(true, S, src, gpa);
+}
+
+fn fuzzSessionNoneSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSessionNone(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzSessionSecureSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSessionSecure(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: a recorded session with one damaged chunk (SecurityPolicy None)" {
+    try testing.fuzz({}, fuzzSessionNoneSmith, .{});
+}
+
+test "fuzz: a recorded SignAndEncrypt session with one damaged chunk" {
+    try testing.fuzz({}, fuzzSessionSecureSmith, .{});
+}
+
+test "fuzz driver: OPCUA_FUZZ (session)" {
+    try fz.fuzz_driver.run(fuzzSessionNone, .{ .prefix = "OPCUA_FUZZ", .name = "opcua-session", .scale = 16 });
+}
+
+test "fuzz driver: OPCUA_FUZZ (secure)" {
+    try fz.fuzz_driver.run(fuzzSessionSecure, .{ .prefix = "OPCUA_FUZZ", .name = "opcua-secure", .scale = 16 });
+}
+
+test "fuzz harness: session, 300 seeds, reaches every outcome" {
+    try SessMark.reach(fuzzSessionNone, "opcua-session", 300);
+}
+
+test "fuzz harness: secure session, 150 seeds, runs clean" {
+    var prng_seed: usize = 0;
+    while (prng_seed < 150) : (prng_seed += 1) {
+        var prng = std.Random.DefaultPrng.init(prng_seed);
+        var rng: fz.fuzz_driver.Rng = .{ .r = prng.random() };
+        fuzzSessionSecure(fz.fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("opcua-secure seed {d}: {t}\n", .{ prng_seed, err });
+            return err;
+        };
     }
 }

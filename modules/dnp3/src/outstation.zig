@@ -4837,3 +4837,169 @@ test "a read of a point kind the database does not have is OBJECT_UNKNOWN, not a
     try testing.expect((try responseIin(reply.fragment)).object_unknown);
     try testing.expect(!reply.more);
 }
+
+// ── deterministic fuzz driver (DNP3_FUZZ, added 2026-10-10) ─────────────────
+
+const fz = @import("fuzz_test.zig");
+
+/// `drawRequest`'s drawer over any source of choices.
+fn SrcDrawer(comptime S: type) type {
+    return struct {
+        src: *S,
+
+        fn below(self: *@This(), n: usize) usize {
+            return self.src.index(n);
+        }
+    };
+}
+
+const FragMark = fz.Marker(enum {
+    structured,
+    damaged_genuine,
+    replied,
+    silent,
+    buffer_too_small,
+    full_width_range,
+    index_past_u16,
+    frame_to_us,
+    frame_filtered,
+    frame_refused,
+    session_replied,
+});
+
+fn prepareStation(fix: *Fixture, config: Config) Outstation {
+    var station = fix.station(config);
+    fix.counters[2].value = 0x1_0000;
+    fix.analogs[3].value = 40_000;
+    _ = &station;
+    return station;
+}
+
+pub fn fuzzFragment(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var fix = Fixture{};
+    var station = prepareStation(&fix, .{ .select_timeout_ms = 1000, .unsolicited_supported = true, .allow_restart = true });
+    var out: [2048]u8 = undefined;
+    var buf: [200]u8 = undefined;
+    var dmg: [200]u8 = undefined;
+    var d = SrcDrawer(S){ .src = src };
+    var shapes = DrawnShapes{};
+    const rounds = 1 + src.index(4);
+    // Now and then a reply buffer too small for any response.
+    const out_len: usize = if (S == fz.fuzz_driver.Rng and src.valueRangeAtMost(u8, 0, 11) == 0) 4 else out.len;
+    for (0..rounds) |round| {
+        var fragment: []const u8 = undefined;
+        if (S == fz.fuzz_driver.Rng and src.valueRangeAtMost(u8, 0, 3) == 0) {
+            // A genuine read of the whole database (class 0 + events), damaged.
+            var rb: [64]u8 = undefined;
+            const headers = [_]objects.ObjectHeader{
+                objects.g60.readClassHeader(.class0),
+                objects.g60.readClassHeader(.class1),
+            };
+            const genuine = try buildRead(&rb, @intCast(round % 16), &headers);
+            const n = fz.damage(src, &dmg, genuine);
+            fragment = dmg[0..n];
+            FragMark.mark(.damaged_genuine);
+        } else {
+            fragment = drawRequest(&d, &buf, &shapes);
+            FragMark.mark(.structured);
+        }
+        const before = out;
+        _ = before;
+        if (station.handle(fragment, round * 7, out[0..out_len])) |maybe| {
+            if (maybe) |reply| {
+                const decoded = try application.decodeResponseHeader(reply.fragment);
+                try testing.expect(decoded.header.function == .response or decoded.header.function == .unsolicited_response);
+                FragMark.mark(.replied);
+            } else FragMark.mark(.silent);
+        } else |err| {
+            try testing.expectEqual(error.BufferTooSmall, err);
+            FragMark.mark(.buffer_too_small);
+        }
+        var fragments: usize = 0;
+        while (station.cursor != null) {
+            _ = station.next(round * 7, out[0..out_len]) catch break;
+            fragments += 1;
+            if (fragments > 64) return error.ResponseSeriesDidNotTerminate;
+        }
+    }
+    if (shapes.full_width_range) FragMark.mark(.full_width_range);
+    if (shapes.index_past_u16) FragMark.mark(.index_past_u16);
+}
+
+pub fn fuzzSessionFrames(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var fix = Fixture{};
+    var station = prepareStation(&fix, .{ .address = 10, .master_address = 1, .allow_restart = true });
+    var rx: [1024]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    var tx: [1024]u8 = undefined;
+    var session = Session.init(&station, &rx, &scratch, &tx);
+    var out: [2048]u8 = undefined;
+    var buf: [200]u8 = undefined;
+    var user: [link.max_user_data_len]u8 = undefined;
+    var frame_buf: [512]u8 = undefined;
+    var dmg: [512]u8 = undefined;
+    const dests = [_]u16{ 10, 10, 10, 11, 999, 0xFFFC, 0xFFFD, 0xFFFE, 0xFFFF };
+    const link_functions = [_]u4{ 0, 1, 2, 3, 4, 9 };
+    var d = SrcDrawer(S){ .src = src };
+    var shapes = DrawnShapes{};
+    const rounds = 1 + src.index(4);
+    for (0..rounds) |round| {
+        const fragment = drawRequest(&d, &buf, &shapes);
+        user[0] = 0xC0 | @as(u8, @intCast(src.index(64)));
+        const carried = @min(fragment.len, user.len - 1);
+        @memcpy(user[1..][0..carried], fragment[0..carried]);
+        const dest = dests[src.index(dests.len)];
+        const src_addr: u16 = if (src.valueRangeAtMost(u8, 0, 3) == 0) @intCast(src.index(4)) else 1;
+        var frame = link.encodeFrame(
+            .{ .dir = true, .prm = src.index(8) != 0, .function = link_functions[src.index(link_functions.len)] },
+            dest,
+            src_addr,
+            user[0 .. 1 + carried],
+            &frame_buf,
+        ) catch continue;
+        if (S == fz.fuzz_driver.Rng and src.valueRangeAtMost(u8, 0, 3) == 0) {
+            const n = fz.damage(src, &dmg, frame);
+            frame = dmg[0..n];
+        }
+        const ours = (dest == 10 or isBroadcast(dest)) and src_addr == 1;
+        if (ours) FragMark.mark(.frame_to_us) else FragMark.mark(.frame_filtered);
+        if (session.feedFrame(frame, round * 3, &out)) |maybe| {
+            if (maybe != null) FragMark.mark(.session_replied);
+        } else |_| FragMark.mark(.frame_refused);
+    }
+}
+
+fn fuzzFragmentSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFragment(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzSessionFramesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSessionFrames(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: structured fragments through the driver harness" {
+    try testing.fuzz({}, fuzzFragmentSmith, .{});
+}
+
+test "fuzz: structured frames through a Session, driver harness" {
+    try testing.fuzz({}, fuzzSessionFramesSmith, .{});
+}
+
+test "fuzz driver: DNP3_FUZZ (fragment)" {
+    try fz.fuzz_driver.run(fuzzFragment, .{ .prefix = "DNP3_FUZZ", .name = "dnp3-fragment" });
+}
+
+test "fuzz driver: DNP3_FUZZ (session)" {
+    try fz.fuzz_driver.run(fuzzSessionFrames, .{ .prefix = "DNP3_FUZZ", .name = "dnp3-session" });
+}
+
+fn fuzzBoth(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    try fuzzFragment(S, src, gpa);
+    try fuzzSessionFrames(S, src, gpa);
+}
+
+test "fuzz harness: fragment + session, 8000 seeds, together reach every outcome" {
+    try FragMark.reach(fuzzBoth, "dnp3-fragment+session", 8000);
+}

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation ? · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: Mcp-Session-Id bytes through the id encoding; 0 in-file after replacing std.fmt `{x}`)
+**Hardening:** fuzz 2026-10-10 (MCP_HTTP_FUZZ: `mcp-http-pre-parse` 200,000-run budget clean after the skipValue fix below; `mcp-http-wire` at `.scale` 2 = 100,000 runs — raw HTTP requests against two live sessions: forged session id → 404, foreign Origin → 403, DELETE takes only its own session, damaged requests answered or dropped) · ct 2026-10-10 (ctgrind: Mcp-Session-Id bytes through the id encoding; 0 in-file after replacing std.fmt `{x}`)
 **Performance:** not measured
 
 **Known defects:** none recorded

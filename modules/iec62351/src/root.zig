@@ -107,4 +107,5 @@ test {
     _ = @import("iec61850_seam_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("fuzz_test.zig");
 }

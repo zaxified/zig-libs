@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (22/23) · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: key-share secrets through ECDHE + key schedule, client-auth key through signCertificateVerify; `kex` 21 / `cv` 32 in-file, all std keygen/ECDSA verdicts, none a Client.zig branch; encrypted flight not measured)
+**Hardening:** fuzz 2026-10-10 (`tlsclient-chain` 200,000-run budget clean; `tlsclient-flight` at `.scale` 10 = 20,000 runs — a genuine TLS 1.3 flight read to close_notify across a KeyUpdate, and a plaintext TLS 1.2 flight, damaged; TLSCLIENT_FUZZ) · ct 2026-10-10 (ctgrind: key-share secrets through ECDHE + key schedule, client-auth key through signCertificateVerify; `kex` 21 / `cv` 32 in-file, all std keygen/ECDSA verdicts, none a Client.zig branch; encrypted flight not measured)
 **Performance:** not measured
 
 **Known defects:** none recorded

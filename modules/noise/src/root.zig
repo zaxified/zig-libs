@@ -111,6 +111,7 @@ test {
     _ = patterns;
     _ = state;
     _ = @import("vectors_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }
 

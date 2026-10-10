@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-17 · mutation none · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: AUTH PLAIN/LOGIN password; 312 -> 6 in-file after the b64ct + masked credential-check fix, the 6 = one validity verdict per call)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget clean, SMTP_FUZZ `smtp-client`: a whole conversation — plain, STARTTLS + AUTH with TLS required, STARTTLS stripped, opportunistic without TLS — with one server reply damaged / dropped / re-coded / garbage / doubled; the per-parser harnesses are unchanged) · ct 2026-10-10 (ctgrind: AUTH PLAIN/LOGIN password; 312 -> 6 in-file after the b64ct + masked credential-check fix, the 6 = one validity verdict per call)
 **Performance:** not measured
 
 **Known defects:** none recorded

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-06 · mutation 2026-09-07 · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: channel nonces through deriveKeys 0; keys + body through sign/encrypt and decrypt/verify 14 in-file = the HMAC verdict and post-MAC padding/length handling)
+**Hardening:** fuzz 2026-10-10 (OPCUA_FUZZ: `opcua-session` / `opcua-secure` — a recorded client conversation, SecurityPolicy None resp. Basic256Sha256 SignAndEncrypt, replayed with one chunk damaged / dropped / duplicated / swapped / replaced — clean at `.scale` 16 = 12,500 runs each, a rig per run; the DER harness and `fuzzConnection` are unchanged) · ct 2026-10-10 (ctgrind: channel nonces through deriveKeys 0; keys + body through sign/encrypt and decrypt/verify 14 in-file = the HMAC verdict and post-MAC padding/length handling)
 **Performance:** not measured
 
 **Known defects:** none recorded

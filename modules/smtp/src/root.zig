@@ -156,6 +156,7 @@ test {
     _ = session;
     _ = client;
     _ = live_golden;
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta.deps names the module this one is built on" {
