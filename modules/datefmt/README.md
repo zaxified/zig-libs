@@ -82,6 +82,14 @@ fn validate(p: DateParts) bool;
 fn parse(input, fmt) ParseError!DateParts;
 fn format(alloc, parts, fmt) ![]u8;              // caller frees
 
+// The same with the format tokenized once (hot paths; comptime works):
+//   const rfc = comptime datefmt.Layout.compile("YYYY-MM-DD[T]hh:mm:ss[Z]") catch unreachable;
+//   const s = try rfc.format(alloc, parts);   const p = try rfc.parse(input);
+const Layout = struct { … };                     // literals point into fmt
+fn Layout.compile(fmt) ParseError!Layout;        // TooManyTokens past 64 tokens
+fn Layout.format(*const Layout, alloc, parts) ![]u8;
+fn Layout.parse(*const Layout, input) ParseError!DateParts;
+
 // Arithmetic (pre-1970 safe)
 fn addDays(parts, n: i64) DateParts;
 fn addMonths(parts, n: i32) DateParts;           // clamps day (Jan 31 +1mo → Feb 28/29)

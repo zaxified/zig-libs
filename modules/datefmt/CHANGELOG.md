@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Speed: `format` and `parse` 7–18× faster on short formats (bench vs Go `time`:
+  0.23–18.95× → 0.29–1.83×; P3). The tokenizer looks tokens up by first character instead of scanning
+  the token table at every position, and the token array is no longer memset on every call. `format`
+  renders into a bounded stack buffer and allocates the result once. New `Layout` (`Layout.compile`,
+  works at comptime) tokenizes a format once for repeated `format`/`parse`, measured 0.40–0.90× Go.
+  ⚠ `format` now reports an allocation failure as `error.OutOfMemory`. Before, the growing writer
+  surfaced it as `error.WriteFailed`.
+
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-datefmt`): **0.23–18.95× Go time** — over 2×, P4. Card stays `not measured` with the numbers in *Backlog* until the module is sped up (owner 2026-10-10: a consumed module must grade 3 or better). Tooling only, no code change.
 
 - **2026-10-04** — Fix: `parse` read every numeric field with `std.fmt.parseInt`, which also

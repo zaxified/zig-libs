@@ -306,9 +306,41 @@ const Token = union(enum) {
 /// the format/parse hot path.
 const MAX_TOKENS = 64;
 
-const Tokenized = struct {
-    toks: [MAX_TOKENS]Token = undefined,
-    n: usize = 0,
+/// A format string tokenized once, for callers that format or parse many
+/// values with the same format: `Layout.compile` does the work `format` and
+/// `parse` repeat on every call. Compile a constant format at comptime
+/// (`const rfc = comptime datefmt.Layout.compile("YYYY-MM-DD") catch unreachable;`).
+/// Literal tokens point into the format string, which must outlive the layout.
+///
+/// No field defaults on purpose: in Zig 0.16 ReleaseFast `.{}` with an
+/// `undefined` array default compiles to a byte-wise memset of all 1.5 KB --
+/// 63 % of `format`'s time (bench 2026-10-10). Build it as `undefined` + `n = 0`.
+pub const Layout = struct {
+    toks: [MAX_TOKENS]Token,
+    n: usize,
+    /// Upper bound of `format`'s output: every literal plus `max_field_len`
+    /// per other token.
+    bound: usize,
+    /// A weekday token (`E*`/`e`) is present, so `format` needs the weekday.
+    needs_dow: bool,
+
+    /// Tokenize `fmt` (`InvalidFormatString` cannot happen today; a format
+    /// with more than 64 tokens is `TooManyTokens`).
+    pub fn compile(fmt: []const u8) ParseError!Layout {
+        var l: Layout = undefined;
+        try tokenize(fmt, &l);
+        return l;
+    }
+
+    /// `datefmt.format` with this layout's format.
+    pub fn format(l: *const Layout, alloc: std.mem.Allocator, parts: DateParts) ![]u8 {
+        return formatLayout(alloc, parts, l);
+    }
+
+    /// `datefmt.parse` with this layout's format.
+    pub fn parse(l: *const Layout, input: []const u8) ParseError!DateParts {
+        return parseTokens(input, l.toks[0..l.n]);
+    }
 };
 
 fn matchAt(s: []const u8, pos: usize, needle: []const u8) bool {
@@ -350,26 +382,73 @@ const token_table = [_]struct { lit: []const u8, tok: Token }{
     .{ .lit = "a", .tok = .ampm_lower },
 };
 
-fn isTokenStart(fmt: []const u8, pos: usize) bool {
-    if (fmt[pos] == '[') return true;
-    for (token_table) |entry| {
-        if (matchAt(fmt, pos, entry.lit)) return true;
+/// `token_table` indexed by first character. Every token literal is a run of
+/// one character ("YYYY", "SSS", "e"), so the longest-first match at `pos` is
+/// the longest entry for `fmt[pos]` that fits the run of that character there
+/// -- one lookup instead of a scan of the whole table per position (the scan
+/// made format/parse 7-18x slower than Go's `time`, bench 2026-10-10).
+const ByChar = struct {
+    lens: [max_per_char]u8 = @splat(0),
+    toks: [max_per_char]Token = undefined,
+    n: u8 = 0,
+};
+const max_per_char = 4;
+const max_token_len = blk: {
+    var m: usize = 0;
+    for (token_table) |e| m = @max(m, e.lit.len);
+    break :blk m;
+};
+const by_char: [128]ByChar = blk: {
+    var t: [128]ByChar = @splat(.{});
+    for (token_table) |e| {
+        for (e.lit) |c| if (c != e.lit[0]) @compileError("token literal is not a single-character run: " ++ e.lit);
+        const slot = &t[e.lit[0]];
+        if (slot.n > 0 and slot.lens[slot.n - 1] <= e.lit.len) @compileError("token_table is not longest-first for " ++ e.lit);
+        slot.lens[slot.n] = e.lit.len;
+        slot.toks[slot.n] = e.tok;
+        slot.n += 1;
     }
-    return false;
+    break :blk t;
+};
+
+const TokenMatch = struct { tok: Token, len: usize };
+
+/// The token `tokenize` would match at `fmt[pos]`, longest first; null when
+/// `fmt[pos]` starts no token (a `[` is handled by the caller).
+fn tokenAt(fmt: []const u8, pos: usize) ?TokenMatch {
+    const c = fmt[pos];
+    if (c >= by_char.len) return null;
+    const e = &by_char[c];
+    if (e.n == 0) return null;
+    var run: usize = 1;
+    while (run < max_token_len and pos + run < fmt.len and fmt[pos + run] == c) run += 1;
+    for (e.lens[0..e.n], e.toks[0..e.n]) |len, tok| {
+        if (len <= run) return .{ .tok = tok, .len = len };
+    }
+    return null;
 }
 
-fn tokenize(fmt: []const u8) ParseError!Tokenized {
-    var out = Tokenized{};
+fn isTokenStart(fmt: []const u8, pos: usize) bool {
+    return fmt[pos] == '[' or tokenAt(fmt, pos) != null;
+}
+
+/// Tokenize into the caller's `out` (a 1.5 KB value returned through an error
+/// union is copied on every call).
+fn tokenize(fmt: []const u8, out: *Layout) ParseError!void {
+    out.n = 0;
     var pos: usize = 0;
     while (pos < fmt.len) {
         if (out.n >= MAX_TOKENS) return ParseError.TooManyTokens;
 
         // [text] literal or [*] wildcard.
         if (fmt[pos] == '[') {
-            const end = std.mem.indexOfScalarPos(u8, fmt, pos + 1, ']') orelse fmt.len;
+            // A plain loop: bracketed literals are a few bytes, shorter than
+            // the setup of a vectorized search.
+            var end = pos + 1;
+            while (end < fmt.len and fmt[end] != ']') end += 1;
             if (end > pos + 1) {
                 const content = fmt[pos + 1 .. end];
-                out.toks[out.n] = if (std.mem.eql(u8, content, "*"))
+                out.toks[out.n] = if (content.len == 1 and content[0] == '*')
                     .wildcard
                 else
                     .{ .literal = content };
@@ -380,17 +459,12 @@ fn tokenize(fmt: []const u8) ParseError!Tokenized {
         }
 
         // Longest-first token match.
-        var matched = false;
-        for (token_table) |entry| {
-            if (matchAt(fmt, pos, entry.lit)) {
-                out.toks[out.n] = entry.tok;
-                out.n += 1;
-                pos += entry.lit.len;
-                matched = true;
-                break;
-            }
+        if (tokenAt(fmt, pos)) |m| {
+            out.toks[out.n] = m.tok;
+            out.n += 1;
+            pos += m.len;
+            continue;
         }
-        if (matched) continue;
 
         // Literal run: consume until the next token start.
         const start = pos;
@@ -399,7 +473,17 @@ fn tokenize(fmt: []const u8) ParseError!Tokenized {
         out.toks[out.n] = .{ .literal = fmt[start..pos] };
         out.n += 1;
     }
-    return out;
+
+    out.bound = 0;
+    out.needs_dow = false;
+    for (out.toks[0..out.n]) |t| switch (t) {
+        .literal => |lit| out.bound += lit.len,
+        .day_name_long, .day_name_short, .day_of_week => {
+            out.bound += max_field_len;
+            out.needs_dow = true;
+        },
+        else => out.bound += max_field_len,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -546,8 +630,14 @@ const Builder = struct {
 /// hour that passed the `oh > 23` check (audit 2026-10-04) -- the same class
 /// `parseDigitField` exists to rule out for `parseXsdDateTime`.
 fn parseUint(comptime T: type, s: []const u8, err: ParseError) ParseError!T {
-    if (!isAllDigits(s)) return err;
-    return std.fmt.parseInt(T, s, 10) catch return err;
+    if (s.len == 0) return err;
+    var v: T = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return err;
+        v = std.math.mul(T, v, 10) catch return err;
+        v = std.math.add(T, v, c - '0') catch return err;
+    }
+    return v;
 }
 
 /// Read exactly `digits` ASCII digits at `input[p..]` as a fraction of a
@@ -577,11 +667,16 @@ fn parseFraction(input: []const u8, p: usize, digits: u8) ParseError!u32 {
 /// does not exist in that week-year (0, or 53 in a 52-week year) is
 /// `InvalidDate`.
 pub fn parse(input: []const u8, fmt: []const u8) ParseError!DateParts {
-    const tk = try tokenize(fmt);
+    var tk: Layout = undefined;
+    try tokenize(fmt, &tk);
+    return parseTokens(input, tk.toks[0..tk.n]);
+}
+
+fn parseTokens(input: []const u8, toks: []const Token) ParseError!DateParts {
     var b = Builder{};
     var p: usize = 0;
 
-    for (tk.toks[0..tk.n], 0..) |token, idx| {
+    for (toks, 0..) |token, idx| {
         if (p >= input.len) {
             // Only a zero-length trailing literal is allowed past end-of-input.
             switch (token) {
@@ -726,8 +821,8 @@ pub fn parse(input: []const u8, fmt: []const u8) ParseError!DateParts {
                 }
             },
             .wildcard => {
-                if (idx + 1 < tk.n) {
-                    p = try skipUntilNextToken(input, p, tk.toks[idx + 1]);
+                if (idx + 1 < toks.len) {
+                    p = try skipUntilNextToken(input, p, toks[idx + 1]);
                 } else {
                     p = input.len;
                 }
@@ -782,74 +877,151 @@ pub fn parse(input: []const u8, fmt: []const u8) ParseError!DateParts {
 /// Render `parts` according to `fmt`. The full token vocabulary is supported,
 /// including derived tokens (weekday names/number) computed via the civil core.
 pub fn format(alloc: std.mem.Allocator, parts: DateParts, fmt: []const u8) ![]u8 {
-    const tk = tokenize(fmt) catch |err| switch (err) {
+    var tk: Layout = undefined;
+    tokenize(fmt, &tk) catch |err| switch (err) {
         error.TooManyTokens => return error.TooManyTokens,
         else => return error.InvalidFormatString,
     };
+    return formatLayout(alloc, parts, &tk);
+}
 
-    var aw: std.Io.Writer.Allocating = .init(alloc);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-
-    // Weekday is only needed for E*/e tokens; compute lazily-ish (cheap anyway).
-    const dow = isoWeekday(ymdToEpochDay(parts.year, parts.month, parts.day));
+fn formatLayout(alloc: std.mem.Allocator, parts: DateParts, l: *const Layout) ![]u8 {
     // A negative year is only reachable from extreme date arithmetic across
     // year 0. `@intCast` of it into u32 is silent UB in ReleaseSmall (and a
     // panic in safe modes). Reject as InvalidDate — the same contract as
     // month 13 / Feb 30 — so the field yields "" rather than garbage.
-    // (`year_short` below uses `@mod` and is already safe for negatives.)
+    // (`year_short` uses `@mod` and is already safe for negatives.)
     if (parts.year < 0) return error.InvalidDate;
-    const year_u: u32 = @intCast(parts.year);
 
-    for (tk.toks[0..tk.n]) |token| {
+    // Render into a buffer sized by an upper bound, then allocate the result
+    // once. The bound fits the stack for any ordinary format; only long
+    // literals take a heap scratch buffer.
+    var stack: [256]u8 = undefined;
+    if (l.bound <= stack.len) {
+        const n = try render(&stack, parts, l);
+        return alloc.dupe(u8, stack[0..n]);
+    }
+    const scratch = try alloc.alloc(u8, l.bound);
+    defer alloc.free(scratch);
+    const n = try render(scratch, parts, l);
+    return alloc.dupe(u8, scratch[0..n]);
+}
+
+/// Longest text one non-literal token renders: `ZZ` of the most extreme
+/// `off_min` ("-35791394:08", 12), ahead of a u32 field (10) or a name (9).
+const max_field_len = 12;
+
+/// Render `l` into `out`, which holds at least `l.bound` bytes; returns the
+/// length written.
+fn render(out: []u8, parts: DateParts, l: *const Layout) error{ InvalidDate, InvalidTime }!usize {
+    const dow = if (l.needs_dow) isoWeekday(ymdToEpochDay(parts.year, parts.month, parts.day)) else 0;
+    const year_u: u32 = @intCast(parts.year); // format() refused a negative year
+    var n: usize = 0;
+
+    for (l.toks[0..l.n]) |token| {
         switch (token) {
-            .year_full => try w.print("{d:0>4}", .{year_u}),
-            .year_short => try w.print("{d:0>2}", .{@as(u32, @intCast(@mod(parts.year, 100)))}),
-            .month_full => try w.print("{d:0>2}", .{parts.month}),
-            .month_short => try w.print("{d}", .{parts.month}),
-            .month_name_short => try w.writeAll(shortMonthName(parts.month)),
-            .month_name_long => try w.writeAll(fullMonthName(parts.month)),
-            .day_full => try w.print("{d:0>2}", .{parts.day}),
-            .day_short => try w.print("{d}", .{parts.day}),
-            .day_name_long => try w.writeAll(fullDayName(dow)),
-            .day_name_short => try w.writeAll(shortDayName(dow)),
-            .day_of_week => try w.print("{d}", .{dow}),
-            .hour_24_full => try w.print("{d:0>2}", .{parts.hour}),
-            .hour_24_short => try w.print("{d}", .{parts.hour}),
-            .hour_12_full => try w.print("{d:0>2}", .{to12Hour(parts.hour)}),
-            .hour_12_short => try w.print("{d}", .{to12Hour(parts.hour)}),
-            .minute_full => try w.print("{d:0>2}", .{parts.minute}),
-            .minute_short => try w.print("{d}", .{parts.minute}),
-            .second_full => try w.print("{d:0>2}", .{parts.second}),
-            .second_short => try w.print("{d}", .{parts.second}),
-            .ampm_upper => try w.writeAll(if (parts.hour < 12) "AM" else "PM"),
-            .ampm_lower => try w.writeAll(if (parts.hour < 12) "am" else "pm"),
+            .year_full => n = putDec(out, n, year_u, 4),
+            .year_short => n = putDec(out, n, @intCast(@mod(parts.year, 100)), 2),
+            .month_full => n = putDec(out, n, parts.month, 2),
+            .month_short => n = putDec(out, n, parts.month, 1),
+            .month_name_short => n = put(out, n, shortMonthName(parts.month)),
+            .month_name_long => n = put(out, n, fullMonthName(parts.month)),
+            .day_full => n = putDec(out, n, parts.day, 2),
+            .day_short => n = putDec(out, n, parts.day, 1),
+            .day_name_long => n = put(out, n, fullDayName(dow)),
+            .day_name_short => n = put(out, n, shortDayName(dow)),
+            .day_of_week => n = putDec(out, n, dow, 1),
+            .hour_24_full => n = putDec(out, n, parts.hour, 2),
+            .hour_24_short => n = putDec(out, n, parts.hour, 1),
+            .hour_12_full => n = putDec(out, n, to12Hour(parts.hour), 2),
+            .hour_12_short => n = putDec(out, n, to12Hour(parts.hour), 1),
+            .minute_full => n = putDec(out, n, parts.minute, 2),
+            .minute_short => n = putDec(out, n, parts.minute, 1),
+            .second_full => n = putDec(out, n, parts.second, 2),
+            .second_short => n = putDec(out, n, parts.second, 1),
+            .ampm_upper => n = put(out, n, if (parts.hour < 12) "AM" else "PM"),
+            .ampm_lower => n = put(out, n, if (parts.hour < 12) "am" else "pm"),
             .tz_offset => {
                 const om = parts.off_min orelse 0;
-                const sign: u8 = if (om < 0) '-' else '+';
-                const mag: u32 = @intCast(if (om < 0) -om else om);
-                try w.print("{c}{d:0>2}:{d:0>2}", .{ sign, mag / 60, mag % 60 });
+                const mag: u32 = @intCast(if (om < 0) -@as(i64, om) else om);
+                out[n] = if (om < 0) '-' else '+';
+                n = putDec(out, n + 1, mag / 60, 2);
+                out[n] = ':';
+                n = putDec(out, n + 1, mag % 60, 2);
             },
-            .fraction => |n| {
+            .fraction => |digits| {
                 if (parts.nanosecond > 999_999_999) return error.InvalidTime;
-                switch (n) { // truncates (never rounds) to the token's width
-                    3 => try w.print("{d:0>3}", .{parts.nanosecond / 1_000_000}),
-                    6 => try w.print("{d:0>6}", .{parts.nanosecond / 1_000}),
-                    else => try w.print("{d:0>9}", .{parts.nanosecond}),
-                }
+                n = switch (digits) { // truncates (never rounds) to the token's width
+                    3 => putDec(out, n, parts.nanosecond / 1_000_000, 3),
+                    6 => putDec(out, n, parts.nanosecond / 1_000, 6),
+                    else => putDec(out, n, parts.nanosecond, 9),
+                };
             },
             .iso_year => {
                 const iy = isoWeek(parts).year;
                 if (iy < 0) return error.InvalidDate; // same contract as YYYY
-                try w.print("{d:0>4}", .{@as(u32, @intCast(iy))});
+                n = putDec(out, n, @intCast(iy), 4);
             },
-            .iso_week_full => try w.print("{d:0>2}", .{isoWeek(parts).week}),
-            .iso_week_short => try w.print("{d}", .{isoWeek(parts).week}),
+            .iso_week_full => n = putDec(out, n, isoWeek(parts).week, 2),
+            .iso_week_short => n = putDec(out, n, isoWeek(parts).week, 1),
             .wildcard => {}, // nothing to emit on the format side
-            .literal => |lit| try w.writeAll(lit),
+            .literal => |lit| n = put(out, n, lit),
         }
     }
-    return aw.toOwnedSlice();
+    return n;
+}
+
+/// "00" "01" … "99" back to back.
+const two_digits: [200]u8 = blk: {
+    var t: [200]u8 = undefined;
+    for (0..100) |i| {
+        t[2 * i] = '0' + i / 10;
+        t[2 * i + 1] = '0' + i % 10;
+    }
+    break :blk t;
+};
+
+fn put(out: []u8, n: usize, s: []const u8) usize {
+    if (s.len == 1) { // the common separator literal; skips a memcpy call
+        out[n] = s[0];
+        return n + 1;
+    }
+    @memcpy(out[n..][0..s.len], s);
+    return n + s.len;
+}
+
+/// `v` in decimal at `out[n..]`, zero-padded to at least `min_width` (≤ 10)
+/// digits -- what `print("{d:0>N}")` produces, without the generic formatter.
+fn putDec(out: []u8, n: usize, v: u32, comptime min_width: u8) usize {
+    comptime std.debug.assert(min_width >= 1 and min_width <= 10);
+    // Fast paths for the common field widths: fixed-size stores, no loop.
+    if (min_width == 1 and v < 10) {
+        out[n] = '0' + @as(u8, @intCast(v));
+        return n + 1;
+    }
+    if (min_width <= 2 and v < 100) { // width 1 with v < 10 returned above
+        out[n..][0..2].* = two_digits[v * 2 ..][0..2].*;
+        return n + 2;
+    }
+    if (min_width == 4 and v < 10000) {
+        out[n..][0..2].* = two_digits[(v / 100) * 2 ..][0..2].*;
+        out[n + 2 ..][0..2].* = two_digits[(v % 100) * 2 ..][0..2].*;
+        return n + 4;
+    }
+    var digits: [10]u8 = undefined;
+    var i: usize = digits.len;
+    var x = v;
+    while (true) {
+        i -= 1;
+        digits[i] = '0' + @as(u8, @intCast(x % 10));
+        x /= 10;
+        if (x == 0) break;
+    }
+    while (digits.len - i < min_width) {
+        i -= 1;
+        digits[i] = '0';
+    }
+    return put(out, n, digits[i..]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,15 +1295,10 @@ pub fn firstInvalidFormatChar(fmt: []const u8) ?usize {
             pos = end + 1;
             continue;
         }
-        var matched = false;
-        for (token_table) |entry| {
-            if (matchAt(fmt, pos, entry.lit)) {
-                pos += entry.lit.len;
-                matched = true;
-                break;
-            }
+        if (tokenAt(fmt, pos)) |m| {
+            pos += m.len;
+            continue;
         }
-        if (matched) continue;
         // A bare ASCII letter that isn't a token is a likely typo.
         if (std.ascii.isAlphabetic(fmt[pos])) return pos;
         pos += 1; // punctuation / separators are fine as literals
@@ -1259,6 +1426,164 @@ test "parse: token edges from the date_tokens table (mutation 2026-10-04)" {
     // [*] "skip until the next token": a literal, or a 4-digit year.
     try testing.expectEqual(@as(i32, 2024), (try parse("abc-2024", "[*]-YYYY")).year);
     try testing.expectEqual(@as(i32, 2024), (try parse("foo2024", "[*]YYYY")).year);
+}
+
+/// The tokenizer before the by-first-character lookup (2026-10-10): scan
+/// `token_table` in order at every position. The oracle for the test below.
+fn tokenizeByTableScan(fmt: []const u8) ParseError!Layout {
+    var out: Layout = undefined;
+    out.n = 0;
+    var pos: usize = 0;
+    while (pos < fmt.len) {
+        if (out.n >= MAX_TOKENS) return ParseError.TooManyTokens;
+        if (fmt[pos] == '[') {
+            const end = std.mem.indexOfScalarPos(u8, fmt, pos + 1, ']') orelse fmt.len;
+            if (end > pos + 1) {
+                const content = fmt[pos + 1 .. end];
+                out.toks[out.n] = if (std.mem.eql(u8, content, "*")) .wildcard else .{ .literal = content };
+                out.n += 1;
+                pos = end + 1;
+                continue;
+            }
+        }
+        const hit = for (token_table) |entry| {
+            if (matchAt(fmt, pos, entry.lit)) break entry;
+        } else null;
+        if (hit) |entry| {
+            out.toks[out.n] = entry.tok;
+            out.n += 1;
+            pos += entry.lit.len;
+            continue;
+        }
+        const start = pos;
+        pos += 1;
+        while (pos < fmt.len and fmt[pos] != '[' and for (token_table) |entry| {
+            if (matchAt(fmt, pos, entry.lit)) break false;
+        } else true) pos += 1;
+        out.toks[out.n] = .{ .literal = fmt[start..pos] };
+        out.n += 1;
+    }
+    return out;
+}
+
+test "tokenize: by-first-character lookup splits every short format like the table scan" {
+    // Every string up to 4 characters over the token letters, their
+    // neighbours and the bracket syntax: same tokens, same literal slices.
+    const alphabet = "YMDEShimsZWGeAa[]*x-";
+    var buf: [4]u8 = undefined;
+    var idx: [4]usize = undefined;
+    for (1..buf.len + 1) |len| {
+        @memset(idx[0..len], 0);
+        while (true) {
+            for (idx[0..len], buf[0..len]) |i, *c| c.* = alphabet[i];
+            const s = buf[0..len];
+            const want = try tokenizeByTableScan(s);
+            var got: Layout = undefined;
+            try tokenize(s, &got);
+            try testing.expectEqual(want.n, got.n);
+            for (want.toks[0..want.n], got.toks[0..got.n]) |a, b| {
+                try testing.expectEqual(std.meta.activeTag(a), std.meta.activeTag(b));
+                switch (a) {
+                    .literal => |l| try testing.expectEqualStrings(l, b.literal),
+                    .fraction => |n| try testing.expectEqual(n, b.fraction),
+                    else => {},
+                }
+            }
+            // odometer
+            var k: usize = 0;
+            while (k < len) : (k += 1) {
+                idx[k] += 1;
+                if (idx[k] < alphabet.len) break;
+                idx[k] = 0;
+            }
+            if (k == len) break;
+        }
+    }
+    // Runs longer than any token: "SSSSSSSSSSSS" = 9 + 3, "YYYYY" = YYYY + literal Y.
+    for ([_][]const u8{ "SSSSSSSSSSSS", "YYYYY", "SSSSSSSS", "MMMMMMMMM", "ZZZ", "GGG" }) |s| {
+        const want = try tokenizeByTableScan(s);
+        var got: Layout = undefined;
+        try tokenize(s, &got);
+        try testing.expectEqual(want.n, got.n);
+        for (want.toks[0..want.n], got.toks[0..got.n]) |a, b|
+            try testing.expectEqual(std.meta.activeTag(a), std.meta.activeTag(b));
+    }
+}
+
+test "putDec: same text as print {d:0>N}" {
+    var buf: [32]u8 = undefined;
+    const values = [_]u32{ 0, 1, 9, 10, 99, 100, 999, 1000, 9999, 10000, 123_456_789, 999_999_999, std.math.maxInt(u32) };
+    inline for (.{ 1, 2, 3, 4, 6, 9 }) |width| {
+        for (values) |v| {
+            const len = putDec(&buf, 0, v, width);
+            var want: [32]u8 = undefined;
+            const exp = try std.fmt.bufPrint(&want, "{d:0>" ++ std.fmt.comptimePrint("{d}", .{width}) ++ "}", .{v});
+            try testing.expectEqualStrings(exp, buf[0..len]);
+        }
+    }
+}
+
+test "format: max_field_len bounds every field, extreme values included" {
+    // The widest rendering of each non-literal token stays within max_field_len.
+    const extreme = DateParts{ .year = std.math.maxInt(i32), .month = 9, .day = 30, .hour = std.math.maxInt(u32), .minute = std.math.maxInt(u32), .second = std.math.maxInt(u32), .nanosecond = 999_999_999, .off_min = std.math.minInt(i32) };
+    for (token_table) |e| {
+        const s = format(testing.allocator, extreme, e.lit) catch continue;
+        defer testing.allocator.free(s);
+        try testing.expect(s.len <= max_field_len);
+    }
+    const s = try format(testing.allocator, extreme, "ZZ");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("-35791394:08", s);
+}
+
+test "format: a bound past the stack buffer takes a heap scratch buffer, same text" {
+    const parts = DateParts{ .year = 2024, .month = 3, .day = 7, .hour = 14, .minute = 5, .second = 9 };
+    const lit = "[" ++ "x" ** 150 ++ "]";
+    const s = try format(testing.allocator, parts, "YYYY" ++ lit ++ "MM-DD");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("2024" ++ "x" ** 150 ++ "03-07", s);
+    // "[q…]DD" bounds to n + 10: just under, at and past the 256-byte stack buffer.
+    for ([_]usize{ 245, 246, 247, 260 }) |n| {
+        var fmt_buf: [270]u8 = undefined;
+        fmt_buf[0] = '[';
+        @memset(fmt_buf[1 .. n - 1], 'q');
+        fmt_buf[n - 1] = ']';
+        @memcpy(fmt_buf[n .. n + 2], "DD");
+        const out = try format(testing.allocator, parts, fmt_buf[0 .. n + 2]);
+        defer testing.allocator.free(out);
+        try testing.expectEqual(n - 2 + 2, out.len);
+        try testing.expectEqualStrings("07", out[out.len - 2 ..]);
+    }
+    // Every allocation failure surfaces as an error, never a leak.
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn f(a: std.mem.Allocator, p: DateParts) !void {
+            a.free(try format(a, p, "YYYY-MM-DD"));
+            a.free(try format(a, p, "YYYY" ++ ("[" ++ "y" ** 300 ++ "]")));
+        }
+    }.f, .{parts});
+}
+
+fn expectLayoutMatches(l: *const Layout, fmt: []const u8, p: DateParts) !void {
+    const a = try l.format(testing.allocator, p);
+    defer testing.allocator.free(a);
+    const b = try format(testing.allocator, p, fmt);
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings(b, a);
+    try testing.expectEqualDeep(try parse(a, fmt), try l.parse(a));
+}
+
+test "Layout: same result as format/parse with the format string, also compiled at comptime" {
+    const rfc = comptime Layout.compile("YYYY-MM-DD[T]hh:mm:ss.SSSZZ") catch unreachable;
+    const imf = try Layout.compile("EEE, DD MMM YYYY hh:mm:ss [GMT]");
+    var prng = std.Random.DefaultPrng.init(0x1a70_7);
+    for (0..500) |_| {
+        var p = unixToParts(prng.random().intRangeAtMost(i64, -62_135_596_800, 253_402_300_799));
+        p.nanosecond = prng.random().uintLessThan(u32, 1_000_000_000);
+        p.off_min = prng.random().intRangeAtMost(i32, -23 * 60, 23 * 60);
+        try expectLayoutMatches(&rfc, "YYYY-MM-DD[T]hh:mm:ss.SSSZZ", p);
+        try expectLayoutMatches(&imf, "EEE, DD MMM YYYY hh:mm:ss [GMT]", p);
+    }
+    try testing.expectError(ParseError.TooManyTokens, Layout.compile("YYYY-" ** 40));
 }
 
 test "tokenize: more than MAX_TOKENS tokens is TooManyTokens, not an overrun" {

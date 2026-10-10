@@ -18,6 +18,10 @@
 //!   parse_rfc3339       RFC 3339 `...Z` -> Unix seconds, ours `parseXsdDateTime`
 //!   parse_rfc3339_frac  RFC 3339 with 9 fraction digits and a +02:00 offset,
 //!                       ours `parseXsdDateTimeNs`, Go `time.Parse(time.RFC3339)`
+//!   *_layout            fmt_imf, fmt_rfc3339, parse_imf through a
+//!                       `datefmt.Layout` compiled once (comptime); Go runs the
+//!                       same code as the row without the suffix (it has no
+//!                       compiled layout -- its layout string is the constant)
 //! Each side times the same way (double the batch until it takes over 100 ms,
 //! best of five); per workload the sides alternate for BENCH_ROUNDS (default 3)
 //! rounds, each keeping its best. The result count (sum of output bytes, or of
@@ -39,7 +43,9 @@ const rfc_fmt = "YYYY-MM-DD[T]hh:mm:ss[Z]";
 
 const net_base: ?[]const u8 = null;
 const info_only = [_][]const u8{};
-const names = [_][]const u8{ "fmt_imf", "fmt_rfc3339", "parse_imf", "parse_rfc3339", "parse_rfc3339_frac" };
+const names = [_][]const u8{ "fmt_imf", "fmt_rfc3339", "parse_imf", "parse_rfc3339", "parse_rfc3339_frac", "fmt_imf_layout", "fmt_rfc3339_layout", "parse_imf_layout" };
+const imf_layout = datefmt.Layout.compile(imf_fmt) catch unreachable;
+const rfc_layout = datefmt.Layout.compile(rfc_fmt) catch unreachable;
 
 const Data = struct {
     unix: [N]i64,
@@ -67,14 +73,25 @@ fn once(d: *const Data, w: usize) u64 {
             const p = datefmt.parse(s, imf_fmt) catch unreachable;
             t +%= @bitCast(datefmt.partsToUnix(p));
         },
+        5, 6 => for (d.unix) |u| {
+            const l = if (w == 5) &imf_layout else &rfc_layout;
+            const s = l.format(a, datefmt.unixToParts(u)) catch unreachable;
+            t += sumBytes(s);
+            a.free(s);
+        },
+        7 => for (d.imf) |s| {
+            const p = imf_layout.parse(s) catch unreachable;
+            t +%= @bitCast(datefmt.partsToUnix(p));
+        },
         3 => for (d.rfc) |s| {
             t +%= @bitCast(datefmt.parseXsdDateTime(s) catch unreachable);
         },
-        else => for (d.rfcns) |s| {
+        4 => for (d.rfcns) |s| {
             const r = datefmt.parseXsdDateTimeNs(s) catch unreachable;
             t +%= @bitCast(r.unix);
             t += r.nanosecond;
         },
+        else => unreachable,
     }
     return t;
 }

@@ -11,6 +11,8 @@
 //	parse_imf    time.Parse(http.TimeFormat, s).Unix()
 //	parse_rfc    time.Parse(time.RFC3339, s).Unix()      (Z, whole seconds)
 //	parse_rfcns  time.Parse(time.RFC3339, s)             (fraction + offset)
+//	*_layout     the same as the name without the suffix (the Zig side
+//	             formats/parses through a precompiled layout there)
 //
 // Timing matches the Zig side: double the batch until it takes over 100 ms,
 // then keep the best of five.
@@ -88,7 +90,7 @@ func main() {
 
 	var f func() int
 	switch name {
-	case "fmt_imf":
+	case "fmt_imf", "fmt_imf_layout":
 		f = func() int {
 			t := 0
 			for _, u := range unix {
@@ -96,7 +98,7 @@ func main() {
 			}
 			return t
 		}
-	case "fmt_rfc3339":
+	case "fmt_rfc3339", "fmt_rfc3339_layout":
 		f = func() int {
 			t := 0
 			for _, u := range unix {
@@ -104,7 +106,7 @@ func main() {
 			}
 			return t
 		}
-	case "parse_imf":
+	case "parse_imf", "parse_imf_layout":
 		f = func() int {
 			t := 0
 			for _, s := range imf {
