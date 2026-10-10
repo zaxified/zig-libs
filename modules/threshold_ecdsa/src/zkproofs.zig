@@ -2138,7 +2138,10 @@ pub const MtaProofWc = struct {
         const base = try MtaProof.fromBytesAlloc(allocator, n_tilde, alice_pk, base_bytes);
         errdefer base.deinit(allocator);
 
-        if (bytes.len < offset + root.Ne) return error.InvalidEncoding;
+        // Exact length, as PdlProof requires: trailing octets after the
+        // point made two encodings of one proof (malleable; fuzz wave I,
+        // 2026-10-10).
+        if (bytes.len != offset + root.Ne) return error.InvalidEncoding;
         const u1_point = try root.Element.fromBytes(bytes[offset..][0..root.Ne].*);
 
         return .{ .base = base, .u1_point = u1_point };
@@ -2459,6 +2462,13 @@ test "MtaProofWc: toBytesAlloc/fromBytesAlloc round-trip on hand-built values" {
     defer back.deinit(allocator);
 
     try testing.expectEqualSlices(u8, &proof.u1_point.toBytes(), &back.u1_point.toBytes());
+
+    // A trailing octet makes it a different encoding of the same proof: refused.
+    const longer = try allocator.alloc(u8, bytes.len + 1);
+    defer allocator.free(longer);
+    @memcpy(longer[0..bytes.len], bytes);
+    longer[bytes.len] = 0;
+    try testing.expectError(error.InvalidEncoding, MtaProofWc.fromBytesAlloc(allocator, setup.aux.n_tilde, setup.pk.public, longer));
     try testing.expectEqualSlices(u8, proof.base.s1, back.base.s1);
 }
 
