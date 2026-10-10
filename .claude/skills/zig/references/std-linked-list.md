@@ -36,7 +36,7 @@ list.insertBefore(&a.node, &c.node);  // insert c before a
 
 // Remove
 list.remove(&a.node);         // O(1) remove specific node
-const last = list.pop();      // remove and return last
+const last = list.pop();  // remove and return last (renamed popLast in 0.17)
 const first = list.popFirst(); // remove and return first
 
 // Get data from node

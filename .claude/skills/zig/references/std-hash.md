@@ -405,8 +405,9 @@ const std = @import("std");
 // Requires 128-bit key
 const key: [16]u8 = .{0} ** 16;
 
-const h64 = std.hash.SipHash64(2, 4).hash(&key, "data");
-const h128 = std.hash.SipHash128(2, 4).hash(&key, "data");
+// One-shot: toInt(msg, &key) (there is no `.hash(key, data)`)
+const h64: u64 = std.hash.SipHash64(2, 4).toInt("data", &key);
+const h128: u128 = std.hash.SipHash128(2, 4).toInt("data", &key);
 
 // Default parameters (2-4 rounds)
 const SipHash = std.hash.SipHash64(2, 4);
@@ -458,15 +459,14 @@ fn checksumFile(io: std.Io, path: []const u8) !u32 {
 ### Bloom Filter Hash
 
 ```zig
-fn bloomHashes(data: []const u8, k: usize) []u64 {
-    var hashes: [16]u64 = undefined;
+// The caller owns the output buffer (never return a slice of a local array)
+fn bloomHashes(data: []const u8, out: []u64) void {
     const h1 = std.hash.Wyhash.hash(0, data);
     const h2 = std.hash.Wyhash.hash(h1, data);
 
-    for (0..k) |i| {
-        hashes[i] = h1 +% @as(u64, i) *% h2;
+    for (out, 0..) |*h, i| {
+        h.* = h1 +% @as(u64, i) *% h2;
     }
-    return hashes[0..k];
 }
 ```
 

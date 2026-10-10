@@ -59,7 +59,7 @@ const encoded = "SGVs bG8s\nIFdv cmxk IQ==";  // with spaces and newlines
 const decoder = base64.standard.decoderWithIgnore(" \n");
 
 var buf: [100]u8 = undefined;
-const max_size = try decoder.calcSizeUpperBound(encoded.len);
+const max_size = decoder.calcSizeUpperBound(encoded.len); // plain usize, no error
 const decoded_len = try decoder.decode(buf[0..max_size], encoded);
 const decoded = buf[0..decoded_len];
 // "Hello, World!"
@@ -125,7 +125,7 @@ fn decodeJwtPayload(payload: []const u8, buf: []u8) ![]u8 {
 fn decodePem(pem_data: []const u8, buf: []u8) ![]u8 {
     // Skip header/footer, decode with newline ignoring
     const decoder = std.base64.standard.decoderWithIgnore("\n\r");
-    const max = try decoder.calcSizeUpperBound(pem_data.len);
+    const max = decoder.calcSizeUpperBound(pem_data.len);
     const len = try decoder.decode(buf[0..max], pem_data);
     return buf[0..len];
 }

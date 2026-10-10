@@ -229,18 +229,20 @@ while (try r.takeDelimiter('\n')) |line| {
 }
 // Loop ends when takeDelimiter returns null (EOF)
 
-// Read until delimiter, exclude delimiter (doesn't consume delimiter!)
+// Read until delimiter, exclude delimiter (does NOT consume the delimiter:
+// calling it again returns "" -- never use it as a loop condition)
 const line = try r.takeDelimiterExclusive('\n');
-// If delimiter not found: error.EndOfStream at EOF, error.StreamTooLong if buffer full
+// If delimiter not found: the remaining bytes are returned (EOF counts as a delimiter);
+// error.EndOfStream only when nothing remains, error.StreamTooLong if buffer full
 
-// Read until delimiter, include delimiter (doesn't consume!)
+// Read until delimiter, include delimiter (consumes it; the slice ends with '\n')
 const line_with_delim = try r.takeDelimiterInclusive('\n');
 
 // Read null-terminated string (consumes null)
 const str = try r.takeSentinel(0);
 
-// Discard until delimiter (inclusive consumes delimiter)
-try r.discardDelimiterInclusive('\n');
+// Discard until delimiter (inclusive consumes delimiter; returns the byte count)
+_ = try r.discardDelimiterInclusive('\n');
 const n = try r.discardDelimiterExclusive('\n');  // doesn't consume delimiter
 ```
 
@@ -431,7 +433,7 @@ const ns: i128 = std.Io.Timestamp.now(io, .awake).nanoseconds - t0.nanoseconds;
 ```
 `Clock` enum: `real` (wall), `awake` (monotonic, excludes suspend — use for benchmarks),
 `boot` (incl. suspend), `cpu_process`, `cpu_thread`. `std/time.zig` now holds only the
-`ns_per_*` constants.
+`ns_*/us_*/ms_*/s_per_*` unit constants and `epoch`.
 
 ### Allocator
 
@@ -440,8 +442,8 @@ var gpa: std.heap.DebugAllocator(.{}) = .init; // was GeneralPurposeAllocator(.{
 defer _ = gpa.deinit();
 ```
 
-> Master-branch APIs, still churning — pin the toolchain (`build.zig.zon`
-> `minimum_zig_version`) when relying on them. Grep the actual std for current shapes:
+> The `std.Io` APIs are young and changed between 0.15, 0.16 and 0.17 — pin the toolchain
+> (`build.zig.zon` `minimum_zig_version`). Grep the actual std for current shapes:
 > `~/.cache/zig/p/<hash>/lib/std/{Io.zig,Io/Dir.zig,process.zig,start.zig}`.
 
 ## Common Patterns
@@ -492,7 +494,7 @@ const FileHeader = extern struct {
     data_offset: u64,
 };
 
-fn parseHeader(file: std.Io.File) !FileHeader {
+fn parseHeader(io: std.Io, file: std.Io.File) !FileHeader {
     var buf: [128]u8 = undefined;
     var reader = file.reader(io, &buf);
     const r = &reader.interface;
@@ -523,7 +525,7 @@ fn buildMessage(allocator: Allocator, items: []const Item) ![]u8 {
 
 ### Streaming JSON to File
 ```zig
-fn writeJson(file: std.Io.File, data: anytype) !void {
+fn writeJson(io: std.Io, file: std.Io.File, data: anytype) !void {
     var buf: [4096]u8 = undefined;
     var writer = file.writer(io, &buf);
     const w = &writer.interface;

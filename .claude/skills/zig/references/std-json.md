@@ -1,6 +1,6 @@
 # std.json - JSON Parsing and Serialization
 
-JSON RFC 8259 compliant parsing and stringification in Zig 0.15.x.
+JSON RFC 8259 compliant parsing and stringification in Zig 0.16.0.
 
 ## Table of Contents
 - [Parsing JSON](#parsing-json)
@@ -182,22 +182,24 @@ pub const Value = union(enum) {
     float: f64,
     number_string: []const u8,  // unparsed number
     string: []const u8,
-    array: Array,               // std.ArrayList(Value)
-    object: ObjectMap,          // StringArrayHashMap(Value)
+    array: Array,               // std.array_list.Managed(Value)
+    object: ObjectMap,          // std.array_hash_map.String(Value) -- UNMANAGED
 };
 ```
 
 ### Building Values Manually
 
 ```zig
-var obj = std.json.ObjectMap.init(allocator);
-try obj.put("name", .{ .string = "test" });
-try obj.put("count", .{ .integer = 42 });
+// ObjectMap is unmanaged: start from `.empty`, pass the allocator to put/deinit.
+// Array is a managed list (`Array.init(allocator)`, `append(v)`).
+var obj: std.json.ObjectMap = .empty;
+try obj.put(allocator, "name", .{ .string = "test" });
+try obj.put(allocator, "count", .{ .integer = 42 });
 
 var arr = std.json.Array.init(allocator);
 try arr.append(.{ .integer = 1 });
 try arr.append(.{ .integer = 2 });
-try obj.put("items", .{ .array = arr });
+try obj.put(allocator, "items", .{ .array = arr });
 
 const value = std.json.Value{ .object = obj };
 ```

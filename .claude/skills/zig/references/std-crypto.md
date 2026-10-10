@@ -14,7 +14,7 @@ Comprehensive cryptographic primitives: hashing, encryption, signatures, key exc
 | **KEM** | `kem.ml_kem.*` (post-quantum) |
 | **Password** | `pwhash.argon2`, `pwhash.scrypt`, `pwhash.bcrypt`, `pwhash.pbkdf2` |
 | **KDF** | `kdf.hkdf.HkdfSha256`, `kdf.hkdf.HkdfSha512` |
-| **Random** | `random` (thread-local CSPRNG) |
+| **Random** | removed in 0.16 — `io.randomSecure(&buf)`; `std.Random.DefaultCsprng` seeded from it |
 | **Utilities** | `secureZero`, `timing_safe.*`, `codecs.*` |
 
 ## Choosing Algorithms
@@ -96,9 +96,11 @@ Blake3.hash("data", &digest, .{});
 var keyed: [Blake3.digest_length]u8 = undefined;
 Blake3.hash("data", &keyed, .{ .key = key });
 
-// Key derivation
+// Key derivation (KDF mode has its own constructor; `Options` has no `context`)
 var derived: [32]u8 = undefined;
-Blake3.hash("material", &derived, .{ .context = "my app v1 key derivation" });
+var kdf = Blake3.initKdf("my app v1 key derivation", .{});
+kdf.update("material");
+kdf.final(&derived);
 ```
 
 ### Blake2
@@ -213,7 +215,10 @@ Fast MAC for hash table keying (not for general authentication):
 ```zig
 const SipHash = std.crypto.auth.siphash.SipHash64(2, 4);
 
-const hash = SipHash.hash(key, data);
+// key: *const [SipHash.key_length]u8 (16 bytes)
+const tag_int: u64 = SipHash.toInt(data, &key);   // as an integer
+var tag: [SipHash.mac_length]u8 = undefined;
+SipHash.create(&tag, data, &key);                 // as bytes
 ```
 
 ## Digital Signatures
@@ -223,18 +228,18 @@ const hash = SipHash.hash(key, data);
 ```zig
 const Ed25519 = std.crypto.sign.Ed25519;
 
-// Generate key pair
-const kp = Ed25519.KeyPair.generate();
+// Generate key pair (randomness comes from the Io)
+const kp = Ed25519.KeyPair.generate(io);
 
-// Sign message
-const sig = kp.sign(message, null);
+// Sign message (error union; noise = null gives a deterministic signature)
+const sig = try kp.sign(message, null);
 
-// Verify signature
-try kp.public_key.verify(sig, message);
+// Verify signature (the method is on Signature, not on PublicKey)
+try sig.verify(message, kp.public_key);
 // Returns error.SignatureVerificationFailed on failure
 
-// Incremental signing (large messages)
-var signer = try kp.signer(null);
+// Incremental signing (large messages); signer() also takes `io`
+var signer = try kp.signer(null, io);
 signer.update(chunk1);
 signer.update(chunk2);
 const sig2 = signer.finalize();
@@ -251,7 +256,7 @@ Key lengths:
 const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
 // Generate key pair
-const kp = EcdsaP256Sha256.KeyPair.generate();
+const kp = EcdsaP256Sha256.KeyPair.generate(io);
 
 // Sign
 const sig = try kp.sign(message, null);
@@ -270,8 +275,8 @@ Available: `EcdsaP256Sha256`, `EcdsaP256Sha3_256`, `EcdsaP384Sha384`, `EcdsaP384
 const X25519 = std.crypto.dh.X25519;
 
 // Generate key pairs for Alice and Bob
-const alice = X25519.KeyPair.generate();
-const bob = X25519.KeyPair.generate();
+const alice = X25519.KeyPair.generate(io);
+const bob = X25519.KeyPair.generate(io);
 
 // Compute shared secret
 const alice_shared = try X25519.scalarmult(alice.secret_key, bob.public_key);
@@ -298,7 +303,7 @@ const shared_secret = encaps.shared_secret;
 const ciphertext = encaps.ciphertext;
 
 // Decapsulation (receiver)
-const decaps_secret = try kp.secret_key.decaps(ciphertext);
+const decaps_secret = try kp.secret_key.decaps(&ciphertext); // takes *const [ciphertext_length]u8
 // shared_secret == decaps_secret
 ```
 
@@ -335,35 +340,41 @@ Memory-hard password hashing (recommended for new applications):
 ```zig
 const argon2 = std.crypto.pwhash.argon2;
 
-// Hash password
+// Derive a key (the Io supplies threads/randomness; it is the LAST parameter)
 var hash: [32]u8 = undefined;
 try argon2.kdf(
     allocator,
     &hash,
     password,
-    salt,
+    salt,          // at least 8 bytes
     .{
         .t = 3,      // time cost (iterations)
         .m = 65536,  // memory cost (KiB)
         .p = 4,      // parallelism
     },
     .argon2id,  // mode: argon2i, argon2d, or argon2id
+    io,
 );
 
 // Use preset parameters
-try argon2.kdf(allocator, &hash, password, salt, argon2.Params.interactive_2id, .argon2id);
+try argon2.kdf(allocator, &hash, password, salt, argon2.Params.interactive_2id, .argon2id, io);
 
-// PHC string format (for storage)
+// PHC string format (for storage); the salt is generated internally
 var buf: [128]u8 = undefined;
-const encoded = try argon2.strHash(password, salt, .interactive_2id, .argon2id, &buf);
-// Returns: "$argon2id$v=19$m=65536,t=3,p=4$..."
+const encoded = try argon2.strHash(
+    password,
+    .{ .allocator = allocator, .params = argon2.Params.interactive_2id, .mode = .argon2id },
+    &buf,
+    io,
+);
+// Returns: "$argon2id$v=19$m=65536,t=2,p=1$..."
 
 // Verify PHC-encoded hash
-try argon2.strVerify(encoded, password, null);
+try argon2.strVerify(encoded, password, .{ .allocator = allocator }, io);
 ```
 
 Parameter presets:
-- `interactive_2id`: Fast verification (login forms)
+- `interactive_2id`: Fast verification (login forms; t=2, m=64 MiB)
 - `moderate_2id`: Balanced
 - `sensitive_2id`: High security (key derivation)
 - `owasp_2id`: OWASP recommended
@@ -384,7 +395,7 @@ try scrypt.kdf(
     .{ .ln = 17, .r = 8, .p = 1 },  // N=2^17, r=8, p=1
 );
 
-// Presets
+// Presets: scrypt.Params.interactive, .sensitive, .owasp
 try scrypt.kdf(allocator, &hash, password, salt, scrypt.Params.interactive);
 ```
 
@@ -393,12 +404,17 @@ try scrypt.kdf(allocator, &hash, password, salt, scrypt.Params.interactive);
 ```zig
 const bcrypt = std.crypto.pwhash.bcrypt;
 
-// Hash password
-var hash: [bcrypt.hash_length]u8 = undefined;
-try bcrypt.strHash(password, .{ .rounds = 10 }, &hash);
+// Hash password (PHC or crypt encoding; the salt is generated from `io`)
+var buf: [bcrypt.hash_length * 2]u8 = undefined;
+const hash_str = try bcrypt.strHash(
+    password,
+    .{ .params = bcrypt.Params.owasp, .encoding = .phc },
+    &buf,
+    io,
+);
 
 // Verify
-try bcrypt.strVerify(hash_str, password);
+try bcrypt.strVerify(hash_str, password, .{ .silently_truncate_password = false });
 ```
 
 ### PBKDF2
@@ -408,7 +424,8 @@ const pbkdf2 = std.crypto.pwhash.pbkdf2;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 var key: [32]u8 = undefined;
-pbkdf2(HmacSha256, &key, password, salt, 100000);  // 100k iterations
+// pbkdf2(dk, password, salt, rounds, Prf) returns an error union
+try pbkdf2(&key, password, salt, 100000, HmacSha256);  // 100k iterations
 ```
 
 ## Secure Random
@@ -419,12 +436,8 @@ pbkdf2(HmacSha256, &key, password, salt, 100000);  // 100k iterations
 // WRONG (0.16) — removed
 std.crypto.random.bytes(&key);
 
-// CORRECT — macOS + Linux glibc 2.36+
-extern "c" fn arc4random_buf(buf: *anyopaque, nbytes: usize) void;
-arc4random_buf(&key, key.len);
-
-// CORRECT — Linux only (no glibc dependency)
-_ = std.os.linux.getrandom(buf.ptr, buf.len, 0);
+// CORRECT — through the Io (portable; returns an error instead of leaving bytes undefined)
+try io.randomSecure(&key);
 ```
 
 Thread-local cryptographically secure PRNG:
@@ -575,10 +588,7 @@ counter += 1;
 // Option 2: Random (safe with XChaCha's 24-byte nonce)
 const XChaCha = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 var nonce: [XChaCha.nonce_length]u8 = undefined;
-// 0.16: std.crypto.random removed — read system entropy
-extern "c" fn arc4random_buf(buf: *anyopaque, nbytes: usize) void;  // macOS + Linux glibc 2.36+
-arc4random_buf(&nonce, nonce.len);
-// Linux-only alternative: _ = std.os.linux.getrandom(&nonce, nonce.len, 0);
+try io.randomSecure(&nonce); // 0.16: std.crypto.random removed
 ```
 
 ### Secure Password Storage

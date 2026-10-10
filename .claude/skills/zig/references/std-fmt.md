@@ -290,7 +290,7 @@ Format into buffer with null terminator.
 
 ```zig
 var buf: [256]u8 = undefined;
-const result = try std.fmt.bufPrintZ(&buf, "Hello {s}!", .{"world"});
+const result = try std.fmt.bufPrintSentinel(&buf, "Hello {s}!", .{"world"}, 0);
 // result is [:0]u8 = "Hello world!" (null-terminated)
 ```
 

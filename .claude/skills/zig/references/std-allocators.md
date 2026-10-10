@@ -8,14 +8,12 @@ Zig has no default allocator. Functions that need heap memory accept an `Allocat
 |-----------|----------|-------------|
 | `std.testing.allocator` | Unit tests (leak detection) | No |
 | `std.heap.FixedBufferAllocator` | Stack-based, bounded size known | Optional |
-| `std.heap.ArenaAllocator` | Batch free, CLI apps, request handlers | No |
+| `std.heap.ArenaAllocator` | Batch free, CLI apps, request handlers | If its child allocator is |
 | `std.heap.page_allocator` | Backing for other allocators | Yes |
 | `std.heap.c_allocator` | Linking libc, interop | Yes |
-| `std.heap.raw_c_allocator` | Libc arena backing (no alignment overhead) | Yes |
 | `std.heap.DebugAllocator` | Debug builds, leak/corruption detection | Configurable |
 | `std.heap.smp_allocator` | ReleaseFast production multithreaded | Yes |
 | `std.heap.MemoryPool` | High-frequency same-type allocations | No |
-| `std.heap.ThreadSafeAllocator` | Wrap non-thread-safe allocator | Yes |
 | `std.heap.StackFallbackAllocator` | Stack buffer with heap fallback | Depends |
 | `std.heap.wasm_allocator` | WebAssembly targets | Yes |
 
@@ -156,7 +154,7 @@ slice = try allocator.realloc(slice, new_len);
 7. **Many same-type objects?** Use `MemoryPool(T)` for fast create/destroy
 8. **Debug build?** Use `DebugAllocator` for leak/corruption detection
 9. **ReleaseFast production?** Use `std.heap.smp_allocator`
-10. **Linking libc?** Use `c_allocator` or `raw_c_allocator` (as arena backing)
+10. **Linking libc?** Use `c_allocator`
 
 ## Common Allocators
 
@@ -239,7 +237,7 @@ const bytes_used = arena.queryCapacity();  // Excludes internal overhead
 **State optimization** - store just the state to save memory:
 ```zig
 const State = std.heap.ArenaAllocator.State;
-var state: State = .{};
+var state: State = .init; // default initialization (.{}) is deprecated
 
 // Promote to full allocator when needed
 var arena = state.promote(std.heap.page_allocator);
@@ -328,10 +326,10 @@ _ = pool.reset(.retain_capacity);
 var pool = try std.heap.MemoryPool(T).initPreheated(allocator, 100);
 
 // Custom alignment
-var pool = std.heap.MemoryPoolAligned(T, .@"64").init(allocator);
+var pool = std.heap.memory_pool.Aligned(T, .@"64").init(allocator);
 
 // Non-growable (fixed capacity)
-var pool = try std.heap.MemoryPoolExtra(T, .{ .growable = false }).initPreheated(allocator, 50);
+var pool = try std.heap.memory_pool.Extra(T, .{ .growable = false }).initPreheated(allocator, 50);
 ```
 
 ### ThreadSafeAllocator → SmpAllocator (0.16)
@@ -464,7 +462,7 @@ const str = try allocator.allocSentinel(u8, len, 0);
 defer allocator.free(str);
 
 // Duplicate with sentinel
-const c_str = try allocator.dupeZ(u8, "hello");  // [:0]u8
+const c_str = try allocator.dupeSentinel(u8, "hello", 0); // [:0]u8 (dupeZ is deprecated)
 defer allocator.free(c_str);
 ```
 

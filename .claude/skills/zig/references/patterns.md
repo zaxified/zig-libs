@@ -1,13 +1,13 @@
 # Zig Patterns Reference
 
-Comprehensive patterns for writing idiomatic Zig code. This reference contains best practices extracted from the Zig standard library (0.15.x) and established community idioms.
+Comprehensive patterns for writing idiomatic Zig code. This reference contains best practices extracted from the Zig standard library and established community idioms (checked against Zig 0.17.0 unless a section says it is an excerpt from older std source).
 
 ## Table of Contents
 
 ### Quick Patterns
 - [Memory and Allocators](#memory-and-allocators)
-- [File I/O (0.15.x)](#file-io-015x)
-- [HTTP Client (0.15.x)](#http-client-015x)
+- [File I/O](#file-io)
+- [HTTP Client](#http-client)
 - [JSON](#json)
 - [Testing](#testing)
 - [Build System Patterns](#build-system-patterns)
@@ -95,7 +95,7 @@ const copy = try allocator.dupe(u8, source);
 defer allocator.free(copy);
 ```
 
-### File I/O (0.15.x)
+### File I/O
 
 #### Reading Files
 ```zig
@@ -135,13 +135,13 @@ try stdout.print("Output\n", .{});
 try stdout.flush();
 ```
 
-### HTTP Client (0.15.x)
+### HTTP Client
 
 See [std-http.md](std-http.md) for full documentation including server, WebSocket, and compression.
 
 ```zig
 // Quick fetch (simple requests)
-var client: std.http.Client = .{ .allocator = allocator };
+var client: std.http.Client = .{ .allocator = allocator, .io = io };
 defer client.deinit();
 
 var body_buf: [65536]u8 = undefined;
@@ -207,7 +207,7 @@ test "example" {
 }
 
 test "with allocator" {
-    var list: std.ArrayListUnmanaged(u32) = .empty;
+    var list: std.ArrayList(u32) = .empty;
     defer list.deinit(testing.allocator);
     try list.append(testing.allocator, 42);
 }
@@ -279,7 +279,7 @@ b.step("test", "Run tests").dependOn(&run_tests.step);
 
 ## Idiomatic Code Patterns
 
-These patterns are extracted from the Zig standard library (0.15.x) and represent established idioms for writing clean, efficient Zig code.
+These patterns are extracted from the Zig standard library and represent established idioms for writing clean, efficient Zig code.
 
 ### I. Syntax Patterns
 
@@ -337,13 +337,14 @@ pub fn SortedSet(comptime T: type, comptime Context: type) type {
             return false;
         }
 
-        pub fn insert(self: *@This(), value: T) !void {
+        // items is an unmanaged ArrayList, so insert takes the allocator
+        pub fn insert(self: *@This(), gpa: std.mem.Allocator, value: T) !void {
             if (!self.contains(value)) {
                 // Use context's lessThan for sorted insertion
                 const pos = for (self.items.items, 0..) |item, i| {
                     if (self.ctx.lessThan(value, item)) break i;
                 } else self.items.items.len;
-                try self.items.insert(pos, value);
+                try self.items.insert(gpa, pos, value);
             }
         }
     };
@@ -515,18 +516,18 @@ Use multiple `AutoArrayHashMapUnmanaged` fields when storing complex interned da
 
 ```zig
 // From llvm/Builder.zig - demonstrating the pattern of parallel maps for interned data
-string_map: std.AutoArrayHashMapUnmanaged(void, void),
-string_indices: std.ArrayListUnmanaged(u32),
-string_bytes: std.ArrayListUnmanaged(u8),
+string_map: std.array_hash_map.Auto(void, void),
+string_indices: std.ArrayList(u32),
+string_bytes: std.ArrayList(u8),
 
-types: std.AutoArrayHashMapUnmanaged(String, Type),
-type_map: std.AutoArrayHashMapUnmanaged(void, void),
-type_items: std.ArrayListUnmanaged(Type.Item),
-type_extra: std.ArrayListUnmanaged(u32),
+types: std.array_hash_map.Auto(String, Type),
+type_map: std.array_hash_map.Auto(void, void),
+type_items: std.ArrayList(Type.Item),
+type_extra: std.ArrayList(u32),
 
-attributes: std.AutoArrayHashMapUnmanaged(Attribute.Storage, void),
-attributes_map: std.AutoArrayHashMapUnmanaged(void, void),
-attributes_indices: std.ArrayListUnmanaged(u32),
+attributes: std.array_hash_map.Auto(Attribute.Storage, void),
+attributes_map: std.array_hash_map.Auto(void, void),
+attributes_indices: std.ArrayList(u32),
 ```
 
 **When to use:** Interning strings/symbols, IR builders, AST storage, deduplication with stable indices.
@@ -724,20 +725,20 @@ try w.print("{t}", .{MyEnum.foo}); // "foo"
 try w.print("{d} {b} {o}", .{10, 10, 10}); // "10 1010 12"
 
 // e: scientific notation
-try w.print("{e}", .{1234.5});    // "1.2345e+03"
+try w.print("{e}", .{1234.5});    // "1.2345e3"
 
 // c: ASCII character, u: UTF-8 codepoint
 try w.print("{c} {u}", .{65, 0x1F600}); // "A 😀"
 
-// D: duration (nanoseconds)
-try w.print("{D}", .{3_661_001_000_000}); // "1h1m1.001s"
+// Durations: there is no {D} specifier any more; std.Io.Duration has a format method, use {f}
+try w.print("{f}", .{std.Io.Duration.fromNanoseconds(3_661_001_000_000)}); // 1h1m1.001s
 
 // B/Bi: bytes in SI/IEC units
 try w.print("{B} {Bi}", .{1536, 1536}); // "1.536kB 1.5KiB"
 ```
 
 #### Custom Type Formatting
-Implement `format` method for custom types (0.15.x signature).
+Implement a `format` method for custom types (this signature has been stable since 0.15 and is unchanged in 0.17).
 
 ```zig
 const Version = struct {
@@ -747,15 +748,15 @@ const Version = struct {
     pre: ?[]const u8 = null,
     build: ?[]const u8 = null,
 
-    // 0.15.x signature: takes *std.io.Writer, returns Writer.Error!void
-    pub fn format(self: Version, w: *std.io.Writer) std.io.Writer.Error!void {
+    // takes *std.Io.Writer, returns Writer.Error!void
+    pub fn format(self: Version, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("{d}.{d}.{d}", .{ self.major, self.minor, self.patch });
         if (self.pre) |pre| try w.print("-{s}", .{pre});
         if (self.build) |build| try w.print("+{s}", .{build});
     }
 };
 
-// Usage with {f} specifier (required in 0.15.x)
+// Usage with the {f} specifier (required since 0.15)
 try stdout.print("{f}", .{version});
 ```
 
@@ -767,14 +768,14 @@ Implement `jsonParse`, `jsonParseFromValue`, and `jsonStringify` for JSON suppor
 ```zig
 pub fn ArrayHashMap(comptime T: type) type {
     return struct {
-        map: std.StringArrayHashMapUnmanaged(T) = .empty,
+        map: std.array_hash_map.String(T) = .empty,
 
         pub fn jsonParse(
             allocator: Allocator,
             source: anytype,
             options: ParseOptions,
         ) !@This() {
-            var map: std.StringArrayHashMapUnmanaged(T) = .empty;
+            var map: std.array_hash_map.String(T) = .empty;
             errdefer map.deinit(allocator);
 
             if (.object_begin != try source.next()) return error.UnexpectedToken;
@@ -1075,10 +1076,10 @@ pub const Tree = struct {
         return self.nodes.get(@intFromEnum(node));
     }
 
-    /// Get mutable pointer to node data.
-    pub fn getPtr(self: *Tree, node: Node) *Node.Data {
-        const slice = self.nodes.slice();
-        return &slice.items(.tag)[@intFromEnum(node)];
+    /// Get a mutable pointer to one field of a node. A MultiArrayList stores the
+    /// fields in separate arrays, so there is no `*Node.Data` to hand out.
+    pub fn tagPtr(self: *Tree, node: Node) *Node.Tag {
+        return &self.nodes.items(.tag)[@intFromEnum(node)];
     }
 };
 ```
@@ -1107,10 +1108,9 @@ pub const Node = enum(u32) {
             return @enumFromInt(@intFromEnum(r.start) + i);
         }
 
-        /// Iterate over all nodes in range.
-        pub fn slice(r: Range) []const Node {
-            // Note: requires nodes stored contiguously
-            return @ptrCast(@as([*]const u32, @ptrFromInt(@intFromEnum(r.start)))[0..r.len]);
+        /// The range as a slice of the backing storage (a node index is not an address).
+        pub fn slice(r: Range, nodes: []const Node.Data) []const Node.Data {
+            return nodes[@intFromEnum(r.start)..][0..r.len];
         }
     };
 };
@@ -1120,7 +1120,8 @@ fn visitChildren(tree: *const Tree, node: Tree.Node) void {
     const data = tree.get(node);
     var i: u32 = 0;
     while (i < data.children.len) : (i += 1) {
-        const child = data.children.at(i);
+        // Children is {start, len}: child i is the node index start + i
+        const child: Tree.Node = @enumFromInt(@intFromEnum(data.children.start) + i);
         visit(tree, child);
     }
 }
@@ -1132,26 +1133,26 @@ When individual node deletion is needed, maintain a freelist stack:
 
 ```zig
 pub const NodePool = struct {
-    nodes: std.ArrayListUnmanaged(Node.Data),
+    nodes: std.ArrayList(Node.Data),
     /// Head of freelist, or none if no free slots.
     free_head: OptionalNode = .none,
 
-    pub fn alloc(self: *NodePool) !Node {
-        if (self.free_head.unwrap()) |free| {
+    pub fn alloc(self: *NodePool, gpa: std.mem.Allocator) !Node {
+        if (self.free_head.unwrap()) |slot| {
             // Reuse freed slot
-            self.free_head = self.nodes.items[@intFromEnum(free)].next_free;
-            return free;
+            self.free_head = self.nodes.items[@intFromEnum(slot)].next_free;
+            return slot;
         }
         // Allocate new slot
         const index: Node = @enumFromInt(self.nodes.items.len);
-        try self.nodes.append(undefined);
+        try self.nodes.append(gpa, undefined);
         return index;
     }
 
     pub fn free(self: *NodePool, node: Node) void {
         // Push onto freelist
         self.nodes.items[@intFromEnum(node)].next_free = self.free_head;
-        self.free_head = node.toOptional();
+        self.free_head = @enumFromInt(@intFromEnum(node)); // Node -> OptionalNode, same integer
     }
 };
 ```
@@ -1170,7 +1171,7 @@ Use a tagged union to attach context to errors.
 
 ```zig
 pub const Diagnostics = struct {
-    errors: std.ArrayListUnmanaged(Error) = .empty,
+    errors: std.ArrayList(Error) = .empty,
     entries: usize = 0,
 
     pub const Error = union(enum) {
@@ -1303,24 +1304,22 @@ fn shl(a: anytype, shift_amt: anytype) @TypeOf(a) {
 Use `errdefer comptime unreachable;` to assert no errors can occur after a point.
 
 ```zig
-fn spawnChild(self: *Child) !void {
-    const pid_result = posix.fork();
-    if (pid_result == 0) {
-        // Child process
-        posix.execvpeZ(...);
-        forkChildErrReport(err_pipe[1], err);
-    }
+fn commit(self: *Registry, gpa: std.mem.Allocator, item: Item) !void {
+    // Phase 1: everything that can fail
+    try self.items.ensureUnusedCapacity(gpa, 1);
+    try self.index.ensureUnusedCapacity(gpa, 1);
 
-    // Parent process - after fork, we must not error
     errdefer comptime unreachable;  // Compile error if any code below can error
 
-    posix.close(err_pipe[1]);
-    self.err_pipe = err_pipe[0];
-    // ... all operations here must be infallible
+    // Phase 2: infallible mutation only
+    self.items.appendAssumeCapacity(item);
+    self.index.putAssumeCapacity(item.id, self.items.items.len - 1);
 }
 ```
 
-**When to use:** After point-of-no-return operations like fork(), to ensure subsequent code is truly infallible.
+(The standard library uses the same guard in its POSIX process-spawn path, after `fork`.)
+
+**When to use:** After a point-of-no-return operation (a spawn, a reservation phase), to ensure subsequent code is truly infallible.
 
 #### Reserve-First Exception Safety
 When mutating data structures that can fail (e.g., growing arrays or hash maps), separate the fallible reservation phase from the infallible mutation phase. This ensures strong exception safety: if an error occurs, the object remains unchanged.

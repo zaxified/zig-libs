@@ -71,6 +71,16 @@ fn toI64(f: f64) ?i64 {
 Pair the guard with a test that an in-range float still converts, or the fix can silently
 disable the feature.
 
+## std.debug
+
+### `getSymbols` with a stack-tracing allocator deadlocks
+
+Measured on 0.16.0: `std.debug.SelfInfo.getSymbols` takes the debug-info lock exclusively and
+then allocates. If the allocator records a stack trace per allocation — a `DebugAllocator`
+with stack traces, such as `std.testing.allocator` — that allocation unwinds the stack, which
+needs the same lock: the process hangs on a futex. Pass `std.debug.getDebugInfoAllocator()`
+(what std itself uses) for both the symbol list and the text arena.
+
 ## std.Io
 
 ### Cancellation is erased at the `Io.Reader` boundary
@@ -300,12 +310,13 @@ test "the carry-less multiply path" {
 The same applies to every other gate on such a path: the dispatcher, `available()`-style
 queries and test helpers all test the comptime condition before the run-time one.
 
-### Optimize modes are renamed after 0.16 (0.17-dev only, not in 0.16.0)
+### Optimize modes are renamed in 0.17.0
 
-On the 0.17 development branch `std.builtin.OptimizeMode` is `.debug`, `.safe`, `.fast`,
-`.small`, and the build option reads `-Doptimize=safe`. A `build.zig` that compares against
-`.Debug` or `.ReleaseSafe`, and every script that passes `-Doptimize=ReleaseSafe`, needs
-updating on the upgrade.
+0.17.0 renames the tags to `.debug`, `.safe`, `.fast`, `.small`: a `build.zig` that compares
+against `.Debug` or `.ReleaseSafe` stops compiling on the upgrade. The command line accepts
+both spellings in 0.17.0 (`-OReleaseSafe`, `-Doptimize=ReleaseSafe` still work; measured), while
+0.16.0 rejects the new ones — so scripts keep the old names until every toolchain is 0.17.
+For 0.17 projects use the `zig-0.17` skill.
 
 ### Deleting `.zig-cache/o` wedges the build runner
 

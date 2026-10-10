@@ -178,6 +178,8 @@ fn myLogFn(
     // Add timestamp, then forward to default.
     // 0.16: std.time.timestamp() is gone, and a log function's fixed signature has no `io`
     // to use std.Io.Clock — fall back to std.c.clock_gettime (see std-time.md).
+    // Requires linking libc (`.link_libc = true`); without libc, omit the timestamp
+    // or keep a clock/Io in a global set at startup.
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.REALTIME, &ts);
     std.debug.print("[{d}] ", .{ts.sec});

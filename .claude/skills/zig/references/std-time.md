@@ -8,15 +8,15 @@ Wall-clock timestamps, monotonic timers, high-precision timing, and epoch/calend
 
 Two 0.16 replacements exist, depending on whether you have an `Io` instance:
 
-- **With an `Io` instance:** use `std.Io.Clock` (`Clock.now(io)`, `Clock.Timestamp`, `Clock.Duration`) — see below. This is the idiomatic 0.16 way and is portable.
-- **Without an `Io` instance** (e.g. deep library code): fall back to `std.c.clock_gettime` directly:
+- **With an `Io` instance:** use `std.Io.Clock` (`clock.now(io)`, e.g. `Io.Clock.real.now(io)`, `Clock.Timestamp`, `Clock.Duration`) — see below. This is the idiomatic 0.16 way and is portable.
+- **Without an `Io` instance** (e.g. deep library code): only when the program already links libc (`.link_libc = true`), fall back to `std.c.clock_gettime` directly:
 
 ```zig
 // WRONG (0.16) — functions removed
 const secs = std.time.timestamp();
 const ms = std.time.milliTimestamp();
 
-// CORRECT — clock_gettime replacements (no Io available)
+// CORRECT — clock_gettime replacements (no Io available; requires linking libc, `.link_libc = true`)
 fn timestampSec() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.REALTIME, &ts);
@@ -40,7 +40,7 @@ fn nanoTimestamp() i128 {
 
 **Still present in 0.16:** `std.time.ns_per_s` and all the other unit constants, and `std.time.epoch`. **Removed, no `std.time` member at all anymore:** `Instant`, `Timer`, and every timestamp function.
 
-**Also removed in 0.16:** `std.Thread.sleep` — with an `Io`, use `io.sleep(duration, clock)`; without one, nanosleep via `std.c.nanosleep`:
+**Also removed in 0.16:** `std.Thread.sleep` — with an `Io`, use `io.sleep(duration, clock)`; without one (and only when already linking libc, `.link_libc = true`), nanosleep via `std.c.nanosleep`:
 ```zig
 fn threadSleep(ns: u64) void {
     const ts = std.c.timespec{
@@ -53,9 +53,9 @@ fn threadSleep(ns: u64) void {
 
 ## Quick Reference
 
-| Category | With `Io` (0.16) | Without `Io` (fallback) |
+| Category | With `Io` (0.16) | Without `Io` (fallback; requires linking libc) |
 |----------|-------------------|--------------------------|
-| Wall-clock timestamp | `Io.Clock.now(io, .real)` → `Io.Timestamp` | `std.c.clock_gettime(.REALTIME, &ts)` |
+| Wall-clock timestamp | `Io.Clock.real.now(io)` → `Io.Timestamp` | `std.c.clock_gettime(.REALTIME, &ts)` |
 | Monotonic / elapsed time | `Io.Clock.Timestamp.now(io, .awake)` + `.untilNow(io)` | n/a — needs some clock source |
 | Sleep | `io.sleep(duration, clock)` | `std.c.nanosleep` |
 | Epoch / calendar | `std.time.epoch.*` (unchanged) | same |
@@ -65,7 +65,7 @@ fn threadSleep(ns: u64) void {
 
 ```
 Need wall-clock time (date/time)?
-├─ Have an Io? → Io.Clock.now(io, .real)
+├─ Have an Io? → Io.Clock.real.now(io)
 └─ No Io?      → std.c.clock_gettime(.REALTIME, &ts)
 
 Need elapsed time / benchmarking / monotonic guarantee?
@@ -134,7 +134,7 @@ const since = t.untilNow(io);
 try t.wait(io);
 ```
 
-There is no `error.Unsupported` from `.now()` in 0.16 — an unsupported clock simply has `resolution(io)` (via `Clock.resolution`) equal to zero; `.now()` itself does not fail (it is not cancelable, since it does not block).
+There is no `error.Unsupported` from `.now()` — `.now()` itself does not fail (it is not cancelable, since it does not block). Clock support is queried with `Clock.resolution(io)`, which returns `ResolutionError!Io.Duration`: `error.ClockUnavailable` (or a zero duration) for an unsupported clock.
 
 ## Clock.Duration - Monotonic Benchmarking
 
@@ -394,9 +394,9 @@ fn windowsToUnix(windows_secs: i64) i64 {
 
 ## Notes
 
-- Wall-clock functions are gone from `std.time`; use `Io.Clock.now(io, .real)` (or `std.c.clock_gettime` with no `Io`) — see migration section above
+- Wall-clock functions are gone from `std.time`; use `Io.Clock.real.now(io)` (or `std.c.clock_gettime` with no `Io`, only when linking libc) — see migration section above
 - `Io.Timestamp`/`Io.Duration` use signed `i96` nanoseconds internally
-- `Io.Clock.Timestamp.now()` does not fail — an unsupported clock just has zero `resolution()`, it does not error
+- `Io.Clock.Timestamp.now()` does not fail; an unsupported clock shows up in `Clock.resolution(io)` (`error.ClockUnavailable`, or a zero duration), not in `now()`
 - `epoch.EpochSeconds` expects unsigned `u64` (use `@intCast` from a timestamp's `.toSeconds()`)
 - Day and month indices in epoch module are 0-based
-- For sleeping: `io.sleep(duration, clock)` (0.16, with `Io`) or `nanosleep` via `std.c.nanosleep` (0.16, no `Io` — `Thread.sleep` removed either way)
+- For sleeping: `io.sleep(duration, clock)` (0.16, with `Io`) or `nanosleep` via `std.c.nanosleep` (no `Io`, only when linking libc — `Thread.sleep` removed either way)

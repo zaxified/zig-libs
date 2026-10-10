@@ -10,14 +10,14 @@ std.mem.eql(u8, "hello", "hello")  // true
 std.mem.order(u8, "abc", "abd")    // .lt
 
 // Find substring/element
-std.mem.indexOf(u8, "hello world", "wor")       // ?usize = 6
-std.mem.lastIndexOf(u8, "ababa", "ab")          // ?usize = 2
-std.mem.indexOfScalar(u8, "hello", 'l')         // ?usize = 2
-std.mem.lastIndexOfScalar(u8, "hello", 'l')     // ?usize = 3
+std.mem.find(u8, "hello world", "wor")       // ?usize = 6
+std.mem.findLast(u8, "ababa", "ab")          // ?usize = 2
+std.mem.findScalar(u8, "hello", 'l')         // ?usize = 2
+std.mem.findScalarLast(u8, "hello", 'l')     // ?usize = 3
 
 // Find any/none of characters
-std.mem.indexOfAny(u8, "hello", "aeiou")        // ?usize = 1 (first vowel)
-std.mem.indexOfNone(u8, "   hello", " ")        // ?usize = 3 (first non-space)
+std.mem.findAny(u8, "hello", "aeiou")        // ?usize = 1 (first vowel)
+std.mem.findNone(u8, "   hello", " ")        // ?usize = 3 (first non-space)
 
 // Check prefix/suffix
 std.mem.startsWith(u8, "hello", "hel")          // true
@@ -242,9 +242,9 @@ std.mem.min(i32, &slice)          // 1
 std.mem.max(i32, &slice)          // 5
 std.mem.minMax(i32, &slice)       // .{ 1, 5 }
 
-std.mem.indexOfMin(i32, &slice)   // 1
-std.mem.indexOfMax(i32, &slice)   // 4
-std.mem.indexOfMinMax(i32, &slice) // .{ 1, 4 }
+std.mem.findMin(i32, &slice)   // 1
+std.mem.findMax(i32, &slice)   // 4
+std.mem.findMinMax(i32, &slice) // .{ 1, 4 }
 ```
 
 ## Reverse & Rotate
@@ -278,7 +278,7 @@ const len = std.mem.len(c_string);  // length of null-terminated string
 const slice = std.mem.span(c_string);
 
 // Index of first difference
-std.mem.indexOfDiff(u8, "hello", "helps")  // ?usize = 3
+std.mem.findDiff(u8, "hello", "helps")  // ?usize = 3
 
 // Collapse repeated elements
 var data = "aabbcc".*;

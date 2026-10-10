@@ -116,7 +116,7 @@ const TagEnum = std.meta.Tag(Tagged);  // enum { a, b }
 ```zig
 const Value = union(enum) { int: i32, float: f32 };
 
-var v = Value{ .int = 42 };
+const v = Value{ .int = 42 };
 const tag = std.meta.activeTag(v);  // Value.int
 
 switch (tag) {
@@ -170,8 +170,8 @@ const ApiMethod = std.meta.DeclEnum(Api);
 ### Int/Float Type Construction
 
 ```zig
-const U24 = std.meta.Int(.unsigned, 24);  // u24
-const I7 = std.meta.Int(.signed, 7);      // i7
+const U24 = @Int(.unsigned, 24);  // u24
+const I7 = @Int(.signed, 7);      // i7
 const F32 = std.meta.Float(32);           // f32
 const F16 = std.meta.Float(16);           // f16
 ```
@@ -180,7 +180,7 @@ const F16 = std.meta.Float(16);           // f16
 
 ```zig
 // From type array
-const T1 = std.meta.Tuple(&.{ u32, f32, bool });
+const T1 = @Tuple(&.{ u32, f32, bool });
 // Equivalent to: struct { u32, f32, bool }
 
 // From function signature
@@ -364,7 +364,7 @@ var flags = Flags.init(.{
 
 // Allocate only needed space
 const size = flags.sizeInBytes();
-const data = try allocator.alignedAlloc(u8, @alignOf(@TypeOf(flags).Fields), size);
+const data = try allocator.alignedAlloc(u8, std.mem.Alignment.of(@TypeOf(flags).Fields), size);
 defer allocator.free(data);
 
 // Set values

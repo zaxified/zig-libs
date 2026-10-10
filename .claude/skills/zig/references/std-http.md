@@ -106,13 +106,11 @@ std.debug.print("Status: {d} {s}\n", .{
 var reader_buf: [4096]u8 = undefined;
 const body_reader = response.reader(&reader_buf);
 
-while (true) {
-    const chunk = body_reader.take(4096) catch |err| switch (err) {
-        error.EndOfStream => break,
-        else => return err,
-    };
-    // process chunk...
-}
+// take(n) fails with EndOfStream when fewer than n bytes remain (the final partial
+// chunk would be lost), so read the whole body with allocRemaining or stream it.
+const body = try body_reader.allocRemaining(allocator, .limited(1024 * 1024));
+defer allocator.free(body);
+// or: _ = try body_reader.streamRemaining(&some_writer);
 ```
 
 ### POST with Request Body
@@ -256,8 +254,9 @@ defer client.deinit();
 // Configure TLS buffer size (affects memory usage)
 client.tls_buffer_size = std.crypto.tls.Client.min_buffer_len;
 
-// Force certificate rescan on next HTTPS request
-client.next_https_rescan_certs = true;
+// Force a root-certificate rescan on the next HTTPS request:
+// when `now` is null the client re-checks the time and rescans the system CA bundle
+client.now = null;
 
 // Disable TLS at compile time via std.options.http_disable_tls
 ```
@@ -319,22 +318,15 @@ fn handleRequest(request: *http.Server.Request) !void {
 ### Reading Request Body
 
 ```zig
-fn handleRequest(request: *http.Server.Request) !void {
+fn handleRequest(allocator: std.mem.Allocator, request: *http.Server.Request) !void {
     // Handle Expect: 100-continue
     var body_buf: [4096]u8 = undefined;
     const body_reader = try request.readerExpectContinue(&body_buf);
 
     // Read entire body
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(allocator);
-
-    while (true) {
-        const chunk = body_reader.take(1024) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        try body.appendSlice(allocator, chunk);
-    }
+    // (take(n) in a loop would drop the final partial chunk; use allocRemaining)
+    const body = try body_reader.allocRemaining(allocator, .limited(1024 * 1024));
+    defer allocator.free(body);
 
     try request.respond("Received", .{});
 }
@@ -568,7 +560,9 @@ const Header = struct {
 ### JSON API Client
 
 ```zig
-fn fetchJson(comptime T: type, allocator: Allocator, io: std.Io, url: []const u8) !T {
+/// Returns the `Parsed(T)`; the caller owns it and must call `deinit()` (the strings
+/// inside `value` live in its arena, not in the stack buffer below).
+fn fetchJson(comptime T: type, allocator: Allocator, io: std.Io, url: []const u8) !std.json.Parsed(T) {
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
 
@@ -585,8 +579,8 @@ fn fetchJson(comptime T: type, allocator: Allocator, io: std.Io, url: []const u8
 
     if (result.status != .ok) return error.HttpError;
 
-    const parsed = try std.json.parseFromSlice(T, allocator, body_writer.buffered(), .{});
-    return parsed.value;
+    // body_buf dies on return: copy strings out of it with .alloc_always
+    return try std.json.parseFromSlice(T, allocator, body_writer.buffered(), .{ .allocate = .alloc_always });
 }
 ```
 

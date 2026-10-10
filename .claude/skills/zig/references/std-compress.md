@@ -1,6 +1,6 @@
 # std.compress - Compression API Reference
 
-Compression and decompression algorithms in Zig 0.15.x. Supports DEFLATE (gzip, zlib), LZMA, LZMA2, XZ, and Zstandard.
+Compression and decompression algorithms in Zig 0.16.0. Supports DEFLATE (gzip, zlib), LZMA, LZMA2, XZ, and Zstandard.
 
 ## Table of Contents
 - [Module Structure](#module-structure)
@@ -72,46 +72,44 @@ flate.history_len     // 32768 - History buffer length
 ```zig
 const flate = std.compress.flate;
 
-var output: std.Io.Writer.Allocating = .init(allocator);
+// Compress.init asserts that the output writer has a buffer of more than 8 bytes,
+// so give the Allocating writer an initial capacity (plain `.init` has none).
+var output = try std.Io.Writer.Allocating.initCapacity(allocator, 64);
 defer output.deinit();
 
 var buffer: [flate.max_window_len]u8 = undefined;
-var compress: flate.Compress = .init(&output.writer, &buffer, .{
-    .level = .default,
-    .container = .gzip,
-});
+// init(output, buffer, container, opts) returns Writer.Error!Compress
+var compress: flate.Compress = try .init(&output.writer, &buffer, .gzip, .default);
 
 try compress.writer.writeAll(data);
-try compress.end();
+try compress.finish(); // writes the final block and the container footer
 
 const compressed = output.written();
 ```
 
 ### Compression Levels
 
-```zig
-const Level = enum {
-    level_4,  // Fastest
-    level_5,
-    level_6,  // Default
-    level_7,
-    level_8,
-    level_9,  // Best compression
+`flate.Compress.Options` is a struct of match-search tuning knobs (`good`, `nice`,
+`lazy`, `chain`) with preset constants for levels 1-9:
 
-    fast,     // Alias for level_4
-    default,  // Alias for level_6
-    best,     // Alias for level_9
-};
+```zig
+flate.Compress.Options.level_1  // ... level_9 (1 = fastest, 9 = best)
+flate.Compress.Options.fastest  // = level_1
+flate.Compress.Options.default  // = level_6
+flate.Compress.Options.best     // = level_9
 ```
+
+Pass one of them as the last argument of `flate.Compress.init`
+(`.default` as a decl literal).
 
 ### Huffman-Only Compression
 
 For faster compression without LZ77 match searching:
 
-```zig
-const HuffmanEncoder = flate.HuffmanEncoder;
-// Used internally for Huffman-only encoding (bigger output, faster compression)
-```
+`flate.Compress.Huffman` (Huffman coding only) exists, but in 0.16.0 its `finish` is not
+`pub`, and `writer.flush()` writes neither the final block nor the gzip/zlib footer — a stream
+cannot be completed, and decompressing it fails with `error.ReadFailed`. Use `flate.Compress`
+in 0.16 (0.17.0 makes `Huffman.finish` public).
 
 ## Zstandard
 
@@ -167,25 +165,22 @@ pub const Options = struct {
 ```zig
 const lzma = std.compress.lzma;
 
-var out_buffer: [4096]u8 = undefined;
-var decompress = try lzma.Decompress.initOptions(input_reader, allocator, &out_buffer, .{}, 128 * 1024 * 1024);
+// The decompressor takes OWNERSHIP of the buffer and resizes/frees it with `allocator`
+// (deinit calls allocator.free on it). Never pass a stack array here.
+const out_buffer = try allocator.alloc(u8, 4096);
+var decompress = try lzma.Decompress.initOptions(input_reader, allocator, out_buffer, .{}, 128 * 1024 * 1024);
 defer decompress.deinit();
 
-const r = &decompress.reader;
-while (true) {
-    const chunk = r.take(4096) catch |err| switch (err) {
-        error.EndOfStream => break,
-        else => return err,
-    };
-    if (chunk.len == 0) break;
-    // Process chunk
-}
+// Read everything (take(N) would drop a final chunk shorter than N)
+const decompressed = try decompress.reader.allocRemaining(allocator, .limited(256 * 1024 * 1024));
+defer allocator.free(decompressed);
 ```
 
 ### With Options
 
 ```zig
-var decompress = try lzma.Decompress.initOptions(input_reader, allocator, &out_buffer, .{
+// `out_buffer` is allocator-owned, as above
+var decompress = try lzma.Decompress.initOptions(input_reader, allocator, out_buffer, .{
     .mem_limit = 128 * 1024 * 1024,  // 128 MB memory limit
 }, 128 * 1024 * 1024);
 ```
@@ -237,19 +232,16 @@ XZ format decompression (LZMA2 in a container with checksums).
 ```zig
 const xz = std.compress.xz;
 
-var out_buffer: [4096]u8 = undefined;
-var decompress = try xz.Decompress.init(input_reader, allocator, &out_buffer);
+// init takes ownership of the buffer and resizes it with `allocator`;
+// deinit frees it. Allocate it with the same allocator (never a stack array),
+// or call `decompress.takeBuffer()` before deinit to reclaim it yourself.
+const out_buffer = try allocator.alloc(u8, 4096);
+var decompress = try xz.Decompress.init(input_reader, allocator, out_buffer);
 defer decompress.deinit();
 
-const r = &decompress.reader;
-while (true) {
-    const chunk = r.take(4096) catch |err| switch (err) {
-        error.EndOfStream => break,
-        else => return err,
-    };
-    if (chunk.len == 0) break;
-    // Process chunk
-}
+// Read everything (take(N) would drop a final chunk shorter than N)
+const decompressed = try decompress.reader.allocRemaining(allocator, .limited(256 * 1024 * 1024));
+defer allocator.free(decompressed);
 ```
 
 ### Check Types
@@ -449,7 +441,7 @@ pub const Error = error{
 
 **DEFLATE (flate)**:
 - Decompression: gzip, zlib, raw deflate
-- Compression: gzip, zlib, raw deflate (levels 4-9)
+- Compression: gzip, zlib, raw deflate (levels 1-9)
 - Streaming with history buffer
 
 **Zstandard (zstd)**:

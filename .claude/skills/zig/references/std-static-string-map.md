@@ -183,7 +183,7 @@ const config_keys = std.StaticStringMapWithEql(
 });
 
 fn parseConfig(line: []const u8) ?struct { key: ConfigKey, value: []const u8 } {
-    const eq_idx = std.mem.indexOf(u8, line, "=") orelse return null;
+    const eq_idx = std.mem.find(u8, line, "=") orelse return null;
     const key_str = std.mem.trim(u8, line[0..eq_idx], " ");
     const value = std.mem.trim(u8, line[eq_idx + 1 ..], " ");
 

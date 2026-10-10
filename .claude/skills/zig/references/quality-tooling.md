@@ -190,6 +190,10 @@ zig build test --fuzz=200000   # bounded, prints a report
 zig build test --fuzz          # unbounded + web UI showing covered lines
 ```
 
+Do not take a verdict from its exit status: `--fuzz` exits 0 even when it found a crash and
+does not report a hang; drive the harness from a deterministic seed loop in an ordinary test
+binary instead.
+
 A plain `zig build test` runs the fuzz test once with a trivial input, so it
 costs nothing in the normal suite.
 

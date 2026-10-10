@@ -373,12 +373,13 @@ These types cannot be serialized:
 ```zig
 // build.zig.zon
 .{
-    .name = "my-project",
+    .name = .my_project,               // enum literal
     .version = "0.1.0",
+    .fingerprint = 0x0123456789abcdef, // zig build prints the value to use
     .dependencies = .{
         .zap = .{
-            .url = "https://github.com/...",
-            .hash = "...",
+            .url = "https://example.com/zap-0.1.0.tar.gz",
+            .hash = "<name>-<version>-<hash printed by zig fetch>",
         },
     },
     .paths = .{ "src", "build.zig", "build.zig.zon" },

@@ -1,25 +1,27 @@
-# std.net / std.Io.net Reference (0.15.x → 0.16)
+# std.net / std.Io.net Reference (0.15.x → 0.16.0)
 
 Cross-platform networking abstractions for TCP/IP connections, address handling, and DNS resolution.
 
 > **CRITICAL: 0.16 Migration Required**
 >
-> In Zig 0.16, **`std.net` is completely removed**. All networking is now under **`std.Io.net`**, which requires an `Io` instance for listen/accept/close operations.
+> **`std.net` is completely removed.** All networking is now under **`std.Io.net`**, which requires an `Io` instance for connect/listen/accept/read/write/close operations.
 >
 > **Key renames:**
-> - `net.Address.parseIp4` → `Io.net.IpAddress.parse`
+> - `net.Address.parseIp4` → `Io.net.IpAddress.parse` (returns an error union)
 > - `net.Stream` → `Io.net.Stream`
+> - `net.tcpConnectToHost` → `Io.net.HostName.connect(host, io, port, .{ .mode = .stream })`
+> - `net.tcpConnectToAddress` → `IpAddress.connect(&addr, io, .{ .mode = .stream })`
+> - `net.connectUnixSocket` → `Io.net.UnixAddress.init(path)` + `.connect(io)`
 >
 > **Behavioral changes:**
-> - `stream.close()` → `stream.close(io)` (requires `Io` instance)
+> - `stream.close()` → `stream.close(io)` (requires `Io` by value)
 > - `stream.handle` → `stream.socket.handle`
-> - `Io.net.Stream` has no `.read()` or `.writeAll()` — use raw C calls or `std.posix.read`
-> - `connectUnixSocket` / `tcpConnectToHost` — removed, use C externs
-> - `std.posix.close` → `std.c.close`
+> - Reading and writing go through `stream.reader(io, &buf)` / `stream.writer(io, &buf)` (buffered, like files); flush the writer
+> - `std.posix.close` → `stream.close(io)` / `file.close(io)`; `std.c.close` only when already linking libc
 > - `net.has_unix_sockets` → `Io.net.has_unix_sockets`
 
 ## Table of Contents
-- [0.16 Migration](#016-migration)
+- [Migration to std.Io.net](#migration-to-stdionet)
 - [TCP Client (0.15.x)](#tcp-client)
 - [TCP Server (0.15.x)](#tcp-server)
 - [Address Types (0.15.x)](#address-types)
@@ -28,60 +30,50 @@ Cross-platform networking abstractions for TCP/IP connections, address handling,
 - [Unix Sockets (0.15.x)](#unix-sockets)
 - [Common Patterns (0.15.x)](#common-patterns)
 
-## 0.16 Migration
+## Migration to std.Io.net
 
-In Zig 0.16, `std.net` is entirely removed. All networking now goes through `std.Io.net`, which requires an `Io` runtime instance. This section covers every breaking change with WRONG (0.15.x) vs CORRECT (0.16) examples.
+`std.net` is entirely removed. All networking goes through `std.Io.net`, which requires an `Io` runtime instance. This section covers every breaking change with WRONG (0.15.x) vs CORRECT (0.16) examples.
 
 ### Io Runtime Setup
 
-All networking in 0.16 requires an `Io` instance. There is no bare `std.Io.init()` — you construct a concrete `Io` implementation (e.g. `std.Io.Threaded`, the thread-pool-backed one) and get an `Io` value from its `.io()` method:
+All networking requires an `Io` instance. In an executable take it from `main`; elsewhere construct a concrete `Io` implementation (e.g. `std.Io.Threaded`, the thread-pool-backed one) and get an `Io` value from its `.io()` method:
 
 ```zig
-// CORRECT (0.16): Obtain an Io runtime from std.Io.Threaded
-const std = @import("std");
-
-pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-
-    var threaded: std.Io.Threaded = .init(gpa.allocator(), .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    // Pass `io` to all networking operations
-    const net = std.Io.net;
-    _ = net;
-    _ = io;
+// CORRECT: main receives a ready-made Io (plus gpa, arena, environ_map, ...)
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    _ = .{ io, gpa };
 }
+
+// Elsewhere (library test harness, C entry point): build one and thread it through
+var threaded: std.Io.Threaded = .init(gpa, .{});
+defer threaded.deinit();
+const io = threaded.io();
 ```
 
-If you control `main` itself (not a library), it's simpler to let the runtime build the `Io` for you: give `main` a single `std.process.Init` parameter (`pub fn main(init: std.process.Init) !void { const io = init.io; ... }`) and it already contains a ready-made `io` (plus `gpa`, `arena`, `environ_map`, ...), with no manual `Io.Threaded` setup needed.
+There is no bare `std.Io.init()`.
 
 ### TCP Client Migration
 
-`tcpConnectToHost` is removed. Use C externs or low-level socket APIs.
+`tcpConnectToHost` is replaced by `HostName.connect` (DNS + try every address); `tcpConnectToAddress` by `IpAddress.connect`.
 
 ```zig
-// WRONG (0.15.x): tcpConnectToHost — removed in 0.16
+// WRONG (0.15.x): tcpConnectToHost — removed
 const stream = try net.tcpConnectToHost(allocator, "example.com", 80);
 defer stream.close();
 ```
 
 ```zig
-// CORRECT (0.16): tcpConnectToHost is removed — use C externs
-const std = @import("std");
-const c = std.c;
+// CORRECT: connect by host name (resolves and tries the addresses)
+const host: std.Io.net.HostName = try .init("example.com");
+const stream = try host.connect(io, 80, .{ .mode = .stream });
+defer stream.close(io);
 
-extern "c" fn connect(sockfd: c_int, addr: *const anyopaque, addrlen: c.socklen_t) c_int;
-extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-
-pub fn tcpConnect(address: std.Io.net.IpAddress, port: u16) !std.Io.net.Stream {
-    _ = port;
-    _ = address;
-    // Manual socket creation + connect via C externs required
-    // This is a simplified sketch — real code needs full sockaddr setup
-    @compileError("TODO: implement with C socket APIs");
-}
+// CORRECT: connect by IP address (no DNS)
+const addr = try std.Io.net.IpAddress.parse("192.168.1.1", 8080);
+const stream2 = try addr.connect(io, .{ .mode = .stream });
+defer stream2.close(io);
 ```
 
 ### TCP Server Migration
@@ -98,28 +90,18 @@ defer conn.stream.close();
 ```
 
 ```zig
-// CORRECT (0.16): Io.net.IpAddress + listen(io) + accept(io) returns Stream directly
-const std = @import("std");
+// CORRECT: Io.net.IpAddress + listen(io) + accept(io) returns the Stream directly
+const address = try std.Io.net.IpAddress.parse("0.0.0.0", 8080);
+var server = try address.listen(io, .{ .reuse_address = true });
+defer server.deinit(io);
 
-pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    var threaded: std.Io.Threaded = .init(gpa.allocator(), .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const address = try std.Io.net.IpAddress.parse("0.0.0.0", 8080);
-    var server = try address.listen(io, .{ .reuse_address = true });
-    defer server.deinit(io);
-
-    const stream = try server.accept(io);
-    defer stream.close(io);
-}
+const stream = try server.accept(io);
+defer stream.close(io);
 ```
 
 ### Address Parsing Migration
 
-`net.Address.parseIp4` is replaced by `Io.net.IpAddress.parse`.
+`net.Address.parseIp4` is replaced by `Io.net.IpAddress.parse` (text, port); it returns an error union, so use `try`.
 
 ```zig
 // WRONG (0.15.x): net.Address.parseIp4
@@ -127,8 +109,8 @@ const address = try net.Address.parseIp4("192.168.1.1", 8080);
 ```
 
 ```zig
-// CORRECT (0.16): Io.net.IpAddress.parse
-const address = std.Io.net.IpAddress.parse("192.168.1.1", 8080);
+// CORRECT: Io.net.IpAddress.parse (IPv4 or IPv6)
+const address = try std.Io.net.IpAddress.parse("192.168.1.1", 8080);
 ```
 
 ### Stream Type Migration
@@ -145,9 +127,10 @@ fn handleClient(stream: net.Stream) !void {
 ```
 
 ```zig
-// CORRECT (0.16): Io.net.Stream — handle is under .socket
-fn handleClient(stream: std.Io.net.Stream, io: *std.Io) !void {
+// CORRECT: Io.net.Stream — handle is under .socket; Io is passed by value
+fn handleClient(stream: std.Io.net.Stream, io: std.Io) !void {
     const fd = stream.socket.handle;
+    _ = fd;
     defer stream.close(io);
     // ...
 }
@@ -155,7 +138,7 @@ fn handleClient(stream: std.Io.net.Stream, io: *std.Io) !void {
 
 ### close(io) Pattern
 
-All close operations now require an `Io` instance.
+All close operations now require an `Io` instance (by value).
 
 ```zig
 // WRONG (0.15.x): stream.close() — no arguments
@@ -163,8 +146,8 @@ stream.close();
 ```
 
 ```zig
-// CORRECT (0.16): stream.close(io) — requires Io instance
-stream.close(&io);
+// CORRECT: stream.close(io)
+stream.close(io);
 ```
 
 ### stream.socket.handle
@@ -177,61 +160,56 @@ const fd = stream.handle;
 ```
 
 ```zig
-// CORRECT (0.16): stream.socket.handle
+// CORRECT: stream.socket.handle
 const fd = stream.socket.handle;
 ```
 
 ### Reading and Writing
 
-`Io.net.Stream` has no `.read()` or `.writeAll()` methods. Use `std.posix.read` for reading and C extern `write` for writing.
+`Io.net.Stream` is read and written through a buffered `Reader` / `Writer` that you create with the `Io`, exactly like a file. Always flush the writer.
 
 ```zig
-// WRONG (0.15.x): stream.reader() / stream.writer() on net.Stream
-var read_buf: [4096]u8 = undefined;
+// WRONG (0.15.x): reader/writer without Io, reader.interface() as a call
 var reader = stream.reader(&read_buf);
 var writer = stream.writer(&write_buf);
 try writer.interface.writeAll("Hello");
 ```
 
 ```zig
-// CORRECT (0.16): Use std.posix.read and extern C write
-const std = @import("std");
+// CORRECT: stream.reader(io, &buf) / stream.writer(io, &buf) + flush
+var read_buf: [4096]u8 = undefined;
+var write_buf: [1024]u8 = undefined;
+var reader = stream.reader(io, &read_buf);
+var writer = stream.writer(io, &write_buf);
 
-extern "c" fn write(fd: std.c.fd_t, buf: [*]const u8, count: usize) isize;
+try writer.interface.writeAll("ping\n");
+try writer.interface.flush();
 
-fn readFromStream(stream: std.Io.net.Stream, buf: []u8) !usize {
-    return std.posix.read(stream.socket.handle, buf);
-}
-
-fn writeToStream(stream: std.Io.net.Stream, data: []const u8) !void {
-    var total: usize = 0;
-    while (total < data.len) {
-        const rc = write(stream.socket.handle, data.ptr + total, data.len - total);
-        if (rc < 0) return error.WriteFailed;
-        total += @intCast(rc);
-    }
-}
+const line = try reader.interface.takeDelimiterExclusive('\n');
 ```
 
-### connectUnixSocket Removal
+If a read or write fails with `error.ReadFailed` / `error.WriteFailed`, the underlying error is in `reader.err` / `writer.err`.
 
-`connectUnixSocket` is removed. Use C externs for Unix socket connections.
+### Unix Sockets
+
+`connectUnixSocket` is replaced by `UnixAddress.init(path)` + `.connect(io)`; servers use `.listen(io, .{})`.
 
 ```zig
-// WRONG (0.15.x): net.connectUnixSocket — removed in 0.16
+// WRONG (0.15.x): net.connectUnixSocket
 const stream = try net.connectUnixSocket("/var/run/app.sock");
 ```
 
 ```zig
-// CORRECT (0.16): Use C externs for Unix sockets
-// connectUnixSocket is removed — manual socket(AF_UNIX) + connect() via C externs required
-// Check availability: Io.net.has_unix_sockets (was net.has_unix_sockets)
+// CORRECT: check availability, then connect through Io
 if (std.Io.net.has_unix_sockets) {
-    // Implement via C extern socket()/connect()
+    const ua = try std.Io.net.UnixAddress.init("/var/run/app.sock");
+    const stream = try ua.connect(io);
+    defer stream.close(io);
+    // stream.reader(io, &buf) / stream.writer(io, &buf) as for TCP
 }
 ```
 
-### std.posix.close → std.c.close
+### std.posix.close
 
 ```zig
 // WRONG (0.15.x): std.posix.close
@@ -239,7 +217,11 @@ std.posix.close(fd);
 ```
 
 ```zig
-// CORRECT (0.16): std.c.close
+// CORRECT: close through the owning handle with Io
+stream.close(io);   // net stream
+file.close(io);     // file
+
+// Fallback only when the program already links libc (`.link_libc = true`):
 _ = std.c.close(fd);
 ```
 
@@ -251,7 +233,7 @@ if (net.has_unix_sockets) { ... }
 ```
 
 ```zig
-// CORRECT (0.16): Io.net.has_unix_sockets
+// CORRECT: Io.net.has_unix_sockets
 if (std.Io.net.has_unix_sockets) { ... }
 ```
 
@@ -267,7 +249,7 @@ if (std.Io.net.has_unix_sockets) { ... }
 
 ```zig
 const std = @import("std");
-const net = std.net;  // OLD (0.15.x) — std.net removed in 0.16, see 0.16 Migration above
+const net = std.net;  // OLD (0.15.x) — std.net removed in 0.16, see Migration above
 
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -326,7 +308,7 @@ const link_local = try net.Address.resolveIp6("fe80::1%eth0", 8080);
 
 ```zig
 const std = @import("std");
-const net = std.net;  // OLD (0.15.x) — std.net removed in 0.16, see 0.16 Migration above
+const net = std.net;  // OLD (0.15.x) — std.net removed in 0.16, see Migration above
 
 pub fn main() !void {
     // Create address to listen on
@@ -594,7 +576,7 @@ const data = r.take(100) catch |err| switch (err) {
 
 ```zig
 const std = @import("std");
-const net = std.net;  // OLD (0.15.x) — std.net removed in 0.16, see 0.16 Migration above
+const net = std.net;  // OLD (0.15.x) — std.net removed in 0.16, see Migration above
 
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -679,7 +661,7 @@ while (true) {
 
 ```zig
 const std = @import("std");
-const net = std.net;  // OLD (0.15.x) — std.net removed in 0.16, see 0.16 Migration above
+const net = std.net;  // OLD (0.15.x) — std.net removed in 0.16, see Migration above
 
 pub fn main() !void {
     const address = net.Address.initIp4(.{ 0, 0, 0, 0 }, 7);  // echo port
@@ -739,7 +721,7 @@ fn httpGet(allocator: Allocator, host: []const u8, path: []const u8) ![]u8 {
 
 ```zig
 const std = @import("std");
-const net = std.net;  // OLD (0.15.x) — std.net removed in 0.16, see 0.16 Migration above
+const net = std.net;  // OLD (0.15.x) — std.net removed in 0.16, see Migration above
 const posix = std.posix;
 
 fn acceptWithTimeout(server: *net.Server, timeout_ms: i32) !?net.Server.Connection {

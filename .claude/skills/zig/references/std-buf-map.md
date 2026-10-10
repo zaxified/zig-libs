@@ -26,9 +26,13 @@ if (map.get("HOME")) |home| {
     std.debug.print("home: {s}\n", .{home});
 }
 
-// Get pointer (invalidated on resize)
+// Update: put() frees the old value and stores a copy of the new one
+// (BufMap.copy is private; never overwrite through getPtr, the old value would leak)
+try map.put("PATH", "/new/path");
+
+// Get pointer (read access; invalidated on resize)
 if (map.getPtr("PATH")) |path_ptr| {
-    path_ptr.* = try map.copy("/new/path");  // update in place
+    std.debug.print("path: {s}\n", .{path_ptr.*});
 }
 
 // Remove (frees both key and value)

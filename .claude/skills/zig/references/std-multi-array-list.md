@@ -17,7 +17,7 @@ const Item = struct {
     score: f32,
 };
 
-var list: std.MultiArrayList(Item) = .{};
+var list: std.MultiArrayList(Item) = .empty;
 defer list.deinit(allocator);
 
 // Pre-allocate capacity
@@ -54,7 +54,7 @@ const n = list.len;
 When accessing multiple fields, use `slice()` to compute pointers once:
 
 ```zig
-const slices = list.slice();
+var slices = list.slice();  // `var`: Slice.set takes *Slice
 
 // Now access fields without recomputing offsets
 for (slices.items(.id), slices.items(.score)) |id, score| {
@@ -90,7 +90,7 @@ const Value = union(enum) {
     string: []const u8,
 };
 
-var values: std.MultiArrayList(Value) = .{};
+var values: std.MultiArrayList(Value) = .empty;
 try values.append(allocator, .{ .int = 42 });
 try values.append(allocator, .{ .float = 3.14 });
 

@@ -49,7 +49,7 @@ comptime {
         expected.patch != builtin.zig_version.patch)
     {
         @compileError(std.fmt.comptimePrint(
-            "unsupported zig version: expected {}, found {}",
+            "unsupported zig version: expected {f}, found {f}",
             .{ expected, builtin.zig_version },
         ));
     }
@@ -107,7 +107,7 @@ pub inline fn move(comptime T: type, dest: []T, source: []const T) void {
 extern "c" fn memmove(*anyopaque, *const anyopaque, usize) *anyopaque;
 ```
 
-Libc `memmove` can be 10-20% faster than Zig builtin on large buffers. Inline preserves tight loop performance.
+Libc `memmove` was measured by the upstream project as 10-20% faster than the Zig builtin on large buffers (their measurement, not reproduced here; requires linking libc). Inline preserves tight loop performance.
 
 ### Pre-Allocated Message Pool (TigerBeetle)
 
@@ -193,7 +193,7 @@ pub const Borrowed = struct {
 };
 ```
 
-Thread-local heaps eliminate contention. Borrowed/Owned makes ownership clear at the type level. 2-3x faster than system malloc under contention.
+Thread-local heaps eliminate contention. Borrowed/Owned makes ownership clear at the type level. Upstream (Bun) reports 2-3x faster than system malloc under contention (their measurement, not reproduced here).
 
 ---
 
@@ -314,11 +314,14 @@ Power-of-two sizing with bit masking. Overflow area for probe chains. Zero alloc
 
 ### Blocking Queue for Message Passing (Ghostty)
 
-**0.16:** `std.Thread.Mutex`/`std.Thread.Condition` are removed — use `std.Io.Mutex`/`std.Io.Condition`, which need an `io: Io` on every call. `Io.Condition` has `wait(io, mutex)` (cancelable) but no built-in `timedWait`; a bounded wait needs a separate cancellation/timeout mechanism at the `Io` level (e.g. racing the wait against `io.sleep`), not shown here for brevity — only the `.forever` case is a direct port:
+**0.16:** `std.Thread.Mutex`/`std.Thread.Condition` are removed — use `std.Io.Mutex`/`std.Io.Condition`, which need an `io: Io` on every call. `Io.Condition` has `wait(io, mutex)` (cancelable) but in 0.16.0 no `waitTimeout` (0.17 adds it); a bounded wait needs a separate timeout mechanism (e.g. racing the wait against `io.sleep`), not shown here — only `.instant` and `.forever` are a direct port:
 
 ```zig
 pub fn BlockingQueue(comptime T: type, comptime capacity: usize) type {
     return struct {
+        const Self = @This();
+        pub const Timeout = union(enum) { instant, forever };
+
         data: [capacity]T = undefined,
         write: u32 = 0,
         read: u32 = 0,
@@ -328,14 +331,19 @@ pub fn BlockingQueue(comptime T: type, comptime capacity: usize) type {
         pub fn push(self: *Self, io: std.Io, value: T, timeout: Timeout) !u32 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
-            if (self.full()) {
+            while (self.full()) {
                 switch (timeout) {
                     .instant => return 0,
                     .forever => try self.cond_not_full.wait(io, &self.mutex),
-                    // .ns => bounded wait: needs a timeout mechanism on top of `wait`, see note above
                 }
             }
-            // ... enqueue
+            self.data[self.write % capacity] = value;
+            self.write +%= 1;
+            return 1;
+        }
+
+        fn full(self: *const Self) bool {
+            return self.write -% self.read == capacity;
         }
     };
 }
@@ -593,7 +601,7 @@ pub const MTLResourceOptions = packed struct(c_ulong) {
     cpu_cache_mode: CPUCacheMode = .default,
     storage_mode: StorageMode,
     hazard_tracking_mode: HazardTrackingMode = .default,
-    _pad: @Type(.{ .int = .{ .signedness = .unsigned, .bits = @bitSizeOf(c_ulong) - 10 } }) = 0,
+    _pad: @Int(.unsigned, @bitSizeOf(c_ulong) - 10) = 0,
 
     pub const StorageMode = enum(u4) { shared = 0, managed = 1, private = 2, memoryless = 3 };
 };
@@ -636,15 +644,15 @@ pub fn EnumUnionType(
     comptime Enum: type,
     comptime TypeForVariant: fn (comptime variant: Enum) type,
 ) type {
-    var fields: [std.enums.values(Enum).len]std.builtin.Type.UnionField = undefined;
-    for (std.enums.values(Enum), 0..) |variant, i| {
-        fields[i] = .{
-            .name = @tagName(variant),
-            .type = TypeForVariant(variant),
-            .alignment = @alignOf(TypeForVariant(variant)),
-        };
+    const variants = std.enums.values(Enum);
+    var names: [variants.len][]const u8 = undefined;
+    var types: [variants.len]type = undefined;
+    for (variants, 0..) |variant, i| {
+        names[i] = @tagName(variant);
+        types[i] = TypeForVariant(variant);
     }
-    return @Type(.{ .@"union" = .{ .layout = .auto, .fields = &fields, .decls = &.{}, .tag_type = Enum } });
+    // Default attributes: natural alignment for every field.
+    return @Union(.auto, Enum, &names, &types, &@splat(.{}));
 }
 ```
 
@@ -817,7 +825,7 @@ pub const inlineAssert = switch (builtin.mode) {
 };
 ```
 
-Stdlib `assert` sometimes doesn't optimize out in ReleaseFast. Custom inline version with `unreachable` helps the compiler. Saves 15-20% in tight loops.
+Stdlib `assert` sometimes doesn't optimize out in ReleaseFast. Custom inline version with `unreachable` helps the compiler. Upstream (Ghostty) reports 15-20% saved in tight loops (their measurement, not reproduced here).
 
 ### Thread-Local Object Pool (Bun)
 

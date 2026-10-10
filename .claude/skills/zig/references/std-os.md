@@ -78,13 +78,13 @@ const linux = std.os.linux;
 const addr = linux.mmap(
     null,
     length,
-    linux.PROT.READ | linux.PROT.WRITE,
+    .{ .READ = true, .WRITE = true }, // linux.PROT is a packed struct of flags
     .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
     -1,
     0,
 );
-if (addr == linux.MAP_FAILED) {
-    // handle error
+if (linux.errno(addr) != .SUCCESS) {
+    // handle error (raw syscalls return -errno in a usize)
 }
 
 // Remap
@@ -148,8 +148,8 @@ const linux = std.os.linux;
 // Signal handling
 var act: linux.Sigaction = .{
     .handler = .{ .handler = signal_handler },
-    .mask = linux.empty_sigset,
-    .flags = .{},
+    .mask = linux.sigemptyset(),
+    .flags = 0,
 };
 _ = linux.sigaction(linux.SIG.INT, &act, null);
 
@@ -162,21 +162,27 @@ _ = linux.kill(pid, linux.SIG.TERM);
 ```zig
 const linux = std.os.linux;
 
-// Create epoll instance
-const epfd = linux.epoll_create1(.{ .CLOEXEC = true });
+// The raw wrappers take u32 flags/ops and return the raw syscall result (usize):
+// check it with linux.errno().
+const epfd_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
+if (linux.errno(epfd_rc) != .SUCCESS) return error.EpollCreateFailed;
+const epfd: i32 = @intCast(epfd_rc);
+defer _ = linux.close(epfd);
 
 // Add file descriptor
 var event: linux.epoll_event = .{
     .events = linux.EPOLL.IN | linux.EPOLL.ET,
     .data = .{ .fd = client_fd },
 };
-_ = linux.epoll_ctl(epfd, .ADD, client_fd, &event);
+if (linux.errno(linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, client_fd, &event)) != .SUCCESS)
+    return error.EpollCtlFailed;
 
-// Wait for events
+// Wait for events: epoll_wait(epfd, events_ptr, maxevents, timeout_ms)
 var events: [64]linux.epoll_event = undefined;
-const n = linux.epoll_wait(epfd, &events, -1);
-for (events[0..n]) |ev| {
-    // handle event
+const rc = linux.epoll_wait(epfd, &events, events.len, -1);
+if (linux.errno(rc) != .SUCCESS) return error.EpollWaitFailed; // EINTR etc. land here
+for (events[0..rc]) |ev| {
+    _ = ev; // handle event
 }
 ```
 
@@ -198,15 +204,13 @@ const platform = linux.getauxval(std.elf.AT_PLATFORM);
 ```zig
 const windows = std.os.windows;
 
-// Open file with NT API
-const handle = try windows.OpenFile(path_utf16, .{
-    .access_mask = windows.GENERIC_READ | windows.GENERIC_WRITE,
-    .creation = windows.FILE_OPEN,
-    .share_access = windows.FILE_SHARE_READ,
-    .filter = .file_only,
-    .follow_symlinks = true,
-});
-defer windows.CloseHandle(handle);
+// std.os.windows has no OpenFile wrapper. Open files through the
+// cross-platform Io API (it uses the NT calls from windows.ntdll internally):
+const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+defer file.close(io);
+
+// Raw handles you obtained elsewhere are closed with:
+//   windows.CloseHandle(handle);
 ```
 
 ### Process Information
@@ -229,15 +233,27 @@ const err = windows.GetLastError();
 ```zig
 const windows = std.os.windows;
 
+// std.os.windows has no CreatePipe wrapper. Child-process pipes are
+// created for you by std.process.spawn (stdio = .pipe). For a raw pipe,
+// declare the kernel32 extern yourself (Windows only):
+extern "kernel32" fn CreatePipe(
+    hReadPipe: *windows.HANDLE,
+    hWritePipe: *windows.HANDLE,
+    lpPipeAttributes: ?*windows.SECURITY_ATTRIBUTES,
+    nSize: windows.DWORD,
+) callconv(.winapi) windows.BOOL;
+
 var read_handle: windows.HANDLE = undefined;
 var write_handle: windows.HANDLE = undefined;
 var sa: windows.SECURITY_ATTRIBUTES = .{
     .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
     .lpSecurityDescriptor = null,
-    .bInheritHandle = windows.TRUE,
+    .bInheritHandle = .TRUE,
 };
 
-try windows.CreatePipe(&read_handle, &write_handle, &sa);
+if (CreatePipe(&read_handle, &write_handle, &sa, 0) == .FALSE) {
+    return windows.unexpectedError(windows.GetLastError());
+}
 ```
 
 ### Submodules
@@ -245,7 +261,6 @@ try windows.CreatePipe(&read_handle, &write_handle, &sa);
 ```zig
 windows.kernel32   // kernel32.dll functions
 windows.ntdll      // ntdll.dll functions (NT native API)
-windows.advapi32   // advapi32.dll (security, registry)
 windows.ws2_32     // Winsock 2 networking
 windows.crypt32    // Cryptographic functions
 windows.nls        // National Language Support
@@ -388,17 +403,21 @@ _ = try ring.submit_and_wait(1);
 
 // Process completions
 while (ring.cq_ready() > 0) {
-    const cqe = ring.peek_cqe() orelse break;
+    // copy_cqe returns a copy and advances the CQ ring itself:
+    // do NOT also call cq_advance()/cqe_seen() for it.
+    const cqe = try ring.copy_cqe();
 
     const user_data = cqe.user_data;
     const result = cqe.res;  // bytes transferred or -errno
 
-    if (result < 0) {
-        const err = std.os.linux.errno(@intCast(-result));  // was E.init, renamed errno in 0.16
-        // handle error
+    switch (cqe.err()) {  // decodes a negative res into linux.E
+        .SUCCESS => {},
+        else => |e| {
+            _ = e; // handle error
+        },
     }
-
-    ring.cq_advance(1);  // mark CQE as consumed
+    _ = user_data;
+    _ = result;
 }
 ```
 
@@ -464,7 +483,7 @@ defer ring.unregister_buffers() catch {};
 
 // Use registered buffer
 const sqe = try ring.get_sqe();
-sqe.prep_read_fixed(fd, &buffers[0], 0, 0);  // buf_index = 0
+sqe.prep_read_fixed(fd, &iovecs[0], 0, 0);  // takes *posix.iovec; buf_index = 0
 ```
 
 ### File Descriptor Registration
@@ -562,8 +581,7 @@ fn eventLoop(ring: *std.os.linux.IoUring) !void {
 
         // Process all available completions
         while (ring.cq_ready() > 0) {
-            const cqe = ring.peek_cqe() orelse break;
-            defer ring.cq_advance(1);
+            const cqe = try ring.copy_cqe(); // advances the CQ ring itself
 
             const ctx = @as(*Context, @ptrFromInt(cqe.user_data));
             try ctx.handle_completion(cqe.res);
@@ -601,10 +619,10 @@ const windows = std.os.windows;
 
 fn windowsOperation() !void {
     const result = windows.kernel32.SomeFunction(...);
-    if (result == windows.FALSE) {
-        switch (windows.GetLastError()) {
-            .ERROR_FILE_NOT_FOUND => return error.FileNotFound,
-            .ERROR_ACCESS_DENIED => return error.AccessDenied,
+    if (result == .FALSE) { // result: windows.BOOL (an enum; compare to .FALSE, never to TRUE)
+        switch (windows.GetLastError()) { // windows.Win32Error: tags have no ERROR_ prefix
+            .FILE_NOT_FOUND => return error.FileNotFound,
+            .ACCESS_DENIED => return error.AccessDenied,
             else => |e| return windows.unexpectedError(e),
         }
     }

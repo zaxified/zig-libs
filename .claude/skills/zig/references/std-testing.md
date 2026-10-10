@@ -158,9 +158,9 @@ std.debug.print("Deallocations: {}\n", .{failing.deallocations});
 
 ```zig
 fn myFunction(allocator: std.mem.Allocator, size: usize) !void {
-    var foo = try allocator.alloc(u8, size);
+    const foo = try allocator.alloc(u8, size);
     defer allocator.free(foo);
-    var bar = try allocator.alloc(u8, size);
+    const bar = try allocator.alloc(u8, size);
     defer allocator.free(bar);
     // ... use foo and bar
 }
@@ -392,7 +392,6 @@ test "arena for test allocations" {
 ```bash
 zig build test                    # Run all tests
 zig test src/lib.zig              # Test single file
-zig test --test-filter "name"     # Filter by name substring
-zig test -fsummary                # Show test summary
-zig test --verbose                # Show debug output
+zig test src/lib.zig --test-filter "name"  # Filter by name substring
+zig build test --summary all      # Show every step and test count
 ```

@@ -166,12 +166,12 @@ asm volatile ("syscall"
 | `std.fifo.LinearFifo` | Use `std.Io.Reader`/`Writer` patterns | Removed; ring-buffer I/O approach |
 | `std.RingBuffer` | Use `std.Io.Reader`/`Writer` patterns | Removed; migrated to Io interfaces |
 | `std.net.*` | `std.Io.net.*` (requires Io instance) | std.net (0.16) |
-| `std.time.timestamp()` | `std.c.clock_gettime(.REALTIME, &ts)` | std.time (0.16) |
-| `std.Thread.Mutex/Condition` | POSIX pthread shims or `std.Io.Mutex` | std.Thread (0.16) |
-| `std.Thread.sleep` | `std.c.nanosleep` | std.Thread (0.16) |
-| `std.crypto.random` | `arc4random_buf` / `std.os.linux.getrandom` | std.crypto (0.16) |
+| `std.time.timestamp()` | `std.Io.Clock.real.now(io).toSeconds()` (libc fallback: `std.c.clock_gettime`) | std.time (0.16) |
+| `std.Thread.Mutex/Condition` | `std.Io.Mutex` / `std.Io.Condition` (no `Io`: futex or, with libc, pthread shims) | std.Thread (0.16) |
+| `std.Thread.sleep` | `io.sleep(duration, clock)` (libc fallback: `std.c.nanosleep`) | std.Thread (0.16) |
+| `std.crypto.random` | `io.randomSecure(&buf)` (no `Io` on Linux: a checked `getrandom` loop) | std.crypto (0.16) |
 | `std.debug.lockStderrWriter` | `std.debug.lockStderr(&buf)` | std.debug (0.16) |
-| `std.posix.close/write/connect/socket` | `std.c.close` / C externs | std.posix (0.16) |
+| `std.posix.close/write/connect/socket` | `std.Io.net` (`connect`, `Stream.reader/writer`) — `std.c.*` only when linking libc | std.posix (0.16) |
 | `lib.addIncludePath(...)` | `lib.root_module.addIncludePath(...)` | std.Build (0.16) |
 | `lib.linkSystemLibrary("x")` | `lib.root_module.linkSystemLibrary("x", .{})` | std.Build (0.16) |
 | `std.io.fixedBufferStream` | `std.fmt.bufPrint` | std.io (0.16) |
@@ -438,7 +438,7 @@ These patterns cause memory corruption or defeat safety mechanisms.
 |---------|---------|-----------|
 | Missing `gpa.deinit()` | No leak detection in debug | Search `DebugAllocator` without `defer.*deinit()` |
 | `@ptrCast` size mismatch | Memory corruption | Search `@ptrCast` between different-sized types |
-| Packed struct field pointer | Unaligned access UB | Search `&packed_struct.field` |
+| Packed struct field pointer | A bit-pointer (`*align(a:bit:host) T`), not a `*T`; breaks when passed where `*T` is expected | Search `&packed_struct.field` |
 | `@setRuntimeSafety(false)` | Removes all safety checks | Search for `@setRuntimeSafety(false)` |
 
 **Examples:**
@@ -482,7 +482,7 @@ const Packet = packed struct {
 };
 
 fn getLen(pkt: *Packet) *u12 {
-    return &pkt.len;  // Unaligned pointer - UB!
+    return &pkt.len;  // error: expected type '*u12', found '*align(4:4:4) u12' (a bit-pointer)
 }
 
 // CORRECT - copy the value instead
@@ -619,7 +619,7 @@ try writer.interface.flush();  // Required!
 
 **Verification:** Check for `writer(&buf)` without corresponding `.flush()` before scope exit.
 
-**Reference:** See [SKILL.md:25-83](../SKILL.md) - I/O API Rewrite ("Writergate").
+**Reference:** See [SKILL.md](../SKILL.md), section "Critical: I/O API Rewrite (Writergate)".
 
 ### 2.3 Allocator Pointer Comparison
 
@@ -1254,11 +1254,11 @@ fn formatVersion(allocator: Allocator, major: u32, minor: u32) ![]u8 {
     return std.fmt.allocPrint(allocator, "{d}.{d}", .{ major, minor });
 }
 
-// BETTER: Stack buffer when max size is bounded
-fn formatVersion(major: u32, minor: u32) []const u8 {
-    var buf: [32]u8 = undefined;  // Max: "4294967295.4294967295" = 21 chars
-    return std.fmt.bufPrint(&buf, "{d}.{d}", .{ major, minor }) catch unreachable;
+// BETTER: the caller owns a bounded buffer (never return a slice of your own stack frame)
+fn formatVersion(buf: []u8, major: u32, minor: u32) ![]u8 {
+    return std.fmt.bufPrint(buf, "{d}.{d}", .{ major, minor }); // max "4294967295.4294967295" = 21 chars
 }
+// caller: var buf: [32]u8 = undefined; const v = try formatVersion(&buf, 1, 2);
 
 // ANTI-PATTERN: Heap allocation for fixed-size array
 const items = try allocator.alloc(u32, 256);
@@ -1535,7 +1535,7 @@ This pattern is common for context types passed to hash maps and other generic c
 | `.?` unwrap | Runtime panic | Not guarded by `if` or `orelse` |
 | `catch unreachable` | Runtime panic | On allocator calls |
 | `return &local` | Dangling pointer | Returning address of stack variable |
-| `&packed.field` | Undefined behavior | Pointer to packed struct field |
+| `&packed.field` | Bit-pointer, not `*T` | Pointer to packed struct field |
 | Missing `gpa.deinit()` | No leak detection | `DebugAllocator` without defer deinit |
 | Missing standard opts | No cross-compile | `build.zig` without `standardTargetOptions` |
 

@@ -57,7 +57,7 @@ fn compareByScore(scores_ctx: []const u32, a: usize, b: usize) bool {
     return scores_ctx[a] < scores_ctx[b];
 }
 
-std.sort.pdq(usize, &indices, &scores, compareByScore);
+std.sort.pdq(usize, &indices, @as([]const u32, &scores), compareByScore);
 // indices = [3, 1, 0, 2] (sorted by score: 20, 30, 50, 80)
 ```
 

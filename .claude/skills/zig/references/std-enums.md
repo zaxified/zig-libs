@@ -106,7 +106,7 @@ if (map.get(.red)) |value| {
 }
 
 // Get with default
-const value = map.getOrDefault(.blue, 0);
+const value = map.get(.blue) orelse 0;  // EnumMap has no getOrDefault
 
 // Get pointer
 if (map.getPtr(.red)) |ptr| {
@@ -132,10 +132,10 @@ while (it.next()) |entry| {
     std.debug.print("{}: {}\n", .{ entry.key, entry.value.* });
 }
 
-// Iterate keys only
-var key_it = map.keyIterator();
-while (key_it.next()) |key| {
-    std.debug.print("{}\n", .{key});
+// Keys only: EnumMap has no keyIterator, use the entry iterator
+var key_it = map.iterator();
+while (key_it.next()) |entry| {
+    std.debug.print("{}\n", .{entry.key});
 }
 ```
 

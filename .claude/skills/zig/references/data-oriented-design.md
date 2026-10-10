@@ -2,7 +2,7 @@
 
 **Load when designing data structures for hot paths, large collections, compilers/parsers, ECS, or any code where memory footprint drives performance.**
 
-Distilled from Andrew Kelly's "Practical Data-Oriented Design" talk and applied to the Zig compiler (self-hosted). The core thesis: **the CPU is fast, main memory is slow; the single most impactful optimization is making the structs you have *the most of* in memory smaller, so more of them fit in a cache line and you take fewer cache misses.**
+Distilled from Andrew Kelley's "Practical Data-Oriented Design" talk and applied to the Zig compiler (self-hosted). The core thesis: **the CPU is fast, main memory is slow; the single most impactful optimization is making the structs you have *the most of* in memory smaller, so more of them fit in a cache line and you take fewer cache misses.**
 
 ## Mental Model
 

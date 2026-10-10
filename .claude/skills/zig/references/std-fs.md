@@ -1,8 +1,8 @@
-# std.fs - File System API Reference (0.16)
+# std.fs - File System API Reference (0.16.0)
 
 File system operations in Zig 0.16. Covers files, directories, iteration, atomic writes, and paths.
 
-**0.16 change:** almost everything that used to live under `std.fs` moved to `std.Io.Dir` / `std.Io.File`, and nearly every method now takes an `io: Io` argument (obtained from an `Io` implementation, e.g. `var threaded: std.Io.Threaded = .init(gpa, .{}); const io = threaded.io();`), because the actual read/write/open syscalls go through it. Only `std.fs.path` (pure path-string manipulation, no I/O) is unchanged.
+**0.16 change:** almost everything that used to live under `std.fs` moved to `std.Io.Dir` / `std.Io.File`, and nearly every method now takes an `io: Io` argument (obtained from an `Io` implementation, e.g. `var threaded: std.Io.Threaded = .init(gpa, .{}); const io = threaded.io();`), because the actual read/write/open syscalls go through it. Only `std.Io.Dir.path` (pure path-string manipulation, no I/O) is unchanged.
 
 ## Table of Contents
 - [Module Structure](#module-structure)
@@ -19,7 +19,7 @@ File system operations in Zig 0.16. Covers files, directories, iteration, atomic
 std.Io.File      // File handle and I/O operations (was std.fs.File)
 std.Io.Dir       // Directory handle and operations (was std.fs.Dir)
 std.Io.File.Atomic // Safe file writes with atomic rename/replace (was std.fs.AtomicFile)
-std.fs.path      // Path manipulation utilities (unchanged, pure functions)
+std.Io.Dir.path      // Path manipulation utilities (unchanged, pure functions)
 std.Io.Dir.cwd() // Current working directory handle (was std.fs.cwd())
 ```
 
@@ -55,7 +55,7 @@ const file = try std.Io.Dir.cwd().createFile(io, "new.txt", .{ .exclusive = true
 - `.read`: enable read access (default: false)
 - `.truncate`: truncate if exists (default: true)
 - `.exclusive`: fail if exists (default: false)
-- `.mode`: POSIX mode (default: 0o666)
+- `.permissions`: `Dir.Permissions` for the new file (default: `.default_file`)
 
 ### Reading Files
 
@@ -67,11 +67,10 @@ var buf: [4096]u8 = undefined;
 var reader = file.reader(io, &buf);
 
 // Read lines
-while (reader.interface.takeDelimiterExclusive('\n')) |line| {
+// takeDelimiter consumes the '\n' and returns null at end of stream.
+// (takeDelimiterExclusive does NOT consume it: in a loop it returns "" forever.)
+while (try reader.interface.takeDelimiter('\n')) |line| {
     // process line (does not include '\n')
-} else |err| switch (err) {
-    error.EndOfStream => {},
-    else => return err,
 }
 
 // Read all into buffer (limit is `Io.Limit`, not a bare `usize`)
@@ -119,7 +118,7 @@ const stat = try file.stat(io);
 stat.size;      // u64 - file size in bytes
 stat.kind;      // .file, .directory, .sym_link, etc.
 stat.mtime;     // Io.Timestamp - modification time
-stat.atime;     // Io.Timestamp - access time
+stat.atime;     // ?Io.Timestamp - access time (null if unavailable)
 stat.ctime;     // Io.Timestamp - status change time
 stat.inode;     // file system inode number
 
@@ -163,11 +162,11 @@ try writer.interface.flush();
 
 ```zig
 // Open for file operations (default)
-var dir = try std.Io.Dir.cwd().openDir(io, "subdir", .{});
+const dir = try std.Io.Dir.cwd().openDir(io, "subdir", .{});
 defer dir.close(io);
 
 // Open for iteration
-var dir = try std.Io.Dir.cwd().openDir(io, "subdir", .{ .iterate = true });
+const dir = try std.Io.Dir.cwd().openDir(io, "subdir", .{ .iterate = true });
 defer dir.close(io);
 ```
 
@@ -185,7 +184,7 @@ try std.Io.Dir.cwd().createDir(io, "new_dir", .default_dir);
 try std.Io.Dir.cwd().createDirPath(io, "path/to/nested/dir");
 
 // Create and open (was makeOpenPath)
-var dir = try std.Io.Dir.cwd().createDirPathOpen(io, "path/to/dir", .{});
+const dir = try std.Io.Dir.cwd().createDirPathOpen(io, "path/to/dir", .{});
 defer dir.close(io);
 ```
 
@@ -205,10 +204,10 @@ try dir.deleteTree(io, "dir_with_contents");
 ### Renaming and Copying
 
 ```zig
-// Rename within same directory
-try dir.rename(io, "old.txt", "new.txt");
+// Rename within same directory — Dir.rename(old_dir, old_sub_path, new_dir, new_sub_path, io)
+try std.Io.Dir.rename(dir, "old.txt", dir, "new.txt", io);
 
-// Rename across directories — Dir.rename(old_dir, old_sub_path, new_dir, new_sub_path, io)
+// Rename across directories
 try std.Io.Dir.rename(old_dir, "file.txt", new_dir, "file.txt", io);
 
 // Copy file atomically — Dir.copyFile(src_dir, src_path, dest_dir, dest_path, io, options)
@@ -243,7 +242,7 @@ defer file.close(io);
 ### Basic Iteration
 
 ```zig
-var dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+const dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
 defer dir.close(io);
 
 var iter = dir.iterate();
@@ -257,7 +256,7 @@ while (try iter.next(io)) |entry| {
 ### Recursive Walking
 
 ```zig
-var dir = try std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true });
+const dir = try std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true });
 defer dir.close(io);
 
 var walker = try dir.walk(allocator);
@@ -302,17 +301,17 @@ try atomic.replace(io);  // atomically replace an existing file
 
 ## Path Manipulation
 
-`std.fs.path` is unchanged in 0.16 — pure string manipulation, no I/O:
+`std.Io.Dir.path` (an alias of `std.fs.path`) is pure string manipulation, no I/O:
 
 ```zig
-const path = std.fs.path;
+const path = std.Io.Dir.path;
 
 // Join path components
 const full = try path.join(allocator, &.{ "dir", "subdir", "file.txt" });
 defer allocator.free(full);
 
 // Split into directory and basename
-const dir_part = path.dirname("/foo/bar/file.txt");   // "/foo/bar"
+const dir_part = path.dirname("/foo/bar/file.txt");   // ?[]const u8: "/foo/bar" (null if no directory part)
 const base = path.basename("/foo/bar/file.txt");      // "file.txt"
 
 // Get extension
@@ -335,14 +334,14 @@ const sep = path.sep;  // '/' on POSIX, '\\' on Windows
 ### Process All Files in Directory
 
 ```zig
-var dir = try std.Io.Dir.cwd().openDir(io, "data", .{ .iterate = true });
+const dir = try std.Io.Dir.cwd().openDir(io, "data", .{ .iterate = true });
 defer dir.close(io);
 
 var iter = dir.iterate();
 while (try iter.next(io)) |entry| {
     if (entry.kind != .file) continue;
 
-    var file = try dir.openFile(io, entry.name, .{});
+    const file = try dir.openFile(io, entry.name, .{});
     defer file.close(io);
     // process file...
 }
@@ -398,7 +397,7 @@ fn copyTree(io: std.Io, allocator: Allocator, src: std.Io.Dir, dest: std.Io.Dir)
         if (entry.kind == .directory) {
             try dest.createDirPath(io, entry.path);
         } else if (entry.kind == .file) {
-            if (std.fs.path.dirname(entry.path)) |parent| {
+            if (std.Io.Dir.path.dirname(entry.path)) |parent| {
                 try dest.createDirPath(io, parent);
             }
             try std.Io.Dir.copyFile(entry.dir, entry.basename, dest, entry.path, io, .{});

@@ -32,8 +32,9 @@ const file = try std.Io.Dir.cwd().openFile(io, "data.txt", .{});
 // POSIX-level — 0.16: std.posix.open is gone, use openat with AT.FDCWD
 const fd = try std.posix.openat(std.posix.AT.FDCWD, "data.txt", .{}, 0);
 
-// C-level (direct libc, lowest level)
-const fd = std.c.open("data.txt", .{}, 0);
+// C-level (direct libc, lowest level) — requires linking libc (`.link_libc = true`).
+// `open` is variadic: the mode must be a typed value, not a bare comptime_int.
+const fd = std.c.open("data.txt", .{}, @as(std.c.mode_t, 0));
 ```
 
 ## Fundamental Types
@@ -42,24 +43,12 @@ const fd = std.c.open("data.txt", .{}, 0);
 ```zig
 const c = std.c;
 
-// Fixed-size types (same as C)
-c.c_char       // char (usually i8)
-c.c_short      // short
-c.c_int        // int
-c.c_long       // long (platform-dependent size)
-c.c_longlong   // long long
-c.c_uchar      // unsigned char
-c.c_ushort     // unsigned short
-c.c_uint       // unsigned int
-c.c_ulong      // unsigned long
-c.c_ulonglong  // unsigned long long
+// C integer types are Zig primitive types, not members of std.c:
+//   c_char c_short c_int c_long c_longlong c_uchar c_ushort c_uint c_ulong c_ulonglong c_longdouble
+const n: c_int = 0;
 
-// Size types
-c.size_t       // size_t
-c.ssize_t      // ssize_t (signed size)
-c.intptr_t     // intptr_t
-c.uintptr_t    // uintptr_t
-c.ptrdiff_t    // ptrdiff_t
+// Size types map to Zig primitives:
+//   size_t, uintptr_t -> usize      ssize_t, intptr_t, ptrdiff_t -> isize
 c.intmax_t     // i64
 c.uintmax_t    // u64
 c.max_align_t  // maximum alignment type
@@ -269,10 +258,10 @@ c.sockaddr         // Generic socket address
     .family        // Address family (sa_family_t)
     .data          // Address data
 
-c.sockaddr_in      // IPv4 address (from std.posix)
-c.sockaddr_in6     // IPv6 address
-c.sockaddr_un      // Unix domain socket
-c.sockaddr_storage // Large enough for any address
+c.sockaddr.in      // IPv4 address (nested in sockaddr, not sockaddr_in)
+c.sockaddr.in6     // IPv6 address
+c.sockaddr.un      // Unix domain socket
+c.sockaddr.storage // Large enough for any address
 
 c.socklen_t        // Socket address length type
 c.sa_family_t      // Address family type
@@ -781,7 +770,6 @@ c.getdents        // Read directory entries (Linux)
 ```zig
 c.pthread_setname_np   // Set thread name
 c.pthread_threadid_np  // Get thread ID (macOS)
-c.getcontext           // Get current context (some platforms)
 ```
 
 ## Platform-Specific Submodules
@@ -944,7 +932,7 @@ extern "c" fn c_function(fd: std.c.fd_t, buf: [*]u8, len: usize) isize;
 pub fn wrapper(fd: std.posix.fd_t, buf: []u8) !usize {
     const result = c_function(fd, buf.ptr, buf.len);
     if (result < 0) {
-        const err = std.posix.errno(std.c._errno().*);
+        const err = std.c.errno(result); // E.SUCCESS unless result == -1
         return std.posix.unexpectedErrno(err);
     }
     return @intCast(result);
@@ -979,7 +967,7 @@ fn platformSpecificCall() void {
 // std.c._errno returns a pointer to errno
 const c = std.c;
 
-fn checkError(result: c.c_int) !void {
+fn checkError(result: c_int) !void {
     if (result < 0) {
         const errno_val = c._errno().*;
         // Convert to std.posix error

@@ -60,6 +60,10 @@ const uri = std.Uri.parse(input) catch |err| switch (err) {
         std.debug.print("Port not a valid u16\n", .{});
         return err;
     },
+    error.InvalidHostName => {
+        std.debug.print("Host is not a valid host name\n", .{});
+        return err;
+    },
 };
 ```
 
@@ -77,9 +81,8 @@ const Uri = struct {
     path: Component = Component.empty,
     query: ?Component = null,
     fragment: ?Component = null,
-
-    pub const host_name_max = 255;
 };
+// No host_name_max on Uri: the host-name limit is std.Io.net.HostName.max_len (254).
 ```
 
 ### Component Union
@@ -261,7 +264,7 @@ var buf: [256]u8 = undefined;
 var writer: std.Io.Writer = .fixed(&buf);
 
 // Encode with custom character validation
-std.Uri.Component.percentEncode(&writer, "custom data", struct {
+try std.Uri.Component.percentEncode(&writer, "custom data", struct {
     fn isValid(c: u8) bool {
         return std.ascii.isAlphanumeric(c);
     }
@@ -316,7 +319,7 @@ fn getQueryParam(uri: std.Uri, key: []const u8) ?[]const u8 {
 
     var iter = std.mem.splitScalar(u8, query_str, '&');
     while (iter.next()) |pair| {
-        if (std.mem.indexOfScalar(u8, pair, '=')) |eq_pos| {
+        if (std.mem.findScalar(u8, pair, '=')) |eq_pos| {
             if (std.mem.eql(u8, pair[0..eq_pos], key)) {
                 return pair[eq_pos + 1 ..];
             }
@@ -355,7 +358,7 @@ fn buildUrl(allocator: Allocator, base: []const u8, params: []const [2][]const u
             if (isUnreserved(c)) {
                 try result.append(allocator, c);
             } else {
-                try result.appendSlice(allocator, try std.fmt.allocPrint(allocator, "%{X:0>2}", .{c}));
+                try result.print(allocator, "%{X:0>2}", .{c}); // formats in place, nothing to free
             }
         }
 
@@ -366,7 +369,7 @@ fn buildUrl(allocator: Allocator, base: []const u8, params: []const [2][]const u
             if (isUnreserved(c)) {
                 try result.append(allocator, c);
             } else {
-                try result.appendSlice(allocator, try std.fmt.allocPrint(allocator, "%{X:0>2}", .{c}));
+                try result.print(allocator, "%{X:0>2}", .{c}); // formats in place, nothing to free
             }
         }
     }
@@ -464,6 +467,7 @@ pub const ParseError = error{
     UnexpectedCharacter,  // Invalid character in URI component
     InvalidFormat,        // Malformed URI structure
     InvalidPort,          // Port not a valid u16
+    InvalidHostName,      // host is not a valid host name
 };
 ```
 

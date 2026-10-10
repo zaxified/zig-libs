@@ -1,6 +1,6 @@
 # Zig Style Guide
 
-Official coding conventions from the Zig language reference. These are implemented and enforced by `zig fmt`.
+Official coding conventions from the Zig language reference. Formatting (indentation, spacing, line wrapping) is applied by `zig fmt`; naming conventions are NOT enforced by it -- they are upheld by convention and review.
 
 ## Naming Conventions
 
@@ -178,13 +178,15 @@ fn processRequest(
 /// Caller must **assume** buffer has at least 4 bytes remaining.
 /// This is not checked and will cause undefined behavior if violated.
 fn readU32Le(buf: []const u8) u32 {
-    return std.mem.readInt(u32, buf[0..4], .little);
+    // buf.ptr[0..4] is a many-pointer slice: no bounds check, so the "assume" is real.
+    // (buf[0..4] would be safety-checked, i.e. an "assert" case.)
+    return std.mem.readInt(u32, buf.ptr[0..4], .little);
 }
 
 /// Pops the last element from the list.
 ///
-/// **Asserts** the list is not empty. In safe modes, returns an error
-/// or panics if the list is empty.
+/// **Asserts** the list is not empty. Violating it is safety-checked:
+/// in safe modes it panics (it does not return an error).
 fn pop(self: *Self) T {
     std.debug.assert(self.items.len > 0);
     // ...
@@ -197,7 +199,7 @@ fn pop(self: *Self) T {
 - **LF** (`\n`, 0x0a) line endings (CRLF discouraged but tolerated)
 - End files with a newline
 - No hard tabs (spaces only)
-- `zig fmt` enforces all these conventions
+- `zig fmt` takes care of the formatting parts of these (indentation, tabs, final newline); it does not check naming
 
 ## Applying the Style Guide
 

@@ -196,7 +196,7 @@ var c1 = try std.process.spawn(io, .{
 _ = try c1.wait(io);
 
 // Option 2: directory handle
-var dir = try std.Io.Dir.cwd().openDir(io, "project", .{});
+const dir = try std.Io.Dir.cwd().openDir(io, "project", .{});
 defer dir.close(io);
 var c2 = try std.process.spawn(io, .{
     .argv = &.{"make"},
@@ -252,16 +252,6 @@ var child = try std.process.spawn(io, .{
     .argv = &.{"app.exe"},
     .create_no_window = true,  // hide console window
     .start_suspended = true,   // start paused
-});
-_ = try child.wait(io);
-```
-
-### Darwin-only: Disable ASLR
-
-```zig
-var child = try std.process.spawn(io, .{
-    .argv = &.{"debugee"},
-    .disable_aslr = true,
 });
 _ = try child.wait(io);
 ```
@@ -443,7 +433,7 @@ CWD access now takes an `Io`. `getCwd` / `getCwdAlloc` were renamed to
 
 ```zig
 // Into a provided buffer; returns the number of bytes written.
-var buf: [std.fs.max_path_bytes]u8 = undefined;
+var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 const n = try std.process.currentPath(io, &buf);
 const cwd = buf[0..n];
 _ = cwd;
@@ -459,7 +449,7 @@ Change the working directory with `setCurrentPath` (by path) or `setCurrentDir`
 ```zig
 try std.process.setCurrentPath(io, "/tmp");
 
-var dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
+const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
 defer dir.close(io);
 try std.process.setCurrentDir(io, dir);
 ```
@@ -503,7 +493,7 @@ var env = std.process.Environ.Map.init(gpa);
 defer env.deinit();
 try env.put("PATH", "/bin");
 
-var dir = try std.Io.Dir.cwd().openDir(io, "/bin", .{});
+const dir = try std.Io.Dir.cwd().openDir(io, "/bin", .{});
 defer dir.close(io);
 return std.process.replacePath(io, dir, .{
     .argv = &.{ "echo", "hi" },
@@ -547,7 +537,7 @@ const exe = try std.process.executablePathAlloc(io, gpa);
 defer gpa.free(exe);
 
 // Into a buffer; returns the number of bytes written.
-var buf: [std.fs.max_path_bytes]u8 = undefined;
+var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 const n = try std.process.executablePath(io, &buf);
 const path = buf[0..n];
 _ = path;
@@ -629,13 +619,13 @@ fn getConfigPath(gpa: Allocator, environ: std.process.Environ) ![]const u8 {
     // Fall back to XDG.
     if (environ.getAlloc(gpa, "XDG_CONFIG_HOME")) |xdg| {
         defer gpa.free(xdg);
-        return std.fs.path.join(gpa, &.{ xdg, "myapp", "config.json" });
+        return std.Io.Dir.path.join(gpa, &.{ xdg, "myapp", "config.json" });
     } else |_| {}
 
     // Fall back to HOME.
     const home = try environ.getAlloc(gpa, "HOME");
     defer gpa.free(home);
-    return std.fs.path.join(gpa, &.{ home, ".config", "myapp", "config.json" });
+    return std.Io.Dir.path.join(gpa, &.{ home, ".config", "myapp", "config.json" });
 }
 ```
 

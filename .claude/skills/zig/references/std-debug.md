@@ -63,7 +63,7 @@ std.debug.print("{*}\n", .{&value});       // "i32@7fff5fbff8a0"
 
 // Floats
 std.debug.print("{d}\n", .{3.14159});      // "3.14159"
-std.debug.print("{e}\n", .{1234.5});       // "1.2345e+03"
+std.debug.print("{e}\n", .{1234.5});       // "1.2345e3"
 std.debug.print("{x}\n", .{@as(f32, 1.0)}); // "0x1.0p0"
 
 // Hex dump of bytes
@@ -84,7 +84,7 @@ std.debug.print("{s:_<10}\n", .{"hi"});    // "hi________" (custom fill)
 
 ```zig
 std.debug.print("{d:.2}\n", .{3.14159});   // "3.14"
-std.debug.print("{e:.3}\n", .{1234.5});    // "1.234e+03"
+std.debug.print("{e:.3}\n", .{1234.5});    // "1.234e3"
 std.debug.print("{x:.4}\n", .{@as(f32, 1.0)}); // "0x1.0000p0"
 ```
 
@@ -324,7 +324,7 @@ const sym: Symbol = .{
 };
 
 // Unknown symbol
-const unknown: Symbol = .{};  // name = "???", compile_unit_name = "???"
+const unknown: Symbol = .unknown;  // name, compile_unit_name, source_location all null (the fields have no defaults: `.{}` does not compile)
 ```
 
 ## Segfault Handling
@@ -380,22 +380,33 @@ if (std.debug.inValgrind()) {
 // Get debug info for current executable
 const info = try std.debug.getSelfDebugInfo();
 
-// Get symbol at address
-const symbol = try info.getSymbolAtAddress(allocator, address);
-defer if (symbol.source_location) |sl| allocator.free(sl.file_name);
+// Get the symbols (more than one when inline callers are resolved) at an address.
+// getSymbols(si, io, symbol_allocator, text_arena, address, resolve_inline_callers, *ArrayList(Symbol))
+// Use std.debug.getDebugInfoAllocator(), as std does. An allocator that captures stack traces
+// (DebugAllocator with stack traces, e.g. std.testing.allocator) deadlocks here: it unwinds
+// the stack, which needs the debug-info lock getSymbols already holds (measured on 0.16.0).
+const debug_gpa = std.debug.getDebugInfoAllocator();
+var text_arena: std.heap.ArenaAllocator = .init(debug_gpa); // owns the name/file strings
+defer text_arena.deinit();
+var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+defer symbols.deinit(debug_gpa);
+try info.getSymbols(io, debug_gpa, text_arena.allocator(), address, false, &symbols);
 
-std.debug.print("{s}:{d}: {s}\n", .{
-    symbol.source_location.?.file_name,
-    symbol.source_location.?.line,
-    symbol.name,
-});
+for (symbols.items) |symbol| {
+    const loc = symbol.source_location orelse continue;
+    std.debug.print("{s}:{d}: {s}\n", .{ loc.file_name, loc.line, symbol.name orelse "???" });
+}
 ```
 
 ## Constants
 
 ```zig
-// Whether runtime safety checks are enabled
-std.debug.runtime_safety  // true in Debug/ReleaseSafe
+// Whether runtime safety checks are enabled in YOUR module (std.debug.runtime_safety is
+// deprecated: it reports the standard library's mode, not the caller's)
+const safety_on = switch (@import("builtin").mode) {
+    .Debug, .ReleaseSafe => true,
+    .ReleaseFast, .ReleaseSmall => false,
+};
 
 // Whether platform can produce stack traces
 std.debug.sys_can_stack_trace  // false on WASM, MIPS, etc.
@@ -410,7 +421,6 @@ std.debug.sys_can_stack_trace  // false on WASM, MIPS, etc.
 | `std.debug.Dwarf` | DWARF debug info parser |
 | `std.debug.Pdb` | Windows PDB debug info parser |
 | `std.debug.SelfInfo` | Debug info for current executable |
-| `std.debug.MemoryAccessor` | Safe memory access for unwinding |
 | `std.debug.Coverage` | Code coverage support |
 
 ## FullPanic
@@ -464,6 +474,7 @@ try writer.print("Complex output: {}\n", .{value});
 var buf: [4096]u8 = undefined;
 const held = std.debug.lockStderr(&buf);
 defer std.debug.unlockStderr();
-// held.file_writer is a File.Writer; .interface is the Io.Writer
-try held.file_writer.print("msg: {s}\n", .{text});
+// held.file_writer is a File.Writer (no print of its own); .interface is the Io.Writer
+try held.file_writer.interface.print("msg: {s}\n", .{text});
+try held.file_writer.interface.flush();
 ```

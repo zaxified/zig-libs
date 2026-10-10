@@ -83,7 +83,7 @@ Two failure modes we hit with inline asm (both vanish with LLVM intrinsics):
 - **Loading a comptime array into a vector:** cast to an *array* pointer, not a vector
   pointer (`@as(*align(1) const [16]u8, @ptrCast(p)).*`) — a `*@Vector` deref of comptime
   data errors with "comptime dereference requires … well-defined layout".
-- `@splat(x)` works for arrays too (0.17), and parses cleanly where `[_]T{x} ** N` can trip
+- `@splat(x)` works for arrays too (already in 0.16), and parses cleanly where `[_]T{x} ** N` can trip
   the `**` whitespace rule.
 
 ## Cross-arch validation workflow (Apple Silicon dev box)

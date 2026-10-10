@@ -78,7 +78,7 @@ const config = parseConfig(@embedFile("config.json"));
 | Builtin | Purpose |
 |---------|---------|
 | `@typeInfo(T)` | Get type metadata as `std.builtin.Type` |
-| `@Type(info)` | Create type from `std.builtin.Type` (inverse of `@typeInfo`) |
+| `@Int`, `@Struct`, `@Union`, `@Enum`, `@Pointer`, `@Fn`, `@Tuple` | Create a type (inverse of `@typeInfo`; `@Type` was removed in 0.16) |
 | `@TypeOf(expr)` | Get type of expression |
 | `@typeName(T)` | Get type name as `[:0]const u8` |
 | `@hasDecl(T, name)` | Check if type has declaration |
@@ -294,33 +294,25 @@ Generate a subset union type from a larger union:
 ```zig
 pub fn Subset(comptime T: type, comptime fields: []const std.meta.FieldEnum(T)) type {
     const source_info = @typeInfo(T).@"union";
-    var new_fields: [fields.len]std.builtin.Type.UnionField = undefined;
+    var names: [fields.len][]const u8 = undefined;
+    var types: [fields.len]type = undefined;
+    var attrs: [fields.len]std.builtin.Type.UnionField.Attributes = undefined;
 
     for (fields, 0..) |field_enum, i| {
         const field_name = @tagName(field_enum);
         for (source_info.fields) |source_field| {
             if (std.mem.eql(u8, source_field.name, field_name)) {
-                new_fields[i] = source_field;
+                names[i] = source_field.name;
+                types[i] = source_field.type;
+                attrs[i] = .{ .@"align" = source_field.alignment };
                 break;
             }
         }
     }
 
-    return @Type(.{
-        .@"union" = .{
-            .layout = source_info.layout,
-            .tag_type = std.meta.FieldEnum(@Type(.{
-                .@"union" = .{
-                    .layout = source_info.layout,
-                    .tag_type = null,
-                    .fields = &new_fields,
-                    .decls = &.{},
-                },
-            })),
-            .fields = &new_fields,
-            .decls = &.{},
-        },
-    });
+    // @Type was removed in 0.16: build the type with @Union.
+    const Bare = @Union(source_info.layout, null, &names, &types, &attrs);
+    return @Union(source_info.layout, std.meta.FieldEnum(Bare), &names, &types, &attrs);
 }
 ```
 
@@ -337,13 +329,14 @@ pub fn toFull(comptime Full: type, subset: anytype) Full {
 }
 
 /// Try to narrow full union to subset type.
-pub fn toSubset(comptime Subset: type, full: anytype) ?Subset {
-    const subset_fields = @typeInfo(Subset).@"union".fields;
+pub fn toSubset(comptime Sub: type, full: anytype) ?Sub {
+    const subset_fields = @typeInfo(Sub).@"union".fields;
     return switch (full) {
         inline else => |payload, tag| {
             inline for (subset_fields) |sf| {
-                if (std.mem.eql(u8, sf.name, @tagName(tag))) {
-                    return @unionInit(Subset, sf.name, payload);
+                // comptime: otherwise every branch is analysed and @unionInit gets the wrong payload type
+                if (comptime std.mem.eql(u8, sf.name, @tagName(tag))) {
+                    return @unionInit(Sub, sf.name, payload);
                 }
             }
             return null;

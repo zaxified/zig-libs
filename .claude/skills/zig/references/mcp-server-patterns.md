@@ -1,6 +1,6 @@
 # MCP Server Patterns in Zig
 
-Real-world patterns from [zig-mcp](https://github.com/nzrsky/zig-mcp) — an MCP server that bridges AI assistants to ZLS via LSP. Pure `std` library, no external dependencies, ~2k LoC. Demonstrates protocol bridging, child process management, thread coordination, and JSON-RPC handling in Zig 0.15.2.
+Real-world patterns from [zig-mcp](https://github.com/nzrsky/zig-mcp) — an MCP server that bridges AI assistants to ZLS via LSP. Pure `std` library, no external dependencies, ~2k LoC. Demonstrates protocol bridging, child process management, thread coordination, and JSON-RPC handling. The fragments are excerpts adapted to the Zig 0.17.0 `std.Io` API; they are not a standalone program (surrounding types are elided).
 
 ## Table of Contents
 
@@ -50,28 +50,29 @@ Key insight: MCP uses newline-delimited messages (no headers), LSP uses `Content
 
 ```zig
 pub const McpTransport = struct {
-    stdin_file: std.Io.File,
+    /// `&file_reader.interface` of ONE long-lived `std.Io.File.Reader` over stdin. The
+    /// reader and its buffer outlive the transport and are never recreated per message:
+    /// a fresh buffered reader per call would drop any bytes it had read past the '\n',
+    /// losing pipelined messages.
+    stdin: *std.Io.Reader,
     stdout_file: std.Io.File,
     stdout_mutex: std.Io.Mutex = .init,
 
-    pub fn readMessage(self: *McpTransport, io: std.Io, allocator: std.mem.Allocator) !?[]const u8 {
-        var line: std.ArrayList(u8) = .empty;
-        errdefer line.deinit(allocator);
+    pub const max_message = 1024 * 1024;
 
-        var buf: [4096]u8 = undefined;
-        var reader = self.stdin_file.reader(io, &buf);
+    /// Returns the next non-empty line (owned by the caller), or null at EOF.
+    /// The reader's buffer must be at least `max_message` bytes (otherwise
+    /// `takeDelimiter` reports StreamTooLong earlier).
+    pub fn readMessage(self: *McpTransport, allocator: std.mem.Allocator) !?[]const u8 {
         while (true) {
-            const byte = reader.interface.takeByte() catch |err| switch (err) {
-                error.EndOfStream => { if (line.items.len == 0) return null; break; },
-                else => return err,
-            };
-            if (byte == '\n') break;
-            if (byte == '\r') continue;
-            try line.append(allocator, byte);
-            if (line.items.len > 1024 * 1024) return error.MessageTooLarge;
+            const raw = self.stdin.takeDelimiter('\n') catch |err| switch (err) {
+                error.StreamTooLong => return error.MessageTooLarge,
+                error.ReadFailed => return error.ReadFailed,
+            } orelse return null;
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            if (line.len == 0) continue;
+            return try allocator.dupe(u8, line);
         }
-        if (line.items.len == 0) return null;
-        return try line.toOwnedSlice(allocator);
     }
 
     /// Thread-safe write with mutex (reader thread may trigger writes).
@@ -85,12 +86,17 @@ pub const McpTransport = struct {
         try writer.interface.flush();
     }
 };
+
+// Setup, once, in main:
+//   var stdin_buf: [McpTransport.max_message]u8 = undefined; // static or heap, not a tiny stack
+//   var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
+//   var transport: McpTransport = .{ .stdin = &stdin_reader.interface, .stdout_file = .stdout() };
 ```
 
-- Byte-by-byte read via the buffered `Io.Reader` interface because we need owned memory per message
+- `takeDelimiter('\n')` on one persistent buffered reader; the line is copied (`dupe`) because the reader's buffer is reused by the next call
 - `EndOfStream` → graceful `null` (EOF), not a hard error
 - `Io.Mutex` on stdout for thread safety
-- 1MB limit prevents OOM from malformed input
+- The reader buffer size (1 MiB) is the line-length limit: a longer line gives `StreamTooLong` → `MessageTooLarge`, so malformed input cannot exhaust memory
 
 ---
 
@@ -109,7 +115,8 @@ pub const LspTransport = struct {
             const io = self.io;
             if (self.buf_start >= self.buf_end) {
                 const n = self.file.readStreaming(io, &.{&self.buf}) catch |err| switch (err) {
-                    error.EndOfStream, error.ReadFailed => return null,
+                    error.EndOfStream => return null,
+                    else => return err,
                 };
                 if (n == 0) return null;
                 self.buf_start = 0;
@@ -133,7 +140,8 @@ pub const LspTransport = struct {
                     pos += to_copy;
                 } else {
                     const n = self.file.readStreaming(io, &.{dest[pos..]}) catch |err| switch (err) {
-                        error.EndOfStream, error.ReadFailed => return false,
+                        error.EndOfStream => return false,
+                        else => return err,
                     };
                     if (n == 0) return false;
                     pos += n;
@@ -186,12 +194,12 @@ pub const LspClient = struct {
 
         { try self.pending_mutex.lock(io); defer self.pending_mutex.unlock(io);
           try self.pending.put(self.allocator, id, pending); }
-        errdefer { self.pending_mutex.lock(io) catch {}; defer self.pending_mutex.unlock(io);
+        errdefer { self.pending_mutex.lockUncancelable(io); defer self.pending_mutex.unlock(io);
                    _ = self.pending.remove(id); self.allocator.destroy(pending); }
 
         const msg = try json_rpc.writeRequest(allocator, .{ .integer = id }, method, params);
         defer allocator.free(msg);
-        try LspTransport.writeMessage(stdin, msg);
+        try LspTransport.writeMessage(stdin, io, msg);
 
         // Block with 30s timeout
         pending.event.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } }) catch {
@@ -226,7 +234,7 @@ pub const LspClient = struct {
 ## Arena-Per-Request Memory
 
 ```zig
-pub fn run(self: *McpServer) !void {
+pub fn run(self: *McpServer, io: std.Io) !void {
     while (self.state != .shutdown) {
         const data = (try self.transport.readMessage(self.allocator)) orelse break;
 
@@ -237,7 +245,7 @@ pub fn run(self: *McpServer) !void {
         self.handleMessage(arena.allocator(), data) catch |err| {
             const error_resp = json_rpc.writeError(arena.allocator(), null,
                 json_rpc.ErrorCode.internal_error, "Internal error") catch continue;
-            self.transport.writeMessage(error_resp) catch {};
+            self.transport.writeMessage(io, error_resp) catch {};
         };
         self.allocator.free(data);  // Raw input freed with parent allocator
     }
@@ -284,7 +292,7 @@ pub const ZlsProcess = struct {
             if (child.stdin) |s| { s.close(self.io); child.stdin = null; }
             if (child.stdout) |s| { s.close(self.io); child.stdout = null; }
             if (child.stderr) |s| { s.close(self.io); child.stderr = null; }
-            _ = child.wait(self.io) catch {};
+            if (child.wait(self.io)) |_| {} else |_| {}
             self.child = null;
         }
     }
@@ -356,7 +364,7 @@ pub const Registry = struct {
 ## JSON Building with std.json.Stringify
 
 ```zig
-fn writeToolResult(self: *McpServer, allocator: std.mem.Allocator, id: RequestId, text: []const u8, is_error: bool) !void {
+fn writeToolResult(self: *McpServer, io: std.Io, allocator: std.mem.Allocator, id: RequestId, text: []const u8, is_error: bool) !void {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
 
@@ -377,7 +385,7 @@ fn writeToolResult(self: *McpServer, allocator: std.mem.Allocator, id: RequestId
     try jw.endObject();
 
     const resp = try aw.toOwnedSlice();
-    try self.transport.writeMessage(resp);
+    try self.transport.writeMessage(io, resp);
 }
 ```
 
@@ -388,7 +396,7 @@ Use `std.json.Stringify` + `std.Io.Writer.Allocating` when:
 
 **Gotcha:** Empty anonymous struct `.{}` serializes as `[]` (empty JSON array), NOT `{}`. For tools with no parameters, explicitly build an empty object:
 ```zig
-.properties = .{ .object = std.json.ObjectMap.init(allocator) }  // → {}
+.properties = .{ .object = .empty }  // → {}  (ObjectMap is unmanaged: `.empty`, no allocator)
 // NOT: .properties = .{}  // → [] which breaks MCP clients
 ```
 
@@ -397,19 +405,19 @@ Use `std.json.Stringify` + `std.Io.Writer.Allocating` when:
 ## Lazy Document Sync with Double-Check Locking
 
 ```zig
-pub fn ensureOpen(self: *DocumentState, lsp_client: *LspClient, file_path: []const u8, ret_allocator: std.mem.Allocator) ![]const u8 {
+pub fn ensureOpen(self: *DocumentState, io: std.Io, lsp_client: *LspClient, file_path: []const u8, ret_allocator: std.mem.Allocator) ![]const u8 {
     const file_uri = try uri_util.pathToUri(self.allocator, abs_path);
 
     // Fast path: check under lock
-    { self.mutex.lock(); defer self.mutex.unlock();
+    { try self.mutex.lock(io); defer self.mutex.unlock(io);
       if (self.open_docs.get(file_uri)) |_| return try ret_allocator.dupe(u8, file_uri); }
 
     // Slow path: read file OUTSIDE the lock (no mutex held during I/O)
-    const content = std.Io.Dir.cwd().readFileAlloc(self.allocator, abs_path, 10 * 1024 * 1024) catch ...;
+    const content = std.Io.Dir.cwd().readFileAlloc(io, abs_path, self.allocator, .limited(10 * 1024 * 1024)) catch ...;
     defer self.allocator.free(content);
 
     // Re-acquire lock, double-check, then register
-    self.mutex.lock(); defer self.mutex.unlock();
+    try self.mutex.lock(io); defer self.mutex.unlock(io);
     if (self.open_docs.get(file_uri)) |_| return try ret_allocator.dupe(u8, file_uri);  // Another thread opened it
 
     try lsp_client.sendNotification(arena.allocator(), "textDocument/didOpen", ...);
@@ -553,12 +561,13 @@ fn needsEncoding(c: u8) bool {
 
 ```zig
 fn makeProps(allocator: std.mem.Allocator, comptime fields: anytype) ToolError!std.json.Value {
-    var obj = std.json.ObjectMap.init(allocator);
+    // ObjectMap is unmanaged: `.empty`, and every put takes the allocator.
+    var obj: std.json.ObjectMap = .empty;
     inline for (fields) |field| {
-        var prop = std.json.ObjectMap.init(allocator);
-        prop.put("type", .{ .string = field[1] }) catch return ToolError.OutOfMemory;
-        prop.put("description", .{ .string = field[2] }) catch return ToolError.OutOfMemory;
-        obj.put(field[0], .{ .object = prop }) catch return ToolError.OutOfMemory;
+        var prop: std.json.ObjectMap = .empty;
+        prop.put(allocator, "type", .{ .string = field[1] }) catch return ToolError.OutOfMemory;
+        prop.put(allocator, "description", .{ .string = field[2] }) catch return ToolError.OutOfMemory;
+        obj.put(allocator, field[0], .{ .object = prop }) catch return ToolError.OutOfMemory;
     }
     return .{ .object = obj };
 }
@@ -607,7 +616,7 @@ With `zig build test` pointing at `src/main.zig`, this comptime block forces all
 
 | Issue | Solution |
 |-------|----------|
-| Empty `.{}` serializes as `[]` not `{}` | Use `.{ .object = std.json.ObjectMap.init(alloc) }` |
+| Empty `.{}` serializes as `[]` not `{}` | Use `.{ .object = .empty }` |
 | `std.json.Value = .null` in properties | Breaks MCP client registration — always pass explicit object |
 | `u4` can't be left-shifted by 4 | Widen first: `@as(u8, val) << 4` |
 | `std.process.Child.Term` fields are lowercase (0.16) | `.exited`, `.signal`, `.stopped`, `.unknown` |

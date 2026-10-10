@@ -73,8 +73,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link libc if using std.heap.c_allocator
-    lib.linkLibC();
+    // Link libc if using std.heap.c_allocator (or set .link_libc = true in createModule)
+    lib.root_module.link_libc = true;
 
     b.installArtifact(lib);
 
@@ -281,7 +281,7 @@ const lib = b.addLibrary(.{
     }),
 });
 
-lib.linkLibC();  // If using c_allocator or libc functions
+lib.root_module.link_libc = true;  // If using c_allocator or libc functions
 b.installArtifact(lib);
 ```
 
@@ -299,7 +299,7 @@ const lib = b.addLibrary(.{
     .version = .{ .major = 1, .minor = 0, .patch = 0 },
 });
 
-lib.linkLibC();
+lib.root_module.link_libc = true;
 b.installArtifact(lib);
 ```
 
@@ -803,14 +803,9 @@ export fn alloc_string(len: usize) ?[*:0]u8 {
     return buf.ptr;
 }
 
-export fn free_string(s: ?[*:0]u8) void {
-    if (s) |ptr| {
-        const allocator = std.heap.c_allocator;
-        // Need to know length to free - typically tracked separately
-        // or use c_allocator which can query allocation size
-        _ = allocator;
-        _ = ptr;
-    }
+// The caller passes the length back; Zig's free needs the exact slice.
+export fn free_string(s: ?[*:0]u8, len: usize) void {
+    if (s) |ptr| std.heap.c_allocator.free(ptr[0..len :0]);
 }
 ```
 

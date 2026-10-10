@@ -1,6 +1,6 @@
 ---
 name: zig
-description: "Up-to-date Zig 0.16.0 patterns, checked against the released standard library. Use when writing, reviewing, or debugging Zig code, build.zig and build.zig.zon files, or comptime metaprogramming. Prevents outdated patterns from training data: the std.Io instance threaded through files, sockets, clocks and locks (std.fs to std.Io.Dir/File, std.net to std.Io.net, std.time timestamps and Timer to std.Io.Clock, std.Thread.Mutex/Condition/Pool to std.Io.Mutex/Condition/Group, std.crypto.random to io.randomSecure), main(init: std.process.Init), build system APIs (root_module, Compile methods to Module methods), buffered Reader/Writer with flush, container initialization (.empty/.init), unmanaged ArrayList and HashMap, DebugAllocator, lowercase @typeInfo fields, removed async/await and usingnamespace; plus gotchas found in production code."
+description: "Up-to-date Zig 0.16.0 patterns, checked against the released standard library. Use when writing, reviewing, or debugging Zig code for Zig 0.16.x (zig version / minimum_zig_version in build.zig.zon; a 0.17 project uses the zig-0.17 skill instead), build.zig and build.zig.zon files, or comptime metaprogramming. Prevents outdated patterns from training data: the std.Io instance threaded through files, sockets, clocks and locks (std.fs to std.Io.Dir/File, std.net to std.Io.net, std.time timestamps and Timer to std.Io.Clock, std.Thread.Mutex/Condition/Pool to std.Io.Mutex/Condition/Group, std.crypto.random to io.randomSecure), main(init: std.process.Init), build system APIs (root_module, Compile methods to Module methods), buffered Reader/Writer with flush, container initialization (.empty/.init), unmanaged ArrayList and HashMap, DebugAllocator, lowercase @typeInfo fields, removed async/await and usingnamespace; plus gotchas found in production code."
 license: MIT
 compatibility:
   - claude-code
@@ -57,7 +57,8 @@ pub const foo = other.foo;
 ```
 
 ### `async`/`await` - REMOVED
-Keywords removed from language. Async I/O support is planned for future releases.
+Keywords removed from the language. Concurrency goes through the `std.Io` interface instead
+(`io.async`, `io.concurrent`, `Io.Group`, `Io.Select`).
 
 ### `std.BoundedArray` - REMOVED
 Use `std.ArrayList` with `initBuffer`:
@@ -77,9 +78,10 @@ Replaced by `std.fmt.Alt`.
 ### Undefined Behavior Restrictions (0.15.x)
 Arithmetic on `undefined` is now **illegal**. Only operators that can never trigger Illegal Behavior permit `undefined` as operand.
 ```zig
-// WRONG - compile error in 0.15.x
+// WRONG - illegal behavior: arithmetic on an undefined value (a compile error when the
+// operand is comptime-known, a runtime safety panic or garbage otherwise)
 var n: usize = undefined;
-while (condition) : (n += 1) {}  // ERROR: use of undefined value
+while (condition) : (n += 1) {}
 
 // CORRECT - explicit initialization required
 var n: usize = 0;
@@ -104,76 +106,71 @@ defer conn.stream.close();
 // CORRECT (0.16) — std.Io.net with Io instance
 const addr = try std.Io.net.IpAddress.parse(host, port);
 var server = try addr.listen(io, .{ .reuse_address = true });
-const stream = try server.accept();  // returns Stream directly, no .stream wrapper
-defer stream.close(io);              // close() now takes io
+const stream = try server.accept(io); // returns Stream directly, no .stream wrapper
+defer stream.close(io);               // close() now takes io
 ```
 
 ### Io Runtime Setup
 ```zig
-// Create Io instance at startup, thread it through your program
-var threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});  // init takes (gpa, options)
-var io: std.Io = threaded.io();
+// In an executable, take the Io (and gpa) from main:
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    _ = io;
+}
+// Elsewhere (a library test harness, a C entry point) create one and thread it through:
+var threaded: std.Io.Threaded = .init(gpa, .{}); // init takes (gpa, options)
+defer threaded.deinit();
+const io = threaded.io();
 ```
 
-### Stream Changes
+### Reading and Writing a Stream
 ```zig
-// stream.handle → stream.socket.handle
-std.posix.setsockopt(stream.socket.handle, ...);
+// Buffered reader/writer over the stream, like files; flush the writer.
+var rbuf: [1024]u8 = undefined;
+var wbuf: [1024]u8 = undefined;
+var reader = stream.reader(io, &rbuf);
+var writer = stream.writer(io, &wbuf);
+const line = try reader.interface.takeDelimiterExclusive('\n');
+try writer.interface.print("echo:{s}\n", .{line});
+try writer.interface.flush();
 
-// Io.net.Stream has NO .read() or .writeAll() — use raw C calls for blocking I/O:
-extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
-
-fn writeAll(stream: std.Io.net.Stream, data: []const u8) !void {
-    var rem = data;
-    while (rem.len > 0) {
-        const n = write(stream.socket.handle, rem.ptr, rem.len);
-        if (n <= 0) return error.BrokenPipe;
-        rem = rem[@intCast(n)..];
-    }
-}
-// std.posix.read() still works for reading
+// The raw handle moved: stream.handle → stream.socket.handle
 ```
 
 ### Removed Convenience Functions
 ```zig
-// connectUnixSocket, tcpConnectToHost — removed, use C externs:
-extern "c" fn socket(domain: c_int, typ: c_int, proto: c_int) c_int;
-extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: u32) c_int;
-// IMPORTANT: don't name local variables "socket" or "connect" — shadows extern
+// Connecting: parse an address and connect through Io
+const target = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+const conn = try target.connect(io, .{ .mode = .stream });
+defer conn.close(io);
 
-// std.net.has_unix_sockets → std.Io.net.has_unix_sockets
-// std.posix.close → std.c.close  (posix.close removed)
-// std.posix.write/connect/socket — removed, use std.c.* or extern "c"
+// std.net.has_unix_sockets → std.Io.net.has_unix_sockets; Unix sockets: std.Io.net.UnixAddress
+// std.posix.close/write/connect/socket are gone. Without an Io and already linking libc
+// (`.link_libc = true`), std.c.close/write/socket/connect are the fallback.
 ```
 
 See **[std.net reference](references/std-net.md)** for complete networking documentation.
 
 ## Critical: Time APIs Removed (0.16)
 
-`std.time.timestamp()`, `milliTimestamp()`, `microTimestamp()`, `nanoTimestamp()` are **removed**. Use `std.c.clock_gettime`:
+`std.time.timestamp()`, `milliTimestamp()`, `microTimestamp()`, `nanoTimestamp()`,
+`std.time.Instant` and `std.time.Timer` are **removed**. Clocks are read through the `Io`:
 
 ```zig
 // WRONG (0.16) — removed
 const secs = std.time.timestamp();
 const ms = std.time.milliTimestamp();
 
-// CORRECT — clock_gettime replacement
-fn timestampSec() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    return ts.sec;
-}
-
-fn milliTimestamp() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
-}
+// CORRECT — std.Io.Clock
+const secs = std.Io.Clock.real.now(io).toSeconds();       // wall clock
+const ms = std.Io.Clock.real.now(io).toMilliseconds();
+const t0 = std.Io.Clock.awake.now(io);                     // monotonic, for timing
+const elapsed = t0.durationTo(std.Io.Clock.awake.now(io)); // Io.Duration
 ```
 
-**Note:** `ts.nsec` is signed — use `@divTrunc`, not `/` (0.16 enforces this for signed division).
-
-`std.time.ns_per_s` and the other unit constants are **still present**. `std.time.Instant` and `std.time.Timer` are **also removed** in 0.16 — monotonic timing now goes through `std.Io.Clock` (e.g. `Io.Clock.now(io, .awake)`, `.durationTo()`/`.untilNow()`), which likewise needs an `Io` instance. See [std.time reference](references/std-time.md).
+`std.time.ns_per_s` and the other unit constants are **still present**. Without an `Io` and
+already linking libc, `std.c.clock_gettime(.REALTIME, &ts)` is the fallback (`ts.nsec` is
+signed: `@divTrunc`, not `/`). See [std.time reference](references/std-time.md).
 
 ## Critical: Thread Primitives Removed (0.16)
 
@@ -249,7 +246,8 @@ try stderr.print("msg\n", .{});
 var buf: [4096]u8 = undefined;
 const held = std.debug.lockStderr(&buf);
 defer std.debug.unlockStderr();
-try held.file_writer.print("msg\n", .{});
+try held.file_writer.interface.print("msg\n", .{});
+try held.file_writer.interface.flush();
 ```
 
 ## Critical: `std.crypto.random` Removed (0.16)
@@ -258,15 +256,30 @@ try held.file_writer.print("msg\n", .{});
 // WRONG (0.16) — removed
 std.crypto.random.bytes(&nonce);
 
-// CORRECT — platform-specific
-extern "c" fn arc4random_buf(buf: *anyopaque, nbytes: usize) void;
-arc4random_buf(&nonce, nonce.len);  // macOS + Linux glibc 2.36+
-
-// Linux-only (no glibc dependency):
-_ = std.os.linux.getrandom(buf.ptr, buf.len, 0);
+// CORRECT — through the Io (portable)
+try io.randomSecure(&nonce);
 ```
 
-**Note:** `std.posix.getrandom` does NOT exist in 0.16. If you already have an `io: Io`, the portable option is `io.randomSecure(buffer)` (or seed `std.Random.DefaultCsprng` from it for the full `std.Random` interface) instead of the platform externs above — see [std.crypto reference](references/std-crypto.md).
+For the full `std.Random` interface seed `std.Random.DefaultCsprng` from `io.randomSecure`
+once. Library code with no `Io` on Linux can call the syscall, but must check it — a failed
+or short call leaves the key bytes undefined:
+
+```zig
+fn getrandomChecked(buf: []u8) !void {
+    const linux = std.os.linux;
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const rc = linux.getrandom(buf[filled..].ptr, buf.len - filled, 0);
+        switch (linux.errno(rc)) {
+            .SUCCESS => filled += rc,
+            .INTR => continue,
+            else => return error.GetRandomFailed,
+        }
+    }
+}
+```
+
+`std.posix.getrandom` does not exist. See [std.crypto reference](references/std-crypto.md).
 
 ## Critical: Scoping Rule Tightened (0.16)
 
@@ -461,18 +474,12 @@ var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 ```
 
 ### ArrayList: Unmanaged by Default
-The old `std.ArrayList` (with allocator stored in struct) is now `std.array_list.Managed`.
-The new `std.ArrayList` is **unmanaged** — no allocator field, pass allocator to every method:
+`std.ArrayList` is **unmanaged** — no allocator field, pass the allocator to every method that
+allocates or frees. The managed variant `std.array_list.Managed` is deprecated.
 ```zig
-// NEW default: unmanaged (no allocator field)
 var list: std.ArrayList(u32) = .empty;
+defer list.deinit(allocator);
 try list.append(allocator, 42);
-list.deinit(allocator);
-
-// If you want old behavior (allocator in struct), use Managed:
-var list = std.array_list.Managed(u32).init(allocator);
-try list.append(42);  // no allocator arg needed
-list.deinit();
 ```
 
 ### HashMap: Managed vs Unmanaged
@@ -624,7 +631,7 @@ State machines use `continue :label`:
 state: switch (initial) {
     .idle => continue :state .running,
     .running => if (done) break :state result else continue :state .running,
-    .error => return error.Failed,
+    .failed => return error.Failed,
 }
 ```
 
@@ -646,10 +653,10 @@ HTTP client/server completely restructured — depends only on I/O streams, not 
 // Server now takes Reader/Writer interfaces, not connection directly
 var recv_buffer: [4000]u8 = undefined;
 var send_buffer: [4000]u8 = undefined;
-var conn_reader = connection.stream.reader(io, &recv_buffer);
-var conn_writer = connection.stream.writer(io, &send_buffer);
+var conn_reader = stream.reader(io, &recv_buffer); // stream = try server.accept(io)
+var conn_writer = stream.writer(io, &send_buffer);
 var server = std.http.Server.init(
-    conn_reader.interface(),
+    &conn_reader.interface,
     &conn_writer.interface,
 );
 ```
@@ -663,13 +670,13 @@ var server = std.http.Server.init(
 | `'std.net' has no member 'Stream'` | Networking moved: use `std.Io.net.Stream` (0.16) |
 | `'std.net' has no member 'Address'` | Use `std.Io.net.IpAddress.parse(host, port)` (0.16) |
 | `no field 'addIncludePath' in 'Compile'` | Methods moved: `lib.root_module.addIncludePath(...)` (0.16) |
-| `'timestamp' not found in 'std.time'` | Removed: use `std.c.clock_gettime(.REALTIME, &ts)` (0.16) |
+| `'timestamp' not found in 'std.time'` | Removed (0.16): `std.Io.Clock.real.now(io)` (wall) / `.awake` (monotonic) |
 | `'Mutex' not found in 'std.Thread'` | Removed: use `std.Io.Mutex` (needs `Io`); no `Io`: raw futex on Linux, POSIX `PthreadMutex` shim as last resort (0.16) |
-| `'random' not found in 'std.crypto'` | Removed: use `arc4random_buf` or `std.os.linux.getrandom` (0.16) |
+| `'random' not found in 'std.crypto'` | Removed (0.16): `io.randomSecure(&buf)`; without an `Io`, a checked `std.os.linux.getrandom` loop |
 | `'lockStderrWriter' not found` | Renamed: use `std.debug.lockStderr(&buf)` (0.16) |
 | `local constant shadows declaration` | 0.16 forbids local names matching module-level `extern fn` — rename local |
-| `signed integer division` | Use `@divTrunc(a, b)` not `a / b` for signed integers (0.16) |
-| `no field 'close' in 'posix'` | `std.posix.close` removed: use `_ = std.c.close(fd)` (0.16) |
+| `signed integer division` | Use `@divTrunc(a, b)` (or `@divFloor`) not `a / b` for signed integers |
+| `no field 'close' in 'posix'` | `std.posix.close` removed (0.16): close through the owning `Io` type (`file.close(io)`, `stream.close(io)`); a raw fd with libc linked: `_ = std.c.close(fd)` |
 | `use of undefined value` | Arithmetic on `undefined` is now illegal — initialize explicitly |
 | `type 'f32' cannot represent integer` | Use float literal: `123_456_789.0` not `123_456_789` |
 | `ambiguous format string` | Use `{f}` for format methods |
@@ -688,7 +695,8 @@ var server = std.http.Server.init(
 
 After writing or modifying Zig code, verify with this sequence:
 1. `zig build` — catch compilation errors, match against Quick Fixes above
-2. `zig build test` — run unit tests (Debug; build test runs with LLVM, see below)
+2. `zig build test` — run unit tests (Debug: self-hosted backend on x86_64 Linux unless the
+   build sets `.use_llvm = true`, see below)
 3. Before a release: `zig build test -Doptimize=ReleaseSafe` and `-Doptimize=ReleaseFast` —
    ReleaseSafe keeps the safety checks with the optimizer on; ReleaseFast turns them off and
    shows bugs that exist only in optimized code (inlining, inline-asm constraints, reads of
@@ -776,7 +784,7 @@ Load these references when working with specific modules:
 - **[std.enums](references/std-enums.md)** - EnumSet, EnumMap, EnumArray: bit-backed enum collections
 
 ### Allocators
-- **[std.heap](references/std-allocators.md)** - Allocator selection guide, ArenaAllocator, DebugAllocator, FixedBufferAllocator, MemoryPool, SmpAllocator, ThreadSafeAllocator, StackFallbackAllocator, custom allocator implementation
+- **[std.heap](references/std-allocators.md)** - Allocator selection guide, ArenaAllocator, DebugAllocator, FixedBufferAllocator, MemoryPool, SmpAllocator, StackFallbackAllocator, custom allocator implementation
 
 ### I/O & Files
 - **[std.io](references/std-io.md)** - Reader/Writer API (0.15.x): buffered I/O, streaming, binary data, format strings
@@ -803,7 +811,7 @@ Load these references when working with specific modules:
 
 ### Patterns & Best Practices
 - **[Hardware SIMD intrinsics](references/simd-intrinsics.md)** - Beyond `@Vector`: calling LLVM target intrinsics (`extern fn @"llvm.x86.avx2.pmadd.wd"` / `@"llvm.aarch64.neon.udot…"`) for ops with no `@Vector` form (udot, vpsadbw, vpmaddubsw); why this beats inline asm (optimizer-transparent vs opaque); perf gotchas (natural result layout, comptime mode params, manual unroll); cross-arch validation via Rosetta / static-musl + scp / asm-diff
-- **[Data-Oriented Design](references/data-oriented-design.md)** - **Load when designing data structures for hot paths, large homogeneous collections, compilers/parsers, ECS, or any memory-footprint-bound code.** From Andrew Kelly's DoD talk applied to the Zig compiler: cache-line mental model (CPU fast, memory slow; compute over memoize), struct size/alignment/padding rules, and six shrink-the-struct techniques — indexes instead of pointers (with `enum(u32)` newtype handles), booleans out of band, struct-of-arrays via MultiArrayList, sparse data in hash maps, encodings instead of fat tagged unions, and constraining ranges/dropping derivable data. Includes the compiler case study (token 64→5 B, AST 120→15.6 B, ZIR 54→20.3 B; −22% then −39% wall-clock) and an anti-pattern checklist
+- **[Data-Oriented Design](references/data-oriented-design.md)** - **Load when designing data structures for hot paths, large homogeneous collections, compilers/parsers, ECS, or any memory-footprint-bound code.** From Andrew Kelley's DoD talk applied to the Zig compiler: cache-line mental model (CPU fast, memory slow; compute over memoize), struct size/alignment/padding rules, and six shrink-the-struct techniques — indexes instead of pointers (with `enum(u32)` newtype handles), booleans out of band, struct-of-arrays via MultiArrayList, sparse data in hash maps, encodings instead of fat tagged unions, and constraining ranges/dropping derivable data. Includes the compiler case study (token 64→5 B, AST 120→15.6 B, ZIR 54→20.3 B; −22% then −39% wall-clock) and an anti-pattern checklist
 - **[Quality Tooling](references/quality-tooling.md)** - Coverage (kcov, and why in-file tests wreck the denominator), dead-code detection (nothing finds unused *functions* — compiler laziness, zlint's `unused-decls` covers only constants), duplicate detection (jscpd + the `--max-lines` trap), zlint (⚠️ Homebrew's `zlint` is an X.509 linter), and the built-in fuzzer (`*Smith` signature, corpus economics, coverage plateaus)
 - **[Zig Patterns](references/patterns.md)** - **Load when writing new code or reviewing code quality.** Comprehensive best practices extracted from the Zig standard library: quick patterns (memory/allocators, file I/O, HTTP, JSON, testing, build system) plus idiomatic code patterns covering syntax (closures, context pattern, options structs, destructuring), polymorphism (duck typing, generics, custom formatting, dynamic/static dispatch), safety (diagnostics, error payloads, defer/errdefer, compile-time assertions), and performance (const pointer passing)
 - **[Production Patterns](references/production-patterns.md)** - **Load when building large-scale Zig systems or optimizing performance.** Real-world patterns from Bun, Ghostty, TigerBeetle: modular build systems, CPU feature locking, pre-allocated message pools, counting allocators, SIMD with scalar fallback, intrusive linked lists, cache-line aligned SoA, work-stealing thread pools, SmolStr (15-byte SSO), comptime string maps, EnumUnionType generation, VOPR fuzzing, snapshot testing, edge-biased fuzz generation, platform abstraction facades, Objective-C bridges, opaque C wrappers with RAII, packed struct bitfields, Result union types, radix sort, tournament trees
@@ -820,7 +828,7 @@ Load these references when working with specific modules:
 - **[std.log](references/std-log.md)** - Scoped logging with configurable levels and output
 
 ### Metaprogramming
-- **[Comptime Reference](references/comptime.md)** - Comptime fundamentals, type reflection (`@typeInfo`/`@Type`/`@TypeOf`), loop variants (`comptime for` vs `inline for`), branch elimination, type generation, comptime limitations
+- **[Comptime Reference](references/comptime.md)** - Comptime fundamentals, type reflection (`@typeInfo`, `@TypeOf`; types built with `@Int`/`@Struct`/`@Union`), loop variants (`comptime for` vs `inline for`), branch elimination, type generation, comptime limitations
 - **[std.meta](references/std-meta.md)** - Type introspection, field iteration, stringToEnum, generic programming
 
 ### Compiler Utilities
@@ -840,22 +848,11 @@ Load these references when working with specific modules:
 ### ZLS (Zig Language Server)
 IDE support via Language Server Protocol. Provides autocomplete, go-to-definition, hover docs, diagnostics.
 
-**Version matching rule:** Use ZLS release matching your Zig release (0.15.x ZLS for 0.15.x Zig). Nightly Zig needs nightly ZLS.
+**Version matching rule:** Use the ZLS release matching your Zig release (0.16.x ZLS for 0.16.x Zig). Nightly Zig needs nightly ZLS.
 
-**Installation:**
-```bash
-# VS Code: install "Zig Language" extension (includes ZLS)
-
-# Manual / other editors:
-# Download from https://github.com/zigtools/zls/releases
-# Or build from source:
-git clone https://github.com/zigtools/zls
-cd zls && git checkout 0.15.0  # match your Zig version
-zig build -Doptimize=ReleaseSafe
-
-# Configure:
-zls --config
-```
+**Installation:** the user's decision — point them at https://github.com/zigtools/zls
+(releases, or the VS Code "Zig Language" extension, which bundles it); do not install it on
+their behalf.
 
 **Editor support:** VS Code, Neovim (nvim-lspconfig), Helix, JetBrains, Emacs (lsp-mode), Sublime Text, Kate.
 

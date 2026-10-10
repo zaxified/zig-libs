@@ -362,13 +362,17 @@ defer b.deinit();
 // Arithmetic
 try a.add(&a, &b);
 try a.mul(&a, &b);
-try a.div(&q, &r, &a, &b);  // quotient and remainder
+var q = try Managed.init(allocator);
+defer q.deinit();
+var r = try Managed.init(allocator);
+defer r.deinit();
+try q.divTrunc(&r, &a, &b);  // q = quotient, r = remainder (also divFloor)
 
 // Comparison
 const ord = a.order(b);  // .lt, .eq, or .gt
 
 // Convert to primitive (if fits)
-const val = a.to(i128) catch |err| {
+const val = a.toInt(i128) catch |err| {
     // Value doesn't fit in i128
     return err;
 };
@@ -386,8 +390,9 @@ try c.setString(10, "123456789012345678901234567890");
 const gcd_val = std.math.gcd(@as(u32, 48), @as(u32, 18));  // 6
 
 // Least common multiple
-const lcm_val = try std.math.lcm(@as(u32, 4), @as(u32, 6));  // 12
-// Returns error.Overflow if result doesn't fit
+const lcm_val = std.math.lcm(@as(u32, 4), @as(u32, 6));  // 12
+// Returns @TypeOf(a, b), no error union; an overflowing result is illegal behavior
+// (safety panic). lcm(0, x) == 0.
 ```
 
 ## Gamma Functions

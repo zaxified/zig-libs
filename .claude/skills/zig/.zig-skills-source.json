@@ -1,60 +1,60 @@
 {
   "repository": "https://github.com/zaxified/zig-skills",
-  "tag": "v0.16.0-r3",
-  "commit": "8ccc9ff6491171133f7e831aa5c52c986137b704",
-  "content_id": "59438162f0018414c47d9f22af083f80c803c8e6bbe45e4cf0864a9fed002a68",
+  "tag": "v0.16.0-r4",
+  "commit": "b05d7d2bd9ae0cce227d54fcdd811a958b887ca6",
+  "content_id": "660e7d564da1a505bfb1714590ca0e425babcde006633ae6524210d49e48a70e",
   "files": [
     {
       "path": "SKILL.md",
-      "sha256": "0b08965650e7d4b22d59e7666800eafbaeac78ce0f9f2d5942c37352fe9b3b1a"
+      "sha256": "c3a9bf356aec705bac557b63552dfc1b4fa4ef9adff9523204b12c1467166030"
     },
     {
       "path": "references/builtins.md",
-      "sha256": "6aa0a953506e2ed27dd5fddc2ad517daffbd2e107e6a465c736138a86da8f9a3"
+      "sha256": "608cb82df0214d700e70aa20d3b822640361e4e43d1c22aba5fdaf5b0d80e0b8"
     },
     {
       "path": "references/c-interop.md",
-      "sha256": "33727f2462f633d442ac1e52fd6d677a0b8b624b823372783818dbffea269597"
+      "sha256": "c967ae0d7e5f5fc8ce80bb18a2d5eba91946dc17331eeaff347c29018b22c7b4"
     },
     {
       "path": "references/code-review.md",
-      "sha256": "617d96e5abc5eff21a861caca42334a72135f070a7d7c0b0aab1ecb85b019121"
+      "sha256": "9e3e0b6bfb8ed75be918988bdea0ca65e0cac7878c621e5020d6df72b34d66da"
     },
     {
       "path": "references/comptime.md",
-      "sha256": "0e3804e41333dad865fbb858cf744ef1fef05e98f6d9bbd96a8c079e8ec53427"
+      "sha256": "c56633c5d8969f398cb5470640af236929d7903dc944e02d6a3536d72522d8ea"
     },
     {
       "path": "references/data-oriented-design.md",
-      "sha256": "7790c9336c57e58356f060cbfd1392c6e95aa25df760d98d825036cddcfb01c8"
+      "sha256": "1f0cd3726de8281c8fe65e1a9a66ff4eea22fb96371f6d1d342134c9c0586f0c"
     },
     {
       "path": "references/language.md",
-      "sha256": "81ac5e91a5f8566e7db1324b6386f38da3761f2c86f7e82eb5da58d6949c7731"
+      "sha256": "801d392c3803e003bf331a5272b2f85fa3c10af76e96d062541843ec819f8df8"
     },
     {
       "path": "references/mcp-server-patterns.md",
-      "sha256": "30b572445498b76bf99c00fae17f7c77e86f26f27ba15c130bbd775d2c4eda91"
+      "sha256": "f604193311d9714881a59280fe6396546eaaeb2b56d06365a536878bf62721e7"
     },
     {
       "path": "references/patterns.md",
-      "sha256": "f563e5b5d9724e395df1e982f9fa50e8c5e6c17159d8a0b461150374111e93b6"
+      "sha256": "a2d3c2669d972e1223e95261552661333b0a5a7f9dc633dadd2fbd79a36f4acb"
     },
     {
       "path": "references/production-patterns.md",
-      "sha256": "581e751d014df6080872d4ad146b472753756c900bd39e78b74d21ae6d42f946"
+      "sha256": "3179cc337f05389daa1253e656e49d6ed64e4e5bad1c43492cf3b1447182d58b"
     },
     {
       "path": "references/quality-tooling.md",
-      "sha256": "f410a63398d417247a20eb7f57874b57c3b10864e2750908c0c7c36879c4cd65"
+      "sha256": "d040c5f103f88d309b35c8ef194610dc31c655dd307b5ad5e07678327ded052e"
     },
     {
       "path": "references/simd-intrinsics.md",
-      "sha256": "8831ffdc04dd0109163d261388f3b6a24aa63bc6097187b343f55792d5522e33"
+      "sha256": "a8aaa685a3ade2549f5306c1fb82e5bb13fc17642486961690720a582780f9de"
     },
     {
       "path": "references/std-allocators.md",
-      "sha256": "7e669fce4e198044428cea78fe7bbc9ef13398826a29102ab0482f61dce674e9"
+      "sha256": "c7ddcab0647b0d9b29a8bcd7dff286a4c85b89aa6ab6275ee80a3a3a949a5660"
     },
     {
       "path": "references/std-array-hash-map.md",
@@ -62,11 +62,11 @@
     },
     {
       "path": "references/std-arraylist.md",
-      "sha256": "bb21c45a01fb316a2af22f6cbcace6df5b777ad4366d87c342e6a1c671587b50"
+      "sha256": "9108b5b130cf87bad497689f9edcdc80be7f8dba5a87251da07a5483e80d32fa"
     },
     {
       "path": "references/std-ascii.md",
-      "sha256": "625f5e2a00035c3dcb0abf6d8f03527c6c30023f06822b6ee2f2d2ecb3ce6128"
+      "sha256": "8690e5b5a20b452cb63629696282556574d039470ef62b83119845dab9d83d3d"
     },
     {
       "path": "references/std-atomic.md",
@@ -74,7 +74,7 @@
     },
     {
       "path": "references/std-base64.md",
-      "sha256": "43cba009d61b0dd71b98098591af28f30831064c218e2f57f1225fefc3cf2bf0"
+      "sha256": "bab6c3ac08977f1cc1ed6065028772613c1c2fdc438ba24b5d2af9fe27835cc2"
     },
     {
       "path": "references/std-bit-set.md",
@@ -82,91 +82,91 @@
     },
     {
       "path": "references/std-buf-map.md",
-      "sha256": "daea28d6099309fd9c7fd10e854cd8b38e0eb68ef0d50230d547e84771026736"
+      "sha256": "19ac51dc1a5bbef8006129fe0f2ae1ba5ad2e100805932ed0f699a010e1110cc"
     },
     {
       "path": "references/std-build.md",
-      "sha256": "d11183ffa5b128fa57c0f2bf3fd5523dd4896d62f44b263251738ae4ef4d3853"
+      "sha256": "abfa55762c86375a98c5e9130a5397760a74ebc2c00bc621351601bc6fb61128"
     },
     {
       "path": "references/std-c.md",
-      "sha256": "fe4da70b789cf0ba3d4098d444ac48518cdc7f058937726cae1f67b9ae9a070e"
+      "sha256": "eb01d70a5857a3ef4067b0510239a0cf109de3955c9b6d885f4685a082d082ba"
     },
     {
       "path": "references/std-compress.md",
-      "sha256": "c466a4735f429bd390aa13dd1d84b065a307016e1c4360644b98e5fdaf389a73"
+      "sha256": "f717b3ceca6cc55c947ec3f712e6a2f430cdf476788710d9f3d3c3faca5e7828"
     },
     {
       "path": "references/std-crypto.md",
-      "sha256": "22ce6387be99b2090d988a30d0d292c4642bf62bbdbf552861c1369cd505bc83"
+      "sha256": "62de6347805f926d1fc869b747062e7a0466cb2aeaabbcc6bc06010415b705ee"
     },
     {
       "path": "references/std-debug.md",
-      "sha256": "2b42d363674dc39dc1ef75994ef0623bc87a5ef9a650b8dd23126b01a42c8b5a"
+      "sha256": "5675eb4b0ead6691aa556e4302fdc0185c30f97fd750c625f6d092b004b42191"
     },
     {
       "path": "references/std-enums.md",
-      "sha256": "b6e3b99551b703951f81a42778a100460285c789f303c544d98e23b055a2024d"
+      "sha256": "8cbdd80a61ec1fe6f0dc54070746c507e35f48bdb30dd0bc30b8686c7d91ddba"
     },
     {
       "path": "references/std-fmt.md",
-      "sha256": "81b80a5097bf56443475da6def075f7b11414159e925f3c18f3d754c09a9e61f"
+      "sha256": "85b3dff87371bece51236e9ff91090da4bc90c25ee239719ff9341bfebcda93d"
     },
     {
       "path": "references/std-fs.md",
-      "sha256": "adac91e5d9a15023f23ea3bb069041154055abe77638df82042374ebd88bf100"
+      "sha256": "ad955f025e8c1b0562779d9652d32aa6e05197f2bc9a4e95bd0b20b5f2e34ba9"
     },
     {
       "path": "references/std-hash.md",
-      "sha256": "cfa6aa4156e34a496e170e828f82bb57de5848cd8812e9c186956bdb9eaf1675"
+      "sha256": "617979ed79387b154f98de8c94be7c2d2fcb94334ae6c8a82dca2bc38614916e"
     },
     {
       "path": "references/std-hashmap.md",
-      "sha256": "48d587b2ceaf877fd3be0809720bc4baeb983b8cfc33aa5367a4aae1ea60a2df"
+      "sha256": "d855bacf29f3a997b58e492f95e5efcf99afde01a5ac17a25575bf055d318240"
     },
     {
       "path": "references/std-http.md",
-      "sha256": "8c08d28e810baa76887b733122109e79044eeecdd114459a8a862609d32c7642"
+      "sha256": "70ec25644e7414a547e4a0fab1e6f5f458bc179c3a7bbc804bbb9fe1704dac74"
     },
     {
       "path": "references/std-io.md",
-      "sha256": "d93b5fb8ab2356640dbe4cfed9d85b2fb0d0066d04a8681113b51a02ff1b0df9"
+      "sha256": "97c98635af0a6619b8a7a90f73dbc12d08b647bc9cbf6e2e5c40dabb4de63cf0"
     },
     {
       "path": "references/std-json.md",
-      "sha256": "b11f5b44c482fdf356e8a71c0356642fdecbf6f026985bda5bce6025b807acf6"
+      "sha256": "4c3ae5d486f2cff2cfa688199fff027608f0c68f2225ab7aa7e207c25e741779"
     },
     {
       "path": "references/std-linked-list.md",
-      "sha256": "2aa1e4876c02d7d28999b410f06fea5ef41e5fa4ed2af4caabc3228e09f6570f"
+      "sha256": "92c9e6446ebfc76589b6914e7210de73a1f70f535c8ce4e374ced3076bbe075c"
     },
     {
       "path": "references/std-log.md",
-      "sha256": "b1ff2c4067b6f5d0423473d82f5dde813ee2a4e6982bf6cc4f41e99b39a5d0fc"
+      "sha256": "22b83bacf0789fc7b8c6b8647a6c2186f61ea18768d615114c81d7a11f6aa788"
     },
     {
       "path": "references/std-math.md",
-      "sha256": "c7eb5cbc0ba32f159c223c35442894206b51c177eab2c24a16c74da5b253b3fb"
+      "sha256": "f018849c20237c9655b8cc0675e8d5177e859bc5bbf4554ac09d0a99e2c7b312"
     },
     {
       "path": "references/std-mem.md",
-      "sha256": "1bf728c15adb961830b21a40ae0a38a7e438bbb32610f2bdb5db738533b8fe5b"
+      "sha256": "5406605d8e45615b5a82cddddf86e9aeaab78b6ed2991655f09983cfd0910ae1"
     },
     {
       "path": "references/std-meta.md",
-      "sha256": "033590bbaf9e5eee45dce1bcff48684091a0d09bfc27e8e3c4021aeb1b782803"
+      "sha256": "79f0862109fb39decde064fdd874234456f9e3e7109d2bf579c89cae8dcc3ebe"
     },
     {
       "path": "references/std-multi-array-list.md",
-      "sha256": "f5ea44050593d7b00e1eb720246dc9fc7e50cea4ced6faa7beeed9c77e69a0bd"
+      "sha256": "ce431c617c86f8559ebb6480f0523ecd0f7a47d3e32883b532c629b89daf3441"
     },
     {
       "path": "references/std-net.md",
-      "sha256": "0aa9ae3b705c97bd2f2d69d8e9b5917144980b36682058a48b452e4933cd4aab"
+      "sha256": "b82c82de5165589284a4830e1f2ee5cf2bd9b47254644399d2ad1e3bfa25fc18"
     },
     {
       "path": "references/std-os.md",
-      "sha256": "b472b535b044cc96dbdffe20b5cb01a5c38c4dc53e550450fabe9395226ed1f6"
+      "sha256": "5106c9b1864cc502dd2a3ea2250d36d41eae312003878f84c2082e2756babfd8"
     },
     {
       "path": "references/std-priority-dequeue.md",
@@ -178,11 +178,11 @@
     },
     {
       "path": "references/std-process.md",
-      "sha256": "28bb288ee6a1897f052f77557756fe5798e8089f58cfd82b196b0821f1e91c56"
+      "sha256": "4c8b0cd3d3e16f821951dcfa5afb277b7717ec307c8796edf44793fd2c25af8b"
     },
     {
       "path": "references/std-random.md",
-      "sha256": "20236be5c07bf10cc7f2ef77ef8b82bb13cdce7b9107d86a4599d55b8e102a1f"
+      "sha256": "e2c0f9219839c6055bd276134b25dce2b15961834fd6327ee91ff30003169f14"
     },
     {
       "path": "references/std-segmented-list.md",
@@ -190,31 +190,31 @@
     },
     {
       "path": "references/std-simd.md",
-      "sha256": "c62a1421c1de8d2c9ead7b9a76c74b11e0441a814de37f571e8420106336589a"
+      "sha256": "2cfc9f4cb1b6e8966e4d070dcaaaf35644c80e41507fd152e2385376a5387c4a"
     },
     {
       "path": "references/std-sort.md",
-      "sha256": "e724cbabe48c8f7be1c73ba746f4a95424f5364c947de394759e96086feaddd3"
+      "sha256": "6319b914e66a024cc35bc03595793a779165886d1947f6c55545268e20546be6"
     },
     {
       "path": "references/std-static-string-map.md",
-      "sha256": "52be57c62161d3968097bf37e2bb68b6f08578f68f7310728b26fef3bcb1584c"
+      "sha256": "c474cdae8be6dcd7df77ed2d49298783605b8f53aa2410e6cbd7a58e1b03c7e8"
     },
     {
       "path": "references/std-tar.md",
-      "sha256": "05a362701f7ccf08915c83b95f625d990aa95d988562b2b6875ca00f88030461"
+      "sha256": "5d1552e129cd0f08f3ff6be5b2bfe188f530190e0ac0f1ee2955cf71fe1ad1db"
     },
     {
       "path": "references/std-testing.md",
-      "sha256": "91a634909d44bcbe4875a20edd3c782a657a91c2844410d823b086ca0804a1b5"
+      "sha256": "e09cfb90767b0c9d0cebf8f254417efa78182812c71a5307d40c5ccbff7b1abf"
     },
     {
       "path": "references/std-thread.md",
-      "sha256": "2058b72b4aa8aca075fc36f554bda0c9c62844c0c124678c46a750a9095b5853"
+      "sha256": "e86a26161f12bcd027cf481980ccfe6e678e99bb2d780e255460d1a3ec8fee04"
     },
     {
       "path": "references/std-time.md",
-      "sha256": "8bfb23b9d47034b805303c5aa771c8622efd9a790244aabcbaabdcfd19c4f3b7"
+      "sha256": "b9a8f57315cd56e59a83d624e83f76e3e28fc3f155af9c34e1c42dec76b736dc"
     },
     {
       "path": "references/std-treap.md",
@@ -226,31 +226,31 @@
     },
     {
       "path": "references/std-unicode.md",
-      "sha256": "cdae2d34ae63ed0507fdfa13189f7953a5fdbc506a84462146b1c9d623f21a34"
+      "sha256": "be8230e509b32a6b1c57dae423574775c9865618fcd4a52d93eed34d0ba933af"
     },
     {
       "path": "references/std-uri.md",
-      "sha256": "b06453033110d5c46ffc0588d8bade56b8443fd284f17cd601dc9a4f863f73b5"
+      "sha256": "739a57a3df14884fd6b32f30e027692f849ea439f918b6c4d8e3108c577a940f"
     },
     {
       "path": "references/std-zig.md",
-      "sha256": "3da202e032eaef42586003ccb0da8a959bd60d974b2545eaec80afe434dc119c"
+      "sha256": "8da13e3bb1fec380abffc535be7e371eeb0a82a19c95aa37e7a9a9b42339991d"
     },
     {
       "path": "references/std-zip.md",
-      "sha256": "182271e54d558b1613f957222044fbf750246d1314c9d0dec0c3e751af135bfd"
+      "sha256": "82056daa2d955cd0c03504ca96c2adf1b390bff08ea587354677ebd9df62a016"
     },
     {
       "path": "references/std-zon.md",
-      "sha256": "9ffb77b1dbebebfdae655960331bb1eb62e273c10ce223573d9c70d35a6341c0"
+      "sha256": "9812fa0d0ebbbe0b2d014cd555e6618fc4a66bffc7eb026d5dea0a58c8777b54"
     },
     {
       "path": "references/style-guide.md",
-      "sha256": "43e387c2b79f7bd35fe7ba3e7a0d26ae60e803eb83d13e0b664316ab99446cc6"
+      "sha256": "4d1444d51421675dd78025efc52cb94ed5371c844c8a64c295553c0272356a0f"
     },
     {
       "path": "references/zig-016-gotchas.md",
-      "sha256": "1b498bd0ecaf93b056d0c6fb76875370035136b30f9125c27b444e9904017b3e"
+      "sha256": "f038ab40dd89e6069a4c61bdcb4a1d93b61944dc165b084ecf8148096aefcc7a"
     }
   ]
 }

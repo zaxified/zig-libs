@@ -120,13 +120,20 @@ const utf8 = utf8_buf[0..len];
 ### ArrayList Conversion
 
 ```zig
-var list = std.ArrayList(u16).empty;
+// utf8ToUtf16LeArrayList / utf16LeToUtf8ArrayList take the deprecated
+// std.array_list.Managed, not the unmanaged ArrayList. With an unmanaged list,
+// convert with the Alloc variants and append:
+var list: std.ArrayList(u16) = .empty;
 defer list.deinit(allocator);
-try unicode.utf8ToUtf16LeArrayList(&list, "hello");
+const utf16 = try unicode.utf8ToUtf16LeAlloc(allocator, "hello");
+defer allocator.free(utf16);
+try list.appendSlice(allocator, utf16);
 
-var list8 = std.ArrayList(u8).empty;
+var list8: std.ArrayList(u8) = .empty;
 defer list8.deinit(allocator);
-try unicode.utf16LeToUtf8ArrayList(&list8, utf16_data);
+const utf8 = try unicode.utf16LeToUtf8Alloc(allocator, list.items);
+defer allocator.free(utf8);
+try list8.appendSlice(allocator, utf8);
 ```
 
 ### Comptime String Literals

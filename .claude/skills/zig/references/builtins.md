@@ -170,7 +170,7 @@ Integer → error. Return type inferred.
 
 ### @intFromError
 ```zig
-@intFromError(err: anytype) std.meta.Int(.unsigned, @bitSizeOf(anyerror))
+@intFromError(err: anytype) @Int(.unsigned, @bitSizeOf(anyerror))
 ```
 Error → integer.
 
@@ -488,11 +488,28 @@ if (info == .@"struct") {
 }
 ```
 
-### @Type
+### Type-creating builtins (`@Type` was removed in 0.16)
 ```zig
-@Type(comptime info: std.builtin.Type) type
+@Int(comptime signedness: std.builtin.Signedness, comptime bits: u16) type
+@Tuple(comptime field_types: []const type) type
+@Struct(layout: std.builtin.Type.ContainerLayout, BackingInt: ?type,
+        field_names: []const []const u8, field_types: *const [field_names.len]type,
+        field_attrs: *const [field_names.len]std.builtin.Type.StructField.Attributes) type
+@Union(layout: std.builtin.Type.ContainerLayout, ArgType: ?type, // tag type, or backing int if packed
+       field_names: []const []const u8, field_types: *const [field_names.len]type,
+       field_attrs: *const [field_names.len]std.builtin.Type.UnionField.Attributes) type
+@Enum(TagInt: type, mode: std.builtin.Type.Enum.Mode,
+      field_names: []const []const u8, field_values: *const [field_names.len]TagInt) type
+@Pointer(size: std.builtin.Type.Pointer.Size, attrs: std.builtin.Type.Pointer.Attributes,
+         Element: type, sentinel: ?Element) type
+@Fn(param_types: []const type, param_attrs: *const [param_types.len]std.builtin.Type.Fn.Param.Attributes,
+    ReturnType: type, attrs: std.builtin.Type.Fn.Attributes) type
 ```
-Create type from type info (inverse of `@typeInfo`).
+All arguments are comptime. `@splat(.{})` gives default attributes for every field:
+```zig
+const U10 = @Int(.unsigned, 10);
+const Point = @Struct(.auto, null, &.{ "x", "y" }, &.{ f32, f32 }, &@splat(.{}));
+```
 
 ### @typeName
 ```zig
@@ -535,13 +552,14 @@ Get type of a struct field.
 
 ### @fieldParentPtr
 ```zig
-@fieldParentPtr(field_ptr: anytype, comptime field_name: []const u8) anytype
+@fieldParentPtr(comptime field_name: []const u8, field_ptr: *T) anytype
 ```
 Get pointer to containing struct from field pointer (for intrusive data structures).
 ```zig
 const Node = struct { data: u32, hook: Hook };
 fn getNode(hook: *Hook) *Node {
-    return @fieldParentPtr(hook, "hook");
+    // @alignCast when the parent struct is more aligned than the field's type
+    return @alignCast(@fieldParentPtr("hook", hook));
 }
 ```
 
@@ -682,8 +700,9 @@ Rearrange vector elements using mask.
 ```zig
 const a: @Vector(4, i32) = .{ 1, 2, 3, 4 };
 const b: @Vector(4, i32) = .{ 5, 6, 7, 8 };
-const result = @shuffle(i32, a, b, .{ 0, 4, 1, 5 });  // {1, 5, 2, 6}
-// Positive indices select from a, indices >= len select from b
+const result = @shuffle(i32, a, b, @Vector(4, i32){ 0, ~@as(i32, 0), 1, ~@as(i32, 1) }); // {1, 5, 2, 6}
+// Non-negative indices select from a; negative ones from b (-1 = b[0], so write ~i).
+// An out-of-bounds index is a compile error.
 ```
 
 ### @select

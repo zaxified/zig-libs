@@ -98,11 +98,19 @@ while (iter.next()) |entry| {
     const value = entry.value_ptr.*;
 }
 
-// Keys only
-for (map.keys()) |key| { }
+// Keys only (keys()/values() slices exist only on the array hash maps)
+var kit = map.keyIterator();
+while (kit.next()) |key_ptr| {
+    const key = key_ptr.*;
+    _ = key;
+}
 
 // Values only
-for (map.values()) |value| { }
+var vit = map.valueIterator();
+while (vit.next()) |value_ptr| {
+    const value = value_ptr.*;
+    _ = value;
+}
 ```
 
 ## Capacity

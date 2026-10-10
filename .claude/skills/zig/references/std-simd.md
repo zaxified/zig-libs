@@ -91,7 +91,7 @@ const vec2: @Vector(2, f32) = arr[1..3].*;
 
 // Runtime offset with comptime length
 const slice: []const f32 = &arr;
-var offset: usize = 1;
+const offset: usize = 1; // runtime-known in real code; never `var` unless mutated
 const vec3: @Vector(2, f32) = slice[offset..][0..2].*;
 ```
 

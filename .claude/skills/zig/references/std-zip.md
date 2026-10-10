@@ -80,7 +80,7 @@ var file_reader = file.reader(io, &buf);
 
 var iter = try std.zip.Iterator.init(&file_reader);
 
-var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
+var filename_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 while (try iter.next()) |entry| {
     // Read filename from archive
     try file_reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
@@ -120,7 +120,7 @@ pub const Entry = struct {
 ```zig
 var iter = try std.zip.Iterator.init(&file_reader);
 
-var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
+var filename_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 while (try iter.next()) |entry| {
     // Extract this entry to destination directory
     try entry.extract(&file_reader, .{}, &filename_buf, output_dir);
@@ -134,7 +134,7 @@ Extract only specific files:
 ```zig
 var iter = try std.zip.Iterator.init(&file_reader);
 
-var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
+var filename_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 while (try iter.next()) |entry| {
     // Read filename first
     try file_reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
@@ -264,7 +264,7 @@ fn listZip(io: std.Io, zip_path: []const u8) !void {
 
     var iter = try std.zip.Iterator.init(&file_reader);
 
-    var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var filename_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var total_size: u64 = 0;
     var file_count: u64 = 0;
 
@@ -303,7 +303,7 @@ fn extractFile(
 ) !bool {
     var iter = try std.zip.Iterator.init(file_reader);
 
-    var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var filename_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     while (try iter.next()) |entry| {
         try file_reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
         const filename = filename_buf[0..entry.filename_len];
