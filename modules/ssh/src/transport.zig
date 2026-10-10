@@ -39,6 +39,7 @@ const Sha384 = std.crypto.hash.sha2.Sha384;
 const P256 = std.crypto.ecc.P256;
 const P384 = std.crypto.ecc.P384;
 const Aes128 = std.crypto.core.aes.Aes128;
+const Aes192 = @import("aes192").Aes192;
 const Aes256 = std.crypto.core.aes.Aes256;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
@@ -163,6 +164,7 @@ pub const encryption_algorithms = [_][]const u8{
     "aes256-gcm@openssh.com",
     "aes128-gcm@openssh.com",
     "aes128-ctr",
+    "aes192-ctr",
 };
 
 /// MAC algorithms this client offers. Not used with
@@ -695,7 +697,7 @@ pub const NoneState = struct {
 pub const AesCtrHmacState = struct {
     /// The first 16 (`aes128`) or all 32 (`aes256`) bytes are the key.
     enc_key: [32]u8,
-    key_bits: enum { aes128, aes256 },
+    key_bits: enum { aes128, aes192, aes256 },
     enc_iv: [16]u8,
     /// The first `macLen()` bytes are the HMAC key (RFC 6668: key = output size).
     mac_key: [64]u8,
@@ -757,6 +759,7 @@ fn packetMac(st: *const AesCtrHmacState, seq: u32, parts: []const []const u8, ou
 fn ctrXor(st: *const AesCtrHmacState, counter: *[16]u8, data: []u8) void {
     switch (st.key_bits) {
         .aes128 => aesCtrXor(Aes128.initEnc(st.enc_key[0..16].*), counter, data),
+        .aes192 => aesCtrXor(Aes192.initEnc(st.enc_key[0..24].*), counter, data),
         .aes256 => aesCtrXor(Aes256.initEnc(st.enc_key), counter, data),
     }
 }
@@ -2692,13 +2695,22 @@ fn buildCipher(name: []const u8, mac_name: ?[]const u8, dir: Direction, kr: *con
             .key_header = km[32..64].*,
             .sequence_number = seq,
         } };
-    } else if (std.mem.eql(u8, name, "aes256-ctr") or std.mem.eql(u8, name, "aes128-ctr")) {
+    } else if (std.mem.eql(u8, name, "aes256-ctr") or std.mem.eql(u8, name, "aes192-ctr") or
+        std.mem.eql(u8, name, "aes128-ctr"))
+    {
         const m = MacAlgorithm.fromName(mac_name orelse return error.UnsupportedAlgorithm) orelse
             return error.UnsupportedAlgorithm;
-        const is256 = std.mem.eql(u8, name, "aes256-ctr");
+        const kb: @FieldType(AesCtrHmacState, "key_bits") = if (std.mem.eql(u8, name, "aes256-ctr"))
+            .aes256
+        else if (std.mem.eql(u8, name, "aes192-ctr")) .aes192 else .aes128;
+        const key_len: usize = switch (kb) {
+            .aes128 => 16,
+            .aes192 => 24,
+            .aes256 => 32,
+        };
         var st: AesCtrHmacState = .{
             .enc_key = @splat(0),
-            .key_bits = if (is256) .aes256 else .aes128,
+            .key_bits = kb,
             .enc_iv = undefined,
             .mac_key = @splat(0),
             .mac = m[0],
@@ -2706,7 +2718,7 @@ fn buildCipher(name: []const u8, mac_name: ?[]const u8, dir: Direction, kr: *con
             .sequence_number = seq,
         };
         deriveKey(&st.enc_iv, if (dir == .c2s) 'A' else 'B', k_enc, h, sid, hl);
-        deriveKey(st.enc_key[0..if (is256) @as(usize, 32) else 16], if (dir == .c2s) 'C' else 'D', k_enc, h, sid, hl);
+        deriveKey(st.enc_key[0..key_len], if (dir == .c2s) 'C' else 'D', k_enc, h, sid, hl);
         // RFC 6668 §2: the HMAC key is as long as its output.
         deriveKey(st.mac_key[0..m[0].len()], if (dir == .c2s) 'E' else 'F', k_enc, h, sid, hl);
         return .{ .aes_ctr_hmac = st };
@@ -4300,9 +4312,9 @@ test "chacha20-poly1305@openssh detects tampering" {
 
 /// Every AES-CTR + HMAC combination `buildCipher` can install.
 const ctr_combos = blk: {
-    var out: [8]AesCtrHmacState = undefined;
+    var out: [12]AesCtrHmacState = undefined;
     var i: usize = 0;
-    for ([_]@FieldType(AesCtrHmacState, "key_bits"){ .aes128, .aes256 }) |kb| {
+    for ([_]@FieldType(AesCtrHmacState, "key_bits"){ .aes128, .aes192, .aes256 }) |kb| {
         for ([_]MacAlgorithm{ .hmac_sha2_256, .hmac_sha2_512 }) |m| {
             for ([_]bool{ false, true }) |etm| {
                 out[i] = .{
@@ -4321,7 +4333,7 @@ const ctr_combos = blk: {
     break :blk out;
 };
 
-test "packet codec round-trip: aes128/256-ctr × hmac-sha2-256/512 × EtM or not (multi-packet)" {
+test "packet codec round-trip: aes128/192/256-ctr × hmac-sha2-256/512 × EtM or not (multi-packet)" {
     const t = std.testing;
     for (ctr_combos) |combo| {
         var wc: CipherState = .{ .aes_ctr_hmac = combo };
@@ -4394,7 +4406,7 @@ test "buildCipher: the negotiated MAC name selects the HMAC and the EtM framing"
     var kr: KexResult = .{};
     kr.hash_len = 32;
     const sid = [_]u8{0x11} ** 32;
-    for ([_][]const u8{ "aes128-ctr", "aes256-ctr" }) |cipher| {
+    for ([_][]const u8{ "aes128-ctr", "aes192-ctr", "aes256-ctr" }) |cipher| {
         for (mac_algorithms) |mac| {
             const cs = try buildCipher(cipher, mac, .c2s, &kr, &sid, 0);
             const m = MacAlgorithm.fromName(mac).?;
@@ -5341,6 +5353,10 @@ test "dhGexKex (client) group checks: bit length, parity, generator range" {
     try t.expect(!gexRejectsPeerValue(&[_]u8{ 0x01, 0x00 }, &[_]u8{0xfe}));
     try t.expectEqual(@as(usize, 2048), magnitudeBits(&([_]u8{0x80} ++ [_]u8{0} ** 255)));
     try t.expectEqual(@as(usize, 2047), magnitudeBits(&([_]u8{0x7f} ++ [_]u8{0} ** 255)));
+}
+
+test "live interop against OpenSSH sshd — aes192-ctr" {
+    try liveInterop("curve25519-sha256", "aes192-ctr");
 }
 
 test "live interop against OpenSSH sshd — ecdh-sha2-nistp256" {

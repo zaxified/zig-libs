@@ -2807,6 +2807,10 @@ test "live interop: OpenSSH ssh client → our server — diffie-hellman-group-e
     try liveOpensshClient("ed25519", "ssh-ed25519", "diffie-hellman-group-exchange-sha256", "aes256-ctr");
 }
 
+test "live interop: OpenSSH ssh client → our server — aes192-ctr" {
+    try liveOpensshClient("ed25519", "ssh-ed25519", "curve25519-sha256", "aes192-ctr");
+}
+
 test "live interop: OpenSSH ssh client → our server — ecdh-sha2-nistp256" {
     try liveOpensshClient("ed25519", "ssh-ed25519", "ecdh-sha2-nistp256", "aes256-ctr");
 }

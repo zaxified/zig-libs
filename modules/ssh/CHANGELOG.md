@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Added:** `aes192-ctr` (RFC 4344), offered after `aes128-ctr`, over the new `aes192`
+  module (std 0.16 has no AES-192); `meta.deps` gains `aes192`. Packet codec round-trips for every MAC,
+  live interop against OpenSSH 10.2 in both roles.
 - **2026-10-10** — **Added:** `diffie-hellman-group-exchange-sha256` (RFC 4419), offered by default after
   the NIST ECDH methods. Client: asks (2048, 2048, 8192) like Go, accepts a prime of 2048..8192 bits
   (odd, 1 < g < p-1; not primality-tested, as in Go and OpenSSH) and runs the exchange on montint's
