@@ -32,7 +32,7 @@ one-star crypto grab-bag (`Jesssullivan/zig-crypto`, licence "Other", not read).
 
 **Where we are ahead:** the only pure-Zig CBC; padding helpers with a documented padding-oracle
 posture (branch-free unpad, both PKCS#7 and the XML-Enc variant) and no allocation. **Where we
-are behind:** no incremental/streaming API, no AES-192 (a `std` gap: no third `Aes` type exists),
+are behind:** no incremental/streaming API,
 no padding schemes beyond PKCS#7/XML-Enc (→ Backlog).
 
 Raw AES-CBC (NIST SP800-38A §6.2) over `std.crypto.core.aes`'s
@@ -152,25 +152,23 @@ the oracle on their own**:
   without an authentication step ahead of or after it (prefer ahead of, per
   `jwe`'s verify-before-decrypt shape).
 
-## AES-192 exclusion
+## AES-192
 
-`std.crypto.core.aes` in Zig 0.16 exports only `Aes128`/`Aes256` — no AES-192
-key schedule exists in any backend (aesni/armcrypto/soft). Because this
-module is `comptime`-generic over the block-cipher type rather than
-dispatching on a runtime key-length enum (unlike `jwe`'s `Enc`/`xmlenc`'s
-`classifyContent`, which pick a cipher from a wire algorithm identifier),
-there is no third type to pass for AES-192 — an attempted call is a
-**compile error** (no matching `Aes` type), not a runtime
-`error.UnsupportedKeyLength`. Callers that dispatch on a runtime algorithm
-identifier (as `jwe` and `xmlenc` both do) are expected to reject AES-192
-themselves, before ever reaching this module — exactly as
-`jwe/src/enc.zig`'s `A192CBC-HS384` arm and `xmlenc/src/root.zig`'s
-`classifyContent` already do today.
+`std.crypto.core.aes` in Zig 0.16 exports only `Aes128`/`Aes256`. Since
+2026-10-10 the `aes192` module supplies `Aes192` with the same declarations
+(`key_bits`, `initEnc`, `initDec`, the contexts' `encrypt`/`decrypt`), and
+because this module is `comptime`-generic over the block-cipher type it takes
+it with no code change: `encrypt(aes192.Aes192, &key24, iv, …)`. aescbc does
+not depend on `aes192` (only its tests do, through `test_deps`); a caller
+passes the type. Anchored by SP800-38A F.2.3/F.2.4 (below); the deterministic
+fuzz harness draws AES-192 for a third of its inputs.
 
 ## Validation
 
 - **Byte-exact vs. NIST SP800-38A**, both directions:
   - Appendix F.2.1 (AES-128-CBC) — encrypt and decrypt, byte-exact.
+  - Appendix F.2.3/F.2.4 (AES-192-CBC, over `aes192.Aes192`) — encrypt and
+    decrypt, byte-exact (re-checked against OpenSSL 3 `aes-192-cbc`).
   - Appendix F.2.5 (AES-256-CBC) — encrypt and decrypt, byte-exact (same
     vector transcribed in `ctap2pin/src/kat_vectors.zig` and
     `xmlenc/src/root.zig`; this module carries its own copy so it stays
@@ -223,4 +221,4 @@ whole block of 0x11 is now refused by both unpadders.
 
 - **(survey 2026-09-30) Incremental CBC state** — a stateful encryptor/decryptor whose chaining value survives across calls (Go `CryptBlocks`, RustCrypto stateful modes, OpenSSL `EVP_Cipher*`). Why: a caller streaming a large body must today hold it whole or carry the last ciphertext block as the next IV by hand. Effort: small (a struct holding the round-key context plus `prev`). Fits §2: yes.
 - **(survey 2026-09-30) Further padding schemes** (ANSI X9.23, ISO 10126, ISO/IEC 7816-4, zero padding) — RustCrypto ships them; consumers here need only PKCS#7 and XML-Enc, so low priority. Effort: small. Fits §2: yes.
-- **AES-192** is blocked on `std` (no `Aes192` in 0.16), not on this module; see *AES-192 exclusion*.
+- ~~**AES-192**~~ — done 2026-10-10: pass `aes192.Aes192`; see *AES-192*.

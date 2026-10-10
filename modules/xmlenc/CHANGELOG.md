@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — AES-192: `aes192-cbc`, `aes192-gcm` and `kw-aes192` are accepted, over the new `aes192` block cipher (through `aescbc`), `aesgcm.Aes192Gcm` and `aeskw`'s 24-byte KEK arm; new deps `aes192`, `aesgcm`. The test that pinned AES-192 as `UnsupportedAlgorithm` is now a round trip of both content modes under kw-aes192 and rsa-oaep; the fuzz harness's algorithm lists gain `aes192-gcm` and `kw-aes192` (appended, so existing seeds keep their meaning).
 - **2026-10-09** — tests: deterministic fuzz driver `XMLENC_FUZZ` over the existing `decryptData` harness, which now also checks that a genuine encrypted document decrypts to the exact plaintext and an AES-GCM one with 1-3 octets flipped fails (or yields the same plaintext).
 - **2026-10-09** — **BREAKING:** `decryptData`, `decryptAssertion` and `decryptDataToDocument` take
   the RSA key by pointer (`sk: *const rsa.SecretKey`, was by value): a by-value `SecretKey` is a

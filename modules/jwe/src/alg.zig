@@ -7,13 +7,13 @@
 //!   - `dirCek`          — `dir` (§4.5): the CEK IS the shared key.
 //!   - `rsaOaepWrap`/`rsaOaepUnwrap` — RSA-OAEP / RSA-OAEP-256 (§4.3), a thin
 //!     wire over the `rsa` module's `encryptOaep`/`decryptOaep`.
-//!   - `gcmkwWrap`/`gcmkwUnwrap` — AxxxGCMKW (§4.7), direct
-//!     `std.crypto.aead.aes_gcm` (same std gap as `enc.zig`: no AES-192).
+//!   - `gcmkwWrap`/`gcmkwUnwrap` — AxxxGCMKW (§4.7), `std.crypto.aead.aes_gcm`
+//!     for 128/256 and `aesgcm.Aes192Gcm` for A192GCMKW (std has no AES-192).
 //!   - `pbes2DeriveKek`  — the PBES2 (§4.8) KDF: `std.crypto.pwhash.pbkdf2`
 //!     over `Alg || 0x00 || p2s`; the KEK it produces feeds `aeskw`.
 //!   - `aeskw` (re-export) — RFC 3394 AES Key Wrap: AxxxKW (§4.4) directly,
 //!     every PBES2-* variant indirectly. Byte-exact against RFC 3394 §4.1;
-//!     see the shared `aeskw` module (A192KW stays a typed AES-192 std gap).
+//!     see the shared `aeskw` module (all three KEK widths since 2026-10-10).
 //!   - `ecdhes` (re-export) — ECDH-ES key agreement (§4.6): ephemeral-static
 //!     ECDH (P-256/X25519) + the Concat KDF. Direct mode derives the CEK
 //!     itself; `ECDH-ES+AxxxKW` derives a KEK that feeds `aeskw`. Byte-exact
@@ -24,14 +24,14 @@ pub const Entropy = @import("entropy.zig").Entropy;
 const rsa = @import("rsa");
 const burn = @import("burn.zig");
 const aead = std.crypto.aead.aes_gcm;
+const aesgcm = @import("aesgcm");
 
 pub const aeskw = @import("aeskw");
 pub const ecdhes = @import("ecdhes.zig");
 
 pub const Error = error{
     BufferTooSmall,
-    /// A KEK/CEK length std 0.16 has no cipher for (AES-192 — see
-    /// `enc.zig`'s module doc comment for the underlying std gap).
+    /// A KEK length that is not an AES key (16/24/32 bytes).
     UnsupportedKeyLength,
     /// `shared_key`'s length doesn't match what `enc` needs (`dirCek`), or
     /// a wrap/unwrap primitive rejected its key.
@@ -93,15 +93,16 @@ pub fn rsaOaepUnwrap(sk: *const rsa.SecretKey, hash: OaepHash, encrypted_key: []
 /// AxxxGCMKW wrap (RFC 7518 §4.7): AES-GCM-encrypt `cek` under `kek` with a
 /// caller-supplied random 96-bit `iv` and no AAD (§4.7.1 — the header
 /// carries `iv`/`tag` as its own params, produced/consumed by the caller of
-/// this function). Real — direct `std.crypto.aead.aes_gcm`, same 16/32-byte
-/// key support (no AES-192) as `enc.gcm`.
+/// this function). 16/32-byte KEKs on `std.crypto.aead.aes_gcm`, 24-byte on
+/// `aesgcm.Aes192Gcm`, as `enc.gcm`.
 pub fn gcmkwWrap(kek: []const u8, iv: [12]u8, cek: []const u8, ct_out: []u8, tag_out: *[16]u8) Error![]u8 {
     if (ct_out.len < cek.len) return error.BufferTooSmall;
     const ct = ct_out[0..cek.len];
     switch (kek.len) {
         16 => aead.Aes128Gcm.encrypt(ct, tag_out, cek, "", iv, kek[0..16].*),
+        24 => aesgcm.Aes192Gcm.encryptInto(ct, tag_out, cek, "", iv, kek[0..24]),
         32 => aead.Aes256Gcm.encrypt(ct, tag_out, cek, "", iv, kek[0..32].*),
-        else => return error.UnsupportedKeyLength, // 24 = AES-192, no std cipher
+        else => return error.UnsupportedKeyLength,
     }
     return ct;
 }
@@ -112,6 +113,7 @@ pub fn gcmkwUnwrap(kek: []const u8, iv: [12]u8, tag: [16]u8, encrypted_key: []co
     const pt = out[0..encrypted_key.len];
     switch (kek.len) {
         16 => aead.Aes128Gcm.decrypt(pt, encrypted_key, tag, "", iv, kek[0..16].*) catch return error.UnwrapFailed,
+        24 => aesgcm.Aes192Gcm.decryptInto(pt, encrypted_key, tag, "", iv, kek[0..24]) catch return error.UnwrapFailed,
         32 => aead.Aes256Gcm.decrypt(pt, encrypted_key, tag, "", iv, kek[0..32].*) catch return error.UnwrapFailed,
         else => return error.UnsupportedKeyLength,
     }
@@ -288,12 +290,26 @@ test "GCMKW A256 (32-byte KEK): every byte of the KEK is load-bearing, not just 
     try std.testing.expectError(error.UnwrapFailed, gcmkwUnwrap(&kek_b, iv, tag_a, &ct_a, &recovered));
 }
 
-test "GCMKW A192 (24-byte KEK) is a documented std gap" {
-    const kek = [_]u8{0x55} ** 24;
-    const cek = [_]u8{0x99} ** 32;
-    var ct: [32]u8 = undefined;
+// Was "GCMKW A192 (24-byte KEK) is a documented std gap" until 2026-10-10.
+test "GCMKW A192: McGrew–Viega GCM test case 8 as a key wrap, round trip, wrong KEK refused" {
+    // TC 8: K = 0^192, IV = 0^96, P = 0^128, no AAD -- exactly GCMKW's shape
+    // (a 16-byte CEK, empty AAD).
+    const kek = [_]u8{0} ** 24;
+    const cek = [_]u8{0} ** 16;
+    var ct: [16]u8 = undefined;
     var tag: [16]u8 = undefined;
-    try std.testing.expectError(error.UnsupportedKeyLength, gcmkwWrap(&kek, [_]u8{0} ** 12, &cek, &ct, &tag));
+    _ = try gcmkwWrap(&kek, [_]u8{0} ** 12, &cek, &ct, &tag);
+    var want_ct: [16]u8 = undefined;
+    var want_tag: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want_ct, "98e7247c07f0fe411c267e4384b0f600");
+    _ = try std.fmt.hexToBytes(&want_tag, "2ff58d80033927ab8ef4d4587514f0fb");
+    try std.testing.expectEqualSlices(u8, &want_ct, &ct);
+    try std.testing.expectEqualSlices(u8, &want_tag, &tag);
+    var back: [16]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &cek, try gcmkwUnwrap(&kek, [_]u8{0} ** 12, tag, &ct, &back));
+    const other = [_]u8{1} ** 24;
+    try std.testing.expectError(error.UnwrapFailed, gcmkwUnwrap(&other, [_]u8{0} ** 12, tag, &ct, &back));
+    try std.testing.expectError(error.UnsupportedKeyLength, gcmkwWrap(&([_]u8{0} ** 20), [_]u8{0} ** 12, &cek, &ct, &tag));
 }
 
 test "PBES2 KDF wiring is real: deterministic, salt/iteration/password sensitive, correct output length" {

@@ -38,6 +38,9 @@ const Aes128 = std.crypto.core.aes.Aes128;
 const Aes256 = std.crypto.core.aes.Aes256;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+/// AES-192: std 0.16 has none; the `aes192` block cipher and `aesgcm`'s GCM.
+const Aes192 = @import("aes192").Aes192;
+const Aes192Gcm = @import("aesgcm").Aes192Gcm;
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -52,7 +55,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "W3C XML Encryption 1.1 (xmlenc-core-1), decryption side; RFC 8017 / RFC 3394 / NIST SP800-38A/D",
-    .deps = .{ "xml", "rsa", "aescbc", "aeskw" },
+    .deps = .{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm" }, // aes192/aesgcm: the AES-192 block cipher and AES-192-GCM (std 0.16 has neither)
 };
 
 // ── namespace URIs ──────────────────────────────────────────────────────────
@@ -81,6 +84,7 @@ const alg_rsa_15 = xenc_ns ++ "rsa-1_5";
 const alg_rsa_oaep_mgf1p = xenc_ns ++ "rsa-oaep-mgf1p";
 const alg_rsa_oaep = xenc11_ns ++ "rsa-oaep";
 const alg_kw_aes128 = xenc_ns ++ "kw-aes128";
+const alg_kw_aes192 = xenc_ns ++ "kw-aes192";
 const alg_kw_aes256 = xenc_ns ++ "kw-aes256";
 
 // Digest methods (for OAEP).
@@ -100,11 +104,12 @@ pub const Options = struct {
     /// for an IdP that offers nothing else, and prefer to migrate the IdP.
     allow_weak_rsa15: bool = false,
 
-    /// Symmetric key-encryption key for `kw-aes128` / `kw-aes256` key wrap
-    /// (RFC 3394). Only consulted when the EncryptedKey uses a kw-aes*
-    /// algorithm; `null` (the default) means "no symmetric KEK available", so a
-    /// kw-aes* EncryptedKey then fails with `error.KekNotProvided`. Must be 16
-    /// bytes (kw-aes128) or 32 bytes (kw-aes256).
+    /// Symmetric key-encryption key for `kw-aes128` / `kw-aes192` /
+    /// `kw-aes256` key wrap (RFC 3394). Only consulted when the EncryptedKey
+    /// uses a kw-aes* algorithm; `null` (the default) means "no symmetric KEK
+    /// available", so a kw-aes* EncryptedKey then fails with
+    /// `error.KekNotProvided`. Must be 16, 24 or 32 bytes to match the
+    /// algorithm.
     kek: ?[]const u8 = null,
 
     /// Upper bound on the decoded content ciphertext, in bytes (DoS guard on an
@@ -115,8 +120,7 @@ pub const Options = struct {
 
 pub const Error = error{
     /// Structure present but not an algorithm on the allow-list (includes
-    /// AES-192 — std 0.16 ships no AES-192 block cipher — and any OAEP
-    /// digest/MGF pairing this module cannot express).
+    /// any OAEP digest/MGF pairing this module cannot express).
     UnsupportedAlgorithm,
     /// Required element/attribute missing, malformed nesting, or a CipherValue
     /// that is not valid base64.
@@ -277,7 +281,9 @@ fn classifyContent(alg: []const u8) Error!ContentAlg {
     if (eq(alg, alg_aes256_cbc)) return .{ .mode = .cbc, .key_len = 32 };
     if (eq(alg, alg_aes128_gcm)) return .{ .mode = .gcm, .key_len = 16 };
     if (eq(alg, alg_aes256_gcm)) return .{ .mode = .gcm, .key_len = 32 };
-    // AES-192 (cbc/gcm) is a real xmlenc algorithm but std 0.16 has no AES-192
+    // AES-192 since 2026-10-10: the `aes192` block cipher, `aesgcm`'s GCM.
+    if (eq(alg, alg_aes192_cbc)) return .{ .mode = .cbc, .key_len = 24 };
+    if (eq(alg, alg_aes192_gcm)) return .{ .mode = .gcm, .key_len = 24 };
     // block cipher — surface it as unsupported, never a silent wrong result.
     if (eq(alg, alg_aes192_cbc) or eq(alg, alg_aes192_gcm)) return error.UnsupportedAlgorithm;
     return error.UnsupportedAlgorithm;
@@ -368,9 +374,9 @@ fn unwrapCek(
     } else if (eq(alg, alg_rsa_15)) {
         if (!options.allow_weak_rsa15) return error.WeakRsa15NotAllowed;
         return try rsaPkcs1v15Unwrap(sk, wrapped, out, want);
-    } else if (eq(alg, alg_kw_aes128) or eq(alg, alg_kw_aes256)) {
+    } else if (eq(alg, alg_kw_aes128) or eq(alg, alg_kw_aes192) or eq(alg, alg_kw_aes256)) {
         const kek = options.kek orelse return error.KekNotProvided;
-        const kek_want: usize = if (eq(alg, alg_kw_aes128)) 16 else 32;
+        const kek_want: usize = if (eq(alg, alg_kw_aes128)) 16 else if (eq(alg, alg_kw_aes192)) 24 else 32;
         if (kek.len != kek_want) return error.UnsupportedAlgorithm;
         return try aesKwUnwrap(kek, wrapped, out, want);
     }
@@ -627,6 +633,7 @@ fn aesGcmDecrypt(alloc: std.mem.Allocator, key: []const u8, data: []const u8) Er
     errdefer alloc.free(out);
     switch (key.len) {
         16 => Aes128Gcm.decrypt(out, ct, tag, "", npub, key[0..16].*) catch return error.DecryptionError,
+        24 => Aes192Gcm.decryptInto(out, ct, tag, "", npub, key[0..24]) catch return error.DecryptionError,
         32 => Aes256Gcm.decrypt(out, ct, tag, "", npub, key[0..32].*) catch return error.DecryptionError,
         else => return error.UnsupportedAlgorithm,
     }
@@ -660,6 +667,7 @@ fn aesCbcDecrypt(alloc: std.mem.Allocator, key: []const u8, data: []const u8) Er
 
     const n = switch (key.len) {
         16 => aescbc.decrypt(Aes128, key[0..16], iv, ct, buf),
+        24 => aescbc.decrypt(Aes192, key[0..24], iv, ct, buf),
         32 => aescbc.decrypt(Aes256, key[0..32], iv, ct, buf),
         else => return error.UnsupportedAlgorithm, // errdefer frees buf
     } catch return error.DecryptionError;
@@ -886,7 +894,8 @@ test {
 test "classifyContent allow-list" {
     try testing.expectEqual(ContentMode.cbc, (try classifyContent(alg_aes256_cbc)).mode);
     try testing.expectEqual(@as(usize, 16), (try classifyContent(alg_aes128_gcm)).key_len);
-    try testing.expectError(error.UnsupportedAlgorithm, classifyContent(alg_aes192_cbc));
+    try testing.expectEqual(@as(usize, 24), (try classifyContent(alg_aes192_cbc)).key_len);
+    try testing.expectEqual(ContentMode.gcm, (try classifyContent(alg_aes192_gcm)).mode);
     try testing.expectError(error.UnsupportedAlgorithm, classifyContent("http://example.com/bogus"));
 }
 

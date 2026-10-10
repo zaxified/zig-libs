@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! aescbc — raw AES-CBC block-cipher mode (NIST SP800-38A §6.2) over
-//! `std.crypto.core.aes`'s `Aes128`/`Aes256`, plus the two padding schemes
+//! aescbc — raw AES-CBC block-cipher mode (NIST SP800-38A §6.2) over any
+//! std-shaped AES type (`std.crypto.core.aes`'s `Aes128`/`Aes256`, the
+//! `aes192` module's `Aes192`), plus the two padding schemes
 //! that consumers in this repo compose CBC with.
 //!
 //! `std.crypto.core.aes` (Zig 0.16) ships the AES block cipher but no CBC
@@ -10,15 +11,10 @@
 //! `A256CBC-HS512`, RFC 7518 §5.2, PKCS#7 padding). This module extracts a
 //! single well-tested core so both can collapse onto it.
 //!
-//! **AES-192 is not offered.** `std.crypto.core.aes` exports only
-//! `Aes128`/`Aes256` in 0.16 (no AES-192 key schedule in any backend); since
-//! this module is comptime-generic over the block-cipher type rather than
-//! dispatching on a runtime key-length enum, an AES-192 caller gets a
-//! compile error selecting `Aes128`/`Aes256`, not a runtime
-//! `error.UnsupportedKeyLength` — there is no third type to pass. Callers
-//! that dispatch on a runtime algorithm identifier (as `jwe`/`xmlenc` do)
-//! are expected to reject AES-192 themselves before reaching this module,
-//! exactly as they already do.
+//! **AES-192:** std 0.16 has no `Aes192`; pass the `aes192` module's
+//! `Aes192` (same declarations as std's two). This module is comptime-generic
+//! over the cipher type, so it needed no code change for it — only the
+//! SP800-38A F.2.3/F.2.4 KATs (2026-10-10).
 //!
 //! See SPEC.md for the padding-oracle caveat and which consumer uses which
 //! padding scheme.
@@ -62,7 +58,7 @@ pub const PaddingError = error{InvalidPadding};
 
 /// Encrypt `plaintext` (must be `block_len`-aligned) into `out` under raw
 /// CBC: `C[0] = E(P[0] XOR IV)`, `C[i] = E(P[i] XOR C[i-1])`. `Aes` is
-/// `std.crypto.core.aes.Aes128` or `Aes256`; `key` points to
+/// `std.crypto.core.aes.Aes128`/`Aes256` or `aes192.Aes192`; `key` points to
 /// `[Aes.key_bits / 8]u8` (BREAKING 2026-10-09: by pointer, so no key copy is
 /// left in the caller's frame; the body runs under a dead-stack burn). `out` must be at least `plaintext.len` bytes.
 /// No allocation. Returns the written length (== `plaintext.len`).
@@ -251,6 +247,8 @@ const testkit = @import("testkit");
 
 const Aes128 = std.crypto.core.aes.Aes128;
 const Aes256 = std.crypto.core.aes.Aes256;
+/// Test-only (`test_deps`): the API takes any std-shaped AES type.
+const Aes192 = @import("aes192").Aes192;
 
 fn hex(comptime s: []const u8) [s.len / 2]u8 {
     var out: [s.len / 2]u8 = undefined;
@@ -269,6 +267,14 @@ const f_2_1_ciphertext = hex("7649abac8119b246cee98e9b12e9197d" ++
     "5086cb9b507219ee95db113a917678b2" ++
     "73bed6b8e3c1743b7116e69e22229516" ++
     "3ff1caa1681fac09120eca307586e1a7");
+
+// NIST SP800-38A Appendix F.2.3/F.2.4 — CBC-AES192.Encrypt/Decrypt (re-checked
+// against OpenSSL 3 `aes-192-cbc` when added, 2026-10-10).
+const f_2_3_key = hex("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b");
+const f_2_3_ciphertext = hex("4f021db243bc633d7178183a9fa071e8" ++
+    "b4d9ada9ad7dedf4e5e738763f69145a" ++
+    "571b242012fb7ae07fa9baac3df102e0" ++
+    "08b0e27988598881d920a9e64f5615cd");
 
 // NIST SP800-38A Appendix F.2.5 — CBC-AES256.Encrypt/Decrypt (also
 // transcribed in ctap2pin/src/kat_vectors.zig and xmlenc/src/root.zig).
@@ -289,6 +295,18 @@ test "NIST SP800-38A F.2.1 (AES-128-CBC): byte-exact encrypt" {
 test "NIST SP800-38A F.2.1 (AES-128-CBC): byte-exact decrypt" {
     var out: [f_2_1_ciphertext.len]u8 = undefined;
     const n = try decrypt(Aes128, &f_2_1_key, f_2_1_iv, &f_2_1_ciphertext, &out);
+    try testing.expectEqualSlices(u8, &f_2_1_plaintext, out[0..n]);
+}
+
+test "NIST SP800-38A F.2.3 (AES-192-CBC): byte-exact encrypt" {
+    var out: [64]u8 = undefined;
+    const n = try encrypt(Aes192, &f_2_3_key, f_2_1_iv, &f_2_1_plaintext, &out);
+    try testing.expectEqualSlices(u8, &f_2_3_ciphertext, out[0..n]);
+}
+
+test "NIST SP800-38A F.2.4 (AES-192-CBC): byte-exact decrypt" {
+    var out: [64]u8 = undefined;
+    const n = try decrypt(Aes192, &f_2_3_key, f_2_1_iv, &f_2_3_ciphertext, &out);
     try testing.expectEqualSlices(u8, &f_2_1_plaintext, out[0..n]);
 }
 

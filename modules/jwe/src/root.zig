@@ -14,30 +14,30 @@
 //! API has no seam for yet (see SPEC.md).
 //!
 //! **Content encryption (`enc`, RFC 7518 §5)**:
-//!   - `A128GCM`/`A256GCM` — REAL (`std.crypto.aead.aes_gcm`).
-//!   - `A128CBC-HS256`/`A256CBC-HS512` — REAL (from-scratch AES-CBC +
-//!     HMAC-SHA-2 encrypt-then-MAC; byte-exact against RFC 7518 Appendix B).
-//!     See `enc.zig`.
-//!   - `A192GCM`/`A192CBC-HS384` — **unsupported** (not stubbed): std 0.16
-//!     ships no AES-192 cipher at all (`error.UnsupportedKeyLength`). See
-//!     `enc.zig`.
+//!   - `A128GCM`/`A256GCM` — REAL (`std.crypto.aead.aes_gcm`); `A192GCM` —
+//!     REAL (`aesgcm.Aes192Gcm`; std 0.16 has no AES-192).
+//!   - `A128CBC-HS256`/`A192CBC-HS384`/`A256CBC-HS512` — REAL (AES-CBC +
+//!     HMAC-SHA-2 encrypt-then-MAC; byte-exact against RFC 7518 Appendix
+//!     B.1–B.3; AES-192 from the `aes192` module). See `enc.zig`.
 //!
 //! **Key management (`alg`, RFC 7518 §4)**:
 //!   - `dir` — REAL (trivial: the CEK is the shared key).
 //!   - `RSA-OAEP` / `RSA-OAEP-256` — REAL (wraps the `rsa` module's OAEP).
-//!   - `A128KW`/`A256KW` — REAL (RFC 3394 AES Key Wrap; byte-exact against
-//!     RFC 3394 §4.1 and RFC 7516 A.3). See the shared `aeskw` module.
-//!   - `A128GCMKW`/`A256GCMKW` — REAL; `A192GCMKW`/`A192KW` unsupported
-//!     (the same AES-192 std gap as content encryption).
-//!   - `PBES2-HS256+A128KW`/`PBES2-HS512+A256KW` — REAL (PBKDF2 KDF feeding
-//!     the AES Key Wrap above); `PBES2-HS384+A192KW` unsupported (its KW
-//!     half needs the missing AES-192 core).
-//!   - `ECDH-ES` / `ECDH-ES+A128KW` / `ECDH-ES+A256KW` — REAL (§4.6
+//!   - `A128KW`/`A192KW`/`A256KW` — REAL (RFC 3394 AES Key Wrap; byte-exact
+//!     against RFC 3394 §4.1/§4.2 and RFC 7516 A.3). See the shared `aeskw`
+//!     module.
+//!   - `A128GCMKW`/`A192GCMKW`/`A256GCMKW` — REAL.
+//!   - `PBES2-HS256+A128KW`/`PBES2-HS384+A192KW`/`PBES2-HS512+A256KW` — REAL
+//!     (PBKDF2 KDF feeding the AES Key Wrap above).
+//!   - `ECDH-ES` / `ECDH-ES+A128KW` / `ECDH-ES+A192KW` / `ECDH-ES+A256KW` —
+//!     REAL (§4.6
 //!     ephemeral-static ECDH on P-256 or X25519 + the Concat KDF; byte-exact
 //!     against RFC 7518 Appendix C — see `ecdhes.zig`). Direct mode derives
 //!     the CEK itself (empty Encrypted Key segment); the `+AxxxKW` modes
-//!     derive a KEK feeding the RFC 3394 wrap. `ECDH-ES+A192KW` is the same
-//!     AES-192 std gap as `A192KW`.
+//!     derive a KEK feeding the RFC 3394 wrap.
+//!
+//! AES-192 (every `A192*` above) since 2026-10-10: std 0.16 has no AES-192;
+//! the block cipher is the `aes192` module's, GCM is `aesgcm`'s.
 //!
 //! ## Usage
 //!
@@ -93,7 +93,7 @@ pub const ecdhes = alg.ecdhes;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "JSON Web Encryption (RFC 7516/7518) compact serialization — RSA-OAEP/AxxxKW/ECDH-ES key management + AES-GCM/CBC-HMAC content encryption; A192* unsupported (no AES-192 in std)",
+    .doc = "JSON Web Encryption (RFC 7516/7518) compact serialization — RSA-OAEP/AxxxKW/ECDH-ES key management + AES-GCM/CBC-HMAC content encryption, AES-128/192/256 throughout (AES-192 via the aes192/aesgcm modules)",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -103,7 +103,7 @@ pub const meta = .{
     .role = .codec, // pure wire codec + crypto dispatch, no I/O of its own
     .concurrency = .reentrant, // no shared/global state; every call is self-contained
     .model_after = "RFC 7516 (JWE) + RFC 7518 (JWA encryption algs) + RFC 3394 (AES Key Wrap); sibling of this repo's `jwt` (RFC 7515 JWS)",
-    .deps = .{ "rsa", "p256", "aescbc", "aeskw" }, // p256 supplies the ECDH-ES P-256 curve (byte-exact to std.crypto.ecc.P256); X25519 stays on std; aescbc/aeskw supply the shared CBC + RFC 3394 key-wrap cores
+    .deps = .{ "rsa", "p256", "aescbc", "aeskw", "aes192", "aesgcm" }, // p256 supplies the ECDH-ES P-256 curve (byte-exact to std.crypto.ecc.P256); X25519 stays on std; aescbc/aeskw supply the shared CBC + RFC 3394 key-wrap cores; aes192/aesgcm the AES-192 block cipher and A192GCM
 };
 
 /// Key management algorithm (`alg` header parameter, RFC 7518 §4 names).
@@ -350,8 +350,7 @@ noinline fn ecdhesEncryptKey(
     }
     // Key Agreement with Key Wrapping: derive a KEK (keydatalen =
     // the KW size, AlgorithmID = the full `alg` name), wrap a
-    // random CEK under it. ECDH-ES+A192KW's 24-byte KEK hits
-    // aeskw's typed AES-192 std gap.
+    // random CEK under it.
     const kek_len: usize = switch (key_alg) {
         .@"ECDH-ES+A128KW" => 16,
         .@"ECDH-ES+A192KW" => 24,
@@ -919,6 +918,33 @@ test "dir + A256GCM real round-trip, empty plaintext" {
     try std.testing.expectEqualStrings("", plaintext);
 }
 
+test "every A192 algorithm round-trips: A192KW, A192GCMKW, PBES2-HS384+A192KW, ECDH-ES+A192KW x A192GCM, A192CBC-HS384" {
+    // RFC 7520 has no AES-192 example for any of these; the anchors are the
+    // primitives' own KATs (aeskw RFC 3394 §4.2/§4.4, McGrew–Viega 7–10,
+    // RFC 7518 B.2) plus these full-token round trips.
+    const gpa = std.testing.allocator;
+    const kek = [_]u8{0x5c} ** 24;
+    var recipient: ecdhes.EphemeralKeyPair = undefined;
+    ecdhes.generateEphemeral(&recipient, .p256, seededForTest());
+    inline for (.{ Enc.A192GCM, Enc.@"A192CBC-HS384" }) |e| {
+        inline for (.{ Alg.A192KW, Alg.A192GCMKW, Alg.@"PBES2-HS384+A192KW", Alg.@"ECDH-ES+A192KW", Alg.dir }) |a| {
+            var cek_buf: [48]u8 = @splat(0x3e);
+            const enc_key: KeyMaterial, const dec_key: KeyMaterial = switch (a) {
+                .A192KW, .A192GCMKW => .{ .{ .symmetric = &kek }, .{ .symmetric = &kek } },
+                .@"PBES2-HS384+A192KW" => .{ .{ .password = "correct horse" }, .{ .password = "correct horse" } },
+                .@"ECDH-ES+A192KW" => .{ .{ .ec_public = recipient.public }, .{ .ec_private = &recipient.private } },
+                .dir => .{ .{ .symmetric = cek_buf[0..e.cekLen().?] }, .{ .symmetric = cek_buf[0..e.cekLen().?] } },
+                else => unreachable,
+            };
+            const token = try encryptCompact(gpa, a, e, enc_key, "AES-192 everywhere", "", seededForTest(), .{ .pbes2_iterations = 1000 });
+            defer gpa.free(token);
+            const pt = try decryptCompact(gpa, dec_key, token, .{ .expect_alg = a });
+            defer gpa.free(pt);
+            try std.testing.expectEqualStrings("AES-192 everywhere", pt);
+        }
+    }
+}
+
 test "A128GCMKW + A128GCM real round-trip" {
     const kek = [_]u8{0x77} ** 16;
     const token = try encryptCompact(std.testing.allocator, .A128GCMKW, .A128GCM, .{ .symmetric = &kek }, "the eagle flies at midnight", "", seededForTest(), .{});
@@ -1083,10 +1109,20 @@ test "ECDH-ES direct rejects a non-empty encrypted_key segment" {
     try std.testing.expectError(error.MalformedToken, decryptCompact(std.testing.allocator, .{ .ec_private = &recipient.private }, forged, .{}));
 }
 
-test "ECDH-ES+A192KW is the documented AES-192 std gap" {
+// Was "ECDH-ES+A192KW is the documented AES-192 std gap" (expected
+// UnsupportedKeyLength) until aeskw gained the 24-byte KEK arm over the
+// `aes192` module, 2026-10-10. RFC 7520 has no ECDH-ES+A192KW example, so the
+// anchor is aeskw's RFC 3394 §4.2/§4.4 KATs plus this round trip.
+test "ECDH-ES+A192KW real round-trip (P-256), through aeskw's AES-192 KEK" {
     var recipient: ecdhes.EphemeralKeyPair = undefined;
     ecdhes.generateEphemeral(&recipient, .p256, seededForTest());
-    try std.testing.expectError(error.UnsupportedKeyLength, encryptCompact(std.testing.allocator, .@"ECDH-ES+A192KW", .A128GCM, .{ .ec_public = recipient.public }, "hi", "", seededForTest(), .{}));
+    const token = try encryptCompact(std.testing.allocator, .@"ECDH-ES+A192KW", .A128GCM, .{ .ec_public = recipient.public }, "hi", "", seededForTest(), .{});
+    defer std.testing.allocator.free(token);
+    const plaintext = try decryptCompact(std.testing.allocator, .{ .ec_private = &recipient.private }, token, .{
+        .expect_alg = .@"ECDH-ES+A192KW",
+    });
+    defer std.testing.allocator.free(plaintext);
+    try std.testing.expectEqualStrings("hi", plaintext);
 }
 
 test "malformed compact tokens are rejected, never panic on arbitrary bytes" {
@@ -1217,14 +1253,13 @@ fn fuzzRoundtripSmith(_: void, smith: *std.testing.Smith) !void {
 /// same token with one octet changed (not a segment's last, whose base64url
 /// unused bits are not authenticated) is REFUSED, as is the wrong key.
 fn fuzzRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
-    const algs = [_]Alg{ .dir, .A128KW, .A256KW, .A128GCMKW, .A256GCMKW };
-    // The 192-bit content encryptions are unsupported by design (std AES-192 gap, see `enc.zig`).
-    const encs = [_]Enc{ .A128GCM, .A256GCM, .@"A128CBC-HS256", .@"A256CBC-HS512" };
+    const algs = [_]Alg{ .dir, .A128KW, .A192KW, .A256KW, .A128GCMKW, .A192GCMKW, .A256GCMKW };
+    const encs = [_]Enc{ .A128GCM, .A192GCM, .A256GCM, .@"A128CBC-HS256", .@"A192CBC-HS384", .@"A256CBC-HS512" };
     const key_alg = algs[src.index(algs.len)];
     const content_enc = encs[src.index(encs.len)];
     switch (key_alg) {
         .dir => RoundtripMark.mark(.dir),
-        .A128GCMKW, .A256GCMKW => RoundtripMark.mark(.gcm_key_wrap),
+        .A128GCMKW, .A192GCMKW, .A256GCMKW => RoundtripMark.mark(.gcm_key_wrap),
         else => RoundtripMark.mark(.key_wrap),
     }
     var key_buf: [64]u8 = undefined;
@@ -1232,6 +1267,7 @@ fn fuzzRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     const key_len: usize = switch (key_alg) {
         .dir => content_enc.cekLen().?,
         .A128KW, .A128GCMKW => 16,
+        .A192KW, .A192GCMKW => 24,
         else => 32,
     };
     const key = key_buf[0..key_len];

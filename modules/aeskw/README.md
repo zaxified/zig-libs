@@ -7,7 +7,7 @@ unwrap) into one place. No allocation, no deps, no panics — every buffer is ca
 
 - **Model after:** RFC 3394 (AES Key Wrap).
 - **Platform:** any. **Role:** crypto primitive. **Concurrency:** reentrant (no shared state, no
-  allocation). **Deps:** none (`std.crypto.core.aes` only).
+  allocation). **Deps:** `aes192` (the 24-byte KEK arm; AES-128/256 are `std.crypto.core.aes`).
 
 Provenance: original work of the zig-libs authors (MIT), implemented directly from the RFC 3394
 text — an open IETF specification, not a copyrightable work. See `SPEC.md` for the full
@@ -18,7 +18,7 @@ design/threat-model breakdown and how this relates to the three in-repo mirrors 
 ```zig
 const aeskw = @import("aeskw");
 
-const kek = [_]u8{ /* 16 bytes (AES-128) or 32 bytes (AES-256) */ };
+const kek = [_]u8{ /* 16 (AES-128), 24 (AES-192) or 32 bytes (AES-256) */ };
 const key_data = [_]u8{ /* 8-byte-multiple, >= 16 bytes */ };
 
 var wrapped: [key_data.len + 8]u8 = undefined;
@@ -40,7 +40,7 @@ pub const default_iv: [8]u8;
 pub const Error = error{
     InvalidLength,       // plaintext/ciphertext not an 8-byte multiple, or below the RFC minimum
     BufferTooSmall,       // out too small for the result
-    UnsupportedKeyLength, // kek.len is neither 16 (AES-128) nor 32 (AES-256)
+    UnsupportedKeyLength, // kek.len is not 16 (AES-128), 24 (AES-192) or 32 (AES-256)
     Unauthentic,          // unwrap: integrity check failed (wrong KEK or corrupted ciphertext)
 };
 
@@ -52,15 +52,15 @@ pub fn unwrap(kek: []const u8, ciphertext: []const u8, out: []u8) Error![]u8;
 `out` and returns that slice. `unwrap`: `ciphertext.len` must be a multiple of 8 and `>= 24`;
 writes `ciphertext.len - 8` bytes to `out` and returns that slice, or fails with
 `error.Unauthentic` — in which case `out`'s scratch region is zeroed before returning, so a
-failed unwrap never leaks partially-recovered, KEK-derived plaintext. The KEK width (16 vs. 32
-bytes) is read from `kek.len` at each call — there's no separate AES-128/AES-256 selection
-argument or comptime variant; a 24-byte (AES-192) KEK returns `error.UnsupportedKeyLength` (see
-`SPEC.md` — a real `std.crypto.core.aes` gap in Zig 0.16, not a design choice).
+failed unwrap never leaks partially-recovered, KEK-derived plaintext. The KEK width (16, 24 or
+32 bytes) is read from `kek.len` at each call — there's no separate AES-128/192/256 selection
+argument or comptime variant; any other width returns `error.UnsupportedKeyLength`. AES-192
+runs on the `aes192` module, since std 0.16 has no AES-192 (see `SPEC.md`).
 
 ## Tests
 
 `zig build test-aeskw` (headless; green in Debug and `-Doptimize=ReleaseFast`). Anchors: RFC
-3394 §4.1 (128-bit KEK / 128-bit key), §4.3 (256-bit KEK / 128-bit key), §4.5 (256-bit KEK /
+3394 §4.1 (128-bit KEK / 128-bit key), §4.2 and §4.4 (192-bit KEK / 128- and 192-bit key), §4.3 (256-bit KEK / 128-bit key), §4.5 (256-bit KEK /
 192-bit key, the odd-block-count n=3 case), and §4.6 (256-bit KEK / 256-bit key, n=4) — each
 byte-exact in both the wrap and unwrap directions; unwrap integrity-failure coverage (wrong KEK,
 single-bit-corrupted ciphertext) each proven `error.Unauthentic` with an all-zeroed `out` and a

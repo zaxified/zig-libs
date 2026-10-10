@@ -32,8 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 verify-before-decrypt CBC-HMAC with a single error for tag or padding failure; refuses `zip`
 outright (a deliberate anti-zip-bomb stance that go-jose, which implements DEF, does not take)
 and caps PBES2 iterations (`default_max_p2c`). **Where we are behind:** JSON
-serialization and multiple recipients (deliberate for v1, see *Design*), RSA1_5, AES-192 (a
-`std` gap), ECDH-ES on P-384/P-521 (→ Backlog).
+serialization and multiple recipients (deliberate for v1, see *Design*), RSA1_5, ECDH-ES on P-384/P-521 (→ Backlog).
 
 Design + threat notes for auditors. Usage: see ./README.md.
 Attribution/provenance: see ./NOTICE (module-local — see its own note on
@@ -75,18 +74,15 @@ placement).
   re-serializing the parsed JSON) avoid any JSON-canonicalization mismatch
   between "the header as written" and "the header the tag was computed
   over" — a classic JOSE interop footgun sidestepped by construction.
-- **AES-192 is a std gap, not a design choice.** Zig 0.16's
-  `std.crypto.core.aes` ships only `Aes128`/`Aes256` (no AES-192 block
-  cipher in ANY backend — aesni/armcrypto/soft all verified), so
-  `std.crypto.aead.aes_gcm` has no `Aes192Gcm` either. `A192GCM`,
-  `A192GCMKW`, `A192KW`, and `A192CBC-HS384` therefore return
-  `error.UnsupportedKeyLength` — a real, typed limitation; there is
-  currently no std primitive to call. Two halves of the A192 story ARE
-  proven where std allows: `aeskw`'s wrap/unwrap logic is key-size-generic
-  above the block cipher, and `A192CBC-HS384`'s HMAC-SHA-384 half is
-  validated byte-exact against the RFC 7518 B.2 vector's `E`/`T` in
-  `enc.zig`'s tests — the only missing piece is genuinely the AES-192 key
-  schedule.
+- **AES-192 comes from sibling modules, not std** (since 2026-10-10). Zig
+  0.16's `std.crypto.core.aes` ships only `Aes128`/`Aes256` and
+  `std.crypto.aead.aes_gcm` no `Aes192Gcm`. `A192CBC-HS384`'s CBC half runs
+  on `aes192.Aes192` through `aescbc`; `A192GCM` and `A192GCMKW` on
+  `aesgcm.Aes192Gcm`; `A192KW`, `PBES2-HS384+A192KW` and `ECDH-ES+A192KW`
+  through `aeskw`'s 24-byte KEK arm. 128/256 stay on std. Anchors: RFC 7518
+  B.2 byte-exact both directions, McGrew–Viega 10 (A192GCM) and 8 (as a
+  GCMKW wrap), RFC 3394 §4.2/§4.4 in `aeskw`, and a full-token round trip of
+  every A192 `alg` × `enc` pair (RFC 7520 has no AES-192 example).
 
 ## Threat model
 
@@ -168,8 +164,8 @@ placement).
   list. `ECDH-ES` / `ECDH-ES+A128KW` / `ECDH-ES+A256KW` (RFC 7518 §4.6,
   elliptic-curve key agreement on P-256 or X25519 + the Concat KDF) ARE in
   scope and implemented — see `ecdhes.zig`, byte-exact against RFC 7518
-  Appendix C. Only `ECDH-ES+A192KW` is unsupported, for the same AES-192 std
-  gap as the other `A192*` algorithms.
+  Appendix C. `ECDH-ES+A192KW` included (its KEK goes to `aeskw`'s AES-192
+  arm).
 
 ## `TODO(fable)` checklist — done-record (completed 2026-07-11)
 
@@ -193,9 +189,8 @@ placement).
    `aescbc`'s padding error onto the same `error.AuthenticationFailed` as a
    tag mismatch) local. Byte-exact against RFC 7518 Appendix B.1 and B.3, `E`
    and `T`, both directions; agrees with the std-only sanity-oracle test.
-   B.2 (A192CBC-HS384): the CBC half is typed-unsupported (AES-192 std gap,
-   see Design), but its HMAC-SHA-384 half is validated byte-exact against the
-   B.2 vector. Tag compare is `std.crypto.timing_safe.eql`,
+   B.2 (A192CBC-HS384) likewise, both directions, since the `aes192`
+   module (2026-10-10). Tag compare is `std.crypto.timing_safe.eql`,
    verify-before-decrypt; padding and tag failures return the identical
    `error.AuthenticationFailed`.
 3. ✅ **End-to-end:** `kat_rfc7516.zig`'s RFC 7516 A.3 test (A128KW +
@@ -203,18 +198,16 @@ placement).
    exact plaintext, the raw key wrap reproduces §A.3.3's Encrypted Key, and
    encrypt (with the RFC's CEK + IV pinned through a fixed-stream `random`)
    reproduces §A.3.7's exact compact token through `root.zig`'s dispatch.
-4. **Optional follow-up, still open (out of scope here):** an AES-192
-   block-cipher core (std gap — see Design above) to unlock
-   `A192GCM`/`A192GCMKW`/`A192KW`/`A192CBC-HS384` for real. A separate
-   primitive, independent of (1)-(3).
+4. ✅ **AES-192** (2026-10-10): the `aes192` module's block cipher and
+   `aesgcm`'s `Aes192Gcm` unlock every `A192*` algorithm — see Design.
 
 ## Verification
 
 `zig build test-jwe`: all pass, no skips (header round-trips + `zip`
 rejection, `A128GCM`/`A256GCM` real round-trips + tamper detection,
-AES-192 documented-std-gap checks, `dir`/`RSA-OAEP-256`/GCMKW/PBES2 wiring,
-RFC 3394 §4.1 AES-KW KAT + fail-closed tests, RFC 7518 B.1/B.3 CBC-HMAC
-KATs both directions + B.2 HMAC-half + padding-vs-tag indistinguishability,
+AES-192 KATs and round trips of every `A192*` algorithm, `dir`/`RSA-OAEP-256`/GCMKW/PBES2 wiring,
+RFC 3394 §4.1 AES-KW KAT + fail-closed tests, RFC 7518 B.1/B.2/B.3 CBC-HMAC
+KATs both directions + padding-vs-tag indistinguishability,
 the RFC 7518 Appendix C ECDH-ES KATs (P-256 ECDH `Z` and Concat-KDF-derived
 key, both byte-exact) plus cross-curve/invalid-peer-material/zeroing tests
 for both P-256 and X25519, full `encryptCompact`/`decryptCompact`
@@ -225,11 +218,10 @@ both green).
 
 ## Status
 
-`gap · any · codec · reentrant` + deps `rsa`, `p256`, `aescbc`, `aeskw` —
+`gap · any · codec · reentrant` + deps `rsa`, `p256`, `aescbc`, `aeskw`, `aes192`, `aesgcm` —
 canonical source is `pub const meta` in src/root.zig ("gap" = fills a genuine
 ecosystem gap, same category as `jwt`). Everything this module lists is real
-and KAT-validated; the only limitation is the typed AES-192 std gap (see
-Design).
+and KAT-validated, AES-192 included since 2026-10-10 (see Design).
 
 ## Anchoring
 
@@ -282,4 +274,4 @@ First pass: 18 survivors. **One defect (fixed), 15 test gaps, 3 equivalent.**
   "What is deliberately not done". A JWE producer can always choose RSA-OAEP, unlike the SAML IdPs that force
   `xmlenc` into `rsa-1_5`, and RFC 8725 §3.2 advises against RSA1_5. Revisited only if a consumer's peer cannot be
   changed. It would then come off by default and with implicit rejection, as in `xmlenc`.
-- **AES-192 variants** stay blocked on `std`; `zip` stays refused by design.
+- ~~**AES-192 variants**~~ — done 2026-10-10 (Design); `zip` stays refused by design.

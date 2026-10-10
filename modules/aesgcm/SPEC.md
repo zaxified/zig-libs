@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-09-28 (31/31) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, AESGCM_FUZZ) · ct 2026-09-28 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (100,000 runs clean, AESGCM_FUZZ, with AES-192) · ct 2026-10-10 (ctgrind ctx/stateless/generic over AES-128/192/256: 6 in-file each = the tag-check verdict)
 
 **Performance:** not measured
 
@@ -30,20 +30,26 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [briansmith/ring](https://github.com/briansmith/ring) | Rust/asm | ISC-style + Apache-2.0 parts (LICENSE read) | 4.1k | pushed 2026-07-23 (no GitHub releases) | AES-128/256-GCM only, 96-bit nonce, 16-byte tag — the same shape as this module; BoringSSL-derived asm kernels *(inferred)*. |
 | Zig `std.crypto.aead.aes_gcm` | Zig | MIT | — | Zig 0.16.0 | `Aes128Gcm`/`Aes256Gcm`, same limits as this module (checked in 0.16.0's `lib/std/crypto/aes_gcm.zig`); stateless and two-pass. Drop-in shape; this module measures 1.6–1.8× it on 16 KiB, 2.0–2.2× on 480 B. |
 
-**Where we are ahead:** the only Zig AES-GCM with a stateful per-key context and a one-pass AES-NI/PCLMULQDQ stitched kernel — 1.6–2.2× `std` and level with OpenSSL at 16 KiB on the author's machine (README figures, one host, not re-measured by the survey); 31-mutant schemata run all killed; OpenSSL 3.5.5 oracle over 17 lengths × both key sizes. **Where we are behind:** AES-192, non-96-bit nonces and shorter tags (refused, SPEC), a streaming interface (refused, SPEC), VAES/AVX-512 (no hardware to measure), an arm64 kernel (arm64 runs `std`'s primitives two-pass), and no Wycheproof vectors (evidence is McGrew–Viega + OpenSSL + `std` differentials) (→ Backlog).
+**Where we are ahead:** the only Zig AES-GCM with a stateful per-key context and a one-pass AES-NI/PCLMULQDQ stitched kernel — 1.6–2.2× `std` and level with OpenSSL at 16 KiB on the author's machine (README figures, one host, not re-measured by the survey); 31-mutant schemata run all killed; OpenSSL 3.5.5 oracle over 17 lengths × both key sizes. **Where we are behind:** non-96-bit nonces and shorter tags (refused, SPEC), a streaming interface (refused, SPEC), VAES/AVX-512 (no hardware to measure), an arm64 kernel (arm64 runs `std`'s primitives two-pass), and no Wycheproof vectors (evidence is McGrew–Viega + OpenSSL + `std` differentials) (→ Backlog).
 
 ## What this module is, and what it is not
 
-AES-GCM with AES-128 and AES-256 keys, a 96-bit nonce and a 128-bit tag — the
-two TLS 1.2/1.3 AES-GCM suites and std's `crypto.aead.aes_gcm` types, nothing
-wider. A stateful `Context` per key, plus std's stateless shape. It is **not**:
+AES-GCM with AES-128, AES-192 and AES-256 keys, a 96-bit nonce and a 128-bit
+tag — the two TLS 1.2/1.3 AES-GCM suites and std's `crypto.aead.aes_gcm` types,
+plus AES-192 (JWE `A192GCM`, XML-Enc `aes192-gcm`), nothing wider. A stateful `Context` per key, plus std's stateless shape. It is **not**:
 
 - **other nonce or tag lengths** (SP 800-38D allows any IV length via GHASH of
   the IV, and tags down to 32 bits). Refused: std has neither, TLS uses
   neither, and a non-96-bit IV is the construction's weak spot (nonce
   collisions after GHASH).
-- **AES-192.** Not now: no TLS suite uses it; std's `aes_gcm` has no type for
-  it either.
+- ~~**AES-192.**~~ Done 2026-10-10 (`Aes192Gcm`). std has no AES-192, so the
+  generic backend and the stateless generic path take the block cipher from
+  the sibling `aes192` module (std's round primitive, own FIPS-197 key
+  expansion) and recompose GCM from std's `modes.ctr` and `Ghash` exactly as
+  for the other sizes; there is no std AEAD to delegate to. The x86-64 kernel
+  is parametrised by Nr alone (12 here) and gets its own `aesenclast`-based
+  Nk = 6 expansion, so a baseline-CPU build that detects AES-NI at run time
+  never expands the key through std's software tables. Not a TLS suite.
 - **a streaming (incremental) AEAD.** Refused: GCM's decrypt must not release
   plaintext before the tag is checked, so a streaming decrypt is an unsafe API
   shape; records are the unit here.
@@ -205,19 +211,21 @@ review, as §2.1 says they must be.
 
 ## Anchoring
 
-- **External** — McGrew–Viega GCM test cases 1–4 (AES-128) and 13–16
-  (AES-256): empty P and A, one zero block, 64-byte P, 60-byte P with 20-byte
+- **External** — McGrew–Viega GCM test cases 1–4 (AES-128), 7–10 (AES-192;
+  11–12 need non-96-bit IVs) and 13–16 (AES-256): empty P and A, one zero block, 64-byte P, 60-byte P with 20-byte
   A, 96-bit IV (test `McGrew–Viega …`). These reach only the tail path, so a
   second set comes from **OpenSSL 3.5.5** through Python `cryptography`:
-  17 lengths × both key sizes from 0 to 19 999 bytes with AD 0…1000, covering
+  17 lengths × all three key sizes from 0 to 19 999 bytes with AD 0…1000, covering
   tail only, one batch plus the delayed GHASH, and the stitched loop with and
   without a partial block (test `long messages agree with OpenSSL`). Recipe:
   `tools/openssl_kat.py`, output `src/testdata/openssl_kat.zig` (tag and
   SHA-256 of the ciphertext; inputs are regenerated from a formula).
-  A third set is **Wycheproof** `aes_gcm_test.json` (2026-10-06): its 133
-  tests with a 128/256-bit key, 96-bit IV and 128-bit tag — 79 valid, which
+  A third set is **Wycheproof** `aes_gcm_test.json` (2026-10-06; 192-bit
+  groups added 2026-10-10, JSON sha256 985e5ecc…dfe7, the 128/256 rows
+  unchanged): its 197 tests with a 128/192/256-bit key, 96-bit IV and 128-bit
+  tag — 116 valid, which
   every backend and the stateless path must encrypt and decrypt exactly, and
-  54 with a modified tag, which each must refuse with the output zeroed
+  81 with a modified tag, which each must refuse with the output zeroed
   (test `Wycheproof aes_gcm_test.json …`; recipe `tools/wycheproof.py`,
   Apache-2.0 data, see NOTICE). No defect; a one-byte change in a kept
   vector fails the test (negative control, 2026-10-06).

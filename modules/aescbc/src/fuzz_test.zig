@@ -83,8 +83,9 @@ const Cursor = testkit.fuzz.Cursor;
 const Rng = fuzz_driver.Rng;
 const Aes128 = std.crypto.core.aes.Aes128;
 const Aes256 = std.crypto.core.aes.Aes256;
+const Aes192 = @import("aes192").Aes192;
 
-const CbcMark = Marker(enum { aes128, aes256, roundtrip, malleability, misaligned_refused, short_out_refused });
+const CbcMark = Marker(enum { aes128, aes192, aes256, roundtrip, malleability, misaligned_refused, short_out_refused });
 const PadMark = Marker(enum { genuine_unpadded, valid, invalid, xmlenc_valid, xmlenc_invalid });
 
 fn cbcSmith(_: void, s: *testing.Smith) !void {
@@ -152,12 +153,19 @@ fn fuzzCbc(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var raw: [256]u8 = undefined;
     const n: usize = src.slice(&raw);
     var k: Cursor = .{ .bytes = raw[0..n] };
-    if (k.byte() & 1 == 0) {
-        CbcMark.mark(.aes128);
-        try cbcCase(Aes128, &k);
-    } else {
-        CbcMark.mark(.aes256);
-        try cbcCase(Aes256, &k);
+    switch (k.byte() % 3) {
+        0 => {
+            CbcMark.mark(.aes128);
+            try cbcCase(Aes128, &k);
+        },
+        1 => {
+            CbcMark.mark(.aes192);
+            try cbcCase(Aes192, &k);
+        },
+        else => {
+            CbcMark.mark(.aes256);
+            try cbcCase(Aes256, &k);
+        },
     }
 }
 

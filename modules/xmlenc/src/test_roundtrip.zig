@@ -21,6 +21,8 @@ const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+const Aes192 = @import("aes192").Aes192;
+const Aes192Gcm = @import("aesgcm").Aes192Gcm;
 
 const xenc_ns = "http://www.w3.org/2001/04/xmlenc#";
 const xenc11_ns = "http://www.w3.org/2009/xmlenc11#";
@@ -714,15 +716,31 @@ test "teeth: unknown key-transport algorithm -> UnsupportedAlgorithm" {
     try std.testing.expectError(error.UnsupportedAlgorithm, roundTrip(a, xenc11_ns ++ "aes256-gcm", "http://example.com/kt", wrapped, content, kp.secret_key, .{}));
 }
 
-test "teeth: AES-192 content algorithm -> UnsupportedAlgorithm (std gap)" {
+// Was "teeth: AES-192 content algorithm -> UnsupportedAlgorithm (std gap)"
+// until 2026-10-10.
+test "round-trip: AES-192 everywhere — aes192-cbc and aes192-gcm content, kw-aes192 and rsa-oaep key transport" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0xC5} ** 32;
-    const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
-    defer a.free(wrapped);
-    const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
-    defer a.free(content);
-    try std.testing.expectError(error.UnsupportedAlgorithm, roundTrip(a, xenc_ns ++ "aes192-cbc", xenc_ns ++ "rsa-oaep-mgf1p", wrapped, content, kp.secret_key, .{}));
+    const cek = [_]u8{0xC5} ** 24;
+    const kek = [_]u8{0x6B} ** 24;
+    var kw_wrapped: [32]u8 = undefined;
+    kwWrap(&kek, &cek, &kw_wrapped);
+    const oaep_wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+    defer a.free(oaep_wrapped);
+    const cbc = try cbcEncrypt(a, Aes192, cek, plaintext_assertion);
+    defer a.free(cbc);
+    const gcm = try gcmEncrypt(a, Aes192Gcm, cek, plaintext_assertion);
+    defer a.free(gcm);
+    for ([_][]const u8{ xenc_ns ++ "aes192-cbc", xenc11_ns ++ "aes192-gcm" }, [_][]const u8{ cbc, gcm }) |alg, content| {
+        const o1 = try roundTrip(a, alg, xenc_ns ++ "kw-aes192", &kw_wrapped, content, kp.secret_key, .{ .kek = &kek });
+        defer a.free(o1);
+        try std.testing.expectEqualStrings(plaintext_assertion, o1);
+        const o2 = try roundTrip(a, alg, xenc_ns ++ "rsa-oaep-mgf1p", oaep_wrapped, content, kp.secret_key, .{});
+        defer a.free(o2);
+        try std.testing.expectEqualStrings(plaintext_assertion, o2);
+    }
+    // A 24-byte KEK is still refused for kw-aes256 (the length must match the algorithm).
+    try std.testing.expectError(error.UnsupportedAlgorithm, roundTrip(a, xenc11_ns ++ "aes192-gcm", xenc_ns ++ "kw-aes256", &kw_wrapped, gcm, kp.secret_key, .{ .kek = &kek }));
 }
 
 test "teeth: wrong private key -> DecryptionError" {
@@ -823,6 +841,7 @@ fn kwWrap(kek: []const u8, plaintext: []const u8, out: []u8) void {
             @memcpy(block[8..16], r[i * 8 ..][0..8]);
             switch (kek.len) {
                 16 => aes.Aes128.initEnc(kek[0..16].*).encrypt(&block, &block),
+                24 => Aes192.initEnc(kek[0..24].*).encrypt(&block, &block),
                 32 => aes.Aes256.initEnc(kek[0..32].*).encrypt(&block, &block),
                 else => unreachable,
             }
@@ -874,8 +893,9 @@ const fuzz_content_algs = [_][]const u8{
     xenc_ns ++ "aes256-cbc",
     xenc11_ns ++ "aes128-gcm",
     xenc11_ns ++ "aes256-gcm",
-    xenc_ns ++ "aes192-cbc", // real xmlenc algorithm this module refuses
+    xenc_ns ++ "aes192-cbc", // refused until 2026-10-10 (no AES-192 in std); now the aes192 module
     "urn:not-an-algorithm",
+    xenc11_ns ++ "aes192-gcm", // appended, so the corpus seeds' indices above keep their meaning
 };
 
 const fuzz_key_algs = [_][]const u8{
@@ -885,6 +905,7 @@ const fuzz_key_algs = [_][]const u8{
     xenc_ns ++ "kw-aes128",
     xenc_ns ++ "kw-aes256",
     "urn:not-an-algorithm",
+    xenc_ns ++ "kw-aes192", // appended (see fuzz_content_algs)
 };
 
 const fuzz_digest_algs = [_][]const u8{
@@ -1179,7 +1200,9 @@ fn buildFuzzCase(
 
     @memcpy(kek[0..@min(raw_len, 32)], raw[0..@min(raw_len, 32)]);
     const kek_len: usize = switch (sc.kek_kind) {
-        0 => 16,
+        // kw-aes192 (2026-10-10) takes a 24-octet KEK; every other choice
+        // keeps the 16 it always had, so the existing seeds read the same.
+        0 => if (std.mem.endsWith(u8, fuzz_key_algs[sc.key_alg], "kw-aes192")) 24 else 16,
         1 => 32,
         else => 0,
     };

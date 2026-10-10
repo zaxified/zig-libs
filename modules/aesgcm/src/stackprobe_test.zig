@@ -19,6 +19,7 @@ const P = sp.Probe(.{ .window = 64 * 1024 });
 var key: [32]u8 = undefined;
 var ctx256: root.Aes256Gcm.Context = undefined;
 var ctx128: root.Aes128Gcm.Context = undefined;
+var ctx192: root.Aes192Gcm.Context = undefined;
 var tag: [16]u8 = undefined;
 var ct: [1024]u8 = undefined;
 var pt: [1024]u8 = undefined;
@@ -44,5 +45,14 @@ test "STACKPROBE: no AES-GCM key or round-key residue after any entry point" {
     try std.testing.expectEqualSlices(u8, &msg, &pt);
     _ = try P.run("Aes128Gcm.encryptInto", root.Aes128Gcm.encryptInto, .{ &ct, &tag, &msg, ad, nonce, k128 }, &.{k128}, .{});
     _ = try P.run("Aes128Gcm.decryptInto", root.Aes128Gcm.decryptInto, .{ &pt, &ct, tag, ad, nonce, k128 }, &.{k128}, .{});
+    try std.testing.expectEqualSlices(u8, &msg, &pt);
+
+    // AES-192 (2026-10-10): both backends' key schedules and the stateless pair.
+    const k192: *const [24]u8 = key[0..24];
+    _ = try P.run("Aes192Gcm.initWithInto generic", root.Aes192Gcm.initWithInto, .{ &ctx192, .generic, k192 }, &.{ k192, std.mem.asBytes(&ctx192) }, .{});
+    if (root.available(.aesni))
+        _ = try P.run("Aes192Gcm.initWithInto aesni", root.Aes192Gcm.initWithInto, .{ &ctx192, .aesni, k192 }, &.{ k192, std.mem.asBytes(&ctx192) }, .{});
+    _ = try P.run("Aes192Gcm.encryptInto", root.Aes192Gcm.encryptInto, .{ &ct, &tag, &msg, ad, nonce, k192 }, &.{k192}, .{});
+    _ = try P.run("Aes192Gcm.decryptInto", root.Aes192Gcm.decryptInto, .{ &pt, &ct, tag, ad, nonce, k192 }, &.{k192}, .{});
     try std.testing.expectEqualSlices(u8, &msg, &pt);
 }

@@ -266,11 +266,11 @@ const module_list = [_]Module{
     .{ .name = "xml", .libs = &.{ "web", "net" }, .test_deps = &.{"testkit"} },
     .{ .name = "xmldsig", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "p256" }, .test_deps = &.{"testkit"} },
     .{ .name = "saml", .libs = &.{"web"}, .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "x509", "datefmt" }, .heavy = true, .test_deps = &.{"testkit"} },
-    .{ .name = "xmlenc", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "aescbc", "aeskw" }, .heavy = true, .test_deps = &.{"testkit"} },
-    .{ .name = "aescbc", .libs = &.{ "web", "crypto" }, .test_deps = &.{"testkit"} },
-    .{ .name = "aeskw", .libs = &.{"web"}, .test_deps = &.{"testkit"} },
+    .{ .name = "xmlenc", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm" }, .heavy = true, .test_deps = &.{"testkit"} },
+    .{ .name = "aescbc", .libs = &.{ "web", "crypto" }, .test_deps = &.{ "testkit", "aes192" } }, // aes192: the AES-192 KAT/fuzz cases (the API is generic over the cipher type)
+    .{ .name = "aeskw", .libs = &.{"web"}, .deps = &.{"aes192"}, .test_deps = &.{"testkit"} }, // aes192: the 24-byte KEK arm
     .{ .name = "aes192", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
-    .{ .name = "jwe", .libs = &.{"web"}, .deps = &.{ "rsa", "p256", "aescbc", "aeskw" }, .test_deps = &.{"testkit"} },
+    .{ .name = "jwe", .libs = &.{"web"}, .deps = &.{ "rsa", "p256", "aescbc", "aeskw", "aes192", "aesgcm" }, .test_deps = &.{"testkit"} },
     .{ .name = "rdap", .libs = &.{"net"}, .deps = &.{ "http", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "blobstore", .libs = &.{"storage"}, .deps = &.{"hashdigest"} },
     .{ .name = "procnet", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
@@ -396,7 +396,7 @@ const module_list = [_]Module{
     .{ .name = "tfhe", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "montint", .libs = &.{"crypto"}, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "chachapoly", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
-    .{ .name = "aesgcm", .libs = &.{ "crypto", "net" }, .test_deps = &.{"testkit"} },
+    .{ .name = "aesgcm", .libs = &.{ "crypto", "net" }, .deps = &.{"aes192"}, .test_deps = &.{"testkit"} }, // aes192: Aes192Gcm's generic backend
     .{ .name = "k256", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "p256", .libs = &.{ "crypto", "web" }, .test_deps = &.{"testkit"} },
     .{ .name = "ripemd160", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },

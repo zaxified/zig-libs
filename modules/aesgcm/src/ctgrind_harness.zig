@@ -25,13 +25,14 @@
 //! ## Targets
 //!
 //! - `ctx`       — `Context` on the `.aesni` backend (the stitched kernel);
-//! - `stateless` — `Aes128Gcm/Aes256Gcm.encrypt/decrypt(…, key)`, which build a
+//! - `stateless` — `Aes{128,192,256}Gcm.encrypt/decrypt(…, key)`, which build a
 //!                 stack context with only the powers the lengths need;
 //! - `generic`   — `Context` on the `.generic` backend (std's AES, CTR and
 //!                 GHASH with the schedule cached). Its pattern names std's
 //!                 files too: std's property IS this backend's property.
 //!
-//! Each target runs AES-128 and AES-256 over lengths that reach every path:
+//! Each target runs AES-128, AES-192 (since 2026-10-10; generic = the `aes192`
+//! module's block cipher) and AES-256 over lengths that reach every path:
 //! the short single-group path (0, 13, 64, 96), the tail after AD hashed
 //! separately (112 with 20-byte AD), one batch plus the delayed GHASH (200),
 //! and the stitched loop with a partial block (1000, 4099) — sealing, opening
@@ -92,7 +93,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("valgrind_support={} target={t} backend={t}\n", .{ builtin.valgrind_support, target, root.backend() });
 
-    inline for (.{ root.Aes128Gcm, root.Aes256Gcm }) |Gcm| {
+    inline for (.{ root.Aes128Gcm, root.Aes192Gcm, root.Aes256Gcm }) |Gcm| {
         var wide: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash("ctgrind-aesgcm-harness-key-v1", &wide, .{});
         var key_mem: [Gcm.key_length]u8 = wide[0..Gcm.key_length].*;

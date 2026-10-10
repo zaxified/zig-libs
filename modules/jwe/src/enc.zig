@@ -4,35 +4,32 @@
 //! parameter's algorithm family, i.e. what actually protects the plaintext
 //! (as opposed to `alg.zig`, which protects the CEK).
 //!
-//! REAL: `A128GCM`/`A256GCM` — direct `std.crypto.aead.aes_gcm` calls.
-//! `A192GCM` is a **std gap, not a stub**: Zig 0.16's `std.crypto.aead.aes_gcm`
-//! ships only `Aes128Gcm`/`Aes256Gcm` (no `Aes192Gcm`, because
-//! `std.crypto.core.aes` itself has no AES-192 block cipher) — there is no
-//! std primitive to call, so this returns `error.UnsupportedKeyLength`
-//! rather than a `TODO(fable)` stub. Fixing it needs an AES-192 core to
-//! exist first (upstream std, or a new from-scratch primitive), which is a
-//! different kind of work than reviewing an already-written careful core.
+//! REAL: `A128GCM`/`A256GCM` — direct `std.crypto.aead.aes_gcm` calls;
+//! `A192GCM` — the `aesgcm` module's `Aes192Gcm` (Zig 0.16's std has no
+//! AES-192 at all; `aesgcm` runs it over the `aes192` block cipher), since
+//! 2026-10-10.
 //!
 //! REAL (see the `cbc_hmac` namespace): `A128CBC-HS256`/`A256CBC-HS512`
 //! (RFC 7518 §5.2) — AES-CBC (raw block-chaining + PKCS#7 padding from the
 //! shared `aescbc` module) + HMAC-SHA-2 "encrypt-then-MAC" with the §5.2.2
 //! key split, AAD-bit-length encoding, and verify-before-decrypt ordering;
-//! byte-exact against RFC 7518 Appendix B. `A192CBC-HS384` hits the same
-//! AES-192 std gap as `A192GCM` (its HMAC-SHA-384 half is validated against
-//! the B.2 vector below; its CBC half has no std cipher to call).
+//! byte-exact against RFC 7518 Appendix B. `A192CBC-HS384` (since
+//! 2026-10-10) runs its CBC half over the `aes192` module's `Aes192`,
+//! byte-exact against B.2.
 
 const std = @import("std");
 const burn = @import("burn.zig");
 const aead = std.crypto.aead.aes_gcm;
 const aescbc = @import("aescbc");
+const aes192 = @import("aes192");
+const aesgcm = @import("aesgcm");
 
 const root = @import("root.zig");
 const Enc = root.Enc;
 
 pub const Error = error{
     BufferTooSmall,
-    /// `enc` needs a key length std 0.16 has no cipher for (AES-192; see
-    /// module doc comment), or `enc` is `.unknown`.
+    /// `enc` is not a content-encryption algorithm (`.unknown`).
     UnsupportedKeyLength,
     /// GCM tag or CBC-HMAC tag did not verify — or, equivalently for
     /// CBC-HMAC, the PKCS#7 padding was invalid (deliberately the SAME error,
@@ -116,8 +113,8 @@ noinline fn decryptUnburned(
     return cbc_hmac.decrypt(enc, cek, iv, aad, ciphertext, tag, plaintext_out);
 }
 
-/// `A128GCM`/`A192GCM`/`A256GCM` (RFC 7518 §5.3) — direct
-/// `std.crypto.aead.aes_gcm`. Real, not a stub.
+/// `A128GCM`/`A192GCM`/`A256GCM` (RFC 7518 §5.3) — `std.crypto.aead.aes_gcm`
+/// for 128/256, `aesgcm.Aes192Gcm` for 192 (std has none).
 const gcm = struct {
     // secret-api-ok: `gcm` is private to this file and reached only through `encrypt` / `decrypt` above, which run it under `burn.content_burn`
     pub fn encrypt(
@@ -141,7 +138,10 @@ const gcm = struct {
                 if (key.len != 32) return error.BufferTooSmall;
                 aead.Aes256Gcm.encrypt(ct, tag, plaintext, aad, iv[0..12].*, key[0..32].*);
             },
-            .A192GCM => return error.UnsupportedKeyLength, // std gap, see module doc comment
+            .A192GCM => {
+                if (key.len != 24) return error.BufferTooSmall;
+                aesgcm.Aes192Gcm.encryptInto(ct, tag, plaintext, aad, iv[0..12].*, key[0..24]);
+            },
             else => return error.UnsupportedKeyLength,
         }
         return plaintext.len;
@@ -169,7 +169,10 @@ const gcm = struct {
                 if (key.len != 32) return error.BufferTooSmall;
                 aead.Aes256Gcm.decrypt(pt, ciphertext, tag_arr, aad, iv[0..12].*, key[0..32].*) catch return error.AuthenticationFailed;
             },
-            .A192GCM => return error.UnsupportedKeyLength,
+            .A192GCM => {
+                if (key.len != 24) return error.BufferTooSmall;
+                aesgcm.Aes192Gcm.decryptInto(pt, ciphertext, tag_arr, aad, iv[0..12].*, key[0..24]) catch return error.AuthenticationFailed;
+            },
             else => return error.UnsupportedKeyLength,
         }
         return ciphertext.len;
@@ -177,16 +180,14 @@ const gcm = struct {
 };
 
 /// `A128CBC-HS256`/`A256CBC-HS512` (RFC 7518 §5.2) — AES-CBC (PKCS#7) +
-/// HMAC-SHA-2, encrypt-then-MAC. `A192CBC-HS384` is the same std AES-192 gap
-/// as `A192GCM` (see module doc comment): the HMAC-SHA-384 half is
-/// std-reachable (validated against the B.2 vector in a test below), but
-/// there is no AES-192 block cipher to build its CBC half from —
-/// `error.UnsupportedKeyLength`, never silently wrong.
+/// HMAC-SHA-2, encrypt-then-MAC. `A192CBC-HS384`'s CBC half runs on the
+/// `aes192` module's `Aes192` (std 0.16 has no AES-192).
 ///
 /// The construction (§5.2.2.1), with the classic footguns handled:
 ///
 ///   - **key split**: CEK = MAC_KEY ‖ ENC_KEY, MAC_KEY = the FIRST half,
-///     ENC_KEY = the SECOND half (§5.2.1 steps 1-2; 16+16 / 32+32 bytes).
+///     ENC_KEY = the SECOND half (§5.2.1 steps 1-2; 16+16 / 24+24 / 32+32
+///     bytes).
 ///   - **AAD length encoding (`AL`)**: the number of **bits** in the AAD as
 ///     an unsigned 64-bit **big-endian** integer (§5.1 step 5, §5.2.2.1
 ///     step 4) — bits, not bytes.
@@ -204,8 +205,7 @@ const gcm = struct {
 ///     secret-dependent early exits — a padding error is indistinguishable
 ///     from a tag error to the caller.
 ///
-/// KAT: RFC 7518 Appendix B.1/B.3 byte-exact both directions (B.2's HMAC
-/// half only — see above), plus RFC 7516 Appendix A.3's full compact-token
+/// KAT: RFC 7518 Appendix B.1/B.2/B.3 byte-exact both directions, plus RFC 7516 Appendix A.3's full compact-token
 /// example in `kat_rfc7516.zig`.
 pub const cbc_hmac = struct {
     const aes_core = std.crypto.core.aes;
@@ -224,7 +224,7 @@ pub const cbc_hmac = struct {
         return switch (enc) {
             .@"A128CBC-HS256" => encryptImpl(aes_core.Aes128, hmac.HmacSha256, cek, iv, aad, plaintext, ciphertext_out, tag_out),
             .@"A256CBC-HS512" => encryptImpl(aes_core.Aes256, hmac.HmacSha512, cek, iv, aad, plaintext, ciphertext_out, tag_out),
-            .@"A192CBC-HS384" => error.UnsupportedKeyLength, // std AES-192 gap, see doc comment
+            .@"A192CBC-HS384" => encryptImpl(aes192.Aes192, hmac.HmacSha384, cek, iv, aad, plaintext, ciphertext_out, tag_out),
             else => error.UnsupportedKeyLength,
         };
     }
@@ -241,7 +241,7 @@ pub const cbc_hmac = struct {
         return switch (enc) {
             .@"A128CBC-HS256" => decryptImpl(aes_core.Aes128, hmac.HmacSha256, cek, iv, aad, ciphertext, tag, plaintext_out),
             .@"A256CBC-HS512" => decryptImpl(aes_core.Aes256, hmac.HmacSha512, cek, iv, aad, ciphertext, tag, plaintext_out),
-            .@"A192CBC-HS384" => error.UnsupportedKeyLength, // std AES-192 gap, see doc comment
+            .@"A192CBC-HS384" => decryptImpl(aes192.Aes192, hmac.HmacSha384, cek, iv, aad, ciphertext, tag, plaintext_out),
             else => error.UnsupportedKeyLength,
         };
     }
@@ -344,8 +344,8 @@ pub const cbc_hmac = struct {
 
     /// RFC 7518 Appendix B known-answer vectors, transcribed verbatim and
     /// exercised by the KAT tests further down this file (B.1/B.3 through
-    /// `encrypt`/`decrypt` above, both directions; B.2's HMAC half directly —
-    /// AES-192 std gap), plus the independent `std.crypto`-only sanity
+    /// `encrypt`/`decrypt` above, both directions, B.2 included since the
+    /// `aes192` module), plus the independent `std.crypto`-only sanity
     /// oracle test.
     pub const kat = struct {
         /// B.1 — AES_128_CBC_HMAC_SHA_256.
@@ -477,12 +477,36 @@ test "A256GCM real round-trip + tamper detection" {
     try std.testing.expectError(error.AuthenticationFailed, gcm.decrypt(.A256GCM, &key, &iv, aad, &ct, &tag, &recovered));
 }
 
-test "A192GCM is a documented std gap, not silently wrong" {
-    const key = [_]u8{0} ** 24;
-    const iv = [_]u8{0} ** 12;
-    var ct: [4]u8 = undefined;
+// Was "A192GCM is a documented std gap" (UnsupportedKeyLength) until
+// 2026-10-10. RFC 7520 has no A192GCM example; McGrew–Viega test case 10
+// (AES-192, 60-byte P, 20-byte AAD) is the external anchor instead.
+test "A192GCM: McGrew–Viega GCM test case 10, both directions, tamper refused" {
+    const hexb = struct {
+        fn f(comptime h: []const u8) [h.len / 2]u8 {
+            var o: [h.len / 2]u8 = undefined;
+            _ = std.fmt.hexToBytes(&o, h) catch unreachable;
+            return o;
+        }
+    }.f;
+    const key = hexb("feffe9928665731c6d6a8f9467308308feffe9928665731c");
+    const iv = hexb("cafebabefacedbaddecaf888");
+    const aad = hexb("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+    const p = hexb("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72" ++
+        "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39");
+    const c = hexb("3980ca0b3c00e841eb06fac4872a2757859e1ceaa6efd984628593b40ca1e19c" ++
+        "7d773d00c144c525ac619d18c84a3f4718e2448b2fe324d9ccda2710");
+    const t = hexb("2519498e80f1478f37ba55bd6d27618c");
+    var ct: [p.len]u8 = undefined;
     var tag: [16]u8 = undefined;
-    try std.testing.expectError(error.UnsupportedKeyLength, gcm.encrypt(.A192GCM, &key, &iv, "", "abcd", &ct, &tag));
+    _ = try gcm.encrypt(.A192GCM, &key, &iv, &aad, &p, &ct, &tag);
+    try std.testing.expectEqualSlices(u8, &c, &ct);
+    try std.testing.expectEqualSlices(u8, &t, &tag);
+    var back: [p.len]u8 = undefined;
+    _ = try gcm.decrypt(.A192GCM, &key, &iv, &aad, &c, &t, &back);
+    try std.testing.expectEqualSlices(u8, &p, &back);
+    var bad = t;
+    bad[0] ^= 1;
+    try std.testing.expectError(error.AuthenticationFailed, gcm.decrypt(.A192GCM, &key, &iv, &aad, &c, &bad, &back));
 }
 
 test "RFC 7518 B.1 (A128CBC-HS256): byte-exact E and T, both directions" {
@@ -513,38 +537,21 @@ test "RFC 7518 B.3 (A256CBC-HS512): byte-exact E and T, both directions" {
     try std.testing.expectEqualSlices(u8, &b1.p, pt[0..m]);
 }
 
-test "RFC 7518 B.2 (A192CBC-HS384): AES-192 std gap — CBC half typed-unsupported, HMAC half byte-exact" {
-    // Verified against std 0.16's source: `std.crypto.core.aes` exports only
-    // `Aes128`/`Aes256` (no AES-192 key schedule in any backend —
-    // aesni/armcrypto/soft), so there is no block cipher to build
-    // A192CBC-HS384's CBC half from. The dispatch must fail typed, never
-    // silently substitute a wrong key size:
+test "RFC 7518 B.2 (A192CBC-HS384): byte-exact E and T, both directions" {
+    // Was a typed-unsupported check of the CBC half plus a byte-exact HMAC
+    // half, until the `aes192` module (2026-10-10). B.2 reuses B.1's
+    // P/IV/A; only K/E/T differ.
     const b1 = cbc_hmac.kat.b1;
     const b2 = cbc_hmac.kat.b2;
     var ct: [b2.e.len]u8 = undefined;
     var tag: [24]u8 = undefined;
-    try std.testing.expectError(
-        error.UnsupportedKeyLength,
-        cbc_hmac.encrypt(.@"A192CBC-HS384", &b2.k, &b1.iv, &b1.a, &b1.p, &ct, &tag),
-    );
-    var pt: [b2.e.len]u8 = undefined;
-    try std.testing.expectError(
-        error.UnsupportedKeyLength,
-        cbc_hmac.decrypt(.@"A192CBC-HS384", &b2.k, &b1.iv, &b1.a, &b2.e, &b2.t, &pt),
-    );
+    const n = try cbc_hmac.encrypt(.@"A192CBC-HS384", &b2.k, &b1.iv, &b1.a, &b1.p, &ct, &tag);
+    try std.testing.expectEqualSlices(u8, &b2.e, ct[0..n]);
+    try std.testing.expectEqualSlices(u8, &b2.t, &tag);
 
-    // The construction's HMAC-SHA-384 half IS std-reachable — validate T
-    // byte-exact against the transcribed E (B.2 reuses B.1's IV/A/AL), so
-    // the only missing piece is genuinely the AES-192 core.
-    const HmacSha384 = std.crypto.auth.hmac.sha2.HmacSha384;
-    var mac = HmacSha384.init(b2.mac_key);
-    mac.update(&b1.a);
-    mac.update(&b1.iv);
-    mac.update(&b2.e);
-    mac.update(&b1.al);
-    var full: [48]u8 = undefined;
-    mac.final(&full);
-    try std.testing.expectEqualSlices(u8, &b2.t, full[0..24]);
+    var pt: [b2.e.len]u8 = undefined;
+    const m = try cbc_hmac.decrypt(.@"A192CBC-HS384", &b2.k, &b1.iv, &b1.a, &b2.e, &b2.t, &pt);
+    try std.testing.expectEqualSlices(u8, &b1.p, pt[0..m]);
 }
 
 test "CBC-HMAC decrypt fails closed: tag mismatch and padding failure are the SAME error" {

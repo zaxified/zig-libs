@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! aesgcm — AES-GCM (NIST SP 800-38D), AES-128 and AES-256, 96-bit nonces,
+//! aesgcm — AES-GCM (NIST SP 800-38D), AES-128/192/256, 96-bit nonces,
 //! 128-bit tags: a drop-in for `std.crypto.aead.aes_gcm` plus a stateful
 //! `Context` that keeps the expanded key and the GHASH key powers across
 //! messages.
@@ -23,6 +23,12 @@
 //! assembly, which does not need them). Everywhere else — arm64 included —
 //! the `generic` backend runs std's own AES and GHASH primitives (hardware on
 //! arm64 when the target has `aes`), still with the per-key state cached.
+//!
+//! AES-192 (`Aes192Gcm`, since 2026-10-10): std 0.16 has no AES-192, so the
+//! generic backend and the stateless generic path take the block cipher from
+//! the sibling `aes192` module (std's round primitive under its own key
+//! expansion); the x86-64 kernel runs it with Nr = 12 and its own
+//! `aesenclast`-based Nk = 6 expansion.
 
 const std = @import("std");
 const burn = @import("burn.zig");
@@ -31,16 +37,17 @@ const crypto = std.crypto;
 const mem = std.mem;
 const assert = std.debug.assert;
 const Ghash = crypto.onetimeauth.Ghash;
+const aes192 = @import("aes192");
 
 pub const meta = .{
-    .doc = "AES-GCM (AES-128/256) — stateful context caching the key schedule and GHASH powers, x86-64 AES-NI+PCLMULQDQ stitched one-pass kernel picked at run time, std fallback; std-shaped stateless API.",
+    .doc = "AES-GCM (AES-128/192/256) — stateful context caching the key schedule and GHASH powers, x86-64 AES-NI+PCLMULQDQ stitched one-pass kernel picked at run time, std fallback; std-shaped stateless API.",
     .platform_note = "any (x86-64 AES-NI/PCLMULQDQ asm, run-time detected + std fallback)",
     .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "OpenSSL/BoringSSL aesni-gcm (stitched CTR+GHASH); Gueron–Kounavis Intel CLMUL GCM white paper; std.crypto.aead.aes_gcm API",
-    .deps = .{},
+    .deps = .{"aes192"}, // the AES-192 block cipher for Aes192Gcm's generic backend (std 0.16 has none)
 };
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -48,6 +55,9 @@ pub const meta = .{
 pub const AuthenticationError = crypto.errors.AuthenticationError;
 
 pub const Aes128Gcm = AesGcm(128);
+/// AES-192-GCM. std has no `Aes192Gcm` to drop in for; same API as the other
+/// two, with the generic backend over the `aes192` module.
+pub const Aes192Gcm = AesGcm(192);
 pub const Aes256Gcm = AesGcm(256);
 
 pub const Backend = enum {
@@ -79,15 +89,27 @@ pub fn available(b: Backend) bool {
 
 /// AES-GCM over a `key_bits`-bit key: 96-bit nonce, 128-bit tag.
 fn AesGcm(comptime key_bits: u16) type {
-    comptime assert(key_bits == 128 or key_bits == 256);
+    comptime assert(key_bits == 128 or key_bits == 192 or key_bits == 256);
     return struct {
         pub const key_length = key_bits / 8;
         pub const nonce_length = 12;
         pub const tag_length = 16;
 
-        const nr = if (key_bits == 128) 10 else 14;
-        const StdGcm = if (key_bits == 128) crypto.aead.aes_gcm.Aes128Gcm else crypto.aead.aes_gcm.Aes256Gcm;
-        const StdAes = if (key_bits == 128) crypto.core.aes.Aes128 else crypto.core.aes.Aes256;
+        /// std's AEAD for the stateless generic path; none for AES-192.
+        const StdGcm = switch (key_bits) {
+            128 => crypto.aead.aes_gcm.Aes128Gcm,
+            256 => crypto.aead.aes_gcm.Aes256Gcm,
+            else => void,
+        };
+        /// The block cipher of the generic backend: std's, or `aes192`'s
+        /// (same declarations, same round primitive).
+        const BlockCipher = switch (key_bits) {
+            128 => crypto.core.aes.Aes128,
+            192 => aes192.Aes192,
+            256 => crypto.core.aes.Aes256,
+            else => unreachable,
+        };
+        const EncCtx = @typeInfo(@TypeOf(BlockCipher.initEnc)).@"fn".return_type.?;
         const Ni = NiKey(key_bits);
 
         /// Everything derived from one key: the AES round keys and the GHASH
@@ -236,7 +258,11 @@ fn AesGcm(comptime key_bits: u16) type {
             assert(c.len == m.len);
             assert(m.len <= max_message_len);
             switch (backend()) {
-                .generic => StdGcm.encrypt(c, tag, m, ad, npub, key.*),
+                .generic => if (key_bits == 192) {
+                    var g = Generic.init(key.*);
+                    defer crypto.secureZero(u8, mem.asBytes(&g));
+                    g.seal(c, tag, m, ad, npub);
+                } else StdGcm.encrypt(c, tag, m, ad, npub, key.*),
                 .aesni => if (x86_asm) {
                     var k = Ni.init(key.*, powersFor(ad.len, m.len));
                     defer wipeBlocks(@ptrCast(&k), @sizeOf(@TypeOf(k)) / 16);
@@ -260,7 +286,11 @@ fn AesGcm(comptime key_bits: u16) type {
             assert(c.len == m.len);
             assert(m.len <= max_message_len);
             switch (backend()) {
-                .generic => StdGcm.decrypt(m, c, tag, ad, npub, key.*) catch |err| {
+                .generic => if (key_bits == 192) {
+                    var g = Generic.init(key.*);
+                    defer crypto.secureZero(u8, mem.asBytes(&g));
+                    return g.open(m, c, tag, ad, npub); // zeroes `m` on failure
+                } else StdGcm.decrypt(m, c, tag, ad, npub, key.*) catch |err| {
                     crypto.secureZero(u8, m);
                     return err;
                 },
@@ -278,11 +308,11 @@ fn AesGcm(comptime key_bits: u16) type {
         /// would add 256 bytes to every context for a saving only long
         /// messages see.
         const Generic = struct {
-            aes: crypto.core.aes.AesEncryptCtx(StdAes),
+            aes: EncCtx,
             h: [16]u8,
 
             fn init(key: [key_length]u8) Generic {
-                const aes = StdAes.initEnc(key);
+                const aes = BlockCipher.initEnc(key);
                 var g: Generic = .{ .aes = aes, .h = undefined };
                 aes.encrypt(&g.h, &@as([16]u8, @splat(0)));
                 return g;
@@ -633,7 +663,12 @@ fn shiftH(h_rev: V) V {
 fn NiKey(comptime key_bits: u16) type {
     return struct {
         const Self = @This();
-        const nr = if (key_bits == 128) 10 else 14;
+        const nr = switch (key_bits) {
+            128 => 10,
+            192 => 12,
+            256 => 14,
+            else => unreachable,
+        };
 
         /// AES round keys 0 … nr.
         rk: [nr + 1]V,
@@ -673,6 +708,22 @@ fn NiKey(comptime key_bits: u16) type {
                     k = prefixXor(k) ^ t;
                     rk[i] = k;
                 }
+            } else if (key_bits == 192) {
+                // Nk = 6 (FIPS-197 §5.2) word by word: every sixth word
+                // takes SubWord(RotWord(w)) ⊕ rcon from one `aesenclast` on
+                // RotWord(w) in all four columns, lane 0 read back. Words are
+                // little-endian u32 lanes, as `load` lays a block out.
+                var w: [4 * (nr + 1)]u32 = undefined;
+                inline for (0..6) |i| w[i] = mem.readInt(u32, key[4 * i ..][0..4], .little);
+                inline for (6..w.len) |i| {
+                    var t = w[i - 1];
+                    if (i % 6 == 0) {
+                        const s: @Vector(4, u32) = @bitCast(Isa.aesenclast(splat32(std.math.rotr(u32, t, 8)), splat32(rcon[i / 6 - 1])));
+                        t = s[0];
+                    }
+                    w[i] = w[i - 6] ^ t;
+                }
+                inline for (0..nr + 1) |r| rk[r] = @bitCast(@Vector(4, u32){ w[4 * r], w[4 * r + 1], w[4 * r + 2], w[4 * r + 3] });
             } else {
                 var a = load(key[0..16]);
                 var b = load(key[16..32]);
@@ -943,6 +994,21 @@ test "McGrew–Viega GCM test cases 1–4 (AES-128)" {
     try expectVector(Aes128Gcm, k, gcm_iv, gcm_p[0..60], &gcm_a, c3[0..60], hexBytes("5bc94fbc3221a5db94fae95ae7121a47"));
 }
 
+test "McGrew–Viega GCM test cases 7–10 (AES-192)" {
+    // Cases 11 and 12 use 64- and 480-bit IVs, which this module refuses
+    // (96-bit nonces only). Values re-checked against OpenSSL 3 when added.
+    const z24: [24]u8 = @splat(0);
+    const z16: [16]u8 = @splat(0);
+    const z12: [12]u8 = @splat(0);
+    try expectVector(Aes192Gcm, z24, z12, "", "", "", hexBytes("cd33b28ac773f74ba00ed1f312572435"));
+    try expectVector(Aes192Gcm, z24, z12, &z16, "", &hexBytes("98e7247c07f0fe411c267e4384b0f600"), hexBytes("2ff58d80033927ab8ef4d4587514f0fb"));
+    const k = hexBytes("feffe9928665731c6d6a8f9467308308feffe9928665731c");
+    const c9 = hexBytes("3980ca0b3c00e841eb06fac4872a2757859e1ceaa6efd984628593b40ca1e19c" ++
+        "7d773d00c144c525ac619d18c84a3f4718e2448b2fe324d9ccda2710acade256");
+    try expectVector(Aes192Gcm, k, gcm_iv, &gcm_p, "", &c9, hexBytes("9924a7c8587336bfb118024db8674a14"));
+    try expectVector(Aes192Gcm, k, gcm_iv, gcm_p[0..60], &gcm_a, c9[0..60], hexBytes("2519498e80f1478f37ba55bd6d27618c"));
+}
+
 test "McGrew–Viega GCM test cases 13–16 (AES-256)" {
     const z32: [32]u8 = @splat(0);
     const z16: [16]u8 = @splat(0);
@@ -971,7 +1037,7 @@ const openssl_kats = @import("testdata/openssl_kat.zig").vectors;
 test "long messages agree with OpenSSL (tools/openssl_kat.py)" {
     const buf = try testing.allocator.alloc(u8, 3 * 20_000);
     defer testing.allocator.free(buf);
-    inline for (.{ Aes128Gcm, Aes256Gcm }) |Gcm| {
+    inline for (.{ Aes128Gcm, Aes192Gcm, Aes256Gcm }) |Gcm| {
         var key: [Gcm.key_length]u8 = undefined;
         var iv: [12]u8 = undefined;
         pattern(&key, 1);
@@ -1006,15 +1072,15 @@ test "long messages agree with OpenSSL (tools/openssl_kat.py)" {
 }
 
 // Wycheproof's AES-GCM vectors (C2SP/wycheproof, Apache-2.0 data -- see
-// NOTICE), made by `tools/wycheproof.py`: every test with a 128/256-bit key,
-// a 96-bit IV and a 128-bit tag. 79 valid, 54 with a modified tag that must
-// be refused -- third-party rejection cases, where the other anchors only
+// NOTICE), made by `tools/wycheproof.py`: every test with a 128/192/256-bit
+// key, a 96-bit IV and a 128-bit tag. 116 valid, 81 with a modified tag that
+// must be refused -- third-party rejection cases, where the other anchors only
 // have our own bit flips.
 const wycheproof = @import("testdata/wycheproof.zig").vectors;
 
 test "Wycheproof aes_gcm_test.json: valid vectors encrypt, modified tags are refused" {
     var counts = [2]usize{ 0, 0 };
-    inline for (.{ Aes128Gcm, Aes256Gcm }) |Gcm| {
+    inline for (.{ Aes128Gcm, Aes192Gcm, Aes256Gcm }) |Gcm| {
         for (wycheproof) |v| {
             if (v.bits != Gcm.key_length * 8) continue;
             counts[@intFromBool(v.valid)] += 1;
@@ -1060,8 +1126,9 @@ test "Wycheproof aes_gcm_test.json: valid vectors encrypt, modified tags are ref
         }
     }
     // Pinned so a regenerated table that silently lost a class shows here.
-    try testing.expectEqual(@as(usize, 79), counts[1]);
-    try testing.expectEqual(@as(usize, 54), counts[0]);
+    // 79 + 54 for 128/256; 37 + 27 for 192 (added 2026-10-10).
+    try testing.expectEqual(@as(usize, 116), counts[1]);
+    try testing.expectEqual(@as(usize, 81), counts[0]);
 }
 
 fn hexAlloc(s: []const u8) ![]u8 {
@@ -1070,10 +1137,26 @@ fn hexAlloc(s: []const u8) ![]u8 {
     return out;
 }
 
+/// The reference a differential test compares against: std's AEAD, or for
+/// AES-192 (std has none) the `.generic` backend — std's CTR and GHASH over
+/// the `aes192` block cipher, anchored itself by McGrew–Viega 7–10 and the
+/// OpenSSL table.
+fn refEncrypt(comptime Gcm: type, c: []u8, t: *[16]u8, m: []const u8, ad: []const u8, iv: [12]u8, key: [Gcm.key_length]u8) void {
+    switch (Gcm.key_length) {
+        16 => crypto.aead.aes_gcm.Aes128Gcm.encrypt(c, t, m, ad, iv, key),
+        32 => crypto.aead.aes_gcm.Aes256Gcm.encrypt(c, t, m, ad, iv, key),
+        24 => {
+            var r = Gcm.initWith(.generic, key).?;
+            defer r.wipe();
+            r.encrypt(c, t, m, ad, iv);
+        },
+        else => unreachable,
+    }
+}
+
 /// One random case against std: stateless and every backend's context,
 /// encrypt out-of-place and in-place, decrypt both ways.
 fn diffOne(comptime Gcm: type, rnd: std.Random, buf: []u8, m_len: usize, ad_len: usize) !void {
-    const Std = if (Gcm.key_length == 16) crypto.aead.aes_gcm.Aes128Gcm else crypto.aead.aes_gcm.Aes256Gcm;
     var key: [Gcm.key_length]u8 = undefined;
     var iv: [12]u8 = undefined;
     var ad_buf: [128]u8 = undefined;
@@ -1086,7 +1169,7 @@ fn diffOne(comptime Gcm: type, rnd: std.Random, buf: []u8, m_len: usize, ad_len:
     const got = buf[2 * m_len ..][0..m_len];
     rnd.bytes(m);
     var want_t: [16]u8 = undefined;
-    Std.encrypt(want_c, &want_t, m, ad, iv, key);
+    refEncrypt(Gcm, want_c, &want_t, m, ad, iv, key);
 
     var t: [16]u8 = undefined;
     Gcm.encrypt(got, &t, m, ad, iv, key);
@@ -1112,7 +1195,7 @@ fn diffOne(comptime Gcm: type, rnd: std.Random, buf: []u8, m_len: usize, ad_len:
     }
 }
 
-test "differential against std: every length 0…300, AD 0…64, both key sizes" {
+test "differential against std: every length 0…300, AD 0…64, all three key sizes" {
     const buf = try testing.allocator.alloc(u8, 3 * 300);
     defer testing.allocator.free(buf);
     var prng = std.Random.DefaultPrng.init(0xae5_6c1);
@@ -1121,6 +1204,7 @@ test "differential against std: every length 0…300, AD 0…64, both key sizes"
         const ad_len = n % 65;
         try diffOne(Aes128Gcm, rnd, buf, n, ad_len);
         try diffOne(Aes256Gcm, rnd, buf, n, 64 - ad_len);
+        try diffOne(Aes192Gcm, rnd, buf, n, (ad_len * 7) % 65);
     }
 }
 
@@ -1137,7 +1221,11 @@ test "differential against std: random lengths up to 20 000" {
         else
             @min(max, 128 * rnd.uintAtMost(usize, 40) + rnd.uintAtMost(usize, 32) -| 16);
         const ad_len = rnd.uintAtMost(usize, 128);
-        if (i % 2 == 0) try diffOne(Aes128Gcm, rnd, buf, n, ad_len) else try diffOne(Aes256Gcm, rnd, buf, n, ad_len);
+        switch (i % 3) {
+            0 => try diffOne(Aes128Gcm, rnd, buf, n, ad_len),
+            1 => try diffOne(Aes256Gcm, rnd, buf, n, ad_len),
+            else => try diffOne(Aes192Gcm, rnd, buf, n, ad_len),
+        }
     }
 }
 
@@ -1218,7 +1306,7 @@ test "the stateless functions compute exactly the GHASH powers they use" {
 test "every single-bit change of tag, ciphertext or AD is refused, and the output zeroed" {
     var prng = std.Random.DefaultPrng.init(0x7a3);
     const rnd = prng.random();
-    inline for (.{ Aes128Gcm, Aes256Gcm }) |Gcm| {
+    inline for (.{ Aes128Gcm, Aes192Gcm, Aes256Gcm }) |Gcm| {
         for ([_]usize{ 0, 1, 17, 130, 300 }) |ml| {
             var key: [Gcm.key_length]u8 = undefined;
             var iv: [12]u8 = undefined;
@@ -1273,9 +1361,9 @@ test "the 32-bit counter wraps modulo 2^32 and leaves the nonce bits alone (inc3
     // batch and the tail, against a CTR reference built on std's AES.
     var prng = std.Random.DefaultPrng.init(0xc0de);
     const rnd = prng.random();
-    inline for (.{ 128, 256 }) |bits| {
+    inline for (.{ 128, 192, 256 }) |bits| {
         const Ni = NiKey(bits);
-        const StdAes = if (bits == 128) crypto.core.aes.Aes128 else crypto.core.aes.Aes256;
+        const StdAes = AesGcm(bits).BlockCipher;
         var key: [bits / 8]u8 = undefined;
         rnd.bytes(&key);
         const k = Ni.init(key, 8);
@@ -1321,8 +1409,11 @@ test "the x86 key expansion and GHASH multiply agree with std" {
     var prng = std.Random.DefaultPrng.init(4);
     const rnd = prng.random();
     for (0..50) |_| {
-        inline for (.{ 128, 256 }) |bits| {
-            const StdAes = if (bits == 128) crypto.core.aes.Aes128 else crypto.core.aes.Aes256;
+        inline for (.{ 128, 192, 256 }) |bits| {
+            // AES-192: the `aes192` module, itself anchored on FIPS-197 A.2/C.2
+            // and NIST CAVP, so the kernel's own Nk = 6 expansion is checked
+            // against an independent one.
+            const StdAes = AesGcm(bits).BlockCipher;
             var key: [bits / 8]u8 = undefined;
             rnd.bytes(&key);
             const k = NiKey(bits).init(key, 8);
@@ -1375,6 +1466,7 @@ test "backend picks AES-NI when the CPU has it" {
     // A context is per key and per direction of a connection, so its size
     // is per-connection memory: round keys + H..H^8, or the AES schedule + H.
     try testing.expect(@sizeOf(Aes128Gcm.Context) <= 320);
+    try testing.expect(@sizeOf(Aes192Gcm.Context) <= 352);
     try testing.expect(@sizeOf(Aes256Gcm.Context) <= 384);
     // std's constants, so the type drops in where std's was.
     try testing.expectEqual(crypto.aead.aes_gcm.Aes256Gcm.key_length, Aes256Gcm.key_length);
@@ -1437,11 +1529,10 @@ fn agreeHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!vo
     const c = fuzz_buf[1100..][0..m_len];
     const d = fuzz_buf[2200..][0..m_len];
     if (m_len > 0) mark(.nonempty_message);
-    inline for (.{ Aes128Gcm, Aes256Gcm }) |Gcm| {
-        const Std = if (Gcm.key_length == 16) crypto.aead.aes_gcm.Aes128Gcm else crypto.aead.aes_gcm.Aes256Gcm;
+    inline for (.{ Aes128Gcm, Aes192Gcm, Aes256Gcm }) |Gcm| {
         const k = key[0..Gcm.key_length].*;
         var want_t: [16]u8 = undefined;
-        Std.encrypt(d, &want_t, m, ad[0..ad_len], iv, k);
+        refEncrypt(Gcm, d, &want_t, m, ad[0..ad_len], iv, k);
         for (all_backends) |b| {
             var ctx = Gcm.initWith(b, k) orelse continue;
             var t: [16]u8 = undefined;

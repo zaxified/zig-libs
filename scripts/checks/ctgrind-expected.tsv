@@ -910,8 +910,8 @@ dkg	ReleaseFast	combine	1	0	89feb80b007daf9a	6407896882d3491c
 # failure reason, and the scan loop contributes 0 contexts, so there is neither.
 # ⚠ The same `u1`-flag idiom did NOT survive the compiler in fss
 # (`dpf.zig:326`), which is why this is measured rather than reviewed.
-aescbc	ReleaseFast	pkcs7	1	1	2f09d102e06cec62	c4046968725e140d
-aescbc	ReleaseFast	xmlenc	1	1	2f09d102e06cec62	c4046968725e140d
+aescbc	ReleaseFast	pkcs7	1	1	aeee3d5799e4743f	c4046968725e140d
+aescbc	ReleaseFast	xmlenc	1	1	aeee3d5799e4743f	c4046968725e140d
 # ── sealedbox: the secret-key text codecs ──────────────────────────────────
 # ⭐ These four were 8 / 7 / 43 / 47 until 2026-09-09, all of it std's
 # table-driven base64 and hex reached with a SECRET argument: 95 of the 105
@@ -1026,9 +1026,12 @@ bip32	ReleaseFast	mnemonic	1	3	a5dbfbf5eee08b66	d42db8cf9cdc2200
 # Source pin moved 2026-10-02 (d30dce13: `x86_asm` also off for the self-hosted
 # backend on a baseline CPU; the ReleaseFast/LLVM build is unchanged): --stacks
 # reads the same one line, root.zig:793 (NiKey.open) and :266 (Generic.open).
-aesgcm	ReleaseFast	ctx	1	4	92f999004abad8dd	beb9b7dd29864dad
-aesgcm	ReleaseFast	stateless	1	4	92f999004abad8dd	beb9b7dd29864dad
-aesgcm	ReleaseFast	generic	1	4	92f999004abad8dd	beb9b7dd29864dad
+# 2026-10-10: AES-192 added to the harness (Aes192Gcm; generic over the aes192
+# module, kernel with Nr = 12) -- 4 -> 6 per row, the same tag-check line for
+# the third key size, nothing else.
+aesgcm	ReleaseFast	ctx	1	6	c3d21ae3d7c7681b	b60805fea700d105
+aesgcm	ReleaseFast	stateless	1	6	c3d21ae3d7c7681b	b60805fea700d105
+aesgcm	ReleaseFast	generic	1	6	c3d21ae3d7c7681b	b60805fea700d105
 # groth16 (2026-10-09): the zkey prover's `.constant_time` MSM choice
 # (`zkprove.proveWith`). zkprove_ct pins 6 in-file, all at the public end:
 # `toAffine` on the three proof points (zkprove.zig, the return) -- the identity
@@ -1159,10 +1162,11 @@ mls	ReleaseFast	priv	1	4	944497b4eeb2d527	616cb338b933af50
 # day: uri 8 -> 0.
 otp	ReleaseFast	code	1	0	5185f8a2ee5289f4	df6ca288cedbb864
 otp	ReleaseFast	uri	1	0	778e776ffe3ec2b6	36cedfe2472c9cba
-# aeskw (2026-10-10) — wrap: KEK + wrapped key tainted, AES-128/256 KEKs,
-# wrap, unwrap, tampered unwrap. 4 = the integrity verdict after the
-# constant-time IV compare (root.zig:170), twice per KEK size.
-aeskw	ReleaseFast	wrap	1	4	a42b270bebe4dc0e	34f66a3308c23092
+# aeskw (2026-10-10) — wrap: KEK + wrapped key tainted, AES-128/192/256 KEKs
+# (192 via the aes192 module since 2026-10-10), wrap, unwrap, tampered unwrap.
+# 6 = the integrity verdict after the constant-time IV compare, twice per KEK
+# size.
+aeskw	ReleaseFast	wrap	1	6	95edc9b3698767c1	a613db024e13b3d3
 # aeadframe (2026-10-10) — chacha / aes: channel keys + plaintext tainted,
 # seal x3, rekeyInto, seal, open x4 + a tampered record. 5 each = the AEAD
 # tag-verify outcome of the opens (4 contexts) + rekey's NonceSpaceReuse

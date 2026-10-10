@@ -38,7 +38,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 RSA-OAEP with decoupled digest/MGF1 (incl. the SHA-256 + MGF1-SHA-1 shape real IdPs emit), `rsa-1_5` gated
 off by default, AES-KW, AES-128/256 CBC and GCM; generic error collapse plus a decoy CEK against unwrap-side timing
 (measured, see *Constant-time posture*); ciphertext cap; CipherReference refused before any crypto. **Where we are
-behind:** decrypt only (by design), no AES-192 (std has no `Aes192`), no MGF1-SHA384/512 or OAEP SHA-384/512, no
+behind:** decrypt only (by design), no MGF1-SHA384/512 or OAEP SHA-384/512, no
 3DES, no ECDH-ES key agreement.
 
 ## Scope
@@ -67,6 +67,7 @@ Also out of scope, and actively rejected:
 | `…2009/xmlenc11#rsa-oaep` | RSAES-OAEP, DigestMethod ∈ {SHA-1, SHA-256} and MGF ∈ {MGF1-SHA-1, MGF1-SHA-256} resolved **independently** — MGF defaults to MGF1-SHA1 when absent, whatever the digest is (RFC 8017 treats them as separate parameters, and real xenc11 configs pair SHA-256 with MGF1-SHA-1) | default |
 | `…2001/04/xmlenc#rsa-1_5` | RSAES-PKCS#1 v1.5 | **gated** by `allow_weak_rsa15` |
 | `…2001/04/xmlenc#kw-aes128` | RFC 3394 AES-128 key wrap | needs `Options.kek` (16 B) |
+| `…2001/04/xmlenc#kw-aes192` | RFC 3394 AES-192 key wrap (since 2026-10-10) | needs `Options.kek` (24 B) |
 | `…2001/04/xmlenc#kw-aes256` | RFC 3394 AES-256 key wrap | needs `Options.kek` (32 B) |
 
 The kw-aes* unwrap is delegated to the shared `aeskw` module (`aeskw.unwrap`,
@@ -96,8 +97,10 @@ OAEPparams (the OAEP label `L`) is honored when present, empty otherwise.
 | URI | Mode | Key |
 |-----|------|-----|
 | `…2001/04/xmlenc#aes128-cbc` | AES-128-CBC | 16 B |
+| `…2001/04/xmlenc#aes192-cbc` | AES-192-CBC (since 2026-10-10) | 24 B |
 | `…2001/04/xmlenc#aes256-cbc` | AES-256-CBC | 32 B |
 | `…2009/xmlenc11#aes128-gcm` | AES-128-GCM | 16 B |
+| `…2009/xmlenc11#aes192-gcm` | AES-192-GCM (since 2026-10-10) | 24 B |
 | `…2009/xmlenc11#aes256-gcm` | AES-256-GCM | 32 B |
 
 - **GCM** (preferred): ciphertext = `IV(12) ‖ ciphertext ‖ tag(16)`, AAD empty;
@@ -109,9 +112,11 @@ OAEPparams (the OAEP label `L`) is honored when present, empty otherwise.
   carries its own CBC loop or unpad logic; any `aescbc` error (misaligned
   input, invalid pad) collapses to this module's generic `DecryptionError`.
 
-**AES-192 (`aes192-cbc`/`aes192-gcm`) is `UnsupportedAlgorithm`, not a stub:**
-std 0.16 ships only `Aes128`/`Aes256` block ciphers (same gap `jwe` documents
-for A192*). The CEK length must match the content algorithm's key size, else
+**AES-192 (`aes192-cbc`/`aes192-gcm`, and `kw-aes192`) since 2026-10-10:**
+std 0.16 ships only `Aes128`/`Aes256`, so CBC runs `aescbc` over the `aes192`
+module's `Aes192` and GCM is `aesgcm.Aes192Gcm`; the key wrap is `aeskw`'s
+24-byte KEK arm. Before that date all three were `UnsupportedAlgorithm`. The
+CEK length must match the content algorithm's key size, else
 `DecryptionError`.
 
 ## Security posture (this decrypts attacker-influenced ciphertext)
@@ -269,7 +274,8 @@ strings.)
   README "Scope") and has no encrypt API to hand xmlsec1 anything.
 - **Teeth (with positive controls):** GCM tag tamper → `DecryptionError`; CBC
   corrupted block → `DecryptionError`; unknown content/key algorithm →
-  `UnsupportedAlgorithm`; AES-192 → `UnsupportedAlgorithm`; `rsa-1_5` without
+  `UnsupportedAlgorithm`; (AES-192 round-trips since 2026-10-10: both content
+  modes under kw-aes192 and rsa-oaep); `rsa-1_5` without
   opt-in → `WeakRsa15NotAllowed`; wrong private key → `DecryptionError`;
   CipherReference → `CipherReferenceUnsupported`; non-base64 CipherValue →
   `MalformedStructure`; kw-aes* without KEK → `KekNotProvided`; a genuinely
@@ -307,7 +313,7 @@ respective sibling modules. AES-GCM and base64 remain from std.
 - **ECDH-ES key agreement (`xenc11:ECDH-ES`, Concat KDF) for EncryptedKey** *(survey 2026-09-30)*: used by newer
   eIDAS/SAML profiles that avoid RSA transport; xmlsec supports it *(inferred)*. Effort: medium (needs P-256
   ECDH + Concat KDF; check siblings). Fits §2: yes. Low-medium priority.
-- **AES-192 CBC/GCM** *(survey 2026-09-30)*: blocked on std 0.16 shipping no `Aes192` (already stated in *Content encryption*); would need our own AES-192 core. Effort: medium; rare in practice. Fits §2: yes.
+- ~~**AES-192 CBC/GCM**~~ *(survey 2026-09-30)* — done 2026-10-10 over the `aes192`/`aesgcm` modules, `kw-aes192` too (see *Content encryption*).
 - **Encryption side (`encryptData`)** *(survey 2026-09-30)*: xmlsec encrypts; here a user building an IdP or a test peer cannot.
   The SPEC's Scope section makes this a scope decision, not a gap: raised as a question. Effort: medium. Fits §2: yes.
 

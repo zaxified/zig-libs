@@ -9,8 +9,8 @@
 //!
 //! ## What this measures
 //!
-//!  * `wrap` — the KEK and the key being wrapped tainted, AES-128 and AES-256
-//!    KEKs: `wrap`, `unwrap` of the result, and `unwrap` of a copy with one
+//!  * `wrap` — the KEK and the key being wrapped tainted, AES-128, AES-192
+//!    (the `aes192` module) and AES-256 KEKs: `wrap`, `unwrap` of the result, and `unwrap` of a copy with one
 //!    ciphertext byte flipped (rejected on the integrity check, which must be
 //!    a constant-time compare folded into one verdict). The wrapped output is
 //!    public (it is what goes on the wire) and is marked defined before the
@@ -69,6 +69,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     switch (target) {
         .wrap => {
             try run(16, taint);
+            try run(24, taint);
             try run(32, taint);
         },
     }

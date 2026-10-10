@@ -35,7 +35,7 @@ print()
 print("pub const Vector = struct { bits: u16, ad_len: usize, m_len: usize, tag: []const u8, ct_sha256: []const u8 };")
 print()
 print("pub const vectors = [_]Vector{")
-for bits in (128, 256):
+for bits in (128, 192, 256):
     key = pattern(bits // 8, 1)
     iv = pattern(12, 2)
     for ad_len, m_len in CASES:

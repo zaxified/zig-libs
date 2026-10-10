@@ -1,6 +1,6 @@
 # aesgcm
 
-**AES-GCM** (AES-128 and AES-256, 96-bit nonce, 128-bit tag) that is a
+**AES-GCM** (AES-128, AES-192 and AES-256, 96-bit nonce, 128-bit tag) that is a
 drop-in for `std.crypto.aead.aes_gcm` and faster than it in two ways: a
 **stateful `Context`** holds the expanded key and the GHASH key powers, so a
 TLS connection derives them once per key instead of once per record; and on

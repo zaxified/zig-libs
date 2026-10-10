@@ -5,7 +5,7 @@ Raw AES-CBC mode (NIST SP800-38A) over `std.crypto.core.aes`'s
 ships the AES block cipher but no CBC mode; this is the one place CBC gets
 implemented in this repo, so `xmlenc` and `jwe` (which each hand-rolled their
 own CBC loop) can build on it instead. See `SPEC.md` for the full design,
-the padding-oracle caveat, and the AES-192 exclusion.
+the padding-oracle caveat, and how AES-192 is passed in.
 
 - **Status:** `extract`. Zero dependencies.
 - **Model after:** NIST SP800-38A §6.2 (CBC mode); RFC 5652 §6.3 (PKCS#7
@@ -43,10 +43,9 @@ const n = try aescbc.unpadPkcs7(out[0..padded_len]);
 const n2 = try aescbc.unpadXmlEnc(decrypted[0..len]);
 ```
 
-`encrypt`/`decrypt` never allocate — caller supplies `out`. AES-192 is not
-offered (`std.crypto.core.aes` has no AES-192 core in 0.16); passing it is a
-compile error, not a runtime error, since the cipher is a `comptime` type
-parameter.
+`encrypt`/`decrypt` never allocate — caller supplies `out`. The cipher is a
+`comptime` type parameter: `std.crypto.core.aes.Aes128`/`Aes256`, or for
+AES-192 (which std 0.16 lacks) the `aes192` module's `Aes192`.
 
 **Padding-oracle warning:** never call `decrypt` + an unpad helper directly
 against attacker-controlled ciphertext without an authentication step (a MAC

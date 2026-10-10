@@ -20,11 +20,11 @@ specifications. No third-party XML-Enc implementation was consulted, so no
 - **Key transport:** `rsa-oaep-mgf1p` (SHA-1), xenc11 `rsa-oaep` (SHA-1/SHA-256,
   DigestMethod and MGF resolved INDEPENDENTLY, MGF defaulting to MGF1-SHA1
   when the element is absent whatever the digest is), and — gated behind `allow_weak_rsa15` —
-  `rsa-1_5`. Optional `kw-aes128`/`kw-aes256` symmetric key wrap (RFC 3394) when
+  `rsa-1_5`. Optional `kw-aes128`/`kw-aes192`/`kw-aes256` symmetric key wrap (RFC 3394) when
   a KEK is supplied.
-- **Content:** `aes128-cbc`, `aes256-cbc`, `aes128-gcm`, `aes256-gcm`. AES-192
-  is `UnsupportedAlgorithm` (std 0.16 has no AES-192 block cipher). GCM and OAEP
-  are the safe, preferred paths.
+- **Content:** `aes128-cbc`, `aes192-cbc`, `aes256-cbc`, `aes128-gcm`,
+  `aes192-gcm`, `aes256-gcm` (AES-192 via the `aes192`/`aesgcm` modules; std
+  0.16 has none). GCM and OAEP are the safe, preferred paths.
 
 Anything off the list → `error.UnsupportedAlgorithm`.
 
@@ -44,7 +44,7 @@ const pt = try xmlenc.decryptData(alloc, encrypted_data, sk, .{});
 
 // Options:
 //   .allow_weak_rsa15 = true   // opt in to Bleichenbacher-vulnerable rsa-1_5
-//   .kek = some_kek            // symmetric KEK for kw-aes128/256
+//   .kek = some_kek            // symmetric KEK for kw-aes128/192/256
 //   .max_ciphertext_len = N    // DoS bound on decoded content (default 4 MiB)
 ```
 

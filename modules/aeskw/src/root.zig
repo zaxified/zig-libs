@@ -26,9 +26,10 @@
 //!     input `>= 24` bytes (default-IV block + >= 2 wrapped semiblocks) —
 //!     RFC 3394 §2.
 //!
-//! **A192KW remains a std gap, not a stub**: a 192-bit KEK needs an AES-192
-//! block cipher and `std.crypto.core.aes` (0.16) ships only `Aes128`/
-//! `Aes256` — a 24-byte KEK returns `error.UnsupportedKeyLength`.
+//! **All three KEK widths**: AES-128 and AES-256 run on
+//! `std.crypto.core.aes`, AES-192 on the sibling `aes192` module (std 0.16
+//! ships no AES-192; that module adds only the key expansion and reuses std's
+//! round primitive). Byte-exact against RFC 3394 §4.2/§4.4 for 192.
 //!
 //! **RFC 5649 (AES Key Wrap with Padding) is deferred, not implemented.**
 //! This module covers only the unpadded RFC 3394 construction (plaintext
@@ -37,6 +38,7 @@
 
 const std = @import("std");
 const aes = std.crypto.core.aes;
+const aes192 = @import("aes192");
 const burn = @import("burn.zig");
 
 // Had no `pub const meta` block at all before this line (checkCatalog's deps
@@ -56,7 +58,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "RFC 3394 AES Key Wrap",
-    .deps = .{},
+    .deps = .{"aes192"}, // the AES-192 block cipher for 24-byte KEKs (std 0.16 has none)
 };
 
 /// RFC 3394 §2.2.3.1 default initial value — the integrity-check register's
@@ -68,27 +70,26 @@ pub const Error = error{
     /// the RFC's minimum (16 bytes to wrap, 24 to unwrap).
     InvalidLength,
     BufferTooSmall,
-    /// The KEK length has no std AES core: anything other than 16 (AES-128)
-    /// or 32 (AES-256) bytes — notably a 192-bit KEK (std 0.16 ships no
-    /// AES-192 block cipher; see the module doc comment).
+    /// The KEK is not an AES key: anything other than 16 (AES-128), 24
+    /// (AES-192) or 32 (AES-256) bytes.
     UnsupportedKeyLength,
     /// Unwrap's integrity check failed (wrong KEK or corrupted ciphertext).
     Unauthentic,
 };
 
 /// AES Key Wrap (RFC 3394 §2.2.1). `plaintext.len` must be a multiple of 8
-/// and >= 16; `kek.len` selects AES-128 (16) or AES-256 (32) — see the
-/// module doc comment for why a 192-bit KEK isn't supported. Writes
+/// and >= 16; `kek.len` selects AES-128 (16), AES-192 (24) or AES-256
+/// (32). Writes
 /// `plaintext.len + 8` bytes to `out` and returns that slice.
 ///
-/// KAT: RFC 3394 §4.1, §4.3, §4.5, §4.6 (this file's tests below).
+/// KAT: RFC 3394 §4.1–§4.6 (this file's tests below).
 pub fn wrap(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
     return burn.run(burn.wrap_burn, Error![]u8, wrapBody, .{ kek, plaintext, out });
 }
 
 fn wrapBody(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
     if (plaintext.len < 16 or plaintext.len % 8 != 0) return error.InvalidLength;
-    if (kek.len != 16 and kek.len != 32) return error.UnsupportedKeyLength;
+    if (kek.len != 16 and kek.len != 24 and kek.len != 32) return error.UnsupportedKeyLength;
     const n = plaintext.len / 8;
     const total = plaintext.len + 8;
     if (out.len < total) return error.BufferTooSmall;
@@ -177,6 +178,7 @@ fn unwrapBody(kek: []const u8, ciphertext: []const u8, out: []u8) Error![]u8 {
 fn encBlock(kek: []const u8, block: *[16]u8) error{UnsupportedKeyLength}!void {
     switch (kek.len) {
         16 => aes.Aes128.initEnc(kek[0..16].*).encrypt(block, block),
+        24 => aes192.Aes192.initEnc(kek[0..24].*).encrypt(block, block),
         32 => aes.Aes256.initEnc(kek[0..32].*).encrypt(block, block),
         else => return error.UnsupportedKeyLength,
     }
@@ -185,6 +187,7 @@ fn encBlock(kek: []const u8, block: *[16]u8) error{UnsupportedKeyLength}!void {
 fn decBlock(kek: []const u8, block: *[16]u8) error{UnsupportedKeyLength}!void {
     switch (kek.len) {
         16 => aes.Aes128.initDec(kek[0..16].*).decrypt(block, block),
+        24 => aes192.Aes192.initDec(kek[0..24].*).decrypt(block, block),
         32 => aes.Aes256.initDec(kek[0..32].*).decrypt(block, block),
         else => return error.UnsupportedKeyLength,
     }
@@ -214,6 +217,28 @@ test "RFC 3394 §4.1 KAT — 128-bit KEK wraps 128-bit key data, byte-exact both
     var out: [24]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &ciphertext, try wrap(&kek, &key_data, &out));
     var back: [16]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &key_data, try unwrap(&kek, &ciphertext, &back));
+}
+
+test "RFC 3394 §4.2 KAT — 192-bit KEK wraps 128-bit key data, byte-exact both directions" {
+    const kek = hexToBytes("000102030405060708090A0B0C0D0E0F1011121314151617");
+    const key_data = hexToBytes("00112233445566778899AABBCCDDEEFF");
+    const ciphertext = hexToBytes("96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D");
+
+    var out: [24]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &ciphertext, try wrap(&kek, &key_data, &out));
+    var back: [16]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &key_data, try unwrap(&kek, &ciphertext, &back));
+}
+
+test "RFC 3394 §4.4 KAT — 192-bit KEK wraps 192-bit key data (n=3), byte-exact both directions" {
+    const kek = hexToBytes("000102030405060708090A0B0C0D0E0F1011121314151617");
+    const key_data = hexToBytes("00112233445566778899AABBCCDDEEFF0001020304050607");
+    const ciphertext = hexToBytes("031D33264E15D33268F24EC260743EDCE1C6C7DDEE725A936BA814915C6762D2");
+
+    var out: [32]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &ciphertext, try wrap(&kek, &key_data, &out));
+    var back: [24]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &key_data, try unwrap(&kek, &ciphertext, &back));
 }
 
@@ -314,14 +339,15 @@ test "unwrap fails closed: wrong KEK / corrupted ciphertext -> Unauthentic, outp
 // RFC 3394's, and BOTH KEK lengths now run on every input instead of hanging on
 // a draw that is the range minimum on every corpus replay.
 
-/// RFC 3394 §4's two KEKs. Fixed rather than drawn: a KEK drawn after the
+/// RFC 3394 §4's three KEKs. Fixed rather than drawn: a KEK drawn after the
 /// ciphertext would be dead on a corpus replay, and a KEK drawn before it is
 /// what made this harness collapse in the first place.
 const rfc3394_kek128 = hexToBytes("000102030405060708090A0B0C0D0E0F");
+const rfc3394_kek192 = hexToBytes("000102030405060708090A0B0C0D0E0F1011121314151617");
 const rfc3394_kek256 = hexToBytes("000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
 
 const UnwrapProbe = struct {
-    /// Ciphertexts that authenticated under one of the two KEKs.
+    /// Ciphertexts that authenticated under one of the three KEKs.
     accepted: usize = 0,
     /// Octets of key material recovered. ⛔ This is the number the collapsed
     /// harness cannot produce: `unwrap` of an empty or wrong-length ciphertext
@@ -336,7 +362,7 @@ const UnwrapProbe = struct {
 /// `fuzzUnwrapNoLeak`'s body, factored out so the corpus guard measures the
 /// same code the harness runs rather than a second copy of it.
 fn probeUnwrap(ct: []const u8, res: *UnwrapProbe) !void {
-    inline for (.{ rfc3394_kek128, rfc3394_kek256 }) |kek_bytes| {
+    inline for (.{ rfc3394_kek128, rfc3394_kek192, rfc3394_kek256 }) |kek_bytes| {
         const kek: []const u8 = &kek_bytes;
         var out: [256]u8 = undefined;
         if (unwrap(kek, ct, &out)) |got| {
@@ -355,6 +381,10 @@ fn probeUnwrap(ct: []const u8, res: *UnwrapProbe) !void {
 const unwrap_seeds = [_][]const u8{
     // RFC 3394 §4.1: 128-bit KEK, 128-bit key. Authenticates under kek128.
     testkit.fuzz.seedHex("1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5"),
+    // §4.2: 192-bit KEK, 128-bit key.
+    testkit.fuzz.seedHex("96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D"),
+    // §4.4: 192-bit KEK, 192-bit key — three semiblocks out.
+    testkit.fuzz.seedHex("031D33264E15D33268F24EC260743EDCE1C6C7DDEE725A936BA814915C6762D2"),
     // §4.3: 256-bit KEK, 128-bit key.
     testkit.fuzz.seedHex("64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7"),
     // §4.5: 256-bit KEK, 192-bit key — three semiblocks out.
@@ -399,16 +429,17 @@ test "corpus: every unwrap seed reaches the recurrence, counts pinned" {
         try probeUnwrap(ct_buf[0..ct_len], &res);
     }
     try std.testing.expectEqual(unwrap_seeds.len - 1, nonempty); // the last is empty
-    try std.testing.expectEqual(@as(usize, 4), res.accepted);
-    try std.testing.expectEqual(@as(usize, 88), res.recovered); // 16 + 16 + 24 + 32
-    // 8 refusals that walked the whole recurrence: the four RFC vectors each
-    // under the KEK that is NOT theirs, plus the two perturbations under both.
-    try std.testing.expectEqual(@as(usize, 8), res.unauthentic);
+    try std.testing.expectEqual(@as(usize, 6), res.accepted);
+    try std.testing.expectEqual(@as(usize, 128), res.recovered); // 16 + 16 + 24 + 16 + 24 + 32
+    // 18 refusals that walked the whole recurrence: the six RFC vectors each
+    // under the two KEKs that are NOT theirs, plus the two perturbations under
+    // all three.
+    try std.testing.expectEqual(@as(usize, 18), res.unauthentic);
 }
 
 /// `fuzzWrapUnwrapRoundTrip`'s body, likewise shared with its guard.
 fn probeRoundTrip(pt: []const u8, recovered_total: *usize) !void {
-    inline for (.{ rfc3394_kek128, rfc3394_kek256 }) |kek_bytes| {
+    inline for (.{ rfc3394_kek128, rfc3394_kek192, rfc3394_kek256 }) |kek_bytes| {
         const kek: []const u8 = &kek_bytes;
         var ct_buf: [256]u8 = undefined;
         const ct = try wrap(kek, pt, &ct_buf);
@@ -462,13 +493,13 @@ test "corpus: the round trip runs at the sizes the seeds name, count pinned" {
         try probeRoundTrip(pt_buf[0..pt_len], &total);
     }
     try std.testing.expectEqual(roundtrip_seeds.len - 1, nonempty);
-    // ⛔ Two KEKs × the rounded-down length of every seed. The collapsed
+    // ⛔ Three KEKs × the rounded-down length of every seed. The collapsed
     // harness could only ever make 2 × 16 = 32 out of one input, so this is the
     // number that says the seeds' own lengths were read.
-    try std.testing.expectEqual(@as(usize, 928), total); // 2 × (16+24+32+16+96+248+16+16)
+    try std.testing.expectEqual(@as(usize, 1392), total); // 3 × (16+24+32+16+96+248+16+16)
 }
 
-test "length + KEK validation (incl. the 192-bit-KEK std gap), with positive controls" {
+test "length + KEK validation (16/24/32-byte KEKs only), with positive controls" {
     const kek = [_]u8{0} ** 16;
     var buf: [64]u8 = undefined;
 
@@ -489,9 +520,20 @@ test "length + KEK validation (incl. the 192-bit-KEK std gap), with positive con
     try std.testing.expectError(error.BufferTooSmall, wrap(&kek, &[_]u8{0} ** 16, buf[0..23]));
     try std.testing.expectError(error.BufferTooSmall, unwrap(&kek, &ct, pt[0..15]));
 
-    const kek192 = [_]u8{0} ** 24;
-    try std.testing.expectError(error.UnsupportedKeyLength, wrap(&kek192, &[_]u8{0} ** 16, &buf));
-    try std.testing.expectError(error.UnsupportedKeyLength, unwrap(&kek192, &[_]u8{0} ** 24, &buf));
+    // Every non-AES KEK width is refused; the three AES widths are accepted
+    // (the 24-byte one since aes192, 2026-10-10).
+    for ([_]usize{ 0, 8, 15, 17, 20, 23, 25, 31, 33, 48 }) |kl| {
+        const bad = [_]u8{0} ** 48;
+        try std.testing.expectError(error.UnsupportedKeyLength, wrap(bad[0..kl], &[_]u8{0} ** 16, &buf));
+        try std.testing.expectError(error.UnsupportedKeyLength, unwrap(bad[0..kl], &[_]u8{0} ** 24, &buf));
+    }
+    for ([_]usize{ 16, 24, 32 }) |kl| {
+        const good = [_]u8{0x42} ** 32;
+        var c: [24]u8 = undefined;
+        _ = try wrap(good[0..kl], &[_]u8{0x5a} ** 16, &c);
+        var p: [16]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, &[_]u8{0x5a} ** 16, try unwrap(good[0..kl], &c, &p));
+    }
 }
 
 test "F4 regression: wrap validates KEK width before writing plaintext into `out`" {
@@ -503,10 +545,10 @@ test "F4 regression: wrap validates KEK width before writing plaintext into `out
     // `wrap`'s own module doc claims for the pair — would see its plaintext
     // sitting in `out` despite the reported failure (wave-2 audit finding
     // `aeskw` F4).
-    const kek192 = [_]u8{0} ** 24; // std has no AES-192 core -> unsupported
+    const kek20 = [_]u8{0} ** 20; // not an AES key width -> unsupported
     const plaintext = [_]u8{0xAA} ** 16;
     var out = [_]u8{0} ** 24;
-    try std.testing.expectError(error.UnsupportedKeyLength, wrap(&kek192, &plaintext, &out));
+    try std.testing.expectError(error.UnsupportedKeyLength, wrap(&kek20, &plaintext, &out));
     // `out` must still be all-zero: the plaintext must never have been
     // copied in before the KEK width was validated.
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 24), &out);

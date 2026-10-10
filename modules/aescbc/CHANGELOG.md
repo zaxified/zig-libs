@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — AES-192: `encrypt`/`decrypt` take the new `aes192` module's `Aes192` like std's two (no code change, the API was already generic); SP800-38A F.2.3/F.2.4 KATs added and the CBC fuzz harness now draws AES-192 for a third of its inputs. `aes192` is a test-only dependency.
 - **2026-10-10** — tests: deterministic fuzz driver `AESCBC_FUZZ` (testkit) over CBC (AES-128/256 round trip, the exact effect of a flipped ciphertext bit, misaligned/short-output refused) and PKCS#7 / XML-Enc unpadding against a branching reference. No change to the library code.
 - **2026-10-09** — **BREAKING:** `encrypt` and `decrypt` take the key by pointer
   (`key: *const [Aes.key_bits / 8]u8`, was by value): a by-value key is a copy in the caller's frame
