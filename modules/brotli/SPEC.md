@@ -326,6 +326,8 @@ larger than its input, and `compress` itself never fails except on allocation.
 
 ## Backlog / deferred
 
+- **Speed: 1.41–3.38× google/brotli 1.2.0 (C, one-shot; compress at equal-size qualities, decompress)** *(`zig build bench-brotli`, quiet host, 2026-10-10)* — over 2× the reference, so P4; the card says `not measured` until it is fixed (owner 2026-10-10, sealedbox precedent 2026-10-07): a consumed module must grade 3 or better and the fix is the module, never the gate. compress 1.4–2.7× at equal output size (q4/q6/q9), decompress 2.5–3.4×; ours allocates its decompress output per call where the reference writes into a preallocated buffer (bench header). First item of the maturity goal.
+
 
 - ~~**Streaming decoder (`std.Io.Reader`)** *(survey 2026-09-30)*~~ — **DONE 2026-09-30** as `decompressStream` (push: reader in, writer out; see § "Streaming decoder"). Still open: a pull-style `std.Io.Reader` over the decompressed bytes (needs a decoder that suspends mid-command), and giving back the read-ahead bytes after the stream.
 - **Streaming encoder (`std.Io.Writer`)** *(survey 2026-09-30)* — a server wants to compress chunks as it writes. Effort: medium (the encoder is already meta-block structured; the match window must be kept across `write`s). Fits §2. Quality levels: **three efforts DONE 2026-09-30** (`Effort`); twelve reference-style qualities are not a goal.

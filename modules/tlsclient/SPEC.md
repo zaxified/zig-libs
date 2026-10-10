@@ -165,6 +165,8 @@ the handshake, and their tests at the end of the file. The offline test
 
 ## Backlog / deferred
 
+- **Speed: 5.22–5.87× Go 1.26.0 crypto/tls client (full TLS 1.3 handshake vs one Go server over loopback, client-thread user cycles; ECDSA P-256 and RSA-2048 chains)** *(`zig build bench-tlsclient`, quiet host, 2026-10-10)* — over 2× the reference, so P4; the card says `not measured` until it is fixed (owner 2026-10-10, sealedbox precedent 2026-10-07): a consumed module must grade 3 or better and the fix is the module, never the gate. full TLS 1.3 handshake 5.2–5.9× Go's client CPU (user cycles of the client thread vs one Go server over loopback); the x509 chain verify gap likely dominates; negotiated group/suite not checked per side. First item of the maturity goal.
+
 **2026-10-09 (resolved, ECDHE + handshake key schedule):** the ECDHE key
 shares (`KeyShare`: ML-KEM-768, X25519, P-256, P-384) and the handshake key
 schedule left their secrets in `Client.init`'s frame and in std's dead frames.

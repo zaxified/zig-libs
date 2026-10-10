@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-sandbox`, kept instrument kind 3): card Performance 0.001–1.01× libseccomp (filter build; per-syscall cost within noise of 1.0), measured on a quiet host. Tooling only, no code change.
+
 - **2026-10-04** — **ADDITIVE + one BREAKING edge:** the survey's core gaps.
   - `seccomp.buildRules(gpa, rules, default_action)`: ordered `Rule{ sysno, when, action }` with
     per-argument conditions `ArgCmp{ arg, op, width, value, mask }` (`eq ne lt le gt ge

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-brotli`): **1.41–3.38× google/brotli** — over 2×, P4. Card stays `not measured` with the numbers in *Backlog* until the module is sped up (owner 2026-10-10: a consumed module must grade 3 or better). Tooling only, no code change.
+
 - **2026-10-04** — Builds for 32-bit and Windows: `meta.targets` is now linux64, linux32 (mips32,
   big-endian, soft-float) and windows. Window and table-size exponents are `u5` (a 32-bit `usize`
   shifts by a `u5`; they never exceed 24), and the interop corpus generator took its remainder in

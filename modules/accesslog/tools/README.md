@@ -13,6 +13,7 @@ format's goaccess anchor lives in `src/root.zig` (verdicts frozen as literals).
 | `json_path_oracle.py` | `python3 tools/json_path_oracle.py > src/json_path_vectors.zig`: Python's `decode('utf-8', 'replace')` of 333 request paths (33 at every Unicode Table 3-7 edge, 300 drawn around them), replayed as `Entry.target` through JSON Lines. Moved from `metrics` with its access-log writer (2026-10-06). |
 | `go_json/` | Go `encoding/json` (stdlib only), one line at a time, numbers exact. |
 | `go_logfmt/` | go-logfmt v0.6.1 (MIT; pinned in `go.sum`), one logfmt line at a time, values as raw bytes. |
+| `bench.zig` + `go_bench/` | `zig build bench-accesslog`: comparative benchmark, the source of the maturity card's `**Performance:**` line (CONVENTIONS.md §9 kind 3). 16 entries per op: `writeJsonLines` vs `encoding/json` and vs `slog.JSONHandler`, `writeLogfmt` vs go-logfmt v0.6.1 (the card's own reference, Apache httpd, is a server directive and cannot be timed; the Combined writer has no reference and is not measured). Byte counts must agree or the run fails. Needs the same go-logfmt module cache as `go_logfmt`. Not run by any lane. 2026-10-10, x86-64 (provisional): json_encoding 0.32, json_slog 0.14, logfmt 0.27 (ours/Go). |
 
 ```bash
 zig build interop-accesslog              # re-take, write src/json_oracle_vectors.zig

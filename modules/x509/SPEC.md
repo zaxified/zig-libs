@@ -470,6 +470,8 @@ that name type, i.e. a false reject, never a bypass.
 
 ## Backlog / deferred
 
+- **Speed: 6.46–7.54× Go 1.26.0 crypto/x509 (TLS-client chain verify: parse + path + 2 signatures + host + EKU; ECDSA P-256, RSA-2048, mixed)** *(`zig build bench-x509`, quiet host, 2026-10-10)* — over 2× the reference, so P4; the card says `not measured` until it is fixed (owner 2026-10-10, sealedbox precedent 2026-10-07): a consumed module must grade 3 or better and the fix is the module, never the gate. TLS-client chain verify 6.5–7.5× (ECDSA P-256 1.35 ms vs 0.18 ms, RSA-2048, mixed); unprofiled — signature verification (std ECDSA P-256, our rsa) is the likely cost, Go's side also re-parses one certificate more. First item of the maturity goal.
+
 - **DONE 2026-10-10 (decided by the coordinator, delegated by the owner): `parse_slack` in
   `verifyChain`.** The open question was whether std, seeing the caller's buffer without padding,
   could still probe past its end. Reading `Certificate.parse` (0.16) settles it: every probe lands

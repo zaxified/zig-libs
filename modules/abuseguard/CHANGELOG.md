@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Card Performance `n/a` with the reason (no timeable reference implementation). Docs only.
+
 - **2026-10-04** — Added (survey 2026-09-30 backlog): `Options.allow` (fail2ban
   `ignoreip` allowlist of `netaddr.Prefix`; exempts from every reputation verdict and from
   `record`/auto-strike, caps still apply); `Options.ipv6_key_bits` / `ipv4_key_bits`

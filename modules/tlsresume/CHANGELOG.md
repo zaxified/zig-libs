@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-tlsresume`, kept instrument kind 3): card Performance 0.90–1.08× the same recipe on OpenSSL EVP (OpenSSL has no standalone resumption API), measured on a quiet host. Tooling only, no code change.
+
 - **2026-10-09** — tests: deterministic fuzz driver `TLSRESUME_FUZZ` over the existing harnesses (plus a generated-record overlay: serialize/encode then parse/decode must round-trip, every truncation and a trailing octet must be refused).
 - **2026-10-09** — **BREAKING:** `StekRing.activeKey()` and `findKey(id)` return `?*const Stek` (a
   pointer into the ring, valid until the next `rotate`) instead of a copy: every call copied the STEK —

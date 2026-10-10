@@ -50,7 +50,7 @@ Five independent steps, weakest-precondition first:
 Provenance: original work of the zig-libs authors (MIT). All ABI constants,
 struct layouts and the seccomp BPF program are clean-room from the kernel UAPI
 (`prctl.h`, `seccomp.h`, `landlock.h`, `capability.h`, `audit.h`); no
-third-party implementation was ported or studied. See SPEC.md for the citation.
+third-party implementation was ported or studied. See SPEC.md for the citation. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` or `c_bench/` reference side, 2026-10-10) is our own tooling; it drives the reference only through its public API.
 
 ## API
 

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Card Performance `n/a` with the reason (no timeable reference implementation). Docs only.
+
 - **2026-09-21** — `decode` and `RecordedResponse` are public: a server without
   `router` reads a `Store.begin` `.replay` blob itself (status, content type,
   body) to answer the replay.

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-http`, kept instrument kind 3): card Performance 0.13–0.32× Go net/http, measured on a quiet host. Tooling only, no code change.
+
 - **2026-10-09** — tests: deterministic fuzz driver `HTTP_FUZZ` over the existing harnesses (range, content-type,
   urlencoded, h1 request/response head and chunked, multipart parse/stream, hpack block/huffman, h2 parseFrame/recv).
 

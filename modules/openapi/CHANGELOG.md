@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Card Performance `n/a` with the reason (no timeable reference implementation). Docs only.
+
 - **2026-10-07** — Follows `router`'s `{name}` captures: a whole-segment or in-segment capture
   (`/files/{name}.{ext}`) is already an OpenAPI template and gets its path parameters (via
   `router.PatternCaptures`); a bare `*` becomes `{*}`; `operationId` drops template braces

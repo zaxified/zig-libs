@@ -15,7 +15,7 @@ silently floors any pre-1970 date to 1970-01-01.
   **Allocation:** `format`/`formatIsoDate` take an allocator (output is an
   owned, variable-length string); everything else is allocation-free.
 
-Provenance: original work of the zig-libs authors (MIT). No third-party code.
+Provenance: original work of the zig-libs authors (MIT). No third-party code. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` or `c_bench/` reference side, 2026-10-10) is our own tooling; it drives the reference only through its public API.
 
 ## Two layers
 

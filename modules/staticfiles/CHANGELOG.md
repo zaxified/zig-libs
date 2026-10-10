@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-staticfiles`, kept instrument kind 3): card Performance 0.11–0.59× Go FileServer, measured on a quiet host. Tooling only, no code change.
+
 - **2026-10-09** — tests: deterministic fuzz driver `STATICFILES_FUZZ` over the existing harnesses.
 
 - **2026-10-05** — **BEHAVIOURAL, not breaking:** a regular file asked for as a directory

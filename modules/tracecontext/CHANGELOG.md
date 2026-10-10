@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-tracecontext`, kept instrument kind 3): card Performance 0.35–0.47× OpenTelemetry Go TraceContext (net of the HTTP stack), measured on a quiet host. Tooling only, no code change.
+
 - **2026-10-09** — tests: deterministic fuzz driver `TRACECONTEXT_FUZZ` over the existing harnesses.
 - **2026-10-05** — **Fix:** `childOf` (and so the middleware's outgoing `traceparent`) keeps only the
   `sampled` flag; every other trace-flags bit was copied through, where W3C requires "all unparsed /

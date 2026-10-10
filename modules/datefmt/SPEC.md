@@ -105,6 +105,9 @@ passing the range check as negative); `parseIsoDate`, documented "strict canonic
 past the month end, `parseIsoDate` length, xsd separator/zone/digits, `MAX_TOKENS`).
 
 ## Backlog / deferred
+
+- **Speed: 0.23–18.95× Go 1.26.0 time** *(`zig build bench-datefmt`, quiet host, 2026-10-10)* — over 2× the reference, so P4; the card says `not measured` until it is fixed (owner 2026-10-10, sealedbox precedent 2026-10-07): a consumed module must grade 3 or better and the fix is the module, never the gate. `format` 9–19× Go's `time.Format` and token `parse` ~8×: the format string is re-tokenized on every call (a pre-compiled layout would remove it); `parseXsdDateTime*` already 0.23–0.5×. First item of the maturity goal.
+
 Deferred from v1: locale-aware month/day names; duration/period types;
 named canned formats (RFC 2822/3339). Timezone-aware formatting is explicitly out of scope here —
 it lives in the separate `tz` module (dep on `datefmt`).
