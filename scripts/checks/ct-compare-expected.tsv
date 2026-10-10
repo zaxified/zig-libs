@@ -23,7 +23,7 @@ modules/dtls/src/Connection.zig	4	8
 modules/dtls/src/certverify.zig	1	1
 modules/dtls/src/keyschedule.zig	2	2
 modules/ecvrf/src/ecvrf.zig	1	5
-modules/idempotency/src/root.zig	1	0
+modules/idempotency/src/root.zig	1	7
 modules/iec62351/src/acse.zig	1	0
 modules/iec62351/src/goose.zig	5	2
 modules/jwe/src/enc.zig	1	0

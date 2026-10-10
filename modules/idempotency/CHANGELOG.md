@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — tests: seeded model-fuzz comparing random request sequences (methods, keys, bodies, callers, clock) with a linear-scan reference model of the documented decision order, plus random-input checks of `validKey`/`scopeKey`/`principalTag`/`decode`. No API or behaviour change.
+
 - **2026-10-10** — Card Performance `n/a` with the reason (no timeable reference implementation). Docs only.
 
 - **2026-09-21** — `decode` and `RecordedResponse` are public: a server without

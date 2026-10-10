@@ -1242,3 +1242,437 @@ test "body fingerprint cap: exactly at the cap fingerprints normally; one byte o
     try testing.expect(std.mem.startsWith(u8, over, "HTTP/1.1 413"));
     try testing.expectEqual(@as(u32, 1), app.calls); // still 1 — the over-cap request never ran
 }
+
+// ── model-fuzz: seeded random request sequences vs. a naive reference model ──
+//
+// The model is a restatement of the documented semantics (module doc + SPEC
+// "Design & invariants"): a linear list of recorded responses, an explicit
+// decision order, no use of the module's cache, store or key builders.
+//
+//   1. a method outside POST/PUT/PATCH, or no key header: pass through;
+//   2. a key that is empty, over `max_key_len` (255) or has a byte outside
+//      0x21..0x7e: 400, handler not run;
+//   3. principal configured but the request names none: pass through;
+//   4. body over `max_body_bytes`: 413, handler not run;
+//   5. a live record under (caller, key[, method, path]) whose body differs: 422;
+//      one whose body matches: replay (status / content type / body, plus
+//      `Idempotent-Replayed: true`), handler not run;
+//   6. otherwise run the handler and, if it used `respond`, record the answer
+//      for `ttl_ns` (a record older than `ttl_ns` is gone).
+//
+// Sequential requests only: the 409 in-flight path is covered by the
+// reentrant test above.
+
+const fz_ttl: i64 = 1000;
+const fz_cap: usize = 32;
+
+fn fzPrincipal(req: *const http.Server.Request) ?[]const u8 {
+    return req.header("X-Caller");
+}
+
+/// Handler: counts itself, echoes the request body it can read, and answers
+/// with a status / content type derived from the call count. `/raw` writes
+/// `ctx.res` directly (never recorded); every other path uses `respond`.
+fn fzHandler(ctx: *router.Ctx) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    const n = app.calls;
+    const seen = try ctx.req.reader().allocRemaining(testing.allocator, .limited(4096));
+    defer testing.allocator.free(seen);
+    var buf: [128]u8 = undefined;
+    const body = std.fmt.bufPrint(&buf, "n{d}:{s}", .{ n, seen }) catch unreachable;
+    const status: u16 = 200 + @as(u16, @intCast(n % 3));
+    const ct: ?[]const u8 = if (n % 3 == 0) null else if (n % 2 == 0) "text/plain" else "application/json";
+    if (std.mem.eql(u8, ctx.req.path, "/raw")) {
+        ctx.res.setStatus(status);
+        if (ct) |c| try ctx.res.setHeader("Content-Type", c);
+        try ctx.res.writeAll(body);
+    } else {
+        try app.store.respond(ctx, status, ct, body);
+    }
+}
+
+const FzRec = struct {
+    caller: []const u8, // "*" when no principal is configured
+    method: usize,
+    path: usize,
+    key: []u8,
+    req_body: []u8,
+    status: u16,
+    ct: ?[]const u8,
+    resp_body: []u8,
+    at: i64,
+};
+
+const FzOp = struct {
+    method: usize,
+    path: usize,
+    key: ?[]const u8,
+    body: []const u8,
+    caller: ?[]const u8,
+};
+
+fn fzKeyValid(k: []const u8) bool {
+    if (k.len == 0) return false;
+    if (k.len > 255) return false;
+    for (k) |c| {
+        if (c < 0x21 or c > 0x7e) return false;
+    }
+    return true;
+}
+
+test "model-fuzz: request sequences through the middleware vs. a linear-scan model" {
+    const seed: u64 = 0x6964656d706f3031;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+
+    const method_names = [_][]const u8{ "POST", "PUT", "PATCH", "GET", "DELETE" };
+    const method_enums = [_]http.Method{ .post, .put, .patch, .get, .delete };
+    const paths = [_][]const u8{ "/orders", "/refunds", "/raw" };
+    const long255: [255]u8 = @splat('k');
+    const long256: [256]u8 = @splat('k');
+    const keys = [_][]const u8{ "k1", "k2", "k3", "a.b_c-d~!", &long255 };
+    const bad_keys = [_][]const u8{ "bad key", &long256, "" };
+    const x32: [fz_cap]u8 = @splat('x');
+    const y32: [fz_cap]u8 = @splat('y');
+    const x33: [fz_cap + 1]u8 = @splat('x');
+    const bodies = [_][]const u8{ "", "A", "B", &x32, &y32, &x33 };
+    const callers = [_][]const u8{ "alice", "bob" };
+
+    var reach = struct {
+        bypass_method: usize = 0,
+        bypass_nokey: usize = 0,
+        bypass_nocaller: usize = 0,
+        bad_key: usize = 0,
+        key255_ok: usize = 0,
+        too_big: usize = 0,
+        too_big_at_cap_ok: usize = 0,
+        mismatch_422: usize = 0,
+        replay: usize = 0,
+        replay_cross_endpoint: usize = 0,
+        expired_rerun: usize = 0,
+        raw_rerun: usize = 0,
+        target_isolated_miss: usize = 0,
+        caller_isolated_miss: usize = 0,
+        recorded: usize = 0,
+        ttl_edge: usize = 0,
+    }{};
+
+    var seq: usize = 0;
+    while (seq < 80) : (seq += 1) {
+        const key_only = rnd.boolean();
+        const use_principal = rnd.boolean();
+        var clk = ManualClock{ .now_ns = 5000 };
+        var cache = newCache();
+        defer cache.deinit();
+        var store = Store{ .cache = &cache, .clock = clk.clock(), .ttl_ns = fz_ttl };
+        defer store.deinit();
+        var app = App{ .store = &store };
+        var idem = Idempotency{ .store = &store, .options = .{
+            .scope = if (key_only) .key_only else .target,
+            .max_body_bytes = fz_cap,
+            .principal = if (use_principal) fzPrincipal else null,
+        } };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        r.state = &app;
+        try r.use(idem.middleware());
+        for (method_enums) |m| for (paths) |p| try r.add(m, p, fzHandler);
+
+        var recs: std.ArrayList(FzRec) = .empty;
+        defer {
+            for (recs.items) |rec| {
+                testing.allocator.free(rec.key);
+                testing.allocator.free(rec.req_body);
+                testing.allocator.free(rec.resp_body);
+            }
+            recs.deinit(testing.allocator);
+        }
+        var model_calls: u32 = 0;
+        var prev: ?FzOp = null;
+
+        var step: usize = 0;
+        while (step < 80) : (step += 1) {
+            errdefer std.debug.print("idempotency model-fuzz mismatch: seed=0x{x} seq={d} step={d} key_only={} principal={}\n", .{ seed, seq, step, key_only, use_principal });
+
+            // Time moves first. A record whose age would equal ttl exactly is
+            // nudged by 1 ns: that single instant is the cache's, not ours.
+            const deltas = [_]i64{ 0, 0, 1, 10, 499, 501, 999, 1001, 2500 };
+            clk.now_ns += deltas[rnd.uintLessThan(usize, deltas.len)];
+            for (recs.items) |rec| if (clk.now_ns - rec.at == fz_ttl) {
+                clk.now_ns += 1;
+                break;
+            };
+            for (recs.items) |rec| {
+                const age = clk.now_ns - rec.at;
+                if (age == fz_ttl - 1 or age == fz_ttl + 1) reach.ttl_edge += 1;
+            }
+
+            // The operation: half the time a verbatim retry of the previous one.
+            var op: FzOp = undefined;
+            if (prev != null and rnd.boolean()) {
+                op = prev.?;
+            } else {
+                op = .{
+                    .method = switch (rnd.uintLessThan(u8, 8)) {
+                        0...3 => 0,
+                        4 => 1,
+                        5 => 2,
+                        6 => 3,
+                        else => 4,
+                    },
+                    .path = rnd.uintLessThan(usize, paths.len),
+                    .key = switch (rnd.uintLessThan(u8, 8)) {
+                        0 => null,
+                        1 => bad_keys[rnd.uintLessThan(usize, bad_keys.len)],
+                        else => keys[rnd.uintLessThan(usize, keys.len)],
+                    },
+                    .body = bodies[rnd.uintLessThan(usize, bodies.len)],
+                    .caller = if (rnd.uintLessThan(u8, 5) == 0) null else callers[rnd.uintLessThan(usize, callers.len)],
+                };
+            }
+            prev = op;
+
+            // Wire.
+            var req_buf: [2048]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&req_buf);
+            try w.print("{s} {s} HTTP/1.1\r\nHost: t\r\n", .{ method_names[op.method], paths[op.path] });
+            if (op.key) |k| try w.print("Idempotency-Key: {s}\r\n", .{k});
+            if (op.caller) |c| try w.print("X-Caller: {s}\r\n", .{c});
+            try w.print("Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ op.body.len, op.body });
+            var out: [2048]u8 = undefined;
+            const got = runWire(&r, w.buffered(), &out);
+            const status = try std.fmt.parseInt(u16, got[9..12], 10);
+            const body = bodyOf(got);
+            const replayed = headerValue(got, "Idempotent-Replayed");
+
+            // Model.
+            const guarded = op.method <= 2;
+            const who: []const u8 = if (use_principal) (op.caller orelse "") else "*";
+            enum_blk: {
+                // Outcome classes that never reach the handler.
+                if (guarded and op.key != null and !fzKeyValid(op.key.?)) {
+                    reach.bad_key += 1;
+                    try testing.expectEqual(@as(u16, 400), status);
+                    try testing.expect(replayed == null);
+                    break :enum_blk;
+                }
+                const bypass = !guarded or op.key == null or (use_principal and op.caller == null);
+                if (!bypass and op.body.len > fz_cap) {
+                    reach.too_big += 1;
+                    try testing.expectEqual(@as(u16, 413), status);
+                    break :enum_blk;
+                }
+                if (!bypass) {
+                    if (op.body.len == fz_cap) reach.too_big_at_cap_ok += 1;
+                    if (op.key.?.len == 255) reach.key255_ok += 1;
+                    // Find a live record that matches this request's scope.
+                    var found: ?usize = null;
+                    var i: usize = 0;
+                    while (i < recs.items.len) : (i += 1) {
+                        const rec = recs.items[i];
+                        if (!std.mem.eql(u8, rec.caller, who)) continue;
+                        if (!std.mem.eql(u8, rec.key, op.key.?)) continue;
+                        if (!key_only and (rec.method != op.method or rec.path != op.path)) continue;
+                        found = i;
+                        break;
+                    }
+                    if (found) |fi| {
+                        if (clk.now_ns - recs.items[fi].at > fz_ttl) {
+                            reach.expired_rerun += 1;
+                            const dead = recs.orderedRemove(fi);
+                            testing.allocator.free(dead.key);
+                            testing.allocator.free(dead.req_body);
+                            testing.allocator.free(dead.resp_body);
+                            found = null;
+                        }
+                    }
+                    if (found) |fi| {
+                        const rec = recs.items[fi];
+                        if (!std.mem.eql(u8, rec.req_body, op.body)) {
+                            reach.mismatch_422 += 1;
+                            try testing.expectEqual(@as(u16, 422), status);
+                            try testing.expect(replayed == null);
+                        } else {
+                            reach.replay += 1;
+                            if (rec.method != op.method or rec.path != op.path) reach.replay_cross_endpoint += 1;
+                            try testing.expectEqual(rec.status, status);
+                            try testing.expectEqualStrings(rec.resp_body, body);
+                            try testing.expectEqualStrings("true", replayed.?);
+                            if (rec.ct) |ct| try testing.expectEqualStrings(ct, headerValue(got, "Content-Type").?);
+                        }
+                        break :enum_blk;
+                    }
+                    // Miss: classify what kept an existing record from matching.
+                    for (recs.items) |rec| {
+                        if (!std.mem.eql(u8, rec.key, op.key.?)) continue;
+                        if (std.mem.eql(u8, rec.caller, who) and !key_only and (rec.method != op.method or rec.path != op.path))
+                            reach.target_isolated_miss += 1;
+                        if (!std.mem.eql(u8, rec.caller, who) and (key_only or (rec.method == op.method and rec.path == op.path)))
+                            reach.caller_isolated_miss += 1;
+                    }
+                    if (op.path == 2) reach.raw_rerun += 1;
+                } else if (!guarded) {
+                    reach.bypass_method += 1;
+                } else if (op.key == null) {
+                    reach.bypass_nokey += 1;
+                } else reach.bypass_nocaller += 1;
+
+                // The handler runs: model its answer, and record it if cooperative.
+                model_calls += 1;
+                const n = model_calls;
+                var want_buf: [128]u8 = undefined;
+                const want_body = std.fmt.bufPrint(&want_buf, "n{d}:{s}", .{ n, op.body }) catch unreachable;
+                const want_status: u16 = 200 + @as(u16, @intCast(n % 3));
+                try testing.expectEqual(want_status, status);
+                try testing.expectEqualStrings(want_body, body);
+                try testing.expect(replayed == null);
+                if (!bypass and op.path != 2) {
+                    reach.recorded += 1;
+                    const ct: ?[]const u8 = if (n % 3 == 0) null else if (n % 2 == 0) "text/plain" else "application/json";
+                    try recs.append(testing.allocator, .{
+                        .caller = who,
+                        .method = op.method,
+                        .path = op.path,
+                        .key = try testing.allocator.dupe(u8, op.key.?),
+                        .req_body = try testing.allocator.dupe(u8, op.body),
+                        .status = want_status,
+                        .ct = ct,
+                        .resp_body = try testing.allocator.dupe(u8, want_body),
+                        .at = clk.now_ns,
+                    });
+                }
+            }
+            // The handler ran exactly as often as the model says.
+            try testing.expectEqual(model_calls, app.calls);
+        }
+    }
+
+    inline for (@typeInfo(@TypeOf(reach)).@"struct".fields) |f| {
+        if (@field(reach, f.name) == 0) {
+            std.debug.print("idempotency model-fuzz: reach class never hit: {s}\n", .{f.name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "model-fuzz: validKey, scopeKey, principalTag and decode vs. models on random inputs" {
+    const seed: u64 = 0x6964656d706f3032;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+
+    var valid_n: usize = 0;
+    var invalid_n: usize = 0;
+    var overflow_n: usize = 0;
+    var fit_n: usize = 0;
+    var dec_ok: usize = 0;
+    var dec_null: usize = 0;
+
+    var case: usize = 0;
+    while (case < 3000) : (case += 1) {
+        errdefer std.debug.print("idempotency model-fuzz(pure) mismatch: seed=0x{x} case={d}\n", .{ seed, case });
+        // validKey: random bytes, lengths around the limit.
+        var kb: [300]u8 = undefined;
+        const klen: usize = switch (rnd.uintLessThan(u8, 5)) {
+            0 => 0,
+            1 => 255,
+            2 => 256,
+            else => rnd.uintLessThan(usize, 300),
+        };
+        const clean = rnd.boolean();
+        for (kb[0..klen]) |*c| c.* = if (clean) 0x21 + rnd.uintLessThan(u8, 0x7e - 0x21 + 1) else rnd.int(u8);
+        const max_len: usize = if (rnd.uintLessThan(u8, 4) == 0) rnd.uintLessThan(usize, 300) else 255;
+        const key = kb[0..klen];
+        var want = klen >= 1 and klen <= max_len;
+        if (want) for (key) |c| {
+            if (!(c >= 0x21 and c <= 0x7e)) want = false;
+        };
+        try testing.expectEqual(want, validKey(key, max_len));
+        if (want) valid_n += 1 else invalid_n += 1;
+
+        // scopeKey: compare with a hand-built string; null iff it overflows.
+        var path_buf: [80]u8 = undefined;
+        const plen = 1 + rnd.uintLessThan(usize, path_buf.len - 1);
+        path_buf[0] = '/';
+        for (path_buf[1..plen]) |*c| c.* = 'a' + rnd.uintLessThan(u8, 26);
+        const path = path_buf[0..plen];
+        const mi = rnd.uintLessThan(usize, 5);
+        const methods = [_]http.Method{ .post, .put, .patch, .get, .delete };
+        const names = [_][]const u8{ "POST", "PUT", "PATCH", "GET", "DELETE" };
+        const sc: Scope = if (rnd.boolean()) .target else .key_only;
+        const who: ?[]const u8 = if (rnd.boolean()) "0123456789abcdef0123456789abcdef" else null;
+        var want_buf: [512]u8 = undefined;
+        var wl: usize = 0;
+        const wstr = if (who) |s| s else "*";
+        const piece = if (sc == .target)
+            std.fmt.bufPrint(&want_buf, "{s} {s} {s} {s}", .{ wstr, names[mi], path, key[0..@min(klen, 100)] }) catch unreachable
+        else
+            std.fmt.bufPrint(&want_buf, "{s} {s}", .{ wstr, key[0..@min(klen, 100)] }) catch unreachable;
+        wl = piece.len;
+        // Output buffer sized around the wanted length so both outcomes occur.
+        var out_buf: [512]u8 = undefined;
+        const room = if (rnd.boolean()) wl else wl -| (1 + rnd.uintLessThan(usize, 3));
+        const got = scopeKey(out_buf[0..room], sc, methods[mi], path, who, key[0..@min(klen, 100)]);
+        if (room >= wl) {
+            fit_n += 1;
+            try testing.expectEqualStrings(want_buf[0..wl], got.?);
+        } else {
+            overflow_n += 1;
+            try testing.expect(got == null);
+        }
+
+        // principalTag: first 16 bytes of SHA-256 in lowercase hex.
+        var pbuf: [64]u8 = undefined;
+        const pl = rnd.uintLessThan(usize, pbuf.len);
+        rnd.bytes(pbuf[0..pl]);
+        var tag_out: [principal_hex_len]u8 = undefined;
+        const tag = principalTag(pbuf[0..pl], &tag_out);
+        var dg: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(pbuf[0..pl], &dg, .{});
+        const hex = "0123456789abcdef";
+        var want_tag: [32]u8 = undefined;
+        for (dg[0..16], 0..) |b, i| {
+            want_tag[2 * i] = hex[b >> 4];
+            want_tag[2 * i + 1] = hex[b & 15];
+        }
+        try testing.expectEqualStrings(&want_tag, tag);
+
+        // decode: build a blob from fields (digest | status BE | ctlen BE | ct | body),
+        // then maybe truncate or corrupt the length field.
+        var blob: [200]u8 = undefined;
+        var bl: usize = 0;
+        rnd.bytes(blob[0..32]);
+        const status: u16 = rnd.int(u16);
+        blob[32] = @intCast(status >> 8);
+        blob[33] = @intCast(status & 0xff);
+        const ctl = rnd.uintLessThan(usize, 20);
+        const bodyl = rnd.uintLessThan(usize, 40);
+        blob[34] = @intCast(ctl >> 8);
+        blob[35] = @intCast(ctl & 0xff);
+        rnd.bytes(blob[36 .. 36 + ctl + bodyl]);
+        bl = 36 + ctl + bodyl;
+        switch (rnd.uintLessThan(u8, 4)) {
+            0 => bl = rnd.uintLessThan(usize, bl + 1), // truncate anywhere
+            1 => { // claim a longer content type than present
+                const lie = ctl + bodyl + 1 + rnd.uintLessThan(usize, 5);
+                blob[34] = @intCast(lie >> 8);
+                blob[35] = @intCast(lie & 0xff);
+            },
+            else => {},
+        }
+        const claimed = (@as(usize, blob[34]) << 8) | blob[35];
+        const decoded = decode(blob[0..bl]);
+        if (bl >= 36 and 36 + claimed <= bl) {
+            dec_ok += 1;
+            const d = decoded.?;
+            try testing.expectEqualSlices(u8, blob[0..32], &d.digest);
+            try testing.expectEqual(status, d.status);
+            try testing.expectEqualSlices(u8, blob[36 .. 36 + claimed], d.content_type);
+            try testing.expectEqualSlices(u8, blob[36 + claimed .. bl], d.body);
+        } else {
+            dec_null += 1;
+            try testing.expect(decoded == null);
+        }
+    }
+    try testing.expect(valid_n > 0 and invalid_n > 0 and overflow_n > 0 and fit_n > 0 and dec_ok > 0 and dec_null > 0);
+}
