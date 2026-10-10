@@ -1010,6 +1010,11 @@ fn isSpecialUseHost(raw_host: []const u8) bool {
     if (host.len == 0) return true; // "." / "" is not a destination
     if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
     if (std.ascii.endsWithIgnoreCase(host, ".localhost")) return true;
+    switch (parseInetAton(raw_host)) {
+        .invalid => return true, // numeric-shaped but not a valid form: refuse, do not guess
+        .addr => |q| return isSpecialUseIp(.{ .v4 = q }),
+        .not_numeric => {},
+    }
     const ip = netaddr.parseIp(host) orelse return false;
     return isSpecialUseIp(ip);
 }
@@ -1045,6 +1050,70 @@ pub fn checkDestination(url: []const u8, policy: DestinationPolicy) DestinationE
     }
     const parsed = http.Url.parse(url) catch return error.BadDestination;
     if (policy.deny_special_use and isSpecialUseHost(parsed.host)) return error.BlockedDestination;
+}
+
+/// Result of reading a host as an `inet_aton` numeric address.
+const NumericHost = union(enum) {
+    /// Not numeric-shaped: an ordinary name or a canonical IP literal.
+    not_numeric,
+    /// Numeric-shaped (every dot-separated part starts with a digit and holds
+    /// only hex digits / `x`) but not a valid `inet_aton` form.
+    invalid,
+    addr: [4]u8,
+};
+
+/// `inet_aton`'s accepted forms: 1 to 4 dot-separated parts, each decimal,
+/// octal (leading `0`) or hex (`0x`); the last part fills the remaining bytes
+/// (`127.1` is 127.0.0.1, `2130706433` is 127.0.0.1). A resolver that takes
+/// such a host as an IPv4 literal dials the address it denotes, so the guard
+/// must classify THAT address (SSRF-guard gap found by the 2026-10-10 fuzz
+/// oracle). A numeric-shaped host that is not a valid form is refused by the
+/// caller rather than guessed at.
+fn parseInetAton(raw: []const u8) NumericHost {
+    // ONE trailing dot is the absolute spelling of the same host; a second one
+    // leaves an empty part, which is invalid below.
+    const host = if (raw.len > 0 and raw[raw.len - 1] == '.') raw[0 .. raw.len - 1] else raw;
+    if (host.len == 0 or !std.ascii.isDigit(host[0])) return .not_numeric;
+    if (std.mem.indexOfNone(u8, host, "0123456789abcdefABCDEFxX.") != null) return .not_numeric;
+    var it0 = std.mem.splitScalar(u8, host, '.');
+    while (it0.next()) |part| {
+        if (part.len == 0) return .invalid;
+        if (!std.ascii.isDigit(part[0])) return .not_numeric;
+    }
+    var vals: [4]u64 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, host, '.');
+    while (it.next()) |part| {
+        if (n == 4) return .invalid;
+        var radix: u8 = 10;
+        var digits = part;
+        if (part.len >= 2 and part[0] == '0' and (part[1] == 'x' or part[1] == 'X')) {
+            radix = 16;
+            digits = part[2..];
+        } else if (part.len >= 2 and part[0] == '0') {
+            radix = 8;
+            digits = part[1..];
+        }
+        if (digits.len == 0) return .invalid;
+        vals[n] = std.fmt.parseInt(u64, digits, radix) catch return .invalid;
+        if (vals[n] > 0xffff_ffff) return .invalid;
+        n += 1;
+    }
+    var out: [4]u8 = undefined;
+    for (vals[0 .. n - 1], 0..) |v, i| {
+        if (v > 255) return .invalid;
+        out[i] = @intCast(v);
+    }
+    const last = vals[n - 1];
+    const room: u6 = @intCast(8 * (4 - (n - 1)));
+    if (room < 32 and last >> room != 0) return .invalid;
+    var i: usize = n - 1;
+    var rest = last;
+    while (i < 4) : (i += 1) {
+        out[3 - (i - (n - 1))] = @intCast(rest & 0xff);
+        rest >>= 8;
+    }
+    return .{ .addr = out };
 }
 
 /// The policy: which address space this module refuses to follow a related
@@ -1999,6 +2068,28 @@ test "isSpecialUseHost: classifies loopback/private/link-local/localhost, passes
     try testing.expect(!isSpecialUseHost("2001:db9::1"));
 }
 
+test "isSpecialUseHost: inet_aton numeric forms are classified by the address they denote (SSRF gap, 2026-10-10)" {
+    // Short, decimal-integer, octal and hex spellings of non-routable addresses.
+    for ([_][]const u8{ "127.1", "2130706433", "0x7f.0.0.1", "017700000001", "0177.0.0.1", "10.1", "0xa000001", "127.0.1", "0xc0.0xa8.1", "192.168.257", "169.254.43518", "0", "0.0", "127.1.", "0X7F.1", "127.0.0.1.", "2130706433.", "127.1..", "127.0.0.1..", "2130706433.." }) |h| {
+        try testing.expect(isSpecialUseHost(h));
+    }
+    // Numeric-shaped but not a valid form: refused, not guessed at.
+    for ([_][]const u8{ "256.1.1.1", "1.2.3.4.5", "4294967296", "0x100000000", "1.65536.1", "09", "1.2.0x", "08.1", "1..2", "999999999999999999999" }) |h| {
+        try testing.expect(isSpecialUseHost(h));
+    }
+    // Public addresses in the same spellings stay allowed.
+    for ([_][]const u8{ "8.8.8.8", "134744072", "0x8080808", "8.8.2056", "010.8.8.8x" }) |h| {
+        if (std.mem.eql(u8, h, "010.8.8.8x")) {
+            try testing.expect(isSpecialUseHost(h)); // 'x' inside a part: invalid, refused
+        } else {
+            try testing.expect(!isSpecialUseHost(h));
+        }
+    }
+    // Ordinary names that merely start with a digit are not numeric.
+    try testing.expect(!isSpecialUseHost("1password.example"));
+    try testing.expect(!isSpecialUseHost("3m.com"));
+}
+
 test "isSpecialUseHost: the ABSOLUTE spelling is the same name (re-audit F1)" {
     // `localhost.` is `localhost` to every resolver on earth — verified on
     // this host: `getent hosts localhost.` answers `::1`. The guard compared
@@ -2500,8 +2591,24 @@ const response_seeds = [_][]const u8{
     seed(""), // InvalidJson — and the ONE input the collapsed harness ran
 };
 
+const fz = @import("fuzz_test.zig");
+const ResponseMark = fz.Marker(enum { mapped, refused, wrapped_mapped, wrapped_refused });
+const BootstrapMark = fz.Marker(enum { parsed, refused, wrapped_parsed, wrapped_refused });
+
 test "fuzz: parseResponse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseResponse, .{ .corpus = &response_seeds });
+    try testing.fuzz({}, fuzzParseResponseSmith, .{ .corpus = &response_seeds });
+}
+
+test "fuzz driver: RDAP_FUZZ (response)" {
+    try fz.fuzz_driver.run(fuzzParseResponse, .{ .prefix = "RDAP_FUZZ", .name = "rdap-response" });
+}
+
+test "fuzz harness: response, 400 seeds, reaches every outcome" {
+    try ResponseMark.reach(fuzzParseResponse, "rdap-response", 400);
+}
+
+fn fuzzParseResponseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseResponse(std.testing.Smith, smith, testing.allocator);
 }
 
 /// The tolerant mapper — `mapObject`/`mapEntities`/`extractVcard`/
@@ -2584,7 +2691,7 @@ fn buildFuzzedResponse(w: *std.Io.Writer, payload: []const u8) !void {
     try w.writeAll("}");
 }
 
-fn fuzzParseResponse(_: void, smith: *std.testing.Smith) !void {
+fn fuzzParseResponse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     try assertMapperReached();
 
     var buf: [rdap_fuzz_buf_len]u8 = undefined;
@@ -2598,17 +2705,27 @@ fn fuzzParseResponse(_: void, smith: *std.testing.Smith) !void {
     // **0 of 12 seeds non-empty and 0 documents mapped before, 11 of 12
     // non-empty (one seed IS the empty document) and 8 mapped after; and the
     // wrapper generator went from 1 distinct document across the corpus to 5.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &response_seeds);
     const payload = buf[0..len];
 
     // (a) the raw bytes, as before: they must never panic.
-    try tolerate(parseResponse(testing.allocator, payload));
+    try tolerate(parseResponse(gpa, payload));
+    if (parseResponse(gpa, payload)) |p| {
+        var pp = p;
+        pp.deinit();
+        ResponseMark.mark(.mapped);
+    } else |_| ResponseMark.mark(.refused);
 
     // (b) the same bytes inside a document the mapper will actually walk.
-    var doc: std.Io.Writer.Allocating = .init(testing.allocator);
+    var doc: std.Io.Writer.Allocating = .init(gpa);
     defer doc.deinit();
     buildFuzzedResponse(&doc.writer, payload) catch return;
-    try tolerate(parseResponse(testing.allocator, doc.written()));
+    try tolerate(parseResponse(gpa, doc.written()));
+    if (parseResponse(gpa, doc.written())) |p| {
+        var pp = p;
+        pp.deinit();
+        ResponseMark.mark(.wrapped_mapped);
+    } else |_| ResponseMark.mark(.wrapped_refused);
 }
 
 test "corpus: every response seed reaches the mapper, and the counts are pinned" {
@@ -2698,10 +2815,22 @@ const bootstrap_seeds = [_][]const u8{
 };
 
 test "fuzz: parseBootstrap never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseBootstrap, .{ .corpus = &bootstrap_seeds });
+    try testing.fuzz({}, fuzzParseBootstrapSmith, .{ .corpus = &bootstrap_seeds });
 }
 
-fn fuzzParseBootstrap(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: RDAP_FUZZ (bootstrap)" {
+    try fz.fuzz_driver.run(fuzzParseBootstrap, .{ .prefix = "RDAP_FUZZ", .name = "rdap-bootstrap" });
+}
+
+test "fuzz harness: bootstrap, 400 seeds, reaches every outcome" {
+    try BootstrapMark.reach(fuzzParseBootstrap, "rdap-bootstrap", 400);
+}
+
+fn fuzzParseBootstrapSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseBootstrap(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParseBootstrap(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [rdap_fuzz_buf_len]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length — see `fuzzParseResponse` for the measurement. `len` was 0 for
@@ -2711,7 +2840,7 @@ fn fuzzParseBootstrap(_: void, smith: *std.testing.Smith) !void {
     // corpus above: **0 of 12 seeds non-empty and 0 registries parsed before,
     // 11 of 12 non-empty (one seed IS the empty file), 7 parsed and 5 services
     // walked after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &bootstrap_seeds);
     const payload = buf[0..len];
 
     // Aim canary: the bootstrap mapper must be reachable, and this says so
@@ -2726,33 +2855,35 @@ fn fuzzParseBootstrap(_: void, smith: *std.testing.Smith) !void {
             \\  ]
             \\}
         ;
-        var bs = try parseBootstrap(testing.allocator, canary);
+        var bs = try parseBootstrap(gpa, canary);
         defer bs.deinit();
         try testing.expectEqual(@as(usize, 2), bs.services.len);
         try testing.expect(bs.lookupDomain("example.com") != null);
     }
 
-    if (parseBootstrap(testing.allocator, payload)) |bs| {
+    if (parseBootstrap(gpa, payload)) |bs| {
         var b = bs;
         b.deinit();
+        BootstrapMark.mark(.parsed);
     } else |err| switch (err) {
-        error.InvalidJson, error.InvalidRdap, error.OutOfMemory => {},
+        error.InvalidJson, error.InvalidRdap, error.OutOfMemory => BootstrapMark.mark(.refused),
     }
 
     // The fuzzer's bytes as a service entry, so the shape the mapper walks is
     // a bootstrap file and not a random blob.
-    var doc: std.Io.Writer.Allocating = .init(testing.allocator);
+    var doc: std.Io.Writer.Allocating = .init(gpa);
     defer doc.deinit();
     doc.writer.writeAll("{\"version\":\"1.0\",\"services\":[[[") catch return;
     std.json.Stringify.encodeJsonString(payload, .{}, &doc.writer) catch return;
     doc.writer.writeAll("],[") catch return;
     std.json.Stringify.encodeJsonString(payload, .{}, &doc.writer) catch return;
     doc.writer.writeAll("]]]}") catch return;
-    if (parseBootstrap(testing.allocator, doc.written())) |bs| {
+    if (parseBootstrap(gpa, doc.written())) |bs| {
         var b = bs;
         b.deinit();
+        BootstrapMark.mark(.wrapped_parsed);
     } else |err| switch (err) {
-        error.InvalidJson, error.InvalidRdap, error.OutOfMemory => {},
+        error.InvalidJson, error.InvalidRdap, error.OutOfMemory => BootstrapMark.mark(.wrapped_refused),
     }
 }
 
@@ -2791,4 +2922,5 @@ test "corpus: every bootstrap seed reaches parseBootstrap, and the counts are pi
 
 test {
     _ = @import("goldens.zig");
+    _ = @import("fuzz_test.zig");
 }

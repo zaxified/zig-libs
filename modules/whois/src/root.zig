@@ -378,8 +378,77 @@ pub fn isSpecialUseHost(host: []const u8) bool {
     if (trimmed.len == 0) return true; // "." / "" is not a destination
     if (std.ascii.eqlIgnoreCase(trimmed, "localhost")) return true;
     if (std.ascii.endsWithIgnoreCase(trimmed, ".localhost")) return true;
+    switch (parseInetAton(host)) {
+        .invalid => return true, // numeric-shaped but not a valid form: refuse, do not guess
+        .addr => |q| return isSpecialUseIp(.{ .v4 = q }),
+        .not_numeric => {},
+    }
     const ip = netaddr.parseIp(trimmed) orelse return false;
     return isSpecialUseIp(ip);
+}
+
+/// Result of reading a host as an `inet_aton` numeric address.
+const NumericHost = union(enum) {
+    /// Not numeric-shaped: an ordinary name or a canonical IP literal.
+    not_numeric,
+    /// Numeric-shaped (every dot-separated part starts with a digit and holds
+    /// only hex digits / `x`) but not a valid `inet_aton` form.
+    invalid,
+    addr: [4]u8,
+};
+
+/// `inet_aton`'s accepted forms: 1 to 4 dot-separated parts, each decimal,
+/// octal (leading `0`) or hex (`0x`); the last part fills the remaining bytes
+/// (`127.1` is 127.0.0.1, `2130706433` is 127.0.0.1). A resolver that takes
+/// such a host as an IPv4 literal dials the address it denotes, so the guard
+/// must classify THAT address (SSRF-guard gap found by the 2026-10-10 fuzz
+/// oracle). A numeric-shaped host that is not a valid form is refused by the
+/// caller rather than guessed at.
+fn parseInetAton(raw: []const u8) NumericHost {
+    // ONE trailing dot is the absolute spelling of the same host; a second one
+    // leaves an empty part, which is invalid below.
+    const host = if (raw.len > 0 and raw[raw.len - 1] == '.') raw[0 .. raw.len - 1] else raw;
+    if (host.len == 0 or !std.ascii.isDigit(host[0])) return .not_numeric;
+    if (std.mem.indexOfNone(u8, host, "0123456789abcdefABCDEFxX.") != null) return .not_numeric;
+    var it0 = std.mem.splitScalar(u8, host, '.');
+    while (it0.next()) |part| {
+        if (part.len == 0) return .invalid;
+        if (!std.ascii.isDigit(part[0])) return .not_numeric;
+    }
+    var vals: [4]u64 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, host, '.');
+    while (it.next()) |part| {
+        if (n == 4) return .invalid;
+        var radix: u8 = 10;
+        var digits = part;
+        if (part.len >= 2 and part[0] == '0' and (part[1] == 'x' or part[1] == 'X')) {
+            radix = 16;
+            digits = part[2..];
+        } else if (part.len >= 2 and part[0] == '0') {
+            radix = 8;
+            digits = part[1..];
+        }
+        if (digits.len == 0) return .invalid;
+        vals[n] = std.fmt.parseInt(u64, digits, radix) catch return .invalid;
+        if (vals[n] > 0xffff_ffff) return .invalid;
+        n += 1;
+    }
+    var out: [4]u8 = undefined;
+    for (vals[0 .. n - 1], 0..) |v, i| {
+        if (v > 255) return .invalid;
+        out[i] = @intCast(v);
+    }
+    const last = vals[n - 1];
+    const room: u6 = @intCast(8 * (4 - (n - 1)));
+    if (room < 32 and last >> room != 0) return .invalid;
+    var i: usize = n - 1;
+    var rest = last;
+    while (i < 4) : (i += 1) {
+        out[3 - (i - (n - 1))] = @intCast(rest & 0xff);
+        rest >>= 8;
+    }
+    return .{ .addr = out };
 }
 
 fn isSpecialUseIp(ip: netaddr.Ip) bool {
@@ -1079,6 +1148,28 @@ test "isSpecialUseHost: classifies loopback/private/link-local/localhost, passes
     try testing.expect(!isSpecialUseHost("2001:db9::1"));
 }
 
+test "isSpecialUseHost: inet_aton numeric forms are classified by the address they denote (SSRF gap, 2026-10-10)" {
+    // Short, decimal-integer, octal and hex spellings of non-routable addresses.
+    for ([_][]const u8{ "127.1", "2130706433", "0x7f.0.0.1", "017700000001", "0177.0.0.1", "10.1", "0xa000001", "127.0.1", "0xc0.0xa8.1", "192.168.257", "169.254.43518", "0", "0.0", "127.1.", "0X7F.1", "127.0.0.1.", "2130706433.", "127.1..", "127.0.0.1..", "2130706433.." }) |h| {
+        try testing.expect(isSpecialUseHost(h));
+    }
+    // Numeric-shaped but not a valid form: refused, not guessed at.
+    for ([_][]const u8{ "256.1.1.1", "1.2.3.4.5", "4294967296", "0x100000000", "1.65536.1", "09", "1.2.0x", "08.1", "1..2", "999999999999999999999" }) |h| {
+        try testing.expect(isSpecialUseHost(h));
+    }
+    // Public addresses in the same spellings stay allowed.
+    for ([_][]const u8{ "8.8.8.8", "134744072", "0x8080808", "8.8.2056", "010.8.8.8x" }) |h| {
+        if (std.mem.eql(u8, h, "010.8.8.8x")) {
+            try testing.expect(isSpecialUseHost(h)); // 'x' inside a part: invalid, refused
+        } else {
+            try testing.expect(!isSpecialUseHost(h));
+        }
+    }
+    // Ordinary names that merely start with a digit are not numeric.
+    try testing.expect(!isSpecialUseHost("1password.example"));
+    try testing.expect(!isSpecialUseHost("3m.com"));
+}
+
 test "isSpecialUseHost: the ABSOLUTE spelling is the same name (audit F1)" {
     // `localhost.` is `localhost` to every resolver on earth (verified with
     // the shipped `TcpTransport` in the audit's `probe_chain.zig`, netns
@@ -1460,15 +1551,34 @@ const referral_seeds = [_][]const u8{
     seed(""), // the empty text: what the collapsed harness ran, every time
 };
 
+const fz = @import("fuzz_test.zig");
+const RefMark = fz.Marker(enum { parsed, refused, chased });
+
 test "fuzz: parseServerRef never panics on arbitrary text" {
-    try testing.fuzz({}, fuzzParseServerRef, .{ .corpus = &referral_seeds });
+    try testing.fuzz({}, fuzzParseServerRefSmith, .{ .corpus = &referral_seeds });
 }
 
-fn fuzzParseServerRef(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: WHOIS_FUZZ (referral)" {
+    try fz.fuzz_driver.run(fuzzParseServerRef, .{ .prefix = "WHOIS_FUZZ", .name = "whois-referral" });
+}
+
+test "fuzz harness: referral, 500 seeds, reaches every outcome" {
+    try RefMark.reach(fuzzParseServerRef, "whois-referral", 500);
+}
+
+fn fuzzParseServerRefSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseServerRef(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParseServerRef(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [max_host_len * 2]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    _ = parseServerRef(buf[0..len]);
-    _ = nextServer(buf[0..len]);
+    const len: usize = fz.drawInput(S, src, &buf, &referral_seeds);
+    if (parseServerRef(buf[0..len])) |r| {
+        RefMark.mark(.parsed);
+        _ = isSpecialUseHost(r.host);
+    } else RefMark.mark(.refused);
+    if (nextServer(buf[0..len])) |_| RefMark.mark(.chased);
 }
 
 test "corpus: every referral seed reaches the parser, and what it extracts is pinned" {
@@ -1743,4 +1853,5 @@ test "TcpTransport: timeout_ms = null (default) preserves today's unbounded beha
 
 test {
     _ = @import("goldens.zig");
+    _ = @import("fuzz_test.zig");
 }

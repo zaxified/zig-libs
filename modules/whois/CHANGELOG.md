@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **SECURITY (Fixed): a trailing dot hid a numeric host from the special-use guard.** `127.0.0.1.`, `127.1.` and `2130706433.` are now read as the address they denote (ONE trailing dot is stripped before the `inet_aton` analysis); two trailing dots leave an empty part and are refused as an invalid numeric form.
+- **2026-10-10** — **SECURITY (Fixed): the special-use destination guard let `inet_aton` numeric spellings of non-routable addresses through.** ``isSpecialUseHost`` classified only canonical IP literals, so `127.1`, `2130706433`, `0x7f.0.0.1`, `017700000001`, `10.1` and the like returned false although a resolver that takes them as IPv4 dials 127.0.0.1 / 10.0.0.1. The host is now read as an `inet_aton` form (1-4 dot-separated parts, decimal, octal or hex; the last part fills the remaining bytes) and the address it denotes is classified; a numeric-shaped host that is not a valid form (a part that overflows, an empty or malformed part) is refused outright. Public numeric spellings (`134744072` = 8.8.8.8) stay allowed. Found by the `WHOIS_FUZZ` oracle.
+- **2026-10-10** — tests: deterministic fuzz driver `WHOIS_FUZZ` over the referral harness (generic over its choice source) plus a referral/query roundtrip oracle and an SSRF oracle (`isSpecialUseHost` refuses every private, loopback, link-local and IPv4-mapped spelling, with trailing dots and upper case). No code change.
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The two `TcpTransport` cancel tests canceled after a fixed
   sleep. They now cancel once the client is inside the socket read under test (`ReadCueIo`, a
   `std.Io` double that counts `netRead` entries), and the peer is released from `accept`

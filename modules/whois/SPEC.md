@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-15 · mutation 2026-08-23 · src ?
 
-**Hardening:** fuzz ? · ct n/a — public registry queries (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, WHOIS_FUZZ) · ct n/a — public registry queries (keyword review, 2026-10-07)
 
 **Performance:** not measured
 
