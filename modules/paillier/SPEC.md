@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-17 · mutation 2026-09-10 · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-06 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `paillier-roundtrip` at scale 20 = 10,000 runs at a 512-bit key, PAILLIER_FUZZ) · ct 2026-10-06 (ctgrind)
 
 **Performance:** not measured
 

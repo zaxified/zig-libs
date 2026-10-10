@@ -1301,3 +1301,162 @@ test "a client takes a packet once, and only one addressed to it; a provider sto
     try testing.expectEqual(@as(u8, 0), mix.deliveries()[0].recipient);
     try testing.expectEqual(@as(u64, 2), mix.relay.misdelivered);
 }
+
+// ── fuzz: hostile packets into the relay handlers ───────────────────────────
+//
+// Every handler a node runs on a received payload (`acceptAtMix`,
+// `providerMessage`, `clientMessage`, the fetch answer) is fed attacker-shaped
+// bytes: wild octets, a well-formed header damaged by 0-3 octets, headers whose
+// route names the receiving mix (so the packet is stashed), mailbox fetches and
+// fetch answers with a lying count. The registry of sent packets holds a few
+// ids so the delivery paths are reachable. Nothing may panic; a delivery names
+// an id that was sent; the counters stay consistent.
+
+const fz = @import("fuzz_test.zig");
+const InjectMark = fz.Marker(enum { fifo, poisson, direct, providers, malformed_counted, stashed_at_mix, mailbox_filled, fetch_answered, delivered });
+
+fn hostilePayload(comptime S: type, src: *S, cfg: LoopixConfig, node_ptr: *NodeId, from_ptr: *NodeId, buf: []u8) []const u8 {
+    const node = node_ptr.*;
+    const kinds = [_]MsgKind{ .real, .loop_cover, .drop_cover };
+    switch (src.index(7)) {
+        0 => {
+            const n = src.slice(buf[0..160]);
+            return buf[0..n];
+        },
+        1, 5 => |which| {
+            var hdr = MixHeader{
+                .kind = kinds[src.index(3)],
+                .id = src.valueRangeAtMost(u64, 0, 6),
+                .hop = 0,
+                .n_hops = src.valueRangeAtMost(u8, 0, types.max_layers),
+                .route = undefined,
+            };
+            hdr.hop = src.valueRangeAtMost(u8, 0, hdr.n_hops);
+            for (&hdr.route) |*r| r.* = @intCast(src.index(cfg.nodeCount()));
+            if (which == 5 and hdr.hop < hdr.n_hops) hdr.route[hdr.hop] = node; // names this node: the packet is stashed
+            hdr.has_delays = src.value(bool);
+            for (&hdr.delays) |*d| d.* = src.valueRangeAtMost(u32, 0, 60);
+            hdr.recipient = @intCast(src.index(cfg.nodeCount()));
+            var enc: [MixHeader.wire_len]u8 = undefined;
+            hdr.encode(&enc);
+            const n = fz.damage(src, buf[0..MixHeader.wire_len], &enc);
+            return buf[0..n];
+        },
+        2 => {
+            buf[0] = FETCH_REQ;
+            return buf[0..1];
+        },
+        3 => {
+            // A fetch answer: a count that may lie about what follows.
+            buf[0] = FETCH_RESP;
+            buf[1] = src.valueRangeAtMost(u8, 0, 4);
+            var enc: [MixHeader.wire_len]u8 = undefined;
+            var hdr = MixHeader{ .kind = .real, .id = src.valueRangeAtMost(u64, 0, 6), .hop = 3, .n_hops = 3, .route = @splat(node), .recipient = node };
+            hdr.encode(&enc);
+            const have = src.valueRangeAtMost(u8, 0, 2);
+            var off: usize = 2;
+            for (0..have) |_| {
+                @memcpy(buf[off..][0..enc.len], &enc);
+                off += enc.len;
+            }
+            return buf[0 .. off - if (src.value(bool) and off > 2) src.index(off - 2) else 0];
+        },
+        6 => {
+            // A last-layer mix handing a packet to its recipient's provider: the
+            // one shape that lands in a mailbox (provider topology) or is
+            // delivered (direct topology), when the header is intact.
+            const c: u8 = @intCast(src.index(cfg.clients));
+            const dest: NodeId = if (cfg.providers > 0) cfg.providerOf(c) else cfg.clientNode(c);
+            node_ptr.* = dest;
+            from_ptr.* = cfg.mixNode(cfg.layers - 1, @intCast(src.index(cfg.width)));
+            var hdr = MixHeader{ .kind = .real, .id = src.valueRangeAtMost(u64, 0, 6), .hop = 3, .n_hops = 3, .route = @splat(0), .recipient = cfg.clientNode(c) };
+            hdr.route[3] = dest;
+            var enc: [MixHeader.wire_len]u8 = undefined;
+            hdr.encode(&enc);
+            const n = fz.damage(src, buf[0..MixHeader.wire_len], &enc);
+            return buf[0..n];
+        },
+        else => return buf[0..0],
+    }
+}
+
+fn injectInto(comptime M: type, mix: *M, cfg: LoopixConfig, comptime scen: anytype, comptime S: type, src: *S, gpa: Allocator) anyerror!void {
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = netsim.Sim.init(gpa, 0, mix.protocol(), &log, UNTIL, 10_000);
+    defer sim.deinit();
+    try scen(&sim);
+    const p = mix.protocol();
+    // A few packets "sent", so a hostile header can name a real one.
+    for (0..7) |id| try mix.relay.sent.put(gpa, id, .{ .client = @intCast(id % cfg.clients), .at = 0, .kind = .real, .recipient = cfg.clientNode(@intCast((id + 1) % cfg.clients)) });
+
+    var buf: [fetch_resp_len + 8]u8 = undefined;
+    for (0..24) |_| {
+        var node: NodeId = @intCast(src.index(cfg.nodeCount()));
+        var from: NodeId = @intCast(src.index(cfg.nodeCount()));
+        const payload = hostilePayload(S, src, cfg, &node, &from, &buf);
+        try p.onMessageFn(p.ctx, &sim, node, from, payload);
+    }
+
+    const relay = &mix.relay;
+    if (relay.malformed > 0) InjectMark.mark(.malformed_counted);
+    for (relay.queues) |q| if (q.items.len != 0) {
+        InjectMark.mark(.stashed_at_mix);
+        break;
+    };
+    for (relay.mailboxes) |m| if (m.items.len != 0) {
+        InjectMark.mark(.mailbox_filled);
+        break;
+    };
+    if (relay.fetch_lens.items.len != 0) InjectMark.mark(.fetch_answered);
+    if (relay.deliveries.items.len != 0) InjectMark.mark(.delivered);
+    for (relay.deliveries.items) |d| if (!relay.sent.contains(d.id)) return error.DeliveryOfUnsentPacket;
+    if (relay.deliveries.items.len > relay.sent.count()) return error.MoreDeliveriesThanPackets;
+}
+
+fn fuzzInject(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
+    const poisson = src.value(bool);
+    const providers = src.value(bool);
+    if (poisson) InjectMark.mark(.poisson) else InjectMark.mark(.fifo);
+    if (providers) InjectMark.mark(.providers) else InjectMark.mark(.direct);
+    const seed = src.value(u64);
+    if (providers) {
+        const cfg = PROVIDER_CFG;
+        if (poisson) {
+            var mix = try Loopix.init(gpa, cfg, seed);
+            defer mix.deinit(gpa);
+            try injectInto(Loopix, &mix, cfg, providerScenario, S, src, gpa);
+        } else {
+            var mix = try FifoMix.init(gpa, cfg);
+            defer mix.deinit(gpa);
+            try injectInto(FifoMix, &mix, cfg, providerScenario, S, src, gpa);
+        }
+    } else {
+        const cfg = DEFAULT_CFG;
+        if (poisson) {
+            var mix = try Loopix.init(gpa, cfg, seed);
+            defer mix.deinit(gpa);
+            try injectInto(Loopix, &mix, cfg, scenario, S, src, gpa);
+        } else {
+            var mix = try FifoMix.init(gpa, cfg);
+            defer mix.deinit(gpa);
+            try injectInto(FifoMix, &mix, cfg, scenario, S, src, gpa);
+        }
+    }
+}
+
+fn fuzzInjectSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzInject(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: hostile packets into the relay handlers never panic or mis-deliver" {
+    try testing.fuzz({}, fuzzInjectSmith, .{});
+}
+
+test "fuzz driver: LOOPIX_FUZZ (inject)" {
+    try fz.fuzz_driver.run(fuzzInject, .{ .prefix = "LOOPIX_FUZZ", .name = "loopix-inject" });
+}
+
+test "fuzz harness: hostile packets, 300 seeds, reaches every outcome" {
+    try InjectMark.reach(fuzzInject, "loopix-inject", 300);
+}

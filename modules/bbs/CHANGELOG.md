@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `BBS_FUZZ` over the three decoders (`bbs-signature`, `bbs-public-key`, `bbs-proof`; what decodes also re-encodes to the same octets) plus two new oracles, `bbs-sign-verify` (SHA-256 and SHAKE-256 suites: a signature this module issued verifies; a flipped octet, another message, another header and another key do not) and `bbs-proof-verify` (random disclosed subsets of three messages: the proof verifies; a flipped octet, another disclosed message and another presentation header do not). No change in `src/` outside tests.
 - **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte
   vector stores LLVM realigned the frame of a burn of 2 KiB or less (`and $-32, %rsp`), and the 32..63
   bytes between the zeroed buffer and the saved frame pointer kept whatever a callee had left there

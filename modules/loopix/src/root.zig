@@ -109,6 +109,7 @@ test {
     _ = @import("mixing.zig");
     _ = @import("protocol.zig");
     _ = @import("gate.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "smoke: module imports and re-exports resolve" {

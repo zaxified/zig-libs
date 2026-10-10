@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `DRAND_FUZZ` over the existing harnesses (`drand-parse`, `drand-verify`, `drand-verify-chained`), now generic over their choice source, with reach labels (genuine accepted / damaged refused at parse / damaged refused at verify). No code change in `src/` outside tests.
 - **2026-10-06** — **BEHAVIOURAL (stricter only on hand-built points), API ADDED:** both schemes
   now verify through `bls12_381.scheme`: new `QuicknetSuite` (= `MinSigBasic`) and `ChainedSuite`
   (= `MinPkBasic`); `verifyRoundPoints` / `verifyChainedRoundPoints` keep their signatures and

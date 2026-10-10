@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `SLHDSA_FUZZ` (`slhdsa-sha2-128f-verify`, `slhdsa-shake-128f-verify`, new `src/fuzz_test.zig`): the genuine signature verifies; every damaged, truncated, extended or wild signature, and the genuine one under another message or context (including a context over 255 octets), is refused. No change in `src/` outside tests.
 - **2026-10-09** — **BREAKING, HIGH (dead stack):** key generation and signing left SK.seed and
   SK.prf on the dead stack, in library frames and in the caller's frame, because every
   secret crossed the API BY VALUE (`keyGenFromSeed(sk_seed, sk_prf, pk_seed) KeyPair`,

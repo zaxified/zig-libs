@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `RESCUE_FUZZ` over the five existing harnesses (`rescue-injective`, `rescue-roundtrip`, `rescue-field`, `rescue-framings`, `rescue-xlix`), now generic over their choice source; under the driver a share of the field-element draws sits on the edges (modulus neighbours, zero, small, top of the u64 range) and the reach labels count them. No change in `src/` outside tests (no parser: every input is already a field element).
 - **2026-09-08** — `fuzzInjective` now carries a corpus, and a guard test pins
   what it reaches. It had none, so `std.testing.fuzz` replayed exactly one
   input, the empty one: every draw this harness makes is a scalar one, and a

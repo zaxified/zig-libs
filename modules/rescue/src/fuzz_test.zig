@@ -28,17 +28,47 @@ const xlix = @import("xlix.zig");
 
 const P128 = perm.Permutation(params.Instance.bits128);
 
-fn arbitraryFe(smith: *std.testing.Smith) gl.Fe {
-    return gl.fromU64(smith.value(u64));
+const testkit = @import("testkit");
+const testing = std.testing;
+const fz = struct {
+    const driver = testkit.fuzz.driver;
+    const Marker = Marker_;
+};
+const Rng = fz.driver.Rng;
+const InjMark = fz.Marker(enum { first_slot, rate_slot, capacity_slot, distinct_outputs });
+const RoundTripMark = fz.Marker(enum { low_state, high_state, ordinary_state });
+const FieldMark = fz.Marker(enum { near_modulus, small, above_modulus, ordinary, wide_high });
+const FramingMark = fz.Marker(enum { empty, below_rate, rate_exact, multi_absorb, distinct_framings });
+const XlixMark = fz.Marker(enum { ordinary, low_state });
+
+/// One field element. Under `Smith` it is exactly `value(u64)` (corpus seeds
+/// are word scripts of these draws); under the driver's `Rng` a share of the
+/// draws sits on the edges random u64s never reach: the modulus' neighbours,
+/// zero and small values, the top of the u64 range.
+fn arbitraryFe(src: anytype) gl.Fe {
+    const S = @typeInfo(@TypeOf(src)).pointer.child;
+    if (S != Rng) return gl.fromU64(src.value(u64));
+    return gl.fromU64(switch (src.index(8)) {
+        0 => gl.P -% src.valueRangeAtMost(u64, 0, 3),
+        1 => gl.P +% src.valueRangeAtMost(u64, 0, 3),
+        2 => src.valueRangeAtMost(u64, 0, 3),
+        3 => std.math.maxInt(u64) - src.valueRangeAtMost(u64, 0, 3),
+        else => src.value(u64),
+    });
 }
 
-fn fuzzInjective(_: void, smith: *std.testing.Smith) !void {
+fn fuzzInjectiveSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzInjective(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzInjective(comptime S: type, smith: *S, _: std.mem.Allocator) anyerror!void {
     var a: P128.State = undefined;
     for (&a) |*x| x.* = arbitraryFe(smith);
 
     // Perturb exactly one slot by a non-zero delta, so the inputs are
     // guaranteed distinct and the outputs therefore must be too.
     const slot = smith.value(u8) % P128.width;
+    if (slot == 0) InjMark.mark(.first_slot) else if (slot < 8) InjMark.mark(.rate_slot) else InjMark.mark(.capacity_slot);
     var delta = arbitraryFe(smith);
     if (delta == 0) delta = 1;
 
@@ -50,6 +80,7 @@ fn fuzzInjective(_: void, smith: *std.testing.Smith) !void {
     P128.permute(&oa);
     P128.permute(&ob);
     try std.testing.expect(!std.mem.eql(gl.Fe, &oa, &ob));
+    InjMark.mark(.distinct_outputs);
 }
 
 /// One `fuzzInjective` round as octets. ⚠ NOT `testkit.fuzz.seed`: that
@@ -114,7 +145,7 @@ test "corpus: the injectivity seeds drive slot and delta, and the counts are pin
     for (inj_seeds) |sd| {
         // The harness itself, over the real `Smith`.
         var sm: std.testing.Smith = .{ .in = sd };
-        try fuzzInjective({}, &sm);
+        try fuzzInjective(std.testing.Smith, &sm, std.testing.allocator);
 
         // …and the same draw sequence again, to count what it produced.
         var smith: std.testing.Smith = .{ .in = sd };
@@ -143,12 +174,17 @@ test "corpus: the injectivity seeds drive slot and delta, and the counts are pin
 }
 
 test "fuzz: the RPO permutation is injective" {
-    try std.testing.fuzz({}, fuzzInjective, .{ .corpus = &inj_seeds });
+    try std.testing.fuzz({}, fuzzInjectiveSmith, .{ .corpus = &inj_seeds });
 }
 
-fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
+fn fuzzRoundTripSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRoundTrip(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzRoundTrip(comptime S: type, smith: *S, _: std.mem.Allocator) anyerror!void {
     var st: P128.State = undefined;
     for (&st) |*x| x.* = arbitraryFe(smith);
+    if (st[0] < 4) RoundTripMark.mark(.low_state) else if (st[0] >= gl.P - 4) RoundTripMark.mark(.high_state) else RoundTripMark.mark(.ordinary_state);
     const original = st;
     P128.permute(&st);
     P128.permuteInverse(&st);
@@ -156,13 +192,21 @@ fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: permuteInverse undoes permute on arbitrary states" {
-    try std.testing.fuzz({}, fuzzRoundTrip, .{});
+    try std.testing.fuzz({}, fuzzRoundTripSmith, .{});
 }
 
-fn fuzzField(_: void, smith: *std.testing.Smith) !void {
+fn fuzzFieldSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzField(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzField(comptime S: type, smith: *S, _: std.mem.Allocator) anyerror!void {
     const a = arbitraryFe(smith);
     const b = arbitraryFe(smith);
-    const wide: u128 = (@as(u128, smith.value(u64)) << 64) | smith.value(u64);
+    const hi = smith.value(u64);
+    const wide: u128 = (@as(u128, hi) << 64) | smith.value(u64);
+    if (a >= gl.P - 4) FieldMark.mark(.near_modulus) else if (a < 4) FieldMark.mark(.small) else FieldMark.mark(.ordinary);
+    if (hi > (1 << 32)) FieldMark.mark(.wide_high);
+    FieldMark.mark(.above_modulus);
     try std.testing.expectEqual(@as(u64, @intCast((@as(u128, a) * b) % gl.P)), gl.mul(a, b));
     try std.testing.expectEqual(@as(u64, @intCast((@as(u128, a) + b) % gl.P)), gl.add(a, b));
     try std.testing.expectEqual(@as(u64, @intCast((@as(u128, a) + gl.P - b) % gl.P)), gl.sub(a, b));
@@ -171,7 +215,7 @@ fn fuzzField(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: Goldilocks arithmetic agrees with a u128 modulo oracle" {
-    try std.testing.fuzz({}, fuzzField, .{});
+    try std.testing.fuzz({}, fuzzFieldSmith, .{});
 }
 
 /// `testkit.fuzz.seed`, aliased so the corpus below reads as the element
@@ -232,7 +276,11 @@ test "corpus: every framing seed reaches the sponge, and the elements absorbed a
     try std.testing.expectEqual(@as(usize, 1), empty_refusals);
 }
 
-fn fuzzFramings(_: void, smith: *std.testing.Smith) !void {
+fn fuzzFramingsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFramings(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzFramings(comptime S: type, smith: *S, _: std.mem.Allocator) anyerror!void {
     // ⚠ ONE byte-first draw. What stood here was `smith.value(u8)` as the
     // harness's FIRST act, and a `Smith` scalar draw reads eight octets as a
     // little-endian `u64`, returning the range minimum when fewer remain.
@@ -252,6 +300,7 @@ fn fuzzFramings(_: void, smith: *std.testing.Smith) !void {
     const n = got / 8;
     for (buf[0..n], 0..) |*x, i| x.* = gl.fromU64(std.mem.readInt(u64, raw[i * 8 ..][0..8], .big));
     const input = buf[0..n];
+    if (n == 0) FramingMark.mark(.empty) else if (n < 8) FramingMark.mark(.below_rate) else if (n == 8) FramingMark.mark(.rate_exact) else FramingMark.mark(.multi_absorb);
 
     const a = rpo.spec128.hash(input) catch |err| {
         // The empty sequence is the single input this framing refuses; the
@@ -262,6 +311,7 @@ fn fuzzFramings(_: void, smith: *std.testing.Smith) !void {
     };
     const b = rpo.Rpo256.hashElements(input);
     try std.testing.expect(!std.mem.eql(gl.Fe, &a, &b));
+    FramingMark.mark(.distinct_framings);
 
     // The same elements through the same framing must agree with themselves —
     // trivial, but it is what catches a stateful `state` slipping into scope.
@@ -269,12 +319,17 @@ fn fuzzFramings(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the two RPO sponge framings never collide" {
-    try std.testing.fuzz({}, fuzzFramings, .{ .corpus = &framing_seeds });
+    try std.testing.fuzz({}, fuzzFramingsSmith, .{ .corpus = &framing_seeds });
 }
 
-fn fuzzXlixDiffers(_: void, smith: *std.testing.Smith) !void {
+fn fuzzXlixDiffersSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzXlixDiffers(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzXlixDiffers(comptime S: type, smith: *S, _: std.mem.Allocator) anyerror!void {
     var st: xlix.State = undefined;
     for (&st) |*x| x.* = arbitraryFe(smith);
+    if (st[0] < 4) XlixMark.mark(.low_state) else XlixMark.mark(.ordinary);
     var a = st;
     var b: P128.State = st;
     xlix.permute(&a);
@@ -283,5 +338,59 @@ fn fuzzXlixDiffers(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: Rescue-XLIX and RPO never agree" {
-    try std.testing.fuzz({}, fuzzXlixDiffers, .{});
+    try std.testing.fuzz({}, fuzzXlixDiffersSmith, .{});
+}
+
+test "fuzz driver: RESCUE_FUZZ (injective)" {
+    try fz.driver.run(fuzzInjective, .{ .prefix = "RESCUE_FUZZ", .name = "rescue-injective" });
+}
+test "fuzz driver: RESCUE_FUZZ (round trip)" {
+    try fz.driver.run(fuzzRoundTrip, .{ .prefix = "RESCUE_FUZZ", .name = "rescue-roundtrip" });
+}
+test "fuzz driver: RESCUE_FUZZ (field)" {
+    try fz.driver.run(fuzzField, .{ .prefix = "RESCUE_FUZZ", .name = "rescue-field" });
+}
+test "fuzz driver: RESCUE_FUZZ (framings)" {
+    try fz.driver.run(fuzzFramings, .{ .prefix = "RESCUE_FUZZ", .name = "rescue-framings" });
+}
+test "fuzz driver: RESCUE_FUZZ (xlix differs)" {
+    try fz.driver.run(fuzzXlixDiffers, .{ .prefix = "RESCUE_FUZZ", .name = "rescue-xlix" });
+}
+
+test "fuzz harness: rescue, 300 seeds each, reaches every outcome" {
+    try InjMark.reach(fuzzInjective, "rescue-injective", 300);
+    try RoundTripMark.reach(fuzzRoundTrip, "rescue-roundtrip", 300);
+    try FieldMark.reach(fuzzField, "rescue-field", 300);
+    try FramingMark.reach(fuzzFramings, "rescue-framings", 300);
+    try XlixMark.reach(fuzzXlixDiffers, "rescue-xlix", 300);
+}
+
+/// Reach counters for one harness file's labels. `mark` also feeds the
+/// driver's `REACH` report; `reach` runs `seeds` seeds in the ordinary test
+/// binary and fails with `error.HarnessDoesNotReach` if a label never fired.
+fn Marker_(comptime Label: type) type {
+    return struct {
+        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+
+        pub fn mark(comptime l: Label) void {
+            counts[@intFromEnum(l)] += 1;
+            fz.driver.hit(@tagName(l));
+        }
+
+        pub fn reach(comptime harness: anytype, comptime name: []const u8, seeds: usize) !void {
+            counts = @splat(0);
+            for (0..seeds) |sn| {
+                var prng = std.Random.DefaultPrng.init(sn);
+                var rng: fz.driver.Rng = .{ .r = prng.random() };
+                harness(fz.driver.Rng, &rng, testing.allocator) catch |err| {
+                    std.debug.print(name ++ " seed {d}: {t}\n", .{ sn, err });
+                    return err;
+                };
+            }
+            for (counts, 0..) |n, i| if (n == 0) {
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                return error.HarnessDoesNotReach;
+            };
+        }
+    };
 }

@@ -698,24 +698,76 @@ const CtCorpus = struct {
     }
 };
 
-fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
-    const f = CtCorpus.fixture();
+const fz = @import("fuzz_test.zig");
+const DecryptMark = fz.Marker(enum { genuine_accepted, damaged_refused_at_decode, damaged_refused_at_decrypt, wrong_key_refused });
 
-    // ⚠ ONE byte-first draw. Never a ranged draw before the bytes.
-    var buf: [ibe.Ciphertext.encoded_bytes]u8 = undefined;
-    const n: usize = smith.slice(&buf);
-    // `fromBytes` takes exactly `encoded_bytes`, so a short draw is
-    // zero-padded the way a short wire read would have to be.
+/// Built once per process (an extract and a pairing): the same fixed PKG key
+/// and ciphertext every run, plus a second identity's key for the wrong-key
+/// control.
+var fixture_cache: ?struct { d_id: g1.Affine, other_id: g1.Affine, bytes: [ibe.Ciphertext.encoded_bytes]u8 } = null;
+
+fn fuzzDecryptSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecrypt(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecrypt(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    if (fixture_cache == null) {
+        const f = CtCorpus.fixture();
+        var msk_bytes = [_]u8{0} ** 32;
+        msk_bytes[31] = 0x07;
+        const msk = Fr.fromBytes(msk_bytes) catch unreachable;
+        fixture_cache = .{ .d_id = f.d_id, .other_id = testExtract(ibe.Default, msk, "other@example.com"), .bytes = f.bytes };
+    }
+    const f = fixture_cache.?;
+
     var bytes: [ibe.Ciphertext.encoded_bytes]u8 = [_]u8{0} ** ibe.Ciphertext.encoded_bytes;
-    @memcpy(bytes[0..n], buf[0..n]);
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        // The driver's structured half: the real ciphertext with 0-3 octets
+        // damaged (the other half is the plain draw below, for wild input).
+        var buf: [ibe.Ciphertext.encoded_bytes]u8 = undefined;
+        const n = fz.damage(src, &buf, &f.bytes);
+        @memcpy(bytes[0..n], buf[0..n]);
+    } else {
+        // ⚠ ONE byte-first draw. Never a ranged draw before the bytes.
+        var buf: [ibe.Ciphertext.encoded_bytes]u8 = undefined;
+        const n: usize = src.slice(&buf);
+        // `fromBytes` takes exactly `encoded_bytes`, so a short draw is
+        // zero-padded the way a short wire read would have to be.
+        @memcpy(bytes[0..n], buf[0..n]);
+    }
 
-    const corrupted = ibe.Ciphertext.fromBytes(bytes) catch return;
-    _ = testDecrypt(ibe.Default, f.d_id, corrupted) catch return;
+    // The oracle: the pristine ciphertext decrypts to its message, and any
+    // damaged one is refused (U by the decoder, V and W by the FO check).
+    const pristine = std.mem.eql(u8, &bytes, &f.bytes);
+    const corrupted = ibe.Ciphertext.fromBytes(bytes) catch {
+        if (pristine) return error.GenuineCiphertextRefused;
+        DecryptMark.mark(.damaged_refused_at_decode);
+        return;
+    };
+    const m = testDecrypt(ibe.Default, f.d_id, corrupted) catch {
+        if (pristine) return error.GenuineCiphertextRefused;
+        DecryptMark.mark(.damaged_refused_at_decrypt);
+        return;
+    };
+    if (!pristine) return error.DamagedCiphertextDecrypted;
+    if (!std.mem.eql(u8, &m, &([_]u8{0xAB} ** ibe.block_bytes))) return error.GenuineCiphertextChanged;
+    DecryptMark.mark(.genuine_accepted);
+    // The same ciphertext under another identity's key is refused.
+    if (testDecrypt(ibe.Default, f.other_id, corrupted)) |_| return error.WrongKeyDecrypted else |_| {}
+    DecryptMark.mark(.wrong_key_refused);
+}
+
+test "fuzz driver: IBE_FUZZ (ciphertext)" {
+    try fz.fuzz_driver.run(fuzzDecrypt, .{ .prefix = "IBE_FUZZ", .name = "ibe-ciphertext" });
+}
+
+test "fuzz harness: ciphertext, 300 seeds, reaches every outcome" {
+    try DecryptMark.reach(fuzzDecrypt, "ibe-ciphertext", 300);
 }
 
 test "fuzz: Ciphertext.fromBytes/decrypt never panics on corrupted ciphertext bytes" {
     var corpus: CtCorpus = .{};
-    try std.testing.fuzz({}, fuzzDecrypt, .{ .corpus = corpus.build(CtCorpus.fixture().bytes) });
+    try std.testing.fuzz({}, fuzzDecryptSmith, .{ .corpus = corpus.build(CtCorpus.fixture().bytes) });
 }
 
 test "corpus: every ciphertext seed reaches fromBytes, and the outcomes are pinned" {

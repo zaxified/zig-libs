@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `LOOPIX_FUZZ`: `loopix-header` (the existing `MixHeader.decode` harness, generic over its source; what decodes is in route bounds and re-encodes to the same octets) and new `loopix-inject` (24 hostile packets per run -- wild octets, damaged well-formed headers, headers naming the receiving mix, mailbox fetches and fetch answers with a lying count -- into the relay handlers of `FifoMix` and `Loopix`, direct and provider topologies; no panic, every delivery names a sent id). New `src/fuzz_test.zig`. No change in `src/` outside tests.
 - **2026-10-04** — **Phase 2: providers, sender-chosen delays, end-to-end anonymity,
   n−1 detection; scope poc → core as a simulator (user decision, reverses 2026-09-30;
   re-surveyed against A. Piotrowska's mix network simulator).**

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-16 · mutation 2026-09-10 · src ?
 
-**Hardening:** fuzz ? · ct n/a — public beacon verification (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; the two verify harnesses at scale 20 = 10,000 runs, DRAND_FUZZ) · ct n/a — public beacon verification (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

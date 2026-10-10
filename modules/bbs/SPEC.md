@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-09 · mutation 2026-10-06 (19/19) · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-06 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; the two verify oracles at scale 200 = 1,000 runs each (a sign or proof plus up to five pairing checks per run), BBS_FUZZ) · ct 2026-10-06 (ctgrind)
 
 **Performance:** not measured
 

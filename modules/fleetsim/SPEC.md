@@ -7,7 +7,7 @@
 **Scope:** core — pymodbus simulator / ModbusPal / conpot, multi-protocol (surveyed 2026-09-30)
 **Audit:** review 2026-09-15 · mutation 2026-09-15 · src ?
 
-**Hardening:** fuzz ? · ct n/a — fleet simulation (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, FLEETSIM_FUZZ) · ct n/a — fleet simulation (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

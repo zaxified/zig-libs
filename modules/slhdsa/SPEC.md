@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-05 (11/11) · src ?
 
-**Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; both verify harnesses at scale 10 = 20,000 runs (a run is up to five verifications of a 17 KiB signature), SLHDSA_FUZZ) · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 

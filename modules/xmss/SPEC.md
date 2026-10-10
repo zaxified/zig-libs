@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-11 · mutation 2026-10-05 (23/24, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: SK_SEED/SK_PRF through keyGen + 5 signs at h=4; 2 in-file = WOTS chain lengths from H_msg over the PUBLISHED r, an artefact)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `xmss-sign-verify` at scale 200 = 1,000 runs, each a real signature, XMSS_FUZZ) · ct 2026-10-10 (ctgrind: SK_SEED/SK_PRF through keyGen + 5 signs at h=4; 2 in-file = WOTS chain lengths from H_msg over the PUBLISHED r, an artefact)
 **Performance:** not measured
 
 **Known defects:** none recorded

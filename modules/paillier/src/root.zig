@@ -2407,10 +2407,39 @@ fn seedFields(out: []u8, frames: []const []const u8) []const u8 {
     return out[0..at];
 }
 
+const PubMark = fz.Marker(enum { accepted, refused, explicit_g, standard_g });
+const SecMark = fz.Marker(enum { accepted, refused });
+const CtMark = fz.Marker(enum { accepted, refused });
+const AgreeMark = fz.Marker(enum { decrypted_both, refused_both, not_a_ciphertext });
+
 test "fuzz: PublicKey.fromBytes never panics on arbitrary bytes" {
     var corpus: Corpus = .{};
     try corpus.build();
-    try testing.fuzz({}, fuzzPublicKeyFromBytes, .{ .corpus = corpus.public_seeds() });
+    try testing.fuzz({}, fuzzPublicKeyFromBytesSmith, .{ .corpus = corpus.public_seeds() });
+}
+
+test "fuzz driver: PAILLIER_FUZZ (public key)" {
+    try fz.fuzz_driver.run(fuzzPublicKeyFromBytes, .{ .prefix = "PAILLIER_FUZZ", .name = "paillier-pubkey" });
+}
+test "fuzz driver: PAILLIER_FUZZ (secret key)" {
+    try fz.fuzz_driver.run(fuzzSecretKeyFromBytes, .{ .prefix = "PAILLIER_FUZZ", .name = "paillier-seckey" });
+}
+test "fuzz driver: PAILLIER_FUZZ (ciphertext)" {
+    try fz.fuzz_driver.run(fuzzCiphertextFromBytes, .{ .prefix = "PAILLIER_FUZZ", .name = "paillier-ciphertext" });
+}
+test "fuzz driver: PAILLIER_FUZZ (decrypt agree)" {
+    try fz.fuzz_driver.run(fuzzDecryptPathsAgree, .{ .prefix = "PAILLIER_FUZZ", .name = "paillier-decrypt-agree" });
+}
+
+test "fuzz harness: paillier loaders, 300 seeds each, reach every outcome" {
+    try PubMark.reach(fuzzPublicKeyFromBytes, "paillier-pubkey", 300);
+    try SecMark.reach(fuzzSecretKeyFromBytes, "paillier-seckey", 300);
+    try CtMark.reach(fuzzCiphertextFromBytes, "paillier-ciphertext", 300);
+    try AgreeMark.reach(fuzzDecryptPathsAgree, "paillier-decrypt-agree", 300);
+}
+
+fn fuzzPublicKeyFromBytesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPublicKeyFromBytes(std.testing.Smith, smith, testing.allocator);
 }
 
 // ⚠ This helper is the HARNESS, and it was the thing that crashed -- twice --
@@ -2432,6 +2461,56 @@ fn fuzzedFieldBytes(smith: *std.testing.Smith, buf: []u8) []const u8 {
     // corpus (see `Corpus` below), where they are reproducible from the seed
     // instead of coming out of a draw the replay lane cannot make.
     const len: usize = smith.slice(buf);
+    return buf[0..len];
+}
+
+const fz = @import("fuzz_test.zig");
+
+/// The real 512-bit key material the corpus is cut from, built once per
+/// process (key generation is the expensive part) on the heap, because
+/// `Corpus` is large.
+var corpus_cache: ?*Corpus = null;
+fn cachedCorpus() *const Corpus {
+    if (corpus_cache == null) {
+        const c = std.heap.page_allocator.create(Corpus) catch @panic("out of memory");
+        c.* = .{};
+        c.build() catch @panic("corpus build failed");
+        corpus_cache = c;
+    }
+    return corpus_cache.?;
+}
+
+/// A field from the source: under `Smith` exactly `fuzzedFieldBytes`; under the
+/// driver's `Rng` half the draws are the REAL field (`real`) with 0-3 octets
+/// damaged and maybe truncated (random bytes alone are never a canonical value
+/// for the key they sit beside).
+fn drawField(comptime S: type, src: *S, buf: []u8, real: []const u8) []const u8 {
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        const n = fz.damage(src, buf, real);
+        return buf[0..n];
+    }
+    const len: usize = src.slice(buf);
+    return buf[0..len];
+}
+
+/// A ciphertext for the toy KAT key (n = 187, n² = 34969): under the driver
+/// half the draws are an integer around the interesting range (0, multiples
+/// of 11 and 17 that share a factor with n, n² - 1, n², n² + 1) written
+/// big-endian with 0-3 leading zero octets.
+fn drawToyCiphertext(comptime S: type, src: *S, buf: []u8) []const u8 {
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        const v: u32 = switch (src.index(4)) {
+            0 => src.valueRangeAtMost(u32, 0, 34969 + 2),
+            1 => 11 * src.valueRangeAtMost(u32, 0, 3179),
+            2 => 17 * src.valueRangeAtMost(u32, 0, 2057),
+            else => 34969 - 2 + src.valueRangeAtMost(u32, 0, 4),
+        };
+        const zeros = src.index(4);
+        @memset(buf[0..zeros], 0);
+        std.mem.writeInt(u32, buf[zeros..][0..4], v, .big);
+        return buf[0 .. zeros + 4];
+    }
+    const len: usize = src.slice(buf);
     return buf[0..len];
 }
 
@@ -2637,9 +2716,10 @@ const Corpus = struct {
     }
 };
 
-fn fuzzPublicKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
+fn fuzzPublicKeyFromBytes(comptime S: type, smith: *S, _: std.mem.Allocator) anyerror!void {
+    const real: *const Corpus = if (S == fz.fuzz_driver.Rng) cachedCorpus() else undefined;
     var n_buf: [modulus_bytes + 16]u8 = undefined;
-    const n_bytes = fuzzedFieldBytes(smith, &n_buf);
+    const n_bytes = drawField(S, smith, &n_buf, if (S == fz.fuzz_driver.Rng) real.n[0..real.n_len] else "");
 
     var g_buf: [modulus_sq_bytes + 16]u8 = undefined;
     // ⛔ This used to be `if (smith.value(bool)) … else null`, with the bool
@@ -2647,10 +2727,18 @@ fn fuzzPublicKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     // the bool was false, and `PublicKey.fromBytes`'s explicit-generator
     // branch had never run. The choice belongs to the SEED: an empty second
     // frame means the standard generator `g = n+1`.
-    const g_frame = fuzzedFieldBytes(smith, &g_buf);
+    const g_frame = if (S == fz.fuzz_driver.Rng and smith.index(3) == 0)
+        g_buf[0..0] // the standard generator g = n + 1
+    else
+        drawField(S, smith, &g_buf, if (S == fz.fuzz_driver.Rng) &real.g else "");
     const g_bytes: ?[]const u8 = if (g_frame.len == 0) null else g_frame;
 
-    _ = PublicKey.fromBytes(n_bytes, g_bytes) catch return;
+    _ = PublicKey.fromBytes(n_bytes, g_bytes) catch {
+        PubMark.mark(.refused);
+        return;
+    };
+    PubMark.mark(.accepted);
+    if (g_bytes != null) PubMark.mark(.explicit_g) else PubMark.mark(.standard_g);
 }
 
 test "corpus: the PublicKey seeds reach the parser, and the counts are pinned" {
@@ -2683,19 +2771,28 @@ test "corpus: the PublicKey seeds reach the parser, and the counts are pinned" {
 test "fuzz: SecretKey.fromBytes never panics on arbitrary bytes" {
     var corpus: Corpus = .{};
     try corpus.build();
-    try testing.fuzz({}, fuzzSecretKeyFromBytes, .{ .corpus = corpus.secret_seeds() });
+    try testing.fuzz({}, fuzzSecretKeyFromBytesSmith, .{ .corpus = corpus.secret_seeds() });
 }
 
-fn fuzzSecretKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
+fn fuzzSecretKeyFromBytesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSecretKeyFromBytes(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzSecretKeyFromBytes(comptime S: type, smith: *S, _: std.mem.Allocator) anyerror!void {
+    const real: *const Corpus = if (S == fz.fuzz_driver.Rng) cachedCorpus() else undefined;
     var n_buf: [modulus_bytes + 16]u8 = undefined;
-    const n_bytes = fuzzedFieldBytes(smith, &n_buf);
+    const n_bytes = drawField(S, smith, &n_buf, if (S == fz.fuzz_driver.Rng) real.n[0..real.n_len] else "");
     var lambda_buf: [modulus_sq_bytes + 16]u8 = undefined;
-    const lambda_bytes = fuzzedFieldBytes(smith, &lambda_buf);
+    const lambda_bytes = drawField(S, smith, &lambda_buf, if (S == fz.fuzz_driver.Rng) &real.lambda else "");
     var mu_buf: [modulus_bytes + 16]u8 = undefined;
-    const mu_bytes = fuzzedFieldBytes(smith, &mu_buf);
+    const mu_bytes = drawField(S, smith, &mu_buf, if (S == fz.fuzz_driver.Rng) &real.mu else "");
 
     var sk: SecretKey = undefined;
-    SecretKey.fromBytes(n_bytes, lambda_bytes, mu_bytes, &sk) catch return;
+    SecretKey.fromBytes(n_bytes, lambda_bytes, mu_bytes, &sk) catch {
+        SecMark.mark(.refused);
+        return;
+    };
+    SecMark.mark(.accepted);
     sk.deinit();
 }
 
@@ -2740,18 +2837,26 @@ test "corpus: the SecretKey seeds reach the parser, and the counts are pinned" {
 test "fuzz: Ciphertext.fromBytes never panics on arbitrary bytes" {
     var corpus: Corpus = .{};
     try corpus.build();
-    try testing.fuzz({}, fuzzCiphertextFromBytes, .{ .corpus = corpus.ciphertext_seeds() });
+    try testing.fuzz({}, fuzzCiphertextFromBytesSmith, .{ .corpus = corpus.ciphertext_seeds() });
 }
 
-fn fuzzCiphertextFromBytes(_: void, smith: *std.testing.Smith) !void {
+fn fuzzCiphertextFromBytesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzCiphertextFromBytes(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzCiphertextFromBytes(comptime S: type, smith: *S, _: std.mem.Allocator) anyerror!void {
     // A real (small, toy) key so `pk.n_sq` is a valid modulus context --
     // the point here is fuzzing the ciphertext bytes, not the key parse
     // (already covered by `fuzzPublicKeyFromBytes` above).
     const pk = PublicKey.fromBytesImpl(&kat_n, null, .unchecked) catch unreachable;
 
     var buf: [modulus_sq_bytes + 16]u8 = undefined;
-    const bytes = fuzzedFieldBytes(smith, &buf);
-    _ = Ciphertext.fromBytes(pk, bytes) catch return;
+    const bytes = drawToyCiphertext(S, smith, &buf);
+    _ = Ciphertext.fromBytes(pk, bytes) catch {
+        CtMark.mark(.refused);
+        return;
+    };
+    CtMark.mark(.accepted);
 }
 
 test "corpus: the Ciphertext seeds reach the parser, and the counts are pinned" {
@@ -2800,16 +2905,20 @@ test "corpus: the Ciphertext seeds reach the parser, and the counts are pinned" 
 test "fuzz: decrypt's CRT and non-CRT paths agree on arbitrary ciphertext bytes (paillier F6)" {
     var corpus: Corpus = .{};
     try corpus.build();
-    try testing.fuzz({}, fuzzDecryptPathsAgree, .{ .corpus = corpus.ciphertext_seeds() });
+    try testing.fuzz({}, fuzzDecryptPathsAgreeSmith, .{ .corpus = corpus.ciphertext_seeds() });
 }
 
-fn fuzzDecryptPathsAgree(_: void, smith: *std.testing.Smith) !void {
-    // Toy KAT key (n=187) so this stays cheap per fuzz iteration; the CRT
-    // vs non-CRT split under test does not depend on key size (the 512-bit
-    // test above already covers the multi-limb case once).
+fn fuzzDecryptPathsAgreeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecryptPathsAgree(std.testing.Smith, smith, testing.allocator);
+}
+
+const AgreeSetup = struct { kp: KeyPair, noncrt: SecretKey };
+var agree_cache: ?AgreeSetup = null;
+
+fn agreeSetup() AgreeSetup {
     var kp: KeyPair = undefined;
     fromPrimes(&kat_p, &kat_q, &kp) catch unreachable;
-    try testing.expect(kp.secret.crt != null);
+    std.debug.assert(kp.secret.crt != null);
 
     // An independent decrypt path to the SAME n/λ/µ: round-tripped through
     // the byte parser (which never sets `crt`; `.unchecked`, because the toy
@@ -2827,21 +2936,101 @@ fn fuzzDecryptPathsAgree(_: void, smith: *std.testing.Smith) !void {
     kp.secret.muToBytes(&mu_b) catch unreachable;
     const sk_noncrt = SecretKey.fromBytesImpl(&n_b, &lam_b, &mu_b, .unchecked) catch unreachable;
     std.debug.assert(sk_noncrt.crt == null);
+    return .{ .kp = kp, .noncrt = sk_noncrt };
+}
 
+fn fuzzDecryptPathsAgree(comptime S: type, smith: *S, _: std.mem.Allocator) anyerror!void {
+    // Toy KAT key (n=187) so this stays cheap per fuzz iteration; the CRT
+    // vs non-CRT split under test does not depend on key size (the 512-bit
+    // test above already covers the multi-limb case once).
+    // (Built once per process: the key is the same every run, and its setup
+    // is a hundred times the cost of the decryptions it feeds.)
+    if (agree_cache == null) agree_cache = agreeSetup();
+    const kp = &agree_cache.?.kp;
+    const sk_noncrt = &agree_cache.?.noncrt;
     var buf: [modulus_sq_bytes + 16]u8 = undefined;
-    const bytes = fuzzedFieldBytes(smith, &buf);
-    const ct = Ciphertext.fromBytes(kp.public, bytes) catch return; // not a well-formed ciphertext under this key; nothing to compare
+    const bytes = drawToyCiphertext(S, smith, &buf);
+    const ct = Ciphertext.fromBytes(kp.public, bytes) catch {
+        AgreeMark.mark(.not_a_ciphertext);
+        return; // not a well-formed ciphertext under this key; nothing to compare
+    };
 
     var v_crt: Fe = undefined;
     const r_crt = decrypt(&kp.secret, ct, &v_crt);
     var v_noncrt: Fe = undefined;
-    const r_noncrt = decrypt(&sk_noncrt, ct, &v_noncrt);
+    const r_noncrt = decrypt(sk_noncrt, ct, &v_noncrt);
     if (r_crt) |_| {
         r_noncrt catch return error.CrtNonCrtDisagree;
         if (!v_crt.eql(v_noncrt)) return error.CrtNonCrtDisagree;
+        AgreeMark.mark(.decrypted_both);
     } else |_| {
         if (r_noncrt) |_| return error.CrtNonCrtDisagree else |_| {}
+        AgreeMark.mark(.refused_both);
     }
+}
+
+// ── encrypt / decrypt round trip and the homomorphisms (driver only) ────────
+
+const RoundTripMark = fz.Marker(enum { roundtrip_ok, add_ok, add_plain_ok, mul_plain_ok });
+var rt_key: ?KeyPair = null;
+
+/// `decrypt(encrypt(m)) == m`, `D(c1 + c2) == m1 + m2`, `D(c + m2) == m + m2`,
+/// `D(k * c) == k * m` (mod n), at a real 512-bit key (generated once).
+fn fuzzRoundTrip(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    if (rt_key == null) {
+        var prng = std.Random.DefaultPrng.init(0x72747269);
+        rt_key = @as(KeyPair, undefined);
+        try generate(prng.random(), 512, &rt_key.?);
+    }
+    const kp = &rt_key.?;
+    var prng = std.Random.DefaultPrng.init(src.value(u64));
+    const random = prng.random();
+    const m1v = src.value(u64);
+    const m2v = src.value(u64);
+    const kv = src.value(u32);
+    const m1 = try Fe.fromPrimitive(u64, kp.public.n, m1v);
+    const m2 = try Fe.fromPrimitive(u64, kp.public.n, m2v);
+    const c1 = try encryptRandom(kp.public, &m1, random);
+    const c2 = try encryptRandom(kp.public, &m2, random);
+
+    var out: Fe = undefined;
+    try decrypt(&kp.secret, c1, &out);
+    if (!out.eql(m1)) return error.RoundTripChanged;
+    RoundTripMark.mark(.roundtrip_ok);
+
+    const sum = addCiphertexts(kp.public, c1, c2);
+    try decrypt(&kp.secret, sum, &out);
+    const want = kp.public.n.add(m1, m2);
+    if (!out.eql(want)) return error.AdditiveHomomorphismBroken;
+    RoundTripMark.mark(.add_ok);
+
+    const sum_plain = try addPlaintext(kp.public, c1, &m2);
+    try decrypt(&kp.secret, sum_plain, &out);
+    if (!out.eql(want)) return error.AddPlaintextBroken;
+    RoundTripMark.mark(.add_plain_ok);
+
+    const k = try Fe.fromPrimitive(u64, kp.public.n, kv);
+    const scaled = try mulPlaintext(kp.public, c1, &k);
+    try decrypt(&kp.secret, scaled, &out);
+    if (!out.eql(kp.public.n.mul(m1, k))) return error.MulPlaintextBroken;
+    RoundTripMark.mark(.mul_plain_ok);
+}
+
+test "fuzz driver: PAILLIER_FUZZ (round trip)" {
+    // `.scale`: a run is two encryptions, five decryptions and three homomorphic ops at 512 bits.
+    try fz.fuzz_driver.run(fuzzRoundTrip, .{ .prefix = "PAILLIER_FUZZ", .name = "paillier-roundtrip", .scale = 20 });
+}
+
+test "fuzz harness: paillier round trip, 20 seeds, reaches every outcome" {
+    try RoundTripMark.reach(fuzzRoundTrip, "paillier-roundtrip", 20);
+}
+
+fn fuzzRoundTripSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRoundTrip(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: paillier round trip and homomorphisms (Smith replay)" {
+    try testing.fuzz({}, fuzzRoundTripSmith, .{});
 }
 
 // ── dead-stack secret residue (paillier F2, wave-3 audit) ──────────────────

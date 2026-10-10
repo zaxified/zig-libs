@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-09 · mutation 2026-10-05 (14/16, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-02 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `tlock-age-file` at scale 100 = 2,000 runs, one pairing-heavy encrypt plus up to four decrypts each, TLOCK_FUZZ) · ct 2026-10-02 (ctgrind)
 
 **Performance:** not measured
 

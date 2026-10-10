@@ -499,8 +499,23 @@ const damage_seeds = [_][]const u8{
         "0060" ++ "04" ++ "0068" ++ "05" ++ "0078" ++ "06"), // the maximum, spread across U/V/W
 };
 
+const fz = @import("fuzz_test.zig");
+const DecryptMark = fz.Marker(enum { genuine_accepted, damaged_refused_at_decode, damaged_refused_at_decrypt });
+
 test "fuzz: Ciphertext.fromBytes/decrypt never panics on corrupted ciphertext bytes" {
-    try std.testing.fuzz({}, fuzzDecrypt, .{ .corpus = &damage_seeds });
+    try std.testing.fuzz({}, fuzzDecryptSmith, .{ .corpus = &damage_seeds });
+}
+
+test "fuzz driver: TLOCK_FUZZ (ciphertext)" {
+    try fz.fuzz_driver.run(fuzzDecrypt, .{ .prefix = "TLOCK_FUZZ", .name = "tlock-ciphertext" });
+}
+
+test "fuzz harness: ciphertext, 200 seeds, reaches every outcome" {
+    try DecryptMark.reach(fuzzDecrypt, "tlock-ciphertext", 200);
+}
+
+fn fuzzDecryptSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecrypt(std.testing.Smith, smith, std.testing.allocator);
 }
 
 /// The fixed beacon-shaped keypair and the pristine ciphertext both the
@@ -540,8 +555,13 @@ fn applyDamage(script: []const u8, bytes: []u8) usize {
     return n_flips;
 }
 
-fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
-    const subject = DamageSubject.build();
+var subject_cache: ?DamageSubject = null;
+
+fn fuzzDecrypt(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    // Built once per process: the subject is a pairing and a scalar mult, and
+    // it is the same fixed keypair every run.
+    if (subject_cache == null) subject_cache = DamageSubject.build();
+    const subject = subject_cache.?;
     var bytes = subject.bytes;
 
     var script: [64]u8 = undefined;
@@ -555,11 +575,26 @@ fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
     // Measured 2026-09-07 over the corpus above: **0 of 11 scripts flipped a
     // byte and 1 distinct ciphertext existed before; 10 of 11 flip, 16 flips
     // in total and 11 distinct ciphertexts after.**
-    const n: usize = smith.slice(&script);
+    const n: usize = src.slice(&script);
     _ = applyDamage(script[0..n], &bytes);
 
-    const corrupted = tlock.Ciphertext.fromBytes(bytes) catch return;
-    _ = testDecrypt(subject.round_signature, corrupted) catch return;
+    // The oracle: the pristine ciphertext decrypts to its message, and any
+    // damaged one (V and W are bound by the FO check, U by the decoder) is
+    // refused.
+    const pristine = std.mem.eql(u8, &bytes, &subject.bytes);
+    const corrupted = tlock.Ciphertext.fromBytes(bytes) catch {
+        if (pristine) return error.GenuineCiphertextRefused;
+        DecryptMark.mark(.damaged_refused_at_decode);
+        return;
+    };
+    const m = testDecrypt(subject.round_signature, corrupted) catch {
+        if (pristine) return error.GenuineCiphertextRefused;
+        DecryptMark.mark(.damaged_refused_at_decrypt);
+        return;
+    };
+    if (!pristine) return error.DamagedCiphertextDecrypted;
+    if (!std.mem.eql(u8, &m, &([_]u8{0xCD} ** tlock.block_bytes))) return error.GenuineCiphertextChanged;
+    DecryptMark.mark(.genuine_accepted);
 }
 
 test "corpus: every damage script actually damages, and the counts are pinned" {

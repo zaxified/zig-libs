@@ -116,5 +116,6 @@ test {
     _ = engine;
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }

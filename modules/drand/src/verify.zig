@@ -864,18 +864,43 @@ const parse_seeds = [_][]const u8{
     parseSeed(chained_round_1000000_json), // a genuine chained round (G2 signature)
 };
 
+const fz = @import("fuzz_test.zig");
+const ParseMark = fz.Marker(enum { info_ok, info_refused, round_ok, round_refused });
+const VerifyMark = fz.Marker(enum { genuine_accepted, info_refused, round_refused_at_parse, damaged_refused_at_verify });
+const ChainedMark = fz.Marker(enum { genuine_accepted, info_refused, round_refused_at_parse, damaged_refused_at_verify });
+
 test "fuzz: chain-info + round parse and verify never panic on arbitrary input" {
-    try std.testing.fuzz({}, fuzzParseVerify, .{ .corpus = &parse_seeds });
+    try std.testing.fuzz({}, fuzzParseVerifySmith, .{ .corpus = &parse_seeds });
 }
 
-fn fuzzParseVerify(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: DRAND_FUZZ (parse)" {
+    try fz.fuzz_driver.run(fuzzParseVerify, .{ .prefix = "DRAND_FUZZ", .name = "drand-parse" });
+}
+
+test "fuzz harness: parse, 500 seeds, reaches every outcome" {
+    try ParseMark.reach(fuzzParseVerify, "drand-parse", 500);
+}
+
+fn fuzzParseVerifySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParseVerify(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzParseVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [2048]u8 = undefined;
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &parse_seeds);
     const input = buf[0..len];
 
     // Parsers must never crash and must bound allocation by the input.
-    const maybe_info = chaininfo.parseInfo(testing.allocator, input) catch null;
-    const maybe_round = round_mod.parseRound(testing.allocator, input) catch null;
+    const maybe_info = chaininfo.parseInfo(gpa, input) catch blk: {
+        ParseMark.mark(.info_refused);
+        break :blk null;
+    };
+    const maybe_round = round_mod.parseRound(gpa, input) catch blk: {
+        ParseMark.mark(.round_refused);
+        break :blk null;
+    };
+    if (maybe_info != null) ParseMark.mark(.info_ok);
+    if (maybe_round != null) ParseMark.mark(.round_ok);
 
     // If BOTH parsed, the verify path must also never crash (it will
     // almost always reject; the contract is "no panic", not "accepts").
@@ -1061,12 +1086,15 @@ fn checkFixture(c: Choices) !void {
     const info_damaged = pk_damaged or hash_damaged or ghash_damaged or c.scheme_idx == 1;
     const info = chaininfo.parseInfo(testing.allocator, info_json) catch |e| {
         if (!info_damaged) return e; // fixture or parser drifted
+        VerifyMark.mark(.info_refused);
         return;
     };
     if (info_damaged) return error.DamagedInfoParsed;
 
     const rnd = round_mod.parseRound(testing.allocator, round_json) catch |e| {
         if (!sig_damaged) return e;
+        VerifyMark.mark(.round_refused_at_parse);
+        VerifyMark.mark(.round_refused_at_parse);
         return; // a damaged signature may be refused at parse (usual) or reach verify (below)
     };
 
@@ -1074,8 +1102,10 @@ fn checkFixture(c: Choices) !void {
         !c.wrong_round and c.scheme_idx == 0;
     if (verifyRound(&info, &rnd)) |_| {
         if (!crypto_intact) return error.DamagedRoundVerified;
+        VerifyMark.mark(.genuine_accepted);
     } else |_| {
         if (crypto_intact) return error.GenuineRoundRejected;
+        VerifyMark.mark(.damaged_refused_at_verify);
     }
 }
 
@@ -1094,14 +1124,27 @@ test "fixture checks, deterministic: the positive control and one damage per fie
 }
 
 test "fuzz: verifyRound on genuine and damaged quicknet documents" {
-    try std.testing.fuzz({}, fuzzVerifyRound, .{ .corpus = &drand_seeds });
+    try std.testing.fuzz({}, fuzzVerifyRoundSmith, .{ .corpus = &drand_seeds });
 }
 
-fn fuzzVerifyRound(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: DRAND_FUZZ (verify, quicknet)" {
+    // `.scale`: a run is a document build, two parses and (mostly) a pairing.
+    try fz.fuzz_driver.run(fuzzVerifyRound, .{ .prefix = "DRAND_FUZZ", .name = "drand-verify", .scale = 20 });
+}
+
+test "fuzz harness: verify (quicknet), 200 seeds, reaches every outcome" {
+    try VerifyMark.reach(fuzzVerifyRound, "drand-verify", 200);
+}
+
+fn fuzzVerifyRoundSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzVerifyRound(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzVerifyRound(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var raw: [24]u8 = undefined;
-    // One `smith.slice` draw; the empty input the default gate feeds decodes
+    // One `slice` draw; the empty input the default gate feeds decodes
     // to "damage nothing", i.e. the positive control runs every time.
-    const n = smith.slice(&raw);
+    const n = src.slice(&raw);
     try checkFixture(Choices.fromBytes(raw[0..n]));
 }
 
@@ -1178,12 +1221,14 @@ fn checkChainedFixture(c: Choices) !void {
     const info_damaged = pk_damaged or hash_damaged or ghash_damaged or c.scheme_idx == 1;
     const info = chaininfo.parseInfo(testing.allocator, info_json) catch |e| {
         if (!info_damaged) return e;
+        ChainedMark.mark(.info_refused);
         return;
     };
     if (info_damaged) return error.DamagedInfoParsed;
 
     const rnd = round_mod.parseRound(testing.allocator, round_json) catch |e| {
         if (!sig_damaged) return e;
+        ChainedMark.mark(.round_refused_at_parse);
         return;
     };
 
@@ -1191,8 +1236,10 @@ fn checkChainedFixture(c: Choices) !void {
         !c.wrong_round and c.scheme_idx == 0;
     if (verifyRound(&info, &rnd)) |_| {
         if (!crypto_intact) return error.DamagedRoundVerified;
+        ChainedMark.mark(.genuine_accepted);
     } else |_| {
         if (crypto_intact) return error.GenuineRoundRejected;
+        ChainedMark.mark(.damaged_refused_at_verify);
     }
 }
 
@@ -1213,12 +1260,24 @@ test "chained fixture checks, deterministic: the positive control and one damage
 }
 
 test "fuzz: verifyRound on genuine and damaged default-chain documents" {
-    try std.testing.fuzz({}, fuzzVerifyChainedRound, .{ .corpus = &chained_seeds });
+    try std.testing.fuzz({}, fuzzVerifyChainedRoundSmith, .{ .corpus = &chained_seeds });
 }
 
-fn fuzzVerifyChainedRound(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: DRAND_FUZZ (verify, chained)" {
+    try fz.fuzz_driver.run(fuzzVerifyChainedRound, .{ .prefix = "DRAND_FUZZ", .name = "drand-verify-chained", .scale = 20 });
+}
+
+test "fuzz harness: verify (chained), 200 seeds, reaches every outcome" {
+    try ChainedMark.reach(fuzzVerifyChainedRound, "drand-verify-chained", 200);
+}
+
+fn fuzzVerifyChainedRoundSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzVerifyChainedRound(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzVerifyChainedRound(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var raw: [24]u8 = undefined;
-    const n = smith.slice(&raw);
+    const n = src.slice(&raw);
     try checkChainedFixture(Choices.fromBytes(raw[0..n]));
 }
 

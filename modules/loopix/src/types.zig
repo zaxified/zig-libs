@@ -542,11 +542,26 @@ const header_seeds = [_][]const u8{
     seed(""), // the ONE input the collapsed harness ever ran
 };
 
+const fz = @import("fuzz_test.zig");
+const HeaderMark = fz.Marker(enum { decoded, refused, with_delays, full_route, refused_kind, refused_hops });
+
 test "fuzz: MixHeader.decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzMixHeaderDecode, .{ .corpus = &header_seeds });
+    try testing.fuzz({}, fuzzMixHeaderDecodeSmith, .{ .corpus = &header_seeds });
 }
 
-fn fuzzMixHeaderDecode(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: LOOPIX_FUZZ (header)" {
+    try fz.fuzz_driver.run(fuzzMixHeaderDecode, .{ .prefix = "LOOPIX_FUZZ", .name = "loopix-header" });
+}
+
+test "fuzz harness: header decode, 500 seeds, reaches every outcome" {
+    try HeaderMark.reach(fuzzMixHeaderDecode, "loopix-header", 500);
+}
+
+fn fuzzMixHeaderDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzMixHeaderDecode(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzMixHeaderDecode(comptime S: type, smith: *S, _: std.mem.Allocator) anyerror!void {
     var buf: [128]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -556,9 +571,25 @@ fn fuzzMixHeaderDecode(_: void, smith: *std.testing.Smith) !void {
     // sitting unread in `buf`. Measured 2026-09-07 over the corpus above:
     // **0 of 10 seeds non-empty and 0 headers decoded before, 9 of 10
     // non-empty (one seed IS the empty payload) and 4 decoded after.**
-    const len: usize = smith.slice(&buf);
-    _ = MixHeader.decode(buf[0..len]) catch return;
+    const len: usize = fz.drawInput(S, smith, &buf, &header_seeds);
+    const h = MixHeader.decode(buf[0..len]) catch {
+        HeaderMark.mark(.refused);
+        if (len >= wire_len_min and buf[0] > @intFromEnum(MsgKind.drop_cover)) HeaderMark.mark(.refused_kind);
+        if (len >= wire_len_min and buf[10] > max_layers) HeaderMark.mark(.refused_hops);
+        return;
+    };
+    HeaderMark.mark(.decoded);
+    if (h.has_delays) HeaderMark.mark(.with_delays);
+    if (h.n_hops == max_layers) HeaderMark.mark(.full_route);
+    // What decodes is within the route's bounds, and encodes back to a header
+    // that decodes to the same value (the encoding is canonical).
+    if (h.n_hops > max_layers or h.hop > h.n_hops) return error.DecodedOutOfBounds;
+    var again: [MixHeader.wire_len]u8 = undefined;
+    h.encode(&again);
+    if (!std.mem.eql(u8, &again, buf[0..MixHeader.wire_len])) return error.NonCanonicalHeaderAccepted;
 }
+
+const wire_len_min = MixHeader.wire_len;
 
 test "corpus: every header reaches decode, and the decoded count is pinned" {
     // ⭐ The measurement, executable rather than written in a comment. A seed

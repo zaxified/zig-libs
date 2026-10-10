@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `PAILLIER_FUZZ` over the four existing harnesses (`paillier-pubkey`, `paillier-seckey`, `paillier-ciphertext`, `paillier-decrypt-agree`; under the driver the fields are the real 512-bit key material with 0-3 octets damaged, and toy-key ciphertexts sit around 0 / shared factors / n squared) plus new `paillier-roundtrip` (decrypt(encrypt(m)) = m and the three homomorphisms at a real 512-bit key). The decrypt-agree harness builds its toy keys once per process (163 to 26,900 runs/s). New `src/fuzz_test.zig`. No change in `src/` outside tests.
 - **2026-10-09** — **BREAKING (source-compatible for method calls):** `SecretKey.nByteLen` and `SecretKey.nToBytes` take `self: *const SecretKey` (was by value, which copied `lambda`/`mu`/the CRT block into the caller's frame). `key.nToBytes(&buf)` call syntax is unchanged; only explicit `SecretKey.nToBytes(copy, …)` callers must pass a pointer. `nToBytes` reads only the public modulus (`secret-api-ok` marker). No new burn, no new probe.
 
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region

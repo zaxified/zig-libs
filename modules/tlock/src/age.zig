@@ -1024,22 +1024,115 @@ const fuzz_seeds = [_][]const u8{
     tkfuzz.seed("\x00" ** 40),
 };
 
-fn fuzzDecoders(_: void, smith: *std.testing.Smith) !void {
+const fz = @import("fuzz_test.zig");
+const DecodersMark = fz.Marker(enum { header_ok, header_refused, dearmor_ok, dearmor_refused, payload_refused, payload_genuine, payload_flip_refused });
+const FileMark = fz.Marker(enum { genuine_accepted, flipped_refused, truncated_refused, appended_refused });
+
+fn fuzzDecodersSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecoders(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzDecoders(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var buf: [2048]u8 = undefined;
-    const n: usize = smith.slice(&buf);
+    const n: usize = fz.drawInput(S, src, &buf, &fuzz_seeds);
     const input = buf[0..n];
 
-    _ = Header.parse(input) catch {};
+    if (Header.parse(input)) |_| DecodersMark.mark(.header_ok) else |_| DecodersMark.mark(.header_refused);
     var out: [2048]u8 = undefined;
-    _ = dearmor(&out, input) catch {};
+    if (dearmor(&out, input)) |_| DecodersMark.mark(.dearmor_ok) else |_| DecodersMark.mark(.dearmor_refused);
     const key = [_]u8{7} ** 32;
     if (openedLen(input.len)) |m| {
-        openPayload(out[0..m], &key, input) catch {};
+        if (openPayload(out[0..m], &key, input)) |_| {} else |_| DecodersMark.mark(.payload_refused);
     } else |_| {}
+
+    // The oracle the decoders alone cannot give (driver only, after every draw
+    // above so `Smith` replay is untouched): a payload this module sealed
+    // opens to its plaintext, and one flipped octet anywhere refuses.
+    if (S == fz.fuzz_driver.Rng) {
+        var plain: [100]u8 = undefined;
+        const plen = src.index(plain.len + 1);
+        src.bytes(plain[0..plen]);
+        var sealed: [100 + tag_bytes]u8 = undefined;
+        const slen = sealedLen(plen);
+        sealPayload(sealed[0..slen], &key, plain[0..plen]);
+        var back: [100]u8 = undefined;
+        openPayload(back[0..plen], &key, sealed[0..slen]) catch return error.GenuinePayloadRefused;
+        if (!std.mem.eql(u8, back[0..plen], plain[0..plen])) return error.GenuinePayloadChanged;
+        DecodersMark.mark(.payload_genuine);
+        sealed[src.index(slen)] ^= src.valueRangeAtMost(u8, 1, 255);
+        if (openPayload(back[0..plen], &key, sealed[0..slen])) |_| return error.FlippedPayloadOpened else |_| {}
+        DecodersMark.mark(.payload_flip_refused);
+    }
+}
+
+test "fuzz driver: TLOCK_FUZZ (age decoders)" {
+    try fz.fuzz_driver.run(fuzzDecoders, .{ .prefix = "TLOCK_FUZZ", .name = "tlock-age-decoders" });
+}
+
+test "fuzz harness: age decoders, 500 seeds, reaches every outcome" {
+    try DecodersMark.reach(fuzzDecoders, "tlock-age-decoders", 500);
 }
 
 test "fuzz: age header, armor and STREAM decoders never panic on hostile bytes" {
-    try std.testing.fuzz({}, fuzzDecoders, .{ .corpus = &fuzz_seeds });
+    try std.testing.fuzz({}, fuzzDecodersSmith, .{ .corpus = &fuzz_seeds });
+}
+
+/// A genuine file (real quicknet round-1000 key and signature, a random
+/// plaintext) is ACCEPTED and returns its plaintext; a flipped octet anywhere,
+/// a truncation and an appended octet are each REFUSED.
+fn fuzzFile(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var plain: [200]u8 = undefined;
+    const plen = src.index(plain.len + 1);
+    src.bytes(plain[0..plen]);
+    var rnd: Randomness = undefined;
+    src.bytes(&rnd.file_key);
+    src.bytes(&rnd.sigma);
+    src.bytes(&rnd.nonce);
+
+    const file = try encryptAlloc(gpa, plain[0..plen], pub1000(), 1000, quicknet_chain, &rnd, .{});
+    defer gpa.free(file);
+    var out: [200]u8 = undefined;
+    const got = decrypt(out[0..plen], file, sig1000(), .{ .chain_hash = quicknet_chain }) catch return error.GenuineFileRefused;
+    if (!std.mem.eql(u8, got, plain[0..plen])) return error.GenuineFileChanged;
+    FileMark.mark(.genuine_accepted);
+
+    // One flipped octet, anywhere in the file.
+    const damaged = try gpa.dupe(u8, file);
+    defer gpa.free(damaged);
+    const at = src.index(damaged.len);
+    damaged[at] ^= src.valueRangeAtMost(u8, 1, 255);
+    if (decrypt(out[0..plen], damaged, sig1000(), .{ .chain_hash = quicknet_chain })) |_| {
+        std.debug.print("flipped octet {d} of {d} accepted\n", .{ at, file.len });
+        return error.FlippedFileAccepted;
+    } else |_| FileMark.mark(.flipped_refused);
+
+    // A truncation (decryptedLen may itself refuse; out is sized for plen).
+    const cut = src.index(file.len);
+    if (decrypt(&out, file[0..cut], sig1000(), .{ .chain_hash = quicknet_chain })) |_| return error.TruncatedFileAccepted else |_| FileMark.mark(.truncated_refused);
+
+    // One octet appended.
+    const longer = try gpa.alloc(u8, file.len + 1);
+    defer gpa.free(longer);
+    @memcpy(longer[0..file.len], file);
+    longer[file.len] = src.value(u8);
+    if (decrypt(&out, longer, sig1000(), .{ .chain_hash = quicknet_chain })) |_| return error.AppendedFileAccepted else |_| FileMark.mark(.appended_refused);
+}
+
+fn fuzzFileSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFile(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: a genuine age file opens and a damaged one does not" {
+    try std.testing.fuzz({}, fuzzFileSmith, .{});
+}
+
+test "fuzz driver: TLOCK_FUZZ (age file)" {
+    // `.scale`: each run is an encryption and up to four decryptions (pairings).
+    try fz.fuzz_driver.run(fuzzFile, .{ .prefix = "TLOCK_FUZZ", .name = "tlock-age-file", .scale = 100 });
+}
+
+test "fuzz harness: age file, 40 seeds, reaches every outcome" {
+    try FileMark.reach(fuzzFile, "tlock-age-file", 40);
 }
 
 test "corpus: the age fuzz seeds reach past the first check" {

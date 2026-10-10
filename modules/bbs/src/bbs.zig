@@ -1292,18 +1292,66 @@ const SigCorpus = struct {
     }
 };
 
+const fz = @import("fuzz_test.zig");
+const SigMark = fz.Marker(enum { accepted, refused });
+const PkMark = fz.Marker(enum { accepted, refused });
+const ProofMark = fz.Marker(enum { accepted, refused, with_m_hat });
+const SignVerifyMark = fz.Marker(enum { sha256, shake256, genuine_accepted, flipped_refused, wrong_message_refused, wrong_header_refused, wrong_key_refused });
+const ProofVerifyMark = fz.Marker(enum { genuine_accepted, disclosed_none, disclosed_all, flipped_refused, wrong_message_refused, wrong_ph_refused });
+
+/// The fixtures the structured half of the driver damages, built once.
+var fixtures_cache: ?Fixtures = null;
+fn fixtures() *const Fixtures {
+    if (fixtures_cache == null) {
+        fixtures_cache = .{};
+        fixtures_cache.?.build();
+    }
+    return &fixtures_cache.?;
+}
+
+/// `buf` (exactly `buf.len` octets) from the source: the driver's structured
+/// half is the real encoding with 0-3 octets damaged, maybe truncated (short
+/// reads zero-padded); the other half, and every `Smith` replay, is raw bytes.
+fn drawFixed(comptime S: type, src: *S, buf: []u8, real: []const u8) void {
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        var tmp: [Proof.encodedLen(8)]u8 = undefined;
+        const n = fz.damage(src, &tmp, real);
+        @memset(buf, 0);
+        @memcpy(buf[0..n], tmp[0..n]);
+        return;
+    }
+    src.bytes(buf);
+}
+
 test "fuzz: Signature.fromBytes never crashes on arbitrary bytes" {
     var fx: Fixtures = .{};
     fx.build();
     var corpus: SigCorpus = .{};
-    try testing.fuzz({}, fuzzSignatureFromBytes, .{ .corpus = corpus.build(&fx) });
+    try testing.fuzz({}, fuzzSignatureFromBytesSmith, .{ .corpus = corpus.build(&fx) });
 }
 
-fn fuzzSignatureFromBytes(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: BBS_FUZZ (signature)" {
+    try fz.fuzz_driver.run(fuzzSignatureFromBytes, .{ .prefix = "BBS_FUZZ", .name = "bbs-signature" });
+}
+
+test "fuzz harness: signature decoder, 500 seeds, reaches every outcome" {
+    try SigMark.reach(fuzzSignatureFromBytes, "bbs-signature", 500);
+}
+
+fn fuzzSignatureFromBytesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSignatureFromBytes(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzSignatureFromBytes(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var buf: [Signature.encoded_bytes]u8 = undefined;
-    smith.bytes(&buf);
-    const sig = Signature.fromBytes(buf) catch return;
-    _ = sig.toBytes();
+    drawFixed(S, src, &buf, &fixtures().sig);
+    const sig = Signature.fromBytes(buf) catch {
+        SigMark.mark(.refused);
+        return;
+    };
+    SigMark.mark(.accepted);
+    // The encoding is canonical: what decodes encodes back to the same octets.
+    if (!std.mem.eql(u8, &sig.toBytes(), &buf)) return error.NonCanonicalSignatureAccepted;
 }
 
 test "corpus: Signature seeds reach the decoder, and the accepted count is pinned" {
@@ -1365,14 +1413,30 @@ test "fuzz: PublicKey.fromBytes never crashes on arbitrary bytes" {
     var fx: Fixtures = .{};
     fx.build();
     var corpus: PkCorpus = .{};
-    try testing.fuzz({}, fuzzPublicKeyFromBytes, .{ .corpus = corpus.build(&fx) });
+    try testing.fuzz({}, fuzzPublicKeyFromBytesSmith, .{ .corpus = corpus.build(&fx) });
 }
 
-fn fuzzPublicKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
+test "fuzz driver: BBS_FUZZ (public key)" {
+    try fz.fuzz_driver.run(fuzzPublicKeyFromBytes, .{ .prefix = "BBS_FUZZ", .name = "bbs-public-key" });
+}
+
+test "fuzz harness: public key decoder, 500 seeds, reaches every outcome" {
+    try PkMark.reach(fuzzPublicKeyFromBytes, "bbs-public-key", 500);
+}
+
+fn fuzzPublicKeyFromBytesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPublicKeyFromBytes(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzPublicKeyFromBytes(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     var buf: [PublicKey.encoded_bytes]u8 = undefined;
-    smith.bytes(&buf);
-    const pk = PublicKey.fromBytes(buf) catch return;
-    _ = pk.toBytes();
+    drawFixed(S, src, &buf, &fixtures().pk);
+    const pk = PublicKey.fromBytes(buf) catch {
+        PkMark.mark(.refused);
+        return;
+    };
+    PkMark.mark(.accepted);
+    if (!std.mem.eql(u8, &pk.toBytes(), &buf)) return error.NonCanonicalPublicKeyAccepted;
 }
 
 test "corpus: PublicKey seeds reach the decoder, and the accepted count is pinned" {
@@ -1451,20 +1515,48 @@ test "fuzz: Proof.fromBytes never crashes on arbitrary bytes" {
     var fx: Fixtures = .{};
     fx.build();
     var corpus: ProofCorpus = .{};
-    try testing.fuzz({}, fuzzProofFromBytes, .{ .corpus = corpus.build(&fx) });
+    try testing.fuzz({}, fuzzProofFromBytesSmith, .{ .corpus = corpus.build(&fx) });
 }
 
-fn fuzzProofFromBytes(_: void, smith: *std.testing.Smith) !void {
+var proof_corpus_cache: ?ProofCorpus = null;
+fn proofCorpus() []const []const u8 {
+    if (proof_corpus_cache == null) {
+        proof_corpus_cache = .{};
+        return proof_corpus_cache.?.build(fixtures());
+    }
+    return proof_corpus_cache.?.entries[0..proof_corpus_cache.?.n];
+}
+
+test "fuzz driver: BBS_FUZZ (proof)" {
+    try fz.fuzz_driver.run(fuzzProofFromBytes, .{ .prefix = "BBS_FUZZ", .name = "bbs-proof" });
+}
+
+test "fuzz harness: proof decoder, 500 seeds, reaches every outcome" {
+    try ProofMark.reach(fuzzProofFromBytes, "bbs-proof", 500);
+}
+
+fn fuzzProofFromBytesSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzProofFromBytes(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzProofFromBytes(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
     // latter drew `len == 0` on every input the ordinary lane ever ran (a
     // ranged draw needs eight octets and `bytes` had eaten them), so this
     // target had returned `InvalidProofEncoding` on the length check every
     // round, with the proof sitting unread in `buf`.
     var buf: [proof_buf_len]u8 = undefined;
-    const len: usize = smith.slice(&buf);
-    const proof = Proof.fromBytes(testing.allocator, buf[0..len]) catch return;
-    defer proof.deinit(testing.allocator);
-    if (proof.toBytes(testing.allocator)) |out| testing.allocator.free(out) else |_| {}
+    const len: usize = fz.drawInput(S, src, &buf, if (S == fz.fuzz_driver.Rng) proofCorpus() else &.{});
+    const proof = Proof.fromBytes(gpa, buf[0..len]) catch {
+        ProofMark.mark(.refused);
+        return;
+    };
+    defer proof.deinit(gpa);
+    ProofMark.mark(.accepted);
+    if (proof.m_hat.len != 0) ProofMark.mark(.with_m_hat);
+    const out = try proof.toBytes(gpa);
+    defer gpa.free(out);
+    if (!std.mem.eql(u8, out, buf[0..len])) return error.NonCanonicalProofAccepted;
 }
 
 test "corpus: Proof seeds reach the decoder, and the counts are pinned" {
@@ -1490,6 +1582,174 @@ test "corpus: Proof seeds reach the decoder, and the counts are pinned" {
     try testing.expectEqual(corpus.n - 1, nonempty); // all but the empty seed
     try testing.expectEqual(@as(usize, 3), accepted);
     try testing.expectEqual(@as(usize, 4), m_hat_total);
+}
+
+/// A key pair from the source: 16 random octets in the low half of a 32-octet
+/// scalar (below the group order under either byte order, forced nonzero).
+fn drawKeyPair(comptime S: type, src: *S) !struct { sk: SecretKey, pk: PublicKey } {
+    var b = [_]u8{0} ** 32;
+    src.bytes(b[16..]);
+    b[31] |= 1;
+    const sk = try testSecretKey(b);
+    return .{ .sk = sk, .pk = keys.skToPk(&sk) };
+}
+
+fn drawText(comptime S: type, src: *S, buf: []u8) []const u8 {
+    const n = src.index(buf.len + 1);
+    src.bytes(buf[0..n]);
+    return buf[0..n];
+}
+
+/// A signature this module issued VERIFIES, and each of: one flipped octet of
+/// the signature, another message, another header, another key does NOT
+/// (`verify` answers false or refuses; it never answers true). SHA-256 and
+/// SHAKE-256 suites, chosen by the source.
+fn fuzzSignVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const kp = try drawKeyPair(S, src);
+    const other = try drawKeyPair(S, src);
+    var hbuf: [8]u8 = undefined;
+    const header = drawText(S, src, &hbuf);
+    var mbufs: [3][8]u8 = undefined;
+    var msgs: [3][]const u8 = undefined;
+    const count = 1 + src.index(3);
+    for (0..count) |i| msgs[i] = drawText(S, src, &mbufs[i]);
+    const shake = src.value(bool);
+    if (shake) SignVerifyMark.mark(.shake256) else SignVerifyMark.mark(.sha256);
+    const m = msgs[0..count];
+
+    const sig = (if (shake) shake256.sign(gpa, &kp.sk, kp.pk, header, m) else sha256.sign(gpa, &kp.sk, kp.pk, header, m)) catch return error.SignRefused;
+    const v = struct {
+        fn f(sh: bool, a: std.mem.Allocator, pk: PublicKey, sg: [Signature.encoded_bytes]u8, h: []const u8, mm: []const []const u8) bool {
+            const r = if (sh) shake256.verify(a, pk, sg, h, mm) else sha256.verify(a, pk, sg, h, mm);
+            return r catch false;
+        }
+    }.f;
+    if (!v(shake, gpa, kp.pk, sig, header, m)) return error.GenuineSignatureRefused;
+    SignVerifyMark.mark(.genuine_accepted);
+
+    var damaged = sig;
+    damaged[src.index(damaged.len)] ^= src.valueRangeAtMost(u8, 1, 255);
+    if (v(shake, gpa, kp.pk, damaged, header, m)) return error.FlippedSignatureVerified;
+    SignVerifyMark.mark(.flipped_refused);
+
+    var changed: [3][]const u8 = msgs;
+    const which = src.index(count);
+    var cbuf: [9]u8 = undefined;
+    @memcpy(cbuf[0..msgs[which].len], msgs[which]);
+    cbuf[msgs[which].len] = src.value(u8); // one octet longer: always a different message
+    changed[which] = cbuf[0 .. msgs[which].len + 1];
+    if (v(shake, gpa, kp.pk, sig, header, changed[0..count])) return error.OtherMessageVerified;
+    SignVerifyMark.mark(.wrong_message_refused);
+
+    var h2: [9]u8 = undefined;
+    @memcpy(h2[0..header.len], header);
+    h2[header.len] = src.value(u8);
+    if (v(shake, gpa, kp.pk, sig, h2[0 .. header.len + 1], m)) return error.OtherHeaderVerified;
+    SignVerifyMark.mark(.wrong_header_refused);
+
+    if (!std.mem.eql(u8, &other.pk.toBytes(), &kp.pk.toBytes())) {
+        if (v(shake, gpa, other.pk, sig, header, m)) return error.OtherKeyVerified;
+        SignVerifyMark.mark(.wrong_key_refused);
+    }
+}
+
+fn fuzzSignVerifySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSignVerify(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: a signature this module issued verifies and a damaged one does not" {
+    try testing.fuzz({}, fuzzSignVerifySmith, .{});
+}
+
+test "fuzz driver: BBS_FUZZ (sign + verify)" {
+    // `.scale`: each run is two key derivations, a sign and up to five verifies.
+    try fz.fuzz_driver.run(fuzzSignVerify, .{ .prefix = "BBS_FUZZ", .name = "bbs-sign-verify", .scale = 200 });
+}
+
+test "fuzz harness: sign + verify, 60 seeds, reaches every outcome" {
+    try SignVerifyMark.reach(fuzzSignVerify, "bbs-sign-verify", 60);
+}
+
+/// A proof of a signature this module issued, over a random subset of three
+/// messages disclosed, VERIFIES; one flipped octet of the proof, another
+/// disclosed message, another presentation header do NOT.
+fn fuzzProofVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const kp = try drawKeyPair(S, src);
+    var mbufs: [3][8]u8 = undefined;
+    var msgs: [3][]const u8 = undefined;
+    for (&msgs, 0..) |*mm, i| mm.* = drawText(S, src, &mbufs[i]);
+    var hbuf: [8]u8 = undefined;
+    const header = drawText(S, src, &hbuf);
+    var pbuf: [8]u8 = undefined;
+    const ph = drawText(S, src, &pbuf);
+
+    const sig = sha256.sign(gpa, &kp.sk, kp.pk, header, &msgs) catch return error.SignRefused;
+    const mask = src.valueRangeAtMost(u8, 0, 7);
+    var idx_buf: [3]usize = undefined;
+    var disclosed: [3][]const u8 = undefined;
+    var d: usize = 0;
+    for (0..3) |i| if (mask >> @intCast(i) & 1 == 1) {
+        idx_buf[d] = i;
+        disclosed[d] = msgs[i];
+        d += 1;
+    };
+    if (d == 0) ProofVerifyMark.mark(.disclosed_none);
+    if (d == 3) ProofVerifyMark.mark(.disclosed_all);
+    var rs: [8]Fr = undefined;
+    for (&rs) |*r| {
+        var w: [48]u8 = undefined;
+        src.bytes(&w);
+        w[0] |= 1; // nonzero even for the all-zero replay; a zero blinding is refused (tested above)
+        r.* = Fr.reduceWide(&w);
+    }
+    const u = 3 - d;
+    const proof = sha256.proofGen(gpa, kp.pk, &sig, header, ph, &msgs, idx_buf[0..d], rs[0 .. 5 + u]) catch |e| {
+        std.debug.print("proofGen refused a genuine request: {t} (mask {d})\n", .{ e, mask });
+        return error.GenuineProofGenRefused;
+    };
+    defer gpa.free(proof);
+    const ok = sha256.proofVerify(gpa, kp.pk, proof, header, ph, disclosed[0..d], idx_buf[0..d]) catch false;
+    if (!ok) return error.GenuineProofRefused;
+    ProofVerifyMark.mark(.genuine_accepted);
+
+    const copy = try gpa.dupe(u8, proof);
+    defer gpa.free(copy);
+    copy[src.index(copy.len)] ^= src.valueRangeAtMost(u8, 1, 255);
+    if (sha256.proofVerify(gpa, kp.pk, copy, header, ph, disclosed[0..d], idx_buf[0..d]) catch false) return error.FlippedProofVerified;
+    ProofVerifyMark.mark(.flipped_refused);
+
+    if (d != 0) {
+        var other: [3][]const u8 = disclosed;
+        var cbuf: [9]u8 = undefined;
+        const w = src.index(d);
+        @memcpy(cbuf[0..disclosed[w].len], disclosed[w]);
+        cbuf[disclosed[w].len] = src.value(u8);
+        other[w] = cbuf[0 .. disclosed[w].len + 1];
+        if (sha256.proofVerify(gpa, kp.pk, proof, header, ph, other[0..d], idx_buf[0..d]) catch false) return error.OtherDisclosedMessageVerified;
+        ProofVerifyMark.mark(.wrong_message_refused);
+    } else ProofVerifyMark.mark(.wrong_message_refused);
+
+    var ph2: [9]u8 = undefined;
+    @memcpy(ph2[0..ph.len], ph);
+    ph2[ph.len] = src.value(u8);
+    if (sha256.proofVerify(gpa, kp.pk, proof, header, ph2[0 .. ph.len + 1], disclosed[0..d], idx_buf[0..d]) catch false) return error.OtherPresentationHeaderVerified;
+    ProofVerifyMark.mark(.wrong_ph_refused);
+}
+
+fn fuzzProofVerifySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzProofVerify(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: a proof this module issued verifies and a damaged one does not" {
+    try testing.fuzz({}, fuzzProofVerifySmith, .{});
+}
+
+test "fuzz driver: BBS_FUZZ (proof + verify)" {
+    try fz.fuzz_driver.run(fuzzProofVerify, .{ .prefix = "BBS_FUZZ", .name = "bbs-proof-verify", .scale = 200 });
+}
+
+test "fuzz harness: proof + verify, 60 seeds, reaches every outcome" {
+    try ProofVerifyMark.reach(fuzzProofVerify, "bbs-proof-verify", 60);
 }
 
 // ── F4: computeB MSM crossover — differential oracle + bench ────────────

@@ -714,12 +714,78 @@ const dispatch_seeds = blk: {
     break :blk out;
 };
 
+const fz = @import("fuzz_test.zig");
+const DispatchMark = fz.Marker(enum { submitted, replied, nothing_submitted, multi_chunk });
+
 fn fuzzSmith(_: void, smith: *std.testing.Smith) anyerror!void {
+    return fuzzDispatchHarness(std.testing.Smith, smith, testing.allocator);
+}
+
+/// The valid first frame of each adapter, in `ids` order.
+const adapter_frames = [6][]const u8{
+    &.{ 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02 }, // Modbus/TCP: read 2 holding registers
+    &.{ 0x03, 0x00, 0x00, 0x16, 0x11, 0xE0, 0x00, 0x00, 0x00, 0x01, 0x00, 0xC1, 0x02, 0x01, 0x00, 0xC2, 0x02, 0x01, 0x02, 0xC0, 0x01, 0x0A }, // TPKT/COTP connection request
+    &.{ 0x68, 0x04, 0x07, 0x00, 0x00, 0x00 }, // IEC 104 STARTDT act
+    &.{ 0x05, 0x64, 0x05, 0xC0, 0x01, 0x00, 0x00, 0x04, 0xE9, 0x21 }, // DNP3 link header
+    &.{ 0x65, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 }, // EtherNet/IP RegisterSession
+    &.{ 0x81, 0x0B, 0x00, 0x0C, 0x01, 0x20, 0xFF, 0xFF, 0x00, 0xFF, 0x10, 0x08 }, // BACnet/IP Who-Is (original broadcast)
+};
+
+/// Valid frames, each aimed at its own adapter (see `ScriptStep`), 0-3 octets
+/// damaged in a share of them; up to four per run, in any order. Same
+/// invariant as `fuzzDispatch`: every in-flight slot is back after the drain.
+fn fuzzFrames(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var steps: [4]ScriptStep = undefined;
+    const count = 1 + src.index(4);
+    for (steps[0..count]) |*step| {
+        step.adapter = @intCast(src.index(6));
+        const real = adapter_frames[step.adapter];
+        step.len = if (src.index(3) == 0) fz.damage(src, &step.bytes, real) else blk: {
+            @memcpy(step.bytes[0..real.len], real);
+            break :blk real.len;
+        };
+    }
+    try fuzzDispatchScript(gpa, "", steps[0..count]);
+    if (dispatch_stats.outbound != 0) FramesMark.mark(.replied) else FramesMark.mark(.silent);
+    if (dispatch_stats.submitted == count) FramesMark.mark(.all_submitted);
+}
+
+const FramesMark = fz.Marker(enum { replied, silent, all_submitted });
+
+fn fuzzFramesSmith(_: void, smith: *std.testing.Smith) anyerror!void {
+    return fuzzFrames(std.testing.Smith, smith, testing.allocator);
+}
+
+test "fuzz: valid frames aimed at their own adapters, damaged (Smith replay)" {
+    try std.testing.fuzz({}, fuzzFramesSmith, .{});
+}
+
+test "fuzz driver: FLEETSIM_FUZZ (frames)" {
+    try fz.fuzz_driver.run(fuzzFrames, .{ .prefix = "FLEETSIM_FUZZ", .name = "fleetsim-frames" });
+}
+
+test "fuzz harness: frames, 300 seeds, reaches every outcome" {
+    try FramesMark.reach(fuzzFrames, "fleetsim-frames", 300);
+}
+
+test "fuzz driver: FLEETSIM_FUZZ (dispatch)" {
+    try fz.fuzz_driver.run(fuzzDispatchHarness, .{ .prefix = "FLEETSIM_FUZZ", .name = "fleetsim-dispatch" });
+}
+
+test "fuzz harness: dispatch, 300 seeds, reaches every outcome" {
+    try DispatchMark.reach(fuzzDispatchHarness, "fleetsim-dispatch", 300);
+}
+
+fn fuzzDispatchHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [1024]u8 = undefined;
-    // ⚠ ONE `smith.slice`. See `dispatch_inputs` for what the ranged length
-    // after `smith.bytes` did to this target.
-    const len: usize = smith.slice(&buf);
-    return fuzzDispatch({}, buf[0..len]);
+    // ⚠ ONE `slice`. See `dispatch_inputs` for what the ranged length after
+    // `bytes` did to this target. Under the driver half the inputs are a seed
+    // frame with 0-3 octets damaged (the other half is wild bytes).
+    const len: usize = fz.drawInput(S, src, &buf, &dispatch_seeds);
+    try fuzzDispatchWith(gpa, buf[0..len]);
+    if (dispatch_stats.submitted != 0) DispatchMark.mark(.submitted) else DispatchMark.mark(.nothing_submitted);
+    if (dispatch_stats.outbound != 0) DispatchMark.mark(.replied);
+    if (dispatch_stats.chunks > 1) DispatchMark.mark(.multi_chunk);
 }
 
 /// What one dispatch actually did, so a corpus guard can pin reach rather than
@@ -733,10 +799,28 @@ const DispatchStats = struct {
 var dispatch_stats: DispatchStats = .{};
 
 fn fuzzDispatch(_: void, input: []const u8) anyerror!void {
+    return fuzzDispatchWith(testing.allocator, input);
+}
+
+/// One frame aimed at one adapter by NAME (`fuzzDispatch` cuts its input into
+/// chunks whose first octet picks the node by `% 6`, so a valid S7, DNP3 or
+/// BACnet frame -- first octets 0x03, 0x05, 0x81 -- can never be routed to its own
+/// adapter that way; a script can).
+const ScriptStep = struct {
+    adapter: u8,
+    len: usize,
+    bytes: [96]u8,
+};
+
+fn fuzzDispatchWith(gpa: std.mem.Allocator, input: []const u8) anyerror!void {
+    return fuzzDispatchScript(gpa, input, null);
+}
+
+fn fuzzDispatchScript(gpa: std.mem.Allocator, input: []const u8, script: ?[]const ScriptStep) anyerror!void {
     dispatch_stats = .{};
-    if (input.len == 0) return;
-    var f = try Fleet.init(testing.allocator, .{
-        .seed = input[0],
+    if (input.len == 0 and script == null) return;
+    var f = try Fleet.init(gpa, .{
+        .seed = if (input.len != 0) input[0] else 0,
         .max_frame_len = 512,
         .inflight_capacity = 32,
         .trace_capacity = 64,
@@ -831,7 +915,21 @@ fn fuzzDispatch(_: void, input: []const u8) anyerror!void {
     var pos: usize = 0;
     var t: Time = 0;
     const ids = [_]NodeId{ mb_id, s7_id, iec_id, dnp_id, enip_id, bac_id };
-    while (pos < input.len) {
+    if (script) |steps| {
+        for (steps) |step| {
+            dispatch_stats.chunks += 1;
+            if (f.submitStream(ids[step.adapter], step.bytes[0..step.len], t)) |_| {
+                dispatch_stats.submitted += 1;
+            } else |e| switch (e) {
+                error.UnknownNode, error.FrameTooLarge => {},
+                else => return e,
+            }
+            _ = try f.advance(t);
+            dispatch_stats.outbound += f.outbound().len;
+            t += 7;
+        }
+    }
+    while (script == null and pos < input.len) {
         const chunk_len = @min(@as(usize, input[pos]) + 1, input.len - pos);
         const chunk = input[pos..][0..chunk_len];
         const id = ids[chunk[0] % ids.len];
@@ -843,11 +941,12 @@ fn fuzzDispatch(_: void, input: []const u8) anyerror!void {
             else => return e,
         }
         _ = try f.advance(t);
+        dispatch_stats.outbound += f.outbound().len; // (`advance` clears the frames of the one before)
         t += 1 + @as(Time, chunk[chunk_len - 1]);
         pos += chunk_len;
     }
     _ = try f.advance(t + 5000);
-    dispatch_stats.outbound = f.outbound().len;
+    dispatch_stats.outbound += f.outbound().len;
     // The invariant that must hold no matter what came in: every in-flight
     // slot is back in the pool once the queue has drained.
     try testing.expectEqual(f.opts.inflight_capacity, f.free_count);
