@@ -418,3 +418,182 @@ test "custom header name" {
         "X-Correlation-Id: trace-42\r\nConnection: close\r\n\r\n", &buf);
     try testing.expectEqualStrings("trace-42", headerValue(got, "X-Correlation-Id").?);
 }
+
+// ── model-fuzz: seeded random requests vs. a naive reference model ──────────
+//
+// The model is a restatement of the documented policy (module doc + SPEC
+// "Design & invariants"), written with its own logic: an explicit allowed
+// character string, no call into `isAdoptable`.
+
+const model_allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
+
+fn modelAdoptable(v: []const u8) bool {
+    if (v.len < 1) return false;
+    if (v.len > 200) return false;
+    var i: usize = 0;
+    while (i < v.len) : (i += 1) {
+        if (std.mem.indexOfScalar(u8, model_allowed, v[i]) == null) return false;
+    }
+    return true;
+}
+
+fn modelIsGenerated(v: []const u8) bool {
+    if (v.len != 32) return false;
+    for (v) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+test "model-fuzz: isAdoptable matches the documented charset/length rule on random bytes" {
+    var prng = std.Random.DefaultPrng.init(0x7265716964303031);
+    const rnd = prng.random();
+    var buf: [260]u8 = undefined;
+    var adoptable: usize = 0;
+    var rejected_len: usize = 0;
+    var rejected_char: usize = 0;
+    var case: usize = 0;
+    while (case < 4000) : (case += 1) {
+        // Length hits 0, 1, the 200/201 boundary and beyond.
+        const len: usize = switch (rnd.uintLessThan(u8, 6)) {
+            0 => 0,
+            1 => 200,
+            2 => 201,
+            3 => rnd.uintLessThan(usize, 260),
+            else => 1 + rnd.uintLessThan(usize, 40),
+        };
+        const style = rnd.uintLessThan(u8, 3);
+        for (buf[0..len]) |*b| {
+            b.* = switch (style) {
+                0 => model_allowed[rnd.uintLessThan(usize, model_allowed.len)],
+                1 => rnd.int(u8),
+                else => if (rnd.uintLessThan(u8, 20) == 0) rnd.int(u8) else model_allowed[rnd.uintLessThan(usize, model_allowed.len)],
+            };
+        }
+        const v = buf[0..len];
+        const want = modelAdoptable(v);
+        if (isAdoptable(v) != want) {
+            std.debug.print("requestid model-fuzz mismatch: seed=0x7265716964303031 case={d} len={d} want={}\n", .{ case, len, want });
+            return error.TestUnexpectedResult;
+        }
+        if (want) adoptable += 1 else if (len > 200) rejected_len += 1 else rejected_char += 1;
+    }
+    try testing.expect(adoptable > 0 and rejected_len > 0 and rejected_char > 0);
+}
+
+test "model-fuzz: middleware adopt-or-generate vs. model over random options and headers" {
+    const seed: u64 = 0x7265716964303032;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+
+    const names = [_][]const u8{ "X-Request-Id", "X-Correlation-Id", "Trace" };
+    const req_spellings = [_][]const u8{ "X-Request-Id", "x-request-id", "X-REQUEST-ID", "X-Correlation-Id", "x-correlation-id", "Trace", "trace" };
+    const wire_chars = model_allowed ++ "!#$%&'()*+,/:;<=>?@[]^`{|}~\"\\ ";
+
+    var reach_adopted: usize = 0;
+    var reach_regen_malformed: usize = 0;
+    var reach_regen_long: usize = 0;
+    var reach_regen_untrusted: usize = 0;
+    var reach_absent: usize = 0;
+    var reach_no_echo: usize = 0;
+    var reach_boundary_adopted: usize = 0;
+    var seen_generated: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = seen_generated.keyIterator();
+        while (it.next()) |k| testing.allocator.free(k.*);
+        seen_generated.deinit(testing.allocator);
+    }
+
+    var step: usize = 0;
+    while (step < 400) : (step += 1) {
+        const name = names[rnd.uintLessThan(usize, names.len)];
+        const trust = rnd.boolean();
+        const echo = rnd.uintLessThan(u8, 4) != 0;
+
+        // Incoming header: absent, or a value. It travels on the wire, so no
+        // CR/LF/NUL/high bytes and no leading/trailing blanks (the HTTP parser
+        // trims those; the raw-byte charset is covered by the test above).
+        var val_buf: [260]u8 = undefined;
+        var present = rnd.uintLessThan(u8, 8) != 0;
+        var len: usize = 0;
+        if (present) {
+            len = switch (rnd.uintLessThan(u8, 8)) {
+                0 => 1,
+                1 => 200,
+                2 => 201,
+                3 => 150 + rnd.uintLessThan(usize, 60),
+                else => 1 + rnd.uintLessThan(usize, 40),
+            };
+            const dirty = rnd.uintLessThan(u8, 3) == 0;
+            for (val_buf[0..len], 0..) |*b, i| {
+                const dirty_here = dirty and rnd.uintLessThan(u8, 12) == 0;
+                const pool: []const u8 = if (dirty_here) wire_chars else model_allowed;
+                b.* = pool[rnd.uintLessThan(usize, pool.len)];
+                if ((i == 0 or i == len - 1) and b.* == ' ') b.* = 'x';
+            }
+        } else {
+            present = false;
+        }
+        const val = val_buf[0..len];
+
+        // The request names the header with a random spelling, but it is only
+        // the configured header when it matches case-insensitively.
+        const spelling = if (present and rnd.boolean())
+            req_spellings[rnd.uintLessThan(usize, req_spellings.len)]
+        else
+            name;
+        const header_applies = present and std.ascii.eqlIgnoreCase(spelling, name);
+
+        var req_buf: [1024]u8 = undefined;
+        const req = if (present)
+            std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\n{s}: {s}\r\nConnection: close\r\n\r\n", .{ spelling, val }) catch unreachable
+        else
+            std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{}) catch unreachable;
+
+        var ri = RequestId{ .options = .{ .header_name = name, .trust_incoming = trust, .echo = echo } };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(ri.middleware());
+        try r.get("/", hEchoCurrent);
+        var out: [2048]u8 = undefined;
+        const got = runWire(&r, req, &out);
+
+        const body = bodyOf(got);
+        const hdr = headerValue(got, name);
+        const should_adopt = trust and header_applies and modelAdoptable(val);
+
+        errdefer std.debug.print("requestid model-fuzz mismatch: seed=0x{x} step={d} name={s} trust={} echo={} present={} applies={} len={d}\n", .{ seed, step, name, trust, echo, present, header_applies, len });
+
+        if (should_adopt) {
+            try testing.expectEqualStrings(val, body);
+            if (echo) try testing.expectEqualStrings(val, hdr.?) else try testing.expect(hdr == null);
+            reach_adopted += 1;
+            if (len == 200) reach_boundary_adopted += 1;
+        } else {
+            try testing.expect(modelIsGenerated(body));
+            if (echo) try testing.expectEqualStrings(body, hdr.?) else try testing.expect(hdr == null);
+            // Generated ids are unique within one thread's run.
+            const gop = try seen_generated.getOrPut(testing.allocator, body);
+            if (gop.found_existing) return error.TestUnexpectedResult;
+            gop.key_ptr.* = try testing.allocator.dupe(u8, body);
+            if (!present or !header_applies) {
+                reach_absent += 1;
+            } else if (!trust) {
+                reach_regen_untrusted += 1;
+            } else if (len > 200) {
+                reach_regen_long += 1;
+            } else {
+                reach_regen_malformed += 1;
+            }
+        }
+        if (!echo) reach_no_echo += 1;
+    }
+    try testing.expect(reach_adopted > 0);
+    try testing.expect(reach_boundary_adopted > 0);
+    try testing.expect(reach_regen_malformed > 0);
+    try testing.expect(reach_regen_long > 0);
+    try testing.expect(reach_regen_untrusted > 0);
+    try testing.expect(reach_absent > 0);
+    try testing.expect(reach_no_echo > 0);
+}

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — tests: seeded model-fuzz against a naive adopt-or-generate reference model (`isAdoptable` on random bytes; the middleware over random options, headers and lengths). No API or behaviour change.
+
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-requestid`, kept instrument kind 3): card Performance 0.15–0.24× go-chi/chi RequestID (net of the HTTP stack), measured on a quiet host. Tooling only, no code change.
 
 - **2026-10-04** — **Tests:** mutation run (12 schemata mutants, all killed after two new tests:
