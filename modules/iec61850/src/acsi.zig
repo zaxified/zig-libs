@@ -284,6 +284,7 @@ pub fn objectNameFor(reference: []const u8, fc: FunctionalConstraint, item_buf: 
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 test "the ACSI and MMS forms of a captured reference convert both ways" {
     // The measurement a real client read.
@@ -485,17 +486,26 @@ const parse_seeds = [_][]const u8{
 };
 
 test "fuzz: reference parsing never panics" {
-    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &parse_seeds });
+    try std.testing.fuzz({}, fuzzParseSmith, .{ .corpus = &parse_seeds });
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+const fuzzParseMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzParseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzParse(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so the length was 0 for every seed and both parsers were handed an empty
     // string with the seed sitting unread in the buffer.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &parse_seeds);
+    fuzzParseMark.mark(.ran);
+    if (len != 0) fuzzParseMark.mark(.nonempty);
     const s = buf[0..len];
     if (parseAcsi(s, .ST)) |ref| {
         var out: [512]u8 = undefined;
@@ -512,6 +522,14 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
         const again = try parseMms(wire);
         try testing.expect(ref.eql(&again));
     } else |_| {}
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzParse)" {
+    try fz.fuzz_driver.run(fuzzParse, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-acsi-parse" });
+}
+
+test "fuzz harness: fuzzParse, 400 seeds, reaches every outcome" {
+    try fuzzParseMark.reach(fuzzParse, "iec61850-acsi-parse", 400);
 }
 
 test "corpus: every seed reaches both parsers, and the accepted counts are pinned" {

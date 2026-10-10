@@ -299,6 +299,7 @@ pub fn encodeDataTransfer(payload: []const u8, out: []u8) Error![]u8 {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 /// The session CONNECT header a real IEC 61850 client sent, with the
 /// presentation payload replaced by a two-octet stand-in.
@@ -405,17 +406,26 @@ const decode_seeds = [_][]const u8{
 };
 
 test "fuzz: session decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so the length was 0 for every seed and the decoder was handed an empty
     // slice with the seed sitting unread in the buffer.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &decode_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     _ = decodeConnect(buf[0..len]) catch {};
     _ = decodeDataTransfer(buf[0..len]) catch {};
     const h = decodeHeader(buf[0..len]) catch return;
@@ -428,6 +438,14 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         const p = it.next() catch return;
         if (p == null) break;
     }
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-session-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "iec61850-session-decode", 400);
 }
 
 test "corpus: every decode seed reaches the decoder, and the accepted count is pinned" {

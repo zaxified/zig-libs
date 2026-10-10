@@ -1810,6 +1810,7 @@ test "binary time round trips through the decoder" {
 }
 
 const testkit = @import("testkit");
+const fz = @import("fuzz_test.zig");
 /// `testkit.fuzz.seedHex`, aliased so the corpora below read as the values they
 /// are. A corpus entry is not the value: `Smith.slice` reads a little-endian
 /// `u32` length first, so a raw TLV would arrive minus its own first four
@@ -1845,10 +1846,17 @@ const rcb_seeds = [_][]const u8{
 };
 
 test "fuzz: an arbitrary write to an RCB attribute never panics" {
-    try std.testing.fuzz({}, fuzzRcbWrite, .{ .corpus = &rcb_seeds });
+    try std.testing.fuzz({}, fuzzRcbWriteSmith, .{ .corpus = &rcb_seeds });
 }
 
-fn fuzzRcbWrite(_: void, smith: *std.testing.Smith) !void {
+const fuzzRcbWriteMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzRcbWriteSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzRcbWrite(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzRcbWrite(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⚠ This harness used to open `smith.valueRangeAtMost(u8, 0, 1)` — the
     // buffered/unbuffered choice — which `check-fuzz-reach` classifies R1: a
     // ranged first draw returns the range MINIMUM outside `--fuzz`, so the
@@ -1860,7 +1868,9 @@ fn fuzzRcbWrite(_: void, smith: *std.testing.Smith) !void {
     // from its first octet, which is the `Data` tag and so varies with the
     // alternative the seed carries.
     var input: [128]u8 = undefined;
-    const len: usize = smith.slice(&input);
+    const len: usize = fz.drawInput(S, src, &input, &rcb_seeds);
+    fuzzRcbWriteMark.mark(.ran);
+    if (len != 0) fuzzRcbWriteMark.mark(.nonempty);
     var h: Harness = .{};
     h.src.init() catch return;
     const d = mmsdata.Data.decode(input[0..len]) catch return;
@@ -1871,6 +1881,14 @@ fn fuzzRcbWrite(_: void, smith: *std.testing.Smith) !void {
     _ = cb.tick(h.src.source(), 1000) catch {};
     var w = ber.Writer.init(&h.out);
     _ = cb.emitNext(h.src.source(), &w) catch {};
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzRcbWrite)" {
+    try fz.fuzz_driver.run(fuzzRcbWrite, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-reporting-rcbWrite" });
+}
+
+test "fuzz harness: fuzzRcbWrite, 400 seeds, reaches every outcome" {
+    try fuzzRcbWriteMark.reach(fuzzRcbWrite, "iec61850-reporting-rcbWrite", 400);
 }
 
 test "corpus: every RCB seed reaches the block, and the outcomes are pinned" {
@@ -2664,10 +2682,17 @@ const reassemble_seeds = [_][]const u8{
 };
 
 test "fuzz: an arbitrary segment sequence never panics and never hangs" {
-    try std.testing.fuzz({}, fuzzReassemble, .{ .corpus = &reassemble_seeds });
+    try std.testing.fuzz({}, fuzzReassembleSmith, .{ .corpus = &reassemble_seeds });
 }
 
-fn fuzzReassemble(_: void, smith: *std.testing.Smith) !void {
+const fuzzReassembleMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzReassembleSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzReassemble(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzReassemble(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⚠ This harness used to open `smith.valueRangeAtMost(u8, 1, 8)` — the
     // member count — which `check-fuzz-reach` classifies R1: a ranged first
     // draw returns the range MINIMUM outside `--fuzz`, and once one draw comes
@@ -2678,8 +2703,18 @@ fn fuzzReassemble(_: void, smith: *std.testing.Smith) !void {
     // be faithful to, so it was restructured rather than exempted — one
     // `smith.slice`, and the octets are the script.
     var script: [64]u8 = undefined;
-    const n: usize = smith.slice(&script);
+    const n: usize = fz.drawInput(S, src, &script, &reassemble_seeds);
+    fuzzReassembleMark.mark(.ran);
+    if (n != 0) fuzzReassembleMark.mark(.nonempty);
     _ = try runReassembleScript(script[0..n]);
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzReassemble)" {
+    try fz.fuzz_driver.run(fuzzReassemble, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-reporting-reassemble" });
+}
+
+test "fuzz harness: fuzzReassemble, 400 seeds, reaches every outcome" {
+    try fuzzReassembleMark.reach(fuzzReassemble, "iec61850-reporting-reassemble", 400);
 }
 
 test "corpus: every segment script drives the reassembler, and the counts are pinned" {

@@ -282,6 +282,8 @@ pub const Pdu = struct {
         var it = ber.Iterator.init(outer.content);
         while (try it.next()) |e| {
             if (e.tag.class != .context) return error.UnexpectedTag;
+            // Only allData [11] is constructed; a flipped constructed bit is a malformed field.
+            if (e.tag.number <= 11 and e.tag.constructed != (e.tag.number == 11)) return error.UnexpectedTag;
             if (e.tag.number <= 11) {
                 const bit = @as(u16, 1) << @as(u4, @intCast(e.tag.number));
                 if (seen_mask & bit != 0) return error.DuplicateField;
@@ -315,7 +317,8 @@ pub const Pdu = struct {
                     p.all_data = e.content;
                     seen_all_data = true;
                 },
-                else => {}, // security [12] and future fields are ignored
+                12 => {}, // security (IEC 62351-6): skipped, see SPEC
+                else => return error.UnexpectedTag, // an unknown field is a malformed PDU
             }
         }
         // `stNum`, `sqNum` and `confRev` are the replay-detection fields (see
@@ -326,6 +329,9 @@ pub const Pdu = struct {
         // omission, not just by a forged value.
         if (p.gocb_ref.len == 0 or !seen_t or !seen_all_data or
             !seen_st_num or !seen_sq_num or !seen_conf_rev) return error.MissingField;
+        // timeAllowedToLive [1] and datSet [2] are mandatory too (8-1): `encode`
+        // always writes them, so an absent one would be invented as 0 / empty.
+        if (seen_mask & 0b110 != 0b110) return error.MissingField;
         if (p.go_id.len == 0) p.go_id = p.gocb_ref;
         // The redundant count must agree with the entries actually present.
         const actual = try p.valueCount();
@@ -494,6 +500,15 @@ test "an 802.1Q tag shifts the EtherType and still decodes" {
     try testing.expectEqual(@as(u3, 4), back.vlan.?.priority);
     try testing.expectEqual(@as(u12, 100), back.vlan.?.id);
     try testing.expectEqualSlices(u8, f0.pdu, back.pdu);
+}
+
+test "an unknown field in a GOOSE PDU is refused, security [12] is skipped" {
+    // Regression (IEC61850_FUZZ seed 420): tag 0xAE (context 14, constructed) used
+    // to be dropped and the default re-encoded in its place.
+    try testing.expectError(error.UnexpectedTag, Pdu.decode(&[_]u8{ 0x61, 0x03, 0xAE, 0x01, 0x00 }));
+    // Regression (second class found by the same run): constructed bit set on gocbRef [0].
+    try testing.expectError(error.UnexpectedTag, Pdu.decode(&[_]u8{ 0x61, 0x03, 0xA0, 0x01, 0x00 }));
+    try testing.expectError(error.MissingField, Pdu.decode(&[_]u8{ 0x61, 0x03, 0x8C, 0x01, 0x00 }));
 }
 
 test "Ethernet padding past the announced length is ignored, not parsed" {
@@ -678,6 +693,36 @@ test "a data value nested past the depth bound is refused inside a GOOSE PDU" {
     try testing.expectError(error.TooDeep, Pdu.decode(encoded));
 }
 
+test "a BER BOOLEAN of any nonzero octet is TRUE and re-encodes as 0x01" {
+    // Regression (IEC61850_FUZZ seed 5997): X.690 section 8.2.2 makes 0x8F true.
+    const p = Pdu{
+        .gocb_ref = "g",
+        .time_allowed_to_live_ms = 100,
+        .dat_set = "d",
+        .go_id = "g",
+        .t = mmsdata.UtcTime.fromMillis(0, 10),
+        .st_num = 1,
+        .sq_num = 0,
+        .test_mode = false,
+        .conf_rev = 1,
+        .nds_com = true,
+        .num_dat_set_entries = 0,
+        .all_data = &.{},
+    };
+    var out: [256]u8 = undefined;
+    const encoded = try p.encode(&.{}, &out);
+    var tmp: [256]u8 = undefined;
+    const raw = tmp[0..encoded.len];
+    @memcpy(raw, encoded);
+    const at = std.mem.indexOf(u8, raw, &[_]u8{ 0x89, 0x01, 0x01 }).?;
+    raw[at + 2] = 0x8F;
+    const d = try Pdu.decode(raw);
+    try testing.expect(d.nds_com);
+    var out2: [256]u8 = undefined;
+    const again = try d.encode(&.{}, &out2);
+    try testing.expectEqualSlices(u8, encoded, again);
+}
+
 test "the encoder derives numDatSetEntries from the values it is given" {
     var vbuf: [64]u8 = undefined;
     var vw = ber.Writer.init(&vbuf);
@@ -708,6 +753,7 @@ test "the encoder derives numDatSetEntries from the values it is given" {
 }
 
 const testkit = @import("testkit");
+const fz = @import("fuzz_test.zig");
 /// `testkit.fuzz.seedHex`, aliased so the literals below read as the frames
 /// they are. A corpus entry is not the frame: `Smith.slice` reads a
 /// little-endian `u32` length first, so a raw frame would arrive minus its own
@@ -757,7 +803,7 @@ const Corpus = struct {
 
 test "fuzz: goose frame and PDU decode never panic" {
     var corpus: Corpus = .{};
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build() });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = try corpus.build() });
 }
 
 test "corpus: every seed reaches the decoders, and the accepted counts are pinned" {
@@ -870,17 +916,34 @@ const GooseShape = struct {
 };
 
 test "fuzz: a publisher-shaped GOOSE frame round-trips through decode and encode" {
-    try std.testing.fuzz({}, fuzzStructuredGoose, .{ .corpus = goose_seeds });
+    try std.testing.fuzz({}, fuzzStructuredGooseSmith, .{ .corpus = goose_seeds });
 }
 
-fn fuzzStructuredGoose(_: void, smith: *std.testing.Smith) !void {
+const fuzzStructuredGooseMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzStructuredGooseSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzStructuredGoose(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzStructuredGoose(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⚠ One `smith.slice`, and the octets are the script. This harness used to
     // open `smith.bytes(&names)` and then take every structural choice from a
     // ranged `Smith` draw; `check-fuzz-reach` named three of those and the
     // generator above records what the arithmetic did to the rest.
     var script: [512]u8 = undefined;
-    const n: usize = smith.slice(&script);
+    const n: usize = fz.drawInput(S, src, &script, goose_seeds);
+    fuzzStructuredGooseMark.mark(.ran);
+    if (n != 0) fuzzStructuredGooseMark.mark(.nonempty);
     _ = try runStructuredGoose(script[0..n]);
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzStructuredGoose)" {
+    try fz.fuzz_driver.run(fuzzStructuredGoose, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-goose-structuredGoose" });
+}
+
+test "fuzz harness: fuzzStructuredGoose, 400 seeds, reaches every outcome" {
+    try fuzzStructuredGooseMark.reach(fuzzStructuredGoose, "iec61850-goose-structuredGoose", 400);
 }
 
 /// The body of `fuzzStructuredGoose`, factored out so the harness and the corpus
@@ -1113,7 +1176,29 @@ test "corpus: the publisher scripts cover the shape space, and the coverage is p
     try testing.expectEqual(@as(usize, 0), collapsed.pad);
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+/// The content of the outer GOOSE PDU, for the harness below.
+fn outerContent(pdu: []const u8) []const u8 {
+    return (ber.expect(pdu, tag_goose_pdu) catch return &.{}).content;
+}
+
+/// True when a top-level field is the skipped `security [12]`.
+fn hasSkippedSecurity(content: []const u8) bool {
+    var it = ber.Iterator.init(content);
+    while (it.next() catch return false) |e| {
+        if (e.tag.class == .context and e.tag.number == 12) return true;
+    }
+    return false;
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: Corpus = .{};
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -1123,11 +1208,16 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // of what the comment below records: `fuzzStructuredGoose` exists because
     // random octets do not build a GOOSE frame — but this harness was not even
     // getting random octets, it was getting nothing.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, (try corpus.build()));
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     _ = Pdu.decode(buf[0..len]) catch {};
     const f = Frame.decode(buf[0..len]) catch return;
     try testing.expect(f.total_len <= len);
     const p = Pdu.decode(f.pdu) catch return;
+    // The one field the decoder skips on purpose (SPEC: `security [12]`, never
+    // emitted) makes the identity impossible by design.
+    if (hasSkippedSecurity(outerContent(f.pdu))) return;
     // Anything that decoded must re-encode to the identical PDU octets.
     var vals: [64][]const u8 = undefined;
     var n: usize = 0;
@@ -1138,5 +1228,69 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     }
     var out: [1024]u8 = undefined;
     const again = p.encode(vals[0..n], &out) catch return;
-    try testing.expectEqualSlices(u8, f.pdu, again);
+    if (std.mem.eql(u8, f.pdu, again)) return;
+    // Byte identity failed. The only difference BER allows is a BOOLEAN
+    // content octet: X.690 section 8.2.2 reads any nonzero octet as TRUE and
+    // `encode` writes 0x01 (simulation [7], ndsCom [9]). Everything else must
+    // match byte for byte; the re-encoded PDU must also be canonically stable.
+    try testing.expect(onlyBooleanOctetsDiffer(f.pdu, again));
+    const p2 = try Pdu.decode(again);
+    var vals2: [64][]const u8 = undefined;
+    var n2: usize = 0;
+    var it2 = p2.values();
+    while (try it2.next()) |d| : (n2 += 1) vals2[n2] = d.raw;
+    var out2: [1024]u8 = undefined;
+    const twice = try p2.encode(vals2[0..n2], &out2);
+    try testing.expectEqualSlices(u8, again, twice);
+}
+
+/// True when `b` (the re-encoding) differs from `a` only in what BER and the
+/// ASN.1 DEFAULTs allow: a one-octet BOOLEAN field [7]/[9] that agrees in truth
+/// value (X.690 section 8.2.2: any nonzero octet is TRUE), and fields the
+/// encoder always writes that the input omitted (simulation [7] or ndsCom [9]
+/// as FALSE, numDatSetEntries [10], goID [3] defaulting to gocbRef). Every other field must match byte for byte.
+fn onlyBooleanOctetsDiffer(a: []const u8, b: []const u8) bool {
+    const oa = ber.expect(a, tag_goose_pdu) catch return false;
+    const ob = ber.expect(b, tag_goose_pdu) catch return false;
+    var ia = ber.Iterator.init(oa.content);
+    var ib = ber.Iterator.init(ob.content);
+    var pending_a: ?ber.Element = ia.next() catch return false;
+    var gocb: []const u8 = "";
+    if (pending_a) |first| {
+        if (first.tag.class == .context and first.tag.number == 0) gocb = first.content;
+    }
+    while (ib.next() catch return false) |eb| {
+        const ea = pending_a orelse return isDefaultedField(eb, gocb) and drainDefaulted(&ib, gocb);
+        if (ea.tag.eql(eb.tag)) {
+            pending_a = ia.next() catch return false;
+            if (std.mem.eql(u8, ea.content, eb.content)) continue;
+            const is_bool = ea.tag.class == .context and (ea.tag.number == 7 or ea.tag.number == 9);
+            if (!is_bool or ea.content.len != 1 or eb.content.len != 1) return false;
+            if ((ea.content[0] != 0) != (eb.content[0] != 0)) return false;
+        } else if (!isDefaultedField(eb, gocb)) return false;
+    }
+    return pending_a == null;
+}
+
+fn isDefaultedField(e: ber.Element, gocb: []const u8) bool {
+    if (e.tag.class != .context) return false;
+    return switch (e.tag.number) {
+        7, 9 => e.content.len == 1 and e.content[0] == 0,
+        10 => true,
+        3 => std.mem.eql(u8, e.content, gocb), // goID absent: defaults to gocbRef
+        else => false,
+    };
+}
+
+fn drainDefaulted(it: *ber.Iterator, gocb: []const u8) bool {
+    while (it.next() catch return false) |e| if (!isDefaultedField(e, gocb)) return false;
+    return true;
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-goose-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "iec61850-goose-decode", 400);
 }

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Fixed (malformed PDUs are refused, found by the new `IEC61850_FUZZ` driver):** `cotp.decode` refuses a nonzero low nibble of the code octet (`UnknownTpduCode`; for a DT `BadDataTpdu`); `goose.Pdu.decode` and `sv.Asdu.decode` refuse an unknown context tag (`UnexpectedTag`; `security [12]` is still skipped, as the SPEC says) and a wrong constructed bit on a known field; `sv.Asdu.decode` now requires smpCnt [2], confRev [3] and smpSynch [5], and `goose.Pdu.decode` timeAllowedToLive [1] and datSet [2] (`MissingField`; `encode` always writes them, so an absent one used to be invented). `ber.decodeBool` is unchanged (any nonzero octet is TRUE, X.690 8.2.2). Tests: deterministic fuzz driver over all 27 existing harnesses (200,000 runs each, clean) plus a reach test each; the cotp DT oracle compares TPDU-NR through `Data.number`; the GOOSE oracle skips PDUs carrying `security [12]` and, when byte identity fails, accepts only BOOLEAN-octet differences and encoder-defaulted fields ([7]/[9] FALSE, [10], [3]=gocbRef) with a canonical-stability check.
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The write→read→write regression
   test bound the fixed port 15684; its peer now binds port 0 and publishes the port it got. The F-B
   test ("one octet does not park the read") slept a fixed 1200 ms and then canceled. On a loaded

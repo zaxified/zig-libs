@@ -1394,6 +1394,7 @@ test "the integrity period writes one entry a period" {
 }
 
 const testkit = @import("testkit");
+const fz = @import("fuzz_test.zig");
 /// `testkit.fuzz.seedHex`, aliased so the literals below read as the bodies
 /// they are. A corpus entry is not the body: `Smith.slice` reads a
 /// little-endian `u32` length first, so a raw body would arrive minus its own
@@ -1457,10 +1458,18 @@ const JournalCorpus = struct {
 
 test "fuzz: journal decoding never panics" {
     var corpus: JournalCorpus = .{};
-    try std.testing.fuzz({}, fuzzJournal, .{ .corpus = try corpus.build() });
+    try std.testing.fuzz({}, fuzzJournalSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzJournal(_: void, smith: *std.testing.Smith) !void {
+const fuzzJournalMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzJournalSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzJournal(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzJournal(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: JournalCorpus = .{};
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -1468,7 +1477,9 @@ fn fuzzJournal(_: void, smith: *std.testing.Smith) !void {
     // so `len` was 0 for every seed and all four decoders were handed an empty
     // slice with the seed sitting unread in the buffer — the entry walk below
     // was unreachable.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, (try corpus.build()));
+    fuzzJournalMark.mark(.ran);
+    if (len != 0) fuzzJournalMark.mark(.nonempty);
     _ = decodeReadJournal(buf[0..len]) catch {};
     if (decodeReadJournalResponse(buf[0..len])) |r| {
         var it = r.entries;
@@ -1479,6 +1490,14 @@ fn fuzzJournal(_: void, smith: *std.testing.Smith) !void {
     } else |_| {}
     _ = decodeGetJournalStatus(buf[0..len]) catch {};
     _ = decodeGetJournalStatusResponse(buf[0..len]) catch {};
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzJournal)" {
+    try fz.fuzz_driver.run(fuzzJournal, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-logging-journal" });
+}
+
+test "fuzz harness: fuzzJournal, 400 seeds, reaches every outcome" {
+    try fuzzJournalMark.reach(fuzzJournal, "iec61850-logging-journal", 400);
 }
 
 test "corpus: every journal seed reaches its decoder, and the counts are pinned" {
@@ -1785,15 +1804,25 @@ const DeletionCorpus = struct {
 
 test "fuzz: the deletion services never panic on arbitrary bytes" {
     var corpus: DeletionCorpus = .{};
-    try std.testing.fuzz({}, fuzzDeletion, .{ .corpus = try corpus.build() });
+    try std.testing.fuzz({}, fuzzDeletionSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzDeletion(_: void, smith: *std.testing.Smith) !void {
+const fuzzDeletionMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDeletionSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDeletion(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDeletion(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: DeletionCorpus = .{};
+    _ = gpa;
     var input: [128]u8 = undefined;
     // ⚠ Same collapse as `fuzzJournal`: `len` was 0 for every seed, so
     // `decodeInitializeJournal` always failed and the block below it — which
     // fills a log and runs `initializeJournal` against it — never ran once.
-    const len: usize = smith.slice(&input);
+    const len: usize = fz.drawInput(S, src, &input, (try corpus.build()));
+    fuzzDeletionMark.mark(.ran);
+    if (len != 0) fuzzDeletionMark.mark(.nonempty);
     const body = input[0..len];
     if (decodeInitializeJournal(body)) |q| {
         var h: Harness = .{};
@@ -1804,6 +1833,14 @@ fn fuzzDeletion(_: void, smith: *std.testing.Smith) !void {
     } else |_| {}
     _ = decodeDeleteJournal(body) catch {};
     _ = decodeInitializeJournalResponse(body) catch {};
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzDeletion)" {
+    try fz.fuzz_driver.run(fuzzDeletion, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-logging-deletion" });
+}
+
+test "fuzz harness: fuzzDeletion, 400 seeds, reaches every outcome" {
+    try fuzzDeletionMark.reach(fuzzDeletion, "iec61850-logging-deletion", 400);
 }
 
 test "corpus: every deletion seed reaches its decoder, and the counts are pinned" {

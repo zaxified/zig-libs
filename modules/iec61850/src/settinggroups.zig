@@ -671,6 +671,7 @@ test "the SGCB write path maps every service onto its attribute" {
 /// `u32` length first, so a raw TLV would arrive minus its own first four
 /// octets. `testkit/src/fuzz.zig` carries the other two hazards.
 const seed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// SGCB attribute values, in the format `Smith.slice` reads.
 ///
@@ -701,10 +702,17 @@ const sgcb_seeds = [_][]const u8{
 };
 
 test "fuzz: an arbitrary SGCB write never panics" {
-    try std.testing.fuzz({}, fuzzSgcb, .{ .corpus = &sgcb_seeds });
+    try std.testing.fuzz({}, fuzzSgcbSmith, .{ .corpus = &sgcb_seeds });
 }
 
-fn fuzzSgcb(_: void, smith: *std.testing.Smith) !void {
+const fuzzSgcbMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzSgcbSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSgcb(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzSgcb(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var fx: Fixture = .{};
     var cb = fx.init() catch return;
     var input: [64]u8 = undefined;
@@ -713,7 +721,9 @@ fn fuzzSgcb(_: void, smith: *std.testing.Smith) !void {
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `Data.decode` was handed an empty slice
     // with the seed sitting unread in the buffer — nothing below it ran.
-    const len: usize = smith.slice(&input);
+    const len: usize = fz.drawInput(S, src, &input, &sgcb_seeds);
+    fuzzSgcbMark.mark(.ran);
+    if (len != 0) fuzzSgcbMark.mark(.nonempty);
     const d = mmsdata.Data.decode(input[0..len]) catch return;
     d.validate() catch return;
     _ = cb.writeAttribute(sgcb_attributes[len % sgcb_attributes.len], d, 1, 0);
@@ -721,6 +731,14 @@ fn fuzzSgcb(_: void, smith: *std.testing.Smith) !void {
     _ = cb.confirmEdit(1) catch {};
     _ = cb.activeValue(0) catch {};
     _ = cb.editValue(0) catch {};
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzSgcb)" {
+    try fz.fuzz_driver.run(fuzzSgcb, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-settinggroups-sgcb" });
+}
+
+test "fuzz harness: fuzzSgcb, 400 seeds, reaches every outcome" {
+    try fuzzSgcbMark.reach(fuzzSgcb, "iec61850-settinggroups-sgcb", 400);
 }
 
 test "corpus: every SGCB seed reaches the block, and the outcomes are pinned" {

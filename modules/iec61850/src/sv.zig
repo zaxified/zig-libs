@@ -108,6 +108,8 @@ pub const Asdu = struct {
         var it = ber.Iterator.init(e.content);
         while (try it.next()) |f| {
             if (f.tag.class != .context) return error.UnexpectedTag;
+            // Every ASDU field is primitive.
+            if (f.tag.number <= 8 and f.tag.constructed) return error.UnexpectedTag;
             if (f.tag.number <= 8) {
                 const bit = @as(u16, 1) << @as(u4, @intCast(f.tag.number));
                 if (seen_mask & bit != 0) return error.DuplicateField;
@@ -144,10 +146,16 @@ pub const Asdu = struct {
                     if (f.content.len != 2) return error.LengthMismatch;
                     a.smp_mod = std.mem.readInt(u16, f.content[0..2], .big);
                 },
-                else => {},
+                12 => {}, // security (IEC 62351-6): skipped, see SPEC
+                else => return error.UnexpectedTag, // an unknown field is a malformed ASDU
             }
         }
         if (!seen_id or !seen_data) return error.MissingField;
+        // smpCnt [2], confRev [3] and smpSynch [5] are mandatory (IEC 61850-9-2)
+        // and `emit` always writes them: accepting an ASDU without one would
+        // silently invent a default (found by IEC61850_FUZZ, 2026-10-10).
+        const mandatory: u16 = (1 << 2) | (1 << 3) | (1 << 5);
+        if (seen_mask & mandatory != mandatory) return error.MissingField;
         return a;
     }
 
@@ -347,6 +355,17 @@ test "the captured SV frame re-encodes to the identical octets" {
     try testing.expectEqualSlices(u8, bytes, try encodeFrame(f, pdu, &fbuf));
 }
 
+test "an unknown field in an ASDU is refused, security [12] is skipped" {
+    // Regression (IEC61850_FUZZ seed 5308): tag 0x95 (context 21) used to be dropped
+    // and re-encoded as a default smpSynch.
+    try testing.expectError(error.UnexpectedTag, Asdu.decode(&[_]u8{ 0x30, 0x15, 0x80, 0x01, 0x61, 0x82, 0x02, 0x00, 0x01, 0x83, 0x04, 0, 0, 0, 1, 0x95, 0x01, 0x00, 0x87, 0x00, 0x8C, 0x01, 0x00 }));
+    const full = [_]u8{ 0x30, 0x15, 0x80, 0x01, 0x61, 0x82, 0x02, 0x00, 0x01, 0x83, 0x04, 0, 0, 0, 1, 0x85, 0x01, 0x00, 0x87, 0x00, 0x8C, 0x01, 0x00 };
+    const a = try Asdu.decode(&full);
+    try testing.expectEqualStrings("a", a.sv_id);
+    // Regression (IEC61850_FUZZ, second class): smpSynch [5] damaged away.
+    try testing.expectError(error.MissingField, Asdu.decode(&[_]u8{ 0x30, 0x15, 0x80, 0x01, 0x61, 0x82, 0x02, 0x00, 0x01, 0x83, 0x04, 0, 0, 0, 1, 0x81, 0x01, 0x00, 0x87, 0x00, 0x8C, 0x01, 0x00 }));
+}
+
 test "noASDU disagreeing with seqASDU is refused" {
     var buf: [512]u8 = undefined;
     const bytes = unhex(captured_frame_hex, &buf);
@@ -439,6 +458,7 @@ test "an SV frame carries a VLAN tag the same way GOOSE does" {
 }
 
 const testkit = @import("testkit");
+const fz = @import("fuzz_test.zig");
 /// `testkit.fuzz.seedHex`, aliased so the literals below read as the frames
 /// they are. A corpus entry is not the frame: `Smith.slice` reads a
 /// little-endian `u32` length first, so a raw frame would arrive minus its own
@@ -449,7 +469,7 @@ const seed = testkit.fuzz.seedHex;
 /// value tests above name. `decodeFrame`, `SavPdu.decode` and `Asdu.decode` all
 /// see the same slice, so it carries all three levels.
 const decode_seeds = [_][]const u8{
-    seed("300F800161820200018304000000018700"), // a minimal well-formed ASDU
+    seed("30128001618202000183040000000185010087" ++ "00"), // a minimal well-formed ASDU (smpCnt, confRev, smpSynch, seqData)
     seed("300A80016182030000018700"), // LengthMismatch: a three-octet smpCnt
     seed("3009800161830200018700"), // LengthMismatch: a two-octet confRev
     seed("30028700"), // MissingField: an ASDU with no svID
@@ -485,10 +505,18 @@ const Corpus = struct {
 
 test "fuzz: sv decode never panics" {
     var corpus: Corpus = .{};
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build() });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: Corpus = .{};
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -496,7 +524,9 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // so `len` was 0 for every seed and all three decoders were handed an empty
     // slice with the seed sitting unread in the buffer — the re-encode identity
     // at the end of this function was unreachable.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, (try corpus.build()));
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     _ = Asdu.decode(buf[0..len]) catch {};
     _ = SavPdu.decode(buf[0..len]) catch {};
     const f = decodeFrame(buf[0..len]) catch return;
@@ -504,6 +534,14 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var out: [1024]u8 = undefined;
     const again = SavPdu.encode(p.list(), &out) catch return;
     try testing.expectEqualSlices(u8, f.pdu, again);
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-sv-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "iec61850-sv-decode", 400);
 }
 
 test "corpus: every seed reaches the decoders, and the accepted counts are pinned" {

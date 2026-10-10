@@ -1638,17 +1638,26 @@ const control_seeds = [_][]const u8{
 };
 
 test "fuzz: control structures decode to a typed error or a valid value" {
-    try std.testing.fuzz({}, fuzzControl, .{ .corpus = &control_seeds });
+    try std.testing.fuzz({}, fuzzControlSmith, .{ .corpus = &control_seeds });
 }
 
-fn fuzzControl(_: void, smith: *std.testing.Smith) !void {
+const fuzzControlMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzControlSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzControl(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzControl(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `Data.decode` was handed an empty slice
     // with the seed sitting unread in the buffer.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &control_seeds);
+    fuzzControlMark.mark(.ran);
+    if (len != 0) fuzzControlMark.mark(.nonempty);
     const bytes = buf[0..len];
     const d = mmsdata.Data.decode(bytes) catch return;
     d.validate() catch return;
@@ -1679,6 +1688,14 @@ fn fuzzControl(_: void, smith: *std.testing.Smith) !void {
     _ = CtlModel.fromData(d) catch {};
 }
 
+test "fuzz driver: IEC61850_FUZZ (fuzzControl)" {
+    try fz.fuzz_driver.run(fuzzControl, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-control-control" });
+}
+
+test "fuzz harness: fuzzControl, 400 seeds, reaches every outcome" {
+    try fuzzControlMark.reach(fuzzControl, "iec61850-control-control", 400);
+}
+
 /// `InformationReport` **bodies** — what `mms.decodeInformationReport` takes,
 /// which is the content of the `[3] unconfirmed-PDU`, not the PDU. All three
 /// are the captured indications from `controlgoldens.zig`, peeled the same way.
@@ -1697,16 +1714,33 @@ const classify_seeds = [_][]const u8{
 };
 
 test "fuzz: classifying an unsolicited report never panics" {
-    try std.testing.fuzz({}, fuzzClassify, .{ .corpus = &classify_seeds });
+    try std.testing.fuzz({}, fuzzClassifySmith, .{ .corpus = &classify_seeds });
 }
 
-fn fuzzClassify(_: void, smith: *std.testing.Smith) !void {
+const fuzzClassifyMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzClassifySmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzClassify(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzClassify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ Same collapse as `fuzzControl` above: `len` was 0 for every seed, so
     // `decodeInformationReport` always failed and `classify` was never called.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &classify_seeds);
+    fuzzClassifyMark.mark(.ran);
+    if (len != 0) fuzzClassifyMark.mark(.nonempty);
     const info = mms.decodeInformationReport(buf[0..len]) catch return;
     _ = classify(info) catch return;
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzClassify)" {
+    try fz.fuzz_driver.run(fuzzClassify, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-control-classify" });
+}
+
+test "fuzz harness: fuzzClassify, 400 seeds, reaches every outcome" {
+    try fuzzClassifyMark.reach(fuzzClassify, "iec61850-control-classify", 400);
 }
 
 /// `testkit.fuzz.Cursor` over one corpus seed, which is what drives `fuzzPoint`.
@@ -1722,6 +1756,7 @@ fn fuzzClassify(_: void, smith: *std.testing.Smith) !void {
 /// form: one `smith.slice`, then the octets say what happens. It also makes a
 /// seed reviewable, which a sequence of `u64` words is not.
 const Script = @import("testkit").fuzz.Cursor;
+const fz = @import("fuzz_test.zig");
 
 /// What a script did to the point, so the guard below can measure a corpus
 /// rather than assert it merely ran.
@@ -1806,13 +1841,30 @@ const point_seeds = [_][]const u8{
 };
 
 test "fuzz: the server-side point never panics and never wedges" {
-    try std.testing.fuzz({}, fuzzPoint, .{ .corpus = &point_seeds });
+    try std.testing.fuzz({}, fuzzPointSmith, .{ .corpus = &point_seeds });
 }
 
-fn fuzzPoint(_: void, smith: *std.testing.Smith) !void {
+const fuzzPointMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzPointSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzPoint(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzPoint(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var script: [256]u8 = undefined;
-    const n: usize = smith.slice(&script);
+    const n: usize = fz.drawInput(S, src, &script, &point_seeds);
+    fuzzPointMark.mark(.ran);
+    if (n != 0) fuzzPointMark.mark(.nonempty);
     _ = try runPointScript(script[0..n]);
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzPoint)" {
+    try fz.fuzz_driver.run(fuzzPoint, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-control-point" });
+}
+
+test "fuzz harness: fuzzPoint, 400 seeds, reaches every outcome" {
+    try fuzzPointMark.reach(fuzzPoint, "iec61850-control-point", 400);
 }
 
 test "corpus: every control seed reaches its decoder, and the counts are pinned" {

@@ -134,6 +134,7 @@ const testing = std.testing;
 /// u32 length first, so a raw frame would arrive minus its own first four
 /// octets. See `testkit/src/fuzz.zig` for the two other hazards.
 const seed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 test "header counts itself" {
     try testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x00, 0x00, 0x17 }, &try header(19));
@@ -205,10 +206,17 @@ const decode_seeds = [_][]const u8{
 };
 
 test "fuzz: tpkt decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -217,12 +225,22 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // every single time, with the seed sitting unread in `buf`. Measured
     // 2026-09-07 over the corpus above: **0 of 9 non-empty and 0 decoded
     // before, 9 of 9 non-empty and 3 decoded after.**
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &decode_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     const pkt = decode(buf[0..len]) catch return;
     try testing.expect(pkt.total_len <= len);
     try testing.expectEqual(pkt.total_len, pkt.payload.len + header_len);
     var round: [512]u8 = undefined;
     try testing.expectEqualSlices(u8, buf[0..pkt.total_len], try encode(pkt.payload, &round));
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-tpkt-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "iec61850-tpkt-decode", 400);
 }
 
 /// Streams for the framer: frames back to back, a frame split across the
@@ -237,10 +255,17 @@ const framer_seeds = [_][]const u8{
 };
 
 test "fuzz: framer never panics or hangs" {
-    try std.testing.fuzz({}, fuzzFramer, .{ .corpus = &framer_seeds });
+    try std.testing.fuzz({}, fuzzFramerSmith, .{ .corpus = &framer_seeds });
 }
 
-fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
+const fuzzFramerMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzFramerSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFramer(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzFramer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var input: [512]u8 = undefined;
     // ⚠ Same defect as `fuzzDecode` above, and for two months `check-fuzz-reach`
     // did NOT see it: its R2 rule looked for the drawn buffer being sliced
@@ -251,7 +276,9 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
     // on 2026-09-07 (form (b)); four other modules were hiding behind the same
     // gap. Measured over the corpus above: **0 of 6 seeds reached `feed` before,
     // 6 of 6 after.**
-    const len: usize = smith.slice(&input);
+    const len: usize = fz.drawInput(S, src, &input, &framer_seeds);
+    fuzzFramerMark.mark(.ran);
+    if (len != 0) fuzzFramerMark.mark(.nonempty);
     var storage: [1024]u8 = undefined;
     var f = Framer.init(&storage);
     var off: usize = 0;
@@ -267,4 +294,12 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
             if (got == null) break;
         }
     }
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzFramer)" {
+    try fz.fuzz_driver.run(fuzzFramer, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-tpkt-framer" });
+}
+
+test "fuzz harness: fuzzFramer, 400 seeds, reaches every outcome" {
+    try fuzzFramerMark.reach(fuzzFramer, "iec61850-tpkt-framer", 400);
 }

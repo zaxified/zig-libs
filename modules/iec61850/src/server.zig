@@ -2252,6 +2252,7 @@ test "an ordinary report is still routed to the report handler, not the control 
 
 const testkit = @import("testkit");
 const goldens = @import("goldens.zig");
+const fz = @import("fuzz_test.zig");
 
 /// `testkit.fuzz.seedHex`, aliased so the literals below read as the frames
 /// they are. A corpus entry is not the frame: `Smith.slice` reads a
@@ -2317,10 +2318,18 @@ const ServerCorpus = struct {
 
 test "fuzz: the server never panics on arbitrary packets" {
     var corpus: ServerCorpus = .{};
-    try std.testing.fuzz({}, fuzzServer, .{ .corpus = corpus.build() });
+    try std.testing.fuzz({}, fuzzServerSmith, .{ .corpus = corpus.build() });
 }
 
-fn fuzzServer(_: void, smith: *std.testing.Smith) !void {
+const fuzzServerMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzServerSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzServer(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: ServerCorpus = .{};
+    _ = gpa;
     var fx: Fixture = .{};
     const model = fx.init() catch return;
     var srv = Server.init(.{}, model);
@@ -2331,12 +2340,22 @@ fn fuzzServer(_: void, smith: *std.testing.Smith) !void {
     // so `len` was 0 for every seed and `handle` was called twice with an empty
     // slice, the seed sitting unread in the buffer. A responder harness that
     // never hands the responder a packet is not a responder harness.
-    const len: usize = smith.slice(&input);
+    const len: usize = fz.drawInput(S, src, &input, corpus.build());
+    fuzzServerMark.mark(.ran);
+    if (len != 0) fuzzServerMark.mark(.nonempty);
     var out: [8192]u8 = undefined;
     _ = srv.handle(input[0..len], &out) catch {};
     // And again once associated, so the MMS path is reached too.
     try srv.markAssociated();
     _ = srv.handle(input[0..len], &out) catch {};
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzServer)" {
+    try fz.fuzz_driver.run(fuzzServer, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-server-server" });
+}
+
+test "fuzz harness: fuzzServer, 400 seeds, reaches every outcome" {
+    try fuzzServerMark.reach(fuzzServer, "iec61850-server-server", 400);
 }
 
 test "corpus: every server seed reaches handle, and the answered count is pinned" {

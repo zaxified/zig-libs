@@ -1017,6 +1017,7 @@ test "an RCB structure that stops early is refused" {
 }
 
 const testkit = @import("testkit");
+const fz = @import("fuzz_test.zig");
 /// `testkit.fuzz.seedHex`, aliased so the literals below read as the structures
 /// they are. A corpus entry is not the structure: `Smith.slice` reads a
 /// little-endian `u32` length first, so a raw TLV would arrive minus its own
@@ -1067,23 +1068,41 @@ const Corpus = struct {
 
 test "fuzz: report decode never panics" {
     var corpus: Corpus = .{};
-    try std.testing.fuzz({}, fuzzReport, .{ .corpus = try corpus.build() });
+    try std.testing.fuzz({}, fuzzReportSmith, .{ .corpus = try corpus.build() });
 }
 
-fn fuzzReport(_: void, smith: *std.testing.Smith) !void {
+const fuzzReportMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzReportSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzReport(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzReport(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var corpus: Corpus = .{};
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and all three decoders were handed an empty
     // slice with the seed sitting unread in the buffer.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, (try corpus.build()));
+    fuzzReportMark.mark(.ran);
+    if (len != 0) fuzzReportMark.mark(.nonempty);
     var r: Report = undefined;
     decodeInformationReport(&r, buf[0..len]) catch {};
     const d = mmsdata.Data.decode(buf[0..len]) catch return;
     d.validate() catch return;
     _ = Rcb.decode(d, .unbuffered) catch {};
     _ = Rcb.decode(d, .buffered) catch {};
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzReport)" {
+    try fz.fuzz_driver.run(fuzzReport, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-report-report" });
+}
+
+test "fuzz harness: fuzzReport, 400 seeds, reaches every outcome" {
+    try fuzzReportMark.reach(fuzzReport, "iec61850-report-report", 400);
 }
 
 test "corpus: every seed reaches the decoders, and the accepted counts are pinned" {

@@ -1805,6 +1805,7 @@ test "a reject PDU is surfaced rather than parsed as a response" {
 /// length first, so a raw PDU would arrive minus its own first four octets.
 /// `testkit/src/fuzz.zig` carries the other two hazards.
 const seed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 /// MMS PDUs, in the format `Smith.slice` reads (see `testkit.fuzz`).
 ///
@@ -1846,10 +1847,17 @@ const decode_seeds = [_][]const u8{
 };
 
 test "fuzz: mms decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -1857,7 +1865,9 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // so `len` was 0 for every seed and `decode` was handed an empty slice with
     // the seed sitting unread in the buffer — every arm of the switch below was
     // unreachable.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &decode_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     const pdu = decode(buf[0..len]) catch return;
     switch (pdu) {
         .confirmed_request => |r| {
@@ -1898,6 +1908,14 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         },
         else => {},
     }
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-mms-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "iec61850-mms-decode", 400);
 }
 
 test "corpus: every seed reaches the decoder, and what it decodes to is pinned" {

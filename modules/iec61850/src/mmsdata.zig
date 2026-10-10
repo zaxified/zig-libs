@@ -430,6 +430,7 @@ pub const Emit = struct {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 test "the captured measurement value decodes" {
     // `87 05 08 3d 2a 51 55` — a floating-point AnIn1.mag.f read from a real IED.
@@ -704,17 +705,26 @@ const data_seeds = [_][]const u8{
 };
 
 test "fuzz: Data decode and validate never panic" {
-    try std.testing.fuzz({}, fuzzData, .{ .corpus = &data_seeds });
+    try std.testing.fuzz({}, fuzzDataSmith, .{ .corpus = &data_seeds });
 }
 
-fn fuzzData(_: void, smith: *std.testing.Smith) !void {
+const fuzzDataMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDataSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzData(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzData(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so the length was 0 for every seed and `decode` was handed an empty slice
     // with the seed sitting unread in the buffer.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &data_seeds);
+    fuzzDataMark.mark(.ran);
+    if (len != 0) fuzzDataMark.mark(.nonempty);
     const d = Data.decode(buf[0..len]) catch return;
     d.validate() catch return;
     // Everything that validated must be walkable without error.
@@ -732,6 +742,14 @@ fn fuzzData(_: void, smith: *std.testing.Smith) !void {
         _ = d.utcTime() catch {};
         _ = d.binaryTime() catch {};
     }
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzData)" {
+    try fz.fuzz_driver.run(fuzzData, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-mmsdata-data" });
+}
+
+test "fuzz harness: fuzzData, 400 seeds, reaches every outcome" {
+    try fuzzDataMark.reach(fuzzData, "iec61850-mmsdata-data", 400);
 }
 
 test "corpus: every Data seed reaches the decoder, and the accepted count is pinned" {

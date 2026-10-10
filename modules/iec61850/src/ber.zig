@@ -712,6 +712,7 @@ const testing = std.testing;
 /// `u32` length first, so a raw frame would arrive minus its own first four
 /// octets. `testkit/src/fuzz.zig` carries the other two hazards.
 const seed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
 
 test "short-form tags round trip" {
     var out: [8]u8 = undefined;
@@ -1032,17 +1033,26 @@ const decode_seeds = [_][]const u8{
 };
 
 test "fuzz: ber decode never panics and re-encodes consistently" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `n` was 0 for every seed and `decode` was handed an empty slice with
     // the seed sitting unread in the buffer.
-    const n: usize = smith.slice(&buf);
+    const n: usize = fz.drawInput(S, src, &buf, &decode_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (n != 0) fuzzDecodeMark.mark(.nonempty);
     const e = decode(buf[0..n]) catch return;
     try testing.expect(e.total_len <= n);
     try testing.expect(e.content.len <= e.total_len);
@@ -1066,6 +1076,14 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         w.header(e.tag, m) catch return;
         try testing.expectEqualSlices(u8, buf[0..e.total_len], w.done());
     }
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-ber-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "iec61850-ber-decode", 400);
 }
 
 test "a non-minimal long-form length decodes, and does not re-encode to its own octets" {
@@ -1105,15 +1123,24 @@ const iterate_seeds = [_][]const u8{
 };
 
 test "fuzz: iterating arbitrary constructed bodies terminates" {
-    try std.testing.fuzz({}, fuzzIterate, .{ .corpus = &iterate_seeds });
+    try std.testing.fuzz({}, fuzzIterateSmith, .{ .corpus = &iterate_seeds });
 }
 
-fn fuzzIterate(_: void, smith: *std.testing.Smith) !void {
+const fuzzIterateMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzIterateSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzIterate(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzIterate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ Same collapse as `fuzzDecode` above: `smith.bytes` followed by a ranged
     // length gave `n == 0` for every seed, so the iterator was always
     // initialised over an empty body and stopped on its first `next`.
-    const n: usize = smith.slice(&buf);
+    const n: usize = fz.drawInput(S, src, &buf, &iterate_seeds);
+    fuzzIterateMark.mark(.ran);
+    if (n != 0) fuzzIterateMark.mark(.nonempty);
     var it = Iterator.init(buf[0..n]);
     var guard: usize = 0;
     while (true) {
@@ -1125,6 +1152,14 @@ fn fuzzIterate(_: void, smith: *std.testing.Smith) !void {
         _ = BitString.parse(e.?.content) catch {};
         _ = Float.parse(e.?.content) catch {};
     }
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzIterate)" {
+    try fz.fuzz_driver.run(fuzzIterate, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-ber-iterate" });
+}
+
+test "fuzz harness: fuzzIterate, 400 seeds, reaches every outcome" {
+    try fuzzIterateMark.reach(fuzzIterate, "iec61850-ber-iterate", 400);
 }
 
 /// Identifier and length octets, in the format `Smith.slice` reads. These are
@@ -1148,10 +1183,17 @@ const taglength_seeds = [_][]const u8{
 };
 
 test "fuzz: tag and length codecs round trip" {
-    try std.testing.fuzz({}, fuzzTagLength, .{ .corpus = &taglength_seeds });
+    try std.testing.fuzz({}, fuzzTagLengthSmith, .{ .corpus = &taglength_seeds });
 }
 
-fn fuzzTagLength(_: void, smith: *std.testing.Smith) !void {
+const fuzzTagLengthMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzTagLengthSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzTagLength(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzTagLength(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     // ⚠ This harness used to open `smith.value(u32)`, which `check-fuzz-reach`
     // classifies R1: a scalar draw reads eight octets as a little-endian u64
     // and returns the range MINIMUM unless the whole word falls inside the
@@ -1162,7 +1204,9 @@ fn fuzzTagLength(_: void, smith: *std.testing.Smith) !void {
     // feeds the encode direction from those same octets rather than from
     // further draws, so one seed drives the whole body.
     var buf: [16]u8 = undefined;
-    const n: usize = smith.slice(&buf);
+    const n: usize = fz.drawInput(S, src, &buf, &taglength_seeds);
+    fuzzTagLengthMark.mark(.ran);
+    if (n != 0) fuzzTagLengthMark.mark(.nonempty);
     const in = buf[0..n];
     var out: [16]u8 = undefined;
 
@@ -1197,6 +1241,14 @@ fn fuzzTagLength(_: void, smith: *std.testing.Smith) !void {
     const v: usize = std.mem.readInt(u32, word[4..8], .little);
     const ln = try encodeLength(v, &out);
     try testing.expectEqual(v, (try decodeLength(out[0..ln])).length.definite);
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzTagLength)" {
+    try fz.fuzz_driver.run(fuzzTagLength, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-ber-tagLength" });
+}
+
+test "fuzz harness: fuzzTagLength, 400 seeds, reaches every outcome" {
+    try fuzzTagLengthMark.reach(fuzzTagLength, "iec61850-ber-tagLength", 400);
 }
 
 test "corpus: every seed reaches its decoder, and the accepted counts are pinned" {

@@ -142,6 +142,9 @@ pub fn decode(bytes: []const u8) Error!Tpdu {
     if (li == 0) return error.BadLengthIndicator;
     if (bytes.len < li + 1) return error.BadLengthIndicator;
     const code: Code = @enumFromInt(bytes[1] & 0xF0);
+    // The low nibble is the credit field in class 0 and must be zero (a DT
+    // reports it as `BadDataTpdu` below).
+    if (bytes[1] & 0x0F != 0 and code != .dt) return error.UnknownTpduCode;
     switch (code) {
         .cr, .cc => {
             // LI covers code + dst-ref + src-ref + class = 6 octets minimum.
@@ -174,7 +177,9 @@ pub fn decode(bytes: []const u8) Error!Tpdu {
         .dt => {
             // In class 0 the DT header is fixed: LI 2, code, then the
             // TPDU-number/EOT octet. Anything else is a framing error.
-            if (li != 2) return error.BadDataTpdu;
+            // The code octet is exactly 0xF0: in class 0 the low nibble is
+            // the (absent) credit field and must be zero.
+            if (li != 2 or bytes[1] != 0xF0) return error.BadDataTpdu;
             const n = bytes[2];
             return .{ .dt = .{
                 .number = @truncate(n),
@@ -321,6 +326,7 @@ pub const Reassembler = struct {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fz = @import("fuzz_test.zig");
 
 /// The COTP connect request a real IEC 61850 client sent, captured on the wire.
 const captured_cr = [_]u8{ 0x11, 0xE0, 0x00, 0x00, 0x00, 0x01, 0x00, 0xC0, 0x01, 0x0D, 0xC2, 0x02, 0x00, 0x01, 0xC1, 0x02, 0x00, 0x01 };
@@ -371,6 +377,11 @@ test "malformed TPDUs are typed errors" {
     try testing.expectError(error.UnknownTpduCode, decode(&[_]u8{ 0x02, 0x20, 0x00 }));
     // A DT with LI != 2 in class 0.
     try testing.expectError(error.BadDataTpdu, decode(&[_]u8{ 0x03, 0xF0, 0x80, 0x00 }));
+    // Regression (IEC61850_FUZZ seed 847): the low nibble of the DT code must be 0.
+    // Regression (IEC61850_FUZZ seed 3221): a CR/CC/DR code with a nonzero low nibble.
+    try testing.expectError(error.UnknownTpduCode, decode(&[_]u8{ 0x06, 0xE1, 0x78, 0x59, 0x98, 0x72, 0x05 }));
+    try testing.expectError(error.BadDataTpdu, decode(&[_]u8{ 0x02, 0xF9, 0x80 }));
+    try testing.expectError(error.BadDataTpdu, decode(&[_]u8{ 0x02, 0xF9, 0x80, 0x01, 0x00 }));
     // A CR whose LI does not cover the fixed part.
     try testing.expectError(error.BadLengthIndicator, decode(&[_]u8{ 0x05, 0xE0, 0x00, 0x00, 0x00, 0x01 }));
     // Class 4 is refused, not silently treated as class 0.
@@ -433,17 +444,26 @@ const decode_seeds = [_][]const u8{
 };
 
 test "fuzz: cotp decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
+    try std.testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+const fuzzDecodeMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzDecodeSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzDecode(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so the length was 0 for every seed and the decoder was handed an empty
     // slice with the seed sitting unread in the buffer.
-    const len: usize = smith.slice(&buf);
+    const len: usize = fz.drawInput(S, src, &buf, &decode_seeds);
+    fuzzDecodeMark.mark(.ran);
+    if (len != 0) fuzzDecodeMark.mark(.nonempty);
     const t = decode(buf[0..len]) catch return;
     var out: [1024]u8 = undefined;
     switch (t) {
@@ -453,10 +473,26 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         },
         .dt => |d| {
             const again = try encodeData(d.payload, d.eot, &out);
-            try testing.expectEqualSlices(u8, buf[0..again.len], again);
+            // `encodeData` always writes TPDU-NR 0 (class 0); `decode` reports
+            // the number it read in `Data.number` and does not refuse a
+            // nonzero one, so the octet is compared without its low 7 bits
+            // and those are checked against `number` instead (found by the
+            // IEC61850_FUZZ driver, 2026-10-10: `02 f0 76 ...`).
+            try testing.expectEqual(@as(u7, @truncate(buf[2])), d.number);
+            try testing.expectEqualSlices(u8, buf[0..2], again[0..2]);
+            try testing.expectEqual(buf[2] & 0x80, again[2]);
+            try testing.expectEqualSlices(u8, buf[3..again.len], again[3..]);
         },
         else => {},
     }
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzDecode)" {
+    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-cotp-decode" });
+}
+
+test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
+    try fuzzDecodeMark.reach(fuzzDecode, "iec61850-cotp-decode", 400);
 }
 
 test "corpus: every decode seed reaches the decoder, and the accepted count is pinned" {

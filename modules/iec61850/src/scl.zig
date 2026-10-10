@@ -2248,6 +2248,7 @@ test "an IED the file does not contain is a typed error" {
 }
 
 const testkit = @import("testkit");
+const fz = @import("fuzz_test.zig");
 /// `testkit.fuzz.seed`, aliased so the corpora below read as the documents they
 /// are. A corpus entry is not the document: `Smith.slice` reads a little-endian
 /// `u32` length first, so a raw document would arrive minus its own first four
@@ -2295,21 +2296,29 @@ const scl_seeds = [_][]const u8{
 };
 
 test "fuzz: SCL parsing and resolution never panic" {
-    try std.testing.fuzz({}, fuzzScl, .{ .corpus = &scl_seeds });
+    try std.testing.fuzz({}, fuzzSclSmith, .{ .corpus = &scl_seeds });
 }
 
-fn fuzzScl(_: void, smith: *std.testing.Smith) !void {
+const fuzzSclMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzSclSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzScl(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzScl(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [scl_input_len]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM,
     // so `len` was 0 for every seed and `parse` was handed an empty string —
     // which fails, so the resolver below was unreachable.
-    const len: usize = smith.slice(&buf);
-    var s = parse(testing.allocator, buf[0..len], .{ .allow_unknown_btype = true }) catch return;
+    const len: usize = fz.drawInput(S, src, &buf, &scl_seeds);
+    fuzzSclMark.mark(.ran);
+    if (len != 0) fuzzSclMark.mark(.nonempty);
+    var s = parse(gpa, buf[0..len], .{ .allow_unknown_btype = true }) catch return;
     defer s.deinit();
     for (s.ieds) |i| {
-        var m = resolve(&s, testing.allocator, i.name) catch continue;
+        var m = resolve(&s, gpa, i.name) catch continue;
         defer m.deinit();
         // Every resolved name must be a legal MMS item id under a domain.
         for (m.nodes) |n| {
@@ -2317,6 +2326,14 @@ fn fuzzScl(_: void, smith: *std.testing.Smith) !void {
             try testing.expect(n.item.len <= acsi.max_reference_len);
         }
     }
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzScl)" {
+    try fz.fuzz_driver.run(fuzzScl, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-scl-scl" });
+}
+
+test "fuzz harness: fuzzScl, 400 seeds, reaches every outcome" {
+    try fuzzSclMark.reach(fuzzScl, "iec61850-scl-scl", 400);
 }
 
 /// Octets for the type id that gets spliced into the skeleton four times over.
@@ -2336,15 +2353,23 @@ const fragment_seeds = [_][]const u8{
 };
 
 test "fuzz: a hostile SCL fragment glued into a valid skeleton never panics" {
-    try std.testing.fuzz({}, fuzzFragment, .{ .corpus = &fragment_seeds });
+    try std.testing.fuzz({}, fuzzFragmentSmith, .{ .corpus = &fragment_seeds });
 }
 
-fn fuzzFragment(_: void, smith: *std.testing.Smith) !void {
+const fuzzFragmentMark = fz.Marker(enum { ran, nonempty });
+
+fn fuzzFragmentSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzFragment(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzFragment(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var frag: [256]u8 = undefined;
     // ⚠ Same collapse as `fuzzScl`: `n` was 0 for every seed, so the id spliced
     // into the skeleton was always the empty string and this harness rendered
     // exactly one document, for ever.
-    const n: usize = smith.slice(&frag);
+    const n: usize = fz.drawInput(S, src, &frag, &fragment_seeds);
+    fuzzFragmentMark.mark(.ran);
+    if (n != 0) fuzzFragmentMark.mark(.nonempty);
     // Keep it XML-legal: only name characters, so the parser gets past the
     // lexer and the *resolver* is what is being exercised.
     for (frag[0..n]) |*c| {
@@ -2358,9 +2383,9 @@ fn fuzzFragment(_: void, smith: *std.testing.Smith) !void {
     const id = frag[0..n];
 
     var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(testing.allocator);
+    defer text.deinit(gpa);
     const rendered = try std.fmt.allocPrint(
-        testing.allocator,
+        gpa,
         "<SCL xmlns=\"http://www.iec.ch/61850/2003/SCL\"><IED name=\"I\"><AccessPoint name=\"A\"><Server>" ++
             "<LDevice inst=\"LD\"><LN lnClass=\"GGIO\" lnType=\"{s}\" inst=\"1\"/></LDevice>" ++
             "</Server></AccessPoint></IED><DataTypeTemplates>" ++
@@ -2369,11 +2394,19 @@ fn fuzzFragment(_: void, smith: *std.testing.Smith) !void {
             "</DataTypeTemplates></SCL>",
         .{ id, id, id, id },
     );
-    defer testing.allocator.free(rendered);
-    var s = parse(testing.allocator, rendered, .{}) catch return;
+    defer gpa.free(rendered);
+    var s = parse(gpa, rendered, .{}) catch return;
     defer s.deinit();
-    var m = resolve(&s, testing.allocator, "I") catch return;
+    var m = resolve(&s, gpa, "I") catch return;
     defer m.deinit();
+}
+
+test "fuzz driver: IEC61850_FUZZ (fuzzFragment)" {
+    try fz.fuzz_driver.run(fuzzFragment, .{ .prefix = "IEC61850_FUZZ", .name = "iec61850-scl-fragment" });
+}
+
+test "fuzz harness: fuzzFragment, 400 seeds, reaches every outcome" {
+    try fuzzFragmentMark.reach(fuzzFragment, "iec61850-scl-fragment", 400);
 }
 
 test "corpus: every SCL seed reaches the parser, and the accepted counts are pinned" {
