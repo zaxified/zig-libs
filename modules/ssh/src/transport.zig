@@ -136,6 +136,7 @@ pub const kex_algorithms = [_][]const u8{
     "curve25519-sha256@libssh.org",
     "ecdh-sha2-nistp256",
     "ecdh-sha2-nistp384",
+    "diffie-hellman-group-exchange-sha256",
     "diffie-hellman-group14-sha256",
     "diffie-hellman-group16-sha512",
 };
@@ -1298,7 +1299,7 @@ pub const HostKeyPolicy = struct {
 
 /// Largest `K`-as-hashed encoding: mpint of a 4096-bit (512-byte) DH shared
 /// secret is `uint32 len || <=1 sign-pad || 512 bytes` = 517 bytes.
-pub const max_k_enc_len = 520;
+pub const max_k_enc_len = 1032;
 
 /// Result of a completed key exchange (RFC 4253 §8 / RFC 8731 §4): the shared
 /// secret `K` and the exchange hash `H`. `H` from the *first* KEX becomes the
@@ -2197,6 +2198,214 @@ fn dhGroupKexBody(
     Sha256.hash(k_s, &res.host_key_digest, .{});
 
     return res;
+}
+
+// ── DH group exchange (RFC 4419: diffie-hellman-group-exchange-sha256) ─────
+
+pub const dh_gex_name = "diffie-hellman-group-exchange-sha256";
+
+pub fn isDhGexKex(name: []const u8) bool {
+    return std.mem.eql(u8, name, dh_gex_name);
+}
+
+/// RFC 4419 message numbers. They reuse 31..33 of the fixed-group exchange
+/// (the method decides which is meant), so they are not `MessageType` tags.
+pub const msg_kex_dh_gex_request: u8 = 34;
+pub const msg_kex_dh_gex_group: u8 = 31;
+pub const msg_kex_dh_gex_init: u8 = 32;
+pub const msg_kex_dh_gex_reply: u8 = 33;
+
+/// What a client asks for (min, n, max), and the range of server primes it
+/// accepts — Go's `dhGroupExchangeMinimumBits` / `PreferredBits` /
+/// `MaximumBits` (2048 / 2048 / 8192). RFC 8270 raised the floor to 2048.
+pub const gex_min_bits: u32 = 2048;
+pub const gex_preferred_bits: u32 = 2048;
+pub const gex_max_bits: u32 = 8192;
+
+/// The server-chosen prime runs on montint's run-time modulus (constant-time
+/// `pow`); 8192 bits is the largest group a client here accepts.
+pub const GexMod = montint.DynModint(gex_max_bits);
+pub const gex_max_prime_len = gex_max_bits / 8;
+
+/// Bit length of a big-endian magnitude with no leading zero byte.
+fn magnitudeBits(m: []const u8) usize {
+    if (m.len == 0) return 0;
+    return 8 * (m.len - 1) + (8 - @as(usize, @clz(m[0])));
+}
+
+/// `base^exp mod m` on a run-time GEX prime, the minimal magnitude into `out`.
+pub fn gexPow(m: *const GexMod, base_be: []const u8, exp_be: []const u8, out: []u8) TransportError![]const u8 {
+    const base = m.elemFromBytesBE(base_be) catch return error.KexFailed; // public
+    var e = GexMod.loadBE(exp_be) catch return error.KexFailed;
+    defer std.crypto.secureZero(u64, &e);
+    var r = m.pow(&base, &e);
+    defer std.crypto.secureZero(u64, &r);
+    var full: [gex_max_prime_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &full);
+    const n = m.byteLen();
+    m.toBytesBE(&r, full[0..n]);
+    const mag = stripLeadingZeros(full[0..n]);
+    if (mag.len > out.len) return error.KexFailed;
+    @memcpy(out[0..mag.len], mag);
+    return out[0..mag.len];
+}
+
+/// `1 < v < p - 1` for a peer value `v` (minimal magnitude) and a group
+/// prime `p` (RFC 4253 §8, which RFC 4419 §3 inherits; Go checks the same).
+pub fn gexRejectsPeerValue(p: []const u8, v: []const u8) bool {
+    if (v.len == 0 or (v.len == 1 and v[0] <= 1)) return true;
+    var pm1_buf: [gex_max_prime_len]u8 = undefined;
+    @memcpy(pm1_buf[0..p.len], p);
+    const pm1 = pm1_buf[0..p.len];
+    var i: usize = pm1.len;
+    while (i > 0) {
+        i -= 1;
+        if (pm1[i] != 0) {
+            pm1[i] -= 1;
+            break;
+        }
+        pm1[i] = 0xff;
+    }
+    return magnitudeGreaterOrEqual(v, stripLeadingZeros(pm1));
+}
+
+/// `H = SHA256(V_C || V_S || I_C || I_S || K_S || min || n || max || p || g
+/// || e || f || K)` (RFC 4419 §3), and `K`'s mpint into `res.k_enc`.
+pub fn gexFinish(
+    res: *KexResult,
+    client_id: []const u8,
+    server_id: []const u8,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    k_s: []const u8,
+    req: [3]u32,
+    p: []const u8,
+    g: []const u8,
+    e: []const u8,
+    f: []const u8,
+    k_mag: []const u8,
+) TransportError!void {
+    {
+        var kw: std.Io.Writer = .fixed(&res.k_enc);
+        messages.writeMpint(&kw, k_mag) catch return error.KexFailed;
+        res.k_enc_len = @intCast(kw.buffered().len);
+    }
+    res.hash_len = 32;
+    var sh = Sha256.init(.{});
+    hashStringH(Sha256, &sh, client_id);
+    hashStringH(Sha256, &sh, server_id);
+    hashStringH(Sha256, &sh, client_kexinit_payload);
+    hashStringH(Sha256, &sh, server_kexinit_payload);
+    hashStringH(Sha256, &sh, k_s);
+    for (req) |v| {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, v, .big);
+        sh.update(&b);
+    }
+    hashMpint(Sha256, &sh, p);
+    hashMpint(Sha256, &sh, g);
+    hashMpint(Sha256, &sh, e);
+    hashMpint(Sha256, &sh, f);
+    sh.update(res.k_enc[0..res.k_enc_len]);
+    sh.final(res.exchange_hash[0..32]);
+}
+
+/// diffie-hellman-group-exchange-sha256 client side (see the body below).
+///
+/// The result goes to `out` (never returned by value: it holds `K`); the body
+/// runs one frame down and the stack it dirtied is zeroed after it.
+pub fn dhGexKex(
+    out: *KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: CipherPair,
+    entropy: Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    policy: HostKeyPolicy,
+    negotiated_host_key_algorithm: []const u8,
+) TransportError!void {
+    return burn.run(burn.kex_gex_burn, TransportError!void, dhGexKexBody, .{ out, r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, policy, negotiated_host_key_algorithm });
+}
+
+/// RFC 4419 §3 client: GEX_REQUEST(min, n, max) → GEX_GROUP(p, g), checked
+/// (p's bit length within [min, max], p odd, 1 < g < p-1 — what Go checks; like
+/// Go and OpenSSH, p is not tested for primality) → GEX_INIT(e) →
+/// GEX_REPLY(K_S, f, sig), then the same host-key gate as every method.
+fn dhGexKexBody(
+    out: *KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: CipherPair,
+    entropy: Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    policy: HostKeyPolicy,
+    negotiated_host_key_algorithm: []const u8,
+) TransportError!void {
+    const req = [3]u32{ gex_min_bits, gex_preferred_bits, gex_max_bits };
+    {
+        var rb: [13]u8 = undefined;
+        rb[0] = msg_kex_dh_gex_request;
+        for (req, 0..) |v, i| std.mem.writeInt(u32, rb[1 + 4 * i ..][0..4], v, .big);
+        try writePacket(w, ciphers.w, entropy, &rb);
+    }
+
+    // SSH_MSG_KEX_DH_GEX_GROUP: byte || mpint p || mpint g.
+    var gbuf: [4096]u8 = undefined;
+    const gpkt = try readKexPacket(r, ciphers, &gbuf);
+    if (msgType(gpkt) != msg_kex_dh_gex_group) return error.KexFailed;
+    var gcur = SliceReader{ .b = gpkt.payload[1..] };
+    const p = stripLeadingZeros(try gcur.string());
+    const g = stripLeadingZeros(try gcur.string());
+    const pbits = magnitudeBits(p);
+    if (pbits < gex_min_bits or pbits > gex_max_bits) return error.KexFailed;
+    if (p[p.len - 1] & 1 == 0) return error.KexFailed;
+    if (gexRejectsPeerValue(p, g)) return error.KexFailed;
+    // `p`/`g` stay in `gbuf`, which no later read touches.
+    const pc = p;
+    const gc = g;
+    const m = GexMod.fromBytesBE(pc) catch return error.KexFailed;
+
+    // Secret x: one byte shorter than p (so x < p), never zero.
+    var x: [gex_max_prime_len]u8 = undefined;
+    const xb = x[0 .. pc.len - 1];
+    defer std.crypto.secureZero(u8, &x);
+    entropy.fill(xb);
+    xb[xb.len - 1] |= 1;
+
+    var ebuf: [gex_max_prime_len]u8 = undefined;
+    const e = try gexPow(&m, gc, xb, &ebuf);
+
+    // SSH_MSG_KEX_DH_GEX_INIT: byte || mpint e.
+    var ibuf: [8 + gex_max_prime_len]u8 = undefined;
+    var iw: std.Io.Writer = .fixed(&ibuf);
+    iw.writeByte(msg_kex_dh_gex_init) catch return error.KexFailed;
+    messages.writeMpint(&iw, e) catch return error.KexFailed;
+    try writePacket(w, ciphers.w, entropy, iw.buffered());
+
+    // SSH_MSG_KEX_DH_GEX_REPLY: byte || string K_S || mpint f || string sig.
+    var buf: [16384]u8 = undefined;
+    const pkt = try readKexPacket(r, ciphers, &buf);
+    if (msgType(pkt) != msg_kex_dh_gex_reply) return error.KexFailed;
+    var cur = SliceReader{ .b = pkt.payload[1..] };
+    const k_s = try cur.string();
+    const f = stripLeadingZeros(try cur.string());
+    const sig = try cur.string();
+    if (gexRejectsPeerValue(pc, f)) return error.KexFailed;
+
+    var kbuf: [gex_max_prime_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &kbuf);
+    const k_mag = try gexPow(&m, f, xb, &kbuf);
+
+    out.* = .{};
+    try gexFinish(out, client_id, server_id, client_kexinit_payload, server_kexinit_payload, k_s, req, pc, gc, e, f, k_mag);
+    try gateHostKey(policy, k_s, sig, out.hash(), negotiated_host_key_algorithm);
+    Sha256.hash(k_s, &out.host_key_digest, .{});
 }
 
 // ── post-quantum hybrid KEX (mlkem768x25519-sha256) ─────────────────────────
@@ -3245,6 +3454,8 @@ fn clientKexRoundBody(
         try curve25519Kex(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.host_key)
     else if (isEcdhNistKex(neg.kex))
         try ecdhNistKex(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.kex, neg.host_key)
+    else if (isDhGexKex(neg.kex))
+        try dhGexKex(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.host_key)
     else
         try dhGroupKex(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, policy, neg.kex, neg.host_key);
 
@@ -5097,6 +5308,39 @@ test "live interop against OpenSSH sshd — diffie-hellman-group14-sha256" {
 
 test "live interop against OpenSSH sshd — diffie-hellman-group16-sha512" {
     try liveInterop("diffie-hellman-group16-sha512", "aes256-ctr");
+}
+
+test "live interop against OpenSSH sshd — diffie-hellman-group-exchange-sha256" {
+    try liveInterop("diffie-hellman-group-exchange-sha256", "aes256-ctr");
+}
+
+test "gexPow on the run-time modulus agrees with the fixed groups' dhPowModPrime (2048 and 4096)" {
+    var prng = std.Random.DefaultPrng.init(0x6765_78);
+    const random = prng.random();
+    inline for (.{ "diffie-hellman-group14-sha256", "diffie-hellman-group16-sha512" }) |name| {
+        const p = DhGroup.forName(name).?.prime;
+        const m = try GexMod.fromBytesBE(p);
+        for (0..3) |_| {
+            var x: [512]u8 = undefined;
+            random.bytes(x[0 .. p.len - 1]);
+            var a: [512]u8 = undefined;
+            var b: [512]u8 = undefined;
+            const want = try dhPowModPrime(p, &[_]u8{2}, x[0 .. p.len - 1], &a);
+            const got = try gexPow(&m, &[_]u8{2}, x[0 .. p.len - 1], &b);
+            try std.testing.expectEqualSlices(u8, want, got);
+        }
+    }
+}
+
+test "dhGexKex (client) group checks: bit length, parity, generator range" {
+    const t = std.testing;
+    try t.expect(gexRejectsPeerValue(&[_]u8{0x0b}, &[_]u8{1}));
+    try t.expect(gexRejectsPeerValue(&[_]u8{0x0b}, &[_]u8{10})); // p-1
+    try t.expect(!gexRejectsPeerValue(&[_]u8{0x0b}, &[_]u8{2}));
+    try t.expect(gexRejectsPeerValue(&[_]u8{ 0x01, 0x00 }, &[_]u8{0xff})); // p-1 across a borrow
+    try t.expect(!gexRejectsPeerValue(&[_]u8{ 0x01, 0x00 }, &[_]u8{0xfe}));
+    try t.expectEqual(@as(usize, 2048), magnitudeBits(&([_]u8{0x80} ++ [_]u8{0} ** 255)));
+    try t.expectEqual(@as(usize, 2047), magnitudeBits(&([_]u8{0x7f} ++ [_]u8{0} ** 255)));
 }
 
 test "live interop against OpenSSH sshd — ecdh-sha2-nistp256" {

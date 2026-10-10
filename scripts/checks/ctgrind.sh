@@ -164,7 +164,7 @@ declare -A TARGETS=(
     [oscore]="derive protect unprotect"
     # 2026-10-02: the MODP DH exponent (dhPowModPrime, montint) + `ffpow`, the
     # positive control that runs the replaced std.crypto.ff pow on the same x.
-    [ssh]="dh ffpow ecdh"
+    [ssh]="dh ffpow ecdh gex"
     # `comb` (C3's fixed-base comb via `mulBase`), `ladderbase` (the pre-C3
     # window ladder over the comptime table, still reachable as
     # `mul(basePoint, s)`) and `ladder` (C4: runtime-decoded point, runtime
@@ -349,6 +349,8 @@ declare -A PATTERN=(
     [oscore/unprotect]='root[.]zig|aes_ccm[.]zig|aes[.]zig|aes_gcm[.]zig|modes[.]zig'
     [ssh/dh]='transport[.]zig|montint[.]zig|limbs[.]zig'
     [ssh/ffpow]='ff[.]zig'
+    [ssh/ecdh]='transport[.]zig'
+    [ssh/gex]='transport[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig'
     # The AEAD's own claim: the tag comparison and the cipher/MAC glue in
     # `root.zig`. Added 2026-09-02 -- the module was listed with the poly1305
     # target alone, so `SPEC.md`'s constant-time sentence about the tag
@@ -364,7 +366,6 @@ declare -A PATTERN=(
     # bn254's own hand-written Montgomery field (commit 1892c814 replaced the
     # `std.crypto.ff` backend with it). `fp.zig` carries montMul/montSqr,
     # condSubP, subLimbs, ctSelect and the `blackBox` barrier; `g1.zig` the
-    [ssh/ecdh]='transport[.]zig'
     # ladder the tainted scalar drives. `scalar.zig` is listed for the
     # scalarmul target because `Fr` IS the secret there.
     [bn254/field]='fp[.]zig'
@@ -643,6 +644,8 @@ declare -A LABEL=(
     [oscore/unprotect]='oscore+std ccm'
     [ssh/dh]='ssh MODP DH x (montint)'
     [ssh/ffpow]='ssh POSITIVE CONTROL: std ff pow on x'
+    [ssh/ecdh]='ssh NIST ECDH scalar (P-256, P-384)'
+    [ssh/gex]='ssh DH-GEX x (montint DynModint)'
     [bn254/field]='bn254 fp.zig'
     [bn254/scalarmul]='bn254 g1+fp+scalar'
     [chachapoly/poly1305]='poly1305.zig'
@@ -669,7 +672,6 @@ declare -A LABEL=(
     [montint/asmcore]='montint src'
     [montint/field]='montint Field(r) (Fr backend)'
     [montint/ffcontrol]='montint ffcontrol (std.crypto.ff, positive control)'
-    [ssh/ecdh]='ssh NIST ECDH scalar (P-256, P-384)'
     [montint/dyn]='montint DynModint (secret modulus)'
     # ── rounds 5-7, 2026-09-09 ─────────────────────────────────────────────
     [spake2plus/w0w1]='spake2plus computeW0W1+std wide-reduce'

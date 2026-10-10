@@ -10,6 +10,7 @@ as the server. No `@panic` stubs remain in this module.
 - **Part 1 — transport** (`transport.zig` client, `server.zig` server): version
   exchange, KEXINIT negotiation, `mlkem768x25519-sha256` / `curve25519-sha256`
   (RFC 8731) / `ecdh-sha2-nistp256` / `-nistp384` (RFC 5656) /
+  `diffie-hellman-group-exchange-sha256` (RFC 4419) /
   `diffie-hellman-group14-sha256` / `-group16-sha512` key
   exchange, the RFC 4253 §6 Binary Packet Protocol,
   `chacha20-poly1305@openssh.com` / `aes256-ctr`+`hmac-sha2-256` /

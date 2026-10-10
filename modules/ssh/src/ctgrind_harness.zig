@@ -4,7 +4,7 @@
 //! `group16-sha512`).
 //!
 //! Usage: ctgrind-ssh <target> <yes|no>
-//!   targets: dh | ffpow | ecdh
+//!   targets: dh | ffpow | ecdh | gex
 //!
 //! * `dh` — taints the DH secret `x` and computes `e = g^x` and `K = f^x` in
 //!   both groups through `dhPowModPrime` (montint `powMont`). Until
@@ -19,6 +19,9 @@
 //!   ephemeral scalar and runs our key-pair construction (`fromScalar`), the
 //!   shared secret against a peer point (`ecdhNistShared`, std's `mul`) and
 //!   `K`'s encoding plus the exchange hash (`ecdhNistFinish`).
+//! * `gex` — `diffie-hellman-group-exchange-sha256` client (2026-10-10): the
+//!   exponent `x` through `gexPow` on montint's run-time modulus (`DynModint`,
+//!   the server-chosen prime), for the group14 and group16 primes.
 //!
 //! `K` is printed as `ctgrind_result=` (the witness and the output pin). The
 //! one in-file context `dh` keeps is `stripLeadingZeros` on `K`: an SSH mpint
@@ -56,6 +59,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     if (std.mem.eql(u8, target, "ecdh")) {
         inline for (.{ transport.EcdhNist.p256, transport.EcdhNist.p384 }) |c| try ecdh(c, random, t);
+        return;
+    }
+
+    if (std.mem.eql(u8, target, "gex")) {
+        for (groups) |name| try gex(name, random, t);
         return;
     }
 
@@ -111,4 +119,23 @@ fn ecdh(comptime c: transport.EcdhNist, random: std.Random, t: Taint) !void {
     var res: transport.KexResult = .{};
     try transport.ecdhNistFinish(c, &res, &shared, "SSH-2.0-a", "SSH-2.0-b", "ic", "is", "ks", &kp.public, &peer);
     std.debug.print("ctgrind_result={x}\n", .{res.hash()});
+}
+
+fn gex(name: []const u8, random: std.Random, t: Taint) !void {
+    const prime = (transport.DhGroup.forName(name) orelse return error.UnknownGroup).prime;
+    const m = try transport.GexMod.fromBytesBE(prime);
+    var y: [transport.dh_max_prime_len]u8 = undefined;
+    random.bytes(y[0 .. prime.len - 1]);
+    var fbuf: [transport.gex_max_prime_len]u8 = undefined;
+    const f = try transport.gexPow(&m, &[_]u8{2}, y[0 .. prime.len - 1], &fbuf);
+    var x: [transport.dh_max_prime_len]u8 = undefined;
+    const xb = x[0 .. prime.len - 1];
+    random.bytes(xb);
+    xb[xb.len - 1] |= 1;
+    if (t == .yes) std.valgrind.memcheck.makeMemUndefined(xb);
+    var ebuf: [transport.gex_max_prime_len]u8 = undefined;
+    const e = try transport.gexPow(&m, &[_]u8{2}, xb, &ebuf);
+    var kbuf: [transport.gex_max_prime_len]u8 = undefined;
+    const k = try transport.gexPow(&m, f, xb, &kbuf);
+    std.debug.print("e_len={d} ctgrind_result={x}\n", .{ e.len, k });
 }

@@ -681,7 +681,7 @@ fn recEntropy(r: *Recorder) transport.Entropy {
     return .{ .io = .{ .userdata = r, .vtable = &rec_vtable } };
 }
 
-const Kex = enum { curve25519, mlkem, dh14, dh16, ecdh256, ecdh384 };
+const Kex = enum { curve25519, mlkem, dh14, dh16, ecdh256, ecdh384, gex };
 const Role = enum { client, server };
 
 const kx_v_c = "SSH-2.0-zig_probe_client";
@@ -703,6 +703,7 @@ fn kexName(k: Kex) []const u8 {
         .dh16 => "diffie-hellman-group16-sha512",
         .ecdh256 => "ecdh-sha2-nistp256",
         .ecdh384 => "ecdh-sha2-nistp384",
+        .gex => "diffie-hellman-group-exchange-sha256",
     };
 }
 
@@ -719,12 +720,14 @@ fn apiKex(k: Kex, role: Role, r: *std.Io.Reader, w: *std.Io.Writer, ent: transpo
             .mlkem => try transport.mlkem768x25519Kex(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, accept_any, "ssh-ed25519"),
             .dh14, .dh16 => try transport.dhGroupKex(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, accept_any, kexName(k), "ssh-ed25519"),
             .ecdh256, .ecdh384 => try transport.ecdhNistKex(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, accept_any, kexName(k), "ssh-ed25519"),
+            .gex => try transport.dhGexKex(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, accept_any, "ssh-ed25519"),
         },
         .server => switch (k) {
             .curve25519 => try server.curve25519KexServer(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, &kex_hk, gpa),
             .mlkem => try server.mlkem768x25519KexServer(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, &kex_hk, gpa),
             .dh14, .dh16 => try server.dhGroupKexServer(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, &kex_hk, gpa, kexName(k)),
             .ecdh256, .ecdh384 => try server.ecdhNistKexServer(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, &kex_hk, gpa, kexName(k)),
+            .gex => try server.dhGexKexServer(out, r, w, cp, ent, kx_i_c, kx_i_s, kx_v_c, kx_v_s, &kex_hk, gpa),
         },
     }
 }
@@ -897,6 +900,31 @@ fn kexNeedles(n: *Needles, k: Kex, role: Role, me: *const Recorder, peer: *const
             n.addBoth("dh K", kk);
             leak_src = mine[0..32].*;
         },
+        .gex => {
+            // The client asks n = 2048, so the server answers with group14.
+            // Client x: p.len - 1 bytes, low bit set; server y: p.len bytes,
+            // top bit cleared, low bit set (see the two bodies).
+            const group = transport.DhGroup.forName("diffie-hellman-group14-sha256").?;
+            const pl = group.prime.len;
+            var cx: [256]u8 = undefined;
+            @memcpy(cx[0 .. pl - 1], c.draw(0)[0 .. pl - 1]);
+            cx[pl - 2] |= 1;
+            var sy: [256]u8 = undefined;
+            @memcpy(&sy, s.draw(0)[0..pl]);
+            sy[0] &= 0x7f;
+            sy[pl - 1] |= 1;
+            const mine: []const u8 = if (role == .client) cx[0 .. pl - 1] else &sy;
+            n.addBoth("dh exponent", mine);
+            var pub_buf: [1024]u8 = undefined;
+            const peer_pub = if (role == .client)
+                try transport.dhPowModPrime(group.prime, &[_]u8{2}, &sy, &pub_buf)
+            else
+                try transport.dhPowModPrime(group.prime, &[_]u8{2}, cx[0 .. pl - 1], &pub_buf);
+            var k_buf: [1024]u8 = undefined;
+            const kk = try transport.dhPowModPrime(group.prime, peer_pub, mine, &k_buf);
+            n.addBoth("dh K", kk);
+            leak_src = mine[0..32].*;
+        },
         inline .ecdh256, .ecdh384 => |kk| {
             // One draw per side: the first candidate scalar (a rejection has
             // probability < 2^-32), from which `fromScalar` builds the pair.
@@ -944,7 +972,7 @@ test "STACKPROBE: no ephemeral secret, shared secret or traffic key on the dead 
     defer threaded.deinit();
     var bad: usize = 0;
 
-    inline for (.{ Kex.curve25519, Kex.mlkem, Kex.dh14, Kex.dh16, Kex.ecdh256, Kex.ecdh384 }) |k| {
+    inline for (.{ Kex.curve25519, Kex.mlkem, Kex.dh14, Kex.dh16, Kex.ecdh256, Kex.ecdh384, Kex.gex }) |k| {
         inline for (.{ Role.client, Role.server }) |role| {
             cur_kex = k;
             cur_role = role;

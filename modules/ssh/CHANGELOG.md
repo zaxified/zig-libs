@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — **Added:** `diffie-hellman-group-exchange-sha256` (RFC 4419), offered by default after
+  the NIST ECDH methods. Client: asks (2048, 2048, 8192) like Go, accepts a prime of 2048..8192 bits
+  (odd, 1 < g < p-1; not primality-tested, as in Go and OpenSSH) and runs the exchange on montint's
+  `DynModint(8192)` (constant-time `pow`; ctgrind target `gex`: 0 contexts in montint). Server:
+  answers from the fixed group14/group16 primes, whichever fits the request closer. `KexResult.k_enc`
+  widened to an 8192-bit `K`. Live interop against OpenSSH 10.2 in both roles; dead-stack burn sized
+  from the probe (203 KiB dirtied on the client).
 - **2026-10-10** — **Added:** `ecdsa-sha2-nistp384` host and user keys (RFC 5656): `HostKey.ecdsa_p384`
   (= `userauth.AuthKey`), OpenSSH key loading (`parseEcdsaP384OpenSSH`, plain and passphrase-protected via
   the shared container path), signing, and verification in `transport.verifySignature`; offered in

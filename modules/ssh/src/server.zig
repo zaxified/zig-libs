@@ -974,6 +974,117 @@ fn dhGroupKexServerBody(
     return res;
 }
 
+/// diffie-hellman-group-exchange-sha256 server side (see the body below).
+///
+/// The result goes to `out` (never returned by value: it holds `K`); the body
+/// runs one frame down and the stack it dirtied is zeroed after it.
+pub fn dhGexKexServer(
+    out: *transport.KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: transport.CipherPair,
+    entropy: transport.Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    host_key: *const HostKey,
+    gpa: std.mem.Allocator,
+) transport.TransportError!void {
+    return burn.run(burn.kex_gex_burn, transport.TransportError!void, dhGexKexServerBody, .{ out, r, w, ciphers, entropy, client_kexinit_payload, server_kexinit_payload, client_id, server_id, host_key, gpa });
+}
+
+/// Which of this module's fixed groups answers a GEX_REQUEST (min, n, max):
+/// the RFC 3526 group14 (2048) or group16 (4096) prime, whichever the
+/// request admits and lies closer to `n` (RFC 4419 §3: "the server should
+/// select a group that best matches the client's request"). No moduli file:
+/// like Go's server, this one offers fixed, well-known safe primes only.
+pub fn gexServerGroup(min: u32, n: u32, max: u32) ?transport.DhGroup {
+    if (min > n or n > max) return null;
+    const g14 = transport.DhGroup.forName("diffie-hellman-group14-sha256").?;
+    const g16 = transport.DhGroup.forName("diffie-hellman-group16-sha512").?;
+    const ok14 = min <= 2048 and 2048 <= max;
+    const ok16 = min <= 4096 and 4096 <= max;
+    if (ok14 and (!ok16 or n <= 3072)) return g14;
+    if (ok16) return g16;
+    return null;
+}
+
+/// RFC 4419 §3 server: GEX_REQUEST → GEX_GROUP(p, 2) → GEX_INIT(e), checked
+/// `1 < e < p-1` → GEX_REPLY(K_S, f, sig over H).
+fn dhGexKexServerBody(
+    out: *transport.KexResult,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    ciphers: transport.CipherPair,
+    entropy: transport.Entropy,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    host_key: *const HostKey,
+    gpa: std.mem.Allocator,
+) transport.TransportError!void {
+    const g = [_]u8{2};
+
+    // SSH_MSG_KEX_DH_GEX_REQUEST: byte || uint32 min || uint32 n || uint32 max.
+    var rbuf: [256]u8 = undefined;
+    const rpkt = try transport.readKexPacket(r, ciphers, &rbuf);
+    if (msgType(rpkt) != transport.msg_kex_dh_gex_request) return error.KexFailed;
+    var rcur = WireCursor{ .b = rpkt.payload[1..] };
+    const req = [3]u32{ try rcur.uint32(), try rcur.uint32(), try rcur.uint32() };
+    const group = gexServerGroup(req[0], req[1], req[2]) orelse return error.KexFailed;
+
+    // SSH_MSG_KEX_DH_GEX_GROUP: byte || mpint p || mpint g.
+    {
+        var gbuf: [16 + transport.dh_max_prime_len]u8 = undefined;
+        var gw: std.Io.Writer = .fixed(&gbuf);
+        try gw.writeByte(transport.msg_kex_dh_gex_group);
+        try messages.writeMpint(&gw, group.prime);
+        try messages.writeMpint(&gw, &g);
+        try transport.writePacket(w, ciphers.w, entropy, gw.buffered());
+    }
+
+    // SSH_MSG_KEX_DH_GEX_INIT: byte || mpint e.
+    var buf: [16384]u8 = undefined;
+    const pkt = try transport.readKexPacket(r, ciphers, &buf);
+    if (msgType(pkt) != transport.msg_kex_dh_gex_init) return error.KexFailed;
+    var cur = WireCursor{ .b = pkt.payload[1..] };
+    const e = stripLeadingZeros(try cur.string());
+    if (group.rejectsDegeneratePeerValue(e)) return error.KexFailed;
+
+    // Secret y, f = g^y, K = e^y (the fixed groups' constant-time modexp).
+    var y: [transport.dh_max_prime_len]u8 = undefined;
+    const yb = y[0..group.prime.len];
+    defer std.crypto.secureZero(u8, &y);
+    entropy.fill(yb);
+    yb[0] &= 0x7f;
+    yb[yb.len - 1] |= 1;
+    var fbuf: [transport.dh_max_prime_len]u8 = undefined;
+    const f = try transport.dhPowModPrime(group.prime, &g, yb, &fbuf);
+    var kbuf: [transport.dh_max_prime_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &kbuf);
+    const k_mag = try transport.dhPowModPrime(group.prime, e, yb, &kbuf);
+
+    const k_s = try host_key.publicBlob(gpa);
+    defer gpa.free(k_s);
+
+    out.* = .{};
+    try transport.gexFinish(out, client_id, server_id, client_kexinit_payload, server_kexinit_payload, k_s, req, group.prime, &g, e, f, k_mag);
+
+    const sig = try host_key.sign(gpa, out.hash());
+    defer gpa.free(sig);
+
+    // SSH_MSG_KEX_DH_GEX_REPLY: byte || string K_S || mpint f || string sig.
+    var obuf: [8 + transport.dh_max_prime_len + 2048]u8 = undefined;
+    var ow: std.Io.Writer = .fixed(&obuf);
+    try ow.writeByte(transport.msg_kex_dh_gex_reply);
+    try messages.writeString(&ow, k_s);
+    try messages.writeMpint(&ow, f);
+    try messages.writeString(&ow, sig);
+    try transport.writePacket(w, ciphers.w, entropy, ow.buffered());
+}
+
 /// mlkem768x25519-sha256 server side (see the body below).
 ///
 /// The result goes to `out` (never returned by value: it holds `K`); the body
@@ -1378,6 +1489,8 @@ fn serverKexRoundBody(
         try curve25519KexServer(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
     else if (transport.isEcdhNistKex(kex_name))
         try ecdhNistKexServer(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa, kex_name)
+    else if (transport.isDhGexKex(kex_name))
+        try dhGexKexServer(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
     else
         try dhGroupKexServer(&kex_result, t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa, kex_name);
 
@@ -2120,7 +2233,9 @@ const DirectKexClient = struct {
         var sw = stream.writer(io, &wbuf);
         var none: transport.CipherState = .plaintext;
         var res: transport.KexResult = .{};
-        if (transport.isEcdhNistKex(self.kex_name))
+        if (transport.isDhGexKex(self.kex_name))
+            try transport.dhGexKex(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.negotiated_host_key_algorithm)
+        else if (transport.isEcdhNistKex(self.kex_name))
             try transport.ecdhNistKex(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.kex_name, self.negotiated_host_key_algorithm)
         else
             try transport.dhGroupKex(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.kex_name, self.negotiated_host_key_algorithm);
@@ -2159,7 +2274,9 @@ fn directDhConsistency(kex_name: []const u8) !void {
     try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
     var none: transport.CipherState = .plaintext;
     var res: transport.KexResult = .{};
-    if (transport.isEcdhNistKex(kex_name))
+    if (transport.isDhGexKex(kex_name))
+        try dhGexKexServer(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, &hk, gpa)
+    else if (transport.isEcdhNistKex(kex_name))
         try ecdhNistKexServer(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, &hk, gpa, kex_name)
     else
         try dhGroupKexServer(&res, &sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, &hk, gpa, kex_name);
@@ -2181,6 +2298,20 @@ test "self-consistency (direct KEX): diffie-hellman-group14-sha256" {
 
 test "self-consistency (direct KEX): diffie-hellman-group16-sha512" {
     try directDhConsistency("diffie-hellman-group16-sha512");
+}
+
+test "self-consistency (direct KEX): diffie-hellman-group-exchange-sha256" {
+    try directDhConsistency("diffie-hellman-group-exchange-sha256");
+}
+
+test "gexServerGroup: picks the fixed group closest to n inside [min, max], or none" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 256), gexServerGroup(2048, 2048, 8192).?.prime.len);
+    try t.expectEqual(@as(usize, 256), gexServerGroup(1024, 3072, 8192).?.prime.len);
+    try t.expectEqual(@as(usize, 512), gexServerGroup(2048, 4096, 8192).?.prime.len);
+    try t.expectEqual(@as(usize, 512), gexServerGroup(3072, 3072, 8192).?.prime.len);
+    try t.expect(gexServerGroup(6144, 7680, 8192) == null);
+    try t.expect(gexServerGroup(4096, 2048, 8192) == null); // min > n
 }
 
 test "self-consistency (direct KEX): ecdh-sha2-nistp256" {
@@ -2670,6 +2801,10 @@ test "live interop: OpenSSH ssh client → our server — diffie-hellman-group16
 
 test "live interop: OpenSSH ssh client → our server — ecdsa-sha2-nistp384 host key" {
     try liveOpensshClient("ecdsa384", "ecdsa-sha2-nistp384", "ecdh-sha2-nistp384", "aes256-gcm@openssh.com");
+}
+
+test "live interop: OpenSSH ssh client → our server — diffie-hellman-group-exchange-sha256" {
+    try liveOpensshClient("ed25519", "ssh-ed25519", "diffie-hellman-group-exchange-sha256", "aes256-ctr");
 }
 
 test "live interop: OpenSSH ssh client → our server — ecdh-sha2-nistp256" {

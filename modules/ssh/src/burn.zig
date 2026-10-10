@@ -56,6 +56,11 @@ pub const kex_x25519_burn = 64 * 1024;
 /// scalar or `K` residue under it in ReleaseFast (2026-10-10), the depth
 /// itself not yet measured.
 pub const kex_ecdh_burn = 96 * 1024;
+/// `dhGexKex` / `dhGexKexServer`: the client's 8192-bit run-time modulus
+/// (`DynModint`, 1 KiB elements) dirtied 203 KiB in ReleaseFast on a
+/// group14 exchange (`stackprobe_test.zig`, 2026-10-10: at 192 KiB, `K` was
+/// found 198 KiB down).
+pub const kex_gex_burn = 256 * 1024;
 pub const kex_dh_burn = 128 * 1024;
 pub const kex_mlkem_burn = 192 * 1024;
 
