@@ -1,0 +1,207 @@
+# `p521` — specification
+
+## Maturity
+
+**Grade:** *(written by `zig build gen-catalog` — never by hand)*
+
+**Scope:** unsurveyed
+
+**Audit:** review none · mutation none · src ?
+
+**Hardening:** fuzz 2026-10-10 (200,000 runs clean, P521_FUZZ, every reach label hit) · ct 2026-10-10 (ctgrind mul/keygen/sign/ecdh: secret tainted, 0 in-file; positive control `vartime` flags)
+
+**Performance:** ref 2.17× OpenSSL 3.5.5 ecp_nistp521 · fastest 2.17× OpenSSL 3.5.5 (measured 2026-10-10)
+
+**Known defects:** none recorded
+
+**Downstream consumer:** no
+
+## What this module is, and what it is not
+
+NIST P-521 (secp521r1): the base field, the scalar field, the group, ECDH and
+ECDSA-P521 with RFC 6979 nonces. Zig 0.16's std ships P-256 and P-384 only, so
+every P-521 feature in this collection — ssh `ecdh-sha2-nistp521` and
+`ecdsa-sha2-nistp521`, jwt `ES512`, x509 P-521 certificates, hpke
+DHKEM(P-521, HKDF-SHA512), acme — was refused for lack of a curve. This module
+is that curve, with std's API shape so the consumers swap a type.
+
+**Not here (phase 1):** wiring into those consumers (phase 2, *Open*); a
+precomputed base-point table (*Backlog*); asm; hash-to-curve (RFC 9380
+P521_XMD:SHA-512_SSWU, needed by voprf's P521 suite); PKCS#8/SPKI key codecs
+(the consumers own their ASN.1); point compression on the ECDH *output*
+(ECDH returns the x-coordinate only, as SEC 1 specifies).
+
+## Algorithm
+
+**Curve** — SP 800-186 §3.2.1.5 / FIPS 186-5: p = 2^521 − 1, y² = x³ − 3x + b,
+G and n as published (checked against `openssl ecparam -name secp521r1
+-param_enc explicit` and by test: G on the curve, n·G = O, (n−1)·G = −G).
+
+**Field** (`field.zig`) — nine limbs, 8 × 58 bits + 57 bits, unsaturated.
+2^521 ≡ 1, so in a product a term at position i + j ≥ 9 folds to i + j − 9
+with factor 2 (2^522 ≡ 2), and the carry out of the top limb's bit 57 re-enters
+limb 0. `mul` is a 9 × 9 schoolbook with u128 columns (the folded operand
+pre-doubled), `sq` the symmetric half with doubled/quadrupled operands; both
+end in one carry chain. `add`/`sub` carry before returning (`sub` adds 4p
+first), so every result is "tight" (limb 1 < 2^58 + 2^9, top < 2^57, the rest
+< 2^58). `mul`/`sq` accept limbs < 2^61; the column bound is 9 · 2^61 · 2^62
+< 2^126.2. Canonical form (encode/compare only): two carry passes bring the
+value into [0, p], then a masked "+1 overflows bit 521" test maps p to 0.
+Inversion: a^(p−2) by a fixed addition chain (x2, x3, x4, x7, x8, …, x512,
+x519, then ·2² ·a). Square root: a^((p+1)/4) = a^(2^519), checked by squaring.
+
+Hand-written from the definition (owner decision 2026-10-10: Mersenne,
+clean-room, no vendored fiat-crypto); held by a wide-integer differential and a
+worst-case-limb test (*Anchoring*).
+
+**Scalars** (`scalar.zig`) — n has no special form: Montgomery, nine 64-bit
+limbs, R = 2^576, CIOS with one masked final subtraction (valid for a < R,
+b < n, so `fromBytesReduce` reduces any 528-bit string with one multiply by
+R² mod n). Constants (R mod n, R² mod n, −n⁻¹ mod 2^64) are computed at
+comptime. Inversion: Fermat with a 4-bit window over the public exponent.
+
+**Group** (`group.zig`) — projective (X:Y:Z), Renes–Costello–Batina 2016
+complete formulas for a = −3 (eprint 2015/1060, Algorithms 4, 5, 6). Secret
+scalar: 132 unsigned 4-bit windows from the top, `Q = 16·Q + T[w]` with
+T = 0·P … 15·P and `T[w]` read by a masked scan of all 16 entries. Public
+scalars (verification): signed 4-bit windows in [−8, 8], Straus interleave for
+`mulDoubleBasePublic`, variable time. SEC1 decode accepts `04‖X‖Y`, `02/03‖X`
+and std's `00` identity encoding; coordinates must be < p and on the curve
+(cofactor 1: on the curve = in the group). Key decoders above it refuse the
+identity.
+
+**ECDH** — SP 800-56A §5.7.1.2: x-coordinate of d·Q, 66 bytes big-endian. d in
+[1, n−1] (`NonCanonical` above, `IdentityElement` for 0); Q validated as above.
+Compressed and uncompressed peers are both accepted (owner decision
+2026-10-10: consumers that must restrict the encoding check the prefix).
+
+**ECDSA** (`sign.zig`) — FIPS 186-5 §6.4. e = bits2int(H(m)) mod n (digest ≤
+65 bytes, so no truncation). Nonces: RFC 6979 §3.2 with HMAC-H, qlen = 521,
+rlen = 528: k = T[0..66] >> 7 (bits2int), retried while k ∉ [1, n−1]; with
+`noise`, §3.6's additional data appended to both K updates. r = 0 or s = 0
+draws the next nonce (§3.4). `generateDeterministic(seed)`: the same DRBG with
+x = 0x01⁶⁶, h = 0⁶⁶ and the seed as additional data (std's derivation shape).
+DER: `SEQUENCE` length short below 128 and `0x81 L` from 128 (P-521
+signatures reach 139 bytes); INTEGERs minimal (a leading 0x00 only as the sign
+byte), non-negative, at most 66 magnitude bytes; nothing trailing.
+
+Differences from std's `Ecdsa`, deliberate: RFC 6979 nonces exactly (std mixes
+noise in another way, so std-style P-384 signatures and ours are not
+comparable anyway); `fromSecretKey` refuses d ≥ n; `PublicKey.fromSec1`
+refuses the identity; strict DER; `KeyPair` methods by `*const`; `*Into`
+twins.
+
+## Constant-time contract
+
+**Secret:** the ECDH secret, the ECDSA secret key and seed, the nonce k, k⁻¹,
+and every intermediate of those computations.
+
+**Claimed constant time (machine-checked, `scripts/checks/ctgrind.sh p521`,
+rows in `scripts/checks/ctgrind-expected.tsv`):** `P521.mulInto` (`mul`),
+`KeyPair.fromSecretKeyInto` (`keygen`), `generateDeterministicInto` +
+`signPrehashedInto` (`sign`, std's HMAC-SHA-512 counted as ours), `ecdhInto`
+(`ecdh`): 0 in-file contexts, ReleaseFast, CPU skylake. The positive control
+`vartime` (a tainted scalar into `mulPublic`) reports 5 in-file — the harness
+does see this module.
+
+**Declassified, not absent** (`ct.zig`; each a value the API reveals):
+
+1. the range verdict on a secret scalar (`Scalar.fromBytes`, ECDH and
+   `checkSecret`): the error says it;
+2. "is the product the identity" (`mulInto`, `ecdhInto`): the error says it;
+   for d in [1, n−1] and a valid point it cannot happen;
+3. r = 0 / s = 0 and the published r, s themselves (`signWithNonce`);
+4. the RFC 6979 retry bit (`Drbg.candidate`): a candidate ≥ n, probability
+   < 2^−259 per signature; a retry is visible only as one extra HMAC round.
+
+**Deliberately not constant time:** `mulPublic`, `mulDoubleBasePublic` and
+`verify` (public inputs only); `Fe.fromBytes`/`fromSec1` (branch once on the
+canonical/on-curve verdict of a public encoding); `Fe.sqrt` (decompression of
+a public point).
+
+**Dead stack** (CONVENTIONS.md §2.1.1): every secret entry point runs under
+`burn.run` (`mul_burn` 16 KiB, `sign_burn` 24 KiB); `stackprobe_test.zig`
+(testkit) probes generate/fromSecretKey/sign/ecdh/mul in ReleaseFast: no
+residue below the burns, no secret needle above them.
+`scripts/checks/check-secret-api.py --modules=p521`: 0 findings (std-shaped
+by-value forms carry `secret-api-ok` with the `*Into` twin named).
+
+## Limits and refusals
+
+- Scalars and coordinates: exactly 66 bytes; coordinates < p, ECDH/ECDSA
+  secrets in [1, n−1].
+- ECDSA hash: digest ≤ 65 bytes (comptime assert).
+- DER signature ≤ 139 bytes (`der_encoded_length_max`), `fromDer` refuses
+  anything else (BER, long-form length below 128, `0x82…` lengths).
+- P1363 signature: exactly 132 bytes (the type).
+
+## Anchoring
+
+- **External anchor:** NIST CAVP 186-4 ECDSA P-521 — SigVer 75 rows (SHA-1/
+  224/256/384/512, 15 valid), SigGen 60 rows (r, s for the given k, and Q from
+  d), KeyPair 10, PKV 12 (4 valid); ECC CDH primitive P-521, 25 rows.
+  Wycheproof secp521r1: ECDSA/SHA-512 DER 542 rows (232 valid; every valid
+  signature also re-encodes to the same DER bytes), P1363 304 rows, ECDH 669
+  rows (shared secret byte-exact on every accepted row). RFC 6979 A.2.7
+  (SHA-512, "sample" and "test"). Every count is asserted (`kat_test.zig`).
+  Recipe with pinned sha256 sums: `tools/gen_vectors.py`.
+- **External anchor (frozen oracle):** OpenSSL 3.5.5, 24 keys
+  (`tools/openssl_oracle.py` → `src/oracle_vectors.zig`): our public key in
+  both SEC1 forms, our RFC 6979 signature byte-identical to OpenSSL's
+  `nonce-type:1`, OpenSSL's random-nonce signature verified (and refused on a
+  changed message), ECDH equal to `pkeyutl -derive`.
+- **Re-derived:** field and scalar arithmetic against Zig's wide integers
+  (`u1100`/`u1200`) on edge values and 3000/1500 random pairs; worst-case limb
+  inputs through `mul`/`sq`/`add`/`sub`/`mulSmall` chains (overflow panics in
+  Debug/ReleaseSafe, values checked in every mode).
+- **Fuzz** (`fuzz_test.zig`, testkit driver, `P521_FUZZ`): genuine signatures
+  verify (raw and DER round trip), one flipped bit in message, r‖s or the
+  public key is refused, ECDH symmetric with compressed and uncompressed
+  peers, constant-time = vartime multiply, (a+b)·G = a·G + b·G, null-noise
+  signing deterministic, noisy signing different and valid.
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+## Performance
+
+ReleaseFast, Intel i7-7920HQ (Kaby Lake), best of 5 × 200, `P521_BENCH=1`
+(`bench.zig`), against `openssl speed -seconds 2 ecdsap521 ecdhp521` on the
+same host, 2026-10-10:
+
+| op | p521 | OpenSSL 3.5.5 | ratio |
+|---|--:|--:|--:|
+| keygen | 615 µs | — | — |
+| ECDH | 637 µs | 404 µs | 1.58× |
+| sign | 741 µs | 342 µs | 2.17× |
+| verify | 849 µs | 646 µs | 1.31× |
+
+Under the owner's 2.5× bar for phase 1 (2026-10-10), so the base-point table
+stays in the backlog.
+
+## What is deliberately not done
+
+- **No vendored fiat-crypto** (owner, 2026-10-10): hand-written Mersenne
+  arithmetic, held by the differential and the bound test.
+- **No precomputed base table in phase 1** (owner, 2026-10-10): one
+  constant-time variable-base path for every secret. Not never — *Backlog*.
+- **No ECDH object**: a function `ecdh`/`ecdhInto` next to `P521.mul`, as std
+  has no ECDH type for its NIST curves either (owner, 2026-10-10).
+
+## Backlog / deferred
+
+- **Fixed-base comb for k·G / d·G** — sign is 2.17× OpenSSL, keygen ~615 µs;
+  a comptime affine comb (as `p256`) would roughly halve both. Fits §2.
+- **Faster scalar inversion** — Fermat costs ~650 Montgomery products per
+  signature; a constant-time safegcd (`p256/src/modinv.zig`'s shape) or
+  blinding would remove most of it.
+- **amd64 MULX/ADX field multiply** — the portable u128 schoolbook only.
+- **Hash-to-curve (RFC 9380 P521_XMD:SHA-512_SSWU_RO_)** — for voprf's
+  P521-SHA512 suite.
+
+## Open
+
+- Phase 2, consumer wiring (not done here): ssh (`ecdh-sha2-nistp521`,
+  `ecdsa-sha2-nistp521` host keys and user auth), jwt (`ES512` verify and
+  sign), x509 (P-521 SPKI + `ecdsa-with-SHA512`), hpke (DHKEM(P-521,
+  HKDF-SHA512), RFC 9180 A.6 vectors), acme (P-521 account keys).
+- No security review, no mutation run yet.

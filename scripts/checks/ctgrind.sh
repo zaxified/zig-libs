@@ -311,6 +311,8 @@ declare -A TARGETS=(
     # ── 2026-10-10: ct-wave: SNMPv3 USM password, auth + priv keys ──
     [snmp]="kdf auth aes des"
     [aes192]="enc dec"
+    # ── 2026-10-10: p521 (NIST P-521): mul/keygen/sign/ecdh claims + the vartime positive control ──
+    [p521]="mul keygen sign ecdh vartime"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -388,6 +390,7 @@ declare -A MODES=(
     [dnp3]="ReleaseFast"
     [snmp]="ReleaseFast"
     [aes192]="ReleaseFast"
+    [p521]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -698,6 +701,14 @@ declare -A PATTERN=(
     # whichever backend the build's CPU selects (skylake here: aesni.zig).
     [aes192/enc]='root[.]zig|burn[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig|armcrypto[.]zig|modes[.]zig'
     [aes192/dec]='root[.]zig|burn[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig|armcrypto[.]zig'
+    # p521 (2026-10-10): the module's own files, plus std's HMAC/SHA-2 for the
+    # RFC 6979 DRBG on the sign path -- that HMAC is this module's nonce
+    # derivation, so its contexts are this module's.
+    [p521/mul]='field[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
+    [p521/keygen]='field[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig'
+    [p521/sign]='field[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig|hmac[.]zig|sha2[.]zig'
+    [p521/ecdh]='field[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
+    [p521/vartime]='field[.]zig|scalar[.]zig|group[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 # WITNESS_CHAIN — the files a witness's stack may consist of BETWEEN the
@@ -914,6 +925,11 @@ declare -A LABEL=(
     [snmp/des]='snmp DES-CBC priv round trip (key+PDU tainted)'
     [aes192/enc]='aes192 init/encrypt/wide/xor/modes.ctr (key+plaintext tainted)'
     [aes192/dec]='aes192 initDec/initFromEnc/decrypt/wide (key+ciphertext tainted)'
+    [p521/mul]='p521 mulInto, non-base point (scalar tainted)'
+    [p521/keygen]='p521 KeyPair.fromSecretKeyInto (d tainted)'
+    [p521/sign]='p521 generateDeterministicInto+signPrehashedInto (seed tainted)'
+    [p521/ecdh]='p521 ecdhInto (secret tainted)'
+    [p521/vartime]='p521 mulPublic POSITIVE CONTROL (scalar tainted, must flag)'
 )
 
 # ── measurement ────────────────────────────────────────────────────────────

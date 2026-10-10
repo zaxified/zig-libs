@@ -1287,3 +1287,15 @@ snmp	ReleaseFast	des	1	256	c58a69cb557ea3a6	f7e7b8e6152d7073
 # posture there; see modules/aes192/SPEC.md.
 aes192	ReleaseFast	enc	1	0	62fecebc952f315c	2b73cb024e51118c
 aes192	ReleaseFast	dec	1	0	62fecebc952f315c	68602ef849690825
+# p521 (2026-10-10) — NIST P-521, new module. mul / keygen / sign / ecdh: the
+# secret (scalar, d, seed, ECDH secret) tainted end to end: 0 in-file on all
+# four. The branches the API reveals (range and identity verdicts, r = 0 /
+# s = 0, the RFC 6979 retry bit) are declassified in `ct.zig` and listed in
+# modules/p521/SPEC.md § Constant-time contract. `vartime` is the POSITIVE
+# CONTROL: a tainted scalar into the documented-vartime `mulPublic` must flag
+# (5 in-file when pinned: the signed-digit branches in group.zig).
+p521	ReleaseFast	mul	1	0	a4f3de9d5ffd5439	2abbc6503ea1b2c2
+p521	ReleaseFast	keygen	1	0	0720081fe63c8187	b44de7eb8b02a855
+p521	ReleaseFast	sign	1	0	0720081fe63c8187	b620c1c667ef0084
+p521	ReleaseFast	ecdh	1	0	a4f3de9d5ffd5439	a348bd01a2bccfcc
+p521	ReleaseFast	vartime	1	>=1	fabac2d6affba398	9ceab2dc760cdabd
