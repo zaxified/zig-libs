@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — tests: seeded model-fuzz comparing random configs and requests against a naive probe/body/call-count reference model. No API or behaviour change.
+
 - **2026-10-04** — **Tests:** mutation run (12 schemata mutants, 11 killed, 1 equivalent; one new
   test pins the 512-byte detail budget edge, the truncation marker and `no-store` on a 503).
   No code change.

@@ -520,3 +520,187 @@ test "readiness: detail=false keeps the status but not the dependency names" {
     const ok = runWire(&r, wire("/readyz"), &buf);
     try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
 }
+
+// ── model-fuzz: seeded random configs/requests vs. a naive reference model ──
+//
+// The model restates the documented contract (module doc + SPEC "Design &
+// invariants"): liveness is always 200; readiness is 200 iff every check
+// passes, else 503 with one "not ready: <name>" line per failing check in
+// registration order, capped at a 512-byte budget with a "not ready: ..."
+// marker, or just "not ready" when `detail` is off; each check runs exactly
+// once per readiness probe and never otherwise; only GET/HEAD on the two exact
+// paths are probes, everything else passes through to the app.
+
+const FuzzCheck = struct {
+    ok: bool = true,
+    calls: u32 = 0,
+};
+
+fn fuzzCheckFn(ctx: ?*anyopaque) bool {
+    const st: *FuzzCheck = @ptrCast(@alignCast(ctx.?));
+    st.calls += 1;
+    return st.ok;
+}
+
+test "model-fuzz: probes, pass-through, detail budget and call counts vs. a naive model" {
+    const seed: u64 = 0x6865616c74683031;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+
+    const path_pool = [_][]const u8{ "/healthz", "/readyz", "/alive", "/ready", "/healthz/", "/readyz2", "/", "/x" };
+    const methods = [_][]const u8{ "GET", "HEAD", "POST" };
+    const name_chars = "abcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    var reach_live: usize = 0;
+    var reach_ready_ok: usize = 0;
+    var reach_ready_503_detail: usize = 0;
+    var reach_ready_503_nodetail: usize = 0;
+    var reach_marker: usize = 0;
+    var reach_skip_then_fit: usize = 0;
+    var reach_passthrough: usize = 0;
+    var reach_non_probe_method: usize = 0;
+    var reach_head: usize = 0;
+    var reach_custom_paths: usize = 0;
+    var reach_exact_fill: usize = 0;
+
+    var step: usize = 0;
+    while (step < 1200) : (step += 1) {
+        errdefer std.debug.print("health model-fuzz mismatch: seed=0x{x} step={d}\n", .{ seed, step });
+
+        // Config.
+        const custom = rnd.boolean();
+        const live_path: []const u8 = if (custom) "/alive" else "/healthz";
+        const ready_path: []const u8 = if (custom) "/ready" else "/readyz";
+        const detail = rnd.uintLessThan(u8, 3) != 0;
+
+        var states: [8]FuzzCheck = @splat(.{});
+        var checks: [8]Check = undefined;
+        var name_store: [8][320]u8 = undefined;
+        // A "heavy" step has long early names and short late ones, so the
+        // 512-byte budget overflows and a later short name may still fit.
+        const heavy = rnd.uintLessThan(u8, 3) == 0;
+        const n_checks = if (heavy) 5 + rnd.uintLessThan(usize, 4) else rnd.uintLessThan(usize, 9);
+        const fail_bias = if (heavy) 3 else rnd.uintLessThan(u8, 4);
+        for (0..n_checks) |i| {
+            // Name lengths: short mostly, sometimes budget-sized.
+            const nlen: usize = if (heavy)
+                (if (i < 3) 120 + rnd.uintLessThan(usize, 180) else 1 + rnd.uintLessThan(usize, 20))
+            else switch (rnd.uintLessThan(u8, 6)) {
+                0 => 150 + rnd.uintLessThan(usize, 170),
+                1 => 1,
+                else => 1 + rnd.uintLessThan(usize, 20),
+            };
+            for (name_store[i][0..nlen]) |*c| c.* = name_chars[rnd.uintLessThan(usize, name_chars.len)];
+            states[i].ok = rnd.uintLessThan(u8, 4) >= fail_bias; // fail_bias 3 => nearly all fail
+            checks[i] = .{ .name = name_store[i][0..nlen], .checkFn = fuzzCheckFn, .ctx = &states[i] };
+        }
+        // Sometimes two failing names that sum to the budget -1/0/+1 bytes, to
+        // probe the exact edge (512 = 2 * 12 + len0 + len1).
+        if (heavy and rnd.uintLessThan(u8, 4) != 0) {
+            const l0 = 200 + rnd.uintLessThan(usize, 50);
+            const l1 = 512 - 24 - l0 + rnd.uintLessThan(usize, 3) - 1;
+            for (0..2) |i| {
+                const l = if (i == 0) l0 else l1;
+                for (name_store[i][0..l]) |*c| c.* = name_chars[rnd.uintLessThan(usize, name_chars.len)];
+                checks[i].name = name_store[i][0..l];
+                states[i].ok = false;
+            }
+        }
+        var h = Health{ .checks = checks[0..n_checks], .live_path = live_path, .ready_path = ready_path, .detail = detail };
+
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(h.middleware());
+        for (path_pool) |p| {
+            try r.get(p, hApp);
+            try r.post(p, hApp);
+        }
+
+        // Request.
+        const path = path_pool[rnd.uintLessThan(usize, path_pool.len)];
+        const method = methods[rnd.uintLessThan(usize, methods.len)];
+        var req_buf: [256]u8 = undefined;
+        const req = std.fmt.bufPrint(&req_buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ method, path }) catch unreachable;
+        var out: [4096]u8 = undefined;
+        const got = runWireWide(&r, req, &out);
+        const body = bodyOf(got);
+
+        // Model.
+        const is_get_head = std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD");
+        const is_head = std.mem.eql(u8, method, "HEAD");
+        const on_live = std.mem.eql(u8, path, live_path);
+        const on_ready = std.mem.eql(u8, path, ready_path);
+
+        if (is_get_head and on_live) {
+            reach_live += 1;
+            if (is_head) reach_head += 1;
+            if (custom) reach_custom_paths += 1;
+            try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+            try testing.expect(std.mem.indexOf(u8, got, "Cache-Control: no-store") != null);
+            if (!is_head) try testing.expectEqualStrings("OK\n", body);
+            for (states[0..n_checks]) |s| try testing.expectEqual(@as(u32, 0), s.calls);
+        } else if (is_get_head and on_ready) {
+            if (custom) reach_custom_paths += 1;
+            if (is_head) reach_head += 1;
+            var want_body: [600]u8 = undefined;
+            var wl: usize = 0;
+            var any_fail = false;
+            var used: usize = 0;
+            var trunc = false;
+            var skipped_earlier = false;
+            for (states[0..n_checks], 0..) |s, i| {
+                if (s.ok) continue;
+                any_fail = true;
+                const name = checks[i].name;
+                const line = 11 + name.len + 1;
+                if (used + line > 512) {
+                    trunc = true;
+                    skipped_earlier = true;
+                } else {
+                    if (skipped_earlier) reach_skip_then_fit += 1;
+                    used += line;
+                    wl += (std.fmt.bufPrint(want_body[wl..], "not ready: {s}\n", .{name}) catch unreachable).len;
+                }
+            }
+            if (!any_fail) {
+                reach_ready_ok += 1;
+                try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+                if (!is_head) try testing.expectEqualStrings("OK\n", body);
+            } else {
+                try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 503"));
+                if (detail) {
+                    reach_ready_503_detail += 1;
+                    if (used == 512) reach_exact_fill += 1;
+                    if (trunc) {
+                        reach_marker += 1;
+                        wl += (std.fmt.bufPrint(want_body[wl..], "not ready: ...\n", .{}) catch unreachable).len;
+                    }
+                    if (!is_head) try testing.expectEqualStrings(want_body[0..wl], body);
+                } else {
+                    reach_ready_503_nodetail += 1;
+                    if (!is_head) try testing.expectEqualStrings("not ready\n", body);
+                }
+            }
+            try testing.expect(std.mem.indexOf(u8, got, "Cache-Control: no-store") != null);
+            for (states[0..n_checks]) |s| try testing.expectEqual(@as(u32, 1), s.calls);
+        } else {
+            reach_passthrough += 1;
+            if (!is_get_head and (on_live or on_ready)) reach_non_probe_method += 1;
+            if (!is_head) {
+                try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+                try testing.expectEqualStrings("app", body);
+            }
+            try testing.expect(std.mem.indexOf(u8, got, "Cache-Control: no-store") == null);
+            for (states[0..n_checks]) |s| try testing.expectEqual(@as(u32, 0), s.calls);
+        }
+
+        // The router-free entry points agree with the wire for every request.
+        const probe = h.probeFor(if (is_head) .head else if (is_get_head) .get else .post, path);
+        const want_probe: ?Probe = if (is_get_head and on_live) .live else if (is_get_head and on_ready) .ready else null;
+        try testing.expectEqual(want_probe, probe);
+    }
+    try testing.expect(reach_live > 0 and reach_ready_ok > 0 and reach_ready_503_detail > 0);
+    try testing.expect(reach_ready_503_nodetail > 0 and reach_marker > 0 and reach_skip_then_fit > 0);
+    try testing.expect(reach_passthrough > 0 and reach_non_probe_method > 0 and reach_head > 0);
+    try testing.expect(reach_custom_paths > 0 and reach_exact_fill > 0);
+}
