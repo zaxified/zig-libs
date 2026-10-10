@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — tests: model-based differential — random connect-outcome scripts through `probeTarget`/`probeMany` against a naive model of samples and statistics; reach on every outcome class; two negative controls red, one of which (RTT kept on an app-check downgrade) no earlier test caught. No API or behaviour change.
+
 - **2026-10-04** — Internal: `PosixConnector`'s per-address verdict logic extracted into
   `VerdictFold` (private) so its multi-address rules can be tested without a resolver; the
   verdict for every sequence of per-address outcomes is unchanged. **Tests:** one sequence per

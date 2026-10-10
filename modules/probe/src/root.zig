@@ -2116,3 +2116,181 @@ test "a non-up outcome may carry neither errno nor err_name" {
     try testing.expect(o.errno == null);
     try testing.expect(o.err_name == null);
 }
+
+// ── model-based differential: probeTarget / probeMany vs a naive model ─────
+//
+// Seeded random scripts of connect outcomes per target (up with an RTT, up
+// with NO RTT — a broken connector —, refused, timeout, canceled, error), a
+// random app check, count (incl. 0 and past `max_repetitions` via the clamp
+// on smaller values) and concurrency. `ProbeModel` restates the documented
+// rules on its own: each repetition takes the target's next outcome; an `up`
+// rejected by the app check is `error` with no RTT; the RTT survives only on
+// `up`; cancelled repetitions are left out of the statistics entirely; an
+// `up` without an RTT is a loss; min/max/mean/population stddev over the
+// RTTs (two-pass, not Welford) and RFC 3550 §6.4.1 jitter over consecutive
+// received RTTs.
+
+const ProbeModel = struct {
+    fn sample(o: ConnectOutcome, app_ok: bool) Result {
+        if (o.status == .up) {
+            if (!app_ok) return .{ .kind = .@"error" };
+            return .{ .kind = .up, .rtt_ns = o.rtt_ns };
+        }
+        return .{ .kind = o.status, .errno = o.errno, .err_name = o.err_name };
+    }
+
+    fn check(samples: []const Result, stats: latency.Stats) !void {
+        var sent: u64 = 0;
+        var rtts: [64]u64 = undefined;
+        var n: usize = 0;
+        for (samples) |s| switch (s.kind) {
+            .canceled => {},
+            .up => {
+                sent += 1;
+                if (s.rtt_ns) |r| {
+                    rtts[n] = r;
+                    n += 1;
+                }
+            },
+            else => sent += 1,
+        };
+        try testing.expectEqual(sent, stats.sent);
+        try testing.expectEqual(@as(u64, n), stats.received);
+        if (n == 0) {
+            try testing.expectEqual(@as(u64, 0), stats.min_ns);
+            try testing.expectEqual(@as(u64, 0), stats.max_ns);
+            try testing.expectEqual(@as(f64, 0), stats.mean_ns);
+            return;
+        }
+        var lo: u64 = std.math.maxInt(u64);
+        var hi: u64 = 0;
+        var sum: f64 = 0;
+        for (rtts[0..n]) |r| {
+            lo = @min(lo, r);
+            hi = @max(hi, r);
+            sum += @floatFromInt(r);
+        }
+        const mean = sum / @as(f64, @floatFromInt(n));
+        var sq: f64 = 0;
+        for (rtts[0..n]) |r| sq += (@as(f64, @floatFromInt(r)) - mean) * (@as(f64, @floatFromInt(r)) - mean);
+        const stddev = @sqrt(sq / @as(f64, @floatFromInt(n)));
+        var jitter: f64 = 0;
+        for (1..n) |i| {
+            const d = @abs(@as(f64, @floatFromInt(rtts[i])) - @as(f64, @floatFromInt(rtts[i - 1])));
+            jitter += (d - jitter) / 16.0;
+        }
+        try testing.expectEqual(lo, stats.min_ns);
+        try testing.expectEqual(hi, stats.max_ns);
+        try testing.expectApproxEqRel(mean, stats.mean_ns, 1e-9);
+        try testing.expectApproxEqAbs(stddev, stats.stddev_ns, 1e-6 * @max(1.0, stddev));
+        try testing.expectApproxEqAbs(jitter, stats.jitter_ns, 1e-6 * @max(1.0, jitter));
+        const loss = @as(f64, @floatFromInt(sent - n)) / @as(f64, @floatFromInt(sent)) * 100.0;
+        try testing.expectApproxEqRel(loss, stats.lossPct(), 1e-12);
+    }
+};
+
+const ProbeReach = enum { up, up_no_rtt, refused, timeout, canceled, err, app_rejected, all_canceled, unreachable_host, many };
+
+const AppRejectOdd = struct {
+    fn check(_: *anyopaque, target: Target) bool {
+        return target.port % 2 == 0;
+    }
+};
+
+test "model: probeTarget and probeMany agree with a naive model on random outcome scripts" {
+    var reach = [_]usize{0} ** @typeInfo(ProbeReach).@"enum".fields.len;
+    var dummy: u8 = 0;
+    const seeds = if (@import("builtin").mode == .Debug) 80 else 300;
+    for (0..seeds) |case_seed| {
+        errdefer std.debug.print("probe model: seed={d}\n", .{case_seed});
+        var prng = std.Random.DefaultPrng.init(case_seed);
+        const rnd = prng.random();
+        const n_targets = 1 + rnd.uintLessThan(usize, 12);
+        const count: u16 = switch (rnd.uintLessThan(u8, 8)) {
+            0 => 0, // clamps to 1
+            1 => 1,
+            else => 1 + rnd.uintLessThan(u16, 40),
+        };
+        const eff: usize = @max(1, count);
+        const use_app = rnd.uintLessThan(u8, 3) == 0;
+        const errnos = [_]i32{ 110, 111, 113, 101 };
+        const names = [_][]const u8{ "ConnectionRefused", "Timeout", "NetworkUnreachable" };
+
+        var hosts: [12][8]u8 = undefined;
+        var outcomes: [12][40]ConnectOutcome = undefined;
+        var scripts: [12]FakeConnector.Script = undefined;
+        var targets: [12]Target = undefined;
+        for (0..n_targets) |t| {
+            const host = std.fmt.bufPrint(&hosts[t], "h{d}", .{t}) catch unreachable;
+            const mode = rnd.uintLessThan(u8, 6); // per-target bias: some all-down, some all-canceled
+            for (0..eff) |i| {
+                const pick: u8 = switch (mode) {
+                    0 => 4, // all canceled
+                    1 => 2 + rnd.uintLessThan(u8, 2), // never up
+                    else => rnd.uintLessThan(u8, 7),
+                };
+                outcomes[t][i] = switch (pick) {
+                    0, 6 => .{ .status = .up, .rtt_ns = 1 + rnd.uintLessThan(u64, 5_000_000) },
+                    1 => .{ .status = .up, .rtt_ns = if (rnd.uintLessThan(u8, 4) == 0) null else rnd.uintLessThan(u64, 3) },
+                    2 => .{ .status = .refused, .errno = errnos[rnd.uintLessThan(usize, errnos.len)] },
+                    3 => .{ .status = .timeout, .err_name = names[rnd.uintLessThan(usize, names.len)] },
+                    4 => .{ .status = .canceled },
+                    else => .{ .status = .@"error", .errno = errnos[rnd.uintLessThan(usize, errnos.len)] },
+                };
+            }
+            scripts[t] = .{ .host = host, .outcomes = outcomes[t][0..eff] };
+            targets[t] = .{ .host = host, .port = @intCast(t) };
+        }
+
+        var fake: FakeConnector = .{ .scripts = scripts[0..n_targets], .spins = 0 };
+        const opts: Options = .{
+            .connector = fake.connector(),
+            .count = count,
+            .max_concurrent = rnd.uintLessThan(u32, 6),
+            .app_check = if (use_app) .{ .ctx = &dummy, .checkFn = AppRejectOdd.check } else null,
+        };
+        const many = rnd.boolean();
+        if (many) reach[@intFromEnum(ProbeReach.many)] += 1;
+        const results: []TargetResult = if (many)
+            try probeMany(testing.allocator, targets[0..n_targets], opts)
+        else blk: {
+            const rs = try testing.allocator.alloc(TargetResult, n_targets);
+            for (rs, targets[0..n_targets]) |*r, t| r.* = try probeTarget(testing.allocator, t, opts);
+            break :blk rs;
+        };
+        defer freeResults(testing.allocator, results);
+
+        for (results, 0..) |r, t| {
+            try testing.expectEqualStrings(targets[t].host, r.target.host);
+            try testing.expectEqual(eff, r.samples.len);
+            var canceled: usize = 0;
+            for (r.samples, outcomes[t][0..eff]) |got, o| {
+                const app_ok = !use_app or targets[t].port % 2 == 0;
+                const want = ProbeModel.sample(o, app_ok);
+                try testing.expectEqual(want.kind, got.kind);
+                try testing.expectEqual(want.rtt_ns, got.rtt_ns);
+                try testing.expectEqual(want.errno, got.errno);
+                try testing.expectEqual(want.err_name, got.err_name);
+                if (want.kind == .canceled) canceled += 1;
+                reach[
+                    @intFromEnum(switch (o.status) {
+                        .up => if (!app_ok) ProbeReach.app_rejected else if (o.rtt_ns == null) ProbeReach.up_no_rtt else ProbeReach.up,
+                        .refused => ProbeReach.refused,
+                        .timeout => ProbeReach.timeout,
+                        .canceled => ProbeReach.canceled,
+                        .@"error" => ProbeReach.err,
+                    })
+                ] += 1;
+            }
+            try ProbeModel.check(r.samples, r.stats);
+            try testing.expectEqual(canceled, r.canceledCount());
+            try testing.expectEqual(r.stats.received > 0, r.reachable());
+            if (canceled == eff) reach[@intFromEnum(ProbeReach.all_canceled)] += 1;
+            if (canceled < eff and !r.reachable()) reach[@intFromEnum(ProbeReach.unreachable_host)] += 1;
+        }
+    }
+    for (reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("model reach: {t} never hit\n", .{@as(ProbeReach, @enumFromInt(i))});
+        return error.ModelDoesNotReach;
+    };
+}
