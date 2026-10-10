@@ -7,7 +7,8 @@ own included — then runs 20–27× faster.
 
 - **Status:** gap — without libc, std has no fast `memset` at all.
 - **Model after:** musl's and Go's runtime `memclr`: full-width vector stores
-  with overlapping unaligned first and last vectors.
+  with overlapping unaligned first and last vectors; `rep stosq` for the middle
+  of clears past 192 KiB on x86-64 (level with musl and glibc at 1 MiB).
 - **Platform:** any (portable `@Vector` code). **Role:** util.
   **Concurrency:** reentrant. **Allocation:** none.
 

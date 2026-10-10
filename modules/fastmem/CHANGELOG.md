@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — `set` stores the middle of a clear of 192 KiB or more with
+  `rep stosq` on x86-64 (head and tail vectors unchanged): 1 MiB went from
+  1.23–1.32× musl's and glibc's `memset` to 0.90–1.02×; shorter lengths run the
+  same code as before. `bench-fastmem` now alternates the sides per round
+  (`BENCH_ROUNDS`) and prints each side's spread. No API change.
+
 - **2026-10-03** — Audit (review + 28-mutant schemata run): no defect; one test
   added for `memset(null, c, 0)` (the length guard had no test). No API or
   behaviour change.

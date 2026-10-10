@@ -44,8 +44,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
-    .doc = "Vectorised memset (32-byte stores, overlapping head/tail) that an executable without libc can export to replace compiler_rt's byte-at-a-time one for every caller, std included; opt-in.",
-    .platform_note = "any (portable @Vector code; the export refuses libc-linked builds)",
+    .doc = "Vectorised memset (32-byte stores, overlapping head/tail; rep stosq past L2 on x86-64) that an executable without libc can export to replace compiler_rt's byte-at-a-time one for every caller, std included; opt-in.",
+    .platform_note = "any (portable @Vector code, plus a rep-stosq path for large lengths on x86-64; the export refuses libc-linked builds)",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util,
@@ -59,6 +59,7 @@ pub const meta = .{
 /// Store `c` into `dest[0..len]`.
 pub fn set(dest: [*]u8, c: u8, len: usize) void {
     if (len < 32) return setSmall(dest, c, len);
+    if (use_stos and len >= stos_min) return setLarge(dest, c, len);
     const v: V = @splat(c);
     // Unaligned first and last vectors, overlapping the aligned middle; the
     // middle then starts at the first aligned address after `dest`.
@@ -91,6 +92,39 @@ pub fn exportSymbols() void {
 // ── implementation ──────────────────────────────────────────────────────────
 
 const V = @Vector(32, u8);
+
+/// Above this length the middle is stored by `rep stosq` instead of the
+/// vector loop. Measured 2026-10-11 on an i7-7920HQ (256 KiB L2): the string
+/// store is 0.95-1.07x the loop from 4 KiB to 192 KiB and 0.75-0.84x from
+/// 256 KiB up, where the buffer leaves L2 and the loop's stores each pay a
+/// read-for-ownership the fast-string protocol skips.
+const stos_min = 192 * 1024;
+
+// Not under the C backend: it would have to spell the register constraints
+// in C, and nothing there is measured.
+const use_stos = builtin.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c;
+
+/// `set` for `len >= stos_min` on x86-64: the same unaligned head and tail
+/// vectors, and the 32-aligned middle by `rep stosq`. The last qword ends at
+/// most 7 bytes past the tail vector's start, which it covers anyway, so
+/// nothing outside `[dest, dest + len)` is written. `noinline` and reached by
+/// a tail call, so `set` itself stays a leaf with no frame: measured
+/// 2026-10-11, a call inside it cost the 256 B and 4 KiB rows 15-40 %.
+noinline fn setLarge(dest: [*]u8, c: u8, len: usize) void {
+    const v: V = @splat(c);
+    store(V, dest, v);
+    store(V, dest + len - 32, v);
+    const start = @intFromPtr(dest);
+    const first = std.mem.alignForward(usize, start + 1, 32);
+    var d: [*]u8 = @ptrFromInt(first);
+    var n: usize = (start + len - 32 - first + 7) / 8;
+    const q: u64 = @as(u64, c) * 0x0101010101010101;
+    asm volatile ("rep stosq"
+        : [d] "+{rdi}" (d),
+          [n] "+{rcx}" (n),
+        : [q] "{rax}" (q),
+        : .{ .memory = true });
+}
 
 inline fn store(comptime T: type, p: [*]u8, v: T) void {
     const w: *align(1) volatile T = @ptrCast(p);
@@ -154,6 +188,26 @@ test "set: large lengths across page-sized buffers" {
             for (buf, 0..) |b, i| {
                 const inside = i >= off and i < off + len;
                 try testing.expectEqual(@as(u8, if (inside) 0xEE else 0x11), b);
+            }
+        }
+    }
+}
+
+test "set: the rep-stosq path writes exactly its range" {
+    // Lengths at and around `stos_min`, at offsets that put `first` at every
+    // distance from `end` mod 8 -- the qword count's rounding is the edge.
+    const buf = try testing.allocator.alignedAlloc(u8, .@"64", stos_min + 4096);
+    defer testing.allocator.free(buf);
+    for ([_]usize{ stos_min - 1, stos_min, stos_min + 1, stos_min + 7, stos_min + 33, stos_min + 2000 }) |len| {
+        for ([_]usize{ 0, 1, 5, 8, 31, 32, 63 }) |off| {
+            for (buf, 0..) |*b, i| b.* = @truncate(i *% 13 +% 3);
+            set(buf[off..].ptr, 0x5A, len);
+            for (buf, 0..) |b, i| {
+                const want: u8 = if (i >= off and i < off + len) 0x5A else @truncate(i *% 13 +% 3);
+                if (b != want) {
+                    std.debug.print("off={d} len={d} i={d}: got {x}, want {x}\n", .{ off, len, i, b, want });
+                    return error.TestUnexpectedResult;
+                }
             }
         }
     }

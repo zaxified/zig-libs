@@ -3,10 +3,13 @@
 // C side of `zig build bench-fastmem` (modules/fastmem/tools/bench.zig): times
 // the libc `memset` this file is linked against (the program builds it twice,
 // with musl-gcc -static and with zig cc against glibc) over the canvas the Zig
-// program writes into the directory given as the only argument. One line per
+// program writes into the directory given as the first argument. One line per
 // workload: name, ns/op, FNV-1a of the canvas after one memset (the equality
 // check: every side must produce the same bytes). Timing matches the Zig side:
 // double the batch until it takes over 100 ms, then keep the best of five.
+// With a second argument (a workload name such as `set_1m_u`) only that
+// workload runs: the Zig driver calls once per workload per round, so the
+// sides alternate instead of one finishing before the other starts.
 //
 // The call goes through a volatile function pointer so no compiler can turn it
 // into inline stores or drop it; -fno-builtin keeps `memset` a real call.
@@ -35,7 +38,8 @@ static uint64_t fnv(const unsigned char *p, size_t n) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) { fprintf(stderr, "usage: memset_bench <work dir>\n"); return 2; }
+    if (argc != 2 && argc != 3) { fprintf(stderr, "usage: memset_bench <work dir> [workload]\n"); return 2; }
+    const char *only = argc == 3 ? argv[2] : NULL;
     char path[4096];
     snprintf(path, sizeof path, "%s/canvas.bin", argv[1]);
     FILE *f = fopen(path, "rb");
@@ -50,6 +54,9 @@ int main(int argc, char **argv) {
     static const char *snames[] = {"16", "256", "4k", "64k", "1m"};
     for (int s = 0; s < 5; s++) {
         for (int mis = 0; mis < 2; mis++) {
+            char name[32];
+            snprintf(name, sizeof name, "set_%s_%s", snames[s], mis ? "u" : "a");
+            if (only && strcmp(only, name) != 0) continue;
             size_t off = mis ? MISALIGN : 0, len = sizes[s];
             // Equality fingerprint: one memset over a pristine canvas.
             memcpy(canvas, pristine, total);
@@ -70,7 +77,7 @@ int main(int argc, char **argv) {
                 double d = now_ns() - t;
                 if (d < best) best = d;
             }
-            printf("set_%s_%s\t%.2f\t%llu\n", snames[s], mis ? "u" : "a", best / (double)n, (unsigned long long)h);
+            printf("%s\t%.2f\t%llu\n", name, best / (double)n, (unsigned long long)h);
         }
     }
     return 0;
