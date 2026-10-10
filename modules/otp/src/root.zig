@@ -291,6 +291,7 @@ test "totpVerify accepts the correct code and rejects wrong ones (constant-time 
 
 test {
     _ = @import("otpauth.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");

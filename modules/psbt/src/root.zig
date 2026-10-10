@@ -808,8 +808,66 @@ const psbt_seeds = [_][]const u8{
     seed("AA55" ** 24), // a repeating pattern the Cursor cycles over every branch
 };
 
+const fz = @import("fuzz_test.zig");
+const ParseMark = fz.Marker(enum { refused, parsed, round_tripped, witness_decoded, finalized, extracted });
+const DamageMark = fz.Marker(enum { generated, damaged_refused, damaged_parsed, damaged_roundtrip, combined });
+
 test "fuzz: parse never panics on arbitrary bytes" {
     try testing.fuzz({}, fuzzParse, .{ .corpus = &psbt_seeds });
+}
+
+test "fuzz driver: PSBT_FUZZ (parse)" {
+    try fz.fuzz_driver.run(fuzzParseBody, .{ .prefix = "PSBT_FUZZ", .name = "psbt-parse" });
+}
+
+test "fuzz harness: parse, 400 seeds, reaches every outcome" {
+    try ParseMark.reach(fuzzParseBody, "psbt-parse", 400);
+}
+
+test "fuzz driver: PSBT_FUZZ (damage)" {
+    try fz.fuzz_driver.run(fuzzDamage, .{ .prefix = "PSBT_FUZZ", .name = "psbt-damage" });
+}
+
+test "fuzz harness: damage, 400 seeds, reaches every outcome" {
+    try DamageMark.reach(fuzzDamage, "psbt-damage", 400);
+}
+
+/// A generated PSBT with 0-3 octets damaged and maybe truncated: `parse`
+/// never panics; whatever it accepts re-serializes to exactly the bytes it
+/// came from, and `combine` with itself is a fixpoint after one pass.
+fn fuzzDamage(comptime S: type, src: *S, allocator: Allocator) anyerror!void {
+    var script: [512]u8 = undefined;
+    const n: usize = src.slice(&script);
+    var cur: tkfuzz.Cursor = .{ .bytes = script[0..n] };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    _ = buildFuzzPsbt(&buf, allocator, &cur) catch return;
+    DamageMark.mark(.generated);
+
+    const dmg = try allocator.alloc(u8, buf.items.len);
+    defer allocator.free(dmg);
+    const dn = fz.damage(src, dmg, buf.items);
+    var ps = parse(allocator, dmg[0..dn]) catch {
+        DamageMark.mark(.damaged_refused);
+        return;
+    };
+    defer ps.deinit(allocator);
+    DamageMark.mark(.damaged_parsed);
+    const reser = try serialize(allocator, ps);
+    defer allocator.free(reser);
+    if (!std.mem.eql(u8, reser, dmg[0..dn])) return error.RoundTripNotByteExact;
+    DamageMark.mark(.damaged_roundtrip);
+
+    var c1 = combine(allocator, ps, ps) catch return;
+    defer c1.deinit(allocator);
+    const s1 = try serialize(allocator, c1);
+    defer allocator.free(s1);
+    var c2 = try combine(allocator, c1, c1);
+    defer c2.deinit(allocator);
+    const s2 = try serialize(allocator, c2);
+    defer allocator.free(s2);
+    if (!std.mem.eql(u8, s1, s2)) return error.CombineNotIdempotent;
+    DamageMark.mark(.combined);
 }
 
 fn appendFuzzRecord(list: *std.ArrayList(u8), allocator: Allocator, keytype: u64, keydata: []const u8, value: []const u8) !void {
@@ -964,8 +1022,10 @@ fn buildFuzzPsbt(buf: *std.ArrayList(u8), allocator: Allocator, cur: *tkfuzz.Cur
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+    try fuzzParseBody(std.testing.Smith, smith, testing.allocator);
+}
 
+fn fuzzParseBody(comptime S: type, smith: *S, allocator: Allocator) anyerror!void {
     var script: [512]u8 = undefined;
     // ⚠ The script comes out of ONE `smith.slice` call, and it is the FIRST
     // draw. Every choice in this generator used to come from `smith` directly
@@ -1005,7 +1065,11 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     const n_in = shape.n_in;
     const n_out = shape.n_out;
 
-    var psbt = parse(allocator, buf.items) catch return;
+    var psbt = parse(allocator, buf.items) catch {
+        ParseMark.mark(.refused);
+        return;
+    };
+    ParseMark.mark(.parsed);
     defer psbt.deinit(allocator);
 
     // Audit F6 (round-trip half): SPEC.md's own headline guarantee is
@@ -1017,6 +1081,7 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     const reser = try serialize(allocator, psbt);
     defer allocator.free(reser);
     if (!std.mem.eql(u8, reser, buf.items)) return error.RoundTripNotByteExact;
+    ParseMark.mark(.round_tripped);
 
     // `decodeWitnessStack` driven directly as well: it is public, it is
     // documented as untrusted-input, and reaching it only through a PSBT that
@@ -1025,14 +1090,28 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
         var wbuf: [96]u8 = undefined;
         const wlen: usize = cur.ranged(0, @intCast(wbuf.len));
         for (wbuf[0..wlen]) |*b| b.* = cur.byte();
-        if (decodeWitnessStack(allocator, wbuf[0..wlen])) |stack| {
+        // Half the time a well-formed stack built from the drawn octets
+        // (random octets almost never form one): the decoder must then hand
+        // every item back.
+        var enc: []u8 = &.{};
+        defer allocator.free(enc);
+        var input: []const u8 = wbuf[0..wlen];
+        if (cur.byte() & 1 == 1) {
+            const cut1 = cur.ranged(0, @intCast(wlen));
+            const cut2 = cur.ranged(@intCast(cut1), @intCast(wlen));
+            const items = [_][]const u8{ wbuf[0..cut1], wbuf[cut1..cut2], wbuf[cut2..wlen] };
+            enc = try encodeWitnessStack(allocator, items[0..cur.ranged(1, 3)]);
+            input = enc;
+        }
+        if (decodeWitnessStack(allocator, input)) |stack| {
             defer allocator.free(stack);
             // Every item is a subslice of the value it was decoded from, and
             // the stack cannot claim more items than there were octets.
-            if (stack.len > wlen) return error.MoreItemsThanOctets;
+            ParseMark.mark(.witness_decoded);
+            if (stack.len > input.len) return error.MoreItemsThanOctets;
             for (stack) |item| {
-                const off = @intFromPtr(item.ptr) - @intFromPtr(&wbuf);
-                if (off > wlen or item.len > wlen - off) return error.ItemOutsideValue;
+                const off = @intFromPtr(item.ptr) - @intFromPtr(input.ptr);
+                if (off > input.len or item.len > input.len - off) return error.ItemOutsideValue;
             }
         } else |_| {}
     }
@@ -1045,6 +1124,7 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
 
     if (finalize(a, ps, .{})) |results| {
         if (results.len != n_in) return error.FinalizeResultCountMismatch;
+        ParseMark.mark(.finalized);
     } else |_| {}
 
     if (extract(a, ps)) |tx| {
@@ -1053,6 +1133,7 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
         if (tx.vin.len != n_in) return error.ExtractChangedInputCount;
         if (tx.vout.len != n_out) return error.ExtractChangedOutputCount;
         if (tx.has_witness and tx.witness.len != n_in) return error.WitnessCountMismatch;
+        ParseMark.mark(.extracted);
     } else |_| {}
 }
 

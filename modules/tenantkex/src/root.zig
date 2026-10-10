@@ -1024,5 +1024,6 @@ test "wipe mid-handshake clears the ephemeral secret and the chaining key" {
 }
 
 test {
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }

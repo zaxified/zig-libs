@@ -992,6 +992,7 @@ fn evaluatePoprfBody(sk: *const [Ns]u8, input: []const u8, info: []const u8, out
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }
 

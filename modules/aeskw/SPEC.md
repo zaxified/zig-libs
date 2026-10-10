@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-05 (12/13, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: KEK + wrapped key through wrap/unwrap/tampered unwrap, AES-128/192/256; 6 in-file = the integrity verdict after the constant-time IV compare, twice per KEK size)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean, AESKW_FUZZ) · ct 2026-10-10 (ctgrind: KEK + wrapped key through wrap/unwrap/tampered unwrap, AES-128/192/256; 6 in-file = the integrity verdict after the constant-time IV compare, twice per KEK size)
 **Performance:** not measured
 
 **Known defects:** none recorded

@@ -84,11 +84,15 @@ pub const ParsedFrame = struct {
 pub fn readHopFrame(unwrapped: []const u8) (bigsize.DecodeError || FrameError)!ParsedFrame {
     const len_field = try bigsize.read(unwrapped);
     if (len_field.value < 2) return error.ReservedPayloadLength;
-    // Fits in `usize` on every platform this repo targets (payload lengths
-    // are bounded by hop_payloads_len, 1300, far below any usize/u64 gap).
-    const payload_len: usize = @intCast(len_field.value);
     const after_len = unwrapped[len_field.len..];
-    if (after_len.len < payload_len + hmac_len) return error.BufferTooSmall;
+    // The declared length is a peer-chosen u64 (a sender that picked the
+    // ephemeral key can authenticate any frame): compare it against the bytes
+    // that remain BEFORE narrowing to `usize` and before adding `hmac_len`,
+    // where a length near 2^64 used to overflow (panic in safe builds, a wild
+    // slice in ReleaseFast) and on 32-bit targets failed `@intCast`.
+    if (len_field.value > after_len.len) return error.BufferTooSmall;
+    const payload_len: usize = @intCast(len_field.value);
+    if (after_len.len - payload_len < hmac_len) return error.BufferTooSmall;
     const payload = after_len[0..payload_len];
     const hmac = after_len[payload_len..][0..hmac_len].*;
     return .{
@@ -131,6 +135,23 @@ pub fn leftShift(buf: []u8, shift: usize) void {
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "readHopFrame: a declared length near 2^64 is BufferTooSmall, not an overflow" {
+    // fuzz 2026-10-10 (sphinx-forged): `payload_len + hmac_len` wrapped for
+    // lengths within 32 of maxInt(u64).
+    var buf: [64]u8 = @splat(0);
+    buf[0] = 0xff;
+    for ([_]u64{ std.math.maxInt(u64), std.math.maxInt(u64) - 31, std.math.maxInt(u64) - 32, @as(u64, 1) << 32 }) |len| {
+        std.mem.writeInt(u64, buf[1..9], len, .big);
+        try testing.expectError(error.BufferTooSmall, readHopFrame(&buf));
+    }
+    // The exact-fit boundary still parses, one past it does not.
+    buf[0] = 31;
+    const ok = try readHopFrame(&buf);
+    try testing.expectEqual(@as(usize, 31), ok.payload.len);
+    buf[0] = 32;
+    try testing.expectError(error.BufferTooSmall, readHopFrame(&buf));
+}
 
 test "shiftSize: 1-byte bigsize (l < 253) is 1 + l + 32" {
     try testing.expectEqual(@as(usize, 1 + 18 + 32), shiftSize(18));

@@ -81,5 +81,6 @@ test {
     _ = channel;
     _ = record;
     _ = replay;
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }

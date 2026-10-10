@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-15 · mutation 2026-09-10 · src ?
 
-**Hardening:** fuzz ? · ct 2026-09-16 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean; `opaque-login` at `.scale` 4 = 50,000 runs — a run is a registration plus a login — `opaque-hostile` 200,000, OPAQUE_FUZZ) · ct 2026-09-16 (ctgrind)
 
 **Performance:** not measured
 

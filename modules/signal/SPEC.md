@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-10-05 (29/30, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct 2026-09-09 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean; `signal-ratchet` / `signal-x3dh` at `.scale` 2 = 100,000 runs, `signal-xeddsa` 200,000, SIGNAL_FUZZ) · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 

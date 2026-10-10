@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `AEADFRAME_FUZZ` (`src/fuzz_test.zig`): `aeadframe-channel` (both AEADs, Sealer to Opener with records delivered in a drawn order with duplicates against an independent replay-window model; before each delivery a flipped bit, a truncation, other AAD, an undersized buffer and a damaged copy are refused and change nothing; an epoch bump refuses the old epoch; the top of the sequence space is exhausted, never wrapped) and `aeadframe-record` (`record.parse`). ReleaseSafe, clean.
 - **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (targets `chacha`, `aes`, ReleaseFast): channel keys and plaintext are tainted through `Sealer.seal`, `rekeyInto` and `Opener.open`, including a tampered record. 5 in-file contexts per target: the AEAD tag-verify outcome and `rekey`'s verdict on its constant-time same-key compare. No code change.
 - **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). `Sealer.seal`, `Opener.open` and
   both `rekey`s now run under an 8 KiB per-message burn (`src/burn.zig`): the AEAD call copied the

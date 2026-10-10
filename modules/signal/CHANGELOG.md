@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `SIGNAL_FUZZ` (`src/fuzz_test.zig`): `signal-ratchet` (a live Double Ratchet conversation, in order and reversed, against an independent replay model; every delivery first as a flipped-bit / damaged copy, refused and state-preserving; replays refused), `signal-x3dh` (PreKeyBundle / InitialMessage codecs and the handshake: a damaged bundle or initial message never yields an agreed session; the exempt positions — ids, an absent one-time prekey, the top bit of an X25519 key — are named in the file) and `signal-xeddsa` (genuine accepted, a flipped bit / other message / other key refused, both variants). ReleaseSafe, clean.
 - **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** `check-secret-api` closed at 0 findings: `x3dh`/`pqxdh` `PreKeyBundle`/`InitialMessage` (public wire structs whose field name `identity_key` the lint reads as secret) and the entry points taking them by value carry `secret-api-ok` markers with that reason; the secret keys of those entry points were already by pointer and burned. No burn or signature changed.
 
 - **2026-10-09** — **Breaking:** dead-stack burn for every secret-handling entry point

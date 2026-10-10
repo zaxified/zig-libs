@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-06 (10/10) · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: lock secrets through the KDFs 0; seal/open with randomness, plaintext and HQC dk tainted 8 in-file, all in tlock/HQC/AEAD reached through the envelope, none in this module)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean at `.scale` 10 = 20,000 runs per harness — a run is a pairing plus an HQC decapsulation, TLE_FUZZ) · ct 2026-10-10 (ctgrind: lock secrets through the KDFs 0; seal/open with randomness, plaintext and HQC dk tainted 8 in-file, all in tlock/HQC/AEAD reached through the envelope, none in this module)
 **Performance:** not measured
 
 **Known defects:** none recorded

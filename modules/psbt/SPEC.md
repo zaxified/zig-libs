@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-10-05 (56/58, 2 eq) · src ?
 
-**Hardening:** fuzz ? · ct n/a — public partial transactions (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, PSBT_FUZZ) · ct n/a — public partial transactions (keyword review, 2026-10-07)
 
 **Performance:** not measured
 

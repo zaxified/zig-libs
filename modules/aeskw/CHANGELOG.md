@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `AESKW_FUZZ` (`src/fuzz_test.zig`): `aeskw-unwrap` — a wrapped key (AES-128/192/256 KEK, 2-8 semiblocks) unwraps exactly; one flipped bit, another KEK, any truncation and a damaged copy are refused, every refusal leaves `out` all zero (no partial key material); unsupported KEK sizes and short buffers get their own errors. ReleaseSafe, clean.
 - **2026-10-10** — AES-192 KEK: `wrap`/`unwrap` accept a 24-byte KEK, run on the new `aes192` module (dep added; std 0.16 has no AES-192). RFC 3394 §4.2/§4.4 KATs added; both fuzz harnesses and their pinned corpus counts now cover three KEK widths; ctgrind `wrap` row extended to AES-192 (6 in-file, the integrity verdict twice per KEK size). A 24-byte KEK no longer returns `UnsupportedKeyLength`; the jwe consumer's `ECDH-ES+A192KW` test flipped to a round trip accordingly.
 - **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (target `wrap`, ReleaseFast): the KEK and the wrapped key are tainted through `wrap`, `unwrap` and a tampered `unwrap`, with AES-128 and AES-256 KEKs. 4 in-file contexts, all the integrity verdict taken after the constant-time IV compare. No code change.
 - **2026-10-09** — Dead-stack burn: `wrap` and `unwrap` (KEK, key data) run their bodies under `burn.run` (4 KiB, per-message path); new `stackprobe_test.zig` on `testkit.stackprobe`. No signature change.

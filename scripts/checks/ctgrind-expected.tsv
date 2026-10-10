@@ -842,8 +842,8 @@ hpke	ReleaseFast	open	1	1	42d3ebff03e12947	59883c70dcd08ee6
 # are declassified there, see modules/p521/SPEC.md).
 hpke	ReleaseFast	p521_decap	1	0	a61e96c24833076e	f9c48b1e130f8af6
 hpke	ReleaseFast	p521_authdecap	1	0	a61e96c24833076e	f00506c9b354a23b
-signal	ReleaseFast	sign	1	1	51e4774f1e219e5c	b2a0053066d93a75
-signal	ReleaseFast	ratchet	1	2	42f801e2bd3aaa81	92ab00fad0ce5c41
+signal	ReleaseFast	sign	1	1	8913e487185c7429	b2a0053066d93a75
+signal	ReleaseFast	ratchet	1	2	769b7983e02f8179	92ab00fad0ce5c41
 # sphinx construct 10 -> 8 (re-pin 2026-09-15): its two ECDH `k256.mul` calls
 # (core.zig:124/:152) read 2 contexts each on the old ladder and 1 each now --
 # `rejectIdentity` at group.zig:347 via `mulInner`, exactly k256/mul's 2 -> 1.
@@ -857,8 +857,8 @@ signal	ReleaseFast	ratchet	1	2	42f801e2bd3aaa81	92ab00fad0ce5c41
 # memcpy contexts, all on the same source line as before (core.zig:502 ->
 # :522, the next hop_payloads copied from the offset the decrypted frame
 # gives), chunked differently now that the result is built in processBody.
-sphinx	ReleaseFast	construct	1	7	b7b5632148189f9f	cb364f94f78ea089
-sphinx	ReleaseFast	process	1	<=47	b7b5632148189f9f	e7c50d755f64b027
+sphinx	ReleaseFast	construct	1	7	3ebc454c64a90bd4	cb364f94f78ea089
+sphinx	ReleaseFast	process	1	<=47	3ebc454c64a90bd4	e7c50d755f64b027
 # bolt3 derive 7 -> 8 (re-pin 2026-10-06; the fix landed 2026-10-05):
 # derivePrivateKey now refuses a per_commitment_secret >= n, so the std scalar
 # canonicality verdict (common.zig:75 via scalar.zig:87, root.zig:98) appears
@@ -996,9 +996,9 @@ pir	ReleaseFast	reconstruct	1	1	1dd419343384c25c	b6ecd96f96e9b339
 # pattern also matches voprf's and ct25519's root.zig by basename. An edit to
 # voprf does NOT turn these rows red by digest; re-run `--check opaque` after
 # one.
-opaque	ReleaseFast	register	1	4	9932ae20f27f70cc	843c12b053124a78
-opaque	ReleaseFast	login	1	11	9932ae20f27f70cc	f8be3480eb708638
-opaque	ReleaseFast	serverke2	1	2	9932ae20f27f70cc	4ef279b842b3cb55
+opaque	ReleaseFast	register	1	4	bb71626120e8018c	843c12b053124a78
+opaque	ReleaseFast	login	1	11	bb71626120e8018c	f8be3480eb708638
+opaque	ReleaseFast	serverke2	1	2	bb71626120e8018c	4ef279b842b3cb55
 # bip32 mnemonic 3 is the M6-CT tree (8c2f1aa4, constant-time `wordIndex`).
 # The three are the mnemonic split plus two accept/reject verdicts, not the
 # word search.
@@ -1144,9 +1144,9 @@ quic-crypto	ReleaseFast	chacha	1	4	807dcd889a53e75b	d1cf9a5cadb2a284
 # (b64ct.zig:141/142, one branch at the end). pickle 26 = the AEAD verdict 2, std Ed25519 keygen/sign on
 # the decrypted seed, and parsing of the decrypted pickle (checkFrame,
 # counters, Ratchet.advanceTo to the stored index, the public-key compare).
-megolm	ReleaseFast	msg	1	16	7a191d6a4c4c5224	505eb3dc7b45f5cd
-megolm	ReleaseFast	skey	1	26	7a191d6a4c4c5224	a22db1b8b5220a74
-megolm	ReleaseFast	pickle	1	26	7a191d6a4c4c5224	f06f4b1b938d2036
+megolm	ReleaseFast	msg	1	16	8c50ac3c043e34eb	505eb3dc7b45f5cd
+megolm	ReleaseFast	skey	1	26	8c50ac3c043e34eb	a22db1b8b5220a74
+megolm	ReleaseFast	pickle	1	26	8c50ac3c043e34eb	f06f4b1b938d2036
 # mls (2026-10-10, suite 0x0001) — ks: deriveEpoch with init/commit/PSK
 # secrets tainted; tree: every node secret, ratchet base, Ratchet and Window
 # under a tainted encryption secret; priv: protectPrivate with the content
@@ -1155,9 +1155,9 @@ megolm	ReleaseFast	pickle	1	26	7a191d6a4c4c5224	f06f4b1b938d2036
 # ks and tree: 0. priv 4 = std Ed25519 signing internals 2 (sign:376,
 # pcMul16 rejectIdentity) + the AES-GCM tag-verify outcome of the two
 # decryptions. TreeKEM/HPKE are the hpke module's rows.
-mls	ReleaseFast	ks	1	0	944497b4eeb2d527	cbdae823f31fa99e
-mls	ReleaseFast	tree	1	0	944497b4eeb2d527	22ea84b82599122e
-mls	ReleaseFast	priv	1	4	944497b4eeb2d527	616cb338b933af50
+mls	ReleaseFast	ks	1	0	d34f115335c14c00	cbdae823f31fa99e
+mls	ReleaseFast	tree	1	0	d34f115335c14c00	22ea84b82599122e
+mls	ReleaseFast	priv	1	4	d34f115335c14c00	616cb338b933af50
 # otp (2026-10-10) — code: the shared secret through hotp/totp/hotpFmt/
 # totpVerify for SHA-1/256/512. FIX: the RFC 4226 dynamic truncation read
 # mac[offset..][0..4] with offset = the MAC's low nibble, a load address
@@ -1166,26 +1166,26 @@ mls	ReleaseFast	priv	1	4	944497b4eeb2d527	616cb338b933af50
 # the base32 module; its encoder indexed its alphabet by the secret 5-bit
 # group (8 = base32/root.zig:149) until base32 went constant-time the same
 # day: uri 8 -> 0.
-otp	ReleaseFast	code	1	0	5185f8a2ee5289f4	df6ca288cedbb864
-otp	ReleaseFast	uri	1	0	778e776ffe3ec2b6	36cedfe2472c9cba
+otp	ReleaseFast	code	1	0	a8a40738fa904cce	df6ca288cedbb864
+otp	ReleaseFast	uri	1	0	1288f82d8f75df11	36cedfe2472c9cba
 # aeskw (2026-10-10) — wrap: KEK + wrapped key tainted, AES-128/192/256 KEKs
 # (192 via the aes192 module since 2026-10-10), wrap, unwrap, tampered unwrap.
 # 6 = the integrity verdict after the constant-time IV compare, twice per KEK
 # size.
-aeskw	ReleaseFast	wrap	1	6	95edc9b3698767c1	a613db024e13b3d3
+aeskw	ReleaseFast	wrap	1	6	a64afcf85099d452	a613db024e13b3d3
 # aeadframe (2026-10-10) — chacha / aes: channel keys + plaintext tainted,
 # seal x3, rekeyInto, seal, open x4 + a tampered record. 5 each = the AEAD
 # tag-verify outcome of the opens (4 contexts) + rekey's NonceSpaceReuse
 # verdict on its constant-time same-key compare (channel.zig:210).
-aeadframe	ReleaseFast	chacha	1	5	9fa6c23915473b7d	9e2cdfce46f95d92
-aeadframe	ReleaseFast	aes	1	5	9fa6c23915473b7d	9e2cdfce46f95d92
+aeadframe	ReleaseFast	chacha	1	5	1b2c360d10f83e40	9e2cdfce46f95d92
+aeadframe	ReleaseFast	aes	1	5	1b2c360d10f83e40	9e2cdfce46f95d92
 # tenantkex (2026-10-10) — ik: Noise_IK both PEs, static private keys and
 # every ephemeral seed tainted. 9, none a branch of tenantkex's on a key:
 # 6 x std X25519 identity-point check (2 ephemeral keygens, 4 DH) + 2 x the
 # AEAD tag-verify outcome (via noise -> chachapoly) + 1 = the verdict on
 # the constant-time compare of the decrypted initiator static against the
 # provisioned one (root.zig:359).
-tenantkex	ReleaseFast	ik	1	9	63c55faf16a26e68	85fb9350a2be9ee1
+tenantkex	ReleaseFast	ik	1	9	23b4dcc4cfb1cd72	85fb9350a2be9ee1
 # ctap2 (2026-10-10) — pin: an 8-byte PIN + the ECDH shared secret tainted
 # through validateNewPin, padPin, pinHash, SharedSecret.encrypt/authenticate
 # (protocols One and Two); token: the shared secret through decryptToken +
@@ -1217,9 +1217,9 @@ base32	ReleaseFast	decode	1	5	27b91372cf4e0b6e	4b6a48f852c57125
 # the t == 0 verdict 2; client 8 = hashToGroup rejectIdentity 2 + the blind
 # canonical-scalar verdict 3 + the blind == 0 verdict 3; keygen 3 = the
 # constant-time skS == 0 verdict per mode.
-voprf	ReleaseFast	server	1	5	8dc686ef4d0871bd	985a5bcd0456a35f
-voprf	ReleaseFast	client	1	8	8dc686ef4d0871bd	82e99d9133134c5f
-voprf	ReleaseFast	keygen	1	3	8dc686ef4d0871bd	f2504d3c494735f2
+voprf	ReleaseFast	server	1	5	df42adce86abaefb	985a5bcd0456a35f
+voprf	ReleaseFast	client	1	8	df42adce86abaefb	82e99d9133134c5f
+voprf	ReleaseFast	keygen	1	3	df42adce86abaefb	f2504d3c494735f2
 # smtp (2026-10-10) — auth: the password through plainResponse/loginResponse
 # at three tail lengths. FIX: std.base64 indexed its alphabet by the secret
 # and checkCredential branched per byte: 312 -> 6. The 6 = the one
@@ -1271,8 +1271,8 @@ lms	ReleaseFast	hss	1	6	b94156931571380a	43dd64bf2e77e52a
 # tlock.encrypt (h3 scalar reduction, g2 toAffine inversion and compressed
 # encoding of U = r*G2, which is the PUBLIC ciphertext half) 5, HQC's
 # dkParse fixed-weight rejection sampling on the decapsulation key 2.
-timelock_envelope	ReleaseFast	kdf	1	0	989cf8a9194aa36e	1dd423b6c587c4a7
-timelock_envelope	ReleaseFast	env	1	8	989cf8a9194aa36e	eb40a7f3ed6eaa0a
+timelock_envelope	ReleaseFast	kdf	1	0	2e9264668ba4b00c	1dd423b6c587c4a7
+timelock_envelope	ReleaseFast	env	1	8	2e9264668ba4b00c	eb40a7f3ed6eaa0a
 # snmp (2026-10-10) — kdf: password through passwordToUserKey + localizeKey
 # (MD5, SHA-1); auth: localized key through computeDigestInto, all six
 # protocols; aes: AES-128-CFB privacy round trip. All 0. des: DES-CBC

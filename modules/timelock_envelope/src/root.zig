@@ -84,6 +84,7 @@ test {
     _ = @import("security_test.zig");
     _ = stream;
     _ = @import("stream_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }
 

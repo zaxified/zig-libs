@@ -568,5 +568,6 @@ test "wrap refuses key data that is not a whole number of 64-bit blocks" {
 }
 
 test {
+    _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }

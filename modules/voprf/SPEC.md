@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-05 (21/25, 4 eq) · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: skS + proof nonce, client input + blinds, keygen seed; `server` 5 / `client` 8 / `keygen` 3 in-file, all single verdicts after the allEqual fix)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, `voprf-verifiable` / `voprf-poprf` at `.scale` 10 = 20,000 runs, VOPRF_FUZZ) · ct 2026-10-10 (ctgrind: skS + proof nonce, client input + blinds, keygen seed; `server` 5 / `client` 8 / `keygen` 3 in-file, all single verdicts after the allEqual fix)
 **Performance:** not measured
 
 **Known defects:** none recorded

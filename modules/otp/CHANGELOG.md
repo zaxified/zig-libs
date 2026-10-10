@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `OTP_FUZZ` (`src/fuzz_test.zig`): `otp-uri` (a formatted `KeyUri` round-trips field for field; a damaged copy never panics and whatever parses re-formats and re-parses to the same fields) and `otp-code` (hotp / totp / `totpVerify` against an independent enumeration of the skew window: genuine accepted, one off or outside the window refused; formatted codes are `digits` decimal characters that parse back). ReleaseSafe, clean.
 - **2026-10-10** — Constant time: the RFC 4226 dynamic truncation read the four code bytes at `mac[offset]`, where `offset` is the low nibble of the MAC under the secret key — a secret-dependent load address. New private `truncateCt` reads all 16 candidate windows and selects one by mask; identical output (new test over every offset). New `src/ctgrind_harness.zig` (targets `code`, `uri`, ReleaseFast): `code` went from 18 to 0 in-file contexts. `uri` (`otpauth.format` writing the secret through the `base32` module) went from 8 to 0 once `base32` became constant-time the same day. No API change.
 - **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). `dynamicTruncate` (the one HMAC call
   under `hotp`/`hotpFmt`/`totp`/`totpFmt`/`totpVerify` and the `KeyUri` code methods) and

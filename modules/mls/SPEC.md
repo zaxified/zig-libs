@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-11 · mutation 2026-10-06 (40/41, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: key schedule, secret tree + ratchets, PrivateMessage protect/decrypt; `ks` 0 / `tree` 0 / `priv` 4 in-file — std Ed25519 signing and AEAD verdicts; TreeKEM/HPKE via hpke)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean at `.scale` 8 = 25,000 runs each — a run is a whole group exchange, MLS_FUZZ) · ct 2026-10-10 (ctgrind: key schedule, secret tree + ratchets, PrivateMessage protect/decrypt; `ks` 0 / `tree` 0 / `priv` 4 in-file — std Ed25519 signing and AEAD verdicts; TreeKEM/HPKE via hpke)
 **Performance:** not measured
 
 **Known defects:** none recorded

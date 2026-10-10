@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — tests: deterministic fuzz driver `VOPRF_FUZZ` (`src/fuzz_test.zig`): `voprf-decode` (an accepted Element / Proof / scalar re-encodes to its input), `voprf-oprf`, `voprf-verifiable` and `voprf-poprf` (a genuine exchange equals the direct evaluation; a flipped bit in the blinded/evaluated element, the proof or the key is refused or changes the output; a proof for another blinded element or info string is refused). ReleaseSafe, clean.
 - **2026-10-10** — Constant time: three zero checks on secrets used the early-exit `std.mem.allEqual`: the blind scalar in `unblind` (every Finalize) and `t = skS + m` in `blindEvaluatePoprfBatch` and `evaluatePoprf`. They are now `std.crypto.timing_safe.eql` against zero with one verdict. New `src/ctgrind_harness.zig` (targets `server`, `client`, `keygen`, ReleaseFast) taints the server key and proof nonce, the client input and blinds, and the key-derivation seed. What remains is single verdicts only: identity rejections, canonical-scalar and zero checks, itemised in `scripts/checks/ctgrind-expected.tsv`. No API change.
 - **2026-10-09** — **Breaking:** dead-stack burn for every secret-handling
   entry point (`stackprobe_test.zig`: every one of the 13 probed calls left

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-05 (18/18) · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: Noise_IK both PEs, static private keys + ephemerals tainted; 9 in-file = std X25519 identity checks, AEAD verdicts and the pinned-static verdict, none a tenantkex branch on a key)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean at `.scale` 2 = 100,000 runs — a run is a whole handshake, TENANTKEX_FUZZ) · ct 2026-10-10 (ctgrind: Noise_IK both PEs, static private keys + ephemerals tainted; 9 in-file = std X25519 identity checks, AEAD verdicts and the pinned-static verdict, none a tenantkex branch on a key)
 **Performance:** not measured
 
 **Evidence:** model — byte-exact comparison with raw Noise_IK as oracle; fuzz is never-panic only

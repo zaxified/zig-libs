@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-04 (56/57, 1 eq) · src ?
 
-**Hardening:** fuzz ? · ct 2026-10-10 (ctgrind: secret through hotp/totp/fmt/verify, SHA-1/256/512, `code` 0 in-file after the truncation fix (was 18); `uri` 0 after base32 went constant-time (was 8))
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, OTP_FUZZ) · ct 2026-10-10 (ctgrind: secret through hotp/totp/fmt/verify, SHA-1/256/512, `code` 0 in-file after the truncation fix (was 18); `uri` 0 after base32 went constant-time (was 8))
 **Performance:** not measured
 
 **Known defects:** none recorded
