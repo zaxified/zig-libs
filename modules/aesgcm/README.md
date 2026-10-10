@@ -1,6 +1,7 @@
 # aesgcm
 
-**AES-GCM** (AES-128, AES-192 and AES-256, 96-bit nonce, 128-bit tag) that is a
+**AES-GCM** (AES-128, AES-192 and AES-256; 96-bit nonce and 128-bit tag by default, any
+nonce length and the SP 800-38D tag lengths on request) that is a
 drop-in for `std.crypto.aead.aes_gcm` and faster than it in two ways: a
 **stateful `Context`** holds the expanded key and the GHASH key powers, so a
 TLS connection derives them once per key instead of once per record; and on
@@ -52,6 +53,14 @@ _ = aesgcm.backend(); // .aesni or .generic
   output is `undefined` then.
 - **Lengths:** `c.len == m.len` and `m.len ≤ 2³⁶ − 32` bytes are asserted, as
   std asserts them.
+- **Other nonce and tag lengths:** `aesgcm.AesGcm(256, .{ .nonce_length = 8,
+  .tag_length = 12 })` has the same API with `[8]u8` nonces and `[12]u8` tags
+  (as Go's `NewGCMWithNonceSize` / `NewGCMWithTagSize`). Any nonce of one byte
+  or more — a non-12-byte one is hashed into the initial counter, which costs
+  one GHASH block per 16 nonce bytes and is weaker against nonce collisions, so
+  keep 12 unless a format fixes another — and tags of 16, 15, 14, 13, 12 bytes,
+  or 8 and 4 under SP 800-38D Appendix C's limits (yours to enforce). Other
+  lengths are compile errors.
 - **Size:** a `Context` is ≤ 320 bytes (AES-128) / ≤ 384 (AES-256).
 - `Gcm.initWith(.generic, key)` / `aesgcm.available(b)` pick a backend
   explicitly, for comparisons.

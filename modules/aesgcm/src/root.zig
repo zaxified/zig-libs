@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-//! aesgcm — AES-GCM (NIST SP 800-38D), AES-128/192/256, 96-bit nonces,
-//! 128-bit tags: a drop-in for `std.crypto.aead.aes_gcm` plus a stateful
-//! `Context` that keeps the expanded key and the GHASH key powers across
-//! messages.
+//! aesgcm — AES-GCM (NIST SP 800-38D), AES-128/192/256, 96-bit nonces and
+//! 128-bit tags by default: a drop-in for `std.crypto.aead.aes_gcm` plus a
+//! stateful `Context` that keeps the expanded key and the GHASH key powers
+//! across messages. `AesGcm(key_bits, .{ .nonce_length, .tag_length })` takes
+//! any nonce length (hashed into J0) and the SP 800-38D tag lengths.
 //!
 //! Two things make it faster than std's:
 //!
@@ -40,7 +41,7 @@ const Ghash = crypto.onetimeauth.Ghash;
 const aes192 = @import("aes192");
 
 pub const meta = .{
-    .doc = "AES-GCM (AES-128/192/256) — stateful context caching the key schedule and GHASH powers, x86-64 AES-NI+PCLMULQDQ stitched one-pass kernel picked at run time, std fallback; std-shaped stateless API.",
+    .doc = "AES-GCM (AES-128/192/256; any nonce length, SP 800-38D tag lengths) — stateful context caching the key schedule and GHASH powers, x86-64 AES-NI+PCLMULQDQ stitched one-pass kernel picked at run time, std fallback; std-shaped stateless API.",
     .platform_note = "any (x86-64 AES-NI/PCLMULQDQ asm, run-time detected + std fallback)",
     .targets = .{.linux64},
     .platform = .any,
@@ -54,11 +55,44 @@ pub const meta = .{
 
 pub const AuthenticationError = crypto.errors.AuthenticationError;
 
-pub const Aes128Gcm = AesGcm(128);
+pub const Aes128Gcm = AesGcm(128, .{});
 /// AES-192-GCM. std has no `Aes192Gcm` to drop in for; same API as the other
 /// two, with the generic backend over the `aes192` module.
-pub const Aes192Gcm = AesGcm(192);
-pub const Aes256Gcm = AesGcm(256);
+pub const Aes192Gcm = AesGcm(192, .{});
+pub const Aes256Gcm = AesGcm(256, .{});
+
+/// The nonce and tag lengths of an `AesGcm` instance. The defaults are the
+/// only shape TLS and std use; the others exist for formats that fixed a
+/// different one (SP 800-38D allows both), as Go's `NewGCMWithNonceSize` /
+/// `NewGCMWithTagSize` and OpenSSL's `EVP_CTRL_GCM_SET_IVLEN` /
+/// `SET_TAG` do.
+pub const Options = struct {
+    /// Nonce bytes, 1 or more. 12 is the fast, recommended case (J0 = IV ‖
+    /// 0³¹1); any other length is hashed into J0 by GHASH (SP 800-38D §7.1),
+    /// one GHASH block per 16 nonce bytes per message. Prefer 12: a hashed
+    /// nonce is the construction's weak spot — two different nonces can
+    /// collide in J0, and random nonces of other lengths give no larger
+    /// collision bound than 96 random bits do (SP 800-38D §8.2.2).
+    nonce_length: usize = 12,
+    /// Tag bytes: 16, 15, 14, 13 or 12 (SP 800-38D §5.2.1.2), or 8 or 4
+    /// only under the message-length and invocation limits of its Appendix C,
+    /// which this module does not enforce. The tag is the leading bytes of
+    /// the full 16-byte tag.
+    tag_length: usize = 16,
+};
+
+/// AES-GCM over a `key_bits`-bit key (128, 192 or 256) with the nonce and
+/// tag lengths of `opts` — `AesGcm(128, .{ .tag_length = 12 })` and the like.
+/// `Aes128Gcm`, `Aes192Gcm` and `Aes256Gcm` are the default shape.
+pub fn AesGcm(comptime key_bits: u16, comptime opts: Options) type {
+    comptime assert(key_bits == 128 or key_bits == 192 or key_bits == 256);
+    comptime if (opts.nonce_length == 0) @compileError("aesgcm: nonce_length must be at least 1 byte (SP 800-38D §5.2.1.1)");
+    comptime switch (opts.tag_length) {
+        4, 8, 12, 13, 14, 15, 16 => {},
+        else => @compileError("aesgcm: tag_length must be 16, 15, 14, 13, 12, 8 or 4 bytes (SP 800-38D §5.2.1.2)"),
+    };
+    return AesGcmImpl(key_bits, opts.nonce_length, opts.tag_length);
+}
 
 pub const Backend = enum {
     /// std's `crypto.core.aes` block cipher, `modes.ctr` and `Ghash`, with
@@ -87,20 +121,19 @@ pub fn available(b: Backend) bool {
     };
 }
 
-/// AES-GCM over a `key_bits`-bit key: 96-bit nonce, 128-bit tag.
-fn AesGcm(comptime key_bits: u16) type {
-    comptime assert(key_bits == 128 or key_bits == 192 or key_bits == 256);
+fn AesGcmImpl(comptime key_bits: u16, comptime nl: usize, comptime tl: usize) type {
     return struct {
         pub const key_length = key_bits / 8;
-        pub const nonce_length = 12;
-        pub const tag_length = 16;
+        pub const nonce_length = nl;
+        pub const tag_length = tl;
 
-        /// std's AEAD for the stateless generic path; none for AES-192.
-        const StdGcm = switch (key_bits) {
+        /// std's AEAD for the stateless generic path: only the default shape
+        /// with a 128- or 256-bit key has one.
+        const StdGcm = if (nl == 12 and tl == 16) switch (key_bits) {
             128 => crypto.aead.aes_gcm.Aes128Gcm,
             256 => crypto.aead.aes_gcm.Aes256Gcm,
             else => void,
-        };
+        } else void;
         /// The block cipher of the generic backend: std's, or `aes192`'s
         /// (same declarations, same round primitive).
         const BlockCipher = switch (key_bits) {
@@ -191,7 +224,7 @@ fn AesGcm(comptime key_bits: u16) type {
                 assert(m.len <= max_message_len);
                 switch (ctx.impl) {
                     .generic => |*g| g.seal(c, tag, m, ad, npub),
-                    .aesni => |*k| if (x86_asm) k.seal(c, tag, m, ad, npub) else unreachable,
+                    .aesni => |*k| if (x86_asm) k.seal(tl, nl, c, tag, m, ad, npub) else unreachable,
                 }
             }
 
@@ -206,7 +239,7 @@ fn AesGcm(comptime key_bits: u16) type {
                 assert(m.len <= max_message_len);
                 switch (ctx.impl) {
                     .generic => |*g| return g.open(m, c, tag, ad, npub),
-                    .aesni => |*k| if (x86_asm) return k.open(m, c, tag, ad, npub) else unreachable,
+                    .aesni => |*k| if (x86_asm) return k.open(tl, nl, m, c, tag, ad, npub) else unreachable,
                 }
             }
 
@@ -258,15 +291,15 @@ fn AesGcm(comptime key_bits: u16) type {
             assert(c.len == m.len);
             assert(m.len <= max_message_len);
             switch (backend()) {
-                .generic => if (key_bits == 192) {
+                .generic => if (StdGcm == void) {
                     var g = Generic.init(key.*);
                     defer crypto.secureZero(u8, mem.asBytes(&g));
                     g.seal(c, tag, m, ad, npub);
                 } else StdGcm.encrypt(c, tag, m, ad, npub, key.*),
                 .aesni => if (x86_asm) {
-                    var k = Ni.init(key.*, powersFor(ad.len, m.len));
+                    var k = Ni.init(key.*, @max(powersFor(ad.len, m.len), noncePowers(nl)));
                     defer wipeBlocks(@ptrCast(&k), @sizeOf(@TypeOf(k)) / 16);
-                    k.seal(c, tag, m, ad, npub);
+                    k.seal(tl, nl, c, tag, m, ad, npub);
                 } else unreachable,
             }
         }
@@ -286,7 +319,7 @@ fn AesGcm(comptime key_bits: u16) type {
             assert(c.len == m.len);
             assert(m.len <= max_message_len);
             switch (backend()) {
-                .generic => if (key_bits == 192) {
+                .generic => if (StdGcm == void) {
                     var g = Generic.init(key.*);
                     defer crypto.secureZero(u8, mem.asBytes(&g));
                     return g.open(m, c, tag, ad, npub); // zeroes `m` on failure
@@ -295,9 +328,9 @@ fn AesGcm(comptime key_bits: u16) type {
                     return err;
                 },
                 .aesni => if (x86_asm) {
-                    var k = Ni.init(key.*, powersFor(ad.len, m.len));
+                    var k = Ni.init(key.*, @max(powersFor(ad.len, m.len), noncePowers(nl)));
                     defer wipeBlocks(@ptrCast(&k), @sizeOf(@TypeOf(k)) / 16);
-                    return k.open(m, c, tag, ad, npub);
+                    return k.open(tl, nl, m, c, tag, ad, npub);
                 } else unreachable,
             }
         }
@@ -323,11 +356,22 @@ fn AesGcm(comptime key_bits: u16) type {
                 return Ghash.initForBlockCount(&g.h, blocks);
             }
 
-            /// `J0` and `E(K, J0)`.
+            /// `J0` and `E(K, J0)`. J0 is `IV ‖ 0³¹1` for a 96-bit IV, else
+            /// GHASH_H(IV ‖ 0^s ‖ 0⁶⁴ ‖ [len(IV)]₆₄) (SP 800-38D §7.1).
             fn j0(g: *const Generic, npub: [nonce_length]u8) struct { [16]u8, [16]u8 } {
                 var j: [16]u8 = undefined;
-                j[0..nonce_length].* = npub;
-                mem.writeInt(u32, j[nonce_length..][0..4], 1, .big);
+                if (nl == 12) {
+                    j[0..12].* = npub;
+                    mem.writeInt(u32, j[12..][0..4], 1, .big);
+                } else {
+                    var mac = Ghash.initForBlockCount(&g.h, (nl + 15) / 16 + 1);
+                    mac.update(&npub);
+                    mac.pad();
+                    var len_block: [16]u8 = @splat(0);
+                    mem.writeInt(u64, len_block[8..16], @as(u64, nl) * 8, .big);
+                    mac.update(&len_block);
+                    mac.final(&j); // wipes `mac`
+                }
                 var t: [16]u8 = undefined;
                 g.aes.encrypt(&t, &j);
                 return .{ j, t };
@@ -342,21 +386,41 @@ fn AesGcm(comptime key_bits: u16) type {
                 for (out, t) |*o, x| o.* ^= x;
             }
 
-            fn seal(g: *const Generic, c: []u8, tag: *[16]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8) void {
-                var j, var t = g.j0(npub);
+            /// GCTR from inc32(J0) (SP 800-38D §6.5): the counter is the low
+            /// 32 bits only. std's `modes.ctr` increments all 128, which is
+            /// the same as long as the low word does not wrap — always, for a
+            /// 96-bit IV (it starts at 2 and `max_message_len` stops it at
+            /// 2³² − 1) — so the message is split where it would wrap, and
+            /// the second part restarts the low word at 0.
+            fn gctr(g: *const Generic, dst: []u8, src: []const u8, j: [16]u8) void {
+                var cb = j;
+                const low = mem.readInt(u32, cb[12..16], .big) +% 1;
+                mem.writeInt(u32, cb[12..16], low, .big);
+                const room = (@as(u64, 1) << 32) - low; // blocks before the wrap
+                const split: usize = @intCast(@min(@as(u64, src.len), room * 16));
+                crypto.core.modes.ctr(@TypeOf(g.aes), g.aes, dst[0..split], src[0..split], cb, .big);
+                if (split == src.len) return;
+                mem.writeInt(u32, cb[12..16], 0, .big);
+                crypto.core.modes.ctr(@TypeOf(g.aes), g.aes, dst[split..], src[split..], cb, .big);
+            }
+
+            fn seal(g: *const Generic, c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8) void {
+                const j, var t = g.j0(npub);
                 defer crypto.secureZero(u8, &t);
                 var mac = g.ghash(ad.len, m.len);
                 mac.update(ad);
                 mac.pad();
-                mem.writeInt(u32, j[nonce_length..][0..4], 2, .big);
-                crypto.core.modes.ctr(@TypeOf(g.aes), g.aes, c, m, j, .big);
+                g.gctr(c, m, j);
                 mac.update(c);
                 mac.pad();
-                finish(&mac, ad.len, m.len, t, tag);
+                if (tl == 16) return finish(&mac, ad.len, m.len, t, tag);
+                var full: [16]u8 = undefined;
+                finish(&mac, ad.len, m.len, t, &full);
+                tag.* = full[0..tl].*;
             }
 
-            fn open(g: *const Generic, m: []u8, c: []const u8, tag: [16]u8, ad: []const u8, npub: [nonce_length]u8) AuthenticationError!void {
-                var j, var t = g.j0(npub);
+            fn open(g: *const Generic, m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8) AuthenticationError!void {
+                const j, var t = g.j0(npub);
                 defer crypto.secureZero(u8, &t);
                 var mac = g.ghash(ad.len, c.len);
                 mac.update(ad);
@@ -366,12 +430,11 @@ fn AesGcm(comptime key_bits: u16) type {
                 var computed: [16]u8 = undefined;
                 defer crypto.secureZero(u8, &computed);
                 finish(&mac, ad.len, c.len, t, &computed);
-                if (!crypto.timing_safe.eql([16]u8, computed, tag)) {
+                if (!crypto.timing_safe.eql([tl]u8, computed[0..tl].*, tag)) {
                     crypto.secureZero(u8, m);
                     return error.AuthenticationFailed;
                 }
-                mem.writeInt(u32, j[nonce_length..][0..4], 2, .big);
-                crypto.core.modes.ctr(@TypeOf(g.aes), g.aes, m, c, j, .big);
+                g.gctr(m, c, j);
             }
         };
     };
@@ -386,6 +449,14 @@ const max_message_len = 16 * ((1 << 32) - 2);
 /// widest aggregated group, at most eight blocks — for a short message the
 /// single group of AD, ciphertext and length block; else the widest of the
 /// AD groups and the ciphertext's last group plus the length block.
+/// How many GHASH key powers hashing an `n`-byte nonce into J0 touches (none
+/// for 12 bytes): `ghashBytes` folds whole 128-byte chunks with all eight
+/// and the rest as one group, and the length block takes H itself.
+fn noncePowers(comptime n: usize) usize {
+    if (n == 12) return 0;
+    return if (n >= 128) 8 else (n + 15) / 16;
+}
+
 fn powersFor(ad_len: usize, m_len: usize) usize {
     const a = (ad_len + 15) / 16;
     const m = (m_len + 15) / 16;
@@ -883,8 +954,13 @@ fn NiKey(comptime key_bits: u16) type {
             return k.openTail(ctr, acc, m[i..], c[i..], ad, lens);
         }
 
-        fn j0Block(npub: [12]u8) V {
-            return load(&(npub ++ [4]u8{ 0, 0, 0, 1 }));
+        /// J0 (SP 800-38D §7.1 step 2): `IV ‖ 0³¹1` for a 96-bit IV,
+        /// else GHASH_H(IV ‖ 0^s ‖ 0⁶⁴ ‖ [len(IV)]₆₄) — the nonce hashed as
+        /// whole zero-padded blocks, then a length block carrying only the
+        /// IV's bit length (`lengths(0, n)`). Needs the powers `noncePowers(n)`.
+        fn j0Block(k: *const Self, comptime n: usize, npub: [n]u8) V {
+            if (n == 12) return load(&(npub ++ [4]u8{ 0, 0, 0, 1 }));
+            return bswap(gmul(ghashBytes(&k.h, zero_v, &npub) ^ lengths(0, n), k.h[0]));
         }
 
         /// The length block [len(A)]₆₄ ‖ [len(C)]₆₄ in bits, byte-reversed.
@@ -892,19 +968,23 @@ fn NiKey(comptime key_bits: u16) type {
             return .{ @as(u64, m_len) * 8, @as(u64, ad_len) * 8 };
         }
 
-        fn seal(k: *const Self, c: []u8, t: *[16]u8, m: []const u8, ad: []const u8, npub: [12]u8) void {
-            const j0 = j0Block(npub);
+        /// `t` gets the first `tl` bytes of the tag (SP 800-38D §5.2.1.2 MSB_t).
+        fn seal(k: *const Self, comptime tl: usize, comptime nl: usize, c: []u8, t: *[tl]u8, m: []const u8, ad: []const u8, npub: [nl]u8) void {
+            const j0 = k.j0Block(nl, npub);
             const ctr = ctrAdd(bswap(j0), 1);
             const lens = lengths(ad.len, m.len);
             const s = if (isShort(ad.len, m.len))
                 k.sealBody(ctr, zero_v, c, m, ad, lens)
             else
                 k.sealBody(ctr, ghashBytes(&k.h, zero_v, ad), c, m, "", lens);
-            store(t, bswap(s) ^ k.encBlock(j0));
+            if (tl == 16) return store(t, bswap(s) ^ k.encBlock(j0));
+            var full: [16]u8 = undefined;
+            store(&full, bswap(s) ^ k.encBlock(j0));
+            t.* = full[0..tl].*;
         }
 
-        fn open(k: *const Self, m: []u8, c: []const u8, t: [16]u8, ad: []const u8, npub: [12]u8) AuthenticationError!void {
-            const j0 = j0Block(npub);
+        fn open(k: *const Self, comptime tl: usize, comptime nl: usize, m: []u8, c: []const u8, t: [tl]u8, ad: []const u8, npub: [nl]u8) AuthenticationError!void {
+            const j0 = k.j0Block(nl, npub);
             const ctr = ctrAdd(bswap(j0), 1);
             const lens = lengths(ad.len, c.len);
             const s = if (isShort(ad.len, c.len))
@@ -914,7 +994,7 @@ fn NiKey(comptime key_bits: u16) type {
             var computed: [16]u8 = undefined;
             defer wipeBlocks(&computed, 1);
             store(&computed, bswap(s) ^ k.encBlock(j0));
-            if (!crypto.timing_safe.eql([16]u8, computed, t)) {
+            if (!crypto.timing_safe.eql([tl]u8, computed[0..tl].*, t)) {
                 crypto.secureZero(u8, m);
                 return error.AuthenticationFailed;
             }
@@ -1082,7 +1162,7 @@ test "Wycheproof aes_gcm_test.json: valid vectors encrypt, modified tags are ref
     var counts = [2]usize{ 0, 0 };
     inline for (.{ Aes128Gcm, Aes192Gcm, Aes256Gcm }) |Gcm| {
         for (wycheproof) |v| {
-            if (v.bits != Gcm.key_length * 8) continue;
+            if (v.bits != Gcm.key_length * 8 or v.iv.len != 2 * 12) continue; // other IVs: next test
             counts[@intFromBool(v.valid)] += 1;
             var key: [Gcm.key_length]u8 = undefined;
             var iv: [12]u8 = undefined;
@@ -1129,6 +1209,166 @@ test "Wycheproof aes_gcm_test.json: valid vectors encrypt, modified tags are ref
     // 79 + 54 for 128/256; 37 + 27 for 192 (added 2026-10-10).
     try testing.expectEqual(@as(usize, 116), counts[1]);
     try testing.expectEqual(@as(usize, 81), counts[0]);
+}
+
+/// The IV lengths of Wycheproof's non-96-bit groups, in bytes (8 … 2056 bits).
+const wycheproof_iv_lengths = [_]usize{ 1, 2, 4, 6, 8, 10, 15, 16, 20, 32, 64, 128, 257 };
+
+test "Wycheproof aes_gcm_test.json: nonces other than 96 bits (J0 by GHASH) and the counter wrap" {
+    // Every valid test with an IV other than 96 bits -- small, long and the
+    // CounterWrap ones, whose J0 ends in ffffffff, fffffffe, … so the 32-bit
+    // counter wraps inside the 40-byte message: the kernel's inc32 and the
+    // generic backend's split of std's 128-bit `modes.ctr` both.
+    var seen: usize = 0;
+    inline for (.{ 128, 192, 256 }) |bits| {
+        inline for (wycheproof_iv_lengths) |n| {
+            const Gcm = AesGcm(bits, .{ .nonce_length = n });
+            for (wycheproof) |v| {
+                if (v.bits != bits or v.iv.len != 2 * n) continue;
+                try testing.expect(v.valid); // Wycheproof has no modified tags at these IV sizes
+                seen += 1;
+                var key: [Gcm.key_length]u8 = undefined;
+                var iv: [n]u8 = undefined;
+                var tag: [16]u8 = undefined;
+                _ = try std.fmt.hexToBytes(&key, v.key);
+                _ = try std.fmt.hexToBytes(&iv, v.iv);
+                _ = try std.fmt.hexToBytes(&tag, v.tag);
+                const aad = try hexAlloc(v.aad);
+                defer testing.allocator.free(aad);
+                const msg = try hexAlloc(v.msg);
+                defer testing.allocator.free(msg);
+                const ct = try hexAlloc(v.ct);
+                defer testing.allocator.free(ct);
+                const out = try testing.allocator.alloc(u8, msg.len);
+                defer testing.allocator.free(out);
+                for (all_backends) |b| {
+                    var ctx = Gcm.initWith(b, key) orelse continue;
+                    var t: [16]u8 = undefined;
+                    ctx.encrypt(out, &t, msg, aad, iv);
+                    try testing.expectEqualSlices(u8, ct, out);
+                    try testing.expectEqualSlices(u8, &tag, &t);
+                    try ctx.decrypt(out, ct, tag, aad, iv);
+                    try testing.expectEqualSlices(u8, msg, out);
+                    var forged = tag;
+                    forged[15] ^= 1;
+                    try testing.expectError(error.AuthenticationFailed, ctx.decrypt(out, ct, forged, aad, iv));
+                    for (out) |byte| try testing.expectEqual(@as(u8, 0), byte);
+                }
+                var t: [16]u8 = undefined;
+                Gcm.encrypt(out, &t, msg, aad, iv, key);
+                try testing.expectEqualSlices(u8, ct, out);
+                try testing.expectEqualSlices(u8, &tag, &t);
+                try Gcm.decrypt(out, ct, tag, aad, iv, key);
+                try testing.expectEqualSlices(u8, msg, out);
+            }
+        }
+    }
+    // 39 + 37 + 37 valid tests (the 128-bit key has one more 64-bit-IV KAT).
+    try testing.expectEqual(@as(usize, 113), seen);
+}
+
+// OpenSSL's answer for nonces other than 96 bits on the long-message paths
+// (`tools/openssl_kat.py`, second table): `pattern` nonces of 8, 16, 60 and
+// 128 bytes, and three Wycheproof CounterWrap key/nonce pairs whose 32-bit
+// counter wraps inside the stitched eight-block loop.
+const openssl_nonce_kats = @import("testdata/openssl_kat.zig").nonce_vectors;
+
+test "nonces other than 96 bits agree with OpenSSL on long messages, across the counter wrap" {
+    const buf = try testing.allocator.alloc(u8, 3 * 20_000);
+    defer testing.allocator.free(buf);
+    var seen: usize = 0;
+    inline for (.{ 128, 192, 256 }) |bits| {
+        inline for (.{ 8, 16, 60, 128 }) |n| {
+            const Gcm = AesGcm(bits, .{ .nonce_length = n });
+            for (openssl_nonce_kats) |v| {
+                if (v.bits != bits or v.nonce.len != 2 * n) continue;
+                seen += 1;
+                var key: [Gcm.key_length]u8 = undefined;
+                var iv: [n]u8 = undefined;
+                _ = try std.fmt.hexToBytes(&key, v.key);
+                _ = try std.fmt.hexToBytes(&iv, v.nonce);
+                const ad = buf[0..v.ad_len];
+                const m = buf[20_000..][0..v.m_len];
+                const c = buf[40_000..][0..v.m_len];
+                pattern(ad, 3);
+                pattern(m, 4);
+                var want_tag: [16]u8 = undefined;
+                var want_sha: [32]u8 = undefined;
+                _ = try std.fmt.hexToBytes(&want_tag, v.tag);
+                _ = try std.fmt.hexToBytes(&want_sha, v.ct_sha256);
+                for (all_backends) |b| {
+                    var ctx = Gcm.initWith(b, key) orelse continue;
+                    var t: [16]u8 = undefined;
+                    ctx.encrypt(c, &t, m, ad, iv);
+                    try testing.expectEqualSlices(u8, &want_tag, &t);
+                    var d: [32]u8 = undefined;
+                    crypto.hash.sha2.Sha256.hash(c, &d, .{});
+                    try testing.expectEqualSlices(u8, &want_sha, &d);
+                    try ctx.decrypt(c, c, t, ad, iv);
+                    try testing.expectEqualSlices(u8, m, c);
+                }
+                var t: [16]u8 = undefined;
+                Gcm.encrypt(c, &t, m, ad, iv, key);
+                try testing.expectEqualSlices(u8, &want_tag, &t);
+                try Gcm.decrypt(c, c, t, ad, iv, key);
+                try testing.expectEqualSlices(u8, m, c);
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 3 * 7 * 7), seen);
+}
+
+test "a shorter tag is the leading bytes of the full one, and every bit of it is checked" {
+    // SP 800-38D §5.2.1.2: T = MSB_t(full tag). The full tag is anchored by
+    // the vectors above; here every shorter length, on both nonce paths and
+    // every backend, against it, and each bit of the short tag flipped.
+    var key: [16]u8 = undefined;
+    pattern(&key, 1);
+    var m: [300]u8 = undefined;
+    var ad: [20]u8 = undefined;
+    pattern(&m, 4);
+    pattern(&ad, 3);
+    inline for (.{ 12, 16 }) |nl| {
+        const Full = AesGcm(128, .{ .nonce_length = nl });
+        var iv: [nl]u8 = undefined;
+        pattern(&iv, 2);
+        inline for (.{ 4, 8, 12, 13, 14, 15 }) |tl| {
+            const Short = AesGcm(128, .{ .nonce_length = nl, .tag_length = tl });
+            for ([_]usize{ 0, 17, 300 }) |ml| {
+                var c_full: [300]u8 = undefined;
+                var t_full: [16]u8 = undefined;
+                Full.encrypt(c_full[0..ml], &t_full, m[0..ml], &ad, iv, key);
+                for (all_backends) |b| {
+                    var ctx = Short.initWith(b, key) orelse continue;
+                    var c: [300]u8 = undefined;
+                    var t: [tl]u8 = undefined;
+                    ctx.encrypt(c[0..ml], &t, m[0..ml], &ad, iv);
+                    try testing.expectEqualSlices(u8, c_full[0..ml], c[0..ml]);
+                    try testing.expectEqualSlices(u8, t_full[0..tl], &t);
+                    var out: [300]u8 = undefined;
+                    try ctx.decrypt(out[0..ml], c[0..ml], t, &ad, iv);
+                    try testing.expectEqualSlices(u8, m[0..ml], out[0..ml]);
+                    for (0..tl * 8) |bit| {
+                        var forged = t;
+                        forged[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
+                        @memset(&out, 0xaa);
+                        try testing.expectError(error.AuthenticationFailed, ctx.decrypt(out[0..ml], c[0..ml], forged, &ad, iv));
+                        for (out[0..ml]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+                    }
+                }
+                var t: [tl]u8 = undefined;
+                var c: [300]u8 = undefined;
+                Short.encrypt(c[0..ml], &t, m[0..ml], &ad, iv, key);
+                try testing.expectEqualSlices(u8, t_full[0..tl], &t);
+                var forged = t;
+                forged[tl - 1] ^= 0x80;
+                var out: [300]u8 = undefined;
+                try testing.expectError(error.AuthenticationFailed, Short.decrypt(out[0..ml], c[0..ml], forged, &ad, iv, key));
+                try Short.decrypt(out[0..ml], c[0..ml], t, &ad, iv, key);
+                try testing.expectEqualSlices(u8, m[0..ml], out[0..ml]);
+            }
+        }
+    }
 }
 
 fn hexAlloc(s: []const u8) ![]u8 {
@@ -1301,6 +1541,33 @@ test "the stateless functions compute exactly the GHASH powers they use" {
     try testing.expectEqual(@as(usize, 8), powersFor(5, 96)); // the largest short one
     try testing.expectEqual(@as(usize, 8), powersFor(5, 97)); // not short: 7 + 1
     try testing.expectEqual(@as(usize, 8), powersFor(0, 1 << 20));
+
+    // A hashed nonce adds its own groups: the stateless context must cover
+    // them too, also when the message itself needs fewer powers.
+    inline for (.{ 1, 16, 17, 60, 127, 128, 200 }) |nl| {
+        const Gcm = AesGcm(128, .{ .nonce_length = nl });
+        var iv_n: [nl]u8 = undefined;
+        rnd.bytes(&iv_n);
+        var ctx_n = Gcm.init(key);
+        defer ctx_n.wipe();
+        for ([_]usize{ 0, 1, 17, 129 }) |ml| {
+            for ([_]usize{ 0, 13, 130 }) |al| {
+                var c1: [300]u8 = undefined;
+                var c2: [300]u8 = undefined;
+                var t1: [16]u8 = undefined;
+                var t2: [16]u8 = undefined;
+                Gcm.encrypt(c1[0..ml], &t1, m[0..ml], ad[0..al], iv_n, key);
+                ctx_n.encrypt(c2[0..ml], &t2, m[0..ml], ad[0..al], iv_n);
+                try testing.expectEqualSlices(u8, c2[0..ml], c1[0..ml]);
+                try testing.expectEqualSlices(u8, &t2, &t1);
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), noncePowers(12));
+    try testing.expectEqual(@as(usize, 1), noncePowers(1));
+    try testing.expectEqual(@as(usize, 2), noncePowers(17));
+    try testing.expectEqual(@as(usize, 8), noncePowers(127));
+    try testing.expectEqual(@as(usize, 8), noncePowers(200));
 }
 
 test "every single-bit change of tag, ciphertext or AD is refused, and the output zeroed" {
@@ -1363,7 +1630,7 @@ test "the 32-bit counter wraps modulo 2^32 and leaves the nonce bits alone (inc3
     const rnd = prng.random();
     inline for (.{ 128, 192, 256 }) |bits| {
         const Ni = NiKey(bits);
-        const StdAes = AesGcm(bits).BlockCipher;
+        const StdAes = AesGcm(bits, .{}).BlockCipher;
         var key: [bits / 8]u8 = undefined;
         rnd.bytes(&key);
         const k = Ni.init(key, 8);
@@ -1413,7 +1680,7 @@ test "the x86 key expansion and GHASH multiply agree with std" {
             // AES-192: the `aes192` module, itself anchored on FIPS-197 A.2/C.2
             // and NIST CAVP, so the kernel's own Nk = 6 expansion is checked
             // against an independent one.
-            const StdAes = AesGcm(bits).BlockCipher;
+            const StdAes = AesGcm(bits, .{}).BlockCipher;
             var key: [bits / 8]u8 = undefined;
             rnd.bytes(&key);
             const k = NiKey(bits).init(key, 8);
@@ -1479,7 +1746,7 @@ test "fuzz: every backend agrees with std on arbitrary key, nonce, AD and messag
 }
 
 const fuzz_driver = @import("testkit").fuzz.driver;
-const FuzzLabel = enum { genuine_accepted, forged_rejected, nonempty_message };
+const FuzzLabel = enum { genuine_accepted, forged_rejected, nonempty_message, other_shape_agreed };
 var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
 
 fn mark(comptime l: FuzzLabel) void {
@@ -1513,9 +1780,25 @@ fn fuzzAgree(_: void, smith: *std.testing.Smith) !void {
     return agreeHarness(std.testing.Smith, smith, testing.allocator);
 }
 
+/// The non-default shapes the fuzz harness draws from: hashed nonces (short,
+/// one block, crossing blocks, past one aggregated group) and short tags.
+const fuzz_shapes = [_]Options{
+    .{ .nonce_length = 1 },
+    .{ .nonce_length = 8, .tag_length = 12 },
+    .{ .nonce_length = 16 },
+    .{ .nonce_length = 16, .tag_length = 4 },
+    .{ .nonce_length = 60, .tag_length = 13 },
+    .{ .nonce_length = 128, .tag_length = 8 },
+    .{ .nonce_length = 200 },
+    .{ .tag_length = 14 },
+};
+
 /// Generic over its source (`Smith` under `--fuzz`, `fuzz_driver.Rng` under the driver).
 /// Besides the differential against std, the genuine tag must be ACCEPTED (and
-/// decrypt to the message) and an arbitrary one refused.
+/// decrypt to the message) and an arbitrary one refused. Then one shape of
+/// `fuzz_shapes`, where std has no answer: the backends and the stateless
+/// path must agree with each other (J0 by the kernel's GHASH against std's
+/// `Ghash`, inc32 against the split `modes.ctr`), and the genuine tag open.
 fn agreeHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     _ = gpa;
     var key: [32]u8 = undefined;
@@ -1550,6 +1833,32 @@ fn agreeHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!vo
             try testing.expectEqual(mem.eql(u8, &forged, &want_t), ok);
             if (!ok) mark(.forged_rejected);
         }
+    }
+
+    var sel: [1]u8 = undefined;
+    smith.bytes(&sel);
+    var nonce: [200]u8 = undefined;
+    smith.bytes(&nonce);
+    switch (sel[0] % fuzz_shapes.len) {
+        inline 0...fuzz_shapes.len - 1 => |i| {
+            const shape = fuzz_shapes[i];
+            const Gcm = AesGcm(256, shape);
+            const k = key;
+            const n = nonce[0..shape.nonce_length].*;
+            var want_t: [shape.tag_length]u8 = undefined;
+            Gcm.encrypt(d, &want_t, m, ad[0..ad_len], n, k);
+            for (all_backends) |b| {
+                var ctx = Gcm.initWith(b, k) orelse continue;
+                var t: [shape.tag_length]u8 = undefined;
+                ctx.encrypt(c, &t, m, ad[0..ad_len], n);
+                try testing.expectEqualSlices(u8, d, c);
+                try testing.expectEqualSlices(u8, &want_t, &t);
+                ctx.decrypt(c, d, want_t, ad[0..ad_len], n) catch return error.GenuineMessageRejected;
+                try testing.expectEqualSlices(u8, m, c);
+            }
+            mark(.other_shape_agreed);
+        },
+        else => unreachable,
     }
 }
 

@@ -1046,9 +1046,9 @@ bip32	ReleaseFast	mnemonic	1	3	a5dbfbf5eee08b66	d42db8cf9cdc2200
 # 2026-10-10: AES-192 added to the harness (Aes192Gcm; generic over the aes192
 # module, kernel with Nr = 12) -- 4 -> 6 per row, the same tag-check line for
 # the third key size, nothing else.
-aesgcm	ReleaseFast	ctx	1	6	c3d21ae3d7c7681b	b60805fea700d105
-aesgcm	ReleaseFast	stateless	1	6	c3d21ae3d7c7681b	b60805fea700d105
-aesgcm	ReleaseFast	generic	1	6	c3d21ae3d7c7681b	b60805fea700d105
+aesgcm	ReleaseFast	ctx	1	6	8ecf4daa6af9a981	b60805fea700d105
+aesgcm	ReleaseFast	stateless	1	6	8ecf4daa6af9a981	b60805fea700d105
+aesgcm	ReleaseFast	generic	1	6	8ecf4daa6af9a981	b60805fea700d105
 # groth16 (2026-10-09): the zkey prover's `.constant_time` MSM choice
 # (`zkprove.proveWith`). zkprove_ct pins 6 in-file, all at the public end:
 # `toAffine` on the three proof points (zkprove.zig, the return) -- the identity

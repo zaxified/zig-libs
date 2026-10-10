@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Nonce and tag lengths: `pub fn AesGcm(key_bits, Options)` with
+  `Options{ .nonce_length = 12, .tag_length = 16 }` — any nonce of 1 byte or more (J0 by
+  GHASH, SP 800-38D §7.1) and tags of 16/15/14/13/12, or 8/4 under Appendix C; other
+  lengths are compile errors. `Aes128Gcm`/`Aes192Gcm`/`Aes256Gcm` are `AesGcm(n, .{})`,
+  unchanged in API and code path (a 12-byte nonce still builds J0 directly; the stateless
+  generic path still calls std's AEAD for 128/256). The generic backend's CTR now wraps the
+  32-bit counter as inc32 when a hashed nonce puts J0 near the wrap (std's `modes.ctr` alone
+  would carry into the nonce bits). Anchors: Wycheproof's 113 non-96-bit-IV tests incl.
+  CounterWrap, 147 OpenSSL long-message rows with 8/16/60/128-byte and counter-wrapping
+  nonces, every shorter tag against the full one with each bit flipped; fuzz harness draws
+  eight nonce/tag shapes (backends and stateless must agree). ctgrind re-measured: same 6
+  in-file contexts per row (the tag-check verdict), digests updated. Scope core → parity.
+
 - **2026-10-10** — tools: comparative benchmark `tools/bench.zig` + `tools/c_bench/foreign_bench.c` (`zig build bench-aesgcm`) against OpenSSL 3.5.5 EVP AES-GCM; card Performance filled (0.23–1.00×, fastest not measured) and a SPEC "Performance" section with the raw table.
 - **2026-10-10** — AES-192: new `Aes192Gcm` (same API). Generic backend and stateless generic path over the new `aes192` module (dep added; std 0.16 has no AES-192); the x86-64 stitched kernel runs it with Nr = 12 and its own `aesenclast` Nk = 6 key expansion (checked against `aes192`). Anchors: McGrew–Viega 7–10, 17 OpenSSL long-message rows, Wycheproof's 64 AES-192 tests (37 valid, 27 forged); differential, bit-flip, inc32 and fuzz harnesses cover all three sizes. ctgrind rows 4 → 6 in-file (the tag-check verdict for the third key size).
 - **2026-10-09** — tests: deterministic fuzz driver `AESGCM_FUZZ` over the existing harnesses (the harness also checks that the genuine tag is accepted and decrypts to the message).

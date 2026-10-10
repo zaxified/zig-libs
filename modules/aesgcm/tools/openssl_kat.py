@@ -12,6 +12,16 @@ Key, nonce, AD and plaintext are the test's `pattern` bytes with seeds 1, 2,
 cover the paths of the x86-64 kernel: tail only (< 128 bytes), one batch plus
 the delayed GHASH (128..255), the stitched loop (>= 256), with and without a
 partial last block, AD shorter and longer than one aggregated group.
+
+The second table, `nonce_vectors` (2026-10-10), takes nonces other than 96
+bits (J0 = GHASH of the nonce, SP 800-38D §7.1) through the same long-message
+paths: `pattern` nonces of 8, 16, 60 and 128 bytes (the `cryptography` package
+accepts 8..128), and three 16-byte nonces from Wycheproof's CounterWrap tests
+whose J0 ends in fffffffe, fffffffd and 7fffffff under Wycheproof's key -- so
+the 32-bit counter wraps inside the stitched loop, which Wycheproof's own
+40-byte messages never reach. Those three key/nonce pairs are Wycheproof data
+(Apache-2.0, see ../NOTICE): tcIds 80/84/85 (128-bit key), 160/164/165 (192),
+243/247/248 (256).
 """
 import hashlib
 
@@ -43,4 +53,31 @@ for bits in (128, 192, 256):
         ct, tag = out[:-16], out[-16:]
         print(f'    .{{ .bits = {bits}, .ad_len = {ad_len}, .m_len = {m_len}, '
               f'.tag = "{tag.hex()}", .ct_sha256 = "{hashlib.sha256(ct).hexdigest()}" }},')
+print("};")
+
+WRAP_KEYS = {
+    128: "00112233445566778899aabbccddeeff",
+    192: "00112233445566778899aabbccddeeff1021324354657687",
+    256: "00112233445566778899aabbccddeeff102132435465768798a9bacbdcedfe0f",
+}
+WRAP_NONCES = {  # J0 ...fffffffe, 000102030405060708090a0bfffffffd, ...0a0b7fffffff
+    128: ("dd9d0b4a0c3d681524bffca31d907661", "d4125676562984c0fe7cb0bdd1a954e8", "b97ec62a5e5900ccf9e4be332e336091"),
+    192: ("40bb0abebc483ff6d5671241ff5d66c6", "db1821ac59c38e9f1e25a2eee9930313", "f7a02ecca03064b2ef3cce9feab79f07"),
+    256: ("918e3c19dbdfee2db18156c5b93f3d75", "538816c3f849067cf8576cd62b90b99c", "d10e631943cd3bdababab2bbd13951c0"),
+}
+NONCE_CASES = [(0, 0), (20, 127), (16, 129), (129, 257), (13, 480), (61, 4099), (1000, 19999)]
+
+print()
+print("pub const NonceVector = struct { bits: u16, key: []const u8, nonce: []const u8, ad_len: usize, m_len: usize, tag: []const u8, ct_sha256: []const u8 };")
+print()
+print("pub const nonce_vectors = [_]NonceVector{")
+for bits in (128, 192, 256):
+    shapes = [(pattern(bits // 8, 1), pattern(n, 2)) for n in (8, 16, 60, 128)]
+    shapes += [(bytes.fromhex(WRAP_KEYS[bits]), bytes.fromhex(n)) for n in WRAP_NONCES[bits]]
+    for key, iv in shapes:
+        for ad_len, m_len in NONCE_CASES:
+            out = AESGCM(key).encrypt(iv, pattern(m_len, 4), pattern(ad_len, 3))
+            ct, tag = out[:-16], out[-16:]
+            print(f'    .{{ .bits = {bits}, .key = "{key.hex()}", .nonce = "{iv.hex()}", .ad_len = {ad_len}, .m_len = {m_len}, '
+                  f'.tag = "{tag.hex()}", .ct_sha256 = "{hashlib.sha256(ct).hexdigest()}" }},')
 print("};")
