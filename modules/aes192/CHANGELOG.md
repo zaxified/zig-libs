@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-10** — Scope survey (OpenSSL reference, Go `crypto/aes`, RustCrypto `aes`, Zig std):
+  `parity`; `## Compared with` table added; grade 4 (no longer provisional). Docs only.
 - **2026-10-10** — New module: the AES-192 block cipher std 0.16 lacks, shaped like std's
   `Aes128`/`Aes256` (`Aes192`, `Aes192EncryptCtx`, `Aes192DecryptCtx`, `*Into` twins, `wipe`).
   Own FIPS-197 §5.2 key expansion (SubWord through std's `Block.encryptLast`), std's round
