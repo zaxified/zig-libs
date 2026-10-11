@@ -360,7 +360,7 @@ way to recognise it.
 |---|:-:|---|---|---|
 | [`aaa-gate`](modules/aaa-gate/README.md) | 3 (S,E,H,P) | Bearer + API-key auth (constant-time) + audit hook + denied-request throttle | any | router, http |
 | [`abuseguard`](modules/abuseguard/README.md) | 2 (S,A) | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | posix | http, netaddr, router |
-| [`accesslog`](modules/accesslog/README.md) | 3 (S) | Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge; thread-safe group-commit `Sink` for one shared log file | any | http |
+| [`accesslog`](modules/accesslog/README.md) | 2 (S,A,P) | Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge; thread-safe group-commit `Sink` for one shared log file | any | http, router |
 | [`acme`](modules/acme/README.md) | 3 (S,H) | Let's Encrypt / ACME v2 (RFC 8555) — HTTP-01, TLS-ALPN-01 and DNS-01 (wildcard) issuance + renewal, ES256 JWS, CSR | any | http, router, entropy, p256 |
 | [`aescbc`](modules/aescbc/README.md) | 3 (S,P) | Raw AES-CBC (NIST SP800-38A) + PKCS#7/XML-Enc padding helpers, zero-alloc; padding-oracle caveat — consumers own authenticate-before-unpad | any | — |
 | [`aeskw`](modules/aeskw/README.md) | 3 (S,P) | RFC 3394 AES Key Wrap (AES-128/256 KEK) — constant-time integrity check + scratch zeroization, byte-exact vs RFC 3394 test vectors | any | aes192 |

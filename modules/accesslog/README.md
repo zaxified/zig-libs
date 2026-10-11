@@ -85,6 +85,31 @@ fn handle(req: *http.Server.Request, res: *http.Server.ResponseWriter) !void {
 anything else the live types can't supply (latency, a correlation id, a preformatted Combined
 time string) comes from `FromRequestOptions`.
 
+## Extra fields, a template, a router middleware
+
+```zig
+// Entry.extra: more keys after the fixed ones (JSON Lines, logfmt). Key grammar
+// [A-Za-z0-9_.-]{1,64}; a bad, repeated or fixed-name key is skipped, never written.
+entry.extra = &.{ .{ .key = "tenant", .value = "acme" }, .{ .key = "cache", .value = "HIT" } };
+
+// LogFormat: an Apache mod_log_config template, parsed once (comptime or runtime).
+const clf = comptime accesslog.LogFormat.comptimeParse("%h %l %u %t \"%r\" %>s %b");
+const mine = try accesslog.LogFormat.parse("%h %{tenant}x %>s %D \"%{User-Agent}i\"");
+try mine.write(entry, w); // one line, every value escaped like Combined
+
+// Logger: one line per request from a router chain; the clock is injected.
+var logger = accesslog.Logger{ .sink = &sink, .clock = .{ .now_ns = myNowNs } };
+try router.use(logger.middleware());
+```
+
+Directives: `%h %l %u %t %r %s %>s %b %B %D %T %m %U %q %H %%`, `%{Referer}i`,
+`%{User-Agent}i`, `%{key}x` (an `extra` field). `%{Name}o` and other request headers are
+rejected at parse (`Entry` carries neither). `%b` prints `-` only for an unknown size.
+`Logger` takes its ids from optional functions (`request_id`, `trace_id`, `span_id`, `user`,
+`extra_fn`), e.g. `requestid.current()`; the format is the `Sink`'s. `keep` makes logging
+conditional (nginx `access_log if=`, Apache `CustomLog env=`): it sees the finished request and
+whether the chain failed, so "only errors" or "one in N" is one function.
+
 ## Time contract — no system clock, ever
 
 `Entry.timestamp_ns` is always caller-supplied (ns since the Unix epoch); this module never

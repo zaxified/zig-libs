@@ -148,7 +148,7 @@ const module_list = [_]Module{
     // `zig build check-testonly` proves the published module never needs it.
     .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{ "netaddr", "datefmt", "tlsclient", "crc32" }, .test_deps = &.{ "testkit", "workerpool" }, .loopback = true },
     .{ .name = "websocket", .libs = &.{"web"}, .deps = &.{"http"}, .test_deps = &.{"testkit"} },
-    .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{"http"}, .test_deps = &.{"testkit"} },
+    .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{ "http", "router" }, .test_deps = &.{"testkit"} },
     .{ .name = "staticfiles", .libs = &.{"web"}, .deps = &.{"http"}, .test_deps = &.{"testkit"} },
     .{ .name = "brotli", .libs = &.{"web"}, .test_deps = &.{"testkit"} },
     .{ .name = "zstd", .libs = &.{ "format", "storage", "web" }, .test_deps = &.{"testkit"}, .heavy = true },

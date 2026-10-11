@@ -55,6 +55,13 @@
 //! spec-shaped bracket formats the string itself (e.g. with the `datefmt`
 //! module) and passes it as `Entry.time_formatted`.
 //!
+//! ## Extra fields, templates, middleware
+//!
+//! `Entry.extra` carries caller-defined key/value pairs (JSON Lines, logfmt);
+//! `LogFormat` renders an Apache `mod_log_config`-style template; `Logger` is
+//! the `router.Middleware` that logs each request to a `Sink` with an injected
+//! clock. See `Field`, `logformat.zig` and `middleware.zig`.
+//!
 //! ## Writing lines from many threads — `Sink`
 //!
 //! The formatters are pure functions over a caller's `Writer`. A server that
@@ -83,7 +90,7 @@ pub const meta = .{
     // caller-supplied Writer; `Sink` synchronizes its own shared writer.
     .concurrency = .threadsafe,
     .model_after = "Apache mod_log_config (Combined Log Format + ap_escape_logitem escaping) + Heroku/kr logfmt + the common JSON-Lines access-log convention (Caddy/nginx json access log)",
-    .deps = .{"http"},
+    .deps = .{ "http", "router" },
 };
 
 // ── the record ───────────────────────────────────────────────────────────
@@ -146,7 +153,69 @@ pub const Entry = struct {
     /// The span that made this request — traceparent's parent-id (16
     /// lowercase hex chars), if any. Same formats as `trace_id`.
     span_id: ?[]const u8 = null,
+    /// Extra key/value pairs, rendered after the fixed fields in JSON Lines
+    /// (more top-level keys) and logfmt (more pairs), values escaped like any
+    /// other field. Combined is a fixed format and ignores them, except that a
+    /// `LogFormat` template can print one with `%{key}x`. Fields with an
+    /// invalid, colliding or repeated key are skipped -- see `Field` and
+    /// `extraRenderable`. Empty (the default) changes no output byte.
+    extra: []const Field = &.{},
 };
+
+/// One caller-supplied extra key/value pair of `Entry.extra`.
+///
+/// **Key grammar** (`isValidExtraKey`): 1 to `max_extra_key_len` (64) bytes
+/// from `[A-Za-z0-9_.-]`. Keys are written raw (no escaping), which is exactly
+/// why the grammar is that narrow: a key can never carry a quote, `=`, space,
+/// control byte or UTF-8, so it cannot close its JSON string, split a logfmt
+/// pair or start a second line. The **value** is arbitrary bytes and goes
+/// through the format's own value escaper, like every fixed field.
+pub const Field = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// Longest key `Entry.extra` accepts.
+pub const max_extra_key_len = 64;
+
+/// True when `key` matches the `Field` key grammar `[A-Za-z0-9_.-]{1,64}`.
+pub fn isValidExtraKey(key: []const u8) bool {
+    if (key.len == 0 or key.len > max_extra_key_len) return false;
+    for (key) |c| switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '_', '.', '-' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// The keys the JSON Lines and logfmt writers emit themselves. An extra field
+/// whose key equals one of these (ASCII case-insensitively, so a reader that
+/// folds case cannot be fooled either) is skipped.
+const fixed_keys = [_][]const u8{
+    "ts",         "remote_addr", "user",          "method",         "target",
+    "protocol",   "status",      "request_bytes", "response_bytes", "latency_ns",
+    "user_agent", "referer",     "request_id",    "trace_id",       "span_id",
+};
+
+/// The one rule for `Entry.extra`: field `i` is **skipped** (nothing of it is
+/// written) when its key is not a valid key, equals a fixed key, or repeats
+/// the key of an earlier field (first one wins). Skipping, not prefixing or
+/// renaming: a caller bug shows up as a missing key, never as a forged or
+/// shadowed one.
+fn extraRenderable(extra: []const Field, i: usize) bool {
+    const key = extra[i].key;
+    if (!isValidExtraKey(key)) return false;
+    for (fixed_keys) |fk| if (std.ascii.eqlIgnoreCase(key, fk)) return false;
+    for (extra[0..i]) |earlier| if (std.ascii.eqlIgnoreCase(key, earlier.key)) return false;
+    return true;
+}
+
+/// First field of `extra` with exactly this key (the one `LogFormat`'s
+/// `%{key}x` prints).
+pub fn extraValue(extra: []const Field, key: []const u8) ?[]const u8 {
+    for (extra) |f| if (std.mem.eql(u8, f.key, key)) return f.value;
+    return null;
+}
 
 /// Selects which `write*` function `write` dispatches to. Each format is
 /// also directly callable (`writeJsonLines`/`writeLogfmt`/`writeCombined`)
@@ -156,6 +225,13 @@ pub const Format = enum { json_lines, logfmt, combined };
 /// The thread-safe line writer over one shared `std.Io.Writer` — see
 /// `sink.zig` and the module doc's "Writing lines from many threads".
 pub const Sink = @import("sink.zig").Sink;
+
+/// A parsed Apache `mod_log_config`-style line template -- see `logformat.zig`.
+pub const LogFormat = @import("logformat.zig").LogFormat;
+
+/// The `router` middleware that logs every request to a `Sink` -- see
+/// `middleware.zig`.
+pub const Logger = @import("middleware.zig").Logger;
 
 /// Emit `entry` in `format` to `w`. See `writeJsonLines`/`writeLogfmt`/
 /// `writeCombined` for the exact shape of each.
@@ -218,6 +294,11 @@ pub fn writeJsonLines(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void 
     try writeJsonOptString(w, entry.trace_id);
     try w.writeAll(",\"span_id\":");
     try writeJsonOptString(w, entry.span_id);
+    for (entry.extra, 0..) |f, i| {
+        if (!extraRenderable(entry.extra, i)) continue;
+        try w.print(",\"{s}\":", .{f.key});
+        try writeJsonString(w, f.value);
+    }
     try w.writeAll("}\n");
 }
 
@@ -431,6 +512,11 @@ pub fn writeLogfmt(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll(" span_id=");
         try writeLogfmtValue(w, v);
     }
+    for (entry.extra, 0..) |f, i| {
+        if (!extraRenderable(entry.extra, i)) continue;
+        try w.print(" {s}=", .{f.key});
+        try writeLogfmtValue(w, f.value);
+    }
     try w.writeByte('\n');
 }
 
@@ -490,15 +576,7 @@ fn writeLogfmtValue(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 pub fn writeCombined(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
     if (entry.remote_addr) |a| try writeClfEscaped(w, hostOnly(a)) else try w.writeByte('-');
     try w.writeAll(" - ");
-    if (entry.user) |u| {
-        if (u.len == 0) try w.writeAll("\"\"");
-        for (u) |c| {
-            switch (c) {
-                ' ', '"', '[', ']' => try w.print("\\x{x:0>2}", .{c}),
-                else => try writeClfEscaped(w, &.{c}),
-            }
-        }
-    } else try w.writeByte('-');
+    try writeClfUser(w, entry.user);
     try w.writeAll(" [");
     if (entry.time_formatted) |t| try writeClfEscaped(w, t) else try w.print("{d}", .{entry.timestamp_ns});
     try w.writeAll("] \"");
@@ -516,6 +594,19 @@ pub fn writeCombined(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("\"\n");
 }
 
+/// Combined's `%u`: `-` for null, `""` for empty, else the user with every
+/// Combined delimiter hex-escaped (see `writeCombined`). Shared with `LogFormat`.
+pub fn writeClfUser(w: *std.Io.Writer, user: ?[]const u8) std.Io.Writer.Error!void {
+    const u = user orelse return w.writeByte('-');
+    if (u.len == 0) try w.writeAll("\"\"");
+    for (u) |c| {
+        switch (c) {
+            ' ', '"', '[', ']' => try w.print("\\x{x:0>2}", .{c}),
+            else => try writeClfEscaped(w, &.{c}),
+        }
+    }
+}
+
 /// Combined's `%h` is the remote *host* — never `host:port`. `remote_addr`
 /// carries the full peer address (`entryFromRequest` formats an
 /// `IpAddress`, which includes the port), so the port is stripped here and
@@ -526,7 +617,7 @@ pub fn writeCombined(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// goaccess 1.10.2 fails the whole line with `Token '192.0.2.1:54321'
 /// doesn't match specifier '%h'`. IPv6 is logged bare (`::1`), matching
 /// Apache, so the `[…]` brackets go too.
-fn hostOnly(addr: []const u8) []const u8 {
+pub fn hostOnly(addr: []const u8) []const u8 {
     if (addr.len != 0 and addr[0] == '[') {
         // `[::1]:8080` / `[::1]` → `::1`
         if (std.mem.indexOfScalar(u8, addr, ']')) |close| return addr[1..close];
@@ -538,7 +629,8 @@ fn hostOnly(addr: []const u8) []const u8 {
     return addr;
 }
 
-fn writeClfEscaped(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+/// The Combined escaper (`ap_escape_logitem` rule + `]`); shared with `LogFormat`.
+pub fn writeClfEscaped(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     for (s) |c| switch (c) {
         '"' => try w.writeAll("\\\""),
         '\\' => try w.writeAll("\\\\"),
@@ -585,6 +677,10 @@ pub const FromRequestOptions = struct {
     trace_id: ?[]const u8 = null,
     /// The requesting span's id (16 hex). See `Entry.span_id`.
     span_id: ?[]const u8 = null,
+    /// The authenticated caller, if the server knows one. See `Entry.user`.
+    user: ?[]const u8 = null,
+    /// Extra fields, borrowed. See `Entry.extra`.
+    extra: []const Field = &.{},
 };
 
 /// Build an `Entry` from a served request + its response writer, pulling
@@ -621,6 +717,8 @@ pub fn entryFromRequest(
         .request_id = opts.request_id,
         .trace_id = opts.trace_id,
         .span_id = opts.span_id,
+        .user = opts.user,
+        .extra = opts.extra,
     };
     if (req.peerAddress()) |p| {
         var w: std.Io.Writer = .fixed(addr_buf);
@@ -1576,6 +1674,18 @@ const fuzz_corpus = [_][]const u8{
     fuzzCase(0x00, .{ "", "", "", "", "", "", "", "", "", "" }),
 };
 
+/// Three extra fields for the JSON/logfmt harnesses: one whose KEY is
+/// arbitrary fuzz bytes (it must never become a key unless it is a valid one),
+/// two with valid keys and fuzzed values.
+fn fuzzExtra(buf: *[3]Field, e: Entry) []const Field {
+    buf.* = .{
+        .{ .key = e.protocol, .value = e.target },
+        .{ .key = "k1", .value = e.method },
+        .{ .key = "k2", .value = e.trace_id.? },
+    };
+    return buf;
+}
+
 /// `out` must end with exactly one `\n` and contain no other one: whatever the
 /// fields carried, the reader downstream sees a single record.
 fn expectOneLine(out: []const u8) !void {
@@ -1697,7 +1807,9 @@ fn mark(comptime l: FuzzLabel) void {
 /// hands them a `*Smith`, the deterministic driver a `*fuzz_driver.Rng`.
 fn jsonLinesHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     var pool: [10 * fuzz_field_max]u8 = undefined;
-    const entry = fuzzEntry(S, smith, &pool);
+    var extra_buf: [3]Field = undefined;
+    var entry = fuzzEntry(S, smith, &pool);
+    entry.extra = fuzzExtra(&extra_buf, entry);
 
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -1723,6 +1835,12 @@ fn jsonLinesHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerro
     try expectFieldPolicy(entry.method, obj.get("method").?.string);
     try expectFieldPolicy(entry.target, obj.get("target").?.string);
     try expectFieldPolicy(entry.protocol, obj.get("protocol").?.string);
+    // The extra fields: the valid-keyed ones come back under the same policy,
+    // and the fuzzed (almost always invalid) key never became a key.
+    try expectFieldPolicy(entry.method, obj.get("k1").?.string);
+    try expectFieldPolicy(entry.trace_id.?, obj.get("k2").?.string);
+    // 14 fixed keys (`user` is unset) + k1 + k2, + the fuzz key only if valid.
+    try testing.expect(obj.count() == 16 or (obj.count() == 17 and isValidExtraKey(entry.protocol)));
     const opts = [_]struct { k: []const u8, v: ?[]const u8 }{
         .{ .k = "remote_addr", .v = entry.remote_addr },
         .{ .k = "user_agent", .v = entry.user_agent },
@@ -1771,7 +1889,9 @@ fn fuzzLogfmt(_: void, smith: *std.testing.Smith) !void {
 fn logfmtHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     _ = gpa;
     var pool: [10 * fuzz_field_max]u8 = undefined;
-    const entry = fuzzEntry(S, smith, &pool);
+    var extra_buf: [3]Field = undefined;
+    var entry = fuzzEntry(S, smith, &pool);
+    entry.extra = fuzzExtra(&extra_buf, entry);
 
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -2157,6 +2277,8 @@ test "logfmt/Combined pass ill-formed bytes through — byte-oriented formats, d
 test {
     _ = @import("bench.zig");
     _ = @import("sink.zig");
+    _ = @import("logformat.zig");
+    _ = @import("middleware.zig");
 }
 
 test "writeJsonLines: target reads back as Python's decode('utf-8', 'replace') (tools/json_path_oracle.py)" {
@@ -2187,4 +2309,211 @@ test "writeJsonLines: target reads back as Python's decode('utf-8', 'replace') (
 // See json_oracle_test.zig / tools/interop.zig / tools/json_oracle.py.
 test {
     _ = @import("json_oracle_test.zig");
+}
+
+// ── Entry.extra ──────────────────────────────────────────────────────────
+
+fn renderBoth(e: Entry, jbuf: []u8, lbuf: []u8) !struct { json: []const u8, logfmt: []const u8 } {
+    var jw: std.Io.Writer = .fixed(jbuf);
+    try writeJsonLines(e, &jw);
+    var lw: std.Io.Writer = .fixed(lbuf);
+    try writeLogfmt(e, &lw);
+    return .{ .json = jw.buffered(), .logfmt = lw.buffered() };
+}
+
+test "extra: byte-exact goldens, appended after the fixed fields in JSON Lines and logfmt" {
+    var e = sampleEntry();
+    e.extra = &.{
+        .{ .key = "tenant", .value = "acme" },
+        .{ .key = "cache.status", .value = "HIT MISS" },
+    };
+    var jb: [1024]u8 = undefined;
+    var lb: [1024]u8 = undefined;
+    const out = try renderBoth(e, &jb, &lb);
+    try testing.expect(std.mem.endsWith(u8, out.json, "\"span_id\":\"b7ad6b7169203331\",\"tenant\":\"acme\",\"cache.status\":\"HIT MISS\"}\n"));
+    try testing.expect(std.mem.endsWith(u8, out.logfmt, " span_id=b7ad6b7169203331 tenant=acme cache.status=\"HIT MISS\"\n"));
+    // Combined is a fixed format: it ignores extra.
+    var cb1: [512]u8 = undefined;
+    var cb2: [512]u8 = undefined;
+    var c1: std.Io.Writer = .fixed(&cb1);
+    var c2: std.Io.Writer = .fixed(&cb2);
+    try writeCombined(e, &c1);
+    try writeCombined(sampleEntry(), &c2);
+    try testing.expectEqualStrings(c2.buffered(), c1.buffered());
+}
+
+test "extra: empty, and a list of only unusable keys, change no output byte" {
+    var jb: [1024]u8 = undefined;
+    var lb: [1024]u8 = undefined;
+    const base = try renderBoth(sampleEntry(), &jb, &lb);
+    var e = sampleEntry();
+    e.extra = &.{ .{ .key = "", .value = "x" }, .{ .key = "status", .value = "x" }, .{ .key = "a b", .value = "x" } };
+    var jb2: [1024]u8 = undefined;
+    var lb2: [1024]u8 = undefined;
+    const skipped = try renderBoth(e, &jb2, &lb2);
+    try testing.expectEqualStrings(base.json, skipped.json);
+    try testing.expectEqualStrings(base.logfmt, skipped.logfmt);
+}
+
+test "extra: a key cannot forge, shadow or duplicate a field -- it is skipped" {
+    const long65 = "k" ** 65;
+    const bad_keys = [_][]const u8{
+        "",         long65,        "a b",    "a=b",    "a\"b",   "a\nb",     "a\rb",   "a\x00b",        "{x}",            "k\xc3\xa9",  "a,b",        "a:b",     "\\",
+        // Collisions with every fixed key, exact and case-folded.
+        "ts",       "remote_addr", "user",   "method", "target", "protocol", "status", "request_bytes", "response_bytes", "latency_ns", "user_agent", "referer", "request_id",
+        "trace_id", "span_id",     "STATUS", "Method",
+    };
+    var jb: [4096]u8 = undefined;
+    var lb: [4096]u8 = undefined;
+    const base = try renderBoth(sampleEntry(), &jb, &lb);
+    for (bad_keys) |k| {
+        var e = sampleEntry();
+        e.extra = &.{.{ .key = k, .value = "FORGED" }};
+        var jb2: [4096]u8 = undefined;
+        var lb2: [4096]u8 = undefined;
+        const out = try renderBoth(e, &jb2, &lb2);
+        testing.expectEqualStrings(base.json, out.json) catch |err| {
+            std.debug.print("key {any} was rendered in JSON\n", .{k});
+            return err;
+        };
+        testing.expectEqualStrings(base.logfmt, out.logfmt) catch |err| {
+            std.debug.print("key {any} was rendered in logfmt\n", .{k});
+            return err;
+        };
+    }
+    // Boundary: 64 bytes is the longest valid key (positive control for the bound).
+    var e = sampleEntry();
+    e.extra = &.{.{ .key = "k" ** 64, .value = "v" }};
+    var jb3: [4096]u8 = undefined;
+    var lb3: [4096]u8 = undefined;
+    const ok = try renderBoth(e, &jb3, &lb3);
+    try testing.expect(std.mem.indexOf(u8, ok.json, "\"" ++ "k" ** 64 ++ "\":\"v\"") != null);
+    // A repeated key: the first wins, the second is skipped (also case-folded).
+    e.extra = &.{ .{ .key = "dup", .value = "first" }, .{ .key = "DUP", .value = "second" }, .{ .key = "dup", .value = "third" } };
+    const dup = try renderBoth(e, &jb3, &lb3);
+    try testing.expect(std.mem.endsWith(u8, dup.logfmt, " dup=first\n"));
+    try testing.expect(std.mem.endsWith(u8, dup.json, ",\"dup\":\"first\"}\n"));
+}
+
+test "extra: values get the same escaping as the fixed fields (the adversarial corpus)" {
+    var e = sampleEntry();
+    e.extra = &.{ .{ .key = "a", .value = evil_payload }, .{ .key = "b", .value = "\xff\xed\xa0\x80\"\\" } };
+    var jb: [2048]u8 = undefined;
+    var lb: [2048]u8 = undefined;
+    const out = try renderBoth(e, &jb, &lb);
+    try expectOneLine(out.json);
+    try expectOneLine(out.logfmt);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings(evil_payload, obj.get("a").?.string); // byte-exact for valid UTF-8
+    try testing.expect(std.mem.indexOf(u8, obj.get("b").?.string, replacement) != null); // ill-formed -> U+FFFD
+}
+
+test "extra: a value cannot split a logfmt pair or start a second record" {
+    var e = sampleEntry();
+    e.extra = &.{.{ .key = "note", .value = "x\" status=999\nts=0 " }};
+    var jb: [2048]u8 = undefined;
+    var lb: [2048]u8 = undefined;
+    const out = try renderBoth(e, &jb, &lb);
+    try expectOneLine(out.logfmt);
+    try testing.expect(std.mem.endsWith(u8, out.logfmt, " note=\"x\\\" status=999\\nts=0 \"\n"));
+    for (out.logfmt[0 .. out.logfmt.len - 1]) |c| try testing.expect(c >= 0x20 and c != 0x7F);
+}
+
+test "entryFromRequest: user and extra options reach the Entry" {
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    const req = testRequest("", "/", false, &body, null);
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var chunk_buf: [16]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var res: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    res.setStatus(200);
+    var addr_buf: [64]u8 = undefined;
+    const extra = [_]Field{.{ .key = "k", .value = "v" }};
+    const entry = entryFromRequest(&req, &res, &addr_buf, .{ .timestamp_ns = 1, .user = "u1", .extra = &extra });
+    try testing.expectEqualStrings("u1", entry.user.?);
+    try testing.expectEqual(@as(usize, 1), entry.extra.len);
+}
+
+// ── LogFormat == writeCombined / Common Log Format ───────────────────────
+
+const combined_template = "%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-agent}i\"";
+const clf_template = "%h %l %u %t \"%r\" %>s %b";
+
+fn expectCombinedEquivalent(e: Entry) !void {
+    const f = comptime LogFormat.comptimeParse(combined_template);
+    var b1: [8192]u8 = undefined;
+    var b2: [8192]u8 = undefined;
+    var w1: std.Io.Writer = .fixed(&b1);
+    var w2: std.Io.Writer = .fixed(&b2);
+    try writeCombined(e, &w1);
+    try f.write(e, &w2);
+    try testing.expectEqualStrings(w1.buffered(), w2.buffered());
+    // CLF is exactly the Combined line up to the referer field.
+    const clf = comptime LogFormat.comptimeParse(clf_template);
+    var b3: [8192]u8 = undefined;
+    var w3: std.Io.Writer = .fixed(&b3);
+    try clf.write(e, &w3);
+    const common = w3.buffered();
+    try testing.expect(std.mem.startsWith(u8, w1.buffered(), common[0 .. common.len - 1]));
+    try testing.expect(std.mem.startsWith(u8, w1.buffered()[common.len - 1 ..], " \""));
+}
+
+test "LogFormat: the Combined template renders byte-identical to writeCombined (goldens and corpus)" {
+    try expectCombinedEquivalent(sampleEntry());
+    var e = sampleEntry();
+    e.time_formatted = null;
+    e.remote_addr = null;
+    e.response_bytes = null;
+    e.user_agent = null;
+    e.referer = null;
+    try expectCombinedEquivalent(e);
+    e.response_bytes = 0;
+    e.remote_addr = "[2001:db8::1]:443";
+    try expectCombinedEquivalent(e);
+    for ([_]?[]const u8{ "svc-billing", "", "a b \"c\" [d] \r\nforged", null }) |u| {
+        e.user = u;
+        try expectCombinedEquivalent(e);
+    }
+    // The shared adversarial payloads in every escaped slot.
+    e = sampleEntry();
+    e.user_agent = evil_payload;
+    e.referer = "Mozilla\" \r\n127.0.0.1 - - [x] \"GET / HTTP/1.1\" 200 1 \"-\" \"-";
+    e.method = evil_payload;
+    e.target = evil_payload;
+    e.protocol = evil_payload;
+    e.remote_addr = evil_payload;
+    e.time_formatted = "x] \"forged\" [";
+    e.user = evil_payload;
+    try expectCombinedEquivalent(e);
+    // The fuzz corpus (ill-formed UTF-8, overlongs, maximal fields, empties).
+    for (fuzz_corpus) |input| {
+        var smith: std.testing.Smith = .{ .in = input };
+        var pool: [10 * fuzz_field_max]u8 = undefined;
+        try expectCombinedEquivalent(fuzzEntry(std.testing.Smith, &smith, &pool));
+    }
+    // And 300 deterministic random draws, as the harnesses use.
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        var pool: [10 * fuzz_field_max]u8 = undefined;
+        try expectCombinedEquivalent(fuzzEntry(fuzz_driver.Rng, &rng, &pool));
+    }
+}
+
+test "LogFormat: Common Log Format golden, and a fixed %{key}x line over extra" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const clf = comptime LogFormat.comptimeParse(clf_template);
+    try clf.write(sampleEntry(), &w);
+    try testing.expectEqualStrings("192.0.2.1 - - [22/Jul/2026:10:00:00 +0000] \"GET /status?x=1 HTTP/1.1\" 200 512\n", w.buffered());
+
+    var e = sampleEntry();
+    e.extra = &.{.{ .key = "tenant", .value = "ac\"me" }};
+    w = .fixed(&buf);
+    const ex = comptime LogFormat.comptimeParse("%{tenant}x %D");
+    try ex.write(e, &w);
+    try testing.expectEqualStrings("ac\\\"me 1500\n", w.buffered());
 }
