@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — **Added (additive; every new field defaults to the old behaviour):**
+  `PosixConnector.source` / `.device` (bind the local address, `SO_BINDTODEVICE`),
+  `PosixConnector.ip_protocol` (`IpProtocol`: `.any`/`.ip4`/`.ip6`/`.prefer_ip4`/`.prefer_ip6`
+  over IP literals and resolved addresses), `Options.interval` (`Interval{ ms, sleeper }`)
+  (`Sleeper`, `IoSleeper`) for a pause between repetitions of one target. Failures are `.error`
+  Results (errno when the kernel refused). An interval without a way to sleep cannot be configured.
+  **Tests:** `selectAddresses` per policy, `validDeviceName`, sleeper call count/arguments/position
+  through the fake connector (single target and `probeMany`), loopback source `127.0.0.2` with the
+  peer address checked, device `lo` / unknown / malformed, wrong-family and unassignable source.
+  Non-Linux `PosixConnector` consciously deferred (SPEC Backlog).
+
 - **2026-10-11** — tests: model-based differential — random connect-outcome scripts through `probeTarget`/`probeMany` against a naive model of samples and statistics; reach on every outcome class; two negative controls red, one of which (RTT kept on an app-check downgrade) no earlier test caught. No API or behaviour change.
 
 - **2026-10-04** — Internal: `PosixConnector`'s per-address verdict logic extracted into

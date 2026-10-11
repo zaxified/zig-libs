@@ -262,6 +262,53 @@ pub const Options = struct {
     max_targets: usize = 65_536,
     /// Optional post-connect application check.
     app_check: ?AppCheck = null,
+    /// Pause between the repetitions of ONE target (tcping's `-i`); null
+    /// (the default) keeps them back to back. See `Interval`.
+    interval: ?Interval = null,
+};
+
+/// `Options.interval`: a pause *between* the repetitions of one target -- none
+/// before the first, none after the last (so `count = 1` never sleeps), none
+/// between targets. The pause and the way to sleep come as one value, so an
+/// interval that would silently not happen cannot be configured. In
+/// `probeMany` each worker sleeps only inside its own target: a sleeping
+/// target holds its worker slot (the pause counts against `max_concurrent`)
+/// but blocks no other worker.
+pub const Interval = struct {
+    ms: u32,
+    /// Build one from an `std.Io` with `IoSleeper`. Must be callable from
+    /// the fan-out worker threads.
+    sleeper: Sleeper,
+};
+
+/// A sleep seam, same shape as `Connector`/`AppCheck`, so the engine stays
+/// free of `std.Io` and tests never sleep: the engine calls `sleepFn(ctx, ns)`
+/// between repetitions (`Options.interval`).
+pub const Sleeper = struct {
+    ctx: *anyopaque,
+    sleepFn: *const fn (ctx: *anyopaque, ns: u64) void,
+
+    fn sleep(self: Sleeper, ns: u64) void {
+        self.sleepFn(self.ctx, ns);
+    }
+};
+
+/// `Sleeper` over `std.Io`: `io.sleep` on the monotonic (`.awake`) clock. Hold
+/// one and hand `sleeper()` to `Options`; it must outlive any probe using it.
+/// A canceled sleep returns early (the following repetition then runs sooner
+/// than `Interval.ms`) — cancelation is the caller's doing, and the engine has
+/// no error channel for it.
+pub const IoSleeper = struct {
+    io: std.Io,
+
+    pub fn sleeper(self: *IoSleeper) Sleeper {
+        return .{ .ctx = self, .sleepFn = sleepImpl };
+    }
+
+    fn sleepImpl(ctx: *anyopaque, ns: u64) void {
+        const self: *IoSleeper = @ptrCast(@alignCast(ctx));
+        self.io.sleep(.fromNanoseconds(ns), .awake) catch {};
+    }
 };
 
 /// Hard cap on repetitions per target, independent of `Options.count`.
@@ -334,7 +381,12 @@ pub fn probeTarget(gpa: Allocator, target: Target, opts: Options) Allocator.Erro
 /// Fill `r.samples` and compute `r.stats`. Pure w.r.t. allocation (samples
 /// already allocated) — safe to call from a worker thread.
 fn probeInto(r: *TargetResult, opts: Options) void {
-    for (r.samples) |*s| s.* = probeTcp(r.target, opts);
+    for (r.samples, 0..) |*s, i| {
+        // Between repetitions only: not before the first, not after the last.
+        if (i > 0) if (opts.interval) |iv| if (iv.ms != 0)
+            iv.sleeper.sleep(@as(u64, iv.ms) * std.time.ns_per_ms);
+        s.* = probeTcp(r.target, opts);
+    }
     var acc = latency.Accumulator.init();
     for (r.samples) |s| {
         // A cancellation is the caller's own doing and is evidence about
@@ -555,6 +607,63 @@ pub const Resolve = enum {
     system,
 };
 
+/// Which address families `PosixConnector` may connect over, and in what
+/// order. Names follow blackbox_exporter's `tcp` prober:
+/// `preferred_ip_protocol` + `ip_protocol_fallback: true` is `prefer_ip4`/
+/// `prefer_ip6`; `ip_protocol_fallback: false` is `ip4`/`ip6`.
+pub const IpProtocol = enum {
+    /// Every address, in the resolver's order (the default).
+    any,
+    /// IPv4 only. A name's IPv6 addresses are dropped; an IPv6 literal is an
+    /// `.error` outcome (no usable address), not a connect attempt.
+    ip4,
+    /// IPv6 only; the mirror of `ip4`.
+    ip6,
+    /// IPv4 addresses first, IPv6 as fallback; relative order kept per family.
+    prefer_ip4,
+    /// IPv6 addresses first, IPv4 as fallback.
+    prefer_ip6,
+};
+
+/// Interface names are at most `IFNAMSIZ - 1` = 15 bytes (`<net/if.h>`).
+const ifname_max = 15;
+
+/// A name `SO_BINDTODEVICE` could meaningfully take: 1..15 bytes, no NUL and
+/// no `/` (the kernel treats neither as part of an interface name). Empty is
+/// rejected on purpose: an empty option value *removes* a binding.
+fn validDeviceName(name: []const u8) bool {
+    if (name.len == 0 or name.len > ifname_max) return false;
+    for (name) |c| if (c == 0 or c == '/') return false;
+    return true;
+}
+
+/// Filter and order `addrs[0..n]` in place by `proto`; returns the new count.
+/// Stable within each family. Pure, so every policy is testable without a
+/// resolver that returns both families.
+fn selectAddresses(addrs: *[PosixConnector.max_addresses]netaddr.Ip, n: usize, proto: IpProtocol) usize {
+    // `.any` keeps the resolver's order (RFC 6724 destination selection
+    // already happened there); only the other policies regroup by family.
+    if (proto == .any) return n;
+    const keep_v4 = proto != .ip6;
+    const keep_v6 = proto != .ip4;
+    const v6_first = proto == .prefer_ip6;
+    var tmp: [PosixConnector.max_addresses]netaddr.Ip = undefined;
+    var m: usize = 0;
+    // Two passes over the same list: the preferred family, then the other.
+    for ([2]bool{ v6_first, !v6_first }) |want_v6| {
+        if (want_v6 and !keep_v6) continue;
+        if (!want_v6 and !keep_v4) continue;
+        for (addrs[0..n]) |ip| {
+            if ((ip == .v6) == want_v6) {
+                tmp[m] = ip;
+                m += 1;
+            }
+        }
+    }
+    @memcpy(addrs[0..m], tmp[0..m]);
+    return m;
+}
+
 /// The recommended live connector: a **real** per-attempt connect timeout.
 ///
 /// Prefer this over `LiveConnector` on Linux. `LiveConnector` goes through
@@ -599,6 +708,16 @@ pub const Resolve = enum {
 ///    socket family follows the address. IPv6 scope/zone ids are not carried
 ///    (`sin6_scope_id = 0`), so a link-local literal needing a zone is out of
 ///    scope.
+///  * **Source binding.** `source` binds the socket to that local address
+///    (port 0) before `connect()`; `device` sets `SO_BINDTODEVICE`. Both are
+///    per-attempt and per-address: a `source` whose family differs from the
+///    address being tried makes THAT address an `.error` (no errno: nothing
+///    reached the kernel) and the next address is tried, so a v4 `source`
+///    with `ip_protocol = .any` still probes a name's v4 address. A kernel
+///    refusal (`EADDRNOTAVAIL` from `bind`, `EPERM`/`ENODEV` from the device
+///    option) is `.error` carrying that errno, never a panic. An invalid
+///    device name (empty, over 15 bytes, containing NUL or `/`) is `.error`
+///    without a syscall.
 ///  * **The descriptor is closed on every path** — success, refusal,
 ///    timeout, socket error, resolver failure — by a single `defer` placed
 ///    immediately after the successful `socket()`.
@@ -647,6 +766,18 @@ pub const PosixConnector = struct {
     /// Name-resolution policy. `.system` matches `LiveConnector`'s behaviour;
     /// `.literal_only` is the fully bounded one.
     resolve: Resolve = .system,
+    /// Address-family restriction / preference; see `IpProtocol`. Applies to
+    /// IP literals too: a literal of an excluded family is `.error` (no usable
+    /// address), the same outcome as a name that resolves to nothing.
+    ip_protocol: IpProtocol = .any,
+    /// Local address to bind before connecting (blackbox_exporter's
+    /// `source_ip_address`): probe from a chosen uplink on a multi-homed host.
+    source: ?netaddr.Ip = null,
+    /// Interface to pin the socket to (`SO_BINDTODEVICE`), name at most 15
+    /// bytes. The slice must outlive any probe using this connector. On kernels
+    /// before 5.7 setting it needs `CAP_NET_RAW`; without it the attempt is an
+    /// `.error` with `errno = EPERM`.
+    device: ?[]const u8 = null,
 
     pub fn connector(self: *PosixConnector) Connector {
         return .{ .ctx = self, .connectFn = connectImpl };
@@ -670,6 +801,12 @@ pub const PosixConnector = struct {
             },
         }
 
+        // The family policy applies to literals and resolved names alike; an
+        // empty result is the same "no usable address" `.error` as a lookup
+        // that returned nothing.
+        n = selectAddresses(&addrs, n, self.ip_protocol);
+        if (n == 0) return .{ .status = .@"error" };
+
         // Every resolved address gets a turn against what is left of the
         // budget, and a definitive negative is only reported once they have
         // all been tried (F1). `.refused` outranks `.@"error"` as the answer
@@ -687,7 +824,7 @@ pub const PosixConnector = struct {
                 break;
             } else timeout_ns - spent_now;
 
-            if (fold.add(connectBounded(ip, target.port, remaining))) break;
+            if (fold.add(connectBounded(ip, target.port, remaining, self.source, self.device))) break;
         }
 
         const v = fold.result();
@@ -753,10 +890,24 @@ pub const PosixConnector = struct {
 
     /// One non-blocking connect bounded by `budget_ns` (0 = unbounded).
     /// Never allocates; closes its descriptor on every exit path.
-    fn connectBounded(ip: netaddr.Ip, port: u16, budget_ns: u64) Verdict {
+    fn connectBounded(
+        ip: netaddr.Ip,
+        port: u16,
+        budget_ns: u64,
+        source: ?netaddr.Ip,
+        device: ?[]const u8,
+    ) Verdict {
         if (comptime builtin.os.tag != .linux)
             @compileError("probe.PosixConnector is Linux-only (raw socket syscalls, no libc)");
         const linux = std.os.linux;
+
+        // Checked before any descriptor exists: nothing to close, no syscall.
+        if (source) |src| {
+            if ((src == .v6) != (ip == .v6)) return .{ .status = .@"error" };
+        }
+        if (device) |d| {
+            if (!validDeviceName(d)) return .{ .status = .@"error" };
+        }
 
         const family: u32 = switch (ip) {
             .v4 => linux.AF.INET,
@@ -771,6 +922,30 @@ pub const PosixConnector = struct {
         const fd: i32 = @intCast(sock_rc);
         // The only descriptor this function owns, released on every path.
         defer _ = linux.close(fd);
+
+        if (device) |d| {
+            // NUL-terminated copy: the kernel reads `optlen` bytes into its own
+            // IFNAMSIZ buffer, and the length we pass includes the terminator.
+            var name: [ifname_max + 1]u8 = [_]u8{0} ** (ifname_max + 1);
+            @memcpy(name[0..d.len], d);
+            const rc = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.BINDTODEVICE, &name, @intCast(d.len + 1));
+            if (linux.errno(rc) != .SUCCESS)
+                return .{ .status = .@"error", .errno = @intFromEnum(linux.errno(rc)) };
+        }
+        if (source) |src| {
+            const bind_rc = switch (src) {
+                .v4 => |q| blk: {
+                    const sa: linux.sockaddr.in = .{ .port = 0, .addr = @bitCast(q) };
+                    break :blk linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
+                },
+                .v6 => |b| blk: {
+                    const sa: linux.sockaddr.in6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 };
+                    break :blk linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in6));
+                },
+            };
+            if (linux.errno(bind_rc) != .SUCCESS)
+                return .{ .status = .@"error", .errno = @intFromEnum(linux.errno(bind_rc)) };
+        }
 
         // Saturating: `Connector.connect` takes an arbitrary u64 from the
         // caller, and a plain `+` on a maxInt budget would trap in Debug.
@@ -2293,4 +2468,235 @@ test "model: probeTarget and probeMany agree with a naive model on random outcom
         std.debug.print("model reach: {t} never hit\n", .{@as(ProbeReach, @enumFromInt(i))});
         return error.ModelDoesNotReach;
     };
+}
+
+// ── interval between repetitions (Options.interval / Sleeper) ────────────
+
+/// Records every sleep and, for each, how many connects had happened by then —
+/// which pins WHERE the pause sits (between repetitions), not just how often.
+const SleepRec = struct {
+    fake: *FakeConnector,
+    calls: std.atomic.Value(u32) = .init(0),
+    wrong_ns: std.atomic.Value(u32) = .init(0),
+    expect_ns: u64,
+    /// Connect count seen at each of the first 8 sleeps (single-thread tests).
+    connects_at: [8]u32 = [_]u32{0} ** 8,
+
+    fn sleeper(self: *SleepRec) Sleeper {
+        return .{ .ctx = self, .sleepFn = sleepImpl };
+    }
+
+    fn sleepImpl(ctx: *anyopaque, ns: u64) void {
+        const self: *SleepRec = @ptrCast(@alignCast(ctx));
+        const i = self.calls.fetchAdd(1, .monotonic);
+        if (ns != self.expect_ns) _ = self.wrong_ns.fetchAdd(1, .monotonic);
+        if (i < self.connects_at.len) self.connects_at[i] = self.fake.total_calls.load(.monotonic);
+    }
+};
+
+test "interval: count-1 sleeps of interval_ns, each between two connects; none for count = 1" {
+    var scripts = [_]FakeConnector.Script{
+        .{ .host = "svc", .outcomes = &.{.{ .status = .up, .rtt_ns = 1 }} },
+    };
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+    var rec: SleepRec = .{ .fake = &fake, .expect_ns = 250 * std.time.ns_per_ms };
+    const target: Target = .{ .host = "svc", .port = 1 };
+
+    const r = try probeTarget(testing.allocator, target, .{
+        .connector = fake.connector(),
+        .count = 4,
+        .interval = .{ .ms = 250, .sleeper = rec.sleeper() },
+    });
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 3), rec.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), rec.wrong_ns.load(.monotonic));
+    // Sleep k happens after connect k and before connect k+1: never first,
+    // never after the last.
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, rec.connects_at[0..3]);
+
+    // count = 1: no repetition to separate, so no sleep.
+    var rec1: SleepRec = .{ .fake = &fake, .expect_ns = 250 * std.time.ns_per_ms };
+    const r1 = try probeTarget(testing.allocator, target, .{
+        .connector = fake.connector(),
+        .count = 1,
+        .interval = .{ .ms = 250, .sleeper = rec1.sleeper() },
+    });
+    defer r1.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 0), rec1.calls.load(.monotonic));
+
+    // `ms = 0` never calls the sleeper.
+    var rec0: SleepRec = .{ .fake = &fake, .expect_ns = 0 };
+    const r0 = try probeTarget(testing.allocator, target, .{
+        .connector = fake.connector(),
+        .count = 4,
+        .interval = .{ .ms = 0, .sleeper = rec0.sleeper() },
+    });
+    defer r0.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 0), rec0.calls.load(.monotonic));
+}
+
+test "interval: probeMany pauses inside each target only, never between targets" {
+    var scripts = [_]FakeConnector.Script{
+        .{ .host = "a", .outcomes = &.{.{ .status = .up, .rtt_ns = 1 }} },
+        .{ .host = "b", .outcomes = &.{.{ .status = .up, .rtt_ns = 1 }} },
+        .{ .host = "c", .outcomes = &.{.{ .status = .up, .rtt_ns = 1 }} },
+    };
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+    var rec: SleepRec = .{ .fake = &fake, .expect_ns = 3 * std.time.ns_per_ms };
+    const targets = [_]Target{ .{ .host = "a", .port = 1 }, .{ .host = "b", .port = 1 }, .{ .host = "c", .port = 1 } };
+
+    // 3 targets x 3 repetitions: 3 x (3-1) = 6 sleeps, whatever the worker count.
+    inline for (.{ 1, 3 }) |workers| {
+        rec.calls.store(0, .monotonic);
+        const res = try probeMany(testing.allocator, &targets, .{
+            .connector = fake.connector(),
+            .count = 3,
+            .interval = .{ .ms = 3, .sleeper = rec.sleeper() },
+            .max_concurrent = workers,
+        });
+        defer freeResults(testing.allocator, res);
+        try testing.expectEqual(@as(u32, 6), rec.calls.load(.monotonic));
+        try testing.expectEqual(@as(u32, 0), rec.wrong_ns.load(.monotonic));
+    }
+}
+
+test "IoSleeper sleeps for the requested time on the std.Io clock" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var s: IoSleeper = .{ .io = threaded.io() };
+    const t0 = monoNs();
+    s.sleeper().sleep(20 * std.time.ns_per_ms);
+    // A lower bound only: an upper bound on a sleep flakes under load.
+    try testing.expect(monoNs() -| t0 >= 20 * std.time.ns_per_ms);
+}
+
+// ── PosixConnector: family policy, source address, device ───────────────────
+
+test "selectAddresses: every IpProtocol, order within a family kept" {
+    const v4a: netaddr.Ip = .{ .v4 = .{ 10, 0, 0, 1 } };
+    const v4b: netaddr.Ip = .{ .v4 = .{ 10, 0, 0, 2 } };
+    const v6a: netaddr.Ip = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} };
+    const v6b: netaddr.Ip = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{2} };
+    const mixed = [_]netaddr.Ip{ v6a, v4a, v6b, v4b };
+
+    const Case = struct { p: IpProtocol, want: []const netaddr.Ip };
+    const cases = [_]Case{
+        .{ .p = .any, .want = &mixed },
+        .{ .p = .ip4, .want = &.{ v4a, v4b } },
+        .{ .p = .ip6, .want = &.{ v6a, v6b } },
+        .{ .p = .prefer_ip4, .want = &.{ v4a, v4b, v6a, v6b } },
+        .{ .p = .prefer_ip6, .want = &.{ v6a, v6b, v4a, v4b } },
+    };
+    for (cases) |c| {
+        var addrs: [PosixConnector.max_addresses]netaddr.Ip = undefined;
+        @memcpy(addrs[0..mixed.len], &mixed);
+        const m = selectAddresses(&addrs, mixed.len, c.p);
+        try testing.expectEqual(c.want.len, m);
+        for (c.want, addrs[0..m]) |w, got| try testing.expect(w.eql(got));
+    }
+
+    // A restriction can leave nothing; a preference never does.
+    var only4 = [_]netaddr.Ip{v4a} ++ [_]netaddr.Ip{v4a} ** (PosixConnector.max_addresses - 1);
+    try testing.expectEqual(@as(usize, 0), selectAddresses(&only4, 1, .ip6));
+    try testing.expectEqual(@as(usize, 1), selectAddresses(&only4, 1, .prefer_ip6));
+}
+
+test "validDeviceName: 1..15 bytes, no NUL, no slash" {
+    try testing.expect(validDeviceName("lo"));
+    try testing.expect(validDeviceName("eth0.100"));
+    try testing.expect(validDeviceName("123456789012345")); // 15 = IFNAMSIZ - 1
+    try testing.expect(!validDeviceName("1234567890123456")); // 16
+    try testing.expect(!validDeviceName("")); // empty would UNBIND
+    try testing.expect(!validDeviceName("a\x00b"));
+    try testing.expect(!validDeviceName("../lo"));
+}
+
+test "live: ip_protocol restricts IP literals — an excluded family is an error, no connect" {
+    // The listener is up: were the literal attempted, the answer would be `.up`.
+    const ln = try listenLoopback(false, 8);
+    defer _ = tl.close(ln.fd);
+    var buf: [24]u8 = undefined;
+    const t = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+
+    var pc: PosixConnector = .{ .resolve = .literal_only, .ip_protocol = .ip6 };
+    const out = pc.connector().connect(t, 2 * std.time.ns_per_s);
+    try testing.expectEqual(Status.@"error", out.status);
+    try testing.expectEqual(@as(?i32, null), out.errno);
+
+    // The allowed family and the preferences still reach the listener.
+    for ([_]IpProtocol{ .any, .ip4, .prefer_ip4, .prefer_ip6 }) |p| {
+        pc.ip_protocol = p;
+        try testing.expectEqual(Status.up, pc.connector().connect(t, 2 * std.time.ns_per_s).status);
+    }
+
+    // And the mirror: an IPv6 literal under `.ip4`.
+    const t6 = try Target.parse("[::1]:9");
+    pc.ip_protocol = .ip4;
+    try testing.expectEqual(Status.@"error", pc.connector().connect(t6, 2 * std.time.ns_per_s).status);
+}
+
+test "live: source binds the local address — the peer sees 127.0.0.2" {
+    const ln = try listenLoopback(false, 8);
+    defer _ = tl.close(ln.fd);
+    var buf: [24]u8 = undefined;
+    const t = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+
+    var pc: PosixConnector = .{ .resolve = .literal_only, .source = .{ .v4 = .{ 127, 0, 0, 2 } } };
+    const out = pc.connector().connect(t, 2 * std.time.ns_per_s);
+    try testing.expectEqual(Status.up, out.status);
+
+    // The handshake is complete, so the connection is in the accept queue.
+    var peer: tl.sockaddr.in = undefined;
+    var plen: tl.socklen_t = @sizeOf(tl.sockaddr.in);
+    const arc = tl.accept4(ln.fd, @ptrCast(&peer), &plen, tl.SOCK.CLOEXEC);
+    try testing.expectEqual(tl.E.SUCCESS, tl.errno(arc));
+    defer _ = tl.close(@intCast(arc));
+    try testing.expectEqual([4]u8{ 127, 0, 0, 2 }, @as([4]u8, @bitCast(peer.addr)));
+}
+
+test "live: a source of the wrong family or not on this host is an error Result, never a panic" {
+    const ln = try listenLoopback(false, 8);
+    defer _ = tl.close(ln.fd);
+    var buf: [24]u8 = undefined;
+    const t = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+
+    // v6 source, v4 target: the family check fires before any syscall.
+    var pc: PosixConnector = .{ .resolve = .literal_only, .source = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} } };
+    var out = pc.connector().connect(t, 2 * std.time.ns_per_s);
+    try testing.expectEqual(Status.@"error", out.status);
+    try testing.expectEqual(@as(?i32, null), out.errno);
+
+    // 203.0.113.1 (TEST-NET-3) is not assigned here: bind() says EADDRNOTAVAIL.
+    pc.source = .{ .v4 = .{ 203, 0, 113, 1 } };
+    out = pc.connector().connect(t, 2 * std.time.ns_per_s);
+    try testing.expectEqual(Status.@"error", out.status);
+    try testing.expectEqual(@as(?i32, @intFromEnum(tl.E.ADDRNOTAVAIL)), out.errno);
+}
+
+test "live: device — lo works, an unknown or malformed name is an error Result" {
+    const ln = try listenLoopback(false, 8);
+    defer _ = tl.close(ln.fd);
+    var buf: [24]u8 = undefined;
+    const t = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+
+    var pc: PosixConnector = .{ .resolve = .literal_only, .device = "lo" };
+    const lo = pc.connector().connect(t, 2 * std.time.ns_per_s);
+    // Before Linux 5.7 SO_BINDTODEVICE needs CAP_NET_RAW; an EPERM is the
+    // documented error Result, and then the positive half cannot be shown.
+    if (lo.status == .@"error" and lo.errno == @as(?i32, @intFromEnum(tl.E.PERM)))
+        return testkit.skip("SO_BINDTODEVICE needs CAP_NET_RAW on this kernel", .{});
+    try testing.expectEqual(Status.up, lo.status);
+
+    // No such interface: the kernel's ENODEV, as a classified error.
+    pc.device = "nosuchif0";
+    const bad = pc.connector().connect(t, 2 * std.time.ns_per_s);
+    try testing.expectEqual(Status.@"error", bad.status);
+
+    // Malformed names never reach the kernel (no errno to carry).
+    for ([_][]const u8{ "", "0123456789abcdef", "a/b" }) |name| {
+        pc.device = name;
+        const o = pc.connector().connect(t, 2 * std.time.ns_per_s);
+        try testing.expectEqual(Status.@"error", o.status);
+        try testing.expectEqual(@as(?i32, null), o.errno);
+    }
 }

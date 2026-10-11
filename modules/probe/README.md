@@ -74,13 +74,32 @@ switch (r.kind) {
 }
 ```
 
+**Options for multi-homed hosts and tcping-style runs.**
+
+- `PosixConnector.source` (`?netaddr.Ip`) binds the local address before
+  connecting (blackbox_exporter's `source_ip_address`); `PosixConnector.device`
+  (`?[]const u8`, at most 15 bytes) pins the socket to an interface with
+  `SO_BINDTODEVICE`. A source of the wrong family, an address not on the host,
+  an unknown interface or missing privilege (`EPERM` before Linux 5.7) is an
+  `.error` Result carrying the kernel's `errno` (none for the pure validation
+  failures), never a panic.
+- `PosixConnector.ip_protocol` is `.any` (default), `.ip4`, `.ip6`,
+  `.prefer_ip4` or `.prefer_ip6`. The first three after `.any` are blackbox's
+  `preferred_ip_protocol` with `ip_protocol_fallback: false`; the `prefer_*`
+  pair is the same with fallback `true` (preferred family first, the other as
+  fallback). An IP literal of an excluded family is an `.error` Result.
+- `Options.interval` pauses between the repetitions of one target (not
+  before the first, not after the last, not between targets):
+  `var s: probe.IoSleeper = .{ .io = io }; … .interval = .{ .ms = 1000, .sleeper = s.sleeper() }`.
+
 Tests are offline-first: a scripted fake `Connector` + a virtual clock drive the
 classify/aggregate/concurrency-bound paths deterministically (`Target.parse`
 including `[v6]:port` covered). The timeout itself cannot be tested that way, so
 live tests drive it on loopback — including a **black hole** (a listener whose
 one-slot accept queue is full, so Linux drops further SYNs) to assert the wall
 clock, and the same black hole through `LiveConnector` to show the old path does
-not come back. All hermetic: loopback only, no resolver traffic, no netns.
+not come back. Source/device binding is tested on loopback (source `127.0.0.2`,
+the accepted peer address is checked; device `lo`). All hermetic: loopback only, no resolver traffic, no netns.
 
 Provenance: clean-room — implements the standard TCP-connect probing technique
 (`nmap -sT` / `fping` fan-out, public knowledge); no third-party source consulted
