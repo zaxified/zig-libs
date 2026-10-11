@@ -3055,4 +3055,5 @@ test "integration: GET /openapi.json over a real socket returns the documented r
 test {
     _ = @import("spec_oracle_test.zig");
     _ = @import("parity_test.zig");
+    _ = @import("fuzz_test.zig");
 }

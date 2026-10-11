@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — tests: fuzz harnesses `build` (generator: `buildRoutes` and `writeRoutes` agree,
+  a rebuild is byte-identical, the output re-parses and passes the checker, no non-UTF-8 accepted)
+  and `spec` (`validateOpenApi31` on raw bytes and on damaged generated documents), with the
+  deterministic driver `OPENAPI_FUZZ`; `zig build check-fuzz` was red on openapi since 2026-10-11.
 - **2026-10-12** — docs: backlog item "move `route_extras` onto `RouteDoc`" rejected with the reason (keeps `router` free of OpenAPI-only fields). No code change.
 - **2026-10-12** — **Scope core -> parity with FastAPI 0.142.** Additive `Info` members, all off by
   default (output byte-identical when unused): `servers`; `schemas` (named-schema registry ->
