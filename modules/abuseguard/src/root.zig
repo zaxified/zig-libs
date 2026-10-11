@@ -482,8 +482,8 @@ pub const Guard = struct {
         if (g.isAllowed(ip)) return;
         const e = g.getOrCreate(g.keyOf(ip), now_ns) orelse return;
         const drained = g.drainedSince(e, now_ns);
-        e.strikes = @max(0, e.strikes - @as(f64, @floatFromInt(drained))) +
-            @as(f64, @floatFromInt(weight));
+        const left = e.strikes - @as(f64, @floatFromInt(drained));
+        e.strikes = @max(0, left) + @as(f64, @floatFromInt(weight));
         // `record` returns above when `weight == 0`, so `weight >= 1` here
         // and `e.strikes` (prior balance minus drain, floored at 0, plus
         // `weight`) can therefore never be exactly 0. Enforced rather than
@@ -493,15 +493,18 @@ pub const Guard = struct {
         std.debug.assert(e.strikes != 0);
         // Advance by what actually drained, not to `now`: discarding the
         // remainder would mean a client striking just inside the interval
-        // never drains at all. When nothing is left to drain there is no
-        // remainder worth keeping, and letting the mark lag would build up a
-        // huge drain for the next strike.
-        e.strikes_updated_ns = if (g.options.strike_decay_ms == 0)
+        // never drains at all. When the old balance drained out completely
+        // there is no remainder worth keeping: an empty bucket accrues no
+        // drain, so the mark restarts at `now`. Until 2026-10-11 it kept the
+        // sub-interval remainder there too, and a strike after a long idle
+        // could drain up to one interval early.
+        e.strikes_updated_ns = if (g.options.strike_decay_ms == 0 or left <= 0)
             now_ns
         else
             e.strikes_updated_ns +| (drained *| (g.options.strike_decay_ms *| std.time.ns_per_ms));
         if (e.strikes < @as(f64, @floatFromInt(g.options.ban_threshold))) return;
-        // Offense: reset the balance, escalate.
+        // Offense: reset the balance, escalate. (The drain mark restarts at
+        // the next strike: an empty balance does that above.)
         e.strikes = 0;
         e.offenses +|= 1;
         if (g.options.ban_after_offenses != 0 and e.offenses >= g.options.ban_after_offenses) {
@@ -1218,6 +1221,50 @@ test "record: a drip just inside the decay interval still drains" {
     // 5 strikes, 4 whole seconds of elapsed time between the first and last:
     // four of them drained, so the balance never reached 5.
     try testing.expect(!g.isGreylisted(ip));
+}
+
+test "record: after the balance drains out, the next strike's interval starts at that strike" {
+    // A strike after a long idle must hold a full `strike_decay_ms`. Until
+    // 2026-10-11 the drain mark kept the idle time's sub-interval remainder
+    // (here 500 ms), so this strike drained 500 ms later instead of 1000 ms
+    // and the offense below was missed. Negative control: restoring the
+    // remainder-keeping mark fails the last expectation.
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{
+        .ban_threshold = 3,
+        .ban_after_offenses = 0,
+        .strike_decay_ms = 1000,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    const ip = mkIp("192.0.2.79");
+    g.record(ip, 1);
+    tc.advanceMs(2500); // the one strike drained long ago
+    g.record(ip, 1); // balance 1, its interval starts now
+    tc.advanceMs(700); // < 1000 ms: nothing may drain yet
+    g.record(ip, 2); // 1 + 2 = 3 → offense
+    try testing.expect(g.isGreylisted(ip));
+}
+
+test "record: after an offense the next strike starts a full interval" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{
+        .ban_threshold = 2,
+        .ban_after_offenses = 0,
+        .greylist_ttl_ms = 100,
+        .strike_decay_ms = 1000,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    const ip = mkIp("192.0.2.80");
+    tc.advanceMs(300);
+    g.record(ip, 2); // offense at 300 ms, balance reset
+    tc.advanceMs(200); // greylist over
+    try testing.expect(!g.isGreylisted(ip));
+    g.record(ip, 1); // 500 ms
+    tc.advanceMs(900); // 1400 ms: 900 ms since the strike, 1100 since the mark of the first one
+    g.record(ip, 1); // nothing drained: 1 + 1 = 2 → offense
+    try testing.expect(g.isGreylisted(ip));
 }
 
 test "per-IP isolation: strikes, greylists and counters never leak across IPs" {
@@ -2838,9 +2885,11 @@ const AgModel = struct {
         const e = &m.ents[i];
         const dr = m.drained(e, now);
         if (dr > 0 and e.strikes > 0) m.reach.strikes_decayed += 1;
+        const emptied = e.strikes <= dr;
         e.strikes = (e.strikes -| dr) + w;
-        // Whole strikes drain; the undrained remainder of the interval is kept.
-        e.mark = if (m.cfg.decay_ms == 0) now else e.mark + dr * m.cfg.decay_ms * ms;
+        // Whole strikes drain; the undrained remainder of the interval is kept
+        // while strikes are left, and an emptied balance restarts at `now`.
+        e.mark = if (m.cfg.decay_ms == 0 or emptied) now else e.mark + dr * m.cfg.decay_ms * ms;
         if (e.strikes < m.cfg.threshold) return;
         e.strikes = 0;
         e.offenses += 1;

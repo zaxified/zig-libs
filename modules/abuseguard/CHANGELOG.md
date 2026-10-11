@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Fix (stricter): `record` restarts the strike-drain interval at the strike when the previous balance had drained out completely. It used to keep the idle time's sub-interval remainder, so a strike after a long idle could drain up to one `strike_decay_ms` early and an offense could be missed (the code comment already said it should not). Two regression tests; the model-fuzz reference updated to match.
+
 - **2026-10-11** — tests: model-fuzz against a naive ordered-array reference model (300 seeded random sequences over admit/close/record/ban/greylist/prefix bans/reconcile with an injected clock; per-step verdict and state checks incl. LRU eviction and sweep, snapshot multiset, text and restore round trips; reach classes enforced). No API or behaviour change.
 
 - **2026-10-10** — Card Performance `n/a` with the reason (no timeable reference implementation). Docs only.

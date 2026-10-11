@@ -43,7 +43,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   optional `router.Middleware`, auto-strike on 4xx/429, registered first so it observes inner
   denials + the router's own 404/405.
 - **Strikes (fail2ban shape):** `record(ip, weight)` decays as a leaky bucket (one strike per
-  `strike_decay_ms` ≈ findtime); reaching `ban_threshold` (≈ maxretry) resets the balance and
+  `strike_decay_ms` ≈ findtime; whole strikes drain, the sub-interval remainder is kept while strikes
+  are left, and a balance that drained out restarts its interval at the next strike — fixed
+  2026-10-11, it used to keep the idle remainder and drain up to one interval early); reaching `ban_threshold` (≈ maxretry) resets the balance and
   greylists for `greylist_ttl_ms` (≈ bantime); reaching `ban_after_offenses` escalates to a
   permanent ban (≈ the recidive jail).
 - **Keying:** socket peer IP, unmapped, masked to `ipv6_key_bits` (default **64**, one subscriber =
