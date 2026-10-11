@@ -27,6 +27,9 @@
 //! - An `index` file (`index.html` by default) for a directory request;
 //!   directory listing is **off by default** (opt-in, HTML-escaped when on).
 //! - `Cache-Control` when configured (`Options.cache_control`, verbatim).
+//! - Opt-in `Options.fallback` (SPA: an extension-less miss under an HTML
+//!   `Accept` answers with that file, 200) and `Options.precompressed`
+//!   (`name.br` / `.zst` / `.gz` negotiated per request, as `Snapshot` does).
 //!
 //! ## Path-traversal safety — the make-or-break requirement
 //!
@@ -179,6 +182,28 @@ pub const Options = struct {
     /// serving (e.g. a caller with its own, different rules for bare vs.
     /// slash-terminated directory URLs upstream of this handler).
     redirect_to_trailing_slash: bool = true,
+    /// SPA / `try_files`-style fallback: a root-relative file (e.g.
+    /// `"index.html"`) served with status 200 in place of a 404. Only for a
+    /// GET/HEAD whose path resolves to nothing, whose LAST segment has no
+    /// `.` (no extension -- a missing `/app.js` stays a 404, so a broken
+    /// asset link is never answered with HTML), and whose `Accept` lists
+    /// `text/html` (a browser navigation, not an API client or `curl`). The
+    /// fallback file goes through exactly the rules of any other path
+    /// (sanitizing, no-follow walk, dotfiles, containment); one that does not
+    /// resolve to a regular file leaves the ordinary 404. Such an answer
+    /// carries `Vary: Accept` (the same URL answers 404 to another `Accept`).
+    /// Must be caller-owned / static. Handler only; `Snapshot` ignores it.
+    fallback: ?[]const u8 = null,
+    /// Serve a precompressed sibling (`name.br`, `name.zst`, `name.gz`) in
+    /// place of `name` when the client's `Accept-Encoding` prefers one over
+    /// identity, as `SnapshotOptions.precompressed` does for a `Snapshot`.
+    /// null (default) = off; `.{}` = all three. The sibling is opened with
+    /// the same rules as any file; it answers with `Content-Encoding`,
+    /// `name`'s `Content-Type`, its own `ETag` (the encoding's token is part
+    /// of it), and `Range` over its encoded bytes. With this on, every
+    /// answer for a file carries `Vary: Accept-Encoding`. Handler only: a
+    /// `Snapshot` takes its set from `SnapshotOptions.precompressed`.
+    precompressed: ?Precompressed = null,
 };
 
 // ── MIME table ───────────────────────────────────────────────────────────────
@@ -220,6 +245,32 @@ const mime_table = std.StaticStringMap([]const u8).initComptime(.{
     .{ "mp4", "video/mp4" },
     .{ "webm", "video/webm" },
     .{ "ogg", "audio/ogg" },
+    .{ "oga", "audio/ogg" },
+    .{ "opus", "audio/ogg" },
+    .{ "flac", "audio/flac" },
+    .{ "m4a", "audio/mp4" },
+    .{ "aac", "audio/aac" },
+    .{ "weba", "audio/webm" },
+    .{ "mov", "video/quicktime" },
+    .{ "ogv", "video/ogg" },
+    .{ "avi", "video/x-msvideo" },
+    .{ "mpeg", "video/mpeg" },
+    .{ "mpg", "video/mpeg" },
+    .{ "apng", "image/apng" },
+    .{ "tif", "image/tiff" },
+    .{ "tiff", "image/tiff" },
+    .{ "heic", "image/heic" },
+    .{ "webmanifest", "application/manifest+json" },
+    .{ "jsonld", "application/ld+json" },
+    .{ "xhtml", "application/xhtml+xml" },
+    .{ "rss", "application/rss+xml" },
+    .{ "atom", "application/atom+xml" },
+    .{ "ics", "text/calendar; charset=utf-8" },
+    .{ "epub", "application/epub+zip" },
+    .{ "tar", "application/x-tar" },
+    .{ "zst", "application/zstd" },
+    .{ "glb", "model/gltf-binary" },
+    .{ "gltf", "model/gltf+json" },
 });
 
 /// The `Content-Type` for `name`, by its extension: `overrides` first
@@ -662,11 +713,31 @@ pub const Handler = struct {
         }
 
         var via_directory = false;
+        var target_raw: []const u8 = req.path;
+        var fallback = false;
         var resolved = h.resolveForServe(req.path, &via_directory) catch |e| switch (e) {
             error.Traversal, error.DotfileForbidden, error.InvalidByte, error.Forbidden => return sendStatus(rw, 403),
             error.Malformed => return sendStatus(rw, 400),
             error.TooLong => return sendStatus(rw, 414),
-            error.NotFound => return sendStatus(rw, 404),
+            error.NotFound => blk: {
+                // Would be a 404: the SPA fallback, if configured and asked for.
+                const fb = h.options.fallback orelse return sendStatus(rw, 404);
+                if (!wantsFallback(req, h.options.serve_dotfiles)) return sendStatus(rw, 404);
+                via_directory = false;
+                const r = h.resolveForServe(fb, &via_directory) catch return sendStatus(rw, 404);
+                switch (r) {
+                    .opened => {},
+                    // A fallback naming a directory without an index: nothing to serve.
+                    .dir_listing => |dh| {
+                        var dirhandle = dh;
+                        if (dirhandle.owned) dirhandle.dir.close(h.io);
+                        return sendStatus(rw, 404);
+                    },
+                }
+                target_raw = fb;
+                fallback = true;
+                break :blk r;
+            },
             error.IoError => return sendStatus(rw, 500),
         };
         // A1 F17 (round-2 Q8): a directory route reached by a URL missing
@@ -674,8 +745,9 @@ pub const Handler = struct {
         // anything is served at the bare URL — matching Go `net/http`
         // `FileServer` / nginx, and avoiding the "relative links inside the
         // page resolve one directory too high" class of bug a silent dual
-        // serve invites.
-        if (via_directory and h.options.redirect_to_trailing_slash and
+        // serve invites. (Not for the fallback: it is served AT the
+        // requested URL, whatever shape the configured file has.)
+        if (via_directory and !fallback and h.options.redirect_to_trailing_slash and
             (req.path.len == 0 or req.path[req.path.len - 1] != '/'))
         {
             switch (resolved) {
@@ -690,7 +762,8 @@ pub const Handler = struct {
         switch (resolved) {
             .opened => |*opened| {
                 defer opened.close(h.io);
-                return h.sendFile(req, rw, opened);
+                if (h.options.precompressed == null and !fallback) return h.sendFile(req, rw, opened);
+                return h.sendNegotiated(req, rw, opened, target_raw, via_directory, fallback);
             },
             .dir_listing => |dh| {
                 var dirhandle = dh;
@@ -698,6 +771,58 @@ pub const Handler = struct {
                 return h.serveDirectory(req, rw, dirhandle);
             },
         }
+    }
+
+    /// The answer for a resolved file when `Options.precompressed` and/or the
+    /// fallback are in play: the `Vary` header, and the precompressed sibling
+    /// the client prefers, if one exists. `raw` is the request path that
+    /// resolved to `opened` (the fallback's own path for a fallback);
+    /// `via_directory` says `opened` is that directory's index.
+    fn sendNegotiated(h: *const Handler, req: *http.Server.Request, rw: *http.Server.ResponseWriter, opened: *Opened, raw: []const u8, via_directory: bool, fallback: bool) Writer.Error!void {
+        // A cache that is not told serves one client's variant to another.
+        const vary: []const u8 = if (h.options.precompressed != null)
+            (if (fallback) "Accept, Accept-Encoding" else "Accept-Encoding")
+        else
+            "Accept";
+        rw.setHeader("Vary", vary) catch return failUnsafeResponse(rw);
+        if (h.options.precompressed) |pc| {
+            if (h.openVariant(req, opened, raw, via_directory, pc)) |v| {
+                var o = v.opened;
+                defer o.close(h.io);
+                o.setMimeName(opened.mimeName()); // Content-Type from the ORIGINAL name
+                rw.setHeader("Content-Encoding", codings[v.coding].token) catch return failUnsafeResponse(rw);
+                var etag_buf: [etag_max + 5]u8 = undefined;
+                const etag = buildVariantETag(&etag_buf, o.stat.size, o.stat.mtime.toSeconds(), !h.options.strong_etag, codings[v.coding].token);
+                return h.sendFileTagged(req, rw, &o, etag);
+            }
+        }
+        return h.sendFile(req, rw, opened);
+    }
+
+    const Variant = struct { opened: Opened, coding: usize };
+
+    /// Open the precompressed sibling this request prefers to identity, or
+    /// null. Candidates are tried in the client's order of preference (ties:
+    /// the server's, `codings`); one that is absent -- or refused by the
+    /// ordinary open rules, a symlink say -- drops out and the next best is
+    /// tried, so a request opens only as many siblings as it must. No
+    /// `Accept-Encoding` is identity and opens nothing.
+    fn openVariant(h: *const Handler, req: *const http.Server.Request, opened: *const Opened, raw: []const u8, via_directory: bool, pc: Precompressed) ?Variant {
+        const ae = req.header("accept-encoding") orelse return null;
+        var rel_buf: [max_path_bytes]u8 = undefined;
+        const rel = sanitizePath(raw, &rel_buf, .{ .allow_dotfiles = h.options.serve_dotfiles }) catch return null;
+        // The file's root-relative name + the suffix, in one buffer.
+        var path_buf: [max_path_bytes + mime_name_max + 8]u8 = undefined;
+        const sep: []const u8 = if (via_directory and rel.len != 0) "/" else "";
+        const leaf: []const u8 = if (via_directory) opened.mimeName() else "";
+        var avail = [codings.len]bool{ pc.br, pc.zstd, pc.gzip };
+        while (pickCoding(ae, avail)) |c| {
+            const path = std.fmt.bufPrint(&path_buf, "{s}{s}{s}{s}", .{ rel, sep, leaf, codings[c].suffix }) catch return null;
+            if (openWithinRoot(h.root, h.io, path, h.options)) |o| {
+                return .{ .opened = o, .coding = c };
+            } else |_| avail[c] = false;
+        }
+        return null;
     }
 
     /// Emit the representation headers + body (or 304/412/206/416) for an
@@ -1147,6 +1272,59 @@ fn writeHtmlEscaped(w: *Writer, s: []const u8) Writer.Error!void {
     };
 }
 
+// ── precompressed variants (shared by `Handler` and `Snapshot`) ─────────────
+
+const Coding = struct { token: []const u8, suffix: []const u8 };
+
+/// Server preference order: a tie in the client's weights goes to the earlier.
+const codings = [_]Coding{
+    .{ .token = "br", .suffix = ".br" },
+    .{ .token = "zstd", .suffix = ".zst" },
+    .{ .token = "gzip", .suffix = ".gz" },
+};
+
+/// The `codings` index the client's `Accept-Encoding` `ae` prefers among the
+/// `avail`able ones, or null when identity is preferred (or nothing offered
+/// is acceptable). A client that said nothing is identity: the caller has no
+/// `ae` to pass.
+fn pickCoding(ae: []const u8, avail: [codings.len]bool) ?usize {
+    var offers: [codings.len][]const u8 = undefined;
+    var which: [codings.len]usize = undefined;
+    var n: usize = 0;
+    for (codings, avail, 0..) |c, ok, i| if (ok) {
+        offers[n] = c.token;
+        which[n] = i;
+        n += 1;
+    };
+    const best = http.conneg.negotiateEncoding(ae, offers[0..n]) orelse return null;
+    if (http.conneg.encodingQuality(ae, "identity")) |q| if (q > best.weight) return null;
+    return which[best.index];
+}
+
+/// `buildETag`'s tag for a precompressed variant: the coding's token before the
+/// closing quote, so no two encodings of one file (same size and mtime, say)
+/// share a validator.
+fn buildVariantETag(buf: *[etag_max + 5]u8, size: u64, mtime_s: i64, weak: bool, token: []const u8) []const u8 {
+    const m: u64 = if (mtime_s < 0) 0 else @intCast(mtime_s);
+    return (if (weak)
+        std.fmt.bufPrint(buf, "W/\"{x}-{x}-{s}\"", .{ size, m, token })
+    else
+        std.fmt.bufPrint(buf, "\"{x}-{x}-{s}\"", .{ size, m, token })) catch unreachable;
+}
+
+/// Is `req` one the SPA fallback answers (`Options.fallback`)? Its last path
+/// segment has no `.` -- a missing asset is a 404, never HTML -- and its
+/// `Accept` lists `text/html`. (Only reached for a path that already
+/// sanitized and resolved to nothing.)
+fn wantsFallback(req: *const http.Server.Request, allow_dotfiles: bool) bool {
+    var buf: [max_path_bytes]u8 = undefined;
+    const rel = sanitizePath(req.path, &buf, .{ .allow_dotfiles = allow_dotfiles }) catch return false;
+    const leaf = rel[(mem.lastIndexOfScalar(u8, rel, '/') orelse 0)..];
+    if (mem.indexOfScalar(u8, leaf, '.') != null) return false;
+    const accept = req.header("accept") orelse return false;
+    return std.ascii.indexOfIgnoreCase(accept, "text/html") != null;
+}
+
 // ── Snapshot: a root opened once, served without opening anything ───────────
 
 /// Precompressed siblings a `Snapshot` serves in place of a file, in server
@@ -1240,13 +1418,6 @@ pub const Snapshot = struct {
     fresh: usize = 0,
 
     const Node = union(enum) { file: u32, dir: ?u32 };
-
-    const Coding = struct { token: []const u8, suffix: []const u8 };
-    const codings = [_]Coding{
-        .{ .token = "br", .suffix = ".br" },
-        .{ .token = "zstd", .suffix = ".zst" },
-        .{ .token = "gzip", .suffix = ".gz" },
-    };
 
     /// Walk `root` and open every regular file under it. `root` must be
     /// opened with `.iterate = true`; the caller keeps it, and the snapshot
@@ -1480,21 +1651,12 @@ pub const Snapshot = struct {
     }
 
     /// The `codings` index of the variant this request prefers to identity,
-    /// or null. No `Accept-Encoding` is identity: a client that said nothing
-    /// gets the bytes every client can read.
+    /// or null.
     fn pickVariant(req: *const http.Server.Request, vars: [codings.len]?u32) ?usize {
         const ae = req.header("accept-encoding") orelse return null;
-        var offers: [codings.len][]const u8 = undefined;
-        var which: [codings.len]usize = undefined;
-        var n: usize = 0;
-        for (codings, vars, 0..) |c, v, i| if (v != null) {
-            offers[n] = c.token;
-            which[n] = i;
-            n += 1;
-        };
-        const best = http.conneg.negotiateEncoding(ae, offers[0..n]) orelse return null;
-        if (http.conneg.encodingQuality(ae, "identity")) |q| if (q > best.weight) return null;
-        return which[best.index];
+        var avail: [codings.len]bool = undefined;
+        for (vars, 0..) |v, i| avail[i] = v != null;
+        return pickCoding(ae, avail);
     }
 };
 
@@ -4060,4 +4222,359 @@ test "Live observer: told unchanged, published (with the generation and fresh fi
     try testing.expectEqual(error.TooManyFiles, log.seen[1].failed);
     try testing.expectEqual(@as(u64, 2), log.seen[2].published.generation);
     try testing.expectEqual(@as(usize, 1), log.seen[2].published.fresh);
+}
+
+// ── fallback, Handler precompressed variants, fuller MIME table ─────────────
+
+/// `runRequest` without the response compressor, so a test of `Content-Encoding`
+/// sees what the handler chose and not what the server core then added.
+fn runPlain(handler: *Handler, wire: []const u8, out_buf: []u8) []const u8 {
+    var in: std.Io.Reader = .fixed(wire);
+    var out: std.Io.Writer = .fixed(out_buf);
+    var head_buf: [4096]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [512]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = httpHandler,
+        .context = handler,
+        .server_name = "test",
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+/// One request with a method and extra header lines (each ending `\r\n`).
+fn sendReq(handler: *Handler, method: []const u8, path: []const u8, extra: []const u8, out_buf: []u8) []const u8 {
+    var wire_buf: [1024]u8 = undefined;
+    const wire = std.fmt.bufPrint(&wire_buf, "{s} {s} HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ method, path, extra }) catch unreachable;
+    return runPlain(handler, wire, out_buf);
+}
+
+const html_accept = "Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8\r\n";
+
+test "mimeType: the fuller table (nginx mime.types' common web types), case-insensitively" {
+    const cases = [_][2][]const u8{
+        .{ "site.webmanifest", "application/manifest+json" },
+        .{ "a.mov", "video/quicktime" },
+        .{ "a.flac", "audio/flac" },
+        .{ "a.jsonld", "application/ld+json" },
+        .{ "a.avif", "image/avif" },
+        .{ "a.opus", "audio/ogg" },
+        .{ "a.mjs", "text/javascript; charset=utf-8" },
+        .{ "a.wasm", "application/wasm" },
+        .{ "cal.ICS", "text/calendar; charset=utf-8" },
+        .{ "b.epub", "application/epub+zip" },
+        .{ "a.apng", "image/apng" },
+        .{ "a.m4a", "audio/mp4" },
+        .{ "a.weba", "audio/webm" },
+        .{ "m.glb", "model/gltf-binary" },
+        .{ "m.gltf", "model/gltf+json" },
+        .{ "app.js.map", "application/json" },
+    };
+    for (cases) |c| try testing.expectEqualStrings(c[1], mimeType(c[0], &.{}, "dflt"));
+    // Still no sniffing: an unlisted extension stays the default.
+    try testing.expectEqualStrings("dflt", mimeType("a.unknownext", &.{}, "dflt"));
+    // And an override still wins over the new entries.
+    const ov = [_]MimeOverride{.{ .ext = "mov", .media_type = "video/x-test" }};
+    try testing.expectEqualStrings("video/x-test", mimeType("a.mov", &ov, "dflt"));
+}
+
+test "fallback: an unknown extension-less path under an HTML Accept serves the fallback file as a normal 200" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var h = Handler.init(testing.io, f.root, .{ .fallback = "index.html" });
+    var b: [4096]u8 = undefined;
+
+    const r = sendReq(&h, "GET", "/app/route", html_accept, &b);
+    try testing.expectEqual(@as(u16, 200), statusOf(r));
+    try testing.expectEqualStrings("<h1>home</h1>", bodyOf(r));
+    try testing.expectEqualStrings("text/html; charset=utf-8", headerOf(r, "content-type").?);
+    try testing.expectEqualStrings("Accept", headerOf(r, "vary").?);
+    const tag = headerOf(r, "etag").?;
+    try testing.expect(headerOf(r, "last-modified") != null);
+    try testing.expectEqualStrings("bytes", headerOf(r, "accept-ranges").?);
+
+    // HEAD: the headers, no body.
+    var b1: [4096]u8 = undefined;
+    const hd = sendReq(&h, "HEAD", "/app/route", html_accept, &b1);
+    try testing.expectEqual(@as(u16, 200), statusOf(hd));
+    try testing.expectEqualStrings("13", headerOf(hd, "content-length").?);
+    try testing.expectEqualStrings("", bodyOf(hd));
+
+    // Conditional and range rules are the file's own.
+    var inm: [128]u8 = undefined;
+    const cond = try std.fmt.bufPrint(&inm, html_accept ++ "If-None-Match: {s}\r\n", .{tag});
+    var b2: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 304), statusOf(sendReq(&h, "GET", "/app/route", cond, &b2)));
+    var b3: [4096]u8 = undefined;
+    const part = sendReq(&h, "GET", "/app/route", html_accept ++ "Range: bytes=0-3\r\n", &b3);
+    try testing.expectEqual(@as(u16, 206), statusOf(part));
+    try testing.expectEqualStrings("<h1>", bodyOf(part));
+
+    // Through a regular file (`hello.txt/x` is ENOTDIR) is nothing too; a
+    // dot in an EARLIER segment does not matter.
+    var b4: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 200), statusOf(sendReq(&h, "GET", "/hello.txt/x", html_accept, &b4)));
+    var b5: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 200), statusOf(sendReq(&h, "GET", "/v1.2/route/", html_accept, &b5)));
+    // The fallback is served AT the requested URL, never redirected to its own.
+    var b6: [4096]u8 = undefined;
+    var h_root = Handler.init(testing.io, f.root, .{ .fallback = "/" });
+    const via_dir = sendReq(&h_root, "GET", "/app/route", html_accept, &b6);
+    try testing.expectEqual(@as(u16, 200), statusOf(via_dir));
+    try testing.expectEqualStrings("<h1>home</h1>", bodyOf(via_dir));
+}
+
+test "fallback: never for an extension, another method, another Accept, a refused path, an existing file, or a fallback that is not there" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var h = Handler.init(testing.io, f.root, .{ .fallback = "index.html" });
+    var b: [4096]u8 = undefined;
+
+    // A missing asset is a 404, not HTML.
+    try testing.expectEqual(@as(u16, 404), statusOf(sendReq(&h, "GET", "/missing.js", html_accept, &b)));
+    try testing.expectEqual(@as(u16, 404), statusOf(sendReq(&h, "GET", "/sub/missing.css", html_accept, &b)));
+    try testing.expectEqual(@as(u16, 404), statusOf(sendReq(&h, "GET", "/app.route/page.html", html_accept, &b)));
+    // Not a navigation: no Accept, a JSON client, curl's `*/*`.
+    try testing.expectEqual(@as(u16, 404), statusOf(sendReq(&h, "GET", "/app/route", "", &b)));
+    try testing.expectEqual(@as(u16, 404), statusOf(sendReq(&h, "GET", "/app/route", "Accept: application/json\r\n", &b)));
+    try testing.expectEqual(@as(u16, 404), statusOf(sendReq(&h, "GET", "/app/route", "Accept: */*\r\n", &b)));
+    // Other methods keep their answer.
+    try testing.expectEqual(@as(u16, 405), statusOf(sendReq(&h, "POST", "/app/route", html_accept, &b)));
+    // A refused path stays refused (403 / 400), and an existing file is itself.
+    try testing.expectEqual(@as(u16, 403), statusOf(sendReq(&h, "GET", "/..%2fsecret", html_accept, &b)));
+    try testing.expectEqual(@as(u16, 403), statusOf(sendReq(&h, "GET", "/.git", html_accept, &b)));
+    try testing.expectEqual(@as(u16, 400), statusOf(sendReq(&h, "GET", "/%zz", html_accept, &b)));
+    const hello = sendReq(&h, "GET", "/hello.txt", html_accept, &b);
+    try testing.expectEqualStrings("hello world", bodyOf(hello));
+    try testing.expect(headerOf(hello, "vary") == null);
+    // Off by default.
+    var h_off = Handler.init(testing.io, f.root, .{});
+    try testing.expectEqual(@as(u16, 404), statusOf(sendReq(&h_off, "GET", "/app/route", html_accept, &b)));
+
+    // The fallback file is held to the same rules as any path: missing,
+    // dotfile, escaping, a symlink, a directory without index -> the 404.
+    const bad = [_][]const u8{ "nope.html", ".env", "../secret.txt", "escape", "inside_link", "sub", "sub/dir" };
+    for (bad) |fb| {
+        var hb = Handler.init(testing.io, f.root, .{ .fallback = fb });
+        var bb: [4096]u8 = undefined;
+        const r = sendReq(&hb, "GET", "/app/route", html_accept, &bb);
+        errdefer std.debug.print("fallback {s}: {s}\n", .{ fb, r });
+        try testing.expectEqual(@as(u16, 404), statusOf(r));
+        try testing.expect(mem.indexOf(u8, r, "SECRET") == null and mem.indexOf(u8, r, "TOP") == null);
+    }
+    // The dotfile is served when dotfiles are (the rule, not a blanket refusal).
+    var h_dot = Handler.init(testing.io, f.root, .{ .fallback = ".env", .serve_dotfiles = true });
+    const dot = sendReq(&h_dot, "GET", "/app/route", html_accept, &b);
+    try testing.expectEqualStrings("SECRET=1", bodyOf(dot));
+}
+
+/// A root for the precompressed tests: `app.js` with a `.gz` and a `.br` of
+/// the SAME size and mtime, a directory with an `index.html` + `.gz`, a
+/// symlinked `.br` pointing out of the root, and a file with no variants.
+fn variantRoot(tmp: *testing.TmpDir) !Dir {
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret.txt", .data = "TOP SECRET" });
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    errdefer root.close(io);
+    try root.writeFile(io, .{ .sub_path = "app.js", .data = "console.log(1)" });
+    try root.writeFile(io, .{ .sub_path = "app.js.gz", .data = "GZ-BYTES" });
+    try root.writeFile(io, .{ .sub_path = "app.js.br", .data = "BR-BYTES" });
+    try root.writeFile(io, .{ .sub_path = "plain.txt", .data = "plain" });
+    try root.writeFile(io, .{ .sub_path = "index.html", .data = "<h1>home</h1>" });
+    try root.writeFile(io, .{ .sub_path = "index.html.gz", .data = "IDX-GZ" });
+    _ = try root.createDirPathOpen(io, "sub", .{});
+    try root.writeFile(io, .{ .sub_path = "sub/index.html", .data = "<h1>sub</h1>" });
+    try root.writeFile(io, .{ .sub_path = "sub/index.html.br", .data = "SUB-BR" });
+    try root.writeFile(io, .{ .sub_path = "evil.css", .data = "body{}" });
+    root.symLink(io, "../secret.txt", "evil.css.br", .{}) catch {};
+    // Equal size AND mtime: only the encoding can tell the two tags apart.
+    for ([_][]const u8{ "app.js.gz", "app.js.br" }) |name| {
+        const file = try root.openFile(io, name, .{ .mode = .read_write });
+        defer file.close(io);
+        const t: Io.Timestamp = .{ .nanoseconds = 1_700_000_000 * std.time.ns_per_s };
+        try file.setTimestamps(io, .{ .access_timestamp = .{ .new = t }, .modify_timestamp = .{ .new = t } });
+    }
+    return root;
+}
+
+test "Handler precompressed: the client's preference over identity, Content-Type of the original, Vary on every answer" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try variantRoot(&tmp);
+    defer root.close(testing.io);
+    var h = Handler.init(testing.io, root, .{ .precompressed = .{} });
+
+    const Case = struct { ae: []const u8, body: []const u8, ce: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .ae = "", .body = "console.log(1)", .ce = null }, // no header: identity
+        .{ .ae = "Accept-Encoding: gzip\r\n", .body = "GZ-BYTES", .ce = "gzip" },
+        .{ .ae = "Accept-Encoding: gzip, br\r\n", .body = "BR-BYTES", .ce = "br" }, // tie -> server preference
+        .{ .ae = "Accept-Encoding: br;q=0.5, gzip\r\n", .body = "GZ-BYTES", .ce = "gzip" },
+        .{ .ae = "Accept-Encoding: gzip;q=0.1\r\n", .body = "console.log(1)", .ce = null }, // identity implicit at q=1
+        .{ .ae = "Accept-Encoding: zstd\r\n", .body = "console.log(1)", .ce = null }, // no such sibling
+        .{ .ae = "Accept-Encoding: *\r\n", .body = "BR-BYTES", .ce = "br" },
+        .{ .ae = "Accept-Encoding: br;q=0, gzip\r\n", .body = "GZ-BYTES", .ce = "gzip" },
+    };
+    for (cases) |c| {
+        var buf: [4096]u8 = undefined;
+        const r = sendReq(&h, "GET", "/app.js", c.ae, &buf);
+        errdefer std.debug.print("{s}-> {s}\n", .{ c.ae, r });
+        try testing.expectEqual(@as(u16, 200), statusOf(r));
+        try testing.expectEqualStrings(c.body, bodyOf(r));
+        try testing.expectEqualStrings("Accept-Encoding", headerOf(r, "vary").?);
+        try testing.expectEqualStrings("text/javascript; charset=utf-8", headerOf(r, "content-type").?);
+        if (c.ce) |ce| try testing.expectEqualStrings(ce, headerOf(r, "content-encoding").?) else try testing.expect(headerOf(r, "content-encoding") == null);
+    }
+
+    // A file with no variants is still told apart by the encoding the
+    // client asked for; the siblings are plain files under their own names.
+    var b1: [4096]u8 = undefined;
+    const plain = sendReq(&h, "GET", "/plain.txt", "Accept-Encoding: gzip\r\n", &b1);
+    try testing.expectEqualStrings("plain", bodyOf(plain));
+    try testing.expectEqualStrings("Accept-Encoding", headerOf(plain, "vary").?);
+    try testing.expect(headerOf(plain, "content-encoding") == null);
+    var b2: [4096]u8 = undefined;
+    const raw = sendReq(&h, "GET", "/app.js.gz", "Accept-Encoding: gzip\r\n", &b2);
+    try testing.expectEqualStrings("GZ-BYTES", bodyOf(raw));
+    try testing.expectEqualStrings("application/gzip", headerOf(raw, "content-type").?);
+    try testing.expect(headerOf(raw, "content-encoding") == null);
+    // An index file has variants too, at the directory URL and the root.
+    var b3: [4096]u8 = undefined;
+    const sub = sendReq(&h, "GET", "/sub/", "Accept-Encoding: br\r\n", &b3);
+    try testing.expectEqualStrings("SUB-BR", bodyOf(sub));
+    try testing.expectEqualStrings("br", headerOf(sub, "content-encoding").?);
+    try testing.expectEqualStrings("text/html; charset=utf-8", headerOf(sub, "content-type").?);
+    var b4: [4096]u8 = undefined;
+    const top = sendReq(&h, "GET", "/", "Accept-Encoding: gzip\r\n", &b4);
+    try testing.expectEqualStrings("IDX-GZ", bodyOf(top));
+    // The directory redirect is untouched.
+    var b5: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 301), statusOf(sendReq(&h, "GET", "/sub", "Accept-Encoding: br\r\n", &b5)));
+}
+
+test "Handler precompressed: a validator per encoding, Range over the encoded bytes, HEAD, 304" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try variantRoot(&tmp);
+    defer root.close(testing.io);
+    var h = Handler.init(testing.io, root, .{ .precompressed = .{} });
+
+    var b0: [4096]u8 = undefined;
+    const ident = sendReq(&h, "GET", "/app.js", "", &b0);
+    var b1: [4096]u8 = undefined;
+    const gz = sendReq(&h, "GET", "/app.js", "Accept-Encoding: gzip\r\n", &b1);
+    var b2: [4096]u8 = undefined;
+    const br = sendReq(&h, "GET", "/app.js", "Accept-Encoding: br\r\n", &b2);
+    // `app.js.gz` and `app.js.br` agree on size and mtime; the tags still differ.
+    try testing.expectEqual(headerOf(gz, "content-length").?.len, headerOf(br, "content-length").?.len);
+    try testing.expect(!mem.eql(u8, headerOf(gz, "etag").?, headerOf(br, "etag").?));
+    try testing.expect(!mem.eql(u8, headerOf(gz, "etag").?, headerOf(ident, "etag").?));
+
+    // Revalidating the variant's tag with that encoding is a 304; the
+    // identity tag does not match the variant.
+    var inm: [256]u8 = undefined;
+    const ok = try std.fmt.bufPrint(&inm, "Accept-Encoding: gzip\r\nIf-None-Match: {s}\r\n", .{headerOf(gz, "etag").?});
+    var b3: [4096]u8 = undefined;
+    const nm = sendReq(&h, "GET", "/app.js", ok, &b3);
+    try testing.expectEqual(@as(u16, 304), statusOf(nm));
+    try testing.expectEqualStrings("Accept-Encoding", headerOf(nm, "vary").?);
+    var inm2: [256]u8 = undefined;
+    const stale = try std.fmt.bufPrint(&inm2, "Accept-Encoding: gzip\r\nIf-None-Match: {s}\r\n", .{headerOf(ident, "etag").?});
+    var b4: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 200), statusOf(sendReq(&h, "GET", "/app.js", stale, &b4)));
+
+    // Range applies to the ENCODED representation.
+    var b5: [4096]u8 = undefined;
+    const part = sendReq(&h, "GET", "/app.js", "Accept-Encoding: gzip\r\nRange: bytes=0-1\r\n", &b5);
+    try testing.expectEqual(@as(u16, 206), statusOf(part));
+    try testing.expectEqualStrings("GZ", bodyOf(part));
+    try testing.expectEqualStrings("bytes 0-1/8", headerOf(part, "content-range").?);
+    try testing.expectEqualStrings("gzip", headerOf(part, "content-encoding").?);
+    // 416 is judged against the encoded length (8), not the original's (14).
+    var b6: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 416), statusOf(sendReq(&h, "GET", "/app.js", "Accept-Encoding: gzip\r\nRange: bytes=10-12\r\n", &b6)));
+
+    // HEAD: the variant's headers, no body.
+    var b7: [4096]u8 = undefined;
+    const hd = sendReq(&h, "HEAD", "/app.js", "Accept-Encoding: br\r\n", &b7);
+    try testing.expectEqual(@as(u16, 200), statusOf(hd));
+    try testing.expectEqualStrings("8", headerOf(hd, "content-length").?);
+    try testing.expectEqualStrings("br", headerOf(hd, "content-encoding").?);
+    try testing.expectEqualStrings("", bodyOf(hd));
+
+    // A strong tag keeps the encoding in it and is not weak.
+    var h_strong = Handler.init(testing.io, root, .{ .precompressed = .{}, .strong_etag = true });
+    var b8: [4096]u8 = undefined;
+    const s = sendReq(&h_strong, "GET", "/app.js", "Accept-Encoding: br\r\n", &b8);
+    const st = headerOf(s, "etag").?;
+    try testing.expect(st[0] == '"' and mem.endsWith(u8, st, "-br\""));
+}
+
+test "Handler precompressed: off by default, per-coding switches, and a sibling is opened by the ordinary rules" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try variantRoot(&tmp);
+    defer root.close(testing.io);
+
+    // Off: identity, no Vary (AE `br` is not one the server core compresses with).
+    var h_off = Handler.init(testing.io, root, .{});
+    var b0: [4096]u8 = undefined;
+    const off = sendReq(&h_off, "GET", "/app.js", "Accept-Encoding: br\r\n", &b0);
+    try testing.expectEqualStrings("console.log(1)", bodyOf(off));
+    try testing.expect(headerOf(off, "vary") == null);
+    try testing.expect(headerOf(off, "content-encoding") == null);
+
+    // One coding off: the next best.
+    var h_nobr = Handler.init(testing.io, root, .{ .precompressed = .{ .br = false } });
+    var b1: [4096]u8 = undefined;
+    const nobr = sendReq(&h_nobr, "GET", "/app.js", "Accept-Encoding: br, gzip\r\n", &b1);
+    try testing.expectEqualStrings("GZ-BYTES", bodyOf(nobr));
+    var h_none = Handler.init(testing.io, root, .{ .precompressed = .{ .br = false, .zstd = false, .gzip = false } });
+    var b2: [4096]u8 = undefined;
+    const none = sendReq(&h_none, "GET", "/app.js", "Accept-Encoding: br, gzip\r\n", &b2);
+    try testing.expectEqualStrings("console.log(1)", bodyOf(none));
+
+    // A sibling that is a symlink out of the root is not followed: the
+    // identity file is served, and nothing of the secret is.
+    var h = Handler.init(testing.io, root, .{ .precompressed = .{} });
+    var b3: [4096]u8 = undefined;
+    const evil = sendReq(&h, "GET", "/evil.css", "Accept-Encoding: br\r\n", &b3);
+    try testing.expectEqual(@as(u16, 200), statusOf(evil));
+    try testing.expectEqualStrings("body{}", bodyOf(evil));
+    try testing.expect(headerOf(evil, "content-encoding") == null);
+    try testing.expect(mem.indexOf(u8, evil, "SECRET") == null);
+    // Same with symlinks followed: containment refuses it.
+    var h_follow = Handler.init(testing.io, root, .{ .precompressed = .{}, .follow_symlinks = true });
+    var b4: [4096]u8 = undefined;
+    const evil2 = sendReq(&h_follow, "GET", "/evil.css", "Accept-Encoding: br\r\n", &b4);
+    try testing.expectEqualStrings("body{}", bodyOf(evil2));
+    try testing.expect(mem.indexOf(u8, evil2, "SECRET") == null);
+}
+
+test "fallback + precompressed: the fallback's sibling is negotiated, and Vary names both headers" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try variantRoot(&tmp);
+    defer root.close(testing.io);
+    var h = Handler.init(testing.io, root, .{ .fallback = "index.html", .precompressed = .{} });
+
+    var b0: [4096]u8 = undefined;
+    const r = sendReq(&h, "GET", "/some/route", html_accept ++ "Accept-Encoding: gzip\r\n", &b0);
+    try testing.expectEqual(@as(u16, 200), statusOf(r));
+    try testing.expectEqualStrings("IDX-GZ", bodyOf(r));
+    try testing.expectEqualStrings("gzip", headerOf(r, "content-encoding").?);
+    try testing.expectEqualStrings("text/html; charset=utf-8", headerOf(r, "content-type").?);
+    try testing.expectEqualStrings("Accept, Accept-Encoding", headerOf(r, "vary").?);
+    var b1: [4096]u8 = undefined;
+    const plain = sendReq(&h, "GET", "/some/route", html_accept, &b1);
+    try testing.expectEqualStrings("<h1>home</h1>", bodyOf(plain));
+    // An existing file keeps its own Vary.
+    var b2: [4096]u8 = undefined;
+    try testing.expectEqualStrings("Accept-Encoding", headerOf(sendReq(&h, "GET", "/plain.txt", html_accept, &b2), "vary").?);
 }

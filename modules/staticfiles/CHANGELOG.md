@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Added (scope core → parity; survey 2026-09-30 backlog): `Options.fallback` (SPA / `try_files`: an extension-less GET/HEAD miss whose `Accept` lists `text/html` answers with that file, 200, `Vary: Accept`; the fallback goes through every ordinary rule, a missing one leaves the 404); `Options.precompressed` for the path-based `Handler` (`name.br`/`.zst`/`.gz` negotiated per request like `Snapshot`, `Content-Encoding`, the original `Content-Type`, a per-coding `ETag`, `Range` over the encoded bytes, `Vary: Accept-Encoding` on every file answer while on); 26 more MIME types (nginx `mime.types` common web types: webmanifest, mov, flac, jsonld, opus, ics, epub, glb/gltf, …). Defaults unchanged. Multi-range stays refused.
+
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-staticfiles`, kept instrument kind 3): card Performance 0.11–0.59× Go FileServer, measured on a quiet host. Tooling only, no code change.
 
 - **2026-10-09** — tests: deterministic fuzz driver `STATICFILES_FUZZ` over the existing harnesses.
