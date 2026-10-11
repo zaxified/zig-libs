@@ -180,7 +180,20 @@ pub fn initCompress(
     c.buffered_tokens.n = 0;
     c.buffered_tokens.lit_freqs = @splat(0);
     c.buffered_tokens.dist_freqs = @splat(0);
-    c.lookup.head = @splat(.{ .value = std.math.maxInt(u15), .is_null = true });
+    // 64 KiB of 0xff (`.{ .value = maxInt(u15), .is_null = true }`), 32
+    // bytes at a time through a volatile vector: `@splat` here lowered to
+    // Zig 0.16's byte-wise `compiler_rt.memset` (no libc), ~16 % of a
+    // permessage-deflate message's compression (websocket bench, 2026-10-11).
+    // Volatile so LLVM neither drops the stores nor turns the loop back into
+    // a memset call. self-hosted backend: n/a. Back to `@splat` once Zig's
+    // compiler_rt memset is vectorized (master is; 0.16.0 is not).
+    {
+        const V = @Vector(32, u8);
+        const bytes = std.mem.asBytes(&c.lookup.head);
+        comptime std.debug.assert(@sizeOf(@TypeOf(c.lookup.head)) % 32 == 0);
+        const words: [*]align(1) volatile V = @ptrCast(bytes.ptr);
+        for (0..bytes.len / 32) |k| words[k] = @splat(0xff);
+    }
     c.lookup.chain_pos = std.math.maxInt(u15);
     c.container = container;
     c.opts = opts;

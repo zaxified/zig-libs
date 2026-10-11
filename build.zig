@@ -732,6 +732,13 @@ pub fn build(b: *std.Build) void {
             // ReleaseFast driver over a Debug module measures Debug.
             bench_mod.addImport(m.name, fastModuleGraph(b, target, &fast_mods, m.name));
             for (m.deps) |dep| bench_mod.addImport(dep, fastModuleGraph(b, target, &fast_mods, dep));
+            // `fastmem` for every bench driver (2026-10-11): a bench that
+            // exercises std code which memsets large blocks installs
+            // `fastmem.exportSymbols()`, as this collection's libc-free
+            // executables do (qap's), so the ratio measures the module and
+            // not Zig 0.16's byte-wise compiler_rt memset. A bench that does
+            // so says it on its card; the module itself never imports it.
+            if (!std.mem.eql(u8, m.name, "fastmem")) bench_mod.addImport("fastmem", fastModuleGraph(b, target, &fast_mods, "fastmem"));
 
             const bench_exe = b.addExecutable(.{
                 .name = b.fmt("bench-{s}", .{m.name}),
