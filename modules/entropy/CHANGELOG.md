@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — **Tests only, evidence E3 → E2 (grade 3 → 2):** the vDSO symbol lookup is
+  checked against an independent section-table model on every exported vDSO symbol (`vdsoLookupAt`
+  split out of `vdsoLookup` for it); every output route (`fill` via vDSO and via `randomSecure`, the
+  vDSO draw, `SecureSource`) passes a byte chi-square and a per-position coverage check with computed
+  false-alarm rates, plus a negative control. Three hand mutants killed (SPEC § Model and invariants).
+
 - **2026-10-10** — **Speed, behaviour unchanged for callers:** `fill` draws through the kernel's vDSO
   `getrandom` (Linux 6.11+, x86_64/aarch64, no libc) when `io` is std's `Threaded` — its whole
   vtable, so an `Io` that interposes on any slot still sees every draw. New `src/vgetrandom.zig`:

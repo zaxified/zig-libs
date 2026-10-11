@@ -95,9 +95,15 @@ fn init() void {
 /// must be a defined global/weak function or object, and its DT_VERSYM entry
 /// must name `version` in DT_VERDEF.
 fn vdsoLookup(version: []const u8, name: []const u8) usize {
-    const elf = std.elf;
-    const vdso_addr = linux.getauxval(elf.AT_SYSINFO_EHDR);
+    const vdso_addr = linux.getauxval(std.elf.AT_SYSINFO_EHDR);
     if (vdso_addr == 0) return 0;
+    return vdsoLookupAt(vdso_addr, version, name);
+}
+
+/// `vdsoLookup` over the image mapped at `vdso_addr`; split out so the test
+/// below can check it against a model that reaches the tables another way.
+fn vdsoLookupAt(vdso_addr: usize, version: []const u8, name: []const u8) usize {
+    const elf = std.elf;
     const eh: *const elf.Ehdr = @ptrFromInt(vdso_addr);
 
     var dynv_opt: ?[*]const usize = null;
@@ -198,6 +204,111 @@ pub fn draw(buf: []u8) bool {
         done += @intCast(r);
     }
     return true;
+}
+
+/// One exported symbol as the model sees it.
+const ModelSym = struct { name: []const u8, version: []const u8, addr: usize };
+
+/// Reference model for `vdsoLookupAt`, reaching the same tables by another
+/// route: the SECTION header table (SHT_DYNSYM, its sh_link string table,
+/// SHT_GNU_VERSYM, SHT_GNU_VERDEF) instead of PT_DYNAMIC + DT_HASH, every
+/// read bounds-checked through a slice and copied out unaligned, the load
+/// bias taken from the symbol table section's sh_offset − sh_addr instead of
+/// PT_LOAD. Shared with the implementation is only the ELF gABI rule for
+/// which symbol a versioned lookup may bind (defined, global/weak/unique,
+/// a data or code type, the non-base version definition named). The kernel
+/// maps its whole vDSO image, section headers included.
+fn modelSymbols(vdso_addr: usize, out: []ModelSym) []ModelSym {
+    const elf = std.elf;
+    const head: [*]const u8 = @ptrFromInt(vdso_addr);
+    const eh = std.mem.bytesToValue(elf.Elf64_Ehdr, head[0..@sizeOf(elf.Elf64_Ehdr)]);
+    const img = head[0 .. eh.e_shoff + @as(usize, eh.e_shnum) * eh.e_shentsize];
+    const shdr = struct {
+        fn at(image: []const u8, e: elf.Elf64_Ehdr, i: usize) elf.Elf64_Shdr {
+            const off = e.e_shoff + i * e.e_shentsize;
+            return std.mem.bytesToValue(elf.Elf64_Shdr, image[off..][0..@sizeOf(elf.Elf64_Shdr)]);
+        }
+    }.at;
+    const cstr = struct {
+        fn at(image: []const u8, table: elf.Elf64_Shdr, off: usize) []const u8 {
+            const s = image[table.sh_offset..][0..table.sh_size];
+            return std.mem.sliceTo(s[off..], 0);
+        }
+    }.at;
+
+    var dynsym: ?elf.Elf64_Shdr = null;
+    var versym: ?elf.Elf64_Shdr = null;
+    var verdef: ?elf.Elf64_Shdr = null;
+    for (0..eh.e_shnum) |i| {
+        const sh = shdr(img, eh, i);
+        switch (sh.sh_type) {
+            elf.SHT_DYNSYM => dynsym = sh,
+            elf.SHT_GNU_VERSYM => versym = sh,
+            elf.SHT_GNU_VERDEF => verdef = sh,
+            else => {},
+        }
+    }
+    const ds = dynsym orelse return out[0..0];
+    const strtab = shdr(img, eh, ds.sh_link);
+    const bias = vdso_addr +% ds.sh_offset -% ds.sh_addr;
+
+    var n: usize = 0;
+    for (0..ds.sh_size / ds.sh_entsize) |k| {
+        const st = std.mem.bytesToValue(elf.Elf64_Sym, img[ds.sh_offset + k * ds.sh_entsize ..][0..@sizeOf(elf.Elf64_Sym)]);
+        const bind = st.st_info >> 4;
+        const typ = st.st_info & 0xf;
+        if (st.st_shndx == elf.SHN_UNDEF) continue;
+        if (bind != elf.STB_GLOBAL and bind != elf.STB_WEAK and bind != elf.STB_GNU_UNIQUE) continue;
+        if (typ != elf.STT_NOTYPE and typ != elf.STT_OBJECT and typ != elf.STT_FUNC and typ != elf.STT_COMMON) continue;
+        // Unversioned images: the implementation skips the version check, so
+        // the model reports an empty version and the test passes any string.
+        var ver: []const u8 = "";
+        if (versym != null and verdef != null) {
+            const vs = std.mem.readInt(u16, img[versym.?.sh_offset + k * 2 ..][0..2], .little) & 0x7fff;
+            var off: usize = verdef.?.sh_offset;
+            var found = false;
+            for (0..verdef.?.sh_info) |_| {
+                const vd = std.mem.bytesToValue(elf.Verdef, img[off..][0..@sizeOf(elf.Verdef)]);
+                if (vd.flags & elf.VER_FLG_BASE == 0 and @intFromEnum(vd.ndx) == vs) {
+                    const aux = std.mem.bytesToValue(elf.Verdaux, img[off + vd.aux ..][0..@sizeOf(elf.Verdaux)]);
+                    ver = cstr(img, strtab, aux.name);
+                    found = true;
+                    break;
+                }
+                off += vd.next;
+            }
+            if (!found) continue;
+        }
+        if (n == out.len) break;
+        out[n] = .{ .name = cstr(img, strtab, st.st_name), .version = ver, .addr = bias +% st.st_value };
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "vdsoLookup agrees with the section-table model on every exported vDSO symbol" {
+    if (builtin.os.tag != .linux or @sizeOf(usize) != 8) return error.SkipZigTest;
+    const vdso_addr = linux.getauxval(std.elf.AT_SYSINFO_EHDR);
+    if (vdso_addr == 0) return error.SkipZigTest;
+    var buf: [256]ModelSym = undefined;
+    const syms = modelSymbols(vdso_addr, &buf);
+    // x86_64 Linux 7.0 exports 14 (clock_gettime, time, getcpu, getrandom, ...
+    // each under two names); a model that finds next to nothing is broken.
+    try std.testing.expect(syms.len >= 4);
+
+    var saw_getrandom = false;
+    for (syms) |s| {
+        try std.testing.expectEqual(s.addr, vdsoLookupAt(vdso_addr, s.version, s.name));
+        // Right name, wrong version: never bound.
+        try std.testing.expectEqual(@as(usize, 0), vdsoLookupAt(vdso_addr, "LINUX_0.0", s.name));
+        if (s.version.len != 0 and sym != null and std.mem.eql(u8, s.name, sym.?.name)) saw_getrandom = true;
+    }
+    try std.testing.expectEqual(@as(usize, 0), vdsoLookupAt(vdso_addr, syms[0].version, "__vdso_no_such_symbol"));
+    // The base version definition (the image's own soname) names no symbol.
+    try std.testing.expectEqual(@as(usize, 0), vdsoLookupAt(vdso_addr, "linux-vdso.so.1", syms[0].name));
+    // The symbol `init` binds is among them where the kernel has it (6.11+);
+    // the agreement above then covers the address `draw` will call.
+    if (sym != null and vdsoLookup(sym.?.version, sym.?.name) != 0) try std.testing.expect(saw_getrandom);
 }
 
 test "draw fills the whole buffer, differently each time, on a kernel with the vDSO symbol" {

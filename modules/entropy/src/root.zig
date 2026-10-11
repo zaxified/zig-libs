@@ -975,6 +975,145 @@ test "the abort messages each name their own cause, and only their own" {
     try testing.expect(std.mem.indexOf(u8, canceled_contract_violation_message, "EntropyUnavailable") == null);
 }
 
+// Output invariants, on every route `fill` can take. The coverage tests above
+// catch a buffer left untouched; these catch a source that writes every byte
+// but writes the wrong ones -- a stuck position, a partial copy, a skewed or
+// patterned byte. Thresholds are statistical, so each is set so that a correct
+// source fails it with probability below 1e-9 per run.
+const uniformity = struct {
+    /// Pearson chi-square of the byte histogram of 1 MiB drawn in odd-sized
+    /// pieces (so piece boundaries move across every block size). df = 255;
+    /// the band [142, 415] is the two-sided 1e-9 tail by Wilson-Hilferty
+    /// (z = ±6). Too low is as wrong as too high: a counter is "too uniform".
+    fn chiSquare(src: anytype) f64 {
+        var counts: [256]u64 = @splat(0);
+        var piece: [4099]u8 = undefined;
+        var total: usize = 0;
+        while (total < 1 << 20) : (total += piece.len) {
+            @memset(&piece, 0);
+            src.draw(&piece);
+            for (piece) |b| counts[b] += 1;
+        }
+        const expected: f64 = @as(f64, @floatFromInt(total)) / 256.0;
+        var chi: f64 = 0;
+        for (counts) |c| {
+            const d = @as(f64, @floatFromInt(c)) - expected;
+            chi += d * d / expected;
+        }
+        return chi;
+    }
+
+    const Stuck = struct { len: usize, pos: usize, zeros: u8 };
+
+    /// Every position of a short draw takes many values. For each length
+    /// 1..130 (two ChaCha blocks and a tail) and 4099, 64 draws into a zeroed
+    /// buffer; a position that reads 0 in 16 or more of them fails. For a
+    /// uniform byte the count is Binomial(64, 1/256), and P(>= 16) < 1e-20, so
+    /// across all positions a correct source never trips it; a position the
+    /// source never writes reads 0 all 64 times.
+    fn everyPosition(src: anytype) ?Stuck {
+        var buf: [4099]u8 = undefined;
+        var zeros: [4099]u8 = undefined;
+        var len: usize = 1;
+        while (len <= 4099) : (len = if (len == 130) 4099 else len + 1) {
+            @memset(zeros[0..len], 0);
+            for (0..64) |_| {
+                @memset(buf[0..len], 0);
+                src.draw(buf[0..len]);
+                for (buf[0..len], zeros[0..len]) |b, *z| z.* += @intFromBool(b == 0);
+            }
+            for (zeros[0..len], 0..) |z, pos| if (z >= 16) return .{ .len = len, .pos = pos, .zeros = z };
+        }
+        return null;
+    }
+
+    fn both(src: anytype) !void {
+        const chi = chiSquare(src);
+        if (chi < 142 or chi > 415) {
+            std.debug.print("chi-square {d:.1} outside [142, 415]\n", .{chi});
+            return error.TestUnexpectedResult;
+        }
+        if (everyPosition(src)) |st| {
+            std.debug.print("length {d}: position {d} read 0 in {d}/64 draws\n", .{ st.len, st.pos, st.zeros });
+            return error.TestUnexpectedResult;
+        }
+    }
+};
+
+test "fill output is uniform, every position written, on std's testing Io" {
+    try uniformity.both(struct {
+        fn draw(_: @This(), buf: []u8) void {
+            fill(testing.io, buf);
+        }
+    }{});
+}
+
+test "fill output is uniform, every position written, on the randomSecure route" {
+    // CountingIo's vtable is not Threaded's, so this is the non-vDSO route.
+    var probe: CountingIo = .{ .inner = testing.io };
+    try uniformity.both(struct {
+        io: std.Io,
+        fn draw(self: @This(), buf: []u8) void {
+            fill(self.io, buf);
+        }
+    }{ .io = probe.io() });
+    try testing.expect(probe.secure_calls > 0);
+}
+
+test "fill output is uniform, every position written, on the vDSO route" {
+    if (!vgetrandom.supported) return error.SkipZigTest;
+    var probe: [1]u8 = undefined;
+    if (!vgetrandom.draw(&probe)) return error.SkipZigTest; // kernel < 6.11
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    try uniformity.both(struct {
+        io: std.Io,
+        fn draw(self: @This(), buf: []u8) void {
+            fill(self.io, buf);
+        }
+    }{ .io = threaded.io() });
+    // And the vDSO draw itself, so a fallback to the syscall cannot hide it.
+    try uniformity.both(struct {
+        fn draw(_: @This(), buf: []u8) void {
+            if (!vgetrandom.draw(buf)) @panic("vDSO draw refused after it had worked");
+        }
+    }{});
+}
+
+test "SecureSource output is uniform, every position written" {
+    var src: SecureSource = .{ .io = testing.io };
+    try uniformity.both(struct {
+        r: std.Random,
+        fn draw(self: @This(), buf: []u8) void {
+            self.r.bytes(buf);
+        }
+    }{ .r = src.interface() });
+}
+
+// Negative control: the checks must reject what they claim to reject.
+test "uniformity checks reject a stuck position and a counter" {
+    const Stuck = struct {
+        fn draw(_: @This(), buf: []u8) void {
+            fill(testing.io, buf);
+            buf[buf.len - 1] = 0; // tail byte never written
+        }
+    };
+    const st = uniformity.everyPosition(Stuck{}) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 0), st.pos); // length 1 already trips it
+    const Counter = struct {
+        n: *u8,
+        fn draw(self: @This(), buf: []u8) void {
+            for (buf) |*b| {
+                b.* = self.n.*;
+                self.n.* +%= 1;
+            }
+        }
+    };
+    var n: u8 = 0;
+    // A byte counter is perfectly flat: chi-square 0, under the band's floor.
+    try testing.expect(uniformity.chiSquare(Counter{ .n = &n }) < 142);
+}
+
 test {
     _ = vgetrandom;
 }
