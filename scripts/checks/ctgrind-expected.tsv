@@ -978,6 +978,19 @@ sealedbox	ReleaseFast	b64dec	1	1	facecdf4850308dd	1c8749621d19a09b
 # `try` is a second, unattributed context (measured, and --check refused it).
 sealedbox	ReleaseFast	seal	1	0	40988af8340a00a7	162755ddf8591877
 sealedbox	ReleaseFast	open	1	1	40988af8340a00a7	4d07318504db8dd7
+# ── cookies: signed/private cookie values, secure.zig (2026-10-12) ──────────
+# Key (and for `seal` the plaintext) tainted. derive/sign/seal: exact 0 in-file.
+# `sign` and `seal` declassify their output inside secure.zig before base64 (it
+# goes to the client), so they have no witness: total_min 0, the out_sha column
+# is what proves the module ran. `verify`: exact 0 (LLVM selects the verdict;
+# the harness prints it tainted as the witness). `open`: exact 2, both aesgcm's
+# own accept/reject branch (aesgcm root.zig, `decryptBody`), once for the
+# genuine and once for the forged value -- secure.zig adds none.
+cookies	ReleaseFast	derive	1	0	1a5356bdb0bbc145	91529f00f4a937a1
+cookies	ReleaseFast	sign	0	0	1a5356bdb0bbc145	cb319d1ef6d579dd
+cookies	ReleaseFast	verify	1	0	1a5356bdb0bbc145	c63e696876bcc630
+cookies	ReleaseFast	seal	0	0	1a5356bdb0bbc145	48f87b677a6c2d06
+cookies	ReleaseFast	open	1	2	1a5356bdb0bbc145	c63e696876bcc630
 # ── pir: the query index, and the client's check ───────────────────────────
 # A1 `pir.md` M2 -- the module's central claim had never been machine-checked,
 # and its sibling `fss` exposed a REAL defect the day it entered the gate.

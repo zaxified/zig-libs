@@ -16,6 +16,7 @@ modules/aesgcm/src/root.zig	2	1
 modules/aeskw/src/root.zig	1	0
 modules/blindrsa/src/root.zig	1	1
 modules/chachapoly/src/root.zig	1	1
+modules/cookies/src/secure.zig	1	0
 modules/ctap2pin/src/root.zig	3	7
 modules/dkg/src/core.zig	2	0
 modules/dnssec/src/ds.zig	1	0

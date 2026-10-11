@@ -17,7 +17,7 @@ const http = @import("http");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "HTTP cookies (RFC 6265) — request `Cookie` parser plus `Set-Cookie` builder (Secure/HttpOnly/SameSite), injection-guarded.",
+    .doc = "HTTP cookies (RFC 6265) — request `Cookie` parser plus `Set-Cookie` builder (Secure/HttpOnly/SameSite), injection-guarded; signed/encrypted values (cookie-rs format), client jar.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -27,7 +27,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .threadsafe, // `Jar` locks itself; the parser and builder have no state
     .model_after = "RFC 6265 (HTTP State Management Mechanism)",
-    .deps = .{"http"},
+    .deps = .{ "http", "aesgcm" },
 };
 
 /// The Public Suffix List algorithm, over a list the caller loads (`psl.zig`).
@@ -39,11 +39,22 @@ pub const PublicSuffixList = psl.PublicSuffixList;
 pub const jar = @import("jar.zig");
 pub const Jar = jar.Jar;
 
+/// Signed and encrypted cookie values (`secure.zig`): cookie-rs-compatible
+/// `private` (AES-256-GCM, name bound) and `signed` (HMAC-SHA256), key
+/// rotation, cookie-rs key derivation.
+pub const secure = @import("secure.zig");
+pub const Key = secure.Key;
+pub const signed = secure.signed;
+pub const private = secure.private;
+
 test {
     _ = psl;
     _ = @import("psl_oracle.zig");
     _ = jar;
     _ = @import("jar_go_oracle.zig");
+    _ = secure;
+    _ = @import("secure_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 /// One cookie name/value pair from a `Cookie` request header. Both slices
@@ -350,6 +361,91 @@ pub const SetCookie = struct {
 };
 
 // ── P3: http integration ────────────────────────────────────────────────────
+
+/// True for a byte cookie-rs's `Cookie::encoded()` percent-encodes: the
+/// WHATWG userinfo percent-encode set (C0 controls, DEL, non-ASCII, SP
+/// `"#<>?`{}` `/:;=@[\]^|`) plus `%`, `(`, `)`, `,`.
+fn mustPercentEncode(c: u8) bool {
+    if (c < 0x20 or c >= 0x7F) return true;
+    return switch (c) {
+        ' ', '"', '<', '>', '`', '#', '?', '{', '}', '/', ':', ';', '=', '@', '[', '\\', ']', '^', '|', '%', '(', ')', ',' => true,
+        else => false,
+    };
+}
+
+/// Length of `percentEncode(bytes)`.
+pub fn percentEncodedLen(bytes: []const u8) usize {
+    var n: usize = bytes.len;
+    for (bytes) |c| {
+        if (mustPercentEncode(c)) n += 2;
+    }
+    return n;
+}
+
+/// Write `bytes` percent-encoded the way cookie-rs's `Cookie::encoded()`
+/// does (uppercase hex): any byte string becomes a valid cookie name or
+/// value. Undo with `percentDecode`.
+pub fn percentEncode(w: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+    var start: usize = 0;
+    for (bytes, 0..) |c, i| {
+        if (!mustPercentEncode(c)) continue;
+        try w.writeAll(bytes[start..i]);
+        try w.writeByte('%');
+        try w.writeByte("0123456789ABCDEF"[c >> 4]);
+        try w.writeByte("0123456789ABCDEF"[c & 15]);
+        start = i + 1;
+    }
+    try w.writeAll(bytes[start..]);
+}
+
+/// Decode `%XX` (either hex case) into `out` (at least `in.len` bytes; the
+/// result is never longer). A `%` not followed by two hex digits is kept
+/// literally, as cookie-rs (`percent_decode`) and browsers do.
+pub fn percentDecode(out: []u8, in: []const u8) []u8 {
+    std.debug.assert(out.len >= in.len);
+    var o: usize = 0;
+    var i: usize = 0;
+    while (i < in.len) {
+        if (in[i] == '%' and i + 2 < in.len) {
+            const hi = std.fmt.charToDigit(in[i + 1], 16) catch null;
+            const lo = std.fmt.charToDigit(in[i + 2], 16) catch null;
+            if (hi != null and lo != null) {
+                out[o] = hi.? << 4 | lo.?;
+                o += 1;
+                i += 3;
+                continue;
+            }
+        }
+        out[o] = in[i];
+        o += 1;
+        i += 1;
+    }
+    return out[0..o];
+}
+
+test "percentEncode / percentDecode: cookie-rs's encoding set, round trip" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try percentEncode(&w, "a b;c=d,(e)%f\"g\\h/i:j@k[l]m^n|o#p?q{r}s<t>u`v\x01\x7f\xc3\xa9!$&'*+-.0Z_az~");
+    try std.testing.expectEqualStrings(
+        "a%20b%3Bc%3Dd%2C%28e%29%25f%22g%5Ch%2Fi%3Aj%40k%5Bl%5Dm%5En%7Co%23p%3Fq%7Br%7Ds%3Ct%3Eu%60v%01%7F%C3%A9!$&'*+-.0Z_az~",
+        w.buffered(),
+    );
+    // Every byte value: encoded output is a valid cookie value, decodes back.
+    var all: [256]u8 = undefined;
+    for (&all, 0..) |*c, i| c.* = @intCast(i);
+    w = .fixed(&buf);
+    try percentEncode(&w, &all);
+    try std.testing.expectEqual(percentEncodedLen(&all), w.buffered().len);
+    try std.testing.expect(SetCookie.isCookieValue(w.buffered()));
+    var back: [1024]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &all, percentDecode(&back, w.buffered()));
+    // Malformed escapes stay literal; lowercase hex decodes.
+    try std.testing.expectEqualStrings("%", percentDecode(&back, "%"));
+    try std.testing.expectEqualStrings("%4", percentDecode(&back, "%4"));
+    try std.testing.expectEqualStrings("%zz!", percentDecode(&back, "%zz%21"));
+    try std.testing.expectEqualStrings("\xab", percentDecode(&back, "%aB"));
+}
 
 pub const SetError = WriteError || http.Server.ResponseWriter.SetHeaderError;
 

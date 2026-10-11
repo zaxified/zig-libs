@@ -245,6 +245,7 @@ declare -A TARGETS=(
     # were right about different functions -- `seal`/`open` ARE pure std and are
     # deliberately not targets. The codecs are the module's own choice.
     [sealedbox]="hexenc hexdec b64enc b64dec seal open"
+    [cookies]="derive sign verify seal open"
     # A1 `pir.md` M2: the module's central claim was never machine-checked, and
     # its sibling `fss` exposed a real defect the day IT entered the gate.
     [pir]="query reconstruct"
@@ -358,6 +359,7 @@ declare -A MODES=(
     [tfhe]="ReleaseFast"
     [dkg]="ReleaseFast"
     [sealedbox]="ReleaseFast"
+    [cookies]="ReleaseFast"
     [pir]="ReleaseFast"
     [opaque]="ReleaseFast"
     [bip32]="ReleaseFast"
@@ -615,6 +617,15 @@ declare -A PATTERN=(
     [sealedbox/b64dec]='root[.]zig:[1-9]|base64[.]zig'
     [sealedbox/seal]='xsalsa20poly1305[.]zig:[1-9]|/poly1305[.]zig:[1-9]'
     [sealedbox/open]='xsalsa20poly1305[.]zig:[1-9]|/poly1305[.]zig:[1-9]'
+    # cookies' secure.zig routes its keys only through std's HMAC-SHA256 and the
+    # aesgcm module, so both are named: their constant-time property IS this
+    # code's property (2026-10-12). The base64 of the outputs runs after an
+    # explicit declassification (the bytes go to the client) and is not here.
+    [cookies/derive]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
+    [cookies/sign]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
+    [cookies/verify]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
+    [cookies/seal]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
+    [cookies/open]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [adaptor/extract]='root[.]zig|common[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
     # ⚠ `root[.]zig` here is opaque's own file AND voprf's AND ct25519's (same
     # basename, see the blindrsa note above). That is the intended column:
@@ -864,6 +875,11 @@ declare -A LABEL=(
     [sealedbox/b64dec]='sealedbox parseSecretKeyBase64 (CT; 1 = accept/reject)'
     [sealedbox/seal]='sealedbox XSalsa20-Poly1305 encrypt (CT, multi-block)'
     [sealedbox/open]='sealedbox XSalsa20-Poly1305 decrypt (CT; 1 = accept/reject)'
+    [cookies/derive]='cookies Key.deriveInto HKDF-SHA256 (CT)'
+    [cookies/sign]='cookies signed.sign HMAC-SHA256 (CT)'
+    [cookies/verify]='cookies signed.verify (CT; 1 = accept/reject)'
+    [cookies/seal]='cookies private.seal AES-256-GCM (CT)'
+    [cookies/open]='cookies private.open AES-256-GCM (CT; verdict only)'
     [opaque/register]='opaque client registration (password, blind)+voprf'
     [opaque/login]='opaque client KE1+KE3 (password, blind, keyshare)+voprf'
     [opaque/serverke2]='opaque server KE2 (sk, oprf_seed, keyshare, masking_key)'

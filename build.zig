@@ -168,7 +168,7 @@ const module_list = [_]Module{
     .{ .name = "health", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     .{ .name = "requestid", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     .{ .name = "linkheader", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
-    .{ .name = "cookies", .libs = &.{"format"}, .deps = &.{"http"}, .test_deps = &.{"testkit"} },
+    .{ .name = "cookies", .libs = &.{"format"}, .deps = &.{ "http", "aesgcm" }, .test_deps = &.{"testkit"} },
     .{ .name = "idempotency", .libs = &.{"web"}, .deps = &.{ "router", "http", "ramcache" } },
     .{ .name = "webhooksig", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"} },
     .{ .name = "tracecontext", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"} },
