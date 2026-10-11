@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Scope core → parity (chrono 0.4, Go `time`). New: `parseRfc2822`/`bufRfc2822`/
+  `formatRfc2822` (RFC 5322 `Date:`: obsolete zones, two/three-digit years per §4.3, CFWS and nested
+  comments, weekday checked, trailing text refused); `parseDuration`/`bufDuration`/`formatDuration`
+  (Go's duration text, bit-exact with Go 1.26 incl. its f64 fraction scaling; a sum past 2^64 is an
+  error where Go wraps to 0); `partsToUnixNs`/`unixNsToParts` (i64 ns, Go's `UnixNano` range);
+  `toUtc` (applies `off_min`). Evidence: `tools/go_time_oracle` (Go) and `tools/mail_date_oracle.py`
+  (Python `email.utils`) write `src/go_time_vectors.zig`/`src/mail_date_vectors.zig`, replayed by
+  `src/go_oracle_test.zig`; `zig build interop-datefmt [-- --check]` re-takes them.
+
 - **2026-10-11** — Canned formats: `bufRfc3339`/`formatRfc3339`/`parseRfc3339` (RFC 3339; 0..9
   fraction digits; offset from/into `off_min`) and `bufImfFixdate`/`formatImfFixdate`/`parseImfFixdate`
   (the RFC 9110 HTTP date). The `buf*` forms write into a fixed-size array without allocating. Unlike

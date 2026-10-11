@@ -27,7 +27,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Civil calendar plus token-based date/time parse/format and calendar arithmetic, correct before 1970.",
+    .doc = "Civil calendar, token-based date/time parse/format, RFC 3339/5322/HTTP dates, Go-style durations and calendar arithmetic, correct before 1970.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -199,6 +199,37 @@ pub fn unixToParts(unix: i64) DateParts {
     r.hour = rem / 3600;
     r.minute = (rem % 3600) / 60;
     r.second = rem % 60;
+    return r;
+}
+
+/// Unix nanoseconds for a UTC wall-clock `DateParts`, `nanosecond` included
+/// (offset ignored, as `partsToUnix`). Null outside the `i64` range, which is
+/// 1677-09-21 .. 2262-04-11 -- Go's `UnixNano` range, where Go's result is
+/// undefined instead.
+pub fn partsToUnixNs(p: DateParts) ?i64 {
+    // Through i128: at the low edge the whole seconds alone are below minInt(i64).
+    const ns = @as(i128, partsToUnix(p)) * std.time.ns_per_s + p.nanosecond;
+    return std.math.cast(i64, ns);
+}
+
+/// Inverse of `partsToUnixNs`: UTC wall-clock `DateParts` for Unix nanoseconds
+/// (Go's `time.Unix(0, ns)`). `nanosecond` is the non-negative fraction, floor
+/// semantics as `unixToParts`.
+pub fn unixNsToParts(ns: i64) DateParts {
+    var r = unixToParts(@divFloor(ns, std.time.ns_per_s));
+    r.nanosecond = @intCast(@mod(ns, std.time.ns_per_s));
+    return r;
+}
+
+/// The same instant as UTC wall-clock parts: `off_min` subtracted, then 0
+/// (`10:00+02:00` → `08:00Z`). A null `off_min` is taken as UTC. Valid input
+/// assumed (`validate`); the fraction is carried. What a caller of
+/// `parseRfc2822`/`parseRfc3339` needs before `partsToUnix`.
+pub fn toUtc(p: DateParts) DateParts {
+    const off: i64 = p.off_min orelse 0;
+    var r = unixToParts(partsToUnix(p) - off * 60);
+    r.nanosecond = p.nanosecond;
+    r.off_min = 0;
     return r;
 }
 
@@ -1325,6 +1356,428 @@ pub fn parseImfFixdate(s: []const u8) ParseError!DateParts {
     return p;
 }
 
+// ---------------------------------------------------------------------------
+// Canned format: the Internet Message Format date (RFC 5322 §3.3, ex-2822)
+// ---------------------------------------------------------------------------
+
+/// Length of a `bufRfc2822` date: `Fri, 21 Nov 1997 09:55:06 -0600`.
+pub const rfc2822_len = 31;
+
+/// `parts` as an RFC 5322 date-time, `EEE, DD MMM YYYY hh:mm:ss ±hhmm` (Go's
+/// `time.RFC1123Z`, chrono's `to_rfc2822`). The zone is `parts.off_min`; null
+/// is written `+0000`, as `bufRfc3339` writes `Z`. Errors as `bufRfc3339`.
+pub fn bufRfc2822(buf: *[rfc2822_len]u8, parts: DateParts) error{ InvalidDate, InvalidTime }!void {
+    try checkCanned(parts);
+    const om: i32 = parts.off_min orelse 0;
+    if (om <= -24 * 60 or om >= 24 * 60) return error.InvalidTime;
+    const dow = isoWeekday(ymdToEpochDay(parts.year, parts.month, parts.day));
+    buf[0..3].* = short_day_names[dow - 1][0..3].*;
+    buf[3..5].* = ", ".*;
+    _ = putDec(buf, 5, parts.day, 2);
+    buf[7] = ' ';
+    buf[8..11].* = short_month_names[parts.month - 1][0..3].*;
+    buf[11] = ' ';
+    _ = putDec(buf, 12, @intCast(parts.year), 4);
+    buf[16] = ' ';
+    _ = putDec(buf, 17, parts.hour, 2);
+    buf[19] = ':';
+    _ = putDec(buf, 20, parts.minute, 2);
+    buf[22] = ':';
+    _ = putDec(buf, 23, parts.second, 2);
+    buf[25] = ' ';
+    buf[26] = if (om < 0) '-' else '+';
+    const mag: u32 = @intCast(@abs(om));
+    _ = putDec(buf, 27, mag / 60, 2);
+    _ = putDec(buf, 29, mag % 60, 2);
+}
+
+/// `bufRfc2822` into a new allocation (caller frees).
+pub fn formatRfc2822(alloc: std.mem.Allocator, parts: DateParts) ![]u8 {
+    var buf: [rfc2822_len]u8 = undefined;
+    try bufRfc2822(&buf, parts);
+    return alloc.dupe(u8, &buf);
+}
+
+/// Parse an RFC 5322 date-time (the `Date:` header of mail; RFC 2822/822
+/// before it) into wall-clock `DateParts` with `off_min` set; `toUtc` gives
+/// the instant. The whole input must match the grammar, obsolete forms of
+/// §4.3 included:
+///   - optional day name and `,`; when present it must be the date's real
+///     weekday (`InvalidDate`), as chrono checks -- Go and Python ignore it;
+///   - day 1-2 digits; month name and day name in any case;
+///   - year 4 digits, or the obsolete 2 digits (00-49 → 20xx, 50-99 → 19xx)
+///     or 3 digits (+1900) -- RFC 5322 §4.3; Go and Python put 50-68 in 20xx;
+///   - `hh:mm` with optional `:ss`; a leap second (`:60`) is `InvalidTime`;
+///   - zone `±hhmm` (under 24 h, minutes under 60, else `InvalidTime`), or an
+///     obsolete name: `UT`/`GMT` = 0, `EST`/`EDT`/`CST`/`CDT`/`MST`/`MDT`/
+///     `PST`/`PDT` = their US offsets, a military letter = 0 (§4.3: "SHOULD
+///     all be considered equivalent to -0000"). `-0000` ("no zone
+///     information") reads as 0 too: `DateParts` cannot say "unknown";
+///   - CFWS -- spaces, tabs, folding (CRLF + space/tab) and nested `( … )`
+///     comments with `\` quoted pairs -- wherever the obsolete grammar allows
+///     it, around `:` too. Trailing text that is not CFWS is `InvalidFormat`
+///     (Go and Python ignore it).
+pub fn parseRfc2822(s: []const u8) ParseError!DateParts {
+    var c: Cfws = .{ .s = s };
+    _ = try c.skip();
+    var dow: ?u32 = null;
+    if (c.i < s.len and std.ascii.isAlphabetic(s[c.i])) {
+        dow = try c.name(&short_day_names);
+        _ = try c.skip();
+        if (!c.eat(',')) return ParseError.InvalidFormat;
+        _ = try c.skip();
+    }
+    const day_digits = c.digits();
+    if (day_digits.len < 1 or day_digits.len > 2) return ParseError.InvalidFormat;
+    if (!try c.skip()) return ParseError.InvalidFormat;
+    const month = try c.name(&short_month_names);
+    if (!try c.skip()) return ParseError.InvalidFormat;
+    const year_digits = c.digits();
+    if (year_digits.len < 2) return ParseError.InvalidFormat;
+    // DateParts holds more than 4 digits, the canned writers do not.
+    if (year_digits.len > 4) return ParseError.InvalidDate;
+    var year = try parseUint(i32, year_digits, ParseError.InvalidFormat);
+    switch (year_digits.len) {
+        2 => year += if (year < 50) 2000 else 1900,
+        3 => year += 1900,
+        else => {},
+    }
+    if (!try c.skip()) return ParseError.InvalidFormat;
+    var p = DateParts{
+        .year = year,
+        .month = month,
+        .day = try parseUint(u32, day_digits, ParseError.InvalidFormat),
+        .hour = try c.twoDigits(),
+    };
+    _ = try c.skip();
+    if (!c.eat(':')) return ParseError.InvalidFormat;
+    _ = try c.skip();
+    p.minute = try c.twoDigits();
+    _ = try c.skip();
+    if (c.eat(':')) {
+        _ = try c.skip();
+        p.second = try c.twoDigits();
+        _ = try c.skip();
+    }
+    p.off_min = try c.zone();
+    _ = try c.skip();
+    if (c.i != s.len) return ParseError.InvalidFormat;
+    try checkParsed(p);
+    if (dow) |d| if (d != isoWeekday(ymdToEpochDay(p.year, p.month, p.day))) return ParseError.InvalidDate;
+    return p;
+}
+
+/// A cursor over RFC 5322 text that steps over CFWS (§3.2.2): white space,
+/// folding and comments. Every reader leaves the cursor after what it read.
+const Cfws = struct {
+    s: []const u8,
+    i: usize = 0,
+
+    /// Skip CFWS; true when anything was skipped. An unclosed comment, or a
+    /// CR not followed by LF and a space or tab, is `InvalidFormat`.
+    fn skip(c: *Cfws) ParseError!bool {
+        const start = c.i;
+        while (c.i < c.s.len) {
+            switch (c.s[c.i]) {
+                ' ', '\t' => c.i += 1,
+                '\r' => {
+                    if (c.i + 2 >= c.s.len or c.s[c.i + 1] != '\n' or (c.s[c.i + 2] != ' ' and c.s[c.i + 2] != '\t'))
+                        return ParseError.InvalidFormat;
+                    c.i += 3;
+                },
+                '(' => {
+                    // Nesting by a counter, not recursion: the depth is the
+                    // sender's to choose.
+                    var depth: usize = 0;
+                    while (c.i < c.s.len) : (c.i += 1) {
+                        switch (c.s[c.i]) {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if (depth == 0) break;
+                            },
+                            '\\' => c.i += 1, // quoted-pair: the next byte is literal
+                            else => {},
+                        }
+                    }
+                    if (c.i >= c.s.len) return ParseError.InvalidFormat;
+                    c.i += 1;
+                },
+                else => break,
+            }
+        }
+        return c.i != start;
+    }
+
+    fn eat(c: *Cfws, ch: u8) bool {
+        if (c.i < c.s.len and c.s[c.i] == ch) {
+            c.i += 1;
+            return true;
+        }
+        return false;
+    }
+
+    /// The run of ASCII digits at the cursor (maybe empty).
+    fn digits(c: *Cfws) []const u8 {
+        const start = c.i;
+        while (c.i < c.s.len and std.ascii.isDigit(c.s[c.i])) c.i += 1;
+        return c.s[start..c.i];
+    }
+
+    /// Exactly two digits (an hour, minute or second).
+    fn twoDigits(c: *Cfws) ParseError!u32 {
+        const d = c.digits();
+        if (d.len != 2) return ParseError.InvalidFormat;
+        return parseUint(u32, d, ParseError.InvalidFormat);
+    }
+
+    /// The run of letters at the cursor as a 1-based index into `names`,
+    /// compared without case.
+    fn name(c: *Cfws, names: []const []const u8) ParseError!u32 {
+        const start = c.i;
+        while (c.i < c.s.len and std.ascii.isAlphabetic(c.s[c.i])) c.i += 1;
+        for (names, 1..) |n, k| {
+            if (std.ascii.eqlIgnoreCase(c.s[start..c.i], n)) return @intCast(k);
+        }
+        return ParseError.InvalidFormat;
+    }
+
+    /// `±hhmm` or an obsolete zone name, as minutes east of UTC.
+    fn zone(c: *Cfws) ParseError!i32 {
+        if (c.i >= c.s.len) return ParseError.InvalidFormat;
+        const sign = c.s[c.i];
+        if (sign == '+' or sign == '-') {
+            c.i += 1;
+            const d = c.digits();
+            if (d.len != 4) return ParseError.InvalidFormat;
+            const oh = try parseUint(i32, d[0..2], ParseError.InvalidFormat);
+            const om = try parseUint(i32, d[2..4], ParseError.InvalidFormat);
+            if (oh > 23 or om > 59) return ParseError.InvalidTime;
+            return if (sign == '-') -(oh * 60 + om) else oh * 60 + om;
+        }
+        const start = c.i;
+        while (c.i < c.s.len and std.ascii.isAlphabetic(c.s[c.i])) c.i += 1;
+        const z = c.s[start..c.i];
+        if (z.len == 1) {
+            // Military zones, all but J (§4.3): treated as -0000.
+            return if (std.ascii.toLower(z[0]) == 'j') ParseError.InvalidFormat else 0;
+        }
+        for (obs_zones) |o| {
+            if (std.ascii.eqlIgnoreCase(z, o.name)) return o.off_min;
+        }
+        return ParseError.InvalidFormat;
+    }
+};
+
+/// RFC 5322 §4.3 obs-zone names with their offsets.
+const obs_zones = [_]struct { name: []const u8, off_min: i32 }{
+    .{ .name = "UT", .off_min = 0 },
+    .{ .name = "GMT", .off_min = 0 },
+    .{ .name = "EST", .off_min = -5 * 60 },
+    .{ .name = "EDT", .off_min = -4 * 60 },
+    .{ .name = "CST", .off_min = -6 * 60 },
+    .{ .name = "CDT", .off_min = -5 * 60 },
+    .{ .name = "MST", .off_min = -7 * 60 },
+    .{ .name = "MDT", .off_min = -6 * 60 },
+    .{ .name = "PST", .off_min = -8 * 60 },
+    .{ .name = "PDT", .off_min = -7 * 60 },
+};
+
+// ---------------------------------------------------------------------------
+// Durations: Go's `time.ParseDuration` / `Duration.String` text
+// ---------------------------------------------------------------------------
+//
+// A duration is plain `i64` nanoseconds -- what `std.Io.Duration` and Go's
+// `time.Duration` hold -- so there is no wrapper type to convert. The text is
+// Go's: `1h2m3.5s`, `300ms`, `-1.5h`, the shape config files and CLIs took
+// from Go. Checked against Go 1.26.0 by `tools/go_time_oracle`.
+
+/// Room for any `bufDuration` text; the longest, `-2562047h47m16.854775808s`,
+/// is 25 bytes. 32 as Go's buffer.
+pub const duration_max_len = 32;
+
+/// `ns` as Go's `Duration.String`: `0s`; under a second in the largest of
+/// `ns`/`µs`/`ms` with a trimmed fraction (`1.5µs`, U+00B5); otherwise
+/// `[h]h[m]m s.fff…s` with leading zero units dropped (`1h0m0s`, `2m3.5s`).
+/// Returns the written suffix of `buf`.
+pub fn bufDuration(buf: *[duration_max_len]u8, ns: i64) []u8 {
+    var w: usize = buf.len;
+    var u: u64 = @abs(ns);
+    if (u < std.time.ns_per_s) {
+        if (u == 0) {
+            buf[w - 2 ..][0..2].* = "0s".*;
+            return buf[w - 2 ..];
+        }
+        var unit: []const u8 = "ns";
+        var prec: u8 = 0;
+        if (u >= std.time.ns_per_ms) {
+            unit = "ms";
+            prec = 6;
+        } else if (u >= std.time.ns_per_us) {
+            unit = "\u{b5}s";
+            prec = 3;
+        }
+        w -= unit.len;
+        @memcpy(buf[w..][0..unit.len], unit);
+        w = putFrac(buf, w, &u, prec);
+        w = putIntLeft(buf, w, u);
+    } else {
+        w -= 1;
+        buf[w] = 's';
+        w = putFrac(buf, w, &u, 9);
+        w = putIntLeft(buf, w, u % 60);
+        u /= 60;
+        if (u > 0) {
+            w -= 1;
+            buf[w] = 'm';
+            w = putIntLeft(buf, w, u % 60);
+            u /= 60;
+            if (u > 0) {
+                w -= 1;
+                buf[w] = 'h';
+                w = putIntLeft(buf, w, u);
+            }
+        }
+    }
+    if (ns < 0) {
+        w -= 1;
+        buf[w] = '-';
+    }
+    return buf[w..];
+}
+
+/// `bufDuration` into a new allocation (caller frees).
+pub fn formatDuration(alloc: std.mem.Allocator, ns: i64) ![]u8 {
+    var buf: [duration_max_len]u8 = undefined;
+    return alloc.dupe(u8, bufDuration(&buf, ns));
+}
+
+/// The low `prec` decimal digits of `u.*` as `.ddd` ending before `buf[w]`,
+/// trailing zeros dropped (nothing at all when every digit is 0); `u.*` keeps
+/// the rest. Returns the new start.
+fn putFrac(buf: []u8, w_end: usize, u: *u64, prec: u8) usize {
+    var w = w_end;
+    var printing = false;
+    for (0..prec) |_| {
+        const digit: u8 = @intCast(u.* % 10);
+        printing = printing or digit != 0;
+        if (printing) {
+            w -= 1;
+            buf[w] = '0' + digit;
+        }
+        u.* /= 10;
+    }
+    if (printing) {
+        w -= 1;
+        buf[w] = '.';
+    }
+    return w;
+}
+
+/// `v` in decimal ending before `buf[w]`; returns the new start.
+fn putIntLeft(buf: []u8, w_end: usize, v: u64) usize {
+    var w = w_end;
+    var x = v;
+    while (true) {
+        w -= 1;
+        buf[w] = '0' + @as(u8, @intCast(x % 10));
+        x /= 10;
+        if (x == 0) return w;
+    }
+}
+
+/// Parse Go's duration text: an optional sign, then one or more
+/// `<decimal><unit>` with units `ns`, `us`, `µs` (U+00B5), `μs` (U+03BC),
+/// `ms`, `s`, `m`, `h` (`1h30m`, `1.5s`, `.5ms`, `-2m3s`); a bare `0` is 0.
+/// Exactly Go's `time.ParseDuration`: a fraction is scaled through `f64` as
+/// Go does (so `0.3333333333h` gives Go's nanosecond, not the nearest one),
+/// fraction digits past `u63` precision are ignored, and anything outside
+/// `i64` is an error (`-2562047h47m16.854775808s`, the minimum, is not).
+pub fn parseDuration(s: []const u8) error{InvalidDuration}!i64 {
+    const limit: u64 = 1 << 63; // the magnitude of minInt(i64)
+    var rest = s;
+    var neg = false;
+    if (rest.len != 0 and (rest[0] == '-' or rest[0] == '+')) {
+        neg = rest[0] == '-';
+        rest = rest[1..];
+    }
+    if (std.mem.eql(u8, rest, "0")) return 0;
+    if (rest.len == 0) return error.InvalidDuration;
+    var total: u64 = 0;
+    while (rest.len != 0) {
+        if (rest[0] != '.' and !std.ascii.isDigit(rest[0])) return error.InvalidDuration;
+        // The integer part: an overflow is an error.
+        var v: u64 = 0;
+        var i: usize = 0;
+        while (i < rest.len and std.ascii.isDigit(rest[i])) : (i += 1) {
+            if (v > limit / 10) return error.InvalidDuration;
+            v = v * 10 + (rest[i] - '0');
+            if (v > limit) return error.InvalidDuration;
+        }
+        const had_int = i != 0;
+        rest = rest[i..];
+        // The fraction: digits past what u63 holds stop counting, no error.
+        var f: u64 = 0;
+        var scale: f64 = 1;
+        var had_frac = false;
+        if (rest.len != 0 and rest[0] == '.') {
+            rest = rest[1..];
+            i = 0;
+            var full = false;
+            while (i < rest.len and std.ascii.isDigit(rest[i])) : (i += 1) {
+                if (full) continue;
+                if (f > (limit - 1) / 10) {
+                    full = true;
+                    continue;
+                }
+                const y = f * 10 + (rest[i] - '0');
+                if (y > limit) {
+                    full = true;
+                    continue;
+                }
+                f = y;
+                scale *= 10;
+            }
+            had_frac = i != 0;
+            rest = rest[i..];
+        }
+        if (!had_int and !had_frac) return error.InvalidDuration;
+        i = 0;
+        while (i < rest.len and rest[i] != '.' and !std.ascii.isDigit(rest[i])) i += 1;
+        if (i == 0) return error.InvalidDuration; // no unit
+        const unit = durationUnit(rest[0..i]) orelse return error.InvalidDuration;
+        rest = rest[i..];
+        if (v > limit / unit) return error.InvalidDuration;
+        v *= unit;
+        if (f > 0) {
+            // Go's arithmetic, in Go's order: f * (unit / scale), truncated.
+            v += @intFromFloat(@as(f64, @floatFromInt(f)) * (@as(f64, @floatFromInt(unit)) / scale));
+            if (v > limit) return error.InvalidDuration;
+        }
+        // Checked: two 2^63 terms wrap Go's uint64 to 0 and pass; here an error.
+        total = std.math.add(u64, total, v) catch return error.InvalidDuration;
+        if (total > limit) return error.InvalidDuration;
+    }
+    if (neg) return @bitCast(0 -% total);
+    if (total > limit - 1) return error.InvalidDuration;
+    return @intCast(total);
+}
+
+fn durationUnit(u: []const u8) ?u64 {
+    const units = [_]struct { []const u8, u64 }{
+        .{ "ns", 1 },
+        .{ "us", std.time.ns_per_us },
+        .{ "\u{b5}s", std.time.ns_per_us },
+        .{ "\u{3bc}s", std.time.ns_per_us },
+        .{ "ms", std.time.ns_per_ms },
+        .{ "s", std.time.ns_per_s },
+        .{ "m", std.time.ns_per_min },
+        .{ "h", std.time.ns_per_hour },
+    };
+    for (units) |e| if (std.mem.eql(u8, u, e[0])) return e[1];
+    return null;
+}
+
 /// The range check the canned writers share: a valid date and time, year
 /// 0000..9999 (four digits).
 fn checkCanned(p: DateParts) error{ InvalidDate, InvalidTime }!void {
@@ -2435,4 +2888,8 @@ test "new tokens are in the vocabulary (firstInvalidFormatChar) and doc table" {
         }
     }
     try testing.expectEqual(@as(usize, 6), found);
+}
+
+test {
+    _ = @import("go_oracle_test.zig");
 }

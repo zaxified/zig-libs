@@ -15,7 +15,7 @@ silently floors any pre-1970 date to 1970-01-01.
   **Allocation:** `format`/`formatIsoDate` take an allocator (output is an
   owned, variable-length string); everything else is allocation-free.
 
-Provenance: original work of the zig-libs authors (MIT). No third-party code. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` or `c_bench/` reference side, 2026-10-10) is our own tooling; it drives the reference only through its public API.
+Provenance: original work of the zig-libs authors (MIT). No third-party code. The duration text follows Go's `time.ParseDuration`/`Duration.String` behaviour (Go's documentation and source read as the specification, BSD-3-Clause; nothing copied), checked black-box by `tools/go_time_oracle`. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` or `c_bench/` reference side, 2026-10-10) is our own tooling; it drives the reference only through its public API.
 
 ## Two layers
 
@@ -74,6 +74,8 @@ fn isoWeeksInYear(iso_year: i32) u32;            // 52 or 53
 fn isoWeekDateToEpochDay(iso_year, week, weekday) ?i64;  // inverse; null if nonexistent
 fn partsToUnix(p: DateParts) i64;                // whole seconds (ignores nanosecond)
 fn unixToParts(unix: i64) DateParts;
+fn partsToUnixNs(p: DateParts) ?i64;             // with nanosecond; null outside 1677..2262 (i64)
+fn unixNsToParts(ns: i64) DateParts;
 fn isLeapYear(year: i32) bool;
 fn daysInMonth(year: i32, month: u32) u32;
 fn validate(p: DateParts) bool;
@@ -97,6 +99,15 @@ fn parseRfc3339(s) ParseError!DateParts;         // offset required, kept in off
 fn bufImfFixdate(buf: *[imf_fixdate_len]u8, parts) !void;  // "Sun, 06 Nov 1994 08:49:37 GMT"
 fn formatImfFixdate(alloc, parts) ![]u8;
 fn parseImfFixdate(s) ParseError!DateParts;      // fixdate only, weekday checked
+fn bufRfc2822(buf: *[rfc2822_len]u8, parts) !void;  // "Fri, 21 Nov 1997 09:55:06 -0600" (Go RFC1123Z)
+fn formatRfc2822(alloc, parts) ![]u8;
+fn parseRfc2822(s) ParseError!DateParts;         // RFC 5322 Date:, obsolete forms + comments, off_min set
+fn toUtc(parts) DateParts;                       // apply off_min: the same instant as UTC parts
+
+// Durations: i64 nanoseconds, Go's text ("1h2m3.5s", "300ms", "-1.5h")
+fn parseDuration(s) error{InvalidDuration}!i64;  // exactly Go's time.ParseDuration
+fn bufDuration(buf: *[duration_max_len]u8, ns: i64) []u8;  // exactly Go's Duration.String
+fn formatDuration(alloc, ns: i64) ![]u8;
 
 // Arithmetic (pre-1970 safe)
 fn addDays(parts, n: i64) DateParts;
@@ -126,15 +137,14 @@ zig build test-datefmt -Doptimize=ReleaseFast
 zig fmt --check modules/datefmt
 ```
 
-## DEFER (not in this v1 — a spec-complete module would want)
+## DEFER (a spec-complete module would want)
 
 - **Locale-aware month/day names** — the name tables are English `Jan`…`Dec` /
-  `Mon`…`Sun` only; no locale table or i18n hook.
+  `Mon`…`Sun` only; no locale table or i18n hook. Neither reference has one by
+  default (Go has none; chrono's is the opt-in `unstable-locales` feature).
 - **Timezone-aware formatting/conversion** (IANA tz database, DST rules,
   offset lookup by zone name) — `ZZ` only carries a raw UTC-offset literal
   through parse/format; there is no zone database. Intentionally a **separate
   module** (`tz`), not pulled in here.
-- **Duration/period types** (e.g. ISO 8601 `PnYnMnD` parsing) — arithmetic
-  here takes/returns plain day/month/year counts, no duration value type.
-- **RFC 2822 / RFC 3339 canned formats** — only the generic token engine;
-  no named-format shortcuts (a caller composes the token string itself).
+- **Calendar periods** (ISO 8601 `PnYnMnD`) — durations here are exact
+  nanoseconds (Go's `Duration`); a month/year count goes to `addMonths`/`addYears`.
