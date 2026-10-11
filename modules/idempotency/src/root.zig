@@ -116,11 +116,12 @@ const builtin = @import("builtin");
 const router = @import("router");
 const http = @import("http");
 const ramcache = @import("ramcache");
+const kv = @import("kv");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Idempotency-Key dedup of unsafe retries — middleware + ramcache-backed store replaying a cached response without re-running the handler",
+    .doc = "Idempotency-Key dedup of unsafe retries — middleware + store (ramcache, or a pluggable Backend; durable KvBackend) replaying a recorded response without re-running the handler",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -133,7 +134,7 @@ pub const meta = .{
     // key travels via thread-local storage owned by the connection task.
     .concurrency = .threadsafe,
     .model_after = "Idempotency-Key (Stripe / draft-ietf-httpapi-idempotency-key-header)",
-    .deps = .{ "router", "http", "ramcache" },
+    .deps = .{ "router", "http", "ramcache", "kv" },
 };
 
 /// Default request header carrying the client's key.
@@ -216,17 +217,78 @@ fn monoNs() i64 {
     }
 }
 
-// ── the store (over ramcache) ───────────────────────────────────────────────
+// ── pluggable record store ──────────────────────────────────────────────────
 
-/// The key→response store the middleware and handlers share, backed by a
-/// caller-owned `ramcache.Cache` (which supplies the TTL expiry, the byte /
-/// entry bounds and W-TinyLFU eviction). Thread-safe: every cache touch is
-/// serialized by the internal spinlock. The `cache` must outlive the `Store`.
+/// Where a `Store` keeps its records and reservations when they must outlive
+/// the process or be shared between processes: a type-erased interface a
+/// Redis, SQL or `kv` adapter implements (`KvBackend` is the bundled
+/// durable one). Without a backend, the `Store` uses its in-process
+/// `ramcache` (`Store.cache`).
+///
+/// Contract, which every implementation must keep:
+/// - `lookupOrReserve` is ATOMIC per key: of two concurrent calls for a key
+///   with no live record and no reservation, exactly one gets `.reserved`.
+///   It returns `.found` (a live record, a copy owned by `gpa`), `.in_flight`
+///   (another request holds the reservation), or `.reserved` (this request
+///   now holds it). A backend that cannot answer (an I/O error) answers
+///   `.in_flight`: the request is refused (409, "retry later") instead of
+///   running the side effect a second time.
+/// - `lease_ns > 0` bounds a reservation's life: a backend may hand a key
+///   whose reservation is older than that to a new request (a holder that
+///   crashed or hung). 0 = held until `release`.
+/// - `put` records `blob` under `key` for `ttl_ns`, best-effort (a failure
+///   only means a later retry runs again, as with a full `ramcache`).
+///   The `Store` calls `put` (if the handler recorded) BEFORE `release`.
+/// - `release` drops the reservation, whether or not a record was put.
+/// - All three may be called from several threads at once.
+pub const Backend = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    /// The allocator the `Store` uses for its own short-lived copies (the
+    /// encoded record, reservation keys, replay blobs).
+    gpa: std.mem.Allocator,
+
+    pub const Lookup = union(enum) {
+        found: []u8,
+        in_flight,
+        reserved,
+    };
+
+    pub const VTable = struct {
+        lookupOrReserve: *const fn (ptr: *anyopaque, key: []const u8, now: i64, lease_ns: i64, gpa: std.mem.Allocator) std.mem.Allocator.Error!Lookup,
+        put: *const fn (ptr: *anyopaque, key: []const u8, blob: []const u8, now: i64, ttl_ns: i64) void,
+        release: *const fn (ptr: *anyopaque, key: []const u8) void,
+    };
+};
+
+/// A durable `Backend` over a `kv.Db` (`kvbackend.zig`): records survive a
+/// restart, so a retry after a crash still replays instead of re-running.
+pub const KvBackend = @import("kvbackend.zig").KvBackend;
+
+test {
+    _ = @import("kvbackend_test.zig");
+}
+
+// ── the store ───────────────────────────────────────────────────────────────
+
+/// The key→response store the middleware and handlers share. Records live in
+/// a caller-owned `ramcache.Cache` (TTL expiry, byte / entry bounds,
+/// W-TinyLFU eviction) or, when `backend` is set, in that `Backend`
+/// (durable or shared). Thread-safe: every cache touch is serialized by the
+/// internal spinlock; a backend synchronizes itself. The `cache` / backend
+/// must outlive the `Store`. Exactly one of `cache` and `backend` is set.
 pub const Store = struct {
     /// The bounded, TTL-expiring cache. Caller owns it (init/deinit); the store
     /// only reads/writes through it under the lock. Its `alloc` is reused for
-    /// the short-lived encode / read-out copies.
-    cache: *ramcache.Cache,
+    /// the short-lived encode / read-out copies. Null when `backend` is set.
+    cache: ?*ramcache.Cache = null,
+    /// Records and reservations kept outside the process (`Backend`). When
+    /// set, `cache` is unused and `in_flight` stays empty: the backend holds
+    /// the reservations.
+    backend: ?Backend = null,
+    /// Passed to `Backend.lookupOrReserve` (see there). The in-process path
+    /// releases every reservation when its handler returns and ignores it.
+    lease_ns: i64 = 0,
     /// Retention of each recorded response. Applied as the ramcache TTL.
     ttl_ns: i64 = default_ttl_ns,
     /// Time source for TTL accounting (injected in tests).
@@ -259,10 +321,16 @@ pub const Store = struct {
     /// released when its handler returns); this frees the map's backing.
     pub fn deinit(store: *Store) void {
         lockSpin(&store.lock);
+        const a = store.alloc();
         var it = store.in_flight.keyIterator();
-        while (it.next()) |k| store.cache.alloc.free(k.*);
-        store.in_flight.deinit(store.cache.alloc);
-        store.pending.deinit(store.cache.alloc);
+        while (it.next()) |k| a.free(k.*);
+        store.in_flight.deinit(a);
+        if (store.backend != null) {
+            // Backend path: `pending` owns its key copies.
+            var pit = store.pending.valueIterator();
+            while (pit.next()) |c| a.free(c.key);
+        }
+        store.pending.deinit(a);
         store.lock.unlock();
         store.* = undefined;
     }
@@ -299,9 +367,11 @@ pub const Store = struct {
     /// `current` find the reservation from inside the handler.
     pub fn begin(store: *Store, key: []const u8, digest: [digest_len]u8, request: ?*const anyopaque, gpa: std.mem.Allocator) std.mem.Allocator.Error!Begin {
         const now = store.clock.now();
+        if (store.backend) |b| return store.beginBackend(b, key, digest, request, gpa, now);
+        const cache = store.cache.?;
         lockSpin(&store.lock);
         defer store.lock.unlock();
-        if (store.cache.get(key, now, 0)) |v| {
+        if (cache.get(key, now, 0)) |v| {
             // Check the fingerprint before ever handing back the recorded
             // response: a same-key request whose body differs from what was
             // recorded is not a retry (a client bug, or a replay of the key
@@ -323,21 +393,65 @@ pub const Store = struct {
             return .{ .replay = try gpa.dupe(u8, v) };
         }
         if (store.in_flight.contains(key)) return .in_flight;
-        const owned = try store.cache.alloc.dupe(u8, key);
-        errdefer store.cache.alloc.free(owned);
-        try store.in_flight.put(store.cache.alloc, owned, {});
+        const owned = try cache.alloc.dupe(u8, key);
+        errdefer cache.alloc.free(owned);
+        try store.in_flight.put(cache.alloc, owned, {});
         errdefer _ = store.in_flight.remove(owned);
-        if (request) |r| try store.pending.put(store.cache.alloc, @intFromPtr(r), .{ .key = owned, .digest = digest });
+        if (request) |r| try store.pending.put(cache.alloc, @intFromPtr(r), .{ .key = owned, .digest = digest });
         return .reserved;
+    }
+
+    /// `begin` over a `Backend`: the backend makes lookup + reservation
+    /// atomic; the fingerprint check and the request binding stay here.
+    fn beginBackend(store: *Store, b: Backend, key: []const u8, digest: [digest_len]u8, request: ?*const anyopaque, gpa: std.mem.Allocator, now: i64) std.mem.Allocator.Error!Begin {
+        switch (try b.vtable.lookupOrReserve(b.ptr, key, now, store.lease_ns, gpa)) {
+            .found => |v| {
+                if (decode(v)) |rec| {
+                    // Constant-time for the reason given in `begin`.
+                    if (!std.crypto.timing_safe.eql([digest_len]u8, rec.digest, digest)) {
+                        gpa.free(v);
+                        return .mismatch;
+                    }
+                }
+                return .{ .replay = v };
+            },
+            .in_flight => return .in_flight,
+            .reserved => {
+                const r = request orelse return .reserved;
+                errdefer b.vtable.release(b.ptr, key);
+                const owned = try b.gpa.dupe(u8, key);
+                errdefer b.gpa.free(owned);
+                lockSpin(&store.lock);
+                defer store.lock.unlock();
+                try store.pending.put(b.gpa, @intFromPtr(r), .{ .key = owned, .digest = digest });
+                return .reserved;
+            },
+        }
     }
 
     /// Release the reservation taken by `begin` for `key` (and `request`'s
     /// binding to it, when one was given).
     pub fn finish(store: *Store, key: []const u8, request: ?*const anyopaque) void {
+        if (store.backend) |b| {
+            if (request) |r| {
+                lockSpin(&store.lock);
+                const kv_ = store.pending.fetchRemove(@intFromPtr(r));
+                store.lock.unlock();
+                if (kv_) |e| b.gpa.free(e.value.key);
+            }
+            b.vtable.release(b.ptr, key);
+            return;
+        }
         lockSpin(&store.lock);
         defer store.lock.unlock();
         if (request) |r| _ = store.pending.remove(@intFromPtr(r));
-        if (store.in_flight.fetchRemove(key)) |kv| store.cache.alloc.free(kv.key);
+        if (store.in_flight.fetchRemove(key)) |e| store.cache.?.alloc.free(e.key);
+    }
+
+    /// The allocator for the store's own copies: the cache's, or the backend's.
+    pub fn alloc(store: *const Store) std.mem.Allocator {
+        if (store.backend) |b| return b.gpa;
+        return store.cache.?.alloc;
     }
 
     /// The reservation `request` holds, or null when it holds none (no key,
@@ -382,12 +496,14 @@ pub const Store = struct {
     /// Callable directly when a handler does not use `respond` -- pair with
     /// `current(ctx.req)` for the key and matching fingerprint.
     pub fn record(store: *Store, key: []const u8, digest: [digest_len]u8, status: u16, content_type: []const u8, body: []const u8) void {
-        const blob = encode(store.cache.alloc, digest, status, content_type, body) catch return;
-        defer store.cache.alloc.free(blob);
+        const a = store.alloc();
+        const blob = encode(a, digest, status, content_type, body) catch return;
+        defer a.free(blob);
         const now = store.clock.now();
+        if (store.backend) |b| return b.vtable.put(b.ptr, key, blob, now, store.ttl_ns);
         lockSpin(&store.lock);
         defer store.lock.unlock();
-        store.cache.put(key, blob, now, store.ttl_ns, 0);
+        store.cache.?.put(key, blob, now, store.ttl_ns, 0);
     }
 };
 
@@ -511,14 +627,14 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
         idem.options.max_body_bytes
     else
         idem.options.max_body_bytes + 1;
-    const body_bytes = ctx.req.reader().allocRemaining(idem.store.cache.alloc, .limited(probe_cap)) catch |err| switch (err) {
+    const body_bytes = ctx.req.reader().allocRemaining(idem.store.alloc(), .limited(probe_cap)) catch |err| switch (err) {
         error.StreamTooLong => return payloadTooLarge(ctx),
         else => |e| return e,
     };
     defer {
         // The caller's payload, on a heap the next request draws from (A1 F4).
         std.crypto.secureZero(u8, body_bytes);
-        idem.store.cache.alloc.free(body_bytes);
+        idem.store.alloc().free(body_bytes);
     }
     var digest: [digest_len]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body_bytes, &digest, .{});
@@ -537,11 +653,11 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // One atomic step: replay a completed response, flag a body-fingerprint
     // mismatch, reject a concurrent in-flight duplicate (409), or reserve
     // this key and run the handler.
-    switch (try idem.store.begin(scoped, digest, ctx.req, idem.store.cache.alloc)) {
+    switch (try idem.store.begin(scoped, digest, ctx.req, idem.store.alloc())) {
         .replay => |blob| {
             // A hit writes the recorded response and short-circuits the chain,
             // so the handler never runs.
-            defer idem.store.cache.alloc.free(blob);
+            defer idem.store.alloc().free(blob);
             const rec = decode(blob) orelse return next.run(ctx); // corrupt ⇒ re-run
             ctx.res.setStatus(rec.status);
             // Passed straight through: `setHeader` copies, so it does not matter
@@ -1322,6 +1438,17 @@ fn fzKeyValid(k: []const u8) bool {
 }
 
 test "model-fuzz: request sequences through the middleware vs. a linear-scan model" {
+    try fuzzSequences(false);
+}
+
+test "model-fuzz: the same sequences over KvBackend (kv on SimStorage) vs. the same model" {
+    try fuzzSequences(true);
+}
+
+/// The sequence model-fuzz, over the in-process `ramcache` store or, with
+/// `use_kv`, over `KvBackend` (records in `kv` on `SimStorage`, expiry on
+/// kv's clock driven by the same manual clock read as milliseconds).
+fn fuzzSequences(comptime use_kv: bool) !void {
     const seed: u64 = 0x6964656d706f3031;
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
@@ -1365,7 +1492,23 @@ test "model-fuzz: request sequences through the middleware vs. a linear-scan mod
         var clk = ManualClock{ .now_ns = 5000 };
         var cache = newCache();
         defer cache.deinit();
-        var store = Store{ .cache = &cache, .clock = clk.clock(), .ttl_ns = fz_ttl };
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var db: kv.Db = undefined;
+        var kb: KvBackend = undefined;
+        if (use_kv) {
+            db = try kv.Db.open(testing.allocator, sim.storage(), "idem.kv", .{ .clock = .{ .ctx = &clk, .nowFn = ManualClock.read } });
+            kb = .{ .db = &db, .gpa = testing.allocator };
+        }
+        defer if (use_kv) {
+            kb.deinit();
+            db.close();
+        };
+        // kv counts its clock in ms: the same ticks, a ttl of `fz_ttl` ms.
+        var store = if (use_kv)
+            Store{ .backend = kb.backend(), .clock = clk.clock(), .ttl_ns = fz_ttl * std.time.ns_per_ms }
+        else
+            Store{ .cache = &cache, .clock = clk.clock(), .ttl_ns = fz_ttl };
         defer store.deinit();
         var app = App{ .store = &store };
         var idem = Idempotency{ .store = &store, .options = .{
@@ -1399,10 +1542,15 @@ test "model-fuzz: request sequences through the middleware vs. a linear-scan mod
             // nudged by 1 ns: that single instant is the cache's, not ours.
             const deltas = [_]i64{ 0, 0, 1, 10, 499, 501, 999, 1001, 2500 };
             clk.now_ns += deltas[rnd.uintLessThan(usize, deltas.len)];
-            for (recs.items) |rec| if (clk.now_ns - rec.at == fz_ttl) {
-                clk.now_ns += 1;
+            // Repeated until no record sits on the edge: one nudge can put
+            // another record (recorded 1 ns later) exactly on it.
+            nudge: while (true) {
+                for (recs.items) |rec| if (clk.now_ns - rec.at == fz_ttl) {
+                    clk.now_ns += 1;
+                    continue :nudge;
+                };
                 break;
-            };
+            }
             for (recs.items) |rec| {
                 const age = clk.now_ns - rec.at;
                 if (age == fz_ttl - 1 or age == fz_ttl + 1) reach.ttl_edge += 1;

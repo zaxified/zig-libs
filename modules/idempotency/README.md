@@ -106,6 +106,29 @@ instead of re-running it. This is in-process state, not shared through
 `ramcache` — it closes the race within one process but not across multiple
 processes/machines sharing one store.
 
+## Durable or shared records: `Backend`
+
+`Store.backend` replaces the in-process `ramcache` with any store that
+implements `Backend` (`lookupOrReserve` atomic per key, `put`, `release`;
+the contract is on the type). Bundled: `KvBackend`, records in a `kv` file,
+fsync'd and expiring on kv's wall clock, so a retry after a crash or restart
+still replays instead of charging twice:
+
+```zig
+var db = try kv.Db.open(gpa, fs.storage(), "idempotency.kv", .{});
+defer db.close();
+var kb = idempotency.KvBackend{ .db = &db, .gpa = gpa };
+defer kb.deinit();
+var store = idempotency.Store{ .backend = kb.backend() };
+defer store.deinit();
+```
+
+A backend over a database several processes share (Redis `SET NX PX`, a SQL
+row lock) closes the race across processes too; `Store.lease_ns` lets such a
+backend hand over a reservation whose holder died. `KvBackend` keeps its
+reservations in memory (the kv file is single-process), and answers 409 when
+it cannot read a record — never a second run.
+
 ## Attributes
 
 - **Role:** server. **Platform:** any. **Deps:** `router`,
