@@ -73,15 +73,6 @@ const parent_id_a = "1234567890123456";
 // Reason strings for excluded categories, named once so every vector that
 // shares a reason is provably consistent (a typo in one copy would no longer
 // silently diverge from the others).
-const reason_strict_grammar =
-    "full tracestate list-member GRAMMAR validation (per-key charset, the " ++
-    "lcalpha/DIGIT-leading rule, 256-char key length cap, 32-member cap) is " ++
-    "deliberately not implemented -- see root.zig's isValidState doc: " ++
-    "\"a light guard -- full grammar validation is intentionally left to the " ++
-    "tracing backend.\" This mirrors the suite's OWN STRICT_LEVEL knob: every " ++
-    "excluded vector here comes from a test method the suite itself guards " ++
-    "with `@unittest.skipIf(STRICT_LEVEL < 2, \"strict\")`, i.e. upstream " ++
-    "already treats this as an opt-in stricter tier, not a Level-1 baseline.";
 const reason_session_repetition =
     "tests repeated-callback / connection-reuse behavior of a stateful " ++
     "vendor HTTP service (multiple round trips over one make_request call), " ++
@@ -437,45 +428,45 @@ pub const vectors = [_]Vector{
     },
     .{
         .source_test = "test_tracestate_duplicated_keys",
-        .doc = "single header 'foo=1,foo=1' -> upstream allows either kept-as-is or deduplicated; this module never dedupes, so exactly 'foo=1,foo=1' survives",
+        .doc = "single header 'foo=1,foo=1' -> upstream asserts only that 'foo=1' survives (kept as-is or deduplicated); this module keeps the first of a duplicated key",
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "foo=1,foo=1" },
         },
         .traceparent = .{ .preserved = trace_id_a },
-        .tracestate = .{ .exact = "foo=1,foo=1" },
+        .tracestate = .{ .exact = "foo=1" },
     },
     .{
         .source_test = "test_tracestate_duplicated_keys",
-        .doc = "single header 'foo=1,foo=2' -> both values pass through unchanged (no member-level parsing)",
+        .doc = "single header 'foo=1,foo=2' -> upstream: 'foo=1' or 'foo=2' survives; the left (most recent) one is kept",
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "foo=1,foo=2" },
         },
         .traceparent = .{ .preserved = trace_id_a },
-        .tracestate = .{ .exact = "foo=1,foo=2" },
+        .tracestate = .{ .exact = "foo=1" },
     },
     .{
         .source_test = "test_tracestate_duplicated_keys",
-        .doc = "two headers, each 'foo=1' -> combined 'foo=1,foo=1'",
+        .doc = "two headers, each 'foo=1' -> combined, then deduplicated to 'foo=1'",
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "foo=1" },
             .{ .name = "tracestate", .value = "foo=1" },
         },
         .traceparent = .{ .preserved = trace_id_a },
-        .tracestate = .{ .exact = "foo=1,foo=1" },
+        .tracestate = .{ .exact = "foo=1" },
     },
     .{
         .source_test = "test_tracestate_duplicated_keys",
-        .doc = "two headers, 'foo=1' then 'foo=2' -> combined 'foo=1,foo=2'",
+        .doc = "two headers, 'foo=1' then 'foo=2' -> combined in wire order, the left one kept: 'foo=1'",
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "foo=1" },
             .{ .name = "tracestate", .value = "foo=2" },
         },
         .traceparent = .{ .preserved = trace_id_a },
-        .tracestate = .{ .exact = "foo=1,foo=2" },
+        .tracestate = .{ .exact = "foo=1" },
     },
     .{
         .source_test = "test_tracestate_all_allowed_characters",
@@ -573,51 +564,47 @@ pub const vectors = [_]Vector{
     },
     .{
         .source_test = "test_tracestate_key_illegal_characters",
-        .doc = "STRICT_LEVEL 2: a key containing a space must be discarded -- requires per-member key-grammar parsing",
+        .doc = "STRICT_LEVEL 2: a key containing a space must be discarded",
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "foo =1" },
         },
         .traceparent = .{ .preserved = trace_id_a },
         .tracestate = .absent,
-        .out_of_scope = reason_strict_grammar,
     },
     .{
         .source_test = "test_tracestate_key_illegal_characters",
-        .doc = "STRICT_LEVEL 2: an uppercase key must be discarded -- requires per-member key-grammar parsing",
+        .doc = "STRICT_LEVEL 2: an uppercase key must be discarded",
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "FOO=1" },
         },
         .traceparent = .{ .preserved = trace_id_a },
         .tracestate = .absent,
-        .out_of_scope = reason_strict_grammar,
     },
     .{
         .source_test = "test_tracestate_key_illegal_characters",
-        .doc = "STRICT_LEVEL 2: a dotted key must be discarded -- requires per-member key-grammar parsing",
+        .doc = "STRICT_LEVEL 2: a dotted key must be discarded",
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "foo.bar=1" },
         },
         .traceparent = .{ .preserved = trace_id_a },
         .tracestate = .absent,
-        .out_of_scope = reason_strict_grammar,
     },
     .{
         .source_test = "test_tracestate_key_illegal_vendor_format",
-        .doc = "STRICT_LEVEL 2: a key starting with '@' must be discarded -- requires per-member key-grammar parsing",
+        .doc = "STRICT_LEVEL 2: a key starting with '@' must be discarded",
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "@foo=1,bar=2" },
         },
         .traceparent = .{ .preserved = trace_id_a },
         .tracestate = .absent,
-        .out_of_scope = reason_strict_grammar,
     },
     .{
         .source_test = "test_tracestate_member_count_limit",
-        .doc = "STRICT_LEVEL 2: 33 list-members must be discarded (32 max) -- requires per-member counting",
+        .doc = "STRICT_LEVEL 2: 33 list-members must be discarded (32 max)",
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "bar01=01,bar02=02,bar03=03,bar04=04,bar05=05,bar06=06,bar07=07,bar08=08,bar09=09,bar10=10" },
@@ -627,11 +614,10 @@ pub const vectors = [_]Vector{
         },
         .traceparent = .{ .preserved = trace_id_a },
         .tracestate = .absent,
-        .out_of_scope = reason_strict_grammar,
     },
     .{
         .source_test = "test_tracestate_key_length_limit",
-        .doc = "STRICT_LEVEL 2: a 257-char key must be discarded (256 max) -- requires per-member key-length checking",
+        .doc = "STRICT_LEVEL 2: a 257-char key must be discarded (256 max)",
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "foo=1" },
@@ -639,29 +625,26 @@ pub const vectors = [_]Vector{
         },
         .traceparent = .{ .preserved = trace_id_a },
         .tracestate = .absent,
-        .out_of_scope = reason_strict_grammar,
     },
     .{
         .source_test = "test_tracestate_value_illegal_characters",
-        .doc = "STRICT_LEVEL 2: a value containing a second '=' must be discarded -- requires per-member value-grammar parsing",
+        .doc = "STRICT_LEVEL 2: a value containing a second '=' must be discarded",
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "foo=bar=baz" },
         },
         .traceparent = .{ .preserved = trace_id_a },
         .tracestate = .absent,
-        .out_of_scope = reason_strict_grammar,
     },
     .{
         .source_test = "test_tracestate_value_illegal_characters",
-        .doc = "STRICT_LEVEL 2: an empty value ('foo=,bar=3') must discard the WHOLE header -- requires per-member value-grammar parsing",
+        .doc = "STRICT_LEVEL 2: an empty value ('foo=,bar=3') must discard the WHOLE header",
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "foo=,bar=3" },
         },
         .traceparent = .{ .preserved = trace_id_a },
         .tracestate = .absent,
-        .out_of_scope = reason_strict_grammar,
     },
 
     // ---- AdvancedTest -------------------------------------------------------

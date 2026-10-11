@@ -37,27 +37,12 @@ const divergences = [_]Divergence{
     .{ .id = "dup_diff", .why = "as dup_same" },
     .{ .id = "dup_bad_second", .why = "as dup_same" },
     .{ .id = "state_split", .why = "tracestate in two fields: otel reads only the first; W3C: 'they MUST be combined into a single header' (RFC 9110 §5.3), as we do -- a=1,b=2" },
-    .{ .id = "state_split_dup", .why = "as state_split; the combined a=1,a=2 is then carried by our light guard" },
-    // Invalid list-member grammar: otel discards the whole tracestate; W3C
-    // makes validation optional ("MAY validate ... MAY discard"), and this
-    // module carries it unchanged by design (isValidState; the conformance
-    // suite gates these behind STRICT_LEVEL >= 2).
-    .{ .id = "state10", .why = "uppercase key: light guard, see above" },
-    .{ .id = "state11", .why = "space in key: light guard" },
-    .{ .id = "state12", .why = "key starts with a digit: light guard" },
-    .{ .id = "state15", .why = "uppercase system id: light guard" },
-    .{ .id = "state16", .why = "empty tenant id: light guard" },
-    .{ .id = "state17", .why = "empty system id: light guard" },
-    .{ .id = "state19", .why = "empty value: light guard" },
-    .{ .id = "state20", .why = "empty key: light guard" },
-    .{ .id = "state21", .why = "member without '=': light guard" },
-    .{ .id = "state22", .why = "'=' in value: light guard" },
-    .{ .id = "state25", .why = "empty value then a comma: light guard" },
-    .{ .id = "state27", .why = "duplicated key: light guard (W3C: one entry per key, enforcement is the vendor's on re-entry)" },
-    .{ .id = "state28", .why = "';' separated: light guard" },
-    .{ .id = "state31", .why = "257-character key: light guard" },
-    .{ .id = "state33", .why = "257-character value: light guard" },
-    .{ .id = "state35", .why = "33 members: light guard (W3C caps at 32; truncation is the vendor's)" },
+    // Member grammar: since 2026-10-11 both sides discard an invalid list
+    // whole. Left: what the pinned W3C text allows and otel's (Level 1
+    // tenant@system) grammar does not, and duplicates.
+    .{ .id = "state12", .why = "key starts with a digit: the W3C key is (lcalpha / DIGIT) 0*255(keychar); otel drops the list" },
+    .{ .id = "state17", .why = "empty system id ('a@=1'): '@' is a plain keychar in the W3C key grammar; otel drops the list" },
+    .{ .id = "state27", .why = "duplicated key: otel drops the whole list; the W3C suite (test_tracestate_duplicated_keys) requires it inherited with one of them -- we keep the left (most recent)" },
 };
 
 fn hOk(ctx: *router.Ctx) anyerror!void {

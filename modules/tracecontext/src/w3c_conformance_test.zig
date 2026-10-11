@@ -14,14 +14,11 @@
 //! Exclusion categories (`out_of_scope` on a vector, still counted by the
 //! canary below, never silently dropped):
 //!
-//!   - strict tracestate list-member GRAMMAR (illegal key/value characters,
-//!     the 256-char key cap, the 32-member cap): this module's tracestate
-//!     validation is a deliberate light byte-class guard over the WHOLE
-//!     combined value, not a per-member parser -- see root.zig's
-//!     `isValidState` doc. Every excluded vector here comes from an upstream
-//!     test the suite itself gates behind `STRICT_LEVEL >= 2`, so upstream
-//!     already treats this as an opt-in stricter tier, not a Level-1
-//!     baseline.
+//!   (The suite's STRICT_LEVEL >= 2 tracestate grammar vectors -- illegal
+//!   key/value characters, the 256-char key cap, the 32-member cap -- were
+//!   excluded here until 2026-10-11, while this module only guarded the
+//!   whole value's byte class. `TraceState.parse` enforces the member
+//!   grammar now, and they are asserted like the rest.)
 //!   - session/connection-repetition tests (`AdvancedTest`): these assert
 //!     properties of a STATEFUL vendor HTTP service handling several
 //!     round trips (same trace-id across callbacks, distinct parent-ids
@@ -133,8 +130,8 @@ test "W3C trace-context conformance corpus: must-accept/must-reject vectors" {
             return err;
         };
     }
-    try testing.expectEqual(@as(usize, 61), executed);
-    try testing.expectEqual(@as(usize, 12), excluded);
+    try testing.expectEqual(@as(usize, 69), executed);
+    try testing.expectEqual(@as(usize, 4), excluded);
 }
 
 test "W3C trace-context conformance corpus: vendored count matches expectation (canary)" {

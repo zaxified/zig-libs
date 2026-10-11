@@ -2,7 +2,8 @@
 
 W3C Trace Context (Level 1) propagation as a `router` middleware — one
 distributed-trace identity per request, carried across services via the
-`traceparent` header (with opaque `tracestate` passthrough).
+`traceparent` header, with the `tracestate` list parsed, carried and
+extended by this service's own entry.
 
 A `traceparent` is `version-traceid-parentid-flags`, e.g.
 `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`:
@@ -23,7 +24,10 @@ Per request the middleware:
    incoming context).
 2. Otherwise **starts a new trace** (fresh trace-id + span-id; flags from
    `sampled`).
-3. **Carries `tracestate`** through unchanged (light validation only).
+3. **Carries `tracestate`** — combined across header fields, checked against
+   the W3C member grammar (a list that fails is dropped whole; at most 32
+   members; a key's later duplicates dropped), and with `state_entry` set,
+   this service's own member put in front.
 4. Exposes the current hop's context via `tracecontext.current()` and, when
    `echo` is set, writes the outgoing `traceparent`/`tracestate` on the
    response.
@@ -40,14 +44,25 @@ if (tracecontext.current()) |cx| {
 }
 ```
 
+```zig
+// Our own tracestate member, e.g. the span this hop is: `zl=<span-id>`.
+fn ourValue(_: ?*anyopaque, hop: tracecontext.TraceParent, buf: *[tracecontext.max_value_len]u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{x}", .{&hop.parent_id}) catch null;
+}
+var tc = tracecontext.TraceContext{ .options = .{ .state_entry = .{ .key = "zl", .value = ourValue } } };
+```
+
 Also usable standalone: `TraceParent.parse` / `.write` / `.sampled`,
-`childOf`, `newTrace`, `newTraceId`, `newSpanId`.
+`childOf`, `newTrace`, `newTraceId`, `newSpanId`, and `TraceState`
+(`parse`, `get`, `put` — add or update, moved to the front — `delete`,
+`write` — truncates whole members, over-128-character ones first), with
+`isValidKey` / `isValidValue`.
 
 ### Generated IDs
 
-trace-ids and span-ids come from the monotonic clock, a per-connection-thread
-nonce and a per-thread counter — no allocation, no OS entropy call, fully
-portable. They are **correlation** identifiers (unique for tracing), **not**
+trace-ids and span-ids come from one process-wide atomic sequence, offset by
+a per-process prefix and scattered by a 64-bit bijection — unique within the
+process across all threads, no allocation, no OS entropy call. They are **correlation** identifiers (unique for tracing), **not**
 unpredictable security tokens; W3C requires trace-ids to be unique, not random.
 If you need CSPRNG ids, mint them yourself and set `traceparent`.
 
@@ -67,9 +82,9 @@ behaviour, exempt per root `NOTICE` §0; no otel source or test corpus is reprod
 
 ## Verification
 
-`zig build test-tracecontext` — 8 offline tests through
-`http.Server.serveStream`: valid incoming traceparent carried into the child
-(fresh span-id) with `current()` agreement, absent and malformed inputs start a
-fresh valid trace, `tracestate` passthrough, `echo=false`, parse/write
-round-trip, invalid inputs rejected (bad version / length / delimiter /
-uppercase hex / all-zero ids), and `childOf` + id uniqueness/non-zero.
+`zig build test-tracecontext` — unit tests through `http.Server.serveStream`,
+the W3C conformance corpus (69 vectors asserted, 4 excluded with a reason),
+the OpenTelemetry Go oracle (498 header sets, 12 listed divergences),
+`TraceState` grammar/mutation/truncation tests and a seeded model-fuzz, id
+uniqueness across 32 threads, and the fuzz driver; details in `SPEC.md`
+§ Verification.
