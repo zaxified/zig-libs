@@ -141,27 +141,66 @@ fn monotonicNowNs(_: ?*anyopaque) u64 {
 /// The outcome of one `allow` call.
 pub const Decision = struct {
     allowed: bool,
-    /// Denied only: time until one token frees up, rounded **up** to whole
-    /// milliseconds — waiting exactly this long guarantees the next attempt
-    /// passes (absent other traffic). 0 when allowed.
+    /// Denied only: time until the requested tokens are free, rounded **up**
+    /// to whole milliseconds — waiting exactly this long guarantees the next
+    /// attempt passes (absent other traffic). 0 when allowed;
+    /// `std.math.maxInt(u64)` when the request can never pass (more tokens
+    /// than `burst`).
     retry_after_ms: u64,
-    /// Whole tokens left after this decision (floor of the balance).
+    /// Whole tokens left after this decision (floor of the balance; 0 while
+    /// reservations hold it below zero).
     remaining: u32,
     /// Time until the bucket is completely full again — the IETF draft
     /// `RateLimit-Reset` value (rounded up to whole milliseconds).
     reset_after_ms: u64,
+    /// The burst the decision was made against — the IETF draft
+    /// `RateLimit-Limit` value. Carried here so a reader sees the burst the
+    /// decision used even while `Limiter.setBurst` runs on another thread.
+    limit: u32 = 0,
+};
+
+/// A claim on future tokens from `TokenBucket.reserveNAt` (x/time/rate's
+/// `Reservation`). The holder waits `delayNs(now)` and then acts — or hands
+/// it back with `TokenBucket.cancelAt`.
+pub const Reservation = struct {
+    /// False: nothing was taken (more than `burst` tokens, or the wait would
+    /// exceed the caller's `max_wait_ns`). The other fields are then 0.
+    ok: bool,
+    /// Tokens taken; 0 after a cancel (a second cancel is a no-op).
+    n: u32 = 0,
+    /// The instant the reserved tokens are available.
+    time_to_act_ns: u64 = 0,
+    /// The rate in force when the reservation was made; a cancel restores
+    /// against it, not against a later `setLimit`.
+    rate_per_s: f64 = 0,
+
+    /// How long the holder must wait from `now_ns` before acting.
+    pub fn delayNs(r: Reservation, now_ns: u64) u64 {
+        return r.time_to_act_ns -| now_ns;
+    }
 };
 
 /// Token bucket, mirroring Go `golang.org/x/time/rate`: a float token
-/// balance refilled lazily at `rate_per_s`, capped at `burst`; one token per
-/// event; denials consume nothing. Pure state + math — no clock, no locking
-/// (single owner; `Limiter` adds keying and synchronization).
+/// balance refilled lazily at `rate_per_s`, capped at `burst`; `n` tokens per
+/// event (one for `allowAt`); denials consume nothing; reservations may take
+/// the balance below zero (future tokens). Pure state + math — no clock, no
+/// locking (single owner; `Limiter` adds keying and synchronization).
+///
+/// The config is the caller's, passed on every call. To change it at run
+/// time, call `advanceAt(old_cfg, now)` first and pass the new one from then
+/// on (x/time/rate's `SetLimitAt`/`SetBurstAt`): tokens earned so far are
+/// kept at the old rate, a smaller burst caps the balance.
 pub const TokenBucket = struct {
-    /// Current fractional token balance (0 ≤ tokens ≤ burst).
+    /// Current fractional token balance: ≤ burst, negative while
+    /// reservations hold future tokens.
     tokens: f64,
-    /// Instant of the last `allowAt` (refill is computed lazily from here —
-    /// x/time/rate's `last`).
+    /// Instant the balance was last brought up to date (refill is computed
+    /// lazily from here — x/time/rate's `last`).
     updated_ns: u64,
+    /// Instant of the latest admitted event or reservation (x/time/rate's
+    /// `lastEvent`); `cancelAt` reads it to see whether later reservations
+    /// already spent what the cancelled one would give back.
+    last_event_ns: u64 = 0,
 
     pub const Config = struct {
         /// Sustained refill, tokens per second. Must be > 0 and finite.
@@ -179,32 +218,116 @@ pub const TokenBucket = struct {
     /// a token when allowed. `now_ns` must be monotonic — a backwards step
     /// is treated as no time passing (never a negative refill).
     pub fn allowAt(b: *TokenBucket, cfg: Config, now_ns: u64) Decision {
+        return b.allowNAt(cfg, now_ns, 1);
+    }
+
+    /// Decide an event costing `n` tokens at `now_ns` (x/time/rate
+    /// `AllowN`): all `n` are taken, or none. `n > burst` can never pass;
+    /// `n == 0` passes unless reservations hold the balance below zero.
+    pub fn allowNAt(b: *TokenBucket, cfg: Config, now_ns: u64, n: u32) Decision {
         std.debug.assert(cfg.rate_per_s > 0 and cfg.burst >= 1);
-        if (now_ns > b.updated_ns) {
-            const elapsed_s = @as(f64, @floatFromInt(now_ns - b.updated_ns)) / ns_per_s_f;
-            b.tokens = @min(@as(f64, @floatFromInt(cfg.burst)), b.tokens + elapsed_s * cfg.rate_per_s);
-            b.updated_ns = now_ns;
-        }
+        b.advanceAt(cfg, now_ns);
         const burst_f: f64 = @floatFromInt(cfg.burst);
-        if (b.tokens >= 1.0) {
-            b.tokens -= 1.0;
-            return .{
-                .allowed = true,
-                .retry_after_ms = 0,
-                .remaining = @intFromFloat(b.tokens),
-                .reset_after_ms = ceilMs((burst_f - b.tokens) / cfg.rate_per_s),
-            };
+        const n_f: f64 = @floatFromInt(n);
+        const allowed = n <= cfg.burst and b.tokens >= n_f;
+        if (allowed) {
+            b.tokens -= n_f;
+            b.last_event_ns = now_ns;
         }
         return .{
-            .allowed = false,
-            .retry_after_ms = ceilMs((1.0 - b.tokens) / cfg.rate_per_s),
-            .remaining = 0,
+            .allowed = allowed,
+            .retry_after_ms = if (allowed) 0 else if (n > cfg.burst)
+                std.math.maxInt(u64)
+            else
+                ceilMs((n_f - b.tokens) / cfg.rate_per_s),
+            .remaining = wholeTokens(b.tokens),
             .reset_after_ms = ceilMs((burst_f - b.tokens) / cfg.rate_per_s),
+            .limit = cfg.burst,
         };
+    }
+
+    /// Take `n` tokens now or from the future (x/time/rate `ReserveN`, and
+    /// with a finite `max_wait_ns` the reservation `Wait` makes). The tokens
+    /// are taken at once and the balance may go negative; the caller waits
+    /// `Reservation.delayNs(now)` before acting. Not ok — nothing taken —
+    /// when `n > burst` or the wait would exceed `max_wait_ns`
+    /// (`std.math.maxInt(u64)`: no limit).
+    pub fn reserveNAt(b: *TokenBucket, cfg: Config, now_ns: u64, n: u32, max_wait_ns: u64) Reservation {
+        std.debug.assert(cfg.rate_per_s > 0 and cfg.burst >= 1);
+        b.advanceAt(cfg, now_ns);
+        if (n > cfg.burst) return .{ .ok = false };
+        const left = b.tokens - @as(f64, @floatFromInt(n));
+        const wait_ns: u64 = if (left < 0) durationNs(-left, cfg.rate_per_s) else 0;
+        if (wait_ns > max_wait_ns) return .{ .ok = false };
+        b.tokens = left;
+        b.last_event_ns = now_ns +| wait_ns;
+        return .{ .ok = true, .n = n, .time_to_act_ns = b.last_event_ns, .rate_per_s = cfg.rate_per_s };
+    }
+
+    /// Hand a reservation's tokens back (x/time/rate `Reservation.CancelAt`),
+    /// as far as later reservations have not already counted on them. A
+    /// no-op once the reservation's time has come, for a not-ok one, and for
+    /// a second cancel (it zeroes `r.n`).
+    pub fn cancelAt(b: *TokenBucket, cfg: Config, r: *Reservation, now_ns: u64) void {
+        if (!r.ok or r.n == 0 or r.time_to_act_ns < now_ns) return;
+        // Tokens reserved after this one were granted on top of it; only
+        // what they did not build on can come back.
+        const later_ns: f64 = @as(f64, @floatFromInt(b.last_event_ns)) - @as(f64, @floatFromInt(r.time_to_act_ns));
+        const restore = @as(f64, @floatFromInt(r.n)) - later_ns / ns_per_s_f * r.rate_per_s;
+        const n = r.n;
+        r.n = 0;
+        if (restore <= 0) return;
+        b.advanceAt(cfg, now_ns);
+        b.tokens = @min(b.tokens + restore, @as(f64, @floatFromInt(cfg.burst)));
+        if (r.time_to_act_ns == b.last_event_ns) {
+            const prev = r.time_to_act_ns -| durationNs(@floatFromInt(n), r.rate_per_s);
+            if (prev >= now_ns) b.last_event_ns = prev;
+        }
+    }
+
+    /// The balance at `now_ns` without changing the bucket (x/time/rate
+    /// `TokensAt`); negative while reservations hold future tokens.
+    pub fn tokensAt(b: TokenBucket, cfg: Config, now_ns: u64) f64 {
+        var copy = b;
+        copy.advanceAt(cfg, now_ns);
+        return copy.tokens;
+    }
+
+    /// Bring the balance up to `now_ns` under `cfg`: refill for the time
+    /// elapsed, cap at `cfg.burst`. Every decision does this first; call it
+    /// directly before switching to a new config (see the type doc).
+    pub fn advanceAt(b: *TokenBucket, cfg: Config, now_ns: u64) void {
+        if (now_ns > b.updated_ns) {
+            const elapsed_s = @as(f64, @floatFromInt(now_ns - b.updated_ns)) / ns_per_s_f;
+            b.tokens += elapsed_s * cfg.rate_per_s;
+            b.updated_ns = now_ns;
+        }
+        b.tokens = @min(b.tokens, @as(f64, @floatFromInt(cfg.burst)));
+    }
+
+    /// The instant from which the bucket counts as idle: its last update, or
+    /// a reservation's later time to act.
+    fn idleSince(b: TokenBucket) u64 {
+        return @max(b.updated_ns, b.last_event_ns);
     }
 };
 
 const ns_per_s_f: f64 = @floatFromInt(std.time.ns_per_s);
+
+/// floor(tokens) as a count, 0 for a negative balance.
+fn wholeTokens(tokens: f64) u32 {
+    if (!(tokens > 0)) return 0;
+    return @intFromFloat(@min(tokens, @as(f64, @floatFromInt(std.math.maxInt(u32)))));
+}
+
+/// Time for `tokens` to accrue at `rate_per_s`, in whole nanoseconds
+/// (truncated, as x/time/rate's duration conversion does), saturated.
+fn durationNs(tokens: f64, rate_per_s: f64) u64 {
+    const ns = ns_per_s_f * (tokens / rate_per_s);
+    if (!(ns > 0)) return 0;
+    if (ns >= @as(f64, @floatFromInt(std.math.maxInt(u64)))) return std.math.maxInt(u64);
+    return @intFromFloat(ns);
+}
 
 /// Seconds (float) → whole milliseconds, rounded up, saturated at u64 max.
 fn ceilMs(seconds: f64) u64 {
@@ -354,24 +477,125 @@ pub const Limiter = struct {
     /// `allow` at an explicit instant — the deterministic-test entry point.
     /// `now_ns` must be non-decreasing across calls.
     pub fn allowAt(l: *Limiter, raw_key: []const u8, now_ns: u64) Decision {
-        const cfg: TokenBucket.Config = .{ .rate_per_s = l.options.rate_per_s, .burst = l.options.burst };
+        return l.allowNAt(raw_key, 1, now_ns);
+    }
+
+    /// Decide a request costing `n` tokens for `key` (x/time/rate `AllowN`:
+    /// bytes, an expensive endpoint). All or nothing; `n > burst` never
+    /// passes (`retry_after_ms` = `maxInt(u64)`).
+    pub fn allowN(l: *Limiter, key: []const u8, n: u32) Decision {
+        return l.allowNAt(key, n, l.options.clock.now());
+    }
+
+    /// `allowN` at an explicit instant.
+    pub fn allowNAt(l: *Limiter, raw_key: []const u8, n: u32, now_ns: u64) Decision {
+        lockSpin(&l.lock);
+        defer l.lock.unlock();
+        const b = l.bucketLocked(raw_key, now_ns) orelse {
+            // OOM → fail open (documented): decide on a fresh bucket.
+            var fresh: TokenBucket = .full(l.config(), now_ns);
+            return fresh.allowNAt(l.config(), now_ns, n);
+        };
+        return b.allowNAt(l.config(), now_ns, n);
+    }
+
+    pub const WaitError = error{
+        /// `n` exceeds the burst: no wait can ever admit it.
+        ExceedsBurst,
+        /// Admission would need longer than the caller's `max_wait_ns`.
+        WaitTooLong,
+    } || std.Io.Cancelable;
+
+    /// Block until `n` tokens for `key` are available, then take them
+    /// (x/time/rate `WaitN`) — pacing one's own outgoing calls. Reserves at
+    /// once and sleeps the reservation's delay on `io`; returns at once when
+    /// the tokens are already there. Fails without taking anything when
+    /// `n > burst` or the wait would exceed `max_wait_ns` (x/time/rate's
+    /// context deadline; `maxInt(u64)` = no limit).
+    ///
+    /// Differs from x/time/rate in one way: a sleep cancelled through `io`
+    /// returns `error.Canceled` with the tokens still taken (x/time/rate
+    /// hands them back). Under-admission only: a later caller waits longer,
+    /// nobody gets past the limit. The key's bucket may have been evicted and
+    /// recreated meanwhile, so giving tokens back to "it" could credit a
+    /// stranger.
+    ///
+    /// The delay is computed on `Options.clock` and slept on `io`'s awake
+    /// clock; with the default monotonic clock they agree.
+    pub fn waitN(l: *Limiter, io: std.Io, key: []const u8, n: u32, max_wait_ns: u64) WaitError!void {
+        const now_ns = l.options.clock.now();
+        const r: Reservation = blk: {
+            lockSpin(&l.lock);
+            defer l.lock.unlock();
+            const cfg = l.config();
+            if (n > cfg.burst) return error.ExceedsBurst;
+            const b = l.bucketLocked(key, now_ns) orelse return; // OOM → fail open
+            break :blk b.reserveNAt(cfg, now_ns, n, max_wait_ns);
+        };
+        if (!r.ok) return error.WaitTooLong;
+        const delay = r.delayNs(now_ns);
+        if (delay == 0) return;
+        try io.sleep(.fromNanoseconds(delay), .awake);
+    }
+
+    /// Change the sustained rate for every key (x/time/rate `SetLimit`):
+    /// tokens earned so far are kept at the old rate, refill continues at
+    /// the new one. Takes the lock and walks every tracked key once.
+    pub fn setRate(l: *Limiter, rate_per_s: f64) void {
+        l.setConfigAt(rate_per_s, null, l.options.clock.now());
+    }
+
+    /// Change the burst for every key (x/time/rate `SetBurst`): a balance
+    /// above the new burst is cut to it; a raised burst fills by refill.
+    pub fn setBurst(l: *Limiter, burst: u32) void {
+        l.setConfigAt(null, burst, l.options.clock.now());
+    }
+
+    /// `setRate`/`setBurst` at an explicit instant; null keeps a value.
+    pub fn setConfigAt(l: *Limiter, rate_per_s: ?f64, burst: ?u32, now_ns: u64) void {
+        if (rate_per_s) |r| std.debug.assert(r > 0 and std.math.isFinite(r));
+        if (burst) |b| std.debug.assert(b >= 1);
+        lockSpin(&l.lock);
+        defer l.lock.unlock();
+        const old = l.config();
+        var it = l.map.valueIterator();
+        while (it.next()) |e| e.*.bucket.advanceAt(old, now_ns);
+        if (rate_per_s) |r| l.options.rate_per_s = r;
+        if (burst) |b| l.options.burst = b;
+    }
+
+    /// The rate and burst in force (x/time/rate `Limit`/`Burst`).
+    pub fn currentConfig(l: *Limiter) TokenBucket.Config {
+        lockSpin(&l.lock);
+        defer l.lock.unlock();
+        return l.config();
+    }
+
+    /// Caller holds the lock.
+    fn config(l: *const Limiter) TokenBucket.Config {
+        return .{ .rate_per_s = l.options.rate_per_s, .burst = l.options.burst };
+    }
+
+    /// The key's bucket, created (full) or reset by the idle TTL as needed,
+    /// moved to the LRU front. Null only when tracking a new key failed on
+    /// allocation. Caller holds the lock.
+    fn bucketLocked(l: *Limiter, raw_key: []const u8, now_ns: u64) ?*TokenBucket {
+        const cfg = l.config();
         const ttl_ns = l.options.ttl_ms *| std.time.ns_per_ms;
         // Cap the stored/looked-up key length (F3 hardening — see
         // `Options.max_key_len`) before it ever reaches the map.
         const key = raw_key[0..@min(raw_key.len, l.options.max_key_len)];
 
-        lockSpin(&l.lock);
-        defer l.lock.unlock();
-
         if (l.map.get(key)) |e| {
             // Idle-expired keys start over with a full bucket (the bucket
             // would have refilled to full long ago anyway; this also resets
-            // `updated_ns` so the entry stops looking expired).
-            if (ttl_ns != 0 and now_ns -| e.bucket.updated_ns > ttl_ns)
+            // `updated_ns` so the entry stops looking expired). A pending
+            // reservation keeps a key busy until its time to act.
+            if (ttl_ns != 0 and now_ns -| e.bucket.idleSince() > ttl_ns)
                 e.bucket = .full(cfg, now_ns);
             l.lru.remove(&e.node);
             l.lru.prepend(&e.node);
-            return e.bucket.allowAt(cfg, now_ns);
+            return &e.bucket;
         }
 
         // New key. First sweep idle-expired keys off the LRU tail (releases
@@ -388,17 +612,15 @@ pub const Limiter = struct {
                 // the same idiom used throughout http/ipcbus/zipstream/
                 // aaa-gate for identical intrusive lists.
                 const e: *Entry = @alignCast(@fieldParentPtr("node", tail));
-                if (now_ns -| e.bucket.updated_ns <= ttl_ns) break;
+                if (now_ns -| e.bucket.idleSince() <= ttl_ns) break;
                 l.removeEntry(e);
             }
         }
         if (l.map.count() >= l.options.max_keys)
             l.removeEntry(@alignCast(@fieldParentPtr("node", l.lru.last.?)));
 
-        var bucket: TokenBucket = .full(cfg, now_ns);
-        const decision = bucket.allowAt(cfg, now_ns);
-        l.insert(key, bucket) catch {}; // OOM → fail open (documented)
-        return decision;
+        const e = l.insert(key, .full(cfg, now_ns)) catch return null; // OOM → fail open (documented)
+        return &e.bucket;
     }
 
     /// Number of keys currently tracked (diagnostics / tests).
@@ -408,13 +630,14 @@ pub const Limiter = struct {
         return l.map.count();
     }
 
-    fn insert(l: *Limiter, key: []const u8, bucket: TokenBucket) Allocator.Error!void {
+    fn insert(l: *Limiter, key: []const u8, bucket: TokenBucket) Allocator.Error!*Entry {
         const e = try l.gpa.create(Entry);
         errdefer l.gpa.destroy(e);
         e.* = .{ .key = try l.gpa.dupe(u8, key), .bucket = bucket };
         errdefer l.gpa.free(e.key);
         try l.map.put(l.gpa, e.key, e);
         l.lru.prepend(&e.node);
+        return e;
     }
 
     fn removeEntry(l: *Limiter, e: *Entry) void {
@@ -464,7 +687,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     const retry_s = @max(1, ceilDivMsToS(decision.retry_after_ms));
     ctx.res.setStatus(429);
     try ctx.res.setHeader("Retry-After", std.fmt.bufPrint(&retry_buf, "{d}", .{retry_s}) catch unreachable);
-    try ctx.res.setHeader("RateLimit-Limit", std.fmt.bufPrint(&limit_buf, "{d}", .{l.options.burst}) catch unreachable);
+    try ctx.res.setHeader("RateLimit-Limit", std.fmt.bufPrint(&limit_buf, "{d}", .{decision.limit}) catch unreachable);
     try ctx.res.setHeader("RateLimit-Remaining", "0");
     try ctx.res.setHeader("RateLimit-Reset", std.fmt.bufPrint(&reset_buf, "{d}", .{ceilDivMsToS(decision.reset_after_ms)}) catch unreachable);
     try ctx.res.setHeader("Content-Type", "text/plain");
@@ -657,6 +880,72 @@ test "TokenBucket: replays a captured golang.org/x/time/rate AllowN trace" {
             try testing.expect(@abs(s.tokens_after - b.tokens) <= tokens_tolerance);
         }
     }
+}
+
+const xrate_ops = @import("xrate_ops_vectors.zig");
+
+test "TokenBucket: replays captured x/time/rate AllowN/ReserveN/CancelAt/SetLimitAt/SetBurstAt sequences" {
+    // 8 seeded random sequences on one reference limiter each (see the
+    // vector file): n in 0..burst+1, reservations into the future, cancels of
+    // due / already-cancelled / not-ok / later-built-upon reservations, and
+    // rate and burst changes mid-flight. Decisions are compared exactly; the
+    // balance within a tolerance (see the AllowN trace test for why), the
+    // reservation delay within 1 ns (x/time/rate truncates a float product
+    // to whole nanoseconds; an ULP on either side can move it by one).
+    // Negative controls 2026-10-11, each red here: (a) `cancelAt` without
+    // the later-reservation correction (restore all `n`); (b) `allowNAt` not
+    // recording `last_event_ns`; (c) `advanceAt` capping only when time
+    // moved (a lowered burst then leaves the balance above it).
+    const tokens_tolerance = 1e-9;
+    var reach = [_]usize{0} ** 6; // allow-deny, reserve-future, cancel-restored, cancel-noop, set_limit, set_burst
+    for (xrate_ops.cases) |c| {
+        var cfg: TokenBucket.Config = .{ .rate_per_s = c.rate_per_s, .burst = c.burst };
+        var b: TokenBucket = .full(cfg, 0);
+        var res: [128]Reservation = undefined;
+        try testing.expect(c.ops.len <= res.len);
+        for (c.ops, 0..) |op, i| {
+            const now = op.at_ms * std.time.ns_per_ms;
+            const before = b.tokensAt(cfg, now);
+            var ok = true;
+            var delay: u64 = 0;
+            switch (op.kind) {
+                .allow => {
+                    ok = b.allowNAt(cfg, now, op.n).allowed;
+                    if (!ok) reach[0] += 1;
+                },
+                .reserve => {
+                    res[i] = b.reserveNAt(cfg, now, op.n, std.math.maxInt(u64));
+                    ok = res[i].ok;
+                    delay = res[i].delayNs(now);
+                    if (delay > 0) reach[1] += 1;
+                },
+                .cancel => if (op.ref >= 0) {
+                    b.cancelAt(cfg, &res[@intCast(op.ref)], now);
+                    if (b.tokensAt(cfg, now) > before) reach[2] += 1 else reach[3] += 1;
+                },
+                .set_limit => {
+                    b.advanceAt(cfg, now);
+                    cfg.rate_per_s = op.rate_per_s;
+                    reach[4] += 1;
+                },
+                .set_burst => {
+                    b.advanceAt(cfg, now);
+                    cfg.burst = op.n;
+                    reach[5] += 1;
+                },
+            }
+            const got_tokens = b.tokensAt(cfg, now);
+            errdefer std.debug.print(
+                "\nx/time/rate op mismatch: seed {d} op {d} ({t} n={d} ref={d} at {d} ms)\n" ++
+                    "  reference: ok={} delay={d} ns tokens={d}\n  ours:      ok={} delay={d} ns tokens={d}\n",
+                .{ c.seed, i, op.kind, op.n, op.ref, op.at_ms, op.ok, op.delay_ns, op.tokens_after, ok, delay, got_tokens },
+            );
+            try testing.expectEqual(op.ok, ok);
+            try testing.expect(@max(delay, op.delay_ns) - @min(delay, op.delay_ns) <= 1);
+            try testing.expect(@abs(op.tokens_after - got_tokens) <= tokens_tolerance);
+        }
+    }
+    for (reach) |r| try testing.expect(r > 0);
 }
 
 // ── tests: the keyed limiter (injected clock, no HTTP) ──────────────────────
@@ -909,6 +1198,99 @@ const RouterUnderLimit = struct {
         rl.r.deinit();
     }
 };
+
+test "TokenBucket: reserveNAt honours max_wait; a second cancel is a no-op (deliberate x/time/rate divergence)" {
+    const cfg: TokenBucket.Config = .{ .rate_per_s = 1, .burst = 3 };
+    var b: TokenBucket = .full(cfg, 0);
+    try testing.expect(b.allowNAt(cfg, 0, 3).allowed); // empty
+    // 2 tokens owed = 2 s; a 1.5 s cap refuses and takes nothing.
+    const refused = b.reserveNAt(cfg, 0, 2, 1500 * std.time.ns_per_ms);
+    try testing.expect(!refused.ok);
+    try testing.expectEqual(@as(f64, 0), b.tokens);
+    // Exactly the wait needed is accepted.
+    var r = b.reserveNAt(cfg, 0, 2, 2 * std.time.ns_per_s);
+    try testing.expect(r.ok);
+    try testing.expectEqual(@as(u64, 2 * std.time.ns_per_s), r.delayNs(0));
+    try testing.expectEqual(@as(f64, -2), b.tokens);
+    // n > burst is never ok, whatever the cap.
+    try testing.expect(!b.reserveNAt(cfg, 0, 4, std.math.maxInt(u64)).ok);
+    // Cancel gives the 2 back; a second cancel must not give them again
+    // (x/time/rate v0.15.0 does — see xrate_ops_vectors.zig).
+    b.cancelAt(cfg, &r, 0);
+    try testing.expectEqual(@as(f64, 0), b.tokens);
+    b.cancelAt(cfg, &r, 0);
+    try testing.expectEqual(@as(f64, 0), b.tokens);
+    // A denied AllowN of n > burst reports "never".
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), b.allowNAt(cfg, 0, 4).retry_after_ms);
+}
+
+test "Limiter: allowN charges n tokens per key, all or nothing" {
+    var clk: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 10, .burst = 10, .clock = clk.clock(), .key = .forwarded_ip });
+    defer l.deinit();
+    try testing.expectEqual(@as(u32, 4), l.allowN("a", 6).remaining);
+    const d = l.allowN("a", 5); // 4 left: refused, nothing taken
+    try testing.expect(!d.allowed);
+    try testing.expectEqual(@as(u64, 100), d.retry_after_ms); // 1 token at 10/s
+    try testing.expectEqual(@as(u32, 10), d.limit);
+    try testing.expect(l.allowN("a", 4).allowed);
+    try testing.expect(l.allowN("b", 10).allowed); // other key untouched
+    try testing.expect(!l.allowN("c", 11).allowed); // over burst: never
+}
+
+test "Limiter: setRate keeps earned tokens, setBurst cuts the balance" {
+    var clk: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 1, .burst = 10, .clock = clk.clock(), .key = .forwarded_ip });
+    defer l.deinit();
+    try testing.expect(l.allowN("k", 10).allowed); // empty at t=0
+    clk.advanceMs(2000); // +2 at the old rate
+    l.setRate(10);
+    clk.advanceMs(300); // +3 at the new rate → 5
+    try testing.expectEqual(@as(u32, 0), l.allowN("k", 5).remaining);
+    try testing.expect(!l.allowN("k", 1).allowed);
+    clk.advanceMs(1000); // full again (10)
+    l.setBurst(4); // cut to 4
+    try testing.expectEqual(@as(u32, 0), l.allowN("k", 4).remaining);
+    try testing.expect(!l.allowN("k", 5).allowed); // over the new burst
+    try testing.expectEqual(@as(u32, 4), l.allow("k").limit);
+    const cur = l.currentConfig();
+    try testing.expectEqual(@as(f64, 10), cur.rate_per_s);
+    try testing.expectEqual(@as(u32, 4), cur.burst);
+}
+
+test "Limiter: waitN paces, refuses over burst and over max_wait without taking tokens" {
+    // Real clock and real sleeps, kept to a few milliseconds.
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 1000, .burst = 2, .key = .forwarded_ip });
+    defer l.deinit();
+    const io = testing.io;
+    try testing.expectError(error.ExceedsBurst, l.waitN(io, "k", 3, std.math.maxInt(u64)));
+    try l.waitN(io, "k", 2, 0); // full: no wait
+    // Empty now; 2 tokens need 2 ms. A 0.5 ms cap refuses and takes nothing.
+    try testing.expectError(error.WaitTooLong, l.waitN(io, "k", 2, 500 * std.time.ns_per_us));
+    const t0 = Clock.monotonic.now();
+    try l.waitN(io, "k", 2, std.math.maxInt(u64));
+    const slept = Clock.monotonic.now() - t0;
+    // ≥ 2 ms minus what refilled between the refusal and this call.
+    try testing.expect(slept >= std.time.ns_per_ms);
+}
+
+test "Limiter: a pending reservation keeps its key from idle reset" {
+    var clk: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.001, .burst = 1, .ttl_ms = 1000, .clock = clk.clock(), .key = .forwarded_ip });
+    defer l.deinit();
+    // Take the token, then reserve one more: due in 1000 s (> ttl).
+    try testing.expect(l.allow("k").allowed);
+    {
+        lockSpin(&l.lock);
+        defer l.lock.unlock();
+        const b = l.bucketLocked("k", clk.ns).?;
+        try testing.expect(b.reserveNAt(l.config(), clk.ns, 1, std.math.maxInt(u64)).ok);
+    }
+    clk.advanceMs(5000); // past the TTL, long before the reservation is due
+    // Negative control 2026-10-11: with `updated_ns` instead of
+    // `idleSince()` the key reset to a full bucket here and admitted.
+    try testing.expect(!l.allow("k").allowed);
+}
 
 test "middleware: burst then golden 429 with Retry-After; deny skips the handler" {
     var tc: TestClock = .{};

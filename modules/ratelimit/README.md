@@ -16,7 +16,7 @@ zero globals.
 
 Provenance: clean-room (token-bucket + keyed store). Design references only, no
 source consulted or copied: `golang.org/x/time/rate` (BSD-3-Clause, The Go
-Authors) and nginx `limit_req` (BSD-2-Clause). DATA: `src/xrate_vectors.zig` is a trace we recorded by driving `golang.org/x/time/rate` as a black-box oracle over a request sequence we chose, then freezing its answers. That is the library's observable behaviour on our input, exempt per root `NOTICE` §0 — not a copy of its test corpus, of which none is reproduced.
+Authors) and nginx `limit_req` (BSD-2-Clause). DATA: `src/xrate_vectors.zig` and `src/xrate_ops_vectors.zig` are traces we recorded by driving `golang.org/x/time/rate` as a black-box oracle over request/operation sequences we chose, then freezing its answers. That is the library's observable behaviour on our input, exempt per root `NOTICE` §0 — not a copy of its test corpus, of which none is reproduced.
 
 ## Layers
 
@@ -61,6 +61,22 @@ Allowed requests flow to the handler untouched. Denied requests get **429**
 with `Retry-After` (whole seconds, rounded up, ≥ 1), the IETF draft
 `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` headers, and a
 short `text/plain` body; the rest of the chain never runs.
+
+Beyond one token per request (x/time/rate's API, per key):
+
+```zig
+_ = limiter.allowN(key, body_len / 1024); // weighted: n tokens, all or nothing
+try limiter.waitN(io, "upstream", 1, 2 * std.time.ns_per_s); // pace own calls; sleeps on io
+limiter.setRate(20); // run-time change, keeps earned tokens
+limiter.setBurst(5); // balances above 5 are cut
+```
+
+`TokenBucket` has the same pieces unkeyed: `allowNAt`, `reserveNAt` (a
+`Reservation` with `delayNs`, the balance may go negative) and `cancelAt`, and
+`advanceAt` to switch configs. Anchored on captured x/time/rate operation
+sequences (`src/xrate_ops_vectors.zig`). Two deliberate differences: a second
+`cancelAt` of one reservation is a no-op (x/time/rate restores the tokens
+again), and `waitN` cancelled through `io` keeps the tokens taken.
 
 The keyed store is bounded: at most `max_keys` entries, least-recently-used
 evicted first (an evicted key seen again starts over with a full bucket),

@@ -61,6 +61,10 @@ func hexf(f float64) string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "ops" {
+		emitOps()
+		return
+	}
 	cases := []kase{
 		{
 			name: "rate=1 burst=3 — the row's (1,3) triple: burst at t0, deny, refill at 1s/3s, long idle",
