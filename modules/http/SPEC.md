@@ -406,8 +406,13 @@ Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML not
 - R2 timeouts Go has: `read_header_timeout_ms`, `idle_timeout_ms` as ABSOLUTE phase deadlines (a peer
   dribbling one byte per period defeats an inactivity timer; qap measured 75 s against a 10 s one),
   per-request read/write deadlines.
-- R3 handler helpers: `addHeader`/`getHeader`/`delHeader`, `redirect`, `writeError`/`notFound`,
-  `Request.headerAll`, `basicAuth` (+ client `basicAuthHeader`), per-request `limitBody`.
+- R3 handler helpers — DONE 2026-10-12: `addHeader`/`getHeader`/`delHeader`, `redirect`,
+  `writeError`/`notFound`, `Request.headerAll`, `basicAuth` (+ client `basicAuthHeader`) and
+  `Server.BodyLimit` (Go `MaxBytesReader`; caller-owned, so neither `Request` nor the serving frame
+  grows). Go oracle area `helpers` (37 redirect, 7 error, 21 BasicAuth cases): one judged divergence,
+  a location resolving to `/\host` is refused. Go's `Error` keeps `Content-Encoding`/`Etag`/
+  `Last-Modified` (the survey assumed it drops them; the oracle says no), and writes the redirect
+  body with two newlines.
 - R4 `http.form`: one form object over query + urlencoded + multipart (Go `ParseForm`/`FormValue`),
   client form encoder.
 - R5 `on_error` hook (Go `ErrorLog`).

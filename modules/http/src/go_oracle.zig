@@ -923,3 +923,132 @@ test "go oracle rproxy: the proxy passes on what Go's ReverseProxy passes on, or
 fn rproxyServe(s: *Server) void {
     s.serve() catch {};
 }
+
+// ── helpers: Redirect, Error/NotFound, BasicAuth ─────────────────────────
+
+const http = @import("root.zig");
+
+/// A response `ResponseWriter` produced, split for comparison.
+const Written = struct {
+    status: u16,
+    head: []const u8,
+    body: []const u8,
+
+    fn of(wire: []const u8) Written {
+        const end = std.mem.indexOf(u8, wire, "\r\n\r\n").?;
+        return .{
+            .status = std.fmt.parseInt(u16, wire[9..12], 10) catch 0,
+            .head = wire[0 .. end + 2],
+            .body = wire[end + 4 ..],
+        };
+    }
+
+    fn header(w: Written, name: []const u8) ?[]const u8 {
+        var lines = std.mem.splitSequence(u8, w.head, "\r\n");
+        _ = lines.next(); // status line
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return std.mem.trim(u8, line[colon + 1 ..], " ");
+        }
+        return null;
+    }
+
+    fn headerCount(w: Written) usize {
+        return std.mem.count(u8, w.head, "\r\n") - 1;
+    }
+};
+
+/// A request carrying only what the helpers read (method and path).
+fn helperRequest(method: []const u8, target: []const u8) Server.Request {
+    return .{
+        .method = Server.methodFromToken(method).?,
+        .target = target,
+        .path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len],
+        .query = "",
+        .head = undefined,
+        .body = undefined,
+        .context = null,
+    };
+}
+
+const RedirectDivergence = struct { id: []const u8, why: []const u8 };
+
+const redirect_divergences = [_]RedirectDivergence{
+    .{ .id = "backslash-abs", .why = "a location resolving to `/\\host` is refused (InvalidLocation): browsers follow it to another host; Go writes it as is" },
+};
+
+test "go oracle helpers: ResponseWriter.redirect answers as http.Redirect, or the difference is judged" {
+    var bad: usize = 0;
+    for (vectors.redirect) |c| {
+        var out_buf: [8192]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        var body_buf: [1024]u8 = undefined;
+        var chunk_buf: [64]u8 = undefined;
+        const head_req = std.mem.eql(u8, c.method, "HEAD");
+        var rw: Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .head_request = head_req });
+        if (c.preset_ct) try rw.setHeader("Content-Type", "text/plain");
+        const req = helperRequest(c.method, c.target);
+        const refused = if (rw.redirect(&req, c.location, c.code)) |_| false else |_| true;
+        const listed = find(RedirectDivergence, &redirect_divergences, c.id);
+        if (refused) {
+            if (listed == null) {
+                bad += 1;
+                std.debug.print("redirect {s}: refused, Go answered {d} {?s}\n", .{ c.id, c.status, c.out_location });
+            }
+            continue;
+        }
+        try rw.end();
+        const w = Written.of(out.buffered());
+        const agrees = w.status == c.status and optEql(w.header("location"), c.out_location) and
+            optEql(w.header("content-type"), c.content_type) and std.mem.eql(u8, w.body, c.body);
+        if (agrees and listed == null) continue;
+        bad += 1;
+        std.debug.print("redirect {s}: {s}\n  go:   {d} loc={?s} ct={?s} body={f}\n  ours: {d} loc={?s} ct={?s} body={f}\n", .{
+            c.id,                     if (agrees) "agrees now, drop its divergence entry" else "diverges",
+            c.status,                 c.out_location,
+            c.content_type,           std.zig.fmtString(c.body),
+            w.status,                 w.header("location"),
+            w.header("content-type"), std.zig.fmtString(w.body),
+        });
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "go oracle helpers: writeError/notFound answer as http.Error/NotFound" {
+    for (vectors.errors) |c| {
+        var out_buf: [4096]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        var body_buf: [1024]u8 = undefined;
+        var chunk_buf: [64]u8 = undefined;
+        var rw: Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        for (c.preset) |h| try rw.setHeader(h[0], h[1]);
+        if (c.not_found) try rw.notFound() else try rw.writeError(c.code, c.message);
+        try rw.end();
+        const w = Written.of(out.buffered());
+        errdefer std.debug.print("error {s}:\n{s}\n", .{ c.id, out.buffered() });
+        try testing.expectEqual(c.status, w.status);
+        try testing.expectEqualStrings(c.body, w.body);
+        // Every header Go kept, with Go's value; nothing else but the
+        // framing `Content-Length` the writer computes at the end (Go's
+        // server adds that at write time too, its recorder does not).
+        for (c.headers) |h| try testing.expectEqualStrings(h[1], w.header(h[0]) orelse return error.TestMissingHeader);
+        try testing.expectEqual(c.headers.len + 1, w.headerCount());
+        var cl_buf: [20]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&cl_buf, "{d}", .{c.body.len}), w.header("content-length").?);
+    }
+}
+
+test "go oracle helpers: basicAuth answers as Request.BasicAuth" {
+    for (vectors.basic_auth) |c| {
+        var out: [256]u8 = undefined;
+        const got = http.basicAuth(c.authorization, &out);
+        errdefer std.debug.print("basic auth {f}: go ok={} user={f} pass={f}, ours {?any}\n", .{
+            std.zig.fmtString(c.authorization), c.ok, std.zig.fmtString(c.user), std.zig.fmtString(c.password), got,
+        });
+        try testing.expectEqual(c.ok, got != null);
+        if (got) |g| {
+            try testing.expectEqualStrings(c.user, g.user);
+            try testing.expectEqualStrings(c.password, g.password);
+        }
+    }
+}

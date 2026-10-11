@@ -644,3 +644,108 @@ pub const rproxy = [_]RProxyCase{
     .{ .id = "resp-set-cookie-two", .wire = "GET /p?q=1 HTTP/1.1\r\nHost: front.example\r\nAccept-Encoding: identity\r\n\r\n", .resp_extra = "Set-Cookie: a=1\r\nSet-Cookie: b=2\r\n", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: front.example", "x-forwarded-for: 127.0.0.1" }, .up_body = "", .status = 200, .down = &.{ "content-type: text/plain", "set-cookie: a=1", "set-cookie: b=2" } },
     .{ .id = "resp-te", .wire = "GET /p?q=1 HTTP/1.1\r\nHost: front.example\r\nAccept-Encoding: identity\r\n\r\n", .resp_extra = "TE: trailers\r\n", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: front.example", "x-forwarded-for: 127.0.0.1" }, .up_body = "", .status = 200, .down = &.{"content-type: text/plain"} },
 };
+
+pub const RedirectCase = struct {
+    id: []const u8,
+    method: []const u8,
+    target: []const u8,
+    location: []const u8,
+    code: u16,
+    preset_ct: bool,
+    /// What Go's recorder holds after http.Redirect.
+    status: u16,
+    out_location: ?[]const u8,
+    content_type: ?[]const u8,
+    body: []const u8,
+};
+
+/// Go's http.Redirect.
+pub const redirect = [_]RedirectCase{
+    .{ .id = "abs-path", .method = "GET", .target = "/a/b", .location = "/x", .code = 302, .preset_ct = false, .status = 302, .out_location = "/x", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/x\">Found</a>.\n\n" },
+    .{ .id = "abs-path-301", .method = "GET", .target = "/a/b", .location = "/x", .code = 301, .preset_ct = false, .status = 301, .out_location = "/x", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/x\">Moved Permanently</a>.\n\n" },
+    .{ .id = "abs-path-303", .method = "POST", .target = "/a/b", .location = "/x", .code = 303, .preset_ct = false, .status = 303, .out_location = "/x", .content_type = null, .body = "" },
+    .{ .id = "abs-path-307", .method = "GET", .target = "/a/b", .location = "/x", .code = 307, .preset_ct = false, .status = 307, .out_location = "/x", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/x\">Temporary Redirect</a>.\n\n" },
+    .{ .id = "abs-path-308", .method = "GET", .target = "/a/b", .location = "/x", .code = 308, .preset_ct = false, .status = 308, .out_location = "/x", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/x\">Permanent Redirect</a>.\n\n" },
+    .{ .id = "rel-sibling", .method = "GET", .target = "/a/b", .location = "c", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a/c", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a/c\">Found</a>.\n\n" },
+    .{ .id = "rel-sibling-dir", .method = "GET", .target = "/a/b/", .location = "c", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a/b/c", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a/b/c\">Found</a>.\n\n" },
+    .{ .id = "rel-dotdot", .method = "GET", .target = "/a/b/c", .location = "../d", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a/d", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a/d\">Found</a>.\n\n" },
+    .{ .id = "rel-dotdot-past-root", .method = "GET", .target = "/a", .location = "../../d", .code = 302, .preset_ct = false, .status = 302, .out_location = "/d", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/d\">Found</a>.\n\n" },
+    .{ .id = "rel-dot", .method = "GET", .target = "/a/b", .location = "./d", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a/d", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a/d\">Found</a>.\n\n" },
+    .{ .id = "rel-trailing-slash", .method = "GET", .target = "/a/b", .location = "d/", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a/d/", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a/d/\">Found</a>.\n\n" },
+    .{ .id = "abs-trailing-slash", .method = "GET", .target = "/a/b", .location = "/d/", .code = 302, .preset_ct = false, .status = 302, .out_location = "/d/", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/d/\">Found</a>.\n\n" },
+    .{ .id = "abs-clean", .method = "GET", .target = "/", .location = "/a//b/./c/../d", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a/b/d", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a/b/d\">Found</a>.\n\n" },
+    .{ .id = "rel-query", .method = "GET", .target = "/a/b", .location = "c?x=1&y=../z", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a/c?x=1&y=../z", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a/c?x=1&amp;y=../z\">Found</a>.\n\n" },
+    .{ .id = "abs-query", .method = "GET", .target = "/a/b", .location = "/c/../d?q=/../", .code = 302, .preset_ct = false, .status = 302, .out_location = "/d?q=/../", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/d?q=/../\">Found</a>.\n\n" },
+    .{ .id = "rel-query-only", .method = "GET", .target = "/a/b", .location = "?x=1", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a/?x=1", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a/?x=1\">Found</a>.\n\n" },
+    .{ .id = "rel-fragment", .method = "GET", .target = "/a/b", .location = "c#frag", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a/c#frag", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a/c#frag\">Found</a>.\n\n" },
+    .{ .id = "empty-location", .method = "GET", .target = "/a/b", .location = "", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a/", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a/\">Found</a>.\n\n" },
+    .{ .id = "root", .method = "GET", .target = "/", .location = "x", .code = 302, .preset_ct = false, .status = 302, .out_location = "/x", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/x\">Found</a>.\n\n" },
+    .{ .id = "absolute-url", .method = "GET", .target = "/a", .location = "https://example.com/p?q=1", .code = 302, .preset_ct = false, .status = 302, .out_location = "https://example.com/p?q=1", .content_type = "text/html; charset=utf-8", .body = "<a href=\"https://example.com/p?q=1\">Found</a>.\n\n" },
+    .{ .id = "absolute-url-dots", .method = "GET", .target = "/a", .location = "https://example.com/a/../b", .code = 302, .preset_ct = false, .status = 302, .out_location = "https://example.com/a/../b", .content_type = "text/html; charset=utf-8", .body = "<a href=\"https://example.com/a/../b\">Found</a>.\n\n" },
+    .{ .id = "scheme-relative", .method = "GET", .target = "/a", .location = "//example.com/p", .code = 302, .preset_ct = false, .status = 302, .out_location = "//example.com/p", .content_type = "text/html; charset=utf-8", .body = "<a href=\"//example.com/p\">Found</a>.\n\n" },
+    .{ .id = "mailto", .method = "GET", .target = "/a", .location = "mailto:x@example.com", .code = 302, .preset_ct = false, .status = 302, .out_location = "mailto:x@example.com", .content_type = "text/html; charset=utf-8", .body = "<a href=\"mailto:x@example.com\">Found</a>.\n\n" },
+    .{ .id = "non-ascii", .method = "GET", .target = "/a", .location = "/\xc4\x8d/x", .code = 302, .preset_ct = false, .status = 302, .out_location = "/%c4%8d/x", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/\xc4\x8d/x\">Found</a>.\n\n" },
+    .{ .id = "percent-kept", .method = "GET", .target = "/a", .location = "/%C4%8D/%2F", .code = 302, .preset_ct = false, .status = 302, .out_location = "/%C4%8D/%2F", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/%C4%8D/%2F\">Found</a>.\n\n" },
+    .{ .id = "html-escape", .method = "GET", .target = "/a", .location = "/x?a=<b>&c=\"d\"'", .code = 302, .preset_ct = false, .status = 302, .out_location = "/x?a=<b>&c=\"d\"'", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/x?a=&lt;b&gt;&amp;c=&#34;d&#34;&#39;\">Found</a>.\n\n" },
+    .{ .id = "space", .method = "GET", .target = "/a", .location = "/a b", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a b", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a b\">Found</a>.\n\n" },
+    .{ .id = "head", .method = "HEAD", .target = "/a/b", .location = "/x", .code = 302, .preset_ct = false, .status = 302, .out_location = "/x", .content_type = "text/html; charset=utf-8", .body = "" },
+    .{ .id = "post", .method = "POST", .target = "/a/b", .location = "/x", .code = 302, .preset_ct = false, .status = 302, .out_location = "/x", .content_type = null, .body = "" },
+    .{ .id = "put-307", .method = "PUT", .target = "/a/b", .location = "/x", .code = 307, .preset_ct = false, .status = 307, .out_location = "/x", .content_type = null, .body = "" },
+    .{ .id = "preset-ct-get", .method = "GET", .target = "/a/b", .location = "/x", .code = 302, .preset_ct = true, .status = 302, .out_location = "/x", .content_type = "text/plain", .body = "" },
+    .{ .id = "preset-ct-head", .method = "HEAD", .target = "/a/b", .location = "/x", .code = 302, .preset_ct = true, .status = 302, .out_location = "/x", .content_type = "text/plain", .body = "" },
+    .{ .id = "colon-in-path", .method = "GET", .target = "/a", .location = "/b:c", .code = 302, .preset_ct = false, .status = 302, .out_location = "/b:c", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/b:c\">Found</a>.\n\n" },
+    .{ .id = "rel-colon-first", .method = "GET", .target = "/a/b", .location = "c:d", .code = 302, .preset_ct = false, .status = 302, .out_location = "c:d", .content_type = "text/html; charset=utf-8", .body = "<a href=\"c:d\">Found</a>.\n\n" },
+    .{ .id = "rel-colon-after-slash", .method = "GET", .target = "/a/b", .location = "./c:d", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a/c:d", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a/c:d\">Found</a>.\n\n" },
+    .{ .id = "backslash-abs", .method = "GET", .target = "/a", .location = "/\\example.com", .code = 302, .preset_ct = false, .status = 302, .out_location = "/\\example.com", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/\\example.com\">Found</a>.\n\n" },
+    .{ .id = "backslash-rel", .method = "GET", .target = "/a/b", .location = "c\\d", .code = 302, .preset_ct = false, .status = 302, .out_location = "/a/c\\d", .content_type = "text/html; charset=utf-8", .body = "<a href=\"/a/c\\d\">Found</a>.\n\n" },
+};
+
+pub const ErrorCase = struct {
+    id: []const u8,
+    message: []const u8,
+    code: u16,
+    preset: []const [2][]const u8,
+    not_found: bool,
+    status: u16,
+    /// Every response header after the call, names canonical, sorted.
+    headers: []const [2][]const u8,
+    body: []const u8,
+};
+
+/// Go's http.Error / http.NotFound.
+pub const errors = [_]ErrorCase{
+    .{ .id = "plain-500", .message = "boom", .code = 500, .preset = &.{}, .not_found = false, .status = 500, .headers = &.{ .{ "Content-Type", "text/plain; charset=utf-8" }, .{ "X-Content-Type-Options", "nosniff" } }, .body = "boom\n" },
+    .{ .id = "plain-400", .message = "bad request", .code = 400, .preset = &.{}, .not_found = false, .status = 400, .headers = &.{ .{ "Content-Type", "text/plain; charset=utf-8" }, .{ "X-Content-Type-Options", "nosniff" } }, .body = "bad request\n" },
+    .{ .id = "empty-message", .message = "", .code = 503, .preset = &.{}, .not_found = false, .status = 503, .headers = &.{ .{ "Content-Type", "text/plain; charset=utf-8" }, .{ "X-Content-Type-Options", "nosniff" } }, .body = "\n" },
+    .{ .id = "message-newline", .message = "line1\nline2", .code = 422, .preset = &.{}, .not_found = false, .status = 422, .headers = &.{ .{ "Content-Type", "text/plain; charset=utf-8" }, .{ "X-Content-Type-Options", "nosniff" } }, .body = "line1\nline2\n" },
+    .{ .id = "html-not-escaped", .message = "<b>x</b>", .code = 400, .preset = &.{}, .not_found = false, .status = 400, .headers = &.{ .{ "Content-Type", "text/plain; charset=utf-8" }, .{ "X-Content-Type-Options", "nosniff" } }, .body = "<b>x</b>\n" },
+    .{ .id = "preset-headers", .message = "boom", .code = 500, .preset = &.{ .{ "Content-Length", "123" }, .{ "Content-Type", "application/json" }, .{ "Content-Encoding", "gzip" }, .{ "Etag", "\"v1\"" }, .{ "Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT" }, .{ "Cache-Control", "max-age=60" }, .{ "X-Custom", "kept" } }, .not_found = false, .status = 500, .headers = &.{ .{ "Cache-Control", "max-age=60" }, .{ "Content-Encoding", "gzip" }, .{ "Content-Type", "text/plain; charset=utf-8" }, .{ "Etag", "\"v1\"" }, .{ "Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT" }, .{ "X-Content-Type-Options", "nosniff" }, .{ "X-Custom", "kept" } }, .body = "boom\n" },
+    .{ .id = "not-found", .message = "", .code = 0, .preset = &.{}, .not_found = true, .status = 404, .headers = &.{ .{ "Content-Type", "text/plain; charset=utf-8" }, .{ "X-Content-Type-Options", "nosniff" } }, .body = "404 page not found\n" },
+};
+
+pub const BasicAuthCase = struct { authorization: []const u8, ok: bool, user: []const u8, password: []const u8 };
+
+/// Go's Request.BasicAuth.
+pub const basic_auth = [_]BasicAuthCase{
+    .{ .authorization = "Basic dXNlcjpwYXNz", .ok = true, .user = "user", .password = "pass" },
+    .{ .authorization = "basic dXNlcjpwYXNz", .ok = true, .user = "user", .password = "pass" },
+    .{ .authorization = "BASIC dXNlcjpwYXNz", .ok = true, .user = "user", .password = "pass" },
+    .{ .authorization = "Basic  dXNlcjpwYXNz", .ok = false, .user = "", .password = "" },
+    .{ .authorization = "Basic\tdXNlcjpwYXNz", .ok = false, .user = "", .password = "" },
+    .{ .authorization = "Basic dXNlcjpwYXNz ", .ok = false, .user = "", .password = "" },
+    .{ .authorization = "Basic dXNlcg==", .ok = false, .user = "", .password = "" },
+    .{ .authorization = "Basic OnBhc3M=", .ok = true, .user = "", .password = "pass" },
+    .{ .authorization = "Basic dXNlcjo=", .ok = true, .user = "user", .password = "" },
+    .{ .authorization = "Basic Og==", .ok = true, .user = "", .password = "" },
+    .{ .authorization = "Basic dTpwOnE=", .ok = true, .user = "u", .password = "p:q" },
+    .{ .authorization = "Basic dXNlcjpwYXNz=", .ok = false, .user = "", .password = "" },
+    .{ .authorization = "Basic dXNlcjpwYXN", .ok = false, .user = "", .password = "" },
+    .{ .authorization = "Basic !!!", .ok = false, .user = "", .password = "" },
+    .{ .authorization = "Basic ", .ok = false, .user = "", .password = "" },
+    .{ .authorization = "Basic", .ok = false, .user = "", .password = "" },
+    .{ .authorization = "Bearer dXNlcjpwYXNz", .ok = false, .user = "", .password = "" },
+    .{ .authorization = "Basic xJ06xI0=", .ok = true, .user = "\xc4\x9d", .password = "\xc4\x8d" },
+    .{ .authorization = "Basic /w==", .ok = false, .user = "", .password = "" },
+    .{ .authorization = "Basic dXNlcjpwYXNz,Basic eA==", .ok = false, .user = "", .password = "" },
+    .{ .authorization = "", .ok = false, .user = "", .password = "" },
+};

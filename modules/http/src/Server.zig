@@ -91,6 +91,7 @@ const testkit = @import("testkit");
 const builtin = @import("builtin");
 const http = @import("root.zig");
 const h1 = @import("h1.zig");
+const helpers = @import("helpers.zig");
 const h2 = @import("h2.zig");
 const h2s = @import("h2_server.zig");
 const gzip = @import("gzip.zig");
@@ -2176,6 +2177,34 @@ pub const Request = struct {
         return req.head.iterate();
     }
 
+    /// Every value of header `name` (case-insensitive), one per field line,
+    /// in wire order — Go's `Header.Values`. A comma-separated list in one
+    /// line comes back as that one line.
+    pub fn headerAll(req: *const Request, name: []const u8) HeaderValues {
+        return .{ .it = req.head.iterate(), .name = name };
+    }
+
+    pub const HeaderValues = struct {
+        it: h1.HeaderIterator,
+        name: []const u8,
+
+        pub fn next(v: *HeaderValues) ?[]const u8 {
+            while (v.it.next()) |e| if (std.ascii.eqlIgnoreCase(e.name, v.name)) return e.value;
+            return null;
+        }
+    };
+
+    /// HTTP Basic credentials from the `Authorization` header (RFC 7617), as
+    /// Go's `Request.BasicAuth`: scheme `Basic` in any case, one space,
+    /// padded standard base64, split at the first `:`. `out` receives the
+    /// decoded `user:password` (the header's length suffices); null when the
+    /// header is absent, another scheme, malformed, or longer than `out`.
+    /// Compare the password in constant time (`std.crypto.timing_safe.eql`
+    /// over equal-length digests), never with `mem.eql`.
+    pub fn basicAuth(req: *const Request, out: []u8) ?BasicCredentials {
+        return helpers.basicAuth(req.header("authorization") orelse return null, out);
+    }
+
     /// Streaming request-body reader — Content-Length / chunked framing
     /// already decoded, and (when `Options.max_decompressed_request_bytes`
     /// is enabled) a `Content-Encoding: gzip` body transparently
@@ -2227,6 +2256,76 @@ pub const Request = struct {
     /// The raw captured incoming chunked trailer block (see `trailer`).
     pub fn trailers(req: *const Request) []const u8 {
         return req.trailer_block orelse req.body.trailerBlock();
+    }
+};
+
+pub const BasicCredentials = helpers.BasicCredentials;
+
+/// A request body capped below the server's `max_body_bytes` for one
+/// handler — Go's `MaxBytesReader`. The handler owns the storage:
+///
+/// ```zig
+/// var limit: http.Server.BodyLimit = undefined;
+/// const r = limit.init(req, rw, 64 * 1024);
+/// const n = r.readSliceShort(&buf) catch |e| switch (e) {
+///     error.ReadFailed => if (limit.exceeded) return rw.writeError(413, "body too large") else return e,
+/// };
+/// ```
+///
+/// Reading past `max_bytes` fails with `error.ReadFailed` and sets
+/// `exceeded`; a declared `Content-Length` above it fails the first read
+/// before a byte is taken (and before a `100 Continue` invites the body).
+/// Either way the response closes the connection, as Go's does: the rest of
+/// the body is not drained. The limit only ever lowers the server's cap.
+pub const BodyLimit = struct {
+    max: u64,
+    remaining: u64,
+    rw: *ResponseWriter,
+    req: *Request,
+    exceeded: bool = false,
+    reader: Reader,
+
+    /// Not movable once `init` has returned the reader.
+    pub fn init(l: *BodyLimit, req: *Request, rw: *ResponseWriter, max_bytes: u64) *Reader {
+        l.* = .{
+            .max = max_bytes,
+            .remaining = max_bytes,
+            .rw = rw,
+            .req = req,
+            .reader = .{
+                .vtable = &.{ .stream = limitStream },
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+            },
+        };
+        return &l.reader;
+    }
+
+    fn trip(l: *BodyLimit) Reader.StreamError {
+        l.exceeded = true;
+        // Go: "it tells the ResponseWriter to close the connection".
+        l.rw.close_connection = true;
+        return error.ReadFailed;
+    }
+
+    fn limitStream(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+        const l: *BodyLimit = @alignCast(@fieldParentPtr("reader", r));
+        if (l.exceeded) return error.ReadFailed;
+        // A declared length over the cap is refused before the body reader
+        // is asked for, so no `100 Continue` invites it.
+        if (l.req.head.content_length) |d| if (d > l.max) return l.trip();
+        const inner = l.req.reader();
+        if (l.remaining == 0) {
+            // At the cap: the end of the body is fine, one octet more is not.
+            // `discard` rather than `peek`, which needs a buffer the body
+            // reader may not have; the connection closes either way.
+            _ = inner.discard(.limited(1)) catch |e| return e;
+            return l.trip();
+        }
+        const n = try inner.stream(w, limit.min(.limited64(l.remaining)));
+        l.remaining -= n;
+        return n;
     }
 };
 
@@ -2952,6 +3051,118 @@ pub const ResponseWriter = struct {
         // and gets the same stable storage every other header value gets.
         rw.headers[rw.headers_len] = .{ .name = "Set-Cookie", .value = try rw.dupe(value) };
         rw.headers_len += 1;
+    }
+
+    /// Add another line for `name` without replacing the ones set before —
+    /// Go's `Header.Add` (`Vary`, `Link`, `Cache-Control` …; `Set-Cookie` has
+    /// `addSetCookie`). Same validation and storage as `setHeader`; a managed
+    /// name (`Content-Length`, `Transfer-Encoding`, `Trailer`, `Connection`)
+    /// cannot repeat, so it is handed to `setHeader`.
+    pub fn addHeader(rw: *ResponseWriter, name: []const u8, value: []const u8) SetHeaderError!void {
+        if (rw.sent_head) return error.HeadersSent;
+        if (!validHeaderName(name) or !validHeaderValue(value)) return error.InvalidHeader;
+        if (managedHeader(name)) return rw.setHeader(name, value);
+        if (rw.headers_len == max_response_headers) return error.TooManyHeaders;
+        const mark = rw.header_buf_len;
+        errdefer rw.header_buf_len = mark;
+        const n = try rw.dupe(name);
+        const v = try rw.dupe(value);
+        rw.headers[rw.headers_len] = .{ .name = n, .value = v };
+        rw.headers_len += 1;
+    }
+
+    /// The first value set for `name` (case-insensitive) so far, or null —
+    /// Go's `Header().Get` on a response. Managed headers the writer keeps
+    /// out of the table (`Content-Length`, `Transfer-Encoding`, `Connection`)
+    /// read as null; `Date`/`Server` added at write time likewise.
+    pub fn getHeader(rw: *const ResponseWriter, name: []const u8) ?[]const u8 {
+        for (rw.headers[0..rw.headers_len]) |hd| if (std.ascii.eqlIgnoreCase(hd.name, name)) return hd.value;
+        return null;
+    }
+
+    /// Remove every line set for `name` — Go's `Header.Del`. `Content-Length`
+    /// forgets the declared length; `Trailer` withdraws the advert and every
+    /// declared trailer with it. `Connection` and `Transfer-Encoding` are the
+    /// server's to decide and are left alone. The header storage the removed
+    /// lines used is not reclaimed.
+    pub fn delHeader(rw: *ResponseWriter, name: []const u8) error{HeadersSent}!void {
+        if (rw.sent_head) return error.HeadersSent;
+        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            rw.declared_len = null;
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "connection") or std.ascii.eqlIgnoreCase(name, "transfer-encoding")) return;
+        if (std.ascii.eqlIgnoreCase(name, "trailer")) {
+            rw.declared_trailers_len = 0;
+            rw.trailer_decl_len = 0;
+        }
+        var w: usize = 0;
+        for (rw.headers[0..rw.headers_len]) |hd| {
+            if (std.ascii.eqlIgnoreCase(hd.name, name)) continue;
+            rw.headers[w] = hd;
+            w += 1;
+        }
+        rw.headers_len = w;
+    }
+
+    fn managedHeader(name: []const u8) bool {
+        for ([_][]const u8{ "content-length", "transfer-encoding", "trailer", "connection" }) |m|
+            if (std.ascii.eqlIgnoreCase(name, m)) return true;
+        return false;
+    }
+
+    pub const RedirectError = SetHeaderError || Writer.Error || helpers.LocationError || error{
+        /// `status` is not a 3xx code.
+        BadStatus,
+    };
+
+    /// Answer `req` with a redirect to `location` — Go's `http.Redirect`,
+    /// held to its answers by the Go oracle. A path-only location is resolved
+    /// against `req.path` and cleaned (`c` from `/a/b` → `/a/c`, `../d`,
+    /// `?q=1`, a trailing slash kept); a location with a scheme or a host is
+    /// sent as given. Non-ASCII is percent-encoded in the header. Unless a
+    /// `Content-Type` was set, a GET gets a short HTML body linking to the
+    /// target (and GET/HEAD the `text/html` type), as Go writes it.
+    ///
+    /// Stricter than Go in one place: a location resolving to `/\…`, which
+    /// browsers follow to another host, is `error.InvalidLocation`.
+    /// `req.path` is the raw (still percent-encoded) path, where Go joins to
+    /// the decoded one; the two differ only for an encoded `/` in the path.
+    pub fn redirect(rw: *ResponseWriter, req: *const Request, location: []const u8, status: u16) RedirectError!void {
+        if (status < 300 or status > 399) return error.BadStatus;
+        if (rw.sent_head) return error.HeadersSent;
+        var buf: [helpers.redirect_buf_len]u8 = undefined;
+        const loc = try helpers.redirectLocation(req.path, location, &buf);
+        try rw.setHeader("Location", loc.header);
+        const had_ct = rw.getHeader("content-type") != null;
+        if (!had_ct and (req.method == .get or req.method == .head))
+            try rw.setHeaderStatic("Content-Type", "text/html; charset=utf-8");
+        rw.setStatus(status);
+        if (!had_ct and req.method == .get) {
+            try rw.interface.writeAll("<a href=\"");
+            try helpers.writeHtmlEscaped(&rw.interface, loc.href);
+            try rw.interface.print("\">{s}</a>.\n\n", .{reasonPhrase(status)});
+        }
+    }
+
+    /// Answer with `status` and the plain-text `message` — Go's `http.Error`:
+    /// a declared `Content-Length` is dropped, `Content-Type: text/plain;
+    /// charset=utf-8` and `X-Content-Type-Options: nosniff` are set, the
+    /// message is written with a newline after it. Other headers the handler
+    /// set stay, as in Go. For JSON errors use `http.problem`.
+    pub fn writeError(rw: *ResponseWriter, status: u16, message: []const u8) (SetHeaderError || Writer.Error)!void {
+        if (rw.sent_head) return error.HeadersSent;
+        rw.declared_len = null;
+        try rw.setHeaderStatic("Content-Type", "text/plain; charset=utf-8");
+        try rw.setHeaderStatic("X-Content-Type-Options", "nosniff");
+        rw.setStatus(status);
+        try rw.interface.writeAll(message);
+        try rw.interface.writeByte('\n');
+    }
+
+    /// `writeError(404, "404 page not found")` — Go's `http.NotFound`.
+    pub fn notFound(rw: *ResponseWriter) (SetHeaderError || Writer.Error)!void {
+        return rw.writeError(404, "404 page not found");
     }
 
     pub const TrailerError = error{
@@ -4117,6 +4328,36 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         try rw.setHeader("Content-Type", "text/plain");
         if (req.query.len != 0) try rw.setHeader("X-Query", req.query);
         try rw.writeAll("hello");
+    } else if (std.mem.eql(u8, req.path, "/limit8")) {
+        // Go `MaxBytesReader`: 8 octets, a 413 of the handler's own over it.
+        var limit: BodyLimit = undefined;
+        const r = limit.init(req, rw, 8);
+        var buf: [64]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        _ = r.streamRemaining(&w) catch |e| switch (e) {
+            error.ReadFailed => return if (limit.exceeded) rw.writeError(413, "too large") else e,
+            else => return e,
+        };
+        try rw.writeAll(w.buffered());
+    } else if (std.mem.eql(u8, req.path, "/hdrs")) {
+        try rw.addHeader("Vary", "Accept");
+        try rw.addHeader("vary", "Origin");
+        try rw.setHeader("X-Gone", "1");
+        try rw.addHeader("X-Gone", "2");
+        try rw.delHeader("x-gone");
+        try rw.setHeader("X-First", rw.getHeader("VARY") orelse "none");
+        try rw.addHeader("Content-Length", "2"); // managed: replaces, never repeats
+        try rw.writeAll("ok");
+    } else if (std.mem.eql(u8, req.path, "/whoami")) {
+        var cred_buf: [128]u8 = undefined;
+        const c = req.basicAuth(&cred_buf) orelse {
+            try rw.setHeader("WWW-Authenticate", "Basic realm=\"t\"");
+            return rw.writeError(401, "who?");
+        };
+        try rw.writer().print("{s}|{s}", .{ c.user, c.password });
+    } else if (std.mem.eql(u8, req.path, "/vals")) {
+        var it = req.headerAll("x-v");
+        while (it.next()) |v| try rw.writer().print("[{s}]", .{v});
     } else if (std.mem.eql(u8, req.path, "/answer-then-read")) {
         // The final head goes out first, the body is read after: a pending
         // `100 Continue` must not follow a final response.
@@ -4714,6 +4955,93 @@ test "serveStream: HTTP/1.0 keep-alive persists with a known length, closes with
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, once, "HTTP/1.1 200 OK\r\n"));
         try testing.expect(std.mem.indexOf(u8, once, "Connection: close\r\n") != null);
     }
+}
+
+test "addHeader repeats, delHeader removes every line, getHeader reads the first; managed names never repeat" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStream(null, "GET /hdrs HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, got, "Vary: Accept\r\nvary: Origin\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "X-Gone") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "X-First: Accept\r\n") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "Content-Length: 2\r\n"));
+    try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nok"));
+}
+
+test "addHeader: same validation and budget as setHeader, and a refused pair leaves the budget as it was" {
+    var out_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try testing.expectError(error.InvalidHeader, rw.addHeader("X-A", "a\r\nInjected: 1"));
+    try testing.expectError(error.InvalidHeader, rw.addHeader("Bad Name", "v"));
+    const before = rw.header_buf_len;
+    var big: [header_copy_bytes]u8 = @splat('x');
+    try testing.expectError(error.HeaderBytesExhausted, rw.addHeader("X-Big", &big));
+    try testing.expectEqual(before, rw.header_buf_len);
+    for (0..max_response_headers) |_| try rw.addHeader("X-N", "1");
+    try testing.expectError(error.TooManyHeaders, rw.addHeader("X-N", "1"));
+    try rw.delHeader("x-n");
+    try rw.addHeader("X-N", "again");
+    try testing.expectEqualStrings("again", rw.getHeader("x-n").?);
+    try rw.end();
+    try testing.expectError(error.HeadersSent, rw.addHeader("X-Late", "1"));
+    try testing.expectError(error.HeadersSent, rw.delHeader("X-N"));
+}
+
+test "delHeader: Content-Length forgets the declared length, Trailer withdraws the declared trailers" {
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try rw.setHeader("Content-Length", "99");
+    try rw.delHeader("Content-Length");
+    try rw.declareTrailers(&.{"X-Sum"});
+    try rw.delHeader("trailer");
+    try testing.expectError(error.TrailerNotDeclared, rw.setTrailer("X-Sum", "1"));
+    try rw.writeAll("abc");
+    try rw.end();
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "Content-Length: 3\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "Trailer") == null);
+}
+
+test "BodyLimit: under, exactly at and over the cap; a declared length over it never invites the body" {
+    var out_buf: [4096]u8 = undefined;
+    // Under and exactly at the cap: echoed, the connection stays open.
+    for ([_][]const u8{ "1234567", "12345678" }) |b| {
+        var wire_buf: [256]u8 = undefined;
+        const wire = try std.fmt.bufPrint(&wire_buf, "POST /limit8 HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n{s}GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ b.len, b });
+        const got = runStream(null, wire, &out_buf);
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "HTTP/1.1 200 OK"));
+        try testing.expect(std.mem.indexOf(u8, got, b) != null);
+    }
+    // Chunked over the cap: the handler's 413, then the connection closes.
+    const chunked = runStream(null, "POST /limit8 HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\n12345\r\n5\r\n67890\r\n0\r\n\r\nGET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, chunked, "HTTP/1.1 413 "));
+    try testing.expect(std.mem.indexOf(u8, chunked, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, chunked, "12345") == null); // nothing past the cap echoed
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, chunked, "HTTP/1.1 "));
+    // Declared over the cap with Expect: 100-continue: refused, never invited.
+    var out_buf2: [4096]u8 = undefined;
+    const declared = runStream(null, "POST /limit8 HTTP/1.1\r\nHost: t\r\nContent-Length: 9\r\nExpect: 100-continue\r\n\r\n", &out_buf2);
+    try testing.expect(std.mem.startsWith(u8, declared, "HTTP/1.1 413 "));
+    try testing.expect(std.mem.indexOf(u8, declared, "100 Continue") == null);
+}
+
+test "Request.basicAuth and headerAll through serveStream" {
+    var out_buf: [4096]u8 = undefined;
+    const ok = runStream(null, "GET /whoami HTTP/1.1\r\nHost: t\r\nAuthorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.endsWith(u8, ok, "\r\n\r\nAladdin|open sesame"));
+    var out_buf2: [4096]u8 = undefined;
+    const no = runStream(null, "GET /whoami HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer x\r\nConnection: close\r\n\r\n", &out_buf2);
+    try testing.expect(std.mem.startsWith(u8, no, "HTTP/1.1 401 "));
+    try testing.expect(std.mem.indexOf(u8, no, "X-Content-Type-Options: nosniff\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, no, "who?\n"));
+    var out_buf3: [4096]u8 = undefined;
+    const vals = runStream(null, "GET /vals HTTP/1.1\r\nHost: t\r\nX-V: a\r\nX-Other: z\r\nx-v: b, c\r\nConnection: close\r\n\r\n", &out_buf3);
+    try testing.expect(std.mem.endsWith(u8, vals, "[a][b, c]"));
 }
 
 test "ResponseWriter: standalone against any writer (no socket, no loop)" {

@@ -368,6 +368,18 @@ HEADERS frame is materialized into it once the body ends.
   Both default to their historical always-on behavior, and both are also
   available on the socket-free codec (`StreamOptions.server_name = null` /
   `.now = null`), which the socket path now agrees with byte-for-byte.
+- **Handler helpers (Go's, held to Go by the oracle):** `rw.addHeader`
+  (another line, Go `Header.Add`), `rw.getHeader`, `rw.delHeader`;
+  `rw.redirect(req, location, status)` (Go `http.Redirect`: a relative
+  location is joined to the request path and cleaned, non-ASCII escaped, a
+  GET gets the small HTML body; a location resolving to `/\host` is refused);
+  `rw.writeError(status, msg)` / `rw.notFound()` (Go `http.Error`/`NotFound`:
+  plain text, `nosniff`, a declared length dropped); `req.headerAll(name)`
+  (every line, Go `Header.Values`); `req.basicAuth(&buf)` and
+  `http.basicAuthHeader` for the client (RFC 7617 as Go reads it);
+  `Server.BodyLimit` (Go `MaxBytesReader`: a per-handler cap below
+  `max_body_bytes`, a declared length over it refused before `100 Continue`,
+  the connection closed after it trips).
 - **Errors:** malformed head → 400; oversized head → 431; over-long
   request line → 414; oversized body → 413; unsupported HTTP version →
   505; unknown method token → 501; missing Host on 1.1 → 400;

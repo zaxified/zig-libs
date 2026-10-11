@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Handler helpers at Go parity (S2 survey R3), additive.** `ResponseWriter.addHeader`
+  / `getHeader` / `delHeader` (Go `Header.Add/Get/Del`), `redirect` (Go `http.Redirect`: relative
+  locations joined to the request path and cleaned as `path.Clean`, non-ASCII percent-encoded in the
+  header, the HTML body on GET; stricter than Go: a location resolving to `/\host` is
+  `error.InvalidLocation`), `writeError` / `notFound` (Go `http.Error`/`NotFound`),
+  `Request.headerAll` (Go `Header.Values`), `Request.basicAuth` + `http.basicAuth` /
+  `http.basicAuthHeader` (Go `BasicAuth`/`SetBasicAuth`), `Server.BodyLimit` (Go `MaxBytesReader`).
+  New Go oracle area `helpers` (`tools/go_oracle/helpers.go`), new fuzz harness `http-helpers`.
+
 - **2026-10-12** — **Behaviour change + source break, Go parity (S2 survey R6).** (1) `multipart`: a
   `Content-Disposition` that names any parameter twice (case-insensitive) is dropped as a whole — the
   part has no `name`/`filename` — as Go's `mime.ParseMediaType` refuses it; two parsers can no longer

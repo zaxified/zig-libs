@@ -170,6 +170,15 @@ pub const gzip = @import("gzip.zig");
 /// error body — standard members + caller extensions, always valid UTF-8.
 pub const problem = @import("problem.zig");
 
+const helpers = @import("helpers.zig");
+
+/// HTTP Basic credentials out of an `Authorization` value (RFC 7617), as Go's
+/// `Request.BasicAuth` — the server side is `Server.Request.basicAuth`.
+pub const basicAuth = helpers.basicAuth;
+/// The `Authorization: Basic …` value for a client request (Go's `SetBasicAuth`).
+pub const basicAuthHeader = helpers.basicAuthHeader;
+pub const BasicCredentials = helpers.BasicCredentials;
+
 // ── request vocabulary ──────────────────────────────────────────────────────
 
 pub const Method = enum {
@@ -502,6 +511,7 @@ test {
     _ = range;
     _ = conneg;
     _ = problem;
+    _ = helpers;
     _ = curl_interop;
     _ = gzip_interop;
     _ = h11_interop;
