@@ -44,6 +44,37 @@ pub const Change = union(enum) {
     del: []const u8,
 };
 
+/// One tree's share of a commit: its plain key `changes`, and the buckets
+/// directly inside it that change (`subs`, at most one per name). The top
+/// level is the store's own tree; a bucket's `Sub.Keep.tree` is its nested
+/// one, to any depth.
+pub const Tree = struct {
+    changes: []const Change = &.{},
+    subs: []const Sub = &.{},
+
+    fn isEmpty(t: Tree) bool {
+        return t.changes.len == 0 and t.subs.len == 0;
+    }
+};
+
+/// A bucket that changes in a commit.
+pub const Sub = struct {
+    name: []const u8,
+    /// The root of an existing nested tree to free whole -- every page of it,
+    /// its overflow chains and the buckets inside it: the bucket was deleted,
+    /// or deleted and created again.
+    drop: ?PageId = null,
+    /// The bucket as the commit leaves it; null = gone (its cell is removed).
+    keep: ?Keep = null,
+
+    pub const Keep = struct {
+        /// The nested tree `tree` applies to; null = a new, empty bucket.
+        base_root: ?PageId,
+        seq: u64,
+        tree: Tree,
+    };
+};
+
 pub const CommitError = error{
     /// A storage side effect (write / fsync / …) failed mid-commit. The store
     /// is left with a committed version that `recover` will adopt — never a
@@ -85,6 +116,12 @@ pub const CommitError = error{
     /// of `error.Locked` for a second `Db.open` over one file, which already
     /// had one.
     TxnInProgress,
+    /// `Db.begin` on a store opened with `Options.read_only`.
+    ReadOnly,
+    /// A plain put/delete reached a key that is a bucket, or a bucket was
+    /// created where a plain value is (bbolt's `ErrIncompatibleValue`).
+    /// Nothing was committed and the `Db` is not poisoned.
+    IncompatibleValue,
 };
 
 pub const RecoverError = error{
@@ -172,11 +209,11 @@ pub fn commit(
     scratch: *std.heap.ArenaAllocator,
     pager: *Pager,
     base: Meta,
-    changes: []const Change,
+    tree: Tree,
     oldest_reader_txn: u64,
     shrink_min_pages: u64,
 ) CommitError!Meta {
-    if (changes.len == 0) return base; // an empty txn commits nothing
+    if (tree.isEmpty()) return base; // an empty txn commits nothing
 
     // The caller's arena, reset and not freed: see `commit_scratch_retain`.
     defer _ = scratch.reset(.{ .retain_with_limit = commit_scratch_retain });
@@ -207,43 +244,8 @@ pub fn commit(
         .oldest_reader_txn = oldest_reader_txn,
     };
 
-    // Fold the ordered change list into one final op per key (last wins).
-    const ops = try reduceChanges(arena, changes);
-
-    // COW-apply down the tree; thread split separators back up, growing new
-    // root levels for as long as the previous level still split.
-    var pieces = try applyRec(&ctx, base.root, ops);
-    // An underfull root has no sibling to merge with: it is written as it is.
-    if (pieces.len == 1) if (pieces[0].pending) |node| {
-        pieces = try writeNode(&ctx, node);
-    };
-    if (pieces.len == 0) {
-        // Every key is gone (`applyRec` drops emptied nodes): the new tree is
-        // the same single empty leaf a fresh file starts with.
-        pieces = try finishNodes(format.LeafBuilder, &ctx, format.LeafBuilder.init(arena));
-    }
-    while (pieces.len > 1) {
-        var nb = format.BranchBuilder.init(arena, pieces[0].id);
-        for (pieces[1..]) |p|
-            nb.cells.append(arena, .{ .sep = p.sep, .child = p.id }) catch return error.OutOfMemory;
-        pieces = try finishNodes(format.BranchBuilder, &ctx, nb);
-    }
-    var new_root = pieces[0].id;
-    // Root collapse: once children were dropped or merged, the root may be a
-    // branch with a single child left, and so may that child. Each such level is
-    // replaced by its child. Only the root level ever goes, so every leaf
-    // stays at the same depth. The page given up is either one this commit
-    // wrote or a base page this commit makes unreachable; both are dead from
-    // the new tree on, which is what `ctx.freed` holds.
-    if (ctx.dropped) while (true) {
-        var rp: [page_size]u8 = undefined;
-        try readForCommit(pager, new_root, &rp);
-        if ((format.kindOf(&rp) orelse return error.Corrupt) != .branch) break;
-        const br = format.Branch.init(&rp);
-        if (br.count() != 0) break;
-        ctx.freed.append(arena, new_root) catch return error.OutOfMemory;
-        new_root = br.leftmost();
-    };
+    // COW-apply the whole batch, nested buckets first (see `applyTree`).
+    const new_root = try applyTree(&ctx, base.root, tree);
     const new_txn = base.txn_id + 1;
 
     // Every page in the old freelist chain is dead too (it was rebuilt above
@@ -292,7 +294,7 @@ pub fn commit(
         .high_water = pager.high_water,
         // Sticky (see `format.format_v3`): the first commit that writes an
         // overflow value moves the store to v3, and it stays there.
-        .version = if (ctx.wrote_overflow) format.format_v3 else base.version,
+        .version = format.versionFor(base.version, ctx.wrote_overflow, ctx.wrote_bucket),
     };
     new_meta.encode(&buf);
     // The slot `base` does NOT occupy (strict txn-parity alternation).
@@ -330,7 +332,9 @@ const Piece = struct { sep: []const u8, id: PageId, pending: ?Node = null };
 const Node = union(enum) { leaf: format.LeafBuilder, branch: format.BranchBuilder };
 
 /// The final effect on one key after folding a txn's ordered change list.
-const Op = struct { key: []const u8, val: ?[]const u8 };
+/// A `bucket` op puts a bucket cell (`val` = its `BucketHdr`) or removes one;
+/// a plain op must not meet a bucket cell, nor a bucket op a plain one.
+const Op = struct { key: []const u8, val: ?[]const u8, bucket: bool = false };
 
 const Ctx = struct {
     arena: Allocator,
@@ -345,6 +349,8 @@ const Ctx = struct {
     dropped: bool = false,
     /// This commit wrote an overflow value (the meta goes to `format_v3`).
     wrote_overflow: bool = false,
+    /// This commit wrote a bucket cell (the meta goes to `format_v4`).
+    wrote_bucket: bool = false,
 
     /// A fresh page for the new tree version: reuse a freed page only past
     /// the MVCC reclaim gate, otherwise grow the file.
@@ -363,7 +369,7 @@ fn readForCommit(pager: *Pager, id: PageId, buf: *[page_size]u8) CommitError!voi
 /// Fold `changes` (ordered, possibly repeating keys) into a sorted list of
 /// final per-key effects — last writer wins, exactly the reference `Model`'s
 /// semantics.
-fn reduceChanges(arena: Allocator, changes: []const Change) CommitError![]Op {
+fn reduceChanges(arena: Allocator, changes: []const Change) CommitError!std.ArrayList(Op) {
     var ops: std.ArrayList(Op) = .empty;
     for (changes) |c| {
         const key: []const u8, const val: ?[]const u8 = switch (c) {
@@ -390,7 +396,132 @@ fn reduceChanges(arena: Allocator, changes: []const Change) CommitError![]Op {
         else
             ops.insert(arena, lo, .{ .key = key, .val = val }) catch return error.OutOfMemory;
     }
-    return ops.items;
+    return ops;
+}
+
+/// COW-apply one tree's share of the commit and return its new root (the
+/// same page when nothing in it changed). The buckets inside it go first,
+/// each to its own new root, which then becomes an ordinary put of the
+/// bucket's cell in this tree -- so a change three buckets deep rewrites the
+/// path down to it in each of the three trees, and nothing else.
+///
+/// Every page this makes dead, a dropped bucket's whole tree included, goes
+/// to `ctx.freed`, and every page it writes comes from `ctx.allocPage`: the
+/// write/fsync order and the reclaim gate around it are `commit`'s, unchanged
+/// by how deep a tree sits.
+fn applyTree(ctx: *Ctx, root: ?PageId, tree: Tree) CommitError!PageId {
+    var ops = try reduceChanges(ctx.arena, tree.changes);
+    for (tree.subs) |sub| {
+        if (sub.drop) |r| try freeSubtree(ctx, r);
+        var op: Op = .{ .key = sub.name, .val = null, .bucket = true };
+        if (sub.keep) |k| {
+            const sub_root = try applyTree(ctx, k.base_root, k.tree);
+            const hdr = ctx.arena.create([format.bucket_hdr_len]u8) catch return error.OutOfMemory;
+            (format.BucketHdr{ .root = sub_root, .seq = k.seq }).encode(hdr);
+            op.val = hdr;
+            ctx.wrote_bucket = true;
+        }
+        // Sorted in among the plain ops; a plain change to the same key is a
+        // put or delete of a bucket, which `Txn` refuses before it gets here.
+        var lo: usize = 0;
+        var hi: usize = ops.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (std.mem.order(u8, ops.items[mid].key, op.key)) {
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+                .eq => return error.IncompatibleValue,
+            }
+        }
+        ops.insert(ctx.arena, lo, op) catch return error.OutOfMemory;
+    }
+    if (ops.items.len == 0) {
+        // A bucket whose keys did not change, only its sequence: an
+        // existing tree stays as it is; a new one is written as an empty
+        // leaf below.
+        if (root) |r| return r;
+    }
+
+    // `dropped` describes THIS tree's rebuild: the nested ones above are
+    // done and collapsed already.
+    ctx.dropped = false;
+    var pieces = if (root) |r|
+        try applyRec(ctx, r, ops.items)
+    else
+        try applyLeaf(ctx, format.LeafBuilder.init(ctx.arena), ops.items);
+    // An underfull root has no sibling to merge with: it is written as it is.
+    if (pieces.len == 1) if (pieces[0].pending) |node| {
+        pieces = try writeNode(ctx, node);
+    };
+    if (pieces.len == 0) {
+        // Every key is gone (`applyRec` drops emptied nodes): the new tree is
+        // the same single empty leaf a fresh file starts with.
+        pieces = try finishNodes(format.LeafBuilder, ctx, format.LeafBuilder.init(ctx.arena));
+    }
+    while (pieces.len > 1) {
+        var nb = format.BranchBuilder.init(ctx.arena, pieces[0].id);
+        for (pieces[1..]) |p|
+            nb.cells.append(ctx.arena, .{ .sep = p.sep, .child = p.id }) catch return error.OutOfMemory;
+        pieces = try finishNodes(format.BranchBuilder, ctx, nb);
+    }
+    var new_root = pieces[0].id;
+    // Root collapse: once children were dropped or merged, the root may be a
+    // branch with a single child left, and so may that child. Each such level is
+    // replaced by its child. Only the root level ever goes, so every leaf
+    // stays at the same depth. The page given up is either one this commit
+    // wrote or a base page this commit makes unreachable; both are dead from
+    // the new tree on, which is what `ctx.freed` holds.
+    if (ctx.dropped) while (true) {
+        var rp: [page_size]u8 = undefined;
+        try readForCommit(ctx.pager, new_root, &rp);
+        if ((format.kindOf(&rp) orelse return error.Corrupt) != .branch) break;
+        const br = format.Branch.init(&rp);
+        if (br.count() != 0) break;
+        ctx.freed.append(ctx.arena, new_root) catch return error.OutOfMemory;
+        new_root = br.leftmost();
+    };
+    return new_root;
+}
+
+/// Hand every page of the nested tree at `root` to `ctx.freed`: its nodes,
+/// its overflow chains and, recursively, the trees of the buckets inside it.
+/// A dropped bucket goes whole -- nothing of it survives into the new
+/// version, and an older snapshot that still reaches it is protected by the
+/// reclaim gate like any page this commit makes dead. Its pages are base
+/// pages and are read, not trusted: out of range, a cycle or a page of the
+/// wrong kind is corruption.
+fn freeSubtree(ctx: *Ctx, root: PageId) CommitError!void {
+    var stack: std.ArrayList(PageId) = .empty;
+    stack.append(ctx.arena, root) catch return error.OutOfMemory;
+    var visited: u64 = 0;
+    var page: [page_size]u8 = undefined;
+    while (stack.pop()) |id| {
+        visited += 1;
+        if (visited > ctx.pager.high_water) return error.Corrupt;
+        if (id < format.first_data_page or id >= ctx.pager.high_water) return error.Corrupt;
+        try readForCommit(ctx.pager, id, &page);
+        ctx.freed.append(ctx.arena, id) catch return error.OutOfMemory;
+        switch (format.kindOf(&page) orelse return error.Corrupt) {
+            .leaf => {
+                const leaf = format.Leaf.init(&page);
+                var i: usize = 0;
+                while (i < leaf.count()) : (i += 1) {
+                    if (leaf.ovfLen(i)) |len| {
+                        try freeOverflow(ctx, leaf.ovfFirst(i), len);
+                    } else if (leaf.isBucket(i)) {
+                        const hdr = format.BucketHdr.decode(leaf.valAt(i));
+                        stack.append(ctx.arena, hdr.root) catch return error.OutOfMemory;
+                    }
+                }
+            },
+            .branch => {
+                const br = format.Branch.init(&page);
+                var i: usize = 0;
+                while (i <= br.count()) : (i += 1)
+                    stack.append(ctx.arena, br.childAtIndex(i)) catch return error.OutOfMemory;
+            },
+        }
+    }
 }
 
 /// COW-apply `ops` (sorted, non-empty) to the subtree rooted at `id`. The
@@ -412,34 +543,8 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]const Piece {
 
     switch (format.kindOf(&page) orelse return error.Corrupt) {
         .leaf => {
-            var b = format.LeafBuilder.fromPage(ctx.arena, &page) catch return error.OutOfMemory;
-            for (ops) |op| {
-                // The value this op replaces or deletes dies with it: an
-                // overflow chain goes to the freelist like a COW-dead node.
-                const s = b.search(op.key);
-                if (s.found) if (b.entries.items[s.index].ovf_len) |len|
-                    try freeOverflow(ctx, std.mem.readInt(u32, b.entries.items[s.index].val[0..format.ovf_ref_len], .little), len);
-                if (op.val) |v| {
-                    if (format.fitsInline(op.key.len, v.len)) {
-                        b.put(op.key, v) catch return error.OutOfMemory;
-                    } else {
-                        if (v.len > format.max_value_len or !format.fitsOverflowRef(op.key.len)) return error.EntryTooLarge;
-                        const ref = try writeOverflow(ctx, v);
-                        b.putOverflow(op.key, ref, @intCast(v.len)) catch |e| return switch (e) {
-                            error.EntryTooLarge => error.EntryTooLarge,
-                            error.OutOfMemory => error.OutOfMemory,
-                        };
-                    }
-                } else {
-                    _ = b.del(op.key);
-                }
-            }
-            if (b.entries.items.len == 0) {
-                ctx.dropped = true;
-                return &.{};
-            }
-            if (b.underflows()) return pendingPiece(ctx, .{ .leaf = b });
-            return finishNodes(format.LeafBuilder, ctx, b);
+            const b = format.LeafBuilder.fromPage(ctx.arena, &page) catch return error.OutOfMemory;
+            return applyLeaf(ctx, b, ops);
         },
         .branch => {
             // Read the base branch straight off its page -- one pass, no
@@ -501,6 +606,50 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]const Piece {
             return finishNodes(format.BranchBuilder, ctx, nb);
         },
     }
+}
+
+/// Apply `ops` to the leaf `b` (decoded from a base page, or empty for a new
+/// bucket) and write what it becomes -- the leaf half of `applyRec`.
+fn applyLeaf(ctx: *Ctx, leaf: format.LeafBuilder, ops: []const Op) CommitError![]const Piece {
+    var b = leaf;
+    for (ops) |op| {
+        const s = b.search(op.key);
+        if (s.found) {
+            const e = b.entries.items[s.index];
+            // A plain op on a bucket, or a bucket op on a plain value.
+            if (e.bucket != op.bucket) return error.IncompatibleValue;
+            // The value this op replaces or deletes dies with it: an
+            // overflow chain goes to the freelist like a COW-dead node. (A
+            // bucket's tree is `applyTree`'s: rewritten or dropped there.)
+            if (e.ovf_len) |len|
+                try freeOverflow(ctx, std.mem.readInt(u32, e.val[0..format.ovf_ref_len], .little), len);
+        }
+        if (op.val) |v| {
+            if (op.bucket) {
+                b.putBucket(op.key, v) catch |e| return switch (e) {
+                    error.EntryTooLarge => error.EntryTooLarge,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+            } else if (format.fitsInline(op.key.len, v.len)) {
+                b.put(op.key, v) catch return error.OutOfMemory;
+            } else {
+                if (v.len > format.max_value_len or !format.fitsOverflowRef(op.key.len)) return error.EntryTooLarge;
+                const ref = try writeOverflow(ctx, v);
+                b.putOverflow(op.key, ref, @intCast(v.len)) catch |e| return switch (e) {
+                    error.EntryTooLarge => error.EntryTooLarge,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+            }
+        } else {
+            _ = b.del(op.key);
+        }
+    }
+    if (b.entries.items.len == 0) {
+        ctx.dropped = true;
+        return &.{};
+    }
+    if (b.underflows()) return pendingPiece(ctx, .{ .leaf = b });
+    return finishNodes(format.LeafBuilder, ctx, b);
 }
 
 /// A lone underfull node, handed up unwritten for the parent to merge.
@@ -772,6 +921,15 @@ fn candidateValid(gpa: Allocator, pager: *Pager, m: Meta) RecoverError!bool {
                 const leaf = format.leafViewSafe(&buf) orelse return false;
                 var i: usize = 0;
                 while (i < leaf.count()) : (i += 1) {
+                    if (leaf.isBucket(i)) {
+                        // A nested tree: walked like the top one, under the
+                        // same visit bound (a bucket cell pointing back up
+                        // the tree is a cycle like any other).
+                        const sub = format.BucketHdr.decode(leaf.valAt(i)).root;
+                        if (!pageIdOk(sub, m.high_water)) return false;
+                        stack.append(gpa, sub) catch return error.OutOfMemory;
+                        continue;
+                    }
                     const len = leaf.ovfLen(i) orelse continue;
                     // The chain, trusting nothing: exactly the pages its length
                     // needs, each in bounds and an overflow page, the last one

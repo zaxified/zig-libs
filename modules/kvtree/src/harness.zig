@@ -731,6 +731,142 @@ test "real Db: a crash anywhere in copyTo leaves the destination as it was or th
     try testing.expect(crashed_in_copy > 8 * 15);
 }
 
+test "real Db: crash at a commit that deletes, creates and fills nested buckets recovers to one side of it" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // Baseline: bucket `old` (with `old/in`, overflow values in both) next to
+    // plain keys. The in-flight commit deletes `old` whole, creates `new` and
+    // `new/n` and fills them, bumps a sequence, and writes a root key -- a
+    // drop of a whole tree, two new trees and the cells that link them, all
+    // in one meta swap. Every crash point must recover to the baseline or to
+    // all of it.
+    var big: [2 * format.page_size]u8 = undefined;
+    @memset(&big, 'B');
+    const modes = [_]kv.CrashMode{ .lose_unsynced, .torn_tail, .reorder_unsynced, .keep_unsynced };
+    var crashed: usize = 0;
+    for (modes) |mode| {
+        const seeds: usize = if (mode == .reorder_unsynced) 3 else 1;
+        for (0..seeds) |seed| {
+            var crash_at: usize = 0;
+            var progressed = false;
+            while (!progressed) : (crash_at += 1) {
+                try testing.expect(crash_at < 600);
+                var sim = kv.SimStorage.init(gpa);
+                defer sim.deinit();
+                sim.allow_overwrite = true;
+                sim.crash_mode = mode;
+                var scratch = std.heap.ArenaAllocator.init(gpa);
+                defer scratch.deinit();
+                const a = scratch.allocator();
+                {
+                    var db = try kvtree.Db.open(gpa, sim.storage(), "bk.kvt", .{});
+                    defer db.close();
+                    var txn = try db.begin();
+                    const old = try txn.createBucket("old");
+                    const in = try old.createBucket("in");
+                    for (0..200) |id| {
+                        const k = try std.fmt.allocPrint(a, "key{d:0>5}", .{id});
+                        try old.put(k, if (id % 40 == 0) &big else "old-value");
+                        try in.put(k, "in-value");
+                        try txn.put(k, "root-value");
+                    }
+                    try txn.commit();
+                }
+                var before: []const Obs = undefined;
+                {
+                    var db = try kvtree.Db.open(gpa, sim.storage(), "bk.kvt", .{});
+                    defer db.close();
+                    var snap = try db.snapshot();
+                    defer snap.release();
+                    before = try flattenAll(&snap, a);
+                }
+                sim.reorder_seed = 0xb0c +% (@as(u64, seed) *% 1024 + @as(u64, crash_at)) *% 0x9e3779b97f4a7c15;
+                sim.ops_until_crash = crash_at;
+                attempt: {
+                    var db = kvtree.Db.open(gpa, sim.storage(), "bk.kvt", .{}) catch break :attempt;
+                    defer db.close();
+                    var txn = db.begin() catch break :attempt;
+                    txn.deleteBucket("old") catch break :attempt;
+                    const nb = txn.createBucket("new") catch break :attempt;
+                    const n = nb.createBucket("n") catch break :attempt;
+                    _ = nb.nextSequence() catch break :attempt;
+                    for (0..150) |id| {
+                        const k = try std.fmt.allocPrint(a, "new{d:0>5}", .{id});
+                        nb.put(k, if (id % 50 == 0) &big else "new-value") catch break :attempt;
+                        n.put(k, "n-value") catch break :attempt;
+                    }
+                    try txn.put("zzz", "root");
+                    txn.commit() catch break :attempt;
+                    progressed = true;
+                }
+                if (!progressed) crashed += 1;
+                sim.reboot();
+                var db = try kvtree.Db.open(gpa, sim.storage(), "bk.kvt", .{});
+                defer db.close();
+                var snap = try db.snapshot();
+                defer snap.release();
+                const got = try flattenAll(&snap, a);
+                if (progressed or entriesEqual(before, got)) continue;
+                // Not the baseline: then exactly the whole in-flight commit.
+                try testing.expect(obsGet(got, "/old/") == null);
+                try testing.expect(obsGet(got, "/old/in/") == null);
+                try testing.expectEqualStrings("1", obsGet(got, "/new/").?);
+                try testing.expectEqualStrings("0", obsGet(got, "/new/n/").?);
+                try testing.expectEqualStrings("root", obsGet(got, "zzz").?);
+                var new_keys: usize = 0;
+                var n_keys: usize = 0;
+                for (got) |o| {
+                    if (std.mem.startsWith(u8, o.key, "/new/n/")) n_keys += 1 else if (std.mem.startsWith(u8, o.key, "/new/")) new_keys += 1;
+                }
+                // Each bucket's keys plus its own `/<path>/` marker.
+                try testing.expectEqual(@as(usize, 150 + 1), new_keys);
+                try testing.expectEqual(@as(usize, 150 + 1), n_keys);
+                try testing.expectEqual(@as(usize, 200 + 1 + 1 + 150 + 1 + 150), got.len);
+            }
+        }
+    }
+    // Teeth: six sweeps (three reorder seeds), each crashing at every one of
+    // the ~20 side effects of the commit (measured: 120 in all).
+    try testing.expect(crashed >= 6 * 15);
+}
+
+fn obsGet(obs: []const Obs, key: []const u8) ?[]const u8 {
+    for (obs) |o| if (std.mem.eql(u8, o.key, key)) return o.val;
+    return null;
+}
+
+/// Every key of a snapshot, buckets included, as one sorted list: a key in a
+/// bucket is `/<bucket>/<key>` (`/<b1>/<b2>/<key>` two deep), and a bucket
+/// itself shows as `/<path>/` with its sequence as the value.
+fn flattenAll(snap: *kvtree.Snapshot, out: Allocator) ![]const Obs {
+    var m = Model.init(out);
+    var cur = try snap.cursor();
+    defer cur.deinit();
+    try cur.first();
+    while (try cur.next()) |e| {
+        if (!e.bucket) {
+            try m.put(try out.dupe(u8, e.key), try out.dupe(u8, e.val));
+            continue;
+        }
+        const b = (try snap.bucket(e.key)).?;
+        try flattenBucket(&m, b, try std.fmt.allocPrint(out, "/{s}/", .{e.key}), out);
+    }
+    return m.entries();
+}
+
+fn flattenBucket(m: *Model, b: kvtree.ReadBucket, prefix: []const u8, out: Allocator) !void {
+    try m.put(prefix, try std.fmt.allocPrint(out, "{d}", .{b.sequence()}));
+    var cur = try b.cursor();
+    defer cur.deinit();
+    try cur.first();
+    while (try cur.next()) |e| {
+        if (e.bucket) {
+            const sub = (try b.bucket(e.key)).?;
+            try flattenBucket(m, sub, try std.fmt.allocPrint(out, "{s}{s}/", .{ prefix, e.key }), out);
+        } else try m.put(try std.fmt.allocPrint(out, "{s}{s}", .{ prefix, e.key }), try out.dupe(u8, e.val));
+    }
+}
+
 /// The crash-point sweep behind the two tests above, over values of
 /// `val_len` bytes; with `overwrite`, the baseline key holds such a value too
 /// and every in-flight commit overwrites it with another.

@@ -53,6 +53,7 @@ pub const Loader = struct {
     pager: *Pager,
     next_id: PageId = format.first_data_page,
     wrote_overflow: bool = false,
+    wrote_bucket: bool = false,
     leaves: Level(format.LeafBuilder),
     /// `levels[0]` holds the leaves' parents, each next one the level above.
     levels: [max_levels]Level(format.BranchBuilder) = undefined,
@@ -80,6 +81,36 @@ pub const Loader = struct {
         return self.addLeafEntry(key, &ref, @intCast(val.len));
     }
 
+    /// Append a bucket whose tree is already written (see `subtree`), in key
+    /// order like `add`.
+    pub fn addBucket(self: *Loader, key: []const u8, hdr: format.BucketHdr) Error!void {
+        if (self.leaves.lastKey()) |last| if (!std.mem.lessThan(u8, last, key)) return error.Corrupt;
+        if (!format.fitsInline(key.len, format.bucket_hdr_len)) return error.EntryTooLarge;
+        var bytes: [format.bucket_hdr_len]u8 = undefined;
+        hdr.encode(&bytes);
+        self.wrote_bucket = true;
+        return self.addLeafEntryKind(key, &bytes, null, true);
+    }
+
+    /// A loader for a bucket's tree, writing from where this one has got to.
+    /// Fill it, then `adoptSubtree` before this one writes anything else: the
+    /// two share the page counter, one at a time. `deinit` it either way.
+    pub fn subtree(self: *Loader) Loader {
+        var sub = Loader.init(self.gpa, self.pager);
+        sub.next_id = self.next_id;
+        return sub;
+    }
+
+    /// Write what `sub` holds back and return its root; this loader goes on
+    /// after `sub`'s last page.
+    pub fn adoptSubtree(self: *Loader, sub: *Loader) Error!PageId {
+        const root = try sub.finishTree();
+        self.next_id = sub.next_id;
+        self.wrote_overflow = self.wrote_overflow or sub.wrote_overflow;
+        self.wrote_bucket = self.wrote_bucket or sub.wrote_bucket;
+        return root;
+    }
+
     /// Write what is held back, then both meta slots, and sync. The store is
     /// complete once this returns; the `Loader` is spent.
     pub fn finish(self: *Loader) Error!void {
@@ -90,7 +121,7 @@ pub const Loader = struct {
             .free_root = 0,
             .free_count = 0,
             .high_water = self.next_id,
-            .version = if (self.wrote_overflow) format.format_v3 else format.format_v2,
+            .version = format.versionFor(format.format_v2, self.wrote_overflow, self.wrote_bucket),
         };
         var buf: [page_size]u8 = undefined;
         m.encode(&buf);
@@ -158,6 +189,10 @@ pub const Loader = struct {
     }
 
     fn addLeafEntry(self: *Loader, key: []const u8, val: []const u8, ovf_len: ?u32) Error!void {
+        return self.addLeafEntryKind(key, val, ovf_len, false);
+    }
+
+    fn addLeafEntryKind(self: *Loader, key: []const u8, val: []const u8, ovf_len: ?u32, bucket: bool) Error!void {
         const l = &self.leaves;
         const need = format.leafEntryBytes(key.len, val.len);
         // A lone entry always fits (`add` checked), so `cur` is not empty here.
@@ -167,7 +202,7 @@ pub const Loader = struct {
         }
         const a = l.arenas[l.cur_arena].allocator();
         if (l.cur == null) l.cur = format.LeafBuilder.init(a);
-        try l.cur.?.entries.append(a, .{ .key = try a.dupe(u8, key), .val = try a.dupe(u8, val), .ovf_len = ovf_len });
+        try l.cur.?.entries.append(a, .{ .key = try a.dupe(u8, key), .val = try a.dupe(u8, val), .ovf_len = ovf_len, .bucket = bucket });
         l.cur_bytes += need;
     }
 

@@ -24,8 +24,11 @@ that see a consistent snapshot without blocking the writer.
 > and a crash-point sweep over every storage side effect of a commit, across
 > all four `kv.SimStorage` crash modes. Values larger than a page live in
 > overflow chains; underfull nodes are merged; the free end of the file is
-> given back. Not built yet (`SPEC.md`'s backlog): buckets, readers in other
-> processes, in-place compaction (`copyTo` compacts into a new file).
+> given back. Buckets (named nested key spaces, bbolt's unit) and read-only
+> openers in other processes (a shared lock, as bbolt's `ReadOnly`) are in since
+> 2026-10-11. Not built (`SPEC.md` says why): in-place compaction (`copyTo`
+> compacts into a new file, as bbolt's `Compact` does), batching of writers
+> from several threads (a `Db` has one owner).
 > The on-disk freelist is a page CHAIN (not a single bounded page) — freeing
 > more pages than one page holds chains another, so nothing is silently
 > leaked. Chain-storage pages are recycled from the freelist like tree pages;
@@ -40,7 +43,7 @@ License) and BoltDB (MIT) for the copy-on-write B-tree with double-buffered
 meta pages (MVCC + atomic commit + crash-safety emergent from COW, no separate
 WAL), and TigerBeetle (Apache-2.0) for the VOPR deterministic fault-injection
 *approach*. Behavior/approach only; no third-party source consulted or
-copied.
+copied. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` reference side against go.etcd.io/bbolt v1.5.0, 2026-10-11) is our own tooling; it drives the reference only through its public API.
 
 ## API
 
@@ -78,6 +81,31 @@ while (try cur.next()) |e| {        // ordered iteration; e.key/e.val borrow
 // prev() the one before. Newest first, from a key down (the key included):
 try cur.seekAfter("t");             // or cur.last() for the very end
 while (try cur.prev()) |e| { _ = e; }
+
+// Buckets: named, nested key spaces (bbolt's `Bucket`), each a B-tree of its
+// own, written in the same atomic commit as everything else in the txn.
+var t2 = try db.begin();
+const users = try t2.createBucketIfNotExists("users");
+try users.put("alice", "...");
+const id = try users.nextSequence();          // a per-bucket counter, committed with it
+const sessions = try users.createBucket("sessions");
+try sessions.put("s1", "...");
+try t2.deleteBucket("old");                  // with everything in it
+try t2.commit();
+var s2 = try db.snapshot();
+defer s2.release();
+if (try s2.bucket("users")) |u| {
+    const alice = try u.get(gpa, "alice");    // ?[]u8, caller frees; a bucket's name reads as null
+    defer if (alice) |a| gpa.free(a);
+    var uc = try u.cursor();                  // nested buckets yield KV.bucket = true
+    defer uc.deinit();
+}
+_ = id;
+
+// Read-only openers share the store across processes; a writer waits for them
+// (and they for it): error.Locked, never a race.
+var ro = try kvtree.Db.open(gpa, store, "app.kvt", .{ .read_only = true });
+defer ro.close();                            // ro.begin() -> error.ReadOnly
 
 // Backup and compaction in one: a full, compact copy of the newest version,
 // written to "<path>.copy", synced, then renamed into place.

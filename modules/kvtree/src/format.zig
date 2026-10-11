@@ -58,13 +58,63 @@ const meta_magic = "ZKVT";
 /// refused by one (its `decode` accepts exactly its own version), where the
 /// alternative -- reading a flagged `val_len` as a length -- would reject the
 /// newest meta in `recover` and silently adopt the one before it.
+///
+/// Bumped 3 -> 4 for buckets (a leaf cell flagged `bucket_flag` whose value is
+/// a nested tree's root), on the same sticky terms: a store gets v4 with its
+/// first bucket and keeps it; one that never had a bucket stays v2/v3.
 pub const format_v2: u32 = 2;
 pub const format_v3: u32 = 3;
+pub const format_v4: u32 = 4;
+
+/// The version a store holding what `overflow`/`bucket` say needs, never below
+/// `base` (versions are sticky).
+pub fn versionFor(base: u32, overflow: bool, bucket: bool) u32 {
+    const need: u32 = if (bucket) format_v4 else if (overflow) format_v3 else format_v2;
+    return @max(base, need);
+}
 
 /// A single leaf entry (borrowed slices into a page buffer, or into a builder's
 /// arena — never owns). For an overflow value (`ovf_len` set) `val` is not the
 /// value but its `ovf_ref_len`-byte reference: the first overflow page's id.
-pub const Entry = struct { key: []const u8, val: []const u8, ovf_len: ?u32 = null };
+///
+/// A BUCKET entry (`bucket`) has a `bucket_hdr_len`-byte `BucketHdr` as its
+/// value: the root of the nested tree that holds the bucket's keys.
+pub const Entry = struct { key: []const u8, val: []const u8, ovf_len: ?u32 = null, bucket: bool = false };
+
+// ── Buckets ──────────────────────────────────────────────────────────────────
+//
+// A bucket is a named, nested key space (bbolt's `Bucket`): a whole B-tree of
+// its own, whose root a cell in its parent's leaf points to. The cell's
+// `val_len` carries `bucket_flag` (an inline cell never has a length anywhere
+// near it, an overflow cell has `ovf_flag` instead), and its value is a
+// `BucketHdr`. Everything else -- copy-on-write, the freelist, the reclaim
+// gate, the two fsyncs -- is the parent tree's: a commit rewrites a bucket's
+// tree bottom-up and then the cell that points to it, like any other value.
+
+/// `val_len`'s second bit: the value is a `BucketHdr` (inline cells only).
+pub const bucket_flag: u32 = 0x4000_0000;
+/// Bytes of a bucket cell's value: `root(4) seq(8)`.
+pub const bucket_hdr_len = 12;
+
+/// A bucket cell's value: the nested tree's root page and the bucket's
+/// sequence counter (bbolt's `NextSequence`).
+pub const BucketHdr = struct {
+    root: PageId,
+    seq: u64,
+
+    pub fn encode(self: BucketHdr, out: *[bucket_hdr_len]u8) void {
+        std.mem.writeInt(u32, out[0..4], self.root, .little);
+        std.mem.writeInt(u64, out[4..12], self.seq, .little);
+    }
+
+    pub fn decode(bytes: []const u8) BucketHdr {
+        std.debug.assert(bytes.len == bucket_hdr_len);
+        return .{
+            .root = std.mem.readInt(u32, bytes[0..4], .little),
+            .seq = std.mem.readInt(u64, bytes[4..12], .little),
+        };
+    }
+};
 
 // ── Overflow values ──────────────────────────────────────────────────────────
 //
@@ -167,7 +217,7 @@ pub const Meta = struct {
     pub fn encode(self: Meta, page: *[page_size]u8) void {
         zeroPage(page);
         @memcpy(page[0..4], meta_magic);
-        std.debug.assert(self.version == format_v2 or self.version == format_v3);
+        std.debug.assert(self.version >= format_v2 and self.version <= format_v4);
         std.mem.writeInt(u32, page[4..8], self.version, .little);
         std.mem.writeInt(u32, page[8..12], @intCast(page_size), .little);
         std.mem.writeInt(u64, page[12..20], self.txn_id, .little);
@@ -186,7 +236,7 @@ pub const Meta = struct {
     pub fn decode(page: *const [page_size]u8) ?Meta {
         if (!std.mem.eql(u8, page[0..4], meta_magic)) return null;
         const version = std.mem.readInt(u32, page[4..8], .little);
-        if (version != format_v2 and version != format_v3) return null;
+        if (version < format_v2 or version > format_v4) return null;
         if (std.mem.readInt(u32, page[8..12], .little) != page_size) return null;
         const want = std.mem.readInt(u32, page[crc_off .. crc_off + 4][0..4], .little);
         if (crc32.hash(page[0..crc_off]) != want) return null;
@@ -272,8 +322,15 @@ pub const Leaf = struct {
         const o = slotOffset(self.page, i);
         const klen = std.mem.readInt(u16, self.page[o .. o + 2][0..2], .little);
         const raw = std.mem.readInt(u32, self.page[o + 2 .. o + 6][0..4], .little);
-        const vlen: usize = if (raw & ovf_flag != 0) ovf_ref_len else raw;
+        const vlen: usize = if (raw & ovf_flag != 0) ovf_ref_len else raw & ~bucket_flag;
         return self.page[o + 6 + klen ..][0..vlen];
+    }
+
+    /// Whether entry `i` is a bucket (its value is a `BucketHdr`).
+    pub fn isBucket(self: Leaf, i: usize) bool {
+        const o = slotOffset(self.page, i);
+        const raw = std.mem.readInt(u32, self.page[o + 2 .. o + 6][0..4], .little);
+        return raw & ovf_flag == 0 and raw & bucket_flag != 0;
     }
 
     /// The length of entry `i`'s value when it lives in overflow pages, else
@@ -290,7 +347,7 @@ pub const Leaf = struct {
     }
 
     pub fn entryAt(self: Leaf, i: usize) Entry {
-        return .{ .key = self.keyAt(i), .val = self.valAt(i), .ovf_len = self.ovfLen(i) };
+        return .{ .key = self.keyAt(i), .val = self.valAt(i), .ovf_len = self.ovfLen(i), .bucket = self.isBucket(i) };
     }
 
     pub fn search(self: Leaf, key: []const u8) Search {
@@ -425,7 +482,10 @@ pub fn leafViewSafe(page: *const [page_size]u8) ?Leaf {
         // An overflow reference: a length of 0 is no value anyone wrote (a
         // value that short is inline), so it is corruption, not a chain.
         if (raw == ovf_flag) return null;
-        const vlen: usize = if (raw & ovf_flag != 0) ovf_ref_len else raw;
+        // A bucket cell's value is a header of exactly one size; any other
+        // length under the flag is no cell this format writes.
+        if (raw & ovf_flag == 0 and raw & bucket_flag != 0 and raw != bucket_flag | bucket_hdr_len) return null;
+        const vlen: usize = if (raw & ovf_flag != 0) ovf_ref_len else raw & ~bucket_flag;
         if (o + 6 + @as(usize, klen) + vlen > page_size) return null;
     }
     return Leaf.init(page);
@@ -539,6 +599,14 @@ pub const LeafBuilder = struct {
         std.debug.assert(first_ref.len == ovf_ref_len and len != 0 and len <= max_value_len);
         if (!fitsOverflowRef(key.len)) return oversize_error;
         try self.set(.{ .key = key, .val = first_ref, .ovf_len = len });
+    }
+
+    /// Insert or overwrite `key` as a bucket whose header is `hdr`
+    /// (`bucket_hdr_len` bytes, borrowed like every other slice here).
+    pub fn putBucket(self: *LeafBuilder, key: []const u8, hdr: []const u8) !void {
+        std.debug.assert(hdr.len == bucket_hdr_len);
+        if (!fitsInline(key.len, bucket_hdr_len)) return oversize_error;
+        try self.set(.{ .key = key, .val = hdr, .bucket = true });
     }
 
     fn set(self: *LeafBuilder, e: Entry) !void {
@@ -746,7 +814,7 @@ fn encodeLeaf(page: *[page_size]u8, entries: []const Entry) void {
         const cell = leafCellBytes(e.key.len, e.val.len);
         tail -= cell;
         std.mem.writeInt(u16, page[tail .. tail + 2][0..2], @intCast(e.key.len), .little);
-        const vlen: u32 = if (e.ovf_len) |l| ovf_flag | l else @intCast(e.val.len);
+        const vlen: u32 = if (e.ovf_len) |l| ovf_flag | l else if (e.bucket) bucket_flag | @as(u32, @intCast(e.val.len)) else @intCast(e.val.len);
         std.mem.writeInt(u32, page[tail + 2 .. tail + 6][0..4], vlen, .little);
         @memcpy(page[tail + 6 ..][0..e.key.len], e.key);
         @memcpy(page[tail + 6 + e.key.len ..][0..e.val.len], e.val);

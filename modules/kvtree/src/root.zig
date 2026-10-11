@@ -84,7 +84,9 @@ pub const OpenError = kv.Storage.Error || core.RecoverError || error{
     Corrupt,
     NotAKvtreeFile,
     /// Another `Db` — in another process, or in this one — currently holds
-    /// the store's exclusive lock. Nothing was opened, read or written.
+    /// the store's lock in a mode this open cannot share: a writer's
+    /// exclusive lock, or (for a writer) a read-only opener's shared one.
+    /// Nothing was opened, read or written.
     Locked,
 };
 pub const GetError = kv.Storage.Error || error{ Corrupt, OutOfMemory };
@@ -118,7 +120,26 @@ pub const CopyError = kv.Storage.Error || error{ Corrupt, OutOfMemory, SamePath 
 /// (repositioning reuses the same frame storage, `clearRetainingCapacity`, so
 /// it invalidates exactly like a step even though it looks like a fresh
 /// start) — or `deinit()`. Copy them if you need to keep them past that.
-pub const KV = struct { key: []const u8, val: []const u8 };
+///
+/// A bucket (see `Bucket`) is yielded too, as `bucket = true` with an empty
+/// `val` (bbolt's cursor gives a nil value): open it with `bucket(key)` on
+/// the snapshot, transaction or bucket the cursor walks.
+pub const KV = struct { key: []const u8, val: []const u8, bucket: bool = false };
+
+/// Errors of the bucket calls on `Txn` and `Bucket`.
+pub const BucketError = kv.Storage.Error || error{
+    Corrupt,
+    OutOfMemory,
+    /// `bucket`/`deleteBucket`/a call on a deleted bucket: no such bucket.
+    BucketNotFound,
+    /// `createBucket` over a bucket that exists.
+    BucketExists,
+    /// `createBucket` where a plain value is (in the base version, or put or
+    /// deleted earlier in this transaction -- commit that first).
+    IncompatibleValue,
+    /// An empty name, or one too long for a leaf cell.
+    InvalidBucketName,
+};
 
 // ── Db ─────────────────────────────────────────────────────────────────────
 
@@ -158,6 +179,8 @@ pub const Db = struct {
     /// caller contract; this is its enforcement — the same-process sibling of
     /// `Options.lock`'s cross-process `error.Locked`.
     in_txn: bool = false,
+    /// `Options.read_only`: `begin` refuses, nothing is ever written.
+    read_only: bool = false,
 
     /// Open (or create) the store. A fresh/empty file is initialized
     /// mechanically (two meta pages + an empty-leaf root); an existing file is
@@ -169,27 +192,47 @@ pub const Db = struct {
     /// why the lock lives on a sidecar rather than the data file). A second
     /// concurrent opener over the same store gets `error.Locked` with
     /// nothing touched, instead of silently racing this one's COW commits.
+    ///
+    /// With `options.read_only` the lock is SHARED and the data file is
+    /// opened read-only: any number of read-only openers, in any processes,
+    /// share the store, and a writer is refused while one is open (and they
+    /// while a writer is) -- bbolt's `ReadOnly`. A missing store is
+    /// `error.FileNotFound`, an empty file `error.NotAKvtreeFile`: a reader
+    /// creates nothing. It sees the newest commit as of `open`, which no
+    /// writer can move while it holds the lock.
     pub fn open(gpa: Allocator, store: kv.Storage, path: []const u8, options: Options) OpenError!Db {
         const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{path});
         errdefer gpa.free(lock_path);
 
         var lock_file: ?kv.Storage.Handle = null;
         if (options.lock == .exclusive) {
-            const lh = try store.open(lock_path, .open_or_create);
+            // A reader takes an existing sidecar read-only (a reader may not
+            // be able to write the directory); one that was never created --
+            // a store written by `copyTo` and not opened since -- is created.
+            const lh = if (options.read_only)
+                store.open(lock_path, .read_only) catch |e| switch (e) {
+                    error.FileNotFound => try store.open(lock_path, .open_or_create),
+                    else => return e,
+                }
+            else
+                try store.open(lock_path, .open_or_create);
             lock_file = lh;
         }
         errdefer if (lock_file) |lh| store.close(lh);
         if (lock_file) |lh| {
-            if (!try store.tryLockExclusive(lh)) return error.Locked;
+            const held = if (options.read_only) try store.tryLockShared(lh) else try store.tryLockExclusive(lh);
+            if (!held) return error.Locked;
         }
 
-        const handle = try store.open(path, .open_or_create);
+        const handle = try store.open(path, if (options.read_only) .read_only else .open_or_create);
         errdefer store.close(handle);
         const size = try store.size(handle);
 
         var pager = Pager.init(store, handle, 0);
         var meta_rec: format.Meta = undefined;
-        if (size == 0) {
+        if (size == 0 and options.read_only) {
+            return error.NotAKvtreeFile;
+        } else if (size == 0) {
             // Genuinely new: nothing exists at `path` yet, so there is
             // nothing a mechanical init could destroy. (`writeAll` at an
             // offset synchronously extends a file's reported size — even
@@ -236,6 +279,7 @@ pub const Db = struct {
             .open_snapshots = .empty,
             .shrink_min_pages = options.shrink_min_pages,
             .commit_scratch = .init(gpa),
+            .read_only = options.read_only,
         };
     }
 
@@ -372,7 +416,8 @@ pub const Db = struct {
     /// `Db` has not yet been consumed, `error.CommitFailed` if this `Db` is
     /// poisoned (see `Db.poisoned`) — in both cases nothing was opened or
     /// touched.
-    pub fn begin(self: *Db) (Allocator.Error || error{ CommitFailed, TxnInProgress })!Txn {
+    pub fn begin(self: *Db) (Allocator.Error || error{ CommitFailed, TxnInProgress, ReadOnly })!Txn {
+        if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.CommitFailed;
         if (self.in_txn) return error.TxnInProgress;
         self.in_txn = true;
@@ -381,6 +426,7 @@ pub const Db = struct {
             .base = self.meta_rec,
             .changes = .empty,
             .arena = std.heap.ArenaAllocator.init(self.gpa),
+            .buckets = .empty,
         };
     }
 
@@ -453,6 +499,9 @@ pub const Options = struct {
     /// The default, 16 pages (64 KiB), keeps a store that breathes by a few
     /// pages per commit from truncating and regrowing its file every time.
     shrink_min_pages: u32 = 16,
+    /// Open for reading only (bbolt's `ReadOnly`): a SHARED lock (see
+    /// `open`), the data file opened read-only, `begin` -> `error.ReadOnly`.
+    read_only: bool = false,
 };
 
 pub const LockPolicy = enum {
@@ -479,6 +528,9 @@ pub const Txn = struct {
     changes: std.ArrayList(core.Change),
     /// Owns the buffered keys/values until commit or rollback.
     arena: std.heap.ArenaAllocator,
+    /// Every bucket this transaction has opened, created or deleted; a
+    /// `Bucket` is an index into it. Empty unless buckets are used.
+    buckets: std.ArrayList(BucketState),
 
     pub fn put(self: *Txn, key: []const u8, val: []const u8) Allocator.Error!void {
         const a = self.arena.allocator();
@@ -534,17 +586,13 @@ pub const Txn = struct {
     /// adopted by the next `recover`. Do not retry on this `Db`; close and
     /// reopen. See `CommitError.CommitFailed` for the full argument.
     pub fn commit(self: *Txn) CommitError!void {
-        defer {
-            self.db.in_txn = false;
-            self.arena.deinit();
-            self.changes.deinit(self.db.gpa);
-            self.* = undefined;
-        }
+        defer self.consume();
+        const tree = try self.treeOf(root_parent);
         const new_meta = core.commit(
             &self.db.commit_scratch,
             &self.db.pager,
             self.base,
-            self.changes.items,
+            tree,
             self.db.oldestReader(),
             self.db.shrink_min_pages,
         ) catch |e| {
@@ -561,12 +609,342 @@ pub const Txn = struct {
     }
 
     pub fn rollback(self: *Txn) void {
+        self.consume();
+    }
+
+    fn consume(self: *Txn) void {
         self.db.in_txn = false;
+        for (self.buckets.items) |*b| b.changes.deinit(self.db.gpa);
+        self.buckets.deinit(self.db.gpa);
         self.arena.deinit();
         self.changes.deinit(self.db.gpa);
         self.* = undefined;
     }
+
+    // ── buckets ──────────────────────────────────────────────────────────
+
+    /// The top-level bucket `name`, or null when there is none.
+    pub fn bucket(self: *Txn, name: []const u8) BucketError!?Bucket {
+        return self.openIn(root_parent, name);
+    }
+
+    /// Create the top-level bucket `name`: `error.BucketExists` when it is
+    /// there already, `error.IncompatibleValue` when `name` is a plain key.
+    pub fn createBucket(self: *Txn, name: []const u8) BucketError!Bucket {
+        return self.createIn(root_parent, name, false);
+    }
+
+    /// `bucket`, or `createBucket` when there is none.
+    pub fn createBucketIfNotExists(self: *Txn, name: []const u8) BucketError!Bucket {
+        return self.createIn(root_parent, name, true);
+    }
+
+    /// Delete the top-level bucket `name` with everything in it, nested
+    /// buckets included; `error.BucketNotFound` when there is none.
+    pub fn deleteBucket(self: *Txn, name: []const u8) BucketError!void {
+        return self.deleteIn(root_parent, name);
+    }
+
+    /// The tree a parent's buffered work goes to: the store's own (`root_parent`)
+    /// or a bucket's.
+    fn changesOf(self: *Txn, parent: u32) *std.ArrayList(core.Change) {
+        return if (parent == root_parent) &self.changes else &self.buckets.items[parent].changes;
+    }
+
+    /// The parent's tree in the base version, or null when it has none (a
+    /// bucket new in this transaction, or deleted and created again).
+    fn baseRootOf(self: *Txn, parent: u32) ?PageId {
+        return if (parent == root_parent) self.base.root else self.buckets.items[parent].base_root;
+    }
+
+    /// A bucket this transaction can still use (or `root_parent`).
+    fn live(self: *Txn, idx: u32) BucketError!void {
+        if (idx == root_parent) return;
+        const b = &self.buckets.items[idx];
+        if (b.deleted or b.dead) return error.BucketNotFound;
+    }
+
+    fn checkName(name: []const u8) BucketError!void {
+        if (name.len == 0 or !format.fitsInline(name.len, format.bucket_hdr_len)) return error.InvalidBucketName;
+    }
+
+    /// The entry for `name` under `parent` that is not dead, if any.
+    fn findState(self: *Txn, parent: u32, name: []const u8) ?u32 {
+        for (self.buckets.items, 0..) |*b, i| {
+            if (b.parent == parent and !b.dead and std.mem.eql(u8, b.name, name)) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// Did this transaction buffer a plain put or delete of `key` in `parent`?
+    fn hasPlainChange(self: *Txn, parent: u32, key: []const u8) bool {
+        for (self.changesOf(parent).items) |c| {
+            const k = switch (c) {
+                .put => |p| p.key,
+                .del => |d| d,
+            };
+            if (std.mem.eql(u8, k, key)) return true;
+        }
+        return false;
+    }
+
+    fn addState(self: *Txn, parent: u32, name: []const u8, base_root: ?PageId, seq: u64) BucketError!u32 {
+        const owned = try self.arena.allocator().dupe(u8, name);
+        try self.buckets.append(self.db.gpa, .{
+            .parent = parent,
+            .name = owned,
+            .base_root = base_root,
+            .base_seq = seq,
+            .seq = seq,
+            .changes = .empty,
+        });
+        return @intCast(self.buckets.items.len - 1);
+    }
+
+    fn openIn(self: *Txn, parent: u32, name: []const u8) BucketError!?Bucket {
+        try self.live(parent);
+        try checkName(name);
+        if (self.findState(parent, name)) |i| {
+            if (self.buckets.items[i].deleted) return null;
+            return .{ .txn = self, .idx = i };
+        }
+        const root = self.baseRootOf(parent) orelse return null;
+        switch (try lookupCell(&self.db.pager, root, name)) {
+            .bucket => |hdr| return .{ .txn = self, .idx = try self.addState(parent, name, hdr.root, hdr.seq) },
+            .none, .plain => return null,
+        }
+    }
+
+    fn createIn(self: *Txn, parent: u32, name: []const u8, if_not_exists: bool) BucketError!Bucket {
+        try self.live(parent);
+        try checkName(name);
+        if (self.findState(parent, name)) |i| {
+            const b = &self.buckets.items[i];
+            if (!b.deleted) {
+                if (if_not_exists) return .{ .txn = self, .idx = i };
+                return error.BucketExists;
+            }
+            // Deleted in this transaction and created again: an empty bucket,
+            // and the tree it had goes at commit.
+            if (b.base_root) |r| b.drop = r;
+            b.base_root = null;
+            b.deleted = false;
+            b.base_seq = 0;
+            b.seq = 0;
+            b.changes.clearRetainingCapacity();
+            return .{ .txn = self, .idx = i };
+        }
+        if (self.hasPlainChange(parent, name)) return error.IncompatibleValue;
+        if (self.baseRootOf(parent)) |root| switch (try lookupCell(&self.db.pager, root, name)) {
+            .bucket => |hdr| {
+                const i = try self.addState(parent, name, hdr.root, hdr.seq);
+                if (if_not_exists) return .{ .txn = self, .idx = i };
+                return error.BucketExists;
+            },
+            .plain => return error.IncompatibleValue,
+            .none => {},
+        };
+        return .{ .txn = self, .idx = try self.addState(parent, name, null, 0) };
+    }
+
+    fn deleteIn(self: *Txn, parent: u32, name: []const u8) BucketError!void {
+        const b = (try self.openIn(parent, name)) orelse return error.BucketNotFound;
+        const st = &self.buckets.items[b.idx];
+        st.deleted = true;
+        st.changes.clearRetainingCapacity();
+        // Everything below it goes with it, for good: a handle to a nested
+        // bucket now reports `BucketNotFound`, and a bucket of the same name
+        // created later is a new one.
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (self.buckets.items) |*x| {
+                if (x.dead or x.parent == root_parent) continue;
+                const up = &self.buckets.items[x.parent];
+                if ((x.parent == b.idx or up.dead) and !x.dead) {
+                    x.dead = true;
+                    x.changes.clearRetainingCapacity();
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    /// The commit's view of `parent`'s tree: its buffered changes and the
+    /// buckets in it that changed, recursively.
+    fn treeOf(self: *Txn, parent: u32) Allocator.Error!core.Tree {
+        const a = self.arena.allocator();
+        var subs: std.ArrayList(core.Sub) = .empty;
+        for (self.buckets.items, 0..) |*b, i| {
+            if (b.parent != parent or b.dead) continue;
+            if (b.deleted) {
+                // Gone: whatever tree it had in the base (or had before it
+                // was deleted, created again and deleted once more) is freed.
+                // One created and deleted here never existed.
+                const old = b.base_root orelse b.drop orelse continue;
+                try subs.append(a, .{ .name = b.name, .drop = old });
+                continue;
+            }
+            const sub_tree = try self.treeOf(@intCast(i));
+            const changed = b.base_root == null or b.drop != null or b.seq != b.base_seq or
+                sub_tree.changes.len != 0 or sub_tree.subs.len != 0;
+            if (!changed) continue;
+            try subs.append(a, .{
+                .name = b.name,
+                .drop = b.drop,
+                .keep = .{ .base_root = b.base_root, .seq = b.seq, .tree = sub_tree },
+            });
+        }
+        return .{ .changes = self.changesOf(parent).items, .subs = subs.items };
+    }
 };
+
+/// The parent index of a top-level bucket.
+const root_parent = std.math.maxInt(u32);
+
+/// One bucket a `Txn` has touched.
+const BucketState = struct {
+    /// Index of the enclosing bucket in `Txn.buckets`, or `root_parent`.
+    parent: u32,
+    /// Owned by the txn's arena.
+    name: []const u8,
+    /// Its tree in the base version; null when it has none (created in this
+    /// transaction, or deleted and created again).
+    base_root: ?PageId,
+    /// A tree of this name the commit frees whole: the bucket was deleted
+    /// and created again in this transaction.
+    drop: ?PageId = null,
+    base_seq: u64,
+    seq: u64,
+    /// Deleted in this transaction; `createBucket` may bring the name back.
+    deleted: bool = false,
+    /// A bucket above it was deleted: gone for good, invisible to lookups.
+    dead: bool = false,
+    /// Its buffered puts and deletes.
+    changes: std.ArrayList(core.Change),
+};
+
+/// A bucket inside a read-write `Txn` (bbolt's `*Bucket` in an `Update`): a
+/// named, nested key space with keys, values and buckets of its own. Valid
+/// until the transaction is consumed; after `deleteBucket` of it or of a
+/// bucket above it, every call is `error.BucketNotFound`.
+///
+/// Writes are buffered like `Txn.put`'s and reach the file only through
+/// `Txn.commit`, atomically with everything else in the transaction. A plain
+/// `put`/`del` of a key that is a bucket in the base version is refused by
+/// that commit (`error.IncompatibleValue`), not here: finding it out now
+/// would cost every buffered write a read.
+pub const Bucket = struct {
+    txn: *Txn,
+    idx: u32,
+
+    fn state(self: Bucket) BucketError!*BucketState {
+        try self.txn.live(self.idx);
+        return &self.txn.buckets.items[self.idx];
+    }
+
+    pub fn put(self: Bucket, key: []const u8, val: []const u8) BucketError!void {
+        const st = try self.state();
+        const a = self.txn.arena.allocator();
+        try st.changes.append(self.txn.db.gpa, .{ .put = .{ .key = try a.dupe(u8, key), .val = try a.dupe(u8, val) } });
+    }
+
+    pub fn del(self: Bucket, key: []const u8) BucketError!void {
+        const st = try self.state();
+        try st.changes.append(self.txn.db.gpa, .{ .del = try self.txn.arena.allocator().dupe(u8, key) });
+    }
+
+    /// A key's value as this transaction sees it; null for a key that is
+    /// absent or a bucket.
+    pub fn get(self: Bucket, gpa: Allocator, key: []const u8) BucketError!?[]u8 {
+        const st = try self.state();
+        var i: usize = st.changes.items.len;
+        while (i > 0) {
+            i -= 1;
+            switch (st.changes.items[i]) {
+                .put => |p| if (std.mem.eql(u8, p.key, key)) return try gpa.dupe(u8, p.val),
+                .del => |k| if (std.mem.eql(u8, k, key)) return null,
+            }
+        }
+        const root = st.base_root orelse return null;
+        return lookup(&self.txn.db.pager, root, gpa, key);
+    }
+
+    pub fn bucket(self: Bucket, name: []const u8) BucketError!?Bucket {
+        return self.txn.openIn(self.idx, name);
+    }
+
+    pub fn createBucket(self: Bucket, name: []const u8) BucketError!Bucket {
+        return self.txn.createIn(self.idx, name, false);
+    }
+
+    pub fn createBucketIfNotExists(self: Bucket, name: []const u8) BucketError!Bucket {
+        return self.txn.createIn(self.idx, name, true);
+    }
+
+    pub fn deleteBucket(self: Bucket, name: []const u8) BucketError!void {
+        return self.txn.deleteIn(self.idx, name);
+    }
+
+    /// The bucket's sequence number (bbolt's `Sequence`); 0 for a new one.
+    pub fn sequence(self: Bucket) BucketError!u64 {
+        return (try self.state()).seq;
+    }
+
+    pub fn setSequence(self: Bucket, v: u64) BucketError!void {
+        (try self.state()).seq = v;
+    }
+
+    /// Increment the sequence and return the new value (bbolt's
+    /// `NextSequence`): an id per record that commits with it.
+    pub fn nextSequence(self: Bucket) BucketError!u64 {
+        const st = try self.state();
+        st.seq +%= 1;
+        return st.seq;
+    }
+};
+
+/// A bucket in a committed version, read through a `Snapshot` (bbolt's
+/// `*Bucket` in a `View`). Valid while the snapshot is: the snapshot's pin is
+/// what keeps the bucket's pages from being recycled.
+pub const ReadBucket = struct {
+    pager: *Pager,
+    gpa: Allocator,
+    root: PageId,
+    seq: u64,
+
+    /// Null for a key that is absent or a bucket.
+    pub fn get(self: ReadBucket, gpa: Allocator, key: []const u8) GetError!?[]u8 {
+        return lookup(self.pager, self.root, gpa, key);
+    }
+
+    /// `Db.getRef` inside the bucket.
+    pub fn getRef(self: ReadBucket, key: []const u8) GetRefError!?ValueRef {
+        if (!self.pager.store.canLend()) return error.CannotLend;
+        return lookupRef(self.pager, self.root, key);
+    }
+
+    /// An ordered cursor over the bucket's keys (nested buckets yield
+    /// `KV.bucket`). It holds no pin of its own: the snapshot's covers it.
+    pub fn cursor(self: ReadBucket) Allocator.Error!Cursor {
+        return Cursor.init(self.gpa, self.pager, self.root);
+    }
+
+    pub fn bucket(self: ReadBucket, name: []const u8) GetError!?ReadBucket {
+        return readBucketIn(self.pager, self.gpa, self.root, name);
+    }
+
+    pub fn sequence(self: ReadBucket) u64 {
+        return self.seq;
+    }
+};
+
+fn readBucketIn(pager: *Pager, gpa: Allocator, root: PageId, name: []const u8) GetError!?ReadBucket {
+    return switch (try lookupCell(pager, root, name)) {
+        .bucket => |hdr| .{ .pager = pager, .gpa = gpa, .root = hdr.root, .seq = hdr.seq },
+        .none, .plain => null,
+    };
+}
 
 // ── Snapshot (read-only MVCC view) ───────────────────────────────────────────
 
@@ -581,6 +959,11 @@ pub const Snapshot = struct {
 
     pub fn cursor(self: *Snapshot) Allocator.Error!Cursor {
         return Cursor.init(self.db.gpa, &self.db.pager, self.root);
+    }
+
+    /// The top-level bucket `name` in this version, or null.
+    pub fn bucket(self: *Snapshot, name: []const u8) GetError!?ReadBucket {
+        return readBucketIn(&self.db.pager, self.db.gpa, self.root, name);
     }
 
     /// Write this version as a new store at `path` on `dest`. It is a backup
@@ -625,14 +1008,7 @@ fn copyVersion(db: *Db, root: PageId, dest: kv.Storage, path: []const u8) CopyEr
     var out = Pager.init(dest, h, 0);
     var loader = bulk.Loader.init(db.gpa, &out);
     defer loader.deinit();
-    var cur = try Cursor.init(db.gpa, &db.pager, root);
-    defer cur.deinit();
-    try cur.first();
-    while (try cur.next()) |e| loader.add(e.key, e.val) catch |err| return switch (err) {
-        // The source held this entry, so its pages are lying about it.
-        error.EntryTooLarge => error.Corrupt,
-        else => |x| x,
-    };
+    try copyTree(db, root, &loader);
     loader.finish() catch |err| return switch (err) {
         error.EntryTooLarge => unreachable, // `finish` adds no entry
         else => |x| x,
@@ -640,6 +1016,30 @@ fn copyVersion(db: *Db, root: PageId, dest: kv.Storage, path: []const u8) CopyEr
     try dest.rename(tmp_path, path);
     renamed = true;
     try dest.syncDir();
+}
+
+/// Every entry of the tree at `root` into `loader`, in key order; a bucket's
+/// tree is loaded first, by a loader of its own over the same pages, and its
+/// cell then refers to the new root.
+fn copyTree(db: *Db, root: PageId, loader: *bulk.Loader) CopyError!void {
+    var cur = try Cursor.init(db.gpa, &db.pager, root);
+    defer cur.deinit();
+    try cur.first();
+    while (try cur.next()) |e| {
+        const added = if (e.bucket) blk: {
+            const hdr = cur.yieldedBucket();
+            var sub = loader.subtree();
+            defer sub.deinit();
+            try copyTree(db, hdr.root, &sub);
+            const sub_root = loader.adoptSubtree(&sub) catch |err| break :blk err;
+            break :blk loader.addBucket(e.key, .{ .root = sub_root, .seq = hdr.seq });
+        } else loader.add(e.key, e.val);
+        added catch |err| return switch (err) {
+            // The source held this entry, so its pages are lying about it.
+            error.EntryTooLarge => error.Corrupt,
+            else => |x| x,
+        };
+    }
 }
 
 /// `lookup` without the copy: the leaf page stays borrowed from the store and
@@ -660,7 +1060,7 @@ fn lookupRef(pager: *Pager, root: PageId, key: []const u8) GetRefError!?ValueRef
             .leaf => {
                 const leaf = format.Leaf.init(bytes);
                 const found = leaf.search(key);
-                if (!found.found) {
+                if (!found.found or leaf.isBucket(found.index)) {
                     pager.releasePageRef(ref);
                     return null;
                 }
@@ -698,7 +1098,9 @@ fn lookup(pager: *Pager, root: PageId, gpa: Allocator, key: []const u8) GetError
             .leaf => {
                 const leaf = format.Leaf.init(bytes);
                 const s = leaf.search(key);
-                if (!s.found) return null;
+                // A bucket is not a value: `get` of its name finds nothing,
+                // as bbolt's `Get` does.
+                if (!s.found or leaf.isBucket(s.index)) return null;
                 if (leaf.ovfLen(s.index)) |len| {
                     const out = try gpa.alloc(u8, len);
                     errdefer gpa.free(out);
@@ -706,6 +1108,27 @@ fn lookup(pager: *Pager, root: PageId, gpa: Allocator, key: []const u8) GetError
                     return out;
                 }
                 return try gpa.dupe(u8, leaf.valAt(s.index));
+            },
+        }
+    }
+}
+
+/// What a key is in the tree at `root`.
+const Cell = union(enum) { none, plain, bucket: format.BucketHdr };
+
+fn lookupCell(pager: *Pager, root: PageId, key: []const u8) (kv.Storage.Error || error{Corrupt})!Cell {
+    var page: [page_size]u8 = undefined;
+    var id = root;
+    while (true) {
+        try pager.readPage(id, &page);
+        switch (format.kindOf(&page) orelse return error.Corrupt) {
+            .branch => id = format.Branch.init(&page).childFor(key),
+            .leaf => {
+                const leaf = format.Leaf.init(&page);
+                const s = leaf.search(key);
+                if (!s.found) return .none;
+                if (!leaf.isBucket(s.index)) return .plain;
+                return .{ .bucket = format.BucketHdr.decode(leaf.valAt(s.index)) };
             },
         }
     }
@@ -921,7 +1344,16 @@ pub const Cursor = struct {
         return null;
     }
 
+    /// The header of the bucket `next` just yielded (`copyTo`'s walk).
+    fn yieldedBucket(self: *const Cursor) format.BucketHdr {
+        const top = &self.stack.items[self.stack.items.len - 1];
+        const leaf = format.Leaf.init(&top.page);
+        std.debug.assert(leaf.isBucket(top.idx - 1));
+        return format.BucketHdr.decode(leaf.valAt(top.idx - 1));
+    }
+
     fn entry(self: *Cursor, leaf: format.Leaf, i: usize) Error!KV {
+        if (leaf.isBucket(i)) return .{ .key = leaf.keyAt(i), .val = &.{}, .bucket = true };
         if (leaf.ovfLen(i)) |len| {
             try self.ovf_buf.resize(self.gpa, len);
             try readOverflow(self.pager, leaf.ovfFirst(i), self.ovf_buf.items);
@@ -987,6 +1419,58 @@ test "open takes an exclusive lock by default: a second concurrent opener over t
     defer db3.close();
     var db4 = try Db.open(testing.allocator, sim.storage(), "t.kvt", .{ .lock = .none });
     db4.close();
+}
+
+test "read_only: readers share the store, a writer is refused while one reads, and nothing is written" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true; // COW page store: meta slots + page reuse
+    const st = sim.storage();
+    // A reader creates nothing: no store, no file.
+    try testing.expectError(error.FileNotFound, Db.open(testing.allocator, st, "t.kvt", .{ .read_only = true }));
+    {
+        var w = try Db.open(testing.allocator, st, "t.kvt", .{});
+        defer w.close();
+        try w.put("a", "1");
+        try w.put("b", "2");
+        // A writer holds the store: a reader is refused.
+        try testing.expectError(error.Locked, Db.open(testing.allocator, st, "t.kvt", .{ .read_only = true }));
+    }
+    var r1 = try Db.open(testing.allocator, st, "t.kvt", .{ .read_only = true });
+    var r2 = try Db.open(testing.allocator, st, "t.kvt", .{ .read_only = true });
+    const v = (try r2.get(testing.allocator, "b")).?;
+    defer testing.allocator.free(v);
+    try testing.expectEqualStrings("2", v);
+    try testing.expectError(error.ReadOnly, r1.begin());
+    try testing.expectError(error.ReadOnly, r1.put("c", "3"));
+    // Readers hold the store: a writer is refused until the last one closes.
+    try testing.expectError(error.Locked, Db.open(testing.allocator, st, "t.kvt", .{}));
+    r1.close();
+    try testing.expectError(error.Locked, Db.open(testing.allocator, st, "t.kvt", .{}));
+    r2.close();
+    var w2 = try Db.open(testing.allocator, st, "t.kvt", .{});
+    defer w2.close();
+    try w2.put("c", "3");
+}
+
+test "read_only opens a copy that no writer ever opened, and refuses an empty file" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true; // COW page store: meta slots + page reuse
+    const st = sim.storage();
+    {
+        var w = try Db.open(testing.allocator, st, "t.kvt", .{});
+        defer w.close();
+        try w.put("k", "v");
+        try w.copyTo(st, "copy.kvt"); // no `copy.kvt.lock` exists
+    }
+    var r = try Db.open(testing.allocator, st, "copy.kvt", .{ .read_only = true });
+    const got = (try r.get(testing.allocator, "k")).?;
+    testing.allocator.free(got);
+    r.close();
+    const h = try st.open("empty.kvt", .open_or_create);
+    st.close(h);
+    try testing.expectError(error.NotAKvtreeFile, Db.open(testing.allocator, st, "empty.kvt", .{ .read_only = true }));
 }
 
 test "read path over a hand-built two-level tree: get + ordered scan + seek" {
@@ -1535,7 +2019,7 @@ fn longKey(buf: *[long_key_len]u8, id: u64) []const u8 {
     return buf;
 }
 
-const TreeShape = struct { depth: ?usize = null, tree_pages: usize = 0, keys: usize = 0, ovf_pages: usize = 0 };
+const TreeShape = struct { depth: ?usize = null, tree_pages: usize = 0, keys: usize = 0, ovf_pages: usize = 0, buckets: usize = 0 };
 
 /// Walk the current tree and check what dropping emptied nodes must keep
 /// true: every leaf at one depth, no empty leaf but an empty root, no root
@@ -1567,6 +2051,15 @@ fn walkShape(db: *Db, id: PageId, depth: usize, lo: ?[]const u8, hi: ?[]const u8
                 const k = leaf.keyAt(i);
                 if (lo) |l| try testing.expect(!std.mem.lessThan(u8, k, l));
                 if (hi) |h| try testing.expect(std.mem.lessThan(u8, k, h));
+                if (leaf.isBucket(i)) {
+                    // A nested tree: its own depth, its pages counted here.
+                    var sub: TreeShape = .{};
+                    try walkShape(db, format.BucketHdr.decode(leaf.valAt(i)).root, 0, null, null, true, &sub);
+                    shape.tree_pages += sub.tree_pages;
+                    shape.ovf_pages += sub.ovf_pages;
+                    shape.keys += sub.keys;
+                    shape.buckets += 1 + sub.buckets;
+                }
                 if (leaf.ovfLen(i)) |len| {
                     // Exactly the pages the length needs, each an overflow page.
                     var ovf: [page_size]u8 = undefined;
@@ -2635,4 +3128,469 @@ test "Snapshot.copyTo copies the pinned version while the writer moves on; it re
     }
     try testing.expectError(error.SamePath, db.copyTo(sim.storage(), "s.kvt"));
     try expectGet(&db, "c", "3");
+}
+
+// ── buckets ──────────────────────────────────────────────────────────────────
+
+fn expectBucketGet(b: ReadBucket, key: []const u8, want: ?[]const u8) !void {
+    const got = try b.get(testing.allocator, key);
+    defer if (got) |g| testing.allocator.free(g);
+    if (want) |w| try testing.expectEqualStrings(w, got orelse return error.TestExpectedValue) else try testing.expect(got == null);
+}
+
+test "buckets: nested key spaces apart from the root's and each other's, a sequence each, all surviving reopen" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "b.kvt", .{});
+        defer db.close();
+        try db.put("k", "root");
+        try testing.expectEqual(format.format_v2, db.meta_rec.version);
+        var txn = try db.begin();
+        const a = try txn.createBucket("a");
+        try a.put("k", "in a");
+        const x = try a.createBucket("x");
+        try x.put("k", "in a/x");
+        try testing.expectEqual(@as(u64, 1), try a.nextSequence());
+        try testing.expectEqual(@as(u64, 2), try a.nextSequence());
+        const b = try txn.createBucket("b");
+        try b.put("only-b", "1");
+        // Reads inside the transaction see its own buffered writes.
+        const v = (try x.get(testing.allocator, "k")).?;
+        defer testing.allocator.free(v);
+        try testing.expectEqualStrings("in a/x", v);
+        try txn.commit();
+        // The first bucket moves the store to v4, for good.
+        try testing.expectEqual(format.format_v4, db.meta_rec.version);
+        try db.put("later", "1");
+        try testing.expectEqual(format.format_v4, db.meta_rec.version);
+    }
+    var db = try Db.open(testing.allocator, sim.storage(), "b.kvt", .{});
+    defer db.close();
+    try expectGet(&db, "k", "root");
+    // A bucket is not a value: its name reads as absent.
+    try expectGet(&db, "a", null);
+    var snap = try db.snapshot();
+    defer snap.release();
+    const a = (try snap.bucket("a")).?;
+    try expectBucketGet(a, "k", "in a");
+    try expectBucketGet(a, "only-b", null);
+    try testing.expectEqual(@as(u64, 2), a.sequence());
+    const x = (try a.bucket("x")).?;
+    try expectBucketGet(x, "k", "in a/x");
+    try testing.expect((try snap.bucket("x")) == null); // not top-level
+    try testing.expect((try snap.bucket("k")) == null); // a plain key
+    const b = (try snap.bucket("b")).?;
+    try expectBucketGet(b, "only-b", "1");
+    // The root's cursor yields the buckets, flagged, in key order.
+    var cur = try snap.cursor();
+    defer cur.deinit();
+    try cur.first();
+    const want = [_]struct { []const u8, bool }{ .{ "a", true }, .{ "b", true }, .{ "k", false }, .{ "later", false } };
+    for (want) |w| {
+        const e = (try cur.next()).?;
+        try testing.expectEqualStrings(w[0], e.key);
+        try testing.expectEqual(w[1], e.bucket);
+        if (e.bucket) try testing.expectEqual(@as(usize, 0), e.val.len);
+    }
+    try testing.expect((try cur.next()) == null);
+    _ = try checkTreeShape(&db);
+}
+
+test "buckets: misuse is refused, and a refused commit leaves the store as it was" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "b.kvt", .{});
+    defer db.close();
+    {
+        var txn = try db.begin();
+        const a = try txn.createBucket("a");
+        _ = try a.createBucket("x");
+        try a.put("plain", "v");
+        try txn.put("p", "plain");
+        try testing.expectError(error.BucketExists, txn.createBucket("a"));
+        try testing.expectError(error.InvalidBucketName, txn.createBucket(""));
+        var long: [format.page_size]u8 = undefined;
+        @memset(&long, 'n');
+        try testing.expectError(error.InvalidBucketName, txn.createBucket(&long));
+        // `p` was put in this transaction: it cannot become a bucket in it.
+        try testing.expectError(error.IncompatibleValue, txn.createBucket("p"));
+        try testing.expectError(error.BucketNotFound, txn.deleteBucket("nope"));
+        try testing.expect((try txn.bucket("nope")) == null);
+        try txn.commit();
+    }
+    const before_meta = db.meta_rec;
+    {
+        var txn = try db.begin();
+        try testing.expectError(error.BucketExists, txn.createBucket("a"));
+        // A committed plain key cannot become a bucket, nor a bucket's plain key.
+        try testing.expectError(error.IncompatibleValue, txn.createBucket("p"));
+        const a = (try txn.bucket("a")).?;
+        try testing.expectError(error.IncompatibleValue, a.createBucket("plain"));
+        // IfNotExists hands back the one that is there.
+        const again = try txn.createBucketIfNotExists("a");
+        try testing.expectEqual(a.idx, again.idx);
+        txn.rollback();
+    }
+    // A plain put or delete over a bucket is refused by the commit -- at the
+    // top level and inside a bucket -- and the store does not move.
+    for ([_]bool{ false, true }) |nested| for ([_]bool{ false, true }) |is_del| {
+        var txn = try db.begin();
+        try txn.put("fine", "1");
+        if (nested) {
+            const a = (try txn.bucket("a")).?;
+            if (is_del) try a.del("x") else try a.put("x", "v");
+        } else {
+            if (is_del) try txn.del("a") else try txn.put("a", "v");
+        }
+        try testing.expectError(error.IncompatibleValue, txn.commit());
+        try testing.expectEqual(before_meta.txn_id, db.meta_rec.txn_id);
+        try testing.expect(!db.poisoned);
+    };
+    try expectGet(&db, "fine", null);
+    // A handle to a deleted bucket -- or to one inside it -- is dead.
+    {
+        var txn = try db.begin();
+        const a = (try txn.bucket("a")).?;
+        const x = (try a.bucket("x")).?;
+        try txn.deleteBucket("a");
+        try testing.expectError(error.BucketNotFound, a.put("k", "v"));
+        try testing.expectError(error.BucketNotFound, x.put("k", "v"));
+        try testing.expectError(error.BucketNotFound, x.sequence());
+        try testing.expect((try txn.bucket("a")) == null);
+        // Created again it is a new, empty bucket, without the old `x`.
+        const a2 = try txn.createBucket("a");
+        try testing.expect((try a2.bucket("x")) == null);
+        try testing.expect((try a2.get(testing.allocator, "plain")) == null);
+        try testing.expectEqual(@as(u64, 0), try a2.sequence());
+        try a2.put("new", "1");
+        try txn.commit();
+    }
+    var snap = try db.snapshot();
+    defer snap.release();
+    const a = (try snap.bucket("a")).?;
+    try expectBucketGet(a, "new", "1");
+    try expectBucketGet(a, "plain", null);
+    try testing.expect((try a.bucket("x")) == null);
+    // Every page of the old `a` went to the freelist.
+    _ = try checkTreeShape(&db);
+}
+
+test "buckets: deleting one frees every page of it, and a snapshot taken before still reads it all" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "b.kvt", .{ .shrink_min_pages = 0 });
+    defer db.close();
+    var big: [3 * format.page_size]u8 = undefined;
+    @memset(&big, 'B');
+    var kb: [16]u8 = undefined;
+    {
+        var txn = try db.begin();
+        const a = try txn.createBucket("a");
+        const x = try a.createBucket("x");
+        for (0..2000) |i| {
+            const k = try std.fmt.bufPrint(&kb, "key{d:0>6}", .{i});
+            try a.put(k, if (i % 100 == 0) &big else "value-0123456789");
+            if (i % 4 == 0) try x.put(k, "nested");
+        }
+        try txn.put("root", "1");
+        try txn.commit();
+    }
+    const full = try checkTreeShape(&db);
+    try testing.expectEqual(@as(usize, 2), full.buckets);
+    try testing.expect(full.ovf_pages >= 20 * 3);
+    var old = try db.snapshot();
+    {
+        var txn = try db.begin();
+        try txn.deleteBucket("a");
+        try txn.commit();
+    }
+    // A few more commits: they may recycle only what the snapshot cannot reach.
+    for (0..5) |i| try db.put(try std.fmt.bufPrint(&kb, "more{d}", .{i}), &big);
+    const after = try checkTreeShape(&db);
+    try testing.expectEqual(@as(usize, 0), after.buckets);
+    const oa = (try old.bucket("a")).?;
+    for (0..2000) |i| {
+        const k = try std.fmt.bufPrint(&kb, "key{d:0>6}", .{i});
+        const got = (try oa.get(testing.allocator, k)).?;
+        defer testing.allocator.free(got);
+        try testing.expectEqual(@as(usize, if (i % 100 == 0) big.len else 16), got.len);
+    }
+    try expectBucketGet((try oa.bucket("x")).?, "key000004", "nested");
+    old.release();
+    // With the snapshot gone, the bucket's pages are reused: the file stops growing.
+    const hw = db.meta_rec.high_water;
+    for (0..5) |i| try db.put(try std.fmt.bufPrint(&kb, "again{d}", .{i}), &big);
+    try testing.expectEqual(hw, db.meta_rec.high_water);
+    _ = try checkTreeShape(&db);
+}
+
+test "buckets: copyTo carries them, nested and with overflow values, compactly" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "b.kvt", .{});
+    defer db.close();
+    var big: [2 * format.page_size]u8 = undefined;
+    @memset(&big, 'C');
+    var kb: [16]u8 = undefined;
+    {
+        var txn = try db.begin();
+        for (0..300) |i| try txn.put(try std.fmt.bufPrint(&kb, "r{d:0>5}", .{i}), "root-value");
+        const a = try txn.createBucket("m-bucket");
+        _ = try a.nextSequence();
+        const x = try a.createBucket("x");
+        _ = try txn.createBucket("empty");
+        for (0..700) |i| {
+            const k = try std.fmt.bufPrint(&kb, "k{d:0>5}", .{i});
+            try a.put(k, if (i % 50 == 0) &big else "in-a");
+            try x.put(k, "in-x");
+        }
+        try txn.commit();
+    }
+    try db.copyTo(sim.storage(), "copy.kvt");
+    var copy = try Db.open(testing.allocator, sim.storage(), "copy.kvt", .{});
+    defer copy.close();
+    try testing.expectEqual(format.format_v4, copy.meta_rec.version);
+    try testing.expectEqual(@as(u64, 0), copy.meta_rec.free_count);
+    const shape = try checkTreeShape(&copy);
+    try testing.expectEqual(@as(usize, 3), shape.buckets);
+    var s1 = try db.snapshot();
+    defer s1.release();
+    var s2 = try copy.snapshot();
+    defer s2.release();
+    try expectSameTree(s1.root, &db.pager, s2.root, &copy.pager);
+    try testing.expectEqual(@as(u64, 1), (try s2.bucket("m-bucket")).?.sequence());
+}
+
+/// Two trees hold the same entries, buckets compared by content and sequence.
+fn expectSameTree(ra: PageId, pa: *Pager, rb: PageId, pb: *Pager) !void {
+    var ca = try Cursor.init(testing.allocator, pa, ra);
+    defer ca.deinit();
+    var cb = try Cursor.init(testing.allocator, pb, rb);
+    defer cb.deinit();
+    try ca.first();
+    try cb.first();
+    while (try ca.next()) |ea| {
+        const eb = (try cb.next()).?;
+        try testing.expectEqualStrings(ea.key, eb.key);
+        try testing.expectEqual(ea.bucket, eb.bucket);
+        if (ea.bucket) {
+            const ha = ca.yieldedBucket();
+            const hb = cb.yieldedBucket();
+            try testing.expectEqual(ha.seq, hb.seq);
+            try expectSameTree(ha.root, pa, hb.root, pb);
+        } else try testing.expectEqualSlices(u8, ea.val, eb.val);
+    }
+    try testing.expect((try cb.next()) == null);
+}
+
+/// The nested model of a store for the random test below: keys and buckets
+/// per bucket, by name.
+const MBucket = struct {
+    kvs: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    subs: std.StringArrayHashMapUnmanaged(*MBucket) = .empty,
+    seq: u64 = 0,
+
+    fn clone(self: *const MBucket, a: Allocator) !*MBucket {
+        const c = try a.create(MBucket);
+        c.* = .{ .seq = self.seq, .kvs = try self.kvs.clone(a) };
+        for (self.subs.keys(), self.subs.values()) |k, v| try c.subs.put(a, k, try v.clone(a));
+        return c;
+    }
+};
+
+/// The store's tree at `root` read back into an `MBucket`.
+fn observe(a: Allocator, pager: *Pager, root: PageId, seq: u64) !*MBucket {
+    const m = try a.create(MBucket);
+    m.* = .{ .seq = seq };
+    var cur = try Cursor.init(testing.allocator, pager, root);
+    defer cur.deinit();
+    try cur.first();
+    while (try cur.next()) |e| {
+        const k = try a.dupe(u8, e.key);
+        if (e.bucket) {
+            const hdr = cur.yieldedBucket();
+            try m.subs.put(a, k, try observe(a, pager, hdr.root, hdr.seq));
+        } else try m.kvs.put(a, k, try a.dupe(u8, e.val));
+    }
+    return m;
+}
+
+fn expectSameModel(want: *const MBucket, got: *const MBucket) !void {
+    try testing.expectEqual(want.seq, got.seq);
+    try testing.expectEqual(want.kvs.count(), got.kvs.count());
+    for (want.kvs.keys(), want.kvs.values()) |k, v| try testing.expectEqualSlices(u8, v, got.kvs.get(k) orelse return error.TestMissingKey);
+    try testing.expectEqual(want.subs.count(), got.subs.count());
+    for (want.subs.keys(), want.subs.values()) |k, v| try expectSameModel(v, got.subs.get(k) orelse return error.TestMissingBucket);
+}
+
+test "buckets: random transactions over two levels of buckets agree with a nested model, open snapshots and reopens included" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0xb0c4e75);
+    const r = prng.random();
+    var big: [format.page_size + 100]u8 = undefined;
+    @memset(&big, 'v');
+    const names = [_][]const u8{ "a", "b", "c" };
+    const inner = [_][]const u8{ "x", "y" };
+
+    var model = try a.create(MBucket);
+    model.* = .{};
+    var db = try Db.open(testing.allocator, sim.storage(), "m.kvt", .{});
+    defer db.close();
+    const Held = struct { snap: Snapshot, model: *MBucket };
+    var held: std.ArrayList(Held) = .empty;
+    defer held.deinit(testing.allocator);
+
+    var kb: [8]u8 = undefined;
+    for (0..400) |round| {
+        var txn = try db.begin();
+        var next = try model.clone(a);
+        for (0..r.intRangeAtMost(usize, 1, 12)) |_| {
+            // Pick a target: the root, a top-level bucket, or one inside it.
+            const depth = r.uintLessThan(u8, 3);
+            const n1 = names[r.uintLessThan(usize, names.len)];
+            const n2 = inner[r.uintLessThan(usize, inner.len)];
+            const key = try std.fmt.bufPrint(&kb, "k{d:0>2}", .{r.uintLessThan(u8, 40)});
+            const val: []const u8 = if (r.uintLessThan(u8, 20) == 0) &big else try std.fmt.allocPrint(a, "v{d}", .{r.int(u16)});
+            const op = r.uintLessThan(u8, 10);
+            if (depth == 0) {
+                if (op < 6) {
+                    try txn.put(key, val);
+                    try next.kvs.put(a, try a.dupe(u8, key), val);
+                } else {
+                    try txn.del(key);
+                    _ = next.kvs.orderedRemove(key);
+                }
+                continue;
+            }
+            // Bucket structure ops first, at the chosen depth.
+            if (op == 0) {
+                if (depth == 1) {
+                    if (next.subs.contains(n1)) {
+                        try txn.deleteBucket(n1);
+                        _ = next.subs.orderedRemove(n1);
+                    } else try testing.expectError(error.BucketNotFound, txn.deleteBucket(n1));
+                } else if (next.subs.get(n1)) |m1| {
+                    const b1 = (try txn.bucket(n1)).?;
+                    if (m1.subs.contains(n2)) {
+                        try b1.deleteBucket(n2);
+                        _ = m1.subs.orderedRemove(n2);
+                    } else try testing.expectError(error.BucketNotFound, b1.deleteBucket(n2));
+                }
+                continue;
+            }
+            const b1 = try txn.createBucketIfNotExists(n1);
+            const m1 = next.subs.get(n1) orelse blk: {
+                const nb = try a.create(MBucket);
+                nb.* = .{};
+                try next.subs.put(a, n1, nb);
+                break :blk nb;
+            };
+            var b = b1;
+            var m = m1;
+            if (depth == 2) {
+                b = try b1.createBucketIfNotExists(n2);
+                m = m1.subs.get(n2) orelse blk: {
+                    const nb = try a.create(MBucket);
+                    nb.* = .{};
+                    try m1.subs.put(a, n2, nb);
+                    break :blk nb;
+                };
+            }
+            if (op == 1) {
+                try testing.expectEqual(m.seq + 1, try b.nextSequence());
+                m.seq += 1;
+            } else if (op < 7) {
+                try b.put(key, val);
+                try m.kvs.put(a, try a.dupe(u8, key), val);
+            } else {
+                try b.del(key);
+                _ = m.kvs.orderedRemove(key);
+            }
+            // The transaction reads its own writes.
+            const got = try b.get(testing.allocator, key);
+            defer if (got) |g| testing.allocator.free(g);
+            const want = m.kvs.get(key);
+            try testing.expectEqual(want == null, got == null);
+            if (want) |w| try testing.expectEqualSlices(u8, w, got.?);
+        }
+        if (r.uintLessThan(u8, 8) == 0) {
+            txn.rollback();
+        } else {
+            try txn.commit();
+            model = next;
+        }
+        try expectSameModel(model, try observe(a, &db.pager, db.meta_rec.root, 0));
+        _ = try checkTreeShape(&db);
+        // Hold a few snapshots across later commits; each must keep reading
+        // its own version.
+        if (r.uintLessThan(u8, 6) == 0 and held.items.len < 4)
+            try held.append(testing.allocator, .{ .snap = try db.snapshot(), .model = try model.clone(a) });
+        if (held.items.len > 0 and r.uintLessThan(u8, 5) == 0) {
+            var h = held.swapRemove(r.uintLessThan(usize, held.items.len));
+            try expectSameModel(h.model, try observe(a, &db.pager, h.snap.root, 0));
+            h.snap.release();
+        }
+        if (round % 97 == 96 and held.items.len == 0) {
+            db.close();
+            db = try Db.open(testing.allocator, sim.storage(), "m.kvt", .{});
+            try expectSameModel(model, try observe(a, &db.pager, db.meta_rec.root, 0));
+        }
+    }
+    for (held.items) |*h| {
+        try expectSameModel(h.model, try observe(a, &db.pager, h.snap.root, 0));
+        h.snap.release();
+    }
+}
+
+test "buckets: recover rejects a version whose bucket cell is corrupt and adopts the one before" {
+    // The newest version's root leaf is the only page that changed in the
+    // last commit; corrupt its bucket cell -- the nested root pointing out of
+    // the file, or a header length that is no header -- and `recover` must
+    // refuse that meta and fall back to the previous version, which has its
+    // own, intact copy of the cell.
+    for ([_]bool{ false, true }) |corrupt_len| {
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.allow_overwrite = true;
+        var cell_off: usize = undefined;
+        {
+            var db = try Db.open(testing.allocator, sim.storage(), "c.kvt", .{});
+            defer db.close();
+            var txn = try db.begin();
+            // `b` sits between `a` and `z`, so its cell is not the page's
+            // last: a longer length still stays inside the page, and only the
+            // exact-header-length check can refuse it.
+            const b = try txn.createBucket("b");
+            try b.put("k", "v");
+            try txn.put("a", &(@as([200]u8, @splat('p')))); // room after `b`'s cell
+            try txn.commit();
+            try db.put("z", "newest");
+            var page: [page_size]u8 = undefined;
+            try db.pager.readPage(db.meta_rec.root, &page);
+            const leaf = format.Leaf.init(&page);
+            const s = leaf.search("b");
+            try testing.expect(s.found and leaf.isBucket(s.index));
+            const o = std.mem.readInt(u16, page[8 + 2 * @as(usize, s.index) ..][0..2], .little);
+            const page_off = @as(usize, db.meta_rec.root) * page_size;
+            // val_len's low byte (12 -> 76), or the nested root's high byte (the key is 1 byte).
+            cell_off = page_off + o + @as(usize, if (corrupt_len) 2 else 6 + 1 + 3);
+        }
+        sim.flipByte("c.kvt", cell_off);
+        var db = try Db.open(testing.allocator, sim.storage(), "c.kvt", .{});
+        defer db.close();
+        try expectGet(&db, "z", null); // the newest version was refused
+        var snap = try db.snapshot();
+        defer snap.release();
+        try expectBucketGet((try snap.bucket("b")).?, "k", "v");
+    }
 }
