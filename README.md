@@ -382,7 +382,7 @@ way to recognise it.
 | [`router`](modules/router/README.md) | 2 (S,A,P) | REST routing, go-chi/chi parity — trie matcher ({name}, in-segment, regexp, wildcard), middleware, groups/mount, host routing, 404/405 | any | http, regex |
 | [`saml`](modules/saml/README.md) | 3 (S,E,H,P) | SAML 2.0 SSO **service-provider** — XSW-hardened Response verification against an IdP key, AuthnRequest builder, SP-metadata generator, IdP-metadata parser, multi-key IdP rollover; decrypts `EncryptedAssertion` via `xmlenc` | any | xmldsig, xml, xmlenc, rsa, x509, datefmt |
 | [`security-headers`](modules/security-headers/README.md) | 3 (S,P) | Secure-by-default response headers (HSTS/CSP/nosniff/frame/referrer/COOP/CORP) | any | router, http |
-| [`sessions`](modules/sessions/README.md) | 3 (S,P) | Server-side web sessions + OWASP-hardened cookies + signed double-submit CSRF middleware | any | router, http, cookies, ramcache, entropy, kv |
+| [`sessions`](modules/sessions/README.md) | 2 (S,A,P) | Server-side web sessions + OWASP-hardened cookies + signed double-submit CSRF middleware | any | router, http, cookies, ramcache, entropy, kv |
 | [`staticfiles`](modules/staticfiles/README.md) | 2 (S,E,A,P) | Path-traversal-safe static file handler over `http` — MIME by extension, ETag/conditional 304, byte-range 206/416; symlinks not followed, dotfiles refused by default | any | http |
 | [`throttle`](modules/throttle/README.md) | 3 (S,P) | Global concurrency limit + load-shedding → 503 | posix | router, http |
 | [`tracecontext`](modules/tracecontext/README.md) | 2 (S,E,A,P) | W3C Trace Context — `traceparent`/`tracestate` parse + generate + propagation middleware (child span per hop) for distributed tracing | any | router, http |
@@ -492,8 +492,8 @@ way to recognise it.
 |---|:-:|---|---|---|
 | [`aesgcm`](modules/aesgcm/README.md) *(crypto)* | 2 (S,E,A,P) | AES-GCM (AES-128/192/256; any nonce length, SP 800-38D tag lengths) — stateful context caching the key schedule and GHASH powers, x86-64 AES-NI+PCLMULQDQ stitched one-pass kernel picked at run time, std fallback; std-shaped stateless API. | any (x86-64 AES-NI/PCLMULQDQ asm, run-time detected + std fallback) | aes192 |
 | [`http`](modules/http/README.md) *(web)* | 3 (S) | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32 |
-| [`kvtree`](modules/kvtree/README.md) *(storage)* | 3 (S,P) | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
-| [`ramcache`](modules/ramcache/README.md) *(storage)* | 3 (S,P) | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
+| [`kvtree`](modules/kvtree/README.md) *(storage)* | 3 (P) | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
+| [`ramcache`](modules/ramcache/README.md) *(storage)* | 3 (P) | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
 | [`resilience`](modules/resilience/README.md) *(web)* | 3 (S,E,P) | Circuit breaker + retry/backoff + timeout + bulkhead (concurrency limiter) for calling upstreams (generic) | posix | — |
 | [`rsa`](modules/rsa/README.md) *(crypto)* | 3 (S,P) | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint |
 | [`sphinx`](modules/sphinx/README.md) *(crypto)* | 4 (S) | Lightning BOLT#4 Sphinx onion routing — forward ECDH blinding chain, layered packet construction, constant-time layer peeling. | any | k256 |
@@ -515,8 +515,8 @@ way to recognise it.
 | [`jobqueue`](modules/jobqueue/README.md) | 3 (S,P) | Durable background-job queue over `kv` — lease/retry/dead-letter queue, per-partition FIFO under priority. | posix | kv |
 | [`jsonshape`](modules/jsonshape/README.md) | 3 (S,E,P) | JSON → `dataset` reshaping — dot-path descent and typed column projection (a minimal jq-style subset). | any | dataset |
 | [`kv`](modules/kv/README.md) | 3 (S,P) | Crash-consistent embedded KV store, Bitcask-style log, with randomized fuzz-tested crash recovery. | any | — |
-| [`kvtree`](modules/kvtree/README.md) | 3 (S,P) | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
-| [`ramcache`](modules/ramcache/README.md) | 3 (S,P) | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
+| [`kvtree`](modules/kvtree/README.md) | 3 (P) | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
+| [`ramcache`](modules/ramcache/README.md) | 3 (P) | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
 | [`tabular`](modules/tabular/README.md) | 3 (S,E,P) | Dataset algebra (pandas/dplyr-style verbs) over `dataset` — aggregate/pivot/resample/rolling/join, fx-aware. | any | dataset |
 | [`trie`](modules/trie/README.md) | 3 (S,P) | Prefix index for instant autocomplete over a large static string set. | any | — |
 | [`tsdb`](modules/tsdb/README.md) | 3 (S,P) | Time-series persistence over `kvtree` — ordered (series, timestamp) key codec, streaming range scans, Gorilla-compressed blocks, crash-safe retention by age or size budget. | any | kvtree |

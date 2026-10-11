@@ -25,6 +25,15 @@
 //! defense): a new id is minted, the data carried over, the old id killed in
 //! the store.
 //!
+//! ## Values, remember-me, enumeration, hashed store keys
+//!
+//! `Session.putValue`/`getValue`/`popValue`/`removeValue`/`valueIterator`/
+//! `clearValues` are a key/value + flash layer over the data blob (see
+//! `values.zig`); `Session.rememberMe` with `Options.persist_cookie = false`
+//! makes the cookie a browser-session cookie unless remembered;
+//! `Manager.iterate` walks every live session (logout-everywhere; `KvStore`
+//! only); `Options.hash_id_in_store` keys the store by SHA-256(id).
+//!
 //! ## Cookie hardening (OWASP Session Management Cheat Sheet)
 //!
 //! Session cookies are always `HttpOnly` (out of reach of page JS) and
@@ -70,6 +79,7 @@ const kv = @import("kv");
 
 const csrf = @import("csrf.zig");
 const idhex = @import("idhex.zig");
+const values = @import("values.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -123,7 +133,29 @@ pub const default_absolute_timeout_ns: i64 = 12 * 60 * 60 * std.time.ns_per_s;
 pub const default_cookie_name = "session";
 
 // Fixed record header: [created_ns i64 LE][last_seen_ns i64 LE], data follows.
+//
+// Bit 63 of the stored `created_ns` word is the session's remember-me flag
+// (`Session.rememberMe`); the timestamp itself is the low 63 bits read as a
+// signed (two's complement) 63-bit number, so any clock value in
+// [-2^62, 2^62) -- about +-146 years of nanoseconds, a negative one included --
+// round-trips exactly. Records written before the flag existed have bit 63
+// clear for every non-negative time, i.e. read as "flag off" and unchanged.
 const record_header_len = 16;
+const remember_bit: u64 = 1 << 63;
+const created_min: i64 = -(1 << 62);
+const created_max: i64 = (1 << 62) - 1;
+
+fn encodeCreated(created: i64, remember: bool) u64 {
+    const c: u64 = @bitCast(std.math.clamp(created, created_min, created_max));
+    return (c & ~remember_bit) | (if (remember) remember_bit else 0);
+}
+
+fn decodeCreated(word: u64) struct { created: i64, remember: bool } {
+    // Sign-extend bit 62 into bit 63.
+    const low = word & ~remember_bit;
+    const ext = if (low & (1 << 62) != 0) low | remember_bit else low;
+    return .{ .created = @bitCast(ext), .remember = word & remember_bit != 0 };
+}
 
 // ── clock injection (deterministic under test) ──────────────────────────────
 
@@ -232,6 +264,14 @@ pub const Store = struct {
         /// pre-delete generation fails closed — a delete always wins over a
         /// concurrent stale save.
         delete: *const fn (ptr: *anyopaque, id: []const u8) void,
+        /// Optional enumeration of every live record: call `visit(ctx, id,
+        /// loaded)` for each (`loaded.record` is borrowed for the call only;
+        /// `id` is the store key, which under `Options.hash_id_in_store` is
+        /// not the cookie id) and stop early when it returns false. Must not
+        /// hold the store's lock across `visit` -- the callback may `delete`.
+        /// Null = the store cannot enumerate (`Manager.iterate` then reports
+        /// `error.Unsupported`).
+        iterate: ?*const fn (ptr: *anyopaque, gpa: Allocator, ctx: ?*anyopaque, visit: *const fn (ctx: ?*anyopaque, id: []const u8, loaded: Loaded) bool) StoreError!void = null,
         /// The records outlive the process. `Manager.init` then refuses
         /// `Clock.monotonic`, whose origin a reboot resets (see `Clock`).
         persistent: bool = false,
@@ -247,6 +287,16 @@ pub const Store = struct {
     }
     pub fn delete(s: Store, id: []const u8) void {
         s.vtable.delete(s.ptr, id);
+    }
+    /// Enumerate the live records; see `VTable.iterate`.
+    pub fn iterate(
+        s: Store,
+        gpa: Allocator,
+        ctx: ?*anyopaque,
+        visit: *const fn (ctx: ?*anyopaque, id: []const u8, loaded: Loaded) bool,
+    ) error{ Unsupported, OutOfMemory }!void {
+        const f = s.vtable.iterate orelse return error.Unsupported;
+        return f(s.ptr, gpa, ctx, visit);
     }
 };
 
@@ -402,7 +452,7 @@ pub const KvStore = struct {
         return self.failed.load(.acquire);
     }
 
-    const vtable: Store.VTable = .{ .get = getImpl, .put = putImpl, .delete = deleteImpl, .persistent = true };
+    const vtable: Store.VTable = .{ .get = getImpl, .put = putImpl, .delete = deleteImpl, .iterate = iterateImpl, .persistent = true };
 
     const gen_prefix_len = 8;
     const KeyBuf = [max_prefix_len + 2 * max_id_bytes]u8;
@@ -471,6 +521,29 @@ pub const KvStore = struct {
         defer self.lock.release();
         self.db.delete(k) catch self.failed.store(true, .release);
     }
+
+    /// Every live session under this store's prefix: `db.keys` lists them
+    /// (a snapshot), then each is read like `get` does. A key removed between
+    /// the listing and its read, or not a framed record, is skipped. The lock
+    /// is taken per read, never across `visit`, so the callback may `delete`.
+    /// A closed (failed) store lists nothing.
+    fn iterateImpl(
+        ptr: *anyopaque,
+        gpa: Allocator,
+        ctx: ?*anyopaque,
+        visit: *const fn (ctx: ?*anyopaque, id: []const u8, loaded: Loaded) bool,
+    ) StoreError!void {
+        const self: *KvStore = @ptrCast(@alignCast(ptr));
+        if (self.hasFailed()) return;
+        const listing = try self.db.keys(gpa, self.prefix_buf[0..self.prefix_len]);
+        defer listing.deinit(gpa);
+        for (listing.keys) |k| {
+            const id = k[self.prefix_len..];
+            const loaded = (try getImpl(ptr, gpa, id)) orelse continue;
+            defer gpa.free(loaded.record);
+            if (!visit(ctx, id, loaded)) return;
+        }
+    }
 };
 
 fn lockSpin(m: *std.atomic.Mutex) void {
@@ -519,6 +592,10 @@ pub const Session = struct {
     /// exist. A new session nobody marked is not persisted at the end of the
     /// request (see `Options.persist_untouched_sessions`).
     kept: bool = false,
+    /// The remember-me flag (`rememberMe`): with `Options.persist_cookie =
+    /// false` it decides whether the cookie carries a `Max-Age`. Stored in the
+    /// record, so it survives save/load.
+    remember: bool = false,
 
     /// The hex-encoded session id (borrows this session's buffer).
     pub fn id(s: *const Session) []const u8 {
@@ -536,7 +613,78 @@ pub const Session = struct {
         if (bytes.len > s.data_buf.len) return error.Overflow;
         @memcpy(s.data_buf[0..bytes.len], bytes);
         s.data_len = bytes.len;
+        s.markModified();
+    }
+
+    /// The one place a mutation says "this session must be saved": every
+    /// writer (`setData`, the values API, `rememberMe`) goes through it.
+    fn markModified(s: *Session) void {
         s.kept = true;
+    }
+
+    // ── key/value + flash layer over the data blob ──────────────────────
+    //
+    // Encoding and rules: `values.zig`. This layer and raw `setData` share
+    // one blob; mixing them on a session yields `error.Malformed` from here,
+    // never a wrong value. scs analogues (alexedwards/scs v2.9.0 data.go):
+    // Put 155, Get 175, Pop 188, Remove 207, Clear 225, Keys 256.
+
+    /// (The parameter is `name`, not `key`: a value's name is no secret, and
+    /// `check-secret-api` reads `key` as one.)
+    ///
+    /// The value stored under `name` (a slice into `data()`: invalidated by the
+    /// next mutation), or null.
+    pub fn getValue(s: *const Session, name: []const u8) error{Malformed}!?[]const u8 {
+        return values.get(s.data(), name);
+    }
+
+    /// Store `val` under `name`, replacing a previous value in place or
+    /// appending. `error.Overflow` when the blob would exceed
+    /// `max_session_bytes`; `error.InvalidKey` for a name of 0 or more than 255
+    /// bytes. Marks the session modified. On error nothing changes.
+    pub fn putValue(s: *Session, name: []const u8, val: []const u8) ValueError!void {
+        s.data_len = try values.put(max_session_bytes, &s.data_buf, s.data_len, name, val);
+        s.markModified();
+    }
+
+    /// Remove `name`; true when it was there (and the session is then marked
+    /// modified).
+    pub fn removeValue(s: *Session, name: []const u8) error{Malformed}!bool {
+        const r = try values.remove(&s.data_buf, s.data_len, name);
+        if (!r.removed) return false;
+        s.data_len = r.len;
+        s.markModified();
+        return true;
+    }
+
+    /// Flash message: copy the value of `name` into `buf`, then remove it.
+    /// `error.BufferTooSmall` leaves the value in place. Null when absent.
+    pub fn popValue(s: *Session, name: []const u8, buf: []u8) error{ Malformed, BufferTooSmall }!?[]u8 {
+        const v = (try values.get(s.data(), name)) orelse return null;
+        if (v.len > buf.len) return error.BufferTooSmall;
+        const out = buf[0..v.len];
+        @memcpy(out, v);
+        _ = try s.removeValue(name);
+        return out;
+    }
+
+    /// Entries in insertion order; the slices point into `data()`.
+    pub fn valueIterator(s: *const Session) ValueIterator {
+        return ValueIterator.init(s.data());
+    }
+
+    /// Drop every value (and any raw payload): `setData(&.{})`.
+    pub fn clearValues(s: *Session) void {
+        s.setData(&.{}) catch unreachable; // an empty payload always fits
+    }
+
+    /// Remember-me (scs `RememberMe`, data.go:534; `Cookie.Persist`,
+    /// session.go:93-101): with `Options.persist_cookie = false` the session
+    /// cookie is a browser-session cookie unless this is on. Stored with the
+    /// session; marks it modified.
+    pub fn rememberMe(s: *Session, on: bool) void {
+        s.remember = on;
+        s.markModified();
     }
 
     /// Persist this session at the end of the request even though the handler
@@ -552,6 +700,22 @@ pub const Session = struct {
     pub fn revoke(s: *Session) void {
         s.revoked = true;
     }
+};
+
+/// Errors of the key/value layer (`Session.putValue`).
+pub const ValueError = values.Error;
+/// `Session.valueIterator`'s cursor: `next()` yields `{ key, val }` entries.
+pub const ValueIterator = values.Iterator;
+
+/// What `iterate`'s callback decides for the session it was just shown.
+pub const IterateAction = enum {
+    /// Leave it, go on to the next.
+    keep,
+    /// Remove it from the store (`Store.delete`: the generation is bumped,
+    /// so a request already holding it cannot resurrect it), go on.
+    destroy,
+    /// End the enumeration here, leaving this session alone.
+    stop,
 };
 
 /// The session the middleware attached to this request, or null when no
@@ -600,6 +764,20 @@ pub const Options = struct {
     /// store and evict live sessions. True restores "every request that
     /// arrives without a session gets one stored and a cookie issued".
     persist_untouched_sessions: bool = false,
+    /// true (default, today's behaviour): the session cookie always carries
+    /// `Max-Age` (rolling idle window). false: a browser-session cookie (no
+    /// `Max-Age`) unless the session called `rememberMe(true)` -- scs
+    /// `Cookie.Persist` (session.go:93-101, 211). The clearing cookie
+    /// (`Max-Age=-1` on destroy) is unaffected. The server-side idle/absolute
+    /// timeouts apply either way.
+    persist_cookie: bool = true,
+    /// false (default): the store is keyed by the session id itself. true: by
+    /// `SHA-256(id)` (32 raw bytes) -- a leaked or read-only-readable store
+    /// then does not hand out live session ids (scs `HashTokenInStore`,
+    /// data.go:627-630, applied at 646-683). The cookie and `Csrf` keep using
+    /// the real id. Changing it on a populated store logs everyone out.
+    /// `Manager.iterate` then shows the store key as `Session.id()`.
+    hash_id_in_store: bool = false,
 };
 
 /// The session manager: immutable config + the middleware over a `Store`.
@@ -619,6 +797,8 @@ pub const Manager = struct {
     same_site: cookies.SameSite,
     secure: bool,
     persist_untouched_sessions: bool,
+    persist_cookie: bool,
+    hash_id_in_store: bool,
 
     /// Build a manager. `gpa` is used only for the short-lived decode copies
     /// `Store.get` hands back (the store owns its own storage).
@@ -664,6 +844,8 @@ pub const Manager = struct {
             .same_site = options.same_site,
             .secure = options.secure and !options.allow_insecure_cookie,
             .persist_untouched_sessions = options.persist_untouched_sessions,
+            .persist_cookie = options.persist_cookie,
+            .hash_id_in_store = options.hash_id_in_store,
         };
     }
 
@@ -701,35 +883,67 @@ pub const Manager = struct {
     /// usable without an `http.Server.Request`.
     pub fn lookup(m: *const Manager, sid: []const u8, out: *Session) LoadResult {
         if (sid.len == 0 or sid.len > out.id_buf.len) return .absent;
-        const loaded = (m.store.get(m.gpa, sid) catch return .absent) orelse return .absent;
+        var key_buf: [store_key_max]u8 = undefined;
+        const key = m.storeKey(&key_buf, sid);
+        const loaded = (m.store.get(m.gpa, key) catch return .absent) orelse return .absent;
         defer m.gpa.free(loaded.record);
+        const now = m.clock.now();
+        switch (m.decode(key, loaded, out, now)) {
+            .loaded => {
+                // `decode` took the id from the store key; a cookie lookup
+                // wants the real id (they differ under `hash_id_in_store`).
+                @memcpy(out.id_buf[0..sid.len], sid);
+                out.id_len = sid.len;
+                out.last_seen_ns = now; // refresh idle window
+                return .loaded;
+            },
+            .absent => return .absent,
+            .expired => {
+                m.store.delete(key);
+                return .expired;
+            },
+        }
+    }
+
+    /// Decode a store record into `out` (id = the store `key` as given,
+    /// `last_seen_ns` as stored) or say why not. Shared by `lookup` and
+    /// `iterate`; deletes nothing.
+    fn decode(m: *const Manager, key: []const u8, loaded: Loaded, out: *Session, now: i64) LoadResult {
+        if (key.len == 0 or key.len > out.id_buf.len) return .absent;
         const rec = loaded.record;
         if (rec.len < record_header_len) return .absent; // corrupt
-        const created = std.mem.readInt(i64, rec[0..8], .little);
+        const word = decodeCreated(std.mem.readInt(u64, rec[0..8], .little));
+        const created = word.created;
         const last_seen = std.mem.readInt(i64, rec[8..16], .little);
         const payload = rec[record_header_len..];
         if (payload.len > out.data_buf.len) return .absent; // corrupt / oversized
 
-        const now = m.clock.now();
-        if (m.absolute_timeout_ns > 0 and now -| created > m.absolute_timeout_ns) {
-            m.store.delete(sid);
-            return .expired;
-        }
-        if (m.idle_timeout_ns > 0 and now -| last_seen > m.idle_timeout_ns) {
-            m.store.delete(sid);
-            return .expired;
-        }
+        if (m.absolute_timeout_ns > 0 and now -| created > m.absolute_timeout_ns) return .expired;
+        if (m.idle_timeout_ns > 0 and now -| last_seen > m.idle_timeout_ns) return .expired;
 
         out.* = .{};
-        @memcpy(out.id_buf[0..sid.len], sid);
-        out.id_len = sid.len;
+        @memcpy(out.id_buf[0..key.len], key);
+        out.id_len = key.len;
         out.created_ns = created;
-        out.last_seen_ns = now; // refresh idle window
+        out.last_seen_ns = last_seen;
+        out.remember = word.remember;
         @memcpy(out.data_buf[0..payload.len], payload);
         out.data_len = payload.len;
         out.is_new = false;
         out.generation = loaded.generation; // for the save-time CAS
         return .loaded;
+    }
+
+    /// Backing for a hashed key.
+    const store_key_max = 32;
+
+    /// The key `id` (a cookie value) is stored under: the id itself, or its
+    /// SHA-256 as 32 raw bytes under `hash_id_in_store` (both `RamcacheStore`
+    /// and `KvStore` take arbitrary key bytes). `buf` backs a hashed result.
+    fn storeKey(m: *const Manager, buf: *[store_key_max]u8, id: []const u8) []const u8 {
+        if (!m.hash_id_in_store) return id;
+        std.crypto.hash.sha2.Sha256.hash(id, buf, .{});
+        return buf;
     }
 
     /// Persist `s` to the store and stamp a refreshed `Set-Cookie`. Called by
@@ -748,8 +962,10 @@ pub const Manager = struct {
     /// but the cookie can't be (re)issued this response — a documented limit
     /// for new sessions behind an early flush.
     pub fn save(m: *const Manager, res: *http.Server.ResponseWriter, s: *Session) void {
-        if (m.persist(s))
-            m.writeCookie(res, s.id(), maxAgeSeconds(m.idle_timeout_ns));
+        if (m.persist(s)) {
+            const max_age: ?i64 = if (m.persist_cookie or s.remember) maxAgeSeconds(m.idle_timeout_ns) else null;
+            m.writeCookie(res, s.id(), max_age);
+        }
         // else: a concurrent destroy/regenerate/newer-write won the CAS — the
         // stale save is a no-op and issues no cookie. The session remains what
         // the winning request made it; the browser keeps its current cookie and
@@ -768,10 +984,11 @@ pub const Manager = struct {
     pub fn persist(m: *const Manager, s: *Session) bool {
         s.last_seen_ns = m.clock.now();
         var buf: [record_header_len + max_session_bytes]u8 = undefined;
-        std.mem.writeInt(i64, buf[0..8], s.created_ns, .little);
+        std.mem.writeInt(u64, buf[0..8], encodeCreated(s.created_ns, s.remember), .little);
         std.mem.writeInt(i64, buf[8..16], s.last_seen_ns, .little);
         @memcpy(buf[record_header_len..][0..s.data_len], s.data());
-        const new_gen = m.store.put(s.id(), buf[0 .. record_header_len + s.data_len], s.generation) orelse return false;
+        var key_buf: [store_key_max]u8 = undefined;
+        const new_gen = m.store.put(m.storeKey(&key_buf, s.id()), buf[0 .. record_header_len + s.data_len], s.generation) orelse return false;
         s.generation = new_gen;
         return true;
     }
@@ -790,7 +1007,8 @@ pub const Manager = struct {
     /// this directly only to destroy a *different* session's id (e.g. an
     /// admin ending someone else's session, or "log out my other devices").
     pub fn destroy(m: *const Manager, res: *http.Server.ResponseWriter, sid: []const u8) void {
-        m.store.delete(sid);
+        var key_buf: [store_key_max]u8 = undefined;
+        m.store.delete(m.storeKey(&key_buf, sid));
         m.writeCookie(res, "", -1);
     }
 
@@ -807,11 +1025,56 @@ pub const Manager = struct {
     /// is set so that invariant is explicit rather than implicit in `id()`'s
     /// side effect.
     pub fn regenerate(m: *const Manager, s: *Session) void {
-        m.store.delete(s.id()); // old id dead in the store (generation bumped)
+        var key_buf: [store_key_max]u8 = undefined;
+        m.store.delete(m.storeKey(&key_buf, s.id())); // old id dead in the store (generation bumped)
         m.newId(s); // overwrite id; created + data preserved
         s.generation = 0; // the new id is unstored ⇒ next save is a create-CAS
         s.regenerated = true;
     }
+
+    /// Enumerate every live session and let `f` keep, destroy or stop at each
+    /// (scs `Iterate`, data.go:541-569, with memstore `All`): logout-everywhere
+    /// for a user whose id the app stored in the session is one pass --
+    /// `getValue("uid")`, compare, `.destroy`. Returns how many were destroyed.
+    ///
+    /// A record past its idle or absolute timeout is skipped (`f` is not
+    /// called). `s` is decoded like `lookup` does and is valid for the call
+    /// only; **`s.id()` is the store key** -- the cookie id, unless
+    /// `Options.hash_id_in_store`, when it is `SHA-256(id)` as raw bytes and
+    /// must not be treated as a cookie value. `error.Unsupported` when the store
+    /// cannot enumerate (`RamcacheStore` has no entry iterator; `KvStore` can).
+    pub fn iterate(
+        m: *const Manager,
+        gpa: Allocator,
+        ctx: ?*anyopaque,
+        f: *const fn (ctx: ?*anyopaque, s: *const Session) IterateAction,
+    ) error{ Unsupported, OutOfMemory }!usize {
+        var st: IterateState = .{ .m = m, .ctx = ctx, .f = f };
+        try m.store.iterate(gpa, &st, IterateState.visit);
+        return st.destroyed;
+    }
+
+    const IterateState = struct {
+        m: *const Manager,
+        ctx: ?*anyopaque,
+        f: *const fn (ctx: ?*anyopaque, s: *const Session) IterateAction,
+        destroyed: usize = 0,
+
+        fn visit(state: ?*anyopaque, id: []const u8, loaded: Loaded) bool {
+            const st: *IterateState = @ptrCast(@alignCast(state.?));
+            var s: Session = undefined;
+            if (st.m.decode(id, loaded, &s, st.m.clock.now()) != .loaded) return true;
+            switch (st.f(st.ctx, &s)) {
+                .keep => {},
+                .destroy => {
+                    st.m.store.delete(id);
+                    st.destroyed += 1;
+                },
+                .stop => return false,
+            }
+            return true;
+        }
+    };
 
     /// A `router.Middleware` that loads-or-creates the session, attaches it to
     /// `ctx.data`, runs the chain, then saves (or destroys, if revoked).
@@ -836,7 +1099,7 @@ pub const Manager = struct {
         out.id_len = m.id_bytes * 2;
     }
 
-    fn writeCookie(m: *const Manager, res: *http.Server.ResponseWriter, value: []const u8, max_age: i64) void {
+    fn writeCookie(m: *const Manager, res: *http.Server.ResponseWriter, value: []const u8, max_age: ?i64) void {
         const sc: cookies.SetCookie = .{
             .name = m.cookie_name,
             .value = value,
@@ -924,6 +1187,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 test {
     _ = csrf;
     _ = idhex;
+    _ = values;
     _ = @import("stackprobe_test.zig");
 }
 
@@ -1588,7 +1852,7 @@ test "__Host- prefixed cookie name: the OWASP hardening measure the config surfa
 
 const App = struct {
     manager: *Manager,
-    action: enum { touch, write_big, revoke, regenerate, regenerate_only, read_only, keep } = .touch,
+    action: enum { touch, write_big, revoke, regenerate, regenerate_only, read_only, keep, put_uid, remember, flash_set, flash_pop } = .touch,
 };
 
 fn hSession(ctx: *router.Ctx) anyerror!void {
@@ -1622,6 +1886,22 @@ fn hSession(ctx: *router.Ctx) anyerror!void {
         .keep => {
             s.keep();
             try ctx.res.writeAll(s.id());
+        },
+        .put_uid => {
+            try s.putValue("uid", "42");
+            try ctx.res.writeAll(s.id());
+        },
+        .remember => {
+            s.rememberMe(true);
+            try ctx.res.writeAll(s.id());
+        },
+        .flash_set => {
+            try s.putValue("flash", "saved!");
+            try ctx.res.writeAll(s.id());
+        },
+        .flash_pop => {
+            var b: [32]u8 = undefined;
+            try ctx.res.writeAll((try s.popValue("flash", &b)) orelse "<none>");
         },
     }
 }
@@ -2389,7 +2669,7 @@ test "KvStore: once closed by a failed write, a readable record is still not ser
 
 const fuzz_driver = @import("testkit").fuzz.driver;
 
-const FuzzLabel = enum { absent, loaded, expired, cookie_found, cookie_missing };
+const FuzzLabel = enum { absent, loaded, expired, cookie_found, cookie_missing, values_ok, values_malformed };
 var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
 
 fn fuzz_mark(comptime l: FuzzLabel) void {
@@ -2478,11 +2758,140 @@ test "fuzz driver: SESSIONS_FUZZ" {
     try fuzz_driver.run(fuzzSessionRecordMutated, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-record-mutated" });
     try fuzz_driver.run(fuzzCookieParse, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-cookie" });
     try fuzz_driver.run(fuzzCookieMutated, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-cookie-mutated" });
+    try fuzz_driver.run(fuzzValuesDecode, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-values" });
+    try fuzz_driver.run(fuzzValuesMutated, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-values-mutated" });
+}
+
+// ── fuzz: the key/value decoder over arbitrary blob bytes ────────────────────
+
+/// Corpus for the key/value decoder: valid blobs (built by the encoder itself),
+/// a tag alone, the empty blob, a blob one octet short of the cap, and a
+/// foreign tag. Run time again, for the large one.
+const ValuesCorpus = struct {
+    stores: [6][4 + max_session_bytes]u8 = undefined,
+    entries: [6][]const u8 = undefined,
+
+    fn build(self: *ValuesCorpus) []const []const u8 {
+        const kit = @import("testkit").fuzz;
+        var blob: [max_session_bytes]u8 = undefined;
+        var len: usize = 0;
+        var n: usize = 0;
+        // 0: empty (no values).
+        self.entries[n] = kit.seedInto(&self.stores[n], blob[0..0]);
+        n += 1;
+        // 1: one small entry.
+        len = values.put(max_session_bytes, &blob, 0, "uid", "42") catch unreachable;
+        self.entries[n] = kit.seedInto(&self.stores[n], blob[0..len]);
+        n += 1;
+        // 2: two entries, the second with an empty value.
+        len = values.put(max_session_bytes, &blob, len, "flash", "") catch unreachable;
+        self.entries[n] = kit.seedInto(&self.stores[n], blob[0..len]);
+        n += 1;
+        // 3: one entry that fills the blob to exactly max_session_bytes.
+        len = values.put(max_session_bytes, &blob, 0, "big", &@as([max_session_bytes - 7]u8, @splat('z'))) catch unreachable;
+        self.entries[n] = kit.seedInto(&self.stores[n], blob[0..len]);
+        n += 1;
+        // 4: the tag alone.
+        blob[0] = values.tag;
+        self.entries[n] = kit.seedInto(&self.stores[n], blob[0..1]);
+        n += 1;
+        // 5: a foreign tag.
+        blob[0] = 0xA0;
+        self.entries[n] = kit.seedInto(&self.stores[n], blob[0..1]);
+        n += 1;
+        std.debug.assert(n == self.entries.len);
+        return &self.entries;
+    }
+};
+
+/// Decode `blob` as a session's data three ways (iterator, `getValue`, a
+/// mutation) and insist they agree: Malformed everywhere or nowhere, a failed
+/// mutation changes nothing, a successful one is read back.
+fn valuesCheck(blob: []const u8) !void {
+    var s: Session = .{};
+    @memcpy(s.data_buf[0..blob.len], blob);
+    s.data_len = blob.len;
+
+    var it = s.valueIterator();
+    var malformed = false;
+    while (true) {
+        const e = it.next() catch {
+            malformed = true;
+            break;
+        } orelse break;
+        if (e.key.len == 0 or e.key.len > 255) return error.BadKey;
+    }
+    if (s.getValue("fz")) |_| {
+        if (malformed) return error.GetDisagrees;
+    } else |_| {
+        if (!malformed) return error.GetDisagrees;
+    }
+
+    if (s.putValue("fz", "v")) {
+        if (malformed) return error.PutAcceptedMalformed;
+        if (!std.mem.eql(u8, (try s.getValue("fz")).?, "v")) return error.PutNotReadBack;
+        if (!try s.removeValue("fz")) return error.RemoveMissed;
+        fuzz_mark(.values_ok);
+    } else |err| {
+        if (!std.mem.eql(u8, s.data(), blob)) return error.FailedPutChanged;
+        const is_malformed = err == error.Malformed;
+        if (is_malformed != malformed) return error.PutDisagrees;
+        if (is_malformed) fuzz_mark(.values_malformed) else fuzz_mark(.values_ok);
+    }
+}
+
+fn fuzzValuesDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var blob: [max_session_bytes]u8 = undefined;
+    // ⚠ One byte-first draw. Never `bytes` then a ranged length.
+    const len: usize = src.slice(&blob);
+    try valuesCheck(blob[0..len]);
+}
+
+fn fuzzValuesMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var corpus: ValuesCorpus = .{};
+    var blob: [max_session_bytes]u8 = undefined;
+    try valuesCheck(damaged(S, src, corpus.build(), &blob));
+}
+
+test "fuzz: key/value decode never panics, and the iterator, getValue and putValue agree" {
+    var corpus: ValuesCorpus = .{};
+    try testing.fuzz({}, fuzzScript(fuzzValuesDecode, max_session_bytes), .{ .corpus = corpus.build() });
+    try testing.fuzz({}, fuzzScript(fuzzValuesMutated, 64), .{});
+}
+
+test "corpus: every key/value seed reaches the decoder, and the entries recovered are pinned" {
+    // Entries can only come from a blob that parsed; an empty corpus entry
+    // is a valid empty set, so "did not panic" says nothing.
+    var corpus: ValuesCorpus = .{};
+    var ok: usize = 0;
+    var bad: usize = 0;
+    var entries: usize = 0;
+    for (corpus.build()) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var blob: [max_session_bytes]u8 = undefined;
+        const len: usize = smith.slice(&blob);
+        var it = values.Iterator.init(blob[0..len]);
+        while (true) {
+            _ = it.next() catch {
+                bad += 1;
+                break;
+            } orelse {
+                ok += 1;
+                break;
+            };
+            entries += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 5), ok);
+    try testing.expectEqual(@as(usize, 1), bad);
+    try testing.expectEqual(@as(usize, 4), entries); // 0 + 1 + 2 + 1 + 0
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
     fuzz_reach = @splat(0);
-    inline for (.{ fuzzSessionRecordDecode, fuzzSessionRecordMutated, fuzzCookieParse, fuzzCookieMutated }, 0..) |h, which| {
+    inline for (.{ fuzzSessionRecordDecode, fuzzSessionRecordMutated, fuzzCookieParse, fuzzCookieMutated, fuzzValuesDecode, fuzzValuesMutated }, 0..) |h, which| {
         for (0..400) |sd| {
             var prng = std.Random.DefaultPrng.init(sd);
             var rng: fuzz_driver.Rng = .{ .r = prng.random() };
@@ -2699,4 +3108,574 @@ test "model: Manager over RamcacheStore and KvStore agrees with a naive session 
         std.debug.print("model reach: {t} never hit\n", .{@as(ModelReach, @enumFromInt(i))});
         return error.ModelDoesNotReach;
     };
+}
+
+// ── key/value layer, remember-me, enumerate, hashed store keys (2026-10-11) ──
+
+test "Session values: put/get/replace/remove/pop/iterate/clear, and they mark the session modified" {
+    var s: Session = .{};
+    try testing.expect(!s.kept);
+    try testing.expect((try s.getValue("uid")) == null);
+    try testing.expect(!s.kept); // reading marks nothing
+    try testing.expect(!(try s.removeValue("uid")));
+    try testing.expect(!s.kept); // removing nothing marks nothing
+
+    try s.putValue("uid", "42");
+    try testing.expect(s.kept);
+    try s.putValue("theme", "dark");
+    try s.putValue("uid", "4711"); // replaced in place, order kept
+    try testing.expectEqualStrings("4711", (try s.getValue("uid")).?);
+    var it = s.valueIterator();
+    const e0 = (try it.next()).?;
+    try testing.expectEqualStrings("uid", e0.key);
+    try testing.expectEqualStrings("4711", e0.val);
+    try testing.expectEqualStrings("theme", (try it.next()).?.key);
+    try testing.expect((try it.next()) == null);
+
+    // Flash: popped once.
+    try s.putValue("flash", "saved");
+    var small: [3]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, s.popValue("flash", &small));
+    try testing.expectEqualStrings("saved", (try s.getValue("flash")).?); // not lost
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("saved", (try s.popValue("flash", &buf)).?);
+    try testing.expect((try s.popValue("flash", &buf)) == null);
+    try testing.expect((try s.getValue("flash")) == null);
+
+    try testing.expect(try s.removeValue("theme"));
+    s.kept = false;
+    s.clearValues();
+    try testing.expect(s.kept);
+    try testing.expectEqual(@as(usize, 0), s.data().len);
+    try testing.expect((try s.getValue("uid")) == null);
+
+    try testing.expectError(error.InvalidKey, s.putValue("", "x"));
+    try testing.expectError(error.InvalidKey, s.putValue(&@as([256]u8, @splat('k')), "x"));
+    const huge: [max_session_bytes]u8 = @splat('v');
+    try testing.expectError(error.Overflow, s.putValue("k", &huge));
+    try testing.expectEqual(@as(usize, 0), s.data().len); // a refused put changed nothing
+}
+
+test "Session values: raw setData on the same session is Malformed, never a value or a panic" {
+    var s: Session = .{};
+    try s.setData("uid=42");
+    try testing.expectError(error.Malformed, s.getValue("uid"));
+    try testing.expectError(error.Malformed, s.putValue("uid", "1"));
+    try testing.expectError(error.Malformed, s.removeValue("uid"));
+    var buf: [8]u8 = undefined;
+    try testing.expectError(error.Malformed, s.popValue("uid", &buf));
+    var it = s.valueIterator();
+    try testing.expectError(error.Malformed, it.next());
+    try testing.expectEqualStrings("uid=42", s.data()); // untouched
+    s.clearValues(); // the way out
+    try s.putValue("uid", "1");
+}
+
+test "model: the key/value layer agrees with an ordered map on random operations" {
+    const Reach = enum { put_new, put_replace, overflow, invalid_key, removed, remove_absent, popped, too_small, cleared, malformed };
+    var reach = [_]usize{0} ** @typeInfo(Reach).@"enum".fields.len;
+    const key_pool = [_][]const u8{ "uid", "a", "flash", "csrf", "theme", "k" ** 255, "x" ** 40, "lang" };
+    for (0..(if (@import("builtin").mode == .Debug) 100 else 400)) |case_seed| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var prng = std.Random.DefaultPrng.init(case_seed);
+        const rnd = prng.random();
+        var md: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+        var s: Session = .{};
+        var scratch: [max_session_bytes]u8 = undefined;
+
+        for (0..60 + rnd.uintLessThan(usize, 80)) |step| {
+            errdefer std.debug.print("values model: seed={d} step={d}\n", .{ case_seed, step });
+            const key = key_pool[rnd.uintLessThan(usize, key_pool.len)];
+            switch (rnd.uintLessThan(u8, 12)) {
+                0, 1, 2, 3, 4 => {
+                    const vlen: usize = if (rnd.uintLessThan(u8, 10) == 0) 1000 + rnd.uintLessThan(usize, 2200) else rnd.uintLessThan(usize, 40);
+                    rnd.bytes(scratch[0..vlen]);
+                    // The size the encoding would have afterwards.
+                    var size: usize = 0;
+                    for (md.keys(), md.values()) |k, v| size += 3 + k.len + v.len;
+                    const old: usize = if (md.get(key)) |v| 3 + key.len + v.len else 0;
+                    const after = (if (size == 0) 1 else 1 + size) - old + 3 + key.len + vlen;
+                    if (after > max_session_bytes) {
+                        try testing.expectError(error.Overflow, s.putValue(key, scratch[0..vlen]));
+                        reach[@intFromEnum(Reach.overflow)] += 1;
+                    } else {
+                        try s.putValue(key, scratch[0..vlen]);
+                        reach[@intFromEnum(if (old != 0) Reach.put_replace else Reach.put_new)] += 1;
+                        try md.put(arena, key, try arena.dupe(u8, scratch[0..vlen]));
+                    }
+                },
+                5 => {
+                    const long_key: [256]u8 = @splat('z');
+                    const bad_key: []const u8 = if (rnd.boolean()) "" else &long_key;
+                    try testing.expectError(error.InvalidKey, s.putValue(bad_key, "v"));
+                    reach[@intFromEnum(Reach.invalid_key)] += 1;
+                },
+                6, 7 => {
+                    const had = md.contains(key);
+                    try testing.expectEqual(had, try s.removeValue(key));
+                    if (had) _ = md.orderedRemove(key);
+                    reach[@intFromEnum(if (had) Reach.removed else Reach.remove_absent)] += 1;
+                },
+                8, 9 => {
+                    var pbuf: [64]u8 = undefined;
+                    const blen = rnd.uintLessThan(usize, pbuf.len + 1);
+                    if (md.get(key)) |v| {
+                        if (v.len > blen) {
+                            try testing.expectError(error.BufferTooSmall, s.popValue(key, pbuf[0..blen]));
+                            reach[@intFromEnum(Reach.too_small)] += 1;
+                        } else {
+                            try testing.expectEqualSlices(u8, v, (try s.popValue(key, pbuf[0..blen])).?);
+                            _ = md.orderedRemove(key);
+                            reach[@intFromEnum(Reach.popped)] += 1;
+                        }
+                    } else try testing.expect((try s.popValue(key, pbuf[0..blen])) == null);
+                },
+                10 => if (rnd.uintLessThan(u8, 3) == 0) {
+                    s.clearValues();
+                    md.clearRetainingCapacity();
+                    reach[@intFromEnum(Reach.cleared)] += 1;
+                },
+                else => if (rnd.uintLessThan(u8, 6) == 0) {
+                    // A raw payload on the same session: every access says so.
+                    try s.setData("not a value blob");
+                    try testing.expectError(error.Malformed, s.getValue(key));
+                    s.clearValues();
+                    md.clearRetainingCapacity();
+                    reach[@intFromEnum(Reach.malformed)] += 1;
+                },
+            }
+            // The whole state agrees: same entries, same order.
+            var it = s.valueIterator();
+            for (md.keys(), md.values()) |k, v| {
+                const e = (try it.next()).?;
+                try testing.expectEqualSlices(u8, k, e.key);
+                try testing.expectEqualSlices(u8, v, e.val);
+                try testing.expectEqualSlices(u8, v, (try s.getValue(k)).?);
+            }
+            try testing.expect((try it.next()) == null);
+        }
+    }
+    for (reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("values model reach: {t} never hit\n", .{@as(Reach, @enumFromInt(i))});
+        return error.ModelDoesNotReach;
+    };
+}
+
+test "created word: the remember bit and the timestamp share it; any 63-bit time round-trips" {
+    const times = [_]i64{ 0, 1, -1, 1000, -5000, std.math.maxInt(i64) >> 1, std.math.minInt(i64) >> 1, 1_800_000_000 * std.time.ns_per_s, -1_800_000_000 * std.time.ns_per_s };
+    for (times) |t| for ([_]bool{ false, true }) |flag| {
+        const d = decodeCreated(encodeCreated(t, flag));
+        try testing.expectEqual(t, d.created);
+        try testing.expectEqual(flag, d.remember);
+    };
+    // Out of range saturates instead of wrapping into the other sign.
+    try testing.expectEqual(created_max, decodeCreated(encodeCreated(std.math.maxInt(i64), false)).created);
+    try testing.expectEqual(created_min, decodeCreated(encodeCreated(std.math.minInt(i64), true)).created);
+    // A record written before the flag existed (positive time, bit 63 clear) reads as off.
+    try testing.expect(!decodeCreated(@bitCast(@as(i64, 1_790_000_000_000_000_000))).remember);
+}
+
+/// The `Set-Cookie` value `Manager.save` stamps for `s` (slice into `out_buf`).
+fn setCookieOf(m: *const Manager, s: *Session, out_buf: *[1024]u8) []const u8 {
+    var out: Writer = .fixed(out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    m.save(&rw, s);
+    rw.end() catch unreachable;
+    return headerValue(out.buffered(), "Set-Cookie").?;
+}
+
+fn knownSession(known_id: []const u8) Session {
+    var s: Session = .{};
+    @memcpy(s.id_buf[0..known_id.len], known_id);
+    s.id_len = known_id.len;
+    s.created_ns = 1;
+    s.last_seen_ns = 1;
+    return s;
+}
+
+test "persist_cookie: the three Set-Cookie shapes, byte for byte (and the clearing cookie unchanged)" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    const tail = "; Secure; HttpOnly; SameSite=Lax";
+    var out_buf: [1024]u8 = undefined;
+    const idle = 10 * std.time.ns_per_s;
+
+    // 1. Default: every cookie carries Max-Age -- today's bytes.
+    const m_default = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .clock = env.clk.clock(), .idle_timeout_ns = idle });
+    var s1 = knownSession("deadbeef" ** 8);
+    try testing.expectEqualStrings("session=" ++ ("deadbeef" ** 8) ++ "; Path=/; Max-Age=10" ++ tail, setCookieOf(&m_default, &s1, &out_buf));
+
+    // 2. persist_cookie = false, not remembered: a browser-session cookie.
+    const m_session = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .clock = env.clk.clock(), .idle_timeout_ns = idle, .persist_cookie = false });
+    var s2 = knownSession("cafebabe" ** 8);
+    try testing.expectEqualStrings("session=" ++ ("cafebabe" ** 8) ++ "; Path=/" ++ tail, setCookieOf(&m_session, &s2, &out_buf));
+
+    // 3. persist_cookie = false, rememberMe(true): Max-Age again.
+    var s3 = knownSession("feedface" ** 8);
+    s3.rememberMe(true);
+    try testing.expectEqualStrings("session=" ++ ("feedface" ** 8) ++ "; Path=/; Max-Age=10" ++ tail, setCookieOf(&m_session, &s3, &out_buf));
+
+    // The default manager ignores the flag; rememberMe(false) is off again.
+    var s4 = knownSession("0123abcd" ** 8);
+    s4.rememberMe(true);
+    s4.rememberMe(false);
+    try testing.expectEqualStrings("session=" ++ ("0123abcd" ** 8) ++ "; Path=/" ++ tail, setCookieOf(&m_session, &s4, &out_buf));
+
+    // The clearing cookie is the same for both.
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    m_session.destroy(&rw, "cafebabe" ** 8);
+    try rw.end();
+    try testing.expectEqualStrings("session=; Path=/; Max-Age=-1" ++ tail, headerValue(out.buffered(), "Set-Cookie").?);
+}
+
+test "rememberMe: the flag survives save/load through RamcacheStore" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var s: Session = .{};
+    m.create(&s);
+    try testing.expect(!s.remember);
+    s.rememberMe(true);
+    try testing.expect(s.kept); // marks the session modified
+    try testing.expect(m.persist(&s));
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(s.id(), &l));
+    try testing.expect(l.remember);
+    try testing.expectEqual(s.created_ns, l.created_ns); // the timestamp is untouched by the flag
+    l.rememberMe(false);
+    try testing.expect(m.persist(&l));
+    var l2: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(s.id(), &l2));
+    try testing.expect(!l2.remember);
+    // Rotating the id keeps it.
+    l2.rememberMe(true);
+    m.regenerate(&l2);
+    try testing.expect(m.persist(&l2));
+    var l3: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(l2.id(), &l3));
+    try testing.expect(l3.remember);
+}
+
+test "rememberMe: the flag survives save/load and a restart through KvStore, also on a negative clock" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    env.clk.now_ns = -5000; // a Clock may have any origin
+    var m = try env.manager();
+    var s: Session = .{};
+    m.create(&s);
+    try testing.expectEqual(@as(i64, -5000), s.created_ns);
+    s.rememberMe(true);
+    try testing.expect(m.persist(&s));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+
+    try env.restart();
+    m = try env.manager();
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
+    try testing.expect(l.remember);
+    try testing.expectEqual(@as(i64, -5000), l.created_ns);
+    // Timeouts still count from the negative origin.
+    env.clk.now_ns = -5000 + 100_001;
+    try testing.expectEqual(Manager.LoadResult.expired, m.lookup(id, &l));
+}
+
+test "middleware: persist_cookie = false gives a session cookie until the handler calls rememberMe" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try Manager.init(testing.allocator, env.store.store(), .{
+        .io = testing.io,
+        .clock = env.clk.clock(),
+        .idle_timeout_ns = 10 * std.time.ns_per_s,
+        .absolute_timeout_ns = 100 * std.time.ns_per_s,
+        .persist_cookie = false,
+    });
+    var app = App{ .manager = &m, .action = .put_uid };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", hSession);
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+
+    const first = getWithCookie(&r, null, &out, &rbody);
+    const sc1 = headerValue(first, "Set-Cookie").?;
+    try testing.expect(std.mem.indexOf(u8, sc1, "Max-Age") == null);
+    try testing.expect(std.mem.indexOf(u8, sc1, "Expires") == null);
+    var id_buf: [64]u8 = undefined;
+    @memcpy(&id_buf, cookieId(sc1));
+    const id: []const u8 = &id_buf;
+
+    // Logging in with "remember me": from now on the cookie persists.
+    app.action = .remember;
+    const second = getWithCookie(&r, id, &out, &rbody);
+    try testing.expect(std.mem.indexOf(u8, headerValue(second, "Set-Cookie").?, "Max-Age=10;") != null);
+    app.action = .read_only;
+    const third = getWithCookie(&r, id, &out, &rbody);
+    try testing.expect(std.mem.indexOf(u8, headerValue(third, "Set-Cookie").?, "Max-Age=10;") != null);
+
+    // A different visitor who did not tick the box still gets a session cookie.
+    app.action = .put_uid;
+    const other = getWithCookie(&r, null, &out, &rbody);
+    try testing.expect(std.mem.indexOf(u8, headerValue(other, "Set-Cookie").?, "Max-Age") == null);
+}
+
+test "middleware: putValue creates and persists a session; a flash message is read once" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var app = App{ .manager = &m, .action = .flash_set };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", hSession);
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+
+    const first = getWithCookie(&r, null, &out, &rbody); // no setData / keep: putValue alone persists
+    var id_buf: [64]u8 = undefined;
+    @memcpy(&id_buf, cookieId(headerValue(first, "Set-Cookie").?));
+    const id: []const u8 = &id_buf;
+    app.action = .flash_pop;
+    try testing.expectEqualStrings("saved!", bodyOf(getWithCookie(&r, id, &out, &rbody)));
+    try testing.expectEqualStrings("<none>", bodyOf(getWithCookie(&r, id, &out, &rbody))); // gone: the pop was saved
+}
+
+/// `uid`-matching callback for `Manager.iterate`: logout-everywhere.
+const Logout = struct {
+    uid: []const u8,
+    seen: usize = 0,
+    stop_after: usize = std.math.maxInt(usize),
+
+    fn visit(ctx: ?*anyopaque, s: *const Session) IterateAction {
+        const c: *Logout = @ptrCast(@alignCast(ctx.?));
+        c.seen += 1;
+        if (c.seen >= c.stop_after) return .stop;
+        const v = (s.getValue("uid") catch return .keep) orelse return .keep;
+        return if (std.mem.eql(u8, v, c.uid)) .destroy else .keep;
+    }
+};
+
+/// Five sessions in `m`: three of user "A", two of user "B".
+fn fiveUsers(m: *const Manager, ids: *[5][64]u8) !void {
+    for (ids, [_][]const u8{ "A", "A", "A", "B", "B" }) |*id, uid| {
+        var s: Session = .{};
+        m.create(&s);
+        try s.putValue("uid", uid);
+        try testing.expect(m.persist(&s));
+        @memcpy(id, s.id());
+    }
+}
+
+test "Manager.iterate: logout-everywhere for one user over KvStore; the CAS still holds" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    var m = try env.manager();
+    var ids: [5][64]u8 = undefined;
+    try fiveUsers(&m, &ids);
+    // Not sessions: another key of the same Db, and a junk value under the prefix.
+    try env.db.put("user:1", "not a session");
+    try env.db.put("session:short", "xy");
+
+    var stale: Session = .{}; // a request of user A already in flight
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(&ids[0], &stale));
+
+    var ctx: Logout = .{ .uid = "A" };
+    try testing.expectEqual(@as(usize, 3), try m.iterate(testing.allocator, &ctx, Logout.visit));
+    try testing.expectEqual(@as(usize, 5), ctx.seen); // the two non-sessions were not shown
+    var l: Session = .{};
+    for (ids[0..3]) |*id| try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
+    for (ids[3..5]) |*id| {
+        try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
+        try testing.expectEqualStrings("B", (try l.getValue("uid")).?);
+    }
+    // The destroy bumped the generation: the in-flight request cannot bring A back.
+    try testing.expect(!m.persist(&stale));
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(&ids[0], &l));
+
+    // Nothing left of A; B untouched.
+    ctx = .{ .uid = "A" };
+    try testing.expectEqual(@as(usize, 0), try m.iterate(testing.allocator, &ctx, Logout.visit));
+    try testing.expectEqual(@as(usize, 2), ctx.seen);
+
+    // `.stop` ends it early and destroys nothing.
+    ctx = .{ .uid = "B", .stop_after = 1 };
+    try testing.expectEqual(@as(usize, 0), try m.iterate(testing.allocator, &ctx, Logout.visit));
+    try testing.expectEqual(@as(usize, 1), ctx.seen);
+
+    // Past the idle timeout nothing is shown.
+    env.clk.now_ns += 20_000;
+    ctx = .{ .uid = "B" };
+    try testing.expectEqual(@as(usize, 0), try m.iterate(testing.allocator, &ctx, Logout.visit));
+    try testing.expectEqual(@as(usize, 0), ctx.seen);
+}
+
+test "Manager.iterate: RamcacheStore cannot enumerate" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var ctx: Logout = .{ .uid = "A" };
+    try testing.expectError(error.Unsupported, m.iterate(testing.allocator, &ctx, Logout.visit));
+    try testing.expectEqual(@as(usize, 0), ctx.seen);
+}
+
+fn sha256Of(id: []const u8) [32]u8 {
+    var h: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(id, &h, .{});
+    return h;
+}
+
+test "hash_id_in_store: RamcacheStore is keyed by SHA-256(id); create/load/regenerate/destroy round-trip" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try Manager.init(testing.allocator, env.store.store(), .{
+        .io = testing.io,
+        .clock = env.clk.clock(),
+        .idle_timeout_ns = 10_000,
+        .absolute_timeout_ns = 100_000,
+        .hash_id_in_store = true,
+    });
+    var s: Session = .{};
+    m.create(&s);
+    try s.putValue("uid", "42");
+    try testing.expect(m.persist(&s));
+
+    // The raw id is not a key; its hash is.
+    try testing.expect((try env.store.store().get(testing.allocator, s.id())) == null);
+    const h = sha256Of(s.id());
+    const rec = (try env.store.store().get(testing.allocator, &h)).?;
+    testing.allocator.free(rec.record);
+
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(s.id(), &l));
+    try testing.expectEqualStrings(s.id(), l.id()); // the real id, not the key
+    try testing.expectEqualStrings("42", (try l.getValue("uid")).?);
+    // Presenting the hash as a cookie finds nothing (it would be hashed again).
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(&h, &l));
+
+    // Regenerate: the old key dies, the new id works.
+    const old_id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(old_id);
+    m.regenerate(&s);
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(old_id, &l));
+    try testing.expect(m.persist(&s));
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(s.id(), &l));
+    try testing.expect((try env.store.store().get(testing.allocator, s.id())) == null);
+
+    // Destroy by cookie id.
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    m.destroy(&rw, s.id());
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(s.id(), &l));
+    const h2 = sha256Of(s.id());
+    try testing.expect((try env.store.store().get(testing.allocator, &h2)) == null);
+}
+
+test "hash_id_in_store: through the middleware (cookie carries the real id; revoke removes the record)" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try Manager.init(testing.allocator, env.store.store(), .{
+        .io = testing.io,
+        .clock = env.clk.clock(),
+        .idle_timeout_ns = 10 * std.time.ns_per_s,
+        .absolute_timeout_ns = 100 * std.time.ns_per_s,
+        .hash_id_in_store = true,
+    });
+    var app = App{ .manager = &m, .action = .put_uid };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", hSession);
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+
+    const first = getWithCookie(&r, null, &out, &rbody);
+    var id_buf: [64]u8 = undefined;
+    @memcpy(&id_buf, cookieId(headerValue(first, "Set-Cookie").?));
+    const id: []const u8 = &id_buf;
+    try testing.expectEqualStrings(id, bodyOf(first));
+    app.action = .read_only;
+    try testing.expectEqualStrings(id, bodyOf(getWithCookie(&r, id, &out, &rbody))); // loaded, not re-minted
+    app.action = .revoke;
+    try testing.expect(std.mem.indexOf(u8, headerValue(getWithCookie(&r, id, &out, &rbody), "Set-Cookie").?, "Max-Age=-1") != null);
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
+}
+
+test "hash_id_in_store: KvStore keys are prefix ++ SHA-256(id); iterate shows the store key, not a cookie id" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    var m = try Manager.init(testing.allocator, env.store.store(), .{
+        .io = testing.io,
+        .clock = env.clk.clock(),
+        .idle_timeout_ns = 10_000,
+        .absolute_timeout_ns = 100_000,
+        .hash_id_in_store = true,
+    });
+    var ids: [5][64]u8 = undefined;
+    try fiveUsers(&m, &ids);
+
+    // On disk: five keys, each prefix ++ 32 raw bytes; none contains a cookie id.
+    const listing = try env.db.keys(testing.allocator, "session:");
+    defer listing.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 5), listing.keys.len);
+    for (listing.keys) |k| {
+        try testing.expectEqual(@as(usize, "session:".len + 32), k.len);
+        for (ids) |id| try testing.expect(std.mem.indexOf(u8, k, &id) == null);
+    }
+    var kb: [96]u8 = undefined;
+    const raw_key = try std.fmt.bufPrint(&kb, "session:{s}", .{&ids[0]});
+    try testing.expect(!env.db.exists(raw_key));
+    const h = sha256Of(&ids[0]);
+    const hashed_key = try std.fmt.bufPrint(&kb, "session:{s}", .{&h});
+    try testing.expect(env.db.exists(hashed_key));
+
+    // The callback's s.id() is the store key: 32 bytes, equal to SHA-256 of one of the cookie ids.
+    const Probe = struct {
+        ids: *const [5][64]u8,
+        matched: usize = 0,
+        fn visit(ctx: ?*anyopaque, s: *const Session) IterateAction {
+            const p: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (s.id().len != 32) return .stop;
+            for (p.ids) |*id| {
+                const hh = sha256Of(id);
+                if (std.mem.eql(u8, s.id(), &hh)) p.matched += 1;
+            }
+            return .keep;
+        }
+    };
+    var probe: Probe = .{ .ids = &ids };
+    _ = try m.iterate(testing.allocator, &probe, Probe.visit);
+    try testing.expectEqual(@as(usize, 5), probe.matched);
+
+    // Logout-everywhere works on the hashed store; cookie ids stop resolving.
+    var ctx: Logout = .{ .uid = "A" };
+    try testing.expectEqual(@as(usize, 3), try m.iterate(testing.allocator, &ctx, Logout.visit));
+    var l: Session = .{};
+    for (ids[0..3]) |*id| try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
+    for (ids[3..5]) |*id| try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
+    try testing.expect(!env.db.exists(hashed_key));
 }

@@ -44,6 +44,62 @@ the disk's fsync rate (~300/s measured by `kv` on NVMe ext4). After a failed
 reopened `Db` (fail closed: a logout that did not reach the disk must not be
 undone by a read).
 
+### Values and flash messages
+
+A session carries a small ordered key/value map over its data blob (≤ 4096 bytes in all;
+keys 1..255 bytes, values any bytes). Writing marks the session to be saved, so a new session
+holding a value gets its cookie without `keep()`:
+
+```zig
+try s.putValue("uid", "42");                    // replace in place or append
+const uid = try s.getValue("uid");              // ?[]const u8, a slice into s.data()
+try s.putValue("flash", "Profile saved");       // flash: show it once ...
+var buf: [128]u8 = undefined;
+if (try s.popValue("flash", &buf)) |msg| try ctx.res.writeAll(msg); // ... copied out, then removed
+_ = try s.removeValue("uid");
+var it = s.valueIterator();                     // insertion order
+while (try it.next()) |e| std.log.info("{s}={s}", .{ e.key, e.val });
+s.clearValues();
+```
+
+`putValue` returns `error.Overflow` when the blob would exceed `max_session_bytes` (nothing
+changes) and `error.InvalidKey` for an empty or over-255-byte key. Raw `setData` and these
+calls share one blob: after a raw `setData` the values calls answer `error.Malformed` until
+`clearValues()` — never a wrong value.
+
+### Remember me
+
+```zig
+var mgr = try sessions.Manager.init(gpa, store.store(), .{ .io = io, .persist_cookie = false });
+// login handler:  if (form.remember) s.rememberMe(true);
+```
+
+With `persist_cookie = false` the session cookie has no `Max-Age` (it ends with the browser
+session) unless the session called `rememberMe(true)`; the default (`true`) is the old
+behaviour. The flag is stored with the session; server-side timeouts apply either way.
+
+### Logout everywhere
+
+```zig
+fn ofUser(ctx: ?*anyopaque, s: *const sessions.Session) sessions.IterateAction {
+    const uid: *const []const u8 = @ptrCast(@alignCast(ctx.?));
+    const v = (s.getValue("uid") catch return .keep) orelse return .keep;
+    return if (std.mem.eql(u8, v, uid.*)) .destroy else .keep;
+}
+const n = try mgr.iterate(gpa, &uid, ofUser); // number destroyed
+```
+
+`iterate` visits every live (not expired) session; `.destroy` removes it through the store's
+delete, so a request that already holds the session cannot save it back. `KvStore` supports
+it; over `RamcacheStore` it returns `error.Unsupported`.
+
+### Hashed ids in the store
+
+`Options.hash_id_in_store = true` keys the store by `SHA-256(id)` (32 raw bytes), so a leaked
+store file does not hold live session ids. The cookie and `Csrf` still use the real id.
+Changing it on a populated store logs everyone out. Under it, `Session.id()` inside an
+`iterate` callback is the store key, not a cookie value.
+
 ## What the middleware does
 
 On each request it **loads** the session named by the cookie (rejecting and
@@ -124,14 +180,14 @@ default `.monotonic` clock touches the OS.
 Distributed `Store` shared by several servers (Redis adapter — implement the `Store` vtable);
 signed-cookie *stateless* sessions (no server store); `SameSite=None`
 cross-site flows; CSRF token rotation / synchronizer-token mode and
-`Csrf.key` provisioning/rotation; logout-everywhere (a user→sessions index);
-concurrent same-session read-modify-write races (last save wins); automatic
+`Csrf.key` provisioning/rotation; a user→sessions index (use `iterate`); a typed
+`GetInt`-style getter set; concurrent same-session read-modify-write races (last save wins); automatic
 CSRF body form-field extraction (use `Csrf.verify` from the handler instead).
 
 Provenance: original work of the zig-libs authors (MIT); modeled after the
 OWASP Session Management and CSRF Prevention Cheat Sheets. No third-party
 source consulted or copied; built on the sibling `router`, `http`, `cookies`
-and `ramcache` modules.
+and `ramcache` modules. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` reference side against alexedwards/scs v2.9.0, 2026-10-11) is our own tooling; it drives the reference only through its public API.
 
 ## Verification
 
