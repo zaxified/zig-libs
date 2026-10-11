@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — **BEHAVIOURAL (fails where it delivered corrupted data):** a deflate entry whose
+  stream ends inside a block at end of file aborted the process (std 0.16 `flate.Decompress` reaches
+  `unreachable`); the decoder now reads exactly `compressed_size` bytes, then zeros (`PaddedInput`),
+  and gets a clean `error.ReadFailed`. And the CRC-32 is now checked on the read that reaches the
+  declared size, not only on the read after it: reading exactly `uncompressed_size` bytes of a corrupted
+  member used to succeed. `EntryReader` grows by a 1 KiB input buffer.
+
 - **2026-10-11** — docs: SPEC backlog records a SUSPECTED std 0.16 `flate.Decompress` overflow panic on a deflate stream that ends mid-block at end of archive (found in websocket's inflate fuzzing); unverified here.
 - **2026-10-09** — tests: deterministic fuzz driver `ZIPSTREAM_FUZZ` over the existing harnesses (`archive`, plus `mutated`: an `ArchiveWriter` archive, damaged, because random octets never form a walkable central directory).
 - **2026-10-05** — **Fixes and behaviour changes** found by a Go archive/zip differential oracle

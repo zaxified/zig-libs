@@ -177,16 +177,16 @@ output clamped to the declared size, `toUnix` month 0 / second 60 / 2100-02-29 /
 
 ## Backlog / deferred
 
-- **SUSPECTED (unverified, 2026-10-11): std 0.16 `flate.Decompress` overflow panic reachable from a
-  crafted archive.** `tossBitsShort` checks `bufferedLen()*8 + consumed_bits` where it needs `-`, so
-  on input that ends inside a block the next `peekBitsEnding` computes `left.len * 8 -
-  consumed_bits` with `left.len == 0` -- an integer-overflow panic in safe builds. Found by
-  websocket's `WEBSOCKET_FUZZ` `inflate` (see websocket SPEC "permessage-deflate", workaround
-  `deflate.ZeroPadded`). Here the decoder reads the file reader past the entry's data, so the end
-  of input is the end of the archive: reachable when a malformed last entry's deflate stream runs
-  through the central directory to EOF. ZIPSTREAM_FUZZ did not find it (its inputs rarely end
-  mid-block). To do: a test with a truncated deflate stream at end of file; if it panics, feed the
-  decoder a zero-padded reader limited to `compressed_size`, as websocket does.
+- ~~**SUSPECTED: std 0.16 `flate.Decompress` panic reachable from a crafted archive**~~ **CONFIRMED and
+  fixed 2026-10-11.** Any proper prefix of an ordinary deflate stream, decoded to the end of its input,
+  reaches `unreachable` in std's `tossBits` via `tossBitsShort` (no crafting needed; measured on every
+  prefix of a 3.9 KB stream). Reachable here when an entry's data runs to end of file, e.g. a local
+  header in the EOCD comment. Fix: the decoder reads `PaddedInput` -- exactly `compressed_size` bytes
+  of the file (Go's SectionReader bound), then zeros, so it never sees an end of input; what the zeros
+  decode to is refused by the CRC-32 check or by the decoder. Found alongside: `CrcReader` checked only
+  on the read AFTER the last byte, so a consumer reading exactly `uncompressed_size` bytes got corrupted
+  content with no error; it now checks on the read that reaches the declared size and withholds that
+  read's bytes. Test: "a deflate stream cut short at end of file" (every prefix length).
 zip64 **writing** (`ArchiveWriter` is classic-format only — zip64 reading is fully supported, see
 "Design & invariants"; not worth the extra-field/EOCD64 bookkeeping until a real >4 GiB or
 >65535-entry write use case shows up); encrypted entries (no consumer needs authoring/reading

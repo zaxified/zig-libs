@@ -540,6 +540,9 @@ pub const EntryReader = struct {
     decompress: std.compress.flate.Decompress,
     limited: std.Io.Reader.Limited,
     crc_reader: CrcReader,
+    /// Deflate input: the entry's `compressed_size` bytes, then zeros.
+    deflate_in: PaddedInput,
+    deflate_in_buf: [1024]u8,
 
     /// Open an entry with the default decompression-bomb cap
     /// (`default_max_output`). See `initMax` to choose the cap.
@@ -585,7 +588,22 @@ pub const EntryReader = struct {
 
         switch (entry.compression) {
             .deflate => {
-                self.decompress = .init(&fr.interface, .raw, window);
+                // The decoder never sees an end of input: std 0.16's
+                // `flate.Decompress` reaches `unreachable` when its input ends
+                // inside a block (`tossBitsShort` adds `consumed_bits` where it
+                // must subtract) -- any truncated stream did it, e.g. a last
+                // entry whose data runs to end of file. So it reads exactly the
+                // entry's own bytes and zeros after them; a stream that needed
+                // the zeros decodes to output the CRC-32 check refuses, or
+                // stops on an invalid block (a zero block header is a stored
+                // block whose LEN/NLEN disagree). Bounding the input to
+                // `compressed_size` is also Go's `archive/zip` (a SectionReader).
+                self.deflate_in = .{
+                    .source = &fr.interface,
+                    .remaining = entry.compressed_size,
+                    .interface = .{ .vtable = &PaddedInput.vtable, .buffer = &self.deflate_in_buf, .seek = 0, .end = 0 },
+                };
+                self.decompress = .init(&self.deflate_in.interface, .raw, window);
                 // Clamp the decompressed stream to the declared size. `window`
                 // is already owned by `decompress`, so the Limited reads
                 // straight through with no buffer of its own.
@@ -596,7 +614,7 @@ pub const EntryReader = struct {
             },
             else => return Error.UnsupportedCompressionMethod,
         }
-        self.crc_reader = CrcReader.init(&self.limited.interface, entry.crc32);
+        self.crc_reader = CrcReader.init(&self.limited.interface, entry.crc32, entry.uncompressed_size);
     }
 
     /// The decompressed-byte reader, bounded by the output cap and verified
@@ -617,6 +635,36 @@ pub const EntryReader = struct {
     }
 };
 
+/// `remaining` bytes of `source`, then zeros for ever (see `EntryReader`'s
+/// deflate arm for why the decoder must never reach an end of input). A
+/// source that ends early is padded the same way: the CRC-32 check, not an
+/// EndOfStream inside std's decoder, reports the short entry.
+const PaddedInput = struct {
+    source: *std.Io.Reader,
+    remaining: u64,
+    interface: std.Io.Reader,
+
+    const vtable: std.Io.Reader.VTable = .{ .stream = stream };
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *PaddedInput = @alignCast(@fieldParentPtr("interface", r));
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        if (self.remaining != 0) {
+            const want: usize = @intCast(@min(dest.len, self.remaining));
+            const n = self.source.readSliceShort(dest[0..want]) catch return error.ReadFailed;
+            if (n != 0) {
+                self.remaining -= n;
+                w.advance(n);
+                return n;
+            }
+            self.remaining = 0; // the file ended first
+        }
+        @memset(dest, 0);
+        w.advance(dest.len);
+        return dest.len;
+    }
+};
+
 /// Wraps a `Reader` (the decompressed/limited stream of one ZIP entry),
 /// accumulating a running CRC-32 over every byte forwarded through it. When
 /// the wrapped reader reaches its own end-of-stream, the accumulated CRC is
@@ -624,20 +672,28 @@ pub const EntryReader = struct {
 /// is set and `error.ReadFailed` returned) instead of silently completing as
 /// if the content were untouched — closing the gap where a corrupted or
 /// tampered archive member was previously delivered as valid data (audit
-/// finding `zipstream` F4).
+/// finding `zipstream` F4). The check also runs on the read that reaches the
+/// declared size, and that read's bytes are withheld on a mismatch: a
+/// consumer that reads exactly `uncompressed_size` bytes never makes the
+/// end-of-stream read, and until 2026-10-11 received corrupted content whole
+/// with no error.
 const CrcReader = struct {
     source: *std.Io.Reader,
     interface: std.Io.Reader,
     crc: std.hash.Crc32,
     expected: u32,
+    /// The declared uncompressed size, and how much has been forwarded.
+    size: u64,
+    seen: u64 = 0,
     crc_mismatch: bool = false,
 
-    fn init(source: *std.Io.Reader, expected: u32) CrcReader {
+    fn init(source: *std.Io.Reader, expected: u32, size: u64) CrcReader {
         return .{
             .source = source,
             .interface = .{ .vtable = &.{ .stream = stream }, .buffer = &.{}, .seek = 0, .end = 0 },
             .crc = std.hash.Crc32.init(),
             .expected = expected,
+            .size = size,
         };
     }
 
@@ -662,6 +718,11 @@ const CrcReader = struct {
             return error.EndOfStream;
         }
         self.crc.update(scratch[0..n]);
+        self.seen += n;
+        if (self.seen == self.size and self.crc.final() != self.expected) {
+            self.crc_mismatch = true;
+            return error.ReadFailed;
+        }
         try w.writeAll(scratch[0..n]);
         return n;
     }
@@ -1490,6 +1551,82 @@ test "EntryReader: a size lie beyond physical EOF errors cleanly, not UB" {
     // be"), not just "the stream stopped".
     try testing.expectError(error.ReadFailed, er.reader().readSliceAll(buf));
     try testing.expect(er.crcMismatch());
+}
+
+test "EntryReader: a deflate stream cut short at end of file is a clean error, not a std flate panic" {
+    // std 0.16 `flate.Decompress` hits `unreachable` (`tossBitsShort` checks
+    // `+ consumed_bits` where it needs `-`) when its input ENDS inside a
+    // block — any proper prefix of an ordinary stream does it. The entry's
+    // data here sits at the very end of the file: the archive's EOCD comment
+    // holds a local header and a prefix of a real deflate stream, and the
+    // entry points at it. Every prefix length, so every bit position the
+    // stream can end at.
+    const a = testing.allocator;
+    var data: [1500]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = "the quick brown fox jumps "[i % 26] ^ @as(u8, @truncate(i *% 2654435761 >> 13 & 1));
+    const full = try deflateRaw(a, &data);
+    defer a.free(full);
+    const base = try buildZip(a, &.{.{ .name = "a", .data = "a" }});
+    defer a.free(base);
+    const name = "cut";
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var out: [data.len]u8 = undefined;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    for (1..full.len) |n| {
+        bytes.clearRetainingCapacity();
+        try bytes.appendSlice(a, base);
+        const comment_len = @sizeOf(std.zip.LocalFileHeader) + name.len + n;
+        std.mem.writeInt(u16, bytes.items[bytes.items.len - 2 ..][0..2], @intCast(comment_len), .little);
+        const lfh = std.zip.LocalFileHeader{
+            .signature = std.zip.local_file_header_sig,
+            .version_needed_to_extract = 20,
+            .flags = @bitCast(@as(u16, 0)),
+            .compression_method = .deflate,
+            .last_modification_time = 0,
+            .last_modification_date = 0,
+            .crc32 = std.hash.Crc32.hash(&data),
+            .compressed_size = @intCast(n),
+            .uncompressed_size = data.len,
+            .filename_len = name.len,
+            .extra_len = 0,
+        };
+        try bytes.appendSlice(a, std.mem.asBytes(&lfh));
+        try bytes.appendSlice(a, name);
+        try bytes.appendSlice(a, full[0..n]);
+
+        var f = try openZip(&tmp, bytes.items);
+        defer f.close(testing.io);
+        var archive: Archive = undefined;
+        try archive.init(testing.io, a, f);
+        defer archive.deinit();
+        var cut = archive.entries.items[0];
+        cut.compression = .deflate;
+        cut.file_offset = base.len;
+        cut.compressed_size = n;
+        cut.uncompressed_size = data.len;
+        cut.crc32 = std.hash.Crc32.hash(&data);
+
+        // Reading exactly the declared size: the zero padding can decode to
+        // a full-length output, and the CRC-32 must stop it on that read.
+        // A prefix that lost only the final block's tail bits may decode to
+        // the right bytes -- then it IS the entry, and the CRC agrees.
+        var er: EntryReader = undefined;
+        try er.init(&archive, &cut, &window);
+        if (er.reader().readSliceAll(&out)) |_| {
+            if (!std.mem.eql(u8, &out, &data)) {
+                std.debug.print("prefix {d}/{d}: wrong bytes delivered without an error\n", .{ n, full.len });
+                return error.TestUnexpectedResult;
+            }
+        } else |err| switch (err) {
+            // The CRC-32 check, or the decoder refusing the padding
+            // (an invalid code or block); both are clean.
+            error.ReadFailed, error.EndOfStream => {},
+        }
+    }
 }
 
 test "isSafeEntryName flags zip-slip names, accepts ordinary member paths" {
