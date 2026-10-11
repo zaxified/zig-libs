@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Performance P3 → P2 (grade 3 → 2): comparative bench `tools/bench.zig`
+  (`zig build bench-aes192`) against OpenSSL 3.5.5 EVP AES-192 — ECB both ways, CBC, CTR at
+  0.97–1.01×, key setup 0.74–0.81×. Key setup was 1.65–1.81× before: the key-schedule burn is
+  now 512 bytes instead of 4 KiB (the body dirties ≤ 256 B; stack probe green), and the
+  expansion runs on little-endian `u32` words instead of `[4]u8` (same FIPS-197 §5.2 schedule;
+  all vectors, model fuzz and ctgrind unchanged). Audit A1 → A2: the mutation run was over the
+  previous text.
+
 - **2026-10-10** — Audit (review + mutation schemata), no code change. Review: key expansion
   (Nk = 6 RotWord/SubWord/Rcon schedule, rcon index 0..7), the equivalent-inverse schedule and the
   round sequences match FIPS-197; clean. LOW, kept: `Aes192DecryptCtx.initFromEnc` takes and returns

@@ -36,4 +36,4 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 
 /// Key expansion: once per key, a 208-byte word array plus the schedule, so a
 /// tight burn. `stackprobe_test.zig` measures it in ReleaseFast.
-pub const schedule_burn = 4 * 1024;
+pub const schedule_burn = 512;

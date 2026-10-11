@@ -102,20 +102,30 @@ inline fn invMixColumns(x: Block) Block {
 const rcon = [_]u8{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
 
 /// KEYEXPANSION() for Nk = 6 (FIPS-197 §5.2, Algorithm 2). Every branch is
-/// on the loop index; the key bytes reach only XOR and `subWord`.
+/// on the loop index; the key bytes reach only XOR and `subWord`. A word is
+/// a little-endian `u32` of its four bytes (byte 0 lowest), so the XORs are
+/// word-wide and RotWord is a rotate right by 8; as `[4]u8` arrays the
+/// expansion compiled to byte operations and cost half of `init`
+/// (bench-aes192 `key_enc`, 2026-10-11).
 fn expand(out: *KeySchedule, key: *const [key_length]u8) void {
     const nk = 6;
-    var w: [4 * (rounds + 1)][4]u8 = undefined;
-    inline for (0..nk) |i| w[i] = key[4 * i ..][0..4].*;
+    var w: [4 * (rounds + 1)]u32 = undefined;
+    inline for (0..nk) |i| w[i] = std.mem.readInt(u32, key[4 * i ..][0..4], .little);
     inline for (nk..w.len) |i| {
         var t = w[i - 1];
-        if (i % nk == 0) {
-            t = subWord(.{ t[1], t[2], t[3], t[0] }); // SubWord(RotWord(t))
-            t[0] ^= rcon[i / nk - 1];
-        }
-        inline for (0..4) |j| w[i][j] = w[i - nk][j] ^ t[j];
+        if (i % nk == 0) t = subWord32(std.math.rotr(u32, t, 8)) ^ rcon[i / nk - 1]; // SubWord(RotWord(t)) ^ Rcon
+        w[i] = w[i - nk] ^ t;
     }
-    inline for (0..rounds + 1) |r| out.round_keys[r] = Block.fromBytes(std.mem.asBytes(w[4 * r ..][0..4]));
+    var bytes: [16 * (rounds + 1)]u8 = undefined;
+    inline for (0..w.len) |i| std.mem.writeInt(u32, bytes[4 * i ..][0..4], w[i], .little);
+    inline for (0..rounds + 1) |r| out.round_keys[r] = Block.fromBytes(bytes[16 * r ..][0..16]);
+}
+
+/// `subWord` on a little-endian word (see `expand`).
+inline fn subWord32(w: u32) u32 {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, w, .little);
+    return std.mem.readInt(u32, &subWord(b), .little);
 }
 
 const RoundOp = enum { encrypt, encryptLast, decrypt, decryptLast };
