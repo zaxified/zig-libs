@@ -13,10 +13,13 @@ shared midstate; categories 3/5 keep SHA-256 for F/PRF but use SHA-512 for
 H/T_l, MGF1-SHA-512 for H_msg and HMAC-SHA-512 for PRF_msg) — WOTS+ (§5),
 XMSS Merkle trees (§6), the hypertree (§7), FORS (§8),
 `slh_keygen/sign/verify_internal` (§9/§10.1) and the **pure** external
-interface with context strings (§10.2). Byte-exact against the official
+interface with context strings (§10.2) and the **HashSLH-DSA pre-hash**
+interface (§10.2.2, Algorithms 23/25). Byte-exact against the official
 **NIST ACVP FIPS 205 vectors**: one keyGen and one deterministic-internal
 sigGen case per parameter set, plus hedged-internal and pure-with-context
-cases for SHA2-128f — provenance per test case in `src/kat_vectors.zig`.
+cases for SHA2-128f, and pre-hash sigGen (all twelve PH functions, deterministic
+and hedged) and sigVer (valid and invalid) cases — provenance per test case in
+`src/kat_vectors.zig`.
 
 | Set (SHA2 / SHAKE) | Category | pk | sk | signature |
 |--------------------|----------|-----|-----|-----------|
@@ -27,8 +30,7 @@ cases for SHA2-128f — provenance per test case in `src/kat_vectors.zig`.
 | 256s | 5 | 64 B | 128 B | 29 792 B |
 | 256f | 5 | 64 B | 128 B | 49 856 B |
 
-**Not implemented:** the HashSLH-DSA pre-hash variants (§10.2.2). Signing is
-not constant-time hardened. Key generation takes caller-supplied seed
+Signing is not constant-time hardened. Key generation takes caller-supplied seed
 bytes — bring your own CSPRNG.
 
 - **Model after:** FIPS 205 (August 2024), clean-room from the standard;
@@ -46,6 +48,7 @@ bytes — bring your own CSPRNG.
 | `src/params.zig` | `Params` struct + all twelve FIPS 205 Table 2 rows | real, tested |
 | `src/address.zig` | §4.2 ADRS (32-byte hash addresses) + SHA2 compressed form | real, tested |
 | `src/engine.zig` | generic `SlhDsa(Params)`: §11.1 SHAKE + §11.2 SHA2 hashes, WOTS+, XMSS, hypertree, FORS, keygen/sign/verify | real, KAT-verified |
+| `src/prehash.zig` | `PreHash` enum (FIPS 205 §10.2.2 approved PH set) with DER OIDs and `hash` | real, tested |
 | `src/root.zig` | `meta`, re-exports, the twelve ready-to-use instantiations | real, tested |
 | `src/kat_vectors.zig` / `src/kat_test.zig` | NIST ACVP vectors (all 12 sets) + the KAT/tamper battery | test-only |
 
@@ -83,6 +86,28 @@ Scheme.SecretKey.fromBytes(&sk, &sk_bytes);
 // protocol plumbing that does its own domain separation:
 Scheme.signInternal(&sig, message, &kp.sk, null);
 _ = Scheme.verifyInternal(&sig, message, kp.pk);
+```
+
+### Pre-hash (HashSLH-DSA, §10.2.2)
+
+Signs `M' = 0x01 ‖ len(ctx) ‖ ctx ‖ OID(PH) ‖ PH(M)` instead of the pure
+`0x00 ‖ len(ctx) ‖ ctx ‖ M`. The two are **not interchangeable**: a pre-hash
+signature never verifies through `verify`, nor under another PH. `PreHash` is
+the approved set: `sha2_224/256/384/512`, `sha2_512_224`, `sha2_512_256`,
+`sha3_224/256/384/512`, `shake128` (256-bit output) and `shake256` (512-bit).
+Same context rule (≤ 255 bytes) and `addrnd` convention as `sign`.
+
+```zig
+// The module hashes the message (one call, message in memory):
+try Scheme.signPrehash(&sig, message, &kp.sk, "", .sha2_256, null);
+const ok2 = Scheme.verifyPrehash(&sig, message, kp.pk, "", .sha2_256);
+
+// Or you hand over the digest (HSM flows, firmware images hashed elsewhere);
+// its length must be ph.digestLength(), else error.DigestLengthMismatch:
+var dbuf: [64]u8 = undefined;
+const digest = Scheme.PreHash.sha2_256.hash(message, &dbuf);
+try Scheme.signPrehashDigest(&sig, digest, &kp.sk, "", .sha2_256, null);
+_ = Scheme.verifyPrehashDigest(&sig, digest, kp.pk, "", .sha2_256); // false on a wrong length
 ```
 
 Verify: `zig build test-slhdsa` (Debug and `-Doptimize=ReleaseFast`).

@@ -85,11 +85,11 @@ const params = @import("params.zig");
 /// A signature this module issued VERIFIES; every damaged signature (0-3
 /// octets of the real one damaged, maybe truncated or extended, or wild
 /// bytes) does NOT; the genuine signature under another message or another
-/// context does NOT.
+/// context does NOT; none of them verifies through the pre-hash entry points.
 fn Verify(comptime P: params.Params) type {
     return struct {
         const Scheme = engine.SlhDsa(P);
-        const Mark = Marker(enum { genuine_accepted, damaged_refused, wrong_length, wrong_message_refused, wrong_context_refused, long_context_refused });
+        const Mark = Marker(enum { genuine_accepted, damaged_refused, wrong_length, wrong_message_refused, wrong_context_refused, long_context_refused, prehash_refused });
         const message = "fuzz msg";
 
         var cached: ?struct { pk: Scheme.PublicKey, sig: [Scheme.signature_length]u8 } = null;
@@ -139,6 +139,15 @@ fn Verify(comptime P: params.Params) type {
                 if (pristine) return error.GenuineSignatureRefused;
                 Mark.mark(.damaged_refused);
             }
+            // The fixture is a PURE signature: no input, the genuine one included,
+            // may verify through the pre-hash entry points (any PH, any digest
+            // length), and none of them may panic.
+            const ph: Scheme.PreHash = @enumFromInt(src.index(@typeInfo(Scheme.PreHash).@"enum".fields.len));
+            if (Scheme.verifyPrehash(buf[0..n], message, f.pk, "", ph)) return error.PureSignatureVerifiedAsPrehash;
+            var digest: [prehash_max + 1]u8 = undefined;
+            src.bytes(&digest);
+            if (Scheme.verifyPrehashDigest(buf[0..n], digest[0..src.index(digest.len + 1)], f.pk, "", ph)) return error.PureSignatureVerifiedAsPrehash;
+            Mark.mark(.prehash_refused);
             if (!pristine) return;
             // The genuine signature under another message / another context.
             var m2: [message.len + 1]u8 = undefined;
@@ -156,6 +165,8 @@ fn Verify(comptime P: params.Params) type {
         }
     };
 }
+
+const prehash_max = @import("prehash.zig").max_digest_length;
 
 const Sha2 = Verify(params.sha2_128f);
 const Shake = Verify(params.shake_128f);

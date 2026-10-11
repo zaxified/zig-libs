@@ -248,3 +248,146 @@ test "kat vector hex decodes to the FIPS 205 lengths for every set" {
         try std.testing.expectEqual(2 * P.n, V.keygen_pk.len / 2);
     }
 }
+
+// ── HashSLH-DSA (pre-hash, FIPS 205 §10.2.2) ───────────────────────────────
+
+fn phOf(alg: v.PrehashAlg) Scheme.PreHash {
+    return switch (alg) {
+        .sha2_224 => .sha2_224,
+        .sha2_256 => .sha2_256,
+        .sha2_384 => .sha2_384,
+        .sha2_512 => .sha2_512,
+        .sha2_512_224 => .sha2_512_224,
+        .sha2_512_256 => .sha2_512_256,
+        .sha3_224 => .sha3_224,
+        .sha3_256 => .sha3_256,
+        .sha3_384 => .sha3_384,
+        .sha3_512 => .sha3_512,
+        .shake_128 => .shake128,
+        .shake_256 => .shake256,
+    };
+}
+
+/// ACVP sigGen pre-hash cases: byte-exact signature from the module-hashed
+/// message, which then verifies through both the message and the digest entry
+/// points; the same bytes must not verify under another PH, as a pure
+/// signature, or under a damaged context.
+fn prehashGen(comptime P: params.Params, comptime cases: []const v.PrehashSigGen) !void {
+    const S = engine.SlhDsa(P);
+    const gpa = std.testing.allocator;
+    const sig = try gpa.alloc(u8, S.signature_length);
+    defer gpa.free(sig);
+    for (cases) |c| {
+        const ph: S.PreHash = phOf(c.ph);
+        var sk: S.SecretKey = undefined;
+        S.SecretKey.fromBytes(&sk, &hex(S.secret_key_length, c.sk));
+        const pk = S.PublicKey.fromBytes(hex(S.public_key_length, c.pk));
+        try std.testing.expectEqualSlices(u8, &pk.toBytes(), &sk.pk.toBytes());
+        const msg = try hexAlloc(gpa, c.msg);
+        defer gpa.free(msg);
+        const ctx = try hexAlloc(gpa, c.ctx);
+        defer gpa.free(ctx);
+        const addrnd: ?[S.n]u8 = if (c.addrnd) |a| hex(S.n, a) else null;
+
+        try S.signPrehash(sig[0..S.signature_length], msg, &sk, ctx, ph, addrnd);
+        var got: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(sig, &got, .{});
+        std.testing.expectEqualSlices(u8, &hex(32, c.sig_sha256), &got) catch |err| {
+            std.debug.print("prehash sigGen tgId {d} tcId {d} ({t})\n", .{ c.tg_id, c.tc_id, c.ph });
+            return err;
+        };
+        try std.testing.expect(S.verifyPrehash(sig, msg, pk, ctx, ph));
+        var dbuf: [64]u8 = undefined;
+        try std.testing.expect(S.verifyPrehashDigest(sig, ph.hash(msg, &dbuf), pk, ctx, ph));
+
+        // Domain separation: other PH, pure interface, other context.
+        const other: S.PreHash = if (ph == .sha2_256) .sha3_256 else .sha2_256;
+        try std.testing.expect(!S.verifyPrehash(sig, msg, pk, ctx, other));
+        try std.testing.expect(!S.verify(sig, msg, pk, ctx));
+        const ctx2 = try gpa.alloc(u8, ctx.len + 1);
+        defer gpa.free(ctx2);
+        @memcpy(ctx2[0..ctx.len], ctx);
+        ctx2[ctx.len] = 0;
+        try std.testing.expect(!S.verifyPrehash(sig, msg, pk, ctx2, ph));
+    }
+}
+
+test "NIST ACVP sigGen pre-hash: SLH-DSA-SHA2-128f, byte-exact" {
+    try prehashGen(params.sha2_128f, &v.prehash_sha2_128f_gen);
+}
+
+test "NIST ACVP sigGen pre-hash: SLH-DSA-SHAKE-128f, byte-exact" {
+    try prehashGen(params.shake_128f, &v.prehash_shake_128f_gen);
+}
+
+test "NIST ACVP sigGen pre-hash: all twelve PH functions are covered" {
+    var covered = std.EnumSet(v.PrehashAlg).initEmpty();
+    for (v.prehash_sha2_128f_gen) |c| covered.insert(c.ph);
+    for (v.prehash_shake_128f_gen) |c| covered.insert(c.ph);
+    try std.testing.expectEqual(@typeInfo(v.PrehashAlg).@"enum".fields.len, covered.count());
+}
+
+fn prehashVer(comptime P: params.Params, comptime cases: []const v.PrehashSigVer) !void {
+    const S = engine.SlhDsa(P);
+    const gpa = std.testing.allocator;
+    for (cases) |c| {
+        const pk = S.PublicKey.fromBytes(hex(S.public_key_length, c.pk));
+        const msg = try hexAlloc(gpa, c.msg);
+        defer gpa.free(msg);
+        const ctx = try hexAlloc(gpa, c.ctx);
+        defer gpa.free(ctx);
+        const sig = try hexAlloc(gpa, c.sig);
+        defer gpa.free(sig);
+        const ph = phOf(c.ph);
+        std.testing.expectEqual(c.passed, S.verifyPrehash(sig, msg, pk, ctx, ph)) catch |err| {
+            std.debug.print("prehash sigVer tgId {d} tcId {d} ({t})\n", .{ c.tg_id, c.tc_id, c.ph });
+            return err;
+        };
+        var dbuf: [64]u8 = undefined;
+        try std.testing.expectEqual(c.passed, S.verifyPrehashDigest(sig, ph.hash(msg, &dbuf), pk, ctx, ph));
+    }
+}
+
+test "NIST ACVP sigVer pre-hash: SLH-DSA-SHA2-128f, valid and invalid" {
+    try prehashVer(params.sha2_128f, &v.prehash_sha2_128f_ver);
+}
+
+test "NIST ACVP sigVer pre-hash: SLH-DSA-SHAKE-128f, invalid" {
+    try prehashVer(params.shake_128f, &v.prehash_shake_128f_ver);
+}
+
+test "pre-hash: digest entry points check lengths; sign(digest) == sign(msg); size boundaries" {
+    var seed: [48]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @truncate(i *% 13 + 7);
+    var kp: Scheme.KeyPair = undefined;
+    Scheme.keyGen(&kp, &seed);
+    const msg = "pre-hash message";
+    var dbuf: [64]u8 = undefined;
+    const digest = Scheme.PreHash.sha3_384.hash(msg, &dbuf);
+    try std.testing.expectEqual(@as(usize, 48), digest.len);
+
+    var a: [sig_len]u8 = undefined;
+    var b: [sig_len]u8 = undefined;
+    try Scheme.signPrehash(&a, msg, &kp.sk, "c", .sha3_384, null);
+    try Scheme.signPrehashDigest(&b, digest, &kp.sk, "c", .sha3_384, null);
+    try std.testing.expectEqualSlices(u8, &a, &b);
+    try std.testing.expect(Scheme.verifyPrehashDigest(&a, digest, kp.pk, "c", .sha3_384));
+
+    // Digest of the wrong length for the named PH.
+    try std.testing.expectError(error.DigestLengthMismatch, Scheme.signPrehashDigest(&b, digest[0..47], &kp.sk, "c", .sha3_384, null));
+    try std.testing.expectError(error.DigestLengthMismatch, Scheme.signPrehashDigest(&b, digest, &kp.sk, "c", .sha3_256, null));
+    try std.testing.expect(!Scheme.verifyPrehashDigest(&a, digest[0..47], kp.pk, "c", .sha3_384));
+    try std.testing.expect(!Scheme.verifyPrehashDigest(&a, "", kp.pk, "c", .sha3_384));
+
+    // Context: 256 bytes refused on both sides, 255 accepted.
+    const big: [256]u8 = @splat(0xAB);
+    try std.testing.expectError(error.ContextTooLong, Scheme.signPrehash(&b, msg, &kp.sk, &big, .sha2_256, null));
+    try std.testing.expectError(error.ContextTooLong, Scheme.signPrehashDigest(&b, digest, &kp.sk, &big, .sha3_384, null));
+    try std.testing.expect(!Scheme.verifyPrehash(&a, msg, kp.pk, &big, .sha3_384));
+    try Scheme.signPrehash(&b, msg, &kp.sk, big[0..255], .sha2_256, @splat(9));
+    try std.testing.expect(Scheme.verifyPrehash(&b, msg, kp.pk, big[0..255], .sha2_256));
+
+    // Wrong-length signatures: false, never a panic.
+    try std.testing.expect(!Scheme.verifyPrehash(a[0 .. sig_len - 1], msg, kp.pk, "c", .sha3_384));
+    try std.testing.expect(!Scheme.verifyPrehash("", msg, kp.pk, "c", .sha3_384));
+}

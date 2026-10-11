@@ -16,6 +16,7 @@ const testkit = @import("testkit");
 const params = @import("params.zig");
 const address = @import("address.zig");
 const burn = @import("burn.zig");
+const prehash = @import("prehash.zig");
 
 const Address = address.Address;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -679,6 +680,61 @@ pub fn SlhDsa(comptime P: params.Params) type {
             if (ctx.len > 255) return false;
             const prefix: [2]u8 = .{ 0x00, @intCast(ctx.len) };
             return verifyInternalParts(sig, &.{ &prefix, ctx, msg }, pk);
+        }
+
+        /// Pre-hash hash function selector (see `prehash.zig`).
+        pub const PreHash = prehash.PreHash;
+
+        pub const PrehashSignError = error{
+            /// FIPS 205 limits the context string to 255 bytes.
+            ContextTooLong,
+            /// A caller-supplied digest is not `ph.digestLength()` bytes.
+            DigestLengthMismatch,
+        };
+
+        /// M' = 0x01 || len(ctx) || ctx || OID || digest, signed; the shared
+        /// body of the two pre-hash signers (length checks done by the caller).
+        fn signPrehashChecked(out: *[signature_length]u8, digest: []const u8, sk: *const SecretKey, ctx: []const u8, ph: PreHash, addrnd: ?[n]u8) void {
+            const prefix: [2]u8 = .{ 0x01, @intCast(ctx.len) };
+            const oid = ph.oid();
+            const parts = [_][]const u8{ &prefix, ctx, &oid, digest };
+            burn.run(burn.sign_burn, void, signInternalParts, .{ out, &parts, sk, addrnd });
+        }
+
+        /// hash_slh_sign (Algorithm 23): hashes `msg` with `ph` and signs
+        /// M' = 0x01 || len(ctx) || ctx || OID(ph) || PH(msg). Not
+        /// interchangeable with `sign`: a pre-hash signature never verifies
+        /// as a pure one or under another `ph`. `addrnd` as for `sign`.
+        pub fn signPrehash(out: *[signature_length]u8, msg: []const u8, sk: *const SecretKey, ctx: []const u8, ph: PreHash, addrnd: ?[n]u8) SignError!void {
+            if (ctx.len > 255) return error.ContextTooLong;
+            var buf: [prehash.max_digest_length]u8 = undefined;
+            signPrehashChecked(out, ph.hash(msg, &buf), sk, ctx, ph, addrnd);
+        }
+
+        /// `signPrehash` over a digest the caller already computed with `ph`
+        /// (HSM flows, firmware images); `digest.len` must be
+        /// `ph.digestLength()`, else `error.DigestLengthMismatch`.
+        pub fn signPrehashDigest(out: *[signature_length]u8, digest: []const u8, sk: *const SecretKey, ctx: []const u8, ph: PreHash, addrnd: ?[n]u8) PrehashSignError!void {
+            if (ctx.len > 255) return error.ContextTooLong;
+            if (digest.len != ph.digestLength()) return error.DigestLengthMismatch;
+            signPrehashChecked(out, digest, sk, ctx, ph, addrnd);
+        }
+
+        /// hash_slh_verify (Algorithm 25). Returns false (never panics) for
+        /// wrong-length signatures or a context over 255 bytes.
+        pub fn verifyPrehash(sig: []const u8, msg: []const u8, pk: PublicKey, ctx: []const u8, ph: PreHash) bool {
+            var buf: [prehash.max_digest_length]u8 = undefined;
+            return verifyPrehashDigest(sig, ph.hash(msg, &buf), pk, ctx, ph);
+        }
+
+        /// `verifyPrehash` over a caller-computed digest; false if
+        /// `digest.len != ph.digestLength()`.
+        pub fn verifyPrehashDigest(sig: []const u8, digest: []const u8, pk: PublicKey, ctx: []const u8, ph: PreHash) bool {
+            if (ctx.len > 255) return false;
+            if (digest.len != ph.digestLength()) return false;
+            const prefix: [2]u8 = .{ 0x01, @intCast(ctx.len) };
+            const oid = ph.oid();
+            return verifyInternalParts(sig, &.{ &prefix, ctx, &oid, digest }, pk);
         }
     };
 }

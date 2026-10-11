@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — **HashSLH-DSA pre-hash (FIPS 205 §10.2.2, Algorithms 23/25):** `signPrehash`, `signPrehashDigest`, `verifyPrehash`, `verifyPrehashDigest` and the `PreHash` enum (`src/prehash.zig`, re-exported as `slhdsa.prehash`; SHA-2 ×6, SHA3 ×4, SHAKE128/256 with their DER OIDs). Additive, no change to existing entry points. Tests: NIST ACVP pre-hash sigGen (all twelve PH functions, deterministic + hedged, SHA2-128f and SHAKE-128f) and sigVer (valid, modified message/R/SIGFORS) vectors, digest-length and context-bound checks; the verify fuzz harnesses also feed the pure-signature fixture to the pre-hash verifiers. Scope core → parity.
+
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-slhdsa`, kept instrument kind 3): card Performance 0.59–0.88× OpenSSL SLH-DSA (6 sets; liboqs is foreign and unreviewed), measured on a quiet host. Tooling only, no code change.
 
 - **2026-10-10** — tests: deterministic fuzz driver `SLHDSA_FUZZ` (`slhdsa-sha2-128f-verify`, `slhdsa-shake-128f-verify`, new `src/fuzz_test.zig`): the genuine signature verifies; every damaged, truncated, extended or wild signature, and the genuine one under another message or context (including a context over 255 octets), is refused. No change in `src/` outside tests.

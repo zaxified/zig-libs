@@ -14,8 +14,10 @@
 //! FORS (§8), the internal functions (§9) and the pure external interface
 //! with context strings (§10.2).
 //!
-//! Out of scope: the HashSLH-DSA pre-hash variants (§10.2.2). Signing is
-//! NOT constant-time hardened (fine for this public-key scheme's verify;
+//! HashSLH-DSA pre-hash (§10.2.2, Algorithms 23/25) is `signPrehash` /
+//! `verifyPrehash` (module hashes) and `signPrehashDigest` /
+//! `verifyPrehashDigest` (caller supplies the digest), over all twelve
+//! approved PH functions. Signing is NOT constant-time hardened (fine for this public-key scheme's verify;
 //! keep sk handling in mind). Key generation takes caller-supplied seed
 //! bytes — bring your own CSPRNG (std 0.16 removed std.crypto.random).
 //! Fills a real std gap: Zig 0.16 std.crypto ships ML-DSA and ML-KEM but
@@ -52,6 +54,9 @@ pub const address = @import("address.zig");
 
 /// The generic construction; instantiate via `SlhDsa(params.sha2_128f)`.
 pub const engine = @import("engine.zig");
+
+/// HashSLH-DSA pre-hash function selector and OIDs (§10.2.2).
+pub const prehash = @import("prehash.zig");
 
 /// Generic SLH-DSA over any FIPS 205 `params.Params` set.
 pub const SlhDsa = engine.SlhDsa;
@@ -113,6 +118,7 @@ test "public API surface: sizes and a sign/verify smoke" {
 test {
     _ = params;
     _ = address;
+    _ = prehash;
     _ = engine;
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
