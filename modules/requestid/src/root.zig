@@ -21,12 +21,13 @@
 //!
 //! ## Generated IDs
 //!
-//! The default generator produces a unique-per-request 32-hex-char token from
-//! the monotonic clock, a per-connection-thread nonce and a per-thread
-//! counter — no allocation and no OS entropy call, fully portable. It is a
+//! The default generator produces a 32-hex-char token: a per-process prefix
+//! and a process-wide atomic sequence number — unique within the process
+//! across all threads, no allocation and no OS entropy call. It is a
 //! **correlation** ID (unique for tracing), NOT an unpredictable security
-//! token: do not use it where unguessability matters. If you need CSPRNG IDs,
-//! adopt an edge-assigned header (`trust_incoming`) or set the header yourself.
+//! token: do not use it where unguessability matters. For another scheme
+//! (UUID, ULID, CSPRNG) plug in `Options.generator`, or adopt an
+//! edge-assigned header (`trust_incoming`).
 //!
 //! ## Memory / concurrency
 //!
@@ -77,6 +78,25 @@ pub const Options = struct {
     /// Echo the ID back on the response. Off ⇒ the ID is only exposed via
     /// `current()` (e.g. for logging) and not sent to the client.
     echo: bool = true,
+    /// Produces an ID when none is adopted. Null ⇒ the built-in 32-hex
+    /// generator (`generateInto`). See `Generator` for the contract.
+    generator: ?Generator = null,
+};
+
+/// A caller-supplied ID scheme (UUIDv4/v7, ULID, a team's own format) —
+/// echo's `Generator` and tower-http's `MakeRequestId` offer the same.
+///
+/// `run` writes into `buf` (thread-local, reused by the next request on the
+/// thread) and returns the ID as a sub-slice of it. The result must pass
+/// `isAdoptable` — the same shape an incoming ID needs, so `current()` stays
+/// safe for an unescaped log sink and the echo cannot fail (`http` refuses a
+/// header value with CR/LF, which would fail the request). A result that
+/// does not (empty, bad byte, not inside `buf`) is discarded and the
+/// built-in generator is used instead.
+pub const Generator = struct {
+    /// Passed back to `run` verbatim (an `Io`, a PRNG, a prefix…).
+    context: ?*anyopaque = null,
+    run: *const fn (context: ?*anyopaque, buf: *[max_adopt_len]u8) []const u8,
 };
 
 /// Config + the middleware over it. Immutable; share one across threads.
@@ -88,10 +108,10 @@ pub const RequestId = struct {
     }
 };
 
-// Per-connection-thread request-scoped storage (see the module doc).
-threadlocal var id_buf: [generated_len]u8 = undefined;
+// Per-connection-thread request-scoped storage (see the module doc). Sized
+// for a custom generator's output; the built-in one fills the first 32.
+threadlocal var id_buf: [max_adopt_len]u8 = undefined;
 threadlocal var current_id: []const u8 = &.{};
-threadlocal var counter: u64 = 0;
 
 /// The current request's ID, or null if no `RequestId` middleware has run on
 /// this thread yet. Call it from the connection thread during the request.
@@ -108,12 +128,24 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
                 if (isAdoptable(incoming)) break :blk incoming; // stable: request head
             }
         }
-        break :blk generateInto(&id_buf);
+        if (ri.options.generator) |g| {
+            if (customId(g, &id_buf)) |custom| break :blk custom;
+        }
+        break :blk generateInto(id_buf[0..generated_len]);
     };
     current_id = id;
 
     if (ri.options.echo) try ctx.res.setHeader(ri.options.header_name, id);
     return next.run(ctx);
+}
+
+/// The generator's ID when it honours the `Generator` contract, else null.
+fn customId(g: Generator, buf: *[max_adopt_len]u8) ?[]const u8 {
+    const id = g.run(g.context, buf);
+    const start = @intFromPtr(id.ptr);
+    const inside = start >= @intFromPtr(buf) and
+        start + id.len <= @intFromPtr(buf) + buf.len;
+    return if (inside and isAdoptable(id)) id else null;
 }
 
 /// An incoming ID is adopted only when it is non-empty, within
@@ -144,35 +176,53 @@ pub fn isAdoptable(v: []const u8) bool {
     return true;
 }
 
-/// Write a unique 32-hex-char ID into `buf` and return it. Composition:
-/// 16 hex of monotonic ns · 4 hex of a per-thread nonce · 12 hex of a
-/// per-thread counter — unique without any OS-entropy call (see module doc).
+/// Write a 32-hex-char ID into `buf` and return it. Composition: 16 hex of a
+/// per-process prefix · 16 hex of a process-wide sequence number. Unique
+/// within the process for 2^64 calls, from any number of threads; across
+/// processes (restarts, replicas) the prefix makes a clash improbable, not
+/// impossible. No allocation and no OS-entropy call (see module doc).
 ///
 /// `pub` for explicit-state servers (see `isAdoptable`); safe from a fiber,
-/// unlike `current()`: the thread-locals here are the generator's own
-/// counter and nonce, consumed within this call — nothing request-scoped
-/// survives it, so a task that later resumes on another thread keeps only
-/// the caller-owned `buf`.
+/// unlike `current()`: it touches only process-wide atomics and the
+/// caller-owned `buf`, nothing request-scoped.
 pub fn generateInto(buf: *[generated_len]u8) []const u8 {
-    counter +%= 1;
-    const ns = monoNs();
-    // The address of a thread-local distinguishes threads (each has its own
-    // TLS block). It does NOT make a collision impossible, which this
-    // comment used to claim: TLS blocks are laid out at a fixed stride, so
-    // bits 4..19 of their addresses form an arithmetic progression with a
-    // short period — measured at 128 distinct nonces across 300 live
-    // threads on x86-64 Linux. `monoNs` is not a tiebreak either (two
-    // threads read the same nanosecond in ~2.6% of concurrent samples), and
-    // `counter` starts at 1 on every thread, so under
-    // one-thread-per-connection the first request of two connections can
-    // match on all three. Duplicate ids merge two traces; that is the cost,
-    // and it is a correlation-quality cost only — the module already
-    // disclaims security use, and nothing here is a uniqueness guarantee.
-    const nonce: u16 = @truncate(@intFromPtr(&counter) >> 4);
-    const printed = std.fmt.bufPrint(buf, "{x:0>16}{x:0>4}{x:0>12}", .{
-        ns, nonce, counter & 0xffffffffffff,
-    }) catch unreachable; // exactly 32 chars fit
+    // A process-wide counter, as chi's RequestID keeps. The 2026-10-04
+    // design (monotonic ns + a thread-address nonce + a per-thread counter)
+    // could repeat across connection threads: TLS blocks sit at a fixed
+    // stride (128 distinct nonces over 300 threads), two threads read the
+    // same nanosecond in ~2.6% of concurrent samples, and every thread's
+    // counter started at 1.
+    const seq = next_seq.fetchAdd(1, .monotonic);
+    const printed = std.fmt.bufPrint(buf, "{x:0>16}{x:0>16}", .{ processPrefix(), seq }) catch unreachable; // exactly 32 chars fit
     return printed;
+}
+
+var next_seq: std.atomic.Value(u64) = .init(0);
+var prefix_cache: std.atomic.Value(u64) = .init(0);
+
+/// The per-process half of a generated ID, computed on first use. It mixes
+/// the wall clock, the monotonic clock, the process ID (Linux) and the
+/// address of a static (ASLR), so two processes started in the same
+/// nanosecond still differ. Racing first callers compute the same kind of
+/// value and the first store wins; 0 is the "not yet" sentinel, so a mix
+/// that lands on 0 is bumped to 1.
+fn processPrefix() u64 {
+    const cached = prefix_cache.load(.monotonic);
+    if (cached != 0) return cached;
+    var h = std.hash.Wyhash.init(0x7265_7169_6470_7265);
+    std.hash.autoHash(&h, wallNs());
+    std.hash.autoHash(&h, monoNs());
+    std.hash.autoHash(&h, @intFromPtr(&prefix_cache));
+    if (builtin.os.tag == .linux) std.hash.autoHash(&h, std.os.linux.getpid());
+    const fresh = @max(h.final(), 1);
+    return prefix_cache.cmpxchgStrong(0, fresh, .monotonic, .monotonic) orelse fresh;
+}
+
+fn wallNs() u64 {
+    if (builtin.os.tag == .windows) return 0; // the monotonic reading and ASLR still vary
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
+    return @as(u64, @bitCast(@as(i64, ts.sec))) *% std.time.ns_per_s +% @as(u64, @intCast(ts.nsec));
 }
 
 fn monoNs() u64 {
@@ -215,18 +265,54 @@ test "current() is null on a thread no middleware has run on" {
     try testing.expect(was_null);
 }
 
-test "generateInto: the last 12 hex digits are a per-thread counter that steps by one" {
-    // `generateInto` doc: "16 hex of monotonic ns · 4 hex of a per-thread
-    // nonce · 12 hex of a per-thread counter". The counter is what keeps two
-    // ids apart when the clock has not moved. Mutation 2026-10-04: a frozen
-    // counter survived (two ids then differ only if the nanosecond did).
+test "generateInto: same prefix, the last 16 hex digits are a sequence that steps by one" {
+    // `generateInto` doc: "16 hex of a per-process prefix · 16 hex of a
+    // process-wide sequence number". Mutation 2026-10-04: a frozen counter
+    // survived the first test set. Test blocks run one at a time, so no
+    // other caller takes a number between the two calls.
     var a: [generated_len]u8 = undefined;
     var b: [generated_len]u8 = undefined;
     const ia = generateInto(&a);
     const ib = generateInto(&b);
-    const ca = try std.fmt.parseInt(u64, ia[20..32], 16);
-    const cb = try std.fmt.parseInt(u64, ib[20..32], 16);
-    try testing.expectEqual((ca + 1) & 0xffffffffffff, cb);
+    try testing.expectEqualStrings(ia[0..16], ib[0..16]);
+    try testing.expect(!std.mem.eql(u8, ia[0..16], "0000000000000000")); // 0 = "not yet"
+    const ca = try std.fmt.parseInt(u64, ia[16..32], 16);
+    const cb = try std.fmt.parseInt(u64, ib[16..32], 16);
+    try testing.expectEqual(ca +% 1, cb);
+}
+
+test "generateInto: no duplicate across many threads (the 2026-09-30 survey gap)" {
+    // The old id (ns · thread-address nonce · per-thread counter starting at
+    // 1) repeated across connection threads. Every thread takes ids at once
+    // after a shared start flag, the case that collided. Negative control
+    // 2026-10-11: a threadlocal sequence instead of the process-wide one
+    // made this fail (same prefix, same sequence 0 on every thread).
+    const n_threads = 32;
+    const per_thread = 200;
+    const T = struct {
+        fn run(go: *std.atomic.Value(bool), out: *[per_thread][generated_len]u8) void {
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            for (out) |*slot| _ = generateInto(slot);
+        }
+    };
+    const ids = try testing.allocator.alloc([per_thread][generated_len]u8, n_threads);
+    defer testing.allocator.free(ids);
+    var go: std.atomic.Value(bool) = .init(false);
+    var threads: [n_threads]std.Thread = undefined;
+    for (&threads, ids) |*th, *out| th.* = try std.Thread.spawn(.{}, T.run, .{ &go, out });
+    go.store(true, .release);
+    for (threads) |th| th.join();
+
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(testing.allocator);
+    for (ids) |*per| for (per) |*id| {
+        const gop = try seen.getOrPut(testing.allocator, id);
+        if (gop.found_existing) {
+            std.debug.print("duplicate generated id {s}\n", .{id});
+            return error.TestUnexpectedResult;
+        }
+    };
+    try testing.expectEqual(@as(usize, n_threads * per_thread), seen.count());
 }
 
 fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
@@ -417,6 +503,80 @@ test "custom header name" {
     const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\n" ++
         "X-Correlation-Id: trace-42\r\nConnection: close\r\n\r\n", &buf);
     try testing.expectEqualStrings("trace-42", headerValue(got, "X-Correlation-Id").?);
+}
+
+/// Test generator: "<prefix>-<n>" with a per-instance counter in `context`.
+const PrefixGen = struct {
+    prefix: []const u8,
+    n: u32 = 0,
+    /// When set, returns this instead (to exercise the contract checks):
+    /// copied into `buf` when `copy`, else the literal itself (outside `buf`).
+    bad: ?[]const u8 = null,
+    copy: bool = false,
+
+    fn run(context: ?*anyopaque, buf: *[max_adopt_len]u8) []const u8 {
+        const self: *PrefixGen = @ptrCast(@alignCast(context.?));
+        self.n += 1;
+        const b = self.bad orelse
+            return std.fmt.bufPrint(buf, "{s}-{d}", .{ self.prefix, self.n }) catch unreachable;
+        if (!self.copy) return b;
+        @memcpy(buf[0..b.len], b);
+        return buf[0..b.len];
+    }
+
+    fn generator(self: *PrefixGen) Generator {
+        return .{ .context = self, .run = run };
+    }
+};
+
+test "generator: a custom scheme is used, echoed and seen by current(); incoming still wins" {
+    var gen: PrefixGen = .{ .prefix = "svc" };
+    var ri = RequestId{ .options = .{ .generator = gen.generator() } };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(ri.middleware());
+    try r.get("/", hEchoCurrent);
+
+    var buf: [1024]u8 = undefined;
+    var got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expectEqualStrings("svc-1", headerValue(got, "X-Request-Id").?);
+    try testing.expectEqualStrings("svc-1", bodyOf(got));
+    got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expectEqualStrings("svc-2", headerValue(got, "X-Request-Id").?);
+
+    // A valid incoming ID is adopted; the generator is not called.
+    got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: edge-7\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expectEqualStrings("edge-7", headerValue(got, "X-Request-Id").?);
+    try testing.expectEqual(@as(u32, 2), gen.n);
+}
+
+test "generator: a result breaking the contract falls back to the built-in id" {
+    // Each case: (bad output, copy it into buf first?). Copied cases fail on
+    // shape (isAdoptable); the literal case fails on "not inside buf".
+    // Negative control 2026-10-11: dropping the `isAdoptable` call in
+    // `customId` failed this test (an empty id went out as the header).
+    const cases = [_]struct { bad: []const u8, copy: bool }{
+        .{ .bad = "", .copy = true },
+        .{ .bad = "a\r\nX-Evil: 1", .copy = true },
+        .{ .bad = "id,with,commas", .copy = true },
+        .{ .bad = "static-literal", .copy = false },
+    };
+    for (cases) |c| {
+        var gen: PrefixGen = .{ .prefix = "", .bad = c.bad, .copy = c.copy };
+        var ri = RequestId{ .options = .{ .generator = gen.generator() } };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(ri.middleware());
+        try r.get("/", hEchoCurrent);
+        var buf: [1024]u8 = undefined;
+        const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+        const hdr = headerValue(got, "X-Request-Id").?;
+        errdefer std.debug.print("generator fallback case bad={s} got header {s}\n", .{ c.bad, hdr });
+        try testing.expectEqual(@as(u32, 1), gen.n);
+        try testing.expect(modelIsGenerated(hdr));
+        try testing.expectEqualStrings(hdr, bodyOf(got));
+        try testing.expect(std.mem.indexOf(u8, got, "X-Evil") == null);
+    }
 }
 
 // ── model-fuzz: seeded random requests vs. a naive reference model ──────────
