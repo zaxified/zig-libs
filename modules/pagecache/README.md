@@ -36,12 +36,13 @@ const s = pc.stats(); // { hits, misses, resident_pages, resident_bytes,
                        //   evictions, borrowed_pages, ref_hits, ref_misses }
 ```
 
-**Precondition: at most one open handle per path per `PageCache`.** The cache
-key is `(handle, page_index)`, which stops two files aliasing each other and
-makes two handles on the SAME file two independent key spaces — a write
-through one would be invisible to the other. kvtree's exclusive lock refuses a
-second opener on a path, so its own usage cannot reach this; a caller driving
-`pc.storage()` directly can.
+**Several handles per path are fine.** The cache key is `(file id, page_index)`;
+a file id is assigned at `open` by path and shared by every handle open on it,
+so a write through one handle is seen by a read through another. `rename` and
+`delete` re-bind the name only (open handles keep following their file) and
+drop only the affected files' pages; `create_truncate` drops only that file's
+pages; the last `close` of a file drops its pages. Paths are compared as byte
+strings: open a file under one spelling (`"x"` and `"./x"` are two ids).
 
 **Options.** `page_size` (default kvtree's), `max_pages` (required, the RAM
 budget) and `read_ahead_pages` (default `0` = off). With `k > 0` a sequential

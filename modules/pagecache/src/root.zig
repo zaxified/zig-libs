@@ -46,12 +46,16 @@
 //! module is for. See SPEC.md for the full design and the write-back
 //! rejection argument.
 //!
-//! **One handle per path.** Pages are keyed by (handle, page index), so two
-//! handles open on the SAME path are two unrelated key spaces (a write through
-//! one never refreshes the other's pages). Every narrow invalidation here
-//! (`truncate`, sub-page writes, `close`) relies on that precondition; the ones
-//! that cannot (`create_truncate` open, `rename`, `delete`: handle -> path is
-//! opaque) clear the whole cache.
+//! **Many handles per path.** Pages are keyed by (file id, page index). A file
+//! id is assigned at `open` by path and refcounted across the handles open on
+//! it, so two handles on the same path share one key space: a write through
+//! one is seen by a read through the other. `rename` and `delete` re-bind the
+//! path -> id table (an open handle keeps following its file, as with an
+//! inode); `create_truncate` open drops that file's pages. Every
+//! invalidation is per file; nothing clears the whole cache. Paths are
+//! compared as byte strings: two spellings of one file ("x" and "./x") get two
+//! ids, so open a file under one spelling. The last `close` of a file drops its
+//! pages.
 //!
 //! **Read-ahead** (opt-in, `Options.read_ahead_pages`): see the option and
 //! SPEC.md.
@@ -184,9 +188,24 @@ pub const PageCache = struct {
     /// forgotten handle only costs one missed read-ahead, never correctness.
     seq: [seq_slots]SeqSlot = [_]SeqSlot{.{}} ** seq_slots,
     seq_next: usize = 0,
+    /// Files with at least one open handle. Few entries (kvtree holds two), so
+    /// lookups by path or id are linear scans; the table never grows with the
+    /// store, only with the number of simultaneously open files.
+    files: std.ArrayList(FileEntry) = .empty,
+    /// Open handle -> file id. A handle absent here was not opened through
+    /// this cache; its accesses go straight to the inner `Storage`.
+    handle_file: std.AutoHashMapUnmanaged(Storage.Handle, FileId) = .empty,
+    /// Starts at 0 on purpose: for the usual case of files opened once, in
+    /// order, the file id equals the backend handle number the keys used
+    /// before, so ramcache's (hash-dependent) admission behaves as it did.
+    next_id: FileId = 0,
+    const FileId = u32;
+    /// `path == null` is an orphan: the name was deleted or renamed over, but
+    /// handles keep the (inode-like) file alive and keep sharing its pages.
+    const FileEntry = struct { id: FileId, path: ?[]u8, refs: u32 };
     const seq_slots = 8;
     const SeqSlot = struct { handle: Storage.Handle = 0, last: u64 = 0, valid: bool = false };
-    /// Key layout for a cached page: the backend handle (so two files opened
+    /// Key layout for a cached page: the file id (so two files opened
     /// through the same cache never alias) followed by the page index.
     const key_len = 4 + 8;
 
@@ -212,6 +231,9 @@ pub const PageCache = struct {
     }
 
     pub fn deinit(self: *PageCache) void {
+        for (self.files.items) |f| if (f.path) |p| self.gpa.free(p);
+        self.files.deinit(self.gpa);
+        self.handle_file.deinit(self.gpa);
         self.cache.deinit();
         self.* = undefined;
     }
@@ -261,8 +283,9 @@ pub const PageCache = struct {
     /// snapshot it was given while later readers see the new bytes.
     pub fn preadRef(self: *PageCache, h: Storage.Handle, len: usize, off: u64) Storage.Error!?Page {
         if (!self.isFullPage(off, len)) return null;
+        const fid = self.fileOf(h) orelse return null;
         const page_index = off / self.page_size;
-        const key = pageKey(h, page_index);
+        const key = pageKey(fid, page_index);
         _ = self.noteAccess(h, page_index);
 
         if (self.cache.pin(&key, 0, 0)) |borrow| {
@@ -303,21 +326,46 @@ pub const PageCache = struct {
         return len == self.page_size and off % self.page_size == 0;
     }
 
-    fn pageKey(handle: Storage.Handle, page_index: u64) [key_len]u8 {
+    fn pageKey(file: FileId, page_index: u64) [key_len]u8 {
         var k: [key_len]u8 = undefined;
-        std.mem.writeInt(u32, k[0..4], handle, .little);
+        std.mem.writeInt(u32, k[0..4], file, .little);
         std.mem.writeInt(u64, k[4..12], page_index, .little);
         return k;
     }
 
-    /// The key prefix every page of `h` shares: `pageKey`'s handle field.
-    /// `vClose` invalidates by this prefix over the RESIDENT set, which is
-    /// bounded by `max_pages`; there is no side table of touched pages to
+    /// The key prefix every page of a file shares: `pageKey`'s id field.
+    /// Whole-file invalidation sweeps this prefix over the RESIDENT set, which
+    /// is bounded by `max_pages`; there is no side table of touched pages to
     /// keep, to grow, or to fail to allocate.
-    fn handlePrefix(handle: Storage.Handle) [4]u8 {
+    fn filePrefix(file: FileId) [4]u8 {
         var k: [4]u8 = undefined;
-        std.mem.writeInt(u32, &k, handle, .little);
+        std.mem.writeInt(u32, &k, file, .little);
         return k;
+    }
+
+    fn fileOf(self: *const PageCache, h: Storage.Handle) ?FileId {
+        return self.handle_file.get(h);
+    }
+
+    fn findById(self: *const PageCache, id: FileId) ?usize {
+        for (self.files.items, 0..) |f, i| if (f.id == id) return i;
+        return null;
+    }
+
+    fn findByPath(self: *const PageCache, path: []const u8) ?usize {
+        for (self.files.items, 0..) |f, i| {
+            if (f.path) |p| if (std.mem.eql(u8, p, path)) return i;
+        }
+        return null;
+    }
+
+    /// A file id no live entry uses (ids wrap after 2^32 opens; skip live ones).
+    fn freshId(self: *PageCache) FileId {
+        while (true) {
+            const id = self.next_id;
+            self.next_id +%= 1;
+            if (self.findById(id) == null) return id;
+        }
     }
 
     /// Record a full-page access of `h` at `page_index`; returns whether it
@@ -341,8 +389,8 @@ pub const PageCache = struct {
         }
     }
 
-    fn dropHandle(self: *PageCache, h: Storage.Handle) void {
-        const prefix = handlePrefix(h);
+    fn dropFile(self: *PageCache, file: FileId) void {
+        const prefix = filePrefix(file);
         _ = self.cache.removeMatching(&prefix);
     }
 
@@ -353,7 +401,7 @@ pub const PageCache = struct {
     /// when their span is small and otherwise sweeps the whole handle by
     /// prefix (a sound superset). `old_size == null` (or a failed truncate,
     /// whose media state is unknown) also means the sweep.
-    fn dropFrom(self: *PageCache, h: Storage.Handle, len: u64, old_size: ?u64, known: bool) void {
+    fn dropFrom(self: *PageCache, file: FileId, len: u64, old_size: ?u64, known: bool) void {
         if (known) if (old_size) |os| {
             const first = len / self.page_size;
             const end = os / self.page_size + @intFromBool(os % self.page_size != 0);
@@ -361,14 +409,13 @@ pub const PageCache = struct {
             if (end - first <= 4 * self.max_pages) {
                 var i = first;
                 while (i < end) : (i += 1) {
-                    const key = pageKey(h, i);
+                    const key = pageKey(file, i);
                     _ = self.cache.remove(&key);
                 }
                 return;
             }
         };
-        const prefix = handlePrefix(h);
-        _ = self.cache.removeMatching(&prefix);
+        self.dropFile(file);
     }
 
     /// Read-ahead on a sequential full-page miss of page `off / page_size`:
@@ -376,7 +423,7 @@ pub const PageCache = struct {
     /// buffer. Returns the page-`i` result for the caller (already copied into
     /// `buf`) or `null` when read-ahead did not apply / did not work and the
     /// caller must take the ordinary single-page path.
-    fn readAhead(self: *PageCache, h: Storage.Handle, buf: []u8, off: u64) ?usize {
+    fn readAhead(self: *PageCache, h: Storage.Handle, fid: FileId, buf: []u8, off: u64) ?usize {
         const ps = self.page_size;
         const extra_cap: u64 = @min(self.read_ahead_pages, self.max_pages -| 1);
         if (extra_cap == 0) return null;
@@ -398,12 +445,12 @@ pub const PageCache = struct {
             // the page the caller asked for is the one that stays.
             var j: usize = 1;
             while (j < got) : (j += 1) {
-                const key = pageKey(h, index + j);
+                const key = pageKey(fid, index + j);
                 self.cache.put(&key, tmp[j * ps ..][0..ps], 0, 0, 0);
                 self.readahead_inserted += 1;
             }
         }
-        const key = pageKey(h, index);
+        const key = pageKey(fid, index);
         self.cache.put(&key, buf, 0, 0, 0);
         return ps;
     }
@@ -435,17 +482,60 @@ pub const PageCache = struct {
     fn vOpen(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
         const self = cast(ctx);
         const h = try self.inner.open(path, mode);
-        // A truncating open discards the file's contents. Pages cached under
-        // ANOTHER still-open handle on the same path would go stale, and
-        // handle -> path is opaque here, so this stays a whole-cache clear
-        // (the new handle's own prefix would not cover them; pinned by the F2
-        // test). Rare: kvtree opens open_or_create.
+        // Everything below runs without yielding to another fiber, so the
+        // tables cannot change between the lookup and the update.
+        errdefer self.inner.close(h);
+        // A backend that hands out a handle number we still map did not see a
+        // close; release the stale mapping rather than leak its refcount.
+        if (self.handle_file.fetchRemove(h)) |stale| self.releaseFile(stale.value);
+        try self.handle_file.ensureUnusedCapacity(self.gpa, 1);
+        const existing = self.findByPath(path);
+        var fresh_path: ?[]u8 = null;
+        if (existing == null) {
+            try self.files.ensureUnusedCapacity(self.gpa, 1);
+            fresh_path = try self.gpa.dupe(u8, path);
+        }
+        var fid: FileId = undefined;
+        if (existing) |i| {
+            fid = self.files.items[i].id;
+            self.files.items[i].refs += 1;
+        } else {
+            fid = self.freshId();
+            self.files.appendAssumeCapacity(.{ .id = fid, .path = fresh_path, .refs = 1 });
+        }
+        self.handle_file.putAssumeCapacity(h, fid);
+        // A truncating open discards the file's contents: pages cached for it
+        // under OTHER open handles on the same path would go stale. They share
+        // this file id, so dropping exactly that file's pages is enough.
         if (mode == .create_truncate) {
             self.epoch +%= 1;
-            self.cache.clear();
+            self.dropFile(fid);
             self.forgetAccess(h);
         }
         return h;
+    }
+
+    /// One handle of `fid` went away; the last one drops the file's pages and
+    /// its table entry.
+    fn releaseFile(self: *PageCache, fid: FileId) void {
+        const i = self.findById(fid) orelse return;
+        const e = &self.files.items[i];
+        e.refs -= 1;
+        if (e.refs != 0) return;
+        // A read parked on this file must not insert its pages afterwards.
+        self.epoch +%= 1;
+        self.dropFile(fid);
+        if (e.path) |pth| self.gpa.free(pth);
+        _ = self.files.swapRemove(i);
+    }
+
+    /// The name of entry `i` no longer leads to its file (deleted, renamed
+    /// over, or rebinding failed). Open handles keep it and its pages; no later
+    /// `open` can reach it.
+    fn orphan(self: *PageCache, i: usize) void {
+        const e = &self.files.items[i];
+        if (e.path) |pth| self.gpa.free(pth);
+        e.path = null;
     }
 
     fn vSize(ctx: *anyopaque, h: Storage.Handle) Storage.Error!u64 {
@@ -458,8 +548,9 @@ pub const PageCache = struct {
     fn vPread(ctx: *anyopaque, h: Storage.Handle, buf: []u8, off: u64) Storage.Error!usize {
         const self = cast(ctx);
         if (!self.isFullPage(off, buf.len)) return self.inner.pread(h, buf, off);
+        const fid = self.fileOf(h) orelse return self.inner.pread(h, buf, off);
 
-        const key = pageKey(h, off / self.page_size);
+        const key = pageKey(fid, off / self.page_size);
         const sequential = self.noteAccess(h, off / self.page_size);
         if (self.cache.get(&key, 0, 0)) |cached| {
             @memcpy(buf, cached); // cached.len == page_size == buf.len
@@ -468,7 +559,7 @@ pub const PageCache = struct {
         }
         self.misses += 1;
         if (sequential and self.read_ahead_pages > 0) {
-            if (self.readAhead(h, buf, off)) |n| return n;
+            if (self.readAhead(h, fid, buf, off)) |n| return n;
         }
         const epoch0 = self.epoch;
         const n = try self.inner.pread(h, buf, off);
@@ -502,34 +593,35 @@ pub const PageCache = struct {
         // is "absent": drop it and let the next read go to media.
         self.epoch +%= 1;
         defer self.epoch +%= 1;
+        // The file id is looked up AFTER the inner write: it may park this
+        // fiber, and the handle can be closed (and the file's pages dropped)
+        // meanwhile. A handle no longer mapped has no pages to refresh.
         self.inner.writeAll(h, bytes, off) catch |err| {
+            const fid = self.fileOf(h) orelse return err;
             if (self.isFullPage(off, bytes.len)) {
-                const failed_key = pageKey(h, off / self.page_size);
+                const failed_key = pageKey(fid, off / self.page_size);
                 _ = self.cache.remove(&failed_key);
             } else {
                 // Sub-page/unaligned failed write: media state unknown for
-                // this handle's pages. Narrowed to the handle (precondition:
-                // one handle per path, see SPEC).
-                self.dropHandle(h);
+                // this file's pages (all handles on the path share them).
+                self.dropFile(fid);
             }
             return err;
         };
+        const fid = self.fileOf(h) orelse return;
 
         if (self.isFullPage(off, bytes.len)) {
             const page_index = off / self.page_size;
-            const key = pageKey(h, page_index);
+            const key = pageKey(fid, page_index);
             // Replace-in-place if resident (put over an existing key always
             // succeeds and never mis-admits), else offer it to the cache.
             self.cache.put(&key, bytes, 0, 0, 0);
         } else {
             // A sub-page or unaligned write could partially overlap several
             // resident pages we cannot pick out cheaply; drop every page of
-            // THIS handle. Other handles' pages are other files, unless two
-            // handles share a path -- the one-handle-per-path precondition
-            // that write-through already relies on (a write through h1 never
-            // refreshes pages cached under h2). kvtree never issues such a
-            // write, so this is defensive.
-            self.dropHandle(h);
+            // THIS file (shared by all handles open on it). kvtree never
+            // issues such a write, so this is defensive.
+            self.dropFile(fid);
         }
     }
 
@@ -539,9 +631,9 @@ pub const PageCache = struct {
 
     fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
         const self = cast(ctx);
-        // Only THIS handle's pages can be affected (the cache key starts with
-        // the handle, and SPEC's precondition is one handle per path), and of
-        // those only the pages at or past the new length -- see `dropFrom`.
+        // Only THIS file's pages can be affected (the cache key starts with
+        // the file id, shared by every handle on the path), and of those only
+        // the pages at or past the new length -- see `dropFrom`.
         // The old size bounds the candidate span; it is read before the
         // truncate because afterwards it is gone.
         const old_size: ?u64 = self.inner.size(h) catch null;
@@ -550,7 +642,9 @@ pub const PageCache = struct {
         self.epoch +%= 1;
         // Also on failure: a failed truncate leaves the media state unknown,
         // and "absent" is the only honest answer (see `vWriteAll`).
-        self.dropFrom(h, len, old_size, if (result) |_| true else |_| false);
+        if (self.fileOf(h)) |fid| {
+            self.dropFrom(fid, len, old_size, if (result) |_| true else |_| false);
+        }
         self.forgetAccess(h);
         return result;
     }
@@ -559,36 +653,59 @@ pub const PageCache = struct {
         const self = cast(ctx);
         self.inner.close(h);
         // The handle number may be recycled by the backend for a different
-        // file, and the key space is `(handle, page_index)` — so every page of
-        // this handle must go, while other files sharing the cache keep their
-        // hot pages resident. Sweeping the RESIDENT set by key prefix is
-        // exact, allocation-free and bounded by `max_pages`.
+        // file, so the handle -> file mapping goes now. Pages belong to the
+        // FILE: other handles still open on it keep sharing them, and the last
+        // close drops them (sweeping the RESIDENT set by key prefix: exact,
+        // allocation-free, bounded by `max_pages`).
         //
-        // The previous form kept a per-handle set of every page index the
+        // An earlier form kept a per-handle set of every page index the
         // handle had ever touched. Two defects, both structural: the set grew
         // with the STORE (measured at ~12 B live / ~18 B peak per distinct
-        // page, so a 4-page budget over 200 000 pages held 2.4 MB — 145x the
-        // cache's own ceiling, and the one quantity this module exists to
-        // decouple RAM from), and it was populated best-effort, so a page
+        // page, so a 4-page budget over 200 000 pages held 2.4 MB -- 145x the
+        // cache's own ceiling), and it was populated best-effort, so a page
         // whose tracking allocation failed survived the close and was served
         // to a DIFFERENT file through the recycled handle number.
-        const prefix = handlePrefix(h);
-        _ = self.cache.removeMatching(&prefix);
+        if (self.handle_file.fetchRemove(h)) |entry| self.releaseFile(entry.value);
         self.forgetAccess(h);
     }
 
+    /// `old_path`'s file now answers to `new_path`: its open handles keep
+    /// following it and its pages stay valid (same file, new name). Whatever
+    /// file `new_path` named before is unreachable by name from now on:
+    /// orphaned, its pages dropped. No other file is touched.
     fn vRename(ctx: *anyopaque, old_path: []const u8, new_path: []const u8) Storage.Error!void {
         const self = cast(ctx);
         try self.inner.rename(old_path, new_path);
         self.epoch +%= 1;
-        self.cache.clear(); // paths→handles is opaque here: cannot tell which handles' pages moved
+        if (std.mem.eql(u8, old_path, new_path)) return;
+        if (self.findByPath(new_path)) |j| {
+            self.dropFile(self.files.items[j].id);
+            self.orphan(j);
+        }
+        if (self.findByPath(old_path)) |i| {
+            if (self.gpa.dupe(u8, new_path)) |np| {
+                self.gpa.free(self.files.items[i].path.?);
+                self.files.items[i].path = np;
+            } else |_| {
+                // Cannot rebind the name: the only safe answer is to forget
+                // the file's pages and stop resolving the old name to it.
+                self.dropFile(self.files.items[i].id);
+                self.orphan(i);
+            }
+        }
     }
 
+    /// `path` stops naming its file: open handles keep it (inode semantics of
+    /// the backends), but a later `open` of the name makes a new file. Only
+    /// that file's pages are dropped.
     fn vDelete(ctx: *anyopaque, path: []const u8) Storage.Error!void {
         const self = cast(ctx);
         try self.inner.delete(path);
         self.epoch +%= 1;
-        self.cache.clear();
+        if (self.findByPath(path)) |i| {
+            self.dropFile(self.files.items[i].id);
+            self.orphan(i);
+        }
     }
 
     fn vSyncDir(ctx: *anyopaque) Storage.Error!void {
@@ -1017,7 +1134,8 @@ test "F2: each of the six clear() invalidation guards actually empties the cache
         try testing.expectEqual(@as(usize, 0), n); // "e" is empty; a stale hit would return "d"'s 0xAB page
     }
 
-    // 5) vRename: must drop resident pages.
+    // 5) vRename: the renamed file's pages MOVE with it (same file, new
+    //    name, so they stay valid); the replaced file's pages are dropped.
     {
         var sim = kv.SimStorage.init(gpa);
         defer sim.deinit();
@@ -1030,7 +1148,19 @@ test "F2: each of the six clear() invalidation guards actually empties the cache
         try testing.expect(pc.stats().resident_pages > 0);
 
         try st.rename("f", "g");
-        try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
+        try testing.expect(pc.stats().resident_pages > 0); // still resident under the new name
+        var buf: [default_page_size]u8 = undefined;
+        const hits0 = pc.stats().hits;
+        _ = try st.pread(h, &buf, 0);
+        try testing.expectEqual(hits0 + 1, pc.stats().hits);
+        try testing.expectEqualSlices(u8, page, &buf);
+
+        // A rename OVER an existing, open file drops that file's pages.
+        const victim = try st.open("v", .create_truncate);
+        try st.writeAll(victim, page, 0);
+        try testing.expectEqual(@as(usize, 2), pc.stats().resident_pages);
+        try st.rename("g", "v");
+        try testing.expectEqual(@as(usize, 1), pc.stats().resident_pages);
     }
 
     // 6) vDelete: must drop resident pages.
@@ -1048,6 +1178,133 @@ test "F2: each of the six clear() invalidation guards actually empties the cache
         try st.delete("h");
         try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
     }
+}
+
+/// Read page 0 of `h` through `st`; returns whether it was a cache hit and
+/// the byte it holds (every test page is filled with one byte).
+fn probePage(pc: *PageCache, st: Storage, h: Storage.Handle) !struct { hit: bool, first: u8, n: usize } {
+    var buf: [default_page_size]u8 = undefined;
+    const hits0 = pc.stats().hits;
+    const n = try st.pread(h, &buf, 0);
+    return .{ .hit = pc.stats().hits == hits0 + 1, .first = if (n > 0) buf[0] else 0, .n = n };
+}
+
+fn putPage(gpa: std.mem.Allocator, st: Storage, h: Storage.Handle, fill: u8) !void {
+    const page = try gpa.alloc(u8, default_page_size);
+    defer gpa.free(page);
+    @memset(page, fill);
+    try st.writeAll(h, page, 0);
+}
+
+test "multi-handle: two handles on one path share pages; a write through either is seen by the other" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+
+    const h1 = try st.open("shared", .open_or_create);
+    const h2 = try st.open("shared", .open_or_create);
+    try putPage(gpa, st, h1, 1);
+    const a = try probePage(&pc, st, h2); // written via h1, read via h2
+    try testing.expect(a.hit);
+    try testing.expectEqual(@as(u8, 1), a.first);
+    try putPage(gpa, st, h2, 2); // overwritten via h2, read via h1
+    const b = try probePage(&pc, st, h1);
+    try testing.expect(b.hit);
+    try testing.expectEqual(@as(u8, 2), b.first);
+    try testing.expectEqual(@as(usize, 1), pc.stats().resident_pages); // ONE page, not one per handle
+
+    // Truncate through one handle is seen by the other.
+    try st.truncate(h1, 0);
+    const c = try probePage(&pc, st, h2);
+    try testing.expectEqual(@as(usize, 0), c.n);
+
+    // Closing one handle keeps the shared pages for the other; the last close drops them.
+    try putPage(gpa, st, h1, 3);
+    st.close(h1);
+    const d = try probePage(&pc, st, h2);
+    try testing.expect(d.hit);
+    try testing.expectEqual(@as(u8, 3), d.first);
+    st.close(h2);
+    try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
+    try testing.expectEqual(@as(usize, 0), pc.files.items.len);
+    try testing.expectEqual(@as(u32, 0), pc.handle_file.count());
+}
+
+test "multi-handle: rename, delete and create_truncate touch only the affected path's pages" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+
+    const hx = try st.open("x", .open_or_create);
+    const hy = try st.open("y", .open_or_create);
+    const hy2 = try st.open("y", .open_or_create);
+    const hz = try st.open("z", .open_or_create);
+    try putPage(gpa, st, hx, 10);
+    try putPage(gpa, st, hy, 20);
+    try putPage(gpa, st, hz, 30);
+    try testing.expectEqual(@as(usize, 3), pc.stats().resident_pages);
+
+    // rename(x, w): x's pages move with the file, y and z stay resident.
+    try st.rename("x", "w");
+    try testing.expectEqual(@as(usize, 3), pc.stats().resident_pages);
+    for ([_]struct { Storage.Handle, u8 }{ .{ hx, 10 }, .{ hy, 20 }, .{ hy2, 20 }, .{ hz, 30 } }) |c| {
+        const r = try probePage(&pc, st, c[0]);
+        try testing.expect(r.hit);
+        try testing.expectEqual(c[1], r.first);
+    }
+    // The renamed file answers to its new name: a new handle shares its pages.
+    const hw = try st.open("w", .open_or_create);
+    const rw = try probePage(&pc, st, hw);
+    try testing.expect(rw.hit and rw.first == 10);
+
+    // delete(y): only y's pages go; its open handles keep reading the (now
+    // nameless) file from the backend, and z / w stay resident.
+    try st.delete("y");
+    try testing.expectEqual(@as(usize, 2), pc.stats().resident_pages);
+    try testing.expect((try probePage(&pc, st, hz)).hit);
+    try testing.expect((try probePage(&pc, st, hw)).hit);
+    const old_y = try probePage(&pc, st, hy);
+    try testing.expect(!old_y.hit);
+    try testing.expectEqual(@as(u8, 20), old_y.first);
+    // Reopening y after the delete is a NEW, empty file: no stale bytes.
+    const hy_new = try st.open("y", .open_or_create);
+    const fresh = try probePage(&pc, st, hy_new);
+    try testing.expectEqual(@as(usize, 0), fresh.n);
+    try putPage(gpa, st, hy_new, 21);
+    try testing.expectEqual(@as(u8, 20), (try probePage(&pc, st, hy2)).first); // the old file is not the new one
+    try testing.expectEqual(@as(u8, 21), (try probePage(&pc, st, hy_new)).first);
+
+    // create_truncate of z through a second handle: z's pages go, others stay.
+    const before = pc.stats().resident_pages;
+    const hz2 = try st.open("z", .create_truncate);
+    try testing.expectEqual(before - 1, pc.stats().resident_pages);
+    try testing.expectEqual(@as(usize, 0), (try probePage(&pc, st, hz)).n);
+    try testing.expectEqual(@as(usize, 0), (try probePage(&pc, st, hz2)).n);
+    try testing.expect((try probePage(&pc, st, hw)).hit);
+    try testing.expect((try probePage(&pc, st, hy_new)).hit);
+
+    // rename OVER an existing path: the replaced file's pages are dropped,
+    // the moved file's are kept, and the old name stops resolving.
+    try putPage(gpa, st, hz2, 31);
+    try st.rename("z", "w");
+    const rw2 = try probePage(&pc, st, hz2);
+    try testing.expect(rw2.hit and rw2.first == 31);
+    const old_w = try probePage(&pc, st, hw); // the replaced inode, still open
+    try testing.expect(!old_w.hit);
+    try testing.expectEqual(@as(u8, 10), old_w.first);
+    const hw_new = try st.open("w", .open_or_create);
+    const rw3 = try probePage(&pc, st, hw_new);
+    try testing.expect(rw3.hit and rw3.first == 31);
+
+    for ([_]Storage.Handle{ hx, hy, hy2, hz, hw, hy_new, hz2, hw_new }) |h| st.close(h);
+    try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
+    try testing.expectEqual(@as(usize, 0), pc.files.items.len);
 }
 
 test "F4: vTryLockExclusive forwards to the inner Storage verbatim (dead in kvtree's own call path today)" {
@@ -2403,26 +2660,36 @@ const MfModel = struct {
     const ps = 16; // page size under test (tiny, so edges are reached fast)
     const n_paths = 3;
     const cap = 24 * ps;
+    const pool = 96; // inodes available to one case
     const paths = [n_paths][]const u8{ "p0", "p1", "p2" };
 
-    exists: [n_paths]bool = .{false} ** n_paths,
-    len: [n_paths]usize = .{0} ** n_paths,
-    data: [n_paths][cap]u8 = undefined,
+    /// Path -> file. The model is per PATH for names and per FILE (inode) for
+    /// bytes, like the backend: a handle follows its file across `rename` and
+    /// `delete`, and a name can lead to a different file after either.
+    name: [n_paths]?usize = .{null} ** n_paths,
+    used: usize = 0,
+    len: [pool]usize = .{0} ** pool,
+    data: [pool][cap]u8 = undefined,
 
-    fn write(m: *MfModel, i: usize, off: usize, bytes: []const u8) void {
+    fn write(m: *MfModel, ino: usize, off: usize, bytes: []const u8) void {
         const end = off + bytes.len;
-        if (end > m.len[i]) {
-            @memset(m.data[i][m.len[i]..end], 0);
-            m.len[i] = end;
+        if (end > m.len[ino]) {
+            @memset(m.data[ino][m.len[ino]..end], 0);
+            m.len[ino] = end;
         }
-        @memcpy(m.data[i][off..end], bytes);
+        @memcpy(m.data[ino][off..end], bytes);
     }
 
-    fn read(m: *const MfModel, i: usize, off: usize, out: []u8) usize {
-        if (off >= m.len[i]) return 0;
-        const n = @min(out.len, m.len[i] - off);
-        @memcpy(out[0..n], m.data[i][off..][0..n]);
+    fn read(m: *const MfModel, ino: usize, off: usize, out: []u8) usize {
+        if (off >= m.len[ino]) return 0;
+        const n = @min(out.len, m.len[ino] - off);
+        @memcpy(out[0..n], m.data[ino][off..][0..n]);
         return n;
+    }
+
+    fn named(m: *const MfModel, ino: usize) bool {
+        for (m.name) |n| if (n == ino) return true;
+        return false;
     }
 };
 
@@ -2448,9 +2715,18 @@ const MfReach = struct {
     rename: u64 = 0,
     delete: u64 = 0,
     open_errors: u64 = 0,
+    // several handles on one path
+    second_handle: u64 = 0,
+    shared_read_after_other_write: u64 = 0,
+    create_truncate_shared: u64 = 0,
+    rename_open: u64 = 0,
+    rename_over_open: u64 = 0,
+    delete_open: u64 = 0,
+    orphan_io: u64 = 0,
 };
 
-const MfBorrow = struct { page: Page, path: usize, off: usize, snap: [MfModel.ps]u8 };
+const MfBorrow = struct { page: Page, ino: usize, off: usize, snap: [MfModel.ps]u8 };
+const MfHandle = struct { h: Storage.Handle, ino: usize, ro: bool };
 
 fn mfCase(gpa: std.mem.Allocator, seed: u64, reach: *MfReach) !void {
     const ps = MfModel.ps;
@@ -2471,9 +2747,11 @@ fn mfCase(gpa: std.mem.Allocator, seed: u64, reach: *MfReach) !void {
     const st = pc.storage();
 
     var model = MfModel{};
-    var handles: [MfModel.n_paths]?Storage.Handle = .{null} ** MfModel.n_paths;
-    var ro: [MfModel.n_paths]bool = .{false} ** MfModel.n_paths;
+    // Up to two handles per path (slot k), each bound to the file it opened.
+    var hs: [MfModel.n_paths][2]?MfHandle = .{.{ null, null }} ** MfModel.n_paths;
     var borrows: [6]?MfBorrow = .{null} ** 6;
+    // Which handle slot last wrote each file (for the shared-read reach class).
+    var last_writer: [MfModel.pool]?Storage.Handle = .{null} ** MfModel.pool;
     var full_reads: u64 = 0;
     var ref_ok: u64 = 0;
     defer for (&borrows) |*slot| {
@@ -2485,115 +2763,134 @@ fn mfCase(gpa: std.mem.Allocator, seed: u64, reach: *MfReach) !void {
     errdefer std.debug.print("pagecache model-fuzz FAILED: seed={d} step={d} max_pages={d} read_ahead={d}\n", .{ seed, step, max_pages, ra });
     while (step < steps) : (step += 1) {
         const i = rnd.uintLessThan(usize, MfModel.n_paths);
+        const k = rnd.uintLessThan(usize, 2);
         var roll = rnd.uintLessThan(u32, 100);
-        if (handles[i] == null and roll >= 12 and roll < 96) roll = 0; // a closed path: open it first
-        const live_pages = model.len[i] / ps;
+        if (hs[i][k] == null and roll >= 12 and roll < 96) roll = 0; // a closed slot: open it first
+        const hk = hs[i][k];
+        const ino: usize = if (hk) |x| x.ino else 0;
+        const live_pages = model.len[ino] / ps;
 
-        if (roll < 12) { // ---- open
-            if (handles[i] != null) continue; // precondition: one handle per path
+        if (roll < 12) { // ---- open (a second handle on an open path is the point)
+            if (hk != null) continue;
             const modes = [_]Storage.OpenMode{ .open_or_create, .open_or_create, .create_truncate, .read_only, .create_new };
             const mode = modes[rnd.uintLessThan(usize, modes.len)];
+            const exists = model.name[i] != null;
+            if (!exists and mode != .read_only and model.used == MfModel.pool) continue;
             if (st.open(MfModel.paths[i], mode)) |h| {
-                try testing.expect(!(mode == .read_only and !model.exists[i]));
-                try testing.expect(!(mode == .create_new and model.exists[i]));
-                if (mode == .create_truncate) {
-                    model.len[i] = 0;
-                    reach.create_truncate += 1;
+                try testing.expect(!(mode == .read_only and !exists));
+                try testing.expect(!(mode == .create_new and exists));
+                const other_open = hs[i][1 - k] != null;
+                var fino: usize = undefined;
+                if (model.name[i]) |n| {
+                    fino = n;
+                    if (mode == .create_truncate) model.len[n] = 0;
+                } else {
+                    fino = model.used;
+                    model.used += 1;
+                    model.len[fino] = 0;
+                    model.name[i] = fino;
                 }
-                if (mode != .read_only) model.exists[i] = true;
-                handles[i] = h;
-                ro[i] = mode == .read_only;
+                if (mode == .create_truncate) {
+                    reach.create_truncate += 1;
+                    if (other_open) reach.create_truncate_shared += 1;
+                }
+                if (other_open) reach.second_handle += 1;
+                hs[i][k] = .{ .h = h, .ino = fino, .ro = mode == .read_only };
             } else |err| {
                 reach.open_errors += 1;
-                if (mode == .read_only and !model.exists[i]) {
+                if (mode == .read_only and !exists) {
                     try testing.expectEqual(error.FileNotFound, err);
-                } else if (mode == .create_new and model.exists[i]) {
+                } else if (mode == .create_new and exists) {
                     try testing.expectEqual(error.PathAlreadyExists, err);
                 } else return err;
             }
         } else if (roll < 18) { // ---- close (and usually reopen later)
-            const h = handles[i].?;
-            st.close(h);
-            handles[i] = null;
+            st.close(hk.?.h);
+            hs[i][k] = null;
             reach.close_reopen += 1;
         } else if (roll < 42) { // ---- full aligned page write
-            const h = handles[i].?;
+            const h = hk.?.h;
             const idx = rnd.uintLessThan(usize, live_pages + 3);
             if ((idx + 1) * ps > MfModel.cap) continue;
             var page: [ps]u8 = undefined;
             if (rnd.boolean()) rnd.bytes(&page) else @memset(&page, rnd.int(u8));
-            if (ro[i]) {
+            if (hk.?.ro) {
                 try testing.expectError(error.AccessDenied, st.writeAll(h, &page, idx * ps));
                 reach.ro_denied += 1;
             } else {
                 try st.writeAll(h, &page, idx * ps);
-                model.write(i, idx * ps, &page);
+                model.write(ino, idx * ps, &page);
+                last_writer[ino] = h;
             }
         } else if (roll < 48) { // ---- unaligned / short / long write
-            const h = handles[i].?;
-            if (ro[i]) continue;
-            const off = rnd.uintLessThan(usize, model.len[i] + 2 * ps + 1);
+            const h = hk.?.h;
+            if (hk.?.ro) continue;
+            const off = rnd.uintLessThan(usize, model.len[ino] + 2 * ps + 1);
             const n = 1 + rnd.uintLessThan(usize, 2 * ps + 3);
             if (off + n > MfModel.cap) continue;
             var buf: [2 * ps + 3]u8 = undefined;
             rnd.bytes(buf[0..n]);
             try st.writeAll(h, buf[0..n], off);
-            model.write(i, off, buf[0..n]);
+            model.write(ino, off, buf[0..n]);
+            last_writer[ino] = h;
             if (!(n == ps and off % ps == 0)) reach.unaligned_write += 1;
         } else if (roll < 72) { // ---- full aligned page read
-            const h = handles[i].?;
+            const h = hk.?.h;
             const idx = rnd.uintLessThan(usize, live_pages + 3);
             var got: [ps]u8 = undefined;
             var want: [ps]u8 = undefined;
+            const hits0 = pc.stats().hits;
             const n = try st.pread(h, &got, idx * ps);
-            const wn = model.read(i, idx * ps, &want);
+            const wn = model.read(ino, idx * ps, &want);
             full_reads += 1;
             try testing.expectEqual(wn, n);
             try testing.expectEqualSlices(u8, want[0..wn], got[0..n]);
             if (n == 0) reach.eof_read += 1 else if (n < ps) reach.short_read += 1;
+            if (!model.named(ino)) reach.orphan_io += 1;
+            if (pc.stats().hits == hits0 + 1 and last_writer[ino] != null and last_writer[ino].? != h) reach.shared_read_after_other_write += 1;
         } else if (roll < 78) { // ---- arbitrary read
-            const h = handles[i].?;
-            const off = rnd.uintLessThan(usize, model.len[i] + ps + 1);
+            const h = hk.?.h;
+            const off = rnd.uintLessThan(usize, model.len[ino] + ps + 1);
             const len = 1 + rnd.uintLessThan(usize, 3 * ps);
             var got: [3 * ps]u8 = undefined;
             var want: [3 * ps]u8 = undefined;
             const n = try st.pread(h, got[0..len], off);
-            const wn = model.read(i, off, want[0..len]);
+            const wn = model.read(ino, off, want[0..len]);
             if (len == ps and off % ps == 0) full_reads += 1;
             try testing.expectEqual(wn, n);
             try testing.expectEqualSlices(u8, want[0..wn], got[0..n]);
         } else if (roll < 86) { // ---- borrow
-            const h = handles[i].?;
+            const h = hk.?.h;
             const aligned = rnd.uintLessThan(u32, 8) != 0;
             const idx = rnd.uintLessThan(usize, live_pages + 2);
             const off = idx * ps + (if (aligned) 0 else 1 + rnd.uintLessThan(usize, ps - 1));
-            const slot = for (&borrows) |*s| {
-                if (s.* == null) break s;
+            const slot = for (&borrows) |*sl| {
+                if (sl.* == null) break sl;
             } else continue;
-            const full_present = off % ps == 0 and off + ps <= model.len[i];
+            const full_present = off % ps == 0 and off + ps <= model.len[ino];
             const r = try pc.preadRef(h, ps, off);
             if (r) |page| {
                 try testing.expect(full_present);
                 var want: [ps]u8 = undefined;
-                _ = model.read(i, off, &want);
+                _ = model.read(ino, off, &want);
                 try testing.expectEqualSlices(u8, &want, page.bytes);
                 ref_ok += 1;
-                slot.* = .{ .page = page, .path = i, .off = off, .snap = want };
+                slot.* = .{ .page = page, .ino = ino, .off = off, .snap = want };
             } else {
                 try testing.expect(!full_present);
                 reach.ref_null += 1;
             }
         } else if (roll < 91) { // ---- release a borrow
-            const k = rnd.uintLessThan(usize, borrows.len);
-            if (borrows[k]) |b| {
+            const kb = rnd.uintLessThan(usize, borrows.len);
+            if (borrows[kb]) |b| {
                 try testing.expectEqualSlices(u8, &b.snap, b.page.bytes);
                 pc.releasePage(b.page);
-                borrows[k] = null;
+                borrows[kb] = null;
             }
         } else if (roll < 94) { // ---- truncate (shrink only: the seam's contract)
-            const h = handles[i].?;
-            const nl = rnd.uintLessThan(usize, model.len[i] + 1);
-            if (ro[i]) {
+            const h = hk.?.h;
+            const nl = rnd.uintLessThan(usize, model.len[ino] + 1);
+            if (hk.?.ro) {
                 try testing.expectError(error.AccessDenied, st.truncate(h, nl));
                 reach.ro_denied += 1;
             } else {
@@ -2601,12 +2898,13 @@ fn mfCase(gpa: std.mem.Allocator, seed: u64, reach: *MfReach) !void {
                 // case that found kv SimStorage's undo-buffer invalid free
                 // (fixed 2026-10-11, kv/src/sim.zig `undoBytes`).
                 try st.truncate(h, nl);
-                model.len[i] = nl;
+                model.len[ino] = nl;
+                last_writer[ino] = h;
                 reach.truncate += 1;
             }
         } else if (roll < 96) { // ---- failed write, optionally torn
-            const h = handles[i].?;
-            if (ro[i]) continue;
+            const h = hk.?.h;
+            if (hk.?.ro) continue;
             const idx = rnd.uintLessThan(usize, live_pages + 2);
             var page: [ps]u8 = undefined;
             rnd.bytes(&page);
@@ -2617,48 +2915,52 @@ fn mfCase(gpa: std.mem.Allocator, seed: u64, reach: *MfReach) !void {
             fault.fail_write_index = null;
             fault.torn_prefix = 0;
             if (torn > 0) {
-                model.write(i, idx * ps, page[0..torn]); // the prefix really landed on media
+                model.write(ino, idx * ps, page[0..torn]); // the prefix really landed on media
+                last_writer[ino] = h;
                 reach.torn_write += 1;
             }
             reach.failed_write += 1;
-        } else if (roll < 98) { // ---- rename (both paths closed)
+        } else if (roll < 98) { // ---- rename (handles on either path may be open)
             const j = rnd.uintLessThan(usize, MfModel.n_paths);
-            if (handles[i] != null or handles[j] != null) continue;
-            if (!model.exists[i]) {
+            if (model.name[i] == null) {
                 try testing.expectError(error.FileNotFound, st.rename(MfModel.paths[i], MfModel.paths[j]));
             } else {
                 try st.rename(MfModel.paths[i], MfModel.paths[j]);
                 if (i != j) {
-                    model.exists[j] = true;
-                    model.len[j] = model.len[i];
-                    model.data[j] = model.data[i];
-                    model.exists[i] = false;
-                    model.len[i] = 0;
+                    if (hs[i][0] != null or hs[i][1] != null) reach.rename_open += 1;
+                    if (hs[j][0] != null or hs[j][1] != null) reach.rename_over_open += 1;
+                    model.name[j] = model.name[i];
+                    model.name[i] = null;
                 }
                 reach.rename += 1;
             }
-        } else { // ---- delete (closed path)
-            if (handles[i] != null) continue;
-            if (!model.exists[i]) {
+        } else { // ---- delete (handles may be open: the file lives on, nameless)
+            if (model.name[i] == null) {
                 try testing.expectError(error.FileNotFound, st.delete(MfModel.paths[i]));
             } else {
+                if (hs[i][0] != null or hs[i][1] != null) reach.delete_open += 1;
                 try st.delete(MfModel.paths[i]);
-                model.exists[i] = false;
-                model.len[i] = 0;
+                model.name[i] = null;
                 reach.delete += 1;
             }
         }
 
         // ---- invariants after EVERY step
+        var open_handles: usize = 0;
         for (0..MfModel.n_paths) |p| {
             // Write-through: media equals the model, always.
-            if (model.exists[p]) {
-                try testing.expectEqualSlices(u8, model.data[p][0..model.len[p]], sim.fileContent(MfModel.paths[p]).?);
+            if (model.name[p]) |n| {
+                try testing.expectEqualSlices(u8, model.data[n][0..model.len[n]], sim.fileContent(MfModel.paths[p]).?);
             } else {
                 try testing.expect(sim.fileContent(MfModel.paths[p]) == null);
             }
-            if (handles[p]) |h| try testing.expectEqual(@as(u64, model.len[p]), try st.size(h));
+            for (hs[p]) |maybe| if (maybe) |x| {
+                open_handles += 1;
+                try testing.expectEqual(@as(u64, model.len[x.ino]), try st.size(x.h));
+            };
         }
+        try testing.expectEqual(open_handles, pc.handle_file.count());
+        try testing.expect(pc.files.items.len <= open_handles);
         var live_borrows: usize = 0;
         for (borrows) |slot| {
             const b = slot orelse continue;
@@ -2666,9 +2968,9 @@ fn mfCase(gpa: std.mem.Allocator, seed: u64, reach: *MfReach) !void {
             // A borrow keeps the snapshot it was handed, whatever happened since.
             try testing.expectEqualSlices(u8, &b.snap, b.page.bytes);
             var cur: [ps]u8 = undefined;
-            const cn = model.read(b.path, b.off, &cur);
+            const cn = model.read(b.ino, b.off, &cur);
             // (reach) the live page moved on while the borrow still holds the old bytes
-            if (!model.exists[b.path] or cn != ps or !std.mem.eql(u8, &cur, &b.snap)) reach.borrow_kept_snapshot += 1;
+            if (cn != ps or !std.mem.eql(u8, &cur, &b.snap)) reach.borrow_kept_snapshot += 1;
         }
         const s = pc.stats();
         try testing.expect(s.resident_pages <= max_pages + s.borrowed_pages);
@@ -2679,20 +2981,21 @@ fn mfCase(gpa: std.mem.Allocator, seed: u64, reach: *MfReach) !void {
         if (s.resident_pages > max_pages) reach.over_cap_by_borrow += 1;
     }
 
-    // A last full audit through the cache, page by page, against the model.
-    for (0..MfModel.n_paths) |p| {
-        const h = handles[p] orelse continue;
+    // A last full audit through the cache, page by page, against the model
+    // (every open handle, named or orphaned).
+    for (0..MfModel.n_paths) |p| for (hs[p]) |maybe| {
+        const x = maybe orelse continue;
         var off: usize = 0;
-        while (off < model.len[p]) : (off += ps) {
+        while (off < model.len[x.ino]) : (off += ps) {
             var got: [ps]u8 = undefined;
             var want: [ps]u8 = undefined;
-            const n = try st.pread(h, &got, off);
-            const wn = model.read(p, off, &want);
+            const n = try st.pread(x.h, &got, off);
+            const wn = model.read(x.ino, off, &want);
             full_reads += 1;
             try testing.expectEqual(wn, n);
             try testing.expectEqualSlices(u8, want[0..wn], got[0..n]);
         }
-    }
+    };
     const fin = pc.stats();
     if (fin.hits > 0) reach.hit += 1;
     if (fin.misses > 0) reach.miss += 1;

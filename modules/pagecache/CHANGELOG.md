@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — Several open handles per path. Pages are keyed by a per-path file id (assigned at `open`, refcounted across handles) instead of the backend handle, so a write, truncate or truncating open through one handle is seen through the others. `rename`, `delete` and `create_truncate` open no longer clear the whole cache: they drop only the affected files' pages (a renamed file keeps its pages under the new name); the last `close` of a file drops its pages. Residual precondition: open a file under one path spelling. Model-fuzz now opens two handles per path and renames/deletes across open handles. Scope core -> parity.
+
 - **2026-10-11** — tests: model-fuzz against a naive per-file byte-array model (300 seeded random `Storage`-op sequences incl. borrows, torn writes, rename/delete; per-step media, size, read, borrow-snapshot and counter checks; reach classes enforced). No API or behaviour change.
 
 - **2026-10-10** — Card Performance `n/a` with the reason (no timeable reference implementation). Docs only.
