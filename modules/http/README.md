@@ -218,6 +218,20 @@ try server.serve();                   // accept loop; or server.listen() = bind+
 // server.activeConnections() = admitted, not-yet-closed connections.
 ```
 
+**Graceful shutdown (Go's `Shutdown`/`Close`).** `server.shutdownGraceful(timeout_ms)`
+stops accepting, runs the `registerOnShutdown` hooks, closes idle keep-alive
+connections at once and lets each request in flight finish — its response says
+`Connection: close` when the head has not gone out yet — then returns, or
+`error.DeadlineExceeded` with connections still open (`0` = no deadline). An
+HTTP/2 connection sends GOAWAY (NO_ERROR, its last stream), refuses streams
+above it, finishes the rest and closes. `server.close()` ends everything at
+once. `server.isDraining()` tells a long-running handler (SSE, long poll) to
+wrap up; `server.setKeepAlivesEnabled(false)` answers every request
+`Connection: close` without stopping the server. Upgraded and detached
+connections are not tracked (Go does not either): the shutdown hook is how they
+learn. A connection accepted while a shutdown runs sees it at its first wait
+and closes.
+
 ### Response trailers
 
 Fields whose value is only known once the body is finished (payload

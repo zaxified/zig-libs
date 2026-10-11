@@ -269,6 +269,11 @@ pub const Options = struct {
     /// stream is reported as `.handler_failed`.
     on_error: ?Server.ErrorFn = null,
     on_error_ctx: ?*anyopaque = null,
+    /// The socket server's connection control (`Server.shutdownGraceful`):
+    /// when the server drains, the connection sends GOAWAY (NO_ERROR),
+    /// finishes the streams it has and closes; an idle one closes at once.
+    /// Null when served by hand.
+    control: ?*Server.ConnControl = null,
     /// DoS-hardening limits; the defaults are safe for exposure.
     limits: Limits = .{},
     /// Per-request opt-in to the **incremental request body** (see the
@@ -740,6 +745,8 @@ const Session = struct {
     jobs: std.AutoArrayHashMapUnmanaged(u31, Job) = .empty,
     req_index: u32 = 0,
     peer_goaway: bool = false,
+    /// We sent GOAWAY because the server drains (`Options.control`).
+    local_goaway: bool = false,
     /// Streams a handler detached (`ResponseWriter.detach`): response open,
     /// request state already freed, DATA pushed through `Detached` between
     /// pumps. Single-task mode only; the dispatcher path never fills it.
@@ -933,15 +940,23 @@ const Session = struct {
                 s.conn.sendGoaway(&s.wire, .no_error, "") catch {};
                 s.flushWire() catch {};
             }
+            // Our own graceful shutdown (`Server.shutdownGraceful`): say
+            // GOAWAY once, with the last stream we took (§6.8), then finish
+            // what is open exactly as for the peer's GOAWAY below.
+            if (!s.local_goaway and s.opts.control != null and s.opts.control.?.server.isDraining()) {
+                s.local_goaway = true;
+                s.conn.sendGoaway(&s.wire, .no_error, "") catch {};
+                s.flushWire() catch {};
+            }
             // Graceful shutdown: the peer said GOAWAY and nothing is left.
             // A GOAWAY forbids NEW streams; a live detached stream is an
             // existing one and keeps the connection open (§6.8).
-            const drained = s.peer_goaway and s.jobs.count() == 0 and
+            const drained = (s.peer_goaway or s.local_goaway) and s.jobs.count() == 0 and
                 s.detached.items.len == 0;
             // Answer the peer's GOAWAY with ours before closing (§6.8: an
             // endpoint SHOULD send one before it closes), so a client that
             // races a request against the close learns none was processed.
-            if (drained and !over_total) {
+            if (drained and !over_total and !s.local_goaway) {
                 s.conn.sendGoaway(&s.wire, .no_error, "") catch {};
                 s.flushWire() catch {};
             }
@@ -964,7 +979,32 @@ const Session = struct {
                     }
                 }
             }
-            s.pump() catch return;
+            // Nothing open: the connection is idle while it waits, and a
+            // server that drains may close it (it sees `draining` first and
+            // says GOAWAY, or claims the socket and the read ends).
+            const idle = s.opts.control != null and s.jobs.count() == 0 and s.inflight == 0 and
+                s.detached.items.len == 0;
+            if (idle and !s.opts.control.?.enterIdle()) {
+                if (!s.local_goaway) {
+                    s.lock();
+                    s.conn.sendGoaway(&s.wire, .no_error, "") catch {};
+                    s.flushWire() catch {};
+                    s.unlock();
+                }
+                return;
+            }
+            s.pump() catch {
+                // A claimed idle connection: the read side is gone, the write
+                // side may still carry the GOAWAY.
+                if (idle and s.opts.control.?.state.load(.seq_cst) == .closing and !s.local_goaway) {
+                    s.lock();
+                    s.conn.sendGoaway(&s.wire, .no_error, "") catch {};
+                    s.flushWire() catch {};
+                    s.unlock();
+                }
+                return;
+            };
+            if (idle and !s.opts.control.?.leaveIdle()) return;
         }
     }
 
@@ -1240,6 +1280,14 @@ const Session = struct {
             if (hd.end_stream) job.complete = true;
             return;
         }
+        // After our GOAWAY, a stream above its last-stream-id is one we said
+        // we would not process (§6.8): refused (retryable elsewhere), so a
+        // peer cannot keep a draining connection open with new streams.
+        if (s.conn.goaway_sent) |last| if (hd.stream_id > last) {
+            hd.headers.deinit(s.gpa);
+            s.conn.sendRstStream(&s.wire, hd.stream_id, .refused_stream) catch {};
+            return;
+        };
         // Enforce our advertised SETTINGS_MAX_CONCURRENT_STREAMS (§5.1.2):
         // excess streams are refused — REFUSED_STREAM is safely retryable
         // (§8.7) — and the connection keeps serving the admitted ones. This

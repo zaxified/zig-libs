@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Graceful shutdown, Go's `Shutdown`/`Close` (S2 survey R1), additive.**
+  `Server.shutdownGraceful(timeout_ms)` (idle connections closed, requests in flight finished with
+  `Connection: close`, HTTP/2 GOAWAY NO_ERROR and its open streams finished; `error.DeadlineExceeded`
+  when connections outlive the timeout), `Server.close`, `isDraining`, `setKeepAlivesEnabled`,
+  `registerOnShutdown`. `Server.Deadlines` (R2, unreleased) is now `Server.ConnControl` and
+  `StreamOptions.deadlines` is `StreamOptions.control`. **Fix, h2:** a stream opened above the
+  last-stream-id of a GOAWAY we sent is refused (REFUSED_STREAM, §6.8); it used to be served,
+  so a peer could hold a closing connection open. `shutdown()` keeps its meaning (stop accepting).
+
 - **2026-10-12** — **Go's server timeouts (S2 survey R2).** New `Options.read_header_timeout_ms` (Go
   `ReadHeaderTimeout`), `idle_timeout_ms` (Go `IdleTimeout`) and `response_timeout_ms` (Go
   `WriteTimeout`), all absolute and off by default; `Request.setReadDeadline` / `setWriteDeadline`

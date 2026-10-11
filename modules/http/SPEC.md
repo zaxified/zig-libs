@@ -401,8 +401,17 @@ directly-exposed parser.
 **S3 → S2 plan (survey 2026-10-11, `go doc` of net/http + httputil + cookiejar + httptest; owner
 decisions the same day: every gap a Go user notices is implemented, TLS server planned separately).**
 Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML notes, not shipped).
-- R1 graceful lifecycle: `shutdownGraceful(deadline)` (idle connections closed, in-flight requests
-  finish, h2 GOAWAY), `close`, `registerOnShutdown`. `shutdown()` today only stops accepting.
+- R1 graceful lifecycle — DONE 2026-10-12: `shutdownGraceful(timeout_ms)`, `close`, `isDraining`,
+  `setKeepAlivesEnabled`, `registerOnShutdown` (8 hooks). Every socket connection registers a
+  `ConnControl` (renamed from R2's `Deadlines`) with an atomic `active/idle/closing` state; the loop
+  publishes `idle` then reads `draining`, the shutdown sets `draining` then claims `idle` — qap's
+  `Conns` ordering, so neither side can miss the other. Idle claims shut only the read side, so h2
+  can still send its GOAWAY. h2: GOAWAY NO_ERROR once draining, streams above its last-stream-id
+  refused (before, `goaway_sent` was recorded but never enforced — a peer could keep a closing
+  connection alive with new streams). `Connection: close` is decided when the head is written,
+  as Go does (a test caught the read-time decision missing a shutdown that began in the handler).
+  h2spec 145/145 both phases; negative controls: no idle sweep → the graceful test times out, no
+  GOAWAY → the h2c test fails.
 - R2 timeouts Go has — DONE 2026-10-12: `read_header_timeout_ms`, `idle_timeout_ms`,
   `response_timeout_ms` as ABSOLUTE phase deadlines (a peer dribbling one byte per period defeats an
   inactivity timer; qap measured 75 s against a 10 s one), `Request.setReadDeadline` /

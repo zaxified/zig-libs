@@ -132,6 +132,13 @@ reaper: Reaper,
 /// `activeConnections`). Atomic: touched by the accept loop and every
 /// connection task.
 active_conns: std.atomic.Value(usize),
+/// Set by `shutdownGraceful`/`close`: every connection closes at its next
+/// request boundary (h1) or once its streams are done (h2, after GOAWAY).
+draining: std.atomic.Value(bool) = .init(false),
+/// `setKeepAlivesEnabled`: off answers every request `Connection: close`.
+keep_alives: std.atomic.Value(bool) = .init(true),
+/// Every live socket connection, for `shutdownGraceful` and `close`.
+registry: Registry = .{},
 /// The Zig error name behind the most recent `BadAddress`/`ListenFailed`
 /// from `bind` — see `bindErrorName`. Same shape as `probe.ConnectOutcome.
 /// err_name`: `std.Io.net` reports an `anyerror`, not an errno, so there is
@@ -708,6 +715,119 @@ pub fn activeConnections(s: *const Server) usize {
     return s.active_conns.load(.monotonic);
 }
 
+/// The live connections and the shutdown hooks, under one lock.
+const Registry = struct {
+    mutex: std.Io.Mutex = .init,
+    list: std.DoublyLinkedList = .{},
+    hooks: [max_shutdown_hooks]ShutdownHook = undefined,
+    hooks_len: usize = 0,
+};
+
+/// `registerOnShutdown` capacity.
+pub const max_shutdown_hooks = 8;
+
+pub const ShutdownHook = struct { ctx: ?*anyopaque, f: *const fn (?*anyopaque) void };
+
+pub const ShutdownError = error{
+    /// Connections were still open when the deadline passed; they are left
+    /// running (`close` ends them), as Go's `Shutdown` leaves them.
+    DeadlineExceeded,
+    Canceled,
+};
+
+/// Go's `Server.Shutdown`: stop accepting, run the `registerOnShutdown`
+/// hooks, close every idle connection now, and let each active one finish
+/// its request — answered `Connection: close` — and close (an HTTP/2
+/// connection sends GOAWAY and finishes its open streams). Returns once no
+/// connection is left, or `error.DeadlineExceeded` after `timeout_ms`
+/// (0 = wait as long as it takes). Callable from any thread while `serve`
+/// runs; `serve` returns when its connections are gone. Hijacked
+/// connections (`ResponseWriter.upgrade`, a detached response) are the
+/// hooks' to end — Go does not track them either.
+pub fn shutdownGraceful(s: *Server, timeout_ms: u32) ShutdownError!void {
+    s.draining.store(true, .seq_cst);
+    s.shutdown();
+    s.registry.mutex.lockUncancelable(s.io);
+    const hooks = s.registry.hooks;
+    const hooks_len = s.registry.hooks_len;
+    s.registry.mutex.unlock(s.io);
+    for (hooks[0..hooks_len]) |h| h.f(h.ctx);
+
+    const deadline_ns: u64 = if (timeout_ms == 0) 0 else nowNs(s.io) + @as(u64, timeout_ms) * std.time.ns_per_ms;
+    while (true) {
+        s.closeConnections(.idle);
+        if (s.active_conns.load(.acquire) == 0) return;
+        if (deadline_ns != 0 and nowNs(s.io) >= deadline_ns) return error.DeadlineExceeded;
+        // Go polls with a growing interval up to 500 ms; connections end on
+        // their own here (they see `draining`), so a short fixed tick only
+        // bounds how late this call notices.
+        sleepMs(s.io, 10) catch return error.Canceled;
+    }
+}
+
+/// Go's `Server.Close`: stop accepting and end every connection now, in
+/// flight or not. Returns at once; `serve` returns when the connection
+/// tasks have unwound.
+pub fn close(s: *Server) void {
+    s.draining.store(true, .seq_cst);
+    s.shutdown();
+    s.closeConnections(.any);
+}
+
+/// Whether `shutdownGraceful`/`close` has begun — for a long-running handler
+/// (SSE, long poll) that should wrap up.
+pub fn isDraining(s: *const Server) bool {
+    return s.draining.load(.monotonic);
+}
+
+/// Go's `SetKeepAlivesEnabled`: false answers every request `Connection:
+/// close` (the connection ends after it) until set back.
+pub fn setKeepAlivesEnabled(s: *Server, enabled: bool) void {
+    s.keep_alives.store(enabled, .monotonic);
+}
+
+/// Go's `RegisterOnShutdown`: `f(ctx)` runs once when `shutdownGraceful`
+/// begins, on the caller's thread — for connections the server does not
+/// track (upgraded, detached) to be told. It must not block.
+pub fn registerOnShutdown(s: *Server, ctx: ?*anyopaque, f: *const fn (?*anyopaque) void) error{TooManyHooks}!void {
+    s.registry.mutex.lockUncancelable(s.io);
+    defer s.registry.mutex.unlock(s.io);
+    if (s.registry.hooks_len == max_shutdown_hooks) return error.TooManyHooks;
+    s.registry.hooks[s.registry.hooks_len] = .{ .ctx = ctx, .f = f };
+    s.registry.hooks_len += 1;
+}
+
+/// Shut down the sockets of the registered connections: `.idle` only those
+/// waiting for a request (claimed, so the claim and the connection's own
+/// draining check cannot both miss), `.any` every one.
+fn closeConnections(s: *Server, which: enum { idle, any }) void {
+    s.registry.mutex.lockUncancelable(s.io);
+    defer s.registry.mutex.unlock(s.io);
+    var it = s.registry.list.first;
+    while (it) |n| : (it = n.next) {
+        const c: *ConnControl = @fieldParentPtr("node", n);
+        const claimed = switch (which) {
+            .idle => c.state.cmpxchgStrong(.idle, .closing, .seq_cst, .seq_cst) == null,
+            .any => c.state.swap(.closing, .seq_cst) != .closing,
+        };
+        // An idle connection loses only its read side: the blocked read
+        // ends, and an h2 session can still send its GOAWAY before closing.
+        if (claimed) c.stream.shutdown(s.io, if (which == .idle) .recv else .both) catch {};
+    }
+}
+
+fn register(s: *Server, c: *ConnControl) void {
+    s.registry.mutex.lockUncancelable(s.io);
+    defer s.registry.mutex.unlock(s.io);
+    s.registry.list.append(&c.node);
+}
+
+fn unregister(s: *Server, c: *ConnControl) void {
+    s.registry.mutex.lockUncancelable(s.io);
+    defer s.registry.mutex.unlock(s.io);
+    s.registry.list.remove(&c.node);
+}
+
 /// Closes every listener if still open. Only call after `serve` returned.
 pub fn deinit(s: *Server) void {
     if (s.listener) |*l| l.deinit(s.io);
@@ -1189,7 +1309,12 @@ fn connMain(s: *Server, stream: net.Stream) void {
     var tw: TimeoutWriter = .init(&sw, s.io, w, o.write_timeout_ms, write_buf);
     tr.header_timeout_ms = o.read_header_timeout_ms;
     tr.idle_timeout_ms = o.idle_timeout_ms;
-    var deadlines: Deadlines = .{ .tr = &tr, .tw = &tw, .response_timeout_ms = o.response_timeout_ms };
+    var control: ConnControl = .{ .server = s, .stream = stream, .tr = &tr, .tw = &tw, .response_timeout_ms = o.response_timeout_ms };
+    // Registered before the first wait: a connection accepted while a
+    // shutdown sweeps finds `draining` set at its first `enterIdle` and
+    // closes itself rather than slipping past the drain.
+    s.register(&control);
+    defer s.unregister(&control);
 
     // h2c (opt-in): a connection that opens with the HTTP/2 client preface
     // is served as HTTP/2 with the same handler; anything else falls
@@ -1203,6 +1328,10 @@ fn connMain(s: *Server, stream: net.Stream) void {
         if (is_h2) {
             served = true;
             tr.armConnection(o.max_h2c_connection_ms);
+            // h2 has no per-request deadlines: the control carries only the
+            // drain state there.
+            control.tr = null;
+            control.tw = null;
             h2s.serve(s.gpa, .{
                 .handler = o.handler,
                 .context = o.context,
@@ -1221,6 +1350,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .on_conn_state_ctx = o.on_conn_state_ctx,
                 .on_error = o.on_error,
                 .on_error_ctx = o.on_error_ctx,
+                .control = &control,
                 // Deliberately not forwarded: the h2 codec's working memory
                 // has a different shape (per-stream, not per-request) and
                 // lending it is a separate change. `Options.buffers_provider`
@@ -1253,7 +1383,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .max_decompressed_request_bytes = o.max_decompressed_request_bytes,
         .verify_inbound_trailer = o.verify_inbound_trailer,
         .max_requests_per_conn = o.max_requests_per_conn,
-        .deadlines = &deadlines,
+        .control = &control,
     }, &tr.reader, &tw.writer, bufs);
 }
 
@@ -1681,29 +1811,67 @@ const TimeoutWriter = struct {
     }
 };
 
-/// One HTTP/1.1 connection's deadline control, owned by the socket serving
-/// loop and reached through `StreamOptions.deadlines`: the loop moves it
-/// through the request cycle (idle → head → body) and a handler adjusts it
-/// with `Request.setReadDeadline` / `setWriteDeadline`. Null when serving
-/// socket-free and on HTTP/2.
-pub const Deadlines = struct {
-    tr: *TimeoutReader,
-    tw: *TimeoutWriter,
-    response_timeout_ms: u32,
+/// One socket connection as its `Server` sees it, reached through
+/// `StreamOptions.control`: the serving loop moves it through the request
+/// cycle (idle → head → body: the deadlines of `read_header_timeout_ms`,
+/// `idle_timeout_ms`, `response_timeout_ms`), a handler adjusts it with
+/// `Request.setReadDeadline` / `setWriteDeadline`, and `shutdownGraceful` /
+/// `close` find it in the server's registry. Null when serving socket-free.
+/// The serving loops' type: nothing here is for a caller to build.
+pub const ConnControl = struct {
+    server: *Server,
+    stream: net.Stream,
+    /// Null on the h2 path, which has no per-request deadlines.
+    tr: ?*TimeoutReader = null,
+    tw: ?*TimeoutWriter = null,
+    response_timeout_ms: u32 = 0,
+    /// `idle` while the connection waits for a request (h1) or has no open
+    /// stream (h2); `closing` once `shutdownGraceful`/`close` claimed it.
+    /// The claim and the loop's own check are ordered the same way round as
+    /// in qap's connection registry: the loop publishes `idle` and THEN reads
+    /// `draining`, the shutdown sets `draining` and THEN claims `idle` — so
+    /// one of the two always sees the other.
+    state: std.atomic.Value(State) = .init(.active),
+    node: std.DoublyLinkedList.Node = .{},
 
-    fn beginIdle(d: *Deadlines) void {
-        d.tr.beginIdle();
-        d.tw.response_deadline_ns = 0;
+    pub const State = enum(u8) { active, idle, closing };
+
+    /// About to wait for the next request / frame with nothing in flight.
+    /// False: the server is draining (or closed this connection) — close now
+    /// instead of waiting.
+    pub fn enterIdle(c: *ConnControl) bool {
+        if (c.state.cmpxchgStrong(.active, .idle, .seq_cst, .seq_cst) != null) return false;
+        if (c.server.draining.load(.seq_cst)) {
+            _ = c.state.cmpxchgStrong(.idle, .active, .seq_cst, .seq_cst);
+            return false;
+        }
+        if (c.tr) |t| t.beginIdle();
+        if (c.tw) |w| w.response_deadline_ns = 0;
+        return true;
     }
 
-    fn beginHead(d: *Deadlines) void {
-        d.tr.beginHead();
+    /// The wait ended with bytes to serve. False: a shutdown claimed the
+    /// connection meanwhile — drop it, as Go drops an idle connection a
+    /// request raced into.
+    pub fn leaveIdle(c: *ConnControl) bool {
+        if (c.state.cmpxchgStrong(.idle, .active, .seq_cst, .seq_cst) != null) return false;
+        if (c.tr) |t| t.beginHead();
+        return true;
+    }
+
+    /// Whether the response being made should end the connection: the
+    /// server drains or has keep-alives off (Go `SetKeepAlivesEnabled`).
+    pub fn mustClose(c: *const ConnControl) bool {
+        return c.server.draining.load(.monotonic) or !c.server.keep_alives.load(.monotonic);
     }
 
     /// The head is parsed: the head deadline ends, the response one starts.
-    fn headRead(d: *Deadlines) void {
-        d.tr.endHead();
-        if (d.tw.watch != null) d.tw.response_deadline_ns = d.tr.afterMs(d.response_timeout_ms);
+    fn headRead(c: *ConnControl) void {
+        const t = c.tr orelse return;
+        t.endHead();
+        if (c.tw) |w| if (w.watch != null) {
+            w.response_deadline_ns = t.afterMs(c.response_timeout_ms);
+        };
     }
 };
 
@@ -1737,10 +1905,11 @@ pub const StreamOptions = struct {
     /// Failure observer — see `Options.on_error`.
     on_error: ?ErrorFn = null,
     on_error_ctx: ?*anyopaque = null,
-    /// The socket loop's deadline control (see `Deadlines`); null =
-    /// socket-free, no deadlines, and `Request.setReadDeadline` /
-    /// `setWriteDeadline` answer `error.Unsupported`.
-    deadlines: ?*Deadlines = null,
+    /// The socket loop's connection control (see `ConnControl`); null =
+    /// socket-free: no deadlines, no graceful shutdown, and
+    /// `Request.setReadDeadline` / `setWriteDeadline` answer
+    /// `error.Unsupported`.
+    control: ?*ConnControl = null,
     /// Lend this connection its working memory one request at a time instead
     /// of taking the caller's for the whole connection. Null keeps the
     /// buffers passed to `serveStream`, which is what every caller did before
@@ -1833,7 +2002,7 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
     fireConnState(&opts, .new);
     var req_index: u32 = 0;
     while (true) {
-        if (opts.deadlines) |d| d.beginIdle();
+        if (opts.control) |c| if (!c.enterIdle()) break;
 
         // ⭐⭐⭐ Wait for the next request BEFORE borrowing anything.
         //
@@ -1850,7 +2019,7 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
         // Any failure here -- client hung up between requests, idle timeout
         // -- is a quiet close, as it was when `serveOne` owned this line.
         _ = in.peekByte() catch break;
-        if (opts.deadlines) |d| d.beginHead();
+        if (opts.control) |c| if (!c.leaveIdle()) break;
 
         if (serveStep(opts, in, out, bufs, req_index) == .close) break;
         req_index += 1;
@@ -1971,7 +2140,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         error.MalformedHead => return respondError(opts, out, date, 400),
         error.ReadFailed, error.ConnectionClosed => return .close,
     };
-    if (opts.deadlines) |d| d.headRead();
+    if (opts.control) |c| c.headRead();
     fireConnState(&opts, .active);
 
     // Request-line bound (Go checks its URI length the same way, after the
@@ -2090,7 +2259,8 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     // (RFC 9112 §9.3; Go oracle `http10-keepalive-pipeline`), and its
     // response then needs a known length (`beginStreaming` closes when there
     // is none). `force_close` (per-connection request cap reached) also ends it.
-    const keep_alive = (!head.http1_0 or head.connection_keep_alive) and !head.connection_close and !force_close;
+    const keep_alive = (!head.http1_0 or head.connection_keep_alive) and !head.connection_close and !force_close and
+        !(if (opts.control) |c| c.mustClose() else false);
 
     // Body cap, declared-length half: refuse before the handler runs (and
     // before any 100-continue invites the body onto the wire) — the nginx
@@ -2128,7 +2298,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         .context = opts.context,
         .peer = opts.peer,
         .conn_request_index = req_index,
-        .deadlines = opts.deadlines,
+        .control = opts.control,
     };
     // Inbound gzip decoding (Task 1): route the handler's `req.reader()`
     // through the flate decoder wrapped in a decompressed-byte cap. The
@@ -2224,6 +2394,12 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         rw.flush() catch return .close;
         return .close;
     }
+    // A shutdown that began while the handler ran still gets its
+    // `Connection: close` when the head has not gone out yet — Go decides
+    // keep-alive when it writes the head, not when it reads the request.
+    if (opts.control) |c| if (!rw.sent_head and c.mustClose()) {
+        rw.close_connection = true;
+    };
     rw.end() catch {
         // Framing failed. When nothing hit the wire yet (e.g. the body did
         // not match a declared Content-Length), a 500 still fits; either
@@ -2318,9 +2494,9 @@ pub const Request = struct {
     /// the interim line goes out on `rw.out` unless the final head already
     /// has. Null on every request that did not ask for one. See `serveOne`.
     continue_rw: ?*ResponseWriter = null,
-    /// The connection's deadline control (HTTP/1.1 over a socket); null
-    /// otherwise. See `setReadDeadline`.
-    deadlines: ?*Deadlines = null,
+    /// The connection's control (over a socket); null otherwise. See
+    /// `setReadDeadline`.
+    control: ?*ConnControl = null,
     /// HTTP/2 only: the request's stream id, so a handler that detaches its
     /// response (`ResponseWriter.detach`) can name the stream to
     /// `h2_server.Detached.push` later. Null on HTTP/1.1.
@@ -2359,9 +2535,10 @@ pub const Request = struct {
     /// HTTP/2, or by a `Server` with every timeout at 0 (no deadline is
     /// enforced at all then).
     pub fn setReadDeadline(req: *const Request, ms: u32) error{Unsupported}!void {
-        const d = req.deadlines orelse return error.Unsupported;
-        if (d.tr.watch == null) return error.Unsupported;
-        d.tr.deadline_ns = d.tr.afterMs(ms);
+        const c = req.control orelse return error.Unsupported;
+        const t = c.tr orelse return error.Unsupported;
+        if (t.watch == null) return error.Unsupported;
+        t.deadline_ns = t.afterMs(ms);
     }
 
     /// Move this response's write deadline (`Options.response_timeout_ms`)
@@ -2370,9 +2547,10 @@ pub const Request = struct {
     /// removes it (`write_timeout_ms` still bounds each stalled write).
     /// `error.Unsupported` as for `setReadDeadline`.
     pub fn setWriteDeadline(req: *const Request, ms: u32) error{Unsupported}!void {
-        const d = req.deadlines orelse return error.Unsupported;
-        if (d.tw.watch == null) return error.Unsupported;
-        d.tw.response_deadline_ns = d.tr.afterMs(ms);
+        const c = req.control orelse return error.Unsupported;
+        const w = c.tw orelse return error.Unsupported;
+        if (w.watch == null) return error.Unsupported;
+        w.response_deadline_ns = c.tr.?.afterMs(ms);
     }
 
     /// Every value of header `name` (case-insensitive), one per field line,
@@ -7477,6 +7655,166 @@ test "integration: response_timeout_ms ends a slow response; setWriteDeadline mo
     try testing.expect(std.mem.endsWith(u8, ext.got, "done"));
 }
 
+fn countHook(ctx: ?*anyopaque) void {
+    const n: *usize = @ptrCast(@alignCast(ctx.?));
+    n.* += 1;
+}
+
+test "integration: shutdownGraceful closes an idle keep-alive connection, lets a slow request finish with Connection: close" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var io = threaded.io();
+    var server = init(io, testing.allocator, .{
+        .handler = deadlineHandler,
+        .context = @ptrCast(&io),
+        .read_timeout_ms = 20_000,
+    });
+    defer server.deinit();
+    var hooks_run: usize = 0;
+    try server.registerOnShutdown(&hooks_run, countHook);
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    // A: one request answered, then idle on keep-alive.
+    const a = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer a.close(io);
+    var a_rbuf: [512]u8 = undefined;
+    var a_wbuf: [256]u8 = undefined;
+    var a_r = a.reader(io, &a_rbuf);
+    var a_w = a.writer(io, &a_wbuf);
+    try a_w.interface.writeAll("GET /fast HTTP/1.1\r\nHost: t\r\n\r\n");
+    try a_w.interface.flush();
+    try testing.expect(std.mem.startsWith(u8, try a_r.interface.takeDelimiterInclusive('\n'), "HTTP/1.1 200 "));
+    while (!std.mem.eql(u8, try a_r.interface.takeDelimiterInclusive('\n'), "\r\n")) {}
+    try testing.expectEqualStrings("done", try a_r.interface.take(4));
+
+    // B: a request whose handler is still sleeping when the shutdown starts.
+    const b = try server.boundAddress().connect(io, .{ .mode = .stream });
+    defer b.close(io);
+    var b_rbuf: [512]u8 = undefined;
+    var b_wbuf: [256]u8 = undefined;
+    var b_r = b.reader(io, &b_rbuf);
+    var b_w = b.writer(io, &b_wbuf);
+    try b_w.interface.writeAll("GET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
+    try b_w.interface.flush();
+    try sleepMs(io, 100);
+
+    const started_ns = nowNs(io);
+    try server.shutdownGraceful(5_000);
+    const took_ms = (nowNs(io) - started_ns) / std.time.ns_per_ms;
+    // Done when B's ~300 ms handler is; an idle A left open would have held
+    // it to the deadline.
+    try testing.expect(took_ms < 2_000);
+    try testing.expectEqual(@as(usize, 1), hooks_run);
+    try testing.expect(server.isDraining());
+
+    var b_buf: [512]u8 = undefined;
+    var b_out: Writer = .fixed(&b_buf);
+    _ = b_r.interface.streamRemaining(&b_out) catch {};
+    try testing.expect(std.mem.startsWith(u8, b_out.buffered(), "HTTP/1.1 200 "));
+    try testing.expect(std.mem.indexOf(u8, b_out.buffered(), "Connection: close\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, b_out.buffered(), "done"));
+    try testing.expectError(error.EndOfStream, a_r.interface.take(1));
+}
+
+test "integration: shutdownGraceful reports DeadlineExceeded; close then ends what is left" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var io = threaded.io();
+    var server = init(io, testing.allocator, .{
+        .handler = deadlineHandler,
+        .context = @ptrCast(&io),
+        .read_timeout_ms = 20_000,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const b = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer b.close(io);
+    var b_rbuf: [512]u8 = undefined;
+    var b_wbuf: [256]u8 = undefined;
+    var b_r = b.reader(io, &b_rbuf);
+    var b_w = b.writer(io, &b_wbuf);
+    try b_w.interface.writeAll("GET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
+    try b_w.interface.flush();
+    try sleepMs(io, 50);
+    try testing.expectError(error.DeadlineExceeded, server.shutdownGraceful(20));
+    server.close();
+    var buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&buf);
+    _ = b_r.interface.streamRemaining(&out) catch {};
+    try testing.expectEqual(@as(usize, 0), out.buffered().len);
+}
+
+test "integration: setKeepAlivesEnabled(false) answers Connection: close and serves one request per connection" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = init(io, testing.allocator, .{ .handler = testHandler, .read_timeout_ms = 20_000 });
+    defer server.deinit();
+    server.setKeepAlivesEnabled(false);
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    var buf: [2048]u8 = undefined;
+    const got = timedExchange(io, &server, "GET /hello HTTP/1.1\r\nHost: t\r\n\r\nGET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &buf) catch |err|
+        return testkit.loopbackSkip("loopback exchange failed ({t})", .{err});
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got.got, "HTTP/1.1 200 "));
+    try testing.expect(std.mem.indexOf(u8, got.got, "Connection: close\r\n") != null);
+}
+
+test "integration: shutdownGraceful sends an idle h2c connection GOAWAY (NO_ERROR) before closing it" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = init(io, testing.allocator, .{ .handler = testHandler, .enable_h2c = true, .read_timeout_ms = 20_000 });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [1024]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(testing.allocator);
+    try wire.appendSlice(testing.allocator, h2.preface);
+    try h2.encodeSettings(testing.allocator, &wire, .{});
+    try sw.interface.writeAll(wire.items);
+    try sw.interface.flush();
+    try sleepMs(io, 100); // the session is up and waiting
+
+    try server.shutdownGraceful(5_000);
+
+    // Walk the frames the server sent until the close: one must be GOAWAY
+    // with error code NO_ERROR.
+    var saw_goaway = false;
+    while (true) {
+        const hdr = sr.interface.takeArray(9) catch break;
+        const len = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | hdr[2];
+        const payload = sr.interface.take(len) catch break;
+        if (hdr[3] == 0x7) {
+            saw_goaway = true;
+            try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, payload[4..8], .big));
+        }
+    }
+    try testing.expect(saw_goaway);
+}
+
 test "setReadDeadline/setWriteDeadline: Unsupported when served socket-free" {
     const H = struct {
         fn handle(req: *Request, rw: *ResponseWriter) anyerror!void {
@@ -7500,7 +7838,7 @@ test "integration: request_timeout_ms bounds the WHOLE request even when no sing
     // The per-read stall budget (`read_timeout_ms`) resets on every byte, so
     // a "dribbling" client that stays just inside it can hold a connection
     // open indefinitely -- exactly the slowloris shape `request_timeout_ms`
-    // exists to close (`Deadlines.beginHead` arms it at the first byte). This
+    // exists to close (`ConnControl.leaveIdle` arms it at the first byte). This
     // was the one guard in the module with zero coverage (A1 audit F6,
     // mutation M20 -- deleting the `armRequest()` call left 479/479 green).
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
