@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — docs: backlog item "move `route_extras` onto `RouteDoc`" rejected with the reason (keeps `router` free of OpenAPI-only fields). No code change.
 - **2026-10-12** — **Scope core -> parity with FastAPI 0.142.** Additive `Info` members, all off by
   default (output byte-identical when unused): `servers`; `schemas` (named-schema registry ->
   `components.schemas`, `schemaRef(name)` for the `$ref` text; same name + different body is
