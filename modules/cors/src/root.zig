@@ -49,7 +49,9 @@
 //! opts in explicitly.
 //!
 //! Origin matching is an exact byte compare against the configured list (or
-//! your predicate): configure the canonical serialization browsers send —
+//! your predicate; `Origins.patterns` adds `https://*.example.com` subdomain
+//! patterns, validated at init and stricter than rs/cors's, see
+//! `OriginPatterns`): configure the canonical serialization browsers send —
 //! lowercase scheme + host, no trailing slash, port only when non-default
 //! (e.g. "https://app.example", "http://localhost:5173").
 //!
@@ -112,6 +114,28 @@ pub const Origins = union(enum) {
     list: []const []const u8,
     /// Custom check; an allowed origin is echoed back specifically.
     predicate: OriginPredicate,
+    /// Exact origins plus subdomain patterns (`https://*.example.com`), the
+    /// rs/cors `AllowedOrigins` wildcard form; see `OriginPatterns`.
+    patterns: OriginPatterns,
+};
+
+/// An allow-list with subdomain patterns (SPEC.md "Origin patterns").
+///
+/// `exact` entries are matched by byte compare, exactly like `Origins.list`.
+/// `subdomains` entries have the shape `scheme://*.host[:port]` with ONE `*`
+/// that must be the whole leftmost host label position, directly after `://`
+/// and directly before a `.`; `Cors.init` rejects anything else with
+/// `error.InvalidOriginPattern`. The `*` stands for one or more complete
+/// DNS labels (`[a-z0-9_-]+` separated by single dots — the lower-case form browsers send), so
+/// `https://*.example.com` grants `https://a.example.com` and
+/// `https://a.b.example.com`, but never `https://example.com`,
+/// `https://example.com.evil.net`, `https://evil.com/.example.com`,
+/// `http://a.example.com` (scheme), or `https://a.example.com:8443` (port;
+/// the pattern's port, or its absence, must equal the origin's).
+/// Matching is byte-exact like the rest of the module (no case folding).
+pub const OriginPatterns = struct {
+    exact: []const []const u8 = &.{},
+    subdomains: []const []const u8 = &.{},
 };
 
 /// Which request headers a preflight may approve.
@@ -174,6 +198,20 @@ pub const Options = struct {
     /// shape for the other kind of request — exactly the problem this
     /// option exists to avoid.
     allow_unconditional_wildcard: bool = false,
+    /// Private Network Access (rs/cors `AllowPrivateNetwork`): a preflight
+    /// that passes every gate and carries `Access-Control-Request-Private-
+    /// Network: true` is answered with `Access-Control-Allow-Private-
+    /// Network: true`, and the preflight `Vary` also names
+    /// `Access-Control-Request-Private-Network`. Off by default: granting
+    /// a public site access to the intranet is an explicit decision.
+    allow_private_network: bool = false,
+    /// Preflight pass-through (rs/cors `OptionsPassthrough`, expressjs
+    /// `preflightContinue`): after the CORS preflight headers are set the
+    /// handler chain still runs and answers the `OPTIONS` itself (no 204 is
+    /// forced). Off by default: a preflight is answered here and routes
+    /// nowhere. The handler's own `Vary` replaces the preflight `Vary`, the
+    /// same hazard as for actual requests (SPEC.md "Threat model").
+    preflight_passthrough: bool = false,
 };
 
 pub const InitError = error{
@@ -194,6 +232,11 @@ pub const InitError = error{
     /// `validateStatic`) already refuses this with a `@compileError`; this
     /// is the runtime API's equivalent.
     EmptyAllowedMethods,
+    /// A `Origins.patterns.subdomains` entry is not `scheme://*.host[:port]`
+    /// with exactly one `*` in the leftmost-label position and at least two
+    /// host labels after it (`https://*.com` is refused: it would grant a
+    /// whole public suffix).
+    InvalidOriginPattern,
 };
 
 // Digits of maxInt(u32) — the precomputed Access-Control-Max-Age value.
@@ -201,6 +244,9 @@ const max_age_digits = std.fmt.count("{d}", .{std.math.maxInt(u32)});
 
 /// Preflight responses vary by all three request inputs that shape them.
 const preflight_vary = "Origin, Access-Control-Request-Method, Access-Control-Request-Headers";
+/// ... plus the private-network request header when `allow_private_network`
+/// is on (rs/cors cors.go:231-232).
+const preflight_vary_pna = preflight_vary ++ ", Access-Control-Request-Private-Network";
 
 // ── the middleware ──────────────────────────────────────────────────────────
 
@@ -251,8 +297,21 @@ pub const Cors = struct {
                     if (std.mem.eql(u8, o, "null") or std.mem.eql(u8, o, "*"))
                         return error.CredentialsWithWildcardOrigin;
                 },
+                .patterns => |p| for (p.exact) |o| {
+                    if (std.mem.eql(u8, o, "null") or std.mem.eql(u8, o, "*"))
+                        return error.CredentialsWithWildcardOrigin;
+                },
                 else => {},
             }
+        }
+        // A pattern is validated, never "best effort" matched: a typo such as
+        // `https://*example.com` would otherwise silently grant
+        // `https://evilexample.com`.
+        switch (options.allowed_origins) {
+            .patterns => |p| for (p.subdomains) |pat| {
+                if (!validSubdomainPattern(pat)) return error.InvalidOriginPattern;
+            },
+            else => {},
         }
         if (options.allow_unconditional_wildcard and options.allowed_origins != .any)
             return error.UnconditionalWildcardRequiresAnyOrigin;
@@ -261,6 +320,7 @@ pub const Cors = struct {
         if (std.debug.runtime_safety) {
             switch (options.allowed_origins) {
                 .list => |l| for (l) |o| assertValueClean(o),
+                .patterns => |p| for (p.exact) |o| assertValueClean(o),
                 else => {},
             }
             switch (options.allowed_headers) {
@@ -327,7 +387,13 @@ pub const Cors = struct {
     /// run a handler afterwards — a preflight is answered, never routed.
     pub fn applyPreflight(c: *const Cors, req: *const http.Server.Request, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
         res.setStatus(204);
-        try res.setHeader("Vary", preflight_vary);
+        return c.writePreflightHeaders(req, res);
+    }
+
+    /// `applyPreflight` minus the status: what `preflight_passthrough` runs
+    /// before handing the request on (the handler chooses the status).
+    fn writePreflightHeaders(c: *const Cors, req: *const http.Server.Request, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
+        try res.setHeader("Vary", if (c.options.allow_private_network) preflight_vary_pna else preflight_vary);
 
         // The `allow_unconditional_wildcard` deviation: every intercepted
         // OPTIONS — preflight or bare — gets the wildcard, unconditionally.
@@ -367,6 +433,7 @@ pub const Cors = struct {
             }
             // `allow_credentials` is unreachable here — rejected together
             // with `.any` at init (same as `applyActual`).
+            try c.privateNetworkGrant(req, res);
             if (c.options.max_age_s != null)
                 try res.setHeader("Access-Control-Max-Age", c.max_age_buf[0..c.max_age_len]);
             return;
@@ -412,6 +479,7 @@ pub const Cors = struct {
             }
             if (c.options.allow_credentials)
                 try res.setHeader("Access-Control-Allow-Credentials", "true");
+            try c.privateNetworkGrant(req, res);
             if (c.options.max_age_s != null)
                 try res.setHeader("Access-Control-Max-Age", c.max_age_buf[0..c.max_age_len]);
         }
@@ -428,6 +496,15 @@ pub const Cors = struct {
         // an OUTER middleware doing work after `next.run` — `sessions`
         // saves its cookie there, `csrf` issues its token there — could not
         // touch a preflight response whose head had already gone out.
+    }
+
+    /// Private Network Access answer (rs/cors cors.go:390): only when the
+    /// option is on and the request says exactly `true`.
+    fn privateNetworkGrant(c: *const Cors, req: *const http.Server.Request, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
+        if (!c.options.allow_private_network) return;
+        const v = req.header("Access-Control-Request-Private-Network") orelse return;
+        if (std.mem.eql(u8, v, "true"))
+            try res.setHeader("Access-Control-Allow-Private-Network", "true");
     }
 
     /// Actual request: set the response CORS headers when Origin + method
@@ -491,6 +568,15 @@ pub const Cors = struct {
                 if (std.mem.eql(u8, o, origin)) break origin;
             } else null,
             .predicate => |p| if (p.allow(p.ctx, origin)) origin else null,
+            .patterns => |p| blk: {
+                for (p.exact) |o| {
+                    if (std.mem.eql(u8, o, origin)) break :blk origin;
+                }
+                for (p.subdomains) |pat| {
+                    if (matchSubdomain(pat, origin)) break :blk origin;
+                }
+                break :blk null;
+            },
         };
     }
 
@@ -558,7 +644,14 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // interceptable, ACRM or not (see the module doc + SPEC.md).
     if (ctx.req.method == .options and
         (ctx.req.header("Access-Control-Request-Method") != null or c.options.allow_unconditional_wildcard))
+    {
+        if (c.options.preflight_passthrough) {
+            // rs/cors OptionsPassthrough (cors.go:281): headers, then the chain.
+            try c.writePreflightHeaders(ctx.req, ctx.res);
+            return next.run(ctx);
+        }
         return c.applyPreflight(ctx.req, ctx.res); // short-circuit: next is never called
+    }
     try c.applyActual(ctx.req, ctx.res);
     return next.run(ctx);
 }
@@ -676,6 +769,66 @@ fn validateStatic(comptime o: StaticOptions) void {
     if (o.allow_methods.len == 0) @compileError(
         "cors.StaticOptions.allow_methods must name at least one method token.",
     );
+}
+
+/// `scheme://*.host[:port]`: one `*`, directly after `://` and before a `.`,
+/// at least two host labels after it, an optional all-digit port, nothing
+/// else (no path, userinfo, query, second `*`).
+fn validSubdomainPattern(p: []const u8) bool {
+    const sep = std.mem.indexOf(u8, p, "://") orelse return false;
+    if (sep == 0) return false;
+    for (p[0..sep]) |ch| {
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '+' or ch == '-' or ch == '.')) return false;
+    }
+    const rest = p[sep + 3 ..];
+    if (rest.len < 4 or rest[0] != '*' or rest[1] != '.') return false;
+    const authority = rest[2..];
+    var host = authority;
+    if (std.mem.indexOfScalar(u8, authority, ':')) |colon| {
+        host = authority[0..colon];
+        const port = authority[colon + 1 ..];
+        if (port.len == 0 or port.len > 5) return false;
+        for (port) |ch| if (!std.ascii.isDigit(ch)) return false;
+    }
+    var labels: usize = 0;
+    var it = std.mem.splitScalar(u8, host, '.');
+    while (it.next()) |label| {
+        if (!validLabel(label)) return false;
+        labels += 1;
+    }
+    return labels >= 2;
+}
+
+fn validLabel(label: []const u8) bool {
+    if (label.len == 0) return false;
+    for (label) |ch| {
+        // Lower case only: browsers serialize the host lower-cased (WHATWG
+        // URL host parsing), so an upper-case label is not one a browser
+        // sends, and a pattern holding one would never match.
+        if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-' or ch == '_')) return false;
+    }
+    return true;
+}
+
+/// Does `origin` match a pattern `validSubdomainPattern` accepted? The text
+/// before the `*` (scheme and `://`) and after it (`.host[:port]`) must be the
+/// origin's exact start and end, and what the `*` covers must be one or more
+/// complete labels: so the match can neither leave the host (`/`, `@`, `:`,
+/// `?` are not label bytes) nor be empty (`https://.example.com`).
+/// rs/cors (utils.go:12-16) accepts ANY bytes for the `*` and lowercases both
+/// sides; ours is stricter on the first and byte-exact on the second.
+fn matchSubdomain(pattern: []const u8, origin: []const u8) bool {
+    const star = std.mem.indexOfScalar(u8, pattern, '*') orelse return false;
+    const prefix = pattern[0..star];
+    const suffix = pattern[star + 1 ..];
+    if (origin.len <= prefix.len + suffix.len) return false;
+    if (!std.mem.startsWith(u8, origin, prefix) or !std.mem.endsWith(u8, origin, suffix)) return false;
+    const mid = origin[prefix.len .. origin.len - suffix.len];
+    var it = std.mem.splitScalar(u8, mid, '.');
+    while (it.next()) |label| {
+        if (!validLabel(label)) return false;
+    }
+    return true;
 }
 
 /// Join method tokens with ", " into one owned slice.
@@ -2265,6 +2418,273 @@ test "allow_unconditional_wildcard: a bare OPTIONS gets only the wildcard, no pr
     try expectHeaderLine(got, "Access-Control-Allow-Origin: *");
     try expectNoHeader(got, "Access-Control-Allow-Methods");
     try expectNoHeader(got, "Access-Control-Max-Age");
+}
+
+// ── 2026-10-11: rs/cors parity (origin patterns, PNA, pass-through) ─────────
+
+const pattern_origins: Origins = .{ .patterns = .{
+    .exact = &.{"https://app.example"},
+    .subdomains = &.{ "https://*.example.com", "http://*.dev.example:8080" },
+} };
+
+test "patterns: a subdomain pattern grants whole labels and nothing else (rs/cors utils.go:12 wildcard, tightened)" {
+    var c: Cors = try .init(testing.allocator, .{ .allowed_origins = pattern_origins });
+    defer c.deinit();
+    // Granted, echoed specifically.
+    for ([_][]const u8{
+        "https://a.example.com",
+        "https://a.b.example.com", // `*` spans labels, as in rs/cors
+        "https://my-app_1.example.com",
+        "http://x.dev.example:8080", // the pattern's own port
+        "https://app.example", // the exact entry beside the patterns
+    }) |o| try testing.expectEqualStrings(o, c.allowOriginValue(o).?);
+    // Refused. rs/cors's prefix+suffix test (utils.go:12) would grant the
+    // empty-label, `/`-escape and `@`-userinfo shapes below; none is a subdomain.
+    for ([_][]const u8{
+        "https://example.com", // no label for the `*`
+        "https://.example.com", // empty label
+        "https://a..example.com", // empty label inside
+        "https://example.com.evil.net", // suffix is not the end
+        "https://evil.com/.example.com", // `/` leaves the host
+        "https://evil.com:443/.example.com",
+        "https://user@evil.com/.example.com", // userinfo
+        "https://evil.com@a.example.com", // `@` is not a label byte
+        "https://evil.com:80@a.example.com",
+        "https://a.example.com:8443", // port differs from the pattern's (none)
+        "https://a.example.com:",
+        "http://a.example.com", // scheme differs
+        "ftp://a.example.com",
+        "https://a.example.com.", // trailing dot
+        "https://A.example.com", // byte-exact: no case folding
+        "https://aexample.com", // the dot is part of the suffix
+        "https://a.example.comx",
+        "xhttps://a.example.com",
+        "http://x.dev.example", // pattern demands :8080
+        "http://x.dev.example:8081",
+        "http://x.dev.example:80809",
+        "",
+        "*",
+        "null",
+    }) |o| try testing.expectEqual(@as(?[]const u8, null), c.allowOriginValue(o));
+}
+
+test "patterns: init validates every subdomain pattern; a bad one is an error, never a loose match" {
+    for ([_][]const u8{
+        "*", // bare wildcard belongs to `.any`
+        "https://*", // no host after it
+        "https://*.", // no labels
+        "https://*.com", // a whole public suffix
+        "https://*example.com", // `*` not followed by a dot: would grant evilexample.com
+        "https://a.*.example.com", // `*` not in the leftmost position
+        "https://*.*.example.com", // two
+        "*.example.com", // no scheme
+        "://*.example.com",
+        "https://*.example.com/", // path
+        "https://*.example.com/x",
+        "https://*.example.com:", // empty port
+        "https://*.example.com:80a",
+        "https://*.example.com:123456",
+        "https://*.exam ple.com",
+        "https://*..example.com",
+        "https://*.example..com",
+        "https://*.@example.com",
+        "ht tp://*.example.com",
+    }) |bad| {
+        try testing.expectError(error.InvalidOriginPattern, Cors.init(testing.allocator, .{
+            .allowed_origins = .{ .patterns = .{ .subdomains = &.{bad} } },
+        }));
+    }
+    var ok: Cors = try .init(testing.allocator, .{ .allowed_origins = .{ .patterns = .{ .subdomains = &.{ "https://*.a.io", "chrome-extension://*.x.y:1" } } } });
+    ok.deinit();
+}
+
+test "patterns: credentials are legal with patterns (a specific origin is echoed); a bare * or null in .exact is still refused" {
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = pattern_origins,
+        .allow_credentials = true,
+    });
+    c.deinit();
+    try testing.expectError(error.CredentialsWithWildcardOrigin, Cors.init(testing.allocator, .{
+        .allowed_origins = .{ .patterns = .{ .exact = &.{"*"}, .subdomains = &.{"https://*.example.com"} } },
+        .allow_credentials = true,
+    }));
+    try testing.expectError(error.CredentialsWithWildcardOrigin, Cors.init(testing.allocator, .{
+        .allowed_origins = .{ .patterns = .{ .exact = &.{"null"} } },
+        .allow_credentials = true,
+    }));
+    // The unconditional wildcard still needs `.any`.
+    try testing.expectError(error.UnconditionalWildcardRequiresAnyOrigin, Cors.init(testing.allocator, .{
+        .allowed_origins = pattern_origins,
+        .allow_unconditional_wildcard = true,
+    }));
+}
+
+test "patterns: wire — a pattern-matched origin is echoed with Vary on an actual request and a preflight; a lookalike gets nothing" {
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = pattern_origins,
+        .allowed_methods = &.{ .get, .post },
+        .allow_credentials = true,
+        .max_age_s = 60,
+    });
+    defer c.deinit();
+    var r = try testRouter(&c, null);
+    defer r.deinit();
+    var buf: [2048]u8 = undefined;
+
+    var got = runWire(&r, wire("GET", "/t", "Origin: https://tenant.example.com\r\n"), &buf);
+    try expectStatus(got, "200");
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: https://tenant.example.com");
+    try expectHeaderLine(got, "Vary: Origin");
+    try expectHeaderLine(got, "Access-Control-Allow-Credentials: true");
+
+    got = runWire(&r, wire("OPTIONS", "/t", "Origin: https://tenant.example.com\r\n" ++
+        "Access-Control-Request-Method: POST\r\n"), &buf);
+    try expectStatus(got, "204");
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: https://tenant.example.com");
+    try expectHeaderLine(got, "Access-Control-Allow-Methods: GET, POST");
+
+    got = runWire(&r, wire("GET", "/t", "Origin: https://example.com.evil.net\r\n"), &buf);
+    try expectStatus(got, "200");
+    try expectNoCorsHeaders(got);
+    got = runWire(&r, wire("OPTIONS", "/t", "Origin: https://evil.com/.example.com\r\n" ++
+        "Access-Control-Request-Method: GET\r\n"), &buf);
+    try expectStatus(got, "204");
+    try expectNoCorsHeaders(got);
+}
+
+const pna_preflight_wire = wire("OPTIONS", "/t", "Origin: https://app.example\r\n" ++
+    "Access-Control-Request-Method: POST\r\n" ++
+    "Access-Control-Request-Private-Network: true\r\n");
+
+test "private network: golden preflight carries Allow-Private-Network and the extended Vary (rs/cors cors.go:231,390)" {
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allowed_methods = &.{ .get, .post },
+        .max_age_s = 600,
+        .allow_private_network = true,
+    });
+    defer c.deinit();
+    var r = try testRouter(&c, null);
+    defer r.deinit();
+    var buf: [2048]u8 = undefined;
+    try testing.expectEqualStrings("HTTP/1.1 204 No Content\r\n" ++
+        "Allow: GET, HEAD, POST\r\n" ++
+        "Vary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Access-Control-Request-Private-Network\r\n" ++
+        "Access-Control-Allow-Origin: https://app.example\r\n" ++
+        "Access-Control-Allow-Methods: GET, POST\r\n" ++
+        "Access-Control-Allow-Private-Network: true\r\n" ++
+        "Access-Control-Max-Age: 600\r\n" ++
+        "Connection: close\r\n" ++
+        "\r\n", runWire(&r, pna_preflight_wire, &buf));
+}
+
+test "private network: no grant when the option is off, the request header is absent or not exactly true, or another gate fails" {
+    var buf: [2048]u8 = undefined;
+    { // option off: header ignored, Vary is the plain one
+        var c: Cors = try .init(testing.allocator, .{ .allowed_origins = .{ .list = &.{"https://app.example"} } });
+        defer c.deinit();
+        var r = try testRouter(&c, null);
+        defer r.deinit();
+        const got = runWire(&r, pna_preflight_wire, &buf);
+        try expectStatus(got, "204");
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+        try expectNoHeader(got, "Access-Control-Allow-Private-Network");
+        try expectHeaderLine(got, "Vary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
+    }
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allow_private_network = true,
+    });
+    defer c.deinit();
+    var r = try testRouter(&c, null);
+    defer r.deinit();
+    { // header absent: ordinary grant, no PNA line
+        const got = runWire(&r, preflight_wire, &buf);
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+        try expectNoHeader(got, "Access-Control-Allow-Private-Network");
+    }
+    { // header not "true"
+        const got = runWire(&r, wire("OPTIONS", "/t", "Origin: https://app.example\r\n" ++
+            "Access-Control-Request-Method: GET\r\n" ++
+            "Access-Control-Request-Private-Network: TRUE\r\n"), &buf);
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+        try expectNoHeader(got, "Access-Control-Allow-Private-Network");
+    }
+    { // origin refused: nothing, though the Vary still names the header
+        const got = runWire(&r, wire("OPTIONS", "/t", "Origin: https://evil.example\r\n" ++
+            "Access-Control-Request-Method: GET\r\n" ++
+            "Access-Control-Request-Private-Network: true\r\n"), &buf);
+        try expectStatus(got, "204");
+        try expectNoCorsHeaders(got);
+        try expectNoHeader(got, "Access-Control-Allow-Private-Network");
+        try expectHeaderLine(got, "Vary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Access-Control-Request-Private-Network");
+    }
+}
+
+fn hOptionsAnswer(ctx: *router.Ctx) anyerror!void {
+    if (ctx.state != null) Flag.of(ctx).hit = true;
+    ctx.res.setStatus(200);
+    try ctx.res.writeAll("mine");
+}
+
+fn passthroughRouter(c: *const Cors, flag: *Flag) !router.Router {
+    var r = router.Router.init(testing.allocator);
+    errdefer r.deinit();
+    r.state = flag;
+    try r.use(c.middleware());
+    try r.options("/t", hOptionsAnswer);
+    try r.get("/t", hOk);
+    return r;
+}
+
+test "preflight_passthrough: CORS headers are set, then the handler answers the OPTIONS itself (rs/cors cors.go:281)" {
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allowed_methods = &.{ .get, .post },
+        .max_age_s = 600,
+        .preflight_passthrough = true,
+    });
+    defer c.deinit();
+    var flag: Flag = .{};
+    var r = try passthroughRouter(&c, &flag);
+    defer r.deinit();
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, preflight_wire, &buf);
+    try expectStatus(got, "200"); // the handler's status, not the forced 204
+    try expectHeaderLine(got, "Vary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    try expectHeaderLine(got, "Access-Control-Allow-Methods: GET, POST");
+    try expectHeaderLine(got, "Access-Control-Max-Age: 600");
+    try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nmine"));
+    try testing.expect(flag.hit);
+}
+
+test "preflight_passthrough: a failed preflight also reaches the handler, headerless; off (default) never does" {
+    var buf: [2048]u8 = undefined;
+    {
+        var c: Cors = try .init(testing.allocator, .{
+            .allowed_origins = .{ .list = &.{"https://other.example"} },
+            .preflight_passthrough = true,
+        });
+        defer c.deinit();
+        var flag: Flag = .{};
+        var r = try passthroughRouter(&c, &flag);
+        defer r.deinit();
+        const got = runWire(&r, preflight_wire, &buf);
+        try expectStatus(got, "200");
+        try expectNoCorsHeaders(got);
+        try testing.expect(flag.hit);
+    }
+    {
+        var c: Cors = try .init(testing.allocator, .{ .allowed_origins = .{ .list = &.{"https://app.example"} } });
+        defer c.deinit();
+        var flag: Flag = .{};
+        var r = try passthroughRouter(&c, &flag);
+        defer r.deinit();
+        const got = runWire(&r, preflight_wire, &buf);
+        try expectStatus(got, "204");
+        try testing.expect(!flag.hit);
+    }
 }
 
 // ── external anchor: headless Chrome against this middleware ───────────────

@@ -63,12 +63,14 @@ it out silently. Other defaults:
 
 | Option | Default | Header |
 |---|---|---|
-| `allowed_origins` | `.none` (opt-in; `.any`, `.list`, `.predicate`) | `Access-Control-Allow-Origin` |
+| `allowed_origins` | `.none` (opt-in; `.any`, `.list`, `.patterns`, `.predicate`) | `Access-Control-Allow-Origin` |
 | `allowed_methods` | `GET, HEAD, POST` (the CORS-safelisted set; rs/cors default) | `Access-Control-Allow-Methods` |
 | `allowed_headers` | `.reflect` (echo `Access-Control-Request-Headers`) | `Access-Control-Allow-Headers` |
 | `exposed_headers` | none | `Access-Control-Expose-Headers` |
 | `allow_credentials` | `false` | `Access-Control-Allow-Credentials` |
 | `max_age_s` | `null` = omit (`0` = disable preflight caching) | `Access-Control-Max-Age` |
+| `allow_private_network` | `false` | `Access-Control-Allow-Private-Network` (+ `Vary`) |
+| `preflight_passthrough` | `false` | none: the handler answers the preflight |
 
 `allowed_headers = .reflect` matches expressjs/cors (rs/cors ships a fixed
 small list instead — a classic "Authorization not allowed" gotcha). Header
@@ -76,6 +78,41 @@ small list instead — a classic "Authorization not allowed" gotcha). Header
 boundary, so reflecting maximizes compatibility. Use `.list` to be strict;
 matching is then case-insensitive and a preflight requesting anything
 outside the list fails.
+
+## Origin patterns (`.patterns`, rs/cors `https://*.example.com`)
+
+```zig
+.allowed_origins = .{ .patterns = .{
+    .exact = &.{"https://app.example"},                       // byte compare, like .list
+    .subdomains = &.{ "https://*.example.com", "http://*.dev.example:8080" },
+} },
+```
+
+A `subdomains` entry is `scheme://*.host[:port]`: one `*`, directly after `://`, standing for one or
+more whole DNS labels (`a.example.com` and `a.b.example.com` match; `example.com` does not). The scheme
+and the port (or its absence) must equal the origin's. `Cors.init` refuses a malformed pattern with
+`error.InvalidOriginPattern` (no scheme, `*` anywhere else, a second `*`, a path, `https://*.com`).
+**Stricter than rs/cors**, whose `*` matches any bytes between prefix and suffix, so
+`https://*.example.com` there also grants `https://evil.com/.example.com`; here the part the `*`
+covers may contain only `[a-z0-9_-]` labels separated by single dots, so `/`, `@`, `:` and empty
+labels never match. Matching is byte-exact (rs/cors lowercases both sides). A match is echoed
+specifically with `Vary: Origin`, so patterns work with credentials.
+
+## Private Network Access and pass-through
+
+`allow_private_network = true` (rs/cors `AllowPrivateNetwork`): a preflight that passes every gate and
+carries `Access-Control-Request-Private-Network: true` is answered with `Access-Control-Allow-Private-Network:
+true`, and the preflight `Vary` also lists `Access-Control-Request-Private-Network`.
+
+`preflight_passthrough = true` (rs/cors `OptionsPassthrough`, expressjs `preflightContinue`): the CORS
+preflight headers are set (or not, when a gate fails), then the handler chain runs and answers the
+`OPTIONS` itself; no 204 is forced. Register an `OPTIONS` route (or the router 405s). A handler that
+sets `Vary` replaces the preflight `Vary`, as for actual requests.
+
+Not offered: rs/cors `Debug` logging (the hot path does no I/O; the pure gates `allowOriginValue`,
+`methodTokenAllowed`, `requestedHeadersAllowed` are public if you want to log a decision yourself) and
+`AllowOriginRequestFunc`/`AllowOriginVaryRequestFunc` (a request-aware origin decision needs its own
+`Vary` bookkeeping; see SPEC.md Backlog).
 
 ## Credentials vs the `*` wildcard (rejected at init)
 
@@ -154,10 +191,7 @@ append-or-read counterpart, so `cors` cannot merge). The response still carries
 a per-origin `Access-Control-Allow-Origin`, so a shared cache keyed on the
 surviving `Vary` list can serve one origin's response to another — **a handler
 that sets `Vary` on a CORS route must include `Origin` in its own list**
-(`Vary: Accept-Encoding, Origin`). Both shapes are pinned by a test; rs/cors's
-`OptionsPassthrough` (let intercepted preflights fall through to your own
-`OPTIONS` routes) and `Access-Control-Allow-Private-Network` are out of
-scope for now.
+(`Vary: Accept-Encoding, Origin`). Both shapes are pinned by a test.
 
 ## Without the router
 
@@ -252,3 +286,9 @@ plus an in-process integration run (`router` + `http.Server` +
 the handler never invoked; `GET` with an allowed `Origin` →
 `Access-Control-Allow-Origin` + `Vary`; a disallowed origin → no CORS
 headers) that only skips when loopback binding is unavailable.
+
+Added 2026-10-11 (rs/cors parity): subdomain-pattern matching incl. the evil shapes
+(`example.com.evil.net`, `evil.com/.example.com`, userinfo, scheme/port mismatch), `init` rejection of
+malformed patterns, credentials with patterns, a byte-exact golden for the private-network preflight
+(and the no-grant cases), pass-through of granted and failed preflights, and the pattern matcher in the
+`CORS_FUZZ` gates harness. Comparative benchmark: `zig build bench-cors` (against rs/cors v1.11.1).

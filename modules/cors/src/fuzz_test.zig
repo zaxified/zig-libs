@@ -50,7 +50,7 @@ pub const ScriptSource = struct {
     }
 };
 
-pub const Label = enum { origin_refused, any_granted, headers_allowed, headers_refused, method_refused };
+pub const Label = enum { origin_refused, any_granted, headers_allowed, headers_refused, method_refused, pattern_granted, pattern_refused };
 var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
 
 fn mark(l: Label) void {
@@ -111,6 +111,48 @@ pub fn gatesHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
         .expose_headers_value = "",
     };
     _ = none_policy.allowOriginValue(bytes);
+
+    // The subdomain-pattern matcher. Raw bytes almost never carry the
+    // `https://` prefix and the `.example.com` suffix, so the second feed
+    // builds an origin around a few drawn bytes (mapped onto label bytes plus
+    // the separators that must NOT widen a match) -- that is what reaches the
+    // granting side. The oracle is independent of the matcher: whatever is
+    // granted must be an https origin of `*.example.com` whose `*` part is
+    // plain labels.
+    const patterned: Cors = .{
+        .gpa = testing.failing_allocator,
+        .options = .{ .allowed_origins = .{ .patterns = .{
+            .exact = &.{"https://exact.example"},
+            .subdomains = &.{ "https://*.example.com", "http://*.dev.example:8080" },
+        } } },
+        .allow_methods_value = "",
+        .allow_headers_value = "",
+        .expose_headers_value = "",
+    };
+    _ = patterned.allowOriginValue(bytes); // raw hostile bytes: must not panic
+    if (len > 1) {
+        const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789-_..@/:";
+        const mid_len: usize = bytes[0] % 9;
+        var cand: [8 + 8 + 12]u8 = undefined;
+        @memcpy(cand[0..8], "https://");
+        var n: usize = 8;
+        for (0..@min(mid_len, len - 1)) |i| {
+            cand[n] = alphabet[bytes[1 + i] % alphabet.len];
+            n += 1;
+        }
+        @memcpy(cand[n..][0..12], ".example.com");
+        n += 12;
+        const origin = cand[0..n];
+        if (patterned.allowOriginValue(origin)) |granted| {
+            mark(.pattern_granted);
+            const mid = origin[8 .. n - 12];
+            try testing.expectEqualStrings(origin, granted);
+            try testing.expect(mid.len != 0);
+            for (mid) |ch| try testing.expect(std.mem.indexOfScalar(u8, "@/:", ch) == null);
+            try testing.expect(mid[0] != '.' and mid[mid.len - 1] != '.');
+            try testing.expect(std.mem.indexOf(u8, mid, "..") == null);
+        } else mark(.pattern_refused);
+    }
 }
 
 test "fuzz driver: CORS_FUZZ (gates)" {

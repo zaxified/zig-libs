@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — rs/cors v1.11.1 parity (grade 2). New: `Origins.patterns` (`.exact` + validated
+  `scheme://*.host[:port]` subdomain patterns; stricter than rs/cors: the `*` covers whole labels only, so
+  `https://evil.com/.example.com` does not match; `error.InvalidOriginPattern` at init), `Options.allow_private_network`
+  (`Access-Control-Allow-Private-Network` + extended preflight `Vary`), `Options.preflight_passthrough` (handler
+  answers the OPTIONS after the CORS headers). Debug logging and request-aware origin functions rejected
+  (SPEC Backlog). Pattern matcher added to the `CORS_FUZZ` gates harness. New `tools/bench.zig` +
+  `tools/go_bench` (`zig build bench-cors`) against rs/cors v1.11.1. Existing behaviour unchanged.
 - **2026-10-09** — tests: deterministic fuzz driver `CORS_FUZZ` over the existing harnesses (`gates`).
 - **2026-10-05** — **Anchoring: headless Chrome** (`tools/interop.zig`, `tools/browser_oracle.js`,
   `src/browser_oracle_test.zig`): 504 `fetch()` calls from two origins under 16 gated and 2 static
