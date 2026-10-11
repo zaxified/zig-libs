@@ -209,15 +209,18 @@ pub const Fe = struct {
         inline for (0..9) |i| b2[i] = b.l[i] << 1;
         var c: [9]u128 = undefined;
         inline for (0..9) |k| {
-            var acc: u128 = 0;
+            // Two accumulators per column (even and odd i): two independent
+            // add/adc chains instead of one nine deep, so the multiplies
+            // overlap. Same sum, same bound.
+            var acc: [2]u128 = .{ 0, 0 };
             inline for (0..9) |i| {
                 if (i <= k) {
-                    acc += @as(u128, a.l[i]) * b.l[k - i];
+                    acc[i & 1] += @as(u128, a.l[i]) * b.l[k - i];
                 } else {
-                    acc += @as(u128, a.l[i]) * b2[k + 9 - i];
+                    acc[i & 1] += @as(u128, a.l[i]) * b2[k + 9 - i];
                 }
             }
-            c[k] = acc;
+            c[k] = acc[0] + acc[1];
         }
         return reduceWide(c);
     }
@@ -243,6 +246,19 @@ pub const Fe = struct {
             }
         }
         return reduceWide(c);
+    }
+
+    /// `mul` forced inline at the call site: the point formulas use it so
+    /// independent products overlap (LLVM keeps `mul` out of line otherwise).
+    pub inline fn mulI(a: Fe, b: Fe) Fe {
+        @setEvalBranchQuota(100_000);
+        return @call(.always_inline, mul, .{ a, b });
+    }
+
+    /// `sq`, forced inline (see `mulI`).
+    pub inline fn sqI(a: Fe) Fe {
+        @setEvalBranchQuota(100_000);
+        return @call(.always_inline, sq, .{a});
     }
 
     /// `n` successive squarings (n is public).

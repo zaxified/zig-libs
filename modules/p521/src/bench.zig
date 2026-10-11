@@ -79,3 +79,23 @@ test "bench (opt-in via P521_BENCH)" {
     std.debug.print("sign    {d:8.1} us\n", .{try bestOf(iters, &c, doSign)});
     std.debug.print("verify  {d:8.1} us\n", .{try bestOf(iters, &c, doVerify)});
 }
+
+test "bench field (opt-in via P521_BENCH)" {
+    if (@import("builtin").target.os.tag != .linux or std.testing.environ.getPosix("P521_BENCH") == null) return error.SkipZigTest;
+    const Fe = @import("field.zig").Fe;
+    var a = Fe.fromInt(0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12) catch unreachable;
+    const b = Fe.fromInt(0x0fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321fedcba098765432) catch unreachable;
+    const n = 1_000_000;
+    var best_m: u64 = std.math.maxInt(u64);
+    var best_s: u64 = std.math.maxInt(u64);
+    for (0..5) |_| {
+        var t0 = nowNs();
+        for (0..n) |_| a = a.mul(b);
+        best_m = @min(best_m, nowNs() - t0);
+        t0 = nowNs();
+        for (0..n) |_| a = a.sq();
+        best_s = @min(best_s, nowNs() - t0);
+    }
+    std.mem.doNotOptimizeAway(&a);
+    std.debug.print("fe.mul  {d:8.1} ns\nfe.sq   {d:8.1} ns\n", .{ @as(f64, @floatFromInt(best_m)) / n, @as(f64, @floatFromInt(best_s)) / n });
+}

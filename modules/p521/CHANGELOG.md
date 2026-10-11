@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — **Speed (P3 → P2):** scalar multiplication in Jacobian coordinates. Secret
+  scalar (`mul`, ECDH): reduced mod n, folded to min(s, n − s), 106 signed 5-bit digits over a
+  16-entry affine table (one batch inversion), masked scans and blends; the incomplete formulas'
+  exceptional cases are ruled out by the fold (proof in `mulCt`), only the identity cases remain
+  and are blended. Public scalars: width-5 NAF, and the comb table for G in
+  `mulDoubleBasePublic`. Field `mul`/`sq` forced inline into the point formulas (`mulI`/`sqI`).
+  Paired against OpenSSL 3.5.5: ECDH 1.70× → 0.97×, verify 1.23× → 0.84×, sign 0.74×.
+  `mul_burn` 16 → 24 KiB (ecdhInto dirtied 19.2 KiB). Tests: `mulCt`, `mulPublic` and
+  `mulDoubleBasePublic` against the old RCB ladder (kept as `mulRcbReference`) on 14 edge scalars
+  (0, n − 1, n, n + 1, 2n − 1, 2^528 − 1, …) and random ones with leading zero windows, compared
+  by SEC1 bytes; doubling and cancelling sums; the wNAF shape. Fuzz 20,000 runs clean.
 - **2026-10-10** — **Speed:** fixed-base comb for s·G (`combMulBaseCt`: 106 signed 5-bit digits,
   one mixed addition each, masked 16-entry scans behind a `blackBox` barrier as in p256) over a
   generated affine table (`src/base_table.zig`, `tools/gen_base_table.py` — independent Python

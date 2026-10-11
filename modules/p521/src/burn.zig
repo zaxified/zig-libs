@@ -34,9 +34,11 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
     return r;
 }
 
-/// A constant-time scalar multiply: the 16-point table (3.5 KiB) plus the
-/// field temporaries. Sized from `stackprobe_test.zig` in ReleaseFast.
-pub const mul_burn = 16 * 1024;
+/// A constant-time scalar multiply: the 17-point projective table (3.7
+/// KiB), its affine form (2.3 KiB), the signed digits (1.7 KiB) and the
+/// inlined Jacobian formulas' temporaries. Sized from `stackprobe_test.zig`
+/// in ReleaseFast (ecdhInto dirtied 19.2 KiB, 2026-10-11).
+pub const mul_burn = 24 * 1024;
 
 /// A signature or key derivation: a scalar multiply, the RFC 6979 HMAC
 /// states, the scalar inversion's 16-entry table.

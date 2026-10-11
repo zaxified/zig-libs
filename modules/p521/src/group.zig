@@ -3,22 +3,21 @@
 //! The NIST P-521 group (secp521r1, FIPS 186-5 / SP 800-186 §3.2.1.5):
 //! y² = x³ − 3x + b over GF(2^521 − 1), prime order n, cofactor 1.
 //!
-//! Points are projective (X : Y : Z) and every addition and doubling uses the
+//! Points are projective (X : Y : Z); `add`, `dbl` and `addMixed` use the
 //! complete formulas of Renes–Costello–Batina 2016 (eprint 2015/1060,
-//! Algorithms 4, 5 and 6 for a = −3): no exceptional cases, so no branch on
-//! whether two points coincide or one is the identity.
+//! Algorithms 4, 5 and 6 for a = −3): no exceptional cases.
 //!
-//! Scalar multiplication:
-//!   * `mul` (secret scalar): fixed 4-bit windows from the top, a 16-point
-//!     table built from the public point, and every lookup a masked scan of
-//!     the whole table — the same sequence of operations and memory accesses
-//!     for every scalar. The scalar is any 66 bytes (no reduction needed:
-//!     n·P = O).
+//! Scalar multiplication runs in Jacobian coordinates (`Jac`), whose cheaper
+//! formulas are not complete:
+//!   * `mul` (secret scalar): reduced mod n and folded to min(s, n − s), then
+//!     signed 5-bit windows from the top over a 16-entry affine table, every
+//!     lookup a masked scan of the whole table. `mulCt` proves that the only
+//!     exceptional cases left are the identity ones, and blends them.
 //!   * `mulBaseCtUnburned` (secret scalar, P = G: key derivation and the ECDSA
 //!     nonce commitment): the fixed-base comb `combMulBaseCt` over the
 //!     generated `base_table.zig`, constant time the same way.
 //!   * `mulPublic` / `mulDoubleBasePublic` (public scalars only, signature
-//!     verification): signed 4-bit windows, VARIABLE TIME.
+//!     verification): width-5 NAF, and the comb table for G; VARIABLE TIME.
 //!
 //! The surface mirrors `std.crypto.ecc.P384` with 66-byte scalars and
 //! coordinates, so code generic over std's curves reads the same.
@@ -322,16 +321,6 @@ pub const P521 = struct {
         p.z.cMov(a.z, c);
     }
 
-    /// `pc[b]` by a masked scan of all 16 entries.
-    fn pcSelect(pc: *const [16]P521, b: u8) P521 {
-        var t = pc[0];
-        inline for (1..16) |i| {
-            const d: u64 = b ^ @as(u8, i);
-            t.cMov(pc[i], @truncate((d -% 1) >> 63));
-        }
-        return t;
-    }
-
     fn precompute(p: P521, comptime count: usize) [1 + count]P521 {
         var pc: [1 + count]P521 = undefined;
         pc[0] = identityElement;
@@ -343,20 +332,119 @@ pub const P521 = struct {
         return pc;
     }
 
-    /// The constant-time core: s (little-endian, 66 bytes) · p.
-    fn mulCt(p: P521, s: *const [66]u8) P521 {
-        const pc = precompute(p, 15);
-        var q = identityElement;
-        var pos: usize = 132;
-        while (pos > 0) {
-            pos -= 1;
-            // `pos` is public: the first window skips the doublings of the
-            // identity, every scalar alike.
-            if (pos != 131) q = q.dbl().dbl().dbl().dbl();
-            const nib: u8 = (s[pos >> 1] >> @as(u3, @intCast((pos & 1) * 4))) & 0xf;
-            q = q.add(pcSelect(&pc, nib));
+    /// The constant-time core: s (little-endian, any 66 bytes) · p.
+    ///
+    /// Jacobian coordinates (`Jac`: doubling 3M + 5S against RCB's 10M + 3S)
+    /// with a 16-entry affine table (mixed addition 7M + 4S) and signed 5-bit
+    /// digits, 106 windows. Those formulas are not complete, so the
+    /// exceptional cases are ruled out instead of handled: s is reduced mod n
+    /// and replaced by s' = min(s, n − s) ≤ (n − 1)/2 (the product negated
+    /// back at the end). With the digits d_i of s', the accumulator before
+    /// adding d_i·p is 32k·p with k ≥ 0 and 32k ≤ s' + 17 < n − 16, so
+    /// 32k ≡ ±d_i (mod n) would need 32k ∓ d_i = 0, i.e. k = d_i = 0. What is
+    /// left is the identity on either side: d_i = 0 (keep the accumulator)
+    /// and an accumulator that is still the identity (leading zero windows:
+    /// take the table entry). Both are masked blends on a secret flag, never
+    /// a branch.
+    fn mulCt(p: P521, s_raw: *const [66]u8) P521 {
+        const sc = scalar_mod.Scalar.fromBytesReduce(s_raw.*, .little);
+        var s = sc.toBytes(.little);
+        defer std.crypto.secureZero(u8, &s);
+        var ns = sc.neg().toBytes(.little);
+        defer std.crypto.secureZero(u8, &ns);
+        // flip = all ones iff n − s < s; then s' = n − s and the result is negated.
+        const flip = blackBox(ltMask(&ns, &s));
+        for (&s, ns) |*a, b| a.* = (b & @as(u8, @truncate(flip))) | (a.* & ~@as(u8, @truncate(flip)));
+
+        // Signed digits, low to high (the comb's recoding): magnitude 0..16 and
+        // a negate mask per window. Secret; zeroed on return.
+        var mags: [fb_t]u64 = undefined;
+        var negs: [fb_t]u64 = undefined;
+        defer std.crypto.secureZero(u64, &mags);
+        defer std.crypto.secureZero(u64, &negs);
+        var carry: u64 = 0;
+        for (0..fb_t) |i| {
+            const x = window5(&s, i * fb_w) + carry; // 0 .. 2^w
+            const is_neg: u64 = @intFromBool(x >= fb_half);
+            carry = is_neg;
+            const negmask = blackBox(0 -% is_neg);
+            mags[i] = ((fb_twow - x) & negmask) | (x & ~negmask);
+            negs[i] = negmask;
         }
-        return q;
+
+        const pc = precompute(p, 16);
+        // The table is public (built from the public point); one inversion.
+        const tab = batchAffine(16, pc[1..17]);
+        var q = Jac.identity;
+        // All ones while q is still the identity; secret (leading zeros).
+        var q_id: u64 = blackBox(~@as(u64, 0));
+        var i: usize = fb_t;
+        while (i > 0) {
+            i -= 1;
+            // `i` is public: the first window skips the doublings of the
+            // identity, every scalar alike.
+            if (i != fb_t - 1) q = q.dbl().dbl().dbl().dbl().dbl();
+            const m = mags[i];
+            var g: AffineCoordinates = .{ .x = Fe.zero, .y = Fe.zero };
+            for (0..16) |j| {
+                const mask = blackBox(0 -% @as(u64, @intFromBool(@as(u64, j + 1) == m)));
+                blend(&g.x, tab[j].x, mask);
+                blend(&g.y, tab[j].y, mask);
+            }
+            blend(&g.y, g.y.neg(), negs[i]);
+            var r = q.addAffine(g);
+            const g_jac: Jac = .{ .x = g.x, .y = g.y, .z = Fe.one };
+            r.blendFrom(g_jac, q_id);
+            const nz = blackBox(0 -% @as(u64, @intFromBool(m != 0)));
+            q.blendFrom(r, nz);
+            q_id &= ~nz;
+        }
+        blend(&q.y, q.y.neg(), flip);
+        var out = q.toProjective();
+        out.blendFrom(identityElement, q_id);
+        return out;
+    }
+
+    /// All ones iff a < b (66-byte little-endian integers), branch-free.
+    fn ltMask(a: *const [66]u8, b: *const [66]u8) u64 {
+        var borrow: u64 = 0;
+        for (0..9) |k| {
+            const x = limb(a, k);
+            const y = limb(b, k);
+            const d = @as(u128, x) -% y -% borrow;
+            borrow = @truncate((d >> 64) & 1);
+        }
+        return 0 -% borrow;
+    }
+
+    fn limb(a: *const [66]u8, k: usize) u64 {
+        if (k < 8) return std.mem.readInt(u64, a[8 * k ..][0..8], .little);
+        return @as(u64, a[64]) | @as(u64, a[65]) << 8;
+    }
+
+    fn blendFrom(p: *P521, a: P521, mask: u64) void {
+        blend(&p.x, a.x, mask);
+        blend(&p.y, a.y, mask);
+        blend(&p.z, a.z, mask);
+    }
+
+    /// Affine forms of `n` projective points, none the identity, with one
+    /// field inversion (Montgomery's trick). Constant time.
+    fn batchAffine(comptime n: usize, pts: *const [n]P521) [n]AffineCoordinates {
+        var acc: [n]Fe = undefined;
+        acc[0] = pts[0].z;
+        for (1..n) |i| acc[i] = acc[i - 1].mul(pts[i].z);
+        var inv = acc[n - 1].invert();
+        var out: [n]AffineCoordinates = undefined;
+        var i: usize = n;
+        while (i > 1) {
+            i -= 1;
+            const zi = inv.mul(acc[i - 1]);
+            inv = inv.mul(pts[i].z);
+            out[i] = .{ .x = pts[i].x.mul(zi), .y = pts[i].y.mul(zi) };
+        }
+        out[0] = .{ .x = pts[0].x.mul(inv), .y = pts[0].y.mul(inv) };
+        return out;
     }
 
     /// Multiply by a (secret) scalar, constant time. `error.IdentityElement`
@@ -447,21 +535,69 @@ pub const P521 = struct {
         return ((lo | hi << 8) >> @intCast(shift % 8)) & fb_wmask;
     }
 
-    /// Signed 4-bit digits of a little-endian scalar, each in [−8, 8].
-    fn slide(s: [66]u8) [133]i8 {
-        var e: [133]i8 = undefined;
-        for (s, 0..) |x, i| {
-            e[i * 2 + 0] = @as(i8, @as(u4, @truncate(x)));
-            e[i * 2 + 1] = @as(i8, @as(u4, @truncate(x >> 4)));
+    /// Width-5 NAF of a little-endian 66-byte scalar: digits odd in
+    /// [−15, 15] or 0, any two non-zero digits at least 5 apart. Variable
+    /// time (public scalars only).
+    fn wnaf5(s: [66]u8) [wnaf_len]i8 {
+        var k: u530 = std.mem.readInt(u528, &s, .little);
+        var e: [wnaf_len]i8 = @splat(0);
+        var i: usize = 0;
+        // k < 2^528, so the digits end by position 528.
+        while (k != 0) : (i += 1) {
+            if (k & 1 != 0) {
+                const m: i8 = @intCast(k & 31);
+                const d: i8 = if (m >= 16) m - 32 else m;
+                e[i] = d;
+                if (d > 0) k -= @intCast(d) else k += @intCast(-d);
+            }
+            k >>= 1;
         }
-        var carry: i8 = 0;
-        for (e[0..132]) |*x| {
-            x.* += carry;
-            carry = (x.* + 8) >> 4;
-            x.* -= carry * 16;
-        }
-        e[132] = carry;
         return e;
+    }
+
+    /// The odd multiples p, 3p, …, 15p in affine form (`p` not the identity).
+    fn oddMultiples(p: P521) [8]AffineCoordinates {
+        const pc = precompute(p, 15);
+        var odd: [8]P521 = undefined;
+        for (&odd, 0..) |*o, i| o.* = pc[2 * i + 1];
+        return batchAffine(8, &odd);
+    }
+
+    /// s·p for a public point and scalar by width-5 NAF, as a Jacobian point.
+    fn wnafMulVt(p: P521, s: [66]u8) Jac {
+        const tab = oddMultiples(p);
+        const e = wnaf5(s);
+        var q = Jac.identity;
+        var pos: usize = e.len;
+        while (pos > 0) {
+            pos -= 1;
+            q = q.dblVt();
+            const d = e[pos];
+            if (d > 0) q = q.addAffineVt(tab[@intCast(@divExact(d - 1, 2))]) else if (d < 0) q = q.addAffineVt(tab[@intCast(@divExact(-d - 1, 2))].neg());
+        }
+        return q;
+    }
+
+    /// s·G over the fixed-base table, variable time: no doublings at all.
+    fn combMulBaseVt(s: [66]u8) Jac {
+        var acc = Jac.identity;
+        var carry: u64 = 0;
+        for (0..fb_t) |i| {
+            const x = window5(&s, i * fb_w) + carry;
+            if (x == 0) {
+                carry = 0;
+                continue;
+            }
+            if (x >= fb_half) {
+                carry = 1;
+                if (x == fb_twow) continue; // digit 0, carry out
+                acc = acc.addAffineVt(base_table[i][fb_twow - x - 1].neg());
+            } else {
+                carry = 0;
+                acc = acc.addAffineVt(base_table[i][x - 1]);
+            }
+        }
+        return acc;
     }
 
     /// Multiply by a PUBLIC scalar, IN VARIABLE TIME (verification only).
@@ -469,21 +605,14 @@ pub const P521 = struct {
         var s = s_;
         if (endian == .big) std.mem.reverse(u8, &s);
         try p.rejectIdentity();
-        const pc = precompute(p, 8);
-        const e = slide(s);
-        var q = identityElement;
-        var pos: usize = e.len;
-        while (pos > 0) {
-            pos -= 1;
-            q = q.dbl().dbl().dbl().dbl();
-            const d = e[pos];
-            if (d > 0) q = q.add(pc[@intCast(d)]) else if (d < 0) q = q.sub(pc[@intCast(-d)]);
-        }
+        const q = wnafMulVt(p, s).toProjectiveVt();
         try q.rejectIdentity();
         return q;
     }
 
     /// p1·s1 + p2·s2 for PUBLIC scalars, IN VARIABLE TIME (verification).
+    /// When p1 is G (ECDSA verification) its half runs over the fixed-base
+    /// table.
     pub fn mulDoubleBasePublic(p1: P521, s1_: [66]u8, p2: P521, s2_: [66]u8, endian: std.builtin.Endian) IdentityElementError!P521 {
         var s1 = s1_;
         var s2 = s2_;
@@ -493,24 +622,124 @@ pub const P521 = struct {
         }
         try p1.rejectIdentity();
         try p2.rejectIdentity();
-        const pc1 = precompute(p1, 8);
-        const pc2 = precompute(p2, 8);
-        const e1 = slide(s1);
-        const e2 = slide(s2);
-        var q = identityElement;
-        var pos: usize = e1.len;
-        while (pos > 0) {
-            pos -= 1;
-            q = q.dbl().dbl().dbl().dbl();
-            const d1 = e1[pos];
-            if (d1 > 0) q = q.add(pc1[@intCast(d1)]) else if (d1 < 0) q = q.sub(pc1[@intCast(-d1)]);
-            const d2 = e2[pos];
-            if (d2 > 0) q = q.add(pc2[@intCast(d2)]) else if (d2 < 0) q = q.sub(pc2[@intCast(-d2)]);
-        }
+        const is_g = p1.z.equivalent(Fe.one) and p1.x.equivalent(basePoint.x) and p1.y.equivalent(basePoint.y);
+        const a = if (is_g) combMulBaseVt(s1) else wnafMulVt(p1, s1);
+        const q = a.addVt(wnafMulVt(p2, s2)).toProjectiveVt();
         try q.rejectIdentity();
         return q;
     }
 };
+
+/// Jacobian (X : Y : Z), x = X/Z², y = Y/Z³: the internal form of the
+/// scalar-multiplication loops. The formulas (a = −3; EFD dbl-2001-b,
+/// madd-2007-bl, add-2007-bl) are NOT complete: the constant-time callers
+/// rule the exceptional cases out (see `mulCt`), the `Vt` variants branch on
+/// them (public inputs only). The identity is (1 : 1 : 0), which `dbl` keeps.
+const Jac = struct {
+    x: Fe,
+    y: Fe,
+    z: Fe,
+
+    const Fe = field.Fe;
+    const identity: Jac = .{ .x = Fe.one, .y = Fe.one, .z = Fe.zero };
+
+    /// 2p, 3M + 5S.
+    fn dbl(p: Jac) Jac {
+        const delta = p.z.sqI();
+        const gamma = p.y.sqI();
+        const beta4 = p.x.mulI(gamma).mulSmall(4);
+        const alpha = p.x.sub(delta).mulI(p.x.add(delta)).mulSmall(3);
+        const x3 = alpha.sqI().sub(beta4.dbl());
+        const z3 = p.y.add(p.z).sqI().sub(gamma).sub(delta);
+        const y3 = alpha.mulI(beta4.sub(x3)).sub(gamma.sqI().mulSmall(4).dbl());
+        return .{ .x = x3, .y = y3, .z = z3 };
+    }
+
+    /// p + q, q affine; 7M + 4S. Wrong (not merely slow) when p is the
+    /// identity, q = ±p, or q is (0, 0): the callers exclude those.
+    fn addAffine(p: Jac, q: AffineCoordinates) Jac {
+        const z1z1 = p.z.sqI();
+        const ux2 = q.x.mulI(z1z1);
+        const s2 = q.y.mulI(p.z).mulI(z1z1);
+        const h = ux2.sub(p.x);
+        const r = s2.sub(p.y).dbl();
+        return maddTail(p, z1z1, h, r);
+    }
+
+    inline fn maddTail(p: Jac, z1z1: Fe, h: Fe, r: Fe) Jac {
+        const hh = h.sqI();
+        const i = hh.mulSmall(4);
+        const j = h.mulI(i);
+        const v = p.x.mulI(i);
+        const x3 = r.sqI().sub(j).sub(v.dbl());
+        const y3 = r.mulI(v.sub(x3)).sub(p.y.mulI(j).dbl());
+        const z3 = p.z.add(h).sqI().sub(z1z1).sub(hh);
+        return .{ .x = x3, .y = y3, .z = z3 };
+    }
+
+    fn isIdentityVt(p: Jac) bool {
+        return p.z.isZero();
+    }
+
+    fn dblVt(p: Jac) Jac {
+        if (p.isIdentityVt()) return identity;
+        return p.dbl();
+    }
+
+    /// `addAffine` with the exceptional cases branched on: public data only.
+    fn addAffineVt(p: Jac, q: AffineCoordinates) Jac {
+        if (p.isIdentityVt()) return .{ .x = q.x, .y = q.y, .z = Fe.one };
+        const z1z1 = p.z.sqI();
+        const ux2 = q.x.mulI(z1z1);
+        const s2 = q.y.mulI(p.z).mulI(z1z1);
+        const h = ux2.sub(p.x);
+        const r = s2.sub(p.y).dbl();
+        if (h.isZero()) return if (r.isZero()) p.dbl() else identity;
+        return maddTail(p, z1z1, h, r);
+    }
+
+    /// p + q, both Jacobian, variable time (11M + 5S).
+    fn addVt(p: Jac, q: Jac) Jac {
+        if (p.isIdentityVt()) return q;
+        if (q.isIdentityVt()) return p;
+        const z1z1 = p.z.sqI();
+        const z2z2 = q.z.sqI();
+        const u_1 = p.x.mulI(z2z2);
+        const u_2 = q.x.mulI(z1z1);
+        const s_1 = p.y.mulI(q.z).mulI(z2z2);
+        const s_2 = q.y.mulI(p.z).mulI(z1z1);
+        const h = u_2.sub(u_1);
+        const r = s_2.sub(s_1).dbl();
+        if (h.isZero()) return if (r.isZero()) p.dbl() else identity;
+        const i = h.dbl().sqI();
+        const j = h.mulI(i);
+        const v = u_1.mulI(i);
+        const x3 = r.sqI().sub(j).sub(v.dbl());
+        const y3 = r.mulI(v.sub(x3)).sub(s_1.mulI(j).dbl());
+        const z3 = p.z.add(q.z).sqI().sub(z1z1).sub(z2z2).mulI(h);
+        return .{ .x = x3, .y = y3, .z = z3 };
+    }
+
+    /// (X·Z : Y : Z³) — the same point in `P521`'s projective form; Z = 0
+    /// gives a Z = 0 point (the caller maps it to `identityElement`).
+    fn toProjective(p: Jac) P521 {
+        return .{ .x = p.x.mulI(p.z), .y = p.y, .z = p.z.sqI().mulI(p.z) };
+    }
+
+    fn toProjectiveVt(p: Jac) P521 {
+        if (p.isIdentityVt()) return P521.identityElement;
+        return p.toProjective();
+    }
+
+    fn blendFrom(p: *Jac, a: Jac, mask: u64) void {
+        blend(&p.x, a.x, mask);
+        blend(&p.y, a.y, mask);
+        blend(&p.z, a.z, mask);
+    }
+};
+
+/// Room for a width-5 NAF of any 66-byte scalar (at most 529 digits).
+const wnaf_len = 530;
 
 // ── fixed-base comb table ───────────────────────────────────────────────────
 
@@ -742,5 +971,144 @@ test "comb: base_table entries are (j+1)·2^(5i)·G (spot checks against mulPubl
         const want = (try G.mulPublic(s, .little)).affineCoordinates();
         const got = base_table[ij[0]][ij[1]];
         try testing.expect(want.x.equivalent(got.x) and want.y.equivalent(got.y));
+    }
+}
+
+/// Test reference: the previous ladder — RCB complete formulas, unsigned
+/// 4-bit windows, no reduction, no table conversion — for any 66-byte
+/// little-endian scalar. Slow and simple; nothing here shares code with the
+/// Jacobian paths it checks.
+fn mulRcbReference(p: P521, s: [66]u8) P521 {
+    const pc = P521.precompute(p, 15);
+    var q = P521.identityElement;
+    var pos: usize = 132;
+    while (pos > 0) {
+        pos -= 1;
+        q = q.dbl().dbl().dbl().dbl();
+        const nib = (s[pos >> 1] >> @as(u3, @intCast((pos & 1) * 4))) & 0xf;
+        q = q.add(pc[nib]);
+    }
+    return q;
+}
+
+/// Same point: both the identity, or the same uncompressed SEC1 bytes
+/// (`equivalent` would call a (0 : 0 : 0) garbage point equal to anything).
+fn expectSamePoint(want: P521, got: P521) !void {
+    const wid = want.z.isZero();
+    try testing.expectEqual(wid, got.z.isZero());
+    if (wid) return;
+    try testing.expectEqualSlices(u8, &want.toUncompressedSec1(), &got.toUncompressedSec1());
+}
+
+/// Edge scalars (little-endian): 0, 1, 2, 15, 16, 17, n − 1, n, n + 1,
+/// 2n − 1, 2^528 − 1, 2^520, nibble patterns, a lone top nibble.
+fn edgeScalars() [14][66]u8 {
+    var c: [14][66]u8 = @splat(@splat(0));
+    c[1][0] = 1;
+    c[2][0] = 2;
+    c[3][0] = 15;
+    c[4][0] = 16;
+    c[5][0] = 17;
+    var n = nBytes();
+    std.mem.reverse(u8, &n);
+    c[6] = n;
+    c[6][0] -%= 1; // n is odd: no borrow
+    c[7] = n;
+    c[8] = n;
+    c[8][0] +%= 1;
+    const two_n = std.mem.readInt(u528, &n, .little) * 2 - 1;
+    std.mem.writeInt(u528, &c[9], two_n, .little);
+    c[10] = @splat(0xff);
+    c[11][65] = 0x01;
+    c[12] = @splat(0x10);
+    c[13] = @splat(0x0f);
+    return c;
+}
+
+test "jacobian: mulCt == RCB reference on edge and random scalars, G and another point" {
+    var prng = std.Random.DefaultPrng.init(0x521_7ac0);
+    const r = prng.random();
+    var t: [66]u8 = undefined;
+    r.bytes(&t);
+    t[65] &= 1;
+    const pts = [_]P521{ P521.basePoint, mulRcbReference(P521.basePoint, t) };
+    for (pts) |p| {
+        for (edgeScalars()) |s| try expectSamePoint(mulRcbReference(p, s), P521.mulCt(p, &s));
+        const iters: usize = if (@import("builtin").mode == .Debug) 8 else 100;
+        for (0..iters) |_| {
+            var s: [66]u8 = undefined;
+            r.bytes(&s);
+            // Mix full-width scalars with ones that have leading zero windows.
+            if (r.boolean()) @memset(s[r.uintLessThan(usize, 66)..], 0);
+            try expectSamePoint(mulRcbReference(p, s), P521.mulCt(p, &s));
+        }
+    }
+}
+
+test "jacobian: mulPublic and mulDoubleBasePublic == RCB reference, incl. doubling and cancelling sums" {
+    var prng = std.Random.DefaultPrng.init(0x521_7ac1);
+    const r = prng.random();
+    const G = P521.basePoint;
+    const G2 = G.dbl(); // a non-G first point: the wNAF path for p1 too
+    for (edgeScalars()) |s| {
+        const want = mulRcbReference(G2, s);
+        if (want.z.isZero()) {
+            try testing.expectError(error.IdentityElement, G2.mulPublic(s, .little));
+        } else try expectSamePoint(want, try G2.mulPublic(s, .little));
+    }
+    const iters: usize = if (@import("builtin").mode == .Debug) 6 else 60;
+    for (0..iters) |_| {
+        var a: [66]u8 = undefined;
+        var b: [66]u8 = undefined;
+        r.bytes(&a);
+        r.bytes(&b);
+        if (r.boolean()) @memset(a[r.uintLessThan(usize, 66)..], 0);
+        const q = mulRcbReference(G, b);
+        for ([_]P521{ G, G2 }) |p1| {
+            const want = mulRcbReference(p1, a).add(mulRcbReference(q, b));
+            try expectSamePoint(want, try P521.mulDoubleBasePublic(p1, a, q, b, .little));
+        }
+    }
+    // a·G + a·G: the final sum doubles. a·G + (n − a)·G: it cancels.
+    var a: [66]u8 = @splat(0);
+    a[0] = 0x2b;
+    a[40] = 0x77;
+    try expectSamePoint(mulRcbReference(G, a).dbl(), try P521.mulDoubleBasePublic(G, a, G, a, .little));
+    var n = nBytes();
+    std.mem.reverse(u8, &n);
+    var na: [66]u8 = undefined;
+    std.mem.writeInt(u528, &na, std.mem.readInt(u528, &n, .little) - std.mem.readInt(u528, &a, .little), .little);
+    try testing.expectError(error.IdentityElement, P521.mulDoubleBasePublic(G, a, G, na, .little));
+    try testing.expectError(error.IdentityElement, P521.mulDoubleBasePublic(G2, a, G2, na, .little));
+    // addAffineVt's exceptional branches, pinned directly: q = p doubles,
+    // q = −p cancels.
+    const g_aff = G.affineCoordinates();
+    const gj: Jac = .{ .x = g_aff.x, .y = g_aff.y, .z = P521.Fe.one };
+    try expectSamePoint(G.dbl(), gj.addAffineVt(g_aff).toProjectiveVt());
+    try testing.expect(gj.addAffineVt(g_aff.neg()).isIdentityVt());
+}
+
+test "jacobian: wnaf5 digits rebuild the scalar and keep the NAF shape" {
+    var prng = std.Random.DefaultPrng.init(0x521_7ac2);
+    var cases: [40][66]u8 = undefined;
+    for (edgeScalars(), 0..) |s, i| cases[i] = s;
+    for (cases[14..]) |*s| prng.random().bytes(s);
+    for (cases) |s| {
+        const e = P521.wnaf5(s);
+        var acc: i1100 = 0;
+        var last: ?usize = null;
+        var pos: usize = e.len;
+        while (pos > 0) {
+            pos -= 1;
+            acc *= 2;
+            acc += e[pos];
+            const d = e[pos];
+            if (d != 0) {
+                try testing.expect(@mod(d, 2) == 1 and d >= -15 and d <= 15);
+                if (last) |l| try testing.expect(l - pos >= 5);
+                last = pos;
+            }
+        }
+        try testing.expectEqual(@as(i1100, std.mem.readInt(u528, &s, .little)), acc);
     }
 }

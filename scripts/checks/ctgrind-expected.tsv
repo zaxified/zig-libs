@@ -1343,8 +1343,15 @@ aes192	ReleaseFast	dec	1	0	8a27e95d551dc294	68602ef849690825
 # modules/p521/SPEC.md § Constant-time contract. `vartime` is the POSITIVE
 # CONTROL: a tainted scalar into the documented-vartime `mulPublic` must flag
 # (5 in-file when pinned: the signed-digit branches in group.zig).
-p521	ReleaseFast	mul	1	0	80073f9abc48e130	2abbc6503ea1b2c2
-p521	ReleaseFast	keygen	1	0	24400dab8e820811	b44de7eb8b02a855
-p521	ReleaseFast	sign	1	0	24400dab8e820811	b620c1c667ef0084
-p521	ReleaseFast	ecdh	1	0	80073f9abc48e130	a348bd01a2bccfcc
-p521	ReleaseFast	vartime	1	>=1	3a1387df7492583d	9ceab2dc760cdabd
+# 2026-10-11 re-pin: Jacobian ladders (signed 5-bit digits, the min(s, n − s)
+# fold, masked identity blends; wNAF for mulPublic). Counts held at 0 in-file;
+# `vartime` now 9 in-file (the wNAF and Jacobian identity branches). The `mul`
+# and `vartime` output pins moved because the harness prints raw projective
+# limbs and the product now comes back as (X·Z : Y : Z³) of the Jacobian
+# point — the same point (tests compare SEC1 bytes against the old RCB
+# ladder); `ecdh`/`keygen`/`sign` print affine bytes and did not move.
+p521	ReleaseFast	mul	1	0	4fe6fcee141114ca	7bcb91b4acac23e9
+p521	ReleaseFast	keygen	1	0	786668597aa111f5	b44de7eb8b02a855
+p521	ReleaseFast	sign	1	0	786668597aa111f5	b620c1c667ef0084
+p521	ReleaseFast	ecdh	1	0	4fe6fcee141114ca	a348bd01a2bccfcc
+p521	ReleaseFast	vartime	1	>=1	4160fbdec86bc619	11557f4b46d4c2af
