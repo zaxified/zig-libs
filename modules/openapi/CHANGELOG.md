@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Scope core -> parity with FastAPI 0.142.** Additive `Info` members, all off by
+  default (output byte-identical when unused): `servers`; `schemas` (named-schema registry ->
+  `components.schemas`, `schemaRef(name)` for the `$ref` text; same name + different body is
+  `error.SchemaConflict`); `security_schemes` (apiKey in header/query/cookie, http basic/bearer,
+  OAuth2 flows, openIdConnect) and `security`; `route_extras` (per route by method + pattern:
+  header and cookie parameters, request/response `example`, per-operation `security`).
+  `validateOpenApi31` now resolves every local `$ref` (`error.DanglingRef`) and checks servers,
+  scheme shapes, component names and security uses (`UnknownSecurityScheme`, `InvalidSecurityScheme`,
+  `InvalidServer`, `InvalidComponentName`). Tests in `src/parity_test.zig`.
+
 - **2026-10-10** — Card Performance `n/a` with the reason (no timeable reference implementation). Docs only.
 
 - **2026-10-07** — Follows `router`'s `{name}` captures: a whole-segment or in-segment capture

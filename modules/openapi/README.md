@@ -86,9 +86,13 @@ defer gpa.free(json2);
 | `operationId` | deterministic: lowercase method + `_` + the converted path's segments joined by `_` (`GET /users/{id}` → `get_users_id`); unique by construction (see `error.PathCollision` below) |
 | Undocumented routes | minimal operation with default `responses: {"200": {"description": "Successful Response"}}` (FastAPI's default) |
 | Excluding a route | `Info.include: ?*const fn (router.Route) bool` — return `false` to omit a route from the document entirely (FastAPI's `include_in_schema=False`); `null` (default) includes everything |
+| `servers` | `Info.servers`: `url` + optional `description`, after `info` |
+| `components.schemas` | `Info.schemas` (name + JSON Schema text) is emitted once; routes point at it with `openapi.schemaRef("Name")` (`{"$ref":"#/components/schemas/Name"}`) in `request_schema` / `Response.schema` / `query_schema`. Same name with a different body → `error.SchemaConflict`; a `$ref` that resolves nowhere → `error.DanglingRef` |
+| Security | `bearer_auth` as before; `Info.security_schemes` adds apiKey (header/query/cookie), http basic/bearer, OAuth2 (implicit/password/clientCredentials/authorizationCode), openIdConnect; `Info.security` makes requirements document-wide, `RouteExtra.security` replaces them for one operation (`&.{}` = public). An undeclared name → `error.UnknownSecurityScheme` |
+| `route_extras` | `Info.route_extras` (matched by `method` + raw `pattern`, since `router.RouteDoc` is not ours to extend): `header_parameters`, `cookie_parameters`, `request_example`, `response_examples` (`example` on the media type), `security`. An entry for no registered route → `error.UnknownRouteExtra` |
 | Not emitted | the implicit HEAD→GET auto-route, 404/405 fallbacks |
 | Self-check | `Generator.build` parses its own output back and runs `validateOpenApi31` on it before returning — a malformed document is a `BuildError`, never served |
-| `BuildError` | `InvalidRequestSchema` (bad `request_schema`), `InvalidQuerySchema` (bad `query_schema`), `InvalidUtf8` (metadata/pattern isn't valid UTF-8 — JSON text must be), `PathCollision` (two different routes convert to the same `(path, method)`, e.g. `/f/:p` and `/f/*p` both → `/f/{p}`), `SelfCheckMalformed`, plus every `ConformanceError` variant (the self-check above) |
+| `BuildError` | `InvalidRequestSchema` (bad `request_schema`), `InvalidQuerySchema` (bad `query_schema`), `InvalidUtf8` (metadata/pattern isn't valid UTF-8 — JSON text must be), `PathCollision` (two different routes convert to the same `(path, method)`, e.g. `/f/:p` and `/f/*p` both → `/f/{p}`), `SelfCheckMalformed`, `InvalidComponentSchema`, `SchemaConflict`, `DuplicateSecurityScheme`, `InvalidParameterSchema`, `InvalidExample`, `UnknownRouteExtra`, plus every `ConformanceError` variant (the self-check above) |
 
 **Endpoint** is an *intercepting* `router.Middleware` (the
 `metrics.Endpoint` pattern — `router.Handler` is a stateless fn pointer and
@@ -118,6 +122,10 @@ by raw path would be the cardinality footgun. Not wired up in this task.
   undocumented, deterministic method order); empty router → valid
   empty-`paths` document; malformed `request_schema` → error; endpoint +
   docs page driven through the socket-free `http.Server.serveStream`.
+- Parity members (`src/parity_test.zig`): golden documents for servers + shared
+  `$ref` schemas, every security scheme kind with per-operation selection, header/cookie
+  parameters and examples; each also passes `validateOpenApi31`; negative tests for the
+  typed errors.
 - In-process integration: `http.Server` + router + endpoint on
   `127.0.0.1:0`, fetched with `http.Client` — the served document parses
   and contains the registered routes/operations.

@@ -47,8 +47,14 @@
 //!   parameters, with `required` from the `required` lists and the
 //!   property's schema as its `schema`; anything else fails with
 //!   `error.InvalidQuerySchema`.
-//! - `operationId` is omitted (optional in OpenAPI; no stable naming
-//!   source in a fn-pointer table).
+//! - Beyond `RouteDoc`, `Info` carries `servers`, a named-schema registry
+//!   (`schemas` -> `components.schemas`, referenced by `$ref` via
+//!   `schemaRef`), further `security_schemes` (apiKey, basic, bearer, OAuth2,
+//!   OpenID Connect) with document-wide `security`, and `route_extras`
+//!   (header/cookie parameters, request/response examples, per-operation
+//!   `security`) for what `router.RouteDoc` has no field for. All of it is
+//!   off by default, and then the output is byte-identical to before.
+//!   `validateOpenApi31` resolves every local `$ref` and security-scheme use.
 //! - Router patterns convert to OpenAPI templates: `:id`/`*rest` → `{id}`/
 //!   `{rest}` (a bare `*` → `{*}`); `{name}` captures, whole or inside a
 //!   segment (`/files/{name}.{ext}`), already are templates. `router`
@@ -104,6 +110,132 @@ pub const Info = struct {
     /// bearerAuth`, RFC 6750) and require it on every operation (top-level
     /// `security`). For an API whose every route sits behind a bearer token.
     bearer_auth: bool = false,
+    /// `servers` (url + optional description), in order; omitted when empty.
+    servers: []const Server = &.{},
+    /// The named-schema registry: each entry is emitted once under
+    /// `components.schemas`, and routes point at it with `schemaRef(name)`
+    /// (a `$ref`) inside their `request_schema` / `Response.schema` /
+    /// `query_schema` text. Listing a name twice is fine when both bodies are
+    /// the same JSON, `error.SchemaConflict` when they differ.
+    schemas: []const NamedSchema = &.{},
+    /// Further `components.securitySchemes`, after `bearerAuth` when that is
+    /// on. A scheme is declared here and *used* by `security` (document-wide)
+    /// or `RouteExtra.security` (one operation).
+    security_schemes: []const SecurityScheme = &.{},
+    /// Document-wide security requirements, appended after `bearerAuth` (when
+    /// on) in the top-level `security`; each entry is one alternative (OR).
+    security: []const SecurityRequirement = &.{},
+    /// Per-route additions that `router.RouteDoc` has no field for (header
+    /// and cookie parameters, examples, a per-operation `security`), matched
+    /// to a registered route by method + raw pattern.
+    route_extras: []const RouteExtra = &.{},
+};
+
+/// One `servers` entry.
+pub const Server = struct {
+    url: []const u8,
+    description: ?[]const u8 = null,
+};
+
+/// A `components.schemas` member: `name` (letters, digits, `.`, `-`, `_`) and
+/// the JSON Schema as JSON text.
+pub const NamedSchema = struct {
+    name: []const u8,
+    schema: []const u8,
+};
+
+/// The JSON text `{"$ref":"#/components/schemas/<name>"}`, for a
+/// `request_schema` / `Response.schema` that is just a registered model.
+pub fn schemaRef(comptime name: []const u8) []const u8 {
+    return "{\"$ref\":\"#/components/schemas/" ++ name ++ "\"}";
+}
+
+pub const Scope = struct {
+    name: []const u8,
+    description: []const u8 = "",
+};
+
+/// One OAuth2 flow. Which URLs are required depends on the flow (implicit:
+/// `authorization_url`; password and client credentials: `token_url`;
+/// authorization code: both) -- a missing one fails the build's own check
+/// with `error.InvalidSecurityScheme`.
+pub const OAuthFlow = struct {
+    authorization_url: ?[]const u8 = null,
+    token_url: ?[]const u8 = null,
+    refresh_url: ?[]const u8 = null,
+    scopes: []const Scope = &.{},
+};
+
+pub const OAuthFlows = struct {
+    implicit: ?OAuthFlow = null,
+    password: ?OAuthFlow = null,
+    client_credentials: ?OAuthFlow = null,
+    authorization_code: ?OAuthFlow = null,
+};
+
+/// A named `components.securitySchemes` member.
+pub const SecurityScheme = struct {
+    name: []const u8,
+    description: ?[]const u8 = null,
+    kind: Kind,
+
+    pub const ApiKeyIn = enum { header, query, cookie };
+
+    pub const Kind = union(enum) {
+        /// `type: apiKey` -- `name` is the header / query / cookie name.
+        api_key: struct { in: ApiKeyIn, name: []const u8 },
+        /// `type: http`, `scheme: basic`.
+        http_basic,
+        /// `type: http`, `scheme: bearer`, optional `bearerFormat`.
+        http_bearer: struct { format: ?[]const u8 = null },
+        /// `type: oauth2`; at least one flow.
+        oauth2: OAuthFlows,
+        /// `type: openIdConnect` with its discovery URL.
+        openid_connect: []const u8,
+    };
+};
+
+/// One security requirement: scheme `name` (declared in `security_schemes`, or
+/// `"bearerAuth"`) with the scopes needed. A list of these is a list of
+/// alternatives; AND-combinations of several schemes are not expressible.
+pub const SecurityRequirement = struct {
+    name: []const u8,
+    scopes: []const []const u8 = &.{},
+};
+
+/// A header or cookie parameter (`RouteExtra`).
+pub const Parameter = struct {
+    name: []const u8,
+    description: ?[]const u8 = null,
+    required: bool = false,
+    /// JSON Schema as JSON text.
+    schema: []const u8 = "{\"type\":\"string\"}",
+};
+
+/// An example body for the response with this `status`: JSON text, emitted as
+/// `example` on that response's media type.
+pub const ResponseExample = struct {
+    status: u16,
+    json: []const u8,
+};
+
+/// What `router.RouteDoc` cannot carry, for one route (`Info.route_extras`).
+/// `method` + `pattern` (the raw `Router.add` pattern) pick the route; an
+/// entry matching no registered route is `error.UnknownRouteExtra`, as is a
+/// `response_examples` status the route does not document. First entry for a
+/// route wins.
+pub const RouteExtra = struct {
+    method: http.Method,
+    pattern: []const u8,
+    header_parameters: []const Parameter = &.{},
+    cookie_parameters: []const Parameter = &.{},
+    /// Null: the document-wide `security` applies. A slice (even empty, which
+    /// emits `security: []` = public) replaces it for this operation.
+    security: ?[]const SecurityRequirement = null,
+    /// JSON text, emitted as `example` of the `application/json` request body
+    /// (the body is emitted for it even without a `request_schema`).
+    request_example: ?[]const u8 = null,
+    response_examples: []const ResponseExample = &.{},
 };
 
 pub const BuildError = error{
@@ -139,6 +271,21 @@ pub const BuildError = error{
     /// self-check, below) -- would mean a bug in the generator itself,
     /// not a caller input problem; surfaced rather than served.
     SelfCheckMalformed,
+    /// A `schemas` entry is not valid JSON.
+    InvalidComponentSchema,
+    /// The same `schemas` name with two different bodies (compared as
+    /// normalized JSON text, key order significant).
+    SchemaConflict,
+    /// Two security schemes with one name (`bearerAuth` counts when
+    /// `bearer_auth` is on).
+    DuplicateSecurityScheme,
+    /// A `RouteExtra` parameter `schema` is not valid JSON.
+    InvalidParameterSchema,
+    /// A `RouteExtra` example is not valid JSON.
+    InvalidExample,
+    /// A `RouteExtra` that matches no registered route, or an example for a
+    /// status the route does not document.
+    UnknownRouteExtra,
 } || ConformanceError;
 
 // ── the generator ───────────────────────────────────────────────────────────
@@ -207,6 +354,9 @@ pub const Generator = struct {
         try checkUtf8(info.title);
         try checkUtf8(info.version);
         if (info.description) |d| try checkUtf8(d);
+        try checkInfoExtrasUtf8(info);
+        const registered = try registerSchemas(arena, info.schemas);
+        try checkSchemeNames(info);
 
         // F11 (A1/openapi.md): `info.include` filters BEFORE anything else
         // touches a route -- an excluded route's metadata is never
@@ -233,6 +383,8 @@ pub const Generator = struct {
                 }
             }
         }
+
+        const extra_of = try resolveExtras(arena, routes, rs, info.route_extras);
 
         // Converted (templated) path per route, index-aligned with `rs`.
         const converted = try arena.alloc([]const u8, rs.len);
@@ -272,14 +424,26 @@ pub const Generator = struct {
             try jw.write(d);
         }
         try jw.endObject();
-        if (info.bearer_auth) {
+        if (info.servers.len != 0) {
+            try jw.objectField("servers");
+            try jw.beginArray();
+            for (info.servers) |s| {
+                try jw.beginObject();
+                try jw.objectField("url");
+                try jw.write(s.url);
+                if (s.description) |d| {
+                    try jw.objectField("description");
+                    try jw.write(d);
+                }
+                try jw.endObject();
+            }
+            try jw.endArray();
+        }
+        if (info.bearer_auth or info.security.len != 0) {
             try jw.objectField("security");
             try jw.beginArray();
-            try jw.beginObject();
-            try jw.objectField("bearerAuth");
-            try jw.beginArray();
-            try jw.endArray();
-            try jw.endObject();
+            if (info.bearer_auth) try writeRequirement(&jw, .{ .name = "bearerAuth" });
+            for (info.security) |req| try writeRequirement(&jw, req);
             try jw.endArray();
         }
         try jw.objectField("paths");
@@ -310,30 +474,268 @@ pub const Generator = struct {
                     }
                 }
                 if (match) |i| {
-                    try writeOperation(&jw, arena, rs[i], path);
+                    try writeOperation(&jw, arena, rs[i], path, extra_of[i]);
                 }
             }
             try jw.endObject();
         }
         try jw.endObject();
-        if (info.bearer_auth) {
+        if (info.bearer_auth or info.security_schemes.len != 0 or registered.len != 0) {
             try jw.objectField("components");
             try jw.beginObject();
-            try jw.objectField("securitySchemes");
-            try jw.beginObject();
-            try jw.objectField("bearerAuth");
-            try jw.beginObject();
-            try jw.objectField("type");
-            try jw.write("http");
-            try jw.objectField("scheme");
-            try jw.write("bearer");
-            try jw.endObject();
-            try jw.endObject();
+            if (registered.len != 0) {
+                try jw.objectField("schemas");
+                try jw.beginObject();
+                for (registered) |s| {
+                    try jw.objectField(s.name);
+                    try jw.write(s.value);
+                }
+                try jw.endObject();
+            }
+            if (info.bearer_auth or info.security_schemes.len != 0) {
+                try jw.objectField("securitySchemes");
+                try jw.beginObject();
+                if (info.bearer_auth) {
+                    try jw.objectField("bearerAuth");
+                    try jw.beginObject();
+                    try jw.objectField("type");
+                    try jw.write("http");
+                    try jw.objectField("scheme");
+                    try jw.write("bearer");
+                    try jw.endObject();
+                }
+                for (info.security_schemes) |s| try writeSecurityScheme(&jw, s);
+                try jw.endObject();
+            }
             try jw.endObject();
         }
         try jw.endObject();
     }
 };
+
+const Registered = struct { name: []const u8, value: std.json.Value };
+
+/// The `schemas` registry parsed, in first-appearance order, a repeated name
+/// with an identical (normalized) body folded into one entry.
+fn registerSchemas(arena: Allocator, schemas: []const NamedSchema) BuildError![]const Registered {
+    var out: std.ArrayList(Registered) = .empty;
+    var texts: std.ArrayList([]const u8) = .empty;
+    for (schemas) |s| {
+        const value = (try parseText(arena, s.schema)) orelse return error.InvalidComponentSchema;
+        const norm = try std.json.Stringify.valueAlloc(arena, value, .{});
+        const prior: ?[]const u8 = for (out.items, texts.items) |q, t| {
+            if (std.mem.eql(u8, q.name, s.name)) break t;
+        } else null;
+        if (prior) |t| {
+            if (!std.mem.eql(u8, t, norm)) return error.SchemaConflict;
+            continue;
+        }
+        try out.append(arena, .{ .name = s.name, .value = value });
+        try texts.append(arena, norm);
+    }
+    return out.items;
+}
+
+/// `text` as a JSON value, null when it is not JSON.
+fn parseText(arena: Allocator, text: []const u8) Allocator.Error!?std.json.Value {
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+}
+
+/// Security scheme names are unique, `bearerAuth` included when it is on.
+fn checkSchemeNames(info: Info) BuildError!void {
+    for (info.security_schemes, 0..) |s, i| {
+        if (info.bearer_auth and std.mem.eql(u8, s.name, "bearerAuth")) return error.DuplicateSecurityScheme;
+        for (info.security_schemes[0..i]) |q| {
+            if (std.mem.eql(u8, q.name, s.name)) return error.DuplicateSecurityScheme;
+        }
+    }
+}
+
+/// UTF-8 (F4) for every string the new `Info` members hand to the writer.
+fn checkInfoExtrasUtf8(info: Info) BuildError!void {
+    for (info.servers) |s| {
+        try checkUtf8(s.url);
+        if (s.description) |d| try checkUtf8(d);
+    }
+    for (info.schemas) |s| {
+        try checkUtf8(s.name);
+        try checkUtf8(s.schema);
+    }
+    for (info.security_schemes) |s| {
+        try checkUtf8(s.name);
+        if (s.description) |d| try checkUtf8(d);
+        switch (s.kind) {
+            .api_key => |k| try checkUtf8(k.name),
+            .http_basic => {},
+            .http_bearer => |b| if (b.format) |f| try checkUtf8(f),
+            .oauth2 => |f| inline for (.{ "implicit", "password", "client_credentials", "authorization_code" }) |field| {
+                if (@field(f, field)) |flow| {
+                    if (flow.authorization_url) |u| try checkUtf8(u);
+                    if (flow.token_url) |u| try checkUtf8(u);
+                    if (flow.refresh_url) |u| try checkUtf8(u);
+                    for (flow.scopes) |sc| {
+                        try checkUtf8(sc.name);
+                        try checkUtf8(sc.description);
+                    }
+                }
+            },
+            .openid_connect => |u| try checkUtf8(u),
+        }
+    }
+    try checkRequirementsUtf8(info.security);
+    for (info.route_extras) |x| {
+        try checkUtf8(x.pattern);
+        for (x.header_parameters) |p| try checkParameterUtf8(p);
+        for (x.cookie_parameters) |p| try checkParameterUtf8(p);
+        if (x.security) |sec| try checkRequirementsUtf8(sec);
+        if (x.request_example) |e| try checkUtf8(e);
+        for (x.response_examples) |e| try checkUtf8(e.json);
+    }
+}
+
+fn checkRequirementsUtf8(reqs: []const SecurityRequirement) BuildError!void {
+    for (reqs) |r| {
+        try checkUtf8(r.name);
+        for (r.scopes) |sc| try checkUtf8(sc);
+    }
+}
+
+fn checkParameterUtf8(p: Parameter) BuildError!void {
+    try checkUtf8(p.name);
+    if (p.description) |d| try checkUtf8(d);
+    try checkUtf8(p.schema);
+}
+
+/// The `RouteExtra` of each kept route (first matching entry), index-aligned
+/// with `rs`. An entry that matches none of the registered `routes` (before
+/// the `include` filter, so excluding a route does not orphan its entry) is
+/// `error.UnknownRouteExtra`.
+fn resolveExtras(
+    arena: Allocator,
+    routes: []const router.Route,
+    rs: []const router.Route,
+    extras: []const RouteExtra,
+) BuildError![]const ?*const RouteExtra {
+    for (extras) |*x| {
+        const known = for (routes) |rt| {
+            if (rt.method == x.method and std.mem.eql(u8, rt.pattern, x.pattern)) break true;
+        } else false;
+        if (!known) return error.UnknownRouteExtra;
+    }
+    const out = try arena.alloc(?*const RouteExtra, rs.len);
+    for (out, rs) |*slot, rt| {
+        slot.* = for (extras) |*x| {
+            if (rt.method == x.method and std.mem.eql(u8, rt.pattern, x.pattern)) break x;
+        } else null;
+    }
+    return out;
+}
+
+/// `{"<name>":[scopes]}`.
+fn writeRequirement(jw: *std.json.Stringify, req: SecurityRequirement) Writer.Error!void {
+    try jw.beginObject();
+    try jw.objectField(req.name);
+    try jw.write(req.scopes);
+    try jw.endObject();
+}
+
+/// One `"<name>": {scheme}` member of `components.securitySchemes`.
+fn writeSecurityScheme(jw: *std.json.Stringify, s: SecurityScheme) Writer.Error!void {
+    try jw.objectField(s.name);
+    try jw.beginObject();
+    try jw.objectField("type");
+    const type_name: []const u8 = switch (s.kind) {
+        .api_key => "apiKey",
+        .http_basic, .http_bearer => "http",
+        .oauth2 => "oauth2",
+        .openid_connect => "openIdConnect",
+    };
+    try jw.write(type_name);
+    if (s.description) |d| {
+        try jw.objectField("description");
+        try jw.write(d);
+    }
+    switch (s.kind) {
+        .api_key => |k| {
+            try jw.objectField("name");
+            try jw.write(k.name);
+            try jw.objectField("in");
+            try jw.write(@tagName(k.in));
+        },
+        .http_basic => {
+            try jw.objectField("scheme");
+            try jw.write("basic");
+        },
+        .http_bearer => |b| {
+            try jw.objectField("scheme");
+            try jw.write("bearer");
+            if (b.format) |f| {
+                try jw.objectField("bearerFormat");
+                try jw.write(f);
+            }
+        },
+        .oauth2 => |f| {
+            try jw.objectField("flows");
+            try jw.beginObject();
+            // OAS 3.1 §4.8.29 key names, in the spec's order.
+            inline for (.{
+                .{ "implicit", "implicit" },
+                .{ "password", "password" },
+                .{ "clientCredentials", "client_credentials" },
+                .{ "authorizationCode", "authorization_code" },
+            }) |pair| {
+                if (@field(f, pair[1])) |flow| {
+                    try jw.objectField(pair[0]);
+                    try jw.beginObject();
+                    if (flow.authorization_url) |u| {
+                        try jw.objectField("authorizationUrl");
+                        try jw.write(u);
+                    }
+                    if (flow.token_url) |u| {
+                        try jw.objectField("tokenUrl");
+                        try jw.write(u);
+                    }
+                    if (flow.refresh_url) |u| {
+                        try jw.objectField("refreshUrl");
+                        try jw.write(u);
+                    }
+                    try jw.objectField("scopes");
+                    try jw.beginObject();
+                    for (flow.scopes) |sc| {
+                        try jw.objectField(sc.name);
+                        try jw.write(sc.description);
+                    }
+                    try jw.endObject();
+                    try jw.endObject();
+                }
+            }
+            try jw.endObject();
+        },
+        .openid_connect => |u| {
+            try jw.objectField("openIdConnectUrl");
+            try jw.write(u);
+        },
+    }
+    try jw.endObject();
+}
+
+/// `"<media_type>": {schema?, example?}`.
+fn writeMediaType(jw: *std.json.Stringify, media_type: []const u8, schema: ?std.json.Value, example: ?std.json.Value) Writer.Error!void {
+    try jw.objectField(media_type);
+    try jw.beginObject();
+    if (schema) |s| {
+        try jw.objectField("schema");
+        try jw.write(s);
+    }
+    if (example) |e| {
+        try jw.objectField("example");
+        try jw.write(e);
+    }
+    try jw.endObject();
+}
 
 /// F4 (A1/openapi.md): JSON text MUST be valid UTF-8 (RFC 8259 §8.1).
 fn checkUtf8(s: []const u8) BuildError!void {
@@ -402,6 +804,7 @@ fn writeOperation(
     arena: Allocator,
     rt: router.Route,
     converted_path: []const u8,
+    extra: ?*const RouteExtra,
 ) (BuildError || Writer.Error)!void {
     try jw.objectField(@tagName(rt.method)); // OpenAPI method keys are lowercase
     try jw.beginObject();
@@ -420,28 +823,31 @@ fn writeOperation(
         }
     }
     try writeOperationId(jw, arena, rt.method, converted_path);
-    try writeParameters(jw, arena, rt);
-    if (rt.doc) |d| {
-        if (d.request_schema) |schema_text| {
-            const schema = std.json.parseFromSliceLeaky(std.json.Value, arena, schema_text, .{}) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.InvalidRequestSchema,
-            };
+    try writeParameters(jw, arena, rt, extra);
+    {
+        const schema_text: ?[]const u8 = if (rt.doc) |d| d.request_schema else null;
+        const example_text: ?[]const u8 = if (extra) |x| x.request_example else null;
+        if (schema_text != null or example_text != null) {
+            const schema: ?std.json.Value = if (schema_text) |t|
+                (try parseText(arena, t)) orelse return error.InvalidRequestSchema
+            else
+                null;
+            const example: ?std.json.Value = if (example_text) |t|
+                (try parseText(arena, t)) orelse return error.InvalidExample
+            else
+                null;
             try jw.objectField("requestBody");
             try jw.beginObject();
             try jw.objectField("content");
             try jw.beginObject();
-            try jw.objectField("application/json");
-            try jw.beginObject();
-            try jw.objectField("schema");
-            try jw.write(schema); // re-emitted normalized (minified)
-            try jw.endObject();
+            try writeMediaType(jw, "application/json", schema, example); // re-emitted normalized (minified)
             try jw.endObject();
             try jw.objectField("required");
             try jw.write(true);
             try jw.endObject();
         }
     }
+    if (extra) |x| try checkResponseExamples(rt, x);
     try jw.objectField("responses");
     try jw.beginObject();
     if (rt.doc != null and rt.doc.?.responses.len != 0) {
@@ -473,18 +879,19 @@ fn writeOperation(
             try jw.beginObject();
             try jw.objectField("description");
             try jw.write(resp.description);
-            if (resp.schema) |schema_text| {
-                const schema = std.json.parseFromSliceLeaky(std.json.Value, arena, schema_text, .{}) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.InvalidResponseSchema,
-                };
+            const example_text = responseExample(extra, resp.status);
+            if (resp.schema != null or example_text != null) {
+                const schema: ?std.json.Value = if (resp.schema) |t|
+                    (try parseText(arena, t)) orelse return error.InvalidResponseSchema
+                else
+                    null;
+                const example: ?std.json.Value = if (example_text) |t|
+                    (try parseText(arena, t)) orelse return error.InvalidExample
+                else
+                    null;
                 try jw.objectField("content");
                 try jw.beginObject();
-                try jw.objectField(resp.media_type);
-                try jw.beginObject();
-                try jw.objectField("schema");
-                try jw.write(schema);
-                try jw.endObject();
+                try writeMediaType(jw, resp.media_type, schema, example);
                 try jw.endObject();
             }
             try jw.endObject();
@@ -495,6 +902,13 @@ fn writeOperation(
         try jw.beginObject();
         try jw.objectField("description");
         try jw.write("Successful Response");
+        if (responseExample(extra, 200)) |t| {
+            const example = (try parseText(arena, t)) orelse return error.InvalidExample;
+            try jw.objectField("content");
+            try jw.beginObject();
+            try writeMediaType(jw, "application/json", null, example);
+            try jw.endObject();
+        }
         try jw.endObject();
     }
     try jw.endObject();
@@ -504,7 +918,37 @@ fn writeOperation(
             try jw.write(true);
         }
     }
+    if (extra) |x| {
+        if (x.security) |sec| {
+            try jw.objectField("security");
+            try jw.beginArray();
+            for (sec) |req| try writeRequirement(jw, req);
+            try jw.endArray();
+        }
+    }
     try jw.endObject();
+}
+
+/// The example text registered for `status`, first entry wins.
+fn responseExample(extra: ?*const RouteExtra, status: u16) ?[]const u8 {
+    const x = extra orelse return null;
+    for (x.response_examples) |e| {
+        if (e.status == status) return e.json;
+    }
+    return null;
+}
+
+/// Every `response_examples` status must be one the operation documents (the
+/// default 200 when it documents none) -- an example for a response the
+/// document does not have would be silently dropped otherwise.
+fn checkResponseExamples(rt: router.Route, x: *const RouteExtra) BuildError!void {
+    const responses: []const router.RouteDoc.Response = if (rt.doc) |d| d.responses else &.{};
+    for (x.response_examples) |e| {
+        const documented = if (responses.len == 0) e.status == 200 else for (responses) |resp| {
+            if (resp.status == e.status) break true;
+        } else false;
+        if (!documented) return error.UnknownRouteExtra;
+    }
 }
 
 /// Deterministic `operationId` (audit finding openapi-F13): lowercase
@@ -582,11 +1026,43 @@ fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8, any: *bool)
 /// parameter per property of `RouteDoc.query_schema`, in the schema's
 /// order, `required` from the schema's `required` list. Nothing when there
 /// are neither.
-fn writeParameters(jw: *std.json.Stringify, arena: Allocator, rt: router.Route) (BuildError || Writer.Error)!void {
+fn writeParameters(jw: *std.json.Stringify, arena: Allocator, rt: router.Route, extra: ?*const RouteExtra) (BuildError || Writer.Error)!void {
     var any = false;
     try writePathParameters(jw, rt.pattern, &any);
     if (rt.doc) |d| if (d.query_schema) |text| try writeQueryParameters(jw, arena, text, &any);
+    if (extra) |x| {
+        try writeExtraParameters(jw, arena, x.header_parameters, "header", &any);
+        try writeExtraParameters(jw, arena, x.cookie_parameters, "cookie", &any);
+    }
     if (any) try jw.endArray();
+}
+
+/// Header / cookie parameters of a `RouteExtra`, after the query ones.
+fn writeExtraParameters(
+    jw: *std.json.Stringify,
+    arena: Allocator,
+    params: []const Parameter,
+    comptime location: []const u8,
+    any: *bool,
+) (BuildError || Writer.Error)!void {
+    for (params) |p| {
+        const schema = (try parseText(arena, p.schema)) orelse return error.InvalidParameterSchema;
+        try openParameters(jw, any);
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(p.name);
+        try jw.objectField("in");
+        try jw.write(location);
+        if (p.description) |d| {
+            try jw.objectField("description");
+            try jw.write(d);
+        }
+        try jw.objectField("required");
+        try jw.write(p.required);
+        try jw.objectField("schema");
+        try jw.write(schema);
+        try jw.endObject();
+    }
 }
 
 fn openParameters(jw: *std.json.Stringify, any: *bool) Writer.Error!void {
@@ -967,6 +1443,22 @@ pub const ConformanceError = error{
     /// A `responses` key that is not `default`, a status code 100-599, or a
     /// range `1XX`-`5XX`.
     InvalidResponseKey,
+    /// A local `$ref` (`#/...`) whose JSON Pointer does not resolve inside the
+    /// document. References to other documents are not followed.
+    DanglingRef,
+    /// A security requirement (top-level or per operation) naming a scheme
+    /// that `components.securitySchemes` does not declare.
+    UnknownSecurityScheme,
+    /// A security scheme without the members its `type` needs (apiKey: `name`
+    /// + `in`; http: `scheme`; oauth2: `flows` with each flow's URLs and
+    /// `scopes`; openIdConnect: `openIdConnectUrl`), or a malformed
+    /// requirement list.
+    InvalidSecurityScheme,
+    /// A `servers` entry that is not an object with a non-empty string `url`.
+    InvalidServer,
+    /// A `components.schemas` / `securitySchemes` key outside
+    /// `[A-Za-z0-9._-]+` (OAS 3.1 §4.8.7).
+    InvalidComponentName,
 };
 
 pub fn validateOpenApi31(doc: std.json.Value) ConformanceError!void {
@@ -994,6 +1486,180 @@ pub fn validateOpenApi31(doc: std.json.Value) ConformanceError!void {
 
     if (root.get("paths")) |v| try validatePathsObject(v, .paths);
     if (root.get("webhooks")) |v| try validatePathsObject(v, .webhooks);
+
+    try validateServers(root.get("servers"));
+    const schemes = try validateComponents(root.get("components"));
+    try validateSecurityList(root.get("security"), schemes);
+    inline for (.{ "paths", "webhooks" }) |key| {
+        if (root.get(key)) |items| {
+            var it = items.object.iterator();
+            while (it.next()) |entry| {
+                for (http_method_keys) |m| {
+                    const op = entry.value_ptr.*.object.get(m) orelse continue;
+                    try validateSecurityList(op.object.get("security"), schemes);
+                }
+            }
+        }
+    }
+    try validateRefs(doc, doc);
+}
+
+fn validateServers(servers: ?std.json.Value) ConformanceError!void {
+    const list = servers orelse return;
+    if (list != .array) return error.InvalidServer;
+    for (list.array.items) |s| {
+        if (s != .object) return error.InvalidServer;
+        const url = paramField(s, "url") orelse return error.InvalidServer;
+        if (url.len == 0) return error.InvalidServer;
+    }
+}
+
+fn validComponentName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '-' and c != '_') return false;
+    }
+    return true;
+}
+
+/// `components`: schema and scheme names well formed, each scheme complete for
+/// its `type`. Returns the `securitySchemes` object (null when absent).
+fn validateComponents(components: ?std.json.Value) ConformanceError!?std.json.ObjectMap {
+    const c = components orelse return null;
+    if (c != .object) return null;
+    if (c.object.get("schemas")) |s| {
+        if (s == .object) {
+            for (s.object.keys()) |k| if (!validComponentName(k)) return error.InvalidComponentName;
+        }
+    }
+    const ss = c.object.get("securitySchemes") orelse return null;
+    if (ss != .object) return error.InvalidSecurityScheme;
+    var it = ss.object.iterator();
+    while (it.next()) |e| {
+        if (!validComponentName(e.key_ptr.*)) return error.InvalidComponentName;
+        try validateSecurityScheme(e.value_ptr.*);
+    }
+    return ss.object;
+}
+
+fn nonEmptyString(obj: std.json.Value, comptime field: []const u8) bool {
+    const s = paramField(obj, field) orelse return false;
+    return s.len != 0;
+}
+
+fn validateSecurityScheme(v: std.json.Value) ConformanceError!void {
+    if (v != .object) return error.InvalidSecurityScheme;
+    if (v.object.get("$ref") != null) return; // a Reference Object, resolved by validateRefs
+    const t = paramField(v, "type") orelse return error.InvalidSecurityScheme;
+    if (std.mem.eql(u8, t, "apiKey")) {
+        const in = paramField(v, "in") orelse return error.InvalidSecurityScheme;
+        if (!nonEmptyString(v, "name")) return error.InvalidSecurityScheme;
+        for ([_][]const u8{ "query", "header", "cookie" }) |loc| {
+            if (std.mem.eql(u8, in, loc)) return;
+        }
+        return error.InvalidSecurityScheme;
+    } else if (std.mem.eql(u8, t, "http")) {
+        if (!nonEmptyString(v, "scheme")) return error.InvalidSecurityScheme;
+    } else if (std.mem.eql(u8, t, "oauth2")) {
+        const flows = v.object.get("flows") orelse return error.InvalidSecurityScheme;
+        if (flows != .object or flows.object.count() == 0) return error.InvalidSecurityScheme;
+        var it = flows.object.iterator();
+        while (it.next()) |e| {
+            const flow = e.value_ptr.*;
+            const name = e.key_ptr.*;
+            if (flow != .object) return error.InvalidSecurityScheme;
+            const scopes = flow.object.get("scopes") orelse return error.InvalidSecurityScheme;
+            if (scopes != .object) return error.InvalidSecurityScheme;
+            const need_auth = std.mem.eql(u8, name, "implicit") or std.mem.eql(u8, name, "authorizationCode");
+            const need_token = std.mem.eql(u8, name, "password") or std.mem.eql(u8, name, "clientCredentials") or
+                std.mem.eql(u8, name, "authorizationCode");
+            if (!need_auth and !need_token) return error.InvalidSecurityScheme;
+            if (need_auth and !nonEmptyString(flow, "authorizationUrl")) return error.InvalidSecurityScheme;
+            if (need_token and !nonEmptyString(flow, "tokenUrl")) return error.InvalidSecurityScheme;
+        }
+    } else if (std.mem.eql(u8, t, "openIdConnect")) {
+        if (!nonEmptyString(v, "openIdConnectUrl")) return error.InvalidSecurityScheme;
+    } else if (!std.mem.eql(u8, t, "mutualTLS")) {
+        return error.InvalidSecurityScheme;
+    }
+}
+
+/// A `security` list: an array of objects whose keys are declared schemes.
+fn validateSecurityList(list: ?std.json.Value, schemes: ?std.json.ObjectMap) ConformanceError!void {
+    const l = list orelse return;
+    if (l != .array) return error.InvalidSecurityScheme;
+    for (l.array.items) |req| {
+        if (req != .object) return error.InvalidSecurityScheme;
+        var it = req.object.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* != .array) return error.InvalidSecurityScheme;
+            const declared = schemes orelse return error.UnknownSecurityScheme;
+            if (!declared.contains(e.key_ptr.*)) return error.UnknownSecurityScheme;
+        }
+    }
+}
+
+/// Every `$ref` string beginning with `#` must resolve inside `root`. Applies
+/// to the whole document, so a literal `{"$ref":"#/..."}` object inside
+/// example data counts as a reference too.
+fn validateRefs(root: std.json.Value, v: std.json.Value) ConformanceError!void {
+    switch (v) {
+        .object => |o| {
+            if (o.get("$ref")) |r| {
+                if (r == .string and !refResolves(root, r.string)) return error.DanglingRef;
+            }
+            for (o.values()) |child| try validateRefs(root, child);
+        },
+        .array => |a| for (a.items) |child| try validateRefs(root, child),
+        else => {},
+    }
+}
+
+/// Whether the URI fragment `ref` (`#/a/b`) points at an existing value. Only
+/// JSON-Pointer fragments are decided; `#` alone, `#anchor` and references to
+/// other documents are taken as resolving.
+fn refResolves(root: std.json.Value, ref: []const u8) bool {
+    if (ref.len < 2 or ref[0] != '#' or ref[1] != '/') return true;
+    var cur = root;
+    var it = std.mem.splitScalar(u8, ref[2..], '/');
+    while (it.next()) |token| {
+        switch (cur) {
+            .object => |o| {
+                cur = for (o.keys(), o.values()) |k, val| {
+                    if (pointerTokenEql(token, k)) break val;
+                } else return false;
+            },
+            .array => |a| {
+                const idx = std.fmt.parseInt(usize, token, 10) catch return false;
+                if (idx >= a.items.len) return false;
+                cur = a.items[idx];
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// A JSON Pointer reference token against an object key (RFC 6901 §4: `~1` is
+/// `/`, `~0` is `~`).
+fn pointerTokenEql(token: []const u8, key: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < token.len) : (j += 1) {
+        if (j >= key.len) return false;
+        var c = token[i];
+        i += 1;
+        if (c == '~' and i < token.len) {
+            switch (token[i]) {
+                '0' => c = '~',
+                '1' => c = '/',
+                else => {},
+            }
+            if (token[i] == '0' or token[i] == '1') i += 1;
+        }
+        if (key[j] != c) return false;
+    }
+    return j == key.len;
 }
 
 const PathsKind = enum { paths, webhooks };
@@ -2388,4 +3054,5 @@ test "integration: GET /openapi.json over a real socket returns the documented r
 // See spec_oracle_test.zig / tools/interop.zig / tools/spec_oracle.py.
 test {
     _ = @import("spec_oracle_test.zig");
+    _ = @import("parity_test.zig");
 }
