@@ -92,6 +92,21 @@ try abuseguard.writeSnapshot(recs, writer); // "ban <prefix>" / "greylist <prefi
 // ... after restart, per line of the file:
 if (try abuseguard.parseSnapshotLine(line)) |rec| try list.append(gpa, rec);
 try guard.restore(list.items);
+
+// Mirror reputation into a firewall (fail2ban actionban/actionunban):
+const Fw = struct {
+    fn run(ctx: ?*anyopaque, ev: abuseguard.Event) void {
+        _ = ctx; // e.g. a queue drained by a thread that talks to nftables
+        switch (ev.kind) {
+            .banned, .prefix_banned => {}, // add ev.prefix to the set
+            .greylisted => {}, // add with timeout ev.ttl_ms.?
+            .unbanned, .prefix_unbanned, .evicted => {}, // delete ev.prefix
+            .all_cleared => {}, // flush the set
+            .dry_run_reject => {}, // log: would have refused (ev.verdict.?)
+        }
+    }
+};
+var guard2: abuseguard.Guard = .init(gpa, .{ .on_event = .{ .run = Fw.run } });
 ```
 
 ## Semantics (and where they come from)
@@ -107,7 +122,24 @@ try guard.restore(list.items);
   Reaching `ban_threshold` (≈ `maxretry`) is an *offense*: the balance
   resets and the IP is greylisted for `greylist_ttl_ms` (≈ `bantime`);
   reaching `ban_after_offenses` escalates to a permanent ban (≈ the
-  recidive jail). `unban` clears everything.
+  recidive jail). `unban` clears everything, `unbanAll` clears every key
+  and range (`fail2ban-client unban --all`).
+- **Ever-longer greylists (fail2ban `bantime.increment`):** with
+  `greylist_ttl_growth = g > 1` the n-th offense greylists for
+  `greylist_ttl_ms * g^(n-1)`, capped at `greylist_ttl_max_ms`
+  (`bantime.maxtime`). With `ban_after_offenses = 0` that is fail2ban's
+  "longer every time, never permanent" policy.
+- **Events (`Options.on_event`, fail2ban actions):** every reputation change
+  -- `banned`, `greylisted` (with its TTL and offense number), `unbanned`,
+  `evicted` (the store dropped a banned/greylisted key), `prefix_banned`,
+  `prefix_unbanned`, `all_cleared`, `dry_run_reject` -- is delivered after
+  the guard's lock is released, so the hook may call back into the Guard.
+  None for a greylist that simply runs out (it carries its TTL), for
+  `restore`, or for a manual ban/greylist of an allowlisted address.
+- **Dry run (nginx `limit_conn_dry_run`):** `dry_run = true` accounts every
+  verdict and strike as usual but admits what it would have refused (still
+  counted), reporting each as a `dry_run_reject` event with the verdict --
+  for rolling out caps and thresholds on live traffic first.
 - **Middleware:** after the chain runs, a 4xx response strikes the client
   (`strike_4xx`, default 1), a 429 strikes harder (`strike_429`, default 2;
   a `ratelimit` deny is a strong signal). 5xx/handler errors are never
@@ -183,4 +215,8 @@ keep-alive connections served concurrently, the next rejected at accept
 manual ban/unban, greylist TTL expiry re-admits (clock injected — no
 sleeps), and a `record`-driven greylist→ban escalation; (2) a router with
 the auto-strike middleware where three real 404s escalate a path scanner to
-an accept-time rejection, then the TTL re-admits it.
+an accept-time rejection, then the TTL re-admits it. Greylist growth and its
+ceiling, dry run (every verdict, store-full), event delivery outside the lock
+(a hook that re-enters the Guard), eviction events and `unbanAll` have their
+own tests, and a seeded model-fuzz checks every verdict, state and the exact
+event stream against a reference model.

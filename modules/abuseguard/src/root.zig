@@ -243,10 +243,83 @@ pub const Options = struct {
     strike_429: u32 = 2,
     /// How `middleware()` picks the IP to strike.
     middleware_key: MiddlewareKey = .peer_ip,
+    /// Growth of the auto-greylist per repeat offense (fail2ban
+    /// `bantime.increment` with `bantime.factor`): the n-th offense
+    /// greylists for `greylist_ttl_ms * greylist_ttl_growth^(n-1)`, capped
+    /// at `greylist_ttl_max_ms`. 1 = every offense greylists for
+    /// `greylist_ttl_ms` (the default). With `ban_after_offenses = 0` this
+    /// is fail2ban's "ever longer, never permanent" policy. Manual
+    /// `greylist` calls do not grow. Must be ≥ 1.
+    greylist_ttl_growth: u32 = 1,
+    /// Ceiling of a grown auto-greylist (fail2ban `bantime.maxtime`); null =
+    /// none (the product saturates at u64). Must be ≥ `greylist_ttl_ms`
+    /// when set.
+    greylist_ttl_max_ms: ?u64 = null,
+    /// Dry run (nginx `limit_conn_dry_run`): every verdict and every
+    /// strike is accounted as usual, but `admit` answers `.admitted` (or
+    /// `.admitted_untracked` when it could not track the peer) instead of
+    /// rejecting, and reports the rejection it would have made as a
+    /// `.dry_run_reject` event. For rolling out caps and thresholds on live
+    /// traffic before enforcing them.
+    dry_run: bool = false,
+    /// Called on every reputation change, after the guard's lock is
+    /// released (fail2ban `actionban` / `actionunban`: push a ban into an
+    /// nftables set, alert, log). See `Event`. Runs on the thread that
+    /// caused the change — the accept loop for `.dry_run_reject` — so keep
+    /// it short; it may call back into the Guard.
+    on_event: ?EventHook = null,
 };
 
 /// `Options.on_store_full`.
 pub const StoreFull = enum { reject, admit_untracked };
+
+/// A reputation change, delivered to `Options.on_event`.
+///
+/// No event is sent for a greylist that simply runs out (it carries its
+/// TTL, so a firewall set with element timeouts expires it on its own), for
+/// `restore` (the caller holds the records it restored), or for a manual
+/// `ban` / `greylist` of an `Options.allow` member (stored, never enforced).
+pub const Event = struct {
+    kind: Kind,
+    /// The key the change applies to (`Options.ipv6_key_bits` /
+    /// `ipv4_key_bits` wide), or the range for `.prefix_banned` /
+    /// `.prefix_unbanned`. `::/0` for `.all_cleared`.
+    prefix: netaddr.Prefix,
+    /// `.greylisted`: how long the greylist lasts.
+    ttl_ms: ?u64 = null,
+    /// `.greylisted` / `.banned` from `record`: the key's offense count
+    /// (1 = first offense); 0 for a manual call.
+    offense: u32 = 0,
+    /// `.dry_run_reject`: what `admit` would have answered.
+    verdict: ?AdmitVerdict = null,
+
+    pub const Kind = enum {
+        /// Permanent ban of a key (offense escalation or `ban`); only on
+        /// the change, not when the key was already banned.
+        banned,
+        /// Greylist of a key for `ttl_ms` (offense or `greylist`).
+        greylisted,
+        /// `unban` lifted a ban or a live greylist of the key.
+        unbanned,
+        /// The store evicted a banned or greylisted key to make room
+        /// (`max_tracked_ips`) — the guard has forgotten it.
+        evicted,
+        /// `banPrefix` added a range.
+        prefix_banned,
+        /// `unbanPrefix` removed a range.
+        prefix_unbanned,
+        /// `unbanAll` cleared every ban, greylist and range.
+        all_cleared,
+        /// `Options.dry_run`: `admit` let in what it would have refused.
+        dry_run_reject,
+    };
+};
+
+/// `Options.on_event`.
+pub const EventHook = struct {
+    ctx: ?*anyopaque = null,
+    run: *const fn (ctx: ?*anyopaque, event: Event) void,
+};
 
 // ── the guard ───────────────────────────────────────────────────────────────
 
@@ -317,6 +390,25 @@ pub const Guard = struct {
         banned: bool = false,
     };
 
+    /// Events gathered under the lock and delivered after it is released
+    /// (`deliver`), so `Options.on_event` may call back into the Guard. One
+    /// operation makes at most two: an eviction plus its own change.
+    const Pending = struct {
+        buf: [2]Event = undefined,
+        len: u8 = 0,
+
+        fn push(p: *Pending, e: Event) void {
+            std.debug.assert(p.len < p.buf.len);
+            p.buf[p.len] = e;
+            p.len += 1;
+        }
+    };
+
+    fn deliver(g: *const Guard, pending: *const Pending) void {
+        const hook = g.options.on_event orelse return;
+        for (pending.buf[0..pending.len]) |e| hook.run(hook.ctx, e);
+    }
+
     pub fn init(gpa: Allocator, options: Options) Guard {
         std.debug.assert(options.max_tracked_ips >= 1);
         std.debug.assert(options.ban_threshold >= 1);
@@ -325,6 +417,8 @@ pub const Guard = struct {
         if (options.max_conns_total) |m| std.debug.assert(m >= 1);
         std.debug.assert(options.ipv6_key_bits >= 1 and options.ipv6_key_bits <= 128);
         std.debug.assert(options.ipv4_key_bits >= 1 and options.ipv4_key_bits <= 32);
+        std.debug.assert(options.greylist_ttl_growth >= 1);
+        if (options.greylist_ttl_max_ms) |m| std.debug.assert(m >= options.greylist_ttl_ms);
         return .{ .gpa = gpa, .options = options };
     }
 
@@ -372,37 +466,64 @@ pub const Guard = struct {
     /// `.admitted_untracked` with one `connClosedUntracked`.
     pub fn admit(g: *Guard, ip: netaddr.Ip) AdmitVerdict {
         const now_ns = g.options.clock.now();
-        lockSpin(&g.lock);
-        defer g.lock.unlock();
+        var pending: Pending = .{};
+        const verdict = verdict: {
+            lockSpin(&g.lock);
+            defer g.lock.unlock();
+            break :verdict g.admitLocked(ip, now_ns, &pending);
+        };
+        g.deliver(&pending);
+        return verdict;
+    }
 
+    fn admitLocked(g: *Guard, ip: netaddr.Ip, now_ns: u64, pending: *Pending) AdmitVerdict {
+        const dry = g.options.dry_run;
+        // The rejection `admit` would answer; in a dry run it is reported
+        // and the connection admitted (and counted) anyway.
+        var deny: ?AdmitVerdict = null;
         // Global cap first: cheapest, and shedding must not insert entries.
         if (g.options.max_conns_total) |max| {
-            if (g.total_conns >= max) return .total_cap;
+            if (g.total_conns >= max) deny = .total_cap;
         }
         const allowed = g.isAllowed(ip);
         // A banned range is refused before any entry is looked up or made, so
         // a rejected peer neither churns the LRU nor, when the store is full,
         // slips in through `.admit_untracked`.
-        if (!allowed and g.inPrefixBan(ip)) return .banned;
-        const e = g.getOrCreate(g.keyOf(ip), now_ns) orelse switch (g.options.on_store_full) {
-            .reject => return .store_full,
-            .admit_untracked => {
-                g.untracked_conns += 1;
-                g.total_conns += 1;
-                return .admitted_untracked;
-            },
+        if (deny == null and !allowed and g.inPrefixBan(ip)) deny = .banned;
+        if (deny) |d| if (!dry) return d;
+        const e = g.getOrCreate(g.keyOf(ip), now_ns, pending) orelse {
+            if (deny == null and g.options.on_store_full == .reject) {
+                if (!dry) return .store_full;
+                deny = .store_full;
+            }
+            if (deny) |d| g.dryRunReject(ip, d, pending);
+            g.untracked_conns += 1;
+            g.total_conns += 1;
+            return .admitted_untracked;
         };
-        if (!allowed) {
-            if (e.banned) return .banned;
-            if (now_ns < e.greylisted_until_ns) return .greylisted;
-            e.greylisted_until_ns = 0; // lazy expiry
+        if (deny == null and !allowed) {
+            if (e.banned) {
+                deny = .banned;
+            } else if (now_ns < e.greylisted_until_ns) {
+                deny = .greylisted;
+            } else {
+                e.greylisted_until_ns = 0; // lazy expiry
+            }
         }
-        if (g.options.max_conns_per_ip) |max| {
-            if (e.active_conns >= max) return .per_ip_cap;
+        if (deny == null) if (g.options.max_conns_per_ip) |max| {
+            if (e.active_conns >= max) deny = .per_ip_cap;
+        };
+        if (deny) |d| {
+            if (!dry) return d;
+            g.dryRunReject(ip, d, pending);
         }
         e.active_conns += 1;
         g.total_conns += 1;
         return .admitted;
+    }
+
+    fn dryRunReject(g: *const Guard, ip: netaddr.Ip, verdict: AdmitVerdict, pending: *Pending) void {
+        pending.push(.{ .kind = .dry_run_reject, .prefix = g.prefixOfKey(g.keyOf(ip)), .verdict = verdict });
     }
 
     /// Release the slot `admit` counted for `ip`. With no live slot for
@@ -477,10 +598,18 @@ pub const Guard = struct {
     pub fn record(g: *Guard, ip: netaddr.Ip, weight: u32) void {
         if (weight == 0) return;
         const now_ns = g.options.clock.now();
-        lockSpin(&g.lock);
-        defer g.lock.unlock();
+        var pending: Pending = .{};
+        {
+            lockSpin(&g.lock);
+            defer g.lock.unlock();
+            g.recordLocked(ip, weight, now_ns, &pending);
+        }
+        g.deliver(&pending);
+    }
+
+    fn recordLocked(g: *Guard, ip: netaddr.Ip, weight: u32, now_ns: u64, pending: *Pending) void {
         if (g.isAllowed(ip)) return;
-        const e = g.getOrCreate(g.keyOf(ip), now_ns) orelse return;
+        const e = g.getOrCreate(g.keyOf(ip), now_ns, pending) orelse return;
         const drained = g.drainedSince(e, now_ns);
         const left = e.strikes - @as(f64, @floatFromInt(drained));
         e.strikes = @max(0, left) + @as(f64, @floatFromInt(weight));
@@ -507,12 +636,28 @@ pub const Guard = struct {
         // the next strike: an empty balance does that above.)
         e.strikes = 0;
         e.offenses +|= 1;
+        const prefix = g.prefixOfKey(e.key);
         if (g.options.ban_after_offenses != 0 and e.offenses >= g.options.ban_after_offenses) {
-            e.banned = true;
             e.greylisted_until_ns = 0;
+            if (!e.banned) pending.push(.{ .kind = .banned, .prefix = prefix, .offense = e.offenses });
+            e.banned = true;
         } else {
-            e.greylisted_until_ns = now_ns +| (g.options.greylist_ttl_ms *| std.time.ns_per_ms);
+            const ttl_ms = g.offenseTtlMs(e.offenses);
+            e.greylisted_until_ns = now_ns +| (ttl_ms *| std.time.ns_per_ms);
+            pending.push(.{ .kind = .greylisted, .prefix = prefix, .ttl_ms = ttl_ms, .offense = e.offenses });
         }
+    }
+
+    /// The auto-greylist TTL of the `offense`-th offense (≥ 1):
+    /// `greylist_ttl_ms * greylist_ttl_growth^(offense-1)`, saturating, capped
+    /// at `greylist_ttl_max_ms`.
+    fn offenseTtlMs(g: *const Guard, offense: u32) u64 {
+        const cap = g.options.greylist_ttl_max_ms orelse std.math.maxInt(u64);
+        var ttl = g.options.greylist_ttl_ms;
+        var n: u32 = 1;
+        while (n < offense and ttl < cap and g.options.greylist_ttl_growth > 1) : (n += 1)
+            ttl *|= g.options.greylist_ttl_growth;
+        return @min(ttl, cap);
     }
 
     /// Manually ban `ip` (permanent until `unban`; rejects new admissions
@@ -520,34 +665,81 @@ pub const Guard = struct {
     /// memory pressure, like `record`. Thread-safe.
     pub fn ban(g: *Guard, ip: netaddr.Ip) void {
         const now_ns = g.options.clock.now();
-        lockSpin(&g.lock);
-        defer g.lock.unlock();
-        const e = g.getOrCreate(g.keyOf(ip), now_ns) orelse return;
-        e.banned = true;
+        var pending: Pending = .{};
+        {
+            lockSpin(&g.lock);
+            defer g.lock.unlock();
+            if (g.getOrCreate(g.keyOf(ip), now_ns, &pending)) |e| {
+                if (!e.banned and !g.isAllowed(ip))
+                    pending.push(.{ .kind = .banned, .prefix = g.prefixOfKey(e.key) });
+                e.banned = true;
+            }
+        }
+        g.deliver(&pending);
     }
 
     /// Full forgiveness: clears the ban, the greylist, all strikes and the
     /// offense history. Live-connection counts are untouched. Thread-safe.
     pub fn unban(g: *Guard, ip: netaddr.Ip) void {
-        lockSpin(&g.lock);
-        defer g.lock.unlock();
-        const e = g.map.get(g.keyOf(ip)) orelse return;
-        e.banned = false;
-        e.greylisted_until_ns = 0;
-        e.strikes = 0;
-        e.offenses = 0;
-        if (e.active_conns == 0) g.removeEntry(e); // now empty — release it
+        const now_ns = g.options.clock.now();
+        var pending: Pending = .{};
+        {
+            lockSpin(&g.lock);
+            defer g.lock.unlock();
+            const e = g.map.get(g.keyOf(ip)) orelse return;
+            if ((e.banned or now_ns < e.greylisted_until_ns) and !g.isAllowed(ip))
+                pending.push(.{ .kind = .unbanned, .prefix = g.prefixOfKey(e.key) });
+            e.banned = false;
+            e.greylisted_until_ns = 0;
+            e.strikes = 0;
+            e.offenses = 0;
+            if (e.active_conns == 0) g.removeEntry(e); // now empty — release it
+        }
+        g.deliver(&pending);
+    }
+
+    /// `unban` for every key at once, plus every `banPrefix` range
+    /// (`fail2ban-client unban --all`). Live-connection counts are
+    /// untouched. One `.all_cleared` event. Thread-safe.
+    pub fn unbanAll(g: *Guard) void {
+        {
+            lockSpin(&g.lock);
+            defer g.lock.unlock();
+            g.prefix_bans.clearRetainingCapacity();
+            var it = g.lru.first;
+            while (it) |n| {
+                it = n.next;
+                const e: *Entry = @fieldParentPtr("node", n);
+                e.banned = false;
+                e.greylisted_until_ns = 0;
+                e.strikes = 0;
+                e.offenses = 0;
+                if (e.active_conns == 0) g.removeEntry(e);
+            }
+        }
+        var pending: Pending = .{};
+        pending.push(.{ .kind = .all_cleared, .prefix = .{ .addr = .{ .v6 = @splat(0) }, .bits = 0 } });
+        g.deliver(&pending);
     }
 
     /// Manually greylist `ip` for `ttl_ms` (null = `Options.greylist_ttl_ms`),
-    /// replacing any current greylist. Does not count as an offense.
-    /// Best-effort under memory pressure, like `record`. Thread-safe.
+    /// replacing any current greylist. Does not count as an offense and does
+    /// not grow (`greylist_ttl_growth`). Best-effort under memory pressure,
+    /// like `record`. Thread-safe.
     pub fn greylist(g: *Guard, ip: netaddr.Ip, ttl_ms: ?u64) void {
         const now_ns = g.options.clock.now();
-        lockSpin(&g.lock);
-        defer g.lock.unlock();
-        const e = g.getOrCreate(g.keyOf(ip), now_ns) orelse return;
-        e.greylisted_until_ns = now_ns +| ((ttl_ms orelse g.options.greylist_ttl_ms) *| std.time.ns_per_ms);
+        const ms = ttl_ms orelse g.options.greylist_ttl_ms;
+        var pending: Pending = .{};
+        {
+            lockSpin(&g.lock);
+            defer g.lock.unlock();
+            if (g.getOrCreate(g.keyOf(ip), now_ns, &pending)) |e| {
+                e.greylisted_until_ns = now_ns +| (ms *| std.time.ns_per_ms);
+                if (!g.isAllowed(ip))
+                    pending.push(.{ .kind = .greylisted, .prefix = g.prefixOfKey(e.key), .ttl_ms = ms });
+            }
+        }
+        g.deliver(&pending);
     }
 
     /// Whether `ip` is currently banned: its key's ban or a `banPrefix`
@@ -579,30 +771,47 @@ pub const Guard = struct {
     /// /48 ban covers every /64 inside it. `TooManyPrefixBans` at
     /// `Options.max_prefix_bans`. Thread-safe.
     pub fn banPrefix(g: *Guard, p: netaddr.Prefix) error{ OutOfMemory, TooManyPrefixBans }!void {
-        lockSpin(&g.lock);
-        defer g.lock.unlock();
-        return g.banPrefixLocked(canonicalPrefix(p));
+        const c = canonicalPrefix(p);
+        const added = added: {
+            lockSpin(&g.lock);
+            defer g.lock.unlock();
+            break :added try g.banPrefixLocked(c);
+        };
+        if (!added) return;
+        var pending: Pending = .{};
+        pending.push(.{ .kind = .prefix_banned, .prefix = c });
+        g.deliver(&pending);
     }
 
-    fn banPrefixLocked(g: *Guard, c: netaddr.Prefix) error{ OutOfMemory, TooManyPrefixBans }!void {
-        for (g.prefix_bans.items) |q| if (q.eql(c)) return;
+    /// False when `c` was already banned.
+    fn banPrefixLocked(g: *Guard, c: netaddr.Prefix) error{ OutOfMemory, TooManyPrefixBans }!bool {
+        for (g.prefix_bans.items) |q| if (q.eql(c)) return false;
         if (g.prefix_bans.items.len >= g.options.max_prefix_bans) return error.TooManyPrefixBans;
         try g.prefix_bans.append(g.gpa, c);
+        return true;
     }
 
     /// Lift a `banPrefix` ban of exactly `p` (after the same canonicalising).
     /// True when one was removed. Does not touch per-key bans. Thread-safe.
     pub fn unbanPrefix(g: *Guard, p: netaddr.Prefix) bool {
         const c = canonicalPrefix(p);
-        lockSpin(&g.lock);
-        defer g.lock.unlock();
-        for (g.prefix_bans.items, 0..) |q, i| {
-            if (q.eql(c)) {
-                _ = g.prefix_bans.orderedRemove(i);
-                return true;
+        const removed = removed: {
+            lockSpin(&g.lock);
+            defer g.lock.unlock();
+            for (g.prefix_bans.items, 0..) |q, i| {
+                if (q.eql(c)) {
+                    _ = g.prefix_bans.orderedRemove(i);
+                    break :removed true;
+                }
             }
+            break :removed false;
+        };
+        if (removed) {
+            var pending: Pending = .{};
+            pending.push(.{ .kind = .prefix_unbanned, .prefix = c });
+            g.deliver(&pending);
         }
-        return false;
+        return removed;
     }
 
     /// The reputation worth keeping across a restart (fail2ban's ban DB):
@@ -668,16 +877,16 @@ pub const Guard = struct {
             const key_bits = g.keyBits(c.addr);
             if (r.greylist_remaining_ms) |ms| {
                 if (c.bits < key_bits) continue;
-                const e = g.getOrCreate(g.keyOf(c.addr), now_ns) orelse return error.StoreFull;
+                const e = g.getOrCreate(g.keyOf(c.addr), now_ns, null) orelse return error.StoreFull;
                 const until = now_ns +| (ms *| std.time.ns_per_ms);
                 e.greylisted_until_ns = @max(e.greylisted_until_ns, until);
                 continue;
             }
             if (r.range or c.bits != key_bits) {
-                try g.banPrefixLocked(c);
+                _ = try g.banPrefixLocked(c);
                 continue;
             }
-            const e = g.getOrCreate(g.keyOf(c.addr), now_ns) orelse return error.StoreFull;
+            const e = g.getOrCreate(g.keyOf(c.addr), now_ns, null) orelse return error.StoreFull;
             e.banned = true;
         }
     }
@@ -775,8 +984,10 @@ pub const Guard = struct {
     /// Look up `key`, refreshing its LRU position — or insert a fresh entry,
     /// first sweeping empty entries off the LRU tail and evicting at the
     /// cap. Null when nothing is evictable or the allocator failed
-    /// (fail-closed; the callers document their policy).
-    fn getOrCreate(g: *Guard, key: Key, now_ns: u64) ?*Entry {
+    /// (fail-closed; the callers document their policy). Evicting a banned
+    /// or greylisted key queues an `.evicted` event into `pending` (null:
+    /// `restore`, which sends none).
+    fn getOrCreate(g: *Guard, key: Key, now_ns: u64, pending: ?*Pending) ?*Entry {
         if (g.map.get(key)) |e| {
             g.lru.remove(&e.node);
             g.lru.prepend(&e.node);
@@ -790,8 +1001,12 @@ pub const Guard = struct {
             if (!g.entryIsEmpty(e, now_ns)) break;
             g.removeEntry(e);
         }
-        if (g.map.count() >= g.options.max_tracked_ips)
-            g.removeEntry(g.findEvictable() orelse return null);
+        if (g.map.count() >= g.options.max_tracked_ips) {
+            const victim = g.findEvictable() orelse return null;
+            if (pending) |p| if (victim.banned or now_ns < victim.greylisted_until_ns)
+                p.push(.{ .kind = .evicted, .prefix = g.prefixOfKey(victim.key) });
+            g.removeEntry(victim);
+        }
         const e = g.gpa.create(Entry) catch return null;
         e.* = .{ .key = key, .strikes_updated_ns = now_ns };
         g.map.put(g.gpa, key, e) catch {
@@ -2586,6 +2801,205 @@ test "record: an idle key with an offense history is not swept as empty" {
     try testing.expect(g.isBanned(a));
 }
 
+/// Collects `Options.on_event` deliveries; optionally calls back into the
+/// Guard from inside the hook (proves the lock is released by then).
+const EvLog = struct {
+    evs: [8]Event = undefined,
+    n: usize = 0,
+    reenter: ?*Guard = null,
+    reentered: usize = 0,
+
+    fn hook(l: *EvLog) EventHook {
+        return .{ .ctx = l, .run = run };
+    }
+
+    fn run(ctx: ?*anyopaque, e: Event) void {
+        const l: *EvLog = @ptrCast(@alignCast(ctx.?));
+        if (l.reenter) |g| {
+            _ = g.isBanned(mkIp("192.0.2.1")); // would spin forever under the lock
+            l.reentered += 1;
+        }
+        l.evs[l.n] = e;
+        l.n += 1;
+    }
+};
+
+test "increment: the n-th offense greylists for ttl * growth^(n-1), capped at greylist_ttl_max_ms" {
+    // fail2ban bantime.increment + bantime.maxtime. Kills: growth ignored
+    // (every greylist 1000 ms), the cap ignored (the 4th lasts 8000 ms), or
+    // the exponent off by one (the 1st already 2000 ms).
+    var tc: TestClock = .{};
+    var log: EvLog = .{};
+    var g = Guard.init(testing.allocator, .{
+        .ban_threshold = 1,
+        .ban_after_offenses = 0,
+        .strike_decay_ms = 0,
+        .greylist_ttl_ms = 1000,
+        .greylist_ttl_growth = 2,
+        .greylist_ttl_max_ms = 5000,
+        .on_event = log.hook(),
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    const ip = mkIp("203.0.113.70");
+    const want = [_]u64{ 1000, 2000, 4000, 5000, 5000 };
+    for (want, 1..) |ttl, offense| {
+        g.record(ip, 1);
+        try testing.expectEqual(offense, log.n);
+        const e = log.evs[offense - 1];
+        try testing.expectEqual(Event.Kind.greylisted, e.kind);
+        try testing.expectEqual(@as(?u64, ttl), e.ttl_ms);
+        try testing.expectEqual(@as(u32, @intCast(offense)), e.offense);
+        try testing.expect(e.prefix.eql(.{ .addr = ip, .bits = 32 }));
+        tc.advanceMs(ttl - 1);
+        try testing.expectEqual(AdmitVerdict.greylisted, g.admit(ip));
+        tc.advanceMs(1);
+        try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip));
+        g.connClosed(ip);
+    }
+    // A manual greylist does not grow.
+    g.greylist(ip, null);
+    try testing.expectEqual(@as(?u64, 1000), log.evs[want.len].ttl_ms);
+}
+
+test "increment: growth 1 (the default) keeps every auto-greylist at greylist_ttl_ms" {
+    var tc: TestClock = .{};
+    var log: EvLog = .{};
+    var g = Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 0, .strike_decay_ms = 0, .greylist_ttl_ms = 700, .on_event = log.hook(), .clock = tc.clock() });
+    defer g.deinit();
+    const ip = mkIp("203.0.113.71");
+    for (0..4) |_| g.record(ip, 1);
+    for (log.evs[0..4]) |e| try testing.expectEqual(@as(?u64, 700), e.ttl_ms);
+}
+
+test "dry run: every rejection is admitted, counted and reported with the verdict it would have been" {
+    // nginx limit_conn_dry_run. Kills: dry run still rejecting, the admitted
+    // connection not counted (connCount/totalConns), or no event.
+    var tc: TestClock = .{};
+    var log: EvLog = .{};
+    var g = Guard.init(testing.allocator, .{
+        .max_conns_per_ip = 1,
+        .max_conns_total = 3,
+        .dry_run = true,
+        .on_event = log.hook(),
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    const a = mkIp("198.51.100.1");
+    const b = mkIp("198.51.100.2");
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(a));
+    try testing.expectEqual(@as(usize, 0), log.n);
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(a)); // over the per-IP cap
+    try testing.expectEqual(@as(u32, 2), g.connCount(a));
+    try testing.expectEqual(Event.Kind.dry_run_reject, log.evs[0].kind);
+    try testing.expectEqual(@as(?AdmitVerdict, .per_ip_cap), log.evs[0].verdict);
+    g.ban(b); // event 1: banned
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(b));
+    try testing.expectEqual(@as(?AdmitVerdict, .banned), log.evs[2].verdict);
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("198.51.100.3"))); // 4th > total 3
+    try testing.expectEqual(@as(?AdmitVerdict, .total_cap), log.evs[3].verdict);
+    try testing.expectEqual(@as(usize, 4), g.totalConns());
+    // Reputation is still accounted: the ban is real, only not enforced.
+    try testing.expect(g.isBanned(b));
+}
+
+test "dry run: an untrackable peer is admitted untracked and reported as store_full" {
+    var tc: TestClock = .{};
+    var log: EvLog = .{};
+    var g = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .dry_run = true, .on_event = log.hook(), .clock = tc.clock() });
+    defer g.deinit();
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("198.51.100.10")));
+    try testing.expectEqual(AdmitVerdict.admitted_untracked, g.admit(mkIp("198.51.100.11")));
+    try testing.expectEqual(@as(?AdmitVerdict, .store_full), log.evs[0].verdict);
+    try testing.expectEqual(@as(usize, 1), g.untrackedConns());
+}
+
+test "events: delivered after the lock is released -- the hook may call back into the Guard" {
+    // Kills: delivering under the spinlock (the re-entrant isBanned would
+    // spin forever: this test hangs instead of passing).
+    var tc: TestClock = .{};
+    var log: EvLog = .{};
+    var g = Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 2, .strike_decay_ms = 0, .on_event = log.hook(), .clock = tc.clock() });
+    defer g.deinit();
+    log.reenter = &g;
+    const ip = mkIp("203.0.113.80");
+    g.record(ip, 1); // greylisted, offense 1
+    g.record(ip, 1); // banned, offense 2
+    g.ban(ip); // already banned: no event
+    g.unban(ip); // unbanned
+    g.greylist(ip, 5); // greylisted, manual
+    try g.banPrefix(mkPrefix("203.0.113.0/24")); // prefix_banned
+    try g.banPrefix(mkPrefix("203.0.113.0/24")); // already: no event
+    try testing.expect(g.unbanPrefix(mkPrefix("203.0.113.0/24"))); // prefix_unbanned
+    try testing.expect(!g.unbanPrefix(mkPrefix("203.0.113.0/24"))); // none
+    const kinds = [_]Event.Kind{ .greylisted, .banned, .unbanned, .greylisted, .prefix_banned, .prefix_unbanned };
+    try testing.expectEqual(kinds.len, log.n);
+    for (kinds, log.evs[0..log.n]) |k, e| try testing.expectEqual(k, e.kind);
+    try testing.expectEqual(kinds.len, log.reentered);
+    try testing.expectEqual(@as(u32, 2), log.evs[1].offense);
+    try testing.expectEqual(@as(u32, 0), log.evs[3].offense);
+    try testing.expectEqual(@as(?u64, 5), log.evs[3].ttl_ms);
+}
+
+test "events: an allowlist member's manual ban/greylist/unban sends nothing (never enforced)" {
+    var tc: TestClock = .{};
+    var log: EvLog = .{};
+    const allow = [_]netaddr.Prefix{mkPrefix("10.9.0.0/16")};
+    var g = Guard.init(testing.allocator, .{ .allow = &allow, .on_event = log.hook(), .clock = tc.clock() });
+    defer g.deinit();
+    const ip = mkIp("10.9.1.1");
+    g.ban(ip);
+    g.greylist(ip, null);
+    g.unban(ip);
+    try testing.expectEqual(@as(usize, 0), log.n);
+}
+
+test "events: evicting a banned or greylisted key reports it; an expired greylist does not" {
+    // Kills: no `.evicted` event (a firewall mirror would keep a ban the
+    // guard forgot), or one for an entry that held no reputation.
+    var tc: TestClock = .{};
+    var log: EvLog = .{};
+    var g = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .greylist_ttl_ms = 100, .on_event = log.hook(), .clock = tc.clock() });
+    defer g.deinit();
+    const a = mkIp("198.51.100.20");
+    g.ban(a); // event 0
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("198.51.100.21"))); // evicts a
+    try testing.expectEqual(@as(usize, 2), log.n);
+    try testing.expectEqual(Event.Kind.evicted, log.evs[1].kind);
+    try testing.expect(log.evs[1].prefix.eql(.{ .addr = a, .bits = 32 }));
+    g.connClosed(mkIp("198.51.100.21"));
+    g.greylist(mkIp("198.51.100.22"), null); // .21 held no reputation: swept, no event
+    try testing.expectEqual(@as(usize, 3), log.n);
+    try testing.expectEqual(Event.Kind.greylisted, log.evs[2].kind);
+    tc.advanceMs(100); // the greylist is over
+    g.ban(mkIp("198.51.100.23")); // .22 is empty now: swept, no event
+    try testing.expectEqual(@as(usize, 4), log.n);
+    try testing.expectEqual(Event.Kind.banned, log.evs[3].kind);
+}
+
+test "unbanAll: clears every key's reputation and every range, keeps live counts, one event" {
+    var tc: TestClock = .{};
+    var log: EvLog = .{};
+    var g = Guard.init(testing.allocator, .{ .ban_threshold = 1, .strike_decay_ms = 0, .on_event = log.hook(), .clock = tc.clock() });
+    defer g.deinit();
+    const a = mkIp("198.51.100.30");
+    const b = mkIp("198.51.100.31");
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(a));
+    g.record(a, 1);
+    g.ban(b);
+    try g.banPrefix(mkPrefix("192.0.2.0/24"));
+    log.n = 0;
+    g.unbanAll();
+    try testing.expectEqual(@as(usize, 1), log.n);
+    try testing.expectEqual(Event.Kind.all_cleared, log.evs[0].kind);
+    try testing.expectEqual(@as(u8, 0), log.evs[0].prefix.bits);
+    try testing.expect(!g.isGreylisted(a) and !g.isBanned(b) and !g.isBanned(mkIp("192.0.2.9")));
+    try testing.expectEqual(@as(u32, 1), g.connCount(a));
+    try testing.expectEqual(@as(usize, 1), g.trackedCount()); // b released, a kept (live)
+    g.record(a, 1); // offense history was cleared too: a first offense again
+    try testing.expectEqual(@as(u32, 1), log.evs[1].offense);
+}
+
 fn hServerErrStatus(ctx: *router.Ctx) anyerror!void {
     ctx.res.setStatus(500);
     try ctx.res.writeAll("boom");
@@ -2691,6 +3105,9 @@ const AgCfg = struct {
     v6bits: u8,
     v4bits: u8,
     max_pfx: usize,
+    growth: u32,
+    max_ttl_ms: ?u64,
+    dry: bool,
 };
 
 const AgReach = struct {
@@ -2719,6 +3136,52 @@ const AgReach = struct {
     reconcile_applied: u64 = 0,
     snapshot_checked: u64 = 0,
     restore_roundtrip: u64 = 0,
+    offense_ttl_grown: u64 = 0,
+    offense_ttl_capped: u64 = 0,
+    dry_run_reject: u64 = 0,
+    evicted_event: u64 = 0,
+    unban_all: u64 = 0,
+    event_checked: u64 = 0,
+};
+
+/// An `Event` as the model predicts it (prefix in the model's own form).
+const AgEv = struct {
+    kind: Event.Kind,
+    p: AgPrefix,
+    ttl_ms: ?u64 = null,
+    offense: u32 = 0,
+    verdict: ?AdmitVerdict = null,
+
+    fn of(e: Event) AgEv {
+        return .{
+            .kind = e.kind,
+            .p = .{ .a = agRaw(e.prefix.addr), .bits = e.prefix.bits },
+            .ttl_ms = e.ttl_ms,
+            .offense = e.offense,
+            .verdict = e.verdict,
+        };
+    }
+
+    fn eql(x: AgEv, y: AgEv) bool {
+        return x.kind == y.kind and x.p.eql(y.p) and x.ttl_ms == y.ttl_ms and
+            x.offense == y.offense and x.verdict == y.verdict;
+    }
+};
+
+/// `Options.on_event` sink for the model-fuzz: what the Guard delivered.
+const AgEvSink = struct {
+    evs: [4]Event = undefined,
+    n: usize = 0,
+
+    fn hook(s: *AgEvSink) EventHook {
+        return .{ .ctx = s, .run = run };
+    }
+
+    fn run(ctx: ?*anyopaque, e: Event) void {
+        const s: *AgEvSink = @ptrCast(@alignCast(ctx.?));
+        s.evs[s.n] = e; // more than 4 per operation overflows: a failure by itself
+        s.n += 1;
+    }
 };
 
 const AgEntry = struct {
@@ -2739,8 +3202,28 @@ const AgModel = struct {
     pfx: [8]AgPrefix = undefined,
     np: usize = 0,
     untracked: usize = 0,
+    evs: [2]AgEv = undefined, // events of the current operation
+    nev: usize = 0,
 
     const ms = std.time.ns_per_ms;
+
+    fn emit(m: *AgModel, e: AgEv) void {
+        m.evs[m.nev] = e;
+        m.nev += 1;
+    }
+
+    fn keyPfx(m: *const AgModel, key: AgAddr) AgPrefix {
+        return .{ .a = key, .bits = if (key.fam == 4) m.cfg.v4bits else m.cfg.v6bits };
+    }
+
+    /// ttl_ms * growth^(offense-1), saturating at u64, then capped.
+    fn offenseTtl(m: *const AgModel, offense: u32) u64 {
+        var t: u128 = m.cfg.ttl_ms;
+        var k: u32 = 1;
+        while (k < offense and t <= std.math.maxInt(u64)) : (k += 1) t *= m.cfg.growth;
+        const sat: u64 = @intCast(@min(t, std.math.maxInt(u64)));
+        return @min(sat, m.cfg.max_ttl_ms orelse std.math.maxInt(u64));
+    }
 
     fn keyOf(m: *const AgModel, ip: netaddr.Ip) AgAddr {
         const a = agUnmap(agRaw(ip));
@@ -2827,6 +3310,10 @@ const AgModel = struct {
                 }
             }
             const v = victim orelse return null;
+            if (m.ents[v].banned or now < m.ents[v].grey_until) {
+                m.emit(.{ .kind = .evicted, .p = m.keyPfx(m.ents[v].key) });
+                m.reach.evicted_event += 1;
+            }
             m.remove(v);
             m.reach.evicted += 1;
         }
@@ -2834,28 +3321,52 @@ const AgModel = struct {
         return 0;
     }
 
+    /// `Guard.admit`: the rejection, or under `dry` the admission plus a
+    /// `.dry_run_reject` event.
     fn admit(m: *AgModel, ip: netaddr.Ip, now: u64) AdmitVerdict {
-        if (m.cfg.max_total) |mx| if (m.total() >= mx) return .total_cap;
+        var deny: ?AdmitVerdict = null;
+        if (m.cfg.max_total) |mx| if (m.total() >= mx) {
+            deny = .total_cap;
+        };
         const al = m.allowed(ip);
-        if (!al and m.inPfx(ip)) return .banned;
-        const i = m.touch(m.keyOf(ip), now) orelse switch (m.cfg.store_full) {
-            .reject => return .store_full,
-            .admit_untracked => {
-                m.untracked += 1;
-                return .admitted_untracked;
-            },
+        if (deny == null and !al and m.inPfx(ip)) deny = .banned;
+        if (deny != null and !m.cfg.dry) return deny.?;
+        const key = m.keyOf(ip);
+        const i = m.touch(key, now) orelse {
+            if (deny == null and m.cfg.store_full == .reject) {
+                if (!m.cfg.dry) return .store_full;
+                deny = .store_full;
+            }
+            if (deny) |d| m.dryReject(key, d);
+            m.untracked += 1;
+            return .admitted_untracked;
         };
         const e = &m.ents[i];
-        if (!al) {
-            if (e.banned) return .banned;
-            if (now < e.grey_until) return .greylisted;
-            e.grey_until = 0;
-        } else if (e.banned or now < e.grey_until or m.inPfx(ip)) {
-            m.reach.allow_overrides_verdict += 1;
+        if (deny == null) {
+            if (!al) {
+                if (e.banned) {
+                    deny = .banned;
+                } else if (now < e.grey_until) {
+                    deny = .greylisted;
+                } else e.grey_until = 0;
+            } else if (e.banned or now < e.grey_until or m.inPfx(ip)) {
+                m.reach.allow_overrides_verdict += 1;
+            }
         }
-        if (m.cfg.max_per) |mx| if (e.live >= mx) return .per_ip_cap;
+        if (deny == null) if (m.cfg.max_per) |mx| if (e.live >= mx) {
+            deny = .per_ip_cap;
+        };
+        if (deny) |d| {
+            if (!m.cfg.dry) return d;
+            m.dryReject(key, d);
+        }
         e.live += 1;
         return .admitted;
+    }
+
+    fn dryReject(m: *AgModel, key: AgAddr, d: AdmitVerdict) void {
+        m.emit(.{ .kind = .dry_run_reject, .p = m.keyPfx(key), .verdict = d });
+        m.reach.dry_run_reject += 1;
     }
 
     fn closed(m: *AgModel, ip: netaddr.Ip) void {
@@ -2894,23 +3405,46 @@ const AgModel = struct {
         e.strikes = 0;
         e.offenses += 1;
         if (m.cfg.after != 0 and e.offenses >= m.cfg.after) {
+            if (!e.banned) m.emit(.{ .kind = .banned, .p = m.keyPfx(e.key), .offense = e.offenses });
             e.banned = true;
             e.grey_until = 0;
             m.reach.offense_ban += 1;
         } else {
-            e.grey_until = now + m.cfg.ttl_ms * ms;
+            const ttl = m.offenseTtl(e.offenses);
+            if (ttl > m.cfg.ttl_ms) m.reach.offense_ttl_grown += 1;
+            if (m.cfg.max_ttl_ms != null and ttl == m.cfg.max_ttl_ms.? and ttl > m.cfg.ttl_ms) m.reach.offense_ttl_capped += 1;
+            e.grey_until = now +| ttl *| ms;
+            m.emit(.{ .kind = .greylisted, .p = m.keyPfx(e.key), .ttl_ms = ttl, .offense = e.offenses });
             m.reach.offense_greylist += 1;
         }
     }
 
     fn ban(m: *AgModel, ip: netaddr.Ip, now: u64) void {
         const i = m.touch(m.keyOf(ip), now) orelse return;
+        if (!m.ents[i].banned and !m.allowed(ip)) m.emit(.{ .kind = .banned, .p = m.keyPfx(m.ents[i].key) });
         m.ents[i].banned = true;
     }
 
-    fn unban(m: *AgModel, ip: netaddr.Ip) void {
+    fn unbanAll(m: *AgModel) void {
+        m.np = 0;
+        var i = m.n;
+        while (i > 0) {
+            i -= 1;
+            const e = &m.ents[i];
+            e.banned = false;
+            e.grey_until = 0;
+            e.strikes = 0;
+            e.offenses = 0;
+            if (e.live == 0) m.remove(i);
+        }
+        m.emit(.{ .kind = .all_cleared, .p = .{ .a = .{ .fam = 6 }, .bits = 0 } });
+        m.reach.unban_all += 1;
+    }
+
+    fn unban(m: *AgModel, ip: netaddr.Ip, now: u64) void {
         const i = m.find(m.keyOf(ip)) orelse return;
         const e = &m.ents[i];
+        if ((e.banned or now < e.grey_until) and !m.allowed(ip)) m.emit(.{ .kind = .unbanned, .p = m.keyPfx(e.key) });
         e.banned = false;
         e.grey_until = 0;
         e.strikes = 0;
@@ -2923,7 +3457,9 @@ const AgModel = struct {
 
     fn greylist(m: *AgModel, ip: netaddr.Ip, ttl_ms: ?u64, now: u64) void {
         const i = m.touch(m.keyOf(ip), now) orelse return;
-        m.ents[i].grey_until = now + (ttl_ms orelse m.cfg.ttl_ms) * ms;
+        const t = ttl_ms orelse m.cfg.ttl_ms;
+        m.ents[i].grey_until = now + t * ms;
+        if (!m.allowed(ip)) m.emit(.{ .kind = .greylisted, .p = m.keyPfx(m.ents[i].key), .ttl_ms = t });
     }
 
     fn banPrefix(m: *AgModel, p: netaddr.Prefix) error{TooManyPrefixBans}!void {
@@ -2932,6 +3468,7 @@ const AgModel = struct {
         if (m.np >= m.cfg.max_pfx) return error.TooManyPrefixBans;
         m.pfx[m.np] = c;
         m.np += 1;
+        m.emit(.{ .kind = .prefix_banned, .p = c });
     }
 
     fn unbanPrefix(m: *AgModel, p: netaddr.Prefix) bool {
@@ -2940,6 +3477,7 @@ const AgModel = struct {
             var j = i;
             while (j + 1 < m.np) : (j += 1) m.pfx[j] = m.pfx[j + 1];
             m.np -= 1;
+            m.emit(.{ .kind = .prefix_unbanned, .p = c });
             return true;
         };
         return false;
@@ -3072,7 +3610,8 @@ fn agCase(gpa: Allocator, seed: u64, reach: *AgReach) !void {
     const thr_c = [_]u32{ 1, 2, 3, 5 };
     const dec_c = [_]u64{ 0, 4, 7 };
     const after_c = [_]u32{ 0, 1, 2, 3 };
-    const cfg = AgCfg{
+    const growth_c = [_]u32{ 1, 1, 2, 3 };
+    var cfg = AgCfg{
         .max_per = per_c[rnd.uintLessThan(usize, per_c.len)],
         .max_total = tot_c[rnd.uintLessThan(usize, tot_c.len)],
         .ttl_ms = ttl_c[rnd.uintLessThan(usize, ttl_c.len)],
@@ -3085,9 +3624,15 @@ fn agCase(gpa: Allocator, seed: u64, reach: *AgReach) !void {
         .v6bits = if (rnd.boolean()) 64 else 128,
         .v4bits = if (rnd.boolean()) 32 else 24,
         .max_pfx = if (rnd.boolean()) 2 else 8,
+        .growth = growth_c[rnd.uintLessThan(usize, growth_c.len)],
+        .max_ttl_ms = null,
+        .dry = rnd.uintLessThan(u32, 4) == 0,
     };
+    // A ceiling is either absent or at least the base TTL (init asserts it).
+    if (rnd.boolean()) cfg.max_ttl_ms = cfg.ttl_ms * (1 + rnd.uintLessThan(u64, 5));
 
     var clk: TestClock = .{ .ns = .init(1_000_000_000 + rnd.uintLessThan(u64, 999_983)) };
+    var sink: AgEvSink = .{};
     const opts = Options{
         .max_conns_per_ip = cfg.max_per,
         .max_conns_total = cfg.max_total,
@@ -3102,6 +3647,10 @@ fn agCase(gpa: Allocator, seed: u64, reach: *AgReach) !void {
         .ipv4_key_bits = cfg.v4bits,
         .max_prefix_bans = cfg.max_pfx,
         .clock = clk.clock(),
+        .greylist_ttl_growth = cfg.growth,
+        .greylist_ttl_max_ms = cfg.max_ttl_ms,
+        .dry_run = cfg.dry,
+        .on_event = sink.hook(),
     };
     var g = Guard.init(gpa, opts);
     defer g.deinit();
@@ -3170,7 +3719,7 @@ fn agCase(gpa: Allocator, seed: u64, reach: *AgReach) !void {
             g.ban(ip);
         } else if (roll < 75) {
             op = "unban";
-            m.unban(ip);
+            m.unban(ip, now);
             g.unban(ip);
         } else if (roll < 79) {
             op = "greylist";
@@ -3199,7 +3748,11 @@ fn agCase(gpa: Allocator, seed: u64, reach: *AgReach) !void {
             const want = m.unbanPrefix(p);
             try testing.expectEqual(want, g.unbanPrefix(p));
             if (want) reach.unban_prefix_true += 1 else reach.unban_prefix_false += 1;
-        } else if (roll < 87) {
+        } else if (roll < 86) {
+            op = "unbanAll";
+            m.unbanAll();
+            g.unbanAll();
+        } else if (roll < 88) {
             op = "reconcile";
             const live = rnd.uintLessThan(u32, 4);
             m.reconcile(ip, live);
@@ -3237,6 +3790,11 @@ fn agCase(gpa: Allocator, seed: u64, reach: *AgReach) !void {
             reach.snapshot_checked += 1;
             if (try agSnapshotCheck(gpa, &g, &m, &univ, &clk, opts, now)) reach.restore_roundtrip += 1;
         }
+        try testing.expectEqual(m.nev, sink.n);
+        for (m.evs[0..m.nev], sink.evs[0..sink.n]) |want, got| try testing.expect(want.eql(AgEv.of(got)));
+        if (m.nev > 0) reach.event_checked += 1;
+        m.nev = 0;
+        sink.n = 0;
         try agAudit(&g, &m, &univ, clk.ns.load(.monotonic));
     }
 }
