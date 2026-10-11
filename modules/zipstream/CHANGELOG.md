@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — docs: SPEC backlog records a SUSPECTED std 0.16 `flate.Decompress` overflow panic on a deflate stream that ends mid-block at end of archive (found in websocket's inflate fuzzing); unverified here.
 - **2026-10-09** — tests: deterministic fuzz driver `ZIPSTREAM_FUZZ` over the existing harnesses (`archive`, plus `mutated`: an `ArchiveWriter` archive, damaged, because random octets never form a walkable central directory).
 - **2026-10-05** — **Fixes and behaviour changes** found by a Go archive/zip differential oracle
   (`tools/go_oracle/`, replayed by `src/go_oracle.zig`, re-taken by `zig build interop-zipstream`;

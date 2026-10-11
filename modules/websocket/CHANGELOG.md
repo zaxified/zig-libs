@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — **Feature: permessage-deflate (RFC 7692) and a `Conn` read/write loop** (scope
+  core → parity with coder/websocket). New `deflate` (offer/response grammar, `Compressor`, bounded
+  `inflate`; no context takeover both ways) and `conn` (`readMessage` with automatic pong, close
+  echo and failing close codes; `writeMessage` with masking and compression). Opt-in everywhere:
+  `ServerAcceptOptions.permessage_deflate`, `ClientRequestOptions.permessage_deflate`,
+  `verifyResponseWith`, `Connection.enableDeflate`. New fields with defaults (`ServerAccept.deflate`,
+  `ClientVerifyResult.deflate`, `Frame.rsv1`, `Header.rsv1`, `WriteOptions.compressed`) and new
+  functions (`parseFrameWith`, `parseHeaderWith`); existing calls behave byte for byte as before.
+  ⚠ Error sets grew: `frame.WriteError` + `CompressedNonDataFrame`, `Connection.Error` +
+  `InvalidCompressedData` (close 1007) — an exhaustive `switch` over either needs the new arm.
+  A std 0.16 `flate.Decompress` defect (an integer-overflow panic when its input ends with bits
+  already dropped, `tossBitsShort`) is kept out of reach by feeding the decoder zero padding
+  (`deflate.ZeroPadded`; found by `WEBSOCKET_FUZZ` `inflate`). Bench `zig build bench-websocket`
+  against coder/websocket.
 - **2026-10-09** — **SECURITY FIX (server DoS / stack overflow write):** `acceptHandshake`
   accepted any 24-character `Sec-WebSocket-Key` and decoded it into a 16-octet buffer; 24
   base64 characters without `==` padding decode to 18 octets, so a client could panic the

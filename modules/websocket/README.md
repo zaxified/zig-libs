@@ -62,7 +62,43 @@ const result = try websocket.handshake.verifyResponse(response_head, &key, &.{})
   within a frame that is still incomplete), and surfaces the close
   handshake: `close_received` is set automatically on receipt; `close_sent` is a plain field the
   caller sets itself after writing its own close frame (this module does no I/O, so it cannot see
-  that write); `bothClosed()` reflects both.
+  that write); `bothClosed()` reflects both. `enableDeflate(compressed_buf, window)` turns on
+  permessage-deflate receiving (RSV1 accepted on a message's first frame; the message is
+  decompressed into `message_buf`, whose length stays the cap — the decompression-bomb bound).
+- **`deflate`** — RFC 7692 permessage-deflate, **no context takeover in either direction** (the
+  gorilla/websocket mode, coder/websocket's `CompressionNoContextTakeover`): `selectOffer`
+  (server: first acceptable offer), `verifyResponse` (client), `response_value` / `offer_value`,
+  `Compressor.compressMessage` (sender; std flate, ~225 KiB, reusable across connections that do
+  not write at once), `inflate` (receiver; bounded by the output buffer, a back-reference before
+  the start of the message is an error). Turned on by `ServerAcceptOptions.permessage_deflate` /
+  `ClientRequestOptions.permessage_deflate` + `verifyResponseWith(.{ .permessage_deflate = true })`;
+  `ServerAccept.deflate` / `ClientVerifyResult.deflate` say whether it was agreed, and
+  `writeResponse`/`respond` then answer with the extension.
+  ⚠ A libc-free executable that sends compressed messages should install `fastmem`
+  (`fastmem.exportSymbols()` in its root): std 0.16's compressor memsets 96 KiB per message,
+  which Zig 0.16's own memset does a byte at a time (~30 µs per message).
+- **`conn`** — optional read/write loop over a `std.Io.Reader` + `std.Io.Writer`:
+  `Conn.init(role, reader, writer, message_buf, .{ .mask_random, .deflate })`,
+  `readMessage()` (answers pings, answers the peer's close and returns `error.Closed`, answers a
+  protocol error with its close code), `writeMessage(opcode, payload)` (masks on the client,
+  compresses messages ≥ `min_size` when deflate is on), `ping`, `close(code, reason)`.
+
+```zig
+// server with compression, after `acceptHandshake(head, .{ .permessage_deflate = true })`:
+var c: websocket.conn.Conn = .init(.server, reader, writer, &message_buf, .{
+    .deflate = if (accept.deflate != null) .{
+        .compressed_buf = &compressed_buf, .window = &window, // receiving
+        .compressor = &compressor, .out_buf = &out_buf, // sending
+    } else null,
+});
+while (true) {
+    const m = c.readMessage() catch |err| switch (err) {
+        error.Closed => break, // the peer's close was answered
+        else => return err,
+    };
+    try c.writeMessage(m.opcode, m.payload); // echo
+}
+```
 
 - **Role:** both (client + server). **Platform:** any. **Deps:** `http` (the handshake's
   `h1.RequestHead`/`ResponseHead` + `Header`), `std.crypto.hash.Sha1`, `std.base64`,
@@ -70,14 +106,18 @@ const result = try websocket.handshake.verifyResponse(response_head, &key, &.{})
   is single-owner if shared across calls (mutates its own fields, not thread-safe to share
   concurrently).
 
-Provenance: clean-room from RFC 6455 (The WebSocket Protocol). No third-party source consulted or
-copied.
+Provenance: written from RFC 6455 (The WebSocket Protocol) and RFC 7692 (permessage-deflate). No
+third-party source copied. For permessage-deflate, coder/websocket v1.8.15 (ISC) was read for its
+behaviour only: which offer parameters it accepts (`accept.go` `acceptDeflate`), and that it reads a
+missing end-of-data as the end of a message (`read.go`). Its behaviour was matched where the RFC
+leaves room; no code was taken.
 
 ## Verification
 
-`zig build test-websocket` — 104 offline tests, green in Debug + ReleaseFast: the RFC 6455 §1.3
+`zig build test-websocket` — 150 offline tests, green in Debug + ReleaseFast: the RFC 6455 §1.3
 handshake worked example and the §5.7 frame examples byte-exact (both parse and serialize),
 plus constructed Autobahn-style adversarial cases (unmasked-client/masked-server rejection,
 RSV/opcode/length-encoding/size-cap/fragmentation-sequencing/UTF-8 rejections, each with a
-positive control). See SPEC.md for the full security-rule rationale and what's deliberately out of
-scope (permessage-deflate).
+positive control), every RFC 7692 §7.2.3 example, and deterministic fuzz harnesses over the
+extension grammar, `inflate` and a deflate `Connection`. See SPEC.md for the full security-rule
+rationale and what's deliberately out of scope.

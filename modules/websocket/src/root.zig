@@ -12,16 +12,17 @@
 //! `http.h1.RequestHead`/`ResponseHead`; `frame` is the pure §5 wire codec
 //! (`parseFrame`/`writeFrame`); `connection` is a small optional state
 //! machine on top of `frame` that reassembles fragmented messages and
-//! tracks the closing handshake. See SPEC.md for the security rules
-//! (masking direction, size caps, UTF-8, RSV/opcode validation) and what's
-//! deliberately out of scope (permessage-deflate).
+//! tracks the closing handshake; `deflate` is RFC 7692 permessage-deflate;
+//! `conn` an optional read/write loop over a reader + writer. See SPEC.md for
+//! the security rules (masking direction, size caps, UTF-8, RSV/opcode
+//! validation, decompression bounds) and what's deliberately out of scope.
 
 const std = @import("std");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "RFC 6455 WebSocket — handshake + frame layer (masking, fragmentation, UTF-8 validation, size caps), transport-agnostic client + server; no permessage-deflate",
+    .doc = "RFC 6455 WebSocket — handshake + frame layer (masking, fragmentation, UTF-8 validation, size caps), transport-agnostic client + server; permessage-deflate (no context takeover) and an optional read/write loop",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -30,7 +31,7 @@ pub const meta = .{
     .platform = .any,
     .role = .both, // server (accept/parse-inbound-masked) + client (request/parse-inbound-unmasked)
     .concurrency = .reentrant, // no shared/global state; a `Connection` is single-owner if shared across calls
-    .model_after = "RFC 6455 (The WebSocket Protocol) §1.3/§4 handshake, §5 framing",
+    .model_after = "RFC 6455 (The WebSocket Protocol) §1.3/§4 handshake, §5 framing; RFC 7692 permessage-deflate",
     .deps = .{"http"}, // also uses std.crypto.hash.Sha1, std.base64, std.unicode
 };
 
@@ -49,6 +50,16 @@ pub const frame = @import("frame.zig");
 /// `connection.Connection`.
 pub const connection = @import("connection.zig");
 
+/// RFC 7692 permessage-deflate (no context takeover): the extension
+/// offer/response grammar, `Compressor` for sending and the bounded
+/// `inflate` that `Connection` uses once `enableDeflate` is called.
+pub const deflate = @import("deflate.zig");
+
+/// Optional read/write loop over a `std.Io.Reader` + `std.Io.Writer`:
+/// `Conn.readMessage` answers pings and the peer's close itself,
+/// `writeMessage` masks and compresses itself.
+pub const conn = @import("conn.zig");
+
 // Dark-tests aggregator: a bare `pub const`/`@import` re-export does NOT
 // pull a submodule's tests into the test binary — this reference does.
 //
@@ -61,4 +72,6 @@ test {
     _ = handshake;
     _ = frame;
     _ = connection;
+    _ = deflate;
+    _ = conn;
 }

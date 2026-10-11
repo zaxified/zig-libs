@@ -4,7 +4,8 @@
 //! adapter `testing.fuzz` feeds the harness through, and reach labels. The
 //! harness bodies and the driver tests live beside the corpora they share:
 //! `handshake.zig` (`response`, `response-mutated`, `request`, `request-mutated`),
-//! `frame.zig` (`frame`, `close`) and `connection.zig` (`connection`). A
+//! `frame.zig` (`frame`, `close`), `connection.zig` (`connection`) and
+//! `deflate.zig` (`extensions`, `inflate`, `deflate-connection`). A
 //! `-mutated` twin takes one corpus seed and flips a few octets, because
 //! random octets never parse as an HTTP head.
 //!
@@ -30,6 +31,15 @@ pub const Label = enum {
     conn_refused,
     conn_need_more,
     conn_event,
+    ext_offer_accepted,
+    ext_offer_declined,
+    ext_response_accepted,
+    ext_response_rejected,
+    inflate_ok,
+    inflate_too_large,
+    inflate_invalid,
+    deflate_conn_message,
+    deflate_conn_refused,
 };
 var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
 

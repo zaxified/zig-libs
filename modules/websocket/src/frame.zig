@@ -86,9 +86,11 @@ fn decodeOpcode(raw: u4) ?Opcode {
 /// connection correctly (§7.1.5/§7.4) without its own switch statement.
 pub const FrameError = error{
     /// An RSV bit is set with no extension negotiated to define it (§5.2:
-    /// "MUST be 0 unless an extension...defines meanings"). This module
-    /// negotiates no extensions (see SPEC.md), so any RSV bit is a
-    /// violation. Close 1002.
+    /// "MUST be 0 unless an extension...defines meanings"). RSV2/RSV3 are
+    /// always a violation; RSV1 is allowed only with
+    /// `ParseOptions.allow_rsv1` (permessage-deflate negotiated), and even
+    /// then only on the first frame of a data message (RFC 7692 §6.1: never
+    /// on a control or continuation frame). Close 1002.
     ReservedRsvBits,
     /// Opcode 0x3-0x7 or 0xB-0xF (§11.8: reserved for future use). Close
     /// 1002.
@@ -124,7 +126,7 @@ pub const FrameError = error{
 pub fn closeCode(err: anyerror) u16 {
     return switch (err) {
         error.FrameTooLarge, error.MessageTooLarge, error.TooManyFragments => 1009, // Message Too Big
-        error.InvalidUtf8 => 1007, // Invalid frame payload data
+        error.InvalidUtf8, error.InvalidCompressedData => 1007, // Invalid frame payload data
         error.InvalidCloseCode => 1002, // Protocol error
         else => 1002, // Protocol error (the default / everything else here)
     };
@@ -140,6 +142,10 @@ pub const Frame = struct {
     /// masking-direction rule was already enforced by the time this is
     /// returned; `payload` is always unmasked).
     masked: bool,
+    /// RSV1 — "Per-Message Compressed" (RFC 7692 §6) — on the first frame
+    /// of a data message. Only ever true when parsed with
+    /// `ParseOptions.allow_rsv1`; `payload` is then compressed data.
+    rsv1: bool = false,
     payload: []u8,
     /// Total bytes consumed from the input buffer (header + mask + payload).
     consumed: usize,
@@ -210,7 +216,20 @@ fn applyMaskScalarRef(payload: []u8, key: [4]u8) void {
 /// any payload bytes need to be present), so an oversized frame is
 /// rejected without waiting to buffer it.
 pub fn parseFrame(buf: []u8, role: Role, max_frame_size: u64) FrameError!ParseResult {
-    const h = switch (try parseHeader(buf, role, max_frame_size)) {
+    return parseFrameWith(buf, role, max_frame_size, .{});
+}
+
+/// What a negotiated extension changes in the frame checks.
+pub const ParseOptions = struct {
+    /// permessage-deflate was negotiated: RSV1 is allowed on a text or
+    /// binary frame (RFC 7692 §6). Still refused on control and
+    /// continuation frames (§6.1).
+    allow_rsv1: bool = false,
+};
+
+/// `parseFrame` with the checks a negotiated extension changes.
+pub fn parseFrameWith(buf: []u8, role: Role, max_frame_size: u64, opts: ParseOptions) FrameError!ParseResult {
+    const h = switch (try parseHeaderWith(buf, role, max_frame_size, opts)) {
         .need_more => return .need_more,
         .header => |h| h,
     };
@@ -225,6 +244,7 @@ pub fn parseFrame(buf: []u8, role: Role, max_frame_size: u64) FrameError!ParseRe
         .fin = h.fin,
         .opcode = h.opcode,
         .masked = h.mask_key != null,
+        .rsv1 = h.rsv1,
         .payload = payload,
         .consumed = total_usize,
     } };
@@ -238,6 +258,8 @@ pub fn parseFrame(buf: []u8, role: Role, max_frame_size: u64) FrameError!ParseRe
 pub const Header = struct {
     fin: bool,
     opcode: Opcode,
+    /// RSV1 (see `Frame.rsv1`); false unless `ParseOptions.allow_rsv1`.
+    rsv1: bool = false,
     /// Non-null iff the frame is masked. The payload bytes in the buffer
     /// are still masked — `parseHeader` does not touch them.
     mask_key: ?[4]u8,
@@ -257,6 +279,11 @@ pub const HeaderResult = union(enum) {
 /// masking direction, minimal length encoding, control-frame limits,
 /// `max_frame_size`). Never reads or modifies payload bytes.
 pub fn parseHeader(buf: []const u8, role: Role, max_frame_size: u64) FrameError!HeaderResult {
+    return parseHeaderWith(buf, role, max_frame_size, .{});
+}
+
+/// `parseHeader` with the checks a negotiated extension changes.
+pub fn parseHeaderWith(buf: []const u8, role: Role, max_frame_size: u64, opts: ParseOptions) FrameError!HeaderResult {
     if (buf.len < 2) return .need_more;
 
     const b0 = buf[0];
@@ -264,8 +291,14 @@ pub fn parseHeader(buf: []const u8, role: Role, max_frame_size: u64) FrameError!
 
     const fin = (b0 & 0x80) != 0;
     const rsv_bits = b0 & 0x70;
-    if (rsv_bits != 0) return error.ReservedRsvBits;
     const opcode = decodeOpcode(@truncate(b0 & 0x0f)) orelse return error.ReservedOpcode;
+    const rsv1 = rsv_bits == 0x40;
+    if (rsv_bits != 0) {
+        // RFC 7692 §6.1: RSV1 only with permessage-deflate, only on the
+        // first frame of a text/binary message.
+        if (!rsv1 or !opts.allow_rsv1) return error.ReservedRsvBits;
+        if (opcode != .text and opcode != .binary) return error.ReservedRsvBits;
+    }
 
     const masked = (b1 & 0x80) != 0;
     switch (role) {
@@ -308,6 +341,7 @@ pub fn parseHeader(buf: []const u8, role: Role, max_frame_size: u64) FrameError!
     return .{ .header = .{
         .fin = fin,
         .opcode = opcode,
+        .rsv1 = rsv1,
         .mask_key = mask_key,
         .len = @intCast(header_len),
         .payload_len = payload_len,
@@ -322,6 +356,11 @@ pub const WriteOptions = struct {
     opcode: Opcode,
     payload: []const u8,
     mask_key: ?[4]u8 = null,
+    /// Set RSV1, "Per-Message Compressed" (RFC 7692 §6): `payload` is
+    /// permessage-deflate data (`deflate.Compressor.compressMessage`). Only
+    /// on the first frame of a text/binary message; refused on control and
+    /// continuation frames.
+    compressed: bool = false,
 };
 
 /// What `writeFrame` can fail with: the writer's own error, or a control
@@ -334,6 +373,8 @@ pub const WriteError = std.Io.Writer.Error || error{
     FragmentedControlFrame,
     /// A control frame with a payload over 125 bytes (§5.5).
     ControlFrameTooLarge,
+    /// `compressed` on a control or continuation frame (RFC 7692 §6.1).
+    CompressedNonDataFrame,
 };
 
 /// Serialize one frame to `w`. A control frame that breaks §5.5 (`fin`
@@ -349,8 +390,11 @@ pub fn writeFrame(w: *std.Io.Writer, opts: WriteOptions) WriteError!void {
         if (opts.payload.len > 125) return error.ControlFrameTooLarge;
     }
 
+    if (opts.compressed and opts.opcode != .text and opts.opcode != .binary) return error.CompressedNonDataFrame;
+
     var b0: u8 = @intFromEnum(opts.opcode);
     if (opts.fin) b0 |= 0x80;
+    if (opts.compressed) b0 |= 0x40;
     try w.writeByte(b0);
 
     const len = opts.payload.len;

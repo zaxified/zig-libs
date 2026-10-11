@@ -10,6 +10,7 @@
 const std = @import("std");
 const http = @import("http");
 const h1 = http.h1;
+const deflate = @import("deflate.zig");
 
 /// RFC 6455 §1.3: fixed GUID concatenated onto the client's key before
 /// hashing. Not a secret — it exists only to make the accept value
@@ -63,11 +64,12 @@ pub const HandshakeError = error{
     UnexpectedSubprotocol,
     /// (Client side) the response carried a `Sec-WebSocket-Extensions`
     /// header naming an extension the client never offered (§4.1 point 5:
-    /// "the client MUST _Fail the WebSocket Connection_"). This module
-    /// never offers any extension (see SPEC.md — no `Sec-WebSocket-
-    /// Extensions` is ever sent by `writeRequest`), so *any* value in the
-    /// response's `Sec-WebSocket-Extensions` header is by definition one
-    /// the client did not ask for.
+    /// "the client MUST _Fail the WebSocket Connection_"). Without
+    /// `ClientVerifyOptions.permessage_deflate` nothing was offered, so any
+    /// value is one the client did not ask for; with it, anything but an
+    /// acceptance of the offer `deflate.verifyResponse` describes (a
+    /// parameter not offered, `server_no_context_takeover` missing, a second
+    /// extension, a malformed value) is this error too.
     UnexpectedExtension,
     /// (Client side) `Sec-WebSocket-Accept` is missing or does not match
     /// the value computed from the key the client sent (§4.1 point 9) —
@@ -184,6 +186,12 @@ pub const ServerAcceptOptions = struct {
     /// a list is given, so a real deployment doesn't get quietly widened by
     /// forgetting the request wasn't actually cross-site.
     origins: []const []const u8 = &.{},
+    /// Accept a permessage-deflate offer (RFC 7692) when the client makes
+    /// one this module can honour — see `deflate.selectOffer`. Off by
+    /// default (coder/websocket's default too): compression costs CPU and
+    /// ~225 KiB of `deflate.Compressor` per concurrent writer, and pays off
+    /// only for compressible messages.
+    permessage_deflate: bool = false,
 };
 
 pub const ServerAccept = struct {
@@ -191,7 +199,30 @@ pub const ServerAccept = struct {
     accept_key: [28]u8,
     /// The negotiated subprotocol (borrows `options.protocols`), or null.
     protocol: ?[]const u8,
+    /// Non-null when permessage-deflate was accepted: the response then
+    /// names it (`writeResponse`/`respond`), and the caller turns it on with
+    /// `Connection.enableDeflate` and may compress what it sends.
+    deflate: ?deflate.Params = null,
 };
+
+/// At most this many `Sec-WebSocket-Extensions` field lines are read from
+/// one handshake; more is refused like any other unreasonable header block
+/// (`DuplicateHeader` on the server side is not right here — the field is a
+/// list and may legitimately repeat — so the server then declines every
+/// extension and the client fails with `UnexpectedExtension`).
+const max_extension_lines = 8;
+
+fn extensionLines(it_in: h1.HeaderIterator, out: *[max_extension_lines][]const u8) ?[]const []const u8 {
+    var it = it_in;
+    var n: usize = 0;
+    while (it.next()) |e| {
+        if (!std.ascii.eqlIgnoreCase(e.name, "sec-websocket-extensions")) continue;
+        if (n == out.len) return null;
+        out[n] = e.value;
+        n += 1;
+    }
+    return out[0..n];
+}
 
 /// Validate a client's upgrade request (§4.2.1) and compute the response
 /// fields. Does not write anything — pass the result to `writeResponse`.
@@ -233,7 +264,13 @@ pub fn acceptHandshake(head: h1.RequestHead, options: ServerAcceptOptions) Hands
         }
     }
 
-    return .{ .accept_key = computeAcceptKey(key), .protocol = protocol };
+    var negotiated: ?deflate.Params = null;
+    if (options.permessage_deflate) {
+        var lines: [max_extension_lines][]const u8 = undefined;
+        if (extensionLines(head.iterate(), &lines)) |values| negotiated = deflate.selectOffer(values);
+    }
+
+    return .{ .accept_key = computeAcceptKey(key), .protocol = protocol, .deflate = negotiated };
 }
 
 /// How many header fields named `name` (case-insensitive) appear in `head`.
@@ -312,6 +349,9 @@ pub fn writeResponse(w: *std.Io.Writer, accept: ServerAccept) std.Io.Writer.Erro
         try w.writeAll(p);
         try w.writeAll("\r\n");
     }
+    if (accept.deflate != null) {
+        try w.writeAll("Sec-WebSocket-Extensions: " ++ deflate.response_value ++ "\r\n");
+    }
     try w.writeAll("\r\n");
 }
 
@@ -337,6 +377,10 @@ pub fn respond(rw: *http.Server.ResponseWriter, accept: ServerAccept) http.Serve
     };
     if (accept.protocol) |p| rw.setHeader("Sec-WebSocket-Protocol", p) catch |err| return switch (err) {
         error.InvalidHeader => error.InvalidHeader,
+        else => |e| e,
+    };
+    if (accept.deflate != null) rw.setHeader("Sec-WebSocket-Extensions", deflate.response_value) catch |err| return switch (err) {
+        error.InvalidHeader => unreachable, // a constant, valid field value
         else => |e| e,
     };
     return rw.upgrade("websocket");
@@ -370,6 +414,9 @@ pub const ClientRequestOptions = struct {
     /// Additional headers to send verbatim (e.g. `Origin`, cookies,
     /// bearer auth) after the required WebSocket headers.
     extra_headers: []const http.Header = &.{},
+    /// Offer permessage-deflate (`deflate.offer_value`). Pass the same flag
+    /// to `verifyResponseWith`.
+    permessage_deflate: bool = false,
 };
 
 /// W3-websocket-F2: every `ClientRequestOptions` field used to go onto the
@@ -415,6 +462,7 @@ pub fn writeRequest(w: *std.Io.Writer, options: ClientRequestOptions) (std.Io.Wr
         }
         try w.writeAll("\r\n");
     }
+    if (options.permessage_deflate) try w.writeAll("Sec-WebSocket-Extensions: " ++ deflate.offer_value ++ "\r\n");
     for (options.extra_headers) |h| {
         try w.print("{s}: {s}\r\n", .{ h.name, h.value });
     }
@@ -424,6 +472,16 @@ pub fn writeRequest(w: *std.Io.Writer, options: ClientRequestOptions) (std.Io.Wr
 pub const ClientVerifyResult = struct {
     /// The subprotocol the server selected, or null.
     protocol: ?[]const u8,
+    /// Non-null when the server accepted the permessage-deflate offer.
+    deflate: ?deflate.Params = null,
+};
+
+pub const ClientVerifyOptions = struct {
+    /// The subprotocols the request offered.
+    protocols: []const []const u8 = &.{},
+    /// The request offered permessage-deflate
+    /// (`ClientRequestOptions.permessage_deflate`).
+    permessage_deflate: bool = false,
 };
 
 /// Verify a server's `101` response against the `key` the client sent and
@@ -432,6 +490,12 @@ pub const ClientVerifyResult = struct {
 /// handshake's core integrity check (a transparent proxy or cache that
 /// mangled/replayed the response is caught here).
 pub fn verifyResponse(head: h1.ResponseHead, key: []const u8, offered_protocols: []const []const u8) HandshakeError!ClientVerifyResult {
+    return verifyResponseWith(head, key, .{ .protocols = offered_protocols });
+}
+
+/// `verifyResponse` for a request that may have offered an extension.
+pub fn verifyResponseWith(head: h1.ResponseHead, key: []const u8, options: ClientVerifyOptions) HandshakeError!ClientVerifyResult {
+    const offered_protocols = options.protocols;
     if (head.status != 101) return error.UnexpectedStatus;
 
     // W3-websocket-F3: `verifyResponse` had no duplicate-header check at
@@ -462,7 +526,14 @@ pub fn verifyResponse(head: h1.ResponseHead, key: []const u8, offered_protocols:
     // never offered. This module never offers one (SPEC.md: "no extension
     // negotiation of any kind is implemented"), so any value here is
     // unrequested by construction.
-    if (head.header("sec-websocket-extensions") != null) return error.UnexpectedExtension;
+    var negotiated: ?deflate.Params = null;
+    if (!options.permessage_deflate) {
+        if (head.header("sec-websocket-extensions") != null) return error.UnexpectedExtension;
+    } else {
+        var lines: [max_extension_lines][]const u8 = undefined;
+        const values = extensionLines(head.iterate(), &lines) orelse return error.UnexpectedExtension;
+        negotiated = deflate.verifyResponse(values) catch return error.UnexpectedExtension;
+    }
 
     var protocol: ?[]const u8 = null;
     if (head.header("sec-websocket-protocol")) |p| {
@@ -478,7 +549,7 @@ pub fn verifyResponse(head: h1.ResponseHead, key: []const u8, offered_protocols:
         if (!matched) return error.UnexpectedSubprotocol;
         protocol = p;
     }
-    return .{ .protocol = protocol };
+    return .{ .protocol = protocol, .deflate = negotiated };
 }
 
 /// How many header fields named `name` (case-insensitive) appear in `head`.
@@ -1267,4 +1338,74 @@ test "subprotocols match exactly on the client: a differently-cased answer fails
     try testing.expectError(error.UnexpectedSubprotocol, verifyResponse(try h1.ResponseHead.parse(resp), key, &.{"chat"}));
     const ok = try std.fmt.bufPrint(&buf, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Protocol: chat\r\n\r\n", .{&accept});
     try testing.expectEqualStrings("chat", (try verifyResponse(try h1.ResponseHead.parse(ok), key, &.{"chat"})).protocol.?);
+}
+
+// ── permessage-deflate negotiation (RFC 7692) ─────────────────────────────
+
+fn deflateRequest(comptime ext_lines: []const u8) []const u8 {
+    return "GET /chat HTTP/1.1\r\n" ++
+        "Host: server.example.com\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++ ext_lines;
+}
+
+test "deflate handshake: server accepts a browser offer only when enabled, and says so in the response" {
+    const head = try h1.RequestHead.parse(deflateRequest("Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n"));
+    const off = try acceptHandshake(head, .{});
+    try testing.expectEqual(@as(?deflate.Params, null), off.deflate);
+    const on = try acceptHandshake(head, .{ .permessage_deflate = true });
+    try testing.expect(on.deflate != null);
+
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    try writeResponse(&out, on);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+            "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n",
+        out.buffered(),
+    );
+    out.end = 0;
+    try writeResponse(&out, off);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "Extensions") == null);
+
+    // Offers spread over two header lines; the first is declined.
+    const two = try h1.RequestHead.parse(deflateRequest(
+        "Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=9\r\n" ++
+            "Sec-WebSocket-Extensions: permessage-deflate\r\n",
+    ));
+    try testing.expect((try acceptHandshake(two, .{ .permessage_deflate = true })).deflate != null);
+    // No acceptable offer: the handshake still succeeds, without the extension.
+    const none = try h1.RequestHead.parse(deflateRequest("Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=9\r\n"));
+    try testing.expectEqual(@as(?deflate.Params, null), (try acceptHandshake(none, .{ .permessage_deflate = true })).deflate);
+}
+
+test "deflate handshake: client offer and response verification" {
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    var req_buf: [512]u8 = undefined;
+    var req: std.Io.Writer = .fixed(&req_buf);
+    try writeRequest(&req, .{ .host = "h", .key = key, .permessage_deflate = true });
+    try testing.expect(std.mem.indexOf(u8, req.buffered(), "\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n") != null);
+
+    // Our own server's acceptance.
+    var resp_buf: [512]u8 = undefined;
+    var resp: std.Io.Writer = .fixed(&resp_buf);
+    try writeResponse(&resp, .{ .accept_key = computeAcceptKey(key), .protocol = null, .deflate = .{} });
+    const head = try h1.ResponseHead.parse(resp.buffered());
+    try testing.expect((try verifyResponseWith(head, key, .{ .permessage_deflate = true })).deflate != null);
+    // The same response to a client that did not offer: refused, as before.
+    try testing.expectError(error.UnexpectedExtension, verifyResponse(head, key, &.{}));
+
+    // A server that declined: no header, no extension.
+    resp.end = 0;
+    try writeResponse(&resp, .{ .accept_key = computeAcceptKey(key), .protocol = null });
+    const plain = try h1.ResponseHead.parse(resp.buffered());
+    try testing.expectEqual(@as(?deflate.Params, null), (try verifyResponseWith(plain, key, .{ .permessage_deflate = true })).deflate);
+
+    // A server that kept context takeover for itself: refused.
+    const bad = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n", .{computeAcceptKey(key)});
+    defer testing.allocator.free(bad);
+    try testing.expectError(error.UnexpectedExtension, verifyResponseWith(try h1.ResponseHead.parse(bad), key, .{ .permessage_deflate = true }));
 }

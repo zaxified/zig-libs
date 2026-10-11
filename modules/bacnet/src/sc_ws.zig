@@ -202,8 +202,9 @@ pub fn writeMessage(
     }) catch |err| switch (err) {
         error.WriteFailed => return error.WriteFailed,
         // `writeFrame` refuses only control frames that break RFC 6455
-        // §5.5; this is always one complete binary frame.
-        error.FragmentedControlFrame, error.ControlFrameTooLarge => unreachable,
+        // §5.5 and a `compressed` non-data frame (RFC 7692 §6.1); this is
+        // always one complete, uncompressed binary frame.
+        error.FragmentedControlFrame, error.ControlFrameTooLarge, error.CompressedNonDataFrame => unreachable,
     };
 }
 

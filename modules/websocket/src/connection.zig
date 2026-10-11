@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const frame = @import("frame.zig");
+const deflate = @import("deflate.zig");
 
 /// Incremental (streaming) UTF-8 validator (RFC 6455 §8.1/§5.6, "Fail-fast
 /// UTF-8 across fragments" — found by qap's Autobahn lane, 2026-09-26; fixed
@@ -86,7 +87,16 @@ pub const IncrementalUtf8 = struct {
         var i: usize = 0;
         while (i < bytes.len) {
             if (self.remaining == 0) {
-                // Fast path: a run of ASCII bytes needs no state at all.
+                // Fast path: a run of ASCII bytes needs no state at all;
+                // 32 at a time, then one by one up to the first non-ASCII
+                // (byte-at-a-time made a fragmented 4 KiB text message
+                // 1.2x coder's read, which does not validate at all).
+                const V = @Vector(32, u8);
+                while (i + 32 <= bytes.len) {
+                    const chunk: V = bytes[i..][0..32].*;
+                    if (@reduce(.Or, chunk >= @as(V, @splat(0x80)))) break;
+                    i += 32;
+                }
                 while (i < bytes.len and bytes[i] < 0x80) i += 1;
                 if (i >= bytes.len) break;
             }
@@ -194,6 +204,25 @@ pub const Connection = struct {
     /// into a text frame that has not fully arrived yet `receive` has
     /// already checked (see `checkPartialText`).
     partial_text: PartialText = .{},
+    /// permessage-deflate (RFC 7692), set by `enableDeflate` once the
+    /// handshake negotiated it: RSV1 is then accepted on the first frame of
+    /// a text/binary message, and such a message is decompressed into
+    /// `message_buf` (whose length stays the cap on the PLAIN message — the
+    /// decompression-bomb bound). This buffer holds the compressed bytes of
+    /// one message (every fragment's, concatenated) plus
+    /// `deflate.inflate_tail.len` bytes the decoder needs after them; its
+    /// length is therefore the cap on the COMPRESSED message
+    /// (`error.MessageTooLarge`, close 1009). null = not negotiated.
+    compressed_buf: ?[]u8 = null,
+    compressed_len: usize = 0,
+    /// The decoder's window (`deflate.Window`, 64 KiB), set with
+    /// `compressed_buf`; used only inside `receive`, so connections that
+    /// never receive concurrently may share one.
+    inflate_window: ?*deflate.Window = null,
+    /// The fragmented message in progress is compressed (its first frame
+    /// had RSV1): continuations go to `compressed_buf`, and UTF-8 is checked
+    /// once, after decompression.
+    fragment_compressed: bool = false,
 
     /// The part of an incomplete text (or text-continuation) frame that
     /// `receive` has already run through UTF-8 validation, so a caller that
@@ -217,6 +246,16 @@ pub const Connection = struct {
 
     pub fn init(role: frame.Role, message_buf: []u8, max_frame_size: u64) Connection {
         return .{ .role = role, .max_frame_size = max_frame_size, .message_buf = message_buf };
+    }
+
+    /// Turn on permessage-deflate receiving after the handshake agreed on it
+    /// (`ServerAccept.deflate` / `ClientVerifyResult.deflate` non-null). See
+    /// `compressed_buf` for what `buf` holds and bounds; it must be longer
+    /// than `deflate.inflate_tail.len`.
+    pub fn enableDeflate(self: *Connection, buf: []u8, window: *deflate.Window) void {
+        std.debug.assert(buf.len > deflate.inflate_tail.len);
+        self.compressed_buf = buf;
+        self.inflate_window = window;
     }
 
     pub const Message = struct { opcode: frame.Opcode, payload: []const u8 };
@@ -277,6 +316,10 @@ pub const Connection = struct {
         /// was already set. Close 1002 (falls through `closeCode`'s
         /// default, same as `DataAfterClose`).
         TooManyFramesAfterClose,
+        /// A permessage-deflate message that does not decompress: not
+        /// DEFLATE, a back-reference before the start of the message (no
+        /// context takeover), or bytes after a final block. Close 1007.
+        InvalidCompressedData,
     };
 
     /// Feed the next available bytes. Consumes at most one frame per call
@@ -304,8 +347,11 @@ pub const Connection = struct {
             self.fragment_count = 0;
             self.text_utf8 = .{};
             self.partial_text = .{};
+            self.compressed_len = 0;
+            self.fragment_compressed = false;
         }
-        const parsed = switch (try frame.parseFrame(buf, self.role, self.max_frame_size)) {
+        const parse_opts: frame.ParseOptions = .{ .allow_rsv1 = self.compressed_buf != null };
+        const parsed = switch (try frame.parseFrameWith(buf, self.role, self.max_frame_size, parse_opts)) {
             .need_more => {
                 try self.checkPartialText(buf);
                 return .{ .event = .need_more, .consumed = 0 };
@@ -353,6 +399,15 @@ pub const Connection = struct {
                 const start_opcode = self.fragment_opcode orelse return error.InvalidFragmentation;
                 self.fragment_count += 1;
                 if (self.fragment_count > self.max_fragments) return error.TooManyFragments;
+                if (self.fragment_compressed) {
+                    try self.appendCompressed(parsed.payload);
+                    if (!parsed.fin) return .{ .event = .frame_consumed, .consumed = parsed.consumed };
+                    self.fragment_opcode = null;
+                    self.fragment_count = 0;
+                    self.fragment_compressed = false;
+                    const payload = try self.inflateMessage(start_opcode);
+                    return .{ .event = .{ .message = .{ .opcode = start_opcode, .payload = payload } }, .consumed = parsed.consumed };
+                }
                 // Fed BEFORE `appendFragment`, so an invalid byte anywhere in
                 // THIS fragment's payload fails this call -- the whole point
                 // of "fail-fast across fragments" -- rather than after the
@@ -381,6 +436,18 @@ pub const Connection = struct {
             },
             .text, .binary => {
                 if (self.fragment_opcode != null) return error.InvalidFragmentation;
+                if (parsed.rsv1) {
+                    self.compressed_len = 0;
+                    try self.appendCompressed(parsed.payload);
+                    if (parsed.fin) {
+                        const payload = try self.inflateMessage(parsed.opcode);
+                        return .{ .event = .{ .message = .{ .opcode = parsed.opcode, .payload = payload } }, .consumed = parsed.consumed };
+                    }
+                    self.fragment_opcode = parsed.opcode;
+                    self.fragment_count = 1;
+                    self.fragment_compressed = true;
+                    return .{ .event = .frame_consumed, .consumed = parsed.consumed };
+                }
                 if (parsed.fin) {
                     // The cap is the caller's memory budget, so it has to apply
                     // to a one-frame message too — the doc comment on
@@ -432,11 +499,15 @@ pub const Connection = struct {
     /// after close) are left to that check, so the error they fail with
     /// does not change.
     fn checkPartialText(self: *Connection, buf: []const u8) Error!void {
-        const h = switch (try frame.parseHeader(buf, self.role, self.max_frame_size)) {
+        const parse_opts: frame.ParseOptions = .{ .allow_rsv1 = self.compressed_buf != null };
+        const h = switch (try frame.parseHeaderWith(buf, self.role, self.max_frame_size, parse_opts)) {
             .need_more => return,
             .header => |h| h,
         };
         if (self.close_received) return;
+        // Compressed bytes are not text; the message is checked once it is
+        // decompressed.
+        if (h.rsv1 or (h.opcode == .continuation and self.fragment_compressed)) return;
         const start: IncrementalUtf8 = switch (h.opcode) {
             .text => if (self.fragment_opcode == null) .{} else return,
             .continuation => if (self.fragment_opcode == .text) self.text_utf8 else return,
@@ -470,6 +541,28 @@ pub const Connection = struct {
             try p.utf8.feed(bytes);
             p.checked += n;
         }
+    }
+
+    fn appendCompressed(self: *Connection, payload: []const u8) Error!void {
+        const cbuf = self.compressed_buf.?;
+        if (self.compressed_len + payload.len + deflate.inflate_tail.len > cbuf.len) return error.MessageTooLarge;
+        @memcpy(cbuf[self.compressed_len..][0..payload.len], payload);
+        self.compressed_len += payload.len;
+    }
+
+    /// Decompress the message collected in `compressed_buf` into
+    /// `message_buf` and check a text message's UTF-8 (the same validator
+    /// as every other path).
+    fn inflateMessage(self: *Connection, opcode: frame.Opcode) Error![]const u8 {
+        const len = self.compressed_len;
+        self.compressed_len = 0;
+        const payload = try deflate.inflate(self.compressed_buf.?, len, self.message_buf, self.inflate_window.?);
+        if (opcode == .text) {
+            var v: IncrementalUtf8 = .{};
+            try v.feed(payload);
+            try v.finish();
+        }
+        return payload;
     }
 
     fn appendFragment(self: *Connection, payload: []const u8) Error!void {
@@ -1662,4 +1755,149 @@ test "corpus: every client seed reaches Connection.receive, and reassembly/close
     try testing.expectEqual(@as(usize, 1), data_after_close); // seed 7, second frame
     try testing.expectEqual(@as(usize, 1), too_many_fragments); // seed 10
     try testing.expectEqual(@as(usize, 1), need_mores); // seed 8
+}
+
+// ── permessage-deflate (RFC 7692) ────────────────────────────────────────
+
+var test_window: deflate.Window = undefined;
+
+test "deflate: RFC 7692 7.2.3.1 frames -- one compressed frame, and the same split 3+4" {
+    var msg: [64]u8 = undefined;
+    var cbuf: [64]u8 = undefined;
+    var conn: Connection = .init(.client, &msg, 1 << 20);
+    conn.enableDeflate(&cbuf, &test_window);
+    var one = [_]u8{ 0xc1, 0x07, 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 };
+    const r = try conn.receive(&one);
+    try testing.expectEqual(one.len, r.consumed);
+    try testing.expectEqual(frame.Opcode.text, r.event.message.opcode);
+    try testing.expectEqualStrings("Hello", r.event.message.payload);
+
+    var f1 = [_]u8{ 0x41, 0x03, 0xf2, 0x48, 0xcd };
+    var f2 = [_]u8{ 0x80, 0x04, 0xc9, 0xc9, 0x07, 0x00 };
+    try testing.expect((try conn.receive(&f1)).event == .frame_consumed);
+    try testing.expectEqualStrings("Hello", (try conn.receive(&f2)).event.message.payload);
+
+    // 7.2.3.3: a stored block, payload length 11 -- the RFC's text says 7.
+    var stored = [_]u8{ 0xc1, 0x0b, 0x00, 0x05, 0x00, 0xfa, 0xff, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x00 };
+    try testing.expectEqualStrings("Hello", (try conn.receive(&stored)).event.message.payload);
+}
+
+test "deflate: RSV1 refused without enableDeflate, on continuation and control frames, and RSV2/RSV3 always" {
+    var msg: [64]u8 = undefined;
+    var cbuf: [64]u8 = undefined;
+    var plain: Connection = .init(.client, &msg, 1 << 20);
+    var one = [_]u8{ 0xc1, 0x07, 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 };
+    try testing.expectError(error.ReservedRsvBits, plain.receive(&one));
+
+    var conn: Connection = .init(.client, &msg, 1 << 20);
+    conn.enableDeflate(&cbuf, &test_window);
+    var f1 = [_]u8{ 0x41, 0x03, 0xf2, 0x48, 0xcd };
+    var f2_rsv1 = [_]u8{ 0xc0, 0x04, 0xc9, 0xc9, 0x07, 0x00 };
+    try testing.expect((try conn.receive(&f1)).event == .frame_consumed);
+    try testing.expectError(error.ReservedRsvBits, conn.receive(&f2_rsv1));
+    var ping_rsv1 = [_]u8{ 0xc9, 0x00 };
+    try testing.expectError(error.ReservedRsvBits, conn.receive(&ping_rsv1));
+    var rsv2 = [_]u8{ 0xa1, 0x00 };
+    try testing.expectError(error.ReservedRsvBits, conn.receive(&rsv2));
+    var rsv13 = [_]u8{ 0xd1, 0x00 };
+    try testing.expectError(error.ReservedRsvBits, conn.receive(&rsv13));
+    // Positive control: an uncompressed message on a deflate connection.
+    var hello = [_]u8{ 0x81, 0x05, 'H', 'e', 'l', 'l', 'o' };
+    try testing.expectEqualStrings("Hello", (try conn.receive(&hello)).event.message.payload);
+}
+
+test "deflate: decompressed text is UTF-8-checked; caps on the plain and the compressed size" {
+    const gpa = testing.allocator;
+    const comp = try gpa.create(deflate.Compressor);
+    defer gpa.destroy(comp);
+    var out: [600]u8 = undefined;
+
+    var msg: [300]u8 = undefined;
+    var cbuf: [64]u8 = undefined;
+    var conn: Connection = .init(.client, &msg, 1 << 20);
+    conn.enableDeflate(&cbuf, &test_window);
+
+    var wire: [700]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&wire);
+
+    // Invalid UTF-8 inside compressed text: 1007 after decompression.
+    const bad = "ok \xff" ** 40;
+    try frame.writeFrame(&w, .{ .opcode = .text, .payload = comp.compressMessage(bad, &out, 6).?, .compressed = true });
+    try testing.expectError(error.InvalidUtf8, conn.receive(w.buffered()));
+    // ...the same bytes as binary are fine.
+    w.end = 0;
+    try frame.writeFrame(&w, .{ .opcode = .binary, .payload = comp.compressMessage(bad, &out, 6).?, .compressed = true });
+    try testing.expectEqualSlices(u8, bad, (try conn.receive(w.buffered())).event.message.payload);
+
+    // 400 plain bytes into a 300-byte message buffer: 1009.
+    w.end = 0;
+    try frame.writeFrame(&w, .{ .opcode = .text, .payload = comp.compressMessage("a" ** 400, &out, 6).?, .compressed = true });
+    try testing.expectError(error.MessageTooLarge, conn.receive(w.buffered()));
+    try testing.expectEqual(@as(u16, 1009), frame.closeCode(error.MessageTooLarge));
+
+    // Compressed bytes over compressed_buf (64 - 9 tail bytes): 1009 too.
+    var noise: [200]u8 = undefined;
+    var prng: std.Random.DefaultPrng = .init(1);
+    for (&noise) |*b| b.* = 'a' + prng.random().uintLessThan(u8, 26);
+    const z = comp.compressMessage(&noise, &out, 6).?;
+    try testing.expect(z.len > 64 - deflate.inflate_tail.len);
+    w.end = 0;
+    try frame.writeFrame(&w, .{ .opcode = .text, .payload = z, .compressed = true });
+    try testing.expectError(error.MessageTooLarge, conn.receive(w.buffered()));
+
+    // Garbage: 1007.
+    var garbage = [_]u8{ 0xc2, 0x02, 0xff, 0xff };
+    try testing.expectError(error.InvalidCompressedData, conn.receive(&garbage));
+    try testing.expectEqual(@as(u16, 1007), frame.closeCode(error.InvalidCompressedData));
+
+    // After all those errors the connection still reads a good message.
+    w.end = 0;
+    try frame.writeFrame(&w, .{ .opcode = .text, .payload = comp.compressMessage("x" ** 250, &out, 6).?, .compressed = true });
+    try testing.expectEqualStrings("x" ** 250, (try conn.receive(w.buffered())).event.message.payload);
+}
+
+test "deflate: masked client frames, fragmented, with a ping in the middle" {
+    const gpa = testing.allocator;
+    const comp = try gpa.create(deflate.Compressor);
+    defer gpa.destroy(comp);
+    var out: [2048]u8 = undefined;
+    const text = "{\"op\":\"update\",\"id\":17,\"value\":\"hello\"}" ** 20;
+    const z = comp.compressMessage(text, &out, 1).?;
+    try testing.expect(z.len < text.len / 4);
+
+    var wire: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&wire);
+    const key: [4]u8 = .{ 0x37, 0xfa, 0x21, 0x3d };
+    const third = z.len / 3;
+    try frame.writeFrame(&w, .{ .fin = false, .opcode = .text, .payload = z[0..third], .mask_key = key, .compressed = true });
+    try frame.writeFrame(&w, .{ .opcode = .ping, .payload = "p", .mask_key = key });
+    try frame.writeFrame(&w, .{ .fin = false, .opcode = .continuation, .payload = z[third .. 2 * third], .mask_key = key });
+    try frame.writeFrame(&w, .{ .opcode = .continuation, .payload = z[2 * third ..], .mask_key = key });
+
+    var msg: [1024]u8 = undefined;
+    var cbuf: [1024]u8 = undefined;
+    var conn: Connection = .init(.server, &msg, 1 << 20);
+    conn.enableDeflate(&cbuf, &test_window);
+    var buf = w.buffered();
+    var events: [4]std.meta.Tag(Connection.Event) = undefined;
+    var got: []const u8 = "";
+    for (&events) |*e| {
+        const r = try conn.receive(buf);
+        e.* = r.event;
+        if (r.event == .message) got = r.event.message.payload;
+        buf = buf[r.consumed..];
+    }
+    try testing.expectEqual(@as(usize, 0), buf.len);
+    try testing.expectEqualSlices(std.meta.Tag(Connection.Event), &.{ .frame_consumed, .ping, .frame_consumed, .message }, &events);
+    try testing.expectEqualStrings(text, got);
+}
+
+test "deflate: writeFrame refuses compressed control and continuation frames" {
+    var wire: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&wire);
+    try testing.expectError(error.CompressedNonDataFrame, frame.writeFrame(&w, .{ .opcode = .ping, .payload = "", .compressed = true }));
+    try testing.expectError(error.CompressedNonDataFrame, frame.writeFrame(&w, .{ .opcode = .continuation, .payload = "", .compressed = true }));
+    try testing.expectEqual(@as(usize, 0), w.end);
+    try frame.writeFrame(&w, .{ .opcode = .text, .payload = &.{ 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 }, .compressed = true });
+    try testing.expectEqualSlices(u8, &.{ 0xc1, 0x07, 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 }, w.buffered()); // RFC 7692 7.2.3.1
 }

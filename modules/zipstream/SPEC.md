@@ -176,6 +176,17 @@ output clamped to the declared size, `toUnix` month 0 / second 60 / 2100-02-29 /
 65 535 written entries with the 65 536th refused, and the writer masking type bits off `mode`.
 
 ## Backlog / deferred
+
+- **SUSPECTED (unverified, 2026-10-11): std 0.16 `flate.Decompress` overflow panic reachable from a
+  crafted archive.** `tossBitsShort` checks `bufferedLen()*8 + consumed_bits` where it needs `-`, so
+  on input that ends inside a block the next `peekBitsEnding` computes `left.len * 8 -
+  consumed_bits` with `left.len == 0` -- an integer-overflow panic in safe builds. Found by
+  websocket's `WEBSOCKET_FUZZ` `inflate` (see websocket SPEC "permessage-deflate", workaround
+  `deflate.ZeroPadded`). Here the decoder reads the file reader past the entry's data, so the end
+  of input is the end of the archive: reachable when a malformed last entry's deflate stream runs
+  through the central directory to EOF. ZIPSTREAM_FUZZ did not find it (its inputs rarely end
+  mid-block). To do: a test with a truncated deflate stream at end of file; if it panics, feed the
+  decoder a zero-padded reader limited to `compressed_size`, as websocket does.
 zip64 **writing** (`ArchiveWriter` is classic-format only — zip64 reading is fully supported, see
 "Design & invariants"; not worth the extra-field/EOCD64 bookkeeping until a real >4 GiB or
 >65535-entry write use case shows up); encrypted entries (no consumer needs authoring/reading
