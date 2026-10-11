@@ -635,17 +635,75 @@ pub fn decodePostField(alloc: std.mem.Allocator, field: []const u8) DecodeError!
 pub fn decodeRedirectField(alloc: std.mem.Allocator, field: []const u8) DecodeError![]u8 {
     const deflated = try decodePostField(alloc, field);
     defer alloc.free(deflated);
-    var in = std.Io.Reader.fixed(deflated);
+    // Not `Reader.fixed`: std 0.16's `flate.Decompress` reaches `unreachable`
+    // when its input ends inside a block (`tossBitsShort` adds
+    // `consumed_bits` where it must subtract) -- one truncated GET parameter
+    // aborted the process. The decoder gets zeros past the end instead and
+    // the field is refused if it consumed any (same as websocket's
+    // `deflate.ZeroPadded`). The buffer is a copy with room for the
+    // decoder's 4-byte peeks even on a 1-byte field; the padding overwrites
+    // only bytes the decoder has already taken.
+    const buf = try alloc.alloc(u8, deflated.len + 8);
+    defer alloc.free(buf);
+    @memcpy(buf[0..deflated.len], deflated);
+    var in: ZeroPadded = .{ .reader = .{ .vtable = &ZeroPadded.vtable, .buffer = buf, .seek = 0, .end = deflated.len } };
     var window: [std.compress.flate.max_window_len]u8 = undefined;
-    var dc = std.compress.flate.Decompress.init(&in, .raw, &window);
+    var dc = std.compress.flate.Decompress.init(&in.reader, .raw, &window);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     dc.reader.appendRemaining(alloc, &out, .limited(max_redirect_inflated)) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidEncoding,
     };
+    // How much of the field the decoder took; more than it holds means the
+    // stream ended in the padding, i.e. the field was cut short.
+    if (deflated.len + in.padded - (in.reader.end - in.reader.seek) > deflated.len) return error.InvalidEncoding;
     return out.toOwnedSlice(alloc);
 }
+
+/// `deflated`, then zero bytes for as long as the decoder asks (see
+/// `decodeRedirectField`). Zero bits cannot keep the decoder busy: they end
+/// a fixed block at once, open a stored block whose LEN/NLEN (0/0)
+/// mismatch, or decode symbols that each write output, which
+/// `max_redirect_inflated` bounds.
+const ZeroPadded = struct {
+    reader: std.Io.Reader,
+    /// Zero bytes handed out beyond the input.
+    padded: usize = 0,
+
+    const vtable: std.Io.Reader.VTable = .{
+        .stream = stream,
+        .readVec = readVec,
+        .rebase = std.Io.Reader.defaultRebase,
+    };
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *ZeroPadded = @fieldParentPtr("reader", r);
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        @memset(dest, 0);
+        w.advance(dest.len);
+        self.padded += dest.len;
+        return dest.len;
+    }
+
+    fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        _ = data; // allowed: fill `buffer` instead and return 0
+        const self: *ZeroPadded = @fieldParentPtr("reader", r);
+        if (r.end == r.buffer.len) {
+            // Full: keep the unread bytes at the front, or a fully consumed
+            // buffer has no room and the caller loops for ever.
+            const unread = r.buffer[r.seek..r.end];
+            @memmove(r.buffer[0..unread.len], unread);
+            r.seek = 0;
+            r.end = unread.len;
+        }
+        const room = r.buffer[r.end..];
+        @memset(room, 0);
+        r.end += room.len;
+        self.padded += room.len;
+        return 0;
+    }
+};
 
 // ── entry points ─────────────────────────────────────────────────────────────
 
@@ -3859,6 +3917,33 @@ test "decodeRedirectField: raw-DEFLATE + base64 round-trips" {
     const decoded = try decodeRedirectField(alloc, field);
     defer alloc.free(decoded);
     try testing.expectEqualStrings(msg, decoded);
+}
+
+test "decodeRedirectField: a DEFLATE stream cut short is a typed error, not a std flate panic" {
+    // std 0.16 `flate.Decompress` reaches `unreachable` (`tossBitsShort`)
+    // when its input ends inside a block; every prefix of a real stream.
+    const alloc = testing.allocator;
+    var msg: [1200]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = "<samlp:AuthnRequest ID=\"_"[i % 25] ^ @as(u8, @truncate(i *% 2654435761 >> 13 & 1));
+    var aw = try std.Io.Writer.Allocating.initCapacity(alloc, 256);
+    defer aw.deinit();
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var comp = try std.compress.flate.Compress.init(&aw.writer, &window, .raw, .default);
+    try comp.writer.writeAll(&msg);
+    try comp.finish();
+    const deflated = aw.writer.buffered();
+
+    const enc = std.base64.standard.Encoder;
+    const b64 = try alloc.alloc(u8, enc.calcSize(deflated.len));
+    defer alloc.free(b64);
+    for (1..deflated.len) |n| {
+        const field = enc.encode(b64, deflated[0..n]);
+        if (decodeRedirectField(alloc, field)) |decoded| {
+            defer alloc.free(decoded);
+            // Only the final block's tail bits lost: the right message.
+            try testing.expectEqualStrings(&msg, decoded);
+        } else |err| try testing.expectEqual(error.InvalidEncoding, err);
+    }
 }
 
 test "decodeRedirectField: malformed base64/inflate is a typed error" {

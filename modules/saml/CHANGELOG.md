@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — **Fix (remote abort):** `decodeRedirectField` on a raw-DEFLATE field cut short
+  inside a block aborted the process (std 0.16 `flate.Decompress` reaches `unreachable` in
+  `tossBits` via `tossBitsShort`; any proper prefix of a real stream does it, so one truncated
+  `SAMLRequest`/`SAMLResponse` query parameter was enough). The decoder now reads the field and then
+  zeros, and the field is `error.InvalidEncoding` if the stream ended in the padding. Test: every
+  prefix of a 1.2 KB stream. The `fields` fuzz harness never produced such an input.
+
 - **2026-10-09** — tests: deterministic fuzz driver `SAML_FUZZ` over the existing harnesses (`fields`, `idp`) plus a new `consume` harness: the genuinely signed fixture is accepted, a damaged one refused (or accepted only with the genuine identity).
 - **2026-10-09** — **BREAKING:** dead-stack pass (`check-secret-api`). `Config.sp_decrypt_key` and `LogoutRequestConfig.sp_decrypt_key` are now `?*const rsa.SecretKey` (were `?rsa.SecretKey` by value: the 11.8 KiB key was copied into every options struct and every frame it passed through) — migrate with `cfg.sp_decrypt_key = &key`; the key must outlive the call (same shape as `SigningKey`). `consumeResponse`, `consumeResponseXml`, `consumeLogoutRequest` and `consumeLogoutRequestXml` now run under a 128 KiB burn (`src/burn.zig`), so the decrypted assertion / NameID / attribute data and the key schedule do not stay on the dead stack. New `src/stackprobe2_test.zig` (testkit.stackprobe, ReleaseFast) probes all four.
 
