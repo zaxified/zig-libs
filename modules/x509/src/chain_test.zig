@@ -206,20 +206,40 @@ fn rfc822Blob(comptime name: []const u8) [4 + name.len]u8 {
     return buf;
 }
 
-test "checkNameConstraints: an excluded rfc822Name constraint fails closed (audit F3)" {
-    // rfc822Name/URI matching is not implemented; an EXCLUDED constraint of such
-    // a type must reject any SAN of that type rather than silently pass (the old
-    // fail-open let an excluded email/URI SAN through).
+test "checkNameConstraints: rfc822Name constraints are evaluated (was fail-closed, audit F3)" {
+    // Until 2026-10-11 rfc822Name had no matching rule and every excluded or
+    // permitted constraint of the type rejected (audit F3 closed the old
+    // fail-open). Now matched by the domain rule, as Go (probe O-email).
     const excluded_tree = rfc822Blob("evil.example.com");
     const excluded = [_][]const u8{&excluded_tree};
     const permitted = [_][]const u8{};
 
     const san = rfc822Blob("user@evil.example.com");
     try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&permitted, &excluded, "dn", &san));
-    // Even an rfc822 SAN not lexically under the excluded base is rejected — we
-    // cannot evaluate the match, so we fail closed.
+    const sub = rfc822Blob("user@a.evil.example.com");
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&permitted, &excluded, "dn", &sub));
     const san2 = rfc822Blob("user@other.com");
-    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&permitted, &excluded, "dn", &san2));
+    try chain_mod.checkNameConstraints(&permitted, &excluded, "dn", &san2);
+    // A mailbox the rule cannot read still fails closed against the excluded set.
+    const quoted = rfc822Blob("a b@other.com");
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&permitted, &excluded, "dn", &quoted));
+    // ... and is not admitted by a permitted one.
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&excluded, &permitted, "dn", &quoted));
+    try chain_mod.checkNameConstraints(&excluded, &permitted, "dn", &san);
+}
+
+test "checkNameConstraints: a type with no matching rule (otherName) still fails closed" {
+    // GeneralSubtree { base [0] otherName { OID 1.2.3, [0] { UTF8String "x" } } }
+    const other_tree = [_]u8{ 0x30, 0x0c, 0xa0, 0x0a, 0x06, 0x02, 0x2a, 0x03, 0xa0, 0x04, 0x0c, 0x02, 'x', 'y' };
+    const excluded = [_][]const u8{&other_tree};
+    const none = [_][]const u8{};
+    // SAN: the same otherName.
+    const san = [_]u8{ 0x30, 0x0c, 0xa0, 0x0a, 0x06, 0x02, 0x2a, 0x03, 0xa0, 0x04, 0x0c, 0x02, 'x', 'y' };
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&none, &excluded, "dn", &san));
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&excluded, &none, "dn", &san));
+    // A certificate without a name of that type is not affected.
+    const dns = generalNamesWithDns("example.org");
+    try chain_mod.checkNameConstraints(&none, &excluded, "dn", &dns);
 }
 
 test "checkNameConstraints: dNSName label-suffix match, default-deny once a permitted set exists" {

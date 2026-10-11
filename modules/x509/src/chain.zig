@@ -30,22 +30,16 @@
 //! (`crl.checkRevocation`, RFC 5280 §6.3; see `Revocation`). Fetching stays the
 //! caller's; OCSP is the sibling `ocsp` module and is not wired in here.
 //!
+//! **Go `Verify` parity (2026-10-11).** Name constraints of every RFC type
+//! (`names.zig`), SAN-only hostname matching (`hostname.zig`), certificate
+//! policies (`policy.zig`), refusal of unhandled critical and repeated
+//! extensions, trust-anchor validity, SHA-1 refusal, Go's `KeyUsages` list,
+//! a constraint-comparison budget — each pinned against Go 1.26 through the
+//! replayed corpus in `s2_oracle_test.zig`; options and differences in
+//! SPEC.md § "Go Verify parity".
+//!
 //! **Out of scope, by design, not silently skipped:** OCSP in the path
-//! (a separate online data-fetching concern) and certificate policy
-//! processing (§6.1.5's explicit-policy /
-//! policy-mapping state machine — most TLS/mTLS/OPC-UA deployments don't
-//! rely on policy OIDs). A consumer needing either must add it explicitly.
-//! `rfc822Name`/`uniformResourceIdentifier`/other `GeneralName` types are
-//! recognized by `checkNameConstraints` but have no matching rule implemented
-//! (only `dNSName`, `directoryName`, `iPAddress` per RFC 5280 §4.2.1.10). A
-//! constraint of one of those types therefore fails **closed**, on both sides:
-//! an excluded subtree of an unmatchable type rejects any certificate bearing
-//! a name of that type (this module cannot prove the name lies outside it),
-//! and a permitted subtree rejects by the same per-type default-deny. The
-//! consequence is a false REJECT, not a bypass — a CA carrying an rfc822Name
-//! constraint turns away every subordinate certificate with an rfc822Name SAN,
-//! including one squarely inside the permitted subtree. Flagged here and in
-//! SPEC.md.
+//! (a separate online data-fetching concern; the sibling `ocsp` module).
 
 const std = @import("std");
 const Certificate = std.crypto.Certificate;
@@ -57,6 +51,9 @@ const p521 = @import("p521");
 const p256 = @import("p256");
 const crl = @import("crl.zig");
 const safe = @import("safe.zig");
+const names = @import("names.zig");
+const hostname = @import("hostname.zig");
+const policy = @import("policy.zig");
 
 /// One certificate's DER bytes. A bare `[]const u8` alias rather than a
 /// wrapper struct: every std/rsa API in this collection that touches a
@@ -69,9 +66,9 @@ pub const Options = struct {
     /// (RFC 5280 §6.1.3 (a)(2)). Caller-supplied rather than read from a
     /// clock — this module does no I/O of its own (`meta.role = .util`).
     now_sec: i64,
-    /// When set, the leaf certificate's subject/SAN must match this hostname
-    /// (delegates to `std.crypto.Certificate.Parsed.verifyHostName`, already
-    /// implemented and RFC 6125-tested by std — not reimplemented here).
+    /// When set, the leaf's subjectAltName must cover this host — a DNS name,
+    /// or an IP address (IPv6 optionally in brackets). `hostname.verify`:
+    /// RFC 9525 / Go `VerifyHostname` rules, never the subject commonName.
     expected_host: ?[]const u8 = null,
     /// When set, the leaf certificate's `extKeyUsage` (if present at all)
     /// must list this purpose or `anyExtendedKeyUsage` (RFC 5280 §4.2.1.12).
@@ -88,6 +85,52 @@ pub const Options = struct {
     /// path. `null` (the default) checks nothing — revocation is opt-in and the
     /// call behaves exactly as it did before this field existed.
     revocation: ?Revocation = null,
+    /// Check the trust anchor's own notBefore/notAfter against `now_sec`, as
+    /// Go ("CurrentTime is used to check the validity of all certificates in
+    /// the chain") and OpenSSL do. An expired root in the store then fails the
+    /// path through it (`CertificateExpired`/`CertificateNotYetValid`, or
+    /// `NoTrustedPath` when another same-subject candidate also failed) instead
+    /// of vouching for a chain past its own lifetime. `false` restores the
+    /// RFC 5280 §6.1.1 reading, where the anchor is trusted input with no window.
+    check_anchor_validity: bool = true,
+    /// Accept certificate signatures made with SHA-1 (`sha1WithRSAEncryption`,
+    /// RSASSA-PSS over SHA-1). Off by default, as in Go ("Certificates that use
+    /// SHA1WithRSA and ECDSAWithSHA1 signatures are not supported") and OpenSSL
+    /// at security level ≥ 1: SHA-1 collisions are practical (SHAttered, 2017;
+    /// chosen-prefix 2020), and a chosen-prefix collision forges a CA
+    /// certificate. A trust anchor's self-signature is never verified, so a
+    /// SHA-1 self-signed root still works. On only for legacy closed PKIs.
+    allow_sha1_signatures: bool = false,
+    /// Go's `VerifyOptions.KeyUsages`: the path is accepted when it permits ANY
+    /// of these purposes, and EKU is enforced nested — every certificate that
+    /// carries `extKeyUsage` (leaf, intermediates, anchor) narrows the set to
+    /// what it lists itself (`anyExtendedKeyUsage` narrows nothing); an empty
+    /// result is `ExtendedKeyUsageMismatch`. Listing `.any_extended_key_usage`
+    /// here accepts every path. `required_eku`, if also set, is one more member.
+    /// Empty (the default) with `required_eku == null` checks no EKU at all —
+    /// a deliberate difference from Go, whose default is serverAuth: this
+    /// module is protocol-agnostic (OPC-UA, IEC 62351 leaves need no EKU).
+    usages_any_of: []const extensions.Purpose = &.{},
+    /// Cap on (name, constraint) comparisons over the whole path's
+    /// nameConstraints check (Go's `MaxConstraintComparisions`); past it the
+    /// call fails with `TooManyConstraints`. A certificate is bounded only by
+    /// its size, and N SAN entries against M accumulated subtrees cost N·M:
+    /// a few thousand of each fit in a 64 KiB post-quantum certificate.
+    max_constraint_comparisons: u64 = 250_000,
+    /// Critical extensions to accept in addition to
+    /// `extensions.handled_critical_oids` (OID content bytes, e.g.
+    /// `&.{ 0x2b, 0x06, 0x01, 0x04, 0x01, … }`), for a caller that processes
+    /// them itself — Go's equivalent is clearing `UnhandledCriticalExtensions`
+    /// before `Verify`. Every certificate on the path, anchor included, is
+    /// checked; an unknown critical extension anywhere else is
+    /// `UnhandledCriticalExtension`, a repeated extension `DuplicateExtension`.
+    ignore_critical_oids: []const []const u8 = &.{},
+    /// Certificate policy processing (RFC 5280 §6.1, `policy.zig`). Always
+    /// on, as in Go: with the defaults no particular policy is asked for,
+    /// but a CA's requireExplicitPolicy / inhibitPolicyMapping /
+    /// inhibitAnyPolicy is enforced. `acceptable` is Go's
+    /// `CertificatePolicies`.
+    policy: policy.Options = .{},
 };
 
 /// Revocation policy for `verifyChain` (`Options.revocation`). Every link the
@@ -186,16 +229,24 @@ pub const VerifyChainError = error{
     /// includes this whole set, but `crl.checkRevocation` never returns
     /// either of these two.)
     RevocationStatusUnknown,
+    /// A certificate in the path is signed with SHA-1 and
+    /// `Options.allow_sha1_signatures` is off.
+    WeakSignatureAlgorithm,
+    /// Checking nameConstraints would take more than
+    /// `Options.max_constraint_comparisons` comparisons.
+    TooManyConstraints,
 } ||
     std.mem.Allocator.Error ||
     Certificate.ParseError ||
     Certificate.Parsed.VerifyError ||
-    Certificate.Parsed.VerifyHostNameError ||
+    hostname.Error ||
     extensions.FindExtensionsError ||
     extensions.ParseBasicConstraintsError ||
     extensions.ParseKeyUsageError ||
     extensions.ParseExtKeyUsageError ||
     extensions.ParseNameConstraintsError ||
+    extensions.HygieneError ||
+    policy.Error ||
     rsa.PublicKey.FromDerError;
 
 /// Top-level RFC 5280 §6.1 path-validation entry point. `chain` is the
@@ -212,16 +263,16 @@ pub const VerifyChainError = error{
 /// same-subject-DN candidates on failure — see `buildPath`'s doc comment).
 /// Once a path exists, this function makes two more passes over it:
 /// `checkPathLength` leaf-to-anchor (pathLenConstraint bookkeeping) and
-/// `checkNameConstraints`/`checkExtendedKeyUsage` anchor-to-leaf
-/// (accumulated name constraints and EKU chaining). Finally `expected_host`,
-/// if set, is checked via `Parsed.verifyHostName`, and the leaf is parsed via
+/// `checkNameConstraints`/`policy.check`/`checkExtendedKeyUsage`
+/// anchor-to-leaf (accumulated name constraints, certificate policies, EKU
+/// chaining), and the leaf's extension hygiene. Finally `expected_host`, if
+/// set, is checked by `hostname.verify`, and the leaf is parsed via
 /// `std.crypto.Certificate.parse` for `VerifiedChain.leaf`.
 ///
 /// A leaf whose algorithm std cannot name (RSASSA-PSS, ML-DSA, SLH-DSA) no longer
 /// fails the whole call the way it did before `algorithm.zig` existed: it is
-/// verified like any other, `VerifiedChain.leaf` is `null`, and the hostname
-/// check runs against `hostNameView` — this module's own walk of the two name
-/// fields `verifyHostName` reads — so it is neither skipped nor weakened.
+/// verified like any other and `VerifiedChain.leaf` is `null`; the hostname
+/// check reads the SAN itself, the same for every algorithm.
 ///
 /// With `opts.revocation` set, revocation is checked inside `buildPath`, per
 /// link, right after that link's signature and CA checks (see `Revocation`);
@@ -237,6 +288,48 @@ pub fn verifyChain(
 
     const path = try buildPath(gpa, chain, trust_anchors, opts);
     defer gpa.free(path);
+    return checkBuiltPath(gpa, path, opts);
+}
+
+/// `verifyChain`'s result plus the path it verified — Go's `Verify` returns
+/// the chain; a caller that logs, pins or staples per intermediate needs to
+/// know which of the presented (or stored) certificates were used. One path,
+/// the first the depth-first search completes, not every valid one.
+pub const VerifiedPath = struct {
+    summary: VerifiedChain,
+    /// Leaf first, trust anchor last. The slice is owned (`deinit`); its
+    /// elements borrow the caller's `chain`/`trust_anchors` buffers.
+    certs: []const CertDer,
+
+    pub fn deinit(p: *VerifiedPath, gpa: std.mem.Allocator) void {
+        gpa.free(p.certs);
+        p.* = undefined;
+    }
+};
+
+/// `verifyChain` that also returns the verified path (`VerifiedPath`).
+pub fn verifyChainPath(
+    gpa: std.mem.Allocator,
+    chain: []const CertDer,
+    trust_anchors: []const CertDer,
+    opts: Options,
+) VerifyChainError!VerifiedPath {
+    if (chain.len == 0) return error.EmptyChain;
+
+    const path = try buildPath(gpa, chain, trust_anchors, opts);
+    defer gpa.free(path);
+    const summary = try checkBuiltPath(gpa, path, opts);
+    const certs = try gpa.alloc(CertDer, path.len);
+    for (path, certs) |entry, *c| c.* = entry.der;
+    return .{ .summary = summary, .certs = certs };
+}
+
+/// The passes `verifyChain` runs once `buildPath` has a path (see there).
+fn checkBuiltPath(gpa: std.mem.Allocator, path: []const PathEntry, opts: Options) VerifyChainError!VerifiedChain {
+    // RFC 5280 §4.2 / §6.1.4 (o): no repeated extension, no critical one
+    // this module would silently not enforce. The CAs were checked as
+    // candidates in `acceptCandidate`, so a bad one could be backtracked over.
+    try extensions.checkHygiene(.{ .buffer = path[0].der, .index = 0 }, opts.ignore_critical_oids);
 
     // RFC 5280 §6.1.4 (h)/(i)/(l): pathLenConstraint, leaf-to-anchor order,
     // with the self-issued-certificate exception. `path[1..]` is every CA
@@ -257,6 +350,7 @@ pub fn verifyChain(
         defer permitted.deinit(gpa);
         var excluded: std.ArrayList([]const u8) = .empty;
         defer excluded.deinit(gpa);
+        var budget: u64 = opts.max_constraint_comparisons;
 
         var i: usize = path.len;
         while (i > 0) {
@@ -264,7 +358,7 @@ pub fn verifyChain(
             const entry = path[i];
             const shape = try parseShape(.{ .buffer = entry.der, .index = 0 });
             const san = try findSan(entry.der);
-            try checkNameConstraints(permitted.items, excluded.items, shape.subject, san);
+            try checkNameConstraintsBudget(permitted.items, excluded.items, shape.subject, san, &budget);
             if (i != 0) {
                 // Every non-leaf path entry is a CA (buildPath already
                 // required this) — its own nameConstraints, if any, apply
@@ -278,6 +372,15 @@ pub fn verifyChain(
         }
     }
 
+    // RFC 5280 §6.1.3 (d)–(f), §6.1.4 (a)/(b)/(h)–(j), §6.1.5: policies,
+    // anchor-to-leaf without the anchor itself.
+    {
+        const top_down = try gpa.alloc([]const u8, path.len - 1);
+        defer gpa.free(top_down);
+        for (top_down, 0..) |*c, k| c.* = path[path.len - 2 - k].der;
+        try policy.check(gpa, top_down, opts.policy);
+    }
+
     // RFC 5280 §4.2.1.12-adjacent EKU chaining, plus the leaf's own
     // required-purpose check.
     {
@@ -285,24 +388,25 @@ pub fn verifyChain(
         defer gpa.free(eku_list);
         for (path[1..], 0..) |entry, idx| eku_list[idx] = try findEku(entry.der);
         const leaf_eku = try findEku(path[0].der);
-        try checkExtendedKeyUsage(eku_list, leaf_eku, opts.required_eku);
+        if (opts.usages_any_of.len == 0) {
+            try checkExtendedKeyUsage(eku_list, leaf_eku, opts.required_eku);
+        } else {
+            var wanted: PurposeSet = .initEmpty();
+            for (opts.usages_any_of) |u| wanted.insert(u);
+            if (opts.required_eku) |r| wanted.insert(r);
+            try checkExtendedKeyUsageAnyOf(eku_list, leaf_eku, wanted);
+        }
     }
 
     const leaf_cert: Certificate = .{ .buffer = path[0].der, .index = 0 };
     const leaf_shape = try parseShape(leaf_cert);
-    // std can parse most leaves; for the ones it cannot name at all, the
-    // hostname check runs against a `Parsed` synthesized from this module's
-    // own walk. `verifyHostName` reads only the two name fields, and
-    // `synthesizeParsed` fills both from the certificate — so the check is
-    // the same check, not a weakened one.
+    // Own walk of the SAN, the same for every leaf algorithm (std cannot
+    // parse PSS/ML-DSA/SLH-DSA leaves) and without std's commonName fallback.
+    if (opts.expected_host) |host| try hostname.verify(path[0].der, host);
     const leaf_parsed: ?Certificate.Parsed = leaf_cert.parse() catch |err| switch (err) {
         error.CertificateHasUnrecognizedObjectId => null,
         else => |e| return e,
     };
-    if (opts.expected_host) |host| {
-        const for_host = leaf_parsed orelse try hostNameView(leaf_cert, leaf_shape);
-        try for_host.verifyHostName(host);
-    }
 
     return .{
         .depth = @intCast(path.len - 1),
@@ -466,8 +570,19 @@ fn acceptCandidate(
     depth: u32,
     path: *std.ArrayList(PathEntry),
 ) VerifyChainError!void {
-    try verifyLink(cur_der, cand.der, opts.now_sec);
-    try checkIsCaSigner(cand.der);
+    try verifyLink(cur_der, cand.der, opts.now_sec, opts.allow_sha1_signatures);
+    // A v1 certificate cannot carry basicConstraints; as a trust anchor it is
+    // the caller's configuration, and Go and OpenSSL both trust one (probe
+    // O-roots, 2026-10-11). A v3 anchor must still be a CA.
+    if (!(cand.is_anchor and try isV1(cand.der))) try checkIsCaSigner(cand.der);
+    try extensions.checkHygiene(.{ .buffer = cand.der, .index = 0 }, opts.ignore_critical_oids);
+    if (cand.is_anchor and opts.check_anchor_validity) {
+        // Every other certificate's window is checked as the subject of its
+        // link (`verifyLink`); the anchor is never a subject, so it is here.
+        const anchor_shape = try parseShape(.{ .buffer = cand.der, .index = 0 });
+        if (opts.now_sec < anchor_shape.not_before) return error.CertificateNotYetValid;
+        if (opts.now_sec > anchor_shape.not_after) return error.CertificateExpired;
+    }
     if (opts.revocation) |rev| {
         if (rev.scope == .full_chain or depth == 0) try checkRevocation(rev, opts.now_sec, trust_anchors, cur_der, cand.der);
     }
@@ -523,6 +638,13 @@ fn checkRevocation(
     if (!have_good and rev.unknown == .reject) return error.RevocationStatusUnknown;
 }
 
+fn isV1(cert_der: CertDer) Certificate.ParseError!bool {
+    const certificate = try extensions.parseElement(cert_der, 0);
+    const tbs = try extensions.parseElement(cert_der, certificate.slice.start);
+    const version_elem = try extensions.parseElement(cert_der, tbs.slice.start);
+    return try Certificate.parseVersion(cert_der, version_elem) == .v1;
+}
+
 /// Verifies that `cand_der` is a certificate authority eligible to sign
 /// another certificate: `basicConstraints.cA` (RFC 5280 §4.2.1.9) must be
 /// true, and if `keyUsage` is present, `keyCertSign` must be asserted (RFC
@@ -552,8 +674,9 @@ fn checkIsCaSigner(cand_der: CertDer) VerifyChainError!void {
 /// chain where an intermediate is PSS-signed by the root but itself signs
 /// the leaf with a std-supported algorithm, the leaf link needs exactly
 /// this fallback).
-fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64) VerifyChainError!void {
+fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64, allow_sha1: bool) VerifyChainError!void {
     const subject_shape = try parseShape(.{ .buffer = subject_der, .index = 0 });
+    if (!allow_sha1 and try signedWithSha1(subject_shape)) return error.WeakSignatureAlgorithm;
 
     if (algorithm.MlDsa.map.get(subject_shape.sig_alg_oid) != null) {
         return verifyMlDsaLink(subject_der, issuer_der, now_sec);
@@ -587,6 +710,19 @@ fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64) VerifyCha
     };
 
     try verifyParsed(subject_parsed, issuer_parsed, now_sec);
+}
+
+const oid_sha1_with_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05 };
+
+/// Whether a certificate's own signature uses SHA-1: PKCS#1 v1.5
+/// `sha1WithRSAEncryption`, or RSASSA-PSS whose hash is SHA-1 — including the
+/// RFC 4055 all-defaults parameters. `ecdsa-with-SHA1` needs no case: neither
+/// std's table nor `algorithm.zig` names it, so it never verifies at all.
+fn signedWithSha1(shape: Shape) ParsePssParamsError!bool {
+    if (std.mem.eql(u8, shape.sig_alg_oid, &oid_sha1_with_rsa)) return true;
+    if (Certificate.AlgorithmCategory.map.get(shape.sig_alg_oid) == .rsassa_pss)
+        return (try parsePssParams(shape.sig_alg_params)).hash == .sha1;
+    return false;
 }
 
 /// `std.crypto.Certificate.Parsed.verify`, check for check and error for
@@ -1172,80 +1308,6 @@ fn partialIssuerParsed(cert: Certificate, shape: Shape) error{CertificateSignatu
     };
 }
 
-/// A `Certificate.Parsed` carrying ONLY what `Parsed.verifyHostName` reads:
-/// the certificate buffer, the subject DN, the commonName attribute inside
-/// it, and the raw `subjectAltName` extnValue. For a leaf whose algorithm
-/// `Certificate.parse` refuses to name (RSASSA-PSS, ML-DSA), this is how the
-/// hostname check still runs against the real fields instead of being
-/// skipped — skipping it would be a fail-open hole exactly where a
-/// post-quantum deployment would first notice it.
-///
-/// Every other field is an inert placeholder, so this value must never be
-/// handed to `Parsed.verify` (`partialIssuerParsed` exists for that, and
-/// refuses rather than placeholder an algorithm it cannot name). It does not
-/// escape this file.
-fn hostNameView(cert: Certificate, shape: Shape) VerifyChainError!Certificate.Parsed {
-    return .{
-        .certificate = cert,
-        .issuer_slice = shape.issuer_slice,
-        .subject_slice = shape.subject_slice,
-        .common_name_slice = try findCommonNameSlice(cert, shape.subject_slice),
-        .subject_alt_name_slice = try findSanSlice(cert),
-        .signature_slice = der.Element.Slice.empty,
-        .signature_algorithm = .sha256WithRSAEncryption,
-        .pub_key_algo = .rsaEncryption,
-        .pub_key_slice = shape.pub_key_slice,
-        .message_slice = der.Element.Slice.empty,
-        .validity = .{ .not_before = shape.not_before, .not_after = shape.not_after },
-        .version = .v3,
-    };
-}
-
-/// The `commonName` AttributeTypeAndValue inside an already-located subject
-/// `RDNSequence`, as offsets into the certificate. Mirrors the walk
-/// `std.crypto.Certificate.parse` performs over the same bytes (RDNSequence
-/// -> RelativeDistinguishedName SET -> AttributeTypeAndValue SEQUENCE), and
-/// like std keeps the LAST commonName when a DN carries several. An empty
-/// slice when there is none — `verifyHostName` then has nothing to fall back
-/// on and rejects, which is the fail-closed direction.
-fn findCommonNameSlice(cert: Certificate, subject_slice: der.Element.Slice) VerifyChainError!der.Element.Slice {
-    const bytes = cert.buffer;
-    var common_name = der.Element.Slice.empty;
-    var name_i = subject_slice.start;
-    while (name_i < subject_slice.end) {
-        const rdn = try extensions.parseElement(bytes, name_i);
-        name_i = rdn.slice.end;
-        var rdn_i = rdn.slice.start;
-        while (rdn_i < rdn.slice.end) {
-            const atav = try extensions.parseElement(bytes, rdn_i);
-            rdn_i = atav.slice.end;
-            var atav_i = atav.slice.start;
-            while (atav_i < atav.slice.end) {
-                const ty_elem = try extensions.parseElement(bytes, atav_i);
-                const val = try extensions.parseElement(bytes, ty_elem.slice.end);
-                atav_i = val.slice.end;
-                const ty = Certificate.parseAttribute(bytes, ty_elem) catch |err| switch (err) {
-                    error.CertificateHasUnrecognizedObjectId => continue,
-                    else => |e| return e,
-                };
-                if (ty == .commonName) common_name = val.slice;
-            }
-        }
-    }
-    return common_name;
-}
-
-/// `findSan`'s answer as offsets rather than bytes — `Certificate.Parsed`
-/// stores slices into the certificate, not pointers.
-fn findSanSlice(cert: Certificate) VerifyChainError!der.Element.Slice {
-    const slice = (try extensions.findExtensions(cert)) orelse return der.Element.Slice.empty;
-    var it = extensions.iterate(slice, cert);
-    while (try it.next()) |entry| {
-        if (entry.id == .subject_alt_name) return entry.value_slice;
-    }
-    return der.Element.Slice.empty;
-}
-
 // ── small extension lookups shared by the algorithm above ──────────────────
 
 fn findExtensionValue(cert_der: CertDer, id: Certificate.ExtensionId) VerifyChainError!?[]const u8 {
@@ -1325,16 +1387,17 @@ fn findSki(cert_der: CertDer) VerifyChainError!?[]const u8 {
 /// common bug this guards against is treating "empty/absent permitted set"
 /// as "nothing permitted" globally rather than per-type.
 ///
-/// Matching rules implemented: `dNSName` (case-insensitive label-suffix,
-/// e.g. `www.example.com` matches base `example.com` but `evilexample.com`
-/// does not), `directoryName` (the base RDNSequence must be an exact
-/// element-wise PREFIX of the name's RDNSequence — compared per encoded RDN
-/// element, not as a raw byte prefix, so an RDN can't accidentally
-/// straddle a match boundary), `iPAddress` (base = address||netmask,
-/// contains iff `(name & mask) == (addr & mask)`). Other `GeneralName`
-/// types (`rfc822Name`, `uniformResourceIdentifier`, etc.) are not matched
-/// at all — see this file's module doc comment.
-pub const CheckNameConstraintsError = error{NameConstraintViolated} || der.Element.ParseError;
+/// Matching rules are `names.match`, one per type: `dNSName`, `rfc822Name`
+/// and `uniformResourceIdentifier` by the shared domain rule (an empty
+/// constraint matches all, `.example.com` subdomains only, `example.com`
+/// itself and its subdomains; an rfc822 constraint with `@` is one mailbox),
+/// `directoryName` as an element-wise RDN prefix, `iPAddress` as address ‖
+/// mask. A name or constraint a rule cannot read (malformed domain, quoted
+/// mailbox, URI without a host or with an IP host) and the four types RFC
+/// 5280 gives no rule for (otherName, x400Address, ediPartyName,
+/// registeredID) fail CLOSED: an excluded subtree that cannot be evaluated
+/// rejects, a permitted one does not admit.
+pub const CheckNameConstraintsError = error{NameConstraintViolated} || names.GeneralNameIterator.Error;
 
 pub fn checkNameConstraints(
     permitted: []const []const u8,
@@ -1342,24 +1405,25 @@ pub fn checkNameConstraints(
     subject_dn: []const u8,
     subject_san: []const u8,
 ) CheckNameConstraintsError!void {
-    try checkOneName(permitted, excluded, .directoryName, subject_dn);
+    var unlimited: u64 = std.math.maxInt(u64);
+    return checkNameConstraintsBudget(permitted, excluded, subject_dn, subject_san, &unlimited) catch |err| switch (err) {
+        error.TooManyConstraints => unreachable,
+        else => |e| e,
+    };
+}
 
-    if (subject_san.len != 0) {
-        // `subject_san` is the raw `subjectAltName` extnValue, i.e. the full
-        // `GeneralNames ::= SEQUENCE OF GeneralName` TLV (same shape
-        // `std.crypto.Certificate.Parsed.verifyHostName` unwraps) — parse
-        // the outer SEQUENCE first, then walk its content.
-        const general_names = try extensions.parseElement(subject_san, 0);
-        var pos = general_names.slice.start;
-        const end = general_names.slice.end;
-        while (pos < end) {
-            const elem = try extensions.parseElement(subject_san, pos);
-            pos = elem.slice.end;
-            const tag: Certificate.GeneralNameTag = @enumFromInt(@intFromEnum(elem.identifier.tag));
-            const value = subject_san[elem.slice.start..elem.slice.end];
-            try checkOneName(permitted, excluded, tag, value);
-        }
-    }
+/// `checkNameConstraints` charging every (name, constraint) pair it looks at
+/// to `budget` (Go's `MaxConstraintComparisions`; `Options.max_constraint_comparisons`).
+fn checkNameConstraintsBudget(
+    permitted: []const []const u8,
+    excluded: []const []const u8,
+    subject_dn: []const u8,
+    subject_san: []const u8,
+    budget: *u64,
+) (CheckNameConstraintsError || error{TooManyConstraints})!void {
+    try checkOneName(permitted, excluded, .directoryName, subject_dn, budget);
+    var it = try names.GeneralNameIterator.init(subject_san);
+    while (try it.next()) |gn| try checkOneName(permitted, excluded, gn.tag, gn.value, budget);
 }
 
 fn checkOneName(
@@ -1367,16 +1431,15 @@ fn checkOneName(
     excluded: []const []const u8,
     tag: Certificate.GeneralNameTag,
     value: []const u8,
-) CheckNameConstraintsError!void {
+    budget: *u64,
+) (CheckNameConstraintsError || error{TooManyConstraints})!void {
     var it_ex: SubtreeSetIterator = .init(excluded);
     while (try it_ex.next()) |entry| {
         if (entry.tag != tag) continue;
-        // An excluded constraint whose type we cannot match (rfc822Name/URI/…)
-        // means we cannot prove `value` is OUTSIDE the excluded subtree — fail
-        // closed rather than let a possibly-excluded name through (RFC 5280
-        // §6.1.4). This mirrors the permitted side's default-deny for its types.
-        if (!constraintTypeSupported(tag)) return error.NameConstraintViolated;
-        if (nameMatchesBase(tag, value, entry.value)) return error.NameConstraintViolated;
+        try charge(budget);
+        // Excluded wins; one we cannot evaluate cannot be proven not to
+        // contain `value`, so it rejects too (RFC 5280 §6.1.4).
+        if (names.match(tag, value, entry.value) != .outside) return error.NameConstraintViolated;
     }
 
     var saw_type = false;
@@ -1384,10 +1447,16 @@ fn checkOneName(
     var it_perm: SubtreeSetIterator = .init(permitted);
     while (try it_perm.next()) |entry| {
         if (entry.tag != tag) continue;
+        try charge(budget);
         saw_type = true;
-        if (nameMatchesBase(tag, value, entry.value)) matched = true;
+        if (names.match(tag, value, entry.value) == .inside) matched = true;
     }
     if (saw_type and !matched) return error.NameConstraintViolated;
+}
+
+fn charge(budget: *u64) error{TooManyConstraints}!void {
+    if (budget.* == 0) return error.TooManyConstraints;
+    budget.* -= 1;
 }
 
 /// Walks a whole SET of accumulated `GeneralSubtrees` blobs (one per
@@ -1413,74 +1482,6 @@ const SubtreeSetIterator = struct {
         }
     }
 };
-
-fn nameMatchesBase(tag: Certificate.GeneralNameTag, name: []const u8, base: []const u8) bool {
-    return switch (tag) {
-        .dNSName => dnsNameMatches(name, base),
-        .directoryName => dnMatchesPrefix(name, base),
-        .iPAddress => ipMatchesSubnet(name, base),
-        else => false,
-    };
-}
-
-/// Whether `nameMatchesBase` can actually evaluate a constraint of this type.
-/// For any other type (rfc822Name, uniformResourceIdentifier, otherName, …) a
-/// match cannot be computed, so an *excluded* constraint of that type must fail
-/// closed rather than silently pass (see `checkOneName`).
-fn constraintTypeSupported(tag: Certificate.GeneralNameTag) bool {
-    return switch (tag) {
-        .dNSName, .directoryName, .iPAddress => true,
-        else => false,
-    };
-}
-
-/// RFC 5280 §4.2.1.10: a name satisfies a dNSName base when it is the base
-/// with zero or more labels added on the left. Two base shapes the old code
-/// matched against NOTHING, which as an excluded subtree let names through:
-/// the empty base, which every name extends (so it excludes, or permits, all
-/// of them), and a leading-dot base (`.example.com`), which Go and
-/// rustls-webpki read as "subdomains only" — `x.example.com`, not
-/// `example.com` itself.
-fn dnsNameMatches(name: []const u8, base: []const u8) bool {
-    if (name.len == 0) return false;
-    if (base.len == 0) return true;
-    if (base[0] == '.')
-        return name.len > base.len and std.ascii.eqlIgnoreCase(name[name.len - base.len ..], base);
-    if (std.ascii.eqlIgnoreCase(name, base)) return true;
-    if (name.len <= base.len) return false;
-    const suffix = name[name.len - base.len ..];
-    if (!std.ascii.eqlIgnoreCase(suffix, base)) return false;
-    return name[name.len - base.len - 1] == '.';
-}
-
-fn dnMatchesPrefix(name: []const u8, base: []const u8) bool {
-    if (base.len == 0) return true;
-    var name_pos: u32 = 0;
-    var base_pos: u32 = 0;
-    const name_end: u32 = @intCast(name.len);
-    const base_end: u32 = @intCast(base.len);
-    while (base_pos < base_end) {
-        const base_elem = extensions.parseElement(base, base_pos) catch return false;
-        if (name_pos >= name_end) return false;
-        const name_elem = extensions.parseElement(name, name_pos) catch return false;
-        if (!std.mem.eql(u8, base[base_pos..base_elem.slice.end], name[name_pos..name_elem.slice.end])) return false;
-        base_pos = base_elem.slice.end;
-        name_pos = name_elem.slice.end;
-    }
-    return true;
-}
-
-fn ipMatchesSubnet(name: []const u8, base: []const u8) bool {
-    const half = base.len / 2;
-    if (half == 0 or base.len != half * 2) return false;
-    if (name.len != half) return false;
-    const addr = base[0..half];
-    const mask = base[half..];
-    for (name, 0..) |b, i| {
-        if ((b & mask[i]) != (addr[i] & mask[i])) return false;
-    }
-    return true;
-}
 
 // ── pathLenConstraint (RFC 5280 §6.1.4 (h)/(i)/(l)) ────────────────────────
 
@@ -1532,6 +1533,40 @@ pub fn checkExtendedKeyUsage(
         const v = maybe_eku orelse continue;
         if (!try extensions.hasPurpose(v, want)) return error.ExtendedKeyUsageMismatch;
     }
+}
+
+pub const PurposeSet = std.EnumSet(extensions.Purpose);
+
+/// `Options.usages_any_of` (Go `KeyUsages` semantics, see there): `wanted`
+/// narrowed by every certificate's `extKeyUsage` on the path, leaf and
+/// `intermediate_ekus` (first intermediate up to and including the anchor,
+/// `null` = extension absent = unrestricted). A wanted set holding
+/// `.any_extended_key_usage` accepts without looking; a certificate listing
+/// `anyExtendedKeyUsage` keeps the set as it is. Unknown purpose OIDs on a
+/// certificate permit nothing this set can name.
+pub fn checkExtendedKeyUsageAnyOf(
+    intermediate_ekus: []const ?[]const u8,
+    leaf_eku: ?[]const u8,
+    wanted: PurposeSet,
+) CheckExtendedKeyUsageError!void {
+    if (wanted.contains(.any_extended_key_usage)) return;
+    var left = wanted;
+    if (leaf_eku) |v| left = try narrowByEku(left, v);
+    for (intermediate_ekus) |maybe_eku| {
+        if (maybe_eku) |v| left = try narrowByEku(left, v);
+    }
+    if (left.count() == 0) return error.ExtendedKeyUsageMismatch;
+}
+
+fn narrowByEku(set: PurposeSet, eku_value: []const u8) extensions.ParseExtKeyUsageError!PurposeSet {
+    var listed: PurposeSet = .initEmpty();
+    var it = try extensions.parseExtKeyUsage(eku_value);
+    while (try it.next()) |entry| {
+        const p = entry.known orelse continue;
+        if (p == .any_extended_key_usage) return set;
+        listed.insert(p);
+    }
+    return set.intersectWith(listed);
 }
 
 // ── RSASSA-PSS certificate-link signature verification (RFC 4055) ─────────

@@ -191,6 +191,58 @@ pub fn iterate(extensions_slice: der.Element.Slice, cert: Certificate) Extension
     return .{ .bytes = cert.buffer, .pos = extensions_slice.start, .end = extensions_slice.end };
 }
 
+// ── extension hygiene (RFC 5280 §4.2, §6.1.4 (o)) ─────────────────────────
+
+pub const HygieneError = error{ UnhandledCriticalExtension, DuplicateExtension };
+
+/// Extensions `chain.verifyChain` acts on, or may ignore without changing
+/// the verdict, and therefore accepts when marked critical. OID content bytes.
+/// Not here although understood: subjectKeyIdentifier and
+/// authorityKeyIdentifier, which RFC 5280 §4.2.1.1/.2 says MUST be
+/// non-critical and Go refuses critical (probe O-crit, 2026-10-11),.
+pub const handled_critical_oids = [_][]const u8{
+    &.{ 0x55, 0x1d, 0x0f }, // keyUsage
+    &.{ 0x55, 0x1d, 0x11 }, // subjectAltName
+    &.{ 0x55, 0x1d, 0x13 }, // basicConstraints
+    &.{ 0x55, 0x1d, 0x1e }, // nameConstraints
+    &.{ 0x55, 0x1d, 0x1f }, // cRLDistributionPoints (CRL scope, `crl.zig`)
+    &.{ 0x55, 0x1d, 0x25 }, // extKeyUsage
+    &.{ 0x55, 0x1d, 0x20 }, // certificatePolicies (`policy.zig`)
+    &.{ 0x55, 0x1d, 0x21 }, // policyMappings
+    &.{ 0x55, 0x1d, 0x24 }, // policyConstraints
+    &.{ 0x55, 0x1d, 0x36 }, // inhibitAnyPolicy
+};
+
+/// One pass over a certificate's extensions: an OID that appears twice is
+/// `DuplicateExtension` (RFC 5280 §4.2: "MUST NOT include more than one
+/// instance" — this module reads the first, another reader the second); a
+/// critical OID that is neither in `handled_critical_oids` nor in `extra_ok`
+/// is `UnhandledCriticalExtension` (§4.2: a system "MUST reject the
+/// certificate if it encounters a critical extension it does not recognize").
+pub fn checkHygiene(
+    cert: Certificate,
+    extra_ok: []const []const u8,
+) (FindExtensionsError || IterateError || HygieneError)!void {
+    const exts = (try findExtensions(cert)) orelse return;
+    var it = iterate(exts, cert);
+    while (try it.next()) |entry| {
+        // Quadratic in the extension count, without allocation; a certificate
+        // is at most 64 KiB, so a few thousand extensions at worst.
+        var later = it;
+        while (try later.next()) |other| {
+            if (std.mem.eql(u8, entry.oid, other.oid)) return error.DuplicateExtension;
+        }
+        if (!entry.critical) continue;
+        if (oidIn(entry.oid, &handled_critical_oids) or oidIn(entry.oid, extra_ok)) continue;
+        return error.UnhandledCriticalExtension;
+    }
+}
+
+fn oidIn(oid: []const u8, set: []const []const u8) bool {
+    for (set) |o| if (std.mem.eql(u8, oid, o)) return true;
+    return false;
+}
+
 // ── basicConstraints (RFC 5280 §4.2.1.9) ────────────────────────────────────
 
 pub const BasicConstraints = struct {
