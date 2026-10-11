@@ -12,7 +12,7 @@ admission/eviction upgrade is clean-room from the TinyLFU paper (Einziger &
 Friedman, "TinyLFU: A Highly Efficient Cache Admission Policy") with design
 references Caffeine (Apache-2.0; window + SLRU probation/protected structure)
 and ristretto (Go, MIT; admission anti-starvation tie-break) —
-algorithm/behavior only, no source consulted or copied.
+algorithm/behavior only, no source consulted or copied. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` reference side against maypok86/otter v2.3.0, 2026-10-11) is our own tooling; it drives the reference only through its public API.
 
 - **Model after:** Go `groupcache` / `ristretto`; the generation-tie is the novel bit.
 - **Platform:** any (pure `std`, dependency-free). **Role:** util.
@@ -54,6 +54,46 @@ key is replaced, evicted, or cleared; copy it if you need it longer.
 caller's `cur_gen != G` — the idiom is "DB-derived entries die the instant a data
 refresh bumps the generation", with external TTL-only entries (`gen == 0`)
 unaffected. An item larger than `max_bytes` is never stored.
+
+**Time-to-idle (opt-in):** `idle_ttl_ns > 0` also expires an entry that has not been
+read for that long (Caffeine `expireAfterAccess`). A hit (`get`, `pin`, `Sharded.getBuf`)
+and a `put` refresh the idle deadline; the effective deadline is the earlier of the
+write TTL and the idle deadline, and an idle expiry counts in `stats.expired`. `<= 0`
+(default) = off.
+
+```zig
+var sessions = ramcache.Cache.init(gpa, .{
+    .max_bytes = 8 << 20,
+    .max_entries = 10_000,
+    .idle_ttl_ns = 30 * std.time.ns_per_min, // drop a session 30 min after its last use
+});
+```
+
+**Adaptive window (opt-in):** `.adaptive_window = true` lets the admission window grow
+or shrink (1 entry .. 80 % of `max_entries`) by hill-climbing the hit rate, as Caffeine
+does; it helps recency-skewed workloads, where the fixed ~1 % window rejects fresh keys.
+Default off — the fixed window and all existing behaviour. A cache under ~16 entries
+never moves its window.
+
+**Read-through:** `getOrLoad` returns the cached value or loads it. `Sharded.getOrLoad`
+is single-flight: on a miss one caller per key runs the loader (without the shard lock),
+every other caller for that key waits and gets a copy of the same value, or the same
+error. `Cache.getOrLoad` has the same signature without the concurrency.
+
+```zig
+fn loadUser(ctx: ?*anyopaque, gpa: std.mem.Allocator, key: []const u8) ramcache.LoadError![]u8 {
+    const db: *Db = @ptrCast(@alignCast(ctx.?));
+    return db.fetchOwned(gpa, key) catch error.LoadFailed; // a gpa-owned slice
+}
+
+const loader: ramcache.Loader = .{ .ctx = &db, .load = loadUser };
+const v = try sc.getOrLoad(gpa, key, now_ns, cur_gen, ttl_ns, gen, loader);
+defer gpa.free(v); // the caller's own copy
+```
+
+The loader must not call `getOrLoad` for the same key from the same thread (it would
+wait for itself). A value the cache declines to keep (admission) is still returned to
+the caller that loaded it, and loaded again on the next miss.
 
 **Write-behind seam (opt-in):** every entry has a dirty bit (`put` sets it;
 `markClean(key)` clears it; `isDirty(key)` reads it), and `Options.on_evict` fires
@@ -142,6 +182,9 @@ instead of corrupting memory under load.
   deadlock, not a detected error). Same for `drainDirty`'s callback — which is
   why the async flusher's ack is `markCleanIf(key, flushed_value)`, a
   compare-and-clear that refuses to ack a value another thread has overwritten.
+
+Benchmark against maypok86/otter: `zig build bench-ramcache` (needs Go 1.26.0 and otter
+v2.3.0 in the module cache).
 
 Tests: `zig build test-ramcache` (deterministic — injected `now_ns`/generation,
 no real clock; the `Sharded` concurrency tests use real threads).

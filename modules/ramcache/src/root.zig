@@ -40,6 +40,13 @@
 //!     more CPU than the NVMe read it was avoiding, against 0.8 us now.
 //!     A buffer pool is exactly the "modest entry counts" assumption's
 //!     counterexample, so the assumption is gone rather than restated.
+//!   * **Time-to-idle, read-through, adaptive window (all opt-in, 2026-10-11):**
+//!     `Options.idle_ttl_ns` expires an entry that has not been read for that
+//!     long (effective deadline = earlier of write TTL and idle deadline, kept
+//!     in the same expiry heap); `getOrLoad` is the read-through call
+//!     (`Sharded.getOrLoad` is single-flight); `Options.adaptive_window` lets a
+//!     hill climber resize the admission window. Defaults keep every earlier
+//!     behaviour.
 //!   * **Provenance:** W-TinyLFU per Einziger & Friedman, "TinyLFU: A Highly
 //!     Efficient Cache Admission Policy"; design refs Caffeine (Apache-2.0)
 //!     and ristretto (MIT) — behavior only, clean-room, no source copied.
@@ -180,6 +187,42 @@ pub const Options = struct {
     on_evict: ?OnEvictFn = null,
     /// Opaque pointer handed to every `on_evict` call.
     on_evict_ctx: ?*anyopaque = null,
+    /// Time-to-idle (Caffeine `expireAfterAccess`, otter `ExpiryAccessing`):
+    /// an entry not read for this long is expired, whatever its write-TTL says.
+    /// A hit (`get`, `pin`, `Sharded.getBuf`) and a `put` both refresh the idle
+    /// deadline; the effective deadline of an entry is
+    /// `min(inserted + ttl, last access + idle_ttl_ns)`. Idle expiry counts in
+    /// `Stats.expired`, like a write-TTL expiry. `<= 0` = off (the default),
+    /// treated exactly like `default_ttl_ns <= 0`: no assert, no clamp, simply
+    /// "never expires by idleness". A `release` does not count as an access
+    /// (it has no clock); the `pin` that opened the borrow did.
+    idle_ttl_ns: i64 = 0,
+    /// Adaptive admission window (Caffeine/otter hill climber). Off by
+    /// default, which keeps the fixed ~1 % window and every existing behaviour.
+    /// On: the hit rate is sampled over `10 x max_entries` lookups, and the
+    /// window share is stepped up or down by a decaying step toward the
+    /// better hit rate, bounded to `[1 entry, 80 % of max_entries]`. See
+    /// `Cache.climbIfDue`. The step is `int(0.0625 x max_entries)` entries
+    /// first, so a cache under ~16 entries never moves its window.
+    adaptive_window: bool = false,
+};
+
+/// Why `getOrLoad` produced no value. `OutOfMemory` is the allocator failing
+/// (the caller's `gpa` for the returned copy, or the in-flight table);
+/// `LoadFailed` is whatever the `Loader` reported -- the cache stays agnostic
+/// about *why*, a caller that needs the reason keeps it in its `ctx`.
+pub const LoadError = error{ LoadFailed, OutOfMemory };
+
+/// The value producer handed to `getOrLoad`.
+pub const Loader = struct {
+    ctx: ?*anyopaque,
+    /// Produce the value for `key` into a `gpa`-owned slice (the allocator
+    /// `getOrLoad` was given; the cache or the caller frees it). `Sharded`
+    /// calls it at most once per key at a time and WITHOUT holding the shard
+    /// lock, but a loader must not re-enter `getOrLoad` for the same key from
+    /// the same thread: it would wait for itself, forever. (Like `on_evict`'s
+    /// "must not suspend": a documented contract, not a detected error.)
+    load: *const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator, key: []const u8) LoadError![]u8,
 };
 
 /// 4-bit Count-Min Sketch + doorkeeper with periodic aging, per the TinyLFU
@@ -298,6 +341,16 @@ pub const Cache = struct {
         protected, // main SLRU: re-referenced at least once (hot)
     };
 
+    // Hill-climber constants, from otter v2.3.0 `policy.go:30-35` (the same
+    // values Caffeine uses). Kept verbatim: restart threshold 0.05, initial and
+    // restart step 6.25 % of the capacity, decay 0.98 per sample.
+    const hill_restart_threshold: f64 = 0.05;
+    const hill_step_percent: f64 = 0.0625;
+    const hill_step_decay: f64 = 0.98;
+    /// Sample length in lookups, as a multiple of `max_entries` (otter takes
+    /// its sketch's `sampleSize`, `sketch.go:63-65`, which is `10 x maximum`).
+    const hill_sample_factor = 10;
+
     /// Per-entry index node — the piece that makes victim selection O(1)
     /// instead of a full-map scan.
     ///
@@ -311,14 +364,16 @@ pub const Cache = struct {
         key: []const u8,
         /// Mirror of `Entry.last_tick`; the ordering key of the region heaps.
         tick: u64,
-        /// `inserted_ns + ttl_ns` — the ordering key of the expiry heap.
-        /// Meaningful only while `exp_idx != not_queued`.
+        /// Effective expiry instant (`Cache.deadlineFor`: the earlier of the
+        /// write-TTL deadline and the idle deadline) — the ordering key of the
+        /// expiry heap. Meaningful only while `exp_idx != not_queued`.
         deadline: i64 = 0,
         /// Position in `Cache.lru[@intFromEnum(entry.region)]`, or
         /// `not_queued` while the entry is deliberately out of the index
         /// (borrowed — see `pins` — or doomed).
         heap_idx: u32 = not_queued,
-        /// Position in `Cache.exp`, or `not_queued` for an entry with no TTL.
+        /// Position in `Cache.exp`, or `not_queued` for an entry with no
+        /// deadline (no TTL and no idle TTL) or while borrowed.
         exp_idx: u32 = not_queued,
         /// Live borrow count: `pin`/`reserve` increment it, `release`
         /// decrements it. A node with `pins > 0` is taken out of its region
@@ -374,6 +429,9 @@ pub const Cache = struct {
         value: []u8,
         inserted_ns: i64,
         ttl_ns: i64, // <= 0 → never expire by time
+        /// Last read or write, for `Options.idle_ttl_ns`. Written even when
+        /// idle expiry is off (one store per hit), so no mode switch exists.
+        last_access_ns: i64,
         gen: u64, // 0 → not generation-tied (TTL only)
         last_tick: u64, // logical access clock, drives LRU ordering
         region: Region,
@@ -439,9 +497,35 @@ pub const Cache = struct {
     /// probe with the rebuild below: see the CHANGELOG. `maintain` rebuilds the
     /// index once this passes a quarter of the capacity.
     removals: u32 = 0,
+    /// Current admission-window size in entries while `Options.adaptive_window`
+    /// is on (otter `windowMaximum`); unused otherwise (`windowCap` then
+    /// derives the fixed ~1 %).
+    window_adapt: usize,
+    /// Hill-climber sample: lookups that hit / missed since the last climb
+    /// (otter `hitsInSample` / `missesInSample`).
+    hc_hits: u64 = 0,
+    hc_misses: u64 = 0,
+    /// Hit rate of the previous sample (otter `previousSampleHitRate`).
+    hc_prev_rate: f64 = 0,
+    /// Signed step in entries (otter `stepSize`); negative = shrink the window.
+    hc_step: f64,
+    /// Instrumentation: completed climber samples. Tests read it to prove a
+    /// run reached the climber at all.
+    climbs: u64 = 0,
+
+    /// ~1% of `max_entries` (min 1) — the fixed admission window.
+    fn baseWindow(max_entries: usize) usize {
+        if (max_entries == 0) return 0;
+        return @max(1, max_entries / 100);
+    }
 
     pub fn init(alloc: std.mem.Allocator, options: Options) Cache {
-        return .{ .alloc = alloc, .options = options };
+        return .{
+            .alloc = alloc,
+            .options = options,
+            .window_adapt = baseWindow(options.max_entries),
+            .hc_step = -hill_step_percent * @as(f64, @floatFromInt(options.max_entries)),
+        };
     }
 
     pub fn deinit(self: *Cache) void {
@@ -469,19 +553,24 @@ pub const Cache = struct {
     /// The returned slice borrows the cache's storage: valid until this key is
     /// replaced, evicted, or the cache is cleared.
     pub fn get(self: *Cache, key: []const u8, now_ns: i64, cur_gen: u64) ?[]const u8 {
+        self.climbIfDue();
         self.noteAccess(key);
         const e = self.lookupFilled(key) orelse {
             self.stats.misses += 1;
+            self.noteOutcome(false);
             return null;
         };
-        const ttl_expired = e.ttl_ns > 0 and (now_ns - e.inserted_ns) > e.ttl_ns;
+        const ttl_expired = self.timeExpired(e, now_ns);
         const gen_stale = e.gen != 0 and e.gen != cur_gen;
         if (ttl_expired or gen_stale) {
             self.stats.expired += 1;
             self.stats.misses += 1;
+            self.noteOutcome(false);
             _ = self.dropKey(key);
             return null;
         }
+        self.noteOutcome(true);
+        self.touchIdle(e, now_ns);
         self.tick += 1;
         e.last_tick = self.tick;
         e.node.tick = self.tick;
@@ -573,10 +662,11 @@ pub const Cache = struct {
                 .region = e.region,
                 .dirty = true, // a fresh write, not yet known to be persisted
                 .node = node,
+                .last_access_ns = now_ns,
             };
             node.tick = self.tick;
             self.lruTouched(e.region, node);
-            self.expUpdate(node, now_ns, ttl_ns);
+            self.expUpdate(node, self.deadlineFor(now_ns, ttl_ns, now_ns));
             self.bytes += vdup.len;
             // A replace can push `bytes` over the cap just as an insert can
             // (a bigger value for the same key), so it owes the same eviction
@@ -602,7 +692,8 @@ pub const Cache = struct {
         // entry the heaps do not know about could never be chosen as a victim.
         const reserved = blk: {
             self.lru[@intFromEnum(Region.window)].ensureUnusedCapacity(self.alloc, 1) catch break :blk false;
-            if (ttl_ns > 0) self.exp.ensureUnusedCapacity(self.alloc, 1) catch break :blk false;
+            if (self.deadlineFor(now_ns, ttl_ns, now_ns) != null)
+                self.exp.ensureUnusedCapacity(self.alloc, 1) catch break :blk false;
             break :blk true;
         };
         if (!reserved) {
@@ -622,6 +713,7 @@ pub const Cache = struct {
             .region = .window,
             .dirty = true, // a fresh write, not yet known to be persisted
             .node = node,
+            .last_access_ns = now_ns,
         }) catch {
             self.alloc.destroy(node);
             self.alloc.free(kdup);
@@ -632,8 +724,8 @@ pub const Cache = struct {
         // in every build mode; the assert only checks the reservation held.
         const indexed = self.lruPush(.window, node);
         std.debug.assert(indexed);
-        if (ttl_ns > 0) {
-            const queued = self.expPush(node, now_ns +| ttl_ns);
+        if (self.deadlineFor(now_ns, ttl_ns, now_ns)) |d| {
+            const queued = self.expPush(node, d);
             std.debug.assert(queued);
         }
         self.window_count += 1;
@@ -645,6 +737,34 @@ pub const Cache = struct {
     /// `put` with `Options.default_ttl_ns` as the TTL.
     pub fn putDefault(self: *Cache, key: []const u8, value: []const u8, now_ns: i64, gen: u64) void {
         self.put(key, value, now_ns, self.options.default_ttl_ns, gen);
+    }
+
+    /// Read-through: the cached value for `key` (a copy owned by `gpa`, free it
+    /// with `gpa`), or on a miss the value `loader` produces, which is stored
+    /// (`put` semantics: admission may decline it, the caller still gets it)
+    /// and returned. `cur_gen` is the lookup's current generation, `ttl_ns` and
+    /// `gen` describe the entry written on a miss (`Cache.get` / `Cache.put`).
+    ///
+    /// `Cache` is single-owner, so this is the trivial non-concurrent shape —
+    /// no in-flight table, the loader simply runs on the owning thread. It
+    /// exists so a caller can switch between `Cache` and `Sharded.getOrLoad`
+    /// (which does single-flight) without touching call sites. The loader must
+    /// not call back into this cache. A `LoadFailed` leaves the cache as the
+    /// miss's `get` left it.
+    pub fn getOrLoad(
+        self: *Cache,
+        gpa: std.mem.Allocator,
+        key: []const u8,
+        now_ns: i64,
+        cur_gen: u64,
+        ttl_ns: i64,
+        gen: u64,
+        loader: Loader,
+    ) LoadError![]u8 {
+        if (self.get(key, now_ns, cur_gen)) |v| return gpa.dupe(u8, v);
+        const loaded = try loader.load(loader.ctx, gpa, key);
+        self.put(key, loaded, now_ns, ttl_ns, gen);
+        return loaded;
     }
 
     /// Drop every entry (e.g. a manual cache flush). Keeps map capacity, the
@@ -782,24 +902,32 @@ pub const Cache = struct {
     /// has no region membership to move. It does refresh the entry's tick, so
     /// `release` re-files it as recently used.
     pub fn pin(self: *Cache, key: []const u8, now_ns: i64, cur_gen: u64) ?Borrow {
+        self.climbIfDue();
         self.noteAccess(key);
         const e = self.lookupFilled(key) orelse {
             self.stats.misses += 1;
+            self.noteOutcome(false);
             return null;
         };
-        const ttl_expired = e.ttl_ns > 0 and (now_ns - e.inserted_ns) > e.ttl_ns;
+        const ttl_expired = self.timeExpired(e, now_ns);
         const gen_stale = e.gen != 0 and e.gen != cur_gen;
         if (ttl_expired or gen_stale) {
             self.stats.expired += 1;
             self.stats.misses += 1;
+            self.noteOutcome(false);
             _ = self.dropKey(key);
             return null;
         }
         const value = e.value;
         if (!self.pinEntry(e)) {
             self.stats.misses += 1;
+            self.noteOutcome(false);
             return null;
         }
+        self.noteOutcome(true);
+        // The node just left the expiry heap (`pinEntry`), so only the stamp
+        // moves; `release` files it again under the deadline this implies.
+        e.last_access_ns = now_ns;
         self.tick += 1;
         e.last_tick = self.tick;
         e.node.tick = self.tick;
@@ -869,6 +997,7 @@ pub const Cache = struct {
             .region = .window,
             .dirty = true,
             .node = node,
+            .last_access_ns = now_ns,
         });
         // Deliberately NOT pushed into the window heap or the expiry heap:
         // `pins == 1`, and a pinned node is out of the index (see `Node.pins`).
@@ -981,7 +1110,7 @@ pub const Cache = struct {
             self.syncStats();
             return;
         }
-        if (e.ttl_ns > 0) _ = self.expPush(n, e.inserted_ns +| e.ttl_ns);
+        if (self.deadlineFor(e.inserted_ns, e.ttl_ns, e.last_access_ns)) |d| _ = self.expPush(n, d);
         self.syncStats();
     }
 
@@ -1054,10 +1183,11 @@ pub const Cache = struct {
         self.stats.pinned = self.pinned_entries;
     }
 
-    /// ~1% of capacity (min 1) — the admission window size in entries.
+    /// The admission window size in entries: ~1% of capacity (min 1), or the
+    /// climber's current size under `Options.adaptive_window`.
     fn windowCap(self: *const Cache) usize {
-        if (self.options.max_entries == 0) return 0;
-        return @max(1, self.options.max_entries / 100);
+        if (self.options.adaptive_window) return self.window_adapt;
+        return baseWindow(self.options.max_entries);
     }
 
     /// 80% of the main (non-window) region — the protected SLRU segment.
@@ -1342,11 +1472,42 @@ pub const Cache = struct {
         }
     }
 
-    /// Re-file `n` after a rewrite changed its TTL (in either direction, so
-    /// this sifts both ways).
-    fn expUpdate(self: *Cache, n: *Node, now_ns: i64, ttl_ns: i64) void {
-        if (ttl_ns <= 0) return self.expRemove(n);
-        const deadline = now_ns +| ttl_ns;
+    /// Effective expiry instant of an entry written at `inserted_ns` with
+    /// `ttl_ns` and last accessed at `last_access_ns`: the earlier of the
+    /// write-TTL deadline and the idle deadline, `null` when neither applies
+    /// (no expiry by time). Saturating, so a huge TTL cannot wrap.
+    fn deadlineFor(self: *const Cache, inserted_ns: i64, ttl_ns: i64, last_access_ns: i64) ?i64 {
+        var d: ?i64 = null;
+        if (ttl_ns > 0) d = inserted_ns +| ttl_ns;
+        if (self.options.idle_ttl_ns > 0) {
+            const idle = last_access_ns +| self.options.idle_ttl_ns;
+            d = if (d) |w| @min(w, idle) else idle;
+        }
+        return d;
+    }
+
+    /// The time-based freshness predicate shared by `get` and `pin`: expired
+    /// by write TTL (`now - inserted > ttl`) or by idleness
+    /// (`now - last access > idle_ttl_ns`). Strict `>` on both, so an entry is
+    /// still fresh at exactly its TTL, matching the heap's `now > deadline`.
+    fn timeExpired(self: *const Cache, e: *const Entry, now_ns: i64) bool {
+        if (e.ttl_ns > 0 and (now_ns - e.inserted_ns) > e.ttl_ns) return true;
+        return self.options.idle_ttl_ns > 0 and (now_ns - e.last_access_ns) > self.options.idle_ttl_ns;
+    }
+
+    /// A hit at `now_ns`: refresh the idle stamp and, when idle expiry is on,
+    /// re-file the entry under its new deadline. A borrowed node is not in the
+    /// expiry heap (`Node.pins`); it only gets the stamp.
+    fn touchIdle(self: *Cache, e: *Entry, now_ns: i64) void {
+        e.last_access_ns = now_ns;
+        if (self.options.idle_ttl_ns <= 0 or e.node.pins > 0) return;
+        self.expUpdate(e.node, self.deadlineFor(e.inserted_ns, e.ttl_ns, now_ns));
+    }
+
+    /// Re-file `n` after a rewrite or a hit changed its deadline (in either
+    /// direction, so this sifts both ways). `null` = no deadline any more.
+    fn expUpdate(self: *Cache, n: *Node, new_deadline: ?i64) void {
+        const deadline = new_deadline orelse return self.expRemove(n);
         if (n.exp_idx == Node.not_queued) {
             _ = self.expPush(n, deadline); // OOM: entry simply loses expired-first priority
             return;
@@ -1387,8 +1548,14 @@ pub const Cache = struct {
         while (self.map.count() > self.options.max_entries or self.bytes > self.options.max_bytes) {
             if (!self.evictStep(now_ns)) break;
         }
-        // Window overflow without global pressure: the main region has room
-        // (global cap holds), so the window's LRU moves to probation freely.
+        self.shrinkWindow();
+        self.enforceProtectedCap();
+        self.shedTombstones();
+    }
+
+    /// Window overflow without global pressure: the main region has room
+    /// (global cap holds), so the window's LRU moves to probation freely.
+    fn shrinkWindow(self: *Cache) void {
         while (self.window_count > self.windowCap()) {
             const k = self.regionLruKey(.window) orelse break;
             const e = self.map.getPtr(k).?;
@@ -1397,8 +1564,119 @@ pub const Cache = struct {
             self.window_count -= 1;
             self.probation_count += 1;
         }
+    }
+
+    // ── adaptive window: the hill climber ───────────────────────────────────
+    //
+    // Behaviour anchored on otter v2.3.0 (`policy.go`: `climb` 375,
+    // `determineAdjustment` 389, `increaseWindow` 449, `decreaseWindow` 495),
+    // clean-room. Kept: constants (see `hill_*`), the sample length
+    // (10 x capacity), the sign convention (initial step negative, the step
+    // flips when the hit rate fell, restarts at full size on a >= 5 point
+    // change, decays 2 % per sample otherwise), growing the window from the
+    // probation LRU first and then the protected LRU, and handing back the part
+    // of a step that could not be realised. Changed: (1) the hit rate counts
+    // lookup outcomes (`get`/`pin` hit vs miss) where otter counts reads that
+    // hit vs inserts -- a caller that does not insert on a miss still adapts;
+    // (2) the window is capped at 80 % of `max_entries` explicitly, otter
+    // stops where its protected quota hits zero; (3) every entry weighs 1
+    // (byte caps are separate); (4) a shrink with an under-filled window
+    // lowers the limit without moving entries out of it, otter moves up to
+    // the quota regardless; (5) the climber runs at the start of a `get`/`pin`
+    // instead of in an asynchronous maintenance cycle.
+
+    fn noteOutcome(self: *Cache, hit: bool) void {
+        if (!self.options.adaptive_window) return;
+        if (hit) self.hc_hits += 1 else self.hc_misses += 1;
+    }
+
+    /// Run one climber step if a full sample has been collected. Moves
+    /// entries between regions but never frees or inserts one, so it is safe
+    /// to run before the lookup it precedes.
+    fn climbIfDue(self: *Cache) void {
+        if (!self.options.adaptive_window) return;
+        const period = self.options.max_entries *| hill_sample_factor;
+        const requests = self.hc_hits + self.hc_misses;
+        if (period == 0 or requests < period) return;
+
+        const hit_rate = @as(f64, @floatFromInt(self.hc_hits)) / @as(f64, @floatFromInt(requests));
+        const change = hit_rate - self.hc_prev_rate;
+        const amount = if (change < 0) -self.hc_step else self.hc_step;
+        if (@abs(change) >= hill_restart_threshold) {
+            const k: f64 = if (amount >= 0) 1 else -1;
+            self.hc_step = hill_step_percent * @as(f64, @floatFromInt(self.options.max_entries)) * k;
+        } else {
+            self.hc_step = hill_step_decay * amount;
+        }
+        self.hc_prev_rate = hit_rate;
+        self.hc_hits = 0;
+        self.hc_misses = 0;
+        self.climbs += 1;
+
+        const quota: i64 = @intFromFloat(amount); // truncates toward zero, like otter's int64()
+        if (quota > 0) {
+            self.growWindow(@intCast(quota));
+        } else if (quota < 0) {
+            self.shrinkWindowBy(@intCast(-quota));
+        }
+    }
+
+    /// Largest window the climber may reach: 80 % of the capacity (min 1).
+    fn windowBound(self: *const Cache) usize {
+        return @max(1, self.options.max_entries / 5 * 4);
+    }
+
+    /// Grow the window by up to `quota` entries, pulling the probation LRU
+    /// (then the protected LRU) in at the window's most-recent end. The limit
+    /// rises only by what was actually moved.
+    fn growWindow(self: *Cache, quota: usize) void {
+        const bound = self.windowBound();
+        if (self.window_adapt >= bound) return;
+        const want = @min(quota, bound - self.window_adapt);
+        var moved: usize = 0;
+        while (moved < want) {
+            const k = self.regionLruKey(.probation) orelse self.regionLruKey(.protected) orelse break;
+            const e = self.map.getPtr(k).?;
+            if (!self.moveToWindow(e)) break;
+            moved += 1;
+        }
+        self.window_adapt += moved;
         self.enforceProtectedCap();
-        self.shedTombstones();
+    }
+
+    /// Shrink the window limit by up to `quota` entries (never below 1); the
+    /// overflow leaves from the window's LRU end into probation.
+    fn shrinkWindowBy(self: *Cache, quota: usize) void {
+        if (self.window_adapt <= 1) return;
+        self.window_adapt -= @min(quota, self.window_adapt - 1);
+        self.shrinkWindow();
+    }
+
+    /// Re-file a main-region entry as the window's most recent one. False on
+    /// OOM re-indexing it, in which case it stays where it was.
+    fn moveToWindow(self: *Cache, e: *Entry) bool {
+        const n = e.node;
+        const from = e.region;
+        self.lruRemove(from, n);
+        const old_tick = n.tick;
+        self.tick += 1;
+        n.tick = self.tick;
+        e.last_tick = self.tick;
+        if (!self.lruPush(.window, n)) {
+            n.tick = old_tick;
+            e.last_tick = old_tick;
+            const back = self.lruPush(from, n); // the slot just vacated is still reserved
+            std.debug.assert(back);
+            return false;
+        }
+        switch (from) {
+            .window => unreachable,
+            .probation => self.probation_count -= 1,
+            .protected => self.protected_count -= 1,
+        }
+        e.region = .window;
+        self.window_count += 1;
+        return true;
     }
 
     /// Rebuild the index once removals since the last rebuild pass a quarter
@@ -1933,7 +2211,7 @@ test "borrow: a parked value outliving two out-of-order releases is freed exactl
 const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 
-const SeamLabel = enum { pinned, committed, released, parked };
+const SeamLabel = enum { pinned, committed, released, parked, idled };
 var seam_reach: [@typeInfo(SeamLabel).@"enum".fields.len]usize = @splat(0);
 
 fn mark(comptime l: SeamLabel) void {
@@ -1962,12 +2240,19 @@ const SeamHarness = struct {
     borrows: [8]?Cache.Borrow = @splat(null),
     fill: ?Cache.Fill = null,
     now: i64 = 0,
+    /// `Options.idle_ttl_ns` of the cache under test. Non-zero also switches
+    /// time to advance by 1..136 ns per step instead of a flat 10, so a key's
+    /// silence lands both below and above the idle limit.
+    idle_ns: i64 = 0,
 
     /// Deliberately tiny caps: three entries and 24 bytes mean real eviction
     /// pressure within a handful of operations, which is where the borrow
     /// seam and the eviction machinery actually meet.
-    fn init(alloc: std.mem.Allocator) SeamHarness {
-        return .{ .c = Cache.init(alloc, .{ .max_bytes = 24, .max_entries = 3 }) };
+    fn init(alloc: std.mem.Allocator, idle_ns: i64) SeamHarness {
+        return .{
+            .c = Cache.init(alloc, .{ .max_bytes = 24, .max_entries = 3, .idle_ttl_ns = idle_ns }),
+            .idle_ns = idle_ns,
+        };
     }
 
     fn deinit(self: *SeamHarness) void {
@@ -2011,7 +2296,15 @@ const SeamHarness = struct {
         const k = key_pool[arg % key_pool.len];
         const len = (arg >> 4) % (payload.len + 1);
         const ttl: i64 = if (arg & 8 != 0) 50 else 0;
-        self.now += 10;
+        self.now += if (self.idle_ns > 0) 1 + @as(i64, op >> 4) * 9 else 10;
+        // Reach: a lookup about to find an entry that only IDLENESS has expired
+        // (silent for > idle_ns, still inside its write TTL).
+        if (self.idle_ns > 0 and (op % op_count == op_get or op % op_count == op_pin)) {
+            if (self.c.map.getPtr(k)) |e| {
+                const ttl_dead = e.ttl_ns > 0 and (self.now - e.inserted_ns) > e.ttl_ns;
+                if (e.node.filled and !ttl_dead and (self.now - e.last_access_ns) > self.idle_ns) mark(.idled);
+            }
+        }
         switch (op % op_count) {
             op_put => self.c.put(k, payload[0..len], self.now, ttl, 0),
             op_get => _ = self.c.get(k, self.now, 0),
@@ -2069,10 +2362,15 @@ const SeamHarness = struct {
         // The parking list never outgrows the reservation `pinEntry`/`reserve`
         // made for it — the invariant that lets `parkNode` be infallible.
         try testing.expect(self.c.doomed.items.len <= self.c.pinned_entries);
+        try expectExpiryAgrees(&self.c);
     }
 
     fn run(alloc: std.mem.Allocator, script: []const u8) !void {
-        var h = SeamHarness.init(alloc);
+        return runWith(alloc, 0, script);
+    }
+
+    fn runWith(alloc: std.mem.Allocator, idle_ns: i64, script: []const u8) !void {
+        var h = SeamHarness.init(alloc, idle_ns);
         defer h.deinit();
         var i: usize = 0;
         while (i + 1 < script.len) : (i += 2) try h.step(script[i], script[i + 1]);
@@ -2144,7 +2442,7 @@ fn fuzzSeam(_: void, smith: *std.testing.Smith) !void {
     // One raw-byte draw of a fixed length, read as (op, arg) pairs. Lengths
     // before payloads is moot here because there is exactly one draw; what
     // matters is that no weighted draw decides which operation runs.
-    var script: [64]u8 = undefined;
+    var script: [65]u8 = undefined; // 1 config byte + 32 (op, arg) pairs
     smith.bytes(&script);
     var src: ScriptSource = .{ .cur = .{ .bytes = &script } };
     try seamHarness(ScriptSource, &src, testing.allocator);
@@ -2162,9 +2460,34 @@ const ScriptSource = struct {
 /// The harness body, generic over its source of choices (`ScriptSource` for
 /// `testing.fuzz`, `fuzz_driver.Rng` for the deterministic driver).
 fn seamHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    // One config byte: bit 0 turns time-to-idle on (40 ns), so half the
+    // scripts run with idle expiry in play and half without.
+    var cfg: [1]u8 = undefined;
+    src.bytes(&cfg);
     var script: [64]u8 = undefined;
     src.bytes(&script);
-    try SeamHarness.run(gpa, &script);
+    try SeamHarness.runWith(gpa, if (cfg[0] & 1 != 0) 40 else 0, &script);
+}
+
+/// The expiry heap holds exactly the nodes that should be in it, under the
+/// deadline they should have: an unborrowed entry with a deadline (write TTL
+/// and/or idle TTL) is queued at `Cache.deadlineFor`, one without is not
+/// queued, and a borrowed one never is (`Node.pins`).
+fn expectExpiryAgrees(c: *Cache) !void {
+    var it = c.map.iterator();
+    while (it.next()) |kv| {
+        const e = kv.value_ptr;
+        if (e.node.pins > 0) {
+            try testing.expectEqual(Cache.Node.not_queued, e.node.exp_idx);
+            continue;
+        }
+        if (c.deadlineFor(e.inserted_ns, e.ttl_ns, e.last_access_ns)) |d| {
+            try testing.expect(e.node.exp_idx != Cache.Node.not_queued);
+            try testing.expectEqual(d, e.node.deadline);
+        } else {
+            try testing.expectEqual(Cache.Node.not_queued, e.node.exp_idx);
+        }
+    }
 }
 
 test "fuzz driver: RAMCACHE_FUZZ (seam)" {
@@ -3459,4 +3782,393 @@ test "random put/get/remove/replace sequences keep every region heap and the exp
         }
         try expectHeapsOrdered(&c);
     }
+}
+
+// ── time-to-idle (2026-10-11) ───────────────────────────────────────────────
+//
+// Anchor: Caffeine `expireAfterAccess` / otter `ExpiryAccessing`
+// (otter `expiry_calculator.go:108-126`): expire a fixed time after creation,
+// replacement of the value, or the last read.
+
+fn idleCache(idle_ns: i64, max_entries: usize) Cache {
+    return Cache.init(testing.allocator, .{ .max_bytes = 1 << 20, .max_entries = max_entries, .idle_ttl_ns = idle_ns });
+}
+
+test "idle ttl: a hit refreshes the deadline, silence expires the entry, and it counts as expired" {
+    var c = idleCache(100, 16);
+    defer c.deinit();
+    c.put("k", "v", 0, 0, 0);
+    try testing.expect(c.get("k", 100, 0) != null); // exactly at the limit: still fresh (strict >)
+    // 200 ns after the write but only 100 after the last read. RED if a hit
+    // does not refresh the idle deadline.
+    try testing.expect(c.get("k", 200, 0) != null);
+    try testing.expectEqual(@as(u64, 0), c.stats.expired);
+    try testing.expect(c.get("k", 301, 0) == null); // 101 ns of silence
+    try testing.expectEqual(@as(u64, 1), c.stats.expired);
+    try testing.expectEqual(@as(usize, 0), c.stats.entries);
+    try testing.expectEqual(@as(u64, 1), c.stats.misses);
+}
+
+test "idle ttl: a put over the key refreshes the deadline too" {
+    var c = idleCache(100, 16);
+    defer c.deinit();
+    c.put("p", "v", 1000, 0, 0);
+    c.put("p", "w", 1090, 0, 0);
+    // 180 after the first write, 90 after the rewrite.
+    try testing.expectEqualStrings("w", c.get("p", 1180, 0).?);
+}
+
+test "idle ttl: the effective deadline is the earlier of the write TTL and the idle deadline" {
+    var c = idleCache(100, 16);
+    defer c.deinit();
+    // Write TTL 300 binds although the entry is read every 90 ns.
+    c.put("t", "v", 0, 300, 0);
+    try testing.expect(c.get("t", 90, 0) != null);
+    try testing.expect(c.get("t", 180, 0) != null);
+    try testing.expect(c.get("t", 270, 0) != null);
+    try testing.expect(c.get("t", 301, 0) == null); // 31 ns idle, but 301 > ttl 300
+    // Idle binds although the write TTL is far away.
+    c.put("i", "v", 1000, 100_000, 0);
+    try testing.expect(c.get("i", 1101, 0) == null);
+    try testing.expectEqual(@as(u64, 2), c.stats.expired);
+}
+
+test "idle ttl: eviction takes an idle-expired entry before the frequency contest" {
+    var c = idleCache(100, 2);
+    defer c.deinit();
+    c.put("a", "1", 0, 0, 0);
+    c.put("b", "2", 50, 0, 0); // a -> probation, b is the window candidate
+    // At 120, "a" has been silent for 120 > 100 and "b" for 70. Without
+    // idle-aware expiry the contest is b (candidate) against a (victim): a tie,
+    // so b is rejected and a survives.
+    c.put("c", "3", 120, 0, 0);
+    try testing.expect(!c.map.contains("a"));
+    try testing.expect(c.map.contains("b"));
+    try testing.expect(c.map.contains("c"));
+    try testing.expectEqual(@as(u64, 0), c.stats.rejections);
+    try testing.expectEqual(@as(u64, 0), c.stats.admissions);
+    try testing.expectEqual(@as(u64, 1), c.stats.evictions);
+}
+
+test "idle ttl: a hit moves the entry's place in the expiry heap, so the NEXT one expires first" {
+    var c = idleCache(100, 2);
+    defer c.deinit();
+    c.put("a", "1", 0, 0, 0);
+    c.put("b", "2", 10, 0, 0);
+    _ = c.get("a", 90, 0); // a: deadline 190 (was 100); b stays at 110
+    try expectHeapsOrdered(&c);
+    try expectExpiryAgrees(&c);
+    // At 150 only b is idle-expired. RED if the hit left a's old deadline in
+    // the heap: a would be the root and would be evicted instead.
+    c.put("c", "3", 150, 0, 0);
+    try testing.expect(c.map.contains("a"));
+    try testing.expect(!c.map.contains("b"));
+}
+
+test "idle ttl: pin counts as an access and release re-files the entry under the new deadline" {
+    var c = idleCache(100, 16);
+    defer c.deinit();
+    c.put("k", "v", 0, 0, 0);
+    const b = c.pin("k", 90, 0).?;
+    try expectExpiryAgrees(&c); // borrowed: not in the heap
+    c.release(b);
+    try expectExpiryAgrees(&c); // back, at 90 + 100
+    try testing.expectEqual(@as(i64, 190), c.map.getPtr("k").?.node.deadline);
+    try testing.expect(c.get("k", 180, 0) != null); // 90 since the pin; 180 since the write
+    // And a borrow held across the deadline does not make the entry immortal:
+    const b2 = c.pin("k", 200, 0).?;
+    c.release(b2);
+    try testing.expect(c.get("k", 301, 0) == null);
+}
+
+test "idle ttl: off by default, and a non-positive value is off exactly like default_ttl_ns" {
+    for ([_]i64{ 0, -5 }) |idle| {
+        var c = idleCache(idle, 16);
+        defer c.deinit();
+        c.put("k", "v", 0, 0, 0);
+        try testing.expect(c.get("k", 1 << 50, 0) != null);
+        try testing.expectEqual(@as(u64, 0), c.stats.expired);
+        try testing.expectEqual(Cache.Node.not_queued, c.map.getPtr("k").?.node.exp_idx);
+    }
+}
+
+test "idle ttl: random put/get/remove sequences agree with a naive model of write TTL + idle TTL" {
+    // The model is the definition, written out: an entry is fresh iff it is
+    // within its write TTL and within `idle` of its last read or write. The
+    // cache is big enough that nothing is ever evicted, so every difference
+    // is an expiry difference. Time advances by 0..5 ns per step against an idle
+    // limit of 37 and write TTLs of 20..79: a key is touched about every 15
+    // steps (~37 ns), so both sides of both limits are crossed constantly.
+    const idle: i64 = 37;
+    const nkeys = 12;
+    var c = idleCache(idle, 64);
+    defer c.deinit();
+    const M = struct { present: bool = false, inserted: i64 = 0, ttl: i64 = 0, last: i64 = 0, val: u8 = 0 };
+    var model: [nkeys]M = @splat(.{});
+    var state: u64 = 0xC0FFEE_1234_5678;
+    var now: i64 = 0;
+    var kbuf: [8]u8 = undefined;
+    var hits: usize = 0;
+    var idle_only: usize = 0;
+    for (0..6000) |step| {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        const r = state >> 33;
+        now += @intCast(r % 6);
+        const ki: usize = @intCast((r >> 5) % nkeys);
+        const key = std.fmt.bufPrint(&kbuf, "k{d}", .{ki}) catch unreachable;
+        const m = &model[ki];
+        switch ((r >> 12) % 5) {
+            0, 1 => {
+                const ttl: i64 = if ((r >> 16) & 1 == 0) 0 else @intCast(20 + (r >> 17) % 60);
+                const val: u8 = @intCast(step % 251);
+                c.put(key, &[_]u8{val}, now, ttl, 0);
+                m.* = .{ .present = true, .inserted = now, .ttl = ttl, .last = now, .val = val };
+            },
+            2, 3 => {
+                const got = c.get(key, now, 0);
+                if (m.present) {
+                    const ttl_dead = m.ttl > 0 and now - m.inserted > m.ttl;
+                    const idle_dead = now - m.last > idle;
+                    if (ttl_dead or idle_dead) {
+                        if (!ttl_dead) idle_only += 1;
+                        try testing.expect(got == null);
+                        m.present = false;
+                    } else {
+                        try testing.expectEqual(m.val, got.?[0]);
+                        m.last = now;
+                        hits += 1;
+                    }
+                } else {
+                    try testing.expect(got == null);
+                }
+            },
+            else => {
+                try testing.expectEqual(m.present, c.remove(key));
+                m.present = false;
+            },
+        }
+        try expectHeapsOrdered(&c);
+        try expectExpiryAgrees(&c);
+    }
+    // The run has to have crossed the boundary it claims to: hits that were
+    // saved by a refresh, and entries lost to idleness alone.
+    try testing.expect(hits > 200);
+    try testing.expect(idle_only > 50);
+    try testing.expect(c.stats.expired > 50);
+}
+
+// ── getOrLoad on the single-owner Cache ─────────────────────────────────────
+
+const CountingLoader = struct {
+    calls: u32 = 0,
+    fail: bool = false,
+
+    fn load(ctx: ?*anyopaque, gpa: std.mem.Allocator, key: []const u8) LoadError![]u8 {
+        const self: *CountingLoader = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        if (self.fail) return error.LoadFailed;
+        const out = try gpa.alloc(u8, key.len + 1);
+        out[0] = '=';
+        @memcpy(out[1..], key);
+        return out;
+    }
+
+    fn loader(self: *CountingLoader) Loader {
+        return .{ .ctx = self, .load = load };
+    }
+};
+
+test "Cache.getOrLoad: a miss loads and stores, a hit copies, an error stores nothing" {
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    var cl: CountingLoader = .{};
+
+    const a = try c.getOrLoad(testing.allocator, "x", 0, 0, 0, 0, cl.loader());
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("=x", a);
+    try testing.expectEqual(@as(u32, 1), cl.calls);
+    const b = try c.getOrLoad(testing.allocator, "x", 1, 0, 0, 0, cl.loader());
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("=x", b);
+    try testing.expectEqual(@as(u32, 1), cl.calls); // served from the cache
+    try testing.expect(a.ptr != b.ptr); // the caller's own copy, not cache storage
+
+    cl.fail = true;
+    try testing.expectError(error.LoadFailed, c.getOrLoad(testing.allocator, "y", 2, 0, 0, 0, cl.loader()));
+    try testing.expect(c.get("y", 3, 0) == null);
+    try testing.expectEqual(@as(u32, 2), cl.calls);
+}
+
+test "Cache.getOrLoad: the stored entry carries the given ttl and generation" {
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    var cl: CountingLoader = .{};
+    testing.allocator.free(try c.getOrLoad(testing.allocator, "x", 1000, 0, 100, 5, cl.loader()));
+    try testing.expect(c.get("x", 1100, 5) != null); // 100 old: fresh
+    try testing.expect(c.get("x", 1101, 5) == null); // ttl 100 passed
+    testing.allocator.free(try c.getOrLoad(testing.allocator, "x", 2000, 0, 100, 5, cl.loader()));
+    try testing.expect(c.get("x", 2001, 6) == null); // generation bumped
+}
+
+// ── adaptive window (hill climber) ──────────────────────────────────────────
+//
+// Anchor: otter v2.3.0 `policy.go` (constants 30-35, `determineAdjustment`
+// 389-423, `increaseWindow` 449, `decreaseWindow` 495), see the comment on
+// `Cache.climbIfDue` for what was kept and changed.
+
+test "adaptive_window off (the default): the window stays ~1 % and the climber never runs" {
+    var c = Cache.init(testing.allocator, .{ .max_bytes = 1 << 30, .max_entries = 200 });
+    defer c.deinit();
+    var kbuf: [16]u8 = undefined;
+    for (0..20_000) |i| {
+        const key = std.fmt.bufPrint(&kbuf, "k{d}", .{(i * 7919) % 900}) catch unreachable;
+        if (c.get(key, 0, 0) == null) c.put(key, "v", 0, 0, 0);
+    }
+    try testing.expectEqual(@as(u64, 0), c.climbs);
+    try testing.expectEqual(@as(usize, 2), c.windowCap());
+    try testing.expect(c.window_count <= 2);
+}
+
+fn expectAdaptiveInvariants(c: *Cache) !void {
+    try expectHeapsOrdered(c);
+    try expectRegionHeapsAgree(c);
+    try testing.expectEqual(
+        @as(usize, c.map.count()),
+        c.window_count + c.probation_count + c.protected_count,
+    );
+    // The limit stays inside its bounds, and the regions inside the limits.
+    try testing.expect(c.window_adapt >= 1);
+    try testing.expect(c.window_adapt <= c.windowBound());
+    try testing.expect(c.window_count <= c.windowCap());
+    try testing.expect(c.protected_count <= c.protectedCap());
+}
+
+test "adaptive window: random get/put/remove keep every structural invariant while the window moves" {
+    var c = Cache.init(testing.allocator, .{
+        .max_bytes = 1 << 30,
+        .max_entries = 100,
+        .adaptive_window = true,
+        .idle_ttl_ns = 400,
+    });
+    defer c.deinit();
+    var state: u64 = 0x5EED_CAFE_0011_2233;
+    var now: i64 = 0;
+    var kbuf: [16]u8 = undefined;
+    var lo: usize = c.window_adapt;
+    var hi: usize = c.window_adapt;
+    for (0..120_000) |_| {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        const r = state >> 33;
+        now += @intCast(r % 3);
+        const key = std.fmt.bufPrint(&kbuf, "k{d}", .{(r >> 4) % 300}) catch unreachable;
+        switch ((r >> 20) % 10) {
+            0, 1 => c.put(key, "v", now, if ((r >> 24) % 4 == 0) 150 else 0, 0),
+            2 => _ = c.remove(key),
+            else => if (c.get(key, now, 0) == null) c.put(key, "v", now, 0, 0),
+        }
+        lo = @min(lo, c.window_adapt);
+        hi = @max(hi, c.window_adapt);
+        try expectAdaptiveInvariants(&c);
+        try expectExpiryAgrees(&c);
+    }
+    // Reach: the climber ran, and it actually moved the window.
+    try testing.expect(c.climbs > 10);
+    try testing.expect(hi > lo);
+}
+
+const TraceKind = enum { recency, zipf };
+
+const TraceResult = struct { overall: f64, late: f64, window: usize };
+
+/// Replay one deterministic synthetic trace through a 200-entry cache
+/// (lookup, `put` on a miss) and report the hit rate over the whole run and
+/// over its second half (where the climber has had time to settle).
+fn replayTrace(kind: TraceKind, adaptive: bool) !TraceResult {
+    const cap = 200;
+    const ops: usize = 80_000;
+    var c = Cache.init(testing.allocator, .{ .max_bytes = 1 << 30, .max_entries = cap, .adaptive_window = adaptive });
+    defer c.deinit();
+
+    const universe = 5000;
+    var cdf: [universe]f64 = undefined;
+    var total: f64 = 0;
+    for (&cdf, 0..) |*slot, i| {
+        total += 1.0 / @as(f64, @floatFromInt(i + 1)); // zipf, s = 1.0
+        slot.* = total;
+    }
+
+    var state: u64 = 0xA5A5_1234_DEAD_BEEF;
+    var next_new: u64 = 0;
+    var hits: usize = 0;
+    var late_hits: usize = 0;
+    var kbuf: [24]u8 = undefined;
+    for (0..ops) |i| {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        const r = state >> 33;
+        const id: u64 = switch (kind) {
+            // Pure recency: half the accesses bring a never-seen key, half
+            // re-reference one of the last 100 new keys (half the cache),
+            // uniformly. Plain LRU would hit on every re-reference. A
+            // frequency gate with a 2-entry window rejects nearly every new
+            // key at the window's exit -- each has been seen once or twice,
+            // the main region's victims at least as often -- so a fixed
+            // window re-hits almost nothing.
+            .recency => blk: {
+                if (r & 1 == 0 or next_new < 100) {
+                    next_new += 1;
+                    break :blk next_new - 1;
+                }
+                break :blk next_new - 1 - (r >> 1) % 100;
+            },
+            // Frequency-skewed: zipf over 5000 keys.
+            .zipf => blk: {
+                const u = @as(f64, @floatFromInt(r & 0xFFFFFF)) / @as(f64, 0x1000000) * total;
+                var lo: usize = 0;
+                var hi: usize = universe - 1;
+                while (lo < hi) {
+                    const mid = (lo + hi) / 2;
+                    if (cdf[mid] < u) lo = mid + 1 else hi = mid;
+                }
+                break :blk lo;
+            },
+        };
+        const key = std.fmt.bufPrint(&kbuf, "k{d}", .{id}) catch unreachable;
+        if (c.get(key, 0, 0) != null) {
+            hits += 1;
+            if (i >= ops / 2) late_hits += 1;
+        } else {
+            c.put(key, "v", 0, 0, 0);
+        }
+    }
+    return .{
+        .overall = @as(f64, @floatFromInt(hits)) / @as(f64, ops),
+        .late = @as(f64, @floatFromInt(late_hits)) / @as(f64, ops / 2),
+        .window = c.window_adapt,
+    };
+}
+
+test "adaptive window: on a recency-skewed trace it beats the fixed window by a wide margin" {
+    const fixed = try replayTrace(.recency, false);
+    const adaptive = try replayTrace(.recency, true);
+    std.testing.expect(adaptive.late > fixed.late + 0.10) catch |err| {
+        std.debug.print(
+            "recency trace, second half: fixed {d:.4} (overall {d:.4}), adaptive {d:.4} (overall {d:.4}), adaptive window {d}\n",
+            .{ fixed.late, fixed.overall, adaptive.late, adaptive.overall, adaptive.window },
+        );
+        return err;
+    };
+    // ...because the climber really did grow the window.
+    try testing.expect(adaptive.window > 20);
+}
+
+test "adaptive window: on a frequency-skewed (zipf) trace it is no worse than the fixed window by 1 point" {
+    const fixed = try replayTrace(.zipf, false);
+    const adaptive = try replayTrace(.zipf, true);
+    std.testing.expect(adaptive.overall + 0.01 >= fixed.overall) catch |err| {
+        std.debug.print(
+            "zipf trace: fixed {d:.4}, adaptive {d:.4} (overall), adaptive window {d}\n",
+            .{ fixed.overall, adaptive.overall, adaptive.window },
+        );
+        return err;
+    };
 }

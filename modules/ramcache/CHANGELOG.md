@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Added (S3 to S2, Caffeine parity; all additive, defaults unchanged): **time-to-idle**
+  (`Options.idle_ttl_ns` on `Cache` and `Sharded`; a hit or a `put` refreshes the idle deadline, the
+  effective deadline is the earlier of write-TTL and idle, counts in `Stats.expired`); **`getOrLoad`**
+  with a `Loader`/`LoadError` (`Sharded.getOrLoad` is single-flight: one leader loads without the
+  shard lock, waiters receive its value or its error; `Cache.getOrLoad` is the non-concurrent twin);
+  an opt-in **adaptive admission window** (`Options.adaptive_window`, Caffeine/otter hill climber,
+  window bounded to 1 entry .. 80 % of `max_entries`). New `tools/bench.zig` + `tools/go_bench`
+  (`zig build bench-ramcache`) against maypok86/otter v2.3.0. The borrow-seam fuzz harness now also
+  runs with idle expiry and checks the expiry heap's membership after every operation.
 - **2026-10-09** — tests: deterministic fuzz driver `RAMCACHE_FUZZ` over the existing harnesses.
 
 - **2026-10-04** — Fix (**BEHAVIOURAL**): `Sharded.stats()` now reports `rehashes` (it was

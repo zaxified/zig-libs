@@ -191,6 +191,17 @@
 //!     `markCleanIf(key, flushed_value)` closes it: it clears the bit only if
 //!     the stored value still equals the bytes that were persisted.
 //!
+//! ## Read-through — `getOrLoad`
+//!
+//! `getOrLoad` is the stampede guard: on a miss exactly one caller per key runs
+//! the caller's `Loader` (with no shard lock held), everyone else who asks for
+//! that key meanwhile waits for it and receives a copy of the same value or
+//! the same error. The in-flight table is per shard and guarded by the shard
+//! lock, so it adds no lock and no lock order: the lock is taken twice by the
+//! leader (register, publish) and once by a waiter, never across the load.
+//! Waiters wait the way lock waiters do (spin, then yield) and are released by
+//! an atomic flag, so a long load keeps its waiters yielding, not spinning.
+//!
 //! ## Requirements on the caller
 //!
 //! The allocator is shared by all shards and is used from every calling
@@ -208,6 +219,8 @@ const Cache = root.Cache;
 const Stats = root.Stats;
 const OnEvictFn = root.OnEvictFn;
 const DirtyFn = root.DirtyFn;
+const Loader = root.Loader;
+const LoadError = root.LoadError;
 
 /// How many `tryLock` attempts a waiter makes before it starts handing the CPU
 /// back. Sized for the uncontended and briefly-contended cases — a lock held
@@ -252,6 +265,24 @@ fn lockAcquire(m: *std.atomic.Mutex) void {
     }
 }
 
+/// Wait for a flag with the shard lock's discipline: a bounded spin, then
+/// `Thread.yield`.
+fn waitFor(flag: *const std.atomic.Value(bool)) void {
+    var spins: u32 = 0;
+    while (!flag.load(.acquire)) {
+        if (spins < spin_budget) {
+            spins += 1;
+            std.atomic.spinLoopHint();
+        } else {
+            waitYield();
+        }
+    }
+}
+
+fn waitYield() void {
+    std.Thread.yield() catch std.atomic.spinLoopHint();
+}
+
 pub const Sharded = struct {
     /// Tunables, fixed at `init`. `max_bytes`/`max_entries` are **aggregate**
     /// budgets — see the per-shard division in the module doc.
@@ -281,6 +312,14 @@ pub const Sharded = struct {
         on_evict: ?OnEvictFn = null,
         /// Opaque pointer handed to every `on_evict` call.
         on_evict_ctx: ?*anyopaque = null,
+        /// Time-to-idle, per `Cache.Options.idle_ttl_ns`: an entry not read
+        /// for this long expires. Every shard applies it independently.
+        idle_ttl_ns: i64 = 0,
+        /// Adaptive admission window, per `Cache.Options.adaptive_window`.
+        /// Each shard runs its own climber on its own traffic and its own
+        /// slice of the capacity (`max_entries / shards`), so a shard under
+        /// ~16 entries never moves its window.
+        adaptive_window: bool = false,
     };
 
     /// Outcome of `getBuf`. Deliberately not `?[]const u8`: "the value is
@@ -314,6 +353,28 @@ pub const Sharded = struct {
     const Shard = struct {
         lock: std.atomic.Mutex align(std.atomic.cache_line) = .unlocked,
         cache: Cache,
+        /// Loads in progress, by key (`getOrLoad`). Guarded by `lock`. The
+        /// `Flight` lives on its leader's stack; the leader removes it from
+        /// here before it can go out of scope.
+        inflight: std.StringHashMapUnmanaged(*Flight) = .empty,
+    };
+
+    /// One in-progress `getOrLoad` of a key: the leader's result, published to
+    /// the callers that arrived while it was running.
+    ///
+    /// Lifetime: it is the leader's stack object. A waiter registers itself in
+    /// `waiters` while holding the shard lock *and* while the flight is still
+    /// in `inflight`; the leader removes the flight under the same lock, so
+    /// after that `waiters` can only fall, and the leader leaves its frame only
+    /// once it reads zero. `key` borrows the leader's argument for the same
+    /// span; `value`/`err` are written before `done` is released and read only
+    /// after it is acquired.
+    const Flight = struct {
+        key: []const u8,
+        done: std.atomic.Value(bool) = .init(false),
+        waiters: std.atomic.Value(u32) = .init(0),
+        err: ?LoadError = null,
+        value: []const u8 = &.{},
     };
 
     /// Base seed, distinct from `FrequencySketch`'s (`0` and
@@ -391,6 +452,8 @@ pub const Sharded = struct {
             .default_ttl_ns = options.default_ttl_ns,
             .on_evict = options.on_evict,
             .on_evict_ctx = options.on_evict_ctx,
+            .idle_ttl_ns = options.idle_ttl_ns,
+            .adaptive_window = options.adaptive_window,
         }) };
         return .{
             .alloc = alloc,
@@ -405,7 +468,10 @@ pub const Sharded = struct {
     /// Free every shard and the shard array. Not synchronized — the caller
     /// guarantees no concurrent access, as for any destructor.
     pub fn deinit(self: *Sharded) void {
-        for (self.shards) |*s| s.cache.deinit();
+        for (self.shards) |*s| {
+            s.inflight.deinit(self.alloc);
+            s.cache.deinit();
+        }
         self.alloc.free(self.shards);
     }
 
@@ -468,6 +534,92 @@ pub const Sharded = struct {
         defer s.lock.unlock();
         const borrowed = s.cache.get(key, now_ns, cur_gen) orelse return null;
         return try self.alloc.dupe(u8, borrowed);
+    }
+
+    /// Read-through with single-flight: the value for `key` as a copy owned by
+    /// `gpa` (free it with `gpa`), loading it with `loader` on a miss.
+    ///
+    /// * **Hit** — a copy of the cached value (`get` semantics: counts a hit,
+    ///   refreshes recency and the idle deadline).
+    /// * **Miss** — exactly one caller per key, the *leader*, runs
+    ///   `loader.load` **without holding the shard lock**, stores the result
+    ///   (`ttl_ns`/`gen` as `put`; admission may decline it, the leader still
+    ///   returns its value), and returns it. Every caller that asks for the
+    ///   same key while the load is in flight is a *waiter*: it blocks until
+    ///   the leader is done and gets its own copy of the same value, or the
+    ///   same error (`LoadFailed` / `OutOfMemory`) if the leader failed.
+    ///   Waiters do not retry. A key whose load finished and was not retained
+    ///   (declined by admission, or evicted at once) is loaded again by the
+    ///   next caller — single-flight, not memoisation.
+    /// * `cur_gen` is the generation the lookup is made at; `ttl_ns` and `gen`
+    ///   describe the entry written on a miss.
+    ///
+    /// Waiting uses the shard lock's discipline (a bounded spin, then
+    /// `Thread.yield`), never an `Io`; a waiter is therefore stuck for as long
+    /// as the loader runs, and the loader must not suspend an `Io` task that
+    /// shares a thread with a waiter (see `Options.io` in the SPEC backlog,
+    /// which this does not close). The loader must **not re-enter `getOrLoad`
+    /// for the same key from the same thread** (it would wait for itself). It
+    /// runs with no lock held, so using this `Sharded` for other keys is fine.
+    ///
+    /// Behaviour anchored on Go singleflight as otter uses it: first caller
+    /// loads (otter `singleflight.go:98-112`), the result and error are shared
+    /// with everyone waiting on that call (`:114-132`, `cache_impl.go:766-791`).
+    /// Not taken: otter forgets a call when the key is invalidated mid-load; here
+    /// a `clear` during a load does not cancel it, its result is stored after.
+    ///
+    /// `gpa` must be thread-safe if several threads pass the same one.
+    pub fn getOrLoad(
+        self: *Sharded,
+        gpa: Allocator,
+        key: []const u8,
+        now_ns: i64,
+        cur_gen: u64,
+        ttl_ns: i64,
+        gen: u64,
+        loader: Loader,
+    ) LoadError![]u8 {
+        const s = &self.shards[self.shardIndex(key)];
+        lockAcquire(&s.lock);
+        if (s.cache.get(key, now_ns, cur_gen)) |hit| {
+            defer s.lock.unlock();
+            return gpa.dupe(u8, hit);
+        }
+        if (s.inflight.get(key)) |f| {
+            _ = f.waiters.fetchAdd(1, .monotonic);
+            s.lock.unlock();
+            waitFor(&f.done);
+            // The decrement is the release that lets the leader reclaim `f`;
+            // nothing of `f` may be touched after it.
+            defer _ = f.waiters.fetchSub(1, .release);
+            if (f.err) |e| return e;
+            return gpa.dupe(u8, f.value);
+        }
+        // Leader. Reserve the table slot before running anything.
+        var flight: Flight = .{ .key = key };
+        s.inflight.put(self.alloc, key, &flight) catch {
+            s.lock.unlock();
+            return error.OutOfMemory;
+        };
+        s.lock.unlock();
+
+        const loaded: LoadError![]u8 = loader.load(loader.ctx, gpa, key);
+
+        lockAcquire(&s.lock);
+        if (loaded) |v| {
+            s.cache.put(key, v, now_ns, ttl_ns, gen);
+            flight.value = v;
+        } else |e| {
+            flight.err = e;
+        }
+        _ = s.inflight.remove(key);
+        flight.done.store(true, .release);
+        s.lock.unlock();
+
+        // Waiters copy `flight.value` after this point; keep it alive until
+        // every one of them has said so.
+        while (flight.waiters.load(.acquire) != 0) waitYield();
+        return loaded;
     }
 
     /// Release a copy returned by `get`.
@@ -1684,4 +1836,194 @@ test "deriveSeed gives two different seeds for the same anchor address" {
     // Doc on `seed_counter`: two caches built back to back get different
     // seeds "even if the allocator hands back the same address".
     try testing.expect(Sharded.deriveSeed(0x1000) != Sharded.deriveSeed(0x1000));
+}
+
+// ── getOrLoad (single-flight) and time-to-idle ───────────────────────────────
+
+const LoadCtx = struct {
+    sc: *Sharded,
+    calls: std.atomic.Value(u32) = .init(0),
+    fail: bool = false,
+    /// The loader holds the load open until this many callers are waiting on
+    /// its flight, so "everyone shares one load" is decided by construction
+    /// and not by thread timing.
+    hold_for_waiters: u32 = 0,
+    waiters_seen: std.atomic.Value(u32) = .init(0),
+
+    fn waitersOf(self: *LoadCtx, key: []const u8) u32 {
+        const s = &self.sc.shards[self.sc.shardIndex(key)];
+        lockAcquire(&s.lock);
+        defer s.lock.unlock();
+        const f = s.inflight.get(key) orelse return 0;
+        return f.waiters.load(.monotonic);
+    }
+
+    fn load(ctx: ?*anyopaque, gpa: Allocator, key: []const u8) LoadError![]u8 {
+        const self: *LoadCtx = @ptrCast(@alignCast(ctx.?));
+        _ = self.calls.fetchAdd(1, .monotonic);
+        var spins: usize = 0;
+        while (spins < 2_000_000 and self.waitersOf(key) < self.hold_for_waiters) : (spins += 1) {
+            std.Thread.yield() catch {};
+        }
+        self.waiters_seen.store(self.waitersOf(key), .monotonic);
+        if (self.fail) return error.LoadFailed;
+        const out = try gpa.alloc(u8, 2 + key.len);
+        out[0] = 'v';
+        out[1] = '-';
+        @memcpy(out[2..], key);
+        return out;
+    }
+
+    fn loader(self: *LoadCtx) root.Loader {
+        return .{ .ctx = self, .load = load };
+    }
+};
+
+test "getOrLoad: a miss loads and stores, a hit does not load again" {
+    var sc = try testSharded(1 << 20, 64, 4);
+    defer sc.deinit();
+    var lc: LoadCtx = .{ .sc = &sc };
+
+    const first = try sc.getOrLoad(testing.allocator, "k", 0, 0, 0, 0, lc.loader());
+    defer testing.allocator.free(first);
+    try testing.expectEqualStrings("v-k", first);
+    try testing.expectEqual(@as(u32, 1), lc.calls.load(.monotonic));
+
+    // Stored: a plain read finds it, and a second getOrLoad runs no loader.
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("v-k", sc.getBuf("k", 1, 0, &buf).ok);
+    const second = try sc.getOrLoad(testing.allocator, "k", 2, 0, 0, 0, lc.loader());
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings("v-k", second);
+    try testing.expectEqual(@as(u32, 1), lc.calls.load(.monotonic));
+    // The caller owns its copy: it is not the cache's storage.
+    try testing.expect(first.ptr != second.ptr);
+    for (sc.shards) |*s| try testing.expectEqual(@as(usize, 0), s.inflight.count());
+    try expectInvariants(&sc);
+}
+
+test "getOrLoad: a loader error is returned, nothing is stored, and the next call loads again" {
+    var sc = try testSharded(1 << 20, 64, 4);
+    defer sc.deinit();
+    var lc: LoadCtx = .{ .sc = &sc, .fail = true };
+
+    try testing.expectError(error.LoadFailed, sc.getOrLoad(testing.allocator, "k", 0, 0, 0, 0, lc.loader()));
+    var buf: [16]u8 = undefined;
+    try testing.expect(sc.getBuf("k", 1, 0, &buf) == .miss);
+    for (sc.shards) |*s| try testing.expectEqual(@as(usize, 0), s.inflight.count());
+
+    lc.fail = false;
+    const v = try sc.getOrLoad(testing.allocator, "k", 2, 0, 0, 0, lc.loader());
+    defer testing.allocator.free(v);
+    try testing.expectEqualStrings("v-k", v);
+    try testing.expectEqual(@as(u32, 2), lc.calls.load(.monotonic));
+}
+
+test "getOrLoad: the entry written on a miss carries the given ttl and generation" {
+    var sc = try testSharded(1 << 20, 64, 4);
+    defer sc.deinit();
+    var lc: LoadCtx = .{ .sc = &sc };
+    const v = try sc.getOrLoad(testing.allocator, "k", 1000, 0, 100, 7, lc.loader());
+    testing.allocator.free(v);
+    var buf: [16]u8 = undefined;
+    try testing.expect(sc.getBuf("k", 1050, 7, &buf) == .ok); // fresh: 50 < 100, gen matches
+    try testing.expect(sc.getBuf("k", 1050, 8, &buf) == .miss); // generation moved on: stale, dropped
+    // The same value, ttl-expired instead.
+    const w = try sc.getOrLoad(testing.allocator, "k", 2000, 0, 100, 7, lc.loader());
+    testing.allocator.free(w);
+    try testing.expect(sc.getBuf("k", 2101, 7, &buf) == .miss);
+}
+
+test "getOrLoad: a hit that cannot be copied is OutOfMemory, not a miss and not a load" {
+    var sc = try testSharded(1 << 20, 64, 4);
+    defer sc.deinit();
+    sc.put("k", "value", 0, 0, 0);
+    var lc: LoadCtx = .{ .sc = &sc };
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, sc.getOrLoad(failing.allocator(), "k", 1, 0, 0, 0, lc.loader()));
+    try testing.expectEqual(@as(u32, 0), lc.calls.load(.monotonic));
+}
+
+const LoadThread = struct {
+    sc: *Sharded,
+    lc: *LoadCtx,
+    out: ?[]u8 = null,
+    err: ?LoadError = null,
+
+    fn run(t: *LoadThread) void {
+        t.out = t.sc.getOrLoad(testing.allocator, "hot", 0, 0, 0, 0, t.lc.loader()) catch |e| {
+            t.err = e;
+            return;
+        };
+    }
+};
+
+fn runLoadThreads(sc: *Sharded, lc: *LoadCtx, n: usize) ![]LoadThread {
+    const ts = try testing.allocator.alloc(LoadThread, n);
+    errdefer testing.allocator.free(ts);
+    const threads = try testing.allocator.alloc(std.Thread, n);
+    defer testing.allocator.free(threads);
+    for (ts) |*t| t.* = .{ .sc = sc, .lc = lc };
+    for (threads, 0..) |*th, i| th.* = try std.Thread.spawn(.{}, LoadThread.run, .{&ts[i]});
+    for (threads) |th| th.join();
+    return ts;
+}
+
+test "getOrLoad: N threads asking for one cold key run the loader exactly once and all get the value" {
+    const n: usize = 6;
+    var sc = try testSharded(1 << 20, 64, 4);
+    defer sc.deinit();
+    var lc: LoadCtx = .{ .sc = &sc, .hold_for_waiters = n - 1 };
+    const ts = try runLoadThreads(&sc, &lc, n);
+    defer testing.allocator.free(ts);
+    // n - 1 callers were parked on the leader's flight while it loaded:
+    // single-flight really was exercised, not dodged by thread timing.
+    try testing.expectEqual(@as(u32, n - 1), lc.waiters_seen.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), lc.calls.load(.monotonic));
+    defer for (ts) |t| if (t.out) |o| testing.allocator.free(o);
+    for (ts, 0..) |t, i| {
+        try testing.expect(t.err == null);
+        try testing.expectEqualStrings("v-hot", t.out.?);
+        // Each caller got its OWN copy.
+        for (ts[0..i]) |u| try testing.expect(u.out.?.ptr != t.out.?.ptr);
+    }
+    for (sc.shards) |*s| try testing.expectEqual(@as(usize, 0), s.inflight.count());
+    try expectInvariants(&sc);
+}
+
+test "getOrLoad: a loader failure reaches every waiter, and they do not retry" {
+    const n: usize = 6;
+    var sc = try testSharded(1 << 20, 64, 4);
+    defer sc.deinit();
+    var lc: LoadCtx = .{ .sc = &sc, .fail = true, .hold_for_waiters = n - 1 };
+    const ts = try runLoadThreads(&sc, &lc, n);
+    defer testing.allocator.free(ts);
+    try testing.expectEqual(@as(u32, n - 1), lc.waiters_seen.load(.monotonic));
+    // One load, and its error is everyone's result: no waiter ran its own.
+    try testing.expectEqual(@as(u32, 1), lc.calls.load(.monotonic));
+    for (ts) |t| {
+        try testing.expect(t.out == null);
+        try testing.expect(t.err.? == error.LoadFailed);
+    }
+    var buf: [16]u8 = undefined;
+    try testing.expect(sc.getBuf("hot", 1, 0, &buf) == .miss);
+}
+
+test "idle_ttl_ns through the shards: a read refreshes the deadline, silence expires the entry, and it counts as expired" {
+    var sc = try Sharded.init(testing.allocator, .{
+        .max_bytes = 1 << 20,
+        .max_entries = 64,
+        .shards = 4,
+        .idle_ttl_ns = 100,
+    });
+    defer sc.deinit();
+    sc.put("k", "v", 0, 0, 0);
+    var buf: [8]u8 = undefined;
+    try testing.expect(sc.getBuf("k", 90, 0, &buf) == .ok); // 90 idle <= 100
+    // Without the refresh at 90 this would be 180 idle: expired.
+    try testing.expect(sc.getBuf("k", 180, 0, &buf) == .ok);
+    try testing.expectEqual(@as(u64, 0), sc.stats().expired);
+    try testing.expect(sc.getBuf("k", 281, 0, &buf) == .miss); // 101 idle > 100
+    try testing.expectEqual(@as(u64, 1), sc.stats().expired);
+    try testing.expectEqual(@as(usize, 0), sc.stats().entries);
 }
