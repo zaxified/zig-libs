@@ -115,6 +115,13 @@ try db.copyTo(store, "app.kvt.bak");
 Production wires `kvtree.FsStorage` over a real directory; tests use
 `kvtree.SimStorage` (re-exported from `kv`) for deterministic crash simulation.
 
+**For read speed, put a `pagecache.PageCache` in front of the `FsStorage`**
+(`Db.open(gpa, pc.storage(), ...)`): a resident page is then lent to a `get`
+with no syscall and no copy, the way bbolt reads its mmap. Bare `FsStorage`
+`pread`s every page of every descent — about 4× slower gets than bbolt; with
+the cache holding the file, gets are on par (see SPEC.md, Performance). The
+cache is write-through, so durability and the fsync order do not change.
+
 ## Verify
 
 ```

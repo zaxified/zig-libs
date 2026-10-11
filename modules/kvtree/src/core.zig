@@ -369,33 +369,32 @@ fn readForCommit(pager: *Pager, id: PageId, buf: *[page_size]u8) CommitError!voi
 /// Fold `changes` (ordered, possibly repeating keys) into a sorted list of
 /// final per-key effects — last writer wins, exactly the reference `Model`'s
 /// semantics.
+///
+/// A stable sort, then one compaction pass that keeps each key's LAST change
+/// (stability keeps equal keys in change order). O(n log n). It used to
+/// insert each change into a sorted array: O(n²) moves, 14 % of a 100 000-put
+/// transaction's whole run in the kvtree bench's preload (2026-10-11).
 fn reduceChanges(arena: Allocator, changes: []const Change) CommitError!std.ArrayList(Op) {
-    var ops: std.ArrayList(Op) = .empty;
-    for (changes) |c| {
-        const key: []const u8, const val: ?[]const u8 = switch (c) {
-            .put => |p| .{ p.key, p.val },
-            .del => |k| .{ k, null },
-        };
-        var lo: usize = 0;
-        var hi: usize = ops.items.len;
-        var found = false;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            switch (std.mem.order(u8, ops.items[mid].key, key)) {
-                .lt => lo = mid + 1,
-                .gt => hi = mid,
-                .eq => {
-                    lo = mid;
-                    found = true;
-                    break;
-                },
-            }
+    var ops = std.ArrayList(Op).initCapacity(arena, changes.len) catch return error.OutOfMemory;
+    for (changes) |c| ops.appendAssumeCapacity(switch (c) {
+        .put => |p| .{ .key = p.key, .val = p.val },
+        .del => |k| .{ .key = k, .val = null },
+    });
+    std.mem.sort(Op, ops.items, {}, struct {
+        fn lessThan(_: void, x: Op, y: Op) bool {
+            return std.mem.order(u8, x.key, y.key) == .lt;
         }
-        if (found)
-            ops.items[lo].val = val
-        else
-            ops.insert(arena, lo, .{ .key = key, .val = val }) catch return error.OutOfMemory;
+    }.lessThan);
+    var w: usize = 0;
+    for (ops.items) |op| {
+        if (w > 0 and std.mem.eql(u8, ops.items[w - 1].key, op.key)) {
+            ops.items[w - 1] = op;
+        } else {
+            ops.items[w] = op;
+            w += 1;
+        }
     }
+    ops.shrinkRetainingCapacity(w);
     return ops;
 }
 

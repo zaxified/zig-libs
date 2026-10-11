@@ -2138,6 +2138,49 @@ test "retention on a forward-moving key range keeps the file bounded (emptied le
     try testing.expectEqual(@as(u64, 90 * block), want);
 }
 
+test "one transaction, many changes per key: the last change of each key wins" {
+    // `core.reduceChanges` folds a transaction's changes by key; each key here
+    // takes ~80 changes with a DISTINCT value each (a put after a put is only
+    // checkable when the values differ), mixed with deletes, in random order.
+    var prng = std.Random.DefaultPrng.init(0x6c617374);
+    const r = prng.random();
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "w.kvt", .{});
+    defer db.close();
+
+    const keys = 50;
+    var model: [keys]?u32 = @splat(null);
+    var txn = try db.begin();
+    var kb: [keys][4]u8 = undefined;
+    var vb: [4000][8]u8 = undefined;
+    for (0..4000) |i| {
+        const id = r.uintLessThan(usize, keys);
+        const k = std.fmt.bufPrint(&kb[id], "k{d:0>2}", .{id}) catch unreachable;
+        if (r.uintLessThan(u8, 4) == 0) {
+            try txn.del(k);
+            model[id] = null;
+        } else {
+            try txn.put(k, std.fmt.bufPrint(&vb[i], "{d:0>8}", .{i}) catch unreachable);
+            model[id] = @intCast(i);
+        }
+    }
+    try txn.commit();
+
+    var snap = try db.snapshot();
+    defer snap.release();
+    for (0..keys) |id| {
+        var k: [4]u8 = undefined;
+        const got = try snap.get(testing.allocator, std.fmt.bufPrint(&k, "k{d:0>2}", .{id}) catch unreachable);
+        defer if (got) |g| testing.allocator.free(g);
+        if (model[id]) |want| {
+            var w: [8]u8 = undefined;
+            try testing.expectEqualStrings(std.fmt.bufPrint(&w, "{d:0>8}", .{want}) catch unreachable, got.?);
+        } else try testing.expect(got == null);
+    }
+}
+
 test "deletes that empty leaves, branches and the whole tree agree with a model, open snapshots included" {
     const key_space = 2500;
     const Model = [key_space]?u32;

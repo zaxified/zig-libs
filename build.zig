@@ -25,6 +25,12 @@ const Module = struct {
     /// exists to tell `scripts/test.sh` what to re-test, and a change to
     /// testkit must re-test everything whose tests use it.
     test_deps: []const []const u8 = &.{},
+    /// Modules ONLY its comparative benchmark (`tools/bench.zig`) imports,
+    /// beside `deps` -- e.g. `kvtree`'s bench measures the production shape
+    /// with a `pagecache` in front, and `pagecache` depends on `kvtree`, so it
+    /// can be neither a dep nor a test dep. Never in the module, its tests or
+    /// `module-graph`: the bench is run by hand, by no lane.
+    bench_deps: []const []const u8 = &.{},
     /// This module ships `example/main.zig`: a consumer binary built by
     /// `zig build check-examples` against the PUBLISHED module — `deps` only,
     /// no `test_deps`, no reach into anything the module does not export.
@@ -190,7 +196,7 @@ const module_list = [_]Module{
     .{ .name = "crc32", .libs = &.{ "format", "storage" }, .test_deps = &.{"testkit"} },
     .{ .name = "crc32c", .libs = &.{ "format", "storage" }, .test_deps = &.{"testkit"} },
     .{ .name = "kv", .libs = &.{"storage"} },
-    .{ .name = "kvtree", .libs = &.{ "storage", "net" }, .deps = &.{ "kv", "crc32" }, .test_deps = &.{"testkit"} },
+    .{ .name = "kvtree", .libs = &.{ "storage", "net" }, .deps = &.{ "kv", "crc32" }, .test_deps = &.{"testkit"}, .bench_deps = &.{"pagecache"} },
     .{ .name = "blobmsg", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "tar", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "latency-stats", .libs = &.{"net"} },
@@ -732,6 +738,7 @@ pub fn build(b: *std.Build) void {
             // ReleaseFast driver over a Debug module measures Debug.
             bench_mod.addImport(m.name, fastModuleGraph(b, target, &fast_mods, m.name));
             for (m.deps) |dep| bench_mod.addImport(dep, fastModuleGraph(b, target, &fast_mods, dep));
+            for (m.bench_deps) |dep| bench_mod.addImport(dep, fastModuleGraph(b, target, &fast_mods, dep));
             // `fastmem` for every bench driver (2026-10-11): a bench that
             // exercises std code which memsets large blocks installs
             // `fastmem.exportSymbols()`, as this collection's libc-free

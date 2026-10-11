@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Performance: `commit` folds a transaction's changes with a stable sort and one
+  compaction pass instead of inserting each into a sorted array (O(n log n), was O(n²) moves; a
+  100 000-put transaction spent most of its CPU there). Same result, last change of a key wins (new
+  test). The comparative bench now opens its stores on a `pagecache` in front of `FsStorage`, the
+  production shape the README now recommends: ref 1.14–1.40× bbolt v1.5.0 (gets were 4.67× on bare
+  `FsStorage`).
 - **2026-10-11** — **Buckets** (bbolt's `Bucket`): `Txn.createBucket`/`createBucketIfNotExists`/`bucket`/`deleteBucket`, `Bucket.put`/`del`/`get`/nested buckets/`sequence`/`setSequence`/`nextSequence`, read through `Snapshot.bucket` → `ReadBucket` (`get`, `getRef`, `cursor`, `bucket`). A bucket is a nested B-tree whose root a flagged leaf cell holds; a commit rewrites the changed nested trees first and links them like values, inside the same two fsyncs; a deleted bucket's whole tree goes to the freelist under the reclaim gate. Format v4, sticky, only once a bucket exists. `get` of a bucket's name is null, cursors yield it as `KV.bucket`; a plain put/delete over a bucket fails the commit with `error.IncompatibleValue` (new `CommitError`, not poisoning). `recover` and `copyTo` walk nested trees. **`Options.read_only`**: a shared lock (`kv.Storage.tryLockShared`), data file opened read-only, `begin` → `error.ReadOnly` (new `CommitError`) — several readers in any processes, none together with a writer, as bbolt's `ReadOnly`. Tests: nested spaces + reopen, misuse refusals, delete frees every page (snapshot still reads it), copyTo deep-equal, a 400-txn random model over two bucket levels with held snapshots and reopens, a crash sweep over a commit that drops one bucket tree and creates two (all four crash modes). Bench `tools/bench.zig` vs bbolt v1.5.0.
 
 - **2026-10-09** — tests: deterministic fuzz driver `KVTREE_FUZZ` over the existing harness (`recover`; its body is now generic over its source) plus `recover-mutated`, the corpus with 0-2 knob words nudged and 0-3 page octets overwritten (random pages never reach an adopted meta).

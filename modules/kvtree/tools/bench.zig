@@ -26,8 +26,14 @@
 //!   map_baseline   std.StringHashMap get vs Go map get over the same keys:
 //!                  a baseline of the language runtimes, INFO ONLY
 //! bbolt has no keys outside a bucket, so its rows all use bucket "b"; ours
-//! use the root tree except bucket_get. bbolt reads from an mmap (no syscall
-//! per get); ours preads through kv.FsStorage -- part of what is compared.
+//! use the root tree except bucket_get. Storage shape, the production one on
+//! each side: bbolt reads its mmap, resident in the OS page cache after the
+//! preload; ours opens the store on a `pagecache.PageCache` in front of
+//! `kv.FsStorage` with a budget that holds the whole file
+//! (`cache_pages`), so a resident page is lent to the descent with no
+//! syscall and no copy (`Storage.preadRef`). Writes go through it too
+//! (write-through, same fsyncs). Until 2026-10-11 ours preaded every page
+//! through bare `kv.FsStorage`: get_hit 4.67x, scan 3.32x.
 //! Result count = hits + value bytes read (gets, scan), puts + value bytes
 //! written (write rows); it does not depend on how many ops a side ran.
 //! Each side times the same way (double the batch until it takes over 100 ms,
@@ -38,6 +44,7 @@
 
 const std = @import("std");
 const kvtree = @import("kvtree");
+const pagecache = @import("pagecache");
 
 const bench_name = "bench-kvtree";
 const work_dir = ".zig-cache/bench-kvtree";
@@ -54,6 +61,9 @@ const val_len = 100;
 const get_n = 20_000;
 const batch_w = 1000;
 const seed = 0x6b767472;
+/// 32 MiB of 4 KiB pages: the preloaded store plus every write row's growth
+/// over a timed run fit, so no row measures eviction.
+const cache_pages = 8192;
 
 const gpa = std.heap.smp_allocator;
 
@@ -229,7 +239,10 @@ fn oursRow(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, d: *const Data
     dir.deleteFile(io, lock) catch {};
     const fs = try arena.create(kvtree.FsStorage);
     fs.* = kvtree.FsStorage.init(io, dir);
-    var l: Live = .{ .d = d, .db = try kvtree.Db.open(gpa, fs.storage(), file, .{}) };
+    const pc = try arena.create(pagecache.PageCache);
+    pc.* = pagecache.PageCache.init(gpa, fs.storage(), .{ .max_pages = cache_pages });
+    defer pc.deinit();
+    var l: Live = .{ .d = d, .db = try kvtree.Db.open(gpa, pc.storage(), file, .{}) };
     try preload(&l, w == 4);
     const row = timeIt(io, d, &l, w);
     l.db.close();
