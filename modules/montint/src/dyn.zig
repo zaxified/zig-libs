@@ -120,7 +120,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             if (v[0] & 1 == 0) return error.EvenModulus;
             const n = activeLimbs(v);
             if (n == 1 and v[0] < 3) return error.ModulusTooSmall;
-            return build(v, (n - 1) * 64 + (64 - @clz(v[n - 1])));
+            return build(v, (n - 1) * 64 + (64 - @clz(v[n - 1])), false);
         }
 
         /// Build from a limb value whose bit length the caller knows — the
@@ -143,16 +143,19 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             }
             bad |= ~(v[top / 64] >> @intCast(top % 64)) & 1; // top bit set
             if (bad != 0) return error.NonCanonical;
-            return build(v, nbits);
+            return build(v, nbits, false);
         }
 
-        fn build(v: *const Elem, nbits: usize) Self {
+        fn build(v: *const Elem, nbits: usize, comptime public: bool) Self {
             const d: u7 = @intCast(@min(64, nbits - 1));
             const slot = slotFor((nbits + 63) / 64);
             comptime var s: usize = min_limbs;
             inline while (s <= max_limbs) : (s += step) {
                 if (s == slot) {
-                    const mm = Mod(s).fromElemUnchecked(v[0..s].*);
+                    // A public modulus starts `R mod m` at `2^(nbits−1)`; a
+                    // secret one keeps the derivation from 1, whose work
+                    // does not involve `nbits` at all.
+                    const mm = if (public) Mod(s).fromElemUncheckedBits(v[0..s].*, nbits) else Mod(s).fromElemUnchecked(v[0..s].*);
                     var self: Self = .{
                         .L = s,
                         .nbits = nbits,
@@ -183,6 +186,25 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             var v = try loadBE(be);
             defer std.crypto.secureZero(u64, &v);
             return fromLimbs(&v);
+        }
+
+        /// `fromLimbs` for a PUBLIC modulus (an RSA `n`, a verifier's key):
+        /// the constants are built faster — `R mod m` starts at
+        /// `2^(bits−1)` instead of 1, `64·L − bits + 1` doublings instead of
+        /// `64·L` (one for a full-width 2048-bit modulus) — at the price of
+        /// work that depends on the exact bit length. Same checks, same
+        /// constants (bit for bit) as `fromLimbs`. Never for a secret prime.
+        pub fn fromLimbsPublic(v: *const Elem) Error!Self {
+            if (v[0] & 1 == 0) return error.EvenModulus;
+            const n = activeLimbs(v);
+            if (n == 1 and v[0] < 3) return error.ModulusTooSmall;
+            return build(v, (n - 1) * 64 + (64 - @clz(v[n - 1])), true);
+        }
+
+        /// `fromBytesBE` for a PUBLIC modulus, see `fromLimbsPublic`.
+        pub fn fromBytesBEPublic(be: []const u8) Error!Self {
+            const v = try loadBE(be);
+            return fromLimbsPublic(&v);
         }
 
         /// Number of limbs up to the top non-zero one. Branches on which
@@ -921,6 +943,41 @@ fn diffAgainstBigInt(comptime max_bits: comptime_int, sizes: []const usize, seed
             try testing.expect(!mod.divExact(&x, &q));
         }
     }
+}
+
+test "DynModint.fromLimbsPublic: the same modulus as fromLimbs, bit for bit, at every length" {
+    // The public constructor may only be faster: every field equal, every
+    // refusal the same (even, below 3), for each bit length 2..4096.
+    const D = DynModint(4096);
+    var prng = std.Random.DefaultPrng.init(0x9AB1_2026);
+    const rnd = prng.random();
+    var nbits: usize = 2;
+    while (nbits <= 4096) : (nbits += if (nbits < 140 or nbits > 3960) 1 else 29) {
+        var v = D.zero;
+        for (v[0 .. (nbits + 63) / 64]) |*w| w.* = rnd.int(u64);
+        const top = nbits - 1;
+        if (top % 64 != 63) v[top / 64] &= (@as(u64, 2) << @intCast(top % 64)) - 1;
+        v[top / 64] |= @as(u64, 1) << @intCast(top % 64);
+        v[0] |= 1;
+        const a = try D.fromLimbs(&v);
+        const b = try D.fromLimbsPublic(&v);
+        try std.testing.expectEqual(a.L, b.L);
+        try std.testing.expectEqual(a.nbits, b.nbits);
+        try std.testing.expectEqual(a.n0inv, b.n0inv);
+        try std.testing.expectEqual(a.digit_bits, b.digit_bits);
+        try std.testing.expectEqualSlices(u64, &a.m, &b.m);
+        try std.testing.expectEqualSlices(u64, &a.r2, &b.r2);
+        try std.testing.expectEqualSlices(u64, &a.one_mont, &b.one_mont);
+        try std.testing.expectEqualSlices(u64, &a.digit_mont, &b.digit_mont);
+        v[0] &= ~@as(u64, 1);
+        try std.testing.expectError(error.EvenModulus, D.fromLimbsPublic(&v));
+    }
+    var one = D.zero;
+    one[0] = 1;
+    try std.testing.expectError(error.ModulusTooSmall, D.fromLimbsPublic(&one));
+    try std.testing.expectError(error.EvenModulus, D.fromBytesBEPublic(&.{ 0x01, 0x00 }));
+    const small = try D.fromBytesBEPublic(&.{ 0x00, 0x03 });
+    try std.testing.expectEqual(@as(usize, 2), small.bits());
 }
 
 test "DynModint matches std.math.big.int (max 4096: 2..4096-bit moduli)" {

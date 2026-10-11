@@ -287,6 +287,18 @@ consumer that feels them, and the consumer who would (`qap`) is expected to solv
 performance question first and push the result back. This section exists so that arrives
 as a measurement rather than a rediscovery.
 
+**Superseded 2026-10-11 — both done, for the consumer that now feels them.** The owner's
+maturity goal (2026-10-10: a consumed module grades ≤ 3) made `x509`'s 6.4–7.3× Go chain verify
+the first work item, and the profile put all of it in signature math. (1) The `ff` constants are
+skipped by a new type, `VerifyKey` (montint modulus + `u32` exponent), so `PublicKey.n` and the
+13 modules that reach it are untouched. (2) `montint`'s new `DynModint.fromLimbsPublic` starts
+`R mod m` at `2^(bits−1)`. Its work depends on the exact bit length, so it is used only for the
+public modulus (`PublicKey.fromBytes`, `VerifyKey`); the secret CRT primes and every other
+`DynModint` caller (`paillier`, `threshold_ecdsa`, `ssh`) keep the derivation from 1 — a first
+version that applied it everywhere added ctgrind contexts to `rsa/keygen` (173 → 177) and
+`paillier/keygen` (314 → 324), the tainted bit length steering the loop. Result in `x509`:
+0.81–0.92× Go 1.26.0 crypto/x509.
+
 ## What is deliberately not done
 
 - **RSAES-PKCS1-v1_5 encryption and decryption** (decided 2026-09-30). *Never* as a

@@ -280,7 +280,7 @@ pub const PublicKey = struct {
         const e_v = e.toPrimitive(u32) catch return error.InvalidPublicKey;
         if (e_v < 3) return error.InvalidPublicKey;
 
-        return .{ .n = n, .e = e, .n_mont = montParamsFromModulus(n) };
+        return .{ .n = n, .e = e, .n_mont = MontParams.fromLimbsPublic(&MontParams.elemFromFf(&n.v)) catch unreachable }; // odd, ≥ 512 bits
     }
 
     pub const FromDerError = error{InvalidDer};
@@ -304,6 +304,71 @@ pub const PublicKey = struct {
             return error.UnsupportedPemLabel;
         }
         return try PublicKey.fromDer(block.der());
+    }
+
+    /// `e` as the `u32` every constructor validated it to fit.
+    fn publicExponent(pk: PublicKey) u32 {
+        return pk.e.toPrimitive(u32) catch unreachable; // < 2^32 since fromBytes
+    }
+};
+
+/// A public key that can only verify (PKCS#1 v1.5, PSS), built for a key
+/// that is used once: certificate path validation, a handshake, a token.
+///
+/// `PublicKey` also carries `n` and `e` as `std.crypto.ff` values, and
+/// `ff.Modulus.fromBytes` computes Montgomery constants of its own that the
+/// verify path never reads — for a 2048-bit key that construction cost
+/// several times the verification itself. This type keeps only the montint
+/// modulus and the exponent, with exactly `PublicKey.fromBytes`'s checks
+/// (size 512…4096 bits, odd `n`, odd `3 ≤ e < 2^32`), and verifies
+/// identically. Hold a `PublicKey` when the key is kept and used for
+/// anything else; build this when it is parsed, used and dropped.
+pub const VerifyKey = struct {
+    mp: MontParams,
+    e: u32,
+
+    pub const FromBytesError = PublicKey.FromBytesError;
+    pub const FromDerError = PublicKey.FromDerError;
+
+    /// From raw big-endian modulus and exponent (leading zeros allowed), as
+    /// `PublicKey.fromBytes`.
+    pub fn fromBytes(modulus_bytes: []const u8, exponent_bytes: []const u8) FromBytesError!VerifyKey {
+        const n_bytes = stripLeadingZeros(modulus_bytes);
+        if (n_bytes.len > max_modulus_len) return error.InvalidPublicKey;
+        // Rejects an even modulus and one below 3; the length is public.
+        const mp = MontParams.fromBytesBEPublic(n_bytes) catch return error.InvalidPublicKey;
+        if (mp.bits() < min_modulus_bits) return error.InvalidPublicKey;
+
+        const e_bytes = stripLeadingZeros(exponent_bytes);
+        if (e_bytes.len == 0 or e_bytes.len > 4) return error.InvalidPublicKey;
+        var e: u32 = 0;
+        for (e_bytes) |b| e = e << 8 | b;
+        if (e & 1 == 0 or e < 3) return error.InvalidPublicKey;
+        // `PublicKey.fromBytes` takes `e` as an element of Z_n, so it refuses
+        // `e ≥ n`; with `n` ≥ 512 bits and `e` < 2^32 that never triggers.
+        return .{ .mp = mp, .e = e };
+    }
+
+    /// From a DER `RSAPublicKey` or an X.509 `SubjectPublicKeyInfo`
+    /// wrapping one, as `PublicKey.fromDer`.
+    pub fn fromDer(bytes: []const u8) FromDerError!VerifyKey {
+        const parts = publicKeyPartsFromDer(bytes) catch return error.InvalidDer;
+        return fromBytes(parts.n, parts.e) catch error.InvalidDer;
+    }
+
+    /// Modulus length in bits.
+    pub fn bits(vk: *const VerifyKey) usize {
+        return vk.mp.bits();
+    }
+
+    /// As `verifyPkcs1v15`.
+    pub fn verifyPkcs1v15(vk: *const VerifyKey, comptime Hash: type, msg: []const u8, sig: []const u8) VerifyPkcs1v15Error!void {
+        return verifyPkcs1v15Mont(&vk.mp, vk.e, Hash, msg, sig);
+    }
+
+    /// As `verifyPss`.
+    pub fn verifyPss(vk: *const VerifyKey, comptime Hash: type, msg: []const u8, sig: []const u8, salt_len: usize) VerifyPssError!void {
+        return verifyPssMont(&vk.mp, vk.e, Hash, msg, sig, salt_len);
     }
 };
 
@@ -708,6 +773,21 @@ fn publicOp(pk: PublicKey, in: []const u8, out: []u8) PrimitiveError!void {
     writeMontResult(out, res); // out.len == byteLen(n); res is < n
 }
 
+/// RSAVP1 / RSAEP straight on the montint modulus: `in` must be `< n`
+/// (`elemFromBytesBE` refuses it otherwise — the same verdict `Fe.fromBytes`
+/// gives `publicOp`), then a variable-time `in^e mod n`. Everything here is
+/// public. `out.len == byteLen(n)`.
+fn publicOpMont(mp: *const MontParams, e: u32, in: []const u8, out: []u8) PrimitiveError!void {
+    const c = mp.elemFromBytesBE(in) catch return error.MessageRepresentativeOutOfRange;
+    var eb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &eb, e, .big);
+    const r = mp.powPublic(&c, stripLeadingZeros(&eb));
+    var ob: [max_modulus_len]u8 = undefined;
+    const res = ob[0 .. mp.L * 8];
+    mp.toBytesBE(&r, res);
+    writeMontResult(out, res); // res is < n
+}
+
 fn privateOpPtr(sk: *const SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
     const c = sk.n_mont.elemFromBytesBE(in) catch return error.MessageRepresentativeOutOfRange;
     // Secret exponent -> constant-time montint modexp; d is validated non-zero
@@ -1054,11 +1134,17 @@ pub const VerifyPkcs1v15Error = error{SignatureVerificationFailed};
 /// of the recovered padding, so no Bleichenbacher'06-style laxity), compared
 /// in constant time.
 pub fn verifyPkcs1v15(pk: PublicKey, comptime Hash: type, msg: []const u8, sig: []const u8) VerifyPkcs1v15Error!void {
-    const k = byteLen(pk.n.bits());
+    return verifyPkcs1v15Mont(&pk.n_mont, pk.publicExponent(), Hash, msg, sig);
+}
+
+/// `verifyPkcs1v15` over the montint modulus and the validated exponent —
+/// the body both `PublicKey` and `VerifyKey` share.
+fn verifyPkcs1v15Mont(mp: *const MontParams, e: u32, comptime Hash: type, msg: []const u8, sig: []const u8) VerifyPkcs1v15Error!void {
+    const k = mp.byteLen();
     // §8.2.2 step 1: the signature must be exactly k octets.
     if (sig.len != k) return error.SignatureVerificationFailed;
     var em_dec = std.mem.zeroes([max_modulus_len]u8);
-    publicOp(pk, sig, em_dec[0..k]) catch return error.SignatureVerificationFailed;
+    publicOpMont(mp, e, sig, em_dec[0..k]) catch return error.SignatureVerificationFailed;
     var em_exp = std.mem.zeroes([max_modulus_len]u8);
     emsaPkcs1v15Encode(Hash, msg, em_exp[0..k]) catch return error.SignatureVerificationFailed;
     if (!std.crypto.timing_safe.eql([max_modulus_len]u8, em_dec, em_exp)) {
@@ -1569,11 +1655,17 @@ pub const VerifyPssError = error{SignatureVerificationFailed};
 /// (H comparison via `std.crypto.timing_safe.eql`) and every failure mode
 /// reports the single generic `error.SignatureVerificationFailed`.
 pub fn verifyPss(pk: PublicKey, comptime Hash: type, msg: []const u8, sig: []const u8, salt_len: usize) VerifyPssError!void {
+    return verifyPssMont(&pk.n_mont, pk.publicExponent(), Hash, msg, sig, salt_len);
+}
+
+/// `verifyPss` over the montint modulus and the validated exponent — the
+/// body both `PublicKey` and `VerifyKey` share.
+fn verifyPssMont(mp: *const MontParams, e: u32, comptime Hash: type, msg: []const u8, sig: []const u8, salt_len: usize) VerifyPssError!void {
     const h_len = Hash.digest_length;
-    const k = byteLen(pk.n.bits());
+    const k = mp.byteLen();
     // §8.1.2 step 1: the signature must be exactly k octets.
     if (sig.len != k) return error.SignatureVerificationFailed;
-    const em_bits = pk.n.bits() - 1;
+    const em_bits = mp.bits() - 1;
     const em_len = byteLen(em_bits);
     // §9.1.2 step 3: emLen >= hLen + sLen + 2. Public parameters only
     // (modulus size, hash, expected salt length), so branching is harmless.
@@ -1581,7 +1673,7 @@ pub fn verifyPss(pk: PublicKey, comptime Hash: type, msg: []const u8, sig: []con
 
     // §8.1.2 step 2: RSAVP1 (public-key operation; s >= n is public info).
     var em_buf: [max_modulus_len]u8 = undefined;
-    publicOp(pk, sig, em_buf[0..k]) catch return error.SignatureVerificationFailed;
+    publicOpMont(mp, e, sig, em_buf[0..k]) catch return error.SignatureVerificationFailed;
 
     var ok: u8 = 1;
     // When emLen < k the representative carries leading pad octets that a
@@ -1699,6 +1791,14 @@ fn derView(bytes: []const u8, e: Asn1.Element) []const u8 {
 /// (RFC 5280) — distinguished by the top SEQUENCE's first child: a bare
 /// INTEGER means PKCS#1, a nested SEQUENCE (AlgorithmIdentifier) means SPKI.
 fn publicKeyFromDerImpl(bytes: []const u8) !PublicKey {
+    const parts = try publicKeyPartsFromDer(bytes);
+    return PublicKey.fromBytes(parts.n, parts.e) catch error.InvalidDer;
+}
+
+/// The modulus and exponent INTEGER contents of a DER `RSAPublicKey`, or of
+/// the one an X.509 `SubjectPublicKeyInfo` wraps — the structure walk shared
+/// by `PublicKey.fromDer` and `VerifyKey.fromDer`.
+fn publicKeyPartsFromDer(bytes: []const u8) !struct { n: []const u8, e: []const u8 } {
     const top = try derTopSequence(bytes);
     if (top.slice.start >= top.slice.end) return error.InvalidDer; // empty SEQUENCE
     const first = Asn1.Element.decode(bytes, top.slice.start) catch return error.InvalidDer;
@@ -1709,7 +1809,7 @@ fn publicKeyFromDerImpl(bytes: []const u8) !PublicKey {
         const n = first;
         const e = try derChild(bytes, n.slice.end, top.slice.end, .integer, false);
         if (e.slice.end != top.slice.end) return error.InvalidDer; // exactly two fields
-        return PublicKey.fromBytes(derView(bytes, n), derView(bytes, e)) catch error.InvalidDer;
+        return .{ .n = derView(bytes, n), .e = derView(bytes, e) };
     }
 
     if (first.tag.class == .universal and first.tag.constructed and first.tag.number == .sequence) {
@@ -1726,7 +1826,7 @@ fn publicKeyFromDerImpl(bytes: []const u8) !PublicKey {
         const raw = derView(bytes, bit_str);
         // The embedded RSAPublicKey DER must be byte-aligned: zero unused bits.
         if (raw.len < 1 or raw[0] != 0) return error.InvalidDer;
-        return publicKeyFromDerImpl(raw[1..]);
+        return publicKeyPartsFromDer(raw[1..]);
     }
 
     return error.InvalidDer;
@@ -3930,6 +4030,122 @@ test "PublicKey.fromDer parses SPKI and PKCS#1 DER, matches kat2048" {
     const from_pkcs1 = try PublicKey.fromDer(&kat2048_der.pub_pkcs1);
     try expectMatchesKat2048PublicKey(from_pkcs1);
     try verifyPkcs1v15(from_pkcs1, std.crypto.hash.sha2.Sha256, kat2048.msg, &kat2048.sig_sha256);
+}
+
+test "VerifyKey: same accept/reject as PublicKey on the KATs, from bytes and from DER" {
+    const sha2 = std.crypto.hash.sha2;
+    const pk = try kat2048.publicKey();
+    for ([_]VerifyKey{
+        try VerifyKey.fromBytes(&kat2048.n, &kat2048.e),
+        try VerifyKey.fromDer(&kat2048_der.pub_spki),
+        try VerifyKey.fromDer(&kat2048_der.pub_pkcs1),
+    }) |vk| {
+        try testing.expectEqual(@as(usize, 2048), vk.bits());
+        try testing.expectEqualSlices(u64, &pk.n_mont.m, &vk.mp.m);
+        try testing.expectEqualSlices(u64, &pk.n_mont.r2, &vk.mp.r2);
+        try vk.verifyPkcs1v15(sha2.Sha256, kat2048.msg, &kat2048.sig_sha256);
+        try vk.verifyPkcs1v15(sha2.Sha384, kat2048.msg, &kat2048.sig_sha384);
+        try vk.verifyPkcs1v15(sha2.Sha512, kat2048.msg, &kat2048.sig_sha512);
+        try testing.expectError(error.SignatureVerificationFailed, vk.verifyPkcs1v15(sha2.Sha384, kat2048.msg, &kat2048.sig_sha256));
+        var bad = kat2048.sig_sha256;
+        bad[100] ^= 4;
+        try testing.expectError(error.SignatureVerificationFailed, vk.verifyPkcs1v15(sha2.Sha256, kat2048.msg, &bad));
+    }
+    // PSS through both, on a fresh signature.
+    const sk = try kat2048.secretKey();
+    var prng = std.Random.DefaultPrng.init(0x7E41);
+    var buf: [256]u8 = undefined;
+    const sig = try signPss(&sk, sha2.Sha256, prng.random(), "verify key pss", 32, &buf);
+    const vk = try VerifyKey.fromDer(&kat2048_der.pub_spki);
+    try verifyPss(pk, sha2.Sha256, "verify key pss", sig, 32);
+    try vk.verifyPss(sha2.Sha256, "verify key pss", sig, 32);
+    try testing.expectError(error.SignatureVerificationFailed, vk.verifyPss(sha2.Sha256, "verify key pss", sig, 31));
+    try testing.expectError(error.SignatureVerificationFailed, vk.verifyPss(sha2.Sha256, "verify key PSS", sig, 32));
+}
+
+test "VerifyKey: a representative s ≥ n is refused, s = n − 1 reaches the padding check" {
+    // `publicOpMont` takes the range check from montint where `publicOp`
+    // took it from `ff`; the boundary is where the two could disagree.
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const pk = try kat2048.publicKey();
+    const vk = try VerifyKey.fromBytes(&kat2048.n, &kat2048.e);
+    var out: [256]u8 = undefined;
+    var s = kat2048.n;
+    try testing.expectError(error.MessageRepresentativeOutOfRange, publicOp(pk, &s, &out));
+    try testing.expectError(error.MessageRepresentativeOutOfRange, publicOpMont(&vk.mp, vk.e, &s, &out));
+    s[255] +%= 2; // n + 2 (n is odd, so no carry out of the last byte)
+    try testing.expectError(error.MessageRepresentativeOutOfRange, publicOpMont(&vk.mp, vk.e, &s, &out));
+    s = kat2048.n;
+    s[255] -= 1; // n − 1 ≡ −1: (−1)^e = −1 = n − 1
+    try publicOpMont(&vk.mp, vk.e, &s, &out);
+    try testing.expectEqualSlices(u8, &s, &out);
+    var out_ff: [256]u8 = undefined;
+    try publicOp(pk, &s, &out_ff);
+    try testing.expectEqualSlices(u8, &out_ff, &out);
+    try testing.expectError(error.SignatureVerificationFailed, vk.verifyPkcs1v15(Sha256, kat2048.msg, &s));
+}
+
+test "VerifyKey.fromBytes accepts and refuses exactly what PublicKey.fromBytes does" {
+    // A seeded differential over the shapes the checks are about: modulus
+    // length around 512 and 4096 bits, even moduli, leading zeros; exponent
+    // 0…5 bytes, even, 1, leading zeros. `PublicKey.fromBytes` validates
+    // through `std.crypto.ff`, `VerifyKey.fromBytes` through montint.
+    var prng = std.Random.DefaultPrng.init(0xD1FF_2026);
+    const rnd = prng.random();
+    var n_buf: [max_modulus_len + 3]u8 = undefined;
+    var e_buf: [6]u8 = undefined;
+    var accepted: usize = 0;
+    var refused: usize = 0;
+    const n_lens = [_]usize{ 0, 1, 62, 63, 64, 65, 256, 511, 512, 513, 514 };
+    for (0..1500) |i| {
+        const n_len = n_lens[i % n_lens.len];
+        const n = n_buf[0..n_len];
+        rnd.bytes(n);
+        const lead = rnd.uintLessThan(usize, 4);
+        if (n_len > 0) {
+            for (n[0..@min(lead, n_len)]) |*b| b.* = 0;
+            if (rnd.boolean()) n[n_len - 1] |= 1 else if (rnd.uintLessThan(u8, 4) == 0) n[n_len - 1] &= 0xfe;
+            if (n_len > lead and rnd.boolean()) n[lead] |= 0x80;
+        }
+        const e_len = rnd.uintLessThan(usize, 6);
+        const e = e_buf[0..e_len];
+        rnd.bytes(e);
+        switch (rnd.uintLessThan(u8, 6)) {
+            0 => if (e_len > 0) {
+                @memset(e, 0);
+                e[e_len - 1] = rnd.uintLessThan(u8, 4); // 0, 1, 2, 3
+            },
+            1 => if (e_len > 0) {
+                e[0] = 0; // leading zero
+            },
+            2 => if (e_len > 0) {
+                e[e_len - 1] &= 0xfe; // even
+            },
+            else => if (e_len > 0) {
+                e[e_len - 1] |= 1;
+            },
+        }
+        const want = PublicKey.fromBytes(n, e);
+        const got = VerifyKey.fromBytes(n, e);
+        if (want) |w| {
+            const g = got catch |err| {
+                std.debug.print("case {d}: PublicKey accepts, VerifyKey says {t}\n", .{ i, err });
+                return error.TestUnexpectedResult;
+            };
+            try testing.expectEqualSlices(u64, &w.n_mont.m, &g.mp.m);
+            try testing.expectEqual(w.publicExponent(), g.e);
+            accepted += 1;
+        } else |_| {
+            if (got) |_| {
+                std.debug.print("case {d}: PublicKey refuses, VerifyKey accepts\n", .{i});
+                return error.TestUnexpectedResult;
+            } else |_| {}
+            refused += 1;
+        }
+    }
+    // Both verdicts must actually occur, or the differential proves nothing.
+    try testing.expect(accepted >= 100);
+    try testing.expect(refused >= 100);
 }
 
 test "PublicKey.fromPem parses PUBLIC KEY and RSA PUBLIC KEY PEM, matches kat2048" {

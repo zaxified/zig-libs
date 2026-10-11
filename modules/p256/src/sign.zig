@@ -525,13 +525,26 @@ noinline fn ecdsaSignDeterministicUnburned(secret_key: *const [32]u8, msg: []con
 /// SEC1-encoded public key (compressed 33-byte or uncompressed 65-byte);
 /// `sig_rs` is `r (32) || s (32)` big-endian. Variable-time (all inputs public).
 pub fn ecdsaVerify(pubkey_sec1: []const u8, msg: []const u8, sig_rs: [64]u8) bool {
+    var h: [32]u8 = undefined;
+    Sha256.hash(msg, &h, .{});
+    return ecdsaVerifyDigest(pubkey_sec1, &h, sig_rs);
+}
+
+/// `ecdsaVerify` over a digest the caller computed with any hash — what
+/// X.509 needs for `ecdsa-with-SHA384`/`SHA512` under a P-256 key. Per SEC 1
+/// §4.1.4 step 5 (and std's `Ecdsa`), `e` is the leftmost 256 bits of the
+/// digest; a shorter digest is its whole value. An empty digest is refused.
+/// Variable-time (all inputs public).
+pub fn ecdsaVerifyDigest(pubkey_sec1: []const u8, digest: []const u8, sig_rs: [64]u8) bool {
+    if (digest.len == 0) return false;
     const Q = P256.fromSec1(pubkey_sec1) catch return false;
     const r = Scalar.fromBytes(sig_rs[0..32].*, .big) catch return false;
     const s = Scalar.fromBytes(sig_rs[32..64].*, .big) catch return false;
     if (r.isZero() or s.isZero()) return false;
 
-    var h: [32]u8 = undefined;
-    Sha256.hash(msg, &h, .{});
+    var h = [_]u8{0} ** 32;
+    const take = @min(digest.len, 32);
+    @memcpy(h[32 - take ..], digest[0..take]);
     const e = reduceToScalar(h);
     // std's verifier rejects `e == 0` and this one did not. With `e ≡ 0
     // (mod n)` the verification equation collapses to `R = u2·Q`, which
@@ -571,6 +584,37 @@ test "ecdsa sign→verify round-trip (fixed key + nonce)" {
     var bad = sig;
     bad[5] ^= 1;
     try std.testing.expect(!ecdsaVerify(&pk, msg, bad));
+}
+
+test "ecdsaVerifyDigest agrees with std's Ecdsa(P256, SHA-384/512/224) and with ecdsaVerify" {
+    // The truncation rule (leftmost 256 bits; a shorter digest whole) is the
+    // only thing this adds over `ecdsaVerify`, so std's verifier over each
+    // hash is the oracle: same verdict on a genuine signature and on one with
+    // a flipped bit, for digests longer, equal and shorter than 32 bytes.
+    const Ecdsa = std.crypto.sign.ecdsa.Ecdsa;
+    const Curve = std.crypto.ecc.P256;
+    inline for (.{ std.crypto.hash.sha2.Sha384, std.crypto.hash.sha2.Sha512, std.crypto.hash.sha2.Sha224, Sha256 }) |H| {
+        const E = Ecdsa(Curve, H);
+        const kp = E.KeyPair.generateDeterministic([_]u8{0x5a} ** E.KeyPair.seed_length) catch unreachable;
+        const pk = kp.public_key.toUncompressedSec1();
+        var i: u8 = 0;
+        while (i < 8) : (i += 1) {
+            const msg = [_]u8{ 'd', 'i', 'g', i };
+            const sig = try kp.sign(&msg, null);
+            var d: [H.digest_length]u8 = undefined;
+            H.hash(&msg, &d, .{});
+            try std.testing.expect(ecdsaVerifyDigest(&pk, &d, sig.toBytes()));
+            if (H == Sha256) try std.testing.expect(ecdsaVerify(&pk, &msg, sig.toBytes()));
+            var bad = sig.toBytes();
+            bad[40 + i] ^= 1;
+            const std_ok = if (E.Signature.fromBytes(bad).verify(&msg, kp.public_key)) |_| true else |_| false;
+            try std.testing.expectEqual(std_ok, ecdsaVerifyDigest(&pk, &d, bad));
+            // The wrong digest (one bit inside the used prefix) must fail.
+            d[0] ^= 0x80;
+            try std.testing.expect(!ecdsaVerifyDigest(&pk, &d, sig.toBytes()));
+        }
+    }
+    try std.testing.expect(!ecdsaVerifyDigest(&([_]u8{4} ++ [_]u8{0} ** 64), "", [_]u8{1} ** 64));
 }
 
 test "ecdsaVerify: r=0 and s=0 are rejected explicitly (never fed to any test before)" {

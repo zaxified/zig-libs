@@ -11,6 +11,8 @@ const native_endian = builtin.cpu.arch.endian();
 
 const std = @import("std");
 const verify = @import("verify.zig");
+const p256 = @import("p256");
+const rsa = @import("rsa");
 // zig-libs tlsclient: dead-stack burn around the client-certificate signature.
 const burn = @import("burn.zig");
 const tls = std.crypto.tls;
@@ -1899,6 +1901,10 @@ const CertificatePublicKey = struct {
         // eddsa
         SchemeEddsa(.ed25519).Signature.VerifyError;
 
+    /// The longest signed content `verifySignature` accepts: TLS 1.2's two
+    /// randoms plus ECDHE params with a 255-byte point (4 + 255) is 323.
+    const max_signed_len = 512;
+
     fn verifySignature(
         cert_pub_key: *const CertificatePublicKey,
         sigd: *tls.Decoder,
@@ -1931,9 +1937,33 @@ const CertificatePublicKey = struct {
             else => return error.TlsBadSignatureScheme,
         })) return error.TlsBadSignatureScheme;
 
+        // zig-libs tlsclient: the signed content is short (TLS 1.3: 64 + 34 +
+        // a transcript hash; TLS 1.2: two randoms + the ECDHE params), so it
+        // is gathered here once for the verifiers that take one message.
+        var signed_buf: [max_signed_len]u8 = undefined;
+        var signed_len: usize = 0;
+        for (msg) |part| {
+            if (part.len > signed_buf.len - signed_len) return error.TlsDecodeError;
+            @memcpy(signed_buf[signed_len..][0..part.len], part);
+            signed_len += part.len;
+        }
+        const signed = signed_buf[0..signed_len];
+
         switch (scheme) {
-            inline .ecdsa_secp256r1_sha256,
-            .ecdsa_secp384r1_sha384,
+            // zig-libs tlsclient: P-256 through the `p256` module (std's
+            // portable P-256 verify cost ~6× Go's per handshake). The
+            // signature and key are still decoded by std, so a malformed one
+            // fails exactly as before; only the verification equation moved.
+            .ecdsa_secp256r1_sha256 => {
+                const Ecdsa = SchemeEcdsa(.ecdsa_secp256r1_sha256);
+                const sig = try Ecdsa.Signature.fromDer(encoded_sig);
+                _ = try Ecdsa.PublicKey.fromSec1(pub_key);
+                var digest: [32]u8 = undefined;
+                crypto.hash.sha2.Sha256.hash(signed, &digest, .{});
+                if (!p256.sign.ecdsaVerifyDigest(pub_key, &digest, sig.toBytes()))
+                    return error.SignatureVerificationFailed;
+            },
+            inline .ecdsa_secp384r1_sha384,
             => |comptime_scheme| {
                 const Ecdsa = SchemeEcdsa(comptime_scheme);
                 const sig = try Ecdsa.Signature.fromDer(encoded_sig);
@@ -1953,19 +1983,24 @@ const CertificatePublicKey = struct {
             .rsa_pss_pss_sha512,
             .rsa_pkcs1_sha1,
             => |comptime_scheme| {
-                const RsaSignature = SchemeRsa(comptime_scheme);
+                // zig-libs tlsclient: std's key DER walk and size gate, then
+                // `rsa.VerifyKey` instead of std's `ff`-based key and modexp.
+                // A signature that is not exactly the modulus length now fails
+                // verification (RFC 8017 §8.1.2/§8.2.2 step 1) — std zero-padded
+                // a short one and indexed past its buffer on a long one.
                 const Hash = SchemeHash(comptime_scheme);
-                const PublicKey = Certificate.rsa.PublicKey;
-                const components = try PublicKey.parseDer(pub_key);
-                const exponent = components.exponent;
-                const modulus = components.modulus;
-                switch (modulus.len) {
-                    inline 128, 256, 384, 512 => |modulus_len| {
-                        const key: PublicKey = try .fromBytes(exponent, modulus);
-                        const sig = RsaSignature.fromBytes(modulus_len, encoded_sig);
-                        try RsaSignature.concatVerify(modulus_len, sig, msg, key, Hash);
-                    },
+                const components = try Certificate.rsa.PublicKey.parseDer(pub_key);
+                switch (components.modulus.len) {
+                    128, 256, 384, 512 => {},
                     else => return error.TlsBadRsaSignatureBitCount,
+                }
+                const key = rsa.VerifyKey.fromBytes(components.modulus, components.exponent) catch
+                    return error.CertificatePublicKeyInvalid;
+                if (SchemeRsa(comptime_scheme) == Certificate.rsa.PSSSignature) {
+                    // RFC 8446 §4.2.3: the salt is as long as the digest.
+                    key.verifyPss(Hash, signed, encoded_sig, Hash.digest_length) catch return error.InvalidSignature;
+                } else {
+                    key.verifyPkcs1v15(Hash, signed, encoded_sig) catch return error.InvalidSignature;
                 }
             },
             inline .ed25519 => |comptime_scheme| {
@@ -2130,6 +2165,71 @@ test "CertificateVerify: the RFC 8446 §4.4.3 content, verified with the public 
     var th2 = crypto.hash.sha2.Sha256.init(.{});
     const empty = try clientAuthMessages(&buf, &CertRequest{ .scheme_ok = false }, &auth, &th2);
     try std.testing.expectEqualSlices(u8, "\x0b\x00\x00\x04\x00\x00\x00\x00", empty);
+}
+
+/// `scheme || u16 length || signature` as a server's CertificateVerify body,
+/// decoded by `verifySignature` over the content `parts`.
+fn testServerSignature(key: *const CertificatePublicKey, scheme: tls.SignatureScheme, sig: []const u8, parts: []const []const u8) CertificatePublicKey.VerifyError!void {
+    var buf: [600]u8 = undefined;
+    mem.writeInt(u16, buf[0..2], @intFromEnum(scheme), .big);
+    mem.writeInt(u16, buf[2..4], @intCast(sig.len), .big);
+    @memcpy(buf[4..][0..sig.len], sig);
+    var d: tls.Decoder = .fromTheirSlice(buf[0 .. 4 + sig.len]);
+    return key.verifySignature(&d, parts);
+}
+
+test "server signature: a genuine P-256 / RSA-PSS / PKCS#1 signature verifies, a damaged one does not" {
+    // The server's CertificateVerify (TLS 1.3) and ServerKeyExchange (TLS 1.2)
+    // signature is the only proof the peer holds the leaf's key; nothing
+    // else in this file fed `verifySignature` a bad one (both negative
+    // controls survived, 2026-10-11). Content split in parts as the callers
+    // pass it.
+    const parts = [_][]const u8{ " " ** 64, "TLS 1.3, server CertificateVerify\x00", &([_]u8{0x5c} ** 32) };
+    const content = parts[0] ++ parts[1] ++ parts[2];
+    const other = [_][]const u8{ " " ** 64, "TLS 1.3, client CertificateVerify\x00", &([_]u8{0x5c} ** 32) };
+
+    // ECDSA P-256, signed by std (independent of the verifier under test).
+    {
+        const E = crypto.sign.ecdsa.EcdsaP256Sha256;
+        const kp = try E.KeyPair.generateDeterministic([_]u8{0x31} ** E.KeyPair.seed_length);
+        var key: CertificatePublicKey = undefined;
+        try key.init(.X9_62_id_ecPublicKey, &kp.public_key.toUncompressedSec1());
+        var der_buf: [E.Signature.der_encoded_length_max]u8 = undefined;
+        const sig = (try kp.sign(content, null)).toDer(&der_buf);
+        try testServerSignature(&key, .ecdsa_secp256r1_sha256, sig, &parts);
+        try std.testing.expectError(error.SignatureVerificationFailed, testServerSignature(&key, .ecdsa_secp256r1_sha256, sig, &other));
+        var bad: [E.Signature.der_encoded_length_max]u8 = undefined;
+        @memcpy(bad[0..sig.len], sig);
+        bad[sig.len - 3] ^= 0x01; // inside s
+        try std.testing.expectError(error.SignatureVerificationFailed, testServerSignature(&key, .ecdsa_secp256r1_sha256, bad[0..sig.len], &parts));
+    }
+
+    // RSA-1024, PSS (rsae, salt = digest length) and PKCS#1 v1.5.
+    {
+        var prng = std.Random.DefaultPrng.init(0x7C5_2026);
+        var kp: rsa.KeyPair = undefined;
+        try rsa.generate(&kp, prng.random(), 1024, 65537);
+        var n: [128]u8 = undefined;
+        try kp.public_key.n.toBytes(&n, .big);
+        // RSAPublicKey ::= SEQUENCE { INTEGER n (sign octet 00), INTEGER 65537 }
+        const spk = "\x30\x81\x89\x02\x81\x81\x00" ++ n ++ "\x02\x03\x01\x00\x01";
+        var key: CertificatePublicKey = undefined;
+        try key.init(.rsaEncryption, spk);
+        const Sha256 = crypto.hash.sha2.Sha256;
+        var sig_buf: [128]u8 = undefined;
+        const pss = try rsa.signPss(&kp.secret_key, Sha256, prng.random(), content, Sha256.digest_length, &sig_buf);
+        try testServerSignature(&key, .rsa_pss_rsae_sha256, pss, &parts);
+        try std.testing.expectError(error.InvalidSignature, testServerSignature(&key, .rsa_pss_rsae_sha256, pss, &other));
+        pss[77] ^= 0x10;
+        try std.testing.expectError(error.InvalidSignature, testServerSignature(&key, .rsa_pss_rsae_sha256, pss, &parts));
+        // a signature one byte short of the modulus length is refused, not padded
+        try std.testing.expectError(error.InvalidSignature, testServerSignature(&key, .rsa_pss_rsae_sha256, pss[0..127], &parts));
+        var v15_buf: [128]u8 = undefined;
+        const v15 = try rsa.signPkcs1v15(&kp.secret_key, Sha256, content, &v15_buf);
+        try testServerSignature(&key, .rsa_pkcs1_sha256, v15, &parts);
+        v15[5] ^= 0x01;
+        try std.testing.expectError(error.InvalidSignature, testServerSignature(&key, .rsa_pkcs1_sha256, v15, &parts));
+    }
 }
 
 test "client Certificate echoes the request context (RFC 8446 §4.4.2)" {

@@ -317,7 +317,7 @@ const module_list = [_]Module{
     .{ .name = "stun", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "opcua", .libs = &.{"net"}, .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .live = true },
     .{ .name = "noise", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .test_deps = &.{"testkit"} },
-    .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa", "p521" }, .test_deps = &.{"testkit"} },
+    .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa", "p521", "p256" }, .test_deps = &.{"testkit"} },
     .{ .name = "ocsp", .libs = &.{"crypto"}, .deps = &.{ "x509", "rsa", "p256" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "ocspcache", .libs = &.{"crypto"}, .deps = &.{ "ocsp", "http", "x509" }, .test_deps = &.{"testkit"}, .timing = true, .loopback = true },
     .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa", "base32" }, .test_deps = &.{"testkit"} },
@@ -326,7 +326,7 @@ const module_list = [_]Module{
     .{ .name = "falcon", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "hqc", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"} },
-    .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{"x509"}, .test_deps = &.{"testkit"}, .loopback = true }, // x509: RFC 5280 chain verification + DER guard
+    .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{ "x509", "p256", "rsa" }, .test_deps = &.{"testkit"}, .loopback = true }, // x509: RFC 5280 chain verification + DER guard
     .{ .name = "tlsresume", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .test_deps = &.{"testkit"} },
     .{ .name = "sandbox", .libs = &.{"os"} },

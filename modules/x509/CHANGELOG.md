@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — perf: **chain verify 6.4–7.3× → 0.81–0.92× Go 1.26.0 crypto/x509** (`bench-x509`). Profile: all of it was std's signature math — `pcurves` P-256 (~0.7 ms per verify) and `Certificate.rsa` (an `ff.Modulus` built per call). `verifyParsed` replaces `Parsed.verify` check for check (issuer, validity, std's RSA gates and errors) and sends PKCS#1 v1.5 to `rsa.VerifyKey` and ECDSA under a P-256 key to `p256` (new dep); P-384 and Ed25519 stay on std. Also for CRL signatures (`verifySignedBy`). Behaviour change: an RSA issuer key with exponent 1 (any `EM` is its own signature) — accepted by std — now fails as `CertificateSignatureInvalid`.
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-x509`): **6.46–7.54× Go crypto/x509 chain verify** — over 2×, P4. Card stays `not measured` with the numbers in *Backlog* until the module is sped up (owner 2026-10-10: a consumed module must grade 3 or better). Tooling only, no code change.
 
 - **2026-10-10** — New: ECDSA P-521 certificates and CRLs. Links (and CRLs) whose issuer key is EC secp521r1 — which std's `Parsed.verify` refuses with `CertificateSignatureNamedCurveUnsupported` — are verified through the new `p521` module (new dep): ecdsa-with-SHA224/256/384/512, std's issuer/validity/signature order and error mapping, strict-DER signatures. `safe.oid_secp521r1` added. Tests: `src/p521_test.zig` over OpenSSL-checked fixtures (`src/data/p521/`, recipe `tools/gen_p521_fixtures.py`).

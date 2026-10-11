@@ -140,7 +140,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
                 .r2 = undefined,
                 .one_mont = undefined,
             };
-            self.computeConstants();
+            self.computeConstants(0);
             return self;
         }
 
@@ -155,7 +155,26 @@ pub fn Modint(comptime max_bits: comptime_int) type {
                 .r2 = undefined,
                 .one_mont = undefined,
             };
-            self.computeConstants();
+            self.computeConstants(0);
+            return self;
+        }
+
+        /// `fromElemUnchecked` for a modulus whose bit length `nbits` the
+        /// caller knows and treats as public (a key size): `v` must be odd
+        /// with its top bit exactly at `nbits − 1`, `2 ≤ nbits ≤ 64·L`.
+        /// `R mod m` then starts from `2^(nbits−1)`, which is already `< m`,
+        /// instead of from 1 — `64·L − nbits + 1` doublings where there were
+        /// `64·L`, so a full-width modulus (2048 bits in 32 limbs) costs one.
+        /// Constant-time in `v`: the work depends on `nbits` and `L` only.
+        pub fn fromElemUncheckedBits(v: Elem, nbits: usize) Self {
+            std.debug.assert(nbits >= 2 and nbits <= 64 * L);
+            var self: Self = .{
+                .m = v,
+                .n0inv = negInvMod2_64(v[0]),
+                .r2 = undefined,
+                .one_mont = undefined,
+            };
+            self.computeConstants(nbits - 1);
             return self;
         }
 
@@ -191,11 +210,16 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         // driving it is 64·L, a COMPTIME constant — the work depends on `L`
         // alone and never on the modulus, so this stays constant-time in `m`,
         // which matters because `rsa` calls this on the secret CRT primes.
-        fn computeConstants(self: *Self) void {
-            // acc = 1, double 64·L times -> 2^(64L) mod m = R mod m.
+        //
+        // `start` is a bit position with `2^start < m` (0 always qualifies;
+        // `bits(m) − 1` is the highest, the public-length shortcut of
+        // `fromElemUncheckedBits`). R mod m is `2^start` doubled the
+        // remaining `64·L − start` times; the loop count is public.
+        fn computeConstants(self: *Self, start: usize) void {
+            // acc = 2^start, double up to 2^(64L) mod m = R mod m.
             var acc = std.mem.zeroes(Elem);
-            acc[0] = 1;
-            var i: usize = 0;
+            acc[start / 64] = @as(u64, 1) << @intCast(start % 64);
+            var i: usize = start;
             while (i < 64 * L) : (i += 1) self.doubleMod(&acc);
             self.one_mont = acc;
 
@@ -1190,6 +1214,35 @@ fn r2ByDoubling(comptime L: usize, m: [L]u64) [L]u64 {
     var i: usize = 0;
     while (i < 128 * L) : (i += 1) mm.doubleMod(&acc);
     return acc;
+}
+
+test "fromElemUncheckedBits: the same constants as starting from 1, for every bit length in a slot" {
+    // The public-length shortcut must change the cost of `R mod m` and nothing
+    // else: same `one_mont`, same `r2`, on moduli of every length the slot
+    // holds (top bit at each position), not just full-width ones.
+    var prng = std.Random.DefaultPrng.init(0xB175_2026);
+    const rnd = prng.random();
+    inline for (.{ 4, 8, 32 }) |L| {
+        const M = Modint(L * 64);
+        var nbits: usize = 2;
+        while (nbits <= 64 * L) : (nbits += if (nbits < 70 or nbits > 64 * L - 70) 1 else 13) {
+            var m: [L]u64 = undefined;
+            for (&m) |*w| w.* = rnd.int(u64);
+            // keep exactly `nbits` bits, odd, top bit set
+            for (&m, 0..) |*w, i| {
+                const lo = 64 * i;
+                if (lo >= nbits) w.* = 0 else if (nbits - lo < 64) w.* &= (@as(u64, 1) << @intCast(nbits - lo)) - 1;
+            }
+            m[(nbits - 1) / 64] |= @as(u64, 1) << @intCast((nbits - 1) % 64);
+            m[0] |= 1;
+            if (nbits == 2) m[0] = 3;
+            const ref = M.fromElemUnchecked(m);
+            const fast = M.fromElemUncheckedBits(m, nbits);
+            try std.testing.expectEqualSlices(u64, &ref.one_mont, &fast.one_mont);
+            try std.testing.expectEqualSlices(u64, &ref.r2, &fast.r2);
+            try std.testing.expectEqual(ref.n0inv, fast.n0inv);
+        }
+    }
 }
 
 test "R2 ladder agrees with the doubling reference, bit for bit, on every slot" {

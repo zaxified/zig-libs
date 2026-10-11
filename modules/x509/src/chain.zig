@@ -54,6 +54,7 @@ const extensions = @import("extensions.zig");
 const algorithm = @import("algorithm.zig");
 const rsa = @import("rsa");
 const p521 = @import("p521");
+const p256 = @import("p256");
 const crl = @import("crl.zig");
 const safe = @import("safe.zig");
 
@@ -562,17 +563,6 @@ fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64) VerifyCha
         return verifySlhDsaLink(subject_der, issuer_der, now_sec);
     }
 
-    // ⚠ PKCS#1 v1.5 deliberately does NOT come through this module's own `rsa`,
-    // even though `rsa.verifyPkcs1v15` does the same verification in 36 us
-    // against std's 388 us. Path validation builds a key per link and no key
-    // repeats inside a chain, so nothing caches, and cold the comparison
-    // reverses: `rsa.PublicKey.fromDer` + verify costs more per link than std
-    // does. `fromDer` has to fall below 352 us before switching pays.
-    // Re-measured 2026-09-16 (min of 25, ReleaseFast): `fromDer` 453 us, so
-    // this module would pay ~489 us per link against std's 388 — still worse,
-    // and the decision stands. 2026-09-08 it was ~500-515 us; the gap has
-    // narrowed, it has not closed. See SPEC.md § "Performance" and
-    // `modules/rsa/SPEC.md`.
     if (Certificate.AlgorithmCategory.map.get(subject_shape.sig_alg_oid) == .rsassa_pss) {
         const issuer_shape = try parseShape(.{ .buffer = issuer_der, .index = 0 });
         const issuer_pub_key = try rsa.PublicKey.fromDer(issuer_shape.spki);
@@ -596,7 +586,69 @@ fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64) VerifyCha
         else => |e| return e,
     };
 
-    try subject_parsed.verify(issuer_parsed, now_sec);
+    try verifyParsed(subject_parsed, issuer_parsed, now_sec);
+}
+
+/// `std.crypto.Certificate.Parsed.verify`, check for check and error for
+/// error, with the signature mathematics of its two hot cases swapped for
+/// this repository's: PKCS#1 v1.5 through `rsa.VerifyKey` and ECDSA under a
+/// P-256 key through `p256`. std's own RSA path builds an `ff.Modulus` per
+/// call and its P-256 is the portable `pcurves` code; the two were 6.4–7.3×
+/// Go's `crypto/x509` on a three-certificate chain (bench-x509, 2026-10-11).
+/// P-384 and Ed25519 stay on std. One deliberate difference: std accepts an
+/// RSA exponent of 1, under which any `EM` is its own signature; `rsa`
+/// refuses `e < 3` and the link fails with `CertificateSignatureInvalid`.
+fn verifyParsed(subject: Certificate.Parsed, issuer: Certificate.Parsed, now_sec: i64) Certificate.Parsed.VerifyError!void {
+    if (!std.mem.eql(u8, subject.issuer(), issuer.subject())) return error.CertificateIssuerMismatch;
+    if (now_sec < subject.validity.not_before) return error.CertificateNotYetValid;
+    if (now_sec > subject.validity.not_after) return error.CertificateExpired;
+
+    switch (subject.signature_algorithm) {
+        inline .sha1WithRSAEncryption,
+        .sha224WithRSAEncryption,
+        .sha256WithRSAEncryption,
+        .sha384WithRSAEncryption,
+        .sha512WithRSAEncryption,
+        => |alg| return verifyRsaPkcs1(alg.Hash(), subject.message(), subject.signature(), issuer.pub_key_algo, issuer.pubKey()),
+        inline .ecdsa_with_SHA224,
+        .ecdsa_with_SHA256,
+        .ecdsa_with_SHA384,
+        .ecdsa_with_SHA512,
+        => |alg| switch (issuer.pub_key_algo) {
+            .X9_62_id_ecPublicKey => |curve| if (curve == .X9_62_prime256v1)
+                return verifyEcdsaP256(alg.Hash(), subject.message(), subject.signature(), issuer.pubKey()),
+            else => {},
+        },
+        else => {},
+    }
+    return subject.verify(issuer, now_sec);
+}
+
+/// std's `verifyRsa` gates (algorithm, key DER, exponent ≤ modulus length,
+/// signature length, modulus of 1024/2048/3072/4096 bits) in std's order and
+/// with std's errors, then `rsa.VerifyKey`.
+fn verifyRsaPkcs1(comptime Hash: type, msg: []const u8, sig: []const u8, pub_key_algo: Certificate.Parsed.PubKeyAlgo, pub_key: []const u8) Certificate.Parsed.VerifyError!void {
+    if (pub_key_algo != .rsaEncryption) return error.CertificateSignatureAlgorithmMismatch;
+    const parts = try Certificate.rsa.PublicKey.parseDer(pub_key);
+    if (parts.exponent.len > parts.modulus.len) return error.CertificatePublicKeyInvalid;
+    if (sig.len != parts.modulus.len) return error.CertificateSignatureInvalidLength;
+    switch (parts.modulus.len) {
+        128, 256, 384, 512 => {},
+        else => return error.CertificateSignatureUnsupportedBitCount,
+    }
+    const vk = rsa.VerifyKey.fromBytes(parts.modulus, parts.exponent) catch return error.CertificateSignatureInvalid;
+    vk.verifyPkcs1v15(Hash, msg, sig) catch return error.CertificateSignatureInvalid;
+}
+
+/// std's `verify_ecdsa` for a P-256 key: a DER signature std's parser
+/// accepts, then `p256.sign.ecdsaVerifyDigest` over the message's digest.
+/// Every failure is `CertificateSignatureInvalid`, as in std.
+fn verifyEcdsaP256(comptime Hash: type, msg: []const u8, sig_der: []const u8, sec1_key: []const u8) Certificate.Parsed.VerifyError!void {
+    const Sig = std.crypto.sign.ecdsa.Ecdsa(std.crypto.ecc.P256, Hash).Signature;
+    const sig = Sig.fromDer(sig_der) catch return error.CertificateSignatureInvalid;
+    var digest: [Hash.digest_length]u8 = undefined;
+    Hash.hash(msg, &digest, .{});
+    if (!p256.sign.ecdsaVerifyDigest(sec1_key, &digest, sig.toBytes())) return error.CertificateSignatureInvalid;
 }
 
 fn isP521(algo: algorithm.PubKeyAlgo) bool {
@@ -892,7 +944,7 @@ pub fn verifySignedBy(data: SignedData, issuer_der: CertDer) VerifyChainError!vo
         error.CertificateHasUnrecognizedObjectId => try partialIssuerParsed(issuer_cert, issuer_shape),
         else => |e| return e,
     };
-    try subject.verify(issuer_parsed, 0);
+    try verifyParsed(subject, issuer_parsed, 0);
 }
 
 /// The certificate's `serialNumber` (INTEGER content) and issuer `Name`
