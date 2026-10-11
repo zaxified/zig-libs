@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — New `decompressInto(gpa, out, input, options)`: decode into the caller's buffer
+  (`OutputTooLarge` when it does not fit), no output allocation. The differential fuzz driver checks it
+  against the other two decoders, with an exact-size buffer and one byte short. Bench: `d_<payload>`
+  now pairs it with the reference's preallocated-buffer decode (1.03–1.15×). The allocating
+  `decompress` is printed as `d_<payload>_alloc`, for information only.
+
 - **2026-10-11** — Decompression faster again (vs google/brotli: 1.49–1.78× → 1.12–1.28×): short
   back-references are 16/32-byte moves into slack the output keeps instead of `memcpy` calls, the
   bit reader refills only when short of bits, and code tables are built with `@bitReverse`. No API

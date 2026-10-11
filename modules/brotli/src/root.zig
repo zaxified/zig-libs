@@ -54,6 +54,9 @@ pub const Options = decoder.Options;
 
 /// Decompress a complete Brotli stream. Caller owns the returned slice.
 pub const decompress = decoder.decompress;
+/// Decompress into a caller's buffer (`OutputTooLarge` if it does not fit);
+/// see `decoder.decompressInto`.
+pub const decompressInto = decoder.decompressInto;
 
 /// Decompress from a `std.Io.Reader` to a `std.Io.Writer`, holding only the
 /// window — never the whole output. See `decoder.decompressStream`.

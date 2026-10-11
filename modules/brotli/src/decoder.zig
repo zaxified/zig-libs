@@ -736,26 +736,7 @@ const ListSink = struct {
     /// bytes of garbage past the copy into the `copy_slack` room `reserve` keeps --
     /// overwritten by whatever comes next, never part of the output.
     fn copyBack(s: *ListSink, d: usize, n: usize) BrotliError!void {
-        const start = s.list.items.len;
-        const buf = s.list.allocatedSlice();
-        if (n <= 16 and d >= 16) {
-            // The common case: one 16-byte move. A wider load than the copy
-            // needs reaches bytes stored just before, which the CPU cannot
-            // forward from a narrower store (measured: 7.7 % on text).
-            copy16(buf, start, start - d);
-        } else if (d >= 32) {
-            // Each chunk's source ends at or before its destination starts;
-            // a source byte inside an earlier chunk was written already.
-            var k: usize = 0;
-            while (k < n) : (k += 32) copy32(buf, start + k, start + k - d);
-        } else if (d >= 16) {
-            var k: usize = 0;
-            while (k < n) : (k += 16) copy16(buf, start + k, start + k - d);
-        } else if (d >= n) {
-            copy16(buf, start, start - d); // n ≤ d < 16: one store
-        } else {
-            for (start..start + n) |i| buf[i] = buf[i - d];
-        }
+        copyBackSlack(s.list.allocatedSlice(), s.list.items.len, d, n);
         s.list.items.len += n;
     }
     /// The next `n` bytes are coming (a meta-block's length): grow once, up
@@ -773,6 +754,102 @@ const ListSink = struct {
     fn setWindow(_: *ListSink, _: u6) BrotliError!void {}
     fn endMetablock(_: *ListSink) BrotliError!void {}
 };
+
+/// `buf[start..][0..n] = ` the bytes `d` back, LZ77 style, with up to
+/// `copy_slack` bytes of garbage written past the copy (see
+/// `ListSink.copyBack`). Precondition: `start + n + copy_slack <= buf.len`.
+inline fn copyBackSlack(buf: []u8, start: usize, d: usize, n: usize) void {
+    if (n <= 16 and d >= 16) {
+        // The common case: one 16-byte move. A wider load than the copy
+        // needs reaches bytes stored just before, which the CPU cannot
+        // forward from a narrower store (measured: 7.7 % on text).
+        copy16(buf, start, start - d);
+    } else if (d >= 32) {
+        // Each chunk's source ends at or before its destination starts;
+        // a source byte inside an earlier chunk was written already.
+        var k: usize = 0;
+        while (k < n) : (k += 32) copy32(buf, start + k, start + k - d);
+    } else if (d >= 16) {
+        var k: usize = 0;
+        while (k < n) : (k += 16) copy16(buf, start + k, start + k - d);
+    } else if (d >= n) {
+        copy16(buf, start, start - d); // n ≤ d < 16: one store
+    } else {
+        for (start..start + n) |i| buf[i] = buf[i - d];
+    }
+}
+
+/// One-shot output into the caller's buffer: the buffer is the window.
+const SliceSink = struct {
+    buf: []u8,
+    len: usize = 0,
+    /// `min(buf.len, effectiveCap)`.
+    cap: usize,
+
+    const WriteError = error{};
+
+    fn pos(s: *const SliceSink) usize {
+        return s.len;
+    }
+    fn back(s: *const SliceSink, d: usize) u8 {
+        return s.buf[s.len - d];
+    }
+    fn reserve(s: *SliceSink, n: usize, _: *const BitReader) BrotliError!void {
+        if (s.len + n > s.cap) return error.OutputTooLarge;
+    }
+    fn reserveStored(s: *SliceSink, n: usize, br: *const BitReader) BrotliError!void {
+        return s.reserve(n, br);
+    }
+    fn put(s: *SliceSink, b: u8) BrotliError!void {
+        s.buf[s.len] = b;
+        s.len += 1;
+    }
+    fn putSlice(s: *SliceSink, bytes: []const u8) BrotliError!void {
+        @memcpy(s.buf[s.len..][0..bytes.len], bytes);
+        s.len += bytes.len;
+    }
+    /// The fast moves of `copyBackSlack` while the caller's buffer has the
+    /// slack past the copy; near its end, exact copies.
+    fn copyBack(s: *SliceSink, d: usize, n: usize) BrotliError!void {
+        const start = s.len;
+        if (start + n + copy_slack <= s.buf.len) {
+            copyBackSlack(s.buf, start, d, n);
+        } else if (d >= n) {
+            @memcpy(s.buf[start..][0..n], s.buf[start - d ..][0..n]);
+        } else {
+            for (start..start + n) |i| s.buf[i] = s.buf[i - d];
+        }
+        s.len += n;
+    }
+    fn hint(_: *SliceSink, _: usize) void {}
+    fn readAligned(s: *SliceSink, br: *BitReader, n: usize) BrotliError!void {
+        try br.readAlignedBytes(s.buf[s.len..][0..n]);
+        s.len += n;
+    }
+    fn setWindow(_: *SliceSink, _: u6) BrotliError!void {}
+    fn endMetablock(_: *SliceSink) BrotliError!void {}
+};
+
+/// Decompress a complete Brotli stream into `out`; returns the decoded prefix
+/// of it. Output that does not fit `out` (or the `options` cap) is
+/// `OutputTooLarge`, and `out` then holds a partial result. `gpa` holds the
+/// decoding tables only. For a caller that knows the size, or reuses one
+/// buffer: no allocation of the output and no growing it.
+pub fn decompressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, options: Options) BrotliError![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var br = BitReader.init(input);
+    var sink: SliceSink = .{ .buf = out, .cap = @min(out.len, effectiveCap(options, input.len)) };
+    var dec = DecoderOf(SliceSink){
+        .arena_state = &arena_state,
+        .arena = arena_state.allocator(),
+        .br = &br,
+        .out = &sink,
+    };
+    try dec.run();
+    return out[0..sink.len];
+}
 
 /// Decompress a complete Brotli stream. Caller owns the returned slice.
 pub fn decompress(gpa: std.mem.Allocator, input: []const u8, options: Options) BrotliError![]u8 {

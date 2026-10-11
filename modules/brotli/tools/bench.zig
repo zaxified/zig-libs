@@ -20,8 +20,11 @@
 //! Workloads: `c_<effort>_<payload>` compresses the payload (ours: `compressWith`
 //! at that effort; theirs: `BrotliEncoderCompress` at the paired quality, lgwin
 //! 22), `d_<payload>` decompresses the stream the reference made at quality 9
-//! (ours: `decompress`, allocating its output per call as an HTTP client does;
-//! theirs: `BrotliDecoderDecompress` into a preallocated buffer). The reported
+//! into a preallocated buffer of the payload size + 1 on both sides (ours:
+//! `decompressInto`; theirs: `BrotliDecoderDecompress`); `d_<payload>_alloc`
+//! is ours allocating its output per call, as `decompress` does for an HTTP
+//! client -- printed for information, not in the verdict, since the
+//! reference has no such call to pair it with. The reported
 //! count is the UNCOMPRESSED bytes covered, so it agrees on both sides.
 //!
 //! ⚠ The two encoders do not reach the same compressed size. The effort ↔
@@ -54,17 +57,24 @@ const pairs = [_]struct { effort: brotli.Effort, quality: u8 }{
     .{ .effort = .best, .quality = 9 },
 };
 
-const Op = struct { decompress: bool, effort: brotli.Effort, payload: usize };
+const Op = struct { decompress: bool, effort: brotli.Effort, payload: usize, alloc: bool = false };
 
 const Ctx = struct {
     gpa: std.mem.Allocator,
     inputs: [payload_names.len][]u8,
     ref_br: [payload_names.len][]u8,
+    /// `decompressInto`'s buffers: the payload size + 1, as the reference's.
+    dec_buf: [payload_names.len][]u8 = undefined,
     op: Op = undefined,
 };
 
 fn once(x: *Ctx) usize {
     const i = x.op.payload;
+    if (x.op.decompress and !x.op.alloc) {
+        const out = brotli.decompressInto(x.gpa, x.dec_buf[i], x.ref_br[i], .{}) catch unreachable;
+        std.mem.doNotOptimizeAway(out.ptr);
+        return out.len;
+    }
     if (x.op.decompress) {
         const out = brotli.decompress(x.gpa, x.ref_br[i], .{}) catch unreachable;
         defer x.gpa.free(out);
@@ -158,6 +168,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (payload_names, 0..) |n, i| {
         const rb = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}.ref.br", .{n}), arena, .limited(1 << 24));
         ctx.ref_br[i] = rb;
+        ctx.dec_buf[i] = try arena.alloc(u8, ctx.inputs[i].len + 1);
         const back = try brotli.decompress(arena, rb, .{});
         if (!std.mem.eql(u8, back, ctx.inputs[i])) {
             std.debug.print("{s}: FAILED -- our decoder does not reproduce {s} from the reference stream\n", .{ bench_name, n });
@@ -184,6 +195,8 @@ pub fn main(init: std.process.Init) !u8 {
         }
         const name = try std.fmt.allocPrint(arena, "d_{s}", .{n});
         try ws.append(arena, .{ .name = name, .op = .{ .decompress = true, .effort = .default, .payload = i }, .ref = name });
+        const aname = try std.fmt.allocPrint(arena, "d_{s}_alloc", .{n});
+        try ws.append(arena, .{ .name = aname, .op = .{ .decompress = true, .effort = .default, .payload = i, .alloc = true }, .ref = name, .info = true });
     }
 
     const s = try drive(io, arena, &.{exe}, abs, &ctx, ws.items, filters, rounds, w);
@@ -289,7 +302,8 @@ fn foreign(arena: std.mem.Allocator, io: std.Io, exe: []const u8, abs: []const u
 /// One workload: `op` for our side, the foreign program's workload `ref`
 /// (the reference) and optionally `alt` (a second implementation in the
 /// field, for the `fastest` ratio); `*_exe` index the foreign programs.
-const Work = struct { name: []const u8, op: Op, ref: []const u8, alt: ?[]const u8 = null, ref_exe: usize = 0, alt_exe: usize = 0 };
+/// `info`: printed, not in the verdict (`worst`/`best`).
+const Work = struct { name: []const u8, op: Op, ref: []const u8, alt: ?[]const u8 = null, ref_exe: usize = 0, alt_exe: usize = 0, info: bool = false };
 
 const Summary = struct {
     best_ref: f64 = std.math.inf(f64),
@@ -328,8 +342,10 @@ fn drive(io: std.Io, arena: std.mem.Allocator, exes: []const []const u8, abs: []
         const by_cyc = ours.best_cyc > 0 and ref.best_cyc > 0 and (x.alt == null or alt.best_cyc > 0);
         metric_cycles = metric_cycles and by_cyc;
         const r_ref = ours.best(by_cyc) / ref.best(by_cyc);
-        s.worst_ref = @max(s.worst_ref, r_ref);
-        s.best_ref = @min(s.best_ref, r_ref);
+        if (!x.info) {
+            s.worst_ref = @max(s.worst_ref, r_ref);
+            s.best_ref = @min(s.best_ref, r_ref);
+        }
         var r_fast: f64 = r_ref;
         if (x.alt != null) {
             r_fast = ours.best(by_cyc) / @min(ref.best(by_cyc), alt.best(by_cyc));
@@ -343,7 +359,7 @@ fn drive(io: std.Io, arena: std.mem.Allocator, exes: []const []const u8, abs: []
             x.name,        ours.best_ns, ref.best_ns,               if (x.alt != null) alt.best_ns else 0,
             r_ref,         r_fast,       100 * ours.spread(by_cyc), 100 * ref.spread(by_cyc),
             100 * spr_alt, ours.count,
-            if (same) "" else " ≠",
+            if (!same) " ≠" else if (x.info) "  (info, not in the verdict)" else "",
         });
         try w.flush();
     }

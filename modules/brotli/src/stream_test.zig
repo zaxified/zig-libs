@@ -391,6 +391,33 @@ fn streamDiffHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
         break :blk brotli.decompressStream(gpa, &tr.interface, &out.writer, opts);
     };
 
+    // The caller's-buffer decoder: an exact-size buffer (no room for the
+    // fast copies' slack) and one byte short; on a bad stream, a buffer of the
+    // cap, for the same error.
+    if (want) |w| {
+        const exact = try gpa.alloc(u8, w.len);
+        defer gpa.free(exact);
+        const into = brotli.decompressInto(gpa, exact, input, opts) catch |e| {
+            std.debug.print("one-shot decoded {d} bytes, into said {t}\n", .{ w.len, e });
+            return error.Disagree;
+        };
+        if (!std.mem.eql(u8, w, into)) return error.Disagree;
+        if (w.len > 0) {
+            if (brotli.decompressInto(gpa, exact[0 .. w.len - 1], input, opts)) |_| {
+                return error.Disagree;
+            } else |e| if (e != error.OutputTooLarge) return error.Disagree;
+        }
+    } else |we| {
+        const room = try gpa.alloc(u8, opts.max_output);
+        defer gpa.free(room);
+        if (brotli.decompressInto(gpa, room, input, opts)) |_| {
+            return error.Disagree;
+        } else |e| if (e != we) {
+            std.debug.print("one-shot said {t}, into said {t}\n", .{ we, e });
+            return error.Disagree;
+        }
+    }
+
     if (want) |w| {
         _ = got catch |e| {
             std.debug.print("one-shot decoded {d} bytes, stream said {t}\n", .{ w.len, e });

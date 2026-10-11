@@ -40,6 +40,10 @@ const brotli = @import("brotli");
 const out = try brotli.decompress(gpa, input, .{});          // default cap 256 MiB
 const out = try brotli.decompress(gpa, input, .{ .max_output = 8 << 20 });
 
+// Into your own buffer (a known size, or one buffer reused): no output
+// allocation; OutputTooLarge when it does not fit. `gpa` holds the tables.
+const got = try brotli.decompressInto(gpa, buf, input, .{});  // a prefix of buf
+
 // Streaming: reader in, writer out. Memory is the window (≤ 16 MiB, and
 // only as much as the output needs), not the output.
 const n = try brotli.decompressStream(gpa, &body_reader, &file_writer, .{});
