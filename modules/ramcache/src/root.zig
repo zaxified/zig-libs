@@ -31,11 +31,11 @@
 //!     doorkeeper bit set and periodic halving ("aging", every ~10× capacity
 //!     samples) so it tracks *recent* frequency, not all-time. TTL-expired
 //!     entries are always evicted first (a free win before any frequency
-//!     logic). Recency ordering uses a logical access tick, indexed by a
-//!     **binary min-heap per region** (plus one over TTL deadlines), so
-//!     picking a victim is O(1) to look at and O(log n) to maintain — never
-//!     a scan. It used to be a full-map scan per region, run up to three
-//!     times per insert, which made one insert O(max_entries): the audited
+//!     logic). Recency order is an **intrusive doubly linked queue per
+//!     region** (Caffeine's access-order deque; a min-heap over TTL deadlines
+//!     beside it), so picking a victim is O(1) to look at and O(1) to
+//!     maintain (the expiry heap O(log n)) — never a scan. It used to be a
+//!     full-map scan per region, run up to three times per insert, which made one insert O(max_entries): the audited
 //!     `pagecache` cost 93.5 us per 4 KiB page fill at a 4096-page pool,
 //!     more CPU than the NVMe read it was avoiding, against 0.8 us now.
 //!     A buffer pool is exactly the "modest entry counts" assumption's
@@ -228,35 +228,40 @@ pub const Loader = struct {
 /// 4-bit Count-Min Sketch + doorkeeper with periodic aging, per the TinyLFU
 /// paper (Einziger & Friedman). Tracks the *recent* access frequency of keys
 /// in a fixed allocation sized to the cache capacity:
-///   * `depth` rows × `width` 4-bit counters (16 counters packed per u64),
-///     indexed by double hashing; estimate = min over rows (CMS never
-///     underestimates).
+///   * `depth` 4-bit counters per key (16 packed per u64), all inside ONE
+///     64-byte block picked by the key's hash — Caffeine's block layout, so a
+///     record touches one cache line of counters, not `depth` scattered ones.
+///     Within the block, counter `i` lives in word `2i` or `2i+1`, nibble
+///     picked by a byte of the second hash. Estimate = min over the `depth`
+///     counters (CMS never underestimates).
 ///   * A doorkeeper bit set absorbs the first occurrence of each key, so
 ///     one-hit wonders never touch the counters; its bit adds 1 to estimates.
 ///   * Aging: after ~10× capacity recorded samples, every counter is halved
 ///     and the doorkeeper cleared, so stale popularity decays away.
+/// The layout was rows × width with one counter per row (5 cache lines per
+/// record with the doorkeeper); on a 16-shard cache the sketches outgrow L1
+/// and those loads were the largest part of a miss (bench 2026-10-11).
 const FrequencySketch = struct {
-    counters: []u64, // depth rows × (width/16) words, 4-bit counters
+    counters: []align(64) u64, // blocks of 8 words, 4-bit counters
     doorkeeper: []u64, // bloom-style bit set, one bit per key hash
-    width: usize, // counters per row, power of two, >= 16
-    words_per_row: usize,
+    block_mask: usize, // number of 8-word blocks - 1 (power of two)
     dk_bits: usize, // doorkeeper size in bits, power of two
     samples: u64 = 0,
     sample_limit: u64,
 
     const depth = 4;
+    const words_per_block = 8;
     const hash_seed: u64 = 0x2545F4914F6CDD1D;
 
     fn init(alloc: std.mem.Allocator, capacity: usize) !FrequencySketch {
-        // Width = 8× capacity (power of two): with the sample window capped
-        // at ~10× capacity, the expected per-counter collision noise stays
-        // ~1, so a cold key cannot impersonate a hot one even in a tiny
-        // cache. Memory is 4-bit × 4 rows × width = 2 bytes per counter
-        // column — negligible.
+        // 8 × capacity counter columns of `depth` counters each (power of
+        // two): with the sample window capped at ~10× capacity, the expected
+        // per-counter collision noise stays ~1, so a cold key cannot
+        // impersonate a hot one even in a tiny cache. 2 bytes per column.
         const base = try std.math.ceilPowerOfTwo(usize, @max(capacity, 16));
         const width = base * 8;
-        const words_per_row = width / 16;
-        const counters = try alloc.alloc(u64, depth * words_per_row);
+        const words = depth * width / 16;
+        const counters = try alloc.alignedAlloc(u64, .@"64", words);
         errdefer alloc.free(counters);
         @memset(counters, 0);
         const dk_bits = width * 8; // 8 doorkeeper bits per counter column
@@ -265,8 +270,7 @@ const FrequencySketch = struct {
         return .{
             .counters = counters,
             .doorkeeper = doorkeeper,
-            .width = width,
-            .words_per_row = words_per_row,
+            .block_mask = words / words_per_block - 1,
             .dk_bits = dk_bits,
             .sample_limit = @as(u64, base) * 10, // ~10× capacity, per the paper
         };
@@ -277,11 +281,23 @@ const FrequencySketch = struct {
         alloc.free(self.doorkeeper);
     }
 
+    /// One pass over the key, the second hash re-mixed from the first
+    /// (splitmix64's finalizer), as Caffeine re-spreads one hash. Was two
+    /// full Wyhash passes.
     fn hashPair(key: []const u8) [2]u64 {
-        return .{
-            std.hash.Wyhash.hash(0, key),
-            std.hash.Wyhash.hash(hash_seed, key),
-        };
+        const h0 = std.hash.Wyhash.hash(hash_seed, key);
+        var z = h0 +% 0x9E3779B97F4A7C15;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        return .{ h0, z ^ (z >> 31) };
+    }
+
+    /// Word index and nibble shift of the key's counter `i` (< depth).
+    inline fn slot(self: *const FrequencySketch, h: [2]u64, i: usize) struct { usize, u6 } {
+        const block: usize = @intCast((h[0] >> 32) & self.block_mask);
+        const b: u64 = h[1] >> @intCast(i * 8);
+        const word = block * words_per_block + 2 * i + @as(usize, @intCast(b & 1));
+        return .{ word, @intCast(((b >> 1) & 15) * 4) };
     }
 
     /// Record one access of `key`. O(1), allocation-free.
@@ -294,11 +310,8 @@ const FrequencySketch = struct {
             // first sighting since the last reset — the doorkeeper absorbs it
             self.doorkeeper[dk_idx >> 6] |= dk_mask;
         } else {
-            var row: usize = 0;
-            while (row < depth) : (row += 1) {
-                const idx: usize = @intCast((h[0] +% h[1] *% @as(u64, row)) & (self.width - 1));
-                const word = row * self.words_per_row + (idx >> 4);
-                const shift: u6 = @intCast((idx & 15) * 4);
+            for (0..depth) |i| {
+                const word, const shift = self.slot(h, i);
                 const cur = (self.counters[word] >> shift) & 0xF;
                 if (cur < 15) self.counters[word] += @as(u64, 1) << shift;
             }
@@ -311,11 +324,8 @@ const FrequencySketch = struct {
     fn estimate(self: *const FrequencySketch, key: []const u8) u64 {
         const h = hashPair(key);
         var min: u64 = 15;
-        var row: usize = 0;
-        while (row < depth) : (row += 1) {
-            const idx: usize = @intCast((h[0] +% h[1] *% @as(u64, row)) & (self.width - 1));
-            const word = row * self.words_per_row + (idx >> 4);
-            const shift: u6 = @intCast((idx & 15) * 4);
+        for (0..depth) |i| {
+            const word, const shift = self.slot(h, i);
             const cur = (self.counters[word] >> shift) & 0xF;
             if (cur < min) min = cur;
         }
@@ -356,22 +366,31 @@ pub const Cache = struct {
     ///
     /// It exists as a separate heap allocation for one reason: a
     /// `StringHashMapUnmanaged` moves its values on rehash, so nothing may
-    /// hold a `*Entry`. A `*Node` is stable, so the four binary heaps below
-    /// can hold pointers into it and write back a heap position without ever
-    /// consulting the map. `key` borrows the map's stored key (the `kdup`
+    /// hold a `*Entry`. A `*Node` is stable, so the three region queues and
+    /// the expiry heap below can link to it and write back a position without
+    /// ever consulting the map. `key` borrows the map's stored key (the `kdup`
     /// this cache owns) and is valid for exactly as long as the entry is.
     const Node = struct {
         key: []const u8,
-        /// Mirror of `Entry.last_tick`; the ordering key of the region heaps.
+        /// Logical time of the node's last append to its region queue
+        /// (`lruPush`); ticks rise strictly from a queue's head to its tail.
+        /// The queue order itself is the recency order — `tick` is what the
+        /// tests check it against.
         tick: u64,
         /// Effective expiry instant (`Cache.deadlineFor`: the earlier of the
         /// write-TTL deadline and the idle deadline) — the ordering key of the
         /// expiry heap. Meaningful only while `exp_idx != not_queued`.
         deadline: i64 = 0,
-        /// Position in `Cache.lru[@intFromEnum(entry.region)]`, or
-        /// `not_queued` while the entry is deliberately out of the index
-        /// (borrowed — see `pins` — or doomed).
-        heap_idx: u32 = not_queued,
+        /// Links in `Cache.lru[@intFromEnum(region)]`, meaningful
+        /// only while `queued`. Not queued while the entry is deliberately out
+        /// of the index (borrowed — see `pins` — or doomed).
+        prev: ?*Node = null,
+        next: ?*Node = null,
+        queued: bool = false,
+        /// W-TinyLFU segment the entry lives in. On the node, not the map
+        /// `Entry`, so moving a queue head between regions never looks the
+        /// key up again (it used to: one hash per SLRU demotion).
+        region: Region = .window,
         /// Position in `Cache.exp`, or `not_queued` for an entry with no
         /// deadline (no TTL and no idle TTL) or while borrowed.
         exp_idx: u32 = not_queued,
@@ -433,14 +452,12 @@ pub const Cache = struct {
         /// idle expiry is off (one store per hit), so no mode switch exists.
         last_access_ns: i64,
         gen: u64, // 0 → not generation-tied (TTL only)
-        last_tick: u64, // logical access clock, drives LRU ordering
-        region: Region,
         /// Write-behind dirty bit: `put` sets it (a write not yet known to
         /// be persisted); the coordinator clears it via `markClean` once it
         /// has durably persisted `value`. Unused by the cache itself —
         /// purely a passenger bit for the caller.
         dirty: bool = false,
-        /// Index node for the region/expiry heaps. Owned by the cache; freed
+        /// Index node for the region queues and expiry heap. Owned by the cache; freed
         /// with the entry.
         node: *Node,
     };
@@ -450,19 +467,21 @@ pub const Cache = struct {
     bytes: usize = 0,
     options: Options,
     stats: Stats = .{},
-    tick: u64 = 0, // logical clock, bumped on every hit/insert
+    tick: u64 = 0, // logical clock, bumped on every region-queue append
     window_count: usize = 0,
     probation_count: usize = 0,
     protected_count: usize = 0,
     sketch: ?FrequencySketch = null, // lazily allocated on first access
     sketch_failed: bool = false, // OOM on sketch alloc → degrade to plain LRU
     prng: u64 = 0x9E3779B97F4A7C15, // deterministic LCG for tie-break admission
-    /// One min-heap per region, ordered by `Node.tick`: `items[0]` is that
-    /// region's least-recently-used entry. Since `tick` is a global counter
-    /// bumped on every insert and every hit, no two live entries share one,
-    /// so "the minimum tick in this region" names exactly the entry the old
-    /// full-map scan named — this is a complexity change, not a policy change.
-    lru: [3]std.ArrayListUnmanaged(*Node) = .{ .empty, .empty, .empty },
+    /// One intrusive doubly linked queue per region (Caffeine's access-order
+    /// deque): `head` is that region's least-recently-used entry, `tail` its
+    /// most recent. A hit, an insert, a move between regions and a `release`
+    /// all append at the tail, so every operation is O(1) with no allocation.
+    /// Was one binary min-heap per region ordered by tick: O(log n) per hit,
+    /// one pointer dereference per level, the larger part of a hit's cost
+    /// (bench vs otter, 2026-10-11).
+    lru: [3]Queue = .{ .{}, .{}, .{} },
     /// Min-heap over `Node.deadline`, holding only entries with a TTL:
     /// `items[0]` is the soonest to expire, so "is any entry expired?" is one
     /// comparison instead of a scan. (The old scan returned whichever expired
@@ -538,7 +557,6 @@ pub const Cache = struct {
         }
         self.doomed.deinit(self.alloc);
         self.map.deinit(self.alloc);
-        for (&self.lru) |*h| h.deinit(self.alloc);
         self.exp.deinit(self.alloc);
         if (self.sketch) |*s| s.deinit(self.alloc);
     }
@@ -548,13 +566,16 @@ pub const Cache = struct {
     /// entry is dropped in passing so its memory is reclaimed (lazy drop — the
     /// only reclamation besides eviction; there is no sweep). `null` = miss
     /// (caller fetches). Pass `cur_gen = 0` for TTL-only lookups.
-    /// Every `get` records the key in the frequency sketch (hit or miss), so
-    /// repeatedly requested keys build up admission credit.
+    /// A hit records the key in the frequency sketch, as every `put` does,
+    /// so repeatedly used keys build up admission credit. A miss records
+    /// nothing (Caffeine and otter do the same): in the read-through shape the
+    /// `put` that follows the miss counts the request once, and a key that is
+    /// never stored has no use for credit. Until 2026-10-11 a miss recorded
+    /// too — a sketch write per miss, the larger part of a miss's cost.
     /// The returned slice borrows the cache's storage: valid until this key is
     /// replaced, evicted, or the cache is cleared.
     pub fn get(self: *Cache, key: []const u8, now_ns: i64, cur_gen: u64) ?[]const u8 {
         self.climbIfDue();
-        self.noteAccess(key);
         const e = self.lookupFilled(key) orelse {
             self.stats.misses += 1;
             self.noteOutcome(false);
@@ -569,24 +590,22 @@ pub const Cache = struct {
             _ = self.dropKey(key);
             return null;
         }
+        self.noteAccess(key);
         self.noteOutcome(true);
         self.touchIdle(e, now_ns);
-        self.tick += 1;
-        e.last_tick = self.tick;
-        e.node.tick = self.tick;
-        // A borrowed node is out of the heaps entirely (Node.pins), so it has
-        // no heap position to sift and no region membership to move; the
-        // fresh tick above is what it re-enters the index with on `release`.
+        // A borrowed node is out of the queues entirely (Node.pins), so it
+        // has no position to move and no region membership to change; it
+        // re-enters its queue at the tail on `release`.
         if (e.node.pins == 0) {
-            self.lruTouched(e.region, e.node);
-            if (e.region == .probation) {
+            if (e.node.region == .probation) {
                 // SLRU promotion: a re-referenced main entry is proven hot
-                if (self.lruMove(e.node, .probation, .protected)) {
-                    e.region = .protected;
-                    self.probation_count -= 1;
-                    self.protected_count += 1;
-                    self.enforceProtectedCap();
-                } // else: OOM indexing the promotion — stay in probation
+                self.lruMove(e.node, .probation, .protected);
+                e.node.region = .protected;
+                self.probation_count -= 1;
+                self.protected_count += 1;
+                self.enforceProtectedCap();
+            } else {
+                self.lruTouched(e.node.region, e.node);
             }
         }
         self.stats.hits += 1;
@@ -647,7 +666,6 @@ pub const Cache = struct {
             self.fireOnEvict(e.node, key, e.value, e.dirty, .replaced);
             self.bytes -= e.value.len;
             self.alloc.free(e.value);
-            self.tick += 1;
             const node = e.node; // survives the rewrite: same key, same slot
             // An entry can only be replaced in place when nothing borrows it,
             // and an unfilled reservation is borrowed by definition (`pins`
@@ -658,14 +676,11 @@ pub const Cache = struct {
                 .inserted_ns = now_ns,
                 .ttl_ns = ttl_ns,
                 .gen = gen,
-                .last_tick = self.tick,
-                .region = e.region,
                 .dirty = true, // a fresh write, not yet known to be persisted
                 .node = node,
                 .last_access_ns = now_ns,
             };
-            node.tick = self.tick;
-            self.lruTouched(e.region, node);
+            self.lruTouched(e.node.region, node);
             self.expUpdate(node, self.deadlineFor(now_ns, ttl_ns, now_ns));
             self.bytes += vdup.len;
             // A replace can push `bytes` over the cap just as an insert can
@@ -687,11 +702,11 @@ pub const Cache = struct {
             self.alloc.free(vdup);
             return;
         };
-        // Reserve the index slots BEFORE the map insert, so that once the
-        // entry exists it is guaranteed to be reachable from the heaps. An
-        // entry the heaps do not know about could never be chosen as a victim.
+        // Reserve the expiry slot BEFORE the map insert, so that once the
+        // entry exists it is guaranteed to be reachable from the index. An
+        // entry the index does not know about could never be chosen as a
+        // victim. (The region queue is intrusive and needs no reservation.)
         const reserved = blk: {
-            self.lru[@intFromEnum(Region.window)].ensureUnusedCapacity(self.alloc, 1) catch break :blk false;
             if (self.deadlineFor(now_ns, ttl_ns, now_ns) != null)
                 self.exp.ensureUnusedCapacity(self.alloc, 1) catch break :blk false;
             break :blk true;
@@ -702,15 +717,12 @@ pub const Cache = struct {
             self.alloc.free(vdup);
             return;
         }
-        self.tick += 1;
-        node.* = .{ .key = kdup, .tick = self.tick };
+        node.* = .{ .key = kdup, .tick = 0 }; // `lruPush` stamps it
         self.map.put(self.alloc, kdup, .{
             .value = vdup,
             .inserted_ns = now_ns,
             .ttl_ns = ttl_ns,
             .gen = gen,
-            .last_tick = self.tick,
-            .region = .window,
             .dirty = true, // a fresh write, not yet known to be persisted
             .node = node,
             .last_access_ns = now_ns,
@@ -720,10 +732,9 @@ pub const Cache = struct {
             self.alloc.free(vdup);
             return;
         };
-        // Capacity was reserved above, so neither can fail. Called for effect
+        // Capacity was reserved above, so this cannot fail. Called for effect
         // in every build mode; the assert only checks the reservation held.
-        const indexed = self.lruPush(.window, node);
-        std.debug.assert(indexed);
+        self.lruPush(.window, node);
         if (self.deadlineFor(now_ns, ttl_ns, now_ns)) |d| {
             const queued = self.expPush(node, d);
             std.debug.assert(queued);
@@ -787,7 +798,7 @@ pub const Cache = struct {
             self.alloc.free(kv.key_ptr.*);
         }
         self.map.clearRetainingCapacity();
-        for (&self.lru) |*h| h.clearRetainingCapacity();
+        self.lru = .{ .{}, .{}, .{} };
         self.exp.clearRetainingCapacity();
         self.bytes = 0;
         self.window_count = 0;
@@ -898,12 +909,11 @@ pub const Cache = struct {
     /// nominal cap; `Stats.pinned` reports how many entries are in that state.
     ///
     /// Unlike `get` this does **not** promote a probation entry to protected:
-    /// the entry is out of the region heaps for the borrow's duration, so it
+    /// the entry is out of the region queues for the borrow's duration, so it
     /// has no region membership to move. It does refresh the entry's tick, so
     /// `release` re-files it as recently used.
     pub fn pin(self: *Cache, key: []const u8, now_ns: i64, cur_gen: u64) ?Borrow {
         self.climbIfDue();
-        self.noteAccess(key);
         const e = self.lookupFilled(key) orelse {
             self.stats.misses += 1;
             self.noteOutcome(false);
@@ -924,13 +934,11 @@ pub const Cache = struct {
             self.noteOutcome(false);
             return null;
         }
+        self.noteAccess(key);
         self.noteOutcome(true);
         // The node just left the expiry heap (`pinEntry`), so only the stamp
         // moves; `release` files it again under the deadline this implies.
         e.last_access_ns = now_ns;
-        self.tick += 1;
-        e.last_tick = self.tick;
-        e.node.tick = self.tick;
         self.stats.hits += 1;
         self.syncStats();
         return .{ .bytes = value, .node = e.node };
@@ -986,15 +994,13 @@ pub const Cache = struct {
             // if borrowed, parked — never left findable with old bytes.
             if (e.node.pins > 0) self.doomEntry(key, .replaced) else _ = self.dropKeyReason(key, .replaced);
         }
-        self.tick += 1;
-        node.* = .{ .key = kdup, .tick = self.tick, .pins = 1, .filled = false };
+        // Born borrowed, so out of the queue until `release` appends it.
+        node.* = .{ .key = kdup, .tick = 0, .pins = 1, .filled = false };
         self.map.putAssumeCapacity(kdup, .{
             .value = vbuf,
             .inserted_ns = now_ns,
             .ttl_ns = ttl_ns,
             .gen = gen,
-            .last_tick = self.tick,
-            .region = .window,
             .dirty = true,
             .node = node,
             .last_access_ns = now_ns,
@@ -1070,7 +1076,7 @@ pub const Cache = struct {
         }
         const kv = self.map.fetchRemove(n.key).?;
         self.removals +|= 1;
-        switch (kv.value.region) {
+        switch (kv.value.node.region) {
             .window => self.window_count -= 1,
             .probation => self.probation_count -= 1,
             .protected => self.protected_count -= 1,
@@ -1084,7 +1090,7 @@ pub const Cache = struct {
     }
 
     /// End a borrow. The entry becomes an ordinary eviction candidate again
-    /// (re-filed into its region's LRU heap with the tick of its last access);
+    /// (re-filed at its region queue's tail, as its most recent entry);
     /// a *doomed* entry — one whose logical life ended while it was borrowed —
     /// has its memory freed here, by the last release.
     ///
@@ -1103,13 +1109,10 @@ pub const Cache = struct {
             return;
         }
         const e = self.map.getPtr(n.key).?;
-        if (!self.lruPush(e.region, n)) {
-            // A live entry that is not in the index could never be chosen as
-            // a victim — un-evictable forever. Dropping it is always safe.
-            _ = self.dropKey(n.key);
-            self.syncStats();
-            return;
-        }
+        // Back in at the tail: the borrow was a use, so the entry is the
+        // region's most recent one (Caffeine has no borrows; this is the
+        // order its read of the same entry would leave).
+        self.lruPush(e.node.region, n);
         if (self.deadlineFor(e.inserted_ns, e.ttl_ns, e.last_access_ns)) |d| _ = self.expPush(n, d);
         self.syncStats();
     }
@@ -1227,9 +1230,9 @@ pub const Cache = struct {
         }
         const found = if (self.map.fetchRemove(key)) |kv| blk: {
             self.removals +|= 1;
-            self.lruRemove(kv.value.region, kv.value.node);
+            self.lruRemove(kv.value.node.region, kv.value.node);
             self.expRemove(kv.value.node);
-            switch (kv.value.region) {
+            switch (kv.value.node.region) {
                 .window => self.window_count -= 1,
                 .probation => self.probation_count -= 1,
                 .protected => self.protected_count -= 1,
@@ -1260,7 +1263,7 @@ pub const Cache = struct {
         const n = e.node;
         if (n.pins == 0) {
             self.doomed.ensureTotalCapacity(self.alloc, self.pinned_entries + 1) catch return false;
-            self.lruRemove(e.region, n);
+            self.lruRemove(e.node.region, n);
             self.expRemove(n);
             self.pinned_entries += 1;
         }
@@ -1281,7 +1284,7 @@ pub const Cache = struct {
         // case, where the bytes were never written and handing a caller's
         // hook uninitialized memory would be a disclosure, not a hook.
         if (reason) |r| self.fireOnEvict(kv.value.node, kv.key, kv.value.value, kv.value.dirty, r);
-        switch (kv.value.region) {
+        switch (kv.value.node.region) {
             .window => self.window_count -= 1,
             .probation => self.probation_count -= 1,
             .protected => self.protected_count -= 1,
@@ -1334,88 +1337,55 @@ pub const Cache = struct {
         if (self.options.on_evict) |cb| cb(self.options.on_evict_ctx, key, value, dirty, reason);
     }
 
-    // ── the index heaps ─────────────────────────────────────────────────────
+    // ── the region queues ───────────────────────────────────────────────────
     //
-    // Four binary min-heaps of `*Node`: one per region ordered by `tick`, one
-    // over `deadline`. Every operation is O(log n) with no hashing — a swap
-    // writes the moved node's index straight back into the node, which is the
-    // whole reason `Node` is a separate stable allocation.
+    // One intrusive doubly linked queue per region (Caffeine's access-order
+    // deque), head = least recently used. Every append stamps a fresh `tick`,
+    // so ticks rise strictly from head to tail (`expectQueuesOrdered`). No
+    // operation allocates, so none can fail.
 
-    fn lruAt(h: []*Node, i: usize, n: *Node) void {
-        h[i] = n;
-        n.heap_idx = @intCast(i);
-    }
+    const Queue = struct {
+        head: ?*Node = null,
+        tail: ?*Node = null,
+        len: usize = 0,
+    };
 
-    fn lruSiftUp(h: []*Node, start: usize) void {
-        var i = start;
-        const item = h[i];
-        while (i > 0) {
-            const parent = (i - 1) / 2;
-            if (h[parent].tick <= item.tick) break;
-            lruAt(h, i, h[parent]);
-            i = parent;
-        }
-        lruAt(h, i, item);
-    }
-
-    fn lruSiftDown(h: []*Node, start: usize) void {
-        var i = start;
-        const item = h[i];
-        while (true) {
-            var child = i * 2 + 1;
-            if (child >= h.len) break;
-            if (child + 1 < h.len and h[child + 1].tick < h[child].tick) child += 1;
-            if (item.tick <= h[child].tick) break;
-            lruAt(h, i, h[child]);
-            i = child;
-        }
-        lruAt(h, i, item);
-    }
-
-    /// Insert `n` into `region`'s heap. False on OOM — every caller has a
-    /// defined fallback, because a failed insert must never leave a live entry
-    /// out of the index (it would then be un-evictable).
-    fn lruPush(self: *Cache, region: Region, n: *Node) bool {
-        const h = &self.lru[@intFromEnum(region)];
-        h.append(self.alloc, n) catch return false;
-        lruAt(h.items, h.items.len - 1, n);
-        lruSiftUp(h.items, h.items.len - 1);
-        return true;
+    /// Append `n` at `region`'s tail as its most recent entry.
+    fn lruPush(self: *Cache, region: Region, n: *Node) void {
+        std.debug.assert(!n.queued);
+        const q = &self.lru[@intFromEnum(region)];
+        self.tick += 1;
+        n.tick = self.tick;
+        n.prev = q.tail;
+        n.next = null;
+        if (q.tail) |t| t.next = n else q.head = n;
+        q.tail = n;
+        q.len += 1;
+        n.queued = true;
     }
 
     fn lruRemove(self: *Cache, region: Region, n: *Node) void {
-        if (n.heap_idx == Node.not_queued) return; // borrowed/doomed: not indexed
-        const h = &self.lru[@intFromEnum(region)];
-        const i: usize = n.heap_idx;
-        n.heap_idx = Node.not_queued;
-        const last = h.items[h.items.len - 1];
-        h.items.len -= 1;
-        if (i >= h.items.len) return; // it was the last slot
-        lruAt(h.items, i, last);
-        if (i > 0 and last.tick < h.items[(i - 1) / 2].tick) {
-            lruSiftUp(h.items, i);
-        } else {
-            lruSiftDown(h.items, i);
-        }
+        if (!n.queued) return; // borrowed/doomed: not indexed
+        const q = &self.lru[@intFromEnum(region)];
+        if (n.prev) |p| p.next = n.next else q.head = n.next;
+        if (n.next) |x| x.prev = n.prev else q.tail = n.prev;
+        n.prev = null;
+        n.next = null;
+        n.queued = false;
+        q.len -= 1;
     }
 
-    /// `n.tick` has just been raised (a hit or a rewrite), so it can only sink.
+    /// A hit or a rewrite: move `n` to its region's tail.
     fn lruTouched(self: *Cache, region: Region, n: *Node) void {
-        if (n.heap_idx == Node.not_queued) return; // borrowed/doomed: not indexed
-        lruSiftDown(self.lru[@intFromEnum(region)].items, n.heap_idx);
+        if (!n.queued) return; // borrowed/doomed: not indexed
+        self.lruRemove(region, n);
+        self.lruPush(region, n);
     }
 
-    /// Move `n` between region heaps. False on OOM, with `n` left in `from`.
-    fn lruMove(self: *Cache, n: *Node, from: Region, to: Region) bool {
+    /// Move `n` from `from` to the tail of `to`.
+    fn lruMove(self: *Cache, n: *Node, from: Region, to: Region) void {
         self.lruRemove(from, n);
-        if (self.lruPush(to, n)) return true;
-        // The slot just vacated in `from` is still reserved, so this cannot
-        // fail — the entry stays indexed and the caller declines the move.
-        // Written out rather than wrapped in `assert`: the call must happen in
-        // every build mode, and an assert reads like it might not.
-        const back = self.lruPush(from, n);
-        std.debug.assert(back);
-        return false;
+        self.lruPush(to, n);
     }
 
     fn expAt(h: []*Node, i: usize, n: *Node) void {
@@ -1522,12 +1492,16 @@ pub const Cache = struct {
     }
 
     /// Key of the least-recently-used entry within `region`, or null.
-    /// O(1): the heap root. Was a full-map scan.
+    /// O(1): the queue head. Was a full-map scan.
     fn regionLruKey(self: *Cache, region: Region) ?[]const u8 {
-        const h = self.lru[@intFromEnum(region)].items;
-        if (h.len == 0) return null;
+        return (self.regionLru(region) orelse return null).key;
+    }
+
+    /// The node behind `regionLruKey`, for moves that need no map entry.
+    fn regionLru(self: *Cache, region: Region) ?*Node {
+        const head = self.lru[@intFromEnum(region)].head orelse return null;
         self.maintenance_visits += 1;
-        return h[0].key;
+        return head;
     }
 
     /// Key of a TTL-expired entry, or null (expired entries are free wins —
@@ -1557,10 +1531,9 @@ pub const Cache = struct {
     /// (global cap holds), so the window's LRU moves to probation freely.
     fn shrinkWindow(self: *Cache) void {
         while (self.window_count > self.windowCap()) {
-            const k = self.regionLruKey(.window) orelse break;
-            const e = self.map.getPtr(k).?;
-            if (!self.lruMove(e.node, .window, .probation)) break;
-            e.region = .probation;
+            const n = self.regionLru(.window) orelse break;
+            self.lruMove(n, .window, .probation);
+            n.region = .probation;
             self.window_count -= 1;
             self.probation_count += 1;
         }
@@ -1635,9 +1608,8 @@ pub const Cache = struct {
         const want = @min(quota, bound - self.window_adapt);
         var moved: usize = 0;
         while (moved < want) {
-            const k = self.regionLruKey(.probation) orelse self.regionLruKey(.protected) orelse break;
-            const e = self.map.getPtr(k).?;
-            if (!self.moveToWindow(e)) break;
+            const n = self.regionLru(.probation) orelse self.regionLru(.protected) orelse break;
+            self.moveToWindow(n);
             moved += 1;
         }
         self.window_adapt += moved;
@@ -1652,31 +1624,17 @@ pub const Cache = struct {
         self.shrinkWindow();
     }
 
-    /// Re-file a main-region entry as the window's most recent one. False on
-    /// OOM re-indexing it, in which case it stays where it was.
-    fn moveToWindow(self: *Cache, e: *Entry) bool {
-        const n = e.node;
-        const from = e.region;
-        self.lruRemove(from, n);
-        const old_tick = n.tick;
-        self.tick += 1;
-        n.tick = self.tick;
-        e.last_tick = self.tick;
-        if (!self.lruPush(.window, n)) {
-            n.tick = old_tick;
-            e.last_tick = old_tick;
-            const back = self.lruPush(from, n); // the slot just vacated is still reserved
-            std.debug.assert(back);
-            return false;
-        }
+    /// Re-file a main-region entry as the window's most recent one.
+    fn moveToWindow(self: *Cache, n: *Node) void {
+        const from = n.region;
+        self.lruMove(n, from, .window);
         switch (from) {
             .window => unreachable,
             .probation => self.probation_count -= 1,
             .protected => self.protected_count -= 1,
         }
-        e.region = .window;
+        n.region = .window;
         self.window_count += 1;
-        return true;
     }
 
     /// Rebuild the index once removals since the last rebuild pass a quarter
@@ -1699,10 +1657,9 @@ pub const Cache = struct {
     fn enforceProtectedCap(self: *Cache) void {
         const cap = self.protectedCap();
         while (self.protected_count > cap) {
-            const k = self.regionLruKey(.protected) orelse break;
-            const e = self.map.getPtr(k).?;
-            if (!self.lruMove(e.node, .protected, .probation)) break;
-            e.region = .probation;
+            const n = self.regionLru(.protected) orelse break;
+            self.lruMove(n, .protected, .probation);
+            n.region = .probation;
             self.protected_count -= 1;
             self.probation_count += 1;
         }
@@ -1781,17 +1738,11 @@ pub const Cache = struct {
         if (self.admit(cand, victim)) {
             _ = self.dropKey(victim);
             const e = self.map.getPtr(cand).?;
-            if (self.lruMove(e.node, .window, .probation)) {
-                e.region = .probation;
-                self.window_count -= 1;
-                self.probation_count += 1;
-                self.stats.admissions += 1;
-            } else {
-                // OOM re-indexing the winner; drop it rather than leave the
-                // cache over its cap. Same outcome shape as a rejection.
-                _ = self.dropKey(cand);
-                self.stats.rejections += 1;
-            }
+            self.lruMove(e.node, .window, .probation);
+            e.node.region = .probation;
+            self.window_count -= 1;
+            self.probation_count += 1;
+            self.stats.admissions += 1;
         } else {
             _ = self.dropKey(cand);
             self.stats.rejections += 1;
@@ -2350,10 +2301,10 @@ const SeamHarness = struct {
             @as(usize, self.c.map.count()),
             self.c.window_count + self.c.probation_count + self.c.protected_count,
         );
-        // ...and they count the same entries the region heaps index. That is a
+        // ...and they count the same entries the region queues index. That is a
         // strictly stronger statement than the partition above, which stays
         // true while an entry is counted in one region and indexed in another.
-        try expectRegionHeapsAgree(&self.c);
+        try expectRegionQueuesAgree(&self.c);
         // Every parked node knows where it is parked, and is still borrowed.
         for (self.c.doomed.items, 0..) |n, i| {
             try testing.expectEqual(@as(u32, @intCast(i)), n.doom_idx);
@@ -2410,15 +2361,15 @@ test "seam scripts: parked values released out of order, and reservations that d
 test "seam scripts: a live release re-files window, probation AND protected borrows" {
     // Every borrow released above is released *doomed* — parked by an
     // intervening remove/put-over/clear, so `release` takes its `freeDoomed`
-    // branch. The other branch, `self.lruPush(e.region, n)` (re-filing a
+    // branch. The other branch, `self.lruPush(e.node.region, n)` (re-filing a
     // still-resident entry into its OWN region's heap), never runs above —
     // for any region, not just a non-window one. That branch is exactly
-    // where `release: release re-files the entry into its OWN region heap,
+    // where `release: release re-files the entry into its OWN region queue,
     // from every region` (below) pins a real historical bug: a refactor that
-    // re-files into a fixed region instead of `e.region`. This script drives
+    // re-files into a fixed region instead of `e.node.region`. This script drives
     // that branch through the harness's own op vocabulary — not a
     // hand-written assertion beside it — so `check()`'s generic
-    // `expectRegionHeapsAgree` is what catches a regression, the same way it
+    // `expectRegionQueuesAgree` is what catches a regression, the same way it
     // would for a shape the fuzzer found on its own.
     const H = SeamHarness;
     try H.run(testing.allocator, &.{
@@ -2852,20 +2803,20 @@ test "borrow: a doomed TTL node must not stall eviction" {
     c.release(b);
 }
 
-/// The region counters and the region heaps are two different structures over
+/// The region counters and the region queues are two different structures over
 /// the same entries, and they are read by different code: the counters drive
-/// `maintain`'s window loop and `enforceProtectedCap`, while the heaps decide
+/// `maintain`'s window loop and `enforceProtectedCap`, while the queues decide
 /// *which* entry those loops — and eviction — actually take. An entry counted
 /// in one region but indexed in another therefore has no symptom in either
 /// structure read on its own: the counters still partition the map, and every
-/// heap is still a valid heap ordered by tick. This asserts the two name the
+/// queue is still a valid queue ordered by tick. This asserts the two name the
 /// same entries, which is the property `release`'s re-file has to preserve.
-fn expectRegionHeapsAgree(c: *Cache) !void {
+fn expectRegionQueuesAgree(c: *Cache) !void {
     var live = [_]usize{ 0, 0, 0 }; // live map entries, by `Entry.region`
     var indexed = [_]usize{ 0, 0, 0 }; // ...of those, the ones a heap must hold
     var it = c.map.iterator();
     while (it.next()) |kv| {
-        const r = @intFromEnum(kv.value_ptr.region);
+        const r = @intFromEnum(kv.value_ptr.node.region);
         live[r] += 1;
         // A borrowed node is deliberately out of both heaps (see `Node.pins`).
         if (kv.value_ptr.node.pins == 0) indexed[r] += 1;
@@ -2873,18 +2824,22 @@ fn expectRegionHeapsAgree(c: *Cache) !void {
     try testing.expectEqual(live[0], c.window_count);
     try testing.expectEqual(live[1], c.probation_count);
     try testing.expectEqual(live[2], c.protected_count);
-    for (&c.lru, 0..) |*h, r| {
-        try testing.expectEqual(indexed[r], h.items.len);
-        for (h.items, 0..) |n, i| {
-            try testing.expectEqual(@as(u32, @intCast(i)), n.heap_idx);
-            const e = c.map.getPtr(n.key) orelse return error.HeapHoldsAnUnmappedNode;
-            try testing.expectEqual(@as(usize, r), @intFromEnum(e.region));
+    for (&c.lru, 0..) |*q, r| {
+        try testing.expectEqual(indexed[r], q.len);
+        var walked: usize = 0;
+        var it_n = q.head;
+        while (it_n) |n| : (it_n = n.next) {
+            try testing.expect(n.queued);
+            const e = c.map.getPtr(n.key) orelse return error.QueueHoldsAnUnmappedNode;
+            try testing.expectEqual(@as(usize, r), @intFromEnum(e.node.region));
+            walked += 1;
         }
+        try testing.expectEqual(q.len, walked);
     }
 }
 
-test "borrow: release re-files the entry into its OWN region heap, from every region" {
-    // `release` re-files an ended borrow with `lruPush(e.region, n)`. Pushing
+test "borrow: release re-files the entry into its OWN region queue, from every region" {
+    // `release` re-files an ended borrow with `lruPush(e.node.region, n)`. Pushing
     // it into a fixed region instead is a plausible refactor and a real bug —
     // heap membership diverging from the region the entry is *counted* in —
     // and it used to be invisible here: only `pagecache` failed, i.e. the rule
@@ -2901,24 +2856,24 @@ test "borrow: release re-files the entry into its OWN region heap, from every re
     c.put("a", "A", 0, 0, 0);
     c.put("b", "B", 0, 0, 0);
     c.put("c", "C", 0, 0, 0); // window overflow demotes a, then b, to probation
-    try expectRegionHeapsAgree(&c);
+    try expectRegionQueuesAgree(&c);
 
     // .window — the newest insert, still in the admission window.
-    try testing.expectEqual(Cache.Region.window, c.map.getPtr("c").?.region);
+    try testing.expectEqual(Cache.Region.window, c.map.getPtr("c").?.node.region);
     c.release(c.pin("c", 0, 0).?);
-    try expectRegionHeapsAgree(&c);
+    try expectRegionQueuesAgree(&c);
 
     // .probation — demoted out of the window by `maintain`.
-    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("a").?.region);
+    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("a").?.node.region);
     c.release(c.pin("a", 0, 0).?);
-    try expectRegionHeapsAgree(&c);
+    try expectRegionQueuesAgree(&c);
 
     // .protected — promoted by the SLRU re-reference rule in `get`.
     _ = c.get("b", 0, 0).?;
-    try testing.expectEqual(Cache.Region.protected, c.map.getPtr("b").?.region);
+    try testing.expectEqual(Cache.Region.protected, c.map.getPtr("b").?.node.region);
     try testing.expectEqual(@as(usize, 1), c.protected_count);
     c.release(c.pin("b", 0, 0).?);
-    try expectRegionHeapsAgree(&c);
+    try expectRegionQueuesAgree(&c);
 }
 
 test "borrow: a released protected entry keeps its SLRU standing, so demotion takes the right victim" {
@@ -2936,7 +2891,7 @@ test "borrow: a released protected entry keeps its SLRU standing, so demotion ta
     c.put("win", "W", 0, 0, 0);
 
     _ = c.get("old", 0, 0).?; // probation → protected
-    try testing.expectEqual(Cache.Region.protected, c.map.getPtr("old").?.region);
+    try testing.expectEqual(Cache.Region.protected, c.map.getPtr("old").?.node.region);
     try testing.expectEqual(@as(usize, 1), c.protected_count);
 
     c.release(c.pin("old", 0, 0).?); // the borrow under test
@@ -2950,9 +2905,9 @@ test "borrow: a released protected entry keeps its SLRU standing, so demotion ta
     // that just earned its place. Note both entries are still resident either
     // way, and both counters still partition the map either way — only *which*
     // entry was demoted differs.
-    try testing.expectEqual(Cache.Region.protected, c.map.getPtr("new").?.region);
-    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("old").?.region);
-    try expectRegionHeapsAgree(&c);
+    try testing.expectEqual(Cache.Region.protected, c.map.getPtr("new").?.node.region);
+    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("old").?.node.region);
+    try expectRegionQueuesAgree(&c);
 }
 
 test "borrow: a released probation entry is still the region's eviction candidate" {
@@ -2965,8 +2920,8 @@ test "borrow: a released probation entry is still the region's eviction candidat
     c.put("lru", "L", 0, 0, 0);
     c.put("mru", "M", 0, 0, 0);
     c.put("win", "W", 0, 0, 0);
-    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("lru").?.region);
-    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("mru").?.region);
+    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("lru").?.node.region);
+    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("mru").?.node.region);
 
     c.release(c.pin("lru", 0, 0).?); // the borrow under test
 
@@ -2980,7 +2935,7 @@ test "borrow: a released probation entry is still the region's eviction candidat
     // `evictOne` goes straight to the main region's LRU root, so the victim is
     // decided by heap membership alone and nothing here depends on frequency.
     const wb = c.pin("win", 0, 0).?;
-    try testing.expectEqual(@as(usize, 0), c.lru[@intFromEnum(Cache.Region.window)].items.len);
+    try testing.expectEqual(@as(usize, 0), c.lru[@intFromEnum(Cache.Region.window)].len);
 
     // A reservation is pinned from birth, so it adds pressure without adding a
     // window candidate: one entry over the cap, one eviction.
@@ -3213,7 +3168,7 @@ test "remove: fires on_evict with reason .evicted and frees the entry's memory (
 test "remove: a removed key's slot can be reused by a fresh put (heap index not left dangling)" {
     // Targets the index-node bookkeeping `remove` shares with capacity
     // eviction: after removing a key, inserting a new key must land cleanly
-    // in the region heaps rather than tripping over a stale node reference.
+    // in the region queues rather than tripping over a stale node reference.
     var c = testCache(1 << 20, 4);
     defer c.deinit();
     c.put("a", "1", 0, 0, 0);
@@ -3461,7 +3416,7 @@ test "victim selection is O(1): eviction bookkeeping does not scan the map" {
     }
 
     // 64x the capacity must not cost meaningfully more per insert. A full-map
-    // scan would make this ratio ~64; the slack is for the region heaps being
+    // scan would make this ratio ~64; the slack is for the region queues being
     // occasionally empty, which skips a visit entirely.
     try testing.expect(per_put[1] <= per_put[0] * 2.0);
     // ...and the bookkeeping actually happens (a zero counter would satisfy
@@ -3745,12 +3700,22 @@ test "removeMatching removes a key equal to the prefix too" {
     try testing.expectEqualStrings("3", c.get("b", 1, 0).?);
 }
 
-fn expectHeapsOrdered(c: *Cache) !void {
-    for (&c.lru) |*h| {
-        for (h.items, 0..) |n, i| {
-            try testing.expectEqual(@as(u32, @intCast(i)), n.heap_idx);
-            if (i > 0) try testing.expect(h.items[(i - 1) / 2].tick <= n.tick);
+fn expectQueuesOrdered(c: *Cache) !void {
+    // Each region queue: links consistent both ways, ticks strictly rising
+    // head to tail (the recency order the head is picked by).
+    for (&c.lru) |*q| {
+        var prev: ?*Cache.Node = null;
+        var it_n = q.head;
+        var walked: usize = 0;
+        while (it_n) |n| : (it_n = n.next) {
+            try testing.expect(n.queued);
+            try testing.expectEqual(prev, n.prev);
+            if (prev) |p| try testing.expect(p.tick < n.tick);
+            prev = n;
+            walked += 1;
         }
+        try testing.expectEqual(prev, q.tail);
+        try testing.expectEqual(q.len, walked);
     }
     for (c.exp.items, 0..) |n, i| {
         try testing.expectEqual(@as(u32, @intCast(i)), n.exp_idx);
@@ -3758,7 +3723,7 @@ fn expectHeapsOrdered(c: *Cache) !void {
     }
 }
 
-test "random put/get/remove/replace sequences keep every region heap and the expiry heap ordered" {
+test "random put/get/remove/replace sequences keep every region queue and the expiry heap ordered" {
     // A heap whose root is not the minimum silently evicts the wrong entry, so
     // the min-heap property (parent <= child on tick / deadline) and the
     // back-pointers are checked after EVERY operation. Fixed LCG, 48 keys in a
@@ -3780,7 +3745,7 @@ test "random put/get/remove/replace sequences keep every region heap and the exp
             2, 3 => _ = c.get(key, now, 0),
             else => _ = c.remove(key),
         }
-        try expectHeapsOrdered(&c);
+        try expectQueuesOrdered(&c);
     }
 }
 
@@ -3856,7 +3821,7 @@ test "idle ttl: a hit moves the entry's place in the expiry heap, so the NEXT on
     c.put("a", "1", 0, 0, 0);
     c.put("b", "2", 10, 0, 0);
     _ = c.get("a", 90, 0); // a: deadline 190 (was 100); b stays at 110
-    try expectHeapsOrdered(&c);
+    try expectQueuesOrdered(&c);
     try expectExpiryAgrees(&c);
     // At 150 only b is idle-expired. RED if the hit left a's old deadline in
     // the heap: a would be the root and would be evicted instead.
@@ -3947,7 +3912,7 @@ test "idle ttl: random put/get/remove sequences agree with a naive model of writ
                 m.present = false;
             },
         }
-        try expectHeapsOrdered(&c);
+        try expectQueuesOrdered(&c);
         try expectExpiryAgrees(&c);
     }
     // The run has to have crossed the boundary it claims to: hits that were
@@ -4030,8 +3995,8 @@ test "adaptive_window off (the default): the window stays ~1 % and the climber n
 }
 
 fn expectAdaptiveInvariants(c: *Cache) !void {
-    try expectHeapsOrdered(c);
-    try expectRegionHeapsAgree(c);
+    try expectQueuesOrdered(c);
+    try expectRegionQueuesAgree(c);
     try testing.expectEqual(
         @as(usize, c.map.count()),
         c.window_count + c.probation_count + c.protected_count,

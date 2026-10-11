@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Performance (P2, **BEHAVIOURAL** in eviction order and admission, API unchanged):
+  the region heaps are intrusive O(1) queues (Caffeine's access-order deque), so a hit, an insert, a
+  move between regions and a `release` all make the entry its region's most recent (a released borrow
+  or a demoted entry used to keep its old tick); a **miss no longer records the key in the frequency
+  sketch** (Caffeine and otter record on hit and write only); the sketch takes one Wyhash instead of
+  two and keeps a key's four counters in one 64-byte block. Bench vs otter v2.3.0: get hit 2.26× →
+  1.00–1.03×, get miss 1.75× → 1.05–1.11×, worst row 1.10×; zipf hit total 75 000 → 75 757.
 - **2026-10-11** — Added (S3 to S2, Caffeine parity; all additive, defaults unchanged): **time-to-idle**
   (`Options.idle_ttl_ns` on `Cache` and `Sharded`; a hit or a `put` refreshes the idle deadline, the
   effective deadline is the earlier of write-TTL and idle, counts in `Stats.expired`); **`getOrLoad`**

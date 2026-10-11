@@ -500,7 +500,7 @@ pub const Sharded = struct {
     ///
     /// Semantics of `key`/`now_ns`/`cur_gen` are `Cache.get`'s, unchanged: a
     /// TTL-expired or generation-stale entry is dropped in passing, and every
-    /// call records the key in that shard's frequency sketch.
+    /// hit records the key in that shard's frequency sketch.
     ///
     /// Deliberately NOT returning a borrowed slice — see the module doc.
     pub fn getBuf(self: *Sharded, key: []const u8, now_ns: i64, cur_gen: u64, buf: []u8) GetResult {
@@ -796,7 +796,7 @@ fn expectInvariants(sc: *Sharded) !void {
         var it = s.cache.map.iterator();
         while (it.next()) |kv| {
             bytes += kv.value_ptr.value.len;
-            switch (kv.value_ptr.region) {
+            switch (kv.value_ptr.node.region) {
                 .window => window += 1,
                 .probation => probation += 1,
                 .protected => protected += 1,
@@ -958,9 +958,10 @@ test "the DELIVERED defaults: 16 shards, and the caps divided by 16" {
 
 test "the shard seed: pinned base, distinct from the sketch's, freshly derived per instance" {
     // (a) The delivered base, as a literal. Its whole job is to be a value the
-    //     frequency sketch does not use — `hashPair` seeds with `0` and
-    //     `0x2545F4914F6CDD1D` — because sharing one confines a shard's keys to
-    //     1/N of the doorkeeper index space.
+    //     frequency sketch does not use — `hashPair` seeds with
+    //     `0x2545F4914F6CDD1D` (with `0` too until 2026-10-11) — because
+    //     sharing one confines a shard's keys to 1/N of the doorkeeper index
+    //     space.
     try testing.expectEqual(@as(u64, 0x9AE16A3B2F90404F), Sharded.shard_seed_base);
     try testing.expect(Sharded.shard_seed_base != 0);
     try testing.expect(Sharded.shard_seed_base != 0x2545F4914F6CDD1D);
