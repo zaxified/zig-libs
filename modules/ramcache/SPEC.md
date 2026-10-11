@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, RAMCA_E_FUZZ) · ct n/a — in-memory cache (keyword review, 2026-10-07)
 
-**Performance:** ref 0.27–1.10× maypok86/otter v2.3.0 · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.24–1.07× maypok86/otter v2.3.0 · fastest ? (measured 2026-10-11)
 
 **Evidence:** model — fuzz of operation sequences and random sequences checking heap/structural invariants (invariant checker, no independent model)
 

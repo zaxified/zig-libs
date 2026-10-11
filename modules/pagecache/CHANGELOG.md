@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Performance: page index and alignment by shift and mask for a power-of-two page size (kvtree's always is) instead of two 64-bit divisions per access; the borrow path also gets the cheaper `ramcache` lookup. kvtree scan through this cache 1.12× → 1.02–1.04× bbolt.
+
 - **2026-10-11** — Forwards `kv.Storage.syncData` (`fdatasync`) to the backend instead of letting it widen into a full `sync`; kvtree's commit barrier uses it. New test: kvtree's cursor borrows its frames through this cache, holds no more than its depth, reads what the copying cursor reads across a commit and under eviction pressure, and gives every borrow back.
 - **2026-10-11** — Forwards the new optional `kv.Storage.tryLockShared` to the backend, like `tryLockExclusive` (the lock belongs to the real file).
 

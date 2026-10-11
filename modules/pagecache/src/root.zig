@@ -170,6 +170,10 @@ pub const PageCache = struct {
     inner: Storage,
     cache: ramcache.Cache,
     page_size: usize,
+    /// `log2(page_size)` when it is a power of two (kvtree's always is), so
+    /// the per-access page arithmetic is a shift and a mask, not two 64-bit
+    /// divisions -- measurable on a resident kvtree scan, one borrow per leaf.
+    page_shift: ?std.math.Log2Int(u64),
     hits: u64 = 0,
     misses: u64 = 0,
     ref_hits: u64 = 0,
@@ -224,6 +228,7 @@ pub const PageCache = struct {
                 .max_bytes = options.max_pages * options.page_size,
             }),
             .page_size = options.page_size,
+            .page_shift = if (std.math.isPowerOfTwo(options.page_size)) std.math.log2_int(u64, options.page_size) else null,
             .gpa = gpa,
             .max_pages = options.max_pages,
             .read_ahead_pages = options.read_ahead_pages,
@@ -284,7 +289,7 @@ pub const PageCache = struct {
     pub fn preadRef(self: *PageCache, h: Storage.Handle, len: usize, off: u64) Storage.Error!?Page {
         if (!self.isFullPage(off, len)) return null;
         const fid = self.fileOf(h) orelse return null;
-        const page_index = off / self.page_size;
+        const page_index = self.pageIndex(off);
         const key = pageKey(fid, page_index);
         _ = self.noteAccess(h, page_index);
 
@@ -323,7 +328,15 @@ pub const PageCache = struct {
 
     /// Is `off`/`len` an access of exactly one whole, aligned page?
     fn isFullPage(self: *const PageCache, off: u64, len: usize) bool {
-        return len == self.page_size and off % self.page_size == 0;
+        if (len != self.page_size) return false;
+        if (self.page_shift != null) return off & (self.page_size - 1) == 0;
+        return off % self.page_size == 0;
+    }
+
+    /// `off / page_size`, a shift for a power-of-two page size.
+    fn pageIndex(self: *const PageCache, off: u64) u64 {
+        if (self.page_shift) |sh| return off >> sh;
+        return off / self.page_size;
     }
 
     fn pageKey(file: FileId, page_index: u64) [key_len]u8 {
@@ -552,8 +565,8 @@ pub const PageCache = struct {
         if (!self.isFullPage(off, buf.len)) return self.inner.pread(h, buf, off);
         const fid = self.fileOf(h) orelse return self.inner.pread(h, buf, off);
 
-        const key = pageKey(fid, off / self.page_size);
-        const sequential = self.noteAccess(h, off / self.page_size);
+        const key = pageKey(fid, self.pageIndex(off));
+        const sequential = self.noteAccess(h, self.pageIndex(off));
         if (self.cache.get(&key, 0, 0)) |cached| {
             @memcpy(buf, cached); // cached.len == page_size == buf.len
             self.hits += 1;
@@ -601,7 +614,7 @@ pub const PageCache = struct {
         self.inner.writeAll(h, bytes, off) catch |err| {
             const fid = self.fileOf(h) orelse return err;
             if (self.isFullPage(off, bytes.len)) {
-                const failed_key = pageKey(fid, off / self.page_size);
+                const failed_key = pageKey(fid, self.pageIndex(off));
                 _ = self.cache.remove(&failed_key);
             } else {
                 // Sub-page/unaligned failed write: media state unknown for
@@ -613,7 +626,7 @@ pub const PageCache = struct {
         const fid = self.fileOf(h) orelse return;
 
         if (self.isFullPage(off, bytes.len)) {
-            const page_index = off / self.page_size;
+            const page_index = self.pageIndex(off);
             const key = pageKey(fid, page_index);
             // Replace-in-place if resident (put over an existing key always
             // succeeds and never mis-admits), else offer it to the cache.

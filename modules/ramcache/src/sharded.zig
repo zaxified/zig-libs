@@ -738,14 +738,7 @@ pub const Sharded = struct {
         const s = &self.shards[self.shardIndex(key)];
         lockAcquire(&s.lock);
         defer s.lock.unlock();
-        // Reaches into the shard's map rather than going through `Cache.get`
-        // on purpose: `get` would count a hit, refresh recency, feed the
-        // frequency sketch and lazily drop a stale entry. A flush ack must be
-        // side-effect-free, exactly like `Cache.isDirty`/`markClean` are.
-        const e = s.cache.map.getPtr(key) orelse return false;
-        if (!std.mem.eql(u8, e.value, flushed)) return false;
-        e.dirty = false;
-        return true;
+        return s.cache.markCleanIf(key, flushed);
     }
 
     /// Visit every dirty entry, shard by shard, via `cb(ctx, key, value)`.
@@ -793,17 +786,17 @@ fn expectInvariants(sc: *Sharded) !void {
         var window: usize = 0;
         var probation: usize = 0;
         var protected: usize = 0;
-        var it = s.cache.map.iterator();
+        var it = s.cache.map.keyIterator();
         while (it.next()) |kv| {
-            bytes += kv.value_ptr.value.len;
-            switch (kv.value_ptr.node.region) {
+            bytes += kv.*.entry.value.len;
+            switch (kv.*.entry.node.region) {
                 .window => window += 1,
                 .probation => probation += 1,
                 .protected => protected += 1,
             }
             // No entry may live in a shard other than the one its key hashes
             // to — otherwise `get` would look in the wrong shard's lock.
-            try testing.expectEqual(i, sc.shardIndex(kv.key_ptr.*));
+            try testing.expectEqual(i, sc.shardIndex(kv.*.key));
         }
         try testing.expectEqual(bytes, s.cache.bytes);
         try testing.expectEqual(bytes, s.cache.stats.bytes);

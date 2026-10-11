@@ -83,6 +83,7 @@
 //!     one extra `bool` per entry and changes nothing else.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// The internally-synchronized wrapper: N independent `Cache` instances, one
 /// lock each, picked by a hash of the key. Its own doc comment carries the
@@ -361,17 +362,29 @@ pub const Cache = struct {
     /// its sketch's `sampleSize`, `sketch.go:63-65`, which is `10 x maximum`).
     const hill_sample_factor = 10;
 
-    /// Per-entry index node — the piece that makes victim selection O(1)
-    /// instead of a full-map scan.
+    /// Per-entry node: the entry itself (`entry`), its key bytes, and the
+    /// links that make victim selection O(1) instead of a full-map scan.
     ///
-    /// It exists as a separate heap allocation for one reason: a
-    /// `StringHashMapUnmanaged` moves its values on rehash, so nothing may
-    /// hold a `*Entry`. A `*Node` is stable, so the three region queues and
-    /// the expiry heap below can link to it and write back a position without
-    /// ever consulting the map. `key` borrows the map's stored key (the `kdup`
-    /// this cache owns) and is valid for exactly as long as the entry is.
+    /// One heap allocation per entry, the key bytes trailing the struct
+    /// (`createNode`), and the map holds only `*Node` (Caffeine's node-in-map
+    /// shape). A `*Node` is stable across rehashes, so the region queues and
+    /// the expiry heap link to it directly. A lookup is the map's metadata,
+    /// its key slot, then this node -- three dependent loads on three memory
+    /// pages. It used to be five (metadata, key slot, a separately allocated
+    /// key copy, the map's value slot, then the node): on a resident
+    /// `pagecache` scan each was a cache and TLB miss per leaf, the largest
+    /// part of a borrow (kvtree scan vs bbolt, 2026-10-11).
     const Node = struct {
+        /// The trailing key bytes while the entry is in the map; `&.{}` once
+        /// it is doomed (`parkNode`), so a stale queue or heap reference can
+        /// never name a key the map holds again.
         key: []const u8,
+        /// Length of the trailing key bytes, for `destroyNode` (`key` is
+        /// emptied when the node is doomed, the allocation is not).
+        key_len: usize,
+        /// The entry's fields. `entry.node` points back here, so code holding
+        /// an `*Entry` reaches its links without another lookup.
+        entry: Entry,
         /// Logical time of the node's last append to its region queue
         /// (`lruPush`); ticks rise strictly from a queue's head to its tail.
         /// The queue order itself is the recency order — `tick` is what the
@@ -440,6 +453,15 @@ pub const Cache = struct {
         /// itself. Every other way of creating an entry writes its value
         /// before publishing it, hence the `true` default.
         filled: bool = true,
+        /// The expiry deadline `release` files the node under when its last
+        /// borrow ends (`deadlineFor` of the entry's times; `null` = none).
+        /// Meaningful only while `pins > 0`. Kept current by everything that
+        /// changes those times while the entry is borrowed -- `pin`, `reserve`
+        /// and `touchIdle` (an overwrite of a borrowed entry dooms it instead)
+        /// -- so `release` re-files the node without looking its key up again:
+        /// that second hash lookup was a fifth of a resident `pagecache` borrow
+        /// (kvtree scan profile, 2026-10-11).
+        pin_deadline: ?i64 = null,
 
         const not_queued: u32 = std.math.maxInt(u32);
     };
@@ -457,13 +479,32 @@ pub const Cache = struct {
         /// has durably persisted `value`. Unused by the cache itself —
         /// purely a passenger bit for the caller.
         dirty: bool = false,
-        /// Index node for the region queues and expiry heap. Owned by the cache; freed
-        /// with the entry.
+        /// The node this entry lives in (`Node.entry`).
         node: *Node,
     };
 
+    /// The map hashes and compares a node by its key bytes.
+    const NodeContext = struct {
+        pub fn hash(_: NodeContext, n: *Node) u64 {
+            return std.hash_map.hashString(n.key);
+        }
+        pub fn eql(_: NodeContext, a: *Node, b: *Node) bool {
+            return std.mem.eql(u8, a.key, b.key);
+        }
+    };
+
+    /// Looks a node up by a caller's key bytes.
+    const KeyAdapter = struct {
+        pub fn hash(_: KeyAdapter, k: []const u8) u64 {
+            return std.hash_map.hashString(k);
+        }
+        pub fn eql(_: KeyAdapter, k: []const u8, n: *Node) bool {
+            return std.mem.eql(u8, k, n.key);
+        }
+    };
+
     alloc: std.mem.Allocator,
-    map: std.StringHashMapUnmanaged(Entry) = .empty,
+    map: std.HashMapUnmanaged(*Node, void, NodeContext, std.hash_map.default_max_load_percentage) = .empty,
     bytes: usize = 0,
     options: Options,
     stats: Stats = .{},
@@ -553,7 +594,7 @@ pub const Cache = struct {
         // bug, but leaking their bytes would only turn it into a second one.
         for (self.doomed.items) |n| {
             self.alloc.free(n.owned);
-            self.alloc.destroy(n);
+            self.destroyNode(n);
         }
         self.doomed.deinit(self.alloc);
         self.map.deinit(self.alloc);
@@ -621,7 +662,7 @@ pub const Cache = struct {
     /// never fatal).
     pub fn put(self: *Cache, key: []const u8, value: []const u8, now_ns: i64, ttl_ns: i64, gen: u64) void {
         self.noteAccess(key);
-        if (self.map.getPtr(key)) |e| replace: {
+        if (self.entryOf(key)) |e| replace: {
             if (value.len > self.options.max_bytes) {
                 // Same single-item ceiling a fresh insert enforces below. It
                 // has to be checked HERE too: without it an update-only
@@ -692,13 +733,8 @@ pub const Cache = struct {
             return;
         }
         if (value.len > self.options.max_bytes) return; // never cache an item larger than the whole cache
-        const kdup = self.alloc.dupe(u8, key) catch return;
-        const vdup = self.alloc.dupe(u8, value) catch {
-            self.alloc.free(kdup);
-            return;
-        };
-        const node = self.alloc.create(Node) catch {
-            self.alloc.free(kdup);
+        const vdup = self.alloc.dupe(u8, value) catch return;
+        const node = self.createNode(key) orelse {
             self.alloc.free(vdup);
             return;
         };
@@ -709,16 +745,15 @@ pub const Cache = struct {
         const reserved = blk: {
             if (self.deadlineFor(now_ns, ttl_ns, now_ns) != null)
                 self.exp.ensureUnusedCapacity(self.alloc, 1) catch break :blk false;
+            self.map.ensureUnusedCapacity(self.alloc, 1) catch break :blk false;
             break :blk true;
         };
         if (!reserved) {
-            self.alloc.destroy(node);
-            self.alloc.free(kdup);
+            self.destroyNode(node);
             self.alloc.free(vdup);
             return;
         }
-        node.* = .{ .key = kdup, .tick = 0 }; // `lruPush` stamps it
-        self.map.put(self.alloc, kdup, .{
+        node.entry = .{
             .value = vdup,
             .inserted_ns = now_ns,
             .ttl_ns = ttl_ns,
@@ -726,12 +761,8 @@ pub const Cache = struct {
             .dirty = true, // a fresh write, not yet known to be persisted
             .node = node,
             .last_access_ns = now_ns,
-        }) catch {
-            self.alloc.destroy(node);
-            self.alloc.free(kdup);
-            self.alloc.free(vdup);
-            return;
         };
+        self.map.putAssumeCapacityNoClobber(node, {});
         // Capacity was reserved above, so this cannot fail. Called for effect
         // in every build mode; the assert only checks the reservation held.
         self.lruPush(.window, node);
@@ -782,20 +813,20 @@ pub const Cache = struct {
     /// cumulative hit/miss/eviction counters, and the frequency sketch (the
     /// popularity history stays useful across a flush).
     pub fn clear(self: *Cache) void {
-        var it = self.map.iterator();
-        while (it.next()) |kv| {
-            self.fireOnEvict(kv.value_ptr.node, kv.key_ptr.*, kv.value_ptr.value, kv.value_ptr.dirty, .cleared);
-            if (kv.value_ptr.node.pins > 0) {
+        var it = self.map.keyIterator();
+        while (it.next()) |np| {
+            const n = np.*;
+            self.fireOnEvict(n, n.key, n.entry.value, n.entry.dirty, .cleared);
+            if (n.pins > 0) {
                 // Borrowed: unlink it like every other entry (a `clear` must
                 // really leave nothing findable — that is what pagecache's
                 // six invalidation guards rest on) but hand the bytes to the
                 // borrower rather than freeing them under it.
-                self.parkNode(kv.value_ptr.node, kv.key_ptr.*, kv.value_ptr.value);
+                self.parkNode(n, n.entry.value);
                 continue;
             }
-            self.alloc.destroy(kv.value_ptr.node);
-            self.alloc.free(kv.value_ptr.value);
-            self.alloc.free(kv.key_ptr.*);
+            self.alloc.free(n.entry.value);
+            self.destroyNode(n);
         }
         self.map.clearRetainingCapacity();
         self.lru = .{ .{}, .{}, .{} };
@@ -851,11 +882,12 @@ pub const Cache = struct {
         var removed: usize = 0;
         outer: while (true) {
             var it = self.map.keyIterator();
-            while (it.next()) |k| {
+            while (it.next()) |np| {
+                const k = np.*.key;
                 if (k.len < prefix.len) continue;
-                if (!std.mem.eql(u8, k.*[0..prefix.len], prefix)) continue;
+                if (!std.mem.eql(u8, k[0..prefix.len], prefix)) continue;
                 // `dropKey` frees this very slice; nothing reads it after.
-                _ = self.dropKey(k.*);
+                _ = self.dropKey(k);
                 removed += 1;
                 continue :outer;
             }
@@ -939,6 +971,7 @@ pub const Cache = struct {
         // The node just left the expiry heap (`pinEntry`), so only the stamp
         // moves; `release` files it again under the deadline this implies.
         e.last_access_ns = now_ns;
+        e.node.pin_deadline = self.deadlineFor(e.inserted_ns, e.ttl_ns, now_ns);
         self.stats.hits += 1;
         self.syncStats();
         return .{ .bytes = value, .node = e.node };
@@ -978,25 +1011,22 @@ pub const Cache = struct {
         // drops with `.evicted`, because nothing takes the entry's place.)
         self.doomed.ensureTotalCapacity(self.alloc, self.pinned_entries + 1) catch return null;
         self.map.ensureUnusedCapacity(self.alloc, 1) catch return null;
-        const kdup = self.alloc.dupe(u8, key) catch return null;
-        const vbuf = self.alloc.alloc(u8, len) catch {
-            self.alloc.free(kdup);
-            return null;
-        };
-        const node = self.alloc.create(Node) catch {
-            self.alloc.free(kdup);
+        const vbuf = self.alloc.alloc(u8, len) catch return null;
+        const node = self.createNode(key) orelse {
             self.alloc.free(vbuf);
             return null;
         };
         // Nothing below this line can fail.
-        if (self.map.getPtr(key)) |e| {
+        if (self.entryOf(key)) |e| {
             // Same reasoning as `put`: an existing entry is either freed or,
             // if borrowed, parked — never left findable with old bytes.
             if (e.node.pins > 0) self.doomEntry(key, .replaced) else _ = self.dropKeyReason(key, .replaced);
         }
         // Born borrowed, so out of the queue until `release` appends it.
-        node.* = .{ .key = kdup, .tick = 0, .pins = 1, .filled = false };
-        self.map.putAssumeCapacity(kdup, .{
+        node.pins = 1;
+        node.filled = false;
+        node.pin_deadline = self.deadlineFor(now_ns, ttl_ns, now_ns);
+        node.entry = .{
             .value = vbuf,
             .inserted_ns = now_ns,
             .ttl_ns = ttl_ns,
@@ -1004,7 +1034,8 @@ pub const Cache = struct {
             .dirty = true,
             .node = node,
             .last_access_ns = now_ns,
-        });
+        };
+        self.map.putAssumeCapacityNoClobber(node, {});
         // Deliberately NOT pushed into the window heap or the expiry heap:
         // `pins == 1`, and a pinned node is out of the index (see `Node.pins`).
         // `release` files it in the moment the borrow ends.
@@ -1066,25 +1097,24 @@ pub const Cache = struct {
             // would happily hand out. So doom it — unlinked now, its storage
             // parked with the borrow that is still outstanding and freed by
             // that borrow's release — and fire no hook, for the same reason
-            // the single-owner path below fires none. (`n.key` aliases the
-            // map's stored key, which `parkNode` frees; `doomEntry` uses the
-            // key it got back from `fetchRemove` and never touches the
-            // parameter afterwards.)
+            // the single-owner path below fires none. (`parkNode` empties
+            // `n.key`, but the bytes live in the node, which outlives the
+            // call, so the slice passed here stays readable throughout.)
             self.doomEntry(n.key, null);
             self.release(.{ .bytes = f.bytes, .node = n });
             return;
         }
-        const kv = self.map.fetchRemove(n.key).?;
+        const removed = self.map.removeAdapted(n.key, KeyAdapter{});
+        std.debug.assert(removed);
         self.removals +|= 1;
-        switch (kv.value.node.region) {
+        switch (n.region) {
             .window => self.window_count -= 1,
             .probation => self.probation_count -= 1,
             .protected => self.protected_count -= 1,
         }
-        self.bytes -= kv.value.value.len;
-        self.alloc.free(kv.value.value);
-        self.alloc.free(kv.key);
-        self.alloc.destroy(n);
+        self.bytes -= n.entry.value.len;
+        self.alloc.free(n.entry.value);
+        self.destroyNode(n);
         self.pinned_entries -= 1;
         self.syncStats();
     }
@@ -1108,12 +1138,12 @@ pub const Cache = struct {
             self.syncStats();
             return;
         }
-        const e = self.map.getPtr(n.key).?;
+        if (builtin.mode == .Debug) std.debug.assert(self.entryOf(n.key).?.node == n);
         // Back in at the tail: the borrow was a use, so the entry is the
         // region's most recent one (Caffeine has no borrows; this is the
         // order its read of the same entry would leave).
-        self.lruPush(e.node.region, n);
-        if (self.deadlineFor(e.inserted_ns, e.ttl_ns, e.last_access_ns)) |d| _ = self.expPush(n, d);
+        self.lruPush(n.region, n);
+        if (n.pin_deadline) |d| _ = self.expPush(n, d);
         self.syncStats();
     }
 
@@ -1126,7 +1156,7 @@ pub const Cache = struct {
     /// map entry", never "nobody is reading anything for this key";
     /// `Stats.pinned` is the count that still includes doomed entries.
     pub fn isPinned(self: *Cache, key: []const u8) bool {
-        const e = self.map.getPtr(key) orelse return false;
+        const e = self.entryOf(key) orelse return false;
         return e.node.pins > 0;
     }
 
@@ -1139,7 +1169,7 @@ pub const Cache = struct {
     /// (indistinguishable here from "clean"; use `get` if that distinction
     /// matters).
     pub fn isDirty(self: *Cache, key: []const u8) bool {
-        const e = self.map.getPtr(key) orelse return false;
+        const e = self.entryOf(key) orelse return false;
         return e.dirty;
     }
 
@@ -1150,7 +1180,20 @@ pub const Cache = struct {
     /// that race. Side-effect-free otherwise (no stats/promotion/sketch
     /// touch).
     pub fn markClean(self: *Cache, key: []const u8) bool {
-        const e = self.map.getPtr(key) orelse return false;
+        const e = self.entryOf(key) orelse return false;
+        e.dirty = false;
+        return true;
+    }
+
+    /// `markClean` only if the resident value still equals `flushed` -- the
+    /// race-free ack for a flusher that persisted a value which may have been
+    /// overwritten since (`Sharded.markCleanIf` is this under the shard lock).
+    /// Side-effect-free like `markClean`: going through `get` would count a
+    /// hit, refresh recency, feed the sketch and lazily drop a stale entry.
+    /// `false` if `key` is absent or its value differs.
+    pub fn markCleanIf(self: *Cache, key: []const u8, flushed: []const u8) bool {
+        const e = self.entryOf(key) orelse return false;
+        if (!std.mem.eql(u8, e.value, flushed)) return false;
         e.dirty = false;
         return true;
     }
@@ -1163,11 +1206,12 @@ pub const Cache = struct {
     /// touch map structure) but must not call `put`/`clear`/`get` — those
     /// can insert, evict, or resize mid-iteration, which is unsupported.
     pub fn drainDirty(self: *Cache, cb: DirtyFn, ctx: ?*anyopaque) void {
-        var it = self.map.iterator();
-        while (it.next()) |kv| {
+        var it = self.map.keyIterator();
+        while (it.next()) |np| {
+            const n = np.*;
             // A reservation is dirty from birth and its bytes are garbage
             // until `commit`: there is nothing to write behind yet.
-            if (kv.value_ptr.dirty and kv.value_ptr.node.filled) cb(ctx, kv.key_ptr.*, kv.value_ptr.value);
+            if (n.entry.dirty and n.filled) cb(ctx, n.key, n.entry.value);
         }
     }
 
@@ -1176,8 +1220,30 @@ pub const Cache = struct {
     /// The entry for `key` if it holds a value -- a reservation that has not
     /// been `commit`ted yet does not (see `reserve`), and reads as a miss.
     fn lookupFilled(self: *Cache, key: []const u8) ?*Entry {
-        const e = self.map.getPtr(key) orelse return null;
-        return if (e.node.filled) e else null;
+        const n = self.map.getKeyAdapted(key, KeyAdapter{}) orelse return null;
+        return if (n.filled) &n.entry else null;
+    }
+
+    /// The map entry for `key`, filled or not.
+    fn entryOf(self: *Cache, key: []const u8) ?*Entry {
+        const n = self.map.getKeyAdapted(key, KeyAdapter{}) orelse return null;
+        return &n.entry;
+    }
+
+    /// One allocation: the node, then `key`'s bytes. `entry` is left for the
+    /// caller to fill before the node is published in the map.
+    fn createNode(self: *Cache, key: []const u8) ?*Node {
+        const mem = self.alloc.alignedAlloc(u8, .of(Node), @sizeOf(Node) + key.len) catch return null;
+        const n: *Node = @ptrCast(mem.ptr);
+        const kbytes = mem[@sizeOf(Node)..];
+        @memcpy(kbytes, key);
+        n.* = .{ .key = kbytes, .key_len = key.len, .entry = undefined, .tick = 0 };
+        return n;
+    }
+
+    fn destroyNode(self: *Cache, n: *Node) void {
+        const base: [*]align(@alignOf(Node)) u8 = @ptrCast(n);
+        self.alloc.free(base[0 .. @sizeOf(Node) + n.key_len]);
     }
 
     fn syncStats(self: *Cache) void {
@@ -1220,7 +1286,7 @@ pub const Cache = struct {
     }
 
     fn dropKeyReason(self: *Cache, key: []const u8, reason: EvictReason) bool {
-        if (self.map.getPtr(key)) |e| {
+        if (self.entryOf(key)) |e| {
             if (e.node.pins > 0) {
                 // Borrowed: unlink it (no stale hit can follow) but leave the
                 // bytes alive for the borrower — see `doomEntry`.
@@ -1228,23 +1294,23 @@ pub const Cache = struct {
                 return true;
             }
         }
-        const found = if (self.map.fetchRemove(key)) |kv| blk: {
+        const found = if (self.map.fetchRemoveAdapted(key, KeyAdapter{})) |kv| blk: {
+            const n = kv.key;
             self.removals +|= 1;
-            self.lruRemove(kv.value.node.region, kv.value.node);
-            self.expRemove(kv.value.node);
-            switch (kv.value.node.region) {
+            self.lruRemove(n.region, n);
+            self.expRemove(n);
+            switch (n.region) {
                 .window => self.window_count -= 1,
                 .probation => self.probation_count -= 1,
                 .protected => self.protected_count -= 1,
             }
-            // The hook reads `node.filled`, so the node outlives it. It is
-            // already out of the map and out of both heaps by now, so nothing
-            // can reach it either way; only the free order changed.
-            self.fireOnEvict(kv.value.node, kv.key, kv.value.value, kv.value.dirty, reason);
-            self.alloc.destroy(kv.value.node);
-            self.bytes -= kv.value.value.len;
-            self.alloc.free(kv.value.value);
-            self.alloc.free(kv.key);
+            // The hook reads `node.filled` and the key bytes the node holds,
+            // so the node outlives it. It is already out of the map and out of
+            // both heaps by now, so nothing can reach it either way.
+            self.fireOnEvict(n, n.key, n.entry.value, n.entry.dirty, reason);
+            self.bytes -= n.entry.value.len;
+            self.alloc.free(n.entry.value);
+            self.destroyNode(n);
             break :blk true;
         } else false;
         self.syncStats();
@@ -1277,32 +1343,33 @@ pub const Cache = struct {
     /// never be served again — while the outstanding borrow keeps reading the
     /// snapshot it was given.
     fn doomEntry(self: *Cache, key: []const u8, reason: ?EvictReason) void {
-        const kv = self.map.fetchRemove(key).?;
+        const n = self.map.fetchRemoveAdapted(key, KeyAdapter{}).?.key;
         self.removals +|= 1;
-        std.debug.assert(kv.value.node.pins > 0);
+        std.debug.assert(n.pins > 0);
         // A `null` reason means "unlink it, but tell nobody" — `discard`'s
         // case, where the bytes were never written and handing a caller's
         // hook uninitialized memory would be a disclosure, not a hook.
-        if (reason) |r| self.fireOnEvict(kv.value.node, kv.key, kv.value.value, kv.value.dirty, r);
-        switch (kv.value.node.region) {
+        if (reason) |r| self.fireOnEvict(n, n.key, n.entry.value, n.entry.dirty, r);
+        switch (n.region) {
             .window => self.window_count -= 1,
             .probation => self.probation_count -= 1,
             .protected => self.protected_count -= 1,
         }
-        self.bytes -= kv.value.value.len;
-        self.parkNode(kv.value.node, kv.key, kv.value.value);
+        self.bytes -= n.entry.value.len;
+        self.parkNode(n, n.entry.value);
         self.syncStats();
     }
 
-    /// Shared tail of `doomEntry` and `clear`: free the map's key copy and
-    /// move the value onto the node. `doomed`'s capacity was reserved when
-    /// the first borrow was taken (`pinEntry`/`reserve`), one slot per
-    /// borrowed entry, so this append cannot fail.
-    fn parkNode(self: *Cache, n: *Node, owned_key: []const u8, value: []u8) void {
+    /// Shared tail of `doomEntry` and `clear`: empty the node's key (its
+    /// bytes stay in the node's allocation until `freeDoomed`) and move the
+    /// value onto the node. `doomed`'s capacity was reserved when the first
+    /// borrow was taken (`pinEntry`/`reserve`), one slot per borrowed entry,
+    /// so this append cannot fail.
+    fn parkNode(self: *Cache, n: *Node, value: []u8) void {
         std.debug.assert(n.pins > 0);
         std.debug.assert(n.doom_idx == Node.not_queued);
-        self.alloc.free(owned_key);
-        n.key = &.{}; // the map key it borrowed is gone
+        n.key = &.{}; // no longer a key the map can hold
+        n.entry.value = &.{};
         n.owned = value;
         self.doomed.appendAssumeCapacity(n);
         n.doom_idx = @intCast(self.doomed.items.len - 1);
@@ -1318,7 +1385,7 @@ pub const Cache = struct {
             last.doom_idx = @intCast(i);
         }
         self.alloc.free(n.owned);
-        self.alloc.destroy(n);
+        self.destroyNode(n);
     }
 
     /// Fire `Options.on_evict` if one is set. Called just before the
@@ -1470,7 +1537,11 @@ pub const Cache = struct {
     /// expiry heap (`Node.pins`); it only gets the stamp.
     fn touchIdle(self: *Cache, e: *Entry, now_ns: i64) void {
         e.last_access_ns = now_ns;
-        if (self.options.idle_ttl_ns <= 0 or e.node.pins > 0) return;
+        if (e.node.pins > 0) {
+            e.node.pin_deadline = self.deadlineFor(e.inserted_ns, e.ttl_ns, now_ns);
+            return;
+        }
+        if (self.options.idle_ttl_ns <= 0) return;
         self.expUpdate(e.node, self.deadlineFor(e.inserted_ns, e.ttl_ns, now_ns));
     }
 
@@ -1648,7 +1719,7 @@ pub const Cache = struct {
         const cap = self.map.capacity();
         if (cap == 0) return;
         if (self.removals < @max(32, cap / 4)) return;
-        self.map.rehash(std.hash_map.StringContext{});
+        self.map.rehash(NodeContext{});
         self.removals = 0;
         self.stats.rehashes += 1;
     }
@@ -1737,7 +1808,7 @@ pub const Cache = struct {
         };
         if (self.admit(cand, victim)) {
             _ = self.dropKey(victim);
-            const e = self.map.getPtr(cand).?;
+            const e = self.entryOf(cand).?;
             self.lruMove(e.node, .window, .probation);
             e.node.region = .probation;
             self.window_count -= 1;
@@ -1909,9 +1980,9 @@ test "eviction takes an expired entry before the LRU one" {
     // CONTROL: check residency directly, BEFORE any `get`. `get("exp", 100, …)`
     // returns null for an expired entry whether or not it was evicted (it drops
     // it lazily), so a `get`-based assertion alone cannot fail here.
-    try testing.expect(!c.map.contains("exp")); // physically gone, not just stale
-    try testing.expect(c.map.contains("lru"));
-    try testing.expect(c.map.contains("new"));
+    try testing.expect(!c.map.containsAdapted("exp", Cache.KeyAdapter{})); // physically gone, not just stale
+    try testing.expect(c.map.containsAdapted("lru", Cache.KeyAdapter{}));
+    try testing.expect(c.map.containsAdapted("new", Cache.KeyAdapter{}));
     // CONTROL: it left via the expired-first branch, not the frequency contest.
     // Without this the test passes even with expired-first removed: "exp" is
     // also the window-LRU candidate and loses the admission gate anyway, so the
@@ -2251,7 +2322,7 @@ const SeamHarness = struct {
         // Reach: a lookup about to find an entry that only IDLENESS has expired
         // (silent for > idle_ns, still inside its write TTL).
         if (self.idle_ns > 0 and (op % op_count == op_get or op % op_count == op_pin)) {
-            if (self.c.map.getPtr(k)) |e| {
+            if (self.c.entryOf(k)) |e| {
                 const ttl_dead = e.ttl_ns > 0 and (self.now - e.inserted_ns) > e.ttl_ns;
                 if (e.node.filled and !ttl_dead and (self.now - e.last_access_ns) > self.idle_ns) mark(.idled);
             }
@@ -2293,8 +2364,8 @@ const SeamHarness = struct {
         // `bytes` counts live map values and nothing else — not a value that
         // was parked with a borrower, not one a discarded reservation held.
         var total: usize = 0;
-        var it = self.c.map.iterator();
-        while (it.next()) |kv| total += kv.value_ptr.value.len;
+        var it = self.c.map.keyIterator();
+        while (it.next()) |kv| total += kv.*.entry.value.len;
         try testing.expectEqual(total, self.c.bytes);
         // The region counters partition the live map.
         try testing.expectEqual(
@@ -2425,11 +2496,13 @@ fn seamHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
 /// and/or idle TTL) is queued at `Cache.deadlineFor`, one without is not
 /// queued, and a borrowed one never is (`Node.pins`).
 fn expectExpiryAgrees(c: *Cache) !void {
-    var it = c.map.iterator();
+    var it = c.map.keyIterator();
     while (it.next()) |kv| {
-        const e = kv.value_ptr;
+        const e = &kv.*.entry;
         if (e.node.pins > 0) {
             try testing.expectEqual(Cache.Node.not_queued, e.node.exp_idx);
+            // `release` files the node under this without a lookup.
+            try testing.expectEqual(c.deadlineFor(e.inserted_ns, e.ttl_ns, e.last_access_ns), e.node.pin_deadline);
             continue;
         }
         if (c.deadlineFor(e.inserted_ns, e.ttl_ns, e.last_access_ns)) |d| {
@@ -2596,7 +2669,9 @@ test "borrow: a reserve that fails leaves the caller's existing entry alone" {
     }
     // Guard against the whole sweep quietly becoming a no-op: several rungs
     // must really have failed for the assertions above to have meant anything.
-    try testing.expect(failures >= 4);
+    // Three since 2026-10-11 (parking slot, value, node with its key): the key
+    // copy no longer is an allocation of its own.
+    try testing.expect(failures >= 3);
 }
 
 test "on-evict: reserve over an existing key replaces it, and says so" {
@@ -2814,12 +2889,12 @@ test "borrow: a doomed TTL node must not stall eviction" {
 fn expectRegionQueuesAgree(c: *Cache) !void {
     var live = [_]usize{ 0, 0, 0 }; // live map entries, by `Entry.region`
     var indexed = [_]usize{ 0, 0, 0 }; // ...of those, the ones a heap must hold
-    var it = c.map.iterator();
+    var it = c.map.keyIterator();
     while (it.next()) |kv| {
-        const r = @intFromEnum(kv.value_ptr.node.region);
+        const r = @intFromEnum(kv.*.entry.node.region);
         live[r] += 1;
         // A borrowed node is deliberately out of both heaps (see `Node.pins`).
-        if (kv.value_ptr.node.pins == 0) indexed[r] += 1;
+        if (kv.*.entry.node.pins == 0) indexed[r] += 1;
     }
     try testing.expectEqual(live[0], c.window_count);
     try testing.expectEqual(live[1], c.probation_count);
@@ -2830,7 +2905,7 @@ fn expectRegionQueuesAgree(c: *Cache) !void {
         var it_n = q.head;
         while (it_n) |n| : (it_n = n.next) {
             try testing.expect(n.queued);
-            const e = c.map.getPtr(n.key) orelse return error.QueueHoldsAnUnmappedNode;
+            const e = c.entryOf(n.key) orelse return error.QueueHoldsAnUnmappedNode;
             try testing.expectEqual(@as(usize, r), @intFromEnum(e.node.region));
             walked += 1;
         }
@@ -2859,18 +2934,18 @@ test "borrow: release re-files the entry into its OWN region queue, from every r
     try expectRegionQueuesAgree(&c);
 
     // .window — the newest insert, still in the admission window.
-    try testing.expectEqual(Cache.Region.window, c.map.getPtr("c").?.node.region);
+    try testing.expectEqual(Cache.Region.window, c.entryOf("c").?.node.region);
     c.release(c.pin("c", 0, 0).?);
     try expectRegionQueuesAgree(&c);
 
     // .probation — demoted out of the window by `maintain`.
-    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("a").?.node.region);
+    try testing.expectEqual(Cache.Region.probation, c.entryOf("a").?.node.region);
     c.release(c.pin("a", 0, 0).?);
     try expectRegionQueuesAgree(&c);
 
     // .protected — promoted by the SLRU re-reference rule in `get`.
     _ = c.get("b", 0, 0).?;
-    try testing.expectEqual(Cache.Region.protected, c.map.getPtr("b").?.node.region);
+    try testing.expectEqual(Cache.Region.protected, c.entryOf("b").?.node.region);
     try testing.expectEqual(@as(usize, 1), c.protected_count);
     c.release(c.pin("b", 0, 0).?);
     try expectRegionQueuesAgree(&c);
@@ -2891,7 +2966,7 @@ test "borrow: a released protected entry keeps its SLRU standing, so demotion ta
     c.put("win", "W", 0, 0, 0);
 
     _ = c.get("old", 0, 0).?; // probation → protected
-    try testing.expectEqual(Cache.Region.protected, c.map.getPtr("old").?.node.region);
+    try testing.expectEqual(Cache.Region.protected, c.entryOf("old").?.node.region);
     try testing.expectEqual(@as(usize, 1), c.protected_count);
 
     c.release(c.pin("old", 0, 0).?); // the borrow under test
@@ -2905,8 +2980,8 @@ test "borrow: a released protected entry keeps its SLRU standing, so demotion ta
     // that just earned its place. Note both entries are still resident either
     // way, and both counters still partition the map either way — only *which*
     // entry was demoted differs.
-    try testing.expectEqual(Cache.Region.protected, c.map.getPtr("new").?.node.region);
-    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("old").?.node.region);
+    try testing.expectEqual(Cache.Region.protected, c.entryOf("new").?.node.region);
+    try testing.expectEqual(Cache.Region.probation, c.entryOf("old").?.node.region);
     try expectRegionQueuesAgree(&c);
 }
 
@@ -2920,15 +2995,15 @@ test "borrow: a released probation entry is still the region's eviction candidat
     c.put("lru", "L", 0, 0, 0);
     c.put("mru", "M", 0, 0, 0);
     c.put("win", "W", 0, 0, 0);
-    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("lru").?.node.region);
-    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("mru").?.node.region);
+    try testing.expectEqual(Cache.Region.probation, c.entryOf("lru").?.node.region);
+    try testing.expectEqual(Cache.Region.probation, c.entryOf("mru").?.node.region);
 
     c.release(c.pin("lru", 0, 0).?); // the borrow under test
 
     // The pin refreshed "lru"'s tick, so re-write the neighbour to put the
     // ordering back: "lru" is the probation LRU again, hence the victim.
     c.put("mru", "M2", 0, 0, 0);
-    try testing.expect(c.map.getPtr("lru").?.node.tick < c.map.getPtr("mru").?.node.tick);
+    try testing.expect(c.entryOf("lru").?.node.tick < c.entryOf("mru").?.node.tick);
 
     // Borrow the sole window entry so the window heap is empty. That takes the
     // admission gate out of the eviction path entirely: with no candidate,
@@ -3131,8 +3206,8 @@ test "remove: drops exactly the named key, leaves siblings untouched, no-ops on 
     try testing.expectEqual(@as(usize, 3), c.bytes);
 
     try testing.expect(c.remove("a")); // present → true, removed
-    try testing.expect(!c.map.contains("a")); // physically gone
-    try testing.expect(c.map.contains("b")); // sibling untouched
+    try testing.expect(!c.map.containsAdapted("a", Cache.KeyAdapter{})); // physically gone
+    try testing.expect(c.map.containsAdapted("b", Cache.KeyAdapter{})); // sibling untouched
     try testing.expectEqual(@as(usize, 1), c.stats.entries);
     try testing.expectEqual(@as(usize, 2), c.bytes); // only "b"'s 2 bytes remain
     try testing.expect(c.get("a", 1, 0) == null); // truly gone, not just stale
@@ -3195,6 +3270,19 @@ test "dirty bit: set on put, cleared by markClean; markClean on an absent key is
     try testing.expect(!c.markClean("nope")); // absent → false
     c.put("k", "v2", 1, 0, 0); // an update re-dirties the entry
     try testing.expect(c.isDirty("k"));
+}
+
+test "markCleanIf acks only the value that was flushed" {
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.put("k", "v1", 0, 0, 0);
+    // The flusher persisted "v1", but "v2" landed before its ack.
+    c.put("k", "v2", 1, 0, 0);
+    try testing.expect(!c.markCleanIf("k", "v1"));
+    try testing.expect(c.isDirty("k")); // "v2" still owes a write
+    try testing.expect(c.markCleanIf("k", "v2"));
+    try testing.expect(!c.isDirty("k"));
+    try testing.expect(!c.markCleanIf("nope", "v2")); // absent → false
 }
 
 test "drainDirty visits exactly the dirty entries, skipping clean ones" {
@@ -3441,11 +3529,11 @@ test "expired-first eviction still finds the expired entry among many live ones"
     // Over the entry cap at t = 100: the expired one must go, not an LRU one.
     c.put("newcomer", "y", 100, 0, 0);
 
-    try testing.expect(!c.map.contains("doomed"));
-    try testing.expect(c.map.contains("newcomer"));
+    try testing.expect(!c.map.containsAdapted("doomed", Cache.KeyAdapter{}));
+    try testing.expect(c.map.containsAdapted("newcomer", Cache.KeyAdapter{}));
     var zero_key: [8]u8 = undefined;
     std.mem.writeInt(u64, &zero_key, 0, .little);
-    try testing.expect(c.map.contains(&zero_key)); // the true LRU survived
+    try testing.expect(c.map.containsAdapted(&zero_key, Cache.KeyAdapter{})); // the true LRU survived
     try testing.expectEqual(@as(u64, 0), c.stats.rejections);
     try testing.expectEqual(@as(u64, 0), c.stats.admissions);
     try testing.expectEqual(@as(u64, 1), c.stats.evictions);
@@ -3679,7 +3767,7 @@ test "eviction terminates even when the chosen victim key is not in the map (pro
     c.put("a", "1", 0, 0, 0);
     c.put("b", "2", 0, 0, 0); // a -> probation, b stays in the window
     c.options.max_entries = 1;
-    const node = c.map.getPtr("b").?.node;
+    const node = c.entryOf("b").?.node;
     const real_key = node.key;
     node.key = &.{};
     c.maintain(0);
@@ -3807,9 +3895,9 @@ test "idle ttl: eviction takes an idle-expired entry before the frequency contes
     // idle-aware expiry the contest is b (candidate) against a (victim): a tie,
     // so b is rejected and a survives.
     c.put("c", "3", 120, 0, 0);
-    try testing.expect(!c.map.contains("a"));
-    try testing.expect(c.map.contains("b"));
-    try testing.expect(c.map.contains("c"));
+    try testing.expect(!c.map.containsAdapted("a", Cache.KeyAdapter{}));
+    try testing.expect(c.map.containsAdapted("b", Cache.KeyAdapter{}));
+    try testing.expect(c.map.containsAdapted("c", Cache.KeyAdapter{}));
     try testing.expectEqual(@as(u64, 0), c.stats.rejections);
     try testing.expectEqual(@as(u64, 0), c.stats.admissions);
     try testing.expectEqual(@as(u64, 1), c.stats.evictions);
@@ -3826,8 +3914,8 @@ test "idle ttl: a hit moves the entry's place in the expiry heap, so the NEXT on
     // At 150 only b is idle-expired. RED if the hit left a's old deadline in
     // the heap: a would be the root and would be evicted instead.
     c.put("c", "3", 150, 0, 0);
-    try testing.expect(c.map.contains("a"));
-    try testing.expect(!c.map.contains("b"));
+    try testing.expect(c.map.containsAdapted("a", Cache.KeyAdapter{}));
+    try testing.expect(!c.map.containsAdapted("b", Cache.KeyAdapter{}));
 }
 
 test "idle ttl: pin counts as an access and release re-files the entry under the new deadline" {
@@ -3838,7 +3926,7 @@ test "idle ttl: pin counts as an access and release re-files the entry under the
     try expectExpiryAgrees(&c); // borrowed: not in the heap
     c.release(b);
     try expectExpiryAgrees(&c); // back, at 90 + 100
-    try testing.expectEqual(@as(i64, 190), c.map.getPtr("k").?.node.deadline);
+    try testing.expectEqual(@as(i64, 190), c.entryOf("k").?.node.deadline);
     try testing.expect(c.get("k", 180, 0) != null); // 90 since the pin; 180 since the write
     // And a borrow held across the deadline does not make the entry immortal:
     const b2 = c.pin("k", 200, 0).?;
@@ -3853,7 +3941,7 @@ test "idle ttl: off by default, and a non-positive value is off exactly like def
         c.put("k", "v", 0, 0, 0);
         try testing.expect(c.get("k", 1 << 50, 0) != null);
         try testing.expectEqual(@as(u64, 0), c.stats.expired);
-        try testing.expectEqual(Cache.Node.not_queued, c.map.getPtr("k").?.node.exp_idx);
+        try testing.expectEqual(Cache.Node.not_queued, c.entryOf("k").?.node.exp_idx);
     }
 }
 
