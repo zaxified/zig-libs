@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — **ADDITIVE + one BREAKING edge (error set):** multi-architecture filters and tree dispatch, closing the survey's two testable seccomp gaps (Scope core → parity).
+  - `seccomp.buildRulesWith(gpa, rules, default_action, Options)`; `buildRules` is `buildRulesWith(.., .{})` and its output is byte-identical to before.
+  - `Options.i386: ?[]const CompatRule` (x86-64 only; `CompatRule.sysno` is a `std.os.linux.syscalls.X86` member): the i386 compat ABI gets its own rule block behind an `arch` dispatch (libseccomp's `seccomp_arch_add`); x32 stays killed.
+  - `Options.dispatch = .tree` (opt-in; `.linear` default): binary search over the syscall numbers, same decisions as linear; long jumps via the new `bpf.ja`.
+  - BREAKING (error set only): `BuildError` gains `UnsupportedArch`; an exhaustive `switch` over it needs the new arm.
+  - Tests: model comparison extended to both features (random arch, colliding i386 numbers, lists past 255 instructions), kernel `int $0x80` allow/deny and alias-leak tests (x86-64).
+
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-sandbox`, kept instrument kind 3): card Performance 0.001–1.01× libseccomp (filter build; per-syscall cost within noise of 1.0), measured on a quiet host. Tooling only, no code change.
 
 - **2026-10-04** — **ADDITIVE + one BREAKING edge:** the survey's core gaps.

@@ -129,6 +129,14 @@ const rules = [_]S.Rule{
 const p3 = try S.buildRules(gpa, &rules, .kill_process);
 defer gpa.free(p3);
 
+// Several ABIs and a long list: `buildRulesWith`. On x86-64 `.i386` also allows
+// the 32-bit compat ABI (`int $0x80`); its rules name numbers of THAT table
+// (`std.os.linux.syscalls.X86`: nr 39 is `mkdir` there, `getpid` here).
+// `.dispatch = .tree` binary-searches the syscall number instead of scanning.
+const rules32 = [_]S.CompatRule{ .{ .sysno = .getpid }, .{ .sysno = .exit_group } };
+const p4 = try S.buildRulesWith(gpa, &rules, .kill_process, .{ .i386 = &rules32, .dispatch = .tree });
+defer gpa.free(p4);
+
 // Profiling a list before enforcing it: `.log` lets everything run and
 // audit-logs what the list would have refused.
 const probe = try S.build(gpa, &custom, .log);
@@ -203,7 +211,29 @@ whole register for `long`/pointer/`size_t` parameters. A deny-list
 allow-list — a syscall nobody listed is allowed. On x86-64 every `buildRules`
 program kills x32-numbered syscalls (`nr ≥ __X32_SYSCALL_BIT`, same
 `AUDIT_ARCH_X86_64`), which a deny-list would otherwise let through. Dispatch
-is a linear scan (no binary tree yet): fine for tens of rules.
+is a linear scan by default: fine for tens of rules.
+
+`seccomp.buildRulesWith(gpa, rules, default_action, opts)` is `buildRules`
+(which is `opts = .{}`, byte-identical output) plus two options:
+
+- **`opts.i386`** (x86-64 only, like libseccomp's `seccomp_arch_add`): a
+  `[]const CompatRule` for the 32-bit compat ABI. The arch guard then
+  dispatches — `AUDIT_ARCH_X86_64` to the native block, `AUDIT_ARCH_I386` to
+  the i386 block, every other arch (and x32 numbers) killed. `CompatRule.sysno`
+  is a member of `std.os.linux.syscalls.X86`, because the same number is a
+  different call per ABI; its conditions see the 32-bit registers zero-extended
+  (so `.u64` adds nothing there, and `-1` is `0xffff_ffff`). `default_action`
+  applies to both ABIs; an empty list adds the ABI with the default only.
+  `null` (default) keeps the ABI killed. Any other host: `error.UnsupportedArch`.
+  x32 rules are not available (x32 stays killed).
+- **`opts.dispatch = .tree`**: groups the rules by number and binary-searches
+  the numbers (~`2·log2(n)+2` instructions per syscall instead of 2 per
+  preceding rule). The decision is the same as `.linear`'s — rules of one
+  number keep their order, first match wins — only the layout differs, and the
+  program is a bit longer; use it for lists past ~50 numbers. Opt-in, not
+  automatic, so short lists stay the small program they were. Jumps beyond a
+  `u8` use `ja`; limits are `max_rules` per list and the kernel's 4096
+  instructions (`error.ProgramTooLong`).
 
 ### seccomp W^X preset
 
@@ -282,7 +312,12 @@ zig build test-sandbox -Doptimize=ReleaseFast
   random rule sets × 16 inputs aimed at 32-bit word boundaries. On the
   kernel: a `socket(AF_UNIX)` deny rule holds against a junk high word,
   `close(fd ≥ 1000)` is exact at 999/1000, x32 numbers are killed under a
-  deny-list, and `.log` lets calls run.
+  deny-list, and `.log` lets calls run. The same comparison covers the tree
+  layout and an i386 rule list (probe arch random, i386 numbers colliding with
+  native ones), 60 rounds of lists up to 200 rules per ABI, and a step count of
+  the tree. On the kernel (x86-64): an `int $0x80` `getpid` runs with an i386
+  allow rule and dies of SIGSYS without one (linear and tree), and a native
+  `getpid` allow does not leak to the aliasing i386 `mkdir` (39).
 - **rlimit** — a child caps `RLIMIT_NOFILE`, exhausts it (EMFILE at the cap),
   and confirms it cannot raise the hard limit back.
 - **privilege drop** — needs to *start* as root; drops to `nobody` and asserts
@@ -297,8 +332,8 @@ sudo zig build test-sandbox                     # adds the priv-drop tests
 
 ## Deferred (v2)
 
-- seccomp `USER_NOTIF` / `TRACE` actions, multi-architecture filters (compat
-  ABIs in one program), binary-tree dispatch for long rule lists.
+- seccomp `USER_NOTIF` / `TRACE` actions; x32 rules and secondary ABIs other
+  than i386-on-x86-64 (multi-arch filters and tree dispatch are done).
 - Landlock ABI 9+ (`FS_RESOLVE_UNIX`, UDP rights, `ADD_RULE_QUIET`,
   `RESTRICT_SELF_NO_NEW_PRIVS`) — not in the kernel this was built and tested
   against.

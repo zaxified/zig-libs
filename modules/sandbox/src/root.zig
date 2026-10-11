@@ -700,6 +700,7 @@ pub const bpf = struct {
     pub const jgt: u16 = 0x20; // A > k (unsigned)
     pub const jge: u16 = 0x30; // A >= k (unsigned)
     pub const k: u16 = 0x00; // constant operand
+    pub const ja: u16 = 0x00; // unconditional jump by `k` instructions (u32, unlike jt/jf)
     // ALU op
     pub const and_: u16 = 0x50; // A = A & k
 
@@ -824,6 +825,8 @@ pub const seccomp = struct {
         /// The compiled program would exceed the kernel's 4096 instructions
         /// (`BPF_MAXINSNS`), which `install` would refuse anyway.
         ProgramTooLong,
+        /// `Options.i386` on a host other than x86-64.
+        UnsupportedArch,
     };
 
     /// The largest errno the kernel will hand back through `SECCOMP_RET_ERRNO`
@@ -1281,7 +1284,7 @@ pub const seccomp = struct {
         };
     }
 
-    fn ruleLen(r: Rule) usize {
+    fn ruleLen(r: anytype) usize {
         var n: usize = 2; // ld nr; jeq nr
         for (r.when) |c| n += condLen(c);
         return n + 1; // ret action
@@ -1389,9 +1392,185 @@ pub const seccomp = struct {
         std.debug.assert(list.items.len == pass_at);
     }
 
+    /// How the rules of one architecture are dispatched on the syscall number.
+    pub const Dispatch = enum {
+        /// One `ld nr; jeq` block per rule, scanned in order — the layout
+        /// `buildRules` always had. A syscall pays for every rule before its
+        /// match; fine for tens of rules, and the smallest program.
+        linear,
+        /// Binary search over the distinct syscall numbers (like libseccomp's
+        /// optimize level 2): about `2·log2(n) + 2` instructions to reach a
+        /// syscall's rules, however many there are. Rules of one number keep
+        /// their order, so the decision is the same as `.linear`'s — only the
+        /// path to it differs. The program is a little longer (two
+        /// instructions per number); opt in for lists past ~50 numbers.
+        tree,
+    };
+
+    /// Extra architectures and the dispatch of `buildRulesWith`.
+    pub const Options = struct {
+        /// x86-64 only: also allow the 32-bit compat ABI (`int $0x80`,
+        /// `AUDIT_ARCH_I386`) — libseccomp's `seccomp_arch_add`. The rules
+        /// name numbers of THAT ABI (`std.os.linux.syscalls.X86`), because
+        /// the same number is another call there (nr 39: `mkdir`, x86-64
+        /// `getpid`). `null` (the default) kills the ABI like every foreign
+        /// one; an empty list adds the ABI with `default_action` for all of
+        /// it. `error.UnsupportedArch` on any other host.
+        i386: ?[]const CompatRule = null,
+        dispatch: Dispatch = .linear,
+    };
+
+    /// `AUDIT_ARCH_I386`: `EM_386` (3) | little-endian.
+    const audit_arch_i386: u32 = 3 | 0x4000_0000;
+
+    /// A `Rule` for the i386 compat ABI: the same shape, but `sysno` names a
+    /// number of the i386 table. Its `ArgCmp`s read the 32-bit registers
+    /// zero-extended to 64 bits, so a `.u64` compare sees a zero high word and
+    /// a value like `-1` is `0xffff_ffff`.
+    pub const CompatRule = struct {
+        sysno: linux.syscalls.X86,
+        when: []const ArgCmp = &.{},
+        action: Action = .allow,
+    };
+
+    fn nrOf(r: anytype) u32 {
+        return @intCast(@intFromEnum(r.sysno));
+    }
+
+    /// Per-rule checks shared by both architectures' lists.
+    fn checkRules(rules: anytype) BuildError!void {
+        if (rules.len > max_rules) return error.TooManyRules;
+        for (rules) |r| {
+            try validateAction(r.action);
+            if (r.when.len > max_rule_conditions) return error.InvalidRule;
+            for (r.when) |c| if (c.arg > 5) return error.InvalidRule;
+        }
+    }
+
+    /// The tree layout's view of a rule list: the rules grouped by number,
+    /// numbers ascending, rules of one number in their original order.
+    fn Plan(comptime R: type) type {
+        return struct {
+            const Self = @This();
+            rules: []const R,
+            order: []usize, // rule indices sorted by (number, index)
+            starts: []usize, // group g = order[starts[g]..starts[g + 1]]
+
+            fn init(gpa: Allocator, rules: []const R) Allocator.Error!Self {
+                const order = try gpa.alloc(usize, rules.len);
+                errdefer gpa.free(order);
+                for (order, 0..) |*o, i| o.* = i;
+                std.sort.pdq(usize, order, rules, lessByNr);
+                const starts = try gpa.alloc(usize, rules.len + 1);
+                var n_groups: usize = 0;
+                for (order, 0..) |ri, i| {
+                    if (i == 0 or nrOf(rules[order[i - 1]]) != nrOf(rules[ri])) {
+                        starts[n_groups] = i;
+                        n_groups += 1;
+                    }
+                }
+                starts[n_groups] = rules.len;
+                return .{ .rules = rules, .order = order, .starts = starts[0 .. n_groups + 1] };
+            }
+
+            fn deinit(p: Self, gpa: Allocator) void {
+                gpa.free(p.order);
+                // `starts` was allocated one longer than the groups need.
+                gpa.free(p.starts.ptr[0 .. p.rules.len + 1]);
+            }
+
+            fn lessByNr(rules: []const R, a: usize, b: usize) bool {
+                const na = nrOf(rules[a]);
+                const nb = nrOf(rules[b]);
+                return na < nb or (na == nb and a < b);
+            }
+
+            fn groups(p: Self) usize {
+                return p.starts.len - 1;
+            }
+
+            /// A group = per rule: conditions + `ret`, then one `ret default`.
+            fn groupLen(p: Self, g: usize) usize {
+                var n: usize = 1;
+                for (p.order[p.starts[g]..p.starts[g + 1]]) |ri| n += ruleLen(p.rules[ri]) - 2;
+                return n;
+            }
+
+            /// Leaf = `jeq nr; ja default; group`; node = `jge pivot; ja right`.
+            fn nodeLen(p: Self, lo: usize, hi: usize) usize {
+                if (hi - lo == 1) return 2 + p.groupLen(lo);
+                const mid = (lo + hi) / 2;
+                return 2 + p.nodeLen(lo, mid) + p.nodeLen(mid, hi);
+            }
+
+            fn emit(p: Self, list: *std.ArrayList(SockFilter), lo: usize, hi: usize, default_at: usize, default_word: u32) void {
+                const ja = bpf.jmp | bpf.ja;
+                if (hi - lo == 1) {
+                    const first = p.rules[p.order[p.starts[lo]]];
+                    // Match: skip the `ja`, run the group. Else: to the default.
+                    list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jeq | bpf.k, nrOf(first), 1, 0));
+                    list.appendAssumeCapacity(bpf.stmt(ja, @intCast(default_at - (list.items.len + 1))));
+                    for (p.order[p.starts[lo]..p.starts[lo + 1]]) |ri| {
+                        const r = p.rules[ri];
+                        const next_rule = list.items.len + ruleLen(r) - 2;
+                        for (r.when) |c| emitCond(list, c, next_rule);
+                        list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, actionWord(r.action)));
+                        std.debug.assert(list.items.len == next_rule);
+                    }
+                    list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, default_word));
+                    return;
+                }
+                const mid = (lo + hi) / 2;
+                const pivot = nrOf(p.rules[p.order[p.starts[mid]]]);
+                // nr >= pivot: take the `ja` to the right half; else skip it
+                // and fall into the left half laid out right behind.
+                list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jge | bpf.k, pivot, 0, 1));
+                list.appendAssumeCapacity(bpf.stmt(ja, @intCast(p.nodeLen(lo, mid))));
+                p.emit(list, lo, mid, default_at, default_word);
+                p.emit(list, mid, hi, default_at, default_word);
+            }
+        };
+    }
+
+    /// Instructions of one architecture's rule block (`plan` set iff tree).
+    fn blockLen(comptime R: type, rules: []const R, plan: ?Plan(R)) usize {
+        if (plan) |p| return if (p.groups() == 0) 1 else 2 + p.nodeLen(0, p.groups());
+        var n: usize = 1; // the default leaf
+        for (rules) |r| n += ruleLen(r);
+        return n;
+    }
+
+    fn emitBlock(comptime R: type, list: *std.ArrayList(SockFilter), rules: []const R, plan: ?Plan(R), default_action: Action) void {
+        const default_word = actionWord(default_action);
+        if (plan) |p| {
+            if (p.groups() != 0) {
+                const default_at = list.items.len + 1 + p.nodeLen(0, p.groups());
+                list.appendAssumeCapacity(bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
+                p.emit(list, 0, p.groups(), default_at, default_word);
+                std.debug.assert(list.items.len == default_at);
+            }
+        } else for (rules) |r| {
+            const start = list.items.len;
+            const next_rule = start + ruleLen(r);
+            // Conditions clobber the accumulator, so every rule reloads nr.
+            list.appendAssumeCapacity(bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
+            const to_next: u8 = @intCast(next_rule - (list.items.len + 1));
+            list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jeq | bpf.k, nrOf(r), 0, to_next));
+            for (r.when) |c| emitCond(list, c, next_rule);
+            list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, actionWord(r.action)));
+            std.debug.assert(list.items.len == next_rule);
+        }
+        list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, default_word));
+    }
+
+    /// `buildRulesWith` with the defaults: one architecture, linear dispatch.
+    pub fn buildRules(gpa: Allocator, rules: []const Rule, default_action: Action) BuildError![]SockFilter {
+        return buildRulesWith(gpa, rules, default_action, .{});
+    }
+
     /// Build a program from `rules`, evaluated IN ORDER: the first rule whose
     /// number and conditions all match decides the syscall (its `action`);
-    /// a syscall no rule matches gets `default_action`. Layout:
+    /// a syscall no rule matches gets `default_action`. Layout (one arch):
     ///
     ///   arch guard                     ; as in `build` — always KILL
     ///   [x86-64] nr ≥ X32 bit → KILL   ; see `x32_syscall_bit`
@@ -1410,20 +1589,34 @@ pub const seccomp = struct {
     ///    year is allowed. Prefer it only for profiling (`.log`) or as a
     ///    narrow patch over a program you cannot profile.
     ///
-    /// Several rules may name one syscall; order decides. The scan is linear
-    /// in the rules a syscall passes before its match — fine for the tens of
-    /// rules a service uses; no binary-tree dispatch (libseccomp's) yet.
-    /// Caller owns the returned slice.
-    pub fn buildRules(gpa: Allocator, rules: []const Rule, default_action: Action) BuildError![]SockFilter {
-        if (rules.len > max_rules) return error.TooManyRules;
+    /// Several rules may name one syscall; order decides. `opts.dispatch`
+    /// `.tree` replaces the linear scan by a binary search over the numbers;
+    /// `opts.i386` adds the compat ABI. With a second architecture the guard
+    /// dispatches on `arch`: `jeq native; ja <past the native block>`, the
+    /// native block (x32 guard included), the same pair for i386 and its block,
+    /// then one `ret KILL` for every other arch. `ja` carries a 32-bit
+    /// offset, so blocks of any size are reachable; `jt`/`jf` only ever span
+    /// one rule (≤ 39 instructions) or the next instruction. Each list holds
+    /// at most `max_rules` rules, the whole program `max_program_len`
+    /// instructions. Caller owns the returned slice.
+    pub fn buildRulesWith(gpa: Allocator, rules: []const Rule, default_action: Action, opts: Options) BuildError![]SockFilter {
         try validateAction(default_action);
-        var total: usize = 3 + x32_guard_len + 1;
-        for (rules) |r| {
-            try validateAction(r.action);
-            if (r.when.len > max_rule_conditions) return error.InvalidRule;
-            for (r.when) |c| if (c.arg > 5) return error.InvalidRule;
-            total += ruleLen(r);
+        try checkRules(rules);
+        if (opts.i386) |c| {
+            if (builtin.cpu.arch != .x86_64) return error.UnsupportedArch;
+            try checkRules(c);
         }
+
+        const tree = opts.dispatch == .tree;
+        const native_plan: ?Plan(Rule) = if (tree) try Plan(Rule).init(gpa, rules) else null;
+        defer if (native_plan) |p| p.deinit(gpa);
+        const compat_rules: []const CompatRule = opts.i386 orelse &.{};
+        const compat_plan: ?Plan(CompatRule) = if (tree and opts.i386 != null) try Plan(CompatRule).init(gpa, compat_rules) else null;
+        defer if (compat_plan) |p| p.deinit(gpa);
+
+        const native_len = x32_guard_len + blockLen(Rule, rules, native_plan);
+        const compat_len = if (opts.i386 != null) blockLen(CompatRule, compat_rules, compat_plan) else 0;
+        const total: usize = if (opts.i386 == null) 3 + native_len else 3 + native_len + 2 + compat_len + 1;
         if (total > max_program_len) return error.ProgramTooLong;
 
         var list: std.ArrayList(SockFilter) = .empty;
@@ -1432,26 +1625,25 @@ pub const seccomp = struct {
 
         list.appendAssumeCapacity(bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_arch));
         list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jeq | bpf.k, audit_arch, 1, 0));
-        list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, ret_kill_process));
+        if (opts.i386 == null) {
+            list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, ret_kill_process));
+        } else {
+            list.appendAssumeCapacity(bpf.stmt(bpf.jmp | bpf.ja, @intCast(native_len)));
+        }
         if (x32_guard_len != 0) {
             list.appendAssumeCapacity(bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
             list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jge | bpf.k, x32_syscall_bit, 0, 1));
             list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, ret_kill_process));
         }
-
-        for (rules) |r| {
-            const start = list.items.len;
-            const next_rule = start + ruleLen(r);
-            // Conditions clobber the accumulator, so every rule reloads nr.
-            list.appendAssumeCapacity(bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
-            const nr: u32 = @intCast(@intFromEnum(r.sysno));
-            const to_next: u8 = @intCast(next_rule - (list.items.len + 1));
-            list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jeq | bpf.k, nr, 0, to_next));
-            for (r.when) |c| emitCond(&list, c, next_rule);
-            list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, actionWord(r.action)));
-            std.debug.assert(list.items.len == next_rule);
+        emitBlock(Rule, &list, rules, native_plan, default_action);
+        if (opts.i386 != null) {
+            // The accumulator still holds `arch`: `ja` does not touch it.
+            list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jeq | bpf.k, audit_arch_i386, 1, 0));
+            list.appendAssumeCapacity(bpf.stmt(bpf.jmp | bpf.ja, @intCast(compat_len)));
+            emitBlock(CompatRule, &list, compat_rules, compat_plan, default_action);
+            list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, ret_kill_process));
         }
-        list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, actionWord(default_action)));
+        std.debug.assert(list.items.len == total);
         return list.toOwnedSlice(gpa);
     }
 };
@@ -1685,15 +1877,23 @@ test "seccomp.buildWx structure: arch guard with its jump targets, one 9-instruc
 // ── seccomp.buildRules: codegen checked against a reference evaluator ─────────
 
 /// A classic-BPF interpreter for exactly the instructions this module emits
-/// (ld w abs, alu and k, jeq/jgt/jge k, ret k). Anything else fails the test.
+/// (ld w abs, alu and k, ja, jeq/jgt/jge k, ret k). Anything else fails the test.
 fn runBpf(prog: []const SockFilter, d: *const linux.SECCOMP.data) !u32 {
+    var steps: usize = 0;
+    return runBpfCounting(prog, d, &steps);
+}
+
+/// `runBpf`, also counting the instructions executed (the tree's point).
+fn runBpfCounting(prog: []const SockFilter, d: *const linux.SECCOMP.data, steps: *usize) !u32 {
     const bytes = std.mem.asBytes(d);
     var a: u32 = 0;
     var pc: usize = 0;
     while (pc < prog.len) {
         const ins = prog[pc];
         pc += 1;
+        steps.* += 1;
         switch (ins.code) {
+            bpf.jmp | bpf.ja => pc += ins.k,
             bpf.ld | bpf.w | bpf.abs => {
                 if (ins.k + 4 > bytes.len) return error.LoadOutOfRange;
                 a = std.mem.readInt(u32, bytes[ins.k..][0..4], builtin.cpu.arch.endian());
@@ -1715,11 +1915,20 @@ fn runBpf(prog: []const SockFilter, d: *const linux.SECCOMP.data) !u32 {
     return error.FellOffTheEnd;
 }
 
-/// What `buildRules` promises, written directly — no BPF.
-fn evalRules(rules: []const seccomp.Rule, default_action: seccomp.Action, d: *const linux.SECCOMP.data) u32 {
-    if (d.arch != audit_arch) return seccomp.ret_kill_process;
+/// What `buildRules` / `buildRulesWith` promise, written directly — no BPF.
+/// `compat` is `Options.i386`: the rules of the second architecture, if added.
+fn evalRules(rules: []const seccomp.Rule, compat: ?[]const seccomp.CompatRule, default_action: seccomp.Action, d: *const linux.SECCOMP.data) u32 {
     const nr: u32 = @bitCast(d.nr);
-    if (builtin.cpu.arch == .x86_64 and nr >= seccomp.x32_syscall_bit) return seccomp.ret_kill_process;
+    if (d.arch == audit_arch) {
+        if (builtin.cpu.arch == .x86_64 and nr >= seccomp.x32_syscall_bit) return seccomp.ret_kill_process;
+        return evalList(seccomp.Rule, rules, default_action, d);
+    }
+    if (compat) |c| if (d.arch == seccomp.audit_arch_i386) return evalList(seccomp.CompatRule, c, default_action, d);
+    return seccomp.ret_kill_process;
+}
+
+fn evalList(comptime R: type, rules: []const R, default_action: seccomp.Action, d: *const linux.SECCOMP.data) u32 {
+    const nr: u32 = @bitCast(d.nr);
     const args = [6]u64{ d.arg0, d.arg1, d.arg2, d.arg3, d.arg4, d.arg5 };
     rules: for (rules) |r| {
         if (nr != @as(u32, @intCast(@intFromEnum(r.sysno)))) continue;
@@ -1772,69 +1981,224 @@ fn nearValue(r: std.Random, v: u64) u64 {
     };
 }
 
-test "seccomp.buildRules: compiled program agrees with the reference evaluator on 40 000 random rule sets" {
-    const sysnos = [_]linux.SYS{ .read, .write, .close, .socket, .ioctl, .mmap };
+const X86 = linux.syscalls.X86;
+
+/// Fill `out` with random rules over `sysnos`, their conditions carved out
+/// of `conds`.
+fn genRules(comptime R: type, r: std.Random, out: []R, conds: []seccomp.ArgCmp, sysnos: []const @FieldType(R, "sysno")) void {
     const ops = std.enums.values(seccomp.Op);
+    const actions = [_]seccomp.Action{ .allow, .log, .kill_process, .trap, .{ .errno = 1 }, .{ .errno = 4095 } };
+    var used: usize = 0;
+    for (out) |*rule| {
+        const n_conds = r.uintLessThan(usize, seccomp.max_rule_conditions + 1);
+        for (conds[used..][0..n_conds]) |*c| c.* = .{
+            .arg = @intCast(r.uintLessThan(u8, 6)),
+            .op = ops[r.uintLessThan(usize, ops.len)],
+            .width = if (r.boolean()) .u32 else .u64,
+            .value = pickValue(r),
+            .mask = pickValue(r),
+        };
+        rule.* = .{
+            .sysno = sysnos[r.uintLessThan(usize, sysnos.len)],
+            .when = conds[used..][0..n_conds],
+            .action = actions[r.uintLessThan(usize, actions.len)],
+        };
+        used += n_conds;
+    }
+}
+
+/// One random seccomp_data aimed at `target`'s conditions; `arch` and the
+/// number come from the caller (the number decides which rules can match).
+fn probeData(r: std.Random, arch: u32, nr: u32, target_when: []const seccomp.ArgCmp) linux.SECCOMP.data {
+    var args: [6]u64 = undefined;
+    for (&args) |*a| a.* = pickValue(r);
+    for (target_when) |c| args[c.arg] = nearValue(r, c.value);
+    return .{
+        .nr = @bitCast(nr),
+        .arch = arch,
+        .instruction_pointer = 0,
+        .arg0 = args[0],
+        .arg1 = args[1],
+        .arg2 = args[2],
+        .arg3 = args[3],
+        .arg4 = args[4],
+        .arg5 = args[5],
+    };
+}
+
+test "seccomp.buildRules: compiled program agrees with the reference evaluator on 40 000 random rule sets" {
+    const sysnos = [_]linux.SYS{ .read, .write, .close, .socket, .ioctl, .mmap, .getpid };
+    // The i386 table: numbers that collide with the native ones (3 is `read`
+    // there and `close` here, 39 `mkdir` there and `getpid` here), so a probe
+    // sent to the wrong block would match the wrong rule.
+    const sysnos32 = [_]X86{ .read, .write, .close, .ioctl, .getpid, .mkdir, .socketcall };
     const actions = [_]seccomp.Action{ .allow, .log, .kill_process, .trap, .{ .errno = 1 }, .{ .errno = 4095 } };
     var prng = std.Random.DefaultPrng.init(0x5ecc_0b9f);
     const r = prng.random();
     var conds: [8 * seccomp.max_rule_conditions]seccomp.ArgCmp = undefined;
+    var conds32: [8 * seccomp.max_rule_conditions]seccomp.ArgCmp = undefined;
     var rules: [8]seccomp.Rule = undefined;
+    var rules32: [8]seccomp.CompatRule = undefined;
     var round: usize = 0;
     while (round < 40_000) : (round += 1) {
         const n_rules = r.uintLessThan(usize, rules.len) + 1;
-        var used: usize = 0;
-        for (rules[0..n_rules]) |*rule| {
-            const n_conds = r.uintLessThan(usize, seccomp.max_rule_conditions + 1);
-            for (conds[used..][0..n_conds]) |*c| c.* = .{
-                .arg = @intCast(r.uintLessThan(u8, 6)),
-                .op = ops[r.uintLessThan(usize, ops.len)],
-                .width = if (r.boolean()) .u32 else .u64,
-                .value = pickValue(r),
-                .mask = pickValue(r),
-            };
-            rule.* = .{
-                .sysno = sysnos[r.uintLessThan(usize, sysnos.len)],
-                .when = conds[used..][0..n_conds],
-                .action = actions[r.uintLessThan(usize, actions.len)],
-            };
-            used += n_conds;
-        }
+        genRules(seccomp.Rule, r, rules[0..n_rules], &conds, &sysnos);
+        // Half the rounds add the i386 ABI (x86-64 only), 0..8 rules, which may
+        // be none; both dispatch shapes are checked against the same model.
+        const with_compat = builtin.cpu.arch == .x86_64 and r.boolean();
+        const n_rules32 = if (with_compat) r.uintLessThan(usize, rules32.len + 1) else 0;
+        genRules(seccomp.CompatRule, r, rules32[0..n_rules32], &conds32, &sysnos32);
+        const compat: ?[]const seccomp.CompatRule = if (with_compat) rules32[0..n_rules32] else null;
         const default_action = actions[r.uintLessThan(usize, actions.len)];
-        const prog = try seccomp.buildRules(testing.allocator, rules[0..n_rules], default_action);
+        const prog = try seccomp.buildRulesWith(testing.allocator, rules[0..n_rules], default_action, .{
+            .i386 = compat,
+            .dispatch = if (r.boolean()) .tree else .linear,
+        });
         defer testing.allocator.free(prog);
 
         var probe: usize = 0;
         while (probe < 16) : (probe += 1) {
             // Aim the input at one rule's conditions so matches are common.
-            const target = rules[r.uintLessThan(usize, n_rules)];
-            var args: [6]u64 = undefined;
-            for (&args) |*a| a.* = pickValue(r);
-            for (target.when) |c| args[c.arg] = nearValue(r, c.value);
-            const nr: u32 = switch (r.uintLessThan(u8, 8)) {
-                0 => @intCast(@intFromEnum(sysnos[r.uintLessThan(usize, sysnos.len)])),
-                1 => seccomp.x32_syscall_bit | @as(u32, @intCast(@intFromEnum(target.sysno))),
-                else => @intCast(@intFromEnum(target.sysno)),
+            const arch: u32 = switch (r.uintLessThan(u8, 16)) {
+                0 => audit_arch ^ 1,
+                1 => if (r.boolean()) seccomp.audit_arch_i386 ^ 0x4000_0000 else 0,
+                2, 3, 4, 5 => seccomp.audit_arch_i386, // answered only when the ABI was added
+                else => audit_arch,
             };
-            const d: linux.SECCOMP.data = .{
-                .nr = @bitCast(nr),
-                .arch = if (r.uintLessThan(u8, 16) == 0) audit_arch ^ 1 else audit_arch,
-                .instruction_pointer = 0,
-                .arg0 = args[0],
-                .arg1 = args[1],
-                .arg2 = args[2],
-                .arg3 = args[3],
-                .arg4 = args[4],
-                .arg5 = args[5],
+            const d = if (arch == seccomp.audit_arch_i386 and n_rules32 != 0) blk: {
+                const target = rules32[r.uintLessThan(usize, n_rules32)];
+                const nr: u32 = if (r.uintLessThan(u8, 4) == 0) @intCast(@intFromEnum(sysnos32[r.uintLessThan(usize, sysnos32.len)])) else @intCast(@intFromEnum(target.sysno));
+                break :blk probeData(r, arch, nr, target.when);
+            } else blk: {
+                const target = rules[r.uintLessThan(usize, n_rules)];
+                const nr: u32 = switch (r.uintLessThan(u8, 8)) {
+                    0 => @intCast(@intFromEnum(sysnos[r.uintLessThan(usize, sysnos.len)])),
+                    1 => seccomp.x32_syscall_bit | @as(u32, @intCast(@intFromEnum(target.sysno))),
+                    else => @intCast(@intFromEnum(target.sysno)),
+                };
+                break :blk probeData(r, arch, nr, target.when);
             };
             const got = try runBpf(prog, &d);
-            const want = evalRules(rules[0..n_rules], default_action, &d);
+            const want = evalRules(rules[0..n_rules], compat, default_action, &d);
             if (got != want) {
                 std.debug.print("round {d} probe {d}: bpf {x} want {x}\n", .{ round, probe, got, want });
                 return error.TestUnexpectedResult;
             }
         }
     }
+}
+
+test "seccomp.buildRulesWith: long lists (jumps past 255), duplicate numbers, tree and linear agree with the model" {
+    // Every native number the table has, in shuffled order, some twice with
+    // different conditions: a list far past what a u8 jump can span, so the
+    // arch dispatch (`ja`) and the tree's right-half jumps are all long.
+    const all = std.enums.values(linux.SYS);
+    const all32 = std.enums.values(X86);
+    var prng = std.Random.DefaultPrng.init(0x7ee_5ecc);
+    const r = prng.random();
+    const gpa = testing.allocator;
+    var rules: [seccomp.max_rules]seccomp.Rule = undefined;
+    var rules32: [seccomp.max_rules]seccomp.CompatRule = undefined;
+    var conds: [seccomp.max_rules]seccomp.ArgCmp = undefined;
+    var round: usize = 0;
+    while (round < 60) : (round += 1) {
+        const n = 1 + r.uintLessThan(usize, 200);
+        for (rules[0..n], 0..) |*rule, i| {
+            conds[i] = .{ .arg = @intCast(r.uintLessThan(u8, 6)), .op = .ge, .width = if (r.boolean()) .u32 else .u64, .value = pickValue(r) };
+            rule.* = .{
+                .sysno = all[r.uintLessThan(usize, all.len)],
+                .when = if (r.boolean()) conds[i..][0..1] else &.{},
+                .action = if (r.boolean()) .allow else .{ .errno = @intCast(1 + i) },
+            };
+        }
+        const n32 = if (builtin.cpu.arch == .x86_64) r.uintLessThan(usize, 200) else 0;
+        for (rules32[0..n32]) |*rule| rule.* = .{
+            .sysno = all32[r.uintLessThan(usize, all32.len)],
+            .action = if (r.boolean()) .allow else .{ .errno = 7 },
+        };
+        const compat: ?[]const seccomp.CompatRule = if (builtin.cpu.arch == .x86_64) rules32[0..n32] else null;
+        const lin = try seccomp.buildRulesWith(gpa, rules[0..n], .kill_process, .{ .i386 = compat });
+        defer gpa.free(lin);
+        const tree = try seccomp.buildRulesWith(gpa, rules[0..n], .kill_process, .{ .i386 = compat, .dispatch = .tree });
+        defer gpa.free(tree);
+        var probe: usize = 0;
+        while (probe < 200) : (probe += 1) {
+            const on32 = compat != null and n32 != 0 and r.boolean();
+            const target = rules[r.uintLessThan(usize, n)];
+            const nr: u32 = if (on32)
+                @intCast(@intFromEnum(rules32[r.uintLessThan(usize, n32)].sysno))
+            else if (r.uintLessThan(u8, 8) == 0)
+                r.int(u32) & 0x3ff // mostly numbers no rule names
+            else
+                @intCast(@intFromEnum(target.sysno));
+            const d = probeData(r, if (on32) seccomp.audit_arch_i386 else audit_arch, nr, target.when);
+            const want = evalRules(rules[0..n], compat, .kill_process, &d);
+            try testing.expectEqual(want, try runBpf(lin, &d));
+            try testing.expectEqual(want, try runBpf(tree, &d));
+        }
+    }
+}
+
+test "seccomp.buildRulesWith: the tree reaches a rule in O(log n) instructions; defaults stay byte-identical" {
+    const gpa = testing.allocator;
+    // 256 distinct numbers (the table's first 256 members), one open rule each.
+    const all = std.enums.values(linux.SYS);
+    var rules: [256]seccomp.Rule = undefined;
+    for (&rules, 0..) |*rule, i| rule.* = .{ .sysno = all[i] };
+    const lin = try seccomp.buildRules(gpa, &rules, .kill_process);
+    defer gpa.free(lin);
+    const tree = try seccomp.buildRulesWith(gpa, &rules, .kill_process, .{ .dispatch = .tree });
+    defer gpa.free(tree);
+    // buildRules IS the all-defaults buildRulesWith.
+    const same = try seccomp.buildRulesWith(gpa, &rules, .kill_process, .{});
+    defer gpa.free(same);
+    try testing.expectEqualSlices(SockFilter, lin, same);
+    var worst_lin: usize = 0;
+    var worst_tree: usize = 0;
+    for (rules) |rule| {
+        var d = std.mem.zeroes(linux.SECCOMP.data);
+        d.nr = @intCast(@intFromEnum(rule.sysno));
+        d.arch = audit_arch;
+        var s_lin: usize = 0;
+        var s_tree: usize = 0;
+        try testing.expectEqual(seccomp.ret_allow, try runBpfCounting(lin, &d, &s_lin));
+        try testing.expectEqual(seccomp.ret_allow, try runBpfCounting(tree, &d, &s_tree));
+        worst_lin = @max(worst_lin, s_lin);
+        worst_tree = @max(worst_tree, s_tree);
+    }
+    try testing.expect(worst_lin > 500); // 2 per rule scanned
+    try testing.expect(worst_tree <= 2 * 8 + 12); // log2(256) levels of jge+ja, guards, leaf
+    try testing.expect(tree.len <= seccomp.max_program_len);
+}
+
+test "seccomp.buildRulesWith: structure of the two-architecture guard" {
+    const rules = [_]seccomp.Rule{.{ .sysno = .getpid }};
+    const rules32 = [_]seccomp.CompatRule{ .{ .sysno = .getpid }, .{ .sysno = .write, .action = .kill_thread } };
+    const gpa = testing.allocator;
+    if (builtin.cpu.arch != .x86_64) {
+        try testing.expectError(error.UnsupportedArch, seccomp.buildRulesWith(gpa, &rules, .kill_process, .{ .i386 = &rules32 }));
+        return;
+    }
+    const prog = try seccomp.buildRulesWith(gpa, &rules, .kill_process, .{ .i386 = &rules32 });
+    defer gpa.free(prog);
+    const ld = bpf.ld | bpf.w | bpf.abs;
+    const jeq = bpf.jmp | bpf.jeq | bpf.k;
+    const ja = bpf.jmp | bpf.ja;
+    // native block = x32 guard (3) + 1 rule (3) + default (1) = 7
+    try testing.expectEqual(bpf.stmt(ld, seccomp.off_arch), prog[0]);
+    try testing.expectEqual(bpf.jump(jeq, audit_arch, 1, 0), prog[1]);
+    try testing.expectEqual(bpf.stmt(ja, 7), prog[2]);
+    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[5]); // x32 guard
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@intFromEnum(linux.SYS.getpid)), 0, 1), prog[7]);
+    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[9]); // native default
+    // i386 block = 2 rules (3 + 3) + default (1) = 7; no x32 guard in it.
+    try testing.expectEqual(bpf.jump(jeq, seccomp.audit_arch_i386, 1, 0), prog[10]);
+    try testing.expectEqual(bpf.stmt(ja, 7), prog[11]);
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@intFromEnum(X86.getpid)), 0, 1), prog[13]);
+    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_thread), prog[17]);
+    // ...and one KILL for every other arch, at the end.
+    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[prog.len - 1]);
+    try testing.expectEqual(@as(usize, 20), prog.len);
 }
 
 test "seccomp.buildRules: structure — arch guard, x32 guard, one self-contained block per rule, default leaf" {
@@ -2138,10 +2502,25 @@ const X86Alias = if (builtin.cpu.arch == .x86_64) struct {
     fn childWx() void {
         childAliasEscape(g_alias_wx_prog);
     }
+    fn childMulti() void {
+        childAliasEscape(g_alias_multi_prog);
+    }
+
+    /// Install `g_compat_prog`, then issue i386 `getpid` (nr 20) through
+    /// `int $0x80`: exit 0 when it ran and returned a pid, 3 when it came back
+    /// without one; a filter that refuses it never returns (SIGSYS).
+    fn childCompatGetpid() void {
+        noNewPrivs() catch linux.exit(101);
+        seccomp.install(g_compat_prog) catch linux.exit(102);
+        const rc = int80(i386_nr_getpid, 0, 0);
+        linux.exit(if (@as(isize, @bitCast(rc)) > 0) 0 else 3);
+    }
 } else struct {};
 
 var g_alias_prog: []const SockFilter = &.{};
 var g_alias_wx_prog: []const SockFilter = &.{};
+var g_alias_multi_prog: []const SockFilter = &.{};
+var g_compat_prog: []const SockFilter = &.{};
 
 fn expectAliasKilled(res: ChildResult) !void {
     // Clean up first so a RED run does not leave the directory behind.
@@ -2180,6 +2559,57 @@ test "seccomp arch guard (buildWx): the same i386 alias is KILLED through the W^
             g_alias_wx_prog = try seccomp.buildWx(testing.allocator, &allowed, .kill_process, .{ .errno = @intFromEnum(E.PERM) });
             defer testing.allocator.free(g_alias_wx_prog);
             try expectAliasKilled(try runInChild(X86Alias.childWx));
+        },
+        else => return error.SkipZigTest,
+    }
+}
+
+test "seccomp.buildRulesWith (x86-64): an i386 allow rule lets an int $0x80 syscall through; without it the ABI is killed" {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            try requireSeccompFilter();
+            const probe = try runInChild(X86Alias.childProbeEmulation);
+            if (!probe.exitedWith(0)) return error.SkipZigTest; // no CONFIG_IA32_EMULATION here
+            const gpa = testing.allocator;
+            const native = [_]seccomp.Rule{ .{ .sysno = .exit }, .{ .sysno = .exit_group } };
+            const with_getpid = [_]seccomp.CompatRule{ .{ .sysno = .getpid }, .{ .sysno = .exit_group } };
+            const without_getpid = [_]seccomp.CompatRule{.{ .sysno = .exit_group }};
+            for ([_]seccomp.Dispatch{ .linear, .tree }) |dispatch| {
+                // i386 getpid allowed: the call runs (a pid comes back) ...
+                const p1 = try seccomp.buildRulesWith(gpa, &native, .kill_process, .{ .i386 = &with_getpid, .dispatch = dispatch });
+                defer gpa.free(p1);
+                g_compat_prog = p1;
+                try testing.expect((try runInChild(X86Alias.childCompatGetpid)).exitedWith(0));
+                // ... a compat list without it: the default action (SIGSYS) ...
+                const p2 = try seccomp.buildRulesWith(gpa, &native, .kill_process, .{ .i386 = &without_getpid, .dispatch = dispatch });
+                defer gpa.free(p2);
+                g_compat_prog = p2;
+                try testing.expect((try runInChild(X86Alias.childCompatGetpid)).killedBy(.SYS));
+                // ... and no compat ABI at all: killed by the arch guard.
+                const p3 = try seccomp.buildRulesWith(gpa, &native, .kill_process, .{ .dispatch = dispatch });
+                defer gpa.free(p3);
+                g_compat_prog = p3;
+                try testing.expect((try runInChild(X86Alias.childCompatGetpid)).killedBy(.SYS));
+            }
+        },
+        else => return error.SkipZigTest,
+    }
+}
+
+test "seccomp.buildRulesWith (x86-64): with both ABIs added, the native getpid allow does not leak to the i386 number it aliases" {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            try requireSeccompFilter();
+            const probe = try runInChild(X86Alias.childProbeEmulation);
+            if (!probe.exitedWith(0)) return error.SkipZigTest;
+            // x86-64 getpid == 39 == i386 mkdir. The i386 list allows only ITS
+            // getpid (20), so `int $0x80` nr 39 must die, not create a directory.
+            g_alias_multi_prog = try seccomp.buildRulesWith(testing.allocator, &.{ .{ .sysno = .getpid }, .{ .sysno = .exit_group } }, .kill_process, .{
+                .i386 = &.{ .{ .sysno = .getpid }, .{ .sysno = .exit_group } },
+                .dispatch = .tree,
+            });
+            defer testing.allocator.free(g_alias_multi_prog);
+            try expectAliasKilled(try runInChild(X86Alias.childMulti));
         },
         else => return error.SkipZigTest,
     }
