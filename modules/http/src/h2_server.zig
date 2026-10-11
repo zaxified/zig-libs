@@ -1919,9 +1919,10 @@ const Session = struct {
         if (gunzip_scratch) |sc| {
             const src = body.reader();
             const container: std.compress.flate.Container = if (s.opts.verify_inbound_trailer) .raw else .gzip;
-            sc.decompress = .init(src, container, &sc.window);
+            const padded = sc.start(src, container);
             gunzip_body = .init(&sc.decompress.reader, s.opts.max_decompressed_request_bytes, &sc.out);
-            if (s.opts.verify_inbound_trailer) gunzip_body.trailer_check = .{ .source = src };
+            gunzip_body.scratch = sc;
+            if (s.opts.verify_inbound_trailer) gunzip_body.trailer_check = .{ .source = padded };
             req.decoded = &gunzip_body.reader;
         }
 
@@ -3722,6 +3723,39 @@ test "h2c serve: verify_inbound_trailer refuses a gzip body whose CRC-32 does no
     try testing.expectEqualStrings(gz_plain, peer.resp(sid_sound).body.items);
     // Any undecodable body: a generic 500, as on h1.
     try testing.expectEqual(@as(u16, 500), peer.resp(sid_corrupt).status);
+}
+
+test "h2c serve: a gzip request body cut short is a 500, not a std flate panic, as on h1" {
+    // std 0.16 `flate.Decompress` reaches `unreachable` when its input ends
+    // inside a block (see `gzip.PaddedSource`). Every proper prefix, both
+    // container modes, plus the whole member as the negative control.
+    const gpa = testing.allocator;
+    const compressed = try gzipOf(gz_plain);
+    defer gpa.free(compressed);
+    for ([_]bool{ false, true }) |verify| {
+        for (1..compressed.len + 1) |n| {
+            var peer: TestPeer = .init(gpa, .{});
+            defer peer.deinit();
+            try peer.conn.sendPreface(&peer.wire);
+            const sid = try peer.conn.startStream(&peer.wire, &postEncoded("/echo", "gzip"), false);
+            try peer.conn.sendData(&peer.wire, sid, compressed[0..n], true);
+            var out_buf: [16384]u8 = undefined;
+            try runOffline(&peer, .{
+                .handler = testHandler,
+                .max_decompressed_request_bytes = 1 << 20,
+                .verify_inbound_trailer = verify,
+            }, &out_buf);
+            if (n == compressed.len) {
+                try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+                try testing.expectEqualStrings(gz_plain, peer.resp(sid).body.items);
+            } else {
+                testing.expectEqual(@as(u16, 500), peer.resp(sid).status) catch |err| {
+                    std.debug.print("verify={} prefix {d}/{d}\n", .{ verify, n, compressed.len });
+                    return err;
+                };
+            }
+        }
+    }
 }
 
 test "h2c serve: a streamed gzip request body is decoded as it lands" {

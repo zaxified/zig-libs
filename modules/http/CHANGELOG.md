@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — fix: a truncated gzip request body (inbound decoding, opt-in via `max_decompressed_request_bytes`) no longer aborts the process. std 0.16's `flate.Decompress` hits `unreachable` when its input ends inside a block — any proper prefix did it. The decoder now reads the body and then zeros (`gzip.PaddedSource`), and `GunzipBody` refuses (500, as for any undecodable body) a read whose decoding used a byte past the body, withholding its bytes; a body missing only (part of) its trailer is refused too, also with `verify_inbound_trailer` off. h1 and h2. `DecodeScratch` grows by 1 KiB (`DecodeScratch.start`).
 - **2026-10-11** — perf: `gzip.initCompress` resets the 64 KiB deflate hash head with a volatile 32-byte vector loop instead of `@splat`, which Zig 0.16 lowered to its byte-wise compiler_rt memset (~16 % of a websocket permessage-deflate message's compression). State is byte-identical to std's `Compress.init` (existing field-by-field test).
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-http`, kept instrument kind 3): card Performance 0.13–0.32× Go net/http, measured on a quiet host. Tooling only, no code change.
 

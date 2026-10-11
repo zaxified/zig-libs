@@ -225,6 +225,83 @@ pub const DecodeScratch = struct {
     decompress: flate.Decompress = undefined,
     window: [flate.max_window_len]u8 = undefined,
     out: [decode_out_len]u8 = undefined,
+    /// What `decompress` reads: the raw body, then zeros (see `PaddedSource`).
+    padded: PaddedSource = undefined,
+    in: [decode_in_len]u8 = undefined,
+
+    /// Point the decoder at `src` (the raw request body) through
+    /// `padded`, and return `padded`'s reader -- the one the gzip header and
+    /// trailer must come off too when the caller parses them itself, so that
+    /// `paddingConsumed` sees every byte taken.
+    pub fn start(self: *DecodeScratch, src: *std.Io.Reader, container: flate.Container) *std.Io.Reader {
+        self.padded = .{
+            .source = src,
+            .reader = .{ .vtable = &PaddedSource.vtable, .buffer = &self.in, .seek = 0, .end = 0 },
+        };
+        self.decompress = .init(&self.padded.reader, container, &self.window);
+        return &self.padded.reader;
+    }
+
+    /// True once decoding has used a byte past the end of the real body:
+    /// the stream was cut short and what it decoded from there on is made
+    /// up. A byte whose bits the decoder has started on counts as used.
+    /// Exact, because `flate.Decompress` only peeks ahead and tosses what
+    /// it consumed -- its lookahead stays in `padded`'s buffer.
+    pub fn paddingConsumed(self: *const DecodeScratch) bool {
+        const p = &self.padded;
+        const used = p.delivered - (p.reader.end - p.reader.seek) +
+            @intFromBool(self.decompress.consumed_bits != 0);
+        return used > p.real;
+    }
+};
+
+/// Input buffer of `PaddedSource`; `flate.Decompress` asserts ≥ 10 bytes.
+pub const decode_in_len = 1024;
+
+/// The raw request body, then zeros for ever. std 0.16's `flate.Decompress`
+/// reaches `unreachable` (`tossBitsShort` adds `consumed_bits` where it must
+/// subtract) when its input ends inside a block, so ANY proper prefix of a
+/// deflate stream aborted the process -- one truncated gzip request body was
+/// enough. The decoder therefore never sees an end of input; whether it ate
+/// into the zeros is `DecodeScratch.paddingConsumed`, and `GunzipBody` refuses
+/// the body as soon as it did. (The same std defect is worked around in
+/// zipstream and saml; websocket feeds whole messages, see its deflate.zig.)
+pub const PaddedSource = struct {
+    source: *std.Io.Reader,
+    reader: std.Io.Reader,
+    /// Bytes handed to `reader`'s consumers so far, padding included.
+    delivered: u64 = 0,
+    /// How many of them came from `source`.
+    real: u64 = 0,
+    source_done: bool = false,
+
+    const vtable: std.Io.Reader.VTable = .{ .stream = stream };
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *PaddedSource = @alignCast(@fieldParentPtr("reader", r));
+        if (!self.source_done) {
+            // One read from the source, not a fill: a body still arriving
+            // must not hold back what the decoder could already use.
+            const n = self.source.stream(w, limit) catch |err| switch (err) {
+                error.EndOfStream => blk: {
+                    self.source_done = true;
+                    break :blk 0;
+                },
+                error.ReadFailed, error.WriteFailed => |e| return e,
+            };
+            if (n != 0) {
+                self.real += n;
+                self.delivered += n;
+                return n;
+            }
+            if (!self.source_done) return 0;
+        }
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        @memset(dest, 0);
+        self.delivered += dest.len;
+        w.advance(dest.len);
+        return dest.len;
+    }
 };
 
 /// A request's `Content-Encoding` classified for the inbound-decode path.

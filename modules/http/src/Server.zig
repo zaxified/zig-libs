@@ -1978,9 +1978,10 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         // and checks the CRC-32/ISIZE trailer in `GunzipBody.streamFn`,
         // since std's `flate.Decompress` reads both but checks neither.
         const container: flate.Container = if (opts.verify_inbound_trailer) .raw else .gzip;
-        sc.decompress = .init(src, container, &sc.window);
+        const padded = sc.start(src, container);
         gunzip_body = .init(&sc.decompress.reader, opts.max_decompressed_request_bytes, &sc.out);
-        if (opts.verify_inbound_trailer) gunzip_body.trailer_check = .{ .source = src };
+        gunzip_body.scratch = sc;
+        if (opts.verify_inbound_trailer) gunzip_body.trailer_check = .{ .source = padded };
         req.decoded = &gunzip_body.reader;
     }
     // Compression is considered only when configured AND the working
@@ -2387,6 +2388,11 @@ pub const GunzipBody = struct {
     /// CRC-32/ISIZE trailer once `inner` reaches end of stream. Null keeps
     /// today's behavior: std reads the trailer but never checks it.
     trailer_check: ?TrailerCheck = null,
+    /// The scratch `inner` decodes in, when it was set up by
+    /// `DecodeScratch.start`: every read is then refused once the decoder
+    /// has used a byte past the end of the body (a truncated stream -- see
+    /// `gzip.PaddedSource`), and the bytes of that read are withheld.
+    scratch: ?*const GunzipScratch = null,
     reader: Reader,
 
     /// Running trailer-verification state (see `trailer_check`).
@@ -2430,6 +2436,7 @@ pub const GunzipBody = struct {
                     error.BadHeader => return error.ReadFailed,
                 };
                 tc.header_done = true;
+                try c.refuseTruncated();
             }
         }
         if (c.remaining == 0) {
@@ -2437,52 +2444,55 @@ pub const GunzipBody = struct {
             // one byte — a clean end passes, anything more is a zip bomb.
             while (true) {
                 const n = c.inner.discard(.limited(1)) catch |err| switch (err) {
-                    error.EndOfStream => {
-                        if (c.trailer_check) |*tc| {
-                            gzip.checkTrailer(tc.source, tc.crc, tc.size) catch
-                                return error.ReadFailed;
-                        }
-                        return error.EndOfStream;
-                    },
+                    error.EndOfStream => return c.end(),
                     error.ReadFailed => return error.ReadFailed,
                 };
+                try c.refuseTruncated();
                 if (n != 0) {
                     c.exceeded = true;
                     return error.ReadFailed;
                 }
             }
         }
-        if (c.trailer_check) |*tc| {
-            // Read the plain bytes into a scratch buffer of our own — never
-            // straight from `inner` to `w`, the way the non-verifying path
-            // below does — so the CRC-32/size running totals see every byte
-            // exactly once, in order, the same contract `Member.take` keeps
-            // on the encoder side above.
-            var buf: [512]u8 = undefined;
-            const want = @min(buf.len, limit.minInt64(c.remaining));
-            if (want == 0) return 0;
-            const n = c.inner.readSliceShort(buf[0..want]) catch |err| switch (err) {
-                error.ReadFailed => return error.ReadFailed,
-            };
-            if (n == 0) {
-                // `inner`'s raw deflate stream ended exactly here: verify
-                // the trailer that must follow it on `tc.source`.
-                gzip.checkTrailer(tc.source, tc.crc, tc.size) catch
-                    return error.ReadFailed;
-                return error.EndOfStream;
-            }
-            tc.crc = crc32.extend(tc.crc, buf[0..n]);
-            tc.size +%= @as(u32, @truncate(n));
-            try w.writeAll(buf[0..n]);
-            c.remaining -= n;
-            return n;
-        }
-        const n = c.inner.stream(w, limit.min(.limited64(c.remaining))) catch |err| switch (err) {
-            error.EndOfStream => return error.EndOfStream,
-            error.ReadFailed, error.WriteFailed => |e| return e,
+        // Decode into `w`'s free space without committing it: the bytes are
+        // handed over only once the read is known to be good (no padding
+        // used, see `scratch`). With `trailer_check` the CRC-32/size running
+        // totals also see every byte exactly once, in order, the same
+        // contract `Member.take` keeps on the encoder side above.
+        const dest = limit.min(.limited64(c.remaining)).slice(try w.writableSliceGreedy(1));
+        if (dest.len == 0) return 0;
+        var fw: Writer = .fixed(dest);
+        const n = c.inner.stream(&fw, .limited(dest.len)) catch |err| switch (err) {
+            // `inner`'s stream ended exactly here (with `trailer_check`, its
+            // raw deflate stream: the trailer must follow on `tc.source`).
+            error.EndOfStream => return c.end(),
+            // `fw` holds `dest.len` bytes, the limit; a decoder writing past
+            // it would be a std bug -- refuse the body, never crash on it.
+            error.ReadFailed, error.WriteFailed => return error.ReadFailed,
         };
+        try c.refuseTruncated();
+        if (c.trailer_check) |*tc| {
+            tc.crc = crc32.extend(tc.crc, dest[0..n]);
+            tc.size +%= @as(u32, @truncate(n));
+        }
+        w.advance(n);
         c.remaining -= n;
         return n;
+    }
+
+    /// The decoded stream ended: check the trailer when asked to, then that
+    /// neither the stream nor its trailer ran past the end of the body.
+    fn end(c: *GunzipBody) Reader.StreamError!usize {
+        if (c.trailer_check) |*tc| {
+            gzip.checkTrailer(tc.source, tc.crc, tc.size) catch
+                return error.ReadFailed;
+        }
+        try c.refuseTruncated();
+        return error.EndOfStream;
+    }
+
+    fn refuseTruncated(c: *const GunzipBody) error{ReadFailed}!void {
+        if (c.scratch) |sc| if (sc.paddingConsumed()) return error.ReadFailed;
     }
 };
 
@@ -6232,6 +6242,56 @@ test "serveStream: gzip request body over the decompressed cap → 413 (zip-bomb
     const got = runStreamWith(.{ .max_decompressed_request_bytes = 16 }, null, wire, &out_buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 Content Too Large\r\n"));
     try testing.expect(std.mem.indexOf(u8, got, "Connection: close\r\n") != null);
+}
+
+test "serveStream: a gzip request body cut short is refused, not a std flate panic" {
+    // std 0.16 `flate.Decompress` reaches `unreachable` (`tossBitsShort`)
+    // when its input ends inside a block -- here the end of a
+    // Content-Length body. Every proper prefix, both container modes, is
+    // refused -- a body missing only (part of) its trailer too, also with
+    // `verify_inbound_trailer` off, where std reads the trailer unchecked.
+    // 400 bytes: under /echo's 512-byte buffer, over the response buffer, so
+    // the whole-member control below is answered chunked.
+    var plain: [400]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = "gzipped-body!"[i % 13] ^ @as(u8, @truncate(i *% 2654435761 >> 13 & 1));
+    const compressed = try gzipAlloc(&plain);
+    defer testing.allocator.free(compressed);
+    var out_buf: [4096]u8 = undefined;
+    for ([_]bool{ false, true }) |verify| {
+        for (1..compressed.len) |n| {
+            const wire = try gzipRequest("gzip", compressed[0..n]);
+            defer testing.allocator.free(wire);
+            const got = runStreamWith(.{
+                .max_decompressed_request_bytes = 1 << 20,
+                .verify_inbound_trailer = verify,
+            }, null, wire, &out_buf);
+            if (!std.mem.startsWith(u8, got, "HTTP/1.1 500 ")) {
+                std.debug.print("verify={} prefix {d}/{d}: {s}\n", .{ verify, n, compressed.len, got[0..@min(got.len, 40)] });
+                return error.TestUnexpectedResult;
+            }
+        }
+        // Negative control: the whole member is still served.
+        const wire = try gzipRequest("gzip", compressed);
+        defer testing.allocator.free(wire);
+        const got = runStreamWith(.{
+            .max_decompressed_request_bytes = 1 << 20,
+            .verify_inbound_trailer = verify,
+        }, null, wire, &out_buf);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+        var body: [plain.len]u8 = undefined;
+        var have: usize = 0;
+        var rest = got[(std.mem.indexOf(u8, got, "\r\n\r\n") orelse return error.TestUnexpectedResult) + 4 ..];
+        while (true) {
+            const eol = std.mem.indexOf(u8, rest, "\r\n") orelse return error.TestUnexpectedResult;
+            const size = try std.fmt.parseInt(usize, rest[0..eol], 16);
+            if (size == 0) break;
+            if (have + size > body.len) return error.TestUnexpectedResult;
+            @memcpy(body[have..][0..size], rest[eol + 2 ..][0..size]);
+            have += size;
+            rest = rest[eol + 2 + size + 2 ..];
+        }
+        try testing.expectEqualSlices(u8, &plain, body[0..have]);
+    }
 }
 
 test "serveStream: identity request body unchanged while gzip decoding is enabled" {
