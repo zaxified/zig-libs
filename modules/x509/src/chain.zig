@@ -1434,8 +1434,18 @@ fn constraintTypeSupported(tag: Certificate.GeneralNameTag) bool {
     };
 }
 
+/// RFC 5280 §4.2.1.10: a name satisfies a dNSName base when it is the base
+/// with zero or more labels added on the left. Two base shapes the old code
+/// matched against NOTHING, which as an excluded subtree let names through:
+/// the empty base, which every name extends (so it excludes, or permits, all
+/// of them), and a leading-dot base (`.example.com`), which Go and
+/// rustls-webpki read as "subdomains only" — `x.example.com`, not
+/// `example.com` itself.
 fn dnsNameMatches(name: []const u8, base: []const u8) bool {
-    if (base.len == 0 or name.len == 0) return false;
+    if (name.len == 0) return false;
+    if (base.len == 0) return true;
+    if (base[0] == '.')
+        return name.len > base.len and std.ascii.eqlIgnoreCase(name[name.len - base.len ..], base);
     if (std.ascii.eqlIgnoreCase(name, base)) return true;
     if (name.len <= base.len) return false;
     const suffix = name[name.len - base.len ..];

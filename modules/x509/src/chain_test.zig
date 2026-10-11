@@ -246,6 +246,29 @@ test "checkNameConstraints: dNSName label-suffix match, default-deny once a perm
     try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&permitted, &excluded, "dn", &other));
 }
 
+test "checkNameConstraints: a leading-dot dNSName base means subdomains only; an empty base covers every name" {
+    // Both used to match nothing, so as EXCLUDED subtrees they excluded
+    // nothing (2026-10-11, found by the S2 survey).
+    const none = [_][]const u8{};
+
+    const dot_tree = dnsSubtree(".bad.example.org");
+    const dot = [_][]const u8{&dot_tree};
+    const sub = generalNamesWithDns("x.bad.example.org");
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&none, &dot, "dn", &sub));
+    const apex = generalNamesWithDns("bad.example.org");
+    try chain_mod.checkNameConstraints(&none, &dot, "dn", &apex);
+    const unrelated = generalNamesWithDns("xbad.example.org");
+    try chain_mod.checkNameConstraints(&none, &dot, "dn", &unrelated);
+    // Permitted the same way: the subdomain passes, the apex does not.
+    try chain_mod.checkNameConstraints(&dot, &none, "dn", &sub);
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&dot, &none, "dn", &apex));
+
+    const empty_tree = dnsSubtree("");
+    const empty = [_][]const u8{&empty_tree};
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&none, &empty, "dn", &unrelated));
+    try chain_mod.checkNameConstraints(&empty, &none, "dn", &unrelated);
+}
+
 test "checkNameConstraints: excluded wins even when a name would also be permitted" {
     const permitted_tree = dnsSubtree("example.org");
     const excluded_tree = dnsSubtree("bad.example.org");
