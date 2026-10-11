@@ -134,6 +134,7 @@ const FaultStorage = struct {
         .delete = vDelete,
         .syncDir = vSyncDir,
         .tryLockExclusive = vTryLockExclusive,
+        .tryLockShared = vTryLockShared,
     };
 
     fn cast(ctx: *anyopaque) *FaultStorage {
@@ -215,6 +216,12 @@ const FaultStorage = struct {
         const self = cast(ctx);
         if (self.fires()) return self.error_kind;
         return self.inner.tryLockExclusive(h);
+    }
+
+    fn vTryLockShared(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        const self = cast(ctx);
+        if (self.fires()) return self.error_kind;
+        return self.inner.tryLockShared(h);
     }
 };
 

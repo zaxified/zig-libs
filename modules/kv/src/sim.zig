@@ -201,6 +201,10 @@ pub const SimStorage = struct {
         /// `foreign_holder`), null when unlocked. Mirrors `flock`: the lock
         /// belongs to an open file description, not to "the process".
         lock_holder: ?Storage.Handle = null,
+        /// Handles holding this file's SHARED advisory lock (`flock`'s
+        /// `LOCK_SH`): any number at once, never together with `lock_holder`.
+        /// All ours -- a foreign process is modeled as an exclusive holder.
+        shared_holders: std.ArrayListUnmanaged(Storage.Handle) = .empty,
     };
 
     /// splitmix64 step (public-domain, S. Vigna) — the harness's only PRNG.
@@ -223,6 +227,7 @@ pub const SimStorage = struct {
             f.content.deinit(self.gpa);
             self.clearUnsynced(f);
             f.unsynced_writes.deinit(self.gpa);
+            f.shared_holders.deinit(self.gpa);
             self.gpa.destroy(f);
         }
         self.all_files.deinit(self.gpa);
@@ -352,6 +357,7 @@ pub const SimStorage = struct {
             if (f.lock_holder) |owner| {
                 if (owner != foreign_holder) f.lock_holder = null;
             }
+            f.shared_holders.clearRetainingCapacity();
         }
         switch (self.crash_mode) {
             // The dying OS flushed the directory too.
@@ -492,6 +498,7 @@ pub const SimStorage = struct {
         .delete = vDelete,
         .syncDir = vSyncDir,
         .tryLockExclusive = vTryLockExclusive,
+        .tryLockShared = vTryLockShared,
         .allocate = vAllocate,
         // The simulator makes no difference between `fdatasync` and `fsync`:
         // for the bytes they promise the same, and the size — the metadata
@@ -777,7 +784,29 @@ pub const SimStorage = struct {
         if (self.lock_unsupported) return error.LockUnsupported;
         const f = self.fileOf(h);
         if (f.lock_holder) |owner| return owner == h;
+        // Shared holders exclude it -- unless the only one is `h` itself,
+        // whose lock `flock` then converts.
+        for (f.shared_holders.items) |o| if (o != h) return false;
+        f.shared_holders.clearRetainingCapacity();
         f.lock_holder = h;
+        return true;
+    }
+
+    /// `flock(fd, LOCK_SH | LOCK_NB)`: shared with every other shared holder,
+    /// refused while another handle (or a foreign process) holds the file
+    /// exclusively. `h`'s own exclusive lock is converted, as `flock` does.
+    fn vTryLockShared(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        const self = cast(ctx);
+        if (self.crashed) return error.Crashed;
+        if (self.inject()) return error.Crashed;
+        if (self.lock_unsupported) return error.LockUnsupported;
+        const f = self.fileOf(h);
+        if (f.lock_holder) |owner| {
+            if (owner != h) return false;
+            f.lock_holder = null;
+        }
+        for (f.shared_holders.items) |o| if (o == h) return true;
+        f.shared_holders.append(self.gpa, h) catch return error.OutOfMemory;
         return true;
     }
 
@@ -789,6 +818,10 @@ pub const SimStorage = struct {
         // forgets to close its lock handle is a `Db` that wedges the store.
         if (self.handles.items[h]) |f| {
             if (f.lock_holder == h) f.lock_holder = null;
+            for (f.shared_holders.items, 0..) |o, i| if (o == h) {
+                _ = f.shared_holders.swapRemove(i);
+                break;
+            };
         }
         self.handles.items[h] = null;
     }
@@ -1259,6 +1292,43 @@ test "sim: a crash releases OUR lock, but not a foreign holder's" {
         sim.releaseForeignLock("f");
         try testing.expect(try st.tryLockExclusive(b));
     }
+}
+
+test "sim: shared locks coexist and exclude an exclusive holder both ways" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const st = sim.storage();
+    const a = try st.open("f", .open_or_create);
+    const b = try st.open("f", .open_or_create);
+    const c = try st.open("f", .open_or_create);
+    try testing.expect(try st.tryLockShared(a));
+    try testing.expect(try st.tryLockShared(b)); // readers share
+    try testing.expect(try st.tryLockShared(a)); // re-lock is a no-op
+    try testing.expect(!try st.tryLockExclusive(c)); // a writer is refused
+    st.close(a);
+    try testing.expect(!try st.tryLockExclusive(c)); // b still reads
+    st.close(b);
+    try testing.expect(try st.tryLockExclusive(c)); // the last reader left
+    const d = try st.open("f", .open_or_create);
+    try testing.expect(!try st.tryLockShared(d)); // a reader is refused too
+    // The writer's own lock converts to shared (flock does), and back.
+    try testing.expect(try st.tryLockShared(c));
+    try testing.expect(try st.tryLockShared(d));
+    try testing.expect(!try st.tryLockExclusive(c)); // d shares: no upgrade
+    st.close(d);
+    try testing.expect(try st.tryLockExclusive(c));
+    st.close(c);
+    // A foreign process's exclusive lock refuses a reader; a crash drops ours.
+    try sim.holdForeignLock("g");
+    const e = try st.open("g", .open_or_create);
+    try testing.expect(!try st.tryLockShared(e));
+    sim.releaseForeignLock("g");
+    try testing.expect(try st.tryLockShared(e));
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, st.sync(e));
+    sim.reboot();
+    const f = try st.open("g", .open_or_create);
+    try testing.expect(try st.tryLockExclusive(f));
 }
 
 test "sim: a filesystem without advisory locks reports it instead of pretending" {

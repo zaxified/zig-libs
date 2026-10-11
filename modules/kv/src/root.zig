@@ -359,6 +359,12 @@ pub const Storage = struct {
         /// Optional data-only sync (`Storage.syncData`). `null` means the
         /// backend has none, and `syncData` falls back to `sync`.
         syncData: ?*const fn (ctx: *anyopaque, h: Handle) Error!void = null,
+        /// Optional SHARED advisory lock (`Storage.tryLockShared`). `null`
+        /// (the default) means this backend cannot take one, and
+        /// `tryLockShared` reports `error.LockUnsupported`, the same answer a
+        /// filesystem without `flock` gives. Defaulted for the same reason as
+        /// `preadRef`; a decorator forwards it to its inner backend.
+        tryLockShared: ?*const fn (ctx: *anyopaque, h: Handle) Error!bool = null,
         /// Optional directory listing (`Storage.list`). `null` (the default)
         /// means this backend cannot list; a decorator whose inner backend
         /// cannot returns `null` from its own slot. Defaulted for the same
@@ -563,6 +569,20 @@ pub const Storage = struct {
     pub fn tryLockExclusive(s: Storage, h: Handle) Error!bool {
         return s.vtable.tryLockExclusive(s.ctx, h);
     }
+
+    /// Try to take a SHARED advisory lock on `h` (`flock(fd, LOCK_SH |
+    /// LOCK_NB)`): any number of descriptions may hold it together, and it
+    /// excludes an exclusive holder both ways -- `true` when held, `false`
+    /// when someone holds the file exclusively. Never blocks. Same lifetime
+    /// rules and same caveats as `tryLockExclusive` (released by `close` and
+    /// by the holder dying, advisory only, local filesystems only). The case
+    /// it is for: several READ-ONLY openers of one store at once, none of
+    /// them while a writer has it (bbolt's `Options.ReadOnly`).
+    /// `error.LockUnsupported` from a backend without the optional slot.
+    pub fn tryLockShared(s: Storage, h: Handle) Error!bool {
+        const f = s.vtable.tryLockShared orelse return error.LockUnsupported;
+        return f(s.ctx, h);
+    }
 };
 
 // ── FsStorage: the real-filesystem backend ───────────────────────────────────
@@ -636,6 +656,7 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
             .delete = vDelete,
             .syncDir = vSyncDir,
             .tryLockExclusive = vTryLockExclusive,
+            .tryLockShared = vTryLockShared,
             .allocate = if (is_linux) vAllocate else null,
             .syncData = if (is_linux) vSyncData else null,
             .list = vList,
@@ -818,6 +839,12 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
         fn vTryLockExclusive(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
             const self = cast(ctx);
             return self.fileOf(h).tryLock(self.io, .exclusive) catch |e| mapErr(e);
+        }
+
+        /// `flock(fd, LOCK_SH | LOCK_NB)`, the shared sibling of the above.
+        fn vTryLockShared(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+            const self = cast(ctx);
+            return self.fileOf(h).tryLock(self.io, .shared) catch |e| mapErr(e);
         }
     };
 }

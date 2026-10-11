@@ -469,6 +469,7 @@ pub const PageCache = struct {
         .delete = vDelete,
         .syncDir = vSyncDir,
         .tryLockExclusive = vTryLockExclusive,
+        .tryLockShared = vTryLockShared,
         // This is the one backend in the seam that *can* lend: it is the only
         // one that holds page bytes in its own memory. `FsStorage` and
         // `SimStorage` leave these null and `Storage.canLend()` answers false
@@ -723,6 +724,11 @@ pub const PageCache = struct {
     /// guarantee it cannot enforce.
     fn vTryLockExclusive(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
         return cast(ctx).inner.tryLockExclusive(h);
+    }
+
+    /// Forwarded verbatim, for the same reason.
+    fn vTryLockShared(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        return cast(ctx).inner.tryLockShared(h);
     }
 
     fn vPreadRef(ctx: *anyopaque, h: Storage.Handle, len: usize, off: u64) Storage.Error!?Storage.Ref {

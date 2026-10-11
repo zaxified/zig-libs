@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — `Storage.tryLockShared` (`flock` `LOCK_SH`, non-blocking) behind a new optional vtable slot `tryLockShared` (default null → `error.LockUnsupported`), so no implementer has to change. `FsStorage` and `SimStorage` implement it (the sim models shared holders per handle, conversion both ways as `flock` does, release on close and on crash); the VOPR `FaultStorage` forwards it. For kvtree's read-only openers. Test: `sim: shared locks coexist and exclude an exclusive holder both ways`.
+
 - **2026-10-11** — **FIX (test infrastructure):** `SimStorage.truncate` through an un-synced overwrite (with `allow_overwrite`) re-sliced the range's undo buffer to the cut, and the next `sync` or crash freed the shorter slice — an invalid free (`testing.allocator` panics; another allocator could be corrupted). The range is now clamped by its length only and undo restores `old[0..min(old.len, len)]`. Found by pagecache's model test; new test `sim: a truncate through an un-synced overwrite frees its undo buffer whole` (sync and crash paths), red with the old re-slice. Only `allow_overwrite` records undo buffers, so kv's own append-only tests never reached it; overwriting consumers' tests over `SimStorage` (pagecache) did.
 
 - **2026-10-01** — `kv.Lock` (the `Db`'s lock: `std.Io.Mutex` when the storage has an `Io`,
