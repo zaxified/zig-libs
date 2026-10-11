@@ -143,6 +143,8 @@ body answers **413**. `Query` + `Body`/`TypedBody` stack on one route — the
 | `custom` predicate | any (after type gate) | rule-supplied (default `custom`) |
 | `fields` | object (nested rules, paths `a.b`) | — |
 | `items` | array (per-element rule, paths `a[i]`) | — |
+| `cross` (see *Cross-field rules*) | object member vs its siblings | `field_mismatch` `field_equal` `greater_than_field` `greater_than_equal_field` `less_than_field` `less_than_equal_field`, `missing` |
+| `format` (see *Formats*) | string | `format` |
 
 Query/path coercion failures: `int_parsing` / `float_parsing` /
 `bool_parsing`. Malformed JSON body: `json_invalid` at path `""`. Root not an
@@ -150,6 +152,55 @@ object: `object_type` at `""`. Codes are pydantic v2 vocabulary;
 `array_type`/`object_type` are renamed from pydantic's `list_type`/
 `dict_type` to match JSON, and the JSON-Schema `enum` keyword is spelled
 `one_of` (`enum` is a Zig keyword).
+
+## Cross-field rules
+
+`Rule.cross` compares a field with its siblings in the same object (go-playground's `eqfield` ..
+`required_without`), on the tree path and the streaming one alike:
+
+```zig
+const rules = [_]validate.Rule{
+    .{ .field = "password", .kind = .string, .required = true },
+    .{ .field = "confirm", .kind = .string, .cross = &.{.{ .op = .eq_field, .other = "password" }} },
+    .{ .field = "start", .kind = .string, .format = .date_time },
+    .{ .field = "end", .kind = .string, .format = .date_time, .cross = &.{.{ .op = .gt_field, .other = "start" }} },
+    .{ .field = "card", .cross = &.{.{ .op = .required_if, .other = "mode", .value = "card" }} },
+};
+```
+
+| op | holds when | code |
+|---|---|---|
+| `eq_field` / `ne_field` | equal / different (numbers by value, date-times as instants, strings by text) | `field_mismatch` / `field_equal` |
+| `gt_field` `gte_field` `lt_field` `lte_field` | numbers by value, date-times chronologically, other strings by byte length | `greater_than_field` `greater_than_equal_field` `less_than_field` `less_than_equal_field` |
+| `required_if` / `required_unless` | the field is present when EVERY entry's sibling equals `value` / unless ANY does | `missing` |
+| `required_with` / `required_without` | present when ANY named sibling is present / absent | `missing` |
+
+"Present" is key presence (an explicit `null` is present). A comparison runs on a present, non-null field
+that passed its own type gate; a missing sibling fails `eq` and the orderings, and passes `ne`. For a typed
+body put them in `T.validate_rules` (the derived rules carry none). `validateQuery` / `validateParams` ignore
+them. `writeJsonSchema` exports `required_with` as `dependentRequired` and the other presence ops as `allOf`
+items; the comparison ops have no 2020-12 form.
+
+## Array roots
+
+```zig
+const item: validate.Rule = .{ .field = "", .kind = .object, .fields = &.{
+    .{ .field = "email", .kind = .string, .required = true, .format = .email },
+} };
+const root: validate.Rule = .{ .field = "", .kind = .array, .min_len = 1, .max_len = 100, .items = &item };
+var report = try validate.validateJsonRoot(gpa, body, &root, .{});   // errors at "[3].email"
+// streaming: validate.validateJsonRootStreaming(gpa, body, &root, .{})
+// typed: validate.parseIntoLeaky([]const Row, arena, body, .{}) -- also parseInto, TypedBody([]const Row)
+```
+
+## Formats
+
+`Rule.format` / `validateFormat(format, s)`. JSON Schema's: `email` `uri` `uri_reference` `uuid` `ipv4`
+`ipv6` `hostname` `date` `time` `date_time` `duration` `json_pointer`. go-playground's (each cites its
+baked-in in the `Format` doc): `uuid3` `uuid4` `uuid5` (lowercase, version + variant) `uuid7`
+`uuid_rfc4122` `http_url` `https_url` `base64` `base64_url` `base64_raw_url` `hex` `e164` `alpha`
+`alphanumeric` `numeric` `ascii` `lowercase` `uppercase` `jwt` `semver` `cidr` `mac`. All pure, no
+allocation, never a panic.
 
 ## Semantics (pydantic / JSON Schema alignment)
 
@@ -174,9 +225,11 @@ object: `object_type` at `""`. Codes are pydantic v2 vocabulary;
 - **Bounds compare as f64** — exact for integers up to 2^53.
 
 Known limits: `pattern` is literal/prefix/suffix/charset only — **regex is
-out of scope** (a future ADOPT dependency; TODO in the module doc). A
-top-level JSON array cannot be described by the field-rule schema (root must
-be an object, as with pydantic models). `min`/`max` cannot express 54+-bit
+out of scope** (a future ADOPT dependency; TODO in the module doc; use
+`Pattern.matcher`). A JSON array root needs `validateJsonRoot` or a
+`[]const T` body (the field-rule schema describes objects). The go-playground
+tag list (~170) is not matched one-for-one — see SPEC *Where we are behind*.
+`min`/`max` cannot express 54+-bit
 integer bounds exactly. Duplicate JSON object keys resolve per std.json
 (last wins) before validation sees the value.
 

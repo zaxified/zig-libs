@@ -12,6 +12,7 @@ no Python, Go or bun (`CONVENTIONS.md` §9).
 | `go_query/` | Go standard library only: `net/url.ParseQuery` + strconv/math.big verdicts for `query_oracle.py`. |
 | `urlsearchparams.js` | bun: WHATWG `URLSearchParams` decoding for `query_oracle.py`. |
 | `ajv_verdicts.js` | ajv 8 (`ajv/dist/2020`, `strict: false`) under bun: the second validator's verdicts on the same schema/document pairs. |
+| `bench.zig` + `go_bench/` | The comparative benchmark (`zig build bench-validate`, ReleaseFast, needs go): `parseIntoLeaky` against go-playground/validator v10.30.5 (`json.Unmarshal` + `validate.Struct`), bytes in, validated struct out; 4 body shapes, each with a decode-only twin so the verdict is the net cost of validation. |
 
 ```bash
 python3 modules/validate/tools/schema_oracle.py > modules/validate/src/schema_oracle_vectors.zig

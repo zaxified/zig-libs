@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — **Scope parity with go-playground/validator v10.30.5 (S3 -> S2)**, no breaking
+  change: every addition is a new decl or a field with a default that keeps the old behaviour.
+  - **Cross-field rules**: `Rule.cross: []const Cross` (`CrossOp`: `eq_field`, `ne_field`, `gt_field`,
+    `gte_field`, `lt_field`, `lte_field`, `required_if`, `required_unless`, `required_with`,
+    `required_without`), on the tree path, the streaming walker (it captures the members the rules name
+    while the object goes by and settles them at the object's end, next to `required`) and the typed
+    paths (`T.validate_rules`). Codes `field_mismatch`, `field_equal`, `greater_than_field`,
+    `greater_than_equal_field`, `less_than_field`, `less_than_equal_field`; the presence ops report
+    `missing`. `writeJsonSchema` exports `required_with` as `dependentRequired` and the other presence ops
+    as `allOf` items (`if`/`then`, `anyOf`); the comparison ops have no 2020-12 form and are not exported.
+  - **Array roots**: `validateJsonRoot` / `validateJsonRootStreaming` (a root `Rule`, errors at
+    `[i].field`), `rootRuleFor`, `writeJsonSchemaRoot`, and `parseInto` / `parseIntoLimited` /
+    `parseIntoLeaky` / `TypedBody` / `writeJsonSchemaFor` accept `[]const T` and `[N]T`. Limits apply.
+  - **22 formats** (`Format`): `uuid3` `uuid4` `uuid5` `uuid7` `uuid_rfc4122` `http_url` `https_url`
+    `base64` `base64_url` `base64_raw_url` `hex` `e164` `alpha` `alphanumeric` `numeric` `ascii`
+    `lowercase` `uppercase` `jwt` `semver` `cidr` `mac`, each citing the go-playground baked-in it follows.
+  - `tools/bench.zig` + `tools/go_bench` (`zig build bench-validate`): `parseIntoLeaky` against
+    `json.Unmarshal` + `validate.Struct`.
+  - tests: cross-field on both paths, array roots, a truth table per new format, a `cross` fuzz
+    harness (`VALIDATE_FUZZ`, tree == streaming, also as a root array).
 - **2026-10-09** — tests: deterministic fuzz driver `VALIDATE_FUZZ` over the existing harnesses (`json`, `streaming`, `format`).
 - **2026-10-06** — **Anchoring: query decoding + coercion oracle** (`tools/query_oracle.py`,
   `src/query_oracle_test.zig`): Python `parse_qsl`, Go `net/url` and WHATWG `URLSearchParams` judge the

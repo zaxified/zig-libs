@@ -15,9 +15,14 @@
 //!   (literal/prefix/suffix/charset — **regex is out of scope**, see TODO
 //!   below), `format` (the JSON Schema 2020-12 `format` vocabulary as
 //!   assertions: `email`, `uri`/`uri_reference`, `uuid`, `ipv4`/`ipv6`,
-//!   `hostname`, `date`/`time`/`date_time`, `duration`, `json_pointer` —
-//!   also standalone via `validateFormat`) and a `custom` predicate —
-//!   validated against a `std.json.Value`.
+//!   `hostname`, `date`/`time`/`date_time`, `duration`, `json_pointer`, and
+//!   since 2026-10-11 go-playground's `uuid3/4/5/7`, `http_url`, `base64*`,
+//!   `hex`, `e164`, `alpha`, `alphanumeric`, `numeric`, `ascii`,
+//!   `lowercase`/`uppercase`, `jwt`, `semver`, `cidr`, `mac` —
+//!   also standalone via `validateFormat`), cross-field rules (`Rule.cross`:
+//!   `eq_field` .. `required_without`) and a `custom` predicate —
+//!   validated against a `std.json.Value`. A JSON array can be the document
+//!   root (`validateJsonRoot`, `[]const T` bodies).
 //!   Every error is **aggregated** into `{ path, code, message }` — never
 //!   fail-fast; users hate fixing one field at a time (pydantic behavior).
 //! - **Body**: the idiomatic **typed** style `parseInto(T, gpa, body)` — a
@@ -165,6 +170,39 @@ pub const Matcher = struct {
 /// - `duration` — the RFC 3339 appendix-A ISO 8601 grammar (`P…` with
 ///   ordered Y/M/D and T-separated H/M/S components, or the week form).
 /// - `json_pointer` — RFC 6901: "" or `/`-prefixed, `~` only as `~0`/`~1`.
+///
+/// The formats below `json_pointer` are go-playground/validator's, not JSON
+/// Schema's (2026-10-11); each cites the baked-in it follows. All are pure
+/// byte-level checks (no allocation, never a panic).
+///
+/// - `uuid3` / `uuid4` / `uuid5` — go's regexes: **lowercase** hex only, the
+///   version nibble, and for 4 and 5 the variant nibble `8 9 a b`
+///   (baked_in.go 650-668, regexes.go `uUID{3,4,5}RegexString`).
+/// - `uuid7` — RFC 9562 version 7 + variant `10xx`, either case (go has no v7).
+/// - `uuid_rfc4122` — any case, version nibble 1-8, variant `10xx`, or the
+///   nil / max UUID (go's `uuid_rfc4122` checks shape only; this one is the RFC).
+/// - `http_url` / `https_url` — `http(s)://` + a non-empty host (reg-name,
+///   IPv4 or `[IPv6]`), optional `user@`, optional numeric port, then any
+///   RFC 3986 path/query/fragment; ASCII only (baked_in.go `isHttpURL` 1654,
+///   `isHttpsURL`; go also takes non-ASCII bytes, this does not).
+/// - `base64` / `base64_url` / `base64_raw_url` — go's regexes: groups of 4,
+///   `=` padding (none for `raw_url`), no canonical-bits check, and the empty
+///   string is NOT valid (baked_in.go 1525-1540).
+/// - `hex` — `^(0[xX])?[0-9a-fA-F]+$` (`isHexadecimal`, 1947).
+/// - `e164` — `^\+?[1-9]\d{7,14}$` (`isE164`, 1903).
+/// - `alpha` / `alphanumeric` / `numeric` — ASCII `[a-zA-Z]+`, `[a-zA-Z0-9]+`,
+///   `[-+]?[0-9]+(\.[0-9]+)?` (`isAlpha` 1977, `isAlphanum` 1972, `isNumeric` 1962).
+/// - `ascii` — every byte below 0x80, the empty string included (`isASCII`, 636).
+/// - `lowercase` / `uppercase` — non-empty, equal to its own case mapping
+///   (`isLowercase` 3063, `isUppercase` 3077). Case mapping here covers ASCII
+///   and Latin-1; a string that is not UTF-8 fails.
+/// - `jwt` — three dot-separated base64url runs, the signature possibly empty
+///   (`isJWT`, 3021; shape only, no signature or JSON check).
+/// - `semver` — semver.org 2.0.0 (regexes.go `semverRegexString`).
+/// - `cidr` — an IPv4/IPv6 address, `/`, a prefix length (`isCIDR`, 516;
+///   the prefix has no leading zeros, which Go's `net.ParseCIDR` would take).
+/// - `mac` — Go's `net.ParseMAC`: 6, 8 or 20 octets as `xx:xx:..`, `xx-xx-..`,
+///   `xxxx.xxxx.xxxx` or unseparated hex (`isMAC`, 495).
 pub const Format = enum {
     email,
     uri,
@@ -178,6 +216,28 @@ pub const Format = enum {
     date_time,
     duration,
     json_pointer,
+    uuid3,
+    uuid4,
+    uuid5,
+    uuid7,
+    uuid_rfc4122,
+    http_url,
+    https_url,
+    base64,
+    base64_url,
+    base64_raw_url,
+    hex,
+    e164,
+    alpha,
+    alphanumeric,
+    numeric,
+    ascii,
+    lowercase,
+    uppercase,
+    jwt,
+    semver,
+    cidr,
+    mac,
 };
 
 /// Caller-supplied predicate, run after all built-in checks pass the type
@@ -246,6 +306,73 @@ pub const Rule = struct {
     /// Rule applied to every element of an `.array` field (JSON Schema
     /// `items`); error paths become "field[i]".
     items: ?*const Rule = null,
+    /// Cross-field rules: this field against its siblings in the same
+    /// object (go-playground's `eqfield` .. `required_without`). Evaluated
+    /// when the object is complete, on the tree and the streaming path
+    /// alike. Empty = none, and a rule without them behaves exactly as it
+    /// did before this field existed. Ignored on `items` element rules
+    /// (an element has no sibling), by `validateQuery`/`validateParams`, and
+    /// in the schema `rulesFor` derives (put them in `T.validate_rules`).
+    cross: []const Cross = &.{},
+};
+
+/// What a `Cross` rule demands of the field it is attached to.
+///
+/// "Present" means the key is in the object -- an explicit `null` is
+/// present, as for `Rule.required` (go-playground tests the Go zero value
+/// instead, which JSON cannot tell from absence).
+///
+/// The comparison ops (`eq_field` .. `lte_field`) run only on a present
+/// field that passed its own type gate (a wrong-typed field has its one
+/// `<kind>_type` error and no comparison noise) and is not `null`. The
+/// presence ops (`required_*`) run only when the field is absent.
+pub const CrossOp = enum {
+    /// The field equals the sibling `other` (code `field_mismatch`). Numbers
+    /// compare by value, strings by text, booleans and `null` by identity;
+    /// different JSON types are unequal; arrays and objects are never equal;
+    /// a missing sibling fails. Two `date-time` strings (or two `date`
+    /// strings) compare as instants, as go-playground compares `time.Time`.
+    /// (baked_in.go `isEqField`, line 1372.)
+    eq_field,
+    /// The field differs from `other` (code `field_equal`); a missing
+    /// sibling or a type mismatch passes. (`isNeField`, line 1042.)
+    ne_field,
+    /// Numbers by value; two `date-time` (or two `date`) strings
+    /// chronologically; any other two strings by their LENGTH IN BYTES
+    /// (go-playground compares `len`, not text); other types and a missing
+    /// sibling fail.
+    /// Codes `greater_than_field`, `greater_than_equal_field`,
+    /// `less_than_field`, `less_than_equal_field`. (`isGtField` 2343,
+    /// `isGteField` 2299, `isLtField` 2571, `isLteField` 2527.)
+    gt_field,
+    gte_field,
+    lt_field,
+    lte_field,
+    /// The field is required (`missing`) when EVERY `required_if` entry's
+    /// sibling holds `value`. (`requiredIf`, line 2120.)
+    required_if,
+    /// Required unless ANY `required_unless` entry's sibling holds `value`.
+    /// (`requiredUnless`, line 2160.)
+    required_unless,
+    /// Required when ANY `required_with` entry's sibling is present.
+    /// (`requiredWith`, line 2219.)
+    required_with,
+    /// Required when ANY `required_without` entry's sibling is absent.
+    /// (`requiredWithout`, line 2264.)
+    required_without,
+};
+
+/// One cross-field entry of `Rule.cross`. Several entries on a rule combine
+/// per op as the CrossOp docs say; the comparison ops each hold on their own.
+pub const Cross = struct {
+    op: CrossOp,
+    /// The sibling's key in the same object.
+    other: []const u8,
+    /// `required_if` / `required_unless` only: the text the sibling is
+    /// compared to -- a string by text, a number by value (the text is
+    /// parsed), a boolean as `"true"` (anything else means false), `null`
+    /// as `"null"`. Arrays and objects never match. Ignored by other ops.
+    value: []const u8 = "",
 };
 
 // ── the error shape ─────────────────────────────────────────────────────────
@@ -681,11 +808,285 @@ fn checkValue(b: *Builder, prefix: []const u8, value: Value, rules: []const Rule
     }
     for (rules) |*rule| {
         const path = try b.fieldPath(prefix, rule.field);
-        if (value.object.get(rule.field)) |v| {
+        const got = value.object.get(rule.field);
+        if (got) |v| {
             try checkRule(b, path, v, rule);
         } else if (rule.required) {
             try b.append(path, "missing", "Field required");
         }
+        if (rule.cross.len != 0) {
+            const self: CrossSlot = if (got) |v| slotOf(v) else .absent;
+            try checkCross(b, path, rule, self, ObjectLookup{ .object = value.object });
+        }
+    }
+}
+
+// ── cross-field rules ───────────────────────────────────────────────────────
+//
+// `Rule.cross` compares a field with its siblings. One implementation
+// (`checkCross`) serves both paths: the tree hands it the object's members,
+// the streaming walker the scalars it captured while the object went by
+// (`Walker.caps`), and it runs once the object is complete.
+
+/// What a cross-field rule sees of one member.
+const CrossSlot = union(enum) {
+    absent,
+    /// A string, number, boolean or null.
+    scalar: Value,
+    /// An array or an object: present, but not comparable.
+    container,
+};
+
+fn slotOf(v: Value) CrossSlot {
+    return switch (v) {
+        .array, .object => .container,
+        else => .{ .scalar = v },
+    };
+}
+
+/// `CrossSlot` lookup over a parsed object (the tree path).
+const ObjectLookup = struct {
+    object: std.json.ObjectMap,
+
+    fn get(l: ObjectLookup, name: []const u8) CrossSlot {
+        return if (l.object.get(name)) |v| slotOf(v) else .absent;
+    }
+};
+
+/// Order of two numeric values, null when either is not a number. Two
+/// integers compare exactly, anything else as f64.
+fn numberOrder(x: Value, y: Value) ?std.math.Order {
+    if (x == .integer and y == .integer) return std.math.order(x.integer, y.integer);
+    const fx = switch (x) {
+        .integer, .float, .number_string => numValue(x) orelse return null,
+        else => return null,
+    };
+    const fy = switch (y) {
+        .integer, .float, .number_string => numValue(y) orelse return null,
+        else => return null,
+    };
+    return std.math.order(fx, fy);
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (Hinnant's civil
+/// algorithm); the caller has range-checked the date.
+fn daysFromCivil(y_in: u32, m: u32, d: u32) i64 {
+    const y: i64 = @as(i64, y_in) - @as(i64, if (m <= 2) 1 else 0);
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp: i64 = @as(i64, if (m > 2) m - 3 else m + 9);
+    const doy = @divFloor(153 * mp + 2, 5) + @as(i64, d) - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// An instant: whole seconds since the epoch plus the fraction digits as
+/// text (compared digit by digit, so no precision is lost).
+const Instant = struct { secs: i64, frac: []const u8 };
+
+/// `date-time` text (already `isDateTime`) as an instant; an offset-less
+/// time counts as UTC, like the format check's profile admits it.
+fn instantOf(s: []const u8) Instant {
+    const y = parseDigits(s[0..4]) orelse 0;
+    const mo = parseDigits(s[5..7]) orelse 1;
+    const d = parseDigits(s[8..10]) orelse 1;
+    const t = s[11..];
+    const h = parseDigits(t[0..2]) orelse 0;
+    const mi = parseDigits(t[3..5]) orelse 0;
+    const sec = parseDigits(t[6..8]) orelse 0;
+    var i: usize = 8;
+    var frac: []const u8 = "";
+    if (i < t.len and t[i] == '.') {
+        i += 1;
+        const start = i;
+        while (i < t.len and std.ascii.isDigit(t[i])) i += 1;
+        frac = t[start..i];
+    }
+    var offset: i64 = 0;
+    if (i < t.len and (t[i] == '+' or t[i] == '-') and t.len - i == 6) {
+        const oh = parseDigits(t[i + 1 .. i + 3]) orelse 0;
+        const om = parseDigits(t[i + 4 .. i + 6]) orelse 0;
+        offset = (@as(i64, oh) * 60 + @as(i64, om)) * 60;
+        if (t[i] == '-') offset = -offset;
+    }
+    const secs = daysFromCivil(y, mo, d) * 86400 + @as(i64, h) * 3600 + @as(i64, mi) * 60 + @as(i64, sec) - offset;
+    return .{ .secs = secs, .frac = frac };
+}
+
+fn fractionOrder(a: []const u8, b: []const u8) std.math.Order {
+    const n = @max(a.len, b.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const ca: u8 = if (i < a.len) a[i] else '0';
+        const cb: u8 = if (i < b.len) b[i] else '0';
+        if (ca != cb) return if (ca < cb) .lt else .gt;
+    }
+    return .eq;
+}
+
+/// Order of two scalars for the comparison ops; null = not comparable.
+/// Numbers by value; two date-times or two dates as instants; any other two
+/// strings by byte length (go-playground's `len`).
+fn scalarOrder(x: Value, y: Value) ?std.math.Order {
+    if (x == .string and y == .string) {
+        if (isDateTime(x.string) and isDateTime(y.string)) {
+            const ix = instantOf(x.string);
+            const iy = instantOf(y.string);
+            const o = std.math.order(ix.secs, iy.secs);
+            return if (o != .eq) o else fractionOrder(ix.frac, iy.frac);
+        }
+        if (isDate(x.string) and isDate(y.string)) return std.mem.order(u8, x.string, y.string);
+        return std.math.order(x.string.len, y.string.len);
+    }
+    return numberOrder(x, y);
+}
+
+/// `eq_field` / `ne_field`'s notion of equal. Strings are equal as text
+/// (or as instants when both are date-times -- the same instant in two
+/// offsets is one value, as `time.Time.Equal` has it).
+fn scalarsEqual(x: Value, y: Value) bool {
+    switch (x) {
+        .string => |s| {
+            if (y != .string) return false;
+            if (isDateTime(s) and isDateTime(y.string)) return scalarOrder(x, y).? == .eq;
+            return std.mem.eql(u8, s, y.string);
+        },
+        .bool => |p| return y == .bool and y.bool == p,
+        .null => return y == .null,
+        .integer, .float, .number_string => return if (numberOrder(x, y)) |o| o == .eq else false,
+        .array, .object => return false,
+    }
+}
+
+/// Does sibling `s` "hold" the text `want` (`required_if` / `required_unless`)?
+fn slotHolds(s: CrossSlot, want: []const u8) bool {
+    const v = switch (s) {
+        .scalar => |v| v,
+        else => return false,
+    };
+    return switch (v) {
+        .string => |t| std.mem.eql(u8, t, want),
+        .bool => |p| p == std.mem.eql(u8, want, "true"),
+        .null => std.mem.eql(u8, want, "null"),
+        .integer, .float, .number_string => blk: {
+            const f = std.fmt.parseFloat(f64, want) catch break :blk false;
+            const n = numValue(v) orelse break :blk false;
+            break :blk n == f;
+        },
+        .array, .object => false,
+    };
+}
+
+/// May the comparison ops look at this field at all? A wrong-typed field
+/// already has its one `<kind>_type` error and gets no comparison noise on
+/// top (as it gets no constraint noise).
+fn crossGated(rule: *const Rule, self: CrossSlot) bool {
+    if (self == .scalar and self.scalar == .null) return false;
+    if (rule.kind == .any) return true;
+    switch (self) {
+        .absent => return false,
+        .container => return rule.kind == .array or rule.kind == .object,
+        .scalar => |v| {
+            if (v == .null) return false; // an allowed null is not compared
+            return typeGate(v, rule.kind);
+        },
+    }
+}
+
+fn crossOpPhrase(op: CrossOp) []const u8 {
+    return switch (op) {
+        .eq_field => "equal",
+        .ne_field => "differ from",
+        .gt_field => "be greater than",
+        .gte_field => "be greater than or equal to",
+        .lt_field => "be less than",
+        .lte_field => "be less than or equal to",
+        else => unreachable,
+    };
+}
+
+fn crossOpCode(op: CrossOp) []const u8 {
+    return switch (op) {
+        .eq_field => "field_mismatch",
+        .ne_field => "field_equal",
+        .gt_field => "greater_than_field",
+        .gte_field => "greater_than_equal_field",
+        .lt_field => "less_than_field",
+        .lte_field => "less_than_equal_field",
+        else => unreachable,
+    };
+}
+
+/// Run `rule.cross` for one member of a complete object. `self` is this
+/// rule's own field; `lookup.get(name)` the siblings. Absent field: the
+/// presence ops may demand it (`missing`) -- unless `rule.required` already
+/// did. Present field: each comparison op must hold.
+fn checkCross(b: *Builder, path: []const u8, rule: *const Rule, self: CrossSlot, lookup: anytype) Allocator.Error!void {
+    if (self == .absent) {
+        if (rule.required) return; // the caller reported `missing`
+        var all_if = true;
+        var has_if: ?*const Cross = null;
+        var has_unless: ?*const Cross = null;
+        var unless_hit = false;
+        var with_hit: ?*const Cross = null;
+        var without_hit: ?*const Cross = null;
+        for (rule.cross) |*c| switch (c.op) {
+            .required_if => {
+                if (has_if == null) has_if = c;
+                if (!slotHolds(lookup.get(c.other), c.value)) all_if = false;
+            },
+            .required_unless => {
+                if (has_unless == null) has_unless = c;
+                if (slotHolds(lookup.get(c.other), c.value)) unless_hit = true;
+            },
+            .required_with => {
+                if (with_hit == null and lookup.get(c.other) != .absent) with_hit = c;
+            },
+            .required_without => {
+                if (without_hit == null and lookup.get(c.other) == .absent) without_hit = c;
+            },
+            else => {},
+        };
+        if (has_if) |c| if (all_if)
+            return b.appendf(path, "missing", "Field required when `{s}` is `{s}`", .{ c.other, c.value });
+        if (has_unless) |c| if (!unless_hit)
+            return b.appendf(path, "missing", "Field required unless `{s}` is `{s}`", .{ c.other, c.value });
+        if (with_hit) |c|
+            return b.appendf(path, "missing", "Field required when `{s}` is present", .{c.other});
+        if (without_hit) |c|
+            return b.appendf(path, "missing", "Field required when `{s}` is absent", .{c.other});
+        return;
+    }
+    if (!crossGated(rule, self)) return;
+    for (rule.cross) |*c| {
+        const holds = switch (c.op) {
+            .eq_field, .ne_field, .gt_field, .gte_field, .lt_field, .lte_field => blk: {
+                const other = lookup.get(c.other);
+                const mine: ?Value = switch (self) {
+                    .scalar => |v| v,
+                    else => null,
+                };
+                const theirs: ?Value = switch (other) {
+                    .scalar => |v| v,
+                    else => null,
+                };
+                if (c.op == .ne_field) {
+                    if (mine == null or theirs == null) break :blk true;
+                    break :blk !scalarsEqual(mine.?, theirs.?);
+                }
+                if (other == .absent or mine == null or theirs == null) break :blk false;
+                if (c.op == .eq_field) break :blk scalarsEqual(mine.?, theirs.?);
+                const o = scalarOrder(mine.?, theirs.?) orelse break :blk false;
+                break :blk switch (c.op) {
+                    .gt_field => o == .gt,
+                    .gte_field => o != .lt,
+                    .lt_field => o == .lt,
+                    else => o != .gt,
+                };
+            },
+            else => true,
+        };
+        if (!holds) try b.appendf(path, crossOpCode(c.op), "Input should {s} the value of `{s}`", .{ crossOpPhrase(c.op), c.other });
     }
 }
 
@@ -939,6 +1340,28 @@ pub fn validateFormat(format: Format, s: []const u8) bool {
         .date_time => isDateTime(s),
         .duration => isDuration(s),
         .json_pointer => isJsonPointer(s),
+        .uuid3 => isUuidVersion(s, '3', false, true),
+        .uuid4 => isUuidVersion(s, '4', true, true),
+        .uuid5 => isUuidVersion(s, '5', true, true),
+        .uuid7 => isUuidVersion(s, '7', true, false),
+        .uuid_rfc4122 => isUuidRfc4122(s),
+        .http_url => isHttpUrl(s, false),
+        .https_url => isHttpUrl(s, true),
+        .base64 => isBase64(s, "+/", true),
+        .base64_url => isBase64(s, "-_", true),
+        .base64_raw_url => isBase64(s, "-_", false),
+        .hex => isHex(s),
+        .e164 => isE164(s),
+        .alpha => allOfClass(s, .alpha),
+        .alphanumeric => allOfClass(s, .alnum),
+        .numeric => isNumeric(s),
+        .ascii => isAscii(s),
+        .lowercase => isCased(s, false),
+        .uppercase => isCased(s, true),
+        .jwt => isJwt(s),
+        .semver => isSemver(s),
+        .cidr => netaddr.parsePrefix(s) != null,
+        .mac => isMac(s),
     };
 }
 
@@ -957,6 +1380,28 @@ fn formatMessage(format: Format) []const u8 {
         .date_time => "Input should be a valid date-time",
         .duration => "Input should be a valid duration",
         .json_pointer => "Input should be a valid JSON Pointer",
+        .uuid3 => "Input should be a valid version 3 UUID",
+        .uuid4 => "Input should be a valid version 4 UUID",
+        .uuid5 => "Input should be a valid version 5 UUID",
+        .uuid7 => "Input should be a valid version 7 UUID",
+        .uuid_rfc4122 => "Input should be a valid RFC 4122 UUID",
+        .http_url => "Input should be a valid HTTP or HTTPS URL",
+        .https_url => "Input should be a valid HTTPS URL",
+        .base64 => "Input should be valid base64",
+        .base64_url => "Input should be valid URL-safe base64",
+        .base64_raw_url => "Input should be valid unpadded URL-safe base64",
+        .hex => "Input should be a hexadecimal string",
+        .e164 => "Input should be a valid E.164 phone number",
+        .alpha => "Input should contain only ASCII letters",
+        .alphanumeric => "Input should contain only ASCII letters and digits",
+        .numeric => "Input should be a valid numeric string",
+        .ascii => "Input should contain only ASCII characters",
+        .lowercase => "Input should be a non-empty lowercase string",
+        .uppercase => "Input should be a non-empty uppercase string",
+        .jwt => "Input should be a valid JWT",
+        .semver => "Input should be a valid semantic version",
+        .cidr => "Input should be a valid CIDR network",
+        .mac => "Input should be a valid MAC address",
     };
 }
 
@@ -1196,6 +1641,290 @@ fn daysInMonth(y: u32, m: u32) u32 {
 
 fn isLeapYear(y: u32) bool {
     return (y % 4 == 0 and y % 100 != 0) or y % 400 == 0;
+}
+
+// ── go-playground formats (2026-10-11) ──────────────────────────────────────
+//
+// Each is a byte-level scan of `s`: no allocation, no recursion, a bounded
+// loop over the input, and any byte sequence (empty, huge, not UTF-8) is simply
+// valid or not.
+
+/// 8-4-4-4-12 with the version nibble `version` (and, with `variant`, the
+/// variant nibble in `8 9 a b`). `lower_only` = go's regex alphabet
+/// `[0-9a-f]`; otherwise either case.
+fn isUuidVersion(s: []const u8, version: u8, variant: bool, lower_only: bool) bool {
+    if (s.len != 36) return false;
+    for (s, 0..) |c, i| {
+        switch (i) {
+            8, 13, 18, 23 => if (c != '-') return false,
+            14 => if (c != version) return false,
+            19 => {
+                if (variant) {
+                    const l = std.ascii.toLower(c);
+                    if (l != '8' and l != '9' and l != 'a' and l != 'b') return false;
+                    if (lower_only and std.ascii.isUpper(c)) return false;
+                } else if (!uuidHexDigit(c, lower_only)) return false;
+            },
+            else => if (!uuidHexDigit(c, lower_only)) return false,
+        }
+    }
+    return true;
+}
+
+fn uuidHexDigit(c: u8, lower_only: bool) bool {
+    if (lower_only) return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+    return std.ascii.isHex(c);
+}
+
+/// RFC 9562: any case, version nibble 1-8, variant `10xx`; the nil and the
+/// max UUID are valid too.
+fn isUuidRfc4122(s: []const u8) bool {
+    if (!isUuid(s)) return false;
+    const all_zero = for (s) |c| {
+        if (c != '0' and c != '-') break false;
+    } else true;
+    if (all_zero) return true;
+    const all_f = for (s) |c| {
+        if (c != 'f' and c != 'F' and c != '-') break false;
+    } else true;
+    if (all_f) return true;
+    const v = s[14];
+    if (v < '1' or v > '8') return false;
+    const l = std.ascii.toLower(s[19]);
+    return l == '8' or l == '9' or l == 'a' or l == 'b';
+}
+
+/// `http://` or `https://` (scheme in either case), an authority with a
+/// non-empty host, then the rest of an RFC 3986 URI.
+fn isHttpUrl(s: []const u8, https_only: bool) bool {
+    if (!isUri(s, true)) return false;
+    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return false;
+    const scheme = s[0..colon];
+    const is_https = std.ascii.eqlIgnoreCase(scheme, "https");
+    if (!is_https and (https_only or !std.ascii.eqlIgnoreCase(scheme, "http"))) return false;
+    const rest = s[colon + 1 ..];
+    if (!std.mem.startsWith(u8, rest, "//")) return false;
+    const after = rest[2..];
+    const end = std.mem.indexOfAny(u8, after, "/?#") orelse after.len;
+    var authority = after[0..end];
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+    var host = authority;
+    if (authority.len != 0 and authority[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return false;
+        const ip = netaddr.parseIp(authority[1..close]) orelse return false;
+        if (ip != .v6) return false;
+        const tail = authority[close + 1 ..];
+        if (tail.len != 0 and (tail[0] != ':' or !allDigitsOrEmpty(tail[1..]))) return false;
+        return true;
+    }
+    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |c| {
+        if (!allDigitsOrEmpty(authority[c + 1 ..])) return false;
+        host = authority[0..c];
+    }
+    if (host.len == 0) return false;
+    for (host) |ch| {
+        if (ch == '[' or ch == ']' or ch == ':' or ch == '@') return false;
+    }
+    return true;
+}
+
+fn allDigitsOrEmpty(s: []const u8) bool {
+    for (s) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+/// Groups of four from `alphabet` (+ `A-Za-z0-9`), a final group of two
+/// plus `==` or three plus `=` when `padded`; unpadded, a final group of two
+/// to four. At least one group, so "" is invalid.
+fn isBase64(s: []const u8, comptime extra: []const u8, padded: bool) bool {
+    if (s.len == 0) return false;
+    var body = s;
+    if (padded) {
+        if (s.len % 4 != 0) return false;
+        var pad: usize = 0;
+        while (pad < 2 and body.len > 0 and body[body.len - 1] == '=') : (pad += 1) body = body[0 .. body.len - 1];
+    } else if (s.len % 4 == 1) return false;
+    for (body) |c| {
+        if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, extra, c) == null) return false;
+    }
+    return true;
+}
+
+fn isHex(s: []const u8) bool {
+    var rest = s;
+    if (s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) rest = s[2..];
+    if (rest.len == 0) return false;
+    for (rest) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
+
+fn isE164(s: []const u8) bool {
+    var digits = s;
+    if (digits.len != 0 and digits[0] == '+') digits = digits[1..];
+    if (digits.len < 8 or digits.len > 15) return false;
+    if (digits[0] < '1' or digits[0] > '9') return false;
+    for (digits) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+const ByteClass = enum { alpha, alnum };
+
+fn allOfClass(s: []const u8, class: ByteClass) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        const ok = switch (class) {
+            .alpha => std.ascii.isAlphabetic(c),
+            .alnum => std.ascii.isAlphanumeric(c),
+        };
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// `[-+]?[0-9]+(\.[0-9]+)?`
+fn isNumeric(s: []const u8) bool {
+    var rest = s;
+    if (rest.len != 0 and (rest[0] == '-' or rest[0] == '+')) rest = rest[1..];
+    const dot = std.mem.indexOfScalar(u8, rest, '.');
+    const int_part = if (dot) |d| rest[0..d] else rest;
+    if (!allDigits(int_part)) return false;
+    if (dot) |d| return allDigits(rest[d + 1 ..]);
+    return true;
+}
+
+fn isAscii(s: []const u8) bool {
+    for (s) |c| if (c >= 0x80) return false;
+    return true;
+}
+
+/// Non-empty and unchanged by `toUpper` (`upper`) or `toLower` (not): a
+/// string with a character that has a case mapping to the other case fails.
+/// ASCII and Latin-1 carry case here; a string that is not UTF-8 fails.
+fn isCased(s: []const u8, upper: bool) bool {
+    if (s.len == 0) return false;
+    const view = std.unicode.Utf8View.init(s) catch return false;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp >= 'A' and cp <= 'Z') {
+            if (!upper) return false;
+        } else if (cp >= 'a' and cp <= 'z') {
+            if (upper) return false;
+        } else if (cp >= 0xC0 and cp <= 0xDE and cp != 0xD7) {
+            if (!upper) return false;
+        } else if (cp >= 0xE0 and cp <= 0xFE and cp != 0xF7) {
+            if (upper) return false;
+        } else if (cp == 0xB5 or cp == 0xFF) {
+            if (upper) return false; // µ and ÿ are lowercase (their uppercase is outside Latin-1)
+        }
+    }
+    return true;
+}
+
+fn isBase64UrlRun(s: []const u8, allow_empty: bool) bool {
+    if (s.len == 0) return allow_empty;
+    for (s) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
+    }
+    return true;
+}
+
+/// `A.B.C` with A, B non-empty and C possibly empty, all base64url bytes.
+fn isJwt(s: []const u8) bool {
+    const d1 = std.mem.indexOfScalar(u8, s, '.') orelse return false;
+    const d2 = std.mem.indexOfScalarPos(u8, s, d1 + 1, '.') orelse return false;
+    return isBase64UrlRun(s[0..d1], false) and isBase64UrlRun(s[d1 + 1 .. d2], false) and
+        isBase64UrlRun(s[d2 + 1 ..], true);
+}
+
+/// semver.org 2.0.0: `MAJOR.MINOR.PATCH[-pre][+build]`, no leading zeros in
+/// the numbers or in numeric pre-release identifiers.
+fn isSemver(s: []const u8) bool {
+    var rest = s;
+    var core_parts: usize = 0;
+    while (core_parts < 3) : (core_parts += 1) {
+        var n: usize = 0;
+        while (n < rest.len and std.ascii.isDigit(rest[n])) n += 1;
+        if (n == 0 or (n > 1 and rest[0] == '0')) return false;
+        rest = rest[n..];
+        if (core_parts < 2) {
+            if (rest.len == 0 or rest[0] != '.') return false;
+            rest = rest[1..];
+        }
+    }
+    var build: ?[]const u8 = null;
+    if (std.mem.indexOfScalar(u8, rest, '+')) |plus| {
+        build = rest[plus + 1 ..];
+        rest = rest[0..plus];
+    }
+    if (rest.len != 0) {
+        if (rest[0] != '-') return false;
+        var ids = std.mem.splitScalar(u8, rest[1..], '.');
+        while (ids.next()) |id| {
+            if (id.len == 0) return false;
+            var numeric = true;
+            for (id) |c| {
+                if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+                if (!std.ascii.isDigit(c)) numeric = false;
+            }
+            if (numeric and id.len > 1 and id[0] == '0') return false;
+        }
+    }
+    if (build) |bd| {
+        var ids = std.mem.splitScalar(u8, bd, '.');
+        while (ids.next()) |id| {
+            if (id.len == 0) return false;
+            for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+        }
+    }
+    return true;
+}
+
+/// Go's `xtoi2`: two hex digits, and when more follows, `sep` right after.
+fn macOctet(s: []const u8, sep: u8) bool {
+    if (s.len < 2) return false;
+    if (s.len > 2 and s[2] != sep) return false;
+    return std.ascii.isHex(s[0]) and std.ascii.isHex(s[1]);
+}
+
+/// Go's `net.ParseMAC` (`mac.go`): 6, 8 or 20 octets, as `xx:xx:...`,
+/// `xx-xx-...`, `xxxx.xxxx....` or `xxxxxxxxxxxx` (no separator).
+fn isMac(s: []const u8) bool {
+    if (s.len < 12) return false;
+    if (s[2] == ':' or s[2] == '-') {
+        if ((s.len + 1) % 3 != 0) return false;
+        const n = (s.len + 1) / 3;
+        if (n != 6 and n != 8 and n != 20) return false;
+        var x: usize = 0;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (!macOctet(s[x..], s[2])) return false;
+            x += 3;
+        }
+        return true;
+    }
+    if (s[4] == '.') {
+        if ((s.len + 1) % 5 != 0) return false;
+        const n = 2 * (s.len + 1) / 5;
+        if (n != 6 and n != 8 and n != 20) return false;
+        var x: usize = 0;
+        var i: usize = 0;
+        while (i < n) : (i += 2) {
+            if (!macOctet(s[x .. x + 2], 0)) return false;
+            if (!macOctet(s[x + 2 ..], s[4])) return false;
+            x += 5;
+        }
+        return true;
+    }
+    if (s.len % 2 != 0) return false;
+    const n = s.len / 2;
+    if (n != 6 and n != 8 and n != 20) return false;
+    var x: usize = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (!macOctet(s[x .. x + 2], 0)) return false;
+        x += 2;
+    }
+    return true;
 }
 
 // ── query + path params (strings → coerce + check) ──────────────────────────
@@ -1485,6 +2214,35 @@ pub fn rulesFor(comptime T: type) []const Rule {
     }
 }
 
+/// The rule for the document root of a typed body `T`: a struct is an
+/// `.object` with `rulesFor(T)` (exactly what the typed paths always
+/// checked); a slice or an array `[N]U` is an `.array` whose elements follow
+/// `ruleForType(U)` -- a JSON array root, errors at `[i].field`. Anything
+/// else is a compile error.
+pub fn rootRuleFor(comptime T: type) Rule {
+    comptime {
+        switch (@typeInfo(T)) {
+            .@"struct" => return objectRoot(rulesFor(T)),
+            .pointer, .array => {
+                var rule = ruleForType(T);
+                if (rule.kind != .array)
+                    @compileError("validate.rootRuleFor: " ++ @typeName(T) ++ " is not an object or an array");
+                rule.field = "";
+                return rule;
+            },
+            else => @compileError("validate.rootRuleFor: " ++ @typeName(T) ++ " is not a struct, slice or array"),
+        }
+    }
+}
+
+/// `T.validate_rules` for a struct that declares it, else none. (Only an
+/// object root has a second rule set: an array root's element constraints
+/// belong to `validateJsonRoot`'s rule.)
+fn typedExtra(comptime T: type) []const Rule {
+    if (@typeInfo(T) != .@"struct") return &.{};
+    return if (@hasDecl(T, "validate_rules")) T.validate_rules else &.{};
+}
+
 fn ruleForType(comptime T: type) Rule {
     comptime {
         switch (@typeInfo(T)) {
@@ -1573,7 +2331,8 @@ pub fn parseIntoLimited(comptime T: type, gpa: Allocator, body: []const u8, limi
     if (try jsonLimitError(gpa, body, limits)) |e|
         return .{ .invalid = try singleErrorReport(gpa, e) };
 
-    const schema = comptime rulesFor(T);
+    const root = comptime rootRuleFor(T);
+    const extra = comptime typedExtra(T);
 
     var parsed = std.json.parseFromSlice(Value, gpa, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1589,10 +2348,10 @@ pub fn parseIntoLimited(comptime T: type, gpa: Allocator, body: []const u8, limi
     {
         var b = Builder.initCapped(gpa, limits.max_errors);
         errdefer b.abort();
-        try checkValue(&b, "", parsed.value, schema);
-        if (@hasDecl(T, "validate_rules")) {
+        try checkRoot(&b, &root, parsed.value);
+        if (extra.len != 0) {
             const first_pass_len = b.list.items.len;
-            try checkValue(&b, "", parsed.value, T.validate_rules);
+            try checkValue(&b, "", parsed.value, extra);
             b.dedupeFrom(first_pass_len);
         }
         if (b.list.items.len != 0) return .{ .invalid = b.finish() };
@@ -1780,7 +2539,7 @@ pub fn LeakyResult(comptime T: type) type {
 /// arena-like allocator: the decoded `T` is never freed piecemeal (the
 /// `Leaky` convention of `std.json`). Errors come in document order.
 pub fn parseIntoLeaky(comptime T: type, arena: Allocator, body: []const u8, limits: Limits) Allocator.Error!LeakyResult(T) {
-    const extra: []const Rule = if (@hasDecl(T, "validate_rules")) T.validate_rules else &.{};
+    const extra: []const Rule = comptime typedExtra(T);
     if (try parseOnePass(T, arena, body, limits, extra)) |r| return r;
     return parseMultiPass(T, arena, body, limits, extra);
 }
@@ -1798,7 +2557,7 @@ fn parseOnePass(comptime T: type, arena: Allocator, body: []const u8, limits: Li
     const scratch = fallback.get();
     var b = Builder.initCapped(arena, limits.max_errors);
     var w: Walker = undefined;
-    w.start(scratch, body.len, &b, comptime rulesFor(T), extra, limits);
+    w.startRoot(scratch, body.len, &b, comptime rootRuleFor(T), extra, limits);
     defer w.deinit();
     var tap: TokenTap = .{ .scanner = .initCompleteInput(scratch, body), .w = &w };
     defer tap.deinit();
@@ -1827,7 +2586,7 @@ fn parseOnePass(comptime T: type, arena: Allocator, body: []const u8, limits: Li
 /// as it always was.
 fn parseMultiPass(comptime T: type, arena: Allocator, body: []const u8, limits: Limits, extra: []const Rule) Allocator.Error!LeakyResult(T) {
     {
-        var report = try streamValidate(arena, body, comptime rulesFor(T), extra, limits);
+        var report = try streamValidate(arena, body, comptime rootRuleFor(T), extra, limits);
         if (!report.ok()) return .{ .invalid = report };
         report.deinit();
     }
@@ -1853,21 +2612,59 @@ fn parseMultiPass(comptime T: type, arena: Allocator, body: []const u8, limits: 
 /// allocator; every temporary is freed before return, and the Report owns
 /// what it keeps. Errors come in document order.
 pub fn validateJsonStreaming(gpa: Allocator, body: []const u8, schema: []const Rule, limits: Limits) Allocator.Error!Report {
-    return streamValidate(gpa, body, schema, &.{}, limits);
+    return streamValidate(gpa, body, objectRoot(schema), &.{}, limits);
+}
+
+/// `validateJsonLimited` for a document whose ROOT is described by one rule:
+/// a batch endpoint's array (`.{ .field = "", .kind = .array, .items = &item }`,
+/// errors at `[2].email`), an object (`.fields`), or a bare scalar. A root of
+/// the wrong type is one `<kind>_type` error at path "". Limits apply as
+/// everywhere. `root.field` and `root.required` mean nothing for a root.
+pub fn validateJsonRoot(gpa: Allocator, body: []const u8, root: *const Rule, limits: Limits) Allocator.Error!Report {
+    if (try jsonLimitError(gpa, body, limits)) |e| return singleErrorReport(gpa, e);
+    var parsed = std.json.parseFromSlice(Value, gpa, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return jsonInvalidReport(gpa, err),
+    };
+    defer parsed.deinit();
+    var b = Builder.initCapped(gpa, limits.max_errors);
+    errdefer b.abort();
+    try checkRoot(&b, root, parsed.value);
+    return b.finish();
+}
+
+/// `validateJsonRoot` without the value tree (the streaming path of
+/// `validateJsonStreaming`, same errors, document order).
+pub fn validateJsonRootStreaming(gpa: Allocator, body: []const u8, root: *const Rule, limits: Limits) Allocator.Error!Report {
+    return streamValidate(gpa, body, root.*, &.{}, limits);
+}
+
+/// A root that is an object keeps `checkValue`'s behaviour (and message) for
+/// a document that is not one; every other root goes through `checkRule`.
+fn checkRoot(b: *Builder, root: *const Rule, v: Value) Allocator.Error!void {
+    if (root.kind == .object and !root.allow_null and root.custom == null) {
+        const fields: []const Rule = root.fields orelse &.{};
+        return checkValue(b, "", v, fields);
+    }
+    return checkRule(b, "", v, root);
+}
+
+fn objectRoot(rules: []const Rule) Rule {
+    return .{ .field = "", .kind = .object, .fields = rules };
 }
 
 /// Validate `body` against `schema` and, as a second rule set over the same
 /// document, `extra` (a typed `T.validate_rules`), deduplicating the second
 /// set's (path, code) pairs against the first -- the `parseIntoLimited`
 /// double-pass, done in one walk.
-fn streamValidate(gpa: Allocator, body: []const u8, schema: []const Rule, extra: []const Rule, limits: Limits) Allocator.Error!Report {
+fn streamValidate(gpa: Allocator, body: []const u8, root: Rule, extra: []const Rule, limits: Limits) Allocator.Error!Report {
     if (try jsonLimitError(gpa, body, limits)) |e| return singleErrorReport(gpa, e);
 
     // No `errdefer` over the builder: the json_invalid branch below aborts it
     // and then allocates again, and an armed errdefer would free it twice on
     // that allocation's failure (the bug fixed in `parseIntoLimited`).
     var b = Builder.initCapped(gpa, limits.max_errors);
-    const bad_json = walkDocument(&b, gpa, body, schema, extra) catch |err| {
+    const bad_json = walkDocument(&b, gpa, body, root, extra) catch |err| {
         b.abort();
         return err;
     };
@@ -1882,14 +2679,14 @@ fn streamValidate(gpa: Allocator, body: []const u8, schema: []const Rule, extra:
 /// have failed with (syntax, truncation, duplicate key) -- the caller turns
 /// it into json_invalid and drops whatever validation errors were found --
 /// or null. Only `OutOfMemory` propagates.
-fn walkDocument(b: *Builder, gpa: Allocator, body: []const u8, schema: []const Rule, extra: []const Rule) Allocator.Error!?anyerror {
+fn walkDocument(b: *Builder, gpa: Allocator, body: []const u8, root: Rule, extra: []const Rule) Allocator.Error!?anyerror {
     var scanner = std.json.Scanner.initCompleteInput(gpa, body);
     defer scanner.deinit();
     // The walker's frames and key copies: a stack buffer first, as the
     // recursion's locals were.
     var fallback = std.heap.stackFallback(1024, gpa);
     var w: Walker = undefined;
-    w.start(fallback.get(), body.len, b, schema, extra, null);
+    w.startRoot(fallback.get(), body.len, b, root, extra, null);
     defer w.deinit();
     while (true) {
         // A non-OOM error here is the document's, not ours: it is the VALUE
@@ -1984,6 +2781,21 @@ const Walker = struct {
 
     const Fields = struct { rules: []const Rule, pass: u1, seen: std.ArrayList(bool) = .empty };
 
+    /// One captured member: `slot` is what its value was. A string or a
+    /// number's text is copied into `owned` -- the token it came from is
+    /// freed right after `feed`.
+    const Cap = struct { name: []const u8, slot: CrossSlot = .absent, owned: ?[]u8 = null };
+
+    /// `CrossSlot` lookup over an object's captured members.
+    const CapLookup = struct {
+        caps: []const Cap,
+
+        fn get(l: CapLookup, name: []const u8) CrossSlot {
+            for (l.caps) |c| if (std.mem.eql(u8, c.name, name)) return c.slot;
+            return .absent;
+        }
+    };
+
     const Frame = struct {
         kind: ContainerKind,
         /// This container's place (null = the root). Points into the parent
@@ -2006,6 +2818,11 @@ const Walker = struct {
         count: usize = 0,
         /// The current child's place.
         child: Seg = .{ .parent = null },
+        /// Objects: the members cross-field rules look at (`Rule.cross`),
+        /// captured as they go by, and which of them the value now being
+        /// read belongs to.
+        caps: std.ArrayList(Cap) = .empty,
+        cap_idx: ?usize = null,
 
         fn fieldSets(f: *Frame) []Fields {
             return f.sets.items[0..f.sets_len];
@@ -2023,16 +2840,16 @@ const Walker = struct {
     };
 
     /// In place: `actives` points at `roots`.
-    fn start(w: *Walker, gpa: Allocator, body_len: usize, b: *Builder, schema: []const Rule, extra: []const Rule, limits: ?Limits) void {
+    /// `root` is the rule the document root is held to (an object rule for
+    /// the schema, or an array of objects, say); `extra` is a second rule set
+    /// for an OBJECT root.
+    fn startRoot(w: *Walker, gpa: Allocator, body_len: usize, b: *Builder, root: Rule, extra: []const Rule, limits: ?Limits) void {
         w.* = .{ .gpa = gpa, .body_len = body_len, .b = b };
         if (limits) |l| w.limit = .{ .gpa = gpa, .limits = l, .frames = .empty };
         // The document root is held to an implicit `.object` rule per rule
         // set, which is `checkValue`'s root behaviour: a non-object root is
         // one `object_type` error at path "".
-        w.roots = .{
-            .{ .field = "", .kind = .object, .fields = schema },
-            .{ .field = "", .kind = .object, .fields = extra },
-        };
+        w.roots = .{ root, objectRoot(extra) };
         w.actives = .{ .{ .rule = &w.roots[0], .pass = 0 }, .{ .rule = &w.roots[1], .pass = 1 } };
         w.root_active = if (extra.len == 0) w.actives[0..1] else w.actives[0..2];
     }
@@ -2041,6 +2858,8 @@ const Walker = struct {
         w.freeKeysFrom(0);
         w.keys.deinit(w.gpa);
         for (w.frames.items) |f| {
+            w.capsClear(f);
+            f.caps.deinit(w.gpa);
             for (f.sets.items) |*s| s.seen.deinit(w.gpa);
             f.sets.deinit(w.gpa);
             f.gated.deinit(w.gpa);
@@ -2051,6 +2870,54 @@ const Walker = struct {
         w.matReset();
         w.mat.stack.deinit(w.gpa);
         if (w.limit) |*l| l.frames.deinit(w.gpa);
+    }
+
+    /// Free what the captured members own, and forget them.
+    fn capsClear(w: *Walker, f: *Frame) void {
+        for (f.caps.items) |c| if (c.owned) |o| w.gpa.free(o);
+        f.caps.clearRetainingCapacity();
+        f.cap_idx = null;
+    }
+
+    /// Capture the members `rules`' cross-field entries look at: each such
+    /// rule's own field and every sibling it names.
+    fn addCaps(w: *Walker, f: *Frame, rules: []const Rule) Allocator.Error!void {
+        for (rules) |*r| {
+            if (r.cross.len == 0) continue;
+            try w.addCap(f, r.field);
+            for (r.cross) |c| try w.addCap(f, c.other);
+        }
+    }
+
+    fn addCap(w: *Walker, f: *Frame, name: []const u8) Allocator.Error!void {
+        for (f.caps.items) |c| if (std.mem.eql(u8, c.name, name)) return;
+        try f.caps.append(w.gpa, .{ .name = name });
+    }
+
+    /// The value just read for captured member `ci`.
+    fn capture(w: *Walker, f: *Frame, ci: usize, v: Value) Allocator.Error!void {
+        const c = &f.caps.items[ci];
+        if (c.owned) |o| w.gpa.free(o);
+        c.owned = null;
+        switch (v) {
+            .string => |s| {
+                const d = try w.gpa.dupe(u8, s);
+                c.owned = d;
+                c.slot = .{ .scalar = .{ .string = d } };
+            },
+            .number_string => |s| {
+                const d = try w.gpa.dupe(u8, s);
+                c.owned = d;
+                c.slot = .{ .scalar = .{ .number_string = d } };
+            },
+            else => c.slot = .{ .scalar = v },
+        }
+    }
+
+    /// A container is the value of captured member `ci`.
+    fn captureContainer(f: *Frame, ci: usize) void {
+        const c = &f.caps.items[ci];
+        c.slot = .container;
     }
 
     /// Merge the second rule set's errors after the first's, minus the pairs
@@ -2189,6 +3056,7 @@ const Walker = struct {
             .object_begin, .array_begin => {
                 const kind: ContainerKind = if (token == .object_begin) .object else .array;
                 try w.limitEnter(kind);
+                if (w.top()) |f| if (f.kind == .object) if (f.cap_idx) |ci| captureContainer(f, ci);
                 for (active) |a| if (a.rule.custom != null) return w.matBegin(seg, active, kind);
                 return w.open(seg, active, kind);
             },
@@ -2203,6 +3071,7 @@ const Walker = struct {
                     else => unreachable, // whole tokens only; ends handled above
                 };
                 for (active) |a| try w.check(seg, v, a);
+                if (w.top()) |f| if (f.kind == .object) if (f.cap_idx) |ci| try w.capture(f, ci, v);
                 w.limitComplete();
                 return w.afterValue();
             },
@@ -2220,6 +3089,7 @@ const Walker = struct {
                 // Reported after the value, as the tree parser does: an error
                 // inside the duplicate's value wins over the duplicate itself.
                 if (f.dup) return error.DuplicateField;
+                f.cap_idx = null;
                 f.expect_key = true;
             },
             .array => f.count += 1,
@@ -2246,6 +3116,7 @@ const Walker = struct {
         f.expect_key = true;
         f.dup = false;
         f.key_mark = w.keys.items.len;
+        w.capsClear(f);
         w.depth += 1;
         switch (kind) {
             .object => for (active) |a| {
@@ -2258,6 +3129,7 @@ const Walker = struct {
                 try set.seen.resize(w.gpa, rules.len);
                 @memset(set.seen.items, false);
                 f.sets_len += 1;
+                try w.addCaps(f, rules);
             },
             .array => for (active) |a| {
                 if (!try w.gate(seg, a, .array)) continue;
@@ -2290,6 +3162,10 @@ const Walker = struct {
                 try f.children.append(w.gpa, .{ .rule = r, .pass = set.pass });
             }
         }
+        f.cap_idx = null;
+        for (f.caps.items, 0..) |c, i| {
+            if (std.mem.eql(u8, c.name, k.name)) f.cap_idx = i;
+        }
         f.expect_key = false;
     }
 
@@ -2303,6 +3179,23 @@ const Walker = struct {
                 try w.b.append(try w.path(&missing), "missing", "Field required");
             }
         }
+        // Cross-field rules, now that every member has been seen. The path
+        // is rendered only if one of them reported.
+        for (f.fieldSets()) |set| {
+            for (set.rules) |*r| {
+                if (r.cross.len == 0) continue;
+                w.use(set.pass);
+                if (w.b.full()) continue;
+                const look: CapLookup = .{ .caps = f.caps.items };
+                const mark = w.b.list.items.len;
+                try checkCross(w.b, "", r, look.get(r.field), look);
+                if (w.b.list.items.len == mark) continue;
+                var self_seg: Seg = .{ .parent = f.seg, .field = r.field };
+                const p = try w.path(&self_seg);
+                for (w.b.list.items[mark..]) |*e| e.path = p;
+            }
+        }
+        w.capsClear(f);
         w.freeKeysFrom(f.key_mark);
         w.depth -= 1;
         w.limitClose();
@@ -2568,7 +3461,11 @@ pub fn writeJsonSchema(rules: []const Rule, w: *std.Io.Writer) std.Io.Writer.Err
 /// typed paths check.
 pub fn writeJsonSchemaFor(comptime T: type, w: *std.Io.Writer) std.Io.Writer.Error!void {
     var s: std.json.Stringify = .{ .writer = w };
-    if (@hasDecl(T, "validate_rules")) {
+    // An array root (`[]const Item`): `{"type":"array","items":{...}}`.
+    if (comptime @typeInfo(T) != .@"struct") {
+        const root = comptime rootRuleFor(T);
+        try writeRuleSchema(&s, &root);
+    } else if (@hasDecl(T, "validate_rules")) {
         try s.beginObject();
         try s.objectField("allOf");
         try s.beginArray();
@@ -2579,6 +3476,13 @@ pub fn writeJsonSchemaFor(comptime T: type, w: *std.Io.Writer) std.Io.Writer.Err
     } else {
         try schemaOfFields(&s, comptime rulesFor(T), true);
     }
+}
+
+/// The schema of a root described by one rule (see `validateJsonRoot`): an
+/// array root is `{"type":"array","items":{...},"minItems":...}`.
+pub fn writeJsonSchemaRoot(root: *const Rule, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    var s: std.json.Stringify = .{ .writer = w };
+    try writeRuleSchema(&s, root);
 }
 
 fn schemaOfFields(s: *std.json.Stringify, rules: []const Rule, typed: bool) std.Io.Writer.Error!void {
@@ -2628,6 +3532,181 @@ fn writeFieldsMembers(s: *std.json.Stringify, rules: []const Rule) std.Io.Writer
         try s.write(r.field);
     }
     if (any_required) try s.endArray();
+    try writeCrossMembers(s, rules);
+}
+
+// ── cross-field rules in the schema ─────────────────────────────────────────
+//
+// 2020-12 can say which members must be PRESENT given others: `required_with`
+// is `dependentRequired`, `required_if` / `required_unless` /
+// `required_without` are `allOf` items (`if`/`then`, `anyOf`). It cannot
+// compare two members, so `eq_field` .. `lte_field` have no schema form and
+// are not exported (they are checked by the validator all the same).
+
+fn hasCrossOp(rules: []const Rule, op: CrossOp) bool {
+    for (rules) |r| for (r.cross) |c| if (c.op == op) return true;
+    return false;
+}
+
+/// Is the `required_with` entry (rule `i`, entry `j`) the first one that
+/// names its `other`?
+fn firstWithOther(rules: []const Rule, i: usize, j: usize) bool {
+    const other = rules[i].cross[j].other;
+    for (rules[0 .. i + 1], 0..) |r, k| {
+        const end = if (k == i) j else r.cross.len;
+        for (r.cross[0..end]) |c| if (c.op == .required_with and std.mem.eql(u8, c.other, other)) return false;
+    }
+    return true;
+}
+
+/// Is `other` named by an entry of `op` earlier in `r.cross[0..j]`?
+fn namedBefore(r: *const Rule, j: usize, op: CrossOp, other: []const u8) bool {
+    for (r.cross[0..j]) |c| if (c.op == op and std.mem.eql(u8, c.other, other)) return true;
+    return false;
+}
+
+/// The schema of "member `other` holds `text`" (see `slotHolds`): typed from
+/// the sibling's own rule when there is one, else every JSON value that
+/// would hold.
+fn writeHoldsSchema(s: *std.json.Stringify, rules: []const Rule, other: []const u8, text: []const u8) std.Io.Writer.Error!void {
+    var kind: Kind = .any;
+    for (rules) |r| if (std.mem.eql(u8, r.field, other)) {
+        kind = r.kind;
+        break;
+    };
+    const num: ?f64 = std.fmt.parseFloat(f64, text) catch null;
+    try s.beginObject();
+    switch (kind) {
+        .string => {
+            try s.objectField("const");
+            try s.write(text);
+        },
+        .int, .float => if (num) |n| {
+            try s.objectField("const");
+            try writeNumber(s, n);
+        } else {
+            try s.objectField("not");
+            try s.beginObject();
+            try s.endObject();
+        },
+        .bool => {
+            try s.objectField("const");
+            try s.write(std.mem.eql(u8, text, "true"));
+        },
+        else => {
+            try s.objectField("enum");
+            try s.beginArray();
+            try s.write(text);
+            if (num) |n| try writeNumber(s, n);
+            try s.write(std.mem.eql(u8, text, "true"));
+            if (std.mem.eql(u8, text, "null")) try s.write(null);
+            try s.endArray();
+        },
+    }
+    try s.endObject();
+}
+
+/// `{"properties":{other:<holds>},"required":[other]}`
+fn writeHoldsEntry(s: *std.json.Stringify, rules: []const Rule, c: Cross) std.Io.Writer.Error!void {
+    try s.beginObject();
+    try s.objectField("properties");
+    try s.beginObject();
+    try s.objectField(c.other);
+    try writeHoldsSchema(s, rules, c.other, c.value);
+    try s.endObject();
+    try s.objectField("required");
+    try s.beginArray();
+    try s.write(c.other);
+    try s.endArray();
+    try s.endObject();
+}
+
+fn writeRequiredField(s: *std.json.Stringify, field: []const u8) std.Io.Writer.Error!void {
+    try s.beginObject();
+    try s.objectField("required");
+    try s.beginArray();
+    try s.write(field);
+    try s.endArray();
+    try s.endObject();
+}
+
+fn writeCrossMembers(s: *std.json.Stringify, rules: []const Rule) std.Io.Writer.Error!void {
+    if (hasCrossOp(rules, .required_with)) {
+        try s.objectField("dependentRequired");
+        try s.beginObject();
+        for (rules, 0..) |r, i| {
+            for (r.cross, 0..) |c, j| {
+                if (c.op != .required_with or !firstWithOther(rules, i, j)) continue;
+                try s.objectField(c.other);
+                try s.beginArray();
+                for (rules, 0..) |r2, ia| {
+                    for (r2.cross, 0..) |c2, ja| {
+                        if (c2.op != .required_with or !std.mem.eql(u8, c2.other, c.other)) continue;
+                        if (namedBefore(&r2, ja, .required_with, c2.other)) continue;
+                        // one listing per field, even with two rules for it
+                        if (ia != firstIndexOf(rules, r2.field)) continue;
+                        try s.write(r2.field);
+                    }
+                }
+                try s.endArray();
+            }
+        }
+        try s.endObject();
+    }
+    if (!hasCrossOp(rules, .required_if) and !hasCrossOp(rules, .required_unless) and
+        !hasCrossOp(rules, .required_without)) return;
+    try s.objectField("allOf");
+    try s.beginArray();
+    for (rules) |*r| {
+        var has_if = false;
+        var has_unless = false;
+        for (r.cross) |c| {
+            if (c.op == .required_if) has_if = true;
+            if (c.op == .required_unless) has_unless = true;
+        }
+        if (has_if) {
+            // required when EVERY listed sibling holds its value
+            try s.beginObject();
+            try s.objectField("if");
+            try s.beginObject();
+            try s.objectField("allOf");
+            try s.beginArray();
+            for (r.cross, 0..) |c, j| {
+                if (c.op != .required_if or namedBefore(r, j, .required_if, c.other)) continue;
+                try writeHoldsEntry(s, rules, c);
+            }
+            try s.endArray();
+            try s.endObject();
+            try s.objectField("then");
+            try writeRequiredField(s, r.field);
+            try s.endObject();
+        }
+        if (has_unless) {
+            // present, or one of the listed siblings holds its value
+            try s.beginObject();
+            try s.objectField("anyOf");
+            try s.beginArray();
+            try writeRequiredField(s, r.field);
+            for (r.cross, 0..) |c, j| {
+                if (c.op != .required_unless or namedBefore(r, j, .required_unless, c.other)) continue;
+                try writeHoldsEntry(s, rules, c);
+            }
+            try s.endArray();
+            try s.endObject();
+        }
+        for (r.cross, 0..) |c, j| {
+            if (c.op != .required_without or namedBefore(r, j, .required_without, c.other)) continue;
+            // present, or this sibling is
+            try s.beginObject();
+            try s.objectField("anyOf");
+            try s.beginArray();
+            try writeRequiredField(s, r.field);
+            try writeRequiredField(s, c.other);
+            try s.endArray();
+            try s.endObject();
+        }
+    }
+    try s.endArray();
 }
 
 fn firstIndexOf(rules: []const Rule, field: []const u8) usize {
@@ -2822,6 +3901,28 @@ fn formatName(f: Format) []const u8 {
         .date_time => "date-time",
         .duration => "duration",
         .json_pointer => "json-pointer",
+        .uuid3 => "uuid3",
+        .uuid4 => "uuid4",
+        .uuid5 => "uuid5",
+        .uuid7 => "uuid7",
+        .uuid_rfc4122 => "uuid-rfc4122",
+        .http_url => "http-url",
+        .https_url => "https-url",
+        .base64 => "base64",
+        .base64_url => "base64url",
+        .base64_raw_url => "base64rawurl",
+        .hex => "hexadecimal",
+        .e164 => "e164",
+        .alpha => "alpha",
+        .alphanumeric => "alphanum",
+        .numeric => "numeric",
+        .ascii => "ascii",
+        .lowercase => "lowercase",
+        .uppercase => "uppercase",
+        .jwt => "jwt",
+        .semver => "semver",
+        .cidr => "cidr",
+        .mac => "mac",
     };
 }
 
@@ -4345,7 +5446,7 @@ fn expectSchemaAgrees(body: []const u8, schema: []const Rule) !void {
 /// When `parseOnePass` answers `body`, require `parseMultiPass`'s answer:
 /// the same errors, or equal decoded values. Returns whether it answered.
 fn expectOnePassAgrees(comptime T: type, body: []const u8, limits: Limits) !bool {
-    const extra: []const Rule = if (@hasDecl(T, "validate_rules")) T.validate_rules else &.{};
+    const extra: []const Rule = comptime typedExtra(T);
     var one_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer one_arena.deinit();
     const one = try parseOnePass(T, one_arena.allocator(), body, limits, extra) orelse return false;
@@ -5533,6 +6634,31 @@ const format_seeds = [_][]const u8{
     fuzzseed.seed("\x00\x01" ++ "\x01\x02\x03\x04\x05"), // near-miss alphabet, email
     fuzzseed.seed("\x05\x01" ++ "\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11"), // near-miss alphabet, ipv6
     fuzzseed.seed("\x0b\x01" ++ "\x11\x12\x13"), // near-miss alphabet, json_pointer
+    // go-playground formats (2026-10-11): octet 0 is the `Format` index, one valid string each
+    fuzzseed.seed("\x0c\x00" ++ "6fa459ea-ee8a-3ca4-894e-db77e160355e"), // uuid3
+    fuzzseed.seed("\x0d\x00" ++ "550e8400-e29b-41d4-a716-446655440000"), // uuid4
+    fuzzseed.seed("\x0d\x00" ++ "550e8400-e29b-11d4-a716-446655440000"), // uuid4, but version 1
+    fuzzseed.seed("\x0e\x00" ++ "886313e1-3b8a-5372-9b90-0c9aee199e5d"), // uuid5
+    fuzzseed.seed("\x0f\x00" ++ "018f3a2c-7b1e-7d3a-8c1f-5b2e9a4d6c10"), // uuid7
+    fuzzseed.seed("\x10\x00" ++ "00000000-0000-0000-0000-000000000000"), // uuid_rfc4122, the nil UUID
+    fuzzseed.seed("\x11\x00" ++ "https://user@example.com:8080/a?b=c#d"), // http_url
+    fuzzseed.seed("\x12\x00" ++ "http://example.com"), // https_url refusing http
+    fuzzseed.seed("\x13\x00" ++ "SGVsbG8="), // base64
+    fuzzseed.seed("\x14\x00" ++ "SGVsbG8_"), // base64_url
+    fuzzseed.seed("\x15\x00" ++ "SGVsbG8"), // base64_raw_url
+    fuzzseed.seed("\x15\x00" ++ "S"), // base64_raw_url, one character
+    fuzzseed.seed("\x16\x00" ++ "0xDEADbeef"), // hex
+    fuzzseed.seed("\x17\x00" ++ "+420123456789"), // e164
+    fuzzseed.seed("\x18\x00" ++ "Hello"), // alpha
+    fuzzseed.seed("\x19\x00" ++ "abc123"), // alphanumeric
+    fuzzseed.seed("\x1a\x00" ++ "-12.5"), // numeric
+    fuzzseed.seed("\x1b\x00" ++ "plain ascii"), // ascii
+    fuzzseed.seed("\x1c\x00" ++ "hello"), // lowercase
+    fuzzseed.seed("\x1d\x00" ++ "HELLO"), // uppercase
+    fuzzseed.seed("\x1e\x00" ++ "aaa.bbb.ccc"), // jwt
+    fuzzseed.seed("\x1f\x00" ++ "1.2.3-rc.1+build.5"), // semver
+    fuzzseed.seed("\x20\x00" ++ "10.0.0.0/8"), // cidr
+    fuzzseed.seed("\x21\x00" ++ "00:1a:2b:3c:4d:5e"), // mac
     fuzzseed.seed(""), // the empty seed: `.email` and the empty string, which is what this target ran
 };
 
@@ -5747,7 +6873,7 @@ test "fuzz driver: VALIDATE_FUZZ (json, streaming, format)" {
 
 test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere" {
     fz.resetReach();
-    inline for (.{ jsonHarness, streamingHarness, formatHarness }, .{ "json", "streaming", "format" }) |h, name| {
+    inline for (.{ jsonHarness, streamingHarness, formatHarness, crossHarness }, .{ "json", "streaming", "format", "cross" }) |h, name| {
         for (0..500) |seed| {
             var prng = std.Random.DefaultPrng.init(seed);
             var rng: fuzz_driver.Rng = .{ .r = prng.random() };
@@ -5763,10 +6889,10 @@ test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere"
 test "corpus: every Format is exercised, and the strings each accepts are pinned" {
     // ⭐ The number that was 1 before, and the only one that says this target
     // is no longer stuck on `.email`: how many DISTINCT formats the corpus
-    // selects. Twelve of twelve, and the accepted count beside it so a corpus
-    // of refusals only would be visible.
+    // selects. All of them (34 since 2026-10-11), and the accepted count
+    // beside it so a corpus of refusals only would be visible.
     const formats = std.enums.values(Format);
-    var seen = [_]bool{false} ** 12;
+    var seen = [_]bool{false} ** 34;
     var nonempty: usize = 0;
     var accepted: usize = 0;
     for (format_seeds) |sd| {
@@ -5779,11 +6905,14 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
         if (case[1].len != 0) nonempty += 1;
         if (validateFormat(case[0], case[1])) accepted += 1;
     }
-    try testing.expectEqual(@as(usize, 12), formats.len);
+    try testing.expectEqual(@as(usize, 34), formats.len);
     for (seen) |v| try testing.expect(v);
-    // Measured 2026-09-07. Before: 1 format, 0 non-empty strings, 0 accepted.
-    try testing.expectEqual(@as(usize, 21), nonempty);
-    try testing.expectEqual(@as(usize, 12), accepted);
+    // Measured 2026-09-07 (21 / 12; before: 1 format, 0 non-empty strings, 0
+    // accepted). 2026-10-11: +24 seeds for the go-playground formats, 21 of
+    // them valid by hand-check (uuid4-as-v1, https_url-on-http and the
+    // one-character base64_raw_url are the refusals).
+    try testing.expectEqual(@as(usize, 45), nonempty);
+    try testing.expectEqual(@as(usize, 33), accepted);
 }
 
 // ── external anchor: json-schema-org/JSON-Schema-Test-Suite (format) ───────
@@ -6034,4 +7163,772 @@ test "the offset-optional date-time profile is a CHOICE, and this is where it is
     try testing.expect(!validateFormat(.date_time, "1998-12-31T23:59:59+99:00"));
     try testing.expect(!validateFormat(.date_time, "1998-13-31T23:59:59Z"));
     try testing.expect(!validateFormat(.time, "24:00:00"));
+}
+
+// ── tests: cross-field rules (2026-10-11) ───────────────────────────────────
+//
+// Every case runs on the tree AND the streaming path and must give the same
+// errors (`expectBoth`), at the (path, code) pairs the case lists.
+
+fn expectPairs(report: *const Report, want: []const [2][]const u8) !void {
+    var ok = report.errors.len == want.len;
+    if (ok) {
+        for (want) |w| {
+            var found = false;
+            for (report.errors) |e| {
+                if (std.mem.eql(u8, e.path, w[0]) and std.mem.eql(u8, e.code, w[1])) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) ok = false;
+        }
+    }
+    if (!ok) {
+        std.debug.print("\nwanted {d} errors:\n", .{want.len});
+        for (want) |w| std.debug.print("  want {s} {s}\n", .{ w[0], w[1] });
+        for (report.errors) |e| std.debug.print("  got  {s} {s} ({s})\n", .{ e.path, e.code, e.message });
+        return error.TestExpectedEqual;
+    }
+}
+
+fn expectBoth(body: []const u8, schema: []const Rule, want: []const [2][]const u8) !void {
+    var tree = try validateJson(testing.allocator, body, schema);
+    defer tree.deinit();
+    var stream = try validateJsonStreaming(testing.allocator, body, schema, .{});
+    defer stream.deinit();
+    try expectPairs(&tree, want);
+    try expectPairs(&stream, want);
+    try expectSameErrors(tree.errors, stream.errors);
+}
+
+fn expectRootBoth(body: []const u8, root: *const Rule, limits: Limits, want: []const [2][]const u8) !void {
+    var tree = try validateJsonRoot(testing.allocator, body, root, limits);
+    defer tree.deinit();
+    var stream = try validateJsonRootStreaming(testing.allocator, body, root, limits);
+    defer stream.deinit();
+    try expectPairs(&tree, want);
+    try expectPairs(&stream, want);
+    try expectSameErrors(tree.errors, stream.errors);
+}
+
+test "cross: a rule without cross entries is exactly what it was" {
+    const r: Rule = .{ .field = "x" };
+    try testing.expectEqual(@as(usize, 0), r.cross.len);
+    // The derived schema never carries cross rules.
+    const T = struct { a: u8, b: u8 };
+    inline for (comptime rulesFor(T)) |d| try testing.expectEqual(@as(usize, 0), d.cross.len);
+}
+
+const pw_schema = [_]Rule{
+    .{ .field = "password", .kind = .string, .required = true, .cross = &.{.{ .op = .eq_field, .other = "confirm" }} },
+    .{ .field = "confirm", .kind = .string },
+};
+
+test "cross: eq_field — a password and its confirmation (baked_in.go isEqField)" {
+    try expectBoth("{\"password\":\"hunter2\",\"confirm\":\"hunter2\"}", &pw_schema, &.{});
+    try expectBoth("{\"confirm\":\"hunter2\",\"password\":\"hunter2\"}", &pw_schema, &.{});
+    try expectBoth("{\"password\":\"hunter2\",\"confirm\":\"hunter3\"}", &pw_schema, &.{.{ "password", "field_mismatch" }});
+    // The sibling is missing: the comparison fails (isEqField: `!ok` -> false).
+    try expectBoth("{\"password\":\"hunter2\"}", &pw_schema, &.{.{ "password", "field_mismatch" }});
+    // An escaped string reaches the streaming walker as an allocated token.
+    try expectBoth("{\"password\":\"hunt\\u0065r2\",\"confirm\":\"hunter2\"}", &pw_schema, &.{});
+    // One is a number: unequal types are unequal (and `confirm` has its own error).
+    try expectBoth("{\"password\":\"1\",\"confirm\":1}", &pw_schema, &.{ .{ "confirm", "string_type" }, .{ "password", "field_mismatch" } });
+    // The same member twice is the tree parser's duplicate-key refusal.
+    try expectBoth("{\"password\":\"a\",\"confirm\":\"a\",\"confirm\":\"b\"}", &pw_schema, &.{.{ "", "json_invalid" }});
+}
+
+test "cross: eq_field on containers and null — never equal; null is not compared" {
+    const any_schema = [_]Rule{
+        .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} },
+        .{ .field = "b" },
+    };
+    try expectBoth("{\"a\":[1],\"b\":[1]}", &any_schema, &.{.{ "a", "field_mismatch" }});
+    try expectBoth("{\"a\":{},\"b\":{}}", &any_schema, &.{.{ "a", "field_mismatch" }});
+    try expectBoth("{\"a\":null,\"b\":null}", &any_schema, &.{});
+    try expectBoth("{\"a\":true,\"b\":true}", &any_schema, &.{});
+    try expectBoth("{\"a\":true,\"b\":false}", &any_schema, &.{.{ "a", "field_mismatch" }});
+    // 1 and 1.0 are one number.
+    try expectBoth("{\"a\":1,\"b\":1.0}", &any_schema, &.{});
+    try expectBoth("{\"a\":1,\"b\":\"1\"}", &any_schema, &.{.{ "a", "field_mismatch" }});
+    // A nullable field holding null is not compared, whatever the sibling is.
+    const nullable = [_]Rule{
+        .{ .field = "a", .kind = .int, .allow_null = true, .cross = &.{.{ .op = .eq_field, .other = "b" }} },
+        .{ .field = "b", .kind = .int },
+    };
+    try expectBoth("{\"a\":null,\"b\":2}", &nullable, &.{});
+}
+
+test "cross: ne_field — a missing or differently typed sibling passes (isNeField)" {
+    const ne = [_]Rule{
+        .{ .field = "new", .kind = .string, .cross = &.{.{ .op = .ne_field, .other = "old" }} },
+        .{ .field = "old", .kind = .string },
+    };
+    try expectBoth("{\"new\":\"a\",\"old\":\"a\"}", &ne, &.{.{ "new", "field_equal" }});
+    try expectBoth("{\"new\":\"a\",\"old\":\"b\"}", &ne, &.{});
+    try expectBoth("{\"new\":\"a\"}", &ne, &.{});
+    try expectBoth("{\"new\":\"a\",\"old\":5}", &ne, &.{.{ "old", "string_type" }});
+}
+
+const range_schema = [_]Rule{
+    .{ .field = "lo", .kind = .int },
+    .{ .field = "hi", .kind = .int, .cross = &.{.{ .op = .gte_field, .other = "lo" }} },
+    .{ .field = "above", .kind = .float, .cross = &.{.{ .op = .gt_field, .other = "lo" }} },
+    .{ .field = "below", .kind = .float, .cross = &.{ .{ .op = .lt_field, .other = "hi" }, .{ .op = .lte_field, .other = "lo" } } },
+};
+
+test "cross: gt/gte/lt/lte_field on numbers (isGtField, isGteField, isLtField, isLteField)" {
+    try expectBoth("{\"lo\":1,\"hi\":1}", &range_schema, &.{});
+    try expectBoth("{\"lo\":2,\"hi\":1}", &range_schema, &.{.{ "hi", "greater_than_equal_field" }});
+    try expectBoth("{\"lo\":1,\"above\":1}", &range_schema, &.{.{ "above", "greater_than_field" }});
+    try expectBoth("{\"lo\":1,\"above\":1.5}", &range_schema, &.{});
+    try expectBoth("{\"lo\":5,\"hi\":9,\"below\":5}", &range_schema, &.{});
+    try expectBoth("{\"lo\":5,\"hi\":9,\"below\":9.5}", &range_schema, &.{ .{ "below", "less_than_field" }, .{ "below", "less_than_equal_field" } });
+    // A sibling that is missing fails every ordering (the `!ok` of isGtField).
+    try expectBoth("{\"hi\":3}", &range_schema, &.{.{ "hi", "greater_than_equal_field" }});
+    // Integers compare exactly, not as doubles: 2^53 + 1 is above 2^53.
+    try expectBoth("{\"lo\":9007199254740992,\"hi\":9007199254740993}", &range_schema, &.{});
+    try expectBoth("{\"lo\":9007199254740993,\"hi\":9007199254740992}", &range_schema, &.{.{ "hi", "greater_than_equal_field" }});
+    // A wrong-typed field has its one type error and no comparison on top.
+    try expectBoth("{\"lo\":1,\"hi\":\"x\"}", &range_schema, &.{.{ "hi", "int_type" }});
+}
+
+test "cross: ordering strings — by length, and date-times as instants (isGtField's len / time.Time)" {
+    const s = [_]Rule{
+        .{ .field = "a", .kind = .string, .cross = &.{.{ .op = .gt_field, .other = "b" }} },
+        .{ .field = "b", .kind = .string },
+    };
+    try expectBoth("{\"a\":\"abcd\",\"b\":\"xyz\"}", &s, &.{});
+    try expectBoth("{\"a\":\"ab\",\"b\":\"xyz\"}", &s, &.{.{ "a", "greater_than_field" }});
+    // 2026-01-01T01:00+02:00 is 2025-12-31T23:00Z: BEFORE the start.
+    const span = [_]Rule{
+        .{ .field = "start", .kind = .string },
+        .{ .field = "end", .kind = .string, .cross = &.{.{ .op = .gte_field, .other = "start" }} },
+    };
+    try expectBoth("{\"start\":\"2026-01-01T00:00:00Z\",\"end\":\"2026-01-01T01:00:00+02:00\"}", &span, &.{.{ "end", "greater_than_equal_field" }});
+    try expectBoth("{\"start\":\"2026-01-01T00:00:00Z\",\"end\":\"2026-01-01T00:30:00+00:00\"}", &span, &.{});
+    try expectBoth("{\"start\":\"2026-01-01T00:00:00Z\",\"end\":\"2026-01-01T00:00:00Z\"}", &span, &.{});
+    // Fractions of a second count.
+    try expectBoth("{\"start\":\"2026-01-01T00:00:00.5Z\",\"end\":\"2026-01-01T00:00:00.25Z\"}", &span, &.{.{ "end", "greater_than_equal_field" }});
+    // Plain dates order as dates (same length, so a `len` comparison could not).
+    try expectBoth("{\"start\":\"2026-02-01\",\"end\":\"2026-01-31\"}", &span, &.{.{ "end", "greater_than_equal_field" }});
+    try expectBoth("{\"start\":\"2026-02-01\",\"end\":\"2026-02-01\"}", &span, &.{});
+    // The same instant in two offsets is equal.
+    const same = [_]Rule{
+        .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} },
+        .{ .field = "b" },
+    };
+    try expectBoth("{\"a\":\"2026-01-01T01:00:00+01:00\",\"b\":\"2026-01-01T00:00:00Z\"}", &same, &.{});
+}
+
+const req_schema = [_]Rule{
+    .{ .field = "mode", .kind = .string },
+    .{ .field = "role", .kind = .string },
+    .{ .field = "card", .kind = .string, .cross = &.{.{ .op = .required_if, .other = "mode", .value = "card" }} },
+    .{ .field = "reason", .kind = .string, .cross = &.{.{ .op = .required_unless, .other = "role", .value = "admin" }} },
+    .{ .field = "email", .kind = .string, .cross = &.{.{ .op = .required_without, .other = "phone" }} },
+    .{ .field = "phone", .kind = .string, .cross = &.{.{ .op = .required_with, .other = "email" }} },
+};
+
+test "cross: required_if / required_unless / required_with / required_without (requiredIf 2120, requiredUnless 2160, requiredWith 2219, requiredWithout 2264)" {
+    // Nothing given: `reason` (role is not admin) and `email` (phone is absent).
+    try expectBoth("{}", &req_schema, &.{ .{ "reason", "missing" }, .{ "email", "missing" } });
+    try expectBoth("{\"role\":\"admin\",\"phone\":\"1\",\"email\":\"a\"}", &req_schema, &.{});
+    try expectBoth("{\"mode\":\"card\",\"role\":\"admin\",\"email\":\"e\"}", &req_schema, &.{ .{ "card", "missing" }, .{ "phone", "missing" } });
+    try expectBoth("{\"mode\":\"cash\",\"role\":\"admin\",\"email\":\"e\",\"phone\":\"p\"}", &req_schema, &.{});
+    try expectBoth("{\"mode\":\"card\",\"role\":\"user\"}", &req_schema, &.{ .{ "card", "missing" }, .{ "reason", "missing" }, .{ "email", "missing" } });
+    // A present field is never "missing", whatever it is.
+    try expectBoth("{\"mode\":\"card\",\"card\":\"\",\"role\":\"admin\",\"phone\":\"\"}", &req_schema, &.{});
+    // The message names the sibling.
+    var r = try validateJson(testing.allocator, "{\"mode\":\"card\",\"role\":\"admin\",\"phone\":\"p\"}", &req_schema);
+    defer r.deinit();
+    try testing.expectEqualStrings("Field required when `mode` is `card`", r.find("card").?.message);
+}
+
+test "cross: required_if needs EVERY entry, required_unless ANY, required_with ANY present, required_without ANY absent" {
+    const s = [_]Rule{
+        .{ .field = "tier" },
+        .{ .field = "mode" },
+        .{ .field = "a" },
+        .{ .field = "b" },
+        .{ .field = "card", .cross = &.{ .{ .op = .required_if, .other = "mode", .value = "card" }, .{ .op = .required_if, .other = "tier", .value = "gold" } } },
+        .{ .field = "pin", .cross = &.{ .{ .op = .required_unless, .other = "mode", .value = "cash" }, .{ .op = .required_unless, .other = "tier", .value = "free" } } },
+        .{ .field = "w", .cross = &.{ .{ .op = .required_with, .other = "a" }, .{ .op = .required_with, .other = "b" } } },
+        .{ .field = "wo", .cross = &.{ .{ .op = .required_without, .other = "a" }, .{ .op = .required_without, .other = "b" } } },
+    };
+    // pin: neither exemption holds (both siblings absent) -> required; wo: a and b absent -> required.
+    try expectBoth("{}", &s, &.{ .{ "pin", "missing" }, .{ "wo", "missing" } });
+    try expectBoth("{\"mode\":\"card\",\"pin\":1,\"a\":1,\"b\":1,\"w\":1}", &s, &.{});
+    try expectBoth("{\"mode\":\"card\",\"tier\":\"gold\",\"pin\":1,\"a\":1,\"b\":1,\"w\":1}", &s, &.{.{ "card", "missing" }});
+    try expectBoth("{\"mode\":\"cash\",\"a\":1,\"b\":1,\"w\":1}", &s, &.{});
+    try expectBoth("{\"tier\":\"free\",\"a\":1,\"b\":1,\"w\":1}", &s, &.{});
+    // required_with: ONE of the siblings present is enough.
+    try expectBoth("{\"a\":1,\"pin\":1,\"wo\":1}", &s, &.{.{ "w", "missing" }});
+    try expectBoth("{\"b\":1,\"pin\":1,\"wo\":1}", &s, &.{.{ "w", "missing" }});
+    // required_without: ONE of the siblings absent is enough.
+    try expectBoth("{\"a\":1,\"pin\":1,\"w\":1}", &s, &.{.{ "wo", "missing" }});
+}
+
+test "cross: required_if compares the sibling's JSON type — number by value, boolean as \"true\"" {
+    const s = [_]Rule{
+        .{ .field = "n" },
+        .{ .field = "flag" },
+        .{ .field = "by_n", .cross = &.{.{ .op = .required_if, .other = "n", .value = "5" }} },
+        .{ .field = "by_flag", .cross = &.{.{ .op = .required_if, .other = "flag", .value = "true" }} },
+        .{ .field = "by_null", .cross = &.{.{ .op = .required_if, .other = "n", .value = "null" }} },
+    };
+    try expectBoth("{\"n\":5}", &s, &.{.{ "by_n", "missing" }});
+    try expectBoth("{\"n\":5.0}", &s, &.{.{ "by_n", "missing" }});
+    try expectBoth("{\"n\":6}", &s, &.{});
+    try expectBoth("{\"n\":\"5\"}", &s, &.{.{ "by_n", "missing" }}); // a string, by text
+    try expectBoth("{\"flag\":true}", &s, &.{.{ "by_flag", "missing" }});
+    try expectBoth("{\"flag\":false}", &s, &.{});
+    try expectBoth("{\"n\":null}", &s, &.{.{ "by_null", "missing" }});
+    try expectBoth("{\"n\":[5]}", &s, &.{}); // a container holds nothing
+    // An exponent spelling is the same number.
+    try expectBoth("{\"n\":5e0}", &s, &.{.{ "by_n", "missing" }});
+}
+
+test "cross: `required` and a presence op report one `missing`, not two" {
+    const s = [_]Rule{
+        .{ .field = "mode" },
+        .{ .field = "card", .required = true, .cross = &.{.{ .op = .required_if, .other = "mode", .value = "card" }} },
+    };
+    try expectBoth("{\"mode\":\"card\"}", &s, &.{.{ "card", "missing" }});
+    try expectBoth("{}", &s, &.{.{ "card", "missing" }});
+}
+
+fn alwaysOk(_: ?*anyopaque, _: Value) bool {
+    return true;
+}
+
+test "cross: nested objects and array items — paths, and a materialized (custom) object" {
+    const inner_rules = [_]Rule{
+        .{ .field = "x", .kind = .int },
+        .{ .field = "y", .kind = .int, .cross = &.{.{ .op = .lt_field, .other = "x" }} },
+    };
+    const row_item: Rule = .{ .field = "", .kind = .object, .fields = &.{
+        .{ .field = "a" },
+        .{ .field = "b", .cross = &.{.{ .op = .eq_field, .other = "a" }} },
+    } };
+    const body =
+        \\{"inner":{"x":1,"y":2},"rows":[{"a":1,"b":1},{"b":2,"a":1}]}
+    ;
+    const plain = [_]Rule{
+        .{ .field = "inner", .kind = .object, .fields = &inner_rules },
+        .{ .field = "rows", .kind = .array, .items = &row_item },
+    };
+    try expectBoth(body, &plain, &.{ .{ "inner.y", "less_than_field" }, .{ "rows[1].b", "field_mismatch" } });
+    // `custom` on the container materializes that subtree; the tree code decides there.
+    const mat = [_]Rule{
+        .{ .field = "inner", .kind = .object, .fields = &inner_rules, .custom = .{ .check = alwaysOk } },
+        .{ .field = "rows", .kind = .array, .items = &row_item },
+    };
+    try expectBoth(body, &mat, &.{ .{ "inner.y", "less_than_field" }, .{ "rows[1].b", "field_mismatch" } });
+    // A cross rule on a nested object whose parent is also a sibling of a captured member.
+    const deep = [_]Rule{
+        .{ .field = "pw", .kind = .string, .cross = &.{.{ .op = .eq_field, .other = "pw2" }} },
+        .{ .field = "pw2" },
+        .{ .field = "inner", .kind = .object, .fields = &inner_rules },
+    };
+    try expectBoth("{\"inner\":{\"x\":3,\"y\":1},\"pw\":\"a\",\"pw2\":\"b\"}", &deep, &.{.{ "pw", "field_mismatch" }});
+}
+
+test "cross: a captured sibling that is a container (streaming marks it, tree sees it)" {
+    const s = [_]Rule{
+        .{ .field = "a", .cross = &.{.{ .op = .ne_field, .other = "b" }} },
+        .{ .field = "b" },
+    };
+    try expectBoth("{\"b\":{\"k\":[1,2,{\"z\":null}]},\"a\":\"x\"}", &s, &.{});
+    try expectBoth("{\"b\":[1,2],\"a\":[1,2]}", &s, &.{});
+}
+
+test "cross: both rule sets of a typed body (derived + validate_rules) with cross rules agree on both paths" {
+    const Signup = struct {
+        password: []const u8,
+        confirm: []const u8,
+        newsletter: bool = false,
+        email: ?[]const u8 = null,
+        pub const validate_rules: []const Rule = &.{
+            .{ .field = "confirm", .cross = &.{.{ .op = .eq_field, .other = "password" }} },
+            .{ .field = "email", .kind = .string, .allow_null = true, .cross = &.{.{ .op = .required_if, .other = "newsletter", .value = "true" }} },
+        };
+    };
+    const bodies = [_][]const u8{
+        \\{"password":"a","confirm":"a"}
+        ,
+        \\{"confirm":"b","password":"a"}
+        ,
+        \\{"password":"a","confirm":"a","newsletter":true}
+        ,
+        \\{"password":"a","confirm":"a","newsletter":true,"email":"x@y.co"}
+        ,
+        \\{"password":"a","confirm":"a","newsletter":true,"email":null}
+        ,
+        \\{"password":1}
+        ,
+    };
+    for (bodies) |body| try expectTypedAgrees(Signup, body);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r = try parseIntoLeaky(Signup, arena.allocator(), bodies[1], .{});
+    try testing.expect(r == .invalid);
+    try testing.expectEqual(@as(usize, 1), r.invalid.errors.len);
+    try testing.expectEqualStrings("confirm", r.invalid.errors[0].path);
+    try testing.expectEqualStrings("field_mismatch", r.invalid.errors[0].code);
+    const ok = try parseIntoLeaky(Signup, arena.allocator(), bodies[0], .{});
+    try testing.expect(ok == .ok);
+    try testing.expectEqualStrings("a", ok.ok.confirm);
+}
+
+test "cross: streaming allocation failures at every point, no leak" {
+    const S = struct {
+        fn run(gpa: Allocator, body: []const u8) !void {
+            var r = try validateJsonStreaming(gpa, body, &req_schema, .{});
+            r.deinit();
+            var r2 = try validateJsonStreaming(gpa, body, &pw_schema, .{});
+            r2.deinit();
+        }
+    };
+    const bodies = [_][]const u8{
+        \\{"password":"hunt\u0065r2","confirm":"hunter3","mode":"card","role":"user","phone":"5\u0030"}
+        ,
+        \\{"mode":{"k":[1]},"role":"x","password":5}
+        ,
+    };
+    for (bodies) |body| try testing.checkAllAllocationFailures(testing.allocator, S.run, .{body});
+}
+
+fn expectJsonEq(want: []const u8, rules: []const Rule) !void {
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonSchema(rules, &w);
+    try testing.expectEqualStrings(want, w.buffered());
+}
+
+test "cross: the schema export — required_with is dependentRequired, the other presence ops are allOf items" {
+    try expectJsonEq(
+        \\{"type":"object","properties":{"email":{"type":"string"},"phone":{"type":"string"}},"dependentRequired":{"email":["phone"]}}
+    , &.{
+        .{ .field = "email", .kind = .string },
+        .{ .field = "phone", .kind = .string, .cross = &.{.{ .op = .required_with, .other = "email" }} },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"mode":{"type":"string"},"card":{"type":"string"}},"allOf":[{"if":{"allOf":[{"properties":{"mode":{"const":"card"}},"required":["mode"]}]},"then":{"required":["card"]}}]}
+    , &.{
+        .{ .field = "mode", .kind = .string },
+        .{ .field = "card", .kind = .string, .cross = &.{.{ .op = .required_if, .other = "mode", .value = "card" }} },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"role":{"type":"string"},"reason":{"type":"string"}},"allOf":[{"anyOf":[{"required":["reason"]},{"properties":{"role":{"const":"admin"}},"required":["role"]}]}]}
+    , &.{
+        .{ .field = "role", .kind = .string },
+        .{ .field = "reason", .kind = .string, .cross = &.{.{ .op = .required_unless, .other = "role", .value = "admin" }} },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"email":{"type":"string"},"phone":{"type":"string"}},"allOf":[{"anyOf":[{"required":["email"]},{"required":["phone"]}]}]}
+    , &.{
+        .{ .field = "email", .kind = .string, .cross = &.{.{ .op = .required_without, .other = "phone" }} },
+        .{ .field = "phone", .kind = .string },
+    });
+    // A sibling with no rule of its own: every JSON value that would hold.
+    try expectJsonEq(
+        \\{"type":"object","properties":{"c":{}},"allOf":[{"if":{"allOf":[{"properties":{"n":{"enum":["5",5,false]}},"required":["n"]}]},"then":{"required":["c"]}}]}
+    , &.{
+        .{ .field = "c", .cross = &.{.{ .op = .required_if, .other = "n", .value = "5" }} },
+    });
+    // The comparison ops have no 2020-12 form: nothing is exported for them.
+    try expectJsonEq(
+        \\{"type":"object","properties":{"a":{},"b":{}}}
+    , &.{
+        .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} },
+        .{ .field = "b" },
+    });
+}
+
+// ── tests: a JSON array as the document root ────────────────────────────────
+
+const batch_item: Rule = .{ .field = "", .kind = .object, .fields = &.{
+    .{ .field = "email", .kind = .string, .required = true, .format = .email },
+    .{ .field = "age", .kind = .int, .min = 0 },
+} };
+const batch_root: Rule = .{ .field = "", .kind = .array, .min_len = 1, .max_len = 3, .items = &batch_item };
+
+test "root array: validateJsonRoot — batch items, [i].field paths, tree == streaming" {
+    try expectRootBoth("[{\"email\":\"a@b.co\"},{\"email\":\"c@d.org\",\"age\":3}]", &batch_root, .{}, &.{});
+    try expectRootBoth(
+        "[{\"email\":\"a@b.co\"},{\"age\":-1},{\"email\":\"nope\"}]",
+        &batch_root,
+        .{},
+        &.{ .{ "[1].email", "missing" }, .{ "[1].age", "greater_than_equal" }, .{ "[2].email", "format" } },
+    );
+    // Not an array.
+    try expectRootBoth("{\"email\":\"a@b.co\"}", &batch_root, .{}, &.{.{ "", "array_type" }});
+    try expectRootBoth("null", &batch_root, .{}, &.{.{ "", "array_type" }});
+    // Lengths of the root array itself.
+    try expectRootBoth("[]", &batch_root, .{}, &.{.{ "", "too_short" }});
+    try expectRootBoth("[{\"email\":\"a@b.co\"},{\"email\":\"a@b.co\"},{\"email\":\"a@b.co\"},{\"email\":\"a@b.co\"}]", &batch_root, .{}, &.{.{ "", "too_long" }});
+    // An item that is not an object.
+    try expectRootBoth("[1]", &batch_root, .{}, &.{.{ "[0]", "object_type" }});
+    // Escapes in keys and values.
+    try expectRootBoth("[{\"em\\u0061il\":\"a@b.co\"}]", &batch_root, .{}, &.{});
+}
+
+test "root array: limits are enforced and malformed JSON is json_invalid, on both paths" {
+    try expectRootBoth("[{\"email\":\"a@b.co\"},{\"email\":\"a@b.co\"}]", &batch_root, .{ .max_array_elements = 1 }, &.{.{ "", "array_too_large" }});
+    try expectRootBoth("[[[[1]]]]", &batch_root, .{ .max_depth = 3 }, &.{.{ "", "too_deep" }});
+    try expectRootBoth("[{\"email\"", &batch_root, .{}, &.{.{ "", "json_invalid" }});
+    try expectRootBoth("", &batch_root, .{}, &.{.{ "", "json_invalid" }});
+    // One duplicate key anywhere in the array is the parser's refusal.
+    try expectRootBoth("[{\"email\":\"a@b.co\",\"email\":\"a@b.co\"}]", &batch_root, .{}, &.{.{ "", "json_invalid" }});
+}
+
+test "root array: scalar items, nested arrays, and a scalar root" {
+    const ints: Rule = .{ .field = "", .kind = .array, .items = &.{ .field = "", .kind = .int, .min = 0 } };
+    try expectRootBoth("[1,2,3]", &ints, .{}, &.{});
+    try expectRootBoth("[1,\"x\",-5,2.5]", &ints, .{}, &.{ .{ "[1]", "int_type" }, .{ "[2]", "greater_than_equal" }, .{ "[3]", "int_type" } });
+    const grid: Rule = .{ .field = "", .kind = .array, .items = &ints };
+    try expectRootBoth("[[1],[2,\"x\"],7]", &grid, .{}, &.{ .{ "[1][1]", "int_type" }, .{ "[2]", "array_type" } });
+    const one: Rule = .{ .field = "", .kind = .string, .min_len = 2 };
+    try expectRootBoth("\"a\"", &one, .{}, &.{.{ "", "string_too_short" }});
+    try expectRootBoth("5", &one, .{}, &.{.{ "", "string_type" }});
+    // An object root through the same function answers as validateJson does.
+    const obj: Rule = .{ .field = "", .kind = .object, .fields = &.{.{ .field = "n", .kind = .int, .required = true }} };
+    try expectRootBoth("[]", &obj, .{}, &.{.{ "", "object_type" }});
+    try expectRootBoth("{}", &obj, .{}, &.{.{ "n", "missing" }});
+}
+
+const BatchRow = struct { id: u32, name: []const u8, note: ?[]const u8 = null };
+
+test "root array: a typed body — parseInto / parseIntoLeaky decode []const T and report [i].field" {
+    const T = []const BatchRow;
+    const good =
+        \\[{"id":1,"name":"a"},{"id":2,"name":"b\u0021","note":"n"}]
+    ;
+    try expectTypedAgrees(T, good);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r = try parseIntoLeaky(T, arena.allocator(), good, .{});
+    try testing.expect(r == .ok);
+    try testing.expectEqual(@as(usize, 2), r.ok.len);
+    try testing.expectEqualStrings("b!", r.ok[1].name);
+    try testing.expectEqualStrings("n", r.ok[1].note.?);
+
+    const bad =
+        \\[{"id":1,"name":"a"},{"id":"x"},{"name":7}]
+    ;
+    try expectTypedAgrees(T, bad);
+    const r2 = try parseIntoLeaky(T, arena.allocator(), bad, .{});
+    try testing.expect(r2 == .invalid);
+    try expectPairs(&r2.invalid, &.{ .{ "[1].id", "int_type" }, .{ "[1].name", "missing" }, .{ "[2].id", "missing" }, .{ "[2].name", "string_type" } });
+
+    // The tree path says the same.
+    var tree = try parseInto(T, testing.allocator, bad);
+    defer tree.deinit();
+    try testing.expect(tree == .invalid);
+    try expectPairs(&tree.invalid, &.{ .{ "[1].id", "int_type" }, .{ "[1].name", "missing" }, .{ "[2].id", "missing" }, .{ "[2].name", "string_type" } });
+
+    // Not an array, not JSON, empty: one error each.
+    try expectTypedAgrees(T, "{\"id\":1}");
+    try expectTypedAgrees(T, "[");
+    try expectTypedAgrees(T, "[]");
+    // A fixed-size array root carries its length as bounds.
+    try expectTypedAgrees([2]BatchRow, "[{\"id\":1,\"name\":\"a\"},{\"id\":2,\"name\":\"b\"}]");
+    try expectTypedAgrees([2]BatchRow, "[{\"id\":1,\"name\":\"a\"}]");
+    // Array limits stop the typed paths too.
+    var capped = try parseIntoLeaky(T, arena.allocator(), good, .{ .max_array_elements = 1 });
+    try testing.expect(capped == .invalid);
+    try testing.expectEqualStrings("array_too_large", capped.invalid.errors[0].code);
+    capped.invalid.deinit();
+}
+
+test "root array: the exported schema — writeJsonSchemaRoot and writeJsonSchemaFor" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonSchemaRoot(&batch_root, &w);
+    try testing.expectEqualStrings(
+        \\{"type":"array","minItems":1,"maxItems":3,"items":{"type":"object","properties":{"email":{"type":"string","format":"email"},"age":{"type":"integer","minimum":0}},"required":["email"]}}
+    , w.buffered());
+
+    var w2: std.Io.Writer = .fixed(&buf);
+    try writeJsonSchemaFor([]const BatchRow, &w2);
+    try testing.expectEqualStrings(
+        \\{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","minimum":0,"maximum":4294967295},"name":{"type":"string"},"note":{"type":["string","null"]}},"required":["id","name"]}}
+    , w2.buffered());
+}
+
+// ── tests: the go-playground formats (2026-10-11) ───────────────────────────
+
+test "format truth table: uuid3 / uuid4 / uuid5 / uuid7 — version and variant (baked_in.go 650-668, regexes.go)" {
+    try expectFormat(.uuid3, &.{"6fa459ea-ee8a-3ca4-894e-db77e160355e"}, &.{
+        "6FA459EA-EE8A-3CA4-894E-DB77E160355E", // go's regex is lowercase only
+        "6fa459ea-ee8a-4ca4-894e-db77e160355e",
+        "6fa459eaee8a3ca4894edb77e160355e",
+        "",
+    });
+    try expectFormat(.uuid4, &.{
+        "550e8400-e29b-41d4-a716-446655440000",
+        "550e8400-e29b-41d4-8716-446655440000",
+        "550e8400-e29b-41d4-b716-446655440000",
+    }, &.{
+        "550e8400-e29b-41d4-c716-446655440000",
+        "550e8400-e29b-41d4-A716-446655440000",
+        "550E8400-e29b-41d4-a716-446655440000",
+        "550e8400-e29b-51d4-a716-446655440000",
+    });
+    try expectFormat(.uuid5, &.{"886313e1-3b8a-5372-9b90-0c9aee199e5d"}, &.{
+        "886313e1-3b8a-4372-9b90-0c9aee199e5d",
+        "886313e1-3b8a-5372-7b90-0c9aee199e5d",
+    });
+    try expectFormat(.uuid7, &.{
+        "018f3a2c-7b1e-7d3a-8c1f-5b2e9a4d6c10",
+        "018F3A2C-7B1E-7D3A-BC1F-5B2E9A4D6C10",
+    }, &.{
+        "018f3a2c-7b1e-4d3a-8c1f-5b2e9a4d6c10",
+        "018f3a2c-7b1e-7d3a-cc1f-5b2e9a4d6c10",
+    });
+    try expectFormat(.uuid_rfc4122, &.{
+        "00000000-0000-0000-0000-000000000000",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+        "F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6",
+        "018f3a2c-7b1e-7d3a-8c1f-5b2e9a4d6c10",
+    }, &.{
+        "f81d4fae-7dec-91d0-a765-00a0c91e6bf6",
+        "f81d4fae-7dec-11d0-c765-00a0c91e6bf6",
+        "f81d4fae-7dec-01d0-a765-00a0c91e6bf6",
+        "not-a-uuid",
+    });
+}
+
+test "format truth table: http_url / https_url (baked_in.go isHttpURL 1654)" {
+    try expectFormat(.http_url, &.{
+        "http://example.com",
+        "HTTPS://Example.COM/path?q=1#frag",
+        "https://user:pw@example.com:8443/a/b",
+        "http://127.0.0.1:80/",
+        "http://[2001:db8::1]:8080/x",
+        "http://localhost",
+        "http://example.com:/",
+    }, &.{
+        "ftp://example.com",
+        "http:example.com",
+        "http://",
+        "http:///path",
+        "http://exa mple.com",
+        "//example.com",
+        "example.com",
+        "http://example.com:80a/",
+        "http://[::1",
+        "http://[1.2.3.4]/",
+        "mailto:a@b.co",
+        "http://user@/",
+        "",
+    });
+    try expectFormat(.https_url, &.{"https://example.com/x"}, &.{ "http://example.com/x", "https:/x" });
+}
+
+test "format truth table: base64 / base64_url / base64_raw_url (baked_in.go 1525-1540)" {
+    try expectFormat(.base64, &.{ "SGVsbG8=", "SGVsbG8h", "SGk=", "QQ==", "AAAA", "+/+/" }, &.{
+        "", "SGVsbG8", "SGVsbG8==", "=SGVsbG8", "SG=k", "A===", "====", "SGVs bG8=", "-_-_",
+    });
+    try expectFormat(.base64_url, &.{ "SGVsbG8_", "-_-_", "SGk=", "QQ==" }, &.{ "+/+/", "SGVsbG8", "" });
+    try expectFormat(.base64_raw_url, &.{ "SGVsbG8", "SGk", "QQ", "SGVs", "-_-_" }, &.{ "", "S", "SGVsbG8_=", "SGk=", "SGVsb" });
+}
+
+test "format truth table: hex, e164, alpha, alphanumeric, numeric, ascii (baked_in.go 1947 1903 1977 1972 1962 636)" {
+    try expectFormat(.hex, &.{ "a", "0", "DEADbeef", "0x1f", "0X1F", "00" }, &.{ "", "0x", "0xg", "xyz", "12 34", "0x0x1" });
+    try expectFormat(.e164, &.{ "+14155552671", "14155552671", "+420123456789", "12345678" }, &.{
+        "+0123456789", "1234567", "+1234567890123456", "+1 415 555 2671", "++14155552671", "+", "", "+1415555267a",
+    });
+    try expectFormat(.alpha, &.{ "a", "Hello", "ZZ" }, &.{ "", "a1", "a b", "é", "hello!" });
+    try expectFormat(.alphanumeric, &.{ "a1", "123", "Abc9" }, &.{ "", "a-1", " ", "é1" });
+    try expectFormat(.numeric, &.{ "0", "-12", "+3.5", "10.25" }, &.{ "", "-", "1.", "1.2.3", ".5", "1e5", "a" });
+    try expectFormat(.ascii, &.{ "", "plain", "tab\there", "\x00\x7f" }, &.{ "é", "\x80", "ok\xff" });
+}
+
+test "format truth table: lowercase / uppercase (isLowercase 3063, isUppercase 3077)" {
+    try expectFormat(.lowercase, &.{ "abc", "abc123 !", "ß", "é", "µ", "日本" }, &.{ "", "Abc", "ABC", "aBc", "É", "\xff" });
+    try expectFormat(.uppercase, &.{ "ABC", "ABC 123", "É", "日本" }, &.{ "", "Abc", "abc", "é", "µ", "\xff" });
+}
+
+test "format truth table: jwt and semver (isJWT 3021, regexes.go semverRegexString)" {
+    try expectFormat(.jwt, &.{ "a.b.c", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.", "a-_.B_-.0" }, &.{ "", "a.b", "a.b.c.d", ".b.c", "a..c", "a.b.c=", "a b.c.d" });
+    try expectFormat(.semver, &.{
+        "0.0.0",                "1.2.3",                      "10.20.30",       "1.0.0-alpha",
+        "1.0.0-alpha.1",        "1.0.0-0.3.7",                "1.0.0-x.7.z.92", "1.0.0-alpha+001",
+        "1.0.0+20130313144700", "1.0.0-beta+exp.sha.5114f85", "1.0.0-a-b",
+    }, &.{
+        "",         "1",              "1.2",    "1.2.3.4",    "01.2.3", "1.02.3",        "1.2.03", "1.2.3-",
+        "1.2.3-01", "1.2.3-alpha..1", "1.2.3+", "1.2.3+a..b", "v1.2.3", "1.2.3-alpha_1", "1.2.a",
+    });
+}
+
+test "format truth table: cidr and mac (isCIDR 516, isMAC 495 -> net.ParseCIDR / net.ParseMAC)" {
+    try expectFormat(.cidr, &.{ "10.0.0.0/8", "192.0.2.5/24", "0.0.0.0/0", "2001:db8::/32", "::1/128", "::/0" }, &.{
+        "10.0.0.0", "10.0.0.0/33", "2001:db8::/129", "10.0.0.0/", "10.0.0.0/08", "10.0.0.256/8", "/8", "10.0.0.0/8/9", "10.0.0.0/-1", "fe80::1%eth0/64",
+    });
+    try expectFormat(.mac, &.{
+        "00:00:5e:00:53:01",
+        "02:00:5e:10:00:00:00:01",
+        "00:00:00:00:fe:80:00:00:00:00:00:00:02:00:5e:10:00:00:00:01",
+        "00-00-5e-00-53-01",
+        "0000.5e00.5301",
+        "0200.5e10.0000.0001",
+        "00005e005301",
+        "AA:BB:CC:DD:EE:FF",
+    }, &.{
+        "",                  "00:00:5e:00:53", "00:00:5e:00:53:01:02", "00:00:5e:00:53:0g",
+        "00:00-5e:00:53:01", "0000.5e00.53",   "00005e00530",          "00:00:5e:00:53:01:",
+        "gg:00:5e:00:53:01",
+    });
+}
+
+test "format rule: a go-playground format on a rule reports the `format` code on both paths" {
+    const s = [_]Rule{
+        .{ .field = "id", .kind = .string, .format = .uuid4 },
+        .{ .field = "site", .kind = .string, .format = .https_url },
+    };
+    try expectBoth("{\"id\":\"550e8400-e29b-41d4-a716-446655440000\",\"site\":\"https://x.org\"}", &s, &.{});
+    try expectBoth("{\"id\":\"550e8400-e29b-11d4-a716-446655440000\",\"site\":\"http://x.org\"}", &s, &.{ .{ "id", "format" }, .{ "site", "format" } });
+}
+
+// ── fuzz: cross-field rules and array roots, tree == streaming ──────────────
+
+const cross_schema = [_]Rule{
+    .{ .field = "password", .kind = .string },
+    .{ .field = "confirm", .cross = &.{.{ .op = .eq_field, .other = "password" }} },
+    .{ .field = "lo", .kind = .int },
+    .{ .field = "hi", .kind = .int, .cross = &.{ .{ .op = .gte_field, .other = "lo" }, .{ .op = .ne_field, .other = "password" } } },
+    .{ .field = "mode", .kind = .string },
+    .{ .field = "card", .cross = &.{.{ .op = .required_if, .other = "mode", .value = "card" }} },
+    .{ .field = "email", .kind = .string, .cross = &.{.{ .op = .required_without, .other = "phone" }} },
+    .{ .field = "phone", .kind = .string, .cross = &.{.{ .op = .required_with, .other = "email" }} },
+    .{ .field = "inner", .kind = .object, .fields = &.{
+        .{ .field = "x", .kind = .int },
+        .{ .field = "y", .cross = &.{.{ .op = .lt_field, .other = "x" }} },
+    } },
+    .{ .field = "rows", .kind = .array, .items = &.{ .field = "", .kind = .object, .fields = &.{
+        .{ .field = "a" },
+        .{ .field = "b", .cross = &.{.{ .op = .eq_field, .other = "a" }} },
+    } } },
+};
+
+const cross_array_root: Rule = .{ .field = "", .kind = .array, .max_len = 3, .items = &.{ .field = "", .kind = .object, .fields = &cross_schema } };
+
+const cross_fields = [_][]const u8{ "password", "confirm", "lo", "hi", "mode", "card", "email", "phone", "inner", "rows" };
+
+/// Octet 0 = 0: the rest is the body. Otherwise a script: a bitmask word over
+/// `cross_fields`, then one octet per present field choosing a value from a
+/// small pool, so equal and unequal siblings of every JSON type come up.
+fn buildCrossBody(seed: []const u8, buf: []u8) []const u8 {
+    if (seed.len == 0) return buf[0..0];
+    if (seed[0] == 0) {
+        const body = seed[1..];
+        const n = @min(body.len, buf.len);
+        @memcpy(buf[0..n], body[0..n]);
+        return buf[0..n];
+    }
+    var script: fuzzseed.Cursor = .{ .bytes = seed[1..] };
+    const present = script.word();
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeByte('{') catch return buf[0..0];
+    var first = true;
+    for (cross_fields, 0..) |f, i| {
+        if (present & (@as(u16, 1) << @intCast(i)) == 0) continue;
+        if (!first) w.writeByte(',') catch return w.buffered();
+        first = false;
+        w.print("\"{s}\":", .{f}) catch return w.buffered();
+        const written = switch (script.ranged(0, 9)) {
+            0 => w.writeAll("1"),
+            1 => w.writeAll("2"),
+            2 => w.writeAll("2.0"),
+            3 => w.writeAll("\"card\""),
+            4 => w.writeAll("\"a\""),
+            5 => w.writeAll("\"2026-01-01T00:00:00Z\""),
+            6 => w.writeAll("true"),
+            7 => w.writeAll("null"),
+            8 => w.writeAll("[1]"),
+            else => w.writeAll(if (i == 8) "{\"x\":2,\"y\":1}" else "{\"a\":1,\"b\":1}"),
+        };
+        written catch return w.buffered();
+    }
+    w.writeByte('}') catch return w.buffered();
+    return w.buffered();
+}
+
+const cross_seeds = [_][]const u8{
+    fuzzseed.seed("\x00" ++ "{}"),
+    fuzzseed.seed("\x00" ++ "{\"password\":\"a\",\"confirm\":\"a\"}"),
+    fuzzseed.seed("\x00" ++ "{\"password\":\"a\",\"confirm\":\"b\",\"lo\":2,\"hi\":1}"),
+    fuzzseed.seed("\x00" ++ "{\"mode\":\"card\",\"email\":\"e\",\"inner\":{\"x\":1,\"y\":5},\"rows\":[{\"a\":1,\"b\":2}]}"),
+    fuzzseed.seed("\x01" ++ "\x03\xff" ++ "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09"),
+    fuzzseed.seed("\x01" ++ "\x01\x5a" ++ "\x04\x04\x00\x01\x03\x03\x09\x08"),
+};
+
+fn isCrossCode(code: []const u8) bool {
+    const codes = [_][]const u8{ "field_mismatch", "field_equal", "greater_than_field", "greater_than_equal_field", "less_than_field", "less_than_equal_field" };
+    for (codes) |c| if (std.mem.eql(u8, c, code)) return true;
+    return false;
+}
+
+fn crossHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var raw: [1 + json_buf_len]u8 = undefined;
+    const n: usize = src.slice(&raw);
+    var buf: [json_buf_len]u8 = undefined;
+    const body = buildCrossBody(raw[0..n], &buf);
+    try expectSchemaAgrees(body, &cross_schema);
+    // The same object as every element of a root array.
+    var wrapped: [2 * json_buf_len + 4]u8 = undefined;
+    if (std.fmt.bufPrint(&wrapped, "[{s},{s}]", .{ body, body })) |arr| {
+        var tree = try validateJsonRoot(testing.allocator, arr, &cross_array_root, .{});
+        defer tree.deinit();
+        var stream = try validateJsonRootStreaming(testing.allocator, arr, &cross_array_root, .{});
+        defer stream.deinit();
+        try expectSameErrors(tree.errors, stream.errors);
+    } else |_| {}
+    var r = validateJson(testing.allocator, body, &cross_schema) catch return;
+    defer r.deinit();
+    for (r.errors) |e| {
+        if (isCrossCode(e.code) or std.mem.eql(u8, e.code, "missing")) {
+            fz.mark(.cross_violations);
+            break;
+        }
+    }
+    fz.mark(.cross_agreed);
+}
+
+test "fuzz: cross-field rules and array roots — the streaming path agrees with the tree path" {
+    try testing.fuzz({}, fuzzCrossAgrees, .{ .corpus = &cross_seeds });
+}
+
+fn fuzzCrossAgrees(_: void, smith: *std.testing.Smith) !void {
+    var raw: [1 + json_buf_len]u8 = undefined;
+    const n: usize = smith.slice(&raw);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = raw[0..n] } };
+    try crossHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
+test "fuzz driver: VALIDATE_FUZZ (cross)" {
+    try fuzz_driver.run(crossHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "cross" });
+}
+
+test "fuzz: the cross corpus reaches cross-field violations" {
+    var hit_corpus = false;
+    for (cross_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [1 + json_buf_len]u8 = undefined;
+        const n: usize = smith.slice(&raw);
+        var buf: [json_buf_len]u8 = undefined;
+        const body = buildCrossBody(raw[0..n], &buf);
+        var r = try validateJson(testing.allocator, body, &cross_schema);
+        defer r.deinit();
+        for (r.errors) |e| if (isCrossCode(e.code)) {
+            hit_corpus = true;
+        };
+    }
+    try testing.expect(hit_corpus);
 }
