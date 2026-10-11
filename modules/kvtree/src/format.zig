@@ -23,7 +23,8 @@
 //!
 //! A node is a slotted page: an 8-byte header, then a `count`-entry slot
 //! directory of 2-byte cell offsets kept in ascending key order, then the
-//! variable-length cells packed from the end of the page toward the front.
+//! variable-length cells packed against the end of the page (a leaf's in
+//! ascending key order; readers only follow the slot offsets).
 
 const std = @import("std");
 const crc32 = @import("crc32");
@@ -346,8 +347,21 @@ pub const Leaf = struct {
         return std.mem.readInt(u32, self.valAt(i)[0..ovf_ref_len], .little);
     }
 
+    /// Entry `i` in one decode of its cell header — what `keyAt`, `valAt`,
+    /// `ovfLen` and `isBucket` would each re-read from the slot directory (a
+    /// cursor's `next` takes every entry this way).
     pub fn entryAt(self: Leaf, i: usize) Entry {
-        return .{ .key = self.keyAt(i), .val = self.valAt(i), .ovf_len = self.ovfLen(i), .bucket = self.isBucket(i) };
+        const o = slotOffset(self.page, i);
+        const klen = std.mem.readInt(u16, self.page[o .. o + 2][0..2], .little);
+        const raw = std.mem.readInt(u32, self.page[o + 2 .. o + 6][0..4], .little);
+        const ovf = raw & ovf_flag != 0;
+        const vlen: usize = if (ovf) ovf_ref_len else raw & ~bucket_flag;
+        return .{
+            .key = self.page[o + 6 ..][0..klen],
+            .val = self.page[o + 6 + klen ..][0..vlen],
+            .ovf_len = if (ovf) raw & ~ovf_flag else null,
+            .bucket = !ovf and raw & bucket_flag != 0,
+        };
     }
 
     pub fn search(self: Leaf, key: []const u8) Search {
@@ -404,7 +418,7 @@ pub const Branch = struct {
         var hi: usize = self.count();
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            switch (std.mem.order(u8, self.keyAt(mid), key)) {
+            switch (orderKeys(self.keyAt(mid), key)) {
                 .lt, .eq => lo = mid + 1,
                 .gt => hi = mid,
             }
@@ -491,13 +505,32 @@ pub fn leafViewSafe(page: *const [page_size]u8) ?Leaf {
     return Leaf.init(page);
 }
 
+/// Bytewise lexicographic order of two keys, exactly `std.mem.order(u8, a, b)`,
+/// eight bytes per step: a big-endian load turns the first differing byte of a
+/// word into the word's order. Every descent and every commit fold compares
+/// keys; std's byte loop was the largest single cost of a resident `get`
+/// (perf, 2026-10-11).
+pub fn orderKeys(a: []const u8, b: []const u8) std.math.Order {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const x = std.mem.readInt(u64, a[i..][0..8], .big);
+        const y = std.mem.readInt(u64, b[i..][0..8], .big);
+        if (x != y) return std.math.order(x, y);
+    }
+    while (i < n) : (i += 1) {
+        if (a[i] != b[i]) return std.math.order(a[i], b[i]);
+    }
+    return std.math.order(a.len, b.len);
+}
+
 /// Generic ascending binary search over a leaf's/branch's key directory.
 fn binarySearch(comptime V: type, view: V, key: []const u8) Search {
     var lo: usize = 0;
     var hi: usize = view.count();
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        const cmp = std.mem.order(u8, view.keyAt(mid), key);
+        const cmp = orderKeys(view.keyAt(mid), key);
         switch (cmp) {
             .lt => lo = mid + 1,
             .gt => hi = mid,
@@ -631,7 +664,7 @@ pub const LeafBuilder = struct {
         var hi: usize = self.entries.items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            switch (std.mem.order(u8, self.entries.items[mid].key, key)) {
+            switch (orderKeys(self.entries.items[mid].key, key)) {
                 .lt => lo = mid + 1,
                 .gt => hi = mid,
                 .eq => return .{ .found = true, .index = @intCast(mid) },
@@ -809,10 +842,17 @@ fn writeHeader(page: *[page_size]u8, kind: NodeKind, count: u16, leftmost: PageI
 
 fn encodeLeaf(page: *[page_size]u8, entries: []const Entry) void {
     writeHeader(page, .leaf, @intCast(entries.len), 0);
-    var tail: usize = page_size; // cells packed from the end downward
+    // The cells sit at the end of the page, as always, but in ASCENDING key
+    // order: a cursor then walks a leaf's memory forward, the direction the
+    // hardware prefetcher follows best (a resident scan was 69 % first-touch
+    // misses on cells laid out downward, perf 2026-10-11). Readers go through
+    // the slot directory, so the order is no part of the format.
+    var total: usize = 0;
+    for (entries) |e| total += leafCellBytes(e.key.len, e.val.len);
+    var tail: usize = page_size - total;
     for (entries, 0..) |e, i| {
         const cell = leafCellBytes(e.key.len, e.val.len);
-        tail -= cell;
+        defer tail += cell;
         std.mem.writeInt(u16, page[tail .. tail + 2][0..2], @intCast(e.key.len), .little);
         const vlen: u32 = if (e.ovf_len) |l| ovf_flag | l else if (e.bucket) bucket_flag | @as(u32, @intCast(e.val.len)) else @intCast(e.val.len);
         std.mem.writeInt(u32, page[tail + 2 .. tail + 6][0..4], vlen, .little);
@@ -1110,4 +1150,24 @@ test "the inline limit is the page: a cell that exactly fills an empty leaf stay
     const vlen = page_size - hdr_len - slot_len - 6 - 1;
     try testing.expect(fitsInline(1, vlen));
     try testing.expect(!fitsInline(1, vlen + 1));
+}
+
+test "orderKeys is std.mem.order: every length pair to 19, a difference at every position" {
+    // Byte values that break a signed or little-endian word compare (0x7f/0x80)
+    // and the extremes; a difference planted at each position, including the
+    // word tail, and every prefix relation (equal, shorter, longer).
+    const vals = [_]u8{ 0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff };
+    var a: [19]u8 = undefined;
+    var b: [19]u8 = undefined;
+    for (0..a.len + 1) |la| for (0..b.len + 1) |lb| for (vals) |fill| {
+        @memset(&a, fill);
+        @memset(&b, fill);
+        try testing.expectEqual(std.mem.order(u8, a[0..la], b[0..lb]), orderKeys(a[0..la], b[0..lb]));
+        for (0..@min(la, lb)) |pos| for (vals) |other| {
+            b[pos] = other;
+            try testing.expectEqual(std.mem.order(u8, a[0..la], b[0..lb]), orderKeys(a[0..la], b[0..lb]));
+            try testing.expectEqual(std.mem.order(u8, b[0..lb], a[0..la]), orderKeys(b[0..lb], a[0..la]));
+            b[pos] = fill;
+        };
+    };
 }

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Forwards `kv.Storage.syncData` (`fdatasync`) to the backend instead of letting it widen into a full `sync`; kvtree's commit barrier uses it. New test: kvtree's cursor borrows its frames through this cache, holds no more than its depth, reads what the copying cursor reads across a commit and under eviction pressure, and gives every borrow back.
 - **2026-10-11** — Forwards the new optional `kv.Storage.tryLockShared` to the backend, like `tryLockExclusive` (the lock belongs to the real file).
 
 - **2026-10-12** — Several open handles per path. Pages are keyed by a per-path file id (assigned at `open`, refcounted across handles) instead of the backend handle, so a write, truncate or truncating open through one handle is seen through the others. `rename`, `delete` and `create_truncate` open no longer clear the whole cache: they drop only the affected files' pages (a renamed file keeps its pages under the new name); the last `close` of a file drops its pages. Residual precondition: open a file under one path spelling. Model-fuzz now opens two handles per path and renames/deletes across open handles. Scope core -> parity.

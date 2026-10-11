@@ -1154,9 +1154,14 @@ fn readOverflow(pager: *Pager, first: PageId, out: []u8) (kv.Storage.Error || er
 }
 
 /// Ordered cursor over a B-tree version, both directions. Holds a
-/// root-to-leaf stack of page copies; yielded `KV` slices borrow the leaf
-/// frame and are valid only until the cursor's next method call — see `KV`'s
-/// doc (every positioning call invalidates them too, same as `next()`/`prev()`).
+/// root-to-leaf stack of pages — each one BORROWED from the store when it can
+/// lend (`Storage.canLend`, a `pagecache` in front), else a copy; yielded `KV`
+/// slices point into the leaf frame and are valid only until the cursor's next
+/// method call — see `KV`'s doc (every positioning call invalidates them too,
+/// same as `next()`/`prev()`). A borrowed page is handed back when its frame
+/// is left or the cursor is deinitialized, so a `KV` kept past that reads a
+/// page the store may already have reused: the rule is the same, its breach
+/// is no longer benign.
 ///
 /// **Position.** A cursor sits in a GAP between two adjacent keys (or before
 /// the first, or after the last). `next` yields the key after the gap and
@@ -1181,11 +1186,20 @@ pub const Cursor = struct {
     pin: ?struct { db: *Db, txn_id: u64 } = null,
 
     const Frame = struct {
+        /// The page's bytes when the store did not lend it (`ref == null`).
         page: [page_size]u8,
+        /// The store's borrow of the page, when it lent one: no copy at all.
+        /// A scan used to copy every page twice (into a frame, then the
+        /// frame onto the stack) — 60 % of a resident scan (perf, 2026-10-11).
+        ref: ?kv.Storage.Ref,
         id: PageId,
         /// For a branch: ordinal of the child we descended into. For a leaf:
         /// the gap — the number of its entries before the cursor.
         idx: u16,
+
+        fn bytes(f: *const Frame) *const [page_size]u8 {
+            return if (f.ref) |r| r.bytes[0..page_size] else &f.page;
+        }
     };
 
     const Error = kv.Storage.Error || error{ Corrupt, OutOfMemory };
@@ -1195,6 +1209,7 @@ pub const Cursor = struct {
     }
 
     pub fn deinit(self: *Cursor) void {
+        self.dropFrames(0);
         if (self.pin) |p| p.db.releaseSnapshot(p.txn_id);
         self.stack.deinit(self.gpa);
         self.ovf_buf.deinit(self.gpa);
@@ -1207,14 +1222,14 @@ pub const Cursor = struct {
     /// stays in-bounds and silently reads whatever this call wrote there,
     /// rather than crashing.
     pub fn first(self: *Cursor) Error!void {
-        self.stack.clearRetainingCapacity();
+        self.dropFrames(0);
         try self.descendLeftmost(self.root);
     }
 
     /// Position after the last (largest) key: `prev` then walks the keys in
     /// descending order.
     pub fn last(self: *Cursor) Error!void {
-        self.stack.clearRetainingCapacity();
+        self.dropFrames(0);
         try self.descendRightmost(self.root);
     }
 
@@ -1231,25 +1246,22 @@ pub const Cursor = struct {
     }
 
     fn seekGap(self: *Cursor, key: []const u8, after: bool) Error!void {
-        self.stack.clearRetainingCapacity();
+        self.dropFrames(0);
         var id = self.root;
         while (true) {
-            var frame = Frame{ .page = undefined, .id = id, .idx = 0 };
-            try self.pager.readPage(id, &frame.page);
-            switch (format.kindOf(&frame.page) orelse return error.Corrupt) {
+            const frame, const kind = try self.pushFrame(id);
+            switch (kind) {
                 .branch => {
                     // The child that holds `key`'s place: every key left of
                     // it is < `key`, every key right of it is > `key`.
-                    const br = format.Branch.init(&frame.page);
+                    const br = format.Branch.init(frame.bytes());
                     const ci = br.childIndexFor(key);
                     frame.idx = @intCast(ci);
-                    try self.stack.append(self.gpa, frame);
                     id = br.childAtIndex(ci);
                 },
                 .leaf => {
-                    const s = format.Leaf.init(&frame.page).search(key);
+                    const s = format.Leaf.init(frame.bytes()).search(key);
                     frame.idx = s.index + @intFromBool(after and s.found);
-                    try self.stack.append(self.gpa, frame);
                     return;
                 },
             }
@@ -1259,31 +1271,48 @@ pub const Cursor = struct {
     fn descendLeftmost(self: *Cursor, from: PageId) Error!void {
         var id = from;
         while (true) {
-            var frame = Frame{ .page = undefined, .id = id, .idx = 0 };
-            try self.pager.readPage(id, &frame.page);
-            const kind = format.kindOf(&frame.page) orelse return error.Corrupt;
-            try self.stack.append(self.gpa, frame);
+            const frame, const kind = try self.pushFrame(id);
             if (kind == .leaf) return;
-            id = format.Branch.init(&self.stack.items[self.stack.items.len - 1].page).childAtIndex(0);
+            id = format.Branch.init(frame.bytes()).childAtIndex(0);
         }
     }
 
     fn descendRightmost(self: *Cursor, from: PageId) Error!void {
         var id = from;
         while (true) {
-            var frame = Frame{ .page = undefined, .id = id, .idx = 0 };
-            try self.pager.readPage(id, &frame.page);
-            const kind = format.kindOf(&frame.page) orelse return error.Corrupt;
+            const frame, const kind = try self.pushFrame(id);
             // A leaf's gap after its last entry; a branch's last child.
             frame.idx = switch (kind) {
-                .leaf => format.Leaf.init(&frame.page).count(),
-                .branch => format.Branch.init(&frame.page).count(),
+                .leaf => format.Leaf.init(frame.bytes()).count(),
+                .branch => format.Branch.init(frame.bytes()).count(),
             };
-            try self.stack.append(self.gpa, frame);
             if (kind == .leaf) return;
-            const top = &self.stack.items[self.stack.items.len - 1];
-            id = format.Branch.init(&top.page).childAtIndex(top.idx);
+            id = format.Branch.init(frame.bytes()).childAtIndex(frame.idx);
         }
+    }
+
+    /// Push the frame of page `id`, borrowed when the store lends it, read
+    /// straight into the new stack slot otherwise (no intermediate copy). The
+    /// returned pointer is valid until the next push. A page that fails to
+    /// read or has no valid kind leaves the stack as it was.
+    fn pushFrame(self: *Cursor, id: PageId) Error!struct { *Frame, format.NodeKind } {
+        const frame = try self.stack.addOne(self.gpa);
+        frame.ref = null;
+        frame.id = id;
+        frame.idx = 0;
+        errdefer self.dropFrames(self.stack.items.len - 1);
+        if (try self.pager.readPageRef(id)) |r| {
+            frame.ref = r;
+        } else {
+            try self.pager.readPage(id, &frame.page);
+        }
+        return .{ frame, format.kindOf(frame.bytes()) orelse return error.Corrupt };
+    }
+
+    /// Shrink the stack to `len` frames, handing back every borrow above it.
+    fn dropFrames(self: *Cursor, len: usize) void {
+        for (self.stack.items[len..]) |f| if (f.ref) |r| self.pager.releasePageRef(r);
+        self.stack.shrinkRetainingCapacity(len);
     }
 
     /// Yield the entry after the cursor and move past it, or null at the end.
@@ -1292,7 +1321,7 @@ pub const Cursor = struct {
     pub fn next(self: *Cursor) Error!?KV {
         while (self.stack.items.len > 0) {
             const top = &self.stack.items[self.stack.items.len - 1];
-            const leaf = format.Leaf.init(&top.page);
+            const leaf = format.Leaf.init(top.bytes());
             if (top.idx < leaf.count()) {
                 const i = top.idx;
                 top.idx += 1;
@@ -1305,11 +1334,11 @@ pub const Cursor = struct {
             while (lvl > 0) {
                 lvl -= 1;
                 const anc = &self.stack.items[lvl];
-                const br = format.Branch.init(&anc.page);
+                const br = format.Branch.init(anc.bytes());
                 if (anc.idx < br.count()) { // children are 0..count
                     anc.idx += 1;
                     const child = br.childAtIndex(anc.idx);
-                    self.stack.shrinkRetainingCapacity(lvl + 1);
+                    self.dropFrames(lvl + 1);
                     try self.descendLeftmost(child);
                     break; // retry the outer loop against the new leaf
                 }
@@ -1323,7 +1352,7 @@ pub const Cursor = struct {
     pub fn prev(self: *Cursor) Error!?KV {
         while (self.stack.items.len > 0) {
             const top = &self.stack.items[self.stack.items.len - 1];
-            const leaf = format.Leaf.init(&top.page);
+            const leaf = format.Leaf.init(top.bytes());
             if (top.idx > 0) {
                 top.idx -= 1;
                 return try self.entry(leaf, top.idx);
@@ -1334,8 +1363,8 @@ pub const Cursor = struct {
                 const anc = &self.stack.items[lvl];
                 if (anc.idx > 0) {
                     anc.idx -= 1;
-                    const child = format.Branch.init(&anc.page).childAtIndex(anc.idx);
-                    self.stack.shrinkRetainingCapacity(lvl + 1);
+                    const child = format.Branch.init(anc.bytes()).childAtIndex(anc.idx);
+                    self.dropFrames(lvl + 1);
                     try self.descendRightmost(child);
                     break;
                 }
@@ -1347,19 +1376,20 @@ pub const Cursor = struct {
     /// The header of the bucket `next` just yielded (`copyTo`'s walk).
     fn yieldedBucket(self: *const Cursor) format.BucketHdr {
         const top = &self.stack.items[self.stack.items.len - 1];
-        const leaf = format.Leaf.init(&top.page);
+        const leaf = format.Leaf.init(top.bytes());
         std.debug.assert(leaf.isBucket(top.idx - 1));
         return format.BucketHdr.decode(leaf.valAt(top.idx - 1));
     }
 
     fn entry(self: *Cursor, leaf: format.Leaf, i: usize) Error!KV {
-        if (leaf.isBucket(i)) return .{ .key = leaf.keyAt(i), .val = &.{}, .bucket = true };
-        if (leaf.ovfLen(i)) |len| {
+        const e = leaf.entryAt(i);
+        if (e.bucket) return .{ .key = e.key, .val = &.{}, .bucket = true };
+        if (e.ovf_len) |len| {
             try self.ovf_buf.resize(self.gpa, len);
             try readOverflow(self.pager, leaf.ovfFirst(i), self.ovf_buf.items);
-            return .{ .key = leaf.keyAt(i), .val = self.ovf_buf.items };
+            return .{ .key = e.key, .val = self.ovf_buf.items };
         }
-        return .{ .key = leaf.keyAt(i), .val = leaf.valAt(i) };
+        return .{ .key = e.key, .val = e.val };
     }
 };
 
@@ -1679,8 +1709,12 @@ test "leafViewSafe accepts a real leaf, rejects an oversized value length" {
     try testing.expect(format.leafViewSafe(&page) != null);
 
     // val_len is a u32: a cell may name far more bytes than the page holds.
+    // The largest INLINE length (no flag bit): 0xFFFF_FFFF would carry
+    // `ovf_flag` and read as a 4-byte overflow reference, which fits — and
+    // only failed here while the first slot's cell sat at the page's very
+    // end (cells were laid out downward until 2026-10-11).
     const o = std.mem.readInt(u16, page[8..10], .little);
-    std.mem.writeInt(u32, page[o + 2 ..][0..4], 0xFFFF_FFFF, .little);
+    std.mem.writeInt(u32, page[o + 2 ..][0..4], format.bucket_flag - 1, .little);
     try testing.expect(format.leafViewSafe(&page) == null);
 }
 

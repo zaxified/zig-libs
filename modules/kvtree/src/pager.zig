@@ -86,8 +86,12 @@ pub const Pager = struct {
         self.file_pages = pages;
     }
 
+    /// The commit's durability barrier: `fdatasync`, as bbolt's. Every byte a
+    /// commit relies on is file data plus the file's size, which `fdatasync`
+    /// covers; the timestamps a full `fsync` adds are a second journal write
+    /// nothing here reads. A backend without it does a full `sync`.
     pub fn sync(self: *Pager) StorageError!void {
-        try self.store.sync(self.handle);
+        try self.store.syncData(self.handle);
     }
 
     pub fn syncDir(self: *Pager) StorageError!void {

@@ -382,7 +382,7 @@ fn reduceChanges(arena: Allocator, changes: []const Change) CommitError!std.Arra
     });
     std.mem.sort(Op, ops.items, {}, struct {
         fn lessThan(_: void, x: Op, y: Op) bool {
-            return std.mem.order(u8, x.key, y.key) == .lt;
+            return format.orderKeys(x.key, y.key) == .lt;
         }
     }.lessThan);
     var w: usize = 0;
@@ -426,7 +426,7 @@ fn applyTree(ctx: *Ctx, root: ?PageId, tree: Tree) CommitError!PageId {
         var hi: usize = ops.items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            switch (std.mem.order(u8, ops.items[mid].key, op.key)) {
+            switch (format.orderKeys(ops.items[mid].key, op.key)) {
                 .lt => lo = mid + 1,
                 .gt => hi = mid,
                 .eq => return error.IncompatibleValue,

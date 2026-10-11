@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Performance, second pass: ref **0.84–1.14×** bbolt v1.5.0 (was 1.14–1.40×; still P3 — the scan row). The commit barrier is `fdatasync` (`Storage.syncData`), as bbolt's, instead of a full `fsync`: commits 0.84–0.90×. Keys compare eight bytes per step (`format.orderKeys`, exactly `std.mem.order`; differential test over every length pair to 19): gets 1.07×. `Cursor` borrows its frames from a lending store (`pagecache`) instead of copying each page twice, and reads straight into its stack otherwise; leaf cells are written in ascending key order (no format change; readers follow the slot offsets): scan 1.09–1.14×. ⚠ A `KV` held past the cursor's next call now reads a page the store may have reused (the rule was already "valid until the next call"). `Leaf.entryAt` decodes a cell header once.
 - **2026-10-11** — Performance: `commit` folds a transaction's changes with a stable sort and one
   compaction pass instead of inserting each into a sorted array (O(n log n), was O(n²) moves; a
   100 000-put transaction spent most of its CPU there). Same result, last change of a key wins (new

@@ -463,6 +463,7 @@ pub const PageCache = struct {
         .pread = vPread,
         .writeAll = vWriteAll,
         .sync = vSync,
+        .syncData = vSyncData,
         .truncate = vTruncate,
         .close = vClose,
         .rename = vRename,
@@ -628,6 +629,13 @@ pub const PageCache = struct {
 
     fn vSync(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
         return cast(ctx).inner.sync(h);
+    }
+
+    /// Forwarded, so a caller's `fdatasync` reaches the backend instead of
+    /// widening into `Storage.syncData`'s full-`sync` fallback (write-through:
+    /// the inner backend already holds every byte this would make durable).
+    fn vSyncData(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
+        return cast(ctx).inner.syncData(h);
     }
 
     fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
@@ -1608,6 +1616,73 @@ test "F3: kvtree's read descent really takes the borrow seam, and still reads id
     // The descent borrowed resident pages instead of copying them, and gave
     // every one of them back.
     try testing.expect(pc.stats().ref_hits > ref_hits_before);
+    try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
+}
+
+test "F3: kvtree's cursor borrows its frames, holds no more than its depth, and gives every one back" {
+    // The cursor keeps a root-to-leaf stack across `next` calls, so unlike the
+    // descent its borrows outlive a call: this checks the release discipline
+    // (leaving a leaf, re-seeking, deinit) and that a scan in both directions
+    // over a cache far smaller than the store, with a commit overwriting pages
+    // mid-scan, reads exactly what the copying cursor over the raw backend does.
+    const gpa = testing.allocator;
+
+    var raw_sim = kv.SimStorage.init(gpa);
+    defer raw_sim.deinit();
+    raw_sim.allow_overwrite = true;
+    var raw_db = try kvtree.Db.open(gpa, raw_sim.storage(), "t.kvt", .{});
+    defer raw_db.close();
+
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 6 });
+    defer pc.deinit();
+    var db = try kvtree.Db.open(gpa, pc.storage(), "t.kvt", .{});
+    defer db.close();
+
+    const scratch = try gpa.alloc(u8, 64);
+    defer gpa.free(scratch);
+    try runWorkload(&raw_db, 0xC0B5, 1500, 400, 64, scratch);
+    try runWorkload(&db, 0xC0B5, 1500, 400, 64, scratch);
+
+    var raw_snap = try raw_db.snapshot();
+    defer raw_snap.release();
+    var snap = try db.snapshot();
+    defer snap.release();
+    var raw_cur = try raw_snap.cursor();
+    defer raw_cur.deinit();
+    var cur = try snap.cursor();
+
+    const ref_hits_before = pc.stats().ref_hits;
+    try raw_cur.first();
+    try cur.first();
+    var n: usize = 0;
+    while (try raw_cur.next()) |want| : (n += 1) {
+        const got = (try cur.next()).?;
+        try testing.expectEqualStrings(want.key, got.key);
+        try testing.expectEqualSlices(u8, want.val, got.val);
+        // At most one borrow per tree level is ever outstanding.
+        try testing.expect(pc.stats().borrowed_pages <= 4);
+        // A commit overwriting the pages under the cursor: the snapshot's
+        // cursor keeps reading the version it started on.
+        if (n == 40) try runWorkload(&db, 0xBEEF, 300, 400, 64, scratch);
+    }
+    try testing.expect(try cur.next() == null);
+    try testing.expect(n > 100);
+    try testing.expect(pc.stats().ref_hits > ref_hits_before);
+
+    // Backwards from a seek, then a re-seek drops the old stack's borrows.
+    try raw_cur.seekAfter("key00300");
+    try cur.seekAfter("key00300");
+    while (try raw_cur.prev()) |want| {
+        const got = (try cur.prev()).?;
+        try testing.expectEqualStrings(want.key, got.key);
+    }
+    try testing.expect(try cur.prev() == null);
+    try cur.seek("key00200");
+    try testing.expect(pc.stats().borrowed_pages > 0);
+    cur.deinit();
     try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
 }
 
