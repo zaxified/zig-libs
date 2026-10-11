@@ -519,8 +519,11 @@ timeouts:
 | Timeout | Default | Bounds |
 |---|---|---|
 | `read_timeout_ms` | 10 s | any single read **stall**: head wait, body wait, keep-alive idle |
-| `request_timeout_ms` | 60 s | one whole request-read cycle — keep-alive idle + head + body, **dribble included** (Go `ReadTimeout` semantics; re-checked at every refill, so slowloris byte-trickling is bounded). Handler compute and response writing are not counted |
+| `request_timeout_ms` | 60 s | one whole request read — head + body from the request's first byte, **dribble included** (Go `ReadTimeout`; re-checked at every refill, so slowloris byte-trickling is bounded). The keep-alive wait before it is not counted (it was until 2026-10-12). Handler compute and response writing are not counted |
+| `read_header_timeout_ms` | off | the head alone, absolute from its first byte (Go `ReadHeaderTimeout`): a head sent a line at a time passes every stall timeout, not this |
+| `idle_timeout_ms` | off | the keep-alive wait for the next request, absolute, in place of `read_timeout_ms` there (Go `IdleTimeout`) |
 | `write_timeout_ms` | 10 s | any single write **stall** (peer stops reading — slow-read attack); per socket write. A trickle-reading peer restarts the window per write |
+| `response_timeout_ms` | off | the whole response, absolute from the end of the request head — handler time included, enforced on the writes (Go `WriteTimeout`). A streaming handler moves it with `req.setWriteDeadline(ms)`, a long upload its read deadline with `req.setReadDeadline(ms)` (Go `ResponseController`) |
 
 0 (or null for the size limits) disables the individual bound.
 

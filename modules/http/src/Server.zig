@@ -36,9 +36,14 @@
 //!
 //! Timeout model: `read_timeout_ms` bounds every read *stall* (request head,
 //! body, keep-alive idle); `request_timeout_ms` is a whole-request read
-//! deadline (Go ReadTimeout shape: keep-alive idle + head + body share one
-//! budget, so a dribbling client cannot stretch a request forever);
-//! `write_timeout_ms` bounds every write stall (a peer that stops reading).
+//! deadline from the request's first byte (Go ReadTimeout: head + body share
+//! one budget, so a dribbling client cannot stretch a request forever);
+//! `read_header_timeout_ms` (Go ReadHeaderTimeout) and `idle_timeout_ms` (Go
+//! IdleTimeout) are absolute deadlines on the head and on the keep-alive
+//! wait; `write_timeout_ms` bounds every write stall (a peer that stops
+//! reading) and `response_timeout_ms` (Go WriteTimeout) the whole response.
+//! A handler moves its own read/write deadline (`Request.setReadDeadline`,
+//! `setWriteDeadline`, Go's ResponseController).
 //! All of them are enforced through `std.Io` alone: each blocking read or
 //! write arms a deadline, and one `Reaper` task per `serve` shuts down the
 //! sockets whose deadline passed, at most a tick (a tenth of the shortest
@@ -450,12 +455,30 @@ pub const Options = struct {
     /// Max time a single read may stall (head wait, body wait, keep-alive
     /// idle) before the connection is dropped; 0 = no timeout.
     read_timeout_ms: u32 = 10_000,
-    /// Whole-request read deadline (Go `ReadTimeout` semantics): keep-alive
-    /// idle + request head + request body must all complete within this
-    /// budget, dribble included — the hard slowloris bound that
-    /// `read_timeout_ms` alone cannot give. Response writing and handler
-    /// compute time are not counted. 0 = no deadline.
+    /// Whole-request read deadline (Go `ReadTimeout`): from the request's
+    /// first byte, head + body must arrive within this budget, dribble
+    /// included — the hard slowloris bound that `read_timeout_ms` alone
+    /// cannot give. The keep-alive wait before that byte is not counted
+    /// (it was until 2026-10-12; Go never counted it): `idle_timeout_ms` or
+    /// `read_timeout_ms` bounds it. Response writing and handler compute time
+    /// are not counted. HTTP/1.1 only. 0 = no deadline.
     request_timeout_ms: u32 = 60_000,
+    /// Absolute deadline for the request head (Go `ReadHeaderTimeout`): from
+    /// the request's first byte to the end of its head. A peer that sends a
+    /// header line every few seconds passes every stall timeout; not this.
+    /// HTTP/1.1 only. 0 = only `request_timeout_ms` bounds the head.
+    read_header_timeout_ms: u32 = 0,
+    /// Absolute deadline for the wait for the next request on a keep-alive
+    /// connection (Go `IdleTimeout`), in place of `read_timeout_ms` during
+    /// that wait. HTTP/1.1 only. 0 = `read_timeout_ms` bounds the wait.
+    idle_timeout_ms: u32 = 0,
+    /// Absolute deadline for writing the response (Go `WriteTimeout`): from
+    /// the end of the request head to the last byte of the response, handler
+    /// time included, enforced on the writes. A handler that streams for
+    /// longer (SSE, a large download) moves it with
+    /// `Request.setWriteDeadline`. `write_timeout_ms` still bounds each
+    /// stalled write. HTTP/1.1 only. 0 = no deadline.
+    response_timeout_ms: u32 = 0,
     /// Absolute lifetime cap for an `enable_h2c` connection; 0 = no cap.
     /// `request_timeout_ms` is deliberately h1-only (its doc says so) — a
     /// multiplexed h2 connection has no single "request" to time, and
@@ -468,8 +491,8 @@ pub const Options = struct {
     /// Armed once, at connection start, and never re-armed — a legitimate
     /// long-lived connection simply reconnects after a graceful close
     /// instead of running unbounded. Ignored on the HTTP/1.1 path, where
-    /// `request_timeout_ms` already bounds every request and keep-alive
-    /// idle period.
+    /// `request_timeout_ms` bounds every request and `idle_timeout_ms` /
+    /// `read_timeout_ms` every keep-alive wait.
     max_h2c_connection_ms: u32 = 4 * std.time.ms_per_hour,
     /// Max time a single write may stall because the peer stopped reading
     /// (slow-read attack), per socket write; 0 = no timeout.
@@ -1164,6 +1187,9 @@ fn connMain(s: *Server, stream: net.Stream) void {
     var tr: TimeoutReader = .init(&sr, s.io, w, o.read_timeout_ms, o.request_timeout_ms, read_buf);
     var sw = stream.writer(s.io, write_buf[0..0]);
     var tw: TimeoutWriter = .init(&sw, s.io, w, o.write_timeout_ms, write_buf);
+    tr.header_timeout_ms = o.read_header_timeout_ms;
+    tr.idle_timeout_ms = o.idle_timeout_ms;
+    var deadlines: Deadlines = .{ .tr = &tr, .tw = &tw, .response_timeout_ms = o.response_timeout_ms };
 
     // h2c (opt-in): a connection that opens with the HTTP/2 client preface
     // is served as HTTP/2 with the same handler; anything else falls
@@ -1227,7 +1253,8 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .max_decompressed_request_bytes = o.max_decompressed_request_bytes,
         .verify_inbound_trailer = o.verify_inbound_trailer,
         .max_requests_per_conn = o.max_requests_per_conn,
-    }, &tr.reader, &tw.writer, bufs, &tr);
+        .deadlines = &deadlines,
+    }, &tr.reader, &tw.writer, bufs);
 }
 
 /// Bytes `lingerClose` reads and drops before it gives up on a peer that keeps
@@ -1363,7 +1390,7 @@ const Reaper = struct {
 /// one configured, within 1..100 ms.
 fn reaperTickMs(o: *const Options) u32 {
     var shortest: u32 = std.math.maxInt(u32);
-    for ([_]u32{ o.read_timeout_ms, o.request_timeout_ms, o.write_timeout_ms }) |t| {
+    for ([_]u32{ o.read_timeout_ms, o.request_timeout_ms, o.write_timeout_ms, o.read_header_timeout_ms, o.idle_timeout_ms, o.response_timeout_ms }) |t| {
         if (t != 0) shortest = @min(shortest, t);
     }
     if (o.enable_h2c and o.max_h2c_connection_ms != 0) shortest = @min(shortest, o.max_h2c_connection_ms);
@@ -1372,6 +1399,7 @@ fn reaperTickMs(o: *const Options) u32 {
 
 fn wantsReaper(o: *const Options) bool {
     return o.read_timeout_ms != 0 or o.request_timeout_ms != 0 or o.write_timeout_ms != 0 or
+        o.read_header_timeout_ms != 0 or o.idle_timeout_ms != 0 or o.response_timeout_ms != 0 or
         (o.enable_h2c and o.max_h2c_connection_ms != 0);
 }
 
@@ -1412,6 +1440,13 @@ const TimeoutReader = struct {
     /// deadline (re-armed every request), `enable_h2c` arms only this one
     /// (once, at connection start) — see `armConnection`.
     conn_deadline_ns: u64 = 0,
+    /// h1 only: where the connection is in its request cycle, and the
+    /// absolute deadline of that phase (idle: `idle_timeout_ms`, head:
+    /// `read_header_timeout_ms`; 0 = none). Set through `Deadlines`.
+    phase: enum { idle, head, body } = .body,
+    phase_deadline_ns: u64 = 0,
+    header_timeout_ms: u32 = 0,
+    idle_timeout_ms: u32 = 0,
     reader: Reader,
     timed_out: bool = false,
     canceled: bool = false,
@@ -1455,9 +1490,39 @@ const TimeoutReader = struct {
     /// `enable_h2c` only the second) — `@min` is future-proofing, not load
     /// bearing today.
     fn earliestDeadlineNs(t: *const TimeoutReader) u64 {
-        if (t.deadline_ns == 0) return t.conn_deadline_ns;
-        if (t.conn_deadline_ns == 0) return t.deadline_ns;
-        return @min(t.deadline_ns, t.conn_deadline_ns);
+        var d: u64 = 0;
+        for ([_]u64{ t.deadline_ns, t.conn_deadline_ns, t.phase_deadline_ns }) |x| {
+            if (x != 0 and (d == 0 or x < d)) d = x;
+        }
+        return d;
+    }
+
+    fn afterMs(t: *const TimeoutReader, ms: u32) u64 {
+        return if (ms == 0) 0 else nowNs(t.io) + @as(u64, ms) * std.time.ns_per_ms;
+    }
+
+    /// Waiting for the next request: no request deadline yet, the idle
+    /// deadline if one is configured.
+    fn beginIdle(t: *TimeoutReader) void {
+        if (t.watch == null) return;
+        t.phase = .idle;
+        t.deadline_ns = 0;
+        t.phase_deadline_ns = t.afterMs(t.idle_timeout_ms);
+    }
+
+    /// The request's first byte is here: its whole-request and head
+    /// deadlines start now.
+    fn beginHead(t: *TimeoutReader) void {
+        if (t.watch == null) return;
+        t.phase = .head;
+        t.armRequest();
+        t.phase_deadline_ns = t.afterMs(t.header_timeout_ms);
+    }
+
+    /// The head is parsed: only the request deadline still bounds the body.
+    fn endHead(t: *TimeoutReader) void {
+        t.phase = .body;
+        t.phase_deadline_ns = 0;
     }
 
     /// A read that reached the socket and failed: recover the real cause
@@ -1491,13 +1556,15 @@ const TimeoutReader = struct {
         defer if (armed) |watch| watch.read_deadline_ns.store(0, .release);
         if (t.watch) |watch| if (in.bufferedLen() == 0) {
             const deadline_ns = t.earliestDeadlineNs();
-            if (t.timeout_ms != 0 or deadline_ns != 0) {
+            // An idle deadline replaces the stall timeout for the wait.
+            const stall_ms: u32 = if (t.phase == .idle and t.idle_timeout_ms != 0) 0 else t.timeout_ms;
+            if (stall_ms != 0 or deadline_ns != 0) {
                 const now = nowNs(t.io);
                 if (deadline_ns != 0 and now >= deadline_ns) {
                     t.timed_out = true;
                     return error.ReadFailed;
                 }
-                var until: u64 = if (t.timeout_ms != 0) now + @as(u64, t.timeout_ms) * std.time.ns_per_ms else std.math.maxInt(u64);
+                var until: u64 = if (stall_ms != 0) now + @as(u64, stall_ms) * std.time.ns_per_ms else std.math.maxInt(u64);
                 if (deadline_ns != 0) until = @min(until, deadline_ns);
                 watch.read_deadline_ns.store(until, .release);
                 armed = watch;
@@ -1532,6 +1599,9 @@ const TimeoutWriter = struct {
     dst: *net.Stream.Writer,
     watch: ?*Watch,
     timeout_ms: u32,
+    /// Absolute response deadline (`Options.response_timeout_ms`, or a
+    /// handler's `Request.setWriteDeadline`); 0 = none.
+    response_deadline_ns: u64 = 0,
     writer: Writer,
     timed_out: bool = false,
     canceled: bool = false,
@@ -1573,8 +1643,17 @@ const TimeoutWriter = struct {
                 t.timed_out = true;
                 return error.WriteFailed;
             }
-            const watch: ?*Watch = if (t.timeout_ms != 0) t.watch else null;
-            if (watch) |w| w.write_deadline_ns.store(nowNs(t.io) + @as(u64, t.timeout_ms) * std.time.ns_per_ms, .release);
+            const watch: ?*Watch = if (t.timeout_ms != 0 or t.response_deadline_ns != 0) t.watch else null;
+            if (watch) |w| {
+                const now = nowNs(t.io);
+                if (t.response_deadline_ns != 0 and now >= t.response_deadline_ns) {
+                    t.timed_out = true;
+                    return error.WriteFailed;
+                }
+                var until: u64 = if (t.timeout_ms != 0) now + @as(u64, t.timeout_ms) * std.time.ns_per_ms else std.math.maxInt(u64);
+                if (t.response_deadline_ns != 0) until = @min(until, t.response_deadline_ns);
+                w.write_deadline_ns.store(until, .release);
+            }
             defer if (watch) |w| w.write_deadline_ns.store(0, .release);
             // Spelled out rather than caught bare: if `Writer.Error` ever
             // grows a second tag, this becomes a compile error instead of a
@@ -1599,6 +1678,32 @@ const TimeoutWriter = struct {
         for (0..splat) |_| try t.sendAll(last);
         consumed += last.len * splat;
         return consumed;
+    }
+};
+
+/// One HTTP/1.1 connection's deadline control, owned by the socket serving
+/// loop and reached through `StreamOptions.deadlines`: the loop moves it
+/// through the request cycle (idle → head → body) and a handler adjusts it
+/// with `Request.setReadDeadline` / `setWriteDeadline`. Null when serving
+/// socket-free and on HTTP/2.
+pub const Deadlines = struct {
+    tr: *TimeoutReader,
+    tw: *TimeoutWriter,
+    response_timeout_ms: u32,
+
+    fn beginIdle(d: *Deadlines) void {
+        d.tr.beginIdle();
+        d.tw.response_deadline_ns = 0;
+    }
+
+    fn beginHead(d: *Deadlines) void {
+        d.tr.beginHead();
+    }
+
+    /// The head is parsed: the head deadline ends, the response one starts.
+    fn headRead(d: *Deadlines) void {
+        d.tr.endHead();
+        if (d.tw.watch != null) d.tw.response_deadline_ns = d.tr.afterMs(d.response_timeout_ms);
     }
 };
 
@@ -1632,6 +1737,10 @@ pub const StreamOptions = struct {
     /// Failure observer — see `Options.on_error`.
     on_error: ?ErrorFn = null,
     on_error_ctx: ?*anyopaque = null,
+    /// The socket loop's deadline control (see `Deadlines`); null =
+    /// socket-free, no deadlines, and `Request.setReadDeadline` /
+    /// `setWriteDeadline` answer `error.Unsupported`.
+    deadlines: ?*Deadlines = null,
     /// Lend this connection its working memory one request at a time instead
     /// of taking the caller's for the whole connection. Null keeps the
     /// buffers passed to `serveStream`, which is what every caller did before
@@ -1714,17 +1823,17 @@ pub const StreamBuffers = struct {
 /// that field. `connMain`'s own wrappers do exactly this on the socket it
 /// owns — see `TimeoutReader`.
 pub fn serveStream(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers) void {
-    serveLoop(opts, in, out, bufs, null);
+    serveLoop(opts, in, out, bufs);
 }
 
 /// The per-connection loop behind `serveStream`; the socket serving loop
 /// additionally passes its TimeoutReader so the whole-request deadline is
 /// re-armed at every request boundary.
-fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, tr: ?*TimeoutReader) void {
+fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers) void {
     fireConnState(&opts, .new);
     var req_index: u32 = 0;
     while (true) {
-        if (tr) |t| t.armRequest();
+        if (opts.deadlines) |d| d.beginIdle();
 
         // ⭐⭐⭐ Wait for the next request BEFORE borrowing anything.
         //
@@ -1741,6 +1850,7 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
         // Any failure here -- client hung up between requests, idle timeout
         // -- is a quiet close, as it was when `serveOne` owned this line.
         _ = in.peekByte() catch break;
+        if (opts.deadlines) |d| d.beginHead();
 
         if (serveStep(opts, in, out, bufs, req_index) == .close) break;
         req_index += 1;
@@ -1861,6 +1971,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         error.MalformedHead => return respondError(opts, out, date, 400),
         error.ReadFailed, error.ConnectionClosed => return .close,
     };
+    if (opts.deadlines) |d| d.headRead();
     fireConnState(&opts, .active);
 
     // Request-line bound (Go checks its URI length the same way, after the
@@ -2017,6 +2128,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         .context = opts.context,
         .peer = opts.peer,
         .conn_request_index = req_index,
+        .deadlines = opts.deadlines,
     };
     // Inbound gzip decoding (Task 1): route the handler's `req.reader()`
     // through the flate decoder wrapped in a decompressed-byte cap. The
@@ -2206,6 +2318,9 @@ pub const Request = struct {
     /// the interim line goes out on `rw.out` unless the final head already
     /// has. Null on every request that did not ask for one. See `serveOne`.
     continue_rw: ?*ResponseWriter = null,
+    /// The connection's deadline control (HTTP/1.1 over a socket); null
+    /// otherwise. See `setReadDeadline`.
+    deadlines: ?*Deadlines = null,
     /// HTTP/2 only: the request's stream id, so a handler that detaches its
     /// response (`ResponseWriter.detach`) can name the stream to
     /// `h2_server.Detached.push` later. Null on HTTP/1.1.
@@ -2234,6 +2349,30 @@ pub const Request = struct {
     /// Iterate all header name/value pairs in wire order.
     pub fn iterateHeaders(req: *const Request) h1.HeaderIterator {
         return req.head.iterate();
+    }
+
+    /// Move this request's read deadline to `ms` from now — Go's
+    /// `ResponseController.SetReadDeadline`: a handler that accepts a long
+    /// upload extends the `request_timeout_ms` budget, one that wants less
+    /// shortens it. `0` removes the deadline (the per-read stall timeout
+    /// still applies). `error.Unsupported` when served socket-free, over
+    /// HTTP/2, or by a `Server` with every timeout at 0 (no deadline is
+    /// enforced at all then).
+    pub fn setReadDeadline(req: *const Request, ms: u32) error{Unsupported}!void {
+        const d = req.deadlines orelse return error.Unsupported;
+        if (d.tr.watch == null) return error.Unsupported;
+        d.tr.deadline_ns = d.tr.afterMs(ms);
+    }
+
+    /// Move this response's write deadline (`Options.response_timeout_ms`)
+    /// to `ms` from now — Go's `ResponseController.SetWriteDeadline`, the way
+    /// an SSE or download handler outlives the server-wide budget. `0`
+    /// removes it (`write_timeout_ms` still bounds each stalled write).
+    /// `error.Unsupported` as for `setReadDeadline`.
+    pub fn setWriteDeadline(req: *const Request, ms: u32) error{Unsupported}!void {
+        const d = req.deadlines orelse return error.Unsupported;
+        if (d.tw.watch == null) return error.Unsupported;
+        d.tw.response_deadline_ns = d.tr.afterMs(ms);
     }
 
     /// Every value of header `name` (case-insensitive), one per field line,
@@ -7194,11 +7333,174 @@ test "integration: stalled client is dropped after the read timeout" {
     try testing.expectError(error.EndOfStream, sr.interface.take(1));
 }
 
+/// The R2 deadline tests' handler: `/slow` sleeps 300 ms before answering,
+/// `/slow-extended` first moves its write deadline out of the way. The
+/// context is the test's `std.Io`.
+fn deadlineHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    const io: *const std.Io = @ptrCast(@alignCast(req.context.?));
+    if (std.mem.eql(u8, req.path, "/slow-extended")) try req.setWriteDeadline(10_000);
+    if (std.mem.startsWith(u8, req.path, "/slow")) try sleepMs(io.*, 300);
+    try rw.writeAll("done");
+}
+
+/// Connect to `server`, send `wire`, and return how long until the server
+/// closed (EOF) plus what it answered before that, into `buf`.
+fn timedExchange(io: std.Io, server: *Server, wire: []const u8, buf: []u8) !struct { ms: u64, got: []const u8 } {
+    const stream = try server.boundAddress().connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rbuf: [512]u8 = undefined;
+    var wbuf: [512]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll(wire);
+    try sw.interface.flush();
+    const started = nowNs(io);
+    var w: Writer = .fixed(buf);
+    _ = sr.interface.streamRemaining(&w) catch {};
+    return .{ .ms = (nowNs(io) - started) / std.time.ns_per_ms, .got = w.buffered() };
+}
+
+test "integration: read_header_timeout_ms cuts a head that arrives a line at a time, inside every other budget" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .read_timeout_ms = 20_000,
+        .request_timeout_ms = 20_000,
+        .read_header_timeout_ms = 200,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [256]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    // A header line every 80 ms, never the blank line: only the head
+    // deadline (200 ms) can end it; the others are 20 s away.
+    for ([_][]const u8{ "GET /hello HTTP/1.1\r\n", "Host: t\r\n", "X-A: 1\r\n", "X-B: 2\r\n", "X-C: 3\r\n", "X-D: 4\r\n" }) |line| {
+        sw.interface.writeAll(line) catch break;
+        sw.interface.flush() catch break;
+        try sleepMs(io, 80);
+    }
+    const started_ns = nowNs(io);
+    try testing.expectError(error.EndOfStream, sr.interface.take(1));
+    try testing.expect((nowNs(io) - started_ns) / std.time.ns_per_ms < 5_000);
+}
+
+/// Read one `testHandler` `/hello` answer: a 200 head, then its 5-byte body.
+fn expectHelloResponse(r: *Reader) !void {
+    try testing.expect(std.mem.startsWith(u8, try r.takeDelimiterInclusive('\n'), "HTTP/1.1 200 "));
+    while (!std.mem.eql(u8, try r.takeDelimiterInclusive('\n'), "\r\n")) {}
+    try testing.expectEqualStrings("hello", try r.take(5));
+}
+
+test "integration: idle_timeout_ms ends a keep-alive wait; request_timeout_ms no longer counts it" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // Idle 250 ms. The whole-request deadline (150 ms) is SHORTER than the
+    // idle period below: if it still counted the wait, the second request
+    // would find the connection gone.
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .read_timeout_ms = 20_000,
+        .request_timeout_ms = 150,
+        .idle_timeout_ms = 600,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [1024]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    const req = "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n";
+    try sw.interface.writeAll(req);
+    try sw.interface.flush();
+    try expectHelloResponse(&sr.interface);
+    try sleepMs(io, 300); // idle: past request_timeout_ms, inside idle_timeout_ms
+    try sw.interface.writeAll(req);
+    try sw.interface.flush();
+    // The second answer arrives on the same connection…
+    try expectHelloResponse(&sr.interface);
+    // …and then the idle deadline closes it, long before the 20 s stall.
+    const started_ns = nowNs(io);
+    var drain: [256]u8 = undefined;
+    var dw: Writer = .fixed(&drain);
+    _ = sr.interface.streamRemaining(&dw) catch {};
+    try testing.expect((nowNs(io) - started_ns) / std.time.ns_per_ms < 5_000);
+}
+
+test "integration: response_timeout_ms ends a slow response; setWriteDeadline moves it" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var io = threaded.io();
+    var server = init(io, testing.allocator, .{
+        .handler = deadlineHandler,
+        .context = @ptrCast(&io),
+        .read_timeout_ms = 20_000,
+        .write_timeout_ms = 20_000,
+        .response_timeout_ms = 100,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    var buf: [1024]u8 = undefined;
+    // A quick answer fits the budget.
+    const quick = try timedExchange(io, &server, "GET /fast HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.endsWith(u8, quick.got, "done"));
+    // 300 ms of handler time against 100 ms: the write finds the deadline
+    // passed and the connection is cut with nothing sent.
+    var buf2: [1024]u8 = undefined;
+    const slow = try timedExchange(io, &server, "GET /slow HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf2);
+    try testing.expectEqual(@as(usize, 0), slow.got.len);
+    // The handler moved its own deadline out: the answer arrives.
+    var buf3: [1024]u8 = undefined;
+    const ext = try timedExchange(io, &server, "GET /slow-extended HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf3);
+    try testing.expect(std.mem.endsWith(u8, ext.got, "done"));
+}
+
+test "setReadDeadline/setWriteDeadline: Unsupported when served socket-free" {
+    const H = struct {
+        fn handle(req: *Request, rw: *ResponseWriter) anyerror!void {
+            try testing.expectError(error.Unsupported, req.setReadDeadline(1));
+            try testing.expectError(error.Unsupported, req.setWriteDeadline(1));
+            try rw.writeAll("ok");
+        }
+    };
+    var in: Reader = .fixed("GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var head: [512]u8 = undefined;
+    var rbody: [64]u8 = undefined;
+    var resp: [64]u8 = undefined;
+    var chunk: [64]u8 = undefined;
+    serveStream(.{ .handler = H.handle }, &in, &out, .{ .head = &head, .request_body = &rbody, .response_body = &resp, .chunk = &chunk });
+    try testing.expect(std.mem.endsWith(u8, out.buffered(), "\r\n\r\nok"));
+}
+
 test "integration: request_timeout_ms bounds the WHOLE request even when no single stall does (F6)" {
     // The per-read stall budget (`read_timeout_ms`) resets on every byte, so
     // a "dribbling" client that stays just inside it can hold a connection
     // open indefinitely -- exactly the slowloris shape `request_timeout_ms`
-    // exists to close (`armRequest()` at connMain start, Server.zig). This
+    // exists to close (`Deadlines.beginHead` arms it at the first byte). This
     // was the one guard in the module with zero coverage (A1 audit F6,
     // mutation M20 -- deleting the `armRequest()` call left 479/479 green).
     var threaded = std.Io.Threaded.init(testing.allocator, .{});

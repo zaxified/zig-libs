@@ -403,9 +403,14 @@ decisions the same day: every gap a Go user notices is implemented, TLS server p
 Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML notes, not shipped).
 - R1 graceful lifecycle: `shutdownGraceful(deadline)` (idle connections closed, in-flight requests
   finish, h2 GOAWAY), `close`, `registerOnShutdown`. `shutdown()` today only stops accepting.
-- R2 timeouts Go has: `read_header_timeout_ms`, `idle_timeout_ms` as ABSOLUTE phase deadlines (a peer
-  dribbling one byte per period defeats an inactivity timer; qap measured 75 s against a 10 s one),
-  per-request read/write deadlines.
+- R2 timeouts Go has — DONE 2026-10-12: `read_header_timeout_ms`, `idle_timeout_ms`,
+  `response_timeout_ms` as ABSOLUTE phase deadlines (a peer dribbling one byte per period defeats an
+  inactivity timer; qap measured 75 s against a 10 s one), `Request.setReadDeadline` /
+  `setWriteDeadline` (Go `ResponseController`). The connection's phase (idle → head → body) lives in
+  `TimeoutReader`, moved by `StreamOptions.deadlines` (`Deadlines`). Behaviour change:
+  `request_timeout_ms` starts at the request's first byte, as Go's `ReadTimeout` — counting the
+  keep-alive wait made a short request budget close every idle connection. Each new deadline has an
+  integration test that fails when its arming is removed (checked).
 - R3 handler helpers — DONE 2026-10-12: `addHeader`/`getHeader`/`delHeader`, `redirect`,
   `writeError`/`notFound`, `Request.headerAll`, `basicAuth` (+ client `basicAuthHeader`) and
   `Server.BodyLimit` (Go `MaxBytesReader`; caller-owned, so neither `Request` nor the serving frame

@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Go's server timeouts (S2 survey R2).** New `Options.read_header_timeout_ms` (Go
+  `ReadHeaderTimeout`), `idle_timeout_ms` (Go `IdleTimeout`) and `response_timeout_ms` (Go
+  `WriteTimeout`), all absolute and off by default; `Request.setReadDeadline` / `setWriteDeadline`
+  (Go `ResponseController`) for a handler that needs more or less time; `StreamOptions.deadlines` /
+  `Server.Deadlines` carry them (null socket-free). **Behaviour change:** `request_timeout_ms` now
+  starts at the request's first byte instead of before the keep-alive wait, as Go's `ReadTimeout`
+  does. The wait is still bounded by `read_timeout_ms` (10 s default) or `idle_timeout_ms`; a server
+  that relied on `request_timeout_ms` to close idle connections sooner than `read_timeout_ms` should
+  set `idle_timeout_ms`.
+
 - **2026-10-12** — **`on_error` failure observer (Go `ErrorLog`, S2 survey R5), additive.**
   `Server.Options.on_error` / `StreamOptions.on_error` / `h2_server.Options.on_error` with
   `Server.ErrorKind` (`handler_failed` with the handler's error, `request_refused` with the status
