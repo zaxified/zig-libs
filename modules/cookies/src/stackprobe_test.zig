@@ -36,4 +36,12 @@ test "STACKPROBE: no key residue after any secure.zig entry point" {
     _ = try P.run("signed.verify", secure.signed.verify, .{ @as([]const secure.Key, &keys), "sid", s, secure.signed.Options{} }, k, .{});
     _ = try P.run("private.seal", secure.private.seal, .{ &key, "sid", value, @as([12]u8, @splat(9)), &out }, k, .{});
     _ = try P.run("private.open", secure.private.open, .{ @as([]const secure.Key, &keys), "sid", sealed, &plain }, k, .{});
+    var tsigned_buf: [128]u8 = undefined;
+    const ts = try secure.signed.signTimed(&key, "sid", value, 1_760_000_000, &tsigned_buf);
+    var tsealed_buf: [128]u8 = undefined;
+    const tsealed = try secure.private.sealTimedNonce(&key, "sid", value, 1_760_000_000, @splat(9), &tsealed_buf);
+    _ = try P.run("signed.signTimed", secure.signed.signTimed, .{ &key, "sid", value, @as(i64, 1_760_000_000), &out }, k, .{});
+    _ = try P.run("signed.verifyTimed", secure.signed.verifyTimed, .{ @as([]const secure.Key, &keys), "sid", ts, @as(i64, 1_760_000_001), @as(i64, 60) }, k, .{});
+    _ = try P.run("private.sealTimedNonce", secure.private.sealTimedNonce, .{ &key, "sid", value, @as(i64, 1_760_000_000), @as([12]u8, @splat(9)), &out }, k, .{});
+    _ = try P.run("private.openTimed", secure.private.openTimed, .{ @as([]const secure.Key, &keys), "sid", tsealed, @as(i64, 1_760_000_001), @as(i64, 60), &plain }, k, .{});
 }

@@ -60,8 +60,11 @@ const t = cookies.signed.verify(&.{key}, "theme", s, .{}) orelse "light";
 ```
 
 `verify`/`open` return the value or null, never why; a list of keys gives
-rotation (seal with the newest, accept any). Nothing expires a value on the
-server: put an issue time inside it when that matters. `percentEncode` /
+rotation (seal with the newest, accept any). For a server-side lifetime use the
+timed variants: `sealTimed(io, &key, name, value, now_s, &buf)` /
+`openTimed(&keys, name, sealed, now_s, max_age_s, &plain)` (and
+`signTimed`/`verifyTimed`) — the issue time is sealed in, so a stolen cookie
+stops working after `max_age_s` whatever the browser was told. `percentEncode` /
 `percentDecode` make any bytes a valid cookie value (cookie-rs `encoded()`).
 
 ## Client: the cookie jar

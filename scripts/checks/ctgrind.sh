@@ -245,7 +245,7 @@ declare -A TARGETS=(
     # were right about different functions -- `seal`/`open` ARE pure std and are
     # deliberately not targets. The codecs are the module's own choice.
     [sealedbox]="hexenc hexdec b64enc b64dec seal open"
-    [cookies]="derive sign verify seal open"
+    [cookies]="derive sign verify seal open tsign tverify tseal topen"
     # A1 `pir.md` M2: the module's central claim was never machine-checked, and
     # its sibling `fss` exposed a real defect the day IT entered the gate.
     [pir]="query reconstruct"
@@ -626,6 +626,10 @@ declare -A PATTERN=(
     [cookies/verify]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [cookies/seal]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [cookies/open]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
+    [cookies/tsign]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
+    [cookies/tverify]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
+    [cookies/tseal]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
+    [cookies/topen]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [adaptor/extract]='root[.]zig|common[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
     # ⚠ `root[.]zig` here is opaque's own file AND voprf's AND ct25519's (same
     # basename, see the blindrsa note above). That is the intended column:
@@ -880,6 +884,10 @@ declare -A LABEL=(
     [cookies/verify]='cookies signed.verify (CT; 1 = accept/reject)'
     [cookies/seal]='cookies private.seal AES-256-GCM (CT)'
     [cookies/open]='cookies private.open AES-256-GCM (CT; verdict only)'
+    [cookies/tsign]='cookies signed.signTimed (CT)'
+    [cookies/tverify]='cookies signed.verifyTimed (CT; verdict, then public issue time)'
+    [cookies/tseal]='cookies private.sealTimedNonce (CT)'
+    [cookies/topen]='cookies private.openTimed (CT; verdict, then public issue time)'
     [opaque/register]='opaque client registration (password, blind)+voprf'
     [opaque/login]='opaque client KE1+KE3 (password, blind, keyshare)+voprf'
     [opaque/serverke2]='opaque server KE2 (sk, oprf_seed, keyshare, masking_key)'

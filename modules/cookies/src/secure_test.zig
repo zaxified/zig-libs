@@ -220,3 +220,79 @@ test "private: seal over every length 0..200 round-trips (the in-place base64 en
         try testing.expectEqualSlices(u8, value[0..n], secure.private.open(&.{k}, "n", s, &plain).?);
     }
 }
+
+test "signed timed: round trip, the max-age edge, future issue, and every refusal" {
+    const k = vectorKey();
+    var buf: [256]u8 = undefined;
+    const t0: i64 = 1_760_000_000;
+    const s = try secure.signed.signTimed(&k, "sid", "user=42", t0, &buf);
+    try testing.expectEqual(secure.signed.timedLen(7, t0), s.len);
+    try testing.expect(std.mem.endsWith(u8, s, "1760000000|user=42"));
+    try testing.expectEqualStrings("user=42", secure.signed.verifyTimed(&.{k}, "sid", s, t0 + 3600, 3600).?);
+    try testing.expect(secure.signed.verifyTimed(&.{k}, "sid", s, t0 + 3601, 3600) == null);
+    try testing.expect(secure.signed.verifyTimed(&.{k}, "sid", s, t0 - 100, 3600) != null); // issued "in the future"
+    try testing.expect(secure.signed.verifyTimed(&.{k}, "other", s, t0, 3600) == null);
+    // Timed and untimed never accept each other's values.
+    try testing.expect(secure.signed.verify(&.{k}, "sid", s, .{}) == null);
+    try testing.expect(secure.signed.verify(&.{k}, "sid", s, .{ .format = .cookie_rs }) == null);
+    const plain = try secure.signed.sign(&k, "sid", "1760000000|user=42", buf[128..], .{});
+    try testing.expect(secure.signed.verifyTimed(&.{k}, "sid", plain, t0, 3600) == null);
+    // A changed issue time (to look fresh) breaks the MAC.
+    var forged: [256]u8 = undefined;
+    @memcpy(forged[0..s.len], s);
+    forged[44 + 3] = '9';
+    try testing.expect(secure.signed.verifyTimed(&.{k}, "sid", forged[0..s.len], t0 + 1_000_000_000, 3600) == null);
+    // Negative and extreme issue times round-trip; overflowing ages refuse.
+    for ([_]i64{ 0, -5, std.math.minInt(i64), std.math.maxInt(i64) }) |t| {
+        const v = try secure.signed.signTimed(&k, "a", "x", t, &buf);
+        const got = secure.signed.verifyTimed(&.{k}, "a", v, t, 0);
+        try testing.expectEqualStrings("x", got.?);
+    }
+    const old = try secure.signed.signTimed(&k, "a", "x", std.math.minInt(i64), &buf);
+    try testing.expect(secure.signed.verifyTimed(&.{k}, "a", old, std.math.maxInt(i64), std.math.maxInt(i64)) == null);
+    try testing.expectError(error.NoSpaceLeft, secure.signed.signTimed(&k, "a", "x", t0, buf[0 .. secure.signed.timedLen(1, t0) - 1]));
+    try testing.expectError(error.InvalidValue, secure.signed.signTimed(&k, "a", "x y", t0, &buf));
+}
+
+test "private timed: round trip, the max-age edge, domain separation, rotation" {
+    const k = vectorKey();
+    const other = otherKey("other");
+    var buf: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const t0: i64 = 1_760_000_000;
+    var sb: [128]u8 = undefined;
+    const s = try secure.private.sealTimedNonce(&k, "sid", "user=42", t0, @splat(3), &sb);
+    try testing.expectEqual(secure.private.timedLen(7), s.len);
+    try testing.expectEqualStrings("user=42", secure.private.openTimed(&.{ other, k }, "sid", s, t0 + 60, 60, &plain).?);
+    try testing.expect(secure.private.openTimed(&.{k}, "sid", s, t0 + 61, 60, &plain) == null);
+    try testing.expect(std.mem.allEqual(u8, plain[0 .. secure.private.overhead + 8 + 7], 0)); // no plaintext left
+    try testing.expect(secure.private.openTimed(&.{k}, "other", s, t0, 60, &plain) == null);
+    try testing.expect(secure.private.openTimed(&.{other}, "sid", s, t0, 60, &plain) == null);
+    // Timed never opens as untimed (the AD differs) and back.
+    try testing.expect(secure.private.open(&.{k}, "sid", s, &plain) == null);
+    var ts: [8]u8 = undefined;
+    std.mem.writeInt(i64, &ts, t0, .big);
+    const untimed = try secure.private.seal(&k, "sid", &(ts ++ "user=42".*), @splat(3), &buf);
+    try testing.expect(secure.private.openTimed(&.{k}, "sid", untimed, t0, 60, &plain) == null);
+    // Name length bound for the AD buffer.
+    const long_name: [secure.private.max_timed_name + 1]u8 = @splat('n');
+    try testing.expectError(error.InvalidValue, secure.private.sealTimedNonce(&k, &long_name, "v", t0, @splat(0), &buf));
+    try testing.expect(secure.private.openTimed(&.{k}, &long_name, s, t0, 60, &plain) == null);
+    const max_name: [secure.private.max_timed_name]u8 = @splat('n');
+    const s2 = try secure.private.sealTimedNonce(&k, &max_name, "v", t0, @splat(0), &buf);
+    try testing.expectEqualStrings("v", secure.private.openTimed(&.{k}, &max_name, s2, t0, 0, &plain).?);
+    // sealTimed draws its own nonce.
+    var b2: [256]u8 = undefined;
+    const r1 = try secure.private.sealTimed(testing.io, &k, "sid", "v", t0, &b2);
+    try testing.expectEqualStrings("v", secure.private.openTimed(&.{k}, "sid", r1, t0, 0, &plain).?);
+    // Every flipped bit of a timed record is refused.
+    var raw: [64]u8 = undefined;
+    const raw_len = try std.base64.standard.Decoder.calcSizeForSlice(s);
+    try std.base64.standard.Decoder.decode(raw[0..raw_len], s);
+    var enc: [96]u8 = undefined;
+    for (0..raw_len * 8) |bit| {
+        raw[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
+        try testing.expect(secure.private.openTimed(&.{k}, "sid", std.base64.standard.Encoder.encode(&enc, raw[0..raw_len]), t0, 60, &plain) == null);
+        raw[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
+    }
+}

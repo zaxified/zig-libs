@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jshttp/cookie](https://github.com/jshttp/cookie) | TypeScript | MIT | 1.5k | v2.0.1 (2026-06-30) | Minimal parse/serialize pair, the Node/Express cookie parser — the closest peer in scope. *(inferred)* |
 | [nektro/zig-cookies](https://github.com/nektro/zig-cookies) | Zig | MIT | 2 | push 2026-07-08 | Only Zig ecosystem hit; tiny. Zig `std` has no cookie support. *(inferred)* |
 
-**Where we are ahead:** header-injection guard that refuses rather than auto-quotes, `SameSite=None` without `Secure` refused at build time, `__Host-`/`__Secure-` prefix constraints checked, zero allocation, bounded 4096-byte `set`, and the parse side compared against CPython's `http.cookies` as an oracle (one real bug found). · **Where we are behind:** no server-side expiry inside signed/private values (gorilla embeds a timestamp; cookie-rs does not either); no `CookieJar` delta tracking on the server side (the caller calls `set` per cookie); the client jar keeps no state across restarts (no persistence). Closed 2026-10-12: signed and private (encrypted) values byte-compatible with cookie-rs, key rotation, cookie-rs key derivation, percent-encoding (`percentEncode`/`percentDecode`, cookie-rs's set).
+**Where we are ahead:** header-injection guard that refuses rather than auto-quotes, `SameSite=None` without `Secure` refused at build time, `__Host-`/`__Secure-` prefix constraints checked, zero allocation, bounded 4096-byte `set`, and the parse side compared against CPython's `http.cookies` as an oracle (one real bug found). · **Where we are behind:** no `CookieJar` delta tracking on the server side (the caller calls `set` per cookie); the client jar keeps no state across restarts (no persistence). Closed 2026-10-12: signed and private (encrypted) values byte-compatible with cookie-rs, key rotation, cookie-rs key derivation, percent-encoding (`percentEncode`/`percentDecode`, cookie-rs's set), server-side expiry (`*Timed`, gorilla's idea in a format of our own).
 
 ## Design & invariants
 - **Allocation-free.** `parse` returns an `Iterator` whose `Cookie{name,value}` pairs **borrow the
@@ -57,6 +57,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   value-or-null. `open` decrypts in place inside the caller's buffer and wipes it on refusal.
   The tag (sign) and ciphertext ‖ tag (seal) are declassified for ctgrind before base64, as they
   go to the client. Keys by pointer, every entry point under a dead-stack burn.
+- **Timed values (server-side expiry).** `signTimed` = base64(HMAC) ‖ issued (decimal seconds) ‖
+  `|` ‖ value, MAC over `"timed1" 0x00 name "=" issued "|" value`; `sealTimed` = the private format
+  with plaintext = issued (i64 BE) ‖ value and AD = `"timed1" 0x00 name` (name ≤ 255 bytes). The
+  verifier takes `now_s` and `max_age_s` (no clock in this module) and accepts iff
+  `now_s - issued <= max_age_s` (overflow refuses; a future issue time counts as fresh, as in
+  gorilla/securecookie). The verdict and the authenticated issue time are declassified for ctgrind
+  before the age check: public metadata, not the protected value.
 - **Percent-encoding.** `percentEncode` = cookie-rs `Cookie::encoded()` (WHATWG userinfo set +
   `%(),`, uppercase hex), `percentDecode` keeps a malformed `%` literal.
 - **SameSite=None ⇒ Secure enforced.** `.none` without `secure` → `error.InsecureSameSiteNone`
@@ -146,7 +153,12 @@ iff intact) — its first run found a real defect: 44 tag characters without pad
 bytes and std's decoder wrote past the 32-byte tag (`verify` panicked on a client-chosen value);
 now refused and pinned by a test. ctgrind (`ctgrind_harness.zig`, key and plaintext tainted):
 0 in-file contexts for derive/sign/verify/seal, 2 for `open` = aesgcm's own accept/reject (genuine
-and forged call). Dead-stack probe over all five entry points (`stackprobe_test.zig`).
+and forged call). Dead-stack probe over all five entry points (`stackprobe_test.zig`). Timed values
+(same day): round trip, the max-age edge (age == max accepted, +1 refused), future issue, overflowing
+age, every refusal (other name, other key, a rewritten issue time, timed through the untimed API and
+back, every flipped bit, name over 255); the `secure` fuzz harness draws timed values, issue/now
+instants including i64 extremes and cross-mode opens; ctgrind rows tsign/tverify/tseal 0, topen 2
+(aesgcm's verdict); four more stack-probe entry points.
 
 ## Backlog / deferred
 None recorded before the 2026-09-30 survey.
@@ -159,7 +171,7 @@ None recorded before the 2026-09-30 survey.
 
 - ~~**`Set-Cookie` response-header parser**~~ — **DONE 2026-10-05** (`jar.SetCookie.parse`). Was: (survey 2026-09-30) — needed by anything that acts as an HTTP client with cookies (tests of our own server, scrapers); Go `ParseSetCookie` and cookie-rs have it. Effort: small (RFC 6265 §5.2). Fits §2: yes.
 - ~~**Signed / encrypted cookie values**~~ (survey 2026-09-30) — DONE 2026-10-12: `secure.zig` (`signed`, `private`, `Key`), cookie-rs-compatible; construction chosen by the session (owner left it): AEAD AES-256-GCM with the name as AD for `private`, name-bound HMAC by default for `signed`, cookie-rs's unbound format as an option.
-- **Server-side expiry for signed/private values** (2026-10-12) — gorilla/securecookie embeds a timestamp and refuses values older than MaxAge; cookie-rs does not. Today: the caller puts an issue time in the value. Ideal: an opt-in `max_age_s` with the time inside the authenticated payload (a format of our own, not cookie-rs's). Effort: small. Fits §2: yes.
+- ~~**Server-side expiry for signed/private values**~~ (2026-10-12) — DONE the same day (owner left the call to the session): `signed.signTimed`/`verifyTimed`, `private.sealTimed`/`sealTimedNonce`/`openTimed`; the issue time is inside the MAC / ciphertext, in a domain of its own (`"timed1" 0x00` before the name), so timed and untimed values never stand in for each other. Our format, not cookie-rs's.
 - ~~**Client-side `CookieJar`**~~ — **DONE 2026-10-05** (`Jar` + `PublicSuffixList`, the list supplied by the caller; no list = host-only cookies). Was: (survey 2026-09-30) — Go `cookiejar`, cookie-rs `CookieJar`; Domain/Path matching needs the public-suffix list, a data dependency to decide. Effort: medium-large. Fits §2: only with a bundled PSL.
 
 ## Status

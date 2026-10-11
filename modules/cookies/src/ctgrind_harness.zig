@@ -30,7 +30,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const secure = @import("secure.zig");
 
-const Target = enum { derive, sign, verify, seal, open };
+const Target = enum { derive, sign, verify, seal, open, tsign, tverify, tseal, topen };
 
 fn reload(comptime n: usize, s: *const [n]u8) [n]u8 {
     var out: [n]u8 = undefined;
@@ -63,11 +63,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const signed_v = try secure.signed.sign(&pub_key, "sid", &value_mem, &signed_buf, .{});
     var sealed_buf: [500]u8 = undefined;
     const sealed_v = try secure.private.seal(&pub_key, "sid", &value_mem, @splat(0x5a), &sealed_buf);
+    var tsigned_buf: [400]u8 = undefined;
+    const tsigned_v = try secure.signed.signTimed(&pub_key, "sid", &value_mem, 1_760_000_000, &tsigned_buf);
+    var tsealed_buf: [500]u8 = undefined;
+    const tsealed_v = try secure.private.sealTimedNonce(&pub_key, "sid", &value_mem, 1_760_000_000, @splat(0x5a), &tsealed_buf);
 
     if (taint) {
         std.valgrind.memcheck.makeMemUndefined(&master_mem);
         std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&pub_key));
-        if (target == .seal) std.valgrind.memcheck.makeMemUndefined(&value_mem);
+        if (target == .seal or target == .tseal) std.valgrind.memcheck.makeMemUndefined(&value_mem);
     }
     const master = reload(48, &master_mem);
     var keys = [_]secure.Key{undefined};
@@ -116,6 +120,36 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var r2 = secure.private.open(&keys, "sid", bad[0..sealed_v.len], &plain);
             std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&r2));
             if (r2 != null) return error.ForgeryAccepted;
+        },
+        .tsign => {
+            var out: [400]u8 = undefined;
+            const s = try secure.signed.signTimed(&keys[0], "sid", &value, 1_760_000_000, &out);
+            std.debug.print("ctgrind_result={x}\n", .{s[0..secure.signed.tag_b64_len]});
+        },
+        .tverify => {
+            var r = secure.signed.verifyTimed(&keys, "sid", tsigned_v, 1_760_000_010, 60);
+            std.debug.print("ctgrind_verdict={}\n", .{r != null});
+            std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&r));
+            if (r == null) return error.GenuineRefused;
+            std.debug.print("ctgrind_result={x}\n", .{r.?[0..8]});
+            var r2 = secure.signed.verifyTimed(&keys, "sid", tsigned_v, 1_760_001_000, 60);
+            std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&r2));
+            if (r2 != null) return error.ExpiredAccepted;
+        },
+        .tseal => {
+            var out: [500]u8 = undefined;
+            const s = try secure.private.sealTimedNonce(&keys[0], "sid", &value, 1_760_000_000, @splat(0x5a), &out);
+            std.debug.print("ctgrind_result={x}\n", .{s[0..32]});
+        },
+        .topen => {
+            var plain: [500]u8 = undefined;
+            var r = secure.private.openTimed(&keys, "sid", tsealed_v, 1_760_000_010, 60, &plain);
+            std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&r));
+            if (r == null) return error.GenuineRefused;
+            std.debug.print("ctgrind_result={x}\n", .{r.?[0..8]});
+            var r2 = secure.private.openTimed(&keys, "sid", tsealed_v, 1_760_001_000, 60, &plain);
+            std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&r2));
+            if (r2 != null) return error.ExpiredAccepted;
         },
     }
 }

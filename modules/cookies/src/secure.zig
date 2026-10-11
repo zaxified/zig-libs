@@ -40,9 +40,10 @@
 //! - Rotation: `verify`/`open` take a list of keys and accept the first that
 //!   authenticates; `sign`/`seal` use the one key given (the newest).
 //!
-//! Nothing here expires a value: a sealed or signed value stays valid for as
-//! long as its key does. Put an issue time inside the value (or rotate keys)
-//! when the server must refuse old values; `Max-Age` binds only the browser.
+//! `seal`/`sign` values stay valid for as long as their key does; the
+//! `*Timed` variants seal the issue time in (a `timed1` domain of their own)
+//! and refuse a value older than the verifier's `max_age_s` — `Max-Age` binds
+//! only the browser.
 //!
 //! Dead-stack: every entry point that touches a key runs its body under
 //! `burn.run` (`stackprobe_test.zig`); keys are passed by pointer.
@@ -150,8 +151,17 @@ pub const signed = struct {
     }
 
     fn signBody(key: *const Key, name: []const u8, value: []const u8, out: []u8, format: Format) []const u8 {
+        return signMode(key, name, value, out, if (format == .bound) .bound else .cookie_rs);
+    }
+
+    /// What the MAC covers: `bound` = name "=" value; `cookie_rs` = value;
+    /// `timed` = "timed1" 0x00 name "=" issued "|" value (its own domain, so
+    /// a timed value never verifies as an untimed one and back).
+    const Mode = enum { bound, cookie_rs, timed };
+
+    fn signMode(key: *const Key, name: []const u8, value: []const u8, out: []u8, mode: Mode) []const u8 {
         var tag: [HmacSha256.mac_length]u8 = undefined;
-        mac(&tag, key, name, value, format);
+        mac(&tag, key, name, value, mode);
         // The tag goes to the client: declassified for ctgrind before the
         // table-driven base64 indexes by it (a no-op without `-fvalgrind`).
         std.valgrind.memcheck.makeMemDefined(&tag);
@@ -162,9 +172,10 @@ pub const signed = struct {
         return out[0 .. tag_b64_len + value.len];
     }
 
-    fn mac(tag: *[HmacSha256.mac_length]u8, key: *const Key, name: []const u8, value: []const u8, format: Format) void {
+    fn mac(tag: *[HmacSha256.mac_length]u8, key: *const Key, name: []const u8, value: []const u8, mode: Mode) void {
         var h = HmacSha256.init(&key.signing);
-        if (format == .bound) {
+        if (mode == .timed) h.update(timed_domain);
+        if (mode != .cookie_rs) {
             h.update(name);
             h.update("=");
         }
@@ -177,30 +188,97 @@ pub const signed = struct {
     /// authenticates it under `name`; null when none does or the value is
     /// malformed. Never says which key matched or why it failed.
     pub fn verify(keys: []const Key, name: []const u8, signed_value: []const u8, opts: Options) ?[]const u8 {
-        if (signed_value.len < tag_b64_len) return null;
         var presented: [HmacSha256.mac_length]u8 = undefined;
+        if (!decodeTag(signed_value, &presented)) return null;
+        return burn.run(burn.mac_burn, ?[]const u8, verifyBody, .{ keys, name, signed_value, &presented, if (opts.format == .bound) Mode.bound else Mode.cookie_rs });
+    }
+
+    fn decodeTag(signed_value: []const u8, presented: *[HmacSha256.mac_length]u8) bool {
+        if (signed_value.len < tag_b64_len) return false;
         // std's decoder wants `dest.len` to be exactly the decoded size: 44
         // characters without the padding `=` decode to 33 bytes (found by
         // the `secure` fuzz harness, 2026-10-12 — an out-of-bounds panic).
         const tag_text = signed_value[0..tag_b64_len];
-        if ((b64.Decoder.calcSizeForSlice(tag_text) catch return null) != presented.len) return null;
-        b64.Decoder.decode(&presented, tag_text) catch return null;
-        return burn.run(burn.mac_burn, ?[]const u8, verifyBody, .{ keys, name, signed_value, &presented, opts.format });
+        if ((b64.Decoder.calcSizeForSlice(tag_text) catch return false) != presented.len) return false;
+        b64.Decoder.decode(presented, tag_text) catch return false;
+        return true;
     }
 
-    fn verifyBody(keys: []const Key, name: []const u8, signed_value: []const u8, presented: *const [HmacSha256.mac_length]u8, format: Format) ?[]const u8 {
+    fn verifyBody(keys: []const Key, name: []const u8, signed_value: []const u8, presented: *const [HmacSha256.mac_length]u8, mode: Mode) ?[]const u8 {
         const value = signed_value[tag_b64_len..];
         var ok = false;
         for (keys) |*k| {
             var tag: [HmacSha256.mac_length]u8 = undefined;
-            mac(&tag, k, name, value, format);
+            mac(&tag, k, name, value, mode);
             // Every key is tried, also after a match: the time depends on
             // the number of keys only, not on which one matched.
             ok = timing_safe.eql([HmacSha256.mac_length]u8, tag, presented.*) or ok;
         }
         return if (ok) value else null;
     }
+
+    /// Length of `signTimed`'s result for a `value_len`-byte value issued at
+    /// `issued_s`.
+    pub fn timedLen(value_len: usize, issued_s: i64) usize {
+        return tag_b64_len + decimalLen(issued_s) + 1 + value_len;
+    }
+
+    /// `sign` with the issue time inside the MAC: base64(HMAC) ‖ issued_s
+    /// (decimal) ‖ "|" ‖ value. `verifyTimed` refuses it once it is older
+    /// than its `max_age_s`, whatever the browser's `Max-Age` did. A format
+    /// of this module's own (gorilla/securecookie's idea, not its bytes);
+    /// cookie-rs has none. `issued_s` is the caller's clock (seconds).
+    pub fn signTimed(key: *const Key, name: []const u8, value: []const u8, issued_s: i64, out: []u8) SignError![]const u8 {
+        for (value) |c| if (!isCookieOctet(c)) return error.InvalidValue;
+        const total = timedLen(value.len, issued_s);
+        if (out.len < total) return error.NoSpaceLeft;
+        // issued "|" value, built in place after the tag, then signed.
+        std.mem.copyBackwards(u8, out[total - value.len .. total], value);
+        const digits = std.fmt.bufPrint(out[tag_b64_len..], "{d}|", .{issued_s}) catch unreachable;
+        std.debug.assert(digits.len == total - value.len - tag_b64_len);
+        return burn.run(burn.mac_burn, []const u8, signMode, .{ key, name, out[tag_b64_len..total], out[0..total], Mode.timed });
+    }
+
+    /// The value (a slice of `signed_value`) when one of `keys` authenticates
+    /// a `signTimed` value under `name` AND `now_s - issued <= max_age_s`;
+    /// null otherwise (forged, another name, untimed, too old, malformed).
+    pub fn verifyTimed(keys: []const Key, name: []const u8, signed_value: []const u8, now_s: i64, max_age_s: i64) ?[]const u8 {
+        var presented: [HmacSha256.mac_length]u8 = undefined;
+        if (!decodeTag(signed_value, &presented)) return null;
+        var verdict = burn.run(burn.mac_burn, ?[]const u8, verifyBody, .{ keys, name, signed_value, &presented, Mode.timed });
+        // The accept/reject verdict is this function's public answer, and the
+        // payload it points at is the client's own text: declassified for
+        // ctgrind before parsing the (authenticated, public) issue time.
+        std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&verdict));
+        const payload = verdict orelse return null;
+        const bar = std.mem.indexOfScalar(u8, payload, '|') orelse return null;
+        const issued = parseIssued(payload[0..bar]) orelse return null;
+        if (!fresh(issued, now_s, max_age_s)) return null;
+        return payload[bar + 1 ..];
+    }
 };
+
+/// Domain prefix of every timed MAC input / AEAD associated data.
+const timed_domain = "timed1\x00";
+
+fn decimalLen(v: i64) usize {
+    var buf: [24]u8 = undefined;
+    return (std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable).len;
+}
+
+/// The decimal `signTimed` wrote: an optional '-', 1..19 digits, nothing else.
+fn parseIssued(text: []const u8) ?i64 {
+    if (text.len == 0 or text.len > 20) return null;
+    for (text, 0..) |c, i| if (!(std.ascii.isDigit(c) or (c == '-' and i == 0 and text.len > 1))) return null;
+    return std.fmt.parseInt(i64, text, 10) catch null;
+}
+
+/// `issued` is no older than `max_age_s` at `now_s` (a value from the future
+/// — clocks of two servers — counts as fresh, as in gorilla/securecookie).
+fn fresh(issued: i64, now_s: i64, max_age_s: i64) bool {
+    const age = std.math.sub(i64, now_s, issued) catch return false;
+    return age <= max_age_s;
+}
 
 pub const private = struct {
     const Aes = aesgcm.Aes256Gcm;
@@ -237,6 +315,81 @@ pub const private = struct {
         const enc_len = len(value.len);
         if (out.len < enc_len) return error.NoSpaceLeft;
         return burn.run(burn.msg_burn, []const u8, sealBody, .{ key, name, value, nonce, out[0..enc_len] });
+    }
+
+    /// Longest cookie name `sealTimed`/`openTimed` take (it is copied into
+    /// the associated data behind the timed domain prefix).
+    pub const max_timed_name = 255;
+    const issued_len = 8;
+
+    /// Length of `sealTimed`'s result for a `value_len`-byte value.
+    pub fn timedLen(value_len: usize) usize {
+        return len(issued_len + value_len);
+    }
+
+    /// `sealRandom` with the issue time sealed in: plaintext = issued_s (i64
+    /// big-endian) ‖ value, associated data = "timed1" 0x00 ‖ name, so a
+    /// timed value never opens as an untimed one and back. `openTimed`
+    /// refuses it once older than its `max_age_s`. This module's own format
+    /// (gorilla/securecookie's idea); cookie-rs's `PrivateJar` cannot open it.
+    pub fn sealTimed(io: std.Io, key: *const Key, name: []const u8, value: []const u8, issued_s: i64, out: []u8) SealRandomError![]const u8 {
+        var nonce: [nonce_len]u8 = undefined;
+        try io.randomSecure(&nonce);
+        return sealTimedNonce(key, name, value, issued_s, nonce, out);
+    }
+
+    /// `sealTimed` with the caller's nonce (tests, vectors). Never repeat one
+    /// under a key.
+    pub fn sealTimedNonce(key: *const Key, name: []const u8, value: []const u8, issued_s: i64, nonce: [nonce_len]u8, out: []u8) SignError![]const u8 {
+        if (name.len > max_timed_name) return error.InvalidValue;
+        const enc_len = timedLen(value.len);
+        if (out.len < enc_len) return error.NoSpaceLeft;
+        return burn.run(burn.msg_burn, []const u8, sealTimedBody, .{ key, name, value, issued_s, nonce, out[0..enc_len] });
+    }
+
+    fn timedAd(buf: *[timed_domain.len + max_timed_name]u8, name: []const u8) []const u8 {
+        @memcpy(buf[0..timed_domain.len], timed_domain);
+        @memcpy(buf[timed_domain.len..][0..name.len], name);
+        return buf[0 .. timed_domain.len + name.len];
+    }
+
+    fn sealTimedBody(key: *const Key, name: []const u8, value: []const u8, issued_s: i64, nonce: [nonce_len]u8, out: []u8) []const u8 {
+        const m_len = issued_len + value.len;
+        const r = overhead + m_len;
+        const raw = out[out.len - r ..];
+        std.debug.assert(!overlaps(raw, value));
+        raw[0..nonce_len].* = nonce;
+        // The plaintext is assembled where the ciphertext goes and encrypted
+        // in place (`c == m` is allowed).
+        const m = raw[nonce_len..][0..m_len];
+        std.mem.writeInt(i64, m[0..issued_len], issued_s, .big);
+        @memcpy(m[issued_len..], value);
+        var ad_buf: [timed_domain.len + max_timed_name]u8 = undefined;
+        const tag = raw[nonce_len + m_len ..][0..tag_len];
+        Aes.encryptInto(m, tag, m, timedAd(&ad_buf, name), nonce, &key.encryption);
+        std.valgrind.memcheck.makeMemDefined(raw);
+        encodeInPlace(out, r);
+        return out;
+    }
+
+    /// The value (a slice of `out`) when one of `keys` opens a `sealTimed`
+    /// value under `name` AND `now_s - issued <= max_age_s`; null otherwise.
+    /// `out.len >= openBufLen(sealed.len)`. On null, `out` holds no plaintext.
+    pub fn openTimed(keys: []const Key, name: []const u8, sealed: []const u8, now_s: i64, max_age_s: i64, out: []u8) ?[]const u8 {
+        if (name.len > max_timed_name) return null;
+        const raw_len = b64.Decoder.calcSizeForSlice(sealed) catch return null;
+        if (raw_len < overhead + issued_len or out.len < raw_len) return null;
+        var ad_buf: [timed_domain.len + max_timed_name]u8 = undefined;
+        const ad = timedAd(&ad_buf, name);
+        const m = burn.run(burn.msg_burn, ?[]const u8, openBody, .{ keys, ad, sealed, out[0..raw_len] }) orelse return null;
+        // Authenticated: the issue time is metadata, not the protected value.
+        var issued_bytes: [issued_len]u8 = m[0..issued_len].*;
+        std.valgrind.memcheck.makeMemDefined(&issued_bytes);
+        if (!fresh(std.mem.readInt(i64, &issued_bytes, .big), now_s, max_age_s)) {
+            std.crypto.secureZero(u8, out[0..raw_len]);
+            return null;
+        }
+        return out[issued_len..m.len];
     }
 
     fn sealBody(key: *const Key, name: []const u8, value: []const u8, nonce: [nonce_len]u8, out: []u8) []const u8 {

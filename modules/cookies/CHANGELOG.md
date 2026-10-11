@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Server-side expiry for signed/private values.** `signed.signTimed`/`verifyTimed`, `private.sealTimed`/`sealTimedNonce`/`openTimed` (`timedLen`, `max_timed_name`): issue time inside the MAC/ciphertext under a `timed1` domain, verifier takes `now_s`/`max_age_s`. Tests, fuzz, ctgrind rows, stack probe extended.
 - **2026-10-12** — **Signed and encrypted cookie values + percent-encoding (S3 → S2).** `secure.zig`: `private` (AES-256-GCM, name as AD, cookie-rs `PrivateJar` format), `signed` (HMAC-SHA256; name-bound by default, cookie-rs `SignedJar` format as `.cookie_rs`), `Key` (`fromBytesInto`, `deriveInto` = cookie-rs `derive_from`, `generateInto`), key rotation in `verify`/`open`; `percentEncode`/`percentDecode` (cookie-rs `encoded()` set). New dep `aesgcm`. Vectors from pyca/cryptography, fuzz harness `secure` (found and fixed an out-of-bounds write on an unpadded tag before release), ctgrind harness, dead-stack probe.
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-cookies`, kept instrument kind 3): card Performance 0.29–0.64× Go net/http, measured on a quiet host. Tooling only, no code change.
 

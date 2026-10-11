@@ -129,7 +129,18 @@ pub fn secureHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
 
     var enc: [256]u8 = undefined;
     const use_private = src.value(bool);
-    const genuine = if (use_private)
+    // Timed values (signTimed / sealTimed): issued at one of a few instants,
+    // checked at another, so "too old" and the exact edge both occur.
+    const timed = src.value(bool);
+    const instants = [_]i64{ -1, 0, 1, 99, 100, 101, 1_760_000_000, std.math.maxInt(i64), std.math.minInt(i64) };
+    const issued = instants[src.index(instants.len)];
+    const now = instants[src.index(instants.len)];
+    const max_age: i64 = if (src.value(bool)) 100 else 0;
+    const genuine = if (timed and use_private)
+        try secure.private.sealTimedNonce(&key, name, value, issued, @splat(src.value(u8)), &enc)
+    else if (timed)
+        try secure.signed.signTimed(&key, name, value, issued, &enc)
+    else if (use_private)
         try secure.private.seal(&key, name, value, @splat(src.value(u8)), &enc)
     else
         try secure.signed.sign(&key, name, value, &enc, .{});
@@ -138,7 +149,9 @@ pub fn secureHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     var presented: []u8 = presented_buf[0..genuine.len];
     var open_name: []const u8 = name;
     var keys = [_]secure.Key{ other, key };
-    switch (src.index(7)) {
+    var cross_mode = false;
+    switch (src.index(8)) {
+        7 => cross_mode = true,
         0 => {},
         1 => presented[src.index(presented.len)] ^= src.value(u8) | 1,
         2 => presented = presented[0..src.index(presented.len)],
@@ -154,9 +167,16 @@ pub fn secureHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
         else => keys[1] = other,
     }
     const intact = std.mem.eql(u8, presented, genuine) and open_name.ptr == name.ptr and
-        std.mem.eql(u8, &keys[1].signing, &key.signing);
+        std.mem.eql(u8, &keys[1].signing, &key.signing) and !cross_mode and
+        (!timed or (std.math.sub(i64, now, issued) catch std.math.maxInt(i64)) <= max_age);
     var plain: [300]u8 = undefined;
-    const got = if (use_private)
+    // `cross_mode`: a timed value through the untimed API, or the reverse.
+    const as_timed = timed != cross_mode;
+    const got = if (as_timed and use_private)
+        secure.private.openTimed(&keys, open_name, presented, now, max_age, &plain)
+    else if (as_timed)
+        secure.signed.verifyTimed(&keys, open_name, presented, now, max_age)
+    else if (use_private)
         secure.private.open(&keys, open_name, presented, &plain)
     else
         secure.signed.verify(&keys, open_name, presented, .{});
