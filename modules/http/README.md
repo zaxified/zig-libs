@@ -33,8 +33,7 @@ behavior. The full spec list and the design-reference record are in
    `activeConnections()`, 431/414/413 size limits, stall + whole-request +
    write timeouts (details below). **Phase 2.2 (DONE) added negotiated
    gzip response compression** (`Options.compression`, off by default —
-   see "Response compression"). Still plain HTTP only: a TLS-terminating
-   server is a separate later task (a reverse proxy also works).
+   see "Response compression"). Still plain HTTP only: a native TLS-terminating server is planned right after the zig-libs maturity goal, on our fork of ianic/tls; until then TLS is the caller's (`serveStream` + ALPN) or a reverse proxy's.
 3. **DONE — HTTP/2** (`hpack` RFC 7541 + `h2` RFC 9113 framing/state
    machine/flow control): opt-in cleartext h2c on the server
    (`Options.enable_h2c`, prior knowledge), a multiplexing client
@@ -362,8 +361,8 @@ HEADERS frame is materialized into it once the body ends.
 - **Auto headers:** `Date` (IMF-fixdate) + `Server` on every response,
   overridable via `setHeader`; `Connection`/`Transfer-Encoding` are managed
   by the writer (`setHeader("Connection", "close")` requests a close,
-  Transfer-Encoding is ignored). `setHeader` replaces same-named headers —
-  repeated fields (multiple Set-Cookie) are not supported yet. To omit
+  Transfer-Encoding is ignored). `setHeader` replaces same-named headers;
+  `Set-Cookie` repeats through `addSetCookie`. To omit
   either auto header instead of overriding it, set `Options.server_name =
   null` (`Server`) — omits `Server`; `.emit_date = false` — omits `Date`.
   Both default to their historical always-on behavior, and both are also
@@ -374,10 +373,12 @@ HEADERS frame is materialized into it once the body ends.
   505; unknown method token → 501; missing Host on 1.1 → 400;
   `Transfer-Encoding` without chunked → 400 (Go answers 501 here);
   handler error → 500 when nothing was sent, otherwise the connection dies
-  mid-response. `Expect: 100-continue` is acknowledged eagerly. Absolute-
+  mid-response. `Expect: 100-continue` is acknowledged on the handler's first body read
+  (`Request.reader`); a handler that answers without reading never invites
+  the body, and the response then closes the connection. Absolute-
   form request targets are rejected (origin-form + `*` only).
-- **No TLS in the server** — terminate TLS in front (Caddy/any proxy); a
-  native TLS-terminating server is a separate later task.
+- **No TLS in the server yet** — terminate TLS in front (Caddy/any proxy,
+  or your own TLS layer over `serveStream`); a native TLS-terminating server is planned right after the zig-libs maturity goal, on our fork of ianic/tls.
 
 ## Multicore accept engine (SO_REUSEPORT thread-per-core)
 

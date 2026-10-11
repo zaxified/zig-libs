@@ -24,7 +24,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [Go `net/http`](https://pkg.go.dev/net/http) — **reference** | Go | BSD-3-Clause | — | Go stdlib (current) | The yardstick for a batteries-included server + client. Native `ListenAndServeTLS`, HTTP/2 negotiated by ALPN, cookie jar, `Hijacker`, `ServeMux`. This module has no TLS server (BYO-TLS seam only), no cookie jar, no HTTP/3 (Go has none in stdlib either). *(inferred from docs)* |
+| [Go `net/http`](https://pkg.go.dev/net/http) — **reference** | Go | BSD-3-Clause | — | Go stdlib (current) | The yardstick for a batteries-included server + client. Native `ListenAndServeTLS`, HTTP/2 negotiated by ALPN, cookie jar, `Hijacker`, `ServeMux`. This module has no TLS server yet (BYO-TLS seam; planned), no HTTP/3 (Go has none in stdlib either); the client cookie jar is `Client.Options.cookie_jar` over the sibling `cookies.Jar`. *(inferred from docs)* |
 | [hyperium/hyper](https://github.com/hyperium/hyper) | Rust | MIT | 16.3k | v1.11.1 (2026-08-28) | HTTP/1 + HTTP/2 client and server as a low-level building block; TLS, routing, static files are other crates. Closest in shape to this module's split; HTTP/3 lives in separate crates *(inferred)*. |
 | [hyperium/h2](https://github.com/hyperium/h2) | Rust | MIT | 1.6k | v0.4.19 (2026-08-24) | The HTTP/2 engine under hyper; no HTTP/1. |
 | [karlseguin/http.zig](https://github.com/karlseguin/http.zig) (httpz) | Zig | MIT | 1.6k | no release (push 2026-08-26) | HTTP/1.1 server only, with router, middleware (built-in CORS) and websocket handoff; its README calls the Zig 0.16 port "not well tested". No HTTP/2, no client *(README; TLS not mentioned → inferred none)*. |
@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.http` | Zig | MIT | — | Zig 0.16.0 | `Client` (TLS, redirects, pooling) and an HTTP/1.1 `Server` with `upgradeRequested`/`respondWebSocket`; no HTTP/2, no range/conditional/multipart/conneg helpers, no proxy (checked in 0.16.0's `lib/std/http/`). |
 | [tardy-org/zzz](https://github.com/tardy-org/zzz) | Zig | MPL-2.0 (source not read) | 790 | v0.3.2 (2026-06-13) | Alpha framework: HTTP and HTTPS server on the tardy runtime. Copyleft-file licence, so source is off limits here. |
 
-**Where we are ahead:** the only pure-Zig stack here with HTTP/2 on **both** client and server, h2c and BYO-TLS/ALPN (`serveStream`, `connectH2Over`), a reverse proxy over h1/h2, trailers in both directions and both protocols, streaming multipart, SSE, range/conditional/conneg/gzip/problem helpers, and a socket-free `serveStream` that makes every one of them testable offline; interop tests against curl and an h11 oracle. **Where we are behind:** no native TLS server (Go, dusty, zzz have one; here it is deliberately the caller's, and qap does exactly that), no client-side cookie jar (server-side `Cookie` parsing and `Set-Cookie` are the sibling `cookies` module's; an outbound proxy -- forward and `CONNECT`, Go's environment rules -- landed 2026-10-05), no HTTP/3, no PROXY-protocol parsing (→ Backlog).
+**Where we are ahead:** the only pure-Zig stack here with HTTP/2 on **both** client and server, h2c and BYO-TLS/ALPN (`serveStream`, `connectH2Over`), a reverse proxy over h1/h2, trailers in both directions and both protocols, streaming multipart, SSE, range/conditional/conneg/gzip/problem helpers, and a socket-free `serveStream` that makes every one of them testable offline; interop tests against curl and an h11 oracle. **Where we are behind:** no native TLS server yet (Go, dusty, zzz have one; here it is the caller's, and qap does exactly that — planned on our ianic/tls fork, see Backlog), no HTTP/3, no PROXY-protocol parsing (→ Backlog; Go's stdlib has neither). The client cookie jar (`Client.Options.cookie_jar`, sibling `cookies.Jar` with the public-suffix list, 2026-10-05) and an outbound proxy (forward and `CONNECT`, Go's environment rules, 2026-10-05) are in. The 2026-10-11 S2 survey (`go doc` of net/http, httputil, cookiejar, httptest against this module) lists the remaining gaps R1–R10 in Backlog.
 
 ## Design & invariants
 Submodules: `Client` / `Server` (h1), `h1` (parser), `hpack` + `h2` + `h2_server` + `h2_client`
@@ -382,15 +382,43 @@ directly-exposed parser.
 ## Backlog / deferred
 **`interop-http` on CI: Go oracle verdicts differ from the committed vectors** — DONE 2026-10-07 (`GOTOOLCHAIN=go1.26.0` in the environment `tools/interop.zig` hands the Go oracle; h2spec v2.2.1 and the SSE venv installed by ci-environment's interop role; the CI interop lane re-took all three phases green, probe run 37556035597). Was: OPEN (2026-10-07, CI interop lane). The runner's `go` produced a different `go_oracle_vectors.zig` than the committed one, which a local go1.26.0 reproduces byte for byte — the oracle moved, not our parser. Before http leaves the lane's local-only list: pin the toolchain (`toolchain go1.26.0` in the oracle's go.mod, so `go` fetches that one), install h2spec and the oracle venv in ci-environment's interop role, then diff the verdicts once more.
 
-- **From the Go oracle (2026-10-05), judged but open** — each is a recorded divergence in
-  `src/go_oracle.zig`, kept because the current answer is legal; listed here so a later decision
-  can move it. (a) A duplicate `Content-Disposition` parameter takes the first (`body.ContentType
-  .param`); Go refuses the whole disposition -- a front end that does the same sees an unnamed
-  field where we see `a`. (b) Quoted-string parameters come back zero-copy with quoted-pairs not
-  unescaped (`name="a\"b"` → `a\"b`). (c) ~~client-side TE leniency~~ fixed the same day
-  (client area). (d) RFC 850 two-digit years use a fixed 70 pivot; RFC 9110 §5.6.7 wants "more than 50 years
-  ahead is the past", which needs a clock -- `69` is right today, `70`-`76` already are not.
-  (e) HTTP/1.0 `Connection: keep-alive` is never honoured; methods outside `Method` get 501.
+- **From the Go oracle (2026-10-05), judged** — each was a recorded divergence in
+  `src/go_oracle.zig`. (a) ~~a duplicate `Content-Disposition` parameter took the first~~ fixed
+  2026-10-12 (owner: "jako Go"): any parameter named twice (case-insensitive) drops the whole
+  disposition, as `mime.ParseMediaType` does — the part has no `name`/`filename`, so a front end
+  and this parser cannot read two field names out of one header. (b) ~~quoted-pairs not
+  unescaped~~ fixed 2026-10-12: `multipart` unescapes `name`/`filename` in place (`parse` takes
+  `[]u8` now — source-breaking for a `[]const u8` caller, none outside tests), and
+  `body.ContentType.paramUnescaped` copies; only a backslash before a tspecial escapes, as Go
+  (oracle case `name-escaped-letter`). (c) ~~client-side TE leniency~~ fixed 2026-10-05.
+  (d) RFC 850 two-digit years use a fixed 70 pivot; RFC 9110 §5.6.7 wants "more than 50 years
+  ahead is the past", which needs a clock -- `69` is right today, `70`-`76` already are not. Kept:
+  an obsolete format nobody sends. (e) ~~HTTP/1.0 `Connection: keep-alive` never honoured~~ fixed
+  2026-10-12: honoured, echoed as `Connection: keep-alive`, closed when the body has no known
+  length (RFC 9112 §9.3). Methods outside `Method` still get 501 → R9 below (owner 2026-10-11: pass
+  them to the handler, as Go does).
+
+**S3 → S2 plan (survey 2026-10-11, `go doc` of net/http + httputil + cookiejar + httptest; owner
+decisions the same day: every gap a Go user notices is implemented, TLS server planned separately).**
+Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML notes, not shipped).
+- R1 graceful lifecycle: `shutdownGraceful(deadline)` (idle connections closed, in-flight requests
+  finish, h2 GOAWAY), `close`, `registerOnShutdown`. `shutdown()` today only stops accepting.
+- R2 timeouts Go has: `read_header_timeout_ms`, `idle_timeout_ms` as ABSOLUTE phase deadlines (a peer
+  dribbling one byte per period defeats an inactivity timer; qap measured 75 s against a 10 s one),
+  per-request read/write deadlines.
+- R3 handler helpers: `addHeader`/`getHeader`/`delHeader`, `redirect`, `writeError`/`notFound`,
+  `Request.headerAll`, `basicAuth` (+ client `basicAuthHeader`), per-request `limitBody`.
+- R4 `http.form`: one form object over query + urlencoded + multipart (Go `ParseForm`/`FormValue`),
+  client form encoder.
+- R5 `on_error` hook (Go `ErrorLog`).
+- R6 oracle divergences (a)(b)(e) above — DONE 2026-10-12.
+- R7 reverse proxy: rewrite/modify-response/error hooks, flush for streaming responses (the h1 relay
+  never flushes: SSE through it waits for a full buffer — survey reading, test first), Upgrade/WebSocket
+  passthrough.
+- R8 client: transparent gzip (opt-in), h2 via ALPN in `Client.request`, `max_conns_per_host`.
+- R9 extension methods (CONNECT, TRACE, `PURGE`, …) reach the handler instead of 501 — breaks
+  exhaustive `switch (req.method)` in qap (5), metrics, mcp-http, openapi; patched together.
+- R10 a test recorder (`httptest.NewRecorder`) over `serveStream`.
 
 - ~~**h2 inbound gzip decode.**~~ — **DONE 2026-09-29**: `h2_server.Options.max_decompressed_request_bytes`
   / `verify_inbound_trailer` (forwarded by `connMain`), the same `GunzipBody` over the h2 request
@@ -500,8 +528,8 @@ pending a native std TLS server.
   connecting a host name starts no task on the Io` (an `Io` whose vtable counts every task start:
   0 with the option, >0 without; 4 before the fix).
 
-- **Native TLS-terminating server** *(survey 2026-09-30)* — Go, dusty and zzz serve HTTPS directly; here TLS is the caller's (`serveStream` + ALPN). A user without a fronting proxy or qap-style TLS layer cannot deploy the server alone. Effort: large (needs a pure-Zig TLS server, `std.crypto.tls` has only the client; qap's TLS fork is the candidate source). Fits CONVENTIONS §2 (pure Zig) once a TLS server exists; blocked on that dependency.
-- **Client cookie jar** *(survey 2026-09-30)* — Go `net/http` ships `CookieJar`. Server-side `Cookie:` parsing and a `Set-Cookie` builder are the sibling `cookies` module's job (see its SPEC); a client-side jar (domain/path matching, carrying cookies across redirects) exists in neither. Effort: medium. Fits §2.
+- **Native TLS-terminating server** *(survey 2026-09-30)* — Go, dusty and zzz serve HTTPS directly; here TLS is the caller's (`serveStream` + ALPN). A user without a fronting proxy or qap-style TLS layer cannot deploy the server alone. Effort: large (needs a pure-Zig TLS server, `std.crypto.tls` has only the client; qap's TLS fork is the candidate source). Fits CONVENTIONS §2 (pure Zig) once a TLS server exists. **PLANNED (owner, 2026-10-11):** not an S2 blocker (the BYO-TLS seam is the design); scheduled right after the zig-libs maturity goal closes, built on our fork of ianic/tls (qap's TLS fork) and optimized for it.
+- ~~**Client cookie jar**~~ — DONE 2026-10-05 (`Client.Options.cookie_jar`, consulted on every request and redirect hop; the implementation is the sibling `cookies.Jar` with a public-suffix list). This line said "exists in neither" until the 2026-10-11 survey caught it.
 - **HTTP/3 (QUIC)** *(survey 2026-09-30)* — Go's stdlib has none either, hyper needs separate crates; listed only so the gap is on record. Effort: very large; pure Zig possible but no consumer. Not a priority.
 - **`ResponseWriter.header_buf` as a 4 KiB inline hole** *(qap R4, 2026-09-30)* — the writer is
   ~6 KB, 4 KiB of it `header_buf`, of which a small response touches a few dozen bytes. On a

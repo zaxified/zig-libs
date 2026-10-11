@@ -81,7 +81,8 @@ pub const ContentType = struct {
     }
 
     /// The value of parameter `name` (case-insensitive), or null. Value is a
-    /// slice into the header (quotes stripped, escapes NOT processed).
+    /// slice into the header (quotes stripped, escapes NOT processed — see
+    /// `paramUnescaped`). A parameter given twice yields the first.
     pub fn param(ct: ContentType, name: []const u8) ?[]const u8 {
         var it = ct.params();
         while (it.next()) |p| {
@@ -89,7 +90,45 @@ pub const ContentType = struct {
         }
         return null;
     }
+
+    /// `param` with a quoted value's quoted-pairs unescaped into `out`
+    /// (`name="a\"b"` → `a"b`), as Go's `mime.ParseMediaType` returns it. An
+    /// unquoted value is copied as is. `error.NoSpaceLeft` when `out` is
+    /// shorter than the result; `value.len` always suffices.
+    pub fn paramUnescaped(ct: ContentType, name: []const u8, out: []u8) error{NoSpaceLeft}!?[]const u8 {
+        const v = ct.param(name) orelse return null;
+        if (v.len > out.len) return error.NoSpaceLeft;
+        @memcpy(out[0..v.len], v);
+        return if (isQuotedValue(ct.params_section, v)) unescapeQuoted(out[0..v.len]) else out[0..v.len];
+    }
 };
+
+/// Whether `value` — a slice of `section` handed out by `ParamIterator` — was
+/// a quoted-string on the wire (the iterator strips the quotes).
+pub fn isQuotedValue(section: []const u8, value: []const u8) bool {
+    const off = @intFromPtr(value.ptr) -% @intFromPtr(section.ptr);
+    return off > 0 and off <= section.len and section[off - 1] == '"';
+}
+
+/// Unescape a quoted-string's quoted-pairs in place and return the shortened
+/// slice. Only a backslash before a tspecial (RFC 2045 §5.1) is an escape;
+/// any other backslash stays, as Go's `mime.ParseMediaType` keeps it
+/// (`"a\xb"` → `a\xb`, Go oracle `name-escaped-letter`).
+pub fn unescapeQuoted(v: []u8) []u8 {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < v.len) : (i += 1) {
+        if (v[i] == '\\' and i + 1 < v.len and isTspecial(v[i + 1])) i += 1;
+        v[w] = v[i];
+        w += 1;
+    }
+    return v[0..w];
+}
+
+/// RFC 2045 §5.1 tspecials.
+fn isTspecial(c: u8) bool {
+    return std.mem.indexOfScalar(u8, "()<>@,;:\\\"/[]?=", c) != null;
+}
 
 pub const Param = struct { name: []const u8, value: []const u8 };
 
@@ -461,4 +500,18 @@ test "corpus: every urlencoded seed reaches the decoder, and the pairs yielded a
     // octets before the draw was fixed; 12 / 18 / 81 after.
     try testing.expectEqual(@as(usize, 18), pairs);
     try testing.expectEqual(@as(usize, 81), decoded_octets);
+}
+
+test "ContentType.paramUnescaped: quoted-pairs before tspecials only, unquoted copied, short out refused" {
+    const ct = ContentType.parse("form-data; name=\"a\\\"b\\\\c\\x\"; plain=x\\y").?;
+    var out: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("a\"b\\c\\x", (try ct.paramUnescaped("name", &out)).?);
+    // Unquoted: no unescaping (a backslash is not legal in a token anyway).
+    try std.testing.expectEqualStrings("x\\y", (try ct.paramUnescaped("plain", &out)).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try ct.paramUnescaped("missing", &out));
+    var tiny: [3]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, ct.paramUnescaped("name", &tiny));
+    // A trailing lone backslash stays.
+    var v = "a\\".*;
+    try std.testing.expectEqualStrings("a\\", unescapeQuoted(&v));
 }

@@ -76,12 +76,16 @@ pub const Error = error{
 /// One parsed part. All slices point into the source buffer, which must
 /// outlive the part.
 pub const Part = struct {
-    /// The Content-Disposition `name` parameter (the form-field name). Null
-    /// only for a malformed part missing it (RFC 7578 §4.2 requires it).
+    /// The Content-Disposition `name` parameter (the form-field name),
+    /// quoted-pairs unescaped (`name="a\"b"` → `a"b`; the source bytes are
+    /// rewritten for that). Null for a malformed part missing it (RFC 7578
+    /// §4.2 requires it), and for a disposition that names any parameter
+    /// twice, which Go refuses as a whole.
     name: ?[]const u8,
     /// The Content-Disposition `filename` parameter — present ⇒ this part is a
-    /// file upload. ATTACKER-CONTROLLED: never use as a filesystem path
-    /// without sanitizing (basename, charset allow-list).
+    /// file upload. Unescaped and dropped as `name` is. ATTACKER-CONTROLLED:
+    /// never use as a filesystem path without sanitizing (basename, charset
+    /// allow-list).
     filename: ?[]const u8,
     /// The part's own `Content-Type` (e.g. `application/pdf`); null ⇒ the
     /// RFC 7578 default `text/plain` applies.
@@ -116,23 +120,56 @@ const Meta = struct {
     filename: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
 
-    fn of(headers_raw: []const u8) Meta {
+    /// `headers_raw` is mutable because a quoted `name`/`filename` is
+    /// unescaped in place (`name="a\"b"` → `a"b`, as Go's `mime/multipart`
+    /// returns it); that header's line then no longer reads as sent.
+    fn of(headers_raw: []u8) Meta {
         var m: Meta = .{ .content_type = findHeader(headers_raw, "content-type") };
-        if (findHeader(headers_raw, "content-disposition")) |cd_raw| {
-            if (body.ContentType.parse(cd_raw)) |cd| {
-                m.name = cd.param("name");
-                m.filename = cd.param("filename");
-            }
+        const cd_raw = findHeader(headers_raw, "content-disposition") orelse return m;
+        const cd = body.ContentType.parse(cd_raw) orelse return m;
+        // A parameter given twice (any parameter, names compared without
+        // case) drops the whole disposition, as Go's `mime.ParseMediaType`
+        // refuses it: two parsers must not read two field names out of one
+        // header (`name="email"; name="admin"`). More parameters than a
+        // browser ever sends are dropped the same way, which keeps the
+        // check linear.
+        var seen: [max_disposition_params][]const u8 = undefined;
+        var n: usize = 0;
+        var it = cd.params();
+        while (it.next()) |p| {
+            for (seen[0..n]) |s| if (std.ascii.eqlIgnoreCase(s, p.name)) return m;
+            if (n == seen.len) return m;
+            seen[n] = p.name;
+            n += 1;
         }
+        // Both looked up before either is unescaped: unescaping rewrites the
+        // header bytes, and a second lookup would parse the rewritten line.
+        const name = cd.param("name");
+        const filename = cd.param("filename");
+        m.name = unescapeIn(headers_raw, cd.params_section, name);
+        m.filename = unescapeIn(headers_raw, cd.params_section, filename);
         return m;
     }
 };
+
+/// Parameters a `Content-Disposition` may carry before it is dropped as
+/// malformed. Browsers send two (`name`, `filename`).
+const max_disposition_params = 32;
+
+/// `value` (a slice of `buf`) with its quoted-pairs unescaped in place when it
+/// was a quoted-string.
+fn unescapeIn(buf: []u8, section: []const u8, value: ?[]const u8) ?[]const u8 {
+    const v = value orelse return null;
+    if (!body.isQuotedValue(section, v)) return v;
+    const off = @intFromPtr(v.ptr) - @intFromPtr(buf.ptr);
+    return body.unescapeQuoted(buf[off..][0..v.len]);
+}
 
 /// Iterator over the parts of a multipart body.
 pub const Iterator = struct {
     /// Not-yet-consumed tail of the source, positioned just after the previous
     /// part's closing CRLF (or, initially, at the very start).
-    rest: []const u8,
+    rest: []u8,
     /// The delimiter line content WITHOUT the leading "--" (the raw boundary).
     boundary: []const u8,
     limits: Limits,
@@ -177,9 +214,9 @@ pub const Iterator = struct {
         // Header block: up to the blank line terminating the headers. An
         // immediate CRLF means an empty header block (the "\r\n\r\n" search
         // would wrongly consume the body's first CRLF there).
-        const hdr: struct { raw: []const u8, body_off: usize } = blk: {
+        const hdr: struct { raw: []u8, body_off: usize } = blk: {
             if (std.mem.startsWith(u8, it.rest, "\r\n"))
-                break :blk .{ .raw = "", .body_off = 2 };
+                break :blk .{ .raw = it.rest[0..0], .body_off = 2 };
             const end = std.mem.indexOf(u8, it.rest, "\r\n\r\n") orelse
                 return error.MalformedBody;
             break :blk .{ .raw = it.rest[0..end], .body_off = end + 4 };
@@ -235,8 +272,9 @@ fn indexOfDelimiter(hay: []const u8, boundary: []const u8) ?usize {
 /// Parse a `multipart/form-data` body already read into `source`. `boundary`
 /// is the Content-Type `boundary` parameter, WITHOUT the leading `--`
 /// (`http.body.ContentType.param("boundary")` gives exactly this). Nothing is
-/// parsed until you call `next`.
-pub fn parse(source: []const u8, boundary: []const u8, limits: Limits) Iterator {
+/// parsed until you call `next`. `source` is mutable because a quoted
+/// `name`/`filename` with quoted-pairs is unescaped in place (see `Part.name`).
+pub fn parse(source: []u8, boundary: []const u8, limits: Limits) Iterator {
     return .{ .rest = source, .boundary = boundary, .limits = limits };
 }
 
@@ -423,7 +461,7 @@ pub const Reader = struct {
     /// the delimiter line counts as the first half of the terminator, so a
     /// part that opens with a bare CRLF has an empty header block (as in
     /// `parse`: a plain "\r\n\r\n" search would eat the body's first CRLF).
-    fn readHeaders(r: *Reader) StreamError![]const u8 {
+    fn readHeaders(r: *Reader) StreamError![]u8 {
         const terminator = "\r\n\r\n";
         var matched: usize = 2;
         var n: usize = 0;
@@ -553,6 +591,19 @@ const test_boundary = "----WebKitFormBoundaryABC123";
 const db = "--" ++ test_boundary;
 const crlf = "\r\n";
 
+/// A mutable copy of a test literal for `parse` (which unescapes in place).
+/// A ring over one static buffer: a test holds a few copies of a few KiB.
+var test_mut_buf: [256 * 1024]u8 = undefined;
+var test_mut_at: usize = 0;
+fn mut(src: []const u8) []u8 {
+    std.debug.assert(src.len <= test_mut_buf.len);
+    if (test_mut_at + src.len > test_mut_buf.len) test_mut_at = 0;
+    const out = test_mut_buf[test_mut_at..][0..src.len];
+    test_mut_at += src.len;
+    @memcpy(out, src);
+    return out;
+}
+
 test "happy path: text field + file part; closing delimiter ends iteration" {
     const src = db ++ crlf ++
         "Content-Disposition: form-data; name=\"title\"" ++ crlf ++
@@ -565,7 +616,7 @@ test "happy path: text field + file part; closing delimiter ends iteration" {
         "%PDF-1.7 fake" ++ crlf ++
         db ++ "--" ++ crlf;
 
-    var it = parse(src, test_boundary, .{});
+    var it = parse(mut(src), test_boundary, .{});
 
     // Plain text field: no filename, no Content-Type (⇒ text/plain default).
     const p1 = (try it.next()).?;
@@ -595,7 +646,7 @@ test "binary-safe: CRLF and boundary-like bytes inside a part body" {
         payload ++ crlf ++
         db ++ "--" ++ crlf;
 
-    var it = parse(src, test_boundary, .{});
+    var it = parse(mut(src), test_boundary, .{});
     const p = (try it.next()).?;
     try testing.expectEqualStrings("blob", p.name.?);
     try testing.expectEqualSlices(u8, payload, p.value);
@@ -611,7 +662,7 @@ test "preamble, epilogue and delimiter transport-padding are ignored" {
         db ++ "--" ++ crlf ++
         "Epilogue junk, also ignored.";
 
-    var it = parse(src, test_boundary, .{});
+    var it = parse(mut(src), test_boundary, .{});
     const p = (try it.next()).?;
     try testing.expectEqualStrings("a", p.name.?);
     try testing.expectEqualStrings("1", p.value);
@@ -627,7 +678,7 @@ test "quoted filename with special characters" {
         "data" ++ crlf ++
         db ++ "--" ++ crlf;
 
-    var it = parse(src, test_boundary, .{});
+    var it = parse(mut(src), test_boundary, .{});
     const p = (try it.next()).?;
     try testing.expectEqualStrings("up", p.name.?);
     try testing.expectEqualStrings("we;ird name(1).txt", p.filename.?);
@@ -640,7 +691,7 @@ test "empty header block: blank line immediately after the delimiter" {
         "raw" ++ crlf ++
         db ++ "--" ++ crlf;
 
-    var it = parse(src, test_boundary, .{});
+    var it = parse(mut(src), test_boundary, .{});
     const p = (try it.next()).?;
     try testing.expect(p.name == null);
     try testing.expect(p.filename == null);
@@ -659,7 +710,7 @@ test "Part.header: case-insensitive lookup, OWS trimming, first match" {
         "v" ++ crlf ++
         db ++ "--" ++ crlf;
 
-    var it = parse(src, test_boundary, .{});
+    var it = parse(mut(src), test_boundary, .{});
     const p = (try it.next()).?;
     try testing.expectEqualStrings("tagged value", p.header("x-custom-meta").?);
     try testing.expectEqualStrings("tagged value", p.header("X-CUSTOM-META").?);
@@ -677,11 +728,11 @@ test "limits: max_parts → TooManyParts; header block → HeadersTooLarge" {
         "2" ++ crlf ++
         db ++ "--" ++ crlf;
 
-    var it = parse(src, test_boundary, .{ .max_parts = 1 });
+    var it = parse(mut(src), test_boundary, .{ .max_parts = 1 });
     try testing.expectEqualStrings("a", (try it.next()).?.name.?);
     try testing.expectError(error.TooManyParts, it.next());
 
-    var it2 = parse(src, test_boundary, .{ .max_header_bytes = 8 });
+    var it2 = parse(mut(src), test_boundary, .{ .max_header_bytes = 8 });
     try testing.expectError(error.HeadersTooLarge, it2.next());
 }
 
@@ -699,18 +750,18 @@ test "Limits defaults are pinned (G8) — the mechanism above was tested, not th
 
 test "malformed bodies → MalformedBody" {
     // No opening delimiter at all.
-    var it1 = parse("no delimiter here", test_boundary, .{});
+    var it1 = parse(mut("no delimiter here"), test_boundary, .{});
     try testing.expectError(error.MalformedBody, it1.next());
 
     // Dash-boundary present but neither at offset 0 nor after a CRLF.
-    var it2 = parse("xx" ++ db ++ crlf, test_boundary, .{});
+    var it2 = parse(mut("xx" ++ db ++ crlf), test_boundary, .{});
     try testing.expectError(error.MalformedBody, it2.next());
 
     // A part with no blank line terminating its headers.
     const no_blank = db ++ crlf ++
         "Content-Disposition: form-data; name=\"a\"" ++ crlf ++
         db ++ "--" ++ crlf;
-    var it3 = parse(no_blank, test_boundary, .{});
+    var it3 = parse(mut(no_blank), test_boundary, .{});
     try testing.expectError(error.MalformedBody, it3.next());
 
     // Unterminated final part (no closing delimiter).
@@ -718,12 +769,12 @@ test "malformed bodies → MalformedBody" {
         "Content-Disposition: form-data; name=\"a\"" ++ crlf ++
         crlf ++
         "body with no end";
-    var it4 = parse(unterminated, test_boundary, .{});
+    var it4 = parse(mut(unterminated), test_boundary, .{});
     try testing.expectError(error.MalformedBody, it4.next());
 
     // Delimiter line followed by garbage instead of CRLF or "--".
     const bad_line = db ++ "junk" ++ crlf;
-    var it5 = parse(bad_line, test_boundary, .{});
+    var it5 = parse(mut(bad_line), test_boundary, .{});
     try testing.expectError(error.MalformedBody, it5.next());
 }
 
@@ -810,6 +861,12 @@ const multipart_seeds = [_][]const u8{
     seed(db ++ "junk" ++ crlf), // a delimiter line followed by neither CRLF nor "--"
     seed(db), // the dash-boundary and nothing after it
     seed(db ++ "--"), // the closing delimiter with no trailing CRLF
+    seed(db ++ crlf ++ // quoted-pairs in name and filename, unescaped in place (Go parity)
+        "Content-Disposition: form-data; name=\"a\\\"b\"; filename=\"x\\\\y\\z\"" ++ crlf ++ crlf ++
+        "v" ++ crlf ++ db ++ "--" ++ crlf),
+    seed(db ++ crlf ++ // a parameter named twice: the disposition is dropped (Go parity)
+        "Content-Disposition: form-data; name=\"email\"; NAME=\"admin\"" ++ crlf ++ crlf ++
+        "v" ++ crlf ++ db ++ "--" ++ crlf),
 };
 
 const fz = @import("fuzz_test.zig");
@@ -880,9 +937,11 @@ test "corpus: every multipart seed reaches the parser, and the parts walked are 
     // octets, 0 named parts and 15 refusals before the draw was fixed (every
     // input the harness ever ran was the same empty body); 15 / 10 / 117 /
     // 9 / 6 after.
-    try testing.expectEqual(@as(usize, 10), parts);
-    try testing.expectEqual(@as(usize, 117), body_octets);
-    try testing.expectEqual(@as(usize, 9), named);
+    // 2026-10-12: +2 seeds (quoted-pairs, a duplicate parameter): 12 / 119 /
+    // 10 -- the duplicate's part is walked but has no name.
+    try testing.expectEqual(@as(usize, 12), parts);
+    try testing.expectEqual(@as(usize, 119), body_octets);
+    try testing.expectEqual(@as(usize, 10), named);
     try testing.expectEqual(@as(usize, 6), refused);
 }
 
@@ -941,7 +1000,9 @@ fn expectSameAsParse(src: []const u8, boundary: []const u8, limits: Limits, step
 
     var chunked: ChunkedReader = .init(src, step, in_buf);
     var mr = try Reader.init(&chunked.interface, boundary, &hdr, limits);
-    var it = parse(src, boundary, limits);
+    const src_mut = try gpa.dupe(u8, src);
+    defer gpa.free(src_mut);
+    var it = parse(src_mut, boundary, limits);
     while (true) {
         const want = it.next() catch |we| {
             // `parse` refused here: the reader refuses at this `nextPart`,
@@ -1211,14 +1272,14 @@ test "a part header line must be `token: value`: no colon, a fold or a second de
         db ++ crlf ++ ": x" ++ crlf ++ crlf ++ "v" ++ crlf ++ db ++ "--" ++ crlf,
     };
     for (bad) |src| {
-        var it = parse(src, test_boundary, .{});
+        var it = parse(mut(src), test_boundary, .{});
         try testing.expectError(error.MalformedBody, it.next());
         try expectSameAsParseEverywhere(src, .{});
     }
     // The refusal is per part: an earlier good part is still yielded.
     const second_bad = db ++ crlf ++ "Content-Disposition: form-data; name=\"a\"" ++ crlf ++ crlf ++ "1" ++ crlf ++
         db ++ crlf ++ "Oops" ++ crlf ++ crlf ++ "2" ++ crlf ++ db ++ "--" ++ crlf;
-    var it = parse(second_bad, test_boundary, .{});
+    var it = parse(mut(second_bad), test_boundary, .{});
     try testing.expectEqualStrings("1", (try it.next()).?.value);
     try testing.expectError(error.MalformedBody, it.next());
     try expectSameAsParseEverywhere(second_bad, .{});
@@ -1232,7 +1293,7 @@ test "Reader: a bare CR right before the blank line ends the header block where 
         "v\r\n\r\nw" ++ crlf ++
         db ++ "--" ++ crlf;
     try expectSameAsParseEverywhere(src, .{});
-    var it = parse(src, test_boundary, .{});
+    var it = parse(mut(src), test_boundary, .{});
     try testing.expectEqualStrings("v\r\n\r\nw", (try it.next()).?.value);
 }
 
@@ -1250,4 +1311,52 @@ test "Reader: a bounded discard skips exactly that many body octets" {
     var rest: [16]u8 = undefined;
     const n = try p.body.readSliceShort(&rest);
     try testing.expectEqualStrings("3456789", rest[0..n]);
+}
+
+test "a quoted name/filename is unescaped as Go returns it; parse and Reader agree" {
+    const src = db ++ crlf ++
+        "Content-Disposition: form-data; name=\"a\\\"b\"; filename=\"my \\\"best\\\" \\x.jpg\"" ++ crlf ++ crlf ++
+        "v" ++ crlf ++ db ++ "--" ++ crlf;
+    var it = parse(mut(src), test_boundary, .{});
+    const p = (try it.next()).?;
+    try testing.expectEqualStrings("a\"b", p.name.?);
+    // Only a backslash before a tspecial escapes; `\x` stays (Go oracle).
+    try testing.expectEqualStrings("my \"best\" \\x.jpg", p.filename.?);
+    try testing.expectEqualStrings("v", p.value);
+    try expectSameAsParseEverywhere(src, .{});
+}
+
+test "a disposition naming any parameter twice has no name and no filename (Go drops it)" {
+    const cases = [_][]const u8{
+        "form-data; name=\"email\"; name=\"admin\"",
+        "form-data; name=\"f\"; filename=\"a\"; FILENAME=\"b\"",
+        "form-data; x=1; X=2; name=\"a\"",
+    };
+    inline for (cases) |cd| {
+        const src = db ++ crlf ++ "Content-Disposition: " ++ cd ++ crlf ++ crlf ++ "v" ++ crlf ++ db ++ "--" ++ crlf;
+        var it = parse(mut(src), test_boundary, .{});
+        const p = (try it.next()).?;
+        try testing.expectEqual(@as(?[]const u8, null), p.name);
+        try testing.expectEqual(@as(?[]const u8, null), p.filename);
+        try testing.expectEqualStrings("v", p.value);
+        try expectSameAsParseEverywhere(src, .{});
+    }
+}
+
+test "a disposition with more parameters than max_disposition_params is dropped, one fewer is kept" {
+    var cd: [max_disposition_params * 8]u8 = undefined;
+    for ([_]usize{ max_disposition_params, max_disposition_params + 1 }) |count| {
+        var w: std.Io.Writer = .fixed(&cd);
+        try w.writeAll("form-data; name=\"a\"");
+        for (1..count) |i| try w.print("; p{d}=1", .{i});
+        var src_buf: [1024]u8 = undefined;
+        var sw: std.Io.Writer = .fixed(&src_buf);
+        try sw.print(db ++ crlf ++ "Content-Disposition: {s}" ++ crlf ++ crlf ++ "v" ++ crlf ++ db ++ "--" ++ crlf, .{w.buffered()});
+        var it = parse(sw.buffered(), test_boundary, .{});
+        const p = (try it.next()).?;
+        if (count <= max_disposition_params)
+            try testing.expectEqualStrings("a", p.name.?)
+        else
+            try testing.expectEqual(@as(?[]const u8, null), p.name);
+    }
 }

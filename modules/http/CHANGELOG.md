@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Behaviour change + source break, Go parity (S2 survey R6).** (1) `multipart`: a
+  `Content-Disposition` that names any parameter twice (case-insensitive) is dropped as a whole — the
+  part has no `name`/`filename` — as Go's `mime.ParseMediaType` refuses it; two parsers can no longer
+  read two field names out of `name="email"; name="admin"`. A form that sent such a header now loses
+  that field's name. (2) `multipart`: a quoted `name`/`filename` has its quoted-pairs unescaped
+  (`name="a\"b"` → `a"b`; a backslash before a non-tspecial stays, as in Go). It is done in place, so
+  **`multipart.parse` takes `source: []u8`** (was `[]const u8`); a caller with a read-only buffer
+  copies it first. The streaming `Reader` is unchanged for callers. New
+  `body.ContentType.paramUnescaped(name, out)`. (3) server: an HTTP/1.0 request with `Connection:
+  keep-alive` keeps the connection (RFC 9112 §9.3), and the response says `Connection: keep-alive`;
+  a body with no known length still closes. Docs: the client cookie jar, `addSetCookie` and the lazy
+  `100-continue` were described as missing/eager; corrected.
+
 - **2026-10-11** — fix: a truncated gzip request body (inbound decoding, opt-in via `max_decompressed_request_bytes`) no longer aborts the process. std 0.16's `flate.Decompress` hits `unreachable` when its input ends inside a block — any proper prefix did it. The decoder now reads the body and then zeros (`gzip.PaddedSource`), and `GunzipBody` refuses (500, as for any undecodable body) a read whose decoding used a byte past the body, withholding its bytes; a body missing only (part of) its trailer is refused too, also with `verify_inbound_trailer` off. h1 and h2. `DecodeScratch` grows by 1 KiB (`DecodeScratch.start`).
 - **2026-10-11** — perf: `gzip.initCompress` resets the 64 KiB deflate hash head with a volatile 32-byte vector loop instead of `@splat`, which Zig 0.16 lowered to its byte-wise compiler_rt memset (~16 % of a websocket permessage-deflate message's compression). State is byte-identical to std's `Compress.init` (existing field-by-field test).
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-http`, kept instrument kind 3): card Performance 0.13–0.32× Go net/http, measured on a quiet host. Tooling only, no code change.

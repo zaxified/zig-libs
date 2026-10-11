@@ -1923,9 +1923,11 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     }
 
     // Persistence: HTTP/1.1 defaults to keep-alive unless the client asked
-    // to close; HTTP/1.0 always closes (keep-alive opt-in not implemented).
-    // `force_close` (per-connection request cap reached) also ends it.
-    const keep_alive = !head.http1_0 and !head.connection_close and !force_close;
+    // to close; HTTP/1.0 persists only on an explicit `Connection: keep-alive`
+    // (RFC 9112 §9.3; Go oracle `http10-keepalive-pipeline`), and its
+    // response then needs a known length (`beginStreaming` closes when there
+    // is none). `force_close` (per-connection request cap reached) also ends it.
+    const keep_alive = (!head.http1_0 or head.connection_keep_alive) and !head.connection_close and !force_close;
 
     // Body cap, declared-length half: refuse before the handler runs (and
     // before any 100-continue invites the body onto the wire) — the nginx
@@ -3621,7 +3623,12 @@ pub const ResponseWriter = struct {
         if (rw.compression != null and !vary_covered)
             try out.writeAll("Vary: Accept-Encoding\r\n");
         if (rw.content_encoding) |ce| try out.print("Content-Encoding: {s}\r\n", .{ce});
-        if (rw.close_connection or rw.continue_pending) try out.writeAll("Connection: close\r\n");
+        if (rw.close_connection or rw.continue_pending)
+            try out.writeAll("Connection: close\r\n")
+        else if (rw.http1_0)
+            // An HTTP/1.0 connection still open here was opted in by the
+            // client; say it persists, or the client closes it (RFC 9112 §9.3).
+            try out.writeAll("Connection: keep-alive\r\n");
         switch (framing) {
             .none => {},
             .content_length => |n| try out.print("Content-Length: {d}\r\n", .{n}),
@@ -4679,6 +4686,34 @@ test "serveStream: HTTP/1.0 gets identity-until-close instead of chunked" {
     try testing.expect(std.mem.indexOf(u8, got, "Transfer-Encoding") == null);
     try testing.expect(std.mem.indexOf(u8, got, "Content-Length") == null);
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\n" ++ big_body));
+}
+
+test "serveStream: HTTP/1.0 keep-alive persists with a known length, closes without one (RFC 9112 §9.3)" {
+    var out_buf: [8192]u8 = undefined;
+    // Opted in, fixed length: the head says so and the next request is served.
+    const kept = runStream(null, "GET /hello HTTP/1.0\r\nConnection: keep-alive\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, kept, "HTTP/1.1 200 OK\r\n"));
+    const first_end = std.mem.indexOf(u8, kept, "\r\n\r\n").?;
+    try testing.expect(std.mem.indexOf(u8, kept[0..first_end], "Connection: keep-alive\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, kept[0..first_end], "Content-Length: ") != null);
+    // Opted in, but the body outgrows the buffer with no declared length: an
+    // HTTP/1.0 body can only end at the close, so the connection closes.
+    var out_buf2: [8192]u8 = undefined;
+    const closed = runStream(null, "GET /big HTTP/1.0\r\nConnection: keep-alive\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf2);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, closed, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, closed, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, closed, "keep-alive") == null);
+    // Not opted in: closes as before, and `close` beats `keep-alive`.
+    for ([_][]const u8{ "", "Connection: keep-alive, close\r\n" }) |conn| {
+        var out_buf3: [8192]u8 = undefined;
+        var wire_buf: [256]u8 = undefined;
+        const wire = try std.fmt.bufPrint(&wire_buf, "GET /hello HTTP/1.0\r\n{s}\r\nGET /hello HTTP/1.1\r\nHost: t\r\n\r\n", .{conn});
+        const once = runStream(null, wire, &out_buf3);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, once, "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(std.mem.indexOf(u8, once, "Connection: close\r\n") != null);
+    }
 }
 
 test "ResponseWriter: standalone against any writer (no socket, no loop)" {

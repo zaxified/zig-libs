@@ -141,7 +141,6 @@ const h1_divergences = [_]H1Divergence{
     .{ .id = "get-host-empty", .reject = 400, .calls = 0, .why = "h1.isValidHost refuses an empty Host on an origin-form request: an http(s) target always has an authority (RFC 9112 §3.2)" },
     .{ .id = "chunk-size-trailing-space", .reject = 0, .calls = 1, .why = "RFC 9112 §7.1: whitespace after chunk-size is only BWS before ';'; Go skips it, we fail the body" },
     // ── a different, legal choice ──
-    .{ .id = "http10-keepalive-pipeline", .reject = 0, .calls = 1, .why = "HTTP/1.0 keep-alive is not honoured; a server may always close (RFC 9112 §9.3)" },
     .{ .id = "lowercase-method", .reject = 501, .calls = 0, .why = "methods are case-sensitive, so `get` is an unknown method: 501 (RFC 9110 §9.1)" },
     .{ .id = "extension-method", .reject = 501, .calls = 0, .why = "only the shared Method vocabulary is dispatched; others get 501 (RFC 9110 §9.1)" },
     .{ .id = "connect-authority", .reject = 501, .calls = 0, .why = "CONNECT is not implemented (a proxy's job): 501" },
@@ -438,9 +437,14 @@ fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
 
 const MultipartOutcome = struct { parts: [8]multipart.Part = undefined, n: usize = 0, err: bool = false };
 
+/// `multipart.parse` unescapes in place; the parts point into this copy.
+var multipart_src: [4096]u8 = undefined;
+
 fn ourMultipart(body: []const u8) MultipartOutcome {
     var o: MultipartOutcome = .{};
-    var it = multipart.parse(body, vectors.multipart_boundary, .{});
+    const src = multipart_src[0..body.len];
+    @memcpy(src, body);
+    var it = multipart.parse(src, vectors.multipart_boundary, .{});
     while (true) {
         const part = it.next() catch {
             o.err = true;
@@ -484,9 +488,6 @@ const multipart_divergences = [_]MultipartDivergence{
     .{ .id = "header-space-before-colon", .ours_err = true, .ours_parts = 0, .why = "a header name with whitespace before the colon is not a token: refused; Go keeps the part without its disposition" },
     // ── a different, legal choice ──
     .{ .id = "closing-junk", .ours_err = false, .ours_parts = 1, .why = "whatever follows the closing delimiter is epilogue and ignored; Go wants a CRLF first" },
-    .{ .id = "name-escaped-quote", .ours_err = false, .ours_parts = 1, .why = "a quoted parameter comes back zero-copy with its quoted-pairs NOT unescaped (body.ContentType.param); Go unescapes. Browsers percent-encode `\"` in names (WHATWG), so they never send this" },
-    .{ .id = "name-escaped-backslash", .ours_err = false, .ours_parts = 1, .why = "as name-escaped-quote" },
-    .{ .id = "name-duplicate-param", .ours_err = false, .ours_parts = 1, .why = "the first `name` wins; Go's ParseMediaType refuses a duplicate parameter and drops the whole disposition" },
     .{ .id = "filename-star", .ours_err = false, .ours_parts = 1, .why = "RFC 7578 §4.2: `filename*` MUST NOT be used; it is ignored here, Go decodes it" },
     .{ .id = "filename-and-star", .ours_err = false, .ours_parts = 1, .why = "as filename-star: `filename` is the one that counts" },
 };

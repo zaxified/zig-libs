@@ -8,8 +8,9 @@
 //! writer and a thread-per-connection serving loop; Phase 2.1 hardened it
 //! for **direct internet exposure** (peer address on requests, accept
 //! hook + connection accounting, 431/414/413 size limits, stall +
-//! whole-request + write timeouts — see `Server`); TLS termination is a
-//! separate later task (a reverse proxy also works). Phase 2.2 adds
+//! whole-request + write timeouts — see `Server`); TLS termination is the
+//! caller's for now (a reverse proxy also works; a native server on our
+//! ianic/tls fork is planned). Phase 2.2 adds
 //! negotiated gzip response compression (`Server.Options.compression`,
 //! off by default; `std.compress.flate` streaming into the chunked
 //! framing). Phase 3 adds HTTP/2: `hpack` (RFC 7541) + `h2` (RFC 9113
