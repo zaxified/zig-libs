@@ -265,6 +265,10 @@ pub const Options = struct {
     /// connection, .active/.idle around each request stream served.
     on_conn_state: ?Server.ConnStateFn = null,
     on_conn_state_ctx: ?*anyopaque = null,
+    /// Failure observer (see `Server.Options.on_error`): a handler error on a
+    /// stream is reported as `.handler_failed`.
+    on_error: ?Server.ErrorFn = null,
+    on_error_ctx: ?*anyopaque = null,
     /// DoS-hardening limits; the defaults are safe for exposure.
     limits: Limits = .{},
     /// Per-request opt-in to the **incremental request body** (see the
@@ -1563,6 +1567,10 @@ const Session = struct {
     /// Threaded: this whole function runs on a **worker** thread. It holds
     /// `mu` only in the short sections that touch the session; the handler
     /// call itself is the point of the exercise and runs without it.
+    fn reportError(s: *Session, kind: Server.ErrorKind, err: ?anyerror, status: u16) void {
+        if (s.opts.on_error) |hook| hook(s.opts.on_error_ctx, kind, err, status, s.opts.peer);
+    }
+
     fn serveJob(s: *Session, id: u31, req_index: u32) Disposition {
         s.lock();
         const job = s.jobs.getPtr(id).?;
@@ -1968,8 +1976,10 @@ const Session = struct {
         defer rw.releaseEncoder();
         sb.req = &req;
         var failed = false;
-        s.opts.handler(&req, rw) catch {
+        var handler_err: ?anyerror = null;
+        s.opts.handler(&req, rw) catch |err| {
             failed = true;
+            handler_err = err;
         };
         // A detach intercepts BEFORE `rw.end`, which would terminate the
         // response the handler is asking to keep open. Single-task mode
@@ -1998,8 +2008,11 @@ const Session = struct {
                 // exactly the old behavior, which held for every response
                 // because every response was staged whole.
                 const over = sb.exceeded or (gunzip_scratch != null and gunzip_body.exceeded);
+                // As h1 reports it: a body over a cap is the request's fault.
+                s.reportError(if (over) .request_refused else if (handler_err != null) .handler_failed else .server_failed, if (over) null else handler_err, if (over) 413 else 500);
                 return s.respondError(id, if (over) 413 else 500);
             }
+            s.reportError(if (handler_err != null) .handler_failed else .server_failed, handler_err, 0);
             // Part of the response IS on the wire and cannot be retracted.
             // h1 closes the connection here; h2 can do better and kill just
             // this stream (§5.4.2) — the client sees a failed stream instead
@@ -3343,6 +3356,19 @@ test "h2c serve: an EncoderProvider's coding is negotiated per stream and given 
     try testing.expectEqual(@as(u32, 1), pass.finished);
 }
 
+/// Records `on_error` events (the h1 tests keep their own in `Server`).
+const ErrorLog = struct {
+    events: [8]struct { kind: Server.ErrorKind, err: ?anyerror, status: u16 } = undefined,
+    n: usize = 0,
+
+    fn record(ctx: ?*anyopaque, kind: Server.ErrorKind, err: ?anyerror, status: u16, _: ?std.Io.net.IpAddress) void {
+        const log: *ErrorLog = @ptrCast(@alignCast(ctx.?));
+        if (log.n == log.events.len) return;
+        log.events[log.n] = .{ .kind = kind, .err = err, .status = status };
+        log.n += 1;
+    }
+};
+
 test "h2c serve: handler error → 500; 404 and HEAD framing (offline)" {
     const gpa = testing.allocator;
     var peer: TestPeer = .init(gpa, .{});
@@ -3354,7 +3380,13 @@ test "h2c serve: handler error → 500; 404 and HEAD framing (offline)" {
     const sid_head = try peer.conn.startStream(&peer.wire, &fieldsFor("HEAD", "/hello"), true);
 
     var out_buf: [8192]u8 = undefined;
-    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+    var log: ErrorLog = .{};
+    try runOffline(&peer, .{ .handler = testHandler, .on_error = ErrorLog.record, .on_error_ctx = &log }, &out_buf);
+    // `on_error` hears the failed stream once; the 404 and the HEAD are answers, not failures.
+    try testing.expectEqual(@as(usize, 1), log.n);
+    try testing.expectEqual(Server.ErrorKind.handler_failed, log.events[0].kind);
+    try testing.expectEqual(@as(?anyerror, error.Boom), log.events[0].err);
+    try testing.expectEqual(@as(u16, 500), log.events[0].status);
 
     // Handler error: clean 500, the staged partial body is dropped.
     const fail = peer.resp(sid_fail);

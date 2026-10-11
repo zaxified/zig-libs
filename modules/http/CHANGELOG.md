@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **`on_error` failure observer (Go `ErrorLog`, S2 survey R5), additive.**
+  `Server.Options.on_error` / `StreamOptions.on_error` / `h2_server.Options.on_error` with
+  `Server.ErrorKind` (`handler_failed` with the handler's error, `request_refused` with the status
+  answered, `server_failed`, `accept_failed`). h1 and h2 report the same request the same way (a body
+  over a cap is `request_refused` 413 on both). Null by default: nothing changes for existing callers.
+
 - **2026-10-12** — **Handler helpers at Go parity (S2 survey R3), additive.** `ResponseWriter.addHeader`
   / `getHeader` / `delHeader` (Go `Header.Add/Get/Del`), `redirect` (Go `http.Redirect`: relative
   locations joined to the request path and cleaned as `path.Clean`, non-ASCII percent-encoded in the

@@ -154,6 +154,36 @@ pub const ConnState = enum { new, active, idle, closed };
 /// when driven socket-free (`serveStream` without `StreamOptions.peer`).
 pub const ConnStateFn = *const fn (?*anyopaque, peer: ?net.IpAddress, state: ConnState) void;
 
+/// What `Options.on_error` is told about — the failures Go's `Server.ErrorLog`
+/// reports, plus the requests refused before a handler ran.
+pub const ErrorKind = enum {
+    /// The handler returned `err`. A 500 went out, or — when the head was
+    /// already on the wire — the connection was cut.
+    handler_failed,
+    /// The request never reached the handler: a malformed or oversized head,
+    /// a bad version, a body over a cap … `status` is what was answered.
+    request_refused,
+    /// The server could not serve a request it accepted: no working memory
+    /// (503), or the response framing broke after the handler (500).
+    server_failed,
+    /// `accept` failed with `err`: a transient error (the loop keeps
+    /// accepting, after a short back-off on resource exhaustion) or a fatal
+    /// one (`serve` returns).
+    accept_failed,
+};
+
+/// Failure observer — see `Options.on_error`. `err` is set for
+/// `handler_failed` and `accept_failed`; `status` (0 when none was sent) for
+/// the others. `peer` is null for `accept_failed` and socket-free serving.
+/// Runs on the connection's task, after the fact: it cannot change the answer.
+pub const ErrorFn = *const fn (ctx: ?*anyopaque, kind: ErrorKind, err: ?anyerror, status: u16, peer: ?net.IpAddress) void;
+
+/// Out of line so the serving frame (`frame_probe`) pays one null check, not
+/// the call, on the paths that never fail.
+noinline fn fireError(hook: ?ErrorFn, ctx: ?*anyopaque, kind: ErrorKind, err: ?anyerror, status: u16, peer: ?net.IpAddress) void {
+    if (hook) |h| h(ctx, kind, err, status, peer);
+}
+
 /// Where a connection's per-request working memory comes from, when the
 /// caller would rather **lend** it than own it.
 ///
@@ -411,6 +441,12 @@ pub const Options = struct {
     on_conn_state: ?ConnStateFn = null,
     /// Opaque pointer passed to `on_conn_state`.
     on_conn_state_ctx: ?*anyopaque = null,
+    /// Optional failure observer — Go's `Server.ErrorLog`, as a callback so
+    /// the caller picks the logger: handler errors, refused requests,
+    /// `accept` failures (see `ErrorKind`). Same threading rules as
+    /// `on_conn_state`. Null = failures are only answered, never reported.
+    on_error: ?ErrorFn = null,
+    on_error_ctx: ?*anyopaque = null,
     /// Max time a single read may stall (head wait, body wait, keep-alive
     /// idle) before the connection is dropped; 0 = no timeout.
     read_timeout_ms: u32 = 10_000,
@@ -820,16 +856,24 @@ fn acceptLoop(s: *Server, listener: *net.Server, group: *std.Io.Group) ServeErro
             error.ConnectionAborted,
             error.ProtocolFailure,
             error.BlockedByFirewall,
-            => continue,
-            // Resource exhaustion: back off briefly, keep accepting.
+            => {
+                fireError(s.options.on_error, s.options.on_error_ctx, .accept_failed, err, 0, null);
+                continue;
+            },
+            // Resource exhaustion: back off briefly, keep accepting (Go logs
+            // "Accept error: …; retrying" here).
             error.ProcessFdQuotaExceeded,
             error.SystemFdQuotaExceeded,
             error.SystemResources,
             => {
+                fireError(s.options.on_error, s.options.on_error_ctx, .accept_failed, err, 0, null);
                 sleepMs(s.io, 50) catch return error.Canceled;
                 continue;
             },
-            else => return error.AcceptFailed,
+            else => {
+                fireError(s.options.on_error, s.options.on_error_ctx, .accept_failed, err, 0, null);
+                return error.AcceptFailed;
+            },
         };
         // Admission control, before anything is spent on the connection.
         // A reject closes the socket without writing a byte (documented on
@@ -1149,6 +1193,8 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .verify_inbound_trailer = o.verify_inbound_trailer,
                 .on_conn_state = o.on_conn_state,
                 .on_conn_state_ctx = o.on_conn_state_ctx,
+                .on_error = o.on_error,
+                .on_error_ctx = o.on_error_ctx,
                 // Deliberately not forwarded: the h2 codec's working memory
                 // has a different shape (per-stream, not per-request) and
                 // lending it is a separate change. `Options.buffers_provider`
@@ -1173,6 +1219,8 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .max_body_bytes = o.max_body_bytes,
         .on_conn_state = o.on_conn_state,
         .on_conn_state_ctx = o.on_conn_state_ctx,
+        .on_error = o.on_error,
+        .on_error_ctx = o.on_error_ctx,
         .buffers_provider = o.buffers_provider,
         .compression = o.compression,
         .encoder_provider = o.encoder_provider,
@@ -1581,6 +1629,9 @@ pub const StreamOptions = struct {
     /// the whole stream counts as one connection.
     on_conn_state: ?ConnStateFn = null,
     on_conn_state_ctx: ?*anyopaque = null,
+    /// Failure observer — see `Options.on_error`.
+    on_error: ?ErrorFn = null,
+    on_error_ctx: ?*anyopaque = null,
     /// Lend this connection its working memory one request at a time instead
     /// of taking the caller's for the whole connection. Null keeps the
     /// buffers passed to `serveStream`, which is what every caller did before
@@ -2029,10 +2080,13 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
 
     // Compiled out entirely outside the test build; see `frame_probe`.
     if (builtin.is_test) frame_probe.record();
-    opts.handler(&req, &rw) catch {
+    opts.handler(&req, &rw) catch |err| {
         // Nothing on the wire yet → a clean 500; otherwise the response
         // framing is broken and the connection must die.
-        if (rw.sent_head) return .close;
+        if (rw.sent_head) {
+            fireError(opts.on_error, opts.on_error_ctx, .handler_failed, err, 0, opts.peer);
+            return .close;
+        }
         // A body that crossed max_body_bytes failed the handler's reads —
         // that is the request's fault, not the handler's: answer 413 and
         // close (the remaining body is unbounded, never drain it). Same for
@@ -2043,6 +2097,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
             return respondError(opts, out, date, 413);
         // `sent_head` was checked above, so this cannot fail; handled rather
         // than asserted so the guard survives ReleaseFast.
+        fireError(opts.on_error, opts.on_error_ctx, .handler_failed, err, 500, opts.peer);
         rw.reset() catch return .close;
         rw.setStatus(500);
         rw.setHeader("Content-Type", "text/plain") catch return .close;
@@ -2083,6 +2138,10 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
 }
 
 fn respondError(opts: StreamOptions, out: *Writer, date: ?[]const u8, status: u16) ConnDisposition {
+    // 500 here is broken framing after the handler, 503 no working memory:
+    // the server's failure. Everything else is the request's.
+    const kind: ErrorKind = if (status == 500 or status == 503) .server_failed else .request_refused;
+    fireError(opts.on_error, opts.on_error_ctx, kind, null, status, opts.peer);
     writeErrorResponse(opts, out, date, status) catch {};
     out.flush() catch {};
     return .close;
@@ -4513,6 +4572,8 @@ const StreamTweaks = struct {
     max_body_bytes: ?u64 = null,
     on_conn_state: ?ConnStateFn = null,
     on_conn_state_ctx: ?*anyopaque = null,
+    on_error: ?ErrorFn = null,
+    on_error_ctx: ?*anyopaque = null,
     compression: ?Compression = null,
     encoder_provider: ?EncoderProvider = null,
     max_decompressed_request_bytes: u64 = 0,
@@ -4555,6 +4616,8 @@ fn runStreamWith(tweaks: StreamTweaks, ctx: ?*anyopaque, wire: []const u8, out_b
         .max_body_bytes = tweaks.max_body_bytes,
         .on_conn_state = tweaks.on_conn_state,
         .on_conn_state_ctx = tweaks.on_conn_state_ctx,
+        .on_error = tweaks.on_error,
+        .on_error_ctx = tweaks.on_error_ctx,
         .compression = tweaks.compression,
         .encoder_provider = tweaks.encoder_provider,
         .max_decompressed_request_bytes = tweaks.max_decompressed_request_bytes,
@@ -5042,6 +5105,47 @@ test "Request.basicAuth and headerAll through serveStream" {
     var out_buf3: [4096]u8 = undefined;
     const vals = runStream(null, "GET /vals HTTP/1.1\r\nHost: t\r\nX-V: a\r\nX-Other: z\r\nx-v: b, c\r\nConnection: close\r\n\r\n", &out_buf3);
     try testing.expect(std.mem.endsWith(u8, vals, "[a][b, c]"));
+}
+
+/// Records `on_error` events for the tests (`h2_server` has its own).
+const ErrorLogForTest = struct {
+    events: [8]struct { kind: ErrorKind, err: ?anyerror, status: u16 } = undefined,
+    n: usize = 0,
+
+    fn record(ctx: ?*anyopaque, kind: ErrorKind, err: ?anyerror, status: u16, _: ?net.IpAddress) void {
+        const log: *ErrorLogForTest = @ptrCast(@alignCast(ctx.?));
+        if (log.n == log.events.len) return;
+        log.events[log.n] = .{ .kind = kind, .err = err, .status = status };
+        log.n += 1;
+    }
+};
+
+test "on_error: a handler error, a refused request and an over-cap body are reported once each; success is silent" {
+    var log: ErrorLogForTest = .{};
+    var out_buf: [8192]u8 = undefined;
+    const tw: StreamTweaks = .{ .on_error = ErrorLogForTest.record, .on_error_ctx = &log, .max_body_bytes = 4 };
+    _ = runStreamWith(tw, null, "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
+        "GET /fail HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
+    try testing.expectEqual(@as(usize, 1), log.n);
+    try testing.expectEqual(ErrorKind.handler_failed, log.events[0].kind);
+    try testing.expectEqual(@as(?anyerror, error.Boom), log.events[0].err);
+    try testing.expectEqual(@as(u16, 500), log.events[0].status);
+
+    log = .{};
+    _ = runStreamWith(tw, null, "GET / HTTP/1.1\r\n\r\n", &out_buf); // no Host on 1.1
+    try testing.expectEqual(@as(usize, 1), log.n);
+    try testing.expectEqual(ErrorKind.request_refused, log.events[0].kind);
+    try testing.expectEqual(@as(u16, 400), log.events[0].status);
+
+    log = .{};
+    _ = runStreamWith(tw, null, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n123456789\r\n0\r\n\r\n", &out_buf);
+    try testing.expectEqual(@as(usize, 1), log.n);
+    try testing.expectEqual(ErrorKind.request_refused, log.events[0].kind);
+    try testing.expectEqual(@as(u16, 413), log.events[0].status);
+
+    log = .{};
+    _ = runStreamWith(tw, null, "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqual(@as(usize, 0), log.n);
 }
 
 test "ResponseWriter: standalone against any writer (no socket, no loop)" {

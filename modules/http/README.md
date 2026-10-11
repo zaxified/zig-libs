@@ -480,7 +480,12 @@ count of admitted, not-yet-closed connections — the enforcement input for
 a global cap. `Options.on_conn_state` optionally observes
 `new / active / idle / closed` per connection (Go ConnState-style;
 `active` fires when a request head arrived, not on the first byte;
-rejected connections fire nothing).
+rejected connections fire nothing). `Options.on_error` is Go's
+`ErrorLog` as a callback: a handler error (`handler_failed`, with the
+error), a request refused before its handler (`request_refused`, with the
+status), a server-side failure (`server_failed`: 503 no working memory, 500
+broken framing) and `accept` errors (`accept_failed`) — h1 and h2 alike;
+success never calls it.
 
 **Size limits** (all configurable in `Options`):
 

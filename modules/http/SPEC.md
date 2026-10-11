@@ -415,7 +415,9 @@ Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML not
   body with two newlines.
 - R4 `http.form`: one form object over query + urlencoded + multipart (Go `ParseForm`/`FormValue`),
   client form encoder.
-- R5 `on_error` hook (Go `ErrorLog`).
+- R5 `on_error` hook (Go `ErrorLog`) — DONE 2026-10-12: `Options`/`StreamOptions`/`h2_server.Options`
+  `.on_error`, `ErrorKind` {handler_failed, request_refused, server_failed, accept_failed}; fired
+  through one `noinline` call so the serving frame stays inside its budget (checked in ReleaseSafe).
 - R6 oracle divergences (a)(b)(e) above — DONE 2026-10-12.
 - R7 reverse proxy: rewrite/modify-response/error hooks, flush for streaming responses (the h1 relay
   never flushes: SSE through it waits for a full buffer — survey reading, test first), Upgrade/WebSocket
