@@ -12,6 +12,7 @@ const native_endian = builtin.cpu.arch.endian();
 const std = @import("std");
 const verify = @import("verify.zig");
 const p256 = @import("p256");
+const keygen = @import("keygen.zig");
 const rsa = @import("rsa");
 // zig-libs tlsclient: dead-stack burn around the client-certificate signature.
 const burn = @import("burn.zig");
@@ -1744,8 +1745,11 @@ const KeyShare = struct {
     fn init(seed: *const [176]u8) error{IdentityElement}!KeyShare {
         return .{
             .ml_kem768_kp = try .generateDeterministic(seed[0..64].*),
-            .secp256r1_kp = try .generateDeterministic(seed[64..96].*),
-            .secp384r1_kp = try .generateDeterministic(seed[96..144].*),
+            // zig-libs tlsclient: std's key pairs, byte for byte, with the
+            // public keys from fixed-base combs (keygen.zig) — std's
+            // `basePoint.mul` for these two was ~2/3 of the client's CPU.
+            .secp256r1_kp = try keygen.keyPairP256(seed[64..96].*),
+            .secp384r1_kp = try keygen.keyPairP384(seed[96..144].*),
             .x25519_kp = try .generateDeterministic(seed[144..176].*),
             .sk_buf = undefined,
             .sk_len = 0,

@@ -1106,8 +1106,18 @@ noise	ReleaseFast	transport	1	6	dde901de8c90da98	b4443cf65f6c3849
 # encoding of the public signature, trimStart of its leading zeros). The
 # encrypted flight is not measured (see the harness: 696 parse contexts on
 # decrypted public server messages).
-tlsclient	ReleaseFast	kex	1	21	506afe7f05797929	73e6ffdaf71d18ad
-tlsclient	ReleaseFast	cv	1	32	ff3d0526033d6ce8	8b11266441b54869
+# 2026-10-11 — kex 21 -> 19 with the P-256/P-384 key shares from fixed-base
+# combs (keygen.zig, now in the row's pattern). Context diff against
+# 7f088f00 (--stacks both, by call chain): std pcMul16 rejectIdentity 3 and
+# ecdsa fromSecretKey/init 2 gone; deterministicScalar range 2 moved 1:1
+# into keygen.deterministicSecret; rejectIdentity now at the end of the P-384
+# comb (keygen.zig) 1 and p256's comb 2. A first version used std's
+# `addMixed`, whose closing `cMov(p, q.x.isZero())` showed up as 2 secret-
+# dependent loads (cmovznzU64) for the digit-0 dummy -- replaced by a copy
+# without the select. Positive control (secret-indexed table load in a
+# disposable copy): 19 -> 20.
+tlsclient	ReleaseFast	kex	1	19	63df6afdb37ae355	73e6ffdaf71d18ad
+tlsclient	ReleaseFast	cv	1	32	1e75aaf8699c2a1a	8b11266441b54869
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
 # record keys (key, IV, sn mask key) tainted, send/recv both ways under

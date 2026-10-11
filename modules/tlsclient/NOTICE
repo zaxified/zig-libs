@@ -7,8 +7,13 @@ modified by this collection: the `@import` of std, the handling of the
 server's Certificate message (chain collected, guarded by `x509.safe`,
 verified by `verify.zig`), and two opt-in additions -- ALPN and TLS 1.3
 client certificates -- each marked "zig-libs tlsclient". Everything else in
-the file is Zig's. Its license
-follows and must travel with the file.
+the file is Zig's.
+
+`src/keygen.zig` carries two smaller copies from the same Zig 0.16.0 release,
+each marked in its doc comment: `deterministicSecret` is the body of
+`deterministicScalar` from `lib/std/crypto/ecdsa.zig`, and `addMixedComplete`
+is `P384.addMixed` from `lib/std/crypto/pcurves/p384.zig` without its final
+select. The license follows and must travel with these files.
 
 The MIT License (Expat)
 
