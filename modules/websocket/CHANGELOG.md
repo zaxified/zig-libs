@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Docs: owner accepted the bench installing `fastmem` as the measurement behind P2
+  (`write_deflate` 0.93× with it, 2.0× with compiler_rt's byte-wise memset).
+
 - **2026-10-11** — **Feature: permessage-deflate (RFC 7692) and a `Conn` read/write loop** (scope
   core → parity with coder/websocket). New `deflate` (offer/response grammar, `Compressor`, bounded
   `inflate`; no context takeover both ways) and `conn` (`readMessage` with automatic pong, close

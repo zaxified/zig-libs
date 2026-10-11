@@ -186,6 +186,8 @@ as this collection's libc-free executables do (qap's): std 0.16's `flate.Compres
 resets its 96 KiB token list once per compressed message, and with Zig 0.16's byte-wise
 compiler_rt memset `write_deflate` measured 2.0× coder (0.93× with a vectorized memset). A
 libc-free binary that sends compressed messages without `fastmem` pays ~30 µs per message for it.
+Owner decision 2026-10-11: the bench installing `fastmem` is the accepted measurement for P2
+(the alternative, an own deflate encoder, is not worth it for this).
 
 **`Conn` (2026-10-11).** `conn.zig`: `readMessage` loops `Connection.receive` over the reader's
 buffer (filling it on `.need_more`; a frame larger than the buffer is `FrameExceedsBuffer` +
