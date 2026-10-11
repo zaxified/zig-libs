@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-11** — Added (S2, closes the survey gaps against alexliesenfeld/health v0.8.1): an opt-in startup probe (`Health.startup = .{ .started = &flag }`, path `/startupz` by default; 503 `not started` until the application sets its own atomic flag) and an opt-in JSON body (`Health.json`; `{"status":"up"|"down","details":{"<check>":{"status":...}}}` with `application/json; charset=utf-8`, still governed by `detail`, names escaped, no allocation; `details` lists at most 256 checks). `Probe` gains `.startup`. Tests: startup + JSON goldens and an extended model-fuzz. New `tools/bench.zig` + `tools/go_bench` (`zig build bench-health`).
+
 - **2026-10-11** — tests: seeded model-fuzz comparing random configs and requests against a naive probe/body/call-count reference model. No API or behaviour change.
 
 - **2026-10-04** — **Tests:** mutation run (12 schemata mutants, 11 killed, 1 equivalent; one new
