@@ -705,7 +705,7 @@ pub fn entryFromRequest(
     var entry: Entry = .{
         .timestamp_ns = opts.timestamp_ns,
         .time_formatted = opts.time_formatted,
-        .method = req.method.token(),
+        .method = req.methodName(),
         .target = req.target,
         .protocol = if (req.head.http1_0) "HTTP/1.0" else "HTTP/1.1",
         .status = res.status,

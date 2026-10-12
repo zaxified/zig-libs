@@ -609,7 +609,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     else
         null;
     var key_buf: [max_scoped_key]u8 = undefined;
-    const scoped = scopeKey(&key_buf, idem.options.scope, ctx.req.method, ctx.req.path, principal, client_key) orelse
+    const scoped = scopeKey(&key_buf, idem.options.scope, ctx.req.methodName(), ctx.req.path, principal, client_key) orelse
         // Too long to scope — degrade to running normally without dedup.
         return next.run(ctx);
 
@@ -709,7 +709,9 @@ pub fn validKey(v: []const u8, max_len: usize) bool {
 pub fn scopeKey(
     buf: []u8,
     scope: Scope,
-    method: http.Method,
+    /// The method's name as sent (`Request.methodName`): two extension
+    /// methods must not share a key.
+    method: []const u8,
     path: []const u8,
     principal: ?[]const u8,
     client_key: []const u8,
@@ -718,7 +720,7 @@ pub fn scopeKey(
     return switch (scope) {
         .key_only => std.fmt.bufPrint(buf, "{s} {s}", .{ who, client_key }) catch null,
         .target => std.fmt.bufPrint(buf, "{s} {s} {s} {s}", .{
-            who, method.token(), path, client_key,
+            who, method, path, client_key,
         }) catch null,
     };
 }
@@ -1760,7 +1762,7 @@ test "model-fuzz: validKey, scopeKey, principalTag and decode vs. models on rand
         // Output buffer sized around the wanted length so both outcomes occur.
         var out_buf: [512]u8 = undefined;
         const room = if (rnd.boolean()) wl else wl -| (1 + rnd.uintLessThan(usize, 3));
-        const got = scopeKey(out_buf[0..room], sc, methods[mi], path, who, key[0..@min(klen, 100)]);
+        const got = scopeKey(out_buf[0..room], sc, methods[mi].token(), path, who, key[0..@min(klen, 100)]);
         if (room >= wl) {
             fit_n += 1;
             try testing.expectEqualStrings(want_buf[0..wl], got.?);

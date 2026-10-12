@@ -2159,7 +2159,9 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     // Semantic rejections (mirrors Go net/http): HTTP/1.1 requires Host; a
     // Transfer-Encoding without chunked leaves the body unframeable; only
     // methods in the shared vocabulary are dispatched.
-    if (!head.http1_0 and head.host == null) return respondError(opts, out, date, 400);
+    // CONNECT names its authority in the target and needs no Host (Go).
+    if (!head.http1_0 and head.host == null and !std.mem.eql(u8, head.method, "CONNECT"))
+        return respondError(opts, out, date, 400);
     if (head.has_transfer_encoding and !head.chunked) return respondError(opts, out, date, 400);
     // Request smuggling (RFC 9112 §6.1): a message carrying BOTH a
     // Content-Length and a Transfer-Encoding is ambiguous. The parser lets
@@ -2174,7 +2176,10 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     // This used to decode it as chunked (Go oracle, 2026-10-05).
     if (head.http1_0 and head.has_transfer_encoding)
         return respondError(opts, out, date, 400);
-    const method = methodFromToken(head.method) orelse return respondError(opts, out, date, 501);
+    // Every method token reaches the handler (Go; RFC 9110 §9.1 leaves an
+    // unrecognized method to the origin): the parser checked it is a token,
+    // `.other` + `Request.method_token` carry the ones outside `Method`.
+    const method = http.Method.fromToken(head.method);
 
     // The request-target, reduced to what routing needs. Origin-form
     // ("/path?query") is what every client sends to an origin; asterisk-form
@@ -2185,7 +2190,17 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     // a MUST is not a concern to weigh.
     var target: []const u8 = head.target;
     var query_of_empty_path: []const u8 = "";
-    if (target[0] != '/' and !std.mem.eql(u8, target, "*")) {
+    // Authority-form ("host:port") is CONNECT's alone (RFC 9112 §3.2.3); it
+    // names no resource, so `path` and `query` are empty and `target` keeps
+    // the authority (Go: `RequestURI` = the authority, `URL.Path` = "").
+    // A CONNECT in origin-form is an ordinary request, as in Go.
+    // `*` would pass `isValidHost` (a sub-delim is a reg-name byte); it is
+    // OPTIONS' asterisk-form, refused below for every other method.
+    const authority_form = method == .connect and target[0] != '/' and !std.mem.eql(u8, target, "*");
+    if (authority_form) {
+        if (!h1.isValidHost(target)) return respondError(opts, out, date, 400);
+        target = "";
+    } else if (target[0] != '/' and !std.mem.eql(u8, target, "*")) {
         const scheme_end = std.mem.indexOf(u8, target, "://") orelse return respondError(opts, out, date, 400);
         const scheme = target[0..scheme_end];
         if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https"))
@@ -2290,6 +2305,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         .initWithTrailers(&head, in, bufs.request_body, bufs.trailers);
     var req: Request = .{
         .method = method,
+        .method_token = head.method,
         .target = head.target,
         .path = path,
         .query = query,
@@ -2337,7 +2353,8 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         .encoder_provider = if (compression_on and opts.encoder_provider != null) &opts.encoder_provider.? else null,
         .accept_encoding = head.header("accept-encoding"),
         .upgradable = !has_body and !head.http1_0,
-        .upgrade_in = if (!has_body and !head.http1_0) in else null,
+        .tunnelable = !has_body and method == .connect,
+        .upgrade_in = if (!has_body and (!head.http1_0 or method == .connect)) in else null,
         .continue_pending = continue_pending,
     });
     // `Expect: 100-continue` is answered LAZILY: the interim `100 Continue`
@@ -2448,11 +2465,8 @@ fn writeErrorResponse(opts: StreamOptions, out: *Writer, date: ?[]const u8, stat
 /// Method-token lookup against the shared vocabulary (case-sensitive, as
 /// the wire demands); also used by the h2 path to map `:method`.
 pub fn methodFromToken(token: []const u8) ?http.Method {
-    inline for (@typeInfo(http.Method).@"enum".fields) |f| {
-        const m: http.Method = @enumFromInt(f.value);
-        if (std.mem.eql(u8, token, comptime m.token())) return m;
-    }
-    return null;
+    const m = http.Method.fromToken(token);
+    return if (m == .other) null else m;
 }
 
 // ── the request ─────────────────────────────────────────────────────────────
@@ -2461,6 +2475,10 @@ pub fn methodFromToken(token: []const u8) ?http.Method {
 /// for the duration of the handler call only.
 pub const Request = struct {
     method: http.Method,
+    /// The method token as sent ("GET", "PURGE", "get"), always set by the
+    /// server — the only name an `.other` method has. A hand-built Request
+    /// (a test) may leave it empty; `methodName` covers both.
+    method_token: []const u8 = "",
     /// Raw request-target as sent ("/path?q=1" or "*").
     target: []const u8,
     /// Target up to the '?' (the whole target when there is none), with
@@ -2518,6 +2536,12 @@ pub const Request = struct {
         return req.conn_request_index;
     }
 
+    /// The method's name as sent — Go's `Request.Method`: `method_token`,
+    /// or the standard token when a hand-built Request left it empty.
+    pub fn methodName(req: *const Request) []const u8 {
+        return if (req.method_token.len != 0) req.method_token else req.method.token();
+    }
+
     /// First value of header `name` (case-insensitive), or null.
     pub fn header(req: *const Request, name: []const u8) ?[]const u8 {
         return req.head.header(name);
@@ -2571,17 +2595,18 @@ pub const Request = struct {
         }
     };
 
-    /// After `ResponseWriter.upgrade` put the 101 on the wire: the
-    /// connection itself, for the new protocol — Go's `Hijack`. The reader
+    /// After `ResponseWriter.upgrade` put the 101 on the wire, or
+    /// `ResponseWriter.tunnel` the 2xx to a CONNECT: the connection itself,
+    /// for the new protocol or the tunnel — Go's `Hijack`. The reader
     /// may already hold bytes the client sent behind its request; write to
     /// `writer` and flush it. The connection's HTTP timeouts (per-read and
     /// per-write stalls, the request, phase and response deadlines) are
     /// lifted: the new protocol owns its liveness (a WebSocket ping, an
     /// idle bound of the handler's own). The serving loop closes the
     /// connection when the handler returns. Null before a successful
-    /// `upgrade`.
+    /// `upgrade` or `tunnel`.
     pub fn upgraded(req: *Request, rw: *ResponseWriter) ?Upgraded {
-        if (rw.status != 101 or !rw.ended) return null;
+        if (!rw.handed_over) return null;
         const in = rw.upgrade_in orelse return null;
         if (req.control) |c| {
             if (c.tr) |t| {
@@ -3176,8 +3201,12 @@ pub const ResponseWriter = struct {
     /// See `upgrade`: only the h1 serving loop sets it, and only for a
     /// request that carries no body.
     upgradable: bool = false,
+    /// See `tunnel`: a CONNECT without a body, on the h1 serving loop.
+    tunnelable: bool = false,
+    /// `upgrade` or `tunnel` handed the connection over.
+    handed_over: bool = false,
     /// The connection's reader, handed over by `Request.upgraded` after a
-    /// 101; set with `upgradable`.
+    /// 101 or a tunnel; set with `upgradable` / `tunnelable`.
     upgrade_in: ?*Reader = null,
     body: BodySink = .buffering,
     /// Body octets written through the `.until_close` sink (see
@@ -3254,6 +3283,7 @@ pub const ResponseWriter = struct {
         /// serving loop for an HTTP/1.1 request without a body; false
         /// everywhere else (h2, a hand-built writer), so `upgrade` refuses.
         upgradable: bool = false,
+        tunnelable: bool = false,
         /// The connection's reader, for `Request.upgraded`. Set with
         /// `upgradable` by the h1 serving loop.
         upgrade_in: ?*Reader = null,
@@ -3291,6 +3321,7 @@ pub const ResponseWriter = struct {
                 if (opts.encoder_provider) |p| p.prefers(p, opts.accept_encoding) else false,
             .field_sink = opts.field_sink,
             .upgradable = opts.upgradable,
+            .tunnelable = opts.tunnelable,
             .upgrade_in = opts.upgrade_in,
             .interface = .{
                 .vtable = &.{ .drain = drainFn },
@@ -3889,6 +3920,37 @@ pub const ResponseWriter = struct {
         try rw.writeHead(.none);
         rw.ended = true;
         rw.detached = true;
+        rw.handed_over = true;
+        try rw.out.flush();
+    }
+
+    pub const TunnelError = Writer.Error || error{ HeadersSent, Unsupported, BadStatus };
+
+    /// Answer a CONNECT with `status` (2xx) and hand the connection over as
+    /// the tunnel (RFC 9110 §9.3.6): the head goes out without
+    /// Content-Length or Transfer-Encoding (a 2xx to CONNECT MUST NOT carry
+    /// them), is flushed, and `Request.upgraded` returns the connection —
+    /// in Go, `WriteHeader` + `Hijack`. Headers set before the call go out
+    /// with it. The serving loop stops (`.close`) and closes the socket
+    /// when the handler returns.
+    ///
+    /// `error.Unsupported` for anything but an h1 CONNECT without a body
+    /// (h2 CONNECT is answered 501 before a handler runs); the writer is
+    /// untouched then. `error.BadStatus` outside 200-299.
+    pub fn tunnel(rw: *ResponseWriter, status: u16) TunnelError!void {
+        if (rw.sent_head) return error.HeadersSent;
+        if (!rw.tunnelable or rw.field_sink != null or rw.upgrade_in == null) return error.Unsupported;
+        if (status < 200 or status > 299) return error.BadStatus;
+        rw.status = status;
+        // The tunnel, not HTTP, now owns the connection: neither
+        // `Connection: close` nor the HTTP/1.0 `keep-alive` echo applies.
+        rw.close_connection = false;
+        rw.http1_0 = false;
+        rw.body = .discard;
+        try rw.writeHead(.none);
+        rw.ended = true;
+        rw.detached = true;
+        rw.handed_over = true;
         try rw.out.flush();
     }
 
@@ -4751,7 +4813,9 @@ const json_body = "{\"data\":[" ++ ("\"abcdefgh\"," ** 160) ++ "\"end\"]}";
 
 fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
     bumpHits(req);
-    if (std.mem.eql(u8, req.path, "/hello")) {
+    if (std.mem.eql(u8, req.path, "/method") or (req.method == .connect and req.path.len == 0)) {
+        try rw.writer().print("{t}|{s}|{s}", .{ req.method, req.methodName(), req.target });
+    } else if (std.mem.eql(u8, req.path, "/hello")) {
         try rw.setHeader("Content-Type", "text/plain");
         if (req.query.len != 0) try rw.setHeader("X-Query", req.query);
         try rw.writeAll("hello");
@@ -5277,10 +5341,9 @@ test "serveStream: a bare LF cannot stand in for the head-terminating CRLF and s
     try testing.expectEqual(@as(u32, 0), hits.load(.monotonic));
 }
 
-test "serveStream: protocol rejections (505, 501, 400s, 431)" {
+test "serveStream: protocol rejections (505, 400s, 431)" {
     var out_buf: [4096]u8 = undefined;
     try testing.expect(std.mem.startsWith(u8, runStream(null, "GET / HTTP/2.0\r\n\r\n", &out_buf), "HTTP/1.1 505 HTTP Version Not Supported\r\n"));
-    try testing.expect(std.mem.startsWith(u8, runStream(null, "BREW /pot HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 501 Not Implemented\r\n"));
     try testing.expect(std.mem.startsWith(u8, runStream(null, "GET / HTTP/1.1\r\n\r\n", &out_buf), // missing Host
         "HTTP/1.1 400 Bad Request\r\n"));
     try testing.expect(std.mem.startsWith(u8, runStream(null, "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: gzip\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
@@ -9121,6 +9184,245 @@ test "upgrade: a malformed protocol and a head already sent are refused" {
     const got, _ = runUpgrade(&probe, ws_request, &out_buf, &residue);
     try testing.expectError(error.HeadersSent, probe.result.?);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
+}
+
+// ── methods outside the standard set (R9) ──────────────────────────────────
+
+test "serveStream: every method token reaches the handler (Go), CONNECT in authority-form" {
+    const cases = [_]struct { wire: []const u8, body: []const u8 }{
+        .{ .wire = "GET /method HTTP/1.1\r\nHost: t\r\n\r\n", .body = "get|GET|/method" },
+        .{ .wire = "TRACE /method HTTP/1.1\r\nHost: t\r\n\r\n", .body = "trace|TRACE|/method" },
+        .{ .wire = "PURGE /method HTTP/1.1\r\nHost: t\r\n\r\n", .body = "other|PURGE|/method" },
+        // Methods are case-sensitive: `get` is not GET.
+        .{ .wire = "get /method HTTP/1.1\r\nHost: t\r\n\r\n", .body = "other|get|/method" },
+        .{ .wire = "PURGE http://t/method?q HTTP/1.1\r\nHost: t\r\n\r\n", .body = "other|PURGE|http://t/method?q" },
+        // CONNECT needs no Host, on 1.1 or 1.0 (Go).
+        .{ .wire = "CONNECT x:443 HTTP/1.1\r\n\r\n", .body = "connect|CONNECT|x:443" },
+        .{ .wire = "CONNECT [::1]:8443 HTTP/1.0\r\n\r\n", .body = "connect|CONNECT|[::1]:8443" },
+        // Origin-form CONNECT is an ordinary request (Go).
+        .{ .wire = "CONNECT /method HTTP/1.1\r\nHost: t\r\n\r\n", .body = "connect|CONNECT|/method" },
+    };
+    for (cases) |c| {
+        var out_buf: [1024]u8 = undefined;
+        const got = runStream(null, c.wire, &out_buf);
+        errdefer std.debug.print("wire {s}\ngot {s}\n", .{ c.wire, got });
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(std.mem.endsWith(u8, got, c.body));
+    }
+}
+
+test "serveStream: authority-form is CONNECT's alone, and a bare authority" {
+    for ([_][]const u8{
+        "GET x:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+        "PURGE x:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+        "PURGE * HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT * HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT x:443/p HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT u@x:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT x:443?q HTTP/1.1\r\nHost: x\r\n\r\n",
+        // Host is still required for every other method.
+        "PURGE / HTTP/1.1\r\n\r\n",
+    }) |wire| {
+        var out_buf: [1024]u8 = undefined;
+        const got = runStream(null, wire, &out_buf);
+        errdefer std.debug.print("wire {s}\ngot {s}\n", .{ wire, got });
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
+    }
+}
+
+const TunnelProbe = struct {
+    status: u16 = 200,
+    result: ?ResponseWriter.TunnelError!void = null,
+    /// What the tunnel read from the client, and whether `upgraded` gave it.
+    read_buf: [16]u8 = undefined,
+    read: []const u8 = "",
+    handed_over: bool = false,
+};
+
+fn tunnelHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    const probe: *TunnelProbe = @ptrCast(@alignCast(req.context.?));
+    try testing.expect(req.upgraded(rw) == null);
+    try rw.setHeader("X-Tunnel", "1");
+    probe.result = rw.tunnel(probe.status);
+    probe.result.? catch {
+        rw.setStatus(405);
+        return rw.writeAll("no\n");
+    };
+    const conn = req.upgraded(rw) orelse return;
+    probe.handed_over = true;
+    const n = try conn.reader.readSliceShort(&probe.read_buf);
+    probe.read = probe.read_buf[0..n];
+    try conn.writer.writeAll("pong");
+    try conn.writer.flush();
+}
+
+fn runTunnel(probe: *TunnelProbe, wire: []const u8, out_buf: []u8) struct { []const u8, ConnDisposition } {
+    var in: Reader = .fixed(wire);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    const d = serveStep(.{ .handler = tunnelHandler, .context = probe }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    }, 0);
+    return .{ out.buffered(), d };
+}
+
+test "tunnel: a 2xx to CONNECT without framing, then the connection is the tunnel" {
+    for ([_][]const u8{ "HTTP/1.1", "HTTP/1.0" }) |version| {
+        var probe: TunnelProbe = .{};
+        var out_buf: [512]u8 = undefined;
+        var wire_buf: [128]u8 = undefined;
+        // The client may send tunnel bytes right behind its request.
+        const wire = try std.fmt.bufPrint(&wire_buf, "CONNECT x:443 {s}\r\nConnection: close\r\n\r\nping", .{version});
+        const got, const d = runTunnel(&probe, wire, &out_buf);
+        try probe.result.?;
+        try testing.expect(probe.handed_over);
+        try testing.expectEqual(ConnDisposition.close, d);
+        try testing.expectEqualStrings("ping", probe.read);
+        // RFC 9110 §9.3.6: no Content-Length / Transfer-Encoding; no
+        // Connection either way — the tunnel, not HTTP, owns the socket.
+        try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nX-Tunnel: 1\r\n" ++
+            "Server: zig-libs-http/0.1\r\n\r\npong", got);
+    }
+}
+
+test "tunnel: refused off CONNECT, with a body, or a non-2xx status; the writer still answers" {
+    const cases = [_]struct { wire: []const u8, status: u16, err: anyerror }{
+        .{ .wire = "GET / HTTP/1.1\r\nHost: t\r\n\r\n", .status = 200, .err = error.Unsupported },
+        .{ .wire = "PURGE / HTTP/1.1\r\nHost: t\r\n\r\n", .status = 200, .err = error.Unsupported },
+        .{ .wire = "CONNECT x:443 HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi", .status = 200, .err = error.Unsupported },
+        .{ .wire = "CONNECT x:443 HTTP/1.1\r\n\r\n", .status = 101, .err = error.BadStatus },
+        .{ .wire = "CONNECT x:443 HTTP/1.1\r\n\r\n", .status = 300, .err = error.BadStatus },
+    };
+    for (cases) |c| {
+        var probe: TunnelProbe = .{ .status = c.status };
+        var out_buf: [512]u8 = undefined;
+        const got, _ = runTunnel(&probe, c.wire, &out_buf);
+        try testing.expectError(c.err, probe.result.?);
+        try testing.expect(!probe.handed_over);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 405 Method Not Allowed\r\n"));
+    }
+    // h2 and hand-built writers: not the h1 loop's CONNECT.
+    var out_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try testing.expectError(error.Unsupported, rw.tunnel(200));
+    try testing.expectEqual(@as(usize, 0), out.buffered().len);
+}
+
+// ── fuzz: the h1 request dispatch (methods, target forms, tunnels) ─────────
+
+const fz = @import("fuzz_test.zig");
+const DispatchMark = fz.Marker(enum { refused, served, other_method, authority_form, tunneled });
+
+/// Whole request streams, pipelining included, for `serveStream`.
+const dispatch_seeds = [_][]const u8{
+    testkit.fuzz.seed("GET /a/../b?q=1 HTTP/1.1\r\nHost: t\r\n\r\n"),
+    testkit.fuzz.seed("PURGE /x HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc"),
+    testkit.fuzz.seed("CONNECT x:443 HTTP/1.1\r\n\r\nping"),
+    testkit.fuzz.seed("CONNECT [::1]:8443 HTTP/1.0\r\nHost: h\r\n\r\n"),
+    testkit.fuzz.seed("OPTIONS * HTTP/1.1\r\nHost: t\r\n\r\n"),
+    testkit.fuzz.seed("get http://t/p?q HTTP/1.1\r\nHost: t\r\n\r\n"),
+    testkit.fuzz.seed("PROPFIND /d HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"),
+    testkit.fuzz.seed("TRACE / HTTP/1.1\r\nHost: t\r\n\r\nCONNECT /rpc HTTP/1.1\r\nHost: t\r\n\r\n"),
+};
+
+/// The handler checks what the dispatch promised it, and drives a tunnel
+/// when the request asks for one.
+fn dispatchHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    const name = req.methodName();
+    if (!h1.isToken(name) or http.Method.fromToken(name) != req.method) return error.MethodMismatch;
+    if (req.method == .other) DispatchMark.mark(.other_method);
+    if (req.path.len == 0 and !std.mem.eql(u8, req.target, "*")) {
+        // Authority-form: CONNECT's alone, a bare authority.
+        if (req.method != .connect or !h1.isValidHost(req.target) or req.query.len != 0)
+            return error.AuthorityFormLeaked;
+        DispatchMark.mark(.authority_form);
+        rw.tunnel(200) catch return rw.writeAll("no");
+        const conn = req.upgraded(rw) orelse return error.TunnelLost;
+        DispatchMark.mark(.tunneled);
+        var sink: [64]u8 = undefined;
+        _ = conn.reader.readSliceShort(&sink) catch {};
+        return;
+    }
+    if (std.mem.eql(u8, req.target, "*")) {
+        if (req.method != .options) return error.AsteriskLeaked;
+    } else {
+        errdefer std.debug.print("dispatch: target {f} path {f}\n", .{ std.ascii.hexEscape(req.target, .lower), std.ascii.hexEscape(req.path, .lower) });
+        checkOriginPath(req.path) catch return error.PathLeaked;
+        // Whole segments: `pathHasDotSegments` is only a pre-filter (it
+        // also flags `/..x`, which is no dot segment — fuzz seed 3930).
+        var segs = std.mem.splitScalar(u8, req.path, '/');
+        while (segs.next()) |seg| if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, ".."))
+            return error.DotSegmentLeaked;
+    }
+    var w: Writer.Discarding = .init(&.{});
+    _ = req.reader().streamRemaining(&w.writer) catch {};
+    try rw.writeAll("ok");
+}
+
+fn fuzzDispatch(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var wire: [512]u8 = undefined;
+    const len: usize = fz.drawInput(S, src, &wire, &dispatch_seeds);
+    var in: Reader = .fixed(wire[0..len]);
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var head_buf: [512]u8 = undefined;
+    var request_body_buf: [128]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var failed = false;
+    serveStream(.{ .handler = dispatchHandler, .on_error = noteDispatchError, .on_error_ctx = &failed }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    // A handler that saw a broken promise failed: that is the finding.
+    if (failed) return error.DispatchBrokePromise;
+    const got = out.buffered();
+    if (got.len == 0) return;
+    if (!std.mem.startsWith(u8, got, "HTTP/1.1 ")) return error.NotAResponse;
+    if (got.len >= 10 and (got[9] == '4' or got[9] == '5')) DispatchMark.mark(.refused) else DispatchMark.mark(.served);
+}
+
+fn noteDispatchError(ctx: ?*anyopaque, kind: ErrorKind, err: ?anyerror, _: u16, _: ?net.IpAddress) void {
+    if (kind != .handler_failed) return;
+    // Only the handler's own verdicts; a read of a cut-short body is not one.
+    switch (err orelse return) {
+        error.MethodMismatch, error.AuthorityFormLeaked, error.TunnelLost, error.AsteriskLeaked, error.PathLeaked, error.DotSegmentLeaked => {
+            std.debug.print("dispatch: {t}\n", .{err.?});
+            const failed: *bool = @ptrCast(@alignCast(ctx.?));
+            failed.* = true;
+        },
+        else => {},
+    }
+}
+
+fn fuzzDispatchSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzDispatch, smith, script[0..n]);
+}
+
+test "fuzz: the h1 dispatch keeps its promises to the handler (method, target form, tunnel)" {
+    try testing.fuzz({}, fuzzDispatchSmith, .{ .corpus = &dispatch_seeds });
+}
+
+test "fuzz driver: HTTP_FUZZ (server dispatch)" {
+    try fz.fuzz_driver.run(fuzzDispatch, .{ .prefix = "HTTP_FUZZ", .name = "http-server-dispatch" });
+}
+
+test "fuzz harness: server dispatch, 300 seeds, reaches every outcome" {
+    try DispatchMark.reach(fuzzDispatch, "http-server-dispatch", 300);
 }
 
 test "upgrade: a writer the h1 loop did not build refuses (h2, hand-built)" {

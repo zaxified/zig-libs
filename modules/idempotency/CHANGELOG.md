@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Breaking (source):** `scopeKey` takes the method name (`[]const u8`,
+  `Request.methodName()`) instead of `http.Method`: since http R9 every extension method is
+  `.other`, and two of them must not share a cached result. qap calls it once.
+
 - **2026-10-12** — **Pluggable record store (S3 → S2).** `Backend` (type-erased: `lookupOrReserve` / `put` / `release`, contract on the type) set through `Store.backend`; **Breaking (source):** `Store.cache` is now optional (`?*ramcache.Cache`, the in-process default, unchanged behaviour) — `store.cache.alloc` becomes `store.alloc()` (qap `src/root.zig` reads it twice; initialising with `.cache = &cache` still compiles); `Store.lease_ns`; `Store.alloc()`. `KvBackend`: durable records over `kv.Db` (`putTtl`, survive a restart), in-memory reservations with lease takeover, fail-closed 409 on an unreadable record. New dep `kv`. The sequence model-fuzz also runs over `KvBackend`; its single clock nudge became a loop (a second record could land on the TTL edge).
 - **2026-10-11** — tests: seeded model-fuzz comparing random request sequences (methods, keys, bodies, callers, clock) with a linear-scan reference model of the documented decision order, plus random-input checks of `validKey`/`scopeKey`/`principalTag`/`decode`. No API or behaviour change.
 

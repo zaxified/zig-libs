@@ -154,7 +154,9 @@ fn writeAllow(buf: []u8, bits: AllowSet) []const u8 {
     const has_get = bits.isSet(@intFromEnum(http.Method.get));
     inline for (@typeInfo(http.Method).@"enum".fields, 0..) |f, i| {
         const m: http.Method = @enumFromInt(f.value);
-        if (bits.isSet(i) or (m == .head and has_get)) {
+        // `.other` has no token to list: a route for it serves extension
+        // methods, which `Allow` cannot name.
+        if (m != .other and (bits.isSet(i) or (m == .head and has_get))) {
             if (w.end != 0) w.writeAll(", ") catch unreachable;
             w.writeAll(comptime m.token()) catch unreachable;
         }
@@ -538,9 +540,12 @@ pub const Router = struct {
         return r.add(.options, pattern, h);
     }
 
-    /// Register `h` for every `http.Method` at `pattern` (chi's `Handle`).
-    /// An explicit route for one method registered before or after is a
-    /// `error.DuplicateRoute` — `any` claims them all. Not atomic: on an
+    /// Register `h` for every standard `http.Method` at `pattern` (chi's
+    /// `Handle`) — not `.other`: an extension method is a 405 there, as in
+    /// chi, unless a route for `.other` exists (`add(.other, …)`; the
+    /// handler reads `Request.method_token`). An explicit route for one
+    /// method registered before or after is a `error.DuplicateRoute` —
+    /// `any` claims them all. Not atomic: on an
     /// error the methods before the failing one stay registered — treat it
     /// as a startup failure, like every `add` error.
     pub fn any(r: *Router, pattern: []const u8, h: Handler) AddError!void {
@@ -1040,13 +1045,13 @@ pub const Router = struct {
         // `rebuildAllow`'s buffer below must fit every registered method's
         // token, comma-separated -- its `catch unreachable` would otherwise
         // be an actual runtime panic in `add()` the day `http.Method` grows
-        // past what fits today (audit finding router-F9: today's 7 methods
-        // use 44 of 64 bytes, so there was room to grow silently until the
-        // panic, with nothing here to say by how much).
+        // past what fits today (audit finding router-F9: the 9 named
+        // methods use 62 of 64 bytes since CONNECT and TRACE joined in
+        // 2026-10; `.other` is never listed).
         var worst: usize = 0;
         for (@typeInfo(http.Method).@"enum".fields) |f| {
             const m: http.Method = @enumFromInt(f.value);
-            worst += m.token().len + 2; // ", " separator; one spare is fine
+            if (m != .other) worst += m.token().len + 2; // ", " separator; one spare is fine
         }
         if (worst > 64) @compileError(std.fmt.comptimePrint(
             "router: http.Method has grown to {d} members ({d} bytes worst-case " ++
@@ -1243,7 +1248,9 @@ fn newGroup(r: *Router, parent: ?*Group, prefix: []const u8, is_inline: bool) er
 }
 
 fn addAny(r: *Router, g: ?*Group, pattern: []const u8, h: Handler) AddError!void {
-    for (std.enums.values(http.Method)) |m| try Router.addRoute(r, g, m, pattern, h, null);
+    for (std.enums.values(http.Method)) |m| {
+        if (m != .other) try Router.addRoute(r, g, m, pattern, h, null);
+    }
 }
 
 fn mountInto(r: *Router, parent: ?*Group, prefix: []const u8, sub: *const Router) MountError!void {
@@ -4044,13 +4051,36 @@ test "any: every method at one pattern; a second registration is a duplicate" {
     defer r.deinit();
     try r.any("/hook", hHello);
     var buf: [1024]u8 = undefined;
-    inline for (.{ "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS" }) |m|
+    inline for (.{ "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "CONNECT", "TRACE" }) |m|
         try testing.expectEqualStrings("hello", bodyOf(runWire(&r, wire(m, "/hook"), &buf)));
-    try testing.expectEqual(std.enums.values(http.Method).len, r.routes().len);
+    // Every standard method, not `.other`: an extension method is a 405
+    // (chi), whose Allow names the standard ones.
+    try testing.expectEqual(std.enums.values(http.Method).len - 1, r.routes().len);
+    const purge = runWire(&r, wire("PURGE", "/hook"), &buf);
+    try expectStatus(purge, "405");
+    try expectHeaderLine(purge, "Allow: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, CONNECT, TRACE");
     try testing.expectError(error.DuplicateRoute, r.post("/hook", hHello));
     const g = try r.group("/g");
     try g.any("/x", hHello);
     try testing.expectEqualStrings("hello", bodyOf(runWire(&r, wire("PATCH", "/g/x"), &buf)));
+}
+
+fn hMethodToken(ctx: *Ctx) anyerror!void {
+    try ctx.res.writeAll(ctx.req.methodName());
+}
+
+test "an .other route serves every extension method; Allow never names it" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.add(.other, "/dav", hMethodToken);
+    try r.get("/dav", hMethodToken);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("PROPFIND", bodyOf(runWire(&r, wire("PROPFIND", "/dav"), &buf)));
+    try testing.expectEqualStrings("get", bodyOf(runWire(&r, wire("get", "/dav"), &buf)));
+    try testing.expectEqualStrings("GET", bodyOf(runWire(&r, wire("GET", "/dav"), &buf)));
+    const put = runWire(&r, wire("PUT", "/dav"), &buf);
+    try expectStatus(put, "405");
+    try expectHeaderLine(put, "Allow: GET, HEAD");
 }
 
 fn hNfSub(ctx: *Ctx) anyerror!void {

@@ -492,10 +492,10 @@ pub const RequestPreview = struct {
         return null;
     }
 
-    /// `:method` mapped onto the shared vocabulary, or null when absent or
-    /// not a method this server speaks.
+    /// `:method` mapped onto the shared vocabulary (`.other` for any other
+    /// token), or null when absent.
     pub fn method(p: RequestPreview) ?http.Method {
-        return Server.methodFromToken(p.get(":method") orelse return null);
+        return http.Method.fromToken(p.get(":method") orelse return null);
     }
 
     /// `:path` up to the '?' ("" when absent).
@@ -1767,8 +1767,11 @@ const Session = struct {
         // never fully made; every h2 conformance suite (h2spec 8.1.2.x)
         // expects the reset, and so does every peer.
         if (malformed) return s.protocolError(id);
-        const method = Server.methodFromToken(method_tok.?) orelse
-            return s.respondError(id, 501);
+        // Every token reaches the handler, as on h1 — except CONNECT, which
+        // on h2 (RFC 9113 §8.5) turns the stream into a tunnel this server
+        // does not provide.
+        const method = http.Method.fromToken(method_tok.?);
+        if (method == .connect) return s.respondError(id, 501);
         // §8.3.1: GET-family requests need :scheme and a non-empty :path.
         if (scheme == null or path_full == null or path_full.?.len == 0)
             return s.protocolError(id);
@@ -1949,6 +1952,7 @@ const Session = struct {
         }
         var req: Server.Request = .{
             .method = method,
+            .method_token = method_tok.?,
             .target = target,
             .path = path,
             .query = query,
@@ -2875,7 +2879,9 @@ fn streamRoutes(ctx: ?*anyopaque, preview: RequestPreview) bool {
 
 /// The one handler every test (h1 and h2 alike) is served by.
 fn testHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
-    if (std.mem.eql(u8, req.path, "/hello")) {
+    if (std.mem.eql(u8, req.path, "/method")) {
+        try rw.writer().print("{t}|{s}|{s}", .{ req.method, req.methodName(), req.target });
+    } else if (std.mem.eql(u8, req.path, "/hello")) {
         try rw.setHeader("Content-Type", "text/plain");
         if (req.query.len != 0) try rw.setHeader("X-Query", req.query);
         try rw.writeAll("hello");
@@ -3456,7 +3462,7 @@ test "h2c serve: handler error → 500; 404 and HEAD framing (offline)" {
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
 }
 
-test "h2c serve: malformed requests → RST_STREAM(PROTOCOL_ERROR)/501, connection survives (offline)" {
+test "h2c serve: malformed requests → RST_STREAM(PROTOCOL_ERROR), CONNECT → 501, connection survives (offline)" {
     const gpa = testing.allocator;
     var peer: TestPeer = .init(gpa, .{});
     defer peer.deinit();
@@ -3483,8 +3489,14 @@ test "h2c serve: malformed requests → RST_STREAM(PROTOCOL_ERROR)/501, connecti
         .{ .name = "content-length", .value = "99" },
     }, false);
     try peer.conn.sendData(&peer.wire, sid_badlen, "four", true);
-    // Method outside the vocabulary → 501 (h1 parity).
-    const sid_brew = try peer.conn.startStream(&peer.wire, &fieldsFor("BREW", "/pot"), true);
+    // A method outside the standard set reaches the handler (h1 parity, Go).
+    const sid_brew = try peer.conn.startStream(&peer.wire, &fieldsFor("BREW", "/method"), true);
+    const sid_trace = try peer.conn.startStream(&peer.wire, &fieldsFor("TRACE", "/method"), true);
+    // CONNECT (§8.5: :method + :authority only) asks for a tunnel → 501.
+    const sid_connect = try peer.conn.startStream(&peer.wire, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "x:443" },
+    }, true);
     // …and a valid request after all of them still gets served.
     const sid_ok = try peer.conn.startStream(&peer.wire, &get_fields, true);
 
@@ -3497,7 +3509,10 @@ test "h2c serve: malformed requests → RST_STREAM(PROTOCOL_ERROR)/501, connecti
     try testing.expectEqual(@as(u16, 0), peer.resp(sid_nopath).status);
     try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid_connhdr).rst);
     try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid_badlen).rst);
-    try testing.expectEqual(@as(u16, 501), peer.resp(sid_brew).status);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_brew).status);
+    try testing.expectEqualStrings("other|BREW|/method", peer.resp(sid_brew).body.items);
+    try testing.expectEqualStrings("trace|TRACE|/method", peer.resp(sid_trace).body.items);
+    try testing.expectEqual(@as(u16, 501), peer.resp(sid_connect).status);
     try testing.expectEqual(@as(u16, 200), peer.resp(sid_ok).status);
     try testing.expectEqualStrings("hello", peer.resp(sid_ok).body.items);
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);

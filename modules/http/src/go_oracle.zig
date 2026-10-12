@@ -137,13 +137,15 @@ const h1_divergences = [_]H1Divergence{
     .{ .id = "cl-and-te", .reject = 400, .calls = 0, .why = "same as te-and-cl, fields reversed" },
     .{ .id = "chunk-smuggle-te-cl", .reject = 400, .calls = 0, .why = "same as te-and-cl: the CL.TE desync shape" },
     .{ .id = "get-asterisk", .reject = 400, .calls = 0, .why = "RFC 9112 §3.2.4: asterisk-form is for OPTIONS only; Go dispatches GET *" },
+    .{ .id = "extension-asterisk", .reject = 400, .calls = 0, .why = "as get-asterisk, for an extension method" },
+    .{ .id = "connect-asterisk", .reject = 400, .calls = 0, .why = "as get-asterisk: a CONNECT names an authority, never *" },
+    .{ .id = "get-authority-form", .reject = 400, .calls = 0, .why = "RFC 9112 §3.2.3: authority-form is for CONNECT only; Go dispatches GET x:443" },
+    .{ .id = "connect-authority-path", .reject = 400, .calls = 0, .why = "RFC 9112 §3.2.3: authority-form is uri-host \":\" port, no path; Go passes x:443/p on" },
+    .{ .id = "connect-authority-userinfo", .reject = 400, .calls = 0, .why = "RFC 9112 §3.2.3: no userinfo in authority-form (h1.isValidHost, as for Host); Go passes u@x:443 on" },
     .{ .id = "target-high-byte", .reject = 400, .calls = 0, .why = "a raw byte >= 0x80 is not a URI (RFC 3986 §2); Go passes it to the handler" },
     .{ .id = "get-host-empty", .reject = 400, .calls = 0, .why = "h1.isValidHost refuses an empty Host on an origin-form request: an http(s) target always has an authority (RFC 9112 §3.2)" },
     .{ .id = "chunk-size-trailing-space", .reject = 0, .calls = 1, .why = "RFC 9112 §7.1: whitespace after chunk-size is only BWS before ';'; Go skips it, we fail the body" },
     // ── a different, legal choice ──
-    .{ .id = "lowercase-method", .reject = 501, .calls = 0, .why = "methods are case-sensitive, so `get` is an unknown method: 501 (RFC 9110 §9.1)" },
-    .{ .id = "extension-method", .reject = 501, .calls = 0, .why = "only the shared Method vocabulary is dispatched; others get 501 (RFC 9110 §9.1)" },
-    .{ .id = "connect-authority", .reject = 501, .calls = 0, .why = "CONNECT is not implemented (a proxy's job): 501" },
     .{ .id = "version-1.2", .reject = 505, .calls = 0, .why = "RFC 9110 §2.5 SHOULD treat 1.2 as 1.1; no HTTP/1.2 exists, refused on purpose (pinned in h1.zig)" },
     .{ .id = "options-asterisk", .reject = 0, .calls = 1, .why = "Go answers OPTIONS * itself; here the handler decides" },
     // ── Go is the one off the RFC ──

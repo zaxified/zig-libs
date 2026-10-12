@@ -102,6 +102,8 @@ pub const Backend = struct {
 /// stripping and forwarding headers already applied).
 pub const RequestParts = struct {
     method: http.Method,
+    /// The `:method` token when `method` is `.other`.
+    method_token: []const u8 = "",
     /// `:path` — origin-form, query included (e.g. the raw request target).
     path: []const u8,
     /// `:authority` (backend authority, or the client's Host when preserved).
@@ -310,6 +312,7 @@ pub const Pool = struct {
         shared.mutex.lockUncancelable(pio);
         defer shared.mutex.unlock(pio);
         return shared.hs.request(parts.method, parts.path, .{
+            .method_token = parts.method_token,
             .scheme = parts.scheme,
             .authority = parts.authority,
             .headers = parts.headers,

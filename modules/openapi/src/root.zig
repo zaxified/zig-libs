@@ -34,6 +34,9 @@
 //! Documented choices (matching FastAPI's generated-spec shape):
 //! - Only registered routes are emitted — the implicit HEAD→GET auto-route
 //!   and the 404/405 fallbacks are dispatch behavior, not operations.
+//! - CONNECT and extension-method (`.other`) routes are not emitted: an
+//!   OpenAPI 3.1 Path Item has no field for them (3.2's
+//!   `additionalOperations` would).
 //! - Path params always get `required: true` + `schema: {type: "string"}`
 //!   (router captures are raw path bytes). A `*wildcard` becomes a regular
 //!   `{param}` — OpenAPI has no cross-segment template, same compromise as
@@ -466,6 +469,10 @@ pub const Generator = struct {
             // merge.
             inline for (@typeInfo(http.Method).@"enum".fields) |f| {
                 const method: http.Method = @enumFromInt(f.value);
+                // An OpenAPI 3.1 Path Item names eight methods; CONNECT and
+                // an extension method (`.other`) are not among them, so
+                // their routes stay out of the document.
+                if (comptime method == .connect or method == .other) continue;
                 var match: ?usize = null;
                 for (group.items) |i| {
                     if (rs[i].method == method) {
@@ -2029,6 +2036,23 @@ test "generate: method grouping is deterministic (enum order, not registration o
         "\"get\":{\"operationId\":\"get_thing\",\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}," ++
         "\"post\":{\"operationId\":\"post_thing\",\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}" ++
         "}}}", json);
+}
+
+test "generate: TRACE is an operation; CONNECT and extension-method routes are left out" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.add(.other, "/thing", hOk);
+    try r.add(.connect, "/thing", hOk);
+    try r.add(.trace, "/thing", hOk);
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings("{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"}," ++
+        "\"paths\":{\"/thing\":{" ++
+        "\"trace\":{\"operationId\":\"trace_thing\",\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}" ++
+        "}}}", json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try validateOpenApi31(parsed.value);
 }
 
 /// What `validate.writeJsonSchemaFor(T)` writes for a query struct

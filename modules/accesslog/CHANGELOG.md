@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — `fromRequest` logs the method as sent (`Request.methodName()`): an extension
+  method (http R9) appears by its name, not as an empty string.
+
 - **2026-10-11** — Added (scope core → parity; survey 2026-09-30 backlog): `Entry.extra: []const Field` (caller key/value pairs in JSON Lines and logfmt, same escaping; a key outside `[A-Za-z0-9_.-]{1,64}`, a fixed key or a repeat is skipped, so no field can be forged or shadowed; empty = byte-identical output); `LogFormat` (`parse` / `comptimeParse` / `write`: Apache 2.4 `LogFormat` templates `%h %l %u %t %r %s %>s %b %B %D %T %m %U %q %H %%`, `%{Referer}i`, `%{User-Agent}i`, `%{key}x`; every value through the Combined escaper; the Combined template renders byte-identical to `writeCombined`); `Logger`, a `router.Middleware` writing one line per request to a `Sink` with an injected clock, optional id/user/extra functions and `keep` for conditional logging / sampling. `FromRequestOptions` gains `user`, `extra`. New dependency: `router`.
 
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-accesslog`, kept instrument kind 3): card Performance 0.13–0.33× Go encoding/json + log/slog + go-logfmt (JSON Lines and logfmt; Combined has no timeable reference), measured on a quiet host. Tooling only, no code change.

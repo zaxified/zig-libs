@@ -873,7 +873,10 @@ const Throttle = struct {
 fn isMutating(m: http.Method) bool {
     return switch (m) {
         .post, .put, .delete, .patch => true,
-        .get, .head, .options => false,
+        // RFC 9110 §9.2.1: TRACE is safe. CONNECT opens a tunnel and an
+        // extension method's semantics are unknown: both fail closed.
+        .connect, .other => true,
+        .get, .head, .options, .trace => false,
     };
 }
 
@@ -1801,15 +1804,15 @@ test "middleware: malformed Authorization never panics, always 401" {
     try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization:   Bearer s3cr3t  \r\n"), &buf), "200");
 }
 
-test "isMutating: every http.Method classified — all four write verbs, all three read verbs" {
+test "isMutating: every http.Method classified — the write verbs, CONNECT and extension methods fail closed, the safe ones read" {
     // Direct unit test of the private classifier: the wire-level
     // protect=.mutations test below only exercises POST as "the" mutating
     // method, which would not notice PUT/PATCH/DELETE silently falling
     // into the read bucket.
-    inline for (.{ .post, .put, .patch, .delete }) |m| {
+    inline for (.{ .post, .put, .patch, .delete, .connect, .other }) |m| {
         try testing.expect(isMutating(m));
     }
-    inline for (.{ .get, .head, .options }) |m| {
+    inline for (.{ .get, .head, .options, .trace }) |m| {
         try testing.expect(!isMutating(m));
     }
 }

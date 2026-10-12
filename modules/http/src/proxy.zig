@@ -248,7 +248,7 @@ pub const Failure = struct {
     /// The cause: a `Client`/`h2_upstream` error, a hook's own error, or
     /// one of `ForwardError`.
     err: anyerror,
-    /// What the default handler answers for it (502, 503 or 504).
+    /// What the default handler answers for it (501, 502, 503 or 504).
     status: u16,
 };
 
@@ -269,6 +269,9 @@ pub const ForwardError = error{
     /// The backend answered `101` to a request that asked for no upgrade,
     /// or switched to another protocol than the one asked for.
     UpgradeMismatch,
+    /// A CONNECT reached the proxy: it asks for a tunnel, not a request to
+    /// relay (501).
+    MethodNotSupported,
 };
 
 /// The outbound request, as a `Rewrite` hook sees and edits it (Go's
@@ -423,6 +426,9 @@ pub const ProxyHandler = struct {
     /// `rw`. Callable directly (e.g. from a `router` route handler that
     /// already resolved `req.context` itself).
     pub fn forward(self: *ProxyHandler, req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        // CONNECT asks for a tunnel to the authority it names, which is a
+        // forward proxy's job; a reverse proxy has no request to relay.
+        if (req.method == .connect) return self.fail(rw, req, error.MethodNotSupported, 501);
         const picked = self.pickBackend(req) orelse return self.fail(rw, req, error.NoBackend, 503);
 
         // ── build the outbound request, then let the hook edit it ───────
@@ -468,12 +474,14 @@ pub const ProxyHandler = struct {
             return self.fail(rw, req, error.BadOutboundRequest, 502);
 
         const c = self.config.client;
+        // An extension method travels as its token (Go relays any method).
+        const method_token = if (req.method == .other) req.methodName() else "";
         const has_body = req.head.chunked or (req.head.content_length orelse 0) != 0;
 
         var res: Client.Response = if (has_body) blk: {
             // Stream the request body through with the same framing shape.
             const content_length: ?u64 = if (req.head.chunked) null else req.head.content_length;
-            var up = c.requestStreaming(req.method, url, .{ .headers = pr.headers.slice() }, content_length) catch |err|
+            var up = c.requestStreaming(req.method, url, .{ .headers = pr.headers.slice(), .method_token = method_token }, content_length) catch |err|
                 return self.onBackendError(rw, req, err);
             _ = req.reader().streamRemaining(up.writer()) catch {
                 up.abort();
@@ -482,6 +490,7 @@ pub const ProxyHandler = struct {
             break :blk up.finish() catch |err| return self.onBackendError(rw, req, err);
         } else c.request(req.method, url, .{
             .headers = pr.headers.slice(),
+            .method_token = method_token,
             .follow_redirects = false, // a proxy relays 3xx, never chases them
         }) catch |err| return self.onBackendError(rw, req, err);
         defer res.deinit();
@@ -618,6 +627,7 @@ pub const ProxyHandler = struct {
         };
         var res = pool.roundtrip(be, .{
             .method = req.method,
+            .method_token = if (req.method == .other) req.methodName() else "",
             .path = target,
             .authority = authority,
             .scheme = if (backend.protocol == .h2) "https" else "http",
@@ -1156,6 +1166,7 @@ fn originHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void
         var buf: [1 << 20]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         _ = try req.reader().streamRemaining(&w);
+        try rw.setHeader("X-Saw-Method", req.methodName());
         try rw.writeAll(w.buffered());
     } else {
         rw.setStatus(404);
@@ -1252,6 +1263,33 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
         const body = try res.readAllAlloc(testing.allocator, payload.len + 16);
         defer testing.allocator.free(body);
         try testing.expectEqualStrings(payload, body);
+    }
+
+    { // An extension method is relayed as its token, body and all (Go).
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo", .{proxy_port});
+        for ([_]?[]const u8{ "<propfind/>", null }) |payload| {
+            var res = try client.request(.other, url, .{ .method_token = "PROPFIND", .body = payload });
+            defer res.deinit();
+            try testing.expectEqual(@as(u16, 200), res.status);
+            try testing.expectEqualStrings("PROPFIND", res.header("x-saw-method").?);
+            const body = try res.readAllAlloc(testing.allocator, 64);
+            defer testing.allocator.free(body);
+            try testing.expectEqualStrings(payload orelse "", body);
+        }
+    }
+
+    { // CONNECT asks a reverse proxy for a tunnel: 501, nothing dialed.
+        const addr = try net.IpAddress.parse("127.0.0.1", proxy_port);
+        const s = try addr.connect(io, .{ .mode = .stream });
+        defer s.close(io);
+        var wbuf: [128]u8 = undefined;
+        var sw = s.writer(io, &wbuf);
+        try sw.interface.writeAll("CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n");
+        try sw.interface.flush();
+        var rbuf: [1024]u8 = undefined;
+        var sr = s.reader(io, &rbuf);
+        const line = try sr.interface.takeDelimiterExclusive('\n');
+        try testing.expectEqualStrings("HTTP/1.1 501 Not Implemented\r", line);
     }
 
     { // Dead upstream → 502 Bad Gateway.

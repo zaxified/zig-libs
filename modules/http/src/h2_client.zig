@@ -169,6 +169,9 @@ pub const StreamOptions = struct {
     /// connection-specific headers and `Host` are dropped (§8.2.2 — the
     /// authority pseudo-header carries the host).
     headers: []const http.Header = &.{},
+    /// The `:method` token when the method is `.other` (an extension
+    /// method such as "PURGE"); must be empty otherwise.
+    method_token: []const u8 = "",
 };
 
 pub const RequestOptions = struct {
@@ -183,9 +186,12 @@ pub const RequestOptions = struct {
     headers: []const http.Header = &.{},
     /// In-memory request body; empty/null sends END_STREAM on HEADERS.
     body: ?[]const u8 = null,
+    /// The `:method` token when the method is `.other` (an extension
+    /// method such as "PURGE"); must be empty otherwise.
+    method_token: []const u8 = "",
 
     fn head(o: RequestOptions) StreamOptions {
-        return .{ .scheme = o.scheme, .authority = o.authority, .headers = o.headers };
+        return .{ .scheme = o.scheme, .authority = o.authority, .headers = o.headers, .method_token = o.method_token };
     }
 };
 
@@ -406,6 +412,11 @@ pub const Session = struct {
         // `Error.InvalidHeader`. Checked before the arena exists, so a
         // refused request allocates nothing.
         if (!h1.isValidRequestTarget(path) or !h1.isToken(options.scheme)) return error.InvalidHeader;
+        // `.other` names its token; a standard method has its own. CONNECT
+        // takes the §8.5 form (no :scheme, no :path), which is not built.
+        const method_token = if (method == .other) options.method_token else method.token();
+        if (method == .connect or !h1.isToken(method_token) or
+            (method != .other and options.method_token.len != 0)) return error.InvalidHeader;
         if (options.authority) |a| {
             if (a.len != 0 and !h1.isValidHost(a)) return error.InvalidHeader;
         }
@@ -420,7 +431,7 @@ pub const Session = struct {
         // §8.3.1 pseudo-headers first, then the regular headers, names
         // lowercased (§8.2.1) and connection-specific ones dropped (§8.2.2).
         var fields: std.ArrayList(hpack.Field) = .empty;
-        try fields.append(arena, .{ .name = ":method", .value = method.token() });
+        try fields.append(arena, .{ .name = ":method", .value = method_token });
         try fields.append(arena, .{ .name = ":scheme", .value = options.scheme });
         try fields.append(arena, .{ .name = ":path", .value = path });
         if (options.authority) |a| {
@@ -972,7 +983,9 @@ const h2_server = @import("h2_server.zig");
 const Server = @import("Server.zig");
 
 fn testHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
-    if (std.mem.eql(u8, req.path, "/hello")) {
+    if (std.mem.eql(u8, req.path, "/method")) {
+        try rw.writer().print("{t}|{s}", .{ req.method, req.methodName() });
+    } else if (std.mem.eql(u8, req.path, "/hello")) {
         try rw.setHeader("Content-Type", "text/plain");
         if (req.query.len != 0) try rw.setHeader("X-Query", req.query);
         try rw.writeAll("hello");
@@ -1025,6 +1038,13 @@ test "h2 client: a :path, :authority or header that fails §8.2.1/§8.3.1 is Inv
         .authority = "t",
         .headers = &.{.{ .name = "X Custom", .value = "v" }},
     }));
+    // The method: `.other` needs a token, only `.other` takes one, and
+    // CONNECT's §8.5 form (no :scheme/:path) is not built.
+    try testing.expectError(error.InvalidHeader, s.request(.other, "/hello", .{ .authority = "t" }));
+    try testing.expectError(error.InvalidHeader, s.request(.other, "/hello", .{ .authority = "t", .method_token = "PU RGE" }));
+    try testing.expectError(error.InvalidHeader, s.request(.get, "/hello", .{ .authority = "t", .method_token = "PURGE" }));
+    try testing.expectError(error.InvalidHeader, s.request(.connect, "/hello", .{ .authority = "t" }));
+    try testing.expectError(error.InvalidHeader, s.openStream(.other, "/hello", .{ .authority = "t" }));
     try testing.expectEqual(framed_before, out.buffered().len);
     // No stream id was spent on any of them: the next legal request is #1.
     try testing.expectEqual(@as(u31, 1), try s.request(.get, "/hello", .{ .authority = "t" }));
@@ -1043,6 +1063,7 @@ test "h2 client: GET and POST round-trip against the h2c server engine (offline)
         .authority = "t",
         .body = "ping pong h2",
     });
+    const sid_purge = try s.request(.other, "/method", .{ .authority = "t", .method_token = "PURGE" });
     // Header names are lowercased; connection-specific ones stripped —
     // the server 400s any request where they leak through (§8.2).
     const sid_hdr = try s.request(.get, "/hdr", .{
@@ -1054,7 +1075,7 @@ test "h2 client: GET and POST round-trip against the h2c server engine (offline)
     });
     try testing.expectEqual(@as(u31, 1), sid_get); // §5.1.1: odd, monotonic
     try testing.expectEqual(@as(u31, 3), sid_post);
-    try testing.expectEqual(@as(u31, 5), sid_hdr);
+    try testing.expectEqual(@as(u31, 7), sid_hdr);
 
     var srv_out: [16384]u8 = undefined;
     serveStaged(&in, &out, &srv_out, .{ .handler = testHandler, .server_name = "h2test" });
@@ -1077,6 +1098,10 @@ test "h2 client: GET and POST round-trip against the h2c server engine (offline)
     defer hdr.deinit(gpa);
     try testing.expectEqual(@as(u16, 200), hdr.status);
     try testing.expectEqualStrings("Val-1", hdr.body);
+
+    var purge = try s.awaitResponse(sid_purge);
+    defer purge.deinit(gpa);
+    try testing.expectEqualStrings("other|PURGE", purge.body);
 
     // Collected streams are gone; unknown ids answer typed errors.
     try testing.expectError(error.UnknownStream, s.awaitResponse(sid_get));

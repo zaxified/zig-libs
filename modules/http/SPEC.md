@@ -405,8 +405,8 @@ directly-exposed parser.
   ahead is the past", which needs a clock -- `69` is right today, `70`-`76` already are not. Kept:
   an obsolete format nobody sends. (e) ~~HTTP/1.0 `Connection: keep-alive` never honoured~~ fixed
   2026-10-12: honoured, echoed as `Connection: keep-alive`, closed when the body has no known
-  length (RFC 9112 §9.3). Methods outside `Method` still get 501 → R9 below (owner 2026-10-11: pass
-  them to the handler, as Go does).
+  length (RFC 9112 §9.3). Methods outside `Method` got 501 → fixed 2026-10-12 (R9 below): every
+  token reaches the handler, as Go.
 
 **S3 → S2 plan (survey 2026-10-11, `go doc` of net/http + httputil + cookiejar + httptest; owner
 decisions the same day: every gap a Go user notices is implemented, TLS server planned separately).**
@@ -519,8 +519,30 @@ Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML not
 - **Client HTTP/1.1 response trailers**: a chunked body's trailer section is read and discarded
   (`h1.ChunkedReader` can capture it; the client gives it no buffer), so `Response.trailer` answers
   only over h2. Go fills `Response.Trailer` on both.
-- R9 extension methods (CONNECT, TRACE, `PURGE`, …) reach the handler instead of 501 — breaks
-  exhaustive `switch (req.method)` in qap (5), metrics, mcp-http, openapi; patched together.
+- R9 every method token reaches the handler — DONE 2026-10-12: `http.Method` gained `.connect`,
+  `.trace` and `.other` (any other token; `Request.method_token` / `methodName()`, Go's
+  `Request.Method`), `Method.fromToken`; the 501 for an unknown method is gone on h1 and h2. h1
+  CONNECT: authority-form (RFC 9112 §3.2.3, a bare `isValidHost` authority, `*` refused —
+  `isValidHost` alone passed it, the new test caught it), no Host needed (Go), `req.path` empty;
+  `ResponseWriter.tunnel(2xx)` answers without framing (RFC 9110 §9.3.6) and hands the connection
+  over through `Request.upgraded` (now keyed on a `handed_over` flag, not on status 101). Client:
+  `RequestOptions.method_token` for `.other` (h1 and h2, a 301-303 rewrites it to GET as Go),
+  `.connect` refused; `h2_client` `StreamOptions/RequestOptions.method_token`; `h2_upstream`
+  `RequestParts.method_token`; the reverse proxy relays the token and answers CONNECT 501
+  (`ForwardError.MethodNotSupported`). Go oracle h1 area: 3 divergences flipped
+  (lowercase/extension method, CONNECT authority) + 15 new wires, 5 judged (Go dispatches
+  `GET x:443`, `PURGE *`, `CONNECT *`, `CONNECT x:443/p`, `CONNECT u@x:443`; RFC 9112 §3.2.3/§3.2.4
+  refuse them). New fuzz harness `http-server-dispatch` (the h1 dispatch had none: method,
+  target form, tunnel promises checked inside the handler). Mutants 19/19 (2 survivors on the h2
+  client path → tests). The survey's "8 breaking switch sites" all had an `else` arm; what broke
+  was `idempotency.scopeKey` (now takes the method name: two extension methods must not share a
+  key) and `cors` (`.other` in `allowed_methods` is `error.UnnamedAllowedMethod`); `router`
+  leaves `.other` out of `Allow` and out of `any` (chi: 405); `openapi` leaves CONNECT/`.other`
+  routes out of the document (no 3.1 Path Item field).
+- **h2 CONNECT** *(R9, not planned)*: answered 501 per stream. RFC 9113 §8.5 makes the stream the
+  tunnel (DATA both ways, no :scheme/:path); Go's h2 server hands it to the handler. Needs a
+  full-duplex handler surface on `h2_server` (request DATA read while response DATA is written);
+  RFC 8441 extended CONNECT (WebSocket over h2) builds on the same.
 - R10 a test recorder (`httptest.NewRecorder`) over `serveStream`.
 
 - ~~**h2 inbound gzip decode.**~~ — **DONE 2026-09-29**: `h2_server.Options.max_decompressed_request_bytes`

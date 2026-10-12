@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -83,6 +84,21 @@ var h1Cases = []h1Case{
 	{"options-asterisk", crlf("OPTIONS * HTTP/1.1", "Host: x", "", "")},
 	{"get-asterisk", crlf("GET * HTTP/1.1", "Host: x", "", "")},
 	{"connect-authority", crlf("CONNECT x:443 HTTP/1.1", "Host: x:443", "", "")},
+	{"connect-no-host", crlf("CONNECT x:443 HTTP/1.1", "", "")},
+	{"connect-http10", crlf("CONNECT x:443 HTTP/1.0", "", "")},
+	{"connect-origin-form", crlf("CONNECT /rpc HTTP/1.1", "Host: x", "", "")},
+	{"connect-asterisk", crlf("CONNECT * HTTP/1.1", "Host: x", "", "")},
+	{"connect-authority-path", crlf("CONNECT x:443/p HTTP/1.1", "Host: x", "", "")},
+	{"connect-authority-userinfo", crlf("CONNECT u@x:443 HTTP/1.1", "Host: x", "", "")},
+	{"connect-then-get", crlf("CONNECT x:443 HTTP/1.1", "Host: x:443", "", "") + get()},
+	{"get-authority-form", crlf("GET x:443 HTTP/1.1", "Host: x", "", "")},
+	{"trace", crlf("TRACE /t HTTP/1.1", "Host: x", "", "")},
+	{"extension-method-body", crlf("PROPFIND /d HTTP/1.1", "Host: x", "Content-Length: 3", "", "abc")},
+	{"extension-method-chunked", crlf("PURGE /d HTTP/1.1", "Host: x", "Transfer-Encoding: chunked", "", "1", "a", "0", "", "")},
+	{"extension-absolute-form", crlf("PURGE http://x/p?q HTTP/1.1", "Host: x", "", "")},
+	{"extension-asterisk", crlf("PURGE * HTTP/1.1", "Host: x", "", "")},
+	{"extension-long-method", crlf(strings.Repeat("M", 100)+" / HTTP/1.1", "Host: x", "", "")},
+	{"mixed-case-method", crlf("Get / HTTP/1.1", "Host: x", "", "")},
 	{"target-no-slash", crlf("GET a HTTP/1.1", "Host: x", "", "")},
 	{"target-with-fragment", crlf("GET /a#f HTTP/1.1", "Host: x", "", "")},
 	{"target-ctl-char", crlf("GET /a\x01 HTTP/1.1", "Host: x", "", "")},

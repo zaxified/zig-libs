@@ -186,6 +186,12 @@ pub const BasicCredentials = helpers.BasicCredentials;
 
 // ── request vocabulary ──────────────────────────────────────────────────────
 
+/// The request methods of RFC 9110 §9.3 (+ PATCH, RFC 5789), plus `other`:
+/// any other token (an extension method such as `PURGE` or `PROPFIND`, or a
+/// standard name in another case — methods are case-sensitive, so `get` is
+/// not GET). Go's `Request.Method` is the token itself; here the server
+/// hands the token over as `Server.Request.method_token`, and the client
+/// sends one given as `RequestOptions.method_token`.
 pub const Method = enum {
     get,
     head,
@@ -194,8 +200,12 @@ pub const Method = enum {
     delete,
     patch,
     options,
+    connect,
+    trace,
+    other,
 
-    /// The on-wire token, e.g. `.get` → "GET".
+    /// The on-wire token, e.g. `.get` → "GET"; "" for `.other`, which has
+    /// no fixed token (read `Server.Request.method_token` instead).
     pub fn token(m: Method) []const u8 {
         return switch (m) {
             .get => "GET",
@@ -205,7 +215,21 @@ pub const Method = enum {
             .delete => "DELETE",
             .patch => "PATCH",
             .options => "OPTIONS",
+            .connect => "CONNECT",
+            .trace => "TRACE",
+            .other => "",
         };
+    }
+
+    /// The method a token names: an exact (case-sensitive) match of a
+    /// standard name, `.other` for any other token. The caller checks
+    /// that `tok` is a token (`h1.isToken`).
+    pub fn fromToken(tok: []const u8) Method {
+        inline for (@typeInfo(Method).@"enum".fields) |f| {
+            const m: Method = @enumFromInt(f.value);
+            if (m != .other and std.mem.eql(u8, tok, comptime m.token())) return m;
+        }
+        return .other;
     }
 };
 

@@ -180,7 +180,8 @@ s.release(sid);
 
 ```zig
 fn handler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
-    // req: .method (http.Method), .target, .path, .query,
+    // req: .method (http.Method; .other + .methodName() for an
+    //      extension method such as PURGE), .target, .path, .query,
     //      .header("name"), .iterateHeaders(), .reader() (streaming body,
     //      Content-Length + chunked already decoded), .context,
     //      .peerAddress() (socket peer, the direct client),
@@ -233,6 +234,29 @@ wrap up; `server.setKeepAlivesEnabled(false)` answers every request
 connections are not tracked (Go does not either): the shutdown hook is how they
 learn. A connection accepted while a shutdown runs sees it at its first wait
 and closes.
+
+### Methods, CONNECT and tunnels
+
+Every method token reaches the handler, as in Go: the standard ones as
+`http.Method` members (`.connect` and `.trace` included), anything else
+(`PURGE`, `PROPFIND`, a lower-case `get` — methods are case-sensitive) as
+`.other`, whose name is `req.methodName()`. A `router` route for `.other`
+serves every extension method; `router.any` does not (chi: 405).
+
+`CONNECT host:port` (authority-form, RFC 9112 §3.2.3) arrives with
+`req.target` = the authority and an empty `req.path`; it needs no Host. A
+forward proxy answers it with `rw.tunnel(200)` — a 2xx without
+Content-Length or Transfer-Encoding (RFC 9110 §9.3.6), flushed — and then
+`req.upgraded(rw)` is the connection (Go: `WriteHeader` + `Hijack`). Over
+HTTP/2, CONNECT is answered 501 (a tunnel on a stream is not provided).
+Authority-form is refused for every other method, and `CONNECT *`,
+`CONNECT host/path`, `CONNECT user@host` are 400 — Go lets all of them
+through (recorded in the Go oracle's divergence table).
+
+On the client, `RequestOptions.method_token` names the method sent for
+`.other`; a 301/302/303 turns it into GET, a 307/308 keeps it (Go). The
+client does not send CONNECT itself (`Options.proxy` builds its tunnels).
+The reverse proxy relays any extension method and answers CONNECT 501.
 
 ### Response trailers
 
@@ -398,7 +422,7 @@ HEADERS frame is materialized into it once the body ends.
   the connection closed after it trips).
 - **Errors:** malformed head → 400; oversized head → 431; over-long
   request line → 414; oversized body → 413; unsupported HTTP version →
-  505; unknown method token → 501; missing Host on 1.1 → 400;
+  505; missing Host on 1.1 → 400 (not for CONNECT, as Go);
   `Transfer-Encoding` without chunked → 400 (Go answers 501 here);
   handler error → 500 when nothing was sent, otherwise the connection dies
   mid-response. `Expect: 100-continue` is acknowledged on the handler's first body read

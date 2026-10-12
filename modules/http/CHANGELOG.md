@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Every method token reaches the handler, Go's `Request.Method` (S2 survey R9).
+  BREAKING (enum):** `http.Method` gains `.connect`, `.trace` and `.other` — an exhaustive
+  `switch` over it needs the new arms (every in-repo one had an `else`). An unknown method is no
+  longer 501 on h1 or h2: it is `.other`, named by the new `Server.Request.method_token` /
+  `methodName()`; `Method.fromToken`. h1 CONNECT in authority-form (`CONNECT host:port`, no Host
+  needed, `path` empty) and the new `ResponseWriter.tunnel(status)`: a 2xx without framing headers,
+  then `Request.upgraded` is the connection (Go `Hijack`). Authority-form for any other method,
+  `CONNECT *`, a path or userinfo in the authority: 400. h2 CONNECT: 501. Client:
+  `RequestOptions.method_token` sends `.other` (h1 and h2); `.connect` and a token on a standard
+  method are `InvalidHeader`. `h2_client` options and `h2_upstream.RequestParts` carry
+  `method_token`. Reverse proxy: relays an extension method, answers CONNECT 501
+  (`ForwardError.MethodNotSupported`). New fuzz harness `http-server-dispatch`.
+
 - **2026-10-12** — **Client: HTTP/2 over TLS by ALPN, Go's `Transport` with `ForceAttemptHTTP2`
   (S2 survey R8), opt-in, additive.** `Client.Options.http2 = .alpn()` (null, the default, offers
   no ALPN and links no h2 code): every `https://` dial offers `h2` and `http/1.1`, and where the

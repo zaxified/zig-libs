@@ -2391,7 +2391,10 @@ pub const ResourceServer = struct {
 fn resourceMethodMutating(m: http.Method) bool {
     return switch (m) {
         .post, .put, .delete, .patch => true,
-        .get, .head, .options => false,
+        // RFC 9110 §9.2.1: TRACE is safe. CONNECT opens a tunnel and an
+        // extension method's semantics are unknown: both fail closed.
+        .connect, .other => true,
+        .get, .head, .options, .trace => false,
     };
 }
 
@@ -8843,6 +8846,12 @@ test "ResourceServer: protect=.mutations gates DELETE; only `Bearer SP token` is
         try resExpectStatus(got, "200");
         try testing.expectEqual(@as(u32, 1), res_test_hits);
     }
+}
+
+test "ResourceServer: protect=.mutations — TRACE is a read; CONNECT and extension methods fail closed" {
+    try testing.expect(!resourceMethodMutating(.trace));
+    try testing.expect(resourceMethodMutating(.connect));
+    try testing.expect(resourceMethodMutating(.other));
 }
 
 test "SECURITY: a realm carrying CR or LF is refused by both guards (header injection)" {

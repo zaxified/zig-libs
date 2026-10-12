@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — CONNECT and extension-method (`.other`) routes (http R9) stay out of the
+  document: an OpenAPI 3.1 Path Item has no field for them. TRACE routes are operations.
+
 - **2026-10-11** — tests: fuzz harnesses `build` (generator: `buildRoutes` and `writeRoutes` agree,
   a rebuild is byte-identical, the output re-parses and passes the checker, no non-UTF-8 accepted)
   and `spec` (`validateOpenApi31` on raw bytes and on damaged generated documents), with the

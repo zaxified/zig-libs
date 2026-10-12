@@ -323,8 +323,8 @@ pub const Http2 = struct {
 
     const VTable = struct {
         start: *const fn (conn: *Conn) Error!void,
-        exchange: *const fn (conn: *Conn, method: http.Method, url: http.Url, headers: []const http.Header, plan: BodyPlan, body: ?[]const u8, strip_sensitive: bool, ask_gzip: bool) Error!h1.ResponseHead,
-        open_upload: *const fn (conn: *Conn, method: http.Method, url: http.Url, headers: []const http.Header, plan: BodyPlan, ask_gzip: bool) Error!void,
+        exchange: *const fn (conn: *Conn, method: http.Method, method_token: []const u8, url: http.Url, headers: []const http.Header, plan: BodyPlan, body: ?[]const u8, strip_sensitive: bool, ask_gzip: bool) Error!h1.ResponseHead,
+        open_upload: *const fn (conn: *Conn, method: http.Method, method_token: []const u8, url: http.Url, headers: []const http.Header, plan: BodyPlan, ask_gzip: bool) Error!void,
         upload_writer: *const fn (conn: *Conn) *std.Io.Writer,
         finish_upload: *const fn (conn: *Conn) Error!h1.ResponseHead,
         setup_body: *const fn (conn: *Conn, method: http.Method) void,
@@ -444,6 +444,11 @@ pub const RequestOptions = struct {
     /// (a recorded default, see SPEC.md — credentials are stripped on a
     /// cross-origin redirect hop, destinations are not judged).
     redirect_filter: ?RedirectFilter = null,
+    /// The token sent for `Method.other` — an extension method such as
+    /// "PURGE" or "PROPFIND" (Go: any `Request.Method`). Required with
+    /// `.other`, refused (`InvalidHeader`) with any other method; it must
+    /// be an RFC 9110 token. A 301/302/303 rewrites it to GET, as Go does.
+    method_token: []const u8 = "",
 };
 
 pub const RedirectFilter = struct {
@@ -500,7 +505,10 @@ pub const Error = error{
     /// a second request) the caller never made — the header-injection
     /// primitive — so it is refused here, before any dial. Same rule for
     /// the URL's path/query: whitespace or a control byte there fails
-    /// `Url.parse` as `BadUrl`.
+    /// `Url.parse` as `BadUrl`. Also a method this client cannot send:
+    /// `.other` without a valid `RequestOptions.method_token` (or one given
+    /// with another method), and `.connect` — tunnels are what
+    /// `Options.proxy` builds, a caller cannot ask for one.
     InvalidHeader,
     /// `RequestOptions.redirect_filter` said no to a redirect target; the
     /// refused host was never dialed.
@@ -532,6 +540,19 @@ fn validateHeaders(headers: []const http.Header) error{InvalidHeader}!void {
     for (headers) |hd| {
         if (!h1.isToken(hd.name) or !h1.isValidFieldValue(hd.value)) return error.InvalidHeader;
     }
+}
+
+/// The method half of the same rule (see `Error.InvalidHeader`).
+fn validateMethod(method: http.Method, method_token: []const u8) error{InvalidHeader}!void {
+    if (method == .connect) return error.InvalidHeader;
+    if (method == .other) {
+        if (!h1.isToken(method_token)) return error.InvalidHeader;
+    } else if (method_token.len != 0) return error.InvalidHeader;
+}
+
+/// The token `method` goes on the wire as.
+fn methodWire(method: http.Method, method_token: []const u8) []const u8 {
+    return if (method == .other) method_token else method.token();
 }
 
 /// `io` must support the net + async vtable operations (e.g.
@@ -603,6 +624,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
 
     var url = try http.Url.parse(url_text);
     try validateHeaders(options.headers);
+    try validateMethod(method, options.method_token);
     // A1 G5 (extended 2026-09-11): the caller's OWN destination is gated
     // too, not just a redirect target — before this, `redirect_filter`
     // covered only hop-to-hop, so a consumer that lets a user supply the
@@ -649,7 +671,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
         var owned = true;
         errdefer if (owned) conn.destroy();
 
-        const head = c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive, ask_gzip) catch |err| retry: {
+        const head = c.sendAndReadHead(conn, current_method, options.method_token, url, options.headers, plan, current_body, strip_sensitive, ask_gzip) catch |err| retry: {
             // Retry exactly once, and only when BOTH hold: (1) `conn` came
             // from the pool (`reused`), so it might have gone stale while
             // parked — a freshly dialed connection failing this way is a
@@ -677,7 +699,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
             owned = false;
             conn = try c.checkoutConn(url, &reused, deadline, false, h1_only, dialConn);
             owned = true;
-            break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive, ask_gzip);
+            break :retry try c.sendAndReadHead(conn, current_method, options.method_token, url, options.headers, plan, current_body, strip_sensitive, ask_gzip);
         };
 
         redirect: {
@@ -759,6 +781,7 @@ fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, opti
     var url = try http.Url.parse(url_text);
     if (url.scheme != .http) return error.UnsupportedScheme;
     try validateHeaders(options.headers);
+    try validateMethod(method, options.method_token);
     // A1 G5 (extended 2026-09-11) — see `requestInner`'s identical gate.
     if (options.redirect_filter) |f| {
         if (!f.allow(f.ctx, url, url)) return error.RedirectRefused;
@@ -791,14 +814,14 @@ fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, opti
         var owned = true;
         errdefer if (owned) conn.destroy();
 
-        const head = c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive, ask_gzip) catch |err| retry: {
+        const head = c.sendAndReadHead(conn, current_method, options.method_token, url, options.headers, plan, current_body, strip_sensitive, ask_gzip) catch |err| retry: {
             if (!reused or !isStaleConnError(err)) return err;
             try c.checkDeadline(deadline);
             conn.destroy();
             owned = false;
             conn = try c.checkoutConn(url, &reused, deadline, false, false, dialPlain);
             owned = true;
-            break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive, ask_gzip);
+            break :retry try c.sendAndReadHead(conn, current_method, options.method_token, url, options.headers, plan, current_body, strip_sensitive, ask_gzip);
         };
 
         redirect: {
@@ -1280,6 +1303,7 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
     std.debug.assert(options.body == null);
     const url = try http.Url.parse(url_text);
     try validateHeaders(options.headers);
+    try validateMethod(method, options.method_token);
     const plan: BodyPlan = if (content_length) |n| .{ .content_length = n } else .chunked;
     const ask_gzip = c.requestsGzip(method, options.headers);
 
@@ -1296,7 +1320,7 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
     var owned = true;
     errdefer if (owned) conn.destroy();
 
-    c.writeUploadHead(conn, method, url, options.headers, plan, ask_gzip) catch |err| {
+    c.writeUploadHead(conn, method, options.method_token, url, options.headers, plan, ask_gzip) catch |err| {
         // Recover the real cause the same way `sendAndReadHead` does, and
         // BEFORE `isStaleConnError` looks at it: `writeRequestHead` itself
         // can only ever hand back `error.WriteFailed`, so without this a
@@ -1318,7 +1342,7 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
         owned = false;
         conn = try c.checkoutConn(url, &reused, deadline, false, h1_only, dialConn);
         owned = true;
-        c.writeUploadHead(conn, method, url, options.headers, plan, ask_gzip) catch |e|
+        c.writeUploadHead(conn, method, options.method_token, url, options.headers, plan, ask_gzip) catch |e|
             return if (e == error.WriteFailed) conn.writeFailure() else e;
     };
     return .{
@@ -1332,9 +1356,9 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
 
 /// `requestStreaming`'s request head: h1 bytes on the wire, or the HEADERS
 /// of a new h2 stream (`Options.http2`) whose DATA the `Upload` sends.
-fn writeUploadHead(c: *Client, conn: *Conn, method: http.Method, url: http.Url, headers: []const http.Header, plan: BodyPlan, ask_gzip: bool) Error!void {
-    if (conn.h2 != null) return c.options.http2.?.vt.open_upload(conn, method, url, headers, plan, ask_gzip);
-    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch
+fn writeUploadHead(c: *Client, conn: *Conn, method: http.Method, method_token: []const u8, url: http.Url, headers: []const http.Header, plan: BodyPlan, ask_gzip: bool) Error!void {
+    if (conn.h2 != null) return c.options.http2.?.vt.open_upload(conn, method, method_token, url, headers, plan, ask_gzip);
+    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, method_token, url, headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch
         return error.WriteFailed;
 }
 
@@ -1348,6 +1372,7 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
     const url = try http.Url.parse(url_text);
     if (url.scheme != .http) return error.UnsupportedScheme;
     try validateHeaders(options.headers);
+    try validateMethod(method, options.method_token);
     const plan: BodyPlan = if (content_length) |n| .{ .content_length = n } else .chunked;
     const ask_gzip = c.requestsGzip(method, options.headers);
 
@@ -1359,7 +1384,7 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
     var owned = true;
     errdefer if (owned) conn.destroy();
 
-    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch {
+    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, options.method_token, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch {
         // See `requestStreaming`'s identical catch for why this must consult
         // `conn.writeFailure()` before `isStaleConnError` rather than trust
         // `writeRequestHead`'s own always-`WriteFailed` result.
@@ -1369,7 +1394,7 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
         owned = false;
         conn = try c.checkoutConn(url, &reused, deadline, false, false, dialPlain);
         owned = true;
-        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
+        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, options.method_token, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
     };
     return .{
         .conn = conn,
@@ -1917,13 +1942,14 @@ const h2glue = struct {
         conn.h2 = null;
     }
 
-    fn exchange(conn: *Conn, method: http.Method, url: http.Url, headers: []const http.Header, plan: BodyPlan, body: ?[]const u8, strip_sensitive: bool, ask_gzip: bool) Error!h1.ResponseHead {
+    fn exchange(conn: *Conn, method: http.Method, method_token: []const u8, url: http.Url, headers: []const http.Header, plan: BodyPlan, body: ?[]const u8, strip_sensitive: bool, ask_gzip: bool) Error!h1.ResponseHead {
         const h = conn.h2.?;
-        var head: Rendered = try .init(conn, method, url, headers, plan, strip_sensitive, ask_gzip);
+        var head: Rendered = try .init(conn, method, method_token, url, headers, plan, strip_sensitive, ask_gzip);
         defer head.deinit();
         h.begin();
         // An empty or absent body: END_STREAM on the HEADERS frame.
         h.sid = h.session.request(method, head.target, .{
+            .method_token = if (method == .other) method_token else "",
             .scheme = @tagName(url.scheme),
             .authority = head.authority,
             .headers = head.fields,
@@ -1932,12 +1958,13 @@ const h2glue = struct {
         return awaitHead(h);
     }
 
-    fn openUpload(conn: *Conn, method: http.Method, url: http.Url, headers: []const http.Header, plan: BodyPlan, ask_gzip: bool) Error!void {
+    fn openUpload(conn: *Conn, method: http.Method, method_token: []const u8, url: http.Url, headers: []const http.Header, plan: BodyPlan, ask_gzip: bool) Error!void {
         const h = conn.h2.?;
-        var head: Rendered = try .init(conn, method, url, headers, plan, false, ask_gzip);
+        var head: Rendered = try .init(conn, method, method_token, url, headers, plan, false, ask_gzip);
         defer head.deinit();
         h.begin();
         h.sid = h.session.openStream(method, head.target, .{
+            .method_token = if (method == .other) method_token else "",
             .scheme = @tagName(url.scheme),
             .authority = head.authority,
             .headers = head.fields,
@@ -2136,7 +2163,7 @@ const h2glue = struct {
         authority: []const u8,
         fields: []const http.Header,
 
-        fn init(conn: *Conn, method: http.Method, url: http.Url, headers: []const http.Header, plan: BodyPlan, strip_sensitive: bool, ask_gzip: bool) Error!Rendered {
+        fn init(conn: *Conn, method: http.Method, method_token: []const u8, url: http.Url, headers: []const http.Header, plan: BodyPlan, strip_sensitive: bool, ask_gzip: bool) Error!Rendered {
             const c = conn.client;
             var r: Rendered = .{ .arena = .init(c.gpa), .target = "", .authority = "", .fields = &.{} };
             errdefer r.arena.deinit();
@@ -2144,7 +2171,7 @@ const h2glue = struct {
             var aw: std.Io.Writer.Allocating = .init(arena);
             // No proxy (an https origin is reached through a tunnel, if at
             // all) and no `Connection: close` (h2 has no such field).
-            writeRequestHeadVia(&aw.writer, null, c.options.cookie_jar, method, url, headers, c.options.user_agent, plan, strip_sensitive, false, ask_gzip) catch
+            writeRequestHeadVia(&aw.writer, null, c.options.cookie_jar, method, method_token, url, headers, c.options.user_agent, plan, strip_sensitive, false, ask_gzip) catch
                 return error.OutOfMemory;
             var lines = std.mem.splitSequence(u8, aw.written(), "\r\n");
             // "METHOD target HTTP/1.1"
@@ -2571,6 +2598,7 @@ fn sendAndReadHead(
     c: *Client,
     conn: *Conn,
     method: http.Method,
+    method_token: []const u8,
     url: http.Url,
     headers: []const http.Header,
     plan: BodyPlan,
@@ -2589,9 +2617,9 @@ fn sendAndReadHead(
     // spent, the retry then blocks a second time with nothing left to
     // interrupt it.
     const head = if (conn.h2 != null)
-        try c.options.http2.?.vt.exchange(conn, method, url, headers, plan, body, strip_sensitive, ask_gzip)
+        try c.options.http2.?.vt.exchange(conn, method, method_token, url, headers, plan, body, strip_sensitive, ask_gzip)
     else h: {
-        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
+        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, method_token, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
         if (body) |b| conn.plainWriter().writeAll(b) catch return conn.writeFailure();
         try conn.flushAll();
         break :h try readResponseHead(conn);
@@ -3157,7 +3185,7 @@ fn writeRequestHead(
     strip_sensitive: bool,
     send_close: bool,
 ) error{WriteFailed}!void {
-    return writeRequestHeadVia(w, null, null, method, url, headers, user_agent, plan, strip_sensitive, send_close, false);
+    return writeRequestHeadVia(w, null, null, method, "", url, headers, user_agent, plan, strip_sensitive, send_close, false);
 }
 
 /// `writeRequestHead` for a connection that may be to a forwarding proxy:
@@ -3168,6 +3196,7 @@ fn writeRequestHeadVia(
     proxy: ?client_proxy.Endpoint,
     jar: ?CookieJar,
     method: http.Method,
+    method_token: []const u8,
     url: http.Url,
     headers: []const http.Header,
     user_agent: []const u8,
@@ -3193,7 +3222,7 @@ fn writeRequestHeadVia(
     // passes it on. Its `Connection: Upgrade` replaces `close`.
     const connection: ConnectionHeader = if (asks_upgrade and has_upgrade) .upgrade else if (send_close) .close else .none;
 
-    writeHead(w, proxy, jar, method, url, headers, user_agent, plan, strip_sensitive, connection, if (strip_sensitive) null else custom_host, custom_ua, custom_ae, ask_gzip) catch
+    writeHead(w, proxy, jar, method, method_token, url, headers, user_agent, plan, strip_sensitive, connection, if (strip_sensitive) null else custom_host, custom_ua, custom_ae, ask_gzip) catch
         return error.WriteFailed;
 }
 
@@ -3204,6 +3233,7 @@ fn writeHead(
     proxy: ?client_proxy.Endpoint,
     jar: ?CookieJar,
     method: http.Method,
+    method_token: []const u8,
     url: http.Url,
     headers: []const http.Header,
     user_agent: []const u8,
@@ -3215,7 +3245,7 @@ fn writeHead(
     custom_ae: bool,
     ask_gzip: bool,
 ) std.Io.Writer.Error!void {
-    try w.print("{s} ", .{method.token()});
+    try w.print("{s} ", .{methodWire(method, method_token)});
     if (proxy != null) {
         try w.writeAll("http://");
         try url.writeHostHeaderValue(w);
@@ -6633,12 +6663,12 @@ test "cookie jar: without a caller Cookie the jar writes its own field, and noth
     var echo: EchoJar = .{};
     const url = try http.Url.parse("http://h.test/x");
     var w: std.Io.Writer = .fixed(&buf);
-    try writeRequestHeadVia(&w, null, echo.jar(), .get, url, &.{}, "a", .none, false, true, false);
+    try writeRequestHeadVia(&w, null, echo.jar(), .get, "", url, &.{}, "a", .none, false, true, false);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
     @memcpy(echo.value[0..3], "k=v");
     echo.len = 3;
     w = .fixed(&buf);
-    try writeRequestHeadVia(&w, null, echo.jar(), .get, url, &.{}, "a", .none, false, true, false);
+    try writeRequestHeadVia(&w, null, echo.jar(), .get, "", url, &.{}, "a", .none, false, true, false);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nCookie: k=v\r\n") != null);
 }
 
@@ -6764,6 +6794,51 @@ const GzipLoopback = struct {
         g.listener.deinit(io);
     }
 };
+
+test "request: an extension method goes out as its token; 307 keeps it, 302 rewrites it to GET (Go)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    var lb: GzipLoopback = undefined;
+    try lb.start(io, &.{
+        ok,
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n",
+        ok,
+        "HTTP/1.1 302 Found\r\nLocation: /c\r\nContent-Length: 0\r\n\r\n",
+        ok,
+        ok,
+    }, "/");
+    defer lb.finish(io);
+    var client = Client.init(io, gpa, .{ .total_timeout_ms = 5000 });
+    defer client.deinit();
+
+    // A method this client cannot send is refused before any dial.
+    try testing.expectError(error.InvalidHeader, client.request(.other, lb.url, .{}));
+    try testing.expectError(error.InvalidHeader, client.request(.other, lb.url, .{ .method_token = "PU RGE" }));
+    try testing.expectError(error.InvalidHeader, client.request(.other, lb.url, .{ .method_token = "PURGE\r\n" }));
+    try testing.expectError(error.InvalidHeader, client.request(.get, lb.url, .{ .method_token = "PURGE" }));
+    try testing.expectError(error.InvalidHeader, client.request(.connect, lb.url, .{}));
+    try testing.expectError(error.InvalidHeader, client.requestStreaming(.other, lb.url, .{}, 0));
+
+    for (0..3) |_| {
+        var res = try client.request(.other, lb.url, .{ .method_token = "PURGE" });
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+    }
+    var up = try client.requestStreaming(.other, lb.url, .{ .method_token = "PROPFIND" }, 3);
+    try up.writer().writeAll("abc");
+    var res = try up.finish();
+    res.deinit();
+
+    const want = [_][]const u8{ "PURGE / ", "PURGE / ", "PURGE /b ", "PURGE / ", "GET /c ", "PROPFIND / " };
+    for (want, 0..) |w, i| {
+        errdefer std.debug.print("head {d}: {s}\n", .{ i, lb.peer.head(i) });
+        try testing.expect(std.mem.startsWith(u8, lb.peer.head(i), w));
+    }
+}
 
 test "gzip: decoded at levels 1/6/9, Content-Length and chunked framing, one pooled connection" {
     const gpa = testing.allocator;
@@ -7228,6 +7303,7 @@ fn h2ClientHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!vo
         var aw: std.Io.Writer.Allocating = .init(testing.allocator);
         defer aw.deinit();
         _ = try req.reader().streamRemaining(&aw.writer);
+        try rw.setHeader("X-Method", req.methodName());
         try rw.writeAll(aw.written());
     } else if (std.mem.eql(u8, req.path, "/fields")) {
         // What arrived, one field per line, for the request-side checks.
@@ -7332,6 +7408,24 @@ test "http2: request over an h2 connection — proto, head, body, cookies, one p
         const body = try res.readAllAlloc(gpa, 1024);
         defer gpa.free(body);
         try testing.expectEqualStrings("posted over h2", body);
+    }
+    { // An extension method is `:method` as its token, buffered or streamed.
+        var res = try client.request(.other, lb.url("/echo"), .{ .method_token = "PROPFIND", .body = "<p/>" });
+        defer res.deinit();
+        try testing.expectEqualStrings("PROPFIND", res.header("x-method").?);
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("<p/>", body);
+    }
+    { // (Its own block: one exchange per h2 connection, `res` above is done.)
+        var up = try client.requestStreaming(.other, lb.url("/echo"), .{ .method_token = "PURGE" }, null);
+        try up.writer().writeAll("streamed");
+        var res = try up.finish();
+        defer res.deinit();
+        try testing.expectEqualStrings("PURGE", res.header("x-method").?);
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("streamed", body);
     }
     { // HEAD and 204: no body.
         var res = try client.request(.head, lb.url("/hello"), .{});

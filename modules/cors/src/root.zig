@@ -232,6 +232,9 @@ pub const InitError = error{
     /// `validateStatic`) already refuses this with a `@compileError`; this
     /// is the runtime API's equivalent.
     EmptyAllowedMethods,
+    /// `allowed_methods` holds `.other`, which names no method: a preflight
+    /// grants method tokens, and an extension method has none here.
+    UnnamedAllowedMethod,
     /// A `Origins.patterns.subdomains` entry is not `scheme://*.host[:port]`
     /// with exactly one `*` in the leftmost-label position and at least two
     /// host labels after it (`https://*.com` is refused: it would grant a
@@ -317,6 +320,7 @@ pub const Cors = struct {
             return error.UnconditionalWildcardRequiresAnyOrigin;
         if (options.allowed_methods.len == 0)
             return error.EmptyAllowedMethods;
+        for (options.allowed_methods) |m| if (m == .other) return error.UnnamedAllowedMethod;
         if (std.debug.runtime_safety) {
             switch (options.allowed_origins) {
                 .list => |l| for (l) |o| assertValueClean(o),
@@ -538,7 +542,7 @@ pub const Cors = struct {
         const acao = c.allowOriginValue(origin) orelse return;
         // rs/cors gate: an actual method outside allowed_methods gets no
         // CORS headers either (OPTIONS always passes, see methodTokenAllowed).
-        if (!c.methodTokenAllowed(req.method.token())) return;
+        if (!c.methodTokenAllowed(req.methodName())) return;
 
         try res.setHeader("Access-Control-Allow-Origin", acao);
         // Echoing a specific origin makes the response vary by it; the
@@ -1448,6 +1452,11 @@ test "init rejects an empty allowed_methods — the comptime twin (StaticOptions
     try testing.expectError(error.EmptyAllowedMethods, Cors.init(testing.allocator, .{
         .allowed_origins = .{ .list = &.{"https://app.example"} },
         .allowed_methods = &.{},
+    }));
+    // `.other` (an extension method) has no token a preflight could grant.
+    try testing.expectError(error.UnnamedAllowedMethod, Cors.init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allowed_methods = &.{ .get, .other },
     }));
     // A non-empty list is untouched by the check.
     var ok: Cors = try .init(testing.allocator, .{

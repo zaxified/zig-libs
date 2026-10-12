@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — `http.Method` grew `.connect`, `.trace`, `.other` (http R9): routes for the first
+  two work like any; a route for `.other` serves every extension method (the handler reads
+  `methodName()`). `Allow` never lists `.other`; `any` registers the standard methods only, so an
+  extension method there is a 405, as in chi.
+
 - **2026-10-07** — Instrument: `tools/bench.zig` + `tools/go_bench/` (`zig build
   bench-router`), the comparative benchmark against go-chi/chi v5.3.2 behind the
   maturity card's `**Performance:**` line: route lookup 0.54×, request bytes →

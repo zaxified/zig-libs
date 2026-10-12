@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — The actual-request gate checks the method as sent (`Request.methodName()`,
+  http R9: extension methods now reach handlers). `.other` in `allowed_methods` is the new
+  `InitError.UnnamedAllowedMethod`: a preflight can only grant named methods.
+
 - **2026-10-11** — rs/cors v1.11.1 parity (grade 2). New: `Origins.patterns` (`.exact` + validated
   `scheme://*.host[:port]` subdomain patterns; stricter than rs/cors: the `*` covers whole labels only, so
   `https://evil.com/.example.com` does not match; `error.InvalidOriginPattern` at init), `Options.allow_private_network`

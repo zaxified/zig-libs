@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — `http.Method` grew `.connect`, `.trace`, `.other` (http R9): under
+  `protect = .mutations` TRACE is a read (RFC 9110 §9.2.1), CONNECT and any extension method are
+  gated and audited like writes (fail closed).
+
 - **2026-10-09** — tests: deterministic fuzz driver `AAA_GATE_FUZZ` over the existing harnesses (bearer token,
   bearer value, API key, query value, client key).
 
