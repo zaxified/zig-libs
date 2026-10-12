@@ -916,13 +916,31 @@ pub const Response = struct {
     }
 
     /// First value of a trailer field (case-insensitive) — the h2 trailer
-    /// section, Go's `Response.Trailer`. Known only once the body has been
-    /// read to its end; null before, when there is none, and on HTTP/1.1
-    /// (a chunked body's trailer section is read and discarded there).
+    /// section or a chunked HTTP/1.1 body's, Go's `Response.Trailer`. Known
+    /// only once the body has been read to its end; null before and when
+    /// there is none. An HTTP/1.1 trailer section shares `max_head_bytes`
+    /// with the head: lines past it are dropped (`trailersTruncated`).
     /// Valid until `deinit`.
     pub fn trailer(res: *const Response, name: []const u8) ?[]const u8 {
-        if (res.conn.h2 == null) return null;
-        return res.conn.client.options.http2.?.vt.trailer(res.conn, name);
+        if (res.conn.h2 != null) return res.conn.client.options.http2.?.vt.trailer(res.conn, name);
+        return switch (res.conn.body) {
+            .chunked => |*cr| if (cr.state == .done) cr.trailer(name) else null,
+            else => null,
+        };
+    }
+
+    /// The HTTP/1.1 trailer section did not fit what `max_head_bytes` left
+    /// after the head, so `trailer` may answer null for a field that was
+    /// sent (the dropped lines were still read off the wire).
+    pub fn trailersTruncated(res: *const Response) bool {
+        if (res.conn.h2 != null) return false;
+        return switch (res.conn.body) {
+            // A head that filled `head_buf` leaves no capture buffer, and
+            // `ChunkedReader` then discards without flagging: anything past
+            // the closing CRLF was a dropped trailer line.
+            .chunked => |*cr| cr.trailers_overflow or (cr.trailer_buf.len == 0 and cr.trailer_bytes_seen > 2),
+            else => false,
+        };
     }
 
     /// Recover the real cause behind an `error.ReadFailed` reported by
@@ -1774,6 +1792,10 @@ const Conn = struct {
     tls_client: ?tls.Client,
     slab: []u8,
     head_buf: []u8,
+    /// Bytes of `head_buf` the current response head occupies (set by
+    /// `readResponseHead`); the rest captures a chunked body's trailer
+    /// section (`setupBody`), so trailers cost no memory of their own.
+    head_len: usize = 0,
     body_buf: []u8,
     body: BodyState,
     /// The origin this connection is dialed to — set once at dial time,
@@ -3316,6 +3338,7 @@ fn readResponseHead(conn: *Conn) Error!h1.ResponseHead {
         };
         // `block` is the front of `conn.head_buf`, which is ours to rewrite.
         h1.unfoldObsFold(conn.head_buf[0..block.len]);
+        conn.head_len = block.len;
         const head = h1.ResponseHead.parse(block) catch |err| switch (err) {
             error.MalformedHead => return error.MalformedResponse,
             error.UnsupportedVersion => return error.UnsupportedHttpVersion,
@@ -3339,7 +3362,9 @@ fn setupBody(conn: *Conn, method: http.Method, head: h1.ResponseHead) void {
     if (method == .head or head.status == 204 or head.status == 304) {
         conn.body = .{ .none = .fixed("") };
     } else if (head.chunked) {
-        conn.body = .{ .chunked = h1.ChunkedReader.init(conn.plainReader(), conn.body_buf) };
+        // Trailers land behind the head in `head_buf` (Go fills
+        // `Response.Trailer` on HTTP/1.1 too).
+        conn.body = .{ .chunked = h1.ChunkedReader.initCapturingTrailers(conn.plainReader(), conn.body_buf, conn.head_buf[conn.head_len..]) };
     } else if (head.content_length) |n| {
         conn.body = .{ .limited = h1.ContentLengthReader.init(conn.plainReader(), n, conn.body_buf) };
     } else {
@@ -6882,6 +6907,71 @@ test "gzip: decoded at levels 1/6/9, Content-Length and chunked framing, one poo
     try testing.expectEqual(@as(usize, 1), client.dialCount());
     try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
     try testing.expect(std.mem.indexOf(u8, lb.peer.head(0), "\r\nAccept-Encoding: gzip\r\n") != null);
+}
+
+test "HTTP/1.1 trailers: read behind the head after the body, next response starts clean, overflow flagged" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const with_trailers = "HTTP/1.1 200 OK\r\nTrailer: X-Checksum\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n0\r\nX-Checksum: c0ffee\r\nX-Other: 1\r\n\r\n";
+    const without = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n";
+    // One trailer line longer than what a 128-byte head buffer leaves.
+    const big = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Small: s\r\nX-Sig: " ++
+        ("a" ** 200) ++ "\r\n\r\n";
+    var lb: GzipLoopback = undefined;
+    try lb.start(io, &.{ with_trailers, without }, "/");
+    defer lb.finish(io);
+    var client = Client.init(io, gpa, .{ .total_timeout_ms = 5000 });
+    defer client.deinit();
+    {
+        var res = try client.request(.get, lb.url, .{});
+        defer res.deinit();
+        try testing.expectEqual(@as(?[]const u8, null), res.trailer("x-checksum"));
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("hello", body);
+        try testing.expectEqualStrings("c0ffee", res.trailer("X-Checksum").?);
+        try testing.expectEqualStrings("1", res.trailer("x-other").?);
+        try testing.expect(!res.trailersTruncated());
+        // The head is untouched by the capture behind it.
+        try testing.expectEqualStrings("X-Checksum", res.header("trailer").?);
+    }
+    {
+        var res = try client.request(.get, lb.url, .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("ok", body);
+        try testing.expectEqual(@as(?[]const u8, null), res.trailer("x-checksum"));
+    }
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+
+    var lb2: GzipLoopback = undefined;
+    try lb2.start(io, &.{ big, big }, "/");
+    defer lb2.finish(io);
+    var small = Client.init(io, gpa, .{ .total_timeout_ms = 5000, .max_head_bytes = 128 });
+    defer small.deinit();
+    {
+        var res = try small.request(.get, lb2.url, .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("x", body);
+        try testing.expectEqualStrings("s", res.trailer("x-small").?);
+        try testing.expectEqual(@as(?[]const u8, null), res.trailer("x-sig"));
+        try testing.expect(res.trailersTruncated());
+    }
+    { // The dropped line was still read off the wire: the connection pooled.
+        var res = try small.request(.get, lb2.url, .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("x", body);
+    }
+    try testing.expectEqual(@as(usize, 1), small.dialCount());
 }
 
 test "gzip: off by default — identity asked, a gzip body handed over as sent" {

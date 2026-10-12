@@ -516,9 +516,11 @@ Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML not
   task — a leader that reads without holding the session while the others wait on progress (a lock
   around the blocking engine deadlocks: the holder blocks on the socket while the stream whose
   unread data shut the window waits for the lock).
-- **Client HTTP/1.1 response trailers**: a chunked body's trailer section is read and discarded
-  (`h1.ChunkedReader` can capture it; the client gives it no buffer), so `Response.trailer` answers
-  only over h2. Go fills `Response.Trailer` on both.
+- ~~**Client HTTP/1.1 response trailers**~~ — DONE 2026-10-12: `setupBody` captures a chunked
+  body's trailer section into the tail of `head_buf` behind the head (`Conn.head_len`), so
+  `Response.trailer` answers on h1 as on h2 (Go fills `Response.Trailer` on both); a section past
+  that space drops its excess lines (still read, the connection still pools) and says so through
+  `Response.trailersTruncated()`. Negative control: capture off → the test fails.
 - R9 every method token reaches the handler — DONE 2026-10-12: `http.Method` gained `.connect`,
   `.trace` and `.other` (any other token; `Request.method_token` / `methodName()`, Go's
   `Request.Method`), `Method.fromToken`; the 501 for an unknown method is gone on h1 and h2. h1

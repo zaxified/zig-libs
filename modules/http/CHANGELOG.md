@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Client: HTTP/1.1 response trailers, Go's `Response.Trailer` on h1 too,
+  additive.** A chunked body's trailer section was read and discarded; `Response.trailer(name)`
+  now answers it once the body is read to its end, as it already did over h2. The section is
+  captured in what `max_head_bytes` leaves after the head (no new memory); lines past it are
+  dropped, still read off the wire, and flagged by the new `Response.trailersTruncated()`.
+
 - **2026-10-12** — **`http.httptest`: Go's `httptest.ResponseRecorder`, socket-free (S2 survey
   R10), additive.** `httptest.record(gpa, opts, wire, .{})` serves canned request bytes through
   `Server.serveStream` and returns a `Recording`: every response parsed (status, head, decoded

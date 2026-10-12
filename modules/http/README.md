@@ -289,8 +289,11 @@ try rw.setTrailer("X-Rows", rows_str);
   `end()` in the one case only `setStatus` could have caused.
 - Reading them is symmetric: `req.trailer("X-Checksum")` /
   `req.iterateTrailers()` work on both protocols, valid once the request body
-  has been drained to end-of-stream. On the client, `h2_client`'s
-  `Response.trailer(name)` / `Response.trailers`.
+  has been drained to end-of-stream. On the client, `Client`'s
+  `Response.trailer(name)` (HTTP/1.1 chunked and h2 alike, once the body is
+  read; `trailersTruncated()` when an h1 section outgrew what `max_head_bytes`
+  left after the head) and `h2_client`'s `Response.trailer(name)` /
+  `Response.trailers`.
 
 The codec works **without a socket**: `h1.RequestHead.parse` +
 `Server.RequestBody` decode requests from any `std.Io.Reader`,
