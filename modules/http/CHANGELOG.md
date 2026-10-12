@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Client: HTTP/2 over TLS by ALPN, Go's `Transport` with `ForceAttemptHTTP2`
+  (S2 survey R8), opt-in, additive.** `Client.Options.http2 = .alpn()` (null, the default, offers
+  no ALPN and links no h2 code): every `https://` dial offers `h2` and `http/1.1`, and where the
+  server picks h2, `request`, redirects, `requestStreaming`, `decompress`, the cookie jar,
+  `max_conns_per_host` and the timeouts run over it with the same header rules as HTTP/1.1. New
+  `Client.Proto` / `Response.proto()` (`.text()` = Go's `HTTP/2.0`), `Response.trailer` (the h2
+  trailer section, after the body's end), `error.StreamReset`. A body left unread resets its
+  stream; the connection is pooled. One exchange per connection — no multiplexing yet (SPEC
+  Backlog). A request asking to upgrade always goes over HTTP/1.1. A response field that is not a
+  lowercase token, or carries a byte HTTP/1.1 cannot, is `error.MalformedResponse`. `h2_client`:
+  `Session.unreadLen`. Interop lane: phase `alpn` (Go net/http over TLS, needs `go`).
+
 - **2026-10-12** — **Fix, `h2.Connection` (client and server): frames in flight for a stream we
   reset stalled the connection.** DATA for a stream we had reset was answered with one more
   RST_STREAM per frame, and its connection-window charge was never given back: one abandoned h2

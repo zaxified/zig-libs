@@ -364,6 +364,14 @@ was refused where RFC 9112 §5.2 makes a user agent unfold it (6 mutants, 6 kill
 `zig build interop-http -- --phase go`
 re-takes the oracle and fails when a fresh run differs from the committed vectors.
 
+**The client over real TLS + ALPN against Go** (2026-10-12, `interop-http -- --phase alpn`, in
+every full run; needs `go`): `go_oracle -h2tls` serves two httptest TLS listeners, one offering h2,
+one HTTP/1.1 only. `Client` with `Options.http2` must land on h2 and on HTTP/1.1 respectively, read
+trailers, decode gzip, follow a redirect, stream an upload and keep one connection on the h2
+listener; and the request Go's server saw from us must equal the one it saw from Go's own Transport
+(`/go`), `User-Agent` aside. No TLS server exists in this module, so this is where ALPN itself is
+tested; the unit tests drive the same h2 exchange over h2c prior knowledge.
+
 ## Hardening: ReleaseSafe vs ReleaseFast for the exposed binary (HD7)
 This module's entire job is turning fully attacker-controlled bytes (request line, headers, chunked
 framing, multipart bodies, Range headers, HPACK blocks, HTTP/2 frames) into typed values before any
@@ -481,7 +489,36 @@ Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML not
   `Connection: close`; peer-side max in flight + accepts). Negative control: 10 mutants (cap, both
   wakes, waiter count, eviction, slot release on failed dial / close, deadline), all caught; the
   oracle alone catches an ignored cap.
-- R8 rest: h2 via ALPN in `Client.request`.
+- R8 rest, h2 via ALPN — DONE 2026-10-12: `Client.Options.http2 = .alpn()` (null = off; a function
+  pointer like `decompress`, so a client without it links no h2 code). Every `https://` dial offers
+  `h2`,`http/1.1`; when the server picks h2 the exchange runs as a stream on that connection —
+  `request`, redirects, `requestStreaming` (DATA frames), `decompress`, the cookie jar,
+  `max_conns_per_host` and the timeouts alike. The request head is rendered by the h1 head writer
+  and split back into fields (one rule for cookies, credentials on a cross-origin hop, `User-Agent`,
+  `Accept-Encoding`, a caller's `Host` → `:authority`); the response head becomes an
+  `h1.ResponseHead` over the same fields, a field that is not a lowercase token or carries a byte h1
+  cannot is `MalformedResponse` (fuzz `http-client-h2-head`: the block reads back as exactly the
+  fields). New `Response.proto()` (`Proto.text()` = Go's `HTTP/2.0`), `Response.trailer`, `error.StreamReset`;
+  a body closed early resets the stream (CANCEL) and pools the connection, as Go. A request asking
+  to upgrade dials without h2 and skips h2 connections (Go's `requiresHTTP1`; here any upgrade, not
+  only WebSocket). Owner decision: one exchange per connection, no multiplexing yet (Backlog).
+  Verified live: interop phase `alpn` against Go net/http over TLS (h2 listener, h1-only listener,
+  Go's Transport's request beside ours as Go's server sees them, `User-Agent` aside; negative
+  control: off, the phase fails 8 checks). FIX found on the way, `h2.Connection` (both roles): DATA
+  for a stream WE had reset was answered with another RST_STREAM and its connection-window charge
+  never returned — one abandoned h2 download shut the connection window and stalled every other
+  stream until the server's 10 s stall timeout cut the connection (13 % of runs of the client test);
+  now §5.1/§6.9: frames on a stream we reset (last 32) are ignored, a trailer block there is still
+  HPACK-decoded, and discarded DATA is credited back on every path. h2spec 145/145 both phases.
+- **Client h2 multiplexing** *(R8, deferred by the owner 2026-10-12)*: `Options.http2` checks an h2
+  connection out for one exchange like an h1 one, so concurrent requests to one origin open several
+  connections where Go's Transport shares one. Needs `h2_client.Session` driven by more than one
+  task — a leader that reads without holding the session while the others wait on progress (a lock
+  around the blocking engine deadlocks: the holder blocks on the socket while the stream whose
+  unread data shut the window waits for the lock).
+- **Client HTTP/1.1 response trailers**: a chunked body's trailer section is read and discarded
+  (`h1.ChunkedReader` can capture it; the client gives it no buffer), so `Response.trailer` answers
+  only over h2. Go fills `Response.Trailer` on both.
 - R9 extension methods (CONNECT, TRACE, `PURGE`, …) reach the handler instead of 501 — breaks
   exhaustive `switch (req.method)` in qap (5), metrics, mcp-http, openapi; patched together.
 - R10 a test recorder (`httptest.NewRecorder`) over `serveStream`.

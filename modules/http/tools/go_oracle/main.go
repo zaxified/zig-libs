@@ -24,9 +24,14 @@ import (
 func main() {
 	out := flag.String("out", "", "write the Zig vectors file here (default stdout)")
 	proxyTarget := flag.String("proxycase", "", "internal: answer one proxy case for this URL and exit")
+	h2tls := flag.String("h2tls", "", "internal: serve the interop lane's ALPN peer, ports to this file (h2tls.go)")
 	flag.Parse()
 	if *proxyTarget != "" {
 		proxyCaseMain(*proxyTarget)
+		return
+	}
+	if *h2tls != "" {
+		h2tlsMain(*h2tls)
 		return
 	}
 

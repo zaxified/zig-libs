@@ -130,8 +130,10 @@ symbols on the TLS-capable probe, for contrast — see the sizeprobe README).
 
 ### HTTP/2 client: multiplexed, and incremental in both directions
 
-`Client.connectH2c` (cleartext h2c, prior knowledge) / `connectH2Over` (a
-stream that ALPN already selected `h2` on) return an `H2Session` that
+For plain `request`/`requestStreaming` over h2 on `https://`, set
+`Options.http2 = .alpn()` (see "Client behavior notes"). For multiplexing
+by hand: `Client.connectH2c` (cleartext h2c, prior knowledge) /
+`connectH2Over` (a stream that ALPN already selected `h2` on) return an `H2Session` that
 multiplexes any number of requests. Buffered use is `request` + a fully
 assembled `awaitResponse`. Underneath it — and usable directly for a body
 you do not have yet, a response you must process as it arrives, or both at
@@ -715,9 +717,20 @@ provider is called concurrently too. For zstd, zig-libs `zstd.StreamWriter`
   `Content-Length`. Every trailer is checked; a bad body reads as
   `error.CorruptGzip`. A caller that sends its own `Accept-Encoding` decodes
   the body itself.
+- **HTTP/2 over TLS is opt-in** (`.http2 = .alpn()`; off, no h2 code is
+  linked in). Every `https://` dial then offers `h2` and `http/1.1` by ALPN;
+  where the server picks h2 the request runs as a stream on that connection,
+  with the same headers, cookies, redirects, `decompress`, pool and
+  timeouts as over HTTP/1.1. `Response.proto()` says which (`.text()` is
+  Go's `HTTP/2.0`); `Response.trailer(name)` reads the h2 trailer section
+  once the body has been read to its end. A body left unread resets the
+  stream and the connection goes back to the pool. One request at a time
+  per connection: concurrent requests to one origin use several
+  connections (Go multiplexes them on one — SPEC Backlog). A request with
+  `Connection: Upgrade` + `Upgrade` always goes over HTTP/1.1.
 - 1xx interim responses are skipped (101 returned as-is); HEAD/204/304
-  responses get an empty body reader; chunked trailers are consumed and
-  discarded.
+  responses get an empty body reader; HTTP/1.1 chunked trailers are
+  consumed and discarded.
 
 ## Submodules
 

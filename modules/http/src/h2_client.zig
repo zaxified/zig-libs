@@ -651,6 +651,13 @@ pub const Session = struct {
         return p.end;
     }
 
+    /// Body octets of `sid` received and not yet read (`readBody`); 0 for
+    /// unknown ids. With `ended`: "the response has no body left at all".
+    pub fn unreadLen(s: *const Session, sid: u31) usize {
+        const p = s.streams.getPtr(sid) orelse return 0;
+        return p.unread().len;
+    }
+
     /// Abort `sid` with RST_STREAM (§6.4) and release its state — for a
     /// download the caller no longer wants, or an upload it is giving up
     /// on. Other streams are untouched. Best effort: a dead session just

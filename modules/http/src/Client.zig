@@ -94,6 +94,7 @@ const netaddr = @import("netaddr");
 const http = @import("root.zig");
 const h1 = @import("h1.zig");
 const h2_client = @import("h2_client.zig");
+const hpack = @import("hpack.zig");
 const bufpool = @import("bufpool.zig");
 const gzip = @import("gzip.zig");
 const crc32 = @import("crc32");
@@ -287,6 +288,68 @@ pub const Options = struct {
     /// ~70 KiB of working memory is allocated per decoded response, only when
     /// the server actually answered gzip.
     decompress: ?Decompress = null,
+    /// HTTP/2 over TLS, negotiated by ALPN — Go's `Transport` with
+    /// `ForceAttemptHTTP2`, switched on with `.http2 = .alpn()`. Null
+    /// (default) = off: the TLS handshake offers no ALPN and every request is
+    /// HTTP/1.1, as before, and no h2 code is linked in (`Http2`). On: every
+    /// `https://` dial offers `h2` and `http/1.1`; when the server picks `h2`
+    /// the exchange runs as one stream on that connection and
+    /// `Response.proto` says `.http2`. Headers, cookies, redirects,
+    /// `decompress`, `max_conns_per_host` and the timeouts mean the same on
+    /// both protocols; `Response.trailer` reads an h2 trailer section.
+    ///
+    /// One request at a time per connection: an h2 connection is checked out
+    /// of the pool for a whole exchange like an h1 one, so concurrent
+    /// requests to one origin open several connections where Go would
+    /// multiplex them on one (SPEC Backlog). A request that asks for a
+    /// protocol upgrade (`Connection: Upgrade` + `Upgrade`, e.g. WebSocket)
+    /// never goes over h2, which has no upgrade: its dial offers only
+    /// `http/1.1`, as Go's does for a WebSocket request. `http://` origins
+    /// stay HTTP/1.1 (h2c is `connectH2c`).
+    http2: ?Http2 = null,
+};
+
+/// How `Options.http2` speaks h2; made only by `alpn`. Function pointers
+/// rather than a flag for the same reason as `Decompress`: the h2 engine
+/// (framing, HPACK, flow control) is linked into a binary only when
+/// something calls `alpn`.
+pub const Http2 = struct {
+    vt: *const VTable,
+
+    /// Offer `h2` by ALPN on every `https://` dial and use it when chosen.
+    pub fn alpn() Http2 {
+        return .{ .vt = &h2glue.vtable };
+    }
+
+    const VTable = struct {
+        start: *const fn (conn: *Conn) Error!void,
+        exchange: *const fn (conn: *Conn, method: http.Method, url: http.Url, headers: []const http.Header, plan: BodyPlan, body: ?[]const u8, strip_sensitive: bool, ask_gzip: bool) Error!h1.ResponseHead,
+        open_upload: *const fn (conn: *Conn, method: http.Method, url: http.Url, headers: []const http.Header, plan: BodyPlan, ask_gzip: bool) Error!void,
+        upload_writer: *const fn (conn: *Conn) *std.Io.Writer,
+        finish_upload: *const fn (conn: *Conn) Error!h1.ResponseHead,
+        setup_body: *const fn (conn: *Conn, method: http.Method) void,
+        drained: *const fn (conn: *const Conn) bool,
+        read_failure: *const fn (conn: *const Conn) ?Error,
+        trailer: *const fn (conn: *const Conn, name: []const u8) ?[]const u8,
+        release: *const fn (conn: *Conn) bool,
+        destroy: *const fn (conn: *Conn) void,
+    };
+};
+
+/// Which HTTP version a response came over (`Response.proto`).
+pub const Proto = enum {
+    http1_0,
+    http1_1,
+    http2,
+
+    /// Go's `Response.Proto` spelling: `HTTP/1.0`, `HTTP/1.1`, `HTTP/2.0`.
+    pub fn text(p: Proto) []const u8 {
+        return switch (p) {
+            .http1_0 => "HTTP/1.0",
+            .http1_1 => "HTTP/1.1",
+            .http2 => "HTTP/2.0",
+        };
+    }
 };
 
 /// How `Options.decompress` decodes; made only by `gzip`. A function
@@ -455,6 +518,9 @@ pub const Error = error{
     /// mismatch, a stream cut short, or bytes after the last member that
     /// are not another member (Go: `gzip.ErrHeader` / `ErrChecksum`).
     CorruptGzip,
+    /// HTTP/2 (`Options.http2`): the server reset this request's stream
+    /// (RST_STREAM) — Go's `http2.StreamError`. The connection stays usable.
+    StreamReset,
 };
 
 /// The outbound half of the header-injection defence: every caller-supplied
@@ -554,6 +620,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
     var current_body = options.body;
     var url_owned: ?[]u8 = null;
     defer if (url_owned) |s| c.gpa.free(s);
+    const h1_only = needsHttp1(options.headers);
 
     var redirects: u8 = 0;
     while (true) {
@@ -569,7 +636,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
         const ask_gzip = c.requestsGzip(current_method, options.headers);
 
         var reused = false;
-        var conn = try c.acquireConn(url, &reused, deadline);
+        var conn = try c.acquireConn(url, &reused, deadline, h1_only);
         // `owned` guards the errdefer below across the two places later in
         // this same iteration that explicitly `conn.destroy()` and then may
         // still return an error (the stale-connection retry's redial, and
@@ -608,7 +675,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
             try c.checkDeadline(deadline);
             conn.destroy();
             owned = false;
-            conn = try c.checkoutConn(url, &reused, deadline, false, dialConn);
+            conn = try c.checkoutConn(url, &reused, deadline, false, h1_only, dialConn);
             owned = true;
             break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive, ask_gzip);
         };
@@ -646,7 +713,9 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
                 if (!f.allow(f.ctx, url, next_url)) return error.RedirectRefused;
             }
 
-            conn.destroy();
+            // h1: closed, the redirect's body is not read. h2: the stream is
+            // reset and the connection pooled for the next hop.
+            if (conn.h2 != null) c.retire(conn) else conn.destroy();
             owned = false;
             if (url_owned) |s| c.gpa.free(s);
             url_owned = buf;
@@ -727,7 +796,7 @@ fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, opti
             try c.checkDeadline(deadline);
             conn.destroy();
             owned = false;
-            conn = try c.checkoutConn(url, &reused, deadline, false, dialPlain);
+            conn = try c.checkoutConn(url, &reused, deadline, false, false, dialPlain);
             owned = true;
             break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive, ask_gzip);
         };
@@ -811,8 +880,26 @@ pub const Response = struct {
             .chunked => |*cr| &cr.reader,
             .limited => |*lr| &lr.reader,
             .until_close => res.conn.plainReader(),
+            .h2 => |r| r,
             .unset => unreachable,
         };
+    }
+
+    /// The HTTP version the response came over: `.http2` when the request
+    /// went over an h2 connection (`Options.http2`).
+    pub fn proto(res: *const Response) Proto {
+        if (res.conn.h2 != null) return .http2;
+        return if (res.head.http1_0) .http1_0 else .http1_1;
+    }
+
+    /// First value of a trailer field (case-insensitive) — the h2 trailer
+    /// section, Go's `Response.Trailer`. Known only once the body has been
+    /// read to its end; null before, when there is none, and on HTTP/1.1
+    /// (a chunked body's trailer section is read and discarded there).
+    /// Valid until `deinit`.
+    pub fn trailer(res: *const Response, name: []const u8) ?[]const u8 {
+        if (res.conn.h2 == null) return null;
+        return res.conn.client.options.http2.?.vt.trailer(res.conn, name);
     }
 
     /// Recover the real cause behind an `error.ReadFailed` reported by
@@ -828,6 +915,7 @@ pub const Response = struct {
     /// `error.ReadFailed` — it describes that failure, not a future one.
     pub fn readFailure(res: *Response) Error {
         if (res.gunzip) |g| if (g.failure) |f| return f;
+        if (res.conn.h2 != null) if (res.conn.client.options.http2.?.vt.read_failure(res.conn)) |f| return f;
         return res.conn.readFailure();
     }
 
@@ -862,19 +950,46 @@ pub const Response = struct {
     /// Return the connection to the pool when it left the exchange in a
     /// clean, fully-drained, keep-alive-eligible state (see
     /// `Conn.keep_alive_eligible` / `isBodyDrained`); otherwise close it.
-    /// Either way, frees this response's per-request buffers.
+    /// Over h2 a body not read to its end resets the stream (RST_STREAM
+    /// CANCEL) and the connection is pooled anyway, as in Go. Either way,
+    /// frees this response's per-request buffers.
     pub fn deinit(res: *Response) void {
         const conn = res.conn;
         const c = conn.client;
         if (res.gunzip) |g| c.gpa.destroy(g);
-        if (c.options.pool.enabled and conn.keep_alive_eligible and isBodyDrained(conn)) {
-            c.pool.release(conn, c.nowMs());
-        } else {
-            conn.destroy();
-        }
+        c.retire(conn);
         res.* = undefined;
     }
 };
+
+/// Done with `conn` after a response: back to the pool when the exchange
+/// left it reusable (h1: keep-alive and the body read to its end; h2: the
+/// session healthy, the stream released or reset), else closed.
+fn retire(c: *Client, conn: *Conn) void {
+    const reusable = if (conn.h2 != null)
+        c.options.http2.?.vt.release(conn)
+    else
+        conn.keep_alive_eligible and isBodyDrained(conn);
+    if (c.options.pool.enabled and reusable) {
+        c.pool.release(conn, c.nowMs());
+    } else {
+        conn.destroy();
+    }
+}
+
+/// Whether a request must go over HTTP/1.1: it asks for a protocol upgrade
+/// (`Connection: Upgrade` + `Upgrade`), which h2 has no way to carry (RFC
+/// 9113 §8.6). Go asks the same of a WebSocket request (`requiresHTTP1`);
+/// any upgrade counts here, as the h1 head writer passes any upgrade on.
+fn needsHttp1(headers: []const http.Header) bool {
+    var asks_upgrade = false;
+    var has_upgrade = false;
+    for (headers) |hd| {
+        if (std.ascii.eqlIgnoreCase(hd.name, "connection") and h1.tokenListContains(hd.value, "upgrade")) asks_upgrade = true;
+        if (std.ascii.eqlIgnoreCase(hd.name, "upgrade")) has_upgrade = true;
+    }
+    return asks_upgrade and has_upgrade;
+}
 
 /// An upgraded connection (see `Response.upgraded`).
 pub const Upgraded = struct {
@@ -930,9 +1045,17 @@ fn requestsGzip(c: *const Client, method: http.Method, headers: []const http.Hea
 /// `uncompressed`; a 101 hands the connection itself over. On error `conn`
 /// is still the caller's.
 fn makeResponse(c: *Client, conn: *Conn, method: http.Method, head: h1.ResponseHead, asked_gzip: bool) Error!Response {
-    setupBody(conn, method, head);
+    // h2 (Go's `http2Transport`): a body exists unless the HEADERS frame
+    // ended the stream or the request was a HEAD; `Content-Length` frames
+    // nothing there, so it does not decide this either.
+    const has_body = if (conn.h2 != null) b: {
+        c.options.http2.?.vt.setup_body(conn, method);
+        break :b conn.body != .none;
+    } else b: {
+        setupBody(conn, method, head);
+        break :b conn.body != .none and head.content_length != 0 and head.status != 101;
+    };
     var res: Response = .{ .status = head.status, .reason = head.reason, .head = head, .conn = conn };
-    const has_body = conn.body != .none and head.content_length != 0 and head.status != 101;
     if (asked_gzip and has_body) if (head.header("content-encoding")) |ce| {
         if (std.ascii.eqlIgnoreCase(ce, "gzip")) {
             const d = c.options.decompress.?;
@@ -1103,8 +1226,10 @@ pub const Upload = struct {
     /// URL text may be gone.
     jar_url: ?[]u8 = null,
 
-    /// The request-body writer: plaintext bytes in, wire framing out.
+    /// The request-body writer: plaintext bytes in, wire framing out (h2:
+    /// DATA frames).
     pub fn writer(u: *Upload) *std.Io.Writer {
+        if (u.conn.h2 != null) return u.conn.client.options.http2.?.vt.upload_writer(u.conn);
         if (u.chunked) |*cw| return &cw.writer;
         return u.conn.plainWriter();
     }
@@ -1131,9 +1256,11 @@ pub const Upload = struct {
         const c = u.conn.client;
         defer if (u.jar_url) |t| c.gpa.free(t);
         errdefer u.conn.destroy();
-        if (u.chunked) |*cw| cw.finish() catch return u.conn.writeFailure();
-        try u.conn.flushAll();
-        const head = try readResponseHead(u.conn);
+        const head = if (u.conn.h2 != null) try c.options.http2.?.vt.finish_upload(u.conn) else h: {
+            if (u.chunked) |*cw| cw.finish() catch return u.conn.writeFailure();
+            try u.conn.flushAll();
+            break :h try readResponseHead(u.conn);
+        };
         if (u.jar_url) |t| if (c.options.cookie_jar) |jar| jar.store(jar.ctx, http.Url.parse(t) catch unreachable, &head);
         return c.makeResponse(u.conn, u.method, head, u.ask_gzip);
     }
@@ -1159,8 +1286,9 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
     // No exchange budget here (the caller paces the body); a wait for a
     // `max_conns_per_host` slot still gets `total_timeout_ms`.
     const deadline = c.totalDeadline();
+    const h1_only = needsHttp1(options.headers);
     var reused = false;
-    var conn = try c.acquireConn(url, &reused, deadline);
+    var conn = try c.acquireConn(url, &reused, deadline, h1_only);
     // See `requestInner`/`requestInnerPlain`'s `owned` doc comment: a bare
     // `errdefer conn.destroy()` would double-free if the redial below fails
     // (reproduced by the `requestInner` regression test — this site has the
@@ -1168,13 +1296,13 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
     var owned = true;
     errdefer if (owned) conn.destroy();
 
-    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch {
+    c.writeUploadHead(conn, method, url, options.headers, plan, ask_gzip) catch |err| {
         // Recover the real cause the same way `sendAndReadHead` does, and
         // BEFORE `isStaleConnError` looks at it: `writeRequestHead` itself
         // can only ever hand back `error.WriteFailed`, so without this a
         // cancelation would masquerade as a dead pooled connection and get
         // retried below with the cancelation already spent.
-        const mapped = conn.writeFailure();
+        const mapped = if (err == error.WriteFailed) conn.writeFailure() else err;
         // Narrower than `request`'s retry: safe here ONLY because nothing
         // of the caller-driven body has been touched yet — just the fixed
         // request head, which we can regenerate byte-for-byte on a fresh
@@ -1188,17 +1316,26 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
         if (!reused or !isStaleConnError(mapped)) return mapped;
         conn.destroy();
         owned = false;
-        conn = try c.checkoutConn(url, &reused, deadline, false, dialConn);
+        conn = try c.checkoutConn(url, &reused, deadline, false, h1_only, dialConn);
         owned = true;
-        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
+        c.writeUploadHead(conn, method, url, options.headers, plan, ask_gzip) catch |e|
+            return if (e == error.WriteFailed) conn.writeFailure() else e;
     };
     return .{
         .conn = conn,
         .method = method,
         .ask_gzip = ask_gzip,
-        .chunked = if (content_length == null) h1.ChunkedWriter.init(conn.plainWriter(), conn.body_buf) else null,
+        .chunked = if (content_length == null and conn.h2 == null) h1.ChunkedWriter.init(conn.plainWriter(), conn.body_buf) else null,
         .jar_url = if (c.options.cookie_jar != null) try c.gpa.dupe(u8, url_text) else null,
     };
+}
+
+/// `requestStreaming`'s request head: h1 bytes on the wire, or the HEADERS
+/// of a new h2 stream (`Options.http2`) whose DATA the `Upload` sends.
+fn writeUploadHead(c: *Client, conn: *Conn, method: http.Method, url: http.Url, headers: []const http.Header, plan: BodyPlan, ask_gzip: bool) Error!void {
+    if (conn.h2 != null) return c.options.http2.?.vt.open_upload(conn, method, url, headers, plan, ask_gzip);
+    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch
+        return error.WriteFailed;
 }
 
 /// `requestStreaming`'s plaintext-only twin — see `requestPlain`'s doc
@@ -1230,7 +1367,7 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
         if (!reused or !isStaleConnError(mapped)) return mapped;
         conn.destroy();
         owned = false;
-        conn = try c.checkoutConn(url, &reused, deadline, false, dialPlain);
+        conn = try c.checkoutConn(url, &reused, deadline, false, false, dialPlain);
         owned = true;
         writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
     };
@@ -1634,6 +1771,9 @@ const Conn = struct {
     /// reserved a slot for; a connection dialed any other way (tests) is
     /// not counted.
     holds_slot: bool = false,
+    /// Set when ALPN chose h2 (`Options.http2`): requests on this
+    /// connection run as streams of this session, one at a time.
+    h2: ?*H2Conn = null,
 
     const BodyState = union(enum) {
         unset,
@@ -1641,6 +1781,8 @@ const Conn = struct {
         chunked: h1.ChunkedReader,
         limited: h1.ContentLengthReader,
         until_close,
+        /// The h2 stream's DATA (`H2Conn.body`).
+        h2: *std.Io.Reader,
     };
 
     /// Decrypted (or plain) byte stream from the server.
@@ -1686,6 +1828,7 @@ const Conn = struct {
 
     fn destroy(conn: *Conn) void {
         const gpa = conn.client.gpa;
+        if (conn.h2 != null) conn.client.options.http2.?.vt.destroy(conn);
         conn.stream.close(conn.client.io);
         // After the close: a waiter woken here dials at once, and the cap
         // is on sockets the peer sees, not on our bookkeeping.
@@ -1693,6 +1836,341 @@ const Conn = struct {
         gpa.free(conn.slab);
         gpa.destroy(conn);
     }
+};
+
+/// An h2 connection's session and the one exchange running on it
+/// (`Options.http2`), on the heap beside its `Conn`, whose plaintext reader
+/// and writer it speaks through.
+const H2Conn = struct {
+    conn: *Conn,
+    session: h2_client.Session,
+    /// The session's writer: bytes go to the TLS writer, and `flush` pushes
+    /// them on to the socket (`Conn.flushAll`) — the TLS writer's own flush
+    /// only seals records into the socket writer's buffer.
+    out: std.Io.Writer,
+    /// The stream of the exchange in progress, until `release`.
+    sid: ?u31 = null,
+    /// The response body was read to END_STREAM.
+    done: bool = false,
+    /// Why the stream's last read or write failed (`Response.readFailure`).
+    failure: ?Error = null,
+    /// The response body (`Conn.BodyState.h2`), buffered in `Conn.body_buf`.
+    body: std.Io.Reader,
+    /// An `Upload`'s request body as DATA frames, buffered in
+    /// `Conn.body_buf` (free until the response body uses it).
+    upload: std.Io.Writer,
+
+    /// A new exchange: forget the last one's outcome.
+    fn begin(h: *H2Conn) void {
+        h.done = false;
+        h.failure = null;
+        h.upload.end = 0;
+    }
+};
+
+/// The h2 half of `Client`, reached only through `Http2.alpn`'s function
+/// pointers. The request head is rendered by the h1 head writer and split
+/// back into fields, so every rule about which fields go out — cookies,
+/// credentials dropped on a cross-origin hop, `User-Agent`,
+/// `Accept-Encoding`, `Content-Length`, a caller's `Host` — is one rule on
+/// both protocols; the session drops the connection-specific ones (RFC 9113
+/// §8.2.2) and a caller's `Host` becomes `:authority`, as in Go. The response
+/// head comes back as an `h1.ResponseHead` over the same fields, so cookies,
+/// redirects and `decompress` read it unchanged.
+const h2glue = struct {
+    const vtable: Http2.VTable = .{
+        .start = start,
+        .exchange = exchange,
+        .open_upload = openUpload,
+        .upload_writer = uploadWriter,
+        .finish_upload = finishUpload,
+        .setup_body = setupBodyH2,
+        .drained = drained,
+        .read_failure = readFailure,
+        .trailer = trailer,
+        .release = release,
+        .destroy = destroy,
+    };
+
+    /// ALPN chose h2 on a fresh `conn`: send the connection preface.
+    fn start(conn: *Conn) Error!void {
+        const gpa = conn.client.gpa;
+        const h = try gpa.create(H2Conn);
+        errdefer gpa.destroy(h);
+        h.* = .{
+            .conn = conn,
+            .session = undefined,
+            .out = .{ .vtable = &.{ .drain = outDrain, .flush = outFlush }, .buffer = &.{} },
+            .body = .{ .vtable = &.{ .stream = bodyStream }, .buffer = conn.body_buf, .seek = 0, .end = 0 },
+            .upload = .{ .vtable = &.{ .drain = uploadDrain, .flush = uploadFlush }, .buffer = conn.body_buf },
+        };
+        // No session `user_agent`: the rendered head carries it.
+        h.session = h2_client.Session.init(gpa, conn.plainReader(), &h.out, .{}) catch |err|
+            return mapError(conn, err);
+        conn.h2 = h;
+    }
+
+    fn destroy(conn: *Conn) void {
+        const h = conn.h2.?;
+        h.session.deinit();
+        conn.client.gpa.destroy(h);
+        conn.h2 = null;
+    }
+
+    fn exchange(conn: *Conn, method: http.Method, url: http.Url, headers: []const http.Header, plan: BodyPlan, body: ?[]const u8, strip_sensitive: bool, ask_gzip: bool) Error!h1.ResponseHead {
+        const h = conn.h2.?;
+        var head: Rendered = try .init(conn, method, url, headers, plan, strip_sensitive, ask_gzip);
+        defer head.deinit();
+        h.begin();
+        // An empty or absent body: END_STREAM on the HEADERS frame.
+        h.sid = h.session.request(method, head.target, .{
+            .scheme = @tagName(url.scheme),
+            .authority = head.authority,
+            .headers = head.fields,
+            .body = body,
+        }) catch |err| return fail(h, err);
+        return awaitHead(h);
+    }
+
+    fn openUpload(conn: *Conn, method: http.Method, url: http.Url, headers: []const http.Header, plan: BodyPlan, ask_gzip: bool) Error!void {
+        const h = conn.h2.?;
+        var head: Rendered = try .init(conn, method, url, headers, plan, false, ask_gzip);
+        defer head.deinit();
+        h.begin();
+        h.sid = h.session.openStream(method, head.target, .{
+            .scheme = @tagName(url.scheme),
+            .authority = head.authority,
+            .headers = head.fields,
+        }) catch |err| return fail(h, err);
+    }
+
+    fn uploadWriter(conn: *Conn) *std.Io.Writer {
+        return &conn.h2.?.upload;
+    }
+
+    fn finishUpload(conn: *Conn) Error!h1.ResponseHead {
+        const h = conn.h2.?;
+        if (h.failure) |f| return f;
+        h.upload.flush() catch return h.failure orelse error.WriteFailed;
+        h.session.closeSend(h.sid.?) catch |err| return fail(h, err);
+        return awaitHead(h);
+    }
+
+    /// Frame the response body: none after a HEAD or when the HEADERS frame
+    /// ended the stream, else the stream's DATA.
+    fn setupBodyH2(conn: *Conn, method: http.Method) void {
+        const h = conn.h2.?;
+        const sid = h.sid.?;
+        h.body.seek = 0;
+        h.body.end = 0;
+        if (method == .head or (h.session.ended(sid) and h.session.unreadLen(sid) == 0)) {
+            conn.body = .{ .none = .fixed("") };
+            h.done = true;
+        } else {
+            conn.body = .{ .h2 = &h.body };
+        }
+    }
+
+    fn drained(conn: *const Conn) bool {
+        const h = conn.h2.?;
+        return h.done and h.failure == null;
+    }
+
+    fn readFailure(conn: *const Conn) ?Error {
+        return conn.h2.?.failure;
+    }
+
+    fn trailer(conn: *const Conn, name: []const u8) ?[]const u8 {
+        const h = conn.h2.?;
+        // Like Go: the values are there after the body's EOF, not before,
+        // even when the trailer section arrived with the first frames.
+        if (!h.done) return null;
+        const hl = h.session.trailers(h.sid orelse return null) orelse return null;
+        for (hl.fields) |f| {
+            if (std.ascii.eqlIgnoreCase(f.name, name)) return f.value;
+        }
+        return null;
+    }
+
+    /// End the exchange: a stream finished both ways is released, any other
+    /// is reset (RST_STREAM CANCEL, as Go does for a body closed early).
+    /// Whether the connection can take another request.
+    fn release(conn: *Conn) bool {
+        const h = conn.h2.?;
+        if (h.sid) |sid| {
+            const finished = h.session.ended(sid) and h.session.unreadLen(sid) == 0 and h.session.sendEnded(sid);
+            if (finished) h.session.release(sid) else h.session.cancel(sid, .cancel);
+            h.sid = null;
+        }
+        return h.session.broken == null and h.session.goaway == null;
+    }
+
+    fn awaitHead(h: *H2Conn) Error!h1.ResponseHead {
+        const head = h.session.awaitHead(h.sid.?) catch |err| return fail(h, err);
+        return headFromFields(head.status, head.headers.fields, h.conn.head_buf) catch |err| {
+            h.failure = err;
+            return err;
+        };
+    }
+
+    /// An h2 response head as the `h1.ResponseHead` the rest of the client
+    /// reads, its block written into `buf`. Pseudo-header fields are left
+    /// out (`status` is `:status`).
+    fn headFromFields(status: u16, fields: []const hpack.Field, buf: []u8) error{ MalformedResponse, HeadTooLarge }!h1.ResponseHead {
+        var w: std.Io.Writer = .fixed(buf);
+        var content_length: ?u64 = null;
+        var lengths: usize = 0;
+        for (fields) |f| {
+            if (f.name.len != 0 and f.name[0] == ':') continue;
+            // RFC 9113 §8.2.1: a name with an uppercase letter, or a value
+            // h1 could not carry, makes the response malformed — and would
+            // break the h1 block it is copied into. Go refuses both.
+            if (!isLowerToken(f.name) or !h1.isValidFieldValue(f.value)) return error.MalformedResponse;
+            w.print("{s}: {s}\r\n", .{ f.name, f.value }) catch return error.HeadTooLarge;
+            if (std.mem.eql(u8, f.name, "content-length")) {
+                lengths += 1;
+                content_length = std.fmt.parseUnsigned(u64, f.value, 10) catch null;
+            }
+        }
+        return .{
+            .status = status,
+            // h2 has no reason phrase; Go's `Status` uses `StatusText`.
+            .reason = Server.reasonPhrase(status),
+            .http1_0 = false,
+            .header_block = w.buffered(),
+            // Informational only: END_STREAM frames an h2 body.
+            .content_length = if (lengths == 1) content_length else null,
+        };
+    }
+
+    fn isLowerToken(name: []const u8) bool {
+        if (!h1.isToken(name)) return false;
+        for (name) |b| if (std.ascii.isUpper(b)) return false;
+        return true;
+    }
+
+    fn fail(h: *H2Conn, err: h2_client.Error) Error {
+        const e = mapError(h.conn, err);
+        h.failure = e;
+        return e;
+    }
+
+    fn mapError(conn: *Conn, err: h2_client.Error) Error {
+        return switch (err) {
+            error.StreamReset => error.StreamReset,
+            // Not processed by the server (RFC 9113 §6.8): safe to send
+            // again on a fresh connection, like a stale pooled h1 one.
+            error.StreamRefused, error.GoawayReceived => error.ConnectionClosed,
+            // The session folds a failed read into this; a cancelation must
+            // stay one (see `Conn.readFailure`).
+            error.ConnectionClosed => if (conn.readFailure() == error.Canceled) error.Canceled else error.ConnectionClosed,
+            error.WriteFailed => conn.writeFailure(),
+            error.ProtocolError, error.MalformedResponse, error.UnknownStream, error.SendClosed => error.MalformedResponse,
+            error.InvalidHeader => error.InvalidHeader,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
+    fn outDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const h: *H2Conn = @alignCast(@fieldParentPtr("out", w));
+        return h.conn.plainWriter().writeSplat(data, splat);
+    }
+
+    fn outFlush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const h: *H2Conn = @alignCast(@fieldParentPtr("out", w));
+        h.conn.flushAll() catch return error.WriteFailed;
+    }
+
+    fn bodyStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const h: *H2Conn = @alignCast(@fieldParentPtr("body", r));
+        if (h.failure != null) return error.ReadFailed;
+        if (h.done) return error.EndOfStream;
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        if (dest.len == 0) return 0;
+        const n = h.session.readBody(h.sid.?, dest) catch |err| {
+            h.failure = mapError(h.conn, err);
+            return error.ReadFailed;
+        };
+        if (n == 0) {
+            h.done = true;
+            return error.EndOfStream;
+        }
+        w.advance(n);
+        return n;
+    }
+
+    fn uploadDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const h: *H2Conn = @alignCast(@fieldParentPtr("upload", w));
+        var total = w.end;
+        try send(h, w.buffered());
+        for (data[0 .. data.len - 1]) |d| {
+            try send(h, d);
+            total += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| {
+            try send(h, last);
+            total += last.len;
+        }
+        return w.consume(total);
+    }
+
+    fn uploadFlush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const h: *H2Conn = @alignCast(@fieldParentPtr("upload", w));
+        try send(h, w.buffered());
+        w.end = 0;
+    }
+
+    fn send(h: *H2Conn, bytes: []const u8) std.Io.Writer.Error!void {
+        if (bytes.len == 0) return;
+        h.session.sendData(h.sid.?, bytes, false) catch |err| {
+            h.failure = mapError(h.conn, err);
+            return error.WriteFailed;
+        };
+    }
+
+    /// The request head as h2 fields (see the struct doc).
+    const Rendered = struct {
+        arena: std.heap.ArenaAllocator,
+        target: []const u8,
+        authority: []const u8,
+        fields: []const http.Header,
+
+        fn init(conn: *Conn, method: http.Method, url: http.Url, headers: []const http.Header, plan: BodyPlan, strip_sensitive: bool, ask_gzip: bool) Error!Rendered {
+            const c = conn.client;
+            var r: Rendered = .{ .arena = .init(c.gpa), .target = "", .authority = "", .fields = &.{} };
+            errdefer r.arena.deinit();
+            const arena = r.arena.allocator();
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            // No proxy (an https origin is reached through a tunnel, if at
+            // all) and no `Connection: close` (h2 has no such field).
+            writeRequestHeadVia(&aw.writer, null, c.options.cookie_jar, method, url, headers, c.options.user_agent, plan, strip_sensitive, false, ask_gzip) catch
+                return error.OutOfMemory;
+            var lines = std.mem.splitSequence(u8, aw.written(), "\r\n");
+            // "METHOD target HTTP/1.1"
+            const request_line = lines.next().?;
+            const sp = std.mem.indexOfScalar(u8, request_line, ' ').?;
+            r.target = request_line[sp + 1 .. request_line.len - " HTTP/1.1".len];
+            var fields: std.ArrayList(http.Header) = .empty;
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                const colon = std.mem.indexOfScalar(u8, line, ':').?;
+                const name = line[0..colon];
+                const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                if (std.ascii.eqlIgnoreCase(name, "host")) {
+                    r.authority = value;
+                    continue;
+                }
+                try fields.append(arena, .{ .name = name, .value = value });
+            }
+            r.fields = fields.items;
+            return r;
+        }
+
+        fn deinit(r: *Rendered) void {
+            r.arena.deinit();
+        }
+    };
 };
 
 /// A connection's origin (`scheme`, `host`, `port`) — the pool's key.
@@ -1812,9 +2290,9 @@ const Pool = struct {
     /// (an ordinary checkout); without it (a stale-connection retry, which
     /// wants a fresh dial) an idle one at the cap is evicted instead, so
     /// the retry never waits on a connection only it could have used.
-    fn checkout(p: *Pool, scheme: http.Url.Scheme, host: []const u8, port: u16, now_ms: i64, take_idle: bool) error{OutOfMemory}!Checkout {
+    fn checkout(p: *Pool, scheme: http.Url.Scheme, host: []const u8, port: u16, now_ms: i64, take_idle: bool, h1_only: bool) error{OutOfMemory}!Checkout {
         if (take_idle and p.options.enabled) {
-            if (p.acquire(scheme, host, port, now_ms)) |conn| return .{ .idle = conn };
+            if (p.acquire(scheme, host, port, now_ms, h1_only)) |conn| return .{ .idle = conn };
         }
         const cap = p.options.max_conns_per_host;
         if (cap == 0) return .{ .dial = null };
@@ -1846,7 +2324,8 @@ const Pool = struct {
         }
         if (oldest) |idx| {
             const conn = p.idle.orderedRemove(idx).conn;
-            if (take_idle) return .{ .idle = conn };
+            // An h2 connection is no use to a request that needs HTTP/1.1.
+            if (take_idle and !(h1_only and conn.h2 != null)) return .{ .idle = conn };
             conn.holds_slot = false;
             return .{ .dial = conn };
         }
@@ -1889,7 +2368,7 @@ const Pool = struct {
     /// idle connections match the key, the most recently released one wins
     /// (keeps the warmest socket in play; older same-key idle connections
     /// simply age out via the timeout or a later cap eviction).
-    fn acquire(p: *Pool, scheme: http.Url.Scheme, host: []const u8, port: u16, now_ms: i64) ?*Conn {
+    fn acquire(p: *Pool, scheme: http.Url.Scheme, host: []const u8, port: u16, now_ms: i64, h1_only: bool) ?*Conn {
         var reap_buf: [max_reap_batch]*Conn = undefined;
         var reap_n: usize = 0;
         var found: ?*Conn = null;
@@ -1908,6 +2387,7 @@ const Pool = struct {
             }
             var match_idx: ?usize = null;
             for (p.idle.items, 0..) |it, idx| {
+                if (h1_only and it.conn.h2 != null) continue;
                 if (it.conn.origin.eql(scheme, host, port)) match_idx = idx;
             }
             if (match_idx) |idx| found = p.idle.orderedRemove(idx).conn;
@@ -2010,8 +2490,8 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 /// whether a subsequent write/read failure is eligible for the transparent
 /// one-shot retry (see `request`'s doc comment on that retry's safety
 /// boundary).
-fn acquireConn(c: *Client, url: http.Url, reused: *bool, deadline: ?std.Io.Clock.Timestamp) Error!*Conn {
-    return c.checkoutConn(url, reused, deadline, true, dialConn);
+fn acquireConn(c: *Client, url: http.Url, reused: *bool, deadline: ?std.Io.Clock.Timestamp, h1_only: bool) Error!*Conn {
+    return c.checkoutConn(url, reused, deadline, true, h1_only, dialConn);
 }
 
 /// Get a connection to `url`'s origin within `PoolOptions.max_conns_per_host`
@@ -2027,11 +2507,12 @@ fn checkoutConn(
     reused: *bool,
     deadline: ?std.Io.Clock.Timestamp,
     take_idle: bool,
-    comptime dial: fn (*Client, http.Url) Error!*Conn,
+    h1_only: bool,
+    comptime dial: fn (*Client, http.Url, bool) Error!*Conn,
 ) Error!*Conn {
     const p = &c.pool;
     while (true) {
-        switch (try p.checkout(url.scheme, url.host, url.port, c.nowMs(), take_idle)) {
+        switch (try p.checkout(url.scheme, url.host, url.port, c.nowMs(), take_idle, h1_only)) {
             .idle => |conn| {
                 reused.* = true;
                 return conn;
@@ -2040,7 +2521,7 @@ fn checkoutConn(
                 if (evicted) |e| e.destroy();
                 reused.* = false;
                 const counted = p.options.max_conns_per_host != 0;
-                const conn = dial(c, url) catch |err| {
+                const conn = dial(c, url, h1_only) catch |err| {
                     if (counted) {
                         var o: Origin = undefined;
                         o.set(url.scheme, url.port, url.host);
@@ -2078,7 +2559,7 @@ fn checkoutConn(
 /// plaintext connection, safe to hand back here.
 fn acquireConnPlain(c: *Client, url: http.Url, reused: *bool, deadline: ?std.Io.Clock.Timestamp) Error!*Conn {
     if (url.scheme != .http) return error.UnsupportedScheme;
-    return c.checkoutConn(url, reused, deadline, true, dialPlain);
+    return c.checkoutConn(url, reused, deadline, true, false, dialPlain);
 }
 
 /// Write the request head + optional in-memory body, flush, and read back
@@ -2107,10 +2588,14 @@ fn sendAndReadHead(
     // pooled connection worth retrying — with the cancelation already
     // spent, the retry then blocks a second time with nothing left to
     // interrupt it.
-    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
-    if (body) |b| conn.plainWriter().writeAll(b) catch return conn.writeFailure();
-    try conn.flushAll();
-    const head = try readResponseHead(conn);
+    const head = if (conn.h2 != null)
+        try c.options.http2.?.vt.exchange(conn, method, url, headers, plan, body, strip_sensitive, ask_gzip)
+    else h: {
+        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
+        if (body) |b| conn.plainWriter().writeAll(b) catch return conn.writeFailure();
+        try conn.flushAll();
+        break :h try readResponseHead(conn);
+    };
     // Every hop's answer, a redirect's included: a login that sets its
     // session cookie on the 302 is the common case.
     if (c.options.cookie_jar) |jar| jar.store(jar.ctx, url, &head);
@@ -2159,9 +2644,10 @@ fn nowMs(c: *Client) i64 {
 /// TLS support for those callers unchanged. That is also exactly why
 /// `requestPlain`/`requestStreamingPlain`/`putFilePlain` do NOT call this —
 /// see `dialPlain`'s doc comment for the reachability argument.
-fn dialConn(c: *Client, url: http.Url) Error!*Conn {
-    if (url.scheme == .https) return c.dialTls(url);
-    return c.dialPlain(url);
+/// `h1_only` (`needsHttp1`): offer no h2 by ALPN.
+fn dialConn(c: *Client, url: http.Url, h1_only: bool) Error!*Conn {
+    if (url.scheme == .https) return c.dialTls(url, h1_only);
+    return c.dialPlain(url, h1_only);
 }
 
 /// Dial a fresh plaintext (`http://`) connection: allocate the buffer slab,
@@ -2182,7 +2668,8 @@ fn dialConn(c: *Client, url: http.Url) Error!*Conn {
 /// TLS-side decl at all drops the reference. Mirrors `dialTls` structurally;
 /// keep the two in sync by hand if the shared parts (buffer accounting,
 /// `Conn` init, dial bookkeeping) change.
-fn dialPlain(c: *Client, url: http.Url) Error!*Conn {
+fn dialPlain(c: *Client, url: http.Url, h1_only: bool) Error!*Conn {
+    _ = h1_only; // plaintext is always HTTP/1.1 (h2c is `connectH2c`)
     const o = &c.options;
     const io = c.io;
 
@@ -2277,7 +2764,7 @@ fn writeConnect(w: *std.Io.Writer, url: http.Url, ep: client_proxy.Endpoint) std
 /// Never called except through `dialConn`'s dispatch — see that decl and
 /// `dialPlain`'s doc comment for why that indirection matters for the
 /// plaintext-only entry points.
-fn dialTls(c: *Client, url: http.Url) Error!*Conn {
+fn dialTls(c: *Client, url: http.Url, h1_only: bool) Error!*Conn {
     const o = &c.options;
     const io = c.io;
     if (o.tls.verify == .strict) try c.ensureCaBundle();
@@ -2370,6 +2857,7 @@ fn dialTls(c: *Client, url: http.Url) Error!*Conn {
         // Fine for HTTP: framing (Content-Length/chunked) detects
         // truncation at the layer above.
         .allow_truncation_attacks = true,
+        .alpn_protocols = if (o.http2 != null and !h1_only) &http.alpn_offer else &.{},
     }) catch |err| {
         conn.tls_client = null;
         return switch (err) {
@@ -2378,6 +2866,10 @@ fn dialTls(c: *Client, url: http.Url) Error!*Conn {
             else => error.TlsFailed,
         };
     };
+    // Only what we offered can come back (tlsclient refuses anything else).
+    if (conn.tls_client.?.alpn_protocol) |chosen| {
+        if (http.protocolFromAlpn(chosen) == .h2) try o.http2.?.vt.start(conn);
+    }
     return conn;
 }
 
@@ -2852,6 +3344,7 @@ fn isBodyDrained(conn: *const Conn) bool {
         .none => true,
         .limited => |r| r.remaining == 0 and !r.truncated,
         .chunked => |r| r.state == .done and r.fail_reason == null,
+        .h2 => conn.client.options.http2.?.vt.drained(conn),
         .until_close, .unset => false,
     };
 }
@@ -5447,9 +5940,9 @@ test "pool: max_idle_per_host and max_idle_total cap eviction (oldest first)" {
     {
         var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_idle_per_host = 2, .max_idle_total = 100 } });
         defer client.deinit();
-        const c0 = try client.dialConn(url);
-        const c1 = try client.dialConn(url);
-        const c2 = try client.dialConn(url);
+        const c0 = try client.dialConn(url, false);
+        const c1 = try client.dialConn(url, false);
+        const c2 = try client.dialConn(url, false);
         client.pool.release(c0, 100);
         client.pool.release(c1, 200);
         try testing.expectEqual(@as(usize, 2), client.poolIdleCount());
@@ -5461,9 +5954,9 @@ test "pool: max_idle_per_host and max_idle_total cap eviction (oldest first)" {
     {
         var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_idle_per_host = 100, .max_idle_total = 2 } });
         defer client.deinit();
-        const c0 = try client.dialConn(url);
-        const c1 = try client.dialConn(url);
-        const c2 = try client.dialConn(url);
+        const c0 = try client.dialConn(url, false);
+        const c1 = try client.dialConn(url, false);
+        const c2 = try client.dialConn(url, false);
         client.pool.release(c0, 100);
         client.pool.release(c1, 200);
         try testing.expectEqual(@as(usize, 2), client.poolIdleCount());
@@ -5489,7 +5982,7 @@ test "pool: idle_timeout_ms reaping via sweep" {
     var client = Client.init(io, testing.allocator, .{ .pool = .{ .idle_timeout_ms = 100 } });
     defer client.deinit();
 
-    const conn = try client.dialConn(url);
+    const conn = try client.dialConn(url, false);
     client.pool.release(conn, 0); // idle_since_ms = 0
     try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
 
@@ -5529,12 +6022,12 @@ test "pool: concurrent acquire/release from many threads is leak-free and race-f
             // `acquire` — so there is never a concurrent touch of the same
             // `*Conn` from two threads; only the pool's own bookkeeping is
             // contended, which is exactly what this test exercises.
-            var conn = c.dialConn(u) catch return;
+            var conn = c.dialConn(u, false) catch return;
             var now: i64 = @intCast(tid * 1_000_000);
             for (0..iters) |_| {
                 c.pool.release(conn, now);
                 now += 1;
-                conn = c.pool.acquire(u.scheme, u.host, u.port, now) orelse (c.dialConn(u) catch return);
+                conn = c.pool.acquire(u.scheme, u.host, u.port, now, false) orelse (c.dialConn(u, false) catch return);
             }
             conn.destroy();
         }
@@ -5575,26 +6068,26 @@ test "max_conns_per_host: at the cap a checkout waits, takes a pooled connection
     var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_conns_per_host = 2 } });
     defer client.deinit();
     var reused = false;
-    const a = try client.acquireConn(url, &reused, null);
-    const b = try client.acquireConn(url, &reused, null);
+    const a = try client.acquireConn(url, &reused, null, false);
+    const b = try client.acquireConn(url, &reused, null, false);
     try testing.expect(a.holds_slot and b.holds_slot);
     try testing.expectEqual(@as(usize, 2), client.dialCount());
 
     // Third: nothing idle, no slot — the budget runs out, nothing dialed.
-    try testing.expectError(error.Timeout, client.acquireConn(url, &reused, deadlineIn(io, 30)));
+    try testing.expectError(error.Timeout, client.acquireConn(url, &reused, deadlineIn(io, 30), false));
     try testing.expectEqual(@as(usize, 2), client.dialCount());
     try testing.expectEqual(@as(u32, 0), client.pool.waiters.load(.monotonic));
 
     // A connection back in the pool is the third request's.
     client.pool.release(a, client.nowMs());
-    const c = try client.acquireConn(url, &reused, deadlineIn(io, 1000));
+    const c = try client.acquireConn(url, &reused, deadlineIn(io, 1000), false);
     try testing.expect(reused and c == a);
     try testing.expectEqual(@as(usize, 2), client.dialCount());
 
     // Another origin (port) has its own cap.
     var listener2, const other = try capTestListener(io);
     defer listener2.deinit(io);
-    const d = try client.acquireConn(other, &reused, deadlineIn(io, 1000));
+    const d = try client.acquireConn(other, &reused, deadlineIn(io, 1000), false);
     d.destroy();
 
     b.destroy();
@@ -5612,14 +6105,14 @@ test "max_conns_per_host: a parked waiter dials when a connection closes" {
     var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false, .max_conns_per_host = 1 } });
     defer client.deinit();
     var reused = false;
-    const a = try client.acquireConn(url, &reused, null);
+    const a = try client.acquireConn(url, &reused, null, false);
 
     const Waiter = struct {
         got: ?*Conn = null,
         err: ?Error = null,
         fn run(w: *@This(), cl: *Client, u: http.Url) void {
             var r = false;
-            w.got = cl.acquireConn(u, &r, null) catch |e| {
+            w.got = cl.acquireConn(u, &r, null, false) catch |e| {
                 w.err = e;
                 return;
             };
@@ -5652,16 +6145,16 @@ test "max_conns_per_host: a fresh redial at the cap evicts the origin's idle con
     var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_conns_per_host = 2 } });
     defer client.deinit();
     var reused = false;
-    const a = try client.acquireConn(url, &reused, null);
-    const b = try client.acquireConn(url, &reused, null);
+    const a = try client.acquireConn(url, &reused, null, false);
+    const b = try client.acquireConn(url, &reused, null, false);
     client.pool.release(b, client.nowMs());
     // `a` went stale: the retry destroys it and wants a FRESH dial; even
     // with `b` idle that must not wait (and must not hand `b` out).
     a.destroy();
-    const a2 = try client.checkoutConn(url, &reused, deadlineIn(io, 1000), false, dialConn);
+    const a2 = try client.checkoutConn(url, &reused, deadlineIn(io, 1000), false, false, dialConn);
     try testing.expect(!reused and a2 != b);
     // Now at the cap with `b` idle: the fresh dial takes over its slot.
-    const c = try client.checkoutConn(url, &reused, deadlineIn(io, 1000), false, dialConn);
+    const c = try client.checkoutConn(url, &reused, deadlineIn(io, 1000), false, false, dialConn);
     try testing.expect(!reused);
     try testing.expectEqual(@as(usize, 0), client.poolIdleCount());
     try testing.expectEqual(@as(usize, 4), client.dialCount());
@@ -5682,7 +6175,7 @@ test "max_conns_per_host: a failed dial gives its slot back" {
     var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_conns_per_host = 1 } });
     defer client.deinit();
     var reused = false;
-    for (0..3) |_| try testing.expectError(error.ConnectFailed, client.acquireConn(url, &reused, deadlineIn(io, 1000)));
+    for (0..3) |_| try testing.expectError(error.ConnectFailed, client.acquireConn(url, &reused, deadlineIn(io, 1000), false));
     try testing.expectEqual(@as(usize, 0), client.pool.slots.items.len);
 }
 
@@ -6703,4 +7196,418 @@ fn fuzzGunzip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     if (len == 0) return GunzipMark.mark(.empty);
     if (std.mem.count(u8, input[0..len], "\x1f\x8b\x08") > 1 and got > 0) GunzipMark.mark(.decoded_multi);
     GunzipMark.mark(.decoded);
+}
+
+// ── tests (Options.http2: the h2 exchange, over h2c prior knowledge) ────────
+//
+// No TLS server exists in this module, so ALPN itself is exercised by the
+// interop lane (`tools/interop.zig`, a Go TLS server). Here the h2 exchange
+// runs over a cleartext connection that `primeH2c` started an h2 session on
+// — what `dialTls` does when ALPN picks h2 — and parked in the pool, where
+// `request` finds it like any idle connection.
+
+/// Dial `url`'s origin in the clear, start an h2 session on it and park it
+/// in the pool.
+fn primeH2c(client: *Client, url_text: []const u8) !void {
+    const url = try http.Url.parse(url_text);
+    const conn = try client.dialPlain(url, false);
+    errdefer conn.destroy();
+    try h2glue.start(conn);
+    client.pool.release(conn, client.nowMs());
+}
+
+/// The gzip body `/gz` answers with (set by the test before serving).
+var h2_test_gz: []const u8 = "";
+
+fn h2ClientHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    if (std.mem.eql(u8, req.path, "/hello")) {
+        try rw.setHeader("Content-Type", "text/plain");
+        try rw.setHeader("Set-Cookie", "sid=h2; Path=/");
+        try rw.writeAll("hello h2");
+    } else if (std.mem.eql(u8, req.path, "/echo")) {
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        _ = try req.reader().streamRemaining(&aw.writer);
+        try rw.writeAll(aw.written());
+    } else if (std.mem.eql(u8, req.path, "/fields")) {
+        // What arrived, one field per line, for the request-side checks.
+        var it = req.iterateHeaders();
+        while (it.next()) |f| try rw.writer().print("{s}={s}\n", .{ f.name, f.value });
+    } else if (std.mem.eql(u8, req.path, "/trailers")) {
+        try rw.declareTrailer("x-checksum");
+        try rw.writeAll("body before trailers");
+        try rw.setTrailer("x-checksum", "c0ffee");
+    } else if (std.mem.eql(u8, req.path, "/gz")) {
+        try rw.setHeader("Content-Encoding", "gzip");
+        try rw.writeAll(h2_test_gz);
+    } else if (std.mem.eql(u8, req.path, "/redirect")) {
+        rw.setStatus(302);
+        try rw.setHeader("Location", "/hello");
+        try rw.writeAll("moved");
+    } else if (std.mem.eql(u8, req.path, "/empty")) {
+        rw.setStatus(204);
+    } else if (std.mem.eql(u8, req.path, "/huge")) {
+        var block: [1024]u8 = undefined;
+        @memset(&block, 'h');
+        for (0..huge_blocks) |_| try rw.writeAll(&block);
+    } else {
+        rw.setStatus(404);
+        try rw.writeAll("nope");
+    }
+}
+
+const H2ClientLoopback = struct {
+    server: *Server,
+    thread: std.Thread,
+    url_buf: [64]u8,
+
+    fn start(lb: *H2ClientLoopback, io: std.Io) !void {
+        const server = try testing.allocator.create(Server);
+        errdefer testing.allocator.destroy(server);
+        server.* = Server.init(io, testing.allocator, .{ .handler = h2ClientHandler, .enable_h2c = true });
+        server.bind() catch |err| {
+            server.deinit();
+            return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        };
+        errdefer server.deinit();
+        lb.server = server;
+        lb.thread = try std.Thread.spawn(.{}, h2ServeWrap, .{server});
+    }
+
+    fn url(lb: *H2ClientLoopback, path: []const u8) []const u8 {
+        return std.fmt.bufPrint(&lb.url_buf, "http://127.0.0.1:{d}{s}", .{ lb.server.boundAddress().getPort(), path }) catch unreachable;
+    }
+
+    fn finish(lb: *H2ClientLoopback) void {
+        lb.server.shutdown();
+        lb.thread.join();
+        lb.server.deinit();
+        testing.allocator.destroy(lb.server);
+    }
+};
+
+test "http2: request over an h2 connection — proto, head, body, cookies, one pooled connection" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var lb: H2ClientLoopback = undefined;
+    try lb.start(io);
+    defer lb.finish();
+
+    var echo: EchoJar = .{};
+    var client = Client.init(io, gpa, .{ .http2 = .alpn(), .total_timeout_ms = 5000, .cookie_jar = echo.jar() });
+    defer client.deinit();
+    try primeH2c(&client, lb.url("/"));
+
+    {
+        var res = try client.request(.get, lb.url("/hello"), .{});
+        defer res.deinit();
+        try testing.expectEqual(Proto.http2, res.proto());
+        try testing.expectEqualStrings("HTTP/2.0", res.proto().text());
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try testing.expectEqualStrings("OK", res.reason);
+        try testing.expectEqualStrings("text/plain", res.header("Content-Type").?);
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("hello h2", body);
+    }
+    { // The cookie the h2 answer set goes out on the next request, and the
+        // fields arrive as the h1 head writer would have sent them.
+        var res = try client.request(.get, lb.url("/fields"), .{ .headers = &.{.{ .name = "X-Custom", .value = "v" }} });
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 4096);
+        defer gpa.free(body);
+        try testing.expect(std.mem.indexOf(u8, body, "cookie=sid=h2; Path=/\n") != null);
+        try testing.expect(std.mem.indexOf(u8, body, "x-custom=v\n") != null);
+        try testing.expect(std.mem.indexOf(u8, body, "user-agent=zig-libs-http/0.1\n") != null);
+        try testing.expect(std.mem.indexOf(u8, body, "accept-encoding=identity\n") != null);
+        try testing.expect(std.mem.indexOf(u8, body, "connection") == null);
+        // `:authority`, from the Host the h1 writer would have sent.
+        try testing.expect(std.mem.indexOf(u8, body, "host=127.0.0.1:") != null);
+    }
+    { // In-memory body.
+        var res = try client.request(.post, lb.url("/echo"), .{ .body = "posted over h2" });
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("posted over h2", body);
+    }
+    { // HEAD and 204: no body.
+        var res = try client.request(.head, lb.url("/hello"), .{});
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try testing.expectEqual(@as(usize, 0), try res.reader().discardRemaining());
+    }
+    {
+        var res = try client.request(.get, lb.url("/empty"), .{});
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 204), res.status);
+        try testing.expectEqual(@as(usize, 0), try res.reader().discardRemaining());
+    }
+    // Every exchange ran on the primed connection: no dial at all.
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+}
+
+test "http2: trailers, a redirect and an unread body keep the one connection" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var lb: H2ClientLoopback = undefined;
+    try lb.start(io);
+    defer lb.finish();
+
+    var client = Client.init(io, gpa, .{ .http2 = .alpn(), .total_timeout_ms = 5000 });
+    defer client.deinit();
+    try primeH2c(&client, lb.url("/"));
+
+    {
+        var res = try client.request(.get, lb.url("/trailers"), .{});
+        defer res.deinit();
+        // Not known before the end of the body.
+        try testing.expectEqual(@as(?[]const u8, null), res.trailer("x-checksum"));
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("body before trailers", body);
+        try testing.expectEqualStrings("c0ffee", res.trailer("X-Checksum").?);
+    }
+    { // The 302's stream is reset, its connection carries the next hop.
+        var res = try client.request(.get, lb.url("/redirect"), .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("hello h2", body);
+    }
+    { // 200 KiB, past the 64 KiB window, abandoned after one read: the
+        // stream is reset and the connection still serves.
+        var res = try client.request(.get, lb.url("/huge"), .{});
+        var one: [10]u8 = undefined;
+        try res.reader().readSliceAll(&one);
+        res.deinit();
+    }
+    {
+        var res = try client.request(.get, lb.url("/hello"), .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("hello h2", body);
+    }
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+}
+
+test "http2: gzip decoding and a streamed upload" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var plain_buf: [50_000]u8 = undefined;
+    const plain = testPlain(&plain_buf);
+    const gz = try testGzip(gpa, plain, 6);
+    defer gpa.free(gz);
+    h2_test_gz = gz;
+    defer h2_test_gz = "";
+
+    var lb: H2ClientLoopback = undefined;
+    try lb.start(io);
+    defer lb.finish();
+    var client = Client.init(io, gpa, .{ .http2 = .alpn(), .decompress = .gzip(1 << 20), .total_timeout_ms = 5000 });
+    defer client.deinit();
+    try primeH2c(&client, lb.url("/"));
+
+    {
+        var res = try client.request(.get, lb.url("/gz"), .{});
+        defer res.deinit();
+        try testing.expectEqual(Proto.http2, res.proto());
+        try testing.expect(res.uncompressed);
+        try testing.expectEqual(@as(?[]const u8, null), res.header("content-encoding"));
+        const body = try res.readAllAlloc(gpa, 1 << 20);
+        defer gpa.free(body);
+        try testing.expectEqualSlices(u8, plain, body);
+    }
+    // Unknown length, a declared one, and small writes the writer buffers.
+    for ([_]?u64{ null, plain.len, null }, [_]usize{ 7000, 7000, 100 }) |length, piece| {
+        var up = try client.requestStreaming(.post, lb.url("/echo"), .{}, length);
+        var at: usize = 0;
+        while (at < plain.len) : (at += piece) try up.writer().writeAll(plain[at..@min(plain.len, at + piece)]);
+        var res = try up.finish();
+        defer res.deinit();
+        try testing.expectEqual(Proto.http2, res.proto());
+        const body = try res.readAllAlloc(gpa, 1 << 20);
+        defer gpa.free(body);
+        try testing.expectEqualSlices(u8, plain, body);
+    }
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+}
+
+test "http2: an upgrade request never takes an h2 connection" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var lb: H2ClientLoopback = undefined;
+    try lb.start(io);
+    defer lb.finish();
+    var client = Client.init(io, gpa, .{ .http2 = .alpn(), .total_timeout_ms = 5000 });
+    defer client.deinit();
+    try primeH2c(&client, lb.url("/"));
+
+    var res = try client.request(.get, lb.url("/hello"), .{ .headers = &.{
+        .{ .name = "Connection", .value = "Upgrade" },
+        .{ .name = "Upgrade", .value = "websocket" },
+    } });
+    defer res.deinit();
+    try testing.expectEqual(Proto.http1_1, res.proto());
+    // A second connection, dialed for HTTP/1.1; the h2 one is still idle.
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+}
+
+test "http2: at max_conns_per_host, a request that needs HTTP/1.1 evicts the idle h2 connection" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var lb: H2ClientLoopback = undefined;
+    try lb.start(io);
+    defer lb.finish();
+    var client = Client.init(io, gpa, .{ .http2 = .alpn(), .total_timeout_ms = 5000, .pool = .{ .max_conns_per_host = 1 } });
+    defer client.deinit();
+    // The origin's one slot: an h2 connection, idle in the pool.
+    const url = try http.Url.parse(lb.url("/"));
+    var reused = false;
+    const conn = try client.checkoutConn(url, &reused, null, true, false, dialPlain);
+    try h2glue.start(conn);
+    client.pool.release(conn, client.nowMs());
+
+    var res = try client.request(.get, lb.url("/hello"), .{ .headers = &.{
+        .{ .name = "Connection", .value = "Upgrade" },
+        .{ .name = "Upgrade", .value = "websocket" },
+    } });
+    defer res.deinit();
+    try testing.expectEqual(Proto.http1_1, res.proto());
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+    try testing.expectEqual(@as(usize, 0), client.poolIdleCount());
+}
+
+test "http2: a session that saw GOAWAY or broke is not reused" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var lb: H2ClientLoopback = undefined;
+    try lb.start(io);
+    defer lb.finish();
+    var client = Client.init(io, gpa, .{ .http2 = .alpn() });
+    defer client.deinit();
+    const url = try http.Url.parse(lb.url("/"));
+    for (0..3) |case| {
+        const conn = try client.dialPlain(url, false);
+        defer conn.destroy();
+        try h2glue.start(conn);
+        const s = &conn.h2.?.session;
+        switch (case) {
+            0 => {},
+            1 => s.goaway = .{ .last_stream_id = 0, .code = .no_error },
+            else => s.broken = error.ProtocolError,
+        }
+        try testing.expectEqual(case == 0, h2glue.release(conn));
+    }
+}
+
+test "http2: a response field h1 could not carry is a malformed response" {
+    var buf: [256]u8 = undefined;
+    const ok = try h2glue.headFromFields(204, &.{
+        .{ .name = ":status", .value = "204" },
+        .{ .name = "content-length", .value = "0" },
+        .{ .name = "x-a", .value = "1" },
+    }, &buf);
+    try testing.expectEqual(@as(u16, 204), ok.status);
+    try testing.expectEqualStrings("No Content", ok.reason);
+    try testing.expectEqual(@as(?u64, 0), ok.content_length);
+    try testing.expectEqualStrings("content-length: 0\r\nx-a: 1\r\n", ok.header_block);
+    for ([_]hpack.Field{
+        .{ .name = "Content-Type", .value = "text/plain" }, // uppercase (RFC 9113 §8.2.1)
+        .{ .name = "bad name", .value = "x" },
+        .{ .name = "", .value = "x" },
+        .{ .name = "x-a", .value = "1\r\nx-injected: 2" },
+    }) |f| {
+        try testing.expectError(error.MalformedResponse, h2glue.headFromFields(200, &.{f}, &buf));
+    }
+    try testing.expectError(error.HeadTooLarge, h2glue.headFromFields(200, &.{.{ .name = "x-a", .value = "1" }}, buf[0..4]));
+}
+
+// ── fuzz: an h2 response head as the h1 block the client reads ──────────────
+//
+// `headFromFields` copies field names and values a server chose into an h1
+// header block. Beyond "no panic": a block it accepts reads back as exactly
+// the non-pseudo fields, in order — no field split, merged or injected (a CR
+// or LF smuggled in a value would add a line) — and a refusal is typed.
+
+const H2HeadMark = fz.Marker(enum { ok, malformed, too_large });
+
+const h2_head_seeds = [_][]const u8{
+    testkit.fuzz.seed("content-type\x00text/plain\x00set-cookie\x00a=1\x00:status\x00200"),
+    testkit.fuzz.seed("content-length\x0012\x00content-length\x0013"),
+    testkit.fuzz.seed("Bad\x00x"),
+    testkit.fuzz.seed("x-a\x00v\r\nx-b: injected"),
+    testkit.fuzz.seed("x\x00  padded  "),
+    testkit.fuzz.seed(""),
+};
+
+test "fuzz driver: HTTP_FUZZ (client h2 head)" {
+    try fz.fuzz_driver.run(fuzzH2Head, .{ .prefix = "HTTP_FUZZ", .name = "http-client-h2-head" });
+}
+
+test "fuzz harness: client h2 head, 300 seeds, reaches every outcome" {
+    try H2HeadMark.reach(fuzzH2Head, "http-client-h2-head", 300);
+}
+
+test "fuzz: an h2 response head becomes the same fields in the h1 block, or a typed refusal" {
+    try testing.fuzz({}, fuzzH2HeadSmith, .{ .corpus = &h2_head_seeds });
+}
+
+fn fuzzH2HeadSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzH2Head, smith, script[0..n]);
+}
+
+fn fuzzH2Head(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var input: [256]u8 = undefined;
+    const len: usize = fz.drawInput(S, src, &input, &h2_head_seeds);
+    // NUL-separated name, value, name, value, …
+    var fields_buf: [16]hpack.Field = undefined;
+    var n: usize = 0;
+    var parts = std.mem.splitScalar(u8, input[0..len], 0);
+    while (n < fields_buf.len) {
+        const name = parts.next() orelse break;
+        fields_buf[n] = .{ .name = name, .value = parts.next() orelse "" };
+        n += 1;
+    }
+    const fields = fields_buf[0..n];
+    var buf: [128]u8 = undefined;
+    const block_len = src.valueRangeAtMost(u8, 0, buf.len);
+    const head = h2glue.headFromFields(200, fields, buf[0..block_len]) catch |err| switch (err) {
+        error.MalformedResponse => {
+            for (fields) |f| {
+                if (f.name.len != 0 and f.name[0] == ':') continue;
+                if (!h2glue.isLowerToken(f.name) or !h1.isValidFieldValue(f.value)) return H2HeadMark.mark(.malformed);
+            }
+            return error.RefusedValidFields;
+        },
+        error.HeadTooLarge => return H2HeadMark.mark(.too_large),
+    };
+    var it = head.iterate();
+    for (fields) |f| {
+        if (f.name.len != 0 and f.name[0] == ':') continue;
+        const got = it.next() orelse return error.FieldLost;
+        if (!std.mem.eql(u8, got.name, f.name)) return error.NameChanged;
+        if (!std.mem.eql(u8, got.value, std.mem.trim(u8, f.value, " \t"))) return error.ValueChanged;
+    }
+    if (it.next() != null) return error.FieldInjected;
+    H2HeadMark.mark(.ok);
 }

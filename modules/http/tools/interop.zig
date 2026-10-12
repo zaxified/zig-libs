@@ -27,6 +27,13 @@
 //!   zig build interop-http -- --phase problem   # CPython on problem+json (or `sse`:
 //!                                               # sseclient-py + httpx-sse); see oracles.zig
 //!   zig build interop-http -- --phase sse --write   # re-take the frozen vectors
+//!   zig build interop-http -- --phase alpn      # Client over TLS + ALPN vs Go
+//!
+//! The `alpn` phase (in every full run) puts `Client` with `Options.http2`
+//! against Go's net/http over real TLS (`go_oracle -h2tls`, needs `go`): ALPN
+//! must pick h2 where the server offers it and HTTP/1.1 where it does not,
+//! and Go's server must see our request exactly as it sees Go's own
+//! Transport's, `User-Agent` aside.
 
 const std = @import("std");
 const http = @import("http");
@@ -148,7 +155,7 @@ fn report(phase: []const u8, v: Verdict, allowed: []const []const u8) bool {
 }
 
 fn usage() u8 {
-    std.debug.print("usage: interop-http [--h2spec PATH] [--only SPEC] [--phase h2spec|go|problem|sse] [--write]\n", .{});
+    std.debug.print("usage: interop-http [--h2spec PATH] [--only SPEC] [--phase h2spec|go|problem|sse|alpn] [--write]\n", .{});
     return 2;
 }
 
@@ -209,7 +216,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     var h2spec: []const u8 = "h2spec";
     var only: ?[]const u8 = null;
-    var phase: enum { all, h2spec, go, problem, sse } = .all;
+    var phase: enum { all, h2spec, go, problem, sse, alpn } = .all;
     var write = false;
     var args = init.args.iterate();
     _ = args.skip();
@@ -238,8 +245,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try env.put("GOTOOLCHAIN", "go1.26.0");
     if (phase == .problem) return if (try oracles.problemPhase(io, gpa, arena, &env, write)) 0 else 1;
     if (phase == .sse) return if (try oracles.ssePhase(io, gpa, arena, &env, write)) 0 else 1;
+    if (phase == .alpn) return if (try alpnPhase(io, gpa, arena, &env)) 0 else 1;
     const go_ok = phase == .h2spec or try checkGoOracle(io, arena, &env);
     if (phase == .go) return if (go_ok) 0 else 1;
+    const alpn_ok = phase == .h2spec or try alpnPhase(io, gpa, arena, &env);
     const py_ok = phase == .h2spec or (try oracles.problemPhase(io, gpa, arena, &env, false) and
         try oracles.ssePhase(io, gpa, arena, &env, false));
 
@@ -276,5 +285,142 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     const a = report("shared h1/h2c port", shared, &.{shared_port_expected});
     const b = report("h2 only (serveStream)", h2only, &.{});
-    return if (a and b and go_ok and py_ok) 0 else 1;
+    return if (a and b and go_ok and py_ok and alpn_ok) 0 else 1;
+}
+
+// ── phase alpn: Client + Options.http2 against Go over TLS ──────────────────
+
+const Client = http.Client;
+
+fn alpnPhase(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, env: *const std.process.Environ.Map) !bool {
+    const port_file = scratch ++ "/h2tls-ports";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteFile(io, port_file) catch {};
+    var child = std.process.spawn(io, .{
+        // `-h2tls` is relative to the generator's directory, four levels down.
+        .argv = &.{ "go", "run", ".", "-h2tls", "../../../../" ++ port_file },
+        .cwd = .{ .path = go_oracle_dir },
+        .environ_map = env,
+        .stdin = .pipe,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |e| {
+        std.debug.print("could not spawn go ({t}) -- the peer is required, not optional\n", .{e});
+        return error.NoGo;
+    };
+    defer {
+        // EOF on its stdin ends the peer (and with it `go run`).
+        if (child.stdin) |f| f.close(io);
+        child.stdin = null;
+        _ = child.wait(io) catch {};
+    }
+    // `go run` builds first: allow two minutes.
+    const ports = for (0..1200) |_| {
+        if (cwd.readFileAlloc(io, port_file, arena, .limited(64))) |t| {
+            if (std.mem.endsWith(u8, t, "\n")) break t;
+        } else |_| {}
+        try io.sleep(.fromMilliseconds(100), .awake);
+    } else {
+        std.debug.print("alpn: the Go peer never wrote {s} -- NOT OK\n", .{port_file});
+        return false;
+    };
+    var it = std.mem.tokenizeAny(u8, ports, " =\n");
+    _ = it.next(); // "h2"
+    const h2_port = it.next() orelse return error.BadPortFile;
+    _ = it.next(); // "h1"
+    const h1_port = it.next() orelse return error.BadPortFile;
+
+    var client = Client.init(io, gpa, .{
+        .http2 = .alpn(),
+        .decompress = .gzip(1 << 20),
+        .tls = .{ .verify = .insecure_no_verify }, // httptest's self-signed certificate
+        .total_timeout_ms = 10_000,
+    });
+    defer client.deinit();
+    var ok = true;
+    const custom: []const http.Header = &.{.{ .name = "X-Custom", .value = "v" }};
+
+    // ALPN picks h2: the request Go's server saw, beside Go's own.
+    const ours = try fetch(&client, arena, h2_port, "/fields", custom, .http2, &ok);
+    const go = try fetch(&client, arena, h2_port, "/go", &.{}, .http2, &ok);
+    ok = sameFields("h2", ours, go, "proto: HTTP/2.0") and ok;
+    {
+        const url = try std.fmt.allocPrint(arena, "https://127.0.0.1:{s}/trailers", .{h2_port});
+        var res = try client.request(.get, url, .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(arena, 1 << 16);
+        ok = check("h2 trailers", std.mem.eql(u8, body, "body before trailers") and
+            std.mem.eql(u8, res.trailer("X-Checksum") orelse "", "c0ffee")) and ok;
+    }
+    {
+        const url = try std.fmt.allocPrint(arena, "https://127.0.0.1:{s}/gz", .{h2_port});
+        var res = try client.request(.get, url, .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(arena, 1 << 16);
+        ok = check("h2 gzip", res.uncompressed and std.mem.eql(u8, body, "gzip over h2, decoded by the client\n")) and ok;
+    }
+    const redirected = try fetch(&client, arena, h2_port, "/redirect", &.{}, .http2, &ok);
+    ok = check("h2 redirect", std.mem.startsWith(u8, redirected, "proto: HTTP/2.0\n")) and ok;
+    {
+        const url = try std.fmt.allocPrint(arena, "https://127.0.0.1:{s}/echo", .{h2_port});
+        var up = try client.requestStreaming(.post, url, .{}, null);
+        for (0..64) |_| try up.writer().writeAll("0123456789abcdef" ** 64);
+        var res = try up.finish();
+        defer res.deinit();
+        const body = try res.readAllAlloc(arena, 1 << 20);
+        ok = check("h2 streamed upload", res.proto() == .http2 and body.len == 64 * 1024) and ok;
+    }
+    ok = check("h2: one connection for all of it", client.dialCount() == 1) and ok;
+
+    // A request that asks to upgrade stays on HTTP/1.1, even here.
+    _ = try fetch(&client, arena, h2_port, "/fields", &.{
+        .{ .name = "Connection", .value = "Upgrade" },
+        .{ .name = "Upgrade", .value = "websocket" },
+    }, .http1_1, &ok);
+
+    // No h2 on offer: HTTP/1.1, the same request for both clients.
+    const ours1 = try fetch(&client, arena, h1_port, "/fields", custom, .http1_1, &ok);
+    const go1 = try fetch(&client, arena, h1_port, "/go", &.{}, .http1_1, &ok);
+    ok = sameFields("h1", ours1, go1, "proto: HTTP/1.1") and ok;
+
+    std.debug.print("alpn: Client over TLS against Go net/http -- {s}\n", .{if (ok) "OK" else "NOT OK"});
+    return ok;
+}
+
+fn fetch(client: *Client, arena: std.mem.Allocator, port: []const u8, path: []const u8, headers: []const http.Header, want: Client.Proto, ok: *bool) ![]const u8 {
+    const url = try std.fmt.allocPrint(arena, "https://127.0.0.1:{s}{s}", .{ port, path });
+    var res = try client.request(.get, url, .{ .headers = headers });
+    defer res.deinit();
+    const body = try res.readAllAlloc(arena, 1 << 16);
+    if (res.proto() != want or res.status != 200) {
+        std.debug.print("  alpn FAIL {s}: {d} over {s}, want 200 over {s}\n", .{ url, res.status, res.proto().text(), want.text() });
+        ok.* = false;
+    }
+    return body;
+}
+
+fn check(what: []const u8, good: bool) bool {
+    if (!good) std.debug.print("  alpn FAIL {s}\n", .{what});
+    return good;
+}
+
+/// Go's server's view of our request and of Go's: the same lines, `User-Agent`
+/// aside, and the protocol line `proto`.
+fn sameFields(label: []const u8, ours: []const u8, go: []const u8, proto: []const u8) bool {
+    var good = std.mem.startsWith(u8, ours, proto) and std.mem.startsWith(u8, go, proto);
+    var a = std.mem.splitScalar(u8, ours, '\n');
+    var b = std.mem.splitScalar(u8, go, '\n');
+    while (true) {
+        var la = a.next();
+        var lb = b.next();
+        while (la != null and std.mem.startsWith(u8, la.?, "user-agent: ")) la = a.next();
+        while (lb != null and std.mem.startsWith(u8, lb.?, "user-agent: ")) lb = b.next();
+        if (la == null and lb == null) break;
+        if (la == null or lb == null or !std.mem.eql(u8, la.?, lb.?)) {
+            good = false;
+            break;
+        }
+    }
+    if (!good) std.debug.print("  alpn FAIL {s}: Go's server saw\n--- ours\n{s}--- Go's\n{s}", .{ label, ours, go });
+    return good;
 }
