@@ -101,7 +101,7 @@ producing each response. The CRC-16 is pinned to the canonical
 `"123456789" -> 0x4B37` check value plus classic example frames. A scripted
 mock transport exercises TCP + RTU round trips, the exception path, quantity
 limits, CRC corruption, MBAP mismatches, and a garbage-frame no-panic sweep;
-two 20 000-iteration fuzz loops hammer the server with random PDUs and ADUs.
+fuzz harnesses (random PDUs/ADUs, plus a deterministic `MODBUS_FUZZ` driver) hammer the server and the ADU decoder.
 
 `src/goldens.zig` holds frames **captured from a live pymodbus 3.14.0
 session** in three directions: pymodbus's `ModbusTcpClient` driving this

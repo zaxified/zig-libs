@@ -353,7 +353,7 @@ one-byte-at-a-time feed where the layer is incremental:
 | more capability lines than the limit | `error.TooManyCapabilities` |
 | an empty multipart / too-deep nesting / too many recipients | `EmptyMultipart` / `DepthExceeded` / `TooManyRecipients` |
 
-Seven `std.testing.fuzz` targets: the reply parser (both bare-LF policies), the capability
+`std.testing.fuzz` targets (also run by the deterministic `SMTP_FUZZ` driver, which adds the `Client` against a scripted server): the reply parser (both bare-LF policies), the capability
 parser, the command builders (asserting no output ever contains a bare CR/LF and no line
 exceeds 512), the dot-stuffer/un-stuffer (asserting `unstuff(stuff(x))` equals an
 *independently computed* canonicalisation of `x`, so the round-trip is not the encoder

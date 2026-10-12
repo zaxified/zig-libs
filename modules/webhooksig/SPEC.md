@@ -45,8 +45,9 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 ## Design & invariants
 Constant-time compare of the computed vs received signature (`std.crypto.timing_safe.eql`) — never a
 byte-wise early-exit compare. Key rotation: verification accepts any of a set of active secrets
-(rotate without downtime); signing uses the primary. HMAC via `std.crypto.auth.hmac` (SHA-256);
-allocation-free; the signature is always **lowercase hex** — no base64 variant is implemented. The
+(rotate without downtime); signing uses the primary. HMAC via `std.crypto.auth.hmac` (SHA-256 by default; `Format` also takes SHA-1/SHA-512 and hex or
+base64 encoding, see Schemes below);
+allocation-free; the default signature is **lowercase hex**. The
 header name and the value prefix in front of the hex are both configurable, which covers GitHub's
 own scheme (`X-Hub-Signature-256: sha256=<hex>`) exactly. The middleware reads the
 raw body **before** any parsing so the MAC covers exactly the bytes received. Immutable after init
@@ -96,8 +97,8 @@ not zeroize it.
 ## Verification
 An HMAC-SHA256 known-answer check, sign→verify round-trip and GitHub-style
 (`sha256=<hex>`) header-format parse/reject tests, constant-time-compare accept/reject, key-rotation
-(old+new secret) acceptance, tamper negatives (wrong secret, mutated body → reject). There is no
-Stripe-format test — no Stripe parsing exists to test (see above). Run: `zig build test-webhooksig`.
+(old+new secret) acceptance, tamper negatives (wrong secret, mutated body → reject). Stripe, Slack and Standard Webhooks are covered
+by the 2026-10-04 section below. Run: `zig build test-webhooksig`.
 
 **2026-10-04 (mvp → core).** Expected values from outside the module: the Standard Webhooks
 reference libraries' own sign test (`libraries/go/webhook_test.go` `TestWebhookSign`:

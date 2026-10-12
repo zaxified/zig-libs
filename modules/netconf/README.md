@@ -208,7 +208,7 @@ correlation errors, so one `catch` covers a call. The interesting ones are
 ## Verify
 
 ```sh
-zig build test-netconf                 # unit/golden/fuzz; the live tests print SKIPPED and pass
+zig build test-netconf                 # unit/golden/fuzz; the live tests are counted skips without a server
 zig build test-netconf --release=fast  # same, optimized
 
 # With a real NETCONF server reachable over SSH:

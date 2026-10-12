@@ -46,8 +46,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `NOTICE`) — the construction here is assembled from the public
   scriptless-scripts literature and cross-validated against secp256kfun's
   `schnorr_fun::adaptor` Rust module (a design reference, not ported
-  source). The curve group is `std.crypto.ecc.Secp256k1` (same as
-  `bip340`); tagged hashing, x-only key/signature handling, and — the
+  source). The curve group is the `k256` module's `Secp256k1` (byte-exact to
+  `std.crypto.ecc.Secp256k1`; same as `bip340`); tagged hashing, x-only key/signature handling, and — the
   scheme's headline property — the FINAL challenge tag are all reused
   from the sibling `bip340` module rather than re-derived.
 - **The four algorithms** (standard scriptless-scripts terminology,

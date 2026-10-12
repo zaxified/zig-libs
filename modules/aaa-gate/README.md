@@ -212,7 +212,7 @@ header values out of your request type remains yours.
   are not audited. Entry slices borrow request-scoped
   memory — copy what you keep. Entry shape:
   `{ method, path, target, detail, authed, status, suppressed }`.
-- **Denied-request throttle** (`AuditThrottle`, per-key):
+- **Denied-request throttle** (internal `Throttle`, per-key):
   within `throttle_window_ms` (default **5 s**; `0` disables) repeated
   401s from one client key are coalesced — the hook stays quiet and the
   suppressed count is **folded into the next admitted entry**

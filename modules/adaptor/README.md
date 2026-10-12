@@ -64,7 +64,8 @@ on its own — see `SPEC.md`'s "Parity" section for why.
 ## Import graph
 
 ```
-adaptor → bip340 → std.crypto.ecc.Secp256k1 / std.crypto.hash.sha2.Sha256
+adaptor → bip340 → k256 (Secp256k1 group, byte-exact to std.crypto.ecc.Secp256k1) / std.crypto.hash.sha2.Sha256
+adaptor → k256   (point arithmetic and scalar field)
 ```
 
 ## Verify

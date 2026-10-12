@@ -267,7 +267,7 @@ are pinned in `scripts/checks/ctgrind-expected.tsv`.
 | target | tainted | in-file contexts | read at |
 |---|---|---|---|
 | `extract` | `msk` | 1 | `toAffine` of `d_id` (the output) — 2026-10-02; the old 3 held two ff `toBytes` contexts |
-| `decrypt` | `d_id` (the pairing plus the FO consistency check) | 10 | the Miller loop (`pairing.zig:270,278,283`), `Fp2.inv`, the FO compare (`ibe.zig:499` ×2), output `toAffine`/compression — 2026-10-02 |
+| `decrypt` | `d_id` (the pairing plus the FO consistency check) | 10 | the Miller loop (`pairing.zig:270,278,283`), `Fp2.inv`, the FO compare (`decryptBody` in `ibe.zig`, ×2), output `toAffine`/compression — 2026-10-02 |
 | `fp12pow` | `sigma`, `message` | 0 | the old 2 were ff `toBytes` on `r` (2026-10-02) |
 
 ⛔ Not a constant-time claim about the pairing — `bls12_381/src/pairing.zig`

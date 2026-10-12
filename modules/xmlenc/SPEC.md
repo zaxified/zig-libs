@@ -288,9 +288,9 @@ strings.)
 `extract` — implemented and tested (green in Debug and ReleaseFast).
 Decryption side only. Depends on `xml` (structure walk), `rsa` (OAEP / v1.5 /
 RSADP, including decoupled-hash OAEP), `aescbc` (CBC core + XML-Enc unpad),
-and `aeskw` (RFC 3394 key unwrap) — this module no longer carries any local
+`aeskw` (RFC 3394 key unwrap), and `aes192` + `aesgcm` (AES-192 and AES-GCM content) — this module no longer carries any local
 hand-rolled CBC or key-wrap implementation; those are single-sourced in their
-respective sibling modules. AES-GCM and base64 remain from std.
+respective sibling modules. Base64 remains from std.
 
 ## Anchoring
 

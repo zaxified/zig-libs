@@ -189,7 +189,7 @@ the key *on* the deadline, so a confirmation that arrives earlier has to
 ## Verify
 
 ```sh
-zig build test-reconcilable --summary all      # 45 tests, Debug + ReleaseFast + ReleaseSafe
+zig build test-reconcilable --summary all      # or: scripts/modtest reconcilable
 scripts/lib/dark-tests.sh reconcilable             # every submodule's tests really run
 ```
 

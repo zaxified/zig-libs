@@ -81,9 +81,8 @@ or copied; the SDK ran only as a black-box test oracle.
 
 ## Verification
 
-`zig build test-mcp-http` — 35 offline tests through a real `router` +
-`http.Server.serveStream`, in two groups (the per-group counts below are
-indicative, not maintained — the total is the counted one):
+`zig build test-mcp-http` (or `scripts/modtest mcp-http`) — offline tests through a real
+`router` + `http.Server.serveStream`, in two groups:
 
 - built from the spec text directly: request/response (initialize,
   tools/list, tools/call, notification → 202), SSE-on-POST (streamed result,
@@ -91,7 +90,7 @@ indicative, not maintained — the total is the counted one):
   (match/mismatch/absent), sessions (assign + validate + 404 + DELETE, `GET`
   push + `Last-Event-ID` replay + heartbeat, unknown-session 404,
   `max_sessions` cap rejected), path pass-through / 405, oversized → 413.
-- 5 tests replaying a real session captured once from the **official `mcp`
+- tests replaying a real session captured once from the **official `mcp`
   Python SDK** (initialize, `notifications/initialized`, `tools/list`, two
   `tools/call`s — one with live progress notifications — all byte-exact
   against the captured request/response bytes; see `oracle_vectors.zig`).

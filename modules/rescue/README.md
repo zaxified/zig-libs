@@ -97,9 +97,9 @@ must interoperate with.
 ## Verify
 
 ```sh
-zig build test-rescue                                  # 43 tests, ~1s
+zig build test-rescue                                  # or: scripts/modtest rescue
 zig build test-rescue -Dstrict-debug                   # real Debug
-zig build test-rescue --fuzz --release=safe            # 5 fuzz harnesses
+RESCUE_FUZZ=200000 zig build test-rescue --release=safe   # deterministic fuzz driver, 5 harnesses (see src/fuzz_test.zig)
 ```
 
 ## Anchoring — grade 1

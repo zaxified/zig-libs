@@ -34,7 +34,7 @@ Anything off the list → `error.UnsupportedAlgorithm`.
 const xmlenc = @import("xmlenc");
 
 // `enc_assertion` is the parsed <saml:EncryptedAssertion> element;
-// `sk` is your rsa.SecretKey.
+// `sk` is a `*const rsa.SecretKey` (yours, loaded via the `rsa` module).
 const plaintext = try xmlenc.decryptAssertion(alloc, enc_assertion, sk, .{});
 defer alloc.free(plaintext);
 // `plaintext` is the serialized <saml:Assertion> — re-parse + verify it.

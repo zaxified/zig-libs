@@ -754,15 +754,8 @@ integer-equality path. All RSA keys in these tests are test material only.
 
 ## DRY / hazard follow-ups
 
-- **xsd:dateTime parsing** is reproduced here (civil→epoch via Hinnant's
-  algorithm) because `saml` depends only on `xmldsig`+`xml`. `datefmt.partsToUnix`
-  does the same arithmetic; a shared `datetime`/`iso8601` helper would let `saml`,
-  a future `xmldsig` conditions check, and `jwt` (`exp`/`nbf`) share one parser.
-  Its return type is now the minimal `error{InvalidDateTime}` rather than the
-  wider `ConsumeError`, specifically so the Single-Logout/Artifact code (their
-  own, narrower error sets) can `try` it directly — Zig widens a narrower
-  error set at the call site automatically, so this is a compatible narrowing,
-  not a behavior change for existing callers.
+- **xsd:dateTime parsing** is delegated to the `datefmt` module (`datefmt.parseXsdDateTime`),
+  shared with the Single-Logout/Artifact code; it no longer carries a private copy.
 - **`std.crypto.Certificate.parse`** is avoided on adversarial DER (metadata /
   KeyInfo certs handed back as raw bytes) — the caller pins.
 - **Signature-algorithm URI string constants** (`sig_alg_rsa_sha256`,

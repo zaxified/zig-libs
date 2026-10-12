@@ -65,7 +65,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Audit** is a synchronous hook (`on_audit(entry)`), never a logger: fires on every authenticated
   mutation and every denial; authenticated reads are not audited. Entry slices borrow request-scoped
   memory.
-- **Denied-request throttle** (`AuditThrottle`, per-key): coalesces repeated 401s from one
+- **Denied-request throttle** (internal `Throttle`, per-key): coalesces repeated 401s from one
   client key within `throttle_window_ms`; suppressed count folds into the next admitted entry so
   nothing is silently dropped, while responses themselves are never throttled (every denial still
   gets its 401). Bounded store (`throttle_max_keys`, LRU); clock injected for deterministic tests;

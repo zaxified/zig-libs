@@ -185,8 +185,8 @@ change reserved for when one does.
 ### Live interop — a real, third-party NETCONF server
 
 The live tests in `client.zig` are gated on `NETCONF_TEST_SERVER` / `NETCONF_TEST_USER` /
-`NETCONF_TEST_PASSWORD` and print `SKIPPED:` and pass without them (the pattern used by
-`ssh` and `tc`).
+`NETCONF_TEST_PASSWORD` and are a counted `error.SkipZigTest` without them (`SKIPPED:` is printed only when
+`ZIG_LIBS_VERBOSE_SKIP` is set; the pattern used by `ssh` and `tc`).
 
 They were run, and pass, against a **third-party NETCONF server**: the Python `netconf`
 2.1.0 package (Christian Hopps' implementation) on `sshutil` 1.5.0 + `paramiko` 3.5.1,
@@ -229,7 +229,7 @@ server above rather than faked.
 ### External-anchor investigation: frozen bytes from the live server (2026-08-01, done)
 
 The live tests above prove interop but are gated: without `NETCONF_TEST_SERVER`
-they print `SKIPPED:` and the byte-level detail of what actually crossed the
+they are counted skips and the byte-level detail of what actually crossed the
 wire is never asserted when no operator supplies a server. To close that gap
 per the governing rule ("run the foreign thing once, freeze its bytes, assert
 offline"), the Python `netconf` 2.1.0 package was actually stood up using the
@@ -350,7 +350,7 @@ are byte-exact in the strong sense.
 * Three `std.testing.fuzz` targets: the framer (both dialects, arbitrary bytes),
   `parseHello`, and `parseReply`/`parseNotification`/`classify`.
 
-Without a live server, the live tests print `SKIPPED:` and pass; with
+Without a live server, the live tests are counted skips (not passes); with
 `NETCONF_TEST_SERVER` set, they all run for real. Green in both `Debug` and
 `--release=fast`.
 

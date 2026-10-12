@@ -39,6 +39,7 @@ at any time.
 | `root.zig` | Module doc, `meta`, re-exports, dark-tests aggregator |
 | `ciphersuite.zig` | `h1` (identity -> `G1`), `h2`/`h3`/`h4` (this module's own domain-separated hash constructions), `randomSigma` |
 | `ibe.zig` | `KeyPair`, `setup`/`extract` (the PKG API), `Ciphertext` `(U ∈ G2, V, W)` struct + byte codec, `encrypt`/`decrypt` + the private `fp12Pow` `Gt`-exponentiation helper |
+| `burn.zig` | Dead-stack burn wrapper run around every secret-holding entry point (`setup`, `extract`, `encrypt`, `decrypt`, `randomSigma`) |
 | `kat_test.zig` | Round-trip, pairing-consistency and soundness (tamper/wrong-key rejection) KATs, plus the drand-parameterised interop anchor (test-only `tlock` import) |
 
 ## Import
@@ -102,12 +103,13 @@ const sigma = [_]u8{0x11} ** ibe.block_bytes;
 
 ```
 ibe → bls12_381 (G1/G2 point arithmetic, the pairing, RFC 9380 hash-to-curve)
+ibe → entropy   (fail-closed `sigma` draw in `ciphersuite.randomSigma`)
 
 tests only:
 ibe → tlock  (drand's ciphersuite + its frozen drand interop fixture)
 ```
 
-`meta.deps = .{"bls12_381"}`. `tlock` is a `test_deps` entry in
+`meta.deps = .{ "bls12_381", "entropy" }`. `tlock` is a `test_deps` entry in
 `build.zig`, never part of the published module — `zig build
 check-testonly` proves it.
 

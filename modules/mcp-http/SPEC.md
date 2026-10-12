@@ -157,7 +157,7 @@ delivery, Origin accept/reject, session assign/validate/unknown-404, GET drain-a
 server→client requests: a response POST → 202 with the handler run, cross-session correlation
 refused (session B's answer leaves session A's request pending, and the request lands only on A's
 `GET` stream), the `application/json` body carrying exactly one object while the tool's elicitation
-goes to the session queue, and the SSE ordering (request event precedes the tool result). 18 tests.
+goes to the session queue, and the SSE ordering (request event precedes the tool result).
 
 The peer-scoping promise is pinned by an **attacker's** test in each configuration, not a
 happy-path one — client A has a request outstanding, client B (who was never asked anything) posts
@@ -209,15 +209,14 @@ wire-identical to any `EventSource`. See `oracle_vectors.zig`'s doc comment for 
 recap and provenance. `mcp` run as a black-box test oracle needs no root `NOTICE` entry (§0); no
 `mcp_dart`, the official SDK, or any other MCP-transport source was ported or copied.
 
-**52 tests total**, of which 5 are the oracle replays above, 3 came from the 2026-08-11
-peer-scoping pass, 1 from the 2026-09-02 `mcp` per-peer-state follow-on, and 16 from the 2026-07-28
+The suite includes the oracle replays above, tests from the 2026-08-11
+peer-scoping pass, the 2026-09-02 `mcp` per-peer-state follow-on, and the 2026-07-28
 transport (2026-09-30): `modern.zig`'s header/body rules anchored on streamable-http.mdx's own
 `execute_sql` request and its Base64 encoding table (every required header dropped, duplicated and
 changed in turn; the escaped-key and duplicated-version-header bypasses), and eight over the router
 (stateless service with sessions configured, 400/404/200 statuses, SSE vs lone-response JSON, the
 listen stream, a two-round MRTR tool, `Mcp-Param-*`, and the session era under a session-revision
-header). (Earlier revisions of this line said "26 (18 + 8)" — a hand-kept split that had
-already drifted from the tree; the total is now the counted one, and `scripts/lib/dark-tests.sh`
+header). (Test counts are deliberately not kept here; `scripts/lib/dark-tests.sh`
 asserts every declared test actually runs.) Run: `zig build test-mcp-http`.
 
 ## Backlog / deferred

@@ -86,7 +86,7 @@ made observable by reading exactly the range being written. CRC-16 pinned to the
 `"123456789" → 0x4B37` check value plus classic example frames; bit packing checked LSB-first. A
 scripted mock transport exercises TCP + RTU round trips (incl. echoed-reply writes and FC 17), the
 exception path, quantity limits, CRC corruption, MBAP/RTU field mismatches, buffer-too-small, and a
-garbage-frame no-panic sweep. Two 20 000-iteration fuzz loops drive the server: one with fully
+garbage-frame no-panic sweep. Fuzz tests drive the server: one with fully
 random bytes, one with a valid function code and random everything else, both asserting that every
 reply is either an echo of the function code or that code with the high bit set.
 

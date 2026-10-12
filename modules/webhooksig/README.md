@@ -124,7 +124,7 @@ Sign an outbound webhook (or in a test):
 
 ```zig
 var buf: [webhooksig.signatureBufLen(webhooksig.default_prefix)]u8 = undefined;
-const value = webhooksig.sign(secret, body, &buf); // "sha256=<hex>"
+const value = try webhooksig.sign(secret, body, &buf); // "sha256=<hex>"
 try req.setHeader("X-Signature-256", value);
 ```
 
@@ -170,7 +170,7 @@ middleware's `state` points at it).
 
 ## API
 
-- `sign(secret, body, out_buf) []const u8` — `"sha256=<hex>"` into
+- `sign(secret, body, out_buf) SignError![]const u8` — `"sha256=<hex>"` into
   `out_buf`; `signWithPrefix(prefix, …)` for a custom prefix;
   `signatureBufLen(prefix)` sizes the buffer.
 - `computeHex(secret, body) [64]u8` — the raw lowercase-hex MAC (no

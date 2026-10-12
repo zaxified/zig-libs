@@ -91,7 +91,6 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   control bytes need no template-specific handling: they are already `min_len`/always-on
   NUL-rejection/`reject_control` in `CharClass`, so a hole with the default class refuses them the
   same way every convenience predicate already does.
-    accessor in a separate file) to make the invariant harder to violate by accident.
 - Pure, reentrant, no shared state; every function is pure over its arguments. Std-only.
 
 ## Threat model / out of scope
