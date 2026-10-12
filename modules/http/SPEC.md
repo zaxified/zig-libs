@@ -464,8 +464,10 @@ Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML not
   integration test idles past the proxy's read timeout (negative control: without the lift it
   fails). FIX found on the way: the default path relayed a client's own `X-Forwarded-Proto`/`-Host`
   in front of ours. Fuzz harness `http-proxy-relay` (no hop-by-hop field relayed; negative control
-  caught). Not done: a `websocket`-module client against a `websocket` server behind the proxy
-  (that server cannot read after the 101 inside a handler until it adopts `Request.upgraded`).
+  caught). The `websocket` module adopted `Request.upgraded` on 2026-10-12
+  (`handshake.respondUpgraded`); its loopback test runs its client against its server directly
+  and behind this proxy, idle past both read timeouts (negative control: without the timeout lift
+  it fails).
 - R8a client transparent gzip — DONE 2026-10-12: `Client.Options.decompress = .gzip(max_bytes)`
   (null = off as before; on = Go's `DisableCompression: false`, `max_bytes` a decoded-size cap that
   Go lacks). A function pointer, not a flag: the plaintext size probe measured +23 KB for every
@@ -556,6 +558,22 @@ Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML not
   Negative control: HEAD given a body, chunked left undecoded, tunnel ignored — each fails a test.
   Consumers' hand-rolled `runWire`/`headerValue`/`bodyOf` helpers (sessions, idempotency,
   ratelimit, throttle, aaa-gate, router, qap) can move to it at their own pace.
+- The survey's "optional, not S2" items — DONE 2026-10-12 (owner: what the competition has gets
+  implemented): `serveByAlpn` (Go `ServeTLS`'s h2-or-h1 choice over a terminated connection),
+  `sniff.detectContentType` (Go `DetectContentType`; WHATWG MIME Sniffing tables, clean-room from
+  the standard), `serveContent` (Go `ServeContent` for an in-memory representation, composed from
+  `conditional` + `range` + `sniff`; unlike the bare composition it bounds a range set by the
+  representation's size, as Go), `CrossOriginProtection` (Go 1.25; bypass patterns are a predicate,
+  routing being `router`'s). Go oracle areas `sniff` (247 inputs: every signature and its near
+  misses, every C0 byte, the 512-byte window, the MP4 box rules) and `crossorigin` (58 `Check`
+  cases, 20 `AddTrustedOrigin` inputs, the default 403), and the 114 `serve` cases replayed through
+  `serveContent` as well — no divergence in any of them. Go facts the oracle settled: a trusted
+  origin may carry user info, a percent-escape of an ASCII byte in a host is an error, `//host`
+  and `ftp://host` origins match on the host alone. Negative controls: a tab accepted as a tag
+  terminator, a case-insensitive Host compare, `range.apply` in place of the bounded one — each
+  fails its area. Fuzz harness `http-sniff` (200k clean). Rejected: `parseHttpDateAt(s, now)`
+  (RFC 9110's 50-year window for two-digit years) — no competitor implements it (Go reads 69 as
+  1969, Python 69 as 1969, curl and nginx pivot at 70), see (d) above.
 
 - ~~**h2 inbound gzip decode.**~~ — **DONE 2026-09-29**: `h2_server.Options.max_decompressed_request_bytes`
   / `verify_inbound_trailer` (forwarded by `connMain`), the same `GunzipBody` over the h2 request
@@ -739,6 +757,6 @@ request phases ARE bounded; do not read that as the whole client being bounded.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** HPACK RFC7541 vectors + curl/nghttp2 live interop + h2spec 145/145 (h2 server, `tools/interop.zig`) + h11 on h1 framing + **Go's standard library as a differential oracle** (2026-10-05, `src/go_oracle.zig`): the h1 server's accept/reject and handler view (104 wires), conditional requests + ranges vs `ServeContent` (114), query/component/path decoding vs `net/url` (95), multipart vs `mime/multipart` (49), the client's response framing vs `http.Transport` (64, loopback peer), outbound proxy selection vs `ProxyFromEnvironment` (63), the reverse proxy's header rewriting vs `httputil.ReverseProxy` (37, raw client + raw backend; 2026-10-06). Closed 2026-10-06, the last self-only paths: **conneg** vs Werkzeug 3.1.9 + python-mimeparse 2.0.0 (`src/conneg_oracle.zig`, 104 cases frozen by `tools/conneg_oracle/gen.py`; RFC 9110 §12.5.1's own table decides where they disagree); **gzip response encoding** decoded LIVE by curl/zlib and gzip(1) at levels 1/6/9 on HTTP/1.1 and h2c (`src/gzip_interop.zig`, teeth: flipped CRC-32/ISIZE refused); **problem+json** parsed by CPython `json.loads` with U+FFFD substitution held to CPython's `decode("utf-8", "replace")` over 225 inputs and default titles to `http.HTTPStatus`; **SSE** streamed by our server through curl and dispatched by sseclient-py and httpx-sse, held to the WHATWG §9.2.6 parsing rules (teeth: a merged event is caught). The Python oracles are phases of `zig build interop-http` (`tools/oracles.zig`, `--phase problem|sse`; CONVENTIONS §9: a module spawns no foreign toolchain); what they accepted is frozen in `src/problem_oracle_vectors.zig` / `src/sse_oracle_vectors.zig` and replayed byte for byte by `src/problem_oracle.zig` / `src/sse_oracle.zig`. Venv for `--phase sse`: `~/.local/share/zig-libs/oracle-venvs/http`.
+**What the tests actually contain.** HPACK RFC7541 vectors + curl/nghttp2 live interop + h2spec 145/145 (h2 server, `tools/interop.zig`) + h11 on h1 framing + **Go's standard library as a differential oracle** (2026-10-05, `src/go_oracle.zig`): the h1 server's accept/reject and handler view (104 wires), conditional requests + ranges vs `ServeContent` (114, through the bare composition and through `serveContent`), content sniffing vs `DetectContentType` (247), `CrossOriginProtection` (58 checks, 20 trusted-origin validations, the denial; 2026-10-12), query/component/path decoding vs `net/url` (95), multipart vs `mime/multipart` (49), the client's response framing vs `http.Transport` (64, loopback peer), outbound proxy selection vs `ProxyFromEnvironment` (63), the reverse proxy's header rewriting vs `httputil.ReverseProxy` (37, raw client + raw backend; 2026-10-06). Closed 2026-10-06, the last self-only paths: **conneg** vs Werkzeug 3.1.9 + python-mimeparse 2.0.0 (`src/conneg_oracle.zig`, 104 cases frozen by `tools/conneg_oracle/gen.py`; RFC 9110 §12.5.1's own table decides where they disagree); **gzip response encoding** decoded LIVE by curl/zlib and gzip(1) at levels 1/6/9 on HTTP/1.1 and h2c (`src/gzip_interop.zig`, teeth: flipped CRC-32/ISIZE refused); **problem+json** parsed by CPython `json.loads` with U+FFFD substitution held to CPython's `decode("utf-8", "replace")` over 225 inputs and default titles to `http.HTTPStatus`; **SSE** streamed by our server through curl and dispatched by sseclient-py and httpx-sse, held to the WHATWG §9.2.6 parsing rules (teeth: a merged event is caught). The Python oracles are phases of `zig build interop-http` (`tools/oracles.zig`, `--phase problem|sse`; CONVENTIONS §9: a module spawns no foreign toolchain); what they accepted is frozen in `src/problem_oracle_vectors.zig` / `src/sse_oracle_vectors.zig` and replayed byte for byte by `src/problem_oracle.zig` / `src/sse_oracle.zig`. Venv for `--phase sse`: `~/.local/share/zig-libs/oracle-venvs/http`.
 
 **How it got there.** The anchoring work landed. DONE 9dee82e: h11 on framing; fixed a misquoted RFC 9112 2.2 in comments

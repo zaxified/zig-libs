@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Go's `ServeContent`, `DetectContentType`, `CrossOriginProtection` and
+  `ServeTLS`'s protocol choice, additive.** `http.serveContent(req, rw, bytes, opts)` answers an
+  in-memory representation the way `ServeContent` does (preconditions, `If-Range`, single and
+  multipart ranges, a range set larger than the body served whole, sniffed or given
+  `Content-Type`, exact `Content-Length`, HEAD). `http.detectContentType` is the WHATWG MIME
+  Sniffing algorithm with Go's result strings (`http.sniff`). `http.CrossOriginProtection` is Go
+  1.25's token-free CSRF guard (`check`, `deny`, trusted origins, a bypass predicate in place of
+  `ServeMux` patterns; `http.validateOrigin`). `http.serveByAlpn` hands a TLS-terminated connection
+  to the h2 or the h1 loop by its ALPN result. New Go oracle areas `sniff` and `crossorigin`; the
+  `serve` area also runs through `serveContent`. New fuzz harness `http-sniff`.
+
 - **2026-10-12** — **Client: HTTP/1.1 response trailers, Go's `Response.Trailer` on h1 too,
   additive.** A chunked body's trailer section was read and discarded; `Response.trailer(name)`
   now answers it once the body is read to its end, as it already did over h2. The section is

@@ -301,6 +301,88 @@ test "go oracle serve: preconditions and ranges answer as Go's ServeContent, or 
     try testing.expectEqual(@as(usize, 0), bad);
 }
 
+// ── serve, again: the same Go answers through `serveContent` itself ──────
+
+const servecontent = @import("servecontent.zig");
+
+fn serveContentHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    try servecontent.serveContent(req, rw, "0123456789" ** (vectors.serve_size / 10), .{
+        .etag = serve_case.etag,
+        .last_modified = serve_case.last_modified,
+    });
+}
+
+/// Where `serveContent` agrees with Go although the bare composition above
+/// does not: it bounds the summed range bytes by the representation, as Go.
+const serve_content_agrees = [_][]const u8{"range-30"};
+
+fn replayServeContent(c: *const vectors.ServeCase, wire_buf: []u8, out_buf: []u8, parts_buf: []range.ResolvedRange) !ServeOutcome {
+    serve_case = c;
+    const wire = try std.fmt.bufPrint(wire_buf, "{s} /r HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ c.method, c.headers });
+    var in: std.Io.Reader = .fixed(wire);
+    var out: std.Io.Writer = .fixed(out_buf);
+    var head_buf: [2048]u8 = undefined;
+    var request_body_buf: [64]u8 = undefined;
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    Server.serveStream(.{ .handler = serveContentHandler, .server_name = null }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    const resp = out.buffered();
+    const status = if (resp.len >= 12) std.fmt.parseInt(u16, resp[9..12], 10) catch 0 else 0;
+    // A multipart answer's parts, in order, from each part's Content-Range.
+    var n: usize = 0;
+    const ct = responseHeader(resp, "Content-Type") orelse "";
+    if (std.mem.startsWith(u8, ct, "multipart/byteranges") and c.method[0] != 'H') {
+        const body = resp[(std.mem.indexOf(u8, resp, "\r\n\r\n") orelse resp.len) + 4 ..];
+        var rest = body;
+        while (std.mem.indexOf(u8, rest, "\r\nContent-Range: bytes ")) |i| {
+            rest = rest[i + "\r\nContent-Range: bytes ".len ..];
+            const dash = std.mem.indexOfScalar(u8, rest, '-').?;
+            const slash = std.mem.indexOfScalar(u8, rest, '/').?;
+            parts_buf[n] = .{
+                .start = try std.fmt.parseInt(u64, rest[0..dash], 10),
+                .end = try std.fmt.parseInt(u64, rest[dash + 1 .. slash], 10),
+                .total = vectors.serve_size,
+            };
+            n += 1;
+        }
+    }
+    return .{ .status = status, .content_range = responseHeader(resp, "Content-Range") orelse "", .parts = parts_buf[0..n] };
+}
+
+test "go oracle serve: serveContent answers as Go's ServeContent, or the difference is judged" {
+    var wire_buf: [1024]u8 = undefined;
+    var out_buf: [8192]u8 = undefined;
+    var parts: [16]range.ResolvedRange = undefined;
+    var bad: usize = 0;
+    for (&vectors.serve) |*c| {
+        const ours = try replayServeContent(c, &wire_buf, &out_buf, &parts);
+        const agrees = serveAgrees(ours, c.*);
+        const listed = if (find(ServeDivergence, &serve_divergences, c.id)) |d|
+            (for (serve_content_agrees) |id| (if (std.mem.eql(u8, id, d.id)) break null) else d)
+        else
+            null;
+        const verdict: ?[]const u8 = if (listed) |d|
+            (if (agrees)
+                "agrees now, drop its divergence entry"
+            else if (ours.status != d.status)
+                "diverges, but not the way its entry says"
+            else
+                null)
+        else if (agrees) null else "diverges";
+        const v = verdict orelse continue;
+        bad += 1;
+        std.debug.print("serveContent {s} [{s}]: {s}\n  go:   {d} '{s}' parts={d}\n  ours: {d} '{s}' parts={d}\n", .{
+            c.id, c.headers, v, c.status, c.content_range, c.parts.len, ours.status, ours.content_range, ours.parts.len,
+        });
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
 // ── url: query strings, query components, paths ─────────────────────────
 
 const url = @import("url.zig");
@@ -1672,4 +1754,122 @@ test "go oracle rproxy_hooks: Rewrite/ModifyResponse/ErrorHandler edit what Go's
         }
     }
     try testing.expectEqual(@as(usize, 0), bad);
+}
+
+// ── sniff: DetectContentType ─────────────────────────────────────────────
+
+const sniff = @import("sniff.zig");
+
+/// Where we name a different type than `DetectContentType`, and why.
+const SniffDivergence = struct { id: []const u8, why: []const u8 };
+
+const sniff_divergences = [_]SniffDivergence{};
+
+test "go oracle sniff: detectContentType answers as Go's DetectContentType, or the difference is judged" {
+    var bad: usize = 0;
+    for (vectors.sniff) |c| {
+        const ours = sniff.detectContentType(c.data);
+        const agrees = std.mem.eql(u8, ours, c.content_type);
+        const listed = find(SniffDivergence, &sniff_divergences, c.id) != null;
+        if (agrees == !listed) continue;
+        bad += 1;
+        std.debug.print("sniff {s}: {s}\n  go:   {s}\n  ours: {s}\n", .{ c.id, if (agrees) "agrees now, drop its divergence entry" else "diverges", c.content_type, ours });
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+// ── crossorigin: CrossOriginProtection ───────────────────────────────────
+
+const crossorigin = @import("crossorigin.zig");
+
+/// Where our verdict differs from Go's `Check`, and why.
+const CrossOriginDivergence = struct { id: []const u8, why: []const u8 };
+
+const crossorigin_divergences = [_]CrossOriginDivergence{};
+
+const CoReplay = struct {
+    var prot: crossorigin.CrossOriginProtection = undefined;
+    var verdict: ?crossorigin.CrossOriginProtection.CheckError = null;
+    var reached = false;
+
+    fn bypass(_: ?*anyopaque, req: *const Server.Request) bool {
+        // Go's pattern "/hook/": the subtree under /hook/.
+        return std.mem.startsWith(u8, req.path, "/hook/");
+    }
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        reached = true;
+        verdict = null;
+        prot.check(req) catch |err| {
+            verdict = err;
+            try crossorigin.CrossOriginProtection.deny(rw, err);
+        };
+    }
+};
+
+test "go oracle crossorigin: check answers as Go's CrossOriginProtection.Check, or the difference is judged" {
+    CoReplay.prot = try crossorigin.CrossOriginProtection.init(.{ .trusted_origins = &.{"https://partner.example"}, .bypass = CoReplay.bypass });
+    var bad: usize = 0;
+    for (vectors.crossorigin) |c| {
+        var wire_buf: [1024]u8 = undefined;
+        const wire = try std.fmt.bufPrint(&wire_buf, "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}Content-Length: 0\r\nConnection: close\r\n\r\n", .{ c.method, c.path, c.host, c.headers });
+        var in: std.Io.Reader = .fixed(wire);
+        var out_buf: [2048]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        var head_buf: [2048]u8 = undefined;
+        var request_body_buf: [64]u8 = undefined;
+        var response_body_buf: [256]u8 = undefined;
+        var chunk_buf: [64]u8 = undefined;
+        CoReplay.reached = false;
+        Server.serveStream(.{ .handler = CoReplay.handler, .server_name = null }, &in, &out, .{
+            .head = &head_buf,
+            .request_body = &request_body_buf,
+            .response_body = &response_body_buf,
+            .chunk = &chunk_buf,
+        });
+        const ours: []const u8 = if (!CoReplay.reached)
+            "(refused by the server)"
+        else if (CoReplay.verdict) |err| crossorigin.CrossOriginProtection.message(err) else "";
+        const agrees = std.mem.eql(u8, ours, c.err);
+        const listed = find(CrossOriginDivergence, &crossorigin_divergences, c.id) != null;
+        if (agrees == !listed) continue;
+        bad += 1;
+        std.debug.print("crossorigin {s} [{s} {s} Host: {s} {f}]: {s}\n  go:   '{s}'\n  ours: '{s}'\n", .{
+            c.id, c.method, c.path, c.host, std.zig.fmtString(c.headers), if (agrees) "agrees now, drop its divergence entry" else "diverges", c.err, ours,
+        });
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "go oracle crossorigin: validateOrigin accepts what AddTrustedOrigin accepts" {
+    var bad: usize = 0;
+    for (vectors.trusted_origin) |c| {
+        const ok = if (crossorigin.validateOrigin(c.origin)) true else |_| false;
+        if (ok == c.ok) continue;
+        bad += 1;
+        std.debug.print("trusted origin '{s}': go ok={} ours ok={}\n", .{ c.origin, c.ok, ok });
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "go oracle crossorigin: the default denial is Go's" {
+    const want = vectors.crossorigin_deny;
+    var in: std.Io.Reader = .fixed("POST / HTTP/1.1\r\nHost: a.example\r\nSec-Fetch-Site: cross-site\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    var out_buf: [2048]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var head_buf: [2048]u8 = undefined;
+    var request_body_buf: [64]u8 = undefined;
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    CoReplay.prot = .{};
+    Server.serveStream(.{ .handler = CoReplay.handler, .server_name = null }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    const resp = out.buffered();
+    try testing.expectEqual(@as(u16, want.status), try std.fmt.parseInt(u16, resp[9..12], 10));
+    try testing.expectEqualStrings(want.content_type, responseHeader(resp, "Content-Type").?);
+    try testing.expectEqualStrings(want.body, resp[std.mem.indexOf(u8, resp, "\r\n\r\n").? + 4 ..]);
 }

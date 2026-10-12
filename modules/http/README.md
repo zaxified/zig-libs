@@ -423,6 +423,22 @@ HEADERS frame is materialized into it once the body ends.
   `Server.BodyLimit` (Go `MaxBytesReader`: a per-handler cap below
   `max_body_bytes`, a declared length over it refused before `100 Continue`,
   the connection closed after it trips).
+- **More of Go's `net/http`, held to Go by the oracle:** `http.serveContent(req,
+  rw, bytes, .{ .etag, .last_modified, .content_type })` (Go `ServeContent` for
+  an in-memory representation: preconditions → 412/304, `If-Range`, one range →
+  206, several → `multipart/byteranges`, none satisfiable → 416, a set larger
+  than the representation served whole, `Content-Type` given / already set /
+  sniffed, exact `Content-Length`, HEAD; files with descriptors and
+  precompressed variants are `staticfiles`); `http.detectContentType(bytes)`
+  (Go `DetectContentType`, the WHATWG MIME Sniffing tables over the first 512
+  bytes); `http.CrossOriginProtection` (Go 1.25's token-free CSRF guard:
+  `check(req)` refuses a non-GET whose `Sec-Fetch-Site` is cross-site, or
+  without it whose `Origin` names another host, unless the origin is trusted
+  or the `bypass` predicate — Go's `ServeMux` bypass patterns — accepts it;
+  `deny(rw, err)` is Go's 403); `http.serveByAlpn(negotiated, in, out, peer,
+  .{ .h1, .h1_buffers, .h2, .gpa })` (Go `ServeTLS`'s protocol choice for a
+  connection your TLS layer terminated: h2 when ALPN picked it, HTTP/1.1
+  otherwise).
 - **Errors:** malformed head → 400; oversized head → 431; over-long
   request line → 414; oversized body → 413; unsupported HTTP version →
   505; missing Host on 1.1 → 400 (not for CONNECT, as Go);
@@ -433,7 +449,7 @@ HEADERS frame is materialized into it once the body ends.
   the body, and the response then closes the connection. Absolute-
   form request targets are rejected (origin-form + `*` only).
 - **No TLS in the server yet** — terminate TLS in front (Caddy/any proxy,
-  or your own TLS layer over `serveStream`); a native TLS-terminating server is planned right after the zig-libs maturity goal, on our fork of ianic/tls.
+  or your own TLS layer over `serveByAlpn` / `serveStream`); a native TLS-terminating server is planned right after the zig-libs maturity goal, on our fork of ianic/tls.
 
 ## Multicore accept engine (SO_REUSEPORT thread-per-core)
 

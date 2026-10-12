@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! http — HTTP/1.1 client + server, pure Zig (TLS via `std.crypto.tls`).
+//! http — HTTP/1.1 + HTTP/2 client and server, pure Zig (client TLS via
+//! `tlsclient`; server TLS is the caller's, see the ALPN seam below).
 //!
 //! Phase 1: `Client` — HTTP/1.1 over TCP and TLS, streaming bodies both
 //! ways, chunked + Content-Length framing, RFC-conformant redirect
@@ -9,8 +10,9 @@
 //! for **direct internet exposure** (peer address on requests, accept
 //! hook + connection accounting, 431/414/413 size limits, stall +
 //! whole-request + write timeouts — see `Server`); TLS termination is the
-//! caller's for now (a reverse proxy also works; a native server on our
-//! ianic/tls fork is planned). Phase 2.2 adds
+//! caller's (a reverse proxy, qap's TLS layer, any Zig TLS server feeding
+//! `serveByAlpn`); a native TLS server on our ianic/tls fork is planned
+//! after the zig-libs maturity goal (SPEC Backlog). Phase 2.2 adds
 //! negotiated gzip response compression (`Server.Options.compression`,
 //! off by default; `std.compress.flate` streaming into the chunked
 //! framing). Phase 3 adds HTTP/2: `hpack` (RFC 7541) + `h2` (RFC 9113
@@ -29,8 +31,8 @@
 //! `Client.connectH2Over` drives the client side; `Server.serveStream`
 //! is the matching h1-over-provided-stream path.
 //! Deliberately NOT built on `std.http` (API
-//! churn is the reason this module exists); client TLS is strictly
-//! `std.crypto.tls`.
+//! churn is the reason this module exists); client TLS is `tlsclient`
+//! (std's `std.crypto.tls.Client` plus the RFC 5280 chain checks std lacks).
 //!
 //! Layout: this file owns the shared vocabulary (methods, URL parsing,
 //! redirect rules); `h1.zig` is the pure HTTP/1.1 wire codec (offline
@@ -179,6 +181,22 @@ pub const gzip = @import("gzip.zig");
 /// Problem details for HTTP APIs (RFC 9457): the `application/problem+json`
 /// error body — standard members + caller extensions, always valid UTF-8.
 pub const problem = @import("problem.zig");
+
+/// Content sniffing (WHATWG MIME Sniffing; Go's `DetectContentType`): the
+/// media type of a body nobody named, from its first 512 bytes.
+pub const sniff = @import("sniff.zig");
+pub const detectContentType = sniff.detectContentType;
+
+/// Go's `ServeContent` for an in-memory representation: preconditions,
+/// If-Range, single and multipart ranges, Content-Type (given or sniffed),
+/// Last-Modified, exact Content-Length, HEAD. Files: `staticfiles`.
+pub const serveContent = @import("servecontent.zig").serveContent;
+pub const ServeContentOptions = @import("servecontent.zig").Options;
+
+/// Token-free CSRF protection from Fetch Metadata (`Sec-Fetch-Site`) and
+/// `Origin` — Go 1.25's `http.CrossOriginProtection`.
+pub const CrossOriginProtection = @import("crossorigin.zig").CrossOriginProtection;
+pub const validateOrigin = @import("crossorigin.zig").validateOrigin;
 
 const helpers = @import("helpers.zig");
 
@@ -441,11 +459,11 @@ pub const max_merged_path = 4096;
 // intended deployment flow is:
 //
 //     terminate TLS with your library, offering `http.alpn_offer`
-//     switch (http.protocolFromAlpn(negotiated)) {
-//         .h2     => h2_server.serveStream(gpa, in, out, peer, .{ .handler = h });
-//         .http11 => Server.serveStream(opts, in, out, bufs);   // or unknown:
-//         .unknown => Server.serveStream(opts, in, out, bufs),  // h1 default
-//     }
+//     http.serveByAlpn(negotiated, in, out, peer, .{ .gpa = gpa,
+//         .h1 = .{ .handler = h }, .h1_buffers = bufs, .h2 = .{ .handler = h } });
+//
+// which is `switch (protocolFromAlpn(negotiated))` over `h2_server.serveStream`
+// (`.h2`) and `Server.serveStream` (`.http11`, and `.unknown` — h1 default),
 //
 // where `in`/`out` are the TLS connection's plaintext reader/writer. The
 // client side mirrors it: offer `alpn_offer`, and when "h2" comes back call
@@ -466,6 +484,40 @@ pub const alpn_offer = [_][]const u8{ alpn_h2, alpn_http11 };
 
 /// Dispatch verdict for a negotiated ALPN protocol id — see `protocolFromAlpn`.
 pub const AlpnProtocol = enum { http11, h2, unknown };
+
+/// The two serving loops `serveByAlpn` chooses between, configured up front.
+pub const AlpnServe = struct {
+    /// HTTP/1.1: ALPN selected `http/1.1`, or nothing (RFC 7301 §3.2 default).
+    h1: Server.StreamOptions,
+    h1_buffers: Server.StreamBuffers,
+    /// HTTP/2: ALPN selected `h2` (RFC 9113 §3.3).
+    h2: h2_server.Options,
+    /// The h2 session's allocator (stream table, HPACK state); h1 allocates nothing.
+    gpa: std.mem.Allocator,
+};
+
+/// Serve one TLS-terminated connection on the protocol its handshake
+/// negotiated — Go's `ServeTLS` choice (HTTP/2 when ALPN selected `h2`,
+/// HTTP/1.1 otherwise) without a `switch` at every call site. `in`/`out` are
+/// the TLS connection's plaintext reader/writer; `peer` reaches every request
+/// on either protocol. Returns when the connection is done; closing the
+/// transport stays the caller's.
+pub fn serveByAlpn(
+    negotiated: []const u8,
+    in: *std.Io.Reader,
+    out: *std.Io.Writer,
+    peer: ?std.Io.net.IpAddress,
+    s: AlpnServe,
+) void {
+    switch (protocolFromAlpn(negotiated)) {
+        .h2 => h2_server.serveStream(s.gpa, in, out, peer, s.h2),
+        .http11, .unknown => {
+            var opts = s.h1;
+            opts.peer = peer;
+            Server.serveStream(opts, in, out, s.h1_buffers);
+        },
+    }
+}
 
 /// Map the ALPN protocol id the caller's TLS layer negotiated to the module
 /// entry point to use: `.h2` → `h2_server.serveStream` /
@@ -548,6 +600,9 @@ test {
     _ = conneg;
     _ = problem;
     _ = helpers;
+    _ = sniff;
+    _ = @import("crossorigin.zig");
+    _ = @import("servecontent.zig");
     _ = curl_interop;
     _ = gzip_interop;
     _ = h11_interop;
@@ -606,6 +661,43 @@ test "alpn_offer: h2 preferred, http/1.1 fallback, nothing else" {
     // Every offered id round-trips through the dispatcher.
     try testing.expectEqual(AlpnProtocol.h2, protocolFromAlpn(alpn_offer[0]));
     try testing.expectEqual(AlpnProtocol.http11, protocolFromAlpn(alpn_offer[1]));
+}
+
+fn alpnTestHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    _ = req;
+    try rw.writeAll("ok");
+}
+
+test "serveByAlpn: h2 gets the HTTP/2 loop, http/1.1 and no ALPN get HTTP/1.1" {
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 7 }, .port = 4433 } };
+    var head: [1024]u8 = undefined;
+    var req_body: [64]u8 = undefined;
+    var resp_body: [256]u8 = undefined;
+    var chunk: [64]u8 = undefined;
+    const serve: AlpnServe = .{
+        .gpa = testing.allocator,
+        .h1 = .{ .handler = alpnTestHandler, .server_name = null },
+        .h1_buffers = .{ .head = &head, .request_body = &req_body, .response_body = &resp_body, .chunk = &chunk },
+        .h2 = .{ .handler = alpnTestHandler },
+    };
+    for ([_][]const u8{ "http/1.1", "", "h3" }) |negotiated| {
+        var in: std.Io.Reader = .fixed("GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        var out_buf: [512]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        serveByAlpn(negotiated, &in, &out, peer, serve);
+        try testing.expect(std.mem.startsWith(u8, out.buffered(), "HTTP/1.1 200 "));
+        try testing.expect(std.mem.endsWith(u8, out.buffered(), "\r\n\r\nok"));
+    }
+    // h2: the client preface + an empty SETTINGS; the server's first frame is
+    // its own SETTINGS (RFC 9113 §3.4), which an h1 loop would never send.
+    var in: std.Io.Reader = .fixed("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ "\x00\x00\x00\x04\x00\x00\x00\x00\x00");
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    serveByAlpn("h2", &in, &out, peer, serve);
+    const wire = out.buffered();
+    try testing.expect(wire.len >= 9);
+    try testing.expectEqual(@as(u8, 0x04), wire[3]); // frame type SETTINGS
+    try testing.expectEqual(@as(u8, 0x00), wire[4]); // not an ACK
 }
 
 test "Url.parse: happy paths" {
