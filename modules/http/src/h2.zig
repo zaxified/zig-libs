@@ -837,6 +837,15 @@ pub const Connection = struct {
     /// Total peer-initiated streams ever opened on this connection; the
     /// serve layer's `max_streams_per_connection` cap reads this.
     remote_streams_total: u32 = 0,
+    /// Live streams we reset (`sendRstStream`, `recoverStreamError`): the
+    /// peer may already have frames for them on the wire, and §5.1 says
+    /// those MUST be ignored. The last `reset_ring_len` ids only — a frame
+    /// for an older one is handled as on any closed stream (a stream
+    /// error), which costs a RST_STREAM, not the connection.
+    reset_by_us: [reset_ring_len]u31 = @splat(0),
+    reset_by_us_next: usize = 0,
+
+    const reset_ring_len = 32;
 
     const Assembly = struct {
         kind: enum { headers, push_promise },
@@ -963,6 +972,23 @@ pub const Connection = struct {
     fn retireIfClosed(c: *Connection, id: u31) void {
         const st = c.streams.getPtr(id) orelse return;
         if (st.state == .closed) c.retire(id);
+    }
+
+    fn noteResetByUs(c: *Connection, id: u31) void {
+        c.reset_by_us[c.reset_by_us_next] = id;
+        c.reset_by_us_next = (c.reset_by_us_next + 1) % reset_ring_len;
+    }
+
+    fn wasResetByUs(c: *const Connection, id: u31) bool {
+        return id != 0 and std.mem.indexOfScalar(u31, &c.reset_by_us, id) != null;
+    }
+
+    /// Give back the connection-window credit of DATA we received and
+    /// threw away (§6.9): nothing will ever consume those octets.
+    fn creditDiscarded(c: *Connection, out: *std.ArrayList(u8), len: u32) Allocator.Error!void {
+        if (len == 0) return;
+        c.conn_recv_window += len;
+        try encodeWindowUpdate(c.gpa, out, 0, @intCast(len));
     }
 
     // ── send side ───────────────────────────────────────────────────────────
@@ -1209,6 +1235,7 @@ pub const Connection = struct {
         if (c.streams.getPtr(stream_id)) |st| {
             st.state = .closed;
             c.retire(stream_id);
+            c.noteResetByUs(stream_id);
         } else if (!c.everExisted(stream_id)) {
             return error.InvalidStream;
         }
@@ -1242,6 +1269,9 @@ pub const Connection = struct {
             st.state = .closed;
             c.retire(v.stream_id);
         }
+        // The caller answers with RST_STREAM: what the peer still has in
+        // flight for this stream is ignored from here on (§5.1).
+        c.noteResetByUs(v.stream_id);
         // CVE-2023-44487: a stream we must reset counts against the same
         // budget as peer resets — a peer forcing us to reset stream after
         // stream is doing the rapid-reset dance in reverse. The next
@@ -1363,6 +1393,13 @@ pub const Connection = struct {
                     if (h.length > c.conn_recv_window)
                         return c.fail(.connection, 0, error.FlowControlError);
                     c.conn_recv_window -= h.length;
+                    // …and discarded, so the credit goes straight back
+                    // (§6.9: or the connection window leaks shut, one
+                    // abandoned stream at a time).
+                    try c.creditDiscarded(out, h.length);
+                    // A stream we reset: the peer sent this before it knew
+                    // (§5.1, ignored). A flood of them is no progress.
+                    if (c.wasResetByUs(d.stream_id)) return c.noteUnproductive();
                     return c.fail(.stream, d.stream_id, error.StreamClosed);
                 };
                 // Flow control charges the whole payload incl. padding (§6.1).
@@ -1374,7 +1411,10 @@ pub const Connection = struct {
                 st.recv_window -= h.length;
                 switch (st.state) {
                     .open, .half_closed_local => {},
-                    else => return c.fail(.stream, d.stream_id, error.StreamClosed),
+                    else => {
+                        try c.creditDiscarded(out, h.length); // discarded (§6.9)
+                        return c.fail(.stream, d.stream_id, error.StreamClosed);
+                    },
                 }
                 // Zero-length DATA without END_STREAM makes no progress —
                 // an empty-frame flood burns the unproductive budget.
@@ -1409,6 +1449,20 @@ pub const Connection = struct {
                     // stream burns the unproductive budget.
                     try c.noteUnproductive();
                 } else if (c.everExisted(hd.stream_id)) {
+                    if (c.wasResetByUs(hd.stream_id)) {
+                        // A stream we reset — a trailer section the peer
+                        // sent before it knew (§5.1, ignored). The block is
+                        // still decoded and dropped: it moves the HPACK
+                        // table both ends share (§4.3).
+                        try c.noteUnproductive();
+                        if (hd.end_headers)
+                            return c.finishHeaderBlock(hd.stream_id, hd.fragment, hd.end_stream, events);
+                        return c.beginAssembly(.{
+                            .kind = .headers,
+                            .stream_id = hd.stream_id,
+                            .end_stream = hd.end_stream,
+                        }, hd.fragment);
+                    }
                     // Closed — either retired after END_STREAM, or implicitly
                     // closed by §5.1.1 when a higher id was opened. The two
                     // cannot be told apart without the table entry this
@@ -1696,8 +1750,14 @@ pub const Connection = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return c.fail(.connection, stream_id, error.CompressionError),
         };
+        // Only a stream we reset gets here without a table entry: decoded
+        // for the HPACK table's sake, then dropped.
+        const st = c.streams.getPtr(stream_id) orelse {
+            list.deinit(c.gpa);
+            return;
+        };
         errdefer list.deinit(c.gpa);
-        if (end_stream) recvEndStream(c.streams.getPtr(stream_id).?);
+        if (end_stream) recvEndStream(st);
         try events.append(c.gpa, .{ .headers = .{
             .stream_id = stream_id,
             .headers = list,
@@ -2347,6 +2407,128 @@ fn deliver(
 ) !void {
     try dst.recv(src.items, reply, events);
     src.clearRetainingCapacity();
+}
+
+test "connection: frames in flight for a stream we reset are ignored, their DATA credit returned, HPACK kept" {
+    // §5.1: after sending RST_STREAM, frames that arrive on that stream MUST
+    // be ignored; §6.9: DATA still counted against the connection window and
+    // thrown away must be credited back. Before this, the client answered each
+    // in-flight DATA frame with another RST_STREAM and kept the window charged:
+    // one abandoned download shut the connection window, and the server could
+    // not send a byte on any other stream (found by `Client` over h2, R8).
+    const gpa = testing.allocator;
+    var client: Connection = .init(gpa, .client, .{});
+    defer client.deinit();
+    var server: Connection = .init(gpa, .server, .{});
+    defer server.deinit();
+    var c2s: std.ArrayList(u8) = .empty;
+    defer c2s.deinit(gpa);
+    var s2c: std.ArrayList(u8) = .empty;
+    defer s2c.deinit(gpa);
+    var c_events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&c_events);
+    var s_events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&s_events);
+    try client.sendPreface(&c2s);
+    try server.sendPreface(&s2c);
+    try deliver(&c2s, &server, &s2c, &s_events);
+    try deliver(&s2c, &client, &c2s, &c_events);
+    try deliver(&c2s, &server, &s2c, &s_events);
+    clearEvents(&s_events);
+    clearEvents(&c_events);
+
+    const req: []const hpack.Field = &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    const a = try client.startStream(&c2s, req, true);
+    try deliver(&c2s, &server, &s2c, &s_events);
+    clearEvents(&s_events);
+    try server.sendHeaders(&s2c, a, &.{.{ .name = ":status", .value = "200" }}, false);
+    try deliver(&s2c, &client, &c2s, &c_events);
+    clearEvents(&c_events);
+
+    // The client gives up on `a`; the server, not knowing yet, keeps sending:
+    // DATA, then a trailer section with a field new to the HPACK table.
+    try client.sendRstStream(&c2s, a, .cancel);
+    c2s.clearRetainingCapacity(); // the RST stays "in flight"
+    const body = "x" ** 300;
+    try server.sendData(&s2c, a, body, false);
+    try server.sendHeaders(&s2c, a, &.{.{ .name = "x-checksum", .value = "c0ffee" }}, true);
+    try deliver(&s2c, &client, &c2s, &c_events);
+    try testing.expectEqual(@as(usize, 0), c_events.items.len);
+    try testing.expectEqual(@as(?Violation, null), client.violation);
+    // No RST_STREAM back, one WINDOW_UPDATE(0, 300): the window is whole.
+    var wu: std.ArrayList(u8) = .empty;
+    defer wu.deinit(gpa);
+    try encodeWindowUpdate(gpa, &wu, 0, body.len);
+    try testing.expectEqualSlices(u8, wu.items, c2s.items);
+    try testing.expectEqual(@as(i64, default_initial_window_size), client.conn_recv_window);
+    c2s.clearRetainingCapacity();
+
+    // The next stream decodes a head that indexes the trailer's field.
+    const b = try client.startStream(&c2s, req, true);
+    try deliver(&c2s, &server, &s2c, &s_events);
+    clearEvents(&s_events);
+    try server.sendHeaders(&s2c, b, &.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "x-checksum", .value = "c0ffee" },
+    }, true);
+    try deliver(&s2c, &client, &c2s, &c_events);
+    try testing.expectEqual(@as(usize, 1), c_events.items.len);
+    const hd = c_events.items[0].headers;
+    try testing.expectEqual(b, hd.stream_id);
+    try testing.expectEqualStrings("c0ffee", hd.headers.fields[1].value);
+}
+
+test "connection: after a stream error we answered, the stream's in-flight frames are ignored too" {
+    // `recoverStreamError` means the caller sends RST_STREAM: what the peer
+    // still has in flight for that stream is ignored (§5.1), and a trailer
+    // block there must not become a connection error.
+    const gpa = testing.allocator;
+    var client: Connection = .init(gpa, .client, .{ .settings = .{ .initial_window_size = 10 } });
+    defer client.deinit();
+    var server: Connection = .init(gpa, .server, .{});
+    defer server.deinit();
+    var c2s: std.ArrayList(u8) = .empty;
+    defer c2s.deinit(gpa);
+    var s2c: std.ArrayList(u8) = .empty;
+    defer s2c.deinit(gpa);
+    var c_events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&c_events);
+    var s_events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&s_events);
+    try client.sendPreface(&c2s);
+    try server.sendPreface(&s2c);
+    try deliver(&c2s, &server, &s2c, &s_events);
+    try deliver(&s2c, &client, &c2s, &c_events);
+    try deliver(&c2s, &server, &s2c, &s_events);
+    clearEvents(&s_events);
+    clearEvents(&c_events);
+
+    const a = try client.startStream(&c2s, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    }, true);
+    try deliver(&c2s, &server, &s2c, &s_events);
+    clearEvents(&s_events);
+    try server.sendHeaders(&s2c, a, &.{.{ .name = ":status", .value = "200" }}, false);
+    // 20 octets into a 10-octet stream window: a stream FLOW_CONTROL_ERROR.
+    try encodeData(gpa, &s2c, a, "x" ** 20, .{});
+    try testing.expectError(error.FlowControlError, client.recv(s2c.items, &c2s, &c_events));
+    s2c.clearRetainingCapacity();
+    const v = client.recoverStreamError().?;
+    try testing.expectEqual(a, v.stream_id);
+    clearEvents(&c_events);
+    // The server, not knowing yet, ends the stream with trailers.
+    try server.sendHeaders(&s2c, a, &.{.{ .name = "x-t", .value = "1" }}, true);
+    try deliver(&s2c, &client, &c2s, &c_events);
+    try testing.expectEqual(@as(?Violation, null), client.violation);
+    try testing.expectEqual(@as(usize, 0), c_events.items.len);
 }
 
 test "connection: full client/server exchange over an in-memory pipe" {

@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Fix, `h2.Connection` (client and server): frames in flight for a stream we
+  reset stalled the connection.** DATA for a stream we had reset was answered with one more
+  RST_STREAM per frame, and its connection-window charge was never given back: one abandoned h2
+  response shut the connection window for every other stream, until the peer's stall timeout cut
+  the connection. Now, per RFC 9113 §5.1 and §6.9, frames for the last 32 streams we reset
+  (`sendRstStream`, or a stream error answered after `recoverStreamError`) are ignored. A trailer
+  block on such a stream is still HPACK-decoded, so the shared table stays in step. DATA that is
+  thrown away on any path is credited back with a connection WINDOW_UPDATE at once. h2spec stays
+  145/145.
+
 - **2026-10-12** — **Client: `pool.max_conns_per_host`, Go's `Transport.MaxConnsPerHost` (S2 survey
   R8b), additive.** 0 (default) = unlimited as before. Set, an origin's h1 connections — dialing,
   in use and idle, with pooling on or off — stay at or under the cap: a request at the cap takes a
