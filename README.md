@@ -29,7 +29,7 @@ carry their own attribution; it does not catalogue provenance.
 > was meant to catch, a public entry point no non-test consumer could compile.
 >
 > **What has been done about it**, so you can judge rather than take a word for it:
-> tests run in three release modes; mutation audits across the collection ask whether each
+> tests run in three optimize modes (`Debug`, `ReleaseSafe`, `ReleaseFast`); mutation audits across the collection ask whether each
 > test would actually go red; constant-time claims are machine-checked where a row in
 > `scripts/checks/ctgrind-expected.tsv` says so; `zig build check-fuzz` requires a fuzz harness on
 > every module that parses foreign bytes; `zig build check-portable` cross-compiles every
@@ -77,18 +77,18 @@ zig fetch --save git+https://github.com/zaxified/zig-libs
 },
 ```
 
-**3. Fetch, pinned to a release** — what every consumer here uses. `?ref=` records *which*
+**3. Fetch, pinned to a release** — the recommended form. `?ref=` records *which*
 tag was meant, the `#` fragment is the commit it stood for:
 
 ```
-zig fetch --save "git+https://github.com/zaxified/zig-libs?ref=2026-08-15#84332afefbbc22f2e6254ee9412cd5e9f91f27fd"
+zig fetch --save "git+https://github.com/zaxified/zig-libs?ref=2026-10-07#112fecb4e3d2838306c8d841540760f0ce13a10f"
 ```
 
 ```zig
 // build.zig.zon
 .zig_libs = .{
-    .url = "git+https://github.com/zaxified/zig-libs?ref=2026-08-15#84332afefbbc22f2e6254ee9412cd5e9f91f27fd",
-    .hash = "zig_libs-0.0.0-WiQ0Gkuq3gJ9oVeW_X5KH_WCwedy4T3uXFl5-DAcgr3J",
+    .url = "git+https://github.com/zaxified/zig-libs?ref=2026-10-07#112fecb4e3d2838306c8d841540760f0ce13a10f",
+    .hash = "zig_libs-0.0.0-WiQ0Gl1dMAU6pyTI-eL40pFMZMNUzaEbp8lRnsOIwfnI",
 },
 ```
 
@@ -157,7 +157,9 @@ never compiled.
 ## Build
 
 ```
-scripts/test.sh          # the gate — every module not yet proven at its current content
+scripts/modtest <name>   # one module's tests — what closes a change to that module
+scripts/test.sh checks-fast # the quick consistency checks the push lane runs
+scripts/test.sh          # every module not yet proven at its current content (`changed`)
 scripts/test.sh all      # every check and every module, ignoring what is proven
 zig build test           # run all module tests
 zig build test-<name>    # run one module's tests
@@ -168,7 +170,10 @@ zig build check-portable-table # verify the README "Portability" table matches m
 zig build gen-portable-table   # regenerate that table (run after changing a module's meta.targets)
 ```
 
-`scripts/test.sh` is the entry point for contributors: `scripts/test.sh changed` runs each
+A change to a module closes with `scripts/modtest <name>` for each module it touched; CI runs the
+rest. On a push, CI only checks consistency and compiles (`checks-fast` + `build`, minutes); the
+dependency closure's tests, the examples and every optimize mode run on a tag or a
+`workflow_dispatch` full lane. `scripts/test.sh changed` (the default) runs each
 module that has no green stamp at its current fingerprint (its own sources, its dependencies,
 the build machinery) together with the `check-*` gates the change can affect, and a change to
 the harness itself adds every check plus a smoke run. See `scripts/README.md`, "Which modules
@@ -287,7 +292,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 <!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
 ### Portability — claimed vs. verified
 
-Every one of the 246 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI matrix executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 246 modules — a linux64-only module has nothing further to show here.
+Every one of the 246 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 246 modules — a linux64-only module has nothing further to show here.
 
 40 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 43 declared pairs, 42 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 

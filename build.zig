@@ -6888,8 +6888,8 @@ fn renderPortableTable(
         "### Portability — claimed vs. verified\n\n" ++
             "Every one of the {d} modules above claims `.linux64` (Linux, amd64 or arm64) — the " ++
             "collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually " ++
-            "**run**, not merely compiled: the CI matrix executes every module's tests in " ++
-            "`ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That " ++
+            "**run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes " ++
+            "every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That " ++
             "claim is not repeated below for all {d} modules — a linux64-only module has nothing " ++
             "further to show here.\n\n" ++
             "{d} of them additionally claim a cross-compile target in `meta.targets` " ++
