@@ -332,6 +332,19 @@ pub const PoolOptions = struct {
     /// transparent one-shot retry (see the module doc / `request`) is the
     /// backstop for the remainder.
     idle_timeout_ms: u32 = 30_000,
+    /// Cap on connections to one `(scheme, host, port)` origin — dialing,
+    /// in use and idle together — Go's `Transport.MaxConnsPerHost`. 0
+    /// (default, Go's too) = unlimited. A request that finds its origin at
+    /// the cap first takes an idle connection if one is pooled; otherwise
+    /// it waits until a connection is released to the pool (it then takes
+    /// that one) or closed (it then dials), bounded by `total_timeout_ms`
+    /// (`error.Timeout`; 0 = waits without bound, as Go without a context
+    /// deadline). Applies with pooling off too: there every connection is
+    /// closed after its response, so the cap is on concurrent exchanges.
+    /// Counts the h1 connections of `request`/`requestStreaming`/`putFile`
+    /// and their `*Plain` twins, an upgraded (`101`) connection until its
+    /// `Response.deinit`; an h2 session (`connectH2c`) is not counted.
+    max_conns_per_host: u16 = 0,
 };
 
 pub const TlsOptions = struct {
@@ -466,7 +479,7 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Client {
         .ca_bundle = .empty,
         .ca_lock = .init,
         .ca_scanned = false,
-        .pool = Pool.init(gpa, options.pool),
+        .pool = Pool.init(gpa, io, options.pool),
     };
 }
 
@@ -556,7 +569,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
         const ask_gzip = c.requestsGzip(current_method, options.headers);
 
         var reused = false;
-        var conn = try c.acquireConn(url, &reused);
+        var conn = try c.acquireConn(url, &reused, deadline);
         // `owned` guards the errdefer below across the two places later in
         // this same iteration that explicitly `conn.destroy()` and then may
         // still return an error (the stale-connection retry's redial, and
@@ -595,7 +608,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
             try c.checkDeadline(deadline);
             conn.destroy();
             owned = false;
-            conn = try c.dialConn(url);
+            conn = try c.checkoutConn(url, &reused, deadline, false, dialConn);
             owned = true;
             break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive, ask_gzip);
         };
@@ -696,7 +709,7 @@ fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, opti
         const ask_gzip = c.requestsGzip(current_method, options.headers);
 
         var reused = false;
-        var conn = try c.acquireConnPlain(url, &reused);
+        var conn = try c.acquireConnPlain(url, &reused, deadline);
         // `owned` guards the errdefer below across the two places later in
         // this same iteration that explicitly `conn.destroy()` and then may
         // still return an error (the stale-connection retry's redial, and
@@ -714,7 +727,7 @@ fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, opti
             try c.checkDeadline(deadline);
             conn.destroy();
             owned = false;
-            conn = try c.dialPlain(url);
+            conn = try c.checkoutConn(url, &reused, deadline, false, dialPlain);
             owned = true;
             break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive, ask_gzip);
         };
@@ -1143,8 +1156,11 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
     const plan: BodyPlan = if (content_length) |n| .{ .content_length = n } else .chunked;
     const ask_gzip = c.requestsGzip(method, options.headers);
 
+    // No exchange budget here (the caller paces the body); a wait for a
+    // `max_conns_per_host` slot still gets `total_timeout_ms`.
+    const deadline = c.totalDeadline();
     var reused = false;
-    var conn = try c.acquireConn(url, &reused);
+    var conn = try c.acquireConn(url, &reused, deadline);
     // See `requestInner`/`requestInnerPlain`'s `owned` doc comment: a bare
     // `errdefer conn.destroy()` would double-free if the redial below fails
     // (reproduced by the `requestInner` regression test — this site has the
@@ -1172,7 +1188,7 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
         if (!reused or !isStaleConnError(mapped)) return mapped;
         conn.destroy();
         owned = false;
-        conn = try c.dialConn(url);
+        conn = try c.checkoutConn(url, &reused, deadline, false, dialConn);
         owned = true;
         writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
     };
@@ -1198,8 +1214,9 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
     const plan: BodyPlan = if (content_length) |n| .{ .content_length = n } else .chunked;
     const ask_gzip = c.requestsGzip(method, options.headers);
 
+    const deadline = c.totalDeadline();
     var reused = false;
-    var conn = try c.acquireConnPlain(url, &reused);
+    var conn = try c.acquireConnPlain(url, &reused, deadline);
     // See `requestInnerPlain`'s `owned` doc comment: a bare
     // `errdefer conn.destroy()` would double-free if the redial below fails.
     var owned = true;
@@ -1213,7 +1230,7 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
         if (!reused or !isStaleConnError(mapped)) return mapped;
         conn.destroy();
         owned = false;
-        conn = try c.dialPlain(url);
+        conn = try c.checkoutConn(url, &reused, deadline, false, dialPlain);
         owned = true;
         writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
     };
@@ -1612,6 +1629,11 @@ const Conn = struct {
     /// the proxy's credentials. (A `CONNECT` tunnel leaves it null: inside
     /// the tunnel the origin is spoken to directly.)
     forward_proxy: ?client_proxy.Endpoint = null,
+    /// Counted against `PoolOptions.max_conns_per_host`: `destroy` gives
+    /// the origin's slot back. Set by `checkoutConn` after a dial it
+    /// reserved a slot for; a connection dialed any other way (tests) is
+    /// not counted.
+    holds_slot: bool = false,
 
     const BodyState = union(enum) {
         unset,
@@ -1665,6 +1687,9 @@ const Conn = struct {
     fn destroy(conn: *Conn) void {
         const gpa = conn.client.gpa;
         conn.stream.close(conn.client.io);
+        // After the close: a waiter woken here dials at once, and the cap
+        // is on sockets the peer sees, not on our bookkeeping.
+        if (conn.holds_slot) conn.client.pool.freeSlot(&conn.origin);
         gpa.free(conn.slab);
         gpa.destroy(conn);
     }
@@ -1719,13 +1744,43 @@ const Origin = struct {
 /// alone is fully deterministic to test.
 const Pool = struct {
     gpa: std.mem.Allocator,
+    /// Only for the futex wake that tells a `max_conns_per_host` waiter a
+    /// slot or an idle connection may have appeared.
+    io: std.Io,
     options: PoolOptions,
     mutex: std.atomic.Mutex = .unlocked,
     idle: std.ArrayList(Idle) = .empty,
+    /// Connections held per origin under `max_conns_per_host` (dialing, in
+    /// use or idle); an origin at 0 has no entry. Empty while the cap is 0.
+    slots: std.ArrayList(Slot) = .empty,
+    /// Bumped after anything a slot waiter could use appears (a slot freed,
+    /// a connection pooled); the futex word waiters park on.
+    epoch: std.atomic.Value(u32) = .init(0),
+    /// Parked waiters — a release wakes nobody (no syscall) while 0.
+    waiters: std.atomic.Value(u32) = .init(0),
 
     const Idle = struct {
         conn: *Conn,
         idle_since_ms: i64,
+    };
+
+    const Slot = struct {
+        origin: Origin,
+        n: u16,
+    };
+
+    /// What `checkout` found for an origin.
+    const Checkout = union(enum) {
+        /// A warm pooled connection — use it.
+        idle: *Conn,
+        /// Dial; a slot is reserved when the cap is on (`freeSlot` it if
+        /// the dial fails). `evicted`, when set, is an idle connection of
+        /// the same origin whose slot this dial took over: close it (its
+        /// `holds_slot` is already cleared).
+        dial: ?*Conn,
+        /// The origin is at its cap; park on `epoch` while it still reads
+        /// this value (`waiters` already counts the caller).
+        wait: u32,
     };
 
     /// Hard upper bound on how many connections one call closes in a
@@ -1734,17 +1789,92 @@ const Pool = struct {
     /// configured cap actually fits.
     const max_reap_batch = 4096;
 
-    fn init(gpa: std.mem.Allocator, options: PoolOptions) Pool {
+    fn init(gpa: std.mem.Allocator, io: std.Io, options: PoolOptions) Pool {
         std.debug.assert(options.max_idle_total <= max_reap_batch);
-        return .{ .gpa = gpa, .options = options };
+        return .{ .gpa = gpa, .io = io, .options = options };
     }
 
     /// Close every idle connection and free the pool's own bookkeeping.
     /// Not synchronized — call only once nothing else can touch the pool
     /// (this mirrors `Client.deinit`'s own contract).
     fn deinit(p: *Pool) void {
-        for (p.idle.items) |it| it.conn.destroy();
-        p.idle.deinit(p.gpa);
+        // Detach first: `destroy` gives a counted connection's slot back
+        // through `freeSlot`, which must not see a list being walked.
+        var idle = p.idle;
+        p.idle = .empty;
+        for (idle.items) |it| it.conn.destroy();
+        idle.deinit(p.gpa);
+        p.slots.deinit(p.gpa);
+    }
+
+    /// The `max_conns_per_host` gate, one decision under the lock. With
+    /// `take_idle` a pooled connection of the origin is handed out first
+    /// (an ordinary checkout); without it (a stale-connection retry, which
+    /// wants a fresh dial) an idle one at the cap is evicted instead, so
+    /// the retry never waits on a connection only it could have used.
+    fn checkout(p: *Pool, scheme: http.Url.Scheme, host: []const u8, port: u16, now_ms: i64, take_idle: bool) error{OutOfMemory}!Checkout {
+        if (take_idle and p.options.enabled) {
+            if (p.acquire(scheme, host, port, now_ms)) |conn| return .{ .idle = conn };
+        }
+        const cap = p.options.max_conns_per_host;
+        if (cap == 0) return .{ .dial = null };
+        // The key as `Origin.set` stores it (an over-long host truncated),
+        // so `freeSlot`, which has only the stored key, finds this entry.
+        const key = host[0..@min(host.len, Origin.max_origin_host)];
+
+        lockSpin(&p.mutex);
+        defer p.mutex.unlock();
+        const slot: *Slot = for (p.slots.items) |*s| {
+            if (s.origin.eql(scheme, key, port)) break s;
+        } else s: {
+            const s = try p.slots.addOne(p.gpa);
+            s.n = 0;
+            s.origin.set(scheme, port, key);
+            break :s s;
+        };
+        if (slot.n < cap) {
+            slot.n += 1;
+            return .{ .dial = null };
+        }
+        // At the cap. An idle connection of this origin can only be here
+        // without `take_idle` (or because it was pooled after `acquire`
+        // above looked): evict the oldest, inherit its slot.
+        var oldest: ?usize = null;
+        for (p.idle.items, 0..) |it, idx| {
+            if (!it.conn.origin.eql(scheme, key, port)) continue;
+            if (oldest == null or it.idle_since_ms < p.idle.items[oldest.?].idle_since_ms) oldest = idx;
+        }
+        if (oldest) |idx| {
+            const conn = p.idle.orderedRemove(idx).conn;
+            if (take_idle) return .{ .idle = conn };
+            conn.holds_slot = false;
+            return .{ .dial = conn };
+        }
+        _ = p.waiters.fetchAdd(1, .monotonic);
+        return .{ .wait = p.epoch.load(.acquire) };
+    }
+
+    /// Give an origin's slot back (`Conn.destroy`, a failed dial) and wake
+    /// the waiters.
+    fn freeSlot(p: *Pool, origin: *const Origin) void {
+        {
+            lockSpin(&p.mutex);
+            defer p.mutex.unlock();
+            for (p.slots.items, 0..) |*s, idx| {
+                if (!s.origin.eql(origin.scheme, origin.host(), origin.port)) continue;
+                s.n -= 1;
+                if (s.n == 0) _ = p.slots.swapRemove(idx);
+                break;
+            } else unreachable; // a held slot has an entry
+        }
+        p.wake();
+    }
+
+    /// After the state a waiter checks has changed (outside the lock — a
+    /// waiter that read `epoch` before the change sees it moved).
+    fn wake(p: *Pool) void {
+        _ = p.epoch.fetchAdd(1, .release);
+        if (p.waiters.load(.acquire) > 0) p.io.futexWake(u32, &p.epoch.raw, std.math.maxInt(u32));
     }
 
     fn idleCount(p: *Pool) usize {
@@ -1839,6 +1969,8 @@ const Pool = struct {
         }
         for (evict_buf[0..evict_n]) |c| c.destroy();
         if (!kept) conn.destroy();
+        // A `max_conns_per_host` waiter can take the pooled connection.
+        if (kept and p.options.max_conns_per_host != 0) p.wake();
     }
 
     /// Reap every idle connection older than `idle_timeout_ms` right now
@@ -1878,15 +2010,59 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 /// whether a subsequent write/read failure is eligible for the transparent
 /// one-shot retry (see `request`'s doc comment on that retry's safety
 /// boundary).
-fn acquireConn(c: *Client, url: http.Url, reused: *bool) Error!*Conn {
-    if (c.options.pool.enabled) {
-        if (c.pool.acquire(url.scheme, url.host, url.port, c.nowMs())) |conn| {
-            reused.* = true;
-            return conn;
+fn acquireConn(c: *Client, url: http.Url, reused: *bool, deadline: ?std.Io.Clock.Timestamp) Error!*Conn {
+    return c.checkoutConn(url, reused, deadline, true, dialConn);
+}
+
+/// Get a connection to `url`'s origin within `PoolOptions.max_conns_per_host`
+/// (when 0, exactly the old pool-then-dial): `take_idle` = an ordinary
+/// checkout (`acquireConn`), false = a fresh dial for a stale-connection
+/// retry. `dial` is passed in, never named here, so the plaintext entry
+/// points stay TLS-free (`dialPlain`'s reachability contract). A wait for a
+/// slot ends at `deadline` with `error.Timeout`, or with `error.Canceled`
+/// when the task is canceled (`runBounded`'s deadline).
+fn checkoutConn(
+    c: *Client,
+    url: http.Url,
+    reused: *bool,
+    deadline: ?std.Io.Clock.Timestamp,
+    take_idle: bool,
+    comptime dial: fn (*Client, http.Url) Error!*Conn,
+) Error!*Conn {
+    const p = &c.pool;
+    while (true) {
+        switch (try p.checkout(url.scheme, url.host, url.port, c.nowMs(), take_idle)) {
+            .idle => |conn| {
+                reused.* = true;
+                return conn;
+            },
+            .dial => |evicted| {
+                if (evicted) |e| e.destroy();
+                reused.* = false;
+                const counted = p.options.max_conns_per_host != 0;
+                const conn = dial(c, url) catch |err| {
+                    if (counted) {
+                        var o: Origin = undefined;
+                        o.set(url.scheme, url.port, url.host);
+                        p.freeSlot(&o);
+                    }
+                    return err;
+                };
+                conn.holds_slot = counted;
+                return conn;
+            },
+            .wait => |epoch| {
+                defer _ = p.waiters.fetchSub(1, .monotonic);
+                const timeout: std.Io.Timeout = if (deadline) |d| t: {
+                    if (d.durationFromNow(c.io).raw.nanoseconds <= 0) return error.Timeout;
+                    break :t .{ .deadline = d };
+                } else .none;
+                // A timeout or a spurious wake just loops: the next
+                // `checkout` decides, and the check above ends a spent budget.
+                try c.io.futexWaitTimeout(u32, &p.epoch.raw, epoch, timeout);
+            },
         }
     }
-    reused.* = false;
-    return c.dialConn(url);
 }
 
 /// `acquireConn`'s plaintext-only twin: same pool checkout, but a miss dials
@@ -1900,16 +2076,9 @@ fn acquireConn(c: *Client, url: http.Url, reused: *bool) Error!*Conn {
 /// `dialPlain` (this path) or by `dialConn`'s dispatch (the TLS-capable
 /// path, which also plaintext-dials `.http` origins) — either way a
 /// plaintext connection, safe to hand back here.
-fn acquireConnPlain(c: *Client, url: http.Url, reused: *bool) Error!*Conn {
+fn acquireConnPlain(c: *Client, url: http.Url, reused: *bool, deadline: ?std.Io.Clock.Timestamp) Error!*Conn {
     if (url.scheme != .http) return error.UnsupportedScheme;
-    if (c.options.pool.enabled) {
-        if (c.pool.acquire(url.scheme, url.host, url.port, c.nowMs())) |conn| {
-            reused.* = true;
-            return conn;
-        }
-    }
-    reused.* = false;
-    return c.dialPlain(url);
+    return c.checkoutConn(url, reused, deadline, true, dialPlain);
 }
 
 /// Write the request head + optional in-memory body, flush, and read back
@@ -5379,6 +5548,211 @@ test "pool: concurrent acquire/release from many threads is leak-free and race-f
     // `testing.allocator` catches any leak or double-free across the whole
     // run.
     try testing.expect(client.poolIdleCount() <= 8);
+}
+
+/// A loopback listener nobody accepts on: connects still complete (the
+/// kernel's backlog), which is all `checkoutConn`'s slot accounting needs.
+fn capTestListener(io: std.Io) !struct { net.Server, http.Url } {
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err|
+        return testkit.loopbackSkip("max_conns_per_host test listen failed ({t})", .{err});
+    errdefer listener.deinit(io);
+    const url: http.Url = .{ .scheme = .http, .host = "127.0.0.1", .port = listener.socket.address.getPort(), .path = "/", .query = "" };
+    return .{ listener, url };
+}
+
+fn deadlineIn(io: std.Io, ms: i64) std.Io.Clock.Timestamp {
+    return .fromNow(io, .{ .raw = .fromMilliseconds(ms), .clock = .awake });
+}
+
+test "max_conns_per_host: at the cap a checkout waits, takes a pooled connection, times out" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var listener, const url = try capTestListener(io);
+    defer listener.deinit(io);
+
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_conns_per_host = 2 } });
+    defer client.deinit();
+    var reused = false;
+    const a = try client.acquireConn(url, &reused, null);
+    const b = try client.acquireConn(url, &reused, null);
+    try testing.expect(a.holds_slot and b.holds_slot);
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+
+    // Third: nothing idle, no slot — the budget runs out, nothing dialed.
+    try testing.expectError(error.Timeout, client.acquireConn(url, &reused, deadlineIn(io, 30)));
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+    try testing.expectEqual(@as(u32, 0), client.pool.waiters.load(.monotonic));
+
+    // A connection back in the pool is the third request's.
+    client.pool.release(a, client.nowMs());
+    const c = try client.acquireConn(url, &reused, deadlineIn(io, 1000));
+    try testing.expect(reused and c == a);
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+
+    // Another origin (port) has its own cap.
+    var listener2, const other = try capTestListener(io);
+    defer listener2.deinit(io);
+    const d = try client.acquireConn(other, &reused, deadlineIn(io, 1000));
+    d.destroy();
+
+    b.destroy();
+    c.destroy();
+    try testing.expectEqual(@as(usize, 0), client.pool.slots.items.len);
+}
+
+test "max_conns_per_host: a parked waiter dials when a connection closes" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var listener, const url = try capTestListener(io);
+    defer listener.deinit(io);
+
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false, .max_conns_per_host = 1 } });
+    defer client.deinit();
+    var reused = false;
+    const a = try client.acquireConn(url, &reused, null);
+
+    const Waiter = struct {
+        got: ?*Conn = null,
+        err: ?Error = null,
+        fn run(w: *@This(), cl: *Client, u: http.Url) void {
+            var r = false;
+            w.got = cl.acquireConn(u, &r, null) catch |e| {
+                w.err = e;
+                return;
+            };
+        }
+    };
+    var w: Waiter = .{};
+    const t = try std.Thread.spawn(.{}, Waiter.run, .{ &w, &client, url });
+    // Parked (no deadline) before the close, so the wake is what frees it.
+    var spins: usize = 0;
+    while (client.pool.waiters.load(.acquire) == 0) : (spins += 1) {
+        if (spins > 5000) break;
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    const parked = client.pool.waiters.load(.acquire) == 1;
+    a.destroy();
+    t.join();
+    try testing.expect(parked);
+    try testing.expectEqual(@as(?Error, null), w.err);
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+    w.got.?.destroy();
+}
+
+test "max_conns_per_host: a fresh redial at the cap evicts the origin's idle connection" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var listener, const url = try capTestListener(io);
+    defer listener.deinit(io);
+
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_conns_per_host = 2 } });
+    defer client.deinit();
+    var reused = false;
+    const a = try client.acquireConn(url, &reused, null);
+    const b = try client.acquireConn(url, &reused, null);
+    client.pool.release(b, client.nowMs());
+    // `a` went stale: the retry destroys it and wants a FRESH dial; even
+    // with `b` idle that must not wait (and must not hand `b` out).
+    a.destroy();
+    const a2 = try client.checkoutConn(url, &reused, deadlineIn(io, 1000), false, dialConn);
+    try testing.expect(!reused and a2 != b);
+    // Now at the cap with `b` idle: the fresh dial takes over its slot.
+    const c = try client.checkoutConn(url, &reused, deadlineIn(io, 1000), false, dialConn);
+    try testing.expect(!reused);
+    try testing.expectEqual(@as(usize, 0), client.poolIdleCount());
+    try testing.expectEqual(@as(usize, 4), client.dialCount());
+    try testing.expectEqual(@as(u16, 2), client.pool.slots.items[0].n);
+    a2.destroy();
+    c.destroy();
+    try testing.expectEqual(@as(usize, 0), client.pool.slots.items.len);
+}
+
+test "max_conns_per_host: a failed dial gives its slot back" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // A port that was listening a moment ago: connects are refused.
+    var listener, const url = try capTestListener(io);
+    listener.deinit(io);
+
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_conns_per_host = 1 } });
+    defer client.deinit();
+    var reused = false;
+    for (0..3) |_| try testing.expectError(error.ConnectFailed, client.acquireConn(url, &reused, deadlineIn(io, 1000)));
+    try testing.expectEqual(@as(usize, 0), client.pool.slots.items.len);
+}
+
+test "max_conns_per_host: N+1 concurrent requests, N connections (Go MaxConnsPerHost)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try poolTestLoopback(io, 0);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_conns_per_host = 2 } });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{server.boundAddress().getPort()});
+
+    const Worker = struct {
+        fn run(cl: *Client, u: []const u8, failures: *std.atomic.Value(u32)) void {
+            for (0..20) |_| {
+                var res = cl.request(.get, u, .{}) catch {
+                    _ = failures.fetchAdd(1, .monotonic);
+                    return;
+                };
+                drainAndDeinit(&res);
+            }
+        }
+    };
+    var failures: std.atomic.Value(u32) = .init(0);
+    var threads: [6]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &client, url, &failures });
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
+    try testing.expect(client.dialCount() <= 2);
+}
+
+test "max_conns_per_host: a request waiting for a slot ends at total_timeout_ms" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try poolTestLoopback(io, 0);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{server.boundAddress().getPort()});
+
+    // Bounded by cancelation (`runBounded`) and, inline, by the deadline
+    // the wait itself carries.
+    for ([_]bool{ false, true }) |inline_blocking| {
+        var client = Client.init(io, testing.allocator, .{
+            .total_timeout_ms = 100,
+            .inline_blocking = inline_blocking,
+            .pool = .{ .max_conns_per_host = 1 },
+        });
+        defer client.deinit();
+        var held = try client.request(.get, url, .{}); // body unread: holds the slot
+        try testing.expectError(error.Timeout, client.request(.get, url, .{}));
+        try testing.expectError(error.Timeout, client.requestPlain(.get, url, .{}));
+        drainAndDeinit(&held);
+        var again = try client.request(.get, url, .{});
+        drainAndDeinit(&again);
+        try testing.expectEqual(@as(usize, 1), client.dialCount());
+    }
 }
 
 test "runBounded: inline_only takes the caller's-thread path without starting a task" {

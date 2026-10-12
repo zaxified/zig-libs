@@ -471,7 +471,17 @@ Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML not
   corrected the design once: Go leaves a 204 or `Content-Length: 0` answer undecoded. Negative
   control: 13 mutants (trailer, padding, multistream, Range/HEAD, header hiding, cap, error mapping,
   request field), all caught.
-- R8 rest: h2 via ALPN in `Client.request`, `max_conns_per_host`.
+- R8b `max_conns_per_host` — DONE 2026-10-12: `PoolOptions.max_conns_per_host` (0 = unlimited, Go's
+  default) counts an origin's dialing, in-use and idle h1 connections, pooling on or off. At the cap
+  a request takes an idle connection, else parks on a futex until one is pooled (takes it) or
+  closed (dials), bounded by `total_timeout_ms` — by cancelation under `runBounded`, by the wait's
+  own deadline inline. A stale-connection retry wants a fresh dial: at the cap it evicts the
+  origin's oldest idle connection rather than wait (a wait there could only end on that connection).
+  h2 sessions are not counted. Go oracle area `max_conns` (6 cases: keep-alive, `DisableKeepAlives`,
+  `Connection: close`; peer-side max in flight + accepts). Negative control: 10 mutants (cap, both
+  wakes, waiter count, eviction, slot release on failed dial / close, deadline), all caught; the
+  oracle alone catches an ignored cap.
+- R8 rest: h2 via ALPN in `Client.request`.
 - R9 extension methods (CONNECT, TRACE, `PURGE`, …) reach the handler instead of 501 — breaks
   exhaustive `switch (req.method)` in qap (5), metrics, mcp-http, openapi; patched together.
 - R10 a test recorder (`httptest.NewRecorder`) over `serveStream`.

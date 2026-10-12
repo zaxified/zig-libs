@@ -48,6 +48,7 @@ func main() {
 	emitForm(&b)
 	emitRProxyHooks(&b)
 	emitClientGzip(&b)
+	emitMaxConns(&b)
 	// Every area ends its table with a blank line; the file ends with one newline.
 	b.Truncate(b.Len() - 1)
 

@@ -765,6 +765,149 @@ test "go oracle client_gzip: transparent gzip matches Go's Transport, or the dif
     try testing.expectEqual(@as(usize, 0), bad);
 }
 
+// ── max_conns: Transport.MaxConnsPerHost ─────────────────────────────────
+
+/// The Go side's peer (tools/go_oracle/maxconns.go), same rules: every
+/// answer held `max_conns_hold_ms` and until `want` requests are in flight
+/// (1 s at most); counts accepts and the most requests in flight at once.
+const MaxConnsPeer = struct {
+    io: std.Io,
+    listener: *net.Server,
+    want: u32,
+    close: bool,
+    in_flight: std.atomic.Value(u32) = .init(0),
+    max_seen: std.atomic.Value(u32) = .init(0),
+    accepts: std.atomic.Value(u32) = .init(0),
+    stop: std.atomic.Value(u32) = .init(0),
+    threads: [16]std.Thread = undefined,
+    n_threads: usize = 0,
+
+    fn run(p: *MaxConnsPeer) void {
+        while (true) {
+            const s = p.listener.accept(p.io) catch return;
+            // `finish`'s own dial: not one of the client's.
+            if (p.stop.load(.acquire) != 0) {
+                s.close(p.io);
+                return;
+            }
+            _ = p.accepts.fetchAdd(1, .monotonic);
+            if (p.n_threads == p.threads.len) {
+                s.close(p.io);
+                continue;
+            }
+            p.threads[p.n_threads] = std.Thread.spawn(.{}, serve, .{ p, s }) catch {
+                s.close(p.io);
+                continue;
+            };
+            p.n_threads += 1;
+        }
+    }
+
+    fn serve(p: *MaxConnsPeer, s: net.Stream) void {
+        defer s.close(p.io);
+        var rbuf: [1024]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        var wbuf: [128]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        while (true) {
+            while (true) {
+                const line = sr.interface.takeDelimiterInclusive('\n') catch return;
+                if (std.mem.eql(u8, line, "\r\n")) break;
+            }
+            const now = p.in_flight.fetchAdd(1, .acq_rel) + 1;
+            _ = p.max_seen.fetchMax(now, .acq_rel);
+            const start = std.Io.Clock.Timestamp.now(p.io, .awake);
+            while (true) {
+                const el_ms = @divTrunc(start.durationTo(std.Io.Clock.Timestamp.now(p.io, .awake)).raw.nanoseconds, std.time.ns_per_ms);
+                const enough = p.in_flight.load(.acquire) >= p.want;
+                if ((enough and el_ms >= vectors.max_conns_hold_ms) or el_ms >= 1000) break;
+                p.io.sleep(.fromMilliseconds(2), .awake) catch {};
+            }
+            _ = p.in_flight.fetchSub(1, .acq_rel);
+            sw.interface.writeAll(if (p.close)
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+            else
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") catch return;
+            sw.interface.flush() catch return;
+            if (p.close) return;
+        }
+    }
+
+    /// Ends `run` (a dial past its `accept`) and joins every connection
+    /// thread — call once the client is gone, so they all see EOF.
+    fn finish(p: *MaxConnsPeer, accept_thread: std.Thread) void {
+        p.stop.store(1, .release);
+        if (net.IpAddress.parse("127.0.0.1", p.listener.socket.address.getPort())) |addr| {
+            if (addr.connect(p.io, .{ .mode = .stream })) |s| s.close(p.io) else |_| {}
+        } else |_| {}
+        accept_thread.join();
+        for (p.threads[0..p.n_threads]) |t| t.join();
+    }
+};
+
+const MaxConnsOutcome = struct { max_in_flight: u32, accepts: u32, failures: u32 };
+
+fn ourMaxConns(io: std.Io, gpa: std.mem.Allocator, c: vectors.MaxConnsCase) !MaxConnsOutcome {
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("go oracle max_conns: listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const want: u32 = if (c.cap == 0 or c.cap > c.n) c.n else c.cap;
+    var peer: MaxConnsPeer = .{ .io = io, .listener = &listener, .want = want, .close = c.server_close };
+    const accept_thread = try std.Thread.spawn(.{}, MaxConnsPeer.run, .{&peer});
+    var failures: std.atomic.Value(u32) = .init(0);
+    {
+        var client = Client.init(io, gpa, .{ .pool = .{
+            .enabled = c.keep_alive,
+            .max_conns_per_host = c.cap,
+            .max_idle_per_host = 8,
+        } });
+        defer client.deinit();
+        var url_buf: [64]u8 = undefined;
+        const url_text = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+        const Worker = struct {
+            fn run(cl: *Client, u: []const u8, f: *std.atomic.Value(u32)) void {
+                var res = cl.requestPlain(.get, u, .{}) catch {
+                    _ = f.fetchAdd(1, .monotonic);
+                    return;
+                };
+                defer res.deinit();
+                _ = res.reader().discardRemaining() catch {
+                    _ = f.fetchAdd(1, .monotonic);
+                };
+            }
+        };
+        var threads: [16]std.Thread = undefined;
+        for (threads[0..c.n]) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &client, url_text, &failures });
+        for (threads[0..c.n]) |t| t.join();
+    }
+    peer.finish(accept_thread);
+    return .{
+        .max_in_flight = peer.max_seen.load(.acquire),
+        .accepts = peer.accepts.load(.acquire),
+        .failures = failures.load(.monotonic),
+    };
+}
+
+test "go oracle max_conns: MaxConnsPerHost caps connections as Go's Transport does" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var bad: usize = 0;
+    for (vectors.max_conns) |c| {
+        const ours = try ourMaxConns(io, gpa, c);
+        if (ours.max_in_flight == c.max_in_flight and ours.accepts == c.accepts and ours.failures == c.failures) continue;
+        bad += 1;
+        std.debug.print("max_conns {s}: diverges\n  go:   in_flight={d} accepts={d} failures={d}\n  ours: in_flight={d} accepts={d} failures={d}\n", .{
+            c.id, c.max_in_flight, c.accepts, c.failures, ours.max_in_flight, ours.accepts, ours.failures,
+        });
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
 // ── proxy: which proxy a URL goes through ────────────────────────────────
 
 const client_proxy = @import("client_proxy.zig");

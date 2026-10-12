@@ -650,7 +650,11 @@ provider is called concurrently too. For zstd, zig-libs `zstd.StreamWriter`
   `keep-alive`, a `101` upgrade, an undrained body, or any read/write error
   all close the connection instead of pooling it). Set
   `Options.pool.enabled = false` for the old one-shot-per-request behavior
-  (`Connection: close` on every request).
+  (`Connection: close` on every request). `Options.pool.max_conns_per_host`
+  (0 = unlimited, the default) caps an origin's connections -- dialing, in
+  use and idle -- like Go's `MaxConnsPerHost`: a request at the cap takes
+  the next connection released to the pool or dials when one closes,
+  waiting at most `total_timeout_ms` (`error.Timeout`).
 - **Outbound proxy:** `Options.proxy` (default: none). `http://` requests
   go to the `http` proxy with an absolute-form target; `https://` requests
   open a `CONNECT` tunnel through the `https` proxy and run TLS to the origin

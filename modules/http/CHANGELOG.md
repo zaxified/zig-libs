@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Client: `pool.max_conns_per_host`, Go's `Transport.MaxConnsPerHost` (S2 survey
+  R8b), additive.** 0 (default) = unlimited as before. Set, an origin's h1 connections — dialing,
+  in use and idle, with pooling on or off — stay at or under the cap: a request at the cap takes a
+  connection released to the pool or dials once one closes, waiting at most `total_timeout_ms`
+  (`error.Timeout`). An upgraded (`101`) connection counts until `Response.deinit`; h2 sessions
+  are not counted. Held to Go by the oracle area `max_conns`.
+
 - **2026-10-12** — **Client: transparent gzip, Go's default `Transport` behaviour (S2 survey R8a),
   opt-in, additive.** `Client.Options.decompress = .gzip(max_bytes)` (null, the default, keeps
   `Accept-Encoding: identity` and links no decoder): a request without a caller `Accept-Encoding` or `Range`, not HEAD,

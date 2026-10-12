@@ -945,3 +945,33 @@ pub const client_gzip = [_]GzipCase{
     .{ .id = "trailing-zeros", .method = "GET", .header = "", .response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 38\r\n\r\n\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\xcaH\xcd\xc9\xc9WH\xaf\xca,\x00\x04\x00\x00\xff\xff\x19j\xd2\xdf\n\x00\x00\x00\x00\x00\x00\x00", .accept_encoding = "gzip", .status = 200, .uncompressed = true, .content_encoding = "", .content_length = -1, .body = null },
     .{ .id = "bad-fhcrc", .method = "GET", .header = "", .response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 42\r\n\r\n\x1f\x8b\x08\n\x00\x00\x00\x00\x00\xffn.txt\x00\xcd\xab\xcaH\xcd\xc9\xc9WH\xaf\xca,\x00\x04\x00\x00\xff\xff\x19j\xd2\xdf\n\x00\x00\x00", .accept_encoding = "gzip", .status = 200, .uncompressed = true, .content_encoding = "", .content_length = -1, .body = null },
 };
+
+pub const MaxConnsCase = struct {
+    id: []const u8,
+    /// Transport.MaxConnsPerHost; 0 = unlimited.
+    cap: u16,
+    /// Concurrent single-GET goroutines.
+    n: u16,
+    /// false = DisableKeepAlives.
+    keep_alive: bool,
+    /// The peer answers `Connection: close`.
+    server_close: bool,
+    /// Most requests the peer saw in flight at once.
+    max_in_flight: u16,
+    /// Connections the peer accepted.
+    accepts: u16,
+    failures: u16,
+};
+
+/// Hold time of the peer's answers (ms), shared with the replay.
+pub const max_conns_hold_ms = 100;
+
+/// Go's http.Transport{MaxConnsPerHost} against a peer that holds each answer (see tools/go_oracle/maxconns.go).
+pub const max_conns = [_]MaxConnsCase{
+    .{ .id = "uncapped", .cap = 0, .n = 4, .keep_alive = true, .server_close = false, .max_in_flight = 4, .accepts = 4, .failures = 0 },
+    .{ .id = "cap2", .cap = 2, .n = 6, .keep_alive = true, .server_close = false, .max_in_flight = 2, .accepts = 2, .failures = 0 },
+    .{ .id = "cap1", .cap = 1, .n = 4, .keep_alive = true, .server_close = false, .max_in_flight = 1, .accepts = 1, .failures = 0 },
+    .{ .id = "cap3-n2", .cap = 3, .n = 2, .keep_alive = true, .server_close = false, .max_in_flight = 2, .accepts = 2, .failures = 0 },
+    .{ .id = "cap2-no-keepalive", .cap = 2, .n = 6, .keep_alive = false, .server_close = false, .max_in_flight = 2, .accepts = 6, .failures = 0 },
+    .{ .id = "cap2-server-close", .cap = 2, .n = 6, .keep_alive = true, .server_close = true, .max_in_flight = 2, .accepts = 6, .failures = 0 },
+};
