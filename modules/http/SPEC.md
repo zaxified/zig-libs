@@ -301,7 +301,8 @@ static).
 **Fuzz harnesses (HD1):** every untrusted-wire parser has a `std.testing.fuzz` harness asserting
 "typed error or valid result, never a panic" — `h1.RequestHead.parse`/`ResponseHead.parse`/
 `ChunkedReader` (request/status line, header block, chunked framing), `body.ContentType.parse`/
-`urlencoded` (Content-Type + form body), `multipart.parse` (form-data boundary/part parse) and
+`urlencoded` (Content-Type + form body), `form.parseSource` (a whole form over method, type, query
+and body), `multipart.parse` (form-data boundary/part parse) and
 `multipart.Reader` (the streaming parser, fuzzed differentially against `parse` over arbitrary read
 sizes and buffer lengths: same parts, same end),
 `range.parse` (Range header), `hpack.Decoder.decodeBlock` (HPACK header-block decode), and
@@ -427,8 +428,17 @@ Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML not
   a location resolving to `/\host` is refused. Go's `Error` keeps `Content-Encoding`/`Etag`/
   `Last-Modified` (the survey assumed it drops them; the oracle says no), and writes the redirect
   body with two newlines.
-- R4 `http.form`: one form object over query + urlencoded + multipart (Go `ParseForm`/`FormValue`),
-  client form encoder.
+- R4 `http.form` — DONE 2026-10-12: `form.Form.parse(arena, req, limits)` (Go `ParseForm` +
+  `ParseMultipartForm`; `value`/`postValue`/`values`/`file` = `FormValue`/`PostFormValue`/
+  `Form[k]`/`FormFile`) and the client encoder `form.encode`/`encodeAlloc`/`escape` (Go
+  `Values.Encode`/`QueryEscape`). `body.checkMediaType` is Go's strict `mime.ParseMediaType` verdict;
+  `multipart` now drops a disposition on any of its errors (valueless or unterminated parameter) and
+  keeps one that repeats a parameter with the same value, as Go does. Go oracle area `form` (64
+  requests, 12 escapes; negative control: dropping `filepath.Base`, the multipart precedence or the
+  Content-Type flag each fails it): two judged divergences, a `;` stays a byte (as in `url`) and
+  quoted-printable parts are not decoded. Hard failures (body over cap, broken multipart, missing
+  boundary) are errors, not Go's half-filled form; no temp files (the whole multipart body must fit
+  `max_multipart_bytes`). Fuzz harness `http-form`.
 - R5 `on_error` hook (Go `ErrorLog`) — DONE 2026-10-12: `Options`/`StreamOptions`/`h2_server.Options`
   `.on_error`, `ErrorKind` {handler_failed, request_refused, server_failed, accept_failed}; fired
   through one `noinline` call so the serving frame stays inside its budget (checked in ReleaseSafe).

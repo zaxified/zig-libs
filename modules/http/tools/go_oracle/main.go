@@ -45,6 +45,7 @@ func main() {
 	emitProxy(&b)
 	emitRProxy(&b)
 	emitHelpers(&b)
+	emitForm(&b)
 	// Every area ends its table with a blank line; the file ends with one newline.
 	b.Truncate(b.Len() - 1)
 

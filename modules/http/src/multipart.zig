@@ -126,22 +126,14 @@ const Meta = struct {
     fn of(headers_raw: []u8) Meta {
         var m: Meta = .{ .content_type = findHeader(headers_raw, "content-type") };
         const cd_raw = findHeader(headers_raw, "content-disposition") orelse return m;
+        // A disposition Go's `mime.ParseMediaType` reports any error for is
+        // dropped whole, as Go's `Part` then has no parameters: a parameter
+        // given twice with two values (two parsers must not read two field
+        // names out of one header, `name="email"; name="admin"`), a
+        // valueless or unterminated one, more parameters than a browser ever
+        // sends (`body.max_checked_params`, which keeps the check linear).
+        if (!body.checkMediaType(cd_raw).clean) return m;
         const cd = body.ContentType.parse(cd_raw) orelse return m;
-        // A parameter given twice (any parameter, names compared without
-        // case) drops the whole disposition, as Go's `mime.ParseMediaType`
-        // refuses it: two parsers must not read two field names out of one
-        // header (`name="email"; name="admin"`). More parameters than a
-        // browser ever sends are dropped the same way, which keeps the
-        // check linear.
-        var seen: [max_disposition_params][]const u8 = undefined;
-        var n: usize = 0;
-        var it = cd.params();
-        while (it.next()) |p| {
-            for (seen[0..n]) |s| if (std.ascii.eqlIgnoreCase(s, p.name)) return m;
-            if (n == seen.len) return m;
-            seen[n] = p.name;
-            n += 1;
-        }
         // Both looked up before either is unescaped: unescaping rewrites the
         // header bytes, and a second lookup would parse the rewritten line.
         const name = cd.param("name");
@@ -154,7 +146,7 @@ const Meta = struct {
 
 /// Parameters a `Content-Disposition` may carry before it is dropped as
 /// malformed. Browsers send two (`name`, `filename`).
-const max_disposition_params = 32;
+const max_disposition_params = body.max_checked_params;
 
 /// `value` (a slice of `buf`) with its quoted-pairs unescaped in place when it
 /// was a quoted-string.

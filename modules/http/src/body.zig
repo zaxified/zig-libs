@@ -130,6 +130,146 @@ fn isTspecial(c: u8) bool {
     return std.mem.indexOfScalar(u8, "()<>@,;:\\\"/[]?=", c) != null;
 }
 
+/// RFC 2045 §5.1 token octet: visible ASCII that is not a tspecial.
+fn isTokenChar(c: u8) bool {
+    return c > 0x20 and c < 0x7f and !isTspecial(c);
+}
+
+fn tokenLen(s: []const u8) usize {
+    for (s, 0..) |c, i| if (!isTokenChar(c)) return i;
+    return s.len;
+}
+
+/// What Go's `mime.ParseMediaType` concludes about a media-type header
+/// value, without building its parameter map. `ContentType.parse` is the
+/// lenient reader; this is the strict verdict, for the places where Go's
+/// answer decides what is read at all (a request form's `Content-Type`, a
+/// form part's `Content-Disposition`).
+pub const MediaTypeCheck = struct {
+    /// The media type (trimmed, case as sent), or "" when Go refuses the
+    /// header outright: no type, a malformed type, or a parameter given twice
+    /// with two different values.
+    media_type: []const u8,
+    /// No error at all: a well-formed type and every parameter
+    /// `token "=" (token / quoted-string)`. Go still returns the type when
+    /// only a parameter is malformed (`ErrInvalidMediaParameter`), so
+    /// `media_type` can be set while this is false.
+    clean: bool,
+};
+
+/// Go's `mime.ParseMediaType` verdict on `header` (see `MediaTypeCheck`).
+/// Its rules, taken from the Go 1.26 source and pinned by the Go oracle:
+/// the type is `token ["/" token]`; a parameter value is a token or a
+/// quoted-string (a quoted CR or LF, or a missing closing quote, is
+/// malformed); one trailing `;` is tolerated; a repeated parameter name is
+/// an error only when the values differ (compared unescaped); RFC 2231
+/// `name*` parameters are checked as names of their own. More than
+/// `max_checked_params` parameters are reported malformed, which keeps the
+/// duplicate check linear (Go has no cap; no sender comes close).
+pub fn checkMediaType(header: []const u8) MediaTypeCheck {
+    const ws = &std.ascii.whitespace;
+    const semi = std.mem.indexOfScalar(u8, header, ';') orelse header.len;
+    const mt = std.mem.trim(u8, header[0..semi], ws);
+    if (!validMediaType(mt)) return .{ .media_type = "", .clean = false };
+    const bad_param: MediaTypeCheck = .{ .media_type = mt, .clean = false };
+
+    var seen: [max_checked_params]StrictParam = undefined;
+    var n: usize = 0;
+    var rest = header[semi..];
+    while (true) {
+        rest = std.mem.trimStart(u8, rest, ws);
+        if (rest.len == 0) break;
+        const p = StrictParam.consume(rest) orelse {
+            if (std.mem.eql(u8, std.mem.trim(u8, rest, ws), ";")) break;
+            return bad_param;
+        };
+        for (seen[0..n]) |s| {
+            if (std.ascii.eqlIgnoreCase(s.name, p.name) and !s.valueEql(p))
+                return .{ .media_type = "", .clean = false };
+        }
+        if (n == seen.len) return bad_param;
+        seen[n] = p;
+        n += 1;
+        rest = p.rest;
+    }
+    return .{ .media_type = mt, .clean = true };
+}
+
+/// Parameters `checkMediaType` compares for duplicates before it gives up.
+pub const max_checked_params = 32;
+
+/// Go's `checkMediaTypeDisposition`: `token ["/" token]`, nothing else.
+fn validMediaType(mt: []const u8) bool {
+    const t = tokenLen(mt);
+    if (t == 0) return false;
+    if (t == mt.len) return true;
+    if (mt[t] != '/') return false;
+    const sub = tokenLen(mt[t + 1 ..]);
+    return sub != 0 and t + 1 + sub == mt.len;
+}
+
+/// One `; name=value` as Go's `consumeMediaParam` reads it.
+const StrictParam = struct {
+    name: []const u8,
+    /// The value as sent, without the quotes of a quoted-string (escapes kept).
+    value: []const u8,
+    quoted: bool,
+    rest: []const u8,
+
+    fn consume(in: []const u8) ?StrictParam {
+        const ws = &std.ascii.whitespace;
+        if (in.len == 0 or in[0] != ';') return null;
+        var r = std.mem.trimStart(u8, in[1..], ws);
+        const name_len = tokenLen(r);
+        if (name_len == 0) return null;
+        const name = r[0..name_len];
+        r = std.mem.trimStart(u8, r[name_len..], ws);
+        if (r.len == 0 or r[0] != '=') return null;
+        r = std.mem.trimStart(u8, r[1..], ws);
+        if (r.len != 0 and r[0] == '"') {
+            var i: usize = 1;
+            while (i < r.len) : (i += 1) switch (r[i]) {
+                '"' => return .{ .name = name, .value = r[1..i], .quoted = true, .rest = r[i + 1 ..] },
+                '\\' => if (i + 1 < r.len and isTspecial(r[i + 1])) {
+                    i += 1;
+                },
+                '\r', '\n' => return null,
+                else => {},
+            };
+            return null; // no closing quote
+        }
+        const len = tokenLen(r);
+        if (len == 0) return null;
+        return .{ .name = name, .value = r[0..len], .quoted = false, .rest = r[len..] };
+    }
+
+    /// Equal values once a quoted-string's quoted-pairs are unescaped.
+    fn valueEql(a: StrictParam, b: StrictParam) bool {
+        var x: Unescaped = .{ .s = a.value, .quoted = a.quoted };
+        var y: Unescaped = .{ .s = b.value, .quoted = b.quoted };
+        while (true) {
+            const cx = x.next();
+            const cy = y.next();
+            if (cx == null or cy == null) return cx == null and cy == null;
+            if (cx.? != cy.?) return false;
+        }
+    }
+};
+
+/// The octets of a parameter value with `unescapeQuoted`'s rule applied.
+const Unescaped = struct {
+    s: []const u8,
+    quoted: bool,
+    i: usize = 0,
+
+    fn next(u: *Unescaped) ?u8 {
+        if (u.i == u.s.len) return null;
+        if (u.quoted and u.s[u.i] == '\\' and u.i + 1 < u.s.len and isTspecial(u.s[u.i + 1])) u.i += 1;
+        u.i += 1;
+        return u.s[u.i - 1];
+    }
+};
+
 pub const Param = struct { name: []const u8, value: []const u8 };
 
 /// Iterates `;`-separated `name=value` parameters, quoted-string aware.
@@ -500,6 +640,49 @@ test "corpus: every urlencoded seed reaches the decoder, and the pairs yielded a
     // octets before the draw was fixed; 12 / 18 / 81 after.
     try testing.expectEqual(@as(usize, 18), pairs);
     try testing.expectEqual(@as(usize, 81), decoded_octets);
+}
+
+test "checkMediaType: Go's verdicts on type, parameter and duplicate shapes" {
+    const Case = struct { in: []const u8, mt: []const u8, clean: bool };
+    const cases = [_]Case{
+        .{ .in = "application/x-www-form-urlencoded", .mt = "application/x-www-form-urlencoded", .clean = true },
+        .{ .in = "  Text/Plain ;charset = \"utf-8\" ", .mt = "Text/Plain", .clean = true },
+        .{ .in = "application", .mt = "application", .clean = true }, // no subtype is fine
+        .{ .in = "text/plain;", .mt = "text/plain", .clean = true }, // one trailing ';'
+        .{ .in = "text/plain;;", .mt = "text/plain", .clean = false },
+        .{ .in = "", .mt = "", .clean = false },
+        .{ .in = "; charset=x", .mt = "", .clean = false },
+        .{ .in = "text/", .mt = "", .clean = false },
+        .{ .in = "text/plain x", .mt = "", .clean = false },
+        .{ .in = "text/plain/x", .mt = "", .clean = false },
+        .{ .in = "text/plain; charset", .mt = "text/plain", .clean = false }, // valueless
+        .{ .in = "text/plain; charset=", .mt = "text/plain", .clean = false }, // empty token
+        .{ .in = "text/plain; charset=\"\"", .mt = "text/plain", .clean = true }, // empty quoted is a value
+        .{ .in = "text/plain; a=b/c", .mt = "text/plain", .clean = false }, // '/' ends the token, then junk
+        .{ .in = "text/plain; a=\"b", .mt = "text/plain", .clean = false }, // unterminated
+        .{ .in = "text/plain; a=\"b\\\"", .mt = "text/plain", .clean = false }, // the quote is escaped
+        .{ .in = "text/plain; a=\"b\\x\"", .mt = "text/plain", .clean = true }, // \x is literal
+        .{ .in = "text/plain; a=1; A=2", .mt = "", .clean = false }, // duplicate, values differ
+        .{ .in = "text/plain; a=1; A=\"1\"", .mt = "text/plain", .clean = true }, // equal once unquoted
+        .{ .in = "text/plain; a=\"\\;\"; a=\";\"", .mt = "text/plain", .clean = true }, // equal once unescaped
+        .{ .in = "text/plain; a=1; a*=2", .mt = "text/plain", .clean = true }, // `a*` is its own name
+    };
+    for (cases) |c| {
+        const got = checkMediaType(c.in);
+        testing.expectEqualStrings(c.mt, got.media_type) catch |e| {
+            std.debug.print("case {f}\n", .{std.zig.fmtString(c.in)});
+            return e;
+        };
+        testing.expectEqual(c.clean, got.clean) catch |e| {
+            std.debug.print("case {f}\n", .{std.zig.fmtString(c.in)});
+            return e;
+        };
+    }
+    // Past the parameter cap: malformed, the type kept.
+    const many = "a/b" ++ ("; p=1" ** (max_checked_params + 1));
+    const got = checkMediaType(many);
+    try testing.expectEqualStrings("a/b", got.media_type);
+    try testing.expect(!got.clean);
 }
 
 test "ContentType.paramUnescaped: quoted-pairs before tspecials only, unquoted copied, short out refused" {

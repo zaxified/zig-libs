@@ -145,6 +145,11 @@ pub const url = @import("url.zig");
 /// part from a `*std.Io.Reader` for uploads too large to hold (`Reader`).
 pub const multipart = @import("multipart.zig");
 
+/// Request forms in one call (Go's `ParseForm` + `ParseMultipartForm`,
+/// `FormValue` / `PostFormValue` / `FormFile`) into an arena, and the
+/// client-side `application/x-www-form-urlencoded` encoder.
+pub const form = @import("form.zig");
+
 /// Server-Sent Events (`text/event-stream`) encoder over a streaming
 /// `ResponseWriter` — the push half of a live HTTP endpoint (SSE / MCP).
 pub const sse = @import("sse.zig");
@@ -507,6 +512,7 @@ test {
     _ = body;
     _ = url;
     _ = multipart;
+    _ = form;
     _ = sse;
     _ = range;
     _ = conneg;

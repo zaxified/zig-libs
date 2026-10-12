@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Request forms, Go's `ParseForm`/`FormValue` family (S2 survey R4), additive;
+  fix in `multipart`.** New `http.form`: `Form.parse(arena, req, limits)` reads the query, an
+  urlencoded body (POST/PUT/PATCH) or a multipart body (any method) by Go's rules and precedence,
+  with `value`/`postValue`/`values`/`file` and a `malformed` flag where Go's `ParseForm` returns an
+  error; `form.encode`/`encodeAlloc`/`escape` write a form body as Go's `Values.Encode`/`QueryEscape`.
+  New `body.checkMediaType` (Go's strict `mime.ParseMediaType` verdict). **Fix, `multipart`:** a
+  `Content-Disposition` with a valueless or unterminated parameter now loses its `name`/`filename`
+  (Go reads no parameters from it; we used to take the name), and one repeating a parameter with
+  the same value keeps them (Go accepts it; we used to drop them).
+
 - **2026-10-12** — **Graceful shutdown, Go's `Shutdown`/`Close` (S2 survey R1), additive.**
   `Server.shutdownGraceful(timeout_ms)` (idle connections closed, requests in flight finished with
   `Connection: close`, HTTP/2 GOAWAY NO_ERROR and its open streams finished; `error.DeadlineExceeded`

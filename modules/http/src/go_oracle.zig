@@ -1052,3 +1052,146 @@ test "go oracle helpers: basicAuth answers as Request.BasicAuth" {
         }
     }
 }
+
+// ── form: ParseForm + ParseMultipartForm over whole requests ─────────────
+
+const form = @import("form.zig");
+
+var form_arena: std.heap.ArenaAllocator = undefined;
+var form_result: ?form.ParseError!form.Form = null;
+
+fn formHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    form_result = form.Form.parse(form_arena.allocator(), req, .{});
+    try rw.writeAll("");
+}
+
+/// The case's request on the wire, body expanded as Go's table expands it.
+fn formWire(gpa: std.mem.Allocator, c: vectors.FormCase) ![]u8 {
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    if (c.n == 0) try body.writer.writeAll(c.body) else for (0..c.n) |i| {
+        if (i != 0) try body.writer.writeByte('&');
+        try body.writer.writeAll(c.body);
+    }
+    var wire: std.Io.Writer.Allocating = .init(gpa);
+    errdefer wire.deinit();
+    try wire.writer.print("{s} {s} HTTP/1.1\r\nHost: t\r\n", .{ c.method, c.target });
+    if (c.content_type.len != 0) try wire.writer.print("Content-Type: {s}\r\n", .{c.content_type});
+    try wire.writer.print("Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.written().len, body.written() });
+    return wire.toOwnedSlice();
+}
+
+/// `pairs` grouped as Go's map prints them: names sorted, a name's values
+/// in order (a stable sort).
+fn sortedPairs(gpa: std.mem.Allocator, pairs: []const form.Pair) ![]form.Pair {
+    const out = try gpa.dupe(form.Pair, pairs);
+    std.sort.insertion(form.Pair, out, {}, struct {
+        fn lt(_: void, a: form.Pair, b: form.Pair) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+    return out;
+}
+
+fn pairsAgree(gpa: std.mem.Allocator, ours: []const form.Pair, go: []const [2][]const u8, go_count: u32, compare_items: bool) !bool {
+    if (ours.len != go_count) return false;
+    if (!compare_items) return true;
+    const s = try sortedPairs(gpa, ours);
+    defer gpa.free(s);
+    for (s, go) |o, g| if (!std.mem.eql(u8, o.name, g[0]) or !std.mem.eql(u8, o.value, g[1])) return false;
+    return true;
+}
+
+fn filesAgree(ours: []const form.File, go: []const vectors.FormFile) bool {
+    if (ours.len != go.len) return false;
+    var used: [16]bool = @splat(false);
+    // Go lists files by sorted key; ours are in body order. Match each Go
+    // file to the first unused one of ours with its key (order within a key
+    // is body order on both sides).
+    for (go) |g| {
+        const i = for (ours, 0..) |o, i| {
+            if (!used[i] and std.mem.eql(u8, o.name, g.key)) break i;
+        } else return false;
+        used[i] = true;
+        const o = ours[i];
+        if (!std.mem.eql(u8, o.filename, g.filename) or !optEql(o.content_type, g.content_type) or !std.mem.eql(u8, o.data, g.data)) return false;
+    }
+    return true;
+}
+
+const FormDivergence = struct { id: []const u8, ours_err: bool, why: []const u8 };
+
+const form_divergences = [_]FormDivergence{
+    .{ .id = "body-semicolon", .ours_err = false, .why = "`;` is an ordinary byte, as in `url` (query divergence `a=1;b=2`); Go drops the pair and reports an error" },
+    .{ .id = "mp-quoted-printable", .ours_err = false, .why = "Content-Transfer-Encoding is not decoded: RFC 7578 §4.7 deprecates it and no browser sends it; Go's NextPart decodes quoted-printable" },
+};
+
+test "go oracle form: requests parse as ParseForm + ParseMultipartForm do, or the difference is judged" {
+    const gpa = testing.allocator;
+    var bad: usize = 0;
+    for (vectors.form) |c| {
+        const wire = try formWire(gpa, c);
+        defer gpa.free(wire);
+        form_arena = .init(gpa);
+        defer form_arena.deinit();
+        form_result = null;
+        var in: std.Io.Reader = .fixed(wire);
+        var out_buf: [1024]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        var head_buf: [2048]u8 = undefined;
+        var request_body_buf: [64]u8 = undefined;
+        var response_body_buf: [256]u8 = undefined;
+        var chunk_buf: [64]u8 = undefined;
+        Server.serveStream(.{ .handler = formHandler, .server_name = null }, &in, &out, .{
+            .head = &head_buf,
+            .request_body = &request_body_buf,
+            .response_body = &response_body_buf,
+            .chunk = &chunk_buf,
+        });
+        const result = form_result orelse {
+            std.debug.print("form {s}: the handler never ran\n", .{c.id});
+            bad += 1;
+            continue;
+        };
+        const go_hard = c.multipart_err.len != 0;
+        const ours_err = if (result) |_| false else |_| true;
+        const agrees = if (result) |f|
+            !go_hard and f.malformed == (c.parse_err.len != 0) and
+                try pairsAgree(gpa, f.all, c.form, c.form_count, c.n == 0) and
+                try pairsAgree(gpa, f.post, c.post, c.post_count, c.n == 0) and
+                filesAgree(f.files, c.files)
+        else |_|
+            go_hard;
+        const listed = find(FormDivergence, &form_divergences, c.id);
+        const verdict: ?[]const u8 = if (listed) |d|
+            (if (agrees)
+                "agrees now, drop its divergence entry"
+            else if (ours_err != d.ours_err)
+                "diverges, but not the way its entry says"
+            else
+                null)
+        else if (agrees) null else "diverges";
+        const v = verdict orelse continue;
+        bad += 1;
+        std.debug.print("form {s}: {s}\n  go:   parse_err={f} multipart_err={f} form={d} post={d} files={d}\n", .{
+            c.id, v, std.zig.fmtString(c.parse_err), std.zig.fmtString(c.multipart_err), c.form_count, c.post_count, c.files.len,
+        });
+        if (result) |f| {
+            std.debug.print("  ours: malformed={} all={d} post={d} files={d}", .{ f.malformed, f.all.len, f.post.len, f.files.len });
+            for (f.all) |p| std.debug.print(" [{f}={f}]", .{ std.zig.fmtString(p.name), std.zig.fmtString(p.value) });
+            for (f.files) |x| std.debug.print(" <{s}:{f}>", .{ x.name, std.zig.fmtString(x.filename) });
+            std.debug.print("\n", .{});
+        } else |e| std.debug.print("  ours: {t}\n", .{e});
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "go oracle form: escape answers as url.QueryEscape" {
+    for (vectors.query_escape) |c| {
+        var buf: [128]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try form.escape(&w, c.input);
+        errdefer std.debug.print("escape {f}\n", .{std.zig.fmtString(c.input)});
+        try testing.expectEqualStrings(c.out, w.buffered());
+    }
+}
